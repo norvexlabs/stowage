@@ -77,6 +77,7 @@ type fakeDisks struct {
 	dir      string // a test's temporary directory
 	made     [][]string
 	requests []kairos.DiskRequest
+	left     []string // the files other than the compressed ones at cleanup
 	fail     bool
 }
 
@@ -104,7 +105,16 @@ func (f *fakeDisks) Build(_ context.Context, r kairos.DiskRequest) (map[string]s
 			return nil, nil, err
 		}
 	}
-	return out, func() { os.RemoveAll(dir) }, nil
+	return out, func() {
+		// What ship left of the disks it made, when it is done with them.
+		entries, _ := os.ReadDir(dir)
+		for _, e := range entries {
+			if !strings.HasSuffix(e.Name(), ".zst") {
+				f.left = append(f.left, e.Name())
+			}
+		}
+		os.RemoveAll(dir)
+	}, nil
 }
 
 // fakeCloud registers images by fetching their disk, as the uploader does, and records them.

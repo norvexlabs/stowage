@@ -19,13 +19,13 @@ import (
 // The module contract: the variables `vm create` writes into terraform.tfvars.json. A module
 // declares every one of contractVars; it may declare any of optionalVars, written when it does:
 // the VM's CPUs and memory (a cloud's module sizes it by its own instance type instead, and
-// --cpus / --memory are refused), whether its IPv4 address comes by DHCP, and the administrator
-// and their SSH key.
+// --cpus / --memory are refused), the image's disk format (one of the platform's), whether its
+// IPv4 address comes by DHCP, and the administrator and their SSH key.
 // Its outputs are `id` (required: what the platform calls the VM) and `address` (optional: where it
 // answers, when the platform tells; empty otherwise).
 var (
 	contractVars = []string{"name", "description", "disk_gib", "image", "image_sha256", "seed", "seed_sha256"}
-	optionalVars = []string{"cpus", "memory_mib", "dhcp", "admin_user", "ssh_public_key"}
+	optionalVars = []string{"cpus", "memory_mib", "image_format", "dhcp", "admin_user", "ssh_public_key"}
 	// truenasVars are the TrueNAS module's own variables, which its flags give.
 	truenasVars = []string{"insecure_skip_verify", "pool", "parent_dataset", "nic_attach"}
 )

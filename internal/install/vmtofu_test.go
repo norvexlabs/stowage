@@ -220,7 +220,7 @@ func TestVMCreateWithOpenTofu(t *testing.T) {
 	if b, _ := os.ReadFile(filepath.Join(dir, platformFile)); string(b) != "truenas builtin\n" {
 		t.Errorf("platform %q", b)
 	}
-	for _, f := range []string{"main.tf", "variables.tf", "outputs.tf", "versions.tf"} {
+	for _, f := range []string{"main.tf", "variables.tf", "outputs.tf", "versions.tf", ".terraform.lock.hcl"} {
 		got, _ := os.ReadFile(filepath.Join(dir, f))
 		emb, _ := tofuModules.ReadFile("tofu/truenas/" + f)
 		if len(emb) == 0 || string(got) != string(emb) {

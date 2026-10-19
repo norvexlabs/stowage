@@ -1,14 +1,16 @@
-# One Proxmox VE VM of the release: its disk imported from the release's image, uploaded as an ISO
-# volume's file, and its NoCloud seed on the CD-ROM. A preview: not run on a Proxmox VE host yet.
+# One Proxmox VE VM of the release: its disk imported from the release's image, uploaded to a
+# datastore with Import content, and its NoCloud seed, uploaded to one with ISO content, on the
+# CD-ROM. Both uploads go through the API, with the token alone (no SSH to the node). A preview: not
+# run on a Proxmox VE host yet.
 
 resource "proxmox_virtual_environment_file" "image" {
   node_name    = var.node
-  datastore_id = var.iso_datastore
-  content_type = "iso"
+  datastore_id = var.import_datastore
+  content_type = "import"
 
   source_file {
     path      = var.image
-    file_name = "${var.name}-${substr(var.image_sha256, 0, 12)}.img"
+    file_name = "${var.name}-${substr(var.image_sha256, 0, 12)}.${var.image_format}"
     checksum  = var.image_sha256
   }
 }
@@ -50,7 +52,7 @@ resource "proxmox_virtual_environment_vm" "vm" {
 
   disk {
     datastore_id = var.datastore
-    file_id      = proxmox_virtual_environment_file.image.id
+    import_from  = proxmox_virtual_environment_file.image.id
     interface    = "virtio0"
     size         = var.disk_gib
   }

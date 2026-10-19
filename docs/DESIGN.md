@@ -300,7 +300,11 @@ pushed artifact.
   (`<repo>:sha256-<hex>`), so a promotion re-tags it and its disks instead of rebuilding a
   multi-gigabyte image. It is kept on its node's inputs **and** the digests of the images it
   preloads (an image rebuilt with the same inputs is another image); each disk is kept on the
-  bundle's digest, its format and the disk recipe, so a format added makes that disk alone. Both
+  bundle's digest, its format, the disk recipe and its layer's compression, so a format added
+  makes that disk alone. A disk's layer is its file compressed with zstd, every format alike (a
+  raw or fixed VHD disk is mostly unallocated space: −66 %; the others −1 to −3 %), annotated
+  with the file's own digest: a reader decompresses it as a stream into the file and checks that
+  digest, the compressed one being checked as it is read. Both
   are planned once the images are pushed by digest — still before any tag moves; on an immutable
   channel the images are then all kept, so a refusal still writes nothing.
 - Floating tags (the installer's `:latest`, each disk's `latest-<fmt>`) follow the pointer of the

@@ -273,7 +273,7 @@ func (in *Installer) CreateVM(ctx context.Context, c *VMCreate) error {
 	}
 	ctl := in.R.Ctl()
 	if tofu {
-		id, out, err := in.applyVM(ctx, state, c.Ctl, p, mach, &c.TofuVM, files, declared, disk, layer.Hex, seed)
+		id, out, err := in.applyVM(ctx, state, c.Ctl, p, mach, &c.TofuVM, files, declared, disk, format, layer.Hex, seed)
 		if err != nil {
 			return fmt.Errorf("%w\n(the state is in %s: `%s vm create` again with the same --hostname is refused; `%s vm destroy %s` removes what was made)", err, state, ctl, ctl, mach.Hostname)
 		}

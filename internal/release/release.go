@@ -87,8 +87,10 @@ type Artifacts struct {
 	Disks map[string]string `json:"disks,omitempty"`
 }
 
-// DiskArtifactType is a disk image's artifact type; its one layer is the disk file, of media type
-// DiskMediaType(format), titled with the file's name.
+// DiskArtifactType is a disk image's artifact type; its one layer is the disk file compressed with
+// zstd, of media type DiskMediaType(format) and registry.ZstdSuffix, titled with the file's name
+// and ".zst", annotated with the file's own digest (registry.ZstdFileBlob); a release before 0.5.0
+// has the file as it is, of media type DiskMediaType(format), titled with its name.
 const DiskArtifactType = "application/vnd.stowage.disk.v1"
 
 // DiskMediaType is the media type of a disk file of format.

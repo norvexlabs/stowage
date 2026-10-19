@@ -4,7 +4,7 @@ terraform {
     # Pinned exactly: an upgrade is a reviewed change of `<short>-stow`, never a drift.
     aws = {
       source  = "hashicorp/aws"
-      version = "6.68.0"
+      version = "6.69.1"
     }
   }
 }

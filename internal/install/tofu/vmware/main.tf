@@ -35,6 +35,7 @@ resource "vsphere_file" "seed" {
 
 resource "vsphere_virtual_machine" "vm" {
   name             = var.name
+  datacenter_id    = data.vsphere_datacenter.dc.id
   annotation       = var.description
   folder           = var.folder == "" ? null : var.folder
   resource_pool_id = data.vsphere_compute_cluster.cluster.resource_pool_id

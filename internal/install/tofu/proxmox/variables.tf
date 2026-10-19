@@ -29,6 +29,15 @@ variable "image" {
   type        = string
 }
 
+variable "image_format" {
+  description = "The image's format: qcow2 or raw."
+  type        = string
+  validation {
+    condition     = contains(["qcow2", "raw"], var.image_format)
+    error_message = "image_format must be qcow2 or raw."
+  }
+}
+
 variable "image_sha256" {
   description = "The image's SHA-256: a change makes the disk again."
   type        = string
@@ -59,8 +68,14 @@ variable "datastore" {
   default     = "local-lvm"
 }
 
+variable "import_datastore" {
+  description = "The datastore the image is uploaded to: a file-based one with Import content enabled (Datacenter > Storage)."
+  type        = string
+  default     = "local"
+}
+
 variable "iso_datastore" {
-  description = "The datastore (with ISO content) the image and the seed are uploaded to."
+  description = "The datastore (with ISO content) the seed is uploaded to."
   type        = string
   default     = "local"
 }

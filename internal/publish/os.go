@@ -477,12 +477,16 @@ func (p *Publisher) buildDisks(ctx context.Context, o ShipOptions, osRef name.Di
 		if path == "" {
 			return fmt.Errorf("disk %s: the disk builder made none", f)
 		}
-		b, err := registry.FileBlob(release.DiskMediaType(f), path)
+		// The layer is the file compressed with zstd, titled with the name `oras pull` writes it to.
+		p.logf("disk %s: compress %s", f, filepath.Base(path))
+		b, err := registry.ZstdFileBlob(release.DiskMediaType(f), path)
 		if err != nil {
 			return fmt.Errorf("disk %s: %w", f, err)
 		}
-		// The layer's title is the file name `oras pull` writes it to.
-		b.Annotations = map[string]string{registry.TitleAnnotation: filepath.Base(path)}
+		// Nothing reads the file again (a cloud upload downloads the disk back): its space goes.
+		if err := os.Remove(path); err != nil {
+			return fmt.Errorf("disk %s: %w", f, err)
+		}
 		m := registry.Manifest{
 			ArtifactType: release.DiskArtifactType,
 			Config:       registry.Blob{MediaType: registry.EmptyMediaType, Data: []byte("{}")},
@@ -492,7 +496,7 @@ func (p *Publisher) buildDisks(ctx context.Context, o ShipOptions, osRef name.Di
 				FormatAnnotation:          f,
 			},
 		}
-		p.logf("disk %s: push %s", f, filepath.Base(path))
+		p.logf("disk %s: push %s", f, b.Annotations[registry.TitleAnnotation])
 		h, err := p.Registry.PutManifest(ctx, repo, m, nil)
 		if err != nil {
 			return fmt.Errorf("disk %s: %w", f, err)

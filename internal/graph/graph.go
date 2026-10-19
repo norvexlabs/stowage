@@ -29,6 +29,7 @@ import (
 	"github.com/norvexlabs/stowage/internal/kairos"
 	"github.com/norvexlabs/stowage/internal/project"
 	"github.com/norvexlabs/stowage/internal/providers"
+	"github.com/norvexlabs/stowage/internal/registry"
 	"github.com/norvexlabs/stowage/internal/release"
 	"github.com/norvexlabs/stowage/internal/spec"
 )
@@ -254,6 +255,7 @@ func Build(p *project.Project, r Release) (*Graph, error) {
 		// In the order they are made, not the spec's: reordering the list changes no disk.
 		d.Field("formats", strings.Join(k.Formats(), ","))
 		d.Field("recipe", diskRecipe())
+		d.Field("layer", diskLayer)
 		disks := Node{ID: KindDisks, Kind: KindDisks, Deps: []string{osNode.ID}, Inputs: d.Sum()}
 		g.Nodes = append(g.Nodes, osNode, disks)
 		all.Field(osNode.ID, osNode.Inputs)
@@ -377,6 +379,10 @@ func imageNode(p *project.Project, name, projectVersion string) (Node, error) {
 // are inputs.
 var bundleRecipe, diskRecipe = kairos.BundleRecipe, kairos.DiskRecipe
 
+// diskLayer is how a disk's file is pushed, as its layer: compressed with zstd, the media type
+// suffix registry.ZstdFileBlob gives it. Another way makes every disk again; tests change it.
+var diskLayer = registry.ZstdSuffix
+
 // OSKey is the key the OS bundle is kept on: its node's inputs and the images it preloads, by
 // digest. An image is kept on its inputs, so one rebuilt with the same inputs is another image;
 // keying the bundle on the digests keeps it from preloading the one it replaced.
@@ -389,12 +395,13 @@ func OSKey(inputs string, images map[string]string) string {
 	return d.Sum()
 }
 
-// DiskKey is the key a disk is kept on: the bundle it is made of, by digest, its format, and
-// what it is made with.
+// DiskKey is the key a disk is kept on: the bundle it is made of, by digest, its format, what it
+// is made with, and how it is pushed.
 func DiskKey(bundle, format string) string {
 	d := digest.New(KindDisks)
 	d.Field("os", bundle)
 	d.Field("format", format)
 	d.Field("recipe", diskRecipe())
+	d.Field("layer", diskLayer)
 	return d.Sum()
 }

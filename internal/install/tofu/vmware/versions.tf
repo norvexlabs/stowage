@@ -3,8 +3,8 @@ terraform {
   required_providers {
     # Pinned exactly: an upgrade is a reviewed change of `<short>-stow`, never a drift.
     vsphere = {
-      source  = "hashicorp/vsphere"
-      version = "2.17.0"
+      source  = "vmware/vsphere"
+      version = "2.17.1"
     }
   }
 }

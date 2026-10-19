@@ -4,7 +4,7 @@ terraform {
     # Pinned exactly: an upgrade is a reviewed change of `<short>-stow`, never a drift.
     proxmox = {
       source  = "bpg/proxmox"
-      version = "0.116.1"
+      version = "0.117.0"
     }
   }
 }

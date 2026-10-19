@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # End-to-end test of the Kairos VM shape's publication: the OS bundle and its disk images, built for
 # real (kairos-init, auroraboot, qemu-img) and published to zot. Needs Docker (privileged
-# containers, loop devices), network access and about 30 GB on disk under XDG_CACHE_HOME.
+# containers, loop devices), zstd, network access and about 30 GB on disk under XDG_CACHE_HOME.
 #
 #   make e2e-kairos        (builds ./bin/stowage first)
 #   STOWAGE_CLOUD_ENV=<file> make e2e-kairos    (also registers the clouds' images: the file sets
@@ -10,7 +10,7 @@
 # Walks examples/minimal, with a real Postgres, two disk formats and the three clouds' (raw, vhd,
 # gce), through: ship a mutable
 # channel (the bundle preloads every image, named by digest, and `docker load` takes each archive;
-# each disk is checked in its format, the clouds' as each cloud imports it), the bundle's own notes-stow run on this host's Docker as on
+# each disk is compressed, decompressed with zstd -d and checked in its format, the clouds' as each cloud imports it), the bundle's own notes-stow run on this host's Docker as on
 # the VM (install from the preloaded images with the cloud-config's settings, boot, the host daemon
 # and its app socket, a backup through the preloaded runner to a WebDAV server, decrypted with the
 # key), a second ship that builds nothing, promote to the immutable channel
@@ -23,6 +23,7 @@ set -euo pipefail
 PG=postgres:17-alpine@sha256:aa90e97ee862e558111d34cfb8b2c4bec768c2b039fb791341686928560263b3
 FORMATS=(raw qcow2 ova vhd gce)
 . "$(dirname "$0")/lib.sh"
+command -v zstd >/dev/null || fail "zstd is needed (the disks are checked decompressed)"
 
 D=$WORK/stowage-e2e-vm
 CLEANUP+=('remove_install')
@@ -222,10 +223,14 @@ for f in "${FORMATS[@]}"; do
 	d=$(art "a['disks']['$f']")
 	[[ $(digest_of "notes/notes-disk:beta-1.0.0-$f") == "$d" ]] || fail "notes-disk:beta-1.0.0-$f is not the release's"
 	m=$(manifest notes-disk "$d")
-	read -r layer title type <<<"$(printf '%s' "$m" | python3 -c 'import json,sys; m=json.load(sys.stdin); l=m["layers"][0]
-print(l["digest"], l["annotations"]["org.opencontainers.image.title"], m["artifactType"])')"
+	read -r layer title type mt sum <<<"$(printf '%s' "$m" | python3 -c 'import json,sys; m=json.load(sys.stdin); l=m["layers"][0]
+print(l["digest"], l["annotations"]["org.opencontainers.image.title"], m["artifactType"], l["mediaType"], l["annotations"]["dev.stowage.uncompressed.digest"])')"
 	[[ $type == application/vnd.stowage.disk.v1 ]] || fail "disk $f artifact type $type"
+	[[ $mt == "application/vnd.stowage.disk.$f+zstd" && $title == *.zst ]] || fail "disk $f is not compressed: $mt $title"
 	curl -sf "${pull_auth[@]}" -o "$WORK/disks/$title" "http://$REG/v2/notes/notes-disk/blobs/$layer" || fail "download of disk $f"
+	# As the docs say: zstd -d gives the disk, of the digest the layer's annotation names.
+	zstd -d -q --rm "$WORK/disks/$title" || fail "zstd -d of disk $f"
+	[[ "sha256:$(sha256sum "$WORK/disks/${title%.zst}" | cut -d' ' -f1)" == "$sum" ]] || fail "disk $f decompressed is not $sum"
 done
 run_tools() { docker run --rm --user "$(id -u):$(id -g)" -v "$WORK/disks:/w" -w /w "$tools" "$@"; }
 run_tools qemu-img check notes-1.0.0.qcow2 >/dev/null || fail "qemu-img check of the qcow2"
@@ -298,8 +303,9 @@ VMC=$WORK/vm-create
 	>"$WORK/vm-create.txt" 2>"$WORK/vm-create.log" || { cat "$WORK/vm-create.log"; fail "vm create"; }
 grep -q '^On TrueNAS:' "$WORK/vm-create.txt" || { cat "$WORK/vm-create.txt"; fail "vm create printed no steps"; }
 d=$(art "a['disks']['qcow2']")
-layer=$(manifest notes-disk "$d" | python3 -c 'import json,sys; print(json.load(sys.stdin)["layers"][0]["digest"])')
-[[ sha256:$(sha256sum "$VMC/notes-1.0.0.qcow2" | cut -d' ' -f1) == "$layer" ]] || fail "the qcow2 written is not the release's"
+# The disk decompressed: the file of the digest the layer's annotation names.
+file=$(manifest notes-disk "$d" | python3 -c 'import json,sys; print(json.load(sys.stdin)["layers"][0]["annotations"]["dev.stowage.uncompressed.digest"])')
+[[ sha256:$(sha256sum "$VMC/notes-1.0.0.qcow2" | cut -d' ' -f1) == "$file" ]] || fail "the qcow2 written is not the release's"
 python3 - "$VMC/notes-e2e-seed.iso" <<'PY' || fail "the seed ISO"
 import sys
 iso = open(sys.argv[1], "rb").read()

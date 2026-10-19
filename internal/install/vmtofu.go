@@ -23,7 +23,7 @@ import (
 // tofuModules are the OpenTofu modules `vm create` applies, one directory per platform that has
 // one.
 //
-//go:embed tofu/*/*.tf
+//go:embed tofu/*/*.tf tofu/*/.terraform.lock.hcl
 var tofuModules embed.FS
 
 // The ways `vm create` makes a VM.
@@ -394,7 +394,7 @@ func (in *Installer) tofu(ctx context.Context, dir, ctl string, args ...string) 
 // applyVM writes the module into dir with its variables, and the platform it was made for, then
 // applies it: the VM is created, its disk written from image, its seed attached, and it is
 // started. It returns the module's outputs: the VM's id, and its address when the platform tells.
-func (in *Installer) applyVM(ctx context.Context, dir, ctl string, p Platform, mach Machine, t *TofuVM, files map[string][]byte, declared []moduleVar, image, imageSHA, seed string) (id, addr string, err error) {
+func (in *Installer) applyVM(ctx context.Context, dir, ctl string, p Platform, mach Machine, t *TofuVM, files map[string][]byte, declared []moduleVar, image, format, imageSHA, seed string) (id, addr string, err error) {
 	seedSHA, err := truenas.SHA256File(seed)
 	if err != nil {
 		return "", "", err
@@ -414,6 +414,8 @@ func (in *Installer) applyVM(ctx context.Context, dir, ctl string, p Platform, m
 			vars[v.Name] = t.CPUs
 		case "memory_mib":
 			vars[v.Name] = t.MemoryMiB
+		case "image_format":
+			vars[v.Name] = format
 		case "dhcp":
 			vars[v.Name] = mach.staticAddr() == ""
 		case "admin_user":

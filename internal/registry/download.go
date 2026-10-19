@@ -21,9 +21,10 @@ import (
 // TitleAnnotation names the file an artifact's layer is written to.
 const TitleAnnotation = "org.opencontainers.image.title"
 
-// Download writes the one layer of the artifact at d — of artifactType, its layer of type layer —
-// into dir, under the layer's title (a plain file name), else fallback, and returns its path and
-// the layer's digest (what the file's bytes hash to). The
+// Download writes the one layer of the artifact at d — of artifactType, its layer of type layer,
+// or layer+ZstdSuffix, then decompressed as it is written and its title's ".zst" dropped — into
+// dir, under the layer's title (a plain file name), else fallback, and returns its path and the
+// file's digest (what the file's bytes hash to: a compressed layer's UncompressedAnnotation, checked). The
 // manifest is checked against d's digest, and the layer against its digest as it is read (both by
 // go-containerregistry's reads); the file reaches its name only once read whole. A file of that name already
 // holding the layer is kept, not fetched again; any other is refused, never replaced. The file is
@@ -44,20 +45,28 @@ func (c *Client) Download(ctx context.Context, d name.Digest, artifactType, laye
 	if err := json.Unmarshal(desc.Manifest, &m); err != nil {
 		return "", v1.Hash{}, fmt.Errorf("%s: manifest: %w", d, err)
 	}
-	if m.ArtifactType != artifactType || len(m.Layers) != 1 || m.Layers[0].MediaType != layer {
+	if m.ArtifactType != artifactType || len(m.Layers) != 1 || (m.Layers[0].MediaType != layer && m.Layers[0].MediaType != layer+ZstdSuffix) {
 		return "", v1.Hash{}, fmt.Errorf("%s is not a %s artifact with one %s layer", d, artifactType, layer)
 	}
 	l := m.Layers[0]
+	compressed := l.MediaType == layer+ZstdSuffix
+	want, size, title := l.Digest, l.Size, l.Annotations[TitleAnnotation]
+	if compressed {
+		if want, err = uncompressedDigest(l); err != nil {
+			return "", v1.Hash{}, fmt.Errorf("%s: %w", d, err)
+		}
+		size, title = -1, strings.TrimSuffix(title, ".zst")
+	}
 	file := fallback
-	if t := l.Annotations[TitleAnnotation]; plainName(t) {
-		file = t
+	if plainName(title) {
+		file = title
 	}
 	path := filepath.Join(dir, file)
-	switch ok, err := holds(path, l); {
+	switch ok, err := holds(path, want, size); {
 	case err != nil:
 		return "", v1.Hash{}, err
 	case ok:
-		return path, l.Digest, nil
+		return path, want, nil
 	}
 	rl, err := remote.Layer(d.Context().Digest(l.Digest.String()), c.opts(ctx)...)
 	if err != nil {
@@ -77,7 +86,7 @@ func (c *Client) Download(ctx context.Context, d name.Digest, artifactType, laye
 	if progress != nil {
 		r = &counter{r: r, total: l.Size, progress: progress}
 	}
-	_, err = io.Copy(tmp, r)
+	err = write(tmp, r, compressed, want)
 	if err == nil {
 		err = tmp.Chmod(0o644)
 	}
@@ -90,7 +99,32 @@ func (c *Client) Download(ctx context.Context, d name.Digest, artifactType, laye
 	if err := os.Rename(tmp.Name(), path); err != nil {
 		return "", v1.Hash{}, err
 	}
-	return path, l.Digest, nil
+	return path, want, nil
+}
+
+// write copies the layer r into w: as it is, or decompressed, its bytes then checked against want.
+// The layer is read to its end either way, where its own digest is checked.
+func write(w io.Writer, r io.Reader, compressed bool, want v1.Hash) error {
+	if !compressed {
+		_, err := io.Copy(w, r)
+		return err
+	}
+	dec, err := unzstd(r)
+	if err != nil {
+		return err
+	}
+	defer dec.Close()
+	h := sha256.New()
+	if _, err := io.Copy(io.MultiWriter(w, h), dec); err != nil {
+		return fmt.Errorf("decompress: %w", err)
+	}
+	if _, err := io.Copy(io.Discard, r); err != nil {
+		return err
+	}
+	if got := "sha256:" + hex.EncodeToString(h.Sum(nil)); got != want.String() {
+		return fmt.Errorf("decompressed, the layer is %s, not %s", got, want)
+	}
+	return nil
 }
 
 // plainName reports whether t is a file name with no directory in it.
@@ -98,9 +132,9 @@ func plainName(t string) bool {
 	return t != "" && t != "." && t != ".." && !strings.ContainsAny(t, `/\`) && filepath.Base(t) == t
 }
 
-// holds reports whether the file at path is the layer l (its size and digest): false when there is
-// none, an error when it is something else.
-func holds(path string, l v1.Descriptor) (bool, error) {
+// holds reports whether the file at path is the file of digest want (and size, unless it is
+// negative): false when there is none, an error when it is something else.
+func holds(path string, want v1.Hash, size int64) (bool, error) {
 	f, err := os.Open(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return false, nil
@@ -117,15 +151,15 @@ func holds(path string, l v1.Descriptor) (bool, error) {
 		return false, fmt.Errorf("%s exists and is not a file", path)
 	}
 	h := sha256.New()
-	if st.Size() == l.Size {
+	if size < 0 || st.Size() == size {
 		if _, err := io.Copy(h, f); err != nil {
 			return false, err
 		}
-		if "sha256:"+hex.EncodeToString(h.Sum(nil)) == l.Digest.String() {
+		if "sha256:"+hex.EncodeToString(h.Sum(nil)) == want.String() {
 			return true, nil
 		}
 	}
-	return false, fmt.Errorf("%s exists and is not %s: move it away", path, l.Digest)
+	return false, fmt.Errorf("%s exists and is not %s: move it away", path, want)
 }
 
 // counter reports the bytes read through it.

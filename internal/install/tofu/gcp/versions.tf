@@ -4,7 +4,7 @@ terraform {
     # Pinned exactly: an upgrade is a reviewed change of `<short>-stow`, never a drift.
     google = {
       source  = "hashicorp/google"
-      version = "8.6.0"
+      version = "8.7.0"
     }
   }
 }

@@ -1,6 +1,7 @@
 package registry
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -516,6 +517,101 @@ func TestDownloadWritesTheCheckedLayerUnderItsTitle(t *testing.T) {
 	for _, e := range entries {
 		if strings.HasPrefix(e.Name(), "other") || strings.HasPrefix(e.Name(), ".other") {
 			t.Errorf("left %s", e.Name())
+		}
+	}
+}
+
+func TestDownloadDecompressesAZstdLayerAndChecksItsFile(t *testing.T) {
+	t.Parallel()
+	var blobs atomic.Int32
+	host := serve(t, func(h http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/blobs/") {
+				blobs.Add(1)
+			}
+			h.ServeHTTP(w, r)
+		})
+	})
+	c := New(authn.DefaultKeychain)
+	ctx := context.Background()
+	src, dir := t.TempDir(), t.TempDir()
+	data := bytes.Repeat([]byte("a raw disk, mostly zeros\x00\x00\x00\x00"), 1<<15)
+	path := filepath.Join(src, "atlas.raw")
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	b, err := ZstdFileBlob(kind, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(data)
+	zst, _ := os.ReadFile(path + ".zst")
+	if zsum := sha256.Sum256(zst); b.digest.String() != "sha256:"+hex.EncodeToString(zsum[:]) || b.size != int64(len(zst)) || b.path != path+".zst" {
+		t.Errorf("blob %s, %d bytes: not the compressed file's", b.digest, b.size)
+	}
+	if b.MediaType != kind+ZstdSuffix || b.Annotations[TitleAnnotation] != "atlas.raw.zst" || b.Annotations[UncompressedAnnotation] != "sha256:"+hex.EncodeToString(sum[:]) || b.size >= int64(len(data))/10 {
+		t.Fatalf("blob %s %v, %d bytes of %d", b.MediaType, b.Annotations, b.size, len(data))
+	}
+	repo, _ := c.Repo(host + "/p/disk")
+	push := func(ann map[string]string) name.Digest {
+		t.Helper()
+		l := b
+		l.Annotations = ann
+		h, err := c.PutManifest(ctx, repo, Manifest{ArtifactType: kind, Config: Blob{MediaType: EmptyMediaType, Data: []byte("{}")}, Layers: []Blob{l}}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return repo.Digest(h.String())
+	}
+	d := push(b.Annotations)
+	p, h, err := c.Download(ctx, d, kind, kind, dir, "fallback", nil)
+	if err != nil || p != filepath.Join(dir, "atlas.raw") || h.String() != b.Annotations[UncompressedAnnotation] {
+		t.Fatalf("%s %s %v", p, h, err)
+	}
+	if got, _ := os.ReadFile(p); !bytes.Equal(got, data) {
+		t.Error("not the file decompressed")
+	}
+	// Fetched again, the decompressed file is kept: no blob is read.
+	blobs.Store(0)
+	if again, h2, err := c.Download(ctx, d, kind, kind, dir, "fallback", nil); err != nil || again != p || h2 != h || blobs.Load() != 0 {
+		t.Errorf("again: %s %v, %d blob reads", again, err, blobs.Load())
+	}
+	// A file digest the decompressed bytes are not, or none, is refused, and leaves no file.
+	other := map[string]string{TitleAnnotation: "other.raw.zst", UncompressedAnnotation: "sha256:" + strings.Repeat("0", 64)}
+	if _, _, err := c.Download(ctx, push(other), kind, kind, dir, "f", nil); err == nil || !strings.Contains(err.Error(), "decompressed, the layer is") {
+		t.Errorf("a wrong file digest: %v", err)
+	}
+	if _, _, err := c.Download(ctx, push(map[string]string{TitleAnnotation: "none.raw.zst"}), kind, kind, dir, "f", nil); err == nil || !strings.Contains(err.Error(), UncompressedAnnotation) {
+		t.Errorf("no file digest: %v", err)
+	}
+	entries, _ := os.ReadDir(dir)
+	if len(entries) != 1 {
+		t.Errorf("left %v", entries)
+	}
+}
+
+// A frame asking for zstd's own window limit (128 MiB) is decoded; one asking for more is refused.
+func TestZstdWindowBothSidesOfTheCap(t *testing.T) {
+	t.Parallel()
+	// A frame of one raw block, "a disk", its header asking for a window of 1<<(10+exponent) bytes.
+	frame := func(exponent byte) []byte {
+		return append([]byte{0x28, 0xb5, 0x2f, 0xfd, 0x00, exponent << 3, 6<<3 | 1, 0, 0}, "a disk"...)
+	}
+	for _, c := range []struct {
+		exponent byte
+		ok       bool
+	}{{17, true}, {18, false}} {
+		if 1<<(10+c.exponent) > zstdMaxWindow == c.ok {
+			t.Fatalf("exponent %d is not on its side of the cap", c.exponent)
+		}
+		dec, err := unzstd(bytes.NewReader(frame(c.exponent)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := io.ReadAll(dec)
+		dec.Close()
+		if (err == nil && string(got) == "a disk") != c.ok {
+			t.Errorf("window 1<<%d: %q %v", 10+c.exponent, got, err)
 		}
 	}
 }

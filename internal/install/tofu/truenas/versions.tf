@@ -5,7 +5,7 @@ terraform {
     # upgrade is a reviewed change of `<short>-stow`, never a drift.
     truenas = {
       source  = "pjsalty/truenas"
-      version = "3.0.0"
+      version = "3.1.0"
     }
   }
 }

@@ -29,6 +29,15 @@ variable "image" {
   type        = string
 }
 
+variable "image_format" {
+  description = "The image's format: qcow2 or raw."
+  type        = string
+  validation {
+    condition     = contains(["qcow2", "raw"], var.image_format)
+    error_message = "image_format must be qcow2 or raw."
+  }
+}
+
 variable "image_sha256" {
   description = "The image's SHA-256: a change makes the disk again."
   type        = string
@@ -64,12 +73,6 @@ variable "network" {
   description = "The libvirt network the VM attaches to (its DHCP gives the address)."
   type        = string
   default     = "default"
-}
-
-variable "firmware" {
-  description = "The UEFI firmware on the libvirt host."
-  type        = string
-  default     = "/usr/share/OVMF/OVMF_CODE.fd"
 }
 
 variable "dhcp" {

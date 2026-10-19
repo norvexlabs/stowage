@@ -4,7 +4,7 @@ terraform {
     # Pinned exactly: an upgrade is a reviewed change of `<short>-stow`, never a drift.
     azurerm = {
       source  = "hashicorp/azurerm"
-      version = "5.9.0"
+      version = "5.10.0"
     }
   }
 }

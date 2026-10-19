@@ -46,6 +46,17 @@ func TestEveryBuiltInModuleHoldsTheContract(t *testing.T) {
 				t.Errorf("%s: variable %s has no description to ask it with", p.Key, v.Name)
 			}
 		}
+		// Its lock file holds the providers' checksums, of the provider and release versions.tf pins.
+		pins := regexp.MustCompile(`(?m)^\s+source\s+=\s+"([^"]+)"\n\s+version\s+=\s+"([^"]+)"`).FindAllStringSubmatch(string(files["versions.tf"]), -1)
+		lock := string(files[".terraform.lock.hcl"])
+		if len(pins) == 0 || !strings.Contains(lock, "h1:") {
+			t.Errorf("%s: no pin (%d) or no checksums in its lock file", p.Key, len(pins))
+		}
+		for _, pin := range pins {
+			if !strings.Contains(lock, "provider \"registry.opentofu.org/"+pin[1]+"\" {\n  version     = \""+pin[2]+"\"") {
+				t.Errorf("%s: its lock file is not of %s %s", p.Key, pin[1], pin[2])
+			}
+		}
 		if p.Preview != (p.Key != "truenas") {
 			t.Errorf("%s: preview %v", p.Key, p.Preview)
 		}
@@ -165,7 +176,7 @@ func TestVMCreateWithABuiltInPreviewModule(t *testing.T) {
 	}
 	dir := filepath.Join(r.state, "notes", "vms", "notes-1")
 	vars := readVars(t, dir)
-	if vars["name"] != "notes-1" || vars["node"] != "pve1" || vars["cpus"] != 2.0 || vars["seed"] != filepath.Join(dir, "seed.iso") || vars["pool"] != nil {
+	if vars["name"] != "notes-1" || vars["node"] != "pve1" || vars["cpus"] != 2.0 || vars["image_format"] != "qcow2" || vars["seed"] != filepath.Join(dir, "seed.iso") || vars["pool"] != nil {
 		t.Errorf("variables %v", vars)
 	}
 	for _, k := range contractVars {
@@ -363,7 +374,7 @@ func TestVMCreateOnACloudAsksNoCPUsOrMemory(t *testing.T) {
 		}
 	}
 	vars := readVars(t, filepath.Join(r.state, "notes", "vms", "notes-1"))
-	if _, ok := vars["cpus"]; ok || vars["region"] != "eu-west-3" || vars["seed"] == nil {
+	if _, ok := vars["cpus"]; ok || vars["image_format"] != nil || vars["region"] != "eu-west-3" || vars["seed"] == nil {
 		t.Errorf("variables %v", vars)
 	}
 	if !strings.Contains(v.log.String(), "OpenTofu creates the VM notes-1 on Amazon EC2: a 40 GiB disk\n") {

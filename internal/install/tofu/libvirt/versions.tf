@@ -4,7 +4,7 @@ terraform {
     # Pinned exactly: an upgrade is a reviewed change of `<short>-stow`, never a drift.
     libvirt = {
       source  = "dmacvicar/libvirt"
-      version = "0.8.3"
+      version = "0.9.9"
     }
   }
 }

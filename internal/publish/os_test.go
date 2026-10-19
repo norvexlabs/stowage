@@ -4,6 +4,8 @@ import (
 	"archive/tar"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -19,9 +21,11 @@ import (
 	"github.com/google/go-containerregistry/pkg/name"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
+	"github.com/klauspost/compress/zstd"
 
 	"github.com/norvexlabs/stowage/internal/kairos"
 	"github.com/norvexlabs/stowage/internal/payload"
+	"github.com/norvexlabs/stowage/internal/registry"
 	"github.com/norvexlabs/stowage/internal/release"
 	"github.com/norvexlabs/stowage/internal/spec"
 	"github.com/norvexlabs/stowage/internal/testutil"
@@ -138,8 +142,10 @@ func TestShipPublishesTheOSBundleAndItsDisks(t *testing.T) {
 		t.Errorf("the bundled spec's kairos shape: %+v", view.Shapes.Kairos)
 	}
 
-	// The disk: made from the bundle by digest, pushed as an artifact titled with its file.
+	// The disk: made from the bundle by digest, pushed compressed as an artifact titled with its
+	// file, annotated with the file's own digest.
 	eq(t, "disks made", len(e.disks.made), 1)
+	eq(t, "disks left uncompressed", fmt.Sprint(e.disks.left), "[]")
 	ref, _ := name.NewDigest(e.host + "/acme/notes/notes-disk@" + m.Artifacts.Disks["qcow2"])
 	desc, err := remote.Get(ref)
 	if err != nil {
@@ -152,14 +158,21 @@ func TestShipPublishesTheOSBundleAndItsDisks(t *testing.T) {
 	eq(t, "artifact type", string(dm.ArtifactType), release.DiskArtifactType)
 	eq(t, "format", dm.Annotations[FormatAnnotation], "qcow2")
 	eq(t, "layers", len(dm.Layers), 1)
-	eq(t, "media type", string(dm.Layers[0].MediaType), "application/vnd.stowage.disk.qcow2")
-	eq(t, "title", dm.Layers[0].Annotations["org.opencontainers.image.title"], "notes-1.0.0.qcow2")
+	eq(t, "media type", string(dm.Layers[0].MediaType), "application/vnd.stowage.disk.qcow2+zstd")
+	eq(t, "title", dm.Layers[0].Annotations["org.opencontainers.image.title"], "notes-1.0.0.qcow2.zst")
+	disk := sha256.Sum256([]byte("qcow2 of " + m.Artifacts.OS))
+	eq(t, "file digest", dm.Layers[0].Annotations[registry.UncompressedAnnotation], "sha256:"+hex.EncodeToString(disk[:]))
 	layer, err := remote.Layer(ref.Context().Digest(dm.Layers[0].Digest.String()))
 	if err != nil {
 		t.Fatal(err)
 	}
 	rc, _ := layer.Compressed()
-	content, _ := io.ReadAll(rc)
+	dec, err := zstd.NewReader(rc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	content, _ := io.ReadAll(dec)
+	dec.Close()
 	rc.Close()
 	eq(t, "disk content", string(content), "qcow2 of "+m.Artifacts.OS)
 	eq(t, "latest-qcow2", e.digest("notes-disk", "latest-qcow2"), m.Artifacts.Disks["qcow2"])

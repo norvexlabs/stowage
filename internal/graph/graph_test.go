@@ -508,7 +508,8 @@ func TestKairosSettingsReachTheBundle(t *testing.T) {
 	}
 }
 
-// The bundle's recipe reaches the bundle and the disks; the disks' recipe the disks alone.
+// The bundle's recipe reaches the bundle and the disks; the disks' recipe, and how they are
+// pushed, the disks alone.
 func TestKairosRecipesReachTheirNodes(t *testing.T) {
 	root := testutil.CopyExample(t, "minimal")
 	a := inputs(build(t, root))
@@ -530,6 +531,18 @@ func TestKairosRecipesReachTheirNodes(t *testing.T) {
 	diskRecipe = savedDisk
 	if DiskKey("sha256:os", "raw") == other {
 		t.Error("DiskKey ignores the disk recipe")
+	}
+	savedLayer := diskLayer
+	diskLayer = "plain"
+	t.Cleanup(func() { diskLayer = savedLayer })
+	c = changed(a, inputs(build(t, root)))
+	if c["os-bundle"] || !c["disks"] || !c["release"] {
+		t.Errorf("a disk layer change: %v", c)
+	}
+	other = DiskKey("sha256:os", "raw")
+	diskLayer = savedLayer
+	if DiskKey("sha256:os", "raw") == other {
+		t.Error("DiskKey ignores how the disk is pushed")
 	}
 }
 

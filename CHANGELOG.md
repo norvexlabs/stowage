@@ -30,6 +30,17 @@ follow [SemVer](https://semver.org/).
   builder reads the OS bundle through a read-only loopback proxy that holds the publisher's
   account, and no account enters its container. `registry.pull` may now be the default Docker
   login with `disk_formats`.
+- **Disk images are published compressed** (zstd), every format: a release's disks take about
+  half the registry space and upload time (a raw or fixed VHD disk a third). `oras pull` now
+  writes `<name>-<version>.<format>.zst`: `zstd -d` it. `vm create` and the cloud upload
+  decompress them as they download them and check the disk's own digest; a disk published before
+  is still read. The first `ship` after the upgrade makes the disks again.
+- `vm create`'s OpenTofu modules run on their providers' latest releases, each with its
+  providers' checksums: libvirt's on the new 0.9 provider (libvirt's own UEFI firmware, so its
+  `firmware` setting is gone; a raw disk works too), vSphere's on `vmware/vsphere` (an OVA
+  deployment no longer fails after the VM is made), Proxmox VE's uploading the disk through the
+  API alone (its datastore needs *Import* content; `import_datastore` names it). A module of your
+  own may declare `image_format` to be told the disk's format.
 
 ## [0.4.1] - 2026-10-19
 

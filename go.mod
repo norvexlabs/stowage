@@ -9,6 +9,7 @@ require (
 	github.com/diskfs/go-diskfs v1.9.4
 	github.com/docker/cli v29.8.2+incompatible
 	github.com/google/go-containerregistry v0.22.1
+	github.com/klauspost/compress v1.20.1
 	github.com/moby/buildkit v0.34.0
 	github.com/moby/patternmatcher v0.6.1
 	github.com/sigstore/sigstore v1.10.8
@@ -84,7 +85,6 @@ require (
 	github.com/in-toto/attestation v1.2.0 // indirect
 	github.com/in-toto/in-toto-golang v0.11.0 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
-	github.com/klauspost/compress v1.20.1 // indirect
 	github.com/lucasb-eyer/go-colorful v1.3.0 // indirect
 	github.com/mattn/go-runewidth v0.0.20 // indirect
 	github.com/mitchellh/hashstructure/v2 v2.0.2 // indirect
