@@ -1,0 +1,99 @@
+#!/usr/bin/env python3
+"""Stand-in backend for the minimal example: just enough to exercise the Stowage contracts.
+
+serve          migrates the stored schema up to this release's, then readiness on /healthz/ready,
+               liveness on /healthz, the stored schema on /schema
+schema-compat  the `command` provider contract (JSON on stdin/stdout; exit 2 = no answer)
+create-admin   the provision hook contract (env in, KEY=VALUE out, idempotent)
+
+schema.json is this release's schema: its migration number, its rollback barriers (migration
+number -> description) and whether it reads a schema newer than its own; "ready": false makes
+readiness answer 503 while liveness stays up (a release that never becomes ready). The uploads volume stands
+in for the database: it holds the migration number reached. schema.current asks the running API,
+as this stand-in has no database client; a real project reads its database, which still answers
+when the new release does not start.
+"""
+import http.client
+import json
+import os
+import secrets
+import sys
+import urllib.error
+import urllib.request
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+
+SCHEMA = json.load(open(os.environ.get("NOTES_SCHEMA", "/usr/local/share/notes/schema.json")))
+STORED = "/data/uploads/.schema"
+
+
+def stored():
+    try:
+        return int(open(STORED).read())
+    except FileNotFoundError:
+        return 0
+
+
+def migrate():
+    if stored() < SCHEMA["version"]:
+        with open(STORED + ".new", "w") as f:
+            f.write(str(SCHEMA["version"]))
+        os.replace(STORED + ".new", STORED)
+
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/healthz/ready" and not SCHEMA.get("ready", True):
+            body = json.dumps({"status": "not ready"})
+            self.send_response(503)
+        elif self.path in ("/healthz", "/healthz/ready"):
+            body = json.dumps({"status": "ready", "version": os.environ.get("NOTES_VERSION", "dev")})
+            self.send_response(200)
+        elif self.path == "/schema":
+            body = json.dumps({"version": stored()})
+            self.send_response(200)
+        else:
+            body = json.dumps({"error": "not found"})
+            self.send_response(404)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(body.encode())
+
+
+def main(argv):
+    cmd = argv[1] if len(argv) > 1 else "serve"
+    if cmd == "serve":
+        migrate()
+        HTTPServer(("0.0.0.0", 8000), Handler).serve_forever()
+    elif cmd == "schema-compat":
+        req = json.load(sys.stdin)
+        op = req.get("op")
+        if op == "schema.current":  # asked of the running stack, on its network
+            try:
+                with urllib.request.urlopen("http://api:8000/schema", timeout=10) as r:
+                    json.dump(json.load(r), sys.stdout)
+            except urllib.error.HTTPError:
+                raise  # the API answered wrong: an error, not "no answer"
+            except (urllib.error.URLError, OSError, http.client.HTTPException):
+                return 2  # the API does not answer: unknown, never a refusal
+        elif op == "schema.barrier_after":
+            since = int(req["version"])
+            json.dump({"barriers": [d for n, d in sorted(SCHEMA["barriers"].items(), key=lambda b: int(b[0])) if int(n) > since]}, sys.stdout)
+        elif op == "schema.reads_newer":
+            json.dump({"reads_newer": SCHEMA["reads_newer"]}, sys.stdout)
+        else:
+            return 2  # no answer: never read as a refusal
+    elif cmd == "create-admin":
+        if not os.environ.get("ADMIN_EMAIL"):
+            print("ADMIN_EMAIL is required", file=sys.stderr)
+            return 1
+        print(f"ADMIN_PASSWORD={os.environ.get('ADMIN_PASSWORD') or secrets.token_urlsafe(18)}")
+        return 0
+    else:
+        print(f"unknown command {cmd}", file=sys.stderr)
+        return 64
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

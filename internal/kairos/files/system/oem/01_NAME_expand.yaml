@@ -1,0 +1,27 @@
+name: "{{.Name}}: grow the persistent partition to fill the disk"
+stages:
+  {{.Name}}.expand:
+    - name: "Grow the persistent partition when the disk has free space"
+      if: |
+        set -e
+        part=$(blkid -L COS_PERSISTENT)
+        pn=${part##*/}
+        disk=$(basename "$(readlink -f "/sys/class/block/$pn/..")")
+        total=$(cat "/sys/block/$disk/size")
+        start=$(cat "/sys/block/$disk/$pn/start")
+        size=$(cat "/sys/block/$disk/$pn/size")
+        [ $(( total - start - size )) -gt 32768 ]
+      layout:
+        device:
+          label: COS_PERSISTENT
+        expand_partition:
+          size: 0
+    - name: "Refresh the partition table and grow the filesystem"
+      commands:
+        - |
+          set -e
+          part=$(blkid -L COS_PERSISTENT)
+          pn=${part##*/}
+          disk=$(basename "$(readlink -f "/sys/class/block/$pn/..")")
+          partx -u "/dev/$disk" || true
+          resize2fs "$part"

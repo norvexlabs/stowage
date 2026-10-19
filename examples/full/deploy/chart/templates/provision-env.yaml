@@ -1,0 +1,9 @@
+# The provision hook's environment beyond what Stowage gives it: `at-stow k8s` runs the hook as a
+# Job of its own once the release is settled, and takes this ConfigMap (by its name, optional) as
+# the hook container's envFrom. No secret here: the hook's secrets come from hooks.provision.env.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-stowage-provision
+data:
+  API_URL: http://{{ .Release.Name }}-api:9090

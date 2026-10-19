@@ -1,0 +1,13 @@
+[Unit]
+Description={{.Name}}: load the release's images into Docker
+Requires=docker.service
+After=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/{{.Name}}-preload
+TimeoutStartSec=600
+
+[Install]
+WantedBy=multi-user.target

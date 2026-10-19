@@ -1,0 +1,13 @@
+# The release's data: `notes-stow k8s reset-db` deletes the claims the release makes and the ones its
+# StatefulSets claim.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ .Release.Name }}-uploads
+  labels:
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 16Mi

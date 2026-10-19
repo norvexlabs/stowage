@@ -1,0 +1,13 @@
+[Unit]
+Description={{.Name}}: grow the persistent partition to fill the disk
+After=local-fs.target
+Before={{.Name}}-preload.service docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/kairos-agent run-stage {{.Name}}.expand
+TimeoutStartSec=120
+
+[Install]
+WantedBy=multi-user.target

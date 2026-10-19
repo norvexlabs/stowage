@@ -1,0 +1,29 @@
+# The console.
+{{- $c := dict "root" $ "component" "ui" "port" 8080 }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-ui
+  labels:
+    {{- include "atlas.labels" $c | nindent 4 }}
+spec:
+  replicas: {{ .Values.ui.replicas }}
+  selector:
+    matchLabels:
+      {{- include "atlas.labels" $c | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "atlas.labels" $c | nindent 8 }}
+    spec:
+      {{- include "atlas.pod" . | nindent 6 }}
+      containers:
+        - name: ui
+          image: {{ include "atlas.image" (dict "root" $ "key" "ui") }}
+          ports:
+            - containerPort: 8080
+          readinessProbe:
+            httpGet: { path: /, port: 8080 }
+            periodSeconds: 2
+---
+{{ include "atlas.service" $c }}

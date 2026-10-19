@@ -1,0 +1,16 @@
+[Unit]
+Description={{.Name}}: bring the install up with this OS's release (upgrade to it, or go back to it)
+Requires=docker.service {{.Name}}-preload.service
+# After the cloud-config's boot and network stages, which write the first install's settings.
+After=docker.service {{.Name}}-preload.service {{.Name}}-expand.service network-online.target cos-setup-boot.service cos-setup-network.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/{{.Ctl}} boot
+# An upgrade dumps the database and may pull nothing: the images are preloaded.
+TimeoutStartSec=1800
+
+[Install]
+WantedBy=multi-user.target

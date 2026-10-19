@@ -1,0 +1,97 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 430" width="960" height="430" role="img" aria-labelledby="t d">
+  <title id="t">The Stowage lifecycle</title>
+  <desc id="d">A publisher describes the stack in stowage.yaml, checks it with lint and plan, and ships it: signed images, chart, OS bundle, disks, installer and release manifest go to one OCI registry. Operators install and manage it from there on a Docker host, a Kubernetes cluster or a Kairos VM, directly or through an offline site mirror.</desc>
+  <defs>
+    <style>
+      svg { --bg: #ffffff; --panel: #f6f8fa; --line: #d0d7de; --card: #ffffff; --ink: #1f2328; --muted: #59636e; --accent: #5A56E0; --accent-soft: #eeedfe; --code: #01875f; --arrow: #8c959f; }
+      @media (prefers-color-scheme: dark) {
+        svg { --bg: #0d1117; --panel: #151b23; --line: #3d444d; --card: #0d1117; --ink: #e6edf3; --muted: #9198a1; --accent: #7571F9; --accent-soft: #1b1a33; --code: #02BF87; --arrow: #6e7681; }
+      }
+      text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif; fill: var(--ink); }
+      .bg { fill: var(--bg); }
+      .panel { fill: var(--panel); stroke: var(--line); }
+      .card { fill: var(--card); stroke: var(--line); }
+      .hot { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 1.5; }
+      .eyebrow { font-size: 11px; font-weight: 600; letter-spacing: .08em; fill: var(--muted); }
+      .h { font-size: 15px; font-weight: 600; }
+      .s { font-size: 12px; fill: var(--muted); }
+      .code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; fill: var(--code); }
+      .lbl { font-size: 11.5px; fill: var(--muted); }
+      .wire { stroke: var(--arrow); stroke-width: 1.5; fill: none; marker-end: url(#a); }
+      .dash { stroke-dasharray: 5 4; }
+      .head { fill: var(--arrow); }
+    </style>
+    <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path class="head" d="M0 0 10 5 0 10z"/>
+    </marker>
+  </defs>
+
+  <rect class="bg" width="960" height="430" rx="12"/>
+
+  <!-- Publisher -->
+  <rect class="panel" x="20" y="20" width="290" height="300" rx="10"/>
+  <text class="eyebrow" x="40" y="46">PUBLISHER · LAPTOP OR CI</text>
+
+  <rect class="card" x="40" y="62" width="250" height="62" rx="8"/>
+  <text class="code" x="56" y="88">stowage.yaml</text>
+  <text class="s" x="56" y="108">beside compose · chart · Dockerfiles</text>
+
+  <path class="wire" d="M165 124v20"/>
+  <rect class="card" x="40" y="146" width="250" height="62" rx="8"/>
+  <text class="code" x="56" y="172">stowage lint · plan</text>
+  <text class="s" x="56" y="192">every contract checked, file:line to fix</text>
+
+  <path class="wire" d="M165 208v20"/>
+  <rect class="hot" x="40" y="230" width="250" height="70" rx="8"/>
+  <text class="code" x="56" y="256">stowage ship</text>
+  <text class="s" x="56" y="276">builds only what changed,</text>
+  <text class="s" x="56" y="291">signs by digest, moves the channel</text>
+
+  <!-- ship → registry -->
+  <path class="wire" d="M290 265h96"/>
+  <text class="lbl" x="338" y="253" text-anchor="middle">signed</text>
+
+  <!-- Registry -->
+  <path class="hot" d="M390 92c0-14 160-14 160 0v196c0 14-160 14-160 0z"/>
+  <path class="hot" style="fill:none" d="M390 92c0 14 160 14 160 0"/>
+  <text class="eyebrow" x="470" y="134" text-anchor="middle">ONE OCI REGISTRY</text>
+  <text class="s" x="470" y="162" text-anchor="middle">images · Helm chart</text>
+  <text class="s" x="470" y="182" text-anchor="middle">OS bundle · disks</text>
+  <text class="s" x="470" y="202" text-anchor="middle">installer · manifest</text>
+  <text class="s" x="470" y="222" text-anchor="middle">signatures</text>
+  <text class="code" x="470" y="254" text-anchor="middle">stable · beta</text>
+
+  <!-- registry → shapes -->
+  <path class="wire" d="M550 150C590 150 600 79 638 79"/>
+  <path class="wire" d="M550 191h88"/>
+  <path class="wire" d="M550 230C590 230 600 303 638 303"/>
+
+  <!-- Shapes -->
+  <text class="eyebrow" x="640" y="14" dy="20">OPERATOR · ONE INSTALLER, ONE SET OF VERBS</text>
+  <rect class="card" x="640" y="40" width="300" height="78" rx="8"/>
+  <text class="h" x="656" y="64">Docker host</text>
+  <text class="code" x="656" y="85">&lt;name&gt;ctl</text>
+  <text class="s" x="656" y="104">Compose on one host, Caddy TLS front</text>
+
+  <rect class="card" x="640" y="152" width="300" height="78" rx="8"/>
+  <text class="h" x="656" y="176">Kubernetes</text>
+  <text class="code" x="656" y="197">&lt;name&gt;ctl k8s install</text>
+  <text class="s" x="656" y="216">Helm: your chart, images by digest</text>
+
+  <rect class="card" x="640" y="264" width="300" height="78" rx="8"/>
+  <text class="h" x="656" y="288">Kairos VM appliance</text>
+  <text class="code" x="656" y="309">&lt;name&gt;ctl vm create</text>
+  <text class="s" x="656" y="328">immutable OS, A/B updates, health gate</text>
+
+  <!-- Mirror -->
+  <path class="wire dash" d="M470 296v54"/>
+  <text class="lbl" x="480" y="328">mirror export / import</text>
+  <rect class="panel dash" x="390" y="352" width="160" height="50" rx="8"/>
+  <text class="h" x="470" y="374" text-anchor="middle">Site mirror</text>
+  <text class="s" x="470" y="392" text-anchor="middle">no internet needed</text>
+  <path class="wire dash" d="M550 377C600 377 610 350 638 338"/>
+
+  <!-- Verbs -->
+  <text class="s" x="790" y="382" text-anchor="middle">install · upgrade · rollback · reset-db</text>
+  <text class="s" x="790" y="400" text-anchor="middle">secrets rotate · status · backup · restore</text>
+</svg>

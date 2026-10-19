@@ -1,0 +1,14 @@
+[Unit]
+Description={{.Name}}: host daemon ({{.Ctl}}'s verbs on this VM)
+Wants=docker.service
+After=docker.service
+
+[Service]
+ExecStart=/usr/sbin/{{.Ctl}} hostd
+Restart=always
+RestartSec=2
+# A backup cut off by a stop cleans up first (up to 2 min 15 s).
+TimeoutStopSec=3min
+
+[Install]
+WantedBy=multi-user.target

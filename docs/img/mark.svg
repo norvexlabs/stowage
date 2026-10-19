@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="Stowage">
+  <title>Stowage</title>
+  <rect x="17" y="6" width="30" height="16" rx="4" fill="#F780E2"/>
+  <rect x="4" y="26" width="27" height="16" rx="4" fill="#7571F9"/>
+  <rect x="33" y="26" width="27" height="16" rx="4" fill="#02BF87"/>
+  <path d="M2 46h60l-7 13a3 3 0 0 1-2.7 1.7H11.7A3 3 0 0 1 9 59z" fill="#5A56E0"/>
+</svg>

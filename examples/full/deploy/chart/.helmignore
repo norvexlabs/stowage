@@ -1,0 +1,3 @@
+# Not packaged: chart CI values and editor files.
+ci/
+*.bak

@@ -1,0 +1,10 @@
+[Unit]
+Description={{.Name}}: the scheduled backup (`{{.Ctl}} backup`), when one is configured
+Wants={{.Name}}-hostd.service
+After={{.Name}}.service {{.Name}}-hostd.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/{{.Ctl}} backup run --if-configured
+# The host daemon bounds a backup at an hour.
+TimeoutStartSec=75min

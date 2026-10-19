@@ -1,0 +1,38 @@
+# The ingest service: forwards the events it receives to the api; spools on an emptyDir.
+{{- $c := dict "root" $ "component" "ingest" "port" 8080 }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-ingest
+  labels:
+    {{- include "atlas.labels" $c | nindent 4 }}
+spec:
+  replicas: {{ .Values.ingest.replicas }}
+  selector:
+    matchLabels:
+      {{- include "atlas.labels" $c | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "atlas.labels" $c | nindent 8 }}
+    spec:
+      {{- include "atlas.pod" . | nindent 6 }}
+      containers:
+        - name: ingest
+          image: {{ include "atlas.image" (dict "root" $ "key" "ingest") }}
+          env:
+            {{- include "atlas.secretEnv" (dict "root" $ "keys" (list "INTERNAL_SERVICE_SECRET")) | trim | nindent 12 }}
+            - name: API_URL
+              value: http://{{ .Release.Name }}-api:9090
+          ports:
+            - containerPort: 8080
+          readinessProbe:
+            httpGet: { path: /health, port: 8080 }
+            periodSeconds: 2
+          volumeMounts:
+            - { name: spool, mountPath: /var/spool/atlas }
+      volumes:
+        - name: spool
+          emptyDir: {}
+---
+{{ include "atlas.service" $c }}

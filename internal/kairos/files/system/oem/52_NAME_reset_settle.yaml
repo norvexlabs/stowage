@@ -1,0 +1,20 @@
+name: "{{.Name}}: settle udev before the Kairos auto-reset"
+stages:
+  initramfs:
+    - if: '(grep -q "kairos.reset" /proc/cmdline || [ -f /run/cos/autoreset_mode ])'
+      only_service_manager: "systemd"
+      name: "Run udevadm settle before kairos-reset.service"
+      directories:
+        - path: /etc/systemd/system/kairos-reset.service.d
+          permissions: 0755
+          owner: 0
+          group: 0
+      files:
+        - path: /etc/systemd/system/kairos-reset.service.d/10-udev-settle.conf
+          permissions: 0644
+          owner: 0
+          group: 0
+          content: |
+            [Service]
+            ExecStartPre=-/usr/bin/udevadm trigger
+            ExecStartPre=-/usr/bin/udevadm settle --timeout=30

@@ -1,0 +1,95 @@
+# syntax=docker/dockerfile:1
+#
+# The OS bundle of {{.Name}}: a plain distribution converted into a bootable Kairos image by
+# kairos-init (no Kubernetes provider), with Docker running the stack and the release's images
+# preloaded. Rendered and built by `stowage ship`.
+
+FROM {{.KairosInit}} AS kairos-init
+
+FROM {{.Base}}
+
+# Guest agents: kairos-init only starts them, on the hypervisor its DMI check matches.
+# tzdata-legacy (the zones' old names, e.g. US/Eastern) where the base has it.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates curl gnupg jq nftables open-vm-tools qemu-guest-agent tzdata \
+        $(apt-cache show tzdata-legacy >/dev/null 2>&1 && echo tzdata-legacy) \
+    && rm -rf /var/lib/apt/lists/*
+
+# The install stage writes the version nowhere (the init stage does, below): a fixed one keeps this
+# layer, and Docker's after it, cached from one release to the next.
+COPY --from=kairos-init /kairos-init /kairos-init
+RUN /kairos-init -s install -v 0.0.0
+
+# Docker engine and the compose plugin, from Docker's apt repository.
+RUN install -m 0755 -d /etc/apt/keyrings \
+    && curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg \
+    && chmod a+r /etc/apt/keyrings/docker.gpg \
+    && . /etc/os-release \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu ${VERSION_CODENAME} stable" \
+        > /etc/apt/sources.list.d/docker.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends docker-ce docker-ce-cli containerd.io docker-compose-plugin \
+    && rm -rf /var/lib/apt/lists/*
+
+# Docker keeps its data on the persistent partition (/usr/local), so images and containers survive
+# an A/B upgrade, and starts after nftables, whose ruleset flush would drop Docker's chains.
+RUN mkdir -p /etc/docker /etc/systemd/system/docker.service.d \
+    && printf '{\n  "data-root": "/usr/local/docker",\n  "features": {"containerd-snapshotter": true}\n}\n' > /etc/docker/daemon.json \
+    && printf '[Unit]\nAfter=nftables.service\nWants=nftables.service\n' > /etc/systemd/system/docker.service.d/after-nftables.conf
+
+# Everything the image adds lives outside /usr/local, /var, /oem, /opt and /home: Kairos mounts
+# persistent storage there, which would hide it.
+COPY files/ /
+RUN chmod 0440 /etc/sudoers.d/10-{{.Name}} \
+    && chmod 0755 /usr/sbin/{{.Name}}-preload \
+    && mkdir -p /etc/{{.Name}} \
+    && echo "{{.OSVersion}}" > /etc/{{.Name}}/os-version \
+    && mkdir -p /etc/systemd/system/multi-user.target.wants /etc/systemd/system/getty.target.wants \
+    && (getent group admin >/dev/null || groupadd --system admin) \
+    && for u in {{.Name}}-expand.service {{.Name}}-preload.service {{.Name}}.service {{.Name}}-health.service {{.Name}}-hostd.service {{.Name}}-network.service; do \
+           ln -sf /etc/systemd/system/$u /etc/systemd/system/multi-user.target.wants/$u; done \
+    && ln -sf /lib/systemd/system/docker.service /etc/systemd/system/multi-user.target.wants/docker.service \
+    && ln -sf /lib/systemd/system/nftables.service /etc/systemd/system/multi-user.target.wants/nftables.service \
+    && ln -sf /lib/systemd/system/serial-getty@.service /etc/systemd/system/getty.target.wants/serial-getty@ttyS0.service \
+    && ln -sf /usr/lib/systemd/system/open-vm-tools.service /etc/systemd/system/vmtoolsd.service \
+    && ln -sf /dev/null /etc/systemd/system/multipathd.service
+
+# The release's images, as archives `docker load` reads at every boot.
+COPY preload/ /usr/share/{{.Name}}-preload/
+
+# {{.Ctl}}, carrying the release: it installs it, brings it up at every boot and runs the host
+# daemon.
+COPY --chmod=0755 ctl/{{.Ctl}} /usr/sbin/{{.Ctl}}
+
+# kairos-init's init stage strips the kernel modules; without them netfilter, and so nftables and
+# Docker, fail. They are reinstalled, and the build fails if they did not come back.
+RUN set -e \
+    && /kairos-init -s init -v "{{.OSVersion}}" \
+    && rm /kairos-init \
+    && mods="$(dpkg-query -W -f='${Package}\n' 'linux-modules-*' 2>/dev/null | sort -u)" \
+    && if [ -z "$mods" ]; then echo "no linux-modules-* package installed" >&2; exit 1; fi \
+    && apt-get update \
+    && apt-get install --reinstall -y --no-install-recommends $mods \
+    && rm -rf /var/lib/apt/lists/* \
+    && n=$(find /lib/modules/ -name '*.ko*' | wc -l) \
+    && if [ "$n" -lt 100 ]; then echo "only $n kernel modules after the reinstall" >&2; exit 1; fi
+
+# Console on the screen and on the serial port, serial last so it owns /dev/console: the recovery
+# shell must work on a VM without a display. The build fails when kairos-init's boot arguments
+# no longer read as expected.
+RUN set -e; f=/etc/cos/bootargs.cfg; \
+    grep -qF 'set baseExtraConsole="console=ttyS0"' "$f"; \
+    grep -qF 'set baseCmd="console=tty1 ' "$f"; \
+    sed -i 's/set baseExtraConsole="console=ttyS0"/set baseExtraConsole="console=tty1 console=ttyS0,115200"/' "$f"; \
+    sed -i 's/set baseCmd="console=tty1 /set baseCmd="/' "$f"; \
+    grep -qF 'set baseExtraConsole="console=tty1 console=ttyS0,115200"' "$f"; \
+    ! grep -qE 'set baseCmd=.*console=' "$f"
+
+# Kairos's boot assessment, with the health gate as its judge: the bundle's copy of 08_grub.yaml
+# leaves out the step that marks every boot of the active system good (files/usr/share/NAME). The
+# build fails when kairos-init's file is no longer the one that copy is derived from.
+RUN set -e; f=/system/oem/08_grub.yaml; \
+    echo "aa7cd9d82f036161eb88c116113864b598d86e4e848f8a01e37f471c05e8fc82  $f" | sha256sum -c -; \
+    mv /usr/share/{{.Name}}/08_grub.yaml "$f"; \
+    rmdir /usr/share/{{.Name}}; \
+    ! grep -q 'Remove GRUB sentinels' "$f"

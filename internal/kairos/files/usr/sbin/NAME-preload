@@ -1,0 +1,9 @@
+#!/bin/sh
+# Loads every image archive the OS bundle carries. The archives live on the OS image itself, so an
+# A/B upgrade brings the new release's images; loading one already present is quick.
+set -eu
+for a in /usr/share/{{.Name}}-preload/*.tar; do
+    [ -e "$a" ] || continue
+    echo "loading $(basename "$a")"
+    docker load --input "$a"
+done

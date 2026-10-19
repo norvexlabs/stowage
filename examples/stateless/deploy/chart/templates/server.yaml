@@ -1,0 +1,50 @@
+# The server, and the Service <release>-server on 8080: the route's upstream (server:8080), which
+# `lookup-stow k8s` prints as the endpoint, http://<release>-server.<namespace>.svc:8080.
+{{- $img := index .Values.stowage.images "server" }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-server
+  labels:
+    app.kubernetes.io/name: server
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  replicas: {{ .Values.server.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: server
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: server
+        app.kubernetes.io/instance: {{ .Release.Name }}
+    spec:
+      {{- with .Values.stowage.pullSecret }}
+      imagePullSecrets:
+        - name: {{ . }}
+      {{- end }}
+      containers:
+        - name: server
+          image: {{ printf "%s/%s@%s" .Values.stowage.registry $img.repository $img.digest }}
+          command: ["sh", "-c", "mkdir -p /www && echo ok > /www/health && echo \"$GREETING\" > /www/index.html && exec httpd -f -p 8080 -h /www"]
+          env:
+            - name: GREETING
+              valueFrom:
+                secretKeyRef: { name: {{ required "stowage.secret: install with lookup-stow k8s" .Values.stowage.secret | quote }}, key: GREETING }
+          ports:
+            - containerPort: 8080
+          readinessProbe:
+            httpGet: { path: /health, port: 8080 }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-server
+spec:
+  selector:
+    app.kubernetes.io/name: server
+    app.kubernetes.io/instance: {{ .Release.Name }}
+  ports:
+    - port: 8080
+      targetPort: 8080

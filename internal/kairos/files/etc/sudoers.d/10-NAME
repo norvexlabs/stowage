@@ -1,0 +1,2 @@
+# The admin group logs in with its SSH key only and has no password: sudo asks none.
+%admin ALL=(ALL:ALL) NOPASSWD: ALL

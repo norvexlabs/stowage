@@ -1,0 +1,92 @@
+# A minimal stack: Postgres + one backend + one frontend behind the Stowage front.
+# Deliberately different from the full example wherever a project can differ: SemVer from a
+# VERSION file, one changelog file per version, a beta channel, a command-provided schema check,
+# health by status, public images.
+apiVersion: stowage/v1
+name: notes
+
+stowage:
+  requires: ">=0.1 <1"
+
+version:
+  source: { provider: file, file: VERSION }
+  scheme: { provider: semver }
+changelog: { provider: dir-per-version, dir: changes/ }       # changes/1.4.0.md
+channels:
+  stable: { tag: "{v}", mutable: false, latest: true }
+  beta:   { tag: "beta-{v}", mutable: true }                 # a suffix would collide with SemVer pre-releases
+
+registry:
+  prefix: ghcr.io/acme/notes
+  pull: { provider: none }                                     # public images
+  push: { provider: docker-config }
+
+images:
+  api: { context: api, dockerfile: api/Dockerfile, inputs: [api/] }
+  web: { context: web, dockerfile: web/Dockerfile, inputs: [web/] }
+  postgres: { ref: "postgres:17-alpine@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24" }
+
+stack:
+  compose: deploy/compose.yaml
+
+front:
+  tls_modes: [acme, byo, internal, none]
+  routes:
+    - { name: app, domain_input: APP_DOMAIN, upstream: web:8080 }
+    - { name: api, domain_input: API_DOMAIN, upstream: api:8000 }   # the front routes by hostname only
+  portal: app
+  loopback_ports: { app: 8080, api: 8000 }
+  loopback_env: { SECURE_COOKIES: "false" }                  # plain HTTP on this machine only
+
+health:
+  provider: http-status
+  service: api
+  port: 8000
+  path: /healthz/ready
+  expect: 200
+
+database:
+  engine: postgres
+  service: postgres
+  name: notes
+  roles: { migrate: notes, app: notes }
+  schema_compat:
+    provider: command
+    image: api                                                 # runs inside the api image
+    cmd: [notes-api, schema-compat]                            # JSON stdin/stdout contract
+
+data:
+  volumes:
+    postgres: { uid: 70 }
+    uploads:  { uid: 1000 }
+  reset: [postgres, uploads]
+
+secrets:
+  - { key: SESSION_SECRET,    gen: hex32 }
+  - { key: POSTGRES_PASSWORD, gen: pass18 }
+
+safe_defaults:
+  SECURE_COOKIES: "true"
+
+inputs:
+  - { key: ADMIN_EMAIL, prompt: "Administrator email", required: true }
+
+hooks:
+  provision:
+    provider: container
+    image: api
+    cmd: [notes-api, create-admin]
+    env: [ADMIN_EMAIL]
+
+backup:
+  provider: pg-age-rclone
+  profiles: { full: all }
+
+shapes:
+  docker: {}
+  kubernetes: { chart: deploy/chart, postgres_modes: [external, cnpg] }
+  kairos:
+    base: ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55
+    kairos_init: quay.io/kairos/kairos-init:v0.16.2@sha256:0777266d25e31b653deaaaa084d4e27d98f7a55e82e42f0648e2ba9c756b8664
+    disk_formats: [qcow2]
+    host_api: [api]

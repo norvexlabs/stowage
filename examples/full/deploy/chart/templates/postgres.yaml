@@ -1,0 +1,50 @@
+# The embedded database (postgres.mode embedded): one pod of the release's postgres image, its data
+# on the StatefulSet's claim (`at-stow k8s reset-db` deletes it). The migrate role is its
+# superuser, atlas, with the generated POSTGRES_PASSWORD.
+{{- if eq .Values.postgres.mode "embedded" }}
+{{- $c := dict "root" $ "component" "postgres" "port" 5432 "headless" true }}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ .Release.Name }}-postgres
+  labels:
+    {{- include "atlas.labels" $c | nindent 4 }}
+spec:
+  serviceName: {{ .Release.Name }}-postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "atlas.labels" $c | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "atlas.labels" $c | nindent 8 }}
+    spec:
+      {{- include "atlas.pod" . | nindent 6 }}
+      containers:
+        - name: postgres
+          image: {{ include "atlas.image" (dict "root" $ "key" "postgres") }}
+          env:
+            - { name: POSTGRES_DB, value: atlas }
+            - { name: POSTGRES_USER, value: atlas }
+            - { name: PGDATA, value: /var/lib/postgresql/data/pgdata }
+            {{- include "atlas.secretEnv" (dict "root" $ "keys" (list "POSTGRES_PASSWORD")) | trim | nindent 12 }}
+          ports:
+            - containerPort: 5432
+          readinessProbe:
+            exec:
+              command: [pg_isready, -U, atlas, -d, atlas]
+            periodSeconds: 2
+          volumeMounts:
+            - { name: data, mountPath: /var/lib/postgresql/data }
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: {{ .Values.postgres.storage }}
+---
+{{ include "atlas.service" $c }}
+{{- end }}

@@ -1,0 +1,164 @@
+# A full Stowage project: every spec key in use. "atlas" is a fictional stack — an API, an ingest
+# service and a console behind the front, an optional search extension, CalVer releases.
+apiVersion: stowage/v1
+name: atlas
+short_name: at               # the installer at-stow: short_name differs from name
+
+stowage:
+  requires: ">=0.1 <1"            # exact runtime pinned in stowage.lock
+
+version:
+  source: { provider: changelog, file: CHANGELOG.md }        # first "## [x]" heading
+  scheme: { provider: calver, format: YYYY.M.MICRO, month_guard: utc }
+changelog: { provider: keepachangelog, file: CHANGELOG.md }
+channels:
+  stable: { tag: "v{v}", mutable: false, latest: true }       # moves installer :latest
+  dev:    { tag: "v{v}-dev", mutable: true }
+
+registry:
+  prefix: registry.example.com/atlas
+  pull: { provider: token, user: atlas-pull, token_env: STOWAGE_PULL_TOKEN }     # baked into installs
+  push: { provider: token, user: publisher, token_env: STOWAGE_PUSH_TOKEN }     # publisher only
+
+signing:
+  provider: cosign-key
+  key: env://ATLAS_SIGNING_KEY
+  public_keys: [keys/release-2026.pub]
+
+images:
+  api:
+    context: .
+    dockerfile: docker/api.Dockerfile
+    target: runtime
+    args: { FEATURES: "core,ingest" }
+    inputs: [server/, migrations/]
+  ingest:    { context: ., dockerfile: docker/ingest.Dockerfile, inputs: [server/] }
+  ui:        { context: ui, dockerfile: ui/Dockerfile }
+  provision: { context: provision, dockerfile: provision/Dockerfile }
+  postgres:  { ref: "postgres:17-alpine@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24" }
+
+stack:
+  compose: deploy/compose.yaml
+
+front:
+  tls_modes: [acme, dns-cloudflare, byo, internal, none]
+  routes:
+    - name: console
+      domain_input: CONSOLE_DOMAIN
+      upstream: ui:8080
+      strip_headers: [X-Auth-Request-*, X-Atlas-Tenant]
+    - name: api
+      domain_input: API_DOMAIN
+      upstream: api:9090
+      strip_headers: [X-Auth-Request-*, X-Atlas-Tenant]
+      # Off while AUTH_ADDRESS is empty; the answer's user header reaches the api.
+      forward_auth: { address_input: AUTH_ADDRESS, uri_input: AUTH_URI, copy_headers: [X-Auth-Request-User] }
+    - name: ingest
+      domain_input: INGEST_DOMAIN
+      upstream: ingest:8080
+      allow_input: INGEST_SOURCES                              # the senders' CIDRs
+  portal: console
+  loopback_ports: { console: 3000, api: 9090, ingest: 8080 }
+  loopback_env: { COOKIE_SECURE: "false", TRUSTED_PROXY_HOPS: "0" }
+  publish_ca: { volume: ca }                                    # the internal CA, or byo's --ca
+
+health:
+  provider: http-json
+  service: api
+  port: 9090
+  path: /ready
+  expect: { status: ready }
+  liveness_path: /health
+
+database:
+  engine: postgres
+  service: postgres
+  name: atlas
+  roles: { migrate: atlas, app: atlas_app }                   # two-URL contract
+  schema_compat:
+    provider: sql
+    current: "SELECT max(version) FROM schema_migrations WHERE success"
+    barrier_after: >-
+      SELECT string_agg(description, '; ' ORDER BY version) FROM schema_migrations
+      WHERE version > $1 AND description LIKE 'rollback barrier%'
+    reads_newer_label: com.example.atlas.reads-newer-schema   # "true" on an image that reads a newer schema
+    reads_newer_image: api                                    # the image that carries it
+    baseline: 1
+
+data:
+  volumes:
+    postgres: { uid: 70 }
+    spool:    { uid: 65532 }
+    certs:    { uid: 0, keep_on_reset: true }
+  reset: [postgres, spool]
+
+secrets:
+  - { key: ENCRYPTION_KEY,          gen: hex32 }
+  - { key: SESSION_SECRET,          gen: hex32 }
+  - { key: INTERNAL_SERVICE_SECRET, gen: hex32, rotation: true }   # secrets rotate
+  - { key: POSTGRES_PASSWORD,       gen: pass18 }
+  - { key: APP_DB_PASSWORD,         gen: pass18 }
+
+safe_defaults:
+  COOKIE_SECURE: "true"
+  TRUSTED_PROXY_HOPS: "1"
+
+inputs:
+  - { key: SUPPORT_EMAIL,     prompt: "Support address shown on the public site", when: tls, shapes: [docker, kairos] }
+  - { key: ADMIN_EMAIL,       prompt: "Administrator email",      required: true }
+  - { key: ORG_NAME,          prompt: "Organisation name",        required: true }
+  - { key: UPSTREAM_API_KEY,  prompt: "Upstream API key",         secret: true, optional: true }
+  - { key: SEARCH_URL,        prompt: "Search service URL (empty: no search)", optional: true }
+  - { key: SEARCH_KEY,        prompt: "Search service key",       secret: true, optional: true }
+  - { key: INGEST_SOURCES,    prompt: "Addresses allowed to send events (CIDRs; empty refuses everyone)", default: "0.0.0.0/0, ::/0", shapes: [docker, kairos] }
+  - { key: AUTH_ADDRESS,      prompt: "Authentication service of the api route, host:port", advanced: true, shapes: [docker, kairos] }
+  - { key: AUTH_URI,          prompt: "Path the authentication service is asked at", advanced: true, shapes: [docker, kairos] }
+  - { key: LOG_LEVEL,         prompt: "Log level (debug, info, warning)", advanced: true }
+  # Kubernetes: the database is external or embedded by the chart's postgres.mode value
+  # (embedded: these two URLs are left empty).
+  - { key: DATABASE_URL,      prompt: "Migration database URL (external Postgres)", secret: true, optional: true, shapes: [kubernetes] }
+  - { key: APP_DATABASE_URL,  prompt: "Application database URL (external Postgres)", secret: true, optional: true, shapes: [kubernetes] }
+  - { key: ADMIN_PASSWORD,    prompt: "Administrator password",   secret: true, required: true, shapes: [kubernetes] }
+
+hooks:
+  provision:
+    provider: container
+    image: provision
+    cmd: [provision.py]
+    env: [ADMIN_EMAIL, ADMIN_PASSWORD, INTERNAL_SERVICE_SECRET]   # all it receives, with what it returned before
+    returns: [ADMIN_API_KEY, ADMIN_LOGIN]                       # provision --set gives one it has not returned
+    outputs: credentials.txt
+  maintenance:
+    disk_pressure:
+      soft_pct: 75
+      hard_pct: 90
+      post: http://api:9090/api/v1/maintenance/purge
+      auth_secret: INTERNAL_SERVICE_SECRET
+
+# Search is an app of its own, published beside atlas: an install takes its URL (and its key).
+extensions:
+  - { name: atlas-search, input: SEARCH_URL, key_input: SEARCH_KEY, prompt: "Full-text search over the events" }
+
+# When another project uses atlas as an extension, the api route is the endpoint it is given.
+endpoint: api
+
+backup:
+  provider: pg-age-rclone
+  default_profile: full
+  profiles:
+    full: all
+    config: [organisations, users, api_keys, settings]
+    lean: { exclude: [events, "audit_*"] }
+
+shapes:
+  docker: {}
+  kubernetes:
+    chart: deploy/chart
+    postgres_modes: [embedded, external]
+  kairos:
+    base: ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55
+    kairos_init: quay.io/kairos/kairos-init:v0.16.2@sha256:0777266d25e31b653deaaaa084d4e27d98f7a55e82e42f0648e2ba9c756b8664
+    disk_formats: [raw, qcow2, ova, vhd, gce]
+    cloud_publish: [aws, azure, gcp]
+    health_gate: { deadline_s: 600, deadline_after_reset_s: 1800, poll_s: 30 }
+    host_api: [api]

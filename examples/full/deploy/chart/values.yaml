@@ -1,0 +1,16 @@
+# The atlas chart's own settings. Stowage's ship adds a `stowage:` block at the end of this file in
+# the packaged chart (the release's images by digest), and `at-stow k8s` gives the names of the
+# Secret holding the secrets and inputs (stowage.secret) and of the pull Secret (stowage.pullSecret).
+api:
+  replicas: 2              # the api migrates at start, under a lock: replicas never race
+ingest:
+  replicas: 1
+ui:
+  replicas: 1
+postgres:
+  # embedded: a single-pod StatefulSet of the release's postgres image, for evaluation; its
+  #   password is the generated POSTGRES_PASSWORD, the app role's APP_DB_PASSWORD.
+  # external: a database outside the release, named by the inputs DATABASE_URL (a role that may
+  #   create roles: the api creates the app role) and APP_DATABASE_URL.
+  mode: embedded
+  storage: 1Gi

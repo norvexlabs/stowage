@@ -1,0 +1,15 @@
+[Unit]
+Description={{.Name}}: health gate (marks an upgraded boot good, or reboots into the passive slot)
+# Wants, not Requires: a boot that failed to bring the install up fails the gate too.
+Wants={{.Name}}.service
+After={{.Name}}.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/{{.Ctl}} health-gate
+# The gate bounds itself: shapes.kairos.health_gate's deadline, then the diagnostics.
+TimeoutStartSec=infinity
+
+[Install]
+WantedBy=multi-user.target

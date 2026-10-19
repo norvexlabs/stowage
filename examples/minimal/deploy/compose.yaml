@@ -1,0 +1,41 @@
+# The single service definition of the notes stack. Images come only through
+# ${STOWAGE_IMAGE_<KEY>}; the TLS front is added by Stowage.
+services:
+  postgres:
+    image: ${STOWAGE_IMAGE_POSTGRES}
+    environment:
+      POSTGRES_DB: notes
+      POSTGRES_USER: notes
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U notes -d notes"]
+      interval: 5s
+      retries: 20
+    restart: unless-stopped
+
+  api:
+    image: ${STOWAGE_IMAGE_API}
+    environment:
+      DATABASE_URL: postgres://notes:${POSTGRES_PASSWORD}@postgres:5432/notes
+      SESSION_SECRET: ${SESSION_SECRET}
+      SECURE_COOKIES: ${SECURE_COOKIES:-true}
+      PUBLIC_URL: ${STOWAGE_URL_APP}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    volumes:
+      - uploads:/data/uploads
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  web:
+    image: ${STOWAGE_IMAGE_WEB}
+    environment:
+      API_URL: ${STOWAGE_URL_API}
+    restart: unless-stopped
+
+volumes:
+  postgres: {}
+  uploads: {}

@@ -1,0 +1,11 @@
+#!/bin/sh
+# Refuses a commit whose author or committer is not the project identity in .githooks/identity.
+set -eu
+want=$(cat "$(git rev-parse --show-toplevel)/.githooks/identity")
+for who in AUTHOR COMMITTER; do
+  got=$(git var "GIT_${who}_IDENT" | sed 's/ [0-9]* [-+][0-9]*$//')
+  if [ "$got" != "$want" ]; then
+    echo "pre-commit: the $(echo "$who" | tr A-Z a-z) is '$got'; commits are made as '$want' (make hooks)" >&2
+    exit 1
+  fi
+done

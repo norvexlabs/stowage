@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+# End-to-end test of examples/full (atlas) on the Kairos shape, a real VM on TrueNAS: this month's
+# signed CalVer release crosses to a TLS mirror of its own CA; `vm create --create opentofu` boots
+# its disk, whose first boot installs it from the cloud-config's settings with the search
+# extension's input set (to the api itself, standing in for a search service); the provision hook registers the administrator through the api; the api reaches the host
+# daemon's app socket and reads the front's local CA; an event goes through ingest; then `vm
+# destroy`. Upgrade, rollback and the health gate's fallback are the VM machinery's: e2e-vm. Needs
+# what e2e-vm needs: Docker (privileged containers, loop devices), network access, about 15 GB
+# on disk under XDG_CACHE_HOME, OpenTofu's `tofu`, ssh, and a TrueNAS host.
+#
+#   STOWAGE_VM_ENV=<file> make e2e-full-vm        (builds ./bin/stowage first)
+#
+# The file is the one e2e-vm reads (test/vm.sh, vm_env), never copied or printed.
+set -euo pipefail
+
+# The amd64 image of the example's postgres: the one e2e-docker mirrors.
+PG=postgres:17-alpine@sha256:aa90e97ee862e558111d34cfb8b2c4bec768c2b039fb791341686928560263b3
+. "$(dirname "$0")/vm.sh"
+vm_env
+. "$(dirname "$0")/lib.sh"
+
+# status <field>…: those fields of one answer of the api's /api/v1/status, through the VM's front,
+# joined by /.
+status() {
+	curl -sfk --max-time 10 --resolve "api.atlas.test:443:$IP" https://api.atlas.test/api/v1/status |
+		python3 -c 'import json,sys; s=json.load(sys.stdin); print("/".join(str(s[k]) for k in sys.argv[1:]))' "$@"
+}
+# atlas_on <version> <schema>: the api answers as that release on that migration, within 5
+# minutes; the console and ingest routes serve.
+atlas_on() {
+	local got="" end=$((SECONDS + 300))
+	while ((SECONDS < end)); do
+		got=$(status version schema 2>/dev/null) || true
+		[[ $got == "$1/$2" ]] && break
+		sleep 5
+	done
+	[[ $got == "$1/$2" ]] || { on_vm at-stow ps >&2 || true; fail "the api answers $got (version/migration), want $1/$2"; }
+	[[ $(curl -sfk --max-time 10 --resolve "console.atlas.test:443:$IP" https://console.atlas.test/) == *'<title>Atlas'* ]] ||
+		fail "the console route does not serve the ui"
+	[[ $(curl -sk -o /dev/null -w '%{http_code}' --max-time 10 --resolve "ingest.atlas.test:443:$IP" https://ingest.atlas.test/health) == 200 ]] ||
+		fail "the ingest route does not serve"
+}
+
+step "start zot"
+start_zot
+
+step "project: examples/full with its kairos shape, a qcow2 disk, a short health gate"
+KAIROS=1 new_full "$PG"
+V1=$CALVER.1
+sed -i 's/^    disk_formats: \[raw, qcow2, ova, vhd, gce\]$/    disk_formats: [qcow2]/; s/^    health_gate: { deadline_s: 600, /    health_gate: { deadline_s: 300, /' "$P/stowage.yaml"
+grep -qx '    disk_formats: \[qcow2\]' "$P/stowage.yaml" && grep -q '^    health_gate: { deadline_s: 300, ' "$P/stowage.yaml" || fail "the kairos shape was not edited"
+"${S[@]}" lint
+
+step "ship $V1: images, the OS bundle, its disk"
+"${S[@]}" ship --channel stable 2>"$WORK/ship-$V1.log" || { tail -50 "$WORK/ship-$V1.log"; fail "ship $V1"; }
+grep -q "disk qcow2: tag .* → v$V1-qcow2" "$WORK/ship-$V1.log" || { grep -i disk "$WORK/ship-$V1.log"; fail "the qcow2 disk was not tagged"; }
+
+step "the published at-stow, the site's mirror, $V1 in it"
+vm_ctl "v$V1"
+vm_mirror
+mirror "$WORK/r1.oci.tar"
+grep -q "^Exported atlas $V1" "$WORK/r1.oci.tar.txt" || { cat "$WORK/r1.oci.tar.txt"; fail "export of $V1"; }
+
+step "vm create with OpenTofu on TrueNAS, from the mirror, search set: it boots and installs"
+vm_names
+vm_cleanup
+"$CTL" vm create --no-input --platform truenas --create opentofu --hostname "$H" --user ops --ssh-key "$KEY.pub" \
+	--tls internal --domains console=console.atlas.test,api=api.atlas.test,ingest=ingest.atlas.test \
+	--set ADMIN_EMAIL=admin@atlas.test --set ORG_NAME=Atlas --set SUPPORT_EMAIL=support@atlas.test --set SEARCH_URL=http://api:9090 \
+	--pool "$POOL" --dataset "$DATASET" --bridge "$BRIDGE" --cpus 2 --memory 4096 --disk 32 --host "$ADDR" --wait "${E2E_VM_WAIT:-30m}" \
+	--registry "$SITE" --registry-ca "$MIRROR_CA" \
+	>"$WORK/vm-create.txt" 2>"$WORK/vm-create.log" || { tail -80 "$WORK/vm-create.log"; fail "vm create"; }
+grep -q "^The VM $H runs atlas $V1" "$WORK/vm-create.txt" || { cat "$WORK/vm-create.txt"; fail "vm create did not report the install"; }
+! grep -rqF -- "$TRUENAS_API_KEY" "$STATE" || fail "the API key is in the VM's state"
+IP=$(getent hosts "$ADDR" | awk '{print $1; exit}')
+[[ -n $IP ]] || fail "$ADDR does not resolve"
+
+step "on the VM: $V1 runs from the mirror, the administrator registered, search set"
+on_vm at-stow status >"$WORK/status.txt" || fail "status over SSH"
+grep -q "^installed  atlas $V1 (revision 1)" "$WORK/status.txt" && grep -q '^channel    stable' "$WORK/status.txt" ||
+	{ cat "$WORK/status.txt"; fail "status does not show the install"; }
+atlas_on "$V1" 1
+[[ $(status organisation admins search) == Atlas/1/True ]] || fail "the api answers $(status organisation admins search) (organisation/admins/search), want Atlas/1/True"
+on_vm sudo cat /usr/local/atlas/.env >"$WORK/vm.env"
+grep -qx "STOWAGE_REGISTRY='$SITE'" "$WORK/vm.env" || fail "the install does not record the mirror"
+grep -qx "SEARCH_URL='\{0,1\}http://api:9090'\{0,1\}" "$WORK/vm.env" || fail "the install does not record SEARCH_URL"
+on_vm sudo grep -qE "'^ADMIN_PASSWORD=[A-Za-z0-9]{20}$'" /usr/local/atlas/credentials.txt || fail "the hook's outputs file holds no credentials"
+[[ $(on_vm sudo stat -c %a /usr/local/atlas/credentials.txt) == 600 ]] || fail "the credentials file is not 0600"
+
+step "on the VM: the api reaches the host daemon's app socket; an event goes through ingest"
+api=$(on_vm sudo docker ps -q --filter label=com.docker.compose.service=api)
+on_vm sudo docker inspect --format "'{{range .Mounts}}{{.Source}}:{{.Destination}}:{{.RW}}{{println}}{{end}}'" "$api" |
+	grep -qx '/run/atlas/app:/run/stowage-host:false' || fail "the api service does not mount the app directory read-only"
+# The front's local CA reaches the api (front.publish_ca): a client trusting it alone reaches the
+# api route.
+on_vm sudo docker exec "$api" cat /etc/atlas/ca/ca.crt >"$WORK/vm-ca.crt" && grep -q 'BEGIN CERTIFICATE' "$WORK/vm-ca.crt" || fail "the api reads no CA"
+curl -sf --max-time 10 --cacert "$WORK/vm-ca.crt" --resolve "api.atlas.test:443:$IP" https://api.atlas.test/health >/dev/null ||
+	fail "the api route's certificate does not chain to the CA the front published"
+code=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 10 --resolve "ingest.atlas.test:443:$IP" -X POST -H 'Content-Type: application/json' -d '{"kind": "probe"}' https://ingest.atlas.test/events)
+[[ $code == 201 ]] || fail "ingest answered $code to an event"
+[[ $(status events) == 1 ]] || fail "the ingested event did not reach the api"
+
+step "vm destroy: the VM, its disk and its uploads go, and its state"
+"$CTL" vm destroy "$H" --yes >"$WORK/vm-destroy.txt" 2>"$WORK/vm-destroy.log" || { tail -50 "$WORK/vm-destroy.log"; fail "vm destroy"; }
+grep -q "^Destroyed $H" "$WORK/vm-destroy.txt" || fail "vm destroy did not report"
+[[ ! -e $STATE ]] || fail "the VM's state is left"
+
+printf '\nPASS\n'

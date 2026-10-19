@@ -1,0 +1,14 @@
+[Unit]
+Description={{.Name}}: the network override of `{{.Ctl}} network`, before networkd starts
+DefaultDependencies=no
+After=local-fs.target
+Before=network-pre.target systemd-networkd.service
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/{{.Ctl}} network-boot
+
+[Install]
+WantedBy=multi-user.target

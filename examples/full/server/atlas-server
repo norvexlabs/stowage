@@ -1,0 +1,245 @@
+#!/usr/bin/env python3
+"""Stand-in services of the full example: just enough to exercise the Stowage contracts for real.
+
+api [port]     migrates the database (DATABASE_URL, the migrate role) with migrations/*.sql and
+               creates the app role APP_DATABASE_URL names, in one session under an advisory lock
+               (replicas starting together do not race), then serves as that role: liveness on
+               /health, readiness on /ready ({"status": "ready"} once the app role reads the
+               database), /api/v1/status (search: whether SEARCH_URL answers; false while it is empty), the admin the
+               provision hook registers (with its API key, which GET /api/v1/key checks: the key as
+               the bearer token, 401 when unknown), ingested events and the disk-pressure purge (each POST
+               with Authorization: Bearer INTERNAL_SERVICE_SECRET, or its _NEXT or _PREVIOUS value
+               while it rotates); /api/v1/auth, a forward-auth endpoint (200 naming the user of
+               X-Atlas-User in X-Auth-Request-User, else 401), and /api/v1/whoami (the
+               X-Auth-Request-User it was given)
+ingest [port]  liveness on /health; POST /events forwards the body to the api
+probe <port>   exits 0 when http://127.0.0.1:<port>/health answers 200 (the compose healthchecks)
+
+A migration is recorded in schema_migrations (version, description, success); one whose first
+line is `-- rollback barrier: <why>` is recorded with the description `rollback barrier: <why>`,
+which the spec's schema_compat query reads.
+"""
+import glob
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import urllib.parse
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+MIGRATIONS = os.environ.get("ATLAS_MIGRATIONS", "/srv/migrations")
+SECRET = os.environ.get("INTERNAL_SERVICE_SECRET", "")
+# The values accepted: the secret, and while it rotates the staged and the previous one.
+ACCEPTED = [v for v in (SECRET, os.environ.get("INTERNAL_SERVICE_SECRET_NEXT", ""),
+                        os.environ.get("INTERNAL_SERVICE_SECRET_PREVIOUS", "")) if v]
+SEARCH_URL = os.environ.get("SEARCH_URL", "")
+# psql's errors when the database is not reachable yet.
+UNREACHABLE = re.compile(r"could not translate host name|could not connect to server|Connection refused|Connection timed out|"
+                         r"timeout expired|No route to host|Network is unreachable|server closed the connection unexpectedly|"
+                         r"the database system is (starting up|shutting down|not yet accepting connections|in recovery mode)")
+
+
+def log(*a):
+    print(*a, file=sys.stderr, flush=True)
+
+
+class PsqlError(RuntimeError):
+    """psql failed: the message holds what the script printed before the error (the migrations it
+    committed), then the error; .stderr the error alone."""
+
+    def __init__(self, stdout, stderr):
+        super().__init__("\n".join(x for x in (stdout, stderr) if x))
+        self.stderr = stderr
+
+
+def psql(url, sql, *params, timeout=30):
+    """Runs sql through psql with url's role; params are bound as :'p1', :'p2', … ."""
+    args = ["psql", url, "-X", "-q", "-t", "-A", "-v", "ON_ERROR_STOP=1"]
+    for i, p in enumerate(params, 1):
+        args += ["-v", f"p{i}={p}"]
+    env = {**os.environ, "PGCONNECT_TIMEOUT": "10"}
+    try:
+        r = subprocess.run(args, input=sql, capture_output=True, text=True, timeout=timeout, env=env)
+    except subprocess.TimeoutExpired:
+        raise PsqlError("", f"psql did not finish in {timeout} s")
+    if r.returncode != 0:
+        raise PsqlError(r.stdout.strip(), r.stderr.strip())
+    return r.stdout.strip()
+
+
+def migrate():
+    """One psql session holding an advisory lock: replicas starting together migrate one at a time,
+    and each later one finds the migrations recorded."""
+    db, app = os.environ["DATABASE_URL"], urllib.parse.urlsplit(os.environ["APP_DATABASE_URL"])
+    params = [urllib.parse.unquote(app.username), urllib.parse.unquote(app.password or ""), os.environ.get("ORG_NAME", "")]
+    script = ["SELECT pg_advisory_lock(7302) \\gset",
+              "CREATE TABLE IF NOT EXISTS schema_migrations (version bigint PRIMARY KEY, description text NOT NULL, success boolean NOT NULL);"]
+    for path in sorted(glob.glob(os.path.join(MIGRATIONS, "*.sql"))):
+        n = int(re.match(r"(\d+)_", os.path.basename(path)).group(1))
+        text = open(path).read()
+        first = text.splitlines()[0] if text else ""
+        m = re.match(r"--\s*rollback barrier:\s*(.*)", first)
+        params.append(f"rollback barrier: {m.group(1)}" if m else os.path.basename(path))
+        d = f"p{len(params)}"
+        script += [f"SELECT NOT EXISTS (SELECT FROM schema_migrations WHERE version = {n} AND success) AS pending \\gset",
+                   "\\if :pending", "BEGIN;", text, f"INSERT INTO schema_migrations VALUES ({n}, :'{d}', true);", "COMMIT;",
+                   f"\\echo migrated to {n}: :{d}", "\\endif"]
+    # The app role: the one APP_DATABASE_URL names, with its password, reading and writing the data.
+    script += ["SELECT format('CREATE ROLE %I LOGIN', :'p1') WHERE NOT EXISTS (SELECT FROM pg_roles WHERE rolname = :'p1') \\gexec",
+               "SELECT format('ALTER ROLE %I PASSWORD %L', :'p1', :'p2') \\gexec",
+               "SELECT format('GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO %I', :'p1') \\gexec",
+               "SELECT format('GRANT USAGE ON ALL SEQUENCES IN SCHEMA public TO %I', :'p1') \\gexec",
+               "INSERT INTO organisations (name) SELECT :'p3' WHERE :'p3' <> '' ON CONFLICT DO NOTHING;"]
+    out = psql(db, "\n".join(script) + "\n", *params, timeout=300)
+    if out:
+        log(out)
+
+
+class Handler(BaseHTTPRequestHandler):
+    def reply(self, code, body, headers=None):
+        raw = json.dumps(body).encode()
+        self.send_response(code)
+        for k, v in (headers or {}).items():
+            self.send_header(k, v)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def body(self):
+        return self.rfile.read(int(self.headers.get("Content-Length", 0)))
+
+    def authorized(self):
+        return self.headers.get("Authorization") in [f"Bearer {v}" for v in ACCEPTED]
+
+    def log_message(self, fmt, *a):
+        log(fmt % a)
+
+
+class API(Handler):
+    def do_GET(self):
+        app = os.environ["APP_DATABASE_URL"]
+        if self.path == "/health":
+            return self.reply(200, {"status": "alive"})
+        if self.path == "/api/v1/auth":
+            user = self.headers.get("X-Atlas-User", "")
+            if re.fullmatch(r"[a-z]+", user):
+                return self.reply(200, {"user": user}, {"X-Auth-Request-User": user})
+            return self.reply(401, {"error": "unauthorized"})
+        if self.path == "/api/v1/whoami":
+            return self.reply(200, {"user": self.headers.get("X-Auth-Request-User", "")})
+        try:
+            if self.path == "/api/v1/key":
+                # The owner of the API key given as the bearer token; 401 for a key the api does not know.
+                key = (self.headers.get("Authorization") or "").removeprefix("Bearer ")
+                owner = psql(app, "SELECT owner FROM api_keys WHERE key_sha256 = encode(sha256(convert_to(:'p1', 'UTF8')), 'hex') LIMIT 1", key)
+                return self.reply(200, {"owner": owner}) if owner else self.reply(401, {"error": "unknown key"})
+            if self.path == "/ready":
+                psql(app, "SELECT count(*) FROM organisations")
+                return self.reply(200, {"status": "ready"})
+            if self.path == "/api/v1/status":
+                # One query: one answer reads one state of the database.
+                db = json.loads(psql(app, """SELECT json_build_object(
+  'schema', (SELECT coalesce(max(version), 0) FROM schema_migrations WHERE success),
+  'organisation', (SELECT coalesce(string_agg(name, ',' ORDER BY name), '') FROM organisations),
+  'admins', (SELECT count(*) FROM users WHERE admin),
+  'events', (SELECT count(*) FROM events))"""))
+                return self.reply(200, {"version": os.environ.get("ATLAS_VERSION", "dev"), **db, "search": search_up()})
+        except Exception as e:
+            return self.reply(503, {"status": "not ready", "error": str(e)})
+        self.reply(404, {"error": "not found"})
+
+    def do_POST(self):
+        if not self.authorized():
+            return self.reply(401, {"error": "unauthorized"})
+        app = os.environ["APP_DATABASE_URL"]
+        try:
+            data = json.loads(self.body() or b"{}")
+            if self.path == "/api/v1/admin":
+                psql(app, """INSERT INTO users (email, password_sha256, admin) VALUES (:'p1', encode(sha256(convert_to(:'p2', 'UTF8')), 'hex'), true)
+ON CONFLICT (email) DO UPDATE SET password_sha256 = excluded.password_sha256, admin = true""", data["email"], data["password"])
+                if data.get("api_key"):
+                    psql(app, """INSERT INTO api_keys (owner, key_sha256) SELECT :'p1', encode(sha256(convert_to(:'p2', 'UTF8')), 'hex')
+WHERE NOT EXISTS (SELECT 1 FROM api_keys WHERE owner = :'p1' AND key_sha256 = encode(sha256(convert_to(:'p2', 'UTF8')), 'hex'))""", data["email"], data["api_key"])
+                return self.reply(200, {"admin": data["email"]})
+            if self.path == "/api/v1/events":
+                psql(app, "INSERT INTO events (body) VALUES (:'p1')", json.dumps(data))
+                return self.reply(201, {"stored": True})
+            if self.path == "/api/v1/maintenance/purge":
+                n = psql(app, "WITH d AS (DELETE FROM events WHERE id IN (SELECT id FROM events ORDER BY id LIMIT 1000) RETURNING 1) SELECT count(*) FROM d")
+                log(f"disk pressure {data.get('level')}: purged {n} events")
+                return self.reply(200, {"purged": int(n)})
+        except Exception as e:
+            return self.reply(500, {"error": str(e)})
+        self.reply(404, {"error": "not found"})
+
+
+def search_up():
+    if not SEARCH_URL:
+        return False
+    try:
+        with urllib.request.urlopen(f"{SEARCH_URL}/health", timeout=1) as r:
+            return r.status == 200
+    except Exception:
+        return False
+
+
+class Ingest(Handler):
+    def do_GET(self):
+        if self.path == "/health":
+            return self.reply(200, {"status": "alive"})
+        self.reply(404, {"error": "not found"})
+
+    def do_POST(self):
+        if self.path != "/events":
+            return self.reply(404, {"error": "not found"})
+        req = urllib.request.Request(f"{os.environ['API_URL']}/api/v1/events", data=self.body(), method="POST",
+                                     headers={"Content-Type": "application/json", "Authorization": f"Bearer {SECRET}"})
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                return self.reply(r.status, json.load(r))
+        except Exception as e:
+            return self.reply(502, {"error": str(e)})
+
+
+def main():
+    role = sys.argv[1] if len(sys.argv) > 1 else "api"
+    if role == "probe":
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{sys.argv[2]}/health", timeout=2) as r:
+                sys.exit(0 if r.status == 200 else 1)
+        except Exception:
+            sys.exit(1)
+    if role == "api":
+        for k in ("DATABASE_URL", "APP_DATABASE_URL"):
+            if not os.environ.get(k):
+                sys.exit(f"{k} is empty: give it (on Kubernetes, postgres.mode external takes it as an input)")
+        # The database may still be starting (a pod starts beside it): a connection that fails is
+        # tried again for 280 s; any other error ends the api at once. With the session's own bound
+        # (300 s), that fits the chart's startup probe (600 s).
+        deadline = time.monotonic() + 280
+        while True:
+            try:
+                migrate()
+                break
+            except PsqlError as e:
+                if not UNREACHABLE.search(e.stderr) or time.monotonic() > deadline:
+                    sys.exit(f"migrate: {e}")
+                log(f"migrate: {e}; trying again")
+                time.sleep(2)
+        handler, port = API, 9090
+    elif role == "ingest":
+        handler, port = Ingest, 8080
+    else:
+        sys.exit(f"unknown role {role}: api, ingest or probe")
+    if len(sys.argv) > 2:
+        port = int(sys.argv[2])
+    log(f"atlas {role} {os.environ.get('ATLAS_VERSION', 'dev')} on :{port}")
+    ThreadingHTTPServer(("", port), handler).serve_forever()
+
+
+if __name__ == "__main__":
+    main()

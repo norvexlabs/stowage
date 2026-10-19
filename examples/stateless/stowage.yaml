@@ -1,0 +1,51 @@
+# A stateless app: one pulled image behind the front, nothing built, no database (so no
+# schema_compat, data.reset, backup or reset-db). Another project uses it as an extension: its
+# endpoint is the lookup route.
+apiVersion: stowage/v1
+name: lookup
+
+stowage:
+  requires: ">=0.1 <1"
+
+version:
+  source: { provider: changelog, file: CHANGELOG.md }
+  scheme: { provider: semver }
+changelog: { provider: keepachangelog, file: CHANGELOG.md }
+channels:
+  stable: { tag: "v{v}", mutable: false, latest: true }
+  dev:    { tag: "dev-{v}", mutable: true }                   # a suffix would collide with SemVer pre-releases
+
+registry:
+  prefix: registry.example.com/acme
+  pull: { provider: none }                                     # public images
+  push: { provider: token, user: publisher, token_env: STOWAGE_PUSH_TOKEN }
+
+images:
+  server: { ref: "busybox:1.37@sha256:bdf57e528e45e4433820e045b29b4597825a1c9e38353532d90a01445013f82e" }
+
+stack:
+  compose: deploy/compose.yaml
+
+front:
+  tls_modes: [acme, internal, none]
+  routes:
+    - { name: lookup, domain_input: LOOKUP_DOMAIN, upstream: server:8080 }
+  portal: lookup
+  loopback_ports: { lookup: 8090 }
+
+health:
+  provider: http-status
+  service: server
+  port: 8080
+  path: /health
+  expect: 200
+
+inputs:
+  - { key: GREETING, prompt: "What the lookup page says", default: "hello" }
+
+# The URL a project using lookup as an extension is given.
+endpoint: lookup
+
+shapes:
+  docker: {}
+  kubernetes: { chart: deploy/chart }                          # no postgres_modes: no database

@@ -1,0 +1,1135 @@
+// Package lint checks a project's stowage.yaml and the files it names, so a spec defect is found
+// at ship time rather than on an operator's host.
+package lint
+
+import (
+	"crypto/x509"
+	"encoding/pem"
+	"fmt"
+	"maps"
+	"os"
+	"path/filepath"
+	"regexp"
+	"slices"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/norvexlabs/stowage/internal/changelog"
+	"github.com/norvexlabs/stowage/internal/digest"
+	"github.com/norvexlabs/stowage/internal/dockerfile"
+	"github.com/norvexlabs/stowage/internal/helm"
+	"github.com/norvexlabs/stowage/internal/lock"
+	"github.com/norvexlabs/stowage/internal/providers"
+	"github.com/norvexlabs/stowage/internal/spec"
+	"github.com/norvexlabs/stowage/internal/version"
+)
+
+// Severity of a finding. Any Error fails `stowage lint` and blocks `stowage ship`.
+type Severity string
+
+const (
+	Error   Severity = "error"
+	Warning Severity = "warning"
+)
+
+// Finding is one lint result. Where is a spec key path or a file:line.
+type Finding struct {
+	Severity Severity `json:"severity"`
+	Where    string   `json:"where"`
+	Message  string   `json:"message"`
+}
+
+func (f Finding) String() string { return fmt.Sprintf("%s: %s: %s", f.Severity, f.Where, f.Message) }
+
+// Result is a lint run's findings plus what it resolved on the way.
+type Result struct {
+	Findings []Finding `json:"findings"`
+	Version  string    `json:"version,omitempty"`
+}
+
+// Errors counts the error findings.
+func (r *Result) Errors() int {
+	n := 0
+	for _, f := range r.Findings {
+		if f.Severity == Error {
+			n++
+		}
+	}
+	return n
+}
+
+type linter struct {
+	root     string
+	s        *spec.Spec
+	now      time.Time
+	findings []Finding
+	compose  *Compose
+	scheme   version.Scheme
+	version  string
+	// releasable: the version validated and its tag can be released; schemeFailed: the scheme
+	// could not answer (as opposed to refusing the version).
+	releasable   bool
+	schemeFailed bool
+}
+
+func (l *linter) errf(where, format string, args ...any) {
+	l.findings = append(l.findings, Finding{Error, where, fmt.Sprintf(format, args...)})
+}
+
+func (l *linter) warnf(where, format string, args ...any) {
+	l.findings = append(l.findings, Finding{Warning, where, fmt.Sprintf(format, args...)})
+}
+
+var (
+	imageKeyRe  = regexp.MustCompile(`^[a-z0-9]+(?:[._-][a-z0-9]+)*$`)
+	imageNameRe = regexp.MustCompile(`^[a-z0-9]+(?:-[a-z0-9]+)*$`)
+	pinnedRe    = regexp.MustCompile(`^[^@\s]+@sha256:[0-9a-f]{64}$`)
+	prefixRe    = regexp.MustCompile(`^(?:[a-z0-9.-]+|\[[0-9a-f:]+\])(?::[0-9]+)?(?:/[a-z0-9]+(?:[._-][a-z0-9]+)*)*$`)
+	upstreamRe  = regexp.MustCompile(`^([a-z0-9][a-z0-9_.-]*):([0-9]{1,5})$`)
+	imageVarRe  = regexp.MustCompile(`^\$\{([A-Z0-9_]+)\}$`)
+)
+
+// Run lints the spec at specPath with paths relative to root. now feeds the scheme's commit guard.
+func Run(root, specPath string, now time.Time) (*Result, error) {
+	s, err := spec.Load(specPath)
+	if err != nil {
+		return nil, err
+	}
+	// Providers resolve paths against the root, and a command provider runs from it.
+	if root, err = filepath.Abs(root); err != nil {
+		return nil, err
+	}
+	l := &linter{root: root, s: s, now: now}
+	l.name()
+	l.versioning()
+	l.channels()
+	l.registry()
+	l.images()
+	l.stack()
+	l.front()
+	l.healthAndDatabase()
+	l.data()
+	l.secretsAndInputs()
+	l.hooks()
+	l.shapes()
+	l.lockFile(filepath.Join(filepath.Dir(specPath), lock.FileName))
+	sort.SliceStable(l.findings, func(i, j int) bool {
+		return l.findings[i].Severity == Error && l.findings[j].Severity != Error
+	})
+	return &Result{Findings: l.findings, Version: l.version}, nil
+}
+
+func (l *linter) exists(where, rel string, dir bool) bool {
+	if rel == "" {
+		l.errf(where, "is required")
+		return false
+	}
+	if err := spec.InsideRoot(rel); err != nil {
+		l.errf(where, "%s %v", rel, err)
+		return false
+	}
+	fi, err := os.Stat(spec.Path(l.root, rel))
+	if err != nil {
+		l.errf(where, "%s: %v", rel, err)
+		return false
+	}
+	if fi.IsDir() != dir {
+		kind := "a file"
+		if dir {
+			kind = "a directory"
+		}
+		l.errf(where, "%s is not %s", rel, kind)
+		return false
+	}
+	return true
+}
+
+// processVars are variables the docker CLI itself needs from its environment; an install's
+// recorded values take their place in that environment, so a project may not declare them.
+var processVars = map[string]bool{
+	"PATH": true, "HOME": true, "USER": true, "SHELL": true, "TMPDIR": true, "TERM": true, "LANG": true,
+	"HTTP_PROXY": true, "HTTPS_PROXY": true, "NO_PROXY": true, "ALL_PROXY": true,
+	"SSH_AUTH_SOCK": true, "XDG_CONFIG_HOME": true, "XDG_RUNTIME_DIR": true, "XDG_CACHE_HOME": true,
+	"TMP": true, "TEMP": true, "LC_ALL": true, "LANGUAGE": true, "TZ": true,
+	"SSL_CERT_FILE": true, "SSL_CERT_DIR": true, "GODEBUG": true, "GOMAXPROCS": true,
+	"LD_PRELOAD": true, "LD_LIBRARY_PATH": true,
+}
+
+// recordable checks a value the spec gives an install can be written to its .env as is.
+func (l *linter) recordable(where, v string) {
+	if err := spec.CheckEnvValue(v); err != nil {
+		l.errf(where, "%v", err)
+	}
+}
+
+func (l *linter) name() {
+	if !spec.NamePattern.MatchString(l.s.Name) {
+		l.errf("name", "%q must be 2–40 lowercase letters, digits or '-', starting with a letter", l.s.Name)
+	}
+	if l.s.ShortName != "" && !spec.NamePattern.MatchString(l.s.ShortName) {
+		l.errf("short_name", "%q must be 2–40 lowercase letters, digits or '-', starting with a letter", l.s.ShortName)
+	}
+	if short := l.s.Short(); short == "stowage" || strings.HasPrefix(short, "stowage-") {
+		key := "short_name"
+		if l.s.ShortName == "" {
+			key = "name"
+		}
+		l.errf(key, "%q gives the installer %s, a name the install directory keeps for Stowage's own files (stowage-*): set another short_name", short, providers.Ctl(short))
+	}
+	if l.s.Stowage.Requires == "" {
+		l.warnf("stowage.requires", "no accepted Stowage range declared")
+	}
+}
+
+func (l *linter) versioning() {
+	sch, err := version.NewScheme(l.root, l.s.Version.Scheme)
+	if err != nil {
+		l.errf("version.scheme", "%v", err)
+	}
+	src, err := version.NewSource(l.root, l.s.Version.Source)
+	if err != nil {
+		l.errf("version.source", "%v", err)
+	}
+	cl, err := changelog.New(l.root, l.s.Changelog)
+	if err != nil {
+		l.errf("changelog", "%v", err)
+	}
+	l.scheme = sch
+	if src == nil || sch == nil {
+		return
+	}
+	v, err := src.Get()
+	if err != nil {
+		l.errf("version.source", "%v", err)
+		return
+	}
+	if err := sch.Validate(v); err != nil {
+		l.errf("version.scheme", "%v", err)
+		l.schemeFailed = !version.IsInvalid(err)
+		return
+	}
+	l.version = v
+	if tag, err := sch.Tag(v); err != nil {
+		l.errf("version.scheme", "%v", err)
+	} else if err := version.CheckVersionTag(tag); err != nil {
+		l.errf("version.scheme", "%v", err)
+	} else {
+		l.releasable = true
+	}
+	if err := sch.Guard(v, l.now); err != nil {
+		l.warnf("version.scheme", "%v", err)
+	}
+	if cl == nil {
+		return
+	}
+	if _, ok, err := cl.Section(v); err != nil {
+		l.errf("changelog", "%v", err)
+	} else if !ok {
+		l.errf("changelog", "no section for the current version %s: operators would see an empty changelog", v)
+	}
+}
+
+func (l *linter) channels() {
+	if len(l.s.Channels) == 0 {
+		l.errf("channels", "at least one channel is required")
+		return
+	}
+	latest := 0
+	for _, name := range l.s.ChannelNames() {
+		c := l.s.Channels[name]
+		where := "channels." + name
+		if !ChannelName(name) {
+			l.errf(where, "channel name must be lowercase letters, digits, '.', '_' or '-', at most 128 characters")
+		}
+		if err := version.CheckTemplate(c.Tag); err != nil {
+			l.errf(where+".tag", "%v", err)
+		}
+		if c.Latest {
+			latest++
+			if c.Mutable {
+				l.warnf(where, "latest moves with a mutable channel: the installer :latest would follow rebuilt releases")
+			}
+		}
+	}
+	if latest > 1 {
+		l.errf("channels", "only one channel may move :latest")
+	}
+	if latest == 0 {
+		l.warnf("channels", "no channel sets latest: the bootstrap one-liner (installer :latest) never moves")
+	}
+	if l.scheme == nil || l.schemeFailed {
+		return // versioning() reported the scheme; asking it again would report it twice
+	}
+	var chs []version.Channel
+	for _, name := range l.s.ChannelNames() {
+		chs = append(chs, version.Channel{Name: name, Template: l.s.Channels[name].Tag})
+	}
+	conflicts, err := version.TemplateConflicts(chs, l.scheme, version.ReservedTags)
+	if err != nil {
+		// The scheme could not answer; the version-level check would ask it the same questions.
+		l.errf("channels", "cannot check the channels' tags: %v", err)
+		return
+	}
+	// A version that cannot be released is reported by versioning(); nothing to check here.
+	if l.releasable {
+		more, err := version.VersionConflicts(chs, l.scheme, l.version)
+		if err != nil {
+			l.errf("channels", "cannot check the channels' tags: %v", err)
+		}
+		conflicts = append(conflicts, more...)
+	}
+	for _, c := range conflicts {
+		l.errf("channels", "%s: every channel writes into the same repositories", c)
+	}
+}
+
+func (l *linter) registry() {
+	r := l.s.Registry
+	if r.Prefix == "" {
+		l.errf("registry.prefix", "is required: the registry is the single deployment point")
+	} else if strings.Contains(r.Prefix, "://") || !prefixRe.MatchString(r.Prefix) {
+		l.errf("registry.prefix", "%q must be <host>[:port][/path] with no scheme, tag or trailing slash", r.Prefix)
+	}
+	if err := providers.RegistryAuth(r.Pull, false); err != nil {
+		l.errf("registry.pull", "%v", err)
+	}
+	if err := providers.RegistryAuth(r.Push, true); err != nil {
+		l.errf("registry.push", "%v", err)
+	}
+	l.pullAccount()
+	if err := providers.Signing(l.s.Signing); err != nil {
+		l.errf("signing", "%v", err)
+	} else if l.s.Signs() {
+		c, _ := providers.CosignKey(l.s.Signing)
+		for i, k := range c.PublicKeys {
+			l.publicKey(fmt.Sprintf("signing.public_keys[%d]", i), k)
+		}
+	}
+}
+
+// publicKey checks a file holds a PEM public key cosign can verify with.
+func (l *linter) publicKey(where, rel string) {
+	if !l.exists(where, rel, false) {
+		return
+	}
+	data, err := os.ReadFile(spec.Path(l.root, rel))
+	if err != nil {
+		l.errf(where, "%s: %v", rel, err)
+		return
+	}
+	b, _ := pem.Decode(data)
+	if b == nil || b.Type != "PUBLIC KEY" {
+		l.errf(where, "%s is not a PEM public key (\"PUBLIC KEY\" block, as cosign generate-key-pair writes)", rel)
+		return
+	}
+	if _, err := x509.ParsePKIXPublicKey(b.Bytes); err != nil {
+		l.errf(where, "%s: %v", rel, err)
+	}
+}
+
+func (l *linter) images() {
+	if len(l.s.Images) == 0 {
+		l.errf("images", "at least one image is required")
+	}
+	for _, name := range l.s.ImageNames() {
+		img := l.s.Images[name]
+		where := "images." + name
+		if !imageNameRe.MatchString(name) {
+			// '-' is the only separator, so each key has its own STOWAGE_IMAGE_<KEY> variable.
+			l.errf(where, "image key must be lowercase letters and digits separated by single '-'")
+		}
+		if slices.Contains(spec.ReservedImageKeys, name) {
+			l.errf(where, "image key %q is reserved: %s-%s is where Stowage publishes its own artifacts", name, l.s.Name, name)
+		}
+		if !img.Built() {
+			if img.Context != "" || img.Dockerfile != "" || img.Target != "" || len(img.Args) > 0 || len(img.Inputs) > 0 {
+				l.errf(where, "ref and build fields are exclusive")
+			}
+			if !pinnedRe.MatchString(img.Ref) {
+				l.errf(where+".ref", "%q must be pinned by digest (<ref>@sha256:<64 hex>)", img.Ref)
+			}
+			continue
+		}
+		if l.exists(where+".context", img.Context, true) && l.exists(where+".dockerfile", img.Dockerfile, false) {
+			if ig, err := digest.DockerIgnore(spec.Path(l.root, img.Context), spec.Path(l.root, img.Dockerfile)); err != nil {
+				l.errf(where, "%v", err)
+			} else if g, err := digest.GitInContext(ig); err != nil {
+				l.errf(where+".context", "%v", err)
+			} else if g != "" {
+				rel, _ := filepath.Rel(l.root, g)
+				l.errf(where+".context", "%s: %v", rel, digest.ErrGitInContext)
+			}
+		}
+		if l.exists(where+".dockerfile", img.Dockerfile, false) {
+			stages := l.baseImages(where+".dockerfile", img.Dockerfile)
+			if img.Target != "" && stages != nil && !stages[strings.ToLower(img.Target)] {
+				l.errf(where+".target", "%q is not a stage of %s", img.Target, img.Dockerfile)
+			}
+		}
+		for i, in := range img.Inputs {
+			l.exists(fmt.Sprintf("%s.inputs[%d]", where, i), in, isDirHint(spec.Path(l.root, in)))
+		}
+	}
+}
+
+// baseImages requires every stage of a built image to start from an image pinned by digest (or
+// from an earlier stage, or scratch). The Dockerfile's bytes are part of the image's inputs
+// digest, so a pinned base is how a base-image update reaches the digest — and so the release.
+// It returns the Dockerfile's stage names (nil when unreadable).
+func (l *linter) baseImages(where, rel string) map[string]bool {
+	src, err := os.ReadFile(spec.Path(l.root, rel))
+	if err != nil {
+		l.errf(where, "%v", err)
+		return nil
+	}
+	parsed, err := dockerfile.Parse(src)
+	if err != nil {
+		l.errf(where, "%s: %v", rel, err)
+		return nil
+	}
+	if parsed.Frontend != "" {
+		l.warnf(where, "%s uses the frontend %s: its base images and stages cannot be checked", rel, parsed.Frontend)
+		return nil
+	}
+	froms := parsed.Froms()
+	stages := map[string]bool{}
+	for _, f := range froms {
+		at := fmt.Sprintf("%s:%d", rel, f.Line)
+		switch {
+		case stages[strings.ToLower(f.Image)], f.Image == "scratch", pinnedRe.MatchString(f.Image):
+		case strings.Contains(f.Image, "$"):
+			l.warnf(at, "FROM %s is set by a build argument: its pinning cannot be checked", f.Image)
+		default:
+			l.errf(at, "FROM %s must be pinned by digest (<image>:<tag>@sha256:<64 hex>): an unpinned base changes without changing the image's inputs digest, so a rebuild would never happen", f.Image)
+		}
+		if f.Stage != "" {
+			stages[f.Stage] = true
+		}
+	}
+	return stages
+}
+
+// isDirHint lets exists() check an input path whose kind the spec does not state.
+func isDirHint(p string) bool {
+	fi, err := os.Stat(p)
+	return err == nil && fi.IsDir()
+}
+
+// imageVars maps each STOWAGE_IMAGE_<KEY> variable to its images key.
+func (l *linter) imageVars() map[string]string {
+	m := map[string]string{}
+	for _, k := range l.s.ImageNames() {
+		m[ImageVar(k)] = k
+	}
+	return m
+}
+
+func (l *linter) stack() {
+	where := "stack.compose"
+	if !l.exists(where, l.s.Stack.Compose, false) {
+		return
+	}
+	c, err := ParseCompose(spec.Path(l.root, l.s.Stack.Compose))
+	if err != nil {
+		l.errf(where, "%v", err)
+		return
+	}
+	l.compose = c
+	file := l.s.Stack.Compose
+	if _, ok := c.TopLevel["name"]; ok {
+		l.errf(file, "top-level name: is set by Stowage per install (the project name), remove it")
+	}
+	if len(c.Services) == 0 {
+		l.errf(file, "declares no service")
+	}
+	for _, section := range []string{"volumes", "networks"} {
+		if m, ok := c.TopLevel[section].(map[string]any); ok {
+			for _, n := range sortedKeys(m) {
+				if strings.HasPrefix(n, "stowage-") {
+					l.errf(file+": "+section+"."+n, "names starting stowage- are Stowage's own (the front's data volume is stowage-front-data)")
+				}
+			}
+		}
+	}
+	imageVars := l.imageVars()
+	used := map[string]bool{}
+	for _, name := range sortedKeys(c.Services) {
+		svc := c.Services[name]
+		w := file + ": services." + name
+		if strings.HasPrefix(name, "stowage-") {
+			l.errf(w, "names starting stowage- are Stowage's own (it adds the front as stowage-front)")
+		}
+		if len(svc.Profiles) > 0 {
+			l.errf(w+".profiles", "nothing turns a profile on: remove `profiles:` (no install ever starts this service)")
+		}
+		if svc.Build != nil {
+			l.errf(w, "build: is forbidden — a host without the image would build instead of pull; images are built by stowage ship")
+		}
+		m := imageVarRe.FindStringSubmatch(svc.Image)
+		if m == nil || imageVars[m[1]] == "" {
+			l.errf(w+".image", "%q must be ${STOWAGE_IMAGE_<KEY>} for a key of images: the registry is the single deployment point", svc.Image)
+			continue
+		}
+		used[imageVars[m[1]]] = true
+	}
+	for _, k := range l.s.ImageNames() {
+		if used[k] || l.hookUsesImage(k) {
+			continue
+		}
+		l.warnf("images."+k, "used by no compose service and no hook")
+	}
+}
+
+func (l *linter) hookUsesImage(key string) bool {
+	compat := l.s.DB().SchemaCompat
+	for _, p := range []*spec.Provider{l.s.Hooks.Provision, l.s.Backup, &l.s.Health, &compat} {
+		if p != nil && p.Config["image"] == key {
+			return true
+		}
+	}
+	return false
+}
+
+func (l *linter) service(where, name string) {
+	if l.compose == nil || name == "" {
+		return
+	}
+	if _, ok := l.compose.Services[name]; !ok {
+		l.errf(where, "service %q is not in %s", name, l.s.Stack.Compose)
+	}
+}
+
+func (l *linter) front() {
+	f := l.s.Front
+	if len(f.TLSModes) == 0 {
+		l.errf("front.tls_modes", "at least one TLS mode is required")
+	}
+	for _, m := range f.TLSModes {
+		if !slices.Contains(providers.TLSModes, m) {
+			l.errf("front.tls_modes", "unknown mode %q (%s)", m, strings.Join(providers.TLSModes, ", "))
+		}
+	}
+	if len(f.Routes) == 0 {
+		l.errf("front.routes", "at least one route is required")
+	}
+	names := map[string]bool{}
+	vars := map[string]string{}
+	domains := map[string]bool{}
+	for i, r := range f.Routes {
+		w := fmt.Sprintf("front.routes[%d]", i)
+		if !imageKeyRe.MatchString(r.Name) {
+			l.errf(w+".name", "%q must be lowercase letters, digits, '.', '_' or '-'", r.Name)
+		}
+		if names[r.Name] {
+			l.errf(w+".name", "duplicate route %q", r.Name)
+		}
+		names[r.Name] = true
+		if other, dup := vars[spec.URLVar(r.Name)]; dup && other != r.Name {
+			l.errf(w+".name", "%q and %q both give %s: route names must differ by more than '-', '.' and '_'", other, r.Name, spec.URLVar(r.Name))
+		}
+		vars[spec.URLVar(r.Name)] = r.Name
+		if !providers.EnvName.MatchString(r.DomainInput) {
+			l.errf(w+".domain_input", "%q is not an environment variable name", r.DomainInput)
+		}
+		if domains[r.DomainInput] {
+			l.errf(w+".domain_input", "%s already routes another upstream: routing is by hostname", r.DomainInput)
+		}
+		domains[r.DomainInput] = true
+		m := upstreamRe.FindStringSubmatch(r.Upstream)
+		if m == nil {
+			l.errf(w+".upstream", "%q must be <service>:<port>", r.Upstream)
+		} else {
+			l.service(w+".upstream", m[1])
+		}
+		for _, h := range r.StripHeaders {
+			if strings.TrimSuffix(h, "*") == "" || strings.ContainsAny(h, " :") {
+				l.errf(w+".strip_headers", "%q is not a header name (a trailing * matches a prefix)", h)
+			}
+		}
+		if a := r.ForwardAuth; a != nil {
+			if a.AddressInput == "" {
+				l.errf(w+".forward_auth.address_input", "is required: the input holding the authentication service's address")
+			} else {
+				l.frontInput(w+".forward_auth.address_input", a.AddressInput)
+			}
+			if a.URIInput != "" {
+				l.frontInput(w+".forward_auth.uri_input", a.URIInput)
+			}
+			for _, h := range a.CopyHeaders {
+				if !headerRe.MatchString(h) {
+					l.errf(w+".forward_auth.copy_headers", "%q is not a header name", h)
+				}
+			}
+		}
+		if r.AllowInput != "" {
+			l.frontInput(w+".allow_input", r.AllowInput)
+			if in, ok := l.s.Input(r.AllowInput); ok && in.Advanced {
+				l.errf(w+".allow_input", "%s is advanced, never asked: the route would refuse everyone until it is set", r.AllowInput)
+			}
+		}
+	}
+	if p := f.PublishCA; p != nil {
+		if !slices.Contains(f.TLSModes, "internal") && !slices.Contains(f.TLSModes, "byo") {
+			l.errf("front.publish_ca", "no mode offered has a CA to publish (internal, or byo with --ca)")
+		}
+		if l.compose != nil {
+			if vols, _ := l.compose.TopLevel["volumes"].(map[string]any); vols == nil || !hasKey(vols, p.Volume) {
+				l.errf("front.publish_ca.volume", "%q is not a volume %s declares", p.Volume, l.s.Stack.Compose)
+			}
+		}
+	}
+	if !names[f.Portal] {
+		l.errf("front.portal", "%q names no route: the installer ends by printing the portal URL", f.Portal)
+	}
+	ports := map[int]string{}
+	for _, name := range sortedKeys(f.LoopbackPorts) {
+		port := f.LoopbackPorts[name]
+		if !names[name] {
+			l.errf("front.loopback_ports."+name, "names no route")
+		}
+		if port < 1 || port > 65535 {
+			l.errf("front.loopback_ports."+name, "%d is not a TCP port", port)
+		}
+		if other, dup := ports[port]; dup {
+			l.errf("front.loopback_ports."+name, "%d is already %s's port", port, other)
+		}
+		ports[port] = name
+	}
+	for _, r := range f.Routes {
+		if _, ok := f.LoopbackPorts[r.Name]; !ok {
+			l.errf("front.loopback_ports", "route %s has no port: loopback mode serves every route on its own port", r.Name)
+		}
+	}
+	for _, k := range sortedKeys(f.LoopbackEnv) {
+		if _, ok := l.s.SafeDefaults[k]; !ok {
+			l.errf("front.loopback_env."+k, "is not a safe_defaults key: loopback mode only relaxes a safe default")
+		}
+	}
+}
+
+var headerRe = regexp.MustCompile(`^[A-Za-z0-9!#$%&'*+.^_|~-]+$`)
+
+// frontInput checks that key, which the front reads, is an input recorded on the Docker shape: a
+// route's value is written into the front's configuration.
+func (l *linter) frontInput(where, key string) {
+	in, ok := l.s.Input(key)
+	switch {
+	case !ok:
+		l.errf(where, "%s is not an input", key)
+	case len(in.Shapes) > 0 && !slices.Contains(in.Shapes, "docker"):
+		l.errf(where, "%s is not an input of the docker shape, which runs the front", key)
+	case len(in.Shapes) > 0 && l.s.Shapes.Kairos != nil && !slices.Contains(in.Shapes, "kairos"):
+		l.errf(where, "%s is not an input of the kairos shape, whose VM runs the front", key)
+	case in.Required:
+		l.errf(where, "%s is required: empty is how the front leaves it off (or refuses everyone)", key)
+	case in.When != "":
+		l.errf(where, "%s is asked only when %s: the front reads it in every mode", key, in.When)
+	}
+}
+
+func hasKey(m map[string]any, k string) bool {
+	_, ok := m[k]
+	return ok
+}
+
+func (l *linter) healthAndDatabase() {
+	svc, err := providers.Health(l.s.Health, l.s.Images)
+	if err != nil {
+		l.errf("health", "%v", err)
+	}
+	l.service("health.service", svc)
+	if !l.s.HasDatabase() {
+		return // a stateless project: what needs a database is refused where it is declared
+	}
+	d := l.s.DB()
+	if d.Engine != "postgres" {
+		l.errf("database.engine", "%q: only postgres is supported", d.Engine)
+	}
+	l.service("database.service", d.Service)
+	if d.Service == "" {
+		l.errf("database.service", "is required")
+	}
+	if d.Name == "" {
+		l.errf("database.name", "is required")
+	}
+	if d.Roles.Migrate == "" || d.Roles.App == "" {
+		l.errf("database.roles", "migrate and app are required (the same role twice is allowed)")
+	}
+	if err := providers.SchemaCompat(d.SchemaCompat, l.s.Images); err != nil {
+		l.errf("database.schema_compat", "%v", err)
+	}
+}
+
+func (l *linter) data() {
+	for _, name := range sortedKeys(l.s.Data.Volumes) {
+		if l.s.Data.Volumes[name].UID < 0 {
+			l.errf("data.volumes."+name, "uid must be >= 0")
+		}
+	}
+	for _, r := range l.s.Data.Reset {
+		v, ok := l.s.Data.Volumes[r]
+		if !ok {
+			l.errf("data.reset", "%q is not a data volume", r)
+		} else if v.KeepOnReset {
+			l.errf("data.reset", "%q is marked keep_on_reset", r)
+		}
+	}
+	switch {
+	case !l.s.HasDatabase():
+		if len(l.s.Data.Reset) > 0 {
+			l.errf("data.reset", "reset-db resets a database, and the project declares none")
+		}
+	case len(l.s.Data.Reset) == 0:
+		l.warnf("data.reset", "empty: reset-db would wipe nothing")
+	}
+}
+
+func (l *linter) secretsAndInputs() {
+	keys := map[string]string{}
+	claim := func(where, key, what string) {
+		if !providers.EnvName.MatchString(key) {
+			l.errf(where, "%q is not an environment variable name", key)
+		}
+		for _, p := range []string{"STOWAGE_", "COMPOSE_", "DOCKER_"} {
+			if strings.HasPrefix(key, p) {
+				l.errf(where, "%s: the %s prefix is reserved (Stowage and Docker read it)", key, p)
+			}
+		}
+		if processVars[strings.ToUpper(key)] {
+			l.errf(where, "%s: the Docker client reads it from its own environment; name the variable after the project", key)
+		}
+		if prev, ok := keys[key]; ok {
+			l.errf(where, "%s is already declared as %s", key, prev)
+		}
+		keys[key] = what
+	}
+	for i, s := range l.s.Secrets {
+		w := fmt.Sprintf("secrets[%d]", i)
+		claim(w, s.Key, "a secret")
+		if _, ok := providers.SecretGenerators[s.Gen]; !ok {
+			l.errf(w+".gen", "unknown generator %q (%s)", s.Gen, strings.Join(sortedKeys(providers.SecretGenerators), ", "))
+		}
+		if s.Rotation {
+			claim(w+".rotation", s.Key+"_NEXT", "a rotated secret's next value")
+			claim(w+".rotation", s.Key+"_PREVIOUS", "a rotated secret's previous value")
+			l.rotated(w, s.Key)
+		}
+	}
+	for _, k := range sortedKeys(l.s.SafeDefaults) {
+		claim("safe_defaults."+k, k, "a safe default")
+		l.recordable("safe_defaults."+k, l.s.SafeDefaults[k])
+	}
+	for _, k := range sortedKeys(l.s.Front.LoopbackEnv) {
+		l.recordable("front.loopback_env."+k, l.s.Front.LoopbackEnv[k])
+	}
+	for i, in := range l.s.Inputs {
+		w := fmt.Sprintf("inputs[%d]", i)
+		claim(w, in.Key, "an input")
+		if in.Prompt == "" {
+			l.errf(w+".prompt", "is required: the installer asks it")
+		}
+		l.recordable(w+".default", in.Default)
+		if in.Required && in.Optional {
+			l.errf(w, "required and optional are exclusive")
+		}
+		if in.Secret && in.Default != "" {
+			l.errf(w, "a secret input must not carry a default")
+		}
+		if in.Advanced && (in.Required || in.Default != "") {
+			l.errf(w+".advanced", "an advanced input is never asked and takes the compose file's default: no required, no default")
+		}
+		switch in.When {
+		case "", "tls", "loopback":
+		default:
+			l.errf(w+".when", "%q: expected tls or loopback", in.When)
+		}
+		for _, sh := range in.Shapes {
+			if sh != "docker" && sh != "kubernetes" && sh != "kairos" {
+				l.errf(w+".shapes", "unknown shape %q", sh)
+			}
+		}
+	}
+	for _, r := range l.s.Front.Routes {
+		if _, ok := keys[r.DomainInput]; !ok {
+			keys[r.DomainInput] = "a route domain"
+		}
+	}
+	l.composeVars(keys)
+	l.inputsConsumed()
+	l.extensions()
+}
+
+// rotated checks that the compose file reads a rotated secret's next and previous values: a
+// service that does not accept them drops the other age's tokens during a rotation.
+func (l *linter) rotated(where, key string) {
+	if l.compose == nil {
+		return
+	}
+	for _, k := range []string{key + "_NEXT", key + "_PREVIOUS"} {
+		if !slices.ContainsFunc(l.compose.Vars, func(v VarRef) bool { return v.Name == k }) {
+			l.errf(where+".rotation", "%s reads no ${%s}: during a rotation its services accept both values", l.s.Stack.Compose, k)
+		}
+	}
+}
+
+func (l *linter) composeVars(keys map[string]string) {
+	if l.compose == nil {
+		return
+	}
+	file := l.s.Stack.Compose
+	safeSeen := map[string]bool{}
+	for _, v := range l.compose.Vars {
+		w := fmt.Sprintf("%s:%d", file, v.Line)
+		if want, ok := l.s.SafeDefaults[v.Name]; ok {
+			safeSeen[v.Name] = true
+			if v.Op != ":-" || v.Default != want {
+				l.errf(w, "${%s} must be written ${%s:-%s}: the safe value is the default, only the installer relaxes it", v.Name, v.Name, want)
+			}
+			continue
+		}
+		if strings.HasPrefix(v.Name, "STOWAGE_IMAGE_") {
+			if _, ok := l.imageVars()[v.Name]; !ok {
+				l.errf(w, "%s names no image (the images keys give %s)", v.Name, strings.Join(sortedKeys(l.imageVars()), ", "))
+			}
+			continue
+		}
+		if strings.HasPrefix(v.Name, "STOWAGE_URL_") {
+			if !slices.ContainsFunc(l.s.Front.Routes, func(r spec.Route) bool { return spec.URLVar(r.Name) == v.Name }) {
+				l.errf(w, "%s names no front route", v.Name)
+			}
+			continue
+		}
+		if strings.HasPrefix(v.Name, "STOWAGE_") {
+			if _, ok := ProvidedVars[v.Name]; !ok {
+				l.errf(w, "%s is not a variable Stowage provides (%s, STOWAGE_IMAGE_<KEY>, STOWAGE_URL_<ROUTE>)", v.Name, strings.Join(sortedKeys(ProvidedVars), ", "))
+			}
+			continue
+		}
+		if v.NeedsValue() && slices.ContainsFunc(l.s.Inputs, func(i spec.Input) bool { return i.Key == v.Name && i.Advanced }) {
+			l.errf(w, "${%s} is an advanced input, recorded only when given: write its default here, ${%s:-…}", v.Name, v.Name)
+			continue
+		}
+		if _, ok := keys[v.Name]; ok || !v.NeedsValue() {
+			continue
+		}
+		l.errf(w, "${%s} has no default and is no input, secret, safe default or route domain: compose would run with it empty or refuse to start", v.Name)
+	}
+	for _, k := range sortedKeys(l.s.SafeDefaults) {
+		if !safeSeen[k] {
+			l.errf("safe_defaults."+k, "not used in %s as ${%s:-%s}", file, k, l.s.SafeDefaults[k])
+		}
+	}
+}
+
+func (l *linter) inputsConsumed() {
+	if l.compose == nil {
+		return // without the compose file nothing can be said
+	}
+	read := l.readInputs()
+	for i, in := range l.s.Inputs {
+		if !read(in) {
+			l.warnf(fmt.Sprintf("inputs[%d]", i), "%s is asked but read by no compose service and no hook", in.Key)
+		}
+	}
+}
+
+// readInputs reports whether something reads an input: a compose service, a route of the front
+// or the provision hook's env; one asked on Kubernetes only is the chart's, taken as read.
+func (l *linter) readInputs() func(spec.Input) bool {
+	inCompose := map[string]bool{}
+	for _, v := range l.compose.Vars {
+		inCompose[v.Name] = true
+	}
+	// The provision hook reads the keys its env lists.
+	if h, err := providers.DecodeProvision(l.s.Short(), l.s.Hooks.Provision, l.s.Images); err == nil {
+		for _, k := range h.Keys() {
+			inCompose[k] = true
+		}
+	}
+	// The front reads its routes' inputs.
+	for _, r := range l.s.Front.Routes {
+		inCompose[r.AllowInput] = true
+		if a := r.ForwardAuth; a != nil {
+			inCompose[a.AddressInput], inCompose[a.URIInput] = true, true
+		}
+	}
+	return func(in spec.Input) bool {
+		if len(in.Shapes) > 0 && !slices.Contains(in.Shapes, "docker") && !slices.Contains(in.Shapes, "kairos") {
+			return true // asked on Kubernetes only, where the chart reads it
+		}
+		return inCompose[in.Key]
+	}
+}
+
+// extensions checks each extension names an app and the inputs that configure it: an optional,
+// non-secret input something reads for its endpoint, an optional secret one for its key; and
+// that the project's own endpoint is one of its routes.
+func (l *linter) extensions() {
+	if e := l.s.Endpoint; e != "" && !slices.ContainsFunc(l.s.Front.Routes, func(r spec.Route) bool { return r.Name == e }) {
+		l.errf("endpoint", "%q is not a route of front.routes (%s)", e, strings.Join(l.s.Front.RouteNames(), ", "))
+	}
+	input := l.s.Input
+	read := func(spec.Input) bool { return true } // without the compose file nothing can be said
+	if l.compose != nil {
+		read = l.readInputs()
+	}
+	names, claimed := map[string]bool{}, map[string]string{}
+	claim := func(where, key, ext string) {
+		if prev, ok := claimed[key]; ok {
+			l.errf(where, "%s is already the input of the extension %s", key, prev)
+		}
+		claimed[key] = ext
+	}
+	for i, e := range l.s.Extensions {
+		w := fmt.Sprintf("extensions[%d]", i)
+		switch {
+		case !spec.NamePattern.MatchString(e.Name):
+			l.errf(w+".name", "%q must be an app name: 2–40 lowercase letters, digits or '-', starting with a letter", e.Name)
+		case e.Name == l.s.Name:
+			l.errf(w+".name", "%q is this project: an extension is another app", e.Name)
+		case names[e.Name]:
+			l.errf(w+".name", "duplicate extension %q", e.Name)
+		}
+		names[e.Name] = true
+		if e.Prompt == "" {
+			l.errf(w+".prompt", "is required: the install's tip names the extension with it")
+		}
+		in, ok := input(e.Input)
+		switch {
+		case e.Input == "":
+			l.errf(w+".input", "is required: the input holding the extension's endpoint")
+		case !ok:
+			l.errf(w+".input", "%q is not an input", e.Input)
+		case !in.Optional || in.Secret:
+			l.errf(w+".input", "%s must be an optional, non-secret input: its endpoint, empty while the extension is off", e.Input)
+		case in.Advanced || in.When != "":
+			l.errf(w+".input", "%s must be asked on every install (no advanced, no when): an install that does not record it empty shows no tip", e.Input)
+		case in.Default != "":
+			l.errf(w+".input", "%s must have no default: empty is how the extension is off", e.Input)
+		case !read(in):
+			l.errf(w+".input", "%s is read by no compose service and no hook: the endpoint would reach nothing", e.Input)
+		}
+		if e.Input != "" {
+			claim(w+".input", e.Input, e.Name)
+		}
+		if e.KeyInput == "" {
+			continue
+		}
+		if k, ok := input(e.KeyInput); !ok {
+			l.errf(w+".key_input", "%q is not an input", e.KeyInput)
+		} else if !k.Optional || !k.Secret {
+			l.errf(w+".key_input", "%s must be an optional secret input: the extension's credential", e.KeyInput)
+		} else if k.Advanced || k.When != "" || !slices.Equal(slices.Sorted(slices.Values(k.Shapes)), slices.Sorted(slices.Values(in.Shapes))) {
+			l.errf(w+".key_input", "%s must be asked wherever %s is: the same shapes, no advanced, no when", e.KeyInput, e.Input)
+		} else if !read(k) {
+			l.errf(w+".key_input", "%s is read by no compose service and no hook: the credential would reach nothing", e.KeyInput)
+		}
+		claim(w+".key_input", e.KeyInput, e.Name)
+	}
+}
+
+func (l *linter) hooks() {
+	if h, err := providers.DecodeProvision(l.s.Short(), l.s.Hooks.Provision, l.s.Images); err != nil {
+		l.errf("hooks.provision", "%v", err)
+	} else if h != nil {
+		l.hookEnv(h)
+	}
+	if m := l.s.Hooks.Maintenance; m != nil && m.DiskPressure != nil {
+		d := m.DiskPressure
+		w := "hooks.maintenance.disk_pressure"
+		if l.s.Shapes.Kairos == nil {
+			l.warnf(w, "only the kairos shape's host daemon watches the disk: with no kairos shape, nothing does")
+		}
+		if d.SoftPct < 1 || d.HardPct > 99 || d.SoftPct >= d.HardPct {
+			l.errf(w, "need 1 <= soft_pct < hard_pct <= 99")
+		}
+		if d.AuthSecret != "" && !slices.ContainsFunc(l.s.Secrets, func(s spec.Secret) bool { return s.Key == d.AuthSecret }) {
+			l.errf(w+".auth_secret", "%q is not a secret", d.AuthSecret)
+		}
+		host := strings.TrimPrefix(d.Post, "http://")
+		if host == d.Post {
+			l.errf(w+".post", "%q must be an http:// URL on the stack's internal network", d.Post)
+		} else if m := upstreamRe.FindStringSubmatch(strings.SplitN(host, "/", 2)[0]); m == nil {
+			l.errf(w+".post", "%q must name <service>:<port>", d.Post)
+		} else {
+			l.service(w+".post", m[1])
+		}
+	}
+	if l.s.Backup != nil && !l.s.HasDatabase() {
+		l.errf("backup", "a backup dumps the database, and the project declares none")
+	} else if err := providers.Backup(l.s.Backup, l.s.Images); err != nil {
+		l.errf("backup", "%v", err)
+	}
+}
+
+// hookEnv checks that each key the provision hook's env lists is one the install records (an
+// input, a secret or a safe default), and that no key its returns lists is: the install's value
+// would shadow it, and `provision --set` changes an input only through what records it.
+func (l *linter) hookEnv(h *providers.ProvisionHook) {
+	known := map[string]string{}
+	for _, i := range l.s.Inputs {
+		known[i.Key] = "an input"
+	}
+	for _, sec := range l.s.Secrets {
+		known[sec.Key] = "a secret"
+	}
+	for k := range l.s.SafeDefaults {
+		known[k] = "a safe default"
+	}
+	for i, k := range h.Keys() {
+		if known[k] == "" {
+			l.errf(fmt.Sprintf("hooks.provision.env[%d]", i), "%s is no input, secret or safe default (the URLs and what the hook returned before it receives without asking)", k)
+		}
+	}
+	for _, r := range l.s.Front.Routes {
+		if known[r.DomainInput] == "" {
+			known[r.DomainInput] = "a route domain"
+		}
+	}
+	for i, k := range h.Returns {
+		if what := known[k]; what != "" {
+			l.errf(fmt.Sprintf("hooks.provision.returns[%d]", i), "%s is %s, a value the install records, not one the hook returns", k, what)
+		}
+	}
+}
+
+// chart checks the chart packages as ship packages it, and that its templates read what ship and
+// `<short>-stow k8s` give it: the release's images, the Secret of its secrets and inputs, the pull
+// Secret.
+func (l *linter) chart(rel string) {
+	c, err := helm.Load(spec.Path(l.root, rel))
+	if err != nil {
+		l.errf("shapes.kubernetes.chart", "%s: %v", rel, err)
+		return
+	}
+	reads := func(key string) bool {
+		re := regexp.MustCompile(regexp.QuoteMeta(".Values."+helm.ValuesKey+"."+key) + `\b`)
+		for _, f := range c.Files {
+			if strings.HasPrefix(f.Name, "templates/") && re.Match(f.Data) {
+				return true
+			}
+		}
+		return false
+	}
+	if !reads("images") {
+		l.warnf("shapes.kubernetes.chart", "%s: no template reads .Values.%s.images: the chart does not run the release's images by digest", rel, helm.ValuesKey)
+	}
+	k8sInput := slices.ContainsFunc(l.s.Inputs, spec.Input.OnKubernetes)
+	if (len(l.s.Secrets) > 0 || k8sInput) && !reads("secret") {
+		l.warnf("shapes.kubernetes.chart", "%s: no template reads .Values.%s.secret: the release's secrets and inputs do not reach the chart", rel, helm.ValuesKey)
+	}
+	if l.s.Registry.Pull.Name == "token" && !reads("pullSecret") {
+		l.warnf("shapes.kubernetes.chart", "%s: no template reads .Values.%s.pullSecret: the cluster pulls the images without the pull account", rel, helm.ValuesKey)
+	}
+}
+
+func (l *linter) shapes() {
+	sh := l.s.Shapes
+	if sh.Docker == nil && sh.Kubernetes == nil && sh.Kairos == nil {
+		l.errf("shapes", "at least one deploy shape is required")
+	}
+	if k := sh.Kubernetes; k != nil {
+		if l.exists("shapes.kubernetes.chart", k.Chart, true) {
+			l.chart(k.Chart)
+		}
+		if len(k.PostgresModes) > 0 && !l.s.HasDatabase() {
+			l.errf("shapes.kubernetes.postgres_modes", "the database's modes, and the project declares no database")
+		}
+		for _, m := range k.PostgresModes {
+			if m != "external" && m != "embedded" && m != "cnpg" {
+				l.errf("shapes.kubernetes.postgres_modes", "unknown mode %q (external, embedded, cnpg)", m)
+			}
+		}
+	}
+	if k := sh.Kairos; k != nil {
+		w := "shapes.kairos"
+		// Both are FROM lines of the bundle: pinned, so an update of either changes its inputs.
+		for _, f := range []struct{ key, ref string }{{"base", k.Base}, {"kairos_init", k.KairosInit}} {
+			switch {
+			case f.ref == "":
+				l.errf(w+"."+f.key, "is required")
+			case !pinnedRe.MatchString(f.ref):
+				l.errf(w+"."+f.key, "%q must be pinned by digest (<image>[:<tag>]@sha256:<64 hex>): an unpinned image changes without changing the OS bundle's inputs digest", f.ref)
+			}
+		}
+		for _, f := range k.DiskFormats {
+			if !slices.Contains(spec.DiskFormats, f) {
+				l.errf(w+".disk_formats", "unknown format %q (%s)", f, strings.Join(spec.DiskFormats, ", "))
+			}
+		}
+		for _, c := range k.CloudPublish {
+			if spec.CloudFormat[c] == "" {
+				l.errf(w+".cloud_publish", "unknown cloud %q (%s)", c, strings.Join(slices.Sorted(maps.Keys(spec.CloudFormat)), ", "))
+			}
+		}
+		if g := k.HealthGate; g != nil && (g.DeadlineS <= 0 || g.PollS <= 0 || g.PollS >= g.DeadlineS || g.DeadlineAfterResetS < g.DeadlineS) {
+			l.errf(w+".health_gate", "need 0 < poll_s < deadline_s <= deadline_after_reset_s")
+		}
+		seen := map[string]bool{}
+		for _, svc := range k.HostAPI {
+			if seen[svc] {
+				l.errf(w+".host_api", "service %q is named twice", svc)
+			}
+			seen[svc] = true
+			l.service(w+".host_api", svc)
+		}
+		switch {
+		case l.s.Backup == nil && !l.s.HasDatabase():
+		case l.s.Backup == nil:
+			l.warnf("backup", "the VM keeps its data locally and no backup is declared")
+		case !providers.RunsVMBackups(l.s):
+			l.warnf("backup", "the VM runs %s backups only: it schedules no %s backup", providers.VMBackup, l.s.Backup.Name)
+		}
+	}
+}
+
+// pullAccount refuses a pull account that can hold the publisher's secret: it is baked into
+// every installer, and the disk builder, a privileged third-party image, pulls with it.
+func (l *linter) pullAccount() {
+	pull, push := l.s.Registry.Pull, l.s.Registry.Push
+	if pull.Name == "token" && push.Name == "token" {
+		pc, perr := providers.Token(pull)
+		uc, uerr := providers.Token(push)
+		if perr == nil && uerr == nil && pc.TokenEnv == uc.TokenEnv {
+			l.errf("registry.pull", "token_env %s is registry.push's: the pull account is baked into every installer, so it must hold a read-only secret of its own", pc.TokenEnv)
+		}
+	}
+	if pull.Name == "docker-config" {
+		pc, err := providers.DockerConfig(pull)
+		if err != nil {
+			return
+		}
+		if push.Name == "docker-config" {
+			if uc, err := providers.DockerConfig(push); err == nil && filepath.Clean(pc.Config) == filepath.Clean(uc.Config) {
+				l.errf("registry.pull", "is registry.push's Docker config: the pull account is baked into every installer, so it must be a read-only account of its own")
+			}
+		}
+		if k := l.s.Shapes.Kairos; k != nil && len(k.Formats()) > 0 && pc.Config == "" {
+			l.errf("registry.pull", "a docker-config without config is the user's Docker login, of unknown rights: the disk builder (shapes.kairos.disk_formats, cloud_publish) runs privileged with registry.pull, so give it a read-only account (a token, or a config directory of its own)")
+		}
+	}
+}
+
+func (l *linter) lockFile(path string) {
+	lk, err := lock.Load(path)
+	if err != nil {
+		l.errf(lock.FileName, "%s", strings.TrimPrefix(err.Error(), lock.FileName+": "))
+		return
+	}
+	if lk == nil {
+		l.errf(lock.FileName, "missing: run stowage lock to pin the Stowage this project publishes with (ship and promote refuse without it)")
+	}
+}
+
+func sortedKeys[V any](m map[string]V) []string {
+	ks := make([]string, 0, len(m))
+	for k := range m {
+		ks = append(ks, k)
+	}
+	sort.Strings(ks)
+	return ks
+}
+
+// ChannelName reports whether name may name a channel: it is a tag (the channel's pointer).
+func ChannelName(name string) bool { return len(name) <= 128 && imageKeyRe.MatchString(name) }

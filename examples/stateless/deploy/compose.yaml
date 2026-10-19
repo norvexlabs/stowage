@@ -1,0 +1,14 @@
+# The single service definition of the lookup stack: one server, no state. The TLS front is added
+# by Stowage.
+services:
+  server:
+    image: ${STOWAGE_IMAGE_SERVER}
+    command: ["sh", "-c", "mkdir -p /www && echo ok > /www/health && echo \"$$VERSION\" > /www/version && echo \"$$GREETING\" > /www/index.html && exec httpd -f -p 8080 -h /www"]
+    environment:
+      GREETING: ${GREETING}
+      VERSION: ${STOWAGE_PROJECT_VERSION}
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/health"]
+      interval: 2s
+      retries: 30
+    restart: unless-stopped

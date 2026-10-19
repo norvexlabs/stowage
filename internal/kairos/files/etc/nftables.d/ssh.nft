@@ -1,0 +1,2 @@
+# SSH, open to all: `vm create --ssh-allow` replaces this file with its sources.
+tcp dport 22 accept

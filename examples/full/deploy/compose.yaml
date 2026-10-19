@@ -1,0 +1,73 @@
+# The single service definition of the atlas stack. Images come only through
+# ${STOWAGE_IMAGE_<KEY>}; the TLS front is added by Stowage.
+services:
+  postgres:
+    image: ${STOWAGE_IMAGE_POSTGRES}
+    environment:
+      POSTGRES_DB: atlas
+      POSTGRES_USER: atlas
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U atlas -d atlas"]
+      interval: 5s
+      retries: 20
+    restart: unless-stopped
+
+  api:
+    image: ${STOWAGE_IMAGE_API}
+    environment:
+      DATABASE_URL: postgres://atlas:${POSTGRES_PASSWORD}@postgres:5432/atlas
+      APP_DATABASE_URL: postgres://atlas_app:${APP_DB_PASSWORD}@postgres:5432/atlas
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY}
+      SESSION_SECRET: ${SESSION_SECRET}
+      INTERNAL_SERVICE_SECRET: ${INTERNAL_SERVICE_SECRET}
+      INTERNAL_SERVICE_SECRET_NEXT: ${INTERNAL_SERVICE_SECRET_NEXT}
+      INTERNAL_SERVICE_SECRET_PREVIOUS: ${INTERNAL_SERVICE_SECRET_PREVIOUS}
+      COOKIE_SECURE: ${COOKIE_SECURE:-true}
+      TRUSTED_PROXY_HOPS: ${TRUSTED_PROXY_HOPS:-1}
+      PUBLIC_URL: ${STOWAGE_URL_API}
+      CONSOLE_URL: ${STOWAGE_URL_CONSOLE}
+      UPSTREAM_API_KEY: ${UPSTREAM_API_KEY:-}
+      SEARCH_URL: ${SEARCH_URL:-}
+      SEARCH_KEY: ${SEARCH_KEY:-}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      ATLAS_VERSION: ${STOWAGE_PROJECT_VERSION}
+      ORG_NAME: ${ORG_NAME}
+    volumes:
+      - ca:/etc/atlas/ca:ro      # the front's CA (front.publish_ca), as ca.crt
+    healthcheck:
+      test: ["CMD", "atlas-server", "probe", "9090"]
+      interval: 2s
+      retries: 30
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  ingest:
+    image: ${STOWAGE_IMAGE_INGEST}
+    environment:
+      API_URL: http://api:9090
+      PUBLIC_URL: ${STOWAGE_URL_INGEST}
+      INTERNAL_SERVICE_SECRET: ${INTERNAL_SERVICE_SECRET}
+    volumes:
+      - spool:/var/spool/atlas
+    healthcheck:
+      test: ["CMD", "atlas-server", "probe", "8080"]
+      interval: 2s
+      retries: 30
+    restart: unless-stopped
+
+  ui:
+    image: ${STOWAGE_IMAGE_UI}
+    environment:
+      API_URL: ${STOWAGE_URL_API}
+      SUPPORT_EMAIL: ${SUPPORT_EMAIL:-}
+    restart: unless-stopped
+
+volumes:
+  postgres: {}
+  spool: {}
+  ca: {}

@@ -1,0 +1,54 @@
+# The api: it migrates the database at start (under a lock, so replicas never race), then serves
+# as the app role. Embedded: both URLs point at the release's postgres, with the generated
+# passwords; external: DATABASE_URL and APP_DATABASE_URL come from the Secret as given (the api
+# refuses to start when either is empty).
+{{- $c := dict "root" $ "component" "api" "port" 9090 }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-api
+  labels:
+    {{- include "atlas.labels" $c | nindent 4 }}
+    app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+spec:
+  replicas: {{ .Values.api.replicas }}
+  selector:
+    matchLabels:
+      {{- include "atlas.labels" $c | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "atlas.labels" $c | nindent 8 }}
+    spec:
+      {{- include "atlas.pod" . | nindent 6 }}
+      containers:
+        - name: api
+          image: {{ include "atlas.image" (dict "root" $ "key" "api") }}
+          env:
+            {{- include "atlas.secretEnv" (dict "root" $ "keys" (list "ENCRYPTION_KEY" "SESSION_SECRET" "INTERNAL_SERVICE_SECRET" "INTERNAL_SERVICE_SECRET_NEXT" "INTERNAL_SERVICE_SECRET_PREVIOUS" "ORG_NAME" "UPSTREAM_API_KEY" "SEARCH_URL" "SEARCH_KEY") "optional" (list "UPSTREAM_API_KEY" "SEARCH_URL" "SEARCH_KEY")) | trim | nindent 12 }}
+            {{- if eq .Values.postgres.mode "embedded" }}
+            {{- include "atlas.secretEnv" (dict "root" $ "keys" (list "POSTGRES_PASSWORD" "APP_DB_PASSWORD")) | trim | nindent 12 }}
+            - name: DATABASE_URL
+              value: postgres://atlas:$(POSTGRES_PASSWORD)@{{ .Release.Name }}-postgres:5432/atlas
+            - name: APP_DATABASE_URL
+              value: postgres://atlas_app:$(APP_DB_PASSWORD)@{{ .Release.Name }}-postgres:5432/atlas
+            {{- else if eq .Values.postgres.mode "external" }}
+            {{- include "atlas.secretEnv" (dict "root" $ "keys" (list "DATABASE_URL" "APP_DATABASE_URL")) | trim | nindent 12 }}
+            {{- else }}
+            {{- fail (printf "postgres.mode %q: embedded or external" .Values.postgres.mode) }}
+            {{- end }}
+          ports:
+            - containerPort: 9090
+          startupProbe:          # the migrations run before the api listens
+            httpGet: { path: /health, port: 9090 }
+            periodSeconds: 2
+            failureThreshold: 300   # 600 s: the api's wait for the database, then its migrations
+          livenessProbe:
+            httpGet: { path: /health, port: 9090 }
+            timeoutSeconds: 5
+          readinessProbe:
+            httpGet: { path: /ready, port: 9090 }   # a psql round trip
+            periodSeconds: 2
+            timeoutSeconds: 5
+---
+{{ include "atlas.service" $c }}

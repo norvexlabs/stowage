@@ -1,0 +1,4 @@
+# The notes chart's own settings. Stowage's ship adds a `stowage:` block at the end of this file
+# in the packaged chart: the release's images by digest (see templates/_helpers.tpl).
+web:
+  replicas: 1
