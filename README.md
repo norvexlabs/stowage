@@ -85,7 +85,7 @@ sh notes.sh
 | **Describe** | developer | `stowage.yaml` names the images, the compose file (the single service definition), the front's routes, the health check, the database, the volumes, the secrets to generate and the inputs to ask. `stowage lint` checks the whole project against the [contracts](#the-contracts-a-project-must-honour) and names the `key` or `file:line` to fix. |
 | **Version** | developer | The version comes from your changelog, a file, a git tag or a command; a scheme (CalVer, SemVer, regex, command) validates and orders it. Stowage never compares versions as strings. `stowage.lock` pins the Stowage that publishes. |
 | **Publish** | developer, CI | `stowage ship` builds what changed, pushes it by digest, signs it, builds the installer and the release manifest, then moves the channel's pointer. `verify`, `promote` (beta → stable without rebuilding), `yank`, `prune`, `releases`. `stowage hook install` ships each version bump on commit. |
-| **Install** | operator | `docker run --rm <prefix>/<name>-installer:latest > <name>.sh` gets the bootstrap script, which carries the installer, `<short>-stow`; then `sh <name>.sh` on Docker; `sh <name>.sh k8s install` on Kubernetes; `sh <name>.sh vm create` for a VM (seed ISO or cloud user-data, or the VM created on TrueNAS with OpenTofu). Inputs asked once, secrets generated once, provision hook run, portal URL printed. |
+| **Install** | operator | `docker run --rm <prefix>/<name>-installer:latest > <name>.sh` gets the bootstrap script, which carries the installer, `<short>-stow`; then `sh <name>.sh` on Docker; `sh <name>.sh k8s install` on Kubernetes; `sh <name>.sh vm create` for a VM (seed ISO or cloud user-data, or the VM created with OpenTofu: TrueNAS; libvirt, Proxmox VE, vSphere, AWS, Google Cloud and Azure as previews; or a module of your own). Inputs asked once, secrets generated once, provision hook run, portal URL printed. |
 | **Operate** | operator | `status`, a re-run to change inputs, ports or the TLS mode (the changes logged, the previous values kept), `provision`, `secrets rotate` (stage, swap, finish: the old value accepted meanwhile), `secrets export` (age-encrypted, to rebuild a machine), `reset-db`. |
 | **Upgrade** | operator | `upgrade --version V` fetches that release's installer, checks its signature against the keys the install trusts and brings the stack up on the new images — on Docker after a `pg_dump` snapshot, on Kubernetes through Helm. On the VM, `updates` lists what the channel offers and `upgrade` reboots into the new OS. |
 | **Roll back** | operator | `rollback` returns to the previous release — unless a migration since then is a rollback barrier your schema-compat provider reports, in which case it refuses and names it. On the VM the health gate does it alone: an upgraded boot that is not healthy in time falls back to the previous system. |
@@ -413,8 +413,8 @@ a real registry, the local Docker engine, a kind cluster and a VM on TrueNAS
 | every version / changelog provider, registry client, release manifest, cosign signing | |
 | inputs digests and the build graph | |
 | installer (Docker): loopback and every TLS front (`acme`, `dns-cloudflare`, `byo`, `internal`), terminal form, `install`, re-run (changes the inputs and the front's ports), `status`, `provision`, `script`, `upgrade` (`--version` fetches the release's installer), `rollback`, `reset-db`, `--dry-run`, `--offline`, a mirror and its CA (`--registry`, `--registry-ca`); `mirror export` / `mirror import` (a release carried as one file to a site without internet); `secrets rotate`, `secrets export` and `--secrets` (a machine made again) | scheduled backup, restore, chart library, `upgrade --reset-db` |
-| installer (Kubernetes): `<short>-stow k8s install`, `upgrade` (`--version`), `rollback`, `status`, `reset-db`, `provision` (the hook as a Job after the release, its outputs in a Secret and handed back, `--set`), `secrets rotate`, `--dry-run`, `--no-provision`, `--image-registry`, `--registry-ca` | barrier pre-flight before `rollback` |
-| installer (Kairos VM): `<short>-stow vm create` (the disk image by digest, the cloud-config on a seed ISO or as user-data, the platform's steps; or the VM created on TrueNAS with OpenTofu, waited for until it installed; from a mirror whose CA the VM then trusts) and `vm destroy`; `<short>-stow` in the OS bundle — the first install from the cloud-config's settings, `install` from the preloaded images, the boot (install up again, upgrade to the OS's release, back to the replaced one), the host daemon and its verbs (`status`, `health`, `events`, `ps`, `logs`, `restart`/`stop`/`start`, `provision`, `updates`, `upgrade`, `rollback` to the passive system, `reset-db`, `network` with its auto-revert, `backup` — scheduled, before an upgrade, or now, encrypted to age keys and uploaded with rclone; `verify` of proposed settings —, `restore`, `secrets export` and `rotate`, `reboot`, `shutdown`), its disk-pressure watch (`hooks.maintenance.disk_pressure`), its app socket for the services `host_api` names, the health gate judging each boot (Kairos boot assessment: an upgraded boot not healthy in time falls back to the passive system, unless going back is refused at a rollback barrier: it is then kept), a default-deny firewall (`vm create --ssh-allow`), the time zone (`--timezone`), a disaster recovery (`vm create --secrets`) | |
+| installer (Kubernetes): `<short>-stow k8s install`, `upgrade` (`--version`), `rollback`, `status`, `reset-db`, `uninstall` (`--data`), `provision` (the hook as a Job after the release, its outputs in a Secret and handed back, `--set`), `secrets rotate`, `--dry-run`, `--no-provision`, `--image-registry`, `--registry-ca` | barrier pre-flight before `rollback` |
+| installer (Kairos VM): `<short>-stow vm create` (the disk image by digest, the cloud-config on a seed ISO or as user-data, the platform's steps; or the VM created with OpenTofu — TrueNAS's module, the previews for libvirt, Proxmox VE, vSphere, AWS, Google Cloud and Azure, or the operator's own holding the module contract — waited for until it installed; from a mirror whose CA the VM then trusts) and `vm destroy`; `<short>-stow` in the OS bundle — the first install from the cloud-config's settings, `install` from the preloaded images, the boot (install up again, upgrade to the OS's release, back to the replaced one), the host daemon and its verbs (`status`, `health`, `events`, `ps`, `logs`, `restart`/`stop`/`start`, `provision`, `updates`, `upgrade`, `rollback` to the passive system, `reset-db`, `network` with its auto-revert, `backup` — scheduled, before an upgrade, or now, encrypted to age keys and uploaded with rclone; `verify` of proposed settings —, `restore`, `secrets export` and `rotate`, `reboot`, `shutdown`), its disk-pressure watch (`hooks.maintenance.disk_pressure`), its app socket for the services `host_api` names, the health gate judging each boot (Kairos boot assessment: an upgraded boot not healthy in time falls back to the passive system, unless going back is refused at a rollback barrier: it is then kept), a default-deny firewall (`vm create --ssh-allow`), the time zone (`--timezone`), a disaster recovery (`vm create --secrets`) | |
 
 ## Reference — for people and AI agents
 
@@ -593,7 +593,25 @@ none and cannot publish); it is one of the installer's inputs too. So `ship` and
 a `stowage` other than the version `stowage.lock` pins, or a project without the file: moving the
 pin (`stowage lock --update`) is a reviewed change, and the release it publishes next carries the
 new installer and front (a version already on an immutable channel needs a new `--revision`). A registry is reached over
-HTTPS; plain HTTP is allowed to a loopback registry only. Publishing builds with `docker buildx build --load` on the local engine, for `linux/amd64` (the
+HTTPS; plain HTTP is allowed to a loopback registry only.
+
+With `registry.pull: { provider: none }`, every install reads the registry anonymously, so `ship`
+and `promote` stop a release an install could not read. A registry may create every new repository
+private (ghcr does, and no API makes a container package public). The run is checked three times;
+each refusal names `registry.pull is none, so every install reads <prefix> anonymously, and
+<repositories> refuse an anonymous read`, what makes them readable (made public once, in the
+package's settings, or an account given to `registry.pull`), then `ship again`:
+- before anything is built: each repository the release writes that already holds tags (read with
+  the publisher's account) must list them anonymously;
+- after the images are pushed by digest, before the OS bundle and its disks: each image must
+  answer an anonymous read of its digest (a repository the push just created). The images were
+  pushed untagged, so the next run builds them again (Docker's cache makes that quick);
+- after the release is written, before a channel points at it: every artifact it records (images,
+  bundle, disks, the channel's chart, the installer, the release manifest) must answer an anonymous
+  read of its digest. The release is published, no channel points at it yet, and a run of the same
+  inputs once they are public carries on and moves the channel.
+
+Publishing builds with `docker buildx build --load` on the local engine, for `linux/amd64` (the
 platform is part of an image's inputs). What `ship` does, in order:
 
 1. every image is planned before anything is written: a tag already carrying the same inputs
@@ -809,13 +827,18 @@ These are what `lint` checks; each finding names the key path or `file:line` to 
   the distribution's and Docker's packages of the day. The build needs network access (apt, kairos-init's
   packages) and takes several minutes; the bundle is about 3 GB.
 - **Disk images** (`shapes.kairos.disk_formats`): made from the bundle by the pinned auroraboot
-  (v0.23.0, run privileged on the host network, pulling the bundle with the pull account —
-  `registry.pull`, never the publisher's — given in a private Docker config). `ship` (not `promote`,
-  `yank` or `prune`) resolves that account for the `<name>-os` repository before building
-  anything, and again before the disks, so a `token` pull account's variable must be set then. It
-  refuses the user's default Docker config (a `docker-config` without `config`, or naming that
-  directory: its rights are unknown) and an account sharing a secret — password, identity or
-  registry token — with the publisher's, whatever its user name. The formats: `raw` (EFI) by
+  (v0.23.0, run privileged on the host network). auroraboot holds no registry account: it reads the
+  bundle by digest from a read-only proxy `ship` serves on a loopback port for the disks' build
+  alone (`127.0.0.1:<port>/<repository>@<digest>`), with the proxy's own account — user
+  `stowage-proxy` and a random password, new for each proxy, given to auroraboot in a private
+  Docker config file (0600), never on a command line, so another user of the machine cannot read
+  through it. The proxy reads the `<name>-os` repository with the publisher's account (pull-scoped
+  to that repository where the registry issues tokens; with Basic auth, the proxy's filter is the
+  limit) and passes only `GET` and `HEAD` of that bundle's manifest, by its digest, and of the
+  repository's blobs (and the `/v2/` ping), so the publisher's account never leaves `ship`, and a
+  disk builds whoever else may read the registry. auroraboot runs on the host's network, so the
+  Docker engine must share this machine's loopback (a rootful engine; not rootless Docker nor
+  Docker Desktop's VM). The formats: `raw` (EFI) by
   auroraboot; then, with qemu-img and tar from the raw disk, `vhd` (a fixed VHD, its virtual size
   the raw disk's grown to a whole number of MiB, as Azure imports it), `gce` (the raw disk grown
   to a whole number of GiB, as `disk.raw` alone in a sparse, oldgnu `.tar.gz`, as Google Cloud
@@ -964,7 +987,7 @@ database: reset-db has nothing to reset` (`… there is no backup to restore`). 
 | `changelog` | `keepachangelog` (default; `file`, default `CHANGELOG.md`; `## [x]` or `## x` headings, `Unreleased` skipped), `dir-per-version` (`dir`, required; `pattern`, default `{v}.md`, holding `{v}` once and no `/`), `command`. The current version must have a section |
 | `channels.<name>` | `tag` (template holding `{v}` once), `mutable`, `latest`. Names are lowercase letters, digits, `.`, `_`, `-`. At most one channel sets `latest` (none, or a mutable one, is a warning) |
 | `registry.prefix` | `<host>[:port][/path]`, the host a name or a bracketed IPv6 address (`[fd00::5]:5000/notes`): no scheme, tag or trailing slash |
-| `registry.pull`, `registry.push` | `token` (`user`, `token_env`), `docker-config` (`config`, a Docker config directory; empty: the default Docker login), `none` (pull only). `registry.pull` is baked into every installer: it may not use `registry.push`'s `token_env` or Docker config, and with `shapes.kairos.disk_formats` it may not be a `docker-config` without `config` |
+| `registry.pull`, `registry.push` | `token` (`user`, `token_env`), `docker-config` (`config`, a Docker config directory; empty: the default Docker login), `none` (pull only). `registry.pull` is baked into every installer: it may not use `registry.push`'s `token_env` or Docker config. With `none`, `ship` refuses a repository the release writes that an anonymous read is refused (see `ship`) |
 | `signing` | `cosign-key` (`key`, `public_keys`), or absent / `none` |
 | `images.<key>` | built (`context`, `dockerfile`, `target`, `args`, `inputs`: the paths whose content enters the image's inputs digest, default the whole context less `.dockerignore`) or `ref` (exclusive with the build keys). An image no service or hook uses is a warning; a `# syntax=` frontend or a `FROM $ARG` cannot be checked (warning) |
 | `stack.compose` | the compose file; a service with `profiles:` is an error (no install turns a profile on, so none would ever start it) |
@@ -1405,6 +1428,8 @@ the current directory. A release with no chart (published without the shape) is 
 <short>-stow k8s reset-db [--namespace NS] [--release R] [--kube-context C] [--yes] [--no-input]
                        [--accessible] [--registry-ca FILE] [--timeout 10m] [--dry-run] [--no-provision]
                        [--new-baseline]                               # the NEW release's installer, across a baseline
+<short>-stow k8s uninstall [--namespace NS] [--release R] [--kube-context C] [--data] [--yes]
+                       [--no-input] [--accessible] [--timeout 10m] [--dry-run]
 <short>-stow k8s provision [--namespace NS] [--release R] [--kube-context C] [--set KEY=VALUE]…
                        [--registry-ca FILE]                           # a project with a provision hook
 <short>-stow k8s secrets rotate KEY [--stage | --finish] [--namespace NS] [--release R]
@@ -1586,6 +1611,42 @@ the current directory. A release with no chart (published without the shape) is 
   repositories (`charts/<name>-<channel>`, `<name>-<key>`, and `<name>-release` and
   `<name>-installer` for `upgrade --version` and the provision hook's Job); no pull Secret is written for it, so give the
   chart your own pull Secret through `--values`.
+- `uninstall` removes the release and what the installer made beside it: `helm uninstall
+  <release> --wait`, then the provision Job `<release>-stowage` (`kubectl delete
+  --cascade=foreground --wait`), the provision hook's RoleBinding, Role and ServiceAccount
+  `<release>-stowage-provision`, and the Secrets `<release>-stowage-pull`, `<release>-stowage-provision`
+  and `<release>-stowage`. It deletes only an object whose labels say this installer made it for this
+  release (`app.kubernetes.io/managed-by: stowage`, `app.kubernetes.io/instance: <release>`); one of
+  those names another tool made is kept and named. It takes any release a chart Stowage published
+  (one whose values hold `stowage.release`), whatever its project name or version, so it removes a
+  release an older installer made, and moving a release to another registry or project name is an
+  uninstall then an install; another release is refused, naming `helm uninstall`. The data:
+  - The release's PersistentVolumeClaims (as `reset-db` finds them) are deleted only with `--data`,
+    or when the operator answers so on a terminal ("Yes, and keep the data" or "Yes, and delete the
+    data"; default no); `--yes` never asks and keeps them.
+  - `helm uninstall` itself deletes the claims the chart makes (not its StatefulSets' claims, nor one
+    marked `helm.sh/resource-policy: keep`): when the chart makes one, `uninstall` without `--data`
+    is refused (`the chart of release R makes the PersistentVolumeClaims …, which helm uninstall
+    deletes with it`), and a terminal offers only deleting the data.
+  - Data kept keeps the Secrets that answer for it: `<release>-stowage` (the values it was made
+    with, a database's password among them) and `<release>-stowage-provision` (what the provision
+    hook returned). `k8s install` of the release then takes the data back with them, as it takes
+    a Secret an install left. Data is kept when its claims are not deleted, when the chart keeps
+    one (`helm.sh/resource-policy: keep`, `--data` or not), and when helm no longer knows the
+    release. `kept:` names the `kubectl delete persistentvolumeclaims` and `kubectl delete secret`
+    that remove them later (the release is gone then, so a second `uninstall` cannot tell its
+    claims); an `uninstall` that finds nothing but those Secrets is refused, naming them.
+  - A release helm no longer knows (gone, or `uninstalled` with its history kept) has its other
+    objects deleted all the same, its claims untold (none deleted, `--data` or not); nothing of it
+    at all is refused (`no release R in NS, and nothing <short>-stow made for it
+    there`).
+
+  It prints `release R in NS is uninstalled` (`… was uninstalled already: what the installer left of
+  it is deleted` when helm no longer knew it), then `kept:` and what it kept, each with the
+  `kubectl` that deletes it later: the claims and Secrets of the data, the claims the chart keeps,
+  another tool's objects, and the namespace, always kept. It asks on a terminal (default no); without one, or with `--no-input`,
+  it refuses unless `--yes`. `--dry-run` prints what a run would delete and keep, and changes
+  nothing.
 - `--registry-ca FILE` (on `install`, `upgrade`, `reset-db` and `provision`; certificates only, as for Docker) makes the
   installer's reads of the registry (the chart, `upgrade --version`, the release manifest the hook's Job reads) trust that CA besides the
   system's, for that run: it is not recorded. The cluster's nodes pull the images and must trust
@@ -1704,7 +1765,7 @@ carries it:
   `<short>-stow k8s install --image-registry PREFIX --registry-ca FILE` (Kubernetes) and `<short>-stow
   vm create --registry PREFIX --registry-ca FILE` (the Kairos VM). A newer release crosses the
   same way; `upgrade --version`, `updates` and the VM's `upgrade` find it in the mirror.
-- `vm create --create opentofu` also needs OpenTofu's TrueNAS provider, which `tofu init`
+- `vm create --create opentofu` also needs its module's OpenTofu provider, which `tofu init`
   fetches from the OpenTofu registry: on a site without internet, give `tofu` a provider mirror
   (a `provider_installation { filesystem_mirror { … } }` block in a CLI configuration file named
   by `TF_CLI_CONFIG_FILE`, filled by `tofu providers mirror` on a machine with internet).
@@ -1722,7 +1783,8 @@ in the same installer (bootstrap it as above, then `sh <name>.sh vm create …`,
           [--ssh-allow CIDR,…] [--timezone ZONE] [--secrets FILE|-]
           [--tls MODE] [--domains route=host,…] [--http-port N] [--https-port N]
           [--set KEY=VALUE]… [--answers FILE] [--no-input] [--accessible]
-          [--create opentofu|manual] [--vm-name N] [--pool P] [--dataset D] [--bridge B]
+          [--create opentofu|manual] [--module DIR] [--tofu-var NAME=VALUE]…
+          [--vm-name N] [--pool P] [--dataset D] [--bridge B]
           [--cpus N] [--memory MiB] [--disk GiB] [--host H] [--wait DURATION]
           [--registry PREFIX] [--registry-ca FILE]
 <short>-stow vm destroy HOSTNAME [--yes] [--no-input] [--accessible]
@@ -1812,42 +1874,95 @@ in the same installer (bootstrap it as above, then `sh <name>.sh vm create …`,
   `/usr/local/share/ca-certificates/<name>-registry.crt` (0644) and then, in a step of its own,
   runs `update-ca-certificates`: the VM's trust store holds it from every boot on, so its
   `<short>-stow`, the host daemon and `kairos-agent upgrade` trust the mirror. It carries no secret.
-- **With OpenTofu** (`--create opentofu`, TrueNAS only; on `truenas` a terminal asks "OpenTofu or
-  by hand", default OpenTofu; without a terminal and without `--create`, by hand; elsewhere,
-  `--create opentofu` is refused). `vm create` then creates the VM itself instead of printing
-  steps:
-  - It needs OpenTofu's `tofu` on `PATH` (it runs `tofu version` first; the module requires
-    1.8 or later) and, in the environment only, `TRUENAS_URL` (`https://<host>[:<port>]`; plain
+- **With OpenTofu** (`--create opentofu`). `vm create` then creates the VM itself instead of
+  printing steps, with a module: the platform's built-in one, or the operator's (`--module DIR`).
+  The built-in modules, each pinning its provider exactly:
+
+  | `--platform` | provider | what the module makes | the module's own variables (`--tofu-var`, or asked) |
+  |---|---|---|---|
+  | `truenas` | `pjsalty/truenas` 3.0.0 | below | its flags: `--pool`, `--dataset`, `--bridge` |
+  | `libvirt` (preview) | `dmacvicar/libvirt` 0.8.3 | a copy-on-write volume over the qcow2 image, grown to `--disk`; the seed as a second volume; a UEFI domain (`firmware`) on `network`, its DHCP lease the address (waited for only with DHCP) | `uri` (default `qemu:///system`), `pool` (`default`), `network` (`default`), `firmware` (`/usr/share/OVMF/OVMF_CODE.fd`) |
+  | `proxmox` (preview) | `bpg/proxmox` 0.116.1 | the qcow2 image and the seed uploaded to an ISO datastore, an OVMF VM importing the image, grown to `--disk`, the seed on its CD-ROM; no address (no guest agent) | `node` (required), `datastore` (`local-lvm`), `iso_datastore` (`local`), `bridge` (`vmbr0`) |
+  | `vmware` (preview) | `hashicorp/vsphere` 2.17.0 | the OVA deployed, its disk grown to `--disk`, the seed uploaded to the datastore on its CD-ROM; its address when VMware tools report one | `datacenter`, `cluster`, `datastore`, `host` (required), `network` (`VM Network`), `folder` |
+  | `aws` (preview) | `hashicorp/aws` 6.68.0 | the raw image uploaded to S3, imported as a snapshot (the `vmimport` role), registered as a UEFI image, an instance launched from it with the cloud-config as its user data (IMDSv2); its public address, else its private one | `region`, `bucket`, `subnet_id` (required), `security_group_ids` (comma-separated), `instance_type` (`t3.medium`), `vmimport_role` (`vmimport`) |
+  | `gcp` (preview) | `hashicorp/google` 8.6.0 | the image's `tar.gz` uploaded to Cloud Storage, a UEFI image, an instance booted from it with the cloud-config as its `user-data`; its external address | `project`, `zone`, `bucket` (required), `network` (`default`), `subnetwork`, `machine_type` (`e2-medium`) |
+  | `azure` (preview) | `hashicorp/azurerm` 5.9.0 | the fixed VHD uploaded as a page blob, a generation 2 image, a VM with a static public address made from it with the cloud-config as its custom data (no VM agent); its public address | `resource_group`, `location`, `storage_account`, `subnet_id` (required), `container` (`vhds`), `vm_size` (`Standard_B2s`) |
+
+  `hyperv` has none: `--create opentofu` there needs `--module`. A **preview** module has not run
+  on its platform yet: `vm create` prints `OpenTofu's <platform> module is a preview: it has not
+  run on <platform> yet`, with the fallback (`vm destroy <host>` removes what it made, and
+  `--create manual` writes the disk and the cloud-config and prints the steps by hand); a module
+  loses the mark at its first passing run there. On a platform with a built-in module a terminal
+  asks "OpenTofu or by hand", default OpenTofu on `truenas` and by hand on a preview; without a
+  terminal and without `--create`, by hand. `--module` alone is `--create opentofu`, and refused
+  with `--create manual`.
+  - Credentials come from the environment only, as each provider reads them (`TRUENAS_URL` /
+    `TRUENAS_API_KEY`; `PROXMOX_VE_ENDPOINT` / `PROXMOX_VE_API_TOKEN`; `VSPHERE_SERVER` /
+    `VSPHERE_USER` / `VSPHERE_PASSWORD`; `AWS_*` or a profile; `GOOGLE_APPLICATION_CREDENTIALS`;
+    `ARM_*` or the `az` login; a libvirt `uri` over SSH uses the SSH agent); no module declares one,
+    and no `--tofu-var` should carry one: the variables are written to a file.
+  - `--tofu-var NAME=VALUE` (repeatable) sets a module variable; one the module does not declare,
+    one given twice, one of the contract's (below, which `vm create` writes from its own
+    flags), and on TrueNAS's built-in module `pool`, `parent_dataset`, `nic_attach` and
+    `insecure_skip_verify` (its flags and `TRUENAS_INSECURE_SKIP_VERIFY` give them) are refused. A required variable not given is asked on a terminal (its description as
+    the question), else refused (`--tofu-var NAME=<value> is required by the module`); one with a
+    default is asked too, empty keeping the module's default. The review lists them.
+  - `--vm-name` is letters and digits on `truenas` (as TrueNAS names a VM); elsewhere lower-case
+    letters, digits and `-`, starting with a letter, at most 63 (default the host name in lower
+    case). `--pool`, `--dataset` and `--bridge` are TrueNAS's built-in module's alone.
+  - **The module contract**, which `--module DIR` holds (its `*.tf`, `*.tf.json` and
+    `.terraform.lock.hcl`, symbolic links followed, not its subdirectories, are copied into the
+    VM's directory, so `vm destroy` needs DIR no more): it declares the variables `name`,
+    `description`, `disk_gib`, `image` (the disk on this machine, in the `--platform`'s format),
+    `image_sha256`, `seed` (the NoCloud seed ISO on a hypervisor, the cloud-config file on a cloud:
+    `--platform` decides) and `seed_sha256`, refused before anything is fetched when one is
+    missing. It may declare `cpus` and `memory_mib` (then asked and given `--cpus` and `--memory`;
+    a module that declares neither sizes the VM by a variable of its own, as the clouds' instance
+    types do, and those flags are refused: `--cpus: the module sizes the VM by a variable of its
+    own`), `dhcp` (true when the VM takes its IPv4 address by DHCP, false with `--network
+    static`), `admin_user` and `ssh_public_key` (given `--user` and the `--ssh-key` file's key). Its
+    `*.tf` files are read as `tofu fmt` writes them (a variable block on one line, or closing at a
+    lone `}`). It outputs `id` (what the platform calls the VM;
+    required: `the module has no output id` fails the run after the apply, the state kept) and
+    `address` (where the VM answers, empty when the platform does not tell); `vm create` reads them
+    with `tofu output -json`, logs `OpenTofu created the VM <name> (<id>)`, and waits at `address`
+    when neither `--host` nor a static address names one. Its steps may run `$STOWAGE_CTL` (the
+    running `<short>-stow`), as the TrueNAS module runs `vm truenas`.
+  - It needs OpenTofu's `tofu` on `PATH` (it runs `tofu version` first; the modules require
+    1.8 or later) and, for TrueNAS's built-in module, in the environment only, `TRUENAS_URL` (`https://<host>[:<port>]`; plain
     `http://` is refused, as the key travels with every call) and `TRUENAS_API_KEY`; `TRUENAS_INSECURE_SKIP_VERIFY` (`1`, `true` or `yes`) accepts the host's
     self-signed certificate. These are the names OpenTofu's TrueNAS provider reads; the key is
     never written to a file. Each is checked before anything is asked.
-  - After the product's questions it asks where on TrueNAS and how big: `--vm-name` (letters and
-    digits; default the host name's), `--pool`, `--dataset` (under the pool, e.g. `vms`),
+  - After the product's questions it asks the VM's name, where it goes and how big — on TrueNAS
+    `--vm-name` (default the host name's letters and digits), `--pool`, `--dataset` (under the pool, e.g. `vms`),
     `--bridge` (the bridge or interface the NIC attaches to), `--cpus` (default 2), `--memory`
     in MiB (default 4096, at least 1024) and `--disk` in GiB (default 40, at least 16; the OS
-    grows into it at first boot). The review shows them with the address it will wait at.
-    These flags, `--host` and `--wait` are refused with `--create manual`.
+    grows into it at first boot), then elsewhere the module's own variables. The review shows
+    them with the address it will wait at (`the address its module returns, else <host>` where the
+    module may return one). These flags, `--tofu-var`, `--host` and `--wait` are refused with
+    `--create manual`.
   - The disk is fetched into `$XDG_CACHE_HOME/<name>/disks/<16 hex>/` (the first 16 hex digits of
     the disk artifact's digest, which the release records; the file's own SHA-256 is
     `image_sha256` below; `$XDG_CACHE_HOME` defaults to `~/.cache`), not `--out`, and kept, so
     a second VM of that disk reuses it. The VM's directory is
     `$XDG_STATE_HOME/<name>/vms/<hostname>/` (default `~/.local/state`, 0700; a relative
     `XDG_*` value is ignored, as the XDG spec says, and `HOME` must then be absolute; a path
-    holding `%`, `\` or `"` is refused, as ssh would misread it): the embedded
-    OpenTofu module (`main.tf`, `variables.tf`, `outputs.tf`, `versions.tf`; the
-    `pjsalty/truenas` provider pinned to 3.0.0), `terraform.tfvars.json` (the VM's name, place,
-    size, the disk's and the seed's paths and SHA-256 — no credential), the seed `seed.iso`,
-    OpenTofu's `terraform.tfstate`, and `known_hosts` (the VM's SSH host key). A host name whose
-    directory holds the variables (an apply ran, or was tried) is refused: `vm destroy` it
+    holding `%`, `\` or `"` is refused, as ssh would misread it): the module (the built-in one's
+    `main.tf`, `variables.tf`, `outputs.tf`, `versions.tf`, or `--module`'s files),
+    `terraform.tfvars.json` (the VM's name, place, size, the module's variables, the disk's and
+    the seed's paths and SHA-256 — no credential), `platform` (`<platform> builtin` or
+    `<platform> module`, which `vm destroy` reads), the seed (`seed.iso`, or `user-data.yaml` on a
+    cloud), OpenTofu's `terraform.tfstate`, and `known_hosts` (the VM's SSH host key). A host name
+    whose directory holds the variables (an apply ran, or was tried) is refused: `vm destroy` it
     first, or choose another `--hostname`. So is a `--vm-name` another VM there already has,
-    whatever its case (its zvol and staging dataset would be the same).
+    whatever its case (on TrueNAS its zvol and staging dataset would be the same).
   - `tofu` runs in a session of its own: interrupted (Ctrl-C, or the run stopped), it is sent one
     interrupt and given 5 minutes to record what it made; a second Ctrl-C is passed on (OpenTofu
     then stops at once), and after 5 minutes it and what it started are killed. Interrupted
     while it waits for the VM, `vm create` says the VM is kept and names `vm destroy`.
-  - It runs `tofu init` and `tofu apply -auto-approve` there (`TF_IN_AUTOMATION=1`, `TF_INPUT=0`,
-    and `STOWAGE_CTL` set to the running `<short>-stow`, which the module's steps run). The module
-    creates a staging dataset `<vm-name>-staging` and a zvol `<dataset>/<vm-name>` (16K blocks,
+  - It runs `tofu init`, `tofu apply -auto-approve` and `tofu output -json` there
+    (`TF_IN_AUTOMATION=1`, `TF_INPUT=0`, and `STOWAGE_CTL` set to the running `<short>-stow`, which
+    the module's steps run). TrueNAS's module creates a staging dataset `<vm-name>-staging` and a zvol `<dataset>/<vm-name>` (16K blocks,
     LZ4), uploads the disk image (checked against its SHA-256 first; an upload already there at
     its size is not sent again) and converts it into the zvol, uploads the seed, creates the VM
     (UEFI, host CPU, `--cpus` cores, autostart) with the disk, a VirtIO NIC whose MAC is derived
@@ -1857,7 +1972,7 @@ in the same installer (bootstrap it as above, then `sh <name>.sh vm create …`,
   - It then waits, up to `--wait` (default 20m), polling every 10 s over `ssh` (batch mode, the
     private key next to `--ssh-key`'s `.pub` when it exists) at `--host` (an address or a
     host name; an IPv6 address bracketed or not, `[2001:db8::7]` taken as `2001:db8::7`; default
-    the static IPv4 address, else the host name — with DHCP and a static IPv6 address alone,
+    the static IPv4 address, else the module's `address`, else the host name — with DHCP and a static IPv6 address alone,
     `--host` gives that address when this machine reaches the VM over it; a DHCP server must
     register it) until `<short>-stow status
     --json` there answers from a system that is not Kairos's recovery (a first boot runs the
@@ -1890,11 +2005,13 @@ in the same installer (bootstrap it as above, then `sh <name>.sh vm create …`,
     the key on first contact into a file of its own, and the VM's `known_hosts` keeps the key of
     the attempt that answered. A VM not ready in time is kept; the error says so.
   - It prints `ssh <user>@<host> <short>-stow status` and where the state is.
-- **`vm destroy HOSTNAME`** destroys a VM `vm create --create opentofu` made: the VM, its zvol
-  (its data), its uploads, then its state directory. It needs the same environment and `tofu`,
-  asks on a terminal (default no), and without one refuses unless `--yes`. Snapshots of the zvol
-  and the staging dataset (a periodic task's) are deleted first, as TrueNAS refuses to delete a
-  dataset that has any. The cached disk stays.
+- **`vm destroy HOSTNAME`** destroys a VM `vm create --create opentofu` made: `tofu destroy` of its
+  module (the VM, its disk and data, its uploads), then its state directory. It needs the same
+  environment and `tofu` (the TrueNAS API's variables for TrueNAS's built-in module, as its
+  `platform` file records; a VM made before that file is TrueNAS's), asks on a terminal ("Destroy
+  the VM H: its disk, its data and its uploads on <platform>", default no), and without one refuses
+  unless `--yes`. On TrueNAS, snapshots of the zvol and the staging dataset (a periodic task's) are
+  deleted first, as TrueNAS refuses to delete a dataset that has any. The cached disk stays.
 - `vm truenas import-image|seed|start|stop|drop-snapshots` (hidden) are the module's steps, run
   by OpenTofu: each reads `TRUENAS_URL`, `TRUENAS_API_KEY`, `TRUENAS_INSECURE_SKIP_VERIFY` and its
   own variables (`IMAGE`, `IMAGE_SHA256`, `STAGING_DIR`, `ZVOL`; `SEED`, `SEED_PATH`; `VM_ID`;
@@ -2523,7 +2640,7 @@ internal/installerbin/ the installer executable embedded in stowage
 internal/payload/     the release an installer carries; the bootstrap shell script
 internal/install/     the installer: the Docker shape (install, re-run, status, provision, the front),
                       the Kubernetes one (k8s), the Kairos VM's (vm create, the cloud-config and
-                      its seed, OpenTofu's TrueNAS module, boot, the host daemon, its verbs) and
+                      its seed, OpenTofu's modules (TrueNAS, and the previews) and their contract, boot, the host daemon, its verbs) and
                       mirror export / import
 internal/truenas/     TrueNAS's API: the disk and seed uploads, power, snapshots (the module's steps)
 internal/testutil/    test helpers
@@ -2541,13 +2658,13 @@ make image    # stowage:<version> runtime image (distroless)
 make test     # fast loop: unit tests without the race detector
 make gate     # the commit gate: check, build, lint, then only the end-to-end suites the change (against GATE_BASE, default HEAD, untracked files included) can affect; e2e-kairos, e2e-vm and e2e-full-vm (given STOWAGE_VM_ENV) one at a time beside the others, which run in parallel; each step of a suite prints the time since it began
 make gate-plan  # the suites `make gate` would run, each with the first changed path that needs it; `bash test/gate.sh --plan --paths P…` for given paths
-make e2e      # build, then ship / verify / promote / yank / prune examples/minimal, signed, against zot, and run its installer image
+make e2e      # build, then ship / verify / promote / yank / prune examples/minimal, signed, against zot, and run its installer image; with registry.pull none on a registry refusing anonymous reads, ship stops before it builds
 make smoke-install  # the installer on the local Docker engine: registry, stack, front, provision hook, re-run, status, upgrade, rollback; behind TLS the local CA, then byo with --ca, each one's CA published to the stack and what the front serves chaining to it; the byo install moved to internal and back by re-runs; a loopback install on `::1` with `--ipv6` (the stack's network and the front have IPv6); with a global IPv6 address on the host, a TLS install whose route has an allowlist, called from that address: `--ipv6` and the allowlist holding it serves, an allowlist without it refuses (403), and the same install moved off IPv6 refuses it too (the front sees Docker's IPv4 gateway)
 make e2e-docker     # build, then the real binaries against zot and the local Docker engine: ship examples/minimal 1.0.0, install it with the bootstrap one-liner, re-run, ship 2.0.0 and 3.0.0 and reach each with notes-stow upgrade --version (each release's signature checked against the kept installer's key), roll back (allowed, then refused at a rollback barrier); then `mirror export` 3.0.0, `mirror import` into a TLS zot of its own test CA (refused without `--registry-ca`, the signatures carried), a second install from it with `--registry` and `--registry-ca`, and `upgrade --version` reading it with the recorded CA
 make e2e-full       # build, then examples/full as it stands on the Docker shape: ship this month's CalVer release with a token push, signed with the key its environment holds (env://), install it with the bootstrap one-liner (the installer image pulled with the project's own pull account) in loopback mode, every route serving, the api migrating a real Postgres and serving as its app role, the provision hook registering the administrator and its API key through the api and its credentials file 0600; the install prints its endpoint (the api route's URL, also in `status`) and ends with the search extension's tip (`atlas-search`, not published on the channel); a re-run sets the search extension's input (`SEARCH_URL`, the api reaching it, no tip), another clears it (the tip again), the hook handed back the key it minted; the app's users revoke that key: `provision` fails naming `provision --set`, `provision --set ADMIN_API_KEY=` mints and registers another (in no log), the next run keeps it; its record lost, `provision --set ADMIN_API_KEY=<key>` gives the key the hook never returned (declared in `hooks.provision.returns`; an undeclared key refused) and no other is minted; re-runs turn forward auth on the api route on (no identity without the authentication service's answer, a forged header stripped) and off, narrow the ingest route's allowlist to another address and to none (403), set an advanced input and give it back to its default (status shows each); `secrets rotate` takes the internal secret through --stage, the swap and --finish, each value accepted while it must be and the old one refused after; ship .2 (a migration), upgrade --version (data kept, a pg_dump snapshot), roll back (allowed by the api image's reads-newer label); ship .3 (a migration that is a rollback barrier), upgrade, and rollback is refused naming the barrier and the snapshot
-make e2e-k8s        # build, then the real binaries against zot and a kind cluster pulling from it with the pull Secret: k8s install with the bootstrap script (the provision hook's Job run, what it returned in its Secret and not the log), upgrade --values, upgrade alone (what the hook returned handed back), upgrade --version 2.0.0, a refused downgrade, a failed upgrade helm rolls back, rollback, status, reset-db (what the hook returned forgotten)
+make e2e-k8s        # build, then the real binaries against zot and a kind cluster pulling from it with the pull Secret: k8s install with the bootstrap script (the provision hook's Job run, what it returned in its Secret and not the log), upgrade --values, upgrade alone (what the hook returned handed back), upgrade --version 2.0.0, a refused downgrade, a failed upgrade helm rolls back, rollback, status, reset-db (what the hook returned forgotten), uninstall refused without --data (the chart's own claim, which helm deletes), then uninstall --data removing the release, its Secrets, the hook's account and the claim, the namespace kept
 make e2e-stateless  # build, then examples/stateless on the Docker shape: ship 1.0.0 (a pulled image, no database) to zot, install it with the bootstrap one-liner in loopback mode, the health path and the route serving the input, the endpoint printed (the route's recorded URL); a re-run changes the input; `status` shows the endpoint; ship 1.0.1, `upgrade --version 1.0.1` (nothing dumped) and `rollback` (no schema check), the input kept; `reset-db` refused, the release having no database
-make e2e-full-k8s   # build, then examples/full's chart on a kind cluster pulling from zot: k8s install with the bootstrap script against a Postgres outside the release (its two URLs and the administrator's password secret inputs from the operator's environment), two api replicas migrating once, the provision hook's Job registering the administrator and its API key (recorded in the outputs Secret, in no log; the Job deleted; no helm hook), every service answering, the api reaching the search extension's URL given at the install (`--set SEARCH_URL=…`), the endpoint printed as the api's Service URL; `k8s upgrade` of the same release, the key handed back to the hook; the app's users revoke the key, ship .2 (a migration), upgrade --version: the release runs .2 and the hook fails naming `k8s provision --set`, which mints and registers another key, and `k8s provision` again keeps it; its record lost, `k8s provision --set ADMIN_API_KEY=<key>` gives the key the hook never returned (an undeclared key refused) and no other is minted (data kept); rollback (the previous api on the newer schema); a second release in another namespace with the embedded Postgres, and reset-db deleting its database's claim, forgetting what the hook returned and registering the administrator again; `k8s secrets rotate` through its three passes, the release restarted at each, each value accepted while it must be
+make e2e-full-k8s   # build, then examples/full's chart on a kind cluster pulling from zot: k8s install with the bootstrap script against a Postgres outside the release (its two URLs and the administrator's password secret inputs from the operator's environment), two api replicas migrating once, the provision hook's Job registering the administrator and its API key (recorded in the outputs Secret, in no log; the Job deleted; no helm hook), every service answering, the api reaching the search extension's URL given at the install (`--set SEARCH_URL=…`), the endpoint printed as the api's Service URL; `k8s upgrade` of the same release, the key handed back to the hook; the app's users revoke the key, ship .2 (a migration), upgrade --version: the release runs .2 and the hook fails naming `k8s provision --set`, which mints and registers another key, and `k8s provision` again keeps it; its record lost, `k8s provision --set ADMIN_API_KEY=<key>` gives the key the hook never returned (an undeclared key refused) and no other is minted (data kept); rollback (the previous api on the newer schema); a second release in another namespace with the embedded Postgres, and reset-db deleting its database's claim, forgetting what the hook returned and registering the administrator again; `k8s secrets rotate` through its three passes, the release restarted at each, each value accepted while it must be; `k8s uninstall --yes` of the embedded release keeps its database's claim and its Secrets, and `k8s install` takes them back, the events kept
 make e2e-kairos     # build, then ship examples/minimal's OS bundle and its qcow2 and ova disks and its three clouds' raw, vhd and gce to zot for real (each image docker-loaded from the bundle, each disk checked in its format, the vhd and the gce as Azure and Google Cloud import them); the bundle's notes-stow on the local Docker engine as on the VM (install from the preloaded images with a settings file, boot, the host daemon's verbs, its disk-pressure POST to the api (the token never logged) and `status` showing it, its app socket and the api service's token and mount, `backup config`, `verify`, `run` to a WebDAV server through the preloaded runner, the backup decrypted and read by `pg_restore`, `list`, `status`); re-ship (nothing built), promote, `vm create` from the published notes-stow (the qcow2 by digest, the seed ISO), verify, prune; ship 2.0.0, whose notes-stow's boot upgrades the install, and 1.0.0's boot goes back
 STOWAGE_VM_ENV=<file> make e2e-vm   # build, ship examples/minimal's OS bundle and qcow2 disk to zot, carry the release with `mirror export` / `mirror import` to a TLS zot mirror of its own test CA on this host's address toward TrueNAS, then the published notes-stow's `vm create --create opentofu --registry --registry-ca` boots a real VM on TrueNAS from the mirror's disk: its first boot installs from the cloud-config (`--ssh-allow` this host's address and its global IPv6 addresses, `--ipv6`, `--timezone Europe/Paris`); over SSH, the firewall's table (input dropped by default, SSH from this host alone, over IPv4 and IPv6, the front's ports) and the time zone, status, ps, passwordless sudo, the admin group, the app socket (refused without the install's token, served with it) and the api service's read-only mount; the install records the mirror and the VM trusts its CA; the front answers HTTPS; `reset-db --yes` wipes the data and provisions again (a new admin password) without a reboot; `backup config` over SSH (the rclone config on standard input, a schedule the timer takes), `backup run` of a partitioned table with a key to a WebDAV server on this host, the backup decrypted and read by `pg_restore`; a row added, then `restore` (the key on standard input) brings the backup's data back; `secrets export` to the operator's key decrypts into the install's secrets; 1.0.1 is shipped and carried through the mirror, `updates` offers it and `upgrade --yes` takes a backup first, then reboots the VM into it, whose health gate marks the boot good; `rollback --yes` reboots it into the passive system, back on 1.0.0, and a second `rollback` is refused there; 1.0.2, whose api never becomes ready, is upgraded to from the passive system, fails its health gate, and the VM falls back to 1.0.0, `status` naming the failed boot and its diagnostics, `updates` no longer offering 1.0.2; 1.0.3, a rollback barrier that never becomes ready, fails its gate too and is kept (the boot marked good, `status` saying why going back is refused); the cloud-config's network is DHCP with DHCPv6 asked at once, the stack's network has IPv6, the LAN gives the VM a global IPv6 address and an IPv6 default route, and this host reaches it over IPv6 by SSH and HTTPS; `network set` keeps the DHCP lease as a static address, a static unique local IPv6 address beside it, and `network confirm` keeps it (the console banner tells it), a change back to DHCP not confirmed comes undone at its 30 s window's end, and another, a reboot inside its window, at the boot; `vm destroy` removes it all
 STOWAGE_VM_ENV=<file> make e2e-full-vm   # build, ship examples/full's this month's release with its OS bundle and qcow2 disk to zot, carry it through the TLS mirror as e2e-vm does, then the published at-stow's `vm create --create opentofu` boots a real VM on TrueNAS whose first boot installs it with the search extension's input set (`--set SEARCH_URL=http://api:9090`, the api standing in for a search service); through the VM's front over HTTPS, the api answers with the organisation, the administrator the provision hook registered and the search URL reached; the console and ingest serve, and an event reaches the api; the api reads the front's local CA (publish_ca), which the api route's certificate chains to; the hook's credentials file is 0600, the api mounts the app socket's directory read-only; `vm destroy` removes it all (upgrade, rollback and the health gate's fallback are e2e-vm's)

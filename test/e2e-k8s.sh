@@ -17,7 +17,9 @@
 # same again is a note → 1.0.0's `k8s upgrade` is refused → an upgrade that never becomes ready is
 # rolled back by helm → `k8s rollback` goes back one upgrade, to 1.0.0 → `k8s status` → `k8s
 # reset-db` deletes the release's claim, forgets what the hook returned and installs it again with
-# the same values and Secret.
+# the same values and Secret → `k8s uninstall` is refused without --data (helm would delete the
+# chart's own claim), then `--data` removes the release, its Secrets, the hook's account and the
+# claim, and keeps the namespace.
 set -euo pipefail
 
 # The amd64 image of the example's postgres: mirroring copies every platform of an index.
@@ -127,5 +129,17 @@ runs 1.0.0 2
 if kubectl exec -n "$NS" deploy/notes-web -- test -e /data/marker; then fail "the uploads claim kept its data"; fi
 [[ $(kubectl get -n "$NS" secret notes-stowage -o jsonpath='{.data}') == "$secret" ]] || fail "reset-db changed the Secret"
 [[ -n $(returned) && $(returned) != "$pw" ]] || fail "reset-db did not forget what the hook returned"
+
+step "k8s uninstall: refused without --data (helm deletes the chart's claim), then removes all but the namespace"
+if ctl v1.sh k8s uninstall --yes >"$WORK/uninstall0.log" 2>&1; then fail "k8s uninstall --yes deleted the chart's claim without --data"; fi
+grep -q 'notes-uploads, which `helm uninstall` deletes with it' "$WORK/uninstall0.log" || { cat "$WORK/uninstall0.log"; fail "the refusal does not name the claim"; }
+helm status -n "$NS" notes >/dev/null 2>&1 || fail "the refused uninstall removed the release"
+ctl v1.sh k8s uninstall --data --yes --timeout 3m >"$WORK/uninstall.log" 2>&1 || { cat "$WORK/uninstall.log"; cluster_logs >&2; fail "k8s uninstall --data"; }
+grep -q 'kept: the namespace notes' "$WORK/uninstall.log" || { cat "$WORK/uninstall.log"; fail "uninstall does not say what it kept"; }
+! helm status -n "$NS" notes >/dev/null 2>&1 || fail "the release is still installed"
+for o in secret/notes-stowage secret/notes-stowage-provision serviceaccount/notes-stowage-provision role/notes-stowage-provision rolebinding/notes-stowage-provision pvc/notes-uploads; do
+	[[ -z $(kubectl get -n "$NS" "$o" --ignore-not-found -o name) ]] || fail "$o is left"
+done
+kubectl get namespace "$NS" >/dev/null || fail "the namespace was deleted"
 
 printf '\nPASS\n'

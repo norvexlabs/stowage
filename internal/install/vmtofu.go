@@ -1,18 +1,16 @@
 package install
 
 import (
-	"bytes"
 	"cmp"
 	"context"
 	"embed"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/fs"
 	"os"
-	"path"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -25,7 +23,7 @@ import (
 // tofuModules are the OpenTofu modules `vm create` applies, one directory per platform that has
 // one.
 //
-//go:embed tofu/truenas/*.tf
+//go:embed tofu/*/*.tf
 var tofuModules embed.FS
 
 // The ways `vm create` makes a VM.
@@ -40,15 +38,20 @@ const CtlVar = "STOWAGE_CTL"
 // sshPoll is how often a new VM is asked whether it has installed.
 var sshPoll = 10 * time.Second
 
-// TofuVM is a VM OpenTofu creates on TrueNAS: where on the host, and its size.
+// TofuVM is a VM OpenTofu creates: its name and size, where it goes on TrueNAS, and the other
+// platforms' variables.
 type TofuVM struct {
-	Name      string // the VM's name on TrueNAS: letters and digits
-	Pool      string
-	Dataset   string // under the pool: where its zvol and staging dataset go
-	Bridge    string // the interface or bridge its NIC attaches to
+	Name      string // the VM's name on its platform: letters and digits on TrueNAS
+	Pool      string // TrueNAS
+	Dataset   string // TrueNAS, under the pool: where its zvol and staging dataset go
+	Bridge    string // TrueNAS: the interface or bridge its NIC attaches to
 	CPUs      int
 	MemoryMiB int
 	DiskGiB   int
+	// Module is the operator's module directory, applied instead of the platform's built-in one.
+	Module string
+	// Vars are the module's own variables (--tofu-var), beside the contract's.
+	Vars map[string]string
 }
 
 // tofuVars are the module's variables (variables.tf): what the state records, never a credential.
@@ -117,9 +120,10 @@ func (o *Options) diskCache(name string) (string, error) {
 // tried to — what `vm destroy` needs, and what a second create of the host refuses.
 const varsFile = "terraform.tfvars.json"
 
-// claimedBy is the host of another VM OpenTofu created whose TrueNAS name is vmName, ignoring case
-// (its zvol and staging dataset are named in lowercase): "" when none.
-func (o *Options) claimedBy(name, host, vmName string) (string, error) {
+// claimedBy is the host of another VM OpenTofu created on the same platform, with a built-in
+// module or not as onBuiltin says, whose name is vmName, ignoring case (a TrueNAS VM's zvol and
+// staging dataset are named in lowercase): "" when none.
+func (o *Options) claimedBy(name, host, vmName, platform string, onBuiltin bool) (string, error) {
 	vms, err := o.vmsDir(name)
 	if err != nil {
 		return "", err
@@ -142,7 +146,16 @@ func (o *Options) claimedBy(name, host, vmName string) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		var v tofuVars
+		// Names are each platform's own: another platform's VM never claims one.
+		if key, builtin, err := readPlatform(filepath.Join(vms, e.Name())); err != nil {
+			return "", err
+		} else if key != platform || builtin != onBuiltin {
+			continue
+		}
+		// The name alone: a module's other variables are of any type.
+		var v struct {
+			Name string `json:"name"`
+		}
 		if err := json.Unmarshal(b, &v); err != nil {
 			return "", fmt.Errorf("%s: %w", filepath.Join(vms, e.Name(), varsFile), err)
 		}
@@ -154,23 +167,38 @@ func (o *Options) claimedBy(name, host, vmName string) (string, error) {
 }
 
 // creation asks how the VM is made, on a platform OpenTofu can create it on.
-func (in *Installer) creation(ctx context.Context, p Platform, given string) (string, error) {
+func (in *Installer) creation(ctx context.Context, p Platform, given, module string) (string, error) {
 	if given != "" && given != CreateTofu && given != CreateManual {
 		return "", fmt.Errorf("--create %s: %s or %s", given, CreateTofu, CreateManual)
 	}
+	if module != "" {
+		if given == CreateManual {
+			return "", fmt.Errorf("--module is for --create %s", CreateTofu)
+		}
+		return CreateTofu, nil
+	}
 	if !p.Tofu {
 		if given == CreateTofu {
-			return "", fmt.Errorf("--create %s: OpenTofu creates VMs on truenas only; %s is by hand", CreateTofu, p.Label)
+			return "", fmt.Errorf("--create %s: OpenTofu has no built-in module for %s: give your own with --module <dir>, or create it by hand", CreateTofu, p.Label)
 		}
 		return CreateManual, nil
 	}
 	if given == "" && in.O.Prompt != nil {
+		tofu := "OpenTofu creates it on " + p.Label + " (`tofu` on this machine)"
+		if p.Preview {
+			tofu += ", with a module not run on " + p.Label + " yet (a preview)"
+		}
 		a, err := in.O.Prompt.Ask(ctx, Form{
 			Questions: []Question{{Title: "How is the VM created", Key: "--create", Choices: []Choice{
-				{CreateTofu, "OpenTofu creates it on " + p.Label + " (`tofu` on this machine)"},
+				{CreateTofu, tofu},
 				{CreateManual, "By hand: write its disk and seed, and print the steps"},
 			}}},
-			Defaults: func(map[string]string) map[string]string { return map[string]string{"--create": CreateTofu} },
+			Defaults: func(map[string]string) map[string]string {
+				if p.Preview {
+					return map[string]string{"--create": CreateManual}
+				}
+				return map[string]string{"--create": CreateTofu}
+			},
 		})
 		if err != nil {
 			return "", err
@@ -182,13 +210,16 @@ func (in *Installer) creation(ctx context.Context, p Platform, given string) (st
 
 // tofuReady checks what OpenTofu needs before anything is asked: `tofu`, and the TrueNAS API's
 // address and key in the environment, which the provider and the module's steps read.
-func (in *Installer) tofuReady(ctx context.Context) error {
+func (in *Installer) tofuReady(ctx context.Context, truenasAPI bool) error {
 	o := &in.O
 	if o.Tofu == nil {
 		return errors.New("OpenTofu is not available to this run")
 	}
 	if _, err := o.Tofu.Run(ctx, Cmd{Args: []string{"version"}}); err != nil {
 		return fmt.Errorf("--create %s runs OpenTofu's `tofu` (https://opentofu.org/docs/intro/install/): %w", CreateTofu, err)
+	}
+	if !truenasAPI {
+		return nil
 	}
 	for _, k := range []string{truenas.URLVar, truenas.KeyVar} {
 		if o.getenv(k) == "" {
@@ -200,10 +231,45 @@ func (in *Installer) tofuReady(ctx context.Context) error {
 	return err
 }
 
-var vmName = regexp.MustCompile(`^[A-Za-z0-9]{1,64}$`)
+var (
+	vmName = regexp.MustCompile(`^[A-Za-z0-9]{1,64}$`)
+	// dnsVMName is a VM name every other platform takes (Google Cloud's is the narrowest).
+	dnsVMName = regexp.MustCompile(`^[a-z]([-a-z0-9]{0,61}[a-z0-9])?$`)
+)
 
-// tofuVM asks what the flags did not give of where on TrueNAS the VM goes and its size.
-func (in *Installer) tofuVM(ctx context.Context, t *TofuVM, host string) error {
+// tofuVM asks what the flags did not give of the VM: its name and size, and where it goes — on
+// TrueNAS its pool, dataset and bridge, elsewhere the module's own variables. It returns the
+// module's files and the variables they declare, its contract checked.
+func (in *Installer) tofuVM(ctx context.Context, p Platform, t *TofuVM, host string) (map[string][]byte, []moduleVar, error) {
+	files, err := moduleFiles(p.Key, t.Module)
+	if err != nil {
+		return nil, nil, err
+	}
+	declared, err := moduleVars(files)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := checkContract(declared, t.Vars); err != nil {
+		return nil, nil, err
+	}
+	onTrueNAS := t.builtinTrueNAS(p)
+	if !onTrueNAS && (t.Pool != "" || t.Dataset != "" || t.Bridge != "") {
+		return nil, nil, errors.New("--pool, --dataset and --bridge are for TrueNAS's built-in module: give a module's own variables with --tofu-var NAME=VALUE")
+	}
+	for _, k := range sortedKeys(t.Vars) {
+		if onTrueNAS && slices.Contains(truenasVars, k) {
+			return nil, nil, fmt.Errorf("--tofu-var %s: TrueNAS's built-in module takes it from its own flag or environment (--pool, --dataset, --bridge, %s)", k, truenas.InsecureVar)
+		}
+	}
+	sized := map[string]bool{"--cpus": declares(declared, "cpus"), "--memory": declares(declared, "memory_mib")}
+	for _, f := range []struct {
+		flag string
+		n    int
+	}{{"--cpus", t.CPUs}, {"--memory", t.MemoryMiB}} {
+		if f.n != 0 && !sized[f.flag] {
+			return nil, nil, fmt.Errorf("%s: the module sizes the VM by a variable of its own (an instance type, a machine type): give it with --tofu-var", f.flag)
+		}
+	}
 	num := func(min int) func(string) error {
 		return func(v string) error {
 			if n, err := strconv.Atoi(v); err != nil || n < min {
@@ -233,66 +299,88 @@ func (in *Installer) tofuVM(ctx context.Context, t *TofuVM, host string) error {
 		}
 		return nil
 	}
+	defName := strings.Map(func(r rune) rune {
+		if r < '0' || (r > '9' && r < 'A') || (r > 'Z' && r < 'a') || r > 'z' {
+			return -1
+		}
+		return r
+	}, host)
+	if !onTrueNAS {
+		checkName = func(v string) error {
+			if !dnsVMName.MatchString(v) {
+				return fmt.Errorf("%q: lower-case letters, digits and '-', starting with a letter, at most 63 (a name every platform takes)", v)
+			}
+			return nil
+		}
+		defName = strings.ToLower(host)
+	}
 	itoa := func(n int) string {
 		if n == 0 {
 			return ""
 		}
 		return strconv.Itoa(n)
 	}
-	qs := []Question{
-		{Title: "The VM's name on TrueNAS", Key: "--vm-name", Check: checkName},
-		{Title: "The pool its disk goes on", Key: "--pool", Required: true, Check: nonEmpty},
-		{Title: "The dataset, under the pool, its disk goes in", Key: "--dataset", Required: true, Check: dataset},
-		{Title: "The bridge or interface its network attaches to", Key: "--bridge", Required: true, Check: nonEmpty},
-		{Title: "Its CPUs", Key: "--cpus", Check: num(1)},
-		{Title: "Its memory, in MiB", Key: "--memory", Check: num(1024)},
-		{Title: "Its disk, in GiB", Key: "--disk", Check: num(16)},
+	qs := []Question{{Title: "The VM's name on " + p.Label, Key: "--vm-name", Check: checkName}}
+	if onTrueNAS {
+		qs = append(qs,
+			Question{Title: "The pool its disk goes on", Key: "--pool", Required: true, Check: nonEmpty},
+			Question{Title: "The dataset, under the pool, its disk goes in", Key: "--dataset", Required: true, Check: dataset},
+			Question{Title: "The bridge or interface its network attaches to", Key: "--bridge", Required: true, Check: nonEmpty})
 	}
+	if sized["--cpus"] {
+		qs = append(qs, Question{Title: "Its CPUs", Key: "--cpus", Check: num(1)})
+	}
+	if sized["--memory"] {
+		qs = append(qs, Question{Title: "Its memory, in MiB", Key: "--memory", Check: num(1024)})
+	}
+	qs = append(qs, Question{Title: "Its disk, in GiB", Key: "--disk", Check: num(16)})
 	given := map[string]string{"--vm-name": t.Name, "--pool": t.Pool, "--dataset": t.Dataset, "--bridge": t.Bridge,
 		"--cpus": itoa(t.CPUs), "--memory": itoa(t.MemoryMiB), "--disk": itoa(t.DiskGiB)}
-	defaults := map[string]string{"--vm-name": strings.Map(func(r rune) rune {
-		if r < '0' || (r > '9' && r < 'A') || (r > 'Z' && r < 'a') || r > 'z' {
-			return -1
+	own := platformVars(declared, onTrueNAS)
+	for _, v := range own {
+		title := cmp.Or(v.Description, v.Name)
+		if v.HasDefault {
+			title += " (empty: the module's default)"
 		}
-		return r
-	}, host), "--cpus": "2", "--memory": "4096", "--disk": "40"}
+		qs = append(qs, Question{Title: title, Key: v.Name, Required: !v.HasDefault})
+		given[v.Name] = t.Vars[v.Name]
+	}
+	defaults := map[string]string{"--vm-name": defName, "--disk": "40"}
+	if sized["--cpus"] {
+		defaults["--cpus"] = "2"
+	}
+	if sized["--memory"] {
+		defaults["--memory"] = "4096"
+	}
 	a, err := in.askGiven(ctx, qs, given, defaults)
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
-	for _, k := range []string{"--vm-name", "--pool", "--dataset", "--bridge"} {
+	required := []string{"--vm-name"}
+	if onTrueNAS {
+		required = append(required, "--pool", "--dataset", "--bridge")
+	}
+	for _, k := range required {
 		if a[k] == "" {
-			return fmt.Errorf("%s is required with --create %s", k, CreateTofu)
+			return nil, nil, fmt.Errorf("%s is required with --create %s", k, CreateTofu)
 		}
 	}
 	t.Name, t.Pool, t.Dataset, t.Bridge = a["--vm-name"], a["--pool"], a["--dataset"], a["--bridge"]
 	t.CPUs, _ = strconv.Atoi(a["--cpus"])
 	t.MemoryMiB, _ = strconv.Atoi(a["--memory"])
 	t.DiskGiB, _ = strconv.Atoi(a["--disk"])
-	return nil
-}
-
-// writeModule writes the platform's module and its variables into dir.
-func writeModule(dir, platform string, v tofuVars) error {
-	root := path.Join("tofu", platform)
-	entries, err := fs.ReadDir(tofuModules, root)
-	if err != nil {
-		return err
-	}
-	for _, e := range entries {
-		b, err := fs.ReadFile(tofuModules, path.Join(root, e.Name()))
-		if err != nil {
-			return err
-		}
-		if err := writeAtomic(filepath.Join(dir, e.Name()), bytes.NewReader(b), 0o644, nil); err != nil {
-			return err
+	for _, v := range own {
+		switch val := a[v.Name]; {
+		case val != "":
+			if t.Vars == nil {
+				t.Vars = map[string]string{}
+			}
+			t.Vars[v.Name] = val
+		case !v.HasDefault:
+			return nil, nil, fmt.Errorf("--tofu-var %s=<value> is required by the module: %s", v.Name, cmp.Or(v.Description, "it has no default"))
 		}
 	}
-	b, err := json.MarshalIndent(v, "", "  ")
-	if err != nil {
-		return err
-	}
-	return writeAtomic(filepath.Join(dir, varsFile), bytes.NewReader(append(b, '\n')), 0o644, nil)
+	return files, declared, nil
 }
 
 // tofu runs OpenTofu in dir, its output on the log, with this run's environment (the TrueNAS
@@ -303,27 +391,58 @@ func (in *Installer) tofu(ctx context.Context, dir, ctl string, args ...string) 
 	return err
 }
 
-// applyVM writes the module into dir and applies it: the VM is created, its disk written from
-// image, its seed attached, and it is started.
-func (in *Installer) applyVM(ctx context.Context, dir, ctl string, t *TofuVM, image, imageSHA, seed string) error {
+// applyVM writes the module into dir with its variables, and the platform it was made for, then
+// applies it: the VM is created, its disk written from image, its seed attached, and it is
+// started. It returns the module's outputs: the VM's id, and its address when the platform tells.
+func (in *Installer) applyVM(ctx context.Context, dir, ctl string, p Platform, mach Machine, t *TofuVM, files map[string][]byte, declared []moduleVar, image, imageSHA, seed string) (id, addr string, err error) {
 	seedSHA, err := truenas.SHA256File(seed)
 	if err != nil {
-		return err
+		return "", "", err
 	}
 	m := in.R.Manifest
-	v := tofuVars{
-		Insecure: truenas.Insecure(in.O.getenv(truenas.InsecureVar)),
-		Name:     t.Name, Description: fmt.Sprintf("%s %s (revision %d), created by %s vm create", in.R.Spec.Name, m.ProjectVersion, m.Revision, in.R.Ctl()),
-		Pool: t.Pool, Dataset: t.Dataset, CPUs: t.CPUs, MemoryMiB: t.MemoryMiB, DiskGiB: t.DiskGiB, Bridge: t.Bridge,
-		Image: image, ImageSHA256: imageSHA, Seed: seed, SeedSHA256: seedSHA,
+	vars := map[string]any{
+		"name": t.Name, "description": fmt.Sprintf("%s %s (revision %d), created by %s vm create", in.R.Spec.Name, m.ProjectVersion, m.Revision, in.R.Ctl()),
+		"disk_gib": t.DiskGiB, "image": image, "image_sha256": imageSHA, "seed": seed, "seed_sha256": seedSHA,
 	}
-	if err := writeModule(dir, "truenas", v); err != nil {
-		return err
+	if t.builtinTrueNAS(p) {
+		vars["insecure_skip_verify"] = truenas.Insecure(in.O.getenv(truenas.InsecureVar))
+		vars["pool"], vars["parent_dataset"], vars["nic_attach"] = t.Pool, t.Dataset, t.Bridge
+	}
+	for _, v := range declared {
+		switch v.Name {
+		case "cpus":
+			vars[v.Name] = t.CPUs
+		case "memory_mib":
+			vars[v.Name] = t.MemoryMiB
+		case "dhcp":
+			vars[v.Name] = mach.staticAddr() == ""
+		case "admin_user":
+			vars[v.Name] = mach.User
+		case "ssh_public_key":
+			vars[v.Name] = mach.SSHKey
+		}
+	}
+	for k, v := range t.Vars {
+		vars[k] = v
+	}
+	// The platform first: a state with variables is one `vm destroy` must know the platform of.
+	how := "module"
+	if t.Module == "" {
+		how = "builtin"
+	}
+	if err := writeAtomic(filepath.Join(dir, platformFile), strings.NewReader(p.Key+" "+how+"\n"), 0o644, nil); err != nil {
+		return "", "", err
+	}
+	if err := writeModule(dir, files, vars); err != nil {
+		return "", "", err
 	}
 	if err := in.tofu(ctx, dir, ctl, "init", "-input=false", "-no-color"); err != nil {
-		return err
+		return "", "", err
 	}
-	return in.tofu(ctx, dir, ctl, "apply", "-input=false", "-auto-approve", "-no-color")
+	if err := in.tofu(ctx, dir, ctl, "apply", "-input=false", "-auto-approve", "-no-color"); err != nil {
+		return "", "", err
+	}
+	return in.tofuOutputs(ctx, dir, ctl)
 }
 
 // sshArgs are ssh's arguments to run command on the VM at addr as user: in batch mode (no
@@ -423,15 +542,23 @@ func (in *Installer) DestroyVM(ctx context.Context, d *VMDestroy) error {
 		}
 		return err
 	}
-	if err := in.tofuReady(ctx); err != nil {
+	key, builtin, err := readPlatform(dir)
+	if err != nil {
 		return err
+	}
+	if err := in.tofuReady(ctx, builtinTrueNAS(key, builtin)); err != nil {
+		return err
+	}
+	label := key
+	if i := slices.IndexFunc(Platforms, func(p Platform) bool { return p.Key == key }); i >= 0 {
+		label = Platforms[i].Label
 	}
 	if !d.Yes {
 		if o.Prompt == nil {
 			return fmt.Errorf("destroying %s deletes its disk: give --yes", d.Host)
 		}
 		a, err := o.Prompt.Ask(ctx, Form{
-			Questions: []Question{{Title: fmt.Sprintf("Destroy the VM %s: its disk, its data and its uploads on TrueNAS", d.Host), Key: "confirm",
+			Questions: []Question{{Title: fmt.Sprintf("Destroy the VM %s: its disk, its data and its uploads on %s", d.Host, label), Key: "confirm",
 				Choices: []Choice{{"no", "No, keep it"}, {"yes", "Yes, destroy it"}}}},
 			Defaults: func(map[string]string) map[string]string { return map[string]string{"confirm": "no"} },
 		})

@@ -392,7 +392,7 @@ func TestReleaseClaimsAreTheManifestsAndItsStatefulSets(t *testing.T) {
 		{"metadata":{"name":"data-notes-postgres-backup-0"` + pg + `}},{"metadata":{"name":"other"}},
 		{"metadata":{"name":"data-notes-postgres-3","labels":{"app":"another-set"}}},{"metadata":{"name":"data-notes-postgres-4"}},
 		{"metadata":{"name":"notes-certs"}},{"metadata":{"name":"cache"}}]}`)
-	got, kept, err := releaseClaims([]byte(resetManifest), listed, "notes")
+	got, kept, byHelm, err := releaseClaims([]byte(resetManifest), listed, "notes")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -404,11 +404,14 @@ func TestReleaseClaimsAreTheManifestsAndItsStatefulSets(t *testing.T) {
 	if !slices.Equal(kept, []string{"notes-certs"}) {
 		t.Errorf("kept %q", kept)
 	}
+	if !slices.Equal(byHelm, []string{"notes-uploads"}) {
+		t.Errorf("deleted by helm %q", byHelm)
+	}
 	// In the namespace the manifest names, its claim is the release's.
-	if got, _, _ := releaseClaims([]byte(resetManifest), listed, "shared"); !slices.Contains(got, "cache") {
+	if got, _, _, _ := releaseClaims([]byte(resetManifest), listed, "shared"); !slices.Contains(got, "cache") {
 		t.Errorf("in shared: %q", got)
 	}
-	if _, _, err := releaseClaims([]byte("kind: [\n"), listed, "notes"); err == nil {
+	if _, _, _, err := releaseClaims([]byte("kind: [\n"), listed, "notes"); err == nil {
 		t.Error("a broken manifest passed")
 	}
 }

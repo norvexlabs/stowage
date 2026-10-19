@@ -161,7 +161,7 @@ func TestShipPublishesTheOSBundleAndItsDisks(t *testing.T) {
 	rc, _ := layer.Compressed()
 	content, _ := io.ReadAll(rc)
 	rc.Close()
-	eq(t, "disk content", string(content), "qcow2 of "+e.host+"/acme/notes/notes-os@"+m.Artifacts.OS)
+	eq(t, "disk content", string(content), "qcow2 of "+m.Artifacts.OS)
 	eq(t, "latest-qcow2", e.digest("notes-disk", "latest-qcow2"), m.Artifacts.Disks["qcow2"])
 
 	again := e.mustShip("stable", 1)
@@ -188,8 +188,7 @@ func TestPromoteRetagsTheBundleAndDisks(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
 	beta := e.mustShip("beta", 1)
-	// A promotion builds nothing: it needs no pull account for the disk builder.
-	e.pullAuth = func(authn.Resource) (authn.AuthConfig, error) { return authn.AuthConfig{}, errors.New("no pull token") }
+	// A promotion builds nothing.
 	p, v := e.publisher()
 	e.builder.built, e.disks.made = nil, nil
 	st, err := p.Promote(context.Background(), v, "beta", "stable", 1)
@@ -381,36 +380,29 @@ func mustDigest(t *testing.T, e *env, repo, d string) name.Digest {
 	return ref
 }
 
-// The disk builder, a privileged third-party image, gets the pull account, never the publisher's.
-func TestDisksGetThePullAccount(t *testing.T) {
+// The disk builder, a privileged third-party image, holds no registry account: it reads the bundle
+// from a loopback proxy of that image, with the proxy's own account, and the proxy is gone once
+// the disks are made.
+func TestDisksReadTheBundleThroughAProxy(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
-	var asked []string
-	e.pullAuth = func(r authn.Resource) (authn.AuthConfig, error) {
-		asked = append(asked, r.String())
-		return authn.AuthConfig{Username: "pull", Password: "read-only"}, nil
-	}
-	e.mustShip("stable", 1)
+	rel := e.mustShip("stable", 1)
 	eq(t, "disks made", len(e.disks.requests), 1)
-	eq(t, "account", e.disks.requests[0].Auth.Username+":"+e.disks.requests[0].Auth.Password, "pull:read-only")
-	// Resolved for the bundle's repository (credentials may be scoped to it), before building and
-	// again before the disks.
-	eq(t, "resolved for", strings.Join(asked, ","), e.host+"/acme/notes/notes-os,"+e.host+"/acme/notes/notes-os")
-
-	// Without one, or one refused, nothing at all is built.
-	e.bump("1.1.0")
-	e.pullAuth = nil
-	if _, err := e.ship("stable", 1); err == nil || !strings.Contains(err.Error(), "no pull account") {
-		t.Fatalf("disks without a pull account: %v", err)
+	r := e.disks.requests[0]
+	ref, err := name.NewDigest(r.Source)
+	if err != nil {
+		t.Fatal(err)
 	}
-	eq(t, "built", len(e.builder.built), 0)
-	e.pullAuth = func(authn.Resource) (authn.AuthConfig, error) {
-		return authn.AuthConfig{}, errors.New("NOTES_PULL_TOKEN is not set")
+	if !strings.HasPrefix(ref.RegistryStr(), "127.0.0.1:") || ref.RegistryStr() == e.host || r.Registry != ref.RegistryStr() {
+		t.Errorf("source %s, registry %s: not a loopback proxy", ref, r.Registry)
 	}
-	if _, err := e.ship("stable", 1); err == nil || !strings.Contains(err.Error(), "disks: NOTES_PULL_TOKEN is not set") {
-		t.Fatalf("a refused pull account: %v", err)
+	eq(t, "repository", ref.RepositoryStr(), "acme/notes/notes-os")
+	eq(t, "digest", ref.DigestStr(), rel.Manifest.Artifacts.OS)
+	eq(t, "account", r.Auth.Username, "stowage-proxy")
+	eq(t, "password", len(r.Auth.Password), 64)
+	if _, err := remote.Head(ref, remote.WithAuth(authn.FromConfig(r.Auth))); err == nil {
+		t.Error("the proxy outlived the disks")
 	}
-	eq(t, "built", len(e.builder.built), 0)
 }
 
 // A work directory in memory is refused before the bundle's archives are written there.

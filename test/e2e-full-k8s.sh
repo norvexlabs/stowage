@@ -20,7 +20,8 @@
 # namespace with the embedded Postgres → `k8s reset-db` deletes its database's claim, forgets what
 # the hook returned, and the hook registers the administrator again → `k8s secrets rotate` takes
 # the internal secret through its three passes, the release restarted at each, each value
-# accepted while it must be.
+# accepted while it must be → `k8s uninstall --yes` of the embedded release keeps its database's
+# claim and its Secrets, and `k8s install` takes them back, the events kept.
 set -euo pipefail
 
 # The amd64 image of the example's postgres: mirroring copies every platform of an index.
@@ -289,5 +290,22 @@ rotate --finish
 [[ $(api_post "$old") == 401 ]] || fail "the api still takes the old value after --finish"
 ingest_event
 atlas_runs "$V1" 2
+
+step "k8s uninstall keeps the embedded database's claim and its Secrets; k8s install takes them back"
+NS=atlas-eval
+ingest_event
+events=$(status events)
+claim=$(kubectl get -n "$NS" pvc data-atlas-postgres-0 -o jsonpath='{.metadata.uid}')
+secret=$(kubectl get -n "$NS" secret atlas-stowage -o jsonpath='{.data}')
+ctl v1.sh k8s uninstall --namespace "$NS" --yes --timeout 3m >"$WORK/uninstall.log" 2>&1 || { cat "$WORK/uninstall.log"; cluster_logs >&2; fail "k8s uninstall"; }
+grep -q 'kept: its PersistentVolumeClaims data-atlas-postgres-0, which hold its data' "$WORK/uninstall.log" || { cat "$WORK/uninstall.log"; fail "uninstall does not say it kept the claim"; }
+! helm status -n "$NS" atlas >/dev/null 2>&1 || fail "the release is still installed"
+[[ -z $(kubectl get -n "$NS" serviceaccount atlas-stowage-provision --ignore-not-found -o name) ]] || fail "the hook's account is left"
+[[ $(kubectl get -n "$NS" pvc data-atlas-postgres-0 -o jsonpath='{.metadata.uid}') == "$claim" ]] || fail "the database's claim was deleted"
+(cd "$OP" && "${OPERATOR[@]}" sh v1.sh k8s install --namespace "$NS" --no-input --timeout 5m) >"$WORK/again.log" 2>&1 ||
+	{ cat "$WORK/again.log"; cluster_logs >&2; fail "k8s install over the kept data"; }
+atlas_runs "$V1" 1
+[[ $(kubectl get -n "$NS" secret atlas-stowage -o jsonpath='{.data}') == "$secret" ]] || fail "the install did not take the kept Secret back"
+[[ $(status events) == "$events" ]] || fail "the install over the kept claim lost the events"
 
 printf '\nPASS\n'

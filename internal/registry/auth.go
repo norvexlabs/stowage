@@ -3,7 +3,6 @@ package registry
 import (
 	"fmt"
 	"os"
-	"path/filepath"
 
 	"github.com/docker/cli/cli/config"
 	"github.com/google/go-containerregistry/pkg/authn"
@@ -41,25 +40,6 @@ func Keychain(p spec.Provider, getenv func(string) string) (authn.Keychain, erro
 	default:
 		return nil, fmt.Errorf("unknown registry auth provider %q", p.Name)
 	}
-}
-
-// DefaultDockerConfig reports whether a docker-config directory (empty: the default) is the
-// user's default Docker config, the one `docker login` writes, named or not.
-func DefaultDockerConfig(dir string) bool {
-	if dir == "" {
-		return true
-	}
-	same := func(p string) string {
-		a, err := filepath.Abs(p)
-		if err != nil {
-			return p
-		}
-		if r, err := filepath.EvalSymlinks(a); err == nil {
-			return r
-		}
-		return a
-	}
-	return same(dir) == same(config.Dir())
 }
 
 // Fixed is a keychain that answers a with every registry.

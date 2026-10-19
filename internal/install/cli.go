@@ -366,7 +366,23 @@ func k8sCommand(in *Installer, o *Options, prepare func() error, terminal func(b
 	rf.DurationVar(&resetTimeout, "timeout", 10*time.Minute, "how long helm and kubectl wait at each step")
 	rf.BoolVar(&o.NoProvision, "no-provision", false, "install again without running the provision hook")
 	rf.BoolVar(&o.K8s.NewBaseline, "new-baseline", false, "the release runs another schema baseline: wipe it and install this installer's release instead")
-	k.AddCommand(install, up, back, status, reset)
+	var uninstallTimeout time.Duration
+	uninstall := &cobra.Command{
+		Use:   "uninstall",
+		Short: "Uninstall the release and what the installer made beside it (its Secrets, the provision hook's Secret, account and Job); its PersistentVolumeClaims only with --data or when answered",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return run(cmd, uninstallTimeout, true, in.K8sUninstall)
+		},
+	}
+	uf := uninstall.Flags()
+	uf.BoolVar(&o.K8s.Data, "data", false, "delete the release's PersistentVolumeClaims too: its data")
+	uf.BoolVarP(&o.Yes, "yes", "y", false, "uninstall without asking (the data is kept unless --data)")
+	uf.BoolVar(noInput, "no-input", false, "never ask: without --yes, refuse")
+	uf.BoolVar(accessible, "accessible", false, "confirm with a plain line prompt")
+	uf.BoolVar(&o.DryRun, "dry-run", false, "print what would be deleted, change nothing")
+	uf.DurationVar(&uninstallTimeout, "timeout", 10*time.Minute, "how long helm and kubectl wait at each step")
+	k.AddCommand(install, up, back, status, reset, uninstall)
 	if in.R.Spec.Hooks.Provision != nil {
 		prov := &cobra.Command{
 			Use:   "provision",
@@ -581,6 +597,7 @@ func vmCreateCommand(in *Installer, o *Options, prepare func() error, terminal f
 	name, m := in.R.Spec.Name, in.R.Manifest
 	var c VMCreate
 	var secretsFile string
+	var tofuVars []string
 	vm := &cobra.Command{
 		Use:   "vm",
 		Short: fmt.Sprintf("Run %s on a VM of its own: its Kairos OS, from a disk image", name),
@@ -598,6 +615,22 @@ func vmCreateCommand(in *Installer, o *Options, prepare func() error, terminal f
 				in.O.Prompt = terminal(*accessible)
 			}
 			c.Progress = downloadProgress(in.O.Log)
+			for _, kv := range tofuVars {
+				k, v, ok := strings.Cut(kv, "=")
+				if !ok || k == "" {
+					return fmt.Errorf("--tofu-var %q: NAME=VALUE", kv)
+				}
+				if slices.Contains(contractVars, k) || slices.Contains(optionalVars, k) {
+					return fmt.Errorf("--tofu-var %s: vm create writes it (the module contract's), from its own flags", k)
+				}
+				if _, dup := c.Vars[k]; dup {
+					return fmt.Errorf("--tofu-var %s is given twice", k)
+				}
+				if c.Vars == nil {
+					c.Vars = map[string]string{}
+				}
+				c.Vars[k] = v
+			}
 			if c.Ctl, err = os.Executable(); err != nil {
 				return err
 			}
@@ -643,11 +676,19 @@ func vmCreateCommand(in *Installer, o *Options, prepare func() error, terminal f
 	f.BoolVar(accessible, "accessible", false, "ask with plain line prompts (screen readers); also when ACCESSIBLE is set or TERM=dumb")
 	f.StringVar(&o.Registry, "registry", "", "a registry prefix to read the disk and the VM's updates from, a mirror")
 	f.StringVar(&o.RegistryCA, "registry-ca", "", "a PEM file of the CA the registry's certificate chains to, a mirror's own: trusted here and, through the cloud-config, by the VM")
-	f.StringVar(&c.Create, "create", "", CreateTofu+" (OpenTofu creates the VM: truenas) or "+CreateManual+" (write its disk and seed, print the steps); asked where OpenTofu can, else "+CreateManual)
-	f.StringVar(&c.Name, "vm-name", "", "OpenTofu: the VM's name on TrueNAS, letters and digits (default: the host name's)")
-	f.StringVar(&c.Pool, "pool", "", "OpenTofu: the pool the VM's disk goes on")
-	f.StringVar(&c.Dataset, "dataset", "", "OpenTofu: the dataset, under the pool, the VM's disk goes in")
-	f.StringVar(&c.Bridge, "bridge", "", "OpenTofu: the bridge or interface the VM's network attaches to")
+	var tofuKeys []string
+	for _, p := range Platforms {
+		if p.Tofu {
+			tofuKeys = append(tofuKeys, p.Key)
+		}
+	}
+	f.StringVar(&c.Create, "create", "", CreateTofu+" (OpenTofu creates the VM: "+strings.Join(tofuKeys, ", ")+", or any platform with --module) or "+CreateManual+" (write its disk and seed, print the steps); asked where OpenTofu can, else "+CreateManual)
+	f.StringVar(&c.Module, "module", "", "OpenTofu: your own module directory, applied instead of the platform's built-in one (it holds the module contract: README)")
+	f.StringArrayVar(&tofuVars, "tofu-var", nil, "OpenTofu: a variable of the module, NAME=VALUE (repeatable): a platform's own, never a credential (those come from the environment)")
+	f.StringVar(&c.Name, "vm-name", "", "OpenTofu: the VM's name on its platform: letters and digits on TrueNAS, else lower-case letters, digits and '-' (default: the host name's)")
+	f.StringVar(&c.Pool, "pool", "", "OpenTofu on TrueNAS: the pool the VM's disk goes on")
+	f.StringVar(&c.Dataset, "dataset", "", "OpenTofu on TrueNAS: the dataset, under the pool, the VM's disk goes in")
+	f.StringVar(&c.Bridge, "bridge", "", "OpenTofu on TrueNAS: the bridge or interface the VM's network attaches to")
 	f.IntVar(&c.CPUs, "cpus", 0, "OpenTofu: the VM's CPUs (default 2)")
 	f.IntVar(&c.MemoryMiB, "memory", 0, "OpenTofu: the VM's memory in MiB (default 4096, at least 1024)")
 	f.IntVar(&c.DiskGiB, "disk", 0, "OpenTofu: the VM's disk in GiB (default 40, at least 16)")

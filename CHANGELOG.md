@@ -3,6 +3,30 @@
 Stowage's own releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
+## [0.5.0]
+
+### Added
+- **`k8s uninstall`** removes a Kubernetes release and what the installer made beside it (its
+  Secrets, the provision hook's account and Job), and prints what it kept. The release's
+  PersistentVolumeClaims go only with `--data` or when answered; data kept keeps the Secrets it
+  needs, so `k8s install` takes it back. It removes a release an older installer made, of any
+  project name, so moving a release to another registry or name is an uninstall then an install.
+- **`vm create --create opentofu` on every canonical platform**: built-in modules for libvirt,
+  Proxmox VE, vSphere, AWS, Google Cloud and Azure beside TrueNAS's, marked as previews until they
+  have run on their platform (by hand stays the default there). Any other platform takes your own
+  module (`--module DIR`) holding the module contract README describes; a module's own settings
+  are `--tofu-var NAME=VALUE`, asked when missing. A cloud VM is waited for at the address its
+  module returns, and sized by its instance type (`--cpus` and `--memory` are for hypervisors).
+- `ship` with `registry.pull: none` stops when a repository it writes refuses an anonymous read
+  (a registry that creates repositories private, as ghcr does), naming them: before it builds,
+  after the images' push, and before a channel points at the release.
+
+### Changed
+- The disk images no longer depend on the registry's visibility or on `registry.pull`: the disk
+  builder reads the OS bundle through a read-only loopback proxy that holds the publisher's
+  account, and no account enters its container. `registry.pull` may now be the default Docker
+  login with `disk_formats`.
+
 ## [0.4.1] - 2026-10-19
 
 ### Changed

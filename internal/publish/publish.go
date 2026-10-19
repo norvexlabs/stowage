@@ -20,7 +20,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/name"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/mutate"
@@ -58,9 +57,11 @@ type Builder interface {
 // Publisher acts on one project's registry.
 type Publisher struct {
 	Project *project.Project
-	// Registry writes with the publisher's credentials; Upstream reads pinned upstream images.
-	Registry, Upstream *registry.Client
-	Builder            Builder
+	// Registry writes with the publisher's credentials; Upstream reads pinned upstream images;
+	// Anonymous reads with no account, as an install does when registry.pull is none (nil checks
+	// nothing).
+	Registry, Upstream, Anonymous *registry.Client
+	Builder                       Builder
 	// Signer signs and checks every image and release manifest when the project configures
 	// signing; it is required then.
 	Signer         Signer
@@ -70,13 +71,11 @@ type Publisher struct {
 	Installer []byte
 	Pull      *payload.Account
 	// Disks makes the OS bundle's disk images, and WorkDir (on disk) holds the bundle's build
-	// context; PullAuth is the account the disk builder is given to pull the bundle: registry.pull,
-	// never the publisher's. All three are needed for a project with the kairos shape.
-	Disks    DiskMaker
-	WorkDir  string
-	PullAuth func(authn.Resource) (authn.AuthConfig, error)
-	Now      func() time.Time
-	Log      io.Writer
+	// context: both are needed for a project with the kairos shape.
+	Disks   DiskMaker
+	WorkDir string
+	Now     func() time.Time
+	Log     io.Writer
 }
 
 func (p *Publisher) logf(format string, a ...any) {
@@ -262,12 +261,9 @@ func (p *Publisher) Ship(ctx context.Context, o ShipOptions) (*Ref, error) {
 	if !ok {
 		return nil, fmt.Errorf("channel %q is not declared", o.Channel)
 	}
-	// The disk builder and its pull account are checked before anything is built; a promotion
-	// builds nothing.
-	if p.hasOS() && len(s.Shapes.Kairos.Formats()) > 0 && !o.NoBuild {
-		if _, err := p.diskAccount(); err != nil {
-			return nil, err
-		}
+	// The disk builder is checked before anything is built; a promotion builds nothing.
+	if p.hasOS() && len(s.Shapes.Kairos.Formats()) > 0 && !o.NoBuild && p.Disks == nil {
+		return nil, errors.New("disks: no disk builder")
 	}
 	tag, err := p.releaseTag(o.Version, o.Channel, o.Revision)
 	if err != nil {
@@ -330,6 +326,17 @@ func (p *Publisher) Ship(ctx context.Context, o ShipOptions) (*Ref, error) {
 				return nil, fmt.Errorf("image %s: %s %s is published on the immutable channel %s and its image is no longer %s; publish a new revision (--revision %d)",
 					pl.image, s.Name, tag, o.Channel, existing.Manifest.Artifacts.Images[pl.image], o.Revision+1)
 			}
+		}
+	}
+	// With registry.pull none, every install reads anonymously: a repository the release writes
+	// that refuses it stops the run before anything is built.
+	if p.anonymousReads() {
+		private, err := p.privateRepos(ctx, p.shipRepos(plans, o.Channel))
+		if err != nil {
+			return nil, err
+		}
+		if len(private) > 0 {
+			return nil, p.privateError(private, "then ship again")
 		}
 	}
 	// The published release's installer is made again from its manifest, before anything is
@@ -409,6 +416,16 @@ func (p *Publisher) Ship(ctx context.Context, o ShipOptions) (*Ref, error) {
 		manifests[pl.image], configs[pl.image] = pm.String(), pc.String()
 		if err := p.ensureSigned(ctx, d); err != nil {
 			return nil, fmt.Errorf("image %s: %w", pl.image, err)
+		}
+	}
+	// A repository the first push created may be private: checked before the bundle and its disks.
+	if p.anonymousReads() {
+		refs, err := p.imageRefs(plans)
+		if err != nil {
+			return nil, err
+		}
+		if private := p.unreadable(ctx, refs); len(private) > 0 {
+			return nil, p.privateError(private, "then ship again")
 		}
 	}
 	images := map[string]string{}
@@ -544,6 +561,17 @@ func (p *Publisher) Ship(ctx context.Context, o ShipOptions) (*Ref, error) {
 	}
 	if err := p.verifyRelease(ctx, rel, tag); err != nil {
 		return nil, fmt.Errorf("verify: %w", err)
+	}
+	// What the release wrote last (its chart, installer and manifest) is checked before a channel
+	// points at it.
+	if p.anonymousReads() {
+		refs, err := p.releaseRefs(rel)
+		if err != nil {
+			return rel, err
+		}
+		if private := p.unreadable(ctx, refs); len(private) > 0 {
+			return rel, p.privateError(private, fmt.Sprintf("then ship again: release %s is published, no channel points at it yet, and a run of the same inputs carries on", tag))
+		}
 	}
 	if y := rel.Manifest.Yanked; y != nil {
 		err := fmt.Errorf("release %s is yanked (%s): it is not offered again; publish a new revision", tag, y.Reason)

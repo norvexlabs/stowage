@@ -40,8 +40,10 @@ type K8sOptions struct {
 	// NewBaseline lets reset-db wipe a release that runs another schema baseline than this
 	// installer's release, and install this one: the only way a release crosses a baseline.
 	NewBaseline bool
-	Helm        Tool
-	Kubectl     Tool
+	// Data lets uninstall delete the release's PersistentVolumeClaims without asking.
+	Data    bool
+	Helm    Tool
+	Kubectl Tool
 }
 
 // MinHelm is the oldest helm the installer accepts: --reset-then-reuse-values.

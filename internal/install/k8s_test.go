@@ -69,6 +69,7 @@ type fakeKube struct {
 	canIErr   string            // `kubectl auth can-i` cannot ask, its stderr saying this
 	canI      []string          // what `kubectl auth can-i` was asked
 	logs      map[string]string // `kubectl logs`, by container
+	objects   map[string]string // `kubectl get <kind> <name>` by "kind/name", before any other answer
 }
 
 type kubeTool struct {
@@ -204,7 +205,12 @@ func (k kubeTool) Run(_ context.Context, c Cmd) ([]byte, error) {
 			}
 			return nil, nil
 		}
+		if obj, ok := f.objects[a[1]+"/"+a[2]]; ok {
+			return []byte(obj), nil
+		}
 		switch {
+		case slices.Contains([]string{"serviceaccount", "role", "rolebinding"}, a[1]):
+			return nil, nil
 		case a[1] == "job":
 			return []byte(f.job), nil
 		case a[1] == "configmap":

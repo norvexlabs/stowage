@@ -15,6 +15,11 @@ A finished item is deleted, not ticked. The plan behind it is
 
 ## Should
 
+- **Disks with rootless Docker or Docker Desktop**: the disk builder (auroraboot, on the host
+  network) reads the bundle from `ship`'s proxy on 127.0.0.1, which an engine in another network
+  namespace does not reach. Serve the proxy where that engine reaches it (its bridge's gateway),
+  with the same one-run account.
+
 - **IPv6 on a cloud**: the VM asks DHCPv6 at once (`WithoutRA=solicit`), the canonical way AWS,
   Azure and GCP hand out IPv6 addresses, proven on a LAN's router advertisements and DHCPv6 only
   (e2e-vm); untested on a cloud (no cloud account). The IPv6 client an allowlist is checked against
@@ -123,8 +128,6 @@ A finished item is deleted, not ticked. The plan behind it is
 - **Kairos at-rest encryption**: the persistent partition encrypted with a TPM-sealed key
   (Kairos kcrypt), or the sealed secrets' deployment key sealed by the TPM; later a key server or
   a cloud KMS releasing it at boot after attestation. The boot flow stays the same.
-- **More OpenTofu providers for VM creation** (libvirt, Proxmox, vSphere, the clouds): TrueNAS
-  only in the first version.
 - **Secrets as files (opt-in)**: deliver secrets as `/run/secrets/<KEY>` (compose `secrets:`, a
   mounted Secret on Kubernetes) instead of environment variables, which leak into `docker
   inspect`, crash dumps and child processes.

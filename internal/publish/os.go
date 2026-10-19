@@ -12,7 +12,6 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/name"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/mutate"
@@ -206,23 +205,6 @@ func (p *Publisher) planOS(ctx context.Context, o ShipOptions, tag string, mutab
 		}
 	}
 	return pl, nil
-}
-
-// diskAccount is the account the disk builder pulls the bundle with. The disk builder runs a
-// third-party image, privileged: it gets the read-only pull account, never the publisher's.
-func (p *Publisher) diskAccount() (authn.AuthConfig, error) {
-	if p.Disks == nil || p.PullAuth == nil {
-		return authn.AuthConfig{}, errors.New("disks: no disk builder or no pull account")
-	}
-	repo, err := p.Registry.Repo(p.osRepo())
-	if err != nil {
-		return authn.AuthConfig{}, err
-	}
-	a, err := p.PullAuth(repo)
-	if err != nil {
-		return authn.AuthConfig{}, fmt.Errorf("disks: %w", err)
-	}
-	return a, nil
 }
 
 // buildOS builds the bundle with the release's images preloaded and pushes it by digest.
@@ -451,20 +433,26 @@ func writeLayout(w io.Writer, img v1.Image, ref string) error {
 
 // buildDisks makes the disks of formats from the bundle at osRef and pushes each by digest.
 func (p *Publisher) buildDisks(ctx context.Context, o ShipOptions, osRef name.Digest, formats []string, plans []*artifact) error {
-	// Resolved again, checks included: Ship checked it before building, and a short-lived
-	// credential may have expired during the bundle's build.
-	acct, err := p.diskAccount()
-	if err != nil {
-		return err
+	if p.Disks == nil {
+		return errors.New("disks: no disk builder")
 	}
 	ov, err := p.osVersion(o.Version, o.Revision)
 	if err != nil {
 		return err
 	}
 	base := p.Project.Spec.Name + "-" + ov
+	// The disk builder runs a third-party image, privileged: it reads the bundle from a loopback
+	// proxy of that one image, with the proxy's own one-run account (in its Docker config file),
+	// while the proxy holds the publisher's; so it never holds a registry credential, and a disk
+	// never depends on who else may read the registry.
+	source, acct, stop, err := p.Registry.ReadProxy(ctx, osRef)
+	if err != nil {
+		return fmt.Errorf("disks: %w", err)
+	}
+	defer stop()
+	host, _, _ := strings.Cut(source, "/")
 	p.logf("disks: make %s", strings.Join(formats, ", "))
-	files, cleanup, err := p.Disks.Build(ctx, kairos.DiskRequest{Source: osRef.String(), Registry: osRef.RegistryStr(),
-		Auth: acct, Formats: formats, Base: base})
+	files, cleanup, err := p.Disks.Build(ctx, kairos.DiskRequest{Source: source, Registry: host, Auth: acct, Formats: formats, Base: base})
 	defer func() {
 		if cleanup != nil {
 			cleanup()

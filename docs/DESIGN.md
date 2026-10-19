@@ -452,6 +452,14 @@ speaks natively (docker, helm, oras, cosign, kairos-agent, containerd):
 | **publisher** token (API key) | read + create + update + delete on the project's repositories | `stowage ship / promote / yank / prune` only; env `STOWAGE_PUSH_TOKEN`, never baked anywhere |
 
 No client certificates anywhere: one auth path to build and test, and no per-tool cert flags.
+With `registry.pull: none` there is no pull account: every install reads anonymously, and a
+registry that creates repositories private (ghcr) would let a release publish that no install can
+read. `ship` reads each repository it writes anonymously — before it builds (what exists),
+after the images' push (what the push created, before the long bundle and disk builds), and
+before a channel points at the release (all it recorded, by digest) — and stops naming them. The
+last check sits after the release is written and before the pointer moves, so nothing an operator
+can reach is unreadable, and the next run of the same inputs carries on. The disk builder does not
+depend on it: it reads the bundle through a loopback proxy (see the Kairos shape's disks).
 Rotating the publisher token touches only the publisher; rotating the pull account gives installs
 the new password through its variable at their next run (§ 7 row 25).
 
@@ -649,7 +657,7 @@ on this shape") instead of failing obscurely.
 | 24 | Rotate secrets | `secrets rotate KEY` for `rotation: true`, three passes (`--stage` → `KEY_NEXT` accepted; swap → `KEY_PREVIOUS` accepted; `--finish`), the stack up again at each **C** | `k8s secrets rotate`: the same passes on the Secret, each workload's rollout restarted and awaited **C** | the Docker shape's verb, a host daemon job **C** |
 | 25 | Registry credential rotation | `.env` / installer flag **C** | pull Secret **C** | sealed env + `reconfigure-userdata` **C** → the pull account the OS bundle carries; a mirror's is root's Docker login on the VM |
 | 26 | Power / maintenance | `stop` / `start` **C** | owner: cluster | `hostctl reboot/shutdown --drain-secs`, disk-pressure hook **C** |
-| 27 | Uninstall | `uninstall [--keep-data]` **X** | `<short>-stow k8s uninstall` wraps `helm uninstall`, names the kept PVCs **X** | owner: hypervisor |
+| 27 | Uninstall | `uninstall [--keep-data]` **X** | `k8s uninstall`: `helm uninstall`, the installer's Secrets, the hook's account and Job; the claims only with `--data`, kept data keeping the Secrets that answer for it, a chart's own claim (which helm deletes) needing `--data` **C** | `vm destroy` (a VM `vm create` made with OpenTofu) **C**; else owner: hypervisor |
 | 28 | Move host / disaster recovery | `secrets export` on old → `install --secrets` on new **C** (data: the snapshot by hand) | owner: managed PG; secrets **X** | `secrets export`, then `vm create --secrets` + `restore OBJECT` **C** |
 
 Rules:
@@ -781,7 +789,7 @@ tests/                  lifecycle smoke per shape
 | scheduled backup on Docker | 15 | S | the backup container is already generic (deferred, § 12) |
 | `restore` verb on Docker, Kubernetes secrets export/import | 16, 28 | M | the VM has both; Docker restores by hand |
 | K8s barrier pre-flight before `helm rollback` | 22 | S | parity with Docker and VM |
-| `uninstall` (Docker, K8s) | 27 | S | otherwise removal is manual |
+| `uninstall` (Docker) | 27 | S | `down` and removing the volumes by hand |
 
 ## 11. Phases
 
@@ -811,8 +819,15 @@ raw, Azure a fixed VHD, Google Cloud a `disk.raw` tar.gz), keeps them across shi
 promotion; `make e2e-kairos` builds them for real against zot. Only the raw disk comes from
 auroraboot; every other format is converted from it by the clouds' documented recipes (qemu-img,
 tar), so one auroraboot run serves them all and each format's conformance is checked by `ship`,
-not taken on trust. Uploading and registering them in a cloud account is pending (TODO): it uses
-the publisher's cloud credentials from the environment, which nothing in a release carries. The bundle carries `<short>-stow`:
+not taken on trust. auroraboot, a privileged third-party image, holds no registry credential: `ship`
+serves it the bundle read-only on a loopback port (GET and HEAD of that manifest, by digest, and
+its repository's blobs), the proxy holding the publisher's account (pull-scoped where the
+registry issues tokens) and asking auroraboot for an account of its own, a one-run random password
+in a private Docker config file — a loopback port is open to every local user, and a command
+line is readable by them. So the disks build from the registry whoever else may read it, and the
+publisher's account never enters a container. Uploading and
+registering them in a cloud account is pending (TODO): it uses the publisher's cloud credentials
+from the environment, which nothing in a release carries. The bundle carries `<short>-stow`:
 it installs the release on the VM from the preloaded images, brings it up, upgrades it or goes
 back at boot, and serves the host daemon (status, services, logs, provision, updates, upgrade
 through kairos-agent, reboot); `make e2e-kairos` runs it on the local Docker engine, including a
@@ -821,7 +836,9 @@ digest, in its platform's format) and its cloud-config (a NoCloud seed ISO, or a
 user-data), whose settings the first boot installs from; the services the spec names reach the
 host daemon on its app socket with a token. With OpenTofu, `vm create` creates the VM on TrueNAS
 and waits until it has installed, and `vm destroy` removes it; `make e2e-vm` does both on a real
-TrueNAS host. Next: the mirror for sites without internet (`mirror export` / `import`, a CA on
+TrueNAS host. The other canonical platforms (libvirt, Proxmox VE, vSphere, AWS, Google Cloud,
+Azure) have built-in modules as previews, and any platform takes the operator's module holding the
+same contract (`--module`). Next: the mirror for sites without internet (`mirror export` / `import`, a CA on
 every shape, the VM end-to-end test upgrading through it), then the health gate.
 
 | Phase | Scope | Proof |
@@ -903,8 +920,9 @@ every shape, the VM end-to-end test upgrading through it), then the health gate.
   answer carries the floor, and a client moves past it, so a truncated answer cannot be asked
   for twice. The scheduled backup waits (bounded) for a running job rather than lose its day to
   a short one (a verify). A check that may outlast a client's
-  deadline (backup verify) is a job, so its answer is never lost to a hop that gives up. A VM is created by `<short>-stow` with OpenTofu (TrueNAS provider first;
-  sizing asked, the disk and the cloud-init seed given to `tofu apply`) or by hand.
+  deadline (backup verify) is a job, so its answer is never lost to a hop that gives up. A VM is created by `<short>-stow` with OpenTofu (a built-in module per
+  canonical platform, TrueNAS's proven and the others previews, or the operator's; sizing asked,
+  the disk and the cloud-init seed given to `tofu apply`) or by hand.
 - **Kairos release on the VM** — the bundle is built before the release is published and serves
   every channel it is promoted to, so its `<short>-stow` carries the manifest without its
   publication (`bundled.json`: no channel, tag, number, date, yank or artifact beyond the images),
@@ -949,9 +967,22 @@ every shape, the VM end-to-end test upgrading through it), then the health gate.
   for the cloud-config's stages. The administrator logs in by SSH key only and has passwordless
   `sudo` (the cloud images' default): no password ever travels in user-data. Secret inputs are
   never in it: the install waits for them, given over SSH.
-- **Creating a VM with OpenTofu** — where a provider exists (TrueNAS in the first version), `vm
+- **Creating a VM with OpenTofu** — `<short>-stow` embeds a module per canonical platform:
+  TrueNAS (proven by `make e2e-vm`), and as previews libvirt/KVM, Proxmox VE and vSphere on
+  premises, AWS, Google Cloud and Azure in the clouds — each uploading the disk the platform takes
+  and the cloud-config (seed ISO on a hypervisor, user data on a cloud), creating and starting the
+  VM, and destroyed by `vm destroy`. A preview is a module not run on its platform yet: checked by
+  `tofu validate` against its pinned provider only, marked in README and in `vm create`'s output,
+  which names the manual steps as the fallback (by hand is its default on a terminal); it loses
+  the mark at its first passing run. Any other platform is the operator's own module
+  (`--module`), holding one contract: the variables `vm create` writes (name, size, the disk and
+  the seed, their SHA-256; the administrator and key when declared), the outputs it reads (`id`,
+  and `address` for a platform that only tells the address after the apply, as clouds do), and
+  `$STOWAGE_CTL` for steps the provider cannot declare. A platform's own settings are module
+  variables (`--tofu-var`, asked from the module's own descriptions), never a credential: each
+  provider reads those from the environment, so none enters the variables or the state. `vm
   create` asks "OpenTofu or by hand" and, with OpenTofu, sizes the VM after the product's
-  questions, applies a module `<short>-stow` embeds, and waits over SSH until the VM has installed.
+  questions, applies the module, and waits over SSH until the VM has installed.
   `tofu` is the operator's own, on `PATH`: OpenTofu is a tool operators install and upgrade, not
   one a product should vendor. The provider (`pjsalty/truenas`, community, over TrueNAS's JSON-RPC
   API) is pinned exactly. What it cannot declare — the bytes of the disk and the seed, power,

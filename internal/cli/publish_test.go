@@ -3,7 +3,6 @@ package cli
 import (
 	"bytes"
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"io"
 	"log"
@@ -12,9 +11,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/docker/cli/cli/config"
-	"github.com/google/go-containerregistry/pkg/authn"
-	"github.com/google/go-containerregistry/pkg/name"
 	ggcrregistry "github.com/google/go-containerregistry/pkg/registry"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/mutate"
@@ -23,7 +19,6 @@ import (
 	"github.com/norvexlabs/stowage/internal/graph"
 	"github.com/norvexlabs/stowage/internal/project"
 	"github.com/norvexlabs/stowage/internal/publish"
-	"github.com/norvexlabs/stowage/internal/registry"
 	"github.com/norvexlabs/stowage/internal/testutil"
 )
 
@@ -240,112 +235,5 @@ func TestShipBakesThePullAccountFromTheEnvironment(t *testing.T) {
 	testutil.Edit(t, root, "stowage.lock", "stowage: 0.0.9", "stowage: 0.1.0")
 	if _, logs, err := run(t, b, map[string]string{"NOTES_PUSH_TOKEN": "t0ken", "NOTES_PULL_TOKEN": "a"}, "-C", root, "ship", "--channel", "beta"); err != nil {
 		t.Fatalf("%v\n%s", err, logs)
-	}
-}
-
-// The disk builder's account is registry.pull's, for the bundle's repository, resolved by ship
-// (never by opening a publisher, so yank and prune need no pull token); never the user's default
-// Docker config, nor an account sharing a secret with the publisher's.
-func TestPullAuthForTheDiskBuilder(t *testing.T) {
-	root := testutil.CopyExample(t, "minimal")
-	auths := func(entries string) string {
-		dir := t.TempDir()
-		testutil.Write(t, dir, "config.json", `{"auths":{`+entries+`}}`)
-		return dir
-	}
-	entry := func(key, user, pw string) string {
-		return `"` + key + `":{"auth":"` + base64.StdEncoding.EncodeToString([]byte(user+":"+pw)) + `"}`
-	}
-	setPush := func(v map[string]any) { testutil.SetYAML(t, root, "stowage.yaml", []string{"registry", "push"}, v) }
-	setPull := func(v map[string]any) { testutil.SetYAML(t, root, "stowage.yaml", []string{"registry", "pull"}, v) }
-	repo, _ := name.NewRepository("registry.example.org/acme/notes-os")
-	env := map[string]string{}
-	o := &options{getenv: func(k string) string { return env[k] }}
-	open := func() *project.Project {
-		t.Helper()
-		p, err := project.Open(root, "")
-		if err != nil {
-			t.Fatal(err)
-		}
-		return p
-	}
-	auth := func() (authn.AuthConfig, error) {
-		t.Helper()
-		p := open()
-		push, err := registry.Keychain(p.Spec.Registry.Push, o.getenv)
-		if err != nil {
-			t.Fatal(err)
-		}
-		return o.pullAuth(p, push)(repo)
-	}
-	refused := func(what, want string) {
-		t.Helper()
-		if _, err := auth(); err == nil || !strings.Contains(err.Error(), want) {
-			t.Fatalf("%s: %v", what, err)
-		}
-	}
-
-	pushDir := auths(entry("registry.example.org", "publisher", "s3cret"))
-	setPush(map[string]any{"provider": "docker-config", "config": pushDir})
-	setPull(map[string]any{"provider": "docker-config", "config": pushDir})
-	refused("the same Docker config", "holds a secret of the publisher's account")
-
-	// The publisher's secret under another user name: a registry may ignore the name.
-	setPull(map[string]any{"provider": "docker-config", "config": auths(entry("registry.example.org", "pull", "s3cret"))})
-	refused("the push secret under another user", "holds a secret of the publisher's account")
-	env["PUSH_TOKEN"], env["PULL_TOKEN"] = "t0k", "t0k"
-	setPush(map[string]any{"provider": "token", "user": "publisher", "token_env": "PUSH_TOKEN"})
-	setPull(map[string]any{"provider": "token", "user": "pull", "token_env": "PULL_TOKEN"})
-	refused("two variables holding one token", "holds a secret of the publisher's account")
-
-	// Push credentials scoped to the repository are the ones compared.
-	setPush(map[string]any{"provider": "docker-config", "config": auths(entry("registry.example.org/acme/notes-os", "publisher", "scoped") + "," + entry("registry.example.org", "other", "host"))})
-	setPull(map[string]any{"provider": "docker-config", "config": auths(entry("registry.example.org", "pull", "scoped"))})
-	refused("a repository-scoped push secret", "holds a secret of the publisher's account")
-
-	// The user's default Docker config, unnamed or named: refused.
-	setPull(map[string]any{"provider": "docker-config"})
-	refused("the default Docker config", "registry.pull is the default Docker config")
-	saved := config.Dir()
-	def := auths(entry("registry.example.org", "me", "mine"))
-	config.SetDir(def)
-	t.Cleanup(func() { config.SetDir(saved) })
-	setPull(map[string]any{"provider": "docker-config", "config": def})
-	refused("the default Docker config by its path", "registry.pull is the default Docker config")
-	config.SetDir(saved)
-
-	// A read-only account of its own: accepted.
-	setPull(map[string]any{"provider": "docker-config", "config": auths(entry("registry.example.org", "reader", "r"))})
-	if a, err := auth(); err != nil || a.Username != "reader" {
-		t.Fatalf("a pull docker-config of its own: %+v, %v", a, err)
-	}
-	env["PULL_TOKEN"] = "r34d"
-	setPull(map[string]any{"provider": "token", "user": "pull", "token_env": "PULL_TOKEN"})
-	if a, err := auth(); err != nil || a.Username != "pull" || a.Password != "r34d" {
-		t.Fatalf("token pull account: %+v, %v", a, err)
-	}
-	delete(env, "PULL_TOKEN")
-	refused("an unset pull token", "PULL_TOKEN is not set")
-	setPull(map[string]any{"provider": "none"})
-	if a, err := auth(); err != nil || a != (authn.AuthConfig{}) {
-		t.Fatalf("anonymous: %+v, %v", a, err)
-	}
-
-	// Opening a publisher needs no pull token.
-	setPull(map[string]any{"provider": "token", "user": "pull", "token_env": "PULL_TOKEN"})
-	t.Setenv("XDG_CACHE_HOME", t.TempDir())
-	if _, err := o.publisher(open(), writeAccess); err != nil {
-		t.Fatalf("publisher without a pull token: %v", err)
-	}
-}
-
-func TestSecretsReadEveryField(t *testing.T) {
-	t.Parallel()
-	got := secrets(authn.AuthConfig{Password: "p", IdentityToken: "i", RegistryToken: "r", Auth: base64.StdEncoding.EncodeToString([]byte("u:a"))})
-	if strings.Join(got, ",") != "p,i,r,a" {
-		t.Errorf("secrets = %v", got)
-	}
-	if got := secrets(authn.AuthConfig{Username: "u"}); len(got) != 0 {
-		t.Errorf("a user name alone: %v", got)
 	}
 }

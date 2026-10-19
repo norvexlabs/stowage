@@ -347,7 +347,7 @@ func (in *Installer) K8sReset(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	claims, keptClaims, err := releaseClaims(manifest, listed, k.Namespace)
+	claims, keptClaims, _, err := releaseClaims(manifest, listed, k.Namespace)
 	if err != nil {
 		return err
 	}
@@ -490,8 +490,9 @@ func (in *Installer) K8sReset(ctx context.Context) error {
 // json`), the ones a release's manifest makes there, and the ones its StatefulSets there claim
 // (<template>-<set>-<ordinal>, carrying the set's selector labels, which Kubernetes gives them),
 // sorted; and, apart, the ones the manifest makes with `helm.sh/resource-policy: keep`, which the
-// chart keeps through an uninstall and a reset keeps too.
-func releaseClaims(manifest, listed []byte, namespace string) (claims, kept []string, err error) {
+// chart keeps through an uninstall and a reset keeps too; and, among claims, the manifest's own,
+// which `helm uninstall` deletes with the release (a StatefulSet's claims outlive it).
+func releaseClaims(manifest, listed []byte, namespace string) (claims, kept, byHelm []string, err error) {
 	type meta struct {
 		Name        string            `yaml:"name"`
 		Namespace   string            `yaml:"namespace"`
@@ -522,7 +523,7 @@ func releaseClaims(manifest, listed []byte, namespace string) (claims, kept []st
 			break
 		}
 		if err != nil {
-			return nil, nil, fmt.Errorf("the release's manifest: %w", err)
+			return nil, nil, nil, fmt.Errorf("the release's manifest: %w", err)
 		}
 		if doc.Metadata.Namespace != "" && doc.Metadata.Namespace != namespace {
 			continue
@@ -552,7 +553,7 @@ func releaseClaims(manifest, listed []byte, namespace string) (claims, kept []st
 		} `json:"items"`
 	}
 	if err := json.Unmarshal(listed, &list); err != nil {
-		return nil, nil, fmt.Errorf("kubectl get persistentvolumeclaims: %w", err)
+		return nil, nil, nil, fmt.Errorf("kubectl get persistentvolumeclaims: %w", err)
 	}
 	for _, it := range list.Items {
 		n, labels := it.Metadata.Name, it.Metadata.Labels
@@ -572,11 +573,15 @@ func releaseClaims(manifest, listed []byte, namespace string) (claims, kept []st
 			kept = append(kept, n)
 		case made[n] || ofSet:
 			claims = append(claims, n)
+			if made[n] {
+				byHelm = append(byHelm, n)
+			}
 		}
 	}
 	slices.Sort(claims)
 	slices.Sort(kept)
-	return claims, kept, nil
+	slices.Sort(byHelm)
+	return claims, kept, byHelm, nil
 }
 
 // ordinal reports whether name is prefix followed by a StatefulSet ordinal.

@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -81,6 +82,14 @@ func (f *fakeDisks) Build(_ context.Context, r kairos.DiskRequest) (map[string]s
 		return nil, func() {}, errors.New("auroraboot failed")
 	}
 	f.made, f.requests = append(f.made, r.Formats), append(f.requests, r)
+	// As auroraboot, the bundle is read from the source with the request's account.
+	ref, err := name.NewDigest(r.Source)
+	if err != nil {
+		return nil, nil, err
+	}
+	if _, err := remote.Head(ref, remote.WithAuth(authn.FromConfig(r.Auth))); err != nil {
+		return nil, nil, fmt.Errorf("read the bundle: %w", err)
+	}
 	dir, err := os.MkdirTemp(f.dir, "disks-")
 	if err != nil {
 		return nil, nil, err
@@ -88,7 +97,7 @@ func (f *fakeDisks) Build(_ context.Context, r kairos.DiskRequest) (map[string]s
 	out := map[string]string{}
 	for _, fm := range r.Formats {
 		out[fm] = filepath.Join(dir, r.Base+"."+kairos.Ext[fm])
-		if err := os.WriteFile(out[fm], []byte(fm+" of "+r.Source), 0o600); err != nil {
+		if err := os.WriteFile(out[fm], []byte(fm+" of "+ref.DigestStr()), 0o600); err != nil {
 			return nil, nil, err
 		}
 	}
@@ -96,20 +105,25 @@ func (f *fakeDisks) Build(_ context.Context, r kairos.DiskRequest) (map[string]s
 }
 
 type env struct {
-	t        *testing.T
-	disks    *fakeDisks
-	pullAuth func(authn.Resource) (authn.AuthConfig, error) // the pull account; anonymous by default
-	root     string
-	host     string
-	reg      *registry.Client
-	builder  *fakeBuilder
-	log      *bytes.Buffer
-	now      time.Time
+	t       *testing.T
+	disks   *fakeDisks
+	root    string
+	host    string
+	reg     *registry.Client
+	builder *fakeBuilder
+	log     *bytes.Buffer
+	now     time.Time
 	// failBlobs makes the registry answer 403 to every blob read; failDelete refuses deleting
 	// tags containing it.
 	failBlobs  bool
 	failDelete string
-	signer     *fakeSigner // set by sign()
+	// private are path fragments of repositories that refuse a request without an account; set,
+	// the registry asks for one (Basic), and anon is the client that reads with none.
+	private []string
+	anon    *registry.Client
+	// privateAs404 answers a refused read as an unknown repository, as some registries do.
+	privateAs404 bool
+	signer       *fakeSigner // set by sign()
 	// installer is the installer executable; pull the baked pull account.
 	installer []byte
 	pull      *payload.Account
@@ -177,6 +191,18 @@ func newEnv(t *testing.T) *env {
 			http.Error(w, "denied", http.StatusForbidden)
 			return
 		}
+		if e.private != nil && r.Header.Get("Authorization") == "" &&
+			(r.URL.Path == "/v2/" || slices.ContainsFunc(e.private, func(f string) bool { return strings.Contains(r.URL.Path, f) })) {
+			if e.privateAs404 && r.URL.Path != "/v2/" {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusNotFound)
+				_, _ = io.WriteString(w, `{"errors":[{"code":"NAME_UNKNOWN","message":"repository name not known to registry"}]}`)
+				return
+			}
+			w.Header().Set("WWW-Authenticate", `Basic realm="test"`)
+			http.Error(w, "authentication required", http.StatusUnauthorized)
+			return
+		}
 		if e.failBlobs && r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/blobs/") {
 			http.Error(w, "denied", http.StatusForbidden)
 			return
@@ -199,7 +225,6 @@ func newEnv(t *testing.T) *env {
 	testutil.SetYAML(t, root, "stowage.yaml", []string{"images", "postgres"}, map[string]any{"ref": host + "/upstream/postgres@" + d.String()})
 	e.root, e.host, e.reg, e.builder, e.log = root, host, registry.New(authn.NewMultiKeychain()) /* no keychain: never the host's Docker login */, &fakeBuilder{}, &bytes.Buffer{}
 	e.disks = &fakeDisks{dir: t.TempDir()}
-	e.pullAuth = func(authn.Resource) (authn.AuthConfig, error) { return authn.AuthConfig{}, nil }
 	e.now = time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC)
 	return e
 }
@@ -215,7 +240,7 @@ func (e *env) publisher() (*Publisher, string) {
 		e.t.Fatal(err)
 	}
 	pub := &Publisher{Project: p, Registry: e.reg, Upstream: e.reg, Builder: e.builder, StowageVersion: "0.1.0",
-		Installer: e.installer, Pull: e.pull, Disks: e.disks, WorkDir: e.t.TempDir(), PullAuth: e.pullAuth, Now: func() time.Time { return e.now }, Log: e.log}
+		Installer: e.installer, Pull: e.pull, Disks: e.disks, WorkDir: e.t.TempDir(), Anonymous: e.anon, Now: func() time.Time { return e.now }, Log: e.log}
 	if e.signer != nil {
 		pub.Signer = e.signer
 	}

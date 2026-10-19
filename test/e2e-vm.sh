@@ -234,7 +234,7 @@ net_field() { sed -n "s/^$1 *//p" "$WORK/net.txt"; }
 net "on DHCP"
 # vm create's network, DHCP with IPv6 on: the cloud-config's file, which asks DHCPv6 without
 # waiting for a router's advertisement, as a cloud gives IPv6 addresses.
-[[ $(net_field 'set by') == "the VM's cloud-config: the network \`vm create\` gave" ]] || { cat "$WORK/net.txt"; fail "the network is not the cloud-config's"; }
+[[ $(net_field 'set by') == "the VM's cloud-config, as \`vm create\` gave it: DHCP, automatic IPv6" ]] || { cat "$WORK/net.txt"; fail "the network is not the cloud-config's"; }
 on_vm cat /etc/systemd/network/05-notes-static.network >"$WORK/net-file.txt" || fail "no network file from the cloud-config"
 grep -qx 'DHCP=yes' "$WORK/net-file.txt" && grep -qx 'WithoutRA=solicit' "$WORK/net-file.txt" && ! grep -q 'IPv6AcceptRA=no' "$WORK/net-file.txt" ||
 	{ cat "$WORK/net-file.txt"; fail "the cloud-config's network is not DHCP with IPv6"; }

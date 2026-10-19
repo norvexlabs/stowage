@@ -2,13 +2,11 @@ package cli
 
 import (
 	"context"
-	"encoding/base64"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
-	"slices"
 	"strings"
 	"text/tabwriter"
 
@@ -62,7 +60,6 @@ func (o *options) publisher(p *project.Project, a access) (*publish.Publisher, e
 		return nil, fmt.Errorf("%s: %w", key, err)
 	}
 	builder, disks, workDir := o.builder, o.disks, ""
-	var pullAuth func(authn.Resource) (authn.AuthConfig, error)
 	kairosShape := p.Spec.Shapes.Kairos != nil
 	if a == writeAccess && (builder == nil || kairosShape) {
 		// Builds land in the user's cache, on disk: an OS bundle and its disks are gigabytes.
@@ -74,7 +71,6 @@ func (o *options) publisher(p *project.Project, a access) (*publish.Publisher, e
 			builder = &publish.DockerBuilder{WorkDir: filepath.Join(cache, "stowage", "build"), Stdout: o.err, Stderr: o.err}
 		}
 		if kairosShape {
-			pullAuth = o.pullAuth(p, kc)
 			workDir = filepath.Join(cache, "stowage", "os")
 			if disks == nil {
 				disks = &kairos.DiskBuilder{WorkDir: filepath.Join(cache, "stowage", "disks"), Stdout: o.err, Stderr: o.err}
@@ -99,82 +95,16 @@ func (o *options) publisher(p *project.Project, a access) (*publish.Publisher, e
 		Signer:         signer,
 		Registry:       reg,
 		Upstream:       registry.New(authn.DefaultKeychain, o.registryOpts...),
+		Anonymous:      registry.New(authn.NewMultiKeychain(), o.registryOpts...),
 		Builder:        builder,
 		Disks:          disks,
 		WorkDir:        workDir,
-		PullAuth:       pullAuth,
 		StowageVersion: o.buildVersion,
 		Installer:      o.installer,
 		Pull:           pull,
 		Now:            o.now,
 		Log:            o.err,
 	}, nil
-}
-
-// pullAuth resolves the account the disk builder pulls the bundle with: registry.pull's, for
-// the bundle's repository. The disk builder runs a third-party image, privileged, so the account
-// must be one the project declares for reading: the user's default Docker config (named or not)
-// is of unknown rights and refused, and so is an account sharing a secret with the publisher's,
-// whatever its user name.
-func (o *options) pullAuth(p *project.Project, push authn.Keychain) func(authn.Resource) (authn.AuthConfig, error) {
-	return func(res authn.Resource) (authn.AuthConfig, error) {
-		if pp := p.Spec.Registry.Pull; pp.Name == "docker-config" {
-			c, err := providers.DockerConfig(pp)
-			if err != nil {
-				return authn.AuthConfig{}, fmt.Errorf("registry.pull: %w", err)
-			}
-			if registry.DefaultDockerConfig(c.Config) {
-				return authn.AuthConfig{}, errors.New("registry.pull is the default Docker config, whose rights stowage cannot know: the disk builder runs privileged, so give registry.pull a read-only account (a token, or a docker-config with a config directory of its own)")
-			}
-		}
-		kc, err := registry.Keychain(p.Spec.Registry.Pull, o.getenv)
-		if err != nil {
-			return authn.AuthConfig{}, fmt.Errorf("registry.pull: %w", err)
-		}
-		pull, err := resolve(kc, res)
-		if err != nil {
-			return authn.AuthConfig{}, fmt.Errorf("registry.pull: %w", err)
-		}
-		pub, err := resolve(push, res)
-		if err != nil {
-			return authn.AuthConfig{}, fmt.Errorf("registry.push: %w", err)
-		}
-		for _, s := range secrets(pull) {
-			if slices.Contains(secrets(pub), s) {
-				return authn.AuthConfig{}, errors.New("registry.pull holds a secret of the publisher's account: the disk builder pulls with registry.pull, so give it a read-only account")
-			}
-		}
-		return pull, nil
-	}
-}
-
-func resolve(kc authn.Keychain, res authn.Resource) (authn.AuthConfig, error) {
-	a, err := kc.Resolve(res)
-	if err != nil {
-		return authn.AuthConfig{}, err
-	}
-	ac, err := a.Authorization()
-	if err != nil {
-		return authn.AuthConfig{}, err
-	}
-	return *ac, nil
-}
-
-// secrets are an account's secrets, whatever field holds them: a registry may ignore the user
-// name, so a secret alone grants the account's rights.
-func secrets(a authn.AuthConfig) []string {
-	var out []string
-	for _, s := range []string{a.Password, a.IdentityToken, a.RegistryToken} {
-		if s != "" {
-			out = append(out, s)
-		}
-	}
-	if raw, err := base64.StdEncoding.DecodeString(a.Auth); err == nil {
-		if _, pw, ok := strings.Cut(string(raw), ":"); ok && pw != "" {
-			out = append(out, pw)
-		}
-	}
-	return out
 }
 
 // pullAccount is the project's pull account as the installer bakes it in: the token provider's

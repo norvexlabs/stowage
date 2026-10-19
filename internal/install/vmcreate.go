@@ -28,8 +28,9 @@ type Platform struct {
 	Key, Label string
 	Formats    []string
 	ISO        bool
-	// Tofu: `vm create` can create the VM with OpenTofu (its module in tofu/<Key>).
-	Tofu bool
+	// Tofu: `vm create` can create the VM with OpenTofu, with its built-in module (tofu/<Key>);
+	// Preview: that module has not run on the platform yet.
+	Tofu, Preview bool
 	// Steps are what the operator does with the files, in order; %[1]s is the disk file, %[2]s the
 	// seed (the ISO or the user-data file).
 	Steps []string
@@ -42,16 +43,16 @@ var Platforms = []Platform{
 		"Create a zvol at least as large as the disk you want, and write the disk into it: qemu-img convert -O raw %[1]s /dev/zvol/<pool>/<zvol>.",
 		"Create a VM with UEFI boot, that zvol as its disk (VirtIO) and %[2]s as its CD-ROM, then start it.",
 	}},
-	{Key: "proxmox", Label: "Proxmox VE", Formats: []string{"qcow2", "raw"}, ISO: true, Steps: []string{
+	{Key: "proxmox", Label: "Proxmox VE", Formats: []string{"qcow2", "raw"}, ISO: true, Tofu: true, Preview: true, Steps: []string{
 		"Copy %[1]s to the Proxmox host, and %[2]s to an ISO storage (e.g. /var/lib/vz/template/iso/).",
 		"Create a VM with OVMF (UEFI) firmware and no disk, then import the disk: qm disk import <vmid> %[1]s <storage>; attach it and grow it to the size you want.",
 		"Attach %[2]s as the VM's CD-ROM, make the disk the first boot device, then start it.",
 	}},
-	{Key: "libvirt", Label: "libvirt / KVM (virt-install, virt-manager)", Formats: []string{"qcow2", "raw"}, ISO: true, Steps: []string{
+	{Key: "libvirt", Label: "libvirt / KVM (virt-install, virt-manager)", Formats: []string{"qcow2", "raw"}, ISO: true, Tofu: true, Preview: true, Steps: []string{
 		"Grow the disk to the size you want: qemu-img resize %[1]s 40G.",
 		"virt-install --name <name> --memory 4096 --vcpus 2 --boot uefi --osinfo linux2022 --import --disk %[1]s --disk %[2]s,device=cdrom --network default --noautoconsole",
 	}},
-	{Key: "vmware", Label: "VMware vSphere, ESXi or Workstation", Formats: []string{"ova"}, ISO: true, Steps: []string{
+	{Key: "vmware", Label: "VMware vSphere, ESXi or Workstation", Formats: []string{"ova"}, ISO: true, Tofu: true, Preview: true, Steps: []string{
 		"Deploy %[1]s (Deploy OVF Template, or File > Open), and grow its disk to the size you want.",
 		"Upload %[2]s to a datastore and attach it as the VM's CD-ROM (connected at power on), then power the VM on.",
 	}},
@@ -59,15 +60,15 @@ var Platforms = []Platform{
 		"Convert the disk for a generation 2 VM and grow it: Convert-VHD %[1]s <name>.vhdx; Resize-VHD <name>.vhdx -SizeBytes 40GB.",
 		"Create a generation 2 VM on <name>.vhdx, with Secure Boot's template \"Microsoft UEFI Certificate Authority\", and %[2]s in its DVD drive, then start it.",
 	}},
-	{Key: "azure", Label: "Microsoft Azure", Formats: []string{"vhd"}, Steps: []string{
+	{Key: "azure", Label: "Microsoft Azure", Formats: []string{"vhd"}, Tofu: true, Preview: true, Steps: []string{
 		"Upload %[1]s as a page blob, and create a managed image from it (az image create --source <blob URL> --os-type Linux --hyper-v-generation V2).",
 		"Create the VM from that image with %[2]s as its custom data (az vm create --custom-data %[2]s).",
 	}},
-	{Key: "gcp", Label: "Google Cloud", Formats: []string{"gce"}, Steps: []string{
+	{Key: "gcp", Label: "Google Cloud", Formats: []string{"gce"}, Tofu: true, Preview: true, Steps: []string{
 		"Upload %[1]s to a bucket, and create an image from it (gcloud compute images create --source-uri gs://<bucket>/<file> --guest-os-features UEFI_COMPATIBLE).",
 		"Create the instance from that image with %[2]s as its user-data (gcloud compute instances create --metadata-from-file user-data=%[2]s).",
 	}},
-	{Key: "aws", Label: "Amazon EC2", Formats: []string{"raw"}, Steps: []string{
+	{Key: "aws", Label: "Amazon EC2", Formats: []string{"raw"}, Tofu: true, Preview: true, Steps: []string{
 		"Upload %[1]s to S3, import it as a snapshot (aws ec2 import-snapshot), and register an image from it (aws ec2 register-image --boot-mode uefi).",
 		"Launch the instance from that image with %[2]s as its user data (aws ec2 run-instances --user-data file://%[2]s).",
 	}},
@@ -126,14 +127,21 @@ func (in *Installer) CreateVM(ctx context.Context, c *VMCreate) error {
 	if err != nil {
 		return err
 	}
-	how, err := in.creation(ctx, p, c.Create)
+	if c.Module != "" {
+		c.Module = expandHome(c.Module)
+	}
+	how, err := in.creation(ctx, p, c.Create, c.Module)
 	if err != nil {
 		return err
 	}
 	tofu := how == CreateTofu
 	if tofu {
-		if err := in.tofuReady(ctx); err != nil {
+		if err := in.tofuReady(ctx, c.builtinTrueNAS(p)); err != nil {
 			return err
+		}
+		if p.Preview && c.Module == "" {
+			fmt.Fprintf(o.Out, "OpenTofu's %s module is a preview: it has not run on %s yet. If it fails, `%s vm destroy <host>` removes what it made, and `--create %s` writes the disk and the cloud-config and prints the steps by hand.\n",
+				p.Label, p.Label, in.R.Ctl(), CreateManual)
 		}
 		if c.Host != "" {
 			// An IPv6 address is taken bare, as ssh takes it.
@@ -146,8 +154,8 @@ func (in *Installer) CreateVM(ctx context.Context, c *VMCreate) error {
 				}
 			}
 		}
-	} else if c.Host != "" || c.Wait != 0 || c.TofuVM != (TofuVM{}) {
-		return fmt.Errorf("--host, --wait, --vm-name, --pool, --dataset, --bridge, --cpus, --memory and --disk are for --create %s", CreateTofu)
+	} else if c.Host != "" || c.Wait != 0 || c.Name != "" || c.Pool != "" || c.Dataset != "" || c.Bridge != "" || c.CPUs != 0 || c.MemoryMiB != 0 || c.DiskGiB != 0 || len(c.Vars) > 0 {
+		return fmt.Errorf("--host, --wait, --vm-name, --pool, --dataset, --bridge, --cpus, --memory, --disk and --tofu-var are for --create %s", CreateTofu)
 	}
 	mach, err := in.machine(ctx, c)
 	if err != nil {
@@ -179,8 +187,10 @@ func (in *Installer) CreateVM(ctx context.Context, c *VMCreate) error {
 		seed = filepath.Join(out, mach.Hostname+"-seed.iso")
 	}
 	var state, addr string
+	var files map[string][]byte
+	var declared []moduleVar
 	if tofu {
-		if err := in.tofuVM(ctx, &c.TofuVM, mach.Hostname); err != nil {
+		if files, declared, err = in.tofuVM(ctx, p, &c.TofuVM, mach.Hostname); err != nil {
 			return err
 		}
 		if state, err = o.stateDir(name, mach.Hostname); err != nil {
@@ -191,11 +201,11 @@ func (in *Installer) CreateVM(ctx context.Context, c *VMCreate) error {
 		if _, err := os.Lstat(filepath.Join(state, varsFile)); err == nil {
 			return fmt.Errorf("%s exists: a VM %s was created before (`%s vm destroy %s` removes it), or give this one another --hostname", state, mach.Hostname, in.R.Ctl(), mach.Hostname)
 		}
-		switch other, err := o.claimedBy(name, mach.Hostname, c.Name); {
+		switch other, err := o.claimedBy(name, mach.Hostname, c.Name, p.Key, c.Module == ""); {
 		case err != nil:
 			return err
 		case other != "":
-			return fmt.Errorf("the VM %s, of host %s, is named %s on TrueNAS already: give this one another --vm-name", other, other, c.Name)
+			return fmt.Errorf("the VM %s, of host %s, is named %s on its platform already: give this one another --vm-name", other, other, c.Name)
 		}
 		if out, err = o.diskCache(name); err != nil {
 			return err
@@ -206,7 +216,10 @@ func (in *Installer) CreateVM(ctx context.Context, c *VMCreate) error {
 			return fmt.Errorf("the release's %s disk digest %q is not sha256", format, m.Artifacts.Disks[format])
 		}
 		out = filepath.Join(out, d[:16])
-		seed = filepath.Join(state, "seed.iso")
+		seed = filepath.Join(state, "user-data.yaml")
+		if p.ISO {
+			seed = filepath.Join(state, "seed.iso")
+		}
 		addr = cmp.Or(c.Host, mach.staticAddr(), mach.Hostname)
 		in.sshAllows(addr, mach.SSHAllow)
 		if a6 := mach.staticAddr6(); c.Host == "" && a6 != "" {
@@ -260,8 +273,15 @@ func (in *Installer) CreateVM(ctx context.Context, c *VMCreate) error {
 	}
 	ctl := in.R.Ctl()
 	if tofu {
-		if err := in.applyVM(ctx, state, c.Ctl, &c.TofuVM, disk, layer.Hex, seed); err != nil {
+		id, out, err := in.applyVM(ctx, state, c.Ctl, p, mach, &c.TofuVM, files, declared, disk, layer.Hex, seed)
+		if err != nil {
 			return fmt.Errorf("%w\n(the state is in %s: `%s vm create` again with the same --hostname is refused; `%s vm destroy %s` removes what was made)", err, state, ctl, ctl, mach.Hostname)
+		}
+		o.logf("OpenTofu created the VM %s (%s)", c.Name, id)
+		// The address the platform gave, when nothing named one: a cloud's is known only now.
+		if out != "" && c.Host == "" && mach.staticAddr() == "" {
+			addr = out
+			in.sshAllows(addr, mach.SSHAllow)
 		}
 		if err := in.awaitVM(ctx, state, mach.User, addr, c.SSHKey, cmp.Or(c.Wait, 20*time.Minute), len(waiting) == 0 && !st.AwaitSecrets); err != nil {
 			return err
@@ -724,8 +744,31 @@ func (in *Installer) confirmVM(ctx context.Context, p Platform, format string, m
 	tofu := addr != ""
 	if tofu {
 		t := c.TofuVM
-		fmt.Fprintf(&b, "  OpenTofu creates the VM %s at %s: %d CPUs, %d MiB, a %d GiB disk on %s/%s, its network on %s\n", t.Name, o.getenv(truenas.URLVar), t.CPUs, t.MemoryMiB, t.DiskGiB, t.Pool, t.Dataset, t.Bridge)
-		fmt.Fprintf(&b, "  then waits for it at %s\n", addr)
+		if t.builtinTrueNAS(p) {
+			fmt.Fprintf(&b, "  OpenTofu creates the VM %s at %s: %d CPUs, %d MiB, a %d GiB disk on %s/%s, its network on %s\n", t.Name, o.getenv(truenas.URLVar), t.CPUs, t.MemoryMiB, t.DiskGiB, t.Pool, t.Dataset, t.Bridge)
+		} else {
+			with := ""
+			if t.Module != "" {
+				with = " with the module " + t.Module
+			}
+			var size []string
+			if t.CPUs != 0 {
+				size = append(size, fmt.Sprintf("%d CPUs", t.CPUs))
+			}
+			if t.MemoryMiB != 0 {
+				size = append(size, fmt.Sprintf("%d MiB", t.MemoryMiB))
+			}
+			size = append(size, fmt.Sprintf("a %d GiB disk", t.DiskGiB))
+			fmt.Fprintf(&b, "  OpenTofu creates the VM %s on %s%s: %s\n", t.Name, p.Label, with, strings.Join(size, ", "))
+			for _, k := range sortedKeys(t.Vars) {
+				fmt.Fprintf(&b, "    %s = %s\n", k, t.Vars[k])
+			}
+		}
+		if c.Host == "" && m.staticAddr() == "" && !t.builtinTrueNAS(p) {
+			fmt.Fprintf(&b, "  then waits for it at the address its module returns, else %s\n", addr)
+		} else {
+			fmt.Fprintf(&b, "  then waits for it at %s\n", addr)
+		}
 	}
 	fmt.Fprintf(&b, "  host %s, administrator %s (%s key)\n", m.Hostname, m.User, strings.Fields(m.SSHKey)[0])
 	fmt.Fprintf(&b, "  network: %s\n", describeNet(&m.Net))

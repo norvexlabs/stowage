@@ -581,17 +581,21 @@ func TestVMCreateAsksWhatNoFlagGave(t *testing.T) {
 			asked = append(asked, q.Key)
 		}
 	}
-	if !slices.Equal(asked, []string{"--platform", "--hostname", "--user", "--ssh-key", "--network", "--tls", "APP_DOMAIN", "API_DOMAIN", "ADMIN_EMAIL", "confirm"}) {
+	// Where the built-in module is a preview, how is asked, and by hand is the default.
+	if !slices.Equal(asked, []string{"--platform", "--create", "--hostname", "--user", "--ssh-key", "--network", "--tls", "APP_DOMAIN", "API_DOMAIN", "ADMIN_EMAIL", "confirm"}) {
 		t.Errorf("asked %v", asked)
 	}
+	if d := p.forms[1].Defaults(nil)["--create"]; d != CreateManual {
+		t.Errorf("--create defaults to %q on a preview", d)
+	}
 	var modes []string
-	for _, c := range p.forms[2].Questions[0].Choices {
+	for _, c := range p.forms[3].Questions[0].Choices {
 		modes = append(modes, c.Value)
 	}
 	if !slices.Equal(modes, []string{"acme", "internal"}) {
 		t.Errorf("modes offered %v: a VM is offered neither loopback nor byo", modes)
 	}
-	if f := p.forms[3]; !f.Review || f.Go != "Go on with these answers" {
+	if f := p.forms[4]; !f.Review || f.Go != "Go on with these answers" {
 		t.Errorf("the inputs form %+v", f)
 	}
 	ud, _, _ := readSeed(t, filepath.Join(v.out, "asked-seed.iso"))

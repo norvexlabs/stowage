@@ -30,8 +30,9 @@ type fakeTofu struct {
 	mu      sync.Mutex
 	calls   [][]string
 	envs    [][]string
-	missing bool  // `tofu` is not installed
-	fail    error // apply fails
+	missing bool   // `tofu` is not installed
+	fail    error  // apply fails
+	outputs string // `tofu output -json`; empty is an id alone
 }
 
 func (f *fakeTofu) Run(_ context.Context, c Cmd) ([]byte, error) {
@@ -53,6 +54,11 @@ func (f *fakeTofu) Run(_ context.Context, c Cmd) ([]byte, error) {
 		return nil, os.WriteFile(filepath.Join(dir, "terraform.tfstate"), []byte("{}"), 0o600)
 	case "destroy":
 		return nil, os.WriteFile(filepath.Join(dir, "terraform.tfstate"), []byte(`{"resources":[]}`), 0o600)
+	case "output":
+		if f.outputs == "" {
+			return []byte(`{"id": {"value": "7", "type": "string"}}`), nil
+		}
+		return []byte(f.outputs), nil
 	}
 	return nil, nil
 }
@@ -165,9 +171,10 @@ func TestVMCreateWithOpenTofu(t *testing.T) {
 		t.Fatalf("%v\n%s", err, v.log)
 	}
 	dir := filepath.Join(r.state, "notes", "vms", "notes-1")
-	if got := r.tofu.calls; len(got) != 3 || got[0][0] != "version" ||
+	if got := r.tofu.calls; len(got) != 4 || got[0][0] != "version" ||
 		!slices.Equal(got[1], []string{"-chdir=" + dir, "init", "-input=false", "-no-color"}) ||
-		!slices.Equal(got[2], []string{"-chdir=" + dir, "apply", "-input=false", "-auto-approve", "-no-color"}) {
+		!slices.Equal(got[2], []string{"-chdir=" + dir, "apply", "-input=false", "-auto-approve", "-no-color"}) ||
+		!slices.Equal(got[3], []string{"-chdir=" + dir, "output", "-json", "-no-color"}) {
 		t.Fatalf("tofu ran %q", got)
 	}
 	// The API key reaches OpenTofu through its environment alone; its steps run this ctl.
@@ -210,6 +217,9 @@ func TestVMCreateWithOpenTofu(t *testing.T) {
 		}
 		return nil
 	})
+	if b, _ := os.ReadFile(filepath.Join(dir, platformFile)); string(b) != "truenas builtin\n" {
+		t.Errorf("platform %q", b)
+	}
 	for _, f := range []string{"main.tf", "variables.tf", "outputs.tf", "versions.tf"} {
 		got, _ := os.ReadFile(filepath.Join(dir, f))
 		emb, _ := tofuModules.ReadFile("tofu/truenas/" + f)
@@ -253,8 +263,8 @@ func TestVMCreateWithOpenTofu(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "notes-stow vm destroy notes-1") {
 		t.Fatalf("a second create over the state: %v", err)
 	}
-	if len(r.tofu.calls) != 4 { // its version check alone
-		t.Errorf("tofu ran %q", r.tofu.calls[3:])
+	if len(r.tofu.calls) != 5 { // its version check alone
+		t.Errorf("tofu ran %q", r.tofu.calls[4:])
 	}
 }
 
@@ -314,7 +324,10 @@ func TestVMCreateWithOpenTofuRefusals(t *testing.T) {
 		{"small memory", func(c *VMCreate) { c.MemoryMiB = 1023 }, nil, "at least 1024"},
 		{"bad host", func(c *VMCreate) { c.Host = "not a host" }, nil, "--host"},
 		{"unknown way", func(c *VMCreate) { c.Create = "terraform" }, nil, "--create terraform"},
-		{"not on proxmox", func(c *VMCreate) { c.Platform = "proxmox" }, nil, "OpenTofu creates VMs on truenas only"},
+		{"TrueNAS's flags on proxmox", func(c *VMCreate) { c.Platform = "proxmox" }, nil, "--pool, --dataset and --bridge are for TrueNAS's built-in module"},
+		{"a module by hand", func(c *VMCreate) {
+			c.Create, c.Host, c.Wait, c.TofuVM = CreateManual, "", 0, TofuVM{Module: "/x"}
+		}, nil, "--module is for --create opentofu"},
 		{"tofu flags by hand", func(c *VMCreate) { c.Create = CreateManual }, nil, "are for --create opentofu"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -606,7 +619,7 @@ func TestVMCreateAsksHowAndWhere(t *testing.T) {
 	if a := r.ssh.calls[0]; !slices.Contains(a, "ops@asked") {
 		t.Errorf("ssh %q: want the host name", a)
 	}
-	// Elsewhere than TrueNAS, how is not asked: by hand.
+	// Where the built-in module is a preview, by hand is the default.
 	q := &fakePrompter{answers: map[string]string{"--platform": "vmware", "--network": "dhcp", "--tls": "internal", "--ssh-key": v.key,
 		"APP_DOMAIN": "a.example.org", "API_DOMAIN": "b.example.org", "ADMIN_EMAIL": "a@example.org", "confirm": "yes"}}
 	v2 := newVMCreate(t, "ova")
@@ -614,8 +627,8 @@ func TestVMCreateAsksHowAndWhere(t *testing.T) {
 		t.Fatalf("%v\n%s", err, v2.log)
 	}
 	for _, f := range q.forms {
-		if f.Questions[0].Key == "--create" {
-			t.Error("asked how on vmware")
+		if f.Questions[0].Key == "--create" && f.Defaults(nil)["--create"] != CreateManual {
+			t.Error("OpenTofu is the default on vmware, a preview")
 		}
 	}
 }
@@ -706,7 +719,7 @@ func TestVMCreateWithOpenTofuRefusesATrueNASNameTaken(t *testing.T) {
 	// notes-1's default name is notes1's too, whatever its case: its zvol would be the first's.
 	c = tofuCreate()
 	err := v.create(c, r.mod(nil))
-	if err == nil || !strings.Contains(err.Error(), "the VM notes1, of host notes1, is named notes1 on TrueNAS already") {
+	if err == nil || !strings.Contains(err.Error(), "the VM notes1, of host notes1, is named notes1 on its platform already") {
 		t.Fatalf("err = %v", err)
 	}
 	c.Name = "NOTES1"

@@ -1085,7 +1085,7 @@ func (l *linter) shapes() {
 }
 
 // pullAccount refuses a pull account that can hold the publisher's secret: it is baked into
-// every installer, and the disk builder, a privileged third-party image, pulls with it.
+// every installer.
 func (l *linter) pullAccount() {
 	pull, push := l.s.Registry.Pull, l.s.Registry.Push
 	if pull.Name == "token" && push.Name == "token" {
@@ -1104,9 +1104,6 @@ func (l *linter) pullAccount() {
 			if uc, err := providers.DockerConfig(push); err == nil && filepath.Clean(pc.Config) == filepath.Clean(uc.Config) {
 				l.errf("registry.pull", "is registry.push's Docker config: the pull account is baked into every installer, so it must be a read-only account of its own")
 			}
-		}
-		if k := l.s.Shapes.Kairos; k != nil && len(k.Formats()) > 0 && pc.Config == "" {
-			l.errf("registry.pull", "a docker-config without config is the user's Docker login, of unknown rights: the disk builder (shapes.kairos.disk_formats, cloud_publish) runs privileged with registry.pull, so give it a read-only account (a token, or a config directory of its own)")
 		}
 	}
 }
