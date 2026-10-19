@@ -42,6 +42,7 @@ type options struct {
 	registryOpts []registry.Option
 	builder      publish.Builder
 	disks        publish.DiskMaker
+	cloud        publish.CloudUploader
 	// installer is the installer executable releases are published with.
 	installer []byte
 	// executable is this stowage's path, and launch starts it detached; the post-commit hook

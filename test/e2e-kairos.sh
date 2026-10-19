@@ -4,6 +4,8 @@
 # containers, loop devices), network access and about 30 GB on disk under XDG_CACHE_HOME.
 #
 #   make e2e-kairos        (builds ./bin/stowage first)
+#   STOWAGE_CLOUD_ENV=<file> make e2e-kairos    (also registers the clouds' images: the file sets
+#                          a cloud's STOWAGE_<CLOUD>_* settings and credentials; needs tofu)
 #
 # Walks examples/minimal, with a real Postgres, two disk formats and the three clouds' (raw, vhd,
 # gce), through: ship a mutable
@@ -28,6 +30,40 @@ CLEANUP+=('remove_install')
 # this host: removed at exit (empty directories only), as root, by a container.
 CLEANUP+=("docker run --rm --network none -v /run:/r --entrypoint rmdir $PG /r/notes/app /r/notes >/dev/null 2>&1")
 
+# The clouds the publisher has settings for (STOWAGE_CLOUD_ENV, the user's file, never in the
+# tree): ship registers their images, which are destroyed at exit; the others are left out.
+CLOUDS=(aws azure gcp)
+declare -A CLOUD_KEY=([aws]=STOWAGE_AWS_BUCKET [azure]=STOWAGE_AZURE_STORAGE_ACCOUNT [gcp]=STOWAGE_GCP_BUCKET)
+if [[ -n ${STOWAGE_CLOUD_ENV:-} ]]; then
+	set -a
+	# shellcheck disable=SC1090
+	. "$STOWAGE_CLOUD_ENV"
+	set +a
+fi
+# destroy_images: every image ship registered, with its upload, through its own OpenTofu state.
+destroy_images() {
+	local d f v
+	# As ship runs it: an empty OpenTofu configuration, no Stowage or registry secret.
+	: >"$WORK/tofurc"
+	# env takes its -u options before the assignment.
+	local -a env=(env -u PULL_TOKEN -u NOTES_PULL_TOKEN)
+	for v in $(compgen -e | grep -E '^(STOWAGE_|COSIGN_|TF_)'); do env+=(-u "$v"); done
+	env+=(TF_CLI_CONFIG_FILE="$WORK/tofurc")
+	# cloud/<cloud>/<settings digest>/<image>/, and those set aside to prove the probe.
+	# Their uploads too, which a run stopped part way leaves.
+	for d in "$XDG_CACHE_HOME"/stowage/cloud{,-aside}/*/*/*/ "$XDG_CACHE_HOME"/stowage/cloud{,-aside}/*/*/*/upload/; do
+		[[ -f $d/terraform.tfstate ]] || continue
+		# An upload's disk is gone (and moved, for a directory set aside): destroy reads only its
+		# path. The providers come again from the module's lock file.
+		# A run stopped mid-apply leaves its lock: nothing else runs here now.
+		f=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("file", ""))' "$d/terraform.tfvars.json")
+		[[ -z $f ]] || { mkdir -p "$(dirname "$f")" && touch "$f"; }
+		"${env[@]}" tofu -chdir="$d" init -input=false -no-color >"$WORK/destroy.log" 2>&1 &&
+			"${env[@]}" tofu -chdir="$d" destroy -lock=false -auto-approve -input=false -no-color >"$WORK/destroy.log" 2>&1 || { tail -20 "$WORK/destroy.log"; echo "WARNING: $d not destroyed: remove its image by hand" >&2; }
+	done
+}
+CLEANUP+=('destroy_images')
+
 step "start zot"
 start_zot
 
@@ -48,6 +84,18 @@ for f in "${FORMATS[@]}"; do
 	grep -q "disk $f: tag .* → beta-1.0.0-$f" "$WORK/ship1.log" || fail "disk $f was not tagged"
 done
 [[ $(grep -c '^signed ' "$WORK/ship1.log") == 14 ]] || { grep '^signed ' "$WORK/ship1.log"; fail "want 14 signatures (8, the bundle, 5 disks)"; }
+for c in "${CLOUDS[@]}"; do
+	if [[ -n ${!CLOUD_KEY[$c]:-} ]]; then
+		grep -q "cloud $c: register notes-[0-9a-f]\{12\}$" "$WORK/ship1.log" && grep -q "cloud $c: image ." "$WORK/ship1.log" || { tail -30 "$WORK/ship1.log"; fail "the $c image was not registered"; }
+		grep "cloud $c: image " "$WORK/ship1.log"
+		# The upload is gone once the image is made: its state holds nothing.
+		for d in "$XDG_CACHE_HOME"/stowage/cloud/"$c"/*/*/upload; do
+			[[ -z $(tofu -chdir="$d" state list 2>&1) ]] || { tofu -chdir="$d" state list; fail "the $c upload was not deleted"; }
+		done
+	else
+		grep -q "cloud $c: not uploaded (set " "$WORK/ship1.log" || fail "the $c image is not reported left out"
+	fi
+done
 
 pull_auth=(-u "pull:$PULL_TOKEN")
 ACCEPT='Accept: application/vnd.oci.image.manifest.v1+json'
@@ -208,6 +256,19 @@ step "ship beta again (nothing is built)"
 "${S[@]}" ship --channel beta 2>"$WORK/ship2.log" || { cat "$WORK/ship2.log"; fail "ship"; }
 ! grep -qE 'os bundle: (build|tag)|disks: make|disk [a-z0-9]+: (push|tag)|^signed ' "$WORK/ship2.log" || { cat "$WORK/ship2.log"; fail "a second ship wrote something"; }
 grep -q 'release beta-1.0.0 unchanged' "$WORK/ship2.log" || fail "release not reported unchanged"
+! grep -q 'cloud [a-z]*: register' "$WORK/ship2.log" || fail "a second ship registered an image again"
+for c in "${CLOUDS[@]}"; do
+	[[ -z ${!CLOUD_KEY[$c]:-} ]] || [[ $(grep "cloud $c: image " "$WORK/ship2.log") == $(grep "cloud $c: image " "$WORK/ship1.log") ]] || fail "the $c image differs on the second ship"
+done
+if [[ -d $XDG_CACHE_HOME/stowage/cloud ]]; then
+	step "ship beta from an empty cloud cache: each image is found in its account, not registered again"
+	mv "$XDG_CACHE_HOME/stowage/cloud" "$XDG_CACHE_HOME/stowage/cloud-aside"
+	"${S[@]}" ship --channel beta 2>"$WORK/ship2b.log" || { tail -30 "$WORK/ship2b.log"; fail "ship"; }
+	! grep -q 'cloud [a-z]*: register' "$WORK/ship2b.log" || fail "an image in its account was registered again"
+	for c in "${CLOUDS[@]}"; do
+		[[ -z ${!CLOUD_KEY[$c]:-} ]] || [[ $(grep "cloud $c: image " "$WORK/ship2b.log") == $(grep "cloud $c: image " "$WORK/ship1.log") ]] || { grep "cloud $c" "$WORK/ship2b.log"; fail "the $c image was not found in its account"; }
+	done
+fi
 
 step "promote to stable: the bundle and the disks are re-tagged, latest-<format> follows"
 "${S[@]}" promote 1.0.0 --from beta --to stable 2>"$WORK/promote.log" || { cat "$WORK/promote.log"; fail "promote"; }

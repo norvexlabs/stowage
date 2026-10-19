@@ -74,8 +74,15 @@ type Publisher struct {
 	// context: both are needed for a project with the kairos shape.
 	Disks   DiskMaker
 	WorkDir string
-	Now     func() time.Time
-	Log     io.Writer
+	// Cloud registers the disks of cloud_publish's clouds as images; CloudVars are each cloud's
+	// settings, a cloud without any not uploaded to.
+	Cloud     CloudUploader
+	CloudVars map[string]map[string]string
+	// CloudErr, when set, refuses a ship or a promote (the clouds' settings could not be read);
+	// the other commands never register an image.
+	CloudErr error
+	Now      func() time.Time
+	Log      io.Writer
 }
 
 func (p *Publisher) logf(format string, a ...any) {

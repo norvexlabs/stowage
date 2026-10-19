@@ -120,7 +120,11 @@ a self-review against the code it describes is enough. Every other commit clears
    alone runs only e2e-full, its chart alone only e2e-full-k8s). A change to `internal/kairos`, to the OS bundle or disk code of
    `internal/publish` (`os.go`), to `internal/graph`'s OS keys or to `examples/minimal`'s
    `kairos` shape, to the VM's backup runner (`internal/backup`), or to the VM side of `internal/install` (`vm*.go`, `hostd*.go`, `seed*.go`), runs `make
-   e2e-kairos` (the bundle and disks built for real, the bundle's `<short>-stow` run, ~25 min). A change
+   e2e-kairos` (the bundle and disks built for real, the bundle's `<short>-stow` run, ~25 min); a
+   change to the cloud images' registration (`internal/cloud`, `internal/publish/cloud.go`,
+   `internal/cli/cloud.go`) runs it as `STOWAGE_CLOUD_ENV=<file>
+   make e2e-kairos`, which registers them on the test clouds the file sets up (the user's file,
+   never in the tree). A change
    to `internal/truenas`, the OpenTofu module (`internal/install/tofu`), `vmtofu.go`, `seed*.go`,
    the boot (`vm.go`), the host daemon, the backup runner or the OS bundle's files runs `STOWAGE_VM_ENV=<file> make
    e2e-vm` too (a real VM on TrueNAS, an upgrade of it through a TLS mirror, `reset-db`, `rollback`, a failed health gate's fallback, a backup and the network override's revert, ~85 min; the file is the user's, its path given at run time,
@@ -204,6 +208,11 @@ asks for one:
   works without a TTY (flags, environment, `--answers` file) and in accessible mode.
 - **Dependencies**: licence compatible with Apache-2.0, maintained (e.g. `go.yaml.in/yaml/v3`, not
   the archived `gopkg.in/yaml.v3`), added through `make tidy`. Prefer the standard library.
+- **OpenTofu modules are written against the provider's latest release**: before writing or
+  changing a module, read that release's official docs and check every resource, data source,
+  argument and exported attribute it uses against the provider's schema (`tofu providers schema
+  -json`; `tofu validate` does not check an element of a list attribute), and pin that release with
+  its lock file's checksums. A module that can run is applied for real before it is called proven.
 - **Comments state what the code does now** and the invariant to preserve — never history, review
   rounds or plans.
 

@@ -13,7 +13,9 @@
 # runs nothing (a docs-only commit). A test file (_test.go) runs no suite: make check runs it. The
 # parallel suites run with make -j -k; beside them e2e-kairos, e2e-vm and e2e-full-vm run as one
 # chain, one at a time (they make disks with auroraboot, which races for loop devices; a failure
-# ends the chain), and e2e-vm and e2e-full-vm need STOWAGE_VM_ENV=<file>.
+# ends the chain), and e2e-vm and e2e-full-vm need STOWAGE_VM_ENV=<file>. A change to the cloud
+# images' registration (the uploader, the publisher's step, the CLI's settings) runs e2e-kairos with STOWAGE_CLOUD_ENV=<file> (the clouds' settings and credentials), so
+# its images are registered for real.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -52,6 +54,16 @@ for f in "${changed[@]}"; do
 	case $f in
 	internal/install/smoke_test.go) need smoke-install "$f" ;;
 	*_test.go) ;; # make check runs it
+	# Before internal/publish/* and internal/cli/*: the first arm that matches is taken.
+	internal/cloud/* | internal/publish/cloud.go | internal/cli/cloud.go)
+		need e2e-kairos "$f"
+		cloud_why=$f
+		# Every ship of the examples' kairos shape runs the publisher's and the CLI's cloud step.
+		if [[ $f != internal/cloud/* ]]; then
+			need e2e "$f"
+			lifecycle "$f"
+		fi
+		;;
 	internal/registry/* | internal/release/* | internal/publish/* | internal/cli/* | cmd/stowage/*)
 		need e2e "$f"
 		lifecycle "$f"
@@ -158,6 +170,10 @@ for s in "${order[@]}"; do
 done
 $plan && exit 0
 
+if [[ -n ${cloud_why:-} && -z ${STOWAGE_CLOUD_ENV:-} ]]; then
+	echo "gate: e2e-kairos registers the clouds' images ($cloud_why): give STOWAGE_CLOUD_ENV=<file>" >&2
+	exit 1
+fi
 for s in e2e-vm e2e-full-vm; do
 	if [[ -n ${why[$s]:-} && -z ${STOWAGE_VM_ENV:-} ]]; then
 		echo "gate: $s is needed (${why[$s]}): give STOWAGE_VM_ENV=<file>" >&2

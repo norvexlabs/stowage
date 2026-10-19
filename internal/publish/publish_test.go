@@ -3,6 +3,8 @@ package publish
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -25,6 +27,7 @@ import (
 	"github.com/google/go-containerregistry/pkg/v1/remote"
 
 	"github.com/norvexlabs/stowage/internal/backup"
+	"github.com/norvexlabs/stowage/internal/cloud"
 	"github.com/norvexlabs/stowage/internal/front"
 	"github.com/norvexlabs/stowage/internal/kairos"
 	"github.com/norvexlabs/stowage/internal/payload"
@@ -104,6 +107,45 @@ func (f *fakeDisks) Build(_ context.Context, r kairos.DiskRequest) (map[string]s
 	return out, func() { os.RemoveAll(dir) }, nil
 }
 
+// fakeCloud registers images by fetching their disk, as the uploader does, and records them.
+type fakeCloud struct {
+	dir        string // a test's temporary directory
+	registered map[string]string
+	uploads    []cloud.Image
+	disks      [][]byte // what each upload fetched
+	fail       bool
+}
+
+func (f *fakeCloud) Registered(_ context.Context, img cloud.Image) (string, error) {
+	return f.registered[img.Cloud+"/"+img.Name], nil
+}
+
+func (f *fakeCloud) Upload(ctx context.Context, img cloud.Image) (string, error) {
+	f.uploads = append(f.uploads, img)
+	file, sum, err := img.Fetch(ctx, f.dir)
+	if err != nil {
+		return "", err
+	}
+	b, err := os.ReadFile(file)
+	if err != nil {
+		return "", err
+	}
+	os.Remove(file)
+	if h := sha256.Sum256(b); hex.EncodeToString(h[:]) != sum {
+		return "", fmt.Errorf("fetched %s: sha256 %s, file %x", file, sum, h)
+	}
+	f.disks = append(f.disks, b)
+	if f.fail {
+		return "", errors.New("cloud " + img.Cloud + ": tofu apply: quota exceeded")
+	}
+	if f.registered == nil {
+		f.registered = map[string]string{}
+	}
+	id := img.Cloud + "-image-" + img.Name
+	f.registered[img.Cloud+"/"+img.Name] = id
+	return id, nil
+}
+
 type env struct {
 	t       *testing.T
 	disks   *fakeDisks
@@ -127,6 +169,9 @@ type env struct {
 	// installer is the installer executable; pull the baked pull account.
 	installer []byte
 	pull      *payload.Account
+	// cloud registers cloud images with cloudVars as the publisher's settings.
+	cloud     *fakeCloud
+	cloudVars map[string]map[string]string
 }
 
 // fakeSigner records signatures by digest reference.
@@ -243,6 +288,9 @@ func (e *env) publisher() (*Publisher, string) {
 		Installer: e.installer, Pull: e.pull, Disks: e.disks, WorkDir: e.t.TempDir(), Anonymous: e.anon, Now: func() time.Time { return e.now }, Log: e.log}
 	if e.signer != nil {
 		pub.Signer = e.signer
+	}
+	if e.cloud != nil {
+		pub.Cloud, pub.CloudVars = e.cloud, e.cloudVars
 	}
 	return pub, v
 }

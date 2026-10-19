@@ -47,6 +47,9 @@ func (p *Publisher) Graph(v string, revision int, channel string) (*graph.Graph,
 // it, a project whose stowage.lock does not pin this Stowage (the installer and the front are
 // this Stowage's), or a project whose pull account's password is not in the environment.
 func (p *Publisher) readyToPublish() error {
+	if p.CloudErr != nil {
+		return p.CloudErr
+	}
 	if len(p.Installer) == 0 {
 		return errors.New("this stowage carries no installer to publish (a build without it): use a release build of stowage (make build)")
 	}

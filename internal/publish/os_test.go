@@ -268,6 +268,69 @@ func TestAFailedDiskMovesNoTag(t *testing.T) {
 	eq(t, "disk", e.digest("notes-disk", "1.0.0-qcow2"), r.Manifest.Artifacts.Disks["qcow2"])
 }
 
+// Each cloud the publisher has settings for gets its disk registered once, read back from the
+// registry; a cloud without settings is named and left out; a failed registration fails the ship
+// before the release is published.
+func TestShipRegistersEachCloudsImageOnce(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	b, err := os.ReadFile(filepath.Join(e.root, "stowage.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	at := bytes.Index(b, []byte("disk_formats:"))
+	line := b[bytes.LastIndexByte(b[:at], '\n')+1 : at+len("disk_formats:")]
+	testutil.Edit(t, e.root, "stowage.yaml", string(line), strings.TrimSuffix(string(line), "disk_formats:")+"cloud_publish: [gcp, aws]\n"+string(line))
+	e.cloud = &fakeCloud{dir: t.TempDir(), fail: true}
+	e.cloudVars = map[string]map[string]string{"gcp": {"project": "p", "bucket": "b"}}
+	if _, err := e.ship("beta", 1); err == nil || !strings.Contains(err.Error(), "quota exceeded") {
+		t.Fatalf("got %v", err)
+	}
+	eq(t, "no release", e.digest("notes-release", "beta"), "")
+
+	e.cloud.fail = false
+	r := e.mustShip("beta", 1)
+	gce := r.Manifest.Artifacts.Disks["gce"]
+	want := "notes-" + strings.TrimPrefix(gce, "sha256:")[:12]
+	if len(e.cloud.uploads) != 2 {
+		t.Fatalf("%d uploads", len(e.cloud.uploads))
+	}
+	img := e.cloud.uploads[1]
+	eq(t, "cloud", img.Cloud, "gcp")
+	eq(t, "name", img.Name, want)
+	eq(t, "vars", img.Vars["bucket"], "b")
+	if !strings.HasPrefix(string(e.cloud.disks[1]), "gce of sha256:") {
+		t.Errorf("fetched %q, not the gce disk", e.cloud.disks[1])
+	}
+	for _, line := range []string{"cloud aws: not uploaded (set STOWAGE_AWS_BUCKET, AWS_REGION)", "cloud gcp: image gcp-image-" + want} {
+		if !strings.Contains(e.log.String(), line) {
+			t.Errorf("log lacks %q:\n%s", line, e.log)
+		}
+	}
+
+	e.mustShip("stable", 1)
+	eq(t, "registered once", len(e.cloud.uploads), 2)
+}
+
+// Settings a cloud's registration could not read refuse a ship and a promote, never a yank.
+func TestCloudErrRefusesShipAndPromoteOnly(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	e := newEnv(t)
+	e.mustShip("beta", 1)
+	p, v := e.publisher()
+	p.CloudErr = errors.New("cloud gcp: tofu is not on PATH")
+	if _, err := p.Ship(ctx, ShipOptions{Version: v, Channel: "beta", Revision: 1}); !errors.Is(err, p.CloudErr) {
+		t.Errorf("ship: %v", err)
+	}
+	if _, err := p.Promote(ctx, v, "beta", "stable", 1); !errors.Is(err, p.CloudErr) {
+		t.Errorf("promote: %v", err)
+	}
+	if err := p.Yank(ctx, "beta", v, 1, "bad"); err != nil {
+		t.Errorf("yank: %v", err)
+	}
+}
+
 // On an immutable channel, a published release is never republished with another bundle.
 func TestABundleThatWouldDifferIsRefusedOnAnImmutableChannel(t *testing.T) {
 	t.Parallel()

@@ -17,6 +17,10 @@ follow [SemVer](https://semver.org/).
   module (`--module DIR`) holding the module contract README describes; a module's own settings
   are `--tofu-var NAME=VALUE`, asked when missing. A cloud VM is waited for at the address its
   module returns, and sized by its instance type (`--cpus` and `--memory` are for hypervisors).
+- **Cloud images registered**: `ship` uploads each `cloud_publish` disk to the publisher's AWS,
+  Azure or Google Cloud account and registers it as an image (an AMI, an Azure image, a Compute
+  Engine image), with the cloud's settings and credentials from the environment, once per disk. A
+  cloud without settings is skipped and named. Needs OpenTofu (`tofu`) then.
 - `ship` with `registry.pull: none` stops when a repository it writes refuses an anonymous read
   (a registry that creates repositories private, as ghcr does), naming them: before it builds,
   after the images' push, and before a channel points at the release.

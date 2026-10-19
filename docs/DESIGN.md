@@ -825,9 +825,21 @@ its repository's blobs), the proxy holding the publisher's account (pull-scoped 
 registry issues tokens) and asking auroraboot for an account of its own, a one-run random password
 in a private Docker config file — a loopback port is open to every local user, and a command
 line is readable by them. So the disks build from the registry whoever else may read it, and the
-publisher's account never enters a container. Uploading and
-registering them in a cloud account is pending (TODO): it uses the publisher's cloud credentials
-from the environment, which nothing in a release carries. The bundle carries `<short>-stow`:
+publisher's account never enters a container. `ship` registers each `cloud_publish` disk in the
+publisher's account of that cloud through built-in OpenTofu modules per cloud — an upload (bucket
+object, S3 object, page blob), the image made of it (Compute Engine image; import-snapshot → AMI;
+Azure image), then the upload destroyed, since a disk may carry the pull account and a bucket is
+often read more widely than the images — with the publisher's credentials from the environment,
+which nothing in a release carries. The modules pin each provider's exact release with its lock
+file's checksums, and OpenTofu runs with an empty CLI configuration, so the provider binary that
+receives the cloud credentials is the one checked. OpenTofu,
+not the clouds' SDKs: the providers already pinned for `vm create` know each cloud's upload and
+import, and adding three SDK trees to `stowage` would only repeat them. The disk is read back from
+the registry by digest, so the image is exactly what an install fetches; the image is named by
+that digest and its OpenTofu state and id kept in the publisher's cache, keyed by the cloud's
+settings; without them, a probe module looks the image up by name in the account, so it is
+registered once whatever machine ships after, and a stopped run resumes. The release manifest does not record it: an
+image lives in one account, and an install takes the disk. The bundle carries `<short>-stow`:
 it installs the release on the VM from the preloaded images, brings it up, upgrades it or goes
 back at boot, and serves the host daemon (status, services, logs, provision, updates, upgrade
 through kairos-agent, reboot); `make e2e-kairos` runs it on the local Docker engine, including a

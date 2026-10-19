@@ -7,6 +7,8 @@ import (
 	"io"
 	"log"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -16,9 +18,11 @@ import (
 	"github.com/google/go-containerregistry/pkg/v1/mutate"
 	"github.com/google/go-containerregistry/pkg/v1/random"
 
+	"github.com/norvexlabs/stowage/internal/cloud"
 	"github.com/norvexlabs/stowage/internal/graph"
 	"github.com/norvexlabs/stowage/internal/project"
 	"github.com/norvexlabs/stowage/internal/publish"
+	"github.com/norvexlabs/stowage/internal/spec"
 	"github.com/norvexlabs/stowage/internal/testutil"
 )
 
@@ -235,5 +239,75 @@ func TestShipBakesThePullAccountFromTheEnvironment(t *testing.T) {
 	testutil.Edit(t, root, "stowage.lock", "stowage: 0.0.9", "stowage: 0.1.0")
 	if _, logs, err := run(t, b, map[string]string{"NOTES_PUSH_TOKEN": "t0ken", "NOTES_PULL_TOKEN": "a"}, "-C", root, "ship", "--channel", "beta"); err != nil {
 		t.Fatalf("%v\n%s", err, logs)
+	}
+}
+
+// OpenTofu, which registers the cloud images, gets the clouds' credentials and never the registry
+// accounts' tokens, cosign's secrets or Stowage's own settings.
+func TestCloudEnvHidesStowagesSecrets(t *testing.T) {
+	for k, v := range map[string]string{"REG_PUSH": "p", "REG_PULL": "q", "SIGN_KEY": "k", "COSIGN_PASSWORD": "c",
+		"STOWAGE_GCP_BUCKET": "b", "GOOGLE_APPLICATION_CREDENTIALS": "/key.json", "AWS_SECRET_ACCESS_KEY": "s", "TF_DATA_DIR": "/x", "TF_CLI_ARGS_apply": "-target=x",
+		"VAULT_TOKEN": "v"} {
+		t.Setenv(k, v)
+	}
+	token := func(env string) spec.Provider {
+		return spec.Provider{Name: "token", Config: map[string]any{"user": "u", "token_env": env}}
+	}
+	p := &project.Project{Spec: &spec.Spec{
+		Registry: spec.Registry{Push: token("REG_PUSH"), Pull: token("REG_PULL")},
+		Signing:  &spec.Provider{Name: "cosign-key", Config: map[string]any{"key": "env://SIGN_KEY", "public_keys": []string{"k.pub"}}},
+	}}
+	got := map[string]bool{}
+	for _, kv := range cloudEnv(p) {
+		k, _, _ := strings.Cut(kv, "=")
+		got[k] = true
+	}
+	// Vault's token is a cloud's own business unless it signs.
+	if !got["VAULT_TOKEN"] {
+		t.Error("VAULT_TOKEN hidden with an env:// key")
+	}
+	p.Spec.Signing.Config["key"] = "hashivault://release"
+	for _, kv := range cloudEnv(p) {
+		if strings.HasPrefix(kv, "VAULT_TOKEN=") {
+			t.Error("VAULT_TOKEN given to OpenTofu with a hashivault:// key")
+		}
+	}
+	for _, k := range []string{"REG_PUSH", "REG_PULL", "SIGN_KEY", "COSIGN_PASSWORD", "STOWAGE_GCP_BUCKET", "TF_DATA_DIR", "TF_CLI_ARGS_apply"} {
+		if got[k] {
+			t.Errorf("%s given to OpenTofu", k)
+		}
+	}
+	for _, k := range []string{"GOOGLE_APPLICATION_CREDENTIALS", "AWS_SECRET_ACCESS_KEY", "PATH"} {
+		if !got[k] {
+			t.Errorf("%s not given to OpenTofu", k)
+		}
+	}
+}
+
+// A cloud's settings turn its registration on: some only are refused, and so is a missing tofu,
+// before anything is built.
+func TestCloudSettings(t *testing.T) {
+	p := &project.Project{Spec: &spec.Spec{Shapes: spec.Shapes{Kairos: &spec.KairosShape{CloudPublish: []string{"aws", "gcp"}}}}}
+	env := map[string]string{"STOWAGE_GCP_PROJECT": "p"}
+	o := &options{getenv: func(k string) string { return env[k] }}
+	if _, _, err := o.clouds(p, t.TempDir()); err == nil || !strings.Contains(err.Error(), "set STOWAGE_GCP_BUCKET too") {
+		t.Errorf("gcp partly set: %v", err)
+	}
+	env["STOWAGE_GCP_BUCKET"] = "b"
+	t.Setenv("PATH", t.TempDir())
+	if _, _, err := o.clouds(p, t.TempDir()); err == nil || !strings.Contains(err.Error(), "tofu is not on PATH") {
+		t.Errorf("no tofu: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(os.Getenv("PATH"), "tofu"), []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	up, vars, err := o.clouds(p, t.TempDir())
+	if u, ok := up.(*cloud.Uploader); err != nil || !ok || u.Tofu == nil || vars["aws"] != nil || vars["gcp"]["bucket"] != "b" {
+		t.Errorf("gcp set: %v, %v, %v", up, vars, err)
+	}
+	delete(env, "STOWAGE_GCP_PROJECT")
+	delete(env, "STOWAGE_GCP_BUCKET")
+	if up, _, err := o.clouds(p, t.TempDir()); up != nil || err != nil {
+		t.Errorf("none set: %v, %v", up, err)
 	}
 }

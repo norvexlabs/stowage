@@ -7,13 +7,67 @@ A finished item is deleted, not ticked. The plan behind it is
 
 ## Must — parity
 
-1. **Cloud upload** (`cloud_publish`): `ship` makes each cloud's importable image; parity also
-   uploads it and registers it (an AWS AMI by import-snapshot, an Azure image from a page blob, a
-   Google Cloud image from a bucket object), with the publisher's cloud credentials from the
-   environment, never from a file or a release. Proven only against test accounts the user
-   provides; until then the images are published as disks.
+1. **Cloud images on AWS and Azure**: `ship` registers the `cloud_publish` images through
+   OpenTofu, run for real on Google Cloud only (`STOWAGE_CLOUD_ENV=<file> make e2e-kairos`). Run it
+   with the AWS and Azure test accounts once they exist, and fix what they find. Azure, known:
+   its probe takes an image of the name whatever its provisioning state (its resource list gives
+   none), and a page blob left by an earlier upload makes the next upload of that name fail
+   (`azurerm_storage_blob` refuses an existing blob): check both there, and that the service
+   principal needs *Storage Blob Data Contributor* on the storage account (blobs are written with
+   Entra ID).
+
+2. **`vm create`'s modules on their providers' latest releases** (checked 2026-10-19 against each
+   latest release's docs and source):
+   - libvirt: `dmacvicar/libvirt` 0.9 is a rewrite (Plugin Framework, the domain XML mapped as
+     nested attributes: `libvirt_volume` `capacity`/`target`/`create.content.url`, `libvirt_domain`
+     `type` required, `os`, `devices.disks`/`interfaces`, the address from
+     `data "libvirt_domain_interface_addresses"`); the module holds 0.8.3, the legacy line. Port it.
+   - vSphere: the provider moved to `vmware/vsphere` (2.17.1; `hashicorp/vsphere` resolves on the
+     OpenTofu registry only), and `vsphere_virtual_machine` with `ovf_deploy` needs
+     `datacenter_id`, checked only after the OVF is deployed: today's apply fails leaving an
+     orphan VM.
+   - Proxmox VE: `disk.file_id` of an `iso` file is imported over SSH, which an API token alone
+     does not give; use `content_type = "import"` with `disk.import_from` (API only), or document
+     the `PROXMOX_VE_SSH_*` credentials. Pin 0.117.0.
+   - TrueNAS 3.1.0, aws 6.69.1, google 8.7.0, azurerm 5.10.0: no breaking change for the modules;
+     pin them (e2e-vm), with lock files as `internal/cloud`'s modules carry.
+3. **Scaleway**: a platform of `vm create` (OpenTofu module: an instance from the release's
+   disk, the cloud-config as its user data) and a cloud of `cloud_publish` (the disk uploaded to
+   Object Storage and imported as an instance image, with the publisher's credentials from the
+   environment), as the other clouds. Before writing a module, read the latest
+   `scaleway/scaleway` provider's official docs and its schema (`tofu providers schema -json`),
+   and pin that release.
+4. **OVHcloud**: the same for OVHcloud Public Cloud (OpenStack): `vm create` and `cloud_publish`
+   (the disk uploaded as a Glance image of the project, `ovh/ovh` and/or
+   `terraform-provider-openstack/openstack`, whichever the latest official docs make canonical).
+   Before writing a module, read the latest provider's official docs and its schema, and pin that
+   release.
+5. **Every published disk is zstd-compressed.** Disks are pushed as plain files
+   (`registry.FileBlob`, `buildDisks`), so a raw or fixed VHD disk uploads its unallocated space:
+   on a Kairos release, 1.7 GB of content goes up as 5.1 GB, twice. Compress every format, with
+   no per-format exception (measured, zstd -3: raw and vhd −66 %, qcow2/ova/gce −1 to −3 %, about
+   11 s of CPU in all; a release's disks 15.6 → 8.7 GB):
+   - media type `…disk.<format>+zstd`, layer title `<name>.<format>.zst`, and an annotation with
+     the uncompressed sha256 (the signed manifest covers the compressed digest);
+   - the installer (writing a VM disk) and `cloud_publish` (before handing a disk to AWS, Azure
+     — a fixed VHD — or GCE — its exact `disk.raw` tar.gz) decompress as a stream, with no
+     uncompressed temp file where the target allows it, and check the uncompressed digest;
+   - the media type decides: a disk published before this keeps its plain media type and is read
+     as it is;
+   - the docs give the `zstd -d` step after an `oras pull`.
+6. **Resumable disk uploads with a stall bound.** A multi-GB blob goes up in one stream: on a lossy
+   link a dropped connection restarts it from zero, and a stalled one waits for ever with nothing
+   in the log (seen: 60 KB/s with 20 % retransmissions, a ship that would have taken days). Upload
+   by chunks (the OCI distribution spec's chunked upload), resume from the last acknowledged byte
+   after a failure, fail with an error naming the blob when no byte is acknowledged for a bounded
+   time, and log progress (bytes sent, throughput) while a large blob is pushed.
 
 ## Should
+
+- **Cloud images, account identity**: an image's working directory is keyed by the cloud's
+  settings, not by the account the credentials reach; two accounts on the same settings (a
+  shared bucket and role name) share a kept id. Key it by the caller's account too (AWS caller
+  identity, the Azure subscription). The GCP probe takes a READY image even when deprecated.
 
 - **Disks with rootless Docker or Docker Desktop**: the disk builder (auroraboot, on the host
   network) reads the bundle from `ship`'s proxy on 127.0.0.1, which an engine in another network

@@ -61,6 +61,9 @@ func (o *options) publisher(p *project.Project, a access) (*publish.Publisher, e
 	}
 	builder, disks, workDir := o.builder, o.disks, ""
 	kairosShape := p.Spec.Shapes.Kairos != nil
+	var up publish.CloudUploader
+	var cloudVars map[string]map[string]string
+	var cloudErr error
 	if a == writeAccess && (builder == nil || kairosShape) {
 		// Builds land in the user's cache, on disk: an OS bundle and its disks are gigabytes.
 		cache, err := os.UserCacheDir()
@@ -75,6 +78,8 @@ func (o *options) publisher(p *project.Project, a access) (*publish.Publisher, e
 			if disks == nil {
 				disks = &kairos.DiskBuilder{WorkDir: filepath.Join(cache, "stowage", "disks"), Stdout: o.err, Stderr: o.err}
 			}
+			// Only ship and promote register images: the refusal is theirs, not yank's or prune's.
+			up, cloudVars, cloudErr = o.clouds(p, cache)
 		}
 	}
 	reg := registry.New(kc, o.registryOpts...)
@@ -99,6 +104,9 @@ func (o *options) publisher(p *project.Project, a access) (*publish.Publisher, e
 		Builder:        builder,
 		Disks:          disks,
 		WorkDir:        workDir,
+		Cloud:          up,
+		CloudVars:      cloudVars,
+		CloudErr:       cloudErr,
 		StowageVersion: o.buildVersion,
 		Installer:      o.installer,
 		Pull:           pull,
