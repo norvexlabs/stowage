@@ -49,7 +49,53 @@ A finished item is deleted, not ticked. The plan behind it is
      the newest disk and reports the requested release once upgraded; a ship with the option
      leaves exactly one disk set behind, and no tag dangling.
 
+6. **Backups and `restore` on Docker.** The Docker shape's only dump is the one `upgrade` takes,
+   on the same host; a restore is done by hand (services stopped, the database dropped and
+   created, `pg_restore`, services started, `provision`), reaching into the stack. The VM's
+   verbs, on the Docker shape, from the same generic backup container: `backup config | run |
+   status | list | verify` with a schedule (the `backup` spec's profiles, encrypted to age
+   recipients, uploaded with rclone) and `restore <object> --identity`, loading into a database
+   of its own and swapping only once the load succeeded. Tests: a scheduled backup lands at the
+   destination; a restore into an install made with `--secrets` brings back the data its keys
+   decrypt; a failed load leaves the current database serving.
+7. **The disk-pressure watch on Docker.** `hooks.maintenance.disk_pressure` runs only on the VM
+   (the host daemon), so on Docker nothing calls the project's purge and the data volume can fill
+   until the database stops. The Docker shape gets the same watch — the volume's filesystem read
+   at start and every 10 min, the POST at `soft_pct`, a `status` line past `hard_pct` — run by
+   the installed stack, not by the operator's cron. Test: a filled test volume triggers the POST
+   with the hook's bearer.
+8. **A byo certificate's lifecycle.** Its expiry is read only when the install or a re-run copies
+   it, so an expired certificate is a hard outage on every route with nothing said before.
+   - `status` names the installed certificate's `notAfter` and warns from 30 days before it (on
+     the VM, also an event in the journal).
+   - Without `--ca`, a chain that does not verify to the host's system roots is refused or warned
+     about: a leaf given without its intermediate is accepted today, and clients that do not fetch
+     intermediates (curl, Go, Python) then fail while browsers work.
+   - Tests: a certificate expiring within the window shows the warning; a leaf-only file without
+     `--ca` is refused (or warned), the same file with its intermediate accepted.
+9. **`mirror export` scoped to what the site runs.**
+   - `--version V`: an export carries the channel's latest release only (its pointer: the highest
+     version shipped), so a site without internet cannot take a release older than the latest
+     across — to hold at one, or to upgrade one step at a time past a rollback barrier. `--version
+     V` exports that release of the channel, as `upgrade --version` fetches one.
+   - `--shapes docker,kubernetes`: the OS bundle is always exported, even with `--disks none`,
+     and is most of the archive (1.9 GiB of 2.9 GiB measured) for a site that runs no VM. Leaving
+     out the kairos shape omits the OS bundle and its disks; the mirror's release still names
+     them, and a `vm create` against that mirror says what is missing.
+   - Tests: `--version` of an earlier release exports and installs it; `--shapes docker` exports
+     no OS bundle, and a Docker install from it succeeds.
+10. **Kubernetes: the rollback barrier before `helm rollback`.** Docker and the VM refuse a
+    rollback across a schema barrier the schema-compat provider reports; `k8s rollback` runs
+    `helm rollback` without asking, so an older release can start on a schema it cannot read. The
+    same pre-flight, against the release's database, before helm is called. Test: a rollback
+    across a barrier is refused and names it; one that crosses none goes through.
+
 ## Should
+
+- **`uninstall` on Docker**: removing an install is `docker compose … down -v` by hand in its
+  directory, plus the directory. `uninstall` takes the stack down, deletes its volumes (asking,
+  or `--yes`), and removes the directory; `--keep-data` keeps the volumes. Kubernetes has its
+  `k8s uninstall` already.
 
 - **Cloud images, account identity**: an image's working directory is keyed by the cloud's
   settings, not by the account the credentials reach; two accounts on the same settings (a
@@ -116,10 +162,6 @@ A finished item is deleted, not ticked. The plan behind it is
   a VM on a missed heartbeat would; on TrueNAS it cannot use the QEMU guest agent (`vm.device.create`
   offers no channel/serial dtype), so it would read the VM power state the host already sees.
 
-- **`mirror export --version`**: an export carries the channel's latest release only (its pointer:
-  the highest version shipped), so a site without internet cannot take a release older than the
-  latest across — to hold at one, or to upgrade one step at a time past a rollback barrier.
-  `--version V` would export that release of the channel, as `upgrade --version` fetches one.
 - **A running job's refusal reads as English for every job kind**: the host daemon's 409 is
   `"an %s is running"` over the job's kind, which gives "an backup is running" / "an reset-db is
   running". An article per kind, or wording without one ("a backup job is running"), would do.
@@ -435,7 +477,7 @@ A finished item is deleted, not ticked. The plan behind it is
 
 - Taking over an install made without Stowage: a project adopting Stowage installs fresh.
 
-- The extensions of DESIGN § 10 (restore verb on Docker and Kubernetes, scheduled Docker backup,
-  `uninstall`, Kubernetes barrier pre-flight, Kubernetes provision hook + portal URL): none
-  exists today; revisit after parity.
+- The other extensions of DESIGN § 10 (restore verb on Kubernetes, Kubernetes provision hook +
+  portal URL): none exists today; revisit after parity. The Docker backups and restore, the
+  Kubernetes barrier pre-flight and `uninstall` on Docker are Musts 6 and 10 and a Should.
 - Secret rotation (DESIGN § 7 row 24, an application concern).
