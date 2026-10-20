@@ -96,6 +96,11 @@ A finished item is deleted, not ticked. The plan behind it is
   directory, plus the directory. `uninstall` takes the stack down, deletes its volumes (asking,
   or `--yes`), and removes the directory; `--keep-data` keeps the volumes. Kubernetes has its
   `k8s uninstall` already.
+- **Service verbs on Docker**: `ps`, `logs <service>`, `restart | stop | start <service>` exist on
+  the VM only, so on Docker an operator reaches into the stack with `docker restart` /
+  `docker logs` and the compose project name — e.g. to have a service re-read a setting it loads
+  only at start (a CA bundle imported in the application). The same verbs on the Docker shape,
+  addressing a service by its compose name, through the install's own compose files.
 
 - **Cloud images, account identity**: an image's working directory is keyed by the cloud's
   settings, not by the account the credentials reach; two accounts on the same settings (a
@@ -479,5 +484,5 @@ A finished item is deleted, not ticked. The plan behind it is
 
 - The other extensions of DESIGN § 10 (restore verb on Kubernetes, Kubernetes provision hook +
   portal URL): none exists today; revisit after parity. The Docker backups and restore, the
-  Kubernetes barrier pre-flight and `uninstall` on Docker are Musts 6 and 10 and a Should.
+  Kubernetes barrier pre-flight, `uninstall` and the service verbs on Docker are Musts 6 and 10 and Shoulds.
 - Secret rotation (DESIGN § 7 row 24, an application concern).
