@@ -31,9 +31,29 @@ const (
 	prevState    = "state.json"
 )
 
-// stackFiles are the files an install's release writes (writeStack): the project's compose file
-// and the front.
-var stackFiles = []string{"compose.yaml", FrontCompose, Caddyfile}
+// stackFiles are the files an install's release writes (writeStack): the project's compose file,
+// the front, and the content labels of that compose file's services.
+var stackFiles = []string{"compose.yaml", FrontCompose, Caddyfile, ContentCompose}
+
+// restoreStack copies the stack files dir keeps over the install's; missingOK skips one dir lacks.
+// The content labels go with the compose file they were written for: where dir keeps none, the
+// install's are removed, never left naming services the restored compose file may not have.
+func (in *Installer) restoreStack(dir string, missingOK bool) error {
+	for _, f := range stackFiles {
+		err := copyFile(filepath.Join(dir, f), in.path(f), 0o644)
+		switch {
+		case err == nil:
+		case errors.Is(err, os.ErrNotExist) && f == ContentCompose:
+			if err := os.Remove(in.path(f)); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return err
+			}
+		case errors.Is(err, os.ErrNotExist) && missingOK:
+		default:
+			return err
+		}
+	}
+	return nil
+}
 
 // state is what an upgrade records about the release it replaced.
 type state struct {
@@ -104,10 +124,16 @@ func (in *Installer) openLocked(ctx context.Context) (*EnvFile, func(), error) {
 }
 
 // pinnedImages reports whether the install pulls its images by digest; one made with --offline
-// runs loaded images by tag, and keeps doing so.
+// runs loaded images by tag, and keeps doing so. Every reference recorded is one or the other;
+// the first found says which, and with none recorded the install pulls.
 func pinnedImages(env *EnvFile) bool {
-	front, _ := env.Get(FrontImageVar)
-	return strings.Contains(front, "@sha256:")
+	for _, k := range env.Keys() {
+		if k == FrontImageVar || k == ChownImageVar || strings.HasPrefix(k, "STOWAGE_IMAGE_") {
+			v, _ := env.Get(k)
+			return strings.Contains(v, "@sha256:")
+		}
+	}
+	return true
 }
 
 // Upgrade moves an install of an earlier release of the project to the one this installer
@@ -317,11 +343,20 @@ func (in *Installer) newer(cur, rev string) error {
 	return nil
 }
 
-// sameFront refuses a release whose front the install cannot keep: a TLS mode it no longer offers,
-// a route the install does not publish, a route's domain under an input the install does not
-// record.
+// sameFront refuses a release whose front the install cannot keep: a front where the install has
+// none or none where it has one, a TLS mode it no longer offers, a route the install does not
+// publish, a route's domain under an input the install does not record.
 func (in *Installer) sameFront(env *EnvFile, mode string) error {
 	m := in.R.Manifest
+	_, served := env.Get("STOWAGE_TLS_MODE") // recorded by an install with a front
+	switch {
+	case !in.R.Spec.HasFront() && served:
+		return fmt.Errorf("%s %s has no front, and this install serves through one: a release without a front needs a new install", m.Name, m.ProjectVersion)
+	case !in.R.Spec.HasFront():
+		return nil
+	case !served:
+		return fmt.Errorf("%s %s serves through a front, and this install has none: a front needs a new install", m.Name, m.ProjectVersion)
+	}
 	if !slices.Contains(in.R.Spec.Front.TLSModes, mode) {
 		return fmt.Errorf("%s %s does not offer the TLS mode this install uses (%s)", m.Name, m.ProjectVersion, mode)
 	}
@@ -412,7 +447,7 @@ func (in *Installer) upgradeEnv(env *EnvFile, mode string, added []input, values
 		next.Set(IPv6Var, "false") // an install made before --ipv6
 	}
 	prefix, _ := env.Get("STOWAGE_REGISTRY")
-	next.Set(FrontImageVar, in.frontImage(prefix))
+	in.stowageImageVars(next, prefix)
 	for _, k := range s.ImageNames() {
 		next.Set(ImageVar(k), in.imageRef(prefix, k))
 	}
@@ -542,7 +577,7 @@ func restoreReturned(kept, cur string) error {
 // the release that uses it comes back.
 func releaseKey(k string) bool {
 	switch k {
-	case "STOWAGE_PROJECT_VERSION", "STOWAGE_REVISION", FrontImageVar:
+	case "STOWAGE_PROJECT_VERSION", "STOWAGE_REVISION", FrontImageVar, ChownImageVar:
 		return true
 	}
 	return strings.HasPrefix(k, "STOWAGE_IMAGE_")
@@ -603,10 +638,8 @@ func (in *Installer) Rollback(ctx context.Context) error {
 			return nil
 		}
 		o.logf("finishing the upgrade from or the rollback to %s %s that stopped, back on it", name, cur)
-		for _, f := range stackFiles {
-			if err := copyFile(filepath.Join(prev, f), in.path(f), 0o644); err != nil && !errors.Is(err, os.ErrNotExist) {
-				return err
-			}
+		if err := in.restoreStack(prev, true); err != nil {
+			return err
 		}
 		if err := copyFile(filepath.Join(prev, in.R.Ctl()), in.ctl(), 0o755); err != nil {
 			return err
@@ -623,9 +656,15 @@ func (in *Installer) Rollback(ctx context.Context) error {
 	o.Offline = o.Offline || !pinnedImages(prevEnv)
 	back := &Installer{R: pr, O: in.O}
 	rolled := NewEnvFile()
+	// A value the release sets is the previous release's, or none where it records none (an image
+	// only the newer release has).
 	for _, k := range env.Keys() {
 		v, _ := env.Get(k)
-		if pv, ok := prevEnv.Get(k); ok && releaseKey(k) {
+		if releaseKey(k) {
+			pv, ok := prevEnv.Get(k)
+			if !ok {
+				continue
+			}
 			v = pv
 		}
 		rolled.Set(k, v)
@@ -682,10 +721,8 @@ func (in *Installer) Rollback(ctx context.Context) error {
 	}
 	// As an upgrade: stack files, then .env (the switch), then the installer; PrevDir stays whole
 	// until the end, so an interrupted rollback can run again.
-	for _, f := range stackFiles {
-		if err := copyFile(filepath.Join(prev, f), in.path(f), 0o644); err != nil {
-			return err
-		}
+	if err := in.restoreStack(prev, false); err != nil {
+		return err
 	}
 	if err := rolled.WriteFile(in.path(envName)); err != nil {
 		return err

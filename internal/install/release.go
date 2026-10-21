@@ -98,10 +98,11 @@ func payloadRelease(files payload.Files) (*release.Manifest, error) {
 	return nil, fmt.Errorf("the installer's payload has no %s", payload.Release)
 }
 
-// checkFront refuses to install a release that records no front image. Only the release being
+// checkFront refuses to install a release of a project with a front that records no front image.
+// Only the release being
 // installed needs one: a kept or previous release is read without it.
 func (r *Release) checkFront() error {
-	if _, ok := r.Manifest.Artifacts.Images[front.Key]; !ok {
+	if _, ok := r.Manifest.Artifacts.Images[front.Key]; !ok && r.Spec.HasFront() {
 		return fmt.Errorf("%s %s has no front image (published by a Stowage without one): this installer cannot install it", r.Manifest.Name, r.Manifest.ProjectVersion)
 	}
 	return nil

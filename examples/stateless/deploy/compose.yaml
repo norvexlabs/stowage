@@ -1,14 +1,30 @@
-# The single service definition of the lookup stack: one server, no state. The TLS front is added
-# by Stowage.
+# The single service definition of the lookup stack: one server, no front — the L4 route publishes
+# its port. Its pages are configs Compose renders from the recorded values, and it runs as a user
+# that writes into a volume its image has no directory for (data.volumes gives it that user).
 services:
   server:
     image: ${STOWAGE_IMAGE_SERVER}
-    command: ["sh", "-c", "mkdir -p /www && echo ok > /www/health && echo \"$$VERSION\" > /www/version && echo \"$$GREETING\" > /www/index.html && exec httpd -f -p 8080 -h /www"]
-    environment:
-      GREETING: ${GREETING}
-      VERSION: ${STOWAGE_PROJECT_VERSION}
+    user: "1000"
+    command: ["sh", "-c", "date > /state/started && exec httpd -f -p 8080 -h /www"]
+    configs:
+      - { source: index, target: /www/index.html }
+      - { source: version, target: /www/version }
+      - { source: health, target: /www/health }
+    volumes:
+      - state:/state
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/health"]
       interval: 2s
       retries: 30
     restart: unless-stopped
+
+configs:
+  index:
+    content: "${GREETING}\n"
+  version:
+    content: "${STOWAGE_PROJECT_VERSION}\n"
+  health:
+    content: "ok\n"
+
+volumes:
+  state: {}

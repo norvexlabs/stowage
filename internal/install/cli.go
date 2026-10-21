@@ -118,6 +118,7 @@ func newCommand(r *Release, self string, stdout, stderr io.Writer, tools K8sOpti
 	ipv6Flag(rf, &o.IPv6, "IPv6 on the stack's network, so the front's IPv6 clients keep their address (Docker 27 or later); --ipv6=false turns it off (default off; on a re-run, the recorded choice)")
 	rf.BoolVar(&o.Offline, "offline", false, "the images are already loaded: never log in or pull")
 	rf.BoolVar(&o.DryRun, "dry-run", false, "check, print what would be written (secrets redacted), write nothing")
+	hideFrontFlags(rf, r.Spec, frontFlagNames)
 	rf.StringVar(&secretsFile, "secrets", "", "a first install's secrets: the file `secrets export` wrote, decrypted (- for standard input)")
 	rf.StringArrayVar(&sets, "set", nil, "an input, KEY=VALUE (repeatable; a re-run changes the recorded one)")
 	rf.StringVar(&answers, "answers", "", "a YAML file of inputs, KEY: value (a re-run changes the recorded ones)")
@@ -685,6 +686,7 @@ func vmCreateCommand(in *Installer, o *Options, prepare func() error, terminal f
 	f.StringSliceVar(domains, "domains", nil, "a route's domain, route=host: HTTPS")
 	f.IntVar(&o.HTTPPort, "http-port", 0, "the VM's port a TLS front serves HTTP on (default the project's front.http_port, else 80)")
 	f.IntVar(&o.HTTPSPort, "https-port", 0, "the VM's port a TLS front serves HTTPS on (default the project's front.https_port, else 443)")
+	hideFrontFlags(f, in.R.Spec, []string{"tls", "domains", "http-port", "https-port"}) // --address is the VM's own
 	f.StringArrayVar(sets, "set", nil, "an input, KEY=VALUE (repeatable; never a secret input)")
 	f.StringVar(answers, "answers", "", "a YAML file of inputs, KEY: value (never a secret input)")
 	f.BoolVar(noInput, "no-input", false, "never ask: what nothing gave takes its default")
@@ -792,6 +794,22 @@ func parsePorts(items []string) (map[string]int, error) {
 		out[k] = n
 	}
 	return out, nil
+}
+
+// frontFlagNames are the install flags only a front takes.
+var frontFlagNames = []string{"tls", "domains", "cert", "key", "ca", "http-port", "https-port", "ports", "address"}
+
+// hideFrontFlags hides, for a project without a front, the flags of names f has; given, they are
+// refused naming it (frontFlags).
+func hideFrontFlags(f *pflag.FlagSet, s *spec.Spec, names []string) {
+	if s.HasFront() {
+		return
+	}
+	for _, name := range names {
+		if f.Lookup(name) != nil {
+			_ = f.MarkHidden(name)
+		}
+	}
 }
 
 // tlsHelp describes --tls for the modes this project offers.

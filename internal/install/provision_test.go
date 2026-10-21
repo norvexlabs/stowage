@@ -18,7 +18,7 @@ import (
 
 // hookCalls are the provision hook's runs.
 func (e *env) hookCalls() []Cmd {
-	return e.docker.ran("compose --project-directory " + e.dir + " -f " + filepath.Join(e.dir, "compose.yaml") + " -f " + filepath.Join(e.dir, FrontCompose) + " -f " + filepath.Join(e.dir, ProvisionCompose))
+	return e.docker.ran("compose --project-directory " + e.dir + " -f " + filepath.Join(e.dir, "compose.yaml") + " -f " + filepath.Join(e.dir, FrontCompose) + " -f " + filepath.Join(e.dir, ContentCompose) + " -f " + filepath.Join(e.dir, ProvisionCompose))
 }
 
 func TestTheHookRunsAfterTheStackAndItsOutputsAreRecorded(t *testing.T) {

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"slices"
 	"sort"
@@ -16,6 +17,7 @@ import (
 	"go.yaml.in/yaml/v3"
 
 	"github.com/norvexlabs/stowage/internal/backup"
+	"github.com/norvexlabs/stowage/internal/chown"
 	"github.com/norvexlabs/stowage/internal/front"
 )
 
@@ -102,8 +104,8 @@ type Image struct {
 
 // ReservedImageKeys are the image keys whose repository <prefix>/<name>-<key> Stowage publishes
 // its own artifacts to (release manifests, sequence records, OS bundle, disks, installer, front,
-// the VM's backup runner).
-var ReservedImageKeys = []string{"release", "release-seq", "os", "disk", "installer", front.Key, backup.Key}
+// the VM's backup runner, the volume helper).
+var ReservedImageKeys = []string{"release", "release-seq", "os", "disk", "installer", front.Key, backup.Key, chown.Key}
 
 // Built reports whether Stowage builds this image (as opposed to pulling a pinned reference).
 func (i Image) Built() bool { return i.Ref == "" }
@@ -229,6 +231,10 @@ func (f Front) RouteNames() []string {
 	return n
 }
 
+// Declared reports whether the front section has anything in it: an absent or empty one is no
+// front.
+func (f Front) Declared() bool { return !reflect.ValueOf(f).IsZero() }
+
 // HasDatabase reports whether the project declares a database.
 func (s *Spec) HasDatabase() bool { return s.Database != nil }
 
@@ -251,7 +257,9 @@ type Data struct {
 }
 
 type Volume struct {
-	UID         int  `yaml:"uid"`
+	// UID is the user a volume is given when its root belongs to another (Docker and the VM);
+	// nil leaves it as Docker makes it.
+	UID         *int `yaml:"uid"`
 	KeepOnReset bool `yaml:"keep_on_reset"`
 }
 
@@ -432,6 +440,19 @@ func Parse(raw []byte) (*Spec, error) {
 	return &s, nil
 }
 
+// Requires reads stowage.requires alone from spec bytes, leniently, so a Stowage the project does
+// not accept can refuse before a key it does not know stops the strict decode. It is "" when the
+// key is absent or the bytes do not decode (Parse reports that).
+func Requires(raw []byte) string {
+	var probe struct {
+		Stowage struct {
+			Requires string `yaml:"requires"`
+		} `yaml:"stowage"`
+	}
+	_ = yaml.Unmarshal(raw, &probe)
+	return probe.Stowage.Requires
+}
+
 // InsideRoot refuses a spec path that is absolute or climbs out of the project root.
 func InsideRoot(p string) error {
 	if p == "" {
@@ -486,6 +507,10 @@ var NamePattern = regexp.MustCompile(`^[a-z][a-z0-9-]{0,38}[a-z0-9]$`)
 
 // Short is the name the installer is named after: short_name, else name.
 func (s *Spec) Short() string { return cmp.Or(s.ShortName, s.Name) }
+
+// HasFront reports whether the project has a front (Front.Declared). Without one, nothing is
+// served over HTTP and its L4 routes are the stack's only way in.
+func (s *Spec) HasFront() bool { return s.Front.Declared() }
 
 // Signs reports whether the project signs its releases: a signing provider other than none.
 func (s *Spec) Signs() bool { return s.Signing != nil && s.Signing.Name != "none" }

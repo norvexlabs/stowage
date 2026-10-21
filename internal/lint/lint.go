@@ -182,6 +182,8 @@ func (l *linter) name() {
 	}
 	if l.s.Stowage.Requires == "" {
 		l.warnf("stowage.requires", "no accepted Stowage range declared")
+	} else if _, err := version.ParseSemVerRange(l.s.Stowage.Requires); err != nil {
+		l.errf("stowage.requires", "%v", err)
 	}
 }
 
@@ -529,6 +531,9 @@ func (l *linter) service(where, name string) {
 }
 
 func (l *linter) front() {
+	if !l.s.HasFront() {
+		return // a stack served by its L4 routes alone, if any
+	}
 	f := l.s.Front
 	if len(f.TLSModes) == 0 {
 		l.errf("front.tls_modes", "at least one TLS mode is required")
@@ -792,10 +797,13 @@ func (l *linter) healthAndDatabase() {
 	}
 }
 
+// maxUID is the largest uid Linux gives a user: 2³²−1 is "no user".
+const maxUID = 1<<32 - 2
+
 func (l *linter) data() {
 	for _, name := range sortedKeys(l.s.Data.Volumes) {
-		if l.s.Data.Volumes[name].UID < 0 {
-			l.errf("data.volumes."+name, "uid must be >= 0")
+		if uid := l.s.Data.Volumes[name].UID; uid != nil && (*uid < 0 || *uid > maxUID) {
+			l.errf("data.volumes."+name, "uid must be 0 to %d", maxUID)
 		}
 	}
 	for _, r := range l.s.Data.Reset {
@@ -874,7 +882,11 @@ func (l *linter) secretsAndInputs() {
 			l.errf(w+".advanced", "an advanced input is never asked and takes the compose file's default: no required, no default")
 		}
 		switch in.When {
-		case "", "tls", "loopback":
+		case "":
+		case "tls", "loopback":
+			if !l.s.HasFront() {
+				l.errf(w+".when", "%q: the project has no front, so no TLS mode: the input would never be asked", in.When)
+			}
 		default:
 			l.errf(w+".when", "%q: expected tls or loopback", in.When)
 		}
@@ -938,6 +950,10 @@ func (l *linter) composeVars(keys map[string]string) {
 			if !slices.ContainsFunc(l.s.L4.Routes, func(r spec.L4Route) bool { return spec.L4Var(r.Name) == v.Name && r.AddressInput != "" }) {
 				l.errf(w, "%s names no L4 route with an address_input", v.Name)
 			}
+			continue
+		}
+		if v.Name == "STOWAGE_TLS_MODE" && !l.s.HasFront() {
+			l.errf(w, "%s: the project has no front, so no TLS mode is recorded", v.Name)
 			continue
 		}
 		if strings.HasPrefix(v.Name, "STOWAGE_") {
@@ -1354,6 +1370,12 @@ func (l *linter) lockFile(path string) {
 	}
 	if lk == nil {
 		l.errf(lock.FileName, "missing: run stowage lock to pin the Stowage this project publishes with (ship and promote refuse without it)")
+		return
+	}
+	if r, err := version.ParseSemVerRange(l.s.Stowage.Requires); err == nil {
+		if ok, _ := r.Contains(lk.Stowage); !ok {
+			l.errf(lock.FileName, "pins stowage %s, which stowage.requires (%s) does not accept: pin a Stowage it accepts, or widen the range", lk.Stowage, r)
+		}
 	}
 }
 

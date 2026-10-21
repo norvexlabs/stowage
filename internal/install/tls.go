@@ -52,6 +52,9 @@ func (in *Installer) domainKeys() map[string]string {
 // applyDomains turns --domains route=host into the routes' domain inputs.
 func (in *Installer) applyDomains() error {
 	o := &in.O
+	if !in.R.Spec.HasFront() {
+		return in.frontFlags()
+	}
 	keys := in.domainKeys()
 	for route, host := range o.Domains {
 		k, ok := keys[route]
@@ -75,6 +78,9 @@ func (in *Installer) applyDomains() error {
 // alone; else the operator's choice when there is a terminal; else loopback.
 // asked reports that the operator chose, so the form may go back to that choice.
 func (in *Installer) mode(ctx context.Context, prev string) (mode string, asked bool, err error) {
+	if !in.R.Spec.HasFront() {
+		return "", false, in.frontFlags()
+	}
 	o, offered := &in.O, in.R.Spec.Front.TLSModes
 	if in.remote {
 		offered = remoteModes(offered)
@@ -152,6 +158,29 @@ func (in *Installer) caFlag(mode string) error {
 		return fmt.Errorf("--ca: %s publishes no CA to its services", in.R.Spec.Name)
 	case mode != "byo":
 		return fmt.Errorf("--ca is for --tls byo, not %s", mode)
+	}
+	return nil
+}
+
+// frontFlags refuses, for a project without a front, the flags only a front takes: its TLS mode,
+// certificate, domains, ports and loopback address.
+func (in *Installer) frontFlags() error {
+	o := &in.O
+	var given []string
+	for _, f := range []struct {
+		flag string
+		set  bool
+	}{
+		{"--tls", o.TLS != ""}, {"--cert", o.Cert != ""}, {"--key", o.Key != ""}, {"--ca", o.CA != ""},
+		{"--domains", len(o.Domains) > 0}, {"--http-port", o.HTTPPort != 0}, {"--https-port", o.HTTPSPort != 0},
+		{"--ports", len(o.Ports) > 0}, {"--address", o.Address != ""},
+	} {
+		if f.set {
+			given = append(given, f.flag)
+		}
+	}
+	if len(given) > 0 {
+		return fmt.Errorf("%s has no front: %s set how a front serves, and its L4 routes are its only way in", in.R.Spec.Name, strings.Join(given, ", "))
 	}
 	return nil
 }

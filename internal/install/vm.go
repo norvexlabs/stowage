@@ -19,6 +19,7 @@ import (
 
 	"go.yaml.in/yaml/v3"
 
+	"github.com/norvexlabs/stowage/internal/chown"
 	"github.com/norvexlabs/stowage/internal/front"
 	"github.com/norvexlabs/stowage/internal/lint"
 	"github.com/norvexlabs/stowage/internal/providers"
@@ -297,7 +298,13 @@ func (in *Installer) systemdBooted(ctx context.Context) bool {
 
 // allPreloaded reports whether the engine holds every image of the release the OS preloads.
 func (in *Installer) allPreloaded(ctx context.Context) bool {
-	for _, k := range append([]string{front.Key}, in.R.Spec.ImageNames()...) {
+	keys := in.R.Spec.ImageNames()
+	for _, k := range []string{front.Key, chown.Key} { // the release's own images a start runs
+		if in.R.Manifest.Artifacts.Images[k] != "" {
+			keys = append(keys, k)
+		}
+	}
+	for _, k := range keys {
 		if _, err := in.O.Docker.Run(ctx, Cmd{Args: []string{"image", "inspect", "--format", "{{.Id}}", in.imageRef("", k)}}); err != nil {
 			return false
 		}

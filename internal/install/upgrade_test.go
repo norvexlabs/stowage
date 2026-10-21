@@ -602,7 +602,7 @@ func TestAnOfflineInstallUpgradesFromLoadedImages(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
 	for _, v := range []string{"1.0.0", "2.0.0"} {
-		for _, k := range []string{"api", "web", "postgres", "front"} {
+		for _, k := range []string{"api", "web", "postgres", "front", "chown"} {
 			e.docker.loaded["ghcr.io/acme/notes/notes-"+k+":"+v] = config
 		}
 	}

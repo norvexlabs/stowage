@@ -2,6 +2,7 @@ package install
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -18,9 +19,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/norvexlabs/stowage/internal/chown"
 	"github.com/norvexlabs/stowage/internal/front"
 	"github.com/norvexlabs/stowage/internal/payload"
 	"github.com/norvexlabs/stowage/internal/project"
+	"github.com/norvexlabs/stowage/internal/providers"
 	"github.com/norvexlabs/stowage/internal/release"
 	"github.com/norvexlabs/stowage/internal/spec"
 	"github.com/norvexlabs/stowage/internal/testutil"
@@ -67,6 +70,12 @@ type fakeDocker struct {
 	answer func(args string) (out []byte, ok bool, err error)
 	// runner answers `docker run` of the backup runner.
 	runner func(c Cmd) ([]byte, error)
+	// model is what `compose config --format json` prints; empty, an empty stack.
+	model string
+	// owner answers the run that gives the data volumes their uid.
+	owner func(c Cmd) ([]byte, error)
+	// volumes are the names `volume ls` prints, one per line.
+	volumes string
 }
 
 // exitCode is a command's exit status, as the docker CLI reports a container's.
@@ -91,6 +100,15 @@ func (f *fakeDocker) Run(_ context.Context, c Cmd) ([]byte, error) {
 	switch {
 	case strings.HasPrefix(a, "version"):
 		return []byte("27.3.1\n"), nil
+	case a == "volume ls --format {{.Name}}":
+		return []byte(f.volumes), nil
+	case strings.HasPrefix(a, "compose") && strings.HasSuffix(a, " config --format json"):
+		return []byte(cmp.Or(f.model, "{}")), nil
+	case strings.HasPrefix(a, "run --rm --pull never --network none --user 0 --entrypoint sh "):
+		if f.owner == nil {
+			return nil, nil
+		}
+		return f.owner(c)
 	case a == "compose version --short":
 		if f.checked != nil {
 			f.checked()
@@ -267,7 +285,11 @@ func testInstallerKeys(t *testing.T, version string, revision int, mod func(*spe
 	}
 	specJSON, _ := json.Marshal(view)
 	images, configs, manifests := map[string]string{}, map[string]string{}, map[string]string{}
-	for _, k := range append(p.Spec.ImageNames(), front.Key) {
+	keys := append(p.Spec.ImageNames(), front.Key)
+	if providers.OwnsVolumes(&view) { // as ship publishes it
+		keys = append(keys, chown.Key)
+	}
+	for _, k := range keys {
 		images[k], configs[k], manifests[k] = digest, config, manifest
 	}
 	m := &release.Manifest{SchemaVersion: release.SchemaVersion, Name: "notes", ShortName: view.Short(), ProjectVersion: version, Revision: revision, ReleaseSeq: 1, Channel: "stable", Tag: version,
@@ -382,20 +404,20 @@ func TestInstallWritesTheStackAndStartsIt(t *testing.T) {
 	if !regexp.MustCompile(`^notes-notes-[0-9a-f]{8}$`).MatchString(get(f, "COMPOSE_PROJECT_NAME")) {
 		t.Errorf("project = %q", get(f, "COMPOSE_PROJECT_NAME"))
 	}
-	for _, n := range []string{"compose.yaml", FrontCompose, Caddyfile} {
+	for _, n := range []string{"compose.yaml", FrontCompose, Caddyfile, ContentCompose} {
 		if _, err := os.Stat(filepath.Join(e.dir, n)); err != nil {
 			t.Error(err)
 		}
 	}
-	if n := len(e.docker.ran("pull")); n != 4 {
-		t.Errorf("%d pulls, want 4 (3 images + the front)", n)
+	if n := len(e.docker.ran("pull")); n != 5 {
+		t.Errorf("%d pulls, want 5 (3 images, the front and the volume helper)", n)
 	}
 	up := e.docker.ran("compose")
-	if len(up) != 3 || !strings.Contains(strings.Join(up[1].Args, " "), "up --detach --wait") || !strings.HasSuffix(strings.Join(up[2].Args, " "), "run --rm --no-deps -T --name "+get(e.readEnv(), "COMPOSE_PROJECT_NAME")+"-"+ProvisionService+" "+ProvisionService) {
+	if len(up) != 4 || !strings.HasSuffix(strings.Join(up[1].Args, " "), "config --format json") || !strings.Contains(strings.Join(up[2].Args, " "), "up --detach --wait") || !strings.HasSuffix(strings.Join(up[3].Args, " "), "run --rm --no-deps -T --name "+get(e.readEnv(), "COMPOSE_PROJECT_NAME")+"-"+ProvisionService+" "+ProvisionService) {
 		t.Fatalf("compose calls: %v", up)
 	}
 	// The recorded values win over the shell's.
-	envs := strings.Join(up[1].Env, "\n")
+	envs := strings.Join(up[2].Env, "\n")
 	if strings.Contains(envs, "from-the-shell") || strings.Contains(envs, "COMPOSE_PROJECT_NAME=other") || !strings.Contains(envs, "PATH=/bin") {
 		t.Fatalf("compose environment:\n%s", envs)
 	}
@@ -452,6 +474,7 @@ func TestOfflineRunsTheLoadedImagesByTagAndNeverPulls(t *testing.T) {
 	// docker load on the classic image store keeps tags, not registry digests: the ID is the config
 	// digest there, the image digest on the containerd store.
 	e.docker.loaded["ghcr.io/acme/notes/notes-front:1.0.0"] = manifest
+	e.docker.loaded["ghcr.io/acme/notes/notes-chown:1.0.0"] = manifest
 	e.docker.loaded["ghcr.io/acme/notes/notes-api:1.0.0"] = config
 	e.docker.loaded["ghcr.io/acme/notes/notes-web:1.0.0"] = digest
 	e.docker.loaded["ghcr.io/acme/notes/notes-postgres:1.0.0"] = "sha256:3333"
@@ -790,7 +813,7 @@ func TestAReRunFinishesSetupAndNeverRedecides(t *testing.T) {
 	if !bytes.Equal(before, after) {
 		t.Fatal("a re-run rewrote .env")
 	}
-	if len(e.docker.ran("pull")) != 0 || len(e.docker.ran("compose")) != 3 {
+	if len(e.docker.ran("pull")) != 0 || len(e.docker.ran("compose")) != 4 {
 		t.Fatalf("re-run calls: %v", e.docker.calls)
 	}
 
@@ -893,7 +916,7 @@ func TestAReRunChangesWhatItIsGiven(t *testing.T) {
 			t.Errorf("log lacks %q:\n%s", want, e.log)
 		}
 	}
-	if len(e.docker.ran("compose")) != 3 || !strings.Contains(e.out.String(), "http://localhost:18080") {
+	if len(e.docker.ran("compose")) != 4 || !strings.Contains(e.out.String(), "http://localhost:18080") {
 		t.Fatalf("the stack was not brought up again: %v\n%s", e.docker.calls, e.out)
 	}
 
@@ -1189,7 +1212,7 @@ func TestDockerHubCredentialsUseTheKeyTheCLIReads(t *testing.T) {
 
 func TestAnOfflineInstallStaysOfflineOnARerun(t *testing.T) {
 	e := newEnv(t)
-	tags := map[string]string{"ghcr.io/acme/notes/notes-front:1.0.0": config, "ghcr.io/acme/notes/notes-api:1.0.0": config,
+	tags := map[string]string{"ghcr.io/acme/notes/notes-front:1.0.0": config, "ghcr.io/acme/notes/notes-chown:1.0.0": config, "ghcr.io/acme/notes/notes-api:1.0.0": config,
 		"ghcr.io/acme/notes/notes-web:1.0.0": config, "ghcr.io/acme/notes/notes-postgres:1.0.0": config}
 	for r, id := range tags {
 		e.docker.loaded[r] = id

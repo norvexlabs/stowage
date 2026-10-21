@@ -459,7 +459,7 @@ func TestUpgradeVersionKeepsTheInstallerThatFailed(t *testing.T) {
 func TestUpgradeVersionNeedsAnInstallThatPulls(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
-	for _, k := range []string{"api", "web", "postgres", "front"} {
+	for _, k := range []string{"api", "web", "postgres", "front", "chown"} {
 		e.docker.loaded["ghcr.io/acme/notes/notes-"+k+":1.0.0"] = config
 	}
 	if err := e.install(func(o *Options) { o.Offline = true }); err != nil {

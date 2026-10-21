@@ -14,8 +14,13 @@ import (
 	"github.com/norvexlabs/stowage/internal/spec"
 )
 
-// FrontImageVar records the front's image reference in .env.
+// FrontImageVar records the front's image reference in .env; a project without a front records
+// none.
 const FrontImageVar = "STOWAGE_FRONT_IMAGE"
+
+// ChownImageVar records the volume helper's image reference in .env, for a release that carries
+// one.
+const ChownImageVar = "STOWAGE_CHOWN_IMAGE"
 
 // FrontService is the compose service Stowage adds; projects may not use the name.
 const FrontService = "stowage-front"
@@ -206,7 +211,7 @@ func frontCommand(f spec.Front, ca string) []string {
 	return []string{"sh", "-c", cp + run}
 }
 
-// frontCompose adds the front service to the project's stack: in loopback mode each route on its
+// frontCompose adds the front service to the project's stack, unless it has none: in loopback mode each route on its
 // port of the loopback address, behind TLS only the HTTP and HTTPS ports (80 and 443 unless
 // moved), on every address. The host ports come from .env. The L4 routes' ports are published
 // in every mode, to their services.
@@ -241,6 +246,10 @@ func frontCompose(f spec.Front, l4 []spec.L4Route, mode string, host hostAPI, di
 		service["environment"] = map[string]string{"CLOUDFLARE_API_TOKEN": "${" + CloudflareTokenVar + "}"}
 	}
 	services := map[string]any{FrontService: service}
+	volumesDoc := map[string]any{"stowage-front-data": map[string]any{}}
+	if !f.Declared() {
+		services, volumesDoc = map[string]any{}, nil // no front: the L4 ports and the host API alone
+	}
 	for _, svc := range host.services {
 		services[svc] = map[string]any{
 			"volumes": []string{host.dir + ":" + HostAppMount + ":ro"},
@@ -262,9 +271,9 @@ func frontCompose(f spec.Front, l4 []spec.L4Route, mode string, host hostAPI, di
 		ports, _ := svc["ports"].([]any)
 		svc["ports"] = append(ports, map[string]any{"target": target, "published": strconv.Itoa(r.Port), "protocol": r.Protocol})
 	}
-	doc := map[string]any{
-		"services": services,
-		"volumes":  map[string]any{"stowage-front-data": map[string]any{}},
+	doc := map[string]any{"services": services}
+	if volumesDoc != nil {
+		doc["volumes"] = volumesDoc
 	}
 	// IPv6 on the default network, which the front is on: Docker forwards the published ports
 	// over IPv6 to the front itself (its own unique local subnet, NAT), rather than through its

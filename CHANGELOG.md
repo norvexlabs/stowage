@@ -3,6 +3,24 @@
 Stowage's own releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
+## [0.8.0]
+
+### Added
+- **A project without a front**: leave `front` out and the stack is served by its L4 routes
+  alone, on Docker and the VM. Nothing about a front is asked, probed or recorded, the VM opens
+  the L4 ports and SSH alone, and the flags only a front takes are refused naming it.
+- **`data.volumes.<name>.uid` is applied** on Docker and the VM: a volume the stack makes (its
+  first start, or after `reset-db`) is given to that uid before its services start, so a service
+  running as a user can write a volume mounted where its image has no directory. A volume that
+  exists keeps its owner. The release then carries a small volume helper image, `<name>-chown`.
+- **`stowage.requires` is enforced**: every command refuses a Stowage outside the range before
+  reading the rest of the spec, naming both versions, and lint refuses a range that does not
+  parse and a `stowage.lock` pin outside it.
+
+### Fixed
+- A change to an inline compose `configs:` content or to an environment-sourced compose secret
+  now recreates the services that mount it: Compose alone kept them running with the old one.
+
 ## [0.7.0] - 2026-10-21
 
 ### Added

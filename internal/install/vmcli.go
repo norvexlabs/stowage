@@ -141,6 +141,7 @@ func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(
 	f.IntVar(&o.HTTPPort, "http-port", 0, "the host port a TLS front serves HTTP on (default the project's front.http_port, else 80; on an installed VM, changes it)")
 	f.IntVar(&o.HTTPSPort, "https-port", 0, "the host port a TLS front serves HTTPS on (default the project's front.https_port, else 443; on an installed VM, changes it)")
 	f.StringVar(&o.Channel, "channel", "", "the channel `updates` and `upgrade` follow")
+	hideFrontFlags(f, r.Spec, frontFlagNames)
 	f.BoolVar(&o.DryRun, "dry-run", false, "check, print what would be written (secrets redacted), write nothing")
 	f.StringArrayVar(&sets, "set", nil, "an input, KEY=VALUE (repeatable; on an installed VM, changes the recorded one)")
 	f.StringVar(&answers, "answers", "", "a YAML file of inputs, KEY: value (on an installed VM, changes the recorded ones)")

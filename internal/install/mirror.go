@@ -19,6 +19,7 @@ import (
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 
 	"github.com/norvexlabs/stowage/internal/backup"
+	"github.com/norvexlabs/stowage/internal/chown"
 	"github.com/norvexlabs/stowage/internal/front"
 	"github.com/norvexlabs/stowage/internal/lint"
 	"github.com/norvexlabs/stowage/internal/providers"
@@ -353,7 +354,7 @@ func (in *Installer) MirrorImport(ctx context.Context, file, prefix string, olde
 	// The release's own repositories, and no other project's: its images are the ones this
 	// installer's project names (an image another release adds needs that release's installer).
 	ours := map[string]bool{name + "-release": true, name + "-installer": true, name + "-os": true, name + "-disk": true}
-	known := map[string]bool{front.Key: true, backup.Key: true}
+	known := map[string]bool{front.Key: true, backup.Key: true, chown.Key: true}
 	for _, k := range in.R.Spec.ImageNames() {
 		known[k] = true
 	}

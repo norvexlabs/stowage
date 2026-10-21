@@ -28,6 +28,7 @@ import (
 	"github.com/google/go-containerregistry/pkg/v1/remote"
 
 	"github.com/norvexlabs/stowage/internal/backup"
+	"github.com/norvexlabs/stowage/internal/chown"
 	"github.com/norvexlabs/stowage/internal/cloud"
 	"github.com/norvexlabs/stowage/internal/front"
 	"github.com/norvexlabs/stowage/internal/kairos"
@@ -394,16 +395,16 @@ func TestShipPublishesThenSkipsEverything(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
 	r := e.mustShip("stable", 1)
-	eq(t, "built", strings.Join(e.builder.names(), ","), "api,web,front,backup,os")
-	for _, r := range e.builder.built[:4] {
-		eq(t, "recipe of "+r.Image, string(r.Recipe), map[string]string{front.Key: string(front.Dockerfile), backup.Key: string(backup.Dockerfile)}[r.Image])
+	eq(t, "built", strings.Join(e.builder.names(), ","), "api,web,front,backup,chown,os")
+	for _, r := range e.builder.built[:5] {
+		eq(t, "recipe of "+r.Image, string(r.Recipe), map[string]string{front.Key: string(front.Dockerfile), backup.Key: string(backup.Dockerfile), chown.Key: string(chown.Dockerfile)}[r.Image])
 	}
 	m := r.Manifest
 	eq(t, "tag", m.Tag, "1.0.0")
 	eq(t, "seq", m.ReleaseSeq, 1)
 	eq(t, "channel", m.Channel, "stable")
 	eq(t, "changelog", strings.Contains(m.Changelog.Project, "First release"), true)
-	eq(t, "images", len(m.Artifacts.Images), 5)
+	eq(t, "images", len(m.Artifacts.Images), 6)
 	for img, d := range m.Artifacts.Images {
 		ref, _ := name.NewDigest(e.host + "/acme/notes/notes-" + img + "@" + d)
 		pulled, err := remote.Image(ref)
@@ -1005,14 +1006,14 @@ func TestASignedProjectSignsEveryArtifactBeforeItsTagMoves(t *testing.T) {
 	eq(t, "manifest signed", e.signedRef("notes-release", r.Digest.String()), true)
 	eq(t, "os bundle signed", e.signedRef("notes-os", r.Manifest.Artifacts.OS), true)
 	eq(t, "disk signed", e.signedRef("notes-disk", r.Manifest.Artifacts.Disks["qcow2"]), true)
-	eq(t, "signatures", e.signer.signs, 11) // and the channel's disk set record
+	eq(t, "signatures", e.signer.signs, 12) // and the channel's disk set record
 
 	e.mustShip("stable", 1)
-	eq(t, "a re-ship signs nothing", e.signer.signs, 11)
+	eq(t, "a re-ship signs nothing", e.signer.signs, 12)
 	e.signer.onSign = nil
 	delete(e.signer.sigs, e.host+"/acme/notes/notes-release@"+r.Digest.String())
 	eq(t, "a lost signature is made again", e.mustShip("stable", 1).Digest, r.Digest)
-	eq(t, "signatures", e.signer.signs, 12)
+	eq(t, "signatures", e.signer.signs, 13)
 	p, _ := e.publisher()
 	if _, err := p.Verify(context.Background(), "stable", "", 1); err != nil {
 		t.Fatal(err)

@@ -32,6 +32,7 @@ import (
 	"github.com/google/go-containerregistry/pkg/name"
 
 	"github.com/norvexlabs/stowage/internal/backup"
+	"github.com/norvexlabs/stowage/internal/chown"
 	"github.com/norvexlabs/stowage/internal/front"
 	"github.com/norvexlabs/stowage/internal/lint"
 	"github.com/norvexlabs/stowage/internal/payload"
@@ -403,6 +404,9 @@ type publish struct {
 // returns where the front listens.
 func (in *Installer) preflight(ctx context.Context, mode string) (publish, error) {
 	o := &in.O
+	if !in.R.Spec.HasFront() {
+		return publish{}, in.l4Free(in.R.Spec.L4.Routes)
+	}
 	if mode == Loopback {
 		if o.HTTPPort != 0 || o.HTTPSPort != 0 {
 			return publish{}, errors.New("--http-port and --https-port are for TLS modes: loopback mode takes --ports")
@@ -542,14 +546,18 @@ func (in *Installer) decide(ctx context.Context, dir, mode string, pub publish, 
 	env.Set("STOWAGE_PROJECT_VERSION", in.R.Manifest.ProjectVersion)
 	env.Set("STOWAGE_REVISION", strconv.Itoa(in.R.Manifest.Revision))
 	env.Set("STOWAGE_REGISTRY", prefix)
-	env.Set("STOWAGE_TLS_MODE", mode)
-	env.Set("STOWAGE_LOOPBACK_ADDRESS", pub.addr) // a TLS front publishes on every address; this one stays local
+	if s.HasFront() {
+		env.Set("STOWAGE_TLS_MODE", mode)
+	}
+	// Always recorded, a service's port may bind to it; a TLS front publishes on every address, and
+	// this one stays local.
+	env.Set("STOWAGE_LOOPBACK_ADDRESS", cmp.Or(pub.addr, "127.0.0.1"))
 	if o.Channel != "" {
 		env.Set(ChannelVar, o.Channel)
 	}
 	in.frontVars(env, mode, pub, domains)
 	in.acmeForward(nil, env)
-	env.Set(FrontImageVar, in.frontImage(prefix))
+	in.stowageImageVars(env, prefix)
 	for _, k := range s.ImageNames() {
 		env.Set(ImageVar(k), in.imageRef(prefix, k))
 	}
@@ -965,8 +973,13 @@ func (in *Installer) renderStack(env *EnvFile, dir string) error {
 	f := in.R.Spec.Front
 	mode, _ := env.Get("STOWAGE_TLS_MODE")
 	get := func(k string) string { v, _ := env.Get(k); return v }
-	cf := loopbackCaddyfile(f, get)
-	if mode != Loopback {
+	var cf string
+	switch {
+	case !f.Declared():
+		cf = "# Written by the installer: " + in.R.Spec.Name + " has no front, nothing is served over HTTP.\n"
+	case mode == Loopback:
+		cf = loopbackCaddyfile(f, get)
+	default:
 		domains := map[string]string{}
 		for _, r := range f.Routes {
 			domains[r.Name], _ = env.Get(r.DomainInput)
@@ -1002,9 +1015,21 @@ func (in *Installer) renderStack(env *EnvFile, dir string) error {
 	if err != nil {
 		return err
 	}
-	data := map[string][]byte{"compose.yaml": in.R.Compose, FrontCompose: fc, Caddyfile: []byte(cf)}
+	// The content labels name the compose file's services: a new compose file starts without them,
+	// until its start labels them (writeContent); the same one keeps them, so nothing started
+	// before that start loses its label.
+	data := map[string][]byte{"compose.yaml": in.R.Compose, FrontCompose: fc, Caddyfile: []byte(cf), ContentCompose: []byte(contentPlaceholder)}
+	if old, err := os.ReadFile(filepath.Join(dir, "compose.yaml")); err == nil && bytes.Equal(old, in.R.Compose) {
+		if _, err := os.Stat(filepath.Join(dir, ContentCompose)); err == nil {
+			delete(data, ContentCompose)
+		}
+	}
 	for _, name := range stackFiles {
-		if err := os.WriteFile(filepath.Join(dir, name), data[name], 0o644); err != nil {
+		raw, ok := data[name]
+		if !ok {
+			continue
+		}
+		if err := os.WriteFile(filepath.Join(dir, name), raw, 0o644); err != nil {
 			return err
 		}
 	}
@@ -1016,9 +1041,13 @@ func (in *Installer) Compose(ctx context.Context, env *EnvFile, stream io.Writer
 	return in.O.Docker.Run(ctx, Cmd{Args: append(in.composeBase(), args...), Env: env.Environ(in.O.environ()), Stream: stream})
 }
 
-// composeBase is `docker compose` on the install's stack, plus the extra compose files.
+// composeBase is `docker compose` on the install's stack, plus the extra compose files. The content
+// labels are named only when the file exists.
 func (in *Installer) composeBase(extra ...string) []string {
 	base := []string{"compose", "--project-directory", in.O.Dir, "-f", in.path("compose.yaml"), "-f", in.path(FrontCompose)}
+	if _, err := os.Stat(in.path(ContentCompose)); err == nil {
+		base = append(base, "-f", in.path(ContentCompose))
+	}
 	for _, f := range extra {
 		base = append(base, "-f", in.path(f))
 	}
@@ -1048,8 +1077,40 @@ func (in *Installer) up(ctx context.Context, env *EnvFile) error {
 	if err := in.profilesOff(ctx, env); err != nil {
 		return err
 	}
+	environ := env.Environ(base)
+	m, err := in.model(ctx, environ)
+	if err != nil {
+		return err
+	}
+	if err := in.writeContent(m, environ); err != nil {
+		return err
+	}
+	// Listed once: a retry finds the volumes its first try made, and they await their uid.
+	names, uids, keep, err := in.newVolumes(ctx, m)
+	if err != nil {
+		return err
+	}
+	if err := in.writePending(append(slices.Clone(keep), names...)); err != nil {
+		return err
+	}
 	run := func() error {
-		_, err := in.O.Docker.Run(ctx, Cmd{Args: append(in.composeBase(), "up", "--detach", "--wait", "--remove-orphans"), Env: env.Environ(base), Stream: in.O.Log})
+		// The containers are made first when a new volume is given its uid: it then holds what
+		// the image put in it.
+		if len(names) > 0 {
+			if _, err := in.O.Docker.Run(ctx, Cmd{Args: append(in.composeBase(), "up", "--no-start", "--remove-orphans"), Env: environ, Stream: in.O.Log}); err != nil {
+				return err
+			}
+			given, err := in.ownVolumes(ctx, env, names, uids)
+			if err != nil {
+				return err
+			}
+			if given {
+				if err := in.writePending(keep); err != nil {
+					return err
+				}
+			}
+		}
+		_, err := in.O.Docker.Run(ctx, Cmd{Args: append(in.composeBase(), "up", "--detach", "--wait", "--remove-orphans"), Env: environ, Stream: in.O.Log})
 		return err
 	}
 	if err = run(); err != nil {
@@ -1064,6 +1125,10 @@ func (in *Installer) up(ctx context.Context, env *EnvFile) error {
 		return fmt.Errorf("the stack did not become ready: %w (see: docker compose --project-directory %s logs)", err, in.O.Dir)
 	}
 	in.certDone()
+	if !in.R.Spec.HasFront() {
+		fmt.Fprintf(in.O.Out, "%s %s is running\n", in.R.Spec.Name, in.R.Manifest.ProjectVersion)
+		return nil
+	}
 	url, _ := env.Get(spec.URLVar(in.R.Spec.Front.Portal))
 	fmt.Fprintf(in.O.Out, "%s %s is running: %s\n", in.R.Spec.Name, in.R.Manifest.ProjectVersion, url)
 	return nil
@@ -1280,7 +1345,7 @@ func (in *Installer) openPorts(ctx context.Context, env *EnvFile) error {
 	}
 	name := in.R.Spec.Name
 	var input, forward []byte
-	if mode, _ := env.Get("STOWAGE_TLS_MODE"); mode != Loopback {
+	if mode, _ := env.Get("STOWAGE_TLS_MODE"); in.R.Spec.HasFront() && mode != Loopback {
 		var ports []int
 		for _, k := range []string{HTTPPortVar, HTTPSPortVar} {
 			v, _ := env.Get(k)
@@ -1741,6 +1806,20 @@ func (in *Installer) imageRef(prefix, key string) string {
 // frontImage is where the release's front is taken from: published with its images.
 func (in *Installer) frontImage(prefix string) string { return in.imageRef(prefix, front.Key) }
 
+// stowageImageVars records the references of the release's own images a start runs: the front's,
+// for a project with one, and the volume helper's, for a release that carries it. Recorded, they
+// keep the first install's way of reaching images (by digest, or loaded by tag) on every run.
+func (in *Installer) stowageImageVars(env *EnvFile, prefix string) {
+	env.Delete(FrontImageVar)
+	if in.R.Spec.HasFront() {
+		env.Set(FrontImageVar, in.frontImage(prefix))
+	}
+	env.Delete(ChownImageVar)
+	if in.R.Manifest.Artifacts.Images[chown.Key] != "" {
+		env.Set(ChownImageVar, in.imageRef(prefix, chown.Key))
+	}
+}
+
 // checkDocker requires the Docker engine (≥ MinDockerIPv6 with --ipv6) and Compose ≥ MinCompose.
 func (in *Installer) checkDocker(ctx context.Context) error {
 	server, err := in.O.Docker.Run(ctx, Cmd{Args: []string{"version", "--format", "{{.Server.Version}}"}})
@@ -1787,11 +1866,17 @@ func (im image) pinned() bool { return strings.Contains(im.ref, "@sha256:") }
 // stackImages lists the images the recorded file names.
 func (in *Installer) stackImages(env *EnvFile) []image {
 	a := in.R.Manifest.Artifacts
-	ref, _ := env.Get(FrontImageVar)
-	out := []image{{ref, []string{a.Images[front.Key], a.Manifests[front.Key], a.Configs[front.Key]}}}
+	var out []image
+	if ref, ok := env.Get(FrontImageVar); ok {
+		out = append(out, image{ref, []string{a.Images[front.Key], a.Manifests[front.Key], a.Configs[front.Key]}})
+	}
 	for _, k := range in.R.Spec.ImageNames() {
 		ref, _ := env.Get(ImageVar(k))
 		out = append(out, image{ref, []string{a.Images[k], a.Manifests[k], a.Configs[k]}})
+	}
+	// The volume helper, which no service runs: a start runs it to give new volumes their uid.
+	if ref, ok := env.Get(ChownImageVar); ok {
+		out = append(out, image{ref, []string{a.Images[chown.Key], a.Manifests[chown.Key], a.Configs[chown.Key]}})
 	}
 	// The backup runner, which no service runs: a Docker install's backups run it (the VM's OS
 	// bundle preloads it).

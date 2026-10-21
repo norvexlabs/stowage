@@ -27,6 +27,15 @@ A finished item is deleted, not ticked. The plan behind it is
    `terraform-provider-openstack/openstack`, whichever the latest official docs make canonical).
    Before writing a module, read the latest provider's official docs and its schema, and pin that
    release.
+4. **Stale disk tags on a registry that refuses tag deletes**: a `ship` without `--disks` to a
+   channel with no disk set tries to remove the disk repository's `latest-<format>` tags, and a
+   registry with no tag DELETE (ghcr.io answers `UNSUPPORTED`) refuses it, so the ship exits 1
+   after the release and channel pointer are already published, and `verify` then fails on every
+   such tag ("the channel has no disk set of that format: yank or prune again") with no verb that
+   can clear it. Deleting by digest would remove other tags sharing the manifest. On such a
+   registry, retire a stale tag some other way (e.g. re-point it at a tombstone manifest that
+   `verify` recognises), or have `verify` and `ship` report it as a warning, not a failure. The
+   release itself must never read as failed because a cleanup was refused.
 
 ## Should
 
@@ -219,6 +228,22 @@ A finished item is deleted, not ticked. The plan behind it is
 
 ## Could
 
+- **A failed chown after `up --no-start` leaves a running stack down**: when a start makes a
+  volume of a `uid` while the stack runs (an upgrade that adds one), `up --no-start` recreates the
+  changed services before the volume helper runs; if the helper then fails, they stay created and
+  stopped until a re-run or a rollback. Start the volume's own services alone first, or bring the
+  others back up on that failure.
+- **`compose config` on every start**: a start reads the stack as Compose runs it for the content
+  labels and the new volumes, even for a stack with no inline config, no environment-sourced
+  secret and no volume of a `uid`, where it finds nothing; skip it there.
+- **One list of the release's own images a start runs**: the front and the volume helper are
+  listed from the manifest (`allPreloaded`), from the spec and the manifest (`stowageImageVars`)
+  and from `.env` (`stackImages`); one helper would keep a new Stowage image from reaching some
+  and not others.
+- **No front as one install mode**: a project without a front is a set of `HasFront` guards across
+  the installer (preflight, decide, renderStack, up, openPorts, reconfig, upgrade, vm create, the
+  CLI's flags); one front mode with no ports, Caddyfile or image would keep a new path from
+  forgetting its guard.
 - **A disk push's commit on a slow registry**: the commit (`PUT ?digest=`) waits at most the
   client's 2-minute response bound; a registry that verifies or moves a large blob for longer
   gets the commit retried, the blob looked for until the 5-minute stall bound, then the push fails

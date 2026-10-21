@@ -384,6 +384,8 @@ the loop to try before your operators do.
 A control plane with daemons of its own (raw TCP or UDP, its own TLS, its own config formats, an
 API it is set up through) packages without changing the software, through the compose file:
 
+- **Nothing served over HTTP**: leave `front` out (see "A project without a front"); the `l4`
+  routes are then the stack's only way in.
 - **Ports clients dial as they are** are `l4` routes (see "Spec keys"), the endpoint the stack
   advertises given by the route's `address_input` (`STOWAGE_L4_<ROUTE>`), the sources the VM's
   firewall lets reach it by its `allow_input`. The front can move off 443 with
@@ -396,7 +398,11 @@ API it is set up through) packages without changing the software, through the co
   the backup's `volumes`, so a restore brings the material back with the data it belongs to.
 - **A daemon's own config format**: a thin entrypoint renders it from the environment (the
   recorded values compose interpolates) and from the volume's material, then `exec`s the daemon
-  unchanged; or compose `configs:` with interpolated `content:`.
+  unchanged; or compose `configs:` with interpolated `content:` (or a `secrets:` entry from an
+  `environment:` variable): a change to what Compose renders recreates the service that mounts it
+  (see the installer's `stowage-content.yaml`).
+- **A volume a non-root daemon writes** at a path its image lacks: give the volume the daemon's
+  user in `data.volumes.<name>.uid`.
 - **Setting up the control plane through its API** (entities, enrolment tokens): a long-lived,
   idempotent compose service that waits for the API, makes what is missing and hands what the
   daemons need through a shared volume, one marker file per finished step. The provision hook
@@ -447,8 +453,9 @@ a real registry, the local Docker engine, a kind cluster and a VM on TrueNAS
 
 A project is a directory holding `stowage.yaml`. Every path in it is relative to that directory.
 Start from [examples/minimal](examples/minimal/) (the smallest complete project) or
-[examples/stateless](examples/stateless/) (no database and nothing built: one pulled image
-behind the front, the endpoint of an extension; installed end to end on Docker, its chart linted) or
+[examples/stateless](examples/stateless/) (no database, nothing built and no front: one pulled
+image served by an L4 route alone, its pages rendered into compose `configs:`, a volume given its
+user's uid; installed end to end on Docker, its chart linted) or
 [examples/full](examples/full/) (every spec key in use, and a working stack on Docker,
 Kubernetes and a Kairos VM: stand-in services that migrate a real Postgres through two roles, a provision hook, an
 optional search extension it takes the URL of; its chart runs them with the database embedded or external, the
@@ -595,6 +602,7 @@ The release manifest (artifact type `application/vnd.stowage.release.v1+json`) h
 | `<name>-<key>` | each image (built, or mirrored from a pinned `ref`) by the release tag |
 | `<name>-front` | the front, built by Stowage, by the release tag |
 | `<name>-backup` | the backup runner, built by Stowage (a `docker` or `kairos` shape with a `pg-age-rclone` backup), by the release tag |
+| `<name>-chown` | the volume helper, built by Stowage (a `docker` or `kairos` shape with a `data.volumes` entry of a `uid`), by the release tag |
 | `<name>-installer` | the release tag, and `:latest` |
 | `<name>-os` | the Kairos OS bundle (an image), by the release tag |
 | `<name>-disk` | each disk image by `<tag>-<format>` (one disk set per channel), and `latest-<format>` |
@@ -793,7 +801,7 @@ exactly what was published (same release inputs: images, compose, spec, changelo
 `stowage.lock`, and the same `stowage` and pull account password, which make the installer
 and the front),
 checked before anything is written. Re-shipping a yanked release fails: publish a new revision (the channel never moves forward to it; a pointer an interrupted yank left on it moves back). Image keys `release`,
-`release-seq`, `os`, `disk`, `installer`, `front` and `backup` are reserved for Stowage's own repositories. `yank` marks a release (nothing is deleted) and moves the pointer back to the latest
+`release-seq`, `os`, `disk`, `installer`, `front`, `backup` and `chown` are reserved for Stowage's own repositories. `yank` marks a release (nothing is deleted) and moves the pointer back to the latest
 release that is not yanked and verifies, removing it when none is left; a broken release can
 always be yanked. `prune` deletes tags (the release's images, installer, chart, OS bundle and
 disk tags first, its manifest last; disks as "Disk sets" says): a registry that deletes no tag
@@ -838,8 +846,9 @@ These are what `lint` checks; each finding names the key path or `file:line` to 
     only the installer relaxes it;
   - `STOWAGE_` is reserved. Stowage provides `STOWAGE_IMAGE_<KEY>`, `STOWAGE_URL_<ROUTE>` (the
     route's public URL — use it rather than building one from a domain), `STOWAGE_NAME`,
-    `STOWAGE_PROJECT_VERSION`, `STOWAGE_REVISION`, `STOWAGE_TLS_MODE`, `STOWAGE_LOOPBACK_ADDRESS`
-    (a loopback address in every mode, for a port only this host may reach: 127.x or `::1`,
+    `STOWAGE_PROJECT_VERSION`, `STOWAGE_REVISION`, `STOWAGE_TLS_MODE` (never set without a
+    front: lint refuses it then), `STOWAGE_LOOPBACK_ADDRESS`
+    (a loopback address in every mode and without a front, for a port only this host may reach: 127.x or `::1`,
     bare — Compose's port syntax takes `::1:5432:5432`), `STOWAGE_IPV6` (`true` with `--ipv6`, else `false`; Docker and the VM),
     `STOWAGE_L4_<ROUTE>` (an `l4` route's endpoint, `<address>:<port>`, for a route with an
     `address_input`; Docker and the VM);
@@ -1121,19 +1130,50 @@ These are what `lint` checks; each finding names the key path or `file:line` to 
   `${X:+v}`, `${X+v}` are defined when X is unset.
 - **`stowage.lock`** (next to `stowage.yaml`, committed; written by `stowage lock`). It is
   decoded strictly and holds only `stowage: <SemVer release, no build metadata>`: the installer,
-  `<short>-stow`, the host daemon and the recipes of the front and the backup runner are all part of
-  that `stowage`, and `ship` builds the front and the runner into the project's own registry
+  `<short>-stow`, the host daemon and the recipes of the front, the backup runner and the volume
+  helper are all part of that `stowage`, and `ship` builds them into the project's own registry
   (there is no Stowage registry to pin pieces from). Without it lint reports
   an error, and `ship` and `promote` refuse; they also refuse a `stowage` of another version than
   `stowage:`, before reading the registry, naming the pinned `stowage` to use (`ship` with a newer
-  `stowage` also offers `stowage lock --update`).
+  `stowage` also offers `stowage lock --update`). Lint also reports a pin `stowage.requires` does
+  not accept.
+- **`stowage.requires`** is the range of Stowage versions the project accepts: comparators
+  separated by spaces, all of which must hold — `>=`, `>`, `<=`, `<`, `=` and a version
+  `MAJOR[.MINOR[.PATCH]]` (missing parts are 0, no pre-release), e.g. `">=0.8 <1"`. Versions
+  compare as SemVer, field by field as numbers (0.10 comes after 0.9). Every `stowage` command
+  that reads the project (`lint`, `plan`, `ship`, `promote`, `lock`, the hook commands) reads it
+  first, before the rest of the spec, so a `stowage` outside the range refuses with
+  `stowage.yaml: stowage.requires accepts Stowage <range>, and this is stowage <version>: run a
+  Stowage it accepts` rather than stopping on a key it does not know. A range that does not parse
+  is a lint error (so `ship` and `promote` refuse it). A build whose version is not a SemVer
+  release (`dev`) is not checked.
 
 ### Spec keys
 
 Keys of `stowage.yaml`, decoded strictly: an unknown key is an error. [examples/full](examples/full/stowage.yaml) uses every one.
 
+**A project without a front** ([examples/stateless](examples/stateless/stowage.yaml)) leaves
+`front` out (or empty: a `front` with anything in it is a front, linted as one). Nothing is served
+over HTTP; its `l4` routes, if any, are the stack's only way in. Lint skips the front's rules and
+refuses what needs one: `endpoint` (no route), an input asked in one mode only (`when`: `"tls":
+the project has no front, so no TLS mode: the input would never be asked`) and a compose file
+reading `${STOWAGE_TLS_MODE}`. Its installs, on Docker and the VM, run no front service and ask
+nothing about one: no TLS mode is chosen or recorded (no `STOWAGE_TLS_MODE`, no route URL, no
+front port; `STOWAGE_LOOPBACK_ADDRESS` is still `127.0.0.1`), no port 80 or 443 is probed, the
+VM's firewall opens the L4 routes' ports (and SSH) alone, an install ends `<name> <version> is
+running` with no URL, and `vm create` shows `served: no front, its L4 routes alone`. The flags
+only a front takes (`--tls`, `--domains`, `--cert`, `--key`, `--ca`, `--http-port`,
+`--https-port`, `--ports`, `--address` of the installer; `--tls`, `--domains`, `--http-port`,
+`--https-port` of `vm create`) are hidden from the help and refused when given:
+`<name> has no front: --tls set how a front serves, and its L4 routes are its only way in`, as is
+a TLS mode or a front port in the VM's settings. An upgrade between a release with a front and one without is
+refused (`… has no front, and this install serves through one: a release without a front needs a
+new install`, and the reverse). On Kubernetes the chart is given no route; `stowage.l4` as
+always. Its releases carry no front image: `ship` builds none, and an install pulls, records
+(`STOWAGE_FRONT_IMAGE`) and preloads none.
+
 **A project without a database** ([examples/stateless](examples/stateless/stowage.yaml)) leaves
-`database` out. `health`, `front` and the rest stay as they are; what only a database needs is
+`database` out. `health` and the rest stay as they are; what only a database needs is
 then refused where it is declared: a `backup` (`a backup dumps the database, and the project
 declares none`) and a non-empty `data.reset` (`reset-db resets a database, and the project
 declares none`); `data.volumes` alone stays the project's own. Its installs skip the database
@@ -1148,7 +1188,7 @@ database: reset-db has nothing to reset` (`… there is no backup to restore`). 
 | `apiVersion` | `stowage/v1` (another value: upgrade Stowage) |
 | `name` | 2–40 lowercase letters, digits or `-`, starting with a letter; it prefixes every repository |
 | `short_name` | optional, the same form as `name` (absent is `name`): the installer is `<short_name>-stow` — the binary that installs and runs the infrastructure's lifecycle. An install keeps it under that name and records it in its `.env` (`STOWAGE_SHORT_NAME`, not a value compose or a hook reads), so `short_name` is fixed for a project's life: `ship` refuses a release whose `short_name` differs from one its channels already hold, and an install refuses one before anything changes (a re-run, `upgrade`, `rollback`, the VM's boot) |
-| `stowage.requires` | the accepted Stowage range; accepted but neither validated nor enforced yet (lint warns when it is missing; `stowage.lock` is what pins) |
+| `stowage.requires` | the Stowage versions the project accepts (see `stowage.requires` under the contracts): every command refuses a `stowage` outside it, lint errors on a range that does not parse and on a `stowage.lock` pin outside it, and warns when it is missing |
 | `version.source` | `changelog` (default; `file`, default `CHANGELOG.md`, the first released heading), `file` (`file`, default `VERSION`, the first non-empty line), `git-tag` (`match`, a `git describe --match` pattern; `strip`, a prefix removed), `command` |
 | `version.scheme` | `calver` (default; `format`, default `YYYY.M.MICRO`, tokens `YYYY YY 0Y MM M 0M WW 0W DD D 0D MAJOR MINOR MICRO` joined by `.`; `month_guard: utc\|local`, which needs a year and a month in the format and only warns), `semver` (no config), `regex` (`pattern`, anchored, with named groups; `order`, a list of `group:int` or `group:str` compared in turn), `command` |
 | `changelog` | `keepachangelog` (default; `file`, default `CHANGELOG.md`; `## [x]` or `## x` headings, `Unreleased` skipped), `dir-per-version` (`dir`, required; `pattern`, default `{v}.md`, holding `{v}` once and no `/`), `command`. The current version must have a section |
@@ -1159,11 +1199,11 @@ database: reset-db has nothing to reset` (`… there is no backup to restore`). 
 | `signing` | `cosign-key` (`key`, `public_keys`), or absent / `none` |
 | `images.<key>` | built (`context`, `dockerfile`, `target`, `args`, `inputs`: the paths whose content enters the image's inputs digest, default the whole context less `.dockerignore`) or `ref` (exclusive with the build keys). An image no service or hook uses is a warning; a `# syntax=` frontend or a `FROM $ARG` cannot be checked (warning) |
 | `stack.compose` | the compose file (its contract: "The contracts a project must honour"): `extends` within the file, `profiles:` only those an input's `profile` names, a `ports:` entry past this host an error with a `kairos` shape and a warning on `docker` |
-| `front` | `tls_modes` (`acme`, `dns-cloudflare`, `byo`, `internal`, `none`), `routes[]` (`name`, `domain_input`, `upstream: <service>:<port>`, `strip_headers`, where a trailing `*` matches a prefix; `forward_auth`: `address_input` (required), `uri_input`, `copy_headers` (header names); `allow_input`), `portal`, `loopback_ports`, `loopback_env`, `publish_ca` (`volume`: a volume the compose file declares; refused when the project offers neither `internal` nor `byo`), `http_port` and `https_port` (the host ports a TLS front publishes unless an install's `--http-port` / `--https-port` move them; absent or 0 is 80 and 443; they must differ). Route names must give distinct `STOWAGE_URL_` variables; each `domain_input` routes one upstream. An input `forward_auth` or `allow_input` names must be an input of the `docker` shape and, with a `kairos` shape, of that one too, and neither `required` (empty is how the front leaves it off) nor asked in one mode only (`when`); an `allow_input` input is not `advanced` (never asked, it would refuse everyone). Lint counts these inputs as read |
+| `front` | optional: absent or empty, the project has no front (see "A project without a front"). `tls_modes` (`acme`, `dns-cloudflare`, `byo`, `internal`, `none`), `routes[]` (`name`, `domain_input`, `upstream: <service>:<port>`, `strip_headers`, where a trailing `*` matches a prefix; `forward_auth`: `address_input` (required), `uri_input`, `copy_headers` (header names); `allow_input`), `portal`, `loopback_ports`, `loopback_env`, `publish_ca` (`volume`: a volume the compose file declares; refused when the project offers neither `internal` nor `byo`), `http_port` and `https_port` (the host ports a TLS front publishes unless an install's `--http-port` / `--https-port` move them; absent or 0 is 80 and 443; they must differ). Route names must give distinct `STOWAGE_URL_` variables; each `domain_input` routes one upstream. An input `forward_auth` or `allow_input` names must be an input of the `docker` shape and, with a `kairos` shape, of that one too, and neither `required` (empty is how the front leaves it off) nor asked in one mode only (`when`); an `allow_input` input is not `advanced` (never asked, it would refuse everyone). Lint counts these inputs as read |
 | `l4` | `routes[]`: host ports published to a service as they are, beside the front and never through it — `name` (1 to 15 lowercase letters, digits or `-`, starting with a letter, no `-` at its end or beside another, as a chart names a Service port after it; neither another L4 route's nor a front route's name), `protocol` (`tcp` or `udp`), `port` (the host port, 1–65535; one route per protocol and port), `upstream: <service>:<port>` (a compose service), `address_input` (optional: an input, not `secret`, holding the host name or address clients dial — a lowercase host name whose last label is not all digits, or an IP address; no port, scheme or zone. It is checked when given, and lint checks its `default`; the install records the route's endpoint `STOWAGE_L4_<ROUTE>` from it, and lint counts it as read), `allow_input` (optional: an input holding the source addresses and CIDRs, separated by commas or spaces, the VM's firewall lets reach the port — empty refuses every source; checked when given. Only the VM enforces it, so without a `kairos` shape it is a warning (the route is open to every source), and its input is asked on that shape alone (`shapes: [kairos]`: a Docker host's firewall is the operator's), is neither `secret` (the firewall's rules show it) nor `advanced` (never asked, it would refuse every source) nor asked in one mode only (`when`); lint counts it as read). With a `kubernetes` shape, a chart whose templates never read `.Values.stowage.l4` is warned. Over TCP a route's port may not be one the front publishes by default: `front.http_port` / `https_port` (80 and 443) in a TLS mode, a route's `loopback_ports` in loopback mode, and 80 and 443 while `acme` is offered (its challenges need them). The same port over UDP is free. See "L4 routes" under the installer |
 | `health` | `http-json` (`service`, `port`, `path`, `liveness_path`, `expect`: the JSON fields a ready answer carries), `http-status` (the same, `expect` a 200–399 status, default 200), `command` (`image`, `cmd`, `timeout_s`). The VM's health gate and `<short>-stow health` run it; the Docker installer waits on the compose healthchecks (`up --wait`) |
 | `database` | optional (see "A project without a database" above); given, `engine` (`postgres` only), `service`, `name`, `roles.migrate`, `roles.app` (all required; one role twice is allowed), `schema_compat` (`sql`, `command`, `none`; `sql`'s `baseline`, an integer ≥ 0 where absent or 0 means 1 (every other provider is at 1), is the schema epoch the release's migrations start from: see the upgrade notes on schema baselines) |
-| `data` | optional: `volumes.<name>.{uid, keep_on_reset}`, `reset` (volumes not `keep_on_reset`; empty is a warning, and `reset-db` refuses it; without a `database`, an error when not empty): the volumes `reset-db` wipes on Docker and the VM (on Kubernetes it deletes every claim of the release). `uid` is validated only (on Docker, a new named volume takes the owner of the image's directory it mounts on, so an image that runs as a user creates that directory owned by it) |
+| `data` | optional: `volumes.<name>.{uid, keep_on_reset}`, `reset` (volumes not `keep_on_reset`; empty is a warning, and `reset-db` refuses it; without a `database`, an error when not empty): the volumes `reset-db` wipes on Docker and the VM (on Kubernetes it deletes every claim of the release). `uid` (0 to 4294967294; absent, the volume is left as Docker makes it — owned by the image's directory it mounts on, root when the image has none): on Docker and the VM, a volume a service mounts that the engine does not hold yet — the stack's first start, or after `reset-db` wiped it — is given to `uid` as that start makes it, before the services start: the containers are made first (`up --no-start`), so the volume already holds what the image put there, then, when its root belongs to another user, it is given to `uid` recursively (`chown -hR uid`: the group kept, a symbolic link changed itself, never what it points to), logging `volume <name> given to its uid`. The volumes a start makes are listed in `.stowage-volumes-pending` (0600) until they have their uid: a start cut off in between, or a release without the helper, leaves them listed, and the next start that mounts them gives it; one a service mounts while no `uid` is owed to it, or that is gone, is struck off. A volume that exists otherwise keeps its owner (its data's: an upgrade never re-owns it), and an `external` one is never touched. The chown runs as root, offline, in the volume helper (`<name>-chown`, busybox pinned by digest), which `ship` builds and publishes for a project with such a volume and the `docker` or `kairos` shape, a Docker install pulls with the stack's images (recorded as `STOWAGE_CHOWN_IMAGE`, by digest or, offline, by tag) and the OS bundle preloads. A release an earlier Stowage published carries none: started again by a rollback, its new volumes keep the owner Docker gives them until a release with the helper starts, and the start logs `<name> <version> carries no volume helper: <volumes> keep the owner Docker gave them until a release with one starts`. On Kubernetes the chart sets its own `securityContext` |
 | `secrets[]` | `key`, `gen`: `hex32`, `hex16` (random bytes, hex), `pass18`, `pass32` (alphanumeric), `b64-32` (base64url); `rotation: true` lets `secrets rotate` replace it (`KEY_NEXT` and `KEY_PREVIOUS` are then reserved names, recorded empty beside it, and the compose file must read both). Generated once at the first install, or at the upgrade that adds it |
 | `safe_defaults` | `KEY: value`, the value the compose file defaults to |
 | `inputs[]` | `key`, `prompt` (required), `default` (may name `${KEY}`), `required`, `optional` (exclusive with `required`; otherwise no effect), `secret` (no default), `when: tls\|loopback` (asked only in that mode), `shapes` (`docker`, `kubernetes`, `kairos`; asked only on those), `profile` (a compose profile name, `[a-zA-Z0-9][a-zA-Z0-9_.-]*`, that a service of the compose file carries: the input turns it on while it holds a value — see "Optional services" under the installer; not `required`, and asked on the `docker` or `kairos` shape; lint counts it as read), `advanced` (a tunable: never asked, recorded only when `--set`, `--answers` or the VM's settings give it — never from an exported variable — its default the compose file's — so no `required` or `default`, and the compose file must write it `${KEY:-default}`; a re-run giving it empty removes it). An input left empty is recorded empty. An input asked on the `docker` or `kairos` shape that no compose service, no route and no provision hook's `env` reads is a warning (one asked on `kubernetes` only is the chart's) |
@@ -1290,8 +1330,20 @@ again, to copy an installer to another host.
     re-run, `reset-db` or an upgrade whose stack comes up removes it, and so does `provision`
     after a `stack: up` failure (it brings nothing up itself); a dry run or a refused re-run
     leaves it as it is;
-  - the files Stowage adds: `stowage-front.yaml` and `stowage-front.Caddyfile` (the front),
-    `stowage-provision.yaml`, `stowage-schema.yaml`;
+  - the files Stowage adds: `stowage-front.yaml` and `stowage-front.Caddyfile` (the front; without
+    one, the first carries the L4 ports and the host API alone and the second is a comment),
+    `stowage-content.yaml`, `stowage-provision.yaml`, `stowage-schema.yaml`.
+    `stowage-content.yaml` labels each service that mounts a compose `configs:` entry with inline
+    `content:` or a `secrets:` entry from an `environment:` variable with an HMAC-SHA256 of what
+    Compose renders into it (`io.stowage.content: hmac-sha256:…`), rewritten from `docker compose
+    config` before each start, and reset (no label) whenever the stack's files are written with
+    another compose file, as its labels name that compose file's services: Compose copies these into a
+    container as it makes it, and makes none again when only they change, so the label makes their change the service's own, and the
+    start recreates it. A file-backed config is a bind mount, which a change reaches as it is. The
+    HMAC's key is the install's own, `.stowage-content.key` (0600, made at the first start), so a
+    label tells nothing of the secrets it covers; a lost key only recreates those services once.
+    An install made by an earlier Stowage has no `stowage-content.yaml` until its next start, and
+    a rollback to a release it kept removes the file (the labels go with their compose file);
   - `provision.env` and the hook's `outputs` file;
   - `.stowage-restore-awaited`, written by an install given `--secrets` with provision values
     (with them, before its stack starts): while it is there no run provisions; `provision`, a
@@ -1341,7 +1393,7 @@ again, to copy an installer to another host.
   `\`, or over 64 KiB, is refused);
   its values win over the shell's environment on every run. Besides the values the compose file
   reads, it records the installer's own: `STOWAGE_REGISTRY` (the prefix images are pulled from),
-  `STOWAGE_FRONT_IMAGE`, `STOWAGE_PORT_<ROUTE>` (loopback mode), `STOWAGE_HTTP_PORT` and
+  `STOWAGE_FRONT_IMAGE` (with a front), `STOWAGE_CHOWN_IMAGE` (a release with the volume helper), `STOWAGE_PORT_<ROUTE>` (loopback mode), `STOWAGE_HTTP_PORT` and
   `STOWAGE_HTTPS_PORT` (TLS mode) and `COMPOSE_PROJECT_NAME`. Edit none of them by hand. The compose project is
   `<name>-<directory name>-<hash of its path>`, so two installs in two directories stay two
   projects. The install keeps the installer that wrote it as `<dir>/<short>-stow` (the running file
@@ -1546,7 +1598,7 @@ again, to copy an installer to another host.
   the install's lifecycle lock; one that stops after the stack went down is finished by running
   it again.
 - The front is the Caddy Stowage adds (`stowage-front`), the release's `front` image. An
-  installer refuses a release that records no front. `STOWAGE_TLS_MODE` records how it serves.
+  installer refuses a release of a project with a front that records no front image. `STOWAGE_TLS_MODE` records how it serves.
   On each route, in this order:
   - `allow_input`: a source address the input's list (IP addresses and CIDRs, separated by commas
     or spaces) does not hold gets 403 — everyone while it is empty. The source is the address the
@@ -2984,6 +3036,7 @@ internal/sigverify/   signature checks of sigstore bundles, in-process (the publ
 internal/front/       the recipe of the Caddy TLS front image, built by ship
 internal/providers/   runtime-side provider configs (auth, signing, health, schema, provision, backup)
 internal/backup/      the recipe of the VM's backup runner (rclone, pinned by digest), built by ship
+internal/chown/       the recipe of the volume helper (busybox, pinned by digest), built by ship
 internal/lock/        stowage.lock
 internal/hook/        the post-commit hook: release detection, lock, detached ship
 internal/gitcmd/      git run without git's per-hook variables
@@ -2996,7 +3049,7 @@ internal/install/     the installer: the Docker shape (install, re-run, status, 
 internal/cloud/       the cloud images' registration: each cloud's settings and its built-in OpenTofu module (tofu/<cloud>), applied once per image
 internal/truenas/     TrueNAS's API: the disk and seed uploads, power, snapshots (the module's steps)
 internal/testutil/    test helpers
-examples/             minimal (the phase-1 smoke target), full (every spec key), stateless (no database, nothing built)
+examples/             minimal (the phase-1 smoke target), full (every spec key), stateless (no database, nothing built, no front)
 test/                 end-to-end scripts (make e2e, make e2e-docker, make e2e-full, make e2e-stateless, make e2e-k8s, make e2e-full-k8s, make e2e-kairos, make e2e-vm, make e2e-full-vm), the commit gate's suite selection (gate.sh), their shared helpers (lib.sh), the VM helpers (vm.sh), their pinned images (pins.sh) and the sweep of earlier runs (sweep.sh)
 docs/                 DESIGN.md; img/ (the logo, icon, social preview, badge, diagram, installer recording); demo/ (how that recording is made)
 ```
@@ -3015,7 +3068,7 @@ make smoke-install  # the installer on the local Docker engine: registry, stack,
 make e2e-docker     # build, then the real binaries against zot and the local Docker engine: ship examples/minimal 1.0.0, install it with the bootstrap one-liner, re-run, ship 2.0.0 and 3.0.0 and reach each with notes-stow upgrade --version (each release's signature checked against the kept installer's key), roll back (allowed, then refused at a rollback barrier); then `mirror export` 3.0.0, `mirror import` into a TLS zot of its own test CA (refused without `--registry-ca`, the signatures carried), a second install from it with `--registry` and `--registry-ca`, and `upgrade --version` reading it with the recorded CA
 make e2e-full       # build, then examples/full as it stands on the Docker shape: ship this month's CalVer release with a token push, signed with the key its environment holds (env://), install it with the bootstrap one-liner (the installer image pulled with the project's own pull account) in loopback mode, every route serving, the api migrating a real Postgres and serving as its app role, the provision hook registering the administrator and its API key through the api and its credentials file 0600; the install prints its endpoint (the api route's URL, also in `status`) and ends with the search extension's tip (`atlas-search`, not published on the channel); a re-run sets the search extension's input (`SEARCH_URL`, the api reaching it, no tip), another clears it (the tip again), the hook handed back the key it minted; the app's users revoke that key: `provision` fails naming `provision --set`, `provision --set ADMIN_API_KEY=` mints and registers another (in no log), the next run keeps it; its record lost, `provision --set ADMIN_API_KEY=<key>` gives the key the hook never returned (declared in `hooks.provision.returns`; an undeclared key refused) and no other is minted; re-runs turn forward auth on the api route on (no identity without the authentication service's answer, a forged header stripped) and off, narrow the ingest route's allowlist to another address and to none (403), set an advanced input and give it back to its default (status shows each); `secrets rotate` takes the internal secret through --stage, the swap and --finish, each value accepted while it must be and the old one refused after; ship .2 (a migration), upgrade --version (data kept, a pg_dump snapshot), roll back (allowed by the api image's reads-newer label); ship .3 (a migration that is a rollback barrier), upgrade, and rollback is refused naming the barrier and the snapshot
 make e2e-k8s        # build, then the real binaries against zot and a kind cluster pulling from it with the pull Secret: k8s install with the bootstrap script (the provision hook's Job run, what it returned in its Secret and not the log), upgrade --values, upgrade alone (what the hook returned handed back), upgrade --version 2.0.0, a refused downgrade, a failed upgrade helm rolls back, rollback, status, reset-db (what the hook returned forgotten), uninstall refused without --data (the chart's own claim, which helm deletes), then uninstall --data removing the release, its Secrets, the hook's account and the claim, the namespace kept
-make e2e-stateless  # build, then examples/stateless on the Docker shape: ship 1.0.0 (a pulled image, no database) to zot, install it with the bootstrap one-liner in loopback mode, the health path and the route serving the input, the endpoint printed (the route's recorded URL); a re-run changes the input; `status` shows the endpoint; ship 1.0.1, `upgrade --version 1.0.1` (nothing dumped) and `rollback` (no schema check), the input kept; `reset-db` refused, the release having no database
+make e2e-stateless  # build, then examples/stateless on the Docker shape: ship 1.0.0 (a pulled image, no database, no front) to zot, install it with the bootstrap one-liner (no TLS mode asked or recorded, no front running), the health path and the L4 route serving the input from an inline compose config, the state volume given the server's uid (the server, uid 1000, writes into it at start); a re-run changes the input, and the server is made again with it; `status` lists the L4 route; `--tls` refused, there being no front; ship 1.0.1, `upgrade --version 1.0.1` (nothing dumped) and `rollback` (no schema check), the input kept; `reset-db` refused, the release having no database
 make e2e-full-k8s   # build, then examples/full's chart on a kind cluster pulling from zot: k8s install with the bootstrap script against a Postgres outside the release (its two URLs and the administrator's password secret inputs from the operator's environment), two api replicas migrating once, the provision hook's Job registering the administrator and its API key (recorded in the outputs Secret, in no log; the Job deleted; no helm hook), every service answering, the api reaching the search extension's URL given at the install (`--set SEARCH_URL=…`), the endpoint printed as the api's Service URL; `k8s upgrade` of the same release, the key handed back to the hook; the app's users revoke the key, ship .2 (a migration), upgrade --version: the release runs .2 and the hook fails naming `k8s provision --set`, which mints and registers another key, and `k8s provision` again keeps it; its record lost, `k8s provision --set ADMIN_API_KEY=<key>` gives the key the hook never returned (an undeclared key refused) and no other is minted (data kept); rollback (the previous api on the newer schema); a second release in another namespace with the embedded Postgres, and reset-db deleting its database's claim, forgetting what the hook returned and registering the administrator again; `k8s secrets rotate` through its three passes, the release restarted at each, each value accepted while it must be; `k8s uninstall --yes` of the embedded release keeps its database's claim and its Secrets, and `k8s install` takes them back, the events kept
 make e2e-kairos     # build, then ship examples/minimal's OS bundle and its qcow2 and ova disks and its three clouds' raw, vhd and gce to zot for real (each image docker-loaded from the bundle, each disk's zstd layer decompressed with `zstd -d` and checked in its format, the vhd and the gce as Azure and Google Cloud import them); the bundle's notes-stow on the local Docker engine as on the VM (install from the preloaded images with a settings file, boot, the host daemon's verbs, its disk-pressure POST to the api (the token never logged) and `status` showing it, its app socket and the api service's token and mount, `backup config`, `verify`, `run` to a WebDAV server through the preloaded runner, the backup decrypted and read by `pg_restore` and the uploads volume's archive beside it, `list`, `status`); with `STOWAGE_CLOUD_ENV=<file>` (a shell file of a cloud's `STOWAGE_<CLOUD>_*` settings and credentials, needs `tofu`), the images registered on the clouds it sets up, the others reported left out, and every image it registered destroyed at exit; re-ship (nothing built, nothing registered again), promote, `vm create` from the published notes-stow (the qcow2 by digest, the seed ISO), verify, prune; ship 2.0.0, whose notes-stow's boot upgrades the install, and 1.0.0's boot goes back
 STOWAGE_VM_ENV=<file> make e2e-vm   # build, ship examples/minimal's OS bundle and qcow2 disk to zot, carry the release with `mirror export` / `mirror import` to a TLS zot mirror of its own test CA on this host's address toward TrueNAS, then the published notes-stow's `vm create --create opentofu --registry --registry-ca` boots a real VM on TrueNAS from the mirror's disk: its first boot installs from the cloud-config (`--ssh-allow` this host's address and its global IPv6 addresses, `--ipv6`, `--timezone Europe/Paris`); over SSH, the firewall's table (input dropped by default, SSH from this host alone, over IPv4 and IPv6, the front's ports, an `l4` route to the database open to this host's IPv4 address alone, its allowlist on the persistent partition: reached from this host, refused over IPv6) and the time zone, status, ps, passwordless sudo, the admin group, the app socket (refused without the install's token, served with it) and the api service's read-only mount; the install records the mirror and the VM trusts its CA; the front answers HTTPS; `reset-db --yes` wipes the data and provisions again (a new admin password) without a reboot; `backup config` over SSH (the rclone config on standard input, a schedule the timer takes), `backup run` of a partitioned table with a key to a WebDAV server on this host, the backup decrypted and read by `pg_restore`, the uploads volume's archive beside it; a row and files added, then `restore` (the key on standard input) brings the backup's data and the volume back as they were; `secrets export` to the operator's key decrypts into the install's secrets; a re-run changing the route's allowlist refuses this host, through the upgrade's reboot; 1.0.1 is shipped and carried through the mirror, `updates` offers it and `upgrade --yes` takes a backup first, then reboots the VM into it, whose health gate marks the boot good; `rollback --yes` reboots it into the passive system, back on 1.0.0, and a second `rollback` is refused there; 1.0.2, whose api never becomes ready, is upgraded to from the passive system, fails its health gate, and the VM falls back to 1.0.0, `status` naming the failed boot and its diagnostics, `updates` no longer offering 1.0.2; 1.0.3, a rollback barrier that never becomes ready, fails its gate too and is kept (the boot marked good, `status` saying why going back is refused); the cloud-config's network is DHCP with DHCPv6 asked at once, the stack's network has IPv6, the LAN gives the VM a global IPv6 address and an IPv6 default route, and this host reaches it over IPv6 by SSH and HTTPS; `network set` keeps the DHCP lease as a static address, a static unique local IPv6 address beside it, and `network confirm` keeps it (the console banner tells it), a change back to DHCP not confirmed comes undone at its 30 s window's end, and another, a reboot inside its window, at the boot; `vm destroy` removes it all

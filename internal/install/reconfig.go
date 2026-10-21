@@ -133,7 +133,10 @@ func (in *Installer) changes(env *EnvFile) (next *EnvFile, secrets map[string]bo
 		return p
 	}
 	var pub publish
-	if mode == Loopback {
+	switch {
+	case !s.HasFront():
+		// No front: no port of its own (frontFlags refused the flags that would set one).
+	case mode == Loopback:
 		if o.HTTPPort != 0 || o.HTTPSPort != 0 {
 			return nil, nil, publish{}, errors.New("--http-port and --https-port are for TLS modes: this install is in loopback mode, which takes --ports")
 		}
@@ -147,7 +150,7 @@ func (in *Installer) changes(env *EnvFile) (next *EnvFile, secrets map[string]bo
 			return nil, nil, publish{}, err
 		}
 		pub = publish{addr: addr, ports: p}
-	} else {
+	default:
 		if len(o.Ports) > 0 {
 			return nil, nil, publish{}, fmt.Errorf("--ports is for loopback mode: this install's front serves %s, on --http-port and --https-port", mode)
 		}
@@ -194,6 +197,9 @@ func (in *Installer) changes(env *EnvFile) (next *EnvFile, secrets map[string]bo
 // newCert.
 func (in *Installer) rerunMode(was string) (string, error) {
 	o := &in.O
+	if !in.R.Spec.HasFront() {
+		return "", in.frontFlags()
+	}
 	mode := o.TLS
 	if mode == "" && (o.Cert != "" || o.Key != "") {
 		mode = "byo"
@@ -363,6 +369,9 @@ func (in *Installer) frontVars(env *EnvFile, mode string, pub publish, domains m
 		env.Set(IPv6Var, strconv.FormatBool(*in.O.IPv6))
 	} else if _, ok := env.Get(IPv6Var); !ok {
 		env.Set(IPv6Var, "false") // always recorded: the compose file may read it
+	}
+	if !in.R.Spec.HasFront() {
+		return
 	}
 	routes := in.R.Spec.Front.Routes
 	if mode == Loopback {

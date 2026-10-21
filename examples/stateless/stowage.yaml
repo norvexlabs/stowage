@@ -1,6 +1,6 @@
-# A stateless app: one pulled image behind the front, nothing built, no database (so no
-# schema_compat, data.reset, backup or reset-db). Another project uses it as an extension: its
-# endpoint is the lookup route.
+# A stateless app without a front: one pulled image, nothing built, no database (so no
+# schema_compat, data.reset, backup or reset-db), and no front: its one L4 route publishes the
+# server's port as it is, the stack's only way in.
 apiVersion: stowage/v1
 name: lookup
 
@@ -26,12 +26,9 @@ images:
 stack:
   compose: deploy/compose.yaml
 
-front:
-  tls_modes: [acme, internal, none]
+l4:
   routes:
-    - { name: lookup, domain_input: LOOKUP_DOMAIN, upstream: server:8080 }
-  portal: lookup
-  loopback_ports: { lookup: 8090 }
+    - { name: lookup, protocol: tcp, port: 8090, upstream: server:8080 }
 
 health:
   provider: http-status
@@ -40,11 +37,12 @@ health:
   path: /health
   expect: 200
 
+data:
+  volumes:
+    state: { uid: 1000 }                                       # the server's user; busybox has no /state
+
 inputs:
   - { key: GREETING, prompt: "What the lookup page says", default: "hello" }
-
-# The URL a project using lookup as an extension is given.
-endpoint: lookup
 
 shapes:
   docker: {}

@@ -84,7 +84,7 @@ grep -q 'disks: make raw, qcow2, ova, vhd, gce' "$WORK/ship1.log" || fail "the d
 for f in "${FORMATS[@]}"; do
 	grep -q "disk $f: tag .* → beta-1.0.0-$f" "$WORK/ship1.log" || fail "disk $f was not tagged"
 done
-[[ $(grep -c '^signed ' "$WORK/ship1.log") == 15 ]] || { grep '^signed ' "$WORK/ship1.log"; fail "want 15 signatures (8, the bundle, 5 disks, the channel's disk set)"; }
+[[ $(grep -c '^signed ' "$WORK/ship1.log") == 16 ]] || { grep '^signed ' "$WORK/ship1.log"; fail "want 16 signatures (9, the bundle, 5 disks, the channel's disk set)"; }
 for c in "${CLOUDS[@]}"; do
 	if [[ -n ${!CLOUD_KEY[$c]:-} ]]; then
 		grep -q "cloud $c: register notes-[0-9a-f]\{12\}$" "$WORK/ship1.log" && grep -q "cloud $c: image ." "$WORK/ship1.log" || { tail -30 "$WORK/ship1.log"; fail "the $c image was not registered"; }
@@ -119,7 +119,7 @@ docker cp "$ctr:/etc/notes/os-version" "$WORK/os-version"
 docker cp "$ctr:/etc/kairos-release" "$WORK/kairos-release"
 grep -q '^KAIROS_FLAVOR="ubuntu"' "$WORK/kairos-release" || fail "not a Kairos image"
 docker cp "$ctr:/usr/share/notes-preload" "$WORK/preload"
-for img in api web postgres front backup; do
+for img in api web postgres front backup chown; do
 	tar="$WORK/preload/$img.tar"
 	[[ -s $tar ]] || fail "no archive for $img"
 	digest=$(art "a['images']['$img']")

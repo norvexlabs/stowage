@@ -461,5 +461,5 @@ var ProvidedVars = map[string]string{
 	"STOWAGE_REVISION":         "the running package revision",
 	"STOWAGE_LOOPBACK_ADDRESS": "a loopback address, 127.x or ::1 (in loopback mode, the one the front's ports bind to)",
 	"STOWAGE_IPV6":             "true with --ipv6: IPv6 on the stack's network",
-	"STOWAGE_TLS_MODE":         "how the front serves: none (loopback), acme, dns-cloudflare, byo or internal",
+	"STOWAGE_TLS_MODE":         "how the front serves: none (loopback), acme, dns-cloudflare, byo or internal (never set without a front)",
 }

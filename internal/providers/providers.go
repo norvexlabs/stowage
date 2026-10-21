@@ -466,6 +466,21 @@ func RunsBackups(s *spec.Spec) bool {
 	return (s.Shapes.Kairos != nil || s.Shapes.Docker != nil) && s.Backup != nil && s.Backup.Name == VMBackup
 }
 
+// OwnsVolumes reports whether s's installs give data volumes their uid: a data volume with a uid,
+// with the Docker or the kairos shape (whose VM runs the Docker shape's install). Its releases
+// carry the volume helper.
+func OwnsVolumes(s *spec.Spec) bool {
+	if s.Shapes.Kairos == nil && s.Shapes.Docker == nil {
+		return false
+	}
+	for _, v := range s.Data.Volumes {
+		if v.UID != nil {
+			return true
+		}
+	}
+	return false
+}
+
 // PgAgeRclone is a decoded pg-age-rclone backup: Profiles maps each profile to the tables whose
 // data it keeps (nil: every table's), and Exclude a profile to the pg_dump patterns of the tables
 // whose data it leaves out (their structure kept); Default is the profile a backup takes unless

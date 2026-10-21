@@ -76,6 +76,8 @@ func TestEachRuleFires(t *testing.T) {
 	}{
 		{"bad name", []edit{{specFile, "\nname: notes\n", "\nname: Notes\n"}}, nil, "name:"},
 		{"k8s schema without sql", []edit{{specFile, "kubernetes: { chart: deploy/chart, postgres_modes: [external, cnpg] }", "kubernetes: { chart: deploy/chart, postgres_modes: [external, cnpg], schema: { url_env: DATABASE_URL, image: postgres } }"}}, nil, "shapes.kubernetes.schema: needs a database whose schema_compat provider is sql"},
+		{"bad requires", []edit{{specFile, `requires: ">=0.1 <1"`, `requires: "~0.1"`}}, nil, "stowage.requires: \"~0.1\": a comparator starts with"},
+		{"lock outside requires", []edit{{specFile, `requires: ">=0.1 <1"`, `requires: ">0.1"`}}, nil, "pins stowage 0.1.0, which stowage.requires (>0.1) does not accept"},
 		{"bad short name", []edit{{specFile, "\nname: notes\n", "\nname: notes\nshort_name: No\n"}}, nil, "short_name:"},
 		{"stowage short name", []edit{{specFile, "\nname: notes\n", "\nname: notes\nshort_name: stowage-notes\n"}}, nil, "keeps for Stowage's own files"},
 		{"compose build", []edit{{composeFile, "image: ${STOWAGE_IMAGE_WEB}", "image: ${STOWAGE_IMAGE_WEB}\n    build: ./web"}}, nil, "build: is forbidden"},
@@ -95,6 +97,7 @@ func TestEachRuleFires(t *testing.T) {
 		{"unknown STOWAGE_ var", []edit{{composeFile, "${LOG_LEVEL:-info}", "${STOWAGE_NOPE:-x}"}}, nil, "not a variable Stowage provides"},
 		{"reserved image key", []edit{{specFile, "  web: { context: web", "  release: { context: web"}, {composeFile, "${STOWAGE_IMAGE_WEB}", "${STOWAGE_IMAGE_RELEASE}"}}, nil, "is reserved"},
 		{"backup image key", []edit{{specFile, "  web: { context: web", "  backup: { context: web"}, {composeFile, "${STOWAGE_IMAGE_WEB}", "${STOWAGE_IMAGE_BACKUP}"}}, nil, `"backup" is reserved`},
+		{"chown image key", []edit{{specFile, "  web: { context: web", "  chown: { context: web"}, {composeFile, "${STOWAGE_IMAGE_WEB}", "${STOWAGE_IMAGE_CHOWN}"}}, nil, `"chown" is reserved`},
 		{"front image key", []edit{{specFile, "  web: { context: web", "  front: { context: web"}, {composeFile, "${STOWAGE_IMAGE_WEB}", "${STOWAGE_IMAGE_FRONT}"}}, nil, `"front" is reserved`},
 		{"unpinned ref", []edit{{specFile, "postgres:17-alpine@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24", "postgres:17-alpine"}}, nil, "pinned by digest"},
 		{"missing dockerfile", []edit{{specFile, "dockerfile: web/Dockerfile", "dockerfile: web/Nope"}}, nil, "web/Nope"},
@@ -245,7 +248,8 @@ func TestEachRuleFiresOnFull(t *testing.T) {
 		{"database service", []edit{{sp, "  service: postgres\n  name: atlas", "  name: atlas"}}, nil, "database.service: is required"},
 		{"barrier without $1", []edit{{sp, "WHERE version > $1 AND", "WHERE version > 0 AND"}}, nil, "$1"},
 		{"sql without current", []edit{{sp, "    current: \"SELECT max(version) FROM schema_migrations WHERE success\"\n", ""}}, nil, "current is required"},
-		{"negative uid", []edit{{sp, "spool:    { uid: 65532 }", "spool:    { uid: -1 }"}}, nil, "uid must be >= 0"},
+		{"negative uid", []edit{{sp, "spool:    { uid: 65532 }", "spool:    { uid: -1 }"}}, nil, "uid must be 0 to 4294967294"},
+		{"uid past the range", []edit{{sp, "spool:    { uid: 65532 }", "spool:    { uid: 4294967295 }"}}, nil, "uid must be 0 to 4294967294"},
 		{"reset keeps", []edit{{sp, "reset: [postgres, spool]", "reset: [postgres, certs]"}}, nil, "keep_on_reset"},
 		{"secret key name", []edit{{sp, "key: APP_DB_PASSWORD", "key: app-db"}}, nil, "not an environment variable name"},
 		{"input without prompt", []edit{{sp, `prompt: "Organisation name",        required: true`, `required: true`}}, nil, "prompt: is required"},
@@ -369,32 +373,45 @@ func TestEachRuleFiresOnFull(t *testing.T) {
 	}
 }
 
-// Rules of a project without a database: what only a database needs is refused where it is
-// declared. examples/stateless being clean is the positive control.
+// Rules of a project without a database or a front: what only a database or a front needs is
+// refused where it is declared. examples/stateless being clean is the positive control.
 func TestEachRuleFiresOnStateless(t *testing.T) {
-	for _, c := range []struct{ name, add, want string }{
-		{"backup", "backup:\n  provider: pg-age-rclone\n  profiles: { full: all }\n", "backup: a backup dumps the database, and the project declares none"},
-		{"data reset", "data:\n  volumes:\n    cache: { uid: 0 }\n  reset: [cache]\n", "data.reset: reset-db resets a database, and the project declares none"},
+	for _, c := range []struct{ name, old, new, want string }{
+		{"backup", "\nshapes:\n", "\nbackup:\n  provider: pg-age-rclone\n  profiles: { full: all }\n\nshapes:\n", "backup: a backup dumps the database, and the project declares none"},
+		{"data reset", "    state: { uid: 1000 }", "    state: { uid: 1000 }\n  reset: [state]", "data.reset: reset-db resets a database, and the project declares none"},
+		{"postgres modes", "kubernetes: { chart: deploy/chart }", "kubernetes: { chart: deploy/chart, postgres_modes: [external] }", "shapes.kubernetes.postgres_modes: the database's modes, and the project declares no database"},
+		// Without a front there is no TLS mode to ask an input in.
+		{"when without a front", `default: "hello" }`, `default: "hello", when: tls }`, `inputs[0].when: "tls": the project has no front, so no TLS mode: the input would never be asked`},
+		// A front section with anything in it is a front, linted as one.
+		{"partial front", "\nhealth:\n", "\nfront: { http_port: 8080 }\n\nhealth:\n", "front.tls_modes: at least one TLS mode is required"},
+		{"endpoint without a front", "\nshapes:\n", "\nendpoint: lookup\n\nshapes:\n", `endpoint: "lookup" is not a route of front.routes`},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			root := testutil.CopyExample(t, "stateless")
-			testutil.Edit(t, root, specFile, "\nshapes:\n", "\n"+c.add+"\nshapes:\n")
+			testutil.Edit(t, root, specFile, c.old, c.new)
 			errs := strings.Join(errorsOf(run(t, root)), "\n")
 			if !strings.Contains(errs, c.want) {
 				t.Fatalf("no %q in:\n%s", c.want, errs)
 			}
 		})
 	}
+	// Without a front no TLS mode is recorded for the stack to read.
 	root := testutil.CopyExample(t, "stateless")
-	testutil.Edit(t, root, specFile, "kubernetes: { chart: deploy/chart }", "kubernetes: { chart: deploy/chart, postgres_modes: [external] }")
-	if errs := strings.Join(errorsOf(run(t, root)), "\n"); !strings.Contains(errs, "shapes.kubernetes.postgres_modes: the database's modes, and the project declares no database") {
-		t.Errorf("postgres_modes: %s", errs)
+	testutil.Edit(t, root, "deploy/compose.yaml", "      - state:/state\n", "      - state:/state\n    environment: { MODE: \"${STOWAGE_TLS_MODE}\" }\n")
+	if errs := strings.Join(errorsOf(run(t, root)), "\n"); !strings.Contains(errs, "STOWAGE_TLS_MODE: the project has no front, so no TLS mode is recorded") {
+		t.Errorf("STOWAGE_TLS_MODE without a front: %s", errs)
 	}
-	// Volumes alone are a stateless project's own: no finding.
-	root = testutil.CopyExample(t, "stateless")
-	testutil.Edit(t, root, specFile, "\nshapes:\n", "\ndata:\n  volumes:\n    cache: { uid: 0 }\n\nshapes:\n")
-	if res := run(t, root); len(res.Findings) != 0 {
-		t.Errorf("findings: %v", res.Findings)
+}
+
+// A uid's range is checked on both sides: 0 and the largest user Linux gives are accepted.
+func TestVolumeUIDBounds(t *testing.T) {
+	t.Parallel()
+	for _, uid := range []string{"0", "4294967294"} {
+		root := testutil.CopyExample(t, "stateless")
+		testutil.Edit(t, root, specFile, "state: { uid: 1000 }", "state: { uid: "+uid+" }")
+		if errs := errorsOf(run(t, root)); len(errs) > 0 {
+			t.Errorf("uid %s: %v", uid, errs)
+		}
 	}
 }
 
@@ -484,7 +501,7 @@ func TestMissingLock(t *testing.T) {
 		t.Error("a lock that does not load is not reported")
 	}
 	// A valid lock silences it.
-	testutil.Write(t, root, "stowage.lock", "stowage: 1.0.0\n")
+	testutil.Write(t, root, "stowage.lock", "stowage: 0.2.0\n")
 	for _, f := range run(t, root).Findings {
 		if strings.Contains(f.Where, "stowage.lock") {
 			t.Errorf("valid lock still reported: %s", f)

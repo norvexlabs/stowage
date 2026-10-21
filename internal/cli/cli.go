@@ -67,7 +67,37 @@ func (o *options) specFile() string {
 }
 
 func (o *options) open() (*project.Project, error) {
+	if err := o.requires(); err != nil {
+		return nil, err
+	}
 	return project.Open(o.root, o.specFile())
+}
+
+// requires refuses a project whose stowage.requires does not accept this stowage, before its
+// spec is decoded. A build that is not a release (its version is not SemVer) is not checked, nor
+// is a range that does not parse: lint reports it, and so ship and promote refuse it.
+func (o *options) requires() error {
+	raw, err := os.ReadFile(o.specFile())
+	if err != nil {
+		return nil // reading the spec reports it
+	}
+	req := spec.Requires(raw)
+	if req == "" || (version.SemVer{}).Validate(o.buildVersion) != nil {
+		return nil
+	}
+	file := filepath.Base(o.specFile())
+	r, err := version.ParseSemVerRange(req)
+	if err != nil {
+		return nil
+	}
+	ok, err := r.Contains(o.buildVersion)
+	if err != nil {
+		return fmt.Errorf("%s: stowage.requires: stowage %s: %w", file, o.buildVersion, err)
+	}
+	if !ok {
+		return fmt.Errorf("%s: stowage.requires accepts Stowage %s, and this is stowage %s: run a Stowage it accepts", file, r, o.buildVersion)
+	}
+	return nil
 }
 
 // releaseVersion opens the project and returns its version, refusing one whose tags would
@@ -126,6 +156,9 @@ func lintCmd(o *options) *cobra.Command {
 		Short: "Validate stowage.yaml and the files it names",
 		Args:  cobra.NoArgs,
 		RunE: func(*cobra.Command, []string) error {
+			if err := o.requires(); err != nil {
+				return err
+			}
 			res, err := lint.Run(o.root, o.specFile(), o.now())
 			if err != nil {
 				return err
@@ -268,6 +301,9 @@ func lockCmd(o *options) *cobra.Command {
 			specPath := o.specFile()
 			if _, err := os.Stat(specPath); err != nil {
 				return fmt.Errorf("%s is written next to the spec: %w", lock.FileName, err)
+			}
+			if err := o.requires(); err != nil {
+				return err
 			}
 			path := filepath.Join(filepath.Dir(specPath), lock.FileName)
 			l, err := lock.Load(path)

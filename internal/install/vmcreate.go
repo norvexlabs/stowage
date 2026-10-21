@@ -117,7 +117,7 @@ func (in *Installer) CreateVM(ctx context.Context, c *VMCreate) error {
 	if in.R.Spec.Shapes.Kairos == nil || m.Artifacts.OS == "" {
 		return fmt.Errorf("%s %s publishes no OS bundle (shapes.kairos)", name, m.ProjectVersion)
 	}
-	if len(remoteModes(in.R.Spec.Front.TLSModes)) == 0 {
+	if in.R.Spec.HasFront() && len(remoteModes(in.R.Spec.Front.TLSModes)) == 0 {
 		return fmt.Errorf("%s offers no TLS mode a VM can be created with: %s (loopback is not reached from outside the VM, and byo's key never goes in its cloud-config)", name, strings.Join(in.R.Spec.Front.TLSModes, ", "))
 	}
 	if c.Secrets != nil {
@@ -825,6 +825,11 @@ func (in *Installer) vmSettings(ctx context.Context) (*Settings, []string, error
 	o := &in.O
 	o.Preloaded = true // the VM's install: the inputs of the Kairos shape
 	in.goOn, in.remote = "Go on with these answers", true
+	if !in.R.Spec.HasFront() {
+		if err := in.frontFlags(); err != nil {
+			return nil, nil, err
+		}
+	}
 	switch o.TLS {
 	case "byo":
 		return nil, nil, fmt.Errorf("--tls byo copies a certificate's private key, which the cloud-config never carries: create the VM with another mode, or install it over SSH (`sudo %s install --tls byo`)", in.R.Ctl())
@@ -925,7 +930,7 @@ func (in *Installer) confirmVM(ctx context.Context, p Platform, format string, m
 		ssh = fmt.Sprint(m.SSHAllow)
 	}
 	fmt.Fprintf(&b, "  SSH from %s; time zone %s\n", ssh, cmp.Or(m.Timezone, "UTC"))
-	fmt.Fprintf(&b, "  served: %s; updates from the %s channel\n", st.TLS, st.Channel)
+	fmt.Fprintf(&b, "  served: %s; updates from the %s channel\n", cmp.Or(st.TLS, "no front, its L4 routes alone"), st.Channel)
 	if st.Registry != "" || st.RegistryCA != "" {
 		fmt.Fprintf(&b, "  registry: %s", cmp.Or(st.Registry, in.R.Spec.Registry.Prefix))
 		if st.RegistryCA != "" {

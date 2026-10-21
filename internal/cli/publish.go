@@ -27,6 +27,9 @@ import (
 
 // lintGate refuses to publish a project with lint errors; warnings are printed and pass.
 func (o *options) lintGate() error {
+	if err := o.requires(); err != nil {
+		return err
+	}
 	res, err := lint.Run(o.root, o.specFile(), o.now())
 	if err != nil {
 		return err

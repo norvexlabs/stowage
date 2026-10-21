@@ -112,8 +112,8 @@ a self-review against the code it describes is enough. Every other commit clears
    change to either, to `internal/installerbin`, `internal/version` or `examples/minimal` runs
    `make e2e-docker` too (the lifecycle with the real binaries), and all but `examples/minimal`
    run `make e2e-full` (`examples/full`'s lifecycle on Docker), as does a change to
-   `examples/full`, and `make e2e-stateless` (`examples/stateless`, a project without a database,
-   on Docker), as does a change to `examples/stateless`. A change that runs `make e2e`
+   `examples/full`, and `make e2e-stateless` (`examples/stateless`, a project without a database
+   or a front, on Docker), as does a change to `examples/stateless`. A change that runs `make e2e`
    or `make e2e-docker`, or to `internal/helm`, runs `make e2e-k8s` too (the Kubernetes
    lifecycle on a kind cluster), and all but `examples/minimal` run `make e2e-full-k8s`
    (`examples/full`'s chart on kind), as does a change to `examples/full` (its compose file
@@ -234,4 +234,4 @@ asks for one:
 - `examples/minimal`, `examples/full` and `examples/stateless` stay lint-clean
   (`TestExamplesAreClean`): minimal is the phase-1 lifecycle smoke target, full uses every spec
   key and is the parity proof's working stack (`make e2e-full`, `make e2e-full-k8s`), stateless
-  is a project without a database or a built image (`make e2e-stateless`).
+  is a project without a database, a built image or a front (`make e2e-stateless`).

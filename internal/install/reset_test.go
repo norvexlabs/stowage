@@ -55,8 +55,8 @@ func (e *env) verbs() []string {
 	var out []string
 	for _, c := range e.docker.calls {
 		a := strings.Join(c.Args, " ")
-		if i := strings.LastIndex(a, FrontCompose+" "); i >= 0 {
-			a = "compose " + a[i+len(FrontCompose)+1:]
+		if i := strings.LastIndex(a, ContentCompose+" "); i >= 0 {
+			a = "compose " + a[i+len(ContentCompose)+1:]
 		}
 		out = append(out, a)
 	}

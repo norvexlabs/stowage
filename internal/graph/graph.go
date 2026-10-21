@@ -22,6 +22,7 @@ import (
 	"strings"
 
 	"github.com/norvexlabs/stowage/internal/backup"
+	"github.com/norvexlabs/stowage/internal/chown"
 	"github.com/norvexlabs/stowage/internal/digest"
 	"github.com/norvexlabs/stowage/internal/dockerfile"
 	"github.com/norvexlabs/stowage/internal/front"
@@ -63,6 +64,11 @@ const FrontID = KindImage + "/" + front.Key
 // (backup.Dockerfile) for a release whose VM runs backups (providers.RunsBackups), published as the image
 // backup.Key.
 const BackupID = KindImage + "/" + backup.Key
+
+// ChownID is the node of the helper that gives data volumes their uid, which Stowage builds from
+// its own recipe (chown.Dockerfile) for a release whose installs give one (providers.OwnsVolumes),
+// published as the image chown.Key.
+const ChownID = KindImage + "/" + chown.Key
 
 // Node is one artifact of a release.
 type Node struct {
@@ -162,9 +168,15 @@ func Build(p *project.Project, r Release) (*Graph, error) {
 		imageIDs = append(imageIDs, n.ID)
 		imageDigests.Field(n.ID, n.Inputs)
 	}
-	stowageImages := []Node{frontNode()}
+	var stowageImages []Node
+	if s.HasFront() {
+		stowageImages = append(stowageImages, frontNode())
+	}
 	if providers.RunsBackups(s) {
 		stowageImages = append(stowageImages, backupNode())
+	}
+	if providers.OwnsVolumes(s) {
+		stowageImages = append(stowageImages, chownNode())
 	}
 	for _, n := range stowageImages {
 		g.Nodes = append(g.Nodes, n)
@@ -311,6 +323,17 @@ func backupNode() Node {
 	b.Field("platform", platform)
 	b.Field("recipe", string(recipe))
 	return Node{ID: BackupID, Kind: KindImage, Inputs: b.Sum(), Recipe: recipe}
+}
+
+// chownNode is the helper that gives data volumes their uid: like the front, its inputs are the
+// recipe and the platform.
+func chownNode() Node {
+	recipe := chown.Dockerfile
+	b := digest.New(KindImage)
+	b.Field("name", chown.Key)
+	b.Field("platform", platform)
+	b.Field("recipe", string(recipe))
+	return Node{ID: ChownID, Kind: KindImage, Inputs: b.Sum(), Recipe: recipe}
 }
 
 func imageNode(p *project.Project, name, projectVersion string) (Node, error) {

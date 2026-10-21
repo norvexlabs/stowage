@@ -158,45 +158,45 @@ func TestLock(t *testing.T) {
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
 		t.Fatalf("a dev build wrote the lock: %v", err)
 	}
-	if _, err := lockAs(t, "1.2.0", "-C", t.TempDir()); err == nil || !strings.Contains(err.Error(), "next to the spec") {
+	if _, err := lockAs(t, "0.12.0", "-C", t.TempDir()); err == nil || !strings.Contains(err.Error(), "next to the spec") {
 		t.Fatalf("no spec: %v", err)
 	}
 
-	if out, err := lockAs(t, "1.2.0", "-C", root); err != nil || !strings.Contains(out, "stowage.lock pins stowage 1.2.0") {
+	if out, err := lockAs(t, "0.12.0", "-C", root); err != nil || !strings.Contains(out, "stowage.lock pins stowage 0.12.0") {
 		t.Fatalf("first lock: %v\n%s", err, out)
 	}
 	l, err := lock.Load(path)
-	if err != nil || l.Stowage != "1.2.0" || strings.Contains(read(), "runtime") {
+	if err != nil || l.Stowage != "0.12.0" || strings.Contains(read(), "runtime") {
 		t.Fatalf("written lock: %+v, %v\n%s", l, err, read())
 	}
-	if out, err := lockAs(t, "1.2.0", "-C", root); err != nil || !strings.Contains(out, "already pins stowage 1.2.0") {
+	if out, err := lockAs(t, "0.12.0", "-C", root); err != nil || !strings.Contains(out, "already pins stowage 0.12.0") {
 		t.Fatalf("again: %v\n%s", err, out)
 	}
 
 	// Another stowage without --update changes nothing.
 	before := read()
-	if _, err := lockAs(t, "1.3.0", "-C", root); err == nil || !strings.Contains(err.Error(), "pins stowage 1.2.0, this is 1.3.0") || !strings.Contains(err.Error(), "--update") {
+	if _, err := lockAs(t, "0.13.0", "-C", root); err == nil || !strings.Contains(err.Error(), "pins stowage 0.12.0, this is 0.13.0") || !strings.Contains(err.Error(), "--update") {
 		t.Fatalf("another stowage: %v", err)
 	}
 	if read() != before {
 		t.Fatal("a refused lock rewrote the file")
 	}
-	if out, err := lockAs(t, "1.3.0", "-C", root, "--update"); err != nil || !strings.Contains(out, "stowage 1.2.0 -> 1.3.0") {
+	if out, err := lockAs(t, "0.13.0", "-C", root, "--update"); err != nil || !strings.Contains(out, "stowage 0.12.0 -> 0.13.0") {
 		t.Fatalf("--update: %v\n%s", err, out)
 	}
-	if l, err := lock.Load(path); err != nil || l.Stowage != "1.3.0" {
+	if l, err := lock.Load(path); err != nil || l.Stowage != "0.13.0" {
 		t.Fatalf("updated lock: %+v, %v", l, err)
 	}
 
-	if out, err := lockAs(t, "1.1.0", "-C", root, "--update"); err != nil || !strings.Contains(out, "stowage 1.3.0 -> 1.1.0, an older stowage") {
+	if out, err := lockAs(t, "0.11.0", "-C", root, "--update"); err != nil || !strings.Contains(out, "stowage 0.13.0 -> 0.11.0, an older stowage") {
 		t.Fatalf("--update to an older stowage: %v\n%s", err, out)
 	}
 
-	testutil.Write(t, root, lock.FileName, "stowage: 1.2.0\nextra: 1\n")
-	if _, err := lockAs(t, "1.3.0", "-C", root, "--update"); err == nil || !strings.Contains(err.Error(), "extra") || !strings.Contains(err.Error(), "remove it and run stowage lock") {
+	testutil.Write(t, root, lock.FileName, "stowage: 0.12.0\nextra: 1\n")
+	if _, err := lockAs(t, "0.13.0", "-C", root, "--update"); err == nil || !strings.Contains(err.Error(), "extra") || !strings.Contains(err.Error(), "remove it and run stowage lock") {
 		t.Fatalf("a broken lock: %v", err)
 	}
-	if read() != "stowage: 1.2.0\nextra: 1\n" {
+	if read() != "stowage: 0.12.0\nextra: 1\n" {
 		t.Fatal("a broken lock was overwritten")
 	}
 	// A lock that cannot be read is not one to remove: its pins may be valid.
@@ -206,7 +206,50 @@ func TestLock(t *testing.T) {
 	if err := os.Mkdir(path, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := lockAs(t, "1.3.0", "-C", root); err == nil || strings.Contains(err.Error(), "remove it") {
+	if _, err := lockAs(t, "0.13.0", "-C", root); err == nil || strings.Contains(err.Error(), "remove it") {
 		t.Fatalf("an unreadable lock: %v", err)
+	}
+}
+
+func TestRequiresRefusesAStowageOutsideIt(t *testing.T) {
+	t.Parallel()
+	root := testutil.CopyExample(t, "minimal")
+	as := func(buildVersion string, args ...string) error {
+		var out bytes.Buffer
+		cmd := New(buildVersion, &out, &out)
+		cmd.SetArgs(append([]string{"-C", root}, args...))
+		return cmd.Execute()
+	}
+	// A key this stowage does not know: the range is what it reports, not the key.
+	testutil.Edit(t, root, "stowage.yaml", "\nname: notes\n", "\nname: notes\nfrom_the_future: 1\n")
+	for _, args := range [][]string{{"lint"}, {"plan"}, {"lock", "--update"}} {
+		if err := as("1.0.0", args...); err == nil || !strings.Contains(err.Error(), "stowage.requires accepts Stowage >=0.1 <1, and this is stowage 1.0.0") {
+			t.Errorf("%v by 1.0.0: %v", args, err)
+		}
+		if err := as("0.0.9", args...); err == nil || !strings.Contains(err.Error(), "this is stowage 0.0.9") {
+			t.Errorf("%v by 0.0.9: %v", args, err)
+		}
+	}
+	// Inside the range, the strict decode reports the key; a dev build is not checked.
+	for _, v := range []string{"0.99.0", "dev"} {
+		if err := as(v, "plan"); err == nil || !strings.Contains(err.Error(), "from_the_future") {
+			t.Errorf("plan by %s: %v", v, err)
+		}
+	}
+	// The error names the spec file given.
+	testutil.Edit(t, root, "stowage.yaml", "from_the_future: 1\n", "")
+	if err := os.Rename(filepath.Join(root, "stowage.yaml"), filepath.Join(root, "other.yaml")); err != nil {
+		t.Fatal(err)
+	}
+	if err := as("1.0.0", "-f", filepath.Join(root, "other.yaml"), "lint"); err == nil || !strings.HasPrefix(err.Error(), "other.yaml: stowage.requires accepts") {
+		t.Errorf("a range in another spec file: %v", err)
+	}
+	// A range that does not parse is lint's finding, which ship refuses.
+	testutil.Edit(t, root, "other.yaml", `requires: ">=0.1 <1"`, `requires: "0.1"`)
+	var out bytes.Buffer
+	cmd := New("0.1.0", &out, &out)
+	cmd.SetArgs([]string{"-C", root, "-f", filepath.Join(root, "other.yaml"), "lint"})
+	if err := cmd.Execute(); err == nil || !strings.Contains(out.String(), "stowage.requires: \"0.1\": a comparator starts with") {
+		t.Errorf("a malformed range: %v\n%s", err, out.String())
 	}
 }

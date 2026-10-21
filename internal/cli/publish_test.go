@@ -84,7 +84,7 @@ func TestPublishCommands(t *testing.T) {
 	if err != nil {
 		t.Fatalf("%v\n%s", err, logs)
 	}
-	if !strings.Contains(out, "notes 1.0.0 revision 1 · channel beta · tag beta-1.0.0 · seq 1") || b.n != 5 {
+	if !strings.Contains(out, "notes 1.0.0 revision 1 · channel beta · tag beta-1.0.0 · seq 1") || b.n != 6 {
 		t.Fatalf("ship output (%d builds):\n%s", b.n, out)
 	}
 	// Read-only commands use the pull account (here anonymous): no publisher token needed.
@@ -102,8 +102,8 @@ func TestPublishCommands(t *testing.T) {
 	if _, _, err := run(t, b, env, "-C", root, "promote", "1.0.0", "--from", "beta", "--to", "stable"); err != nil {
 		t.Fatalf("promote: %v", err)
 	}
-	if b.n != 5 {
-		t.Fatalf("promote built %d images", b.n-5)
+	if b.n != 6 {
+		t.Fatalf("promote built %d images", b.n-6)
 	}
 	if _, _, err := run(t, b, env, "-C", root, "promote", "0.9.0", "--from", "beta", "--to", "stable"); err == nil || !strings.Contains(err.Error(), "the tree is at 1.0.0") {
 		t.Fatalf("promote of another version: %v", err)
@@ -229,14 +229,14 @@ func TestShipBakesThePullAccountFromTheEnvironment(t *testing.T) {
 	if _, logs, err := run(t, b, nil, "-C", root, "plan"); err != nil || strings.Contains(logs, "stowage.lock") {
 		t.Fatalf("plan with the pinned stowage: %v\n%s", err, logs)
 	}
-	testutil.Edit(t, root, "stowage.lock", "stowage: 0.1.0", "stowage: 0.0.9")
-	if _, logs, err := run(t, b, nil, "-C", root, "plan"); err != nil || !strings.Contains(logs, "warning: stowage.lock pins stowage 0.0.9, this is 0.1.0") {
+	testutil.Edit(t, root, "stowage.lock", "stowage: 0.1.0", "stowage: 0.2.0")
+	if _, logs, err := run(t, b, nil, "-C", root, "plan"); err != nil || !strings.Contains(logs, "warning: stowage.lock pins stowage 0.2.0, this is an older 0.1.0") {
 		t.Fatalf("plan with another pin: %v\n%s", err, logs)
 	}
-	if _, _, err := run(t, b, map[string]string{"NOTES_PUSH_TOKEN": "t0ken", "NOTES_PULL_TOKEN": "a"}, "-C", root, "ship", "--channel", "beta"); err == nil || !strings.Contains(err.Error(), "pins stowage 0.0.9") {
+	if _, _, err := run(t, b, map[string]string{"NOTES_PUSH_TOKEN": "t0ken", "NOTES_PULL_TOKEN": "a"}, "-C", root, "ship", "--channel", "beta"); err == nil || !strings.Contains(err.Error(), "pins stowage 0.2.0") {
 		t.Fatalf("ship with another pin: %v", err)
 	}
-	testutil.Edit(t, root, "stowage.lock", "stowage: 0.0.9", "stowage: 0.1.0")
+	testutil.Edit(t, root, "stowage.lock", "stowage: 0.2.0", "stowage: 0.1.0")
 	if _, logs, err := run(t, b, map[string]string{"NOTES_PUSH_TOKEN": "t0ken", "NOTES_PULL_TOKEN": "a"}, "-C", root, "ship", "--channel", "beta"); err != nil {
 		t.Fatalf("%v\n%s", err, logs)
 	}

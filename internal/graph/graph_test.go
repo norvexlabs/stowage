@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/norvexlabs/stowage/internal/backup"
+	"github.com/norvexlabs/stowage/internal/chown"
 	"github.com/norvexlabs/stowage/internal/front"
 	"github.com/norvexlabs/stowage/internal/project"
 	"github.com/norvexlabs/stowage/internal/testutil"
@@ -50,7 +51,7 @@ func changed(a, b map[string]string) map[string]bool {
 
 func TestGraphShape(t *testing.T) {
 	g := build(t, testutil.CopyExample(t, "minimal"))
-	want := []string{"image/api", "image/postgres", "image/web", FrontID, BackupID, "chart", "os-bundle", "disks", "installer", "release"}
+	want := []string{"image/api", "image/postgres", "image/web", FrontID, BackupID, ChownID, "chart", "os-bundle", "disks", "installer", "release"}
 	if len(g.Nodes) != len(want) {
 		t.Fatalf("nodes = %v", g.Nodes)
 	}
@@ -286,7 +287,7 @@ func TestPlatformIsABuiltImageInput(t *testing.T) {
 	platform = "linux/arm64"
 	t.Cleanup(func() { platform = Platform })
 	b := inputs(build(t, root))
-	for _, id := range []string{"image/api", "image/web", FrontID, BackupID} {
+	for _, id := range []string{"image/api", "image/web", FrontID, BackupID, ChownID} {
 		if a[id] == b[id] {
 			t.Errorf("%s: same inputs on another platform", id)
 		}
@@ -359,6 +360,64 @@ func TestBackupRunnerOnlyWithAPgAgeRcloneBackup(t *testing.T) {
 	testutil.Edit(t, root, "stowage.yaml", "  kairos:\n    base: ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55\n    kairos_init: quay.io/kairos/kairos-init:v0.16.2@sha256:0777266d25e31b653deaaaa084d4e27d98f7a55e82e42f0648e2ba9c756b8664\n    disk_formats: [qcow2]\n    host_api: [api]\n", "")
 	if _, ok := build(t, root).Node(BackupID); !ok {
 		t.Error("a Docker release with a pg-age-rclone backup carries no runner")
+	}
+}
+
+// The volume helper's recipe is the helper's input, and through it every artifact's that lists
+// the images; no project image reads it.
+func TestChownRecipeReachesTheHelperOnly(t *testing.T) {
+	root := testutil.CopyExample(t, "minimal")
+	a := inputs(build(t, root))
+	saved := chown.Dockerfile
+	chown.Dockerfile = append([]byte("# another recipe\n"), saved...)
+	t.Cleanup(func() { chown.Dockerfile = saved })
+	g := build(t, root)
+	if n, _ := g.Node(ChownID); string(n.Recipe) != string(chown.Dockerfile) {
+		t.Error("the helper's node does not carry the recipe it hashes")
+	}
+	c := changed(a, inputs(g))
+	want := map[string]bool{ChownID: true, "chart": true, "os-bundle": true, "disks": true, "installer": true, "release": true}
+	if !maps.Equal(c, want) {
+		t.Errorf("changed = %v, want %v", c, want)
+	}
+}
+
+// Only a release whose Docker or VM installs give a data volume its uid carries the helper.
+func TestVolumeHelperOnlyWithAVolumeOfAUID(t *testing.T) {
+	t.Parallel()
+	for _, c := range []struct {
+		name, old, new string
+	}{
+		{"no uid", "    postgres: { uid: 70 }\n    uploads:  { uid: 1000 }\n", "    postgres: {}\n    uploads:  {}\n"},
+		{"neither docker nor kairos", "  docker: {}\n  kubernetes: { chart: deploy/chart, postgres_modes: [external, cnpg] }\n  kairos:\n    base: ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55\n    kairos_init: quay.io/kairos/kairos-init:v0.16.2@sha256:0777266d25e31b653deaaaa084d4e27d98f7a55e82e42f0648e2ba9c756b8664\n    disk_formats: [qcow2]\n    host_api: [api]\n", "  kubernetes: { chart: deploy/chart, postgres_modes: [external, cnpg] }\n"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			root := testutil.CopyExample(t, "minimal")
+			testutil.Edit(t, root, "stowage.yaml", c.old, c.new)
+			if _, ok := build(t, root).Node(ChownID); ok {
+				t.Error("the release carries the volume helper")
+			}
+		})
+	}
+	// Positive control: one volume of a uid is enough.
+	root := testutil.CopyExample(t, "minimal")
+	testutil.Edit(t, root, "stowage.yaml", "    postgres: { uid: 70 }\n", "    postgres: {}\n")
+	if _, ok := build(t, root).Node(ChownID); !ok {
+		t.Error("a release with a volume of a uid carries no volume helper")
+	}
+}
+
+// A project without a front builds no front image (examples/minimal's, with one, is in
+// TestGraphShape).
+func TestNoFrontImageWithoutAFront(t *testing.T) {
+	t.Parallel()
+	g := build(t, testutil.CopyExample(t, "stateless"))
+	if _, ok := g.Node(FrontID); ok {
+		t.Error("a project without a front builds the front")
+	}
+	if _, ok := g.Node(ChownID); !ok {
+		t.Error("examples/stateless's volume of a uid has no volume helper")
 	}
 }
 

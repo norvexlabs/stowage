@@ -1,14 +1,17 @@
 #!/usr/bin/env bash
 # End-to-end test of examples/stateless (lookup) on the Docker shape: a project without a
-# database, nothing built (one pulled image), the real stowage and <short>-stow binaries, a real
-# registry (zot) and the local Docker engine. Needs Docker and network access.
+# database or a front, no image of its own built (one pulled image), served by its L4 route alone, the real
+# stowage and <short>-stow binaries, a real registry (zot) and the local Docker engine. Needs
+# Docker and network access.
 #
 #   make e2e-stateless     (builds ./bin/stowage first)
 #
-# Walks: ship 1.0.0 → the bootstrap one-liner installs it in loopback mode → the health path and
-# the route serve, the install prints its endpoint → a re-run changes an input → status shows the
-# endpoint → ship 1.0.1, `upgrade --version 1.0.1` (nothing dumped) → rollback (no schema check) →
-# reset-db is refused: the release has no database.
+# Walks: ship 1.0.0 → the bootstrap one-liner installs it, with no TLS mode asked → the health path
+# and the L4 route serve, the volume was given the server's uid (the server writes into it), no
+# front runs → a re-run changes an input its page is rendered from (an inline config: the server is
+# made again) → status lists the L4 route → --tls is refused → ship 1.0.1, `upgrade --version
+# 1.0.1` (nothing dumped) → rollback (no schema check) → reset-db is refused: the release has no
+# database.
 set -euo pipefail
 . "$(dirname "$0")/lib.sh"
 
@@ -26,13 +29,15 @@ step "project, ship 1.0.0"
 # private ones there.
 P=$WORK/lookup
 cp -r "$REPO/examples/stateless" "$P"
-python3 - "$P/stowage.yaml" "$REG" <<'PY'
+PORT=$(free_port)
+python3 - "$P/stowage.yaml" "$REG" "$PORT" <<'PY'
 import sys
-path, reg = sys.argv[1:]
+path, reg, port = sys.argv[1:]
 s = open(path).read()
 for old, new in [
     ("prefix: registry.example.com/acme", f"prefix: {reg}/notes"),
     ("pull: { provider: none }", "pull: { provider: token, user: pull, token_env: NOTES_PULL_TOKEN }"),
+    ("port: 8090,", f"port: {port},"),
 ]:
     assert s.count(old) == 1, old
     s = s.replace(old, new)
@@ -43,27 +48,30 @@ S=("$STOWAGE" -C "$P")
 "${S[@]}" lint
 "${S[@]}" ship --channel stable 2>"$WORK/ship-1.0.0.log" || { cat "$WORK/ship-1.0.0.log"; fail "ship 1.0.0"; }
 
-step "install 1.0.0 with the bootstrap one-liner (loopback)"
-PORT=$(free_port)
+step "install 1.0.0 with the bootstrap one-liner (no front)"
 login_pull
 docker run --rm --pull always "$REG/notes/lookup-installer:latest" >"$WORK/lookup.sh" || fail "docker run of the installer image"
 unset DOCKER_CONFIG # the installer's environment never has it (OPERATOR)
-(cd "$WORK" && "${OPERATOR[@]}" sh lookup.sh --no-input --dir "$D" --ports "lookup=$PORT" --set GREETING=bonjour) \
+(cd "$WORK" && "${OPERATOR[@]}" sh lookup.sh --no-input --dir "$D" --set GREETING=bonjour) \
 	>"$WORK/install.log" 2>&1 || { cat "$WORK/install.log"; fail "install"; }
 [[ $(page health) == ok ]] || { stack_logs >&2; fail "the health path does not answer"; }
 [[ $(page) == bonjour ]] || fail "the route does not serve the input GREETING"
-url=$(sed -n "s/^STOWAGE_URL_LOOKUP='\{0,1\}\([^']*\)'\{0,1\}$/\1/p" "$D/.env")
-[[ $url == http://*:$PORT ]] || fail "the install records the lookup route's URL as $url"
-grep -qxF "endpoint  $url (loopback: this machine only; another compose project's containers cannot reach it, a project using lookup as an extension reaches it through a domain: a new install with --tls)" "$WORK/install.log" ||
-	{ cat "$WORK/install.log"; fail "the install did not print its endpoint"; }
+grep -q 'volume .*_state given to its uid' "$WORK/install.log" || { cat "$WORK/install.log"; fail "the install did not give the state volume its uid"; }
+! grep -q 'TLS\|https://\|portal\|served' "$WORK/install.log" || { cat "$WORK/install.log"; fail "the install of a project without a front speaks of one"; }
+[[ -z $(docker ps -q --filter "label=com.docker.compose.project=$(sed -n 's/^COMPOSE_PROJECT_NAME=//p' "$D/.env")" --filter label=com.docker.compose.service=stowage-front) ]] ||
+	fail "a front runs"
+! grep -q '^STOWAGE_TLS_MODE=\|^STOWAGE_URL_' "$D/.env" || fail "the install recorded a TLS mode or a route URL"
 ! grep -qi 'database\|snapshot' "$WORK/install.log" || { cat "$WORK/install.log"; fail "the install of a release without a database names one"; }
 
-step "a re-run changes an input; status shows the endpoint"
+step "a re-run changes an input its page is rendered from; status lists the L4 route; --tls is refused"
 "${CTL[@]}" --dir "$D" --no-input --set GREETING=salut >"$WORK/rerun.log" 2>&1 || { cat "$WORK/rerun.log"; fail "re-run"; }
 grep -q 'changing GREETING: bonjour → salut' "$WORK/rerun.log" || { cat "$WORK/rerun.log"; fail "the re-run did not log the change"; }
-[[ $(page) == salut ]] || fail "the route does not serve the changed input"
+! grep -q 'given to its uid' "$WORK/rerun.log" || { cat "$WORK/rerun.log"; fail "the re-run gave a volume it did not make a uid"; }
+[[ $(page) == salut ]] || fail "the route does not serve the changed input: its server was not made again"
 "${CTL[@]}" status --dir "$D" >"$WORK/status.txt" 2>&1 || { cat "$WORK/status.txt"; fail "status"; }
-grep -qxF "endpoint  $url" "$WORK/status.txt" || { cat "$WORK/status.txt"; fail "status does not show the endpoint"; }
+grep -q "lookup.*tcp.*$PORT" "$WORK/status.txt" || { cat "$WORK/status.txt"; fail "status does not list the L4 route"; }
+if "${CTL[@]}" --dir "$D" --no-input --tls acme >"$WORK/tls.log" 2>&1; then cat "$WORK/tls.log"; fail "--tls was taken"; fi
+grep -qF 'lookup has no front: --tls' "$WORK/tls.log" || { cat "$WORK/tls.log"; fail "the refusal of --tls does not say there is no front"; }
 
 step "ship 1.0.1, upgrade --version 1.0.1, rollback: no database to dump or check"
 python3 - "$P/CHANGELOG.md" <<'PY'
