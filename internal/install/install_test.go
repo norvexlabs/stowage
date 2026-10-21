@@ -623,6 +623,142 @@ func TestAnUpgradeRecordsIPv6Off(t *testing.T) {
 	}
 }
 
+// An input turns its compose profile on while it holds a value; once it is emptied, the profile's
+// services are removed, as `up` would leave them running. A shell's COMPOSE_PROFILES starts none.
+func TestAnInputTurnsItsProfileOn(t *testing.T) {
+	e := newEnv(t)
+	e.r.Spec.Inputs = append(e.r.Spec.Inputs, spec.Input{Key: "RELAY_SOURCE", Prompt: "Relay source", Optional: true, Profile: "relay"})
+	e.r.Compose = []byte(strings.Replace(string(e.r.Compose), "services:\n", "services:\n  relay:\n    image: ${STOWAGE_IMAGE_API}\n    profiles: [relay]\n", 1))
+	removed := func() bool {
+		return slices.ContainsFunc(e.docker.calls, func(c Cmd) bool {
+			return strings.HasSuffix(strings.Join(c.Args, " "), " --profile relay rm --stop --force relay")
+		})
+	}
+	for _, c := range []struct {
+		set     map[string]string
+		on      string
+		removes bool
+	}{
+		{nil, "", true}, // never asked a value: off
+		{map[string]string{"RELAY_SOURCE": "sensors"}, "relay", false},
+		{nil, "relay", false}, // kept
+		{map[string]string{"RELAY_SOURCE": ""}, "", true},
+	} {
+		e.docker.calls = nil
+		if err := e.install(func(o *Options) {
+			o.Set, o.Environ = c.set, append(o.Environ, "COMPOSE_PROFILES=relay")
+		}); err != nil {
+			t.Fatal(err)
+		}
+		env := e.readEnv()
+		got, recorded := env.Get(ProfilesVar)
+		up := slices.IndexFunc(e.docker.calls, func(c Cmd) bool { return slices.Contains(c.Args, "up") })
+		if !recorded || got != c.on || removed() != c.removes || up < 0 || !slices.Contains(e.docker.calls[up].Env, ProfilesVar+"="+c.on) {
+			t.Errorf("--set %v: recorded %q (%v), removed %v", c.set, got, recorded, removed())
+		}
+	}
+	// A release whose inputs turn no profile on records none.
+	e = newEnv(t)
+	if err := e.install(nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := e.readEnv().Get(ProfilesVar); ok {
+		t.Error("recorded without a profile input")
+	}
+}
+
+// An upgrade to a release whose inputs turn no profile on drops the recorded profiles.
+func TestAnUpgradeDropsTheProfiles(t *testing.T) {
+	t.Parallel()
+	in := &Installer{R: testRelease(t, "2.0.0")}
+	env := NewEnvFile()
+	env.Set("STOWAGE_REGISTRY", "ghcr.io/acme/notes")
+	env.Set(ProfilesVar, "relay")
+	next, _, err := in.upgradeEnv(env, Loopback, nil, nil)
+	if _, ok := next.Get(ProfilesVar); err != nil || ok {
+		t.Errorf("recorded after the upgrade: %v", err)
+	}
+}
+
+// An L4 route publishes its host port to its service in every mode, and hands the stack its
+// endpoint; the front's ports never take one of its TCP ports, and its port must be free at the
+// first install. The project's front ports are the defaults an install moves.
+func TestL4Routes(t *testing.T) {
+	newL4 := func() *env {
+		e := newEnv(t)
+		s := e.r.Spec
+		s.Inputs = append(s.Inputs, spec.Input{Key: "DATA_ADDRESS", Prompt: "Data address", Optional: true})
+		s.L4.Routes = []spec.L4Route{
+			{Name: "data", Protocol: "tcp", Port: 7443, Upstream: "api:7000", AddressInput: "DATA_ADDRESS"},
+			{Name: "data-udp", Protocol: "udp", Port: 7443, Upstream: "api:7000"},
+		}
+		s.Front.HTTPSPort = 8443
+		e.vars["APP_DOMAIN"], e.vars["API_DOMAIN"] = "app.example.org", "api.example.org"
+		return e
+	}
+	tls := func(o *Options) { o.TLS = "internal" }
+	e := newL4()
+	e.vars["DATA_ADDRESS"] = "fd00::7"
+	if err := e.install(tls); err != nil {
+		t.Fatal(err)
+	}
+	env := e.readEnv()
+	if got := get(env, "STOWAGE_L4_DATA"); got != "[fd00::7]:7443" {
+		t.Errorf("STOWAGE_L4_DATA = %q", got)
+	}
+	if _, ok := env.Get("STOWAGE_L4_DATA_UDP"); ok {
+		t.Error("an endpoint recorded for a route without an address input")
+	}
+	if got := get(env, HTTPSPortVar); got != "8443" {
+		t.Errorf("the project's HTTPS port: %q", got)
+	}
+	fc, _ := os.ReadFile(filepath.Join(e.dir, FrontCompose))
+	for _, want := range []string{"  api:\n        ports:\n            - protocol: tcp\n              published: \"7443\"\n              target: \"7000\"\n            - protocol: udp\n              published: \"7443\"\n              target: \"7000\"\n"} {
+		if !strings.Contains(string(fc), want) {
+			t.Errorf("no %q in:\n%s", want, fc)
+		}
+	}
+	if err := e.install(func(o *Options) { o.Set = map[string]string{"DATA_ADDRESS": "data.example.org:7443"} }); err == nil || !strings.Contains(err.Error(), "is not a host name or an IP address") {
+		t.Errorf("an address with a port: %v", err)
+	}
+	// A re-run that empties the address empties the endpoint; one that moves the front onto the
+	// route's TCP port is refused.
+	if err := e.install(func(o *Options) { o.Set = map[string]string{"DATA_ADDRESS": ""} }); err != nil || get(e.readEnv(), "STOWAGE_L4_DATA") != "" {
+		t.Fatalf("%v %q", err, get(e.readEnv(), "STOWAGE_L4_DATA"))
+	}
+	if err := e.install(func(o *Options) { o.HTTPSPort = 7443 }); err == nil || !strings.Contains(err.Error(), "the front's https port 7443 is the L4 route data's: choose another with --https-port") {
+		t.Errorf("err = %v", err)
+	}
+	var out bytes.Buffer
+	if err := e.installer(func(o *Options) { o.Out = &out }).Status(context.Background()); err != nil || !strings.Contains(out.String(), "\ndata      tcp/7443\ndata-udp  udp/7443\n") {
+		t.Errorf("%v\n%s", err, out.String())
+	}
+	// The first install: an option over the project's port, and the route's port free.
+	e = newL4()
+	if err := e.install(func(o *Options) { tls(o); o.HTTPPort = 7443 }); err == nil || !strings.Contains(err.Error(), "--http-port") {
+		t.Errorf("err = %v", err)
+	}
+	e.busy[7443] = true
+	if err := e.install(tls); err == nil || !strings.Contains(err.Error(), "port(s) 7443 (data) already in use on this host: the project's L4 routes publish them") {
+		t.Errorf("err = %v", err)
+	}
+	// Loopback mode publishes them too; a route's loopback port is the front's.
+	e = newL4()
+	if err := e.install(func(o *Options) { o.TLS, o.Ports = Loopback, map[string]int{"app": 7443} }); err == nil || !strings.Contains(err.Error(), "the front's app port 7443 is the L4 route data's: choose another with --ports") {
+		t.Errorf("err = %v", err)
+	}
+	if err := e.install(func(o *Options) { o.TLS = Loopback }); err != nil {
+		t.Fatal(err)
+	}
+	if fc, _ := os.ReadFile(filepath.Join(e.dir, FrontCompose)); !strings.Contains(string(fc), `published: "7443"`) {
+		t.Errorf("loopback mode:\n%s", fc)
+	}
+	// The provision hook is handed the endpoint, like the routes' URLs.
+	if keys := e.installer(nil).providedEnv(e.readEnv()); !slices.Contains(keys, "STOWAGE_L4_DATA") {
+		t.Errorf("provided: %v", keys)
+	}
+}
+
 func TestAReRunFinishesSetupAndNeverRedecides(t *testing.T) {
 	e := newEnv(t)
 	if err := e.install(nil); err != nil {
@@ -956,7 +1092,7 @@ func TestFrontStripsHeadersAndPublishesOnTheLoopback(t *testing.T) {
 			t.Errorf("Caddyfile lacks %q:\n%s", want, cf)
 		}
 	}
-	fc, err := frontCompose(e.r.Spec.Front, Loopback, hostAPI{}, "sha256:x", "", false)
+	fc, err := frontCompose(e.r.Spec.Front, nil, Loopback, hostAPI{}, "sha256:x", "", false)
 	if err != nil {
 		t.Fatal(err)
 	}

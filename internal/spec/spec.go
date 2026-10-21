@@ -38,6 +38,7 @@ type Spec struct {
 	Images       map[string]Image   `yaml:"images"`
 	Stack        Stack              `yaml:"stack"`
 	Front        Front              `yaml:"front"`
+	L4           L4                 `yaml:"l4"`
 	Health       Provider           `yaml:"health"`
 	Database     *Database          `yaml:"database"`
 	Data         Data               `yaml:"data"`
@@ -121,6 +122,32 @@ type Front struct {
 	LoopbackEnv map[string]string `yaml:"loopback_env"`
 	// PublishCA copies the CA the front's certificates chain to into a project volume.
 	PublishCA *PublishCA `yaml:"publish_ca"`
+	// HTTPPort and HTTPSPort are the host ports a TLS front publishes unless the install gives
+	// others; 0 is 80 and 443.
+	HTTPPort  int `yaml:"http_port"`
+	HTTPSPort int `yaml:"https_port"`
+}
+
+// L4 is the stack's layer-4 routes: host ports published to a service as they are, TCP or UDP,
+// beside the front and never through it.
+type L4 struct {
+	Routes []L4Route `yaml:"routes"`
+}
+
+// L4Route publishes the host port Port, over Protocol, to Upstream (service:port).
+// AddressInput names the input holding the host name or address clients dial, which the stack
+// reads as the route's endpoint (L4Var).
+type L4Route struct {
+	Name         string `yaml:"name"`
+	Protocol     string `yaml:"protocol"`
+	Port         int    `yaml:"port"`
+	Upstream     string `yaml:"upstream"`
+	AddressInput string `yaml:"address_input"`
+}
+
+// L4Var is the variable carrying an L4 route's endpoint, <address>:<port>.
+func L4Var(route string) string {
+	return "STOWAGE_L4_" + strings.ToUpper(strings.NewReplacer("-", "_", ".", "_").Replace(route))
 }
 
 // PublishCA names the project volume the front copies its CA into, as ca.crt: the local CA's
@@ -246,6 +273,21 @@ type Input struct {
 	// Advanced makes the input a tunable: never asked, recorded only when given, the compose
 	// file's default otherwise.
 	Advanced bool `yaml:"advanced"`
+	// Profile names the compose profile the input turns on while it holds a value: the services
+	// of that profile run only then.
+	Profile string `yaml:"profile"`
+}
+
+// Profiles are the compose profiles the inputs turn on, sorted, each once.
+func (s *Spec) Profiles() []string {
+	var p []string
+	for _, i := range s.Inputs {
+		if i.Profile != "" && !slices.Contains(p, i.Profile) {
+			p = append(p, i.Profile)
+		}
+	}
+	slices.Sort(p)
+	return p
 }
 
 // OnKubernetes reports whether the input is recorded on the kubernetes shape: its shapes allow it,

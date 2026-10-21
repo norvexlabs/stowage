@@ -66,7 +66,8 @@ func (in *Installer) hookEnv(env *EnvFile, h *providers.ProvisionHook) []string 
 	return keys
 }
 
-// providedEnv lists the recorded values Stowage provides and each route's URL.
+// providedEnv lists the recorded values Stowage provides, each route's URL and each L4 route's
+// endpoint.
 func (in *Installer) providedEnv(env *EnvFile) []string {
 	var keys []string
 	add := func(k string) {
@@ -79,6 +80,9 @@ func (in *Installer) providedEnv(env *EnvFile) []string {
 	}
 	for _, r := range in.R.Spec.Front.Routes {
 		add(spec.URLVar(r.Name))
+	}
+	for _, r := range in.R.Spec.L4.Routes {
+		add(spec.L4Var(r.Name))
 	}
 	return keys
 }

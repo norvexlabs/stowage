@@ -109,6 +109,29 @@ grep -q 'tip: the extension atlas-search' "$WORK/search-off.log" || { cat "$WORK
 [[ $(sed -n 's/^ADMIN_API_KEY=//p' "$D/credentials.txt") == "$key" ]] || fail "a re-run minted a new API key: what the hook returned was not handed back"
 atlas_running "$V1" 1
 
+step "the L4 routes: the echo service over TCP and UDP on 17007, published beside the front; an optional service its input turns on"
+# echo_l4 tcp|udp: what the echo service sends back for "ping" (TCP: prefixed by its endpoint).
+echo_l4() {
+	python3 -c '
+import socket, sys
+proto = sys.argv[1]
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM if proto == "tcp" else socket.SOCK_DGRAM)
+s.settimeout(10)
+s.connect(("127.0.0.1", 17007))
+s.sendall(b"ping\n" if proto == "tcp" else b"ping")
+print(s.recv(256).decode().strip())' "$1"
+}
+[[ $(echo_l4 tcp) == "localhost:17007 ping" ]] || { stack_logs >&2; fail "the echo service over TCP (STOWAGE_L4_ECHO handed to it)"; }
+[[ $(echo_l4 udp) == "ping" ]] || fail "the echo service over UDP"
+grep -qxF "echo      tcp/17007 localhost:17007" "$WORK/status.txt" && grep -qxF "echo-udp  udp/17007" "$WORK/status.txt" ||
+	{ cat "$WORK/status.txt"; fail "status does not list the L4 routes"; }
+relay() { docker ps -q --filter "label=com.docker.compose.project=$(project)" --filter label=com.docker.compose.service=relay; }
+[[ -z $(relay) ]] || fail "the relay runs while RELAY_SOURCE is empty"
+"${CTL[@]}" --dir "$D" --no-input --set RELAY_SOURCE=sensors >"$WORK/relay-on.log" 2>&1 || { cat "$WORK/relay-on.log"; fail "re-run --set RELAY_SOURCE=sensors"; }
+[[ -n $(relay) ]] || fail "the relay does not run once RELAY_SOURCE is set"
+"${CTL[@]}" --dir "$D" --no-input --set RELAY_SOURCE= >"$WORK/relay-off.log" 2>&1 || { cat "$WORK/relay-off.log"; fail "re-run --set RELAY_SOURCE="; }
+[[ -z $(relay) ]] || fail "the relay still runs once RELAY_SOURCE is cleared"
+
 step "a key the app's users revoked: provision fails naming --set, which replaces it before the hook runs"
 # key_status <key>: the status the api answers its key check with, through the api route.
 key_status() { curl -s -o /dev/null -w '%{http_code}' --max-time 10 -H "Authorization: Bearer $1" "http://127.0.0.1:$API_PORT/api/v1/key"; }

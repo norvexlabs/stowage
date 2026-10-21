@@ -1,8 +1,10 @@
 package lint
 
 import (
+	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -78,6 +80,12 @@ func TestEachRuleFires(t *testing.T) {
 		{"stowage short name", []edit{{specFile, "\nname: notes\n", "\nname: notes\nshort_name: stowage-notes\n"}}, nil, "keeps for Stowage's own files"},
 		{"compose build", []edit{{composeFile, "image: ${STOWAGE_IMAGE_WEB}", "image: ${STOWAGE_IMAGE_WEB}\n    build: ./web"}}, nil, "build: is forbidden"},
 		{"compose name", []edit{{composeFile, "services:", "name: notes\nservices:"}}, nil, "top-level name"},
+		{"extends another file", []edit{{composeFile, "  web:\n    image: ${STOWAGE_IMAGE_WEB}\n", "  web:\n    extends: { file: base.yaml, service: api }\n"}}, nil, "services.web.extends: file: names another compose file"},
+		{"extends unknown service", []edit{{composeFile, "  web:\n    image: ${STOWAGE_IMAGE_WEB}\n", "  web:\n    extends: www\n"}}, nil, `services.web.extends: extends "www", which is not a service`},
+		{"extends loop", []edit{{composeFile, "  web:\n    image: ${STOWAGE_IMAGE_WEB}\n", "  web:\n    extends: { service: web }\n"}}, nil, "extends loops: web → web"},
+		{"extends loop reached from outside", []edit{{composeFile, "  web:\n    image: ${STOWAGE_IMAGE_WEB}\n", "  web:\n    image: ${STOWAGE_IMAGE_WEB}\n  x:\n    extends: y\n  y:\n    extends: x\n  a:\n    extends: x\n"}}, nil, "services.x.extends: extends loops: x → y → x"},
+		{"extends joins the base's ports", []edit{{composeFile, "  web:\n    image: ${STOWAGE_IMAGE_WEB}\n", "  base:\n    image: ${STOWAGE_IMAGE_WEB}\n    ports: [\"127.0.0.1:1:1\", \"5432:5432\"]\n  web:\n    extends: base\n    image: ${STOWAGE_IMAGE_WEB}\n    ports: [\"127.0.0.1:9000:9000\"]\n"}}, nil, "services.web.ports: the VM's firewall"},
+		{"extends inherits a literal image", []edit{{composeFile, "  web:\n    image: ${STOWAGE_IMAGE_WEB}\n", "  base:\n    image: nginx:latest\n  web:\n    extends: base\n"}}, nil, "services.web.image"},
 		{"literal image", []edit{{composeFile, "image: ${STOWAGE_IMAGE_WEB}", "image: nginx:latest"}}, nil, "single deployment point"},
 		{"image var of unknown key", []edit{{composeFile, "image: ${STOWAGE_IMAGE_WEB}", "image: ${STOWAGE_IMAGE_NOPE}"}}, nil, "for a key of images"},
 		{"safe default relaxed", []edit{{composeFile, "${SECURE_COOKIES:-true}", "${SECURE_COOKIES:-false}"}}, nil, "${SECURE_COOKIES:-true}"},
@@ -261,7 +269,34 @@ func TestEachRuleFiresOnFull(t *testing.T) {
 		{"extension key advanced", []edit{{sp, `prompt: "Search service key",       secret: true, optional: true`, `prompt: "Search service key", secret: true, optional: true, advanced: true`}}, nil, "extensions[0].key_input: SEARCH_KEY must be asked wherever SEARCH_URL is"},
 		{"extension input with a default", []edit{{sp, `prompt: "Search service URL (empty: no search)", optional: true`, `prompt: "Search service URL (empty: no search)", optional: true, default: "http://search:7700"`}}, nil, "extensions[0].input: SEARCH_URL must have no default"},
 		{"extension key unread", []edit{{cp, "      SEARCH_KEY: ${SEARCH_KEY:-}\n", ""}}, nil, "extensions[0].key_input: SEARCH_KEY is read by no compose service and no hook"},
-		{"service with a profile", []edit{{cp, "      SUPPORT_EMAIL: ${SUPPORT_EMAIL:-}\n", "      SUPPORT_EMAIL: ${SUPPORT_EMAIL:-}\n    profiles: [debug]\n"}}, nil, "services.ui.profiles: nothing turns a profile on: remove `profiles:`"},
+		{"service with a profile", []edit{{cp, "      SUPPORT_EMAIL: ${SUPPORT_EMAIL:-}\n", "      SUPPORT_EMAIL: ${SUPPORT_EMAIL:-}\n    profiles: [debug]\n"}}, nil, "services.ui.profiles: no input turns debug on"},
+		{"profile of no service", []edit{{cp, "    profiles: [relay]\n", ""}}, nil, "inputs[11].profile: no service of deploy/compose.yaml has the profile relay"},
+		{"profile input required", []edit{{sp, "optional: true, profile: relay", "required: true, profile: relay"}}, nil, "a required input always turns relay on"},
+		{"profile name", []edit{{sp, "profile: relay,", "profile: -relay,"}, {cp, "profiles: [relay]", "profiles: [-relay]"}}, nil, `"-relay" is not a compose profile name`},
+		{"l4 bad name", []edit{{sp, "name: echo,     protocol", "name: Echo,     protocol"}}, nil, `l4.routes[0].name: "Echo" must be 1 to 15`},
+		{"l4 name twice", []edit{{sp, "name: echo-udp, protocol: udp", "name: echo, protocol: udp"}}, nil, `l4.routes[1].name: "echo" is already another L4 route's name`},
+		{"l4 name of a front route", []edit{{sp, "name: echo-udp, protocol: udp", "name: api, protocol: udp"}}, nil, `l4.routes[1].name: "api" is already a front route's name`},
+		{"l4 name too long", []edit{{sp, "name: echo-udp, protocol: udp", "name: echo-udp-streams, protocol: udp"}}, nil, `"echo-udp-streams" must be 1 to 15`},
+		{"l4 name with two hyphens", []edit{{sp, "name: echo-udp, protocol: udp", "name: echo--udp, protocol: udp"}}, nil, `"echo--udp" must be 1 to 15`},
+		{"l4 name with an underscore", []edit{{sp, "name: echo-udp, protocol: udp", "name: echo_udp, protocol: udp"}}, nil, `"echo_udp" must be 1 to 15`},
+		{"l4 protocol", []edit{{sp, "protocol: udp, port: 17007", "protocol: sctp, port: 17007"}}, nil, `l4.routes[1].protocol: "sctp": expected tcp or udp`},
+		{"l4 port range", []edit{{sp, "protocol: udp, port: 17007", "protocol: udp, port: 65536"}}, nil, "l4.routes[1].port: 65536 is not a port"},
+		{"l4 port twice", []edit{{sp, "protocol: udp, port: 17007", "protocol: tcp, port: 17007"}}, nil, "l4.routes[1].port: tcp/17007 is route echo's port"},
+		{"l4 on the front's port", []edit{{sp, "protocol: tcp, port: 17007", "protocol: tcp, port: 443"}}, nil, "l4.routes[0].port: tcp/443 is"},
+		{"l4 on a moved front port", []edit{{sp, "https_port: 443", "https_port: 17007"}}, nil, "tcp/17007 is the front's HTTPS port"},
+		{"l4 on acme's port", []edit{{sp, "https_port: 443", "https_port: 8443"}, {sp, "protocol: tcp, port: 17007", "protocol: tcp, port: 443"}}, nil, "tcp/443 is acme's TLS challenge port"},
+		{"l4 on a loopback port", []edit{{sp, "protocol: tcp, port: 17007", "protocol: tcp, port: 3000"}}, nil, "tcp/3000 is route console's loopback port"},
+		{"front ports equal", []edit{{sp, "https_port: 443", "https_port: 80"}}, nil, "front.https_port: 80 is the HTTP port too"},
+		{"front port range", []edit{{sp, "http_port: 80 ", "http_port: 70000 "}}, nil, "front.http_port: 70000 is not a TCP port"},
+		{"l4 upstream syntax", []edit{{sp, "upstream: echo:17007 }", "upstream: echo }"}}, nil, `l4.routes[1].upstream: "echo" must be <service>:<port>`},
+		{"l4 upstream port", []edit{{sp, "upstream: echo:17007 }", "upstream: echo:0 }"}}, nil, "l4.routes[1].upstream: 0 is not a port"},
+		{"l4 upstream service", []edit{{sp, "upstream: echo:17007 }", "upstream: echoes:17007 }"}}, nil, `l4.routes[1].upstream: service "echoes"`},
+		{"l4 address not an input", []edit{{sp, "address_input: ECHO_ADDRESS", "address_input: NOPE"}}, nil, "l4.routes[0].address_input: NOPE is not an input"},
+		{"l4 address secret", []edit{{sp, `"Host name or address clients dial the echo service at", default: localhost,`, `"Host name or address clients dial the echo service at", secret: true,`}}, nil, "ECHO_ADDRESS is secret"},
+		{"l4 address default", []edit{{sp, "echo service at\", default: localhost,", "echo service at\", default: \"localhost:17007\","}}, nil, `ECHO_ADDRESS's default: "localhost:17007" is not a host name`},
+		{"l4 var of no route", []edit{{cp, "${STOWAGE_L4_ECHO}", "${STOWAGE_L4_ECHO_UDP}"}}, nil, "STOWAGE_L4_ECHO_UDP names no L4 route with an address_input"},
+		{"published port on the VM", []edit{{cp, "    command: [atlas-server, echo, \"17007\"]\n", "    command: [atlas-server, echo, \"17007\"]\n    ports: [\"17008:17007\"]\n"}}, nil, "services.echo.ports: the VM's firewall opens only what Stowage publishes"},
+		{"profile on kubernetes only", []edit{{sp, "profile: relay, shapes: [docker, kairos]", "profile: relay, shapes: [kubernetes]"}}, nil, "this input is asked on neither"},
 		{"endpoint no route", []edit{{sp, "endpoint: api\n", "endpoint: admin\n"}}, nil, `endpoint: "admin" is not a route of front.routes (console, api, ingest)`},
 		{"bad when", []edit{{sp, "when: tls,", "when: always,"}}, nil, "expected tls or loopback"},
 		{"bad shape", []edit{{sp, "shapes: [docker, kairos] }\n  - { key: ADMIN_EMAIL", "shapes: [docker, nomad] }\n  - { key: ADMIN_EMAIL"}}, nil, "unknown shape"},
@@ -487,6 +522,41 @@ func TestComposeVarParsing(t *testing.T) {
 	}
 }
 
+// A port bound to a loopback address stays on this host; any other is published past it.
+func TestPublishesBeyondLoopback(t *testing.T) {
+	t.Parallel()
+	for _, c := range []struct {
+		ports any
+		want  bool
+	}{
+		{nil, false}, {[]any{}, false},
+		{[]any{"127.0.0.1:6060:6060"}, false}, {[]any{"[::1]:6060:6060/udp"}, false}, {[]any{"::1:6060:6060"}, false},
+		{[]any{"${STOWAGE_LOOPBACK_ADDRESS}:5432:5432"}, false}, {[]any{map[string]any{"target": 80, "host_ip": "127.0.0.2"}}, false},
+		{[]any{"127.0.0.1:${PG_PORT:-5432}:5432"}, false}, {[]any{"${STOWAGE_LOOPBACK_ADDRESS}:${P:-1}:1"}, false},
+		{[]any{"[127.0.0.1]:6060"}, true}, {[]any{"[127.0.0.1]:"}, true}, {[]any{"${HOST:-127.0.0.1}:1:1"}, true},
+		{[]any{"$STOWAGE_LOOPBACK_ADDRESS:1:1"}, false}, {[]any{"${STOWAGE_LOOPBACK_ADDRESS:-127.0.0.1}:1:1"}, false},
+		{[]any{"${STOWAGE_LOOPBACK_ADDRESS:+0.0.0.0}:1:1"}, true}, {[]any{"${STOWAGE_LOOPBACK_ADDRESSES}:1:1"}, true},
+		{[]any{"6060:6060"}, true}, {[]any{"6060"}, true}, {[]any{6060}, true}, {[]any{"0.0.0.0:6060:6060"}, true},
+		{[]any{"127.0.0.1:1:1", "192.0.2.1:2:2"}, true}, {[]any{map[string]any{"target": 80}}, true}, {"6060:6060", true},
+	} {
+		if got := PublishesBeyondLoopback(c.ports); got != c.want {
+			t.Errorf("%v: %v", c.ports, got)
+		}
+	}
+}
+
+func FuzzPublishesBeyondLoopback(f *testing.F) {
+	for _, s := range []string{"127.0.0.1:1:1", "[::1]:1:1", "[", "::1:1:1", "${STOWAGE_LOOPBACK_ADDRESS}:1:1", "1"} {
+		f.Add(s)
+	}
+	f.Fuzz(func(t *testing.T, p string) {
+		// An entry kept on this host names its host before two port fields.
+		if !PublishesBeyondLoopback([]any{p}) && strings.Count(p, ":") < 2 {
+			t.Fatalf("%q counted as loopback", p)
+		}
+	})
+}
+
 func TestImageVar(t *testing.T) {
 	if got := ImageVar("admin-api"); got != "STOWAGE_IMAGE_ADMIN_API" {
 		t.Errorf("ImageVar = %s", got)
@@ -636,6 +706,80 @@ func TestInputOnlyTheHookReads(t *testing.T) {
 	}
 }
 
+// A route's domain input declared under inputs (to give it a prompt) is read: the front reads it.
+func TestDomainInputIsRead(t *testing.T) {
+	t.Parallel()
+	root := testutil.CopyExample(t, "minimal")
+	testutil.Edit(t, root, specFile, "  - { key: ADMIN_EMAIL,", "  - { key: APP_DOMAIN, prompt: \"The app's domain\", required: true }\n  - { key: ADMIN_EMAIL,")
+	for _, f := range run(t, root).Findings {
+		t.Errorf("%s", f)
+	}
+}
+
+// A service that takes its image from the service it extends is clean: compose inherits image:.
+func TestExtendsInheritsTheImage(t *testing.T) {
+	t.Parallel()
+	root := testutil.CopyExample(t, "minimal")
+	testutil.Edit(t, root, composeFile, "  web:\n    image: ${STOWAGE_IMAGE_WEB}\n", "  web:\n    extends: { service: api }\n    image: ${STOWAGE_IMAGE_WEB}\n  worker:\n    extends: api\n")
+	for _, f := range run(t, root).Findings {
+		t.Errorf("%s", f)
+	}
+}
+
+// An extends error is its own service's: one extending it is not blamed, and a loop is reported
+// once.
+func TestExtendsErrorsOnce(t *testing.T) {
+	t.Parallel()
+	root := testutil.CopyExample(t, "minimal")
+	testutil.Edit(t, root, composeFile, "  web:\n    image: ${STOWAGE_IMAGE_WEB}\n", "  web:\n    image: ${STOWAGE_IMAGE_WEB}\n  a:\n    image: ${STOWAGE_IMAGE_WEB}\n    extends: b\n  b:\n    image: ${STOWAGE_IMAGE_WEB}\n    extends: missing\n  x:\n    image: ${STOWAGE_IMAGE_WEB}\n    extends: y\n  y:\n    image: ${STOWAGE_IMAGE_WEB}\n    extends: x\n")
+	var got []string
+	for _, e := range errorsOf(run(t, root)) {
+		if strings.Contains(e, ".extends") {
+			got = append(got, e)
+		}
+	}
+	want := []string{
+		`error: deploy/compose.yaml: services.b.extends: extends "missing", which is not a service of this file`,
+		"error: deploy/compose.yaml: services.x.extends: extends loops: x → y → x",
+	}
+	if !slices.Equal(got, want) {
+		t.Errorf("got:\n%s", strings.Join(got, "\n"))
+	}
+}
+
+// The front's ports are TCP: an L4 route over UDP on 443 is clean, beside the front and acme.
+func TestL4UDPOnTheFrontsPort(t *testing.T) {
+	t.Parallel()
+	root := testutil.CopyExample(t, "full")
+	testutil.Edit(t, root, specFile, "protocol: udp, port: 17007", "protocol: udp, port: 443")
+	if errs := errorsOf(run(t, root)); len(errs) > 0 {
+		t.Fatal(strings.Join(errs, "\n"))
+	}
+}
+
+// A port the compose file publishes past Stowage is warned on the docker shape, whose host
+// firewall is the operator's.
+func TestPublishedPortOnDockerWarns(t *testing.T) {
+	t.Parallel()
+	root := testutil.CopyExample(t, "stateless")
+	testutil.Edit(t, root, "deploy/compose.yaml", "    image: ${STOWAGE_IMAGE_SERVER}\n", "    image: ${STOWAGE_IMAGE_SERVER}\n    ports: [\"6060:6060\"]\n")
+	res := run(t, root)
+	if len(res.Findings) != 1 || res.Findings[0].Severity != Warning || !strings.Contains(res.Findings[0].String(), "ports: published past Stowage") {
+		t.Fatalf("findings: %+v", res.Findings)
+	}
+}
+
+// A chart that never reads the L4 routes is warned: they would not be published on Kubernetes.
+func TestChartNotReadingTheL4RoutesWarns(t *testing.T) {
+	t.Parallel()
+	root := testutil.CopyExample(t, "full")
+	testutil.Edit(t, root, "deploy/chart/templates/echo.yaml", "{{- range .Values.stowage.l4 }}", "{{- range list }}")
+	res := run(t, root)
+	if len(res.Findings) != 1 || !strings.Contains(res.Findings[0].String(), "no template reads .Values.stowage.l4") {
+		t.Fatalf("findings: %+v", res.Findings)
+	}
+}
+
 // A disk-pressure hook with neither the docker nor the kairos shape is warned: only the VM's host
 // daemon and a Docker install's timer act on it.
 func TestDiskPressureWithoutKairosOrDockerWarns(t *testing.T) {
@@ -753,4 +897,43 @@ func TestChannelNameIsATag(t *testing.T) {
 			t.Errorf("%q: %v", name, !want)
 		}
 	}
+}
+
+// A service's profiles are its own and those of the service it extends, as compose joins them.
+func TestServiceProfilesJoinTheBase(t *testing.T) {
+	t.Parallel()
+	p, err := ServiceProfiles([]byte("services:\n  base: { image: x, profiles: [a] }\n  child: { extends: base, profiles: [b] }\n  plain: { image: x }\n"))
+	if err != nil || !slices.Equal(p["child"], []string{"b", "a"}) || !slices.Equal(p["base"], []string{"a"}) || p["plain"] != nil {
+		t.Fatalf("%v %v", p, err)
+	}
+}
+
+// An L4 route's address is a host name or an IP address, never with a port, a scheme or a zone.
+func TestCheckL4Address(t *testing.T) {
+	t.Parallel()
+	for v, ok := range map[string]bool{
+		"": true, "localhost": true, "data.example.com": true, "192.0.2.7": true, "fd00::7": true,
+		"data.example.com:7443": false, "tcp://data.example.com": false, "fe80::1%eth0": false, "Data.example.com": false,
+		"[fd00::7]": false, "192.168.1": false, "data.99999999999999999999": false, "10.0.0.300": false, "-data.example.com": false, "data..example.com": false,
+	} {
+		if err := CheckL4Address(v); (err == nil) != ok {
+			t.Errorf("%q: %v", v, err)
+		}
+	}
+}
+
+// Whatever it accepts makes an endpoint net.SplitHostPort reads back as that address.
+func FuzzCheckL4Address(f *testing.F) {
+	for _, s := range []string{"localhost", "fd00::7", "192.0.2.7", "a.b:1", "[::1]", "x/y"} {
+		f.Add(s)
+	}
+	f.Fuzz(func(t *testing.T, v string) {
+		if CheckL4Address(v) != nil || v == "" {
+			return
+		}
+		host, port, err := net.SplitHostPort(net.JoinHostPort(v, "7443"))
+		if err != nil || host != v || port != "7443" || strings.ContainsAny(v, "/ \t\n'\"") {
+			t.Fatalf("%q accepted: %q %q %v", v, host, port, err)
+		}
+	})
 }

@@ -61,6 +61,14 @@ front:
   loopback_ports: { console: 3000, api: 9090, ingest: 8080 }
   loopback_env: { COOKIE_SECURE: "false", TRUSTED_PROXY_HOPS: "0" }
   publish_ca: { volume: ca }                                    # the internal CA, or byo's --ca
+  http_port: 80                                                 # the defaults; an install's --http-port
+  https_port: 443                                               # and --https-port move them
+
+# Host ports published to a service as they are, beside the front.
+l4:
+  routes:
+    - { name: echo,     protocol: tcp, port: 17007, upstream: echo:17007, address_input: ECHO_ADDRESS }
+    - { name: echo-udp, protocol: udp, port: 17007, upstream: echo:17007 }
 
 health:
   provider: http-json
@@ -114,6 +122,8 @@ inputs:
   - { key: AUTH_ADDRESS,      prompt: "Authentication service of the api route, host:port", advanced: true, shapes: [docker, kairos] }
   - { key: AUTH_URI,          prompt: "Path the authentication service is asked at", advanced: true, shapes: [docker, kairos] }
   - { key: LOG_LEVEL,         prompt: "Log level (debug, info, warning)", advanced: true }
+  - { key: ECHO_ADDRESS,      prompt: "Host name or address clients dial the echo service at", default: localhost, shapes: [docker, kairos] }
+  - { key: RELAY_SOURCE,      prompt: "Event source the relay forwards (empty: no relay)", optional: true, profile: relay, shapes: [docker, kairos] }
   # Kubernetes: the database is external or embedded by the chart's postgres.mode value
   # (embedded: these two URLs are left empty).
   - { key: DATABASE_URL,      prompt: "Migration database URL (external Postgres)", secret: true, optional: true, shapes: [kubernetes] }

@@ -184,6 +184,10 @@ ingest_event
 [[ $(status search) == True ]] || fail "the api does not reach SEARCH_URL, given at the install"
 grep -qF "endpoint  http://atlas-api.$NS.svc:9090" "$WORK/install.log" || { cat "$WORK/install.log"; fail "k8s install did not print its endpoint"; }
 ! grep -qF "tip: the extension atlas-search" "$WORK/install.log" || { cat "$WORK/install.log"; fail "a tip for the search extension, whose URL was given"; }
+# The chart's Services of the L4 routes (stowage.l4), to the echo pods.
+[[ $(kubectl get -n "$NS" svc atlas-l4-echo atlas-l4-echo-udp -o jsonpath='{range .items[*]}{.spec.ports[0].protocol}/{.spec.ports[0].port} {end}') == "TCP/17007 UDP/17007 " ]] ||
+	fail "the chart did not render a Service per L4 route from stowage.l4"
+[[ -n $(kubectl get -n "$NS" endpoints atlas-l4-echo -o jsonpath='{.subsets[0].addresses[0].ip}') ]] || fail "the L4 route's Service selects no echo pod"
 
 step "k8s upgrade of the same release: the key handed back to the hook"
 ctl v1.sh k8s upgrade --no-input --timeout 5m >"$WORK/search.log" 2>&1 || { cat "$WORK/search.log"; fail "k8s upgrade"; }

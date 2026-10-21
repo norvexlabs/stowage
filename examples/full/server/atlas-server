@@ -13,6 +13,8 @@ api [port]     migrates the database (DATABASE_URL, the migrate role) with migra
                X-Atlas-User in X-Auth-Request-User, else 401), and /api/v1/whoami (the
                X-Auth-Request-User it was given)
 ingest [port]  liveness on /health; POST /events forwards the body to the api
+echo <port>    echoes over TCP and UDP on <port>: each TCP line back, prefixed by ECHO_ENDPOINT
+               and a space; each UDP datagram back as sent (the stack's L4 routes)
 probe <port>   exits 0 when http://127.0.0.1:<port>/health answers 200 (the compose healthchecks)
 
 A migration is recorded in schema_migrations (version, description, success); one whose first
@@ -23,7 +25,10 @@ import glob
 import json
 import os
 import re
+import socket
+import socketserver
 import subprocess
+import threading
 import sys
 import time
 import urllib.parse
@@ -205,8 +210,33 @@ class Ingest(Handler):
             return self.reply(502, {"error": str(e)})
 
 
+class EchoTCP(socketserver.StreamRequestHandler):
+    def handle(self):
+        prefix = os.environ.get("ECHO_ENDPOINT", "").encode()
+        for line in self.rfile:
+            self.wfile.write(prefix + b" " + line)
+
+
+class EchoServer(socketserver.ThreadingTCPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+
+def echo(port):
+    """Serves TCP on port in a thread, UDP on port in this one."""
+    threading.Thread(target=EchoServer(("", port), EchoTCP).serve_forever, daemon=True).start()
+    udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    udp.bind(("", port))
+    log(f"atlas echo on :{port} (tcp, udp)")
+    while True:
+        data, peer = udp.recvfrom(65535)
+        udp.sendto(data, peer)
+
+
 def main():
     role = sys.argv[1] if len(sys.argv) > 1 else "api"
+    if role == "echo":
+        echo(int(sys.argv[2]))
     if role == "probe":
         try:
             with urllib.request.urlopen(f"http://127.0.0.1:{sys.argv[2]}/health", timeout=2) as r:
@@ -234,7 +264,7 @@ def main():
     elif role == "ingest":
         handler, port = Ingest, 8080
     else:
-        sys.exit(f"unknown role {role}: api, ingest or probe")
+        sys.exit(f"unknown role {role}: api, ingest, echo or probe")
     if len(sys.argv) > 2:
         port = int(sys.argv[2])
     log(f"atlas {role} {os.environ.get('ATLAS_VERSION', 'dev')} on :{port}")

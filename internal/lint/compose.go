@@ -1,8 +1,12 @@
 package lint
 
 import (
+	"errors"
 	"fmt"
+	"net/netip"
 	"os"
+	"regexp"
+	"slices"
 	"strings"
 
 	"go.yaml.in/yaml/v3"
@@ -32,6 +36,189 @@ type Service struct {
 	Image    string   `yaml:"image"`
 	Build    any      `yaml:"build"`
 	Profiles []string `yaml:"profiles"`
+	// Extends is `extends: base` or `extends: {service: base, file: …}`; after inherit, Profiles
+	// and Ports hold the base's too.
+	Extends any `yaml:"extends"`
+	Ports   any `yaml:"ports"`
+}
+
+// inherit fills each service's image and build from the service it extends, where it sets none,
+// and joins its profiles and ports with the base's, as compose does. It refuses an extends compose would resolve outside this file (a
+// file the release does not carry), a service the file does not declare, and a cycle.
+func (c *Compose) inherit() map[string]error {
+	errs := map[string]error{}
+	base := map[string]string{}
+	for name, svc := range c.Services {
+		var from string
+		switch e := svc.Extends.(type) {
+		case nil:
+			continue
+		case string:
+			from = e
+		case map[string]any:
+			if _, ok := e["file"]; ok {
+				errs[name] = errors.New("file: names another compose file, which the release does not carry: extend a service of this file")
+				continue
+			}
+			from, _ = e["service"].(string)
+		}
+		switch _, ok := c.Services[from]; {
+		case from == "":
+			errs[name] = errors.New("expected a service name, or {service: <name>}")
+		case !ok:
+			errs[name] = fmt.Errorf("extends %q, which is not a service of this file", from)
+		default:
+			base[name] = from
+		}
+	}
+	// A loop is reported once, on its first service in name order.
+	for _, name := range sortedKeys(base) {
+		path := []string{name}
+		for from := base[name]; from != ""; from = base[from] {
+			if i := slices.Index(path, from); i >= 0 {
+				loop := path[i:]
+				first := slices.Index(loop, slices.Min(loop))
+				loop = append(slices.Clone(loop[first:]), loop[:first]...)
+				errs[loop[0]] = fmt.Errorf("extends loops: %s", strings.Join(append(loop, loop[0]), " → "))
+				for _, n := range loop {
+					delete(base, n) // nothing inherits around a loop
+				}
+				break
+			}
+			path = append(path, from)
+		}
+	}
+	var resolve func(name string) Service
+	resolve = func(name string) Service {
+		svc := c.Services[name]
+		from, ok := base[name]
+		if !ok {
+			return svc // nothing to inherit, or an error its own extends reports
+		}
+		b := resolve(from)
+		if svc.Image == "" {
+			svc.Image = b.Image
+		}
+		if svc.Build == nil {
+			svc.Build = b.Build
+		}
+		// Compose joins the lists: the service's profiles and ports are its own and its base's.
+		for _, p := range b.Profiles {
+			if !slices.Contains(svc.Profiles, p) {
+				svc.Profiles = append(slices.Clone(svc.Profiles), p)
+			}
+		}
+		own, ownList := svc.Ports.([]any)
+		inherited, baseList := b.Ports.([]any)
+		switch {
+		case svc.Ports == nil:
+			svc.Ports = b.Ports
+		case ownList && baseList:
+			svc.Ports = append(slices.Clone(own), inherited...)
+		case b.Ports != nil:
+			svc.Ports = []any{svc.Ports, b.Ports} // one is no list: lint counts it as published
+		}
+		return svc
+	}
+	out := map[string]Service{}
+	for name := range c.Services {
+		out[name] = resolve(name)
+	}
+	c.Services = out
+	return errs
+}
+
+// PublishesBeyondLoopback reports whether a service's ports: publish one past this host: any
+// entry not bound to a loopback address or to ${STOWAGE_LOOPBACK_ADDRESS} (a bare port is
+// published on every address; an entry it cannot read counts as published).
+func PublishesBeyondLoopback(ports any) bool {
+	list, ok := ports.([]any)
+	if !ok {
+		return ports != nil
+	}
+	loopback := func(host string) bool {
+		// The variable, which is always recorded: a default or an error word never applies, an
+		// alternate value (:+, +) would.
+		if host == "${STOWAGE_LOOPBACK_ADDRESS}" || host == "$STOWAGE_LOOPBACK_ADDRESS" {
+			return true
+		}
+		for _, op := range []string{":-", "-", ":?", "?"} {
+			if strings.HasPrefix(host, "${STOWAGE_LOOPBACK_ADDRESS"+op) && strings.HasSuffix(host, "}") {
+				return true
+			}
+		}
+		a, err := netip.ParseAddr(strings.TrimSuffix(strings.TrimPrefix(host, "["), "]"))
+		return err == nil && a.IsLoopback()
+	}
+	for _, p := range list {
+		switch p := p.(type) {
+		case string:
+			var host string
+			if rest, ok := strings.CutPrefix(p, "["); ok {
+				if h, ports, closed := strings.Cut(rest, "]"); closed {
+					if f := portFields(ports); len(f) == 3 && f[0] == "" {
+						host = h
+					}
+				}
+			} else if parts := portFields(p); len(parts) >= 3 {
+				host = strings.Join(parts[:len(parts)-2], ":") // a bare IPv6 address holds colons too
+			}
+			if !loopback(host) {
+				return true
+			}
+		case map[string]any:
+			host, _ := p["host_ip"].(string)
+			if !loopback(host) {
+				return true
+			}
+		default:
+			return true
+		}
+	}
+	return false
+}
+
+// CheckL4Address accepts what an L4 route's endpoint is made from: nothing, an IP address (no
+// zone), or a lowercase host name whose last label is not all digits (192.168.1 is no address) —
+// never a port or a scheme, which the endpoint adds or lacks.
+func CheckL4Address(v string) error {
+	if v == "" {
+		return nil
+	}
+	if a, err := netip.ParseAddr(v); err == nil {
+		if a.Zone() != "" {
+			return fmt.Errorf("%q: an address clients dial carries no zone", v)
+		}
+		return nil
+	}
+	labels := strings.Split(v, ".")
+	if len(v) > 253 || strings.Trim(labels[len(labels)-1], "0123456789") == "" || slices.ContainsFunc(labels, func(l string) bool { return !hostLabel.MatchString(l) }) {
+		return fmt.Errorf("%q is not a host name or an IP address (lowercase, no port: like data.example.com or 192.0.2.7)", v)
+	}
+	return nil
+}
+
+// hostLabel is a label of a lowercase DNS name.
+var hostLabel = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)
+
+// portFields splits a short-syntax port entry at its colons, leaving those inside a ${…}
+// interpolation (`${PORT:-5432}`) in their field.
+func portFields(p string) []string {
+	var fields []string
+	depth, start := 0, 0
+	for i := 0; i < len(p); i++ {
+		switch {
+		case strings.HasPrefix(p[i:], "${"):
+			depth++
+			i++
+		case p[i] == '}' && depth > 0:
+			depth--
+		case p[i] == ':' && depth == 0:
+			fields = append(fields, p[start:i])
+			start = i + 1
+		}
+	}
+	return append(fields, p[start:])
 }
 
 // ParseCompose reads a compose file and collects every interpolation in its keys and scalar
@@ -42,6 +229,30 @@ func ParseCompose(path string) (*Compose, error) {
 	if err != nil {
 		return nil, err
 	}
+	return parseCompose(raw, path)
+}
+
+// ServiceProfiles are the profiles of each service of a compose file that has some, inherited
+// through extends as compose does.
+func ServiceProfiles(raw []byte) (map[string][]string, error) {
+	c, err := parseCompose(raw, "compose.yaml")
+	if err != nil {
+		return nil, err
+	}
+	if errs := c.inherit(); len(errs) > 0 {
+		name := sortedKeys(errs)[0]
+		return nil, fmt.Errorf("compose.yaml: services.%s.extends: %w", name, errs[name])
+	}
+	p := map[string][]string{}
+	for name, svc := range c.Services {
+		if len(svc.Profiles) > 0 {
+			p[name] = svc.Profiles
+		}
+	}
+	return p, nil
+}
+
+func parseCompose(raw []byte, path string) (*Compose, error) {
 	c := &Compose{}
 	var root yaml.Node
 	if err := yaml.Unmarshal(raw, &root); err != nil {

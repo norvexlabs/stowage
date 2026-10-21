@@ -224,6 +224,9 @@ func TestUpgradeRefusesBeforeChangingAnything(t *testing.T) {
 		"renamed installer": {"2.0.0", func(s *spec.Spec) { s.ShortName = "nt" }, nil, "install this release afresh"},
 		"bad hook":          {"2.0.0", func(s *spec.Spec) { s.Hooks.Provision.Config["image"] = "docs" }, nil, "hooks.provision"},
 		"offline":           {"2.0.0", nil, nil, "--offline: this install pulls its images by digest"},
+		"l4 on the front's port": {"2.0.0", func(s *spec.Spec) {
+			s.L4.Routes = []spec.L4Route{{Name: "data", Protocol: "tcp", Port: 8000, Upstream: "api:7000"}}
+		}, nil, "the front's api port 8000 is the L4 route data's"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -249,6 +252,61 @@ func TestUpgradeRefusesBeforeChangingAnything(t *testing.T) {
 				t.Errorf("snapshots left: %v", entries)
 			}
 		})
+	}
+}
+
+// An upgrade adding an L4 route checks its port is free on the host; one the running release
+// already publishes is the install's own.
+func TestUpgradeChecksTheL4PortsItAdds(t *testing.T) {
+	t.Parallel()
+	route := func(s *spec.Spec) {
+		s.L4.Routes = []spec.L4Route{{Name: "data", Protocol: "tcp", Port: 7443, Upstream: "api:7000"}}
+	}
+	e := installed(t)
+	e.busy[7443] = true
+	e.to("2.0.0", route)
+	if err := e.upgrade(nil); err == nil || !strings.Contains(err.Error(), "port(s) 7443 (data) already in use on this host") {
+		t.Fatalf("err = %v", err)
+	}
+	e.busy[7443] = false
+	if err := e.upgrade(nil); err != nil {
+		t.Fatal(err)
+	}
+	// The stack's own: published by the running release, through a route or a service's ports:.
+	e.busy[7443] = true
+	e.docker.answer = func(a string) ([]byte, bool, error) {
+		if strings.HasSuffix(a, " ps --format json") {
+			return []byte(`{"Service":"api","Publishers":[{"URL":"0.0.0.0","TargetPort":7000,"PublishedPort":7443,"Protocol":"tcp"}]}` + "\n" + `{"Service":"web","Publishers":[]}` + "\n"), true, nil
+		}
+		return nil, false, nil
+	}
+	e.to("3.0.0", route)
+	if err := e.upgrade(nil); err != nil {
+		t.Fatal(err)
+	}
+	// The front's recorded port: the refusal says how to move it.
+	e.to("4.0.0", func(s *spec.Spec) {
+		s.L4.Routes = []spec.L4Route{{Name: "data", Protocol: "tcp", Port: 8000, Upstream: "api:7000"}}
+	})
+	if err := e.upgrade(nil); err == nil || !strings.Contains(err.Error(), "the front's api port 8000 is the L4 route data's: choose another with --ports: give it to a re-run of the installer the install runs") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+// The ports compose ps lists as published, from an array or a line per container.
+func TestPublishedPorts(t *testing.T) {
+	t.Parallel()
+	for _, out := range []string{
+		`[{"Publishers":[{"URL":"0.0.0.0","PublishedPort":7443,"Protocol":"udp"},{"URL":"0.0.0.0","PublishedPort":0,"Protocol":"tcp"},{"URL":"127.0.0.1","PublishedPort":5432,"Protocol":"tcp"}]}]`,
+		`{"Publishers":[{"URL":"::","PublishedPort":7443,"Protocol":"udp"}]}` + "\n\n" + `{"Publishers":null}`,
+	} {
+		got, err := publishedPorts([]byte(out))
+		if err != nil || len(got) != 1 || !got["udp/7443"] {
+			t.Errorf("%s: %v %v", out, got, err)
+		}
+	}
+	if _, err := publishedPorts([]byte("{")); err == nil {
+		t.Error("no error on a broken answer")
 	}
 }
 

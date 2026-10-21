@@ -60,6 +60,29 @@ services:
       retries: 30
     restart: unless-stopped
 
+  # Echoes over TCP and UDP on 17007, which the spec's l4 routes publish as they are.
+  echo:
+    image: ${STOWAGE_IMAGE_INGEST}
+    command: [atlas-server, echo, "17007"]
+    environment:
+      ECHO_ENDPOINT: ${STOWAGE_L4_ECHO}
+    restart: unless-stopped
+
+  # Optional: runs only while RELAY_SOURCE holds a value (its input turns the relay profile on).
+  relay:
+    image: ${STOWAGE_IMAGE_INGEST}
+    command: [atlas-server, ingest, "8081"]
+    environment:
+      API_URL: http://api:9090
+      INTERNAL_SERVICE_SECRET: ${INTERNAL_SERVICE_SECRET}
+      RELAY_SOURCE: ${RELAY_SOURCE:-}
+    healthcheck:
+      test: ["CMD", "atlas-server", "probe", "8081"]
+      interval: 2s
+      retries: 30
+    profiles: [relay]
+    restart: unless-stopped
+
   ui:
     image: ${STOWAGE_IMAGE_UI}
     environment:

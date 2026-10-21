@@ -111,8 +111,8 @@ func newCommand(r *Release, self string, stdout, stderr io.Writer, tools K8sOpti
 	if r.Spec.Front.PublishCA != nil {
 		rf.StringVar(&o.CA, "ca", "", "--tls byo: the CA the certificate chains to, PEM, published to the stack")
 	}
-	rf.IntVar(&o.HTTPPort, "http-port", 0, "the host port a TLS front serves HTTP on (default 80; a re-run changes it)")
-	rf.IntVar(&o.HTTPSPort, "https-port", 0, "the host port a TLS front serves HTTPS on (default 443; a re-run changes it)")
+	rf.IntVar(&o.HTTPPort, "http-port", 0, "the host port a TLS front serves HTTP on (default the project's front.http_port, else 80; a re-run changes it)")
+	rf.IntVar(&o.HTTPSPort, "https-port", 0, "the host port a TLS front serves HTTPS on (default the project's front.https_port, else 443; a re-run changes it)")
 	rf.StringVar(&o.Registry, "registry", "", "pull the images from this registry prefix, a mirror (first install only)")
 	rf.StringVar(&o.RegistryCA, "registry-ca", "", "a PEM file of the CA the registry's certificate chains to, a mirror's own: kept in the install, given to the Docker daemon (first install only)")
 	ipv6Flag(rf, &o.IPv6, "IPv6 on the stack's network, so the front's IPv6 clients keep their address (Docker 27 or later); --ipv6=false turns it off (default off; on a re-run, the recorded choice)")
@@ -683,8 +683,8 @@ func vmCreateCommand(in *Installer, o *Options, prepare func() error, terminal f
 	}
 	f.StringVar(&o.TLS, "tls", "", tlsVM)
 	f.StringSliceVar(domains, "domains", nil, "a route's domain, route=host: HTTPS")
-	f.IntVar(&o.HTTPPort, "http-port", 0, "the VM's port a TLS front serves HTTP on (default 80)")
-	f.IntVar(&o.HTTPSPort, "https-port", 0, "the VM's port a TLS front serves HTTPS on (default 443)")
+	f.IntVar(&o.HTTPPort, "http-port", 0, "the VM's port a TLS front serves HTTP on (default the project's front.http_port, else 80)")
+	f.IntVar(&o.HTTPSPort, "https-port", 0, "the VM's port a TLS front serves HTTPS on (default the project's front.https_port, else 443)")
 	f.StringArrayVar(sets, "set", nil, "an input, KEY=VALUE (repeatable; never a secret input)")
 	f.StringVar(answers, "answers", "", "a YAML file of inputs, KEY: value (never a secret input)")
 	f.BoolVar(noInput, "no-input", false, "never ask: what nothing gave takes its default")

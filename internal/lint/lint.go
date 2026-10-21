@@ -3,6 +3,7 @@
 package lint
 
 import (
+	"cmp"
 	"crypto/x509"
 	"encoding/pem"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"regexp"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -108,6 +110,7 @@ func Run(root, specPath string, now time.Time) (*Result, error) {
 	l.images()
 	l.stack()
 	l.front()
+	l.l4()
 	l.healthAndDatabase()
 	l.data()
 	l.secretsAndInputs()
@@ -455,6 +458,10 @@ func (l *linter) stack() {
 			}
 		}
 	}
+	inherited := c.inherit()
+	for _, name := range sortedKeys(inherited) {
+		l.errf(file+": services."+name+".extends", "%v", inherited[name])
+	}
 	imageVars := l.imageVars()
 	used := map[string]bool{}
 	for _, name := range sortedKeys(c.Services) {
@@ -463,8 +470,18 @@ func (l *linter) stack() {
 		if strings.HasPrefix(name, "stowage-") {
 			l.errf(w, "names starting stowage- are Stowage's own (it adds the front as stowage-front)")
 		}
-		if len(svc.Profiles) > 0 {
-			l.errf(w+".profiles", "nothing turns a profile on: remove `profiles:` (no install ever starts this service)")
+		if PublishesBeyondLoopback(svc.Ports) {
+			switch {
+			case l.s.Shapes.Kairos != nil:
+				l.errf(w+".ports", "the VM's firewall opens only what Stowage publishes: declare the port in l4.routes")
+			case l.s.Shapes.Docker != nil:
+				l.warnf(w+".ports", "published past Stowage, which neither checks nor lists it: declare it in l4.routes")
+			}
+		}
+		for _, p := range svc.Profiles {
+			if !slices.Contains(l.s.Profiles(), p) {
+				l.errf(w+".profiles", "no input turns %s on: name it in an input's profile:, or remove it (no install ever starts this service)", p)
+			}
 		}
 		if svc.Build != nil {
 			l.errf(w, "build: is forbidden — a host without the image would build instead of pull; images are built by stowage ship")
@@ -631,6 +648,85 @@ func (l *linter) frontInput(where, key string) {
 	}
 }
 
+// l4 checks the L4 routes: a name, a protocol, a host port none other takes over that protocol,
+// an upstream service of the compose file, and an address input. Over TCP a route's port is not
+// one the front publishes by default — its HTTP and HTTPS ports in the TLS modes, a route's loopback
+// port in loopback mode — and never 80 or 443 while acme is offered, whose challenges need them.
+func (l *linter) l4() {
+	f := l.s.Front
+	for _, p := range []struct {
+		key  string
+		port int
+	}{{"front.http_port", f.HTTPPort}, {"front.https_port", f.HTTPSPort}} {
+		if p.port < 0 || p.port > 65535 {
+			l.errf(p.key, "%d is not a TCP port", p.port)
+		}
+	}
+	httpPort, httpsPort := cmp.Or(f.HTTPPort, 80), cmp.Or(f.HTTPSPort, 443)
+	if httpPort == httpsPort {
+		l.errf("front.https_port", "%d is the HTTP port too", httpsPort)
+	}
+	taken := map[string]string{}
+	tls := slices.ContainsFunc(f.TLSModes, func(m string) bool { return m != "none" })
+	if tls {
+		taken[fmt.Sprintf("tcp/%d", httpPort)] = "the front's HTTP port"
+		taken[fmt.Sprintf("tcp/%d", httpsPort)] = "the front's HTTPS port"
+	}
+	if slices.Contains(f.TLSModes, "acme") {
+		taken["tcp/80"], taken["tcp/443"] = "acme's HTTP challenge port", "acme's TLS challenge port"
+	}
+	if slices.Contains(f.TLSModes, "none") {
+		for _, name := range sortedKeys(f.LoopbackPorts) {
+			taken[fmt.Sprintf("tcp/%d", f.LoopbackPorts[name])] = "route " + name + "'s loopback port"
+		}
+	}
+	names := map[string]string{}
+	for _, r := range f.Routes {
+		names[r.Name] = "a front route's"
+	}
+	for i, r := range l.s.L4.Routes {
+		w := fmt.Sprintf("l4.routes[%d]", i)
+		if !l4Name.MatchString(r.Name) || len(r.Name) > 15 {
+			l.errf(w+".name", "%q must be 1 to 15 lowercase letters, digits or '-', starting with a letter, no '-' at its end or beside another (a chart names a Service port after it)", r.Name)
+		}
+		if what, dup := names[r.Name]; dup {
+			l.errf(w+".name", "%q is already %s name", r.Name, what)
+		}
+		names[r.Name] = "another L4 route's"
+		if r.Protocol != "tcp" && r.Protocol != "udp" {
+			l.errf(w+".protocol", "%q: expected tcp or udp", r.Protocol)
+		}
+		if r.Port < 1 || r.Port > 65535 {
+			l.errf(w+".port", "%d is not a port", r.Port)
+		}
+		key := fmt.Sprintf("%s/%d", r.Protocol, r.Port)
+		if other, dup := taken[key]; dup {
+			l.errf(w+".port", "%s is %s", key, other)
+		}
+		taken[key] = "route " + r.Name + "'s port"
+		if m := upstreamRe.FindStringSubmatch(r.Upstream); m == nil {
+			l.errf(w+".upstream", "%q must be <service>:<port>", r.Upstream)
+		} else if p, _ := strconv.Atoi(m[2]); p < 1 || p > 65535 {
+			l.errf(w+".upstream", "%s is not a port", m[2])
+		} else {
+			l.service(w+".upstream", m[1])
+		}
+		if k := r.AddressInput; k != "" {
+			if in, ok := l.s.Input(k); !ok {
+				l.errf(w+".address_input", "%s is not an input", k)
+			} else if in.Secret {
+				l.errf(w+".address_input", "%s is secret: the endpoint is handed to the stack and printed", k)
+			} else if err := CheckL4Address(in.Default); err != nil && !strings.Contains(in.Default, "${") {
+				l.errf(w+".address_input", "%s's default: %v", k, err)
+			}
+		}
+	}
+}
+
+// l4Name is an L4 route's name: a Kubernetes Service port name (an IANA service name), so a chart
+// can name its port after it.
+var l4Name = regexp.MustCompile(`^[a-z](-?[a-z0-9])*$`)
+
 func hasKey(m map[string]any, k string) bool {
 	_, ok := m[k]
 	return ok
@@ -739,6 +835,9 @@ func (l *linter) secretsAndInputs() {
 		if in.Secret && in.Default != "" {
 			l.errf(w, "a secret input must not carry a default")
 		}
+		if in.Profile != "" {
+			l.profileInput(w, in)
+		}
 		if in.Advanced && (in.Required || in.Default != "") {
 			l.errf(w+".advanced", "an advanced input is never asked and takes the compose file's default: no required, no default")
 		}
@@ -803,9 +902,15 @@ func (l *linter) composeVars(keys map[string]string) {
 			}
 			continue
 		}
+		if strings.HasPrefix(v.Name, "STOWAGE_L4_") {
+			if !slices.ContainsFunc(l.s.L4.Routes, func(r spec.L4Route) bool { return spec.L4Var(r.Name) == v.Name && r.AddressInput != "" }) {
+				l.errf(w, "%s names no L4 route with an address_input", v.Name)
+			}
+			continue
+		}
 		if strings.HasPrefix(v.Name, "STOWAGE_") {
 			if _, ok := ProvidedVars[v.Name]; !ok {
-				l.errf(w, "%s is not a variable Stowage provides (%s, STOWAGE_IMAGE_<KEY>, STOWAGE_URL_<ROUTE>)", v.Name, strings.Join(sortedKeys(ProvidedVars), ", "))
+				l.errf(w, "%s is not a variable Stowage provides (%s, STOWAGE_IMAGE_<KEY>, STOWAGE_URL_<ROUTE>, STOWAGE_L4_<ROUTE>)", v.Name, strings.Join(sortedKeys(ProvidedVars), ", "))
 			}
 			continue
 		}
@@ -837,6 +942,33 @@ func (l *linter) inputsConsumed() {
 	}
 }
 
+// profileInput checks an input that turns a compose profile on: a profile name compose accepts,
+// carried by a service of the compose file, on a shape that runs it, and an input that may be
+// left empty (a required one would always turn it on).
+func (l *linter) profileInput(w string, in spec.Input) {
+	if !composeProfile.MatchString(in.Profile) {
+		l.errf(w+".profile", "%q is not a compose profile name ([a-zA-Z0-9][a-zA-Z0-9_.-]*)", in.Profile)
+	}
+	if in.Required {
+		l.errf(w+".profile", "a required input always turns %s on: drop required, or the profile", in.Profile)
+	}
+	if len(in.Shapes) > 0 && !slices.Contains(in.Shapes, "docker") && !slices.Contains(in.Shapes, "kairos") {
+		l.errf(w+".profile", "compose profiles run on the docker and kairos shapes, and this input is asked on neither")
+	}
+	if l.compose == nil {
+		return
+	}
+	for _, svc := range l.compose.Services {
+		if slices.Contains(svc.Profiles, in.Profile) {
+			return
+		}
+	}
+	l.errf(w+".profile", "no service of %s has the profile %s", l.s.Stack.Compose, in.Profile)
+}
+
+// composeProfile is a compose profile's name.
+var composeProfile = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]*$`)
+
 // readInputs reports whether something reads an input: a compose service, a route of the front
 // or the provision hook's env; one asked on Kubernetes only is the chart's, taken as read.
 func (l *linter) readInputs() func(spec.Input) bool {
@@ -852,12 +984,19 @@ func (l *linter) readInputs() func(spec.Input) bool {
 	}
 	// The front reads its routes' inputs.
 	for _, r := range l.s.Front.Routes {
-		inCompose[r.AllowInput] = true
+		inCompose[r.DomainInput], inCompose[r.AllowInput] = true, true
 		if a := r.ForwardAuth; a != nil {
 			inCompose[a.AddressInput], inCompose[a.URIInput] = true, true
 		}
 	}
+	// The installer reads the L4 routes' address inputs.
+	for _, r := range l.s.L4.Routes {
+		inCompose[r.AddressInput] = true
+	}
 	return func(in spec.Input) bool {
+		if in.Profile != "" {
+			return true // the installer reads it: it turns the profile on
+		}
 		if len(in.Shapes) > 0 && !slices.Contains(in.Shapes, "docker") && !slices.Contains(in.Shapes, "kairos") {
 			return true // asked on Kubernetes only, where the chart reads it
 		}
@@ -1024,6 +1163,9 @@ func (l *linter) chart(rel string) {
 	}
 	if l.s.Registry.Pull.Name == "token" && !reads("pullSecret") {
 		l.warnf("shapes.kubernetes.chart", "%s: no template reads .Values.%s.pullSecret: the cluster pulls the images without the pull account", rel, helm.ValuesKey)
+	}
+	if len(l.s.L4.Routes) > 0 && !reads("l4") {
+		l.warnf("shapes.kubernetes.chart", "%s: no template reads .Values.%s.l4: the L4 routes are not published on Kubernetes", rel, helm.ValuesKey)
 	}
 }
 

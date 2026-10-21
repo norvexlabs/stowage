@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"regexp"
+	"strconv"
+	"strings"
 
 	"github.com/norvexlabs/stowage/internal/helm"
 	"github.com/norvexlabs/stowage/internal/providers"
@@ -42,6 +44,9 @@ func (p *Publisher) chartManifest(m *release.Manifest) (registry.Manifest, error
 	for k, d := range m.Artifacts.Images {
 		v.Images[k] = helm.Image{Repository: p.imageName(k), Digest: d}
 	}
+	if v.L4, err = l4Values(s.L4.Routes); err != nil {
+		return registry.Manifest{}, err
+	}
 	if s.Signs() {
 		ck, err := providers.CosignKey(s.Signing)
 		if err != nil {
@@ -68,6 +73,21 @@ func (p *Publisher) chartManifest(m *release.Manifest) (registry.Manifest, error
 			"org.opencontainers.image.version": cv,
 		},
 	}, nil
+}
+
+// l4Values are the L4 routes as the chart's values give them: the protocol as a Service names it,
+// the upstream split into its service and port.
+func l4Values(routes []spec.L4Route) ([]helm.L4Route, error) {
+	var out []helm.L4Route
+	for _, r := range routes {
+		svc, port, _ := strings.Cut(r.Upstream, ":")
+		target, err := strconv.Atoi(port)
+		if err != nil {
+			return nil, fmt.Errorf("l4.routes %s: upstream %q: %w", r.Name, r.Upstream, err)
+		}
+		out = append(out, helm.L4Route{Name: r.Name, Protocol: strings.ToUpper(r.Protocol), Port: r.Port, Service: svc, TargetPort: target})
+	}
+	return out, nil
 }
 
 // pushChart puts the chart in its channel's repository by digest and signs it, and returns where

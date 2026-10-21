@@ -379,6 +379,30 @@ the loop to try before your operators do.
   encrypted backups, `health_gate` to tune the boot check, and `host_api` for services that may
   call the host daemon.
 
+### Stacks that are not only HTTP
+
+A control plane with daemons of its own (raw TCP or UDP, its own TLS, its own config formats, an
+API it is set up through) packages without changing the software, through the compose file:
+
+- **Ports clients dial as they are** are `l4` routes (see "Spec keys"), the endpoint the stack
+  advertises given by the route's `address_input` (`STOWAGE_L4_<ROUTE>`). The front can move off
+  443 with `front.https_port`, when a daemon owns it.
+- **Material minted once** (a CA, a server key and certificate, a token): a one-shot service of a
+  small image (openssl, step-cli) writes it into a named volume, keeping what it finds there, and
+  the services that read it `depends_on` it with `condition: service_completed_successfully` and
+  mount the volume `:ro`. `up --wait` counts a one-shot done when it exits 0. Its inputs (a
+  hostname for a SAN) are inputs like any other; its policy is the project's.
+- **A daemon's own config format**: a thin entrypoint renders it from the environment (the
+  recorded values compose interpolates) and from the volume's material, then `exec`s the daemon
+  unchanged; or compose `configs:` with interpolated `content:`.
+- **Setting up the control plane through its API** (entities, enrolment tokens): a long-lived,
+  idempotent compose service that waits for the API, makes what is missing and hands what the
+  daemons need through a shared volume, one marker file per finished step. The provision hook
+  is not the vehicle: it mounts no project volume and its results go back to it alone.
+- **Health behind authentication**: a `command` health provider, in an image holding a client of
+  the API, or an unauthenticated readiness endpoint.
+- **An optional daemon**: a compose profile an input's `profile` turns on.
+
 ### What to read next
 
 - [The contracts a project must honour](#the-contracts-a-project-must-honour) — every rule
@@ -770,7 +794,21 @@ These are what `lint` checks; each finding names the key path or `file:line` to 
     top-level `name:` (Stowage names each install);
   - every service's `image:` is exactly `${STOWAGE_IMAGE_<KEY>}`, where `<KEY>` is an `images` key
     upper-cased with `-` as `_` (`admin-api` → `STOWAGE_IMAGE_ADMIN_API`). The registry is
-    the single deployment point, so a literal image is an error;
+    the single deployment point, so a literal image is an error. A service with `extends`
+    (`extends: base` or `extends: {service: base}`) takes the `image:` and `build:` it does not set
+    from the service it extends, and its `profiles:` and `ports:` are its own and the base's, as
+    compose joins them; an `extends` naming
+    another file (`file:`, which the release does not carry), a service the file does not declare,
+    or a loop is an error;
+  - a service publishes no port past this host of its own (a `ports:` entry not bound to a
+    loopback address or to `${STOWAGE_LOOPBACK_ADDRESS}`; a bare port, or one lint cannot read,
+    counts as published): with a `kairos` shape that is an error (the VM's firewall opens only
+    what Stowage publishes), on the `docker` shape a warning (`published past Stowage, which
+    neither checks nor lists it`). A port clients reach as it is
+    — TCP or UDP, beside the front — is an `l4` route (see "Spec keys");
+  - a service with `profiles:` runs only while an input turns one of its profiles on (an input's
+    `profile`, see "Spec keys"); a profile no input names is an error (no install would ever
+    start the service);
   - a variable without a default (`${X}`) must be an input, a secret, a safe default or a route's
     `domain_input`; a variable with a default (`${X:-v}`) is an optional tunable;
   - each `safe_defaults` key appears as `${KEY:-<safe value>}`: the safe value is the default and
@@ -779,9 +817,12 @@ These are what `lint` checks; each finding names the key path or `file:line` to 
     route's public URL — use it rather than building one from a domain), `STOWAGE_NAME`,
     `STOWAGE_PROJECT_VERSION`, `STOWAGE_REVISION`, `STOWAGE_TLS_MODE`, `STOWAGE_LOOPBACK_ADDRESS`
     (a loopback address in every mode, for a port only this host may reach: 127.x or `::1`,
-    bare — Compose's port syntax takes `::1:5432:5432`), `STOWAGE_IPV6` (`true` with `--ipv6`, else `false`; Docker and the VM);
-  - an unknown `STOWAGE_…` variable, a `STOWAGE_IMAGE_<KEY>` naming no image or a
-    `STOWAGE_URL_<ROUTE>` naming no route is an error, and so is a compose file with no service;
+    bare — Compose's port syntax takes `::1:5432:5432`), `STOWAGE_IPV6` (`true` with `--ipv6`, else `false`; Docker and the VM),
+    `STOWAGE_L4_<ROUTE>` (an `l4` route's endpoint, `<address>:<port>`, for a route with an
+    `address_input`; Docker and the VM);
+  - an unknown `STOWAGE_…` variable, a `STOWAGE_IMAGE_<KEY>` naming no image, a
+    `STOWAGE_URL_<ROUTE>` naming no route or a `STOWAGE_L4_<ROUTE>` naming no `l4` route with an
+    `address_input` is an error, and so is a compose file with no service;
   - service names starting `stowage-` are Stowage's (it adds the front as `stowage-front`), and so
     are top-level `volumes` and `networks` starting `stowage-` (the front's data volume is
     `stowage-front-data`).
@@ -809,7 +850,12 @@ These are what `lint` checks; each finding names the key path or `file:line` to 
       images:
         <key>: { repository: <name>-<key>, digest: "sha256:…" }   # every image, the front included
       publicKeys: [ "<PEM>" ]           # signing.public_keys, when the project signs
+      l4:                               # the l4 routes, when there are any
+        - { name, protocol: TCP|UDP, port, service, targetPort }   # service: the upstream's compose service
     ```
+    Stowage creates nothing in the cluster for `l4`: the chart publishes each route as it
+    chooses (a `NodePort` or `LoadBalancer` Service to the pods of `service`, as
+    [examples/full](examples/full/deploy/chart/templates/echo.yaml) does);
   - the templates run the release's images by digest:
     `{{ printf "%s/%s@%s" .Values.stowage.registry $img.repository $img.digest }}` with
     `$img := index .Values.stowage.images "<key>"`. `lint` warns when no template reads
@@ -969,7 +1015,7 @@ These are what `lint` checks; each finding names the key path or `file:line` to 
   (lint: anything else is an error; `[]` for none; a key listed twice or not a variable name is an
   error) — of those the install records; besides them it always receives the values Stowage
   provides (on Docker and the VM `STOWAGE_NAME`, `STOWAGE_PROJECT_VERSION`, `STOWAGE_REVISION`,
-  `STOWAGE_LOOPBACK_ADDRESS`, `STOWAGE_TLS_MODE`, `STOWAGE_IPV6`, and each route's `STOWAGE_URL_<ROUTE>`; on
+  `STOWAGE_LOOPBACK_ADDRESS`, `STOWAGE_TLS_MODE`, `STOWAGE_IPV6`, each route's `STOWAGE_URL_<ROUTE>` and each `l4` route's `STOWAGE_L4_<ROUTE>`; on
   Kubernetes the first three) and every value it returned before. No other input, secret or safe
   default reaches it. It must be idempotent (it runs on every install
   re-run), print progress on stderr and only `KEY=VALUE` lines on stdout (at most 1 MiB a run,
@@ -1088,14 +1134,15 @@ database: reset-db has nothing to reset` (`… there is no backup to restore`). 
 | `registry.pull`, `registry.push` | `token` (`user`, `token_env`), `docker-config` (`config`, a Docker config directory; empty: the default Docker login), `none` (pull only). `registry.pull` is baked into every installer: it may not use `registry.push`'s `token_env` or Docker config. With `none`, `ship` refuses a repository the release writes that an anonymous read is refused (see `ship`) |
 | `signing` | `cosign-key` (`key`, `public_keys`), or absent / `none` |
 | `images.<key>` | built (`context`, `dockerfile`, `target`, `args`, `inputs`: the paths whose content enters the image's inputs digest, default the whole context less `.dockerignore`) or `ref` (exclusive with the build keys). An image no service or hook uses is a warning; a `# syntax=` frontend or a `FROM $ARG` cannot be checked (warning) |
-| `stack.compose` | the compose file; a service with `profiles:` is an error (no install turns a profile on, so none would ever start it) |
-| `front` | `tls_modes` (`acme`, `dns-cloudflare`, `byo`, `internal`, `none`), `routes[]` (`name`, `domain_input`, `upstream: <service>:<port>`, `strip_headers`, where a trailing `*` matches a prefix; `forward_auth`: `address_input` (required), `uri_input`, `copy_headers` (header names); `allow_input`), `portal`, `loopback_ports`, `loopback_env`, `publish_ca` (`volume`: a volume the compose file declares; refused when the project offers neither `internal` nor `byo`). Route names must give distinct `STOWAGE_URL_` variables; each `domain_input` routes one upstream. An input `forward_auth` or `allow_input` names must be an input of the `docker` shape and, with a `kairos` shape, of that one too, and neither `required` (empty is how the front leaves it off) nor asked in one mode only (`when`); an `allow_input` input is not `advanced` (never asked, it would refuse everyone). Lint counts these inputs as read |
+| `stack.compose` | the compose file (its contract: "The contracts a project must honour"): `extends` within the file, `profiles:` only those an input's `profile` names, a `ports:` entry past this host an error with a `kairos` shape and a warning on `docker` |
+| `front` | `tls_modes` (`acme`, `dns-cloudflare`, `byo`, `internal`, `none`), `routes[]` (`name`, `domain_input`, `upstream: <service>:<port>`, `strip_headers`, where a trailing `*` matches a prefix; `forward_auth`: `address_input` (required), `uri_input`, `copy_headers` (header names); `allow_input`), `portal`, `loopback_ports`, `loopback_env`, `publish_ca` (`volume`: a volume the compose file declares; refused when the project offers neither `internal` nor `byo`), `http_port` and `https_port` (the host ports a TLS front publishes unless an install's `--http-port` / `--https-port` move them; absent or 0 is 80 and 443; they must differ). Route names must give distinct `STOWAGE_URL_` variables; each `domain_input` routes one upstream. An input `forward_auth` or `allow_input` names must be an input of the `docker` shape and, with a `kairos` shape, of that one too, and neither `required` (empty is how the front leaves it off) nor asked in one mode only (`when`); an `allow_input` input is not `advanced` (never asked, it would refuse everyone). Lint counts these inputs as read |
+| `l4` | `routes[]`: host ports published to a service as they are, beside the front and never through it — `name` (1 to 15 lowercase letters, digits or `-`, starting with a letter, no `-` at its end or beside another, as a chart names a Service port after it; neither another L4 route's nor a front route's name), `protocol` (`tcp` or `udp`), `port` (the host port, 1–65535; one route per protocol and port), `upstream: <service>:<port>` (a compose service), `address_input` (optional: an input, not `secret`, holding the host name or address clients dial — a lowercase host name whose last label is not all digits, or an IP address; no port, scheme or zone. It is checked when given, and lint checks its `default`; the install records the route's endpoint `STOWAGE_L4_<ROUTE>` from it, and lint counts it as read). With a `kubernetes` shape, a chart whose templates never read `.Values.stowage.l4` is warned. Over TCP a route's port may not be one the front publishes by default: `front.http_port` / `https_port` (80 and 443) in a TLS mode, a route's `loopback_ports` in loopback mode, and 80 and 443 while `acme` is offered (its challenges need them). The same port over UDP is free. See "L4 routes" under the installer |
 | `health` | `http-json` (`service`, `port`, `path`, `liveness_path`, `expect`: the JSON fields a ready answer carries), `http-status` (the same, `expect` a 200–399 status, default 200), `command` (`image`, `cmd`, `timeout_s`). The VM's health gate and `<short>-stow health` run it; the Docker installer waits on the compose healthchecks (`up --wait`) |
 | `database` | optional (see "A project without a database" above); given, `engine` (`postgres` only), `service`, `name`, `roles.migrate`, `roles.app` (all required; one role twice is allowed), `schema_compat` (`sql`, `command`, `none`; `sql`'s `baseline`, an integer ≥ 0 where absent or 0 means 1 (every other provider is at 1), is the schema epoch the release's migrations start from: see the upgrade notes on schema baselines) |
 | `data` | optional: `volumes.<name>.{uid, keep_on_reset}`, `reset` (volumes not `keep_on_reset`; empty is a warning, and `reset-db` refuses it; without a `database`, an error when not empty): the volumes `reset-db` wipes on Docker and the VM (on Kubernetes it deletes every claim of the release). `uid` is validated only (on Docker, a new named volume takes the owner of the image's directory it mounts on, so an image that runs as a user creates that directory owned by it) |
 | `secrets[]` | `key`, `gen`: `hex32`, `hex16` (random bytes, hex), `pass18`, `pass32` (alphanumeric), `b64-32` (base64url); `rotation: true` lets `secrets rotate` replace it (`KEY_NEXT` and `KEY_PREVIOUS` are then reserved names, recorded empty beside it, and the compose file must read both). Generated once at the first install, or at the upgrade that adds it |
 | `safe_defaults` | `KEY: value`, the value the compose file defaults to |
-| `inputs[]` | `key`, `prompt` (required), `default` (may name `${KEY}`), `required`, `optional` (exclusive with `required`; otherwise no effect), `secret` (no default), `when: tls\|loopback` (asked only in that mode), `shapes` (`docker`, `kubernetes`, `kairos`; asked only on those), `advanced` (a tunable: never asked, recorded only when `--set`, `--answers` or the VM's settings give it — never from an exported variable — its default the compose file's — so no `required` or `default`, and the compose file must write it `${KEY:-default}`; a re-run giving it empty removes it). An input left empty is recorded empty. An input asked on the `docker` or `kairos` shape that no compose service, no route and no provision hook's `env` reads is a warning (one asked on `kubernetes` only is the chart's) |
+| `inputs[]` | `key`, `prompt` (required), `default` (may name `${KEY}`), `required`, `optional` (exclusive with `required`; otherwise no effect), `secret` (no default), `when: tls\|loopback` (asked only in that mode), `shapes` (`docker`, `kubernetes`, `kairos`; asked only on those), `profile` (a compose profile name, `[a-zA-Z0-9][a-zA-Z0-9_.-]*`, that a service of the compose file carries: the input turns it on while it holds a value — see "Optional services" under the installer; not `required`, and asked on the `docker` or `kairos` shape; lint counts it as read), `advanced` (a tunable: never asked, recorded only when `--set`, `--answers` or the VM's settings give it — never from an exported variable — its default the compose file's — so no `required` or `default`, and the compose file must write it `${KEY:-default}`; a re-run giving it empty removes it). An input left empty is recorded empty. An input asked on the `docker` or `kairos` shape that no compose service, no route and no provision hook's `env` reads is a warning (one asked on `kubernetes` only is the chart's) |
 | `extensions[]` | the apps an install of this project can be pointed at (see "Extensions"): `name` (an app name, as `name` is; not this project's; none twice), `input` (required: an input holding the extension's endpoint, empty while it is off — `optional`, not `secret`, no `default`, and read by a compose service, a route or the provision hook's `env`, or asked on `kubernetes` only, where the chart reads it), `prompt` (required: what the install's tip calls it; the `input` is neither `advanced` nor asked in one mode only, `when`, so every install records it), `key_input` (an `optional` `secret` input holding its credential, asked on the same shapes as `input`, neither `advanced` nor `when`, and read as `input` is). No input is named by two extensions, or twice by one |
 | `endpoint` | a route of `front.routes`: this project's endpoint when another project uses it as an extension. Its installer prints the route's URL at the end of an install (see "Extensions") |
 | `hooks.provision` | `container` (`image`, `cmd`, `env`: the inputs, secrets and safe defaults it receives, required, `[]` for none; `returns`: keys it may return, which `provision --set` sets before it returned them; `outputs`) |
@@ -1147,7 +1194,8 @@ again, to copy an installer to another host.
 - Defaults: `--dir ./<name>`, `--address 127.0.0.1` (a 127.x address or `::1`, recorded bare
   in `STOWAGE_LOOPBACK_ADDRESS` — Compose's port syntax takes `::1:8080:80` — and bracketed in
   the routes' URLs, `http://[::1]:8080`; `localhost` is 127.0.0.1, and its URL `http://localhost:…`;
-  any other address, a zone included, is refused), `--http-port 80`, `--https-port 443`. `--ports` and `--address` are for loopback
+  any other address, a zone included, is refused), `--http-port` the project's `front.http_port`,
+  else 80, `--https-port` its `front.https_port`, else 443. `--ports` and `--address` are for loopback
   mode only, and `--http-port` / `--https-port` for TLS mode only; the two ports must differ.
   `--cert` or `--key` alone picks `byo`.
 - `--ipv6` turns IPv6 on for the stack's default network (`enable_ipv6` in the front's compose
@@ -1197,7 +1245,8 @@ again, to copy an installer to another host.
   re-run of the installer with --dir D finishes it` (or `… runs, or was stopped; …`), each
   route's URL (after it, while an install given `--secrets` awaits its data, `not provisioned: a
   backup of the install --secrets came from is awaited; once loaded, `<short>-stow provision --dir D`
-  provisions it`), `endpoint  <URL>` when the spec names an `endpoint` (that route's URL), a `tunable   KEY=value` line per advanced input (`(not set)` when none is
+  provisions it`), each `l4` route as `<name> <protocol>/<port>` followed by its endpoint when it has
+  an `address_input` (`echo      tcp/17007 localhost:17007`), `endpoint  <URL>` when the spec names an `endpoint` (that route's URL), a `tunable   KEY=value` line per advanced input (`(not set)` when none is
   recorded — the compose file's default, or off for one the front reads — a secret one
   `<redacted>`), in byo mode `cert      <its names>, valid until <date> (<N> days)` and, from 30
   days before that date or once it passed, `warning: the certificate expires in N day(s), …` (or
@@ -1304,8 +1353,8 @@ again, to copy an installer to another host.
   - An advanced input given empty is removed from `.env`: the compose file's default applies
     again.
   - What derives from them is computed again: each route's `STOWAGE_URL_<ROUTE>`, the
-    `STOWAGE_PORT_<ROUTE>` or `STOWAGE_HTTP_PORT`/`STOWAGE_HTTPS_PORT`. The generated secrets
-    are kept.
+    `STOWAGE_PORT_<ROUTE>` or `STOWAGE_HTTP_PORT`/`STOWAGE_HTTPS_PORT`, each `l4` route's
+    `STOWAGE_L4_<ROUTE>` and `COMPOSE_PROFILES`. The generated secrets are kept.
   - A value given as recorded is no change. Each change is logged as `changing KEY: old → new`
     (a secret input's values `<redacted>`) once the host checks passed. `.env.prev` (0600,
     secrets included) keeps the `.env` a change replaced: a change writes it from the `.env` it
@@ -1495,6 +1544,29 @@ again, to copy an installer to another host.
   `--ca` is refused outside `byo` and for a project without `publish_ca`.
 - Loopback mode (`none`, the default when the project offers it and no domain is given): each
   route on its own port of a 127.x address, plain HTTP; `loopback_env` relaxes safe defaults.
+- L4 routes (`l4.routes`): in every mode, loopback included, each route's host port is published
+  on every address to its upstream, over its protocol, in the front's compose file
+  (`stowage-front.yaml`; compose adds it to the service's own); the front never sees that traffic.
+  With `--ipv6`, Docker forwards them over IPv6 too. A route with an `address_input` gets
+  `STOWAGE_L4_<ROUTE>` = `<the input's value>:<port>` (an IPv6 address bracketed,
+  `[fd00::7]:7443`), recorded in `.env` and empty while the input is; the address is never
+  guessed (behind NAT the host's own is not the one clients dial). A first install refuses a
+  route's TCP port a process of the host already listens on (`port(s) 7443 (data) already in use
+  on this host: the project's L4 routes publish them`), and so does an upgrade for a route the
+  stack does not publish already; an install, re-run or upgrade refuses front ports on one of them
+  (an upgrade's refusal says to move the front with a re-run of the installer the install runs,
+  then upgrade) (`the front's https port 7443 is the L4 route data's: choose another with
+  --https-port`, `--http-port`, or `--ports` in loopback mode). Stowage neither probes nor
+  restricts them: the stack's health is the `health` provider's, and on Docker the host's
+  firewall is the operator's.
+- Optional services (an input's `profile`): the install records `COMPOSE_PROFILES` in `.env`, the
+  profiles whose input holds a value, comma-separated and sorted (recorded empty while none is;
+  not recorded for a project whose inputs name no profile). Every `docker compose` the installer
+  runs starts exactly those, a shell's `COMPOSE_PROFILES` never overriding it; one an operator runs
+  in the install directory reads them from `.env`, unless their shell exports `COMPOSE_PROFILES`
+  (compose prefers the environment). A run that turns a profile off removes its services'
+  containers before the stack comes up (`docker compose --profile <each> rm --stop --force
+  <services>`: `up` would leave them running).
 - TLS mode: each route on its own domain over HTTPS, only the HTTP and HTTPS ports published (80
   and 443 on every address, HTTP/1.1 and HTTP/2; `--http-port` / `--https-port` move them: with
   `acme` the public ports stay 80 and 443, forwarded to them, otherwise the moved HTTPS port is the

@@ -155,11 +155,16 @@ func (in *Installer) changes(env *EnvFile) (next *EnvFile, secrets map[string]bo
 			return nil, nil, publish{}, err
 		}
 	}
+	if err := in.l4Clash(pub); err != nil {
+		return nil, nil, publish{}, err
+	}
 	domains, err := in.routeDomains(mode, func(k string) string { v, _ := next.Get(k); return v })
 	if err != nil {
 		return nil, nil, publish{}, err
 	}
 	in.frontVars(next, mode, pub, domains)
+	in.profilesVar(next)
+	in.l4Vars(next)
 	if err := next.Check(); err != nil {
 		return nil, nil, publish{}, err
 	}

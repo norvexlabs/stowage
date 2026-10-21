@@ -3,6 +3,27 @@
 Stowage's own releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
+## [0.7.0]
+
+### Added
+- **L4 routes** (`l4.routes`): host ports published to a service as they are, over TCP or UDP,
+  beside the front, in every mode; a route's endpoint for the stack (`STOWAGE_L4_<ROUTE>`) from
+  an input holding the address clients dial; `status` lists them, and a chart receives them in
+  `stowage.l4`. Front ports and L4 ports never clash: lint and the installer refuse it.
+- `front.http_port` and `front.https_port`: a project's own defaults for the TLS front's host
+  ports, which `--http-port` and `--https-port` still move.
+- **Optional services**: an input's `profile` turns a compose profile on while it holds a value;
+  turned off, its services are removed.
+- Compose `extends` within the file: a service takes the image of the one it extends.
+
+### Changed
+- A service that publishes a port of its own past this host (not on a loopback address) is an
+  error with a `kairos` shape (the VM's
+  firewall opens only what Stowage publishes) and a warning on `docker`: declare it in
+  `l4.routes`.
+- An input named by a route's `domain_input` and also declared under `inputs` is no longer
+  warned as read by nothing.
+
 ## [0.6.0] - 2026-10-21
 
 ### Added

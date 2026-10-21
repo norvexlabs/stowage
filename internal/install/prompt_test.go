@@ -289,3 +289,16 @@ func TestAnAdvancedInputIsNeverAskedAndRecordedOnlyWhenGiven(t *testing.T) {
 		t.Fatalf("WORKERS stayed recorded:\n%s", e.file(".env"))
 	}
 }
+
+// An L4 route's port taken while the form is open is refused before anything is written.
+func TestAnL4PortTakenDuringTheForm(t *testing.T) {
+	e := newEnv(t)
+	e.r.Spec.L4.Routes = []spec.L4Route{{Name: "data", Protocol: "tcp", Port: 7443, Upstream: "api:7000"}}
+	delete(e.vars, "ADMIN_EMAIL")
+	p := &fakePrompter{answers: map[string]string{"ADMIN_EMAIL": "a@x"}}
+	p.onAsk = func() { e.busy[7443] = true }
+	if err := e.install(func(o *Options) { o.Prompt = p; o.TLS = Loopback }); err == nil || !strings.Contains(err.Error(), "7443 (data) already in use") {
+		t.Fatalf("err = %v", err)
+	}
+	e.nothingWritten()
+}

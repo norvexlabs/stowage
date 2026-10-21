@@ -1,0 +1,40 @@
+# The echo service, over TCP and UDP; and a NodePort Service for each of the release's L4 routes
+# (stowage.l4), to the component its upstream names.
+{{- $c := dict "root" $ "component" "echo" }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-echo
+  labels:
+    {{- include "atlas.labels" $c | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "atlas.labels" $c | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "atlas.labels" $c | nindent 8 }}
+    spec:
+      {{- include "atlas.pod" . | nindent 6 }}
+      containers:
+        - name: echo
+          image: {{ include "atlas.image" (dict "root" $ "key" "ingest") }}
+          command: [atlas-server, echo, "17007"]
+          ports:
+            - { containerPort: 17007, protocol: TCP }
+            - { containerPort: 17007, protocol: UDP }
+{{- range .Values.stowage.l4 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $.Release.Name }}-l4-{{ .name }}
+spec:
+  type: NodePort
+  selector:
+    {{- include "atlas.labels" (dict "root" $ "component" .service) | nindent 4 }}
+  ports:
+    - { name: {{ .name }}, protocol: {{ .protocol }}, port: {{ .port }}, targetPort: {{ .targetPort }} }
+{{- end }}

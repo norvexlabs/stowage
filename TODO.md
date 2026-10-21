@@ -44,38 +44,31 @@ A finished item is deleted, not ticked. The plan behind it is
 
 ## Should
 
-- **Non-HTTP stacks: L4 routes, optional services, volume backup** — two sessions, one release
-  (0.7.0) cut after the second; each session batches its tasks so a long e2e runs once. Generic
-  only: a fictional TCP/UDP echo in `examples/full`, no product's ports or policy.
-  - *Session 1 (short suites only; touch no `vm*.go`, `hostd*.go`, `seed*.go`, `internal/kairos`,
-    `os.go`, `openPorts`)*:
-    - lint follows `extends` (image inherited in-file, `file:` refused);
-    - `readInputs` counts a route's `domain_input`, which removes a false warning;
-    - optional service: `inputs[].profile` → `COMPOSE_PROFILES` when the input is non-empty, and
-      `profiles:` accepted only when an input claims it;
-    - top-level `l4.routes[] {name, protocol tcp|udp, port, upstream, address_input?,
-      allow_input?}`, rendered as a `stowage-l4.yaml` ports overlay;
-    - `STOWAGE_L4_<NAME>` = `<address_input>:<port>` (never auto-detected: wrong behind NAT);
-    - lint errors: a clash with the front's ports, `acme` with an L4 tcp/443, and `allow_input`
-      on Docker (the host firewall is the operator's);
-    - a compose `ports:` not declared as an L4 route: an error on kairos, a warning on docker
-      (short and long syntax, fuzzed);
-    - `front.http_port`/`https_port` project defaults;
-    - a TCP listen probe, logged and not a gate (no UDP probe);
-    - `status` lists the routes;
-    - `.Values.stowage.l4` for charts;
-    - a README section on packaging a control plane in the thin layer.
-  - *Session 2 (one e2e-kairos → e2e-vm chain)*:
-    - the VM firewall opens L4 ports for both families;
-    - `allow_input` is enforced in a new `forward` chain (policy accept, drop on `ct original
-      proto-dst` + saddr), since DNAT'd traffic never meets `input`;
-    - `backup.volumes` (age-encrypted tar of declared volumes beside `pg_dump`, restored at the
-      same point in time; Docker and VM);
-    - host requirements read from compose (`network_mode: host` refused on kairos, devices in
-      the `vm create` plan).
-    - Spot tests: `nft -c -f` on the rendered ruleset; Docker backup via `make e2e-full`.
-  - Not built: x509/key generators (product PKI; DR is covered by volume backup), a pre-start
-    hook, front client-cert auth, a pure-L4 project with no front.
+- **Non-HTTP stacks, second session (one e2e-kairos → e2e-vm chain), then the 0.7.0 release.**
+  The L4 routes, optional services, `extends` and the front's default ports are in (unreleased
+  0.7.0). Batch the rest so the long chain runs once:
+  - the VM firewall opens the L4 ports for both families (`openPorts`' rule file, the input
+    chain: the userland-proxy path);
+  - `l4.routes[].allow_input`, enforced on the VM only, in a new `forward` base chain (policy
+    accept, drop on `ct original proto-dst` + saddr): DNAT'd traffic never meets `input`. On a
+    project with a `docker` shape its input is asked on `kairos` only (lint), as the Docker host's
+    firewall is the operator's;
+  - `backup.volumes`: an age-encrypted tar of declared volumes beside `pg_dump`, restored at the
+    same point in time, on Docker and the VM (the DR of material a one-shot minted);
+  - host requirements read from compose: `network_mode: host` refused with a `kairos` shape and
+    warned on `docker` (it listens past Stowage without a `ports:` entry), the devices listed in
+    `vm create`'s plan;
+  - the VM verbs' `--http-port` / `--https-port` help (`vmcli.go`) names the project's
+    `front.http_port` / `https_port` default;
+  - spot tests: `nft -c -f` on the rendered ruleset; Docker backup via `make e2e-full`.
+  - (Should) the compose model the installer reads (`ServiceProfiles`, `CheckL4Address`, the
+    `extends` resolution) in a small package of its own: the installer imports `internal/lint`
+    for them today, linking the publisher's lint code (and `dockerfile`, `lock`, `digest`) into
+    `stowage-install`;
+  - (Could) the first install's free-port check covers the L4 routes' UDP ports too (TCP only
+    today: a UDP port already bound fails at `compose up`).
+  Not built: x509/key generators (product PKI; DR is covered by volume backup), a pre-start hook,
+  front client-cert auth, a project with no front.
 
 - **Kubernetes schema check for a `command` schema-compat provider**: `shapes.kubernetes.schema`
   runs the `sql` provider's queries in a pod; a `command` provider's ops (JSON on stdin) are not

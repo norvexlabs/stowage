@@ -185,6 +185,9 @@ func (in *Installer) Upgrade(ctx context.Context) error {
 	if err := in.checkDocker(ctx); err != nil {
 		return err
 	}
+	if err := in.l4Upgrade(ctx, env, mode); err != nil {
+		return err
+	}
 	in.recorded = map[string]string{}
 	for _, k := range env.Keys() {
 		in.recorded[k], _ = env.Get(k)
@@ -410,6 +413,8 @@ func (in *Installer) upgradeEnv(env *EnvFile, mode string, added []input, values
 	for _, k := range s.ImageNames() {
 		next.Set(ImageVar(k), in.imageRef(prefix, k))
 	}
+	in.profilesVar(next)
+	in.l4Vars(next)
 	return next, secrets, next.Check()
 }
 

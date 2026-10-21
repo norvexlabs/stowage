@@ -260,6 +260,18 @@ type Values struct {
 	Images   map[string]Image `yaml:"images"`
 	// PublicKeys are the trusted release keys (PEM), when the project signs.
 	PublicKeys []string `yaml:"publicKeys,omitempty"`
+	// L4 are the project's L4 routes, for the chart to publish as it chooses (a Service each).
+	L4 []L4Route `yaml:"l4,omitempty"`
+}
+
+// L4Route is an L4 route: its protocol (TCP or UDP, as a Service names it), its port, and the
+// compose service and port it reaches.
+type L4Route struct {
+	Name       string `yaml:"name"`
+	Protocol   string `yaml:"protocol"`
+	Port       int    `yaml:"port"`
+	Service    string `yaml:"service"`
+	TargetPort int    `yaml:"targetPort"`
 }
 
 // Release identifies the release a chart belongs to.

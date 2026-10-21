@@ -59,12 +59,13 @@ Full examples: [full](../examples/full/stowage.yaml) (every key),
 | `version`, `changelog`, `channels` | § 3 |
 | `registry` | prefix, pull credentials (baked into the installer), push auth |
 | `images` | build table: `context`/`dockerfile`/`target`/`args`/`inputs`, or `ref` for a pinned upstream image |
-| `stack.compose` | **the single service definition**, no `build:` (lint-enforced) |
-| `front` | TLS modes offered, hostname → upstream routes, header stripping, forward auth and a source allowlist per route, which route is the portal, the CA published to the stack |
+| `stack.compose` | **the single service definition**, no `build:` (lint-enforced); `extends` within the file, `profiles:` only those an input turns on, no `ports:` of its own on the VM |
+| `front` | TLS modes offered, hostname → upstream routes, header stripping, forward auth and a source allowlist per route, which route is the portal, the CA published to the stack, the project's default host ports |
+| `l4` | host ports published to a service as they are (TCP or UDP), beside the front; the input holding the address clients dial |
 | `health` | readiness probe (provider) used by every consumer: compose healthcheck, health gate, install wait |
 | `database` | optional: engine, service, db name, migration and app roles, schema-compat provider; without it, no backup, `data.reset`, `reset-db`, restore or schema check |
 | `data` | persistent volumes with owner uid, which ones `reset-db` wipes |
-| `inputs` | what the installer asks: key, prompt, default, secret, required, which shapes |
+| `inputs` | what the installer asks: key, prompt, default, secret, required, which shapes, the compose profile it turns on |
 | `secrets` | generated once: key + generator (`hex32`, `pass18`, …) |
 | `safe_defaults` | values the compose template defaults to; only the installer's loopback mode relaxes them |
 | `hooks` | the only application code: `provision`, `maintenance` |
@@ -80,7 +81,10 @@ domain or a Stowage-provided variable (`${VAR:-x}` is an optional tunable); ever
 by compose, a route or the provision hook's `env` (a Kubernetes-only input is the chart's);
 the provision hook's `env` names only inputs, secrets and safe defaults; every `safe_defaults` key appears in compose as
 `${KEY:-<value>}`; routes, the portal, the health and database services resolve to compose
-services; image refs are pinned by digest; the current version validates under the scheme and has a
+services; L4 routes resolve to compose services and take no port the front publishes by default
+over TCP (nor 80 and 443 while `acme` is offered); a service publishes no port of its own (an error
+with a `kairos` shape, a warning on `docker`); every compose profile is one an input turns on;
+image refs are pinned by digest; the current version validates under the scheme and has a
 changelog section; every built image starts from base images pinned by digest; spec paths are
 relative and stay inside the project. Each rule is held by a case in the tables of
 `internal/lint/lint_test.go`.
@@ -89,9 +93,10 @@ Variables Stowage provides on every shape (the `STOWAGE_` prefix is reserved):
 `STOWAGE_IMAGE_<KEY>` (the image's pinned reference; key upper-cased, `-` → `_`),
 `STOWAGE_URL_<ROUTE>` (the route's public URL: `https://<domain>` behind TLS,
 `http://<address>:<port>` in loopback mode — projects read it rather than assembling URLs),
-`STOWAGE_NAME`, `STOWAGE_PROJECT_VERSION`, `STOWAGE_REVISION`, `STOWAGE_LOOPBACK_ADDRESS`. Service
-names starting `stowage-` are Stowage's: the front is the `stowage-front` service, added beside the
-project's compose file.
+`STOWAGE_NAME`, `STOWAGE_PROJECT_VERSION`, `STOWAGE_REVISION`, `STOWAGE_LOOPBACK_ADDRESS`, and on
+Docker and the VM `STOWAGE_L4_<ROUTE>` (an L4 route's `<address>:<port>`, from its address input).
+Service names starting `stowage-` are Stowage's: the front is the `stowage-front` service, added
+beside the project's compose file.
 
 ### 2.1 One pattern for everything project-specific
 
@@ -892,8 +897,8 @@ every shape, the VM end-to-end test upgrading through it), then the health gate.
   token (§ 5.1).
 - **Registry auth** — no mTLS: a pull account + a publisher token (API key), standard login only;
   reference registry zot (§ 5.2).
-- **Optional components are extensions, not compose profiles** — an input turning a profile on
-  made every optional component part of the core release: its images in every release and OS
+- **Optional components are extensions; an optional service of the release is a profile** — an
+  input turning a profile on made every optional component part of the core release: its images in every release and OS
   bundle, its sizing on every VM, its toggle in every chart. An optional component is its own
   project (`extensions:` in the host, `endpoint:` in the extension), published beside the host
   under its own name; the host takes its URL as an ordinary input, so configuring it is all the
@@ -902,6 +907,20 @@ every shape, the VM end-to-end test upgrading through it), then the health gate.
   bound, and only its answer that it is not is said. On Kubernetes the endpoint is derived from
   the route's upstream (the chart exposes `<release>-<service>`), and it is given at the install
   (an upgrade keeps a recorded input). Installing the extension from the host's installer is later work.
+  A profile stays for a service of the release itself, whose image ships anyway (a sidecar run
+  only when its input is given, as an events forwarder pointed at an external collector): an
+  input's `profile` turns it on while the input holds a value. The installer records
+  `COMPOSE_PROFILES` in `.env`, so every compose call — the installer's, the host daemon's, an
+  operator's in the directory — sees the same profiles, and it removes a profile's containers
+  when the profile goes off, as `up` leaves them running.
+- **L4 routes beside the front, not through it** — the front is HTTP (Caddy, h1/h2): a data
+  channel of raw TCP or UDP, often with its own TLS, is published by Docker straight to its
+  service, in the front's compose file so the project's own stays untouched. The route is declared
+  rather than derived from compose `ports:`, which carry no name, no endpoint and nothing the VM's
+  firewall could be told; so a service's own `ports:` is refused with a `kairos` shape and warned
+  on Docker. The endpoint the stack advertises comes from an input, never from the host's own
+  address, which behind NAT or on a cloud is not the one clients dial. No probe: a UDP connect
+  proves nothing, and the stack's readiness is its health provider's.
 - **Docker backups** — the VM's host daemon's code, run in the Docker installer's process for one
   command, the schedule a systemd timer of the install's own: no daemon stays on a Docker host,
   and nothing of the backup path is written twice.

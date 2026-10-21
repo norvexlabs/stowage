@@ -15,6 +15,7 @@ import (
 
 	"github.com/norvexlabs/stowage/internal/helm"
 	"github.com/norvexlabs/stowage/internal/registry"
+	"github.com/norvexlabs/stowage/internal/spec"
 	"github.com/norvexlabs/stowage/internal/testutil"
 )
 
@@ -417,4 +418,14 @@ func TestTheSweepDeletesOnlyChartVersionsItCanTellUnnamed(t *testing.T) {
 	p.sweepCharts(ctx, "beta")
 	eq(t, "nothing swept past an unreadable manifest", e.digest("charts/notes-beta", "0.9.0"), d)
 	eq(t, "warned", strings.Contains(e.log.String(), "warning: chart versions of"), true)
+}
+
+// The chart's values give each L4 route its protocol as a Service names it and its upstream's
+// service and port.
+func TestL4Values(t *testing.T) {
+	t.Parallel()
+	got, err := l4Values([]spec.L4Route{{Name: "data", Protocol: "udp", Port: 443, Upstream: "relay:4430"}})
+	if err != nil || len(got) != 1 || got[0] != (helm.L4Route{Name: "data", Protocol: "UDP", Port: 443, Service: "relay", TargetPort: 4430}) {
+		t.Fatalf("%+v %v", got, err)
+	}
 }

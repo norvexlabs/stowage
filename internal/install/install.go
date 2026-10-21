@@ -33,6 +33,7 @@ import (
 
 	"github.com/norvexlabs/stowage/internal/backup"
 	"github.com/norvexlabs/stowage/internal/front"
+	"github.com/norvexlabs/stowage/internal/lint"
 	"github.com/norvexlabs/stowage/internal/payload"
 	"github.com/norvexlabs/stowage/internal/providers"
 	"github.com/norvexlabs/stowage/internal/registry"
@@ -294,6 +295,9 @@ func (in *Installer) Install(ctx context.Context) error {
 	if err := in.portsFree(pub); err != nil {
 		return err
 	}
+	if err := in.l4Free(in.R.Spec.L4.Routes); err != nil {
+		return err
+	}
 	if o.DryRun {
 		for _, k := range env.Keys() {
 			v, _ := env.Get(k)
@@ -417,12 +421,40 @@ func (in *Installer) preflight(ctx context.Context, mode string) (publish, error
 	if err != nil {
 		return publish{}, err
 	}
-	return pub, in.portsFree(pub)
+	if err := in.l4Clash(pub); err != nil {
+		return publish{}, err
+	}
+	if err := in.portsFree(pub); err != nil {
+		return publish{}, err
+	}
+	return pub, in.l4Free(in.R.Spec.L4.Routes)
+}
+
+// l4Free refuses a TCP port of routes a process of the host already listens on, on any of its
+// addresses.
+func (in *Installer) l4Free(routes []spec.L4Route) error {
+	hosts := []string{"127.0.0.1", "::1"}
+	for _, h := range hostAddrs() {
+		if !slices.Contains(hosts, h) {
+			hosts = append(hosts, h)
+		}
+	}
+	var busy []string
+	for _, r := range routes {
+		if r.Protocol == "tcp" && slices.ContainsFunc(hosts, func(h string) bool { return !in.O.portFree(h, r.Port) }) {
+			busy = append(busy, fmt.Sprintf("%d (%s)", r.Port, r.Name))
+		}
+	}
+	if len(busy) > 0 {
+		return fmt.Errorf("port(s) %s already in use on this host: the project's L4 routes publish them", strings.Join(busy, ", "))
+	}
+	return nil
 }
 
 func (in *Installer) publish(mode string) (publish, error) {
 	if mode != Loopback {
-		return tlsPublish(cmp.Or(in.O.HTTPPort, 80), cmp.Or(in.O.HTTPSPort, 443))
+		f := in.R.Spec.Front
+		return tlsPublish(cmp.Or(in.O.HTTPPort, f.HTTPPort, 80), cmp.Or(in.O.HTTPSPort, f.HTTPSPort, 443))
 	}
 	addr, err := loopbackAddr(in.O.Address)
 	if err != nil {
@@ -544,6 +576,8 @@ func (in *Installer) decide(ctx context.Context, dir, mode string, pub publish, 
 	}
 	// A rotation under way when the secrets were exported goes on from where it was.
 	rotationVars(in.secrets(), func(k string) bool { _, ok := env.Get(k); return ok }, func(k, _ string) { env.Set(k, in.restoredSecret(k)); secrets[k] = true })
+	in.profilesVar(env)
+	in.l4Vars(env)
 	return env, secrets, env.Check()
 }
 
@@ -946,7 +980,7 @@ func (in *Installer) renderStack(env *EnvFile, dir string) error {
 			}
 		}
 	}
-	fc, err := frontCompose(f, mode, in.hostAPI(), "sha256:"+hex.EncodeToString(h.Sum(nil)), ca, get(IPv6Var) == "true")
+	fc, err := frontCompose(f, in.R.Spec.L4.Routes, mode, in.hostAPI(), "sha256:"+hex.EncodeToString(h.Sum(nil)), ca, get(IPv6Var) == "true")
 	if err != nil {
 		return err
 	}
@@ -988,6 +1022,9 @@ func (in *Installer) up(ctx context.Context, env *EnvFile) error {
 	}
 	defer cleanup()
 	if err := in.ipv6Network(ctx, env); err != nil {
+		return err
+	}
+	if err := in.profilesOff(ctx, env); err != nil {
 		return err
 	}
 	run := func() error {
@@ -1033,6 +1070,174 @@ func (in *Installer) ipv6Network(ctx context.Context, env *EnvFile) error {
 		return fmt.Errorf("stopping the stack to make its network again: %w", err)
 	}
 	return nil
+}
+
+// ProfilesVar is compose's own variable naming the profiles it starts.
+const ProfilesVar = "COMPOSE_PROFILES"
+
+// profilesVar records the compose profiles the inputs turn on: each input's profile while the
+// input holds a value. It is recorded empty while none is on, so a shell's COMPOSE_PROFILES never
+// starts one, and not at all for a release whose inputs turn none on.
+func (in *Installer) profilesVar(env *EnvFile) {
+	if len(in.R.Spec.Profiles()) == 0 {
+		env.Delete(ProfilesVar)
+		return
+	}
+	var on []string
+	for _, i := range in.R.Spec.Inputs {
+		if v, _ := env.Get(i.Key); i.Profile != "" && v != "" && !slices.Contains(on, i.Profile) {
+			on = append(on, i.Profile)
+		}
+	}
+	slices.Sort(on)
+	env.Set(ProfilesVar, strings.Join(on, ","))
+}
+
+// profilesOff removes the containers of the services whose profiles are all off: `up` leaves a
+// service of a profile turned off running, as it is still the project's. Each profile is named
+// to compose for the removal, so it finds the services.
+func (in *Installer) profilesOff(ctx context.Context, env *EnvFile) error {
+	all := in.R.Spec.Profiles()
+	if len(all) == 0 {
+		return nil
+	}
+	profiles, err := lint.ServiceProfiles(in.R.Compose)
+	if err != nil {
+		return err
+	}
+	v, _ := env.Get(ProfilesVar)
+	on := strings.Split(v, ",")
+	var off []string
+	for _, name := range sortedKeys(profiles) {
+		if !slices.ContainsFunc(profiles[name], func(p string) bool { return slices.Contains(on, p) }) {
+			off = append(off, name)
+		}
+	}
+	if len(off) == 0 {
+		return nil
+	}
+	args := in.composeBase()
+	for _, p := range all {
+		args = append(args, "--profile", p)
+	}
+	args = append(append(args, "rm", "--stop", "--force"), off...)
+	if _, err := in.O.Docker.Run(ctx, Cmd{Args: args, Env: env.Environ(in.O.environ())}); err != nil {
+		return fmt.Errorf("removing %s, whose profiles are off: %w", strings.Join(off, ", "), err)
+	}
+	return nil
+}
+
+// l4Vars records each L4 route's endpoint the stack reads, <address>:<port> from its address
+// input (bracketed when an IPv6 address), empty while that input is; a route without an address
+// input has none.
+func (in *Installer) l4Vars(env *EnvFile) {
+	for _, r := range in.R.Spec.L4.Routes {
+		if r.AddressInput == "" {
+			continue
+		}
+		v := ""
+		if a, _ := env.Get(r.AddressInput); a != "" {
+			v = net.JoinHostPort(a, strconv.Itoa(r.Port))
+		}
+		env.Set(spec.L4Var(r.Name), v)
+	}
+}
+
+// l4Clash refuses front ports one of the L4 routes publishes over TCP.
+func (in *Installer) l4Clash(p publish) error {
+	for _, r := range in.R.Spec.L4.Routes {
+		for _, k := range sortedKeys(p.ports) {
+			if r.Protocol == "tcp" && p.ports[k] == r.Port {
+				flag := "--ports"
+				if p.all {
+					flag = "--" + k + "-port"
+				}
+				return fmt.Errorf("the front's %s port %d is the L4 route %s's: choose another with %s", k, r.Port, r.Name, flag)
+			}
+		}
+	}
+	return nil
+}
+
+// l4Upgrade checks the release's L4 routes against the install before an upgrade changes it: none
+// on the front's recorded ports, and each on a port the stack publishes already or one free on the
+// host.
+func (in *Installer) l4Upgrade(ctx context.Context, env *EnvFile, mode string) error {
+	pub := publish{all: true, ports: map[string]int{}}
+	keys := map[string]string{"http": HTTPPortVar, "https": HTTPSPortVar}
+	if mode == Loopback {
+		pub.all, keys = false, map[string]string{}
+		for _, r := range in.R.Spec.Front.Routes {
+			keys[r.Name] = PortVar(r.Name)
+		}
+	}
+	for k, v := range keys {
+		s, _ := env.Get(v)
+		pub.ports[k], _ = strconv.Atoi(s)
+	}
+	if err := in.l4Clash(pub); err != nil {
+		return fmt.Errorf("%w: give it to a re-run of the installer the install runs, `%s --dir %s`, then upgrade", err, in.ctl(), in.O.Dir)
+	}
+	if len(in.R.Spec.L4.Routes) == 0 {
+		return nil
+	}
+	// A port the stack publishes already — an L4 route of the running release, or a service's
+	// own ports: the release moves into one — is the install's own.
+	out, err := in.Compose(ctx, env, nil, "ps", "--format", "json")
+	if err != nil {
+		return fmt.Errorf("compose ps: %w", err)
+	}
+	own, err := publishedPorts(out)
+	if err != nil {
+		return err
+	}
+	var added []spec.L4Route
+	for _, r := range in.R.Spec.L4.Routes {
+		if !own[fmt.Sprintf("%s/%d", r.Protocol, r.Port)] {
+			added = append(added, r)
+		}
+	}
+	return in.l4Free(added)
+}
+
+// publishedPorts are the host ports, as protocol/port, the containers `compose ps --format json`
+// lists publish on every address: one JSON array, or one object a line.
+func publishedPorts(out []byte) (map[string]bool, error) {
+	type row struct {
+		Publishers []struct {
+			URL           string
+			PublishedPort int
+			Protocol      string
+		}
+	}
+	var rows []row
+	trimmed := bytes.TrimSpace(out)
+	if bytes.HasPrefix(trimmed, []byte("[")) {
+		if err := json.Unmarshal(trimmed, &rows); err != nil {
+			return nil, fmt.Errorf("compose ps: %w", err)
+		}
+	} else {
+		for line := range bytes.Lines(trimmed) {
+			if len(bytes.TrimSpace(line)) == 0 {
+				continue
+			}
+			var r row
+			if err := json.Unmarshal(line, &r); err != nil {
+				return nil, fmt.Errorf("compose ps: %w", err)
+			}
+			rows = append(rows, r)
+		}
+	}
+	ports := map[string]bool{}
+	for _, r := range rows {
+		for _, p := range r.Publishers {
+			// Only a port on every address: one bound to loopback leaves the others to probe.
+			if p.PublishedPort != 0 && (p.URL == "0.0.0.0" || p.URL == "::") {
+				ports[fmt.Sprintf("%s/%d", p.Protocol, p.PublishedPort)] = true
+			}
+		}
+	}
+	return ports, nil
 }
 
 // FirewallConf is the VM's firewall ruleset, which flushes its own table only.
@@ -1127,6 +1332,10 @@ func (in *Installer) Status(ctx context.Context) error {
 	}
 	for _, r := range in.R.Spec.Front.Routes {
 		fmt.Fprintf(in.O.Out, "%-9s %s\n", r.Name, get(spec.URLVar(r.Name)))
+	}
+	// Each L4 route: its protocol and host port, and the endpoint the stack reads when it has one.
+	for _, r := range in.R.Spec.L4.Routes {
+		fmt.Fprintf(in.O.Out, "%-9s %s\n", r.Name, strings.TrimSpace(fmt.Sprintf("%s/%d %s", r.Protocol, r.Port, get(spec.L4Var(r.Name)))))
 	}
 	if url := in.dockerEndpoint(env); url != "" {
 		fmt.Fprintf(in.O.Out, "%-9s %s\n", "endpoint", url)
@@ -1229,6 +1438,9 @@ func (in *Installer) inputList(mode string) []input {
 			continue
 		}
 		check := frontCheck(in.R.Spec.Front, i.Key)
+		if slices.ContainsFunc(in.R.Spec.L4.Routes, func(r spec.L4Route) bool { return r.AddressInput == i.Key }) {
+			check = lint.CheckL4Address
+		}
 		domain := tls && slices.ContainsFunc(in.R.Spec.Front.Routes, func(r spec.Route) bool { return r.DomainInput == i.Key })
 		if domain {
 			check = in.domainCheck

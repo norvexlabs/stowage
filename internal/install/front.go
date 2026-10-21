@@ -5,6 +5,7 @@ import (
 	"net/netip"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"unicode"
 
@@ -207,11 +208,12 @@ func frontCommand(f spec.Front, ca string) []string {
 
 // frontCompose adds the front service to the project's stack: in loopback mode each route on its
 // port of the loopback address, behind TLS only the HTTP and HTTPS ports (80 and 443 unless
-// moved), on every address. The host ports come from .env.
+// moved), on every address. The host ports come from .env. The L4 routes' ports are published
+// in every mode, to their services.
 // digest labels the front with its configuration (the Caddyfile, a byo certificate), so a change
 // recreates it. ca is the CA it publishes (frontCommand). ipv6 turns IPv6 on for the default
 // network.
-func frontCompose(f spec.Front, mode string, host hostAPI, digest, ca string, ipv6 bool) ([]byte, error) {
+func frontCompose(f spec.Front, l4 []spec.L4Route, mode string, host hostAPI, digest, ca string, ipv6 bool) ([]byte, error) {
 	var ports []string
 	volumes := []string{"./" + Caddyfile + ":/etc/caddy/Caddyfile:ro", "stowage-front-data:/data"}
 	if mode == Loopback {
@@ -247,6 +249,18 @@ func frontCompose(f spec.Front, mode string, host hostAPI, digest, ca string, ip
 				HostTokenVar:  "${" + HostTokenVar + "}",
 			},
 		}
+	}
+	// Each L4 route's host port, on every address, to its upstream as it is: compose appends these
+	// to the service's own ports.
+	for _, r := range l4 {
+		name, target, _ := strings.Cut(r.Upstream, ":")
+		svc, _ := services[name].(map[string]any)
+		if svc == nil {
+			svc = map[string]any{}
+			services[name] = svc
+		}
+		ports, _ := svc["ports"].([]any)
+		svc["ports"] = append(ports, map[string]any{"target": target, "published": strconv.Itoa(r.Port), "protocol": r.Protocol})
 	}
 	doc := map[string]any{
 		"services": services,
