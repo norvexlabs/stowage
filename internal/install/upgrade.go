@@ -182,6 +182,9 @@ func (in *Installer) Upgrade(ctx context.Context) error {
 	if o.Self == "" {
 		return errors.New("an upgrade keeps the installer it runs as the install's: its path is not known")
 	}
+	if err := in.volumesSplit(); err != nil {
+		return err
+	}
 	if err := in.checkDocker(ctx); err != nil {
 		return err
 	}
@@ -634,6 +637,9 @@ func (in *Installer) Rollback(ctx context.Context) error {
 		}
 	}
 	if err := in.baselineCheck(back, st); err != nil {
+		return err
+	}
+	if err := in.volumesSplit(); err != nil {
 		return err
 	}
 	if err := in.checkDocker(ctx); err != nil {

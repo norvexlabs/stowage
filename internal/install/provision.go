@@ -525,6 +525,9 @@ func (in *Installer) Provision(ctx context.Context) error {
 			return err
 		}
 	}
+	if err := in.volumesSplit(); err != nil {
+		return err
+	}
 	if err := in.checkDocker(ctx); err != nil {
 		return err
 	}

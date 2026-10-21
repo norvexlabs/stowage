@@ -36,14 +36,17 @@ type Service struct {
 	Image    string   `yaml:"image"`
 	Build    any      `yaml:"build"`
 	Profiles []string `yaml:"profiles"`
-	// Extends is `extends: base` or `extends: {service: base, file: …}`; after inherit, Profiles
-	// and Ports hold the base's too.
-	Extends any `yaml:"extends"`
-	Ports   any `yaml:"ports"`
+	// Extends is `extends: base` or `extends: {service: base, file: …}`; after inherit, Profiles,
+	// Ports, Volumes and Devices hold the base's too, and NetworkMode is the base's unless set.
+	Extends     any    `yaml:"extends"`
+	Ports       any    `yaml:"ports"`
+	Volumes     any    `yaml:"volumes"`
+	Devices     any    `yaml:"devices"`
+	NetworkMode string `yaml:"network_mode"`
 }
 
-// inherit fills each service's image and build from the service it extends, where it sets none,
-// and joins its profiles and ports with the base's, as compose does. It refuses an extends compose would resolve outside this file (a
+// inherit fills each service's image, build and network mode from the service it extends, where it
+// sets none, and joins its profiles, ports, volumes and devices with the base's, as compose does. It refuses an extends compose would resolve outside this file (a
 // file the release does not carry), a service the file does not declare, and a cycle.
 func (c *Compose) inherit() map[string]error {
 	errs := map[string]error{}
@@ -102,22 +105,17 @@ func (c *Compose) inherit() map[string]error {
 		if svc.Build == nil {
 			svc.Build = b.Build
 		}
-		// Compose joins the lists: the service's profiles and ports are its own and its base's.
+		if svc.NetworkMode == "" {
+			svc.NetworkMode = b.NetworkMode
+		}
+		// Compose joins the lists: the service's profiles, ports, volumes and devices are its own
+		// and its base's.
 		for _, p := range b.Profiles {
 			if !slices.Contains(svc.Profiles, p) {
 				svc.Profiles = append(slices.Clone(svc.Profiles), p)
 			}
 		}
-		own, ownList := svc.Ports.([]any)
-		inherited, baseList := b.Ports.([]any)
-		switch {
-		case svc.Ports == nil:
-			svc.Ports = b.Ports
-		case ownList && baseList:
-			svc.Ports = append(slices.Clone(own), inherited...)
-		case b.Ports != nil:
-			svc.Ports = []any{svc.Ports, b.Ports} // one is no list: lint counts it as published
-		}
+		svc.Ports, svc.Volumes, svc.Devices = joinList(svc.Ports, b.Ports), joinList(svc.Volumes, b.Volumes), joinList(svc.Devices, b.Devices)
 		return svc
 	}
 	out := map[string]Service{}
@@ -126,6 +124,41 @@ func (c *Compose) inherit() map[string]error {
 	}
 	c.Services = out
 	return errs
+}
+
+// mountsVolume reports whether a service's volumes: mount the named volume key, in the short
+// syntax (key:/path[:mode]) or the long one ({type: volume, source: key}).
+func mountsVolume(vols any, key string) bool {
+	list, _ := vols.([]any)
+	for _, m := range list {
+		switch m := m.(type) {
+		case string:
+			if src, _, ok := strings.Cut(m, ":"); ok && src == key {
+				return true
+			}
+		case map[string]any:
+			if t, _ := m["type"].(string); (t == "" || t == "volume") && m["source"] == key {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// joinList is a service's list joined with its base's; one that is no list is kept as an entry,
+// which no reader takes for a valid one.
+func joinList(own, base any) any {
+	o, ownList := own.([]any)
+	b, baseList := base.([]any)
+	switch {
+	case own == nil:
+		return base
+	case ownList && baseList:
+		return append(slices.Clone(o), b...)
+	case base != nil:
+		return []any{own, base}
+	}
+	return own
 }
 
 // PublishesBeyondLoopback reports whether a service's ports: publish one past this host: any
@@ -250,6 +283,36 @@ func ServiceProfiles(raw []byte) (map[string][]string, error) {
 		}
 	}
 	return p, nil
+}
+
+// ServiceDevices maps each service of a compose file mapping host devices (devices:, its own and
+// those it extends) to their host paths, in the order it lists them.
+func ServiceDevices(raw []byte) (map[string][]string, error) {
+	c, err := parseCompose(raw, "compose.yaml")
+	if err != nil {
+		return nil, err
+	}
+	if errs := c.inherit(); len(errs) > 0 {
+		name := sortedKeys(errs)[0]
+		return nil, fmt.Errorf("compose.yaml: services.%s.extends: %w", name, errs[name])
+	}
+	out := map[string][]string{}
+	for name, svc := range c.Services {
+		list, _ := svc.Devices.([]any)
+		for _, d := range list {
+			var host string
+			switch d := d.(type) {
+			case string:
+				host, _, _ = strings.Cut(d, ":")
+			case map[string]any:
+				host, _ = d["source"].(string)
+			}
+			if host != "" {
+				out[name] = append(out[name], host)
+			}
+		}
+	}
+	return out, nil
 }
 
 func parseCompose(raw []byte, path string) (*Compose, error) {

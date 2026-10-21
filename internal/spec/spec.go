@@ -136,13 +136,15 @@ type L4 struct {
 
 // L4Route publishes the host port Port, over Protocol, to Upstream (service:port).
 // AddressInput names the input holding the host name or address clients dial, which the stack
-// reads as the route's endpoint (L4Var).
+// reads as the route's endpoint (L4Var). AllowInput names the input holding the source addresses
+// (CIDRs) the VM's firewall lets reach the port: empty refuses every one.
 type L4Route struct {
 	Name         string `yaml:"name"`
 	Protocol     string `yaml:"protocol"`
 	Port         int    `yaml:"port"`
 	Upstream     string `yaml:"upstream"`
 	AddressInput string `yaml:"address_input"`
+	AllowInput   string `yaml:"allow_input"`
 }
 
 // L4Var is the variable carrying an L4 route's endpoint, <address>:<port>.

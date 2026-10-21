@@ -6,7 +6,7 @@
 #
 # Walks examples/minimal, with a real Postgres, through: ship 1.0.0 → the bootstrap one-liner
 # installs it → a re-run changes nothing → backups to a WebDAV server through the release's
-# runner, and a restore that brings the backup's data back → ship 2.0.0 (a migration) → `notes-stow upgrade --version
+# runner (the dump and the uploads volume's archive), and a restore that brings both back → ship 2.0.0 (a migration) → `notes-stow upgrade --version
 # 2.0.0` fetches its installer and upgrades → rollback is allowed (1.0.0 reads the newer schema) →
 # ship 3.0.0 (a migration that is a rollback barrier) → upgrade → going back to 1.0.0 by upgrade
 # is refused, and rollback is refused naming the snapshot → `reset-db` wipes the data volumes and
@@ -68,6 +68,8 @@ age_key
 project=$(project)
 pg() { docker ps --quiet --filter "label=com.docker.compose.project=$project" --filter label=com.docker.compose.service=postgres; }
 docker exec "$(pg)" psql -U notes -d notes -c 'CREATE TABLE e2e_backup (n int); INSERT INTO e2e_backup VALUES (1)' >/dev/null || fail "a table to back up"
+api() { docker ps --quiet --filter "label=com.docker.compose.project=$project" --filter label=com.docker.compose.service=api; }
+docker exec "$(api)" sh -c 'echo at-the-backup >/data/uploads/e2e.txt' || fail "a file to back up in the uploads volume"
 # The schedule is not tested here: the host's systemd is not this suite's (the units are unit-tested).
 "${CTL[@]}" backup config --dir "$D" --destination dav:backups --rclone-config "$DAV_CONF" --recipient "$AGE_RECIPIENT" >"$WORK/dbackup-config.txt" 2>&1 ||
 	{ cat "$WORK/dbackup-config.txt"; fail "backup config"; }
@@ -77,11 +79,19 @@ grep -q 'reachable and writable' "$WORK/dbackup-verify.txt" || { cat "$WORK/dbac
 backups=("$WORK"/dav/backups/notes-full-*-1.0.0-r1.pgdump.age)
 [[ ${#backups[@]} == 1 && -s ${backups[0]} ]] || { ls -la "$WORK/dav/backups"; fail "no backup in the destination"; }
 check_backup "${backups[0]}" "$PG" e2e_backup
+# The uploads volume's archive beside the dump (backup.volumes), encrypted too; backup list shows the dump alone.
+archive=${backups[0]%.pgdump.age}.uploads.tar.age
+"$BIN/age" -d -i "$AGE_KEY" "$archive" | tar -t | grep -qx './e2e.txt' || fail "$archive does not hold the uploads volume's file"
 "${CTL[@]}" backup list --dir "$D" | grep -q "^${backups[0]##*/} " || fail "backup list does not show the backup"
+! "${CTL[@]}" backup list --dir "$D" | grep -q 'tar\.age' || fail "backup list shows a volume's archive as a backup"
 "${CTL[@]}" backup status --dir "$D" | grep -q "^last  .*${backups[0]##*/}" || fail "backup status does not show the backup"
 docker exec "$(pg)" psql -U notes -d notes -c 'INSERT INTO e2e_backup VALUES (2)' >/dev/null || fail "a row after the backup"
+docker exec "$(api)" sh -c 'echo since >/data/uploads/e2e.txt && echo later >/data/uploads/later.txt' || fail "files after the backup"
 "${CTL[@]}" restore "${backups[0]##*/}" --dir "$D" --identity "$AGE_KEY" --yes >"$WORK/drestore.txt" 2>&1 || { cat "$WORK/drestore.txt"; fail "restore"; }
 [[ $(docker exec "$(pg)" psql -U notes -d notes -tAc 'SELECT count(*) FROM e2e_backup') == 1 ]] || fail "the restore did not bring the backup's data back"
+# The volume as it was at the backup, its file's owner kept; what came after is gone.
+[[ $(docker exec "$(api)" sh -c 'cat /data/uploads/e2e.txt; stat -c %u /data/uploads/e2e.txt; test -e /data/uploads/later.txt || echo gone') == $'at-the-backup\n1000\ngone' ]] ||
+	{ docker exec "$(api)" ls -lan /data/uploads; fail "the restore did not bring the uploads volume back as it was"; }
 running 1.0.0 1
 "${CTL[@]}" backup config --dir "$D" --remove >/dev/null 2>&1 || fail "backup config --remove"
 

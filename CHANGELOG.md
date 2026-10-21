@@ -15,6 +15,14 @@ follow [SemVer](https://semver.org/).
 - **Optional services**: an input's `profile` turns a compose profile on while it holds a value;
   turned off, its services are removed.
 - Compose `extends` within the file: a service takes the image of the one it extends.
+- **An L4 route's allowlist on the VM** (`allow_input`): the VM's firewall lets only the sources
+  an input holds reach the route's port, over IPv4 and IPv6, from boot on; a Docker host's
+  firewall stays the operator's.
+- **Volumes in backups** (`backup.volumes`): each backup also archives the volumes listed,
+  encrypted beside the dump, and a restore brings them back with the database, on Docker and on
+  the VM. A restore that cannot bring every volume back keeps the stack down, and refuses the
+  verbs that would start or change it, until a restore again finishes; `status` says so.
+- `vm create` names the ports the VM opens to each L4 route and the host devices the stack maps.
 
 ### Changed
 - A service that publishes a port of its own past this host (not on a loopback address) is an
@@ -23,6 +31,8 @@ follow [SemVer](https://semver.org/).
   `l4.routes`.
 - An input named by a route's `domain_input` and also declared under `inputs` is no longer
   warned as read by nothing.
+- A service on the host's network (`network_mode: host`) is an error with a `kairos` shape and a
+  warning on `docker`: publish its ports with `l4.routes`.
 
 ## [0.6.0] - 2026-10-21
 

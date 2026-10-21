@@ -18,6 +18,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/norvexlabs/stowage/internal/lint"
 	"github.com/norvexlabs/stowage/internal/registry"
 	"github.com/norvexlabs/stowage/internal/release"
 	"github.com/norvexlabs/stowage/internal/truenas"
@@ -937,6 +938,21 @@ func (in *Installer) confirmVM(ctx context.Context, p Platform, format string, m
 	}
 	if st.AwaitSecrets {
 		b.WriteString("  secrets: --secrets', given over SSH once the VM answers (never in its cloud-config)\n")
+	}
+	for _, r := range in.R.Spec.L4.Routes {
+		from := "every source"
+		if r.AllowInput != "" {
+			from = "the sources of " + r.AllowInput
+		}
+		fmt.Fprintf(&b, "  opens %s/%d (L4 route %s) to %s\n", r.Protocol, r.Port, r.Name, from)
+	}
+	// The host devices the stack maps, which the VM must have: its module or its host gives them.
+	devices, err := lint.ServiceDevices(in.R.Compose)
+	if err != nil {
+		return err
+	}
+	for _, svc := range sortedKeys(devices) {
+		fmt.Fprintf(&b, "  the service %s maps the host's %s: the VM must have them\n", svc, strings.Join(devices[svc], ", "))
 	}
 	o.logf("%s", strings.TrimRight(b.String(), "\n"))
 	if o.Prompt == nil {

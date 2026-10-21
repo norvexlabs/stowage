@@ -687,10 +687,11 @@ func TestL4Routes(t *testing.T) {
 	newL4 := func() *env {
 		e := newEnv(t)
 		s := e.r.Spec
-		s.Inputs = append(s.Inputs, spec.Input{Key: "DATA_ADDRESS", Prompt: "Data address", Optional: true})
+		s.Inputs = append(s.Inputs, spec.Input{Key: "DATA_ADDRESS", Prompt: "Data address", Optional: true},
+			spec.Input{Key: "DATA_SOURCES", Prompt: "Data sources", Optional: true})
 		s.L4.Routes = []spec.L4Route{
 			{Name: "data", Protocol: "tcp", Port: 7443, Upstream: "api:7000", AddressInput: "DATA_ADDRESS"},
-			{Name: "data-udp", Protocol: "udp", Port: 7443, Upstream: "api:7000"},
+			{Name: "data-udp", Protocol: "udp", Port: 7443, Upstream: "api:7000", AllowInput: "DATA_SOURCES"},
 		}
 		s.Front.HTTPSPort = 8443
 		e.vars["APP_DOMAIN"], e.vars["API_DOMAIN"] = "app.example.org", "api.example.org"
@@ -720,6 +721,9 @@ func TestL4Routes(t *testing.T) {
 	}
 	if err := e.install(func(o *Options) { o.Set = map[string]string{"DATA_ADDRESS": "data.example.org:7443"} }); err == nil || !strings.Contains(err.Error(), "is not a host name or an IP address") {
 		t.Errorf("an address with a port: %v", err)
+	}
+	if err := e.install(func(o *Options) { o.Set = map[string]string{"DATA_SOURCES": "192.0.2.0/24; tcp dport 22 accept"} }); err == nil || !strings.Contains(err.Error(), "is not an IP address or a CIDR") {
+		t.Errorf("an allowlist of rules: %v", err)
 	}
 	// A re-run that empties the address empties the endpoint; one that moves the front onto the
 	// route's TCP port is refused.

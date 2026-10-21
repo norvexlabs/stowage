@@ -18,6 +18,7 @@ import (
 
 	"github.com/norvexlabs/stowage/internal/backup"
 	"github.com/norvexlabs/stowage/internal/front"
+	"github.com/norvexlabs/stowage/internal/kairos"
 	"github.com/norvexlabs/stowage/internal/payload"
 	"github.com/norvexlabs/stowage/internal/project"
 	"github.com/norvexlabs/stowage/internal/release"
@@ -901,8 +902,8 @@ func TestEveryStartOpensTheFrontsPortsInTheFirewall(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	host := &nftHost{}
-	in := &Installer{R: testRelease(t, "1.0.0"), O: Options{Firewall: filepath.Join(t.TempDir(), "nftables.d"), Host: host}}
-	file := filepath.Join(in.O.Firewall, "notes-front.nft")
+	in := &Installer{R: testRelease(t, "1.0.0"), O: Options{Dir: t.TempDir(), Firewall: filepath.Join(t.TempDir(), "nftables.d"), Host: host}}
+	file := filepath.Join(in.O.Firewall, "notes-ports.nft")
 	env := NewEnvFile()
 	env.Set("STOWAGE_TLS_MODE", "internal")
 	env.Set(HTTPPortVar, "80")
@@ -916,7 +917,7 @@ func TestEveryStartOpensTheFrontsPortsInTheFirewall(t *testing.T) {
 	if err := in.openPorts(ctx, env); err != nil {
 		t.Fatal(err)
 	}
-	if b, _ := os.ReadFile(file); string(b) != "# notes's front, which every start of the install writes.\ntcp dport { 80, 8443 } accept\n" {
+	if b, _ := os.ReadFile(file); string(b) != "# notes's ports, which every start of the install writes.\ntcp dport { 80, 8443 } accept\n" {
 		t.Errorf("rule %q", b)
 	}
 	reloads(1, "first start")
@@ -951,7 +952,7 @@ func TestEveryStartOpensTheFrontsPortsInTheFirewall(t *testing.T) {
 	}
 	env.Set(HTTPPortVar, "80")
 	host.err = errors.New("nft: no such table")
-	if err := in.openPorts(ctx, env); err == nil || !strings.Contains(err.Error(), "loading the firewall with the front's ports: nft: no such table") {
+	if err := in.openPorts(ctx, env); err == nil || !strings.Contains(err.Error(), "loading the firewall with the install's ports: nft: no such table") {
 		t.Errorf("err = %v", err)
 	}
 	// The next start loads it again.
@@ -964,6 +965,111 @@ func TestEveryStartOpensTheFrontsPortsInTheFirewall(t *testing.T) {
 	off := &Installer{R: in.R, O: Options{Host: host}}
 	if err := off.openPorts(ctx, env); err != nil || len(host.ran) != 5 {
 		t.Errorf("err = %v, ran %v", err, host.ran)
+	}
+}
+
+// The L4 routes' ports are opened in every mode: from every source without an allowlist, else in
+// the input chain from its sources alone, with the forward chain (on the persistent partition)
+// dropping a DNAT'd connection from any other, per family; an empty allowlist refuses all.
+func TestEveryStartOpensTheL4PortsFromTheirSources(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	host := &nftHost{}
+	r, _ := testInstallerWith(t, "1.0.0", func(s *spec.Spec) {
+		s.L4.Routes = []spec.L4Route{
+			{Name: "db", Protocol: "tcp", Port: 15432, Upstream: "postgres:5432"},
+			{Name: "feed", Protocol: "udp", Port: 17007, Upstream: "api:17007", AllowInput: "FEED_SOURCES"},
+		}
+	})
+	in := &Installer{R: r, O: Options{Dir: t.TempDir(), Firewall: filepath.Join(t.TempDir(), "nftables.d"), Host: host}}
+	ports, l4 := filepath.Join(in.O.Firewall, "notes-ports.nft"), filepath.Join(in.O.Dir, ForwardRules, "notes-l4.nft")
+	env := NewEnvFile()
+	env.Set("STOWAGE_TLS_MODE", Loopback)
+	env.Set("FEED_SOURCES", "192.0.2.7, 10.1.2.3/8 2001:db8::1 10.9.9.9 ::ffff:198.51.100.4 192.0.2.7/32")
+	if err := in.openPorts(ctx, env); err != nil {
+		t.Fatal(err)
+	}
+	const dnat = "ct direction original ct status dnat ct original proto-dst 17007"
+	if b, _ := os.ReadFile(ports); string(b) != "# notes's ports, which every start of the install writes.\n"+
+		"tcp dport 15432 accept\n"+
+		"udp dport 17007 ip saddr { 10.0.0.0/8, 192.0.2.7/32, 198.51.100.4/32 } accept\n"+
+		"udp dport 17007 ip6 saddr { 2001:db8::1/128 } accept\n" {
+		t.Errorf("ports %q", b)
+	}
+	if b, _ := os.ReadFile(l4); string(b) != "# notes's L4 routes' allowlists, which every start of the install writes.\n"+
+		"meta nfproto ipv4 meta l4proto udp "+dnat+" ip saddr != { 10.0.0.0/8, 192.0.2.7/32, 198.51.100.4/32 } drop\n"+
+		"meta nfproto ipv6 meta l4proto udp "+dnat+" ip6 saddr != { 2001:db8::1/128 } drop\n" {
+		t.Errorf("allowlists %q", b)
+	}
+	if len(host.ran) != 1 {
+		t.Fatalf("ran %v", host.ran)
+	}
+	// IPv4 alone: IPv6 is refused whole.
+	env.Set("FEED_SOURCES", "192.0.2.7")
+	if err := in.openPorts(ctx, env); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(l4); !strings.Contains(string(b), "meta nfproto ipv6 meta l4proto udp "+dnat+" drop\n") {
+		t.Errorf("allowlists %q", b)
+	}
+	if b, _ := os.ReadFile(ports); strings.Contains(string(b), "ip6") {
+		t.Errorf("ports %q", b)
+	}
+	// A load that fails puts the allowlists back as they were: the next boot drops as before.
+	before, _ := os.ReadFile(l4)
+	env.Set("FEED_SOURCES", "")
+	host.err = errors.New("nft: syntax error")
+	if err := in.openPorts(ctx, env); err == nil {
+		t.Fatal("a failed load passed")
+	}
+	if b, _ := os.ReadFile(l4); !bytes.Equal(b, before) {
+		t.Errorf("allowlists after a failed load %q", b)
+	}
+	if _, err := os.Stat(ports); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("the ports file is left: %v", err)
+	}
+	// Empty: every source refused, nothing opened in the input chain.
+	host.err = nil
+	if err := in.openPorts(ctx, env); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(l4); strings.Count(string(b), " drop\n") != 2 || strings.Contains(string(b), "saddr") {
+		t.Errorf("allowlists %q", b)
+	}
+	if b, _ := os.ReadFile(ports); strings.Contains(string(b), "17007") {
+		t.Errorf("ports %q", b)
+	}
+	env.Set("FEED_SOURCES", "192.0.2.7; tcp dport 22 accept")
+	if err := in.openPorts(ctx, env); err == nil || !strings.Contains(err.Error(), "FEED_SOURCES: ") {
+		t.Errorf("err = %v", err)
+	}
+	// No allowlist left: the file goes.
+	in.R.Spec.L4.Routes = in.R.Spec.L4.Routes[:1]
+	if err := in.openPorts(ctx, env); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(l4); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("the allowlists are left: %v", err)
+	}
+}
+
+// The OS bundle's ruleset includes the rule files openPorts writes where the VM's install writes
+// them: the ports in the input chain, the allowlists in the forward chain.
+func TestTheBundlesFirewallIncludesTheInstallsRules(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	if err := kairos.WriteContext(dir, kairos.Params{Name: "notes", Ctl: "notes-stow"}); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(filepath.Join(dir, "files", FirewallConf))
+	if err != nil {
+		t.Fatal(err)
+	}
+	conf := string(raw)
+	input, forward, ok := strings.Cut(conf, "chain forward {")
+	if !ok || !strings.Contains(input, `include "`+PortRules+`/*.nft"`) ||
+		!strings.Contains(forward, `include "`+VMDir("notes")+"/"+ForwardRules+`/*.nft"`) || !strings.Contains(forward, "hook forward") {
+		t.Errorf("ruleset:\n%s", conf)
 	}
 }
 

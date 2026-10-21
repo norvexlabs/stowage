@@ -3,10 +3,12 @@
 # of its own CA (`mirror export`, `mirror import`), `vm create --create opentofu` on a TrueNAS host
 # boots the disk it reads from the mirror, whose first boot installs from the cloud-config, IPv6 on
 # (`--ipv6`: the LAN's IPv6 address, SSH and the front reached over it);
-# its firewall lets SSH in from this host alone (`--ssh-allow`) and the front's ports, in the time
+# its firewall lets SSH in from this host alone (`--ssh-allow`) and the front's ports, and an L4
+# route's port from the sources its allowlist holds (this host over IPv4: refused over IPv6, and
+# from every source once a re-run changes the allowlist, through the upgrade's reboot), in the time
 # zone given (`--timezone`); `reset-db` wipes the data and provisions again without a reboot; a
-# backup goes, encrypted, to a WebDAV server on this host, and `restore` loads it back over newer
-# data; `secrets export` writes the install's secrets encrypted to the operator's key; a newer release crosses the same way and the VM upgrades from the
+# backup goes, encrypted, to a WebDAV server on this host — the database and the uploads volume —
+# and `restore` loads both back over newer data; `secrets export` writes the install's secrets encrypted to the operator's key; a newer release crosses the same way and the VM upgrades from the
 # mirror (a backup first), its health gate marking the boot
 # good; `rollback` takes the VM back to the passive system; a release that never becomes ready
 # fails its health gate, and Kairos falls back to the passive system, whose boot goes back; one that
@@ -56,6 +58,20 @@ KAIROS=1 new_project "$PG"
 # A short health gate: the release that never becomes ready falls back sooner.
 sed -i 's/^    host_api: \[api\]$/&\n    health_gate: { deadline_s: 120, deadline_after_reset_s: 600, poll_s: 10 }/' "$P/stowage.yaml"
 grep -q '^    health_gate: ' "$P/stowage.yaml" || fail "no health_gate in the project"
+# An L4 route to the database, which the VM's firewall opens to the sources DB_SOURCES holds.
+python3 - "$P/stowage.yaml" <<'PY'
+import sys
+path = sys.argv[1]
+s = open(path).read()
+for old, new in [
+    ("\nhealth:\n", "\nl4:\n  routes:\n    - { name: db, protocol: tcp, port: 15432, upstream: postgres:5432, allow_input: DB_SOURCES }\n\nhealth:\n"),
+    ("  - { key: ADMIN_EMAIL, prompt: \"Administrator email\", required: true }\n",
+     "  - { key: ADMIN_EMAIL, prompt: \"Administrator email\", required: true }\n  - { key: DB_SOURCES, prompt: \"Sources the VM lets reach the database\", shapes: [kairos] }\n"),
+]:
+    assert s.count(old) == 1, old
+    s = s.replace(old, new)
+open(path, "w").write(s)
+PY
 "${S[@]}" lint
 vm_names
 
@@ -76,7 +92,7 @@ mapfile -t HOST6 < <(ip -6 -o addr show scope global | awk '$2 !~ /^(docker|br-|
 allow=$MIRROR_IP/32
 for a in "${HOST6[@]}"; do allow+=",$a/128"; done
 "$CTL" vm create --no-input --platform truenas --create opentofu --hostname "$H" --user ops --ssh-key "$KEY.pub" \
-	--tls internal --domains app=app.notes.test,api=api.notes.test --set ADMIN_EMAIL=admin@notes.test \
+	--tls internal --domains app=app.notes.test,api=api.notes.test --set ADMIN_EMAIL=admin@notes.test --set "DB_SOURCES=$MIRROR_IP/32" \
 	--pool "$POOL" --dataset "$DATASET" --bridge "$BRIDGE" --cpus 2 --memory 4096 --disk 32 --host "$ADDR" --wait "${E2E_VM_WAIT:-30m}" \
 	--registry "$SITE" --registry-ca "$MIRROR_CA" --ssh-allow "$allow" --ipv6 --timezone Europe/Paris \
 	>"$WORK/vm-create.txt" 2>"$WORK/vm-create.log" || { tail -80 "$WORK/vm-create.log"; fail "vm create"; }
@@ -103,6 +119,17 @@ for a in "${HOST6[@]}"; do
 	grep -q "ip6 saddr $a tcp dport 22 accept" "$WORK/nft.txt" || { cat "$WORK/nft.txt"; fail "the firewall does not let SSH in from $a"; }
 done
 [[ $(on_vm readlink /etc/localtime) == */Europe/Paris && $(on_vm date +%Z) =~ ^CES?T$ ]] || fail "the VM is not in Europe/Paris's time zone"
+
+step "on the VM: the L4 route's port, open to its allowlist's sources alone (this host, over IPv4)"
+# reach <address> <port>: a TCP connection opens within 8 s.
+reach() { python3 -c 'import socket, sys; socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=8).close()' "$@" 2>/dev/null; }
+vm4=$(getent ahostsv4 "$ADDR" | awk '{print $1; exit}') # `getent hosts` gives IPv6 first
+[[ -n $vm4 ]] || fail "$ADDR has no IPv4 address"
+grep -q "tcp dport 15432 ip saddr $MIRROR_IP accept" "$WORK/nft.txt" &&
+	grep -q "ct original proto-dst 15432 ip saddr != $MIRROR_IP drop" "$WORK/nft.txt" && grep -q 'meta nfproto ipv6 .*ct original proto-dst 15432 drop' "$WORK/nft.txt" ||
+	{ cat "$WORK/nft.txt"; fail "the firewall does not open the L4 route's port to $MIRROR_IP alone"; }
+on_vm test -s /usr/local/notes/nftables.d/notes-l4.nft || fail "the allowlists are not on the persistent partition"
+reach "$vm4" 15432 || { on_vm sudo nft list chain inet notes forward; on_vm sudo ss -ltn; fail "the L4 route's port ($vm4:15432) is not reachable from this host ($MIRROR_IP), which its allowlist holds"; }
 
 step "on the VM: the api service reaches the host daemon's app socket with the install's token"
 on_vm sudo cat /usr/local/notes/.env >"$WORK/vm.env"
@@ -145,33 +172,52 @@ on_vm systemctl show notes-backup.timer --property TimersCalendar --value | grep
 pg=$(on_vm sudo docker ps -q --filter label=com.docker.compose.service=postgres)
 # Partitioned, with a key: the restore brings it back whole, its partition's inherited key with it.
 on_vm sudo docker exec "$pg" psql -U notes -d notes -c "'CREATE TABLE e2e_backup (n int PRIMARY KEY) PARTITION BY RANGE (n); CREATE TABLE e2e_backup_all PARTITION OF e2e_backup DEFAULT; INSERT INTO e2e_backup VALUES (1)'" >/dev/null || fail "a table to back up"
+on_vm sudo docker exec "$api" sh -c "'echo at-the-backup >/data/uploads/e2e.txt'" || fail "a file to back up in the uploads volume"
 on_vm sudo notes-stow backup run >"$WORK/backup-run.txt" 2>&1 || { cat "$WORK/backup-run.txt"; fail "backup run"; }
 backups=("$WORK"/dav/backups/notes-full-*-1.0.0-r1.pgdump.age)
 [[ ${#backups[@]} == 1 && -s ${backups[0]} ]] || { ls -la "$WORK/dav/backups"; fail "no backup in the destination"; }
 check_backup "${backups[0]}" "$PG" e2e_backup_all
+"$BIN/age" -d -i "$AGE_KEY" "${backups[0]%.pgdump.age}.uploads.tar.age" | tar -t | grep -qx './e2e.txt' || fail "the backup holds no archive of the uploads volume"
 on_vm notes-stow backup status | grep -q "^last  .*${backups[0]##*/}" || fail "backup status does not show the backup"
 
 step "restore on the VM: the backup loaded back over newer data; the secrets exported, encrypted to the operator's key"
 on_vm sudo docker exec "$pg" psql -U notes -d notes -c "'INSERT INTO e2e_backup VALUES (2)'" >/dev/null || fail "a row after the backup"
+on_vm sudo docker exec "$api" sh -c "'echo since >/data/uploads/e2e.txt && echo later >/data/uploads/later.txt'" || fail "files after the backup"
 on_vm sudo notes-stow restore "${backups[0]##*/}" --yes <"$AGE_KEY" >"$WORK/restore.txt" 2>&1 || { cat "$WORK/restore.txt"; fail "restore"; }
 grep -q "restored ${backups[0]##*/}" "$WORK/restore.txt" || { cat "$WORK/restore.txt"; fail "restore did not say it restored"; }
 healthy_postgres "after restore"
 pg=$(on_vm sudo docker ps -q --filter label=com.docker.compose.service=postgres)
 [[ $(on_vm sudo docker exec "$pg" psql -U notes -d notes -Atc "'SELECT count(*) FROM e2e_backup'") == 1 ]] || fail "the restore did not bring the backup's data back"
+api=$(on_vm sudo docker ps -q --filter label=com.docker.compose.service=api)
+[[ $(on_vm sudo docker exec "$api" sh -c "'cat /data/uploads/e2e.txt; stat -c %u /data/uploads/e2e.txt; test -e /data/uploads/later.txt || echo gone'") == $'at-the-backup\n1000\ngone' ]] ||
+	{ on_vm sudo docker exec "$api" ls -lan /data/uploads; fail "the restore did not bring the uploads volume back as it was"; }
 # A backup cut short (named as one, a later time): its restore fails and the data stays as it was.
 cut=${backups[0]##*/}; cut=${cut/-full-????????T??????Z-/-full-29991231T235959Z-}
 head -c $(($(stat -c %s "${backups[0]}") / 2)) "${backups[0]}" >"$WORK/dav/backups/$cut"
+# Its archive whole beside it (the dump is what is cut), sent through the server, whose listing a
+# file written behind its back reaches only once its directory cache expires.
+dav_rclone() { docker run --rm --network host --user "$(id -u):$(id -g)" -v "$WORK:$WORK" "$RCLONE" --config "$DAV_CONF" "$@"; }
+dav_rclone copyto "${backups[0]%.pgdump.age}.uploads.tar.age" "dav:backups/${cut%.pgdump.age}.uploads.tar.age" || fail "the cut backup's archive"
 on_vm sudo docker exec "$pg" psql -U notes -d notes -c "'INSERT INTO e2e_backup VALUES (3)'" >/dev/null || fail "a row before the restore cut short"
+on_vm sudo docker exec "$api" touch /data/uploads/since-cut || fail "a file before the restore cut short"
 if on_vm sudo notes-stow restore "$cut" --yes <"$AGE_KEY" >"$WORK/restore-cut.txt" 2>&1; then cat "$WORK/restore-cut.txt"; fail "a backup cut short restored"; fi
+grep -q 'the database is as it was' "$WORK/restore-cut.txt" || { cat "$WORK/restore-cut.txt"; fail "the restore cut short did not fail loading the dump"; }
 healthy_postgres "after the restore cut short"
 pg=$(on_vm sudo docker ps -q --filter label=com.docker.compose.service=postgres)
 [[ $(on_vm sudo docker exec "$pg" psql -U notes -d notes -Atc "'SELECT count(*) FROM e2e_backup'") == 2 ]] || fail "the restore cut short changed the data"
 [[ $(on_vm sudo docker exec "$pg" psql -U notes -d postgres -Atc "\"SELECT count(*) FROM pg_database WHERE datname LIKE 'notes_stowage%'\"") == 0 ]] || fail "the restore cut short left its database"
+api=$(on_vm sudo docker ps -q --filter label=com.docker.compose.service=api)
+[[ $(on_vm sudo docker exec "$api" sh -c "'cat /data/uploads/e2e.txt; ls -A /data/uploads | grep -c -e since-cut -e stowage'") == $'at-the-backup\n1' ]] || fail "the restore cut short changed the uploads volume, or left its staging"
 rm -f "$WORK/dav/backups/$cut"
+dav_rclone deletefile "dav:backups/${cut%.pgdump.age}.uploads.tar.age" || fail "removing the cut backup's archive"
 on_vm notes-stow secrets export --recipient "$AGE_RECIPIENT" -o - >"$WORK/secrets.age" 2>"$WORK/secrets.log" || { cat "$WORK/secrets.log"; fail "secrets export"; }
 "$BIN/age" -d -i "$AGE_KEY" "$WORK/secrets.age" >"$WORK/secrets.yaml" || fail "the exported secrets do not decrypt with the key"
 grep -qx 'project: notes' "$WORK/secrets.yaml" && grep -q "$host_token" "$WORK/secrets.yaml" || fail "the exported secrets are not the install's"
 rm -f "$WORK/secrets.yaml"
+
+step "a re-run on the VM changes the L4 route's allowlist: this host is refused"
+on_vm sudo notes-stow install --no-input --set DB_SOURCES=192.0.2.1/32 >"$WORK/allow.txt" 2>&1 || { cat "$WORK/allow.txt"; fail "the re-run changing DB_SOURCES"; }
+! reach "$vm4" 15432 || fail "the L4 route's port still answers this host, which its allowlist no longer holds"
 
 step "ship beta 1.0.1, carry it through the mirror; the VM upgrades from it, and its health gate keeps it"
 release 1.0.1
@@ -185,6 +231,9 @@ grep -q 'a backup first: notes-full-' "$WORK/upgrade.txt" && grep -q 'backed up:
 back_on 1.0.1 active "after the upgrade" "$boot"
 healthy_postgres "after the upgrade"
 [[ $(on_vm systemctl is-active notes-health.service) == active ]] || fail "the health gate did not pass 1.0.1"
+# The allowlist outlives the reboot: the boot's ruleset holds it before the stack starts.
+on_vm sudo nft list chain inet notes forward | grep -q 'ct original proto-dst 15432 ip saddr != 192.0.2.1 drop' || fail "the upgraded boot lost the L4 route's allowlist"
+! reach "$vm4" 15432 || fail "the L4 route's port answers this host after the upgrade"
 assessment >"$WORK/assess.txt" || { cat "$WORK/assess.txt"; fail "the boot assessment cannot be read"; }
 grep -qx 'enable_boot_assessment=' "$WORK/assess.txt" && grep -qx 'boot_assessment_tentative=' "$WORK/assess.txt" ||
 	{ cat "$WORK/assess.txt"; fail "the health gate did not mark the upgraded boot good"; }
@@ -253,6 +302,7 @@ if ((${#HOST6[@]})); then
 	VM_IP=$vm6 on_vm true || fail "no SSH over IPv6 to $vm6"
 	code=$(curl -6 -sk --connect-timeout 10 --max-time 30 -o /dev/null -w '%{http_code}' --resolve "app.notes.test:443:[$vm6]" https://app.notes.test/)
 	[[ $code =~ ^[23] ]] || fail "https://app.notes.test/ over IPv6 ([$vm6]) answered $code"
+	! reach "$vm6" 15432 || fail "the L4 route's port answered over IPv6, which its allowlist leaves out"
 else
 	echo "this host has no global IPv6 address: the VM's IPv6 address, SSH and HTTPS over it are not checked"
 fi

@@ -42,7 +42,7 @@ const bootLockWait = 10 * time.Minute
 func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(accessible bool) Prompter, unit time.Duration) *cobra.Command {
 	name := r.Spec.Name
 	o := Options{Out: stdout, Log: stderr, Docker: ExecTool{Bin: "docker"}, Self: self, Dir: VMDir(name), Offline: true, Preloaded: true,
-		Firewall: "/run/nftables.d", Host: HostTool{}}
+		Firewall: PortRules, Host: HostTool{}}
 	if _, err := os.Stat("/proc/self/exe"); err == nil {
 		o.SelfExe = "/proc/self/exe"
 	}
@@ -138,8 +138,8 @@ func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(
 	if r.Spec.Front.PublishCA != nil {
 		f.StringVar(&o.CA, "ca", "", "--tls byo: the CA the certificate chains to, PEM, published to the stack (none: no CA)")
 	}
-	f.IntVar(&o.HTTPPort, "http-port", 0, "the host port a TLS front serves HTTP on (default 80; on an installed VM, changes it)")
-	f.IntVar(&o.HTTPSPort, "https-port", 0, "the host port a TLS front serves HTTPS on (default 443; on an installed VM, changes it)")
+	f.IntVar(&o.HTTPPort, "http-port", 0, "the host port a TLS front serves HTTP on (default the project's front.http_port, else 80; on an installed VM, changes it)")
+	f.IntVar(&o.HTTPSPort, "https-port", 0, "the host port a TLS front serves HTTPS on (default the project's front.https_port, else 443; on an installed VM, changes it)")
 	f.StringVar(&o.Channel, "channel", "", "the channel `updates` and `upgrade` follow")
 	f.BoolVar(&o.DryRun, "dry-run", false, "check, print what would be written (secrets redacted), write nothing")
 	f.StringArrayVar(&sets, "set", nil, "an input, KEY=VALUE (repeatable; on an installed VM, changes the recorded one)")
@@ -641,6 +641,8 @@ func (c *hostClient) status(ctx context.Context, asJSON bool) error {
 	} else {
 		fmt.Fprintf(c.out, "installed  %s %s\n", st.Name, st.Installed)
 		switch {
+		case st.VolumesSplit:
+			fmt.Fprintf(c.out, "           not running: a restore left the volumes half restored; `sudo %s restore OBJECT` again finishes it\n", c.ctl)
 		case st.InstallFailed != "":
 			fmt.Fprintf(c.out, "           not finished: the first install failed: %s (`journalctl -u %s` tells more); `sudo %s install` runs it again\n", st.InstallFailed, st.Name, c.ctl)
 		case st.Installing:

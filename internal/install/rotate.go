@@ -118,6 +118,10 @@ func (in *Installer) RotateSecret(ctx context.Context, key, pass string) error {
 	if err := in.sameRelease(env); err != nil {
 		return err
 	}
+	// Before anything is recorded: nothing would come up to use it.
+	if err := in.volumesSplit(); err != nil {
+		return err
+	}
 	if err := in.checkDocker(ctx); err != nil {
 		return err
 	}

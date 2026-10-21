@@ -704,7 +704,7 @@ func TestBackupVerbsOverTheSocket(t *testing.T) {
 	if out, err := ctl(e, sock, "backup", "run"); err == nil || !strings.Contains(err.Error(), "no backup is configured") {
 		t.Errorf("%v\n%s", err, out)
 	}
-	if len(f.objects) != 3 { // the backup, and the two probes
+	if len(f.objects) != 4 { // the backup, its volume's archive, and the two probes
 		t.Errorf("objects %v", f.objects)
 	}
 }

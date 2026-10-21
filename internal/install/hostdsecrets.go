@@ -1,11 +1,14 @@
 package install
 
 import (
+	"cmp"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"regexp"
 	"slices"
 	"strconv"
@@ -195,7 +198,14 @@ func (h *Hostd) restoreBackup(w http.ResponseWriter, r *http.Request) {
 		replyErr(w, err)
 		return
 	}
-	j, err := h.startJob("restore", req.Object, nil)
+	// Not while an upgrade waits in the passive slot: a restore that left the volumes half
+	// restored would strand it, its boot refusing them.
+	j, err := h.startJob("restore", req.Object, func() error {
+		if err := h.osWritten(); len(pg.Volumes) > 0 && err != nil {
+			return fail(http.StatusConflict, "%v: reboot first, then restore", err)
+		}
+		return nil
+	})
 	if err != nil {
 		replyErr(w, err)
 		return
@@ -397,11 +407,47 @@ func (h *Hostd) runRestore(in *Installer, object string, ids []age.Identity, log
 			others = append(others, s)
 		}
 	}
+	// Every volume's archive is there before anything stops.
+	for _, v := range pg.Volumes {
+		src := within(c.Destination, volumeObject(object, v))
+		out, err := h.rclone(ctx, in, conf, nil, "lsjson", "--files-only", "--no-mimetype", src)
+		var found []struct{ Name string }
+		if err == nil {
+			err = json.Unmarshal(out, &found)
+		}
+		if err != nil || len(found) != 1 {
+			return fmt.Errorf("%s has no archive of the volume %s to restore with it (%s: %v): nothing restored", object, v, src, cmp.Or(err, errors.New("not found")))
+		}
+	}
 	// Registered first: a stop that fails part-way leaves services stopped too. Once the stack is
 	// up on restored data, the provision hook runs on it: its values belong to that data.
-	swapped := false
+	// An earlier restore that left the volumes half restored keeps the stack down until this one
+	// finishes, whatever ends it.
+	hadSplit := in.volumesSplit() != nil
+	swapped, halfSwapped := false, hadSplit
+	// asWas says what a failure before the swap left: what was, or volumes an earlier restore
+	// left half restored (whose staging this one's replaced).
+	asWas := func(what string) string {
+		if hadSplit {
+			return "(the volumes are still half restored: restore again)"
+		}
+		return "(the " + what + " is as it was)"
+	}
 	dropReplaced := func() {}
 	defer func() {
+		// A volume left half swapped keeps the services stopped: they would run, and be backed
+		// up, on data of two times.
+		if halfSwapped {
+			// Their containers go too: a restart policy would start them at a reboot.
+			if len(others) > 0 {
+				rctx, cancel := context.WithTimeout(context.WithoutCancel(h.ctx), 2*time.Minute)
+				defer cancel()
+				if _, rerr := in.Compose(rctx, env, in.O.Log, append([]string{"rm", "--stop", "--force"}, others...)...); rerr != nil {
+					logf("the stopped services' containers were not removed (%v): a restart policy may start them at a reboot", rerr)
+				}
+			}
+			return
+		}
 		// A context of its own: the restore's may be what ran out.
 		up, cancel := context.WithTimeout(context.WithoutCancel(h.ctx), 10*time.Minute)
 		defer cancel()
@@ -421,6 +467,21 @@ func (h *Hostd) runRestore(in *Installer, object string, ids []age.Identity, log
 			dropReplaced()
 		}
 	}()
+	// The runner is there before anything stops: a Docker install pulls it again here, never
+	// inside a step bounded after the swap.
+	var image string
+	if len(pg.Volumes) > 0 {
+		if image, err = h.runnerImage(ctx, in); err != nil {
+			return err
+		}
+	}
+	// The database alone comes up when an earlier restore left the stack down: the load runs in
+	// its service.
+	if hadSplit {
+		if _, err := in.Compose(ctx, env, in.O.Log, "up", "--detach", "--wait", "--no-deps", d.Service); err != nil {
+			return fmt.Errorf("starting the database: %w (the volumes are still half restored: restore again)", err)
+		}
+	}
 	// Without a service to name, `stop` would stop them all, the database included.
 	if len(others) > 0 {
 		logf("stopping %s but its database: %s", in.R.Spec.Name, strings.Join(others, ", "))
@@ -428,8 +489,180 @@ func (h *Hostd) runRestore(in *Installer, object string, ids []age.Identity, log
 			return fmt.Errorf("stopping the services: %w", err)
 		}
 	}
+	// The volumes are staged first, each in a directory of its own beside its data, which a
+	// restore that ends before the swap removes.
+	staged := map[string]string{}
+	step := volumeStepWait * cmp.Or(h.Unit, time.Second)
+	unstage := func() {
+		for _, v := range sortedKeys(staged) {
+			clean, cancel := context.WithTimeout(context.WithoutCancel(ctx), step)
+			if _, err := h.runnerShell(clean, in, image, staged[v], false, nil, nil, unstageScript); err != nil {
+				logf("the volume %s keeps the restore's staging directory %s (%v): the next restore removes it", v, restoreStage, err)
+			}
+			cancel()
+		}
+	}
+	for _, v := range pg.Volumes {
+		vol, err := in.stackVolume(ctx, env, v, true)
+		if err != nil {
+			unstage()
+			return fmt.Errorf("%w %s", err, asWas("data"))
+		}
+		staged[v] = vol
+		src := within(c.Destination, volumeObject(object, v))
+		logf("restoring %s into the volume %s", src, v)
+		if err := h.fetchDecrypted(ctx, in, conf, src, ids, func(plain io.Reader) error {
+			_, err := h.runnerShell(ctx, in, image, vol, false, plain, nil, stageScript)
+			return err
+		}); err != nil {
+			unstage()
+			return fmt.Errorf("the volume %s: %w %s", v, err, asWas("data"))
+		}
+	}
 	src := within(c.Destination, object)
 	logf("restoring %s into %s's database", src, in.R.Spec.Name)
+	if err := h.fetchDecrypted(ctx, in, conf, src, ids, func(plain io.Reader) error {
+		load := []string{"exec", "-T", d.Service, "sh", "-c", loadScript, "restore", d.Roles.Migrate, d.Name, maintenanceDB(d.Name)}
+		if _, err := in.O.Docker.Run(ctx, Cmd{Args: append(in.composeBase(), load...), Env: env.Environ(in.O.environ()), Stdin: plain, Stream: in.O.Log}); err != nil {
+			return fmt.Errorf("loading %s: %w", object, err)
+		}
+		return nil
+	}); err != nil {
+		unstage()
+		// The load writes only its own database: whatever ended it, the install's is as it was.
+		return fmt.Errorf("%w %s", err, asWas("database"))
+	}
+	inDB := func(base context.Context, timeout time.Duration, script, verb string, stream bool) ([]byte, error) {
+		cctx, cancel := context.WithTimeout(base, timeout)
+		defer cancel()
+		cmd := Cmd{Args: append(in.composeBase(), "exec", "-T", d.Service, "sh", "-c", script, verb, d.Roles.Migrate, d.Name, maintenanceDB(d.Name)), Env: env.Environ(in.O.environ())}
+		if stream {
+			cmd.Stream = in.O.Log
+		}
+		return in.O.Docker.Run(cctx, cmd)
+	}
+	// The swap is short and never left half done: a context of its own, which neither the job's
+	// deadline nor the daemon's stop cuts while it commits.
+	firm := context.WithoutCancel(h.ctx)
+	// From the database's swap until every volume is swapped in, the data is of two times: the
+	// mark keeps the stack down and backups off, across a reboot too, until a restore finishes.
+	split := in.path(volumesSplitFile)
+	if len(staged) > 0 {
+		if err := writePrivate(split, []byte(object+"\n")); err != nil {
+			// A write that failed after its rename leaves it: one that cannot go keeps the
+			// stack down, as it says.
+			if rerr := os.Remove(split); rerr != nil && !errors.Is(rerr, os.ErrNotExist) {
+				halfSwapped = true
+			}
+			unstage()
+			return fmt.Errorf("%w %s", err, asWas("data"))
+		}
+	}
+	if _, err := inDB(firm, 3*time.Minute, swapScript, "swap", true); err != nil {
+		// The swap's one transaction either committed or not, whatever the exit: stowage_replaced,
+		// which only its rename makes, tells which.
+		out, qerr := inDB(firm, 30*time.Second, swappedCheck, "check", false)
+		switch {
+		case qerr != nil:
+			// Committed or not, a restore again does it all (its load drops what this one
+			// left). With volumes, the database may be the backup's beside volumes that are not:
+			// the stack stays down, marked, until then.
+			halfSwapped = halfSwapped || len(staged) > 0
+			if !halfSwapped {
+				return fmt.Errorf("swapping %s in: %w; whether it committed could not be read (%v): a database named stowage_replaced in %s's Postgres means it did — then `sudo %s provision` finishes the restore", object, err, qerr, in.R.Spec.Name, in.R.Ctl())
+			}
+			return fmt.Errorf("swapping %s in: %w; whether it committed could not be read (%v): a database named stowage_replaced in %s's Postgres means it did, and holds the data from before the restore, which a restore again drops — restore again to bring the backup back whole, its volumes included", object, err, qerr, in.R.Spec.Name)
+		case strings.TrimSpace(string(out)) != "1":
+			unstage()
+			if hadSplit {
+				// The volumes are still as an earlier restore left them.
+				halfSwapped = true
+				return fmt.Errorf("swapping %s in: %w (the database is as it was; the volumes still half restored: restore again)", object, err)
+			}
+			if err := os.Remove(split); err != nil && !errors.Is(err, os.ErrNotExist) {
+				halfSwapped = true
+				return fmt.Errorf("swapping %s in: the data is as it was, but %w: remove it, then a re-run of the installer brings the stack up", object, err)
+			}
+			return fmt.Errorf("swapping %s in: %w (the database is as it was)", object, err)
+		}
+		logf("the swap ended with %v, but committed: the backup is in place", err)
+	}
+	swapped = true
+	dropReplaced = func() {
+		// Optional, once the stack is up and provisioned: never holding either back, and with a
+		// context of its own, which the load's long hour cannot have used up.
+		if _, err := inDB(firm, 10*time.Minute, dropScript, "drop", true); err != nil {
+			logf("the replaced database was not dropped (%v): the next restore drops stowage_replaced", err)
+		}
+		// Bounded, and cut by the daemon's stop: the install's lock is held until it ends. One
+		// left is removed by the next restore's staging.
+		for _, v := range sortedKeys(staged) {
+			dctx, cancel := context.WithTimeout(h.ctx, 6*step)
+			if _, err := h.runnerShell(dctx, in, image, staged[v], false, nil, nil, dropVolumeScript); err != nil {
+				logf("the volume %s keeps its data from before the restore in %s (%v): the next restore removes it", v, restoreReplaced, err)
+			}
+			cancel()
+		}
+	}
+	// Each volume is swapped in by renames alone, its data moved aside rather than deleted, each
+	// bounded (a hung runner never holds the install's lock), every one tried: one that fails
+	// keeps what it holds, split between its root, its staging and its former data, and the
+	// services stay stopped until a restore again.
+	var failed []error
+	for _, v := range sortedKeys(staged) {
+		sctx, cancel := context.WithTimeout(firm, step)
+		_, err := h.runnerShell(sctx, in, image, staged[v], false, nil, nil, swapVolumeScript)
+		cancel()
+		if err != nil {
+			failed = append(failed, fmt.Errorf("the volume %s: %w", v, err))
+		}
+	}
+	if len(failed) > 0 {
+		halfSwapped = true
+		return fmt.Errorf("restored %s's database, but not every volume was swapped in (%w; its files are split between its root, %s — the backup's — and %s — its own): the services stay stopped, restore again", object, errors.Join(failed...), restoreStage, restoreReplaced)
+	}
+	if err := os.Remove(split); err != nil && !errors.Is(err, os.ErrNotExist) {
+		halfSwapped = true
+		return fmt.Errorf("restored %s whole, but %w: remove it, then restore again", object, err)
+	}
+	halfSwapped = false
+	// The data is loaded whole: what a --secrets install waited for is here, whatever comes next.
+	in.restoreDone()
+	logf("restored %s", object)
+	return nil
+}
+
+// restoreStage is the directory, at a volume's root, a restore extracts the volume's archive into;
+// restoreReplaced the one its swap moves the volume's former data into, deleted once the restore
+// is done. volumeStepWait bounds, in Unit, a volume's swap (renames) and its staging's removal.
+const (
+	restoreStage    = ".stowage-restore"
+	restoreReplaced = ".stowage-replaced"
+	volumeStepWait  = 10 * 60
+)
+
+// archiveScript writes the volume's archive, a restore's two directories left out; stageScript
+// removes what an earlier restore left of them, then extracts one archive (stdin) into the
+// staging directory, made with the root's owner and mode (an archive's own root entry then sets
+// them), the two names never extracted; unstageScript removes it; swapVolumeScript, renames
+// alone, moves the volume's entries into the replaced directory, then the staging's into the
+// root, which takes the archive's owner and mode; dropVolumeScript deletes the replaced data.
+const (
+	archiveScript = "tar -c -f - -C /v --exclude ./" + restoreStage + " --exclude ./" + restoreReplaced + " ."
+	stageScript   = "rm -rf /v/" + restoreStage + " /v/" + restoreReplaced + " && mkdir /v/" + restoreStage +
+		` && chown "$(stat -c %u:%g /v)" /v/` + restoreStage + ` && chmod "$(stat -c %a /v)" /v/` + restoreStage +
+		" && tar -x -f - -C /v/" + restoreStage + " --exclude ./" + restoreStage + " --exclude ./" + restoreReplaced
+	unstageScript    = "rm -rf /v/" + restoreStage
+	swapVolumeScript = "cd /v && mkdir " + restoreReplaced + " && " +
+		`for f in ./* ./.[!.]* ./..?*; do case "$f" in ./` + restoreStage + "|./" + restoreReplaced + `) continue ;; esac; if [ -e "$f" ] || [ -L "$f" ]; then mv -- "$f" ` + restoreReplaced + `/ || exit 1; fi; done && ` +
+		"for f in ./" + restoreStage + "/* ./" + restoreStage + "/.[!.]* ./" + restoreStage + `/..?*; do if [ -e "$f" ] || [ -L "$f" ]; then mv -- "$f" . || exit 1; fi; done && ` +
+		`chown "$(stat -c %u:%g ` + restoreStage + `)" . && chmod "$(stat -c %a ` + restoreStage + `)" . && rmdir ` + restoreStage
+	dropVolumeScript = "rm -rf /v/" + restoreReplaced
+)
+
+// fetchDecrypted downloads src, decrypting it as it streams into use; a failure says whether the
+// download or the identity was why.
+func (h *Hostd) fetchDecrypted(ctx context.Context, in *Installer, conf, src string, ids []age.Identity, use func(io.Reader) error) error {
 	pr, pw := io.Pipe()
 	fetched := make(chan error, 1)
 	go func() {
@@ -446,54 +679,12 @@ func (h *Hostd) runRestore(in *Installer, object string, ids []age.Identity, log
 		if ferr := <-fetched; ferr != nil {
 			return ferr
 		}
-		return fmt.Errorf("decrypting %s: %w (is the identity one of the backup's recipients?)", object, err)
+		return fmt.Errorf("decrypting %s: %w (is the identity one of the backup's recipients?)", src, err)
 	}
-	load := []string{"exec", "-T", d.Service, "sh", "-c", loadScript, "restore", d.Roles.Migrate, d.Name, maintenanceDB(d.Name)}
-	_, rerr := in.O.Docker.Run(ctx, Cmd{Args: append(in.composeBase(), load...), Env: env.Environ(in.O.environ()), Stdin: plain, Stream: in.O.Log})
+	uerr := use(plain)
 	pr.CloseWithError(errUploadEnded) // the download has nothing more to write to
-	// The load writes only its own database: whatever ended it, the install's is as it was. One
-	// that failed may have failed for the download's sake, which then tells why.
-	switch ferr := <-fetched; {
-	case rerr == nil:
-	case ferr != nil:
-		return fmt.Errorf("%w (the database is as it was)", ferr)
-	default:
-		return fmt.Errorf("loading %s: %w (the database is as it was)", object, rerr)
+	if ferr := <-fetched; ferr != nil && uerr != nil {
+		return ferr
 	}
-	inDB := func(base context.Context, timeout time.Duration, script, verb string, stream bool) ([]byte, error) {
-		cctx, cancel := context.WithTimeout(base, timeout)
-		defer cancel()
-		cmd := Cmd{Args: append(in.composeBase(), "exec", "-T", d.Service, "sh", "-c", script, verb, d.Roles.Migrate, d.Name, maintenanceDB(d.Name)), Env: env.Environ(in.O.environ())}
-		if stream {
-			cmd.Stream = in.O.Log
-		}
-		return in.O.Docker.Run(cctx, cmd)
-	}
-	// The swap is short and never left half done: a context of its own, which neither the job's
-	// deadline nor the daemon's stop cuts while it commits.
-	firm := context.WithoutCancel(h.ctx)
-	if _, err := inDB(firm, 3*time.Minute, swapScript, "swap", true); err != nil {
-		// The swap's one transaction either committed or not, whatever the exit: stowage_replaced,
-		// which only its rename makes, tells which.
-		out, qerr := inDB(firm, 30*time.Second, swappedCheck, "check", false)
-		switch {
-		case qerr != nil:
-			return fmt.Errorf("swapping %s in: %w; whether it committed could not be read (%v): a database named stowage_replaced in %s's Postgres means it did — then `sudo %s provision` finishes the restore", object, err, qerr, in.R.Spec.Name, in.R.Ctl())
-		case strings.TrimSpace(string(out)) != "1":
-			return fmt.Errorf("swapping %s in: %w (the database is as it was)", object, err)
-		}
-		logf("the swap ended with %v, but committed: the backup is in place", err)
-	}
-	swapped = true
-	// The data is loaded: what a --secrets install waited for is here, whatever comes next.
-	in.restoreDone()
-	dropReplaced = func() {
-		// Optional, once the stack is up and provisioned: never holding either back, and with a
-		// context of its own, which the load's long hour cannot have used up.
-		if _, err := inDB(firm, 10*time.Minute, dropScript, "drop", true); err != nil {
-			logf("the replaced database was not dropped (%v): the next restore drops stowage_replaced", err)
-		}
-	}
-	logf("restored %s", object)
-	return nil
+	return uerr
 }

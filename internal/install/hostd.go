@@ -232,9 +232,12 @@ type Status struct {
 	InstallFailed string `json:"install_failed,omitempty"`
 	// RestoreAwaited: --secrets gave the install another's provision values; the hook waits for a
 	// backup of that install's data (`restore` loads it, then provisions).
-	RestoreAwaited bool   `json:"restore_awaited,omitempty"`
-	Channel        string `json:"channel,omitempty"`
-	Disk           *Disk  `json:"disk,omitempty"`
+	RestoreAwaited bool `json:"restore_awaited,omitempty"`
+	// VolumesSplit: a restore left the volumes half restored; the stack stays down until a
+	// restore again finishes.
+	VolumesSplit bool   `json:"volumes_split,omitempty"`
+	Channel      string `json:"channel,omitempty"`
+	Disk         *Disk  `json:"disk,omitempty"`
 	// Pressure is the disk-pressure watch's reading; nil without hooks.maintenance.disk_pressure.
 	Pressure *DiskPressure `json:"disk_pressure,omitempty"`
 	// Cert is a byo install's certificate: its end, and a warning from 30 days before it.
@@ -612,6 +615,10 @@ func (h *Hostd) status(w http.ResponseWriter, r *http.Request) {
 	}
 	h.mu.Lock()
 	st.RebootPending = h.rebooting
+	// Read with the job: a restore running holds the mark from its database's swap to its last
+	// volume's.
+	restoring := h.job != nil && h.job.Kind == "restore" && h.job.State == "running"
+	st.VolumesSplit = st.Installed != nil && !restoring && in.volumesSplit() != nil
 	if h.job != nil {
 		st.Job = h.job.State
 	}
@@ -780,6 +787,11 @@ func (h *Hostd) serviceAction(w http.ResponseWriter, r *http.Request) {
 	env, err := in.open()
 	if err != nil {
 		replyErr(w, err)
+		return
+	}
+	// Under the lock, which a restore holds while it marks them.
+	if err := in.volumesSplit(); args[0] != "stop" && err != nil {
+		replyErr(w, fail(http.StatusConflict, "%v", err))
 		return
 	}
 	svc := r.PathValue("service")
@@ -1279,6 +1291,11 @@ func (h *Hostd) upgrade(w http.ResponseWriter, r *http.Request) {
 		replyErr(w, err)
 		return
 	}
+	// A restore again finishes half restored volumes, onto this release only.
+	if err := in.volumesSplit(); err != nil {
+		replyErr(w, fail(http.StatusConflict, "%v", err))
+		return
+	}
 	if err := h.judged(r.Context()); err != nil {
 		replyErr(w, err)
 		return
@@ -1316,6 +1333,10 @@ func (h *Hostd) upgrade(w http.ResponseWriter, r *http.Request) {
 	j, err := h.startJob("upgrade", m.Tag, func() error {
 		if err := h.osWritten(); err != nil {
 			return fail(http.StatusConflict, "%v: reboot first, then upgrade", err)
+		}
+		// Again as the job claims the slot: a restore that just ended may have marked them.
+		if err := in.volumesSplit(); err != nil {
+			return fail(http.StatusConflict, "%v", err)
 		}
 		return nil
 	})

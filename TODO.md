@@ -44,32 +44,9 @@ A finished item is deleted, not ticked. The plan behind it is
 
 ## Should
 
-- **Non-HTTP stacks, second session (one e2e-kairos → e2e-vm chain), then the 0.7.0 release.**
-  The L4 routes, optional services, `extends` and the front's default ports are in (unreleased
-  0.7.0). Batch the rest so the long chain runs once:
-  - the VM firewall opens the L4 ports for both families (`openPorts`' rule file, the input
-    chain: the userland-proxy path);
-  - `l4.routes[].allow_input`, enforced on the VM only, in a new `forward` base chain (policy
-    accept, drop on `ct original proto-dst` + saddr): DNAT'd traffic never meets `input`. On a
-    project with a `docker` shape its input is asked on `kairos` only (lint), as the Docker host's
-    firewall is the operator's;
-  - `backup.volumes`: an age-encrypted tar of declared volumes beside `pg_dump`, restored at the
-    same point in time, on Docker and the VM (the DR of material a one-shot minted);
-  - host requirements read from compose: `network_mode: host` refused with a `kairos` shape and
-    warned on `docker` (it listens past Stowage without a `ports:` entry), the devices listed in
-    `vm create`'s plan;
-  - the VM verbs' `--http-port` / `--https-port` help (`vmcli.go`) names the project's
-    `front.http_port` / `https_port` default;
-  - spot tests: `nft -c -f` on the rendered ruleset; Docker backup via `make e2e-full`.
-  - (Should) the compose model the installer reads (`ServiceProfiles`, `CheckL4Address`, the
-    `extends` resolution) in a small package of its own: the installer imports `internal/lint`
-    for them today, linking the publisher's lint code (and `dockerfile`, `lock`, `digest`) into
-    `stowage-install`;
-  - (Could) the first install's free-port check covers the L4 routes' UDP ports too (TCP only
-    today: a UDP port already bound fails at `compose up`).
-  Not built: x509/key generators (product PKI; DR is covered by volume backup), a pre-start hook,
-  front client-cert auth, a project with no front.
-
+- **The compose model in a package of its own**: the installer imports `internal/lint` for
+  `ServiceProfiles`, `ServiceDevices`, `CheckL4Address` and the `extends` resolution, linking the
+  publisher's lint code (and `dockerfile`, `lock`, `digest`) into `stowage-install`.
 - **Kubernetes schema check for a `command` schema-compat provider**: `shapes.kubernetes.schema`
   runs the `sql` provider's queries in a pod; a `command` provider's ops (JSON on stdin) are not
   run on Kubernetes, so its rollback is not checked there.
@@ -255,6 +232,16 @@ A finished item is deleted, not ticked. The plan behind it is
   pull account (a secret, so over SSH, as other secrets) when a mirror refuses anonymous reads.
 
 ## Could
+
+- **e2e-kairos's `backup verify` failed once beside the parallel suites** (2026-10-21) and passed
+  alone: find the clash (the WebDAV server's port, or the runner's container name) and fix it.
+- **UDP in the first install's free-port check**: it covers the L4 routes' TCP ports only;
+  a UDP port already bound fails at `compose up`.
+- **A volume quiesced for its backup**: `backup.volumes` are read while the stack runs,
+  which suits material written once; a service writing a volume continuously would need its own
+  pause (a hook around the archive).
+- Not built for non-HTTP stacks: x509/key generators (product PKI; DR is covered by volume
+  backup), a pre-start hook, front client-cert auth, a project with no front.
 
 - **A compressed disk's file size**: a disk's layer is annotated with its file's digest, not its
   size, so a different file of that name in `vm create`'s `--out` is hashed whole before it is

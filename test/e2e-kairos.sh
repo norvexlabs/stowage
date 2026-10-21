@@ -207,11 +207,12 @@ vmctl backup config --destination dav:backups --rclone-config "$DAV_CONF" --reci
 	{ cat "$WORK/backup-config.txt"; fail "backup config"; }
 grep -q '^rclone       set (not shown)' "$WORK/backup-config.txt" && ! grep -q 'webdav' "$WORK/backup-config.txt" ||
 	{ cat "$WORK/backup-config.txt"; fail "backup config does not mask the rclone config"; }
-vmctl backup verify 2>&1 | grep -q 'reachable and writable' || fail "backup verify"
+vmctl backup verify >"$WORK/backup-verify.txt" 2>&1; grep -q 'reachable and writable' "$WORK/backup-verify.txt" || { cat "$WORK/backup-verify.txt"; fail "backup verify"; }
 vmctl backup run >"$WORK/backup-run.txt" 2>&1 || { cat "$WORK/backup-run.txt"; fail "backup run"; }
 backups=("$WORK"/dav/backups/notes-full-*-1.0.0-r1.pgdump.age)
 [[ ${#backups[@]} == 1 && -s ${backups[0]} ]] || { ls -la "$WORK/dav/backups"; fail "no backup in the destination"; }
 check_backup "${backups[0]}" "$PG" e2e_backup
+[[ -s ${backups[0]%.pgdump.age}.uploads.tar.age ]] || { ls -la "$WORK/dav/backups"; fail "no archive of the uploads volume beside the backup"; }
 vmctl backup list | grep -q "^${backups[0]##*/} " || fail "backup list does not show the backup"
 vmctl backup status | grep -q "^last  .*${backups[0]##*/}" || fail "backup status does not show the backup"
 

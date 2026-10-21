@@ -192,6 +192,9 @@ func TestBackup(t *testing.T) {
 		{"profile in capitals", prov("pg-age-rclone", "profiles", map[string]any{"Full": "all"}), "lowercase letters and digits"},
 		{"profile of 32", prov("pg-age-rclone", "profiles", map[string]any{strings.Repeat("a", 32): "all"}), ""},
 		{"profile of 33", prov("pg-age-rclone", "profiles", map[string]any{strings.Repeat("a", 33): "all"}), "lowercase letters and digits"},
+		{"volumes", prov("pg-age-rclone", "profiles", map[string]any{"full": "all"}, "volumes", []any{"uploads", "keys.d_1"}), ""},
+		{"volume not a key", prov("pg-age-rclone", "profiles", map[string]any{"full": "all"}, "volumes", []any{"../uploads"}), `volumes[0] "../uploads" is not a compose volume's key`},
+		{"volume twice", prov("pg-age-rclone", "profiles", map[string]any{"full": "all"}, "volumes", []any{"a", "b", "a"}), `volumes[2] "a" is listed twice`},
 		{"command", prov("command", "image", "api", "cmd", []any{"x"}), ""},
 		{"unknown", prov("restic"), "unknown provider"},
 	}

@@ -81,6 +81,7 @@ hooks:
 backup:
   provider: pg-age-rclone
   profiles: { full: all }
+  volumes: [uploads]                                         # archived beside each dump
 
 shapes:
   docker: {}

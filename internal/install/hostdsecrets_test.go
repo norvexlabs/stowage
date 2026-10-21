@@ -1,9 +1,13 @@
 package install
 
 import (
+	"bytes"
+	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -143,19 +147,24 @@ func TestARestoreThatFailsBringsTheStackUpAgain(t *testing.T) {
 		restoreErr error
 		want       string
 		swapErr    error
+		stageErr   error
 	}{
-		"another key": {true, nil, "is the identity one of the backup's recipients?", nil},
+		"another key": {true, nil, "is the identity one of the backup's recipients?", nil, nil},
+		// A volume is staged beside its data, which stays until the database is swapped in.
+		"volume not staged": {false, nil, "the volume uploads: exit status 1 (the data is as it was)", nil, exitCode(1)},
 		// The load writes only its own database: any end of it leaves the install's as it was.
-		"not loaded":     {false, exitCode(3), "the database is as it was)", nil},
-		"cut short":      {false, errors.New("signal: killed"), "signal: killed (the database is as it was)", nil},
-		"not swapped":    {false, nil, "exit status 4 (the database is as it was)", exitCode(4)},
-		"swap cut short": {false, nil, "signal: killed (the database is as it was)", errors.New("signal: killed")},
+		"not loaded":     {false, exitCode(3), "the database is as it was)", nil, nil},
+		"cut short":      {false, errors.New("signal: killed"), "signal: killed (the database is as it was)", nil, nil},
+		"not swapped":    {false, nil, "exit status 4 (the database is as it was)", exitCode(4), nil},
+		"swap cut short": {false, nil, "signal: killed (the database is as it was)", errors.New("signal: killed"), nil},
 	} {
-		e, d, _, key, obj := restoreVM(t)
+		e, d, f, key, obj := restoreVM(t)
 		if err := os.WriteFile(filepath.Join(e.dir, restoreAwaitedFile), nil, 0o600); err != nil {
 			t.Fatal(err)
 		}
 		e.docker.restoreErr = c.restoreErr
+		vol := stackVolumeOf(t, d, "uploads")
+		f.volumes[vol], f.stageErr = []byte("since the backup"), c.stageErr
 		if c.swapErr != nil {
 			prev := e.docker.answer
 			e.docker.answer = func(a string) ([]byte, bool, error) {
@@ -184,6 +193,146 @@ func TestARestoreThatFailsBringsTheStackUpAgain(t *testing.T) {
 		if calls := composeCalls(e, n); len(calls) == 0 || calls[len(calls)-1] != "up --detach" {
 			t.Errorf("%s: the stack is not brought up again: %v", name, calls)
 		}
+		if string(f.volumes[vol]) != "since the backup" || len(f.staged) != 0 {
+			t.Errorf("%s: the volume is %q, staged %q", name, f.volumes[vol], f.staged)
+		}
+	}
+}
+
+// A volume that cannot be swapped in once the database is fails the restore, naming it, every
+// volume tried; it keeps the backup's files and its own, and the install still awaits a restore.
+func TestAVolumeNotSwappedInFailsTheRestore(t *testing.T) {
+	t.Parallel()
+	e, d, f, key := backupVM(t)
+	e.r.Spec.Backup.Config["volumes"] = []any{"keys", "uploads"}
+	configure(t, d, validConfig(key))
+	e.docker.answer = func(a string) ([]byte, bool, error) {
+		return []byte("api\nweb\npostgres\n"), strings.HasSuffix(a, "config --services"), nil
+	}
+	h := d.Handler()
+	call(t, h, "POST", "/v1/backup", BackupRequest{}, nil)
+	obj := waitJob(t, h).Target
+	if err := os.WriteFile(filepath.Join(e.dir, restoreAwaitedFile), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	keys, uploads := stackVolumeOf(t, d, "keys"), stackVolumeOf(t, d, "uploads")
+	f.volumes[keys], f.volumes[uploads] = []byte("keys since"), []byte("uploads since")
+	f.swapErr, f.swapFails = exitCode(1), "_keys"
+	n := len(e.docker.ran("compose"))
+	call(t, h, "POST", "/v1/restore", RestoreRequest{Object: obj, Identity: key.String(), Confirm: &Version{"1.0.0", 1}}, nil)
+	j := waitJob(t, h)
+	if j.State != "failed" || !strings.Contains(j.Error, "but not every volume was swapped in (the volume keys: exit status 1; its files are split between its root, .stowage-restore — the backup's — and .stowage-replaced — its own): the services stay stopped, restore again") {
+		t.Errorf("%+v", j)
+	}
+	// Nothing replaced is deleted, and the services stay stopped on data of two times.
+	if len(f.dropped) != 0 || len(e.docker.ran("compose")) == 0 || strings.Contains(fmt.Sprint(composeCalls(e, n)), "up --detach") || slices.ContainsFunc(e.docker.ran("compose")[n:], func(c Cmd) bool { return slices.Contains(c.Args, dropScript) }) {
+		t.Errorf("dropped %v, ran %v", f.dropped, composeCalls(e, n))
+	}
+	// The other volume is swapped in all the same; the failed one keeps its staging.
+	if len(f.staged) != 1 || f.staged[keys] == nil || string(f.volumes[uploads]) != "" || e.docker.restored != "the database's dump" {
+		t.Errorf("staged %q, volumes %q, database %q", f.staged, f.volumes, e.docker.restored)
+	}
+	if _, err := os.Stat(filepath.Join(e.dir, restoreAwaitedFile)); err != nil {
+		t.Error("the restore awaited is no longer, though the volumes are not whole")
+	}
+	var st Status
+	if call(t, h, "GET", "/v1/status", nil, &st); !st.VolumesSplit {
+		t.Errorf("status %+v", st)
+	}
+	// Marked: no backup is taken, nothing brings the stack up, across the daemon's runs.
+	var refused errOf
+	if code := call(t, h, "POST", "/v1/backup", BackupRequest{}, &refused); code != 409 || !strings.Contains(refused.Error, "half restored") {
+		t.Errorf("a backup of half restored volumes: %d %s", code, refused.Error)
+	}
+	if err := e.installer(vm).up(context.Background(), e.readEnv()); err == nil || !strings.Contains(err.Error(), "its services stay stopped until a restore again finishes") {
+		t.Errorf("up: %v", err)
+	}
+	// Nothing else starts a service, writes the data or moves the release either.
+	for _, path := range []string{"/v1/services/api/start", "/v1/services/api/restart", "/v1/upgrade", "/v1/rollback"} {
+		var e409 errOf
+		if code := call(t, h, "POST", path, map[string]any{}, &e409); code != 409 || !strings.Contains(e409.Error, "half restored") {
+			t.Errorf("%s: %d %s", path, code, e409.Error)
+		}
+	}
+	// The stopped services' containers went: no restart policy starts them at a reboot.
+	if !slices.ContainsFunc(e.docker.ran("compose")[n:], func(c Cmd) bool { return strings.HasSuffix(strings.Join(c.Args, " "), " rm --stop --force api web") }) {
+		t.Error("the stopped services' containers were kept")
+	}
+	before, _ := os.ReadFile(filepath.Join(e.dir, envName))
+	for name, run := range map[string]func(*Installer) error{
+		"re-run": func(in *Installer) error {
+			in.O.Set = map[string]string{"ADMIN_EMAIL": "x@example.org"}
+			return in.Install(context.Background())
+		},
+		"secrets rotate": func(in *Installer) error {
+			for i := range in.R.Spec.Secrets {
+				in.R.Spec.Secrets[i].Rotation = in.R.Spec.Secrets[i].Key == "SESSION_SECRET"
+			}
+			return in.RotateSecret(context.Background(), "SESSION_SECRET", "stage")
+		},
+		"provision": func(in *Installer) error { return in.Provision(context.Background()) },
+		"reset-db":  func(in *Installer) error { in.O.Yes = true; return in.Reset(context.Background()) },
+	} {
+		if err := run(e.installer(vm)); err == nil || !strings.Contains(err.Error(), "half restored") {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+	if after, _ := os.ReadFile(filepath.Join(e.dir, envName)); !bytes.Equal(before, after) {
+		t.Error("a refused verb changed .env")
+	}
+	// A restore again finishes it: the mark goes, the stack comes up.
+	f.swapErr = nil
+	n = len(e.docker.ran("compose"))
+	call(t, h, "POST", "/v1/restore", RestoreRequest{Object: obj, Identity: key.String(), Confirm: &Version{"1.0.0", 1}}, nil)
+	if j := waitJob(t, h); j.State != "done" || fileExists(filepath.Join(e.dir, volumesSplitFile)) || !slices.Contains(composeCalls(e, n), "up --detach") {
+		t.Errorf("%+v, ran %v", j, composeCalls(e, n))
+	}
+	// It brought the database alone up first: an earlier restore left the stack down.
+	if !slices.ContainsFunc(e.docker.ran("compose")[n:], func(c Cmd) bool {
+		return strings.HasSuffix(strings.Join(c.Args, " "), " up --detach --wait --no-deps postgres")
+	}) {
+		t.Error("the database was not brought up for the restore again")
+	}
+}
+
+// A backup's volumes come back with its database: each archive staged beside the volume's data,
+// swapped in once the database is; one whose archive is missing is refused before anything stops.
+func TestARestoreBringsTheVolumesBackWithTheDatabase(t *testing.T) {
+	t.Parallel()
+	e, d, f, key := backupVM(t)
+	configure(t, d, validConfig(key))
+	e.docker.answer = func(a string) ([]byte, bool, error) {
+		return []byte("api\nweb\npostgres\n"), strings.HasSuffix(a, "config --services"), nil
+	}
+	vol := stackVolumeOf(t, d, "uploads")
+	f.volumes, f.staged = map[string][]byte{vol: []byte("at the backup")}, map[string][]byte{}
+	h := d.Handler()
+	call(t, h, "POST", "/v1/backup", BackupRequest{}, nil)
+	obj := waitJob(t, h).Target
+	f.volumes[vol] = []byte("since the backup")
+	req := RestoreRequest{Object: obj, Identity: key.String(), Confirm: &Version{"1.0.0", 1}}
+	call(t, h, "POST", "/v1/restore", req, nil)
+	if j := waitJob(t, h); j.State != "done" || !strings.Contains(strings.Join(j.Log, "\n"), "into the volume uploads") {
+		t.Fatalf("%+v", j)
+	}
+	if string(f.volumes[vol]) != "at the backup" || len(f.staged) != 0 || e.docker.restored != "the database's dump" {
+		t.Errorf("volume %q, staged %q, database %q", f.volumes[vol], f.staged, e.docker.restored)
+	}
+	if !slices.Equal(f.dropped, []string{vol}) {
+		t.Errorf("the former data deleted from %v", f.dropped)
+	}
+	for k := range f.objects {
+		if strings.HasSuffix(k, ".uploads.tar.age") {
+			delete(f.objects, k)
+		}
+	}
+	n := len(e.docker.ran("compose"))
+	call(t, h, "POST", "/v1/restore", req, nil)
+	if j := waitJob(t, h); j.State != "failed" || !strings.Contains(j.Error, "has no archive of the volume uploads to restore with it") {
+		t.Errorf("%+v", j)
+	}
+	if calls := composeCalls(e, n); slices.Contains(calls, "stop") || slices.Contains(calls, "restore") {
+		t.Errorf("ran %v", calls)
 	}
 }
 
@@ -420,9 +569,9 @@ func swapCommitted(t *testing.T, swapErr error) {
 	}
 }
 
-func TestASwapWhoseOutcomeCannotBeReadNamesProvision(t *testing.T) {
+func TestASwapWhoseOutcomeCannotBeReadSaysToRestoreAgain(t *testing.T) {
 	t.Parallel()
-	e, d, _, key, obj := restoreVM(t)
+	e, d, f, key, obj := restoreVM(t)
 	prev := e.docker.answer
 	e.docker.answer = func(a string) ([]byte, bool, error) {
 		switch {
@@ -434,9 +583,15 @@ func TestASwapWhoseOutcomeCannotBeReadNamesProvision(t *testing.T) {
 		return prev(a)
 	}
 	h := d.Handler()
+	n := len(e.docker.ran("compose"))
 	call(t, h, "POST", "/v1/restore", RestoreRequest{Object: obj, Identity: key.String(), Confirm: &Version{"1.0.0", 1}}, nil)
-	if j := waitJob(t, h); j.State != "failed" || !strings.Contains(j.Error, "could not be read") || !strings.Contains(j.Error, "stowage_replaced") || !strings.Contains(j.Error, "`sudo notes-stow provision`") {
+	if j := waitJob(t, h); j.State != "failed" || !strings.Contains(j.Error, "could not be read") || !strings.Contains(j.Error, "stowage_replaced") || !strings.HasSuffix(j.Error, "restore again to bring the backup back whole, its volumes included") {
 		t.Fatalf("%+v", j)
+	}
+	// The database may be the backup's beside volumes that are not: staging kept, the stack down
+	// and marked.
+	if len(f.staged) != 1 || !fileExists(filepath.Join(e.dir, volumesSplitFile)) || slices.Contains(composeCalls(e, n), "up --detach") {
+		t.Errorf("staged %q, ran %v", f.staged, composeCalls(e, n))
 	}
 }
 
@@ -470,5 +625,53 @@ func TestADropThatFailsAfterTheSwapIsStillARestore(t *testing.T) {
 	}
 	if drop < up {
 		t.Errorf("the drop ran at call %d, the stack up at %d", drop, up)
+	}
+}
+
+// A restore again whose database swap does not commit leaves the mark of the restore before it:
+// the volumes are still half restored, and the stack stays down.
+func TestARestoreAgainNotSwappedKeepsTheMark(t *testing.T) {
+	t.Parallel()
+	e, d, _, key, obj := restoreVM(t)
+	if err := os.WriteFile(filepath.Join(e.dir, volumesSplitFile), []byte(obj+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	prev := e.docker.answer
+	e.docker.answer = func(a string) ([]byte, bool, error) {
+		switch {
+		case strings.Contains(a, "RENAME TO stowage_replaced"):
+			return nil, true, exitCode(4)
+		case strings.Contains(a, "SELECT count(*) FROM pg_database WHERE datname = 'stowage_replaced'"):
+			return []byte("0\n"), true, nil
+		}
+		return prev(a)
+	}
+	h := d.Handler()
+	n := len(e.docker.ran("compose"))
+	call(t, h, "POST", "/v1/restore", RestoreRequest{Object: obj, Identity: key.String(), Confirm: &Version{"1.0.0", 1}}, nil)
+	j := waitJob(t, h)
+	if j.State != "failed" || !strings.Contains(j.Error, "the volumes still half restored: restore again") {
+		t.Errorf("%+v", j)
+	}
+	stackUp := slices.ContainsFunc(e.docker.ran("compose")[n:], func(c Cmd) bool {
+		a := strings.Join(c.Args, " ")
+		return strings.Contains(a, " up --detach ") && !strings.Contains(a, "--no-deps")
+	})
+	if !fileExists(filepath.Join(e.dir, volumesSplitFile)) || stackUp {
+		t.Errorf("the mark went or the stack came up: %v", composeCalls(e, n))
+	}
+}
+
+// No restore while an upgrade waits in the passive slot: one that left the volumes half restored
+// would strand it.
+func TestARestoreWaitsForAnUpgradesBoot(t *testing.T) {
+	t.Parallel()
+	_, d, _, key, obj := restoreVM(t)
+	if err := os.WriteFile(filepath.Join(d.Run, osWritten), []byte("notes 1.0.1 (revision 1)\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var e409 errOf
+	if code := call(t, d.Handler(), "POST", "/v1/restore", RestoreRequest{Object: obj, Identity: key.String(), Confirm: &Version{"1.0.0", 1}}, &e409); code != 409 || !strings.Contains(e409.Error, "reboot first, then restore") {
+		t.Errorf("%d %s", code, e409.Error)
 	}
 }

@@ -1,6 +1,7 @@
 package install
 
 import (
+	"archive/tar"
 	"bytes"
 	"cmp"
 	"context"
@@ -475,6 +476,110 @@ func ownBackups(name, profile string) string {
 	return name + "-" + profile + `-{{\d{8}T\d{6}Z}}-*.pgdump.age`
 }
 
+// composeKV is a compose mapping as key=value entries: a mapping's sorted by key, a list's as
+// listed.
+func composeKV(v any) []string {
+	var out []string
+	switch v := v.(type) {
+	case map[string]any:
+		for _, k := range sortedKeys(v) {
+			out = append(out, k+"="+fmt.Sprint(cmp.Or(v[k], any(""))))
+		}
+	case []any:
+		for _, e := range v {
+			out = append(out, fmt.Sprint(e))
+		}
+	}
+	return out
+}
+
+// ownArchives is the rclone filter of a profile's backups' volume archives.
+func ownArchives(name, profile string) string {
+	return name + "-" + profile + `-{{\d{8}T\d{6}Z}}-*.tar.age`
+}
+
+// volumeObject names the archive of the volume vol beside the backup obj: obj's name, the volume
+// in place of the dump.
+func volumeObject(obj, vol string) string {
+	return strings.TrimSuffix(obj, ".pgdump.age") + "." + vol + ".tar.age"
+}
+
+// stackVolume is the Docker volume of the stack's compose volume key: the one Compose labelled as
+// the project's, else the one named as Compose names it, when it exists and is the stack's. When
+// there is none it is "", unless create: then it is made as the compose file declares it.
+func (in *Installer) stackVolume(ctx context.Context, env *EnvFile, key string, create bool) (string, error) {
+	project, _ := env.Get("COMPOSE_PROJECT_NAME")
+	if project == "" {
+		return "", fmt.Errorf("%s records no COMPOSE_PROJECT_NAME: its volumes cannot be found", in.path(envName))
+	}
+	labels := []string{"com.docker.compose.project=" + project, "com.docker.compose.volume=" + key}
+	out, err := in.O.Docker.Run(ctx, Cmd{Args: []string{"volume", "ls", "--filter", "label=" + labels[0], "--filter", "label=" + labels[1], "--format", "{{.Name}}"}})
+	if err != nil {
+		return "", fmt.Errorf("listing the volumes: %w", err)
+	}
+	switch names := strings.Fields(string(out)); len(names) {
+	case 0:
+	case 1:
+		return names[0], nil
+	default:
+		return "", fmt.Errorf("the volume %s is %d Docker volumes (%s): remove those the stack no longer mounts", key, len(names), strings.Join(names, ", "))
+	}
+	var doc struct {
+		Volumes map[string]yaml.Node `yaml:"volumes"`
+	}
+	if err := yaml.Unmarshal(in.R.Compose, &doc); err != nil {
+		return "", fmt.Errorf("the release's compose file: %w", err)
+	}
+	// Only this volume's declaration is read; its labels and driver_opts a mapping or a list of
+	// key=value, as Compose takes them.
+	var decl struct {
+		Name       string `yaml:"name"`
+		Driver     string `yaml:"driver"`
+		DriverOpts any    `yaml:"driver_opts"`
+		Labels     any    `yaml:"labels"`
+	}
+	if n, ok := doc.Volumes[key]; ok {
+		if err := n.Decode(&decl); err != nil {
+			return "", fmt.Errorf("the release's compose file: volumes.%s: %w", key, err)
+		}
+	}
+	vol := cmp.Or(decl.Name, project+"_"+key)
+	// A volume found by its name alone is the stack's when it carries no project's labels (one
+	// Compose adopted) or this project's.
+	owner, err := in.O.Docker.Run(ctx, Cmd{Args: []string{"volume", "inspect", "--format", `{{index .Labels "com.docker.compose.project"}}`, vol}})
+	switch {
+	case err == nil:
+		if o := strings.TrimSpace(string(owner)); o != "" && o != "<no value>" && o != project {
+			return "", fmt.Errorf("volume %s belongs to the Compose project %s, not %s", vol, o, project)
+		}
+		return vol, nil
+	case !strings.Contains(strings.ToLower(err.Error()), "no such volume"):
+		return "", fmt.Errorf("volume %s: %w", vol, err)
+	case !create:
+		return "", nil
+	}
+	// Made as Compose would make it: its driver, options and labels, and Compose's own labels.
+	args := []string{"volume", "create", "--label", labels[0], "--label", labels[1]}
+	if decl.Driver != "" {
+		args = append(args, "--driver", decl.Driver)
+	}
+	for _, kv := range composeKV(decl.DriverOpts) {
+		args = append(args, "--opt", kv)
+	}
+	for _, kv := range composeKV(decl.Labels) {
+		args = append(args, "--label", kv)
+	}
+	for _, a := range args {
+		if strings.Contains(a, "$") {
+			return "", fmt.Errorf("volume %s: its declaration holds %q, which Compose interpolates: up the stack once, then restore again", vol, a)
+		}
+	}
+	if _, err := in.O.Docker.Run(ctx, Cmd{Args: append(args, vol)}); err != nil {
+		return "", fmt.Errorf("creating the volume %s: %w", vol, err)
+	}
+	return vol, nil
+}
+
 // within joins a destination and a name in it.
 func within(dest, name string) string {
 	if strings.HasSuffix(dest, ":") || strings.HasSuffix(dest, "/") {
@@ -570,6 +675,10 @@ func (h *Hostd) planBackup(ctx context.Context, req BackupRequest) (*backupPlan,
 	if err != nil {
 		return nil, err
 	}
+	// A backup of volumes half restored would pass for a whole one.
+	if err := in.volumesSplit(); err != nil {
+		return nil, fail(http.StatusConflict, "%v", err)
+	}
 	h.backupMu.Lock()
 	c, err := h.readBackup(pg)
 	h.backupMu.Unlock()
@@ -651,12 +760,17 @@ func (h *Hostd) takeBackup(in *Installer, env *EnvFile, c BackupConfig, pg *prov
 	return run
 }
 
-// dumpUpload streams the encrypted dump to the destination, checks the size it reached, then
-// prunes the profile's backups past the retention; it returns the bytes uploaded and the
-// pruning's error apart.
+// dumpUpload streams each volume's encrypted archive, then the encrypted dump, to the destination,
+// checking the size each reached, then prunes the profile's backups past the retention; it
+// returns the bytes uploaded and the pruning's error apart. The dump is the backup's last object:
+// one that failed leaves none of them.
 func (h *Hostd) dumpUpload(ctx context.Context, in *Installer, env *EnvFile, c BackupConfig, pg *providers.PgAgeRclone, profile, obj string, logf func(string, ...any)) (int64, error, error) {
 	recips, err := validBackup(c, pg)
 	if err != nil {
+		return 0, nil, err
+	}
+	// A backup of volumes half restored would pass for a whole one (an upgrade's first too).
+	if err := in.volumesSplit(); err != nil {
 		return 0, nil, err
 	}
 	conf, done, err := h.rcloneConf(c)
@@ -682,73 +796,168 @@ func (h *Hostd) dumpUpload(ctx context.Context, in *Installer, env *EnvFile, c B
 	for _, t := range pg.Exclude[profile] {
 		dump = append(dump, "--exclude-table-data="+t)
 	}
+	var sent []string
+	discard := func() {
+		for _, dest := range sent {
+			h.discard(ctx, in, conf, dest, logf)
+		}
+	}
+	var total int64
+	var image string
+	if len(pg.Volumes) > 0 {
+		if image, err = h.runnerImage(ctx, in); err != nil {
+			return 0, nil, err
+		}
+	}
+	for _, v := range pg.Volumes {
+		vol, err := in.stackVolume(ctx, env, v, false)
+		if err != nil {
+			discard()
+			return 0, nil, err
+		}
+		dest := within(c.Destination, volumeObject(obj, v))
+		logf("archiving the volume %s, encrypted to %d recipient(s), to %s", v, len(recips), dest)
+		n, err := h.encryptUpload(ctx, in, conf, recips, dest, func(w io.Writer) error {
+			if vol == "" {
+				// Never created (no service of it ran): an archive of nothing.
+				return tar.NewWriter(w).Close()
+			}
+			_, err := h.runnerShell(ctx, in, image, vol, true, nil, w, archiveScript)
+			if err != nil {
+				err = fmt.Errorf("the archive of the volume %s: %w", v, err)
+			}
+			return err
+		}, logf)
+		if err != nil {
+			discard()
+			return 0, nil, err
+		}
+		sent, total = append(sent, dest), total+n
+	}
 	dest := within(c.Destination, obj)
 	logf("dumping %s's database (profile %s), encrypted to %d recipient(s), to %s", h.R.Spec.Name, profile, len(recips), dest)
-	pr, pw := io.Pipe()
-	// The dump's own error does not say whether the upload stopped first (the CLI reports its
-	// exit, not the broken pipe): its writes do.
-	watched := &pipeWatch{w: pw}
-	dumped := make(chan error, 1)
-	go func() {
-		enc, err := age.Encrypt(watched, recips...)
-		if err == nil {
-			_, err = in.O.Docker.Run(ctx, Cmd{Args: append(in.composeBase(), dump...), Env: env.Environ(in.O.environ()), Stdout: enc})
-			if err == nil {
-				err = enc.Close()
-			}
-		}
+	n, err := h.encryptUpload(ctx, in, conf, recips, dest, func(w io.Writer) error {
+		_, err := in.O.Docker.Run(ctx, Cmd{Args: append(in.composeBase(), dump...), Env: env.Environ(in.O.environ()), Stdout: w})
 		if err != nil {
 			err = fmt.Errorf("the dump: %w", err)
 		}
+		return err
+	}, logf)
+	if err != nil {
+		discard()
+		return 0, nil, err
+	}
+	total += n
+	var prune error
+	if c.RetentionDays != 0 {
+		_, prune = h.rclone(ctx, in, conf, nil, "delete", "--min-age", fmt.Sprintf("%dd", c.RetentionDays), "--max-depth", "1", "--include", ownBackups(h.R.Spec.Name, profile), c.Destination)
+	}
+	// Orphan archives go whatever the retention and the volumes now listed: a failed backup whose
+	// cleanup failed left them, or retention took a dump an earlier release archived volumes with.
+	if prune == nil {
+		prune = h.pruneArchives(ctx, in, conf, c.Destination, profile)
+	}
+	return total, prune, nil
+}
+
+// pruneArchives deletes the profile's volume archives whose dump is gone: retention goes by the
+// dump's age, as an archive, uploaded before its dump, is older than it. An archive younger than
+// a backup's limit may be a backup's still running (another install's, in a shared
+// destination): it stays.
+func (h *Hostd) pruneArchives(ctx context.Context, in *Installer, conf, dest, profile string) error {
+	name := h.R.Spec.Name
+	out, err := h.rclone(ctx, in, conf, nil, "lsjson", "--files-only", "--no-mimetype", "--max-depth", "1", "--include", ownBackups(name, profile), "--include", ownArchives(name, profile), dest)
+	if err != nil {
+		return err
+	}
+	var found []struct {
+		Name    string
+		ModTime time.Time
+	}
+	if err := json.Unmarshal(out, &found); err != nil {
+		return fmt.Errorf("the destination's list: %w", err)
+	}
+	var dumps []string
+	for _, f := range found {
+		if base, ok := strings.CutSuffix(f.Name, ".pgdump.age"); ok {
+			dumps = append(dumps, base+".")
+		}
+	}
+	var errs []error
+	for _, f := range found {
+		if !strings.HasSuffix(f.Name, ".tar.age") || time.Since(f.ModTime) < 2*backupTimeout ||
+			slices.ContainsFunc(dumps, func(d string) bool { return strings.HasPrefix(f.Name, d) }) {
+			continue
+		}
+		if _, err := h.rclone(ctx, in, conf, nil, "deletefile", within(dest, f.Name)); err != nil && !rcloneNotFound(err) {
+			errs = append(errs, fmt.Errorf("%s: %w", f.Name, err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// encryptUpload streams what produce writes, encrypted to recips, to dest, and checks the size it
+// reached; one that fails leaves nothing under its name.
+func (h *Hostd) encryptUpload(ctx context.Context, in *Installer, conf string, recips []age.Recipient, dest string, produce func(io.Writer) error, logf func(string, ...any)) (int64, error) {
+	pr, pw := io.Pipe()
+	// The producer's own error does not say whether the upload stopped first (the CLI reports
+	// its exit, not the broken pipe): its writes do.
+	watched := &pipeWatch{w: pw}
+	produced := make(chan error, 1)
+	go func() {
+		enc, err := age.Encrypt(watched, recips...)
+		if err == nil {
+			if err = produce(enc); err == nil {
+				err = enc.Close()
+			}
+		}
 		pw.CloseWithError(err)
-		dumped <- err
+		produced <- err
 	}()
 	sent := &counter{r: pr}
 	_, upErr := h.rcloneNamed(ctx, in, conf, h.runnerName(), sent, "rcat", dest)
-	// An upload that stopped early leaves the dump nothing to write to.
+	// An upload that stopped early leaves the producer nothing to write to.
 	pr.CloseWithError(errUploadEnded)
-	dumpErr := <-dumped
+	prodErr := <-produced
 	ctxErr := ctx.Err() // before the cleanup, which may outlast the deadline
-	// A backup that fails leaves nothing under its name: rclone may have taken the dump's end for
-	// the file's, or a backend kept what it was sent. The run's context may be over (the
-	// backup's timeout, the daemon stopping): the cleanup has its own.
-	discard := func() {
-		clean, cancel := context.WithTimeout(context.WithoutCancel(ctx), rcloneTimeout)
-		defer cancel()
-		if _, err := h.rclone(clean, in, conf, nil, "deletefile", dest); err != nil && !rcloneNotFound(err) {
-			logf("%s may be left incomplete: deleting it failed (%v)", dest, err)
-		}
-	}
-	if dumpErr != nil || upErr != nil {
-		discard()
+	// A failed upload leaves nothing under its name: rclone may have taken the stream's end for
+	// the file's, or a backend kept what it was sent.
+	if prodErr != nil || upErr != nil {
+		h.discard(ctx, in, conf, dest, logf)
 		switch {
 		case errors.Is(ctxErr, context.DeadlineExceeded):
-			return 0, nil, fmt.Errorf("the backup did not finish within %s", backupTimeout)
+			return 0, fmt.Errorf("the backup did not finish within %s", backupTimeout)
 		case ctxErr != nil:
-			return 0, nil, errors.New("the backup was stopped: the host daemon is stopping")
-		case dumpErr != nil && !watched.ended.Load():
-			// The dump failed on its own: the upload's error is its echo.
-			return 0, nil, dumpErr
+			return 0, errors.New("the backup was stopped: the host daemon is stopping")
+		case prodErr != nil && !watched.ended.Load():
+			// The producer failed on its own: the upload's error is its echo.
+			return 0, prodErr
 		}
 		// The upload ended first (rclone may exit 0 before reading to the end).
-		return 0, nil, fmt.Errorf("the upload: %w", cmp.Or(upErr, errUploadEnded))
+		return 0, fmt.Errorf("the upload: %w", cmp.Or(upErr, errUploadEnded))
 	}
 	n := sent.n.Load()
 	out, err := h.rclone(ctx, in, conf, nil, "lsjson", "--files-only", "--no-mimetype", dest)
 	if err != nil {
-		discard()
-		return n, nil, fmt.Errorf("the uploaded backup could not be checked: %w", err)
+		h.discard(ctx, in, conf, dest, logf)
+		return n, fmt.Errorf("the uploaded backup could not be checked: %w", err)
 	}
 	var found []struct{ Size int64 }
 	if err := json.Unmarshal(out, &found); err != nil || len(found) != 1 || found[0].Size != n {
-		discard()
-		return n, nil, fmt.Errorf("the destination holds %s, not the %d bytes sent", strings.TrimSpace(string(out)), n)
+		h.discard(ctx, in, conf, dest, logf)
+		return n, fmt.Errorf("the destination holds %s, not the %d bytes sent", strings.TrimSpace(string(out)), n)
 	}
-	if c.RetentionDays == 0 {
-		return n, nil, nil
+	return n, nil
+}
+
+// discard deletes dest, an object a failed backup sent. The run's context may be over (the
+// backup's timeout, the daemon stopping): the cleanup has its own.
+func (h *Hostd) discard(ctx context.Context, in *Installer, conf, dest string, logf func(string, ...any)) {
+	clean, cancel := context.WithTimeout(context.WithoutCancel(ctx), rcloneTimeout)
+	defer cancel()
+	if _, err := h.rclone(clean, in, conf, nil, "deletefile", dest); err != nil && !rcloneNotFound(err) {
+		logf("%s may be left incomplete: deleting it failed (%v)", dest, err)
 	}
-	_, prune := h.rclone(ctx, in, conf, nil, "delete", "--min-age", fmt.Sprintf("%dd", c.RetentionDays), "--max-depth", "1", "--include", ownBackups(h.R.Spec.Name, profile), c.Destination)
-	return n, prune, nil
 }
 
 // errUploadEnded is what the dump meets when the upload stopped first.
@@ -863,28 +1072,59 @@ func (h *Hostd) rcloneTo(ctx context.Context, in *Installer, dir, name string, s
 	if stdin != nil {
 		a = append(a, "-i")
 	}
-	prefix := ""
-	if env, err := in.open(); err == nil {
-		prefix, _ = env.Get("STOWAGE_REGISTRY")
-		// A Docker install pulls the runner again when the engine lost it (an image prune):
-		// with its images, as the install pulls them.
-		if h.Docker {
-			if _, ierr := in.O.Docker.Run(ctx, Cmd{Args: []string{"image", "inspect", "--format", "{{.Id}}", in.imageRef(prefix, backup.Key)}}); ierr != nil {
-				if err := in.fetchImages(ctx, env); err != nil {
-					return nil, fmt.Errorf("the backup runner: %w", err)
-				}
+	image, err := h.runnerImage(ctx, in)
+	if err != nil {
+		return nil, err
+	}
+	a = append(append(a, image, "--config", "/config/rclone/rclone.conf"), args...)
+	return h.runRunner(ctx, in, name, Cmd{Args: a, Stdin: stdin, Stdout: stdout})
+}
+
+// runnerImage is the backup runner's image reference. A Docker install pulls it again when the
+// engine lost it (an image prune): with its images, as the install pulls them.
+func (h *Hostd) runnerImage(ctx context.Context, in *Installer) (string, error) {
+	env, err := in.open()
+	if err != nil {
+		return in.imageRef("", backup.Key), nil
+	}
+	prefix, _ := env.Get("STOWAGE_REGISTRY")
+	ref := in.imageRef(prefix, backup.Key)
+	if h.Docker {
+		if _, ierr := in.O.Docker.Run(ctx, Cmd{Args: []string{"image", "inspect", "--format", "{{.Id}}", ref}}); ierr != nil {
+			if err := in.fetchImages(ctx, env); err != nil {
+				return "", fmt.Errorf("the backup runner: %w", err)
 			}
 		}
 	}
-	a = append(append(a, in.imageRef(prefix, backup.Key), "--config", "/config/rclone/rclone.conf"), args...)
-	out, err := in.O.Docker.Run(ctx, Cmd{Args: a, Stdin: stdin, Stdout: stdout})
+	return ref, nil
+}
+
+// runRunner runs c, a runner container named name; a stopped docker CLI leaves its container
+// running, which is then removed.
+func (h *Hostd) runRunner(ctx context.Context, in *Installer, name string, c Cmd) ([]byte, error) {
+	out, err := in.O.Docker.Run(ctx, c)
 	if err != nil && ctx.Err() != nil {
-		// A stopped docker CLI leaves its container running.
 		clean, cancel := context.WithTimeout(context.WithoutCancel(ctx), rcloneTimeout)
 		defer cancel()
 		_, _ = in.O.Docker.Run(clean, Cmd{Args: []string{"rm", "--force", name}})
 	}
 	return out, err
+}
+
+// runnerShell runs script in the runner's shell (image, the reference runnerImage resolved), off any network, with the Docker volume vol
+// mounted at /v (read-only when ro), stdin given when not nil and its output streamed to stdout.
+func (h *Hostd) runnerShell(ctx context.Context, in *Installer, image, vol string, ro bool, stdin io.Reader, stdout io.Writer, script string) ([]byte, error) {
+	mount := vol + ":/v"
+	if ro {
+		mount += ":ro"
+	}
+	name := h.runnerName()
+	a := []string{"run", "--rm", "--pull", "never", "--network", "none", "--name", name, "-v", mount}
+	if stdin != nil {
+		a = append(a, "-i")
+	}
+	a = append(a, "--entrypoint", "sh", image, "-euc", script)
+	return h.runRunner(ctx, in, name, Cmd{Args: a, Stdin: stdin, Stdout: stdout})
 }
 
 // runnerCall is a short call of the runner with the settings: list and verify.

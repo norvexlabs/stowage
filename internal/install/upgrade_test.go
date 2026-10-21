@@ -1,6 +1,7 @@
 package install
 
 import (
+	"bytes"
 	"compress/gzip"
 	"context"
 	"encoding/json"
@@ -1217,5 +1218,23 @@ func TestAnInputMovedToASecretIsKept(t *testing.T) {
 	to := &Release{Spec: &spec.Spec{Secrets: []spec.Secret{{Key: "DB_PASSWORD", Gen: "hex16"}}, SafeDefaults: map[string]string{"MODE": "safe"}}}
 	if r := removedBy(from, to); strings.Join(r.inputs, ",") != "GONE,MODE" {
 		t.Errorf("removed %v", r.inputs)
+	}
+}
+
+// An install a restore left half restored is not upgraded: a restore again finishes it, onto the
+// release it runs only.
+func TestUpgradeRefusesVolumesHalfRestored(t *testing.T) {
+	t.Parallel()
+	e := installed(t)
+	before, _ := os.ReadFile(filepath.Join(e.dir, envName))
+	if err := os.WriteFile(filepath.Join(e.dir, volumesSplitFile), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	e.to("2.0.0", nil)
+	if err := e.upgrade(nil); err == nil || !strings.Contains(err.Error(), "half restored") {
+		t.Fatalf("err = %v", err)
+	}
+	if after, _ := os.ReadFile(filepath.Join(e.dir, envName)); !bytes.Equal(before, after) {
+		t.Error("the refused upgrade changed .env")
 	}
 }

@@ -422,6 +422,27 @@ func TestVMCreateWritesTheSSHSourcesAndTheTimeZone(t *testing.T) {
 	}
 }
 
+// The plan names the L4 ports the VM opens, and from which sources, and the host devices the
+// stack maps, which the VM must have.
+func TestVMCreatePlanNamesTheL4PortsAndTheDevices(t *testing.T) {
+	t.Parallel()
+	v := newVMCreate(t, "qcow2")
+	v.r.Spec.L4.Routes = []spec.L4Route{
+		{Name: "db", Protocol: "tcp", Port: 15432, Upstream: "postgres:5432"},
+		{Name: "feed", Protocol: "udp", Port: 17007, Upstream: "api:17007", AllowInput: "FEED_SOURCES"},
+	}
+	v.r.Compose = bytes.Replace(v.r.Compose, []byte("  web:\n"), []byte("  web:\n    devices: [\"/dev/ttyUSB0:/dev/ttyS0\"]\n"), 1)
+	if err := v.create(VMCreate{Platform: "libvirt"}, nil); err != nil {
+		t.Fatalf("%v\n%s", err, v.log)
+	}
+	for _, want := range []string{"  opens tcp/15432 (L4 route db) to every source\n", "  opens udp/17007 (L4 route feed) to the sources of FEED_SOURCES\n",
+		"  the service web maps the host's /dev/ttyUSB0: the VM must have them\n"} {
+		if !strings.Contains(v.log.String(), want) {
+			t.Errorf("no %q in:\n%s", want, v.log)
+		}
+	}
+}
+
 func TestVMCreateWithSecretsWaitsForThemOverSSH(t *testing.T) {
 	t.Parallel()
 	v := newVMCreate(t, "qcow2")

@@ -478,6 +478,14 @@ func (l *linter) stack() {
 				l.warnf(w+".ports", "published past Stowage, which neither checks nor lists it: declare it in l4.routes")
 			}
 		}
+		if svc.NetworkMode == "host" {
+			switch {
+			case l.s.Shapes.Kairos != nil:
+				l.errf(w+".network_mode", "host: the VM's firewall opens only what Stowage publishes, and a port on the host's network is none: publish it with l4.routes")
+			case l.s.Shapes.Docker != nil:
+				l.warnf(w+".network_mode", "host: the service listens on the host past Stowage, which neither checks nor lists its ports: publish them with l4.routes")
+			}
+		}
 		for _, p := range svc.Profiles {
 			if !slices.Contains(l.s.Profiles(), p) {
 				l.errf(w+".profiles", "no input turns %s on: name it in an input's profile:, or remove it (no install ever starts this service)", p)
@@ -720,6 +728,30 @@ func (l *linter) l4() {
 				l.errf(w+".address_input", "%s's default: %v", k, err)
 			}
 		}
+		if k := r.AllowInput; k != "" {
+			l.l4Allow(w+".allow_input", k)
+		}
+	}
+}
+
+// l4Allow checks an L4 route's allowlist input: only the VM's firewall enforces it (a Docker
+// host's is the operator's), so it is asked on the kairos shape alone, in every mode, and an
+// empty one refuses every source; without a kairos shape nothing enforces it (a warning).
+func (l *linter) l4Allow(where, key string) {
+	in, ok := l.s.Input(key)
+	switch {
+	case !ok:
+		l.errf(where, "%s is not an input", key)
+	case l.s.Shapes.Kairos == nil:
+		l.warnf(where, "only the VM's firewall enforces it, and the project has no kairos shape: the route is open to every source (a Docker host's firewall is the operator's)")
+	case !slices.Equal(in.Shapes, []string{"kairos"}):
+		l.errf(where, "%s must be asked on the kairos shape alone (shapes: [kairos]): only the VM's firewall enforces it, a Docker host's is the operator's", key)
+	case in.Secret:
+		l.errf(where, "%s is secret: the firewall's rules show it", key)
+	case in.Advanced:
+		l.errf(where, "%s is advanced, never asked: the route would refuse every source until it is set", key)
+	case in.When != "":
+		l.errf(where, "%s is asked only when %s: the firewall reads it in every mode", key, in.When)
 	}
 }
 
@@ -991,7 +1023,7 @@ func (l *linter) readInputs() func(spec.Input) bool {
 	}
 	// The installer reads the L4 routes' address inputs.
 	for _, r := range l.s.L4.Routes {
-		inCompose[r.AddressInput] = true
+		inCompose[r.AddressInput], inCompose[r.AllowInput] = true, true
 	}
 	return func(in spec.Input) bool {
 		if in.Profile != "" {
@@ -1102,6 +1134,38 @@ func (l *linter) hooks() {
 		l.errf("backup", "a backup dumps the database, and the project declares none")
 	} else if err := providers.Backup(l.s.Backup, l.s.Images); err != nil {
 		l.errf("backup", "%v", err)
+	} else if pg, err := providers.DecodeBackup(l.s.Backup); err == nil {
+		l.backupVolumes(pg.Volumes)
+	}
+}
+
+// backupVolumes checks the volumes a backup archives: each one the compose file declares and
+// Compose creates, under a literal name (a backup finds it by its labels or that name), and none
+// the database mounts (its files are the dump's, read live).
+func (l *linter) backupVolumes(vols []string) {
+	if l.compose == nil {
+		return
+	}
+	decls, _ := l.compose.TopLevel["volumes"].(map[string]any)
+	for i, v := range vols {
+		w := fmt.Sprintf("backup.volumes[%d]", i)
+		decl, ok := decls[v]
+		if !ok {
+			l.errf(w, "%q is not a volume %s declares", v, l.s.Stack.Compose)
+			continue
+		}
+		d, _ := decl.(map[string]any)
+		if ext, ok := d["external"]; ok && ext != false {
+			l.errf(w, "%q is an external volume, which Compose does not own: a backup finds a volume by its labels", v)
+		}
+		if name, _ := d["name"].(string); strings.Contains(name, "$") {
+			l.errf(w, "%q is named %q, which Compose interpolates: a backup finds a volume by its labels or a literal name", v, name)
+		}
+		if l.s.HasDatabase() {
+			if svc, ok := l.compose.Services[l.s.DB().Service]; ok && mountsVolume(svc.Volumes, v) {
+				l.errf(w, "%q is mounted by the database's service: the dump backs its data up, and an archive of its files read live would not restore", v)
+			}
+		}
 	}
 }
 

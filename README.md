@@ -89,7 +89,7 @@ sh notes.sh
 | **Operate** | operator | `status`, a re-run to change inputs, ports or the TLS mode (the changes logged, the previous values kept), `provision`, `secrets rotate` (stage, swap, finish: the old value accepted meanwhile), `secrets export` (age-encrypted, to rebuild a machine), `reset-db`. |
 | **Upgrade** | operator | `upgrade --version V` fetches that release's installer, checks its signature against the keys the install trusts and brings the stack up on the new images — on Docker after a `pg_dump` snapshot, on Kubernetes through Helm. On the VM, `updates` lists what the channel offers and `upgrade` reboots into the new OS. |
 | **Roll back** | operator | `rollback` returns to the previous release — unless a migration since then is a rollback barrier your schema-compat provider reports, in which case it refuses and names it. On the VM the health gate does it alone: an upgraded boot that is not healthy in time falls back to the previous system. |
-| **Recover** | operator | On the VM: scheduled and pre-upgrade backups (`pg_dump`, encrypted to age keys, uploaded with rclone to any rclone remote), `restore` into a side database swapped in once loaded whole, and a disaster recovery from exported secrets. |
+| **Recover** | operator | On the VM: scheduled and pre-upgrade backups (`pg_dump` and the volumes the project lists, encrypted to age keys, uploaded with rclone to any rclone remote), `restore` into a side database swapped in once loaded whole, and a disaster recovery from exported secrets. |
 | **Disconnected sites** | operator | `mirror export` carries a release, signatures included, as one file; `mirror import` loads it into a local registry; installs and upgrades then read the mirror (`--registry`, `--registry-ca`). |
 
 ### What each shape gets
@@ -385,13 +385,15 @@ A control plane with daemons of its own (raw TCP or UDP, its own TLS, its own co
 API it is set up through) packages without changing the software, through the compose file:
 
 - **Ports clients dial as they are** are `l4` routes (see "Spec keys"), the endpoint the stack
-  advertises given by the route's `address_input` (`STOWAGE_L4_<ROUTE>`). The front can move off
-  443 with `front.https_port`, when a daemon owns it.
+  advertises given by the route's `address_input` (`STOWAGE_L4_<ROUTE>`), the sources the VM's
+  firewall lets reach it by its `allow_input`. The front can move off 443 with
+  `front.https_port`, when a daemon owns it.
 - **Material minted once** (a CA, a server key and certificate, a token): a one-shot service of a
   small image (openssl, step-cli) writes it into a named volume, keeping what it finds there, and
   the services that read it `depends_on` it with `condition: service_completed_successfully` and
   mount the volume `:ro`. `up --wait` counts a one-shot done when it exits 0. Its inputs (a
-  hostname for a SAN) are inputs like any other; its policy is the project's.
+  hostname for a SAN) are inputs like any other; its policy is the project's. List the volume in
+  the backup's `volumes`, so a restore brings the material back with the data it belongs to.
 - **A daemon's own config format**: a thin entrypoint renders it from the environment (the
   recorded values compose interpolates) and from the volume's material, then `exec`s the daemon
   unchanged; or compose `configs:` with interpolated `content:`.
@@ -806,6 +808,9 @@ These are what `lint` checks; each finding names the key path or `file:line` to 
     what Stowage publishes), on the `docker` shape a warning (`published past Stowage, which
     neither checks nor lists it`). A port clients reach as it is
     — TCP or UDP, beside the front — is an `l4` route (see "Spec keys");
+  - a service on the host's network (`network_mode: host`, its own or the one it extends) is,
+    likewise, an error with a `kairos` shape (a port on the host's network is none Stowage
+    publishes) and a warning on the `docker` shape (`listens on the host past Stowage`);
   - a service with `profiles:` runs only while an input turns one of its profiles on (an input's
     `profile`, see "Spec keys"); a profile no input names is an error (no install would ever
     start the service);
@@ -899,8 +904,9 @@ These are what `lint` checks; each finding names the key path or `file:line` to 
     every boot of the active system good as it starts: the health gate marks it. The build fails
     when kairos-init's file is not the one this copy is derived from (by its sha256);
   - a default-deny firewall, `/etc/nftables.conf`, with SSH open to every source
-    (`/etc/nftables.d/ssh.nft`) and `/run/nftables.d` made at boot for the front's ports (see
-    "The firewall" under the installer on the Kairos VM);
+    (`/etc/nftables.d/ssh.nft`), `/run/nftables.d` made at boot for the install's ports, and a
+    forward chain enforcing the L4 routes' allowlists (see "The firewall" under the installer on
+    the Kairos VM);
   - SSH by key only (`/etc/ssh/sshd_config.d/10-<name>.conf`), an `admin` group (created when the
     base lacks it), `sudo` without a password for it (`/etc/sudoers.d/10-<name>`: its members log in with an SSH key and have none), a console banner (`/etc/issue.d/05-<name>.issue`),
     consoles on the screen and the serial port (serial last, so it owns `/dev/console`), the QEMU
@@ -1136,7 +1142,7 @@ database: reset-db has nothing to reset` (`… there is no backup to restore`). 
 | `images.<key>` | built (`context`, `dockerfile`, `target`, `args`, `inputs`: the paths whose content enters the image's inputs digest, default the whole context less `.dockerignore`) or `ref` (exclusive with the build keys). An image no service or hook uses is a warning; a `# syntax=` frontend or a `FROM $ARG` cannot be checked (warning) |
 | `stack.compose` | the compose file (its contract: "The contracts a project must honour"): `extends` within the file, `profiles:` only those an input's `profile` names, a `ports:` entry past this host an error with a `kairos` shape and a warning on `docker` |
 | `front` | `tls_modes` (`acme`, `dns-cloudflare`, `byo`, `internal`, `none`), `routes[]` (`name`, `domain_input`, `upstream: <service>:<port>`, `strip_headers`, where a trailing `*` matches a prefix; `forward_auth`: `address_input` (required), `uri_input`, `copy_headers` (header names); `allow_input`), `portal`, `loopback_ports`, `loopback_env`, `publish_ca` (`volume`: a volume the compose file declares; refused when the project offers neither `internal` nor `byo`), `http_port` and `https_port` (the host ports a TLS front publishes unless an install's `--http-port` / `--https-port` move them; absent or 0 is 80 and 443; they must differ). Route names must give distinct `STOWAGE_URL_` variables; each `domain_input` routes one upstream. An input `forward_auth` or `allow_input` names must be an input of the `docker` shape and, with a `kairos` shape, of that one too, and neither `required` (empty is how the front leaves it off) nor asked in one mode only (`when`); an `allow_input` input is not `advanced` (never asked, it would refuse everyone). Lint counts these inputs as read |
-| `l4` | `routes[]`: host ports published to a service as they are, beside the front and never through it — `name` (1 to 15 lowercase letters, digits or `-`, starting with a letter, no `-` at its end or beside another, as a chart names a Service port after it; neither another L4 route's nor a front route's name), `protocol` (`tcp` or `udp`), `port` (the host port, 1–65535; one route per protocol and port), `upstream: <service>:<port>` (a compose service), `address_input` (optional: an input, not `secret`, holding the host name or address clients dial — a lowercase host name whose last label is not all digits, or an IP address; no port, scheme or zone. It is checked when given, and lint checks its `default`; the install records the route's endpoint `STOWAGE_L4_<ROUTE>` from it, and lint counts it as read). With a `kubernetes` shape, a chart whose templates never read `.Values.stowage.l4` is warned. Over TCP a route's port may not be one the front publishes by default: `front.http_port` / `https_port` (80 and 443) in a TLS mode, a route's `loopback_ports` in loopback mode, and 80 and 443 while `acme` is offered (its challenges need them). The same port over UDP is free. See "L4 routes" under the installer |
+| `l4` | `routes[]`: host ports published to a service as they are, beside the front and never through it — `name` (1 to 15 lowercase letters, digits or `-`, starting with a letter, no `-` at its end or beside another, as a chart names a Service port after it; neither another L4 route's nor a front route's name), `protocol` (`tcp` or `udp`), `port` (the host port, 1–65535; one route per protocol and port), `upstream: <service>:<port>` (a compose service), `address_input` (optional: an input, not `secret`, holding the host name or address clients dial — a lowercase host name whose last label is not all digits, or an IP address; no port, scheme or zone. It is checked when given, and lint checks its `default`; the install records the route's endpoint `STOWAGE_L4_<ROUTE>` from it, and lint counts it as read), `allow_input` (optional: an input holding the source addresses and CIDRs, separated by commas or spaces, the VM's firewall lets reach the port — empty refuses every source; checked when given. Only the VM enforces it, so without a `kairos` shape it is a warning (the route is open to every source), and its input is asked on that shape alone (`shapes: [kairos]`: a Docker host's firewall is the operator's), is neither `secret` (the firewall's rules show it) nor `advanced` (never asked, it would refuse every source) nor asked in one mode only (`when`); lint counts it as read). With a `kubernetes` shape, a chart whose templates never read `.Values.stowage.l4` is warned. Over TCP a route's port may not be one the front publishes by default: `front.http_port` / `https_port` (80 and 443) in a TLS mode, a route's `loopback_ports` in loopback mode, and 80 and 443 while `acme` is offered (its challenges need them). The same port over UDP is free. See "L4 routes" under the installer |
 | `health` | `http-json` (`service`, `port`, `path`, `liveness_path`, `expect`: the JSON fields a ready answer carries), `http-status` (the same, `expect` a 200–399 status, default 200), `command` (`image`, `cmd`, `timeout_s`). The VM's health gate and `<short>-stow health` run it; the Docker installer waits on the compose healthchecks (`up --wait`) |
 | `database` | optional (see "A project without a database" above); given, `engine` (`postgres` only), `service`, `name`, `roles.migrate`, `roles.app` (all required; one role twice is allowed), `schema_compat` (`sql`, `command`, `none`; `sql`'s `baseline`, an integer ≥ 0 where absent or 0 means 1 (every other provider is at 1), is the schema epoch the release's migrations start from: see the upgrade notes on schema baselines) |
 | `data` | optional: `volumes.<name>.{uid, keep_on_reset}`, `reset` (volumes not `keep_on_reset`; empty is a warning, and `reset-db` refuses it; without a `database`, an error when not empty): the volumes `reset-db` wipes on Docker and the VM (on Kubernetes it deletes every claim of the release). `uid` is validated only (on Docker, a new named volume takes the owner of the image's directory it mounts on, so an image that runs as a user creates that directory owned by it) |
@@ -1147,7 +1153,7 @@ database: reset-db has nothing to reset` (`… there is no backup to restore`). 
 | `endpoint` | a route of `front.routes`: this project's endpoint when another project uses it as an extension. Its installer prints the route's URL at the end of an install (see "Extensions") |
 | `hooks.provision` | `container` (`image`, `cmd`, `env`: the inputs, secrets and safe defaults it receives, required, `[]` for none; `returns`: keys it may return, which `provision --set` sets before it returned them; `outputs`) |
 | `hooks.maintenance.disk_pressure` | `soft_pct`, `hard_pct` (1 ≤ soft < hard ≤ 99), `post` (`http://<service>:<port>/…`), `auth_secret` (a `secrets` key). The Kairos VM's host daemon acts on it (see "Disk pressure" under the installer on the Kairos VM), and a Docker install's own timer (see "Backups, restore and the disk-pressure watch on Docker"); Kubernetes ignores it, and without a `docker` or `kairos` shape it is a warning |
-| `backup` | optional, and only with a `database`: `pg-age-rclone` (`profiles`: a name of 1 to 32 lowercase letters and digits each, `all`, a list of the tables whose data it keeps — `table` in any schema, or `schema.table` —, or `{ exclude: [pattern, …] }`, the tables whose rows it leaves out, structure kept (`table` or `schema.table` of letters, digits and `_`, with pg_dump's `*` and `?`); `default_profile`, required with several), which the Kairos VM and a Docker install run (see "Backups" under the installer on the Kairos VM); `command`, validated only (with a `kairos` shape, a warning: the VM schedules no backup of it). A `docker` or `kairos` shape with a `pg-age-rclone` backup makes `ship` build and publish the backup runner (`<name>-backup`), which the OS bundle preloads and a Docker install pulls |
+| `backup` | optional, and only with a `database`: `pg-age-rclone` (`profiles`: a name of 1 to 32 lowercase letters and digits each, `all`, a list of the tables whose data it keeps — `table` in any schema, or `schema.table` —, or `{ exclude: [pattern, …] }`, the tables whose rows it leaves out, structure kept (`table` or `schema.table` of letters, digits and `_`, with pg_dump's `*` and `?`); `default_profile`, required with several; `volumes`, the compose volumes every backup also archives and a restore brings back with the database — each listed once, a volume the compose file declares and Compose creates (not `external`), under a literal name (no `${…}` in its `name:`), and none the database's service mounts: its data is the dump's), which the Kairos VM and a Docker install run (see "Backups" under the installer on the Kairos VM); `command`, validated only (with a `kairos` shape, a warning: the VM schedules no backup of it). A `docker` or `kairos` shape with a `pg-age-rclone` backup makes `ship` build and publish the backup runner (`<name>-backup`), which the OS bundle preloads and a Docker install pulls |
 | `shapes` | at least one of `docker: {}`, `kubernetes` (`chart`, a directory holding `Chart.yaml`; `postgres_modes`: `external`, `embedded`, `cnpg`, optional and validated only; an error without a `database`; `schema`: `url_env`, the variable holding the migrate role's URL in the container of the workload running `reads_newer_image`, and `image`, an images key holding `psql` — the schema check of `k8s upgrade` and `k8s rollback`, which needs the `sql` schema-compat provider with `reads_newer_image`; absent with that provider, a warning), `kairos` (`base`, the distribution converted into Kairos, and `kairos_init`, the kairos-init image, both pinned by digest; `disk_formats`: `raw`, `qcow2`, `ova`, `vhd`, `gce`, none publishing the bundle alone; `cloud_publish`: `aws`, `azure`, `gcp`, each adding the disk format it imports (`raw`, `vhd`, `gce`); `health_gate`: 0 < `poll_s` < `deadline_s` ≤ `deadline_after_reset_s`, the VM's health gate's window and polling (default 600, 1800 and 30 s; `deadline_after_reset_s` is validated only: `reset-db` does not reboot, so no boot is judged after it); `host_api`: the compose services given the host daemon's app socket on the VM, each in the compose file, none twice; no `backup` is a warning when there is a `database`). `ship` publishes the `kubernetes` chart and the `kairos` OS bundle and disks; `docker` and `kubernetes` have a runtime |
 
 A `command` provider answers per op: `version.get` → `{"version"}`; `scheme.validate`
@@ -1242,7 +1248,9 @@ again, to copy an installer to another host.
   the stack would be brought up again.
 - `status` prints the release (version, revision), the registry, then, while the first install
   has not finished, `not finished: the first install failed (<the first line of its error>); a
-  re-run of the installer with --dir D finishes it` (or `… runs, or was stopped; …`), each
+  re-run of the installer with --dir D finishes it` (or `… runs, or was stopped; …`); while a
+  restore left the volumes half restored, `not running: a restore left <name>'s volumes half
+  restored … (or a restore is running)` instead; each
   route's URL (after it, while an install given `--secrets` awaits its data, `not provisioned: a
   backup of the install --secrets came from is awaited; once loaded, `<short>-stow provision --dir D`
   provisions it`), each `l4` route as `<name> <protocol>/<port>` followed by its endpoint when it has
@@ -1556,9 +1564,11 @@ again, to copy an installer to another host.
   stack does not publish already; an install, re-run or upgrade refuses front ports on one of them
   (an upgrade's refusal says to move the front with a re-run of the installer the install runs,
   then upgrade) (`the front's https port 7443 is the L4 route data's: choose another with
-  --https-port`, `--http-port`, or `--ports` in loopback mode). Stowage neither probes nor
-  restricts them: the stack's health is the `health` provider's, and on Docker the host's
-  firewall is the operator's.
+  --https-port`, `--http-port`, or `--ports` in loopback mode). Stowage never probes them: the
+  stack's health is the `health` provider's. On Docker it never restricts them either (the host's
+  firewall is the operator's, and an `allow_input` is never asked there); on the VM the firewall
+  opens each route's port, from its `allow_input`'s sources alone when it has one (see "The
+  firewall" under the installer on the Kairos VM).
 - Optional services (an input's `profile`): the install records `COMPOSE_PROFILES` in `.env`, the
   profiles whose input holds a value, comma-separated and sorted (recorded empty while none is;
   not recorded for a project whose inputs name no profile). Every `docker compose` the installer
@@ -1603,7 +1613,8 @@ keeps (`<dir>/<short>-stow`, the release it runs; another is refused).
 - `backup config|run|status|list|verify` and `restore OBJECT` (`--dir D`, the other flags as on
   the VM — see "Backups" under the installer on the Kairos VM) take a project's `pg-age-rclone`
   backup: the settings in `backup.yaml` (root's alone) and the last run in `backup-last.json` in
-  the install directory, the dump encrypted to the recipients as it streams to the backup runner
+  the install directory, the volumes' archives and the dump encrypted to the recipients as they
+  stream to the backup runner
   (`<name>-backup`, pulled with the stack's images, by digest, since a release of a project with
   the `docker` shape and a `pg-age-rclone` backup publishes one, and pulled again when the engine
   lost it), and the restore into a database
@@ -2088,7 +2099,11 @@ in the same installer (bootstrap it as above, then `sh <name>.sh vm create …`,
   input: one given is refused, and one the install
   requires is named at the end, for the operator to give over SSH (`ssh <user>@<address> sudo
   <short>-stow install`). The answers are reviewed ("Go on with these answers"), the whole is shown,
-  and on a terminal confirmed; without one the flags and the defaults decide.
+  and on a terminal confirmed; without one the flags and the defaults decide. The whole names the
+  ports the VM opens to each `l4` route (`opens tcp/15432 (L4 route db) to every source`, or `to
+  the sources of <its allow_input>`) and the host devices each service maps (`devices:`, its own
+  and those it extends: `the service S maps the host's /dev/…: the VM must have them`), which
+  the VM's platform or module must give it.
 - It boots the disk set the release records: its own disks, or, for a release shipped without
   them, the set its manifest names (`boot_disks`); a set no longer in the registry (a newer one
   replaced it) gives way to the set of the channel's pointer (its manifest signed by a key this
@@ -2293,7 +2308,7 @@ sudo <short>-stow install [--channel C] [--set KEY=VALUE]… [--answers FILE] [-
           [--ports route=port,…] [--address 127.x.x.x] [--tls MODE] [--domains route=host,…]
           [--cert F --key F [--ca F]] [--http-port N] [--https-port N] [--no-provision] [--dry-run]
           [--secrets FILE|- | --new-secrets]   (both: refused)
-<short>-stow status [--json]          # this OS's release, the install's (and `not finished` while a first install's stack comes up or its provision hook runs, or after one failed — with why, and the `sudo <short>-stow install` that runs it again; `"installing": true` and `"install_failed": "<why>"` in JSON; `not provisioned` while an install given `--secrets` awaits the backup `restore` loads, `"restore_awaited": true`), the channel, the system Kairos booted (active, passive or recovery; the fallback), the last failed boot, the disk, a byo install's certificate (`cert`: its names, end and days left, with a warning from 30 days before it; `"cert"` in JSON), the services
+<short>-stow status [--json]          # this OS's release, the install's (and `not finished` while a first install's stack comes up or its provision hook runs, or after one failed — with why, and the `sudo <short>-stow install` that runs it again; `"installing": true` and `"install_failed": "<why>"` in JSON; `not provisioned` while an install given `--secrets` awaits the backup `restore` loads, `"restore_awaited": true`; `not running` while a restore left the volumes half restored, `"volumes_split": true`), the channel, the system Kairos booted (active, passive or recovery; the fallback), the last failed boot, the disk, a byo install's certificate (`cert`: its names, end and days left, with a warning from 30 days before it; `"cert"` in JSON), the services
 <short>-stow health [--json]          # ready, or fails saying why: the health gate's check, once
 <short>-stow events [--after N] [--follow|-f] [--json]   # the event journal: jobs, reboots, boots and the health gate's verdicts, the first install; --follow waits for more until interrupted, through daemon restarts
 <short>-stow ps [--json]              # the stack's services, state and health
@@ -2513,7 +2528,8 @@ sudo <short>-stow install [--channel C] [--set KEY=VALUE]… [--answers FILE] [-
   config, so backups must be configured): `<short>-stow` reads the age identity that decrypts it
   from standard input (`--identity FILE` instead), asks to confirm on a terminal (without one,
   `--yes` is required) naming the release the install runs, which the request carries, and
-  follows the job. The daemon refuses (400, 409) a request without that release or with
+  follows the job. For a backup with `volumes` it is refused (409, `reboot first, then restore`)
+  while an upgrade's system waits in the passive slot for its boot. The daemon refuses (400, 409) a request without that release or with
   another, an install running another release than the OS's, an object not named as this
   project's backups are (`<name>-<profile>-<UTC time>-<version>-r<revision>.pgdump.age`, no
   path), a backup of another release (a backup restores onto the release whose schema it
@@ -2523,7 +2539,13 @@ sudo <short>-stow install [--channel C] [--set KEY=VALUE]… [--answers FILE] [-
   the refusal names the profiles to restore from), an identity that is not one (never echoed), and every verb's refusals until the health
   gate judged the boot. The job takes the install's lock, reads the install again (refusing
   another release, and, before anything is stopped, a provision or schema container an earlier
-  run left), stops every service but the database (none to stop: nothing),
+  run left), refuses, before anything is stopped, a backup missing one of its volumes' archives
+  (`has no archive of the volume V to restore with it`), stops every service but the database
+  (none to stop: nothing), extracts each volume's archive into a directory of its own at the
+  volume's root (`.stowage-restore`, made afresh with the root's owner and mode: it and
+  `.stowage-replaced` are names the stack's own data must not use, never extracted from an
+  archive; a volume not there is made as the compose file declares it —
+  driver, `driver_opts`, labels, and Compose's labels — refused when those hold a `$`),
   streams the object out of the destination (the backup runner's `rclone cat`), decrypts it as
   it streams, and loads it beside the database, never into it: as the migration role — which
   owns the database, may create one (`CREATEDB`) and `SET ROLE` to every owner the dump names, as
@@ -2543,16 +2565,37 @@ sudo <short>-stow install [--channel C] [--set KEY=VALUE]… [--answers FILE] [-
   container by Postgres — connect, lock and statement timeouts on every step, both legs together
   well within it — so nothing of it still runs when the job reads how it ended; any end but success is judged by whether
   `stowage_replaced`, which only its rename makes, exists: there, it committed and the restore
-  goes on; if that cannot be read, the job says to look for it and that `provision` then finishes
-  the restore), then, once the stack is up again and provisioned, drop the replaced one (its own
+  goes on; if that cannot be read, the job removes the volumes' staging and says that a
+  `stowage_replaced` means it committed, that it holds the data from before the restore, and to
+  restore again, which loads and swaps afresh whether it committed or not, dropping it), then, once the stack is up again and provisioned, drop the replaced one (its own
   ten minutes, bounded the same way)
   (`stowage_replaced`; if that drop fails the restore is still done, says so, and the next
   restore drops it); a swap that fails drops the loaded copy (one the job could not see fail is left for the next
-  restore to drop). If the stack does not come up
+  restore to drop). A restore that ends before the swap removes the volumes' staging directories:
+  their data is as it was. Once the database is swapped in, each volume's data is replaced by
+  what its staging directory holds, by renames alone: the volume's entries move into
+  `.stowage-replaced` (made afresh), then the staging's into the root, which takes the archive's
+  owner and mode — each volume within ten minutes, every one tried. The volumes that could not
+  be are the job's error, naming them (`restore again`): each holds its files split between its
+  root, `.stowage-restore` (the backup's) and `.stowage-replaced` (its own), the services stay
+  stopped (they would run, and be backed up, on data of two times) and the install still awaits
+  a restore. From the database's swap until every volume is in, `<dir>/.stowage-volumes-split`
+  marks the install (a swap whose outcome cannot be read keeps it too, with the staging): while
+  it is there nothing brings the stack up, writes the data or moves the release — the boot, a
+  re-run, `secrets rotate`, `start` and `restart` (409), `provision`, `reset-db`, `upgrade` and
+  `rollback` refuse before changing anything, saying so; the stopped services' containers are
+  removed (`compose rm --stop --force`), so no restart policy starts them at a reboot —, no backup is taken (409, an upgrade's first one
+  failing), and `status` says `not running` (on Docker `… (or a restore is running)`; the VM's
+  daemon leaves it out while its restore job runs). Only a restore again, onto the release the
+  install runs, removes it once it finishes: it brings the database's service alone up first
+  (`up --detach --wait --no-deps`), and any end short of finishing keeps the mark. Once the stack is up and provisioned, the `.stowage-replaced` directories are
+  deleted, each within ten minutes, cut by the daemon's stop (one that is not is logged; the next
+  restore's staging deletes it, and what an earlier restore left of `.stowage-restore`). An install that awaited a restore stops
+  awaiting it only once the database and every volume are in. If the stack does not come up
   after a swap, the job says so and names `provision`. A database named `stowage_restore`, `stowage_replaced` or a template is
   refused. Nothing is dropped object by object, so partitioned tables, large objects and
   extensions come back as the dump holds them, and nothing the replaced database held stays. Then, whatever happened, the stack comes up again; after a
-  restore that swapped the backup in, the install no longer awaits one (`.stowage-restore-awaited` goes) and
+  restore that swapped the backup and every volume in, the install no longer awaits one (`.stowage-restore-awaited` goes) and
   the provision hook runs on the restored data (a failure there is the job's, naming `sudo
   <short>-stow provision`). The identity is kept nowhere.
 - `reset-db` is the Docker shape's `reset-db` on the install, run by the daemon as a job without
@@ -2664,7 +2707,18 @@ sudo <short>-stow install [--channel C] [--set KEY=VALUE]… [--answers FILE] [-
   (it reaches the destination, and names it, as the VM does — over IPv6 too), the settings' rclone config mounted from a directory under `/run/<name>/`
   (root's, removed afterwards) — which uploads it with `rclone rcat` to
   `<destination>/<name>-<profile>-<UTC time, 20261010T030000Z>-<version>-r<revision>.pgdump.age`;
-  nothing is written to the VM's disk. A profile listing tables keeps the data of those tables
+  nothing is written to the VM's disk. Before the dump, each of the backup's `volumes` is
+  archived the same way beside it, as `<the same name>.<volume>.tar.age`: a tar of the volume's
+  files (owners and modes kept), read while the stack runs by the runner's own `tar`, the volume
+  mounted read-only and the container on no network, a restore's `.stowage-restore` and
+  `.stowage-replaced` left out
+  (Docker's volume of the compose project, found by Compose's labels, else by the name Compose
+  gives it when it carries no other project's labels — another project's is refused; one never
+  created archives as empty). A volume's files are read live, unlike the dump's snapshot (a file changing as it is
+  read fails the backup, which says so): the volumes suit what a
+  stack writes once or rarely (minted keys and certificates, a service's own state between
+  writes). The dump is the backup's last object: a backup that fails deletes every object it
+  sent, and `backup list` lists the dumps alone. Bytes are the whole backup's. A profile listing tables keeps the data of those tables
   only (every table's schema is kept: the other tables' data is excluded with
   `--exclude-table-data`, quoted, so names are taken literally); a listed name no table has is
   logged. A profile `{ exclude: [pattern, …] }` keeps every table, leaving out the rows of the
@@ -2677,7 +2731,9 @@ sudo <short>-stow install [--channel C] [--set KEY=VALUE]… [--answers FILE] [-
   (`<name>-hostd.service`'s `TimeoutStopSec` is 3 min); each runner's container is named
   `<name>-backup-<random>` and removed when its run is cut off. After a backup,
   the profile's backups (its file names) older than `retention_days` are deleted (`rclone delete
-  --min-age`); a pruning that fails is logged and recorded, the backup stands. A backup takes at
+  --min-age`), then — whatever the retention — the profile's volume archives whose dump is gone (retention goes by the
+  dump's age; one younger than two hours may be a backup's still running, another install's in a
+  shared destination, and stays); a pruning that fails is logged and recorded, the backup stands. A backup takes at
   most an hour. `backup run` is a job (`<short>-stow` prints its log as it runs; refused until
   `<name>.service` ran, during another job, and once a reboot is scheduled); its last run —
   object, profile, release, start and end, bytes, error, pruning error — is kept in
@@ -2865,13 +2921,25 @@ other than the one the install runs, and without the last GET's token, which it 
   input chain drops by default and accepts the loopback, replies (`ct state
   established,related`), ICMP and ICMPv6 (behind extension headers too), DHCP's answers (UDP 67→68, 547→546), SSH per
   `/etc/nftables.d/ssh.nft` (the bundle's is open to every source; `vm create --ssh-allow`
-  replaces it) and the front's ports per `/run/nftables.d/<name>-front.nft`, which each start of
-  the install writes (a TLS mode: `tcp dport { <http port>, <https port> } accept`; loopback
-  mode: removed) before loading the ruleset again (`nft -f /etc/nftables.conf`; a load that
-  fails fails the start and leaves no file, so the next start loads it again). Forwarded traffic
-  (Docker's published ports, IPv4) and outbound traffic are Docker's and the OS's to judge; the
-  input rule serves what Docker's userland proxy takes on the host (an IPv6 client of a bridge
-  without IPv6).
+  replaces it) and the install's ports per `/run/nftables.d/<name>-ports.nft`, which each start
+  of the install writes: the front's in a TLS mode (`tcp dport { <http port>, <https port> }
+  accept`; none in loopback mode), and in every mode each `l4` route's (`<protocol> dport <port>
+  accept`, or, with an `allow_input`, `… ip saddr { <its IPv4 sources> } accept` and `… ip6
+  saddr { <its IPv6 sources> } accept`, widest first: an address as its /32 or /128, an
+  IPv4-mapped IPv6 one as IPv4, a CIDR's host bits cleared, one another holds left out; a value
+  that is not an allowlist fails the start). Its forward chain (`priority filter
+  - 1`, ahead of Docker's; policy accept) includes `/usr/local/<name>/nftables.d/*.nft`, where
+  each start writes `<name>-l4.nft` for the routes with an `allow_input`: a connection to the
+  route's port that Docker's DNAT forwards (`ct direction original ct status dnat ct original
+  proto-dst <port>`, per family and protocol) from a source the allowlist leaves out is dropped —
+  every IPv6 one when it holds no IPv6 source, every one when it is empty (no route with one: the
+  file goes). That file is on the persistent partition, so the boot's ruleset drops them before
+  Docker restarts the stack's containers. The ruleset is loaded again (`nft -f
+  /etc/nftables.conf`) when either file changed; a load that fails fails the start, leaves no
+  ports file (the next start loads it again) and puts the allowlists' file back as it was.
+  Outbound traffic, and forwarded traffic but that, are Docker's and the OS's to judge; the input
+  rules serve what Docker's userland proxy takes on the host (an IPv6 client of a bridge without
+  IPv6).
 
 ## Repository map
 
@@ -2929,8 +2997,8 @@ make e2e-full       # build, then examples/full as it stands on the Docker shape
 make e2e-k8s        # build, then the real binaries against zot and a kind cluster pulling from it with the pull Secret: k8s install with the bootstrap script (the provision hook's Job run, what it returned in its Secret and not the log), upgrade --values, upgrade alone (what the hook returned handed back), upgrade --version 2.0.0, a refused downgrade, a failed upgrade helm rolls back, rollback, status, reset-db (what the hook returned forgotten), uninstall refused without --data (the chart's own claim, which helm deletes), then uninstall --data removing the release, its Secrets, the hook's account and the claim, the namespace kept
 make e2e-stateless  # build, then examples/stateless on the Docker shape: ship 1.0.0 (a pulled image, no database) to zot, install it with the bootstrap one-liner in loopback mode, the health path and the route serving the input, the endpoint printed (the route's recorded URL); a re-run changes the input; `status` shows the endpoint; ship 1.0.1, `upgrade --version 1.0.1` (nothing dumped) and `rollback` (no schema check), the input kept; `reset-db` refused, the release having no database
 make e2e-full-k8s   # build, then examples/full's chart on a kind cluster pulling from zot: k8s install with the bootstrap script against a Postgres outside the release (its two URLs and the administrator's password secret inputs from the operator's environment), two api replicas migrating once, the provision hook's Job registering the administrator and its API key (recorded in the outputs Secret, in no log; the Job deleted; no helm hook), every service answering, the api reaching the search extension's URL given at the install (`--set SEARCH_URL=…`), the endpoint printed as the api's Service URL; `k8s upgrade` of the same release, the key handed back to the hook; the app's users revoke the key, ship .2 (a migration), upgrade --version: the release runs .2 and the hook fails naming `k8s provision --set`, which mints and registers another key, and `k8s provision` again keeps it; its record lost, `k8s provision --set ADMIN_API_KEY=<key>` gives the key the hook never returned (an undeclared key refused) and no other is minted (data kept); rollback (the previous api on the newer schema); a second release in another namespace with the embedded Postgres, and reset-db deleting its database's claim, forgetting what the hook returned and registering the administrator again; `k8s secrets rotate` through its three passes, the release restarted at each, each value accepted while it must be; `k8s uninstall --yes` of the embedded release keeps its database's claim and its Secrets, and `k8s install` takes them back, the events kept
-make e2e-kairos     # build, then ship examples/minimal's OS bundle and its qcow2 and ova disks and its three clouds' raw, vhd and gce to zot for real (each image docker-loaded from the bundle, each disk's zstd layer decompressed with `zstd -d` and checked in its format, the vhd and the gce as Azure and Google Cloud import them); the bundle's notes-stow on the local Docker engine as on the VM (install from the preloaded images with a settings file, boot, the host daemon's verbs, its disk-pressure POST to the api (the token never logged) and `status` showing it, its app socket and the api service's token and mount, `backup config`, `verify`, `run` to a WebDAV server through the preloaded runner, the backup decrypted and read by `pg_restore`, `list`, `status`); with `STOWAGE_CLOUD_ENV=<file>` (a shell file of a cloud's `STOWAGE_<CLOUD>_*` settings and credentials, needs `tofu`), the images registered on the clouds it sets up, the others reported left out, and every image it registered destroyed at exit; re-ship (nothing built, nothing registered again), promote, `vm create` from the published notes-stow (the qcow2 by digest, the seed ISO), verify, prune; ship 2.0.0, whose notes-stow's boot upgrades the install, and 1.0.0's boot goes back
-STOWAGE_VM_ENV=<file> make e2e-vm   # build, ship examples/minimal's OS bundle and qcow2 disk to zot, carry the release with `mirror export` / `mirror import` to a TLS zot mirror of its own test CA on this host's address toward TrueNAS, then the published notes-stow's `vm create --create opentofu --registry --registry-ca` boots a real VM on TrueNAS from the mirror's disk: its first boot installs from the cloud-config (`--ssh-allow` this host's address and its global IPv6 addresses, `--ipv6`, `--timezone Europe/Paris`); over SSH, the firewall's table (input dropped by default, SSH from this host alone, over IPv4 and IPv6, the front's ports) and the time zone, status, ps, passwordless sudo, the admin group, the app socket (refused without the install's token, served with it) and the api service's read-only mount; the install records the mirror and the VM trusts its CA; the front answers HTTPS; `reset-db --yes` wipes the data and provisions again (a new admin password) without a reboot; `backup config` over SSH (the rclone config on standard input, a schedule the timer takes), `backup run` of a partitioned table with a key to a WebDAV server on this host, the backup decrypted and read by `pg_restore`; a row added, then `restore` (the key on standard input) brings the backup's data back; `secrets export` to the operator's key decrypts into the install's secrets; 1.0.1 is shipped and carried through the mirror, `updates` offers it and `upgrade --yes` takes a backup first, then reboots the VM into it, whose health gate marks the boot good; `rollback --yes` reboots it into the passive system, back on 1.0.0, and a second `rollback` is refused there; 1.0.2, whose api never becomes ready, is upgraded to from the passive system, fails its health gate, and the VM falls back to 1.0.0, `status` naming the failed boot and its diagnostics, `updates` no longer offering 1.0.2; 1.0.3, a rollback barrier that never becomes ready, fails its gate too and is kept (the boot marked good, `status` saying why going back is refused); the cloud-config's network is DHCP with DHCPv6 asked at once, the stack's network has IPv6, the LAN gives the VM a global IPv6 address and an IPv6 default route, and this host reaches it over IPv6 by SSH and HTTPS; `network set` keeps the DHCP lease as a static address, a static unique local IPv6 address beside it, and `network confirm` keeps it (the console banner tells it), a change back to DHCP not confirmed comes undone at its 30 s window's end, and another, a reboot inside its window, at the boot; `vm destroy` removes it all
+make e2e-kairos     # build, then ship examples/minimal's OS bundle and its qcow2 and ova disks and its three clouds' raw, vhd and gce to zot for real (each image docker-loaded from the bundle, each disk's zstd layer decompressed with `zstd -d` and checked in its format, the vhd and the gce as Azure and Google Cloud import them); the bundle's notes-stow on the local Docker engine as on the VM (install from the preloaded images with a settings file, boot, the host daemon's verbs, its disk-pressure POST to the api (the token never logged) and `status` showing it, its app socket and the api service's token and mount, `backup config`, `verify`, `run` to a WebDAV server through the preloaded runner, the backup decrypted and read by `pg_restore` and the uploads volume's archive beside it, `list`, `status`); with `STOWAGE_CLOUD_ENV=<file>` (a shell file of a cloud's `STOWAGE_<CLOUD>_*` settings and credentials, needs `tofu`), the images registered on the clouds it sets up, the others reported left out, and every image it registered destroyed at exit; re-ship (nothing built, nothing registered again), promote, `vm create` from the published notes-stow (the qcow2 by digest, the seed ISO), verify, prune; ship 2.0.0, whose notes-stow's boot upgrades the install, and 1.0.0's boot goes back
+STOWAGE_VM_ENV=<file> make e2e-vm   # build, ship examples/minimal's OS bundle and qcow2 disk to zot, carry the release with `mirror export` / `mirror import` to a TLS zot mirror of its own test CA on this host's address toward TrueNAS, then the published notes-stow's `vm create --create opentofu --registry --registry-ca` boots a real VM on TrueNAS from the mirror's disk: its first boot installs from the cloud-config (`--ssh-allow` this host's address and its global IPv6 addresses, `--ipv6`, `--timezone Europe/Paris`); over SSH, the firewall's table (input dropped by default, SSH from this host alone, over IPv4 and IPv6, the front's ports, an `l4` route to the database open to this host's IPv4 address alone, its allowlist on the persistent partition: reached from this host, refused over IPv6) and the time zone, status, ps, passwordless sudo, the admin group, the app socket (refused without the install's token, served with it) and the api service's read-only mount; the install records the mirror and the VM trusts its CA; the front answers HTTPS; `reset-db --yes` wipes the data and provisions again (a new admin password) without a reboot; `backup config` over SSH (the rclone config on standard input, a schedule the timer takes), `backup run` of a partitioned table with a key to a WebDAV server on this host, the backup decrypted and read by `pg_restore`, the uploads volume's archive beside it; a row and files added, then `restore` (the key on standard input) brings the backup's data and the volume back as they were; `secrets export` to the operator's key decrypts into the install's secrets; a re-run changing the route's allowlist refuses this host, through the upgrade's reboot; 1.0.1 is shipped and carried through the mirror, `updates` offers it and `upgrade --yes` takes a backup first, then reboots the VM into it, whose health gate marks the boot good; `rollback --yes` reboots it into the passive system, back on 1.0.0, and a second `rollback` is refused there; 1.0.2, whose api never becomes ready, is upgraded to from the passive system, fails its health gate, and the VM falls back to 1.0.0, `status` naming the failed boot and its diagnostics, `updates` no longer offering 1.0.2; 1.0.3, a rollback barrier that never becomes ready, fails its gate too and is kept (the boot marked good, `status` saying why going back is refused); the cloud-config's network is DHCP with DHCPv6 asked at once, the stack's network has IPv6, the LAN gives the VM a global IPv6 address and an IPv6 default route, and this host reaches it over IPv6 by SSH and HTTPS; `network set` keeps the DHCP lease as a static address, a static unique local IPv6 address beside it, and `network confirm` keeps it (the console banner tells it), a change back to DHCP not confirmed comes undone at its 30 s window's end, and another, a reboot inside its window, at the boot; `vm destroy` removes it all
 STOWAGE_VM_ENV=<file> make e2e-full-vm   # build, ship examples/full's this month's release with its OS bundle and qcow2 disk to zot, carry it through the TLS mirror as e2e-vm does, then the published at-stow's `vm create --create opentofu` boots a real VM on TrueNAS whose first boot installs it with the search extension's input set (`--set SEARCH_URL=http://api:9090`, the api standing in for a search service); through the VM's front over HTTPS, the api answers with the organisation, the administrator the provision hook registered and the search URL reached; the console and ingest serve, and an event reaches the api; the api reads the front's local CA (publish_ca), which the api route's certificate chains to; the hook's credentials file is 0600, the api mounts the app socket's directory read-only; `vm destroy` removes it all (upgrade, rollback and the health gate's fallback are e2e-vm's)
 ```
 

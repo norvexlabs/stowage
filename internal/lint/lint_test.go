@@ -270,7 +270,7 @@ func TestEachRuleFiresOnFull(t *testing.T) {
 		{"extension input with a default", []edit{{sp, `prompt: "Search service URL (empty: no search)", optional: true`, `prompt: "Search service URL (empty: no search)", optional: true, default: "http://search:7700"`}}, nil, "extensions[0].input: SEARCH_URL must have no default"},
 		{"extension key unread", []edit{{cp, "      SEARCH_KEY: ${SEARCH_KEY:-}\n", ""}}, nil, "extensions[0].key_input: SEARCH_KEY is read by no compose service and no hook"},
 		{"service with a profile", []edit{{cp, "      SUPPORT_EMAIL: ${SUPPORT_EMAIL:-}\n", "      SUPPORT_EMAIL: ${SUPPORT_EMAIL:-}\n    profiles: [debug]\n"}}, nil, "services.ui.profiles: no input turns debug on"},
-		{"profile of no service", []edit{{cp, "    profiles: [relay]\n", ""}}, nil, "inputs[11].profile: no service of deploy/compose.yaml has the profile relay"},
+		{"profile of no service", []edit{{cp, "    profiles: [relay]\n", ""}}, nil, "inputs[12].profile: no service of deploy/compose.yaml has the profile relay"},
 		{"profile input required", []edit{{sp, "optional: true, profile: relay", "required: true, profile: relay"}}, nil, "a required input always turns relay on"},
 		{"profile name", []edit{{sp, "profile: relay,", "profile: -relay,"}, {cp, "profiles: [relay]", "profiles: [-relay]"}}, nil, `"-relay" is not a compose profile name`},
 		{"l4 bad name", []edit{{sp, "name: echo,     protocol", "name: Echo,     protocol"}}, nil, `l4.routes[0].name: "Echo" must be 1 to 15`},
@@ -288,13 +288,27 @@ func TestEachRuleFiresOnFull(t *testing.T) {
 		{"l4 on a loopback port", []edit{{sp, "protocol: tcp, port: 17007", "protocol: tcp, port: 3000"}}, nil, "tcp/3000 is route console's loopback port"},
 		{"front ports equal", []edit{{sp, "https_port: 443", "https_port: 80"}}, nil, "front.https_port: 80 is the HTTP port too"},
 		{"front port range", []edit{{sp, "http_port: 80 ", "http_port: 70000 "}}, nil, "front.http_port: 70000 is not a TCP port"},
-		{"l4 upstream syntax", []edit{{sp, "upstream: echo:17007 }", "upstream: echo }"}}, nil, `l4.routes[1].upstream: "echo" must be <service>:<port>`},
-		{"l4 upstream port", []edit{{sp, "upstream: echo:17007 }", "upstream: echo:0 }"}}, nil, "l4.routes[1].upstream: 0 is not a port"},
-		{"l4 upstream service", []edit{{sp, "upstream: echo:17007 }", "upstream: echoes:17007 }"}}, nil, `l4.routes[1].upstream: service "echoes"`},
+		{"l4 upstream syntax", []edit{{sp, "upstream: echo:17007, allow", "upstream: echo, allow"}}, nil, `l4.routes[1].upstream: "echo" must be <service>:<port>`},
+		{"l4 upstream port", []edit{{sp, "upstream: echo:17007, allow", "upstream: echo:0, allow"}}, nil, "l4.routes[1].upstream: 0 is not a port"},
+		{"l4 upstream service", []edit{{sp, "upstream: echo:17007, allow", "upstream: echoes:17007, allow"}}, nil, `l4.routes[1].upstream: service "echoes"`},
 		{"l4 address not an input", []edit{{sp, "address_input: ECHO_ADDRESS", "address_input: NOPE"}}, nil, "l4.routes[0].address_input: NOPE is not an input"},
 		{"l4 address secret", []edit{{sp, `"Host name or address clients dial the echo service at", default: localhost,`, `"Host name or address clients dial the echo service at", secret: true,`}}, nil, "ECHO_ADDRESS is secret"},
 		{"l4 address default", []edit{{sp, "echo service at\", default: localhost,", "echo service at\", default: \"localhost:17007\","}}, nil, `ECHO_ADDRESS's default: "localhost:17007" is not a host name`},
 		{"l4 var of no route", []edit{{cp, "${STOWAGE_L4_ECHO}", "${STOWAGE_L4_ECHO_UDP}"}}, nil, "STOWAGE_L4_ECHO_UDP names no L4 route with an address_input"},
+		{"l4 allow not an input", []edit{{sp, "allow_input: ECHO_SOURCES", "allow_input: NOPE"}}, nil, "l4.routes[1].allow_input: NOPE is not an input"},
+		{"l4 allow asked on docker", []edit{{sp, `default: "0.0.0.0/0 ::/0", shapes: [kairos] }`, `default: "0.0.0.0/0 ::/0", shapes: [docker, kairos] }`}}, nil, "ECHO_SOURCES must be asked on the kairos shape alone"},
+		{"l4 allow on every shape", []edit{{sp, `default: "0.0.0.0/0 ::/0", shapes: [kairos] }`, `default: "0.0.0.0/0 ::/0" }`}}, nil, "ECHO_SOURCES must be asked on the kairos shape alone"},
+		{"l4 allow secret", []edit{{sp, `default: "0.0.0.0/0 ::/0", shapes: [kairos] }`, `default: "0.0.0.0/0 ::/0", shapes: [kairos], secret: true }`}}, nil, "ECHO_SOURCES is secret: the firewall's rules show it"},
+		{"l4 allow advanced", []edit{{sp, `default: "0.0.0.0/0 ::/0", shapes: [kairos] }`, `default: "0.0.0.0/0 ::/0", shapes: [kairos], advanced: true }`}}, nil, "ECHO_SOURCES is advanced, never asked"},
+		{"l4 allow by mode", []edit{{sp, `default: "0.0.0.0/0 ::/0", shapes: [kairos] }`, `default: "0.0.0.0/0 ::/0", shapes: [kairos], when: tls }`}}, nil, "ECHO_SOURCES is asked only when tls: the firewall reads it in every mode"},
+		{"host network on the VM", []edit{{cp, "    command: [atlas-server, echo, \"17007\"]\n", "    command: [atlas-server, echo, \"17007\"]\n    network_mode: host\n"}}, nil, "services.echo.network_mode: host: the VM's firewall opens only what Stowage publishes"},
+		{"host network inherited", []edit{{cp, "    command: [atlas-server, echo, \"17007\"]\n", "    command: [atlas-server, echo, \"17007\"]\n    network_mode: host\n"}, {cp, "  relay:\n", "  relay:\n    extends: echo\n"}}, nil, "services.relay.network_mode: host"},
+		{"backup volume not declared", []edit{{sp, "volumes: [spool] ", "volumes: [spools] "}}, nil, `backup.volumes[0]: "spools" is not a volume deploy/compose.yaml declares`},
+		{"backup volume external", []edit{{cp, "  spool: {}\n", "  spool: { external: true }\n"}}, nil, `backup.volumes[0]: "spool" is an external volume`},
+		{"backup volume interpolated", []edit{{cp, "  spool: {}\n", "  spool: { name: \"${SPOOL}\" }\n"}}, nil, `backup.volumes[0]: "spool" is named "${SPOOL}", which Compose interpolates`},
+		{"backup volume of the database", []edit{{sp, "volumes: [spool] ", "volumes: [spool, postgres] "}}, nil, `backup.volumes[1]: "postgres" is mounted by the database's service`},
+		{"backup volume key", []edit{{sp, "volumes: [spool] ", "volumes: [\"../spool\"] "}}, nil, `backup: pg-age-rclone: volumes[0] "../spool" is not a compose volume's key`},
+		{"backup volume twice", []edit{{sp, "volumes: [spool] ", "volumes: [spool, spool] "}}, nil, `backup: pg-age-rclone: volumes[1] "spool" is listed twice`},
 		{"published port on the VM", []edit{{cp, "    command: [atlas-server, echo, \"17007\"]\n", "    command: [atlas-server, echo, \"17007\"]\n    ports: [\"17008:17007\"]\n"}}, nil, "services.echo.ports: the VM's firewall opens only what Stowage publishes"},
 		{"profile on kubernetes only", []edit{{sp, "profile: relay, shapes: [docker, kairos]", "profile: relay, shapes: [kubernetes]"}}, nil, "this input is asked on neither"},
 		{"endpoint no route", []edit{{sp, "endpoint: api\n", "endpoint: admin\n"}}, nil, `endpoint: "admin" is not a route of front.routes (console, api, ingest)`},
@@ -667,7 +681,7 @@ func TestFailingSchemeReportedOnce(t *testing.T) {
 func TestVMBackupCommandWarns(t *testing.T) {
 	t.Parallel()
 	root := testutil.CopyExample(t, "minimal")
-	testutil.Edit(t, root, specFile, "  provider: pg-age-rclone\n  profiles: { full: all }\n", "  provider: command\n  image: api\n  cmd: [notes-api, backup]\n")
+	testutil.Edit(t, root, specFile, "  provider: pg-age-rclone\n  profiles: { full: all }\n  volumes: [uploads]", "  provider: command\n  image: api\n  cmd: [notes-api, backup]\n")
 	res := run(t, root)
 	if errs := errorsOf(res); len(errs) > 0 {
 		t.Fatalf("errors:\n%s", strings.Join(errs, "\n"))
@@ -765,6 +779,31 @@ func TestPublishedPortOnDockerWarns(t *testing.T) {
 	testutil.Edit(t, root, "deploy/compose.yaml", "    image: ${STOWAGE_IMAGE_SERVER}\n", "    image: ${STOWAGE_IMAGE_SERVER}\n    ports: [\"6060:6060\"]\n")
 	res := run(t, root)
 	if len(res.Findings) != 1 || res.Findings[0].Severity != Warning || !strings.Contains(res.Findings[0].String(), "ports: published past Stowage") {
+		t.Fatalf("findings: %+v", res.Findings)
+	}
+}
+
+// An L4 route's allowlist without a kairos shape is warned: nothing enforces it.
+func TestL4AllowlistWithoutKairosWarns(t *testing.T) {
+	t.Parallel()
+	root := testutil.CopyExample(t, "full")
+	testutil.Edit(t, root, specFile, "  kairos:\n    base: ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55\n    kairos_init: quay.io/kairos/kairos-init:v0.16.2@sha256:0777266d25e31b653deaaaa084d4e27d98f7a55e82e42f0648e2ba9c756b8664\n    disk_formats: [raw, qcow2, ova, vhd, gce]\n    cloud_publish: [aws, azure, gcp]\n    health_gate: { deadline_s: 600, deadline_after_reset_s: 1800, poll_s: 30 }\n    host_api: [api]\n", "")
+	res := run(t, root)
+	if errs := errorsOf(res); len(errs) > 0 {
+		t.Fatalf("errors:\n%s", strings.Join(errs, "\n"))
+	}
+	if len(res.Findings) != 1 || res.Findings[0].Severity != Warning || !strings.Contains(res.Findings[0].String(), "l4.routes[1].allow_input: only the VM's firewall enforces it, and the project has no kairos shape: the route is open to every source") {
+		t.Fatalf("findings: %+v", res.Findings)
+	}
+}
+
+// A service on the host's network with the docker shape alone is warned: it listens past Stowage.
+func TestHostNetworkOnDockerWarns(t *testing.T) {
+	t.Parallel()
+	root := testutil.CopyExample(t, "stateless")
+	testutil.Edit(t, root, "deploy/compose.yaml", "    image: ${STOWAGE_IMAGE_SERVER}\n", "    image: ${STOWAGE_IMAGE_SERVER}\n    network_mode: host\n")
+	res := run(t, root)
+	if len(res.Findings) != 1 || res.Findings[0].Severity != Warning || !strings.Contains(res.Findings[0].String(), "network_mode: host: the service listens on the host past Stowage") {
 		t.Fatalf("findings: %+v", res.Findings)
 	}
 }
@@ -905,6 +944,28 @@ func TestServiceProfilesJoinTheBase(t *testing.T) {
 	p, err := ServiceProfiles([]byte("services:\n  base: { image: x, profiles: [a] }\n  child: { extends: base, profiles: [b] }\n  plain: { image: x }\n"))
 	if err != nil || !slices.Equal(p["child"], []string{"b", "a"}) || !slices.Equal(p["base"], []string{"a"}) || p["plain"] != nil {
 		t.Fatalf("%v %v", p, err)
+	}
+}
+
+// A service's devices are its host paths, in both syntaxes, joined with those of its base.
+func TestServiceDevicesJoinTheBase(t *testing.T) {
+	t.Parallel()
+	d, err := ServiceDevices([]byte("services:\n  base: { image: x, devices: [\"/dev/ttyUSB0:/dev/ttyS0:rwm\"] }\n" +
+		"  child: { extends: base, devices: [{ source: /dev/dri/renderD128, target: /dev/dri/renderD128 }, /dev/net/tun] }\n  plain: { image: x }\n"))
+	if err != nil || !slices.Equal(d["child"], []string{"/dev/dri/renderD128", "/dev/net/tun", "/dev/ttyUSB0"}) || !slices.Equal(d["base"], []string{"/dev/ttyUSB0"}) || d["plain"] != nil {
+		t.Fatalf("%v %v", d, err)
+	}
+}
+
+// A volume is mounted by its key in the short syntax and the long one, a bind mount never.
+func TestMountsVolume(t *testing.T) {
+	t.Parallel()
+	vols := []any{"data:/var/lib/data", "./conf:/etc/conf:ro", map[string]any{"type": "volume", "source": "keys", "target": "/keys"},
+		map[string]any{"type": "bind", "source": "spool", "target": "/spool"}}
+	for key, want := range map[string]bool{"data": true, "keys": true, "spool": false, "conf": false} {
+		if mountsVolume(vols, key) != want {
+			t.Errorf("%s: want %v", key, want)
+		}
 	}
 }
 

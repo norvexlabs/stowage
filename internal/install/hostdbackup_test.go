@@ -1,6 +1,7 @@
 package install
 
 import (
+	"archive/tar"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -10,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -38,6 +40,62 @@ type fakeRclone struct {
 	early, delErr error
 	// quits ends an upload with success before it reads anything.
 	quits bool
+	// volumes are the Docker volumes' archives, as the runner's tar writes and reads them; staged
+	// what a restore extracted beside a volume's data. tarErr fails an archive, stageErr an
+	// extraction.
+	volumes, staged  map[string][]byte
+	tarErr, stageErr error
+	swapErr          error // fails the swap of a volume named …swapFails
+	swapFails        string
+	dropped          []string // the volumes whose former data was deleted
+	// modTimes are objects' times other than the fixed one lsjson gives.
+	modTimes map[string]time.Time
+}
+
+// shell runs the runner's shell on a volume: its archive, a restore's staging and swap.
+func (f *fakeRclone) shell(c Cmd) ([]byte, error) {
+	if n := slices.Index(c.Args, "--network"); n < 0 || c.Args[n+1] != "none" {
+		return nil, fmt.Errorf("the shell is on a network: %v", c.Args)
+	}
+	mount := c.Args[slices.Index(c.Args, "-v")+1]
+	vol, rest, _ := strings.Cut(mount, ":")
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.volumes == nil {
+		f.volumes, f.staged = map[string][]byte{}, map[string][]byte{}
+	}
+	switch script := c.Args[len(c.Args)-1]; script {
+	case archiveScript:
+		if rest != "/v:ro" {
+			return nil, fmt.Errorf("archived through %s", mount)
+		}
+		if _, err := c.Stdout.Write(f.volumes[vol]); err != nil {
+			return nil, err
+		}
+		return nil, f.tarErr
+	case stageScript:
+		b, err := io.ReadAll(c.Stdin)
+		if err != nil {
+			return nil, err
+		}
+		if f.stageErr != nil {
+			return nil, f.stageErr
+		}
+		f.staged[vol] = b
+	case unstageScript:
+		delete(f.staged, vol)
+	case swapVolumeScript:
+		if f.swapErr != nil && strings.HasSuffix(vol, f.swapFails) {
+			return nil, f.swapErr
+		}
+		f.volumes[vol] = f.staged[vol]
+		delete(f.staged, vol)
+	case dropVolumeScript:
+		f.dropped = append(f.dropped, vol)
+	default:
+		return nil, fmt.Errorf("script %q", script)
+	}
+	return nil, nil
 }
 
 // matches is rclone's filter of a name: {{regexp}}, * within a path element.
@@ -61,6 +119,9 @@ func matches(pattern, name string) bool {
 }
 
 func (f *fakeRclone) run(c Cmd) ([]byte, error) {
+	if slices.Contains(c.Args, "--entrypoint") {
+		return f.shell(c)
+	}
 	// The runner reaches its destination as the host does, over IPv6 too.
 	if n := slices.Index(c.Args, "--network"); n < 0 || c.Args[n+1] != "host" {
 		return nil, fmt.Errorf("not on the host's network: %v", c.Args)
@@ -143,7 +204,11 @@ func (f *fakeRclone) run(c Cmd) ([]byte, error) {
 				}
 			}
 			if k == last || listed {
-				list = append(list, entry{filepath.Base(k), n, time.Date(2026, 10, 10, 3, 0, 0, 0, time.UTC)})
+				at, ok := f.modTimes[k]
+				if !ok {
+					at = time.Date(2026, 10, 10, 3, 0, 0, 0, time.UTC)
+				}
+				list = append(list, entry{filepath.Base(k), n, at})
 			}
 		}
 		return json.Marshal(list)
@@ -175,6 +240,17 @@ func backupVM(t *testing.T) (*env, *Hostd, *fakeRclone, *age.X25519Identity) {
 		t.Fatal(err)
 	}
 	return e, daemon(e, &fakeHost{}), f, key
+}
+
+// stackVolumeOf is the Docker volume the install's compose project names key.
+func stackVolumeOf(t *testing.T, d *Hostd, key string) string {
+	t.Helper()
+	env, err := ReadEnvFile(filepath.Join(d.O.Dir, envName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	project, _ := env.Get("COMPOSE_PROJECT_NAME")
+	return project + "_" + key
 }
 
 func configure(t *testing.T, h *Hostd, req BackupConfigRequest) BackupSettings {
@@ -338,6 +414,13 @@ func TestABackupStreamsTheEncryptedDumpThenChecksAndPrunes(t *testing.T) {
 		t.Errorf("unconfigured, if configured: %d %+v", code, skipped)
 	}
 	configure(t, d, validConfig(key))
+	f.volumes, f.staged = map[string][]byte{stackVolumeOf(t, d, "uploads"): []byte("the uploads' archive")}, map[string][]byte{}
+	// An archive whose dump retention removed goes; one beside its dump stays.
+	const orphan, kept = "store:backups/notes/notes-full-20200101T000000Z-1.0.0-r1.uploads.tar.age", "store:backups/notes/notes-full-20200102T000000Z-1.0.0-r1.uploads.tar.age"
+	f.objects[orphan], f.objects[kept], f.objects[strings.TrimSuffix(kept, ".uploads.tar.age")+".pgdump.age"] = []byte("x"), []byte("x"), []byte("x")
+	// One just uploaded, without its dump yet, may be a running backup's (another install's).
+	const running = "store:backups/notes/notes-full-20261021T000000Z-1.0.0-r1.uploads.tar.age"
+	f.objects[running], f.modTimes = []byte("x"), map[string]time.Time{running: time.Now()}
 	var started struct{ Job, Target string }
 	if code := call(t, h, "POST", "/v1/backup", BackupRequest{IfConfigured: true}, &started); code != 202 || started.Job != "backup" {
 		t.Fatalf("%d %+v", code, started)
@@ -346,12 +429,27 @@ func TestABackupStreamsTheEncryptedDumpThenChecksAndPrunes(t *testing.T) {
 	if j.State != "done" || j.Target != started.Target {
 		t.Fatalf("%+v", j)
 	}
-	if len(f.objects) != 1 {
+	if _, ok := f.objects[orphan]; ok || f.objects[kept] == nil || f.objects[running] == nil {
+		t.Errorf("pruned %v", f.calls())
+	}
+	delete(f.objects, kept)
+	delete(f.objects, running)
+	delete(f.objects, strings.TrimSuffix(kept, ".uploads.tar.age")+".pgdump.age")
+	if len(f.objects) != 2 {
 		t.Fatalf("objects %v", f.objects)
 	}
 	var obj string
 	for k := range f.objects {
-		obj = k
+		if strings.HasSuffix(k, ".pgdump.age") {
+			obj = k
+		}
+	}
+	// The volume's archive beside it, encrypted too, read through a read-only mount.
+	archive := strings.TrimSuffix(obj, ".pgdump.age") + ".uploads.tar.age"
+	if r, err := age.Decrypt(bytes.NewReader(f.objects[archive]), key); err != nil {
+		t.Errorf("%s: %v", archive, err)
+	} else if plain, _ := io.ReadAll(r); string(plain) != "the uploads' archive" {
+		t.Errorf("archived %q", plain)
 	}
 	if !objectName.MatchString(strings.TrimPrefix(obj, "store:")) || filepath.Base(obj) != started.Target {
 		t.Fatalf("object %s, target %s", obj, started.Target)
@@ -386,15 +484,20 @@ func TestABackupStreamsTheEncryptedDumpThenChecksAndPrunes(t *testing.T) {
 	}
 	var st BackupStatus
 	call(t, h, "GET", "/v1/backup/status", nil, &st)
-	if st.Last == nil || st.Last.Object != started.Target || st.Last.Error != "" || st.Last.Bytes != int64(len(f.objects[obj])) || st.Last.Release != (Version{"1.0.0", 1}) || st.Running {
+	if st.Last == nil || st.Last.Object != started.Target || st.Last.Error != "" || st.Last.Bytes != int64(len(f.objects[obj])+len(f.objects[archive])) || st.Last.Release != (Version{"1.0.0", 1}) || st.Running {
 		t.Errorf("%+v", st.Last)
 	}
 	// No retention, no pruning.
 	configure(t, d, BackupConfigRequest{RetentionDays: ptr(0)})
 	f.ran = nil
+	f.objects[orphan] = []byte("x")
 	call(t, h, "POST", "/v1/backup", nil, nil)
 	if j := waitJob(t, h); j.State != "done" || strings.Contains(fmt.Sprint(f.calls()), "[delete ") {
 		t.Errorf("%+v %v", j, f.calls())
+	}
+	// An orphan archive goes all the same.
+	if _, ok := f.objects[orphan]; ok {
+		t.Errorf("kept %s with no retention", orphan)
 	}
 }
 
@@ -421,6 +524,7 @@ func TestAFailedBackupLeavesNoObjectAndIsRecorded(t *testing.T) {
 			e.docker.dump = strings.Repeat("x", 1<<20) // more than the pipe holds
 		}, "the upload: 401 Unauthorized"},
 		"the size is short":  {func(_ *env, f *fakeRclone) { f.short = true }, "the destination holds"},
+		"the archive fails":  {func(_ *env, f *fakeRclone) { f.tarErr = exitCode(2) }, "the archive of the volume uploads: exit status 2"},
 		"the pruning fails?": {func(_ *env, f *fakeRclone) { f.deleteErr = errors.New("no delete") }, ""},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -444,9 +548,13 @@ func TestAFailedBackupLeavesNoObjectAndIsRecorded(t *testing.T) {
 			}
 			log := strings.Join(j.Log, "\n")
 			switch name {
-			case "the dump fails", "the upload fails", "the size is short":
+			case "the dump fails", "the upload fails", "the size is short", "the archive fails":
 				if len(f.objects) != 0 || !strings.Contains(fmt.Sprint(f.calls()), "[deletefile store:backups/notes/notes-full-") {
 					t.Errorf("the cut backup was kept: %v", f.calls())
+				}
+				// The volumes go first: a backup whose archive failed dumps nothing.
+				if name == "the archive fails" && strings.Contains(fmt.Sprint(e.docker.ran("compose")), "pg_dump") {
+					t.Error("dumped after the archive failed")
 				}
 			case "the upload fails, its rest kept":
 				if !strings.Contains(log, "may be left incomplete: deleting it failed (unreachable)") {
@@ -641,7 +749,7 @@ func TestAnUpgradeBacksUpFirstUnlessSkipped(t *testing.T) {
 	}
 	j := waitJob(t, h)
 	log := strings.Join(j.Log, "\n")
-	if j.State != "done" || !strings.Contains(log, "a backup first: notes-full-") || !strings.Contains(log, "backed up: ") || len(f.objects) != 1 {
+	if j.State != "done" || !strings.Contains(log, "a backup first: notes-full-") || !strings.Contains(log, "backed up: ") || len(f.objects) != 2 {
 		t.Fatalf("%+v", j)
 	}
 	if i, k := strings.Index(log, "backed up: "), strings.Index(log, "next boot runs it"); i > k {
@@ -944,7 +1052,7 @@ func TestADockerInstallBacksUpThroughItsOwnDaemon(t *testing.T) {
 	}
 	h := d.Handler()
 	call(t, h, "POST", "/v1/backup", nil, nil)
-	if j := waitJob(t, h); j.State != "done" || len(f.objects) != 1 {
+	if j := waitJob(t, h); j.State != "done" || len(f.objects) != 2 {
 		t.Fatalf("%+v %v", j, f.objects)
 	}
 	// Removing the settings removes the units.
@@ -1067,5 +1175,173 @@ func TestTheInProcessTransportGivesAnEmptyBody(t *testing.T) {
 	req.Body = nil
 	if _, err := tr.RoundTrip(req); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// A backup's volume is the one Compose labelled as the project's, else the one of its name when no
+// other project's; a restore makes a missing one as the compose file declares it.
+func TestTheStacksVolume(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	in := e.installer(nil)
+	in.R = &Release{Spec: e.r.Spec, Manifest: e.r.Manifest, Compose: []byte("volumes:\n  keys:\n    driver: local\n    driver_opts: { type: nfs, o: \"addr=192.0.2.9\" }\n    labels: { tier: data, empty: }\n  listed: { labels: [\"tier=cache\"] }\n")}
+	env := NewEnvFile()
+	env.Set("COMPOSE_PROJECT_NAME", "notes")
+	var owner string
+	var inspectErr error
+	e.docker.answer = func(a string) ([]byte, bool, error) {
+		switch {
+		case strings.HasPrefix(a, "volume ls "):
+			if strings.Contains(a, "volume=labelled") {
+				return []byte("notes_labelled\n"), true, nil
+			}
+			return nil, true, nil
+		case strings.HasPrefix(a, "volume inspect "):
+			return []byte(owner + "\n"), true, inspectErr
+		case strings.HasPrefix(a, "volume create "):
+			return nil, true, nil
+		}
+		return nil, false, nil
+	}
+	ctx := context.Background()
+	if v, err := in.stackVolume(ctx, env, "labelled", false); v != "notes_labelled" || err != nil {
+		t.Errorf("labelled: %q %v", v, err)
+	}
+	if v, err := in.stackVolume(ctx, env, "keys", false); v != "notes_keys" || err != nil {
+		t.Errorf("adopted: %q %v", v, err)
+	}
+	owner = "other"
+	if _, err := in.stackVolume(ctx, env, "keys", false); err == nil || !strings.Contains(err.Error(), "belongs to the Compose project other, not notes") {
+		t.Errorf("another project's: %v", err)
+	}
+	owner, inspectErr = "", errors.New("Error: No such volume: notes_keys")
+	if v, err := in.stackVolume(ctx, env, "keys", false); v != "" || err != nil {
+		t.Errorf("never created: %q %v", v, err)
+	}
+	if v, err := in.stackVolume(ctx, env, "keys", true); v != "notes_keys" || err != nil {
+		t.Fatalf("created: %q %v", v, err)
+	}
+	created := e.docker.ran("volume create")
+	if len(created) != 1 || strings.Join(created[0].Args, " ") != "volume create --label com.docker.compose.project=notes --label com.docker.compose.volume=keys --driver local --opt o=addr=192.0.2.9 --opt type=nfs --label empty= --label tier=data notes_keys" {
+		t.Errorf("created with %v", created)
+	}
+	// Labels as a list, as Compose takes them too.
+	if _, err := in.stackVolume(ctx, env, "listed", true); err != nil {
+		t.Fatal(err)
+	}
+	if created := e.docker.ran("volume create"); len(created) != 2 || !strings.HasSuffix(strings.Join(created[1].Args, " "), " --label tier=cache notes_listed") {
+		t.Errorf("created with %v", created)
+	}
+}
+
+// The volume scripts, run by a shell on a directory standing in for the volume (/v): the archive
+// leaves a staging directory out, the swap brings every entry back (hidden ones, spaces) with the
+// root's mode and drops what came after, and an empty archive keeps the root's mode.
+func TestTheVolumeScripts(t *testing.T) {
+	t.Parallel()
+	for _, bin := range []string{"sh", "tar", "rm", "mkdir", "rmdir", "mv", "chown", "chmod", "stat"} {
+		if _, err := exec.LookPath(bin); err != nil {
+			t.Skipf("no %s here", bin)
+		}
+	}
+	v := t.TempDir()
+	run := func(script string, stdin io.Reader) []byte {
+		t.Helper()
+		cmd := exec.Command("sh", "-euc", strings.ReplaceAll(script, "/v", v))
+		cmd.Stdin = stdin
+		out, err := cmd.Output()
+		if err != nil {
+			t.Fatalf("%s: %v", script, err)
+		}
+		return out
+	}
+	for name, body := range map[string]string{"keep.txt": "kept", ".hidden": "h", "a b/c": "c", "-dash": "d", restoreStage + "/junk": "j", restoreReplaced + "/old": "o"} {
+		if err := os.MkdirAll(filepath.Dir(filepath.Join(v, name)), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(v, name), []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Chmod(v, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	archive := run(archiveScript, nil)
+	tr := tar.NewReader(bytes.NewReader(archive))
+	for {
+		h, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(h.Name, restoreStage) || strings.Contains(h.Name, restoreReplaced) {
+			t.Errorf("archived %s", h.Name)
+		}
+	}
+	// Since the backup: a file gone, one new, the root's mode changed.
+	_ = os.Remove(filepath.Join(v, "keep.txt"))
+	_ = os.WriteFile(filepath.Join(v, "later.txt"), nil, 0o600)
+	_ = os.Chmod(v, 0o755)
+	// A leftover of an earlier restore's former data goes as the archive is staged; an archive
+	// holding the restore's own names never extracts them.
+	_ = os.MkdirAll(filepath.Join(v, restoreReplaced), 0o755)
+	_ = os.WriteFile(filepath.Join(v, restoreReplaced, "leftover"), nil, 0o600)
+	var crafted bytes.Buffer
+	tw := tar.NewWriter(&crafted)
+	tr = tar.NewReader(bytes.NewReader(archive))
+	for {
+		h, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		body, _ := io.ReadAll(tr)
+		_ = tw.WriteHeader(h)
+		_, _ = tw.Write(body)
+	}
+	_ = tw.WriteHeader(&tar.Header{Name: "./" + restoreReplaced + "/planted", Mode: 0o600, Size: 1, Typeflag: tar.TypeReg})
+	_, _ = tw.Write([]byte("p"))
+	_ = tw.Close()
+	run(stageScript, &crafted)
+	if _, err := os.Stat(filepath.Join(v, restoreReplaced)); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("staging kept the former leftover: %v", err)
+	}
+	run(swapVolumeScript, nil)
+	for _, planted := range []string{"planted", restoreReplaced + "/planted"} {
+		if _, err := os.Stat(filepath.Join(v, planted)); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("the archive's %s was extracted: %v", planted, err)
+		}
+	}
+	// The former data, moved aside whole, until the restore is done.
+	if b, err := os.ReadFile(filepath.Join(v, restoreReplaced, "later.txt")); err != nil || len(b) != 0 {
+		t.Errorf("replaced: %q %v", b, err)
+	}
+	run(dropVolumeScript, nil)
+	for name, body := range map[string]string{"keep.txt": "kept", ".hidden": "h", "a b/c": "c", "-dash": "d"} {
+		if b, err := os.ReadFile(filepath.Join(v, name)); err != nil || string(b) != body {
+			t.Errorf("%s: %q %v", name, b, err)
+		}
+	}
+	for _, gone := range []string{"later.txt", restoreStage, restoreReplaced} {
+		if _, err := os.Stat(filepath.Join(v, gone)); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("%s is there: %v", gone, err)
+		}
+	}
+	if fi, _ := os.Stat(v); fi.Mode().Perm() != 0o750 {
+		t.Errorf("root mode %v", fi.Mode().Perm())
+	}
+	// An empty archive (a volume never created at the backup) empties it, its root's mode kept.
+	_ = os.Chmod(v, 0o700)
+	var empty bytes.Buffer
+	_ = tar.NewWriter(&empty).Close()
+	run(stageScript, &empty)
+	run(swapVolumeScript, nil)
+	run(dropVolumeScript, nil)
+	if entries, _ := os.ReadDir(v); len(entries) != 0 {
+		t.Errorf("left %v", entries)
+	}
+	if fi, _ := os.Stat(v); fi.Mode().Perm() != 0o700 {
+		t.Errorf("root mode after an empty archive %v", fi.Mode().Perm())
 	}
 }

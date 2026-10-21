@@ -469,12 +469,17 @@ func RunsBackups(s *spec.Spec) bool {
 // PgAgeRclone is a decoded pg-age-rclone backup: Profiles maps each profile to the tables whose
 // data it keeps (nil: every table's), and Exclude a profile to the pg_dump patterns of the tables
 // whose data it leaves out (their structure kept); Default is the profile a backup takes unless
-// told another.
+// told another. Volumes are the compose volumes every backup also takes, each an archive beside
+// the dump, which a restore brings back with it.
 type PgAgeRclone struct {
 	Profiles map[string][]string
 	Exclude  map[string][]string
 	Default  string
+	Volumes  []string
 }
+
+// volumeKey is a compose volume's key: it names its archive in the destination.
+var volumeKey = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]*$`)
 
 // tablePattern is an exclude pattern: a table, or schema.table, of letters, digits and '_', with
 // pg_dump's wildcards * and ?.
@@ -488,14 +493,23 @@ func DecodeBackup(p *spec.Provider) (*PgAgeRclone, error) {
 	var c struct {
 		DefaultProfile string         `yaml:"default_profile"`
 		Profiles       map[string]any `yaml:"profiles"`
+		Volumes        []string       `yaml:"volumes"`
 	}
 	if err := p.Decode(&c); err != nil {
 		return nil, err
 	}
+	for i, v := range c.Volumes {
+		if !volumeKey.MatchString(v) {
+			return nil, fmt.Errorf("pg-age-rclone: volumes[%d] %q is not a compose volume's key", i, v)
+		}
+		if slices.Contains(c.Volumes[:i], v) {
+			return nil, fmt.Errorf("pg-age-rclone: volumes[%d] %q is listed twice", i, v)
+		}
+	}
 	if len(c.Profiles) == 0 {
 		return nil, errors.New("pg-age-rclone: profiles is required (e.g. { full: all })")
 	}
-	out := &PgAgeRclone{Profiles: map[string][]string{}, Exclude: map[string][]string{}, Default: c.DefaultProfile}
+	out := &PgAgeRclone{Profiles: map[string][]string{}, Exclude: map[string][]string{}, Default: c.DefaultProfile, Volumes: c.Volumes}
 	names := make([]string, 0, len(c.Profiles))
 	for name := range c.Profiles {
 		names = append(names, name)

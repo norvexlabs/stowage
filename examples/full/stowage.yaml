@@ -68,7 +68,7 @@ front:
 l4:
   routes:
     - { name: echo,     protocol: tcp, port: 17007, upstream: echo:17007, address_input: ECHO_ADDRESS }
-    - { name: echo-udp, protocol: udp, port: 17007, upstream: echo:17007 }
+    - { name: echo-udp, protocol: udp, port: 17007, upstream: echo:17007, allow_input: ECHO_SOURCES }   # the VM's firewall
 
 health:
   provider: http-json
@@ -123,6 +123,7 @@ inputs:
   - { key: AUTH_URI,          prompt: "Path the authentication service is asked at", advanced: true, shapes: [docker, kairos] }
   - { key: LOG_LEVEL,         prompt: "Log level (debug, info, warning)", advanced: true }
   - { key: ECHO_ADDRESS,      prompt: "Host name or address clients dial the echo service at", default: localhost, shapes: [docker, kairos] }
+  - { key: ECHO_SOURCES,      prompt: "Sources (addresses, CIDRs) the VM lets reach the UDP echo", default: "0.0.0.0/0 ::/0", shapes: [kairos] }
   - { key: RELAY_SOURCE,      prompt: "Event source the relay forwards (empty: no relay)", optional: true, profile: relay, shapes: [docker, kairos] }
   # Kubernetes: the database is external or embedded by the chart's postgres.mode value
   # (embedded: these two URLs are left empty).
@@ -159,6 +160,7 @@ backup:
     full: all
     config: [organisations, users, api_keys, settings]
     lean: { exclude: [events, "audit_*"] }
+  volumes: [spool]                                           # archived beside each dump
 
 shapes:
   docker: {}

@@ -187,6 +187,9 @@ func (in *Installer) Reset(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	if err := in.volumesSplit(); err != nil {
+		return err
+	}
 	if err := in.checkDocker(ctx); err != nil {
 		return err
 	}

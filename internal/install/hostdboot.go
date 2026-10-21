@@ -161,6 +161,12 @@ func (h *Hostd) rollback(w http.ResponseWriter, r *http.Request) {
 		replyErr(w, err)
 		return
 	}
+	// A restore again finishes half restored volumes, onto this release only.
+	in, _ := h.run()
+	if err := in.volumesSplit(); err != nil {
+		replyErr(w, fail(http.StatusConflict, "%v", err))
+		return
+	}
 	if err := h.judged(r.Context()); err != nil {
 		replyErr(w, err)
 		return
@@ -175,7 +181,13 @@ func (h *Hostd) rollback(w http.ResponseWriter, r *http.Request) {
 		replyErr(w, fail(http.StatusConflict, "the passive system carries %s, not %s, which was confirmed", p.To, *req.Confirm))
 		return
 	}
-	j, err := h.startJob("rollback", p.To.String(), nil)
+	// Again as the job claims the slot: a restore that just ended may have marked them.
+	j, err := h.startJob("rollback", p.To.String(), func() error {
+		if err := in.volumesSplit(); err != nil {
+			return fail(http.StatusConflict, "%v", err)
+		}
+		return nil
+	})
 	if err != nil {
 		replyErr(w, err)
 		return

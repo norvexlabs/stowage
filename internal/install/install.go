@@ -192,6 +192,10 @@ const (
 	// restoreAwaitedFile marks an install that --secrets gave another install's provision values:
 	// they belong to that install's data, so the hook waits for it to be loaded (provisionUp).
 	restoreAwaitedFile = ".stowage-restore-awaited"
+	// volumesSplitFile marks an install a restore left with its volumes not whole (a swap that
+	// failed, or a database swap whose outcome was not read): nothing brings the stack up, and no
+	// backup is taken, until a restore again finishes.
+	volumesSplitFile = ".stowage-volumes-split"
 )
 
 func (in *Installer) path(name string) string { return filepath.Join(in.O.Dir, name) }
@@ -598,6 +602,10 @@ func (in *Installer) rerun(ctx context.Context) (err error) {
 	if err := in.sameRelease(env); err != nil {
 		return err
 	}
+	// Before anything is recorded: nothing would come up to use it.
+	if err := in.volumesSplit(); err != nil {
+		return err
+	}
 	in.again = true
 	next, secrets, probe, err := in.changes(env)
 	if err != nil {
@@ -804,6 +812,16 @@ func (in *Installer) installEvent(kind, why string) {
 
 // restoreAwaited reports whether the install waits for its data before its provision hook runs.
 func (in *Installer) restoreAwaited() bool { return fileExists(in.path(restoreAwaitedFile)) }
+
+// volumesSplit refuses while a restore left the volumes not whole.
+// A mark that cannot be read counts as there.
+func (in *Installer) volumesSplit() error {
+	_, err := os.Lstat(in.path(volumesSplitFile))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	return fmt.Errorf("a restore left %s's volumes half restored (%s): its services stay stopped until a restore again finishes", in.R.Spec.Name, in.path(volumesSplitFile))
+}
 
 // restoreDone removes the restore-awaited marker: the hook ran on the data its values belong to,
 // or on the data the operator chose. A marker it cannot remove is only reported.
@@ -1012,6 +1030,9 @@ func (in *Installer) composeBase(extra ...string) []string {
 // meanwhile: Compose then refuses to create its container), the images are pulled again and the
 // stack started once more.
 func (in *Installer) up(ctx context.Context, env *EnvFile) error {
+	if err := in.volumesSplit(); err != nil {
+		return err
+	}
 	if err := in.openPorts(ctx, env); err != nil {
 		return err
 	}
@@ -1243,17 +1264,22 @@ func publishedPorts(out []byte) (map[string]bool, error) {
 // FirewallConf is the VM's firewall ruleset, which flushes its own table only.
 const FirewallConf = "/etc/nftables.conf"
 
-// openPorts opens a TLS front's host ports in the VM's firewall (O.Firewall): a rule file of the
-// install's own, then the ruleset loaded again when the file changed. Loopback mode publishes
-// nothing outside the VM: the file goes. Forwarded traffic never meets the input chain, but what
-// Docker's userland proxy takes on the host does: an IPv6 client of a bridge without IPv6, a
-// connection from the host to its own address.
+// openPorts opens the install's host ports in the VM's firewall (O.Firewall): a TLS front's, and
+// every L4 route's in every mode, from the sources its allowlist holds. Two rule files of the
+// install's own, then the ruleset loaded again when either changed:
+//   - O.Firewall/<name>-ports.nft, in the input chain: what Docker's userland proxy takes on the
+//     host meets it (an IPv6 client of a bridge without IPv6, a connection from the host to its
+//     own address). It is under /run: a boot opens nothing until the install starts.
+//   - <dir>/nftables.d/<name>-l4.nft, in the forward chain, which Docker's DNAT sends the rest
+//     through: a connection to a route's port from a source its allowlist leaves out is dropped.
+//     It is on the persistent partition: the boot's ruleset drops them before the stack's
+//     containers restart.
 func (in *Installer) openPorts(ctx context.Context, env *EnvFile) error {
 	if in.O.Firewall == "" {
 		return nil
 	}
-	file := filepath.Join(in.O.Firewall, in.R.Spec.Name+"-front.nft")
-	var rule []byte
+	name := in.R.Spec.Name
+	var input, forward []byte
 	if mode, _ := env.Get("STOWAGE_TLS_MODE"); mode != Loopback {
 		var ports []int
 		for _, k := range []string{HTTPPortVar, HTTPSPortVar} {
@@ -1264,28 +1290,119 @@ func (in *Installer) openPorts(ctx context.Context, env *EnvFile) error {
 			}
 			ports = append(ports, n)
 		}
-		rule = fmt.Appendf(nil, "# %s's front, which every start of the install writes.\ntcp dport { %d, %d } accept\n", in.R.Spec.Name, ports[0], ports[1])
+		input = fmt.Appendf(input, "tcp dport { %d, %d } accept\n", ports[0], ports[1])
 	}
-	cur, _ := os.ReadFile(file)
-	if bytes.Equal(cur, rule) {
+	for _, r := range in.R.Spec.L4.Routes {
+		if r.AllowInput == "" {
+			input = fmt.Appendf(input, "%s dport %d accept\n", r.Protocol, r.Port)
+			continue
+		}
+		v, _ := env.Get(r.AllowInput)
+		if err := checkSources(v); err != nil {
+			return fmt.Errorf("%s: %w", r.AllowInput, err)
+		}
+		v4, v6 := familySources(v)
+		for _, f := range []struct {
+			family, match string
+			set           []string
+		}{{"ipv4", "ip", v4}, {"ipv6", "ip6", v6}} {
+			dnat := fmt.Sprintf("meta nfproto %s meta l4proto %s ct direction original ct status dnat ct original proto-dst %d", f.family, r.Protocol, r.Port)
+			if len(f.set) == 0 {
+				forward = fmt.Appendf(forward, "%s drop\n", dnat)
+				continue
+			}
+			set := strings.Join(f.set, ", ")
+			input = fmt.Appendf(input, "%s dport %d %s saddr { %s } accept\n", r.Protocol, r.Port, f.match, set)
+			forward = fmt.Appendf(forward, "%s %s saddr != { %s } drop\n", dnat, f.match, set)
+		}
+	}
+	files := []struct {
+		path, what string
+		rule, cur  []byte
+		had        bool
+	}{
+		{path: filepath.Join(in.O.Firewall, name+"-ports.nft"), what: "ports", rule: input},
+		{path: filepath.Join(in.O.Dir, ForwardRules, name+"-l4.nft"), what: "L4 routes' allowlists", rule: forward},
+	}
+	changed := false
+	for i := range files {
+		f := &files[i]
+		if f.rule != nil {
+			f.rule = append(fmt.Appendf(nil, "# %s's %s, which every start of the install writes.\n", name, f.what), f.rule...)
+		}
+		cur, err := os.ReadFile(f.path)
+		f.cur, f.had = cur, err == nil
+		if bytes.Equal(cur, f.rule) {
+			continue
+		}
+		changed = true
+		if f.rule == nil {
+			err = os.Remove(f.path)
+		} else if err = os.MkdirAll(filepath.Dir(f.path), 0o755); err == nil {
+			err = writeAtomic(f.path, bytes.NewReader(f.rule), 0o644, nil)
+		}
+		if err != nil {
+			return fmt.Errorf("the firewall's rules for the %s: %w", f.what, err)
+		}
+	}
+	if !changed {
 		return nil
 	}
-	var err error
-	if rule == nil {
-		err = os.Remove(file)
-	} else if err = os.MkdirAll(in.O.Firewall, 0o755); err == nil {
-		err = writeAtomic(file, bytes.NewReader(rule), 0o644, nil)
-	}
-	if err != nil {
-		return fmt.Errorf("the firewall's rule for the front: %w", err)
-	}
 	if _, err := in.O.Host.Run(ctx, Cmd{Args: []string{"nft", "-f", FirewallConf}}); err != nil {
-		// No file a failed load left: the next start finds a change, and loads again.
-		_ = os.Remove(file)
-		return fmt.Errorf("loading the firewall with the front's ports: %w", err)
+		// No ports file a failed load left: the next start finds a change, and loads again. The
+		// allowlists' file goes back to what it was, which the next boot loads.
+		_ = os.Remove(files[0].path)
+		if f := files[1]; f.had {
+			_ = writeAtomic(f.path, bytes.NewReader(f.cur), 0o644, nil)
+		} else {
+			_ = os.Remove(f.path)
+		}
+		return fmt.Errorf("loading the firewall with the install's ports: %w", err)
 	}
 	return nil
 }
+
+// familySources splits an allowlist into its IPv4 and IPv6 prefixes, as the firewall's sets
+// hold them, widest first: an address is its own /32 or /128 (an IPv4-mapped one IPv4's), a
+// prefix's host bits are cleared, and one another holds is left out.
+func familySources(v string) (v4, v6 []string) {
+	var prefixes []netip.Prefix
+	for _, s := range splitSources(v) {
+		p, err := netip.ParsePrefix(s)
+		if err != nil {
+			a, _ := netip.ParseAddr(s)
+			p = netip.PrefixFrom(a, a.BitLen())
+		}
+		if a := p.Addr(); a.Is4In6() && p.Bits() >= 96 {
+			p = netip.PrefixFrom(a.Unmap(), p.Bits()-96)
+		}
+		prefixes = append(prefixes, p.Masked())
+	}
+	// Widest first, so a prefix another holds is left out.
+	slices.SortStableFunc(prefixes, func(a, b netip.Prefix) int { return a.Bits() - b.Bits() })
+	var kept []netip.Prefix
+	for _, p := range prefixes {
+		if slices.ContainsFunc(kept, func(k netip.Prefix) bool { return k.Addr().Is4() == p.Addr().Is4() && k.Contains(p.Addr()) }) {
+			continue
+		}
+		kept = append(kept, p)
+	}
+	for _, p := range kept {
+		if p.Addr().Is4() {
+			v4 = append(v4, p.String())
+		} else {
+			v6 = append(v6, p.String())
+		}
+	}
+	return v4, v6
+}
+
+// PortRules is the VM's directory of the rules the firewall's input chain includes, under /run.
+const PortRules = "/run/nftables.d"
+
+// ForwardRules is the directory of the install (on the VM's persistent partition) holding the
+// rules the firewall's forward chain includes.
+const ForwardRules = "nftables.d"
 
 // tunables prints each advanced input of the install's shape: its recorded value (a secret's
 // redacted), or (not set) when none is: the compose file's default, or off for one the front
@@ -1322,7 +1439,10 @@ func (in *Installer) Status(ctx context.Context) error {
 	}
 	get := func(k string) string { v, _ := env.Get(k); return v }
 	fmt.Fprintf(in.O.Out, "%s %s (revision %s)\nregistry  %s\n", get("STOWAGE_NAME"), get("STOWAGE_PROJECT_VERSION"), get("STOWAGE_REVISION"), get("STOWAGE_REGISTRY"))
+	split := in.volumesSplit()
 	switch unfinished, failed, _ := in.firstInstall(); {
+	case split != nil:
+		fmt.Fprintf(in.O.Out, "not running: %v (or a restore is running)\n", split)
 	case failed != "":
 		fmt.Fprintf(in.O.Out, "not finished: the first install failed (%s); a re-run of the installer with --dir %s finishes it\n", failed, dir)
 	case unfinished:
@@ -1440,6 +1560,9 @@ func (in *Installer) inputList(mode string) []input {
 		check := frontCheck(in.R.Spec.Front, i.Key)
 		if slices.ContainsFunc(in.R.Spec.L4.Routes, func(r spec.L4Route) bool { return r.AddressInput == i.Key }) {
 			check = lint.CheckL4Address
+		}
+		if slices.ContainsFunc(in.R.Spec.L4.Routes, func(r spec.L4Route) bool { return r.AllowInput == i.Key }) {
+			check = checkSources
 		}
 		domain := tls && slices.ContainsFunc(in.R.Spec.Front.Routes, func(r spec.Route) bool { return r.DomainInput == i.Key })
 		if domain {
