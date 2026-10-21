@@ -3,7 +3,7 @@
 Stowage's own releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
-## [0.6.0]
+## [0.6.0] - 2026-10-21
 
 ### Added
 - **Disks only when asked, one disk set per channel.** `ship --disks` (or `STOWAGE_SHIP_DISKS=1`,
