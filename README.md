@@ -727,6 +727,24 @@ other tag holds it, through `registry.delete` (`oci`: the distribution API, the 
 `github`: GitHub's packages API, for ghcr, whose distribution API deletes nothing — the token
 needs `delete:packages`).
 
+**A disk's push** goes up in chunks (the OCI distribution API's chunked upload, 1 to 64 MiB each,
+never under the `OCI-Chunk-Min-Length` a registry answers, sized to about a minute at the rate the
+last one went and halved after a failure). After a failure (a dropped or stalled connection, a 5xx,
+a 408, 413 or 429, with `Retry-After` not read) it waits (2 s, doubled up to a minute) and goes on
+from the last byte the registry acknowledged, asking it how far it got. A registry that lost the
+upload (a 404, a 416 or a 400 `BLOB_UPLOAD_*`, which Docker Distribution answers to an upload
+resumed after a chunk cut short; one that cannot tell how far it got keeps the last offset
+acknowledged) is asked again whether it holds the blob, then gets a new upload,
+from the first byte, said in the log. A push with no byte acknowledged for 5 minutes fails, naming
+the disk (its file and digest); so does, at once, a refusal no retry changes: a credential (401,
+403), the repository (`NAME_UNKNOWN`, `NAME_INVALID`, `DENIED`), a registry that takes no push
+(405, `UNSUPPORTED`), the digest or size, or any other 400. Between chunks, every 30 s at most,
+the push logs its progress to stderr (bytes sent, of the total, and the rate since its upload
+began), and each retry with its cause. A registry that refuses the first chunk of an upload
+(400, 405, 416 or 501), or that lost the upload 4 times, gets the disk in one stream, as any
+other blob. An upload given up (lost, failed, or replaced by the one stream) is deleted, unless it
+holds every byte: its commit may be under way.
+
 **Signing** (`signing: { provider: cosign-key, key: …, public_keys: [...] }`): every image, chart,
 OS bundle, disk image, installer and release manifest is signed by digest before its tag moves, with the `cosign` CLI (v3, on
 `PATH`, or `STOWAGE_COSIGN`); a signature already made by a listed public key is not made again.
@@ -1417,7 +1435,9 @@ again, to copy an installer to another host.
   says so): any other version is fetched and run.
   Otherwise the installer is pulled by the digest the manifest records
   (`<prefix>/<name>-installer@sha256:…`), written to `<dir>/.stowage-next-<random>/<short>-stow`
-  (0700), and refused unless it carries that release. The reads use the pull account as the
+  (0700), and refused unless it carries that release: checked by its release manifest alone,
+  so the installer of a release a newer Stowage built runs, its spec read by that installer
+  (Docker and Kubernetes alike). The reads use the pull account as the
   image pulls do: on the project's registry, the `token` account, or anonymously with `none`;
   otherwise (a mirror, `docker-config`, no password) the Docker client's own login. It refuses V
   when it is not published on the channel, when any release manifest of the repository cannot be

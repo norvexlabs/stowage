@@ -422,13 +422,15 @@ func extract(l layer, file, dst string) error {
 	return nil
 }
 
-// carries checks that the installer at exe carries the release m.
+// carries checks that the installer at exe carries the release m, by its release manifest alone:
+// the installer of a release a newer Stowage built carries a spec this one may not read, and its
+// own run reads it.
 func carries(exe string, m *release.Manifest) error {
 	files, err := payload.Read(exe)
 	if err != nil {
 		return err
 	}
-	r, err := Load(files)
+	got, err := payloadRelease(files)
 	if err != nil {
 		return err
 	}
@@ -438,12 +440,12 @@ func carries(exe string, m *release.Manifest) error {
 	if err != nil {
 		return err
 	}
-	b, err := r.Manifest.Encode()
+	b, err := got.Encode()
 	if err != nil {
 		return err
 	}
 	if !bytes.Equal(a, b) {
-		return fmt.Errorf("the installer carries %s %s (revision %d, %s), not the release %s", r.Manifest.Name, r.Manifest.ProjectVersion, r.Manifest.Revision, r.Manifest.Tag, m.Tag)
+		return fmt.Errorf("the installer carries %s %s (revision %d, %s), not the release %s", got.Name, got.ProjectVersion, got.Revision, got.Tag, m.Tag)
 	}
 	return nil
 }

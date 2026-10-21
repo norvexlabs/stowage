@@ -44,6 +44,7 @@ type Client struct {
 	keychain authn.Keychain
 	rt       http.RoundTripper
 	roots    *x509.CertPool
+	log      io.Writer // a large blob's push: its progress and its retries
 }
 
 // Option configures a Client.
@@ -56,6 +57,9 @@ func WithTransport(rt http.RoundTripper) Option { return func(c *Client) { c.rt 
 // mirror's own CA together with the system's (CertPool). It applies to the client's own
 // transport; one WithTransport gives is used as it is.
 func WithRootCAs(pool *x509.CertPool) Option { return func(c *Client) { c.roots = pool } }
+
+// WithLog has the client write a large blob's push progress, and its retries, to w.
+func WithLog(w io.Writer) Option { return func(c *Client) { c.log = w } }
 
 // maxCA bounds a CA file.
 const maxCA = 1 << 20
@@ -552,7 +556,11 @@ func (c *Client) PutManifest(ctx context.Context, repo name.Repository, m Manife
 		return v1.Hash{}, err
 	}
 	for _, b := range append([]Blob{m.Config}, m.Layers...) {
-		if err := remote.WriteLayer(repo, b.layer(), c.opts(ctx)...); err != nil {
+		push := func() error { return remote.WriteLayer(repo, b.layer(), c.opts(ctx)...) }
+		if b.path != "" {
+			push = func() error { return c.pushFile(ctx, repo, b) }
+		}
+		if err := push(); err != nil {
 			return v1.Hash{}, fmt.Errorf("push %s: %w", repo, err)
 		}
 	}

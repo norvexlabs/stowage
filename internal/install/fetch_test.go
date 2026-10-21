@@ -6,6 +6,7 @@ import (
 	"cmp"
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -232,6 +233,46 @@ func TestUpgradeVersionRunsThatReleasesInstaller(t *testing.T) {
 		if a != "" {
 			t.Errorf("public images read with %q", a)
 		}
+	}
+}
+
+// The installer of a release a newer Stowage built carries a spec with fields this one does not
+// know: it is checked by its release manifest alone, then run.
+func TestUpgradeVersionRunsTheInstallerOfANewerStowage(t *testing.T) {
+	t.Parallel()
+	p := published(t, spec.Provider{Name: "none"}, nil)
+	r, exe := testInstallerOf(t, "2.0.0", 1, p.spec, func(m *release.Manifest) { m.Tag = "2.0.0-1" })
+	files, err := payload.Read(exe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var s map[string]any
+	if err := json.Unmarshal(files[payload.Spec], &s); err != nil {
+		t.Fatal(err)
+	}
+	s["a_key_of_a_newer_stowage"] = true
+	files[payload.Spec], _ = json.Marshal(s)
+	if _, err := Load(files); err == nil {
+		t.Fatal("this installer reads the newer spec: the test proves nothing")
+	}
+	var buf bytes.Buffer
+	if err := payload.Write(&buf, strings.NewReader("exe"), files); err != nil {
+		t.Fatal(err)
+	}
+	m := *r.Manifest
+	m.Artifacts.Installer = p.pushInstaller("notes-stow", buf.Bytes())
+	p.putRelease(m.Tag, &m)
+	in := p.installer(nil)
+	in.R, _ = testInstallerOf(t, "0.9.0", 1, p.spec, nil)
+	in.O.Exec = func(_ context.Context, _ string, args []string) error {
+		p.ran = append(p.ran, args)
+		return nil
+	}
+	if err := in.UpgradeTo(context.Background(), "2.0.0", nil); err != nil {
+		t.Fatal(err)
+	}
+	if len(p.ran) != 1 || p.ran[0][0] != "upgrade" {
+		t.Fatalf("ran %q", p.ran)
 	}
 }
 

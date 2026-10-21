@@ -27,20 +27,6 @@ A finished item is deleted, not ticked. The plan behind it is
    `terraform-provider-openstack/openstack`, whichever the latest official docs make canonical).
    Before writing a module, read the latest provider's official docs and its schema, and pin that
    release.
-4. **Resumable disk uploads with a stall bound.** A multi-GB blob goes up in one stream: on a lossy
-   link a dropped connection restarts it from zero, and a stalled one waits for ever with nothing
-   in the log (seen: 60 KB/s with 20 % retransmissions, a ship that would have taken days). Upload
-   by chunks (the OCI distribution spec's chunked upload), resume from the last acknowledged byte
-   after a failure, fail with an error naming the blob when no byte is acknowledged for a bounded
-   time, and log progress (bytes sent, throughput) while a large blob is pushed.
-5. **`k8s upgrade --version` to a release a newer Stowage built.** An installer upgrading to a
-   named release fetches that release's installer, but first decodes the target's release spec
-   with its own (strict) schema, so a release whose spec carries a field the older Stowage does not
-   know is refused (`payload spec.json: json: unknown field … (an installer from a newer
-   Stowage?)`) — the upgrade an operator is told to run fails exactly when the tool moved on.
-   Hand the upgrade to the target's own installer before reading anything of its spec but the
-   version and signature, so any installer can move an install to any later release; keep the
-   strict decode for the spec an installer runs itself.
 
 ## Should
 
@@ -233,6 +219,15 @@ A finished item is deleted, not ticked. The plan behind it is
 
 ## Could
 
+- **A disk push's commit on a slow registry**: the commit (`PUT ?digest=`) waits at most the
+  client's 2-minute response bound; a registry that verifies or moves a large blob for longer
+  gets the commit retried, the blob looked for until the 5-minute stall bound, then the push fails
+  though every byte went up. Give the commit a bound of its own, scaled to the blob.
+- **`k8s upgrade --version` reads the fetched installer's payload twice** (its check, then the
+  run's release): pass the files read once along.
+- **A mirror import's blobs in chunks too**: `mirror import` pushes each blob in one stream, as
+  a ship pushed disks before; a disk set imported over a lossy link restarts from zero. Push the
+  archive's large blobs as a ship pushes a disk.
 - **e2e-kairos's `backup verify` failed once beside the parallel suites** (2026-10-21) and passed
   alone: find the clash (the WebDAV server's port, or the runner's container name) and fix it.
 - **UDP in the first install's free-port check**: it covers the L4 routes' TCP ports only;

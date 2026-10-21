@@ -325,7 +325,14 @@ pushed artifact.
   makes that disk alone. A disk's layer is its file compressed with zstd, every format alike (a
   raw or fixed VHD disk is mostly unallocated space: −66 %; the others −1 to −3 %), annotated
   with the file's own digest: a reader decompresses it as a stream into the file and checks that
-  digest, the compressed one being checked as it is read. Both
+  digest, the compressed one being checked as it is read. A disk goes up by chunks, resumed from
+  the registry's acknowledged range after a failure and failed when no byte is acknowledged for
+  a bounded time: a multi-GB stream restarted from zero on each drop, or stalled without a word,
+  never finishes on a lossy link. The bound counts acknowledged bytes, not bytes sent (a link
+  that drops everything still takes a socket buffer's worth on each attempt), so chunks are small
+  enough to be acknowledged within it down to a few KB/s; the sessions are capped, as a registry
+  that keeps losing the upload acknowledges the same bytes again, and past the cap, or for a
+  registry without chunked uploads, the blob goes up in one stream. Both
   are planned once the images are pushed by digest — still before any tag moves; on an immutable
   channel the images are then all kept, so a refusal still writes nothing.
 - Floating tags follow the channel that sets latest and are re-tagged in place: the installer's
@@ -559,7 +566,9 @@ point.
    channel, V's latest revision not yanked, read from the registry the install pulls from (a
    mirror holds the release and installer repositories too). The installer is pulled in process
    by the digest the manifest records, checked to carry that manifest, and run as a child with
-   the flags given, so its own checks, lock and messages apply unchanged.
+   the flags given, so its own checks, lock and messages apply unchanged. That check reads the
+   payload's release manifest alone, never its spec: the installer of a release a newer Stowage
+   built carries a spec this installer's strict decode would refuse, and only it reads its spec.
    Every check (order by the recorded scheme, same routes and TLS mode, added inputs only) and
    every pull come first; then `pg_dump` into `snapshots/`, the schema version read, the running
    release (compose files, `.env`, `<short>-stow`, a state record) kept in `.stowage-prev/`, `.env`

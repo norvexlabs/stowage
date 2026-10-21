@@ -38,20 +38,7 @@ func Load(files payload.Files) (*Release, error) {
 			return nil, fmt.Errorf("the installer's payload has no %s", f)
 		}
 	}
-	published, pok := files[payload.Release]
-	bundled, bok := files[payload.Bundled]
-	var m *release.Manifest
-	var err error
-	switch {
-	case pok && bok:
-		return nil, fmt.Errorf("the installer's payload has both %s and %s", payload.Release, payload.Bundled)
-	case pok:
-		m, err = release.Decode(published)
-	case bok:
-		m, err = release.DecodeBundled(bundled)
-	default:
-		return nil, fmt.Errorf("the installer's payload has no %s", payload.Release)
-	}
+	m, err := payloadRelease(files)
 	if err != nil {
 		return nil, err
 	}
@@ -92,6 +79,23 @@ func Load(files payload.Files) (*Release, error) {
 		}
 	}
 	return r, nil
+}
+
+// payloadRelease is the release manifest an installer's payload carries, read alone: what an
+// installer of another Stowage's release can be checked by, as its spec may hold fields this one
+// does not know.
+func payloadRelease(files payload.Files) (*release.Manifest, error) {
+	published, pok := files[payload.Release]
+	bundled, bok := files[payload.Bundled]
+	switch {
+	case pok && bok:
+		return nil, fmt.Errorf("the installer's payload has both %s and %s", payload.Release, payload.Bundled)
+	case pok:
+		return release.Decode(published)
+	case bok:
+		return release.DecodeBundled(bundled)
+	}
+	return nil, fmt.Errorf("the installer's payload has no %s", payload.Release)
 }
 
 // checkFront refuses to install a release that records no front image. Only the release being

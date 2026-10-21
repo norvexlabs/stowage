@@ -23,6 +23,9 @@ follow [SemVer](https://semver.org/).
   the VM. A restore that cannot bring every volume back keeps the stack down, and refuses the
   verbs that would start or change it, until a restore again finishes; `status` says so.
 - `vm create` names the ports the VM opens to each L4 route and the host devices the stack maps.
+- **Resumable disk pushes**: a disk goes up in chunks and, after a dropped connection, goes on
+  from the last byte the registry acknowledged; a push with no byte acknowledged for 5 minutes
+  fails naming the disk, and a running push logs its progress and rate every 30 s.
 
 ### Changed
 - A service that publishes a port of its own past this host (not on a loopback address) is an
@@ -33,6 +36,12 @@ follow [SemVer](https://semver.org/).
   warned as read by nothing.
 - A service on the host's network (`network_mode: host`) is an error with a `kairos` shape and a
   warning on `docker`: publish its ports with `l4.routes`.
+
+### Fixed
+- `upgrade --version` and `k8s upgrade --version` to a release a newer Stowage built: the fetched
+  installer is checked by its release alone, so a spec key the running installer does not know no
+  longer refuses the upgrade. From this release on; an installer of 0.6.0 or earlier still refuses
+  one: run the new release's installer.
 
 ## [0.6.0] - 2026-10-21
 

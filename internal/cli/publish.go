@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"text/tabwriter"
 
@@ -82,7 +83,8 @@ func (o *options) publisher(p *project.Project, a access) (*publish.Publisher, e
 			up, cloudVars, cloudErr = o.clouds(p, cache)
 		}
 	}
-	reg := registry.New(kc, o.registryOpts...)
+	// A large blob's push logs its progress where the run logs.
+	reg := registry.New(kc, append(slices.Clip(o.registryOpts), registry.WithLog(o.err))...)
 	var signer publish.Signer
 	if a != listAccess {
 		if signer, err = o.signer(p, kc, a, reg); err != nil {
