@@ -3,7 +3,7 @@
 Stowage's own releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
-## [0.7.0]
+## [0.7.0] - 2026-10-21
 
 ### Added
 - **L4 routes** (`l4.routes`): host ports published to a service as they are, over TCP or UDP,
