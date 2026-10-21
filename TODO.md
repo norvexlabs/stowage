@@ -33,8 +33,49 @@ A finished item is deleted, not ticked. The plan behind it is
    by chunks (the OCI distribution spec's chunked upload), resume from the last acknowledged byte
    after a failure, fail with an error naming the blob when no byte is acknowledged for a bounded
    time, and log progress (bytes sent, throughput) while a large blob is pushed.
+5. **`k8s upgrade --version` to a release a newer Stowage built.** An installer upgrading to a
+   named release fetches that release's installer, but first decodes the target's release spec
+   with its own (strict) schema, so a release whose spec carries a field the older Stowage does not
+   know is refused (`payload spec.json: json: unknown field … (an installer from a newer
+   Stowage?)`) — the upgrade an operator is told to run fails exactly when the tool moved on.
+   Hand the upgrade to the target's own installer before reading anything of its spec but the
+   version and signature, so any installer can move an install to any later release; keep the
+   strict decode for the spec an installer runs itself.
 
 ## Should
+
+- **Non-HTTP stacks: L4 routes, optional services, volume backup** — two sessions, one release
+  (0.7.0) cut after the second; each session batches its tasks so a long e2e runs once. Generic
+  only: a fictional TCP/UDP echo in `examples/full`, no product's ports or policy.
+  - *Session 1 (short suites only; touch no `vm*.go`, `hostd*.go`, `seed*.go`, `internal/kairos`,
+    `os.go`, `openPorts`)*:
+    - lint follows `extends` (image inherited in-file, `file:` refused);
+    - `readInputs` counts a route's `domain_input`, which removes a false warning;
+    - optional service: `inputs[].profile` → `COMPOSE_PROFILES` when the input is non-empty, and
+      `profiles:` accepted only when an input claims it;
+    - top-level `l4.routes[] {name, protocol tcp|udp, port, upstream, address_input?,
+      allow_input?}`, rendered as a `stowage-l4.yaml` ports overlay;
+    - `STOWAGE_L4_<NAME>` = `<address_input>:<port>` (never auto-detected: wrong behind NAT);
+    - lint errors: a clash with the front's ports, `acme` with an L4 tcp/443, and `allow_input`
+      on Docker (the host firewall is the operator's);
+    - a compose `ports:` not declared as an L4 route: an error on kairos, a warning on docker
+      (short and long syntax, fuzzed);
+    - `front.http_port`/`https_port` project defaults;
+    - a TCP listen probe, logged and not a gate (no UDP probe);
+    - `status` lists the routes;
+    - `.Values.stowage.l4` for charts;
+    - a README section on packaging a control plane in the thin layer.
+  - *Session 2 (one e2e-kairos → e2e-vm chain)*:
+    - the VM firewall opens L4 ports for both families;
+    - `allow_input` is enforced in a new `forward` chain (policy accept, drop on `ct original
+      proto-dst` + saddr), since DNAT'd traffic never meets `input`;
+    - `backup.volumes` (age-encrypted tar of declared volumes beside `pg_dump`, restored at the
+      same point in time; Docker and VM);
+    - host requirements read from compose (`network_mode: host` refused on kairos, devices in
+      the `vm create` plan).
+    - Spot tests: `nft -c -f` on the rendered ruleset; Docker backup via `make e2e-full`.
+  - Not built: x509/key generators (product PKI; DR is covered by volume backup), a pre-start
+    hook, front client-cert auth, a pure-L4 project with no front.
 
 - **Kubernetes schema check for a `command` schema-compat provider**: `shapes.kubernetes.schema`
   runs the `sql` provider's queries in a pod; a `command` provider's ops (JSON on stdin) are not
