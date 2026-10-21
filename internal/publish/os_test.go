@@ -333,7 +333,7 @@ func TestCloudErrRefusesShipAndPromoteOnly(t *testing.T) {
 	e.mustShip("beta", 1)
 	p, v := e.publisher()
 	p.CloudErr = errors.New("cloud gcp: tofu is not on PATH")
-	if _, err := p.Ship(ctx, ShipOptions{Version: v, Channel: "beta", Revision: 1}); !errors.Is(err, p.CloudErr) {
+	if _, err := p.Ship(ctx, ShipOptions{Version: v, Channel: "beta", Revision: 1, Disks: true}); !errors.Is(err, p.CloudErr) {
 		t.Errorf("ship: %v", err)
 	}
 	if _, err := p.Promote(ctx, v, "beta", "stable", 1); !errors.Is(err, p.CloudErr) {
@@ -377,7 +377,7 @@ func TestAnImmutableBundleTagWithOtherInputsIsRefused(t *testing.T) {
 	if err := e.reg.WriteImage(ctx, tag, other); err != nil {
 		t.Fatal(err)
 	}
-	_, err := p.Ship(ctx, ShipOptions{Version: "1.0.0", Channel: "stable", Revision: 1})
+	_, err := p.Ship(ctx, ShipOptions{Version: "1.0.0", Channel: "stable", Revision: 1, Disks: true})
 	if err == nil || !strings.Contains(err.Error(), "os bundle: "+tag.String()+" exists with other inputs on an immutable channel") {
 		t.Fatalf("got %v", err)
 	}
@@ -420,31 +420,97 @@ func TestVerifyAndPruneCoverTheBundleAndDisks(t *testing.T) {
 	eq(t, "current disk kept", e.digest("notes-disk", "beta-1.1.0-qcow2"), cur.Manifest.Artifacts.Disks["qcow2"])
 }
 
-// A yank moves latest-<format> back with the pointer; verify reports one that is off.
-func TestLatestDiskFollowsThePointer(t *testing.T) {
+// latest-<format> follows the channel's disk set, which only a ship publishing disks moves: a
+// yank moves the pointer back and leaves it; verify reports one that is off.
+func TestLatestDiskFollowsTheDiskSet(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
 	first := e.mustShip("stable", 1)
 	e.bump("1.1.0")
 	second := e.mustShip("stable", 1)
 	eq(t, "latest-qcow2", e.digest("notes-disk", "latest-qcow2"), second.Manifest.Artifacts.Disks["qcow2"])
+	eq(t, "the older set removed", e.digest("notes-disk", "1.0.0-qcow2"), "")
 	p, _ := e.publisher()
 	ctx := context.Background()
 	if err := p.Yank(ctx, "stable", "1.1.0", 1, "bad"); err != nil {
 		t.Fatal(err)
 	}
-	eq(t, "latest-qcow2 back", e.digest("notes-disk", "latest-qcow2"), first.Manifest.Artifacts.Disks["qcow2"])
+	eq(t, "pointer back", e.digest("notes-release", "stable"), first.Digest.String())
+	eq(t, "latest-qcow2 kept", e.digest("notes-disk", "latest-qcow2"), second.Manifest.Artifacts.Disks["qcow2"])
+	if _, err := p.Verify(ctx, "stable", "", 1); err != nil {
+		t.Fatalf("verify of a release whose disks a newer set replaced: %v", err)
+	}
 	tag, _ := e.reg.Tag(e.host+"/acme/notes/notes-disk", "latest-qcow2")
-	if err := e.reg.Retag(ctx, mustDigest(t, e, "notes-disk", second.Manifest.Artifacts.Disks["qcow2"]), tag); err != nil {
+	if err := e.reg.DeleteTag(ctx, tag); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := p.Verify(ctx, "stable", "", 1); err == nil || !strings.Contains(err.Error(), tag.String()+" is "+second.Manifest.Artifacts.Disks["qcow2"]) {
+	if _, err := p.Verify(ctx, "stable", "", 1); err == nil || !strings.Contains(err.Error(), tag.String()+" is missing") {
 		t.Fatalf("verify with latest-qcow2 off: %v", err)
 	}
 	if err := p.Yank(ctx, "stable", "1.0.0", 1, "bad too"); err != nil {
 		t.Fatal(err)
 	}
-	eq(t, "latest-qcow2 removed with the pointer", e.digest("notes-disk", "latest-qcow2"), "")
+	eq(t, "latest-qcow2 back on the set", e.digest("notes-disk", "latest-qcow2"), second.Manifest.Artifacts.Disks["qcow2"])
+}
+
+// A ship without disks moves, rewrites and deletes no disk tag, on a registry refusing a tag
+// delete too; its release records the channel's set as the one its installs boot.
+func TestAShipWithoutDisksLeavesTheDiskSet(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	e.refuseTagDelete = true
+	first := e.mustShip("stable", 1)
+	set := first.Manifest.Artifacts.Disks["qcow2"]
+	e.noDisks = true
+	e.bump("1.1.0")
+	second := e.mustShip("stable", 1)
+	eq(t, "no disk made", len(e.disks.made), 0)
+	eq(t, "own disks", len(second.Manifest.Artifacts.Disks), 0)
+	if b := second.Manifest.Artifacts.BootDisks; b == nil || b.Release != "1.0.0" || b.Disks["qcow2"] != set {
+		t.Fatalf("boot disks: %+v", b)
+	}
+	eq(t, "latest-qcow2", e.digest("notes-disk", "latest-qcow2"), set)
+	eq(t, "1.0.0-qcow2", e.digest("notes-disk", "1.0.0-qcow2"), set)
+	p, _ := e.publisher()
+	if _, err := p.Verify(context.Background(), "stable", "", 1); err != nil {
+		t.Fatal(err)
+	}
+	// The next disk-less release records the same set; one with disks replaces it, removing the
+	// older set by digest.
+	e.bump("1.2.0")
+	third := e.mustShip("stable", 1)
+	eq(t, "boot disks again", third.Manifest.Artifacts.BootDisks.Release, "1.0.0")
+	e.noDisks = false
+	e.bump("1.3.0")
+	fourth := e.mustShip("stable", 1)
+	eq(t, "latest-qcow2 moved", e.digest("notes-disk", "latest-qcow2"), fourth.Manifest.Artifacts.Disks["qcow2"])
+	eq(t, "older set removed", e.digest("notes-disk", "1.0.0-qcow2"), "")
+	if d, _ := e.reg.Head(context.Background(), mustDigest(t, e, "notes-disk", set)); d != nil {
+		t.Fatal("the older disk is still in the registry")
+	}
+	// Re-shipping 1.0.0's version is refused as an immutable release, and 1.1.0 again records
+	// what it recorded.
+	e.noDisks = true
+	testutil.Write(t, e.root, "VERSION", "1.1.0\n")
+	again := e.mustShip("stable", 1)
+	eq(t, "1.1.0 unchanged", again.Digest.String(), second.Digest.String())
+}
+
+// A failed cleanup after the release is published is a CleanupError: the release and the pointer
+// stand.
+func TestACleanupFailureIsReportedApart(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	first := e.mustShip("beta", 1)
+	e.failDelete = "notes-disk/manifests/" + first.Manifest.Artifacts.Disks["qcow2"]
+	e.bump("1.1.0")
+	r, err := e.ship("beta", 1)
+	var ce *CleanupError
+	if !errors.As(err, &ce) || r == nil {
+		t.Fatalf("got %v", err)
+	}
+	eq(t, "pointer on it", e.digest("notes-release", "beta"), r.Digest.String())
+	eq(t, "message", strings.Contains(err.Error(), "beta-1.1.0 is published; the cleanup of the older disk sets failed"), true)
 }
 
 func mustDigest(t *testing.T, e *env, repo, d string) name.Digest {
@@ -491,4 +557,106 @@ func TestTheBundleIsNotBuiltInMemory(t *testing.T) {
 		t.Fatalf("got %v", err)
 	}
 	eq(t, "bundle built", slices.Contains(e.builder.names(), "os"), false)
+}
+
+// A mutable tag rebuilt with other inputs and no --disks is refused: its disks would be the
+// build it replaces'. With --disks, a re-ship makes disks the newer set replaced again.
+func TestDisksOfARebuiltOrSupersededRelease(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	e.mustShip("beta", 1)
+	testutil.Write(t, e.root, "api/main.go", "package main // changed\n")
+	e.noDisks = true
+	if _, err := e.ship("beta", 1); err == nil || !strings.Contains(err.Error(), "ship it with --disks") {
+		t.Fatalf("rebuild without --disks: %v", err)
+	}
+	e.noDisks = false
+	r := e.mustShip("beta", 1)
+	eq(t, "rebuilt with its disks", len(r.Manifest.Artifacts.Disks), 1)
+	// 1.1.0's set replaces 1.0.0's; 1.0.0 shipped again with --disks makes its disk again.
+	e.bump("1.1.0")
+	e.mustShip("beta", 1)
+	eq(t, "1.0.0's disk removed", e.digest("notes-disk", "beta-1.0.0-qcow2"), "")
+	testutil.Write(t, e.root, "VERSION", "1.0.0\n")
+	again := e.mustShip("beta", 1)
+	if len(e.disks.made) != 1 || e.digest("notes-disk", "beta-1.0.0-qcow2") != again.Manifest.Artifacts.Disks["qcow2"] {
+		t.Fatalf("made %v, tag %s", e.disks.made, e.digest("notes-disk", "beta-1.0.0-qcow2"))
+	}
+}
+
+// A disk tagged for a release whose manifest is not written yet (a ship on another channel) is
+// never removed by a cleanup.
+func TestACleanupKeepsADiskOfAShipInFlight(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	first := e.mustShip("beta", 1)
+	// The stand-in for another ship's disk, pushed and tagged, its release not written.
+	ctx := context.Background()
+	tag, _ := e.reg.Tag(e.host+"/acme/notes/notes-disk", "9.9.9-qcow2")
+	h, err := e.reg.PutArtifact(ctx, tag, registry.Artifact{Type: release.DiskArtifactType, Data: []byte("a disk being pushed")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.bump("1.1.0")
+	e.mustShip("beta", 1)
+	eq(t, "in-flight disk kept", e.digest("notes-disk", "9.9.9-qcow2"), h.String())
+	eq(t, "the older set removed", e.digest("notes-disk", "beta-1.0.0-qcow2"), "")
+	_ = first
+}
+
+// Pruning a release keeps its disks whole while a release left boots them, and a channel's disk
+// set always: only a ship publishing disks replaces it.
+func TestPruneKeepsTheDisksAReleaseLeftBoots(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	first := e.mustShip("beta", 1)
+	d := first.Manifest.Artifacts.Disks["qcow2"]
+	e.noDisks = true
+	e.bump("1.1.0")
+	e.mustShip("beta", 1) // boots 1.0.0's disk
+	p, _ := e.publisher()
+	if _, err := p.Prune(context.Background(), "beta", "1.0.0"); err != nil {
+		t.Fatalf("%v\n%s", err, e.log)
+	}
+	eq(t, "kept: 1.1.0 boots it", e.digest("notes-disk", "beta-1.0.0-qcow2"), d)
+	if _, err := p.Prune(context.Background(), "beta", "1.1.0"); err != nil {
+		t.Fatalf("%v\n%s", err, e.log)
+	}
+	if h, _ := e.reg.Head(context.Background(), mustDigest(t, e, "notes-disk", d)); h == nil {
+		t.Error("the channel's disk set was pruned")
+	}
+}
+
+// A tag rebuilt with --disks removes the disks of the build it replaced.
+func TestARebuiltTagsEarlierDisksGo(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	first := e.mustShip("beta", 1)
+	testutil.Write(t, e.root, "api/main.go", "package main // changed\n")
+	second := e.mustShip("beta", 1)
+	old := first.Manifest.Artifacts.Disks["qcow2"]
+	if old == second.Manifest.Artifacts.Disks["qcow2"] {
+		t.Fatal("the rebuild made the same disk")
+	}
+	if h, _ := e.reg.Head(context.Background(), mustDigest(t, e, "notes-disk", old)); h != nil {
+		t.Error("the replaced build's disk is left")
+	}
+}
+
+// verify of a release without disks reports the channel's set it boots when that set is gone.
+func TestVerifyReportsTheSetAReleaseBoots(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	first := e.mustShip("beta", 1)
+	e.noDisks = true
+	e.bump("1.1.0")
+	e.mustShip("beta", 1)
+	ctx := context.Background()
+	if err := e.reg.DeleteManifest(ctx, mustDigest(t, e, "notes-disk", first.Manifest.Artifacts.Disks["qcow2"])); err != nil {
+		t.Fatal(err)
+	}
+	p, _ := e.publisher()
+	if _, err := p.Verify(ctx, "beta", "", 1); err == nil || !strings.Contains(err.Error(), "the qcow2 disk it boots (beta-1.0.0's), is missing") {
+		t.Fatalf("got %v", err)
+	}
 }

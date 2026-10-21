@@ -81,8 +81,14 @@ type Publisher struct {
 	// CloudErr, when set, refuses a ship or a promote (the clouds' settings could not be read);
 	// the other commands never register an image.
 	CloudErr error
-	Now      func() time.Time
-	Log      io.Writer
+	// Deleter deletes a manifest by digest (registry.delete); nil is the registry's distribution
+	// API.
+	Deleter Deleter
+	// checkDisksOf is the release tag whose disks the running ship published: verify checks them
+	// before the channel's set names them.
+	checkDisksOf string
+	Now          func() time.Time
+	Log          io.Writer
 }
 
 func (p *Publisher) logf(format string, a ...any) {
@@ -235,6 +241,10 @@ type ShipOptions struct {
 	// Promoted is the release a promotion re-publishes: its changelog is carried over, and its
 	// runtime pins must equal the tree's.
 	Promoted *Ref
+	// Disks publishes the kairos shape's disks (and registers cloud_publish's images); without
+	// it the release publishes none and its installs boot its channel's disk set. A promotion
+	// publishes the disks the release it promotes published.
+	Disks bool
 }
 
 type imageAction int
@@ -269,7 +279,7 @@ func (p *Publisher) Ship(ctx context.Context, o ShipOptions) (*Ref, error) {
 		return nil, fmt.Errorf("channel %q is not declared", o.Channel)
 	}
 	// The disk builder is checked before anything is built; a promotion builds nothing.
-	if p.hasOS() && len(s.Shapes.Kairos.Formats()) > 0 && !o.NoBuild && p.Disks == nil {
+	if p.hasOS() && len(s.Shapes.Kairos.Formats()) > 0 && o.Disks && !o.NoBuild && p.Disks == nil {
 		return nil, errors.New("disks: no disk builder")
 	}
 	tag, err := p.releaseTag(o.Version, o.Channel, o.Revision)
@@ -291,6 +301,17 @@ func (p *Publisher) Ship(ctx context.Context, o ShipOptions) (*Ref, error) {
 			s.Name, tag, o.Channel, o.Revision+1)
 	}
 
+	// A mutable tag rebuilt with other inputs and no --disks would keep disks of the build it
+	// replaces, whose OS bundle is not the new one's: refused before anything is written.
+	if p.hasOS() && !o.Disks && existing != nil && existing.Manifest.Inputs != relNode.Inputs && len(existing.Manifest.Artifacts.Disks) > 0 {
+		there, err := p.present(ctx, diskSet{disks: existing.Manifest.Artifacts.Disks})
+		if err != nil {
+			return nil, err
+		}
+		if there {
+			return nil, fmt.Errorf("%s %s is published with disks, and its build is replaced: ship it with --disks, so its disks are the new build's", s.Name, tag)
+		}
+	}
 	sources := append([]*Ref(nil), o.Sources...)
 	if existing != nil {
 		sources = append(sources, existing)
@@ -442,13 +463,29 @@ func (p *Publisher) Ship(ctx context.Context, o ShipOptions) (*Ref, error) {
 	// The OS bundle preloads the images as they are about to be tagged; it and its disks are
 	// built, pushed by digest and signed before any tag moves too.
 	var osp *osPlan
+	var recorded map[string]string // the disks a newer set replaced, which a ship again records
 	if p.hasOS() {
 		osNode, _ := g.Node(graph.KindOSBundle)
 		var immutable *Ref
 		if existing != nil && !ch.Mutable {
 			immutable = existing
 		}
-		if osp, err = p.planOS(ctx, o, tag, ch.Mutable || existing == nil, osNode.Inputs, images, configs, manifests, sources, immutable); err != nil {
+		// A release published with disks keeps them when shipped again with the same inputs while
+		// they are there; gone (a newer set replaced them), they are recorded as they were, or made
+		// again with --disks.
+		disks := o.Disks
+		if existing != nil && existing.Manifest.Inputs == relNode.Inputs && len(existing.Manifest.Artifacts.Disks) > 0 {
+			there, err := p.present(ctx, diskSet{disks: existing.Manifest.Artifacts.Disks})
+			if err != nil {
+				return nil, err
+			}
+			if there {
+				disks = true
+			} else if !o.Disks {
+				recorded = existing.Manifest.Artifacts.Disks
+			}
+		}
+		if osp, err = p.planOS(ctx, o, disks, tag, ch.Mutable || existing == nil, osNode.Inputs, images, configs, manifests, sources, immutable); err != nil {
 			return nil, err
 		}
 	}
@@ -471,7 +508,28 @@ func (p *Publisher) Ship(ctx context.Context, o ShipOptions) (*Ref, error) {
 			disks[a.format] = a.digest
 		}
 		if len(disks) == 0 {
-			disks = nil
+			disks = recorded
+		}
+	}
+	// A release without disks of its own records the disk set its installs boot: its channel's,
+	// or, shipped again with the same inputs, the one it recorded.
+	var boot *release.BootDisks
+	if osp != nil && disks == nil {
+		if existing != nil && existing.Manifest.Inputs == relNode.Inputs && len(existing.Manifest.Artifacts.Disks) == 0 {
+			boot = existing.Manifest.Artifacts.BootDisks
+		} else {
+			cur, err := p.currentDisks(ctx, o.Channel)
+			if err != nil {
+				return nil, err
+			}
+			if !cur.empty() && cur.release != tag {
+				boot = &release.BootDisks{Release: cur.release, Stowage: cur.stowage, Disks: cur.disks}
+			}
+		}
+		if boot == nil {
+			p.logf("no disk published, and the channel %s has none: a VM of this release cannot be created until a ship publishes disks (--disks)", o.Channel)
+		} else {
+			p.logf("no disk published: a VM of this release boots %s's disks, then takes this release's OS bundle", boot.Release)
 		}
 	}
 
@@ -491,7 +549,7 @@ func (p *Publisher) Ship(ctx context.Context, o ShipOptions) (*Ref, error) {
 		Inputs:         relNode.Inputs,
 		Scheme:         release.SchemeOf(s.Version.Scheme),
 		StowageVersion: p.StowageVersion,
-		Artifacts:      release.Artifacts{Images: images, Configs: configs, Manifests: manifests, OS: osDigest, Disks: disks},
+		Artifacts:      release.Artifacts{Images: images, Configs: configs, Manifests: manifests, OS: osDigest, Disks: disks, BootDisks: boot},
 		Changelog:      release.Changelog{Project: text},
 	}
 	if src := o.Promoted; src != nil {
@@ -566,7 +624,12 @@ func (p *Publisher) Ship(ctx context.Context, o ShipOptions) (*Ref, error) {
 		rel = &Ref{m, d}
 		p.logf("release %s published (seq %d)", tag, m.ReleaseSeq)
 	}
-	if err := p.verifyRelease(ctx, rel, tag); err != nil {
+	if len(rel.Manifest.Artifacts.Disks) > 0 && recorded == nil {
+		p.checkDisksOf = tag
+	}
+	err = p.verifyRelease(ctx, rel, tag)
+	p.checkDisksOf = ""
+	if err != nil {
 		return nil, fmt.Errorf("verify: %w", err)
 	}
 	// What the release wrote last (its chart, installer and manifest) is checked before a channel
@@ -596,7 +659,25 @@ func (p *Publisher) Ship(ctx context.Context, o ShipOptions) (*Ref, error) {
 		return rel, err
 	}
 	p.sweepCharts(ctx, o.Channel)
+	if len(rel.Manifest.Artifacts.Disks) > 0 && recorded == nil {
+		// A rebuilt tag's earlier disks, which no manifest names any more.
+		var replaced diskSet
+		if existing != nil && !maps.Equal(existing.Manifest.Artifacts.Disks, rel.Manifest.Artifacts.Disks) {
+			replaced = diskSet{release: tag, disks: existing.Manifest.Artifacts.Disks}
+		}
+		if err := p.cleanDisks(ctx, o.Channel, rel, replaced); err != nil {
+			return rel, &CleanupError{Release: tag, Err: err}
+		}
+	}
 	return rel, nil
+}
+
+// sameBoot reports whether two boot disk sets are the same.
+func sameBoot(a, b *release.BootDisks) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return a.Release == b.Release && a.Stowage == b.Stowage && maps.Equal(a.Disks, b.Disks)
 }
 
 // sameRelease reports whether a published manifest already describes the release m would: the
@@ -606,7 +687,8 @@ func (p *Publisher) Ship(ctx context.Context, o ShipOptions) (*Ref, error) {
 // published release.
 func sameRelease(a, b *release.Manifest) bool {
 	if a.Inputs != b.Inputs || len(a.Artifacts.Images) != len(b.Artifacts.Images) ||
-		a.Artifacts.OS != b.Artifacts.OS || !maps.Equal(a.Artifacts.Disks, b.Artifacts.Disks) {
+		a.Artifacts.OS != b.Artifacts.OS || !maps.Equal(a.Artifacts.Disks, b.Artifacts.Disks) ||
+		!sameBoot(a.Artifacts.BootDisks, b.Artifacts.BootDisks) {
 		return false
 	}
 	for k, v := range b.Artifacts.Images {
@@ -1011,9 +1093,44 @@ func (p *Publisher) verifyRelease(ctx context.Context, rel *Ref, tag string) err
 			return err
 		}
 	}
-	for _, f := range sortedKeys(rel.Manifest.Artifacts.Disks) {
-		if err := checkTag(p.diskRepo(), release.DiskTag(rel.Manifest.Tag, f), rel.Manifest.Artifacts.Disks[f]); err != nil {
+	// A release's own disks are checked while they are its channel's set, and by the ship that
+	// publishes them; others' a newer set may have replaced: its installs boot the channel's set.
+	if own := (diskSet{release: rel.Manifest.Tag, disks: rel.Manifest.Artifacts.Disks}); !own.empty() {
+		check := p.checkDisksOf == rel.Manifest.Tag
+		if !check {
+			cur, err := p.currentDisks(ctx, rel.Manifest.Channel)
+			if err != nil {
+				return err
+			}
+			check = cur.release == rel.Manifest.Tag
+		}
+		for _, f := range sortedKeys(own.disks) {
+			if !check {
+				break
+			}
+			if err := checkTag(p.diskRepo(), release.DiskTag(rel.Manifest.Tag, f), own.disks[f]); err != nil {
+				return err
+			}
+		}
+	}
+	// The set a release without disks boots, while it is the channel's: there, or reported.
+	if b := rel.Manifest.Artifacts.BootDisks; len(rel.Manifest.Artifacts.Disks) == 0 && b != nil {
+		cur, err := p.currentDisks(ctx, rel.Manifest.Channel)
+		if err != nil {
 			return err
+		}
+		if cur.release == b.Release {
+			for _, f := range sortedKeys(b.Disks) {
+				ref, err := p.Registry.Digest(p.diskRepo(), b.Disks[f])
+				if err != nil {
+					return err
+				}
+				if d, err := p.Registry.Head(ctx, ref); err != nil {
+					return err
+				} else if d == nil {
+					problems = append(problems, fmt.Sprintf("%s, the %s disk it boots (%s's), is missing", ref, f, b.Release))
+				}
+			}
 		}
 	}
 	if len(problems) > 0 {
@@ -1099,7 +1216,17 @@ func (p *Publisher) Promote(ctx context.Context, v, from, to string, revision in
 		return nil, fmt.Errorf("promote: the release inputs differ from %s as published (inputs %s, the release has %s): %s",
 			src.Manifest.Tag, registry.Short(rn.Inputs), registry.Short(src.Manifest.Inputs), hint)
 	}
-	return p.Ship(ctx, ShipOptions{Version: v, Channel: to, Revision: revision, NoBuild: true, Sources: []*Ref{src}, Promoted: src})
+	// The disks it published, while they are there: a newer set replaced them otherwise, and the
+	// promotion boots the target channel's.
+	disks := len(src.Manifest.Artifacts.Disks) > 0
+	if disks {
+		there, err := p.present(ctx, diskSet{disks: src.Manifest.Artifacts.Disks})
+		if err != nil {
+			return nil, err
+		}
+		disks = there
+	}
+	return p.Ship(ctx, ShipOptions{Version: v, Channel: to, Revision: revision, NoBuild: true, Sources: []*Ref{src}, Promoted: src, Disks: disks})
 }
 
 // scan reads every release manifest of the repository (of one channel when channel is set),
@@ -1263,7 +1390,7 @@ func (p *Publisher) retreatPointer(ctx context.Context, channel string) error {
 		return err
 	}
 	p.logf("channel %s has no complete release left: pointer removed", channel)
-	if err := p.Registry.DeleteTag(ctx, t); err != nil {
+	if err := p.untag(ctx, t); err != nil {
 		return err
 	}
 	return p.dropLatest(ctx, channel)
@@ -1294,6 +1421,36 @@ func (p *Publisher) Prune(ctx context.Context, channel, v string) (pruned []stri
 		}
 	}
 	pointerGone := false
+	// Which releases go, decided first: a pruned release's disk is kept whole while a release the
+	// prune keeps names it (its own, or the set it boots).
+	prunes := map[string]bool{}
+	for _, r := range rs {
+		onPointer := ptr != nil && ptr.Manifest.Tag == r.Manifest.Tag
+		if v == "" {
+			prunes[r.Manifest.Tag] = !onPointer
+			continue
+		}
+		same, err := p.sameVersion(r.Manifest.ProjectVersion, v)
+		if err != nil {
+			return nil, err
+		}
+		prunes[r.Manifest.Tag] = same
+	}
+	// Every channel's releases count, and one the current scheme does not order: a promotion
+	// shares a disk across channels.
+	everyRelease, err := p.scan(ctx, "")
+	if err != nil {
+		return nil, err
+	}
+	named := map[string]bool{}
+	for _, r := range everyRelease {
+		if r.Manifest.Channel != channel || !prunes[r.Manifest.Tag] {
+			for _, d := range bootSet(r.Manifest).digests() {
+				named[d] = true
+			}
+		}
+	}
+	var kept map[string]bool // the other channels' disk sets, read once a pruned release has disks
 	// Whatever happens below, a pointer whose release lost tags is moved off it.
 	defer func() {
 		if pointerGone {
@@ -1309,20 +1466,10 @@ func (p *Publisher) Prune(ctx context.Context, channel, v string) (pruned []stri
 		p.sweepCharts(ctx, channel)
 	}()
 	for _, r := range rs {
-		onPointer := ptr != nil && ptr.Manifest.Tag == r.Manifest.Tag
-		if v == "" && onPointer {
+		if !prunes[r.Manifest.Tag] {
 			continue
 		}
-		if v != "" {
-			same, err := p.sameVersion(r.Manifest.ProjectVersion, v)
-			if err != nil {
-				return pruned, err
-			}
-			if !same {
-				continue
-			}
-		}
-		if onPointer {
+		if ptr != nil && ptr.Manifest.Tag == r.Manifest.Tag {
 			pointerGone = true
 		}
 		type repoTag struct{ repo, tag string }
@@ -1339,23 +1486,54 @@ func (p *Publisher) Prune(ctx context.Context, channel, v string) (pruned []stri
 		if r.Manifest.Artifacts.OS != "" {
 			tags = append(tags, repoTag{p.osRepo(), r.Manifest.Tag})
 		}
-		for _, f := range sortedKeys(r.Manifest.Artifacts.Disks) {
-			tags = append(tags, repoTag{p.diskRepo(), release.DiskTag(r.Manifest.Tag, f)})
-		}
 		for _, rt := range tags {
 			t, err := p.Registry.Tag(rt.repo, rt.tag)
 			if err != nil {
 				return pruned, err
 			}
-			if err := p.Registry.DeleteTag(ctx, t); err != nil {
+			if err := p.untag(ctx, t); err != nil {
 				return pruned, err
+			}
+		}
+		// The disks the release boots (its own, or another's set) go, by digest, unless a release
+		// left boots them, or they are another channel's set.
+		if rd := bootSet(r.Manifest); !rd.empty() {
+			if kept == nil {
+				if kept, err = p.keptDisks(ctx); err != nil {
+					return pruned, err
+				}
+			}
+			for _, f := range sortedKeys(rd.disks) {
+				d := rd.disks[f]
+				switch {
+				case named[d]:
+					// A release left boots it: kept whole, tag included.
+					p.logf("disk %s of %s kept: a release left boots it", registry.Short(d), r.Manifest.Tag)
+					continue
+				case !kept[d]:
+					if err := p.remove(ctx, p.diskRepo(), d); err != nil {
+						return pruned, err
+					}
+					continue
+				}
+				// Another channel's set (a promotion re-tags the same disk): only this tag goes,
+				// where the registry deletes a tag alone.
+				t, err := p.Registry.Tag(p.diskRepo(), release.DiskTag(rd.release, f))
+				if err != nil {
+					return pruned, err
+				}
+				if err := p.Registry.DeleteTag(ctx, t); errors.Is(err, registry.ErrDeleteRefused) {
+					p.logf("disk %s of %s kept: it is a channel's disk set, and the registry deletes no tag alone", registry.Short(d), r.Manifest.Tag)
+				} else if err != nil {
+					return pruned, err
+				}
 			}
 		}
 		t, err := p.Registry.Tag(p.releaseRepo(), r.Manifest.Tag)
 		if err != nil {
 			return pruned, err
 		}
-		if err := p.Registry.DeleteTag(ctx, t); err != nil {
+		if err := p.untag(ctx, t); err != nil {
 			return pruned, err
 		}
 		p.logf("pruned %s", r.Manifest.Tag)

@@ -90,8 +90,12 @@ func (o *options) publisher(p *project.Project, a access) (*publish.Publisher, e
 		}
 	}
 	var pull *payload.Account
+	var del publish.Deleter
 	if a == writeAccess {
 		if pull, err = o.pullAccount(p); err != nil {
+			return nil, err
+		}
+		if del, err = o.deleter(p); err != nil {
 			return nil, err
 		}
 	}
@@ -107,12 +111,40 @@ func (o *options) publisher(p *project.Project, a access) (*publish.Publisher, e
 		Cloud:          up,
 		CloudVars:      cloudVars,
 		CloudErr:       cloudErr,
+		Deleter:        del,
 		StowageVersion: o.buildVersion,
 		Installer:      o.installer,
 		Pull:           pull,
 		Now:            o.now,
 		Log:            o.err,
 	}, nil
+}
+
+// DisksEnv set to 1 or true publishes the disks as --disks does: for a hook ship, from the
+// commit's environment.
+const DisksEnv = "STOWAGE_SHIP_DISKS"
+
+func (o *options) envDisks() bool {
+	v := strings.ToLower(strings.TrimSpace(o.getenv(DisksEnv)))
+	return v == "1" || v == "true"
+}
+
+// deleter is how the publisher deletes a manifest by digest (registry.delete): nil, the
+// registry's distribution API, for oci.
+func (o *options) deleter(p *project.Project) (publish.Deleter, error) {
+	d := p.Spec.Registry.Delete
+	if d.Or("oci").Name != "github" {
+		return nil, nil
+	}
+	c, err := providers.GitHubDelete(d, p.Spec.Registry.Push)
+	if err != nil {
+		return nil, fmt.Errorf("registry.delete: %w", err)
+	}
+	token := o.getenv(c.TokenEnv)
+	if token == "" {
+		return nil, fmt.Errorf("registry.delete: %s is not set: the github provider deletes with it", c.TokenEnv)
+	}
+	return &registry.GitHubPackages{API: c.API, Token: token}, nil
 }
 
 // pullAccount is the project's pull account as the installer bakes it in: the token provider's
@@ -208,7 +240,7 @@ func (o *options) printRelease(r *publish.Ref) error {
 
 // ship publishes the tree's release on channel (the default one when empty). want, when set, is
 // the version the caller expects the tree to be at: another one is refused.
-func (o *options) ship(ctx context.Context, channel string, revision int, want string) error {
+func (o *options) ship(ctx context.Context, channel string, revision int, want string, disks bool) error {
 	if err := o.lintGate(); err != nil {
 		return err
 	}
@@ -230,7 +262,21 @@ func (o *options) ship(ctx context.Context, channel string, revision int, want s
 	if err != nil {
 		return err
 	}
-	r, err := pub.Ship(ctx, publish.ShipOptions{Version: v, Channel: channel, Revision: revision})
+	r, err := pub.Ship(ctx, publish.ShipOptions{Version: v, Channel: channel, Revision: revision, Disks: disks})
+	return o.published(r, err)
+}
+
+// published prints a release a ship or a promote published. A cleanup that failed after it is
+// said apart, with exit status 3: the release is out, and is not shipped again.
+func (o *options) published(r *publish.Ref, err error) error {
+	var ce *publish.CleanupError
+	if errors.As(err, &ce) && r != nil {
+		if perr := o.printRelease(r); perr != nil {
+			return perr
+		}
+		fmt.Fprintf(o.err, "stowage: %v\n", ce)
+		return ExitError{Code: 3}
+	}
 	if err != nil {
 		return err
 	}
@@ -240,14 +286,16 @@ func (o *options) ship(ctx context.Context, channel string, revision int, want s
 func shipCmd(o *options) *cobra.Command {
 	var channel string
 	var revision int
+	var disks bool
 	c := &cobra.Command{
 		Use:   "ship",
 		Short: "Build what changed, push the release and move the channel pointer",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			return o.ship(cmd.Context(), channel, revision, "")
+			return o.ship(cmd.Context(), channel, revision, "", disks || o.envDisks())
 		},
 	}
+	c.Flags().BoolVar(&disks, "disks", false, "also publish the kairos shape's disks (and register cloud_publish's images); the channel's older disk sets are removed")
 	c.Flags().StringVar(&channel, "channel", "", "channel (default: the one that moves latest, else the first)")
 	c.Flags().IntVar(&revision, "revision", 1, "package revision")
 	c.Flags().BoolVar(&o.json, "json", false, "machine-readable output")
@@ -322,10 +370,7 @@ func promoteCmd(o *options) *cobra.Command {
 				return err
 			}
 			r, err := pub.Promote(cmd.Context(), v, from, to, revision)
-			if err != nil {
-				return err
-			}
-			return o.printRelease(r)
+			return o.published(r, err)
 		},
 	}
 	c.Flags().StringVar(&from, "from", "", "source channel (required)")

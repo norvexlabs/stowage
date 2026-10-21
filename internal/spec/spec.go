@@ -84,6 +84,9 @@ type Registry struct {
 	Prefix string   `yaml:"prefix"`
 	Pull   Provider `yaml:"pull"`
 	Push   Provider `yaml:"push"`
+	// Delete is how the publisher deletes a manifest (an older disk set, a pruned release's):
+	// oci, the distribution API (the default), or github, GitHub's packages API.
+	Delete Provider `yaml:"delete"`
 }
 
 // Image is either built (Context + Dockerfile) or a pinned upstream reference (Ref).
@@ -273,11 +276,37 @@ type Shapes struct {
 	Kairos     *KairosShape `yaml:"kairos"`
 }
 
+// Names are the shapes the project has: docker, kubernetes, kairos, in that order.
+func (s Shapes) Names() []string {
+	var out []string
+	if s.Docker != nil {
+		out = append(out, "docker")
+	}
+	if s.Kubernetes != nil {
+		out = append(out, "kubernetes")
+	}
+	if s.Kairos != nil {
+		out = append(out, "kairos")
+	}
+	return out
+}
+
 type DockerShape struct{}
 
 type K8sShape struct {
 	Chart         string   `yaml:"chart"`
 	PostgresModes []string `yaml:"postgres_modes"`
+	// Schema lets `k8s upgrade` record the database's schema and `k8s rollback` check it: the
+	// sql schema-compat queries run with psql in a pod of Image, with the environment of the
+	// container of the workload running database.schema_compat's reads_newer_image, connecting
+	// to the URL the variable URLEnv holds there.
+	Schema *K8sSchema `yaml:"schema"`
+}
+
+// K8sSchema is shapes.kubernetes.schema.
+type K8sSchema struct {
+	URLEnv string `yaml:"url_env"`
+	Image  string `yaml:"image"`
 }
 
 // DiskFormats are the kairos shape's disk image formats, in the order they are made.
@@ -419,7 +448,7 @@ func (s *Spec) Signs() bool { return s.Signing != nil && s.Signing.Name != "none
 
 // RuntimeView is the part of the spec that reaches an install: the spec without the fields only
 // the publisher reads (version and changelog providers, channels, push credentials, the signing
-// key). Artifacts embed this view, so their inputs digests hash it and nothing else: fixing push
+// key, the delete provider). Artifacts embed this view, so their inputs digests hash it and nothing else: fixing push
 // credentials or a channel template must not change what a release contains.
 func (s *Spec) RuntimeView() Spec {
 	v := *s
@@ -427,6 +456,7 @@ func (s *Spec) RuntimeView() Spec {
 	v.Changelog = Provider{}
 	v.Channels = nil
 	v.Registry.Push = Provider{}
+	v.Registry.Delete = Provider{}
 	if s.Signing != nil {
 		pub := Provider{Name: s.Signing.Name}
 		if keys, ok := s.Signing.Config["public_keys"]; ok {

@@ -840,32 +840,32 @@ func TestSchemaAnswersAreBounded(t *testing.T) {
 	e.docker.schema = func(string, map[string]any) (string, error) {
 		return `{"version": "` + strings.Repeat("1", maxSchemaAnswer) + `"}`, nil
 	}
-	if _, err := (schema{e.installer(nil), e.readEnv()}).current(context.Background(), e.readEnv()); err == nil || !strings.Contains(err.Error(), "longer than") {
+	if _, err := (schema{in: e.installer(nil), stack: e.readEnv()}).current(context.Background(), e.readEnv()); err == nil || !strings.Contains(err.Error(), "longer than") {
 		t.Fatalf("%v", err)
 	}
 	e.docker.schema = func(string, map[string]any) (string, error) { return `{"version": "0006"}`, nil }
-	if v, err := (schema{e.installer(nil), e.readEnv()}).current(context.Background(), e.readEnv()); v != "6" || err != nil {
+	if v, err := (schema{in: e.installer(nil), stack: e.readEnv()}).current(context.Background(), e.readEnv()); v != "6" || err != nil {
 		t.Fatalf("leading zeros: %q %v", v, err)
 	}
 	for _, v := range []string{`"5; DROP"`, "1234567890123456", "-1", `"0x10"`} {
 		e.docker.schema = func(string, map[string]any) (string, error) { return `{"version": ` + v + `}`, nil }
-		if _, err := (schema{e.installer(nil), e.readEnv()}).current(context.Background(), e.readEnv()); err == nil || !strings.Contains(err.Error(), "not a migration number") {
+		if _, err := (schema{in: e.installer(nil), stack: e.readEnv()}).current(context.Background(), e.readEnv()); err == nil || !strings.Contains(err.Error(), "not a migration number") {
 			t.Errorf("%s: %v", v, err)
 		}
 	}
 	e.docker.schema = func(string, map[string]any) (string, error) { return `{"version": 123456789012345}`, nil }
-	if _, err := (schema{e.installer(nil), e.readEnv()}).current(context.Background(), e.readEnv()); err != nil {
+	if _, err := (schema{in: e.installer(nil), stack: e.readEnv()}).current(context.Background(), e.readEnv()); err != nil {
 		t.Errorf("15 digits: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(e.dir, SchemaCompose)); !errors.Is(err, os.ErrNotExist) {
 		t.Error("the schema command's compose file is left in the install")
 	}
 	e.docker.schema = func(string, map[string]any) (string, error) { return `{"version": "5; DROP"}`, nil }
-	if _, err := (schema{e.installer(nil), e.readEnv()}).current(context.Background(), e.readEnv()); err == nil || !strings.Contains(err.Error(), "not a migration number") {
+	if _, err := (schema{in: e.installer(nil), stack: e.readEnv()}).current(context.Background(), e.readEnv()); err == nil || !strings.Contains(err.Error(), "not a migration number") {
 		t.Fatalf("%v", err)
 	}
 	e.docker.schema = func(string, map[string]any) (string, error) { return "", exitCode(2) }
-	if _, err := (schema{e.installer(nil), e.readEnv()}).current(context.Background(), e.readEnv()); !errors.Is(err, command.ErrNoAnswer) {
+	if _, err := (schema{in: e.installer(nil), stack: e.readEnv()}).current(context.Background(), e.readEnv()); !errors.Is(err, command.ErrNoAnswer) {
 		t.Fatalf("%v", err)
 	}
 }
@@ -1104,5 +1104,60 @@ func TestFinishingAStoppedUpgradeRestoresTheStackFiles(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(e.dir, PrevDir)); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("PrevDir is left: %v", err)
+	}
+}
+
+// An upgrade to a release that no longer declares an input, or a key its provision hook returned,
+// drops the recorded value, saying so, and asks nothing; a rollback takes both back.
+func TestUpgradeDropsWhatTheReleaseRemoved(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	e.schemaAt("5", nil, true)
+	e.to("1.0.0", func(s *spec.Spec) {
+		s.Inputs = append(s.Inputs, spec.Input{Key: "OLD_KNOB", Prompt: "old"}, spec.Input{Key: "OLD_ADV", Prompt: "adv", Advanced: true})
+		s.Hooks.Provision.Config["returns"] = []any{"OLD_KEY", "KEPT_KEY"}
+	})
+	e.docker.hookOut = "OLD_KEY=a\nKEPT_KEY=b\n"
+	if err := e.install(func(o *Options) { o.Set = map[string]string{"OLD_KNOB": "x", "OLD_ADV": "y"} }); err != nil {
+		t.Fatalf("%v\n%s", err, e.log)
+	}
+	e.to("2.0.0", func(s *spec.Spec) { s.Hooks.Provision.Config["returns"] = []any{"KEPT_KEY"} })
+	e.docker.hookOut = ""
+	if err := e.upgrade(nil); err != nil {
+		t.Fatalf("%v\n%s", err, e.log)
+	}
+	after := e.readEnv()
+	for _, k := range []string{"OLD_KNOB", "OLD_ADV"} {
+		if _, ok := after.Get(k); ok {
+			t.Errorf("%s is still recorded", k)
+		}
+		if !strings.Contains(e.log.String(), "input "+k+" is not in notes 2.0.0: dropped") {
+			t.Errorf("no line for %s:\n%s", k, e.log)
+		}
+	}
+	rec := read(t, filepath.Join(e.dir, ProvisionEnv))
+	if strings.Contains(rec, "OLD_KEY") || !strings.Contains(rec, "KEPT_KEY='b'") || strings.Contains(strings.Join(e.docker.hookEnv, " "), "OLD_KEY") {
+		t.Errorf("provision.env %q, hook given %v", rec, e.docker.hookEnv)
+	}
+	if !strings.Contains(e.log.String(), "no longer returns OLD_KEY: dropped") {
+		t.Errorf("no line for OLD_KEY:\n%s", e.log)
+	}
+	// Back on 1.0.0, the values it reads come back.
+	if err := e.rollback(nil); err != nil {
+		t.Fatalf("rollback: %v\n%s", err, e.log)
+	}
+	if get(e.readEnv(), "OLD_KNOB") != "x" || !strings.Contains(read(t, filepath.Join(e.dir, ProvisionEnv)), "OLD_KEY='a'") {
+		t.Errorf("rollback did not take them back: %v", e.readEnv().Keys())
+	}
+}
+
+// An input the release now records as a secret is no removed input: its value stays. One now a
+// safe default is: the safe value replaces the operator's.
+func TestAnInputMovedToASecretIsKept(t *testing.T) {
+	t.Parallel()
+	from := &Release{Spec: &spec.Spec{Inputs: []spec.Input{{Key: "DB_PASSWORD"}, {Key: "MODE"}, {Key: "GONE"}}}}
+	to := &Release{Spec: &spec.Spec{Secrets: []spec.Secret{{Key: "DB_PASSWORD", Gen: "hex16"}}, SafeDefaults: map[string]string{"MODE": "safe"}}}
+	if r := removedBy(from, to); strings.Join(r.inputs, ",") != "GONE,MODE" {
+		t.Errorf("removed %v", r.inputs)
 	}
 }

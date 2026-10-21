@@ -6,6 +6,7 @@ package providers
 import (
 	"errors"
 	"fmt"
+	"net/url"
 	"regexp"
 	"slices"
 	"sort"
@@ -94,6 +95,56 @@ func RegistryAuth(p spec.Provider, push bool) error {
 		return errors.New("provider is required (token, docker-config, none)")
 	default:
 		return fmt.Errorf("unknown provider %q (token, docker-config, none)", p.Name)
+	}
+}
+
+// GitHubDeleteConfig is the github delete provider's configuration: API is GitHub's REST API root
+// (default https://api.github.com), TokenEnv the variable holding a token with delete:packages
+// (default: the push token's variable).
+type GitHubDeleteConfig struct {
+	API      string `yaml:"api"`
+	TokenEnv string `yaml:"token_env"`
+}
+
+// GitHubDelete decodes a github delete provider, its defaults applied: push is registry.push.
+func GitHubDelete(p, push spec.Provider) (GitHubDeleteConfig, error) {
+	var c GitHubDeleteConfig
+	if err := p.Decode(&c); err != nil {
+		return c, err
+	}
+	if c.API == "" {
+		c.API = "https://api.github.com"
+	}
+	if u, err := url.Parse(c.API); err != nil || u.Scheme != "https" || u.Host == "" || u.RawQuery != "" || u.Fragment != "" {
+		return c, fmt.Errorf("github: api %q is not an https URL", c.API)
+	}
+	if c.TokenEnv == "" {
+		if push.Name != "token" {
+			return c, errors.New("github: token_env is required when registry.push is not a token")
+		}
+		t, err := Token(push)
+		if err != nil {
+			return c, err
+		}
+		c.TokenEnv = t.TokenEnv
+	}
+	if !EnvName.MatchString(c.TokenEnv) {
+		return c, fmt.Errorf("github: token_env %q is not an environment variable name", c.TokenEnv)
+	}
+	return c, nil
+}
+
+// RegistryDelete validates registry.delete: oci (the default) or github.
+func RegistryDelete(p, push spec.Provider) error {
+	switch p.Or("oci").Name {
+	case "oci":
+		var c struct{}
+		return p.Decode(&c)
+	case "github":
+		_, err := GitHubDelete(p, push)
+		return err
+	default:
+		return fmt.Errorf("unknown provider %q (oci, github)", p.Name)
 	}
 }
 
@@ -408,10 +459,11 @@ var profileName = regexp.MustCompile(`^[a-z0-9]{1,32}$`)
 // VMBackup is the backup provider the Kairos VM runs.
 const VMBackup = "pg-age-rclone"
 
-// RunsVMBackups reports whether s's VM runs backups: a kairos shape with a pg-age-rclone backup.
+// RunsBackups reports whether s's installs run backups: a pg-age-rclone backup, with the Docker or
+// the kairos shape (whose VM runs the Docker shape's install).
 // Its releases carry the backup runner.
-func RunsVMBackups(s *spec.Spec) bool {
-	return s.Shapes.Kairos != nil && s.Backup != nil && s.Backup.Name == VMBackup
+func RunsBackups(s *spec.Spec) bool {
+	return (s.Shapes.Kairos != nil || s.Shapes.Docker != nil) && s.Backup != nil && s.Backup.Name == VMBackup
 }
 
 // PgAgeRclone is a decoded pg-age-rclone backup: Profiles maps each profile to the tables whose

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # End-to-end test of examples/full (atlas) on the Kairos shape, a real VM on TrueNAS: this month's
-# signed CalVer release crosses to a TLS mirror of its own CA; `vm create --create opentofu` boots
-# its disk, whose first boot installs it from the cloud-config's settings with the search
+# signed CalVer release .1 is shipped with its disk, .2 without one (it records .1's), and .2
+# crosses to a TLS mirror of its own CA; `vm create --create opentofu` of .2 boots .1's disk, whose
+# first boot writes .2's OS bundle and reboots into it, which installs it from the cloud-config's settings with the search
 # extension's input set (to the api itself, standing in for a search service); the provision hook registers the administrator through the api; the api reaches the host
 # daemon's app socket and reads the front's local CA; an event goes through ingest; then `vm
 # destroy`. Upgrade, rollback and the health gate's fallback are the VM machinery's: e2e-vm. Needs
@@ -51,35 +52,44 @@ sed -i 's/^    disk_formats: \[raw, qcow2, ova, vhd, gce\]$/    disk_formats: [q
 grep -qx '    disk_formats: \[qcow2\]' "$P/stowage.yaml" && grep -q '^    health_gate: { deadline_s: 300, ' "$P/stowage.yaml" || fail "the kairos shape was not edited"
 "${S[@]}" lint
 
-step "ship $V1: images, the OS bundle, its disk"
-"${S[@]}" ship --channel stable 2>"$WORK/ship-$V1.log" || { tail -50 "$WORK/ship-$V1.log"; fail "ship $V1"; }
+step "ship $V1 with its disk (--disks): images, the OS bundle, its disk"
+"${S[@]}" ship --channel stable --disks 2>"$WORK/ship-$V1.log" || { tail -50 "$WORK/ship-$V1.log"; fail "ship $V1"; }
 grep -q "disk qcow2: tag .* → v$V1-qcow2" "$WORK/ship-$V1.log" || { grep -i disk "$WORK/ship-$V1.log"; fail "the qcow2 disk was not tagged"; }
 
-step "the published at-stow, the site's mirror, $V1 in it"
-vm_ctl "v$V1"
+V2=$CALVER.2
+step "ship $V2 (a migration) without disks: it records $V1's as the disk its VMs boot"
+full_release 2 002_event_source.sql "-- 002: where an event came from
+ALTER TABLE events ADD COLUMN source text;"
+grep -q "no disk published: a VM of this release boots v$V1's disks" "$WORK/ship-$V2.log" || { grep -i disk "$WORK/ship-$V2.log"; fail "$V2 does not record $V1's disk"; }
+! grep -q 'disks: make' "$WORK/ship-$V2.log" || fail "$V2 made disks"
+
+step "the published at-stow of $V2, the site's mirror, $V2 in it with $V1's disk"
+vm_ctl "v$V2"
 vm_mirror
 mirror "$WORK/r1.oci.tar"
-grep -q "^Exported atlas $V1" "$WORK/r1.oci.tar.txt" || { cat "$WORK/r1.oci.tar.txt"; fail "export of $V1"; }
+grep -q "^Exported atlas $V2" "$WORK/r1.oci.tar.txt" || { cat "$WORK/r1.oci.tar.txt"; fail "export of $V2"; }
 
-step "vm create with OpenTofu on TrueNAS, from the mirror, search set: it boots and installs"
+step "vm create of $V2 with OpenTofu on TrueNAS, from the mirror, search set: it boots $V1's disk, takes $V2's OS, and installs $V2"
 vm_names
 vm_cleanup
 "$CTL" vm create --no-input --platform truenas --create opentofu --hostname "$H" --user ops --ssh-key "$KEY.pub" \
 	--tls internal --domains console=console.atlas.test,api=api.atlas.test,ingest=ingest.atlas.test \
 	--set ADMIN_EMAIL=admin@atlas.test --set ORG_NAME=Atlas --set SUPPORT_EMAIL=support@atlas.test --set SEARCH_URL=http://api:9090 \
-	--pool "$POOL" --dataset "$DATASET" --bridge "$BRIDGE" --cpus 2 --memory 4096 --disk 32 --host "$ADDR" --wait "${E2E_VM_WAIT:-30m}" \
+	--pool "$POOL" --dataset "$DATASET" --bridge "$BRIDGE" --cpus 2 --memory 4096 --disk 32 --host "$ADDR" --wait "${E2E_VM_WAIT:-45m}" \
 	--registry "$SITE" --registry-ca "$MIRROR_CA" \
 	>"$WORK/vm-create.txt" 2>"$WORK/vm-create.log" || { tail -80 "$WORK/vm-create.log"; fail "vm create"; }
-grep -q "^The VM $H runs atlas $V1" "$WORK/vm-create.txt" || { cat "$WORK/vm-create.txt"; fail "vm create did not report the install"; }
+grep -q "fetching atlas's qcow2 disk of v$V1" "$WORK/vm-create.log" || { tail -30 "$WORK/vm-create.log"; fail "vm create did not boot $V1's disk"; }
+grep -q "^The VM $H runs atlas $V2" "$WORK/vm-create.txt" || { cat "$WORK/vm-create.txt"; fail "vm create did not report the install"; }
 ! grep -rqF -- "$TRUENAS_API_KEY" "$STATE" || fail "the API key is in the VM's state"
 IP=$(getent hosts "$ADDR" | awk '{print $1; exit}')
 [[ -n $IP ]] || fail "$ADDR does not resolve"
 
-step "on the VM: $V1 runs from the mirror, the administrator registered, search set"
+step "on the VM: $V2 runs from the mirror on its own OS, the administrator registered, search set"
 on_vm at-stow status >"$WORK/status.txt" || fail "status over SSH"
-grep -q "^installed  atlas $V1 (revision 1)" "$WORK/status.txt" && grep -q '^channel    stable' "$WORK/status.txt" ||
+grep -q "^os         atlas $V2 (revision 1)" "$WORK/status.txt" || { cat "$WORK/status.txt"; fail "the VM does not run $V2's OS"; }
+grep -q "^installed  atlas $V2 (revision 1)" "$WORK/status.txt" && grep -q '^channel    stable' "$WORK/status.txt" ||
 	{ cat "$WORK/status.txt"; fail "status does not show the install"; }
-atlas_on "$V1" 1
+atlas_on "$V2" 2
 [[ $(status organisation admins search) == Atlas/1/True ]] || fail "the api answers $(status organisation admins search) (organisation/admins/search), want Atlas/1/True"
 on_vm sudo cat /usr/local/atlas/.env >"$WORK/vm.env"
 grep -qx "STOWAGE_REGISTRY='$SITE'" "$WORK/vm.env" || fail "the install does not record the mirror"

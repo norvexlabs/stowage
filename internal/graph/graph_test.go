@@ -335,14 +335,14 @@ func TestBackupRecipeReachesTheRunnerOnly(t *testing.T) {
 }
 
 // Only a release whose VM runs a pg-age-rclone backup carries the runner.
-func TestBackupRunnerOnlyWithAVMBackup(t *testing.T) {
+func TestBackupRunnerOnlyWithAPgAgeRcloneBackup(t *testing.T) {
 	t.Parallel()
 	for _, c := range []struct {
 		name, old, new string
 	}{
 		{"no backup", "backup:\n  provider: pg-age-rclone\n  profiles: { full: all }\n", ""},
 		{"command backup", "  provider: pg-age-rclone\n  profiles: { full: all }\n", "  provider: command\n  image: api\n  cmd: [notes-api, backup]\n"},
-		{"no kairos shape", "  kairos:\n    base: ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55\n    kairos_init: quay.io/kairos/kairos-init:v0.16.2@sha256:0777266d25e31b653deaaaa084d4e27d98f7a55e82e42f0648e2ba9c756b8664\n    disk_formats: [qcow2]\n    host_api: [api]\n", ""},
+		{"neither docker nor kairos", "  docker: {}\n  kubernetes: { chart: deploy/chart, postgres_modes: [external, cnpg] }\n  kairos:\n    base: ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55\n    kairos_init: quay.io/kairos/kairos-init:v0.16.2@sha256:0777266d25e31b653deaaaa084d4e27d98f7a55e82e42f0648e2ba9c756b8664\n    disk_formats: [qcow2]\n    host_api: [api]\n", "  kubernetes: { chart: deploy/chart, postgres_modes: [external, cnpg] }\n"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			t.Parallel()
@@ -353,6 +353,12 @@ func TestBackupRunnerOnlyWithAVMBackup(t *testing.T) {
 				t.Error("the release carries the backup runner")
 			}
 		})
+	}
+	// Positive control: the Docker shape alone runs backups, with the runner.
+	root := testutil.CopyExample(t, "minimal")
+	testutil.Edit(t, root, "stowage.yaml", "  kairos:\n    base: ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55\n    kairos_init: quay.io/kairos/kairos-init:v0.16.2@sha256:0777266d25e31b653deaaaa084d4e27d98f7a55e82e42f0648e2ba9c756b8664\n    disk_formats: [qcow2]\n    host_api: [api]\n", "")
+	if _, ok := build(t, root).Node(BackupID); !ok {
+		t.Error("a Docker release with a pg-age-rclone backup carries no runner")
 	}
 }
 

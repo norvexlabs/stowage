@@ -24,6 +24,10 @@ import (
 
 	"github.com/google/go-containerregistry/pkg/authn"
 	ggcrregistry "github.com/google/go-containerregistry/pkg/registry"
+	v1 "github.com/google/go-containerregistry/pkg/v1"
+	"github.com/google/go-containerregistry/pkg/v1/mutate"
+	"github.com/google/go-containerregistry/pkg/v1/random"
+	"github.com/google/go-containerregistry/pkg/v1/remote"
 
 	"github.com/norvexlabs/stowage/internal/helm"
 	"github.com/norvexlabs/stowage/internal/payload"
@@ -70,6 +74,10 @@ type fakeKube struct {
 	canI      []string          // what `kubectl auth can-i` was asked
 	logs      map[string]string // `kubectl logs`, by container
 	objects   map[string]string // `kubectl get <kind> <name>` by "kind/name", before any other answer
+	// sql answers the schema pod's query: its pod's phase and its output.
+	sql      func(query string) (phase, out string)
+	schemaPo map[string][2]string // the schema pods made: name → phase, output
+	schemaQs []string             // the queries they ran
 }
 
 type kubeTool struct {
@@ -146,6 +154,28 @@ func (k kubeTool) Run(_ context.Context, c Cmd) ([]byte, error) {
 		}
 		return nil, f.deleteErr
 	case "kubectl create":
+		if f.sql != nil {
+			raw, _ := io.ReadAll(c.Stdin)
+			var pod struct {
+				Kind     string
+				Metadata struct{ Name string }
+				Spec     struct {
+					Containers []struct{ Command []string }
+				}
+			}
+			if json.Unmarshal(raw, &pod) == nil && pod.Kind == "Pod" {
+				cmdl := pod.Spec.Containers[0].Command
+				q := cmdl[slices.Index(cmdl, "-c")+1]
+				f.schemaQs = append(f.schemaQs, q)
+				phase, out := f.sql(q)
+				if f.schemaPo == nil {
+					f.schemaPo = map[string][2]string{}
+				}
+				f.schemaPo[pod.Metadata.Name] = [2]string{phase, out}
+				return nil, nil
+			}
+			c.Stdin = bytes.NewReader(raw)
+		}
 		var job map[string]any
 		if err := json.NewDecoder(c.Stdin).Decode(&job); err != nil {
 			return nil, err
@@ -177,6 +207,9 @@ func (k kubeTool) Run(_ context.Context, c Cmd) ([]byte, error) {
 		_, _ = io.WriteString(c.Stdout, "yes\n")
 		return nil, nil
 	case "kubectl logs":
+		if p, ok := f.schemaPo[a[1]]; ok {
+			return []byte(p[1]), nil
+		}
 		return []byte(f.logs[a[slices.Index(a, "--container")+1]]), nil
 	case "helm status":
 		_, err := io.WriteString(c.Stdout, "STATUS: deployed\n")
@@ -207,6 +240,9 @@ func (k kubeTool) Run(_ context.Context, c Cmd) ([]byte, error) {
 		}
 		if obj, ok := f.objects[a[1]+"/"+a[2]]; ok {
 			return []byte(obj), nil
+		}
+		if p, ok := f.schemaPo[a[2]]; ok && a[1] == "pod" {
+			return []byte(p[0]), nil
 		}
 		switch {
 		case slices.Contains([]string{"serviceaccount", "role", "rolebinding"}, a[1]):
@@ -1057,6 +1093,103 @@ func TestListedKeys(t *testing.T) {
 		}
 		if got := len(listedKeys(d.PublicKeys)) > 0; got != want {
 			t.Errorf("%s: %v", raw, got)
+		}
+	}
+}
+
+// sqlSchema gives the release the sql schema-compat provider and the Kubernetes schema check.
+func sqlSchema(s *spec.Spec) {
+	s.Database.SchemaCompat = spec.Provider{Name: "sql", Config: map[string]any{
+		"current":           "SELECT max(version) FROM m",
+		"barrier_after":     "SELECT string_agg(d, '; ') FROM m WHERE version > $1 AND d LIKE 'rollback barrier%'",
+		"reads_newer_label": "com.example.reads-newer",
+		"reads_newer_image": "api",
+	}}
+	s.Shapes.Kubernetes.Schema = &spec.K8sSchema{URLEnv: "DATABASE_URL", Image: "postgres"}
+}
+
+// The rollback reads the database in a pod before helm: across a barrier, or onto a release that
+// does not read the newer schema, it is refused; a release reading it goes back.
+func TestK8sRollbackChecksTheSchema(t *testing.T) {
+	t.Parallel()
+	for _, c := range []struct {
+		name, barrier, label, want string
+		recorded                   string
+		rolledBack                 bool
+	}{
+		{"a barrier since", "rollback barrier: x moved", "true", "the database carries rollback barrier: x moved, which removed something notes 0.9.0 (revision 1) may still use", "3", false},
+		{"a release that predates the newer schema", "", "", "the database is at 5, and notes 0.9.0 (revision 1) predates reading a newer schema", "3", false},
+		{"a release that reads it", "", "true", "", "3", true},
+		{"nothing recorded", "rollback barrier: x moved", "", "", "", true},
+		{"the schema did not move", "rollback barrier: x moved", "", "", "5", true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			e := newKubeEnv(t, spec.Provider{Name: "none"})
+			e.release = e.at("1.0.0", 1, sqlSchema)
+			// 0.9.0's api image, labelled as the case says, in its published release manifest.
+			cl := registry.New(authn.NewMultiKeychain())
+			img, _ := random.Image(64, 1)
+			if c.label != "" {
+				img, _ = mutate.Config(img, v1.Config{Labels: map[string]string{"com.example.reads-newer": c.label}})
+			}
+			h, _ := img.Digest()
+			ref, _ := cl.Digest(e.prefix+"/notes-api", h.String())
+			if err := remote.Write(ref, img); err != nil {
+				t.Fatal(err)
+			}
+			old := e.at("0.9.0", 1, sqlSchema)
+			old.Manifest.Artifacts.Images["api"] = h.String()
+			e.published(old)
+			e.runs("1.0.0", 1)
+			e.f.manifest = "kind: Deployment\nmetadata: {name: notes-api}\nspec:\n  template:\n    spec:\n      imagePullSecrets: [{name: notes-stowage-pull}]\n      containers:\n        - name: api\n          image: " + e.prefix + "/notes-api@" + digest + "\n          env: [{name: DATABASE_URL, value: postgres://x}]\n"
+			e.f.history = []helmRevision{{Revision: 1, Status: "superseded", Chart: "notes-0.1.0", Description: "Install complete"}, {Revision: 2, Status: "deployed", Chart: "notes-0.1.0", Description: "Upgrade complete"}}
+			rel := func(v string) string {
+				return `"release": {"name": "notes", "version": "` + v + `", "revision": 1, "channel": "stable", "tag": "` + v + `"}`
+			}
+			e.f.revValues = map[int]string{
+				1: `{"stowage": {"registry": "` + e.prefix + `", ` + rel("0.9.0") + `}}`,
+				2: `{"stowage": {"registry": "` + e.prefix + `", "schemaFrom": "` + c.recorded + `", ` + rel("1.0.0") + `}}`,
+			}
+			e.f.sql = func(q string) (string, string) {
+				if strings.HasPrefix(q, "SELECT max") {
+					return "Succeeded", "5\n"
+				}
+				return "Succeeded", c.barrier + "\n"
+			}
+			err := e.installer(func(o *Options) { o.K8s.Revision = 1 }).K8sRollback(context.Background())
+			if rolled := len(e.f.ran("helm rollback")) == 1; rolled != c.rolledBack || (c.want != "" && (err == nil || !strings.Contains(err.Error(), c.want))) || (c.want == "" && err != nil) {
+				t.Fatalf("rolled back %v: %v\n%s", rolled, err, e.log)
+			}
+			if c.recorded != "" {
+				if len(e.f.schemaQs) == 0 {
+					t.Fatal("no schema pod ran")
+				}
+				if c.recorded == "3" && c.rolledBack && !slices.ContainsFunc(e.f.schemaQs, func(q string) bool { return strings.Contains(q, "version > 3") }) {
+					t.Errorf("queries %q", e.f.schemaQs)
+				}
+			}
+		})
+	}
+}
+
+// An upgrade records the schema it read before helm migrates; one it could not read is recorded
+// empty, so an earlier upgrade's value is never reused.
+func TestK8sUpgradeRecordsTheSchema(t *testing.T) {
+	t.Parallel()
+	for _, c := range []struct{ phase, out, want string }{{"Succeeded", "7\n", `schemaFrom: "7"`}, {"Failed", "could not connect", `schemaFrom: ""`}} {
+		e := newKubeEnv(t, spec.Provider{Name: "none"})
+		e.release = e.at("1.0.0", 1, sqlSchema)
+		e.published(e.release)
+		e.runs("0.9.0", 1)
+		e.stored(map[string]string{"ADMIN_EMAIL": "a@example.org", "SESSION_SECRET": "s", "POSTGRES_PASSWORD": "p"}, ours)
+		e.f.manifest = "kind: Deployment\nmetadata: {name: notes-api}\nspec:\n  template:\n    spec:\n      containers:\n        - name: api\n          image: " + e.prefix + "/notes-api:1.0.0\n          envFrom: [{secretRef: {name: notes-db}}]\n"
+		e.f.sql = func(string) (string, string) { return c.phase, c.out }
+		if err := e.installer(nil).K8sUpgrade(context.Background()); err != nil {
+			t.Fatalf("%v\n%s", err, e.log)
+		}
+		if !strings.Contains(e.f.given[0], c.want) {
+			t.Errorf("%s: values %q", c.phase, e.f.given[0])
 		}
 	}
 }

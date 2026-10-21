@@ -15,7 +15,7 @@
 # and its app socket, a backup through the preloaded runner to a WebDAV server, decrypted with the
 # key), a second ship that builds nothing, promote to the immutable channel
 # (re-tagged, with latest-<format> following it), `vm create` from the published notes-stow (the
-# disk by digest, the seed ISO), verify, prune; then ship 2.0.0 (a migration): booting its notes-stow
+# disk by digest, the seed ISO), verify, prune (a channel's disk set stays); then ship 2.0.0 (a migration): booting its notes-stow
 # upgrades the install, and booting 1.0.0's again (the A/B fallback) goes back.
 set -euo pipefail
 
@@ -78,13 +78,13 @@ grep -q 'disk_pressure: { soft_pct: 1,' "$P/stowage.yaml" || fail "disk pressure
 "${S[@]}" lint
 
 step "ship beta: images, the OS bundle, its disks"
-"${S[@]}" ship --channel beta 2>"$WORK/ship1.log" || { tail -50 "$WORK/ship1.log"; fail "ship"; }
+"${S[@]}" ship --channel beta --disks 2>"$WORK/ship1.log" || { tail -50 "$WORK/ship1.log"; fail "ship"; }
 grep -q 'os bundle: build 1.0.0' "$WORK/ship1.log" || fail "the bundle was not built"
 grep -q 'disks: make raw, qcow2, ova, vhd, gce' "$WORK/ship1.log" || fail "the disks were not made"
 for f in "${FORMATS[@]}"; do
 	grep -q "disk $f: tag .* → beta-1.0.0-$f" "$WORK/ship1.log" || fail "disk $f was not tagged"
 done
-[[ $(grep -c '^signed ' "$WORK/ship1.log") == 14 ]] || { grep '^signed ' "$WORK/ship1.log"; fail "want 14 signatures (8, the bundle, 5 disks)"; }
+[[ $(grep -c '^signed ' "$WORK/ship1.log") == 15 ]] || { grep '^signed ' "$WORK/ship1.log"; fail "want 15 signatures (8, the bundle, 5 disks, the channel's disk set)"; }
 for c in "${CLOUDS[@]}"; do
 	if [[ -n ${!CLOUD_KEY[$c]:-} ]]; then
 		grep -q "cloud $c: register notes-[0-9a-f]\{12\}$" "$WORK/ship1.log" && grep -q "cloud $c: image ." "$WORK/ship1.log" || { tail -30 "$WORK/ship1.log"; fail "the $c image was not registered"; }
@@ -316,10 +316,10 @@ for want in [b"#cloud-config", b"ssh-ed25519 ", b"/etc/notes/install.yaml", b"ch
 PY
 rm -rf "$VMC"
 
-step "prune beta: its bundle and disk tags go, stable's stay"
+step "prune beta: its bundle tag goes, its disks (beta's disk set) and stable's stay"
 [[ $("${S[@]}" prune --channel beta 1.0.0) == beta-1.0.0 ]] || fail "prune output"
 expect_code 404 "${pull_auth[@]}" -H "$ACCEPT" "http://$REG/v2/notes/notes-os/manifests/beta-1.0.0"
-expect_code 404 "${pull_auth[@]}" -H "$ACCEPT" "http://$REG/v2/notes/notes-disk/manifests/beta-1.0.0-qcow2"
+expect_code 200 "${pull_auth[@]}" -H "$ACCEPT" "http://$REG/v2/notes/notes-disk/manifests/beta-1.0.0-qcow2"
 [[ $(digest_of "notes/notes-os:1.0.0") == "$os_digest" ]] || fail "prune took stable's bundle"
 env -u STOWAGE_PUSH_TOKEN "${S[@]}" verify --channel stable
 
@@ -330,6 +330,9 @@ printf '2.0.0\n' >"$P/VERSION"
 printf '### Changed\n- Release 2.0.0.\n' >"$P/changes/2.0.0.md"
 printf '%s\n' '{"version": 2, "barriers": {}, "reads_newer": true}' >"$P/api/schema.json"
 "${S[@]}" ship --channel beta 2>"$WORK/ship3.log" || { tail -50 "$WORK/ship3.log"; fail "ship 2.0.0"; }
+# Without --disks: no disk made or moved; 2.0.0's VMs boot 1.0.0's.
+! grep -qE 'disks: make|disk [a-z0-9]+: (push|tag)|disk .* removed' "$WORK/ship3.log" || { cat "$WORK/ship3.log"; fail "a ship without --disks touched a disk"; }
+grep -q "no disk published: a VM of this release boots" "$WORK/ship3.log" || { cat "$WORK/ship3.log"; fail "2.0.0 does not record the disk set it boots"; }
 vmctl updates | grep -q '2.0.0 (revision 1) on beta' || fail "updates does not offer 2.0.0"
 login_pull
 docker pull -q "$REG/notes/notes-os:beta-2.0.0" >/dev/null

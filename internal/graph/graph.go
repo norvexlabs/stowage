@@ -60,7 +60,7 @@ const (
 const FrontID = KindImage + "/" + front.Key
 
 // BackupID is the node of the VM's backup runner Stowage builds from its own recipe
-// (backup.Dockerfile) for a release whose VM runs backups (providers.RunsVMBackups), published as the image
+// (backup.Dockerfile) for a release whose VM runs backups (providers.RunsBackups), published as the image
 // backup.Key.
 const BackupID = KindImage + "/" + backup.Key
 
@@ -163,7 +163,7 @@ func Build(p *project.Project, r Release) (*Graph, error) {
 		imageDigests.Field(n.ID, n.Inputs)
 	}
 	stowageImages := []Node{frontNode()}
-	if providers.RunsVMBackups(s) {
+	if providers.RunsBackups(s) {
 		stowageImages = append(stowageImages, backupNode())
 	}
 	for _, n := range stowageImages {

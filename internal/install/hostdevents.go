@@ -58,6 +58,7 @@ const (
 	evBootJudged      = "boot.judged"
 	evInstallFinished = "install.finished"
 	evInstallFailed   = "install.failed"
+	evCertExpiring    = "cert.expiring"
 )
 
 // Why a job was lost, and a reboot cancelled at the daemon's start.

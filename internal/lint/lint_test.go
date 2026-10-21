@@ -73,6 +73,7 @@ func TestEachRuleFires(t *testing.T) {
 		want  string
 	}{
 		{"bad name", []edit{{specFile, "\nname: notes\n", "\nname: Notes\n"}}, nil, "name:"},
+		{"k8s schema without sql", []edit{{specFile, "kubernetes: { chart: deploy/chart, postgres_modes: [external, cnpg] }", "kubernetes: { chart: deploy/chart, postgres_modes: [external, cnpg], schema: { url_env: DATABASE_URL, image: postgres } }"}}, nil, "shapes.kubernetes.schema: needs a database whose schema_compat provider is sql"},
 		{"bad short name", []edit{{specFile, "\nname: notes\n", "\nname: notes\nshort_name: No\n"}}, nil, "short_name:"},
 		{"stowage short name", []edit{{specFile, "\nname: notes\n", "\nname: notes\nshort_name: stowage-notes\n"}}, nil, "keeps for Stowage's own files"},
 		{"compose build", []edit{{composeFile, "image: ${STOWAGE_IMAGE_WEB}", "image: ${STOWAGE_IMAGE_WEB}\n    build: ./web"}}, nil, "build: is forbidden"},
@@ -175,6 +176,12 @@ func TestEachRuleFiresOnFull(t *testing.T) {
 		{"no prefix", []edit{{sp, "  prefix: registry.example.com/atlas\n", ""}}, nil, "single deployment point"},
 		{"pull token_env", []edit{{sp, "token_env: STOWAGE_PULL_TOKEN", "token_env: pull-token"}}, nil, "registry.pull: token: token_env"},
 		{"push provider missing", []edit{{sp, "push: { provider: token, user: publisher, token_env: STOWAGE_PUSH_TOKEN }", "push: { user: publisher }"}}, nil, "registry.push: provider is required"},
+		{"delete provider unknown", []edit{{sp, "push: { provider: token, user: publisher, token_env: STOWAGE_PUSH_TOKEN }", "push: { provider: token, user: publisher, token_env: STOWAGE_PUSH_TOKEN }\n  delete: { provider: s3 }"}}, nil, `registry.delete: unknown provider "s3" (oci, github)`},
+		{"github delete api not https", []edit{{sp, "push: { provider: token, user: publisher, token_env: STOWAGE_PUSH_TOKEN }", "push: { provider: token, user: publisher, token_env: STOWAGE_PUSH_TOKEN }\n  delete: { provider: github, api: \"http://api.github.com\" }"}}, nil, `registry.delete: github: api "http://api.github.com" is not an https URL`},
+		{"github delete token not a name", []edit{{sp, "push: { provider: token, user: publisher, token_env: STOWAGE_PUSH_TOKEN }", "push: { provider: token, user: publisher, token_env: STOWAGE_PUSH_TOKEN }\n  delete: { provider: github, token_env: \"a-b\" }"}}, nil, `registry.delete: github: token_env "a-b" is not an environment variable name`},
+		{"k8s schema url_env", []edit{{sp, "schema: { url_env: DATABASE_URL, image: postgres }", "schema: { url_env: \"x y\", image: postgres }"}}, nil, `shapes.kubernetes.schema.url_env: "x y" is not an environment variable name`},
+		{"k8s schema without reads_newer_image", []edit{{sp, "    reads_newer_label: com.example.atlas.reads-newer-schema   # \"true\" on an image that reads a newer schema\n    reads_newer_image: api                                    # the image that carries it\n", ""}}, nil, "shapes.kubernetes.schema: needs database.schema_compat.reads_newer_image"},
+		{"k8s schema image", []edit{{sp, "schema: { url_env: DATABASE_URL, image: postgres }", "schema: { url_env: DATABASE_URL, image: psql }"}}, nil, `shapes.kubernetes.schema.image: "psql" is not an images key`},
 		{"signing without public keys", []edit{{sp, "  public_keys: [keys/release-2026.pub]\n", ""}}, nil, "public_keys is required"},
 		{"loopback env not a safe default", []edit{{sp, `loopback_env: { COOKIE_SECURE: "false",`, `loopback_env: { DEBUG: "1", COOKIE_SECURE: "false",`}}, nil, "front.loopback_env.DEBUG: is not a safe_defaults key"},
 		{"route without loopback port", []edit{{sp, "loopback_ports: { console: 3000, api: 9090, ingest: 8080 }", "loopback_ports: { console: 3000, api: 9090 }"}}, nil, "route ingest has no port"},
@@ -629,12 +636,13 @@ func TestInputOnlyTheHookReads(t *testing.T) {
 	}
 }
 
-// A disk-pressure hook with no kairos shape is warned: only the VM's host daemon acts on it.
-func TestDiskPressureWithoutKairosWarns(t *testing.T) {
+// A disk-pressure hook with neither the docker nor the kairos shape is warned: only the VM's host
+// daemon and a Docker install's timer act on it.
+func TestDiskPressureWithoutKairosOrDockerWarns(t *testing.T) {
 	t.Parallel()
 	warned := func(res *Result) bool {
 		for _, f := range res.Findings {
-			if f.Where == "hooks.maintenance.disk_pressure" && strings.Contains(f.Message, "only the kairos shape's host daemon watches the disk") {
+			if f.Where == "hooks.maintenance.disk_pressure" && strings.Contains(f.Message, "with neither shape, nothing does") {
 				return true
 			}
 		}
@@ -658,6 +666,10 @@ func TestDiskPressureWithoutKairosWarns(t *testing.T) {
 		t.Fatal("no kairos shape in the minimal example")
 	}
 	testutil.Edit(t, root, specFile, string(raw[i:]), "")
+	if warned(run(t, root)) {
+		t.Fatal("warned with a docker shape")
+	}
+	testutil.Edit(t, root, specFile, "  docker: {}\n", "")
 	if res := run(t, root); !warned(res) {
 		t.Fatalf("findings: %+v", res.Findings)
 	}

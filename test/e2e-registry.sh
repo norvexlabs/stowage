@@ -32,7 +32,7 @@ grep -q 'image postgres: mirror' "$WORK/ship1.log" || fail "postgres was not mir
 grep -q 'image front: build' "$WORK/ship1.log" || fail "the front was not built"
 grep -q 'installer: push' "$WORK/ship1.log" || fail "the installer was not pushed"
 grep -q 'chart: tag .* → charts/notes-beta:0.1.0' "$WORK/ship1.log" || fail "the chart was not pushed"
-[[ $(grep -c '^signed ' "$WORK/ship1.log") == 7 ]] || { cat "$WORK/ship1.log"; fail "want 7 signatures (3 images, the front, the chart, the installer, the release manifest)"; }
+[[ $(grep -c '^signed ' "$WORK/ship1.log") == 8 ]] || { cat "$WORK/ship1.log"; fail "want 8 signatures (3 images, the front, the backup runner, the chart, the installer, the release manifest)"; }
 
 step "ship beta again (nothing changes)"
 "${S[@]}" ship --channel beta 2>"$WORK/ship2.log" || { cat "$WORK/ship2.log"; fail "ship"; }

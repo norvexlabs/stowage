@@ -5,6 +5,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -59,6 +60,20 @@ func TestHookPostCommit(t *testing.T) {
 	}
 	if want := "stowage hook: release 1.0.0: ship to channel stable started in the background\n  follow: tail -f " + wantLog + "\n"; out != want {
 		t.Fatalf("output:\n%s", out)
+	}
+	// The disks: by the hook's flag, or by the commit's environment.
+	for _, c := range []struct {
+		env  map[string]string
+		args []string
+	}{{nil, []string{"--disks"}}, {map[string]string{"STOWAGE_SHIP_DISKS": "1"}, nil}, {map[string]string{"STOWAGE_SHIP_DISKS": "TRUE"}, nil}} {
+		out, _, l, err := runHook(t, nil, c.env, append([]string{"-C", root, "hook", "post-commit"}, c.args...)...)
+		if err != nil || len(l) != 1 || !strings.HasSuffix(strings.Join(l[0].args, " "), "--commit "+head+" --disks") ||
+			!strings.HasPrefix(out, "stowage hook: release 1.0.0, with its disks,: ship") {
+			t.Fatalf("disks %v %v: %v %+v %q", c.env, c.args, err, l, out)
+		}
+	}
+	if _, _, l, _ := runHook(t, nil, map[string]string{"STOWAGE_SHIP_DISKS": "0"}, "-C", root, "hook", "post-commit"); len(l) != 1 || slices.Contains(l[0].args, "--disks") {
+		t.Fatalf("STOWAGE_SHIP_DISKS=0: %+v", l)
 	}
 	spec := filepath.Join(root, "stowage.yaml")
 	if _, _, l, _ := runHook(t, nil, nil, "-C", root, "-f", spec, "hook", "post-commit", "--channel", "beta"); len(l) != 1 ||
@@ -262,6 +277,12 @@ func TestHookInstall(t *testing.T) {
 	}
 	if b, _ := os.ReadFile(hookFile); !strings.Contains(string(b), "\n/usr/local/bin/stowage -C sub/proj hook post-commit\n") {
 		t.Fatalf("hook through a link:\n%s", b)
+	}
+	if _, _, _, err := runHook(t, nil, nil, "-C", root, "hook", "install", "--disks"); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(hookFile); !strings.Contains(string(b), "\n/usr/local/bin/stowage -C sub/proj hook post-commit --disks\n") {
+		t.Fatalf("hook with --disks:\n%s", b)
 	}
 	if _, _, _, err := runHook(t, nil, nil, "-C", root, "hook", "install", "--channel", "nope"); err == nil || !strings.Contains(err.Error(), `channel "nope" is not declared`) {
 		t.Fatalf("undeclared channel: %v", err)

@@ -247,6 +247,7 @@ func newCommand(r *Release, self string, stdout, stderr io.Writer, tools K8sOpti
 		root.AddCommand(vmCreateCommand(in, &o, prepare, terminal, &sets, &domains, &answers, &noInput, &accessible))
 	}
 	root.AddCommand(mirrorCommand(in, &o, prepare))
+	root.AddCommand(dockerHostCommands(in, prepare, dirFlag, stdout, stderr, terminal)...)
 	if r.Spec.Shapes.Kubernetes != nil && r.Spec.Hooks.Provision != nil {
 		root.AddCommand(k8sHookPodCommand(stderr))
 	}
@@ -501,12 +502,13 @@ func mirrorCommand(in *Installer, o *Options, prepare func() error) *cobra.Comma
 		Short: fmt.Sprintf("Carry %s's latest release to a registry without internet: export it to one file, import that file", name),
 		Args:  cobra.NoArgs,
 	}
-	var channel, output, to string
+	var channel, output, to, version string
 	var older bool
-	var disks []string
+	var revision int
+	var disks, shapes []string
 	export := &cobra.Command{
 		Use:   "export",
-		Short: "Write the channel's latest release, every artifact and signature, into one OCI layout archive",
+		Short: "Write the channel's latest release (or --version's), every artifact and signature, into one OCI layout archive",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if err := prepare(); err != nil {
@@ -518,13 +520,26 @@ func mirrorCommand(in *Installer, o *Options, prepare func() error) *cobra.Comma
 			} else if len(disks) == 1 && disks[0] == "none" || len(disks) == 0 {
 				formats = []string{}
 			}
-			return in.MirrorExport(cmd.Context(), channel, output, formats)
+			if revision != 0 && version == "" {
+				return errors.New("--revision goes with --version")
+			}
+			if revision < 0 {
+				return fmt.Errorf("--revision %d: a revision is 1 or more", revision)
+			}
+			req := MirrorExportRequest{Channel: channel, File: output, Version: version, Revision: revision, Formats: formats}
+			if cmd.Flags().Changed("shapes") {
+				req.Shapes = append([]string{}, shapes...)
+			}
+			return in.MirrorExport(cmd.Context(), req)
 		},
 	}
 	ef := export.Flags()
 	ef.StringVar(&channel, "channel", "", "the channel whose latest release is exported (default: this release's, "+in.R.Manifest.Channel+")")
 	ef.StringVarP(&output, "output", "o", "", "the archive written (default: "+name+"-<tag>.oci.tar here); an existing file is refused")
 	ef.StringSliceVar(&disks, "disks", nil, "the VM disk formats exported (default: all; none for no disk)")
+	ef.StringVar(&version, "version", "", "export this release of the channel (its latest revision) instead of its latest")
+	ef.IntVar(&revision, "revision", 0, "with --version: that revision")
+	ef.StringSliceVar(&shapes, "shapes", nil, "the shapes the site runs (default: every shape): without kairos no OS bundle and no disk, without kubernetes no chart")
 	imp := &cobra.Command{
 		Use:   "import FILE",
 		Short: "Push an exported archive into a registry (a mirror), by digest, under the tags it was published with",

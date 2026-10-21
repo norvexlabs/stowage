@@ -293,8 +293,24 @@ pushed artifact.
   publication (one concurrency group per project), and `stowage hook post-commit` takes a lock.
 - An image tag with no release manifest under the same tag (a publication interrupted after
   tagging) is replaced even on an immutable channel: nothing was published under it.
-- Deletion (`prune`, a pointer with no release left) is always by tag, never by digest: one digest
-  carries the tags of several channels. The registry must support tag deletion.
+- Deletion (`prune`, a pointer with no release left) is by tag: one digest carries the tags of
+  several channels. A registry that deletes no tag alone (ghcr deletes nothing through the
+  distribution API) has a manifest deleted by digest, through the `registry.delete` provider
+  (`oci`, `github`), only when no other tag holds it.
+- **Disk sets.** A disk set is several GB a release, while most releases move only the OS bundle
+  and the images: `ship` publishes disks only with `--disks`, the publisher's call (the post-commit
+  hook passes it from the hook's own flag or the commit's environment). A release without disks
+  records the set its installs boot (`boot_disks`: the channel's, the newest release's that
+  published disks, with the stowage that published them); `vm create` boots it and the VM's first
+  boot writes the requested release's OS bundle and reboots into it before installing, so a VM
+  always comes up on the release asked for. The channel's set is a signed record in the disk
+  repository (`set-<channel>`), written only by a ship that published disks once its channel
+  points at it — never inferred from the releases, so a yank, a prune or a promotion cannot make
+  two commands disagree about it. That ship then removes the disks the channel's releases name
+  that no channel's record holds: one set per channel, and a disk no manifest names (another
+  ship's in flight) never touched. A disk-less ship, a yank or a prune moves, rewrites or deletes
+  no disk tag; `latest-<fmt>` follows the latest channel's record. A cleanup failing after the release is out is
+  reported apart (exit 3), so the release is never shipped again.
 - The OS bundle names no channel: its OS version is the release's version and revision, and it
   preloads each image as an OCI layout archive named by the image's digest
   (`<repo>:sha256-<hex>`), so a promotion re-tags it and its disks instead of rebuilding a
@@ -307,9 +323,9 @@ pushed artifact.
   digest, the compressed one being checked as it is read. Both
   are planned once the images are pushed by digest — still before any tag moves; on an immutable
   channel the images are then all kept, so a refusal still writes nothing.
-- Floating tags (the installer's `:latest`, each disk's `latest-<fmt>`) follow the pointer of the
-  channel that sets latest and are re-tagged in place; a format the pointer's release lacks loses
-  its tag.
+- Floating tags follow the channel that sets latest and are re-tagged in place: the installer's
+  `:latest` its pointer, each disk's `latest-<fmt>` its disk set; a format the set lacks loses its
+  tag.
 - `stowage hook post-commit`: version moved forward between `HEAD~1` and `HEAD` (both read from the
   commits, ordered by the scheme) → detached `ship` under a lock, logged per version; skipped
   during rebase/merge/cherry-pick/revert, on a merge commit or a cherry-pick (its first parent
@@ -376,7 +392,10 @@ The release manifest is an OCI artifact, media type `application/vnd.stowage.rel
 }
 ```
 
-`ship` fills `images`, `installer`, `chart`, `os` and `disks` today; the Platform changelog and
+A release shipped without disks records `"boot_disks": {"release": "<tag>", "stowage_version":
+"…", "disks": {…}}` in their place: the disk set its installs boot.
+
+`ship` fills `images`, `installer`, `chart`, `os`, `disks` and `boot_disks` today; the Platform changelog and
 `compat` are filled as their phases land (§ 11), and a consumer must treat a missing one as "not
 published". `release_seq` is claimed from a per-channel record (`<prefix>/<name>-release-seq:<channel>`)
 before the release is written, so a number is never handed out twice — not after a prune, not
@@ -577,7 +596,10 @@ into a binary every shape carries, for what two CLIs every cluster operator has 
   then this run's.
 - **helm rolls back what fails**: `--atomic` (helm 3) or `--rollback-on-failure` (helm 4) with
   `--wait`, gated by the chart's readiness probes, as the VM's health gate reverts a bad OS swap.
-  `rollback` is `helm rollback`; a barrier pre-flight before it is an extension (§ 7 row 22).
+  `rollback` is `helm rollback`, after the same schema check as Docker's and the VM's: the
+  `sql` provider's queries run with psql in a pod made from the pod template of the workload
+  running `reads_newer_image` (its environment holds the database's URL, `shapes.kubernetes.schema`
+  names the variable), the schema before each upgrade recorded in the revision's values.
   With no revision given, helm goes to the revision before the latest, which after a revert is
   the failed upgrade and after a rollback is the release just left; `<short>-stow k8s rollback`
   reads `helm history` instead. After a revision that did not deploy, it restores the latest one
@@ -649,14 +671,14 @@ on this shape") instead of failing obscurely.
 | 12 | Reconfigure | installer re-run is an idempotent reconcile **C**; it changes what it is given — `--set`, `--answers`, `--domains`, the front's ports, its TLS mode (between HTTPS modes) and `byo` certificate — and brings the stack up again; advanced inputs (`advanced: true`) are tunables only `--set` records | `upgrade` with full values **C** | `reconfigure-userdata` (+ `.prev`) then reboot **C** → `sudo <short>-stow install --set …` over SSH, the Docker re-run; the settings file is the first install's |
 | 13 | Network / SSH | owner: host | owner: cluster | `<short>-stow network` set / confirm / revert / reset, an addressing change undone unless confirmed in its window (also at a daemon restart or a reboot inside it) **C**; SSH key-only, the admin group **C** |
 | 14 | TLS | Caddy acme / dns / byo / internal / none, auto-renew, certs survive reset-db **C** | owner: ingress + cert-manager **C** | same front as Docker **C** |
-| 15 | Backup | pre-upgrade snapshot **C**; scheduled backup **X** | owner: managed PG / CNPG **C** | timer, pg_dump → age → rclone, retention, `backup config/run/list/status/verify` **C** |
-| 16 | Restore | manual from snapshot **C** → `restore <file>` **X** | owner: managed PG PITR | `restore OBJECT`: a host daemon job, the backup streamed from the destination, decrypted with the key given on stdin, `pg_restore` in one transaction, the services but the database stopped **C** |
+| 15 | Backup | pre-upgrade snapshot **C**; scheduled backup (systemd timer), `backup config/run/list/status/verify` **C** | owner: managed PG / CNPG **C** | timer, pg_dump → age → rclone, retention, `backup config/run/list/status/verify` **C** |
+| 16 | Restore | `restore OBJECT`, as the VM's **C** | owner: managed PG PITR | `restore OBJECT`: a host daemon job, the backup streamed from the destination, decrypted with the key given on stdin, `pg_restore` in one transaction, the services but the database stopped **C** |
 | 17 | Check for update | `updates` from manifests **C** | same **C** | `hostctl updates` from manifests **C** |
 | 18 | Read changelog | project + Platform sections current → target **C** | same | `hostctl changelog new` **C**, source becomes the manifest |
 | 19 | Upgrade pre-flight | mandatory snapshot **C**; yanked / `min_upgrade_from` / barrier warning **C** | same checks **C** | pre-upgrade backup **C**; same checks **C** |
 | 20 | Upgrade | compose file moves with images, new `.env` keys merged, `up --wait` **C** | `--atomic`, gated by readiness **C** | kairos-agent stages passive slot while serving; reboot now or later **C** |
 | 21 | Health gate / auto-rollback | failure → prints the rollback command **C** | helm `--atomic` reverts **C** | health gate: deadline, all-healthy, diagnostics, grub fallback, loop guard; kept at a rollback barrier **C** |
-| 22 | Manual rollback | barrier + reads-newer check, else points to the snapshot **C** | `helm rollback` **C** + barrier pre-flight **X** | `hostctl rollback`, rollback-check refuses only on proof **C** |
+| 22 | Manual rollback | barrier + reads-newer check, else points to the snapshot **C** | `helm rollback` after the barrier + reads-newer check in a pod (`shapes.kubernetes.schema`) **C** | `hostctl rollback`, rollback-check refuses only on proof **C** |
 | 23 | Reset data | `reset-db`: stack down, the `data.reset` volumes deleted (`keep_on_reset` kept), provisioned as first installed **C** | `k8s reset-db`: uninstall, the release's claims deleted, installed again with its values and Secrets **C** | `reset-db`, a host daemon job, the Docker shape's, no reboot **C** |
 | 24 | Rotate secrets | `secrets rotate KEY` for `rotation: true`, three passes (`--stage` → `KEY_NEXT` accepted; swap → `KEY_PREVIOUS` accepted; `--finish`), the stack up again at each **C** | `k8s secrets rotate`: the same passes on the Secret, each workload's rollout restarted and awaited **C** | the Docker shape's verb, a host daemon job **C** |
 | 25 | Registry credential rotation | `.env` / installer flag **C** | pull Secret **C** | sealed env + `reconfigure-userdata` **C** → the pull account the OS bundle carries; a mirror's is root's Docker login on the VM |
@@ -679,14 +701,16 @@ Rules:
   storage: the release is uninstalled and installed again with the values it was given, the
   claims its manifest makes or its StatefulSets claim deleted between, the installer's Secrets
   kept; no label contract is asked of the chart.
-- Disk pressure is the VM's alone: its disk is fixed at creation, while a Docker host's is the
-  operator's and a cluster's storage the cluster's. The daemon tells the level, not a policy: the
+- Disk pressure is watched on the VM (the host daemon) and on Docker (a systemd timer of the
+  install's own, running the daemon's check in the installer's process, the Docker engine's data
+  directory read); a cluster's storage is the cluster's. The daemon tells the level, not a policy: the
   body is `{level, used_pct, soft_pct, hard_pct}`, and what to purge, or for how long to keep data,
   is the project's endpoint's to decide. It reaches the service as the health gate does, at its
   container's address on the stack's network, so the service publishes no port for it; a POST
   not taken is tried again after a minute (at boot the daemon starts before the stack), not at
-  once, and nothing is persisted (the reading is the
-  disk's, the last POST is the daemon's memory).
+  once, and nothing is persisted on the VM (the reading is the disk's, the last POST is the
+  daemon's memory); a Docker install keeps its last POST in the install directory, as each check
+  is a process of its own.
 - The VM's network override has one record, a state file on the persistent partition (the
   override, and the change awaiting confirmation with the settings before it); networkd's file is
   rendered from it — at boot by a unit ordered before networkd, which first undoes a change never
@@ -790,9 +814,7 @@ tests/                  lifecycle smoke per shape
 | Extension | Matrix row | Size | Why |
 |---|---|---|---|
 | K8s portal URL | 9 | S | parity with Docker |
-| scheduled backup on Docker | 15 | S | the backup container is already generic (deferred, § 12) |
-| `restore` verb on Docker, Kubernetes secrets export/import | 16, 28 | M | the VM has both; Docker restores by hand |
-| K8s barrier pre-flight before `helm rollback` | 22 | S | parity with Docker and VM |
+| Kubernetes secrets export/import | 28 | M | the VM and Docker have it |
 | `uninstall` (Docker) | 27 | S | `down` and removing the volumes by hand |
 
 ## 11. Phases
@@ -880,7 +902,9 @@ every shape, the VM end-to-end test upgrading through it), then the health gate.
   bound, and only its answer that it is not is said. On Kubernetes the endpoint is derived from
   the route's upstream (the chart exposes `<release>-<service>`), and it is given at the install
   (an upgrade keeps a recorded input). Installing the extension from the host's installer is later work.
-- **Docker backups** — deferred; revisit when phase 1 shows its cost (stays in § 10 as optional).
+- **Docker backups** — the VM's host daemon's code, run in the Docker installer's process for one
+  command, the schedule a systemd timer of the install's own: no daemon stays on a Docker host,
+  and nothing of the backup path is written twice.
 - **Licence** — Apache License 2.0 (`LICENSE`). Dependencies used as binaries or libraries are
   compatible: Kairos, auroraboot, Caddy, Helm, oras, go-containerregistry, cosign, sigstore-go (Apache-2.0),
   age (BSD-3), rclone, qemu-img (GPL-2.0, run as a binary in its own image),

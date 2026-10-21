@@ -6,8 +6,10 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -19,6 +21,7 @@ import (
 	"github.com/norvexlabs/stowage/internal/registry"
 	"github.com/norvexlabs/stowage/internal/release"
 	"github.com/norvexlabs/stowage/internal/truenas"
+	"github.com/norvexlabs/stowage/internal/version"
 )
 
 // Platform is where a VM of the Kairos shape runs: the disk formats it boots, preferred first, and
@@ -110,8 +113,8 @@ type VMCreate struct {
 func (in *Installer) CreateVM(ctx context.Context, c *VMCreate) error {
 	o, m, name := &in.O, in.R.Manifest, in.R.Spec.Name
 	in.givenCA = true
-	if in.R.Spec.Shapes.Kairos == nil || len(m.Artifacts.Disks) == 0 {
-		return fmt.Errorf("%s %s publishes no disk image (shapes.kairos.disk_formats)", name, m.ProjectVersion)
+	if in.R.Spec.Shapes.Kairos == nil || m.Artifacts.OS == "" {
+		return fmt.Errorf("%s %s publishes no OS bundle (shapes.kairos)", name, m.ProjectVersion)
 	}
 	if len(remoteModes(in.R.Spec.Front.TLSModes)) == 0 {
 		return fmt.Errorf("%s offers no TLS mode a VM can be created with: %s (loopback is not reached from outside the VM, and byo's key never goes in its cloud-config)", name, strings.Join(in.R.Spec.Front.TLSModes, ", "))
@@ -123,6 +126,23 @@ func (in *Installer) CreateVM(ctx context.Context, c *VMCreate) error {
 		}
 		in.useSecrets(f)
 	}
+	// The disk comes from the mirror when one is given, as the VM's updates do.
+	prefix := in.R.Spec.Registry.Prefix
+	if o.Registry != "" {
+		prefix = strings.TrimSuffix(o.Registry, "/")
+		if _, err := registry.Repository(prefix); err != nil {
+			return fmt.Errorf("--registry: %w", err)
+		}
+	}
+	cl, err := in.registryClient(prefix)
+	if err != nil {
+		return err
+	}
+	boot, err := in.bootDisks(ctx, cl, prefix)
+	if err != nil {
+		return err
+	}
+	in.boot = boot
 	p, format, err := in.platform(ctx, c.Platform)
 	if err != nil {
 		return err
@@ -167,13 +187,14 @@ func (in *Installer) CreateVM(ctx context.Context, c *VMCreate) error {
 	}
 	st.AwaitSecrets = c.Secrets != nil
 	st.IPv6 = c.IPv6 // the install's network too: the front's IPv6 clients keep their address
+	// Another release's disk: the first boot takes this release's OS bundle before it installs.
+	if boot.release != m.Tag {
+		st.Release = &OSRelease{Version: m.ProjectVersion, Revision: m.Revision, Tag: m.Tag, OS: m.Artifacts.OS}
+	}
 	// A mirror: the disk comes from it, and the VM's updates.
 	var ca []byte
 	if o.Registry != "" {
-		st.Registry = strings.TrimSuffix(o.Registry, "/")
-		if _, err := registry.Repository(st.Registry); err != nil {
-			return fmt.Errorf("--registry: %w", err)
-		}
+		st.Registry = prefix
 	}
 	if o.RegistryCA != "" {
 		if ca, err = registry.ReadCA(o.RegistryCA); err != nil {
@@ -211,9 +232,9 @@ func (in *Installer) CreateVM(ctx context.Context, c *VMCreate) error {
 			return err
 		}
 		// One directory per disk: another release's disk of the same file name never meets it.
-		d := strings.TrimPrefix(m.Artifacts.Disks[format], "sha256:")
+		d := strings.TrimPrefix(boot.disks[format], "sha256:")
 		if len(d) != 64 {
-			return fmt.Errorf("the release's %s disk digest %q is not sha256", format, m.Artifacts.Disks[format])
+			return fmt.Errorf("the release's %s disk digest %q is not sha256", format, boot.disks[format])
 		}
 		out = filepath.Join(out, d[:16])
 		seed = filepath.Join(state, "user-data.yaml")
@@ -248,17 +269,16 @@ func (in *Installer) CreateVM(ctx context.Context, c *VMCreate) error {
 			return err
 		}
 	}
-	prefix := cmp.Or(st.Registry, in.R.Spec.Registry.Prefix)
-	cl, err := in.registryClient(prefix)
+	ref, err := cl.Digest(prefix+"/"+name+"-disk", boot.disks[format])
 	if err != nil {
 		return err
 	}
-	ref, err := cl.Digest(prefix+"/"+name+"-disk", m.Artifacts.Disks[format])
-	if err != nil {
-		return err
+	if boot.release != m.Tag {
+		o.logf("fetching %s's %s disk of %s (%s): %s %s published none, its first boot takes its OS bundle", name, format, boot.release, registry.Short(ref.DigestStr()), name, m.ProjectVersion)
+	} else {
+		o.logf("fetching %s's %s disk (%s)", name, format, registry.Short(ref.DigestStr()))
 	}
-	o.logf("fetching %s's %s disk (%s)", name, format, registry.Short(ref.DigestStr()))
-	fallback := fmt.Sprintf("%s-%s.%s", name, m.Tag, format)
+	fallback := fmt.Sprintf("%s-%s.%s", name, boot.release, format)
 	disk, layer, err := cl.Download(ctx, ref, release.DiskArtifactType, release.DiskMediaType(format), out, fallback, c.Progress)
 	if err != nil {
 		return err
@@ -283,7 +303,11 @@ func (in *Installer) CreateVM(ctx context.Context, c *VMCreate) error {
 			addr = out
 			in.sshAllows(addr, mach.SSHAllow)
 		}
-		if err := in.awaitVM(ctx, state, mach.User, addr, c.SSHKey, cmp.Or(c.Wait, 20*time.Minute), len(waiting) == 0 && !st.AwaitSecrets); err != nil {
+		wait := 20 * time.Minute
+		if st.Release != nil {
+			wait = 40 * time.Minute // the first boot writes the release's OS bundle and reboots first
+		}
+		if err := in.awaitVM(ctx, state, mach.User, addr, c.SSHKey, cmp.Or(c.Wait, wait), len(waiting) == 0 && !st.AwaitSecrets); err != nil {
 			return err
 		}
 		if st.AwaitSecrets && len(waiting) == 0 {
@@ -324,6 +348,129 @@ func (in *Installer) CreateVM(ctx context.Context, c *VMCreate) error {
 		fmt.Fprintf(o.Out, "The install waits for %s, which the cloud-config never carries: ssh %s@<address> sudo %s install\n", strings.Join(waiting, ", "), mach.User, ctl)
 	}
 	return nil
+}
+
+// bootDisk is the disk set a VM boots: the release tag the disks are under, and each disk's digest
+// by format.
+type bootDisk struct {
+	release string
+	disks   map[string]string
+}
+
+// switchingStowage is the first stowage whose OS's first boot takes another release's OS bundle
+// (Settings.Release): a disk set an older one published cannot boot a VM of another release.
+const switchingStowage = "0.6.0"
+
+// bootDisks is the disk set a VM of this release boots, read in the registry at prefix: the
+// release's own disks, or the set it records (a release that published none boots its channel's);
+// when they are no longer there (a newer set replaced them), the set of the channel pointer's
+// release, its manifest signed by a key this installer trusts, else the channel's disk set
+// record, signed too.
+func (in *Installer) bootDisks(ctx context.Context, cl *registry.Client, prefix string) (bootDisk, error) {
+	m, name := in.R.Manifest, in.R.Spec.Name
+	present := func(disks map[string]string) (bool, error) {
+		for _, f := range slices.Sorted(maps.Keys(disks)) {
+			ref, err := cl.Digest(prefix+"/"+name+"-disk", disks[f])
+			if err != nil {
+				return false, err
+			}
+			d, err := cl.Head(ctx, ref)
+			if err != nil {
+				return false, fmt.Errorf("the %s disk: %w", f, err)
+			}
+			if d == nil {
+				return false, nil
+			}
+		}
+		return true, nil
+	}
+	// cannot is why a set found could not boot this release (an older stowage's), said when no
+	// other one can.
+	var cannot error
+	usable := func(src *release.Manifest) (bootDisk, bool, error) {
+		tag, disks := src.Artifacts.Boot(src.Tag)
+		if len(disks) == 0 {
+			return bootDisk{}, false, nil
+		}
+		ok, err := present(disks)
+		if err != nil || !ok {
+			return bootDisk{}, false, err
+		}
+		if tag != m.Tag {
+			by := src.StowageVersion
+			if b := src.Artifacts.BootDisks; len(src.Artifacts.Disks) == 0 && b != nil {
+				by = b.Stowage
+			}
+			if old, err := (version.SemVer{}).Compare(by, switchingStowage); err != nil || old < 0 {
+				cannot = cmp.Or(cannot, fmt.Errorf("the disk set %s boots is %s's, published by stowage %q, whose first boot cannot take another release's OS: the publisher ships a release with its disks (stowage ship --disks)",
+					src.Tag, tag, by))
+				return bootDisk{}, false, nil
+			}
+		}
+		return bootDisk{tag, disks}, true, nil
+	}
+	if d, ok, err := usable(m); err != nil || ok {
+		return d, err
+	}
+	trust, err := trusted("this installer", in.R.Keys)
+	if err != nil {
+		return bootDisk{}, err
+	}
+	repo := prefix + "/" + name + "-release"
+	ptr, h, err := readRelease(ctx, cl, repo, m.Channel)
+	if err != nil {
+		// Unread (another stowage's), it boots nothing here: the record may.
+		in.O.logf("the channel %s's release could not be read (%v): its disk set record is tried", m.Channel, err)
+		ptr = nil
+	}
+	if ptr != nil && ptr.Name == name && ptr.Channel == m.Channel {
+		r, err := cl.Repo(repo)
+		if err != nil {
+			return bootDisk{}, err
+		}
+		if err := checkSigned(ctx, cl, r, h, ptr, trust); err != nil {
+			return bootDisk{}, err
+		}
+		if d, ok, err := usable(ptr); err != nil || ok {
+			return d, err
+		}
+	}
+	// The channel's disk set record, which only a ship publishing disks writes: signed as a
+	// release is when the installer trusts a key.
+	setTag, err := cl.Tag(prefix+"/"+name+"-disk", release.DiskSetTag(m.Channel))
+	if err != nil {
+		return bootDisk{}, err
+	}
+	a, h, err := cl.GetArtifact(ctx, setTag, release.DiskSetMediaType)
+	if err != nil && !errors.Is(err, registry.ErrNotArtifact) {
+		return bootDisk{}, err
+	}
+	if a != nil {
+		var set release.DiskSet
+		if err := json.Unmarshal(a.Data, &set); err != nil {
+			return bootDisk{}, fmt.Errorf("%s: %w", setTag, err)
+		}
+		if err := set.Check(m.Channel); err != nil {
+			return bootDisk{}, fmt.Errorf("%s: %w", setTag, err)
+		}
+		if trust != nil {
+			r, err := cl.Repo(prefix + "/" + name + "-disk")
+			if err != nil {
+				return bootDisk{}, err
+			}
+			if err := trust.Verify(ctx, cl, r.Digest(h.String())); err != nil {
+				return bootDisk{}, fmt.Errorf("%s is not signed by a key this installer trusts: %w", setTag, err)
+			}
+		}
+		rec := &release.Manifest{Tag: set.Release, StowageVersion: set.Stowage, Artifacts: release.Artifacts{Disks: set.Disks}}
+		if d, ok, err := usable(rec); err != nil || ok {
+			return d, err
+		}
+	}
+	if cannot != nil {
+		return bootDisk{}, cannot
+	}
+	return bootDisk{}, fmt.Errorf("%s %s has no disk in %s, nor does its channel %s: the publisher ships a release with its disks (stowage ship --disks)", name, m.ProjectVersion, prefix, m.Channel)
 }
 
 // secretsSteps tells how to give a VM's install its secrets file: copied over, its mode kept
@@ -378,7 +525,7 @@ func (in *Installer) sshAllows(addr string, allow []netip.Prefix) {
 // platform's formats the release publishes. Only the platforms the release has a disk for are
 // offered.
 func (in *Installer) platform(ctx context.Context, key string) (Platform, string, error) {
-	disks := in.R.Manifest.Artifacts.Disks
+	disks := in.boot.disks
 	var offered []Platform
 	for _, p := range Platforms {
 		if slices.ContainsFunc(p.Formats, func(f string) bool { return disks[f] != "" }) {

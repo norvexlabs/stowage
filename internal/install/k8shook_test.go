@@ -761,3 +761,25 @@ func TestHookRecordLastTryWhenStoppedAfterTheHook(t *testing.T) {
 		t.Fatalf("%v, %d patches after the stop", err, after)
 	}
 }
+
+// A key the hook of the release it upgraded from declared it returns, and this one does not,
+// leaves the outputs: the hook is not given it.
+func TestK8sHookDropsAReturnTheReleaseRemoved(t *testing.T) {
+	t.Parallel()
+	e := newKubeEnv(t, spec.Provider{Name: "none"})
+	e.runs("1.0.0", 1)
+	e.stored(map[string]string{"ADMIN_EMAIL": "a@example.org", "SESSION_SECRET": "s", "POSTGRES_PASSWORD": "p"}, ours)
+	e.f.outputs = outputsJSON(map[string]string{"ADMIN_PASSWORD": "minted", "OLD_KEY": "k"})
+	e.hookRuns("Succeeded", "", map[string]string{"ADMIN_PASSWORD": "minted"})
+	in := e.installer(nil)
+	in.dropped = removed{returns: []string{"OLD_KEY"}}
+	if err := in.K8sProvision(context.Background()); err != nil {
+		t.Fatalf("%v\n%s", err, e.log)
+	}
+	if env := envOf(e.container("provision")); env["OLD_KEY"] != "" {
+		t.Errorf("the hook was given OLD_KEY: %v", env)
+	}
+	if len(e.f.patches) != 1 || e.f.patches[0] != `{"data":{"OLD_KEY":null}}` || !strings.Contains(e.log.String(), "no longer returns") {
+		t.Errorf("patches %q\n%s", e.f.patches, e.log)
+	}
+}

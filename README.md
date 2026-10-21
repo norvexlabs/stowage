@@ -99,13 +99,14 @@ sh notes.sh
 | Install with the terminal form or an answers file | ✓ | ✓ | ✓ (`vm create`, first boot) |
 | TLS front (Caddy) built in | ✓ | — (your chart's ingress) | ✓ |
 | Signed `upgrade` / `rollback` | ✓ | ✓ (Helm) | ✓ (A/B reboot) |
-| Rollback refused past a schema barrier | ✓ | not yet | ✓ |
+| Rollback refused past a schema barrier | ✓ | ✓ (`shapes.kubernetes.schema`) | ✓ |
 | `reset-db`, `secrets rotate` | ✓ | ✓ | ✓ |
 | `secrets export` | ✓ | — | ✓ |
 | Install from a mirror | ✓ | ✓ | ✓ |
 | A failed upgrade undone on its own | — | ✓ (Helm `--wait`, rolled back when not ready) | ✓ (health gate) |
-| Scheduled encrypted backups, `restore` | not yet | — | ✓ |
-| Host daemon, firewall, network change with auto-revert, disk-pressure hook | — | — | ✓ |
+| Scheduled encrypted backups, `restore` | ✓ (systemd timer) | — | ✓ |
+| Disk-pressure hook | ✓ (systemd timer) | — | ✓ |
+| Host daemon, firewall, network change with auto-revert | — | — | ✓ |
 
 ### What it is not
 
@@ -439,14 +440,14 @@ stowage -C <project> project-version [--channel C] [--revision N] [--json]
 stowage -C <project> changelog [--from V] [--to V] [--json]
 stowage -C <project> plan [--revision N] [--channel C] [--json]   # build graph + inputs digests
 stowage -C <project> lock [--update]                  # pin this stowage in stowage.lock
-stowage -C <project> ship [--channel C] [--revision N] [--json]   # build what changed, push, move the pointer
+stowage -C <project> ship [--channel C] [--revision N] [--disks] [--json]   # build what changed, push, move the pointer
 stowage -C <project> verify [<version>] [--channel C] [--revision N] [--json]
 stowage -C <project> promote <version> --from C --to C [--revision N] [--json]
 stowage -C <project> yank <version> --reason TEXT [--channel C] [--revision N]
 stowage -C <project> prune --channel C [<version>]    # mutable channels only
 stowage -C <project> releases [--channel C] [--json]
-stowage -C <project> hook install [--channel C]       # write git's post-commit hook for this project
-stowage -C <project> hook post-commit [--channel C]   # what that hook runs: ship a version bump in the background
+stowage -C <project> hook install [--channel C] [--disks]       # write git's post-commit hook for this project
+stowage -C <project> hook post-commit [--channel C] [--disks]   # what that hook runs: ship a version bump in the background
 stowage --version
 ```
 
@@ -478,7 +479,8 @@ stowage --version
 
 - `hook install` writes git's post-commit hook (where git looks: `.git/hooks/post-commit`, or
   `core.hooksPath` when set) as a script running `<this stowage's absolute path> -C <project,
-  relative to the working tree's top level> [-f <spec>] hook post-commit [--channel C]`. It
+  relative to the working tree's top level> [-f <spec>] hook post-commit [--channel C] [--disks]`
+  (`--disks`: every release it ships publishes its disks). It
   replaces a hook only it wrote, and refuses another (printing the line to add to it). Run it
   again after moving the `stowage` binary or the project. A spec (`-f`) outside the repository, or
   not committed, is refused, here and by `hook post-commit`: the ship runs in a checkout of the
@@ -499,10 +501,14 @@ stowage --version
 
   A version `HEAD` records that the scheme refuses is reported as an error. Every outcome exits
   0: a commit never fails on its release.
+- The ship publishes the disks (as `ship --disks`) when the hook was written with `--disks`, or
+  when the commit was made with `STOWAGE_SHIP_DISKS=1` (or `true`) in its environment — so a
+  project chooses its own cadence, a release at a time; the started line then says `, with its
+  disks,`.
 - The ship runs in the background, in a session of its own with no input, and `hook post-commit`
   returns at once, printing `follow: tail -f <log>`. The background run is `stowage -C <project>
-  hook post-commit --channel C --ship <version> --commit <id>` (both flags together), which can
-  also be run by hand:
+  hook post-commit --channel C --ship <version> --commit <id> [--disks]` (`--ship` and `--commit`
+  together), which can also be run by hand:
   - it takes `<git common dir>/stowage/ship.lock`, so one hook ship runs at a time per
     repository; a later one waits for it (its log says so);
   - it checks `<id>` out, detached, as a linked worktree at
@@ -562,10 +568,10 @@ The release manifest (artifact type `application/vnd.stowage.release.v1+json`) h
 |---|---|
 | `<name>-<key>` | each image (built, or mirrored from a pinned `ref`) by the release tag |
 | `<name>-front` | the front, built by Stowage, by the release tag |
-| `<name>-backup` | the VM's backup runner, built by Stowage (a `kairos` shape with a `pg-age-rclone` backup), by the release tag |
+| `<name>-backup` | the backup runner, built by Stowage (a `docker` or `kairos` shape with a `pg-age-rclone` backup), by the release tag |
 | `<name>-installer` | the release tag, and `:latest` |
 | `<name>-os` | the Kairos OS bundle (an image), by the release tag |
-| `<name>-disk` | each disk image by `<tag>-<format>`, and `latest-<format>` |
+| `<name>-disk` | each disk image by `<tag>-<format>` (one disk set per channel), and `latest-<format>` |
 | `charts/<name>-<channel>` | the channel's Helm charts (OCI), each by its version `0.<release_seq>.0`. The release manifests are the channel's offer: a yank deletes nothing, so the repository's highest version may be a yanked release's — install the version a release names (`--version`), never the latest |
 | `<name>-release` | the release tag; `:<channel>` (the channel pointer) |
 | `<name>-release-seq` | `:<channel>`: the last sequence number claimed, written before the release so a number is never reused, even after a prune or a failure |
@@ -640,13 +646,13 @@ platform is part of an image's inputs). What `ship` does, in order:
    added by hand) are left. When a manifest of the release repository cannot be read (another
    artifact, a newer format), nothing is deleted. A failure is a warning; the next ship or prune
    retries. An immutable channel's chart repository is never swept;
-4. with the `kairos` shape, the OS bundle and its disks (see the Kairos contract below) are kept,
-   re-tagged or built after the images are in the registry and before any tag moves: built ones
-   are pushed by digest and signed, and the tags `<prefix>/<name>-os:<tag>` and
-   `<prefix>/<name>-disk:<tag>-<format>` move with the images'. A failure leaves every tag as it
-   was (a bundle built before a disk failed is built again by the next ship). On an immutable
-   channel, a published release whose bundle or a disk would now differ is refused — publish a
-   new `--revision`;
+4. with the `kairos` shape, the OS bundle (and, with `--disks`, its disks — see the Kairos contract
+   below and "Disk sets" after this list) are kept, re-tagged or built after the images are in
+   the registry and before any tag moves: built ones are pushed by digest and signed, and the
+   tags `<prefix>/<name>-os:<tag>` and `<prefix>/<name>-disk:<tag>-<format>` move with the
+   images'. A failure leaves every tag as it was (a bundle built before a disk failed is built
+   again by the next ship). On an immutable channel, a published release whose bundle or a disk
+   would now differ is refused — publish a new `--revision`;
 5. the installer image `<prefix>/<name>-installer:<tag>` is made: one linux/amd64 file,
    `<short>-stow`, with the release appended (the manifest less its own installer digest and yank,
    the compose file, the runtime spec, the trusted keys, the pull account); its default command
@@ -656,10 +662,44 @@ platform is part of an image's inputs). What `ship` does, in order:
 6. the release manifest, naming the installer, the chart, the OS bundle and the disks, is pushed to
    `<prefix>/<name>-release:<tag>`, verified, and only then the channel pointer
    `<prefix>/<name>-release:<channel>` moves — never backwards to an earlier release, never to
-   a yanked one. On the channel with `latest: true` the installer's `:latest` and each disk's
-   `latest-<format>` follow the pointer (a yank or prune moves them back, or removes them with the
-   last release; a format the pointer's release has none of loses its tag), and `verify` of that
-   channel compares their digests with the pointer's.
+   a yanked one. On the channel with `latest: true` the installer's `:latest` follows the pointer
+   (a yank or prune moves it back, or removes it with the last release) and each disk's
+   `latest-<format>` follows the channel's disk set (a format the set has none of loses its tag);
+   `verify` of that channel compares their digests with the pointer's and the set's;
+7. a ship that published disks, once the pointer is on its release, records them as the channel's
+   disk set (`<prefix>/<name>-disk:set-<channel>`, an artifact of type
+   `application/vnd.stowage.disk-set.v1+json`: `{channel, release, stowage_version, disks}`,
+   signed), moves each `latest-<format>` to them (on the channel moving latest), then removes,
+   with their signatures, the disks the channel's releases name (their own, or the set they
+   boot) that no channel's set holds: the registry then holds one disk set per channel. Only
+   disks a release manifest of the channel names are removed, so a ship running on another
+   channel never loses the disks it is pushing; a disk no release names (a failed ship's) is left.
+   A release shipped while its channel points at a later one publishes its disks and leaves the
+   channel's set as it is. A failure here comes after the release is out: `ship`
+   prints the release, then `stowage: <tag> is published; the cleanup of the older disk sets
+   failed: …`, and exits `3`, so the release is not shipped again (the next ship with `--disks`
+   cleans up).
+
+**Disk sets** (`--disks`). A disk set is several GB, while most releases only move the OS bundle
+and the images, so `ship` publishes the kairos shape's disks, and registers `cloud_publish`'s
+images, only when given `--disks` (or `STOWAGE_SHIP_DISKS=1` or `true` in its environment). A
+release shipped without it publishes no disk, says so in one line, and records in its manifest
+the disk set its installs boot (`boot_disks`): the channel's, the disks of the newest release (by
+release number) that published disks, as its record holds it; `vm create` of it boots that set, and the VM's first boot
+takes the release's own OS bundle before it installs (see `vm create`). A ship, yank or prune
+that publishes no disk never moves, rewrites or deletes a disk tag. A release shipped again with
+the same inputs keeps the disks it published while they are there, and records them as they
+were once a newer set replaced them (`--disks` makes them again); `verify` checks a release's
+disks while they are its channel's set (and the ship that publishes them). A promotion publishes
+the disks the release it promotes published, while they are there. A yank or a prune never
+moves a channel's set: a yank leaves the channel booting the yanked release's disks until a ship
+publishes disks. `prune` deletes the disks a pruned release boots by digest, but those a release
+left names (kept whole) and a channel's set — of another channel's it deletes the release's tag
+alone, where the registry deletes a tag alone. Removing a tag never
+relies on a registry deleting a tag: one that refuses has the manifest deleted by digest when no
+other tag holds it, through `registry.delete` (`oci`: the distribution API, the default;
+`github`: GitHub's packages API, for ghcr, whose distribution API deletes nothing — the token
+needs `delete:packages`).
 
 **Signing** (`signing: { provider: cosign-key, key: …, public_keys: [...] }`): every image, chart,
 OS bundle, disk image, installer and release manifest is signed by digest before its tag moves, with the `cosign` CLI (v3, on
@@ -711,12 +751,14 @@ and the front),
 checked before anything is written. Re-shipping a yanked release fails: publish a new revision (the channel never moves forward to it; a pointer an interrupted yank left on it moves back). Image keys `release`,
 `release-seq`, `os`, `disk`, `installer`, `front` and `backup` are reserved for Stowage's own repositories. `yank` marks a release (nothing is deleted) and moves the pointer back to the latest
 release that is not yanked and verifies, removing it when none is left; a broken release can
-always be yanked. `prune` deletes tags only (the release's images, installer, chart, OS bundle and
-disk tags first, its manifest last) — never a
-digest, which other channels' tags share — so the registry must support tag deletion (zot does).
+always be yanked. `prune` deletes tags (the release's images, installer, chart, OS bundle and
+disk tags first, its manifest last; disks as "Disk sets" says): a registry that deletes no tag
+alone has a manifest deleted by digest through `registry.delete` when no other tag holds it, and
+refuses, naming the tags, otherwise.
 
 Global flags: `-C <dir>` project root (default `.`), `-f <file>` spec file (default
-`<dir>/stowage.yaml`). Exit codes: `0` success, `1` failure or lint errors. With `--json`, stdout
+`<dir>/stowage.yaml`). Exit codes: `0` success, `1` failure or lint errors, `3` a release `ship`
+or `promote` published whose disk cleanup failed. With `--json`, stdout
 is one JSON document and nothing else; diagnostics go to stderr.
 
 ### The contracts a project must honour
@@ -1042,6 +1084,7 @@ database: reset-db has nothing to reset` (`… there is no backup to restore`). 
 | `changelog` | `keepachangelog` (default; `file`, default `CHANGELOG.md`; `## [x]` or `## x` headings, `Unreleased` skipped), `dir-per-version` (`dir`, required; `pattern`, default `{v}.md`, holding `{v}` once and no `/`), `command`. The current version must have a section |
 | `channels.<name>` | `tag` (template holding `{v}` once), `mutable`, `latest`. Names are lowercase letters, digits, `.`, `_`, `-`. At most one channel sets `latest` (none, or a mutable one, is a warning) |
 | `registry.prefix` | `<host>[:port][/path]`, the host a name or a bracketed IPv6 address (`[fd00::5]:5000/notes`): no scheme, tag or trailing slash |
+| `registry.delete` | how the publisher deletes a manifest by digest (an older disk set, a pruned release's): `oci` (the default, the distribution API) or `github` (GitHub's packages API: `api`, default `https://api.github.com`; `token_env`, default `registry.push`'s, a token with `delete:packages`) |
 | `registry.pull`, `registry.push` | `token` (`user`, `token_env`), `docker-config` (`config`, a Docker config directory; empty: the default Docker login), `none` (pull only). `registry.pull` is baked into every installer: it may not use `registry.push`'s `token_env` or Docker config. With `none`, `ship` refuses a repository the release writes that an anonymous read is refused (see `ship`) |
 | `signing` | `cosign-key` (`key`, `public_keys`), or absent / `none` |
 | `images.<key>` | built (`context`, `dockerfile`, `target`, `args`, `inputs`: the paths whose content enters the image's inputs digest, default the whole context less `.dockerignore`) or `ref` (exclusive with the build keys). An image no service or hook uses is a warning; a `# syntax=` frontend or a `FROM $ARG` cannot be checked (warning) |
@@ -1056,9 +1099,9 @@ database: reset-db has nothing to reset` (`… there is no backup to restore`). 
 | `extensions[]` | the apps an install of this project can be pointed at (see "Extensions"): `name` (an app name, as `name` is; not this project's; none twice), `input` (required: an input holding the extension's endpoint, empty while it is off — `optional`, not `secret`, no `default`, and read by a compose service, a route or the provision hook's `env`, or asked on `kubernetes` only, where the chart reads it), `prompt` (required: what the install's tip calls it; the `input` is neither `advanced` nor asked in one mode only, `when`, so every install records it), `key_input` (an `optional` `secret` input holding its credential, asked on the same shapes as `input`, neither `advanced` nor `when`, and read as `input` is). No input is named by two extensions, or twice by one |
 | `endpoint` | a route of `front.routes`: this project's endpoint when another project uses it as an extension. Its installer prints the route's URL at the end of an install (see "Extensions") |
 | `hooks.provision` | `container` (`image`, `cmd`, `env`: the inputs, secrets and safe defaults it receives, required, `[]` for none; `returns`: keys it may return, which `provision --set` sets before it returned them; `outputs`) |
-| `hooks.maintenance.disk_pressure` | `soft_pct`, `hard_pct` (1 ≤ soft < hard ≤ 99), `post` (`http://<service>:<port>/…`), `auth_secret` (a `secrets` key). The Kairos VM's host daemon acts on it (see "Disk pressure" under the installer on the Kairos VM); Docker and Kubernetes ignore it, and without a `kairos` shape it is a warning |
-| `backup` | optional, and only with a `database`: `pg-age-rclone` (`profiles`: a name of 1 to 32 lowercase letters and digits each, `all`, a list of the tables whose data it keeps — `table` in any schema, or `schema.table` —, or `{ exclude: [pattern, …] }`, the tables whose rows it leaves out, structure kept (`table` or `schema.table` of letters, digits and `_`, with pg_dump's `*` and `?`); `default_profile`, required with several), which the Kairos VM runs (see "Backups" under the installer on the Kairos VM); `command`, validated only (with a `kairos` shape, a warning: the VM schedules no backup of it). A `kairos` shape with a `pg-age-rclone` backup makes `ship` build and publish the backup runner (`<name>-backup`), which the OS bundle preloads |
-| `shapes` | at least one of `docker: {}`, `kubernetes` (`chart`, a directory holding `Chart.yaml`; `postgres_modes`: `external`, `embedded`, `cnpg`, optional and validated only; an error without a `database`), `kairos` (`base`, the distribution converted into Kairos, and `kairos_init`, the kairos-init image, both pinned by digest; `disk_formats`: `raw`, `qcow2`, `ova`, `vhd`, `gce`, none publishing the bundle alone; `cloud_publish`: `aws`, `azure`, `gcp`, each adding the disk format it imports (`raw`, `vhd`, `gce`); `health_gate`: 0 < `poll_s` < `deadline_s` ≤ `deadline_after_reset_s`, the VM's health gate's window and polling (default 600, 1800 and 30 s; `deadline_after_reset_s` is validated only: `reset-db` does not reboot, so no boot is judged after it); `host_api`: the compose services given the host daemon's app socket on the VM, each in the compose file, none twice; no `backup` is a warning when there is a `database`). `ship` publishes the `kubernetes` chart and the `kairos` OS bundle and disks; `docker` and `kubernetes` have a runtime |
+| `hooks.maintenance.disk_pressure` | `soft_pct`, `hard_pct` (1 ≤ soft < hard ≤ 99), `post` (`http://<service>:<port>/…`), `auth_secret` (a `secrets` key). The Kairos VM's host daemon acts on it (see "Disk pressure" under the installer on the Kairos VM), and a Docker install's own timer (see "Backups, restore and the disk-pressure watch on Docker"); Kubernetes ignores it, and without a `docker` or `kairos` shape it is a warning |
+| `backup` | optional, and only with a `database`: `pg-age-rclone` (`profiles`: a name of 1 to 32 lowercase letters and digits each, `all`, a list of the tables whose data it keeps — `table` in any schema, or `schema.table` —, or `{ exclude: [pattern, …] }`, the tables whose rows it leaves out, structure kept (`table` or `schema.table` of letters, digits and `_`, with pg_dump's `*` and `?`); `default_profile`, required with several), which the Kairos VM and a Docker install run (see "Backups" under the installer on the Kairos VM); `command`, validated only (with a `kairos` shape, a warning: the VM schedules no backup of it). A `docker` or `kairos` shape with a `pg-age-rclone` backup makes `ship` build and publish the backup runner (`<name>-backup`), which the OS bundle preloads and a Docker install pulls |
+| `shapes` | at least one of `docker: {}`, `kubernetes` (`chart`, a directory holding `Chart.yaml`; `postgres_modes`: `external`, `embedded`, `cnpg`, optional and validated only; an error without a `database`; `schema`: `url_env`, the variable holding the migrate role's URL in the container of the workload running `reads_newer_image`, and `image`, an images key holding `psql` — the schema check of `k8s upgrade` and `k8s rollback`, which needs the `sql` schema-compat provider with `reads_newer_image`; absent with that provider, a warning), `kairos` (`base`, the distribution converted into Kairos, and `kairos_init`, the kairos-init image, both pinned by digest; `disk_formats`: `raw`, `qcow2`, `ova`, `vhd`, `gce`, none publishing the bundle alone; `cloud_publish`: `aws`, `azure`, `gcp`, each adding the disk format it imports (`raw`, `vhd`, `gce`); `health_gate`: 0 < `poll_s` < `deadline_s` ≤ `deadline_after_reset_s`, the VM's health gate's window and polling (default 600, 1800 and 30 s; `deadline_after_reset_s` is validated only: `reset-db` does not reboot, so no boot is judged after it); `host_api`: the compose services given the host daemon's app socket on the VM, each in the compose file, none twice; no `backup` is a warning when there is a `database`). `ship` publishes the `kubernetes` chart and the `kairos` OS bundle and disks; `docker` and `kubernetes` have a runtime |
 
 A `command` provider answers per op: `version.get` → `{"version"}`; `scheme.validate`
 `{version}` → `{"valid", "reason"}`; `scheme.compare` `{a, b}` → `{"result": -1|0|1}`;
@@ -1094,8 +1137,10 @@ again, to copy an installer to another host.
           [--no-input] [--accessible] [--dry-run] [--no-provision]
 <short>-stow rollback [--dir D] [--offline] [--dry-run]                  # the installer the install keeps
 <short>-stow reset-db [--dir D] [--yes] [--no-input] [--accessible] [--dry-run] [--no-provision]
+<short>-stow backup config|run|status|list|verify [--dir D] [the VM's flags]   # a pg-age-rclone backup
+<short>-stow restore OBJECT [--dir D] [--identity FILE|-] [--yes] [--accessible]
 <short>-stow script                                                      # print the bootstrap script
-<short>-stow mirror export [--channel C] [--output FILE] [--disks F,…|none]
+<short>-stow mirror export [--channel C] [--version V [--revision N]] [--shapes S,…] [--output FILE] [--disks F,…|none]
 <short>-stow mirror import FILE --to PREFIX [--registry-ca FILE] [--older]
 ```
 
@@ -1154,7 +1199,11 @@ again, to copy an installer to another host.
   backup of the install --secrets came from is awaited; once loaded, `<short>-stow provision --dir D`
   provisions it`), `endpoint  <URL>` when the spec names an `endpoint` (that route's URL), a `tunable   KEY=value` line per advanced input (`(not set)` when none is
   recorded — the compose file's default, or off for one the front reads — a secret one
-  `<redacted>`) and `docker compose ps --all`.
+  `<redacted>`), in byo mode `cert      <its names>, valid until <date> (<N> days)` and, from 30
+  days before that date or once it passed, `warning: the certificate expires in N day(s), …` (or
+  `expired on …`) naming the re-run that renews it, with `hooks.maintenance.disk_pressure` a
+  `pressure  <level>: <used>% used (soft …, hard …)` line and the watch's last POST, and `docker
+  compose ps --all`.
 - A failed first install removes the directory it created.
 - The install directory holds:
   - `.env`, the project's `compose.yaml`, `.env.prev` and `.stowage-changing` (a re-run's
@@ -1284,9 +1333,15 @@ again, to copy an installer to another host.
   An install already on the release is left as it is, with a note. The upgrade follows how the
   install pulls its images (an install made with `--offline` upgrades from loaded images). Then it pulls the images, dumps the database (`pg_dump` as the migrate role, gzip,
   `snapshots/<UTC time>.sql.gz`, 0600; a failed dump stops the upgrade), records the schema
-  version, keeps the running release — compose files, `.env`, installer — in `.stowage-prev/`
-  (one level), writes `.env` (every recorded value kept; the release's added inputs, secrets and
-  safe defaults decided as at a first install; version, revision and images rewritten), starts it and provisions. A failure names the rollback. `--dry-run` prints the
+  version, keeps the running release — compose files, `.env`, `provision.env`, installer — in
+  `.stowage-prev/` (one level), writes `.env` (every recorded value kept but an input the release
+  no longer declares, on any shape — dropped, with `input KEY is not in <name> <version>: dropped`,
+  never asked again —; the release's added inputs, secrets and safe defaults decided as at a
+  first install; version, revision and images rewritten), starts it and provisions (a key the
+  previous release's hook declared in `returns` and this one's does not is dropped from
+  `provision.env`, with `the provision hook of <name> <version> no longer returns KEY: dropped`).
+  `rollback` takes both back: the previous release's values `.env` lacks, and what its hook
+  returned. A failure names the rollback. `--dry-run` prints the
   values that would change (secrets redacted). An install already on the release says so and
   names `upgrade --version`.
 - `upgrade --version V`, run by any installer of the project (the one the install keeps,
@@ -1455,7 +1510,11 @@ again, to copy an installer to another host.
   them, and that IPv6 forwards no port: a domain whose AAAA record names the host is reached on
   80 and 443 themselves; `STOWAGE_ACME_EMAIL`, optional, is checked
   as an address), `byo` (`--cert` / `--key`, PEM: checked as a pair, unexpired and covering every
-  domain, then copied into `<dir>/tls/` 0600), `internal` (Caddy's local CA; its root is
+  domain, and its chain — without `--ca`, it must verify to a CA this host trusts with the
+  intermediates the file holds, so a leaf given without its intermediate is refused, naming its
+  issuer; a chain ending at a self-signed certificate no host trusts, a private CA's, is said and
+  kept — then copied into `<dir>/tls/` 0600; `status` shows its end, and warns from 30 days
+  before it), `internal` (Caddy's local CA; its root is
   `/data/caddy/pki/authorities/local/root.crt` in the front). `dns-cloudflare`
   (Let's Encrypt alone, DNS-01 through Cloudflare, so no port needs to reach the host for
   issuance; `STOWAGE_ACME_EMAIL` as with `acme`; `STOWAGE_CLOUDFLARE_API_TOKEN`, required and
@@ -1464,6 +1523,35 @@ again, to copy an installer to another host.
   and given to the front's container as `CLOUDFLARE_API_TOKEN`; the project's services and the
   provision hook are not given it, though a stack that reads `.env` itself — an `env_file` or a
   mount of the install directory — sees it like every recorded value). HSTS is sent except with `internal`.
+
+**Backups, restore and the disk-pressure watch on Docker.** The VM's host daemon's code runs in
+the Docker installer's process for one command (no daemon stays): run by the installer the install
+keeps (`<dir>/<short>-stow`, the release it runs; another is refused).
+
+- `backup config|run|status|list|verify` and `restore OBJECT` (`--dir D`, the other flags as on
+  the VM — see "Backups" under the installer on the Kairos VM) take a project's `pg-age-rclone`
+  backup: the settings in `backup.yaml` (root's alone) and the last run in `backup-last.json` in
+  the install directory, the dump encrypted to the recipients as it streams to the backup runner
+  (`<name>-backup`, pulled with the stack's images, by digest, since a release of a project with
+  the `docker` shape and a `pg-age-rclone` backup publishes one, and pulled again when the engine
+  lost it), and the restore into a database
+  of its own, swapped in only once it loaded, then the stack up and provisioned. The schedule is
+  a systemd timer of the install's own, `<name>-backup-<8 hex of the install directory's
+  digest>.timer` and its `.service` (`ExecStart=<dir>/<short>-stow backup run --if-configured
+  --dir <dir>`) in `/etc/systemd/system`, written, enabled and started by `backup config` (and
+  `--remove` removes them); on a host without systemd, or a run not as root, there is none (a
+  backup runs when `backup run` is), and the schedule is kept unchecked. One process at a time
+  runs the jobs (`backup run`, `verify`, `restore`): it holds `.stowage-host.lock` in the install
+  directory, and another waits for it, saying so; the reads and the settings (`backup status`,
+  `list`, `config`, a settings change holding `.stowage-settings.lock` alone) never wait for a job, and `backup status` says `running` while another process runs a
+  job (a backup, a verify or a restore). A signal stops the job the command runs.
+- The disk-pressure watch (`hooks.maintenance.disk_pressure`): the install (each run of the
+  installer that brings the stack up) writes, enables and starts `<name>-disk-<8 hex>.timer` and
+  its service, which runs `<dir>/<short>-stow disk-check --dir <dir>` two minutes after boot and
+  every 10 minutes: it reads the filesystem of the Docker engine's data directory (`docker info`'s
+  `DockerRootDir`), and from `soft_pct` POSTs the level as the VM's watch does, the last POST kept
+  in `disk-pressure.json`, which `status` shows. Without systemd or root it is not installed, and
+  the install says so; a release without the hook removes the units.
 
 ### The installer on Kubernetes (`<short>-stow k8s`)
 
@@ -1600,6 +1688,11 @@ the current directory. A release with no chart (published without the shape) is 
   given at earlier runs (the installer's and the operator's `--values`), then this run's. By
   default the chart and the images come from the registry the release was installed from. An
   upgrade with no pull password refreshes no pull Secret and keeps the one the release names.
+- `upgrade` drops, from the Secret `<release>-stowage`, the value of an input the release no
+  longer declares (fetching the installer of the release the helm release runs, as for the schema
+  baseline: one that cannot be read keeps every value), saying `input KEY is not in <name>
+  <version>: dropped`; the server-side apply removes it. The provision hook's run drops, from the
+  outputs Secret, a key the previous release's hook declared in `returns` and this one's does not.
 - `upgrade --version V` resolves V as the Docker shape does, among the release manifests of the
   registry the release records (or `--image-registry`), on its channel, refuses it unless it is
   signed by a key this `<short>-stow` carries (when it carries any), orders the release
@@ -1616,6 +1709,21 @@ the current directory. A release with no chart (published without the shape) is 
   a failed revision or a copy of what runs (an upgrade that changed nothing). When there is none
   (a first install, or a release back to it) it is refused, and `helm history` lists the
   revisions to pick one. The Secrets are not changed. `--dry-run` passes helm's own.
+- The schema check (`shapes.kubernetes.schema: { url_env, image }`, with the `sql` schema-compat
+  provider): `upgrade` (to another release) reads the database's schema before helm migrates and
+  records it in the revision's values (`stowage.schemaFrom`; empty when it could not be read, so an
+  earlier value is never reused), and `rollback`, before helm is called, refuses as Docker's and
+  the VM's rollbacks do: a rollback barrier (`barrier_after`) since the schema the upgrade from the
+  target revision recorded, or a newer schema than that, which the target release's
+  `reads_newer_image` does not read (its label, read from the image in the registry, its release
+  manifest signed by a key this installer carries). Each query runs as a pod
+  `<release>-stowage-schema-<8 hex>` in the namespace, made from the pod template of the workload
+  running `reads_newer_image` (its `env`, `envFrom`, pull Secrets, service account, node selector
+  and tolerations), with `image` (the release's, by digest) in its place running `psql … -c
+  <query> "$(<url_env>)"`, non-root, read-only, deleted once read (it needs `pods` create, get and
+  delete and `pods/log` get). A check that cannot run (nothing recorded, a revision helm made by a
+  rollback, the pod refused) is logged and does not refuse; without `shapes.kubernetes.schema`
+  nothing is checked, and lint warns.
 - `status` prints what the release runs (name, version, revision, channel) and its registry,
   `endpoint  http://<release>-<service>.<namespace>.svc:<port>` when the spec names an `endpoint`
   (see "Extensions"), then `helm status`.
@@ -1777,18 +1885,28 @@ release crosses the gap as one file, and the operator, who has `<short>-stow` bu
 carries it:
 
 - `mirror export` (on a machine with internet) reads the channel's latest release — `--channel`,
-  default the channel of the release this `<short>-stow` carries — from the project's registry with
+  default the channel of the release this `<short>-stow` carries; with `--version V` that release
+  of the channel instead (its latest revision not yanked, or `--revision N`; signed by a key this
+  `<short>-stow` carries, as `upgrade --version` reads one) — from the project's registry with
   the pull account, and writes it to `--output` (default `<name>-<tag>.oci.tar` in the current
   directory; an existing file is refused, then and when the archive, written beside it, is
   linked to its name once whole; on a filesystem without links, FAT or exFAT, it is renamed
   after a last check; a mode the filesystem refuses is logged, not an error). It holds the release manifest under its tag and under the channel's tag, every image
   (`<name>-<key>`, every platform of an index), the installer (`<name>-installer`), the chart
   (`charts/<name>-<channel>`, under its chart version), the OS bundle (`<name>-os`) and the disks
-  (`<name>-disk`, under `<tag>-<format>`; `--disks` limits them to the formats given, `none`
-  exports none; a format the release has no disk of is refused), each by digest and under the
+  its installs boot (`<name>-disk`, under `<tag>-<format>` of the release that published them: its
+  own, or the set its manifest records; `--disks` limits them to the formats given, `none`
+  exports none; a format the release has no disk of is refused, as is a disk a newer set
+  replaced, which is no longer published), each by digest and under the
   tag it was published with, with its signatures (each one's referrers). Every blob is checked
   against its digest as it is read. It prints `Exported <name> <version> (revision N, <tag>) to
   <file>` with the manifests, blobs and bytes written.
+  `--shapes S,…` (`docker`, `kubernetes`, `kairos`; default every shape the project has) exports
+  only what the site runs: without `kubernetes` no chart, without `kairos` no OS bundle and no
+  disk (`--disks` is then refused). The release manifest still names them: an install of a shape
+  left out says, from the mirror, what is missing. The channel's tag in the archive is on the
+  release exported, so importing an earlier release into a mirror whose channel holds a later one
+  takes `mirror import --older`.
 - The archive is a standard OCI image layout (`oci-layout`, `index.json`, `blobs/sha256/`) as one
   tar; each top-level manifest carries `org.opencontainers.image.ref.name` (its tag; none for a
   signature) and `dev.stowage.repository` (its repository under the registry prefix), so skopeo
@@ -1899,7 +2017,18 @@ in the same installer (bootstrap it as above, then `sh <name>.sh vm create …`,
   requires is named at the end, for the operator to give over SSH (`ssh <user>@<address> sudo
   <short>-stow install`). The answers are reviewed ("Go on with these answers"), the whole is shown,
   and on a terminal confirmed; without one the flags and the defaults decide.
-- It fetches the release's disk of that format (`<prefix>/<name>-disk@<digest>`, the digest the
+- It boots the disk set the release records: its own disks, or, for a release shipped without
+  them, the set its manifest names (`boot_disks`); a set no longer in the registry (a newer one
+  replaced it) gives way to the set of the channel's pointer (its manifest signed by a key this
+  `<short>-stow` carries), and a channel holding none is refused, naming `stowage ship --disks`.
+  Another release's set must have been published by stowage 0.6.0 or later, whose OS takes another
+  release (refused otherwise). The VM's settings then name the release to install (`release`:
+  its version, revision, tag and OS bundle digest): its first boot writes that release's OS
+  bundle into the passive slot (`kairos-agent upgrade`, by digest, from the registry or the
+  mirror the settings name), records it in `/usr/local/<name>.os-switch`, and reboots into it;
+  the boot after it installs (a boot still on another OS after that stops, naming the file).
+  `vm create --create opentofu` waits 40 minutes by default then, rather than 20.
+- It fetches that disk of the format (`<prefix>/<name>-disk@<digest>`, the digest the
   release records) with the pull account, as `upgrade --version` reads the registry, into
   `--out` (default the current directory) under the layer's title less its `.zst`
   (`<name>-<version>.<format>`), decompressed as it is written, checking the compressed layer's
@@ -2092,7 +2221,7 @@ sudo <short>-stow install [--channel C] [--set KEY=VALUE]… [--answers FILE] [-
           [--ports route=port,…] [--address 127.x.x.x] [--tls MODE] [--domains route=host,…]
           [--cert F --key F [--ca F]] [--http-port N] [--https-port N] [--no-provision] [--dry-run]
           [--secrets FILE|- | --new-secrets]   (both: refused)
-<short>-stow status [--json]          # this OS's release, the install's (and `not finished` while a first install's stack comes up or its provision hook runs, or after one failed — with why, and the `sudo <short>-stow install` that runs it again; `"installing": true` and `"install_failed": "<why>"` in JSON; `not provisioned` while an install given `--secrets` awaits the backup `restore` loads, `"restore_awaited": true`), the channel, the system Kairos booted (active, passive or recovery; the fallback), the last failed boot, the disk, the services
+<short>-stow status [--json]          # this OS's release, the install's (and `not finished` while a first install's stack comes up or its provision hook runs, or after one failed — with why, and the `sudo <short>-stow install` that runs it again; `"installing": true` and `"install_failed": "<why>"` in JSON; `not provisioned` while an install given `--secrets` awaits the backup `restore` loads, `"restore_awaited": true`), the channel, the system Kairos booted (active, passive or recovery; the fallback), the last failed boot, the disk, a byo install's certificate (`cert`: its names, end and days left, with a warning from 30 days before it; `"cert"` in JSON), the services
 <short>-stow health [--json]          # ready, or fails saying why: the health gate's check, once
 <short>-stow events [--after N] [--follow|-f] [--json]   # the event journal: jobs, reboots, boots and the health gate's verdicts, the first install; --follow waits for more until interrupted, through daemon restarts
 <short>-stow ps [--json]              # the stack's services, state and health
@@ -2125,7 +2254,7 @@ sudo <short>-stow install [--channel C] [--set KEY=VALUE]… [--answers FILE] [-
   first install with exported secrets (see `secrets export` under the Docker shape). A first
   install takes the settings file `/etc/<name>/install.yaml` (written by the cloud-config `vm
   create` makes; YAML: `channel`, `tls`, `http_port`, `https_port`, `inputs` of KEY: value,
-  `await_secrets`, and `registry` and `registry_ca` — a mirror and the file of its CA, taken as `--registry` and
+  `await_secrets`, `ipv6`, `release` (see `vm create`: the release whose OS a first boot takes first), and `registry` and `registry_ca` — a mirror and the file of its CA, taken as `--registry` and
   `--registry-ca`, so the install records them and its updates and upgrades read the mirror,
   with root's Docker login on the VM, anonymously when it has none —; any other key refused) for what its flags and `--answers` do not give (its `tls` is not taken when
   `--cert` or `--key` is given, nor when its `tls` is `none` and a domain is given, by
@@ -2581,7 +2710,10 @@ sudo <short>-stow install [--channel C] [--set KEY=VALUE]… [--answers FILE] [-
     is not on trial.
   - `install.finished`, `install.failed` — `release`, and `reason` (failed): a run of the VM's
     first install that brought it to its end, or that failed (a run stopped by a reboot or a stop
-    writes nothing; the boot runs it again). A Docker install keeps no journal.
+    writes nothing; the boot runs it again). A Docker install's journal holds the jobs its
+    backup and restore verbs run (no verb reads it there).
+  - `cert.expiring` — `reason`, the warning `status` gives: a byo install's certificate within 30
+    days of its end, or past it, journaled as the daemon starts and once a day.
   - `<short>-stow events` prints the entries after `--after` (default 0), one per line (`--json`:
     the daemon's JSON), and says when entries asked for are no longer kept. `--follow` then waits
     for more until interrupted; a daemon it cannot reach (a restart) is asked again from the same

@@ -464,9 +464,15 @@ func (in *Installer) k8sDeploy(ctx context.Context, upgrade bool) error {
 			return err
 		}
 		prefix = cmp.Or(k.Registry, cur.Registry)
-		// The same release applied again shares its baseline: nothing to fetch.
+		// The same release applied again shares its baseline and its inputs: nothing to fetch.
 		if cur.Release.Version != m.ProjectVersion || cur.Release.Revision != m.Revision {
-			if from, to, ok := in.k8sBaselines(ctx, cur, prefix); ok && from != to {
+			running, runErr := in.k8sRunning(ctx, cur, prefix)
+			if runErr == nil {
+				in.dropped = removedBy(running, in.R)
+			} else {
+				in.O.logf("the release %s %s runs could not be read (%v): the inputs it removes are kept", cur.Release.Name, cur.Release.Version, runErr)
+			}
+			if from, to, ok := in.k8sBaselines(running, runErr, cur); ok && from != to {
 				return fmt.Errorf("%s %s starts schema baseline %d, and release %s in %s runs %s %s, at baseline %d: its data cannot carry over, so it moves to %s only by a fresh install: `%s --new-baseline` wipes it and installs %s",
 					m.Name, m.ProjectVersion, to, k.Release, k.Namespace, cur.Release.Name, cur.Release.Version, from, m.ProjectVersion, in.k8sCtl("reset-db"), m.ProjectVersion)
 			}
@@ -484,6 +490,14 @@ func (in *Installer) k8sDeploy(ctx context.Context, upgrade bool) error {
 	}
 	if d.env, d.secret, d.changed, err = in.k8sEnv(ctx, upgrade); err != nil {
 		return err
+	}
+	// A value the release no longer declares as an input leaves its Secret: the server-side apply
+	// removes a key the installer no longer gives.
+	for _, k := range in.dropped.inputs {
+		if _, ok := d.env[k]; ok {
+			delete(d.env, k)
+			o.logf("input %s is not in %s %s: dropped", k, m.Name, m.ProjectVersion)
+		}
 	}
 	user, token, err := in.pullAccount(prefix)
 	if err != nil {
@@ -550,6 +564,17 @@ func (in *Installer) k8sDeploy(ctx context.Context, upgrade bool) error {
 	}
 	if err := in.applySecrets(ctx, d); err != nil {
 		return err
+	}
+	// The schema before helm migrates, which a rollback past this upgrade is checked against; empty
+	// when it is not read, so the value an earlier upgrade recorded is never reused for this one.
+	if upgrade && in.k8sSchemaOn() {
+		vals[k8sSchemaFrom] = in.k8sRecordSchema(ctx, prefix)
+		if d.values, err = yaml.Marshal(map[string]any{helm.ValuesKey: vals}); err != nil {
+			return err
+		}
+		if err := os.WriteFile(valuesFile, d.values, 0o600); err != nil {
+			return err
+		}
 	}
 	o.logf("helm: %s %s %s (chart %s) in %s", map[bool]string{false: "installing", true: "upgrading to"}[upgrade], m.Name, m.ProjectVersion, m.Artifacts.Chart.Version, k.Namespace)
 	if _, err := in.helm(ctx, Cmd{Args: args, Stream: o.Log}); err != nil {
@@ -821,7 +846,8 @@ func (in *Installer) K8sRollback(ctx context.Context) error {
 	if err := in.pending(rel); err != nil {
 		return err
 	}
-	if _, err := in.installedRelease(ctx); err != nil {
+	cur, err := in.installedRelease(ctx)
+	if err != nil {
 		return err
 	}
 	to := k.Revision
@@ -829,6 +855,10 @@ func (in *Installer) K8sRollback(ctx context.Context) error {
 		if to, err = in.previousRevision(ctx); err != nil {
 			return err
 		}
+	}
+	// The database is checked before helm is called, as Docker's and the VM's rollbacks check it.
+	if err := in.k8sRollbackCheck(ctx, cur, to); err != nil {
+		return err
 	}
 	args := []string{"rollback", k.Release, strconv.Itoa(to), "--wait", "--timeout", k.Timeout.String()}
 	if o.DryRun {
@@ -841,8 +871,7 @@ func (in *Installer) K8sRollback(ctx context.Context) error {
 	if o.DryRun {
 		return nil
 	}
-	cur, err := in.installedRelease(ctx)
-	if err != nil {
+	if cur, err = in.installedRelease(ctx); err != nil {
 		return err
 	}
 	fmt.Fprintf(o.Out, "release %s in %s runs %s %s (revision %d)\n", k.Release, k.Namespace, cur.Release.Name, cur.Release.Version, cur.Release.Revision)
@@ -959,20 +988,26 @@ func (in *Installer) K8sUpgradeTo(ctx context.Context, v string, args []string) 
 }
 
 // k8sBaselines are the schema baselines of the release the helm release runs (from) and of this
-// installer's (to). A release's baseline is in its spec, which travels in its installer: the
-// installer of the release the helm release runs is fetched by the tag it was installed from,
-// from prefix, signature-checked against this installer's keys, and read. ok is false when either
-// has no database or a baseline cannot be told (said in the log): the check then does not refuse,
-// as on Docker.
-func (in *Installer) k8sBaselines(ctx context.Context, cur *deployed, prefix string) (int, int, bool) {
+// installer's (to), running being that release (k8sRunning). ok is false when either has no
+// database or a baseline cannot be told (said in the log): the check then does not refuse, as on
+// Docker.
+func (in *Installer) k8sBaselines(running *Release, runErr error, cur *deployed) (int, int, bool) {
 	if !in.R.Spec.HasDatabase() {
 		return 0, 0, false
 	}
-	r := cur.Release
-	unknown := func(err error) (int, int, bool) {
-		in.O.logf("the schema baseline of %s %s is not known (%v): not checked", r.Name, r.Version, err)
+	if runErr != nil {
+		in.O.logf("the schema baseline of %s %s is not known (%v): not checked", cur.Release.Name, cur.Release.Version, runErr)
 		return 0, 0, false
 	}
+	return baselines(&in.O, &Installer{R: running, O: in.O}, in)
+}
+
+// k8sRunning is the release the helm release runs, as its installer carries it: a release's spec
+// travels in its installer, which is fetched by the tag the release was installed from, from
+// prefix, signature-checked against this installer's keys, and read.
+func (in *Installer) k8sRunning(ctx context.Context, cur *deployed, prefix string) (*Release, error) {
+	r := cur.Release
+	unknown := func(err error) (*Release, error) { return nil, err }
 	if r.Tag == "" {
 		return unknown(errors.New("the release records no tag"))
 	}
@@ -1018,5 +1053,5 @@ func (in *Installer) k8sBaselines(ctx context.Context, cur *deployed, prefix str
 	if err != nil {
 		return unknown(err)
 	}
-	return baselines(&in.O, &Installer{R: running, O: in.O}, in)
+	return running, nil
 }

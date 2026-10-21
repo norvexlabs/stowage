@@ -200,7 +200,7 @@ func (in *Installer) loadCert(ctx context.Context) (*byoCert, error) {
 		if err != nil {
 			return nil, fmt.Errorf("--cert and --key: %w", err)
 		}
-		return c, in.readCA(c)
+		return c, in.checkChain(c)
 	}
 	// What the form asks stays this run's, never a flag: going back to the mode asks it again.
 	f := Form{
@@ -226,10 +226,24 @@ func (in *Installer) loadCert(ctx context.Context) (*byoCert, error) {
 		}
 		c, err := readPair(expandHome(a["--cert"]), expandHome(a["--key"]))
 		if err == nil {
-			return c, in.readCA(c)
+			err = in.checkChain(c)
+		}
+		if err == nil {
+			return c, nil
 		}
 		f.Answers, f.Note = a, fmt.Sprintf("These two files are not a certificate and its key (%v): change either.", err)
 	}
+}
+
+// checkChain checks a byo certificate's chain: to --ca when given, else to the host's trusted CAs.
+func (in *Installer) checkChain(c *byoCert) error {
+	if in.O.CA != "" && in.O.CA != noCA {
+		return in.readCA(c)
+	}
+	if err := in.chainComplete(c); err != nil {
+		return fmt.Errorf("--cert: %w", err)
+	}
+	return nil
 }
 
 // noCA is --ca's value that publishes no CA: a re-run moving a byo install to a certificate of a

@@ -14,10 +14,15 @@ import (
 // publishAt puts version (revision 1) in the kubeEnv's registry at schema baseline b, tagged as
 // `runs` records it, with its installer image carrying the spec that declares the baseline.
 func (e *kubeEnv) publishAt(version string, b int) {
+	e.publishWith(version, atBaseline(b))
+}
+
+// publishWith is publishAt with the spec mod changes.
+func (e *kubeEnv) publishWith(version string, mod func(*spec.Spec)) {
 	t := e.t
 	r, exe := testInstallerOf(t, version, 1, func(s *spec.Spec) {
 		e.spec(s)
-		atBaseline(b)(s)
+		mod(s)
 	}, func(m *release.Manifest) {
 		m.Artifacts.Chart = &release.Chart{Repository: "charts/notes-stable", Version: "0.1.0", Digest: e.digest}
 	})
@@ -170,4 +175,44 @@ func TestK8sResetAcrossABaselineWritesWhatTheNewReleaseAdds(t *testing.T) {
 	if applied == 0 || uninstalled == 0 || applied > uninstalled {
 		t.Errorf("apply %d, uninstall %d", applied, uninstalled)
 	}
+}
+
+// An upgrade to a release that no longer declares an input drops its value from the release's
+// Secret, saying so; a key the old hook declared it returns, and the new one does not, leaves the
+// outputs Secret.
+func TestK8sUpgradeDropsWhatTheReleaseRemoved(t *testing.T) {
+	t.Parallel()
+	e := newKubeEnv(t, spec.Provider{Name: "none"})
+	e.publishWith("1.0.0", func(s *spec.Spec) {
+		atBaseline(1)(s)
+		s.Inputs = append(s.Inputs, spec.Input{Key: "OLD_KNOB", Prompt: "old"})
+		s.Hooks.Provision.Config["returns"] = []any{"OLD_KEY"}
+	})
+	e.runs("1.0.0", 1)
+	e.release = e.at("2.0.0", 1, atBaseline(1))
+	e.stored(map[string]string{"ADMIN_EMAIL": "a@example.org", "SESSION_SECRET": "s", "POSTGRES_PASSWORD": "p", "OLD_KNOB": "x"}, ours)
+	if err := e.installer(nil).K8sUpgrade(context.Background()); err != nil {
+		t.Fatalf("%v\n%s", err, e.log)
+	}
+	if d := e.secretData("notes-stowage"); d["OLD_KNOB"] != "" || d["ADMIN_EMAIL"] != "a@example.org" {
+		t.Errorf("Secret %v", d)
+	}
+	if !strings.Contains(e.log.String(), "input OLD_KNOB is not in notes 2.0.0: dropped") {
+		t.Errorf("log %s", e.log)
+	}
+	if r := removedBy(mustRelease(t, e, "1.0.0"), e.release); strings.Join(r.returns, ",") != "OLD_KEY" || strings.Join(r.inputs, ",") != "OLD_KNOB" {
+		t.Errorf("removed %+v", r)
+	}
+}
+
+// mustRelease is version's release as publishAt made it, read back from its installer.
+func mustRelease(t *testing.T, e *kubeEnv, version string) *Release {
+	t.Helper()
+	cur := &deployed{Registry: e.prefix}
+	cur.Release.Name, cur.Release.Version, cur.Release.Revision, cur.Release.Tag = "notes", version, 1, version
+	r, err := e.installer(nil).k8sRunning(context.Background(), cur, e.prefix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return r
 }

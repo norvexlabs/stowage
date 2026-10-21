@@ -154,15 +154,15 @@ var remoteName = regexp.MustCompile(`^[A-Za-z0-9_+@][A-Za-z0-9_.+@ -]{0,63}$`)
 // carries no runner.
 func (h *Hostd) pgBackup() (*providers.PgAgeRclone, error) {
 	s := h.R.Spec
-	if !providers.RunsVMBackups(s) {
-		return nil, fail(http.StatusConflict, "%s declares no pg-age-rclone backup: the VM runs none", s.Name)
+	if !providers.RunsBackups(s) {
+		return nil, fail(http.StatusConflict, "%s declares no pg-age-rclone backup: the install runs none", s.Name)
 	}
 	pg, err := providers.DecodeBackup(s.Backup)
 	if err != nil {
 		return nil, err
 	}
 	if h.R.Manifest.Artifacts.Images[backup.Key] == "" {
-		return nil, fail(http.StatusConflict, "this OS carries no backup runner")
+		return nil, fail(http.StatusConflict, "this release carries no backup runner")
 	}
 	return pg, nil
 }
@@ -372,6 +372,9 @@ func (h *Hostd) removeBackupConfig(w http.ResponseWriter, r *http.Request) {
 
 // checkSchedule asks systemd whether s is a calendar event it reads.
 func (h *Hostd) checkSchedule(ctx context.Context, s string) error {
+	if h.Docker && !h.systemdHost() {
+		return nil // no timer takes it: kept, unchecked
+	}
 	if _, err := h.Host.Run(ctx, Cmd{Args: []string{"systemd-analyze", "calendar", "--iterations", "1", "--", s}}); err != nil {
 		return fail(http.StatusBadRequest, "schedule %q is not a systemd calendar event (e.g. %q): %v", s, defaultBackupSchedule, err)
 	}
@@ -379,13 +382,21 @@ func (h *Hostd) checkSchedule(ctx context.Context, s string) error {
 }
 
 // backupTimer is the timer that runs the scheduled backup.
-func (h *Hostd) backupTimer() string { return h.R.Spec.Name + "-backup.timer" }
+func (h *Hostd) backupTimer() string {
+	if h.Docker {
+		return installUnit(h.R.Spec.Name, "backup", h.O.Dir) + ".timer"
+	}
+	return h.R.Spec.Name + "-backup.timer"
+}
 
 // applySchedule runs the timer on c's schedule, or stops it (nil). The timer is never enabled:
 // the daemon starts it, at each start and change, once the schedule's runtime drop-in is
 // written (the bundle's unit has the default), so no boot runs it on a schedule not the
 // operator's.
 func (h *Hostd) applySchedule(ctx context.Context, c *BackupConfig) error {
+	if h.Docker {
+		return h.dockerSchedule(ctx, c)
+	}
 	// A host without the timer (the daemon off the VM) has none to run.
 	if st, err := unitState(ctx, h.Host, h.backupTimer()); err != nil {
 		return err
@@ -852,7 +863,20 @@ func (h *Hostd) rcloneTo(ctx context.Context, in *Installer, dir, name string, s
 	if stdin != nil {
 		a = append(a, "-i")
 	}
-	a = append(append(a, in.imageRef("", backup.Key), "--config", "/config/rclone/rclone.conf"), args...)
+	prefix := ""
+	if env, err := in.open(); err == nil {
+		prefix, _ = env.Get("STOWAGE_REGISTRY")
+		// A Docker install pulls the runner again when the engine lost it (an image prune):
+		// with its images, as the install pulls them.
+		if h.Docker {
+			if _, ierr := in.O.Docker.Run(ctx, Cmd{Args: []string{"image", "inspect", "--format", "{{.Id}}", in.imageRef(prefix, backup.Key)}}); ierr != nil {
+				if err := in.fetchImages(ctx, env); err != nil {
+					return nil, fmt.Errorf("the backup runner: %w", err)
+				}
+			}
+		}
+	}
+	a = append(append(a, in.imageRef(prefix, backup.Key), "--config", "/config/rclone/rclone.conf"), args...)
 	out, err := in.O.Docker.Run(ctx, Cmd{Args: a, Stdin: stdin, Stdout: stdout})
 	if err != nil && ctx.Err() != nil {
 		// A stopped docker CLI leaves its container running.
@@ -1051,5 +1075,9 @@ func (h *Hostd) backupStatus(w http.ResponseWriter, r *http.Request) {
 	h.mu.Lock()
 	st.Running = h.job != nil && h.job.State == "running" && (h.job.Kind == "backup" || h.backingUp.Load())
 	h.mu.Unlock()
+	// A Docker install's reads are answered beside the process running its jobs.
+	if h.Docker && h.Run == "" && !st.Running {
+		st.Running = hostBusy(h.O.Dir)
+	}
 	reply(w, http.StatusOK, st)
 }

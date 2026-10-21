@@ -1033,3 +1033,34 @@ func TestTheVMInstallChecksItsDirectoryThenWaits(t *testing.T) {
 		t.Errorf("the probe left %v", entries)
 	}
 }
+
+// A first boot on another release's OS writes the settings' release's OS bundle and reboots into
+// it, installing nothing; a boot still on another OS after that stops.
+func TestTheFirstBootTakesTheReleasesOSFirst(t *testing.T) {
+	t.Parallel()
+	e := vmEnv(t, "1.0.0")
+	os1 := "sha256:" + strings.Repeat("a", 64)
+	with := settings(t, "tls: internal\nrelease:\n  version: 1.1.0\n  revision: 1\n  tag: 1.1.0\n  os: "+os1+"\n")
+	host := &fakeHost{}
+	in := e.installer(func(o *Options) { with(o); o.Host = host })
+	if err := in.Boot(context.Background()); err != nil {
+		t.Fatalf("%v\n%s", err, e.log)
+	}
+	if _, err := os.Stat(filepath.Join(e.dir, envName)); err == nil {
+		t.Fatal("installed on the other release's OS")
+	}
+	ran := host.calls()
+	if len(ran) != 2 || strings.Join(ran[0], " ") != "kairos-agent upgrade --source oci:"+in.R.Spec.Registry.Prefix+"/notes-os@"+os1 ||
+		strings.Join(ran[1], " ") != "systemctl reboot" {
+		t.Fatalf("ran %v", ran)
+	}
+	in = e.installer(func(o *Options) { with(o); o.Host = host })
+	if err := in.Boot(context.Background()); err == nil || !strings.Contains(err.Error(), "after 1.1.0's OS bundle was written and booted") {
+		t.Fatalf("second boot: %v", err)
+	}
+	// The release's own OS installs as ever.
+	same := settings(t, "tls: internal\nrelease:\n  version: 1.0.0\n  revision: 1\n  tag: 1.0.0\n  os: "+os1+"\ninputs:\n  APP_DOMAIN: app.example.org\n  API_DOMAIN: api.example.org\n")
+	if err := e.installer(same).Boot(context.Background()); err != nil {
+		t.Fatalf("own OS: %v\n%s", err, e.log)
+	}
+}

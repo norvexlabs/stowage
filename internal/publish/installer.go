@@ -268,11 +268,14 @@ type latest struct {
 	tag  name.Tag
 	repo string
 	want string // the pointer release's artifact; "" when it has none: the tag is removed
+	disk bool   // a disk's: it follows the channel's disk set, not the pointer
 }
 
 // latestTags are channel's floating tags for rel (nil: no release), none when channel does not
-// set latest. Every disk format is listed, so a format the project dropped loses its tag.
-func (p *Publisher) latestTags(channel string, rel *Ref) ([]latest, error) {
+// set latest: the installer's follows rel, each disk format's the channel's disk set
+// (currentDisks), which only a ship publishing disks moves. Every disk format is listed, so a
+// format the project dropped loses its tag.
+func (p *Publisher) latestTags(ctx context.Context, channel string, rel *Ref) ([]latest, error) {
 	if !p.Project.Spec.Channels[channel].Latest {
 		return nil, nil
 	}
@@ -284,14 +287,18 @@ func (p *Publisher) latestTags(channel string, rel *Ref) ([]latest, error) {
 	if err != nil {
 		return nil, err
 	}
-	out := []latest{{"installer", t, p.installerRepo(), a.Installer}}
+	out := []latest{{"installer", t, p.installerRepo(), a.Installer, false}}
 	if p.hasOS() {
+		cur, err := p.currentDisks(ctx, channel)
+		if err != nil {
+			return nil, err
+		}
 		for _, f := range spec.DiskFormats {
 			t, err := p.Registry.Tag(p.diskRepo(), release.DiskTag(LatestTag, f))
 			if err != nil {
 				return nil, err
 			}
-			out = append(out, latest{"disk " + f, t, p.diskRepo(), a.Disks[f]})
+			out = append(out, latest{"disk " + f, t, p.diskRepo(), cur.disks[f], true})
 		}
 	}
 	return out, nil
@@ -301,7 +308,7 @@ func (p *Publisher) latestTags(channel string, rel *Ref) ([]latest, error) {
 // afterwards: an existence check would pass on a stale tag. An artifact rel lacks removes its tag:
 // none is offered rather than another release's.
 func (p *Publisher) syncLatest(ctx context.Context, channel string, rel *Ref) error {
-	ls, err := p.latestTags(channel, rel)
+	ls, err := p.latestTags(ctx, channel, rel)
 	if err != nil {
 		return err
 	}
@@ -338,13 +345,20 @@ func (p *Publisher) syncTag(ctx context.Context, l latest, relTag string) error 
 	return nil
 }
 
-// dropLatest removes channel's floating tags.
+// dropLatest removes channel's installer latest tag; its disk tags follow its disk set, which a
+// channel left without a release keeps.
 func (p *Publisher) dropLatest(ctx context.Context, channel string) error {
-	ls, err := p.latestTags(channel, nil)
+	ls, err := p.latestTags(ctx, channel, nil)
 	if err != nil {
 		return err
 	}
 	for _, l := range ls {
+		if l.disk {
+			if err := p.syncTag(ctx, l, "the channel's disk set"); err != nil {
+				return err
+			}
+			continue
+		}
 		if err := p.dropTag(ctx, l); err != nil {
 			return err
 		}
@@ -357,7 +371,7 @@ func (p *Publisher) dropTag(ctx context.Context, l latest) error {
 		return err
 	}
 	p.logf("%s :%s removed", l.what, l.tag.TagStr())
-	return p.Registry.DeleteTag(ctx, l.tag)
+	return p.untag(ctx, l.tag)
 }
 
 // settleLatest puts the channel's floating tags right for its pointer, once a command has moved
@@ -398,7 +412,7 @@ func (p *Publisher) settleLatest(ctx context.Context, channel string, checked *R
 // of rel, the pointer's release, and is absent when there is no release (rel nil) or it lacks
 // that artifact.
 func (p *Publisher) verifyLatest(ctx context.Context, channel string, rel *Ref) error {
-	ls, err := p.latestTags(channel, rel)
+	ls, err := p.latestTags(ctx, channel, rel)
 	if err != nil {
 		return err
 	}
@@ -409,7 +423,10 @@ func (p *Publisher) verifyLatest(ctx context.Context, channel string, rel *Ref) 
 			return err
 		}
 		what := "the channel has no release"
-		if rel != nil {
+		switch {
+		case l.disk:
+			what = "the channel has no disk set of that format"
+		case rel != nil:
 			what = "the channel's release " + rel.Manifest.Tag + " has no " + l.what
 		}
 		switch {
@@ -419,7 +436,7 @@ func (p *Publisher) verifyLatest(ctx context.Context, channel string, rel *Ref) 
 		case d == nil:
 			problems = append(problems, fmt.Sprintf("%s is missing", l.tag))
 		case d.Digest.String() != l.want:
-			problems = append(problems, fmt.Sprintf("%s is %s, the channel's release %s has %s", l.tag, d.Digest, rel.Manifest.Tag, l.want))
+			problems = append(problems, fmt.Sprintf("%s is %s, the channel's %s is %s", l.tag, d.Digest, l.what, l.want))
 		}
 	}
 	if len(problems) > 0 {

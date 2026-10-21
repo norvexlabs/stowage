@@ -7,7 +7,9 @@ import (
 	"crypto/ed25519"
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/json"
 	"io"
+	"maps"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -78,6 +80,7 @@ func newVMCreatePulling(t *testing.T, pull spec.Provider, formats ...string) *vm
 		disks[f], v.disks[f] = h.String(), data
 	}
 	v.r.Manifest.Artifacts.Disks = disks
+	v.r.Manifest.Artifacts.OS = "sha256:" + strings.Repeat("0", 64)
 	return v
 }
 
@@ -448,7 +451,7 @@ func TestVMCreateRefusals(t *testing.T) {
 		opts    func(*Options)
 		want    string
 	}{
-		{"no disk", nil, nil, VMCreate{Platform: "truenas"}, nil, "publishes no disk image"},
+		{"no disk", nil, nil, VMCreate{Platform: "truenas"}, nil, "has no disk in"},
 		{"no platform", []string{"qcow2"}, nil, VMCreate{}, nil, "--platform is required (truenas, proxmox, libvirt)"},
 		{"platform without its format", []string{"qcow2"}, nil, VMCreate{Platform: "aws"}, nil, "--platform aws: notes 1.0.0 offers truenas, proxmox, libvirt"},
 		{"unknown platform", []string{"ova"}, nil, VMCreate{Platform: "virtualbox"}, nil, "offers vmware"},
@@ -655,5 +658,105 @@ func TestHostAndUserNamesAtTheirBounds(t *testing.T) {
 		if err := checkUser(v); (err == nil) != ok {
 			t.Errorf("user %q: %v", v, err)
 		}
+	}
+}
+
+// bootVia makes v's release one that published no disk: it records set as the disk set it boots,
+// and the channel's pointer is release 0.9.0, published with v's disks by stowage by.
+func bootVia(t *testing.T, v *vmCreate, set *release.BootDisks, by string) {
+	t.Helper()
+	ptr := *v.r.Manifest
+	ptr.ProjectVersion, ptr.Tag, ptr.StowageVersion, ptr.ReleaseSeq = "0.9.0", "0.9.0", by, 1
+	ptr.Artifacts.Images = maps.Clone(ptr.Artifacts.Images)
+	v.putRelease(ptr.Channel, &ptr)
+	v.r.Manifest.Artifacts.Disks, v.r.Manifest.Artifacts.BootDisks = nil, set
+}
+
+// A release that published no disk boots its channel's disk set: the one it records, else, gone,
+// the pointer's; its first boot takes the release's OS bundle.
+func TestVMCreateBootsTheChannelsDiskSet(t *testing.T) {
+	t.Parallel()
+	gone := &release.BootDisks{Release: "0.8.0", Stowage: "0.6.0", Disks: map[string]string{"qcow2": "sha256:" + strings.Repeat("e", 64)}}
+	for _, c := range []struct {
+		name string
+		set  *release.BootDisks
+	}{{"recorded", nil}, {"pointer's", gone}} {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			v := newVMCreate(t, "qcow2")
+			set := c.set
+			if set == nil {
+				set = &release.BootDisks{Release: "0.9.0", Stowage: "0.6.0", Disks: maps.Clone(v.r.Manifest.Artifacts.Disks)}
+			}
+			bootVia(t, v, set, "0.6.0")
+			err := v.create(VMCreate{Platform: "truenas", Hostname: "notes-1", User: "ops"}, func(o *Options) { o.TLS = "internal" })
+			if err != nil {
+				t.Fatalf("%v\n%s", err, v.log)
+			}
+			disk, _ := os.ReadFile(filepath.Join(v.out, "notes-1.0.0.qcow2")) // named by the disk's own title
+			if !bytes.Equal(disk, v.disks["qcow2"]) {
+				t.Fatalf("disk %q", disk)
+			}
+			ud, _, _ := readSeed(t, filepath.Join(v.out, "notes-1-seed.iso"))
+			st, _ := cloudSettings(t, ud)
+			m := v.r.Manifest
+			if r := st.Release; r == nil || *r != (OSRelease{m.ProjectVersion, m.Revision, m.Tag, m.Artifacts.OS}) {
+				t.Fatalf("release %+v", r)
+			}
+		})
+	}
+}
+
+// A release's own disk: the first boot installs from its OS, no release named.
+func TestVMCreateOfItsOwnDiskNamesNoRelease(t *testing.T) {
+	t.Parallel()
+	v := newVMCreate(t, "qcow2")
+	if err := v.create(VMCreate{Platform: "truenas", Hostname: "notes-1", User: "ops"}, func(o *Options) { o.TLS = "internal" }); err != nil {
+		t.Fatalf("%v\n%s", err, v.log)
+	}
+	ud, _, _ := readSeed(t, filepath.Join(v.out, "notes-1-seed.iso"))
+	if st, _ := cloudSettings(t, ud); st.Release != nil {
+		t.Fatalf("release %+v", st.Release)
+	}
+}
+
+// A disk set an older stowage published, whose first boot cannot take another release, is
+// refused; so is a release whose channel holds no disk.
+func TestVMCreateRefusesADiskSetThatCannotSwitch(t *testing.T) {
+	t.Parallel()
+	v := newVMCreate(t, "qcow2")
+	bootVia(t, v, &release.BootDisks{Release: "0.9.0", Stowage: "0.5.0", Disks: maps.Clone(v.r.Manifest.Artifacts.Disks)}, "0.5.0")
+	err := v.create(VMCreate{Platform: "truenas", Hostname: "notes-1", User: "ops"}, func(o *Options) { o.TLS = "internal" })
+	if err == nil || !strings.Contains(err.Error(), `published by stowage "0.5.0", whose first boot cannot take another release's OS`) {
+		t.Fatalf("got %v", err)
+	}
+	if _, err := os.Stat(v.out); err == nil {
+		t.Error("a refused run wrote", v.out)
+	}
+}
+
+// With neither the release's disks nor the pointer's there, the channel's disk set record
+// gives the set.
+func TestVMCreateBootsTheChannelsDiskSetRecord(t *testing.T) {
+	t.Parallel()
+	v := newVMCreate(t, "qcow2")
+	disks := maps.Clone(v.r.Manifest.Artifacts.Disks)
+	gone := &release.BootDisks{Release: "0.8.0", Stowage: "0.6.0", Disks: map[string]string{"qcow2": "sha256:" + strings.Repeat("e", 64)}}
+	bootVia(t, v, gone, "0.6.0")
+	// The pointer boots the same gone set.
+	ptr := *v.r.Manifest
+	ptr.Artifacts.Images = maps.Clone(ptr.Artifacts.Images)
+	v.putRelease(ptr.Channel, &ptr)
+	data, _ := json.Marshal(release.DiskSet{Channel: ptr.Channel, Release: "0.9.0", Stowage: "0.6.0", Disks: disks})
+	c := registry.New(nil)
+	tag, _ := c.Tag(v.prefix+"/notes-disk", release.DiskSetTag(ptr.Channel))
+	if _, err := c.PutArtifact(context.Background(), tag, registry.Artifact{Type: release.DiskSetMediaType, Data: data}); err != nil {
+		t.Fatal(err)
+	}
+	if err := v.create(VMCreate{Platform: "truenas", Hostname: "notes-1", User: "ops"}, func(o *Options) { o.TLS = "internal" }); err != nil {
+		t.Fatalf("%v\n%s", err, v.log)
+	}
+	if !strings.Contains(v.log.String(), "disk of 0.9.0") {
+		t.Errorf("log %s", v.log)
 	}
 }

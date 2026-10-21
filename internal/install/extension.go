@@ -31,6 +31,12 @@ func (in *Installer) Finished(ctx context.Context, shape string) {
 	if err != nil {
 		return
 	}
+	// The VM's watch is its host daemon's; a Docker install's is a timer of its own.
+	if shape == onDocker && !in.O.Preloaded {
+		if err := in.InstallWatch(ctx); err != nil {
+			in.O.logf("the disk-pressure watch could not be installed: %v", err)
+		}
+	}
 	if url := in.dockerEndpoint(env); url != "" {
 		if mode, _ := env.Get("STOWAGE_TLS_MODE"); mode == Loopback {
 			fmt.Fprintf(in.O.Out, "endpoint  %s (loopback: this machine only; another compose project's containers cannot reach it, a project using %s as an extension reaches it through a domain: a new install with --tls)\n", url, in.R.Spec.Name)

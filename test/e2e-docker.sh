@@ -5,7 +5,8 @@
 #   make e2e-docker        (builds ./bin/stowage first)
 #
 # Walks examples/minimal, with a real Postgres, through: ship 1.0.0 → the bootstrap one-liner
-# installs it → a re-run changes nothing → ship 2.0.0 (a migration) → `notes-stow upgrade --version
+# installs it → a re-run changes nothing → backups to a WebDAV server through the release's
+# runner, and a restore that brings the backup's data back → ship 2.0.0 (a migration) → `notes-stow upgrade --version
 # 2.0.0` fetches its installer and upgrades → rollback is allowed (1.0.0 reads the newer schema) →
 # ship 3.0.0 (a migration that is a rollback barrier) → upgrade → going back to 1.0.0 by upgrade
 # is refused, and rollback is refused naming the snapshot → `reset-db` wipes the data volumes and
@@ -60,6 +61,29 @@ sum=$(sha256sum "$D/.env" "$D/compose.yaml")
 "${CTL[@]}" --dir "$D" --no-input >"$WORK/rerun.log" 2>&1 || { cat "$WORK/rerun.log"; fail "re-run"; }
 [[ $(sha256sum "$D/.env" "$D/compose.yaml") == "$sum" ]] || fail "a re-run changed .env or compose.yaml"
 running 1.0.0 1
+
+step "backups on Docker: config, verify, run to WebDAV through the release's runner, list, status, restore"
+start_dav
+age_key
+project=$(project)
+pg() { docker ps --quiet --filter "label=com.docker.compose.project=$project" --filter label=com.docker.compose.service=postgres; }
+docker exec "$(pg)" psql -U notes -d notes -c 'CREATE TABLE e2e_backup (n int); INSERT INTO e2e_backup VALUES (1)' >/dev/null || fail "a table to back up"
+# The schedule is not tested here: the host's systemd is not this suite's (the units are unit-tested).
+"${CTL[@]}" backup config --dir "$D" --destination dav:backups --rclone-config "$DAV_CONF" --recipient "$AGE_RECIPIENT" >"$WORK/dbackup-config.txt" 2>&1 ||
+	{ cat "$WORK/dbackup-config.txt"; fail "backup config"; }
+"${CTL[@]}" backup verify --dir "$D" >"$WORK/dbackup-verify.txt" 2>&1 || { cat "$WORK/dbackup-verify.txt"; fail "backup verify"; }
+grep -q 'reachable and writable' "$WORK/dbackup-verify.txt" || { cat "$WORK/dbackup-verify.txt"; fail "backup verify did not reach the destination"; }
+"${CTL[@]}" backup run --dir "$D" >"$WORK/dbackup-run.txt" 2>&1 || { cat "$WORK/dbackup-run.txt"; fail "backup run"; }
+backups=("$WORK"/dav/backups/notes-full-*-1.0.0-r1.pgdump.age)
+[[ ${#backups[@]} == 1 && -s ${backups[0]} ]] || { ls -la "$WORK/dav/backups"; fail "no backup in the destination"; }
+check_backup "${backups[0]}" "$PG" e2e_backup
+"${CTL[@]}" backup list --dir "$D" | grep -q "^${backups[0]##*/} " || fail "backup list does not show the backup"
+"${CTL[@]}" backup status --dir "$D" | grep -q "^last  .*${backups[0]##*/}" || fail "backup status does not show the backup"
+docker exec "$(pg)" psql -U notes -d notes -c 'INSERT INTO e2e_backup VALUES (2)' >/dev/null || fail "a row after the backup"
+"${CTL[@]}" restore "${backups[0]##*/}" --dir "$D" --identity "$AGE_KEY" --yes >"$WORK/drestore.txt" 2>&1 || { cat "$WORK/drestore.txt"; fail "restore"; }
+[[ $(docker exec "$(pg)" psql -U notes -d notes -tAc 'SELECT count(*) FROM e2e_backup') == 1 ]] || fail "the restore did not bring the backup's data back"
+running 1.0.0 1
+"${CTL[@]}" backup config --dir "$D" --remove >/dev/null 2>&1 || fail "backup config --remove"
 
 step "ship 2.0.0, upgrade --version 2.0.0"
 release 2.0.0 '{"version": 2, "barriers": {}, "reads_newer": true}'

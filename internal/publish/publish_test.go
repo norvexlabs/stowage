@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -182,6 +183,10 @@ type env struct {
 	// cloud registers cloud images with cloudVars as the publisher's settings.
 	cloud     *fakeCloud
 	cloudVars map[string]map[string]string
+	// noDisks ships without publishing disks; refuseTagDelete makes the registry refuse deleting
+	// a manifest by tag (405), as a registry deleting by digest only does.
+	noDisks         bool
+	refuseTagDelete bool
 }
 
 // fakeSigner records signatures by digest reference.
@@ -223,6 +228,27 @@ func (f *fakeSigner) Verify(_ context.Context, d name.Digest) error {
 }
 
 // sign turns signing on in the project and gives the publisher a signer.
+// untagDigest deletes, in the in-memory registry h, the tags of the repository of r (a DELETE of
+// a manifest by digest) that hold that digest.
+func untagDigest(h http.Handler, r *http.Request) {
+	repo, digest, _ := strings.Cut(strings.TrimPrefix(r.URL.Path, "/v2/"), "/manifests/")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v2/"+repo+"/tags/list", nil))
+	var list struct{ Tags []string }
+	if json.Unmarshal(rec.Body.Bytes(), &list) != nil {
+		return
+	}
+	for _, t := range list.Tags {
+		head := httptest.NewRequest(http.MethodHead, "/v2/"+repo+"/manifests/"+t, nil)
+		head.Header.Set("Accept", "*/*")
+		hr := httptest.NewRecorder()
+		h.ServeHTTP(hr, head)
+		if hr.Header().Get("Docker-Content-Digest") == digest {
+			h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodDelete, "/v2/"+repo+"/manifests/"+t, nil))
+		}
+	}
+}
+
 func (e *env) sign() {
 	e.t.Helper()
 	testutil.Write(e.t, e.root, "keys/release.pub", readFile(e.t, "../../examples/full/keys/release-2026.pub"))
@@ -246,6 +272,13 @@ func newEnv(t *testing.T) *env {
 			http.Error(w, "denied", http.StatusForbidden)
 			return
 		}
+		if e.refuseTagDelete && r.Method == http.MethodDelete && strings.Contains(r.URL.Path, "/manifests/") &&
+			!strings.Contains(r.URL.Path, "/manifests/sha256:") {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			_, _ = io.WriteString(w, `{"errors":[{"code":"UNSUPPORTED","message":"delete a manifest by digest"}]}`)
+			return
+		}
 		if e.private != nil && r.Header.Get("Authorization") == "" &&
 			(r.URL.Path == "/v2/" || slices.ContainsFunc(e.private, func(f string) bool { return strings.Contains(r.URL.Path, f) })) {
 			if e.privateAs404 && r.URL.Path != "/v2/" {
@@ -261,6 +294,11 @@ func newEnv(t *testing.T) *env {
 		if e.failBlobs && r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/blobs/") {
 			http.Error(w, "denied", http.StatusForbidden)
 			return
+		}
+		if r.Method == http.MethodDelete && strings.Contains(r.URL.Path, "/manifests/sha256:") {
+			// A registry deletes a manifest's tags with it; the in-memory one keeps each tag as an
+			// entry of its own, so they are deleted here too.
+			untagDigest(reg, r)
 		}
 		reg.ServeHTTP(w, r)
 	}))
@@ -309,7 +347,7 @@ func (e *env) ship(channel string, revision int) (*Ref, error) {
 	e.t.Helper()
 	e.builder.built, e.disks.made = nil, nil
 	p, v := e.publisher()
-	return p.Ship(context.Background(), ShipOptions{Version: v, Channel: channel, Revision: revision})
+	return p.Ship(context.Background(), ShipOptions{Version: v, Channel: channel, Revision: revision, Disks: !e.noDisks})
 }
 
 func (e *env) mustShip(channel string, revision int) *Ref {
@@ -405,7 +443,9 @@ func TestVersionBumpRebuildsOnlyWhatReadsIt(t *testing.T) {
 	eq(t, "seq", second.Manifest.ReleaseSeq, 2)
 	eq(t, "pointer", e.digest("notes-release", "stable"), second.Digest.String())
 
-	// Re-shipping the older version leaves the pointer on the later release.
+	// Re-shipping the older version (its disks a newer set replaced: without --disks) leaves the
+	// pointer on the later release.
+	e.noDisks = true
 	e.bump("1.0.0")
 	testutil.Write(t, e.root, "changes/1.0.0.md", "### Added\n- First release: notes with attachments, one administrator created at install.\n")
 	old := e.mustShip("stable", 1)
@@ -965,14 +1005,14 @@ func TestASignedProjectSignsEveryArtifactBeforeItsTagMoves(t *testing.T) {
 	eq(t, "manifest signed", e.signedRef("notes-release", r.Digest.String()), true)
 	eq(t, "os bundle signed", e.signedRef("notes-os", r.Manifest.Artifacts.OS), true)
 	eq(t, "disk signed", e.signedRef("notes-disk", r.Manifest.Artifacts.Disks["qcow2"]), true)
-	eq(t, "signatures", e.signer.signs, 10)
+	eq(t, "signatures", e.signer.signs, 11) // and the channel's disk set record
 
 	e.mustShip("stable", 1)
-	eq(t, "a re-ship signs nothing", e.signer.signs, 10)
+	eq(t, "a re-ship signs nothing", e.signer.signs, 11)
 	e.signer.onSign = nil
 	delete(e.signer.sigs, e.host+"/acme/notes/notes-release@"+r.Digest.String())
 	eq(t, "a lost signature is made again", e.mustShip("stable", 1).Digest, r.Digest)
-	eq(t, "signatures", e.signer.signs, 11)
+	eq(t, "signatures", e.signer.signs, 12)
 	p, _ := e.publisher()
 	if _, err := p.Verify(context.Background(), "stable", "", 1); err != nil {
 		t.Fatal(err)

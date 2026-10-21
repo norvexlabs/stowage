@@ -49,6 +49,8 @@ func laterSchema(a, b string) bool {
 type schema struct {
 	in    *Installer
 	stack *EnvFile
+	// sql, when set, runs a query in its place (on Kubernetes, in a pod).
+	sql func(ctx context.Context, q string) (string, error)
 }
 
 // on reports whether the release checks schemas at all.
@@ -175,6 +177,9 @@ func (s schema) readsNewer(ctx context.Context, prev *EnvFile, now string) (bool
 
 // psql runs a query in the database service as the migrate role and returns its one value.
 func (s schema) psql(ctx context.Context, q string) (string, error) {
+	if s.sql != nil {
+		return s.sql(ctx, q)
+	}
 	d := s.in.R.Spec.DB()
 	out, err := s.in.Compose(ctx, s.stack, nil, "exec", "-T", d.Service,
 		"psql", "-X", "-q", "-t", "-A", "-v", "ON_ERROR_STOP=1", "-U", d.Roles.Migrate, "-d", d.Name, "-c", q)

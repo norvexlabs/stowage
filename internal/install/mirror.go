@@ -175,17 +175,41 @@ func holdsAll(have, want []byte) bool {
 	return len(w) > 0
 }
 
-// MirrorExport writes the channel's latest release into one archive at file (an OCI image layout,
-// as a tar): its release manifest under its tag and the channel's, its images, installer, chart,
-// OS bundle and the disks of the formats given (all when nil), each by digest with its
-// signatures. It reads the project's registry with the pull account. An existing file is
-// refused.
-func (in *Installer) MirrorExport(ctx context.Context, channel, file string, formats []string) error {
+// MirrorExportRequest is what `mirror export` exports: the channel's latest release, or version
+// Version (at Revision, 0 the latest), into File; the VM disks of Formats (nil all, empty none),
+// and only what Shapes run (nil: every shape of the project).
+type MirrorExportRequest struct {
+	Channel, File string
+	Version       string
+	Revision      int
+	Formats       []string
+	Shapes        []string
+}
+
+// MirrorExport writes one release of a channel into one archive (an OCI image layout, as a tar):
+// its release manifest under its tag and the channel's, its images, installer, chart (the
+// kubernetes shape), OS bundle and the disks of the formats given (the kairos shape: the disk set
+// it boots, its own or its channel's), each by digest with its signatures. It reads the project's
+// registry with the pull account. An existing file is refused.
+func (in *Installer) MirrorExport(ctx context.Context, r MirrorExportRequest) error {
 	o, name := &in.O, in.R.Spec.Name
 	in.givenCA = true
-	channel = cmp.Or(channel, in.R.Manifest.Channel)
+	channel := cmp.Or(r.Channel, in.R.Manifest.Channel)
 	if !lint.ChannelName(channel) {
 		return fmt.Errorf("%q is not a channel name", channel)
+	}
+	shapes := map[string]bool{}
+	for _, sh := range in.R.Spec.Shapes.Names() {
+		shapes[sh] = r.Shapes == nil
+	}
+	for _, sh := range r.Shapes {
+		if _, ok := shapes[sh]; !ok {
+			return fmt.Errorf("--shapes: %s has no shape %s (it has: %s)", name, sh, strings.Join(in.R.Spec.Shapes.Names(), ", "))
+		}
+		shapes[sh] = true
+	}
+	if !shapes["kairos"] && len(r.Formats) > 0 {
+		return errors.New("--disks: the kairos shape is not exported (--shapes), so no disk is")
 	}
 	prefix := in.R.Spec.Registry.Prefix
 	c, err := in.registryClient(prefix)
@@ -193,35 +217,47 @@ func (in *Installer) MirrorExport(ctx context.Context, channel, file string, for
 		return err
 	}
 	relRepo := name + "-release"
-	ptr, err := c.Tag(prefix+"/"+relRepo, channel)
-	if err != nil {
-		return err
-	}
-	a, ptrDigest, err := c.GetArtifact(ctx, ptr, release.MediaType)
-	if err != nil {
-		return err
-	}
-	if a == nil {
-		return fmt.Errorf("the channel %s has no release in %s", channel, prefix)
-	}
-	m, err := release.Decode(a.Data)
-	if err != nil {
-		return fmt.Errorf("the release on %s could not be read (from another Stowage? use that release's installer): %w", channel, err)
-	}
-	if m.Name != name || m.Channel != channel {
-		return fmt.Errorf("the release on %s is %s's on %s, not %s's", channel, m.Name, m.Channel, name)
+	var m *release.Manifest
+	var d v1.Hash
+	if r.Version == "" {
+		ptr, err := c.Tag(prefix+"/"+relRepo, channel)
+		if err != nil {
+			return err
+		}
+		a, _, err := c.GetArtifact(ctx, ptr, release.MediaType)
+		if err != nil {
+			return err
+		}
+		if a == nil {
+			return fmt.Errorf("the channel %s has no release in %s", channel, prefix)
+		}
+		if m, err = release.Decode(a.Data); err != nil {
+			return fmt.Errorf("the release on %s could not be read (from another Stowage? use that release's installer): %w", channel, err)
+		}
+		if m.Name != name || m.Channel != channel {
+			return fmt.Errorf("the release on %s is %s's on %s, not %s's", channel, m.Name, m.Channel, name)
+		}
+	} else {
+		trust, err := trusted("this installer", in.R.Keys)
+		if err != nil {
+			return err
+		}
+		if m, err = findRevision(ctx, c, prefix, name, channel, r.Version, r.Revision, trust, o.logf); err != nil {
+			return err
+		}
 	}
 	tag, err := c.Tag(prefix+"/"+relRepo, m.Tag)
 	if err != nil {
 		return err
 	}
-	d, err := c.Head(ctx, tag)
+	hd, err := c.Head(ctx, tag)
 	if err != nil {
 		return err
 	}
-	if d == nil {
+	if hd == nil {
 		return fmt.Errorf("%s: the channel's release has no tag of its own", tag)
 	}
+	d = hd.Digest
 	var entries []registry.Entry
 	for _, k := range sortedKeys(m.Artifacts.Images) {
 		entries = append(entries, registry.Entry{Repo: name + "-" + k, Tag: m.Tag, Digest: m.Artifacts.Images[k]})
@@ -229,27 +265,40 @@ func (in *Installer) MirrorExport(ctx context.Context, channel, file string, for
 	if m.Artifacts.Installer != "" {
 		entries = append(entries, registry.Entry{Repo: name + "-installer", Tag: m.Tag, Digest: m.Artifacts.Installer})
 	}
-	if ch := m.Artifacts.Chart; ch != nil {
+	if ch := m.Artifacts.Chart; ch != nil && shapes["kubernetes"] {
 		entries = append(entries, registry.Entry{Repo: ch.Repository, Tag: ch.Version, Digest: ch.Digest})
 	}
-	if m.Artifacts.OS != "" {
+	if m.Artifacts.OS != "" && shapes["kairos"] {
 		entries = append(entries, registry.Entry{Repo: name + "-os", Tag: m.Tag, Digest: m.Artifacts.OS})
 	}
-	all := sortedKeys(m.Artifacts.Disks)
-	if formats == nil {
+	bootTag, disks := m.Artifacts.Boot(m.Tag)
+	all := sortedKeys(disks)
+	formats := r.Formats
+	if formats == nil && shapes["kairos"] {
 		formats = all
 	}
 	for _, f := range formats {
 		if !slices.Contains(all, f) {
 			return fmt.Errorf("--disks: %s %s has no %s disk (it has: %s)", name, m.Tag, f, cmp.Or(strings.Join(all, ", "), "none"))
 		}
-		entries = append(entries, registry.Entry{Repo: name + "-disk", Tag: release.DiskTag(m.Tag, f), Digest: m.Artifacts.Disks[f]})
+		ref, err := c.Digest(prefix+"/"+name+"-disk", disks[f])
+		if err != nil {
+			return err
+		}
+		if have, err := c.Head(ctx, ref); err != nil {
+			return err
+		} else if have == nil {
+			return fmt.Errorf("--disks: the %s disk %s %s boots (%s's) is no longer published: a newer disk set replaced it; export the channel's latest release for a VM, or give --disks none", f, name, m.Tag, bootTag)
+		}
+		entries = append(entries, registry.Entry{Repo: name + "-disk", Tag: release.DiskTag(bootTag, f), Digest: disks[f]})
 	}
 	// The release last, its channel's tag after it: an import pushes in this order, so a mirror
-	// never names a release whose artifacts it does not hold yet.
+	// never names a release whose artifacts it does not hold yet. The channel's tag holds the
+	// release exported.
 	entries = append(entries,
-		registry.Entry{Repo: relRepo, Tag: m.Tag, Digest: d.Digest.String()},
-		registry.Entry{Repo: relRepo, Tag: channel, Digest: ptrDigest.String()})
+		registry.Entry{Repo: relRepo, Tag: m.Tag, Digest: d.String()},
+		registry.Entry{Repo: relRepo, Tag: channel, Digest: d.String()})
+	file := r.File
 	file = cmp.Or(file, fmt.Sprintf("%s-%s.oci.tar", name, m.Tag))
 	if _, err := os.Lstat(file); err == nil {
 		return fmt.Errorf("%s exists: move it away, or give another --output", file)
@@ -413,8 +462,9 @@ func releaseTags(a *registry.Archive, m *release.Manifest, h v1.Hash) error {
 	if m.Artifacts.OS != "" {
 		want[name+"-os:"+m.Tag] = m.Artifacts.OS
 	}
-	for f, d := range m.Artifacts.Disks {
-		want[name+"-disk:"+release.DiskTag(m.Tag, f)] = d
+	bootTag, disks := m.Artifacts.Boot(m.Tag)
+	for f, d := range disks {
+		want[name+"-disk:"+release.DiskTag(bootTag, f)] = d
 	}
 	if ch := m.Artifacts.Chart; ch != nil {
 		want[ch.Repository+":"+ch.Version] = ch.Digest

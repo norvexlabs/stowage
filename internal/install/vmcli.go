@@ -487,6 +487,17 @@ func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(
 		err := c.do(cmd.Context(), http.MethodPost, "/v1/secrets/export", SecretsExportRequest{Recipients: recipients}, &out)
 		return []byte(out.File), err
 	})
+	restore := restoreCommand(c, name, "sudo "+c.ctl+" install", stderr, terminal)
+	root.AddCommand(prov, updates, upgrade, rollback, reset, secrets, restore, networkCommand(c, name, stdout), backupCommand(c, name, stdout, stderr),
+		power("reboot", "Reboot the VM", "/v1/reboot"),
+		power("shutdown", "Power the VM off", "/v1/shutdown"))
+	return root
+}
+
+// restoreCommand is `restore OBJECT`, asking the host daemon c reaches; install names the command
+// that installs.
+func restoreCommand(c *hostClient, name, install string, stderr io.Writer, terminal func(accessible bool) Prompter) *cobra.Command {
+	var yes, accessible bool
 	var identity string
 	restore := &cobra.Command{
 		Use:   "restore OBJECT",
@@ -499,7 +510,7 @@ func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(
 				return err
 			}
 			if st.Installed == nil {
-				return fmt.Errorf("%s is not installed yet: `sudo %s install` installs it", name, c.ctl)
+				return fmt.Errorf("%s is not installed yet: `%s` installs it", name, install)
 			}
 			key, err := readFileOrStdin(identity, cmd.InOrStdin())
 			if err != nil {
@@ -531,10 +542,7 @@ func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(
 	restore.Flags().StringVar(&identity, "identity", "-", "the age identity file that decrypts the backup; - for standard input")
 	restore.Flags().BoolVarP(&yes, "yes", "y", false, "restore without asking")
 	restore.Flags().BoolVar(&accessible, "accessible", false, "confirm with a plain line prompt")
-	root.AddCommand(prov, updates, upgrade, rollback, reset, secrets, restore, networkCommand(c, name, stdout), backupCommand(c, name, stdout, stderr),
-		power("reboot", "Reboot the VM", "/v1/reboot"),
-		power("shutdown", "Power the VM off", "/v1/shutdown"))
-	return root
+	return restore
 }
 
 // socketClient is an HTTP client that dials the unix socket *path.
@@ -668,6 +676,12 @@ func (c *hostClient) status(ctx context.Context, asJSON bool) error {
 		}
 		if l := p.Last; l != nil {
 			fmt.Fprintf(c.out, "           last POST at %s (%s, %.1f%%): %s\n", l.At.Format(time.RFC3339), l.Level, l.UsedPct, l.Result)
+		}
+	}
+	if ct := st.Cert; ct != nil {
+		fmt.Fprintf(c.out, "cert       %s, valid until %s (%d days)\n", ct.Subject, ct.NotAfter.Format(time.DateOnly), ct.DaysLeft)
+		if ct.Warning != "" {
+			fmt.Fprintf(c.out, "           warning: %s\n", ct.Warning)
 		}
 	}
 	if st.RebootPending {

@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -82,7 +83,7 @@ func TestMirrorExportImportCarriesTheChannelsLatestRelease(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(v.dir, RegistryCAFile), []byte("not a CA"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := in.MirrorExport(ctx, "", file, []string{"qcow2"}); err != nil {
+	if err := in.MirrorExport(ctx, MirrorExportRequest{Channel: "", File: file, Formats: []string{"qcow2"}}); err != nil {
 		t.Fatalf("%v\n%s", err, v.log)
 	}
 	// The release comes last, its channel's tag after it.
@@ -109,7 +110,7 @@ func TestMirrorExportImportCarriesTheChannelsLatestRelease(t *testing.T) {
 	if !strings.Contains(v.out2(), "Exported notes 1.0.0 (revision 1, 1.0.0-1) to "+file) {
 		t.Errorf("out: %s", v.out)
 	}
-	if err := in.MirrorExport(ctx, "", file, nil); err == nil || !strings.Contains(err.Error(), "exists") {
+	if err := in.MirrorExport(ctx, MirrorExportRequest{Channel: "", File: file, Formats: nil}); err == nil || !strings.Contains(err.Error(), "exists") {
 		t.Fatalf("an existing archive: %v", err)
 	}
 	to := mirrorRegistry(t)
@@ -146,20 +147,20 @@ func TestMirrorRefusals(t *testing.T) {
 	ctx := context.Background()
 	in := v.installer(nil)
 	dir := t.TempDir()
-	if err := in.MirrorExport(ctx, "", filepath.Join(dir, "a.tar"), []string{"vhd"}); err == nil || !strings.Contains(err.Error(), "no vhd disk (it has: qcow2)") {
+	if err := in.MirrorExport(ctx, MirrorExportRequest{Channel: "", File: filepath.Join(dir, "a.tar"), Formats: []string{"vhd"}}); err == nil || !strings.Contains(err.Error(), "no vhd disk (it has: qcow2)") {
 		t.Errorf("unknown format: %v", err)
 	}
-	if err := in.MirrorExport(ctx, "edge", filepath.Join(dir, "a.tar"), nil); err == nil || !strings.Contains(err.Error(), "the channel edge has no release") {
+	if err := in.MirrorExport(ctx, MirrorExportRequest{Channel: "edge", File: filepath.Join(dir, "a.tar"), Formats: nil}); err == nil || !strings.Contains(err.Error(), "the channel edge has no release") {
 		t.Errorf("empty channel: %v", err)
 	}
-	if err := in.MirrorExport(ctx, "Not A Channel", filepath.Join(dir, "a.tar"), nil); err == nil {
+	if err := in.MirrorExport(ctx, MirrorExportRequest{Channel: "Not A Channel", File: filepath.Join(dir, "a.tar"), Formats: nil}); err == nil {
 		t.Error("exported a channel of no valid name")
 	}
 	if _, err := os.Stat(filepath.Join(dir, "a.tar")); err == nil {
 		t.Error("a refused export left a file")
 	}
 	file := filepath.Join(dir, "ok.tar")
-	if err := in.MirrorExport(ctx, "", file, []string{}); err != nil {
+	if err := in.MirrorExport(ctx, MirrorExportRequest{Channel: "", File: file, Formats: []string{}}); err != nil {
 		t.Fatal(err)
 	}
 	if err := in.MirrorImport(ctx, file, "not a prefix", false); err == nil || !strings.Contains(err.Error(), "--to") {
@@ -330,7 +331,7 @@ func TestMirrorImportRefusesAnImageThisCtlDoesNotKnow(t *testing.T) {
 	v.putRelease(next.Channel, &next)
 	file := filepath.Join(t.TempDir(), "next.tar")
 	in := v.installer(nil)
-	if err := in.MirrorExport(ctx, "", file, []string{}); err != nil {
+	if err := in.MirrorExport(ctx, MirrorExportRequest{Channel: "", File: file, Formats: []string{}}); err != nil {
 		t.Fatal(err)
 	}
 	if err := in.MirrorImport(ctx, file, mirrorRegistry(t), false); err == nil || !strings.Contains(err.Error(), "has the image admin-release, which this notes-stow does not know") {
@@ -538,5 +539,123 @@ func TestAVMInstallFromAMirrorRunsThePreloadedImagesAndRecordsTheMirror(t *testi
 	want, _ := os.ReadFile(ca)
 	if got, err := os.ReadFile(filepath.Join(e.dir, RegistryCAFile)); err != nil || !bytes.Equal(got, want) {
 		t.Errorf("recorded CA: %v", err)
+	}
+}
+
+// archived lists an archive's tagged manifests as repository:tag.
+func archived(t *testing.T, file string) []string {
+	t.Helper()
+	a, err := registry.ReadArchive(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	var out []string
+	for _, d := range a.Manifests {
+		if tag := d.Annotations[registry.RefNameAnnotation]; tag != "" {
+			out = append(out, d.Annotations[registry.RepositoryAnnotation]+":"+tag)
+		}
+	}
+	return out
+}
+
+// --shapes docker leaves the OS bundle, the disks and the chart out; the archive still imports.
+func TestMirrorExportOfTheShapesASiteRuns(t *testing.T) {
+	t.Parallel()
+	v := newVMCreate(t, "qcow2")
+	m := withDisks(t, v)
+	ctx := context.Background()
+	in := v.installer(nil)
+	file := filepath.Join(t.TempDir(), "docker.tar")
+	if err := in.MirrorExport(ctx, MirrorExportRequest{File: file, Shapes: []string{"docker"}}); err != nil {
+		t.Fatalf("%v\n%s", err, v.log)
+	}
+	for _, e := range archived(t, file) {
+		if strings.HasPrefix(e, "notes-os:") || strings.HasPrefix(e, "notes-disk:") || strings.HasPrefix(e, "charts/") {
+			t.Errorf("exported %s", e)
+		}
+	}
+	if err := in.MirrorImport(ctx, file, mirrorRegistry(t), false); err != nil {
+		t.Fatalf("import: %v", err)
+	}
+	if err := in.MirrorExport(ctx, MirrorExportRequest{File: filepath.Join(t.TempDir(), "x.tar"), Shapes: []string{"docker"}, Formats: []string{"qcow2"}}); err == nil || !strings.Contains(err.Error(), "the kairos shape is not exported") {
+		t.Errorf("disks without kairos: %v", err)
+	}
+	if err := in.MirrorExport(ctx, MirrorExportRequest{File: filepath.Join(t.TempDir(), "x.tar"), Shapes: []string{"vms"}}); err == nil || !strings.Contains(err.Error(), "has no shape vms") {
+		t.Errorf("unknown shape: %v", err)
+	}
+	all := filepath.Join(t.TempDir(), "all.tar")
+	if err := in.MirrorExport(ctx, MirrorExportRequest{File: all}); err != nil {
+		t.Fatal(err)
+	}
+	if got := archived(t, all); !slices.Contains(got, "notes-os:"+m.Tag) || !slices.Contains(got, "notes-disk:"+release.DiskTag(m.Tag, "qcow2")) {
+		t.Errorf("every shape: %v", got)
+	}
+}
+
+// --version exports an earlier release of the channel, under the channel's tag too; a release
+// that published no disk carries the disk set it boots.
+func TestMirrorExportOfAnEarlierRelease(t *testing.T) {
+	t.Parallel()
+	v := newVMCreate(t, "qcow2")
+	first := withDisks(t, v)
+	later := *first
+	later.ProjectVersion, later.Tag, later.ReleaseSeq = "1.1.0", "1.1.0-1", first.ReleaseSeq+1
+	later.Artifacts.Disks = nil
+	later.Artifacts.BootDisks = &release.BootDisks{Release: first.Tag, Stowage: "0.6.0", Disks: first.Artifacts.Disks}
+	v.putRelease(later.Tag, &later)
+	v.putRelease(later.Channel, &later)
+	ctx := context.Background()
+	in := v.installer(nil)
+	old := filepath.Join(t.TempDir(), "old.tar")
+	if err := in.MirrorExport(ctx, MirrorExportRequest{File: old, Version: "1.0.0"}); err != nil {
+		t.Fatalf("%v\n%s", err, v.log)
+	}
+	if got := archived(t, old); !slices.Contains(got, "notes-release:"+first.Tag) || slices.Contains(got, "notes-release:"+later.Tag) {
+		t.Errorf("the earlier release: %v", got)
+	}
+	to := mirrorRegistry(t)
+	if err := in.MirrorImport(ctx, old, to, false); err != nil {
+		t.Fatalf("import: %v", err)
+	}
+	c := registry.New(authn.NewMultiKeychain())
+	ptr, _ := c.Tag(to+"/notes-release", first.Channel)
+	if mm, _, err := readRelease(ctx, c, to+"/notes-release", first.Channel); err != nil || mm == nil || mm.Tag != first.Tag {
+		t.Fatalf("%s: %v %v", ptr, mm, err)
+	}
+	cur := filepath.Join(t.TempDir(), "cur.tar")
+	if err := in.MirrorExport(ctx, MirrorExportRequest{File: cur}); err != nil {
+		t.Fatal(err)
+	}
+	if got := archived(t, cur); !slices.Contains(got, "notes-disk:"+release.DiskTag(first.Tag, "qcow2")) {
+		t.Errorf("the boot disk set: %v", got)
+	}
+	if err := in.MirrorImport(ctx, cur, to, false); err != nil {
+		t.Fatalf("import of the later release with its boot disks: %v", err)
+	}
+	if err := in.MirrorExport(ctx, MirrorExportRequest{File: filepath.Join(t.TempDir(), "x.tar"), Version: "9.9.9"}); err == nil || !strings.Contains(err.Error(), "is not published") {
+		t.Errorf("unknown version: %v", err)
+	}
+}
+
+// --version V --revision N exports that revision, not only V's latest.
+func TestMirrorExportOfAnEarlierRevision(t *testing.T) {
+	t.Parallel()
+	v := newVMCreate(t, "qcow2")
+	first := withDisks(t, v)
+	second := *first
+	second.Revision, second.Tag, second.ReleaseSeq = 2, first.Tag+"-r2", first.ReleaseSeq+1
+	v.putRelease(second.Tag, &second)
+	v.putRelease(second.Channel, &second)
+	in := v.installer(nil)
+	file := filepath.Join(t.TempDir(), "r1.tar")
+	if err := in.MirrorExport(context.Background(), MirrorExportRequest{File: file, Version: first.ProjectVersion, Revision: 1}); err != nil {
+		t.Fatalf("%v\n%s", err, v.log)
+	}
+	if got := archived(t, file); !slices.Contains(got, "notes-release:"+first.Tag) {
+		t.Errorf("revision 1: %v", got)
+	}
+	if err := in.MirrorExport(context.Background(), MirrorExportRequest{File: filepath.Join(t.TempDir(), "x.tar"), Version: first.ProjectVersion, Revision: 3}); err == nil || !strings.Contains(err.Error(), "(revision 3) is not published") {
+		t.Errorf("revision 3: %v", err)
 	}
 }

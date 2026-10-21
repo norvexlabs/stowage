@@ -76,6 +76,9 @@ func (h *Hostd) pressureHook() *spec.DiskPressure {
 // the VM the persistent partition, which also holds Docker's volumes (Kairos bind-mounts /var/lib
 // from it).
 func (h *Hostd) diskPath() string {
+	if h.DiskDir != "" {
+		return h.DiskDir
+	}
 	dir, err := filepath.Abs(h.O.Dir)
 	if err != nil {
 		dir = h.O.Dir
@@ -179,9 +182,13 @@ func (h *Hostd) pressureCheck(ctx context.Context, dp *spec.DiskPressure) bool {
 		return false // the daemon stops: the check was cut off, not refused
 	}
 	h.O.logf("disk pressure %s, %.1f%% used: POST %s: %s", level, used, dp.Post, result)
+	post := PressurePost{At: time.Now().UTC(), Level: level, UsedPct: used, Result: result, OK: ok}
 	h.pressMu.Lock()
-	h.lastPost = &PressurePost{At: time.Now().UTC(), Level: level, UsedPct: used, Result: result, OK: ok}
+	h.lastPost = &post
 	h.pressMu.Unlock()
+	if h.Docker {
+		h.savePressure(post)
+	}
 	return again
 }
 
@@ -266,6 +273,9 @@ func (h *Hostd) pressurePost(ctx context.Context, dp *spec.DiskPressure, body Pr
 // pressureBanner writes text as the disk banner, or removes it when text is empty; the login
 // screen is reloaded only when the banner changed.
 func (h *Hostd) pressureBanner(ctx context.Context, text string) {
+	if h.Docker {
+		return // a Docker host's console is not the install's
+	}
 	p := filepath.Join(cmp.Or(h.Issue, "/etc/issue.d"), "08-"+h.R.Spec.Name+"-disk.issue")
 	old, err := os.ReadFile(p)
 	switch {

@@ -193,6 +193,12 @@ func (in *Installer) Upgrade(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	in.dropped = removedBy(kept, in.R)
+	for _, k := range in.dropped.inputs {
+		if _, ok := env.Get(k); ok {
+			o.logf("input %s is not in %s %s: dropped", k, name, m.ProjectVersion)
+		}
+	}
 	next, secrets, err := in.upgradeEnv(env, mode, added, values)
 	if err != nil {
 		return err
@@ -221,7 +227,7 @@ func (in *Installer) Upgrade(ctx context.Context) error {
 	st := state{ProjectVersion: cur}
 	st.Revision, _ = strconv.Atoi(rev)
 	if in.schemaOn() {
-		st.Schema, err = (schema{in, env}).current(ctx, next)
+		st.Schema, err = (schema{in: in, stack: env}).current(ctx, next)
 		if ctx.Err() == nil && err != nil {
 			o.logf("the schema version could not be read (%v): a rollback will not be checked against it", err)
 		}
@@ -359,6 +365,9 @@ func (in *Installer) upgradeEnv(env *EnvFile, mode string, added []input, values
 	s := in.R.Spec
 	next := NewEnvFile()
 	for _, k := range env.Keys() {
+		if slices.Contains(in.dropped.inputs, k) {
+			continue
+		}
 		v, _ := env.Get(k)
 		next.Set(k, v)
 	}
@@ -462,6 +471,10 @@ func (in *Installer) keepPrev(env *EnvFile, st state) error {
 	if err := env.WriteFile(filepath.Join(tmp, envName)); err != nil {
 		return err
 	}
+	// What the hook returned, which a rollback takes back what the upgrade dropped from.
+	if err := copyFile(in.path(ProvisionEnv), filepath.Join(tmp, ProvisionEnv), 0o600); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
 	raw, err := json.MarshalIndent(st, "", "  ")
 	if err != nil {
 		return err
@@ -483,6 +496,37 @@ func copyFile(src, dst string, mode os.FileMode) error {
 	}
 	defer f.Close()
 	return writeAtomic(dst, f, mode, nil)
+}
+
+// restoreReturned takes back, from what the hook returned when the previous release ran (kept),
+// the keys the hook's record cur lacks: what an upgrade dropped. Nothing is kept: nothing to do.
+func restoreReturned(kept, cur string) error {
+	prev, err := ReadEnvFile(kept)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	now, err := ReadEnvFile(cur)
+	if errors.Is(err, os.ErrNotExist) {
+		now, err = NewEnvFile(), nil
+	}
+	if err != nil {
+		return err
+	}
+	changed := false
+	for _, k := range prev.Keys() {
+		if _, ok := now.Get(k); !ok {
+			v, _ := prev.Get(k)
+			now.Set(k, v)
+			changed = true
+		}
+	}
+	if !changed {
+		return nil
+	}
+	return now.WriteFile(cur)
 }
 
 // releaseKeys are the recorded values a release sets: a rollback takes them back from the
@@ -635,6 +679,9 @@ func (in *Installer) Rollback(ctx context.Context) error {
 	if err := rolled.WriteFile(in.path(envName)); err != nil {
 		return err
 	}
+	if err := restoreReturned(filepath.Join(prev, ProvisionEnv), in.path(ProvisionEnv)); err != nil {
+		return err
+	}
 	in.forgetChanges()
 	if err := copyFile(filepath.Join(prev, in.R.Ctl()), in.ctl(), 0o755); err != nil {
 		return err
@@ -671,7 +718,7 @@ func (in *Installer) rollbackCheck(ctx context.Context, back *Installer, env, pr
 	if !schemaVersion.MatchString(st.Schema) {
 		return unchecked("the schema version recorded before the upgrade, %q, is not a migration number", st.Schema)
 	}
-	s := schema{in, env}
+	s := schema{in: in, stack: env}
 	now, err := s.current(ctx, env)
 	if err != nil {
 		return unchecked("the schema version could not be read (%v)", err)
@@ -696,7 +743,7 @@ func (in *Installer) rollbackCheck(ctx context.Context, back *Installer, env, pr
 	if !back.schemaOn() {
 		return unchecked("%s declares no schema compatibility", st.ProjectVersion)
 	}
-	reads, err := (schema{back, env}).readsNewer(ctx, prevEnv, now)
+	reads, err := (schema{in: back, stack: env}).readsNewer(ctx, prevEnv, now)
 	if err != nil {
 		return unchecked("whether %s reads the newer schema %s is not known (%v)", st.ProjectVersion, now, err)
 	}

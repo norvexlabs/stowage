@@ -26,6 +26,7 @@ func hookCmd(o *options) *cobra.Command {
 
 func postCommitCmd(o *options) *cobra.Command {
 	var channel, ship, commit string
+	var disks bool
 	c := &cobra.Command{
 		Use:   "post-commit",
 		Short: "When HEAD moved the version, start its ship in the background (always exits 0)",
@@ -35,9 +36,9 @@ func postCommitCmd(o *options) *cobra.Command {
 				if ship == "" || commit == "" {
 					return errors.New("--ship and --commit go together")
 				}
-				return o.hookShip(cmd.Context(), channel, ship, commit)
+				return o.hookShip(cmd.Context(), channel, ship, commit, disks)
 			}
-			if err := o.postCommit(channel); err != nil {
+			if err := o.postCommit(channel, disks || o.envDisks()); err != nil {
 				fmt.Fprintf(o.err, "stowage hook: %v\n", err)
 			}
 			return nil
@@ -46,12 +47,13 @@ func postCommitCmd(o *options) *cobra.Command {
 	c.Flags().StringVar(&channel, "channel", "", "channel (default: the one that moves latest, else the first)")
 	c.Flags().StringVar(&ship, "ship", "", "ship this version now, under the hook's lock (what the background run does)")
 	c.Flags().StringVar(&commit, "commit", "", "with --ship: the commit the project must be exactly at")
+	c.Flags().BoolVar(&disks, "disks", false, "the ship publishes the disks (as ship --disks)")
 	return c
 }
 
 // postCommit starts the release's ship in a session of its own when HEAD moved the version; it
 // returns at once, so the commit never waits for its release.
-func (o *options) postCommit(channel string) error {
+func (o *options) postCommit(channel string, disks bool) error {
 	p, err := o.open()
 	if err != nil {
 		return err
@@ -94,18 +96,25 @@ func (o *options) postCommit(channel string) error {
 		args = append(args, "-f", spec)
 	}
 	args = append(args, "hook", "post-commit", "--channel", channel, "--ship", d.Version, "--commit", d.Commit)
+	if disks {
+		args = append(args, "--disks")
+	}
 	logPath := r.LogPath(p.Spec.Name, tag)
 	if err := o.launch(exe, args, logPath); err != nil {
 		return fmt.Errorf("start the ship of %s: %w", d.Version, err)
 	}
-	fmt.Fprintf(o.out, "stowage hook: release %s: ship to channel %s started in the background\n  follow: tail -f %s\n", d.Version, channel, logPath)
+	with := ""
+	if disks {
+		with = ", with its disks,"
+	}
+	fmt.Fprintf(o.out, "stowage hook: release %s%s: ship to channel %s started in the background\n  follow: tail -f %s\n", d.Version, with, channel, logPath)
 	return nil
 }
 
 // hookShip is the background run: under the repository's hook lock (waiting for another hook
 // ship to end), it ships version v from a checkout of commit, so the release is that commit
 // whatever the working tree holds meanwhile.
-func (o *options) hookShip(ctx context.Context, channel, v, commit string) (err error) {
+func (o *options) hookShip(ctx context.Context, channel, v, commit string, disks bool) (err error) {
 	fmt.Fprintf(o.out, "%s stowage hook: ship %s (commit %s) to channel %s\n", o.now().UTC().Format(time.RFC3339), v, commit, channel)
 	root, err := filepath.Abs(o.root)
 	if err != nil {
@@ -150,7 +159,7 @@ func (o *options) hookShip(ctx context.Context, channel, v, commit string) (err 
 			err = fmt.Errorf("remove the checkout of %s: %w", id, rerr)
 		}
 	}()
-	return o.inCheckout(top, rel, spec, root).ship(ctx, channel, 1, v)
+	return o.inCheckout(top, rel, spec, root).ship(ctx, channel, 1, v, disks)
 }
 
 // inCheckout is o run on the project at rel (and the spec at spec, when set) in the checkout at
@@ -167,6 +176,7 @@ func (o *options) inCheckout(top, rel, spec, root string) *options {
 
 func hookInstallCmd(o *options) *cobra.Command {
 	var channel string
+	var disks bool
 	c := &cobra.Command{
 		Use:   "install",
 		Short: "Write git's post-commit hook so it runs stowage hook post-commit for this project",
@@ -208,6 +218,9 @@ func hookInstallCmd(o *options) *cobra.Command {
 			if channel != "" {
 				argv = append(argv, "--channel", channel)
 			}
+			if disks {
+				argv = append(argv, "--disks")
+			}
 			replaced, err := hook.Install(r.HookFile, argv)
 			if err != nil {
 				return err
@@ -221,6 +234,7 @@ func hookInstallCmd(o *options) *cobra.Command {
 		},
 	}
 	c.Flags().StringVar(&channel, "channel", "", "channel the hook ships to (default: the one that moves latest, else the first)")
+	c.Flags().BoolVar(&disks, "disks", false, "every release the hook ships publishes its disks (without it, a commit made with STOWAGE_SHIP_DISKS=1 does)")
 	return c
 }
 

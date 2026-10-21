@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -998,5 +999,112 @@ func TestAMoveFromByoWhoseFirstTryFailedRemovesTheCertificateOnceUp(t *testing.T
 	}
 	if _, err := os.Stat(filepath.Join(e.dir, TLSDir)); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("tls/ stayed once the stack came up in internal: %v", err)
+	}
+}
+
+// On the VM, status gives a byo install's certificate, and the daemon journals its warning.
+func TestTheVMSaysItsCertificateExpires(t *testing.T) {
+	t.Parallel()
+	e := vmEnv(t, "1.0.0")
+	cert, key := writeCert(t, time.Now().Add(10*24*time.Hour), "*.example.com")
+	if err := e.install(func(o *Options) { vm(o); tlsDomains(o); o.TLS, o.Cert, o.Key = "byo", cert, key }); err != nil {
+		t.Fatalf("%v\n%s", err, e.log)
+	}
+	d := daemon(e, &fakeHost{})
+	var st Status
+	if call(t, d.Handler(), "GET", "/v1/status", nil, &st); st.Cert == nil || st.Cert.DaysLeft != 9 || !strings.Contains(st.Cert.Warning, "expires in 9 day(s)") {
+		t.Fatalf("status cert %+v", st.Cert)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	var mu sync.Mutex
+	var got []Event
+	d.onEvent = func(evs []Event) { mu.Lock(); got = append(got, evs...); mu.Unlock(); cancel() }
+	d.certWatch(ctx)
+	if len(got) != 1 || got[0].Kind != evCertExpiring || !strings.Contains(got[0].Reason, "sudo notes-stow install --tls byo") {
+		t.Fatalf("events %+v", got)
+	}
+}
+
+// issued writes a CA, an intermediate it signs and a leaf for name the intermediate signs; it
+// returns the CA's pool, the leaf alone, the leaf with its intermediate, and the leaf's key.
+func issued(t *testing.T, name string) (*x509.CertPool, string, string, string) {
+	t.Helper()
+	dir := t.TempDir()
+	mk := func(cn string, ca bool, parent *x509.Certificate, pk *ecdsa.PrivateKey) (*x509.Certificate, *ecdsa.PrivateKey, []byte) {
+		k, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		tmpl := &x509.Certificate{SerialNumber: big.NewInt(time.Now().UnixNano()), Subject: pkix.Name{CommonName: cn}, NotBefore: time.Now().Add(-time.Hour),
+			NotAfter: time.Now().Add(90 * 24 * time.Hour), IsCA: ca, BasicConstraintsValid: true}
+		if ca {
+			tmpl.KeyUsage = x509.KeyUsageCertSign
+		} else {
+			tmpl.DNSNames = []string{name}
+		}
+		if parent == nil {
+			parent, pk = tmpl, k
+		}
+		der, err := x509.CreateCertificate(rand.Reader, tmpl, parent, &k.PublicKey, pk)
+		if err != nil {
+			t.Fatal(err)
+		}
+		c, _ := x509.ParseCertificate(der)
+		return c, k, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	}
+	root, rk, _ := mk("Test Root", true, nil, nil)
+	inter, ik, interPEM := mk("Test Intermediate", true, root, rk)
+	_, lk, leafPEM := mk(name, false, inter, ik)
+	kder, _ := x509.MarshalECPrivateKey(lk)
+	key := filepath.Join(dir, "key.pem")
+	_ = os.WriteFile(key, pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: kder}), 0o600)
+	alone, full := filepath.Join(dir, "leaf.pem"), filepath.Join(dir, "full.pem")
+	_ = os.WriteFile(alone, leafPEM, 0o600)
+	_ = os.WriteFile(full, append(leafPEM, interPEM...), 0o600)
+	pool := x509.NewCertPool()
+	pool.AddCert(root)
+	return pool, alone, full, key
+}
+
+// Without --ca, a leaf given without its intermediate is refused; the whole chain is taken.
+func TestAByoChainWithoutItsIntermediateIsRefused(t *testing.T) {
+	t.Parallel()
+	pool, alone, full, key := issued(t, "*.example.com")
+	roots := func(o *Options) { o.Roots = func() (*x509.CertPool, error) { return pool, nil } }
+	e := newEnv(t)
+	err := e.install(func(o *Options) { tlsDomains(o); roots(o); o.TLS, o.Cert, o.Key = "byo", alone, key })
+	if err == nil || !strings.Contains(err.Error(), "the file must hold the whole chain") || !strings.Contains(err.Error(), `its issuer is "Test Intermediate"`) {
+		t.Fatalf("leaf alone: %v", err)
+	}
+	e = newEnv(t)
+	if err := e.install(func(o *Options) { tlsDomains(o); roots(o); o.TLS, o.Cert, o.Key = "byo", full, key }); err != nil {
+		t.Fatalf("the whole chain: %v", err)
+	}
+}
+
+// status names the certificate's end and warns from 30 days before it, and once it passed.
+func TestCertStatusWarnsBeforeTheEnd(t *testing.T) {
+	t.Parallel()
+	now := time.Now()
+	for _, c := range []struct {
+		left time.Duration
+		warn string
+	}{
+		{31 * 24 * time.Hour, ""},
+		{29*24*time.Hour + time.Hour, "expires in 29 day(s)"},
+		{-time.Hour, "expired on"},
+	} {
+		dir := t.TempDir()
+		cert, _ := writeCert(t, now.Add(c.left), "app.example.org")
+		raw, _ := os.ReadFile(cert)
+		_ = os.MkdirAll(filepath.Join(dir, TLSDir), 0o700)
+		_ = os.WriteFile(filepath.Join(dir, TLSDir, "cert.pem"), raw, 0o600)
+		st, err := certStatus(dir, now, "renew it")
+		if err != nil || st == nil || st.Subject != "app.example.org" {
+			t.Fatalf("%v: %+v %v", c.left, st, err)
+		}
+		if (c.warn == "") != (st.Warning == "") || !strings.Contains(st.Warning, c.warn) {
+			t.Errorf("%v: warning %q, want %q", c.left, st.Warning, c.warn)
+		}
+	}
+	if st, err := certStatus(t.TempDir(), now, ""); st != nil || err != nil {
+		t.Errorf("no certificate: %+v %v", st, err)
 	}
 }

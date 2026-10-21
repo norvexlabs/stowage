@@ -15,6 +15,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	"go.yaml.in/yaml/v3"
 
@@ -110,6 +111,58 @@ type Settings struct {
 	AwaitSecrets bool `yaml:"await_secrets,omitempty"`
 	// IPv6 turns IPv6 on for the stack's network (`vm create --ipv6`, as `install --ipv6`).
 	IPv6 bool `yaml:"ipv6,omitempty"`
+	// Release is the release the first install runs when the VM boots another release's disk (a
+	// release that published none boots its channel's disk set): the first boot writes its OS
+	// bundle into the passive slot and reboots into it, then installs. Absent, the OS's release.
+	Release *OSRelease `yaml:"release,omitempty"`
+}
+
+// OSRelease is a release by its version and revision, its tag, and its OS bundle's digest.
+type OSRelease struct {
+	Version  string `yaml:"version"`
+	Revision int    `yaml:"revision"`
+	Tag      string `yaml:"tag"`
+	OS       string `yaml:"os"`
+}
+
+// osSwitchFile records, on the persistent partition beside the install directory, the release
+// whose OS bundle the first boot wrote: a boot finding it, still on another OS, stops instead of
+// writing it again.
+func osSwitchFile(dir string) string { return filepath.Clean(dir) + ".os-switch" }
+
+// switchOS writes the OS bundle of the release the settings name into the passive slot and
+// reboots into it; the boot after it makes the first install from that OS. A second boot still
+// on another OS stops.
+func (in *Installer) switchOS(ctx context.Context, st *Settings) error {
+	o, m, t := &in.O, in.R.Manifest, st.Release
+	if t.OS == "" || !strings.HasPrefix(t.OS, "sha256:") {
+		return fmt.Errorf("%s: release.os %q is not a digest", cmp.Or(o.Settings, SettingsFile(in.R.Spec.Name)), t.OS)
+	}
+	mark := osSwitchFile(o.Dir)
+	if raw, err := os.ReadFile(mark); err == nil && strings.TrimSpace(string(raw)) == t.Tag {
+		return fmt.Errorf("this OS carries %s %s (revision %d) after %s's OS bundle was written and booted: the first install of %s %s stops (remove %s to write it again)",
+			in.R.Spec.Name, m.ProjectVersion, m.Revision, t.Tag, in.R.Spec.Name, t.Version, mark)
+	}
+	if o.Host == nil {
+		return errors.New("no host tool to write the OS bundle with")
+	}
+	prefix := cmp.Or(st.Registry, in.R.Spec.Registry.Prefix)
+	src := fmt.Sprintf("%s/%s-os@%s", prefix, in.R.Spec.Name, t.OS)
+	o.logf("this OS carries %s %s (revision %d); the first install runs %s (revision %d): writing its OS bundle %s, then rebooting into it",
+		in.R.Spec.Name, m.ProjectVersion, m.Revision, t.Version, t.Revision, src)
+	if err := writeAtomic(mark, strings.NewReader(t.Tag+"\n"), 0o600, nil); err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Minute)
+	defer cancel()
+	if err := writeOSBundle(ctx, in, o.Host, os.TempDir(), prefix, src, o.Log); err != nil {
+		// Written again by the next boot.
+		_ = os.Remove(mark)
+		return err
+	}
+	o.logf("%s's OS is written: rebooting into it", t.Tag)
+	_, err := o.Host.Run(ctx, Cmd{Args: []string{"systemctl", "reboot"}})
+	return err
 }
 
 // ReadSettings strictly decodes the settings file at path; nil when there is none.
@@ -328,6 +381,9 @@ func (in *Installer) firstBoot(ctx context.Context, path string) error {
 	if st == nil {
 		o.logf("%s holds no install yet, and no cloud-config gave %s: `sudo %s install` makes one", o.Dir, path, ctl)
 		return nil
+	}
+	if t := st.Release; t != nil && (t.Version != in.R.Manifest.ProjectVersion || t.Revision != in.R.Manifest.Revision) {
+		return in.switchOS(ctx, st)
 	}
 	if st.AwaitSecrets {
 		o.logf("the first install waits for its secrets, which the cloud-config never carries: `sudo %s install --secrets FILE` gives them", ctl)

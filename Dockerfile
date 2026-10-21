@@ -5,7 +5,7 @@
 #                                  linux/amd64 stowage-install it ships, stowage-install, and the
 #                                  installer's Docker smoke test)
 #   make image  → target image    (distroless runtime image)
-ARG GO_VERSION=1.27.2
+ARG GO_VERSION=1.27.3
 
 FROM golang:${GO_VERSION}-bookworm AS base
 WORKDIR /src

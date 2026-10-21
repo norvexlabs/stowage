@@ -99,6 +99,11 @@ type Hostd struct {
 	Systemd string
 	// Statfs reads the space of a directory's filesystem; nil is the system's.
 	Statfs func(dir string) *Disk
+	// Docker: the daemon of a Docker install, run in the installer's process (dockerhost.go): no
+	// boot, no health gate, no banner; its units the installer's own; DiskDir the Docker engine's
+	// data, whose filesystem the disk-pressure watch reads.
+	Docker  bool
+	DiskDir string
 
 	// held is the install's lock a rollback keeps to its reboot.
 	held      func()
@@ -232,6 +237,8 @@ type Status struct {
 	Disk           *Disk  `json:"disk,omitempty"`
 	// Pressure is the disk-pressure watch's reading; nil without hooks.maintenance.disk_pressure.
 	Pressure *DiskPressure `json:"disk_pressure,omitempty"`
+	// Cert is a byo install's certificate: its end, and a warning from 30 days before it.
+	Cert *CertStatus `json:"cert,omitempty"`
 	// Boot is the system Kairos booted: active, passive (the fallback) or recovery; empty off
 	// Kairos.
 	Boot string `json:"boot,omitempty"`
@@ -384,6 +391,7 @@ func (h *Hostd) Serve(ctx context.Context, path string) error {
 		defer close(watched)
 		h.pressureWatch(wctx)
 	}()
+	go h.certWatch(wctx)
 	// One server failing stops the others: the daemon is restarted whole.
 	var first error
 	for range servers {
@@ -569,6 +577,9 @@ func (h *Hostd) status(w http.ResponseWriter, r *http.Request) {
 		st.Installing, st.InstallFailed, _ = in.firstInstall()
 		st.RestoreAwaited = in.restoreAwaited()
 		st.Channel, _ = env.Get(ChannelVar)
+		if mode, _ := env.Get("STOWAGE_TLS_MODE"); mode == "byo" {
+			st.Cert, _ = certStatus(in.O.Dir, time.Now(), h.renewHint())
+		}
 	} else if !errors.Is(err, os.ErrNotExist) && fileExists(filepath.Join(in.O.Dir, envName)) {
 		replyErr(w, err)
 		return
@@ -1022,6 +1033,9 @@ func (h *Hostd) updates(w http.ResponseWriter, r *http.Request) {
 // booting refuses until <name>.service ran (active, or failed): before, the boot is queued or is
 // installing, upgrading or going back. A host without the unit has no boot to wait for.
 func (h *Hostd) booting(ctx context.Context) error {
+	if h.Docker {
+		return nil // no boot unit: the install is brought up by the installer
+	}
 	st, err := h.bootState(ctx)
 	if err != nil {
 		return err
@@ -1035,6 +1049,9 @@ func (h *Hostd) booting(ctx context.Context) error {
 // judged refuses as booting does, and then until the health gate judged this boot: an upgrade or
 // a rollback during the judgement would reboot before the boot assessment is settled.
 func (h *Hostd) judged(ctx context.Context) error {
+	if h.Docker {
+		return nil // no health gate
+	}
 	if err := h.booting(ctx); err != nil {
 		return err
 	}
@@ -1338,6 +1355,17 @@ func (h *Hostd) upgrade(w http.ResponseWriter, r *http.Request) {
 func (h *Hostd) writeOS(in *Installer, j *job, prefix, src string) error {
 	ctx, cancel := context.WithTimeout(h.ctx, 30*time.Minute)
 	defer cancel()
+	h.logf(j, "writing %s to the passive slot", src)
+	jw := &jobWriter{h: h, j: j}
+	err := writeOSBundle(ctx, in, h.Host, h.Run, prefix, src, jw)
+	jw.flush()
+	return err
+}
+
+// writeOSBundle runs kairos-agent upgrade from src (<prefix>/<name>-os@<digest>) through host,
+// its output streamed to w, with a private Docker config under dir holding the install's pull
+// account for prefix (none when the registry is public).
+func writeOSBundle(ctx context.Context, in *Installer, host Tool, dir, prefix, src string, w io.Writer) error {
 	user, token, err := in.pullAccount(prefix)
 	if err != nil {
 		return err
@@ -1348,21 +1376,17 @@ func (h *Hostd) writeOS(in *Installer, j *job, prefix, src string) error {
 		if err != nil {
 			return err
 		}
-		dir, err := os.MkdirTemp(h.Run, ".pull-")
+		tmp, err := os.MkdirTemp(dir, ".pull-")
 		if err != nil {
 			return err
 		}
-		defer os.RemoveAll(dir)
-		if err := registry.WriteDockerConfig(dir, repo.Registry, &authn.AuthConfig{Username: user, Password: token}, nil); err != nil {
+		defer os.RemoveAll(tmp)
+		if err := registry.WriteDockerConfig(tmp, repo.Registry, &authn.AuthConfig{Username: user, Password: token}, nil); err != nil {
 			return err
 		}
-		env = append(env, "DOCKER_CONFIG="+dir)
+		env = append(env, "DOCKER_CONFIG="+tmp)
 	}
-	h.logf(j, "writing %s to the passive slot", src)
-	jw := &jobWriter{h: h, j: j}
-	_, err = h.Host.Run(ctx, Cmd{Args: []string{"kairos-agent", "upgrade", "--source", "oci:" + src}, Env: env, Stream: jw})
-	jw.flush()
-	if err != nil {
+	if _, err := host.Run(ctx, Cmd{Args: []string{"kairos-agent", "upgrade", "--source", "oci:" + src}, Env: env, Stream: w}); err != nil {
 		return fmt.Errorf("kairos-agent upgrade: %w", err)
 	}
 	return nil

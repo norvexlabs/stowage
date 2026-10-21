@@ -1,5 +1,5 @@
 # Docker is the only host requirement: every target runs the Go toolchain in a container.
-GO_VERSION ?= 1.27.2
+GO_VERSION ?= 1.27.3
 VERSION    ?= $(shell sed -n 's/^## \[\([^]]*\)\].*/\1/p' CHANGELOG.md | grep -vi '^unreleased$$' | head -n1)
 IMAGE      ?= stowage:$(VERSION)
 BUILD      := DOCKER_BUILDKIT=1 docker buildx build --build-arg GO_VERSION=$(GO_VERSION) --build-arg VERSION=$(VERSION)

@@ -85,6 +85,55 @@ type Artifacts struct {
 	// DiskTag.
 	OS    string            `json:"os,omitempty"`
 	Disks map[string]string `json:"disks,omitempty"`
+	// BootDisks is the disk set an install of a release that published no disk of its own boots:
+	// the newest one its channel published when it was shipped (nil when there was none, and on a
+	// release with Disks). That set's release boots, then takes this release's OS bundle.
+	BootDisks *BootDisks `json:"boot_disks,omitempty"`
+}
+
+// BootDisks is another release's disk set: its tag (the disks are under DiskTag of it), the
+// stowage that published it (its OS's <short>-stow decides what its first boot can do), and each
+// disk's digest by format.
+type BootDisks struct {
+	Release string            `json:"release"`
+	Stowage string            `json:"stowage_version"`
+	Disks   map[string]string `json:"disks"`
+}
+
+// DiskSetMediaType is a channel's disk set record, at <prefix>/<name>-disk under DiskSetTag: the
+// disks the channel's VMs boot, which only a ship publishing disks writes.
+const DiskSetMediaType = "application/vnd.stowage.disk-set.v1+json"
+
+// DiskSetTag is the tag of a channel's disk set record.
+func DiskSetTag(channel string) string { return "set-" + channel }
+
+// DiskSet is a channel's disk set record: the release that published the disks, the stowage that
+// published it, and each disk's digest by format.
+type DiskSet struct {
+	Channel string            `json:"channel"`
+	Release string            `json:"release"`
+	Stowage string            `json:"stowage_version"`
+	Disks   map[string]string `json:"disks"`
+}
+
+// Check refuses a record that is not one of channel's.
+func (d *DiskSet) Check(channel string) error {
+	if d.Channel != channel || d.Release == "" || len(d.Disks) == 0 {
+		return fmt.Errorf("disk set record: not channel %s's, or no release or disk", channel)
+	}
+	return checkDisks(d.Disks)
+}
+
+// Boot is the disk set an install of the release boots: its own disks, else BootDisks; the
+// release tag they are under, and the disks, empty when there are none.
+func (a Artifacts) Boot(tag string) (string, map[string]string) {
+	if len(a.Disks) > 0 {
+		return tag, a.Disks
+	}
+	if b := a.BootDisks; b != nil {
+		return b.Release, b.Disks
+	}
+	return "", nil
 }
 
 // DiskArtifactType is a disk image's artifact type; its one layer is the disk file compressed with
@@ -183,7 +232,7 @@ func (m *Manifest) checkBundled() error {
 	switch {
 	case !m.Bundled(), m.ReleaseSeq != 0, !m.Date.IsZero(), m.Yanked != nil:
 		return errors.New("release manifest: an OS bundle's carries no channel, tag, release_seq, date or yank")
-	case a.Installer != "", a.Chart != nil, a.OS != "", len(a.Disks) > 0:
+	case a.Installer != "", a.Chart != nil, a.OS != "", len(a.Disks) > 0, a.BootDisks != nil:
 		return errors.New("release manifest: an OS bundle's records no installer, chart, os or disks")
 	}
 	// Everything else is checked as a published manifest's.
@@ -195,6 +244,20 @@ func (m *Manifest) checkBundled() error {
 // PreloadTag is the tag an image is preloaded under in the OS bundle: its digest, so the bundle
 // serves every channel and an install finds the release's images by digest alone.
 func PreloadTag(digest string) string { return strings.Replace(digest, ":", "-", 1) }
+
+// checkDisks checks a disk set. A format this build does not know is kept: a later stowage may
+// publish more, and a consumer uses the formats it knows.
+func checkDisks(disks map[string]string) error {
+	for f, d := range disks {
+		if !diskFormat.MatchString(f) {
+			return fmt.Errorf("release manifest: disk format %q is not lowercase letters, digits, '.', '_' or '-'", f)
+		}
+		if !sha256Digest.MatchString(d) {
+			return fmt.Errorf("release manifest: disk %s %q is not a sha256 digest", f, d)
+		}
+	}
+	return nil
+}
 
 func (m *Manifest) check() error {
 	switch {
@@ -225,14 +288,20 @@ func (m *Manifest) check() error {
 	if len(m.Artifacts.Disks) > 0 && m.Artifacts.OS == "" {
 		return errors.New("release manifest: disks without an os bundle")
 	}
-	// A format this build does not know is kept: a later stowage may publish more, and a consumer
-	// uses the formats it knows.
-	for f, d := range m.Artifacts.Disks {
-		if !diskFormat.MatchString(f) {
-			return fmt.Errorf("release manifest: disk format %q is not lowercase letters, digits, '.', '_' or '-'", f)
+	if err := checkDisks(m.Artifacts.Disks); err != nil {
+		return err
+	}
+	if b := m.Artifacts.BootDisks; b != nil {
+		switch {
+		case len(m.Artifacts.Disks) > 0:
+			return errors.New("release manifest: boot_disks beside disks of its own")
+		case m.Artifacts.OS == "":
+			return errors.New("release manifest: boot_disks without an os bundle")
+		case b.Release == "" || b.Release == m.Tag || len(b.Disks) == 0:
+			return fmt.Errorf("release manifest: boot_disks must name another release (%q) and its disks", b.Release)
 		}
-		if !sha256Digest.MatchString(d) {
-			return fmt.Errorf("release manifest: disk %s %q is not a sha256 digest", f, d)
+		if err := checkDisks(b.Disks); err != nil {
+			return fmt.Errorf("boot_disks: %w", err)
 		}
 	}
 	if c := m.Artifacts.Chart; c != nil {

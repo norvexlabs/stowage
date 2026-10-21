@@ -84,7 +84,7 @@ func TestPublishCommands(t *testing.T) {
 	if err != nil {
 		t.Fatalf("%v\n%s", err, logs)
 	}
-	if !strings.Contains(out, "notes 1.0.0 revision 1 · channel beta · tag beta-1.0.0 · seq 1") || b.n != 4 {
+	if !strings.Contains(out, "notes 1.0.0 revision 1 · channel beta · tag beta-1.0.0 · seq 1") || b.n != 5 {
 		t.Fatalf("ship output (%d builds):\n%s", b.n, out)
 	}
 	// Read-only commands use the pull account (here anonymous): no publisher token needed.
@@ -102,8 +102,8 @@ func TestPublishCommands(t *testing.T) {
 	if _, _, err := run(t, b, env, "-C", root, "promote", "1.0.0", "--from", "beta", "--to", "stable"); err != nil {
 		t.Fatalf("promote: %v", err)
 	}
-	if b.n != 4 {
-		t.Fatalf("promote built %d images", b.n-4)
+	if b.n != 5 {
+		t.Fatalf("promote built %d images", b.n-5)
 	}
 	if _, _, err := run(t, b, env, "-C", root, "promote", "0.9.0", "--from", "beta", "--to", "stable"); err == nil || !strings.Contains(err.Error(), "the tree is at 1.0.0") {
 		t.Fatalf("promote of another version: %v", err)

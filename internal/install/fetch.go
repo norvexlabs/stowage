@@ -179,6 +179,11 @@ const readers = 8
 // sign). A tag holding something else, or a pointer (whose manifest names another tag), is passed
 // over; the channel's pointer, the reserved tags and signature tags are not read.
 func findRelease(ctx context.Context, c *registry.Client, prefix, name, channel, v string, trust *sigverify.Verifier, logf func(string, ...any)) (*release.Manifest, error) {
+	return findRevision(ctx, c, prefix, name, channel, v, 0, trust, logf)
+}
+
+// findRevision is findRelease of revision rev of v; 0 is its latest revision.
+func findRevision(ctx context.Context, c *registry.Client, prefix, name, channel, v string, rev int, trust *sigverify.Verifier, logf func(string, ...any)) (*release.Manifest, error) {
 	repo, err := c.Repo(prefix + "/" + name + "-release")
 	if err != nil {
 		return nil, err
@@ -214,7 +219,7 @@ func findRelease(ctx context.Context, c *registry.Client, prefix, name, channel,
 	var live, yanked []candidate
 	for i, t := range tags {
 		m := ms[i]
-		if m == nil || m.Name != name || m.Tag != t || m.Channel != channel || !isVersion(m, v) {
+		if m == nil || m.Name != name || m.Tag != t || m.Channel != channel || !isVersion(m, v) || (rev > 0 && m.Revision != rev) {
 			continue
 		}
 		if m.Yanked != nil {
@@ -251,6 +256,9 @@ func findRelease(ctx context.Context, c *registry.Client, prefix, name, channel,
 	}
 	if refused != nil {
 		return nil, refused
+	}
+	if rev > 0 {
+		return nil, fmt.Errorf("%s %s (revision %d) is not published on %s in %s", name, v, rev, channel, repo)
 	}
 	return nil, fmt.Errorf("%s %s is not published on %s in %s (a mirror holds the %s-release and %s-installer repositories too)", name, v, channel, repo, name, name)
 }

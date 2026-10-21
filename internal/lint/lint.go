@@ -297,6 +297,9 @@ func (l *linter) registry() {
 	if err := providers.RegistryAuth(r.Push, true); err != nil {
 		l.errf("registry.push", "%v", err)
 	}
+	if err := providers.RegistryDelete(r.Delete, r.Push); err != nil {
+		l.errf("registry.delete", "%v", err)
+	}
 	l.pullAccount()
 	if err := providers.Signing(l.s.Signing); err != nil {
 		l.errf("signing", "%v", err)
@@ -938,8 +941,8 @@ func (l *linter) hooks() {
 	if m := l.s.Hooks.Maintenance; m != nil && m.DiskPressure != nil {
 		d := m.DiskPressure
 		w := "hooks.maintenance.disk_pressure"
-		if l.s.Shapes.Kairos == nil {
-			l.warnf(w, "only the kairos shape's host daemon watches the disk: with no kairos shape, nothing does")
+		if l.s.Shapes.Kairos == nil && l.s.Shapes.Docker == nil {
+			l.warnf(w, "the kairos shape's host daemon and a Docker install's timer watch the disk: with neither shape, nothing does")
 		}
 		if d.SoftPct < 1 || d.HardPct > 99 || d.SoftPct >= d.HardPct {
 			l.errf(w, "need 1 <= soft_pct < hard_pct <= 99")
@@ -1024,6 +1027,34 @@ func (l *linter) chart(rel string) {
 	}
 }
 
+// k8sSchema checks shapes.kubernetes.schema: it needs the sql schema-compat provider, with the
+// image it reads the label of, and names an image to run psql in. Without it, a project whose
+// schema the Docker shape checks is not checked on Kubernetes: a warning.
+func (l *linter) k8sSchema(k *spec.K8sShape) {
+	const w = "shapes.kubernetes.schema"
+	sql := l.s.HasDatabase() && l.s.DB().SchemaCompat.Name == "sql"
+	sc := k.Schema
+	if sc == nil {
+		if sql {
+			l.warnf(w, "is not set: `k8s rollback` is not checked against the database's schema, as Docker's and the VM's rollbacks are")
+		}
+		return
+	}
+	if !sql {
+		l.errf(w, "needs a database whose schema_compat provider is sql")
+		return
+	}
+	if !providers.EnvName.MatchString(sc.URLEnv) {
+		l.errf(w+".url_env", "%q is not an environment variable name", sc.URLEnv)
+	}
+	if _, ok := l.s.Images[sc.Image]; !ok {
+		l.errf(w+".image", "%q is not an images key (the image psql runs in)", sc.Image)
+	}
+	if c, err := providers.SQL(l.s.DB().SchemaCompat, l.s.Images); err == nil && c.ReadsNewerImage == "" {
+		l.errf(w, "needs database.schema_compat.reads_newer_image: the workload running it gives the environment")
+	}
+}
+
 func (l *linter) shapes() {
 	sh := l.s.Shapes
 	if sh.Docker == nil && sh.Kubernetes == nil && sh.Kairos == nil {
@@ -1041,6 +1072,7 @@ func (l *linter) shapes() {
 				l.errf("shapes.kubernetes.postgres_modes", "unknown mode %q (external, embedded, cnpg)", m)
 			}
 		}
+		l.k8sSchema(k)
 	}
 	if k := sh.Kairos; k != nil {
 		w := "shapes.kairos"
@@ -1078,7 +1110,7 @@ func (l *linter) shapes() {
 		case l.s.Backup == nil && !l.s.HasDatabase():
 		case l.s.Backup == nil:
 			l.warnf("backup", "the VM keeps its data locally and no backup is declared")
-		case !providers.RunsVMBackups(l.s):
+		case !providers.RunsBackups(l.s):
 			l.warnf("backup", "the VM runs %s backups only: it schedules no %s backup", providers.VMBackup, l.s.Backup.Name)
 		}
 	}

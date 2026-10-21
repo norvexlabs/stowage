@@ -155,6 +155,7 @@ shapes:
   kubernetes:
     chart: deploy/chart
     postgres_modes: [embedded, external]
+    schema: { url_env: DATABASE_URL, image: postgres }            # k8s upgrade records the schema, k8s rollback checks it
   kairos:
     base: ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55
     kairos_init: quay.io/kairos/kairos-init:v0.16.2@sha256:0777266d25e31b653deaaaa084d4e27d98f7a55e82e42f0648e2ba9c756b8664

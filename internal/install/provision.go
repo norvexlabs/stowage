@@ -206,6 +206,10 @@ func (in *Installer) runHook(ctx context.Context, env *EnvFile, h *providers.Pro
 				in.O.logf("%s: dropping %s, now a recorded value of the install", in.path(ProvisionEnv), k)
 				continue
 			}
+			if slices.Contains(in.dropped.returns, k) {
+				in.O.logf("the provision hook of %s %s no longer returns %s: dropped", in.R.Spec.Name, in.R.Manifest.ProjectVersion, k)
+				continue
+			}
 			v, _ := prev.Get(k)
 			outs.Set(k, v)
 		}

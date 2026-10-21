@@ -59,8 +59,8 @@ grep -q '^    health_gate: ' "$P/stowage.yaml" || fail "no health_gate in the pr
 "${S[@]}" lint
 vm_names
 
-step "ship beta: images, the OS bundle, its disk"
-"${S[@]}" ship --channel beta 2>"$WORK/ship.log" || { tail -50 "$WORK/ship.log"; fail "ship"; }
+step "ship beta with its disk (--disks): images, the OS bundle, its disk"
+"${S[@]}" ship --channel beta --disks 2>"$WORK/ship.log" || { tail -50 "$WORK/ship.log"; fail "ship"; }
 grep -q 'disk qcow2: tag .* → beta-1.0.0-qcow2' "$WORK/ship.log" || fail "the qcow2 disk was not tagged"
 
 step "the published notes-stow; the site's mirror, TLS of its own CA, on the address the VM reaches this host at"

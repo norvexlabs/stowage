@@ -20,6 +20,7 @@ import (
 
 	"filippo.io/age"
 
+	"github.com/norvexlabs/stowage/internal/backup"
 	"github.com/norvexlabs/stowage/internal/spec"
 )
 
@@ -896,5 +897,175 @@ func TestARunWaitingItsTurnReadsAgainAfterAJobBetween(t *testing.T) {
 	reads = 0
 	if _, err = d.startJobWhenFree(context.Background(), 0, "backup", func() (string, error) { reads++; return "once", nil }); err != nil || reads != 1 {
 		t.Errorf("%v: read %d times", err, reads)
+	}
+}
+
+// A Docker install runs the VM's backup code in the installer's process: its settings, a backup
+// streamed through the runner, the schedule written as the install's own systemd units.
+// withRunner gives e's release a backup runner, as ship publishes one for a project with a
+// pg-age-rclone backup.
+func withRunner(e *env) {
+	a := &e.r.Manifest.Artifacts
+	a.Images[backup.Key], a.Configs[backup.Key], a.Manifests[backup.Key] = digest, config, manifest
+}
+
+func TestADockerInstallBacksUpThroughItsOwnDaemon(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	withRunner(e)
+	if err := e.install(nil); err != nil {
+		t.Fatalf("%v\n%s", err, e.log)
+	}
+	f := &fakeRclone{objects: map[string][]byte{}}
+	e.docker.runner = f.run
+	e.docker.dump = "the database's dump"
+	key, _ := age.GenerateX25519Identity()
+	units, host := t.TempDir(), &fakeHost{}
+	in := e.installer(func(o *Options) { o.Systemd, o.Host = units, host })
+	d, done, err := in.dockerHostd(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer done()
+	req := validConfig(key)
+	req.Schedule = ptr("Mon *-*-* 04:00:00")
+	configure(t, d, req)
+	unit := installUnit("notes", "backup", e.dir)
+	timer, err := os.ReadFile(filepath.Join(units, unit+".timer"))
+	if err != nil || !strings.Contains(string(timer), "OnCalendar=Mon *-*-* 04:00:00\n") {
+		t.Fatalf("timer %q %v", timer, err)
+	}
+	svc, _ := os.ReadFile(filepath.Join(units, unit+".service"))
+	if !strings.Contains(string(svc), "ExecStart="+filepath.Join(e.dir, "notes-stow")+" backup run --if-configured --dir "+e.dir+"\n") {
+		t.Errorf("service %s", svc)
+	}
+	if !strings.Contains(fmt.Sprint(host.calls()), "systemctl enable --now "+unit+".timer") {
+		t.Errorf("ran %v", host.calls())
+	}
+	h := d.Handler()
+	call(t, h, "POST", "/v1/backup", nil, nil)
+	if j := waitJob(t, h); j.State != "done" || len(f.objects) != 1 {
+		t.Fatalf("%+v %v", j, f.objects)
+	}
+	// Removing the settings removes the units.
+	if code := call(t, h, "DELETE", "/v1/backup/config", nil, nil); code != 200 {
+		t.Fatalf("remove: %d", code)
+	}
+	if _, err := os.Stat(filepath.Join(units, unit+".timer")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("the timer is left: %v", err)
+	}
+	if installUnit("notes", "backup", e.dir) == installUnit("notes", "backup", e.dir+"2") {
+		t.Error("two installs share a unit")
+	}
+}
+
+// A Docker install's disk-pressure watch: units at the install, a check that POSTs past soft_pct
+// with the hook's bearer and records it, which status shows.
+func TestADockerInstallWatchesItsDisk(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	e.to("1.0.0", func(s *spec.Spec) {
+		s.Hooks.Maintenance = &spec.Maintenance{DiskPressure: &spec.DiskPressure{SoftPct: 75, HardPct: 90, Post: "http://api:8080/purge"}}
+	})
+	if err := e.install(nil); err != nil {
+		t.Fatalf("%v\n%s", err, e.log)
+	}
+	units := t.TempDir()
+	in := e.installer(func(o *Options) { o.Systemd, o.Host = units, &fakeHost{} })
+	if err := in.InstallWatch(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	unit := installUnit("notes", "disk", e.dir)
+	if timer, err := os.ReadFile(filepath.Join(units, unit+".timer")); err != nil || !strings.Contains(string(timer), "OnUnitActiveSec=600s") {
+		t.Fatalf("timer %q %v", timer, err)
+	}
+	if svc, _ := os.ReadFile(filepath.Join(units, unit+".service")); !strings.Contains(string(svc), " disk-check --dir "+e.dir) {
+		t.Errorf("service %s", svc)
+	}
+}
+
+// One process at a time runs a Docker install's jobs: a second daemon waits for the first.
+func TestADockerInstallsDaemonsTakeTurns(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	if err := e.install(nil); err != nil {
+		t.Fatal(err)
+	}
+	in := e.installer(nil)
+	_, done, err := in.dockerHostd(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hostBusy(e.dir) {
+		t.Error("the lock is not seen held")
+	}
+	got := make(chan struct{})
+	go func() {
+		_, d2, err := e.installer(nil).dockerHostd(context.Background())
+		if err == nil {
+			d2()
+		}
+		close(got)
+	}()
+	select {
+	case <-got:
+		t.Fatal("a second daemon ran beside the first")
+	case <-time.After(200 * time.Millisecond):
+	}
+	done()
+	select {
+	case <-got:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the second daemon did not take its turn")
+	}
+	if left, _ := filepath.Glob(filepath.Join(e.dir, ".host-*")); len(left) > 0 {
+		t.Errorf("left %v", left)
+	}
+	if hostBusy(e.dir) {
+		t.Error("the lock is seen held once released")
+	}
+}
+
+// A read goes to the daemon that takes no lock; a job, and every request after it, to the one
+// that runs jobs.
+func TestTheDockerTransportRoutesReadsAndJobs(t *testing.T) {
+	t.Parallel()
+	var made []string
+	handler := func(name string) func() (http.Handler, error) {
+		return func() (http.Handler, error) {
+			made = append(made, name)
+			return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, name) }), nil
+		}
+	}
+	c := &http.Client{Transport: &lazyTransport{read: handler("read"), jobs: handler("jobs")}}
+	ask := func(method, path string) string {
+		req, _ := http.NewRequest(method, "http://host"+path, nil)
+		resp, err := c.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		b, _ := io.ReadAll(resp.Body)
+		return string(b)
+	}
+	got := []string{ask(http.MethodGet, "/v1/backup/status"), ask(http.MethodPost, "/v1/backup/config"), ask(http.MethodPost, "/v1/backup"), ask(http.MethodGet, "/v1/job")}
+	if strings.Join(got, ",") != "read,read,jobs,jobs" || strings.Join(made, ",") != "read,jobs" {
+		t.Fatalf("answered %v, made %v", got, made)
+	}
+}
+
+// A request without a body reaches a handler as a server gives it: an empty body.
+func TestTheInProcessTransportGivesAnEmptyBody(t *testing.T) {
+	t.Parallel()
+	tr := handlerTransport{http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, err := io.ReadAll(r.Body)
+		if err != nil || len(b) != 0 {
+			t.Errorf("%q %v", b, err)
+		}
+	})}
+	req, _ := http.NewRequest(http.MethodPost, "http://host/v1/backup/verify", nil)
+	req.Body = nil
+	if _, err := tr.RoundTrip(req); err != nil {
+		t.Fatal(err)
 	}
 }

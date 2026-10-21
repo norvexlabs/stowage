@@ -3,6 +3,40 @@
 Stowage's own releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
+## [0.6.0]
+
+### Added
+- **Disks only when asked, one disk set per channel.** `ship --disks` (or `STOWAGE_SHIP_DISKS=1`,
+  or `hook install --disks`) publishes the VM disks and registers the cloud images; a release
+  shipped without it publishes none and records the disk set its VMs boot, the channel's newest.
+  `vm create` of such a release boots that set, and the VM's first boot takes the release's own
+  OS bundle and reboots into it before it installs. A ship that publishes disks removes the
+  channel's older disk sets once the channel points at it; a cleanup that fails after the release
+  is out exits 3, the release published.
+- `registry.delete`: `github` deletes manifests through GitHub's packages API (ghcr deletes
+  nothing through the registry API); a registry that deletes no tag alone has a manifest deleted
+  by digest when no other tag holds it.
+- **Backups, `restore` and the disk-pressure watch on Docker**: `backup config|run|status|list|verify`
+  and `restore OBJECT`, as on the VM, the schedule and the watch as systemd timers of the install;
+  `status` shows the disk pressure.
+- **`k8s rollback` checks the database's schema** (`shapes.kubernetes.schema`): a rollback barrier
+  since the schema `k8s upgrade` recorded, or a release that does not read the newer schema, is
+  refused before helm is called.
+- `mirror export --version V [--revision N]` exports an earlier release of the channel;
+  `--shapes` leaves out what the site does not run (the OS bundle and the disks, the chart).
+- A byo certificate: `status` (Docker and the VM) shows its end and warns from 30 days before
+  it, the VM's journal says so daily (`cert.expiring`); without `--ca`, a chain lacking its
+  intermediate is refused.
+
+### Changed
+- An upgrade (Docker, the VM, Kubernetes) drops the recorded value of an input the release no
+  longer declares, and a value its provision hook no longer declares it returns, saying so; a
+  rollback takes them back.
+- A ship, yank or prune that publishes no disk never moves, rewrites or deletes a disk tag:
+  `latest-<format>` follows the channel's disk set, not its pointer.
+- A project with the Docker shape and a `pg-age-rclone` backup publishes the backup runner.
+- Built with Go 1.27.3 (crypto/x509 fix GO-2026-6809).
+
 ## [0.5.0] - 2026-10-20
 
 ### Added

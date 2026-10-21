@@ -122,10 +122,10 @@ type osPlan struct {
 }
 
 // planOS plans the bundle on the images about to be published, and builds what is missing: the
-// bundle, then the disks of it no source holds. Everything is pushed by digest and signed; no tag
+// bundle, then (with disks) the disks of it no source holds. Everything is pushed by digest and signed; no tag
 // moves. existing is the release published under the tag on an immutable channel (nil
 // otherwise): it is never republished with another bundle or disk.
-func (p *Publisher) planOS(ctx context.Context, o ShipOptions, tag string, mutable bool, osInputs string, images, configs, manifests map[string]string, sources []*Ref, immutable *Ref) (*osPlan, error) {
+func (p *Publisher) planOS(ctx context.Context, o ShipOptions, disks bool, tag string, mutable bool, osInputs string, images, configs, manifests map[string]string, sources []*Ref, immutable *Ref) (*osPlan, error) {
 	s := p.Project.Spec
 	newRevision := func(what, had string) error {
 		if had == "" {
@@ -165,6 +165,9 @@ func (p *Publisher) planOS(ctx context.Context, o ShipOptions, tag string, mutab
 		return nil, fmt.Errorf("os bundle: %w", err)
 	}
 
+	if !disks {
+		return pl, nil
+	}
 	var missing []string
 	for _, f := range p.Project.Spec.Shapes.Kairos.Formats() {
 		dt, err := p.Registry.Tag(p.diskRepo(), release.DiskTag(tag, f))

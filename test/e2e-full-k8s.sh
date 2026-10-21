@@ -16,7 +16,7 @@
 # the key, ship .2 (a migration) → `k8s upgrade --version`: the release runs .2, its hook fails
 # naming `k8s provision --set`, which mints another key; `k8s provision` again keeps it → its
 # record lost, `k8s provision --set ADMIN_API_KEY=<key>` gives the key the hook never returned (the
-# spec declares it in hooks.provision.returns) and no other is minted → the data kept → `k8s rollback` (the previous api reads the newer schema) → a second release in another
+# spec declares it in hooks.provision.returns) and no other is minted → the data kept → `k8s rollback` (the database read in a pod of the release: no barrier since the schema the upgrade recorded, and the previous api reads the newer schema) → a second release in another
 # namespace with the embedded Postgres → `k8s reset-db` deletes its database's claim, forgets what
 # the hook returned, and the hook registers the administrator again → `k8s secrets rotate` takes
 # the internal secret through its three passes, the release restarted at each, each value
@@ -232,6 +232,8 @@ hook_ran "$WORK/prov-given.log" "$new"
 step "k8s rollback to $V1 (its api reads the newer schema)"
 ctl v1.sh k8s rollback --timeout 5m >"$WORK/rollback.log" 2>&1 || { cat "$WORK/rollback.log"; fail "k8s rollback"; }
 grep -q "release atlas in atlas runs atlas $V1" "$WORK/rollback.log" || { cat "$WORK/rollback.log"; fail "the rollback does not say $V1 runs"; }
+grep -q "the database is at 2; atlas $V1 (revision 1) reads past the newer migrations" "$WORK/rollback.log" ||
+	{ cat "$WORK/rollback.log"; fail "the rollback did not check the schema in a pod"; }
 atlas_runs "$V1" 2
 [[ $(status events admins) == 1/1 ]] || fail "the rollback lost data"
 

@@ -412,6 +412,7 @@ func TestAShipOfAYankedReleaseMovesNoPointer(t *testing.T) {
 		t.Fatal(err)
 	}
 	testutil.Write(t, e.root, "VERSION", "1.0.0\n")
+	e.noDisks = true // its disks a newer set replaced
 	if _, err := e.ship("stable", 1); err == nil || !strings.Contains(err.Error(), "is yanked") {
 		t.Fatalf("ship of a yanked release: %v", err)
 	}

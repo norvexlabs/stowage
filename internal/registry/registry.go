@@ -254,6 +254,19 @@ func (c *Client) Referrers(ctx context.Context, d name.Digest, t types.MediaType
 // asked for: a definite answer, unlike a failed read.
 var ErrNotArtifact = errors.New("not an artifact of the requested type")
 
+// Labels are the labels of the image ref names (an index: its linux/amd64 image's).
+func (c *Client) Labels(ctx context.Context, ref name.Reference) (map[string]string, error) {
+	img, err := remote.Image(ref, append(c.opts(ctx), remote.WithPlatform(v1.Platform{OS: "linux", Architecture: "amd64"}))...)
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", ref, err)
+	}
+	cf, err := img.ConfigFile()
+	if err != nil {
+		return nil, fmt.Errorf("the config of %s: %w", ref, err)
+	}
+	return cf.Config.Labels, nil
+}
+
 // Image reads an image manifest (not an index); its layers are fetched as they are read.
 func (c *Client) Image(ctx context.Context, ref name.Reference) (v1.Image, error) {
 	return remote.Image(ref, c.opts(ctx)...)
@@ -345,14 +358,54 @@ func (c *Client) Retag(ctx context.Context, digest name.Digest, tag name.Tag) er
 	return nil
 }
 
-// DeleteTag removes one tag. A registry that can only delete by digest refuses it, and the error
-// says so: deleting by digest would also remove every other tag on that manifest.
+// ErrDeleteRefused is a registry refusing a delete through the distribution API: it deletes no
+// tag (only a manifest by digest), or nothing at all (a registry deleting through an API of its
+// own).
+var ErrDeleteRefused = errors.New("the registry refuses this delete")
+
+// refused reports a delete the registry does not support: 405, or an UNSUPPORTED error.
+func refused(err error) bool {
+	var te *transport.Error
+	if !errors.As(err, &te) {
+		return false
+	}
+	if te.StatusCode == http.StatusMethodNotAllowed {
+		return true
+	}
+	for _, d := range te.Errors {
+		if d.Code == transport.UnsupportedErrorCode {
+			return true
+		}
+	}
+	return false
+}
+
+// DeleteTag removes one tag, nothing when it is absent. A registry that can only delete by digest
+// refuses it with an error wrapping ErrDeleteRefused: deleting by digest would also remove every
+// other tag on that manifest.
 func (c *Client) DeleteTag(ctx context.Context, tag name.Tag) error {
 	err := remote.Delete(tag, c.opts(ctx)...)
-	if err == nil || NotFound(err) {
+	switch {
+	case err == nil, NotFound(err):
 		return nil
+	case refused(err):
+		return fmt.Errorf("delete %s: %w (%v)", tag, ErrDeleteRefused, err)
 	}
-	return fmt.Errorf("delete %s (the registry must support deleting a tag, not only a digest): %w", tag, err)
+	return fmt.Errorf("delete %s: %w", tag, err)
+}
+
+// DeleteManifest removes a manifest, and every tag on it, by digest; nothing when it is absent. A
+// registry that deletes nothing through the distribution API refuses it with an error wrapping
+// ErrDeleteRefused.
+func (c *Client) DeleteManifest(ctx context.Context, d name.Digest) error {
+	err := remote.Delete(d, c.opts(ctx)...)
+	switch {
+	case err == nil, NotFound(err):
+		return nil
+	case refused(err):
+		return fmt.Errorf("delete %s: %w (%v)", d, ErrDeleteRefused, err)
+	}
+	return fmt.Errorf("delete %s: %w", d, err)
 }
 
 // Tags lists a repository's tags; an unknown repository has none.

@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -30,6 +31,7 @@ import (
 	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/name"
 
+	"github.com/norvexlabs/stowage/internal/backup"
 	"github.com/norvexlabs/stowage/internal/front"
 	"github.com/norvexlabs/stowage/internal/payload"
 	"github.com/norvexlabs/stowage/internal/providers"
@@ -113,6 +115,10 @@ type Options struct {
 	// is the program.
 	Firewall string
 	Host     Tool
+	// Systemd is where a Docker install's units are written; empty is /etc/systemd/system.
+	Systemd string
+	// Roots are the host's trusted CAs a byo chain is checked against; nil is the system's.
+	Roots func() (*x509.CertPool, error)
 	// SourceAddr is the address this machine reaches dst from; nil asks the system's routes.
 	// LookupIP resolves a host name; nil is the system's resolver.
 	SourceAddr func(dst netip.Addr) (netip.Addr, error)
@@ -141,6 +147,10 @@ type Installer struct {
 	recorded map[string]string
 	// again: this run is a re-run of an install.
 	again bool
+	// boot is the disk set `vm create` boots (bootDisks).
+	boot bootDisk
+	// dropped is what an upgrade drops: inputs and hook returns the release removed.
+	dropped removed
 	// upgraded: Upgrade moved the install to this release (not a no-op, not a dry run).
 	upgraded bool
 	// preloadErr: the VM's preload unit failed when this run waited for it (awaitPreload).
@@ -1122,6 +1132,23 @@ func (in *Installer) Status(ctx context.Context) error {
 		fmt.Fprintf(in.O.Out, "%-9s %s\n", "endpoint", url)
 	}
 	in.tunables(env, get("STOWAGE_TLS_MODE") != Loopback)
+	if get("STOWAGE_TLS_MODE") == "byo" {
+		st, err := certStatus(dir, time.Now(), in.renewHint())
+		if err != nil {
+			fmt.Fprintf(in.O.Out, "warning: the certificate could not be read: %v\n", err)
+		}
+		in.printCert(st)
+	}
+	if p := in.dockerPressure(ctx); p != nil {
+		if p.Level == "unknown" {
+			fmt.Fprintf(in.O.Out, "%-9s unknown: the disk cannot be read (soft %d%%, hard %d%%)\n", "pressure", p.SoftPct, p.HardPct)
+		} else {
+			fmt.Fprintf(in.O.Out, "%-9s %s: %.1f%% used (soft %d%%, hard %d%%)\n", "pressure", p.Level, p.UsedPct, p.SoftPct, p.HardPct)
+		}
+		if l := p.Last; l != nil {
+			fmt.Fprintf(in.O.Out, "          last POST at %s (%s, %.1f%%): %s\n", l.At.Format(time.RFC3339), l.Level, l.UsedPct, l.Result)
+		}
+	}
 	out, err := in.Compose(ctx, env, nil, "ps", "--all")
 	if err != nil {
 		return err
@@ -1430,6 +1457,12 @@ func (in *Installer) stackImages(env *EnvFile) []image {
 	for _, k := range in.R.Spec.ImageNames() {
 		ref, _ := env.Get(ImageVar(k))
 		out = append(out, image{ref, []string{a.Images[k], a.Manifests[k], a.Configs[k]}})
+	}
+	// The backup runner, which no service runs: a Docker install's backups run it (the VM's OS
+	// bundle preloads it).
+	if a.Images[backup.Key] != "" && !in.O.Preloaded {
+		prefix, _ := env.Get("STOWAGE_REGISTRY")
+		out = append(out, image{in.imageRef(prefix, backup.Key), []string{a.Images[backup.Key], a.Manifests[backup.Key], a.Configs[backup.Key]}})
 	}
 	return out
 }

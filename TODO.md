@@ -33,64 +33,26 @@ A finished item is deleted, not ticked. The plan behind it is
    by chunks (the OCI distribution spec's chunked upload), resume from the last acknowledged byte
    after a failure, fail with an error naming the blob when no byte is acknowledged for a bounded
    time, and log progress (bytes sent, throughput) while a large blob is pushed.
-5. **Disks only when the publisher asks, installs from the newest disk.** A disk set is several
-   GB per release while most releases only move the OS bundle and the images. Whether a release
-   publishes disks is the publisher's call at `ship`, never a rule of Stowage's:
-   - `ship` takes an option to publish the kairos shape's disks (and `cloud_publish`); without
-     it the release publishes none and says so in one line. The post-commit hook passes it
-     through from the project's own hook configuration, so a project chooses its own cadence.
-   - Publishing a disk set removes the previous one (every format, its blobs and its
-     `latest-<format>` tags re-pointed first), so the registry holds one disk set per channel.
-   - The release manifest names the disk set an install of it boots: its own, or the newest
-     published one on its channel. `vm create` (and the installer's VM paths) boot that disk, then
-     upgrade the VM to the requested release with the OS bundle, as `upgrade` does, before
-     reporting it installed; the install's status and events name both versions.
-   - Tests: a ship without the option publishes no disk; a VM created for such a release boots
-     the newest disk and reports the requested release once upgraded; a ship with the option
-     leaves exactly one disk set behind, and no tag dangling.
-
-6. **Backups and `restore` on Docker.** The Docker shape's only dump is the one `upgrade` takes,
-   on the same host; a restore is done by hand (services stopped, the database dropped and
-   created, `pg_restore`, services started, `provision`), reaching into the stack. The VM's
-   verbs, on the Docker shape, from the same generic backup container: `backup config | run |
-   status | list | verify` with a schedule (the `backup` spec's profiles, encrypted to age
-   recipients, uploaded with rclone) and `restore <object> --identity`, loading into a database
-   of its own and swapping only once the load succeeded. Tests: a scheduled backup lands at the
-   destination; a restore into an install made with `--secrets` brings back the data its keys
-   decrypt; a failed load leaves the current database serving.
-7. **The disk-pressure watch on Docker.** `hooks.maintenance.disk_pressure` runs only on the VM
-   (the host daemon), so on Docker nothing calls the project's purge and the data volume can fill
-   until the database stops. The Docker shape gets the same watch — the volume's filesystem read
-   at start and every 10 min, the POST at `soft_pct`, a `status` line past `hard_pct` — run by
-   the installed stack, not by the operator's cron. Test: a filled test volume triggers the POST
-   with the hook's bearer.
-8. **A byo certificate's lifecycle.** Its expiry is read only when the install or a re-run copies
-   it, so an expired certificate is a hard outage on every route with nothing said before.
-   - `status` names the installed certificate's `notAfter` and warns from 30 days before it (on
-     the VM, also an event in the journal).
-   - Without `--ca`, a chain that does not verify to the host's system roots is refused or warned
-     about: a leaf given without its intermediate is accepted today, and clients that do not fetch
-     intermediates (curl, Go, Python) then fail while browsers work.
-   - Tests: a certificate expiring within the window shows the warning; a leaf-only file without
-     `--ca` is refused (or warned), the same file with its intermediate accepted.
-9. **`mirror export` scoped to what the site runs.**
-   - `--version V`: an export carries the channel's latest release only (its pointer: the highest
-     version shipped), so a site without internet cannot take a release older than the latest
-     across — to hold at one, or to upgrade one step at a time past a rollback barrier. `--version
-     V` exports that release of the channel, as `upgrade --version` fetches one.
-   - `--shapes docker,kubernetes`: the OS bundle is always exported, even with `--disks none`,
-     and is most of the archive (1.9 GiB of 2.9 GiB measured) for a site that runs no VM. Leaving
-     out the kairos shape omits the OS bundle and its disks; the mirror's release still names
-     them, and a `vm create` against that mirror says what is missing.
-   - Tests: `--version` of an earlier release exports and installs it; `--shapes docker` exports
-     no OS bundle, and a Docker install from it succeeds.
-10. **Kubernetes: the rollback barrier before `helm rollback`.** Docker and the VM refuse a
-    rollback across a schema barrier the schema-compat provider reports; `k8s rollback` runs
-    `helm rollback` without asking, so an older release can start on a schema it cannot read. The
-    same pre-flight, against the release's database, before helm is called. Test: a rollback
-    across a barrier is refused and names it; one that crosses none goes through.
 
 ## Should
+
+- **Kubernetes schema check for a `command` schema-compat provider**: `shapes.kubernetes.schema`
+  runs the `sql` provider's queries in a pod; a `command` provider's ops (JSON on stdin) are not
+  run on Kubernetes, so its rollback is not checked there.
+- **Docker restore drill of a machine made again**: e2e-docker restores into the install the
+  backup came from; an install made with `--secrets` that then restores (`restore_awaited`) is
+  unit-tested only on Docker.
+- **Untag on a registry deleting no tag alone, at scale**: `untag` lists and reads every tag of
+  the repository to find the others on a digest, once per tag; `prune` on ghcr does it for each
+  image, installer, chart, bundle and release tag. Read each repository's tags once per prune.
+- **One rule for a boot set's stowage**: which stowage published a release's boot set (its own
+  disks' or `boot_disks`') is written in the publisher (`bootSet`) and the installer (`vm create`);
+  one helper beside `release.Artifacts.Boot`.
+- **A killed read leaves an rclone config**: `backup list` on Docker (and on the VM, under the
+  daemon's runtime directory) writes the destination's rclone config to a temporary directory
+  removed once read; a SIGKILL leaves it. Sweep stale ones.
+- **The Docker disk-pressure check end to end**: `disk-check` and its timer are unit-tested; no
+  suite runs the check against a filled volume on a Docker host.
 
 - **`uninstall` on Docker**: removing an install is `docker compose … down -v` by hand in its
   directory, plus the directory. `uninstall` takes the stack down, deletes its volumes (asking,

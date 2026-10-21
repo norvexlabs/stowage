@@ -255,6 +255,8 @@ func (in *Installer) k8sRunHook(ctx context.Context, p *k8sHookPlan, set map[str
 			why = "not a variable name"
 		case reserved[key]:
 			why = "now a value of the release (its Secret, a safe default) or of the ConfigMap " + k.hookName()
+		case slices.Contains(in.dropped.returns, key):
+			why = fmt.Sprintf("which the provision hook of %s %s no longer returns", in.R.Spec.Name, in.R.Manifest.ProjectVersion)
 		}
 		if why != "" {
 			o.logf("the Secret %s: dropping %s, %s", k.hookName(), key, why)

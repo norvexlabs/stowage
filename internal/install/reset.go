@@ -297,7 +297,8 @@ func (in *Installer) K8sReset(ctx context.Context) error {
 			return fmt.Errorf("release %s in %s already runs %s %s (revision %d): --new-baseline installs another release, which this installer does not carry; reset-db without it wipes this one",
 				k.Release, k.Namespace, m.Name, r.Version, r.Revision)
 		}
-		from, to, ok := in.k8sBaselines(ctx, cur, cmp.Or(k.Registry, cur.Registry))
+		running, runErr := in.k8sRunning(ctx, cur, cmp.Or(k.Registry, cur.Registry))
+		from, to, ok := in.k8sBaselines(running, runErr, cur)
 		crosses := ok && from != to
 		switch {
 		case !k.NewBaseline && crosses:
