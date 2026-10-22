@@ -3,7 +3,7 @@
 Stowage's own releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
-## [0.8.0]
+## [0.8.0] - 2026-10-22
 
 ### Added
 - **A project without a front**: leave `front` out and the stack is served by its L4 routes
