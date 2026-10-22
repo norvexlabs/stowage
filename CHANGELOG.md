@@ -3,6 +3,18 @@
 Stowage's own releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
+## [0.9.0]
+
+### Added
+- **`tune`**: the Docker host's network tuning for many connections, UDP and QUIC, and tunnels,
+  sized from its RAM and CPUs — every memory ceiling a share of RAM, used under load only. `tune`
+  reports what differs (`--check` exits non-zero), `--print` prints the files, `--apply` (root,
+  asks first) writes and applies them, `--revert` puts the host back. Docker is never restarted
+  unless `--restart-docker`. The install and `upgrade` say in one line when the host differs.
+- **The containers get the network settings their namespace keeps of its own** (listen queues,
+  TCP buffers, latency and MTU probing), sized from the host, except those a service sets itself
+  or shares another's network for. A stack's services are recreated once, at their next start.
+
 ## [0.8.0] - 2026-10-22
 
 ### Added

@@ -1242,6 +1242,30 @@ every shape, the VM end-to-end test upgrading through it), then the health gate.
   by `ship` from a recipe in `stowage`, like the backup runner, and published only for a release
   that needs it. The front's image could run it, but would tie volume ownership to the front's
   recipe and ship a Caddy with a project that has no front.
+- **Network tuning is a share of RAM, one rule set, applied only where the OS is Stowage's** —
+  the stacks scale on connections, UDP (QUIC through the L4 routes) and tunnels, which the
+  kernel's defaults starve (socket buffers below what QUIC asks, forwarded UDP unbatched, a
+  1500 MTU bridge on a 1460 or 9001 link). A fixed value is wrong for a 1 GiB VM or a 64 GiB
+  host, so each memory ceiling is a share of RAM, and every ceiling is memory used under load,
+  never held (the one reserve, `min_free_kbytes`, at most 0.5 %). `internal/tune` holds the rules
+  and is the only place that sizes them: the Docker host's `tune` reports, prints or applies them,
+  the containers get the namespaced ones in `stowage-content.yaml`. A Docker host's OS is the
+  operator's: nothing changes there unless asked, Docker is never restarted unasked (it restarts
+  the containers), a ceiling the host holds higher is kept (the two socket budgets excepted:
+  they are the RAM shares, exact, below the kernel's ~9 %), and `--revert` puts back what the
+  first apply found — and a ceiling is judged against that record, so a host that shrank is not
+  held at a larger one's values. RAM is read to 64 MiB, so a kernel's few KiB never make another
+  host, and the containers' buffer is a power of two, so only a doubling of RAM rewrites their
+  settings and recreates them; a start whose engine does not answer fails rather than drop them
+  for one start (which would recreate every service twice). What `--apply` cannot change (the NIC's
+  driver, a missing `ethtool`, a key dockerd takes as a flag) is advice or n/a, never drift, so
+  `--check` settles after an apply. A container's own namespace starts from the kernel's defaults, not the
+  host's, so its settings are given per service — only those its kernel has (a missing key would
+  fail its start: none before Linux 4.15, nor in a user namespace of the containers' own), and
+  never a service's own. The files are named for Stowage, not a stack: two
+  stacks on one host write the same values instead of competing. Left out: Docker's userland
+  proxy (turning it off breaks a loopback install on `::1`, and it carries only local
+  traffic), widening the ephemeral port range (it would take ports an L4 route publishes).
 - **The adoption proof lives in the tree** — Stowage knows no project, so the proof that a
   production project can adopt it is `examples/full` made a working stack with that project's
   traits, walked through each shape's lifecycle by its own end-to-end suite; a real project's

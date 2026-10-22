@@ -40,6 +40,7 @@ import (
 	"github.com/norvexlabs/stowage/internal/registry"
 	"github.com/norvexlabs/stowage/internal/release"
 	"github.com/norvexlabs/stowage/internal/spec"
+	"github.com/norvexlabs/stowage/internal/tune"
 )
 
 // Options is one run of the installer.
@@ -121,6 +122,9 @@ type Options struct {
 	Systemd string
 	// Roots are the host's trusted CAs a byo chain is checked against; nil is the system's.
 	Roots func() (*x509.CertPool, error)
+	// Tune is the host tune reads and changes (`tune`, the containers' network settings, the
+	// hint after a start); nil tunes nothing.
+	Tune *tune.System
 	// SourceAddr is the address this machine reaches dst from; nil asks the system's routes.
 	// LookupIP resolves a host name; nil is the system's resolver.
 	SourceAddr func(dst netip.Addr) (netip.Addr, error)
@@ -142,9 +146,11 @@ type Installer struct {
 	// removeDir: this run created the install directory before writing the install, so a failure
 	// before .env removes it again.
 	removeDir bool
-	byo       *byoCert          // --tls byo: the operator's certificate, checked
-	newCert   *byoCert          // a re-run's byo certificate, written before the stack comes up again
-	answered  map[string]string // the form's answers, kept when it goes back to the TLS mode
+	// tuned is the host's tune.System once its engine read: one `docker info` per run.
+	tuned    *tune.System
+	byo      *byoCert          // --tls byo: the operator's certificate, checked
+	newCert  *byoCert          // a re-run's byo certificate, written before the stack comes up again
+	answered map[string]string // the form's answers, kept when it goes back to the TLS mode
 	// recorded are the values an upgrade keeps, which an added input's default may name.
 	recorded map[string]string
 	// again: this run is a re-run of an install.
@@ -1044,8 +1050,14 @@ func (in *Installer) Compose(ctx context.Context, env *EnvFile, stream io.Writer
 // composeBase is `docker compose` on the install's stack, plus the extra compose files. The content
 // labels are named only when the file exists.
 func (in *Installer) composeBase(extra ...string) []string {
+	return in.composeFiles(true, extra...)
+}
+
+// composeFiles is composeBase, without ContentCompose unless content: the stack as the release
+// and the front define it, before the installer adds to each service.
+func (in *Installer) composeFiles(content bool, extra ...string) []string {
 	base := []string{"compose", "--project-directory", in.O.Dir, "-f", in.path("compose.yaml"), "-f", in.path(FrontCompose)}
-	if _, err := os.Stat(in.path(ContentCompose)); err == nil {
+	if _, err := os.Stat(in.path(ContentCompose)); err == nil && content {
 		base = append(base, "-f", in.path(ContentCompose))
 	}
 	for _, f := range extra {
@@ -1082,7 +1094,7 @@ func (in *Installer) up(ctx context.Context, env *EnvFile) error {
 	if err != nil {
 		return err
 	}
-	if err := in.writeContent(m, environ); err != nil {
+	if err := in.writeContent(ctx, m, environ); err != nil {
 		return err
 	}
 	// Listed once: a retry finds the volumes its first try made, and they await their uid.

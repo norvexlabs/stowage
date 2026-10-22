@@ -19,6 +19,7 @@ import (
 
 	"github.com/norvexlabs/stowage/internal/payload"
 	"github.com/norvexlabs/stowage/internal/spec"
+	"github.com/norvexlabs/stowage/internal/tune"
 )
 
 // Command is the installer's command line: with no subcommand it installs (or finishes an
@@ -33,7 +34,8 @@ func newCommand(r *Release, self string, stdout, stderr io.Writer, tools K8sOpti
 	if r.Manifest.Bundled() {
 		return vmCommand(r, self, stdout, stderr, terminal, 0)
 	}
-	o := Options{Out: stdout, Log: stderr, Docker: ExecTool{Bin: "docker"}, Tofu: ExecTool{Bin: "tofu", Grace: 5 * time.Minute}, SSH: ExecTool{Bin: "ssh"}, Self: self, K8s: tools}
+	o := Options{Out: stdout, Log: stderr, Docker: ExecTool{Bin: "docker"}, Tofu: ExecTool{Bin: "tofu", Grace: 5 * time.Minute}, SSH: ExecTool{Bin: "ssh"}, Self: self, K8s: tools,
+		Tune: hostTune(r.Ctl(), runHost, tune.SystemLook)}
 	if _, err := os.Stat("/proc/self/exe"); err == nil {
 		o.SelfExe = "/proc/self/exe" // the running file, even when its path was replaced since
 	}
@@ -248,6 +250,7 @@ func newCommand(r *Release, self string, stdout, stderr io.Writer, tools K8sOpti
 		root.AddCommand(vmCreateCommand(in, &o, prepare, terminal, &sets, &domains, &answers, &noInput, &accessible))
 	}
 	root.AddCommand(mirrorCommand(in, &o, prepare))
+	root.AddCommand(tuneCommand(in, prepare, terminal))
 	root.AddCommand(dockerHostCommands(in, prepare, dirFlag, stdout, stderr, terminal)...)
 	if r.Spec.Shapes.Kubernetes != nil && r.Spec.Hooks.Provision != nil {
 		root.AddCommand(k8sHookPodCommand(stderr))

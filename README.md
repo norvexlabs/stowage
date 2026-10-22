@@ -390,6 +390,10 @@ API it is set up through) packages without changing the software, through the co
   advertises given by the route's `address_input` (`STOWAGE_L4_<ROUTE>`), the sources the VM's
   firewall lets reach it by its `allow_input`. The front can move off 443 with
   `front.https_port`, when a daemon owns it.
+- **UDP, QUIC and tunnels at speed**: the containers get the network settings their namespace
+  keeps of its own, and [`tune`](#network-tuning-short-stow-tune) tunes the host (the socket
+  buffers QUIC asks for, forwarded UDP kept batched, TUN devices' queues); a TUN device in a
+  container is the payload's to tune (same section).
 - **Material minted once** (a CA, a server key and certificate, a token): a one-shot service of a
   small image (openssl, step-cli) writes it into a named volume, keeping what it finds there, and
   the services that read it `depends_on` it with `condition: service_completed_successfully` and
@@ -1263,6 +1267,8 @@ again, to copy an installer to another host.
 <short>-stow backup config|run|status|list|verify [--dir D] [the VM's flags]   # a pg-age-rclone backup
 <short>-stow restore OBJECT [--dir D] [--identity FILE|-] [--yes] [--accessible]
 <short>-stow script                                                      # print the bootstrap script
+<short>-stow tune [--check | --print]                                    # the host's network tuning
+<short>-stow tune --apply | --revert [--yes] [--restart-docker] [--no-input] [--accessible]
 <short>-stow mirror export [--channel C] [--version V [--revision N]] [--shapes S,…] [--output FILE] [--disks F,…|none]
 <short>-stow mirror import FILE --to PREFIX [--registry-ca FILE] [--older]
 ```
@@ -1354,6 +1360,18 @@ again, to copy an installer to another host.
     start recreates it. A file-backed config is a bind mount, which a change reaches as it is. The
     HMAC's key is the install's own, `.stowage-content.key` (0600, made at the first start), so a
     label tells nothing of the secrets it covers; a lost key only recreates those services once.
+    The same file gives each service with a network namespace of its own (no `network_mode`, or
+    `network_mode: bridge`) the network settings a namespace keeps apart from the host's, sized
+    from this host as [`tune`](#network-tuning-short-stow-tune) sizes them: `net.core.somaxconn`
+    and `net.ipv4.tcp_max_syn_backlog` 8192, `net.ipv4.tcp_rmem` / `tcp_wmem` up to the socket
+    buffer, `tcp_notsent_lowat` 131072, `tcp_slow_start_after_idle` 0, `tcp_mtu_probing` 1 —
+    each one the service does not set in its own `sysctls:`, and the host's kernel has. None on
+    Linux older than 4.15 (those keys are not a namespace's there), on rootless Docker or
+    `userns-remap` (a user namespace of the containers' own hides them), or on Docker Desktop;
+    a start whose `docker info` does not answer fails rather than drop them. They follow RAM by
+    doubling (the buffer is a power of two), so a small change of RAM recreates nothing. A change
+    of them (the host's RAM changed) recreates the services at the next start, as any change of
+    the service does.
     An install made by an earlier Stowage has no `stowage-content.yaml` until its next start, and
     a rollback to a release it kept removes the file (the labels go with their compose file);
   - `provision.env` and the hook's `outputs` file;
@@ -1719,6 +1737,90 @@ keeps (`<dir>/<short>-stow`, the release it runs; another is refused).
   `DockerRootDir`), and from `soft_pct` POSTs the level as the VM's watch does, the last POST kept
   in `disk-pressure.json`, which `status` shows. Without systemd or root it is not installed, and
   the install says so; a release without the hook removes the units.
+
+#### Network tuning (`<short>-stow tune`)
+
+The host's kernel and Docker engine, tuned for network throughput (many connections, UDP and QUIC
+through the L4 routes, tunnels on TUN devices) without holding memory: every memory ceiling is a
+share of the host's RAM, which the kernel uses under load only. On a Docker host the OS is the
+operator's, so nothing changes until they ask; the install and `upgrade` end with one line,
+`tuning   N network settings of this host differ …`, when the host differs.
+
+- `tune` reports each item, its value here and the one wanted, `ok`, `differs`, `advice` (a
+  setting outside the OS: never applied, never counted) or `n/a`; it needs no root, and no
+  engine but for the daemon's file, which it leaves out (and says so) when `docker info` does
+  not answer. `--check`
+  exits non-zero when one differs (monitoring, CI). `--print` prints the files `--apply` writes,
+  for a host configured by other means. `--apply` (root) prints what it writes, asks (`--yes`
+  without a terminal, else it refuses), writes the files and applies them to the running host;
+  `--revert` (root, asks too) removes them and puts back what the first `--apply` found.
+- The rules, from the host's RAM (`MemTotal`, rounded down to 64 MiB, so a few KiB from one
+  kernel to the next is the same host) and its online CPUs. The value is the one written; "at
+  least" (and "at most"): a host holding more (less) keeps it, field by field — judged, while a
+  value is still the one `--apply` wrote, against what the host held before the first `--apply`
+  (`tune.json`), so a host that shrank goes back down to its own share; a value changed since
+  is the host's own, and kept when the rule allows it. The two socket
+  budgets, `tcp_mem` and `udp_mem`, are the RAM shares themselves, written exactly — below the
+  kernel's own default of about 9 % of RAM:
+
+  | Setting | Value |
+  |---|---|
+  | `net.core.rmem_max`, `wmem_max`, the top of `net.ipv4.tcp_rmem` / `tcp_wmem` | RAM / 256 rounded down to a power of two, from 8 MiB (a QUIC stack asks 7) to 64 MiB, at least; `tcp_rmem` `4096 131072 …`, `tcp_wmem` `4096 16384 …` |
+  | `net.ipv4.tcp_mem`, `net.ipv4.udp_mem` (all sockets) | 4, 6 and 8 % of RAM, in pages |
+  | `net.core.netdev_max_backlog` | 1 % of RAM across the CPUs at 2 KiB a packet, from 1000 to 32768, at least |
+  | `net.netfilter.nf_conntrack_max` / `nf_conntrack_buckets` | 2 % of RAM at 320 B an entry / a quarter of it, at least |
+  | `vm.min_free_kbytes` | 0.5 % of RAM, at most 128 MiB, at least (a small host keeps the kernel's larger default) |
+  | `net.core.rps_sock_flow_entries` | RAM / 128 KiB, a power of two from 4096 to 65536, at least |
+  | `net.core.default_qdisc`, `net.ipv4.tcp_congestion_control` | `fq`, `bbr` |
+  | `net.ipv4.tcp_notsent_lowat` | 131072, at most |
+  | `net.ipv4.tcp_slow_start_after_idle`, `tcp_mtu_probing` | 0, 1 (at least) |
+  | `net.core.somaxconn`, `net.ipv4.tcp_max_syn_backlog` | 8192, at least |
+  | `net.ipv4.conf.all.rp_filter`, `conf.default.rp_filter` | 2 (loose; any value but 1 passes): a tunnel's replies may come back another way |
+  | a NIC backed by a device | `ethtool -K <nic> rx-udp-gro-forwarding on rx-gro-list off`: forwarded UDP (QUIC to a container, a tunnel) stays batched |
+  | a TUN or TAP device made in the host's namespace | `tx_queue_len` 1 % of RAM at 2 KiB a packet, from 500 to 10000; `queues/rx-0/rps_cpus` every online CPU; `rps_flow_cnt` as `rps_sock_flow_entries` |
+  | the `tun` module | present |
+  | Docker's `daemon.json` | `default-ulimits.nofile` 1048576 soft and hard, at least; `default-network-opts.bridge."com.docker.network.driver.mtu"` the default route's MTU when it is not 1500 (Docker ≥ 24; the networks made from then on, a stack's at its first start) |
+
+- The files, named for Stowage rather than one stack (two stacks write the same values):
+  `/etc/sysctl.d/60-stowage-net.conf`; `/etc/modules-load.d/60-stowage-net.conf` (`tun`,
+  `nf_conntrack`, `tcp_bbr`, `sch_fq`, loaded at boot, before the settings that need them);
+  `/etc/udev/rules.d/60-stowage-net.rules` (the NICs' offload, left out without `ethtool`
+  installed, and the TUN devices' queues, at each device's appearance); the keys above merged
+  into the daemon's file — `/etc/docker/daemon.json`, or the `--config-file` of the dockerd that
+  runs as root (snap; a relative one from `/`; a user's rootless dockerd is never read) — its
+  other keys kept (a file that does not parse is refused, nothing written);
+  `/etc/stowage/tune.json`, the values the first `--apply` found (the modules loaded first, so
+  their settings are there), the values the last one wrote, and each daemon key it set with its
+  file, which `--revert` reads; a `tune.json` that does not read is reported as `differs`.
+  `--apply` and `--revert` refuse a user before they read or ask anything; `--apply` and
+  `--print` refuse Docker Desktop (running, or stopped: the CLI's context names it), whose
+  containers this host's settings miss.
+- On the running host `--apply` loads the modules (`modprobe`), writes the settings, runs
+  `ethtool` on each NIC and sets the TUN devices there. An interface already up takes `fq` when
+  it next comes up. Docker reads its file when it restarts, which restarts the containers:
+  `--apply` says so and leaves it to the operator, unless `--restart-docker` (`systemctl restart
+  docker`). `--revert` puts back each daemon key still holding what `--apply` set (one changed
+  since is left, and said), writes back the settings the first `--apply` found, and leaves the
+  NICs' offload and the TUN queues until the next boot.
+- `advice` judges each NIC on what its hypervisor or cloud decides: an emulated NIC (e1000,
+  rtl8139: give the VM a virtio or vmxnet3 one), a virtio NIC with fewer receive queues than
+  vCPUs (multiqueue), virtio on Compute Engine (gVNIC), an Azure NIC without accelerated
+  networking, a Xen NIC (an instance type with ENA).
+- `advice` also covers a NIC `ethtool` cannot read, and a host without `ethtool` (install it,
+  then `--apply` sets the offload).
+- `n/a`: on Docker Desktop the containers run in its own VM, which this host's settings miss;
+  rootless Docker's daemon file and network are the user's, and are left out; an offload the
+  kernel or the driver fixes (`[fixed]`, or none: Linux before 5.12); a daemon key dockerd is
+  started with as a flag (`--default-ulimit`, `--default-network-opt`), which its file may not
+  repeat — dockerd refuses to start on both — so `--apply` leaves it out and says so.
+- `--revert` and `--print` run without a reachable engine (`--print` then leaves the daemon
+  file out): an engine that does not start may be what is reverted.
+- A payload's own TUN device lives in its container's namespace, which the host's rules do not
+  reach: the payload gets it with `devices: [/dev/net/tun]` and `cap_add: [NET_ADMIN]` in its
+  compose file (Stowage grants neither), sets its offloads itself (`TUNSETOFFLOAD`: TCP and UDP
+  segments, on kernel 6.2 or later), its queue (`ip link set <tun> txqueuelen …`, or a
+  multi-queue TUN) and its MTU (the host's, less the tunnel's overhead). Its UDP socket may ask
+  for the host's `rmem_max` / `wmem_max`, which hold for every namespace.
 
 ### The installer on Kubernetes (`<short>-stow k8s`)
 

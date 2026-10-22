@@ -25,7 +25,7 @@ func labels(t *testing.T, m string, environ ...string) map[string]string {
 	if err := json.Unmarshal([]byte(m), &model); err != nil {
 		t.Fatal(err)
 	}
-	raw, err := contentCompose(&model, environ, []byte("key"))
+	raw, err := contentCompose(&model, environ, []byte("key"), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -75,11 +75,11 @@ func TestContentLabelsFollowWhatComposeRenders(t *testing.T) {
 	if err := json.Unmarshal([]byte(stack("one", "/x")), &model); err != nil {
 		t.Fatal(err)
 	}
-	other, err := contentCompose(&model, []string{"SEC=x"}, []byte("another key"))
+	other, err := contentCompose(&model, []string{"SEC=x"}, []byte("another key"), nil)
 	if err != nil || strings.Contains(string(other), first["a"]) || strings.Contains(string(other), first["b"]) {
 		t.Errorf("another key gave the same labels: %s, %v", other, err)
 	}
-	none, err := contentCompose(&composeModel{}, nil, []byte("key"))
+	none, err := contentCompose(&composeModel{}, nil, []byte("key"), nil)
 	if err != nil || string(none) != contentPlaceholder {
 		t.Errorf("no rendered file: %q, %v", none, err)
 	}

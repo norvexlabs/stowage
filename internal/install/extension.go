@@ -44,6 +44,9 @@ func (in *Installer) Finished(ctx context.Context, shape string) {
 			fmt.Fprintf(in.O.Out, "endpoint  %s (the URL a project using %s as an extension is given)\n", url, in.R.Spec.Name)
 		}
 	}
+	if shape == onDocker && !in.O.Preloaded {
+		in.tuneHint(ctx)
+	}
 	prefix, _ := env.Get("STOWAGE_REGISTRY")
 	in.extensionTips(ctx, shape, prefix, func(key string) (string, bool) { return env.Get(key) })
 }

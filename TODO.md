@@ -223,6 +223,11 @@ A finished item is deleted, not ticked. The plan behind it is
 
 ## Could
 
+- **`tune` as a user on a `hidepid` host**: without root, `/proc` hides dockerd's command line,
+  so the report judges `/etc/docker/daemon.json` where the engine may read a `--config-file`
+  (which `--apply`, as root, writes): the report can show the daemon keys as differing after a
+  good apply. Say so in the report when no dockerd is visible to a user.
+
 - **Retired release tags stay**: on a registry that deletes no tag alone, a tag `prune` retired
   (a release's, an image's, an installer's) is never visited again, even once the registry deletes
   tags alone; each costs a read in every release listing. Only floating tags are deleted then.

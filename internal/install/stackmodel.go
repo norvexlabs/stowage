@@ -18,8 +18,9 @@ import (
 	"go.yaml.in/yaml/v3"
 )
 
-// ContentCompose is the stack file that labels each service with what Compose renders into it
-// (contentCompose). It is written before each `up` and kept between runs.
+// ContentCompose is the stack file of what the installer adds to each service (contentCompose):
+// the label of what Compose renders into it, and the network settings its namespace keeps of its
+// own. It is written before each `up` and kept between runs.
 const ContentCompose = "stowage-content.yaml"
 
 // ContentKey is the install's key of the content labels, private to it: a label is a keyed digest,
@@ -32,13 +33,16 @@ const ContentLabel = "io.stowage.content"
 
 // contentPlaceholder is ContentCompose before the stack's first `up`: every compose command
 // names the file.
-const contentPlaceholder = "# Written by the installer: what Compose renders into each service, labelled at each start.\n{}\n"
+const contentPlaceholder = "# Written by the installer: what it adds to each service at each start.\n{}\n"
 
 // composeModel is what the installer reads of `docker compose config`: the stack as Compose runs
-// it, its variables interpolated and the services of profiles that are off left out.
+// it, its variables interpolated and the services of profiles that are off left out, without
+// ContentCompose.
 type composeModel struct {
 	Services map[string]struct {
-		Configs []struct {
+		NetworkMode string            `json:"network_mode"`
+		Sysctls     map[string]string `json:"sysctls"`
+		Configs     []struct {
 			Source string `json:"source"`
 		} `json:"configs"`
 		Secrets []struct {
@@ -64,9 +68,10 @@ type renderedFile struct {
 	Environment string `json:"environment"`
 }
 
-// model reads the stack as Compose runs it with environ.
+// model reads the stack as Compose runs it with environ, without what ContentCompose adds: a
+// setting the model names is the project's.
 func (in *Installer) model(ctx context.Context, environ []string) (*composeModel, error) {
-	out, err := in.O.Docker.Run(ctx, Cmd{Args: append(in.composeBase(), "config", "--format", "json"), Env: environ})
+	out, err := in.O.Docker.Run(ctx, Cmd{Args: append(in.composeFiles(false), "config", "--format", "json"), Env: environ})
 	if err != nil {
 		return nil, fmt.Errorf("docker compose config: %w", err)
 	}
@@ -80,8 +85,9 @@ func (in *Installer) model(ctx context.Context, environ []string) (*composeModel
 // contentCompose labels each service with an HMAC, under key, of the configs and secrets Compose
 // renders into it (inline content, an environment variable's value from environ): Compose copies
 // them into the container as it creates it, and recreates none when only they change, so the
-// label makes their change one of the service's.
-func contentCompose(m *composeModel, environ []string, key []byte) ([]byte, error) {
+// label makes their change one of the service's. It gives each service with a network namespace
+// of its own the sysctls it does not set itself.
+func contentCompose(m *composeModel, environ []string, key []byte, sysctls map[string]string) ([]byte, error) {
 	lookup := func(k string) string {
 		for _, kv := range slices.Backward(environ) {
 			if name, v, ok := strings.Cut(kv, "="); ok && name == k {
@@ -113,8 +119,24 @@ func contentCompose(m *composeModel, environ []string, key []byte) ([]byte, erro
 		for _, s := range svc.Secrets {
 			add("secret", m.Secrets, s.Source)
 		}
+		extra := map[string]any{}
 		if n > 0 {
-			services[name] = map[string]any{"labels": map[string]string{ContentLabel: "hmac-sha256:" + hex.EncodeToString(h.Sum(nil))}}
+			extra["labels"] = map[string]string{ContentLabel: "hmac-sha256:" + hex.EncodeToString(h.Sum(nil))}
+		}
+		// The host's namespace, or another service's, is no service's own to set.
+		if svc.NetworkMode == "" || svc.NetworkMode == "bridge" {
+			own := map[string]string{}
+			for k, v := range sysctls {
+				if _, set := svc.Sysctls[k]; !set {
+					own[k] = v
+				}
+			}
+			if len(own) > 0 {
+				extra["sysctls"] = own
+			}
+		}
+		if len(extra) > 0 {
+			services[name] = extra
 		}
 	}
 	if len(services) == 0 {
@@ -124,7 +146,7 @@ func contentCompose(m *composeModel, environ []string, key []byte) ([]byte, erro
 	if err != nil {
 		return nil, err
 	}
-	return append([]byte("# Written by the installer: what Compose renders into each service, labelled at each start.\n"), out...), nil
+	return append([]byte("# Written by the installer: what it adds to each service at each start.\n"), out...), nil
 }
 
 // contentKey is the install's key of the content labels, made once (0600, never logged): losing it
@@ -151,12 +173,16 @@ func (in *Installer) contentKey() ([]byte, error) {
 }
 
 // writeContent writes ContentCompose for the stack as Compose runs it with environ.
-func (in *Installer) writeContent(m *composeModel, environ []string) error {
+func (in *Installer) writeContent(ctx context.Context, m *composeModel, environ []string) error {
 	key, err := in.contentKey()
 	if err != nil {
 		return fmt.Errorf("%s: %w", ContentKey, err)
 	}
-	raw, err := contentCompose(m, environ, key)
+	sysctls, err := in.containerSysctls(ctx)
+	if err != nil {
+		return err
+	}
+	raw, err := contentCompose(m, environ, key, sysctls)
 	if err != nil {
 		return err
 	}
