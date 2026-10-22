@@ -16,6 +16,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/google/go-containerregistry/pkg/authn"
@@ -257,6 +258,19 @@ func (c *Client) Referrers(ctx context.Context, d name.Digest, t types.MediaType
 // ErrNotArtifact marks a reference that exists but holds something other than the artifact type
 // asked for: a definite answer, unlike a failed read.
 var ErrNotArtifact = errors.New("not an artifact of the requested type")
+
+// RetiredMediaType is the type of the retired artifact, which a tag is moved onto in place of its
+// removal on a registry that deletes no tag alone: GetArtifact reads a tag holding it as absent.
+const RetiredMediaType types.MediaType = "application/vnd.stowage.retired.v1+json"
+
+// Retired is the retired artifact. Its one layer is "{}", so it is one manifest, RetiredDigest,
+// in every repository.
+func Retired() Artifact { return Artifact{Type: RetiredMediaType, Data: []byte("{}")} }
+
+// RetiredDigest is the retired artifact's manifest digest.
+func RetiredDigest() (v1.Hash, error) { return retiredDigest() }
+
+var retiredDigest = sync.OnceValues(func() (v1.Hash, error) { return Retired().Digest() })
 
 // Labels are the labels of the image ref names (an index: its linux/amd64 image's).
 func (c *Client) Labels(ctx context.Context, ref name.Reference) (map[string]string, error) {
@@ -583,12 +597,21 @@ func (c *Client) PutManifest(ctx context.Context, repo name.Repository, m Manife
 	return h, nil
 }
 
-// GetArtifact reads an artifact of type want. It returns nil when ref does not exist, and an error
-// when ref holds anything else.
+// GetArtifact reads an artifact of type want. It returns nil when ref does not exist or is a tag
+// holding the retired artifact, and an error when ref holds anything else.
 func (c *Client) GetArtifact(ctx context.Context, ref name.Reference, want types.MediaType) (*Artifact, v1.Hash, error) {
 	d, err := c.Get(ctx, ref)
 	if err != nil || d == nil {
 		return nil, v1.Hash{}, err
+	}
+	if _, tag := ref.(name.Tag); tag && want != RetiredMediaType {
+		r, err := RetiredDigest()
+		if err != nil {
+			return nil, v1.Hash{}, fmt.Errorf("retired artifact: %w", err)
+		}
+		if d.Digest == r {
+			return nil, v1.Hash{}, nil
+		}
 	}
 	var m struct {
 		ArtifactType types.MediaType   `json:"artifactType"`

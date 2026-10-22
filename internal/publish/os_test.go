@@ -478,7 +478,7 @@ func TestADroppedFormatsLatestTagIsRetiredWhereNoTagDeletes(t *testing.T) {
 	e.mustShip("stable", 1)
 	// The retired artifact is a format: its digest changes only with a new media type.
 	const want = "sha256:bdd095c53eaab1e07bc8f68df2cc39eeddb7eaa6c070661698961aef3d16ce5b"
-	r, err := retiredDigest()
+	r, err := registry.RetiredDigest()
 	if err != nil || r.String() != want {
 		t.Fatalf("retired digest %s %v, want %s", r, err, want)
 	}

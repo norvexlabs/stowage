@@ -702,8 +702,10 @@ platform is part of an image's inputs). What `ship` does, in order:
    `latest-<format>` follows the channel's disk set (a format the set has none of loses its tag);
    `verify` of that channel compares their digests with the pointer's and the set's. On a
    registry that deletes no tag alone (ghcr), a floating tag with nothing to offer is retired
-   instead of removed: moved onto a small artifact of type `application/vnd.stowage.retired.v1+json`, which `ship` and `verify` read as
-   absent, and the ship logs `… retired: the registry deletes no tag alone`. A retired tag holds
+   instead of removed: moved onto a small artifact of type
+   `application/vnd.stowage.retired.v1+json`, which every reader (`ship`, `verify`, the installer,
+   a mirror, the VM's upgrades) takes for absent, and the ship logs `… retired: the registry
+   deletes no tag alone`. A retired tag holds
    no image or disk (its one blob is `{}`): nothing is on offer under it. Once the registry
    deletes tags alone, the next ship deletes it;
 7. a ship that published disks, once the pointer is on its release, records them as the channel's
@@ -811,8 +813,12 @@ checked before anything is written. Re-shipping a yanked release fails: publish 
 release that is not yanked and verifies, removing it when none is left; a broken release can
 always be yanked. `prune` deletes tags (the release's images, installer, chart, OS bundle and
 disk tags first, its manifest last; disks as "Disk sets" says): a registry that deletes no tag
-alone has a manifest deleted by digest through `registry.delete` when no other tag holds it, and
-refuses, naming the tags, otherwise.
+alone has a manifest deleted by digest through `registry.delete` when no other tag holds it; when
+another does (the channel pointer, `:latest`, another release's tag of the same image), the tag is
+retired as step 6 of `ship` says and logged `<tag> retired: the registry deletes no tag alone; its
+content stays under <tags>`. Once the pointer and `:latest` have moved, the prune deletes by digest
+what no tag holds any more (logged `<ref> deleted: no tag holds it any more`). A retired release
+tag is no release: `prune`, `verify`, installs and mirrors skip it; it stays in the registry.
 
 Global flags: `-C <dir>` project root (default `.`), `-f <file>` spec file (default
 `<dir>/stowage.yaml`). Exit codes: `0` success, `1` failure or lint errors, `3` a release `ship`

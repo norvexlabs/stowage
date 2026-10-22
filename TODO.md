@@ -27,15 +27,13 @@ A finished item is deleted, not ticked. The plan behind it is
    `terraform-provider-openstack/openstack`, whichever the latest official docs make canonical).
    Before writing a module, read the latest provider's official docs and its schema, and pin that
    release.
-4. **The last release of a channel yanked on a registry that deletes no tag alone**: the channel
-   pointer `:<channel>` shares its manifest with the release's own tag, so removing it is refused
-   (`untag` names the other tag) and the yank or prune stops there. Retire it as the floating
-   tags are, with the pointer's readers taking a retired tag for no pointer. Likewise `prune
-   <version>` of the pointer's release: `untag` of its installer tag is refused while `:latest`
-   shares it, before the pointer moves back; retiring a floating tag in `untag` covers both.
 
 ## Should
 
+- **A prune on a registry that deletes no tag alone reads every tag per refused delete**: `untag`
+  and the sweep after it list the repository and read each tag for each tag they remove, so a
+  prune of many releases makes a quadratic number of requests and may meet the registry's rate
+  limit. One tag-to-digest snapshot per repository per prune would do.
 - **The compose model in a package of its own**: the installer imports `internal/lint` for
   `ServiceProfiles`, `ServiceDevices`, `CheckL4Address` and the `extends` resolution, linking the
   publisher's lint code (and `dockerfile`, `lock`, `digest`) into `stowage-install`.
@@ -225,6 +223,15 @@ A finished item is deleted, not ticked. The plan behind it is
 
 ## Could
 
+- **Retired release tags stay**: on a registry that deletes no tag alone, a tag `prune` retired
+  (a release's, an image's, an installer's) is never visited again, even once the registry deletes
+  tags alone; each costs a read in every release listing. Only floating tags are deleted then.
+- **Content left untagged outside a prune's sweep**: on a registry that deletes no tag alone, a
+  prune killed between retiring a tag and its closing sweep loses the list of content another tag
+  held, and a pointer `yank` retires on an incomplete release keeps no such list; once the other
+  tag moves, that manifest stays untagged and is deleted by nothing. The sweep running when the
+  pointer's move back fails has no test that fails without it (the pointer then still holds the
+  content).
 - **An installer only `:latest` held, left untagged on retirement**: on a registry that deletes no
   tag alone, a retired `:latest` leaves the installer manifest it held in the registry, untagged,
   when no release tag holds it any more (a prune that stopped part way). Disks have the disk set

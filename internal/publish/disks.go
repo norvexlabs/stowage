@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/google/go-containerregistry/pkg/name"
+	v1 "github.com/google/go-containerregistry/pkg/v1"
 
 	"github.com/norvexlabs/stowage/internal/registry"
 	"github.com/norvexlabs/stowage/internal/release"
@@ -259,45 +260,91 @@ func (p *Publisher) remove(ctx context.Context, repo, digest string) error {
 }
 
 // untag removes tag. A registry refusing to delete a tag alone has the manifest deleted by digest
-// when no other tag of the repository holds it; otherwise the refusal stands, naming the tags that
-// would go with it.
-func (p *Publisher) untag(ctx context.Context, tag name.Tag) error {
+// when no other tag of the repository holds it; otherwise the tag is retired (moved onto the
+// retired artifact, which reads as absent) and the content returned: the other tags hold it, and
+// sweepHeld deletes it once they no longer do. A retired tag is left as it is.
+func (p *Publisher) untag(ctx context.Context, tag name.Tag) (*name.Digest, error) {
 	err := p.Registry.DeleteTag(ctx, tag)
 	if err == nil || !errors.Is(err, registry.ErrDeleteRefused) {
-		return err
+		return nil, err
 	}
-	have, herr := p.Registry.Head(ctx, tag)
+	have, herr := p.headFloating(ctx, tag)
+	if herr != nil || have == nil {
+		return nil, herr
+	}
+	others, herr := p.holders(ctx, tag.Context(), have.Digest, tag.TagStr())
 	if herr != nil {
-		return herr
-	}
-	if have == nil {
-		return nil
-	}
-	tags, terr := p.Registry.Tags(ctx, tag.Context())
-	if terr != nil {
-		return terr
-	}
-	var others []string
-	for _, t := range tags {
-		if t == tag.TagStr() {
-			continue
-		}
-		ref, err := p.Registry.Tag(tag.Context().Name(), t)
-		if err != nil {
-			return err
-		}
-		d, err := p.Registry.Head(ctx, ref)
-		if err != nil {
-			return err
-		}
-		if d != nil && d.Digest == have.Digest {
-			others = append(others, t)
-		}
+		return nil, herr
 	}
 	if len(others) > 0 {
-		return fmt.Errorf("%w; deleting %s by digest would also remove %s", err, have.Digest, strings.Join(others, ", "))
+		if err := p.retire(ctx, tag); err != nil {
+			return nil, err
+		}
+		p.logf("%s retired: the registry deletes no tag alone; its content stays under %s", tag, strings.Join(others, ", "))
+		d := tag.Context().Digest(have.Digest.String())
+		return &d, nil
 	}
-	return p.remove(ctx, tag.Context().Name(), have.Digest.String())
+	return nil, p.remove(ctx, tag.Context().Name(), have.Digest.String())
+}
+
+// holders lists the tags of repo but except that hold the manifest d.
+func (p *Publisher) holders(ctx context.Context, repo name.Repository, d v1.Hash, except string) ([]string, error) {
+	tags, err := p.Registry.Tags(ctx, repo)
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, t := range tags {
+		if t == except {
+			continue
+		}
+		ref, err := p.Registry.Tag(repo.Name(), t)
+		if err != nil {
+			return nil, err
+		}
+		h, err := p.Registry.Head(ctx, ref)
+		if err != nil {
+			return nil, err
+		}
+		if h != nil && h.Digest == d {
+			out = append(out, t)
+		}
+	}
+	return out, nil
+}
+
+// sweepHeld deletes by digest the content untag left to other tags, once none holds it; content
+// already gone is skipped, and an error on one digest does not stop the others.
+func (p *Publisher) sweepHeld(ctx context.Context, held []name.Digest) error {
+	var errs []error
+	seen := map[name.Digest]bool{}
+	for _, d := range held {
+		if seen[d] {
+			continue
+		}
+		seen[d] = true
+		if err := p.sweepOne(ctx, d); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// sweepOne deletes d by digest unless it is gone or a tag of its repository holds it.
+func (p *Publisher) sweepOne(ctx context.Context, d name.Digest) error {
+	have, err := p.Registry.Head(ctx, d)
+	if err != nil || have == nil {
+		return err
+	}
+	others, err := p.holders(ctx, d.Context(), have.Digest, "")
+	if err != nil || len(others) > 0 {
+		return err
+	}
+	if err := p.remove(ctx, d.Context().Name(), d.DigestStr()); err != nil {
+		return err
+	}
+	p.logf("%s deleted: no tag holds it any more", d)
+	return nil
 }
 
 // cleanDisks makes rel's disks its channel's set and removes the channel's older disk sets, once

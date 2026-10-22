@@ -11,7 +11,6 @@ import (
 	"io"
 	"os"
 	"path"
-	"sync"
 	"time"
 
 	"github.com/google/go-containerregistry/pkg/name"
@@ -373,7 +372,7 @@ func (p *Publisher) dropLatest(ctx context.Context, channel string) error {
 // no set keeps.
 // A retired tag is deleted where the registry deletes tags alone, and left as it is elsewhere.
 func (p *Publisher) dropTag(ctx context.Context, l latest) error {
-	r, err := retiredDigest()
+	r, err := registry.RetiredDigest()
 	if err != nil {
 		return fmt.Errorf("retired artifact: %w", err)
 	}
@@ -385,13 +384,8 @@ func (p *Publisher) dropTag(ctx context.Context, l latest) error {
 		if have.Digest == r {
 			return nil
 		}
-		if _, err := p.Registry.PutArtifact(ctx, l.tag, retired); err != nil {
+		if err := p.retire(ctx, l.tag); err != nil {
 			return err
-		}
-		if have, err := p.headFloating(ctx, l.tag); err != nil {
-			return err
-		} else if have != nil {
-			return fmt.Errorf("%s was not retired: it is %s", l.tag, have.Digest)
 		}
 		p.logf("%s :%s retired: the registry deletes no tag alone", l.what, l.tag.TagStr())
 		return nil
@@ -402,16 +396,24 @@ func (p *Publisher) dropTag(ctx context.Context, l latest) error {
 	return nil
 }
 
-// retired is the artifact a floating tag is moved onto in place of its removal; retiredDigest
-// its manifest digest, the same in every repository.
-var (
-	retired       = registry.Artifact{Type: release.RetiredMediaType, Data: []byte(release.RetiredData)}
-	retiredDigest = sync.OnceValues(retired.Digest)
-)
+// retire moves tag onto the retired artifact, which reads as absent, and reads it back.
+func (p *Publisher) retire(ctx context.Context, tag name.Tag) error {
+	if _, err := p.Registry.PutArtifact(ctx, tag, registry.Retired()); err != nil {
+		return err
+	}
+	have, err := p.headFloating(ctx, tag)
+	if err != nil {
+		return err
+	}
+	if have != nil {
+		return fmt.Errorf("%s was not retired: it is %s", tag, have.Digest)
+	}
+	return nil
+}
 
 // headFloating is the descriptor a floating tag holds; nil when it is absent or retired.
 func (p *Publisher) headFloating(ctx context.Context, tag name.Tag) (*v1.Descriptor, error) {
-	r, err := retiredDigest()
+	r, err := registry.RetiredDigest()
 	if err != nil {
 		return nil, fmt.Errorf("retired artifact: %w", err)
 	}

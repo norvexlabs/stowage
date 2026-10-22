@@ -1390,7 +1390,7 @@ func (p *Publisher) retreatPointer(ctx context.Context, channel string) error {
 		return err
 	}
 	p.logf("channel %s has no complete release left: pointer removed", channel)
-	if err := p.untag(ctx, t); err != nil {
+	if _, err := p.untag(ctx, t); err != nil {
 		return err
 	}
 	return p.dropLatest(ctx, channel)
@@ -1451,8 +1451,16 @@ func (p *Publisher) Prune(ctx context.Context, channel, v string) (pruned []stri
 		}
 	}
 	var kept map[string]bool // the other channels' disk sets, read once a pruned release has disks
+	var held []name.Digest   // what untag left to other tags: the pointer, latest, another release
 	// Whatever happens below, a pointer whose release lost tags is moved off it.
 	defer func() {
+		// Content whose tag was retired while another tag held it (the pointer, latest, another
+		// release) goes once no tag does, whatever happened: what a tag still holds stays.
+		defer func() {
+			if serr := p.sweepHeld(ctx, held); serr != nil {
+				err = errors.Join(err, serr)
+			}
+		}()
 		if pointerGone {
 			if rerr := p.retreatPointer(ctx, channel); rerr != nil {
 				err = errors.Join(err, rerr)
@@ -1491,8 +1499,12 @@ func (p *Publisher) Prune(ctx context.Context, channel, v string) (pruned []stri
 			if err != nil {
 				return pruned, err
 			}
-			if err := p.untag(ctx, t); err != nil {
+			d, err := p.untag(ctx, t)
+			if err != nil {
 				return pruned, err
+			}
+			if d != nil {
+				held = append(held, *d)
 			}
 		}
 		// The disks the release boots (its own, or another's set) go, by digest, unless a release
@@ -1533,8 +1545,12 @@ func (p *Publisher) Prune(ctx context.Context, channel, v string) (pruned []stri
 		if err != nil {
 			return pruned, err
 		}
-		if err := p.untag(ctx, t); err != nil {
+		d, err := p.untag(ctx, t)
+		if err != nil {
 			return pruned, err
+		}
+		if d != nil {
+			held = append(held, *d)
 		}
 		p.logf("pruned %s", r.Manifest.Tag)
 		pruned = append(pruned, r.Manifest.Tag)

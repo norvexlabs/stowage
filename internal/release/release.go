@@ -147,15 +147,6 @@ func DiskMediaType(format string) types.MediaType {
 	return types.MediaType("application/vnd.stowage.disk." + format)
 }
 
-// RetiredMediaType is the artifact a floating tag (the installer's latest, a disk format's
-// latest-<format>) is moved onto when it has nothing to offer and the registry deletes no tag
-// alone: the tag reads as absent. Its one layer is RetiredData, so it is one manifest per
-// repository.
-const RetiredMediaType = "application/vnd.stowage.retired.v1+json"
-
-// RetiredData is the retired artifact's content.
-const RetiredData = "{}"
-
 // DiskTag is the tag of a release's disk image of format.
 func DiskTag(tag, format string) string { return tag + "-" + format }
 

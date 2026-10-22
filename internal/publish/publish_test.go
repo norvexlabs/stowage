@@ -648,6 +648,115 @@ func TestPruneDeletesOnlyMutableTags(t *testing.T) {
 	eq(t, "stable untouched", e.digest("notes-release", "stable") != "", true)
 }
 
+// On a registry that deletes no tag alone, the pointer of a channel whose last release is yanked,
+// and the tags of a pruned release another tag shares, are retired: they read as absent.
+func TestYankAndPruneRetireWhereNoTagDeletes(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	e.refuseTagDelete = true
+	ctx := context.Background()
+	r, err := registry.RetiredDigest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.mustShip("stable", 1)
+	p, _ := e.publisher()
+	if err := p.Yank(ctx, "stable", "1.0.0", 1, "bad"); err != nil {
+		t.Fatal(err)
+	}
+	// The yank rewrote the release's tag: the pointer alone holds its manifest, deleted by digest.
+	eq(t, "pointer removed", e.digest("notes-release", "stable"), "")
+	eq(t, "latest retired", e.digest("notes-installer", "latest"), r.String())
+	// A pointer on an incomplete release, with none to fall back to, shares that release's
+	// manifest: it is retired, and is no pointer.
+	e.bump("1.0.1")
+	e.mustShip("stable", 1)
+	gone, _ := name.NewTag(e.host + "/acme/notes/notes-web:1.0.1")
+	e.refuseTagDelete = false
+	if err := remote.Delete(gone); err != nil {
+		t.Fatal(err)
+	}
+	e.refuseTagDelete = true
+	if err := p.retreatPointer(ctx, "stable"); err != nil {
+		t.Fatal(err)
+	}
+	eq(t, "pointer retired", e.digest("notes-release", "stable"), r.String())
+	if ptr, err := p.pointer(ctx, "stable"); err != nil || ptr != nil {
+		t.Fatalf("a retired pointer reads as %v %v", ptr, err)
+	}
+	if _, err := p.Verify(ctx, "stable", "", 1); err == nil || !strings.Contains(err.Error(), "no release") {
+		t.Fatalf("verify on a retired pointer: %v", err)
+	}
+	e.bump("1.1.0")
+	second := e.mustShip("stable", 1)
+	eq(t, "pointer back on a release", e.digest("notes-release", "stable"), second.Digest.String())
+
+	old := e.mustShip("beta", 1)
+	e.bump("1.2.0")
+	gone12 := e.mustShip("beta", 1)
+	pruned, err := p.Prune(ctx, "beta", "1.2.0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	eq(t, "pruned", strings.Join(pruned, ","), "beta-1.2.0")
+	eq(t, "pruned release retired", e.digest("notes-release", "beta-1.2.0"), r.String())
+	eq(t, "retirement logged", strings.Contains(e.log.String(), "notes-release:beta-1.2.0 retired: the registry deletes no tag alone; its content stays under beta"), true)
+	// Once the pointer moved off it, nothing holds the pruned manifest: it is deleted by digest.
+	if d, _ := e.reg.Head(ctx, mustDigest(t, e, "notes-release", gone12.Digest.String())); d != nil {
+		t.Fatal("the pruned release's manifest stayed in the registry")
+	}
+	// A retired tag is left as it is.
+	retiredTag, err := p.Registry.Tag(p.releaseRepo(), "beta-1.2.0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d, err := p.untag(ctx, retiredTag); d != nil || err != nil {
+		t.Fatalf("untag of a retired tag: %v %v", d, err)
+	}
+	eq(t, "retired once", strings.Count(e.log.String(), "notes-release:beta-1.2.0 retired"), 1)
+	eq(t, "still retired", e.digest("notes-release", "beta-1.2.0"), r.String())
+	// The web image is the same in both releases: retired under beta-1.2.0, it stays under beta-1.1.0.
+	eq(t, "shared image", gone12.Manifest.Artifacts.Images["web"], old.Manifest.Artifacts.Images["web"])
+	eq(t, "web image retired", e.digest("notes-web", "beta-1.2.0"), r.String())
+	eq(t, "web image kept", e.digest("notes-web", "beta-1.1.0"), old.Manifest.Artifacts.Images["web"])
+	eq(t, "pointer moved back", e.digest("notes-release", "beta"), old.Digest.String())
+	rs, err := p.Releases(ctx, "beta")
+	if err != nil {
+		t.Fatal(err)
+	}
+	eq(t, "releases left", len(rs), 1)
+	if _, err := p.Verify(ctx, "beta", "", 1); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A prune of two revisions sharing an image, on a registry that deletes no tag alone: the first
+// revision's tag is retired while the second holds the image, then the second's untag deletes it;
+// the sweep after skips it, gone, and the prune succeeds.
+func TestAPruneSweepsContentAlreadyDeleted(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	e.refuseTagDelete = true
+	ctx := context.Background()
+	first := e.mustShip("beta", 1)
+	e.mustShip("beta", 2)
+	e.bump("1.1.0")
+	e.changeWeb()
+	e.mustShip("beta", 1)
+	web := first.Manifest.Artifacts.Images["web"]
+	p, _ := e.publisher()
+	pruned, err := p.Prune(ctx, "beta", "1.0.0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	eq(t, "pruned", len(pruned), 2)
+	eq(t, "first retired", strings.Contains(e.log.String(), "notes-web:beta-1.0.0 retired"), true)
+	if d, _ := e.reg.Head(ctx, mustDigest(t, e, "notes-web", web)); d != nil {
+		t.Fatal("the pruned revisions' web image stayed")
+	}
+	eq(t, "not swept again", strings.Count(e.log.String(), "notes-web@"+web), 0)
+}
+
 func TestSigningConfiguredRefusesToShipUnsigned(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)

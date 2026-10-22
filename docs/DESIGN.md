@@ -303,12 +303,15 @@ pushed artifact.
 - Deletion (`prune`, a pointer with no release left) is by tag: one digest carries the tags of
   several channels. A registry that deletes no tag alone (ghcr deletes nothing through the
   distribution API) has a manifest deleted by digest, through the `registry.delete` provider
-  (`oci`, `github`), only when no other tag holds it. A floating tag (`:latest`,
-  `latest-<format>`) is retired instead: moved onto a retired artifact (one manifest per
-  repository) that every reader takes for absent. Its manifest is never deleted by digest there,
-  since a release's own tag or another channel's disk set may name it; the disk cleanup, which
-  knows the sets, removes a disk none keeps. A retired tag is deleted once the registry deletes
-  tags alone.
+  (`oci`, `github`), only when no other tag holds it; a tag another one shares (the pointer on a
+  pruned release, `:latest` on its installer) is retired instead, as is a floating tag (`:latest`,
+  `latest-<format>`): moved onto a retired artifact (one manifest per repository) that the
+  registry client reads as absent, so every reader does. A floating tag's manifest is never
+  deleted by digest there, since a release's own tag or another channel's disk set may name it;
+  the disk cleanup, which knows the sets, removes a disk none keeps. A prune that completes deletes
+  by digest what it retired a tag of once no tag holds it (the pointer and `:latest` moved off),
+  so a pruned release is not left pullable by digest. A retired floating tag is deleted once the
+  registry deletes tags alone; another retired tag stays.
 - **Disk sets.** A disk set is several GB a release, while most releases move only the OS bundle
   and the images: `ship` publishes disks only with `--disks`, the publisher's call (the post-commit
   hook passes it from the hook's own flag or the commit's environment). A release without disks

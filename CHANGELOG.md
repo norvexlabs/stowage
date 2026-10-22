@@ -21,6 +21,11 @@ follow [SemVer](https://semver.org/).
 - On a registry that deletes no tag alone (ghcr), a `ship` that leaves a disk's
   `latest-<format>` with nothing to offer no longer fails after publishing: the tag is retired
   (moved onto a marker that reads as absent), and `verify` passes.
+- On such a registry, `prune` of the release the channel pointer is on (or of a tag another
+  release shares) no longer stops part way: the shared tags are retired, the pointer moves back,
+  and what no tag holds any more is deleted. The installer, a mirror, `verify` and the VM's
+  upgrades of this version read a retired tag as absent (a retired channel pointer: the channel
+  has no release); an earlier one reports it as not a release.
 - A change to an inline compose `configs:` content or to an environment-sourced compose secret
   now recreates the services that mount it: Compose alone kept them running with the old one.
 

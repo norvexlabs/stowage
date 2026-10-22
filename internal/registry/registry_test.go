@@ -65,6 +65,28 @@ func TestArtifactRoundTripAndMisses(t *testing.T) {
 	if _, _, err := c.GetArtifact(ctx, tag, "application/other"); err == nil {
 		t.Fatal("read an artifact of another type")
 	}
+	// A retired tag reads as absent, unless the retired artifact itself is asked for.
+	r, err := c.PutArtifact(ctx, tag, Retired())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a, _, err := c.GetArtifact(ctx, tag, kind); a != nil || err != nil {
+		t.Fatalf("retired tag: %v %v", a, err)
+	}
+	// Only a tag holding the retired artifact itself: not its digest, nor another of its type.
+	if _, _, err := c.GetArtifact(ctx, tag.Context().Digest(r.String()), kind); err == nil {
+		t.Fatal("read the retired artifact by digest as absent")
+	}
+	like, _ := c.Tag(host+"/p/rel", "like")
+	if _, err := c.PutArtifact(ctx, like, Artifact{Type: RetiredMediaType, Data: []byte(`{"a":1}`)}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := c.GetArtifact(ctx, like, kind); err == nil {
+		t.Fatal("read another artifact of the retired type as absent")
+	}
+	if a, _, err := c.GetArtifact(ctx, tag, RetiredMediaType); err != nil || a == nil || string(a.Data) != "{}" {
+		t.Fatalf("the retired artifact: %v %v", a, err)
+	}
 	missing, _ := c.Tag(host+"/p/rel", "2")
 	if a, _, err := c.GetArtifact(ctx, missing, kind); a != nil || err != nil {
 		t.Fatalf("missing tag: %v %v", a, err)
