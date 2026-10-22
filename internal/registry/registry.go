@@ -455,8 +455,17 @@ func (c *Client) PushArtifact(ctx context.Context, repo name.Repository, a Artif
 }
 
 func (c *Client) putArtifact(ctx context.Context, repo name.Repository, a Artifact, tag *name.Tag) (v1.Hash, error) {
-	m := Manifest{ArtifactType: a.Type, Config: Blob{MediaType: EmptyMediaType, Data: []byte("{}")}, Layers: []Blob{{MediaType: a.Type, Data: a.Data}}, Annotations: a.Annotations}
-	return c.PutManifest(ctx, repo, m, tag)
+	return c.PutManifest(ctx, repo, a.manifest(), tag)
+}
+
+func (a Artifact) manifest() Manifest {
+	return Manifest{ArtifactType: a.Type, Config: Blob{MediaType: EmptyMediaType, Data: []byte("{}")}, Layers: []Blob{{MediaType: a.Type, Data: a.Data}}, Annotations: a.Annotations}
+}
+
+// Digest is the manifest digest the artifact is pushed under, the same in every repository.
+func (a Artifact) Digest() (v1.Hash, error) {
+	_, h, err := a.manifest().Body()
+	return h, err
 }
 
 // Blob is a blob of a manifest: its media type and content, in memory or, from FileBlob, in a

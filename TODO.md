@@ -27,15 +27,12 @@ A finished item is deleted, not ticked. The plan behind it is
    `terraform-provider-openstack/openstack`, whichever the latest official docs make canonical).
    Before writing a module, read the latest provider's official docs and its schema, and pin that
    release.
-4. **Stale disk tags on a registry that refuses tag deletes**: a `ship` without `--disks` to a
-   channel with no disk set tries to remove the disk repository's `latest-<format>` tags, and a
-   registry with no tag DELETE (ghcr.io answers `UNSUPPORTED`) refuses it, so the ship exits 1
-   after the release and channel pointer are already published, and `verify` then fails on every
-   such tag ("the channel has no disk set of that format: yank or prune again") with no verb that
-   can clear it. Deleting by digest would remove other tags sharing the manifest. On such a
-   registry, retire a stale tag some other way (e.g. re-point it at a tombstone manifest that
-   `verify` recognises), or have `verify` and `ship` report it as a warning, not a failure. The
-   release itself must never read as failed because a cleanup was refused.
+4. **The last release of a channel yanked on a registry that deletes no tag alone**: the channel
+   pointer `:<channel>` shares its manifest with the release's own tag, so removing it is refused
+   (`untag` names the other tag) and the yank or prune stops there. Retire it as the floating
+   tags are, with the pointer's readers taking a retired tag for no pointer. Likewise `prune
+   <version>` of the pointer's release: `untag` of its installer tag is refused while `:latest`
+   shares it, before the pointer moves back; retiring a floating tag in `untag` covers both.
 
 ## Should
 
@@ -228,6 +225,10 @@ A finished item is deleted, not ticked. The plan behind it is
 
 ## Could
 
+- **An installer only `:latest` held, left untagged on retirement**: on a registry that deletes no
+  tag alone, a retired `:latest` leaves the installer manifest it held in the registry, untagged,
+  when no release tag holds it any more (a prune that stopped part way). Disks have the disk set
+  cleanup; nothing sweeps the installer repository.
 - **A failed chown after `up --no-start` leaves a running stack down**: when a start makes a
   volume of a `uid` while the stack runs (an upgrade that adds one), `up --no-start` recreates the
   changed services before the volume helper runs; if the helper then fails, they stay created and

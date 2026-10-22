@@ -453,6 +453,64 @@ func TestLatestDiskFollowsTheDiskSet(t *testing.T) {
 	eq(t, "latest-qcow2 back on the set", e.digest("notes-disk", "latest-qcow2"), second.Manifest.Artifacts.Disks["qcow2"])
 }
 
+// On a registry that deletes no tag alone, a dropped format's latest tag is retired: it reads as
+// absent, the ship and verify succeed, and the format coming back moves it onto its disk.
+func TestADroppedFormatsLatestTagIsRetiredWhereNoTagDeletes(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	e.refuseTagDelete = true
+	formats := func(f ...string) {
+		testutil.SetYAML(t, e.root, "stowage.yaml", []string{"shapes", "kairos", "disk_formats"}, f)
+	}
+	formats("qcow2", "vhd")
+	// beta's set keeps 1.0.0's vhd disk, which stable's retirement must leave in the registry.
+	beta := e.mustShip("beta", 1)
+	e.mustShip("stable", 1)
+	formats("qcow2")
+	// A registry acknowledging the move without making it fails the ship.
+	e.ignorePut = "/manifests/latest-vhd"
+	e.bump("1.0.1")
+	if _, err := e.ship("stable", 1); err == nil || !strings.Contains(err.Error(), "latest-vhd was not retired") {
+		t.Fatalf("a retirement the registry ignored: %v", err)
+	}
+	e.ignorePut = ""
+	e.bump("1.1.0")
+	e.mustShip("stable", 1)
+	// The retired artifact is a format: its digest changes only with a new media type.
+	const want = "sha256:bdd095c53eaab1e07bc8f68df2cc39eeddb7eaa6c070661698961aef3d16ce5b"
+	r, err := retiredDigest()
+	if err != nil || r.String() != want {
+		t.Fatalf("retired digest %s %v, want %s", r, err, want)
+	}
+	eq(t, "latest-vhd retired", e.digest("notes-disk", "latest-vhd"), r.String())
+	p, _ := e.publisher()
+	if _, err := p.Verify(context.Background(), "stable", "", 1); err != nil {
+		t.Fatal(err)
+	}
+	// A retired tag is absent: the next ship leaves it as it is.
+	e.bump("1.1.1")
+	e.mustShip("stable", 1)
+	eq(t, "retired once", strings.Count(e.log.String(), "disk vhd :latest-vhd retired"), 1)
+	eq(t, "never removed", strings.Contains(e.log.String(), "latest-vhd removed"), false)
+	eq(t, "still retired", e.digest("notes-disk", "latest-vhd"), r.String())
+	if d, _ := e.reg.Head(context.Background(), mustDigest(t, e, "notes-disk", beta.Manifest.Artifacts.Disks["vhd"])); d == nil {
+		t.Fatal("beta's vhd disk went with stable's latest-vhd")
+	}
+	e.bump("1.2.0")
+	formats("qcow2", "vhd")
+	third := e.mustShip("stable", 1)
+	eq(t, "latest-vhd back", e.digest("notes-disk", "latest-vhd"), third.Manifest.Artifacts.Disks["vhd"])
+	// A retired tag goes once the registry deletes tags alone.
+	e.bump("1.3.0")
+	formats("qcow2")
+	e.mustShip("stable", 1)
+	eq(t, "retired again", e.digest("notes-disk", "latest-vhd"), r.String())
+	e.refuseTagDelete = false
+	e.bump("1.4.0")
+	e.mustShip("stable", 1)
+	eq(t, "retired tag deleted", e.digest("notes-disk", "latest-vhd"), "")
+}
+
 // A ship without disks moves, rewrites and deletes no disk tag, on a registry refusing a tag
 // delete too; its release records the channel's set as the one its installs boot.
 func TestAShipWithoutDisksLeavesTheDiskSet(t *testing.T) {

@@ -18,6 +18,9 @@ follow [SemVer](https://semver.org/).
   parse and a `stowage.lock` pin outside it.
 
 ### Fixed
+- On a registry that deletes no tag alone (ghcr), a `ship` that leaves a disk's
+  `latest-<format>` with nothing to offer no longer fails after publishing: the tag is retired
+  (moved onto a marker that reads as absent), and `verify` passes.
 - A change to an inline compose `configs:` content or to an environment-sourced compose secret
   now recreates the services that mount it: Compose alone kept them running with the old one.
 

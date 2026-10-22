@@ -188,6 +188,8 @@ type env struct {
 	// a manifest by tag (405), as a registry deleting by digest only does.
 	noDisks         bool
 	refuseTagDelete bool
+	// ignorePut answers a manifest PUT to a path containing it with 201 and stores nothing.
+	ignorePut string
 }
 
 // fakeSigner records signatures by digest reference.
@@ -271,6 +273,10 @@ func newEnv(t *testing.T) *env {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if e.failDelete != "" && r.Method == http.MethodDelete && strings.Contains(r.URL.Path, e.failDelete) {
 			http.Error(w, "denied", http.StatusForbidden)
+			return
+		}
+		if e.ignorePut != "" && r.Method == http.MethodPut && strings.Contains(r.URL.Path, e.ignorePut) {
+			w.WriteHeader(http.StatusCreated)
 			return
 		}
 		if e.refuseTagDelete && r.Method == http.MethodDelete && strings.Contains(r.URL.Path, "/manifests/") &&

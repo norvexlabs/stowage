@@ -501,7 +501,8 @@ stowage --version
   `go build`'s `dev`) cannot pin, and a lock that does not decode is never overwritten.
 - `verify` without `<version>` checks the channel pointer's release. On the `latest` channel it
   also checks the installer's `:latest` and, with the `kairos` shape, each `latest-<format>` disk
-  tag (absent for a format the release has none of). With a version, it checks that release.
+  tag (absent for a format the release has none of). A retired tag counts as absent. With a
+  version, it checks that release.
 - `prune` without a version deletes every release of the channel except the pointer's. With a
   version, it deletes every revision of that version, and the pointer moves back when it held
   one. An immutable channel is refused: yank instead.
@@ -699,7 +700,12 @@ platform is part of an image's inputs). What `ship` does, in order:
    a yanked one. On the channel with `latest: true` the installer's `:latest` follows the pointer
    (a yank or prune moves it back, or removes it with the last release) and each disk's
    `latest-<format>` follows the channel's disk set (a format the set has none of loses its tag);
-   `verify` of that channel compares their digests with the pointer's and the set's;
+   `verify` of that channel compares their digests with the pointer's and the set's. On a
+   registry that deletes no tag alone (ghcr), a floating tag with nothing to offer is retired
+   instead of removed: moved onto a small artifact of type `application/vnd.stowage.retired.v1+json`, which `ship` and `verify` read as
+   absent, and the ship logs `… retired: the registry deletes no tag alone`. A retired tag holds
+   no image or disk (its one blob is `{}`): nothing is on offer under it. Once the registry
+   deletes tags alone, the next ship deletes it;
 7. a ship that published disks, once the pointer is on its release, records them as the channel's
    disk set (`<prefix>/<name>-disk:set-<channel>`, an artifact of type
    `application/vnd.stowage.disk-set.v1+json`: `{channel, release, stowage_version, disks}`,

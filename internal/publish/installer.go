@@ -11,6 +11,7 @@ import (
 	"io"
 	"os"
 	"path"
+	"sync"
 	"time"
 
 	"github.com/google/go-containerregistry/pkg/name"
@@ -345,7 +346,7 @@ func (p *Publisher) syncTag(ctx context.Context, l latest, relTag string) error 
 	return nil
 }
 
-// dropLatest removes channel's installer latest tag; its disk tags follow its disk set, which a
+// dropLatest removes (or retires, as dropTag does) channel's installer latest tag; its disk tags follow its disk set, which a
 // channel left without a release keeps.
 func (p *Publisher) dropLatest(ctx context.Context, channel string) error {
 	ls, err := p.latestTags(ctx, channel, nil)
@@ -366,12 +367,59 @@ func (p *Publisher) dropLatest(ctx context.Context, channel string) error {
 	return nil
 }
 
+// dropTag removes a floating tag. A registry that deletes no tag alone has it retired instead:
+// moved onto the retired artifact, which reads as absent. Its manifest is never deleted by
+// digest here: a release's own tag, or a disk set, may name it; the disk cleanup removes a disk
+// no set keeps.
+// A retired tag is deleted where the registry deletes tags alone, and left as it is elsewhere.
 func (p *Publisher) dropTag(ctx context.Context, l latest) error {
-	if have, err := p.Registry.Head(ctx, l.tag); err != nil || have == nil {
+	r, err := retiredDigest()
+	if err != nil {
+		return fmt.Errorf("retired artifact: %w", err)
+	}
+	have, err := p.Registry.Head(ctx, l.tag)
+	if err != nil || have == nil {
+		return err
+	}
+	if err := p.Registry.DeleteTag(ctx, l.tag); errors.Is(err, registry.ErrDeleteRefused) {
+		if have.Digest == r {
+			return nil
+		}
+		if _, err := p.Registry.PutArtifact(ctx, l.tag, retired); err != nil {
+			return err
+		}
+		if have, err := p.headFloating(ctx, l.tag); err != nil {
+			return err
+		} else if have != nil {
+			return fmt.Errorf("%s was not retired: it is %s", l.tag, have.Digest)
+		}
+		p.logf("%s :%s retired: the registry deletes no tag alone", l.what, l.tag.TagStr())
+		return nil
+	} else if err != nil {
 		return err
 	}
 	p.logf("%s :%s removed", l.what, l.tag.TagStr())
-	return p.untag(ctx, l.tag)
+	return nil
+}
+
+// retired is the artifact a floating tag is moved onto in place of its removal; retiredDigest
+// its manifest digest, the same in every repository.
+var (
+	retired       = registry.Artifact{Type: release.RetiredMediaType, Data: []byte(release.RetiredData)}
+	retiredDigest = sync.OnceValues(retired.Digest)
+)
+
+// headFloating is the descriptor a floating tag holds; nil when it is absent or retired.
+func (p *Publisher) headFloating(ctx context.Context, tag name.Tag) (*v1.Descriptor, error) {
+	r, err := retiredDigest()
+	if err != nil {
+		return nil, fmt.Errorf("retired artifact: %w", err)
+	}
+	d, err := p.Registry.Head(ctx, tag)
+	if err != nil || d == nil || d.Digest == r {
+		return nil, err
+	}
+	return d, nil
 }
 
 // settleLatest puts the channel's floating tags right for its pointer, once a command has moved
@@ -418,7 +466,7 @@ func (p *Publisher) verifyLatest(ctx context.Context, channel string, rel *Ref) 
 	}
 	var problems []string
 	for _, l := range ls {
-		d, err := p.Registry.Head(ctx, l.tag)
+		d, err := p.headFloating(ctx, l.tag)
 		if err != nil {
 			return err
 		}

@@ -56,6 +56,9 @@ func TestArtifactRoundTripAndMisses(t *testing.T) {
 	if err != nil || a == nil {
 		t.Fatalf("%v %v", a, err)
 	}
+	if want, err := a.Digest(); err != nil || want != d {
+		t.Fatalf("digest computed %s %v, pushed %s", want, err, d)
+	}
 	if got != d || string(a.Data) != `{"a":1}` || a.Annotations[InputsAnnotation] != "x" {
 		t.Fatalf("round trip: %s %s %q %v", got, d, a.Data, a.Annotations)
 	}
