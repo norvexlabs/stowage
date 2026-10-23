@@ -9,6 +9,7 @@ import (
 	"errors"
 	"io"
 	"maps"
+	"net"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -332,6 +333,8 @@ type env struct {
 	log    *bytes.Buffer
 	vars   map[string]string
 	busy   map[int]bool
+	// udpBusy are the UDP ports a socket of the host holds.
+	udpBusy map[int]bool
 }
 
 func newEnv(t *testing.T) *env {
@@ -343,9 +346,10 @@ func newEnv(t *testing.T) *env {
 
 func (e *env) installer(mod func(*Options)) *Installer {
 	o := Options{Dir: e.dir, Cos: e.cos, Out: e.out, Log: e.log, Docker: e.docker, Self: e.self,
-		Getenv:   func(k string) string { return e.vars[k] },
-		Environ:  []string{"PATH=/bin", "SESSION_SECRET=from-the-shell", "COMPOSE_PROJECT_NAME=other"},
-		PortFree: func(_ string, p int) bool { return !e.busy[p] }}
+		Getenv:      func(k string) string { return e.vars[k] },
+		Environ:     []string{"PATH=/bin", "SESSION_SECRET=from-the-shell", "COMPOSE_PROJECT_NAME=other"},
+		PortFree:    func(_ string, p int) bool { return !e.busy[p] },
+		UDPPortFree: func(_ string, p int) bool { return !e.udpBusy[p] }}
 	if mod != nil {
 		mod(&o)
 	}
@@ -767,6 +771,21 @@ func TestL4Routes(t *testing.T) {
 	}
 	e.busy[7443] = true
 	if err := e.install(tls); err == nil || !strings.Contains(err.Error(), "port(s) 7443 (data) already in use on this host: the project's L4 routes publish them") {
+		t.Errorf("err = %v", err)
+	}
+	// A UDP route's port, which another socket holds.
+	e = newL4()
+	e.udpBusy = map[int]bool{7443: true}
+	if err := e.install(tls); err == nil || !strings.Contains(err.Error(), "port(s) 7443 (data-udp) already in use on this host") {
+		t.Errorf("err = %v", err)
+	}
+	// Held on another address than the host's own (a local resolver's): the wildcard is probed.
+	e = newL4()
+	wildcard := func(o *Options) {
+		tls(o)
+		o.UDPPortFree = func(h string, p int) bool { return h != "0.0.0.0" || p != 7443 }
+	}
+	if err := e.install(wildcard); err == nil || !strings.Contains(err.Error(), "port(s) 7443 (data-udp) already in use on this host") {
 		t.Errorf("err = %v", err)
 	}
 	// Loopback mode publishes them too; a route's loopback port is the front's.
@@ -1413,5 +1432,22 @@ func TestAnImageGoneAsTheStackStartsIsPulledAgain(t *testing.T) {
 	e.docker.onUp = func() error { ups++; return errors.New("unhealthy") }
 	if err := e.install(nil); err == nil || ups != 1 {
 		t.Fatalf("%v, %d ups", err, ups)
+	}
+}
+
+// The UDP probe: a port a socket holds is busy, and free again once it closes.
+func TestUDPPortFree(t *testing.T) {
+	t.Parallel()
+	c, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Skip(err)
+	}
+	port := c.LocalAddr().(*net.UDPAddr).Port
+	if udpPortFree("127.0.0.1", port) {
+		t.Error("a held port is free")
+	}
+	c.Close()
+	if !udpPortFree("127.0.0.1", port) {
+		t.Error("a released port is busy")
 	}
 }

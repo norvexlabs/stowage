@@ -449,7 +449,7 @@ a real registry, the local Docker engine, a kind cluster and a VM on TrueNAS
 | `ship`, `verify`, `promote`, `yank`, `prune`, `releases` (images, the front, the Helm chart, the Kairos OS bundle and its disk images + `latest-<format>`, each cloud's importable image (`cloud_publish`) registered in the publisher's AWS, Azure or Google Cloud account, installer image + `:latest`, release manifest) | registering on AWS and Azure (written, run on Google Cloud only) |
 | every version / changelog provider, registry client, release manifest, cosign signing | |
 | inputs digests and the build graph | |
-| installer (Docker): loopback and every TLS front (`acme`, `dns-cloudflare`, `byo`, `internal`), terminal form, `install`, re-run (changes the inputs and the front's ports), `status`, `provision`, `script`, `upgrade` (`--version` fetches the release's installer), `rollback`, `reset-db`, `--dry-run`, `--offline`, a mirror and its CA (`--registry`, `--registry-ca`); `mirror export` / `mirror import` (a release carried as one file to a site without internet); `secrets rotate`, `secrets export` and `--secrets` (a machine made again) | scheduled backup, restore, chart library, `upgrade --reset-db` |
+| installer (Docker): loopback and every TLS front (`acme`, `dns-cloudflare`, `byo`, `internal`), terminal form, `install`, re-run (changes the inputs and the front's ports), `status`, `ps`, `logs`, `restart`/`stop`/`start`, `exec`, `schema`, `uninstall` (`--data`), `provision`, `script`, `upgrade` (`--version` fetches the release's installer), `rollback`, `reset-db`, `--dry-run`, `--offline`, a mirror and its CA (`--registry`, `--registry-ca`); `mirror export` / `mirror import` (a release carried as one file to a site without internet); `secrets rotate`, `secrets export` and `--secrets` (a machine made again) | scheduled backup, restore, chart library, `upgrade --reset-db` |
 | installer (Kubernetes): `<short>-stow k8s install`, `upgrade` (`--version`), `rollback`, `status`, `reset-db`, `uninstall` (`--data`), `provision` (the hook as a Job after the release, its outputs in a Secret and handed back, `--set`), `secrets rotate`, `tune`, `--dry-run`, `--no-provision`, `--image-registry`, `--registry-ca`, `--unsafe-sysctls` | barrier pre-flight before `rollback` |
 | installer (Kairos VM): `<short>-stow vm create` (the disk image by digest, the cloud-config on a seed ISO or as user-data, the platform's steps; or the VM created with OpenTofu — TrueNAS's module, the previews for libvirt, Proxmox VE, vSphere, AWS, Google Cloud and Azure, or the operator's own holding the module contract — waited for until it installed; from a mirror whose CA the VM then trusts) and `vm destroy`; `<short>-stow` in the OS bundle — the first install from the cloud-config's settings, `install` from the preloaded images, the boot (install up again, upgrade to the OS's release, back to the replaced one), the host daemon and its verbs (`status`, `health`, `events`, `ps`, `logs`, `restart`/`stop`/`start`, `provision`, `updates`, `upgrade`, `rollback` to the passive system, `reset-db`, `network` with its auto-revert, `backup` — scheduled, before an upgrade, or now, encrypted to age keys and uploaded with rclone; `verify` of proposed settings —, `restore`, `secrets export` and `rotate`, `reboot`, `shutdown`), its disk-pressure watch (`hooks.maintenance.disk_pressure`), its app socket for the services `host_api` names, the health gate judging each boot (Kairos boot assessment: an upgraded boot not healthy in time falls back to the passive system, unless going back is refused at a rollback barrier: it is then kept), a default-deny firewall (`vm create --ssh-allow`), the time zone (`--timezone`), a disaster recovery (`vm create --secrets`) | |
 
@@ -486,6 +486,7 @@ stowage -C <project> releases [--channel C] [--json]
 stowage -C <project> hook install [--channel C] [--disks]       # write git's post-commit hook for this project
 stowage -C <project> hook post-commit [--channel C] [--disks]   # what that hook runs: ship a version bump in the background
 stowage --version
+stowage -C <project> --test-registry PREFIX [--test-push USER:ENV] [--test-pull USER:ENV|none] [--test-key KEY --test-public-key FILE] [--shapes S,…] <command>   # a test release
 ```
 
 - For `plan`, `ship`, `verify` and `yank`, `--channel` defaults to the channel with
@@ -512,6 +513,56 @@ stowage --version
   one. An immutable channel is refused: yank instead.
 - `releases` lists the published releases, oldest first in each channel. It checks no signature.
   A release whose version the current scheme refuses is skipped with a warning.
+- `ship` refuses a version that `version.scheme`'s `month_guard` puts out of its month (`lint`
+  only warns of it) unless the channel holds a release of it already — a ship resumed after the
+  month's turn, or a later revision of a version out: `version.scheme month_guard: version V is
+  not in the current month (Y.M, UTC): start a new month's series; not shipped`, before anything
+  is built. `promote` re-tags a published release, whatever its month.
+
+**A test release** (`--test-registry`, before or after the command): every command that opens the
+project — `ship`, `plan`, `verify`, `releases`, `promote`, `yank`, `prune` — takes it as a
+release for a test run, never the project's, without editing the spec:
+
+- `--test-registry PREFIX` publishes to and reads from that registry prefix instead of
+  `registry.prefix`; the release's installs pull from it. It is written as `registry.prefix`
+  is (host[:port][/path], lower case, no scheme or trailing `/`; a registry's host alone, as
+  `localhost:5000`, is one). The project's own prefix, however its host is spelt (case, a
+  trailing dot, an IP address's forms, a port with leading zeros, the default ports 80 and 443
+  — taken as one —, the loopback's names — `localhost`, `*.localhost`, 127.0.0.0/8, `::1` — and
+  Docker Hub's other host names), is refused, and so is a prefix within
+  it or holding it (`is the project's registry (registry.prefix P), or within it`): its
+  repositories would be the project's. Only the spelling is read: another DNS name or address
+  of the same registry (a second name its certificate covers) is not told, so give a registry —
+  and an account (`--test-push`) — that cannot write the project's repositories. A port is 1 to
+  65535. Each flag below is refused without `--test-registry`. Deleting (`prune`, an older disk
+  set) uses the test registry's own API, never `registry.delete`'s.
+- The registry's credentials are the run's, never the project's: `--test-push USER:ENV`
+  publishes as USER with the password in `$ENV`, and `--test-pull USER:ENV` (or `none`) is the
+  pull account the test release's installers carry. A project whose `registry.push` is a
+  `token` refuses a test release without `--test-push` (its token would be sent to another
+  registry), and one whose `registry.pull` is a `token` without `--test-pull` (its account would
+  be baked into an installer published there), as is a `docker-config` push naming the
+  project's own `config` directory; the publisher's default Docker config, read per registry
+  host, is kept.
+- `--test-key KEY` (a cosign private key file, `env://VAR` or a KMS URI) signs it, and
+  `--test-public-key FILE` (a project file) is the one key its installs, charts and OS bundle
+  trust — the project's `public_keys` are left out, so no install of the project trusts the run's
+  key, and an install of the test release trusts no key of the project's. The two go together;
+  a project that signs refuses a test release without them (never signed with the project's
+  key), and refuses its own key (`signing.key`, or a copy of it) and its own `public_keys` as
+  them (compared as keys, whatever their encoding; a project key that cannot be read refuses the
+  test release); the public key must be a PEM public key (PKIX or PKCS#1, as installs read).
+  Before a command signs anything, cosign derives the public key of `--test-key` (`cosign
+  public-key`): one that is not `--test-public-key` is refused (`--test-key K is not the key of
+  --test-public-key F: not signed`), so no form of the project's key — `env://`, a copy encrypted
+  again — signs a test release. An unsigned project's test release is signed
+  with them when given.
+- `--shapes docker,kubernetes,kairos` keeps only those of the project's shapes (`kairos` left
+  out: no OS bundle or disk is built); one that leaves none is refused. A test release's disks
+  are registered on no cloud (`cloud_publish` is left out).
+- Each command prints first `test release: registry PREFIX[, signed with KEY, its installs
+  trusting FILE alone], shapes …`. `lint` reads the spec as it is. `hook` refuses the flags: a
+  commit ships the project's release.
 
 **Ship on commit** (`hook`): a commit that moves the project's version publishes that release.
 
@@ -537,8 +588,9 @@ stowage --version
   - a `git-tag` or `command` version source: its version does not move with a commit (a tag comes
     after it), so such a project publishes with `stowage ship`.
 
-  A version `HEAD` records that the scheme refuses is reported as an error. Every outcome exits
-  0: a commit never fails on its release.
+  A version `HEAD` records that the scheme refuses is reported as an error, and so is one
+  `month_guard` puts out of its month (no ship starts; a ship of a version the channel holds
+  already is `stowage ship`'s). Every outcome exits 0: a commit never fails on its release.
 - The ship publishes the disks (as `ship --disks`) when the hook was written with `--disks`, or
   when the commit was made with `STOWAGE_SHIP_DISKS=1` (or `true`) in its environment — so a
   project chooses its own cadence, a release at a time; the started line then says `, with its
@@ -1218,7 +1270,7 @@ database: reset-db has nothing to reset` (`… there is no backup to restore`). 
 | `short_name` | optional, the same form as `name` (absent is `name`): the installer is `<short_name>-stow` — the binary that installs and runs the infrastructure's lifecycle. An install keeps it under that name and records it in its `.env` (`STOWAGE_SHORT_NAME`, not a value compose or a hook reads), so `short_name` is fixed for a project's life: `ship` refuses a release whose `short_name` differs from one its channels already hold, and an install refuses one before anything changes (a re-run, `upgrade`, `rollback`, the VM's boot) |
 | `stowage.requires` | the Stowage versions the project accepts (see `stowage.requires` under the contracts): every command refuses a `stowage` outside it, lint errors on a range that does not parse and on a `stowage.lock` pin outside it, and warns when it is missing |
 | `version.source` | `changelog` (default; `file`, default `CHANGELOG.md`, the first released heading), `file` (`file`, default `VERSION`, the first non-empty line), `git-tag` (`match`, a `git describe --match` pattern; `strip`, a prefix removed), `command` |
-| `version.scheme` | `calver` (default; `format`, default `YYYY.M.MICRO`, tokens `YYYY YY 0Y MM M 0M WW 0W DD D 0D MAJOR MINOR MICRO` joined by `.`; `month_guard: utc\|local`, which needs a year and a month in the format and only warns), `semver` (no config), `regex` (`pattern`, anchored, with named groups; `order`, a list of `group:int` or `group:str` compared in turn), `command` |
+| `version.scheme` | `calver` (default; `format`, default `YYYY.M.MICRO`, tokens `YYYY YY 0Y MM M 0M WW 0W DD D 0D MAJOR MINOR MICRO` joined by `.`; `month_guard: utc\|local`, which needs a year and a month in the format: `lint` warns of a version out of its month, `ship` and `hook post-commit` refuse it), `semver` (no config), `regex` (`pattern`, anchored, with named groups; `order`, a list of `group:int` or `group:str` compared in turn), `command` |
 | `changelog` | `keepachangelog` (default; `file`, default `CHANGELOG.md`; `## [x]` or `## x` headings, `Unreleased` skipped), `dir-per-version` (`dir`, required; `pattern`, default `{v}.md`, holding `{v}` once and no `/`), `command`. The current version must have a section |
 | `channels.<name>` | `tag` (template holding `{v}` once), `mutable`, `latest`. Names are lowercase letters, digits, `.`, `_`, `-`. At most one channel sets `latest` (none, or a mutable one, is a warning) |
 | `registry.prefix` | `<host>[:port][/path]`, the host a name or a bracketed IPv6 address (`[fd00::5]:5000/notes`): no scheme, tag or trailing slash |
@@ -1233,7 +1285,7 @@ database: reset-db has nothing to reset` (`… there is no backup to restore`). 
 | `health` | `http-json` (`service`, `port`, `path`, `liveness_path`, `expect`: the JSON fields a ready answer carries), `http-status` (the same, `expect` a 200–399 status, default 200), `command` (`image`, `cmd`, `timeout_s`). The VM's health gate and `<short>-stow health` run it; the Docker installer waits on the compose healthchecks (`up --wait`) |
 | `database` | optional (see "A project without a database" above); given, `engine` (`postgres` only), `service`, `name`, `roles.migrate`, `roles.app` (all required; one role twice is allowed), `schema_compat` (`sql`, `command`, `none`; `sql`'s `baseline`, an integer ≥ 0 where absent or 0 means 1 (every other provider is at 1), is the schema epoch the release's migrations start from: see the upgrade notes on schema baselines) |
 | `data` | optional: `volumes.<name>.{uid, keep_on_reset}`, `reset` (volumes not `keep_on_reset`; empty is a warning, and `reset-db` refuses it; without a `database`, an error when not empty): the volumes `reset-db` wipes on Docker and the VM (on Kubernetes it deletes every claim of the release). `uid` (0 to 4294967294; absent, the volume is left as Docker makes it — owned by the image's directory it mounts on, root when the image has none): on Docker and the VM, a volume a service mounts that the engine does not hold yet — the stack's first start, or after `reset-db` wiped it — is given to `uid` as that start makes it, before the services start: the containers are made first (`up --no-start`), so the volume already holds what the image put there, then, when its root belongs to another user, it is given to `uid` recursively (`chown -hR uid`: the group kept, a symbolic link changed itself, never what it points to), logging `volume <name> given to its uid`. The volumes a start makes are listed in `.stowage-volumes-pending` (0600) until they have their uid: a start cut off in between, or a release without the helper, leaves them listed, and the next start that mounts them gives it; one a service mounts while no `uid` is owed to it, or that is gone, is struck off. A volume that exists otherwise keeps its owner (its data's: an upgrade never re-owns it), and an `external` one is never touched. The chown runs as root, offline, in the volume helper (`<name>-chown`, busybox pinned by digest), which `ship` builds and publishes for a project with such a volume and the `docker` or `kairos` shape, a Docker install pulls with the stack's images (recorded as `STOWAGE_CHOWN_IMAGE`, by digest or, offline, by tag) and the OS bundle preloads. A release an earlier Stowage published carries none: started again by a rollback, its new volumes keep the owner Docker gives them until a release with the helper starts, and the start logs `<name> <version> carries no volume helper: <volumes> keep the owner Docker gave them until a release with one starts`. On Kubernetes the chart sets its own `securityContext` |
-| `secrets[]` | `key`, `gen`: `hex32`, `hex16` (random bytes, hex), `pass18`, `pass32` (alphanumeric), `b64-32` (base64url); `rotation: true` lets `secrets rotate` replace it (`KEY_NEXT` and `KEY_PREVIOUS` are then reserved names, recorded empty beside it, and the compose file must read both). Generated once at the first install, or at the upgrade that adds it |
+| `secrets[]` | `key`, `gen`: `hex32`, `hex16` (random bytes, hex), `pass18`, `pass32` (alphanumeric), `b64-32` (base64url); `rotation: true` lets `secrets rotate` replace it (`KEY_NEXT`, `KEY_PREVIOUS` and `KEY_ACCEPTED` are then reserved names, recorded empty beside it, and the compose file must read both `KEY_NEXT` and `KEY_PREVIOUS`, or `KEY_ACCEPTED` alone). Generated once at the first install, or at the upgrade that adds it |
 | `safe_defaults` | `KEY: value`, the value the compose file defaults to |
 | `inputs[]` | `key`, `prompt` (required), `default` (may name `${KEY}`), `required`, `optional` (exclusive with `required`; otherwise no effect), `secret` (no default), `when: tls\|loopback` (asked only in that mode), `shapes` (`docker`, `kubernetes`, `kairos`; asked only on those), `profile` (a compose profile name, `[a-zA-Z0-9][a-zA-Z0-9_.-]*`, that a service of the compose file carries: the input turns it on while it holds a value — see "Optional services" under the installer; not `required`, and asked on the `docker` or `kairos` shape; lint counts it as read), `advanced` (a tunable: never asked, recorded only when `--set`, `--answers` or the VM's settings give it — never from an exported variable — its default the compose file's — so no `required` or `default`, and the compose file must write it `${KEY:-default}`; a re-run giving it empty removes it). An input left empty is recorded empty. An input asked on the `docker` or `kairos` shape that no compose service, no route and no provision hook's `env` reads is a warning (one asked on `kubernetes` only is the chart's) |
 | `extensions[]` | the apps an install of this project can be pointed at (see "Extensions"): `name` (an app name, as `name` is; not this project's; none twice), `input` (required: an input holding the extension's endpoint, empty while it is off — `optional`, not `secret`, no `default`, and read by a compose service, a route or the provision hook's `env`, or asked on `kubernetes` only, where the chart reads it), `prompt` (required: what the install's tip calls it; the `input` is neither `advanced` nor asked in one mode only, `when`, so every install records it), `key_input` (an `optional` `secret` input holding its credential, asked on the same shapes as `input`, neither `advanced` nor `when`, and read as `input` is). No input is named by two extensions, or twice by one |
@@ -1268,6 +1320,12 @@ again, to copy an installer to another host.
           [--ipv6[=false]]                                                 # IPv6 on the stack's network
           [--secrets FILE|-]                                               # a machine made again
 <short>-stow status [--dir D]
+<short>-stow ps [--json] [--dir D]                                       # the stack's services, state and health
+<short>-stow logs SERVICE [--tail N] [--follow|-f] [--dir D]             # 1 to 5000 lines, default 200
+<short>-stow restart|stop|start SERVICE [--dir D]
+<short>-stow exec SERVICE [--dir D] -- COMMAND [ARG…]                    # in the running container; its exit status
+<short>-stow schema [--after N] [--json] [--dir D]                        # the database's migration, the kept release's, the barriers after it
+<short>-stow uninstall [--data] [--yes] [--no-input] [--accessible] [--dry-run] [--dir D]
 <short>-stow secrets export --recipient AGE_KEY… [-o FILE|-] [--dir D]   # the secrets, encrypted
 <short>-stow secrets rotate KEY [--stage | --finish] [--dir D]           # a secret with rotation: true
 <short>-stow provision [--dir D] [--set KEY=VALUE]…                      # run the provision hook again; --set an input only it reads, or a value it returned or declares it returns
@@ -1350,6 +1408,39 @@ again, to copy an installer to another host.
   `expired on …`) naming the re-run that renews it, with `hooks.maintenance.disk_pressure` a
   `pressure  <level>: <used>% used (soft …, hard …)` line and the watch's last POST, and `docker
   compose ps --all`.
+- `ps` prints `docker compose ps --all` of the stack (the front among its services), `--json`
+  Compose's JSON, one service per line. `logs SERVICE` prints a service's last `--tail` lines
+  (1 to 5000, default 200, no colour), and with `--follow` the lines it writes next until
+  interrupted. `restart`, `stop` and `start SERVICE` run Compose's verb on one service, under
+  the install's lifecycle lock (refused while a provision, upgrade, rollback or reset-db runs,
+  and while a restore left the volumes half restored); a service `stop` stops stays stopped until
+  `start`, or until a run brings the stack up again (a re-run, `upgrade`, `rollback`,
+  `reset-db`). A name that is no service of the stack is refused, naming them.
+- `exec SERVICE -- COMMAND [ARG…]` runs the command in the service's running container (`docker
+  compose exec`), with a terminal when standard input is one (else `-T`, so it reads a pipe);
+  the run exits with the command's exit status. The command goes after `--`.
+- `schema` reads the database's schema as `rollback` checks it, on the running stack (the
+  project's `database.schema_compat`; refused without one): `migration  N`; when the install
+  keeps a release for `rollback`, `kept       V (revision R), at migration M before the upgrade:
+  \`rollback\` goes back to it` and `barriers   after M: <the barriers, or none>`. `--after N`
+  reports the barriers after migration N instead. `--json` prints `{"migration", "kept":
+  {"project_version", "revision", "schema"}, "after", "barriers"}`, the absent ones left out.
+- `uninstall` removes the install's containers and networks (`docker compose down
+  --remove-orphans`, the containers a hook or a schema check left among them). The data — the
+  stack's volumes and the install directory (its `.env` and secrets, the dumps, the release kept
+  for `rollback`) — is kept, and it prints `kept: its volumes and D (its secrets): \`D/<short>-stow
+  --dir D\` installs it again on them, \`… uninstall --data --dir D\` deletes them`; with `--data`
+  (or "Yes, and delete the data" on a terminal) it deletes the stack's volumes (`--volumes`; an
+  external one never) and then the directory. It asks on a terminal ("No", "Yes, and keep the
+  data", "Yes, and delete the data"; default no); without one, or with `--no-input`, it refuses
+  unless `--yes`, which keeps the data unless `--data`. The install's timers on the host — the
+  scheduled backup's and the disk-pressure watch's units — are disabled and removed either way;
+  a later install on the kept data writes both again (the schedule from the settings `backup
+  config` keeps in D). Removing a unit written as root takes root: a run as another user refuses
+  before anything goes (`<unit> is the install's, and removing it takes root: run \`sudo … uninstall
+  --dir D\``). It runs under the install's lifecycle
+  lock, and refuses a directory holding an install of another project. `--dry-run` prints what
+  it would remove and keep. The host's own settings (`tune`) are not touched.
 - A failed first install removes the directory it created.
 - The install directory holds:
   - `.env`, the project's `compose.yaml`, `.env.prev` and `.stowage-changing` (a re-run's
@@ -1623,7 +1714,10 @@ again, to copy an installer to another host.
   (its restart failed) changes nothing and brings the stack up again. Between two passes every
   service runs with both values it may meet, so none refuses the other age's tokens. `KEY_NEXT` and `KEY_PREVIOUS` are recorded empty from the first install (or the
   upgrade that adds the secret); the compose file passes them to the services that check the
-  value.
+  value. `KEY_ACCEPTED` is recorded with them, the one of the two that holds a value (`KEY_NEXT`
+  while one is staged, else `KEY_PREVIOUS`; empty outside a rotation, as the two are never both
+  set), each pass and each upgrade writing it again: a service that accepts one more value beside
+  `KEY` reads `${KEY_ACCEPTED}` alone. It is a secret, as the two are.
 - `reset-db` takes the install back to its first setup, run by the installer of the release it
   runs (another is refused, naming the one to use). It refuses, before anything changes, a
   `data.reset` volume the release's compose file does not declare at top level, declares
@@ -1677,8 +1771,10 @@ again, to copy an installer to another host.
   `STOWAGE_L4_<ROUTE>` = `<the input's value>:<port>` (an IPv6 address bracketed,
   `[fd00::7]:7443`), recorded in `.env` and empty while the input is; the address is never
   guessed (behind NAT the host's own is not the one clients dial). A first install refuses a
-  route's TCP port a process of the host already listens on (`port(s) 7443 (data) already in use
-  on this host: the project's L4 routes publish them`), and so does an upgrade for a route the
+  route's port a process of the host already holds — a TCP port one listens on, a UDP port a
+  socket is bound to on any address, probed as Docker binds it, on the wildcard addresses (a
+  port below the unprivileged ones, the installer run as a user, is not checked) (`port(s) 7443 (data) already in use
+  on this host: the project's L4 routes publish them`) — and so does an upgrade for a route the
   stack does not publish already; an install, re-run or upgrade refuses front ports on one of them
   (an upgrade's refusal says to move the front with a re-run of the installer the install runs,
   then upgrade) (`the front's https port 7443 is the L4 route data's: choose another with
@@ -1951,12 +2047,21 @@ the current directory. A release with no chart (published without the shape) is 
   `--unsafe-sysctls` again gives the upgrading installer's (none after an install without it;
   `reset-db` installs again with the values it has). `upgrade --version V` to the release that
   runs applies nothing, and says so when the release does not have what was asked:
-  `k8s upgrade --unsafe-sysctls` by that release's installer does.
+  `k8s upgrade --unsafe-sysctls` by that release's installer does. The installer of an earlier
+  release, made before the flag, refuses it as unknown: `upgrade --version V --unsafe-sysctls`
+  then fails, and its failure is followed by a note saying, if that is why, to run it without
+  the flag (that release gives the pods none).
   The kubelet calls them unsafe: a node runs such a pod only when its configuration allows each
   (`allowedUnsafeSysctls`), else the pod fails (`SysctlForbidden`), helm waits out `--timeout`
   and rolls back, and the error names `k8s tune`. Pod Security admits them only at the
-  `privileged` level: a namespace labelled `pod-security.kubernetes.io/enforce: baseline` (or
-  `restricted`) refuses the pods. A pod's namespace copies its node's TCP buffer
+  `privileged` level: `install`, `upgrade` and `reset-db` given `--unsafe-sysctls` refuse at once
+  (an upgrade keeping the release's, its pods running with them today, warns instead: the
+  cluster's admission configuration may exempt the namespace),
+  before anything changes, a namespace whose `pod-security.kubernetes.io/enforce` label names
+  another level (`--unsafe-sysctls: namespace NS enforces the Pod Security level baseline, which
+  refuses pods given those settings: label it privileged (…), or give the pods none (--unsafe-sysctls=false)`); a
+  namespace without the label (the cluster's default level applies), not there yet, or one the
+  operator may not read is not checked. A pod's namespace copies its node's TCP buffer
   sizes and sizes its SYN queue from the node's memory, which the installer does not read: those
   are the node's own tuning. `k8s tune` prints the settings, the kubelet's `allowedUnsafeSysctls`
   list (and its `--allowed-unsafe-sysctls` flag) and how a node is tuned: `<short>-stow tune` on
@@ -2112,9 +2217,10 @@ the current directory. A release with no chart (published without the shape) is 
   release with no such Secret and a `pending-…` one): each pass
   applies the Secret, then restarts the Deployments, StatefulSets and DaemonSets the release's
   manifest makes in its namespace that read the key (a `secretKeyRef` of the Secret naming `KEY`,
-  `KEY_NEXT` or `KEY_PREVIOUS`, or the whole Secret by `envFrom`, a secret volume or a projected
+  `KEY_NEXT`, `KEY_PREVIOUS` or `KEY_ACCEPTED`, or the whole Secret by `envFrom`, a secret volume or a projected
   one), one after the other (`kubectl rollout restart`, then `kubectl
   rollout status`, each bounded by `--timeout`). The chart gives `KEY_NEXT` and `KEY_PREVIOUS`
+  (or `KEY_ACCEPTED`, the one of them that holds a value, as on Docker; the Secret holds the three)
   to the pods that check the value.
 - `reset-db` takes the release back to its first setup, run by the installer of the release it
   runs (another is refused, as is a `pending-…` release and a project whose `data.reset` names

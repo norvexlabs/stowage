@@ -215,7 +215,16 @@ func (o *options) signer(p *project.Project, kc authn.Keychain, a access, reg *r
 			s.Key = filepath.Join(base, c.Key)
 		}
 	}
-	return publish.NewCosignSigner(s)
+	signer, err := publish.NewCosignSigner(s)
+	if err != nil || a != writeAccess || o.test.Key == "" {
+		return signer, err
+	}
+	// A test release is signed with the run's key alone: the key given must be the one its public
+	// key names, so no form of the project's key (env://, a copy re-encrypted) signs it.
+	if err := o.test.sameKey(context.Background(), signer, s.PublicKeys); err != nil {
+		return nil, err
+	}
+	return signer, nil
 }
 
 // openPublisher opens the project, its publisher and the channel (the default one when empty).
@@ -266,6 +275,17 @@ func (o *options) ship(ctx context.Context, channel string, revision int, want s
 	pub, err := o.publisher(p, writeAccess)
 	if err != nil {
 		return err
+	}
+	// lint warns of a version out of its month; a ship of it is refused unless the channel holds
+	// it already (a ship resumed, or a later revision of a version out).
+	if gerr := p.Scheme.Guard(v, o.now()); gerr != nil {
+		out, err := o.released(ctx, pub, p, channel, v)
+		if err != nil {
+			return fmt.Errorf("version.scheme month_guard: %w, and whether %s holds it is not known: %v; not shipped", gerr, channel, err)
+		}
+		if !out {
+			return fmt.Errorf("version.scheme month_guard: %w; not shipped", gerr)
+		}
 	}
 	r, err := pub.Ship(ctx, publish.ShipOptions{Version: v, Channel: channel, Revision: revision, Disks: disks})
 	return o.published(r, err)
@@ -487,4 +507,16 @@ func releasesCmd(o *options) *cobra.Command {
 	c.Flags().StringVar(&channel, "channel", "", "only this channel")
 	c.Flags().BoolVar(&o.json, "json", false, "machine-readable output")
 	return c
+}
+
+// released reports whether channel holds a release of version v, any revision.
+func (o *options) released(ctx context.Context, pub *publish.Publisher, p *project.Project, channel, v string) (bool, error) {
+	// Releases' order does not matter here: a release it could not order is still listed.
+	refs, err := pub.Releases(ctx, channel)
+	for _, r := range refs {
+		if c, cerr := p.Scheme.Compare(r.Manifest.ProjectVersion, v); cerr == nil && c == 0 {
+			return true, nil
+		}
+	}
+	return false, err
 }

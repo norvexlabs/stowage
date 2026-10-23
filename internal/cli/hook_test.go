@@ -320,3 +320,28 @@ func TestHookShipSigningKey(t *testing.T) {
 		}
 	}
 }
+
+// A version out of its month is said at the commit, and no ship starts; this month's starts.
+func TestHookPostCommitRefusesAVersionOutOfItsMonth(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	root := filepath.Join(dir, "proj")
+	if err := os.Rename(testutil.CopyExample(t, "minimal"), root); err != nil {
+		t.Fatal(err)
+	}
+	testutil.Edit(t, root, "stowage.yaml", "scheme: { provider: semver }", "scheme: { provider: calver, format: YYYY.M.MICRO, month_guard: utc }")
+	testutil.Write(t, root, "VERSION", "2026.9.1\n")
+	testutil.Write(t, root, "changes/2026.9.1.md", "- x\n")
+	testutil.GitRepo(t, dir)
+	if _, logs, l, err := runHook(t, nil, nil, "-C", root, "hook", "post-commit"); err != nil || len(l) != 0 ||
+		!strings.HasPrefix(logs, "stowage hook: version.scheme month_guard: version 2026.9.1 is not in the current month (2026.10, UTC)") {
+		t.Fatalf("last month's: %v %+v %q", err, l, logs)
+	}
+	testutil.Write(t, root, "VERSION", "2026.10.1\n")
+	testutil.Write(t, root, "changes/2026.10.1.md", "- x\n")
+	testutil.Git(t, dir, "add", "-A")
+	testutil.Git(t, dir, "commit", "-qm", "this month")
+	if _, logs, l, err := runHook(t, nil, nil, "-C", root, "hook", "post-commit"); err != nil || len(l) != 1 {
+		t.Fatalf("this month's: %v %+v %q", err, l, logs)
+	}
+}

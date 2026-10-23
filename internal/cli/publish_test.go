@@ -311,3 +311,49 @@ func TestCloudSettings(t *testing.T) {
 		t.Errorf("none set: %v, %v", up, err)
 	}
 }
+
+// A version out of its month (version.scheme.month_guard), which lint only warns of, is not
+// shipped: neither last month's nor next month's, before anything is built; this month's is, and
+// once out, a ship of it again (resumed) and a later revision pass after the month's turn.
+func TestShipRefusesAVersionOutOfItsMonth(t *testing.T) {
+	t.Parallel()
+	root := registryProject(t)
+	testutil.SetYAML(t, root, "stowage.yaml", []string{"version", "scheme"}, map[string]any{"provider": "calver", "format": "YYYY.M.MICRO", "month_guard": "utc"})
+	b := &randomBuilder{}
+	env := map[string]string{"NOTES_PUSH_TOKEN": "t0ken"}
+	for _, v := range []string{"2026.9.1", "2026.11.1"} {
+		testutil.Write(t, root, "VERSION", v+"\n")
+		testutil.Write(t, root, "changes/"+v+".md", "- x\n")
+		if _, logs, err := run(t, b, env, "-C", root, "ship"); err == nil || !strings.Contains(err.Error(), "version.scheme month_guard: version "+v+" is not in the current month (2026.10, UTC)") || b.n != 0 {
+			t.Fatalf("%s: %v (%d builds)\n%s", v, err, b.n, logs)
+		}
+	}
+	testutil.Write(t, root, "VERSION", "2026.10.1\n")
+	testutil.Write(t, root, "changes/2026.10.1.md", "- x\n")
+	if _, logs, err := run(t, b, env, "-C", root, "ship"); err != nil {
+		t.Fatalf("this month's: %v\n%s", err, logs)
+	}
+	november := time.Date(2026, 11, 2, 0, 0, 0, 0, time.UTC)
+	for _, args := range [][]string{{"ship"}, {"ship", "--revision", "2"}} {
+		if _, logs, err := runAt(t, b, env, november, append([]string{"-C", root}, args...)...); err != nil {
+			t.Fatalf("%v of a version out, in the next month: %v\n%s", args, err, logs)
+		}
+	}
+	testutil.Write(t, root, "VERSION", "2026.10.2\n")
+	testutil.Write(t, root, "changes/2026.10.2.md", "- x\n")
+	if _, _, err := runAt(t, b, env, november, "-C", root, "ship"); err == nil || !strings.Contains(err.Error(), "month_guard") {
+		t.Fatalf("a new version of last month: %v", err)
+	}
+}
+
+// runAt is run at the time now.
+func runAt(t *testing.T, b *randomBuilder, env map[string]string, now time.Time, args ...string) (string, string, error) {
+	t.Helper()
+	var out, errOut bytes.Buffer
+	o := &options{buildVersion: "0.1.0", getenv: func(k string) string { return env[k] }, builder: b, installer: []byte("exe"),
+		now: func() time.Time { return now }, out: &out, err: &errOut}
+	cmd := newRoot(o)
+	cmd.SetArgs(args)
+	err := cmd.ExecuteContext(context.Background())
+	return out.String(), errOut.String(), err
+}

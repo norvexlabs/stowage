@@ -10,8 +10,30 @@ follow [SemVer](https://semver.org/).
   as its memory limit, on Docker and the VM, recomputed at each start and each VM boot — never
   below the limit its compose file sets itself. The service is told its limit, the host's RAM and
   CPUs (`STOWAGE_MEM_LIMIT_MB`, `STOWAGE_HOST_MEM_MB`, `STOWAGE_HOST_CPUS`) to size its own caches.
+- **Test releases**: `--test-registry`, `--test-key` with `--test-public-key`, and `--shapes`
+  make `ship`, `verify`, `releases` and `promote` work on a test release of the project —
+  published elsewhere, signed with the run's key, which its installs trust alone, with only the
+  shapes asked, with the run's own registry accounts — without editing the spec. The project's
+  registry, its signing key and its registry tokens are refused for one.
+- **Docker service verbs**: `ps`, `logs SERVICE` (`--follow`), `restart`, `stop` and `start
+  SERVICE`, and `exec SERVICE -- COMMAND` (its exit status the run's), as the VM has them.
+- **`schema`** on Docker: the database's migration, the one the release kept for `rollback`
+  recorded, and the rollback barriers after it (`--after`, `--json`).
+- **`uninstall` on Docker**: the containers, networks and host timers go, the volumes and the
+  install directory are kept for a later install, or deleted with `--data`.
+- **`KEY_ACCEPTED`** beside a rotated secret: the other value its services accept during a
+  rotation, so a service reads one variable instead of two.
+
+### Changed
+- `ship` and the commit hook refuse a version that `month_guard` puts out of its month, unless
+  the channel holds it already (a resumed ship, a later revision); `lint` still only warns.
+- `k8s install`, `upgrade` and `reset-db` with `--unsafe-sysctls` refuse at once a namespace
+  whose Pod Security label refuses the pods' settings, instead of waiting out the timeout; an
+  upgrade to a release whose installer predates the flag says to run it without.
 
 ### Fixed
+- A first install refuses a UDP port of an L4 route that another program holds, as it does a
+  TCP one, instead of failing as the stack starts.
 - The VM's host daemon refuses a request during another job as `a job (<kind>) is running`, which
   reads right for every kind of job.
 

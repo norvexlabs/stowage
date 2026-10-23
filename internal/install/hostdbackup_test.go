@@ -1034,7 +1034,7 @@ func TestADockerInstallBacksUpThroughItsOwnDaemon(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer done()
+	defer func() { done() }() // the daemon made last
 	req := validConfig(key)
 	req.Schedule = ptr("Mon *-*-* 04:00:00")
 	configure(t, d, req)
@@ -1055,6 +1055,24 @@ func TestADockerInstallBacksUpThroughItsOwnDaemon(t *testing.T) {
 	if j := waitJob(t, h); j.State != "done" || len(f.objects) != 2 {
 		t.Fatalf("%+v %v", j, f.objects)
 	}
+	// Units gone (an uninstall that kept the data), an install writes them again from the settings.
+	for _, ext := range []string{".timer", ".service"} {
+		_ = os.Remove(filepath.Join(units, unit+ext))
+	}
+	done()
+	rerun := e.installer(func(o *Options) { o.Systemd, o.Host = units, host })
+	if err := rerun.Install(context.Background()); err != nil {
+		t.Fatalf("the re-run: %v\n%s", err, e.log)
+	}
+	rerun.Finished(context.Background(), onDocker)
+	if again, err := os.ReadFile(filepath.Join(units, unit+".timer")); err != nil || string(again) != string(timer) {
+		t.Fatalf("the timer again: %q %v", again, err)
+	}
+	d, done, err = in.dockerHostd(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	h = d.Handler()
 	// Removing the settings removes the units.
 	if code := call(t, h, "DELETE", "/v1/backup/config", nil, nil); code != 200 {
 		t.Fatalf("remove: %d", code)

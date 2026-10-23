@@ -197,3 +197,16 @@ func TestACosignThatSucceedsAndLeavesAChildSucceeds(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// The public key of the signer's key: cosign public-key, which reaches no registry, is given no
+// credentials.
+func TestCosignSignerPublicKeyCarriesNoCredentials(t *testing.T) {
+	s, logf := newFakeCosign(t, "registry.example.com", &authn.Basic{Username: "publisher", Password: "s3cret"})
+	if _, err := s.PublicKey(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	eq(t, "args", strings.TrimSpace(readFile(t, logf)), "public-key --key env://KEY")
+	if c := readFile(t, logf+".config"); strings.Contains(c, "auth") {
+		t.Fatalf("cosign public-key was given the registry's credentials: %s", c)
+	}
+}

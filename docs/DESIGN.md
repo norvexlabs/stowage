@@ -1310,6 +1310,30 @@ every shape, the VM end-to-end test upgrading through it), then the health gate.
   limit reads the new value. RAM is read to 64 MiB, as the network tuning reads it, so a kernel's
   few KiB never recreate a service. The chart is left out: a node's RAM is not the installer's
   to know, and a chart's `resources:` already say what a pod gets.
+- **A test release is the project's, overridden at open** (`--test-registry`, `--test-key`,
+  `--test-public-key`, `--shapes`): every command that opens the project sees the same release,
+  so a test run ships, verifies and promotes without a rewritten spec, and the publish and trust
+  code paths are the production ones. What it may not be is the project's release: the
+  project's registry (compared as the registry names it) is refused, a signing project's test
+  release must carry the run's key, and the run's public key replaces `public_keys` rather than
+  joining them — no install of the project ever trusts a test key, and a test release reaching
+  the project's registry would fail every install's verification. Its credentials are the run's
+  too: the project's push token is never sent to another registry, its pull account never baked
+  into an installer published there, and nothing of it reaches a cloud (`cloud_publish`) or the
+  project's packages service (`registry.delete`). `hook` refuses the flags: its background ship
+  runs without them.
+- **Docker's verbs reach the stack through the install's own compose files**: `ps`, `logs`,
+  `restart`/`stop`/`start`, `exec` and `uninstall` run `docker compose` with the files a start
+  uses, so an operator never needs the project name or labels. The verbs that change the stack
+  take the lifecycle lock. `uninstall` keeps the data unless asked — the volumes and the
+  directory together, as a database's volume is useless without the secrets `.env` holds — and
+  prints how to bring it back or delete it, as `k8s uninstall` does.
+- **`KEY_ACCEPTED` is derived, never chosen**: written from `KEY_NEXT` and `KEY_PREVIOUS` by
+  every pass, upgrade and install, since the two are never both set; a compose file or a chart
+  reading it alone accepts what both would.
+- **The month guard refuses at release time only**: `lint` stays a warning, so a project checks
+  and plans across a month's turn, and `ship` and the commit hook — the two ways a release
+  starts — refuse; `promote` re-tags a published release, whatever its month.
 - **The adoption proof lives in the tree** — Stowage knows no project, so the proof that a
   production project can adopt it is `examples/full` made a working stack with that project's
   traits, walked through each shape's lifecycle by its own end-to-end suite; a real project's

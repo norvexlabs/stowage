@@ -54,6 +54,8 @@ type options struct {
 	keyRoot  string
 	root     string
 	specPath string
+	// test, when on, makes every command's project a test release.
+	test     testRelease
 	json     bool
 	now      func() time.Time
 	out, err io.Writer
@@ -70,7 +72,15 @@ func (o *options) open() (*project.Project, error) {
 	if err := o.requires(); err != nil {
 		return nil, err
 	}
-	return project.Open(o.root, o.specFile())
+	p, err := project.Open(o.root, o.specFile())
+	if err != nil || !o.test.on() {
+		return p, err
+	}
+	if err := o.test.apply(p); err != nil {
+		return nil, err
+	}
+	fmt.Fprintln(o.err, o.test.describe(p))
+	return p, nil
 }
 
 // requires refuses a project whose stowage.requires does not accept this stowage, before its
@@ -145,6 +155,13 @@ func newRoot(o *options) *cobra.Command {
 	root.SetErr(o.err)
 	root.PersistentFlags().StringVarP(&o.root, "dir", "C", ".", "project root (spec paths are relative to it)")
 	root.PersistentFlags().StringVarP(&o.specPath, "file", "f", "", "spec file (default <dir>/stowage.yaml)")
+	pf := root.PersistentFlags()
+	pf.StringVar(&o.test.Registry, "test-registry", "", "a test release: publish to and read from this registry prefix, never the project's")
+	pf.StringVar(&o.test.Key, "test-key", "", "a test release: sign with this cosign key (a file, env://VAR or a KMS URI), never the project's")
+	pf.StringVar(&o.test.Public, "test-public-key", "", "a test release: its installs trust this public key alone (a project file)")
+	pf.StringSliceVar(&o.test.Shapes, "shapes", nil, "a test release: only these shapes (docker, kubernetes, kairos)")
+	pf.StringVar(&o.test.Push, "test-push", "", "a test release: publish with this account, USER:ENV (the variable holding its password), never the project's token")
+	pf.StringVar(&o.test.Pull, "test-pull", "", "a test release: the pull account its installers carry, USER:ENV, or none; never the project's")
 	root.AddCommand(lintCmd(o), versionCmd(o), changelogCmd(o), planCmd(o), lockCmd(o), hookCmd(o),
 		shipCmd(o), verifyCmd(o), promoteCmd(o), yankCmd(o), pruneCmd(o), releasesCmd(o))
 	return root

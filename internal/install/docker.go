@@ -3,6 +3,7 @@ package install
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -10,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -124,6 +126,18 @@ func hostAddrs() []string {
 		}
 	}
 	return out
+}
+
+// udpPortFree reports whether no socket of the host holds the UDP port on host: a bind to it
+// fails only then. A port this process may not bind (below the unprivileged ports, as a user)
+// is not known to be held, and counts as free.
+func udpPortFree(host string, port int) bool {
+	c, err := net.ListenPacket("udp", net.JoinHostPort(host, strconv.Itoa(port)))
+	if err != nil {
+		return !errors.Is(err, syscall.EADDRINUSE)
+	}
+	c.Close()
+	return true
 }
 
 // portFree reports whether nothing listens on host:port.

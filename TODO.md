@@ -55,15 +55,9 @@ A finished item is deleted, not ticked. The plan behind it is
 - **The Docker disk-pressure check end to end**: `disk-check` and its timer are unit-tested; no
   suite runs the check against a filled volume on a Docker host.
 
-- **`uninstall` on Docker**: removing an install is `docker compose … down -v` by hand in its
-  directory, plus the directory. `uninstall` takes the stack down, deletes its volumes (asking,
-  or `--yes`), and removes the directory; `--keep-data` keeps the volumes. Kubernetes has its
-  `k8s uninstall` already.
-- **Service verbs on Docker**: `ps`, `logs <service>`, `restart | stop | start <service>` exist on
-  the VM only, so on Docker an operator reaches into the stack with `docker restart` /
-  `docker logs` and the compose project name — e.g. to have a service re-read a setting it loads
-  only at start (a CA bundle imported in the application). The same verbs on the Docker shape,
-  addressing a service by its compose name, through the install's own compose files.
+- **`exec` and `schema` on the VM and Kubernetes**: Docker's `exec SERVICE -- CMD` and `schema`
+  have no VM verb (the host daemon would run them, as it runs `logs`) nor `k8s schema` (a query
+  pod, as the rollback check runs).
 
 - **Cloud images, account identity**: an image's working directory is keyed by the cloud's
   settings, not by the account the credentials reach; two accounts on the same settings (a
@@ -221,13 +215,9 @@ A finished item is deleted, not ticked. The plan behind it is
 ## Could
 
 - **`k8s install --unsafe-sysctls` on a kubelet that refuses them**: the pods fail at once
-  (`SysctlForbidden`, or Pod Security's refusal), yet helm waits out `--timeout` before it rolls
-  back. Watch the rollout's pods and fail on that reason early; the error's hint then names the
-  real cause (now it is added to any failure of a release that gives them, and `reset-db`'s
-  failed install gives none).
-
-- **`k8s upgrade --version V --unsafe-sysctls` to an installer built before the flag** fails
-  with `unknown flag`; the error could say to run `k8s upgrade --unsafe-sysctls` after it.
+  (`SysctlForbidden`), yet helm waits out `--timeout` before it rolls back. Watch the rollout's
+  pods and fail on that reason early (a namespace's Pod Security label is checked before
+  anything changes already; the cluster's default level, without a label, is not).
 
 - **An image gone under `make gate`'s parallel suites**: once, e2e-full's re-run met `No such
   image: …/atlas/atlas-provision@sha256:…` at its provision step (its registry live, the image
@@ -285,8 +275,6 @@ A finished item is deleted, not ticked. The plan behind it is
   archive's large blobs as a ship pushes a disk.
 - **e2e-kairos's `backup verify` failed once beside the parallel suites** (2026-10-21) and passed
   alone: find the clash (the WebDAV server's port, or the runner's container name) and fix it.
-- **UDP in the first install's free-port check**: it covers the L4 routes' TCP ports only;
-  a UDP port already bound fails at `compose up`.
 - **A volume quiesced for its backup**: `backup.volumes` are read while the stack runs,
   which suits material written once; a service writing a volume continuously would need its own
   pause (a hook around the archive).
@@ -519,6 +507,14 @@ A finished item is deleted, not ticked. The plan behind it is
   binary from it fails that exec (text file busy); the gate's own suites reuse its one build
   (`make -o build`). Exporting to a temporary directory and renaming each file into `./bin`
   would make any build safe beside a run.
+- **A test release on another name of the project's registry**: `--test-registry` is compared
+  by its spelling, folded (case, dots, ports, loopback, Docker Hub); another DNS name or address
+  of the same registry is not told. Before publishing, a test release of a signing project could
+  read the test prefix's release repository and refuse when a release there verifies with the
+  project's own keys (the user to decide: now, or as a Should).
+- **A test release's key check**: `cosign public-key` runs with a background context (a cancelled
+  command waits for it, up to cosign's timeout), and once, when the signer is made: a key file
+  changed during the ship would sign unchecked. The check beside each sign call would close it.
 - **An empty `stack.memory:` is caught by lint alone**, from the file: decoding takes it as no
   key. A presence check in spec decoding would give every reader of the spec the refusal.
 
@@ -528,5 +524,5 @@ A finished item is deleted, not ticked. The plan behind it is
 
 - The other extensions of DESIGN § 10 (restore verb on Kubernetes, Kubernetes provision hook +
   portal URL): none exists today; revisit after parity. The Docker backups and restore, the
-  Kubernetes barrier pre-flight, `uninstall` and the service verbs on Docker are Musts 6 and 10 and Shoulds.
+  Kubernetes barrier pre-flight are Musts 6 and 10.
 - Secret rotation (DESIGN § 7 row 24, an application concern).

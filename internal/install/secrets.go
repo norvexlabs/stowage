@@ -31,7 +31,7 @@ const maxSecretsFile = 1 << 20
 // secret's next or previous value, a secret input, or the Cloudflare token.
 func (in *Installer) secretKey(k string) bool {
 	for _, s := range in.secrets() {
-		if k == s.Key || s.Rotation && (k == NextVar(s.Key) || k == PreviousVar(s.Key)) {
+		if k == s.Key || s.Rotation && (k == NextVar(s.Key) || k == PreviousVar(s.Key) || k == AcceptedVar(s.Key)) {
 			return true
 		}
 	}

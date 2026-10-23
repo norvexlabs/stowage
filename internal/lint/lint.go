@@ -901,6 +901,7 @@ func (l *linter) secretsAndInputs() {
 		if s.Rotation {
 			claim(w+".rotation", s.Key+"_NEXT", "a rotated secret's next value")
 			claim(w+".rotation", s.Key+"_PREVIOUS", "a rotated secret's previous value")
+			claim(w+".rotation", s.Key+"_ACCEPTED", "a rotated secret's other accepted value")
 			l.rotated(w, s.Key)
 		}
 	}
@@ -955,15 +956,22 @@ func (l *linter) secretsAndInputs() {
 	l.extensions()
 }
 
-// rotated checks that the compose file reads a rotated secret's next and previous values: a
-// service that does not accept them drops the other age's tokens during a rotation.
+// rotated checks that the compose file reads a rotated secret's next and previous values, or the
+// one of them it holds (_ACCEPTED): a service that does not accept them drops the other age's
+// tokens during a rotation.
 func (l *linter) rotated(where, key string) {
 	if l.compose == nil {
 		return
 	}
+	reads := func(k string) bool {
+		return slices.ContainsFunc(l.compose.Vars, func(v VarRef) bool { return v.Name == k })
+	}
+	if reads(key + "_ACCEPTED") {
+		return
+	}
 	for _, k := range []string{key + "_NEXT", key + "_PREVIOUS"} {
-		if !slices.ContainsFunc(l.compose.Vars, func(v VarRef) bool { return v.Name == k }) {
-			l.errf(where+".rotation", "%s reads no ${%s}: during a rotation its services accept both values", l.s.Stack.Compose, k)
+		if !reads(k) {
+			l.errf(where+".rotation", "%s reads no ${%s} (nor ${%s_ACCEPTED}, either of them): during a rotation its services accept both values", l.s.Stack.Compose, k, key)
 		}
 	}
 }
@@ -1442,3 +1450,7 @@ func sortedKeys[V any](m map[string]V) []string {
 
 // ChannelName reports whether name may name a channel: it is a tag (the channel's pointer).
 func ChannelName(name string) bool { return len(name) <= 128 && imageKeyRe.MatchString(name) }
+
+// RegistryPrefix reports whether p is written as registry.prefix must be: host[:port][/path], lower
+// case, no scheme, no trailing slash.
+func RegistryPrefix(p string) bool { return !strings.Contains(p, "://") && prefixRe.MatchString(p) }

@@ -16,6 +16,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 	"go.yaml.in/yaml/v3"
+	"golang.org/x/term"
 
 	"github.com/norvexlabs/stowage/internal/payload"
 	"github.com/norvexlabs/stowage/internal/spec"
@@ -140,6 +141,107 @@ func newCommand(r *Release, self string, stdout, stderr io.Writer, tools K8sOpti
 	}
 	dirFlag(status)
 	root.AddCommand(status)
+	var asJSON bool
+	ps := &cobra.Command{
+		Use:   "ps",
+		Short: "The stack's services, their state and health",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			if err := prepare(); err != nil {
+				return err
+			}
+			return in.Ps(cmd.Context(), asJSON)
+		},
+	}
+	ps.Flags().BoolVar(&asJSON, "json", false, "Compose's JSON, one service per line")
+	dirFlag(ps)
+	var tail int
+	var follow bool
+	logs := &cobra.Command{
+		Use:   "logs SERVICE",
+		Short: "A service's last log lines",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := prepare(); err != nil {
+				return err
+			}
+			return in.Logs(cmd.Context(), args[0], tail, follow)
+		},
+	}
+	logs.Flags().IntVar(&tail, "tail", 200, fmt.Sprintf("how many lines (1 to %d)", maxLogTail))
+	logs.Flags().BoolVarP(&follow, "follow", "f", false, "then the lines it writes, until interrupted")
+	dirFlag(logs)
+	root.AddCommand(ps, logs)
+	for _, verb := range ServiceVerbs {
+		c := &cobra.Command{
+			Use:   verb + " SERVICE",
+			Short: strings.ToUpper(verb[:1]) + verb[1:] + " one service of the stack",
+			Args:  cobra.ExactArgs(1),
+			RunE: func(cmd *cobra.Command, args []string) error {
+				if err := prepare(); err != nil {
+					return err
+				}
+				return in.Service(cmd.Context(), verb, args[0])
+			},
+		}
+		dirFlag(c)
+		root.AddCommand(c)
+	}
+	exec := &cobra.Command{
+		Use:   "exec SERVICE -- COMMAND [ARG...]",
+		Short: "Run a command in a running service's container (with a terminal when standard input is one); its exit status is the run's",
+		Args:  cobra.MinimumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := prepare(); err != nil {
+				return err
+			}
+			if cmd.ArgsLenAtDash() != 1 {
+				return errors.New("exec SERVICE -- COMMAND: the command goes after --")
+			}
+			stdin := cmd.InOrStdin()
+			f, ok := stdin.(*os.File)
+			return in.Exec(cmd.Context(), args[0], args[1:], stdin, ok && term.IsTerminal(int(f.Fd())))
+		},
+	}
+	dirFlag(exec)
+	var after string
+	schemaCmd := &cobra.Command{
+		Use:   "schema",
+		Short: "The database's migration, the one the release kept for rollback recorded, and the rollback barriers after it",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			if err := prepare(); err != nil {
+				return err
+			}
+			return in.Schema(cmd.Context(), after, asJSON)
+		},
+	}
+	schemaCmd.Flags().StringVar(&after, "after", "", "the barriers after this migration (default: the one the kept release recorded)")
+	schemaCmd.Flags().BoolVar(&asJSON, "json", false, "print the report as JSON")
+	dirFlag(schemaCmd)
+	var data bool
+	uninstall := &cobra.Command{
+		Use:   "uninstall",
+		Short: "Remove the install's containers and networks; with --data its volumes and directory too",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			if err := prepare(); err != nil {
+				return err
+			}
+			if !noInput {
+				in.O.Prompt = terminal(accessible)
+			}
+			return in.Uninstall(cmd.Context(), data)
+		},
+	}
+	unf := uninstall.Flags()
+	unf.BoolVar(&data, "data", false, "delete the volumes and the install directory too (its secrets, the dumps, the release kept for rollback)")
+	unf.BoolVarP(&o.Yes, "yes", "y", false, "uninstall without asking (the data kept, unless --data)")
+	unf.BoolVar(&noInput, "no-input", false, "never ask: without --yes, refuse")
+	unf.BoolVar(&accessible, "accessible", false, "confirm with a plain line prompt")
+	unf.BoolVar(&o.DryRun, "dry-run", false, "print what would be removed and kept, change nothing")
+	dirFlag(uninstall)
+	root.AddCommand(exec, schemaCmd, uninstall)
 	prov := &cobra.Command{
 		Use:   "provision",
 		Short: "Run the provision hook again on the running stack (idempotent; continues an unfinished one)",

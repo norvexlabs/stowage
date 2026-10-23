@@ -111,8 +111,9 @@ type Options struct {
 	Exec func(ctx context.Context, exe string, args []string) error
 	// K8s is a run of `k8s`.
 	K8s K8sOptions
-	// PortFree replaces the listening-port probe in tests.
-	PortFree func(host string, port int) bool
+	// PortFree and UDPPortFree replace the TCP and UDP port probes in tests.
+	PortFree    func(host string, port int) bool
+	UDPPortFree func(host string, port int) bool
 	// Firewall is the directory the VM's firewall includes runtime rules from, where every start
 	// opens the front's ports (openPorts); empty opens none. Host runs host programs (nft): Args[0]
 	// is the program.
@@ -446,8 +447,8 @@ func (in *Installer) preflight(ctx context.Context, mode string) (publish, error
 	return pub, in.l4Free(in.R.Spec.L4.Routes)
 }
 
-// l4Free refuses a TCP port of routes a process of the host already listens on, on any of its
-// addresses.
+// l4Free refuses a port of routes a process of the host already holds, on any of its addresses: a
+// TCP port one listens on, a UDP port one is bound to.
 func (in *Installer) l4Free(routes []spec.L4Route) error {
 	hosts := []string{"127.0.0.1", "::1"}
 	for _, h := range hostAddrs() {
@@ -457,7 +458,13 @@ func (in *Installer) l4Free(routes []spec.L4Route) error {
 	}
 	var busy []string
 	for _, r := range routes {
-		if r.Protocol == "tcp" && slices.ContainsFunc(hosts, func(h string) bool { return !in.O.portFree(h, r.Port) }) {
+		free, on := in.O.portFree, hosts
+		if r.Protocol == "udp" {
+			// Docker binds the wildcard, which a socket holding the port on any address
+			// keeps from binding (a local resolver's 127.0.0.53:53).
+			free, on = in.O.udpPortFree, []string{"0.0.0.0", "::"}
+		}
+		if slices.ContainsFunc(on, func(h string) bool { return !free(h, r.Port) }) {
 			busy = append(busy, fmt.Sprintf("%d (%s)", r.Port, r.Name))
 		}
 	}
@@ -596,6 +603,7 @@ func (in *Installer) decide(ctx context.Context, dir, mode string, pub publish, 
 	}
 	// A rotation under way when the secrets were exported goes on from where it was.
 	rotationVars(in.secrets(), func(k string) bool { _, ok := env.Get(k); return ok }, func(k, _ string) { env.Set(k, in.restoredSecret(k)); secrets[k] = true })
+	acceptedVars(in.secrets(), func(k string) string { v, _ := env.Get(k); return v }, func(k, v string) { env.Set(k, v); secrets[k] = true })
 	in.profilesVar(env)
 	in.l4Vars(env)
 	return env, secrets, env.Check()
@@ -2223,6 +2231,13 @@ func (o *Options) portFree(host string, port int) bool {
 		return o.PortFree(host, port)
 	}
 	return portFree(host, port)
+}
+
+func (o *Options) udpPortFree(host string, port int) bool {
+	if o.UDPPortFree != nil {
+		return o.UDPPortFree(host, port)
+	}
+	return udpPortFree(host, port)
 }
 
 func sortedKeys[V any](m map[string]V) []string {

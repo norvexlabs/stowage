@@ -2,6 +2,7 @@ package publish
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -98,7 +99,24 @@ func (s *CosignSigner) Sign(ctx context.Context, d name.Digest) error {
 	if s.Key == "" {
 		return errors.New("signing: no private key (a read-only command cannot sign)")
 	}
-	return s.run(ctx, "sign", "--key", s.Key, "--tlog-upload=false", "--use-signing-config=false", "--yes", d.String())
+	args := []string{"--key", s.Key, "--tlog-upload=false", "--use-signing-config=false", "--yes", d.String()}
+	if registry.Loopback(hostname(s.Registry.RegistryStr())) {
+		args = append([]string{"--allow-http-registry"}, args...)
+	}
+	return s.run(ctx, nil, true, "sign", args...)
+}
+
+// PublicKey is the PEM public key of the private key s.Key, as cosign derives it: what its
+// signatures verify against, whatever form the key is given in.
+func (s *CosignSigner) PublicKey(ctx context.Context) ([]byte, error) {
+	if s.Key == "" {
+		return nil, errors.New("signing: no private key")
+	}
+	var out bytes.Buffer
+	if err := s.run(ctx, &out, false, "public-key", "--key", s.Key); err != nil {
+		return nil, err
+	}
+	return out.Bytes(), nil
 }
 
 // Verify implements Signer, in-process.
@@ -106,7 +124,9 @@ func (s *CosignSigner) Verify(ctx context.Context, d name.Digest) error {
 	return s.verifier.Verify(ctx, s.Reader, d)
 }
 
-func (s *CosignSigner) run(ctx context.Context, verb string, args ...string) error {
+// run runs cosign's verb, with auth the registry's credentials in a private Docker config (an
+// empty one without), its stdout to stdout (nil: discarded).
+func (s *CosignSigner) run(ctx context.Context, stdout io.Writer, auth bool, verb string, args ...string) error {
 	if err := os.MkdirAll(s.WorkDir, 0o700); err != nil {
 		return err
 	}
@@ -115,22 +135,18 @@ func (s *CosignSigner) run(ctx context.Context, verb string, args ...string) err
 		return err
 	}
 	defer os.RemoveAll(dir)
-	if err := s.writeDockerConfig(dir); err != nil {
-		return err
+	if auth {
+		if err := s.writeDockerConfig(dir); err != nil {
+			return err
+		}
 	}
-	if registry.Loopback(hostname(s.Registry.RegistryStr())) {
-		args = append([]string{"--allow-http-registry"}, args...)
-	}
-	cosign := s.Cosign
-	if cosign == "" {
-		cosign = "cosign"
-	}
+	cosign := cmp.Or(s.Cosign, "cosign")
 	ctx, cancel := context.WithTimeout(ctx, cosignTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, cosign, append([]string{verb}, args...)...)
 	cmd.Env = append(withoutEnv(os.Environ(), "DOCKER_CONFIG"), "DOCKER_CONFIG="+dir)
 	var out tail
-	cmd.Stdout, cmd.Stderr = io.Discard, &out
+	cmd.Stdout, cmd.Stderr = cmp.Or[io.Writer](stdout, io.Discard), &out
 	// A child cosign left behind (a credential or KMS helper) must not keep Run waiting on the
 	// stderr pipe once cosign itself was stopped.
 	cmd.WaitDelay = cosignWaitDelay

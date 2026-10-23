@@ -40,15 +40,11 @@ cat "$WORK/ship2.log"
 ! grep -qE 'image [a-z]+: (build|mirror|tag )|installer[: ]|chart: |published \(seq|^signed ' "$WORK/ship2.log" || fail "a second ship wrote something"
 grep -q 'release beta-1.0.0 unchanged' "$WORK/ship2.log" || fail "release not reported unchanged"
 
-step "registry.pull none, and the registry refuses anonymous reads: ship stops before it builds"
-cp "$P/stowage.yaml" "$WORK/stowage.yaml.saved"
-sed -i 's/pull: { provider: token, user: pull, token_env: NOTES_PULL_TOKEN }/pull: { provider: none }/' "$P/stowage.yaml"
-grep -q 'pull: { provider: none }' "$P/stowage.yaml" || fail "registry.pull was not set to none"
-if "${S[@]}" ship --channel beta 2>"$WORK/private.log"; then fail "ship published what an install cannot read"; fi
+step "no pull account, and the registry refuses anonymous reads: ship stops before it builds"
+if "${S[@]}" --test-pull none ship --channel beta 2>"$WORK/private.log"; then fail "ship published what an install cannot read"; fi
 grep -q "every install reads $REG/notes anonymously, and .*$REG/notes/notes-api.* refuse an anonymous read" "$WORK/private.log" ||
 	{ cat "$WORK/private.log"; fail "the refusal does not name the private repositories"; }
 ! grep -qE 'image [a-z]+: (build|mirror)' "$WORK/private.log" || fail "ship built before it refused"
-cp "$WORK/stowage.yaml.saved" "$P/stowage.yaml"
 
 step "verify, promote, verify"
 # Read-only: with the pull account only (zot grants it read, nothing else).

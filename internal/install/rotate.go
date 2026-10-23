@@ -30,6 +30,21 @@ const (
 func NextVar(key string) string     { return key + "_NEXT" }
 func PreviousVar(key string) string { return key + "_PREVIOUS" }
 
+// AcceptedVar is the other value a rotated secret's services accept beside KEY: KEY_NEXT while
+// one is staged, else KEY_PREVIOUS, empty outside a rotation (the two are never both set). A
+// service that accepts one more value reads it alone.
+func AcceptedVar(key string) string { return key + "_ACCEPTED" }
+
+// acceptedVars records each rotated secret's AcceptedVar from the next and previous values get
+// reads.
+func acceptedVars(secrets []spec.Secret, get func(string) string, set func(k, v string)) {
+	for _, s := range secrets {
+		if s.Rotation {
+			set(AcceptedVar(s.Key), cmp.Or(get(NextVar(s.Key)), get(PreviousVar(s.Key))))
+		}
+	}
+}
+
 // rotated returns the secret key names, which must have rotation: true.
 func (in *Installer) rotated(key string) (spec.Secret, error) {
 	var names []string
@@ -58,9 +73,18 @@ func rotationVars(secrets []spec.Secret, has func(string) bool, set func(k, v st
 	}
 }
 
-// rotatePass applies one pass of sec's rotation to the values get reads and set writes, and
-// says what it did. A pass out of order is refused.
+// rotatePass applies one pass of sec's rotation to the values get reads and set writes, its
+// AcceptedVar with them, and says what it did. A pass out of order is refused.
 func (in *Installer) rotatePass(sec spec.Secret, pass string, get func(string) string, set func(k, v string)) (string, error) {
+	what, err := in.rotateValues(sec, pass, get, set)
+	if err == nil {
+		acceptedVars([]spec.Secret{sec}, get, set)
+	}
+	return what, err
+}
+
+// rotateValues is rotatePass on KEY, KEY_NEXT and KEY_PREVIOUS.
+func (in *Installer) rotateValues(sec spec.Secret, pass string, get func(string) string, set func(k, v string)) (string, error) {
 	k, next, prev := sec.Key, NextVar(sec.Key), PreviousVar(sec.Key)
 	ctl := in.R.Ctl() + " secrets rotate " + k
 	// A pass whose state is already there (a run that recorded it, then failed to restart) is run
@@ -191,7 +215,7 @@ func (in *Installer) K8sRotateSecret(ctx context.Context, key, pass string) erro
 	if err != nil {
 		return err
 	}
-	workloads, err := releaseWorkloads(manifest, k.Namespace, k.envSecret(), []string{key, NextVar(key), PreviousVar(key)})
+	workloads, err := releaseWorkloads(manifest, k.Namespace, k.envSecret(), []string{key, NextVar(key), PreviousVar(key), AcceptedVar(key)})
 	if err != nil {
 		return err
 	}

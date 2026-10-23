@@ -243,6 +243,24 @@ func (in *Installer) InstallWatch(ctx context.Context) error {
 			in.R.Spec.Name, in.O.Dir, pressureEvery))
 }
 
+// InstallSchedule writes the scheduled backup's units of a Docker install from the settings it
+// keeps (`backup config`), as the daemon's start does (the release's backup, the schedule
+// checked), under the settings' lock: an install brought back on its data after `uninstall`
+// backs up again. Without settings, or without root and systemd, it changes nothing.
+func (in *Installer) InstallSchedule(ctx context.Context) error {
+	h, err := in.dockerWatchd(ctx)
+	if err != nil || !h.systemdHost() {
+		return err
+	}
+	unlock, err := flockWait(filepath.Join(h.O.Dir, settingsLock), true)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	h.backupResume()
+	return nil
+}
+
 // DiskCheck is `disk-check` on Docker: the disk-pressure watch's one check, its POST recorded.
 func (in *Installer) DiskCheck(ctx context.Context) error {
 	h, err := in.dockerWatchd(ctx)

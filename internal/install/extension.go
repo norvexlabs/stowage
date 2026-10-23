@@ -36,6 +36,9 @@ func (in *Installer) Finished(ctx context.Context, shape string) {
 		if err := in.InstallWatch(ctx); err != nil {
 			in.O.logf("the disk-pressure watch could not be installed: %v", err)
 		}
+		if err := in.InstallSchedule(ctx); err != nil {
+			in.O.logf("the scheduled backup's timer could not be installed: %v", err)
+		}
 	}
 	if url := in.dockerEndpoint(env); url != "" {
 		if mode, _ := env.Get("STOWAGE_TLS_MODE"); mode == Loopback {

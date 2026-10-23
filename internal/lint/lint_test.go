@@ -237,7 +237,8 @@ func TestEachRuleFiresOnFull(t *testing.T) {
 		{"publish ca without a CA mode", []edit{{sp, "tls_modes: [acme, dns-cloudflare, byo, internal, none]", "tls_modes: [acme, dns-cloudflare, none]"}}, nil, "front.publish_ca: no mode offered has a CA to publish"},
 		{"advanced with default", []edit{{sp, `prompt: "Log level (debug, info, warning)", advanced: true`, `prompt: "Log level (debug, info, warning)", default: info, advanced: true`}}, nil, "inputs[9].advanced: an advanced input is never asked"},
 		{"advanced without compose default", []edit{{cp, "${LOG_LEVEL:-info}", "${LOG_LEVEL}"}}, nil, "${LOG_LEVEL} is an advanced input, recorded only when given"},
-		{"rotation unread", []edit{{cp, "      INTERNAL_SERVICE_SECRET_PREVIOUS: ${INTERNAL_SERVICE_SECRET_PREVIOUS}\n", ""}}, nil, "secrets[2].rotation: deploy/compose.yaml reads no ${INTERNAL_SERVICE_SECRET_PREVIOUS}"},
+		{"rotation unread", []edit{{cp, "      INTERNAL_SERVICE_SECRET_PREVIOUS: ${INTERNAL_SERVICE_SECRET_PREVIOUS}\n", ""}}, nil, "secrets[2].rotation: deploy/compose.yaml reads no ${INTERNAL_SERVICE_SECRET_PREVIOUS} (nor ${INTERNAL_SERVICE_SECRET_ACCEPTED}, either of them)"},
+		{"rotation accepted name taken", []edit{{sp, "  - { key: LOG_LEVEL, ", "  - { key: INTERNAL_SERVICE_SECRET_ACCEPTED, prompt: x }\n  - { key: LOG_LEVEL, "}}, nil, "INTERNAL_SERVICE_SECRET_ACCEPTED is already declared as a rotated secret's other accepted value"},
 		{"rotation name taken", []edit{{sp, "  - { key: LOG_LEVEL, ", "  - { key: INTERNAL_SERVICE_SECRET_NEXT, prompt: x }\n  - { key: LOG_LEVEL, "}}, nil, "INTERNAL_SERVICE_SECRET_NEXT is already declared as a rotated secret's next value"},
 		{"duplicate route", []edit{{sp, "- name: ingest", "- name: api"}}, nil, "duplicate route"},
 		{"bad domain input", []edit{{sp, "domain_input: INGEST_DOMAIN", "domain_input: ingest-domain"}}, nil, "not an environment variable name"},
@@ -1076,5 +1077,16 @@ func TestMemorySharesOnKubernetesAloneWarn(t *testing.T) {
 	testutil.SetYAML(t, root, specFile, []string{"shapes", "docker"}, nil)
 	if res := run(t, root); !warned(res) {
 		t.Fatalf("findings: %+v", res.Findings)
+	}
+}
+
+// A compose file that reads the one other accepted value of a rotated secret reads enough.
+func TestRotationReadThroughTheAcceptedValue(t *testing.T) {
+	t.Parallel()
+	root := testutil.CopyExample(t, "full")
+	testutil.Edit(t, root, composeFile, "      INTERNAL_SERVICE_SECRET_NEXT: ${INTERNAL_SERVICE_SECRET_NEXT}\n      INTERNAL_SERVICE_SECRET_PREVIOUS: ${INTERNAL_SERVICE_SECRET_PREVIOUS}\n",
+		"      INTERNAL_SERVICE_SECRET_ACCEPTED: ${INTERNAL_SERVICE_SECRET_ACCEPTED}\n")
+	if errs := errorsOf(run(t, root)); len(errs) > 0 {
+		t.Fatal(errs)
 	}
 }

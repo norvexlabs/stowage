@@ -230,8 +230,9 @@ mirror_referrers() {
 
 # new_project <postgres ref>: examples/minimal pinned to $STOWAGE, publishing to zot with the token accounts, its
 # postgres replaced by the ref given, signed with a fresh cosign key (keys/release.*); a second key
-# pair, never trusted, is $WORK/other/other.*. The kairos shape is dropped (its OS bundle is a
-# long build) unless KAIROS=1.
+# pair, never trusted, is $WORK/other/other.*. S runs stowage on it as a test release (zot's
+# prefix and token accounts, the fresh key, without the kairos shape, whose OS bundle is a long
+# build); with KAIROS=1 the spec itself is rewritten so, the kairos shape kept.
 new_project() {
 	P=$WORK/notes NAME=notes SHORT=notes
 	cp -r "$REPO/examples/minimal" "$P"
@@ -240,28 +241,29 @@ new_project() {
 import sys
 path, reg, pinned, kairos = sys.argv[1:]
 s = open(path).read()
-for old, new in [
-    ("prefix: ghcr.io/acme/notes", f"prefix: {reg}/notes"),
-    ("pull: { provider: none }", "pull: { provider: token, user: pull, token_env: NOTES_PULL_TOKEN }"),
-    ("push: { provider: docker-config }", "push: { provider: token, user: publisher, token_env: STOWAGE_PUSH_TOKEN }"),
-]:
+edits = []
+if kairos == "1":
+    edits = [
+        ("prefix: ghcr.io/acme/notes", f"prefix: {reg}/notes"),
+        ("pull: { provider: none }", "pull: { provider: token, user: pull, token_env: NOTES_PULL_TOKEN }"),
+        ("push: { provider: docker-config }", "push: { provider: token, user: publisher, token_env: STOWAGE_PUSH_TOKEN }"),
+    ]
+for old, new in edits:
     assert s.count(old) == 1, old
     s = s.replace(old, new)
 lines = [l for l in s.splitlines() if not l.lstrip().startswith("postgres: { ref:")]
 assert len(lines) == len(s.splitlines()) - 1
-if kairos != "1":
-    k = lines.index("  kairos:")
-    end = k + 1
-    while end < len(lines) and lines[end].startswith("    "):
-        end += 1
-    assert end - k == 5, lines[k:end]
-    del lines[k:end]
 i = lines.index("images:")
 lines.insert(i + 1, f'  postgres: {{ ref: "{pinned}" }}')
-lines.insert(i, "signing: { provider: cosign-key, key: keys/release.key, public_keys: [keys/release.pub] }")
+if kairos == "1":
+    lines.insert(i, "signing: { provider: cosign-key, key: keys/release.key, public_keys: [keys/release.pub] }")
 open(path, "w").write("\n".join(lines) + "\n")
 PY
 	S=("$STOWAGE" -C "$P")
+	if [[ ${KAIROS:-0} != 1 ]]; then
+		S+=(--test-registry "$REG/notes" --test-push publisher:STOWAGE_PUSH_TOKEN --test-pull pull:NOTES_PULL_TOKEN
+			--test-key "$P/keys/release.key" --test-public-key keys/release.pub --shapes docker,kubernetes)
+	fi
 	"${S[@]}" lock --update >/dev/null # the example pins a stowage; publish with the one built
 	"${S[@]}" lint
 }

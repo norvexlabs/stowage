@@ -21,7 +21,7 @@ func removedBy(from, to *Release) removed {
 	// now a safe default is dropped: the product's safe value replaces the operator's.
 	still := map[string]bool{}
 	for _, s := range to.Spec.Secrets {
-		still[s.Key], still[s.Key+"_NEXT"], still[s.Key+"_PREVIOUS"] = true, true, true
+		still[s.Key], still[s.Key+"_NEXT"], still[s.Key+"_PREVIOUS"], still[s.Key+"_ACCEPTED"] = true, true, true, true
 	}
 	for _, i := range from.Spec.Inputs {
 		if _, ok := to.Spec.Input(i.Key); !ok && !still[i.Key] && !slices.Contains(r.inputs, i.Key) {

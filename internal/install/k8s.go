@@ -553,6 +553,16 @@ func (in *Installer) k8sDeploy(ctx context.Context, upgrade bool) error {
 		// An upgrade without --unsafe-sysctls keeps the release's list as given (reused values),
 		// an operator's own included.
 	}
+	// The release's settings: given now, refused at once where Pod Security refuses them; kept
+	// by an upgrade (pods that run with them today: the cluster may exempt the namespace), said.
+	if sysctls {
+		if err := in.podSecurityAdmitsSysctls(ctx); err != nil {
+			if k.UnsafeSysctls != nil {
+				return err
+			}
+			o.logf("warning: %v", err)
+		}
+	}
 	if d.values, err = yaml.Marshal(map[string]any{helm.ValuesKey: vals}); err != nil {
 		return err
 	}
@@ -727,6 +737,7 @@ func (in *Installer) k8sEnv(ctx context.Context, upgrade bool) (env map[string]s
 		}
 	}
 	rotationVars(in.R.Spec.Secrets, func(k string) bool { _, ok := rec[k]; return ok }, func(k, v string) { values[k] = v; secret[k] = true })
+	acceptedVars(in.R.Spec.Secrets, func(k string) string { return values[k] }, func(k, v string) { values[k] = v; secret[k] = true })
 	for _, key := range sortedKeys(values) {
 		if old, ok := rec[key]; !ok || old != values[key] {
 			changed = append(changed, key)
@@ -1011,6 +1022,9 @@ func (in *Installer) K8sUpgradeTo(ctx context.Context, v string, args []string) 
 	}
 	if err := in.O.exec(ctx, exe, append([]string{"k8s", "upgrade"}, args...)); err != nil {
 		in.O.logf("the fetched installer is kept: %s", exe)
+		if k.UnsafeSysctls != nil {
+			in.O.logf("note: if it refused --unsafe-sysctls as an unknown flag, it was made before it: run `%s --version %s` without it; its release gives the pods no such settings", in.k8sCtl("upgrade"), m.ProjectVersion)
+		}
 		return err
 	}
 	if err := os.RemoveAll(filepath.Dir(exe)); err != nil {
@@ -1086,4 +1100,26 @@ func (in *Installer) k8sRunning(ctx context.Context, cur *deployed, prefix strin
 		return unknown(err)
 	}
 	return running, nil
+}
+
+// PodSecurityEnforce is the namespace label naming the Pod Security level its pods must meet.
+const PodSecurityEnforce = "pod-security.kubernetes.io/enforce"
+
+// podSecurityAdmitsSysctls refuses --unsafe-sysctls, before anything changes, in a namespace whose
+// label enforces a Pod Security level below privileged, which refuses every pod given them (helm
+// would wait them out). A namespace that cannot be read, has no such label or does not exist
+// yet is let through: the cluster's own default level is not readable from it.
+func (in *Installer) podSecurityAdmitsSysctls(ctx context.Context) error {
+	k := in.O.K8s
+	out, err := in.kubectl(ctx, Cmd{Args: []string{"get", "namespace", k.Namespace, "--ignore-not-found", "--output", "jsonpath={.metadata.labels." + strings.ReplaceAll(PodSecurityEnforce, ".", `\.`) + "}"}})
+	if err != nil {
+		in.O.logf("namespace %s could not be read (%v): its Pod Security level is not checked", k.Namespace, err)
+		return nil
+	}
+	switch level := strings.TrimSpace(string(out)); level {
+	case "", "privileged":
+		return nil
+	default:
+		return fmt.Errorf("--unsafe-sysctls: namespace %s enforces the Pod Security level %s, which refuses pods given those settings: label it privileged (`kubectl label namespace %s %s=privileged --overwrite`), or give the pods none (--unsafe-sysctls=false)", k.Namespace, level, k.Namespace, PodSecurityEnforce)
+	}
 }

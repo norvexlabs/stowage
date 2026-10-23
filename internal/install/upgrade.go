@@ -431,6 +431,7 @@ func (in *Installer) upgradeEnv(env *EnvFile, mode string, added []input, values
 		secrets[sec.Key] = true
 	}
 	rotationVars(in.secrets(), func(k string) bool { _, ok := next.Get(k); return ok }, func(k, v string) { next.Set(k, v); secrets[k] = true })
+	acceptedVars(in.secrets(), func(k string) string { v, _ := next.Get(k); return v }, func(k, v string) { next.Set(k, v); secrets[k] = true })
 	for _, k := range sortedKeys(s.SafeDefaults) {
 		if _, ok := next.Get(k); ok {
 			continue

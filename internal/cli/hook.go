@@ -20,6 +20,13 @@ func hookCmd(o *options) *cobra.Command {
 		Short: "Ship a release from git's post-commit hook when a commit moves the version",
 		Args:  cobra.NoArgs,
 	}
+	// A hook ship is the project's release: its background run takes no test flag.
+	c.PersistentPreRunE = func(*cobra.Command, []string) error {
+		if o.test.on() {
+			return errors.New("hook: a commit ships the project's release, never a test one: the --test-… flags and --shapes are for ship")
+		}
+		return nil
+	}
 	c.AddCommand(postCommitCmd(o), hookInstallCmd(o))
 	return c
 }
@@ -78,6 +85,10 @@ func (o *options) postCommit(channel string, disks bool) error {
 	if d.Version == "" {
 		fmt.Fprintf(o.out, "stowage hook: %s\n", d.Reason)
 		return nil
+	}
+	// Said at the commit, rather than by the background run's log.
+	if err := p.Scheme.Guard(d.Version, o.now()); err != nil {
+		return fmt.Errorf("version.scheme month_guard: %w; not shipped", err)
 	}
 	tag, err := p.Scheme.Tag(d.Version)
 	if err != nil {

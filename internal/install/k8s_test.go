@@ -49,15 +49,17 @@ type fakeKube struct {
 	pull      string // `kubectl get secret` of the pull Secret
 	namespace bool   // the namespace exists
 	nsErr     error  // reading the namespace fails
-	calls     [][]string
-	applied   []map[string]any // the objects kubectl applied
-	chart     []byte           // the chart helm was given
-	given     []string         // the values files helm was given, read when it ran
-	upErr     error            // `helm upgrade` and `helm rollback` fail
-	manifest  string           // `helm get manifest`
-	claims    []string         // the PersistentVolumeClaims `kubectl get` lists
-	deleteErr error            // `kubectl delete` fails
-	uninstErr error            // `helm uninstall` fails
+	// podSecurity is the namespace's Pod Security enforce label.
+	podSecurity string
+	calls       [][]string
+	applied     []map[string]any // the objects kubectl applied
+	chart       []byte           // the chart helm was given
+	given       []string         // the values files helm was given, read when it ran
+	upErr       error            // `helm upgrade` and `helm rollback` fail
+	manifest    string           // `helm get manifest`
+	claims      []string         // the PersistentVolumeClaims `kubectl get` lists
+	deleteErr   error            // `kubectl delete` fails
+	uninstErr   error            // `helm uninstall` fails
 	// The provision hook's Job.
 	outputs string         // `kubectl get secret` of the outputs Secret
 	job     string         // `kubectl get job`: a Job an earlier run left; set to the created one
@@ -232,6 +234,9 @@ func (k kubeTool) Run(_ context.Context, c Cmd) ([]byte, error) {
 		if a[1] == "namespace" {
 			if f.nsErr != nil {
 				return nil, f.nsErr
+			}
+			if slices.ContainsFunc(a, func(s string) bool { return strings.Contains(s, "pod-security") }) {
+				return []byte(f.podSecurity), nil
 			}
 			if f.namespace {
 				return []byte("namespace/" + a[2] + "\n"), nil
@@ -673,6 +678,36 @@ func TestK8sUnsafeSysctls(t *testing.T) {
 		if got := e.f.given[0]; (c.want == "" && strings.Contains(got, "sysctls")) || !strings.HasSuffix(got, c.want) {
 			t.Errorf("%s: values %q", c.name, got)
 		}
+	}
+}
+
+// --unsafe-sysctls in a namespace that enforces a Pod Security level below privileged is refused
+// before anything changes; privileged, no label, or a namespace that cannot be read, let through.
+func TestK8sUnsafeSysctlsPodSecurity(t *testing.T) {
+	t.Parallel()
+	on := true
+	for _, c := range []struct {
+		level   string
+		nsErr   error
+		refused bool
+	}{{"baseline", nil, true}, {"restricted", nil, true}, {"privileged", nil, false}, {"", nil, false}, {"baseline", errors.New("forbidden"), false}} {
+		e := newKubeEnv(t, spec.Provider{Name: "none"})
+		e.f.podSecurity, e.f.nsErr = c.level, c.nsErr
+		err := e.installer(func(o *Options) { o.K8s.UnsafeSysctls = &on }).K8sInstall(context.Background())
+		refused := err != nil && strings.Contains(err.Error(), "namespace notes enforces the Pod Security level "+c.level+", which refuses pods given those settings: label it privileged (`kubectl label namespace notes pod-security.kubernetes.io/enforce=privileged --overwrite`)")
+		if refused != c.refused || refused && (len(e.f.applied) != 0 || e.f.ran("helm upgrade") != nil) {
+			t.Errorf("%q (%v): %v, %d applied", c.level, c.nsErr, err, len(e.f.applied))
+		}
+	}
+	// An upgrade that keeps the release's settings (the flag left out), on pods that run with them
+	// today, is warned: the cluster may exempt the namespace.
+	e := newKubeEnv(t, spec.Provider{Name: "none"})
+	e.runs("0.9.0", 1)
+	e.f.values["stowage"].(map[string]any)["sysctls"] = []any{map[string]any{"name": "net.core.somaxconn", "value": "8192"}}
+	e.stored(map[string]string{"ADMIN_EMAIL": "a@example.org", "SESSION_SECRET": "s", "POSTGRES_PASSWORD": "p"}, ours)
+	e.f.podSecurity = "baseline"
+	if err := e.installer(nil).K8sUpgrade(context.Background()); err != nil || !strings.Contains(e.log.String(), "warning: --unsafe-sysctls: namespace notes enforces the Pod Security level baseline") {
+		t.Errorf("an upgrade keeping the settings: %v\n%s", err, e.log)
 	}
 }
 
@@ -1267,6 +1302,25 @@ func TestK8sUpgradeRecordsTheSchema(t *testing.T) {
 		}
 		if !strings.Contains(e.f.given[0], c.want) {
 			t.Errorf("%s: values %q", c.phase, e.f.given[0])
+		}
+	}
+}
+
+// An installer of the release asked that fails with --unsafe-sysctls given says an older one does
+// not take it; without the flag, nothing more is said.
+func TestK8sUpgradeVersionWithUnsafeSysctlsToAnOlderInstaller(t *testing.T) {
+	t.Parallel()
+	on := true
+	for _, flag := range []*bool{&on, nil} {
+		e := newKubeEnv(t, spec.Provider{Name: "none"})
+		e.publish("2.0.0", 1)
+		e.runs("1.0.0", 1)
+		in := e.installer(func(o *Options) { o.K8s.UnsafeSysctls = flag })
+		in.O.Exec = func(context.Context, string, []string) error { return ExitCode(1) }
+		err := in.K8sUpgradeTo(context.Background(), "2.0.0", []string{"--unsafe-sysctls"})
+		noted := strings.Contains(e.log.String(), "note: if it refused --unsafe-sysctls as an unknown flag, it was made before it: run `notes-stow k8s upgrade --namespace notes --release notes --version 2.0.0` without it")
+		if err == nil || noted != (flag != nil) {
+			t.Errorf("--unsafe-sysctls %v: %v\n%s", flag, err, e.log)
 		}
 	}
 }
