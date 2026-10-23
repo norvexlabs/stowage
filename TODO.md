@@ -216,6 +216,12 @@ A finished item is deleted, not ticked. The plan behind it is
 - **A VM reading a mirror that needs a login**: the VM's reads of a mirror use root's Docker login
   on the VM (`sudo docker login` over SSH); the e2e mirror allows anonymous reads. Carry the site's
   pull account (a secret, so over SSH, as other secrets) when a mirror refuses anonymous reads.
+- **A test release on another name of the project's registry**: `--test-registry` is compared
+  by its spelling, folded (case, dots, ports, loopback, Docker Hub); another DNS name or address
+  of the same registry is not told. Before publishing, a test release of a signing project could
+  read the test prefix's release repository and refuse when a release there verifies with the
+  project's own keys; meanwhile README asks for an account that cannot write the project's
+  repositories.
 
 ## Could
 
@@ -530,11 +536,6 @@ A finished item is deleted, not ticked. The plan behind it is
   binary from it fails that exec (text file busy); the gate's own suites reuse its one build
   (`make -o build`). Exporting to a temporary directory and renaming each file into `./bin`
   would make any build safe beside a run.
-- **A test release on another name of the project's registry**: `--test-registry` is compared
-  by its spelling, folded (case, dots, ports, loopback, Docker Hub); another DNS name or address
-  of the same registry is not told. Before publishing, a test release of a signing project could
-  read the test prefix's release repository and refuse when a release there verifies with the
-  project's own keys (the user to decide: now, or as a Should).
 - **A test release's key check**: `cosign public-key` runs with a background context (a cancelled
   command waits for it, up to cosign's timeout), and once, when the signer is made: a key file
   changed during the ship would sign unchecked. The check beside each sign call would close it.
