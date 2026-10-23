@@ -7,9 +7,13 @@ import (
 	"os"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 
+	"github.com/docker/go-units"
 	"go.yaml.in/yaml/v3"
+
+	"github.com/norvexlabs/stowage/internal/spec"
 )
 
 // VarRef is one interpolation in the compose file: `${NAME}`, `${NAME<op>word}` or `$NAME`.
@@ -43,10 +47,64 @@ type Service struct {
 	Volumes     any    `yaml:"volumes"`
 	Devices     any    `yaml:"devices"`
 	NetworkMode string `yaml:"network_mode"`
+	// MemLimit, MemReservation, Scale and Deploy are what the service sets of its memory and its
+	// number of containers.
+	MemLimit       any `yaml:"mem_limit"`
+	MemReservation any `yaml:"mem_reservation"`
+	Scale          any `yaml:"scale"`
+	Deploy         struct {
+		Replicas  any `yaml:"replicas"`
+		Resources struct {
+			Limits struct {
+				Memory any `yaml:"memory"`
+			} `yaml:"limits"`
+			Reservations struct {
+				Memory any `yaml:"memory"`
+			} `yaml:"reservations"`
+		} `yaml:"resources"`
+	} `yaml:"deploy"`
 }
 
-// inherit fills each service's image, build and network mode from the service it extends, where it
-// sets none, and joins its profiles, ports, volumes and devices with the base's, as compose does. It refuses an extends compose would resolve outside this file (a
+// MemFloor is the least memory limit each of the service's containers gets whatever its share:
+// the largest of the limits and reservations it writes as a literal size (one from a variable
+// only a run knows), and its number of containers (scale, deploy.replicas; 1 when unset or from a
+// variable).
+func (s Service) MemFloor() (floor spec.Bytes, containers int) {
+	for _, v := range []any{s.MemLimit, s.MemReservation, s.Deploy.Resources.Limits.Memory, s.Deploy.Resources.Reservations.Memory} {
+		if b, ok := composeSize(v); ok {
+			floor = max(floor, b)
+		}
+	}
+	containers = 1
+	for _, v := range []any{s.Scale, s.Deploy.Replicas} {
+		n, ok := v.(int)
+		if q, isText := v.(string); isText {
+			var err error
+			n, err = strconv.Atoi(q)
+			ok = err == nil
+		}
+		if ok {
+			containers = max(containers, n)
+		}
+	}
+	return floor, containers
+}
+
+// composeSize reads a size as Compose does (go-units' RAMInBytes): a whole number of bytes, or
+// text such as 512m or 1.5GB.
+func composeSize(v any) (spec.Bytes, bool) {
+	switch n := v.(type) {
+	case int:
+		return spec.Bytes(n), n >= 0
+	case string:
+		b, err := units.RAMInBytes(n)
+		return spec.Bytes(b), err == nil && b >= 0
+	}
+	return 0, false
+}
+
+// inherit fills each service's image, build, network mode and memory settings from the service it
+// extends, where it sets none, and joins its profiles, ports, volumes and devices with the base's, as compose does. It refuses an extends compose would resolve outside this file (a
 // file the release does not carry), a service the file does not declare, and a cycle.
 func (c *Compose) inherit() map[string]error {
 	errs := map[string]error{}
@@ -107,6 +165,16 @@ func (c *Compose) inherit() map[string]error {
 		}
 		if svc.NetworkMode == "" {
 			svc.NetworkMode = b.NetworkMode
+		}
+		// The memory a share's maximum is checked against: each setting the service leaves unset.
+		for _, f := range []struct{ own, base *any }{
+			{&svc.MemLimit, &b.MemLimit}, {&svc.MemReservation, &b.MemReservation}, {&svc.Scale, &b.Scale},
+			{&svc.Deploy.Replicas, &b.Deploy.Replicas}, {&svc.Deploy.Resources.Limits.Memory, &b.Deploy.Resources.Limits.Memory},
+			{&svc.Deploy.Resources.Reservations.Memory, &b.Deploy.Resources.Reservations.Memory},
+		} {
+			if *f.own == nil {
+				*f.own = *f.base
+			}
 		}
 		// Compose joins the lists: the service's profiles, ports, volumes and devices are its own
 		// and its base's.

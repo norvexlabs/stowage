@@ -168,8 +168,28 @@ func TestEachRuleFiresOnFull(t *testing.T) {
 		{"memory share over 90", []edit{{sp, memShares, "shares: { postgres: 91 }"}}, nil, "stack.memory.shares.postgres: 91: a percent of the host's RAM, from 1 to 90"},
 		{"memory shares over 90", []edit{{sp, memShares, "shares: { postgres: 60, api: 31 }"}}, nil, "stack.memory.shares: the shares total 91 %: at most 90"},
 		{"memory share of no service", []edit{{sp, memShares, "shares: { postgres: 25, search: 10 }"}}, nil, `stack.memory.shares.search: service "search" is not in deploy/compose.yaml`},
+		{"memory share max under the least", []edit{{sp, memShares, "shares: { api: { percent: 25, max: 67108863 } }"}}, nil, "stack.memory.shares.api.max: 67108863: 67108863 for api, under 64M, the least limit"},
+		{"memory share max under the least per container", []edit{{sp, memShares, "shares: { api: { percent: 10, max: 255M } }"}, {"deploy/compose.yaml", "  api:\n    image: ${STOWAGE_IMAGE_API}\n", "  api:\n    deploy: { replicas: \"4\" }\n    image: ${STOWAGE_IMAGE_API}\n"}}, nil, "stack.memory.shares.api.max: 255M: 65280K for each of api's 4 containers, under 64M"},
+		{"memory share max under a GiB reservation", []edit{{sp, memShares, "shares: { postgres: { percent: 25, max: 1535M } }"}, {"deploy/compose.yaml", "    mem_limit: 256m ", "    mem_reservation: 1.5GiB\n    mem_limit: 256m "}}, nil, "stack.memory.shares.postgres.max: 1535M: 1535M for postgres, under the 1536M limit"},
+		{"memory share max under the compose limit", []edit{{sp, memShares, "shares: { postgres: { percent: 25, max: 255M } }"}}, nil, "stack.memory.shares.postgres.max: 255M: 255M for postgres, under the 256M limit or reservation deploy/compose.yaml gives it itself"},
+		{"memory share max under the replicas' limits", []edit{{sp, memShares, "shares: { postgres: { percent: 25, max: 511M } }"}, {"deploy/compose.yaml", "    mem_limit: 256m ", "    scale: 2\n    mem_limit: 256m "}}, nil, "stack.memory.shares.postgres.max: 511M: 261632K for each of postgres's 2 containers, under the 256M limit or reservation"},
+		{"memory share max under the reservation", []edit{{sp, memShares, "shares: { postgres: { percent: 25, max: 1G } }"}, {"deploy/compose.yaml", "    mem_limit: 256m ", "    mem_reservation: 1.5g\n    mem_limit: 256m "}}, nil, "stack.memory.shares.postgres.max: 1G: 1G for postgres, under the 1536M limit"},
+		{"memory share max under the base's limit", []edit{{sp, memShares, "shares: { api: { percent: 25, max: 1G } }"}, {"deploy/compose.yaml", "  api:\n    image: ${STOWAGE_IMAGE_API}\n", "  api:\n    extends: postgres\n    image: ${STOWAGE_IMAGE_API}\n"}, {"deploy/compose.yaml", "    mem_limit: 256m ", "    mem_limit: 2g "}}, nil, "stack.memory.shares.api.max: 1G: 1G for api, under the 2G limit"},
+		{"memory share max without percent", []edit{{sp, memShares, "shares: { postgres: { max: 16G } }"}}, nil, "stack.memory.shares.postgres: 0: a percent of the host's RAM"},
+		{"vm size empty", []edit{{sp, vmSizeLine, "size: {}"}}, nil, "shapes.kairos.size: states no size"},
+		{"vm size states nothing", []edit{{sp, vmSizeLine, "size: { min: {} }"}}, nil, "shapes.kairos.size.min: states nothing"},
+		{"vm size negative cpus", []edit{{sp, vmSizeLine, "size: { min: { cpus: -1 } }"}}, nil, "cpus: -1: at least 1"},
+		{"vm size small memory", []edit{{sp, vmSizeLine, "size: { min: { memory: 1023M } }"}}, nil, "shapes.kairos.size.min.memory: 1023M: whole MiB, at least 1G"},
+		{"vm size partial MiB", []edit{{sp, vmSizeLine, "size: { min: { memory: 2097153K } }"}}, nil, "shapes.kairos.size.min.memory: 2097153K: whole MiB"},
+		{"vm size small disk", []edit{{sp, vmSizeLine, "size: { recommended: { disk: 15G } }"}}, nil, "shapes.kairos.size.recommended.disk: 15G: whole GiB, at least 16G"},
+		{"vm size partial GiB", []edit{{sp, vmSizeLine, "size: { recommended: { disk: 16385M } }"}}, nil, "shapes.kairos.size.recommended.disk: 16385M: whole GiB"},
+		{"vm size min over recommended cpus", []edit{{sp, vmSizeLine, "size: { min: { cpus: 4 }, recommended: { cpus: 3 } }"}}, nil, "shapes.kairos.size.recommended.cpus: 3: under the minimum 4"},
+		{"vm size min over recommended memory", []edit{{sp, vmSizeLine, "size: { min: { memory: 8G }, recommended: { memory: 8191M } }"}}, nil, "shapes.kairos.size.recommended.memory: 8191M: under the minimum 8G"},
+		{"vm size min over recommended disk", []edit{{sp, vmSizeLine, "size: { min: { disk: 41G }, recommended: { disk: 40G } }"}}, nil, "shapes.kairos.size.recommended.disk: 40G: under the minimum 41G"},
+		{"vm size min left empty", []edit{{sp, vmSizeLine, "size: { min: , recommended: { cpus: 2 } }"}}, nil, "shapes.kairos.size.min: states nothing"},
+		{"vm size left empty", []edit{{sp, vmSizeLine, "size:"}}, nil, "shapes.kairos.size: states no size"},
 		{"memory shares empty", []edit{{sp, memShares, "shares: {}"}}, nil, "stack.memory.shares: names no service"},
-		{"memory left empty", []edit{{sp, "  memory:\n    " + memShares + "   # percent of the host's RAM, recomputed at each start\n", "  memory:\n"}}, nil, "stack.memory.shares: names no service"},
+		{"memory left empty", []edit{{sp, "  memory:\n    " + memShares + "   # percent of the host's RAM, recomputed at each start; postgres's capped at 16 GiB\n", "  memory:\n"}}, nil, "stack.memory.shares: names no service"},
 		{"tune profile unknown", []edit{{sp, "  profile: network   #", "  profile: shared   #"}}, nil, `tune.profile: "shared": default or network`},
 		{"tune profile missing", []edit{{sp, "  profile: network   #", "  other: network   #"}}, nil, "field other not found"},
 		{"tune profile empty", []edit{{sp, "  profile: network   #", "  profile: \"\"   #"}}, nil, "tune.profile: missing"},
@@ -815,7 +835,7 @@ func TestPublishedPortOnDockerWarns(t *testing.T) {
 func TestL4AllowlistWithoutKairosWarns(t *testing.T) {
 	t.Parallel()
 	root := testutil.CopyExample(t, "full")
-	testutil.Edit(t, root, specFile, "  kairos:\n    base: ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55\n    kairos_init: quay.io/kairos/kairos-init:v0.16.2@sha256:0777266d25e31b653deaaaa084d4e27d98f7a55e82e42f0648e2ba9c756b8664\n    disk_formats: [raw, qcow2, ova, vhd, gce]\n    cloud_publish: [aws, azure, gcp]\n    health_gate: { deadline_s: 600, deadline_after_reset_s: 1800, poll_s: 30 }\n    host_api: [api]\n", "")
+	testutil.Edit(t, root, specFile, "  kairos:\n    base: ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55\n    kairos_init: quay.io/kairos/kairos-init:v0.16.2@sha256:0777266d25e31b653deaaaa084d4e27d98f7a55e82e42f0648e2ba9c756b8664\n    disk_formats: [raw, qcow2, ova, vhd, gce]\n    cloud_publish: [aws, azure, gcp]\n    health_gate: { deadline_s: 600, deadline_after_reset_s: 1800, poll_s: 30 }\n    host_api: [api]\n    "+vmSizeLine+"   # vm create's least and default size\n", "")
 	res := run(t, root)
 	if errs := errorsOf(res); len(errs) > 0 {
 		t.Fatalf("errors:\n%s", strings.Join(errs, "\n"))
@@ -1043,7 +1063,10 @@ func FuzzCheckL4Address(f *testing.F) {
 }
 
 // memShares is examples/full's stack.memory.shares.
-const memShares = "shares: { postgres: 25, api: 10 }"
+const memShares = "shares: { postgres: { percent: 25, max: 16G }, api: 10 }"
+
+// vmSizeLine is examples/full's shapes.kairos.size.
+const vmSizeLine = "size: { min: { cpus: 2, memory: 2G, disk: 20G }, recommended: { cpus: 4, memory: 8G, disk: 40G } }"
 
 // stack.memory's shares at their bounds are clean: 1 % and 90 % each, 90 % together (the errors
 // past them are TestEachRuleFiresOnFull's).
@@ -1054,6 +1077,58 @@ func TestMemorySharesBounds(t *testing.T) {
 		testutil.Edit(t, root, specFile, memShares, shares)
 		if errs := errorsOf(run(t, root)); len(errs) > 0 {
 			t.Errorf("%s: %v", shares, errs)
+		}
+	}
+}
+
+// A maximum at its bounds is clean: the least limit, the compose file's own limit; a size whose
+// minimum equals its recommendation is clean.
+func TestMemoryShareMaxAndVMSizeBounds(t *testing.T) {
+	t.Parallel()
+	for _, e := range [][]string{
+		{memShares, "shares: { api: { percent: 10, max: 64M } }"},
+		{memShares, "shares: { postgres: { percent: 25, max: 256M } }"},
+		{memShares, "shares: { api: { percent: 10, max: 256M } }", "  api:\n    image: ${STOWAGE_IMAGE_API}\n", "  api:\n    deploy: { replicas: \"4\" }\n    image: ${STOWAGE_IMAGE_API}\n"},
+		{memShares, "shares: { postgres: { percent: 25, max: 512M } }", "    mem_limit: 256m ", "    scale: 2\n    mem_limit: 256m "},
+		{memShares, "shares: { postgres: { percent: 25, max: 1536M } }", "    mem_limit: 256m ", "    mem_reservation: 1.5g\n    mem_limit: 256m "},
+		{vmSizeLine, "size: { min: { cpus: 1, memory: 1G, disk: 16G }, recommended: { cpus: 1, memory: 1G, disk: 16G } }"},
+		{vmSizeLine, "size: { recommended: { memory: 1025M } }"},
+	} {
+		root := testutil.CopyExample(t, "full")
+		testutil.Edit(t, root, specFile, e[0], e[1])
+		if len(e) == 4 {
+			testutil.Edit(t, root, "deploy/compose.yaml", e[2], e[3])
+		}
+		if errs := errorsOf(run(t, root)); len(errs) > 0 {
+			t.Errorf("%s: %v", e[1], errs)
+		}
+	}
+}
+
+// Where every host is a VM of at least size.min, a maximum the percent always passes is warned;
+// a Docker host can be of any size.
+func TestMemoryShareMaxAlwaysReachedWarns(t *testing.T) {
+	t.Parallel()
+	warned := func(res *Result) bool {
+		for _, f := range res.Findings {
+			if f.Severity == Warning && f.Where == "stack.memory.shares.postgres.max" {
+				return true
+			}
+		}
+		return false
+	}
+	for share, want := range map[string]bool{
+		"{ percent: 25, max: 460M }": true,  // 25 % of the 90 % of 2G its kernel shows is 460.8M: always the maximum
+		"{ percent: 25, max: 461M }": false, // just above: under it on the least VM
+	} {
+		root := testutil.CopyExample(t, "full")
+		testutil.Edit(t, root, specFile, memShares, "shares: { postgres: "+share+" }")
+		if warned(run(t, root)) {
+			t.Errorf("%s: warned with a Docker shape", share)
+		}
+		testutil.SetYAML(t, root, specFile, []string{"shapes", "docker"}, nil)
+		if res := run(t, root); warned(res) != want {
+			t.Errorf("%s on the VM alone: warned %v, findings %+v", share, !want, res.Findings)
 		}
 	}
 }

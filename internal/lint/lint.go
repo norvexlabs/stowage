@@ -114,6 +114,7 @@ func Run(root, specPath string, now time.Time) (*Result, error) {
 	l.images()
 	l.stack()
 	l.memory()
+	l.vmSize()
 	l.tune()
 	l.front()
 	l.l4()
@@ -518,7 +519,7 @@ func (l *linter) stack() {
 }
 
 // memory checks stack.memory: shares of services the compose file declares (when it reads), from
-// 1 %, together at most spec.MaxMemoryShares.
+// 1 %, together at most spec.MaxMemoryShares, each maximum one the service can be given.
 func (l *linter) memory() {
 	m := l.s.Stack.Memory
 	if m == nil && !l.leftEmpty("stack", "memory") {
@@ -531,19 +532,116 @@ func (l *linter) memory() {
 	}
 	total := 0
 	for _, name := range sortedKeys(m.Shares) {
-		pct := m.Shares[name]
-		l.service(where+"."+name, name)
-		if pct < 1 || pct > spec.MaxMemoryShares {
-			l.errf(where+"."+name, "%d: a percent of the host's RAM, from 1 to %d", pct, spec.MaxMemoryShares)
+		share, at := m.Shares[name], where+"."+name
+		l.service(at, name)
+		if share.Max != 0 {
+			l.shareMax(at, name, share)
+		}
+		if pct := share.Percent; pct < 1 || pct > spec.MaxMemoryShares {
+			l.errf(at, "%d: a percent of the host's RAM, from 1 to %d", pct, spec.MaxMemoryShares)
 			continue
 		}
-		total += pct
+		total += share.Percent
 	}
 	if total > spec.MaxMemoryShares {
 		l.errf(where, "the shares total %d %%: at most %d, the rest is the OS's, the engine's and Stowage's", total, spec.MaxMemoryShares)
 	}
 	if l.s.Shapes.Docker == nil && l.s.Shapes.Kairos == nil {
 		l.warnf("stack.memory", "only the docker and kairos shapes size services from the host: the chart gives its pods their resources")
+	}
+}
+
+// shareMax checks a share's maximum: at least spec.MinMemLimit and, split among the service's
+// containers, at least what its compose file gives each of them itself (a share never gives less),
+// and a warning when every host the shapes allow has RAM enough that the percent is always over
+// it: only the VM's least size bounds a host, of which its kernel shows at least vmRAMShown.
+func (l *linter) shareMax(at, name string, share spec.Share) {
+	at += ".max"
+	floor, n := spec.Bytes(0), 1
+	if l.compose != nil {
+		floor, n = l.compose.Services[name].MemFloor()
+	}
+	// A maximum is split among the service's containers: each part is checked.
+	part, each := share.Max/spec.Bytes(n), name
+	if n > 1 {
+		each = fmt.Sprintf("each of %s's %d containers", name, n)
+	}
+	switch {
+	case part < spec.MinMemLimit:
+		l.errf(at, "%s: %s for %s, under %s, the least limit a share gives", share.Max, part, each, spec.MinMemLimit)
+		return
+	case part < floor:
+		l.errf(at, "%s: %s for %s, under the %s limit or reservation %s gives it itself, which a share never goes below", share.Max, part, each, floor, l.s.Stack.Compose)
+		return
+	}
+	k := l.s.Shapes.Kairos
+	if l.s.Shapes.Docker != nil || k == nil || k.Size == nil || k.Size.Min == nil || k.Size.Min.Memory == 0 || share.Percent < 1 || share.Percent > spec.MaxMemoryShares {
+		return
+	}
+	// Divided first: a size of petabytes times a percent would overflow.
+	shown := k.Size.Min.Memory / 100 * vmRAMShown
+	if least := shown / 100 * spec.Bytes(share.Percent); least >= share.Max {
+		l.warnf(at, "%s: %d %% of the least VM's %s (%s of it shown by its kernel) is already %s, so the limit is always the maximum: give %s a %s limit in %s instead", share.Max, share.Percent, k.Size.Min.Memory, shown&^(1<<20-1), least&^(1<<20-1), each, part&^(1<<20-1), l.s.Stack.Compose)
+	}
+}
+
+// vmRAMShown is the percent of a VM's memory its kernel shows, at least: the firmware and the
+// kernel keep the rest.
+const vmRAMShown = 90
+
+// vmSize checks shapes.kairos.size: sizes vm create can make, the least at most the recommended.
+func (l *linter) vmSize() {
+	k := l.s.Shapes.Kairos
+	if k == nil {
+		return
+	}
+	z := k.Size
+	if z == nil && !l.leftEmpty("shapes", "kairos", "size") {
+		return
+	}
+	where := "shapes.kairos.size"
+	if z == nil || z.Min == nil && z.Recommended == nil {
+		l.errf(where, "states no size: give min, recommended or both, or remove size")
+		return
+	}
+	check := func(at string, m *spec.Machine) bool {
+		ok := true
+		if m.CPUs == 0 && m.Memory == 0 && m.Disk == 0 {
+			l.errf(at, "states nothing: give cpus, memory or disk")
+			return false
+		}
+		if m.Memory != 0 && (m.Memory < spec.MinVMMemory || m.Memory%(1<<20) != 0) {
+			l.errf(at+".memory", "%s: whole MiB, at least %s", m.Memory, spec.MinVMMemory)
+			ok = false
+		}
+		if m.Disk != 0 && (m.Disk < spec.MinVMDisk || m.Disk%(1<<30) != 0) {
+			l.errf(at+".disk", "%s: whole GiB, at least %s", m.Disk, spec.MinVMDisk)
+			ok = false
+		}
+		return ok
+	}
+	for _, f := range []struct {
+		key string
+		m   *spec.Machine
+	}{{"min", z.Min}, {"recommended", z.Recommended}} {
+		if f.m == nil && l.leftEmpty("shapes", "kairos", "size", f.key) {
+			l.errf(where+"."+f.key, "states nothing: give cpus, memory or disk, or remove %s", f.key)
+		}
+	}
+	minOK := z.Min != nil && check(where+".min", z.Min)
+	recOK := z.Recommended != nil && check(where+".recommended", z.Recommended)
+	if !minOK || !recOK {
+		return
+	}
+	lo, hi, at := z.Min, z.Recommended, where+".recommended."
+	if lo.CPUs != 0 && hi.CPUs != 0 && lo.CPUs > hi.CPUs {
+		l.errf(at+"cpus", "%d: under the minimum %d", hi.CPUs, lo.CPUs)
+	}
+	if lo.Memory != 0 && hi.Memory != 0 && lo.Memory > hi.Memory {
+		l.errf(at+"memory", "%s: under the minimum %s", hi.Memory, lo.Memory)
+	}
+	if lo.Disk != 0 && hi.Disk != 0 && lo.Disk > hi.Disk {
+		l.errf(at+"disk", "%s: under the minimum %s", hi.Disk, lo.Disk)
 	}
 }
 

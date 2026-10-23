@@ -270,10 +270,15 @@ func (in *Installer) tofuVM(ctx context.Context, p Platform, t *TofuVM, host str
 			return nil, nil, fmt.Errorf("%s: the module sizes the VM by a variable of its own (an instance type, a machine type): give it with --tofu-var", f.flag)
 		}
 	}
-	num := func(min int) func(string) error {
+	size := in.vmSize()
+	num := func(least, floor int) func(string) error {
 		return func(v string) error {
-			if n, err := strconv.Atoi(v); err != nil || n < min {
-				return fmt.Errorf("%q: a whole number, at least %d", v, min)
+			n, err := strconv.Atoi(v)
+			if err != nil || n < least {
+				if least > floor {
+					return fmt.Errorf("%q: a whole number, at least %d, the least %s runs on", v, least, in.R.Spec.Name)
+				}
+				return fmt.Errorf("%q: a whole number, at least %d", v, least)
 			}
 			return nil
 		}
@@ -328,12 +333,12 @@ func (in *Installer) tofuVM(ctx context.Context, p Platform, t *TofuVM, host str
 			Question{Title: "The bridge or interface its network attaches to", Key: "--bridge", Required: true, Check: nonEmpty})
 	}
 	if sized["--cpus"] {
-		qs = append(qs, Question{Title: "Its CPUs", Key: "--cpus", Check: num(1)})
+		qs = append(qs, Question{Title: "Its CPUs", Key: "--cpus", Check: num(size.least.cpus, 1)})
 	}
 	if sized["--memory"] {
-		qs = append(qs, Question{Title: "Its memory, in MiB", Key: "--memory", Check: num(1024)})
+		qs = append(qs, Question{Title: "Its memory, in MiB", Key: "--memory", Check: num(size.least.mib, minVMMiB)})
 	}
-	qs = append(qs, Question{Title: "Its disk, in GiB", Key: "--disk", Check: num(16)})
+	qs = append(qs, Question{Title: "Its disk, in GiB", Key: "--disk", Check: num(size.least.gib, minVMGiB)})
 	given := map[string]string{"--vm-name": t.Name, "--pool": t.Pool, "--dataset": t.Dataset, "--bridge": t.Bridge,
 		"--cpus": itoa(t.CPUs), "--memory": itoa(t.MemoryMiB), "--disk": itoa(t.DiskGiB)}
 	own := platformVars(declared, onTrueNAS)
@@ -345,12 +350,12 @@ func (in *Installer) tofuVM(ctx context.Context, p Platform, t *TofuVM, host str
 		qs = append(qs, Question{Title: title, Key: v.Name, Required: !v.HasDefault})
 		given[v.Name] = t.Vars[v.Name]
 	}
-	defaults := map[string]string{"--vm-name": defName, "--disk": "40"}
+	defaults := map[string]string{"--vm-name": defName, "--disk": itoa(size.def.gib)}
 	if sized["--cpus"] {
-		defaults["--cpus"] = "2"
+		defaults["--cpus"] = itoa(size.def.cpus)
 	}
 	if sized["--memory"] {
-		defaults["--memory"] = "4096"
+		defaults["--memory"] = itoa(size.def.mib)
 	}
 	a, err := in.askGiven(ctx, qs, given, defaults)
 	if err != nil {
@@ -369,6 +374,7 @@ func (in *Installer) tofuVM(ctx context.Context, p Platform, t *TofuVM, host str
 	t.CPUs, _ = strconv.Atoi(a["--cpus"])
 	t.MemoryMiB, _ = strconv.Atoi(a["--memory"])
 	t.DiskGiB, _ = strconv.Atoi(a["--disk"])
+	size.warn(in.O.logf, in.R.Spec.Name, *t, sized["--cpus"], sized["--memory"])
 	for _, v := range own {
 		switch val := a[v.Name]; {
 		case val != "":

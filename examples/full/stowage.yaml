@@ -40,7 +40,7 @@ images:
 stack:
   compose: deploy/compose.yaml
   memory:
-    shares: { postgres: 25, api: 10 }   # percent of the host's RAM, recomputed at each start
+    shares: { postgres: { percent: 25, max: 16G }, api: 10 }   # percent of the host's RAM, recomputed at each start; postgres's capped at 16 GiB
 
 tune:
   profile: network   # a heavy network load: the hosts are tuned for it (default: Docker's path alone)
@@ -180,3 +180,4 @@ shapes:
     cloud_publish: [aws, azure, gcp]
     health_gate: { deadline_s: 600, deadline_after_reset_s: 1800, poll_s: 30 }
     host_api: [api]
+    size: { min: { cpus: 2, memory: 2G, disk: 20G }, recommended: { cpus: 4, memory: 8G, disk: 40G } }   # vm create's least and default size

@@ -10,6 +10,12 @@ follow [SemVer](https://semver.org/).
   as its memory limit, on Docker and the VM, recomputed at each start and each VM boot — never
   below the limit its compose file sets itself. The service is told its limit, the host's RAM and
   CPUs (`STOWAGE_MEM_LIMIT_MB`, `STOWAGE_HOST_MEM_MB`, `STOWAGE_HOST_CPUS`) to size its own caches.
+- **A memory share takes a maximum**: `{ percent: 25, max: 16G }` gives a service a quarter of
+  the host's RAM up to 16 GiB, still never below its compose file's own limit; lint refuses a
+  maximum under 64 MiB or under that limit, and says when the percent can never be reached.
+- **The VM's size**: `shapes.kairos.size` states the least and the recommended VM. `vm create`
+  sizes a VM at the recommendation by default, refuses one under the minimum, warns under the
+  recommendation, and prints the size when the VM is made by hand or by a cloud's instance type.
 - **Test releases**: `--test-registry`, `--test-key` with `--test-public-key`, and `--shapes`
   make `ship`, `verify`, `releases` and `promote` work on a test release of the project —
   published elsewhere, signed with the run's key, which its installs trust alone, with only the

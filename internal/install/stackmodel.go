@@ -192,8 +192,8 @@ func contentCompose(m *composeModel, environ []string, key []byte, ctr tune.Cont
 		if _, set := svc.Ulimits["nofile"]; !set && ctr.Nofile > 0 {
 			extra["ulimits"] = map[string]any{"nofile": map[string]uint64{"soft": min(ctr.Nofile, tune.NofileSoft), "hard": ctr.Nofile}}
 		}
-		if pct, ok := mem.Shares[name]; ok {
-			mem.give(extra, pct, svc.serviceMemory)
+		if share, ok := mem.Shares[name]; ok {
+			mem.give(extra, share, svc.serviceMemory)
 		}
 		if len(extra) > 0 {
 			services[name] = extra

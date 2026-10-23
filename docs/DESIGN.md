@@ -72,7 +72,7 @@ Full examples: [full](../examples/full/stowage.yaml) (every key),
 | `backup` | provider + profiles + the volumes archived beside the dump |
 | `extensions` | the apps an install can be pointed at: name, the optional input holding the endpoint (empty: off), an optional secret input for its key, the tip's prompt |
 | `endpoint` | the route that is this project's endpoint when another project uses it as an extension |
-| `shapes` | per-shape settings: `docker`, `kubernetes.chart`, `kairos.{base,kairos_init,disk_formats,cloud_publish,health_gate,host_api}` |
+| `shapes` | per-shape settings: `docker`, `kubernetes.chart`, `kairos.{base,kairos_init,disk_formats,cloud_publish,health_gate,host_api,size}` |
 
 Lint rules (`stowage lint`): compose has no `build:` and no `name:`; every service image is
 `${STOWAGE_IMAGE_<KEY>}` for an `images` key (no literal image: the registry is the single
@@ -1338,6 +1338,18 @@ every shape, the VM end-to-end test upgrading through it), then the health gate.
   limit reads the new value. RAM is read to 64 MiB, as the network tuning reads it, so a kernel's
   few KiB never recreate a service. The chart is left out: a node's RAM is not the installer's
   to know, and a chart's `resources:` already say what a pod gets.
+  A share may take a maximum (`{ percent, max }`), because a service's use stops growing past
+  a size of its own and a large host would otherwise hand it RAM no other service gets back; the
+  maximum caps the share, not the floors, so the compose file's limit still wins, and a share
+  without one renders in the spec's JSON as the bare percent, so its digests are unchanged.
+  Lint can only say the percent is never reached where every host is bounded below: a VM's
+  `size.min`, not a Docker host of any size.
+- **The VM's size is the release's to state** (`shapes.kairos.size`): the project knows what its
+  stack needs, the operator the hypervisor, so `vm create` takes `recommended` as its default,
+  refuses under `min` and only logs under `recommended`. It is read where a VM is made, never on
+  it, so it stays out of the OS bundle's view (as the disk formats do) and changes the installer
+  alone. A module that sizes by its own instance type gets the size as a log line: Stowage cannot
+  map an instance type to CPUs and memory.
 - **A test release is the project's, overridden at open** (`--test-registry`, `--test-key`,
   `--test-public-key`, `--shapes`): every command that opens the project sees the same release,
   so a test run ships, verifies and promotes without a rewritten spec, and the publish and trust

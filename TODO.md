@@ -28,18 +28,12 @@ A finished item is deleted, not ticked. The plan behind it is
    Before writing a module, read the latest provider's official docs and its schema, and pin that
    release.
 
-4. **A ceiling on a memory share**: `stack.memory.shares` gives a service a percent of the host's
-   RAM, with a floor (its compose file's own limit) but no maximum, so on a large host a service
-   whose use stops growing past some size (a database's caches, a gateway's buffers) is handed
-   far more than it can use, and a project cannot say "a quarter of the RAM, up to 16 GiB". Let a
-   share take an optional maximum beside its percent (e.g. `postgres: { percent: 25, max: 16G }`,
-   the bare number kept as the percent alone): the limit is the share, capped at the maximum,
-   still never below the floors; `STOWAGE_MEM_LIMIT_MB` is the capped limit. Lint refuses a
-   maximum under 64 MiB or under the service's own compose limit, and says when the maximum makes
-   the percent unreachable on every host the project's shapes allow. Document it under "Memory
-   shares" and test the cap on both sides of it.
-
 ## Should
+
+- **`TestAnUnreachableDaemonIsNamed` flakes under load**: once in a full `go test ./internal/...`
+  run its 0000 socket still let the caller connect (`no permission: <nil>`); 30 runs alone pass.
+  The chmod and the dial race the served socket's own setup: make the test wait for the daemon to
+  listen before the chmod.
 
 - **A prune on a registry that deletes no tag alone reads every tag per refused delete**: `untag`
   and the sweep after it list the repository and read each tag for each tag they remove, so a

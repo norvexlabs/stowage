@@ -339,6 +339,9 @@ func (in *Installer) CreateVM(ctx context.Context, c *VMCreate) error {
 		return nil
 	}
 	fmt.Fprintf(o.Out, "Wrote %s and %s.\n\nOn %s:\n", disk, seed, p.Label)
+	if n := in.vmSize().note(name); n != "" {
+		fmt.Fprintf(o.Out, "  Size the VM: %s.\n", n)
+	}
 	for n, s := range p.Steps {
 		fmt.Fprintf(o.Out, "  %d. %s\n", n+1, fmt.Sprintf(s, disk, seed))
 	}

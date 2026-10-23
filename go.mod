@@ -8,6 +8,7 @@ require (
 	github.com/coder/websocket v1.8.15
 	github.com/diskfs/go-diskfs v1.9.4
 	github.com/docker/cli v29.8.2+incompatible
+	github.com/docker/go-units v0.5.0
 	github.com/google/go-containerregistry v0.22.1
 	github.com/klauspost/compress v1.20.1
 	github.com/moby/buildkit v0.34.0
@@ -52,7 +53,6 @@ require (
 	github.com/digitorus/timestamp v0.0.0-20231217203849-220c5c2851b7 // indirect
 	github.com/djherbis/times v1.6.0 // indirect
 	github.com/docker/docker-credential-helpers v0.9.9 // indirect
-	github.com/docker/go-units v0.5.0 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/go-logr/logr v1.4.4 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect

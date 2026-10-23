@@ -24,12 +24,15 @@ func TestContentComposeGivesTheMemoryShares(t *testing.T) {
 		"reserved": {"mem_reservation": "1073741824"},
 		"scaled": {"scale": 2},
 		"replicated": {"deploy": {"replicas": 4, "resources": {"reservations": {"memory": "134217728"}}}},
+		"capped": {},
 		"other": {}}}`), &model); err != nil {
 		t.Fatal(err)
 	}
 	mem := memoryPlan{
-		Shares: map[string]int{"db": 50, "api": 25, "both": 25, "bare": 10, "large": 10, "small": 1, "reserved": 10, "scaled": 10, "replicated": 10, "gone": 5},
-		Host:   tune.Host{MemBytes: 4 << 30, CPUs: 3},
+		Shares: map[string]spec.Share{"db": {Percent: 50}, "api": {Percent: 25}, "both": {Percent: 25}, "bare": {Percent: 10}, "large": {Percent: 10},
+			"small": {Percent: 1}, "reserved": {Percent: 10}, "scaled": {Percent: 10}, "replicated": {Percent: 10}, "gone": {Percent: 5},
+			"capped": {Percent: 50, Max: 1 << 30}},
+		Host: tune.Host{MemBytes: 4 << 30, CPUs: 3},
 	}
 	raw, err := contentCompose(&model, nil, []byte("key"), tune.Container{}, mem)
 	if err != nil {
@@ -91,6 +94,10 @@ func TestContentComposeGivesTheMemoryShares(t *testing.T) {
 	if s := got["replicated"]; s.MemLimit != 128*mib || s.Environment[MemLimitVar] != "128" {
 		t.Errorf("replicated, 102 MiB each under its 128 MiB reservation: %+v", s)
 	}
+	// 50 % of 4 GiB capped at 1 GiB: the cap is what it is given and told.
+	if s := got["capped"]; s.MemLimit != 1024*mib || s.Environment[MemLimitVar] != "1024" {
+		t.Errorf("capped: %+v", s)
+	}
 	for _, name := range []string{"other", "gone"} {
 		if _, ok := got[name]; ok {
 			t.Errorf("%s given %+v", name, got[name])
@@ -114,26 +121,43 @@ func TestMemoryShareBounds(t *testing.T) {
 		{0, 0, MinMemLimit},     // nothing: the floor
 		{0, MinMemLimit + 1, MinMemLimit + 1},
 	} {
-		if got := p.limit(c.pct, 1, c.own); got != c.want {
+		if got := p.limit(spec.Share{Percent: c.pct}, 1, c.own); got != c.want {
 			t.Errorf("%d %% with own %d: %d MiB, want %d MiB", c.pct, c.own, got/mib, c.want/mib)
 		}
 	}
 	small := memoryPlan{Host: tune.Host{MemBytes: 6400 * mib}}
-	if got := small.limit(1, 1, 0); got != MinMemLimit {
+	if got := small.limit(spec.Share{Percent: 1}, 1, 0); got != MinMemLimit {
 		t.Errorf("1 %% of 6400 MiB, at the floor: %d MiB", got/mib)
 	}
 	under := memoryPlan{Host: tune.Host{MemBytes: 6336 * mib}}
-	if got := under.limit(1, 1, 0); got != MinMemLimit {
+	if got := under.limit(spec.Share{Percent: 1}, 1, 0); got != MinMemLimit {
 		t.Errorf("1 %% of 6336 MiB, under the floor: %d MiB", got/mib)
 	}
-	if got := p.limit(25, 2, 0); got != 1024*mib {
+	if got := p.limit(spec.Share{Percent: 25}, 2, 0); got != 1024*mib {
 		t.Errorf("25 %% of 8 GiB split in two: %d MiB", got/mib)
 	}
-	if got := p.limit(25, 0, 0); got != 2048*mib {
+	if got := p.limit(spec.Share{Percent: 25}, 0, 0); got != 2048*mib {
 		t.Errorf("25 %% of 8 GiB, no replica count: %d MiB", got/mib)
 	}
+	// The maximum, on both sides of the share it caps, split with the share, never under the floors.
+	for _, c := range []struct {
+		max       spec.Bytes
+		n         int
+		own, want int64
+	}{
+		{2049 * mib, 1, 0, 2048 * mib},              // over the share: the share
+		{2048 * mib, 1, 0, 2048 * mib},              // the share itself
+		{2047 * mib, 1, 0, 2047 * mib},              // under it: the maximum
+		{2047 * mib, 2, 0, 1023 * mib},              // split: half of each, in whole MiB
+		{100 * mib, 1, 512 * mib, 512 * mib},        // the compose file's own limit is a floor
+		{spec.MinMemLimit - mib, 1, 0, MinMemLimit}, // under the least limit: the least
+	} {
+		if got := p.limit(spec.Share{Percent: 25, Max: c.max}, c.n, c.own); got != c.want {
+			t.Errorf("25 %% of 8 GiB, max %s, %d containers, own %d: %d MiB, want %d MiB", c.max, c.n, c.own, got/mib, c.want/mib)
+		}
+	}
 	over := memoryPlan{Host: tune.Host{MemBytes: 6528 * mib}}
-	if got := over.limit(1, 1, 0); got != 65*mib {
+	if got := over.limit(spec.Share{Percent: 1}, 1, 0); got != 65*mib {
 		t.Errorf("1 %% of 6528 MiB, above the floor: %d MiB", got/mib)
 	}
 }
@@ -141,9 +165,9 @@ func TestMemoryShareBounds(t *testing.T) {
 // Docker Desktop's containers run in its own VM: the host's RAM sizes none of them.
 func TestNoMemorySharesOnDockerDesktop(t *testing.T) {
 	t.Parallel()
-	in := &Installer{R: &Release{Spec: &spec.Spec{Stack: spec.Stack{Memory: &spec.Memory{Shares: map[string]int{"db": 50}}}}}}
+	in := &Installer{R: &Release{Spec: &spec.Spec{Stack: spec.Stack{Memory: &spec.Memory{Shares: map[string]spec.Share{"db": {Percent: 50}}}}}}}
 	h := tune.Host{MemBytes: 8 << 30}
-	if p := in.memoryPlan(tune.System{Docker: &tune.Docker{}}, h); p.Shares["db"] != 50 {
+	if p := in.memoryPlan(tune.System{Docker: &tune.Docker{}}, h); p.Shares["db"].Percent != 50 {
 		t.Errorf("on an engine: %+v", p)
 	}
 	if p := in.memoryPlan(tune.System{Docker: &tune.Docker{Desktop: true}}, h); p.Shares != nil {

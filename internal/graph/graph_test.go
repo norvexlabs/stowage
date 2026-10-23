@@ -541,7 +541,7 @@ func TestAChartThatCannotBePackagedFailsTheGraph(t *testing.T) {
 }
 
 // The VM shape's settings reach the bundle and its disks, the disk formats the disks and not the
-// bundle, and none of them an image. (The chart and the installer carry the whole spec.)
+// bundle, the size neither, and none of them an image. (The chart and the installer carry the whole spec.)
 func TestKairosSettingsReachTheBundle(t *testing.T) {
 	root := testutil.CopyExample(t, "full")
 	base := inputs(build(t, root))
@@ -570,6 +570,11 @@ func TestKairosSettingsReachTheBundle(t *testing.T) {
 			}
 		}
 		testutil.Edit(t, root, "stowage.yaml", e.new, e.old)
+	}
+	// The VM's size is vm create's, the installer's: no bundle, no disk.
+	testutil.Edit(t, root, "stowage.yaml", "recommended: { cpus: 4,", "recommended: { cpus: 8,")
+	if c := changed(base, inputs(build(t, root))); c["os-bundle"] || c["disks"] || !c["installer"] || !c["release"] {
+		t.Errorf("a size change: changed = %v", c)
 	}
 }
 

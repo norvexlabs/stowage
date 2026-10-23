@@ -119,9 +119,10 @@ type Stack struct {
 }
 
 // Memory gives services a share of the host's RAM: Shares maps a compose service to the percent
-// of RAM its memory limit is, never below the limit its compose file sets itself.
+// of RAM its memory limit is, capped at the share's maximum, never below the limit its compose
+// file sets itself.
 type Memory struct {
-	Shares map[string]int `yaml:"shares"`
+	Shares map[string]Share `yaml:"shares"`
 }
 
 // Tune names the tuning profile the stack's hosts take: "default" (Docker's path as fast as the
@@ -141,6 +142,10 @@ func (s *Spec) TuneProfile() string {
 // MaxMemoryShares is the total of the shares: the rest of the RAM is the OS's, the engine's and
 // Stowage's own.
 const MaxMemoryShares = 90
+
+// MinMemLimit is the least limit a share gives, and the least maximum it takes: a share of a small
+// host must still start its service.
+const MinMemLimit Bytes = 64 << 20
 
 type Front struct {
 	TLSModes      []string       `yaml:"tls_modes"`
@@ -404,6 +409,8 @@ type KairosShape struct {
 	HealthGate   *HealthGate `yaml:"health_gate"`
 	// HostAPI are the compose services given the host daemon's app socket and its token on the VM.
 	HostAPI []string `yaml:"host_api"`
+	// Size is the VM's least and recommended size, which `vm create` sizes a VM from.
+	Size *VMSize `yaml:"size"`
 }
 
 // Formats are the shape's disk formats, those cloud_publish's clouds import included, in the
@@ -564,14 +571,14 @@ func (s *Spec) RuntimeView() Spec {
 	return v
 }
 
-// BundleView is the runtime view the Kairos OS bundle carries: without the disk formats and cloud
-// targets, which are made from the bundle and never read on it, so adding a format builds only
-// its disk.
+// BundleView is the runtime view the Kairos OS bundle carries: without the disk formats, the cloud
+// targets and the VM's size, which are read where a VM is made and never on it, so adding a format
+// builds only its disk.
 func (s *Spec) BundleView() Spec {
 	v := s.RuntimeView()
 	if k := s.Shapes.Kairos; k != nil {
 		c := *k
-		c.DiskFormats, c.CloudPublish = nil, nil
+		c.DiskFormats, c.CloudPublish, c.Size = nil, nil, nil
 		v.Shapes.Kairos = &c
 	}
 	return v

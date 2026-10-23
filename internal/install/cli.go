@@ -822,9 +822,9 @@ func vmCreateCommand(in *Installer, o *Options, prepare func() error, terminal f
 	f.StringVar(&c.Pool, "pool", "", "OpenTofu on TrueNAS: the pool the VM's disk goes on")
 	f.StringVar(&c.Dataset, "dataset", "", "OpenTofu on TrueNAS: the dataset, under the pool, the VM's disk goes in")
 	f.StringVar(&c.Bridge, "bridge", "", "OpenTofu on TrueNAS: the bridge or interface the VM's network attaches to")
-	f.IntVar(&c.CPUs, "cpus", 0, "OpenTofu: the VM's CPUs (default 2)")
-	f.IntVar(&c.MemoryMiB, "memory", 0, "OpenTofu: the VM's memory in MiB (default 4096, at least 1024)")
-	f.IntVar(&c.DiskGiB, "disk", 0, "OpenTofu: the VM's disk in GiB (default 40, at least 16)")
+	f.IntVar(&c.CPUs, "cpus", 0, "OpenTofu: the VM's CPUs (default: the release's recommended size, else 2; at least its minimum)")
+	f.IntVar(&c.MemoryMiB, "memory", 0, "OpenTofu: the VM's memory in MiB (default: the release's recommended size, else 4096; at least its minimum and 1024)")
+	f.IntVar(&c.DiskGiB, "disk", 0, "OpenTofu: the VM's disk in GiB (default: the release's recommended size, else 40; at least its minimum and 16)")
 	f.StringVar(&c.Host, "host", "", "OpenTofu: the name or address the VM answers at once booted (default: --address's, else the host name)")
 	f.DurationVar(&c.Wait, "wait", 0, "OpenTofu: how long to wait for the VM to answer over SSH and install (default 20m)")
 
