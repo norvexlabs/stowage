@@ -1,6 +1,7 @@
 package install
 
 import (
+	"encoding/binary"
 	"fmt"
 	"net/netip"
 	"os"
@@ -216,6 +217,7 @@ const SeedVolume = "cidata"
 // WriteSeedISO writes a NoCloud seed at path, 0644 (a hypervisor running as its own user reads
 // it; it carries no secret): an ISO 9660 image (Rock Ridge and Joliet names)
 // labelled SeedVolume, holding user-data and meta-data, which a hypervisor attaches as a CD-ROM.
+// The file is the sectors the volume declares, then seedPad sectors of zeros: VMware Workstation's CD-ROM reads no image that ends short of a whole sector.
 func WriteSeedISO(path string, userData, metaData []byte) (err error) {
 	dir := filepath.Dir(path)
 	work, err := os.MkdirTemp(dir, ".seed-*")
@@ -264,5 +266,33 @@ func WriteSeedISO(path string, userData, metaData []byte) (err error) {
 		}
 	}
 	// Padded with spaces, as ISO 9660 pads it, which blkid trims: the label reads SeedVolume.
-	return fs.Finalize(iso9660.FinalizeOptions{RockRidge: true, Joliet: true, VolumeIdentifier: fmt.Sprintf("%-32s", SeedVolume)})
+	if err := fs.Finalize(iso9660.FinalizeOptions{RockRidge: true, Joliet: true, VolumeIdentifier: fmt.Sprintf("%-32s", SeedVolume)}); err != nil {
+		return err
+	}
+	// go-diskfs may end the file inside the last sector its volume declares (VMware Workstation's
+	// CD-ROM then cannot read the image at all: the guest cannot read its first sector), or write
+	// a sector of zeros past it. The file is cut to the declared volume, then seedPad sectors of
+	// zeros, as Linux reads ahead past a CD's last sector.
+	st, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	pvd := make([]byte, 4)
+	if _, err := f.ReadAt(pvd, seedVolumeSize); err != nil {
+		return fmt.Errorf("reading the seed's volume size: %w", err)
+	}
+	vol := int64(binary.LittleEndian.Uint32(pvd)) * seedSector
+	if vol <= seedVolumeSize || vol < st.Size()-seedSector || vol > st.Size()+seedSector {
+		return fmt.Errorf("the seed's volume declares %d bytes, its file holds %d", vol, st.Size())
+	}
+	return f.Truncate(vol + seedPad*seedSector)
 }
+
+// seedSector is a CD's sector, seedPad the sectors of zeros after the seed's volume, and
+// seedVolumeSize the offset of the volume's size in sectors (little-endian) in its primary
+// volume descriptor (sector 16).
+const (
+	seedSector     = 2048
+	seedPad        = 150
+	seedVolumeSize = 16*seedSector + 80
+)

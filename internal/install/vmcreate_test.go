@@ -123,8 +123,17 @@ func readSeed(t *testing.T, path string) (userData, metaData, label string) {
 		t.Fatal(err)
 	}
 	defer f.Close()
-	st, _ := f.Stat()
-	fs, err := iso9660.Read(file.New(f, true), st.Size(), 0, 2048)
+	raw, err := os.ReadFile(path)
+	if err != nil || len(raw) < seedVolumeSize+4 {
+		t.Fatalf("seed ISO of %d bytes: %v", len(raw), err)
+	}
+	// The declared volume whole (whole sectors), then 150 sectors of zeros, or VMware's CD-ROM
+	// cannot read it.
+	size, vol := int64(len(raw)), int64(binary.LittleEndian.Uint32(raw[seedVolumeSize:]))*2048
+	if vol%2048 != 0 || size != vol+150*2048 || strings.Trim(string(raw[vol:]), "\x00") != "" {
+		t.Errorf("seed ISO of %d bytes, a volume of %d: want the volume then 150 sectors of zeros", size, vol)
+	}
+	fs, err := iso9660.Read(file.New(f, true), size, 0, seedSector)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -783,5 +792,21 @@ func TestVMCreateBootsTheChannelsDiskSetRecord(t *testing.T) {
 	}
 	if !strings.Contains(v.log.String(), "disk of 0.9.0") {
 		t.Errorf("log %s", v.log)
+	}
+}
+
+// A user-data ending on a sector boundary: go-diskfs then writes a sector of zeros past its
+// volume, which the seed's padding replaces.
+func TestSeedISOOfWholeSectors(t *testing.T) {
+	t.Parallel()
+	for _, n := range []int{0, 2048, 4096, 2047, 2049} {
+		path := filepath.Join(t.TempDir(), "seed.iso")
+		ud := strings.Repeat("x", n)
+		if err := WriteSeedISO(path, []byte(ud), []byte("instance-id: x\n")); err != nil {
+			t.Fatal(err)
+		}
+		if got, _, label := readSeed(t, path); got != ud || strings.TrimSpace(label) != SeedVolume {
+			t.Errorf("user-data of %d bytes read back as %d, label %q", n, len(got), label)
+		}
 	}
 }

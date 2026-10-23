@@ -322,6 +322,8 @@ import sys
 iso = open(sys.argv[1], "rb").read()
 assert iso[0x8001:0x8006] == b"CD001", "not ISO 9660"
 assert iso[0x8028:0x8048] == b"cidata".ljust(32), iso[0x8028:0x8048]
+vol = int.from_bytes(iso[0x8050:0x8054], "little") * 2048
+assert len(iso) == vol + 150 * 2048 and not iso[vol:].strip(b"\0"), (len(iso), vol)
 for want in [b"#cloud-config", b"ssh-ed25519 ", b"/etc/notes/install.yaml", b"channel: stable", b"tls: internal", b"APP_DOMAIN: app.notes.test", b"instance-id: notes-e2e", b"user-data", b"meta-data"]:
     assert want in iso, want
 PY

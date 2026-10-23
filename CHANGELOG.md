@@ -3,6 +3,15 @@
 Stowage's own releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
+## [0.11.2]
+
+### Fixed
+- The VM's seed ISO is read by VMware Workstation: its last sector was cut short, which
+  Workstation's CD-ROM refuses, so a VM imported from the OVA never read its cloud-config and
+  stopped at the recovery system's login. The image now holds its whole volume and 300 KiB of
+  zeros after it. `vm create` refuses to replace a seed it finds: move away one an
+  earlier version wrote before running it again.
+
 ## [0.11.1] - 2026-10-23
 
 ### Fixed

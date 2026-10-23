@@ -2593,7 +2593,9 @@ in the same installer (bootstrap it as above, then `sh <name>.sh vm create …`,
   | `aws` | `raw` | `<hostname>-user-data.yaml` (user data) |
 
   The seed ISO is a NoCloud seed (ISO 9660 with Rock Ridge and Joliet names, labelled `cidata`,
-  holding `user-data` and `meta-data` — `instance-id` and `local-hostname`, the host name), which
+  holding `user-data` and `meta-data` — `instance-id` and `local-hostname`, the host name; the
+  volume's sectors whole and 300 KiB of zeros after them: VMware Workstation's CD-ROM reads no
+  image that ends inside a sector), which
   Kairos reads from the VM's CD-ROM at its first boot; a cloud's user-data is read from its
   metadata service. Both files, and the disk, are written 0644 (a hypervisor reads them as its
   own user; they carry no secret). A seed that exists already is never replaced (it may be
