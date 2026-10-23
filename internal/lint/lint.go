@@ -1218,7 +1218,7 @@ func (l *linter) hookEnv(h *providers.ProvisionHook) {
 
 // chart checks the chart packages as ship packages it, and that its templates read what ship and
 // `<short>-stow k8s` give it: the release's images, the Secret of its secrets and inputs, the pull
-// Secret.
+// Secret, the pods' network settings.
 func (l *linter) chart(rel string) {
 	c, err := helm.Load(spec.Path(l.root, rel))
 	if err != nil {
@@ -1243,6 +1243,9 @@ func (l *linter) chart(rel string) {
 	}
 	if l.s.Registry.Pull.Name == "token" && !reads("pullSecret") {
 		l.warnf("shapes.kubernetes.chart", "%s: no template reads .Values.%s.pullSecret: the cluster pulls the images without the pull account", rel, helm.ValuesKey)
+	}
+	if !reads("sysctls") {
+		l.warnf("shapes.kubernetes.chart", "%s: no template reads .Values.%s.sysctls: the pods are not given the network settings `k8s install --unsafe-sysctls` sets", rel, helm.ValuesKey)
 	}
 	if len(l.s.L4.Routes) > 0 && !reads("l4") {
 		l.warnf("shapes.kubernetes.chart", "%s: no template reads .Values.%s.l4: the L4 routes are not published on Kubernetes", rel, helm.ValuesKey)

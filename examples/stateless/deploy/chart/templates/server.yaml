@@ -24,6 +24,11 @@ spec:
       imagePullSecrets:
         - name: {{ . }}
       {{- end }}
+      {{- with .Values.stowage.sysctls }}
+      securityContext:
+        sysctls:
+          {{- toYaml . | nindent 10 }}
+      {{- end }}
       containers:
         - name: server
           image: {{ printf "%s/%s@%s" .Values.stowage.registry $img.repository $img.digest }}

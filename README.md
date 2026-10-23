@@ -369,8 +369,8 @@ the loop to try before your operators do.
 
 - **Kubernetes**: add `kubernetes: { chart: deploy/chart }` to `shapes`. Your chart runs the
   release's images by digest from `.Values.stowage.images`, reads the secrets from the Secret
-  named in `.Values.stowage.secret` and pulls with `.Values.stowage.pullSecret`
-  ([Helm chart contract](#the-contracts-a-project-must-honour);
+  named in `.Values.stowage.secret`, pulls with `.Values.stowage.pullSecret` and gives its pods
+  `.Values.stowage.sysctls` ([Helm chart contract](#the-contracts-a-project-must-honour);
   `examples/minimal/deploy/chart` is a working one). Operators run `sh <name>.sh k8s install`.
 - **Kairos VM**: add `kairos` with a `base` distribution and the `kairos_init` image, both pinned
   by digest, and the `disk_formats` to publish. `ship` then also builds the OS bundle (about
@@ -450,7 +450,7 @@ a real registry, the local Docker engine, a kind cluster and a VM on TrueNAS
 | every version / changelog provider, registry client, release manifest, cosign signing | |
 | inputs digests and the build graph | |
 | installer (Docker): loopback and every TLS front (`acme`, `dns-cloudflare`, `byo`, `internal`), terminal form, `install`, re-run (changes the inputs and the front's ports), `status`, `provision`, `script`, `upgrade` (`--version` fetches the release's installer), `rollback`, `reset-db`, `--dry-run`, `--offline`, a mirror and its CA (`--registry`, `--registry-ca`); `mirror export` / `mirror import` (a release carried as one file to a site without internet); `secrets rotate`, `secrets export` and `--secrets` (a machine made again) | scheduled backup, restore, chart library, `upgrade --reset-db` |
-| installer (Kubernetes): `<short>-stow k8s install`, `upgrade` (`--version`), `rollback`, `status`, `reset-db`, `uninstall` (`--data`), `provision` (the hook as a Job after the release, its outputs in a Secret and handed back, `--set`), `secrets rotate`, `--dry-run`, `--no-provision`, `--image-registry`, `--registry-ca` | barrier pre-flight before `rollback` |
+| installer (Kubernetes): `<short>-stow k8s install`, `upgrade` (`--version`), `rollback`, `status`, `reset-db`, `uninstall` (`--data`), `provision` (the hook as a Job after the release, its outputs in a Secret and handed back, `--set`), `secrets rotate`, `tune`, `--dry-run`, `--no-provision`, `--image-registry`, `--registry-ca`, `--unsafe-sysctls` | barrier pre-flight before `rollback` |
 | installer (Kairos VM): `<short>-stow vm create` (the disk image by digest, the cloud-config on a seed ISO or as user-data, the platform's steps; or the VM created with OpenTofu — TrueNAS's module, the previews for libvirt, Proxmox VE, vSphere, AWS, Google Cloud and Azure, or the operator's own holding the module contract — waited for until it installed; from a mirror whose CA the VM then trusts) and `vm destroy`; `<short>-stow` in the OS bundle — the first install from the cloud-config's settings, `install` from the preloaded images, the boot (install up again, upgrade to the OS's release, back to the replaced one), the host daemon and its verbs (`status`, `health`, `events`, `ps`, `logs`, `restart`/`stop`/`start`, `provision`, `updates`, `upgrade`, `rollback` to the passive system, `reset-db`, `network` with its auto-revert, `backup` — scheduled, before an upgrade, or now, encrypted to age keys and uploaded with rclone; `verify` of proposed settings —, `restore`, `secrets export` and `rotate`, `reboot`, `shutdown`), its disk-pressure watch (`hooks.maintenance.disk_pressure`), its app socket for the services `host_api` names, the health gate judging each boot (Kairos boot assessment: an upgraded boot not healthy in time falls back to the passive system, unless going back is refused at a rollback barrier: it is then kept), a default-deny firewall (`vm create --ssh-allow`), the time zone (`--timezone`), a disaster recovery (`vm create --secrets`) | |
 
 ## Reference — for people and AI agents
@@ -908,16 +908,19 @@ These are what `lint` checks; each finding names the key path or `file:line` to 
     `{{ printf "%s/%s@%s" .Values.stowage.registry $img.repository $img.digest }}` with
     `$img := index .Values.stowage.images "<key>"`. `lint` warns when no template reads
     `.Values.stowage.images`;
-  - `<short>-stow k8s` adds two values at install time (absent from the published chart, so guard
+  - `<short>-stow k8s` adds three values at install time (absent from the published chart, so guard
     them with `{{ with }}`, or `stowage.secret` with `{{ required }}`): `stowage.secret`, the name of the Secret holding
     the release's secrets and Kubernetes inputs as `KEY: value` (give each container only the
     keys it reads, with `env: [{name: K, valueFrom: {secretKeyRef: {name: …, key: K}}}]`;
     `envFrom` would give every container every secret), and `stowage.pullSecret`, the name of the `kubernetes.io/dockerconfigjson` Secret
-    holding the pull account, empty when there is none (give it to `imagePullSecrets`). It also
+    holding the pull account, empty when there is none (give it to `imagePullSecrets`), and
+    `stowage.sysctls`, the pods' network settings as a list of `{name, value}`, empty unless the
+    operator gave `--unsafe-sysctls` (give it to each pod's `securityContext.sysctls`, as
+    [examples/full](examples/full/deploy/chart/templates/_helpers.tpl) does). It also
     sets `stowage.registry` to the prefix the release is pulled from. `lint` warns when no
     template reads `.Values.stowage.secret` while the project has a secret or an input on
-    Kubernetes, and when no template reads `.Values.stowage.pullSecret` while its pull account is
-    a `token`;
+    Kubernetes, when no template reads `.Values.stowage.pullSecret` while its pull account is
+    a `token`, and when no template reads `.Values.stowage.sysctls`;
   - with an `endpoint` (see "Extensions"), the chart exposes that route's `upstream:
     <service>:<port>` as the Service `<release>-<service>` on that port: `<short>-stow k8s` prints
     `http://<release>-<service>.<namespace>.svc:<port>` as the project's endpoint.
@@ -1753,7 +1756,9 @@ through the L4 routes, tunnels on TUN devices) without holding memory: every mem
 share of the host's RAM, which the kernel uses under load only, and never below the kernel's own
 default. On a Docker host the OS is the operator's, so nothing changes until they ask; the
 install and `upgrade` end with one line, `tuning   N network settings of this host differ …`,
-when the host differs. A Kairos VM is Stowage's: it tunes itself at each boot (below).
+when the host differs. A Kairos VM is Stowage's: it tunes itself at each boot (below). On
+Kubernetes a node is tuned by the same `tune` run on it, and the pods get their namespace's
+settings with `k8s install --unsafe-sysctls` (see the installer on Kubernetes).
 
 - Two profiles. `shared` (a Docker host's default) is a host whose other processes the admin
   runs; `network` leans harder on the network, for a host that runs the stack alone: larger
@@ -1875,6 +1880,7 @@ the current directory. A release with no chart (published without the shape) is 
 <short>-stow k8s install  [--namespace NS] [--release R] [--kube-context C] [--values FILE]…
                        [--image-registry PREFIX] [--registry-ca FILE] [--set KEY=VALUE]… [--answers FILE]
                        [--no-input] [--accessible] [--timeout 10m] [--dry-run] [--no-provision]
+                       [--unsafe-sysctls[=false]]
 <short>-stow k8s upgrade  [the same flags; --timeout 6m]                 # the NEW release's installer
 <short>-stow k8s upgrade --version V [the same flags]                    # fetches V's installer
 <short>-stow k8s rollback [--namespace NS] [--release R] [--kube-context C] [--revision N] [--timeout 6m] [--dry-run]
@@ -1888,10 +1894,29 @@ the current directory. A release with no chart (published without the shape) is 
                        [--registry-ca FILE]                           # a project with a provision hook
 <short>-stow k8s secrets rotate KEY [--stage | --finish] [--namespace NS] [--release R]
                        [--kube-context C] [--timeout 6m]
+<short>-stow k8s tune                                                 # what tunes the network (prints)
 ```
 
 - Defaults: `--namespace <name>`, `--release <name>` (each a DNS label; a release name is at most
   53 characters).
+- `--unsafe-sysctls` gives the release's pods the network settings of "Network tuning" whose
+  namespace starts at a fixed default — `net.core.somaxconn` 8192, `net.ipv4.tcp_mtu_probing` 1,
+  `net.ipv4.tcp_notsent_lowat` 131072, `net.ipv4.tcp_slow_start_after_idle` 0 — as the chart's
+  `stowage.sysctls`; `--unsafe-sysctls=false` takes them away, and an `upgrade` without the flag
+  keeps the release's list as it was given — the operator's own, set with `--values`, included;
+  `--unsafe-sysctls` again gives the upgrading installer's (none after an install without it;
+  `reset-db` installs again with the values it has). `upgrade --version V` to the release that
+  runs applies nothing, and says so when the release does not have what was asked:
+  `k8s upgrade --unsafe-sysctls` by that release's installer does.
+  The kubelet calls them unsafe: a node runs such a pod only when its configuration allows each
+  (`allowedUnsafeSysctls`), else the pod fails (`SysctlForbidden`), helm waits out `--timeout`
+  and rolls back, and the error names `k8s tune`. Pod Security admits them only at the
+  `privileged` level: a namespace labelled `pod-security.kubernetes.io/enforce: baseline` (or
+  `restricted`) refuses the pods. A pod's namespace copies its node's TCP buffer
+  sizes and sizes its SYN queue from the node's memory, which the installer does not read: those
+  are the node's own tuning. `k8s tune` prints the settings, the kubelet's `allowedUnsafeSysctls`
+  list (and its `--allowed-unsafe-sysctls` flag) and how a node is tuned: `<short>-stow tune` on
+  the node (see "Network tuning"; the daemon's file is left out where no Docker answers).
 - `install` refuses a namespace that already has the release (it names `upgrade`). It creates
   the namespace when missing (one the operator may not read is taken to exist), then applies, with `kubectl apply --server-side --field-manager
   stowage`, the Secret `<release>-stowage` (type `Opaque`): every `secrets` key, generated as the

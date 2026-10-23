@@ -311,6 +311,7 @@ func k8sCommand(in *Installer, o *Options, prepare func() error, terminal func(b
 		f.BoolVar(&o.DryRun, "dry-run", false, "check, print what would be applied (secrets redacted), change nothing")
 		f.DurationVar(timeout, "timeout", def, "how long helm waits for the release to be ready before it rolls it back")
 		f.BoolVar(&o.NoProvision, "no-provision", false, "deploy without running the provision hook (`k8s provision` runs it later)")
+		f.VarPF(optionalBool{&o.K8s.UnsafeSysctls}, "unsafe-sysctls", "", "give the pods the network settings `k8s tune` lists, which each node's kubelet must allow; =false takes them away (default: the release's, none on an install)").NoOptDefVal = "true"
 	}
 	install := &cobra.Command{
 		Use:   "install",
@@ -387,7 +388,15 @@ func k8sCommand(in *Installer, o *Options, prepare func() error, terminal func(b
 	uf.BoolVar(accessible, "accessible", false, "confirm with a plain line prompt")
 	uf.BoolVar(&o.DryRun, "dry-run", false, "print what would be deleted, change nothing")
 	uf.DurationVar(&uninstallTimeout, "timeout", 10*time.Minute, "how long helm and kubectl wait at each step")
-	k.AddCommand(install, up, back, status, reset, uninstall)
+	tuneCmd := &cobra.Command{
+		Use:   "tune",
+		Short: "Print the pods' network settings --unsafe-sysctls gives, the kubelet setting that allows them, and how the nodes are tuned",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return run(cmd, 0, false, func(context.Context) error { return in.K8sTune() })
+		},
+	}
+	k.AddCommand(install, up, back, status, reset, uninstall, tuneCmd)
 	if in.R.Spec.Hooks.Provision != nil {
 		prov := &cobra.Command{
 			Use:   "provision",

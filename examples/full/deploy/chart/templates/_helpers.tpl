@@ -10,12 +10,18 @@ app.kubernetes.io/name: {{ .component }}
 app.kubernetes.io/instance: {{ .root.Release.Name }}
 {{- end -}}
 
-{{- /* atlas.pod: what every pod of the release shares — the pull Secret `at-stow k8s` records. */ -}}
+{{- /* atlas.pod: what every pod of the release shares — the pull Secret `at-stow k8s` records and
+     the network settings `at-stow k8s install --unsafe-sysctls` gives. */ -}}
 {{- define "atlas.pod" -}}
-{{- with .Values.stowage.pullSecret -}}
+{{- with .Values.stowage.pullSecret }}
 imagePullSecrets:
   - name: {{ . }}
-{{- end -}}
+{{- end }}
+{{- with .Values.stowage.sysctls }}
+securityContext:
+  sysctls:
+    {{- toYaml . | nindent 4 }}
+{{- end }}
 {{- end -}}
 
 {{- /* atlas.secretEnv: env entries for the keys .keys of the Secret `at-stow k8s` records (its

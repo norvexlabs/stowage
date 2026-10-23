@@ -250,6 +250,30 @@ func TestContainerKeepsTheNamespacedSettings(t *testing.T) {
 	}
 }
 
+// A pod is given a container's settings that no node's size enters, the same on every node.
+func TestAPodGetsTheSettingsNoNodeSizes(t *testing.T) {
+	t.Parallel()
+	p := Pod()
+	var keys []string
+	for _, s := range p {
+		keys = append(keys, s.Key)
+	}
+	if !slices.Equal(keys, podKeys) || !slices.IsSorted(keys) {
+		t.Fatalf("pod settings %v, want %v sorted", keys, podKeys)
+	}
+	for _, h := range []Host{host(1024, 1), host(256*1024, 64), {MemBytes: 64 * 1024 * mib, CPUs: 16, PageSize: 4096, Profile: Network}} {
+		c := h.Container()
+		for _, s := range p {
+			if c[s.Key] != s.Want {
+				t.Errorf("%s: a pod gets %s, a container on %d MiB / %s gets %s", s.Key, s.Want, h.MemBytes/mib, h.Profile, c[s.Key])
+			}
+		}
+	}
+	if slices.Contains(keys, "net.ipv4.tcp_rmem") || slices.Contains(keys, "net.ipv4.tcp_max_syn_backlog") {
+		t.Errorf("%v: a pod's namespace takes these from its node", keys)
+	}
+}
+
 func TestReadHost(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()

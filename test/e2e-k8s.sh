@@ -75,13 +75,27 @@ pw=$(returned)
 [[ -n $pw ]] || fail "the provision hook's outputs Secret holds no ADMIN_PASSWORD"
 ! grep -qF "$pw" "$WORK/install.log" || fail "what the hook returned reached the installer's log"
 ! kubectl get -n "$NS" job notes-stowage >/dev/null 2>&1 || fail "the provision Job was not deleted"
+# somaxconn: the net.core.somaxconn of each web pod not being deleted, its namespace's own, one
+# line each, sorted unique (a failed exec fails).
+somaxconn() {
+	local p
+	for p in $(kubectl get pods -n "$NS" -l app.kubernetes.io/name=web -o go-template='{{range .items}}{{if not .metadata.deletionTimestamp}}{{.metadata.name}} {{end}}{{end}}'); do
+		kubectl exec -n "$NS" "$p" -- cat /proc/sys/net/core/somaxconn || fail "kubectl exec $p"
+	done | sort -u
+}
+n=$(somaxconn)
+[[ $n =~ ^[0-9]+$ && $n != 8192 ]] || fail "an install without --unsafe-sysctls gave the pods their settings"
+ctl v1.sh k8s tune >"$WORK/tune.log" 2>&1 || { cat "$WORK/tune.log"; fail "k8s tune"; }
+for k in "${POD_SYSCTLS[@]}"; do grep -qx "    - $k" "$WORK/tune.log" || { cat "$WORK/tune.log"; fail "k8s tune does not list $k for the kubelet"; }; done
 
-step "k8s upgrade --values (2 replicas), then k8s upgrade alone keeps them"
+step "k8s upgrade --values (2 replicas) --unsafe-sysctls, then k8s upgrade alone keeps them"
 printf 'web:\n  replicas: 2\n' >"$OP/replicas.yaml"
-ctl v1.sh k8s upgrade --values replicas.yaml --no-input --timeout 3m >"$WORK/values.log" 2>&1 || { cat "$WORK/values.log"; fail "k8s upgrade --values"; }
+ctl v1.sh k8s upgrade --values replicas.yaml --unsafe-sysctls --no-input --timeout 3m >"$WORK/values.log" 2>&1 || { cat "$WORK/values.log"; cluster_logs >&2; fail "k8s upgrade --values --unsafe-sysctls"; }
 runs 1.0.0 2
+[[ $(somaxconn) == 8192 ]] || { cluster_logs >&2; fail "--unsafe-sysctls did not give the pods their settings"; }
 ctl v1.sh k8s upgrade --no-input --timeout 3m >"$WORK/reapply.log" 2>&1 || { cat "$WORK/reapply.log"; fail "k8s upgrade"; }
 runs 1.0.0 2
+[[ $(somaxconn) == 8192 ]] || { cluster_logs >&2; fail "an upgrade without --unsafe-sysctls dropped the pods' settings"; }
 [[ $(kubectl get -n "$NS" secret notes-stowage -o jsonpath='{.data}') == "$secret" ]] || fail "an upgrade changed the Secret"
 [[ $(returned) == "$pw" ]] || fail "the hook minted another password: what it returned was not handed back"
 
@@ -90,6 +104,7 @@ release 2.0.0
 [[ $(digest_of notes/notes-web:2.0.0) != "$(digest_of notes/notes-web:1.0.0)" ]] || fail "2.0.0 has 1.0.0's web image"
 ctl v1.sh k8s upgrade --version 2.0.0 --no-input --timeout 3m >"$WORK/up2.log" 2>&1 || { cat "$WORK/up2.log"; fail "k8s upgrade --version 2.0.0"; }
 runs 2.0.0 2
+[[ $(somaxconn) == 8192 ]] || { cluster_logs >&2; fail "2.0.0's pods lost the settings the release was given"; }
 ! compgen -G "$OP/.stowage-next-*" >/dev/null || fail "a fetched installer was left in $OP"
 ctl v1.sh k8s upgrade --version 2.0.0 >"$WORK/again.log" 2>&1 || { cat "$WORK/again.log"; fail "upgrade to the running release"; }
 grep -q 'already runs notes 2.0.0' "$WORK/again.log" || { cat "$WORK/again.log"; fail "no note that 2.0.0 already runs"; }

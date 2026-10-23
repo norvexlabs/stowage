@@ -223,6 +223,15 @@ A finished item is deleted, not ticked. The plan behind it is
 
 ## Could
 
+- **`k8s install --unsafe-sysctls` on a kubelet that refuses them**: the pods fail at once
+  (`SysctlForbidden`, or Pod Security's refusal), yet helm waits out `--timeout` before it rolls
+  back. Watch the rollout's pods and fail on that reason early; the error's hint then names the
+  real cause (now it is added to any failure of a release that gives them, and `reset-db`'s
+  failed install gives none).
+
+- **`k8s upgrade --version V --unsafe-sysctls` to an installer built before the flag** fails
+  with `unknown flag`; the error could say to run `k8s upgrade --unsafe-sysctls` after it.
+
 - **An image gone under `make gate`'s parallel suites**: once, e2e-full's re-run met `No such
   image: …/atlas/atlas-provision@sha256:…` at its provision step (its registry live, the image
   pulled earlier in the run); alone it passes. No suite removes another's registry references;

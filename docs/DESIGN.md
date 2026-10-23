@@ -1283,6 +1283,18 @@ every shape, the VM end-to-end test upgrading through it), then the health gate.
   copied from the extra modules rather than its 110 MB. Left out: Docker's userland
   proxy (turning it off breaks a loopback install on `::1`, and it carries only local
   traffic), widening the ephemeral port range (it would take ports an L4 route publishes).
+  On Kubernetes the node is the cluster admin's, so the installer never touches it: no
+  privileged pod, no DaemonSet. The node is tuned by the same `tune`, run on it, and the
+  pods get only the namespaced settings whose namespace default is fixed, so no node's size
+  enters them. They are the same on every node, and the chart takes them as one value. The TCP
+  buffer sizes come from the node (a pod's namespace copies them), and so does the SYN queue,
+  sized from the node's memory, which the installer cannot read. A cluster-wide read would be a
+  grant an operator limited to a namespace lacks, and the smallest node is no bound for the
+  others. The kubelet calls those settings unsafe and refuses a pod with one it does not allow,
+  so they are opt-in (`--unsafe-sysctls`), and `k8s tune` prints the kubelet's setting. A report
+  pod is left out: unprivileged, it reads only its own namespace, and reading the node's needs
+  `hostNetwork`, which the baseline Pod Security level refuses. The values are written at
+  install time, as the release's `stowage` block is written at ship before any cluster is known.
 - **The adoption proof lives in the tree** — Stowage knows no project, so the proof that a
   production project can adopt it is `examples/full` made a working stack with that project's
   traits, walked through each shape's lifecycle by its own end-to-end suite; a real project's

@@ -926,6 +926,21 @@ func TestChartNotReadingThePullSecretWarns(t *testing.T) {
 	}
 }
 
+// A chart that never gives its pods the network settings `k8s install --unsafe-sysctls` sets is
+// warned.
+func TestChartNotReadingTheSysctlsWarns(t *testing.T) {
+	t.Parallel()
+	root := testutil.CopyExample(t, "stateless")
+	testutil.Edit(t, root, "deploy/chart/templates/server.yaml", "with .Values.stowage.sysctls", "with .Values.sysctls")
+	res := run(t, root)
+	if errs := errorsOf(res); len(errs) > 0 {
+		t.Fatalf("errors:\n%s", strings.Join(errs, "\n"))
+	}
+	if len(res.Findings) != 1 || !strings.Contains(res.Findings[0].Message, "no template reads .Values.stowage.sysctls") {
+		t.Fatalf("findings: %+v", res.Findings)
+	}
+}
+
 func TestCustomFrontendWarns(t *testing.T) {
 	root := testutil.CopyExample(t, "full")
 	testutil.Edit(t, root, "provision/Dockerfile", "FROM python", "# syntax=registry.example.com/frontend:1\nFROM python")

@@ -453,9 +453,14 @@ k8s_tools() {
 	OPERATOR=(env -i "PATH=$PATH" "HOME=$OP/home" "KUBECONFIG=$KUBECONFIG")
 }
 
+# POD_SYSCTLS: what `k8s install --unsafe-sysctls` gives the pods, which the kind node's kubelet
+# allows (`k8s tune` must list each).
+POD_SYSCTLS=(net.core.somaxconn net.ipv4.tcp_mtu_probing net.ipv4.tcp_notsent_lowat net.ipv4.tcp_slow_start_after_idle)
+
 # start_kind (after start_zot): a kind cluster on a network of its own, which zot joins; the
 # node's containerd maps the registry's loopback address to zot there (a plain-HTTP mirror). zot
-# serves no anonymous pull, so every running pod proves the pull Secret the installer wrote.
+# serves no anonymous pull, so every running pod proves the pull Secret the installer wrote. Its
+# kubelet allows POD_SYSCTLS.
 start_kind() {
 	local pid
 	CLUSTER=stowage-e2e-$$ NET=stowage-e2e-$$
@@ -475,6 +480,10 @@ containerdConfigPatches:
   - |-
     [plugins."io.containerd.cri.v1.images".registry]
       config_path = "/etc/containerd/certs.d"
+kubeadmConfigPatches:
+  - |
+    kind: KubeletConfiguration
+    allowedUnsafeSysctls: [$(IFS=,; echo "${POD_SYSCTLS[*]}")]
 nodes:
   - role: control-plane
     image: $NODE

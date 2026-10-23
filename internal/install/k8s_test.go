@@ -451,7 +451,7 @@ func TestK8sInstallAppliesTheSecretsThenInstallsTheChartByDigest(t *testing.T) {
 	if strings.Contains(a, "--reset-then-reuse-values") || strings.Contains(a, "--kube-context") {
 		t.Errorf("%s", a)
 	}
-	want := fmt.Sprintf("stowage:\n    pullSecret: \"\"\n    registry: %s\n    secret: notes-stowage\n", e.prefix)
+	want := fmt.Sprintf("stowage:\n    pullSecret: \"\"\n    registry: %s\n    secret: notes-stowage\n    sysctls: []\n", e.prefix)
 	if len(e.f.given) != 1 || e.f.given[0] != want {
 		t.Errorf("values %q, want %q", e.f.given, want)
 	}
@@ -633,6 +633,66 @@ func TestK8sFailedInstallKeepsTheSecret(t *testing.T) {
 	err := e.installer(nil).K8sInstall(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "helm removed the release; its Secret notes-stowage is kept, and a new `notes-stow k8s install --namespace notes --release notes` reuses its values") {
 		t.Fatalf("%v", err)
+	}
+}
+
+// --unsafe-sysctls gives the pods their network settings, =false takes them away, and an upgrade
+// without it keeps the release's; a failed deploy that gave them names the kubelet's setting.
+func TestK8sUnsafeSysctls(t *testing.T) {
+	t.Parallel()
+	on, off := true, false
+	e := newKubeEnv(t, spec.Provider{Name: "none"})
+	e.f.upErr = errors.New("timed out waiting for the condition")
+	err := e.installer(func(o *Options) { o.K8s.UnsafeSysctls = &on }).K8sInstall(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "refuses them (SysctlForbidden), as does a namespace whose Pod Security level is not privileged: `notes-stow k8s tune --namespace notes --release notes` prints the kubelet's setting") {
+		t.Fatalf("%v", err)
+	}
+	want := "    sysctls:\n        - name: net.core.somaxconn\n          value: \"8192\"\n        - name: net.ipv4.tcp_mtu_probing\n          value: \"1\"\n" +
+		"        - name: net.ipv4.tcp_notsent_lowat\n          value: \"131072\"\n        - name: net.ipv4.tcp_slow_start_after_idle\n          value: \"0\"\n"
+	if !strings.HasSuffix(e.f.given[0], want) {
+		t.Errorf("values %q, want %q at the end", e.f.given[0], want)
+	}
+	for _, c := range []struct {
+		name string
+		had  bool // the release gives them
+		set  *bool
+		want string
+		hint bool
+	}{{"none kept", false, nil, "", false}, {"kept as given", true, nil, "", true}, {"taken away", true, &off, "    sysctls: []\n", false}, {"given", false, &on, want, true}} {
+		e := newKubeEnv(t, spec.Provider{Name: "none"})
+		e.runs("0.9.0", 1)
+		if c.had {
+			e.f.values["stowage"].(map[string]any)["sysctls"] = []any{map[string]any{"name": "net.core.somaxconn", "value": "8192"}}
+		}
+		e.stored(map[string]string{"ADMIN_EMAIL": "a@example.org", "SESSION_SECRET": "s", "POSTGRES_PASSWORD": "p"}, ours)
+		e.f.upErr = errors.New("UPGRADE FAILED")
+		err := e.installer(func(o *Options) { o.K8s.UnsafeSysctls = c.set }).K8sUpgrade(context.Background())
+		if hint := strings.Contains(fmt.Sprint(err), "SysctlForbidden"); hint != c.hint {
+			t.Errorf("%s: %v", c.name, err)
+		}
+		if got := e.f.given[0]; (c.want == "" && strings.Contains(got, "sysctls")) || !strings.HasSuffix(got, c.want) {
+			t.Errorf("%s: values %q", c.name, got)
+		}
+	}
+}
+
+// k8s tune lists, for the kubelet, every setting --unsafe-sysctls gives.
+func TestK8sTuneListsWhatTheKubeletMustAllow(t *testing.T) {
+	t.Parallel()
+	e := newKubeEnv(t, spec.Provider{Name: "none"})
+	if err := e.installer(nil).K8sTune(); err != nil {
+		t.Fatal(err)
+	}
+	out := e.out.String()
+	var keys []string
+	for _, s := range podSysctls() {
+		keys = append(keys, s["name"])
+		if !strings.Contains(out, "\n    - "+s["name"]+"\n") {
+			t.Errorf("no %s in allowedUnsafeSysctls:\n%s", s["name"], out)
+		}
+	}
+	if !strings.Contains(out, "--allowed-unsafe-sysctls="+strings.Join(keys, ",")+"\n") || !strings.Contains(out, "`notes-stow tune` on a node") {
+		t.Errorf("%s", out)
 	}
 }
 
@@ -1080,6 +1140,23 @@ func TestK8sUpgradeVersionRunsThatReleasesInstaller(t *testing.T) {
 	}
 	if len(e.ran) != 1 {
 		t.Errorf("ran %q", e.ran)
+	}
+	// --unsafe-sysctls to the release it runs is not applied, and said so, naming that release's
+	// installer, whichever this one is.
+	on := true
+	in.O.K8s.UnsafeSysctls = &on
+	for _, run := range []string{"1.0.0", "2.0.0"} {
+		e.runs(run, 1)
+		e.out.Reset()
+		if err := in.K8sUpgradeTo(context.Background(), run, nil); err != nil || !strings.Contains(e.out.String(), "--unsafe-sysctls is not applied: `notes-stow k8s upgrade --namespace notes --release notes --unsafe-sysctls=true`, without --version, by the installer of notes "+run+" (revision 1), applies it") {
+			t.Errorf("%s: %v %s", run, err, e.out)
+		}
+	}
+	// A release that already has what was asked is told nothing more.
+	e.f.values["stowage"].(map[string]any)["sysctls"] = podSysctls()
+	e.out.Reset()
+	if err := in.K8sUpgradeTo(context.Background(), "2.0.0", nil); err != nil || strings.Contains(e.out.String(), "not applied") {
+		t.Errorf("%v %s", err, e.out)
 	}
 }
 

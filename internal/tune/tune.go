@@ -411,6 +411,30 @@ func (h Host) Container() map[string]string {
 	return out
 }
 
+// podKeys are the container settings a Kubernetes pod is given: those its namespace starts at a
+// fixed default for. It copies the node's TCP buffer sizes, which the node's own tuning sets, and
+// sizes its SYN queue from the node's memory, which the installer does not read.
+var podKeys = []string{
+	"net.core.somaxconn",
+	"net.ipv4.tcp_mtu_probing",
+	"net.ipv4.tcp_notsent_lowat",
+	"net.ipv4.tcp_slow_start_after_idle",
+}
+
+// Pod is the settings each pod is given, sorted by key: the kubelet's unsafe sysctls, the same on
+// every node, as no node's size enters them.
+func Pod() []Sysctl {
+	h := Host{MemBytes: MemStep, CPUs: 1, PageSize: 4096}
+	var out []Sysctl
+	for _, s := range h.Sysctls() {
+		if slices.Contains(podKeys, s.Key) {
+			out = append(out, s)
+		}
+	}
+	slices.SortFunc(out, func(a, b Sysctl) int { return strings.Compare(a.Key, b.Key) })
+	return out
+}
+
 // Modules are the kernel modules loaded at boot: the TUN device, the connection tracker whose
 // settings are written, BBR and the fq queue.
 var Modules = []string{"tun", "nf_conntrack", "tcp_bbr", "sch_fq"}

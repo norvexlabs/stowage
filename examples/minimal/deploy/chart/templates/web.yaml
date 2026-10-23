@@ -22,6 +22,11 @@ spec:
       imagePullSecrets:
         - name: {{ . }}                  # the pull account `notes-stow k8s` records
       {{- end }}
+      {{- with .Values.stowage.sysctls }}
+      securityContext:
+        sysctls:   # the network settings `notes-stow k8s install --unsafe-sysctls` gives
+          {{- toYaml . | nindent 10 }}
+      {{- end }}
       containers:
         - name: web
           image: {{ include "notes.image" (dict "root" $ "key" "web") }}

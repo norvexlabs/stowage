@@ -23,6 +23,10 @@ follow [SemVer](https://semver.org/).
 - **The containers get the network settings their namespace keeps of its own** (listen queues,
   TCP buffers, latency and MTU probing), sized from the host, except those a service sets itself
   or shares another's network for. A stack's services are recreated once, at their next start.
+- **Kubernetes pods get their network settings** with `k8s install --unsafe-sysctls` (and
+  `upgrade`): listen queues, latency and MTU probing, given to the chart as `stowage.sysctls`,
+  which each node's kubelet must allow. `k8s tune` prints them, the kubelet's setting, and how a
+  node is tuned (`tune` on the node). `lint` warns when a chart does not give them to its pods.
 
 ## [0.8.0] - 2026-10-22
 

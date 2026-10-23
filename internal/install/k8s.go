@@ -41,9 +41,12 @@ type K8sOptions struct {
 	// installer's release, and install this one: the only way a release crosses a baseline.
 	NewBaseline bool
 	// Data lets uninstall delete the release's PersistentVolumeClaims without asking.
-	Data    bool
-	Helm    Tool
-	Kubectl Tool
+	Data bool
+	// UnsafeSysctls gives the pods the network settings the kubelet must allow (tune.Pod): true
+	// gives them, false takes them away, nil keeps the release's (none on an install).
+	UnsafeSysctls *bool
+	Helm          Tool
+	Kubectl       Tool
 }
 
 // MinHelm is the oldest helm the installer accepts: --reset-then-reuse-values.
@@ -72,6 +75,15 @@ type deployed struct {
 	// not upgrade it.
 	// Raw: a value of another shape an operator set must not break every verb.
 	PublicKeys json.RawMessage `json:"publicKeys"`
+	// Sysctls are the pods' network settings the release was given (stowage.sysctls). Raw, as
+	// PublicKeys.
+	Sysctls json.RawMessage `json:"sysctls"`
+}
+
+// givesSysctls reports whether the release's values give its pods network settings.
+func (d *deployed) givesSysctls() bool {
+	var l []any
+	return json.Unmarshal(d.Sysctls, &l) == nil && len(l) > 0
 }
 
 // listedKeys is the set of PEM keys (trimmed) a stowage.publicKeys value lists; a value of any
@@ -447,6 +459,8 @@ func (in *Installer) k8sDeploy(ctx context.Context, upgrade bool) error {
 		return err
 	}
 	prefix := cmp.Or(k.Registry, in.R.Spec.Registry.Prefix)
+	// sysctls: the release gives its pods network settings, as reused or given now.
+	var sysctls bool
 	switch {
 	case !upgrade && rel != nil:
 		return fmt.Errorf("release %s in %s exists (%s, %s): `%s` moves it to %s", k.Release, k.Namespace, rel.Status, rel.AppVersion, in.k8sCtl("upgrade"), m.ProjectVersion)
@@ -464,6 +478,7 @@ func (in *Installer) k8sDeploy(ctx context.Context, upgrade bool) error {
 			return err
 		}
 		prefix = cmp.Or(k.Registry, cur.Registry)
+		sysctls = cur.givesSysctls()
 		// The same release applied again shares its baseline and its inputs: nothing to fetch.
 		if cur.Release.Version != m.ProjectVersion || cur.Release.Revision != m.Revision {
 			running, runErr := in.k8sRunning(ctx, cur, prefix)
@@ -527,6 +542,17 @@ func (in *Installer) k8sDeploy(ctx context.Context, upgrade bool) error {
 		vals["pullSecret"] = ""
 		// An upgrade with no password keeps the pull Secret the release names (reused values).
 	}
+	if u := k.UnsafeSysctls; u != nil {
+		sysctls = *u
+	}
+	switch u := k.UnsafeSysctls; {
+	case u != nil && *u:
+		vals["sysctls"] = podSysctls()
+	case u != nil || !upgrade:
+		vals["sysctls"] = []any{}
+		// An upgrade without --unsafe-sysctls keeps the release's list as given (reused values),
+		// an operator's own included.
+	}
 	if d.values, err = yaml.Marshal(map[string]any{helm.ValuesKey: vals}); err != nil {
 		return err
 	}
@@ -578,6 +604,9 @@ func (in *Installer) k8sDeploy(ctx context.Context, upgrade bool) error {
 	}
 	o.logf("helm: %s %s %s (chart %s) in %s", map[bool]string{false: "installing", true: "upgrading to"}[upgrade], m.Name, m.ProjectVersion, m.Artifacts.Chart.Version, k.Namespace)
 	if _, err := in.helm(ctx, Cmd{Args: args, Stream: o.Log}); err != nil {
+		if sysctls {
+			err = fmt.Errorf("%w\na node whose kubelet does not allow the pods' sysctls refuses them (SysctlForbidden), as does a namespace whose Pod Security level is not privileged: `%s` prints the kubelet's setting", err, in.k8sCtl("tune"))
+		}
 		if upgrade {
 			return fmt.Errorf("%w\nhelm rolled the release back to what it ran: `%s` shows it", err, in.k8sCtl("status"))
 		}
@@ -970,6 +999,9 @@ func (in *Installer) K8sUpgradeTo(ctx context.Context, v string, args []string) 
 		return fmt.Errorf("release %s in %s runs %s %s (revision %d), after %s %s (revision %d): `%s` goes back one upgrade", k.Release, k.Namespace, name, r.Version, r.Revision, name, m.ProjectVersion, m.Revision, in.k8sCtl("rollback"))
 	case order == 0 && r.Revision == m.Revision:
 		fmt.Fprintf(in.O.Out, "release %s in %s already runs %s %s (revision %d)\n", k.Release, k.Namespace, name, r.Version, r.Revision)
+		if u := k.UnsafeSysctls; u != nil && *u != cur.givesSysctls() {
+			fmt.Fprintf(in.O.Out, "--unsafe-sysctls is not applied: `%s --unsafe-sysctls=%t`, without --version, by the installer of %s %s (revision %d), applies it\n", in.k8sCtl("upgrade"), *u, name, r.Version, r.Revision)
+		}
 		return nil
 	}
 	in.O.logf("fetching the installer of %s %s (revision %d, %s)", name, m.ProjectVersion, m.Revision, m.Tag)

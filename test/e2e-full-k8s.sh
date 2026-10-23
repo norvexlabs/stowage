@@ -156,9 +156,16 @@ printf 'postgres:\n  mode: external\n' >"$OP/external.yaml"
 # The secret inputs come from the operator's environment, never a command line.
 (cd "$OP" && "${OPERATOR[@]}" "DATABASE_URL=$DB_URL" "APP_DATABASE_URL=$APP_URL" "ADMIN_PASSWORD=$ADMIN_PW" \
 	sh v1.sh k8s install --no-input --values external.yaml --set ADMIN_EMAIL=admin@atlas.test --set ORG_NAME=Atlas \
-	--set SEARCH_URL=http://atlas-api:9090 --timeout 5m) \
+	--set SEARCH_URL=http://atlas-api:9090 --unsafe-sysctls --timeout 5m) \
 	>"$WORK/install.log" 2>&1 || { cat "$WORK/install.log"; cluster_logs >&2; fail "k8s install"; }
 atlas_runs "$V1" 1
+# --unsafe-sysctls: every pod of the chart is given the settings, which reach the api's namespace.
+for d in api echo ingest ui; do
+	[[ $(kubectl get -n "$NS" deploy/atlas-$d -o jsonpath='{.spec.template.spec.securityContext.sysctls[*].name}') == "${POD_SYSCTLS[*]}" ]] ||
+		fail "atlas-$d's pods are not given ${POD_SYSCTLS[*]}"
+done
+[[ $(kubectl exec -n "$NS" deploy/atlas-api -c api -- python3 -c 'print(*(open("/proc/sys/net/" + k).read().strip() for k in ("core/somaxconn", "ipv4/tcp_notsent_lowat")))') == "8192 131072" ]] ||
+	fail "the api's namespace does not hold the settings --unsafe-sysctls gives"
 [[ $(kubectl exec -n "$NS" deploy/atlas-api -- printenv DATABASE_URL) == "$DB_URL" ]] || fail "the api's DATABASE_URL is not the input"
 # Each pod reads only its keys of the Secret: ingest has the service token, not the database's;
 # the api not the administrator's password; the console none.

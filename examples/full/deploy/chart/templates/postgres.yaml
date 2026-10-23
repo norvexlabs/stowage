@@ -20,7 +20,7 @@ spec:
       labels:
         {{- include "atlas.labels" $c | nindent 8 }}
     spec:
-      {{- include "atlas.pod" . | nindent 6 }}
+      {{- include "atlas.pod" . | trim | nindent 6 }}
       containers:
         - name: postgres
           image: {{ include "atlas.image" (dict "root" $ "key" "postgres") }}
