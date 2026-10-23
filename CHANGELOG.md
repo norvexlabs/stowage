@@ -3,7 +3,7 @@
 Stowage's own releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
-## [0.10.0]
+## [0.10.0] - 2026-10-23
 
 ### Added
 - **Memory follows the host**: `stack.memory.shares` gives a service a percent of the host's RAM
