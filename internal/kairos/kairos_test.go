@@ -33,8 +33,8 @@ func TestDockerfileRendersTheParams(t *testing.T) {
 	s := string(df)
 	for _, want := range []string{"FROM " + params.KairosInit + " AS kairos-init", "FROM " + params.Base + "\n",
 		"-s install -v 0.0.0\n", `-s init -v "1.2.0-r2"`, "nftables open-vm-tools qemu-guest-agent tzdata", "apt-cache show tzdata-legacy", "/usr/share/notes-preload/", "/etc/notes/os-version",
-		"notes-preload.service", "chmod 0440 /etc/sudoers.d/10-notes", "notes-health.service", "notes-network.service",
-		"mv /usr/share/notes/08_grub.yaml \"$f\"", "sha256sum -c -"} {
+		"notes-preload.service", "chmod 0440 /etc/sudoers.d/10-notes", "notes-health.service", "notes-network.service", "notes-tune.service", "notes-tune-online.service", "ethtool",
+		"mv /usr/share/notes/08_grub.yaml \"$f\"", "sha256sum -c -", "sed -i '/^        net\\.core\\.rmem_max: 7500000$/d'"} {
 		if !strings.Contains(s, want) {
 			t.Errorf("Dockerfile lacks %q", want)
 		}
@@ -111,6 +111,31 @@ func TestWriteContextNamesEveryFileAfterTheProject(t *testing.T) {
 		if !strings.Contains(string(nw), want) {
 			t.Errorf("network unit lacks %q:\n%s", want, nw)
 		}
+	}
+	// The tuning runs before the network and Docker, after the kernel's own settings.
+	tu, err := os.ReadFile(filepath.Join(dir, "files/etc/systemd/system/notes-tune.service"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"ExecStart=/usr/sbin/notes-stow tune-boot\n", "Before=network-pre.target systemd-networkd.service docker.service\n", "systemd-sysctl.service", "DefaultDependencies=no\n"} {
+		if !strings.Contains(string(tu), want) {
+			t.Errorf("tune unit lacks %q:\n%s", want, tu)
+		}
+	}
+	// Again once the network is up (its MTU), before Docker reads its file.
+	tuo, err := os.ReadFile(filepath.Join(dir, "files/etc/systemd/system/notes-tune-online.service"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"ExecStart=/usr/sbin/notes-stow tune-boot\n", "After=network-online.target notes-tune.service\n", "Before=docker.service\n"} {
+		if !strings.Contains(string(tuo), want) {
+			t.Errorf("tune-online unit lacks %q:\n%s", want, tuo)
+		}
+	}
+	// Azure's virtual function stays networkd's to leave alone, on Hyper-V alone.
+	vf, err := os.ReadFile(filepath.Join(dir, "files/etc/systemd/network/00-notes-sriov.network"))
+	if err != nil || !strings.Contains(string(vf), "Virtualization=microsoft\nDriver=mlx4_en mlx4_core mlx5_core mana\n") || !strings.Contains(string(vf), "Unmanaged=yes") {
+		t.Errorf("the VF's network file: %v\n%s", err, vf)
 	}
 	// The scheduled backup: the host daemon runs it, when one is configured.
 	for unit, wants := range map[string][]string{

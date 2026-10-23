@@ -118,6 +118,11 @@ docker cp "$ctr:/etc/notes/os-version" "$WORK/os-version"
 [[ $(cat "$WORK/os-version") == 1.0.0 ]] || fail "os-version is $(cat "$WORK/os-version")"
 docker cp "$ctr:/etc/kairos-release" "$WORK/kairos-release"
 grep -q '^KAIROS_FLAVOR="ubuntu"' "$WORK/kairos-release" || fail "not a Kairos image"
+docker cp "$ctr:/etc/systemd/system/notes-tune.service" "$WORK/tune.service" && grep -q '^ExecStart=/usr/sbin/notes-stow tune-boot$' "$WORK/tune.service" ||
+	fail "the bundle does not tune the network at boot"
+[[ $(docker cp "$ctr:/etc/systemd/system/multi-user.target.wants/notes-tune.service" - | tar -tvf - 2>/dev/null) == *"-> /etc/systemd/system/notes-tune.service"* ]] ||
+	fail "the tuning unit is not enabled"
+docker cp "$ctr:/usr/sbin/ethtool" "$WORK/ethtool" || fail "the bundle has no ethtool"
 docker cp "$ctr:/usr/share/notes-preload" "$WORK/preload"
 for img in api web postgres front backup chown; do
 	tar="$WORK/preload/$img.tar"
@@ -172,7 +177,12 @@ for _ in $(seq 1 100); do grep -q 'disk pressure soft' "$WORK/hostd.log" && brea
 grep -q 'disk pressure soft, .* used: POST http://api:8000/maintenance/disk-pressure: answered 501' "$WORK/hostd.log" ||
 	{ cat "$WORK/hostd.log"; fail "the host daemon did not post the disk pressure"; }
 api=$(docker ps -q --filter "label=com.docker.compose.project=$(project)" --filter label=com.docker.compose.service=api)
-docker logs "$api" 2>&1 | grep -q '"POST /maintenance/disk-pressure HTTP/1.1" 501' || fail "the api was not posted the disk pressure"
+# Docker copies a container's output to its log on its own time: the line may trail the answer.
+# The log is read to a file first: `grep -q` quitting at its match would fail `docker logs`, still
+# writing, and so the pipeline (pipefail).
+posted() { docker logs "$api" >"$WORK/api.log" 2>&1; grep -q '"POST /maintenance/disk-pressure HTTP/1.1" 501' "$WORK/api.log"; }
+for _ in $(seq 1 50); do posted && break; sleep 0.2; done
+posted || { tail -20 "$WORK/api.log"; fail "the api was not posted the disk pressure"; }
 session=$(sed -n "s/^SESSION_SECRET='\{0,1\}\([0-9a-f]*\).*/\1/p" "$D/.env")
 [[ ${#session} == 64 ]] || fail "no session secret recorded"
 ! grep -qF "$session" "$WORK/hostd.log" || fail "the host daemon logged the token"

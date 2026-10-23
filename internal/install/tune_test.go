@@ -338,11 +338,85 @@ func TestTuneFlagsExcludeEachOther(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
 	in := e.installer(nil)
-	cmd := tuneCommand(in, func() error { return nil }, func(bool) Prompter { return nil })
+	cmd := tuneCommand(in, func() error { return nil }, func(bool) Prompter { return nil }, false)
 	cmd.SetArgs([]string{"--check", "--apply"})
 	cmd.SetOut(&bytes.Buffer{})
 	cmd.SetErr(&bytes.Buffer{})
 	if err := cmd.Execute(); err == nil {
 		t.Error("--check with --apply runs")
+	}
+}
+
+func TestTheVMsTuneOnlyReports(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	dockerInfo(e.docker, `27.3.1|Ubuntu 24.04 LTS|[]`)
+	root := tuneRoot(t)
+	sys := fakeTune(root, 0)
+	sys.Profile = tune.Network
+	in := e.installer(func(o *Options) { o.Tune = sys; o.TunedAtBoot = true; o.Yes = true })
+	ctx := context.Background()
+	for _, o := range []TuneOptions{{Apply: true}, {Print: true}, {Revert: true}} {
+		if err := in.Tune(ctx, o); err == nil || !strings.Contains(err.Error(), "tunes itself at each boot") {
+			t.Errorf("%+v on a VM: %v", o, err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(root, tune.SysctlFile)); !errors.Is(err, os.ErrNotExist) {
+		t.Error("a VM's tune wrote")
+	}
+	if err := in.Tune(ctx, TuneOptions{}); err != nil || !strings.Contains(e.out.String(), "the network profile") || !strings.Contains(e.out.String(), "net.core.netdev_budget") ||
+		!strings.Contains(e.out.String(), "a reboot tunes it again; `sudo journalctl -b -u notes-tune -u notes-tune-online`") || strings.Contains(e.out.String(), "--apply") {
+		t.Errorf("the VM's report: %v\n%s", err, e.out)
+	}
+	cmd := tuneCommand(in, func() error { return nil }, func(bool) Prompter { return nil }, true)
+	cmd.SetArgs([]string{"--apply"})
+	cmd.SetOut(&bytes.Buffer{})
+	cmd.SetErr(&bytes.Buffer{})
+	if err := cmd.Execute(); err == nil || !strings.Contains(err.Error(), "unknown flag") {
+		t.Errorf("the VM's tune --apply: %v", err)
+	}
+}
+
+func TestTuneProfileFlag(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	dockerInfo(e.docker, `27.3.1|Ubuntu 24.04 LTS|[]`)
+	in := e.installer(func(o *Options) { o.Tune = fakeTune(tuneRoot(t), 1000) })
+	run := func(args ...string) error {
+		cmd := tuneCommand(in, func() error { return nil }, func(bool) Prompter { return nil }, false)
+		cmd.SetArgs(args)
+		cmd.SetOut(&bytes.Buffer{})
+		cmd.SetErr(&bytes.Buffer{})
+		return cmd.Execute()
+	}
+	if err := run("--profile", "fast"); err == nil || !strings.Contains(err.Error(), "--profile") {
+		t.Errorf("--profile fast: %v", err)
+	}
+	if err := run("--profile", "network"); err != nil || !strings.Contains(e.out.String(), "the network profile") {
+		t.Errorf("--profile network: %v\n%s", err, e.out)
+	}
+	e.out.Reset()
+	if err := run(); err != nil || !strings.Contains(e.out.String(), "the shared profile") {
+		t.Errorf("no --profile: %v\n%s", err, e.out)
+	}
+}
+
+func TestTuneRefusesTheSharedProfileOnANetworkHost(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	dockerInfo(e.docker, `27.3.1|Ubuntu 24.04 LTS|[]`)
+	root := tuneRoot(t)
+	if err := os.MkdirAll(filepath.Join(root, "etc/stowage"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, tune.StateFile), []byte(`{"sysctls": {}, "wrote": {}, "daemon": [], "profile": "network"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	in := e.installer(func(o *Options) { o.Tune = fakeTune(root, 1000) })
+	if err := in.Tune(context.Background(), TuneOptions{Check: true, Profile: tune.Shared}); err == nil || !strings.Contains(err.Error(), "tune --revert` first") {
+		t.Errorf("--check --profile shared on a network host: %v", err)
+	}
+	if err := in.Tune(context.Background(), TuneOptions{}); err != nil || !strings.Contains(e.out.String(), "the network profile") {
+		t.Errorf("the report follows the recorded profile: %v\n%s", err, e.out)
 	}
 }

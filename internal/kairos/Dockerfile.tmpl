@@ -11,7 +11,7 @@ FROM {{.Base}}
 # Guest agents: kairos-init only starts them, on the hypervisor its DMI check matches.
 # tzdata-legacy (the zones' old names, e.g. US/Eastern) where the base has it.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates curl gnupg jq nftables open-vm-tools qemu-guest-agent tzdata \
+        ca-certificates curl ethtool gnupg jq nftables open-vm-tools qemu-guest-agent tzdata \
         $(apt-cache show tzdata-legacy >/dev/null 2>&1 && echo tzdata-legacy) \
     && rm -rf /var/lib/apt/lists/*
 
@@ -46,7 +46,7 @@ RUN chmod 0440 /etc/sudoers.d/10-{{.Name}} \
     && echo "{{.OSVersion}}" > /etc/{{.Name}}/os-version \
     && mkdir -p /etc/systemd/system/multi-user.target.wants /etc/systemd/system/getty.target.wants \
     && (getent group admin >/dev/null || groupadd --system admin) \
-    && for u in {{.Name}}-expand.service {{.Name}}-preload.service {{.Name}}.service {{.Name}}-health.service {{.Name}}-hostd.service {{.Name}}-network.service; do \
+    && for u in {{.Name}}-expand.service {{.Name}}-preload.service {{.Name}}.service {{.Name}}-health.service {{.Name}}-hostd.service {{.Name}}-network.service {{.Name}}-tune.service {{.Name}}-tune-online.service; do \
            ln -sf /etc/systemd/system/$u /etc/systemd/system/multi-user.target.wants/$u; done \
     && ln -sf /lib/systemd/system/docker.service /etc/systemd/system/multi-user.target.wants/docker.service \
     && ln -sf /lib/systemd/system/nftables.service /etc/systemd/system/multi-user.target.wants/nftables.service \
@@ -74,6 +74,22 @@ RUN set -e \
     && n=$(find /lib/modules/ -name '*.ko*' | wc -l) \
     && if [ "$n" -lt 100 ]; then echo "only $n kernel modules after the reinstall" >&2; exit 1; fi
 
+# The clouds' fast NICs, gVNIC (gve) and Azure's MANA, ship in the kernel's extra modules: those two
+# are copied from it, not its 110 MB. The build fails when a kernel lacks one, or a module the
+# boot's tuning loads (TUN devices, the connection tracker, BBR, fq).
+RUN set -e; apt-get update; cd /tmp; \
+    for k in /lib/modules/*; do v="$(basename "$k")"; \
+        if ! modinfo -k "$v" gve >/dev/null 2>&1 || ! modinfo -k "$v" mana >/dev/null 2>&1; then \
+            apt-get download "linux-modules-extra-$v"; dpkg-deb -x linux-modules-extra-"$v"_*.deb /tmp/extra; \
+            for m in gve mana; do \
+                f="$(find /tmp/extra -path "*/modules/$v/*" -name "$m.ko*" | head -n1)"; \
+                if [ -z "$f" ]; then echo "linux-modules-extra-$v has no $m" >&2; exit 1; fi; \
+                install -D -m 0644 "$f" "$k/${f#*/modules/$v/}"; done; \
+            rm -rf /tmp/extra linux-modules-extra-*.deb; depmod "$v"; fi; \
+        for m in tun nf_conntrack tcp_bbr sch_fq gve mana mlx5_core; do \
+            modinfo -k "$v" "$m" >/dev/null || { echo "kernel $v lacks $m" >&2; exit 1; }; done; done; \
+    rm -rf /var/lib/apt/lists/*
+
 # Console on the screen and on the serial port, serial last so it owns /dev/console: the recovery
 # shell must work on a VM without a display. The build fails when kairos-init's boot arguments
 # no longer read as expected.
@@ -84,6 +100,15 @@ RUN set -e; f=/etc/cos/bootargs.cfg; \
     sed -i 's/set baseCmd="console=tty1 /set baseCmd="/' "$f"; \
     grep -qF 'set baseExtraConsole="console=tty1 console=ttyS0,115200"' "$f"; \
     ! grep -qE 'set baseCmd=.*console=' "$f"
+
+# Kairos's boot stage sets a fixed receive buffer ceiling after the tune units have run, below the
+# one they size from RAM: its line goes, the stage's other settings stay. The build fails when the
+# line is no longer there to remove.
+RUN set -e; f=/system/oem/09_systemd_services.yaml; \
+    grep -qxF '        net.core.rmem_max: 7500000' "$f"; \
+    sed -i '/^        net\.core\.rmem_max: 7500000$/d' "$f"; \
+    ! grep -q 'rmem_max' "$f"; \
+    grep -qF 'vm.max_map_count: 262144' "$f"
 
 # Kairos's boot assessment, with the health gate as its judge: the bundle's copy of 08_grub.yaml
 # leaves out the step that marks every boot of the active system good (files/usr/share/NAME). The

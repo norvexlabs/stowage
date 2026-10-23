@@ -11,6 +11,15 @@ follow [SemVer](https://semver.org/).
   reports what differs (`--check` exits non-zero), `--print` prints the files, `--apply` (root,
   asks first) writes and applies them, `--revert` puts the host back. Docker is never restarted
   unless `--restart-docker`. The install and `upgrade` say in one line when the host differs.
+  Every value is at least the kernel's own default. `--profile network` leans harder on the
+  network, for a host that runs the stack alone.
+- **The Kairos VM tunes its network at each boot** with the `network` profile, for its RAM and
+  CPUs (a resized VM is retuned): larger socket buffers and budgets, NIC rings and flow
+  steering, the containers' logs rotated; `tune` on the VM reports and `--check` checks. The image
+  carries `ethtool` and the gVNIC and Azure MANA drivers.
+- **Faster VM NICs**: libvirt and Proxmox give the VM a virtio queue per vCPU (libvirt a larger
+  receive ring), Compute Engine a gVNIC (`nic_type`), Azure accelerated networking
+  (`accelerated_networking`, on; the default size is now `Standard_B2ls_v2`, which offers it).
 - **The containers get the network settings their namespace keeps of its own** (listen queues,
   TCP buffers, latency and MTU probing), sized from the host, except those a service sets itself
   or shares another's network for. A stack's services are recreated once, at their next start.

@@ -86,6 +86,9 @@ resource "libvirt_domain" "vm" {
     interfaces = [
       {
         model = { type = "virtio" }
+        # A queue per vCPU, each on its own CPU in the guest, and the largest receive ring virtio
+        # offers: the guest's tuning grows its ring to it.
+        driver = { queues = var.cpus, rx_queue_size = 1024 }
         source = {
           network = { network = var.network }
         }

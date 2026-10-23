@@ -25,6 +25,11 @@ resource "google_compute_image" "image" {
   guest_os_features {
     type = "UEFI_COMPATIBLE"
   }
+
+  # The image carries gVNIC's driver (gve): an instance may take Compute Engine's faster NIC.
+  guest_os_features {
+    type = "GVNIC"
+  }
 }
 
 resource "google_compute_instance" "vm" {
@@ -40,6 +45,7 @@ resource "google_compute_instance" "vm" {
   }
 
   network_interface {
+    nic_type   = var.nic_type
     network    = var.network
     subnetwork = var.subnetwork == "" ? null : var.subnetwork
     access_config {}

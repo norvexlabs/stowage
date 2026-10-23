@@ -67,9 +67,15 @@ variable "subnet_id" {
 }
 
 variable "vm_size" {
-  description = "The VM size."
+  description = "The VM size: one that offers accelerated networking while accelerated_networking is on."
   type        = string
-  default     = "Standard_B2s"
+  default     = "Standard_B2ls_v2"
+}
+
+variable "accelerated_networking" {
+  description = "Accelerated networking on the VM's NIC (a size that offers it)."
+  type        = bool
+  default     = true
 }
 
 variable "admin_user" {

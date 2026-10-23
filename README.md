@@ -939,13 +939,19 @@ These are what `lint` checks; each finding names the key path or `file:line` to 
     first-boot reset;
   - `/usr/sbin/<short>-stow`, the installer with the release as the bundle carries it, and its units
     `<name>.service` (the boot), `<name>-health.service` (the health gate),
-    `<name>-hostd.service` (the host daemon), `<name>-network.service` (the network override) and
+    `<name>-hostd.service` (the host daemon), `<name>-network.service` (the network override),
+    `<name>-tune.service` and `<name>-tune-online.service` (the network tuning, at each boot
+    before the network starts and again once it is up, before Docker: `<short>-stow tune-boot`;
+    see [Network tuning](#network-tuning-short-stow-tune)) and
     `<name>-backup.timer` (not enabled: the host daemon starts it) with `<name>-backup.service` (the
     scheduled backup); see "The installer
     on the Kairos VM" below;
   - Kairos's `/system/oem/08_grub.yaml` (its GRUB boot assessment) without the step that marks
     every boot of the active system good as it starts: the health gate marks it. The build fails
     when kairos-init's file is not the one this copy is derived from (by its sha256);
+  - Kairos's `/system/oem/09_systemd_services.yaml` without its fixed `net.core.rmem_max`
+    (7500000), which its boot stage would set after the tuning units, below what they size from
+    RAM; its other settings stay. The build fails when that line is no longer there;
   - a default-deny firewall, `/etc/nftables.conf`, with SSH open to every source
     (`/etc/nftables.d/ssh.nft`), `/run/nftables.d` made at boot for the install's ports, and a
     forward chain enforcing the L4 routes' allowlists (see "The firewall" under the installer on
@@ -1267,8 +1273,8 @@ again, to copy an installer to another host.
 <short>-stow backup config|run|status|list|verify [--dir D] [the VM's flags]   # a pg-age-rclone backup
 <short>-stow restore OBJECT [--dir D] [--identity FILE|-] [--yes] [--accessible]
 <short>-stow script                                                      # print the bootstrap script
-<short>-stow tune [--check | --print]                                    # the host's network tuning
-<short>-stow tune --apply | --revert [--yes] [--restart-docker] [--no-input] [--accessible]
+<short>-stow tune [--check | --print] [--profile shared|network]         # the host's network tuning
+<short>-stow tune --apply | --revert [--profile shared|network] [--yes] [--restart-docker] [--no-input] [--accessible]
 <short>-stow mirror export [--channel C] [--version V [--revision N]] [--shapes S,…] [--output FILE] [--disks F,…|none]
 <short>-stow mirror import FILE --to PREFIX [--registry-ca FILE] [--older]
 ```
@@ -1362,9 +1368,11 @@ again, to copy an installer to another host.
     label tells nothing of the secrets it covers; a lost key only recreates those services once.
     The same file gives each service with a network namespace of its own (no `network_mode`, or
     `network_mode: bridge`) the network settings a namespace keeps apart from the host's, sized
-    from this host as [`tune`](#network-tuning-short-stow-tune) sizes them: `net.core.somaxconn`
+    from this host as [`tune`](#network-tuning-short-stow-tune) sizes them (on a VM, its network
+    profile): `net.core.somaxconn`
     and `net.ipv4.tcp_max_syn_backlog` 8192, `net.ipv4.tcp_rmem` / `tcp_wmem` up to the socket
-    buffer, `tcp_notsent_lowat` 131072, `tcp_slow_start_after_idle` 0, `tcp_mtu_probing` 1 —
+    buffer (or the host's own, field by field, where it is higher: a newer kernel sizes it from
+    RAM), `tcp_notsent_lowat` 131072, `tcp_slow_start_after_idle` 0, `tcp_mtu_probing` 1 —
     each one the service does not set in its own `sysctls:`, and the host's kernel has. None on
     Linux older than 4.15 (those keys are not a namespace's there), on rootless Docker or
     `userns-remap` (a user namespace of the containers' own hides them), or on Docker Desktop;
@@ -1742,14 +1750,23 @@ keeps (`<dir>/<short>-stow`, the release it runs; another is refused).
 
 The host's kernel and Docker engine, tuned for network throughput (many connections, UDP and QUIC
 through the L4 routes, tunnels on TUN devices) without holding memory: every memory ceiling is a
-share of the host's RAM, which the kernel uses under load only. On a Docker host the OS is the
-operator's, so nothing changes until they ask; the install and `upgrade` end with one line,
-`tuning   N network settings of this host differ …`, when the host differs.
+share of the host's RAM, which the kernel uses under load only, and never below the kernel's own
+default. On a Docker host the OS is the operator's, so nothing changes until they ask; the
+install and `upgrade` end with one line, `tuning   N network settings of this host differ …`,
+when the host differs. A Kairos VM is Stowage's: it tunes itself at each boot (below).
 
+- Two profiles. `shared` (a Docker host's default) is a host whose other processes the admin
+  runs; `network` leans harder on the network, for a host that runs the stack alone: larger
+  ceilings, more steering of the NICs' packets, their rings grown, the containers' logs rotated. A Kairos VM always takes
+  `network`; a Docker host takes it with `--profile network`, which `--apply` records in
+  `tune.json`, so the report, `--check` and the containers' settings follow it until `--revert`
+  (an unknown name is refused). A host applied with `network` refuses `--profile shared` —
+  report, `--check`, `--print` or `--apply` — until `--revert`: the network profile's own keys
+  would be neither judged, kept nor put back.
 - `tune` reports each item, its value here and the one wanted, `ok`, `differs`, `advice` (a
-  setting outside the OS: never applied, never counted) or `n/a`; it needs no root, and no
-  engine but for the daemon's file, which it leaves out (and says so) when `docker info` does
-  not answer. `--check`
+  setting outside the OS: never applied, never counted) or `n/a`, after the host's RAM, CPUs and
+  profile; it needs no root, and no engine but for the daemon's file, which it leaves out (and
+  says so) when `docker info` does not answer. `--check`
   exits non-zero when one differs (monitoring, CI). `--print` prints the files `--apply` writes,
   for a host configured by other means. `--apply` (root) prints what it writes, asks (`--yes`
   without a terminal, else it refuses), writes the files and applies them to the running host;
@@ -1759,33 +1776,58 @@ operator's, so nothing changes until they ask; the install and `upgrade` end wit
   least" (and "at most"): a host holding more (less) keeps it, field by field — judged, while a
   value is still the one `--apply` wrote, against what the host held before the first `--apply`
   (`tune.json`), so a host that shrank goes back down to its own share; a value changed since
-  is the host's own, and kept when the rule allows it. The two socket
-  budgets, `tcp_mem` and `udp_mem`, are the RAM shares themselves, written exactly — below the
-  kernel's own default of about 9 % of RAM:
+  is the host's own, and kept when the rule allows it. Every memory value is at least the
+  kernel's default for that RAM; `vm.min_free_kbytes` is the only one that sets memory aside:
 
-  | Setting | Value |
-  |---|---|
-  | `net.core.rmem_max`, `wmem_max`, the top of `net.ipv4.tcp_rmem` / `tcp_wmem` | RAM / 256 rounded down to a power of two, from 8 MiB (a QUIC stack asks 7) to 64 MiB, at least; `tcp_rmem` `4096 131072 …`, `tcp_wmem` `4096 16384 …` |
-  | `net.ipv4.tcp_mem`, `net.ipv4.udp_mem` (all sockets) | 4, 6 and 8 % of RAM, in pages |
-  | `net.core.netdev_max_backlog` | 1 % of RAM across the CPUs at 2 KiB a packet, from 1000 to 32768, at least |
-  | `net.netfilter.nf_conntrack_max` / `nf_conntrack_buckets` | 2 % of RAM at 320 B an entry / a quarter of it, at least |
-  | `vm.min_free_kbytes` | 0.5 % of RAM, at most 128 MiB, at least (a small host keeps the kernel's larger default) |
-  | `net.core.rps_sock_flow_entries` | RAM / 128 KiB, a power of two from 4096 to 65536, at least |
-  | `net.core.default_qdisc`, `net.ipv4.tcp_congestion_control` | `fq`, `bbr` |
-  | `net.ipv4.tcp_notsent_lowat` | 131072, at most |
-  | `net.ipv4.tcp_slow_start_after_idle`, `tcp_mtu_probing` | 0, 1 (at least) |
-  | `net.core.somaxconn`, `net.ipv4.tcp_max_syn_backlog` | 8192, at least |
-  | `net.ipv4.conf.all.rp_filter`, `conf.default.rp_filter` | 2 (loose; any value but 1 passes): a tunnel's replies may come back another way |
-  | a NIC backed by a device | `ethtool -K <nic> rx-udp-gro-forwarding on rx-gro-list off`: forwarded UDP (QUIC to a container, a tunnel) stays batched |
-  | a TUN or TAP device made in the host's namespace | `tx_queue_len` 1 % of RAM at 2 KiB a packet, from 500 to 10000; `queues/rx-0/rps_cpus` every online CPU; `rps_flow_cnt` as `rps_sock_flow_entries` |
-  | the `tun` module | present |
-  | Docker's `daemon.json` | `default-ulimits.nofile` 1048576 soft and hard, at least; `default-network-opts.bridge."com.docker.network.driver.mtu"` the default route's MTU when it is not 1500 (Docker ≥ 24; the networks made from then on, a stack's at its first start) |
+  | Setting | `shared` | `network` |
+  |---|---|---|
+  | `net.core.rmem_max`, `wmem_max`, the top of `net.ipv4.tcp_rmem` / `tcp_wmem` | RAM / 256 rounded down to a power of two, from 8 MiB (a QUIC stack asks 7) to 64 MiB, at least; `tcp_rmem` `4096 131072 …`, `tcp_wmem` `4096 16384 …` | RAM / 128, from 16 MiB to 128 MiB (10 Gbit/s over 100 ms) |
+  | `net.ipv4.tcp_mem` (all TCP sockets, in pages) | the kernel's default (low, pressure, high: ¾, 1 and 1½ × RAM / 16 pages, about 4.7, 6.25 and 9.4 % of RAM) × 1.5, at least | × 2 |
+  | `net.ipv4.udp_mem` (all UDP sockets: QUIC, tunnels) | the kernel's default (from RAM / 8 pages, about 9.4, 12.5 and 18.75 %) × 1.5, at least | the same |
+  | `net.core.netdev_max_backlog` | 1 % of RAM across the CPUs at 2 KiB a packet, from 1000 (the kernel's) to 32768, at least | 2 %, up to 65536 |
+  | `net.netfilter.nf_conntrack_max` / `nf_conntrack_buckets` | 2 % of RAM at 320 B an entry / a quarter of it, each at least the kernel's table (262144 above 4 GiB, 65536 above 1 GiB, else RAM / 128 KiB, at least 1024) | 4 % |
+  | `vm.min_free_kbytes` | 0.5 % of RAM, at most 128 MiB, and at least the kernel's √(16 × RAM in KiB) | the same |
+  | `net.core.rps_sock_flow_entries` | RAM / 128 KiB, a power of two from 4096 to 65536, at least | the same |
+  | `net.core.netdev_budget`, `netdev_budget_usecs` | the kernel's | 600, 8000, at least: more packets a CPU takes from the NICs in one pass |
+  | `net.core.default_qdisc`, `net.ipv4.tcp_congestion_control` | `fq`, `bbr` | the same |
+  | `net.ipv4.tcp_notsent_lowat` | 131072, at most: less unsent data held in a socket (latency; BBR keeps the throughput) | the same |
+  | `net.ipv4.tcp_slow_start_after_idle`, `tcp_mtu_probing` | 0, 1 (at least) | the same |
+  | `net.core.somaxconn`, `net.ipv4.tcp_max_syn_backlog` | 8192, at least | the same |
+  | `net.ipv4.conf.all.rp_filter`, `conf.default.rp_filter` | 2 (loose; any value but 1 passes): a tunnel's replies may come back another way | the same |
+  | a NIC backed by a device | `ethtool -K <nic> rx-udp-gro-forwarding on rx-gro-list off`: forwarded UDP (QUIC to a container, a tunnel) stays batched | also each receive queue's `rps_flow_cnt` its share of `rps_sock_flow_entries`, the table over the CPUs as a power of two (flows steered to the CPU that reads them; in the udev rule too, on each queue's own appearance, a change of the NIC's channels included), and its receive and transmit rings (`ethtool -G`) grown to the driver's maximum within 1 % of RAM at 2 KiB a slot, a power of two — never shrunk, and only on a link not yet up (`IFF_UP` clear; flags that do not read count as up), as a resize resets it: the VM's first boot pass grows them; on an up link the item is `advice` with the `ethtool -G` to run while it is down (also when a driver refuses a ring it lists), `n/a` when the driver offers no larger one |
+  | a TUN or TAP device made in the host's namespace | `tx_queue_len` 1 % of RAM at 2 KiB a packet, from 500 to 10000; `queues/rx-0/rps_cpus` every online CPU; `rps_flow_cnt` as `rps_sock_flow_entries` | `tx_queue_len` 2 %, from 1000 |
+  | the `tun` module | present | the same |
+  | Docker's `daemon.json` | `default-ulimits.nofile` 1048576 soft and hard, at least; `default-network-opts.bridge."com.docker.network.driver.mtu"` the default route's MTU when it is not 1500 (Docker ≥ 24; the networks made from then on, a stack's at its first start) | also `log-opts` `max-size` 20m, `max-file` 5: the default `json-file` driver's rotation, for the containers made from then on, a service's own logging options still valid — `n/a`, left out, when the file names another driver or has `log-opts` of its own, or dockerd runs with `--log-opt` or another `--log-driver` |
 
+- **On a Kairos VM**, `<name>-tune.service` runs `<short>-stow tune-boot` at each boot, after the
+  kernel's own settings and udev's first pass, before the network starts, and
+  `<name>-tune-online.service` runs it again once the network is online, before Docker starts
+  (the default route's MTU is known then, and a NIC probed late is there). It loads the
+  modules, writes the `network` profile's settings for this boot's RAM and CPUs over what the
+  kernel holds (so a resized VM is tuned for its new size), the udev rule to
+  `/run/udev/rules.d/60-stowage-net.rules` (the offload of a NIC, and the queues of a TUN device, that
+  appears later), the daemon
+  keys into `/etc/docker/daemon.json` before Docker reads it, and sets the NICs and TUN devices
+  already there; it writes no file that outlives the boot and keeps no `tune.json`. A daemon
+  file that does not merge is left as it is, and the rest is tuned. Its notes are in the units'
+  journal. The VM's `tune` reports against it and `--check` checks it; it has no `--print`,
+  `--apply`, `--revert` or `--profile`, and its drift line names the reboot that tunes it again
+  and the units' journal (`sudo journalctl`). On Hyper-V and Azure, `/etc/systemd/network/00-<name>-sriov.network` (first of the
+  VM's network files, `network set`'s override included)
+  leaves the accelerated networking's virtual function (`mlx4_en`, `mlx4_core`, `mlx5_core`, `mana`)
+  unmanaged: the kernel bonds it under the VM's NIC, whose address it shares. The image carries `ethtool`, and the
+  build fails when its kernel lacks `tun`, `nf_conntrack`, `tcp_bbr`, `sch_fq`, or the clouds'
+  NIC drivers: `gve` (gVNIC) and `mana` (Azure), copied from the kernel's extra modules
+  package, and `mlx5_core` (Azure's ConnectX). The VM modules give the hypervisor's part:
+  multiqueue virtio on libvirt and Proxmox, gVNIC on Compute Engine, accelerated networking on
+  Azure ([`vm create`](#creating-a-vm-short-stow-vm-create)); TrueNAS offers no queue setting,
+  which the report gives as `advice`.
 - The files, named for Stowage rather than one stack (two stacks write the same values):
   `/etc/sysctl.d/60-stowage-net.conf`; `/etc/modules-load.d/60-stowage-net.conf` (`tun`,
   `nf_conntrack`, `tcp_bbr`, `sch_fq`, loaded at boot, before the settings that need them);
   `/etc/udev/rules.d/60-stowage-net.rules` (the NICs' offload, left out without `ethtool`
-  installed, and the TUN devices' queues, at each device's appearance); the keys above merged
+  installed, the TUN devices' queues, and on the `network` profile each NIC queue's steered
+  flows, at each device's or queue's appearance); the keys above merged
   into the daemon's file — `/etc/docker/daemon.json`, or the `--config-file` of the dockerd that
   runs as root (snap; a relative one from `/`; a user's rootless dockerd is never read) — its
   other keys kept (a file that does not parse is refused, nothing written);
@@ -2341,12 +2383,12 @@ in the same installer (bootstrap it as above, then `sh <name>.sh vm create …`,
   | `--platform` | provider | what the module makes | the module's own variables (`--tofu-var`, or asked) |
   |---|---|---|---|
   | `truenas` | `pjsalty/truenas` 3.1.0 | below | its flags: `--pool`, `--dataset`, `--bridge` |
-  | `libvirt` (preview) | `dmacvicar/libvirt` 0.9.9 | the image uploaded as a volume, a copy-on-write qcow2 volume over it grown to `--disk`; the seed as a second, read-only volume; a KVM domain with libvirt's UEFI firmware (Secure Boot off) on `network`, its DHCP lease of an IPv4 address the address (waited for, up to 5 minutes, only with DHCP) | `uri` (default `qemu:///system`), `pool` (`default`), `network` (`default`) |
-  | `proxmox` (preview) | `bpg/proxmox` 0.117.0 | the image uploaded to a datastore with *Import* content (not enabled by default: Datacenter > Storage), the seed to one with *ISO* content, both through the API (the token alone, no SSH to the node); an OVMF VM importing the image, grown to `--disk`, the seed on its CD-ROM; no address (no guest agent) | `node` (required), `datastore` (`local-lvm`), `import_datastore` (`local`), `iso_datastore` (`local`), `bridge` (`vmbr0`) |
+  | `libvirt` (preview) | `dmacvicar/libvirt` 0.9.9 | the image uploaded as a volume, a copy-on-write qcow2 volume over it grown to `--disk`; the seed as a second, read-only volume; a KVM domain with libvirt's UEFI firmware (Secure Boot off) on `network`, its virtio NIC with a queue per vCPU and a receive ring of 1024, its DHCP lease of an IPv4 address the address (waited for, up to 5 minutes, only with DHCP) | `uri` (default `qemu:///system`), `pool` (`default`), `network` (`default`) |
+  | `proxmox` (preview) | `bpg/proxmox` 0.117.0 | the image uploaded to a datastore with *Import* content (not enabled by default: Datacenter > Storage), the seed to one with *ISO* content, both through the API (the token alone, no SSH to the node); an OVMF VM importing the image, grown to `--disk`, the seed on its CD-ROM, a virtio NIC with a queue per vCPU (at most 64); no address (no guest agent) | `node` (required), `datastore` (`local-lvm`), `import_datastore` (`local`), `iso_datastore` (`local`), `bridge` (`vmbr0`) |
   | `vmware` (preview) | `vmware/vsphere` 2.17.1 | the OVA deployed, its disk grown to `--disk`, the seed uploaded to the datastore on its CD-ROM; its address when VMware tools report one | `datacenter`, `cluster`, `datastore`, `host` (required), `network` (`VM Network`), `folder` |
   | `aws` (preview) | `hashicorp/aws` 6.69.1 | the raw image uploaded to S3, imported as a snapshot (the `vmimport` role), registered as a UEFI image, an instance launched from it with the cloud-config as its user data (IMDSv2); its public address, else its private one | `region`, `bucket`, `subnet_id` (required), `security_group_ids` (comma-separated), `instance_type` (`t3.medium`), `vmimport_role` (`vmimport`) |
-  | `gcp` (preview) | `hashicorp/google` 8.7.0 | the image's `tar.gz` uploaded to Cloud Storage, a UEFI image, an instance booted from it with the cloud-config as its `user-data`; its external address | `project`, `zone`, `bucket` (required), `network` (`default`), `subnetwork`, `machine_type` (`e2-medium`) |
-  | `azure` (preview) | `hashicorp/azurerm` 5.10.0 | the fixed VHD uploaded as a page blob, a generation 2 image, a VM with a static public address made from it with the cloud-config as its custom data (no VM agent); its public address | `resource_group`, `location`, `storage_account`, `subnet_id` (required), `container` (`vhds`), `vm_size` (`Standard_B2s`) |
+  | `gcp` (preview) | `hashicorp/google` 8.7.0 | the image's `tar.gz` uploaded to Cloud Storage, a UEFI image declaring gVNIC, an instance booted from it with the cloud-config as its `user-data`; its external address | `project`, `zone`, `bucket` (required), `network` (`default`), `subnetwork`, `machine_type` (`e2-medium`), `nic_type` (`GVNIC`, or `VIRTIO_NET`) |
+  | `azure` (preview) | `hashicorp/azurerm` 5.10.0 | the fixed VHD uploaded as a page blob, a generation 2 image, a VM with a static public address and accelerated networking made from it with the cloud-config as its custom data (no VM agent); its public address | `resource_group`, `location`, `storage_account`, `subnet_id` (required), `container` (`vhds`), `vm_size` (`Standard_B2ls_v2`: a size that offers accelerated networking), `accelerated_networking` (`true`) |
 
   `hyperv` has none: `--create opentofu` there needs `--module`. A **preview** module has not run
   on its platform yet: `vm create` prints `OpenTofu's <platform> module is a preview: it has not
@@ -2509,6 +2551,7 @@ sudo <short>-stow install [--channel C] [--set KEY=VALUE]… [--answers FILE] [-
 <short>-stow secrets export --recipient age1…… [-o FILE|-]   # the install's secrets, encrypted
 <short>-stow secrets rotate KEY [--stage | --finish]   # a secret with rotation: true
 <short>-stow network [--json]          # the address, gateway and DNS servers, what sets them, a change awaiting confirmation
+<short>-stow tune [--check]           # how the VM's network settings differ from what its boot tuning wants (the network profile); --check exits non-zero
 <short>-stow network set --mode dhcp|static [--address A/P] [--gateway G] [--ipv6 [--address6 A/P] [--gateway6 G]] [--dns D,…] [--revert-secs N | --no-revert]
 <short>-stow network confirm|revert   # keep the change awaiting confirmation, or undo it now
 <short>-stow network reset [--revert-secs N | --no-revert]   # drop the override: back to the cloud-config's network

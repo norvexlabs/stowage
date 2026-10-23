@@ -1,0 +1,9 @@
+# Azure's accelerated networking adds a virtual function beside the VM's NIC, with its MAC: the
+# kernel bonds it under that NIC, and networkd must leave it alone. 00- sorts before every other
+# file of the VM's, `network set`'s override included: networkd takes the first that matches.
+[Match]
+Virtualization=microsoft
+Driver=mlx4_en mlx4_core mlx5_core mana
+
+[Link]
+Unmanaged=yes

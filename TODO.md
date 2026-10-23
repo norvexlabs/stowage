@@ -223,6 +223,17 @@ A finished item is deleted, not ticked. The plan behind it is
 
 ## Could
 
+- **An image gone under `make gate`'s parallel suites**: once, e2e-full's re-run met `No such
+  image: …/atlas/atlas-provision@sha256:…` at its provision step (its registry live, the image
+  pulled earlier in the run); alone it passes. No suite removes another's registry references;
+  the suspect is two suites pulling the same content (e2e-full and e2e-full-k8s build
+  `examples/full` alike) and a removal of one reference reaching the other's. Find the removal.
+
+- **A Docker host's NIC rings on the `network` profile**: a resize resets the link, so `tune`
+  never resizes an up link and reports it as advice with the `ethtool -G` to run while it is
+  down; a host's own boot does not grow them either. A unit ordered before the network (as the
+  VM's) would.
+
 - **`tune` as a user on a `hidepid` host**: without root, `/proc` hides dockerd's command line,
   so the report judges `/etc/docker/daemon.json` where the engine may read a `--config-file`
   (which `--apply`, as root, writes): the report can show the daemon keys as differing after a

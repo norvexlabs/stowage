@@ -4,13 +4,17 @@
 // ones its network namespace keeps of its own.
 //
 // Every memory ceiling is a share of RAM, so a small VM and a large one are each tuned in
-// proportion; a ceiling is memory the kernel may use under load, never memory it holds.
+// proportion, and never below the kernel's own default; a ceiling is memory the kernel may use
+// under load, never memory it holds. A Kairos VM, which runs the stack alone, takes the Network
+// profile at each boot.
 package tune
 
 import (
 	"bufio"
 	"bytes"
 	"fmt"
+	"math"
+	"math/bits"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -30,7 +34,35 @@ type Host struct {
 	CPUs     int
 	Online   []int // the online CPUs' ids; empty is 0 to CPUs-1
 	PageSize int
+	Profile  Profile
 }
+
+// Profile is how far the rules lean on the network. Both keep every value at the kernel's default
+// or above.
+type Profile string
+
+const (
+	// Shared is a host whose other processes the admin runs: the zero value.
+	Shared Profile = "shared"
+	// Network is a host that runs the stack alone, a Kairos VM: larger ceilings, NIC rings and
+	// flow steering.
+	Network Profile = "network"
+)
+
+// ParseProfile reads a profile's name; "" is Shared.
+func ParseProfile(s string) (Profile, error) {
+	switch Profile(s) {
+	case "", Shared:
+		return Shared, nil
+	case Network:
+		return Network, nil
+	}
+	return "", fmt.Errorf("profile %q: shared or network", s)
+}
+
+func (h Host) network() bool { return h.Profile == Network }
+
+func (h Host) pages() uint64 { return h.MemBytes / uint64(max(h.PageSize, 1)) }
 
 // MemStep is the RAM's granularity: MemTotal moves by a few KiB from one kernel or boot to the
 // next, which must not make another host of it.
@@ -93,41 +125,128 @@ func cpuList(s string) ([]int, bool) {
 func clamp(v, lo, hi uint64) uint64 { return min(max(v, lo), hi) }
 
 // SocketBuffer is the largest buffer one socket may get: RAM/256 rounded down to a power of two,
-// from 8 MiB (QUIC stacks ask for 7) to 64 MiB. The containers are given it, so it moves only when
-// RAM doubles; the socket memory budgets (tcp_mem, udp_mem) bound all sockets together.
+// from 8 MiB (QUIC stacks ask for 7) to 64 MiB; on the network profile RAM/128, from 16 to 128 MiB
+// (10 Gbit/s over 100 ms). The containers are given it, so it moves only when RAM doubles; the
+// socket memory budgets (tcp_mem, udp_mem) bound all sockets together.
 func (h Host) SocketBuffer() uint64 {
-	b := uint64(8 * mib)
-	for b*2 <= h.MemBytes/256 && b < 64*mib {
-		b *= 2
+	b, top, share := uint64(8*mib), uint64(64*mib), uint64(256)
+	if h.network() {
+		b, top, share = 16*mib, 128*mib, 128
 	}
-	return b
+	return clamp(floorPow2(h.MemBytes/share), b, top)
+}
+
+// floorPow2 is the largest power of two at most n; 0 for 0.
+func floorPow2(n uint64) uint64 {
+	if n == 0 {
+		return 0
+	}
+	return 1 << (bits.Len64(n) - 1)
 }
 
 // Backlog is the packets each CPU may queue in a burst: 1 % of RAM across the CPUs at ~2 KiB a
-// packet.
-func (h Host) Backlog() uint64 { return clamp(h.MemBytes/100/(uint64(h.CPUs)*2*kib), 1000, 32768) }
+// packet, from 1000 (the kernel's default) to 32768; on the network profile 2 %, up to 65536.
+func (h Host) Backlog() uint64 {
+	if h.network() {
+		return clamp(h.MemBytes*2/100/(uint64(h.CPUs)*2*kib), 1000, 65536)
+	}
+	return clamp(h.MemBytes/100/(uint64(h.CPUs)*2*kib), 1000, 32768)
+}
 
-// ConntrackMax is the connections the NAT may track: 2 % of RAM at ~320 B an entry.
-func (h Host) ConntrackMax() uint64 { return h.MemBytes * 2 / 100 / 320 }
+// kernelConntrack is the kernel's own size of the connection table, its buckets and its entries
+// alike: 262144 above 4 GiB, 65536 above 1 GiB, else RAM/16384 buckets of 8 B, at least 1024.
+func (h Host) kernelConntrack() uint64 {
+	switch {
+	case h.MemBytes > 4<<30:
+		return 262144
+	case h.MemBytes > 1<<30:
+		return 65536
+	}
+	return max(h.MemBytes/16384/8, 1024)
+}
+
+// ConntrackMax is the connections the NAT may track: 2 % of RAM at ~320 B an entry (4 % on the
+// network profile), at least the kernel's default.
+func (h Host) ConntrackMax() uint64 {
+	share := uint64(2)
+	if h.network() {
+		share = 4
+	}
+	return max(h.MemBytes*share/100/320, h.kernelConntrack())
+}
+
+// ConntrackBuckets is the connection table's hash size: a quarter of its entries, at least the
+// kernel's default.
+func (h Host) ConntrackBuckets() uint64 { return max(h.ConntrackMax()/4, h.kernelConntrack()) }
 
 // MinFreeKB is the memory, in KiB, the kernel keeps free for the allocations a burst of packets
-// makes: 0.5 % of RAM, at most 128 MiB. A smaller host keeps the kernel's own, larger, default.
-func (h Host) MinFreeKB() uint64 { return min(h.MemBytes/kib/200, 128*kib) }
+// makes: 0.5 % of RAM, at most 128 MiB, and never below the kernel's own default (√(16 × RAM in
+// KiB), from 128 KiB to 256 MiB). It is the one rule that takes memory from the processes.
+func (h Host) MinFreeKB() uint64 {
+	kernel := clamp(uint64(math.Sqrt(float64(h.MemBytes/kib*16))), 128, 256*kib)
+	return max(min(h.MemBytes/kib/200, 128*kib), kernel)
+}
+
+// socketMem is a socket memory budget, in pages, as the kernel sizes it from limit (its low mark
+// three quarters of it, its high mark twice the low), scaled by num/den.
+func socketMem(limit, num, den uint64) string {
+	limit = max(limit, 128)
+	low := limit / 4 * 3
+	return nums(low*num/den, limit*num/den, low*2*num/den)
+}
+
+// TCPMem is the budget of every TCP socket together: the kernel's (RAM/16 pages) × 1.5, × 2 on the
+// network profile.
+func (h Host) TCPMem() string {
+	if h.network() {
+		return socketMem(h.pages()/16, 2, 1)
+	}
+	return socketMem(h.pages()/16, 3, 2)
+}
+
+// UDPMem is the budget of every UDP socket together (QUIC, tunnels): the kernel's (RAM/8 pages) ×
+// 1.5.
+func (h Host) UDPMem() string { return socketMem(h.pages()/8, 3, 2) }
 
 // FlowEntries sizes the table that steers a flow's packets to the CPU its socket reads on: RAM /
 // 128 KiB, a power of two from 4096 to 65536 (at most 512 KiB).
 func (h Host) FlowEntries() uint64 {
-	n := clamp(h.MemBytes/(128*kib), 4096, 65536)
-	p := uint64(4096)
-	for p*2 <= n {
-		p *= 2
+	return floorPow2(clamp(h.MemBytes/(128*kib), 4096, 65536))
+}
+
+// TunQueueLen is a TUN or TAP device's transmit queue: 1 % of RAM at ~2 KiB a packet, from 500 to
+// 10000; on the network profile 2 %, from 1000.
+func (h Host) TunQueueLen() uint64 {
+	if h.network() {
+		return clamp(h.MemBytes*2/100/(2*kib), 1000, 10000)
+	}
+	return clamp(h.MemBytes/100/(2*kib), 500, 10000)
+}
+
+// RingEntries is the receive and transmit ring a NIC of queues queues is given on the network
+// profile: the driver's maximum, within 1 % of RAM at ~2 KiB a slot, a power of two; 0 leaves the
+// NIC's own.
+func (h Host) RingEntries(queues int, driverMax uint64) uint64 {
+	if !h.network() || driverMax == 0 {
+		return 0
+	}
+	budget := h.MemBytes / 100 / (2 * kib * 2 * uint64(max(queues, 1)))
+	p := floorPow2(min(driverMax, budget))
+	if p < 64 {
+		return 0
 	}
 	return p
 }
 
-// TunQueueLen is a TUN or TAP device's transmit queue: 1 % of RAM at ~2 KiB a packet, from 500 to
-// 10000.
-func (h Host) TunQueueLen() uint64 { return clamp(h.MemBytes/100/(2*kib), 500, 10000) }
+// QueueFlows is each receive queue's share of the steered flows: the table over the CPUs (a
+// multiqueue NIC has a queue per CPU), a power of two, as the udev rule and an apply both write
+// it; 0 off the network profile, where a NIC's queues are not steered.
+func (h Host) QueueFlows() uint64 {
+	if !h.network() {
+		return 0
+	}
+	return max(floorPow2(h.FlowEntries()/uint64(max(h.CPUs, 1))), 1)
+}
 
 // RPSMask is the CPU mask of every online CPU, as rps_cpus reads it: 32-bit hex groups, comma
 // separated.
@@ -235,20 +354,21 @@ func nums(v ...uint64) string {
 // Sysctls are the host's settings, in the order they are written.
 func (h Host) Sysctls() []Sysctl {
 	buf := h.SocketBuffer()
-	pages := h.MemBytes / uint64(max(h.PageSize, 1))
-	pct := func(p uint64) uint64 { return pages * p / 100 }
-	conn := h.ConntrackMax()
-	return []Sysctl{
-		{"net.core.rmem_max", nums(buf), "the largest receive buffer a socket may ask for (QUIC asks 7 MiB): RAM/256, a power of two", AtLeast},
-		{"net.core.wmem_max", nums(buf), "the largest send buffer a socket may ask for: RAM/256, a power of two", AtLeast},
+	share, tcp, backlog, conn := "RAM/256", "1.5", "1 %", "2 %"
+	if h.network() {
+		share, tcp, backlog, conn = "RAM/128", "2", "2 %", "4 %"
+	}
+	out := []Sysctl{
+		{"net.core.rmem_max", nums(buf), "the largest receive buffer a socket may ask for (QUIC asks 7 MiB): " + share + ", a power of two", AtLeast},
+		{"net.core.wmem_max", nums(buf), "the largest send buffer a socket may ask for: " + share + ", a power of two", AtLeast},
 		{"net.ipv4.tcp_rmem", nums(4096, 131072, buf), "how far TCP's receive buffer may grow on a fast, distant link", AtLeast},
 		{"net.ipv4.tcp_wmem", nums(4096, 16384, buf), "how far TCP's send buffer may grow", AtLeast},
-		{"net.ipv4.tcp_mem", nums(pct(4), pct(6), pct(8)), "all TCP sockets' memory, in pages: 4, 6 and 8 % of RAM", Exact},
-		{"net.ipv4.udp_mem", nums(pct(4), pct(6), pct(8)), "all UDP sockets' memory, in pages: 4, 6 and 8 % of RAM", Exact},
-		{"net.core.netdev_max_backlog", nums(h.Backlog()), "the packets a CPU may queue in a burst: 1 % of RAM across the CPUs", AtLeast},
-		{"net.netfilter.nf_conntrack_max", nums(conn), "the connections the NAT may track: 2 % of RAM", AtLeast},
-		{"net.netfilter.nf_conntrack_buckets", nums(conn / 4), "the connection table's hash size", AtLeast},
-		{"vm.min_free_kbytes", nums(h.MinFreeKB()), "memory kept free for a burst's allocations: 0.5 % of RAM, at most 128 MiB", AtLeast},
+		{"net.ipv4.tcp_mem", h.TCPMem(), "all TCP sockets' memory, in pages: the kernel's default × " + tcp, AtLeast},
+		{"net.ipv4.udp_mem", h.UDPMem(), "all UDP sockets' memory (QUIC, tunnels), in pages: the kernel's default × 1.5", AtLeast},
+		{"net.core.netdev_max_backlog", nums(h.Backlog()), "the packets a CPU may queue in a burst: " + backlog + " of RAM across the CPUs", AtLeast},
+		{"net.netfilter.nf_conntrack_max", nums(h.ConntrackMax()), "the connections the NAT may track: " + conn + " of RAM, at least the kernel's default", AtLeast},
+		{"net.netfilter.nf_conntrack_buckets", nums(h.ConntrackBuckets()), "the connection table's hash size", AtLeast},
+		{"vm.min_free_kbytes", nums(h.MinFreeKB()), "memory kept free for a burst's allocations: 0.5 % of RAM, at most 128 MiB, at least the kernel's default", AtLeast},
 		{"net.core.rps_sock_flow_entries", nums(h.FlowEntries()), "the flows steered to the CPU their socket reads on", AtLeast},
 		{"net.core.default_qdisc", "fq", "pacing: what a QUIC or BBR sender asks of the queue", Exact},
 		{"net.ipv4.tcp_congestion_control", "bbr", "throughput on a lossy or distant link", Exact},
@@ -260,6 +380,12 @@ func (h Host) Sysctls() []Sysctl {
 		{"net.ipv4.conf.all.rp_filter", "2", "loose reverse-path filtering: a tunnel's replies may come back another way", NotStrict},
 		{"net.ipv4.conf.default.rp_filter", "2", "the same for interfaces made later", NotStrict},
 	}
+	if h.network() {
+		out = append(out,
+			Sysctl{"net.core.netdev_budget", "600", "the packets a CPU takes from the NICs in one pass: fewer drops in a flood", AtLeast},
+			Sysctl{"net.core.netdev_budget_usecs", "8000", "the time that pass may take", AtLeast})
+	}
+	return out
 }
 
 // containerKeys are the settings a container's network namespace keeps of its own, starting from

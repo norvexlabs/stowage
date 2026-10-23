@@ -814,7 +814,7 @@ func TestTheVMAsksNamingTheReleaseItResets(t *testing.T) {
 	sock := served(t, d)
 	p := &fakePrompter{answers: map[string]string{"confirm": "no"}}
 	var out bytes.Buffer
-	cmd := vmCommand(e.r, e.self, &out, &out, func(bool) Prompter { return p }, time.Millisecond)
+	cmd := vmCommand(e.r, e.self, &out, &out, func(bool) Prompter { return p }, clientTimes{unit: time.Millisecond})
 	cmd.SetArgs([]string{"reset-db", "--socket", sock})
 	if err := cmd.ExecuteContext(context.Background()); !errors.Is(err, ErrAborted) {
 		t.Fatalf("%v\n%s", err, &out)

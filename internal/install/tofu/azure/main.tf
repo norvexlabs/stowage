@@ -48,6 +48,9 @@ resource "azurerm_network_interface" "vm" {
   name                = "${var.name}-nic"
   location            = var.location
   resource_group_name = var.resource_group
+  # The NIC's own hardware path (ConnectX, MANA), whose drivers the image carries: the size must
+  # offer it.
+  accelerated_networking_enabled = var.accelerated_networking
 
   ip_configuration {
     name                          = "primary"

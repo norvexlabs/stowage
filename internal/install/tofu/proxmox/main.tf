@@ -62,8 +62,11 @@ resource "proxmox_virtual_environment_vm" "vm" {
     interface = "ide2"
   }
 
+  # Virtio with a queue per vCPU (Proxmox's limit is 64), each on its own CPU in the guest.
   network_device {
     bridge = var.bridge
+    model  = "virtio"
+    queues = min(var.cpus, 64)
   }
 
   operating_system {

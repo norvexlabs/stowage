@@ -62,8 +62,13 @@ func ctl(e *env, sock string, args ...string) (string, error) {
 
 // ctlCtx is ctl until ctx ends (an interrupt).
 func ctlCtx(ctx context.Context, e *env, sock string, args ...string) (string, error) {
+	return ctlTimes(ctx, e, sock, clientTimes{unit: time.Millisecond}, args...)
+}
+
+// ctlTimes is ctlCtx on the client's clocks times.
+func ctlTimes(ctx context.Context, e *env, sock string, times clientTimes, args ...string) (string, error) {
 	var out, errb bytes.Buffer
-	cmd := vmCommand(e.r, e.self, &out, &errb, func(bool) Prompter { return nil }, time.Millisecond)
+	cmd := vmCommand(e.r, e.self, &out, &errb, func(bool) Prompter { return nil }, times)
 	cmd.SetArgs(append(args, "--socket", sock))
 	err := cmd.ExecuteContext(ctx)
 	return out.String() + errb.String(), err
@@ -1079,7 +1084,8 @@ func TestAFollowEndsWhenTheDaemonNeverAnswers(t *testing.T) {
 			}
 			hang(w, r)
 		}, func(_ int, w http.ResponseWriter, r *http.Request) { hang(w, r) })
-	out, err := bounded(t, func() (string, error) { return ctl(e, sock, "upgrade", "--yes") })
+	short := clientTimes{unit: time.Millisecond, margin: time.Second}
+	out, err := bounded(t, func() (string, error) { return ctlTimes(context.Background(), e, sock, short, "upgrade", "--yes") })
 	if err == nil || !strings.Contains(err.Error(), "the host daemon is not reachable") {
 		t.Errorf("%v\n%s", err, out)
 	}
@@ -1168,5 +1174,42 @@ func TestProvisionSetOfADeclaredValueOverTheSocket(t *testing.T) {
 	}
 	if out, err := ctl(e, sock, "provision", "--set", "OTHER_KEY=x"); err == nil || !strings.Contains(err.Error(), "nor a value it returned or declares it returns (ADMIN_KEY)") {
 		t.Fatalf("%v\n%s", err, out)
+	}
+}
+
+// A daemon that answers late, as a loaded machine does, is still read: the client's shortened
+// second counts its waits, never the time an answer may take.
+func TestAFollowReadsADaemonThatAnswersLate(t *testing.T) {
+	t.Parallel()
+	e := vmEnv(t, "1.0.0")
+	sock := followDaemon(t, ptr(int64(5)),
+		func(n int, w http.ResponseWriter, _ *http.Request) {
+			if n == 1 {
+				running(w, "upgrade", fakeStart)
+				return
+			}
+			conn, _, err := w.(http.Hijacker).Hijack()
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			conn.Close()
+		},
+		func(n int, w http.ResponseWriter, r *http.Request) {
+			if n > 1 {
+				hang(w, r)
+				return
+			}
+			// Later than the test's shortened seconds would allow an answer: the client waits on.
+			select {
+			case <-r.Context().Done():
+				return
+			case <-time.After(300 * time.Millisecond):
+			}
+			journalAnswer(w, r, []Event{{Seq: 6, Kind: evJobLost, Job: ptr(fakeStart), JobKind: "upgrade", Target: "2.0.0-1", Reason: lostRestart}})
+		})
+	out, err := bounded(t, func() (string, error) { return ctl(e, sock, "upgrade", "--yes") })
+	if err == nil || !strings.Contains(err.Error(), "upgrade 2.0.0-1 lost: the daemon restarted") {
+		t.Errorf("%v\n%s", err, out)
 	}
 }

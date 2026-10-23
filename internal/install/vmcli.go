@@ -38,11 +38,11 @@ const bootLockWait = 10 * time.Minute
 // vmCommand is the command line of the <short>-stow an OS bundle carries: the first install and the
 // boot run as root on the VM; every other verb asks the host daemon, which root and the admin
 // group reach.
-// unit is the client's second (tests shorten it; 0 is a second).
-func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(accessible bool) Prompter, unit time.Duration) *cobra.Command {
+// times are the client's clocks (tests shorten them; zero is the real ones).
+func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(accessible bool) Prompter, times clientTimes) *cobra.Command {
 	name := r.Spec.Name
 	o := Options{Out: stdout, Log: stderr, Docker: ExecTool{Bin: "docker"}, Self: self, Dir: VMDir(name), Offline: true, Preloaded: true,
-		Firewall: PortRules, Host: HostTool{}}
+		Firewall: PortRules, Host: HostTool{}, Tune: vmTune(r.Ctl()), TunedAtBoot: true}
 	if _, err := os.Stat("/proc/self/exe"); err == nil {
 		o.SelfExe = "/proc/self/exe"
 	}
@@ -71,7 +71,7 @@ func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(
 		in.O = o
 		return nil
 	}
-	c := &hostClient{http: socketClient(&socket), out: stdout, unit: unit, ctl: r.Ctl()}
+	c := &hostClient{http: socketClient(&socket), out: stdout, clientTimes: times, ctl: r.Ctl()}
 	root := &cobra.Command{
 		Use:           c.ctl,
 		Short:         fmt.Sprintf("Manage %s on this VM (its OS carries %s, revision %d)", name, r.Manifest.ProjectVersion, r.Manifest.Revision),
@@ -213,7 +213,7 @@ func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(
 	dirFlag(gate)
 	netBoot := netBootCommand(name, c.ctl, &o.Dir, stderr)
 	dirFlag(netBoot)
-	root.AddCommand(install, boot, back, hostd, gate, netBoot)
+	root.AddCommand(install, boot, back, hostd, gate, netBoot, tuneBootCommand(c.ctl, stderr), tuneCommand(in, prepare, terminal, true))
 
 	jsonFlag := func(cmd *cobra.Command) {
 		cmd.Flags().BoolVar(&asJSON, "json", false, "print the daemon's JSON answer")
@@ -562,12 +562,20 @@ type hostClient struct {
 	out  io.Writer
 	// ctl is the installer's name, which messages give the operator.
 	ctl string
-	// unit is the client's second, which its waits count (tests shorten it); 0 is a second.
-	unit time.Duration
+	clientTimes
 }
+
+// clientTimes are the host client's clocks. unit is its second, which its waits count (tests
+// shorten it); 0 is a second. margin is how long a follow's request may take past the wait it asks
+// for, whatever the unit; 0 is requestMargin. Only a test of a daemon that never answers
+// shortens it: a short one would fail a request a loaded machine answers late.
+type clientTimes struct{ unit, margin time.Duration }
 
 // second is the client's second.
 func (c *hostClient) second() time.Duration { return cmp.Or(c.unit, time.Second) }
+
+// patience is how long a follow's request may take past its wait.
+func (c *hostClient) patience() time.Duration { return cmp.Or(c.margin, requestMargin) }
 
 // unreachable is a request that got no answer from the daemon: it is not running, or it stopped
 // before answering.
@@ -798,10 +806,10 @@ func (f *jobEvents) final() *JobStatus {
 }
 
 const (
-	// requestMargin is how long, in the client's seconds, a follow's request may take past the
-	// wait it asks for: a daemon that takes the request and never answers is then one that does
-	// not answer.
-	requestMargin = 120
+	// requestMargin is how long a follow's request may take past the wait it asks for, in real
+	// time (never the client's shortened second): a daemon that takes the request and never
+	// answers is then one that does not answer.
+	requestMargin = 120 * time.Second
 )
 
 // interrupted is the error of a follow its context ended (Ctrl-C): what the job did is not
@@ -887,18 +895,20 @@ func (c *hostClient) unlogged(w io.Writer, f *jobEvents) {
 	}
 }
 
-// within is do, given secs of the client's seconds to answer.
-func (c *hostClient) within(ctx context.Context, secs int, method, path string, body, out any) error {
-	ctx, cancel := context.WithTimeout(ctx, time.Duration(secs)*c.second())
+// within is do, given wait of the client's seconds (the wait the request asks the daemon for) and
+// the client's patience to answer.
+func (c *hostClient) within(ctx context.Context, wait int, method, path string, body, out any) error {
+	ctx, cancel := context.WithTimeout(ctx, time.Duration(wait)*c.second()+c.patience())
 	defer cancel()
 	return c.do(ctx, method, path, body, out)
 }
 
 // await reads the journal's entries after f.after, waiting up to wait seconds for one, and
-// requestMargin more for the answer. A context that ended is its error, whatever the request's.
+// the client's patience more for the answer. A context that ended is its error, whatever the
+// request's.
 func (c *hostClient) await(ctx context.Context, f *jobEvents, wait int) error {
 	var a EventsAnswer
-	if err := c.within(ctx, wait+requestMargin, http.MethodGet, fmt.Sprintf("/v1/events?after=%d&wait=%d", f.after, wait), nil, &a); err != nil {
+	if err := c.within(ctx, wait, http.MethodGet, fmt.Sprintf("/v1/events?after=%d&wait=%d", f.after, wait), nil, &a); err != nil {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
@@ -937,7 +947,7 @@ func (c *hostClient) readOn(ctx context.Context, f *jobEvents) {
 // way (the daemon stopping for the reboot the job scheduled), or when another job took its place;
 // a job.lost read likewise answers the loss. A 202 without
 // the journal's number is followed by the job's log alone, which the follow says. A context that
-// ends is never the job's end (stopped). Every request is bounded (requestMargin).
+// ends is never the job's end (stopped). Every request is bounded (its wait and the client's patience).
 func (c *hostClient) followJob(ctx context.Context, w io.Writer, started JobStarted) (JobStatus, error) {
 	f := &jobEvents{started: started}
 	if started.Events == nil {
@@ -949,7 +959,7 @@ func (c *hostClient) followJob(ctx context.Context, w io.Writer, started JobStar
 	}
 	for {
 		var j JobStatus
-		if err := c.within(ctx, requestMargin, http.MethodGet, "/v1/job?since="+strconv.Itoa(f.since), nil, &j); err != nil {
+		if err := c.within(ctx, 0, http.MethodGet, "/v1/job?since="+strconv.Itoa(f.since), nil, &j); err != nil {
 			if ctx.Err() != nil {
 				return c.stopped(ctx, w, f, started.Job+" ended")
 			}

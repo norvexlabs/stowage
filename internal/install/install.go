@@ -125,6 +125,8 @@ type Options struct {
 	// Tune is the host tune reads and changes (`tune`, the containers' network settings, the
 	// hint after a start); nil tunes nothing.
 	Tune *tune.System
+	// TunedAtBoot: the host tunes itself at each boot (a VM), so `tune` only reports.
+	TunedAtBoot bool
 	// SourceAddr is the address this machine reaches dst from; nil asks the system's routes.
 	// LookupIP resolves a host name; nil is the system's resolver.
 	SourceAddr func(dst netip.Addr) (netip.Addr, error)

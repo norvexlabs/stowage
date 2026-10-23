@@ -19,6 +19,8 @@ var MinDockerNetworkOpts = [3]int{24, 0, 0}
 // TuneOptions is a run of `tune`: a report without a flag.
 type TuneOptions struct {
 	Check, Print, Apply, Revert, RestartDocker bool
+	// Profile is the rules' profile; "" is the one the last apply recorded, else shared.
+	Profile tune.Profile
 }
 
 // tuneSystem is the host's tune.System with its Docker engine read; on an error, the engine is
@@ -63,7 +65,7 @@ func (in *Installer) containerSysctls(ctx context.Context) (map[string]string, e
 	if err != nil {
 		return nil, fmt.Errorf("the containers' network settings: %w", err)
 	}
-	h, err := tune.ReadHost(sys.Root)
+	h, err := sys.Host()
 	if err != nil {
 		return nil, fmt.Errorf("the containers' network settings: %w", err)
 	}
@@ -76,6 +78,9 @@ func (in *Installer) Tune(ctx context.Context, t TuneOptions) error {
 	if in.O.Tune == nil {
 		return errors.New("tune: no host to tune")
 	}
+	if in.O.TunedAtBoot && (t.Print || t.Apply || t.Revert) {
+		return fmt.Errorf("this VM tunes itself at each boot, before its network and Docker start: `%s tune` reports, --check checks", in.R.Ctl())
+	}
 	// Only the daemon's file needs the engine: without one it is left out (a revert reads what
 	// the apply recorded), so a host whose engine does not start, or that the user's CLI does not
 	// reach, is still tuned and reverted.
@@ -86,9 +91,17 @@ func (in *Installer) Tune(ctx context.Context, t TuneOptions) error {
 			in.O.logf("note: %v: the Docker daemon's file is left out", err)
 		}
 	}
-	h, err := tune.ReadHost(sys.Root)
+	if t.Profile != "" {
+		sys.Profile = t.Profile
+	}
+	h, err := sys.Host()
 	if err != nil {
 		return err
+	}
+	if !t.Revert {
+		if err := sys.CheckProfile(h); err != nil {
+			return err
+		}
 	}
 	ctl := in.R.Ctl()
 	switch {
@@ -125,7 +138,7 @@ func (in *Installer) Tune(ctx context.Context, t TuneOptions) error {
 			}
 			return nil
 		}
-		fmt.Fprintf(in.O.Out, "this host: %d MiB, %d CPUs\n", h.MemBytes>>20, h.CPUs)
+		fmt.Fprintf(in.O.Out, "this host: %d MiB, %d CPUs, the %s profile\n", h.MemBytes>>20, h.CPUs, h.Profile)
 		p.Describe(in.O.Out, sys.Root)
 		if !p.Changes() {
 			fmt.Fprintln(in.O.Out, "the files hold these values already: the running host is set from them")
@@ -142,7 +155,7 @@ func (in *Installer) Tune(ctx context.Context, t TuneOptions) error {
 		return nil
 	}
 	items := sys.Inspect(ctx, h)
-	fmt.Fprintf(in.O.Out, "this host: %d MiB, %d CPUs\n", h.MemBytes>>20, h.CPUs)
+	fmt.Fprintf(in.O.Out, "this host: %d MiB, %d CPUs, the %s profile\n", h.MemBytes>>20, h.CPUs, h.Profile)
 	if err := tune.Print(in.O.Out, items); err != nil {
 		return err
 	}
@@ -151,7 +164,12 @@ func (in *Installer) Tune(ctx context.Context, t TuneOptions) error {
 		fmt.Fprintln(in.O.Out, "nothing differs")
 		return nil
 	}
-	fmt.Fprintf(in.O.Out, "%d settings differ: `%s tune --apply` (as root) writes and applies them, `%s tune --print` prints the files\n", n, ctl, ctl)
+	if in.O.TunedAtBoot {
+		name := in.R.Spec.Name
+		fmt.Fprintf(in.O.Out, "%d settings differ: the boot tunes this VM, and a reboot tunes it again; `sudo journalctl -b -u %s-tune -u %s-tune-online` says what it could not set\n", n, name, name)
+	} else {
+		fmt.Fprintf(in.O.Out, "%d settings differ: `%s tune --apply` (as root) writes and applies them, `%s tune --print` prints the files\n", n, ctl, ctl)
+	}
 	if t.Check {
 		return fmt.Errorf("%d settings differ", n)
 	}
@@ -201,7 +219,7 @@ func (in *Installer) tuneHint(ctx context.Context) {
 	if err != nil {
 		return
 	}
-	h, err := tune.ReadHost(sys.Root)
+	h, err := sys.Host()
 	if err != nil {
 		return
 	}
@@ -210,9 +228,9 @@ func (in *Installer) tuneHint(ctx context.Context) {
 	}
 }
 
-// hostTune is the machine's tune.System.
-func hostTune(ctl string, run func(ctx context.Context, name string, args ...string) ([]byte, error), look func(string) (string, error)) *tune.System {
-	return &tune.System{Root: "/", Run: run, Look: look, Euid: os.Geteuid, Ctl: ctl}
+// hostTune is the machine's tune.System, of profile ("" is the last apply's).
+func hostTune(ctl string, run func(ctx context.Context, name string, args ...string) ([]byte, error), look func(string) (string, error), profile tune.Profile) *tune.System {
+	return &tune.System{Root: "/", Run: run, Look: look, Euid: os.Geteuid, Ctl: ctl, Profile: profile}
 }
 
 // runHost runs a host program, its error carrying what it wrote to stderr.
@@ -224,10 +242,11 @@ func runHost(ctx context.Context, name string, args ...string) ([]byte, error) {
 	return out, err
 }
 
-// tuneCommand is `tune`.
-func tuneCommand(in *Installer, prepare func() error, terminal func(bool) Prompter) *cobra.Command {
+// tuneCommand is `tune`; on a VM, which tunes itself at each boot, the report and --check alone.
+func tuneCommand(in *Installer, prepare func() error, terminal func(bool) Prompter, vm bool) *cobra.Command {
 	var t TuneOptions
 	var noInput, accessible, yes bool
+	var profile string
 	cmd := &cobra.Command{
 		Use:   "tune",
 		Short: "Report how this host's network settings differ from what its RAM and CPUs call for; --apply writes and applies them",
@@ -235,6 +254,13 @@ func tuneCommand(in *Installer, prepare func() error, terminal func(bool) Prompt
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if err := prepare(); err != nil {
 				return err
+			}
+			if cmd.Flags().Changed("profile") {
+				p, err := tune.ParseProfile(profile)
+				if err != nil {
+					return fmt.Errorf("--profile: %w", err)
+				}
+				t.Profile = p
 			}
 			in.O.Yes = yes
 			if !noInput && (t.Apply || t.Revert) {
@@ -245,9 +271,14 @@ func tuneCommand(in *Installer, prepare func() error, terminal func(bool) Prompt
 	}
 	f := cmd.Flags()
 	f.BoolVar(&t.Check, "check", false, "report, and exit non-zero when a setting differs")
+	if vm {
+		cmd.Short = "Report how this VM's network settings differ from what its RAM and CPUs call for (it tunes itself at each boot)"
+		return cmd
+	}
 	f.BoolVar(&t.Print, "print", false, "print the files --apply writes, for a host configured by other means")
 	f.BoolVar(&t.Apply, "apply", false, "write the files and apply them to the running host (root; asks first)")
 	f.BoolVar(&t.Revert, "revert", false, "remove the files and put back what the first --apply found (root; asks first)")
+	f.StringVar(&profile, "profile", "", "shared (a host the admin runs other processes on) or network (a host that runs the stack alone: larger ceilings, NIC rings, flow steering); default: the last --apply's, else shared")
 	f.BoolVar(&t.RestartDocker, "restart-docker", false, "--apply, --revert: restart Docker when its daemon file changed (its containers restart with it)")
 	f.BoolVarP(&yes, "yes", "y", false, "--apply, --revert: change the host without asking")
 	f.BoolVar(&noInput, "no-input", false, "never ask: without --yes, refuse")

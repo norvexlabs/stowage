@@ -623,7 +623,7 @@ func (h *Hostd) events(w http.ResponseWriter, r *http.Request) {
 // events prints the journal's entries after after; following, it then waits for more until ctx
 // ends. Following, a daemon that cannot be reached (it restarts) is asked
 // again from the same number, after a wait that doubles from one unit to thirty. Every request is
-// bounded by its wait and requestMargin: a daemon that takes one and never answers is one that
+// bounded by its wait and the client's patience: a daemon that takes one and never answers is one that
 // cannot be reached.
 func (c *hostClient) events(ctx context.Context, errw io.Writer, after int64, follow, asJSON bool) error {
 	backoff := time.Duration(0)
@@ -633,7 +633,7 @@ func (c *hostClient) events(ctx context.Context, errw io.Writer, after int64, fo
 			wait = maxEventsWait
 		}
 		var a EventsAnswer
-		if err := c.within(ctx, wait+requestMargin, http.MethodGet, fmt.Sprintf("/v1/events?after=%d&wait=%d", after, wait), nil, &a); err != nil {
+		if err := c.within(ctx, wait, http.MethodGet, fmt.Sprintf("/v1/events?after=%d&wait=%d", after, wait), nil, &a); err != nil {
 			if follow && ctx.Err() != nil {
 				return nil
 			}

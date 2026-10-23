@@ -23,6 +23,9 @@ const (
 	ModulesFile = "etc/modules-load.d/60-stowage-net.conf"
 	UdevFile    = "etc/udev/rules.d/60-stowage-net.rules"
 	DaemonFile  = "etc/docker/daemon.json"
+	// BootUdevFile is the udev rule Boot writes: the runtime's, gone at the next boot, which writes
+	// it again.
+	BootUdevFile = "run/udev/rules.d/60-stowage-net.rules"
 	// StateFile records what the first apply replaced, for `--revert`.
 	StateFile = "etc/stowage/tune.json"
 )
@@ -35,9 +38,12 @@ type daemonWant struct {
 	ok    func(have json.RawMessage) bool
 	// flag is dockerd's flag for the key: a daemon given both refuses to start.
 	flag string
+	// leave, given the daemon's file and dockerd's flags, says why the key is the admin's to
+	// keep; "" sets it.
+	leave func(raw []byte, args map[string]string) string
 }
 
-func (s System) daemonWants() []daemonWant {
+func (s System) daemonWants(h Host) []daemonWant {
 	w := []daemonWant{{
 		path:  []string{"default-ulimits", "nofile"},
 		value: map[string]any{"Name": "nofile", "Soft": NofileLimit, "Hard": NofileLimit},
@@ -58,8 +64,41 @@ func (s System) daemonWants() []daemonWant {
 			ok:    func(have json.RawMessage) bool { return string(have) == strconv.Quote(v) },
 		})
 	}
+	if h.network() {
+		// The host runs the stack alone, and its logs share its disk: the default driver's files
+		// rotate. json-file's own options, so a service's logging options keep working.
+		w = append(w, daemonWant{
+			path:  []string{"log-opts"},
+			value: map[string]any{"max-size": LogMaxSize, "max-file": LogMaxFiles},
+			show:  fmt.Sprintf("max-size %s, max-file %s (json-file's rotation, for the containers made from then on)", LogMaxSize, LogMaxFiles),
+			flag:  "--log-opt",
+			ok: func(have json.RawMessage) bool {
+				var o map[string]string
+				return json.Unmarshal(have, &o) == nil && o["max-size"] != "" && o["max-file"] != ""
+			},
+			// A driver or options the file names are the admin's: theirs to rotate.
+			leave: func(raw []byte, args map[string]string) string {
+				if driver, ok, _ := daemonValue(raw, []string{"log-driver"}); ok && string(driver) != `"json-file"` {
+					return "the daemon's file chooses " + string(driver)
+				}
+				if d := args["--log-driver"]; d != "" && d != "json-file" {
+					return "dockerd runs with --log-driver " + d
+				}
+				if have, ok, _ := daemonValue(raw, []string{"log-opts"}); ok {
+					return "the daemon's file has log options of its own: " + string(have)
+				}
+				return ""
+			},
+		})
+	}
 	return w
 }
+
+// The default log driver's rotation on the network profile.
+const (
+	LogMaxSize  = "20m"
+	LogMaxFiles = "5"
+)
 
 // File is one file a plan writes.
 type File struct {
@@ -93,6 +132,28 @@ type state struct {
 	// one changed since is the host's own.
 	Wrote  map[string]string `json:"wrote"`
 	Daemon []daemonRecord    `json:"daemon"`
+	// Profile is the last apply's: the report and the containers' settings follow it.
+	Profile Profile `json:"profile,omitempty"`
+}
+
+// checkProfile refuses h's profile on a host the last apply tuned with the network one: the
+// network profile's own keys (the log rotation, the softirq budget, the steering) are not the
+// shared one's, which would neither judge, keep nor revert them.
+func (st *state) checkProfile(ctl string, h Host) error {
+	if st.Profile == Network && !h.network() {
+		return fmt.Errorf("this host was tuned with --profile network: `%s tune --revert` first, then `%s tune --apply --profile %s`", ctl, ctl, h.Profile)
+	}
+	return nil
+}
+
+// CheckProfile refuses a report, a plan or an apply of h's profile on a host tuned with another
+// that it would misjudge.
+func (s System) CheckProfile(h Host) error {
+	st, err := s.readState()
+	if err != nil {
+		return nil // the report shows the state as unreadable; a plan refuses it
+	}
+	return st.checkProfile(s.Ctl, h)
 }
 
 // base is what c is judged against: the value the host held before the first apply while the
@@ -130,6 +191,9 @@ func (s System) Plan(h Host) (*Plan, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := st.checkProfile(s.Ctl, h); err != nil {
+		return nil, err
+	}
 	p := &Plan{Host: h}
 	var b strings.Builder
 	b.WriteString(s.header(h))
@@ -156,9 +220,15 @@ func (s System) Plan(h Host) (*Plan, error) {
 		b.WriteString("# A NIC keeps forwarded UDP (QUIC, tunnels, traffic to containers) batched.\n")
 		fmt.Fprintf(&b, "ACTION==\"add\", SUBSYSTEM==\"net\", DEVPATH!=\"/devices/virtual/*\", RUN+=\"%s -K $name rx-udp-gro-forwarding on rx-gro-list off\"\n", eth)
 	}
+	// A receive queue has a uevent of its own, after its NIC's (whose may come before the queues
+	// exist), and again when a NIC's channels change: queue settings are set on it.
+	if h.network() {
+		b.WriteString("# A NIC's receive queue: its share of the flows steered to the CPU that reads them.\n")
+		fmt.Fprintf(&b, "ACTION==\"add\", SUBSYSTEM==\"queues\", KERNEL==\"rx-*\", DEVPATH!=\"/devices/virtual/*\", ATTR{rps_flow_cnt}=\"%d\"\n", h.QueueFlows())
+	}
 	b.WriteString("# A TUN or TAP device made on the host: a longer queue, its packets spread over every CPU.\n")
-	fmt.Fprintf(&b, "ACTION==\"add\", SUBSYSTEM==\"net\", TEST==\"tun_flags\", ATTR{tx_queue_len}=\"%d\", ATTR{queues/rx-0/rps_cpus}=\"%s\", ATTR{queues/rx-0/rps_flow_cnt}=\"%d\"\n",
-		h.TunQueueLen(), h.RPSMask(), h.FlowEntries())
+	fmt.Fprintf(&b, "ACTION==\"add\", SUBSYSTEM==\"net\", TEST==\"tun_flags\", ATTR{tx_queue_len}=\"%d\"\n", h.TunQueueLen())
+	fmt.Fprintf(&b, "ACTION==\"add\", SUBSYSTEM==\"queues\", KERNEL==\"rx-*\", TEST==\"../../tun_flags\", ATTR{rps_cpus}=\"%s\", ATTR{rps_flow_cnt}=\"%d\"\n", h.RPSMask(), h.FlowEntries())
 	files[UdevFile] = b.String()
 	for _, name := range []string{SysctlFile, ModulesFile, UdevFile} {
 		f := File{Path: name, Content: []byte(files[name])}
@@ -191,7 +261,7 @@ func (s System) planDaemon(p *Plan) error {
 		}
 	}
 	args := s.dockerdArgs()
-	for _, w := range s.daemonWants() {
+	for _, w := range s.daemonWants(p.Host) {
 		have, ok, _ := daemonValue(old, w.path)
 		if ok && w.ok(have) {
 			continue
@@ -199,6 +269,12 @@ func (s System) planDaemon(p *Plan) error {
 		if args[w.flag] != "" {
 			p.Notes = append(p.Notes, fmt.Sprintf("%s is left out: dockerd runs with %s, and refuses to start when its file repeats one", strings.Join(w.path, "."), w.flag))
 			continue
+		}
+		if w.leave != nil {
+			if why := w.leave(old, args); why != "" {
+				p.Notes = append(p.Notes, fmt.Sprintf("%s is left out: %s", strings.Join(w.path, "."), why))
+				continue
+			}
 		}
 		after, err := json.Marshal(w.value)
 		if err != nil {
@@ -344,8 +420,6 @@ func (s System) root() error {
 
 // ApplyOptions are how an apply runs.
 type ApplyOptions struct {
-	// Boot: the apply runs before Docker starts, which then reads its file as written.
-	Boot bool
 	// RestartDocker restarts the engine when its file changed, which restarts the containers.
 	RestartDocker bool
 }
@@ -374,6 +448,7 @@ func (s System) Apply(ctx context.Context, p *Plan, o ApplyOptions) ([]string, e
 	for _, kv := range p.values {
 		st.Wrote[kv[0]] = kv[1]
 	}
+	st.Profile = p.Host.Profile
 	for _, r := range p.records {
 		i := slices.IndexFunc(st.Daemon, func(o daemonRecord) bool { return o.File == r.File && slices.Equal(o.Path, r.Path) })
 		if i < 0 {
@@ -403,7 +478,7 @@ func (s System) Apply(ctx context.Context, p *Plan, o ApplyOptions) ([]string, e
 	}
 	notes = append(notes, s.live(ctx, p)...)
 	switch {
-	case p.Daemon == nil || o.Boot:
+	case p.Daemon == nil:
 	case o.RestartDocker:
 		if _, err := s.Run(ctx, "systemctl", "restart", "docker"); err != nil {
 			notes = append(notes, fmt.Sprintf("restarting Docker: %v", err))
@@ -439,11 +514,24 @@ func (s System) live(ctx context.Context, p *Plan) []string {
 		}
 	}
 	all := s.nics()
-	if eth, err := s.Look("ethtool"); err == nil {
-		for _, n := range all {
-			if n.physical {
-				if _, err := s.Run(ctx, eth, "-K", n.name, "rx-udp-gro-forwarding", "on", "rx-gro-list", "off"); err != nil {
-					notes = append(notes, fmt.Sprintf("ethtool -K %s: %v", n.name, err))
+	eth, lookErr := s.Look("ethtool")
+	for _, n := range all {
+		if !n.physical {
+			continue
+		}
+		if lookErr == nil {
+			if _, err := s.Run(ctx, eth, "-K", n.name, "rx-udp-gro-forwarding", "on", "rx-gro-list", "off"); err != nil {
+				notes = append(notes, fmt.Sprintf("ethtool -K %s: %v", n.name, err))
+			}
+			notes = append(notes, s.growRing(ctx, h, eth, n)...)
+		}
+		if q := h.QueueFlows(); q > 0 {
+			for i := range n.queues {
+				f := filepath.Join("sys/class/net", n.name, "queues", fmt.Sprintf("rx-%d", i), "rps_flow_cnt")
+				if cur, _ := s.read(f); !atLeast(cur, q) {
+					if err := os.WriteFile(s.path(f), []byte(nums(q)+"\n"), 0o644); err != nil {
+						notes = append(notes, fmt.Sprintf("%s rx-%d rps_flow_cnt: %v", n.name, i, err))
+					}
 				}
 			}
 		}
@@ -464,6 +552,83 @@ func (s System) live(ctx context.Context, p *Plan) []string {
 		}
 	}
 	return notes
+}
+
+// linkUp reports whether the interface is administratively up (IFF_UP), whatever its driver
+// says of its operational state; one whose flags do not read is taken as up.
+func linkUp(s System, name string) bool {
+	v, ok := s.read(filepath.Join("sys/class/net", name, "flags"))
+	if !ok {
+		return true
+	}
+	f, err := strconv.ParseUint(strings.TrimPrefix(v, "0x"), 16, 64)
+	return err != nil || f&1 == 1
+}
+
+// growRing gives a NIC the ring the network profile wants, when it is larger than the NIC's.
+func (s System) growRing(ctx context.Context, h Host, eth string, n nic) []string {
+	if !h.network() {
+		return nil
+	}
+	// A resize resets the link: only a link not yet up is resized (the VM's boot, before its
+	// network); the report gives an up one as advice.
+	if linkUp(s, n.name) {
+		return nil
+	}
+	r, err := s.ethtoolRings(ctx, eth, n.name)
+	if err != nil {
+		return nil
+	}
+	var args []string
+	if w := h.ringWant(n, r.rx, r.maxRX); w > 0 {
+		args = append(args, "rx", nums(w))
+	}
+	if w := h.ringWant(n, r.tx, r.maxTX); w > 0 {
+		args = append(args, "tx", nums(w))
+	}
+	if len(args) == 0 {
+		return nil
+	}
+	if _, err := s.Run(ctx, eth, append([]string{"-G", n.name}, args...)...); err != nil {
+		return []string{fmt.Sprintf("ethtool -G %s: %v", n.name, err)}
+	}
+	return nil
+}
+
+// Boot tunes a host Stowage owns at each boot, before its network and Docker start: the modules,
+// the settings from what the kernel holds now (so a resized VM is tuned for its new RAM), a
+// runtime udev rule, the daemon file's keys and the NICs and TUN devices already there. It writes
+// no file that outlives the boot and no state: the next boot computes it all again.
+func (s System) Boot(ctx context.Context, h Host) ([]string, error) {
+	if err := s.root(); err != nil {
+		return nil, err
+	}
+	notes := s.loadModules(ctx)
+	// A daemon file that does not merge leaves Docker as it is, not the rest of the boot's tuning.
+	p, err := s.Plan(h)
+	if p == nil {
+		return notes, err
+	}
+	if err != nil {
+		notes = append(notes, fmt.Sprintf("Docker's file is left as it is: %v", err))
+	}
+	for _, f := range p.Files {
+		if f.Path == UdevFile {
+			if err := s.writeFile(BootUdevFile, f.Content, 0o644); err != nil {
+				return notes, err
+			}
+		}
+	}
+	if _, err := s.Run(ctx, "udevadm", "control", "--reload"); err != nil {
+		notes = append(notes, fmt.Sprintf("udevadm control --reload: %v", err))
+	}
+	if p.Daemon != nil {
+		if err := s.writeFile(p.Daemon.Path, p.Daemon.Content, 0o644); err != nil {
+			return notes, err
+		}
+	}
+	notes = append(notes, p.Notes...)
+	return append(notes, s.live(ctx, p)...), nil
 }
 
 // Revert removes the files, puts back the daemon keys still holding what tune set and the
@@ -512,7 +677,7 @@ func (s System) Revert(ctx context.Context, restartDocker bool) ([]string, error
 			notes = append(notes, fmt.Sprintf("%s: %v", k, err))
 		}
 	}
-	notes = append(notes, "the NICs' offload and the TUN devices' queues stay as they are until the next boot")
+	notes = append(notes, "the NICs' offload and flow steering and the TUN devices' queues stay as they are until the next boot")
 	if err := os.Remove(s.path(StateFile)); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return nil, err
 	}

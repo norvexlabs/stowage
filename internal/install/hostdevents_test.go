@@ -802,7 +802,7 @@ func TestFollowingEventsOutlivesTheDaemon(t *testing.T) {
 	})
 	sock := servedHandler(t, mux)
 	var out, errb bytes.Buffer
-	c := &hostClient{http: socketClient(&sock), out: &out, unit: time.Millisecond}
+	c := &hostClient{http: socketClient(&sock), out: &out, clientTimes: clientTimes{unit: time.Millisecond}}
 	if err := c.events(ctx, &errb, 0, true, false); err != nil {
 		t.Fatal(err)
 	}
@@ -820,7 +820,7 @@ func TestFollowingEventsOutlivesTheDaemon(t *testing.T) {
 }
 
 // Following, a daemon that takes a request and never answers is one that cannot be reached: the
-// request's deadline (its wait and requestMargin) ends it, and the next asks from the same number.
+// request's deadline (its wait and the client's patience) ends it, and the next asks from the same number.
 func TestFollowingEventsBoundsEachRequest(t *testing.T) {
 	t.Parallel()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -845,7 +845,7 @@ func TestFollowingEventsBoundsEachRequest(t *testing.T) {
 	})
 	sock := servedHandler(t, mux)
 	var out, errb bytes.Buffer
-	c := &hostClient{http: socketClient(&sock), out: &out, unit: time.Millisecond}
+	c := &hostClient{http: socketClient(&sock), out: &out, clientTimes: clientTimes{unit: time.Millisecond, margin: time.Second}}
 	if _, err := bounded(t, func() (string, error) { return "", c.events(ctx, &errb, 0, true, false) }); err != nil {
 		t.Fatal(err)
 	}

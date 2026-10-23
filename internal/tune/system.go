@@ -26,6 +26,24 @@ type System struct {
 	Ctl  string // the command that writes the files, named in their headers
 	// Docker is the host's engine; nil leaves its daemon file out.
 	Docker *Docker
+	// Profile is the rules' profile; "" is the one the last apply recorded, else Shared.
+	Profile Profile
+}
+
+// Host reads the machine (ReadHost) with the system's profile.
+func (s System) Host() (Host, error) {
+	h, err := ReadHost(s.Root)
+	if err != nil {
+		return h, err
+	}
+	h.Profile = s.Profile
+	if h.Profile == "" {
+		h.Profile = Shared
+		if st, err := s.readState(); err == nil && st.Profile != "" {
+			h.Profile = st.Profile
+		}
+	}
+	return h, nil
 }
 
 // Docker is what tune needs of the host's engine.
@@ -161,6 +179,52 @@ func (s System) ethtoolFeatures(ctx context.Context, eth, dev string) (map[strin
 	return f, nil
 }
 
+// ring is a NIC's receive and transmit ring: its driver's maximum and its current size.
+type ring struct{ maxRX, maxTX, rx, tx uint64 }
+
+// ethtoolRings reads `ethtool -g dev`.
+func (s System) ethtoolRings(ctx context.Context, eth, dev string) (ring, error) {
+	out, err := s.Run(ctx, eth, "-g", dev)
+	if err != nil {
+		return ring{}, err
+	}
+	var r ring
+	var rx, tx *uint64
+	sc := bufio.NewScanner(bytes.NewReader(out))
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		switch {
+		case strings.HasPrefix(line, "Pre-set maximums"):
+			rx, tx = &r.maxRX, &r.maxTX
+		case strings.HasPrefix(line, "Current hardware settings"):
+			rx, tx = &r.rx, &r.tx
+		}
+		k, v, ok := strings.Cut(line, ":")
+		if !ok || rx == nil {
+			continue
+		}
+		n, err := strconv.ParseUint(strings.TrimSpace(v), 10, 64)
+		if err != nil {
+			continue
+		}
+		switch k {
+		case "RX":
+			*rx = n
+		case "TX":
+			*tx = n
+		}
+	}
+	return r, nil
+}
+
+// ringWant is the ring size an apply gives dev; 0 leaves it. It never shrinks a ring.
+func (h Host) ringWant(n nic, have, driverMax uint64) uint64 {
+	if w := h.RingEntries(n.queues, driverMax); w > have {
+		return w
+	}
+	return 0
+}
+
 // emulated are the drivers of NICs a hypervisor emulates, the slowest it offers.
 var emulated = []string{"e1000", "e1000e", "8139cp", "8139too", "pcnet32", "ne2k-pci", "tulip"}
 
@@ -245,6 +309,15 @@ func (s System) Inspect(ctx context.Context, h Host) []Item {
 		} else {
 			items = append(items, Item{verdict(v == "on"), "nic", n.name + " " + gro, v, "on"})
 		}
+		if h.network() && lookErr == nil {
+			items = append(items, s.inspectRing(ctx, h, eth, n))
+		}
+		if q := h.QueueFlows(); q > 0 {
+			for i := range n.queues {
+				flows, _ := s.read(filepath.Join("sys/class/net", n.name, "queues", fmt.Sprintf("rx-%d", i), "rps_flow_cnt"))
+				items = append(items, Item{verdict(atLeast(flows, q)), "nic", fmt.Sprintf("%s rx-%d rps_flow_cnt", n.name, i), flows, AtLeast.render(nums(q))})
+			}
+		}
 		if a := s.advice(n, all, h.CPUs); a != "" {
 			items = append(items, Item{Advice, "nic", n.name + " " + cmp.Or(n.driver, "driver"), a, ""})
 		}
@@ -274,18 +347,49 @@ func (s System) Inspect(ctx context.Context, h Host) []Item {
 		return append(items, Item{Differs, "docker", daemon, "unreadable: " + err.Error(), ""})
 	}
 	args := s.dockerdArgs()
-	for _, d := range s.daemonWants() {
+	for _, d := range s.daemonWants(h) {
 		have, ok, err := daemonValue(raw, d.path)
+		why := leave(d, raw, args)
 		switch {
 		case d.flag != "" && args[d.flag] != "":
 			items = append(items, Item{NA, "docker", strings.Join(d.path, "."), "dockerd runs with " + d.flag + ", which the file may not repeat", ""})
 		case err != nil:
 			items = append(items, Item{Differs, "docker", strings.Join(d.path, "."), "unreadable: " + err.Error(), d.show})
+		case !(ok && d.ok(have)) && why != "":
+			items = append(items, Item{NA, "docker", strings.Join(d.path, "."), why, ""})
 		default:
 			items = append(items, Item{verdict(ok && d.ok(have)), "docker", strings.Join(d.path, "."), cmp.Or(string(have), "absent"), d.show})
 		}
 	}
 	return items
+}
+
+// inspectRing judges a NIC's rings against what the network profile gives it.
+func (s System) inspectRing(ctx context.Context, h Host, eth string, n nic) Item {
+	name := n.name + " rings"
+	r, err := s.ethtoolRings(ctx, eth, n.name)
+	if err != nil {
+		return Item{NA, "nic", name, "ethtool -g: " + err.Error(), ""}
+	}
+	rx, tx := h.RingEntries(n.queues, r.maxRX), h.RingEntries(n.queues, r.maxTX)
+	if rx == 0 && tx == 0 {
+		return Item{NA, "nic", name, fmt.Sprintf("rx %d tx %d: the driver offers no larger ring", r.rx, r.tx), ""}
+	}
+	have, want := fmt.Sprintf("rx %d tx %d", r.rx, r.tx), fmt.Sprintf("rx ≥ %d tx ≥ %d", rx, tx)
+	if r.rx >= rx && r.tx >= tx {
+		return Item{OK, "nic", name, have, want}
+	}
+	// A resize resets the link: the Stowage VM grows a ring at its boot, before its network; on a
+	// running host it is the admin's to do. Some drivers also refuse a ring they list: never drift.
+	return Item{Advice, "nic", name, fmt.Sprintf("%s: a resize resets the link, so it grows at a boot before the network, or by `ethtool -G %s rx %d tx %d` while the link is down", have, n.name, max(rx, r.rx), max(tx, r.tx)), want}
+}
+
+// leave is why d is the admin's to keep; "" when it is not.
+func leave(d daemonWant, raw []byte, args map[string]string) string {
+	if d.leave == nil {
+		return ""
+	}
+	return d.leave(raw, args)
 }
 
 func atLeast(cur string, want uint64) bool {
@@ -351,7 +455,9 @@ func daemonValue(raw []byte, path []string) (json.RawMessage, bool, error) {
 }
 
 // Container is h's container settings that the host's kernel has, a container's namespace having
-// the same keys from Linux 4.15 on: one it lacked would fail the container's start. None on an
+// the same keys from Linux 4.15 on: one it lacked would fail the container's start. A ceiling the
+// host holds higher is kept, field by field, as a namespace copies the host's buffer sizes and a
+// kernel may size them above ours. None on an
 // older kernel, on an engine whose containers are in a user namespace of their own (rootless,
 // userns-remap: their namespace hides keys) or in Docker Desktop's VM, or when the engine is not
 // known.
@@ -360,9 +466,14 @@ func (s System) Container(h Host) map[string]string {
 		return nil
 	}
 	out := h.Container()
-	for k := range out {
-		if !s.exists(Sysctl{Key: k}.Path()) {
-			delete(out, k)
+	for _, c := range h.Sysctls() {
+		if _, ok := out[c.Key]; !ok {
+			continue
+		}
+		if cur, ok := s.read(c.Path()); !ok {
+			delete(out, c.Key)
+		} else {
+			out[c.Key] = c.Value(strings.Join(strings.Fields(cur), " "))
 		}
 	}
 	return out

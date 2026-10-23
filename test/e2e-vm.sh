@@ -120,6 +120,21 @@ for a in "${HOST6[@]}"; do
 done
 [[ $(on_vm readlink /etc/localtime) == */Europe/Paris && $(on_vm date +%Z) =~ ^CES?T$ ]] || fail "the VM is not in Europe/Paris's time zone"
 
+step "on the VM: the boot tuned the network for its RAM (the network profile), and the containers with it"
+on_vm systemctl is-active notes-tune.service >/dev/null || { on_vm sudo journalctl -b -u notes-tune.service --no-pager | tail -30; fail "the tuning unit did not run"; }
+[[ $(on_vm cat /proc/sys/net/ipv4/tcp_congestion_control) == bbr && $(on_vm cat /proc/sys/net/core/default_qdisc) == fq ]] || fail "the boot did not set BBR and fq"
+(($(on_vm cat /proc/sys/net/core/rmem_max) >= 16777216 && $(on_vm cat /proc/sys/net/core/netdev_budget) >= 600)) || {
+	on_vm sudo sysctl net.core.rmem_max net.core.netdev_budget
+	on_vm sudo journalctl -b -u notes-tune.service -u notes-tune-online.service --no-pager | tail -30
+	fail "the boot did not give the network profile's ceilings"
+}
+on_vm notes-stow tune --check >"$WORK/tune.txt" 2>&1 || { cat "$WORK/tune.txt"; fail "the VM's tune --check finds settings that differ"; }
+grep -q '^this host: .* the network profile$' "$WORK/tune.txt" || { cat "$WORK/tune.txt"; fail "the VM's tune does not report the network profile"; }
+on_vm test ! -e /etc/sysctl.d/60-stowage-net.conf || fail "the boot wrote a sysctl file"
+tuned=$(on_vm sudo docker ps -q --filter label=com.docker.compose.service=api)
+[[ $(on_vm sudo docker exec "$tuned" cat /proc/sys/net/ipv4/tcp_rmem | awk '{print $3}') -ge 16777216 ]] || fail "the api container's TCP buffers are not the VM's"
+on_vm sudo docker inspect --format "'{{json .HostConfig.LogConfig}}'" "$tuned" | grep -q '"max-size":"20m"' || fail "the api container's logs do not rotate"
+
 step "on the VM: the L4 route's port, open to its allowlist's sources alone (this host, over IPv4)"
 # reach <address> <port>: a TCP connection opens within 8 s.
 reach() { python3 -c 'import socket, sys; socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=8).close()' "$@" 2>/dev/null; }

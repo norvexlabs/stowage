@@ -1,0 +1,13 @@
+[Unit]
+Description={{.Name}}: tune the network again once it is up (its MTU, a NIC probed late), before Docker starts
+After=network-online.target {{.Name}}-tune.service
+Wants=network-online.target
+Before=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/{{.Ctl}} tune-boot
+
+[Install]
+WantedBy=multi-user.target

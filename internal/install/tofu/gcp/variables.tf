@@ -72,3 +72,13 @@ variable "machine_type" {
   type        = string
   default     = "e2-medium"
 }
+
+variable "nic_type" {
+  description = "The instance's NIC: GVNIC (Compute Engine's faster one) or VIRTIO_NET."
+  type        = string
+  default     = "GVNIC"
+  validation {
+    condition     = contains(["GVNIC", "VIRTIO_NET"], var.nic_type)
+    error_message = "nic_type is GVNIC or VIRTIO_NET."
+  }
+}
