@@ -3,7 +3,7 @@
 Stowage's own releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
-## [0.11.0]
+## [0.11.0] - 2026-10-23
 
 ### Added
 - **Client certificates on a route**: `client_auth: true` makes the front require, on that
