@@ -1242,7 +1242,7 @@ every shape, the VM end-to-end test upgrading through it), then the health gate.
   by `ship` from a recipe in `stowage`, like the backup runner, and published only for a release
   that needs it. The front's image could run it, but would tie volume ownership to the front's
   recipe and ship a Caddy with a project that has no front.
-- **Network tuning is a share of RAM, never below the kernel's default, one rule set, applied only where the OS is Stowage's** —
+- **Network tuning is a share of RAM, never below the kernel's default, two profiles of rules, applied only where the OS is Stowage's** —
   the stacks scale on connections, UDP (QUIC through the L4 routes) and tunnels, which the
   kernel's defaults starve (socket buffers below what QUIC asks, forwarded UDP unbatched, a
   1500 MTU bridge on a 1460 or 9001 link). A fixed value is wrong for a 1 GiB VM or a 64 GiB
@@ -1250,51 +1250,79 @@ every shape, the VM end-to-end test upgrading through it), then the health gate.
   never held (the one reserve, `min_free_kbytes`, at most 0.5 %). Tuning for the network only
   raises: every memory value is at least what the kernel computes for that RAM (the socket
   budgets its own formula scaled, the conntrack table and `min_free_kbytes` floored at its
-  sizes), written as a floor even before the module that brings it is loaded. Two profiles of
-  the one rule set: `shared` for a host the admin also runs other things on, `network` for a
-  host that runs the stack alone — larger buffers and budgets, softirq budget, NIC rings and flow
-  steering, the default log driver's rotation (json-file's own options, so a service's
-  logging options keep working). A ring resize resets the link, so only a link not yet up is
-  resized — the VM's first pass, before its network; nothing persistent re-runs it. `internal/tune` holds the rules
-  and is the only place that sizes them: the Docker host's `tune` reports, prints or applies them,
-  the containers get the namespaced ones in `stowage-content.yaml`. A Docker host's OS is the
-  operator's: nothing changes there unless asked, Docker is never restarted unasked (it restarts
-  the containers), a ceiling the host holds higher is kept, and `--revert` puts back what the
-  first apply found — and a ceiling is judged against that record, so a host that shrank is not
-  held at a larger one's values. RAM is read to 64 MiB, so a kernel's few KiB never make another
-  host, and the containers' buffer is a power of two, so only a doubling of RAM rewrites their
-  settings and recreates them; a start whose engine does not answer fails rather than drop them
-  for one start (which would recreate every service twice). What `--apply` cannot change (the NIC's
-  driver, a missing `ethtool`, a key dockerd takes as a flag) is advice or n/a, never drift, so
-  `--check` settles after an apply. A container's own namespace starts from the kernel's defaults, not the
-  host's (but for TCP's buffer sizes, which it copies from the host, so a ceiling the host holds
-  higher, as a newer kernel sizes it from RAM, is kept), so its settings are given per service — only those its kernel has (a missing key would
-  fail its start: none before Linux 4.15, nor in a user namespace of the containers' own), and
-  never a service's own. The files are named for Stowage, not a stack: two
-  stacks on one host write the same values instead of competing. A Kairos VM is Stowage's own and
-  takes the `network` profile at each boot, before networkd, and again once the network is up
-  and before Docker (only then are the MTU and a late NIC known): from the values the
-  kernel computed for this boot's RAM, with no `sysctl.d` file and no state (`/etc` is the
-  boot's), so a resized VM is retuned and nothing stale survives an upgrade; its `tune` only
-  reports. Kairos's own boot stage would set a fixed receive buffer ceiling after both passes, and
-  its stages give no ordering a later unit can wait for: the image drops that line from Kairos's
-  file, and its build fails when the line moves. The hypervisor's part is the VM modules' (a virtio queue per vCPU, gVNIC,
-  accelerated networking), and the image carries the drivers they need, the two cloud NICs'
-  copied from the extra modules rather than its 110 MB. Left out: Docker's userland
-  proxy (turning it off breaks a loopback install on `::1`, and it carries only local
-  traffic), widening the ephemeral port range (it would take ports an L4 route publishes).
-  On Kubernetes the node is the cluster admin's, so the installer never touches it: no
-  privileged pod, no DaemonSet. The node is tuned by the same `tune`, run on it, and the
-  pods get only the namespaced settings whose namespace default is fixed, so no node's size
-  enters them. They are the same on every node, and the chart takes them as one value. The TCP
-  buffer sizes come from the node (a pod's namespace copies them), and so does the SYN queue,
-  sized from the node's memory, which the installer cannot read. A cluster-wide read would be a
-  grant an operator limited to a namespace lacks, and the smallest node is no bound for the
-  others. The kubelet calls those settings unsafe and refuses a pod with one it does not allow,
-  so they are opt-in (`--unsafe-sysctls`), and `k8s tune` prints the kubelet's setting. A report
-  pod is left out: unprivileged, it reads only its own namespace, and reading the node's needs
-  `hostNetwork`, which the baseline Pod Security level refuses. The values are written at
-  install time, as the release's `stowage` block is written at ship before any cluster is known.
+  sizes), written as a floor even before the module that brings it is loaded.
+  Not every stack is a network appliance, so tuning is not forced: a profile is a list of rules
+  in `internal/tune`, and `default` holds only what makes Docker's own path as fast as the
+  host's network — a container running as it would on the host (its namespace at the host's
+  values, which a new namespace otherwise takes at the kernel's defaults; its open files at the
+  host's `fs.nr_open`; its networks at the host route's MTU) and the host parts that path goes
+  through (the NAT's connection table, the forwarding backlog, forwarded UDP batched). `network`
+  is `default` and the rest: larger buffers and budgets, BBR and `fq`, the ports (`tcp_tw_reuse`,
+  a wide local range with the stack's own ports reserved in it, so an outgoing connection never
+  takes a port an L4 route or the front publishes) and neighbours of many connections, softirq
+  budget, NIC rings, interrupts and flow steering, the CPUs at full speed, the default log
+  driver's rotation (json-file's own options, so a service's logging options keep working) — which
+  a Kairos VM keeps on every profile, its logs sharing its disk. The
+  container's part is per stack, in `stowage-content.yaml`, not in the engine's file: the
+  author's profile then needs nothing of the operator, an MTU set on the network the stack makes
+  follows the host at each start (written always, 1500 included, so the daemon's own default
+  never stands in for it; its driver option judged, and a changed one made again, as a network's
+  MTU is set when it is made; a route that does not read that moment keeps the last start's MTU
+  rather than stop the stack twice), and the open files' hard limit is capped at 1048576 and at
+  the host engine's own hard limit (above it, runc's setrlimit fails where the engine may not
+  raise it, as in an unprivileged LXC container), their soft limit at 65536 (a larger one slows
+  programs that walk every descriptor; one that needs more raises it). The project's author knows the
+  load and picks the profile (`tune.profile`); the operator may know better for one host and
+  overrides it (`--tune-profile`, recorded, `release` to follow the release again), without a
+  new release. A VM raised to `network` is tuned at once, as its boot does; lowered, it keeps the
+  higher values until the next reboot, as the VM never records what the kernel held before (its
+  boot computes it all again). A Docker host's `tune` judges the higher of the stack's profile and
+  the last apply's, as the host's settings serve every stack on it. Interrupts are spread only
+  when all of a NIC's land on the same CPUs: a driver's own spread (virtio pairs a queue's
+  interrupts) and `irqbalance` are kept. The VM sets interrupts and the governor at each boot; a
+  Docker host keeps them until its reboot, as no file of the OS's sets them. A ring resize resets
+  the link, so only a link not yet up is resized — the VM's first pass, before its network;
+  nothing persistent re-runs it. `internal/tune` holds the rules and is the only place that
+  sizes them: the Docker host's `tune` reports, prints or applies them, the containers get
+  theirs in `stowage-content.yaml`. A Docker host's OS is the operator's: nothing changes there
+  unless asked, Docker is never restarted unasked (it restarts the containers), a ceiling the
+  host holds higher is kept, and `--revert` puts back what the first apply found — and a
+  ceiling is judged against that record, so a host that shrank is not held at a larger one's
+  values (a record from before the profiles names `shared`, read as `default`). RAM is read to
+  64 MiB, so a kernel's few KiB never make another host, and the network profile's buffer is a
+  power of two, so only a doubling of RAM rewrites the containers' settings and recreates them;
+  a start whose engine does not answer fails rather than drop them for one start (which would
+  recreate every service twice). What `--apply` cannot change (the NIC's driver, a missing
+  `ethtool`, a key dockerd takes as a flag, an interrupt the kernel manages) is advice, n/a or a
+  note, never drift, so `--check` settles after an apply. A container's settings are given per
+  service — only those its kernel has (a missing key would fail its start: none before Linux
+  4.15, nor in a user namespace of the containers' own), and never a service's own. The files
+  are named for Stowage, not a stack: two stacks on one host write the same values instead of
+  competing. A Kairos VM is Stowage's own and takes its stack's profile at each boot, before
+  networkd, and again once the network is up and before Docker (only then are the MTU and a late
+  NIC known): from the values the kernel computed for this boot's RAM, with no `sysctl.d` file
+  and no state (`/etc` is the boot's), so a resized VM is retuned and nothing stale survives an
+  upgrade; its `tune` only reports. Kairos's own boot stage would set a fixed receive buffer
+  ceiling after both passes, and its stages give no ordering a later unit can wait for: the
+  image drops that line from Kairos's file, and its build fails when the line moves. The
+  hypervisor's part is the VM modules' (a virtio queue per vCPU, gVNIC, accelerated
+  networking), and the image carries the drivers they need, the two cloud NICs' copied from the
+  extra modules rather than its 110 MB. Left out: Docker's userland proxy (turning it off breaks
+  a loopback install on `::1`, and it carries only local traffic), host networking (the stack's
+  isolation), the NICs' offloads beyond forwarded UDP (a driver's defaults are its best).
+  On Kubernetes the node is the cluster admin's, so the installer never touches it and reads
+  no `tune.profile`: no privileged pod, no DaemonSet. The node is tuned by the same `tune`, run
+  on it, and the pods get only the network profile's namespaced settings whose namespace
+  default is fixed, so no node's size enters them. They are the same on every node, and the
+  chart takes them as one value. The TCP buffer sizes come from the node (a pod's namespace
+  copies them), and so does the SYN queue, sized from the node's memory, which the installer
+  cannot read. A cluster-wide read would be a grant an operator limited to a namespace lacks,
+  and the smallest node is no bound for the others. The kubelet calls those settings unsafe and
+  refuses a pod with one it does not allow, so they are the operator's choice
+  (`--unsafe-sysctls`), and `k8s tune` prints the kubelet's setting. A report pod is left out:
+  unprivileged, it reads only its own namespace, and reading the node's needs `hostNetwork`,
+  which the baseline Pod Security level refuses. The values are written at install time, as
+  the release's `stowage` block is written at ship before any cluster is known.
 - **Memory follows the host** (`stack.memory`): a service's limit is a share of the RAM, set in
   `stowage-content.yaml` at each start, so a resized VM or host is followed at its next start
   without a new release. A share only raises: the compose file's own limit and its reservation

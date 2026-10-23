@@ -50,6 +50,8 @@ type Spec struct {
 	Hooks        Hooks              `yaml:"hooks"`
 	Backup       *Provider          `yaml:"backup"`
 	Shapes       Shapes             `yaml:"shapes"`
+	// Tune is how the hosts of the docker and kairos shapes are tuned for the stack's network.
+	Tune *Tune `yaml:"tune"`
 	// Extensions are the apps, published on the same registry prefix, whose endpoint an input
 	// of this project takes.
 	Extensions []Extension `yaml:"extensions"`
@@ -120,6 +122,20 @@ type Stack struct {
 // of RAM its memory limit is, never below the limit its compose file sets itself.
 type Memory struct {
 	Shares map[string]int `yaml:"shares"`
+}
+
+// Tune names the tuning profile the stack's hosts take: "default" (Docker's path as fast as the
+// host's network) or "network" (a host serving a heavy network load). Absent is "default".
+type Tune struct {
+	Profile string `yaml:"profile"`
+}
+
+// TuneProfile is the release's tuning profile's name: tune.profile, "default" when absent.
+func (s *Spec) TuneProfile() string {
+	if s.Tune == nil || s.Tune.Profile == "" {
+		return "default"
+	}
+	return s.Tune.Profile
 }
 
 // MaxMemoryShares is the total of the shares: the rest of the RAM is the OS's, the engine's and

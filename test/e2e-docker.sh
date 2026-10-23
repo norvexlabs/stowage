@@ -62,6 +62,18 @@ sum=$(sha256sum "$D/.env" "$D/compose.yaml")
 [[ $(sha256sum "$D/.env" "$D/compose.yaml") == "$sum" ]] || fail "a re-run changed .env or compose.yaml"
 running 1.0.0 1
 
+step "the release's default profile: each container takes the host's own settings and open files"
+"${CTL[@]}" status --dir "$D" >"$WORK/status.txt" 2>&1 && grep -qx 'tune      default (release)' "$WORK/status.txt" ||
+	{ cat "$WORK/status.txt"; fail "status does not show the release's default profile"; }
+api=$(docker ps -q --filter "label=com.docker.compose.project=$(project)" --filter label=com.docker.compose.service=api)
+[[ $(docker inspect --format '{{index .HostConfig.Sysctls "net.ipv4.ip_local_port_range"}}' "$api") == "$(awk '{print $1, $2}' /proc/sys/net/ipv4/ip_local_port_range)" &&
+	$(docker inspect --format '{{index .HostConfig.Sysctls "net.core.somaxconn"}}' "$api") == "$(cat /proc/sys/net/core/somaxconn)" ]] ||
+	fail "the api container's settings are not the host's: $(docker inspect --format '{{json .HostConfig.Sysctls}}' "$api")"
+# Its open files: fs.nr_open, bounded by the engine's own limit; the soft limit at most 65536.
+read -r _ soft hard < <(docker inspect --format '{{range .HostConfig.Ulimits}}{{.Name}} {{.Soft}} {{.Hard}}{{println}}{{end}}' "$api" | grep '^nofile ') || true
+[[ -n $hard ]] && ((hard > 1024 && hard <= $(cat /proc/sys/fs/nr_open) && soft == (hard < 65536 ? hard : 65536))) ||
+	fail "the api container is given ${soft:-no} open files (hard ${hard:-none})"
+
 step "backups on Docker: config, verify, run to WebDAV through the release's runner, list, status, restore"
 start_dav
 age_key

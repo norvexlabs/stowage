@@ -123,6 +123,7 @@ func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(
 			if err := in.Install(cmd.Context()); err != nil {
 				return err
 			}
+			in.retune(cmd.Context(), vmTune(r.Ctl()), stderr)
 			in.Finished(cmd.Context(), onVM)
 			return nil
 		},
@@ -131,6 +132,7 @@ func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(
 	f.StringSliceVar(&ports, "ports", nil, "a route's port, route=port (loopback mode; on an installed VM, changes it)")
 	f.StringVar(&o.Address, "address", "", "loopback address the ports bind to, default 127.0.0.1 (or ::1)")
 	ipv6Flag(f, &o.IPv6, "IPv6 on the stack's network, so the front's IPv6 clients keep their address; --ipv6=false turns it off (default: the cloud-config's, `vm create --ipv6`; on an installed VM, changes it)")
+	tuneProfileFlag(f, &o.TuneProfile, "the VM's tuning profile over the release's tune.profile ("+r.Spec.TuneProfile()+"): default or network; release follows the release's again (default: the cloud-config's, `vm create --tune-profile`; on an installed VM, changes it: a higher profile applies at once, a lower one at the next reboot)")
 	f.StringVar(&o.TLS, "tls", "", tlsHelp(in))
 	f.StringSliceVar(&domains, "domains", nil, "a route's domain, route=host: HTTPS (on an installed VM, changes it)")
 	f.StringVar(&o.Cert, "cert", "", "--tls byo: the certificate chain, PEM, copied into the install")
@@ -213,7 +215,7 @@ func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(
 	dirFlag(gate)
 	netBoot := netBootCommand(name, c.ctl, &o.Dir, stderr)
 	dirFlag(netBoot)
-	root.AddCommand(install, boot, back, hostd, gate, netBoot, tuneBootCommand(c.ctl, stderr), tuneCommand(in, prepare, terminal, true))
+	root.AddCommand(install, boot, back, hostd, gate, netBoot, tuneBootCommand(r, stderr), tuneCommand(in, prepare, terminal, true))
 
 	jsonFlag := func(cmd *cobra.Command) {
 		cmd.Flags().BoolVar(&asJSON, "json", false, "print the daemon's JSON answer")
@@ -662,6 +664,9 @@ func (c *hostClient) status(ctx context.Context, asJSON bool) error {
 	}
 	if st.Channel != "" {
 		fmt.Fprintf(c.out, "channel    %s\n", st.Channel)
+	}
+	if st.Tune != "" {
+		fmt.Fprintf(c.out, "tune       %s\n", st.Tune)
 	}
 	if st.Boot != "" {
 		boot := st.Boot

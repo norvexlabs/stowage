@@ -292,12 +292,15 @@ func TestVMCreateOnACloudWritesTheUserDataFile(t *testing.T) {
 func TestVMCreateWritesAStaticNetwork(t *testing.T) {
 	t.Parallel()
 	v := newVMCreate(t, "qcow2")
-	c := VMCreate{Platform: "proxmox", IPv6: true, Network: "static", Address: "192.0.2.10/24", Gateway: "192.0.2.1", DNS: []string{"192.0.2.53", "2001:db8::53"}}
+	c := VMCreate{Platform: "proxmox", IPv6: true, Network: "static", Address: "192.0.2.10/24", Gateway: "192.0.2.1", DNS: []string{"192.0.2.53", "2001:db8::53"}, TuneProfile: "network"}
 	if err := v.create(c, nil); err != nil {
 		t.Fatalf("%v\n%s", err, v.log)
 	}
 	ud, _, _ := readSeed(t, filepath.Join(v.out, "notes-seed.iso"))
-	_, cc := cloudSettings(t, ud)
+	st, cc := cloudSettings(t, ud)
+	if st.TuneProfile != "network" || !st.IPv6 {
+		t.Errorf("the install's settings: %+v", st)
+	}
 	boot := cc.Stages["boot"]
 	if len(boot) != 3 || boot[2].Files[0].Path != "/etc/systemd/network/05-notes-static.network" || !slices.Equal(boot[2].Commands, []string{"networkctl reload"}) {
 		t.Fatalf("boot %+v", boot)
@@ -490,6 +493,7 @@ func TestVMCreateRefusals(t *testing.T) {
 		{"IPv6 address without --ipv6", []string{"qcow2"}, nil, VMCreate{Platform: "truenas", Network: "static", Address: "192.0.2.10/24", Address6: "2001:db8::10/64"}, nil, "--address6 and --gateway6 are for --ipv6"},
 		{"IPv6 DNS without --ipv6", []string{"qcow2"}, nil, VMCreate{Platform: "truenas", Network: "static", Address: "192.0.2.10/24", DNS: []string{"2001:db8::53"}}, nil, "DNS server 2001:db8::53 is IPv6, which is off"},
 		{"bad network", []string{"qcow2"}, nil, VMCreate{Platform: "truenas", Network: "bridge"}, nil, "dhcp or static"},
+		{"unknown tune profile", []string{"qcow2"}, nil, VMCreate{Platform: "truenas", TuneProfile: "shared"}, nil, `--tune-profile: profile "shared": default or network`},
 		{"ssh source without prefix", []string{"qcow2"}, nil, VMCreate{Platform: "truenas", SSHAllow: []string{"192.0.2.0/24", "192.0.2.7"}}, nil, `--ssh-allow: "192.0.2.7" is not a source with its prefix`},
 		{"time zone not a name", []string{"qcow2"}, nil, VMCreate{Platform: "truenas", Timezone: "../../etc/passwd"}, nil, "--timezone: \"../../etc/passwd\" is not a time zone name"},
 		{"unknown time zone", []string{"qcow2"}, nil, VMCreate{Platform: "truenas", Timezone: "Mars/Olympus"}, nil, "--timezone: \"Mars/Olympus\" is not a time zone:"},

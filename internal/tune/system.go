@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"slices"
@@ -26,7 +27,10 @@ type System struct {
 	Ctl  string // the command that writes the files, named in their headers
 	// Docker is the host's engine; nil leaves its daemon file out.
 	Docker *Docker
-	// Profile is the rules' profile; "" is the one the last apply recorded, else Shared.
+	// Owned: the host is Stowage's own (a Kairos VM), whose Docker file rotates the containers'
+	// logs on every profile.
+	Owned bool
+	// Profile is the rules' profile; "" is the one the last apply recorded, else Default.
 	Profile Profile
 }
 
@@ -38,7 +42,7 @@ func (s System) Host() (Host, error) {
 	}
 	h.Profile = s.Profile
 	if h.Profile == "" {
-		h.Profile = Shared
+		h.Profile = Default
 		if st, err := s.readState(); err == nil && st.Profile != "" {
 			h.Profile = st.Profile
 		}
@@ -52,8 +56,6 @@ type Docker struct {
 	Desktop  bool // Docker Desktop: the containers run in its own VM, which this host's settings miss
 	// UsernsRemap: the containers run in a user namespace of their own.
 	UsernsRemap bool
-	// NetworkOpts: the engine reads default-network-opts (Docker 24 or later).
-	NetworkOpts bool
 }
 
 func (s System) path(rel string) string { return filepath.Join(s.Root, rel) }
@@ -69,6 +71,120 @@ func (s System) read(rel string) (string, bool) {
 func (s System) exists(rel string) bool {
 	_, err := os.Stat(s.path(rel))
 	return err == nil
+}
+
+// ipv6Off reports whether key is IPv6's and the kernel runs without IPv6 (ipv6.disable=1): its
+// settings are not there to set.
+func (s System) ipv6Off(key string) bool {
+	return strings.HasPrefix(key, "net.ipv6.") && !s.exists("proc/sys/net/ipv6")
+}
+
+// running reports whether a process of that name runs (proc/<pid>/comm).
+func (s System) running(name string) bool {
+	entries, err := os.ReadDir(s.path("proc"))
+	if err != nil {
+		return false
+	}
+	for _, e := range entries {
+		if comm, ok := s.read(filepath.Join("proc", e.Name(), "comm")); ok && comm == name {
+			return true
+		}
+	}
+	return false
+}
+
+// cpuIDs are the online CPUs' ids.
+func (h Host) cpuIDs() []int {
+	if len(h.Online) > 0 {
+		return h.Online
+	}
+	ids := make([]int, max(h.CPUs, 1))
+	for i := range ids {
+		ids[i] = i
+	}
+	return ids
+}
+
+// irqs are a NIC's interrupts, as its PCI device lists them (msi_irqs: a virtio NIC's device is
+// the PCI device's child, and only its parent's are taken), in order.
+func (s System) irqs(n nic) []int {
+	dev, err := filepath.EvalSymlinks(s.path(filepath.Join("sys/class/net", n.name, "device")))
+	if err != nil {
+		return nil
+	}
+	dirs := []string{dev}
+	if strings.HasPrefix(filepath.Base(dev), "virtio") {
+		dirs = append(dirs, filepath.Dir(dev))
+	}
+	for _, dir := range dirs {
+		entries, err := os.ReadDir(filepath.Join(dir, "msi_irqs"))
+		if err != nil {
+			continue
+		}
+		var out []int
+		for _, e := range entries {
+			if irq, err := strconv.Atoi(e.Name()); err == nil {
+				out = append(out, irq)
+			}
+		}
+		slices.Sort(out)
+		return out
+	}
+	return nil
+}
+
+// irqsStacked reports whether two or more interrupts all land on the same CPUs (their effective
+// affinity, else the one asked for): a NIC whose queues are all served by one CPU.
+func (s System) irqsStacked(irqs []int) bool {
+	if len(irqs) < 2 {
+		return false
+	}
+	first := ""
+	for i, irq := range irqs {
+		dir := filepath.Join("proc/irq", strconv.Itoa(irq))
+		cpus, ok := s.read(filepath.Join(dir, "effective_affinity_list"))
+		if !ok || cpus == "" {
+			if cpus, ok = s.read(filepath.Join(dir, "smp_affinity_list")); !ok {
+				return false
+			}
+		}
+		if i == 0 {
+			first = cpus
+		} else if cpus != first {
+			return false
+		}
+	}
+	return true
+}
+
+// cpuGovernor is one CPU's frequency governor: its file, its value, whether it offers performance.
+type cpuGovernor struct {
+	file   string
+	have   string
+	offers bool
+}
+
+// governors are the governors of the CPUs whose frequency the kernel drives; none on most VMs,
+// where the hypervisor does.
+func (s System) governors() []cpuGovernor {
+	cpus, err := filepath.Glob(s.path("sys/devices/system/cpu/cpu[0-9]*/cpufreq"))
+	if err != nil {
+		return nil
+	}
+	var out []cpuGovernor
+	for _, dir := range cpus {
+		rel, err := filepath.Rel(s.Root, dir)
+		if err != nil {
+			continue
+		}
+		have, ok := s.read(filepath.Join(rel, "scaling_governor"))
+		if !ok {
+			continue
+		}
+		avail, _ := s.read(filepath.Join(rel, "scaling_available_governors"))
+		out = append(out, cpuGovernor{filepath.Join(rel, "scaling_governor"), have, slices.Contains(strings.Fields(avail), "performance")})
+	}
+	return out
 }
 
 // State is an item's verdict.
@@ -283,6 +399,10 @@ func (s System) Inspect(ctx context.Context, h Host) []Item {
 	}
 	for _, c := range h.Sysctls() {
 		have, ok := s.read(c.Path())
+		if !ok && s.ipv6Off(c.Key) {
+			items = append(items, Item{NA, "sysctl", c.Key, "IPv6 is off in this kernel", ""})
+			continue
+		}
 		have = strings.Join(strings.Fields(have), " ")
 		base, _ := st.base(c, have, ok)
 		if !ok {
@@ -318,12 +438,18 @@ func (s System) Inspect(ctx context.Context, h Host) []Item {
 				items = append(items, Item{verdict(atLeast(flows, q)), "nic", fmt.Sprintf("%s rx-%d rps_flow_cnt", n.name, i), flows, AtLeast.render(nums(q))})
 			}
 		}
+		if h.network() {
+			items = append(items, s.inspectSteering(h, n)...)
+		}
 		if a := s.advice(n, all, h.CPUs); a != "" {
 			items = append(items, Item{Advice, "nic", n.name + " " + cmp.Or(n.driver, "driver"), a, ""})
 		}
 	}
+	if h.network() {
+		items = append(items, s.inspectGovernor())
+	}
 	for _, n := range all {
-		if !n.tun {
+		if !n.tun || !h.network() {
 			continue
 		}
 		dir := filepath.Join("sys/class/net", n.name)
@@ -362,6 +488,46 @@ func (s System) Inspect(ctx context.Context, h Host) []Item {
 		}
 	}
 	return items
+}
+
+// inspectSteering judges how a NIC's received packets spread over the CPUs: its interrupts, and
+// RPS on a NIC with fewer queues than CPUs.
+func (s System) inspectSteering(h Host, n nic) []Item {
+	var items []Item
+	switch irqs := s.irqs(n); {
+	case len(irqs) < 2 || len(h.cpuIDs()) < 2:
+	case s.running("irqbalance"):
+		items = append(items, Item{NA, "nic", n.name + " interrupts", "irqbalance spreads them", ""})
+	case s.irqsStacked(irqs):
+		// Advice, never drift: a driver whose interrupts the kernel manages refuses the move.
+		items = append(items, Item{Advice, "nic", n.name + " interrupts", fmt.Sprintf("%d, all on the same CPUs: --apply (the VM's boot) spreads them, unless the kernel manages them", len(irqs)), ""})
+	default:
+		items = append(items, Item{OK, "nic", n.name + " interrupts", fmt.Sprintf("%d, spread", len(irqs)), "spread over the CPUs"})
+	}
+	if h.steers(n) {
+		for i := range n.queues {
+			mask, _ := s.read(filepath.Join("sys/class/net", n.name, "queues", fmt.Sprintf("rx-%d", i), "rps_cpus"))
+			items = append(items, Item{verdict(sameMask(mask, h.RPSMask())), "nic", fmt.Sprintf("%s rx-%d rps_cpus", n.name, i), mask, h.RPSMask()})
+		}
+	}
+	return items
+}
+
+// inspectGovernor judges the CPUs' frequency governors.
+func (s System) inspectGovernor() Item {
+	gs := s.governors()
+	if len(gs) == 0 {
+		return Item{NA, "cpu", "governor", "no cpufreq: the hypervisor or the firmware drives the CPUs' frequency", ""}
+	}
+	var have []string
+	ok := true
+	for _, g := range gs {
+		if !slices.Contains(have, g.have) {
+			have = append(have, g.have)
+		}
+		ok = ok && (g.have == "performance" || !g.offers)
+	}
+	return Item{verdict(ok), "cpu", "governor", strings.Join(have, ","), "performance"}
 }
 
 // inspectRing judges a NIC's rings against what the network profile gives it.
@@ -454,29 +620,109 @@ func daemonValue(raw []byte, path []string) (json.RawMessage, bool, error) {
 	return out, true, err
 }
 
-// Container is h's container settings that the host's kernel has, a container's namespace having
-// the same keys from Linux 4.15 on: one it lacked would fail the container's start. A ceiling the
-// host holds higher is kept, field by field, as a namespace copies the host's buffer sizes and a
-// kernel may size them above ours. None on an
-// older kernel, on an engine whose containers are in a user namespace of their own (rootless,
-// userns-remap: their namespace hides keys) or in Docker Desktop's VM, or when the engine is not
-// known.
-func (s System) Container(h Host) map[string]string {
-	if d := s.Docker; d == nil || d.Rootless || d.UsernsRemap || d.Desktop || !s.kernelAtLeast(4, 15) {
-		return nil
+// Container is what each container is given so that it runs as it would on the host.
+type Container struct {
+	// Sysctls are its network namespace's own settings, by key.
+	Sysctls map[string]string
+	// MTU is the host's default route's MTU, its networks' (1500 included); 0 when it does not
+	// read or the engine's networks take none (rootless, Docker Desktop).
+	MTU int
+	// MTUUnread: the engine's networks take the host's MTU, but it did not read this moment (no
+	// default route): they keep the one they have.
+	MTUUnread bool
+	// Nofile is the open files it may hold (its hard limit); 0 leaves the engine's. Its soft
+	// limit is NofileSoft at most.
+	Nofile uint64
+}
+
+// NofileSoft is the most open files a container's soft limit is given: a program that needs more
+// raises it to the hard limit itself, and one that walks every descriptor up to it stays fast.
+const NofileSoft = 65536
+
+// Container is h's container settings on this host. Sysctls are containerKeys that the host's
+// kernel has, a container's namespace having the same keys from Linux 4.15 on (one it lacked
+// would fail the container's start): the host's value, or on the network profile the profile's
+// where the host holds less, field by field. None on an older kernel or on an engine whose
+// containers are in a user namespace of their own (rootless, userns-remap: their namespace hides
+// keys). Nofile is fs.nr_open, at most NofileLimit and the hard limit dockerd and containerd run
+// with (a container's limit above theirs fails its start where they may not raise it, as in an
+// unprivileged LXC container); none when neither is seen, or under a user namespace, where the
+// engine's own limit bounds it. MTU is not on rootless Docker, whose network is a user-mode one.
+// Nothing in Docker Desktop's VM, or when the engine is not known.
+func (s System) Container(h Host) Container {
+	d := s.Docker
+	if d == nil || d.Desktop || d.Rootless {
+		return Container{}
 	}
-	out := h.Container()
-	for _, c := range h.Sysctls() {
-		if _, ok := out[c.Key]; !ok {
+	c := Container{MTU: s.MTU()}
+	c.MTUUnread = c.MTU == 0
+	if d.UsernsRemap {
+		return c
+	}
+	if v, ok := s.read("proc/sys/fs/nr_open"); ok {
+		if n, err := strconv.ParseUint(v, 10, 64); err == nil {
+			if engine, seen := s.engineNofile(); seen {
+				c.Nofile = min(n, NofileLimit, engine)
+			}
+		}
+	}
+	if !s.kernelAtLeast(4, 15) {
+		return c
+	}
+	want := map[string]Sysctl{}
+	for _, r := range h.Sysctls() {
+		want[r.Key] = r
+	}
+	c.Sysctls = map[string]string{}
+	for _, k := range containerKeys {
+		cur, ok := s.read(Sysctl{Key: k}.Path())
+		if !ok {
 			continue
 		}
-		if cur, ok := s.read(c.Path()); !ok {
-			delete(out, c.Key)
-		} else {
-			out[c.Key] = c.Value(strings.Join(strings.Fields(cur), " "))
+		cur = strings.Join(strings.Fields(cur), " ")
+		if r, tuned := want[k]; tuned {
+			cur = r.Value(cur)
+		}
+		c.Sysctls[k] = cur
+	}
+	return c
+}
+
+// engineNofile is the lowest hard limit of open files the host's own root dockerd and containerd
+// run with (proc/<pid>/limits); an engine in a container of its own (kind, dind) is not the
+// host's: its NSpid names more than one pid. False when neither is seen.
+func (s System) engineNofile() (uint64, bool) {
+	entries, err := os.ReadDir(s.path("proc"))
+	if err != nil {
+		return 0, false
+	}
+	low, seen := uint64(math.MaxUint64), false
+	for _, e := range entries {
+		comm, ok := s.read(filepath.Join("proc", e.Name(), "comm"))
+		if !ok || comm != "dockerd" && comm != "containerd" {
+			continue
+		}
+		if status, _ := s.read(filepath.Join("proc", e.Name(), "status")); !rootUID(status) || !hostPID(status) {
+			continue
+		}
+		limits, _ := s.read(filepath.Join("proc", e.Name(), "limits"))
+		for line := range strings.SplitSeq(limits, "\n") {
+			f := strings.Fields(strings.TrimPrefix(line, "Max open files"))
+			if !strings.HasPrefix(line, "Max open files") || len(f) < 2 {
+				continue
+			}
+			hard := uint64(math.MaxUint64)
+			if f[1] != "unlimited" {
+				n, err := strconv.ParseUint(f[1], 10, 64)
+				if err != nil {
+					continue
+				}
+				hard = n
+			}
+			low, seen = min(low, hard), true
 		}
 	}
-	return out
+	return low, seen
 }
 
 // SystemLook finds file in the system's own program directories, never in PATH.
@@ -546,6 +792,17 @@ func (s System) dockerdArgs() map[string]string {
 		return out
 	}
 	return nil
+}
+
+// hostPID reports whether a proc/<pid>/status reads as a process of the host's own pid namespace:
+// its NSpid names one pid (a kernel without the line, before 4.1, is taken as the host's).
+func hostPID(status string) bool {
+	for line := range strings.SplitSeq(status, "\n") {
+		if f := strings.Fields(line); len(f) >= 1 && f[0] == "NSpid:" {
+			return len(f) == 2
+		}
+	}
+	return true
 }
 
 // rootUID reports whether a proc/<pid>/status reads as a process whose real uid is root.

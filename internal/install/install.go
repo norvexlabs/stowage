@@ -49,6 +49,9 @@ type Options struct {
 	Ports   map[string]int // --ports: a route's loopback port
 	Address string         // the loopback address ports bind to; first install only
 	IPv6    *bool          // --ipv6: IPv6 on the stack's network; nil keeps the recorded choice
+	// TuneProfile is --tune-profile: the operator's tuning profile (TuneProfileVar), "release"
+	// to follow the release's again; nil keeps the recorded choice.
+	TuneProfile *string
 	// TLS is the front's TLS mode (--tls); empty decides it from the domains given, or asks.
 	TLS     string
 	Domains map[string]string // --domains: a route's domain, sugar for its domain input
@@ -571,6 +574,7 @@ func (in *Installer) decide(ctx context.Context, dir, mode string, pub publish, 
 		env.Set(ChannelVar, o.Channel)
 	}
 	in.frontVars(env, mode, pub, domains)
+	in.tuneVar(env)
 	in.acmeForward(nil, env)
 	in.stowageImageVars(env, prefix)
 	for _, k := range s.ImageNames() {
@@ -1104,7 +1108,7 @@ func (in *Installer) up(ctx context.Context, env *EnvFile) error {
 	if err != nil {
 		return err
 	}
-	if err := in.writeContent(ctx, m, environ); err != nil {
+	if err := in.writeContent(ctx, m, env, environ); err != nil {
 		return err
 	}
 	// Listed once: a retry finds the volumes its first try made, and they await their uid.
@@ -1526,6 +1530,8 @@ func (in *Installer) Status(ctx context.Context) error {
 	}
 	get := func(k string) string { v, _ := env.Get(k); return v }
 	fmt.Fprintf(in.O.Out, "%s %s (revision %s)\nregistry  %s\n", get("STOWAGE_NAME"), get("STOWAGE_PROJECT_VERSION"), get("STOWAGE_REVISION"), get("STOWAGE_REGISTRY"))
+	p, by := in.tuneProfile(get)
+	fmt.Fprintf(in.O.Out, "%-9s %s (%s)\n", "tune", p, by)
 	split := in.volumesSplit()
 	switch unfinished, failed, _ := in.firstInstall(); {
 	case split != nil:

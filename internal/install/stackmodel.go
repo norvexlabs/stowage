@@ -2,6 +2,7 @@ package install
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"crypto/hmac"
 	"crypto/rand"
@@ -15,12 +16,14 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/norvexlabs/stowage/internal/tune"
 	"go.yaml.in/yaml/v3"
 )
 
 // ContentCompose is the stack file of what the installer adds to each service (contentCompose):
-// the label of what Compose renders into it, and the network settings its namespace keeps of its
-// own. It is written before each `up` and kept between runs.
+// the label of what Compose renders into it, the network settings its namespace keeps of its own,
+// its open files and its memory, and the host's MTU on the stack's networks. It is written before
+// each `up` and kept between runs.
 const ContentCompose = "stowage-content.yaml"
 
 // ContentKey is the install's key of the content labels, private to it: a label is a keyed digest,
@@ -42,6 +45,7 @@ type composeModel struct {
 	Services map[string]struct {
 		NetworkMode string            `json:"network_mode"`
 		Sysctls     map[string]string `json:"sysctls"`
+		Ulimits     map[string]any    `json:"ulimits"`
 		serviceMemory
 		Configs []struct {
 			Source string `json:"source"`
@@ -54,12 +58,29 @@ type composeModel struct {
 			Source string `json:"source"`
 		} `json:"volumes"`
 	} `json:"services"`
-	Configs map[string]renderedFile `json:"configs"`
-	Secrets map[string]renderedFile `json:"secrets"`
-	Volumes map[string]struct {
+	Configs  map[string]renderedFile   `json:"configs"`
+	Secrets  map[string]renderedFile   `json:"secrets"`
+	Networks map[string]composeNetwork `json:"networks"`
+	Volumes  map[string]struct {
 		Name     string `json:"name"`
 		External bool   `json:"external"`
 	} `json:"volumes"`
+}
+
+// composeNetwork is a network of the compose file, as `docker compose config` renders it.
+type composeNetwork struct {
+	External   bool              `json:"external"`
+	Driver     string            `json:"driver"`
+	DriverOpts map[string]string `json:"driver_opts"`
+}
+
+// mtuOpt is the bridge driver's option holding a network's MTU.
+const mtuOpt = "com.docker.network.driver.mtu"
+
+// takesMTU reports whether the installer gives n the host's MTU: a bridge network the stack makes
+// itself, whose compose file sets no MTU of its own.
+func (n composeNetwork) takesMTU() bool {
+	return !n.External && (n.Driver == "" || n.Driver == "bridge") && n.DriverOpts[mtuOpt] == ""
 }
 
 // serviceMemory is what a service sets of its memory and its number of containers, as `docker
@@ -124,16 +145,11 @@ func (in *Installer) model(ctx context.Context, environ []string) (*composeModel
 // renders into it (inline content, an environment variable's value from environ): Compose copies
 // them into the container as it creates it, and recreates none when only they change, so the
 // label makes their change one of the service's. It gives each service with a network namespace
-// of its own the sysctls it does not set itself, and each service mem shares its memory limit.
-func contentCompose(m *composeModel, environ []string, key []byte, sysctls map[string]string, mem memoryPlan) ([]byte, error) {
-	lookup := func(k string) string {
-		for _, kv := range slices.Backward(environ) {
-			if name, v, ok := strings.Cut(kv, "="); ok && name == k {
-				return v
-			}
-		}
-		return ""
-	}
+// of its own the sysctls of ctr it does not set itself, each service ctr's open files unless it
+// sets its own, each service mem shares its memory limit, and each bridge network the stack makes
+// ctr's MTU.
+func contentCompose(m *composeModel, environ []string, key []byte, ctr tune.Container, mem memoryPlan) ([]byte, error) {
+	lookup := environLookup(environ)
 	services := map[string]any{}
 	for _, name := range sortedKeys(m.Services) {
 		svc := m.Services[name]
@@ -164,7 +180,7 @@ func contentCompose(m *composeModel, environ []string, key []byte, sysctls map[s
 		// The host's namespace, or another service's, is no service's own to set.
 		if svc.NetworkMode == "" || svc.NetworkMode == "bridge" {
 			own := map[string]string{}
-			for k, v := range sysctls {
+			for k, v := range ctr.Sysctls {
 				if _, set := svc.Sysctls[k]; !set {
 					own[k] = v
 				}
@@ -173,6 +189,9 @@ func contentCompose(m *composeModel, environ []string, key []byte, sysctls map[s
 				extra["sysctls"] = own
 			}
 		}
+		if _, set := svc.Ulimits["nofile"]; !set && ctr.Nofile > 0 {
+			extra["ulimits"] = map[string]any{"nofile": map[string]uint64{"soft": min(ctr.Nofile, tune.NofileSoft), "hard": ctr.Nofile}}
+		}
 		if pct, ok := mem.Shares[name]; ok {
 			mem.give(extra, pct, svc.serviceMemory)
 		}
@@ -180,10 +199,25 @@ func contentCompose(m *composeModel, environ []string, key []byte, sysctls map[s
 			services[name] = extra
 		}
 	}
-	if len(services) == 0 {
+	networks := map[string]any{}
+	if mtu := networkMTUOpt(ctr.MTU); mtu != "" {
+		for _, name := range sortedKeys(m.Networks) {
+			if m.Networks[name].takesMTU() {
+				networks[name] = map[string]any{"driver_opts": map[string]string{mtuOpt: mtu}}
+			}
+		}
+	}
+	if len(services) == 0 && len(networks) == 0 {
 		return []byte(contentPlaceholder), nil
 	}
-	out, err := yaml.Marshal(map[string]any{"services": services})
+	doc := map[string]any{}
+	if len(services) > 0 {
+		doc["services"] = services
+	}
+	if len(networks) > 0 {
+		doc["networks"] = networks
+	}
+	out, err := yaml.Marshal(doc)
 	if err != nil {
 		return nil, err
 	}
@@ -213,21 +247,115 @@ func (in *Installer) contentKey() ([]byte, error) {
 	return key, nil
 }
 
-// writeContent writes ContentCompose for the stack as Compose runs it with environ.
-func (in *Installer) writeContent(ctx context.Context, m *composeModel, environ []string) error {
+// environLookup reads a variable of environ, its last value; "" when absent.
+func environLookup(environ []string) func(string) string {
+	return func(k string) string {
+		for _, kv := range slices.Backward(environ) {
+			if name, v, ok := strings.Cut(kv, "="); ok && name == k {
+				return v
+			}
+		}
+		return ""
+	}
+}
+
+// networkMTUOpt is the driver option a network of the host's MTU (0: unknown) takes, 1500
+// included, so the daemon's own default-network-opts never stands in for it; "" when the MTU
+// does not read.
+func networkMTUOpt(mtu int) string {
+	if mtu <= 0 {
+		return ""
+	}
+	return strconv.Itoa(mtu)
+}
+
+// madeMTU is a network's MTU as its driver option says: none is Docker's 1500.
+func madeMTU(opt string) string { return cmp.Or(strings.TrimSpace(opt), "1500") }
+
+// previousMTU is the MTU the last start gave the stack's networks (ContentCompose's); 0 when it
+// gave none.
+func (in *Installer) previousMTU() int {
+	raw, err := os.ReadFile(in.path(ContentCompose))
+	if err != nil {
+		return 0
+	}
+	var doc struct {
+		Networks map[string]struct {
+			DriverOpts map[string]string `yaml:"driver_opts"`
+		} `yaml:"networks"`
+	}
+	if yaml.Unmarshal(raw, &doc) != nil {
+		return 0
+	}
+	for _, name := range sortedKeys(doc.Networks) {
+		if n, err := strconv.Atoi(doc.Networks[name].DriverOpts[mtuOpt]); err == nil && n > 0 {
+			return n
+		}
+	}
+	return 0
+}
+
+// networkMTU stops the stack when a network the installer gives the host's MTU (mtu) was made
+// with another, as its driver option says: a network's MTU is set when it is made, so `up` makes
+// it again. Volumes are kept. An MTU that does not read (no default route this moment) judges
+// nothing.
+func (in *Installer) networkMTU(ctx context.Context, environ []string, m *composeModel, mtu int) error {
+	if mtu <= 0 {
+		return nil
+	}
+	want := networkMTUOpt(mtu)
+	out, err := in.O.Docker.Run(ctx, Cmd{Args: []string{"network", "ls", "--quiet", "--filter", "label=com.docker.compose.project=" + environLookup(environ)("COMPOSE_PROJECT_NAME")}})
+	if err != nil {
+		return fmt.Errorf("listing the stack's networks: %w", err)
+	}
+	ids := strings.Fields(string(out))
+	if len(ids) == 0 {
+		return nil
+	}
+	out, err = in.O.Docker.Run(ctx, Cmd{Args: append([]string{"network", "inspect", "--format", "{{index .Labels \"com.docker.compose.network\"}} {{index .Options \"" + mtuOpt + "\"}}"}, ids...)})
+	if err != nil {
+		return fmt.Errorf("reading the stack's networks: %w", err)
+	}
+	for line := range strings.SplitSeq(strings.TrimSpace(string(out)), "\n") {
+		name, made, _ := strings.Cut(line, " ")
+		n, ok := m.Networks[name]
+		if name == "" || !ok || !n.takesMTU() || madeMTU(made) == want {
+			continue
+		}
+		in.O.logf("the host's MTU is %d, network %s was made with %s: the stack stops, and its networks are made again", mtu, name, madeMTU(made))
+		if _, err := in.O.Docker.Run(ctx, Cmd{Args: append(in.composeBase(), "down", "--remove-orphans"), Env: environ, Stream: in.O.Log}); err != nil {
+			return fmt.Errorf("stopping the stack to make its networks again: %w", err)
+		}
+		return nil
+	}
+	return nil
+}
+
+// writeContent writes ContentCompose for the stack as Compose runs it with environ, by the
+// install's record env (never the shell's), and makes the stack's networks again when the host's
+// MTU changed.
+func (in *Installer) writeContent(ctx context.Context, m *composeModel, env *EnvFile, environ []string) error {
 	key, err := in.contentKey()
 	if err != nil {
 		return fmt.Errorf("%s: %w", ContentKey, err)
 	}
-	sysctls, mem, err := in.containerSizing(ctx)
+	ctr, mem, err := in.containerSizing(ctx, func(k string) string { v, _ := env.Get(k); return v })
 	if err != nil {
 		return err
 	}
-	raw, err := contentCompose(m, environ, key, sysctls, mem)
+	if ctr.MTUUnread {
+		// No default route this moment: the networks keep the MTU the last start gave them,
+		// rather than be made again without it.
+		ctr.MTU = in.previousMTU()
+	}
+	raw, err := contentCompose(m, environ, key, ctr, mem)
 	if err != nil {
 		return err
 	}
-	return writeAtomic(in.path(ContentCompose), bytes.NewReader(raw), 0o644, nil)
+	if err := writeAtomic(in.path(ContentCompose), bytes.NewReader(raw), 0o644, nil); err != nil {
+		return err
+	}
+	return in.networkMTU(ctx, environ, m, ctr.MTU)
 }
 
 // VolumesPending lists, one per line, the volumes a start made that still await their uid: written

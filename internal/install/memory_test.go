@@ -31,7 +31,7 @@ func TestContentComposeGivesTheMemoryShares(t *testing.T) {
 		Shares: map[string]int{"db": 50, "api": 25, "both": 25, "bare": 10, "large": 10, "small": 1, "reserved": 10, "scaled": 10, "replicated": 10, "gone": 5},
 		Host:   tune.Host{MemBytes: 4 << 30, CPUs: 3},
 	}
-	raw, err := contentCompose(&model, nil, []byte("key"), nil, mem)
+	raw, err := contentCompose(&model, nil, []byte("key"), tune.Container{}, mem)
 	if err != nil {
 		t.Fatal(err)
 	}

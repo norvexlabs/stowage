@@ -93,6 +93,19 @@ docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$pg" | grep
 	fail "postgres is not given the host's RAM"
 [[ $(docker exec "$pg" psql -U atlas -d atlas -tAc "SELECT setting::bigint * 8 / 1024 FROM pg_settings WHERE name = 'shared_buffers'") == $((want_mb / 4)) ]] ||
 	fail "postgres did not size shared_buffers from STOWAGE_MEM_LIMIT_MB"
+# The release's network profile: each container gets the profile's settings and the host's open
+# files, the stack's network the host route's MTU.
+api=$(docker ps -q --filter "label=com.docker.compose.project=$(project)" --filter label=com.docker.compose.service=api)
+read -r reuse somax < <(docker exec "$api" python3 -c 'print(*(open("/proc/sys/net/" + k).read().strip() for k in ("ipv4/tcp_tw_reuse", "core/somaxconn")))') ||
+	fail "the api's namespace does not read"
+[[ $reuse == 1 ]] && ((somax >= 8192)) || fail "the api's namespace holds tcp_tw_reuse $reuse, somaxconn $somax: not the network profile's"
+# Its open files: fs.nr_open, bounded by the engine's own limit; the soft limit at most 65536.
+read -r _ soft hard < <(docker inspect --format '{{range .HostConfig.Ulimits}}{{.Name}} {{.Soft}} {{.Hard}}{{println}}{{end}}' "$api" | grep '^nofile ') || true
+[[ -n $hard ]] && ((hard > 1024 && hard <= $(cat /proc/sys/fs/nr_open) && soft == (hard < 65536 ? hard : 65536))) ||
+	fail "the api is given ${soft:-no} open files (hard ${hard:-none})"
+mtu=$(cat "/sys/class/net/$(ip -o route show default | awk '{print $5; exit}')/mtu")
+net_mtu=$(docker network inspect --format '{{index .Options "com.docker.network.driver.mtu"}}' "$(project)_default")
+[[ $net_mtu == "$mtu" ]] || fail "the stack's network has MTU '$net_mtu', the host's route $mtu"
 # The loopback URL of the api route, as the install records it (STOWAGE_URL_API).
 url=$(sed -n "s/^STOWAGE_URL_API='\{0,1\}\([^']*\)'\{0,1\}$/\1/p" "$D/.env")
 [[ $url == http://*:$API_PORT ]] || fail "the install records the api route's URL as $url"
@@ -104,6 +117,7 @@ grep -qF "tip: the extension atlas-search (Full-text search over the events) is 
 	{ cat "$WORK/install.log"; fail "the install did not end with the search extension's tip"; }
 "${CTL[@]}" status --dir "$D" >"$WORK/status.txt" 2>&1 || { cat "$WORK/status.txt"; fail "status"; }
 grep -qxF "endpoint  $url" "$WORK/status.txt" || { cat "$WORK/status.txt"; fail "status does not show the endpoint"; }
+grep -qx "tune      network (release)" "$WORK/status.txt" || { cat "$WORK/status.txt"; fail "status does not show the release's tuning profile"; }
 
 step "a re-run sets the search extension's input, then clears it"
 pw=$(grep '^ADMIN_PASSWORD=' "$D/credentials.txt") key=$(sed -n 's/^ADMIN_API_KEY=//p' "$D/credentials.txt")

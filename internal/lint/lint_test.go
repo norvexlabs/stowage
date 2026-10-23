@@ -170,6 +170,10 @@ func TestEachRuleFiresOnFull(t *testing.T) {
 		{"memory share of no service", []edit{{sp, memShares, "shares: { postgres: 25, search: 10 }"}}, nil, `stack.memory.shares.search: service "search" is not in deploy/compose.yaml`},
 		{"memory shares empty", []edit{{sp, memShares, "shares: {}"}}, nil, "stack.memory.shares: names no service"},
 		{"memory left empty", []edit{{sp, "  memory:\n    " + memShares + "   # percent of the host's RAM, recomputed at each start\n", "  memory:\n"}}, nil, "stack.memory.shares: names no service"},
+		{"tune profile unknown", []edit{{sp, "  profile: network   #", "  profile: shared   #"}}, nil, `tune.profile: "shared": default or network`},
+		{"tune profile missing", []edit{{sp, "  profile: network   #", "  other: network   #"}}, nil, "field other not found"},
+		{"tune profile empty", []edit{{sp, "  profile: network   #", "  profile: \"\"   #"}}, nil, "tune.profile: missing"},
+		{"tune left empty", []edit{{sp, "tune:\n  profile: network   # a heavy network load: the hosts are tuned for it (default: Docker's path alone)\n", "tune:\n"}}, nil, "tune.profile: missing"},
 		{"hook env not recorded", []edit{{sp, "env: [ADMIN_EMAIL, ADMIN_PASSWORD, INTERNAL_SERVICE_SECRET]", "env: [ADMIN_EMAIL, API_URL]"}}, nil, "hooks.provision.env[1]: API_URL is no input, secret or safe default"},
 		{"hook returns an input", []edit{{sp, "returns: [ADMIN_API_KEY, ADMIN_LOGIN]", "returns: [ADMIN_API_KEY, ADMIN_EMAIL]"}}, nil, "hooks.provision.returns[1]: ADMIN_EMAIL is an input, a value the install records"},
 		{"hook returns a secret", []edit{{sp, "returns: [ADMIN_API_KEY, ADMIN_LOGIN]", "returns: [INTERNAL_SERVICE_SECRET]"}}, nil, "hooks.provision.returns[0]: INTERNAL_SERVICE_SECRET is a secret"},
@@ -1051,6 +1055,28 @@ func TestMemorySharesBounds(t *testing.T) {
 		if errs := errorsOf(run(t, root)); len(errs) > 0 {
 			t.Errorf("%s: %v", shares, errs)
 		}
+	}
+}
+
+// The nodes are the cluster's: tune on Kubernetes alone is warned.
+func TestTuneOnKubernetesAloneWarns(t *testing.T) {
+	t.Parallel()
+	warned := func(res *Result) bool {
+		for _, f := range res.Findings {
+			if f.Severity == Warning && f.Where == "tune.profile" {
+				return true
+			}
+		}
+		return false
+	}
+	root := testutil.CopyExample(t, "full")
+	testutil.SetYAML(t, root, specFile, []string{"shapes", "docker"}, nil)
+	if warned(run(t, root)) {
+		t.Fatal("warned with a kairos shape")
+	}
+	testutil.SetYAML(t, root, specFile, []string{"shapes", "kairos"}, nil)
+	if res := run(t, root); !warned(res) {
+		t.Fatalf("findings: %+v", res.Findings)
 	}
 }
 

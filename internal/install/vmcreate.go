@@ -22,6 +22,7 @@ import (
 	"github.com/norvexlabs/stowage/internal/registry"
 	"github.com/norvexlabs/stowage/internal/release"
 	"github.com/norvexlabs/stowage/internal/truenas"
+	"github.com/norvexlabs/stowage/internal/tune"
 	"github.com/norvexlabs/stowage/internal/version"
 )
 
@@ -94,6 +95,9 @@ type VMCreate struct {
 	DNS      []string
 	SSHAllow []string // CIDR: the sources SSH accepts; none is every source
 	Timezone string
+	// TuneProfile is the operator's tuning profile, which the VM's boots apply and its first
+	// install records; empty is the release's.
+	TuneProfile string
 	// Secrets is a decrypted SecretsFile the first install takes (a machine made again): given over
 	// SSH, never in the cloud-config.
 	Secrets  []byte
@@ -188,6 +192,7 @@ func (in *Installer) CreateVM(ctx context.Context, c *VMCreate) error {
 	}
 	st.AwaitSecrets = c.Secrets != nil
 	st.IPv6 = c.IPv6 // the install's network too: the front's IPv6 clients keep their address
+	st.TuneProfile = c.TuneProfile
 	// Another release's disk: the first boot takes this release's OS bundle before it installs.
 	if boot.release != m.Tag {
 		st.Release = &OSRelease{Version: m.ProjectVersion, Revision: m.Revision, Tag: m.Tag, OS: m.Artifacts.OS}
@@ -706,6 +711,11 @@ func (in *Installer) machine(ctx context.Context, c *VMCreate) (Machine, error) 
 	}
 	if err := checkNet(a["--network"]); err != nil {
 		return Machine{}, err
+	}
+	if c.TuneProfile != "" {
+		if _, err := tune.ParseProfile(c.TuneProfile); err != nil {
+			return Machine{}, fmt.Errorf("--tune-profile: %w", err)
+		}
 	}
 	// The IPv6 pair is checked with the rest of the addressing, by the rules `network set` follows.
 	if !c.IPv6 && (c.Address6 != "" || c.Gateway6 != "") {

@@ -120,20 +120,33 @@ for a in "${HOST6[@]}"; do
 done
 [[ $(on_vm readlink /etc/localtime) == */Europe/Paris && $(on_vm date +%Z) =~ ^CES?T$ ]] || fail "the VM is not in Europe/Paris's time zone"
 
-step "on the VM: the boot tuned the network for its RAM (the network profile), and the containers with it"
+step "on the VM: the boot tuned Docker's path (the release's default profile), and the containers as on the host"
 on_vm systemctl is-active notes-tune.service >/dev/null || { on_vm sudo journalctl -b -u notes-tune.service --no-pager | tail -30; fail "the tuning unit did not run"; }
-[[ $(on_vm cat /proc/sys/net/ipv4/tcp_congestion_control) == bbr && $(on_vm cat /proc/sys/net/core/default_qdisc) == fq ]] || fail "the boot did not set BBR and fq"
-(($(on_vm cat /proc/sys/net/core/rmem_max) >= 16777216 && $(on_vm cat /proc/sys/net/core/netdev_budget) >= 600)) || {
-	on_vm sudo sysctl net.core.rmem_max net.core.netdev_budget
-	on_vm sudo journalctl -b -u notes-tune.service -u notes-tune-online.service --no-pager | tail -30
-	fail "the boot did not give the network profile's ceilings"
-}
+grep -q '^tune       default (release)$' "$WORK/status.txt" || { cat "$WORK/status.txt"; fail "status does not show the release's default profile"; }
 on_vm notes-stow tune --check >"$WORK/tune.txt" 2>&1 || { cat "$WORK/tune.txt"; fail "the VM's tune --check finds settings that differ"; }
-grep -q '^this host: .* the network profile$' "$WORK/tune.txt" || { cat "$WORK/tune.txt"; fail "the VM's tune does not report the network profile"; }
+grep -q '^this host: .* the default profile$' "$WORK/tune.txt" && ! grep -q 'rmem_max' "$WORK/tune.txt" || { cat "$WORK/tune.txt"; fail "the VM's tune does not report the default profile alone"; }
+(($(on_vm cat /proc/sys/net/netfilter/nf_conntrack_max) > 65536)) || fail "the boot did not size the connection table"
+[[ $(on_vm cat /proc/sys/net/ipv4/tcp_congestion_control) != bbr ]] || fail "the default profile set BBR"
 on_vm test ! -e /etc/sysctl.d/60-stowage-net.conf || fail "the boot wrote a sysctl file"
 tuned=$(on_vm sudo docker ps -q --filter label=com.docker.compose.service=api)
-[[ $(on_vm sudo docker exec "$tuned" cat /proc/sys/net/ipv4/tcp_rmem | awk '{print $3}') -ge 16777216 ]] || fail "the api container's TCP buffers are not the VM's"
-on_vm sudo docker inspect --format "'{{json .HostConfig.LogConfig}}'" "$tuned" | grep -q '"max-size":"20m"' || fail "the api container's logs do not rotate"
+[[ $(on_vm sudo docker exec "$tuned" cat /proc/sys/net/core/somaxconn) == "$(on_vm cat /proc/sys/net/core/somaxconn)" ]] || fail "the api container's somaxconn is not the VM's"
+on_vm sudo docker inspect --format "'{{range .HostConfig.Ulimits}}{{.Name}} {{.Soft}} {{.Hard}}{{println}}{{end}}'" "$tuned" | grep -qE '^nofile 65536 [0-9]{6,}$' || fail "the api container is not given the VM's open files"
+on_vm sudo docker inspect --format "'{{json .HostConfig.LogConfig}}'" "$tuned" | grep -q '"max-size":"20m"' || fail "the api container's logs do not rotate on the default profile"
+
+step "the operator raises the VM to the network profile: a re-run tunes it at once, and the containers with it"
+on_vm sudo notes-stow install --no-input --tune-profile network >"$WORK/retune.txt" 2>&1 || { cat "$WORK/retune.txt"; fail "the re-run with --tune-profile network"; }
+grep -q 'tuning: the network profile, the operator' "$WORK/retune.txt" && grep -q 'tuned by the network profile' "$WORK/retune.txt" || { cat "$WORK/retune.txt"; fail "the re-run did not tune the VM"; }
+[[ $(on_vm cat /proc/sys/net/ipv4/tcp_congestion_control) == bbr && $(on_vm cat /proc/sys/net/core/default_qdisc) == fq ]] || fail "the re-run did not set BBR and fq"
+(($(on_vm cat /proc/sys/net/core/rmem_max) >= 16777216 && $(on_vm cat /proc/sys/net/core/netdev_budget) >= 600)) || {
+	on_vm sudo sysctl net.core.rmem_max net.core.netdev_budget
+	fail "the re-run did not give the network profile's ceilings"
+}
+[[ $(on_vm cat /proc/sys/net/ipv4/ip_local_port_range | awk '{print $1}') == 10000 ]] && on_vm cat /proc/sys/net/ipv4/ip_local_reserved_ports | grep -qw 15432 ||
+	fail "the network profile's local ports do not hold the L4 route's"
+on_vm notes-stow status | grep -q '^tune       network (operator)$' || fail "status does not show the operator's network profile"
+tuned=$(on_vm sudo docker ps -q --filter label=com.docker.compose.service=api)
+[[ $(on_vm sudo docker exec "$tuned" cat /proc/sys/net/ipv4/tcp_rmem | awk '{print $3}') -ge 16777216 && $(on_vm sudo docker exec "$tuned" cat /proc/sys/net/ipv4/tcp_tw_reuse) == 1 ]] ||
+	fail "the api container's settings are not the network profile's"
 
 step "on the VM: the L4 route's port, open to its allowlist's sources alone (this host, over IPv4)"
 # reach <address> <port>: a TCP connection opens within 8 s.
@@ -246,6 +259,12 @@ grep -q 'a backup first: notes-full-' "$WORK/upgrade.txt" && grep -q 'backed up:
 back_on 1.0.1 active "after the upgrade" "$boot"
 healthy_postgres "after the upgrade"
 [[ $(on_vm systemctl is-active notes-health.service) == active ]] || fail "the health gate did not pass 1.0.1"
+# The boot keeps the operator's profile, and its Docker file, written before Docker starts, rotates
+# the logs.
+on_vm notes-stow tune --check >"$WORK/tune.txt" 2>&1 && grep -q '^this host: .* the network profile$' "$WORK/tune.txt" ||
+	{ cat "$WORK/tune.txt"; fail "the upgraded boot's tuning differs, or is not the network profile"; }
+tuned=$(on_vm sudo docker ps -q --filter label=com.docker.compose.service=api)
+on_vm sudo docker inspect --format "'{{json .HostConfig.LogConfig}}'" "$tuned" | grep -q '"max-size":"20m"' || fail "the api container's logs do not rotate"
 # The allowlist outlives the reboot: the boot's ruleset holds it before the stack starts.
 on_vm sudo nft list chain inet notes forward | grep -q 'ct original proto-dst 15432 ip saddr != 192.0.2.1 drop' || fail "the upgraded boot lost the L4 route's allowlist"
 ! reach "$vm4" 15432 || fail "the L4 route's port answers this host after the upgrade"

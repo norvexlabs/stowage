@@ -166,6 +166,7 @@ func (in *Installer) changes(env *EnvFile) (next *EnvFile, secrets map[string]bo
 		return nil, nil, publish{}, err
 	}
 	in.frontVars(next, mode, pub, domains)
+	in.tuneVar(next)
 	in.profilesVar(next)
 	in.l4Vars(next)
 	if err := next.Check(); err != nil {

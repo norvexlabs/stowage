@@ -27,7 +27,7 @@ func TestContentComposeGivesEachOwnNamespaceTheSysctls(t *testing.T) {
 		t.Fatal(err)
 	}
 	set := map[string]string{"net.core.somaxconn": "8192", "net.ipv4.tcp_rmem": "4096 131072 16777216"}
-	raw, err := contentCompose(&model, nil, []byte("key"), set, memoryPlan{})
+	raw, err := contentCompose(&model, nil, []byte("key"), tune.Container{Sysctls: set}, memoryPlan{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -53,9 +53,62 @@ func TestContentComposeGivesEachOwnNamespaceTheSysctls(t *testing.T) {
 			t.Errorf("%s, on another's namespace, given %v", name, got[name])
 		}
 	}
-	again, _ := contentCompose(&model, nil, []byte("key"), set, memoryPlan{})
+	again, _ := contentCompose(&model, nil, []byte("key"), tune.Container{Sysctls: set}, memoryPlan{})
 	if !bytes.Equal(raw, again) {
 		t.Error("the file is not the same from one run to the next")
+	}
+}
+
+// Each service is given the open files the host allows, unless it sets its own; each network the
+// stack makes as a bridge the host's MTU, unless it sets its own.
+func TestContentComposeGivesTheHostsOpenFilesAndMTU(t *testing.T) {
+	t.Parallel()
+	var model composeModel
+	if err := json.Unmarshal([]byte(`{"services": {
+		"app": {},
+		"own": {"ulimits": {"nofile": {"soft": 1024, "hard": 4096}}},
+		"hosted": {"network_mode": "host"}},
+		"networks": {
+		"default": {"name": "p_default"},
+		"edge": {"driver": "bridge"},
+		"set": {"driver_opts": {"com.docker.network.driver.mtu": "1400"}},
+		"shared": {"external": true},
+		"over": {"driver": "overlay"}}}`), &model); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := contentCompose(&model, nil, []byte("key"), tune.Container{Nofile: 524288, MTU: 9001}, memoryPlan{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc struct {
+		Services map[string]struct {
+			Ulimits map[string]map[string]int `yaml:"ulimits"`
+		} `yaml:"services"`
+		Networks map[string]struct {
+			DriverOpts map[string]string `yaml:"driver_opts"`
+		} `yaml:"networks"`
+	}
+	if err := yaml.Unmarshal(raw, &doc); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"app", "hosted"} {
+		if n := doc.Services[name].Ulimits["nofile"]; n["soft"] != tune.NofileSoft || n["hard"] != 524288 {
+			t.Errorf("%s's open files: %v\n%s", name, n, raw)
+		}
+	}
+	if _, ok := doc.Services["own"]; ok {
+		t.Errorf("own, which sets its open files: %v", doc.Services["own"])
+	}
+	if len(doc.Networks) != 2 || doc.Networks["default"].DriverOpts[mtuOpt] != "9001" || doc.Networks["edge"].DriverOpts[mtuOpt] != "9001" {
+		t.Errorf("networks: %+v\n%s", doc.Networks, raw)
+	}
+	// A hard limit below the soft cap: the soft limit is the hard one.
+	raw, _ = contentCompose(&model, nil, []byte("key"), tune.Container{Nofile: 4096}, memoryPlan{})
+	if !strings.Contains(string(raw), "hard: 4096\n                soft: 4096\n") {
+		t.Errorf("a hard limit of 4096:\n%s", raw)
+	}
+	if raw, _ := contentCompose(&model, nil, []byte("key"), tune.Container{}, memoryPlan{}); string(raw) != contentPlaceholder {
+		t.Errorf("nothing to give:\n%s", raw)
 	}
 }
 
@@ -74,7 +127,8 @@ func tuneRoot(t *testing.T) string {
 	}
 	put("proc/meminfo", "MemTotal: 4194304 kB\n")
 	put("proc/sys/kernel/osrelease", "6.8.0-45-generic\n")
-	for _, c := range (tune.Host{MemBytes: 4 << 30, CPUs: 1, PageSize: 4096}).Sysctls() {
+	put("proc/sys/fs/nr_open", "1048576\n")
+	for _, c := range (tune.Host{MemBytes: 4 << 30, CPUs: 1, PageSize: 4096, Profile: tune.Network}).Sysctls() {
 		put(c.Path(), "1\n")
 	}
 	return root
@@ -108,8 +162,12 @@ func TestInstallGivesTheContainersTheHostsSettings(t *testing.T) {
 	if err := os.Remove(filepath.Join(root, "proc/sys/net/ipv4/tcp_notsent_lowat")); err != nil {
 		t.Fatal(err)
 	}
-	if err := e.install(func(o *Options) { o.Tune = fakeTune(root, 1000) }); err != nil {
+	network := "network"
+	if err := e.install(func(o *Options) { o.Tune = fakeTune(root, 1000); o.TuneProfile = &network }); err != nil {
 		t.Fatalf("%v\n%s", err, e.log)
+	}
+	if v, _ := e.readEnv().Get(TuneProfileVar); v != "network" {
+		t.Errorf("--tune-profile network recorded as %q", v)
 	}
 	raw, err := os.ReadFile(filepath.Join(e.dir, ContentCompose))
 	if err != nil {
@@ -124,7 +182,7 @@ func TestInstallGivesTheContainersTheHostsSettings(t *testing.T) {
 		t.Fatal(err)
 	}
 	api, web := doc.Services["api"].Sysctls, doc.Services["web"].Sysctls
-	if api["net.ipv4.tcp_rmem"] != "4096 131072 16777216" || api["net.core.somaxconn"] != "8192" {
+	if api["net.ipv4.tcp_rmem"] != "4096 131072 33554432" || api["net.core.somaxconn"] != "8192" || api["net.ipv4.tcp_tw_reuse"] != "1" {
 		t.Errorf("api: %v\n%s", api, raw)
 	}
 	if _, ok := api["net.ipv4.tcp_notsent_lowat"]; ok {
@@ -197,10 +255,13 @@ func TestTune(t *testing.T) {
 	if err := in.Tune(ctx, TuneOptions{Print: true}); err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"# " + tune.SysctlFile + "\n", "# " + tune.DaemonFile + "\n", "# note: ethtool is not installed"} {
+	for _, want := range []string{"# " + tune.SysctlFile + "\n", "# note: ethtool is not installed"} {
 		if !strings.Contains(e.out.String(), want) {
 			t.Errorf("--print lacks %q:\n%s", want, e.out)
 		}
+	}
+	if strings.Contains(e.out.String(), "# "+tune.DaemonFile) || strings.Contains(e.out.String(), "rmem_max") {
+		t.Errorf("the default profile prints the network one's:\n%s", e.out)
 	}
 	if _, err := os.Stat(filepath.Join(root, tune.SysctlFile)); !errors.Is(err, os.ErrNotExist) {
 		t.Error("--print wrote")
@@ -212,8 +273,14 @@ func TestTune(t *testing.T) {
 	if err := in.Tune(ctx, TuneOptions{Apply: true}); err != nil {
 		t.Fatal(err)
 	}
-	if raw, err := os.ReadFile(filepath.Join(root, tune.DaemonFile)); err != nil || !strings.Contains(string(raw), `"Soft": 1048576`) {
-		t.Errorf("daemon.json after --apply: %v\n%s", err, raw)
+	if _, err := os.Stat(filepath.Join(root, tune.DaemonFile)); !errors.Is(err, os.ErrNotExist) {
+		t.Error("the default profile wrote Docker's file")
+	}
+	if err := in.Tune(ctx, TuneOptions{Apply: true, Profile: tune.Network}); err != nil {
+		t.Fatal(err)
+	}
+	if raw, err := os.ReadFile(filepath.Join(root, tune.DaemonFile)); err != nil || !strings.Contains(string(raw), `"max-size": "20m"`) {
+		t.Errorf("daemon.json after --apply --profile network: %v\n%s", err, raw)
 	}
 	if !strings.Contains(e.log.String(), "systemctl restart docker") {
 		t.Errorf("no word of the restart:\n%s", e.log)
@@ -353,7 +420,12 @@ func TestTheVMsTuneOnlyReports(t *testing.T) {
 	dockerInfo(e.docker, `27.3.1|Ubuntu 24.04 LTS|[]`)
 	root := tuneRoot(t)
 	sys := fakeTune(root, 0)
-	sys.Profile = tune.Network
+	if err := os.MkdirAll(e.dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(e.dir, envName), []byte(TuneProfileVar+"='network'\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	in := e.installer(func(o *Options) { o.Tune = sys; o.TunedAtBoot = true; o.Yes = true })
 	ctx := context.Background()
 	for _, o := range []TuneOptions{{Apply: true}, {Print: true}, {Revert: true}} {
@@ -367,6 +439,18 @@ func TestTheVMsTuneOnlyReports(t *testing.T) {
 	if err := in.Tune(ctx, TuneOptions{}); err != nil || !strings.Contains(e.out.String(), "the network profile") || !strings.Contains(e.out.String(), "net.core.netdev_budget") ||
 		!strings.Contains(e.out.String(), "a reboot tunes it again; `sudo journalctl -b -u notes-tune -u notes-tune-online`") || strings.Contains(e.out.String(), "--apply") {
 		t.Errorf("the VM's report: %v\n%s", err, e.out)
+	}
+	// The profile the boot applied is the one the VM holds until its next boot: a lower one the
+	// operator chose since is not judged yet, nor needs the install's record, which only root reads.
+	if err := os.MkdirAll(filepath.Join(root, "run/stowage"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, tune.BootProfileFile), []byte("default\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	e.out.Reset()
+	if err := in.Tune(ctx, TuneOptions{}); err != nil || !strings.Contains(e.out.String(), "the default profile") {
+		t.Errorf("the VM's report after a boot of the default profile: %v\n%s", err, e.out)
 	}
 	cmd := tuneCommand(in, func() error { return nil }, func(bool) Prompter { return nil }, true)
 	cmd.SetArgs([]string{"--apply"})
@@ -396,12 +480,12 @@ func TestTuneProfileFlag(t *testing.T) {
 		t.Errorf("--profile network: %v\n%s", err, e.out)
 	}
 	e.out.Reset()
-	if err := run(); err != nil || !strings.Contains(e.out.String(), "the shared profile") {
+	if err := run(); err != nil || !strings.Contains(e.out.String(), "the default profile") {
 		t.Errorf("no --profile: %v\n%s", err, e.out)
 	}
 }
 
-func TestTuneRefusesTheSharedProfileOnANetworkHost(t *testing.T) {
+func TestTuneRefusesTheDefaultProfileOnANetworkHost(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
 	dockerInfo(e.docker, `27.3.1|Ubuntu 24.04 LTS|[]`)
@@ -413,8 +497,8 @@ func TestTuneRefusesTheSharedProfileOnANetworkHost(t *testing.T) {
 		t.Fatal(err)
 	}
 	in := e.installer(func(o *Options) { o.Tune = fakeTune(root, 1000) })
-	if err := in.Tune(context.Background(), TuneOptions{Check: true, Profile: tune.Shared}); err == nil || !strings.Contains(err.Error(), "tune --revert` first") {
-		t.Errorf("--check --profile shared on a network host: %v", err)
+	if err := in.Tune(context.Background(), TuneOptions{Check: true, Profile: tune.Default}); err == nil || !strings.Contains(err.Error(), "tune --revert` first") {
+		t.Errorf("--check --profile default on a network host: %v", err)
 	}
 	if err := in.Tune(context.Background(), TuneOptions{}); err != nil || !strings.Contains(e.out.String(), "the network profile") {
 		t.Errorf("the report follows the recorded profile: %v\n%s", err, e.out)

@@ -237,7 +237,9 @@ type Status struct {
 	// restore again finishes.
 	VolumesSplit bool   `json:"volumes_split,omitempty"`
 	Channel      string `json:"channel,omitempty"`
-	Disk         *Disk  `json:"disk,omitempty"`
+	// Tune is the stack's tuning profile, and whose it is: "network (operator)".
+	Tune string `json:"tune,omitempty"`
+	Disk *Disk  `json:"disk,omitempty"`
 	// Pressure is the disk-pressure watch's reading; nil without hooks.maintenance.disk_pressure.
 	Pressure *DiskPressure `json:"disk_pressure,omitempty"`
 	// Cert is a byo install's certificate: its end, and a warning from 30 days before it.
@@ -580,6 +582,8 @@ func (h *Hostd) status(w http.ResponseWriter, r *http.Request) {
 		st.Installing, st.InstallFailed, _ = in.firstInstall()
 		st.RestoreAwaited = in.restoreAwaited()
 		st.Channel, _ = env.Get(ChannelVar)
+		p, by := in.tuneProfile(func(k string) string { v, _ := env.Get(k); return v })
+		st.Tune = fmt.Sprintf("%s (%s)", p, by)
 		if mode, _ := env.Get("STOWAGE_TLS_MODE"); mode == "byo" {
 			st.Cert, _ = certStatus(in.O.Dir, time.Now(), h.renewHint())
 		}

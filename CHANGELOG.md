@@ -23,8 +23,26 @@ follow [SemVer](https://semver.org/).
   install directory are kept for a later install, or deleted with `--data`.
 - **`KEY_ACCEPTED`** beside a rotated secret: the other value its services accept during a
   rotation, so a service reads one variable instead of two.
+- **Tuning profiles**: `tune.profile` in `stowage.yaml` picks how the hosts are tuned — `default`
+  (also without `tune`) makes Docker's path as fast as the host's network and nothing more,
+  `network` adds the tuning of a host serving a heavy network load. The operator may choose
+  another with `--tune-profile` (Docker install and re-run, `vm create`, the VM's `install`),
+  `release` to follow the release again; `status` shows the profile and whose it is.
+- **Containers as on the host**, on every profile: each container takes the host's own network
+  settings, the open files the host allows, and the stack's networks the host route's MTU.
+- **The network profile goes further**: `tcp_tw_reuse`, a wide range of local ports that keeps
+  the stack's own ports out of it, larger neighbour tables, a 65536 floor for the packet
+  backlog, a NIC's interrupts spread over the CPUs (unless `irqbalance` runs), its packets
+  spread over every CPU when it has fewer queues than CPUs, and the CPUs at full speed.
 
 ### Changed
+- **The Kairos VM is no longer always tuned for the network**: it applies its stack's profile,
+  `default` unless the release or the operator chooses `network`. A VM raised to `network` by a
+  re-run is tuned at once; lowered, at its next reboot.
+- `tune --profile` takes `default` or `network` (`shared` is gone; a host applied with it reads
+  as `default`), and defaults to the stack's profile, or the last `--apply`'s when higher.
+  `tune --apply` no longer writes the open-file limit or the MTU into Docker's file: the
+  containers get them from the install.
 - `ship` and the commit hook refuse a version that `month_guard` puts out of its month, unless
   the channel holds it already (a resumed ship, a later revision); `lint` still only warns.
 - `k8s install`, `upgrade` and `reset-db` with `--unsafe-sysctls` refuse at once a namespace

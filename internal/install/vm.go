@@ -112,6 +112,9 @@ type Settings struct {
 	AwaitSecrets bool `yaml:"await_secrets,omitempty"`
 	// IPv6 turns IPv6 on for the stack's network (`vm create --ipv6`, as `install --ipv6`).
 	IPv6 bool `yaml:"ipv6,omitempty"`
+	// TuneProfile is the operator's tuning profile (`vm create --tune-profile`, as `install
+	// --tune-profile`); the boot takes it before the first install records it.
+	TuneProfile string `yaml:"tune_profile,omitempty"`
 	// Release is the release the first install runs when the VM boots another release's disk (a
 	// release that published none boots its channel's disk set): the first boot writes its OS
 	// bundle into the passive slot and reboots into it, then installs. Absent, the OS's release.
@@ -225,6 +228,11 @@ func (in *Installer) applySettings(path string, st *Settings) error {
 	o.HTTPSPort = cmp.Or(o.HTTPSPort, st.HTTPSPort)
 	if o.IPv6 == nil && st.IPv6 {
 		o.IPv6 = &st.IPv6
+	}
+	if o.TuneProfile == nil && st.TuneProfile != "" {
+		if err := (tuneProfileValue{&o.TuneProfile}).Set(st.TuneProfile); err != nil {
+			return fmt.Errorf("%s: tune_profile %w", path, err)
+		}
 	}
 	if len(st.Inputs) > 0 {
 		answers := maps.Clone(st.Inputs)

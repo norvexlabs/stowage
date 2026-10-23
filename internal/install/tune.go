@@ -12,14 +12,11 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// MinDockerNetworkOpts is the engine that reads default-network-opts, where the host's MTU is
-// given to the networks Compose makes.
-var MinDockerNetworkOpts = [3]int{24, 0, 0}
-
 // TuneOptions is a run of `tune`: a report without a flag.
 type TuneOptions struct {
 	Check, Print, Apply, Revert, RestartDocker bool
-	// Profile is the rules' profile; "" is the one the last apply recorded, else shared.
+	// Profile is the rules' profile; "" is the stack's (the higher of it and the last apply's on
+	// a Docker host).
 	Profile tune.Profile
 }
 
@@ -43,33 +40,33 @@ func (in *Installer) tuneSystem(ctx context.Context) (tune.System, error) {
 	if len(f) != 3 {
 		return sys, fmt.Errorf("docker info: %q", out)
 	}
-	v, ok := parseVersion(f[0])
 	sys.Docker = &tune.Docker{
 		Rootless:    strings.Contains(f[2], "name=rootless"),
 		UsernsRemap: strings.Contains(f[2], "name=userns"),
 		Desktop:     strings.Contains(f[1], "Docker Desktop"),
-		NetworkOpts: ok && !older(v, MinDockerNetworkOpts),
 	}
 	in.tuned = &sys
 	return sys, nil
 }
 
-// containerSizing is what each container is given from this host, read once: the network
-// settings, and the memory limits of stack.memory; none without a host to read. An engine or a
-// host that does not read fails the start: settings dropped for one start would recreate every
-// service, and again at the next.
-func (in *Installer) containerSizing(ctx context.Context) (map[string]string, memoryPlan, error) {
+// containerSizing is what each container is given from this host, read once: the settings that
+// run it as on the host, by the stack's tuning profile as get reads the install, and the memory
+// limits of stack.memory; none without a host to read. An engine or a host that does not read
+// fails the start: settings dropped for one start would recreate every service, and again at the
+// next.
+func (in *Installer) containerSizing(ctx context.Context, get func(string) string) (tune.Container, memoryPlan, error) {
 	if in.O.Tune == nil {
-		return nil, memoryPlan{}, nil
+		return tune.Container{}, memoryPlan{}, nil
 	}
 	sys, err := in.tuneSystem(ctx)
 	if err != nil {
-		return nil, memoryPlan{}, fmt.Errorf("the containers' network settings and memory: %w", err)
+		return tune.Container{}, memoryPlan{}, fmt.Errorf("the containers' network settings and memory: %w", err)
 	}
 	h, err := sys.Host()
 	if err != nil {
-		return nil, memoryPlan{}, fmt.Errorf("the containers' network settings and memory: %w", err)
+		return tune.Container{}, memoryPlan{}, fmt.Errorf("the containers' network settings and memory: %w", err)
 	}
+	h.Profile, _ = in.tuneProfile(get)
 	return sys.Container(h), in.memoryPlan(sys, h), nil
 }
 
@@ -92,12 +89,15 @@ func (in *Installer) Tune(ctx context.Context, t TuneOptions) error {
 			in.O.logf("note: %v: the Docker daemon's file is left out", err)
 		}
 	}
-	if t.Profile != "" {
-		sys.Profile = t.Profile
-	}
+	sys.Profile = t.Profile
 	h, err := sys.Host()
 	if err != nil {
 		return err
+	}
+	if t.Profile == "" {
+		h = in.hostProfile(sys, h)
+	} else {
+		h.Reserved = in.stackPorts(in.reportEnv(true))
 	}
 	if !t.Revert {
 		if err := sys.CheckProfile(h); err != nil {
@@ -224,8 +224,9 @@ func (in *Installer) tuneHint(ctx context.Context) {
 	if err != nil {
 		return
 	}
+	h = in.hostProfile(sys, h)
 	if n := tune.Drift(sys.Inspect(ctx, h)); n > 0 {
-		fmt.Fprintf(in.O.Out, "tuning   %d network settings of this host differ from what its RAM and CPUs call for: `%s tune` shows them\n", n, in.R.Ctl())
+		fmt.Fprintf(in.O.Out, "tuning   %d network settings of this host differ from what the %s profile calls for on its RAM and CPUs: `%s tune` shows them\n", n, h.Profile, in.R.Ctl())
 	}
 }
 
@@ -279,7 +280,7 @@ func tuneCommand(in *Installer, prepare func() error, terminal func(bool) Prompt
 	f.BoolVar(&t.Print, "print", false, "print the files --apply writes, for a host configured by other means")
 	f.BoolVar(&t.Apply, "apply", false, "write the files and apply them to the running host (root; asks first)")
 	f.BoolVar(&t.Revert, "revert", false, "remove the files and put back what the first --apply found (root; asks first)")
-	f.StringVar(&profile, "profile", "", "shared (a host the admin runs other processes on) or network (a host that runs the stack alone: larger ceilings, NIC rings, flow steering); default: the last --apply's, else shared")
+	f.StringVar(&profile, "profile", "", "default (Docker's path as fast as the host's network) or network (a host serving a heavy network load: larger ceilings, BBR, many connections' ports and neighbours, NIC rings, interrupts and flow steering, the CPUs at full speed); default: the stack's, or the last --apply's when it is higher")
 	f.BoolVar(&t.RestartDocker, "restart-docker", false, "--apply, --revert: restart Docker when its daemon file changed (its containers restart with it)")
 	f.BoolVarP(&yes, "yes", "y", false, "--apply, --revert: change the host without asking")
 	f.BoolVar(&noInput, "no-input", false, "never ask: without --yes, refuse")

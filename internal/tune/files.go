@@ -26,6 +26,9 @@ const (
 	// BootUdevFile is the udev rule Boot writes: the runtime's, gone at the next boot, which writes
 	// it again.
 	BootUdevFile = "run/udev/rules.d/60-stowage-net.rules"
+	// BootProfileFile is the profile the last Boot applied and the ports it reserved (0644, the
+	// runtime's): what the host holds until its next boot, which a report reads without root.
+	BootProfileFile = "run/stowage/tune-profile"
 	// StateFile records what the first apply replaced, for `--revert`.
 	StateFile = "etc/stowage/tune.json"
 )
@@ -44,54 +47,35 @@ type daemonWant struct {
 }
 
 func (s System) daemonWants(h Host) []daemonWant {
-	w := []daemonWant{{
-		path:  []string{"default-ulimits", "nofile"},
-		value: map[string]any{"Name": "nofile", "Soft": NofileLimit, "Hard": NofileLimit},
-		show:  fmt.Sprintf("Soft and Hard ≥ %d", NofileLimit),
-		flag:  "--default-ulimit",
+	if !h.network() && !s.Owned {
+		return nil
+	}
+	// The host runs the stack alone (the network profile's, or Stowage's own VM on every
+	// profile), and its logs share its disk: the default driver's files rotate. json-file's own
+	// options, so a service's logging options keep working.
+	return []daemonWant{{
+		path:  []string{"log-opts"},
+		value: map[string]any{"max-size": LogMaxSize, "max-file": LogMaxFiles},
+		show:  fmt.Sprintf("max-size %s, max-file %s (json-file's rotation, for the containers made from then on)", LogMaxSize, LogMaxFiles),
+		flag:  "--log-opt",
 		ok: func(have json.RawMessage) bool {
-			var u struct{ Soft, Hard int64 }
-			return json.Unmarshal(have, &u) == nil && u.Soft >= NofileLimit && u.Hard >= NofileLimit
+			var o map[string]string
+			return json.Unmarshal(have, &o) == nil && o["max-size"] != "" && o["max-file"] != ""
+		},
+		// A driver or options the file names are the admin's: theirs to rotate.
+		leave: func(raw []byte, args map[string]string) string {
+			if driver, ok, _ := daemonValue(raw, []string{"log-driver"}); ok && string(driver) != `"json-file"` {
+				return "the daemon's file chooses " + string(driver)
+			}
+			if d := args["--log-driver"]; d != "" && d != "json-file" {
+				return "dockerd runs with --log-driver " + d
+			}
+			if have, ok, _ := daemonValue(raw, []string{"log-opts"}); ok {
+				return "the daemon's file has log options of its own: " + string(have)
+			}
+			return ""
 		},
 	}}
-	if mtu := s.MTU(); s.Docker.NetworkOpts && mtu > 0 && mtu != 1500 {
-		v := strconv.Itoa(mtu)
-		w = append(w, daemonWant{
-			path:  []string{"default-network-opts", "bridge", "com.docker.network.driver.mtu"},
-			value: v,
-			show:  v + " (the host's MTU, on the networks made from now on)",
-			flag:  "--default-network-opt",
-			ok:    func(have json.RawMessage) bool { return string(have) == strconv.Quote(v) },
-		})
-	}
-	if h.network() {
-		// The host runs the stack alone, and its logs share its disk: the default driver's files
-		// rotate. json-file's own options, so a service's logging options keep working.
-		w = append(w, daemonWant{
-			path:  []string{"log-opts"},
-			value: map[string]any{"max-size": LogMaxSize, "max-file": LogMaxFiles},
-			show:  fmt.Sprintf("max-size %s, max-file %s (json-file's rotation, for the containers made from then on)", LogMaxSize, LogMaxFiles),
-			flag:  "--log-opt",
-			ok: func(have json.RawMessage) bool {
-				var o map[string]string
-				return json.Unmarshal(have, &o) == nil && o["max-size"] != "" && o["max-file"] != ""
-			},
-			// A driver or options the file names are the admin's: theirs to rotate.
-			leave: func(raw []byte, args map[string]string) string {
-				if driver, ok, _ := daemonValue(raw, []string{"log-driver"}); ok && string(driver) != `"json-file"` {
-					return "the daemon's file chooses " + string(driver)
-				}
-				if d := args["--log-driver"]; d != "" && d != "json-file" {
-					return "dockerd runs with --log-driver " + d
-				}
-				if have, ok, _ := daemonValue(raw, []string{"log-opts"}); ok {
-					return "the daemon's file has log options of its own: " + string(have)
-				}
-				return ""
-			},
-		})
-	}
-	return w
 }
 
 // The default log driver's rotation on the network profile.
@@ -132,13 +116,13 @@ type state struct {
 	// one changed since is the host's own.
 	Wrote  map[string]string `json:"wrote"`
 	Daemon []daemonRecord    `json:"daemon"`
-	// Profile is the last apply's: the report and the containers' settings follow it.
+	// Profile is the last apply's: a report without --profile follows it.
 	Profile Profile `json:"profile,omitempty"`
 }
 
 // checkProfile refuses h's profile on a host the last apply tuned with the network one: the
 // network profile's own keys (the log rotation, the softirq budget, the steering) are not the
-// shared one's, which would neither judge, keep nor revert them.
+// default one's, which would neither judge, keep nor revert them.
 func (st *state) checkProfile(ctl string, h Host) error {
 	if st.Profile == Network && !h.network() {
 		return fmt.Errorf("this host was tuned with --profile network: `%s tune --revert` first, then `%s tune --apply --profile %s`", ctl, ctl, h.Profile)
@@ -210,7 +194,7 @@ func (s System) Plan(h Host) (*Plan, error) {
 	}
 	files := map[string]string{
 		SysctlFile:  b.String(),
-		ModulesFile: s.header(h) + strings.Join(Modules, "\n") + "\n",
+		ModulesFile: s.header(h) + strings.Join(h.Modules(), "\n") + "\n",
 	}
 	b.Reset()
 	b.WriteString(s.header(h))
@@ -225,10 +209,16 @@ func (s System) Plan(h Host) (*Plan, error) {
 	if h.network() {
 		b.WriteString("# A NIC's receive queue: its share of the flows steered to the CPU that reads them.\n")
 		fmt.Fprintf(&b, "ACTION==\"add\", SUBSYSTEM==\"queues\", KERNEL==\"rx-*\", DEVPATH!=\"/devices/virtual/*\", ATTR{rps_flow_cnt}=\"%d\"\n", h.QueueFlows())
+		for _, n := range s.nics() {
+			if h.steers(n) {
+				fmt.Fprintf(&b, "# %s has fewer receive queues than CPUs: its packets spread over every CPU.\n", n.name)
+				fmt.Fprintf(&b, "ACTION==\"add\", SUBSYSTEM==\"queues\", KERNEL==\"rx-*\", DEVPATH==\"*/net/%s/queues/rx-*\", ATTR{rps_cpus}=\"%s\"\n", n.name, h.RPSMask())
+			}
+		}
+		b.WriteString("# A TUN or TAP device made on the host: a longer queue, its packets spread over every CPU.\n")
+		fmt.Fprintf(&b, "ACTION==\"add\", SUBSYSTEM==\"net\", TEST==\"tun_flags\", ATTR{tx_queue_len}=\"%d\"\n", h.TunQueueLen())
+		fmt.Fprintf(&b, "ACTION==\"add\", SUBSYSTEM==\"queues\", KERNEL==\"rx-*\", TEST==\"../../tun_flags\", ATTR{rps_cpus}=\"%s\", ATTR{rps_flow_cnt}=\"%d\"\n", h.RPSMask(), h.FlowEntries())
 	}
-	b.WriteString("# A TUN or TAP device made on the host: a longer queue, its packets spread over every CPU.\n")
-	fmt.Fprintf(&b, "ACTION==\"add\", SUBSYSTEM==\"net\", TEST==\"tun_flags\", ATTR{tx_queue_len}=\"%d\"\n", h.TunQueueLen())
-	fmt.Fprintf(&b, "ACTION==\"add\", SUBSYSTEM==\"queues\", KERNEL==\"rx-*\", TEST==\"../../tun_flags\", ATTR{rps_cpus}=\"%s\", ATTR{rps_flow_cnt}=\"%d\"\n", h.RPSMask(), h.FlowEntries())
 	files[UdevFile] = b.String()
 	for _, name := range []string{SysctlFile, ModulesFile, UdevFile} {
 		f := File{Path: name, Content: []byte(files[name])}
@@ -239,7 +229,7 @@ func (s System) Plan(h Host) (*Plan, error) {
 		}
 		p.Files = append(p.Files, f)
 	}
-	if s.Docker == nil || s.Docker.Rootless || s.Docker.Desktop {
+	if s.Docker == nil || s.Docker.Rootless || s.Docker.Desktop || len(s.daemonWants(h)) == 0 {
 		return p, nil
 	}
 	return p, s.planDaemon(p)
@@ -399,6 +389,9 @@ func (s System) readState() (*state, error) {
 	if err := d.Decode(&st); err != nil {
 		return nil, fmt.Errorf("%s: %w", s.path(StateFile), err)
 	}
+	if st.Profile == legacyShared {
+		st.Profile = Default
+	}
 	if st.Sysctls == nil {
 		st.Sysctls = map[string]string{}
 	}
@@ -435,7 +428,7 @@ func (s System) Apply(ctx context.Context, p *Plan, o ApplyOptions) ([]string, e
 		return nil, err
 	}
 	// The modules first: the settings they bring are then there to record.
-	notes := s.loadModules(ctx)
+	notes := s.loadModules(ctx, p.Host)
 	// What the first apply finds is what a revert puts back: a later apply records only keys the
 	// earlier ones did not set.
 	for _, c := range p.Host.Sysctls() {
@@ -489,10 +482,10 @@ func (s System) Apply(ctx context.Context, p *Plan, o ApplyOptions) ([]string, e
 	return notes, nil
 }
 
-// loadModules loads Modules into the running kernel.
-func (s System) loadModules(ctx context.Context) []string {
+// loadModules loads h's modules into the running kernel.
+func (s System) loadModules(ctx context.Context, h Host) []string {
 	var notes []string
-	for _, m := range Modules {
+	for _, m := range h.Modules() {
 		if _, err := s.Run(ctx, "modprobe", m); err != nil {
 			notes = append(notes, fmt.Sprintf("modprobe %s: %v", m, err))
 		}
@@ -509,6 +502,9 @@ func (s System) live(ctx context.Context, p *Plan) []string {
 		notes = append(notes, "an interface already up takes the fq queue when it next comes up")
 	}
 	for _, kv := range p.values {
+		if s.ipv6Off(kv[0]) {
+			continue
+		}
 		if err := os.WriteFile(s.path(Sysctl{Key: kv[0]}.Path()), []byte(kv[1]+"\n"), 0o644); err != nil {
 			notes = append(notes, fmt.Sprintf("%s: %v", kv[0], err))
 		}
@@ -536,8 +532,12 @@ func (s System) live(ctx context.Context, p *Plan) []string {
 			}
 		}
 	}
+	if h.network() {
+		notes = append(notes, s.steer(h, all)...)
+		notes = append(notes, s.governor()...)
+	}
 	for _, n := range all {
-		if !n.tun {
+		if !n.tun || !h.network() {
 			continue
 		}
 		dir := filepath.Join("sys/class/net", n.name)
@@ -563,6 +563,65 @@ func linkUp(s System, name string) bool {
 	}
 	f, err := strconv.ParseUint(strings.TrimPrefix(v, "0x"), 16, 64)
 	return err != nil || f&1 == 1
+}
+
+// steers reports whether the network profile spreads n's packets over every CPU (RPS): a NIC
+// with fewer receive queues than CPUs, whose hardware cannot.
+func (h Host) steers(n nic) bool {
+	return h.network() && n.physical && n.queues > 0 && n.queues < h.CPUs
+}
+
+// steer spreads each NIC's received packets over the CPUs: a NIC's interrupts that all land on
+// one CPU go one to a CPU, unless irqbalance moves them; a NIC with fewer queues than CPUs has
+// its packets spread by RPS.
+func (s System) steer(h Host, all []nic) []string {
+	var notes []string
+	balanced := s.running("irqbalance")
+	cpus := h.cpuIDs()
+	for _, n := range all {
+		if !n.physical {
+			continue
+		}
+		if irqs := s.irqs(n); !balanced && len(cpus) > 1 && s.irqsStacked(irqs) {
+			refused := 0
+			for i, irq := range irqs {
+				f := filepath.Join("proc/irq", strconv.Itoa(irq), "smp_affinity_list")
+				if err := os.WriteFile(s.path(f), []byte(strconv.Itoa(cpus[i%len(cpus)])+"\n"), 0o644); err != nil {
+					refused++
+				}
+			}
+			if refused > 0 {
+				notes = append(notes, fmt.Sprintf("%s: %d of its %d interrupts keep their CPU (the kernel manages them)", n.name, refused, len(irqs)))
+			}
+		}
+		if !h.steers(n) {
+			continue
+		}
+		for i := range n.queues {
+			f := filepath.Join("sys/class/net", n.name, "queues", fmt.Sprintf("rx-%d", i), "rps_cpus")
+			if cur, _ := s.read(f); !sameMask(cur, h.RPSMask()) {
+				if err := os.WriteFile(s.path(f), []byte(h.RPSMask()+"\n"), 0o644); err != nil {
+					notes = append(notes, fmt.Sprintf("%s rx-%d rps_cpus: %v", n.name, i, err))
+				}
+			}
+		}
+	}
+	return notes
+}
+
+// governor puts every CPU whose frequency the kernel drives (cpufreq) on the performance
+// governor, where its driver offers it.
+func (s System) governor() []string {
+	var notes []string
+	for _, g := range s.governors() {
+		if g.have == "performance" || !g.offers {
+			continue
+		}
+		if err := os.WriteFile(s.path(g.file), []byte("performance\n"), 0o644); err != nil {
+			notes = append(notes, fmt.Sprintf("%s: %v", g.file, err))
+		}
+	}
+	return notes
 }
 
 // growRing gives a NIC the ring the network profile wants, when it is larger than the NIC's.
@@ -597,13 +656,14 @@ func (s System) growRing(ctx context.Context, h Host, eth string, n nic) []strin
 
 // Boot tunes a host Stowage owns at each boot, before its network and Docker start: the modules,
 // the settings from what the kernel holds now (so a resized VM is tuned for its new RAM), a
-// runtime udev rule, the daemon file's keys and the NICs and TUN devices already there. It writes
-// no file that outlives the boot and no state: the next boot computes it all again.
+// runtime udev rule, the daemon file's keys and the NICs and TUN devices already there, then
+// records the profile in BootProfileFile. It writes no file that outlives the boot and no state:
+// the next boot computes it all again.
 func (s System) Boot(ctx context.Context, h Host) ([]string, error) {
 	if err := s.root(); err != nil {
 		return nil, err
 	}
-	notes := s.loadModules(ctx)
+	notes := s.loadModules(ctx, h)
 	// A daemon file that does not merge leaves Docker as it is, not the rest of the boot's tuning.
 	p, err := s.Plan(h)
 	if p == nil {
@@ -628,7 +688,33 @@ func (s System) Boot(ctx context.Context, h Host) ([]string, error) {
 		}
 	}
 	notes = append(notes, p.Notes...)
-	return append(notes, s.live(ctx, p)...), nil
+	notes = append(notes, s.live(ctx, p)...)
+	ports := make([]string, len(h.Reserved))
+	for i, port := range h.Reserved {
+		ports[i] = strconv.Itoa(port)
+	}
+	return notes, s.writeFile(BootProfileFile, []byte(strings.TrimSpace(string(h.Profile)+" "+strings.Join(ports, ","))+"\n"), 0o644)
+}
+
+// Booted is the profile the last Boot applied and the ports it reserved; false when none did
+// since the host booted.
+func (s System) Booted() (Profile, []int, bool) {
+	v, ok := s.read(BootProfileFile)
+	if !ok {
+		return "", nil, false
+	}
+	name, list, _ := strings.Cut(v, " ")
+	p, err := ParseProfile(name)
+	if err != nil {
+		return "", nil, false
+	}
+	var ports []int
+	for f := range strings.SplitSeq(list, ",") {
+		if n, err := strconv.Atoi(f); err == nil {
+			ports = append(ports, n)
+		}
+	}
+	return p, ports, true
 }
 
 // Revert removes the files, puts back the daemon keys still holding what tune set and the
@@ -677,7 +763,7 @@ func (s System) Revert(ctx context.Context, restartDocker bool) ([]string, error
 			notes = append(notes, fmt.Sprintf("%s: %v", k, err))
 		}
 	}
-	notes = append(notes, "the NICs' offload and flow steering and the TUN devices' queues stay as they are until the next boot")
+	notes = append(notes, "the NICs' offload, interrupts and flow steering, the TUN devices' queues and the CPUs' governor stay as they are until the next boot")
 	if err := os.Remove(s.path(StateFile)); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return nil, err
 	}

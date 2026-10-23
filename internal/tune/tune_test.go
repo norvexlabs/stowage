@@ -11,42 +11,132 @@ import (
 )
 
 func host(memMiB uint64, cpus int) Host {
-	return Host{MemBytes: memMiB * mib, CPUs: cpus, PageSize: 4096}
+	return Host{MemBytes: memMiB * mib, CPUs: cpus, PageSize: 4096, Profile: Default}
+}
+
+func netHost(memMiB uint64, cpus int) Host {
+	h := host(memMiB, cpus)
+	h.Profile = Network
+	return h
 }
 
 func TestRulesScaleWithRAM(t *testing.T) {
 	t.Parallel()
 	for _, c := range []struct {
-		mem                             uint64
-		cpus                            int
-		buf, backlog, conn, free, flows uint64
-		tunq                            uint64
+		mem                        uint64
+		cpus                       int
+		backlog, conn, free, flows uint64
 	}{
-		// RAM/256 as a power of two: 8 MiB to 4 GiB, 64 MiB from 16 GiB.
-		{mem: 1024, cpus: 1, buf: 8 * mib, backlog: 5242, conn: 67108, free: 5242, flows: 8192, tunq: 5242},
-		{mem: 1792, cpus: 2, buf: 8 * mib, backlog: 4587, conn: 117440, free: 9175, flows: 8192, tunq: 9175},
-		{mem: 2048, cpus: 2, buf: 8 * mib, backlog: 5242, conn: 134217, free: 10485, flows: 16384, tunq: 10000},
-		{mem: 16384, cpus: 4, buf: 64 * mib, backlog: 20971, conn: 1073741, free: 83886, flows: 65536, tunq: 10000},
-		{mem: 32768, cpus: 4, buf: 64 * mib, backlog: 32768, conn: 2147483, free: 131072, flows: 65536, tunq: 10000},
-		// The floors: a backlog of 1000, a TUN queue of 500, 4096 flows; the kernel's min_free_kbytes
-		// (√(16 × KiB)) above 0.5 % of a small host.
-		{mem: 256, cpus: 64, buf: 8 * mib, backlog: 1000, conn: 16777, free: 2048, flows: 4096, tunq: 1310},
-		{mem: 64, cpus: 1, buf: 8 * mib, backlog: 1000, conn: 4194, free: 1024, flows: 4096, tunq: 500},
+		{mem: 1024, cpus: 1, backlog: 5242, conn: 67108, free: 5242, flows: 8192},
+		{mem: 1792, cpus: 2, backlog: 4587, conn: 117440, free: 9175, flows: 8192},
+		{mem: 2048, cpus: 2, backlog: 5242, conn: 134217, free: 10485, flows: 16384},
+		{mem: 16384, cpus: 4, backlog: 20971, conn: 1073741, free: 83886, flows: 65536},
+		{mem: 32768, cpus: 4, backlog: 32768, conn: 2147483, free: 131072, flows: 65536},
+		// The floors: a backlog of 1000, 4096 flows; the kernel's min_free_kbytes (√(16 × KiB))
+		// above 0.5 % of a small host.
+		{mem: 256, cpus: 64, backlog: 1000, conn: 16777, free: 2048, flows: 4096},
+		{mem: 64, cpus: 1, backlog: 1000, conn: 4194, free: 1024, flows: 4096},
 	} {
 		h := host(c.mem, c.cpus)
-		got := []uint64{h.SocketBuffer(), h.Backlog(), h.ConntrackMax(), h.MinFreeKB(), h.FlowEntries(), h.TunQueueLen()}
-		want := []uint64{c.buf, c.backlog, c.conn, c.free, c.flows, c.tunq}
+		got := []uint64{h.Backlog(), h.ConntrackMax(), h.MinFreeKB(), h.FlowEntries()}
+		want := []uint64{c.backlog, c.conn, c.free, c.flows}
 		if !slices.Equal(got, want) {
-			t.Errorf("%d MiB, %d CPUs: buf, backlog, conntrack, min_free, flows, tun queue = %v, want %v", c.mem, c.cpus, got, want)
+			t.Errorf("%d MiB, %d CPUs: backlog, conntrack, min_free, flows = %v, want %v", c.mem, c.cpus, got, want)
 		}
 	}
 }
 
 func TestSocketBufferMovesOnlyWhenRAMDoubles(t *testing.T) {
 	t.Parallel()
-	for memMiB, want := range map[uint64]uint64{64: 8, 2048: 8, 4095: 8, 4096: 16, 8191: 16, 8192: 32, 16384: 64, 1 << 20: 64} {
-		if got := host(memMiB, 1).SocketBuffer(); got != want*mib {
+	for memMiB, want := range map[uint64]uint64{64: 16, 2048: 16, 4095: 16, 4096: 32, 8191: 32, 8192: 64, 16384: 128, 1 << 20: 128} {
+		if got := netHost(memMiB, 1).SocketBuffer(); got != want*mib {
 			t.Errorf("%d MiB: %d MiB, want %d", memMiB, got/mib, want)
+		}
+	}
+}
+
+// The default profile is what Docker's path goes through, and nothing else.
+func TestTheDefaultProfileIsDockersPath(t *testing.T) {
+	t.Parallel()
+	if k := sysctlKeys(host(4096, 2)); !slices.Equal(k, []string{"net.core.netdev_max_backlog", "net.netfilter.nf_conntrack_max", "net.netfilter.nf_conntrack_buckets"}) {
+		t.Errorf("the default profile's settings: %v", k)
+	}
+	if m := host(4096, 2).Modules(); !slices.Equal(m, []string{"tun", "nf_conntrack"}) {
+		t.Errorf("the default profile's modules: %v", m)
+	}
+	if m := netHost(4096, 2).Modules(); !slices.Contains(m, "tcp_bbr") || !slices.Contains(m, "nf_conntrack") {
+		t.Errorf("the network profile's modules: %v", m)
+	}
+	// The network profile holds every default key, in its place, at its own value.
+	d, n := sysctlKeys(host(4096, 2)), sysctlKeys(netHost(4096, 2))
+	for i, k := range d {
+		if n[i] != k {
+			t.Errorf("network key %d is %s, want the default's %s", i, n[i], k)
+		}
+	}
+	if len(slices.Compact(slices.Sorted(slices.Values(n)))) != len(n) {
+		t.Errorf("a key twice in the network profile: %v", n)
+	}
+	if s := netHost(4096, 2).Sysctls(); s[0].Key != "net.core.netdev_max_backlog" || s[0].Want != "65536" {
+		t.Errorf("the network profile's backlog in the default's place: %+v", s[0])
+	}
+	for _, k := range []string{"net.ipv4.tcp_tw_reuse", "net.ipv4.ip_local_port_range", "net.ipv6.neigh.default.gc_thresh3", "net.core.rmem_max"} {
+		if !slices.Contains(n, k) {
+			t.Errorf("the network profile lacks %s", k)
+		}
+	}
+	if slices.Contains(n, "net.ipv4.ip_local_reserved_ports") {
+		t.Error("ports reserved for a stack with none")
+	}
+	for _, p := range []string{"default", "network"} {
+		if got, err := ParseProfile(p); err != nil || string(got) != p {
+			t.Errorf("%s = %q, %v", p, got, err)
+		}
+	}
+	for _, bad := range []string{"", "shared", "fast"} {
+		if _, err := ParseProfile(bad); err == nil {
+			t.Errorf("%q read as a profile", bad)
+		}
+	}
+	if Higher(Default, Network) != Network || Higher("", Default) != Default || Higher(Network, "") != Network {
+		t.Error("Higher")
+	}
+}
+
+// The network profile reserves the stack's ports within its range of local ports, and keeps the
+// host's own.
+func TestTheNetworkProfileReservesTheStacksPorts(t *testing.T) {
+	t.Parallel()
+	h := netHost(4096, 2)
+	h.Reserved = []int{443, 15432, 9999, 10000, 51820, 15432, 65535}
+	var res *Sysctl
+	for _, c := range h.Sysctls() {
+		if c.Key == "net.ipv4.ip_local_reserved_ports" {
+			res = &c
+		}
+	}
+	if res == nil || res.Want != "10000,15432,51820,65535" {
+		t.Fatalf("reserved ports %+v", res)
+	}
+	h.Reserved = []int{443, 9999}
+	if slices.Contains(sysctlKeys(h), "net.ipv4.ip_local_reserved_ports") {
+		t.Error("ports below the range reserved")
+	}
+	for _, c := range []struct {
+		cur, value string
+		ok         bool
+	}{
+		{"", "10000,15432,51820,65535", false},
+		{"8080", "8080,10000,15432,51820,65535", false},
+		{"10000-20000,51820,65535", "10000-20000,51820,65535", true},
+		{"10000,15432", "10000,15432,51820,65535", false},
+		{"x", "10000,15432,51820,65535", false},
+	} {
+		if got := res.Satisfied(c.cur); got != c.ok {
+			t.Errorf("%q satisfied = %v", c.cur, got)
+		}
+		if got := res.Value(c.cur); got != c.value {
+			t.Errorf("over %q: %q, want %q", c.cur, got, c.value)
 		}
 	}
 }
@@ -59,11 +149,13 @@ func TestNetworkProfileLeansHarder(t *testing.T) {
 		buf, backlog, conn    uint64
 		tunq, rings, perQueue uint64
 	}{
-		// RAM/128 as a power of two from 16 MiB, 2 % backlogs, 4 % conntrack, rings within 1 %.
-		{mem: 1024, cpus: 1, buf: 16 * mib, backlog: 10485, conn: 134217, tunq: 10000, rings: 2048, perQueue: 8192},
-		{mem: 4096, cpus: 4, buf: 32 * mib, backlog: 10485, conn: 536870, tunq: 10000, rings: 2048, perQueue: 8192},
-		{mem: 65536, cpus: 8, buf: 128 * mib, backlog: 65536, conn: 8589934, tunq: 10000, rings: 4096, perQueue: 8192},
-		{mem: 256, cpus: 2, buf: 16 * mib, backlog: 1310, conn: 33554, tunq: 2621, rings: 256, perQueue: 2048},
+		// RAM/128 as a power of two from 16 MiB, 2 % backlogs from 65536, 4 % conntrack, rings
+		// within 1 %.
+		{mem: 1024, cpus: 1, buf: 16 * mib, backlog: 65536, conn: 134217, tunq: 10000, rings: 2048, perQueue: 8192},
+		{mem: 4096, cpus: 4, buf: 32 * mib, backlog: 65536, conn: 536870, tunq: 10000, rings: 2048, perQueue: 8192},
+		{mem: 65536, cpus: 8, buf: 128 * mib, backlog: 83886, conn: 8589934, tunq: 10000, rings: 4096, perQueue: 8192},
+		{mem: 1 << 20, cpus: 2, buf: 128 * mib, backlog: 262144, conn: 137438953, tunq: 10000, rings: 4096, perQueue: 32768},
+		{mem: 256, cpus: 2, buf: 16 * mib, backlog: 65536, conn: 33554, tunq: 2621, rings: 256, perQueue: 2048},
 	} {
 		h := host(c.mem, c.cpus)
 		h.Profile = Network
@@ -93,10 +185,10 @@ func TestNetworkProfileLeansHarder(t *testing.T) {
 		t.Errorf("3 CPUs: %d flows a queue, want 8192", f)
 	}
 	if r := host(4096, 4).RingEntries(4, 4096); r != 0 {
-		t.Errorf("the shared profile resizes rings: %d", r)
+		t.Errorf("the default profile resizes rings: %d", r)
 	}
 	if f := host(4096, 4).QueueFlows(); f != 0 {
-		t.Errorf("the shared profile steers a NIC's queues: %d", f)
+		t.Errorf("the default profile steers a NIC's queues: %d", f)
 	}
 	if k := sysctlKeys(h); !slices.Contains(k, "net.core.netdev_budget") || slices.Contains(sysctlKeys(host(64, 4)), "net.core.netdev_budget") {
 		t.Errorf("netdev_budget is the network profile's alone: %v", k)
@@ -113,19 +205,11 @@ func sysctlKeys(h Host) []string {
 
 func TestNoCeilingBelowTheKernelsDefault(t *testing.T) {
 	t.Parallel()
-	want := map[Profile][2]string{
-		// 8 GiB is 2097152 pages: the kernel's tcp_mem is 98304 131072 196608 and its udp_mem
-		// 196608 262144 393216.
-		Shared:  {"147456 196608 294912", "294912 393216 589824"},
-		Network: {"196608 262144 393216", "294912 393216 589824"},
-	}
-	for p, w := range want {
-		h := host(8192, 2)
-		h.Profile = p
-		for _, c := range h.Sysctls() {
-			if c.Key == "net.ipv4.tcp_mem" && (c.Want != w[0] || c.Rule != AtLeast) || c.Key == "net.ipv4.udp_mem" && (c.Want != w[1] || c.Rule != AtLeast) {
-				t.Errorf("%s: %s = %q (%v)", p, c.Key, c.Want, c.Rule)
-			}
+	// 8 GiB is 2097152 pages: the kernel's tcp_mem is 98304 131072 196608 and its udp_mem 196608
+	// 262144 393216.
+	for _, c := range netHost(8192, 2).Sysctls() {
+		if c.Key == "net.ipv4.tcp_mem" && (c.Want != "196608 262144 393216" || c.Rule != AtLeast) || c.Key == "net.ipv4.udp_mem" && (c.Want != "294912 393216 589824" || c.Rule != AtLeast) {
+			t.Errorf("%s = %q (%v)", c.Key, c.Want, c.Rule)
 		}
 	}
 	// The conntrack table's default (65536 between 1 and 4 GiB) is a floor: a quarter of 2 % of 2
@@ -137,12 +221,6 @@ func TestNoCeilingBelowTheKernelsDefault(t *testing.T) {
 	}
 	if got := socketMem(10, 3, 2); got != "144 192 288" {
 		t.Errorf("a tiny budget = %q: the kernel's floor is 128 pages", got)
-	}
-	if _, err := ParseProfile("fast"); err == nil {
-		t.Error("an unknown profile read")
-	}
-	if p, err := ParseProfile(""); p != Shared || err != nil {
-		t.Errorf(`"" = %q, %v`, p, err)
 	}
 }
 
@@ -168,6 +246,12 @@ func TestSatisfied(t *testing.T) {
 		{Sysctl{Want: "2", Rule: NotStrict}, "0", true},
 		{Sysctl{Want: "2", Rule: NotStrict}, "2", true},
 		{Sysctl{Want: "2", Rule: NotStrict}, "1", false},
+		{Sysctl{Want: "10000 65535", Rule: Range}, "10000 65535", true},
+		{Sysctl{Want: "10000 65535", Rule: Range}, "1024 65535", true},
+		{Sysctl{Want: "10000 65535", Rule: Range}, "10001 65535", false},
+		{Sysctl{Want: "10000 65535", Rule: Range}, "10000 65534", false},
+		{Sysctl{Want: "10000 65535", Rule: Range}, "32768 60999", false},
+		{Sysctl{Want: "1", Rule: Exact}, "2", false},
 	} {
 		if got := c.s.Satisfied(c.cur); got != c.ok {
 			t.Errorf("%v %q against %q = %v, want %v", c.s.Rule, c.s.Want, c.cur, got, c.ok)
@@ -191,6 +275,9 @@ func TestValueKeepsWhatTheHostHoldsBeyond(t *testing.T) {
 		{Sysctl{Want: "2", Rule: NotStrict}, "1", "2"},
 		{Sysctl{Want: "100", Rule: AtLeast}, "1 2", "100"},
 		{Sysctl{Want: "fq", Rule: Exact}, "fq_codel", "fq"},
+		{Sysctl{Want: "10000 65535", Rule: Range}, "32768 60999", "10000 65535"},
+		{Sysctl{Want: "10000 65535", Rule: Range}, "1024 60999", "1024 65535"},
+		{Sysctl{Want: "10000 65535", Rule: Range}, "60999", "10000 65535"},
 	} {
 		if got := c.s.Value(c.cur); got != c.out {
 			t.Errorf("%v %q over %q = %q, want %q", c.s.Rule, c.s.Want, c.cur, got, c.out)
@@ -229,24 +316,63 @@ func TestRPSMask(t *testing.T) {
 	}
 }
 
+// The default profile gives a container the host's own values; the network profile its own where
+// the host holds less.
 func TestContainerKeepsTheNamespacedSettings(t *testing.T) {
 	t.Parallel()
-	c := host(4096, 2).Container()
-	if len(c) != len(containerKeys) {
-		t.Fatalf("%d settings, want %d: %v", len(c), len(containerKeys), c)
+	s, _ := fakeHost(t, "9001")
+	c := s.Container(host(4096, 2))
+	if len(c.Sysctls) != len(containerKeys) || c.MTU != 9001 || c.Nofile != NofileLimit {
+		t.Fatalf("container %+v", c)
 	}
-	if c["net.ipv4.tcp_rmem"] != "4096 131072 16777216" || c["net.core.somaxconn"] != "8192" {
-		t.Errorf("container settings %v", c)
+	if c.Sysctls["net.core.somaxconn"] != "1" || c.Sysctls["net.ipv4.tcp_rmem"] != "4096 131072 6291456" {
+		t.Errorf("the default profile's container settings are not the host's: %v", c.Sysctls)
 	}
-	h := host(4096, 2)
-	h.Profile = Network
-	if c := h.Container(); c["net.ipv4.tcp_wmem"] != "4096 16384 33554432" {
-		t.Errorf("the network profile's container settings %v", c)
+	c = s.Container(netHost(4096, 2))
+	for k, want := range map[string]string{"net.ipv4.tcp_wmem": "4096 16384 33554432", "net.core.somaxconn": "8192", "net.ipv4.tcp_tw_reuse": "1", "net.ipv4.ip_local_port_range": "10000 65535"} {
+		if c.Sysctls[k] != want {
+			t.Errorf("the network profile's %s = %q, want %q", k, c.Sysctls[k], want)
+		}
 	}
-	for k := range c {
-		if strings.HasPrefix(k, "vm.") || strings.Contains(k, "netfilter") || strings.Contains(k, "rmem_max") {
+	for k := range c.Sysctls {
+		if strings.HasPrefix(k, "vm.") || strings.Contains(k, "netfilter") || strings.Contains(k, "rmem_max") || strings.Contains(k, "neigh") {
 			t.Errorf("%s is the host's, not a namespace's", k)
 		}
+	}
+	// fs.nr_open and the engine's own hard limit bound the open files.
+	s, _ = fakeHost(t, "1500")
+	write(t, s.Root, "proc/sys/fs/nr_open", "524288\n")
+	if c := s.Container(host(1024, 1)); c.MTU != 1500 || c.Nofile != 524288 {
+		t.Errorf("MTU 1500, nr_open 524288: %+v", c)
+	}
+	write(t, s.Root, "proc/sys/fs/nr_open", "1073741816\n")
+	if c := s.Container(host(1024, 1)); c.Nofile != NofileLimit {
+		t.Errorf("a huge nr_open: %d open files", c.Nofile)
+	}
+	write(t, s.Root, "proc/9100/comm", "containerd\n")
+	write(t, s.Root, "proc/9100/status", "Uid:\t0\t0\t0\t0\n")
+	write(t, s.Root, "proc/9100/limits", "Max open files            1024                 524288               files\n")
+	if c := s.Container(host(1024, 1)); c.Nofile != 524288 {
+		t.Errorf("containerd's hard limit of 524288: %d open files", c.Nofile)
+	}
+	write(t, s.Root, "proc/9100/limits", "Max open files            unlimited            unlimited            files\n")
+	if c := s.Container(host(1024, 1)); c.Nofile != NofileLimit {
+		t.Errorf("an unlimited containerd: %d open files", c.Nofile)
+	}
+	// An engine in a container of its own (kind, dind) is not the host's.
+	write(t, s.Root, "proc/9200/comm", "containerd\n")
+	write(t, s.Root, "proc/9200/status", "Uid:\t0\t0\t0\t0\nNSpid:\t9200\t57\n")
+	write(t, s.Root, "proc/9200/limits", "Max open files            1024                 4096                 files\n")
+	if c := s.Container(host(1024, 1)); c.Nofile != NofileLimit {
+		t.Errorf("a nested containerd's limit: %d open files", c.Nofile)
+	}
+	for _, pid := range []string{"9000", "9100"} {
+		if err := os.RemoveAll(filepath.Join(s.Root, "proc", pid)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if c := s.Container(host(1024, 1)); c.Nofile != 0 {
+		t.Errorf("no engine seen: %d open files", c.Nofile)
 	}
 }
 
@@ -261,11 +387,13 @@ func TestAPodGetsTheSettingsNoNodeSizes(t *testing.T) {
 	if !slices.Equal(keys, podKeys) || !slices.IsSorted(keys) {
 		t.Fatalf("pod settings %v, want %v sorted", keys, podKeys)
 	}
-	for _, h := range []Host{host(1024, 1), host(256*1024, 64), {MemBytes: 64 * 1024 * mib, CPUs: 16, PageSize: 4096, Profile: Network}} {
-		c := h.Container()
-		for _, s := range p {
-			if c[s.Key] != s.Want {
-				t.Errorf("%s: a pod gets %s, a container on %d MiB / %s gets %s", s.Key, s.Want, h.MemBytes/mib, h.Profile, c[s.Key])
+	s, _ := fakeHost(t, "1500")
+	write(t, s.Root, Sysctl{Key: "net.ipv4.tcp_notsent_lowat"}.Path(), "4294967295\n")
+	for _, h := range []Host{netHost(1024, 1), netHost(256*1024, 64)} {
+		c := s.Container(h)
+		for _, p := range p {
+			if c.Sysctls[p.Key] != p.Want {
+				t.Errorf("%s: a pod gets %s, a container on %d MiB gets %s", p.Key, p.Want, h.MemBytes/mib, c.Sysctls[p.Key])
 			}
 		}
 	}
@@ -366,6 +494,11 @@ func fakeHost(t *testing.T, mtu string) (System, *[]string) {
 	write(t, root, "sys/class/net/tun0/queues/rx-0/rps_cpus", "00000000\n")
 	write(t, root, "sys/class/net/tun0/queues/rx-0/rps_flow_cnt", "0\n")
 	write(t, root, "proc/sys/kernel/osrelease", "6.8.0-45-generic\n")
+	write(t, root, "proc/sys/fs/nr_open", "1048576\n")
+	// The engine, without a command line to read: its limits alone.
+	write(t, root, "proc/9000/comm", "dockerd\n")
+	write(t, root, "proc/9000/status", "Uid:\t0\t0\t0\t0\n")
+	write(t, root, "proc/9000/limits", "Limit                     Soft Limit           Hard Limit           Units\nMax open files            1048576              1048576              files\n")
 	write(t, root, "proc/net/route", "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\nbr-x\t0011AC0A\t00000000\t0001\t0\t0\t0\t00FFFFFF\neth0\t00000000\t0100A8C0\t0003\t0\t0\t100\t00000000\n")
 	var ran []string
 	s := System{
@@ -382,7 +515,7 @@ func fakeHost(t *testing.T, mtu string) (System, *[]string) {
 		},
 		Look:   func(f string) (string, error) { return "/usr/sbin/" + f, nil },
 		Euid:   func() int { return 0 },
-		Docker: &Docker{NetworkOpts: true},
+		Docker: &Docker{},
 	}
 	return s, &ran
 }
@@ -399,7 +532,7 @@ func find(items []Item, kind, name string) *Item {
 func TestInspect(t *testing.T) {
 	t.Parallel()
 	s, _ := fakeHost(t, "1460")
-	h := host(4096, 2)
+	h := netHost(4096, 2)
 	items := s.Inspect(context.Background(), h)
 	for _, c := range []struct {
 		kind, name string
@@ -409,13 +542,15 @@ func TestInspect(t *testing.T) {
 		{"sysctl", "net.ipv4.tcp_rmem", Differs, "4096 131072 6291456"},
 		{"sysctl", "net.core.default_qdisc", Differs, "fq_codel"},
 		{"sysctl", "net.ipv4.tcp_mtu_probing", OK, "1"},
+		{"sysctl", "net.ipv4.tcp_tw_reuse", OK, "1"},
+		{"sysctl", "net.ipv4.ip_local_port_range", Differs, "1"},
 		{"sysctl", "net.ipv4.conf.all.rp_filter", Differs, "1"},
 		{"module", "tun", Differs, "absent"},
 		{"nic", "eth0 rx-udp-gro-forwarding", Differs, "off"},
+		{"nic", "eth0 rx-0 rps_cpus", Differs, "00000000"},
 		{"tun", "tun0 tx_queue_len", Differs, "500"},
 		{"tun", "tun0 rps_cpus", Differs, "00000000"},
-		{"docker", "default-ulimits.nofile", Differs, "absent"},
-		{"docker", "default-network-opts.bridge.com.docker.network.driver.mtu", Differs, "absent"},
+		{"docker", "log-opts", Differs, "absent"},
 	} {
 		it := find(items, c.kind, c.name)
 		if it == nil || it.State != c.state || it.Have != c.have {
@@ -425,8 +560,19 @@ func TestInspect(t *testing.T) {
 	if a := find(items, "nic", "eth0 virtio_net"); a == nil || a.State != Advice || !strings.Contains(a.Have, "1 receive queue(s) for 2 vCPUs") {
 		t.Errorf("the queue advice %+v", a)
 	}
-	if find(items, "docker", "log-opts") != nil || find(items, "nic", "eth0 rings") != nil || find(items, "nic", "eth0 rx-0 rps_flow_cnt") != nil {
-		t.Error("the shared profile judges the network profile's log driver, rings or steering")
+	if g := find(items, "cpu", "governor"); g == nil || g.State != NA {
+		t.Errorf("a host without cpufreq: %+v", g)
+	}
+	// A kernel without IPv6 has no IPv6 settings to judge.
+	off, _ := fakeHost(t, "1500")
+	if err := os.RemoveAll(filepath.Join(off.Root, "proc/sys/net/ipv6")); err != nil {
+		t.Fatal(err)
+	}
+	if it := find(off.Inspect(context.Background(), h), "sysctl", "net.ipv6.neigh.default.gc_thresh3"); it == nil || it.State != NA {
+		t.Errorf("IPv6 off: %+v", it)
+	}
+	if it := find(items, "sysctl", "net.ipv6.neigh.default.gc_thresh3"); it == nil || it.State != Differs {
+		t.Errorf("IPv6 on: %+v", it)
 	}
 	if find(items, "nic", "docker0 rx-udp-gro-forwarding") != nil {
 		t.Error("a bridge's offload judged: only a NIC backed by a device is")
@@ -437,6 +583,16 @@ func TestInspect(t *testing.T) {
 	var b strings.Builder
 	if err := Print(&b, items); err != nil || !strings.Contains(b.String(), "differs  sysctl net.ipv4.tcp_rmem") {
 		t.Errorf("Print:\n%s", b.String())
+	}
+	// The default profile judges Docker's path alone.
+	items = s.Inspect(context.Background(), host(4096, 2))
+	for _, it := range items {
+		if it.Kind == "tun" || it.Kind == "cpu" || it.Kind == "docker" || it.Kind == "sysctl" && !slices.Contains(sysctlKeys(host(4096, 2)), it.Name) || strings.Contains(it.Name, "rings") || strings.Contains(it.Name, "rps") {
+			t.Errorf("the default profile judges %s %s", it.Kind, it.Name)
+		}
+	}
+	if it := find(items, "nic", "eth0 rx-udp-gro-forwarding"); it == nil || it.State != Differs {
+		t.Errorf("the default profile leaves the forwarded UDP's offload: %+v", it)
 	}
 }
 
@@ -456,10 +612,6 @@ func TestInspectWithoutEthtoolOrADockerToTune(t *testing.T) {
 	s.Docker = &Docker{Desktop: true}
 	if items := s.Inspect(context.Background(), host(4096, 2)); len(items) != 1 || items[0].State != NA {
 		t.Errorf("Docker Desktop: %+v", items)
-	}
-	s.Docker = &Docker{NetworkOpts: true}
-	if find(s.Inspect(context.Background(), host(4096, 2)), "docker", "default-network-opts.bridge.com.docker.network.driver.mtu") != nil {
-		t.Error("an MTU of 1500, Docker's own, is set")
 	}
 }
 
@@ -484,43 +636,59 @@ func TestDockerdFlagsKeepTheirKeysOutOfTheFile(t *testing.T) {
 	s, _ := fakeHost(t, "9001")
 	write(t, s.Root, "proc/812/comm", "dockerd\n")
 	write(t, s.Root, "proc/812/status", "Name:\tdockerd\nUid:\t0\t0\t0\t0\n")
-	write(t, s.Root, "proc/812/cmdline", "/usr/bin/dockerd\x00--default-ulimit=nofile=32768:65536\x00-H\x00fd://\x00")
+	write(t, s.Root, "proc/812/cmdline", "/usr/bin/dockerd\x00--log-opt=max-size=1g\x00-H\x00fd://\x00")
 	write(t, s.Root, "proc/900/comm", "containerd\n")
-	p, err := s.Plan(host(1024, 1))
+	p, err := s.Plan(netHost(1024, 1))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if p.Daemon == nil || len(p.DaemonKeys) != 1 || !strings.HasPrefix(p.DaemonKeys[0], "default-network-opts.") {
+	if p.Daemon != nil || len(p.DaemonKeys) != 0 {
 		t.Errorf("daemon keys %v", p.DaemonKeys)
 	}
-	if !slices.ContainsFunc(p.Notes, func(n string) bool { return strings.Contains(n, "dockerd runs with --default-ulimit") }) {
+	if !slices.ContainsFunc(p.Notes, func(n string) bool { return strings.Contains(n, "dockerd runs with --log-opt") }) {
 		t.Errorf("notes %v", p.Notes)
 	}
-	if it := find(s.Inspect(context.Background(), host(1024, 1)), "docker", "default-ulimits.nofile"); it == nil || it.State != NA {
+	if it := find(s.Inspect(context.Background(), netHost(1024, 1)), "docker", "log-opts"); it == nil || it.State != NA {
 		t.Errorf("report %+v", it)
 	}
 }
 
 func TestContainerSettingsOnlyWhereANamespaceTakesThem(t *testing.T) {
 	t.Parallel()
-	s, _ := fakeHost(t, "1500")
+	s, _ := fakeHost(t, "9001")
 	h := host(1024, 1)
-	if len(s.Container(h)) != len(containerKeys) {
-		t.Fatalf("a 6.8 kernel and a plain engine: %v", s.Container(h))
+	if c := s.Container(h); len(c.Sysctls) != len(containerKeys) {
+		t.Fatalf("a 6.8 kernel and a plain engine: %+v", c)
 	}
-	for name, d := range map[string]*Docker{"rootless": {Rootless: true}, "userns-remap": {UsernsRemap: true}, "Desktop": {Desktop: true}, "unknown engine": nil} {
-		s.Docker = d
-		if c := s.Container(h); c != nil {
-			t.Errorf("%s: %v", name, c)
+	for name, c := range map[string]struct {
+		d    *Docker
+		want Container
+	}{
+		"rootless":       {&Docker{Rootless: true}, Container{}},
+		"userns-remap":   {&Docker{UsernsRemap: true}, Container{MTU: 9001}},
+		"Desktop":        {&Docker{Desktop: true}, Container{}},
+		"unknown engine": {nil, Container{}},
+	} {
+		s.Docker = c.d
+		if got := s.Container(h); got.MTU != c.want.MTU || got.Nofile != 0 || got.Sysctls != nil {
+			t.Errorf("%s: %+v", name, got)
 		}
 	}
 	s.Docker = &Docker{}
 	for rel, n := range map[string]int{"4.14.330": 0, "4.15.0-213-generic": len(containerKeys), "5.4": len(containerKeys), "3.10.0": 0, "x": 0,
 		"6.10-rc1": len(containerKeys), "5.4-1-pve": len(containerKeys), "4.9-rc15": 0} {
 		write(t, s.Root, "proc/sys/kernel/osrelease", rel+"\n")
-		if got := len(s.Container(h)); got != n {
-			t.Errorf("kernel %s: %d settings, want %d", rel, got, n)
+		if got := s.Container(h); len(got.Sysctls) != n || got.Nofile != NofileLimit {
+			t.Errorf("kernel %s: %d settings, want %d (%+v)", rel, len(got.Sysctls), n, got)
 		}
+	}
+	// A key the host's kernel lacks is no container's.
+	write(t, s.Root, "proc/sys/kernel/osrelease", "6.8\n")
+	if err := os.Remove(filepath.Join(s.Root, Sysctl{Key: "net.ipv4.tcp_tw_reuse"}.Path())); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := s.Container(netHost(1024, 1)).Sysctls["net.ipv4.tcp_tw_reuse"]; ok {
+		t.Error("a key the kernel lacks given to a container")
 	}
 }
 
@@ -529,16 +697,15 @@ func TestContainerSettingsOnlyWhereANamespaceTakesThem(t *testing.T) {
 func TestAContainerKeepsTheHostsHigherCeilings(t *testing.T) {
 	t.Parallel()
 	s, _ := fakeHost(t, "1500")
-	h := host(1024, 1)
-	c := s.Container(h)
-	if c["net.ipv4.tcp_rmem"] != h.Container()["net.ipv4.tcp_rmem"] {
-		t.Fatalf("a host below ours: tcp_rmem %q, want ours %q", c["net.ipv4.tcp_rmem"], h.Container()["net.ipv4.tcp_rmem"])
+	h := netHost(1024, 1)
+	if c := s.Container(h); c.Sysctls["net.ipv4.tcp_rmem"] != "4096 131072 16777216" {
+		t.Fatalf("a host below ours: tcp_rmem %q, want ours", c.Sysctls["net.ipv4.tcp_rmem"])
 	}
 	write(t, s.Root, Sysctl{Key: "net.ipv4.tcp_rmem"}.Path(), "4096\t131072\t30177216\n")
 	write(t, s.Root, Sysctl{Key: "net.core.somaxconn"}.Path(), "4096\n")
-	c = s.Container(h)
-	if c["net.ipv4.tcp_rmem"] != "4096 131072 30177216" || c["net.core.somaxconn"] != "8192" {
-		t.Errorf("tcp_rmem %q (want the host's top), somaxconn %q (want ours)", c["net.ipv4.tcp_rmem"], c["net.core.somaxconn"])
+	c := s.Container(h)
+	if c.Sysctls["net.ipv4.tcp_rmem"] != "4096 131072 30177216" || c.Sysctls["net.core.somaxconn"] != "8192" {
+		t.Errorf("tcp_rmem %q (want the host's top), somaxconn %q (want ours)", c.Sysctls["net.ipv4.tcp_rmem"], c.Sysctls["net.core.somaxconn"])
 	}
 }
 
@@ -546,7 +713,7 @@ func TestAShrunkHostIsNotKeptAtALargerHostsCeilings(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	s, _ := fakeHost(t, "1500")
-	big, small := host(32768, 4), host(2048, 4)
+	big, small := netHost(32768, 4), netHost(2048, 4)
 	p, err := s.Plan(big)
 	if err != nil {
 		t.Fatal(err)
@@ -585,7 +752,7 @@ func TestTheDaemonsConfigFileIsTheOneItReads(t *testing.T) {
 	write(t, s.Root, "proc/1200/cmdline", "dockerd\x00--config-file=/home/u/.config/docker/daemon.json\x00")
 	write(t, s.Root, "proc/77/cmdline", "dockerd\x00--group\x00docker\x00--config-file\x00/"+snap+"\x00")
 	write(t, s.Root, snap, `{"log-level": "error"}`)
-	p, err := s.Plan(host(1024, 1))
+	p, err := s.Plan(netHost(1024, 1))
 	if err != nil || p.Daemon == nil || p.Daemon.Path != snap {
 		t.Fatalf("plan: %v %+v", err, p)
 	}
@@ -595,7 +762,7 @@ func TestTheDaemonsConfigFileIsTheOneItReads(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(s.Root, DaemonFile)); !errors.Is(err, os.ErrNotExist) {
 		t.Error("/etc/docker/daemon.json written, which the engine does not read")
 	}
-	if it := find(s.Inspect(ctx, host(1024, 1)), "docker", "default-ulimits.nofile"); it == nil || it.State != OK {
+	if it := find(s.Inspect(ctx, netHost(1024, 1)), "docker", "log-opts"); it == nil || it.State != OK {
 		t.Errorf("report %+v", it)
 	}
 	// The revert finds the file the apply wrote, even with the engine gone.
@@ -605,7 +772,7 @@ func TestTheDaemonsConfigFileIsTheOneItReads(t *testing.T) {
 	if _, err := s.Revert(ctx, false); err != nil {
 		t.Fatal(err)
 	}
-	if got := read(t, s.Root, snap); strings.Contains(got, "nofile") || !strings.Contains(got, "log-level") {
+	if got := read(t, s.Root, snap); strings.Contains(got, "max-size") || !strings.Contains(got, "log-level") {
 		t.Errorf("after the revert:\n%s", got)
 	}
 }
@@ -625,7 +792,7 @@ func TestRecordsFollowTheModulesAndTheOperator(t *testing.T) {
 		}
 		return run(ctx, name, args...)
 	}
-	h := host(1024, 1)
+	h := netHost(1024, 1)
 	p, err := s.Plan(h)
 	if err != nil {
 		t.Fatal(err)
@@ -666,7 +833,7 @@ func TestEachDaemonFileIsReverted(t *testing.T) {
 	ctx := context.Background()
 	s, _ := fakeHost(t, "1500")
 	write(t, s.Root, DaemonFile, "{}")
-	p, err := s.Plan(host(1024, 1))
+	p, err := s.Plan(netHost(1024, 1))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -678,7 +845,7 @@ func TestEachDaemonFileIsReverted(t *testing.T) {
 	write(t, s.Root, "proc/5/status", "Uid:\t0\t0\t0\t0\n")
 	write(t, s.Root, "proc/5/cmdline", "dockerd\x00--config-file=etc/docker/alt.json\x00")
 	write(t, s.Root, "etc/docker/alt.json", "{}")
-	if p, err = s.Plan(host(1024, 1)); err != nil || p.Daemon == nil || p.Daemon.Path != "etc/docker/alt.json" {
+	if p, err = s.Plan(netHost(1024, 1)); err != nil || p.Daemon == nil || p.Daemon.Path != "etc/docker/alt.json" {
 		t.Fatalf("plan: %v %+v", err, p)
 	}
 	if _, err := s.Apply(ctx, p, ApplyOptions{}); err != nil {
@@ -688,7 +855,7 @@ func TestEachDaemonFileIsReverted(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, f := range []string{DaemonFile, "etc/docker/alt.json"} {
-		if got := read(t, s.Root, f); strings.Contains(got, "nofile") {
+		if got := read(t, s.Root, f); strings.Contains(got, "max-size") {
 			t.Errorf("%s after the revert:\n%s", f, got)
 		}
 	}
@@ -707,18 +874,18 @@ func TestApplyThenRevert(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	s, ran := fakeHost(t, "9001")
-	h := host(4096, 2)
-	write(t, s.Root, DaemonFile, `{"log-driver": "journald", "default-ulimits": {"core": {"Name": "core", "Soft": 0, "Hard": 0}}}`)
+	h := netHost(4096, 2)
+	write(t, s.Root, DaemonFile, `{"log-driver": "json-file", "default-ulimits": {"core": {"Name": "core", "Soft": 0, "Hard": 0}}}`)
 	p, err := s.Plan(h)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !p.Changes() || len(p.DaemonKeys) != 2 {
+	if !p.Changes() || len(p.DaemonKeys) != 1 {
 		t.Fatalf("plan: changes %v, daemon keys %v", p.Changes(), p.DaemonKeys)
 	}
 	var d strings.Builder
 	p.Describe(&d, s.Root)
-	if !strings.Contains(d.String(), "default-ulimits.nofile: absent →") {
+	if !strings.Contains(d.String(), "log-opts: absent →") {
 		t.Errorf("Describe:\n%s", d.String())
 	}
 	notes, err := s.Apply(ctx, p, ApplyOptions{})
@@ -734,14 +901,14 @@ func TestApplyThenRevert(t *testing.T) {
 	if !slices.Contains(*ran, "/usr/sbin/ethtool -K eth0 rx-udp-gro-forwarding on rx-gro-list off") || !slices.Contains(*ran, "modprobe tun") {
 		t.Errorf("ran %v", *ran)
 	}
-	if !strings.Contains(read(t, s.Root, SysctlFile), "\nnet.core.rmem_max = 16777216\n") {
+	if !strings.Contains(read(t, s.Root, SysctlFile), "\nnet.core.rmem_max = 33554432\n") {
 		t.Errorf("sysctl file:\n%s", read(t, s.Root, SysctlFile))
 	}
 	if !strings.Contains(read(t, s.Root, UdevFile), `RUN+="/usr/sbin/ethtool -K $name rx-udp-gro-forwarding on rx-gro-list off"`) {
 		t.Errorf("udev file:\n%s", read(t, s.Root, UdevFile))
 	}
 	daemon := read(t, s.Root, DaemonFile)
-	for _, want := range []string{`"log-driver": "journald"`, `"core": {`, `"Soft": 1048576`, `"com.docker.network.driver.mtu": "9001"`} {
+	for _, want := range []string{`"log-driver": "json-file"`, `"core": {`, `"max-size": "20m"`} {
 		if !strings.Contains(daemon, want) {
 			t.Errorf("daemon.json lacks %s:\n%s", want, daemon)
 		}
@@ -758,7 +925,7 @@ func TestApplyThenRevert(t *testing.T) {
 		_ = Print(&b, items)
 		t.Errorf("after an apply, %d items differ:\n%s", Drift(items), b.String())
 	}
-	// A second plan changes nothing; the operator then changes the MTU key by hand.
+	// A second plan changes nothing; the operator then changes the rotation by hand.
 	p, err = s.Plan(h)
 	if err != nil || p.Changes() {
 		t.Fatalf("plan after apply: %v, changes %v", err, p != nil && p.Changes())
@@ -767,9 +934,7 @@ func TestApplyThenRevert(t *testing.T) {
 	if _, err := s.Apply(ctx, p, ApplyOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	write(t, s.Root, DaemonFile, strings.Replace(read(t, s.Root, DaemonFile), `"9001"`, `"8000"`, 1))
-	notes, err = s.Revert(ctx, true)
-	if err != nil {
+	if _, err := s.Revert(ctx, true); err != nil {
 		t.Fatal(err)
 	}
 	for _, f := range []string{SysctlFile, ModulesFile, UdevFile, StateFile} {
@@ -778,11 +943,8 @@ func TestApplyThenRevert(t *testing.T) {
 		}
 	}
 	daemon = read(t, s.Root, DaemonFile)
-	if strings.Contains(daemon, "nofile") || !strings.Contains(daemon, `"8000"`) || !strings.Contains(daemon, `"core"`) || !strings.Contains(daemon, "journald") {
+	if strings.Contains(daemon, "max-size") || !strings.Contains(daemon, `"core"`) || !strings.Contains(daemon, "json-file") {
 		t.Errorf("daemon.json after the revert:\n%s", daemon)
-	}
-	if !slices.ContainsFunc(notes, func(n string) bool { return strings.Contains(n, "driver.mtu: left as it is") }) {
-		t.Errorf("the hand-changed key's note missing: %v", notes)
 	}
 	if !slices.Contains(*ran, "systemctl restart docker") {
 		t.Error("--restart-docker did not restart it")
@@ -793,13 +955,27 @@ func TestApplyThenRevert(t *testing.T) {
 	if got := read(t, s.Root, Sysctl{Key: "net.ipv4.tcp_rmem"}.Path()); got != "4096 131072 6291456\n" {
 		t.Errorf("tcp_rmem after the revert = %q", got)
 	}
+	// A key changed by hand since the apply set it is left as it is.
+	if p, err = s.Plan(h); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Apply(ctx, p, ApplyOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	write(t, s.Root, DaemonFile, strings.Replace(read(t, s.Root, DaemonFile), `"20m"`, `"50m"`, 1))
+	if notes, err = s.Revert(ctx, false); err != nil || !slices.ContainsFunc(notes, func(n string) bool { return strings.Contains(n, "log-opts: left as it is") }) {
+		t.Errorf("the hand-changed key's note missing: %v %v", err, notes)
+	}
+	if !strings.Contains(read(t, s.Root, DaemonFile), `"50m"`) {
+		t.Error("the hand-changed rotation reverted")
+	}
 }
 
 func TestApplyKeepsAHigherCeilingAndRefusesWithoutRoot(t *testing.T) {
 	t.Parallel()
 	s, _ := fakeHost(t, "1500")
 	write(t, s.Root, Sysctl{Key: "vm.min_free_kbytes"}.Path(), "67584\n")
-	p, err := s.Plan(host(512, 1))
+	p, err := s.Plan(netHost(512, 1))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -812,10 +988,10 @@ func TestApplyKeepsAHigherCeilingAndRefusesWithoutRoot(t *testing.T) {
 	if !strings.Contains(read(t, s.Root, SysctlFile), "\nvm.min_free_kbytes = 67584\n") {
 		t.Error("the file lowers min_free_kbytes")
 	}
-	write(t, s.Root, DaemonFile, `{"default-ulimits": {"nofile": {"Name": "nofile", "Soft": 2097152, "Hard": 2097152}}}`)
-	p, err = s.Plan(host(4096, 2))
+	write(t, s.Root, DaemonFile, `{"log-opts": {"max-size": "1g", "max-file": "2"}}`)
+	p, err = s.Plan(netHost(4096, 2))
 	if err != nil || p.Daemon != nil {
-		t.Fatalf("a higher open-file limit is changed: %v %+v", err, p.Daemon)
+		t.Fatalf("the admin's rotation is changed: %v %+v", err, p.Daemon)
 	}
 	if err := os.Remove(filepath.Join(s.Root, SysctlFile)); err != nil {
 		t.Fatal(err)
@@ -828,12 +1004,13 @@ func TestApplyKeepsAHigherCeilingAndRefusesWithoutRoot(t *testing.T) {
 		t.Error("a refused apply wrote")
 	}
 	write(t, s.Root, DaemonFile, `{"default-ulimits": [1]`)
-	if _, err := s.Plan(host(4096, 2)); err == nil {
+	if _, err := s.Plan(netHost(4096, 2)); err == nil {
 		t.Error("a daemon file that does not parse is merged")
 	}
-	write(t, s.Root, DaemonFile, `{"default-ulimits": "x"}`)
-	if _, err := s.Plan(host(4096, 2)); err == nil || !strings.Contains(err.Error(), "default-ulimits is not an object") {
-		t.Errorf("a daemon key of the wrong type: %v", err)
+	d, _ := fakeHost(t, "1500")
+	write(t, d.Root, DaemonFile, `{"default-ulimits": [1]`)
+	if p, err := d.Plan(host(4096, 2)); err != nil || p.Daemon != nil {
+		t.Errorf("the default profile reads the daemon's file: %v", err)
 	}
 }
 
@@ -944,7 +1121,7 @@ func TestTheLastApplysProfileIsTheHosts(t *testing.T) {
 	if _, err := s.Revert(context.Background(), false); err != nil {
 		t.Fatal(err)
 	}
-	if h, _ := s.Host(); h.Profile != Shared {
+	if h, _ := s.Host(); h.Profile != Default {
 		t.Errorf("after the revert: %q", h.Profile)
 	}
 }
@@ -953,7 +1130,7 @@ func TestBootTunesAroundADaemonFileThatDoesNotMerge(t *testing.T) {
 	t.Parallel()
 	s, _ := fakeHost(t, "1500")
 	s.Profile = Network
-	write(t, s.Root, DaemonFile, `{"default-ulimits": "x"}`)
+	write(t, s.Root, DaemonFile, `{"default-ulimits": [1]`)
 	h, _ := s.Host()
 	notes, err := s.Boot(context.Background(), h)
 	if err != nil {
@@ -962,7 +1139,7 @@ func TestBootTunesAroundADaemonFileThatDoesNotMerge(t *testing.T) {
 	if got := read(t, s.Root, Sysctl{Key: "net.ipv4.tcp_congestion_control"}.Path()); got != "bbr\n" {
 		t.Errorf("congestion control = %q: the boot stopped at the daemon file", got)
 	}
-	if read(t, s.Root, DaemonFile) != `{"default-ulimits": "x"}` || !slices.ContainsFunc(notes, func(n string) bool { return strings.Contains(n, "Docker's file is left as it is") }) {
+	if read(t, s.Root, DaemonFile) != `{"default-ulimits": [1]` || !slices.ContainsFunc(notes, func(n string) bool { return strings.Contains(n, "Docker's file is left as it is") }) {
 		t.Errorf("daemon file changed, or not said: %v", notes)
 	}
 }
@@ -1045,11 +1222,11 @@ func TestRingsGrowOnlyOnALinkNotYetUp(t *testing.T) {
 	}
 	s, _ := fakeHost(t, "1500")
 	if p, _ := s.Plan(host(4096, 2)); strings.Contains(string(p.Files[2].Content), `DEVPATH!="/devices/virtual/*", ATTR{rps_flow_cnt}`) {
-		t.Error("the shared profile steers NICs")
+		t.Error("the default profile steers NICs")
 	}
 }
 
-func TestANetworkHostIsRevertedBeforeItIsShared(t *testing.T) {
+func TestANetworkHostIsRevertedBeforeItTakesTheDefault(t *testing.T) {
 	t.Parallel()
 	s, _ := fakeHost(t, "1500")
 	s.Profile = Network
@@ -1061,16 +1238,213 @@ func TestANetworkHostIsRevertedBeforeItIsShared(t *testing.T) {
 	if _, err := s.Apply(context.Background(), p, ApplyOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	s.Profile = Shared
+	s.Profile = Default
 	h, _ = s.Host()
 	if _, err := s.Plan(h); err == nil || !strings.Contains(err.Error(), "tune --revert` first") {
-		t.Errorf("a shared plan over a network apply: %v", err)
+		t.Errorf("a default plan over a network apply: %v", err)
 	}
 	if err := s.CheckProfile(h); err == nil {
-		t.Error("a shared report over a network apply")
+		t.Error("a default report over a network apply")
 	}
 	s.Profile = Network
 	if h, _ := s.Host(); s.CheckProfile(h) != nil {
 		t.Error("the network report over a network apply refused")
+	}
+}
+
+// The network profile spreads a NIC's interrupts that all land on one CPU, and its packets over
+// every CPU when it has fewer queues than CPUs; never where irqbalance runs.
+func TestTheNetworkProfileSpreadsTheNICsWork(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s, _ := fakeHost(t, "1500")
+	s.Profile = Network
+	for _, irq := range []string{"24", "25", "26"} {
+		write(t, s.Root, "sys/class/net/eth0/device/msi_irqs/"+irq, "msix\n")
+		write(t, s.Root, "proc/irq/"+irq+"/smp_affinity_list", "0-1\n")
+		write(t, s.Root, "proc/irq/"+irq+"/effective_affinity_list", "0\n")
+	}
+	h, _ := s.Host()
+	items := s.Inspect(ctx, h)
+	if it := find(items, "nic", "eth0 interrupts"); it == nil || it.State != Advice {
+		t.Errorf("interrupts all on CPU 0 (advice: the kernel may manage them): %+v", it)
+	}
+	p, err := s.Plan(h)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rules := string(p.Files[2].Content); !strings.Contains(rules, `ACTION=="add", SUBSYSTEM=="queues", KERNEL=="rx-*", DEVPATH=="*/net/eth0/queues/rx-*", ATTR{rps_cpus}="00000003"`+"\n") {
+		t.Errorf("no RPS rule for eth0's single queue:\n%s", rules)
+	}
+	if _, err := s.Apply(ctx, p, ApplyOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	for irq, cpu := range map[string]string{"24": "0\n", "25": "1\n", "26": "0\n"} {
+		if got := read(t, s.Root, "proc/irq/"+irq+"/smp_affinity_list"); got != cpu {
+			t.Errorf("IRQ %s on %q, want %q", irq, got, cpu)
+		}
+		write(t, s.Root, "proc/irq/"+irq+"/effective_affinity_list", cpu)
+	}
+	if got := read(t, s.Root, "sys/class/net/eth0/queues/rx-0/rps_cpus"); got != "00000003\n" {
+		t.Errorf("eth0 rx-0 rps_cpus = %q", got)
+	}
+	items = s.Inspect(ctx, h)
+	for _, n := range []string{"eth0 interrupts", "eth0 rx-0 rps_cpus"} {
+		if it := find(items, "nic", n); it == nil || it.State != OK {
+			t.Errorf("%s after the apply: %+v", n, it)
+		}
+	}
+	// irqbalance moves them: left to it.
+	for _, irq := range []string{"24", "25", "26"} {
+		write(t, s.Root, "proc/irq/"+irq+"/smp_affinity_list", "0-1\n")
+		write(t, s.Root, "proc/irq/"+irq+"/effective_affinity_list", "0\n")
+	}
+	write(t, s.Root, "proc/610/comm", "irqbalance\n")
+	if it := find(s.Inspect(ctx, h), "nic", "eth0 interrupts"); it == nil || it.State != NA {
+		t.Errorf("with irqbalance: %+v", it)
+	}
+	if _, err := s.Apply(ctx, p, ApplyOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := read(t, s.Root, "proc/irq/25/smp_affinity_list"); got != "0-1\n" {
+		t.Errorf("an IRQ moved under irqbalance: %q", got)
+	}
+	// A NIC with a queue per CPU is not steered; the default profile steers none.
+	write(t, s.Root, "sys/class/net/eth0/queues/rx-1/rps_cpus", "00000000\n")
+	if p, _ := s.Plan(h); strings.Contains(string(p.Files[2].Content), "*/net/eth0/") {
+		t.Error("a NIC with a queue per CPU steered")
+	}
+	if host(4096, 2).steers(nic{physical: true, queues: 1}) {
+		t.Error("the default profile steers")
+	}
+}
+
+// A virtio NIC's interrupts are its PCI device's, the parent of its device.
+func TestAVirtioNICsInterruptsAreItsPCIDevices(t *testing.T) {
+	t.Parallel()
+	s, _ := fakeHost(t, "1500")
+	write(t, s.Root, "devices/pci0/msi_irqs/40", "msix\n")
+	write(t, s.Root, "devices/pci0/msi_irqs/41", "msix\n")
+	if err := os.MkdirAll(filepath.Join(s.Root, "devices/pci0/virtio1"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	write(t, s.Root, "sys/class/net/eth1/mtu", "1500\n")
+	if err := os.Symlink(filepath.Join(s.Root, "devices/pci0/virtio1"), filepath.Join(s.Root, "sys/class/net/eth1/device")); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.irqs(nic{name: "eth1"}); !slices.Equal(got, []int{40, 41}) {
+		t.Errorf("eth1's interrupts %v", got)
+	}
+	if got := s.irqs(nic{name: "eth0"}); got != nil {
+		t.Errorf("eth0 without msi_irqs: %v", got)
+	}
+	// A NIC on legacy interrupts, under a bridge with vectors of its own: not the NIC's.
+	write(t, s.Root, "devices/pci1/msi_irqs/50", "msix\n")
+	write(t, s.Root, "devices/pci1/msi_irqs/51", "msix\n")
+	if err := os.MkdirAll(filepath.Join(s.Root, "devices/pci1/0000:01:00.0"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	write(t, s.Root, "sys/class/net/eth2/mtu", "1500\n")
+	if err := os.Symlink(filepath.Join(s.Root, "devices/pci1/0000:01:00.0"), filepath.Join(s.Root, "sys/class/net/eth2/device")); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.irqs(nic{name: "eth2"}); got != nil {
+		t.Errorf("eth2 took its bridge's interrupts: %v", got)
+	}
+}
+
+func TestTheNetworkProfileRunsTheCPUsAtFullSpeed(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s, _ := fakeHost(t, "1500")
+	s.Profile = Network
+	write(t, s.Root, "sys/devices/system/cpu/cpu0/cpufreq/scaling_governor", "powersave\n")
+	write(t, s.Root, "sys/devices/system/cpu/cpu0/cpufreq/scaling_available_governors", "performance powersave\n")
+	write(t, s.Root, "sys/devices/system/cpu/cpu1/cpufreq/scaling_governor", "schedutil\n")
+	write(t, s.Root, "sys/devices/system/cpu/cpu1/cpufreq/scaling_available_governors", "schedutil\n")
+	h, _ := s.Host()
+	if it := find(s.Inspect(ctx, h), "cpu", "governor"); it == nil || it.State != Differs || it.Have != "powersave,schedutil" {
+		t.Errorf("governor before: %+v", it)
+	}
+	p, err := s.Plan(h)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Apply(ctx, p, ApplyOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if read(t, s.Root, "sys/devices/system/cpu/cpu0/cpufreq/scaling_governor") != "performance\n" || read(t, s.Root, "sys/devices/system/cpu/cpu1/cpufreq/scaling_governor") != "schedutil\n" {
+		t.Error("the governors after the apply")
+	}
+	if it := find(s.Inspect(ctx, h), "cpu", "governor"); it == nil || it.State != OK {
+		t.Errorf("governor after: %+v", it)
+	}
+	if find(s.Inspect(ctx, host(4096, 2)), "cpu", "governor") != nil {
+		t.Error("the default profile judges the governor")
+	}
+}
+
+// A boot of the default profile tunes Docker's path alone.
+func TestABootOfTheDefaultProfile(t *testing.T) {
+	t.Parallel()
+	s, ran := fakeHost(t, "1500")
+	s.Profile = Default
+	h, _ := s.Host()
+	if _, err := s.Boot(context.Background(), h); err != nil {
+		t.Fatal(err)
+	}
+	if got := read(t, s.Root, Sysctl{Key: "net.netfilter.nf_conntrack_max"}.Path()); got != "268435\n" {
+		t.Errorf("nf_conntrack_max = %q", got)
+	}
+	if got := read(t, s.Root, Sysctl{Key: "net.ipv4.tcp_congestion_control"}.Path()); got != "1\n" {
+		t.Errorf("the default profile set the congestion control: %q", got)
+	}
+	if slices.Contains(*ran, "modprobe tcp_bbr") || !slices.Contains(*ran, "modprobe nf_conntrack") {
+		t.Errorf("modules: %v", *ran)
+	}
+	if rules := read(t, s.Root, BootUdevFile); strings.Contains(rules, "tun_flags") || !strings.Contains(rules, "rx-udp-gro-forwarding on") {
+		t.Errorf("the default profile's udev rule:\n%s", rules)
+	}
+	if _, err := os.Stat(filepath.Join(s.Root, DaemonFile)); err == nil {
+		t.Error("the default profile wrote Docker's file")
+	}
+	if p, ports, ok := s.Booted(); !ok || p != Default || ports != nil || read(t, s.Root, BootProfileFile) != "default\n" {
+		t.Errorf("the boot's profile record: %q %v %v", p, ports, ok)
+	}
+	write(t, s.Root, BootProfileFile, "shared\n")
+	if _, _, ok := s.Booted(); ok {
+		t.Error("a record that names no profile read")
+	}
+	// Stowage's own VM rotates the containers' logs on the default profile too.
+	s.Owned = true
+	if _, err := s.Boot(context.Background(), h); err != nil {
+		t.Fatal(err)
+	}
+	if d := read(t, s.Root, DaemonFile); !strings.Contains(d, `"max-size": "20m"`) {
+		t.Errorf("the VM's daemon file on the default profile:\n%s", d)
+	}
+	h.Reserved = []int{15432, 443}
+	if _, err := s.Boot(context.Background(), h); err != nil {
+		t.Fatal(err)
+	}
+	if p, ports, ok := s.Booted(); !ok || p != Default || !slices.Equal(ports, []int{15432, 443}) {
+		t.Errorf("the record of the ports: %q %v %v", p, ports, ok)
+	}
+}
+
+// A record of a Stowage before profiles names "shared": the default profile now.
+func TestASharedRecordIsTheDefault(t *testing.T) {
+	t.Parallel()
+	s, _ := fakeHost(t, "1500")
+	write(t, s.Root, StateFile, `{"sysctls": {"net.core.somaxconn": "4096"}, "wrote": {"net.core.somaxconn": "8192"}, "daemon": [], "profile": "shared"}`)
+	h, err := s.Host()
+	if err != nil || h.Profile != Default || s.CheckProfile(h) != nil {
+		t.Errorf("a shared record: %q %v", h.Profile, err)
+	}
+	if _, err := s.Revert(context.Background(), false); err != nil {
+		t.Fatal(err)
+	}
+	if got := read(t, s.Root, Sysctl{Key: "net.core.somaxconn"}.Path()); got != "4096\n" {
+		t.Errorf("the revert of a shared record: somaxconn %q", got)
 	}
 }

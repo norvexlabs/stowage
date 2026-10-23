@@ -42,6 +42,9 @@ stack:
   memory:
     shares: { postgres: 25, api: 10 }   # percent of the host's RAM, recomputed at each start
 
+tune:
+  profile: network   # a heavy network load: the hosts are tuned for it (default: Docker's path alone)
+
 front:
   tls_modes: [acme, dns-cloudflare, byo, internal, none]
   routes:

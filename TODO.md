@@ -28,6 +28,17 @@ A finished item is deleted, not ticked. The plan behind it is
    Before writing a module, read the latest provider's official docs and its schema, and pin that
    release.
 
+4. **A ceiling on a memory share**: `stack.memory.shares` gives a service a percent of the host's
+   RAM, with a floor (its compose file's own limit) but no maximum, so on a large host a service
+   whose use stops growing past some size (a database's caches, a gateway's buffers) is handed
+   far more than it can use, and a project cannot say "a quarter of the RAM, up to 16 GiB". Let a
+   share take an optional maximum beside its percent (e.g. `postgres: { percent: 25, max: 16G }`,
+   the bare number kept as the percent alone): the limit is the share, capped at the maximum,
+   still never below the floors; `STOWAGE_MEM_LIMIT_MB` is the capped limit. Lint refuses a
+   maximum under 64 MiB or under the service's own compose limit, and says when the maximum makes
+   the percent unreachable on every host the project's shapes allow. Document it under "Memory
+   shares" and test the cap on both sides of it.
+
 ## Should
 
 - **A prune on a registry that deletes no tag alone reads every tag per refused delete**: `untag`
@@ -229,6 +240,24 @@ A finished item is deleted, not ticked. The plan behind it is
   never resizes an up link and reports it as advice with the `ethtool -G` to run while it is
   down; a host's own boot does not grow them either. A unit ordered before the network (as the
   VM's) would.
+
+- **Ports the network profile's local range may take**: the host reserves the front's and the
+  L4 routes' ports, not a port a service publishes itself on loopback, nor a container's own
+  listening ports in its namespace (whose range the network profile widens too). Reserve the
+  model's published host ports on the host and each service's listening ports in its namespace
+  (`ip_local_reserved_ports` is a namespace's), or keep a container's range at the host's.
+
+- **One pass over the stack's networks before `up`**: the IPv6 check and the MTU check each list
+  the networks and may each stop the stack; one listing, judging both, would stop it once.
+
+- **A Docker host's interrupts and CPU governor on the `network` profile**: `tune --apply` sets
+  them on the running host only, so the host's reboot loses them until the next apply (the VM's
+  boot sets them each time). A unit ordered after the NICs' probe, written by `--apply`, would
+  keep them.
+
+- **The Docker `status`'s `(release)` profile is the running installer's**: `status` run by
+  another release's installer than the one installed names that release's `tune.profile`; the
+  stack runs the installed one's. Read the kept installer's spec, as `upgrade` reads its release.
 
 - **`tune` as a user on a `hidepid` host**: without root, `/proc` hides dockerd's command line,
   so the report judges `/etc/docker/daemon.json` where the engine may read a `--config-file`

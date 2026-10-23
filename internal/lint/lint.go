@@ -26,6 +26,7 @@ import (
 	"github.com/norvexlabs/stowage/internal/lock"
 	"github.com/norvexlabs/stowage/internal/providers"
 	"github.com/norvexlabs/stowage/internal/spec"
+	"github.com/norvexlabs/stowage/internal/tune"
 	"github.com/norvexlabs/stowage/internal/version"
 )
 
@@ -113,6 +114,7 @@ func Run(root, specPath string, now time.Time) (*Result, error) {
 	l.images()
 	l.stack()
 	l.memory()
+	l.tune()
 	l.front()
 	l.l4()
 	l.healthAndDatabase()
@@ -519,7 +521,7 @@ func (l *linter) stack() {
 // 1 %, together at most spec.MaxMemoryShares.
 func (l *linter) memory() {
 	m := l.s.Stack.Memory
-	if m == nil && !l.memoryLeftEmpty() {
+	if m == nil && !l.leftEmpty("stack", "memory") {
 		return
 	}
 	where := "stack.memory.shares"
@@ -545,19 +547,53 @@ func (l *linter) memory() {
 	}
 }
 
-// memoryLeftEmpty: the spec writes `memory:` with nothing under it, which decodes as no
-// stack.memory at all.
-func (l *linter) memoryLeftEmpty() bool {
+// tune checks tune: a profile tune knows.
+func (l *linter) tune() {
+	t := l.s.Tune
+	if t == nil && !l.leftEmpty("tune") {
+		return
+	}
+	if t == nil || t.Profile == "" {
+		l.errf("tune.profile", "missing: default or network, or remove tune")
+		return
+	}
+	if _, err := tune.ParseProfile(t.Profile); err != nil {
+		l.errf("tune.profile", "%q: default or network", t.Profile)
+		return
+	}
+	if l.s.Shapes.Docker == nil && l.s.Shapes.Kairos == nil {
+		l.warnf("tune.profile", "only the docker and kairos shapes tune their hosts: the nodes are the cluster's, and `k8s install --unsafe-sysctls` gives the pods the network profile's settings")
+	}
+}
+
+// leftEmpty: the spec writes the key at path with nothing under it, which decodes as no key at
+// all.
+func (l *linter) leftEmpty(path ...string) bool {
 	raw, err := os.ReadFile(l.specPath)
 	if err != nil {
 		return false
 	}
-	var doc struct {
-		Stack struct {
-			Memory yaml.Node `yaml:"memory"`
-		} `yaml:"stack"`
+	var doc yaml.Node
+	if yaml.Unmarshal(raw, &doc) != nil || len(doc.Content) == 0 {
+		return false
 	}
-	return yaml.Unmarshal(raw, &doc) == nil && doc.Stack.Memory.Kind != 0
+	n := doc.Content[0]
+	for _, k := range path {
+		if n.Kind != yaml.MappingNode {
+			return false
+		}
+		var next *yaml.Node
+		for i := 0; i+1 < len(n.Content); i += 2 {
+			if n.Content[i].Value == k {
+				next = n.Content[i+1]
+			}
+		}
+		if next == nil {
+			return false
+		}
+		n = next
+	}
+	return true
 }
 
 func (l *linter) hookUsesImage(key string) bool {

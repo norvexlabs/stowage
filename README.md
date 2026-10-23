@@ -390,10 +390,11 @@ API it is set up through) packages without changing the software, through the co
   advertises given by the route's `address_input` (`STOWAGE_L4_<ROUTE>`), the sources the VM's
   firewall lets reach it by its `allow_input`. The front can move off 443 with
   `front.https_port`, when a daemon owns it.
-- **UDP, QUIC and tunnels at speed**: the containers get the network settings their namespace
-  keeps of its own, and [`tune`](#network-tuning-short-stow-tune) tunes the host (the socket
-  buffers QUIC asks for, forwarded UDP kept batched, TUN devices' queues); a TUN device in a
-  container is the payload's to tune (same section).
+- **UDP, QUIC and tunnels at speed**: `tune.profile: network` — the containers get the network
+  settings their namespace keeps of its own, and [`tune`](#network-tuning-short-stow-tune)
+  tunes the host (the socket buffers QUIC asks for, forwarded UDP kept batched, the ports and
+  neighbours of many connections, TUN devices' queues, the NICs' interrupts and steering); a TUN
+  device in a container is the payload's to tune (same section).
 - **Material minted once** (a CA, a server key and certificate, a token): a one-shot service of a
   small image (openssl, step-cli) writes it into a named volume, keeping what it finds there, and
   the services that read it `depends_on` it with `condition: service_completed_successfully` and
@@ -1279,6 +1280,7 @@ database: reset-db has nothing to reset` (`… there is no backup to restore`). 
 | `signing` | `cosign-key` (`key`, `public_keys`), or absent / `none` |
 | `images.<key>` | built (`context`, `dockerfile`, `target`, `args`, `inputs`: the paths whose content enters the image's inputs digest, default the whole context less `.dockerignore`) or `ref` (exclusive with the build keys). An image no service or hook uses is a warning; a `# syntax=` frontend or a `FROM $ARG` cannot be checked (warning) |
 | `stack.compose` | the compose file (its contract: "The contracts a project must honour"): `extends` within the file, `profiles:` only those an input's `profile` names, a `ports:` entry past this host an error with a `kairos` shape and a warning on `docker` |
+| `tune.profile` | optional: the tuning profile of the hosts the `docker` and `kairos` shapes run on (see "Network tuning" under the installer): `default` (the same as no `tune`: Docker's path as fast as the host's network) or `network` (a host serving a heavy network load); the operator may choose another (`--tune-profile`). Another name is an error, and so is `tune:` without a profile; a project with neither a `docker` nor a `kairos` shape is warned: a node is the cluster's |
 | `stack.memory` | optional: `shares`, a compose service → the percent of the host's RAM its memory limit is (`{ postgres: 25, api: 10 }`), on Docker and the VM, recomputed at each start (see "Memory shares" under the installer). Each share is a whole percent from 1 to 90, together at most 90 (the rest is the OS's, the engine's and Stowage's); a service the compose file does not declare is an error, and so is `memory:` with no share (empty, or `shares: {}`). A project with neither a `docker` nor a `kairos` shape is warned: the chart gives its pods their resources |
 | `front` | optional: absent or empty, the project has no front (see "A project without a front"). `tls_modes` (`acme`, `dns-cloudflare`, `byo`, `internal`, `none`), `routes[]` (`name`, `domain_input`, `upstream: <service>:<port>`, `strip_headers`, where a trailing `*` matches a prefix; `forward_auth`: `address_input` (required), `uri_input`, `copy_headers` (header names); `allow_input`), `portal`, `loopback_ports`, `loopback_env`, `publish_ca` (`volume`: a volume the compose file declares; refused when the project offers neither `internal` nor `byo`), `http_port` and `https_port` (the host ports a TLS front publishes unless an install's `--http-port` / `--https-port` move them; absent or 0 is 80 and 443; they must differ). Route names must give distinct `STOWAGE_URL_` variables; each `domain_input` routes one upstream. An input `forward_auth` or `allow_input` names must be an input of the `docker` shape and, with a `kairos` shape, of that one too, and neither `required` (empty is how the front leaves it off) nor asked in one mode only (`when`); an `allow_input` input is not `advanced` (never asked, it would refuse everyone). Lint counts these inputs as read |
 | `l4` | `routes[]`: host ports published to a service as they are, beside the front and never through it — `name` (1 to 15 lowercase letters, digits or `-`, starting with a letter, no `-` at its end or beside another, as a chart names a Service port after it; neither another L4 route's nor a front route's name), `protocol` (`tcp` or `udp`), `port` (the host port, 1–65535; one route per protocol and port), `upstream: <service>:<port>` (a compose service), `address_input` (optional: an input, not `secret`, holding the host name or address clients dial — a lowercase host name whose last label is not all digits, or an IP address; no port, scheme or zone. It is checked when given, and lint checks its `default`; the install records the route's endpoint `STOWAGE_L4_<ROUTE>` from it, and lint counts it as read), `allow_input` (optional: an input holding the source addresses and CIDRs, separated by commas or spaces, the VM's firewall lets reach the port — empty refuses every source; checked when given. Only the VM enforces it, so without a `kairos` shape it is a warning (the route is open to every source), and its input is asked on that shape alone (`shapes: [kairos]`: a Docker host's firewall is the operator's), is neither `secret` (the firewall's rules show it) nor `advanced` (never asked, it would refuse every source) nor asked in one mode only (`when`); lint counts it as read). With a `kubernetes` shape, a chart whose templates never read `.Values.stowage.l4` is warned. Over TCP a route's port may not be one the front publishes by default: `front.http_port` / `https_port` (80 and 443) in a TLS mode, a route's `loopback_ports` in loopback mode, and 80 and 443 while `acme` is offered (its challenges need them). The same port over UDP is free. See "L4 routes" under the installer |
@@ -1318,6 +1320,7 @@ again, to copy an installer to another host.
           [--tls acme|dns-cloudflare|byo|internal] [--domains route=host,…] # TLS mode
           [--cert FILE --key FILE [--ca FILE]] [--http-port N] [--https-port N]
           [--ipv6[=false]]                                                 # IPv6 on the stack's network
+          [--tune-profile default|network|release]                         # over the release's tune.profile
           [--secrets FILE|-]                                               # a machine made again
 <short>-stow status [--dir D]
 <short>-stow ps [--json] [--dir D]                                       # the stack's services, state and health
@@ -1338,8 +1341,8 @@ again, to copy an installer to another host.
 <short>-stow backup config|run|status|list|verify [--dir D] [the VM's flags]   # a pg-age-rclone backup
 <short>-stow restore OBJECT [--dir D] [--identity FILE|-] [--yes] [--accessible]
 <short>-stow script                                                      # print the bootstrap script
-<short>-stow tune [--check | --print] [--profile shared|network]         # the host's network tuning
-<short>-stow tune --apply | --revert [--profile shared|network] [--yes] [--restart-docker] [--no-input] [--accessible]
+<short>-stow tune [--check | --print] [--profile default|network]        # the host's network tuning
+<short>-stow tune --apply | --revert [--profile default|network] [--yes] [--restart-docker] [--no-input] [--accessible]
 <short>-stow mirror export [--channel C] [--version V [--revision N]] [--shapes S,…] [--output FILE] [--disks F,…|none]
 <short>-stow mirror import FILE --to PREFIX [--registry-ca FILE] [--older]
 ```
@@ -1367,6 +1370,12 @@ again, to copy an installer to another host.
   (`stowage-ipv6-check-<random>`, labelled `io.stowage.probe=true`): an engine that cannot is
   refused, the install as it was. The VM takes it from
   `vm create --ipv6`.
+- `--tune-profile default|network` chooses the stack's tuning profile over the release's
+  `tune.profile` (see "Network tuning"), for a host whose load differs; `release` gives the choice
+  back to the release. Recorded as `STOWAGE_TUNE_PROFILE` (absent: the release's); a re-run
+  without the flag keeps it. A change of profile changes the containers' settings, so the next
+  start recreates the services; it never changes the host's own settings (`tune --apply` does).
+  The VM takes it from `vm create --tune-profile`.
 - `--registry PREFIX` pulls the images from a mirror holding the same `<name>-<key>`
   repositories (and `<name>-release` and `<name>-installer`, which `upgrade --version` reads
   there). The project's pull account is never sent there: the pulls use the operator's own
@@ -1393,7 +1402,8 @@ again, to copy an installer to another host.
 - `--dry-run` on a first install prints every `KEY=VALUE` `.env` would record (secrets
   `<redacted>`) and writes nothing. On a re-run, it logs the changes a run would record and says
   the stack would be brought up again.
-- `status` prints the release (version, revision), the registry, then, while the first install
+- `status` prints the release (version, revision), the registry, the stack's tuning profile and
+  whose it is (`tune      network (operator)`, or `(release)`), then, while the first install
   has not finished, `not finished: the first install failed (<the first line of its error>); a
   re-run of the installer with --dir D finishes it` (or `… runs, or was stopped; …`); while a
   restore left the volumes half restored, `not running: a restore left <name>'s volumes half
@@ -1465,19 +1475,15 @@ again, to copy an installer to another host.
     HMAC's key is the install's own, `.stowage-content.key` (0600, made at the first start), so a
     label tells nothing of the secrets it covers; a lost key only recreates those services once.
     The same file gives each service with a network namespace of its own (no `network_mode`, or
-    `network_mode: bridge`) the network settings a namespace keeps apart from the host's, sized
-    from this host as [`tune`](#network-tuning-short-stow-tune) sizes them (on a VM, its network
-    profile): `net.core.somaxconn`
-    and `net.ipv4.tcp_max_syn_backlog` 8192, `net.ipv4.tcp_rmem` / `tcp_wmem` up to the socket
-    buffer (or the host's own, field by field, where it is higher: a newer kernel sizes it from
-    RAM), `tcp_notsent_lowat` 131072, `tcp_slow_start_after_idle` 0, `tcp_mtu_probing` 1 —
-    each one the service does not set in its own `sysctls:`, and the host's kernel has. None on
-    Linux older than 4.15 (those keys are not a namespace's there), on rootless Docker or
-    `userns-remap` (a user namespace of the containers' own hides them), or on Docker Desktop;
-    a start whose `docker info` does not answer fails rather than drop them. They follow RAM by
-    doubling (the buffer is a power of two), so a small change of RAM recreates nothing. A change
-    of them (the host's RAM changed) recreates the services at the next start, as any change of
-    the service does.
+    `network_mode: bridge`) the network settings a namespace keeps apart from the host's, by the
+    stack's tuning profile: the host's own values, and on the `network` profile its values where
+    the host holds less; each service its open files (`ulimits.nofile`); and each bridge network
+    the stack makes the host route's MTU — each as "Network tuning" (under the installer) says,
+    and none on Docker Desktop; a start whose `docker info` does not answer fails rather than
+    drop them. The network profile's values follow RAM by doubling (the buffer is a power of
+    two), so a small change of RAM recreates nothing. A change of them (the host's values, its
+    RAM or the profile changed) recreates the services at the next start, as any change of the
+    service does; a change of the host's MTU makes the networks again.
     The same file gives each service of `stack.memory` its memory limit — see "Memory shares".
     An install made by an earlier Stowage has no `stowage-content.yaml` until its next start, and
     a rollback to a release it kept removes the file (the labels go with their compose file);
@@ -1891,27 +1897,76 @@ from `/proc/meminfo` in 64 MiB steps; a limit is whole MiB, and never less than 
 
 #### Network tuning (`<short>-stow tune`)
 
-The host's kernel and Docker engine, tuned for network throughput (many connections, UDP and QUIC
-through the L4 routes, tunnels on TUN devices) without holding memory: every memory ceiling is a
-share of the host's RAM, which the kernel uses under load only, and never below the kernel's own
-default. On a Docker host the OS is the operator's, so nothing changes until they ask; the
-install and `upgrade` end with one line, `tuning   N network settings of this host differ …`,
-when the host differs. A Kairos VM is Stowage's: it tunes itself at each boot (below). On
-Kubernetes a node is tuned by the same `tune` run on it, and the pods get their namespace's
-settings with `k8s install --unsafe-sysctls` (see the installer on Kubernetes).
+The host's kernel, Docker engine and containers, tuned for the stack's network without holding
+memory: every memory ceiling is a share of the host's RAM, which the kernel uses under load only,
+and never below the kernel's own default. Two profiles, each a list of rules:
 
-- Two profiles. `shared` (a Docker host's default) is a host whose other processes the admin
-  runs; `network` leans harder on the network, for a host that runs the stack alone: larger
-  ceilings, more steering of the NICs' packets, their rings grown, the containers' logs rotated. A Kairos VM always takes
-  `network`; a Docker host takes it with `--profile network`, which `--apply` records in
-  `tune.json`, so the report, `--check` and the containers' settings follow it until `--revert`
-  (an unknown name is refused). A host applied with `network` refuses `--profile shared` —
-  report, `--check`, `--print` or `--apply` — until `--revert`: the network profile's own keys
-  would be neither judged, kept nor put back.
+- **`default`** makes Docker's own path as fast as the host's network, and nothing more: each
+  container runs as it would on the host (below), and the host gets what that path goes through
+  — the NAT's connection table, the queue each packet a bridge forwards waits in, forwarded UDP
+  kept batched. It is the profile of a project without `tune`, or with `tune.profile: default`.
+- **`network`** is `default` and everything a host serving a heavy network load needs: larger
+  socket ceilings, BBR and `fq`, the ports and neighbours of many connections, NIC rings,
+  interrupts and flow steering, TUN devices' queues, the CPUs at full speed, the containers'
+  logs rotated. The project picks it with `tune.profile: network`.
+
+The project's author picks the profile in `stowage.yaml` (`tune.profile`); the operator may
+choose another for a host whose load differs: `--tune-profile default|network` on the Docker
+install or a re-run, `vm create --tune-profile` and `install --tune-profile` on the VM. It is
+recorded in `STOWAGE_TUNE_PROFILE` (absent: the release's); `--tune-profile release` removes the
+record, a re-run without the flag keeps it, and a run that changes the stack's profile logs
+`tuning: the network profile, the operator's (was default)`. `status` prints it with whose it is:
+`tune      network (operator)` (the VM's `tune       default (release)`). On a Docker host the
+OS is the operator's, so the host's own settings change only when they ask (`tune --apply`);
+the install and `upgrade` end with one line, `tuning   N network settings of this host differ
+from what the <profile> profile calls for …`, when the host differs. A Kairos VM is Stowage's:
+it tunes itself at each boot (below). On Kubernetes `tune.profile` does not apply: a node is
+tuned by the same `tune` run on it, and the pods get the network profile's namespace settings
+with `k8s install --unsafe-sysctls` (see the installer on Kubernetes); lint warns a project
+with `tune` and neither a `docker` nor a `kairos` shape.
+
+- **Each container**, at each start (the install, a re-run, `upgrade`, `rollback`, the VM's
+  boot), in `stowage-content.yaml`, on every profile, unless Docker Desktop runs it (its own VM)
+  or the engine does not answer (the start then fails):
+  - its network namespace's own settings — `net.core.somaxconn`, `net.ipv4.ip_local_port_range`,
+    `tcp_max_syn_backlog`, `tcp_mtu_probing`, `tcp_notsent_lowat`, `tcp_rmem`,
+    `tcp_slow_start_after_idle`, `tcp_tw_reuse`, `tcp_wmem`, most of which a new namespace takes at
+    the kernel's default rather than the host's — at the host's value; on the `network` profile
+    at the profile's value where the host holds less (field by field, a ceiling the host holds
+    higher kept), so the containers are tuned before the host is — the range of local ports
+    included, so a service listening at 10000 or above in its own namespace may see an outgoing
+    connection of that namespace take its port while it restarts. A service's own `sysctls`
+    key wins; a service on the host's namespace or another service's (`network_mode`) gets none;
+    a key the host's kernel lacks is left out (its start would fail); none on a kernel before
+    4.15 or under a user namespace (rootless Docker, `userns-remap`), whose namespace hides keys.
+  - its open files, `ulimits.nofile`: the hard limit the host's `fs.nr_open`, at most 1048576
+    and at most the hard limit the host's own root `dockerd` and `containerd` run with
+    (`/proc/<pid>/limits`; one in a container of its own, kind or dind, whose `NSpid` names two
+    pids, is not the host's: a container above theirs fails to start where they may not raise
+    it, as in an unprivileged LXC container), the soft limit at most 65536 (a program that needs
+    more raises it to the hard limit itself; one that walks every descriptor stays fast); none
+    when neither process is seen, on rootless Docker or under `userns-remap`, where the engine's
+    own limit bounds it. A service's own `ulimits.nofile` wins.
+  - each network the stack makes as a bridge (`default` and the compose file's own, not an
+    external one nor one setting `com.docker.network.driver.mtu` itself) gets the MTU of the
+    host's default route as that driver option, 1500 included (so the daemon's own
+    `default-network-opts` never stands in for it); a start that finds one of them made with
+    another MTU (its driver option, none being 1500) stops the stack first (`docker compose down
+    --remove-orphans`, volumes kept; a network's MTU is set when it is made), logs it, and starts
+    it on new ones. A host whose default route does not read at that moment keeps the MTU the last
+    start gave the networks.
 - `tune` reports each item, its value here and the one wanted, `ok`, `differs`, `advice` (a
   setting outside the OS: never applied, never counted) or `n/a`, after the host's RAM, CPUs and
   profile; it needs no root, and no engine but for the daemon's file, which it leaves out (and
-  says so) when `docker info` does not answer. `--check`
+  says so) when `docker info` does not answer. Its profile is `--profile`, else on a Docker
+  host the higher of the stack's and the one the last `--apply` recorded in `tune.json` (the host
+  being shared by every stack on it), on the VM the stack's (an unknown name is refused). The
+  stack's choice and its ports are read from the install's record, which is root's (0600): a
+  report run as a user that cannot read it says so (`note: the install's record does not read
+  …`) and takes the release's profile (unless `--profile` names one) and no port. A host
+  applied with `network` refuses `--profile default` — report, `--check`, `--print` or `--apply`
+  — until `--revert`: the network profile's own keys would be neither judged, kept nor put back
+  (a `tune.json` written before the profiles, naming `shared`, is read as `default`). `--check`
   exits non-zero when one differs (monitoring, CI). `--print` prints the files `--apply` writes,
   for a host configured by other means. `--apply` (root) prints what it writes, asks (`--yes`
   without a terminal, else it refuses), writes the files and applies them to the running host;
@@ -1924,71 +1979,95 @@ settings with `k8s install --unsafe-sysctls` (see the installer on Kubernetes).
   is the host's own, and kept when the rule allows it. Every memory value is at least the
   kernel's default for that RAM; `vm.min_free_kbytes` is the only one that sets memory aside:
 
-  | Setting | `shared` | `network` |
+  | Setting | `default` | `network` |
   |---|---|---|
-  | `net.core.rmem_max`, `wmem_max`, the top of `net.ipv4.tcp_rmem` / `tcp_wmem` | RAM / 256 rounded down to a power of two, from 8 MiB (a QUIC stack asks 7) to 64 MiB, at least; `tcp_rmem` `4096 131072 …`, `tcp_wmem` `4096 16384 …` | RAM / 128, from 16 MiB to 128 MiB (10 Gbit/s over 100 ms) |
-  | `net.ipv4.tcp_mem` (all TCP sockets, in pages) | the kernel's default (low, pressure, high: ¾, 1 and 1½ × RAM / 16 pages, about 4.7, 6.25 and 9.4 % of RAM) × 1.5, at least | × 2 |
-  | `net.ipv4.udp_mem` (all UDP sockets: QUIC, tunnels) | the kernel's default (from RAM / 8 pages, about 9.4, 12.5 and 18.75 %) × 1.5, at least | the same |
-  | `net.core.netdev_max_backlog` | 1 % of RAM across the CPUs at 2 KiB a packet, from 1000 (the kernel's) to 32768, at least | 2 %, up to 65536 |
+  | `net.core.netdev_max_backlog` | 1 % of RAM across the CPUs at 2 KiB a packet, from 1000 (the kernel's) to 32768, at least | 2 %, from 65536 to 262144 |
   | `net.netfilter.nf_conntrack_max` / `nf_conntrack_buckets` | 2 % of RAM at 320 B an entry / a quarter of it, each at least the kernel's table (262144 above 4 GiB, 65536 above 1 GiB, else RAM / 128 KiB, at least 1024) | 4 % |
-  | `vm.min_free_kbytes` | 0.5 % of RAM, at most 128 MiB, and at least the kernel's √(16 × RAM in KiB) | the same |
-  | `net.core.rps_sock_flow_entries` | RAM / 128 KiB, a power of two from 4096 to 65536, at least | the same |
+  | a NIC backed by a device | `ethtool -K <nic> rx-udp-gro-forwarding on rx-gro-list off`: forwarded UDP (QUIC to a container, a tunnel) stays batched | also its receive queues' steering, rings and interrupts (below) |
+  | the modules loaded at boot | `tun`, `nf_conntrack` | also `tcp_bbr`, `sch_fq` |
+  | `net.core.rmem_max`, `wmem_max`, the top of `net.ipv4.tcp_rmem` / `tcp_wmem` | the kernel's | RAM / 128 rounded down to a power of two, from 16 MiB (a QUIC stack asks 7) to 128 MiB (10 Gbit/s over 100 ms), at least; `tcp_rmem` `4096 131072 …`, `tcp_wmem` `4096 16384 …` |
+  | `net.ipv4.tcp_mem` (all TCP sockets, in pages) | the kernel's | the kernel's default (low, pressure, high: ¾, 1 and 1½ × RAM / 16 pages, about 4.7, 6.25 and 9.4 % of RAM) × 2, at least |
+  | `net.ipv4.udp_mem` (all UDP sockets: QUIC, tunnels) | the kernel's | the kernel's default (from RAM / 8 pages, about 9.4, 12.5 and 18.75 %) × 1.5, at least |
+  | `vm.min_free_kbytes` | the kernel's | 0.5 % of RAM, at most 128 MiB, and at least the kernel's √(16 × RAM in KiB) |
+  | `net.core.rps_sock_flow_entries` | the kernel's | RAM / 128 KiB, a power of two from 4096 to 65536, at least |
   | `net.core.netdev_budget`, `netdev_budget_usecs` | the kernel's | 600, 8000, at least: more packets a CPU takes from the NICs in one pass |
-  | `net.core.default_qdisc`, `net.ipv4.tcp_congestion_control` | `fq`, `bbr` | the same |
-  | `net.ipv4.tcp_notsent_lowat` | 131072, at most: less unsent data held in a socket (latency; BBR keeps the throughput) | the same |
-  | `net.ipv4.tcp_slow_start_after_idle`, `tcp_mtu_probing` | 0, 1 (at least) | the same |
-  | `net.core.somaxconn`, `net.ipv4.tcp_max_syn_backlog` | 8192, at least | the same |
-  | `net.ipv4.conf.all.rp_filter`, `conf.default.rp_filter` | 2 (loose; any value but 1 passes): a tunnel's replies may come back another way | the same |
-  | a NIC backed by a device | `ethtool -K <nic> rx-udp-gro-forwarding on rx-gro-list off`: forwarded UDP (QUIC to a container, a tunnel) stays batched | also each receive queue's `rps_flow_cnt` its share of `rps_sock_flow_entries`, the table over the CPUs as a power of two (flows steered to the CPU that reads them; in the udev rule too, on each queue's own appearance, a change of the NIC's channels included), and its receive and transmit rings (`ethtool -G`) grown to the driver's maximum within 1 % of RAM at 2 KiB a slot, a power of two — never shrunk, and only on a link not yet up (`IFF_UP` clear; flags that do not read count as up), as a resize resets it: the VM's first boot pass grows them; on an up link the item is `advice` with the `ethtool -G` to run while it is down (also when a driver refuses a ring it lists), `n/a` when the driver offers no larger one |
-  | a TUN or TAP device made in the host's namespace | `tx_queue_len` 1 % of RAM at 2 KiB a packet, from 500 to 10000; `queues/rx-0/rps_cpus` every online CPU; `rps_flow_cnt` as `rps_sock_flow_entries` | `tx_queue_len` 2 %, from 1000 |
-  | the `tun` module | present | the same |
-  | Docker's `daemon.json` | `default-ulimits.nofile` 1048576 soft and hard, at least; `default-network-opts.bridge."com.docker.network.driver.mtu"` the default route's MTU when it is not 1500 (Docker ≥ 24; the networks made from then on, a stack's at its first start) | also `log-opts` `max-size` 20m, `max-file` 5: the default `json-file` driver's rotation, for the containers made from then on, a service's own logging options still valid — `n/a`, left out, when the file names another driver or has `log-opts` of its own, or dockerd runs with `--log-opt` or another `--log-driver` |
+  | `net.core.default_qdisc`, `net.ipv4.tcp_congestion_control` | the kernel's | `fq`, `bbr` |
+  | `net.ipv4.tcp_notsent_lowat` | the kernel's | 131072, at most: less unsent data held in a socket (latency; BBR keeps the throughput) |
+  | `net.ipv4.tcp_slow_start_after_idle`, `tcp_mtu_probing` | the kernel's | 0, 1 (at least) |
+  | `net.core.somaxconn`, `net.ipv4.tcp_max_syn_backlog` | the kernel's | 8192, at least |
+  | `net.ipv4.tcp_tw_reuse` | the kernel's | 1: an outgoing connection reuses a port in `TIME_WAIT` (the kernel's 2 does so on loopback only) |
+  | `net.ipv4.ip_local_port_range` | the kernel's | `10000 65535`, a range the host holds wider kept: its width caps the connections open to one destination |
+  | `net.ipv4.ip_local_reserved_ports` | the kernel's | the stack's own ports within that range — the front's (`STOWAGE_HTTP_PORT`, `STOWAGE_HTTPS_PORT`, each loopback route's port) and each `l4` route's — added to the host's list, never given to an outgoing connection; left out when none is. A port a service publishes itself (`ports:` on loopback) is not reserved: one at 10000 or above may be taken by an outgoing connection while its service restarts — publish it below 10000, or as a route |
+  | `net.ipv4.neigh.default.gc_thresh1` / `2` / `3`, and IPv6's | the kernel's | 8192, 32768, 65536, at least: the neighbour table of a network of many clients |
+  | `net.ipv4.conf.all.rp_filter`, `conf.default.rp_filter` | the kernel's | 2 (loose; any value but 1 passes): a tunnel's replies may come back another way |
+  | a NIC's receive queues | — | each queue's `rps_flow_cnt` its share of `rps_sock_flow_entries`, the table over the CPUs as a power of two (flows steered to the CPU that reads them; in the udev rule too, on each queue's own appearance, a change of the NIC's channels included); a NIC with fewer receive queues than CPUs also has each queue's `rps_cpus` at every online CPU (RPS: the hardware cannot spread them), in a udev rule of its own (`DEVPATH=="*/net/<nic>/queues/rx-*"`) |
+  | a NIC's interrupts | — | the NIC's interrupts (its PCI device's `msi_irqs`, a virtio NIC's parent's) that all land on the same CPUs (`effective_affinity_list`, else `smp_affinity_list`) go one to a CPU, round robin over the online CPUs; a NIC whose interrupts are spread already, a driver whose interrupts the kernel manages (the write refused: said), or a host where `irqbalance` runs (`n/a`) is left as it is. The report gives interrupts all on the same CPUs as `advice` (the kernel may manage them), spread ones as `ok`. Set on the running host, never in a file: a Docker host's reboot loses it, the VM's boot sets it again |
+  | a NIC's rings | — | its receive and transmit rings (`ethtool -G`) grown to the driver's maximum within 1 % of RAM at 2 KiB a slot, a power of two — never shrunk, and only on a link not yet up (`IFF_UP` clear; flags that do not read count as up), as a resize resets it: the VM's first boot pass grows them; on an up link the item is `advice` with the `ethtool -G` to run while it is down (also when a driver refuses a ring it lists), `n/a` when the driver offers no larger one |
+  | the CPUs' frequency | — | `scaling_governor` `performance` on each CPU whose cpufreq driver offers it (one that does not keeps its own); `n/a` without cpufreq, as on most VMs, where the hypervisor drives it. Set on the running host, as the interrupts are |
+  | a TUN or TAP device made in the host's namespace | — | `tx_queue_len` 2 % of RAM at 2 KiB a packet, from 1000 to 10000; `queues/rx-0/rps_cpus` every online CPU; `rps_flow_cnt` as `rps_sock_flow_entries` |
+  | Docker's `daemon.json` | not read on a Docker host; on a Kairos VM the network profile's `log-opts` (its logs share its disk) | `log-opts` `max-size` 20m, `max-file` 5: the default `json-file` driver's rotation, for the containers made from then on, a service's own logging options still valid — `n/a`, left out, when the file names another driver or has `log-opts` of its own, or dockerd runs with `--log-opt` or another `--log-driver` |
 
+  The `tun` module is checked on both (`present`).
 - **On a Kairos VM**, `<name>-tune.service` runs `<short>-stow tune-boot` at each boot, after the
   kernel's own settings and udev's first pass, before the network starts, and
   `<name>-tune-online.service` runs it again once the network is online, before Docker starts
-  (the default route's MTU is known then, and a NIC probed late is there). It loads the
-  modules, writes the `network` profile's settings for this boot's RAM and CPUs over what the
-  kernel holds (so a resized VM is tuned for its new size), the udev rule to
-  `/run/udev/rules.d/60-stowage-net.rules` (the offload of a NIC, and the queues of a TUN device, that
-  appears later), the daemon
-  keys into `/etc/docker/daemon.json` before Docker reads it, and sets the NICs and TUN devices
-  already there; it writes no file that outlives the boot and keeps no `tune.json`. A daemon
-  file that does not merge is left as it is, and the rest is tuned. Its notes are in the units'
-  journal. The VM's `tune` reports against it and `--check` checks it; it has no `--print`,
-  `--apply`, `--revert` or `--profile`, and its drift line names the reboot that tunes it again
-  and the units' journal (`sudo journalctl`). On Hyper-V and Azure, `/etc/systemd/network/00-<name>-sriov.network` (first of the
-  VM's network files, `network set`'s override included)
-  leaves the accelerated networking's virtual function (`mlx4_en`, `mlx4_core`, `mlx5_core`, `mana`)
-  unmanaged: the kernel bonds it under the VM's NIC, whose address it shares. The image carries `ethtool`, and the
-  build fails when its kernel lacks `tun`, `nf_conntrack`, `tcp_bbr`, `sch_fq`, or the clouds'
-  NIC drivers: `gve` (gVNIC) and `mana` (Azure), copied from the kernel's extra modules
-  package, and `mlx5_core` (Azure's ConnectX). The VM modules give the hypervisor's part:
-  multiqueue virtio on libvirt and Proxmox, gVNIC on Compute Engine, accelerated networking on
-  Azure ([`vm create`](#creating-a-vm-short-stow-vm-create)); TrueNAS offers no queue setting,
-  which the report gives as `advice`.
+  (the default route's MTU is known then, and a NIC probed late is there). Its Docker file rotates
+  the containers' logs on every profile (`log-opts` as the table's `network` column: the VM's
+  logs share its disk). It applies the
+  stack's profile — the install's record, before the first install the settings file's
+  (`vm create --tune-profile`), else the release's: it loads the profile's modules, writes its
+  settings for this boot's RAM and CPUs over what the kernel holds (so a resized VM is tuned for
+  its new size), the udev rule to `/run/udev/rules.d/60-stowage-net.rules` (the offload of a
+  NIC, and on `network` the queues of a NIC or TUN device, that appears later), on `network` the
+  daemon keys into `/etc/docker/daemon.json` before Docker reads it, and sets the NICs, TUN
+  devices and CPUs already there, then records the profile it applied and the ports it
+  reserved in `/run/stowage/tune-profile` (0644, `network 443,15432`); it writes no file that outlives the boot and keeps no
+  `tune.json`. A daemon file that does not merge is left as it is, and the rest is tuned. Its
+  notes are in the units' journal. `sudo <short>-stow install --tune-profile P` on an installed
+  VM records the operator's profile and restarts the containers with its settings; a profile
+  higher than the one `/run/stowage/tune-profile` says the VM holds tunes the VM at once, as the
+  boot does (so a re-run after one that failed before it tuned still tunes it) (`tuned by the network profile for … MiB and …
+  CPUs`; a ring of an up link waits for the next boot), as does a re-run on the `network` profile that
+  changes the stack's ports (their reservation); a lower one takes over at the next reboot
+  (`<short>-stow reboot`), the higher one's settings staying until then (said). The install is
+  done by then: a tuning that fails is a note (`tuning the VM now failed …: its next boot tunes
+  it`), not the run's failure. The VM's `tune` reports against what the VM
+  holds — the profile and ports `/run/stowage/tune-profile` records, else the stack's — and
+  `--check` checks it; it has no `--print`, `--apply`, `--revert` or `--profile`, and
+  its drift line names the reboot that tunes it again and the units' journal (`sudo
+  journalctl`). On Hyper-V and Azure, `/etc/systemd/network/00-<name>-sriov.network` (first of
+  the VM's network files, `network set`'s override included) leaves the accelerated networking's
+  virtual function (`mlx4_en`, `mlx4_core`, `mlx5_core`, `mana`) unmanaged: the kernel bonds it
+  under the VM's NIC, whose address it shares. The image carries `ethtool`, and the build fails
+  when its kernel lacks `tun`, `nf_conntrack`, `tcp_bbr`, `sch_fq`, or the clouds' NIC drivers:
+  `gve` (gVNIC) and `mana` (Azure), copied from the kernel's extra modules package, and
+  `mlx5_core` (Azure's ConnectX). The VM modules give the hypervisor's part: multiqueue virtio
+  on libvirt and Proxmox, gVNIC on Compute Engine, accelerated networking on Azure ([`vm
+  create`](#creating-a-vm-short-stow-vm-create)); TrueNAS offers no queue setting, which the
+  report gives as `advice`.
 - The files, named for Stowage rather than one stack (two stacks write the same values):
-  `/etc/sysctl.d/60-stowage-net.conf`; `/etc/modules-load.d/60-stowage-net.conf` (`tun`,
-  `nf_conntrack`, `tcp_bbr`, `sch_fq`, loaded at boot, before the settings that need them);
+  `/etc/sysctl.d/60-stowage-net.conf`; `/etc/modules-load.d/60-stowage-net.conf` (the profile's
+  modules, loaded at boot, before the settings that need them);
   `/etc/udev/rules.d/60-stowage-net.rules` (the NICs' offload, left out without `ethtool`
-  installed, the TUN devices' queues, and on the `network` profile each NIC queue's steered
-  flows, at each device's or queue's appearance); the keys above merged
-  into the daemon's file — `/etc/docker/daemon.json`, or the `--config-file` of the dockerd that
-  runs as root (snap; a relative one from `/`; a user's rootless dockerd is never read) — its
-  other keys kept (a file that does not parse is refused, nothing written);
-  `/etc/stowage/tune.json`, the values the first `--apply` found (the modules loaded first, so
-  their settings are there), the values the last one wrote, and each daemon key it set with its
-  file, which `--revert` reads; a `tune.json` that does not read is reported as `differs`.
-  `--apply` and `--revert` refuse a user before they read or ask anything; `--apply` and
-  `--print` refuse Docker Desktop (running, or stopped: the CLI's context names it), whose
-  containers this host's settings miss.
+  installed, and on the `network` profile the TUN devices' queues, each NIC queue's steered
+  flows and the RPS of a NIC with fewer queues than CPUs, at each device's or queue's
+  appearance); on `network` the keys above merged into the daemon's file —
+  `/etc/docker/daemon.json`, or the `--config-file` of the dockerd that runs as root (snap; a
+  relative one from `/`; a user's rootless dockerd is never read) — its other keys kept (a file
+  that does not parse is refused, nothing written); `/etc/stowage/tune.json`, the values the
+  first `--apply` found (the modules loaded first, so their settings are there), the values the
+  last one wrote, the profile, and each daemon key it set with its file, which `--revert` reads;
+  a `tune.json` that does not read is reported as `differs`. `--apply` and `--revert` refuse a
+  user before they read or ask anything; `--apply` and `--print` refuse Docker Desktop (running,
+  or stopped: the CLI's context names it), whose containers this host's settings miss.
 - On the running host `--apply` loads the modules (`modprobe`), writes the settings, runs
-  `ethtool` on each NIC and sets the TUN devices there. An interface already up takes `fq` when
-  it next comes up. Docker reads its file when it restarts, which restarts the containers:
-  `--apply` says so and leaves it to the operator, unless `--restart-docker` (`systemctl restart
-  docker`). `--revert` puts back each daemon key still holding what `--apply` set (one changed
-  since is left, and said), writes back the settings the first `--apply` found, and leaves the
-  NICs' offload and the TUN queues until the next boot.
+  `ethtool` on each NIC, and on `network` spreads the NICs' interrupts and packets, sets the
+  CPUs' governor and the TUN devices there. An interface already up takes `fq` when it next
+  comes up. Docker reads its file when it restarts, which restarts the containers: `--apply`
+  says so and leaves it to the operator, unless `--restart-docker` (`systemctl restart docker`).
+  `--revert` puts back each daemon key still holding what `--apply` set (one changed since is
+  left, and said), writes back the settings the first `--apply` found, and leaves the NICs'
+  offload, interrupts and steering, the TUN queues and the CPUs' governor until the next boot.
 - `advice` judges each NIC on what its hypervisor or cloud decides: an emulated NIC (e1000,
   rtl8139: give the VM a virtio or vmxnet3 one), a virtio NIC with fewer receive queues than
   vCPUs (multiqueue), virtio on Compute Engine (gVNIC), an Azure NIC without accelerated
@@ -1997,9 +2076,10 @@ settings with `k8s install --unsafe-sysctls` (see the installer on Kubernetes).
   then `--apply` sets the offload).
 - `n/a`: on Docker Desktop the containers run in its own VM, which this host's settings miss;
   rootless Docker's daemon file and network are the user's, and are left out; an offload the
-  kernel or the driver fixes (`[fixed]`, or none: Linux before 5.12); a daemon key dockerd is
-  started with as a flag (`--default-ulimit`, `--default-network-opt`), which its file may not
-  repeat — dockerd refuses to start on both — so `--apply` leaves it out and says so.
+  kernel or the driver fixes (`[fixed]`, or none: Linux before 5.12); an IPv6 setting of a kernel
+  running without IPv6 (`ipv6.disable=1`), which `--apply` does not set either; a daemon key dockerd is
+  started with as a flag (`--log-opt`), which its file may not repeat — dockerd refuses to start
+  on both — so `--apply` leaves it out and says so.
 - `--revert` and `--print` run without a reachable engine (`--print` then leaves the daemon
   file out): an engine that does not start may be what is reverted.
 - A payload's own TUN device lives in its container's namespace, which the host's rules do not
@@ -2039,7 +2119,8 @@ the current directory. A release with no chart (published without the shape) is 
 
 - Defaults: `--namespace <name>`, `--release <name>` (each a DNS label; a release name is at most
   53 characters).
-- `--unsafe-sysctls` gives the release's pods the network settings of "Network tuning" whose
+- `--unsafe-sysctls` gives the release's pods the network profile's settings of "Network
+  tuning" (whatever the release's `tune.profile`, which Kubernetes does not read) whose
   namespace starts at a fixed default — `net.core.somaxconn` 8192, `net.ipv4.tcp_mtu_probing` 1,
   `net.ipv4.tcp_notsent_lowat` 131072, `net.ipv4.tcp_slow_start_after_idle` 0 — as the chart's
   `stowage.sysctls`; `--unsafe-sysctls=false` takes them away, and an `upgrade` without the flag
@@ -2438,7 +2519,7 @@ in the same installer (bootstrap it as above, then `sh <name>.sh vm create …`,
 ```bash
 <short>-stow vm create [--platform P] [--out DIR] [--hostname H] [--user U] [--ssh-key FILE]
           [--network dhcp|static] [--address A/P] [--gateway G] [--dns D,…]
-          [--ipv6 [--address6 A/P] [--gateway6 G]]
+          [--ipv6 [--address6 A/P] [--gateway6 G]] [--tune-profile default|network]
           [--ssh-allow CIDR,…] [--timezone ZONE] [--secrets FILE|-]
           [--tls MODE] [--domains route=host,…] [--http-port N] [--https-port N]
           [--set KEY=VALUE]… [--answers FILE] [--no-input] [--accessible]
@@ -2479,7 +2560,10 @@ in the same installer (bootstrap it as above, then `sh <name>.sh vm create …`,
   optional static IPv6 `--address6` with its prefix and its `--gateway6` (asked with the static
   mode's questions when `--ipv6` is given, empty by default) sit beside them; `--address6` or
   `--gateway6` without `--ipv6` is refused, as is an IPv6 `--dns` server; `--ipv6` also turns IPv6
-  on for the install's network (`install --ipv6`, recorded in the settings); the whole
+  on for the install's network (`install --ipv6`, recorded in the settings); `--tune-profile`
+  (`default` or `network`, another refused) is the VM's tuning profile over the release's
+  `tune.profile`, which its boots apply and its first install records (`install
+  --tune-profile`, recorded in the settings as `tune_profile`); the whole
   addressing, IPv4 and IPv6, is checked by the rules `network set` follows (below), a refusal
   starting "the VM's network:"; `--ssh-allow` (CIDR, repeatable or comma-separated,
   IPv4 or IPv6; each masked to its prefix) the sources SSH accepts — without it SSH accepts every
@@ -2710,8 +2794,9 @@ and never pulls: it runs the images the bundle preloads, by their digest tag
 sudo <short>-stow install [--channel C] [--set KEY=VALUE]… [--answers FILE] [--no-input] [--accessible]
           [--ports route=port,…] [--address 127.x.x.x] [--tls MODE] [--domains route=host,…]
           [--cert F --key F [--ca F]] [--http-port N] [--https-port N] [--no-provision] [--dry-run]
+          [--tune-profile default|network|release]   # on an installed VM, a higher profile applies at once, a lower one at the next reboot
           [--secrets FILE|- | --new-secrets]   (both: refused)
-<short>-stow status [--json]          # this OS's release, the install's (and `not finished` while a first install's stack comes up or its provision hook runs, or after one failed — with why, and the `sudo <short>-stow install` that runs it again; `"installing": true` and `"install_failed": "<why>"` in JSON; `not provisioned` while an install given `--secrets` awaits the backup `restore` loads, `"restore_awaited": true`; `not running` while a restore left the volumes half restored, `"volumes_split": true`), the channel, the system Kairos booted (active, passive or recovery; the fallback), the last failed boot, the disk, a byo install's certificate (`cert`: its names, end and days left, with a warning from 30 days before it; `"cert"` in JSON), the services
+<short>-stow status [--json]          # this OS's release, the install's (and `not finished` while a first install's stack comes up or its provision hook runs, or after one failed — with why, and the `sudo <short>-stow install` that runs it again; `"installing": true` and `"install_failed": "<why>"` in JSON; `not provisioned` while an install given `--secrets` awaits the backup `restore` loads, `"restore_awaited": true`; `not running` while a restore left the volumes half restored, `"volumes_split": true`), the channel, the stack's tuning profile and whose it is (`tune       network (operator)`, `"tune"` in JSON), the system Kairos booted (active, passive or recovery; the fallback), the last failed boot, the disk, a byo install's certificate (`cert`: its names, end and days left, with a warning from 30 days before it; `"cert"` in JSON), the services
 <short>-stow health [--json]          # ready, or fails saying why: the health gate's check, once
 <short>-stow events [--after N] [--follow|-f] [--json]   # the event journal: jobs, reboots, boots and the health gate's verdicts, the first install; --follow waits for more until interrupted, through daemon restarts
 <short>-stow ps [--json]              # the stack's services, state and health
@@ -2726,7 +2811,7 @@ sudo <short>-stow install [--channel C] [--set KEY=VALUE]… [--answers FILE] [-
 <short>-stow secrets export --recipient age1…… [-o FILE|-]   # the install's secrets, encrypted
 <short>-stow secrets rotate KEY [--stage | --finish]   # a secret with rotation: true
 <short>-stow network [--json]          # the address, gateway and DNS servers, what sets them, a change awaiting confirmation
-<short>-stow tune [--check]           # how the VM's network settings differ from what its boot tuning wants (the network profile); --check exits non-zero
+<short>-stow tune [--check]           # how the VM's network settings differ from what its boot tuning wants (the stack's profile); --check exits non-zero
 <short>-stow network set --mode dhcp|static [--address A/P] [--gateway G] [--ipv6 [--address6 A/P] [--gateway6 G]] [--dns D,…] [--revert-secs N | --no-revert]
 <short>-stow network confirm|revert   # keep the change awaiting confirmation, or undo it now
 <short>-stow network reset [--revert-secs N | --no-revert]   # drop the override: back to the cloud-config's network
@@ -3397,13 +3482,13 @@ make gate     # the commit gate: check, build, lint, then only the end-to-end su
 make gate-plan  # the suites `make gate` would run, each with the first changed path that needs it; `bash test/gate.sh --plan --paths P…` for given paths
 make e2e      # build, then ship / verify / promote / yank / prune examples/minimal, signed, against zot, and run its installer image; with registry.pull none on a registry refusing anonymous reads, ship stops before it builds
 make smoke-install  # the installer on the local Docker engine: registry, stack, front, provision hook, re-run, status, upgrade, rollback; behind TLS the local CA, then byo with --ca, each one's CA published to the stack and what the front serves chaining to it; the byo install moved to internal and back by re-runs; a loopback install on `::1` with `--ipv6` (the stack's network and the front have IPv6); with a global IPv6 address on the host, a TLS install whose route has an allowlist, called from that address: `--ipv6` and the allowlist holding it serves, an allowlist without it refuses (403), and the same install moved off IPv6 refuses it too (the front sees Docker's IPv4 gateway)
-make e2e-docker     # build, then the real binaries against zot and the local Docker engine: ship examples/minimal 1.0.0, install it with the bootstrap one-liner, re-run, ship 2.0.0 and 3.0.0 and reach each with notes-stow upgrade --version (each release's signature checked against the kept installer's key), roll back (allowed, then refused at a rollback barrier); then `mirror export` 3.0.0, `mirror import` into a TLS zot of its own test CA (refused without `--registry-ca`, the signatures carried), a second install from it with `--registry` and `--registry-ca`, and `upgrade --version` reading it with the recorded CA
-make e2e-full       # build, then examples/full as it stands on the Docker shape: ship this month's CalVer release with a token push, signed with the key its environment holds (env://), install it with the bootstrap one-liner (the installer image pulled with the project's own pull account) in loopback mode, every route serving, the api migrating a real Postgres and serving as its app role, the provision hook registering the administrator and its API key through the api and its credentials file 0600; the install prints its endpoint (the api route's URL, also in `status`) and ends with the search extension's tip (`atlas-search`, not published on the channel); a re-run sets the search extension's input (`SEARCH_URL`, the api reaching it, no tip), another clears it (the tip again), the hook handed back the key it minted; the app's users revoke that key: `provision` fails naming `provision --set`, `provision --set ADMIN_API_KEY=` mints and registers another (in no log), the next run keeps it; its record lost, `provision --set ADMIN_API_KEY=<key>` gives the key the hook never returned (declared in `hooks.provision.returns`; an undeclared key refused) and no other is minted; re-runs turn forward auth on the api route on (no identity without the authentication service's answer, a forged header stripped) and off, narrow the ingest route's allowlist to another address and to none (403), set an advanced input and give it back to its default (status shows each); `secrets rotate` takes the internal secret through --stage, the swap and --finish, each value accepted while it must be and the old one refused after; ship .2 (a migration), upgrade --version (data kept, a pg_dump snapshot), roll back (allowed by the api image's reads-newer label); ship .3 (a migration that is a rollback barrier), upgrade, and rollback is refused naming the barrier and the snapshot
+make e2e-docker     # build, then the real binaries against zot and the local Docker engine: ship examples/minimal 1.0.0, install it with the bootstrap one-liner, re-run, the release's default tuning profile in status and the api container given the host's own settings and open files, ship 2.0.0 and 3.0.0 and reach each with notes-stow upgrade --version (each release's signature checked against the kept installer's key), roll back (allowed, then refused at a rollback barrier); then `mirror export` 3.0.0, `mirror import` into a TLS zot of its own test CA (refused without `--registry-ca`, the signatures carried), a second install from it with `--registry` and `--registry-ca`, and `upgrade --version` reading it with the recorded CA
+make e2e-full       # build, then examples/full as it stands on the Docker shape: ship this month's CalVer release with a token push, signed with the key its environment holds (env://), install it with the bootstrap one-liner (the installer image pulled with the project's own pull account) in loopback mode, every route serving, the api migrating a real Postgres and serving as its app role, the provision hook registering the administrator and its API key through the api and its credentials file 0600; the release's network tuning profile in status, the api's namespace holding its settings, the host's open files and the host route's MTU on the stack's network; the install prints its endpoint (the api route's URL, also in `status`) and ends with the search extension's tip (`atlas-search`, not published on the channel); a re-run sets the search extension's input (`SEARCH_URL`, the api reaching it, no tip), another clears it (the tip again), the hook handed back the key it minted; the app's users revoke that key: `provision` fails naming `provision --set`, `provision --set ADMIN_API_KEY=` mints and registers another (in no log), the next run keeps it; its record lost, `provision --set ADMIN_API_KEY=<key>` gives the key the hook never returned (declared in `hooks.provision.returns`; an undeclared key refused) and no other is minted; re-runs turn forward auth on the api route on (no identity without the authentication service's answer, a forged header stripped) and off, narrow the ingest route's allowlist to another address and to none (403), set an advanced input and give it back to its default (status shows each); `secrets rotate` takes the internal secret through --stage, the swap and --finish, each value accepted while it must be and the old one refused after; ship .2 (a migration), upgrade --version (data kept, a pg_dump snapshot), roll back (allowed by the api image's reads-newer label); ship .3 (a migration that is a rollback barrier), upgrade, and rollback is refused naming the barrier and the snapshot
 make e2e-k8s        # build, then the real binaries against zot and a kind cluster pulling from it with the pull Secret: k8s install with the bootstrap script (the provision hook's Job run, what it returned in its Secret and not the log), upgrade --values, upgrade alone (what the hook returned handed back), upgrade --version 2.0.0, a refused downgrade, a failed upgrade helm rolls back, rollback, status, reset-db (what the hook returned forgotten), uninstall refused without --data (the chart's own claim, which helm deletes), then uninstall --data removing the release, its Secrets, the hook's account and the claim, the namespace kept
 make e2e-stateless  # build, then examples/stateless on the Docker shape: ship 1.0.0 (a pulled image, no database, no front) to zot, install it with the bootstrap one-liner (no TLS mode asked or recorded, no front running), the health path and the L4 route serving the input from an inline compose config, the state volume given the server's uid (the server, uid 1000, writes into it at start); a re-run changes the input, and the server is made again with it; `status` lists the L4 route; `--tls` refused, there being no front; ship 1.0.1, `upgrade --version 1.0.1` (nothing dumped) and `rollback` (no schema check), the input kept; `reset-db` refused, the release having no database
 make e2e-full-k8s   # build, then examples/full's chart on a kind cluster pulling from zot: k8s install with the bootstrap script against a Postgres outside the release (its two URLs and the administrator's password secret inputs from the operator's environment), two api replicas migrating once, the provision hook's Job registering the administrator and its API key (recorded in the outputs Secret, in no log; the Job deleted; no helm hook), every service answering, the api reaching the search extension's URL given at the install (`--set SEARCH_URL=…`), the endpoint printed as the api's Service URL; `k8s upgrade` of the same release, the key handed back to the hook; the app's users revoke the key, ship .2 (a migration), upgrade --version: the release runs .2 and the hook fails naming `k8s provision --set`, which mints and registers another key, and `k8s provision` again keeps it; its record lost, `k8s provision --set ADMIN_API_KEY=<key>` gives the key the hook never returned (an undeclared key refused) and no other is minted (data kept); rollback (the previous api on the newer schema); a second release in another namespace with the embedded Postgres, and reset-db deleting its database's claim, forgetting what the hook returned and registering the administrator again; `k8s secrets rotate` through its three passes, the release restarted at each, each value accepted while it must be; `k8s uninstall --yes` of the embedded release keeps its database's claim and its Secrets, and `k8s install` takes them back, the events kept
 make e2e-kairos     # build, then ship examples/minimal's OS bundle and its qcow2 and ova disks and its three clouds' raw, vhd and gce to zot for real (each image docker-loaded from the bundle, each disk's zstd layer decompressed with `zstd -d` and checked in its format, the vhd and the gce as Azure and Google Cloud import them); the bundle's notes-stow on the local Docker engine as on the VM (install from the preloaded images with a settings file, boot, the host daemon's verbs, its disk-pressure POST to the api (the token never logged) and `status` showing it, its app socket and the api service's token and mount, `backup config`, `verify`, `run` to a WebDAV server through the preloaded runner, the backup decrypted and read by `pg_restore` and the uploads volume's archive beside it, `list`, `status`); with `STOWAGE_CLOUD_ENV=<file>` (a shell file of a cloud's `STOWAGE_<CLOUD>_*` settings and credentials, needs `tofu`), the images registered on the clouds it sets up, the others reported left out, and every image it registered destroyed at exit; re-ship (nothing built, nothing registered again), promote, `vm create` from the published notes-stow (the qcow2 by digest, the seed ISO), verify, prune; ship 2.0.0, whose notes-stow's boot upgrades the install, and 1.0.0's boot goes back
-STOWAGE_VM_ENV=<file> make e2e-vm   # build, ship examples/minimal's OS bundle and qcow2 disk to zot, carry the release with `mirror export` / `mirror import` to a TLS zot mirror of its own test CA on this host's address toward TrueNAS, then the published notes-stow's `vm create --create opentofu --registry --registry-ca` boots a real VM on TrueNAS from the mirror's disk: its first boot installs from the cloud-config (`--ssh-allow` this host's address and its global IPv6 addresses, `--ipv6`, `--timezone Europe/Paris`); over SSH, the firewall's table (input dropped by default, SSH from this host alone, over IPv4 and IPv6, the front's ports, an `l4` route to the database open to this host's IPv4 address alone, its allowlist on the persistent partition: reached from this host, refused over IPv6) and the time zone, status, ps, passwordless sudo, the admin group, the app socket (refused without the install's token, served with it) and the api service's read-only mount; the install records the mirror and the VM trusts its CA; the front answers HTTPS; `reset-db --yes` wipes the data and provisions again (a new admin password) without a reboot; `backup config` over SSH (the rclone config on standard input, a schedule the timer takes), `backup run` of a partitioned table with a key to a WebDAV server on this host, the backup decrypted and read by `pg_restore`, the uploads volume's archive beside it; a row and files added, then `restore` (the key on standard input) brings the backup's data and the volume back as they were; `secrets export` to the operator's key decrypts into the install's secrets; a re-run changing the route's allowlist refuses this host, through the upgrade's reboot; 1.0.1 is shipped and carried through the mirror, `updates` offers it and `upgrade --yes` takes a backup first, then reboots the VM into it, whose health gate marks the boot good; `rollback --yes` reboots it into the passive system, back on 1.0.0, and a second `rollback` is refused there; 1.0.2, whose api never becomes ready, is upgraded to from the passive system, fails its health gate, and the VM falls back to 1.0.0, `status` naming the failed boot and its diagnostics, `updates` no longer offering 1.0.2; 1.0.3, a rollback barrier that never becomes ready, fails its gate too and is kept (the boot marked good, `status` saying why going back is refused); the cloud-config's network is DHCP with DHCPv6 asked at once, the stack's network has IPv6, the LAN gives the VM a global IPv6 address and an IPv6 default route, and this host reaches it over IPv6 by SSH and HTTPS; `network set` keeps the DHCP lease as a static address, a static unique local IPv6 address beside it, and `network confirm` keeps it (the console banner tells it), a change back to DHCP not confirmed comes undone at its 30 s window's end, and another, a reboot inside its window, at the boot; `vm destroy` removes it all
+STOWAGE_VM_ENV=<file> make e2e-vm   # build, ship examples/minimal's OS bundle and qcow2 disk to zot, carry the release with `mirror export` / `mirror import` to a TLS zot mirror of its own test CA on this host's address toward TrueNAS, then the published notes-stow's `vm create --create opentofu --registry --registry-ca` boots a real VM on TrueNAS from the mirror's disk: its first boot installs from the cloud-config (`--ssh-allow` this host's address and its global IPv6 addresses, `--ipv6`, `--timezone Europe/Paris`); over SSH, the firewall's table (input dropped by default, SSH from this host alone, over IPv4 and IPv6, the front's ports, an `l4` route to the database open to this host's IPv4 address alone, its allowlist on the persistent partition: reached from this host, refused over IPv6) and the time zone, status, ps, passwordless sudo, the boot's tuning by the release's default profile (the connection table sized, no BBR, no sysctl file, the api container given the VM's own settings and open files), then `install --tune-profile network` tuning the VM at once (BBR, the ceilings, the local ports holding the L4 route's, status naming the operator's profile, the api container's settings), kept through the upgrade's reboot with the logs rotated, the admin group, the app socket (refused without the install's token, served with it) and the api service's read-only mount; the install records the mirror and the VM trusts its CA; the front answers HTTPS; `reset-db --yes` wipes the data and provisions again (a new admin password) without a reboot; `backup config` over SSH (the rclone config on standard input, a schedule the timer takes), `backup run` of a partitioned table with a key to a WebDAV server on this host, the backup decrypted and read by `pg_restore`, the uploads volume's archive beside it; a row and files added, then `restore` (the key on standard input) brings the backup's data and the volume back as they were; `secrets export` to the operator's key decrypts into the install's secrets; a re-run changing the route's allowlist refuses this host, through the upgrade's reboot; 1.0.1 is shipped and carried through the mirror, `updates` offers it and `upgrade --yes` takes a backup first, then reboots the VM into it, whose health gate marks the boot good; `rollback --yes` reboots it into the passive system, back on 1.0.0, and a second `rollback` is refused there; 1.0.2, whose api never becomes ready, is upgraded to from the passive system, fails its health gate, and the VM falls back to 1.0.0, `status` naming the failed boot and its diagnostics, `updates` no longer offering 1.0.2; 1.0.3, a rollback barrier that never becomes ready, fails its gate too and is kept (the boot marked good, `status` saying why going back is refused); the cloud-config's network is DHCP with DHCPv6 asked at once, the stack's network has IPv6, the LAN gives the VM a global IPv6 address and an IPv6 default route, and this host reaches it over IPv6 by SSH and HTTPS; `network set` keeps the DHCP lease as a static address, a static unique local IPv6 address beside it, and `network confirm` keeps it (the console banner tells it), a change back to DHCP not confirmed comes undone at its 30 s window's end, and another, a reboot inside its window, at the boot; `vm destroy` removes it all
 STOWAGE_VM_ENV=<file> make e2e-full-vm   # build, ship examples/full's this month's release with its OS bundle and qcow2 disk to zot, carry it through the TLS mirror as e2e-vm does, then the published at-stow's `vm create --create opentofu` boots a real VM on TrueNAS whose first boot installs it with the search extension's input set (`--set SEARCH_URL=http://api:9090`, the api standing in for a search service); through the VM's front over HTTPS, the api answers with the organisation, the administrator the provision hook registered and the search URL reached; the console and ingest serve, and an event reaches the api; the api reads the front's local CA (publish_ca), which the api route's certificate chains to; the hook's credentials file is 0600, the api mounts the app socket's directory read-only; `vm destroy` removes it all (upgrade, rollback and the health gate's fallback are e2e-vm's)
 ```
 
