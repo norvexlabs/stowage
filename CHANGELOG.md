@@ -3,7 +3,7 @@
 Stowage's own releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
-## [0.11.2]
+## [0.11.2] - 2026-10-23
 
 ### Fixed
 - The VM's seed ISO is read by VMware Workstation: its last sector was cut short, which
