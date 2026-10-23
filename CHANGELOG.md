@@ -3,7 +3,7 @@
 Stowage's own releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
-## [0.9.0]
+## [0.9.0] - 2026-10-23
 
 ### Added
 - **`tune`**: the Docker host's network tuning for many connections, UDP and QUIC, and tunnels,
