@@ -3,6 +3,14 @@
 Stowage's own releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
+## [0.11.1]
+
+### Fixed
+- The VM's host daemon sockets (its own and the app socket the stack's services reach) appear only
+  once they listen, their owner and mode already set: a command run as the daemon starts is no
+  longer refused, and no other process can connect in between. A daemon stopping leaves the
+  sockets a restarted one made.
+
 ## [0.11.0] - 2026-10-23
 
 ### Added

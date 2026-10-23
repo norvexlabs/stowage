@@ -424,21 +424,52 @@ func (h *Hostd) Serve(ctx context.Context, path string) error {
 	return first
 }
 
-// listen listens on the unix socket path, a stale one removed first, then gives it its owner and
-// mode with perm.
+// listen listens on the unix socket path with the owner and mode perm gives it. The socket is made
+// and given them under a name of its own beside path (.<base>.<pid>), then renamed onto path
+// (replacing a stale one): a client never finds path before it listens, nor while any process may
+// still connect. Closing the listener removes path while it is still that socket.
 func listen(path string, perm func(string) error) (net.Listener, error) {
-	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+	tmp := filepath.Join(filepath.Dir(path), fmt.Sprintf(".%s.%d", filepath.Base(path), os.Getpid()))
+	if err := os.Remove(tmp); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return nil, err
 	}
-	l, err := net.Listen("unix", path)
+	l, err := net.Listen("unix", tmp)
 	if err != nil {
 		return nil, err
 	}
-	if err := perm(path); err != nil {
+	// The listener would remove tmp, a name it no longer has once renamed: unixSocket removes path.
+	l.(*net.UnixListener).SetUnlinkOnClose(false)
+	fi, err := os.Lstat(tmp)
+	if err == nil {
+		err = perm(tmp)
+	}
+	if err == nil {
+		err = os.Rename(tmp, path)
+	}
+	if err != nil {
 		l.Close()
+		_ = os.Remove(tmp)
 		return nil, err
 	}
-	return l, nil
+	return &unixSocket{Listener: l, path: path, file: fi}, nil
+}
+
+// unixSocket is a listener on the unix socket file renamed onto path. Its address is path, and
+// closing it removes path while path is still that socket: never one a daemon started since put
+// there.
+type unixSocket struct {
+	net.Listener
+	path string
+	file os.FileInfo
+}
+
+func (u *unixSocket) Addr() net.Addr { return &net.UnixAddr{Name: u.path, Net: "unix"} }
+
+func (u *unixSocket) Close() error {
+	if fi, err := os.Lstat(u.path); err == nil && os.SameFile(fi, u.file) {
+		_ = os.Remove(u.path)
+	}
+	return u.Listener.Close()
 }
 
 // own gives p to root and gid (none when -1, mode then dropping the group's bits).

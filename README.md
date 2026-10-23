@@ -2959,7 +2959,10 @@ sudo <short>-stow install [--channel C] [--set KEY=VALUE]… [--answers FILE] [-
 - Every other verb asks the host daemon, `<name>-hostd.service` (`<short>-stow hostd`, root, hidden
   from the help; its hidden `--group`, default `admin`, names the socket's group, empty for root
   alone), on the unix socket `/run/<name>/host.sock`: the socket is `root:admin` 0660 in a 0750
-  directory (`root` alone, 0600, on a host without that group, which the bundle creates). Until
+  directory (`root` alone, 0600, on a host without that group, which the bundle creates). Each
+  socket the daemon serves (this one and the app socket) is made as `.<socket>.<pid>` beside it,
+  given its owner and mode, then renamed into place: it appears listening, already restricted, and
+  a daemon stopping removes it unless a restarted one replaced it. Until
   `<name>.service` ran (its state is `active` or `failed`: before, the boot is queued, or is
   installing, upgrading or going back; a host without that unit has no boot to wait for), `upgrade`, `rollback`, `provision` and `restart`/`stop`/`start` are
   refused; `upgrade` and `rollback` also until `<name>-health.service` judged the boot (its state

@@ -9,6 +9,7 @@ import (
 	"github.com/google/go-containerregistry/pkg/name"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -897,5 +898,80 @@ func TestAnUpgradeAnnouncesItsRebootOnlyOnceScheduled(t *testing.T) {
 	}
 	if evs := ofKind(held(t, d.O.Dir), evRebootScheduled); len(evs) != 0 {
 		t.Errorf("%+v", evs)
+	}
+}
+
+// The daemon's socket appears at its path listening, with its owner and mode already given; closing
+// it removes the path, unless another socket has taken it since.
+func TestTheSocketAppearsListeningAndGuarded(t *testing.T) {
+	t.Parallel()
+	dir, err := os.MkdirTemp("", "sock") // short: a unix socket's path is bounded
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	path := filepath.Join(dir, "host.sock")
+	if err := os.WriteFile(path, nil, 0o600); err != nil { // a stale one is replaced
+		t.Fatal(err)
+	}
+	l, err := listen(path, func(p string) error {
+		if p == path {
+			t.Error("perm given the socket's own path: it is reachable before its mode")
+		}
+		if fi, err := os.Stat(path); err == nil && fi.Mode()&os.ModeSocket != 0 {
+			t.Error("the socket is at its path before its mode is given")
+		}
+		if c, err := net.Dial("unix", p); err != nil {
+			t.Errorf("not listening once made: %v", err)
+		} else {
+			c.Close()
+		}
+		return os.Chmod(p, 0o600)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi, err := os.Stat(path); err != nil || fi.Mode()&os.ModeSocket == 0 || fi.Mode().Perm() != 0o600 {
+		t.Fatalf("%v %v", fi, err)
+	}
+	if entries, _ := os.ReadDir(dir); len(entries) != 1 {
+		t.Errorf("left beside it: %v", entries)
+	}
+	if l.Addr().String() != path {
+		t.Errorf("serving on %s, not %s", l.Addr(), path)
+	}
+	if c, err := net.Dial("unix", path); err != nil {
+		t.Fatal(err)
+	} else {
+		c.Close()
+	}
+	if err := l.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("closed, the socket stays: %v", err)
+	}
+	// A daemon started since holds the path: the first one closing leaves it.
+	first, err := listen(path, func(string) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := listen(path, func(string) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+	first.Close()
+	if c, err := net.Dial("unix", path); err != nil {
+		t.Errorf("the newer socket was removed: %v", err)
+	} else {
+		c.Close()
+	}
+	// perm failing leaves nothing.
+	if _, err := listen(filepath.Join(dir, "other.sock"), func(string) error { return errors.New("no group") }); err == nil {
+		t.Fatal("perm's failure ignored")
+	}
+	if entries, _ := os.ReadDir(dir); len(entries) != 1 {
+		t.Errorf("left after a failure: %v", entries)
 	}
 }

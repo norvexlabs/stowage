@@ -45,7 +45,7 @@ func served(t *testing.T, h *Hostd) string {
 			t.Error(err)
 		}
 	})
-	// The socket's file exists from its bind, before it listens: ready once a connection is taken.
+	// Ready once a connection is taken, not once something is at the socket's path.
 	for range 2000 {
 		if c, err := net.Dial("unix", sock); err == nil {
 			c.Close()

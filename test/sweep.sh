@@ -33,16 +33,23 @@ done
 
 # Images of a test registry that no longer runs: each reference <ipv4>:<port>/{notes,atlas,smoke,site,t}/…
 # (a tag, or a digest it was pulled by) whose port no running container publishes, removed by
-# that reference alone: the image goes with its last one, and an image a container uses stays
-# (docker rmi refuses).
-live=" $(docker ps --format '{{.Ports}}' | grep -oE ':[0-9]+->' | tr -d ':->' | tr '\n' ' ') "
-docker images -q | sort -u | xargs -r docker image inspect -f '{{range .RepoTags}}{{println .}}{{end}}{{range .RepoDigests}}{{println .}}{{end}}' 2>/dev/null |
-	grep -E '^[0-9]+(\.[0-9]+){3}:[0-9]+/(notes|atlas|smoke|site|t)/' | sort -u |
+# that reference alone: the image goes with its last one (docker rmi refuses the last reference of
+# an image a container uses). The references are listed before the live ports are read: an image a
+# run pulls after the listing is not in it, and a run that started before it publishes its port
+# when the ports are read. A failed read of the ports removes nothing.
+refs=$(docker images -q | sort -u | xargs -r docker image inspect -f '{{range .RepoTags}}{{println .}}{{end}}{{range .RepoDigests}}{{println .}}{{end}}' 2>/dev/null |
+	grep -E '^[0-9]+(\.[0-9]+){3}:[0-9]+/(notes|atlas|smoke|site|t)/' | sort -u)
+if ports=$(docker ps --format '{{.Ports}}'); then
+	live=" $(grep -oE ':[0-9]+->' <<<"$ports" | grep -oE '[0-9]+' | tr '\n' ' ') "
 	while read -r ref; do
+		[[ -n $ref ]] || continue
 		port=${ref#*:}
 		port=${port%%/*}
 		[[ $live == *" $port "* ]] || docker rmi "$ref" >/dev/null 2>&1
-	done
+	done <<<"$refs"
+else
+	echo "sweep: docker ps failed; the test registries' images are kept" >&2
+fi
 
 # Work directories of dead runs: lib.sh records its PID in .pid; one without (older than an hour)
 # is dead unless a running test registry mounts from it. Files a privileged container wrote there
