@@ -3,7 +3,7 @@
 Stowage's own releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
-## [0.11.1]
+## [0.11.1] - 2026-10-23
 
 ### Fixed
 - The VM's host daemon sockets (its own and the app socket the stack's services reach) appear only
