@@ -15,7 +15,8 @@
 # chain, one at a time (they make disks with auroraboot, which races for loop devices; a failure
 # ends the chain), and e2e-vm and e2e-full-vm need STOWAGE_VM_ENV=<file>. A change to the cloud
 # images' registration (the uploader, the publisher's step, the CLI's settings) runs e2e-kairos with STOWAGE_CLOUD_ENV=<file> (the clouds' settings and credentials), so
-# its images are registered for real.
+# its images are registered for real. Every suite runs the binaries the gate builds once, before
+# them: a snapshot of the tree as the gate started.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -185,15 +186,17 @@ make build
 ./bin/stowage -C examples/minimal lint
 ./bin/stowage -C examples/full lint
 ./bin/stowage -C examples/stateless lint
-# The kairos chain runs one suite at a time, beside the parallel suites.
+# The kairos chain runs one suite at a time, beside the parallel suites. Both run the binaries the
+# build above made (-o build): a suite's own build would rewrite ./bin while another one runs a
+# binary from it, which exec then refuses (text file busy).
 chain_rc=0 pid=""
 if ((${#chain[@]} > 0)); then
-	(for s in "${chain[@]}"; do make --output-sync=target "$s" || exit 1; done) &
+	(for s in "${chain[@]}"; do make -o build --output-sync=target "$s" || exit 1; done) &
 	pid=$!
 fi
 rc=0
 if ((${#parallel[@]} > 0)); then
-	make -k -j --output-sync=target "${parallel[@]}" || rc=1
+	make -o build -k -j --output-sync=target "${parallel[@]}" || rc=1
 fi
 if [[ -n $pid ]]; then
 	wait "$pid" || chain_rc=1

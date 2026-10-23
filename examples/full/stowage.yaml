@@ -39,6 +39,8 @@ images:
 
 stack:
   compose: deploy/compose.yaml
+  memory:
+    shares: { postgres: 25, api: 10 }   # percent of the host's RAM, recomputed at each start
 
 front:
   tls_modes: [acme, dns-cloudflare, byo, internal, none]

@@ -921,7 +921,7 @@ func TestTheTimersRunWaitsForARunningJob(t *testing.T) {
 		t.Fatal(err)
 	}
 	var e409 errOf
-	if code := call(t, h, "POST", "/v1/backup", nil, &e409); code != 409 || !strings.Contains(e409.Error, "backup-verify is running") {
+	if code := call(t, h, "POST", "/v1/backup", nil, &e409); code != 409 || !strings.Contains(e409.Error, "a job (backup-verify) is running") {
 		t.Errorf("by hand: %d %s", code, e409.Error)
 	}
 	// The job's end wakes the run at once: no poll of the slot (a Unit of an hour would show it).
@@ -957,7 +957,7 @@ func TestTheTimersRunWaitsForARunningJob(t *testing.T) {
 		t.Fatal(err)
 	}
 	d.Unit = time.Microsecond // scheduledBackupWait is then 0.6 ms
-	if code := call(t, h, "POST", "/v1/backup", BackupRequest{IfConfigured: true}, &e409); code != 409 || !strings.Contains(e409.Error, "backup-verify is running") {
+	if code := call(t, h, "POST", "/v1/backup", BackupRequest{IfConfigured: true}, &e409); code != 409 || !strings.Contains(e409.Error, "a job (backup-verify) is running") {
 		t.Errorf("past the wait: %d %s", code, e409.Error)
 	}
 }

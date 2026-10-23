@@ -3,6 +3,18 @@
 Stowage's own releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
+## [0.10.0]
+
+### Added
+- **Memory follows the host**: `stack.memory.shares` gives a service a percent of the host's RAM
+  as its memory limit, on Docker and the VM, recomputed at each start and each VM boot — never
+  below the limit its compose file sets itself. The service is told its limit, the host's RAM and
+  CPUs (`STOWAGE_MEM_LIMIT_MB`, `STOWAGE_HOST_MEM_MB`, `STOWAGE_HOST_CPUS`) to size its own caches.
+
+### Fixed
+- The VM's host daemon refuses a request during another job as `a job (<kind>) is running`, which
+  reads right for every kind of job.
+
 ## [0.9.0] - 2026-10-23
 
 ### Added

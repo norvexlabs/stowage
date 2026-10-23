@@ -596,7 +596,7 @@ func TestOneJobAtATime(t *testing.T) {
 		t.Fatalf("%d", code)
 	}
 	var e errOf
-	if code := call(t, hh, "POST", "/v1/upgrade", UpgradeRequest{Channel: "stable"}, &e); code != 409 || !strings.Contains(e.Error, "upgrade is running") {
+	if code := call(t, hh, "POST", "/v1/upgrade", UpgradeRequest{Channel: "stable"}, &e); code != 409 || !strings.Contains(e.Error, "a job (upgrade) is running") {
 		t.Errorf("a second upgrade: %d %s", code, e.Error)
 	}
 	if code := call(t, hh, "POST", "/v1/reboot", nil, &e); code != 409 {

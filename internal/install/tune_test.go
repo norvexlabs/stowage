@@ -27,7 +27,7 @@ func TestContentComposeGivesEachOwnNamespaceTheSysctls(t *testing.T) {
 		t.Fatal(err)
 	}
 	set := map[string]string{"net.core.somaxconn": "8192", "net.ipv4.tcp_rmem": "4096 131072 16777216"}
-	raw, err := contentCompose(&model, nil, []byte("key"), set)
+	raw, err := contentCompose(&model, nil, []byte("key"), set, memoryPlan{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -53,7 +53,7 @@ func TestContentComposeGivesEachOwnNamespaceTheSysctls(t *testing.T) {
 			t.Errorf("%s, on another's namespace, given %v", name, got[name])
 		}
 	}
-	again, _ := contentCompose(&model, nil, []byte("key"), set)
+	again, _ := contentCompose(&model, nil, []byte("key"), set, memoryPlan{})
 	if !bytes.Equal(raw, again) {
 		t.Error("the file is not the same from one run to the next")
 	}

@@ -17,6 +17,8 @@ import (
 	"strings"
 	"time"
 
+	"go.yaml.in/yaml/v3"
+
 	"github.com/norvexlabs/stowage/internal/changelog"
 	"github.com/norvexlabs/stowage/internal/digest"
 	"github.com/norvexlabs/stowage/internal/dockerfile"
@@ -63,6 +65,7 @@ func (r *Result) Errors() int {
 
 type linter struct {
 	root     string
+	specPath string
 	s        *spec.Spec
 	now      time.Time
 	findings []Finding
@@ -102,13 +105,14 @@ func Run(root, specPath string, now time.Time) (*Result, error) {
 	if root, err = filepath.Abs(root); err != nil {
 		return nil, err
 	}
-	l := &linter{root: root, s: s, now: now}
+	l := &linter{root: root, specPath: specPath, s: s, now: now}
 	l.name()
 	l.versioning()
 	l.channels()
 	l.registry()
 	l.images()
 	l.stack()
+	l.memory()
 	l.front()
 	l.l4()
 	l.healthAndDatabase()
@@ -509,6 +513,51 @@ func (l *linter) stack() {
 		}
 		l.warnf("images."+k, "used by no compose service and no hook")
 	}
+}
+
+// memory checks stack.memory: shares of services the compose file declares (when it reads), from
+// 1 %, together at most spec.MaxMemoryShares.
+func (l *linter) memory() {
+	m := l.s.Stack.Memory
+	if m == nil && !l.memoryLeftEmpty() {
+		return
+	}
+	where := "stack.memory.shares"
+	if m == nil || len(m.Shares) == 0 {
+		l.errf(where, "names no service: give one a percent of the host's RAM, or remove stack.memory")
+		return
+	}
+	total := 0
+	for _, name := range sortedKeys(m.Shares) {
+		pct := m.Shares[name]
+		l.service(where+"."+name, name)
+		if pct < 1 || pct > spec.MaxMemoryShares {
+			l.errf(where+"."+name, "%d: a percent of the host's RAM, from 1 to %d", pct, spec.MaxMemoryShares)
+			continue
+		}
+		total += pct
+	}
+	if total > spec.MaxMemoryShares {
+		l.errf(where, "the shares total %d %%: at most %d, the rest is the OS's, the engine's and Stowage's", total, spec.MaxMemoryShares)
+	}
+	if l.s.Shapes.Docker == nil && l.s.Shapes.Kairos == nil {
+		l.warnf("stack.memory", "only the docker and kairos shapes size services from the host: the chart gives its pods their resources")
+	}
+}
+
+// memoryLeftEmpty: the spec writes `memory:` with nothing under it, which decodes as no
+// stack.memory at all.
+func (l *linter) memoryLeftEmpty() bool {
+	raw, err := os.ReadFile(l.specPath)
+	if err != nil {
+		return false
+	}
+	var doc struct {
+		Stack struct {
+			Memory yaml.Node `yaml:"memory"`
+		} `yaml:"stack"`
+	}
+	return yaml.Unmarshal(raw, &doc) == nil && doc.Stack.Memory.Kind != 0
 }
 
 func (l *linter) hookUsesImage(key string) bool {

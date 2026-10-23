@@ -112,7 +112,19 @@ func (i Image) Built() bool { return i.Ref == "" }
 
 type Stack struct {
 	Compose string `yaml:"compose"`
+	// Memory sizes services from the RAM of the host they run on (Docker and the VM).
+	Memory *Memory `yaml:"memory"`
 }
+
+// Memory gives services a share of the host's RAM: Shares maps a compose service to the percent
+// of RAM its memory limit is, never below the limit its compose file sets itself.
+type Memory struct {
+	Shares map[string]int `yaml:"shares"`
+}
+
+// MaxMemoryShares is the total of the shares: the rest of the RAM is the OS's, the engine's and
+// Stowage's own.
+const MaxMemoryShares = 90
 
 type Front struct {
 	TLSModes      []string       `yaml:"tls_modes"`

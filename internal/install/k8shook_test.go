@@ -394,12 +394,10 @@ func TestK8sProvisionRefusals(t *testing.T) {
 // it as the Docker shape reads the hook's stdout and patches the outputs Secret with what changed
 // since the run before. Its errors name keys, never a value.
 func TestHookRunThenRecord(t *testing.T) {
+	script := hookScript(t, "#!/bin/sh\necho progress >&2\necho ADMIN_PASSWORD=minted\necho KEPT=same\necho SESSION_SECRET=x\nprintf 'PARTIAL=cut'\nexit 3\n")
+	unbroken := hookScript(t, "#!/bin/sh\nprintf 'TOKEN=t'\n")
 	t.Parallel()
 	dir, prev := t.TempDir(), t.TempDir()
-	script := filepath.Join(t.TempDir(), "hook")
-	if err := os.WriteFile(script, []byte("#!/bin/sh\necho progress >&2\necho ADMIN_PASSWORD=minted\necho KEPT=same\necho SESSION_SECRET=x\nprintf 'PARTIAL=cut'\nexit 3\n"), 0o755); err != nil {
-		t.Fatal(err)
-	}
 	var stderr strings.Builder
 	if err := hookRun(context.Background(), dir, time.Minute, []string{script}, &stderr); err != nil {
 		t.Fatal(err)
@@ -447,8 +445,7 @@ func TestHookRunThenRecord(t *testing.T) {
 	}
 
 	// A hook that exits 0 with its last line unbroken: that line counts, and nothing fails.
-	_ = os.WriteFile(script, []byte("#!/bin/sh\nprintf 'TOKEN=t'\n"), 0o755)
-	if err := hookRun(context.Background(), dir, time.Minute, []string{script}, io.Discard); err != nil {
+	if err := hookRun(context.Background(), dir, time.Minute, []string{unbroken}, io.Discard); err != nil {
 		t.Fatal(err)
 	}
 	got.body = nil
@@ -463,25 +460,25 @@ func TestHookRunThenRecord(t *testing.T) {
 // `run` stops a hook that writes too much or runs too long, and records why; one it cannot start
 // too. `record` fails each.
 func TestHookRunStops(t *testing.T) {
+	bounded := hookScript(t, fmt.Sprintf("#!/bin/sh\nhead -c %d /dev/zero | tr '\\0' A\nexec sleep 30\n", maxProvisionOut+10))
+	sleeper := hookScript(t, "#!/bin/sh\nexec sleep 30\n")
 	t.Parallel()
 	dir := t.TempDir()
-	script := filepath.Join(t.TempDir(), "hook")
 	r := &hookRecorder{dir: dir, prev: "", token: t.TempDir(), log: io.Discard, client: http.DefaultClient, api: "http://127.0.0.1:1"}
 	for _, c := range []struct {
-		body    string
+		script  string
 		timeout time.Duration
 		want    string
 	}{
 		// Past the bound, then it would run on: stopped at once (a bounded write either way).
-		{fmt.Sprintf("#!/bin/sh\nhead -c %d /dev/zero | tr '\\0' A\nexec sleep 30\n", maxProvisionOut+10), 5 * time.Second, fmt.Sprintf("it wrote more than %d bytes on stdout", maxProvisionOut)},
-		{"#!/bin/sh\nexec sleep 30\n", 50 * time.Millisecond, "stopped after 50ms"},
+		{bounded, 5 * time.Second, fmt.Sprintf("it wrote more than %d bytes on stdout", maxProvisionOut)},
+		{sleeper, 50 * time.Millisecond, "stopped after 50ms"},
 	} {
-		_ = os.WriteFile(script, []byte(c.body), 0o755)
-		if err := hookRun(context.Background(), dir, c.timeout, []string{script}, io.Discard); err != nil {
+		if err := hookRun(context.Background(), dir, c.timeout, []string{c.script}, io.Discard); err != nil {
 			t.Fatal(err)
 		}
 		if err := r.record(context.Background()); err == nil || !strings.Contains(err.Error(), c.want) {
-			t.Errorf("%q: %v", c.body, err)
+			t.Errorf("%s: %v", c.script, err)
 		}
 	}
 	if err := hookRun(context.Background(), dir, time.Minute, []string{"no-such-hook-program"}, io.Discard); err != nil {
@@ -647,10 +644,9 @@ func TestK8sHookPodGivenUp(t *testing.T) {
 
 // A line past the line bound stops the hook, as on Docker: nothing it prints after is recorded.
 func TestHookRunStopsALongLine(t *testing.T) {
+	script := hookScript(t, fmt.Sprintf("#!/bin/sh\nhead -c %d /dev/zero | tr '\\0' A\nexec sleep 30\n", maxProvisionLine+10))
 	t.Parallel()
 	dir := t.TempDir()
-	script := filepath.Join(t.TempDir(), "hook")
-	_ = os.WriteFile(script, []byte(fmt.Sprintf("#!/bin/sh\nhead -c %d /dev/zero | tr '\\0' A\nexec sleep 30\n", maxProvisionLine+10)), 0o755)
 	if err := hookRun(context.Background(), dir, 5*time.Second, []string{script}, io.Discard); err != nil {
 		t.Fatal(err)
 	}
@@ -782,4 +778,16 @@ func TestK8sHookDropsAReturnTheReleaseRemoved(t *testing.T) {
 	if len(e.f.patches) != 1 || e.f.patches[0] != `{"data":{"OLD_KEY":null}}` || !strings.Contains(e.log.String(), "no longer returns") {
 		t.Errorf("patches %q\n%s", e.f.patches, e.log)
 	}
+}
+
+// hookScript writes an executable script, before its test turns parallel: a parallel test's fork
+// holds a file it inherits open until its exec, and exec refuses a file open for writing
+// (ETXTBSY), so no script is written while other tests fork.
+func hookScript(t *testing.T, body string) string {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), "hook")
+	if err := os.WriteFile(p, []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return p
 }

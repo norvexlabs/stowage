@@ -164,6 +164,12 @@ func TestEachRuleFiresOnFull(t *testing.T) {
 		want  string
 	}{
 		{"absolute path", []edit{{sp, "compose: deploy/compose.yaml", "compose: /etc/compose.yaml"}}, nil, "must be relative to the project root"},
+		{"memory share of 0", []edit{{sp, memShares, "shares: { postgres: 0 }"}}, nil, "stack.memory.shares.postgres: 0: a percent of the host's RAM, from 1 to 90"},
+		{"memory share over 90", []edit{{sp, memShares, "shares: { postgres: 91 }"}}, nil, "stack.memory.shares.postgres: 91: a percent of the host's RAM, from 1 to 90"},
+		{"memory shares over 90", []edit{{sp, memShares, "shares: { postgres: 60, api: 31 }"}}, nil, "stack.memory.shares: the shares total 91 %: at most 90"},
+		{"memory share of no service", []edit{{sp, memShares, "shares: { postgres: 25, search: 10 }"}}, nil, `stack.memory.shares.search: service "search" is not in deploy/compose.yaml`},
+		{"memory shares empty", []edit{{sp, memShares, "shares: {}"}}, nil, "stack.memory.shares: names no service"},
+		{"memory left empty", []edit{{sp, "  memory:\n    " + memShares + "   # percent of the host's RAM, recomputed at each start\n", "  memory:\n"}}, nil, "stack.memory.shares: names no service"},
 		{"hook env not recorded", []edit{{sp, "env: [ADMIN_EMAIL, ADMIN_PASSWORD, INTERNAL_SERVICE_SECRET]", "env: [ADMIN_EMAIL, API_URL]"}}, nil, "hooks.provision.env[1]: API_URL is no input, secret or safe default"},
 		{"hook returns an input", []edit{{sp, "returns: [ADMIN_API_KEY, ADMIN_LOGIN]", "returns: [ADMIN_API_KEY, ADMIN_EMAIL]"}}, nil, "hooks.provision.returns[1]: ADMIN_EMAIL is an input, a value the install records"},
 		{"hook returns a secret", []edit{{sp, "returns: [ADMIN_API_KEY, ADMIN_LOGIN]", "returns: [INTERNAL_SERVICE_SECRET]"}}, nil, "hooks.provision.returns[0]: INTERNAL_SERVICE_SECRET is a secret"},
@@ -1029,4 +1035,46 @@ func FuzzCheckL4Address(f *testing.F) {
 			t.Fatalf("%q accepted: %q %q %v", v, host, port, err)
 		}
 	})
+}
+
+// memShares is examples/full's stack.memory.shares.
+const memShares = "shares: { postgres: 25, api: 10 }"
+
+// stack.memory's shares at their bounds are clean: 1 % and 90 % each, 90 % together (the errors
+// past them are TestEachRuleFiresOnFull's).
+func TestMemorySharesBounds(t *testing.T) {
+	t.Parallel()
+	for _, shares := range []string{"shares: { postgres: 1 }", "shares: { postgres: 90 }", "shares: { postgres: 60, api: 30 }"} {
+		root := testutil.CopyExample(t, "full")
+		testutil.Edit(t, root, specFile, memShares, shares)
+		if errs := errorsOf(run(t, root)); len(errs) > 0 {
+			t.Errorf("%s: %v", shares, errs)
+		}
+	}
+}
+
+// The chart sizes its pods: stack.memory on Kubernetes alone is warned.
+func TestMemorySharesOnKubernetesAloneWarn(t *testing.T) {
+	t.Parallel()
+	warned := func(res *Result) bool {
+		for _, f := range res.Findings {
+			if f.Severity == Warning && f.Where == "stack.memory" {
+				return true
+			}
+		}
+		return false
+	}
+	for _, shape := range []string{"kairos", "docker"} {
+		root := testutil.CopyExample(t, "full")
+		testutil.SetYAML(t, root, specFile, []string{"shapes", shape}, nil)
+		if warned(run(t, root)) {
+			t.Fatalf("warned without a %s shape", shape)
+		}
+	}
+	root := testutil.CopyExample(t, "full")
+	testutil.SetYAML(t, root, specFile, []string{"shapes", "kairos"}, nil)
+	testutil.SetYAML(t, root, specFile, []string{"shapes", "docker"}, nil)
+	if res := run(t, root); !warned(res) {
+		t.Fatalf("findings: %+v", res.Findings)
+	}
 }

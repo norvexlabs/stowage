@@ -273,7 +273,7 @@ func TestTheDaemonResetsAsAJobOnceConfirmedAndJudged(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, method := range []string{"GET", "POST"} {
-		if code := call(t, h, method, "/v1/reset-db", ResetRequest{Confirm: &Version{"1.0.0", 1}}, &refused); code != 409 || !strings.Contains(refused.Error, "an upgrade is running") {
+		if code := call(t, h, method, "/v1/reset-db", ResetRequest{Confirm: &Version{"1.0.0", 1}}, &refused); code != 409 || !strings.Contains(refused.Error, "a job (upgrade) is running") {
 			t.Fatalf("%s during a job: %d %s", method, code, refused.Error)
 		}
 	}

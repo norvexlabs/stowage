@@ -867,7 +867,10 @@ These are what `lint` checks; each finding names the key path or `file:line` to 
     (a loopback address in every mode and without a front, for a port only this host may reach: 127.x or `::1`,
     bare — Compose's port syntax takes `::1:5432:5432`), `STOWAGE_IPV6` (`true` with `--ipv6`, else `false`; Docker and the VM),
     `STOWAGE_L4_<ROUTE>` (an `l4` route's endpoint, `<address>:<port>`, for a route with an
-    `address_input`; Docker and the VM);
+    `address_input`; Docker and the VM). The variables `stack.memory` gives a service
+    (`STOWAGE_MEM_LIMIT_MB`, `STOWAGE_HOST_MEM_MB`, `STOWAGE_HOST_CPUS`) are in its container's
+    environment, not the compose file's: a command reads them escaped, `$${STOWAGE_MEM_LIMIT_MB}`,
+    and `${STOWAGE_MEM_LIMIT_MB}` is an unknown variable;
   - an unknown `STOWAGE_…` variable, a `STOWAGE_IMAGE_<KEY>` naming no image, a
     `STOWAGE_URL_<ROUTE>` naming no route or a `STOWAGE_L4_<ROUTE>` naming no `l4` route with an
     `address_input` is an error, and so is a compose file with no service;
@@ -1224,6 +1227,7 @@ database: reset-db has nothing to reset` (`… there is no backup to restore`). 
 | `signing` | `cosign-key` (`key`, `public_keys`), or absent / `none` |
 | `images.<key>` | built (`context`, `dockerfile`, `target`, `args`, `inputs`: the paths whose content enters the image's inputs digest, default the whole context less `.dockerignore`) or `ref` (exclusive with the build keys). An image no service or hook uses is a warning; a `# syntax=` frontend or a `FROM $ARG` cannot be checked (warning) |
 | `stack.compose` | the compose file (its contract: "The contracts a project must honour"): `extends` within the file, `profiles:` only those an input's `profile` names, a `ports:` entry past this host an error with a `kairos` shape and a warning on `docker` |
+| `stack.memory` | optional: `shares`, a compose service → the percent of the host's RAM its memory limit is (`{ postgres: 25, api: 10 }`), on Docker and the VM, recomputed at each start (see "Memory shares" under the installer). Each share is a whole percent from 1 to 90, together at most 90 (the rest is the OS's, the engine's and Stowage's); a service the compose file does not declare is an error, and so is `memory:` with no share (empty, or `shares: {}`). A project with neither a `docker` nor a `kairos` shape is warned: the chart gives its pods their resources |
 | `front` | optional: absent or empty, the project has no front (see "A project without a front"). `tls_modes` (`acme`, `dns-cloudflare`, `byo`, `internal`, `none`), `routes[]` (`name`, `domain_input`, `upstream: <service>:<port>`, `strip_headers`, where a trailing `*` matches a prefix; `forward_auth`: `address_input` (required), `uri_input`, `copy_headers` (header names); `allow_input`), `portal`, `loopback_ports`, `loopback_env`, `publish_ca` (`volume`: a volume the compose file declares; refused when the project offers neither `internal` nor `byo`), `http_port` and `https_port` (the host ports a TLS front publishes unless an install's `--http-port` / `--https-port` move them; absent or 0 is 80 and 443; they must differ). Route names must give distinct `STOWAGE_URL_` variables; each `domain_input` routes one upstream. An input `forward_auth` or `allow_input` names must be an input of the `docker` shape and, with a `kairos` shape, of that one too, and neither `required` (empty is how the front leaves it off) nor asked in one mode only (`when`); an `allow_input` input is not `advanced` (never asked, it would refuse everyone). Lint counts these inputs as read |
 | `l4` | `routes[]`: host ports published to a service as they are, beside the front and never through it — `name` (1 to 15 lowercase letters, digits or `-`, starting with a letter, no `-` at its end or beside another, as a chart names a Service port after it; neither another L4 route's nor a front route's name), `protocol` (`tcp` or `udp`), `port` (the host port, 1–65535; one route per protocol and port), `upstream: <service>:<port>` (a compose service), `address_input` (optional: an input, not `secret`, holding the host name or address clients dial — a lowercase host name whose last label is not all digits, or an IP address; no port, scheme or zone. It is checked when given, and lint checks its `default`; the install records the route's endpoint `STOWAGE_L4_<ROUTE>` from it, and lint counts it as read), `allow_input` (optional: an input holding the source addresses and CIDRs, separated by commas or spaces, the VM's firewall lets reach the port — empty refuses every source; checked when given. Only the VM enforces it, so without a `kairos` shape it is a warning (the route is open to every source), and its input is asked on that shape alone (`shapes: [kairos]`: a Docker host's firewall is the operator's), is neither `secret` (the firewall's rules show it) nor `advanced` (never asked, it would refuse every source) nor asked in one mode only (`when`); lint counts it as read). With a `kubernetes` shape, a chart whose templates never read `.Values.stowage.l4` is warned. Over TCP a route's port may not be one the front publishes by default: `front.http_port` / `https_port` (80 and 443) in a TLS mode, a route's `loopback_ports` in loopback mode, and 80 and 443 while `acme` is offered (its challenges need them). The same port over UDP is free. See "L4 routes" under the installer |
 | `health` | `http-json` (`service`, `port`, `path`, `liveness_path`, `expect`: the JSON fields a ready answer carries), `http-status` (the same, `expect` a 200–399 status, default 200), `command` (`image`, `cmd`, `timeout_s`). The VM's health gate and `<short>-stow health` run it; the Docker installer waits on the compose healthchecks (`up --wait`) |
@@ -1383,6 +1387,7 @@ again, to copy an installer to another host.
     doubling (the buffer is a power of two), so a small change of RAM recreates nothing. A change
     of them (the host's RAM changed) recreates the services at the next start, as any change of
     the service does.
+    The same file gives each service of `stack.memory` its memory limit — see "Memory shares".
     An install made by an earlier Stowage has no `stowage-content.yaml` until its next start, and
     a rollback to a release it kept removes the file (the labels go with their compose file);
   - `provision.env` and the hook's `outputs` file;
@@ -1748,6 +1753,45 @@ keeps (`<dir>/<short>-stow`, the release it runs; another is refused).
   `DockerRootDir`), and from `soft_pct` POSTs the level as the VM's watch does, the last POST kept
   in `disk-pressure.json`, which `status` shows. Without systemd or root it is not installed, and
   the install says so; a release without the hook removes the units.
+
+#### Memory shares (`stack.memory`)
+
+A service named in `stack.memory.shares` gets that percent of the host's RAM as its memory limit,
+written in `stowage-content.yaml` before each start — the install, each re-run, `upgrade`,
+`rollback`, `reset-db` and, on the VM, each boot — so a host given more RAM gives its services
+more at the next start, and a change of the limit recreates the service then. The RAM is read
+from `/proc/meminfo` in 64 MiB steps; a limit is whole MiB, and never less than 64 MiB.
+
+- **Never below the compose file's own limit**: a service whose `mem_limit` (or
+  `deploy.resources.limits.memory`) is larger than its share keeps it. A share gives no service
+  less than its compose file does; a service with no limit of its own gets its share as one.
+  Nor below the memory it reserves (`mem_reservation`, `deploy.resources.reservations.memory`),
+  which Docker refuses a limit under. These floors can take the limits past 90 % of a small
+  host's RAM: the 90 % bounds the shares, not the floors.
+- **The share is the service's**: a service run as several containers (`scale`,
+  `deploy.replicas`) splits it, each container's limit its part.
+- The limit is set on the key the compose file sets it with — `mem_limit`, or
+  `deploy.resources.limits.memory`, or both when it sets both (Compose refuses them distinct);
+  `mem_limit` when it sets neither. A `memswap_limit` it sets moves by as much as the limit, so
+  the swap it allows stays the same.
+- Each such service's container is given `STOWAGE_MEM_LIMIT_MB` (its limit, in MiB),
+  `STOWAGE_HOST_MEM_MB` (the host's RAM, in MiB) and `STOWAGE_HOST_CPUS` (its online CPUs), to
+  size its own caches. Compose does no arithmetic, so a command that needs a fraction computes
+  it in a shell, e.g. Postgres at a quarter of its limit:
+
+  ```yaml
+  postgres:
+    command: [sh, -c, 'exec docker-entrypoint.sh postgres -c shared_buffers=$$(( $${STOWAGE_MEM_LIMIT_MB:-512} / 4 ))MB']
+    mem_limit: 256m   # the least it gets
+  ```
+
+- A service a profile leaves off gets nothing until it runs. On Docker Desktop no service is
+  given a share: its containers run in a VM of its own, whose RAM is not the host's. On
+  Kubernetes the chart sizes its pods (`resources:`): `stack.memory` does not reach it. In both,
+  and in a service no share names, the three variables are unset: a command that reads them
+  gives a default (`$${STOWAGE_MEM_LIMIT_MB:-512}`).
+- A start that cannot read the host's RAM, or whose `docker info` does not answer, fails
+  (`the containers' network settings and memory: …`) rather than start the services unsized.
 
 #### Network tuning (`<short>-stow tune`)
 

@@ -54,22 +54,23 @@ func (in *Installer) tuneSystem(ctx context.Context) (tune.System, error) {
 	return sys, nil
 }
 
-// containerSysctls are the network settings each container is given, sized from this host; none
-// without a host to read. An engine or a host that does not read fails the start: settings
-// dropped for one start would recreate every service, and again at the next.
-func (in *Installer) containerSysctls(ctx context.Context) (map[string]string, error) {
+// containerSizing is what each container is given from this host, read once: the network
+// settings, and the memory limits of stack.memory; none without a host to read. An engine or a
+// host that does not read fails the start: settings dropped for one start would recreate every
+// service, and again at the next.
+func (in *Installer) containerSizing(ctx context.Context) (map[string]string, memoryPlan, error) {
 	if in.O.Tune == nil {
-		return nil, nil
+		return nil, memoryPlan{}, nil
 	}
 	sys, err := in.tuneSystem(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("the containers' network settings: %w", err)
+		return nil, memoryPlan{}, fmt.Errorf("the containers' network settings and memory: %w", err)
 	}
 	h, err := sys.Host()
 	if err != nil {
-		return nil, fmt.Errorf("the containers' network settings: %w", err)
+		return nil, memoryPlan{}, fmt.Errorf("the containers' network settings and memory: %w", err)
 	}
-	return sys.Container(h), nil
+	return sys.Container(h), in.memoryPlan(sys, h), nil
 }
 
 // Tune reports how the host differs from what its RAM and CPUs call for, prints the files that

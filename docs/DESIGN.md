@@ -1295,6 +1295,21 @@ every shape, the VM end-to-end test upgrading through it), then the health gate.
   pod is left out: unprivileged, it reads only its own namespace, and reading the node's needs
   `hostNetwork`, which the baseline Pod Security level refuses. The values are written at
   install time, as the release's `stowage` block is written at ship before any cluster is known.
+- **Memory follows the host** (`stack.memory`): a service's limit is a share of the RAM, set in
+  `stowage-content.yaml` at each start, so a resized VM or host is followed at its next start
+  without a new release. A share only raises: the compose file's own limit and its reservation
+  are floors, as the kernel's defaults are for the network tuning, and the shares together leave
+  at least 10 % of the RAM to the OS, the engine and Stowage's own front and daemon — the floors
+  can take a small host past it, which the compose file's own limits asked for anyway. A share is
+  the service's, split among its containers, so a scaled service takes no more of the RAM. Docker
+  Desktop gets none: its containers' RAM is its VM's, which the host does not show. The limit goes on the key the
+  compose file uses (Compose refuses `mem_limit` beside a distinct deploy limit), and the swap a
+  `memswap_limit` allows is kept. A service learns its size from its environment
+  (`STOWAGE_MEM_LIMIT_MB`), not from compose interpolation: the limit depends on the compose
+  file's own one, which interpolation would make circular, and a container recreated for a new
+  limit reads the new value. RAM is read to 64 MiB, as the network tuning reads it, so a kernel's
+  few KiB never recreate a service. The chart is left out: a node's RAM is not the installer's
+  to know, and a chart's `resources:` already say what a pod gets.
 - **The adoption proof lives in the tree** — Stowage knows no project, so the proof that a
   production project can adopt it is `examples/full` made a working stack with that project's
   traits, walked through each shape's lifecycle by its own end-to-end suite; a real project's

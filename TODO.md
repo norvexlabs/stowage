@@ -130,9 +130,6 @@ A finished item is deleted, not ticked. The plan behind it is
   a VM on a missed heartbeat would; on TrueNAS it cannot use the QEMU guest agent (`vm.device.create`
   offers no channel/serial dtype), so it would read the VM power state the host already sees.
 
-- **A running job's refusal reads as English for every job kind**: the host daemon's 409 is
-  `"an %s is running"` over the job's kind, which gives "an backup is running" / "an reset-db is
-  running". An article per kind, or wording without one ("a backup job is running"), would do.
 - **Disaster recovery on Kubernetes**: `secrets export` and `install --secrets` run on Docker and
   the VM; `k8s secrets export` (from the release's Secret) and `k8s install --secrets` would
   follow the same file format.
@@ -513,6 +510,17 @@ A finished item is deleted, not ticked. The plan behind it is
 - **The gate exercises the release workflow**: `test/gate.sh` selects nothing for a change to
   `.github/workflows/`, so the release's tag, date and notes extraction run first on a real tag.
   A script the workflow calls, with a test in the gate, would cover it.
+
+- **Other tests write a script and run it while parallel tests fork** (`internal/command`,
+  `internal/publish`, `internal/kairos`): exec can then fail with "text file busy" (a fork holds
+  the file it inherited open until its own exec). `internal/install`'s hook tests write theirs
+  before they turn parallel; the same would make these immune.
+- **`make build` rewrites `./bin` in place**: a build in another terminal while a suite runs a
+  binary from it fails that exec (text file busy); the gate's own suites reuse its one build
+  (`make -o build`). Exporting to a temporary directory and renaming each file into `./bin`
+  would make any build safe beside a run.
+- **An empty `stack.memory:` is caught by lint alone**, from the file: decoding takes it as no
+  key. A presence check in spec decoding would give every reader of the spec the refusal.
 
 ## Won't — not in the first version
 

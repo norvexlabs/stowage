@@ -42,7 +42,8 @@ type composeModel struct {
 	Services map[string]struct {
 		NetworkMode string            `json:"network_mode"`
 		Sysctls     map[string]string `json:"sysctls"`
-		Configs     []struct {
+		serviceMemory
+		Configs []struct {
 			Source string `json:"source"`
 		} `json:"configs"`
 		Secrets []struct {
@@ -59,6 +60,43 @@ type composeModel struct {
 		Name     string `json:"name"`
 		External bool   `json:"external"`
 	} `json:"volumes"`
+}
+
+// serviceMemory is what a service sets of its memory and its number of containers, as `docker
+// compose config` renders it (0: unset).
+type serviceMemory struct {
+	MemLimit       composeBytes `json:"mem_limit"`
+	MemswapLimit   composeBytes `json:"memswap_limit"`
+	MemReservation composeBytes `json:"mem_reservation"`
+	Scale          int          `json:"scale"`
+	Deploy         struct {
+		Replicas  int `json:"replicas"`
+		Resources struct {
+			Limits struct {
+				Memory composeBytes `json:"memory"`
+			} `json:"limits"`
+			Reservations struct {
+				Memory composeBytes `json:"memory"`
+			} `json:"reservations"`
+		} `json:"resources"`
+	} `json:"deploy"`
+}
+
+// composeBytes is a size as `docker compose config` renders it: a string of bytes, or a number.
+type composeBytes int64
+
+func (b *composeBytes) UnmarshalJSON(raw []byte) error {
+	s := strings.Trim(string(raw), `"`)
+	if s == "" || s == "null" {
+		*b = 0
+		return nil
+	}
+	n, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		return fmt.Errorf("a size of %s: %w", raw, err)
+	}
+	*b = composeBytes(n)
+	return nil
 }
 
 // renderedFile is a config or a secret: inline content, or the value of an environment variable
@@ -86,8 +124,8 @@ func (in *Installer) model(ctx context.Context, environ []string) (*composeModel
 // renders into it (inline content, an environment variable's value from environ): Compose copies
 // them into the container as it creates it, and recreates none when only they change, so the
 // label makes their change one of the service's. It gives each service with a network namespace
-// of its own the sysctls it does not set itself.
-func contentCompose(m *composeModel, environ []string, key []byte, sysctls map[string]string) ([]byte, error) {
+// of its own the sysctls it does not set itself, and each service mem shares its memory limit.
+func contentCompose(m *composeModel, environ []string, key []byte, sysctls map[string]string, mem memoryPlan) ([]byte, error) {
 	lookup := func(k string) string {
 		for _, kv := range slices.Backward(environ) {
 			if name, v, ok := strings.Cut(kv, "="); ok && name == k {
@@ -135,6 +173,9 @@ func contentCompose(m *composeModel, environ []string, key []byte, sysctls map[s
 				extra["sysctls"] = own
 			}
 		}
+		if pct, ok := mem.Shares[name]; ok {
+			mem.give(extra, pct, svc.serviceMemory)
+		}
 		if len(extra) > 0 {
 			services[name] = extra
 		}
@@ -178,11 +219,11 @@ func (in *Installer) writeContent(ctx context.Context, m *composeModel, environ 
 	if err != nil {
 		return fmt.Errorf("%s: %w", ContentKey, err)
 	}
-	sysctls, err := in.containerSysctls(ctx)
+	sysctls, mem, err := in.containerSizing(ctx)
 	if err != nil {
 		return err
 	}
-	raw, err := contentCompose(m, environ, key, sysctls)
+	raw, err := contentCompose(m, environ, key, sysctls, mem)
 	if err != nil {
 		return err
 	}

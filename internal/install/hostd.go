@@ -878,7 +878,7 @@ func (h *Hostd) resetCheck(ctx context.Context, in *Installer) (ResetPlan, error
 	case h.rebooting:
 		return ResetPlan{}, fail(http.StatusConflict, "a reboot is scheduled")
 	case h.job != nil && h.job.State == "running":
-		return ResetPlan{}, fail(http.StatusConflict, "an %s is running", h.job.Kind)
+		return ResetPlan{}, fail(http.StatusConflict, "a job (%s) is running", h.job.Kind)
 	}
 	return ResetPlan{Target: target, Plan: in.resetPlan()}, nil
 }
@@ -1118,7 +1118,7 @@ func (h *Hostd) claimJob(kind, target string, guard func() error) (*job, error) 
 	case h.rebooting:
 		return nil, fail(http.StatusConflict, "a reboot is scheduled")
 	case h.job != nil && h.job.State == "running":
-		return nil, jobRunning{fail(http.StatusConflict, "an %s is running", h.job.Kind)}
+		return nil, jobRunning{fail(http.StatusConflict, "a job (%s) is running", h.job.Kind)}
 	}
 	if guard != nil {
 		if err := guard(); err != nil {
@@ -1515,7 +1515,7 @@ func (h *Hostd) claimReboot(idle bool) error {
 		return fail(http.StatusConflict, "a reboot is scheduled")
 	}
 	if idle && h.job != nil && h.job.State == "running" {
-		return fail(http.StatusConflict, "an %s is running: wait for it to finish", h.job.Kind)
+		return fail(http.StatusConflict, "a job (%s) is running: wait for it to finish", h.job.Kind)
 	}
 	h.rebooting = true
 	return nil

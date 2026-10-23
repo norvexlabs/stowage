@@ -82,6 +82,17 @@ expect_code 201 -X POST -H 'Content-Type: application/json' -d '{"kind": "probe"
 [[ $(status events) == 1 ]] || fail "the ingested event did not reach the api"
 expect_code 401 -X POST "http://127.0.0.1:$API_PORT/api/v1/maintenance/purge"
 [[ $(status search) == False ]] || fail "the api reaches a search service while SEARCH_URL is empty"
+# stack.memory: postgres's limit is 25 % of this host's RAM (in 64 MiB steps), never under its own
+# 256 MiB, and it sizes its cache from the variable it is given.
+pg=$(docker ps -q --filter "label=com.docker.compose.project=$(project)" --filter label=com.docker.compose.service=postgres)
+host_mb=$(awk '/^MemTotal:/ { print int($2 / 65536) * 64 }' /proc/meminfo)
+want_mb=$((host_mb * 25 / 100)); ((want_mb > 256)) || want_mb=256
+[[ $(docker inspect --format '{{.HostConfig.Memory}}' "$pg") == $((want_mb << 20)) ]] ||
+	fail "postgres's memory limit is $(docker inspect --format '{{.HostConfig.Memory}}' "$pg"), want $want_mb MiB of $host_mb"
+docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$pg" | grep -qxF "STOWAGE_HOST_MEM_MB=$host_mb" ||
+	fail "postgres is not given the host's RAM"
+[[ $(docker exec "$pg" psql -U atlas -d atlas -tAc "SELECT setting::bigint * 8 / 1024 FROM pg_settings WHERE name = 'shared_buffers'") == $((want_mb / 4)) ]] ||
+	fail "postgres did not size shared_buffers from STOWAGE_MEM_LIMIT_MB"
 # The loopback URL of the api route, as the install records it (STOWAGE_URL_API).
 url=$(sed -n "s/^STOWAGE_URL_API='\{0,1\}\([^']*\)'\{0,1\}$/\1/p" "$D/.env")
 [[ $url == http://*:$API_PORT ]] || fail "the install records the api route's URL as $url"
