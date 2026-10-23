@@ -172,7 +172,8 @@ type L4 struct {
 // L4Route publishes the host port Port, over Protocol, to Upstream (service:port).
 // AddressInput names the input holding the host name or address clients dial, which the stack
 // reads as the route's endpoint (L4Var). AllowInput names the input holding the source addresses
-// (CIDRs) the VM's firewall lets reach the port: empty refuses every one.
+// (CIDRs) the VM's firewall lets reach the port: empty refuses every one. BindInput names the
+// advanced input holding the host address the port is published on: empty is every address.
 type L4Route struct {
 	Name         string `yaml:"name"`
 	Protocol     string `yaml:"protocol"`
@@ -180,6 +181,7 @@ type L4Route struct {
 	Upstream     string `yaml:"upstream"`
 	AddressInput string `yaml:"address_input"`
 	AllowInput   string `yaml:"allow_input"`
+	BindInput    string `yaml:"bind_input"`
 }
 
 // L4Var is the variable carrying an L4 route's endpoint, <address>:<port>.
@@ -229,6 +231,9 @@ type Route struct {
 	// AllowInput names the input holding the source addresses (CIDRs) the route serves; the
 	// front refuses any other, and everyone while it is empty.
 	AllowInput string `yaml:"allow_input"`
+	// ClientAuth makes the front require a client certificate the install's client CA issued
+	// (--client-ca) on the route: without one given, and in loopback mode, it refuses everyone.
+	ClientAuth bool `yaml:"client_auth"`
 }
 
 // ForwardAuth is a route's authentication service: the inputs holding its address and the URI it

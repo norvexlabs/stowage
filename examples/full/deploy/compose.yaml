@@ -71,6 +71,13 @@ services:
       ECHO_ENDPOINT: ${STOWAGE_L4_ECHO}
     restart: unless-stopped
 
+  # A one-shot no other service waits for: it checks the echo service answers, then exits. The
+  # install judges it by its exit code.
+  echo-check:
+    image: ${STOWAGE_IMAGE_INGEST}
+    command: [python3, -c, "import socket, time\nfor _ in range(50):\n    try:\n        socket.create_connection(('echo', 17007), 2).close()\n        break\n    except OSError:\n        time.sleep(0.2)\nelse:\n    raise SystemExit('echo does not answer')"]
+    depends_on: [echo]
+
   # Optional: runs only while RELAY_SOURCE holds a value (its input turns the relay profile on).
   relay:
     image: ${STOWAGE_IMAGE_INGEST}

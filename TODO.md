@@ -30,6 +30,13 @@ A finished item is deleted, not ticked. The plan behind it is
 
 ## Should
 
+- **A front route's guards on Kubernetes are the chart's**: `client_auth`, `allow_input` and
+  `forward_auth` are enforced by the Docker and VM fronts; on Kubernetes the chart's ingress
+  serves the routes and lint says nothing. Warn per route with a `kubernetes` shape (the examples
+  would then need the chart to declare it handles them, or the warning accepted there).
+- **One judgement of a stack's services**: the Docker install's `settled` and the VM health gate's
+  `ready` (`vmhealth.go`) judge `compose ps` alike, in two places; one helper, `ready` waiting
+  on a starting healthcheck, when the VM suites next run.
 - **`TestAnUnreachableDaemonIsNamed` flakes under load**: once in a full `go test ./internal/...`
   run its 0000 socket still let the caller connect (`no permission: <nil>`); 30 runs alone pass.
   The chmod and the dial race the served socket's own setup: make the test wait for the daemon to

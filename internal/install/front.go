@@ -54,18 +54,38 @@ func PortVar(route string) string {
 }
 
 // loopbackCaddyfile serves each route on its own plain-HTTP port, as routeBody says; get reads a
-// recorded value.
+// recorded value. A route asking for a client certificate refuses everyone: plain HTTP carries
+// none.
 func loopbackCaddyfile(f spec.Front, get func(string) string) string {
 	var b strings.Builder
 	b.WriteString("# Written by the installer from the project's front routes; rewritten on every run.\n")
 	b.WriteString("{\n\tadmin off\n\tauto_https off\n\tpersist_config off\n}\n")
 	for i, r := range f.Routes {
 		fmt.Fprintf(&b, "\n# %s\nhttp://:%d {\n", r.Name, frontPort(i))
-		routeBody(&b, r, get)
+		if r.ClientAuth {
+			b.WriteString("\trespond 403\n")
+		} else {
+			routeBody(&b, r, get)
+		}
 		b.WriteString("}\n")
 	}
 	return b.String()
 }
+
+// ClientCAFile is the install's client CA (--client-ca), PEM: the CAs a client certificate of a
+// route with client_auth chains to. Its directory is what the front mounts (clientCADir), so a
+// configuration naming a file since removed never has Docker make a directory in its place;
+// clientCAPath is where the front reads it.
+const (
+	ClientCADir  = "stowage-front-client-ca"
+	ClientCAFile = ClientCADir + "/ca.pem"
+	clientCADir  = "/etc/caddy/client-ca"
+	clientCAPath = clientCADir + "/ca.pem"
+)
+
+// clientAuth is a TLS route's client authentication, inside its tls directive: a certificate
+// chaining to the client CA is required, and verified.
+const clientAuth = "\t\tclient_auth {\n\t\t\tmode require_and_verify\n\t\t\ttrust_pool file " + clientCAPath + "\n\t\t}\n"
 
 // routeBody is a route's handling, in this order: a source the allowlist does not hold is refused
 // (403; everyone while the allowlist is empty), the stripped headers — and the headers
@@ -214,11 +234,12 @@ func frontCommand(f spec.Front, ca string) []string {
 // frontCompose adds the front service to the project's stack, unless it has none: in loopback mode each route on its
 // port of the loopback address, behind TLS only the HTTP and HTTPS ports (80 and 443 unless
 // moved), on every address. The host ports come from .env. The L4 routes' ports are published
-// in every mode, to their services.
+// in every mode, to their services: each on every address, or on the one its bind input holds (get
+// reads a recorded value).
 // digest labels the front with its configuration (the Caddyfile, a byo certificate), so a change
-// recreates it. ca is the CA it publishes (frontCommand). ipv6 turns IPv6 on for the default
-// network.
-func frontCompose(f spec.Front, l4 []spec.L4Route, mode string, host hostAPI, digest, ca string, ipv6 bool) ([]byte, error) {
+// recreates it. ca is the CA it publishes (frontCommand). clientCA mounts the install's client CA.
+// ipv6 turns IPv6 on for the default network.
+func frontCompose(f spec.Front, l4 []spec.L4Route, get func(string) string, mode string, host hostAPI, digest, ca string, clientCA, ipv6 bool) ([]byte, error) {
 	var ports []string
 	volumes := []string{"./" + Caddyfile + ":/etc/caddy/Caddyfile:ro", "stowage-front-data:/data"}
 	if mode == Loopback {
@@ -230,6 +251,9 @@ func frontCompose(f spec.Front, l4 []spec.L4Route, mode string, host hostAPI, di
 	}
 	if mode == "byo" {
 		volumes = append(volumes, "./"+TLSDir+":/etc/caddy/"+TLSDir+":ro")
+	}
+	if clientCA {
+		volumes = append(volumes, "./"+ClientCADir+":"+clientCADir+":ro")
 	}
 	if f.PublishCA != nil {
 		volumes = append(volumes, f.PublishCA.Volume+":"+caMount)
@@ -259,8 +283,8 @@ func frontCompose(f spec.Front, l4 []spec.L4Route, mode string, host hostAPI, di
 			},
 		}
 	}
-	// Each L4 route's host port, on every address, to its upstream as it is: compose appends these
-	// to the service's own ports.
+	// Each L4 route's host port, on every address or its bind address, to its upstream as it is:
+	// compose appends these to the service's own ports.
 	for _, r := range l4 {
 		name, target, _ := strings.Cut(r.Upstream, ":")
 		svc, _ := services[name].(map[string]any)
@@ -269,7 +293,11 @@ func frontCompose(f spec.Front, l4 []spec.L4Route, mode string, host hostAPI, di
 			services[name] = svc
 		}
 		ports, _ := svc["ports"].([]any)
-		svc["ports"] = append(ports, map[string]any{"target": target, "published": strconv.Itoa(r.Port), "protocol": r.Protocol})
+		port := map[string]any{"target": target, "published": strconv.Itoa(r.Port), "protocol": r.Protocol}
+		if a := bindAddr(r, get); a != "" {
+			port["host_ip"] = a
+		}
+		svc["ports"] = append(ports, port)
 	}
 	doc := map[string]any{"services": services}
 	if volumesDoc != nil {

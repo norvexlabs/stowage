@@ -566,16 +566,25 @@ func smokeCloudflareCaddyfile(t *testing.T, work, frontRef string, f spec.Front)
 	if err := os.Mkdir(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	// The route asks an authentication service and serves an allowlist only: Caddy takes both.
+	// The route asks an authentication service, serves an allowlist only and requires a client
+	// certificate the client CA issued: Caddy takes all three, the CA loaded where the front reads it.
 	f.Routes = slices.Clone(f.Routes)
 	f.Routes[0].ForwardAuth = &spec.ForwardAuth{AddressInput: "AUTH", URIInput: "AUTH_URI", CopyHeaders: []string{"X-Auth-Request-User"}}
 	f.Routes[0].AllowInput = "ALLOW"
+	f.Routes[0].ClientAuth = true
 	vals := map[string]string{"AUTH": "http://auth:4180", "AUTH_URI": "/oauth2/auth?rd=x", "ALLOW": "10.0.0.0/8, 192.0.2.7"}
-	cf := tlsCaddyfile(f, "dns-cloudflare", map[string]string{"app": "notes.smoke.test"}, "ops@example.com", "80", "443", func(k string) string { return vals[k] })
+	cf := tlsCaddyfile(f, "dns-cloudflare", map[string]string{"app": "notes.smoke.test"}, "ops@example.com", "80", "443", true, func(k string) string { return vals[k] })
+	if !strings.Contains(cf, "client_auth") {
+		t.Fatalf("no client authentication in:\n%s", cf)
+	}
+	ca, _, _ := writeCAChain(t, "client")
+	if err := os.Chmod(ca, 0o644); err != nil { // the front reads it as its own user
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(filepath.Join(dir, "Caddyfile"), []byte(cf), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	out := sh(t, "docker", "run", "--rm", "-e", "CLOUDFLARE_API_TOKEN=cfut_"+strings.Repeat("x", 60), "-v", dir+":/c:ro", frontRef,
+	out := sh(t, "docker", "run", "--rm", "-e", "CLOUDFLARE_API_TOKEN=cfut_"+strings.Repeat("x", 60), "-v", dir+":/c:ro", "-v", ca+":"+clientCAPath+":ro", frontRef,
 		"caddy", "validate", "--config", "/c/Caddyfile", "--adapter", "caddyfile")
 	if !strings.Contains(out, "Valid configuration") {
 		t.Fatalf("the dns-cloudflare Caddyfile:\n%s\n%s", cf, out)

@@ -62,6 +62,7 @@ type fakeDocker struct {
 	health func(req map[string]any) (string, error)
 	labels map[string]string // image reference → its labels, JSON
 	upErr  error             // `compose up` fails
+	upOut  string            // what `compose up` prints
 	onUp   func() error      // when set, runs at each `compose up` and gives its error
 	// schemaFiles are the schema command's compose files, one per run.
 	schemaFiles []string
@@ -126,6 +127,9 @@ func (f *fakeDocker) Run(_ context.Context, c Cmd) ([]byte, error) {
 	case strings.HasPrefix(a, "rm --force"):
 		return nil, f.rmErr
 	case strings.HasPrefix(a, "compose") && strings.Contains(a, " up --detach "):
+		if c.Stream != nil {
+			_, _ = io.WriteString(c.Stream, f.upOut)
+		}
 		if f.onUp != nil {
 			return nil, f.onUp()
 		}
@@ -349,6 +353,7 @@ func (e *env) installer(mod func(*Options)) *Installer {
 		Getenv:      func(k string) string { return e.vars[k] },
 		Environ:     []string{"PATH=/bin", "SESSION_SECRET=from-the-shell", "COMPOSE_PROJECT_NAME=other"},
 		PortFree:    func(_ string, p int) bool { return !e.busy[p] },
+		HostAddrs:   func() []string { return []string{"127.0.0.1", "::1", "192.0.2.7", "192.0.2.8"} },
 		UDPPortFree: func(_ string, p int) bool { return !e.udpBusy[p] }}
 	if mod != nil {
 		mod(&o)
@@ -805,6 +810,79 @@ func TestL4Routes(t *testing.T) {
 	}
 }
 
+// An L4 route bound to one host address is published there alone, and its port probed there alone:
+// two installs holding one port on two addresses of a host.
+func TestAnL4RouteBoundToOneAddress(t *testing.T) {
+	newL4 := func() *env {
+		e := newEnv(t)
+		s := e.r.Spec
+		s.Inputs = append(s.Inputs, spec.Input{Key: "DATA_BIND", Prompt: "Data bind address", Advanced: true})
+		s.L4.Routes = []spec.L4Route{
+			{Name: "data", Protocol: "tcp", Port: 7443, Upstream: "api:7000", BindInput: "DATA_BIND"},
+			{Name: "data-udp", Protocol: "udp", Port: 7443, Upstream: "api:7000", BindInput: "DATA_BIND"},
+		}
+		return e
+	}
+	// Another install holds the port on every address but 192.0.2.7.
+	var tcp, udp []string
+	held := func(o *Options) {
+		probe := func(on *[]string) func(string, int) bool {
+			return func(h string, p int) bool {
+				if p != 7443 {
+					return true
+				}
+				*on = append(*on, h)
+				return h == "192.0.2.7" || h == "0.0.0.0" // a dial of the wildcard reaches the loopback alone
+			}
+		}
+		o.PortFree, o.UDPPortFree = probe(&tcp), probe(&udp)
+	}
+	bind := func(a string) func(*Options) {
+		return func(o *Options) { held(o); o.Set = map[string]string{"DATA_BIND": a} }
+	}
+	e := newL4()
+	if err := e.install(held); err == nil || !strings.Contains(err.Error(), "port(s) 7443 (data), 7443 (data-udp) already in use on this host") {
+		t.Fatalf("on every address: %v", err)
+	}
+	tcp, udp = nil, nil
+	if err := e.install(bind("192.0.2.8")); err == nil || !strings.Contains(err.Error(), "port(s) 7443 (data), 7443 (data-udp) already in use") {
+		t.Fatalf("on an address held: %v", err)
+	}
+	// The unspecified address is every address: probed on each.
+	if err := e.install(bind("0.0.0.0")); err == nil || !strings.Contains(err.Error(), "port(s) 7443 (data), 7443 (data-udp) already in use") {
+		t.Fatalf("on 0.0.0.0: %v", err)
+	}
+	if err := e.install(bind("data.example.org")); err == nil || !strings.Contains(err.Error(), "is not an IP address") {
+		t.Fatalf("a host name: %v", err)
+	}
+	if err := e.install(bind("192.0.2.99")); err == nil || !strings.Contains(err.Error(), "192.0.2.99 (DATA_BIND, the L4 route data's address) is not an address of this host") {
+		t.Fatalf("an address of another host: %v", err)
+	}
+	e.nothingWritten()
+	tcp, udp = nil, nil
+	// An IPv4-mapped address is that IPv4 address.
+	if err := e.install(bind("::ffff:192.0.2.7")); err != nil {
+		t.Fatal(err)
+	}
+	if len(tcp) == 0 || len(udp) == 0 || slices.ContainsFunc(append(tcp, udp...), func(h string) bool { return h != "192.0.2.7" }) {
+		t.Errorf("probed %v (tcp), %v (udp)", tcp, udp)
+	}
+	fc, _ := os.ReadFile(filepath.Join(e.dir, FrontCompose))
+	if strings.Count(string(fc), "host_ip: 192.0.2.7\n") != 2 {
+		t.Errorf("not published on 192.0.2.7 alone:\n%s", fc)
+	}
+	if err := e.install(func(o *Options) { o.Set = map[string]string{"DATA_BIND": "192.0.2.99"} }); err == nil || !strings.Contains(err.Error(), "is not an address of this host") {
+		t.Fatalf("a re-run onto an address of another host: %v", err)
+	}
+	// A re-run emptying it publishes on every address again.
+	if err := e.install(func(o *Options) { o.Set = map[string]string{"DATA_BIND": ""} }); err != nil {
+		t.Fatal(err)
+	}
+	if fc, _ := os.ReadFile(filepath.Join(e.dir, FrontCompose)); strings.Contains(string(fc), "host_ip") {
+		t.Errorf("still bound:\n%s", fc)
+	}
+}
+
 func TestAReRunFinishesSetupAndNeverRedecides(t *testing.T) {
 	e := newEnv(t)
 	if err := e.install(nil); err != nil {
@@ -1138,7 +1216,7 @@ func TestFrontStripsHeadersAndPublishesOnTheLoopback(t *testing.T) {
 			t.Errorf("Caddyfile lacks %q:\n%s", want, cf)
 		}
 	}
-	fc, err := frontCompose(e.r.Spec.Front, nil, Loopback, hostAPI{}, "sha256:x", "", false)
+	fc, err := frontCompose(e.r.Spec.Front, nil, nil, Loopback, hostAPI{}, "sha256:x", "", false, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1432,6 +1510,178 @@ func TestAnImageGoneAsTheStackStartsIsPulledAgain(t *testing.T) {
 	e.docker.onUp = func() error { ups++; return errors.New("unhealthy") }
 	if err := e.install(nil); err == nil || ups != 1 {
 		t.Fatalf("%v, %d ups", err, ups)
+	}
+}
+
+// Compose's --wait fails once a one-shot service no other one waits for exits, whatever its code:
+// the install then judges the stack by its services' state.
+func TestAStackUpWaitRefusedIsJudgedByItsServices(t *testing.T) {
+	unit := settleUnit
+	settleUnit = 0
+	t.Cleanup(func() { settleUnit = unit })
+	row := func(svc, state, health string, code int) string {
+		return `{"Service":"` + svc + `","State":"` + state + `","Health":"` + health + `","ExitCode":` + strconv.Itoa(code) + `}`
+	}
+	exited := " Container notes-api-1 Healthy\ncontainer notes-check-1 exited (0)\n"
+	for _, c := range []struct {
+		name string
+		// polls answers each `compose ps`, the last one again once they run out.
+		polls []string
+		want  string // empty: the install succeeds
+		// out is what up printed; empty, its wait refusing a container that exited.
+		out string
+	}{
+		{"a one-shot exited 0", []string{row("api", "running", "", 0) + "\n" + row("check", "exited", "", 0)}, "", ""},
+		{"a healthcheck still starting is waited for", []string{row("api", "running", "starting", 0), row("api", "running", "healthy", 0)}, "", ""},
+		{"a one-shot exited 1", []string{row("api", "running", "", 0) + "\n" + row("check", "exited", "", 1)}, "check exited with code 1", ""},
+		{"an unhealthy service", []string{row("api", "running", "unhealthy", 0)}, "api is unhealthy", ""},
+		{"a container never started", []string{row("api", "created", "", 0)}, "api is created", ""},
+		{"a restarting service", []string{row("api", "restarting", "", 0)}, "api is restarting", ""},
+		{"no service", []string{""}, "no service of the stack runs", ""},
+		{"healthy at the last poll", append(slices.Repeat([]string{row("api", "running", "starting", 0)}, settlePolls), row("api", "running", "healthy", 0)), "", ""},
+		{"still starting after the last poll", append(slices.Repeat([]string{row("api", "running", "starting", 0)}, settlePolls+1), row("api", "running", "healthy", 0)), "api still starting", ""},
+		// Up refused before its wait: the containers may be the last configuration's, and are
+		// never judged.
+		{"a refusal before the wait", []string{row("api", "running", "", 0)}, "-", " Network notes_default Error\nfailed to create network notes_default: exists\n"},
+		{"an exit without its code", []string{row("api", "running", "", 0)}, "-", "container notes-check-1 exited (0.5)\n"},
+		{"an exit named before the last line", []string{row("api", "running", "", 0)}, "-", "container notes-check-1 exited (0)\nError response from daemon: no such network\n"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			e := newEnv(t)
+			e.docker.upErr = errors.New("up refused")
+			e.docker.upOut = cmp.Or(c.out, exited)
+			n := 0
+			e.docker.answer = func(a string) ([]byte, bool, error) {
+				if !strings.HasSuffix(a, " ps --all --format json") {
+					return nil, false, nil
+				}
+				out := c.polls[min(n, len(c.polls)-1)]
+				n++
+				return []byte(out), true, nil
+			}
+			err := e.install(nil)
+			switch c.want {
+			case "":
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !slices.ContainsFunc(e.docker.ran("compose"), func(c Cmd) bool { return strings.Contains(strings.Join(c.Args, " "), " run --rm ") }) {
+					t.Fatal("the provision hook did not run")
+				}
+			case "-":
+				if err == nil || !strings.HasPrefix(strings.TrimPrefix(err.Error(), "the stack did not become ready: "), "up refused (") || n != 0 {
+					t.Fatalf("got %v after %d polls, want compose's error alone", err, n)
+				}
+			default:
+				if err == nil || !strings.Contains(err.Error(), "up refused: "+c.want) {
+					t.Fatalf("got %v, want %q after compose's error", err, c.want)
+				}
+			}
+		})
+	}
+	if settlePolls < 2 {
+		t.Fatal("the bound's cases need two polls at least")
+	}
+}
+
+// Compose's refusal is read through its colours, and only its output's last 4 KiB are kept; a
+// judgement that cannot read the services says why, after compose's error.
+func TestUpWaitsRefusalIsReadAtTheEndOfItsOutput(t *testing.T) {
+	t.Parallel()
+	var b tailBuffer
+	_, _ = b.Write([]byte(strings.Repeat("x", 5000) + "\n"))
+	_, _ = b.Write([]byte("\x1b[31mcontainer notes-check-1 exited (0)\x1b[0m\n"))
+	if len(b.Bytes()) != 4<<10 || !waitExited(b.Bytes()) {
+		t.Errorf("%d bytes kept, exit read %v", len(b.Bytes()), waitExited(b.Bytes()))
+	}
+	for _, out := range []string{"container notes-check-1 exited (0)\nhint: see the logs\n", "Error: container notes-check-1 exited (0)\n", ""} {
+		if waitExited([]byte(out)) {
+			t.Errorf("%q read as the wait's refusal", out)
+		}
+	}
+	e := newEnv(t)
+	e.docker.upErr, e.docker.upOut = errors.New("up refused"), "container notes-check-1 exited (0)\n"
+	e.docker.answer = func(a string) ([]byte, bool, error) {
+		return nil, strings.HasSuffix(a, " ps --all --format json"), errors.New("daemon gone")
+	}
+	if err := e.install(nil); err == nil || !strings.Contains(err.Error(), "up refused: judging its services: daemon gone") {
+		t.Errorf("err = %v", err)
+	}
+}
+
+// Where the stack holds an L4 route's port already: on that address or on every one; a wildcard
+// is never taken as held.
+func TestHeldOn(t *testing.T) {
+	t.Parallel()
+	tcp := spec.L4Route{Name: "data", Protocol: "tcp", Port: 7443}
+	udp := spec.L4Route{Name: "dns", Protocol: "udp", Port: 53}
+	for _, c := range []struct {
+		own  string
+		r    spec.L4Route
+		host string
+		held bool
+	}{
+		{"tcp/7443", tcp, "192.0.2.8", true},
+		{"tcp/192.0.2.7/7443", tcp, "192.0.2.7", true},
+		{"tcp/192.0.2.7/7443", tcp, "::ffff:192.0.2.7", true},
+		{"tcp/192.0.2.7/7443", tcp, "192.0.2.8", false},
+		{"udp/7443", tcp, "192.0.2.8", false},
+		{"udp/192.0.2.7/53", udp, "0.0.0.0", false},
+		{"udp/53", udp, "::", false},
+	} {
+		if got := heldOn(map[string]bool{c.own: true}, c.r, c.host); got != c.held {
+			t.Errorf("%s holds %s on %s: %v, want %v", c.own, c.r.Name, c.host, got, c.held)
+		}
+	}
+}
+
+// A re-run moving an L4 route's bind address probes the port there, unless the stack holds it
+// there already; one keeping it probes nothing. Unknown host addresses refuse no address.
+func TestAReRunMovingAnL4RouteProbesItsNewAddress(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	e.r.Spec.Inputs = append(e.r.Spec.Inputs, spec.Input{Key: "DATA_BIND", Prompt: "Data bind address", Advanced: true})
+	e.r.Spec.L4.Routes = []spec.L4Route{{Name: "data", Protocol: "tcp", Port: 7443, Upstream: "api:7000", BindInput: "DATA_BIND"}}
+	published := "0.0.0.0"
+	e.docker.answer = func(a string) ([]byte, bool, error) {
+		if strings.HasSuffix(a, " ps --format json") {
+			return []byte(`{"Service":"api","Publishers":[{"URL":"` + published + `","TargetPort":7000,"PublishedPort":7443,"Protocol":"tcp"}]}`), true, nil
+		}
+		return nil, false, nil
+	}
+	var probed []string
+	// The stack's socket answers wherever it listens, and another install holds 192.0.2.8.
+	held := func(o *Options) {
+		o.PortFree = func(h string, p int) bool {
+			if p == 7443 {
+				probed = append(probed, h)
+			}
+			return p != 7443 || h != "192.0.2.8" && (published == "0.0.0.0" || h != published)
+		}
+	}
+	if err := e.install(nil); err != nil {
+		t.Fatal(err)
+	}
+	set := func(v string) func(*Options) {
+		return func(o *Options) { held(o); o.Set = map[string]string{"DATA_BIND": v} }
+	}
+	// From every address, which the stack holds, to one of them.
+	if err := e.install(set("192.0.2.7")); err != nil {
+		t.Fatalf("onto an address the stack holds: %v", err)
+	}
+	published, probed = "192.0.2.7", nil
+	if err := e.install(func(o *Options) { held(o); o.Set = map[string]string{"ADMIN_EMAIL": "x@example.org"} }); err != nil || len(probed) != 0 {
+		t.Fatalf("a re-run keeping the address: %v, probed %v", err, probed)
+	}
+	if err := e.install(set("192.0.2.8")); err == nil || !strings.Contains(err.Error(), "port(s) 7443 (data) already in use") {
+		t.Fatalf("onto an address another install holds: %v", err)
+	}
+	if err := e.install(func(o *Options) {
+		set("192.0.2.99")(o)
+		o.HostAddrs = func() []string { return nil }
+		o.PortFree = func(string, int) bool { return true }
+	}); err != nil {
+		t.Errorf("with the host's addresses unknown: %v", err)
 	}
 }
 

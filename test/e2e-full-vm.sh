@@ -4,8 +4,9 @@
 # crosses to a TLS mirror of its own CA; `vm create --create opentofu` of .2 boots .1's disk, whose
 # first boot writes .2's OS bundle and reboots into it, which installs it from the cloud-config's settings with the search
 # extension's input set (to the api itself, standing in for a search service); the provision hook registers the administrator through the api; the api reaches the host
-# daemon's app socket and reads the front's local CA; an event goes through ingest; then `vm
-# destroy`. Upgrade, rollback and the health gate's fallback are the VM machinery's: e2e-vm. Needs
+# daemon's app socket and reads the front's local CA; an event goes through ingest; the ops route
+# refuses everyone until a re-run gives `--client-ca`, then takes a certificate that CA issued
+# alone; then `vm destroy`. Upgrade, rollback and the health gate's fallback are the VM machinery's: e2e-vm. Needs
 # what e2e-vm needs: Docker (privileged containers, loop devices), network access, about 15 GB
 # on disk under XDG_CACHE_HOME, OpenTofu's `tofu`, ssh, and a TrueNAS host.
 #
@@ -73,7 +74,7 @@ step "vm create of $V2 with OpenTofu on TrueNAS, from the mirror, search set: it
 vm_names
 vm_cleanup
 "$CTL" vm create --no-input --platform truenas --create opentofu --hostname "$H" --user ops --ssh-key "$KEY.pub" \
-	--tls internal --domains console=console.atlas.test,api=api.atlas.test,ingest=ingest.atlas.test \
+	--tls internal --domains console=console.atlas.test,api=api.atlas.test,ingest=ingest.atlas.test,ops=ops.atlas.test \
 	--set ADMIN_EMAIL=admin@atlas.test --set ORG_NAME=Atlas --set SUPPORT_EMAIL=support@atlas.test --set SEARCH_URL=http://api:9090 \
 	--pool "$POOL" --dataset "$DATASET" --bridge "$BRIDGE" --cpus 2 --memory 4096 --disk 32 --host "$ADDR" --wait "${E2E_VM_WAIT:-45m}" \
 	--registry "$SITE" --registry-ca "$MIRROR_CA" \
@@ -109,6 +110,22 @@ curl -sf --max-time 10 --cacert "$WORK/vm-ca.crt" --resolve "api.atlas.test:443:
 code=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 10 --resolve "ingest.atlas.test:443:$IP" -X POST -H 'Content-Type: application/json' -d '{"kind": "probe"}' https://ingest.atlas.test/events)
 [[ $code == 201 ]] || fail "ingest answered $code to an event"
 [[ $(status events) == 1 ]] || fail "the ingested event did not reach the api"
+
+step "on the VM: the ops route refuses everyone until --client-ca, then a client certificate its CA issued alone"
+ops() { curl -sk -o /dev/null -w '%{http_code}' --max-time 10 --resolve "ops.atlas.test:443:$IP" "$@" https://ops.atlas.test/health; }
+[[ $(ops) == 403 ]] || fail "the ops route serves without a client CA"
+for n in client rogue; do
+	openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout "$WORK/$n-ca.key" -out "$WORK/$n-ca.pem" -days 1 -subj "/CN=$n CA" \
+		-addext basicConstraints=critical,CA:TRUE -addext keyUsage=critical,keyCertSign 2>/dev/null &&
+		openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout "$WORK/$n.key" -out "$WORK/$n.csr" -subj "/CN=$n" 2>/dev/null &&
+		openssl x509 -req -in "$WORK/$n.csr" -CA "$WORK/$n-ca.pem" -CAkey "$WORK/$n-ca.key" -CAcreateserial -out "$WORK/$n.pem" -days 1 \
+			-extfile <(printf 'extendedKeyUsage=clientAuth\n') 2>/dev/null || fail "openssl: the $n certificate"
+done
+on_vm 'cat >/tmp/client-ca.pem' <"$WORK/client-ca.pem" || fail "copying the client CA"
+on_vm sudo at-stow install --no-input --client-ca /tmp/client-ca.pem >"$WORK/client-ca.txt" 2>&1 || { cat "$WORK/client-ca.txt"; fail "the re-run with --client-ca"; }
+[[ $(ops --cert "$WORK/client.pem" --key "$WORK/client.key") == 200 ]] || fail "the ops route refuses a certificate its client CA issued"
+[[ $(ops) == 000 && $(ops --cert "$WORK/rogue.pem" --key "$WORK/rogue.key") == 000 ]] || fail "the ops route takes a client without a certificate its client CA issued"
+[[ $(curl -sk -o /dev/null -w '%{http_code}' --max-time 10 --resolve "api.atlas.test:443:$IP" https://api.atlas.test/health) == 200 ]] || fail "the api route asks for a client certificate"
 
 step "vm destroy: the VM, its disk and its uploads go, and its state"
 "$CTL" vm destroy "$H" --yes >"$WORK/vm-destroy.txt" 2>"$WORK/vm-destroy.log" || { tail -50 "$WORK/vm-destroy.log"; fail "vm destroy"; }

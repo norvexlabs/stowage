@@ -299,6 +299,19 @@ func CheckL4Address(v string) error {
 	return nil
 }
 
+// CheckL4Bind accepts the host address an L4 route's port is published on: nothing (every
+// address) or an IP address of the host, without a zone.
+func CheckL4Bind(v string) error {
+	if v == "" {
+		return nil
+	}
+	a, err := netip.ParseAddr(v)
+	if err != nil || a.Zone() != "" {
+		return fmt.Errorf("%q is not an IP address without a zone (like 192.0.2.7 or 2001:db8::7)", v)
+	}
+	return nil
+}
+
 // hostLabel is a label of a lowercase DNS name.
 var hostLabel = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)
 

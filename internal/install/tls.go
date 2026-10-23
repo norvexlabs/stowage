@@ -1,6 +1,7 @@
 package install
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -171,7 +172,7 @@ func (in *Installer) frontFlags() error {
 		flag string
 		set  bool
 	}{
-		{"--tls", o.TLS != ""}, {"--cert", o.Cert != ""}, {"--key", o.Key != ""}, {"--ca", o.CA != ""},
+		{"--tls", o.TLS != ""}, {"--cert", o.Cert != ""}, {"--key", o.Key != ""}, {"--ca", o.CA != ""}, {"--client-ca", o.ClientCA != ""},
 		{"--domains", len(o.Domains) > 0}, {"--http-port", o.HTTPPort != 0}, {"--https-port", o.HTTPSPort != 0},
 		{"--ports", len(o.Ports) > 0}, {"--address", o.Address != ""},
 	} {
@@ -498,8 +499,10 @@ const hsts = `header Strict-Transport-Security "max-age=31536000; includeSubDoma
 // each domain to Let's Encrypt through Cloudflare's DNS, with the token from the front's
 // environment. HSTS is sent except
 // with the local CA, which browsers do not trust. The front listens on the host's port numbers,
-// so its ACME challenge and its redirects to HTTPS use them.
-func tlsCaddyfile(f spec.Front, mode string, domains map[string]string, email string, httpPort, httpsPort string, get func(string) string) string {
+// so its ACME challenge and its redirects to HTTPS use them. A route with client_auth requires a
+// client certificate chaining to the install's client CA (clientCA: one was given), and refuses
+// everyone while none was.
+func tlsCaddyfile(f spec.Front, mode string, domains map[string]string, email string, httpPort, httpsPort string, clientCA bool, get func(string) string) string {
 	public := publicHTTPSPort(mode, httpsPort)
 	var b strings.Builder
 	b.WriteString("# Written by the installer from the project's front routes; rewritten on every run.\n")
@@ -521,13 +524,27 @@ func tlsCaddyfile(f spec.Front, mode string, domains map[string]string, email st
 	b.WriteString("}\n")
 	for _, r := range f.Routes {
 		fmt.Fprintf(&b, "\n# %s\n%s {\n", r.Name, domains[r.Name])
+		tls := ""
 		if mode == "byo" {
-			fmt.Fprintf(&b, "\ttls /etc/caddy/%s/cert.pem /etc/caddy/%s/key.pem\n", TLSDir, TLSDir)
+			tls = fmt.Sprintf("/etc/caddy/%s/cert.pem /etc/caddy/%s/key.pem", TLSDir, TLSDir)
+		}
+		switch {
+		case r.ClientAuth && clientCA:
+			if tls != "" {
+				tls += " "
+			}
+			fmt.Fprintf(&b, "\ttls %s{\n%s\t}\n", tls, clientAuth)
+		case tls != "":
+			fmt.Fprintf(&b, "\ttls %s\n", tls)
 		}
 		if mode != "internal" {
 			fmt.Fprintf(&b, "\t%s\n", hsts)
 		}
-		routeBody(&b, r, get)
+		if r.ClientAuth && !clientCA {
+			b.WriteString("\trespond 403\n")
+		} else {
+			routeBody(&b, r, get)
+		}
 		b.WriteString("}\n")
 		// Caddy's own redirect leaves out the port it listens on: a public port other than 443 is
 		// named here.
@@ -536,4 +553,100 @@ func tlsCaddyfile(f spec.Front, mode string, domains map[string]string, email st
 		}
 	}
 	return b.String()
+}
+
+// clientAuthRoutes are the names of the front's routes asking for a client certificate.
+func clientAuthRoutes(f spec.Front) []string {
+	var names []string
+	for _, r := range f.Routes {
+		if r.ClientAuth {
+			names = append(names, r.Name)
+		}
+	}
+	return names
+}
+
+// readClientCA reads --client-ca: nil when it was not given or is none (which removes the
+// install's), else the file's CA certificates.
+func (in *Installer) readClientCA() ([]byte, error) {
+	v := in.O.ClientCA
+	switch {
+	case v == "":
+		return nil, nil
+	case len(clientAuthRoutes(in.R.Spec.Front)) == 0:
+		return nil, fmt.Errorf("--client-ca: no route of %s asks for a client certificate (client_auth)", in.R.Spec.Name)
+	case v == noCA:
+		return nil, nil
+	}
+	raw, err := os.ReadFile(v)
+	if err != nil {
+		return nil, fmt.Errorf("--client-ca: %w", err)
+	}
+	certs, err := clientCAs(raw)
+	if err != nil {
+		return nil, fmt.Errorf("--client-ca %s: %w", v, err)
+	}
+	return certs, nil
+}
+
+// clientCAs are the PEM CA certificates raw holds, one at least, encoded again: a private key
+// given by mistake is refused, and no text around the blocks is ever copied into the install.
+func clientCAs(raw []byte) ([]byte, error) {
+	var out bytes.Buffer
+	for rest := raw; len(bytes.TrimSpace(rest)) > 0; {
+		var b *pem.Block
+		b, rest = pem.Decode(rest)
+		switch {
+		case b == nil:
+			if out.Len() == 0 {
+				return nil, errors.New("holds no PEM certificate")
+			}
+			return nil, errors.New("holds text after its certificates")
+		case b.Type != "CERTIFICATE":
+			return nil, fmt.Errorf("holds a %s: CA certificates alone are expected", b.Type)
+		}
+		c, err := x509.ParseCertificate(b.Bytes)
+		if err != nil {
+			return nil, err
+		}
+		if !c.IsCA {
+			return nil, fmt.Errorf("%q is not a CA certificate", c.Subject.String())
+		}
+		if err := pem.Encode(&out, &pem.Block{Type: "CERTIFICATE", Bytes: c.Raw}); err != nil {
+			return nil, err
+		}
+	}
+	if out.Len() == 0 {
+		return nil, errors.New("holds no certificate")
+	}
+	return out.Bytes(), nil
+}
+
+// writeClientCA puts --client-ca's CA in the install (raw), or removes the install's (none), and
+// says which routes refuse everyone in mode: all of them in loopback mode, which carries no
+// client certificate, and in a TLS mode while the install holds no client CA.
+func (in *Installer) writeClientCA(raw []byte, mode string) error {
+	switch {
+	case raw != nil:
+		if err := os.MkdirAll(in.path(ClientCADir), 0o755); err != nil {
+			return err
+		}
+		if err := writeAtomic(in.path(ClientCAFile), bytes.NewReader(raw), 0o644, nil); err != nil {
+			return err
+		}
+		in.O.logf("copied the client CA into %s", in.path(ClientCAFile))
+	case in.O.ClientCA == noCA:
+		if err := os.RemoveAll(in.path(ClientCADir)); err != nil {
+			return err
+		}
+	}
+	routes := clientAuthRoutes(in.R.Spec.Front)
+	switch {
+	case len(routes) == 0:
+	case mode == Loopback:
+		in.O.logf("%s refuse(s) everyone in loopback mode: plain HTTP carries no client certificate", strings.Join(routes, ", "))
+	case !fileExists(in.path(ClientCAFile)):
+		in.O.logf("%s refuse(s) everyone until --client-ca FILE gives the CA their client certificates chain to", strings.Join(routes, ", "))
+	}
+	return nil
 }

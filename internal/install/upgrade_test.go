@@ -2,6 +2,7 @@ package install
 
 import (
 	"bytes"
+	"cmp"
 	"compress/gzip"
 	"context"
 	"encoding/json"
@@ -294,16 +295,77 @@ func TestUpgradeChecksTheL4PortsItAdds(t *testing.T) {
 	}
 }
 
+// A route bound to one address holds its port there alone: the port the running release publishes
+// on that address is the install's own, one on another address is not.
+func TestUpgradeKnowsABoundL4PortItHolds(t *testing.T) {
+	t.Parallel()
+	// The running release publishes 7443 on 192.0.2.7 (published), where alone the port is held.
+	bound := func(s *spec.Spec) {
+		s.Inputs = append(s.Inputs, spec.Input{Key: "DATA_BIND", Prompt: "Data bind address", Advanced: true})
+		s.L4.Routes = []spec.L4Route{{Name: "data", Protocol: "tcp", Port: 7443, Upstream: "api:7000", BindInput: "DATA_BIND"}}
+	}
+	unbound := func(s *spec.Spec) {
+		s.L4.Routes = []spec.L4Route{{Name: "data", Protocol: "tcp", Port: 7443, Upstream: "api:7000"}}
+	}
+	for _, c := range []struct {
+		name, published, recorded, set string
+		release                        func(*spec.Spec)
+		own                            bool
+		held                           []string // where the port is held: the stack's address, another process's
+		want                           string   // the refusal; empty, the port in use
+	}{
+		{"recorded on its address", "192.0.2.7", "192.0.2.7", "", bound, true, []string{"192.0.2.7"}, ""},
+		{"recorded on another address", "192.0.2.8", "192.0.2.7", "", bound, false, []string{"192.0.2.7", "192.0.2.8"}, ""},
+		{"given to the upgrade on its address", "192.0.2.7", "", "192.0.2.7", bound, true, []string{"192.0.2.7", "192.0.2.8"}, ""},
+		{"given to the upgrade on another address", "192.0.2.7", "", "192.0.2.8", bound, false, []string{"192.0.2.7", "192.0.2.8"}, ""},
+		// Every address: the one the stack holds the port on is not probed, the others are.
+		{"unbound by the release", "192.0.2.7", "192.0.2.7", "", unbound, true, []string{"192.0.2.7"}, ""},
+		{"unbound by the release, held elsewhere", "192.0.2.7", "192.0.2.7", "", unbound, false, []string{"192.0.2.7", "192.0.2.8"}, ""},
+		// Bound by the release, on every address now: the address is checked though the port is held.
+		{"bound by the release elsewhere than the host", "0.0.0.0", "", "192.0.2.99", bound, false, nil, "192.0.2.99 (DATA_BIND, the L4 route data's address) is not an address of this host"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			e := installed(t)
+			if c.recorded != "" {
+				env := e.readEnv()
+				env.Set("DATA_BIND", c.recorded)
+				if err := env.WriteFile(filepath.Join(e.dir, ".env")); err != nil {
+					t.Fatal(err)
+				}
+			}
+			e.docker.answer = func(a string) ([]byte, bool, error) {
+				if strings.HasSuffix(a, " ps --format json") {
+					return []byte(`{"Service":"api","Publishers":[{"URL":"` + c.published + `","TargetPort":7000,"PublishedPort":7443,"Protocol":"tcp"}]}`), true, nil
+				}
+				return nil, false, nil
+			}
+			e.to("2.0.0", c.release)
+			err := e.upgrade(func(o *Options) {
+				o.PortFree = func(h string, p int) bool { return p != 7443 || !slices.Contains(c.held, h) }
+				if c.set != "" {
+					o.Set = map[string]string{"DATA_BIND": c.set}
+				}
+			})
+			if c.own && err != nil || !c.own && (err == nil || !strings.Contains(err.Error(), cmp.Or(c.want, "port(s) 7443 (data) already in use"))) {
+				t.Errorf("%v", err)
+			}
+		})
+	}
+}
+
 // The ports compose ps lists as published, from an array or a line per container.
 func TestPublishedPorts(t *testing.T) {
 	t.Parallel()
-	for _, out := range []string{
-		`[{"Publishers":[{"URL":"0.0.0.0","PublishedPort":7443,"Protocol":"udp"},{"URL":"0.0.0.0","PublishedPort":0,"Protocol":"tcp"},{"URL":"127.0.0.1","PublishedPort":5432,"Protocol":"tcp"}]}]`,
-		`{"Publishers":[{"URL":"::","PublishedPort":7443,"Protocol":"udp"}]}` + "\n\n" + `{"Publishers":null}`,
+	for out, want := range map[string][]string{
+		// A port on one address is keyed by it: it holds the port there alone.
+		`[{"Publishers":[{"URL":"0.0.0.0","PublishedPort":7443,"Protocol":"udp"},{"URL":"0.0.0.0","PublishedPort":0,"Protocol":"tcp"},{"URL":"127.0.0.1","PublishedPort":5432,"Protocol":"tcp"}]}]`: {"udp/7443", "tcp/127.0.0.1/5432"},
+		`{"Publishers":[{"URL":"::","PublishedPort":7443,"Protocol":"udp"}]}` + "\n\n" + `{"Publishers":null}`:                                                                                      {"udp/7443"},
+		`{"Publishers":[{"URL":"::ffff:192.0.2.7","PublishedPort":17007,"Protocol":"tcp"},{"URL":"","PublishedPort":80,"Protocol":"tcp"}]}`:                                                         {"tcp/192.0.2.7/17007"},
 	} {
 		got, err := publishedPorts([]byte(out))
-		if err != nil || len(got) != 1 || !got["udp/7443"] {
-			t.Errorf("%s: %v %v", out, got, err)
+		if err != nil || len(got) != len(want) || slices.ContainsFunc(want, func(k string) bool { return !got[k] }) {
+			t.Errorf("%s: %v %v, want %v", out, got, err, want)
 		}
 	}
 	if _, err := publishedPorts([]byte("{")); err == nil {

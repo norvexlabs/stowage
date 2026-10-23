@@ -9,7 +9,8 @@
 # holds, a private registry the installer pulls with its baked account — with a real Postgres its
 # api migrates through two roles, and a provision hook that registers the administrator through
 # the api. Walks: ship this month's .1 → the bootstrap one-liner installs it in loopback mode
-# (every route serves; the hook's credentials file; the endpoint printed, the tip of the search
+# (every route serves but ops, which asks for a client certificate plain HTTP never carries; a
+# one-shot service no other one waits for exits 0; the hook's credentials file; the endpoint printed, the tip of the search
 # extension, not published) → re-runs set the search extension's input, then clear it, the hook
 # handed back the key it minted → the app's users revoke that key: `provision` fails
 # naming `--set`, `provision --set ADMIN_API_KEY=` mints and registers another, the next run keeps
@@ -62,15 +63,22 @@ grep -q 'not in the current month' "$WORK/ship-$V1.log" && fail "this month's re
 
 step "install $V1 with the bootstrap one-liner (loopback)"
 # Three distinct free ports for the stack, picked just before they are bound.
-CONSOLE_PORT=$(free_port) API_PORT=$(free_port) INGEST_PORT=$(free_port)
+CONSOLE_PORT=$(free_port) API_PORT=$(free_port) INGEST_PORT=$(free_port) OPS_PORT=$(free_port)
 while [[ $API_PORT == "$CONSOLE_PORT" ]]; do API_PORT=$(free_port); done
 while [[ $INGEST_PORT == "$CONSOLE_PORT" || $INGEST_PORT == "$API_PORT" ]]; do INGEST_PORT=$(free_port); done
+while [[ $OPS_PORT == "$CONSOLE_PORT" || $OPS_PORT == "$API_PORT" || $OPS_PORT == "$INGEST_PORT" ]]; do OPS_PORT=$(free_port); done
 login_pull
 docker run --rm --pull always "$REG/atlas/atlas-installer:latest" >"$WORK/atlas.sh" || fail "docker run of the installer image"
 unset DOCKER_CONFIG # for the next ships; the installer's environment never has it (OPERATOR)
-(cd "$WORK" && "${OPERATOR[@]}" sh atlas.sh --no-input --dir "$D" --ports "console=$CONSOLE_PORT,api=$API_PORT,ingest=$INGEST_PORT" \
+(cd "$WORK" && "${OPERATOR[@]}" sh atlas.sh --no-input --dir "$D" --ports "console=$CONSOLE_PORT,api=$API_PORT,ingest=$INGEST_PORT,ops=$OPS_PORT" \
 	--set ADMIN_EMAIL=admin@atlas.test --set ORG_NAME=Atlas) >"$WORK/install.log" 2>&1 || { cat "$WORK/install.log"; fail "install"; }
 atlas_running "$V1" 1
+# The one-shot echo-check, which no service waits for, exited 0: the install came up all the same.
+[[ $(docker ps -a --filter "label=com.docker.compose.project=$(project)" --filter label=com.docker.compose.service=echo-check --format '{{.State}} {{.Status}}') == "exited Exited (0)"* ]] ||
+	{ stack_logs >&2; fail "echo-check did not exit 0"; }
+# The ops route asks for a client certificate, which plain HTTP never carries: it refuses everyone.
+expect_code 403 --max-time 10 "http://127.0.0.1:$OPS_PORT/health"
+grep -qF 'ops refuse(s) everyone in loopback mode' "$WORK/install.log" || { cat "$WORK/install.log"; fail "the install does not say the ops route refuses everyone"; }
 kept "$V1"
 [[ $(status organisation) == Atlas ]] || fail "the api did not record ORG_NAME"
 [[ $(status admins) == 1 ]] || fail "the provision hook did not register the administrator"
@@ -134,7 +142,7 @@ grep -q 'tip: the extension atlas-search' "$WORK/search-off.log" || { cat "$WORK
 [[ $(sed -n 's/^ADMIN_API_KEY=//p' "$D/credentials.txt") == "$key" ]] || fail "a re-run minted a new API key: what the hook returned was not handed back"
 atlas_running "$V1" 1
 
-step "the L4 routes: the echo service over TCP and UDP on 17007, published beside the front; an optional service its input turns on"
+step "the L4 routes: the echo service over TCP and UDP on 17007, published beside the front, then on one address; an optional service its input turns on"
 # echo_l4 tcp|udp: what the echo service sends back for "ping" (TCP: prefixed by its endpoint).
 echo_l4() {
 	python3 -c '
@@ -148,6 +156,14 @@ print(s.recv(256).decode().strip())' "$1"
 }
 [[ $(echo_l4 tcp) == "localhost:17007 ping" ]] || { stack_logs >&2; fail "the echo service over TCP (STOWAGE_L4_ECHO handed to it)"; }
 [[ $(echo_l4 udp) == "ping" ]] || fail "the echo service over UDP"
+# ECHO_BIND publishes the TCP route on that host address alone; empty, on every address again.
+echo_ports() { docker port "$(docker ps -q --filter "label=com.docker.compose.project=$(project)" --filter label=com.docker.compose.service=echo)" 17007/tcp | sort | tr '\n' ' '; }
+[[ $(echo_ports) == *0.0.0.0:17007* ]] || fail "the TCP echo is published on $(echo_ports), not every address"
+"${CTL[@]}" --dir "$D" --no-input --set ECHO_BIND=127.0.0.1 >"$WORK/bind.log" 2>&1 || { cat "$WORK/bind.log"; fail "re-run --set ECHO_BIND=127.0.0.1"; }
+[[ $(echo_ports) == "127.0.0.1:17007 " ]] || fail "the TCP echo is published on $(echo_ports), not 127.0.0.1 alone"
+[[ $(echo_l4 tcp) == "localhost:17007 ping" ]] || fail "the echo service bound to 127.0.0.1 does not answer"
+"${CTL[@]}" --dir "$D" --no-input --set ECHO_BIND= >"$WORK/unbind.log" 2>&1 || { cat "$WORK/unbind.log"; fail "re-run --set ECHO_BIND="; }
+[[ $(echo_ports) == *0.0.0.0:17007* ]] || fail "the TCP echo is published on $(echo_ports) once ECHO_BIND is empty"
 grep -qxF "echo      tcp/17007 localhost:17007" "$WORK/status.txt" && grep -qxF "echo-udp  udp/17007" "$WORK/status.txt" ||
 	{ cat "$WORK/status.txt"; fail "status does not list the L4 routes"; }
 relay() { docker ps -q --filter "label=com.docker.compose.project=$(project)" --filter label=com.docker.compose.service=relay; }

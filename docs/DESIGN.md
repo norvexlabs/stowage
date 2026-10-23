@@ -60,8 +60,8 @@ Full examples: [full](../examples/full/stowage.yaml) (every key),
 | `registry` | prefix, pull credentials (baked into the installer), push auth |
 | `images` | build table: `context`/`dockerfile`/`target`/`args`/`inputs`, or `ref` for a pinned upstream image |
 | `stack.compose` | **the single service definition**, no `build:` (lint-enforced); `extends` within the file, `profiles:` only those an input turns on, no `ports:` of its own nor `network_mode: host` on the VM |
-| `front` | optional (absent or empty: no front, the `l4` routes alone); TLS modes offered, hostname → upstream routes, header stripping, forward auth and a source allowlist per route, which route is the portal, the CA published to the stack, the project's default host ports |
-| `l4` | host ports published to a service as they are (TCP or UDP), beside the front; the input holding the address clients dial; the input holding the sources the VM lets reach it |
+| `front` | optional (absent or empty: no front, the `l4` routes alone); TLS modes offered, hostname → upstream routes, header stripping, forward auth, a source allowlist and client certificates per route, which route is the portal, the CA published to the stack, the project's default host ports |
+| `l4` | host ports published to a service as they are (TCP or UDP), beside the front; the input holding the address clients dial; the input holding the sources the VM lets reach it; the advanced input holding the host address the port is bound to |
 | `health` | readiness probe (provider) used by every consumer: compose healthcheck, health gate, install wait |
 | `database` | optional: engine, service, db name, migration and app roles, schema-compat provider; without it, no backup, `data.reset`, `reset-db`, restore or schema check |
 | `data` | persistent volumes with owner uid, which ones `reset-db` wipes |
@@ -497,7 +497,9 @@ speaks natively (docker, helm, oras, cosign, kairos-agent, containerd):
 | **pull** account | read on the project's repositories | baked into the installer, the VM, the K8s pull Secret; near-public by design |
 | **publisher** token (API key) | read + create + update + delete on the project's repositories | `stowage ship / promote / yank / prune` only; env `STOWAGE_PUSH_TOKEN`, never baked anywhere |
 
-No client certificates anywhere: one auth path to build and test, and no per-tool cert flags.
+No client certificates on the registry: one auth path to build and test, and no per-tool cert
+flags. (A front route may ask its own clients for one, `client_auth`: that is the stack's traffic,
+not the registry's.)
 With `registry.pull: none` there is no pull account: every install reads anonymously, and a
 registry that creates repositories private (ghcr) would let a release publish that no install can
 read. `ship` reads each repository it writes anonymously — before it builds (what exists),
@@ -557,7 +559,8 @@ point.
    inline, a review screen before anything is written; then pre-flight, shape-specific (§ 7 row 6),
    still **before anything is written**.
 3. **Fetch** — the channel's release manifest, then exactly its digests.
-4. **Start + provision** — Docker: `.env` (0600) + `compose up --wait`. K8s: Secret +
+4. **Start + provision** — Docker: `.env` (0600) + `compose up --wait`, a refusal judged by each
+   service's state (running and healthy, or exited 0). K8s: Secret +
    `helm upgrade --install --atomic`. VM: render cloud-config (+ NoCloud ISO, or point at the disk
    image) and boot; first boot needs no registry (images are preloaded). Then the `provision` hook,
    resumable. Docker: a service Stowage adds (`stowage-provision.yaml`, profile-gated, no
@@ -919,6 +922,27 @@ every shape, the VM end-to-end test upgrading through it), then the health gate.
   token (§ 5.1).
 - **Registry auth** — no mTLS: a pull account + a publisher token (API key), standard login only;
   reference registry zot (§ 5.2).
+- **Client certificates are a route's, enforced by the front** — a stack whose link must reject
+  clients without a certificate terminates that link on the front, so the front checks it:
+  `client_auth` on the route, the CA an install flag (`--client-ca`, a file kept in the install
+  directory like byo's), as the CA is the operator's PKI, not the release's. It fails closed:
+  without a CA, and in loopback mode (plain HTTP carries no certificate), the route refuses
+  everyone rather than serving unauthenticated. One CA per install, not per route: a second PKI
+  is a second front. The Kubernetes shape's front is the chart's ingress, so the key is the
+  Docker and VM fronts'.
+- **The Docker install is judged by its services, not by `up --wait`'s exit code** — compose's
+  `--wait` fails once a one-shot service no other service waits for exits, whatever its code, so
+  that refusal — and that one alone, the last line of its output, which compose prints only once
+  it made and started every container, so the containers are this configuration's — is read
+  again: every service running (healthy, when it has a healthcheck) or exited 0 is up, a
+  healthcheck still starting is waited for (bounded), anything else fails with compose's error and
+  the service named. Not compose's config hashes: a service with `env_file` never matches its
+  container's label. A long-running service without a restart policy that
+  exits 0 cannot be told from a one-shot, as on the VM's health gate. Its success is taken as it is: a prerequisite that failed fails `up`.
+- **An L4 route binds every address, or one an advanced input gives** — two installs on one host
+  may each need the same port (a relay and a controller on 443) on their own address. The address
+  is the host's, never the release's, so it is an input; advanced, as only such a host sets it, and
+  the many installs that never do are never asked.
 - **Optional components are extensions; an optional service of the release is a profile** — an
   input turning a profile on made every optional component part of the core release: its images in every release and OS
   bundle, its sizing on every VM, its toggle in every chart. An optional component is its own

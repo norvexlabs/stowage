@@ -47,6 +47,10 @@ func TestExamplesAreClean(t *testing.T) {
 			if errs := errorsOf(res); len(errs) > 0 {
 				t.Fatalf("%s example has errors:\n%s", name, strings.Join(errs, "\n"))
 			}
+			// Warnings too: a key the examples use that lint stops counting shows as one.
+			for _, f := range res.Findings {
+				t.Errorf("%s example: %s", name, f)
+			}
 			if res.Version != version {
 				t.Errorf("Version = %q, want %q", res.Version, version)
 			}
@@ -225,14 +229,14 @@ func TestEachRuleFiresOnFull(t *testing.T) {
 		{"k8s schema image", []edit{{sp, "schema: { url_env: DATABASE_URL, image: postgres }", "schema: { url_env: DATABASE_URL, image: psql }"}}, nil, `shapes.kubernetes.schema.image: "psql" is not an images key`},
 		{"signing without public keys", []edit{{sp, "  public_keys: [keys/release-2026.pub]\n", ""}}, nil, "public_keys is required"},
 		{"loopback env not a safe default", []edit{{sp, `loopback_env: { COOKIE_SECURE: "false",`, `loopback_env: { DEBUG: "1", COOKIE_SECURE: "false",`}}, nil, "front.loopback_env.DEBUG: is not a safe_defaults key"},
-		{"route without loopback port", []edit{{sp, "loopback_ports: { console: 3000, api: 9090, ingest: 8080 }", "loopback_ports: { console: 3000, api: 9090 }"}}, nil, "route ingest has no port"},
-		{"duplicate loopback port", []edit{{sp, "ingest: 8080 }", "ingest: 9090 }"}}, nil, "is already api's port"},
+		{"route without loopback port", []edit{{sp, "loopback_ports: { console: 3000, api: 9090, ingest: 8080, ops: 9091 }", "loopback_ports: { console: 3000, api: 9090, ops: 9091 }"}}, nil, "route ingest has no port"},
+		{"duplicate loopback port", []edit{{sp, "ops: 9091 }", "ops: 9090 }"}}, nil, "is already api's port"},
 		{"reserved service name", nil, map[string]string{cp: "services:\n  stowage-front:\n    image: ${STOWAGE_IMAGE_API}\n"}, "names starting stowage- are Stowage's own"},
 		{"reserved volume name", nil, map[string]string{cp: "services:\n  api:\n    image: ${STOWAGE_IMAGE_API}\nvolumes:\n  stowage-front-data: {}\n"}, "volumes.stowage-front-data: names starting stowage- are Stowage's own"},
 		{"compose variable claimed", []edit{{sp, "  COOKIE_SECURE: \"true\"\n", "  COOKIE_SECURE: \"true\"\n  COMPOSE_PROFILES: \"x\"\n"}}, nil, "COMPOSE_PROFILES: the COMPOSE_ prefix is reserved"},
 		{"process variable claimed", []edit{{sp, "  COOKIE_SECURE: \"true\"\n", "  COOKIE_SECURE: \"true\"\n  HOME: \"/\"\n"}}, nil, "HOME: the Docker client reads it"},
 		{"unrecordable loopback value", []edit{{sp, `loopback_env: { COOKIE_SECURE: "false"`, `loopback_env: { COOKIE_SECURE: "it's false"`}}, nil, "front.loopback_env.COOKIE_SECURE: a value cannot hold a single quote"},
-		{"routes sharing a variable", []edit{{sp, "- name: api", "- name: in_gest"}, {sp, "- name: ingest", "- name: in-gest"}, {sp, "loopback_ports: { console: 3000, api: 9090, ingest: 8080 }", "loopback_ports: { console: 3000, in_gest: 9090, in-gest: 8080 }"}}, nil, `"in_gest" and "in-gest" both give STOWAGE_URL_IN_GEST`},
+		{"routes sharing a variable", []edit{{sp, "- name: api", "- name: in_gest"}, {sp, "- name: ingest", "- name: in-gest"}, {sp, "loopback_ports: { console: 3000, api: 9090, ingest: 8080, ops: 9091 }", "loopback_ports: { console: 3000, in_gest: 9090, in-gest: 8080, ops: 9091 }"}}, nil, `"in_gest" and "in-gest" both give STOWAGE_URL_IN_GEST`},
 		{"url of no route", []edit{{cp, "${STOWAGE_URL_INGEST}", "${STOWAGE_URL_INGRESS}"}}, nil, "STOWAGE_URL_INGRESS names no front route"},
 		{"public key missing", []edit{{sp, "public_keys: [keys/release-2026.pub]", "public_keys: [keys/nope.pub]"}}, nil, "signing.public_keys[0]: keys/nope.pub"},
 		{"public key not PEM", nil, map[string]string{"keys/release-2026.pub": "ssh-ed25519 AAAA\n"}, "is not a PEM public key"},
@@ -268,8 +272,8 @@ func TestEachRuleFiresOnFull(t *testing.T) {
 		{"bad domain input", []edit{{sp, "domain_input: INGEST_DOMAIN", "domain_input: ingest-domain"}}, nil, "not an environment variable name"},
 		{"bad upstream", []edit{{sp, "upstream: ingest:8080", "upstream: ingest"}}, nil, "must be <service>:<port>"},
 		{"bad header", []edit{{sp, "strip_headers: [X-Auth-Request-*, X-Atlas-Tenant]\n    - name: api", "strip_headers: [\"X Bad\"]\n    - name: api"}}, nil, "not a header name"},
-		{"loopback names no route", []edit{{sp, "ingest: 8080 }", "ingest: 8080, admin: 8081 }"}}, nil, "loopback_ports.admin"},
-		{"loopback bad port", []edit{{sp, "ingest: 8080 }", "ingest: 80800 }"}}, nil, "80800 is not a TCP port"},
+		{"loopback names no route", []edit{{sp, "ops: 9091 }", "ops: 9091, admin: 8081 }"}}, nil, "loopback_ports.admin"},
+		{"loopback bad port", []edit{{sp, "ops: 9091 }", "ops: 80800 }"}}, nil, "80800 is not a TCP port"},
 		{"health unknown provider", []edit{{sp, "provider: http-json", "provider: grpc"}}, nil, "health: unknown provider"},
 		{"health no expect", []edit{{sp, "  expect: { status: ready }\n", ""}}, nil, "expect is required"},
 		{"health bad port", []edit{{sp, "  port: 9090\n  path: /ready", "  port: 0\n  path: /ready"}}, nil, "is not a TCP port"},
@@ -305,7 +309,7 @@ func TestEachRuleFiresOnFull(t *testing.T) {
 		{"extension input with a default", []edit{{sp, `prompt: "Search service URL (empty: no search)", optional: true`, `prompt: "Search service URL (empty: no search)", optional: true, default: "http://search:7700"`}}, nil, "extensions[0].input: SEARCH_URL must have no default"},
 		{"extension key unread", []edit{{cp, "      SEARCH_KEY: ${SEARCH_KEY:-}\n", ""}}, nil, "extensions[0].key_input: SEARCH_KEY is read by no compose service and no hook"},
 		{"service with a profile", []edit{{cp, "      SUPPORT_EMAIL: ${SUPPORT_EMAIL:-}\n", "      SUPPORT_EMAIL: ${SUPPORT_EMAIL:-}\n    profiles: [debug]\n"}}, nil, "services.ui.profiles: no input turns debug on"},
-		{"profile of no service", []edit{{cp, "    profiles: [relay]\n", ""}}, nil, "inputs[12].profile: no service of deploy/compose.yaml has the profile relay"},
+		{"profile of no service", []edit{{cp, "    profiles: [relay]\n", ""}}, nil, "inputs[13].profile: no service of deploy/compose.yaml has the profile relay"},
 		{"profile input required", []edit{{sp, "optional: true, profile: relay", "required: true, profile: relay"}}, nil, "a required input always turns relay on"},
 		{"profile name", []edit{{sp, "profile: relay,", "profile: -relay,"}, {cp, "profiles: [relay]", "profiles: [-relay]"}}, nil, `"-relay" is not a compose profile name`},
 		{"l4 bad name", []edit{{sp, "name: echo,     protocol", "name: Echo,     protocol"}}, nil, `l4.routes[0].name: "Echo" must be 1 to 15`},
@@ -330,6 +334,10 @@ func TestEachRuleFiresOnFull(t *testing.T) {
 		{"l4 address secret", []edit{{sp, `"Host name or address clients dial the echo service at", default: localhost,`, `"Host name or address clients dial the echo service at", secret: true,`}}, nil, "ECHO_ADDRESS is secret"},
 		{"l4 address default", []edit{{sp, "echo service at\", default: localhost,", "echo service at\", default: \"localhost:17007\","}}, nil, `ECHO_ADDRESS's default: "localhost:17007" is not a host name`},
 		{"l4 var of no route", []edit{{cp, "${STOWAGE_L4_ECHO}", "${STOWAGE_L4_ECHO_UDP}"}}, nil, "STOWAGE_L4_ECHO_UDP names no L4 route with an address_input"},
+		{"client auth without a TLS mode", []edit{{sp, "tls_modes: [acme, dns-cloudflare, byo, internal, none]", "tls_modes: [none]"}}, nil, "front.routes[3].client_auth: no TLS mode is offered"},
+		{"l4 bind not an input", []edit{{sp, "bind_input: ECHO_BIND", "bind_input: NOPE"}}, nil, "l4.routes[0].bind_input: NOPE is not an input"},
+		{"l4 bind asked", []edit{{sp, `(every address when empty)", advanced: true,`, `(every address when empty)",`}}, nil, "l4.routes[0].bind_input: ECHO_BIND must be advanced"},
+		{"l4 bind secret", []edit{{sp, `(every address when empty)", advanced: true,`, `(every address when empty)", advanced: true, secret: true,`}}, nil, "ECHO_BIND is secret: the ports the stack publishes show it"},
 		{"l4 allow not an input", []edit{{sp, "allow_input: ECHO_SOURCES", "allow_input: NOPE"}}, nil, "l4.routes[1].allow_input: NOPE is not an input"},
 		{"l4 allow asked on docker", []edit{{sp, `default: "0.0.0.0/0 ::/0", shapes: [kairos] }`, `default: "0.0.0.0/0 ::/0", shapes: [docker, kairos] }`}}, nil, "ECHO_SOURCES must be asked on the kairos shape alone"},
 		{"l4 allow on every shape", []edit{{sp, `default: "0.0.0.0/0 ::/0", shapes: [kairos] }`, `default: "0.0.0.0/0 ::/0" }`}}, nil, "ECHO_SOURCES must be asked on the kairos shape alone"},
@@ -346,7 +354,7 @@ func TestEachRuleFiresOnFull(t *testing.T) {
 		{"backup volume twice", []edit{{sp, "volumes: [spool] ", "volumes: [spool, spool] "}}, nil, `backup: pg-age-rclone: volumes[1] "spool" is listed twice`},
 		{"published port on the VM", []edit{{cp, "    command: [atlas-server, echo, \"17007\"]\n", "    command: [atlas-server, echo, \"17007\"]\n    ports: [\"17008:17007\"]\n"}}, nil, "services.echo.ports: the VM's firewall opens only what Stowage publishes"},
 		{"profile on kubernetes only", []edit{{sp, "profile: relay, shapes: [docker, kairos]", "profile: relay, shapes: [kubernetes]"}}, nil, "this input is asked on neither"},
-		{"endpoint no route", []edit{{sp, "endpoint: api\n", "endpoint: admin\n"}}, nil, `endpoint: "admin" is not a route of front.routes (console, api, ingest)`},
+		{"endpoint no route", []edit{{sp, "endpoint: api\n", "endpoint: admin\n"}}, nil, `endpoint: "admin" is not a route of front.routes (console, api, ingest, ops)`},
 		{"bad when", []edit{{sp, "when: tls,", "when: always,"}}, nil, "expected tls or loopback"},
 		{"bad shape", []edit{{sp, "shapes: [docker, kairos] }\n  - { key: ADMIN_EMAIL", "shapes: [docker, nomad] }\n  - { key: ADMIN_EMAIL"}}, nil, "unknown shape"},
 		{"unknown image var", []edit{{cp, "ATLAS_VERSION: ${STOWAGE_PROJECT_VERSION}", "ATLAS_VERSION: ${STOWAGE_IMAGE_TYPO}"}}, nil, "STOWAGE_IMAGE_TYPO names no image"},
@@ -489,7 +497,7 @@ func TestRevisionLikeVersionRefused(t *testing.T) {
 // Findings come out in the same order on every run.
 func TestFindingsAreDeterministic(t *testing.T) {
 	root := testutil.CopyExample(t, "full")
-	testutil.Edit(t, root, specFile, "{ console: 3000, api: 9090, ingest: 8080 }", "{ console: 0, api: 70000, ingest: 99999, a: 1, b: 2 }")
+	testutil.Edit(t, root, specFile, "{ console: 3000, api: 9090, ingest: 8080, ops: 9091 }", "{ console: 0, api: 70000, ingest: 99999, ops: 9091, a: 1, b: 2 }")
 	first := run(t, root).Findings
 	for range 20 {
 		again := run(t, root).Findings
@@ -1058,6 +1066,35 @@ func FuzzCheckL4Address(f *testing.F) {
 		host, port, err := net.SplitHostPort(net.JoinHostPort(v, "7443"))
 		if err != nil || host != v || port != "7443" || strings.ContainsAny(v, "/ \t\n'\"") {
 			t.Fatalf("%q accepted: %q %q %v", v, host, port, err)
+		}
+	})
+}
+
+// An L4 route's bind address is an IP address, never a host name, a port or a zone.
+func TestCheckL4Bind(t *testing.T) {
+	t.Parallel()
+	for v, ok := range map[string]bool{
+		"": true, "192.0.2.7": true, "2001:db8::7": true, "0.0.0.0": true, "::": true,
+		"localhost": false, "192.0.2.7:443": false, "[2001:db8::7]": false, "fe80::1%eth0": false, "10.0.0.300": false, " 192.0.2.7": false,
+	} {
+		if err := CheckL4Bind(v); (err == nil) != ok {
+			t.Errorf("%q: %v", v, err)
+		}
+	}
+}
+
+// Whatever it accepts is written literally into the compose file Compose interpolates, and
+// dialed: hex digits, dots and colons alone.
+func FuzzCheckL4Bind(f *testing.F) {
+	for _, s := range []string{"192.0.2.7", "::1", "fe80::1%eth0", "${X}", "1.2.3.4:5"} {
+		f.Add(s)
+	}
+	f.Fuzz(func(t *testing.T, v string) {
+		if CheckL4Bind(v) != nil {
+			return
+		}
+		if strings.Trim(v, "0123456789abcdefABCDEF.:") != "" {
+			t.Fatalf("%q accepted", v)
 		}
 	})
 }

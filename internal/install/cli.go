@@ -77,7 +77,7 @@ func newCommand(r *Release, self string, stdout, stderr io.Writer, tools K8sOpti
 			if !noInput {
 				in.O.Prompt = terminal(accessible)
 			}
-			in.O.Cert, in.O.Key, in.O.CA = expandHome(in.O.Cert), expandHome(in.O.Key), expandHome(in.O.CA)
+			in.O.Cert, in.O.Key, in.O.CA, in.O.ClientCA = expandHome(in.O.Cert), expandHome(in.O.Key), expandHome(in.O.CA), expandHome(in.O.ClientCA)
 			if secretsFile != "" {
 				var err error
 				if in.O.Secrets, err = readSecretsArg(secretsFile, cmd.InOrStdin()); err != nil {
@@ -113,6 +113,9 @@ func newCommand(r *Release, self string, stdout, stderr io.Writer, tools K8sOpti
 	rf.StringVar(&o.Key, "key", "", "--tls byo: the certificate's private key, PEM, copied into the install")
 	if r.Spec.Front.PublishCA != nil {
 		rf.StringVar(&o.CA, "ca", "", "--tls byo: the CA the certificate chains to, PEM, published to the stack")
+	}
+	if len(clientAuthRoutes(r.Spec.Front)) > 0 {
+		rf.StringVar(&o.ClientCA, "client-ca", "", "the CA, PEM, the client certificates of the routes with client_auth chain to, copied into the install (a re-run replaces it; none removes it)")
 	}
 	rf.IntVar(&o.HTTPPort, "http-port", 0, "the host port a TLS front serves HTTP on (default the project's front.http_port, else 80; a re-run changes it)")
 	rf.IntVar(&o.HTTPSPort, "https-port", 0, "the host port a TLS front serves HTTPS on (default the project's front.https_port, else 443; a re-run changes it)")
@@ -913,7 +916,7 @@ func parsePorts(items []string) (map[string]int, error) {
 }
 
 // frontFlagNames are the install flags only a front takes.
-var frontFlagNames = []string{"tls", "domains", "cert", "key", "ca", "http-port", "https-port", "ports", "address"}
+var frontFlagNames = []string{"tls", "domains", "cert", "key", "ca", "client-ca", "http-port", "https-port", "ports", "address"}
 
 // hideFrontFlags hides, for a project without a front, the flags of names f has; given, they are
 // refused naming it (frontFlags).

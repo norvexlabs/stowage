@@ -862,6 +862,143 @@ func TestARouteRefusesOtherSourcesThenStripsThenAsksTheAuthService(t *testing.T)
 	}
 }
 
+// A route with client_auth requires a client certificate the install's client CA issued: it refuses
+// everyone while none was given, and in loopback mode; the other routes are left as they are.
+func TestARouteAskingForAClientCertificate(t *testing.T) {
+	t.Parallel()
+	ca, leaf, key := writeCAChain(t, "notes.example.com", "api.example.com")
+	other, _, _ := writeCAChain(t, "api.example.com")
+	block := func(e *env, domain string) string {
+		cf := e.file(Caddyfile)
+		_, after, _ := strings.Cut(cf, "\n"+domain+" {\n")
+		b, _, _ := strings.Cut(after, "\n}\n")
+		return b
+	}
+	required := "\ttls {\n\t\tclient_auth {\n\t\t\tmode require_and_verify\n\t\t\ttrust_pool file /etc/caddy/client-ca/ca.pem\n\t\t}\n\t}\n"
+	mounted := func(e *env) bool {
+		return strings.Contains(e.file(FrontCompose), "./"+ClientCADir+":/etc/caddy/client-ca:ro")
+	}
+	newAuth := func() *env {
+		e := newEnv(t)
+		e.r.Spec.Front.Routes[1].ClientAuth = true
+		return e
+	}
+	internal := func(more func(*Options)) func(*Options) {
+		return func(o *Options) {
+			tlsDomains(o)
+			o.TLS = "internal"
+			if more != nil {
+				more(o)
+			}
+		}
+	}
+
+	e := newAuth()
+	if err := e.install(internal(nil)); err != nil {
+		t.Fatal(err)
+	}
+	if b := block(e, "api.example.com"); !strings.Contains(b, "\trespond 403") || strings.Contains(b, "reverse_proxy") || strings.Contains(b, "client_auth") || mounted(e) {
+		t.Errorf("without a client CA, api serves:\n%s", b)
+	}
+	if !strings.Contains(e.log.String(), "api refuse(s) everyone until --client-ca FILE") {
+		t.Errorf("log:\n%s", e.log)
+	}
+	if b := block(e, "notes.example.com"); !strings.Contains(b, "reverse_proxy") || strings.Contains(b, "tls") {
+		t.Errorf("app:\n%s", b)
+	}
+	// What is not a CA, PEM, alone is refused, and nothing is written.
+	for file, want := range map[string]string{key: "holds a EC PRIVATE KEY", leaf: "is not a CA certificate", filepath.Join(t.TempDir(), "none.pem"): "no such file"} {
+		if err := e.install(func(o *Options) { o.ClientCA = file }); err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("%s: %v, want %q", file, err, want)
+		}
+		if _, err := os.Stat(filepath.Join(e.dir, ClientCAFile)); !errors.Is(err, os.ErrNotExist) {
+			t.Fatal("a refused client CA was written")
+		}
+	}
+	raw, _ := os.ReadFile(ca)
+	trailing := filepath.Join(t.TempDir(), "trailing.pem")
+	_ = os.WriteFile(trailing, append(slices.Clone(raw), "a secret pasted after it\n"...), 0o600)
+	if err := e.install(func(o *Options) { o.ClientCA = trailing }); err == nil || !strings.Contains(err.Error(), "holds text after its certificates") {
+		t.Errorf("text after the certificates: %v", err)
+	}
+	// Only the certificates are copied: text before them is not.
+	before := e.frontLabel()
+	leading := filepath.Join(t.TempDir(), "leading.pem")
+	_ = os.WriteFile(leading, append([]byte("a secret pasted before it\n"), raw...), 0o600)
+	if err := e.install(func(o *Options) { o.ClientCA = leading }); err != nil {
+		t.Fatal(err)
+	}
+	if b := block(e, "api.example.com"); !strings.HasPrefix(b, required) || !strings.Contains(b, "reverse_proxy api:8000") || strings.Contains(b, "respond 403") || !mounted(e) {
+		t.Errorf("with a client CA, api serves:\n%s", b)
+	}
+	if e.file(ClientCAFile) != string(raw) {
+		t.Errorf("the client CA was not copied, its certificates alone:\n%s", e.file(ClientCAFile))
+	}
+	// Another CA recreates the front, as its configuration changed.
+	withCA := e.frontLabel()
+	if err := e.install(func(o *Options) { o.ClientCA = other }); err != nil {
+		t.Fatal(err)
+	}
+	if withCA == before || e.frontLabel() == withCA {
+		t.Error("the front's configuration digest does not follow the client CA")
+	}
+	// Back behind TLS with byo: the certificate and the client authentication in one directive.
+	if err := e.install(func(o *Options) { o.TLS, o.Cert, o.Key = "byo", leaf, key }); err != nil {
+		t.Fatal(err)
+	}
+	if b := block(e, "api.example.com"); !strings.HasPrefix(b, "\ttls /etc/caddy/tls/cert.pem /etc/caddy/tls/key.pem {\n\t\tclient_auth {") || !mounted(e) {
+		t.Errorf("byo:\n%s", b)
+	}
+	if b := block(e, "notes.example.com"); !strings.HasPrefix(b, "\ttls /etc/caddy/tls/cert.pem /etc/caddy/tls/key.pem\n") {
+		t.Errorf("byo app:\n%s", b)
+	}
+	// A client CA emptied since is none: the route refuses everyone, the front serves the others.
+	if err := os.WriteFile(filepath.Join(e.dir, ClientCAFile), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.install(nil); err != nil {
+		t.Fatal(err)
+	}
+	if b := block(e, "api.example.com"); !strings.Contains(b, "\trespond 403") || strings.Contains(b, "client_auth") || mounted(e) || !strings.Contains(e.log.String(), "holds no certificate: api refuse(s) everyone") {
+		t.Errorf("an empty client CA:\n%s\n%s", b, e.log)
+	}
+	// none removes it: the route refuses everyone again.
+	if err := e.install(func(o *Options) { o.ClientCA = "none" }); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(e.dir, ClientCAFile)); !errors.Is(err, os.ErrNotExist) || mounted(e) || !strings.Contains(block(e, "api.example.com"), "\trespond 403") {
+		t.Errorf("none kept the client CA: %v", err)
+	}
+
+	// A first install takes it; a dry run reads it and writes nothing.
+	e = newAuth()
+	if err := e.install(internal(func(o *Options) { o.ClientCA, o.DryRun = ca, true })); err != nil {
+		t.Fatal(err)
+	}
+	e.nothingWritten()
+	if err := e.install(internal(func(o *Options) { o.ClientCA = ca })); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(block(e, "api.example.com"), required) {
+		t.Errorf("first install:\n%s", e.file(Caddyfile))
+	}
+	// Loopback mode carries no client certificate: the route refuses everyone, a CA given is kept
+	// and not read.
+	e = newAuth()
+	if err := e.install(func(o *Options) { o.TLS, o.ClientCA = Loopback, ca }); err != nil {
+		t.Fatal(err)
+	}
+	if cf := e.file(Caddyfile); !strings.Contains(cf, "# api\nhttp://:10001 {\n\trespond 403\n}") || mounted(e) || !strings.Contains(e.log.String(), "api refuse(s) everyone in loopback mode") {
+		t.Errorf("loopback:\n%s", cf)
+	}
+	// A project without such a route has no use for one.
+	e = newEnv(t)
+	if err := e.install(internal(func(o *Options) { o.ClientCA = ca })); err == nil || !strings.Contains(err.Error(), "--client-ca: no route of notes asks for a client certificate (client_auth)") {
+		t.Errorf("err = %v", err)
+	}
+	e.nothingWritten()
+}
+
 func TestTheValuesTheFrontReadsAreChecked(t *testing.T) {
 	t.Parallel()
 	for _, c := range []struct {

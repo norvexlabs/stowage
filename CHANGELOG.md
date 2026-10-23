@@ -3,6 +3,22 @@
 Stowage's own releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
+## [0.11.0]
+
+### Added
+- **Client certificates on a route**: `client_auth: true` makes the front require, on that
+  route's domain, a client certificate the install's client CA issued (`--client-ca FILE`, a
+  re-run replaces it, `none` removes it). Until one is given, and in loopback mode, the route
+  refuses everyone, and the install says so.
+- **An L4 route on one host address**: `bind_input` names an advanced input whose address the
+  route's port is published on alone, so installs sharing a host can each hold the port on
+  their own address; the port is probed on that address alone.
+
+### Fixed
+- A one-shot service no other service waits for no longer fails the Docker install when it
+  exits: the install is judged by each service's state — running (healthy, when it has a
+  healthcheck) or exited 0 — rather than by `docker compose up --wait`'s exit code.
+
 ## [0.10.0] - 2026-10-23
 
 ### Added

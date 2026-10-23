@@ -784,6 +784,11 @@ func (l *linter) front() {
 				l.errf(w+".allow_input", "%s is advanced, never asked: the route would refuse everyone until it is set", r.AllowInput)
 			}
 		}
+		if r.ClientAuth {
+			if !slices.ContainsFunc(f.TLSModes, func(m string) bool { return m != "none" }) {
+				l.errf(w+".client_auth", "no TLS mode is offered: plain HTTP carries no client certificate, so the route would refuse everyone")
+			}
+		}
 	}
 	if p := f.PublishCA; p != nil {
 		if !slices.Contains(f.TLSModes, "internal") && !slices.Contains(f.TLSModes, "byo") {
@@ -919,6 +924,23 @@ func (l *linter) l4() {
 		if k := r.AllowInput; k != "" {
 			l.l4Allow(w+".allow_input", k)
 		}
+		if k := r.BindInput; k != "" {
+			l.l4Bind(w+".bind_input", k)
+		}
+	}
+}
+
+// l4Bind checks an L4 route's bind input: a tunable an operator sets on a host that serves
+// several installs, so it is never asked (advanced) and is shown in the ports it publishes.
+func (l *linter) l4Bind(where, key string) {
+	in, ok := l.s.Input(key)
+	switch {
+	case !ok:
+		l.errf(where, "%s is not an input", key)
+	case !in.Advanced:
+		l.errf(where, "%s must be advanced: the address is set only where a host serves several installs, never asked", key)
+	case in.Secret:
+		l.errf(where, "%s is secret: the ports the stack publishes show it", key)
 	}
 }
 
@@ -1228,9 +1250,9 @@ func (l *linter) readInputs() func(spec.Input) bool {
 			inCompose[a.AddressInput], inCompose[a.URIInput] = true, true
 		}
 	}
-	// The installer reads the L4 routes' address inputs.
+	// The installer reads the L4 routes' inputs.
 	for _, r := range l.s.L4.Routes {
-		inCompose[r.AddressInput], inCompose[r.AllowInput] = true, true
+		inCompose[r.AddressInput], inCompose[r.AllowInput], inCompose[r.BindInput] = true, true, true
 	}
 	return func(in spec.Input) bool {
 		if in.Profile != "" {

@@ -119,7 +119,7 @@ func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(
 			if !noInput {
 				in.O.Prompt = terminal(accessible)
 			}
-			in.O.Cert, in.O.Key, in.O.CA = expandHome(in.O.Cert), expandHome(in.O.Key), expandHome(in.O.CA)
+			in.O.Cert, in.O.Key, in.O.CA, in.O.ClientCA = expandHome(in.O.Cert), expandHome(in.O.Key), expandHome(in.O.CA), expandHome(in.O.ClientCA)
 			if err := in.Install(cmd.Context()); err != nil {
 				return err
 			}
@@ -139,6 +139,9 @@ func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(
 	f.StringVar(&o.Key, "key", "", "--tls byo: the certificate's private key, PEM, copied into the install")
 	if r.Spec.Front.PublishCA != nil {
 		f.StringVar(&o.CA, "ca", "", "--tls byo: the CA the certificate chains to, PEM, published to the stack (none: no CA)")
+	}
+	if len(clientAuthRoutes(r.Spec.Front)) > 0 {
+		f.StringVar(&o.ClientCA, "client-ca", "", "the CA, PEM, the client certificates of the routes with client_auth chain to, copied into the install (on an installed VM, replaces it; none removes it)")
 	}
 	f.IntVar(&o.HTTPPort, "http-port", 0, "the host port a TLS front serves HTTP on (default the project's front.http_port, else 80; on an installed VM, changes it)")
 	f.IntVar(&o.HTTPSPort, "https-port", 0, "the host port a TLS front serves HTTPS on (default the project's front.https_port, else 443; on an installed VM, changes it)")

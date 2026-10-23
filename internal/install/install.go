@@ -60,6 +60,9 @@ type Options struct {
 	// CA is the CA a byo certificate chains to (--ca), PEM, copied into the install for
 	// front.publish_ca.
 	CA string
+	// ClientCA is the CA file, PEM, the client certificates of the routes with client_auth chain
+	// to (--client-ca), copied into the install; "none" removes the install's.
+	ClientCA string
 	// HTTPPort and HTTPSPort are the host ports a TLS front publishes; 0 is 80 and 443.
 	HTTPPort, HTTPSPort int
 	Registry            string // --registry: the prefix images are pulled from (a mirror); first install only
@@ -117,6 +120,8 @@ type Options struct {
 	// PortFree and UDPPortFree replace the TCP and UDP port probes in tests.
 	PortFree    func(host string, port int) bool
 	UDPPortFree func(host string, port int) bool
+	// HostAddrs replaces the host's addresses (L4 routes are probed and bound on them) in tests.
+	HostAddrs func() []string
 	// Firewall is the directory the VM's firewall includes runtime rules from, where every start
 	// opens the front's ports (openPorts); empty opens none. Host runs host programs (nft): Args[0]
 	// is the program.
@@ -255,6 +260,10 @@ func (in *Installer) Install(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	clientCA, err := in.readClientCA()
+	if err != nil {
+		return err
+	}
 	// Everything is checked and decided first; nothing is pulled or written before. The host is
 	// checked before anything is asked, so a refusal never comes after the operator answered a
 	// form. With nothing to ask, every given input is checked before the host. Going back from the
@@ -312,7 +321,7 @@ func (in *Installer) Install(ctx context.Context) error {
 	if err := in.portsFree(pub); err != nil {
 		return err
 	}
-	if err := in.l4Free(in.R.Spec.L4.Routes); err != nil {
+	if err := in.l4Free(in.R.Spec.L4.Routes, func(k string) string { v, _ := env.Get(k); return v }, nil); err != nil {
 		return err
 	}
 	if o.DryRun {
@@ -342,7 +351,7 @@ func (in *Installer) Install(ctx context.Context) error {
 		return err
 	}
 	// Until .env is written no install owns what this run wrote: a failure removes it.
-	certWritten, caWritten := false, false
+	certWritten, caWritten, clientCAWritten := false, false, false
 	unwritten := func(err error) error {
 		if in.wroteDockerCA != "" {
 			_ = os.Remove(in.wroteDockerCA)
@@ -360,6 +369,9 @@ func (in *Installer) Install(ctx context.Context) error {
 			if caWritten {
 				_ = os.Remove(in.path(RegistryCAFile))
 			}
+			if clientCAWritten {
+				_ = os.RemoveAll(in.path(ClientCADir))
+			}
 			_ = os.Remove(in.path(installingFile)) // written by this run, under its lock
 		}
 		return err
@@ -371,6 +383,14 @@ func (in *Installer) Install(ctx context.Context) error {
 		return unwritten(err)
 	}
 	certWritten = in.byo != nil
+	if clientCA != nil {
+		// A file of that name there before is not this run's to remove.
+		_, err := os.Lstat(in.path(ClientCADir))
+		clientCAWritten = errors.Is(err, os.ErrNotExist)
+	}
+	if err := in.writeClientCA(clientCA, mode); err != nil {
+		return unwritten(err)
+	}
 	if o.RegistryCA != "" {
 		// A file of that name there before is not this run's to remove (it may be the CA given).
 		_, err := os.Lstat(in.path(RegistryCAFile))
@@ -417,7 +437,7 @@ type publish struct {
 func (in *Installer) preflight(ctx context.Context, mode string) (publish, error) {
 	o := &in.O
 	if !in.R.Spec.HasFront() {
-		return publish{}, in.l4Free(in.R.Spec.L4.Routes)
+		return publish{}, in.l4Free(in.R.Spec.L4.Routes, in.given, nil)
 	}
 	if mode == Loopback {
 		if o.HTTPPort != 0 || o.HTTPSPort != 0 {
@@ -447,14 +467,26 @@ func (in *Installer) preflight(ctx context.Context, mode string) (publish, error
 	if err := in.portsFree(pub); err != nil {
 		return publish{}, err
 	}
-	return pub, in.l4Free(in.R.Spec.L4.Routes)
+	return pub, in.l4Free(in.R.Spec.L4.Routes, in.given, nil)
 }
 
-// l4Free refuses a port of routes a process of the host already holds, on any of its addresses: a
-// TCP port one listens on, a UDP port one is bound to.
-func (in *Installer) l4Free(routes []spec.L4Route) error {
+// given is the value --set, then --answers, gives the input key; empty when neither does.
+func (in *Installer) given(key string) string {
+	if v, ok := in.O.Set[key]; ok {
+		return v
+	}
+	return in.O.Answers[key]
+}
+
+// l4Free refuses a port of routes a process of the host already holds, on any of its addresses or
+// on the one a route is bound to (its bind input's value): a TCP port one listens on, a UDP port
+// one is bound to. The addresses own says the stack holds the port on are not probed.
+func (in *Installer) l4Free(routes []spec.L4Route, value func(string) string, own map[string]bool) error {
+	if err := in.bindHere(routes, value); err != nil {
+		return err
+	}
 	hosts := []string{"127.0.0.1", "::1"}
-	for _, h := range hostAddrs() {
+	for _, h := range in.O.hostAddrs() {
 		if !slices.Contains(hosts, h) {
 			hosts = append(hosts, h)
 		}
@@ -467,12 +499,73 @@ func (in *Installer) l4Free(routes []spec.L4Route) error {
 			// keeps from binding (a local resolver's 127.0.0.53:53).
 			free, on = in.O.udpPortFree, []string{"0.0.0.0", "::"}
 		}
+		// A route bound to one address needs the port there alone: a socket holding it on every
+		// address answers there too, over TCP, and keeps a bind to it from succeeding, over UDP.
+		if a := bindAddr(r, value); a != "" {
+			on = []string{a}
+		}
+		// An address the stack holds the port on already is its own (own, publishedPorts' keys).
+		on = slices.DeleteFunc(slices.Clone(on), func(h string) bool { return heldOn(own, r, h) })
 		if slices.ContainsFunc(on, func(h string) bool { return !free(h, r.Port) }) {
 			busy = append(busy, fmt.Sprintf("%d (%s)", r.Port, r.Name))
 		}
 	}
 	if len(busy) > 0 {
 		return fmt.Errorf("port(s) %s already in use on this host: the project's L4 routes publish them", strings.Join(busy, ", "))
+	}
+	return nil
+}
+
+// l4Moved probes the port of each L4 route whose bind address the re-run's values (next) change,
+// as a first install does, but where the stack holds it already.
+func (in *Installer) l4Moved(ctx context.Context, env, next *EnvFile) error {
+	was := func(k string) string { v, _ := env.Get(k); return v }
+	now := func(k string) string { v, _ := next.Get(k); return v }
+	var moved []spec.L4Route
+	for _, r := range in.R.Spec.L4.Routes {
+		if bindAddr(r, was) != bindAddr(r, now) || was(r.BindInput) != now(r.BindInput) {
+			moved = append(moved, r)
+		}
+	}
+	if len(moved) == 0 {
+		return nil
+	}
+	out, err := in.Compose(ctx, env, nil, "ps", "--format", "json")
+	if err != nil {
+		return fmt.Errorf("compose ps: %w", err)
+	}
+	own, err := publishedPorts(out)
+	if err != nil {
+		return err
+	}
+	return in.l4Free(moved, now, own)
+}
+
+// heldOn reports whether own (publishedPorts' keys) holds r's port on host, an address of the host:
+// there, or on every address.
+// A wildcard is always probed: a socket holding the port on any address keeps Docker from binding
+// it, and only the stack's own on that address is known.
+func heldOn(own map[string]bool, r spec.L4Route, host string) bool {
+	a, err := netip.ParseAddr(host)
+	if err != nil || a.IsUnspecified() {
+		return false
+	}
+	return own[fmt.Sprintf("%s/%d", r.Protocol, r.Port)] || own[fmt.Sprintf("%s/%s/%d", r.Protocol, a.Unmap(), r.Port)]
+}
+
+// bindHere refuses an L4 route bound to an address this host does not have: Docker could not
+// publish the port there.
+func (in *Installer) bindHere(routes []spec.L4Route, value func(string) string) error {
+	addrs := in.O.hostAddrs()
+	if len(addrs) == 0 {
+		return nil // the host's addresses are unknown: up says whether Docker can bind it
+	}
+	for _, r := range routes {
+		a := bindAddr(r, value)
+		if a == "" || slices.ContainsFunc(addrs, func(h string) bool { b, err := netip.ParseAddr(h); return err == nil && b.Unmap().String() == a }) {
+			continue
+		}
+		return fmt.Errorf("%s (%s, the L4 route %s's address) is not an address of this host", value(r.BindInput), r.BindInput, r.Name)
 	}
 	return nil
 }
@@ -622,6 +715,10 @@ func (in *Installer) rerun(ctx context.Context) (err error) {
 	if o.Address != "" || o.Registry != "" || o.RegistryCA != "" || o.Channel != "" {
 		return errors.New("--address, --registry, --registry-ca and --channel are recorded at the first install: this directory already holds one (a re-run changes the inputs with --set, --answers and --domains, the front's ports, and its TLS mode and certificate)")
 	}
+	clientCA, err := in.readClientCA()
+	if err != nil {
+		return err
+	}
 	env, unlock, err := in.openLocked(ctx)
 	if err != nil {
 		return err
@@ -646,6 +743,11 @@ func (in *Installer) rerun(ctx context.Context) (err error) {
 	}
 	if err := in.checkDocker(ctx); err != nil {
 		return err
+	}
+	if next != nil {
+		if err := in.l4Moved(ctx, env, next); err != nil {
+			return err
+		}
 	}
 	was, _ := env.Get("STOWAGE_TLS_MODE")
 	mode := was
@@ -685,6 +787,9 @@ func (in *Installer) rerun(ctx context.Context) (err error) {
 		return err
 	}
 	if err := in.writeNewCert(); err != nil {
+		return err
+	}
+	if err := in.writeClientCA(clientCA, mode); err != nil {
 		return err
 	}
 	if next == nil {
@@ -993,6 +1098,21 @@ func (in *Installer) renderStack(env *EnvFile, dir string) error {
 	f := in.R.Spec.Front
 	mode, _ := env.Get("STOWAGE_TLS_MODE")
 	get := func(k string) string { v, _ := env.Get(k); return v }
+	// The client CA is read in a TLS mode by a front with a route asking for client certificates.
+	// One that holds no CA certificate any more is none: its routes refuse everyone, and the
+	// front still serves the others.
+	var clientCA []byte
+	if mode != Loopback && len(clientAuthRoutes(f)) > 0 {
+		raw, err := os.ReadFile(in.path(ClientCAFile))
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		if err == nil {
+			if clientCA, err = clientCAs(raw); err != nil {
+				in.O.logf("%s %v: %s refuse(s) everyone", in.path(ClientCAFile), err, strings.Join(clientAuthRoutes(f), ", "))
+			}
+		}
+	}
 	var cf string
 	switch {
 	case !f.Declared():
@@ -1007,11 +1127,15 @@ func (in *Installer) renderStack(env *EnvFile, dir string) error {
 		email, _ := env.Get(ACMEEmailVar)
 		httpPort, _ := env.Get(HTTPPortVar)
 		httpsPort, _ := env.Get(HTTPSPortVar)
-		cf = tlsCaddyfile(f, mode, domains, email, httpPort, httpsPort, get)
+		cf = tlsCaddyfile(f, mode, domains, email, httpPort, httpsPort, clientCA != nil, get)
 	}
-	// The front's configuration: the Caddyfile, and in byo the files of tls/ it reads.
+	// The front's configuration: the Caddyfile, the client CA it reads, and in byo the files of
+	// tls/ it reads.
 	h := sha256.New()
 	fmt.Fprintf(h, "Caddyfile %d\n%s", len(cf), cf)
+	if clientCA != nil {
+		fmt.Fprintf(h, "%s %d\n%s", ClientCAFile, len(clientCA), clientCA)
+	}
 	ca := ""
 	switch mode {
 	case "internal":
@@ -1031,7 +1155,7 @@ func (in *Installer) renderStack(env *EnvFile, dir string) error {
 			}
 		}
 	}
-	fc, err := frontCompose(f, in.R.Spec.L4.Routes, mode, in.hostAPI(), "sha256:"+hex.EncodeToString(h.Sum(nil)), ca, get(IPv6Var) == "true")
+	fc, err := frontCompose(f, in.R.Spec.L4.Routes, get, mode, in.hostAPI(), "sha256:"+hex.EncodeToString(h.Sum(nil)), ca, clientCA != nil, get(IPv6Var) == "true")
 	if err != nil {
 		return err
 	}
@@ -1136,8 +1260,15 @@ func (in *Installer) up(ctx context.Context, env *EnvFile) error {
 				}
 			}
 		}
-		_, err := in.O.Docker.Run(ctx, Cmd{Args: append(in.composeBase(), "up", "--detach", "--wait", "--remove-orphans"), Env: environ, Stream: in.O.Log})
-		return err
+		var out tailBuffer
+		w := io.Writer(&out)
+		if in.O.Log != nil {
+			w = io.MultiWriter(in.O.Log, &out)
+		}
+		if _, err := in.O.Docker.Run(ctx, Cmd{Args: append(in.composeBase(), "up", "--detach", "--wait", "--remove-orphans"), Env: environ, Stream: w}); err != nil {
+			return in.settle(ctx, env, out.Bytes(), err)
+		}
+		return nil
 	}
 	if err = run(); err != nil {
 		if gone := in.goneImages(ctx, env); len(gone) > 0 {
@@ -1158,6 +1289,99 @@ func (in *Installer) up(ctx context.Context, env *EnvFile) error {
 	url, _ := env.Get(spec.URLVar(in.R.Spec.Front.Portal))
 	fmt.Fprintf(in.O.Out, "%s %s is running: %s\n", in.R.Spec.Name, in.R.Manifest.ProjectVersion, url)
 	return nil
+}
+
+// settleUnit paces settle's polls of the stack; settlePolls bounds them. Tests shorten the unit.
+var settleUnit = time.Second
+
+const settlePolls = 300
+
+// settle judges a stack `up --wait` refused because a container exited (out is what up printed):
+// --wait fails once a one-shot service that no other service waits for exits, whatever its code.
+// Up reached its wait only once it had made and started every container of this configuration,
+// so any other refusal is returned as it is. The stack came up when every service runs — healthy
+// when it has a healthcheck — or exited 0; settle waits while a healthcheck is starting, and
+// otherwise returns upErr with what it saw. A container still created, or restarting, failed.
+func (in *Installer) settle(ctx context.Context, env *EnvFile, out []byte, upErr error) error {
+	if !waitExited(out) {
+		return upErr
+	}
+	for n := 0; ; n++ {
+		ps, err := in.Compose(ctx, env, nil, "ps", "--all", "--format", "json")
+		if err != nil {
+			return fmt.Errorf("%w: judging its services: %v", upErr, err)
+		}
+		list, err := parseServices(ps)
+		if err != nil {
+			return fmt.Errorf("%w: judging its services: %v", upErr, err)
+		}
+		starting, why := settled(list)
+		switch {
+		case why != "":
+			return fmt.Errorf("%w: %s", upErr, why)
+		case len(starting) == 0:
+			in.O.logf("every service runs or exited 0: a one-shot service exiting stopped compose's wait")
+			return nil
+		case n >= settlePolls:
+			return fmt.Errorf("%w: %s still starting", upErr, strings.Join(starting, ", "))
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("%w: judging its services: %v", upErr, ctx.Err())
+		case <-time.After(settleUnit):
+		}
+	}
+}
+
+// tailBuffer keeps the last 4 KiB written to it: the end of up's output, which settle reads.
+type tailBuffer struct{ b []byte }
+
+func (t *tailBuffer) Write(p []byte) (int, error) {
+	t.b = append(t.b, p...)
+	if over := len(t.b) - 4<<10; over > 0 {
+		t.b = append(t.b[:0], t.b[over:]...)
+	}
+	return len(p), nil
+}
+
+func (t *tailBuffer) Bytes() []byte { return t.b }
+
+// ansiRe is a terminal escape sequence compose may color or redraw its output with.
+var ansiRe = regexp.MustCompile(`\x1b\[[0-9;?]*[A-Za-z]`)
+
+// waitExited reports whether up's output ends on its wait's refusal of a container that exited,
+// `container <name> exited (<code>)`.
+func waitExited(out []byte) bool {
+	t := bytes.TrimSpace(ansiRe.ReplaceAll(out, nil))
+	f := strings.Fields(string(t[bytes.LastIndexByte(t, '\n')+1:]))
+	return len(f) == 4 && f[0] == "container" && f[2] == "exited" && exitedCodeRe.MatchString(f[3])
+}
+
+var exitedCodeRe = regexp.MustCompile(`^\([0-9]+\)$`)
+
+// settled sorts the stack's services: those whose healthcheck is still starting, and why the
+// stack failed (empty while none did): a service exited non-zero, unhealthy, or in any other
+// state than running or exited; or no service at all.
+func settled(list []Service) (starting []string, why string) {
+	if len(list) == 0 {
+		return nil, "no service of the stack runs"
+	}
+	slices.SortFunc(list, func(a, b Service) int { return strings.Compare(a.Service, b.Service) })
+	for _, s := range list {
+		switch {
+		case s.State == "running" && (s.Health == "" || s.Health == "healthy"):
+		case s.State == "running" && s.Health == "starting":
+			starting = append(starting, s.Service)
+		case s.State == "running":
+			return nil, fmt.Sprintf("%s is %s", s.Service, s.Health)
+		case s.State == "exited" && s.ExitCode == 0:
+		case s.State == "exited":
+			return nil, fmt.Sprintf("%s exited with code %d", s.Service, s.ExitCode)
+		default:
+			return nil, fmt.Sprintf("%s is %s", s.Service, s.State)
+		}
+	}
+	return starting, ""
 }
 
 // ipv6Network stops the stack when IPv6 was turned on or off (--ipv6) since its default network
@@ -1303,13 +1527,31 @@ func (in *Installer) l4Upgrade(ctx context.Context, env *EnvFile, mode string) e
 	if err != nil {
 		return err
 	}
+	// A bind address this run gives (--set, --answers) is the one the release will take.
+	get := func(k string) string {
+		if v, ok := in.O.Set[k]; ok {
+			return v
+		}
+		if v, ok := in.O.Answers[k]; ok {
+			return v
+		}
+		v, _ := env.Get(k)
+		return v
+	}
+	if err := in.bindHere(in.R.Spec.L4.Routes, get); err != nil {
+		return err
+	}
 	var added []spec.L4Route
 	for _, r := range in.R.Spec.L4.Routes {
-		if !own[fmt.Sprintf("%s/%d", r.Protocol, r.Port)] {
+		held := own[fmt.Sprintf("%s/%d", r.Protocol, r.Port)]
+		if a := bindAddr(r, get); a != "" {
+			held = held || own[fmt.Sprintf("%s/%s/%d", r.Protocol, a, r.Port)]
+		}
+		if !held {
 			added = append(added, r)
 		}
 	}
-	return in.l4Free(added)
+	return in.l4Free(added, get, own)
 }
 
 // publishedPorts are the host ports, as protocol/port, the containers `compose ps --format json`
@@ -1343,13 +1585,30 @@ func publishedPorts(out []byte) (map[string]bool, error) {
 	ports := map[string]bool{}
 	for _, r := range rows {
 		for _, p := range r.Publishers {
-			// Only a port on every address: one bound to loopback leaves the others to probe.
-			if p.PublishedPort != 0 && (p.URL == "0.0.0.0" || p.URL == "::") {
+			switch a, err := netip.ParseAddr(p.URL); {
+			case p.PublishedPort == 0 || err != nil:
+			case a.IsUnspecified():
 				ports[fmt.Sprintf("%s/%d", p.Protocol, p.PublishedPort)] = true
+			default:
+				// A port on one address holds it there alone: the others are still probed.
+				ports[fmt.Sprintf("%s/%s/%d", p.Protocol, a.Unmap(), p.PublishedPort)] = true
 			}
 		}
 	}
 	return ports, nil
+}
+
+// bindAddr is the one address an L4 route is published on, in the form publishedPorts keys it;
+// empty when on every address (no bind input, an empty one, or an unspecified address).
+func bindAddr(r spec.L4Route, get func(string) string) string {
+	if r.BindInput == "" {
+		return ""
+	}
+	a, err := netip.ParseAddr(get(r.BindInput))
+	if err != nil || a.IsUnspecified() {
+		return ""
+	}
+	return a.Unmap().String()
 }
 
 // FirewallConf is the VM's firewall ruleset, which flushes its own table only.
@@ -1653,6 +1912,9 @@ func (in *Installer) inputList(mode string) []input {
 		check := frontCheck(in.R.Spec.Front, i.Key)
 		if slices.ContainsFunc(in.R.Spec.L4.Routes, func(r spec.L4Route) bool { return r.AddressInput == i.Key }) {
 			check = lint.CheckL4Address
+		}
+		if slices.ContainsFunc(in.R.Spec.L4.Routes, func(r spec.L4Route) bool { return r.BindInput == i.Key }) {
+			check = lint.CheckL4Bind
 		}
 		if slices.ContainsFunc(in.R.Spec.L4.Routes, func(r spec.L4Route) bool { return r.AllowInput == i.Key }) {
 			check = checkSources
@@ -2237,6 +2499,14 @@ func (o *Options) portFree(host string, port int) bool {
 		return o.PortFree(host, port)
 	}
 	return portFree(host, port)
+}
+
+// hostAddrs are the host's addresses (HostAddrs in tests).
+func (o *Options) hostAddrs() []string {
+	if o.HostAddrs != nil {
+		return o.HostAddrs()
+	}
+	return hostAddrs()
 }
 
 func (o *Options) udpPortFree(host string, port int) bool {

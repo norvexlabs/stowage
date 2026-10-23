@@ -62,8 +62,12 @@ front:
       domain_input: INGEST_DOMAIN
       upstream: ingest:8080
       allow_input: INGEST_SOURCES                              # the senders' CIDRs
+    - name: ops
+      domain_input: OPS_DOMAIN
+      upstream: api:9090
+      client_auth: true                                        # a certificate the install's --client-ca issued
   portal: console
-  loopback_ports: { console: 3000, api: 9090, ingest: 8080 }
+  loopback_ports: { console: 3000, api: 9090, ingest: 8080, ops: 9091 }
   loopback_env: { COOKIE_SECURE: "false", TRUSTED_PROXY_HOPS: "0" }
   publish_ca: { volume: ca }                                    # the internal CA, or byo's --ca
   http_port: 80                                                 # the defaults; an install's --http-port
@@ -72,7 +76,7 @@ front:
 # Host ports published to a service as they are, beside the front.
 l4:
   routes:
-    - { name: echo,     protocol: tcp, port: 17007, upstream: echo:17007, address_input: ECHO_ADDRESS }
+    - { name: echo,     protocol: tcp, port: 17007, upstream: echo:17007, address_input: ECHO_ADDRESS, bind_input: ECHO_BIND }
     - { name: echo-udp, protocol: udp, port: 17007, upstream: echo:17007, allow_input: ECHO_SOURCES }   # the VM's firewall
 
 health:
@@ -128,6 +132,7 @@ inputs:
   - { key: AUTH_URI,          prompt: "Path the authentication service is asked at", advanced: true, shapes: [docker, kairos] }
   - { key: LOG_LEVEL,         prompt: "Log level (debug, info, warning)", advanced: true }
   - { key: ECHO_ADDRESS,      prompt: "Host name or address clients dial the echo service at", default: localhost, shapes: [docker, kairos] }
+  - { key: ECHO_BIND,         prompt: "Host address the TCP echo is published on (every address when empty)", advanced: true, shapes: [docker, kairos] }
   - { key: ECHO_SOURCES,      prompt: "Sources (addresses, CIDRs) the VM lets reach the UDP echo", default: "0.0.0.0/0 ::/0", shapes: [kairos] }
   - { key: RELAY_SOURCE,      prompt: "Event source the relay forwards (empty: no relay)", optional: true, profile: relay, shapes: [docker, kairos] }
   # Kubernetes: the database is external or embedded by the chart's postgres.mode value
