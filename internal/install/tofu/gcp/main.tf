@@ -1,6 +1,6 @@
 # One Compute Engine instance of the release: its image's tar.gz uploaded to Cloud Storage, made a
-# UEFI image, and an instance booted from it with the cloud-config as its user-data, and the
-# firewall rules that reach it: SSH from its sources, the ports its own firewall opens. A preview:
+# UEFI image, and an instance booted from it with the cloud-config as its user-data, and, with
+# firewall, the rules that reach it: SSH from its sources, the ports its own firewall opens. A preview:
 # no suite runs it on Google Cloud.
 
 locals {
@@ -15,7 +15,7 @@ locals {
 # The VM's own firewall accepts these sources alone; the network's other rules (the default
 # network's default-allow-ssh) still let others reach it.
 resource "google_compute_firewall" "ssh" {
-  count         = length(local.ssh_sources) > 0 ? 1 : 0
+  count         = var.firewall && length(local.ssh_sources) > 0 ? 1 : 0
   name          = "${local.rule}-ssh"
   description   = var.description
   network       = var.network
@@ -32,7 +32,7 @@ resource "google_compute_firewall" "ssh" {
 # The front's ports and the L4 routes' from every source: a route's allowlist is the VM's own
 # firewall's.
 resource "google_compute_firewall" "ports" {
-  count         = length(local.ports) > 0 ? 1 : 0
+  count         = var.firewall && length(local.ports) > 0 ? 1 : 0
   name          = "${local.rule}-ports"
   description   = var.description
   network       = var.network

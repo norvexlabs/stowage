@@ -343,6 +343,12 @@ Docker shape, 2026-10-24):
 
 ## Could
 
+- **A built-in module's variables checked by type** (review, Low): only Google Cloud's
+  `firewall` is checked (true/false, 1/0) before OpenTofu runs; another built-in bool or number
+  (Azure's `accelerated_networking`) given wrong fails at the apply. Read each variable's `type`
+  from `variables.tf` and check every operator-given value, and refuse a bad answer inside the
+  interactive form (a Check on its question) rather than after it.
+
 - **HSTS `includeSubDomains` opt-out** (security review, Low): the front sends it on every route,
   as the reference deployment does, binding the names under a route's to HTTPS for a year. A spec
   key (`front.hsts_subdomains: false`) for an operator whose route name has other services

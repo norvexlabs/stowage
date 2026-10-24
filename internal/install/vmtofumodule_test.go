@@ -243,18 +243,77 @@ func TestTheGCPModuleIsGivenSSHsSourcesAndTheOpenedPorts(t *testing.T) {
 	if got := fmt.Sprint(vars["open_ports"]); got != "[map[port:80 protocol:tcp] map[port:443 protocol:tcp] map[port:5353 protocol:udp]]" {
 		t.Errorf("open_ports %s", got)
 	}
-	// Every source when told so, the front's ports as the install publishes them.
+	// No firewall rule unless asked: the network's own rules are the operator's to open.
+	if !strings.Contains(v.log.String(), "warning: no firewall rule is made on Google Cloud: the network's own rules must let tcp/22, tcp/80, tcp/443, udp/5353 reach the VM") {
+		t.Errorf("no warning:\n%s", v.log)
+	}
+	// Every source when told so, the front's ports as the install publishes them, the rules asked.
 	v = newVMCreate(t, "gce")
 	r = newTofuRun(t)
 	delete(r.vars, "TRUENAS_URL")
 	r.tofu.outputs = `{"id": {"value": "1"}, "address": {"value": "192.0.2.7"}}`
 	c.SSHAllow = []string{"0.0.0.0/0", "::/0"}
+	c.Vars["firewall"] = "true"
 	if err := v.create(c, r.mod(func(o *Options) { o.HTTPPort, o.HTTPSPort = 8080, 8443 })); err != nil {
 		t.Fatalf("%v\n%s", err, v.log)
 	}
 	vars = readVars(t, filepath.Join(r.state, "notes", "vms", "notes-1"))
 	if got := fmt.Sprint(vars["ssh_sources"], vars["open_ports"]); got != "[0.0.0.0/0 ::/0] [map[port:8080 protocol:tcp] map[port:8443 protocol:tcp]]" {
 		t.Errorf("variables %s", got)
+	}
+	if vars["firewall"] != "true" || strings.Contains(v.log.String(), "no firewall rule") {
+		t.Errorf("firewall %v:\n%s", vars["firewall"], v.log)
+	}
+}
+
+func TestTheGCPModulesFirewallIsOptIn(t *testing.T) {
+	t.Parallel()
+	const off = "warning: no firewall rule is made on Google Cloud"
+	for _, tc := range []struct {
+		name, platform, firewall, warn string
+		allow                          []string
+	}{
+		{"off when told so", "gcp", "false", off, nil},
+		{"off, in OpenTofu's other spelling", "gcp", "0", off, nil},
+		{"on, in OpenTofu's other spelling", "gcp", "1", "", nil},
+		{"on, with IPv4 sources", "gcp", "true", "", []string{"192.0.2.0/24", "2001:db8::/32"}},
+		{"on, with IPv6 sources alone", "gcp", "true", "warning: SSH's sources name no IPv4 address, and Google Cloud's SSH rule takes IPv4 alone", []string{"2001:db8::/32"}},
+		{"a module without it", "aws", "", "", nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			v := newVMCreate(t, "gce", "raw")
+			r := newTofuRun(t)
+			delete(r.vars, "TRUENAS_URL")
+			r.tofu.outputs = `{"id": {"value": "1"}, "address": {"value": "192.0.2.7"}}`
+			c := VMCreate{Platform: tc.platform, Create: CreateTofu, Hostname: "notes-1", User: "ops", Ctl: "/opt/notes-stow", Wait: 5 * time.Second,
+				Vars: map[string]string{"project": "p", "zone": "z", "bucket": "b"}, SSHAllow: tc.allow}
+			if tc.platform == "aws" {
+				c.Vars = map[string]string{"region": "r", "bucket": "b", "subnet_id": "s", "instance_type": "t3.medium"}
+			}
+			if tc.firewall != "" {
+				c.Vars["firewall"] = tc.firewall
+			}
+			if err := v.create(c, r.mod(nil)); err != nil {
+				t.Fatalf("%v\n%s", err, v.log)
+			}
+			if got := v.log.String(); tc.warn == "" && (strings.Contains(got, "warning: no firewall rule") || strings.Contains(got, "name no IPv4 address")) || tc.warn != "" && !strings.Contains(got, tc.warn) ||
+				tc.warn != "" && strings.Count(got, "warning: no firewall rule")+strings.Count(got, "warning: SSH's sources name no IPv4") != 1 {
+				t.Errorf("want %q:\n%s", tc.warn, got)
+			}
+		})
+	}
+	// A value OpenTofu would refuse mid-apply is refused before.
+	v := newVMCreate(t, "gce")
+	r := newTofuRun(t)
+	delete(r.vars, "TRUENAS_URL")
+	c := VMCreate{Platform: "gcp", Create: CreateTofu, Hostname: "notes-1", User: "ops", Ctl: "/opt/notes-stow", Wait: 5 * time.Second,
+		Vars: map[string]string{"project": "p", "zone": "z", "bucket": "b", "firewall": "yes"}}
+	if err := v.create(c, r.mod(nil)); err == nil || err.Error() != "--tofu-var firewall=yes: true or false" {
+		t.Fatalf("err = %v", err)
+	}
+	if len(r.tofu.calls) != 1 {
+		t.Errorf("OpenTofu ran: %v", r.tofu.calls)
 	}
 }
 
@@ -335,17 +394,18 @@ func TestVMCreateWithTheOperatorsModule(t *testing.T) {
 	if _, _, r, err := create(nil); err == nil || !strings.Contains(err.Error(), "the module does not declare description, disk_gib") || len(r.tofu.calls) != 1 {
 		t.Fatalf("%v", err)
 	}
-	write("variables.tf", contract+"variable \"admin_user\" {\n}\n\nvariable \"ssh_public_key\" {\n}\n\nvariable \"subnet\" {\n  description = \"The subnet.\"\n}\n")
+	write("variables.tf", contract+"variable \"admin_user\" {\n}\n\nvariable \"ssh_public_key\" {\n}\n\nvariable \"subnet\" {\n  description = \"The subnet.\"\n}\n\nvariable \"firewall\" {\n  default = \"\"\n}\n")
 	if _, _, _, err := create(nil); err == nil || !strings.Contains(err.Error(), "--tofu-var subnet=<value> is required by the module: The subnet.") {
 		t.Fatalf("%v", err)
 	}
-	_, v, r, err := create(map[string]string{"subnet": "subnet-1"})
+	// The operator's own `firewall` is neither checked nor warned of: only a built-in module's is a bool.
+	_, v, r, err := create(map[string]string{"subnet": "subnet-1", "firewall": "sg-1"})
 	if err != nil {
 		t.Fatalf("%v\n%s", err, v.log)
 	}
 	dir := filepath.Join(r.state, "notes", "vms", "notes-1")
 	vars := readVars(t, dir)
-	if vars["subnet"] != "subnet-1" || vars["admin_user"] != "ops" || !strings.HasPrefix(vars["ssh_public_key"].(string), "ssh-ed25519 ") ||
+	if vars["subnet"] != "subnet-1" || vars["firewall"] != "sg-1" || strings.Contains(v.log.String(), "firewall rule") || vars["admin_user"] != "ops" || !strings.HasPrefix(vars["ssh_public_key"].(string), "ssh-ed25519 ") ||
 		vars["seed"] != filepath.Join(dir, "user-data.yaml") {
 		t.Errorf("variables %v", vars)
 	}

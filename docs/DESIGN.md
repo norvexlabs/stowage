@@ -1090,7 +1090,11 @@ every shape, the VM end-to-end test upgrading through it), then the health gate.
   machine's public address (asked of a plain-text echo service, the one fact it cannot see from
   here behind a NAT), and refuses rather than open SSH to the internet when it cannot learn it.
   A cloud's network firewall is the platform's, in front of the VM's: a module may declare
-  `ssh_sources` and `open_ports` to make one matching the VM's (the GCP module does); the VM's
+  `ssh_sources` and `open_ports` to make one matching the VM's (the GCP module does, behind its
+  `firewall` variable, off by default: creating firewall rules takes a role that may change every
+  rule of the project, which a deployment account is often refused; while it is off, `vm create`
+  warns, naming the ports the network must open; while it is on, the SSH rule takes IPv4 sources
+  alone, as the instance has no IPv6 address, and sources all IPv6 are warned: no rule is made); the VM's
   own stays the one that applies each L4 route's allowlist. An L4 route's
   allowlist cannot live in input — Docker's DNAT sends its traffic through forward — so a forward
   chain of the project's table, ahead of Docker's and accepting by default, drops a DNAT'd

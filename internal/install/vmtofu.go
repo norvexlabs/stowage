@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -386,6 +387,15 @@ func (in *Installer) tofuVM(ctx context.Context, p Platform, t *TofuVM, host str
 			return nil, nil, fmt.Errorf("--tofu-var %s=<value> is required by the module: %s", v.Name, cmp.Or(v.Description, "it has no default"))
 		}
 	}
+	// A built-in module's firewall is a bool OpenTofu would refuse only once the apply started;
+	// its spellings (OpenTofu's: 1 and 0 too) are made true or false, which moduleFirewall reads.
+	if fw, ok := t.Vars["firewall"]; ok && t.Module == "" && declares(declared, "firewall") {
+		on, known := map[string]string{"true": "true", "1": "true", "false": "false", "0": "false"}[fw]
+		if !known {
+			return nil, nil, fmt.Errorf("--tofu-var firewall=%s: true or false", fw)
+		}
+		t.Vars["firewall"] = on
+	}
 	return files, declared, nil
 }
 
@@ -414,6 +424,26 @@ func (in *Installer) openedPorts(st *Settings) []modulePort {
 		ports = append(ports, modulePort{r.Protocol, r.Port})
 	}
 	return ports
+}
+
+// moduleFirewall warns when a built-in module's network firewall leaves out what the VM's opens:
+// with `firewall` off, the network's own rules must let SSH and the opened ports reach it; with
+// it on, SSH's rule takes IPv4 sources alone, so sources all IPv6 make none.
+func (in *Installer) moduleFirewall(p Platform, t *TofuVM, mach Machine, st *Settings, declared []moduleVar) {
+	if t.Module != "" || !declares(declared, "firewall") {
+		return
+	}
+	if t.Vars["firewall"] == "true" {
+		if len(mach.SSHAllow) > 0 && !slices.ContainsFunc(mach.SSHAllow, func(a netip.Prefix) bool { return a.Addr().Is4() }) {
+			in.O.logf("warning: SSH's sources name no IPv4 address, and %s's SSH rule takes IPv4 alone: none is made, so the network's own rules must let tcp/22 reach the VM (--ssh-allow with an IPv4 source makes it)", p.Label)
+		}
+		return
+	}
+	open := []string{"tcp/22"}
+	for _, o := range in.openedPorts(st) {
+		open = append(open, fmt.Sprintf("%s/%d", o.Protocol, o.Port))
+	}
+	in.O.logf("warning: no firewall rule is made on %s: the network's own rules must let %s reach the VM (its own firewall then narrows them); --tofu-var firewall=true makes them, if the account may create firewall rules", p.Label, strings.Join(open, ", "))
 }
 
 // applyVM writes the module into dir with its variables, and the platform it was made for, then
@@ -463,6 +493,7 @@ func (in *Installer) applyVM(ctx context.Context, dir, ctl string, p Platform, m
 	for k, v := range t.Vars {
 		vars[k] = v
 	}
+	in.moduleFirewall(p, t, mach, st, declared)
 	// The platform first: a state with variables is one `vm destroy` must know the platform of.
 	how := "module"
 	if t.Module == "" {

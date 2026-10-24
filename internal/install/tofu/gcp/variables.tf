@@ -83,6 +83,12 @@ variable "nic_type" {
   }
 }
 
+variable "firewall" {
+  description = "Make the firewall rules reaching the instance (SSH from ssh_sources, open_ports from every source): the account must be allowed to create firewall rules."
+  type        = bool
+  default     = false
+}
+
 variable "ssh_sources" {
   description = "The sources SSH accepts, as CIDR: --ssh-allow's, or this machine's public address."
   type        = list(string)

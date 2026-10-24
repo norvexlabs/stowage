@@ -41,8 +41,9 @@ follow [SemVer](https://semver.org/).
 - **A cloud's VM takes SSH from this machine alone by default**: `vm create` on AWS, Azure or
   Google Cloud without `--ssh-allow` lets SSH in from this machine's public address only (it used
   to accept every source on the VM's public address); `--ssh-allow 0.0.0.0/0,::/0` keeps every
-  source. Google Cloud's module also makes firewall rules for SSH's sources and for the front's
-  and the L4 routes' ports, which a network without them used to block.
+  source. Google Cloud's module makes firewall rules for SSH's sources and for the front's and
+  the L4 routes' ports with `--tofu-var firewall=true` (the account must be allowed to create
+  firewall rules); without it `vm create` warns which ports the network's own rules must open.
 - **`ship` and `promote` print the installer by digest**, with the `cosign verify` that checks it
   before an operator runs it (or say the release is not signed): a first install trusts the
   installer it runs, and a digest is what a tag cannot be moved under.
