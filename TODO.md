@@ -101,7 +101,103 @@ Shoulds it found are under Should:
     for every other service. With it, a CPU set per service (compose `cpuset`, the VM's and the
     chart's equivalent): an unpinned service shares its cores with the rest of the stack.
 
+### Network appliances — a stack between networks
+
+A stack whose service sits between networks (routes, filters or intercepts traffic for the
+hosts behind it) rather than serving on one: today only its explicit form fits (clients name it
+as their proxy, one interface, an L4 route), and that form needs 10. The transparent form needs
+the following on a Kairos host, bare metal first (after the bare-metal slice: the ISO and its
+install block, the metal platform, NICs named by MAC); the VM where it applies; on a Docker host,
+whose kernel is the operator's, `tune` reports what is missing and sets nothing.
+
+11. **More than one interface**: the VM has one NIC. An appliance has a client side and an
+    upstream side (and often a management one): `shapes.kairos` declares named interfaces (role,
+    addressing: DHCP / static / none, MTU), `vm create` and the OpenTofu modules attach one NIC
+    per role on the named network, and the stack's spec names which role an L4 route or the front
+    listens on. The VM's firewall, `allow_input` and the front judge per interface.
+12. **Firewall rules a service declares, in the host's ruleset**: interception and the
+    appliance's egress floor are host rules (nftables: a TPROXY / redirect of the client side's
+    TCP to the service's port, a forward chain that default-denies what the service cannot
+    inspect, DNS sent to the stack's resolver, UDP 443 rejected), which a container cannot own.
+    The spec declares a ruleset fragment per service (a table of its own, its named sets fed by the
+    service), Stowage loads it at boot before the service starts, removes it with the service, and
+    lint checks it parses and touches only its own table; routing and `ip_forward` with it, on the
+    interfaces 11 names. The host's own firewall stays Stowage's.
+13. **Host tuning a service asks for**: the `network` profile tunes the host as a whole. An
+    appliance places work: the NIC queues' interrupts and RPS/XPS off the service's CPU set (or on
+    it, by the service's choice), the queue count — one per core, which a driver may refuse:
+    Intel's E810 (`ice`) answers every `ethtool -L` with EBUSY ("Cannot change channels when RDMA
+    is active") while `irdma` is bound to the port's `ice.roce.N` auxiliary device, leaving a 100G
+    port at 8 queues on a 16-core host; a project that uses no RDMA declares `block: irdma` (16) —
+    kernel arguments, modules (16), and sysctls past the container-namespaced set. The spec
+    declares them per service or per host; the host's boot applies them before the service starts,
+    and `tune` reports a host that lacks them (the warnings the service logs at its start are the
+    list to meet). The host then:
+    - **Kernel command line**: IOMMU passthrough, `iommu=pt` (`iommu.passthrough=1` on arm64), in
+      the Kairos install's GRUB options: DMA remapping maps and unmaps every NIC buffer with a
+      cache flush, several percent of CPU under a throughput load on a small host. Written only
+      where an IOMMU is active (none on most cloud VMs: nothing to write); a boot that fails with it
+      falls back to the passive system as any other; an opt-out for hosts with untrusted PCIe
+      devices (passthrough leaves a host-owned device unconfined). Effective at the next boot,
+      said so.
+    - **CPU power**: 15.
+    - **Modules at boot**: those the project declares (16), e.g. `tcp_bbr` and `nf_conntrack`.
+    - **Conntrack sized from RAM**: `nf_conntrack_max` ~300 B of unswappable memory per entry
+      (512 MB → ~89k, 4 GB → ~715k, capped at 1,048,576 from ~6 GB) and the hash buckets at a
+      quarter of it (both directions inserted: mean chain 8; the kernel's own 4,096 buckets on a
+      512 MB box make it 512).
+    - **NICs**: each offload set on its own and only where the driver reports it changeable (one
+      `[fixed]` knob in a combined `ethtool -K` rejects them all — ENA), rings at the device's own
+      pre-set maximums (never a constant: ENA's TX caps at 1024), one combined queue per core with
+      RSS spread equally over the CPUs the host allows the appliance (the E810 case above: its
+      queues stay at 8 unless `irdma` is blocked).
+14. **An upgrade that keeps the listening sockets**: an appliance's clients cannot be told to
+    retry, and a container's replacement drops every connection and refuses new ones until the
+    new one listens. The service hands its listening sockets to its successor (systemd socket
+    passing, or the app's own handoff over a Unix socket: old and new running side by side, the
+    old draining). Stowage's upgrade starts the new container beside the old one on the host's
+    network with the handoff socket shared, waits for the old one to exit, and keeps the rollback.
+15. **Power management, a declared posture that survives the reboot**: `tune --apply` sets the
+    governor on the running Docker host only (a reboot loses it: the Should on the `network`
+    profile's interrupts and governor), the VM's boot sets it each time, and nothing stops another
+    writer from undoing it. An appliance declares its posture — `performance` (every core held at
+    its maximum) or `platform` (the kernel's and firmware's own policy, nothing written) — and
+    Stowage keeps it on every shape it owns the host of. Under `performance`, applied at install
+    and again by a boot unit (sysfs is not on disk):
+    - every core on the `performance` governor, its energy preference (EPP) `performance` where the
+      driver exposes one, its frequency floor raised to its ceiling
+      (`intel_pstate/min_perf_pct=100`, which also keeps thermald from throttling below it; the
+      firmware's own power and thermal limits still apply);
+    - **one writer**: `power-profiles-daemon` (on every Ubuntu Desktop) and `tuned` each
+      re-assert their own profile (`powersave`, `balance_performance`) over another writer's, so
+      both are stopped and masked under `performance` and given back under `platform`; the log
+      says when one of them re-applies its profile as it starts;
+    - a host with no `cpufreq` (most VMs: the hypervisor owns frequency) is told there is nothing
+      to set, never failed — the posture is then the hypervisor host's to apply, and `tune` says so;
+    - the cost stated, no gain claimed: power and heat, and a fanless box held at its turbo
+      frequency can meet its power or thermal limit sooner under a sustained load.
+    Not reached today, and part of this item: idle states (where a cpuidle driver is bound, a
+    service-held PM QoS `/dev/cpu_dma_latency` request or per-state `disable` bounds the wake-up
+    latency; where none is bound, only the firmware's setup menu does, which `tune` can only
+    report), and a NIC's Energy Efficient Ethernet and PCIe ASPM, which trade latency for watts the
+    same way.
+16. **Kernel modules a project declares**: `shapes.kairos.modules` in the project's own
+    `stowage.yaml`, each entry with a `reason` — `load` (`/etc/modules-load.d`), `block` (a
+    `blacklist` and an `install <name> /bin/false`, so neither a dependency nor udev loads it) and
+    `options` (`/etc/modprobe.d`, `name` and `value`). The OS bundle carries the files, so they hold
+    from the first boot, before a driver binds (a boot stage would come too late for one the
+    initramfs loads). `lint` checks each name and option, refuses a module both loaded and
+    blocked, and asks for a reason; `tune` reports a blocked module still loaded, a loaded one
+    missing, an option the running module does not hold, each with its reason. No hardware
+    condition: a block of a module the host lacks does nothing. Stowage declares none of its own;
+    `examples/full` shows the key.
+
 ## Should
+
+- **A driver's RDMA freed per port** (from Must 13): blocking `irdma` (Must 16) takes RDMA off
+  every port of the host. A port that uses none could instead have its `ice.roce.N` auxiliary
+  device unbound only on `ethtool -L`'s EBUSY, logged, and again at each boot, keeping RDMA on
+  the others; a device-level action, not a module's setting.
 
 - **`lint` names the `kairos_init` release the bundle accepts**: the OS bundle's build refuses a
   kairos-init whose `08_grub.yaml` is not the one Stowage's copy is derived from, minutes into
