@@ -27,10 +27,15 @@ type Machine struct {
 	// included, as IPv6 is off unless Net turns it on, and as data (InstallNetworkFile) for the
 	// host daemon to answer.
 	Net NetConfig
-	// SSHAllow are the sources SSH accepts; none is every source.
-	SSHAllow []netip.Prefix
+	// SSHAllow are the sources SSH accepts; none is every source. publicSSH: they are this
+	// machine's public address alone, as a server on the internet saw it (a cloud's default).
+	SSHAllow  []netip.Prefix
+	publicSSH bool
 	// Timezone is an IANA zone name; empty keeps the OS's, UTC.
 	Timezone string
+	// HostKey is a one-time SSH host key (an OpenSSH private key) the VM serves until its first
+	// install, which `vm create --secrets` pins to send the secrets; nil for none.
+	HostKey []byte
 }
 
 // staticAddr is the VM's static IPv4 address, without its prefix; empty with DHCP.
@@ -68,6 +73,7 @@ type cloudConfig struct {
 
 type stage struct {
 	Name     string               `yaml:"name"`
+	If       string               `yaml:"if,omitempty"` // a shell test: the step runs when it holds
 	Hostname string               `yaml:"hostname,omitempty"`
 	Users    map[string]cloudUser `yaml:"users,omitempty"`
 	Files    []cloudFile          `yaml:"files,omitempty"`
@@ -94,7 +100,9 @@ type cloudFile struct {
 // both at every boot; and the first install's settings (SettingsFile), which the boot
 // installs from. With ca, the CA of the registry the settings name (a mirror's) goes to
 // VMRegistryCA and into the VM's trust store, at every boot, before the install reads it. ctl is
-// the installer its comments and console banner name. It carries no secret.
+// the installer its comments and console banner name. It carries no secret, but for
+// m.HostKey: written, while the install does not exist and the key was never retired, to a file under /run (gone at the next
+// boot) that a drop-in of sshd names first, then the system's own keys (seedHostKeyFiles).
 func UserData(name, ctl string, m Machine, st Settings, ca []byte) ([]byte, error) {
 	settings, err := yaml.Marshal(st)
 	if err != nil {
@@ -173,6 +181,27 @@ func UserData(name, ctl string, m Machine, st Settings, ca []byte) ([]byte, erro
 		},
 		Commands: []string{"networkctl reload"},
 	})
+	if m.HostKey != nil {
+		key, dropIn, retired := seedHostKeyFiles(name)
+		before := "[ ! -e " + VMDir(name) + "/" + envName + " ] && [ ! -e " + retired + " ]"
+		boot = append(boot, stage{
+			Name: name + ": the one-time SSH host key, until the install",
+			If:   before,
+			Files: []cloudFile{
+				{Path: key, Permissions: 0o600, Content: string(m.HostKey)},
+				{Path: dropIn, Permissions: 0o644, Content: "# The one-time host key `" + ctl + " vm create` pins, served until the install.\nHostKey " + key + "\nHostKey /etc/ssh/ssh_host_ed25519_key\nHostKey /etc/ssh/ssh_host_ecdsa_key\nHostKey /etc/ssh/ssh_host_rsa_key\n"},
+			},
+		}, stage{
+			// A step of its own, after the one that writes the files; an sshd not started yet reads them.
+			Name:     name + ": sshd with the one-time host key",
+			If:       before,
+			Commands: []string{sshdReload},
+		}, stage{
+			Name:     name + ": the one-time SSH host key retired after the install",
+			If:       "[ -e " + VMDir(name) + "/" + envName + " ] && [ ! -e " + retired + " ]",
+			Commands: []string{"rm -f " + dropIn + " " + key + " && touch " + retired + " && " + sshdReload},
+		})
+	}
 	// The host name is set in the initramfs stage, before networkd starts: its DHCP request then
 	// carries it, and a DHCP server registering names registers this one.
 	initramfs := []stage{{Name: name + ": the host name", Hostname: m.Hostname}}
@@ -180,9 +209,24 @@ func UserData(name, ctl string, m Machine, st Settings, ca []byte) ([]byte, erro
 	if err != nil {
 		return nil, err
 	}
-	head := fmt.Sprintf("#cloud-config\n# %s's VM %s, written by `%s vm create`. It carries no secret.\n", name, m.Hostname, ctl)
+	carries := "It carries no secret."
+	if m.HostKey != nil {
+		carries = "It carries no secret but a one-time SSH host key, served until the install."
+	}
+	head := fmt.Sprintf("#cloud-config\n# %s's VM %s, written by `%s vm create`. %s\n", name, m.Hostname, ctl, carries)
 	return append([]byte(head), out...), nil
 }
+
+// seedHostKeyFiles are, on the VM, the one-time host key's file, the sshd drop-in naming it, and
+// the mark of its retirement on the OEM partition, which a reset keeps and every system mounts:
+// no boot serves the key past it, not one whose install is gone, nor the recovery system's.
+func seedHostKeyFiles(name string) (key, dropIn, retired string) {
+	return "/run/" + name + "-seed-host-key", "/etc/ssh/sshd_config.d/01-" + name + "-seed-host-key.conf", "/oem/" + name + "-seed-host-key.retired"
+}
+
+// sshdReload makes a running sshd read its configuration again (Debian's unit is ssh.service,
+// others' sshd.service); one not running reads it when it starts.
+const sshdReload = "for u in ssh.service sshd.service; do systemctl try-reload-or-restart $u 2>/dev/null; done; true"
 
 // SSHRules is the firewall's SSH rule file on the VM: the bundle's opens SSH to every source, and
 // a cloud-config with Machine.SSHAllow replaces it.
@@ -214,11 +258,11 @@ func MetaData(m Machine) []byte {
 // for.
 const SeedVolume = "cidata"
 
-// WriteSeedISO writes a NoCloud seed at path, 0644 (a hypervisor running as its own user reads
-// it; it carries no secret): an ISO 9660 image (Rock Ridge and Joliet names)
+// WriteSeedISO writes a NoCloud seed at path, of mode (0644: a hypervisor running as its own user
+// reads it, when it carries no secret): an ISO 9660 image (Rock Ridge and Joliet names)
 // labelled SeedVolume, holding user-data and meta-data, which a hypervisor attaches as a CD-ROM.
 // The file is the sectors the volume declares, then seedPad sectors of zeros: VMware Workstation's CD-ROM reads no image that ends short of a whole sector.
-func WriteSeedISO(path string, userData, metaData []byte) (err error) {
+func WriteSeedISO(path string, userData, metaData []byte, mode os.FileMode) (err error) {
 	dir := filepath.Dir(path)
 	work, err := os.MkdirTemp(dir, ".seed-*")
 	if err != nil {
@@ -226,11 +270,11 @@ func WriteSeedISO(path string, userData, metaData []byte) (err error) {
 	}
 	defer os.RemoveAll(work)
 	tmp := filepath.Join(work, "seed.iso")
-	f, err := os.OpenFile(tmp, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o644)
+	f, err := os.OpenFile(tmp, os.O_RDWR|os.O_CREATE|os.O_EXCL, mode)
 	if err != nil {
 		return err
 	}
-	if err := f.Chmod(0o644); err != nil { // whatever the umask
+	if err := f.Chmod(mode); err != nil { // whatever the umask
 		f.Close()
 		return err
 	}

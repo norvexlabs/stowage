@@ -495,6 +495,20 @@ func (l *linter) stack() {
 				l.warnf(w+".network_mode", "host: the service listens on the host past Stowage, which neither checks nor lists its ports: publish them with l4.routes")
 			}
 		}
+		// Not refused: a stack may need one (a VPN's NET_ADMIN). Each makes a compromise of the
+		// service one of the host.
+		if b, _ := svc.Privileged.(bool); b || privilegedText(svc.Privileged) {
+			l.warnf(w+".privileged", "true: the container holds every power of the host's root, its devices included; a compromise of the service is the host's")
+		}
+		if caps := joinCaps(svc.CapAdd); caps != "" {
+			l.warnf(w+".cap_add", "%s: powers of the host's root beyond Docker's defaults; give the fewest the service needs", caps)
+		}
+		if svc.Pid == "host" {
+			l.warnf(w+".pid", "host: the service sees and signals every process of the host")
+		}
+		if MountsDockerSocket(svc.Volumes) {
+			l.warnf(w+".volumes", "the Docker socket is mounted, or a directory holding it: the service drives the host's engine, so holds the host")
+		}
 		for _, p := range svc.Profiles {
 			if !slices.Contains(l.s.Profiles(), p) {
 				l.errf(w+".profiles", "no input turns %s on: name it in an input's profile:, or remove it (no install ever starts this service)", p)

@@ -3,6 +3,7 @@ package install
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -10,6 +11,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/norvexlabs/stowage/internal/spec"
 )
 
 // Every built-in module holds the contract: it declares the contract's variables, outputs id and
@@ -214,6 +217,44 @@ func TestVMCreateWithABuiltInPreviewModule(t *testing.T) {
 	}
 	if title := p.forms[0].Questions[0].Title; !strings.Contains(title, "on Proxmox VE") {
 		t.Errorf("asked %q", title)
+	}
+}
+
+func TestTheGCPModuleIsGivenSSHsSourcesAndTheOpenedPorts(t *testing.T) {
+	t.Parallel()
+	v := newVMCreate(t, "gce")
+	v.r.Spec.L4.Routes = append(v.r.Spec.L4.Routes, spec.L4Route{Name: "dns", Protocol: "udp", Port: 5353})
+	r := newTofuRun(t)
+	delete(r.vars, "TRUENAS_URL")
+	r.tofu.outputs = `{"id": {"value": "1"}, "address": {"value": "192.0.2.7"}}`
+	c := VMCreate{Platform: "gcp", Create: CreateTofu, Hostname: "notes-1", User: "ops", Ctl: "/opt/notes-stow", Wait: 5 * time.Second,
+		Vars: map[string]string{"project": "p", "zone": "z", "bucket": "b"}}
+	if err := v.create(c, r.mod(nil)); err != nil {
+		t.Fatalf("%v\n%s", err, v.log)
+	}
+	vars := readVars(t, filepath.Join(r.state, "notes", "vms", "notes-1"))
+	if got := fmt.Sprint(vars["ssh_sources"]); got != "[198.51.100.40/32]" {
+		t.Errorf("ssh_sources %s", got)
+	}
+	// The public address is no route's source behind a NAT: not compared with it.
+	if strings.Contains(v.log.String(), "--ssh-allow leaves out") {
+		t.Errorf("warned:\n%s", v.log)
+	}
+	if got := fmt.Sprint(vars["open_ports"]); got != "[map[port:80 protocol:tcp] map[port:443 protocol:tcp] map[port:5353 protocol:udp]]" {
+		t.Errorf("open_ports %s", got)
+	}
+	// Every source when told so, the front's ports as the install publishes them.
+	v = newVMCreate(t, "gce")
+	r = newTofuRun(t)
+	delete(r.vars, "TRUENAS_URL")
+	r.tofu.outputs = `{"id": {"value": "1"}, "address": {"value": "192.0.2.7"}}`
+	c.SSHAllow = []string{"0.0.0.0/0", "::/0"}
+	if err := v.create(c, r.mod(func(o *Options) { o.HTTPPort, o.HTTPSPort = 8080, 8443 })); err != nil {
+		t.Fatalf("%v\n%s", err, v.log)
+	}
+	vars = readVars(t, filepath.Join(r.state, "notes", "vms", "notes-1"))
+	if got := fmt.Sprint(vars["ssh_sources"], vars["open_ports"]); got != "[0.0.0.0/0 ::/0] [map[port:8080 protocol:tcp] map[port:8443 protocol:tcp]]" {
+		t.Errorf("variables %s", got)
 	}
 }
 

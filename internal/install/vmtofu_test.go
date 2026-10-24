@@ -70,6 +70,9 @@ type fakeSSH struct {
 	calls   [][]string
 	stdin   []string // what each call was given on its standard input
 	answers []func() ([]byte, error)
+	// served is the host key a pinned call (StrictHostKeyChecking=yes) finds: the pinned file's
+	// when empty, as a VM serving its cloud-config's key does.
+	served string
 }
 
 func (f *fakeSSH) Run(_ context.Context, c Cmd) ([]byte, error) {
@@ -86,6 +89,18 @@ func (f *fakeSSH) Run(_ context.Context, c Cmd) ([]byte, error) {
 	// reach the last one's). As accept-new does: the key taken into the known hosts file when it
 	// holds none, and refused when it holds another.
 	i := min(len(f.calls), len(f.answers)) - 1
+	if slices.Contains(c.Args, "StrictHostKeyChecking=yes") {
+		for _, a := range c.Args {
+			if p, ok := strings.CutPrefix(a, "UserKnownHostsFile="); ok {
+				b, err := os.ReadFile(strings.Trim(p, `"`))
+				alias, key, _ := strings.Cut(strings.TrimSpace(string(b)), " ")
+				if err != nil || !slices.Contains(c.Args, "HostKeyAlias="+alias) || f.served != "" && key != f.served {
+					return nil, errors.New("Host key verification failed.")
+				}
+			}
+		}
+		return f.answers[i]()
+	}
 	key := fmt.Sprintf("host key %d\n", i+1)
 	for _, a := range c.Args {
 		if p, ok := strings.CutPrefix(a, "UserKnownHostsFile="); ok {
@@ -456,8 +471,10 @@ func TestVMCreateWithOpenTofuGivesTheSecretsOverSSH(t *testing.T) {
 	v := newVMCreate(t, "qcow2")
 	v.r.Spec.Inputs = append(v.r.Spec.Inputs, spec.Input{Key: "API_KEY", Prompt: "API key", Secret: true, Required: true})
 	r := newTofuRun(t)
-	// The install's call reaches the system that answered last (the same host key).
-	r.ssh.answers = []func() ([]byte, error){refused, statusIn("recovery", false), statusJSON(false)}
+	// Every system serves the cloud-config's one-time host key; the last call reads the VM's own.
+	const own = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMttF2bIpr7R386X4GUm0TkSzgnDFwXOzWeDxQGI7oDJ"
+	r.ssh.answers = []func() ([]byte, error){refused, statusIn("recovery", false), statusJSON(false), statusJSON(false),
+		func() ([]byte, error) { return []byte(own + " root@notes-1\n"), nil }}
 	plain := "project: notes\nsecrets:\n  SESSION_SECRET: kept\n  API_KEY: k\n"
 	c := tofuCreate()
 	c.Secrets = []byte(plain)
@@ -465,16 +482,43 @@ func TestVMCreateWithOpenTofuGivesTheSecretsOverSSH(t *testing.T) {
 		t.Fatalf("%v\n%s", err, v.log)
 	}
 	// The VM answers, waiting: the secrets go over SSH, the API_KEY among them, never in the
-	// cloud-config.
-	if len(r.ssh.calls) != 4 || r.ssh.stdin[3] != plain || !strings.HasSuffix(strings.Join(r.ssh.calls[3], " "), "ops@notes-1.lan -- sudo systemctl start notes.service && sudo notes-stow install --secrets - --no-input") {
+	// cloud-config, each call pinned to the host key the cloud-config carries.
+	dir := filepath.Join(r.state, "notes", "vms", "notes-1")
+	if len(r.ssh.calls) != 5 || r.ssh.stdin[3] != plain || !strings.HasSuffix(strings.Join(r.ssh.calls[3], " "), "ops@notes-1.lan -- sudo systemctl start notes.service && sudo notes-stow install --secrets - --no-input") ||
+		!strings.Contains(strings.Join(r.ssh.calls[4], " "), "-- cat /etc/ssh/ssh_host_ed25519_key.pub && sudo rm -f /etc/ssh/sshd_config.d/01-notes-seed-host-key.conf /run/notes-seed-host-key && sudo touch /oem/notes-seed-host-key.retired && ") {
 		t.Fatalf("ssh %v", r.ssh.calls)
 	}
-	seed, _, _ := readSeed(t, filepath.Join(r.state, "notes", "vms", "notes-1", "seed.iso"))
+	for _, call := range r.ssh.calls {
+		if !slices.Contains(call, "StrictHostKeyChecking=yes") || slices.Contains(call, "StrictHostKeyChecking=accept-new") {
+			t.Errorf("not pinned: %v", call)
+		}
+	}
+	seed, _, _ := readSeed(t, filepath.Join(dir, "seed.iso"))
 	if st, _ := cloudSettings(t, seed); !st.AwaitSecrets || strings.Contains(seed, "kept") || strings.Contains(seed, "API_KEY") {
 		t.Errorf("seed:\n%s", seed)
 	}
-	if !strings.Contains(v.out2(), "The VM notes-1 runs notes 1.0.0") {
-		t.Errorf("out:\n%s", v.out2())
+	if fi, err := os.Stat(filepath.Join(dir, "seed.iso")); err != nil || fi.Mode().Perm() != 0o600 {
+		t.Errorf("the seed holding the host key: %v %v", fi.Mode(), err)
+	}
+	// The VM's own key, read through the pinned one, is what is known of it after.
+	if b, err := os.ReadFile(filepath.Join(dir, "known_hosts")); err != nil || string(b) != "notes-1.lan "+own+"\n" {
+		t.Errorf("known_hosts: %q %v", b, err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "known_hosts.seed")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("the pin stays: %v", err)
+	}
+	if out := v.out2(); !strings.Contains(out, "The VM notes-1 runs notes 1.0.0") || !strings.Contains(out, "SHA256:L5LQSq6nk+/aMtE/vRjUwQNn83u49Fsd5kmL2j7/D0I (ED25519)") {
+		t.Errorf("out:\n%s", out)
+	}
+	// A VM serving another key is never given the secrets.
+	v = newVMCreate(t, "qcow2")
+	v.r.Spec.Inputs = append(v.r.Spec.Inputs, spec.Input{Key: "API_KEY", Prompt: "API key", Secret: true, Required: true})
+	r = newTofuRun(t)
+	r.ssh.answers, r.ssh.served = []func() ([]byte, error){statusJSON(false)}, own
+	bad := c
+	bad.Wait = 50 * time.Millisecond
+	if err := v.create(bad, r.mod(nil)); err == nil || !strings.Contains(err.Error(), "Host key verification failed.") || slices.Contains(r.ssh.stdin, plain) {
+		t.Errorf("err = %v, stdin %q", err, r.ssh.stdin)
 	}
 	// Another project's file is refused before anything is made.
 	v = newVMCreate(t, "qcow2")

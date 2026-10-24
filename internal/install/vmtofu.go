@@ -397,10 +397,29 @@ func (in *Installer) tofu(ctx context.Context, dir, ctl string, args ...string) 
 	return err
 }
 
+// modulePort is a port the VM's firewall opens to some source, for a module's own firewall.
+type modulePort struct {
+	Protocol string `json:"protocol"` // tcp or udp
+	Port     int    `json:"port"`
+}
+
+// openedPorts are the ports the VM's firewall opens besides SSH: the front's, and each L4
+// route's, whose allowlist the VM's firewall alone applies.
+func (in *Installer) openedPorts(st *Settings) []modulePort {
+	ports := []modulePort{}
+	if in.R.Spec.HasFront() {
+		ports = append(ports, modulePort{"tcp", cmp.Or(st.HTTPPort, in.R.Spec.Front.HTTPPort, 80)}, modulePort{"tcp", cmp.Or(st.HTTPSPort, in.R.Spec.Front.HTTPSPort, 443)})
+	}
+	for _, r := range in.R.Spec.L4.Routes {
+		ports = append(ports, modulePort{r.Protocol, r.Port})
+	}
+	return ports
+}
+
 // applyVM writes the module into dir with its variables, and the platform it was made for, then
 // applies it: the VM is created, its disk written from image, its seed attached, and it is
 // started. It returns the module's outputs: the VM's id, and its address when the platform tells.
-func (in *Installer) applyVM(ctx context.Context, dir, ctl string, p Platform, mach Machine, t *TofuVM, files map[string][]byte, declared []moduleVar, image, format, imageSHA, seed string) (id, addr string, err error) {
+func (in *Installer) applyVM(ctx context.Context, dir, ctl string, p Platform, mach Machine, st *Settings, t *TofuVM, files map[string][]byte, declared []moduleVar, image, format, imageSHA, seed string) (id, addr string, err error) {
 	seedSHA, err := truenas.SHA256File(seed)
 	if err != nil {
 		return "", "", err
@@ -428,6 +447,17 @@ func (in *Installer) applyVM(ctx context.Context, dir, ctl string, p Platform, m
 			vars[v.Name] = mach.User
 		case "ssh_public_key":
 			vars[v.Name] = mach.SSHKey
+		case "ssh_sources":
+			src := []string{"0.0.0.0/0", "::/0"}
+			if len(mach.SSHAllow) > 0 {
+				src = nil
+				for _, a := range mach.SSHAllow {
+					src = append(src, a.String())
+				}
+			}
+			vars[v.Name] = src
+		case "open_ports":
+			vars[v.Name] = in.openedPorts(st)
 		}
 	}
 	for k, v := range t.Vars {
@@ -457,8 +487,13 @@ func (in *Installer) applyVM(ctx context.Context, dir, ctl string, p Platform, m
 // prompt), with the private key next to the public one given when there is one, and the host key
 // taken on first contact into the file known, apart from the operator's known hosts.
 func sshArgs(known, user, addr, pubKey string, command ...string) []string {
+	return sshArgsChecking("accept-new", known, user, addr, pubKey, command...)
+}
+
+// sshArgsChecking are sshArgs with ssh's StrictHostKeyChecking set to checking.
+func sshArgsChecking(checking, known, user, addr, pubKey string, command ...string) []string {
 	// Quoted: ssh splits an option's value at white space, into several files.
-	args := []string{"-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=accept-new",
+	args := []string{"-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=" + checking,
 		"-o", `UserKnownHostsFile="` + known + `"`}
 	if priv, ok := strings.CutSuffix(expandHome(pubKey), ".pub"); ok {
 		if _, err := os.Stat(priv); err == nil {
@@ -468,12 +503,22 @@ func sshArgs(known, user, addr, pubKey string, command ...string) []string {
 	return append(append(args, user+"@"+addr, "--"), command...)
 }
 
+// seedHostAlias is the name a pinned known_hosts file gives the VM's one-time host key.
+const seedHostAlias = "vm-seed-host-key"
+
+// pinnedSSHArgs are sshArgs, the VM's host key checked against the file pin's alone (its line
+// names seedHostAlias): ssh refuses any other, never adding one.
+func pinnedSSHArgs(pin, user, addr, pubKey string, command ...string) []string {
+	return append([]string{"-o", "HostKeyAlias=" + seedHostAlias}, sshArgsChecking("yes", pin, user, addr, pubKey, command...)...)
+}
+
 // awaitVM waits, up to wait, until `<short>-stow status --json` on the VM at addr answers from a
 // system that is not Kairos's recovery and — unless the install waits for a secret input —
 // reports the install. A first boot runs the recovery system, then resets and reboots into the
 // active one, each with its own SSH host key: every attempt takes the key into a file of its own,
-// and the VM's known_hosts in dir is the one of the attempt that answered.
-func (in *Installer) awaitVM(ctx context.Context, dir, user, addr, pubKey string, wait time.Duration, installs bool) error {
+// and the VM's known_hosts in dir is the one of the attempt that answered. With pin, a known_hosts
+// file of the host key the VM serves (pinnedSSHArgs), every attempt takes that key alone.
+func (in *Installer) awaitVM(ctx context.Context, dir, pin, user, addr, pubKey string, wait time.Duration, installs bool) error {
 	o, ctl := &in.O, in.R.Ctl()
 	if o.SSH == nil {
 		return errors.New("ssh is not available to this run")
@@ -487,7 +532,11 @@ func (in *Installer) awaitVM(ctx context.Context, dir, user, addr, pubKey string
 		if err := os.Remove(attempt); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return err
 		}
-		out, err := o.SSH.Run(ctx, Cmd{Args: sshArgs(attempt, user, addr, pubKey, ctl, "status", "--json")})
+		args := sshArgs(attempt, user, addr, pubKey, ctl, "status", "--json")
+		if pin != "" {
+			args = pinnedSSHArgs(pin, user, addr, pubKey, ctl, "status", "--json")
+		}
+		out, err := o.SSH.Run(ctx, Cmd{Args: args})
 		if err == nil {
 			var st Status
 			if err = json.Unmarshal(out, &st); err == nil {

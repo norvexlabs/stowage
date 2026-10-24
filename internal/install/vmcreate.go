@@ -182,7 +182,7 @@ func (in *Installer) CreateVM(ctx context.Context, c *VMCreate) error {
 	} else if c.Host != "" || c.Wait != 0 || c.Name != "" || c.Pool != "" || c.Dataset != "" || c.Bridge != "" || c.CPUs != 0 || c.MemoryMiB != 0 || c.DiskGiB != 0 || len(c.Vars) > 0 {
 		return fmt.Errorf("--host, --wait, --vm-name, --pool, --dataset, --bridge, --cpus, --memory, --disk and --tofu-var are for --create %s", CreateTofu)
 	}
-	mach, err := in.machine(ctx, c)
+	mach, err := in.machine(ctx, c, p)
 	if err != nil {
 		return err
 	}
@@ -248,20 +248,29 @@ func (in *Installer) CreateVM(ctx context.Context, c *VMCreate) error {
 			seed = filepath.Join(state, "seed.iso")
 		}
 		addr = cmp.Or(c.Host, mach.staticAddr(), mach.Hostname)
-		in.sshAllows(addr, mach.SSHAllow)
+		in.sshAllows(addr, mach)
 		if a6 := mach.staticAddr6(); c.Host == "" && a6 != "" {
-			in.sshAllows(a6, mach.SSHAllow) // ssh to the VM's name may take it
+			in.sshAllows(a6, mach) // ssh to the VM's name may take it
 		}
 	} else if _, err := os.Lstat(seed); err == nil { // a seed may already be attached to a VM: never replaced
 		return fmt.Errorf("%s exists: move it away, or give the VM another --hostname or --out", seed)
 	}
 	for _, a := range []string{mach.staticAddr(), mach.staticAddr6()} {
 		if !tofu && a != "" {
-			in.sshAllows(a, mach.SSHAllow)
+			in.sshAllows(a, mach)
 		}
 	}
 	if err := in.confirmVM(ctx, p, format, mach, st, seed, c, addr); err != nil {
 		return err
+	}
+	// The secrets go over SSH to a host key known beforehand: one generated here, which the
+	// cloud-config carries and the VM serves until its install.
+	var hostKey *seedHostKey
+	if st.AwaitSecrets {
+		if hostKey, err = newSeedHostKey(mach.Hostname); err != nil {
+			return err
+		}
+		mach.HostKey = hostKey.Private
 	}
 	userData, err := UserData(name, in.R.Ctl(), mach, *st, ca)
 	if err != nil {
@@ -289,17 +298,21 @@ func (in *Installer) CreateVM(ctx context.Context, c *VMCreate) error {
 	if err != nil {
 		return err
 	}
+	mode := os.FileMode(0o644)
+	if hostKey != nil {
+		mode = 0o600 // it holds the host key
+	}
 	if p.ISO {
-		err = WriteSeedISO(seed, userData, MetaData(mach))
+		err = WriteSeedISO(seed, userData, MetaData(mach), mode)
 	} else {
-		err = writeAtomic(seed, bytes.NewReader(userData), 0o644, nil)
+		err = writeAtomic(seed, bytes.NewReader(userData), mode, nil)
 	}
 	if err != nil {
 		return err
 	}
 	ctl := in.R.Ctl()
 	if tofu {
-		id, out, err := in.applyVM(ctx, state, c.Ctl, p, mach, &c.TofuVM, files, declared, disk, format, layer.Hex, seed)
+		id, out, err := in.applyVM(ctx, state, c.Ctl, p, mach, st, &c.TofuVM, files, declared, disk, format, layer.Hex, seed)
 		if err != nil {
 			return fmt.Errorf("%w\n(the state is in %s: `%s vm create` again with the same --hostname is refused; `%s vm destroy %s` removes what was made)", err, state, ctl, ctl, mach.Hostname)
 		}
@@ -307,29 +320,38 @@ func (in *Installer) CreateVM(ctx context.Context, c *VMCreate) error {
 		// The address the platform gave, when nothing named one: a cloud's is known only now.
 		if out != "" && c.Host == "" && mach.staticAddr() == "" {
 			addr = out
-			in.sshAllows(addr, mach.SSHAllow)
+			in.sshAllows(addr, mach)
 		}
 		wait := 20 * time.Minute
 		if st.Release != nil {
 			wait = 40 * time.Minute // the first boot writes the release's OS bundle and reboots first
 		}
-		if err := in.awaitVM(ctx, state, mach.User, addr, c.SSHKey, cmp.Or(c.Wait, wait), len(waiting) == 0 && !st.AwaitSecrets); err != nil {
+		pin := ""
+		if hostKey != nil {
+			pin = filepath.Join(state, "known_hosts.seed")
+			if err := writeAtomic(pin, strings.NewReader(seedHostAlias+" "+hostKey.Public+"\n"), 0o600, nil); err != nil {
+				return err
+			}
+		}
+		if err := in.awaitVM(ctx, state, pin, mach.User, addr, c.SSHKey, cmp.Or(c.Wait, wait), len(waiting) == 0 && !st.AwaitSecrets); err != nil {
 			return err
 		}
 		if st.AwaitSecrets && len(waiting) == 0 {
 			o.logf("installing over SSH with the secrets given")
 			// After the boot unit: it runs after the release's images are loaded, which the install
 			// takes (`systemctl start` waits for it, or returns at once once it ran).
-			args := sshArgs(filepath.Join(state, "known_hosts"), mach.User, addr, c.SSHKey,
+			args := pinnedSSHArgs(pin, mach.User, addr, c.SSHKey,
 				"sudo", "systemctl", "start", name+".service", "&&", "sudo", ctl, "install", "--secrets", "-", "--no-input")
 			if _, err := o.SSH.Run(ctx, Cmd{Args: args, Stdin: bytes.NewReader(c.Secrets), Stream: o.Log}); err != nil {
-				return fmt.Errorf("the install over SSH with the secrets: %w; the VM is kept: `ssh %s@%s %s status` tells where it stopped — `sudo %s install` finishes an install begun, and %s; `%s vm destroy %s` removes it",
-					err, mach.User, addr, ctl, ctl, secretsSteps(mach.User, addr, ctl), ctl, mach.Hostname)
+				return fmt.Errorf("the install over SSH with the secrets: %w; the VM is kept: `ssh %s@%s %s status` tells where it stopped — `sudo %s install` finishes an install begun, and %s; `%s vm destroy %s` removes it. %s",
+					err, mach.User, addr, ctl, ctl, secretsSteps(mach.User, addr, ctl), ctl, mach.Hostname, strings.TrimSpace(seedHostKeyNote(hostKey, addr)))
 			}
+			in.retireSeedHostKey(ctx, state, pin, mach, addr, c.SSHKey)
 		}
 		switch {
 		case st.AwaitSecrets && len(waiting) > 0:
 			fmt.Fprintf(o.Out, "The VM %s answers. Its install waits for its secrets and %s, which the cloud-config never carries: %s\n", mach.Hostname, strings.Join(waiting, ", "), secretsSteps(mach.User, addr, ctl))
+			fmt.Fprint(o.Out, seedHostKeyNote(hostKey, addr))
 		case len(waiting) > 0:
 			fmt.Fprintf(o.Out, "The VM %s answers. Its install waits for %s, which the cloud-config never carries: ssh %s@%s sudo %s install\n", mach.Hostname, strings.Join(waiting, ", "), mach.User, addr, ctl)
 		default:
@@ -347,6 +369,7 @@ func (in *Installer) CreateVM(ctx context.Context, c *VMCreate) error {
 	}
 	if st.AwaitSecrets {
 		fmt.Fprintf(o.Out, "\nIts first install waits for its secrets (the file `secrets export` wrote, decrypted), which the cloud-config never carries: %s\n", secretsSteps(mach.User, "<address>", ctl))
+		fmt.Fprint(o.Out, seedHostKeyNote(hostKey, "<address>"))
 		if len(waiting) > 0 {
 			fmt.Fprintf(o.Out, "It asks for %s, which the file does not hold.\n", strings.Join(waiting, ", "))
 		}
@@ -496,8 +519,11 @@ func secretsSteps(user, addr, ctl string) string {
 // `vm create` waits for the VM, and the secrets steps run, over SSH. A warning, not a refusal:
 // the VM may see this machine at another address (NAT, a VPN). A name that does not resolve yet
 // (one the VM's DHCP lease registers) is not checked.
-func (in *Installer) sshAllows(addr string, allow []netip.Prefix) {
-	if len(allow) == 0 {
+func (in *Installer) sshAllows(addr string, m Machine) {
+	// The public address the sources hold is not this machine's own, behind a NAT: nothing to
+	// compare with the route's source.
+	allow := m.SSHAllow
+	if len(allow) == 0 || m.publicSSH {
 		return
 	}
 	dsts := []netip.Addr{}
@@ -667,7 +693,7 @@ func defaultUser(getenv func(string) string) string {
 }
 
 // machine asks what the flags did not give of the VM's own settings, and checks them.
-func (in *Installer) machine(ctx context.Context, c *VMCreate) (Machine, error) {
+func (in *Installer) machine(ctx context.Context, c *VMCreate, p Platform) (Machine, error) {
 	o := &in.O
 	given := map[string]string{"--hostname": c.Hostname, "--user": c.User, "--ssh-key": c.SSHKey, "--network": c.Network}
 	defaults := map[string]string{"--hostname": in.R.Spec.Name, "--user": defaultUser(o.getenv), "--ssh-key": defaultKey(o.getenv("HOME")), "--network": "dhcp"}
@@ -703,7 +729,16 @@ func (in *Installer) machine(ctx context.Context, c *VMCreate) (Machine, error) 
 		}
 		m.SSHAllow = append(m.SSHAllow, p.Masked())
 	}
-	if len(m.SSHAllow) == 0 {
+	switch {
+	case len(m.SSHAllow) == 0 && !p.ISO:
+		// A cloud's VM has a public address: SSH from this machine's alone, unless told.
+		a, err := o.publicAddr(ctx)
+		if err != nil {
+			return Machine{}, fmt.Errorf("--ssh-allow: a cloud's VM answers on a public address, and SSH accepts this machine's alone unless given the sources (--ssh-allow CIDR,…; 0.0.0.0/0,::/0 is every source), but its public address is unknown: %w", err)
+		}
+		m.SSHAllow, m.publicSSH = []netip.Prefix{netip.PrefixFrom(a, a.BitLen())}, true
+		o.logf("SSH accepts this machine's public address alone, %s (%s answered; ssh over another address, IPv6 or another way out of this network, is refused): --ssh-allow CIDR,… gives the operators' addresses", a, publicAddrURL)
+	case len(m.SSHAllow) == 0:
 		o.logf("SSH accepts every source: --ssh-allow CIDR,… limits it to the operators' addresses")
 	}
 	if c.Timezone != "" {
@@ -955,7 +990,7 @@ func (in *Installer) confirmVM(ctx context.Context, p Platform, format string, m
 		fmt.Fprintf(&b, "  %s=%s\n", k, st.Inputs[k])
 	}
 	if st.AwaitSecrets {
-		b.WriteString("  secrets: --secrets', given over SSH once the VM answers (never in its cloud-config)\n")
+		b.WriteString("  secrets: --secrets', given over SSH once the VM answers, to a one-time host key its cloud-config carries (never the secrets)\n")
 	}
 	for _, r := range in.R.Spec.L4.Routes {
 		from := "every source"

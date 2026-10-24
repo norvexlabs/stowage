@@ -785,8 +785,17 @@ Rules:
   included) is left alone.
   The engine's ability is probed before anything is written (a throwaway network). Off by default: a host without IPv6 cannot create an IPv6 network. The backup runner
   runs on the host's network, so it reaches a destination and DNS servers as the VM does, IPv6
-  included, without needing the stack's choice. The app socket serves these verbs too, as the whole API (the
-  operator's choice: the app's admin pages change the network as `<short>-stow` does).
+  included, without needing the stack's choice. The app socket serves these verbs too (the
+  operator's choice: the app's admin pages change the network as `<short>-stow` does), but not
+  the routes that hand out or replace the secrets, erase or overwrite the data, or re-run the
+  hook whose outputs hold credentials (`provision`, `reset-db`, `secrets export` and `rotate`,
+  `restore`), nor the removal of the backup settings: a service holding the token is a
+  compromised one's reach, and those stay the operator's, over SSH. The backup settings stay the
+  app's (the console sets the destination, its credentials and the recipients), so a leaked
+  token can redirect or stop them: the operator can lock them (opt-in, as the console's parity
+  needs them open), the lock outliving their removal and failing closed, and every change the
+  app makes is journaled. The backup before an upgrade is the operator's alone to skip, though
+  an unlocked app can defeat it through the settings.
 - `/health` is always-200 liveness; every readiness consumer polls the `health` provider.
 
 ## 8. Runtime pieces (generic, parameterised by `name` + spec)
@@ -1076,7 +1085,13 @@ every shape, the VM end-to-end test upgrading through it), then the health gate.
   which it leaves alone, so the front's ports are opened in input for what reaches the host
   itself (the userland proxy), from a runtime file each start writes, as the ports are the
   install's, changed by a re-run. SSH's sources are the cloud-config's (`--ssh-allow`), a file
-  replacing the bundle's open default, so a VM made by hand is never locked out. An L4 route's
+  replacing the bundle's open default, so a VM made by hand is never locked out. On a cloud the VM
+  answers on a public address from its first boot, so `vm create` defaults SSH's sources to this
+  machine's public address (asked of a plain-text echo service, the one fact it cannot see from
+  here behind a NAT), and refuses rather than open SSH to the internet when it cannot learn it.
+  A cloud's network firewall is the platform's, in front of the VM's: a module may declare
+  `ssh_sources` and `open_ports` to make one matching the VM's (the GCP module does); the VM's
+  own stays the one that applies each L4 route's allowlist. An L4 route's
   allowlist cannot live in input — Docker's DNAT sends its traffic through forward — so a forward
   chain of the project's table, ahead of Docker's and accepting by default, drops a DNAT'd
   connection to the route's port (its original direction only, the replies being the
@@ -1194,7 +1209,13 @@ every shape, the VM end-to-end test upgrading through it), then the health gate.
   Disaster recovery: `secrets export` writes the secrets encrypted to the operator's age keys
   (age, the backups' tool; no private key on the target), and `install --secrets` / `vm create
   --secrets` take them back decrypted, the VM's over SSH as every secret (its settings only say
-  the first install waits); then a backup is restored. After the first version (TODO): sealed secrets opt-in per deployment (a SOPS file, the sops library, encrypted to the
+  the first install waits); then a backup is restored. That SSH is pinned: `vm create` gives the
+  VM a one-time host key in its cloud-config and refuses any other, as a first contact taking
+  whatever key answers would hand the secrets to whoever answered first. The key is a secret of
+  little worth: it is served only until the install (from `/run`, so not past a reboot), then
+  marked retired on the OEM partition, which a reset keeps and the recovery system mounts too, so
+  no later boot serves it, and the VM's own key, read through it, is what `vm create` keeps;
+  anyone reading the seed or the metadata service later finds a key no system of the VM offers. After the first version (TODO): sealed secrets opt-in per deployment (a SOPS file, the sops library, encrypted to the
   operator's key plus a per-deployment key that alone reaches the target, decrypted at each start
   or boot); then the VM's key sealed by its TPM or released by a KMS, with the same boot flow.
 - **Installer** — one installer image for all three shapes. It carries a Go binary with a terminal

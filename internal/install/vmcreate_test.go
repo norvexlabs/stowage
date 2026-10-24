@@ -8,8 +8,10 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"io"
 	"maps"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -90,6 +92,8 @@ func (v *vmCreate) create(c VMCreate, mod func(*Options)) error {
 	c.Out = cmpOr(c.Out, v.out)
 	c.SSHKey = cmpOr(c.SSHKey, v.key)
 	in := v.installer(func(o *Options) {
+		// This machine's public address, which a cloud's VM takes SSH from: never asked of the network.
+		o.PublicAddr = func(context.Context) (netip.Addr, error) { return netip.MustParseAddr("198.51.100.40"), nil }
 		if mod != nil {
 			mod(o)
 		}
@@ -295,6 +299,48 @@ func TestVMCreateOnACloudWritesTheUserDataFile(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(v.out, "notes-1.0.0.raw")); err != nil {
 		t.Error(err)
+	}
+}
+
+func TestACloudsVMTakesSSHFromThisMachinesPublicAddress(t *testing.T) {
+	t.Parallel()
+	rules := func(t *testing.T, c VMCreate, mod func(*Options)) (string, error) {
+		v := newVMCreate(t, "raw")
+		if err := v.create(c, mod); err != nil {
+			return "", err
+		}
+		ud, err := os.ReadFile(filepath.Join(v.out, c.Hostname+"-user-data.yaml"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, cc := cloudSettings(t, string(ud))
+		for _, s := range cc.Stages["boot"] {
+			for _, f := range s.Files {
+				if f.Path == SSHRules {
+					return f.Content, nil
+				}
+			}
+		}
+		return "", nil
+	}
+	got, err := rules(t, VMCreate{Platform: "aws", Hostname: "edge"}, nil)
+	if err != nil || !strings.Contains(got, "\nip saddr 198.51.100.40/32 tcp dport 22 accept\n") || strings.Count(got, "accept") != 1 {
+		t.Errorf("rules %q, %v", got, err)
+	}
+	unknown := func(o *Options) {
+		o.PublicAddr = func(context.Context) (netip.Addr, error) { return netip.Addr{}, errors.New("no route") }
+	}
+	if _, err := rules(t, VMCreate{Platform: "aws", Hostname: "edge"}, unknown); err == nil || !strings.Contains(err.Error(), "--ssh-allow: a cloud's VM answers on a public address") || !strings.Contains(err.Error(), "no route") {
+		t.Errorf("err = %v", err)
+	}
+	// The sources given are SSH's, the address never asked; every source when told so.
+	if got, err := rules(t, VMCreate{Platform: "aws", Hostname: "edge", SSHAllow: []string{"0.0.0.0/0", "::/0"}}, unknown); err != nil || got != "# SSH, from the sources `notes-stow vm create --ssh-allow` gave.\nip saddr 0.0.0.0/0 tcp dport 22 accept\nip6 saddr ::/0 tcp dport 22 accept\n" {
+		t.Errorf("rules %q, %v", got, err)
+	}
+	// A hypervisor's VM is on the operator's network: every source, the address never asked.
+	v := newVMCreate(t, "qcow2")
+	if err := v.create(VMCreate{Platform: "proxmox"}, unknown); err != nil || !strings.Contains(v.log.String(), "SSH accepts every source") {
+		t.Errorf("%v\n%s", err, v.log)
 	}
 }
 
@@ -802,7 +848,7 @@ func TestSeedISOOfWholeSectors(t *testing.T) {
 	for _, n := range []int{0, 2048, 4096, 2047, 2049} {
 		path := filepath.Join(t.TempDir(), "seed.iso")
 		ud := strings.Repeat("x", n)
-		if err := WriteSeedISO(path, []byte(ud), []byte("instance-id: x\n")); err != nil {
+		if err := WriteSeedISO(path, []byte(ud), []byte("instance-id: x\n"), 0o644); err != nil {
 			t.Fatal(err)
 		}
 		if got, _, label := readSeed(t, path); got != ud || strings.TrimSpace(label) != SeedVolume {

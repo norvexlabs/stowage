@@ -1363,3 +1363,107 @@ func TestTheVolumeScripts(t *testing.T) {
 		t.Errorf("root mode after an empty archive %v", fi.Mode().Perm())
 	}
 }
+
+// Through the app socket the settings change as through the operator's, unless the operator locked
+// them: then the app saves them unchanged alone, and the lock is the operator's. Each change the
+// app makes is in the journal, and a request refused leaves the lock as it was.
+func TestTheAppChangesTheBackupSettingsUnlessLocked(t *testing.T) {
+	t.Parallel()
+	_, d, _, key := backupVM(t)
+	app := d.routes(true)
+	other, _ := age.GenerateX25519Identity()
+	var s BackupSettings
+	var e errOf
+	if code := call(t, app, "POST", "/v1/backup/config", validConfig(key), &s); code != 200 || s.Locked {
+		t.Fatalf("the app's first settings: %d %+v", code, s)
+	}
+	if code := call(t, app, "POST", "/v1/backup/config", BackupConfigRequest{Destination: ptr("store:elsewhere")}, &s); code != 200 || s.Destination != "store:elsewhere" {
+		t.Errorf("the app's change, unlocked: %d %+v", code, s)
+	}
+	if code := call(t, app, "POST", "/v1/backup/config", BackupConfigRequest{Lock: ptr(true)}, &e); code != 403 || !strings.Contains(e.Error, "lock is the operator's") {
+		t.Errorf("the app locking: %d %s", code, e.Error)
+	}
+	// A request refused (by validation, or by systemd's calendar) sets no lock, nor drops one;
+	// verify tries none.
+	if code := call(t, d.Handler(), "POST", "/v1/backup/config", BackupConfigRequest{Lock: ptr(true), RetentionDays: ptr(-3)}, &e); code != 400 || d.settingsLocked() {
+		t.Errorf("a refused lock: %d, locked %v", code, d.settingsLocked())
+	}
+	if code := call(t, d.Handler(), "POST", "/v1/backup/verify", BackupConfigRequest{Lock: ptr(true)}, &e); code != 400 || d.settingsLocked() {
+		t.Errorf("verify with a lock: %d", code)
+	}
+	if s := configure(t, d, BackupConfigRequest{Lock: ptr(true)}); !s.Locked || s.Destination != "store:elsewhere" {
+		t.Fatalf("the operator's lock: %+v", s)
+	}
+	if code := call(t, d.Handler(), "POST", "/v1/backup/config", BackupConfigRequest{Lock: ptr(false), RetentionDays: ptr(-3)}, &e); code != 400 || !d.settingsLocked() {
+		t.Errorf("a refused unlock: %d, locked %v", code, d.settingsLocked())
+	}
+	// Locked: the whole form saved unchanged passes, its recipients in any order; every change is
+	// refused, and so are an unlock and a removal.
+	same := validConfig(key)
+	same.Destination = ptr("store:elsewhere")
+	if code := call(t, app, "POST", "/v1/backup/config", same, &s); code != 200 || !s.Locked {
+		t.Errorf("the settings saved unchanged, locked: %d %+v", code, s)
+	}
+	for _, req := range []BackupConfigRequest{
+		{Recipients: []string{other.Recipient().String()}},
+		{Destination: ptr("store:backups/notes")},
+		{RetentionDays: ptr(1)},
+		{Schedule: ptr("monthly")},
+		{Lock: ptr(false)},
+	} {
+		if code := call(t, app, "POST", "/v1/backup/config", req, &e); code != 403 {
+			t.Errorf("%+v through the app, locked: %d", req, code)
+		}
+	}
+	if code := call(t, app, "DELETE", "/v1/backup/config", nil, &e); code != 403 {
+		t.Errorf("the app removing the settings: %d", code)
+	}
+	if s := configure(t, d, BackupConfigRequest{Recipients: []string{other.Recipient().String(), key.Recipient().String()}}); len(s.Recipients) != 2 || !s.Locked {
+		t.Errorf("the operator's change, locked: %+v", s)
+	}
+	reordered := same
+	reordered.Recipients = []string{key.Recipient().String(), other.Recipient().String()}
+	if code := call(t, app, "POST", "/v1/backup/config", reordered, &s); code != 200 {
+		t.Errorf("the recipients reordered: %d", code)
+	}
+	// The lock outlives the settings: the app cannot set them again.
+	if code := call(t, d.Handler(), "DELETE", "/v1/backup/config", nil, &s); code != 200 || !s.Locked {
+		t.Errorf("the operator's removal: %d %+v", code, s)
+	}
+	if code := call(t, app, "POST", "/v1/backup/config", validConfig(key), &e); code != 403 {
+		t.Errorf("the app's settings after a removal, locked: %d", code)
+	}
+	// A lock that cannot be read is one.
+	if err := os.Remove(BackupLockFile(d.O.Dir)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(BackupLockFile(d.O.Dir), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(BackupLockFile(d.O.Dir), "x"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if !d.settingsLocked() {
+		t.Error("an odd lock file is no lock")
+	}
+	if err := os.RemoveAll(BackupLockFile(d.O.Dir)); err != nil {
+		t.Fatal(err)
+	}
+	if code := call(t, app, "POST", "/v1/backup/config", validConfig(key), &s); code != 200 || s.Locked {
+		t.Errorf("the app's settings, unlocked: %d %+v", code, s)
+	}
+	var a EventsAnswer
+	if code := call(t, d.Handler(), "GET", "/v1/events?after=0", nil, &a); code != 200 {
+		t.Fatalf("events: %d", code)
+	}
+	var reasons []string
+	for _, ev := range a.Events {
+		if ev.Kind == evBackupConfig {
+			reasons = append(reasons, ev.Reason)
+		}
+	}
+	all := "changed through the app socket: destination, rclone_config, recipients, retention_days, schedule, profile"
+	if want := []string{all, "changed through the app socket: destination", all}; !slices.Equal(reasons, want) {
+		t.Errorf("events %q", reasons)
+	}
+}

@@ -28,36 +28,22 @@ A finished item is deleted, not ticked. The plan behind it is
    image; its database fetched, or given offline for a mirror without internet), printing them
    by severity, `--json`, and exiting non-zero at or above `--fail-on`. README documents the
    SBOM's tag/referrer, the verb and how to verify one by hand with `cosign verify-attestation`.
-3. **Security review (2026-10-24) of the produced artifacts**, to fix in the next version:
-   - **High — the app socket serves the whole host API**: a compromised `host_api` service with
-     the install's token can `secrets/export` to its own key, `reset-db`, `restore` over the
-     data, and rotate secrets. Refuse those four on the app socket (the operator's socket keeps
-     them); the parity app uses none of them, and keeps the rest (upgrade, rollback, network,
-     backup and its settings, reboot, shutdown, status, events, updates, job).
-   - **Medium — `vm create --secrets` trusts the first SSH host key** (`accept-new`), then sends
-     the secrets: pin the VM's host key (one `vm create` generates and gives in the seed, or read
-     from the console), or encrypt the secrets to a key the seed carries.
-   - **Medium — the bootstrap runs `<name>-installer:latest` unverified**, and the trust of every
-     later check comes from it: print and document a digest-pinned `cosign verify` of the
-     installer; lint warns on a project with no `signing`.
-   - **Medium — Docker without `--ipv6`: IPv6 clients reach the front as the bridge's gateway**,
-     which an allowlist of private ranges admits: refuse or warn when an allowlist holds the
-     stack network while IPv6 is off on a host with a global IPv6 address.
-   - **Medium — Docker: L4 routes listen on every address** (`allow_input` is the VM's): the
-     install and `status` print each port and its exposure, and suggest `bind_input`.
-   - **Medium — SSH open to every source by default, public addresses on the clouds**: `vm create`
-     on a cloud requires `--ssh-allow` (or defaults it to this machine's address); the GCP, Azure
-     and AWS modules make a firewall rule / NSG / security group for SSH and the front's ports.
-   - **Low**: the mirror's CA trusted system-wide (`update-ca-certificates`) rather than for the
-     registry alone (kairos-agent's pull needs it: check what else can carry it); no GRUB
-     password and a serial getty (console access = root); AWS EBS not `encrypted`, no Secure
-     Boot or vTPM in the modules; the VM's forward chain accepts by default (relies on Docker's);
-     lint has no rule against `privileged`, a mounted `docker.sock`, `cap_add` or `pid: host`;
-     HSTS `includeSubDomains` reaches the operator's other subdomains.
-   - **To check on a running VM**: `ss -tulpn` on the active and recovery systems (no kairos-agent
-     web UI, p2p or edgevpn), `passwd -S` of every account (root locked, no `kairos` user with a
-     password), no console autologin, the effective `sshd -T` (`PermitRootLogin`), Docker's
-     FORWARD policy with `--ipv6`, whether Kairos reads the cloud's user-data again at each boot.
+3. **Security review (2026-10-24) of the produced artifacts, the findings left** (AWS's and
+   Azure's are under 4):
+   - **The mirror's CA is trusted system-wide** (`update-ca-certificates`) rather than for the
+     registry alone: kairos-agent's pull needs it; find what else can carry it (a per-registry
+     `certs.d` its pull reads), else document the scope.
+   - **The Docker IPv6 allowlist warning checks Docker's default pools** (`172.16.0.0/12`,
+     `192.168.0.0/16`), not the stack network's gateway: a daemon given other
+     `default-address-pools` is missed, and a list overlapping a pool without holding the gateway
+     is warned. Read the gateway (`docker network inspect`) once the network exists.
+   - **On a running VM, checked once by hand** (and kept in e2e-vm where cheap): `ss -tulpn` on
+     the active and recovery systems (no kairos-agent web UI, p2p or edgevpn), `passwd -S` of
+     every account (root locked, no `kairos` user with a password: README claims no account
+     logs in on the console with one), no console autologin, the effective `sshd -T`
+     (`PermitRootLogin`), Docker's FORWARD policy with `--ipv6` (the project's forward chain
+     accepts by default and relies on it), whether Kairos reads the cloud's user-data again at
+     each boot.
 
 4. **Cloud images on AWS and Azure**: `ship` registers the `cloud_publish` images through
    OpenTofu, run for real on Google Cloud only (`STOWAGE_CLOUD_ENV=<file> make e2e-kairos`). Run it
@@ -67,6 +53,11 @@ A finished item is deleted, not ticked. The plan behind it is
    (`azurerm_storage_blob` refuses an existing blob): check both there, and that the service
    principal needs *Storage Blob Data Contributor* on the storage account (blobs are written with
    Entra ID).
+   The same accounts prove the modules' firewalls, as GCP's does (from the security review):
+   AWS's module makes a security group from `ssh_sources` and `open_ports` when no
+   `security_group_ids` is given (a VPC's default group admits nothing from outside) and an
+   `encrypted` root volume; Azure's an NSG on the NIC; Secure Boot / vTPM where the image allows.
+   Each checked against its provider's schema and applied for real.
 
 5. **Scaleway**: a platform of `vm create` (OpenTofu module: an instance from the release's
    disk, the cloud-config as its user data) and a cloud of `cloud_publish` (the disk uploaded to
@@ -79,6 +70,36 @@ A finished item is deleted, not ticked. The plan behind it is
    `terraform-provider-openstack/openstack`, whichever the latest official docs make canonical).
    Before writing a module, read the latest provider's official docs and its schema, and pin that
    release.
+
+Found packaging a second project (an explicit forward proxy, Docker shape, 2026-10-24); the
+Shoulds it found are under Should:
+
+7. **Docker: an L4 route open to every source** (security): its port was published on `0.0.0.0`
+   and `[::]` while its `allow_input` held one address; for a forward proxy that is an open relay.
+   The security work in progress may close it (bind address / exposure printed) — delete this
+   item when it lands, else enforce `allow_input` on Docker (the host's nftables, as the VM does)
+   or refuse the install without a bind address.
+8. **An admin route needs a password**: the front guards a route by `allow_input`, `client_auth`
+   or `forward_auth`, nothing in between, so a console showing users' traffic is guarded by a
+   CIDR list alone. A route behind a password (Caddy `basic_auth`, a bcrypt hash from a
+   generated secret), on Docker, the VM and in the chart's contract.
+9. **`upgrade` takes a new revision of the same version**: with the channel pointer on `V-r3`, an
+   install of `V` revision 2 answered `already runs V (revision 2)`; only `upgrade --version V`
+   took r3, so a fix shipped as a revision never reaches an install that upgrades plainly (nor
+   the VM's update check, to verify).
+10. **An L4 route pays no Docker networking** (performance): a service an `l4.routes` entry
+    targets is on the stack's bridge, its port published through Docker's DNAT (conntrack on every
+    connection, a veth hop per packet), and the way around it, `network_mode: host`, is a lint
+    error on the VM and a warning on Docker because the port then escapes Stowage. Measured on a
+    pinned 2-vCPU Linux host, one binary and one configuration, native process vs the Docker
+    shape: keep-alive HTTP/2 through the proxy −4.4% req/s and +4.5% CPU per request (median of
+    three interleaved runs, all three agreeing; connection-heavy workloads, where the DNAT's cost is
+    per connection, were not run). An L4 route is chosen for throughput and latency,
+    so its target runs on the host's network by default, still owned by Stowage: the route's port
+    listed and checked, `allow_input` enforced by the host's nftables (closing 7 at the same time)
+    and the VM's firewall opening it; lint stops refusing it for an L4 target, and the bridge stays
+    for every other service. With it, a CPU set per service (compose `cpuset`, the VM's and the
+    chart's equivalent): an unpinned service shares its cores with the rest of the stack.
 
 ## Should
 
@@ -294,7 +315,44 @@ A finished item is deleted, not ticked. The plan behind it is
   project's own keys; meanwhile README asks for an account that cannot write the project's
   repositories.
 
+Found packaging a second project (an explicit forward proxy with an IdP, a scanner and sidecars,
+Docker shape, 2026-10-24):
+
+- **Routes by path on one domain**: the front routes by hostname only, so a console, an IdP and
+  metrics need three names (and three certificates) where one host with `/`, `/dex`, `/metrics`
+  would do.
+- **A moved `--https-port` is also the front's port inside the stack network**: a service that
+  reaches a route through the front by its public name must dial that port, and an app that
+  builds a URL from the domain alone (an OIDC issuer `https://<domain>/…`) breaks. Keep the
+  front on 443 inside, publishing the chosen host port to it.
+- **The stack reaching a route by its public name**: a service that must call another route as
+  clients do (a gateway fetching its IdP's discovery at the issuer URL) has to resolve the
+  route's domain to the front itself (an `/etc/hosts` write at start). Give the front a network
+  alias per route domain on the stack network.
+- **A long-running service reading a file a one-shot service renders**: a re-run re-renders it,
+  and the reader (Dex reading its config once) keeps the old file until restarted. Document the
+  contract (compose `depends_on: { condition: service_completed_successfully, restart: true }`)
+  or lint a one-shot feeding a volume another service mounts.
+- **Loopback mode when no route can work in it**: `loopback_ports` is required for every route
+  though a project whose IdP needs an https issuer cannot serve in loopback; a project could
+  leave `none` out of `tls_modes` and owe no loopback ports.
+- **`ship` on a host whose `/tmp` is RAM**: the staged context and the `image save` tarball go to
+  `$TMPDIR`; a multi-GB image fills a tmpfs. Stage under the user's cache directory, or say so.
+- **Build options an image may need**: `add_hosts` (a build whose tests resolve fixed names;
+  BuildKit's `/etc/hosts` is read-only) and a build network.
+
 ## Could
+
+- **HSTS `includeSubDomains` opt-out** (security review, Low): the front sends it on every route,
+  as the reference deployment does, binding the names under a route's to HTTPS for a year. A spec
+  key (`front.hsts_subdomains: false`) for an operator whose route name has other services
+  under it.
+
+- **Images from packages**: `images.<k>` built from `.deb` packages on a digest-pinned base
+  (`base`, `packages`: a build target writing them or a glob, `purge`: the per-install paths a
+  maintainer script leaves in an image — a generated CA, a default config), with lint on the pin
+  and the purge list and an SBOM from `dpkg -l`. Turning the packages' systemd units into
+  services stays the project's (an entrypoint per unit).
 
 - **`k8s install --unsafe-sysctls` on a kubelet that refuses them**: the pods fail at once
   (`SysctlForbidden`), yet helm waits out `--timeout` before it rolls back. Watch the rollout's

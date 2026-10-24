@@ -862,6 +862,30 @@ func TestARouteRefusesOtherSourcesThenStripsThenAsksTheAuthService(t *testing.T)
 	}
 }
 
+func TestAnAllowlistIPv6ClientsPassIsWarned(t *testing.T) {
+	t.Parallel()
+	const warn = "warning: route api: SOURCES="
+	for _, c := range []struct {
+		sources, ipv6 string
+		addrs         []string
+		warns         bool
+	}{
+		{"172.18.0.0/16", "", []string{"192.0.2.10", "2001:db8::10"}, true},
+		{"10.0.0.0/8, 192.168.1.7", "", []string{"2001:db8::10"}, true},
+		{"10.0.0.0/8", "", []string{"2001:db8::10"}, false},                                  // no pool of Docker's
+		{"172.18.0.0/16", "true", []string{"2001:db8::10"}, false},                           // IPv6 on: clients keep their address
+		{"172.18.0.0/16", "", []string{"192.0.2.10", "fd00::10", "::ffff:192.0.2.1"}, false}, // no global IPv6 address
+	} {
+		var log bytes.Buffer
+		s := &spec.Spec{Front: spec.Front{Routes: []spec.Route{{Name: "web", Upstream: "web:80"}, {Name: "api", Upstream: "api:9090", AllowInput: "SOURCES"}}}}
+		in := &Installer{R: &Release{Spec: s}, O: Options{Log: &log, HostAddrs: func() []string { return c.addrs }}}
+		in.warnIPv6Allowlists(func(k string) string { return map[string]string{"SOURCES": c.sources, IPv6Var: c.ipv6}[k] })
+		if got := strings.Contains(log.String(), warn); got != c.warns {
+			t.Errorf("%+v: %q", c, log.String())
+		}
+	}
+}
+
 // A route with client_auth requires a client certificate the install's client CA issued: it refuses
 // everyone while none was given, and in loopback mode; the other routes are left as they are.
 func TestARouteAskingForAClientCertificate(t *testing.T) {

@@ -138,6 +138,41 @@ func splitSources(v string) []string {
 	return strings.FieldsFunc(v, func(r rune) bool { return r == ',' || unicode.IsSpace(r) })
 }
 
+// dockerPools are Docker's default address pools, which a stack's network is cut from.
+var dockerPools = []netip.Prefix{netip.MustParsePrefix("172.16.0.0/12"), netip.MustParsePrefix("192.168.0.0/16")}
+
+// warnIPv6Allowlists warns of a route's allowlist that every IPv6 client passes: with IPv6 off on
+// the stack's network, Docker's userland proxy hands the front an IPv6 client as the bridge's
+// IPv4 gateway, an address of Docker's pools, so a list holding one of those admits them all on a
+// host IPv6 reaches (a global address).
+func (in *Installer) warnIPv6Allowlists(get func(string) string) {
+	if get(IPv6Var) == "true" || !slices.ContainsFunc(in.O.hostAddrs(), func(h string) bool {
+		a, err := netip.ParseAddr(h)
+		return err == nil && a.Is6() && !a.Is4In6() && a.IsGlobalUnicast() && !a.IsPrivate()
+	}) {
+		return
+	}
+	for _, r := range in.R.Spec.Front.Routes {
+		if r.AllowInput == "" {
+			continue
+		}
+		for _, s := range splitSources(get(r.AllowInput)) {
+			p, err := netip.ParsePrefix(s)
+			if err != nil {
+				a, aerr := netip.ParseAddr(s)
+				if aerr != nil {
+					continue
+				}
+				p = netip.PrefixFrom(a, a.BitLen())
+			}
+			if slices.ContainsFunc(dockerPools, p.Overlaps) {
+				in.O.logf("warning: route %s: %s=%s holds %s, which every IPv6 client passes as Docker's bridge gateway while the stack's IPv6 is off and this host has a global IPv6 address: install --ipv6, or list narrower sources", r.Name, r.AllowInput, get(r.AllowInput), s)
+				break
+			}
+		}
+	}
+}
+
 // checkSources accepts an allowlist of IP addresses and CIDRs (empty: refuse everyone).
 func checkSources(v string) error {
 	for _, s := range splitSources(v) {

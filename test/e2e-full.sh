@@ -164,7 +164,8 @@ echo_ports() { docker port "$(docker ps -q --filter "label=com.docker.compose.pr
 [[ $(echo_l4 tcp) == "localhost:17007 ping" ]] || fail "the echo service bound to 127.0.0.1 does not answer"
 "${CTL[@]}" --dir "$D" --no-input --set ECHO_BIND= >"$WORK/unbind.log" 2>&1 || { cat "$WORK/unbind.log"; fail "re-run --set ECHO_BIND="; }
 [[ $(echo_ports) == *0.0.0.0:17007* ]] || fail "the TCP echo is published on $(echo_ports) once ECHO_BIND is empty"
-grep -qxF "echo      tcp/17007 localhost:17007" "$WORK/status.txt" && grep -qxF "echo-udp  udp/17007" "$WORK/status.txt" ||
+grep -qxF "echo      tcp/17007 localhost:17007 · on every address, open to whoever reaches this host (ECHO_BIND gives it one address)" "$WORK/status.txt" &&
+	grep -qxF "echo-udp  udp/17007 · on every address, open to whoever reaches this host" "$WORK/status.txt" ||
 	{ cat "$WORK/status.txt"; fail "status does not list the L4 routes"; }
 relay() { docker ps -q --filter "label=com.docker.compose.project=$(project)" --filter label=com.docker.compose.service=relay; }
 [[ -z $(relay) ]] || fail "the relay runs while RELAY_SOURCE is empty"

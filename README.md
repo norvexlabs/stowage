@@ -858,6 +858,13 @@ images, chart, OS bundle), each by digest. An install whose release carries no k
 does not sign) checks nothing; one that carries keys never accepts an unsigned release. The
 first install trusts the installer the operator runs; check it before running it with
 `cosign verify --key <public key> --insecure-ignore-tlog=true <prefix>/<name>-installer:<tag>`.
+`ship` and `promote` end their report (not with `--json`) with the release's installer by digest,
+which a tag cannot move: `Check the installer: cosign verify --key <public key>
+--insecure-ignore-tlog=true <prefix>/<name>-installer@sha256:…`, the first of `public_keys` (a
+test release's `--test-public-key`), from the project's root, then `  or, with another key: …` for
+each other one, as in a rotation either may sign (or, for a project that does not
+sign, `Not signed (no signing): an install trusts whatever the registry serves.`), then `Then:
+docker run --rm <prefix>/<name>-installer@sha256:… > <name>.sh`.
 Among a version's revisions, `upgrade --version` takes the latest one signed by a trusted key: one
 pushed without the key is passed over, its yank not believed; one whose signatures cannot be read
 stops it (an older revision never stands in for it). Each revision passed over is logged
@@ -916,6 +923,14 @@ These are what `lint` checks; each finding names the key path or `file:line` to 
   - a service on the host's network (`network_mode: host`, its own or the one it extends) is,
     likewise, an error with a `kairos` shape (a port on the host's network is none Stowage
     publishes) and a warning on the `docker` shape (`listens on the host past Stowage`);
+  - a service given the host's powers is warned, on every shape, never refused (a stack may need
+    one, as a VPN's `NET_ADMIN`): `privileged: true` (or a string reading `true`, or an interpolation lint cannot read: `the
+    container holds every power of the host's root`), `cap_add` (`powers of the host's root beyond Docker's defaults`, naming them),
+    `pid: host` (`sees and signals every process of the host`), and a `volumes:` entry
+    bind-mounting the Docker socket, `/var/run/docker.sock` or `/run/docker.sock`, or a directory
+    holding it (`/var/run`, `/run`, `/`; a long-syntax entry without a `type` counts as a bind, a
+    `${VAR:-default}` source reads as its default, and a bare container path is no bind) (`the service drives the host's engine, so holds the
+    host`); a service extending another takes its `privileged`, `pid` and `cap_add` too;
   - a service with `profiles:` runs only while an input turns one of its profiles on (an input's
     `profile`, see "Spec keys"); a profile no input names is an error (no install would ever
     start the service);
@@ -1043,7 +1058,10 @@ These are what `lint` checks; each finding names the key path or `file:line` to 
     027 (`/etc/profile`, `/etc/profile.d`, `/etc/bash.bashrc`, `/etc/login.defs`) is there; an
     `admin` group (created when the
     base lacks it), `sudo` without a password for it (`/etc/sudoers.d/10-<name>`: its members log in with an SSH key and have none), a console banner (`/etc/issue.d/05-<name>.issue`),
-    consoles on the screen and the serial port (serial last, so it owns `/dev/console`), the QEMU
+    consoles on the screen and the serial port (serial last, so it owns `/dev/console`; no
+    account logs in there with a password, but GRUB has none either, and its menu edits the
+    kernel's command line: whoever reaches the hypervisor's console or the serial port has root,
+    so they are as trusted as the hypervisor), the QEMU
     and VMware guest agents, `multipathd` masked; the kernel modules kairos-init strips are
     reinstalled (the build fails with fewer than 100).
 
@@ -1438,7 +1456,9 @@ again, to copy an installer to another host.
   route's URL (after it, while an install given `--secrets` awaits its data, `not provisioned: a
   backup of the install --secrets came from is awaited; once loaded, `<short>-stow provision --dir D`
   provisions it`), each `l4` route as `<name> <protocol>/<port>` followed by its endpoint when it has
-  an `address_input` (`echo      tcp/17007 localhost:17007`), `endpoint  <URL>` when the spec names an `endpoint` (that route's URL), a `tunable   KEY=value` line per advanced input (`(not set)` when none is
+  an `address_input` (`echo      tcp/17007 localhost:17007`) and where it listens (`· on
+  192.0.2.7 alone` from its `bind_input`, else `· on every address, open to whoever reaches this
+  host`, adding `(<BIND_INPUT> gives it one address)` when the route has a `bind_input`), `endpoint  <URL>` when the spec names an `endpoint` (that route's URL), a `tunable   KEY=value` line per advanced input (`(not set)` when none is
   recorded — the compose file's default, or off for one the front reads — a secret one
   `<redacted>`), in byo mode `cert      <its names>, valid until <date> (<N> days)` and, from 30
   days before that date or once it passed, `warning: the certificate expires in N day(s), …` (or
@@ -1777,7 +1797,12 @@ again, to copy an installer to another host.
   - `allow_input`: a source address the input's list (IP addresses and CIDRs, separated by commas
     or spaces) does not hold gets 403 — everyone while it is empty. The source is the address the
     front sees: through Docker's published ports, a client on another host keeps its own, while
-    this machine's own requests may come from the Docker bridge's gateway.
+    this machine's own requests may come from the Docker bridge's gateway. So does every IPv6
+    client while the stack's IPv6 is off (no `--ipv6`): Docker's userland proxy hands it to the
+    front as the gateway, an address of Docker's pools. On a host with a global IPv6 address, an
+    install, re-run or upgrade with IPv6 off warns of each list holding a source in Docker's
+    default pools, `172.16.0.0/12` or `192.168.0.0/16` (a daemon given others is not checked; `warning: route R: K=… holds S, which every IPv6 client
+    passes as Docker's bridge gateway …: install --ipv6, or list narrower sources`).
   - `strip_headers` are removed, whatever the client sent, and so are the headers
     `forward_auth.copy_headers` lists (even while forward auth is off), so a client never forges
     one.
@@ -1846,7 +1871,9 @@ again, to copy an installer to another host.
   then upgrade) (`the front's https port 7443 is the L4 route data's: choose another with
   --https-port`, `--http-port`, or `--ports` in loopback mode). Stowage never probes them: the
   stack's health is the `health` provider's. On Docker it never restricts them either (the host's
-  firewall is the operator's, and an `allow_input` is never asked there); on the VM the firewall
+  firewall is the operator's, and an `allow_input` is never asked there): the end of an install,
+  re-run or upgrade logs each one's exposure (`L4 route echo: tcp/17007 on every address, open to
+  whoever reaches this host`, as `status` says it); on the VM the firewall
   opens each route's port, from its `allow_input`'s sources alone when it has one (see "The
   firewall" under the installer on the Kairos VM).
 - Optional services (an input's `profile`): the install records `COMPOSE_PROFILES` in `.env`, the
@@ -2637,7 +2664,11 @@ in the same installer (bootstrap it as above, then `sh <name>.sh vm create …`,
   addressing, IPv4 and IPv6, is checked by the rules `network set` follows (below), a refusal
   starting "the VM's network:"; `--ssh-allow` (CIDR, repeatable or comma-separated,
   IPv4 or IPv6; each masked to its prefix) the sources SSH accepts — without it SSH accepts every
-  source, and the run warns —, and `--timezone` an IANA zone name (`Europe/Paris`; letters,
+  source, and the run warns; on a cloud (`aws`, `azure`, `gcp`), whose VM answers on a public
+  address, without it SSH accepts this machine's public address alone, as
+  `https://checkip.amazonaws.com` sees it (logged: `SSH accepts this machine's public address
+  alone, <address>`), and a run that cannot learn it is refused (`--ssh-allow: a cloud's VM
+  answers on a public address …`): `--ssh-allow 0.0.0.0/0,::/0` is every source —, and `--timezone` an IANA zone name (`Europe/Paris`; letters,
   digits, `_`, `+`, `-` and `/`, a zone Go's database knows, never `Local`, `localtime`,
   `posixrules`, `Factory` or one under `right/` or `posix/`; default the OS's, UTC; a zone the
   VM's own database lacks leaves it on UTC, said in its boot log). When `--ssh-allow` leaves out
@@ -2649,7 +2680,18 @@ in the same installer (bootstrap it as above, then `sh <name>.sh vm create …`,
   `--secrets FILE` (`-` for standard input) is a decrypted `secrets export` file, a machine made
   again: checked as `install --secrets` checks it before anything else, it is never written into
   the cloud-config, whose settings say the first install waits for it (`await_secrets: true`); a
-  secret input it holds is not named as due. Then the product, as the VM's `install` asks it: the
+  secret input it holds is not named as due. The secrets go over SSH to a host key known
+  beforehand: `vm create` generates a one-time ed25519 host key, which the cloud-config carries
+  (the seed, `seed.iso` or `user-data.yaml`, is then written 0600). While the install does not
+  exist (`/usr/local/<name>/.env`) and the key was never retired, each boot writes it to
+  `/run/<name>-seed-host-key` (0600) and `/etc/ssh/sshd_config.d/01-<name>-seed-host-key.conf`,
+  which names it before the system's own keys, and reloads sshd; the first boot after the install
+  removes both and marks the key retired (`/oem/<name>-seed-host-key.retired`, on the OEM
+  partition, which a reset keeps), so no later boot serves it again: not an uninstalled or reset
+  VM's, nor its recovery system's. Without OpenTofu,
+  `vm create` prints the key's fingerprint (`ssh must show SHA256:… (ED25519), or do not send the
+  secrets`): after the install and a reboot the VM serves its own key, so `ssh-keygen -R <address>`
+  then. Then the product, as the VM's `install` asks it: the
   TLS mode (an HTTPS one: never `none`, whose loopback address nothing outside the VM reaches,
   nor `byo`, whose private key the cloud-config never carries), the domains and the inputs of the
   `kairos` shape — never from the environment, which says nothing about the VM — but no secret
@@ -2702,7 +2744,8 @@ in the same installer (bootstrap it as above, then `sh <name>.sh vm create …`,
   `registry_ca`. With `--registry-ca` it also writes the CA to
   `/usr/local/share/ca-certificates/<name>-registry.crt` (0644) and then, in a step of its own,
   runs `update-ca-certificates`: the VM's trust store holds it from every boot on, so its
-  `<short>-stow`, the host daemon and `kairos-agent upgrade` trust the mirror. It carries no secret.
+  `<short>-stow`, the host daemon and `kairos-agent upgrade` trust the mirror. It carries no secret,
+  but with `--secrets` the one-time host key (its header says so).
 - **With OpenTofu** (`--create opentofu`). `vm create` then creates the VM itself instead of
   printing steps, with a module: the platform's built-in one, or the operator's (`--module DIR`).
   The built-in modules, each pinning its provider's release exactly, with its lock file (the
@@ -2716,7 +2759,7 @@ in the same installer (bootstrap it as above, then `sh <name>.sh vm create …`,
   | `proxmox` (preview) | `bpg/proxmox` 0.117.0 | the image uploaded to a datastore with *Import* content (not enabled by default: Datacenter > Storage), the seed to one with *ISO* content, both through the API (the token alone, no SSH to the node); an OVMF VM importing the image, grown to `--disk`, the seed on its CD-ROM, a virtio NIC with a queue per vCPU (at most 64); no address (no guest agent) | `node` (required), `datastore` (`local-lvm`), `import_datastore` (`local`), `iso_datastore` (`local`), `bridge` (`vmbr0`) |
   | `vmware` (preview) | `vmware/vsphere` 2.17.1 | the OVA deployed, its disk grown to `--disk`, the seed uploaded to the datastore on its CD-ROM; its address when VMware tools report one | `datacenter`, `cluster`, `datastore`, `host` (required), `network` (`VM Network`), `folder` |
   | `aws` (preview) | `hashicorp/aws` 6.69.1 | the raw image uploaded to S3, imported as a snapshot (the `vmimport` role), registered as a UEFI image, an instance launched from it with the cloud-config as its user data (IMDSv2); its public address, else its private one | `region`, `bucket`, `subnet_id` (required), `security_group_ids` (comma-separated), `instance_type` (`t3.medium`), `vmimport_role` (`vmimport`) |
-  | `gcp` (preview) | `hashicorp/google` 8.7.0 | the image's `tar.gz` uploaded to Cloud Storage, a UEFI image declaring gVNIC, an instance booted from it with the cloud-config as its `user-data`; its external address | `project`, `zone`, `bucket` (required), `network` (`default`), `subnetwork`, `machine_type` (`e2-medium`), `nic_type` (`GVNIC`, or `VIRTIO_NET`) |
+  | `gcp` (preview) | `hashicorp/google` 8.7.0 | the image's `tar.gz` uploaded to Cloud Storage, a UEFI image declaring gVNIC, an instance booted from it with the cloud-config as its `user-data`, tagged with its name, and two firewall rules on its network reaching that tag (`<name>-<hash>-ssh`: TCP 22 from `ssh_sources`' IPv4 sources; `<name>-<hash>-ports`: `open_ports` from every source); its external address. The network's own rules still apply: the default network's `default-allow-ssh` opens SSH to every source, which the VM's firewall then narrows | `project`, `zone`, `bucket` (required), `network` (`default`), `subnetwork`, `machine_type` (`e2-medium`), `nic_type` (`GVNIC`, or `VIRTIO_NET`) |
   | `azure` (preview) | `hashicorp/azurerm` 5.10.0 | the fixed VHD uploaded as a page blob, a generation 2 image, a VM with a static public address and accelerated networking made from it with the cloud-config as its custom data (no VM agent); its public address | `resource_group`, `location`, `storage_account`, `subnet_id` (required), `container` (`vhds`), `vm_size` (`Standard_B2ls_v2`: a size that offers accelerated networking), `accelerated_networking` (`true`) |
 
   `hyperv` has none: `--create opentofu` there needs `--module`. A **preview** module has not run
@@ -2752,7 +2795,12 @@ in the same installer (bootstrap it as above, then `sh <name>.sh vm create …`,
     types do, and those flags are refused: `--cpus: the module sizes the VM by a variable of its
     own`), `image_format` (the format of `image`, the first of the `--platform`'s formats the
     release publishes: `qcow2` before `raw` on `truenas`, `proxmox` and `libvirt`), `dhcp` (true when the VM takes its IPv4 address by DHCP, false with `--network
-    static`), `admin_user` and `ssh_public_key` (given `--user` and the `--ssh-key` file's key). Its
+    static`), `admin_user` and `ssh_public_key` (given `--user` and the `--ssh-key` file's key),
+    `ssh_sources` (a list of CIDR: the sources SSH accepts, `--ssh-allow`'s or the cloud default's
+    above, `["0.0.0.0/0", "::/0"]` for every source) and `open_ports` (a list of `{protocol,
+    port}`: the ports the VM's firewall opens besides SSH, the front's HTTP and HTTPS ports and
+    each `l4` route's, whose `allow_input` only the VM's firewall applies), for a firewall of the
+    platform's. Its
     `*.tf` files are read as `tofu fmt` writes them (a variable block on one line, or closing at a
     lone `}`). It outputs `id` (what the platform calls the VM;
     required: `the module has no output id` fails the run after the apply, the state kept) and
@@ -2791,7 +2839,8 @@ in the same installer (bootstrap it as above, then `sh <name>.sh vm create …`,
     `terraform.tfvars.json` (the VM's name, place, size, the module's variables, the disk's and
     the seed's paths and SHA-256 — no credential), `platform` (`<platform> builtin` or
     `<platform> module`, which `vm destroy` reads), the seed (`seed.iso`, or `user-data.yaml` on a
-    cloud), OpenTofu's `terraform.tfstate`, and `known_hosts` (the VM's SSH host key). A host name
+    cloud), OpenTofu's `terraform.tfstate`, and `known_hosts` (the VM's SSH host key; with
+    `--secrets`, `known_hosts.seed` holds the one-time key while it is pinned). A host name
     whose directory holds the variables (an apply ran, or was tried) is refused: `vm destroy` it
     first, or choose another `--hostname`. So is a `--vm-name` another VM there already has,
     whatever its case (on TrueNAS its zvol and staging dataset would be the same).
@@ -2844,7 +2893,12 @@ in the same installer (bootstrap it as above, then `sh <name>.sh vm create …`,
     `status` tells where it stopped, a re-run of `sudo <short>-stow install` finishes an install
     begun, and those steps make one that did not begin. By hand, the steps end with them. The recovery and active systems have different SSH host keys: each attempt takes
     the key on first contact into a file of its own, and the VM's `known_hosts` keeps the key of
-    the attempt that answered. A VM not ready in time is kept; the error says so.
+    the attempt that answered. With `--secrets`, every call is pinned to the one-time host key
+    instead (`StrictHostKeyChecking=yes` against `known_hosts.seed`): a VM serving another key is
+    never sent the secrets, and is not ready until its wait ends. Once the install took them, a
+    last call through the pinned key reads the VM's own ed25519 key into `known_hosts`, removes
+    the one-time key and its drop-in, marks it retired and reloads sshd, and prints the VM's key's fingerprint; a
+    failure there is a warning (the next boot retires the key). A VM not ready in time is kept; the error says so.
   - It prints `ssh <user>@<host> <short>-stow status` and where the state is.
 - **`vm destroy HOSTNAME`** destroys a VM `vm create --create opentofu` made: `tofu destroy` of its
   module (the VM, its disk and data, its uploads), then its state directory. It needs the same
@@ -2896,6 +2950,7 @@ sudo <short>-stow install [--channel C] [--set KEY=VALUE]… [--answers FILE] [-
 <short>-stow network reset [--revert-secs N | --no-revert]   # drop the override: back to the cloud-config's network
 <short>-stow backup config [--json] [--destination REMOTE:PATH] [--rclone-config FILE|-] [--recipient age1…]…
           [--retention-days N] [--schedule CALENDAR] [--profile P] [--remove]   # show, change or drop the backup settings
+          [--lock | --unlock]   # the app socket may (not) change the settings
 <short>-stow backup run [--profile P] [--if-configured]   # back up now, and wait for it
 <short>-stow backup status|list [--json]   # the settings, the next and the last backup; the destination's backups
 <short>-stow backup verify [--destination REMOTE:PATH] [--rclone-config FILE|-] [--recipient age1…]…   # write a probe file, as a job it waits for; the flags try settings unsaved
@@ -3414,6 +3469,9 @@ sudo <short>-stow install [--channel C] [--set KEY=VALUE]… [--answers FILE] [-
     backup and restore verbs run (no verb reads it there).
   - `cert.expiring` — `reason`, the warning `status` gives: a byo install's certificate within 30
     days of its end, or past it, journaled as the daemon starts and once a day.
+  - `backup.config` — `reason`: `changed through the app socket: <the settings changed>`
+    (`destination`, `rclone_config`, `recipients`, `retention_days`, `schedule`, `profile`; the
+    values never), each time a service `host_api` names saves the backup settings.
   - `<short>-stow events` prints the entries after `--after` (default 0), one per line (`--json`:
     the daemon's JSON), and says when entries asked for are no longer kept. `--follow` then waits
     for more until interrupted; a daemon it cannot reach (a restart) is asked again from the same
@@ -3421,11 +3479,25 @@ sudo <short>-stow install [--channel C] [--set KEY=VALUE]… [--answers FILE] [-
     following) and 2 minutes to be answered, then counts as the daemon not reached, so a daemon
     that takes one and never answers is asked again. It runs on the VM, so a reboot ends it with
     the VM: run it again after the boot.
-- The app socket: when `shapes.kairos.host_api` names services, the daemon also serves its whole
+- The app socket: when `shapes.kairos.host_api` names services, the daemon also serves its
   API on `/run/<name>/app/app.sock` (0666, in a 0755 directory beside its socket), and every
   request there must carry `Authorization: Bearer <token>`, the install's `STOWAGE_HOST_TOKEN`
   (64 hex digits generated at the first install, or by the upgrade to a release that names
   services first); before an install records one, or with another token, the answer is 401.
+  The operator's routes answer 403 there, token or not: `provision`, `reset-db` (its plan
+  excepted), `secrets export`, `secrets rotate`, `restore` and `backup config --remove`
+  (`DELETE backup/config`), run over SSH alone, and so does an `upgrade` with `skip_backup` (the
+  backup a failed migration is restored from). `network` stays the app's, `revert_secs` 0
+  included: a service holding the token can move the VM to an address nothing reaches, which
+  the console undoes. The backup settings stay the app's to change —
+  destination, credentials, recipients, retention, schedule and profile, as a console sets them,
+  so a service whose token leaked can send the backups elsewhere, to its own keys, or stop them —
+  unless the operator locks them (`backup config --lock`, kept in `<dir>/backup-settings.lock`,
+  which removing the settings keeps, and a lock file that cannot be read counts as one): the app
+  then saves them unchanged alone (its whole form, recipients in any order), and every change is
+  the operator's, over SSH. A lock is written before the settings and an unlock after them, so a
+  refused or interrupted request leaves the settings locked. Each change the app makes is
+  journaled (`backup.config`; a save changing nothing, none).
   A daemon serving elsewhere (the hidden `--socket`) says so, as the services still mount
   `/run/<name>/app`. The services named, and only they, mount `/run/<name>/app` read-only at `/run/stowage-host`
   and are given `STOWAGE_HOST_SOCKET=/run/stowage-host/app.sock` and `STOWAGE_HOST_TOKEN`
@@ -3465,9 +3537,11 @@ other than the one the install runs, and without the last GET's token, which it 
   "dns", "revert_secs"}`; `ipv6` absent is off), `POST network/confirm`, `POST network/revert`, `POST network/reset`
   (`{"revert_secs"}`), each answering `{"message", "override", "pending"}`, `GET backup/config`
   (`{"configured", "destination", "rclone_config_set", "recipients", "retention_days", "schedule",
-  "profile", "profiles"}`), `POST backup/config` (`{"destination", "rclone_config", "recipients",
-  "retention_days", "schedule", "profile"}`: a field left out, or an empty `recipients`, keeps its
-  value; answers the settings), `DELETE backup/config`, `POST backup` (`{"profile",
+  "profile", "profiles", "locked"}`), `POST backup/config` (`{"destination", "rclone_config", "recipients",
+  "retention_days", "schedule", "profile", "lock"}`: a field left out, or an empty `recipients`, keeps its
+  value; answers the settings; `lock`, which `backup config --lock` / `--unlock` set, alone or
+  with other settings, is the operator's: on the app socket it is refused (403), and while it is
+  on, so is any change of the settings there; `POST backup/verify` refuses it, 400), `DELETE backup/config`, `POST backup` (`{"profile",
   "if_configured"}`: 202, a job, the target the backup's file name; with
   `if_configured`, 200 `{"skipped"}` without settings, before the install, or when the release
   has no `pg-age-rclone` backup or the OS no runner), `GET backup/status` (`{"settings", "next",
@@ -3571,7 +3645,7 @@ make e2e-k8s        # build, then the real binaries against zot and a kind clust
 make e2e-stateless  # build, then examples/stateless on the Docker shape: ship 1.0.0 (a pulled image, no database, no front) to zot, install it with the bootstrap one-liner (no TLS mode asked or recorded, no front running), the health path and the L4 route serving the input from an inline compose config, the state volume given the server's uid (the server, uid 1000, writes into it at start); a re-run changes the input, and the server is made again with it; `status` lists the L4 route; `--tls` refused, there being no front; ship 1.0.1, `upgrade --version 1.0.1` (nothing dumped) and `rollback` (no schema check), the input kept; `reset-db` refused, the release having no database
 make e2e-full-k8s   # build, then examples/full's chart on a kind cluster pulling from zot: k8s install with the bootstrap script against a Postgres outside the release (its two URLs and the administrator's password secret inputs from the operator's environment), two api replicas migrating once, the provision hook's Job registering the administrator and its API key (recorded in the outputs Secret, in no log; the Job deleted; no helm hook), every service answering, the api reaching the search extension's URL given at the install (`--set SEARCH_URL=…`), the endpoint printed as the api's Service URL; `k8s upgrade` of the same release, the key handed back to the hook; the app's users revoke the key, ship .2 (a migration), upgrade --version: the release runs .2 and the hook fails naming `k8s provision --set`, which mints and registers another key, and `k8s provision` again keeps it; its record lost, `k8s provision --set ADMIN_API_KEY=<key>` gives the key the hook never returned (an undeclared key refused) and no other is minted (data kept); rollback (the previous api on the newer schema); a second release in another namespace with the embedded Postgres, and reset-db deleting its database's claim, forgetting what the hook returned and registering the administrator again; `k8s secrets rotate` through its three passes, the release restarted at each, each value accepted while it must be; `k8s uninstall --yes` of the embedded release keeps its database's claim and its Secrets, and `k8s install` takes them back, the events kept
 make e2e-kairos     # build, then ship examples/minimal's OS bundle and its qcow2 and ova disks and its three clouds' raw, vhd and gce to zot for real (each image docker-loaded from the bundle, each disk's zstd layer decompressed with `zstd -d` and checked in its format, the vhd and the gce as Azure and Google Cloud import them); the bundle's notes-stow on the local Docker engine as on the VM (install from the preloaded images with a settings file, boot, the host daemon's verbs, its disk-pressure POST to the api (the token never logged) and `status` showing it, its app socket and the api service's token and mount, `backup config`, `verify`, `run` to a WebDAV server through the preloaded runner, the backup decrypted and read by `pg_restore` and the uploads volume's archive beside it, `list`, `status`); with `STOWAGE_CLOUD_ENV=<file>` (a shell file of a cloud's `STOWAGE_<CLOUD>_*` settings and credentials, needs `tofu`), the images registered on the clouds it sets up, the others reported left out, and every image it registered destroyed at exit; re-ship (nothing built, nothing registered again), promote, `vm create` from the published notes-stow (the qcow2 by digest, the seed ISO), verify, prune; ship 2.0.0, whose notes-stow's boot upgrades the install, and 1.0.0's boot goes back
-STOWAGE_VM_ENV=<file> make e2e-vm   # build, ship examples/minimal's OS bundle and qcow2 disk to zot, carry the release with `mirror export` / `mirror import` to a TLS zot mirror of its own test CA on this host's address toward TrueNAS, then the published notes-stow's `vm create --create opentofu --registry --registry-ca` boots a real VM on TrueNAS from the mirror's disk: its first boot installs from the cloud-config (`--ssh-allow` this host's address and its global IPv6 addresses, `--ipv6`, `--timezone Europe/Paris`); over SSH, the firewall's table (input dropped by default, SSH from this host alone, over IPv4 and IPv6, the front's ports, an `l4` route to the database open to this host's IPv4 address alone, its allowlist on the persistent partition: reached from this host, refused over IPv6) and the time zone, status, ps, passwordless sudo, the boot's tuning by the release's default profile (the connection table sized, no BBR, no sysctl file, the api container given the VM's own settings and open files), then `install --tune-profile network` tuning the VM at once (BBR, the ceilings, the local ports holding the L4 route's, status naming the operator's profile, the api container's settings), kept through the upgrade's reboot with the logs rotated, the admin group, the app socket (refused without the install's token, served with it) and the api service's read-only mount; the install records the mirror and the VM trusts its CA; the front answers HTTPS; `reset-db --yes` wipes the data and provisions again (a new admin password) without a reboot; `backup config` over SSH (the rclone config on standard input, a schedule the timer takes), `backup run` of a partitioned table with a key to a WebDAV server on this host, the backup decrypted and read by `pg_restore`, the uploads volume's archive beside it; a row and files added, then `restore` (the key on standard input) brings the backup's data and the volume back as they were; `secrets export` to the operator's key decrypts into the install's secrets; a re-run changing the route's allowlist refuses this host, through the upgrade's reboot; 1.0.1 is shipped and carried through the mirror, `updates` offers it and `upgrade --yes` takes a backup first, then reboots the VM into it, whose health gate marks the boot good; `rollback --yes` reboots it into the passive system, back on 1.0.0, and a second `rollback` is refused there; 1.0.2, whose api never becomes ready, is upgraded to from the passive system, fails its health gate, and the VM falls back to 1.0.0, `status` naming the failed boot and its diagnostics, `updates` no longer offering 1.0.2; 1.0.3, a rollback barrier that never becomes ready, fails its gate too and is kept (the boot marked good, `status` saying why going back is refused); the cloud-config's network is DHCP with DHCPv6 asked at once, the stack's network has IPv6, the LAN gives the VM a global IPv6 address and an IPv6 default route, and this host reaches it over IPv6 by SSH and HTTPS; `network set` keeps the DHCP lease as a static address, a static unique local IPv6 address beside it, and `network confirm` keeps it (the console banner tells it), a change back to DHCP not confirmed comes undone at its 30 s window's end, and another, a reboot inside its window, at the boot; `vm destroy` removes it all
+STOWAGE_VM_ENV=<file> make e2e-vm   # build, ship examples/minimal's OS bundle and qcow2 disk to zot, carry the release with `mirror export` / `mirror import` to a TLS zot mirror of its own test CA on this host's address toward TrueNAS, then the published notes-stow's `vm create --create opentofu --registry --registry-ca` boots a real VM on TrueNAS from the mirror's disk: its first boot installs from the cloud-config (`--ssh-allow` this host's address and its global IPv6 addresses, `--ipv6`, `--timezone Europe/Paris`); over SSH, the firewall's table (input dropped by default, SSH from this host alone, over IPv4 and IPv6, the front's ports, an `l4` route to the database open to this host's IPv4 address alone, its allowlist on the persistent partition: reached from this host, refused over IPv6) and the time zone, status, ps, passwordless sudo, the boot's tuning by the release's default profile (the connection table sized, no BBR, no sysctl file, the api container given the VM's own settings and open files), then `install --tune-profile network` tuning the VM at once (BBR, the ceilings, the local ports holding the L4 route's, status naming the operator's profile, the api container's settings), kept through the upgrade's reboot with the logs rotated, the admin group, the app socket (refused without the install's token, served with it, `secrets export` refused there) and the api service's read-only mount; the install records the mirror and the VM trusts its CA; the front answers HTTPS; `reset-db --yes` wipes the data and provisions again (a new admin password) without a reboot; `backup config` over SSH (the rclone config on standard input, a schedule the timer takes), `backup run` of a partitioned table with a key to a WebDAV server on this host, the backup decrypted and read by `pg_restore`, the uploads volume's archive beside it; a row and files added, then `restore` (the key on standard input) brings the backup's data and the volume back as they were; `secrets export` to the operator's key decrypts into the install's secrets; a re-run changing the route's allowlist refuses this host, through the upgrade's reboot; 1.0.1 is shipped and carried through the mirror, `updates` offers it and `upgrade --yes` takes a backup first, then reboots the VM into it, whose health gate marks the boot good; `rollback --yes` reboots it into the passive system, back on 1.0.0, and a second `rollback` is refused there; 1.0.2, whose api never becomes ready, is upgraded to from the passive system, fails its health gate, and the VM falls back to 1.0.0, `status` naming the failed boot and its diagnostics, `updates` no longer offering 1.0.2; 1.0.3, a rollback barrier that never becomes ready, fails its gate too and is kept (the boot marked good, `status` saying why going back is refused); the cloud-config's network is DHCP with DHCPv6 asked at once, the stack's network has IPv6, the LAN gives the VM a global IPv6 address and an IPv6 default route, and this host reaches it over IPv6 by SSH and HTTPS; `network set` keeps the DHCP lease as a static address, a static unique local IPv6 address beside it, and `network confirm` keeps it (the console banner tells it), a change back to DHCP not confirmed comes undone at its 30 s window's end, and another, a reboot inside its window, at the boot; `vm destroy` removes it all
 STOWAGE_VM_ENV=<file> make e2e-full-vm   # build, ship examples/full's this month's release with its OS bundle and qcow2 disk to zot, carry it through the TLS mirror as e2e-vm does, then the published at-stow's `vm create --create opentofu` boots a real VM on TrueNAS whose first boot installs it with the search extension's input set (`--set SEARCH_URL=http://api:9090`, the api standing in for a search service); through the VM's front over HTTPS, the api answers with the organisation, the administrator the provision hook registered and the search URL reached; the console and ingest serve, and an event reaches the api; the api reads the front's local CA (publish_ca), which the api route's certificate chains to; the hook's credentials file is 0600, the api mounts the app socket's directory read-only; `vm destroy` removes it all (upgrade, rollback and the health gate's fallback are e2e-vm's)
 ```
 

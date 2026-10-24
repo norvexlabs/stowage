@@ -17,6 +17,7 @@ import (
 	"maps"
 	"math/big"
 	"net"
+	"net/http"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -140,6 +141,9 @@ type Options struct {
 	// LookupIP resolves a host name; nil is the system's resolver.
 	SourceAddr func(dst netip.Addr) (netip.Addr, error)
 	LookupIP   func(host string) ([]netip.Addr, error)
+	// PublicAddr is this machine's public address, as a server on the internet sees it; nil asks
+	// publicAddrURL.
+	PublicAddr func(ctx context.Context) (netip.Addr, error)
 }
 
 func (o *Options) logf(format string, a ...any) { fmt.Fprintf(o.Log, format+"\n", a...) }
@@ -1155,6 +1159,7 @@ func (in *Installer) renderStack(env *EnvFile, dir string) error {
 			}
 		}
 	}
+	in.warnIPv6Allowlists(get)
 	fc, err := frontCompose(f, in.R.Spec.L4.Routes, get, mode, in.hostAPI(), "sha256:"+hex.EncodeToString(h.Sum(nil)), ca, clientCA != nil, get(IPv6Var) == "true")
 	if err != nil {
 		return err
@@ -1282,6 +1287,11 @@ func (in *Installer) up(ctx context.Context, env *EnvFile) error {
 		return fmt.Errorf("the stack did not become ready: %w (see: docker compose --project-directory %s logs)", err, in.O.Dir)
 	}
 	in.certDone()
+	for _, r := range in.R.Spec.L4.Routes {
+		if e := in.l4Exposure(r, func(k string) string { v, _ := env.Get(k); return v }); e != "" {
+			in.O.logf("L4 route %s: %s/%d %s", r.Name, r.Protocol, r.Port, e)
+		}
+	}
 	if !in.R.Spec.HasFront() {
 		fmt.Fprintf(in.O.Out, "%s %s is running\n", in.R.Spec.Name, in.R.Manifest.ProjectVersion)
 		return nil
@@ -1611,6 +1621,22 @@ func bindAddr(r spec.L4Route, get func(string) string) string {
 	return a.Unmap().String()
 }
 
+// l4Exposure says where a Docker install's L4 route listens and who decides its sources: Docker
+// publishes the port past the host's own firewall rules, so on every address it is open to
+// whoever reaches the host. Empty on the VM, whose firewall applies the route's allowlist.
+func (in *Installer) l4Exposure(r spec.L4Route, get func(string) string) string {
+	switch a := bindAddr(r, get); {
+	case in.O.Firewall != "":
+		return ""
+	case a != "":
+		return "on " + a + " alone"
+	case r.BindInput != "":
+		return "on every address, open to whoever reaches this host (" + r.BindInput + " gives it one address)"
+	default:
+		return "on every address, open to whoever reaches this host"
+	}
+}
+
 // FirewallConf is the VM's firewall ruleset, which flushes its own table only.
 const FirewallConf = "/etc/nftables.conf"
 
@@ -1807,7 +1833,11 @@ func (in *Installer) Status(ctx context.Context) error {
 	}
 	// Each L4 route: its protocol and host port, and the endpoint the stack reads when it has one.
 	for _, r := range in.R.Spec.L4.Routes {
-		fmt.Fprintf(in.O.Out, "%-9s %s\n", r.Name, strings.TrimSpace(fmt.Sprintf("%s/%d %s", r.Protocol, r.Port, get(spec.L4Var(r.Name)))))
+		line := strings.TrimSpace(fmt.Sprintf("%s/%d %s", r.Protocol, r.Port, get(spec.L4Var(r.Name))))
+		if e := in.l4Exposure(r, get); e != "" {
+			line += " · " + e
+		}
+		fmt.Fprintf(in.O.Out, "%-9s %s\n", r.Name, line)
 	}
 	if url := in.dockerEndpoint(env); url != "" {
 		fmt.Fprintf(in.O.Out, "%-9s %s\n", "endpoint", url)
@@ -2485,6 +2515,41 @@ func (o *Options) lookupIP(host string) ([]netip.Addr, error) {
 		return o.LookupIP(host)
 	}
 	return net.DefaultResolver.LookupNetIP(context.Background(), "ip", host)
+}
+
+// publicAddrURL answers, in plain text, the address its client comes from.
+const publicAddrURL = "https://checkip.amazonaws.com"
+
+// publicAddr is this machine's public address: the one publicAddrURL saw it come from.
+func (o *Options) publicAddr(ctx context.Context) (netip.Addr, error) {
+	if o.PublicAddr != nil {
+		return o.PublicAddr(ctx)
+	}
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, publicAddrURL, nil)
+	if err != nil {
+		return netip.Addr{}, err
+	}
+	// Straight, never through a proxy: the address asked for is the one this machine's SSH leaves from.
+	resp, err := (&http.Client{Transport: &http.Transport{Proxy: nil}}).Do(req)
+	if err != nil {
+		return netip.Addr{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return netip.Addr{}, fmt.Errorf("%s: %s", publicAddrURL, resp.Status)
+	}
+	b, err := io.ReadAll(io.LimitReader(resp.Body, 64))
+	if err != nil {
+		return netip.Addr{}, err
+	}
+	a, err := netip.ParseAddr(strings.TrimSpace(string(b)))
+	a = a.Unmap()
+	if err != nil || !a.IsGlobalUnicast() || a.IsPrivate() {
+		return netip.Addr{}, fmt.Errorf("%s answered %q, not a public address", publicAddrURL, b)
+	}
+	return a, nil
 }
 
 func (o *Options) environ() []string {

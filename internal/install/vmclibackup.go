@@ -63,7 +63,7 @@ func backupCommand(c *hostClient, name string, stdout, stderr io.Writer) *cobra.
 	var dest, rcloneFile, schedule, profile string
 	var recipients []string
 	var retention int
-	var remove bool
+	var remove, lock, unlock bool
 	config := &cobra.Command{
 		Use:   "config",
 		Short: "Show the backup settings, or change them (the flags given; the others keep their value)",
@@ -73,7 +73,10 @@ func backupCommand(c *hostClient, name string, stdout, stderr io.Writer) *cobra.
 			f := cmd.Flags()
 			var s BackupSettings
 			changed := false
-			for _, n := range []string{"destination", "rclone-config", "recipient", "retention-days", "schedule", "profile"} {
+			if lock && unlock {
+				return fmt.Errorf("--lock or --unlock, not both")
+			}
+			for _, n := range []string{"destination", "rclone-config", "recipient", "retention-days", "schedule", "profile", "lock", "unlock"} {
 				changed = changed || f.Changed(n)
 			}
 			switch {
@@ -117,6 +120,9 @@ func backupCommand(c *hostClient, name string, stdout, stderr io.Writer) *cobra.
 				if f.Changed("profile") {
 					body.Profile = &profile
 				}
+				if lock || unlock {
+					body.Lock = &lock
+				}
 				if err := c.do(ctx, http.MethodPost, "/v1/backup/config", body, &s); err != nil {
 					return err
 				}
@@ -136,6 +142,8 @@ func backupCommand(c *hostClient, name string, stdout, stderr io.Writer) *cobra.
 	cf.StringVar(&schedule, "schedule", defaultBackupSchedule, "when the scheduled backup runs: a systemd calendar event")
 	cf.StringVar(&profile, "profile", "", "the profile a scheduled backup takes (default: the release's default profile)")
 	cf.BoolVar(&remove, "remove", false, "drop the settings: no backup runs")
+	cf.BoolVar(&lock, "lock", false, "the app socket may no longer change the settings (the operator still does)")
+	cf.BoolVar(&unlock, "unlock", false, "the app socket may change the settings again")
 	jsonFlag(config)
 
 	var run BackupRequest
@@ -255,6 +263,9 @@ func printBackupSettings(w io.Writer, ctl string, s BackupSettings) {
 	fmt.Fprintf(w, "retention    %s\n", keep)
 	fmt.Fprintf(w, "schedule     %s\n", s.Schedule)
 	fmt.Fprintf(w, "profile      %s (of %s)\n", s.Profile, strings.Join(s.Profiles, ", "))
+	if s.Locked {
+		fmt.Fprintln(w, "locked       the app socket may not change these (--unlock)")
+	}
 }
 
 func orNone(s string) string {

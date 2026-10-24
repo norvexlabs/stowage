@@ -864,6 +864,51 @@ func TestHostNetworkOnDockerWarns(t *testing.T) {
 	}
 }
 
+// A service given the host's powers is warned, each key on its own, never refused.
+func TestHostPrivilegesWarn(t *testing.T) {
+	t.Parallel()
+	const img, vol = "    image: ${STOWAGE_IMAGE_SERVER}\n", "      - state:/state\n"
+	for _, c := range []struct{ old, add, want string }{
+		{img, "    privileged: true\n", "services.server.privileged: true: the container holds every power of the host's root"},
+		{img, "    cap_add: [NET_ADMIN, SYS_TIME]\n", "services.server.cap_add: NET_ADMIN, SYS_TIME: powers of the host's root beyond Docker's defaults"},
+		{img, "    pid: host\n", "services.server.pid: host: the service sees and signals every process of the host"},
+		{vol, "      - /var/run/docker.sock:/var/run/docker.sock:ro\n", "services.server.volumes: the Docker socket is mounted"},
+		{vol, "      - { type: bind, source: /run/docker.sock, target: /d.sock }\n", "services.server.volumes: the Docker socket is mounted"},
+		{vol, "      - { source: /var/run/docker.sock, target: /d.sock }\n", "services.server.volumes: the Docker socket is mounted"},
+		{vol, "      - /var/run:/host/run:ro\n", "services.server.volumes: the Docker socket is mounted"},
+		{vol, "      - /:/host:ro\n", "services.server.volumes: the Docker socket is mounted"},
+		{vol, "      - ${SOCK:-/var/run/docker.sock}:/var/run/docker.sock\n", "services.server.volumes: the Docker socket is mounted"},
+		{img, "    privileged: ${PRIVILEGED:-true}\n", "services.server.privileged: true"},
+	} {
+		root := testutil.CopyExample(t, "stateless")
+		testutil.Edit(t, root, "deploy/compose.yaml", c.old, c.old+c.add)
+		res := run(t, root)
+		if len(res.Findings) != 1 || res.Findings[0].Severity != Warning || !strings.Contains(res.Findings[0].String(), c.want) {
+			t.Errorf("%q: findings %+v", c.add, res.Findings)
+		}
+	}
+	// What a service extends is its own: the base and the service are both warned.
+	root := testutil.CopyExample(t, "stateless")
+	testutil.Edit(t, root, "deploy/compose.yaml", img, img+"    pid: host\n    cap_add: [NET_ADMIN]\n")
+	testutil.Edit(t, root, "deploy/compose.yaml", "\nconfigs:\n", "  relay:\n    extends: server\n\nconfigs:\n")
+	var got []string
+	for _, f := range run(t, root).Findings {
+		got = append(got, f.String())
+	}
+	for _, want := range []string{"services.relay.pid: host", "services.relay.cap_add: NET_ADMIN", "services.server.pid: host"} {
+		if !slices.ContainsFunc(got, func(s string) bool { return strings.Contains(s, want) }) {
+			t.Errorf("no %q in %q", want, got)
+		}
+	}
+	// What gives none: privileged false, another socket.
+	root = testutil.CopyExample(t, "stateless")
+	testutil.Edit(t, root, "deploy/compose.yaml", img, img+"    privileged: false\n")
+	testutil.Edit(t, root, "deploy/compose.yaml", vol, vol+"      - /run/other.sock:/run/other.sock\n      - /var/lib/data:/data\n      - /var/run/docker.sock\n      - ${DATA:-/srv/data}:/data2\n")
+	if res := run(t, root); len(res.Findings) != 0 {
+		t.Errorf("findings %+v", res.Findings)
+	}
+}
+
 // A chart that never reads the L4 routes is warned: they would not be published on Kubernetes.
 func TestChartNotReadingTheL4RoutesWarns(t *testing.T) {
 	t.Parallel()

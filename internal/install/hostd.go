@@ -483,51 +483,80 @@ func own(p string, gid int, mode os.FileMode) error {
 	return os.Chmod(p, mode)
 }
 
-// Handler is the API.
-func (h *Hostd) Handler() http.Handler {
+// appCaller marks a request's context as the app socket's.
+type appCaller struct{}
+
+// fromApp is whether r came through the app socket.
+func fromApp(r *http.Request) bool { b, _ := r.Context().Value(appCaller{}).(bool); return b }
+
+// Handler is the API, as the operator's socket serves it.
+func (h *Hostd) Handler() http.Handler { return h.routes(false) }
+
+// routes is the API; for the app socket (app), what each route says the app may reach, and a
+// 403 for the others: every route states it where it is registered.
+func (h *Hostd) routes(app bool) http.Handler {
 	if h.ctx == nil {
 		h.ctx = context.Background()
 	}
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /v1/status", h.status)
-	mux.HandleFunc("GET /v1/services", h.services)
-	mux.HandleFunc("GET /v1/services/{service}/logs", h.logs)
-	mux.HandleFunc("POST /v1/services/{service}/{action}", h.serviceAction)
-	mux.HandleFunc("POST /v1/provision", h.provision)
-	mux.HandleFunc("GET /v1/reset-db", h.resetDBPlan)
-	mux.HandleFunc("POST /v1/reset-db", h.resetDB)
-	mux.HandleFunc("GET /v1/health", h.health)
-	mux.HandleFunc("GET /v1/updates", h.updates)
-	mux.HandleFunc("POST /v1/upgrade", h.upgrade)
-	mux.HandleFunc("GET /v1/rollback", h.rollbackPlan)
-	mux.HandleFunc("POST /v1/rollback", h.rollback)
-	mux.HandleFunc("GET /v1/job", h.jobStatus)
-	mux.HandleFunc("GET /v1/events", h.events)
-	mux.HandleFunc("POST /v1/reboot", func(w http.ResponseWriter, r *http.Request) { h.power(w, r, "reboot") })
-	mux.HandleFunc("POST /v1/shutdown", func(w http.ResponseWriter, r *http.Request) { h.power(w, r, "poweroff") })
-	mux.HandleFunc("GET /v1/network", h.network)
-	mux.HandleFunc("POST /v1/network", h.setNetwork)
-	mux.HandleFunc("POST /v1/network/confirm", h.confirmNetwork)
-	mux.HandleFunc("POST /v1/network/revert", h.revertNetwork)
-	mux.HandleFunc("POST /v1/network/reset", h.resetNetwork)
-	mux.HandleFunc("GET /v1/backup/config", h.backupConfig)
-	mux.HandleFunc("POST /v1/backup/config", h.setBackupConfig)
-	mux.HandleFunc("DELETE /v1/backup/config", h.removeBackupConfig)
-	mux.HandleFunc("POST /v1/backup", h.startBackup)
-	mux.HandleFunc("GET /v1/backup/status", h.backupStatus)
-	mux.HandleFunc("GET /v1/backup/list", h.listBackups)
-	mux.HandleFunc("POST /v1/backup/verify", h.verifyBackup)
-	mux.HandleFunc("POST /v1/secrets/export", h.exportSecrets)
-	mux.HandleFunc("POST /v1/secrets/rotate", h.rotateSecret)
-	mux.HandleFunc("POST /v1/restore", h.restoreBackup)
+	handle := func(pattern string, f http.HandlerFunc, appToo bool) {
+		switch serve := f; {
+		case app && !appToo:
+			f = func(w http.ResponseWriter, r *http.Request) {
+				reply(w, http.StatusForbidden, map[string]string{"error": "the host daemon's app socket does not serve " + pattern + ": run it as the operator"})
+			}
+		case app:
+			f = func(w http.ResponseWriter, r *http.Request) {
+				serve(w, r.WithContext(context.WithValue(r.Context(), appCaller{}, true)))
+			}
+		}
+		mux.HandleFunc(pattern, f)
+	}
+	// The app reaches what operates the install; the operator's alone are the routes that hand
+	// out or replace the secrets, erase or overwrite the data, re-run the hook (whose outputs
+	// include credentials), or stop the backups.
+	both := func(pattern string, f http.HandlerFunc) { handle(pattern, f, true) }
+	operator := func(pattern string, f http.HandlerFunc) { handle(pattern, f, false) }
+	both("GET /v1/status", h.status)
+	both("GET /v1/services", h.services)
+	both("GET /v1/services/{service}/logs", h.logs)
+	both("POST /v1/services/{service}/{action}", h.serviceAction)
+	operator("POST /v1/provision", h.provision)
+	both("GET /v1/reset-db", h.resetDBPlan)
+	operator("POST /v1/reset-db", h.resetDB)
+	both("GET /v1/health", h.health)
+	both("GET /v1/updates", h.updates)
+	both("POST /v1/upgrade", h.upgrade)
+	both("GET /v1/rollback", h.rollbackPlan)
+	both("POST /v1/rollback", h.rollback)
+	both("GET /v1/job", h.jobStatus)
+	both("GET /v1/events", h.events)
+	both("POST /v1/reboot", func(w http.ResponseWriter, r *http.Request) { h.power(w, r, "reboot") })
+	both("POST /v1/shutdown", func(w http.ResponseWriter, r *http.Request) { h.power(w, r, "poweroff") })
+	both("GET /v1/network", h.network)
+	both("POST /v1/network", h.setNetwork)
+	both("POST /v1/network/confirm", h.confirmNetwork)
+	both("POST /v1/network/revert", h.revertNetwork)
+	both("POST /v1/network/reset", h.resetNetwork)
+	both("GET /v1/backup/config", h.backupConfig)
+	both("POST /v1/backup/config", h.setBackupConfig) // the lock's checks are its own
+	operator("DELETE /v1/backup/config", h.removeBackupConfig)
+	both("POST /v1/backup", h.startBackup)
+	both("GET /v1/backup/status", h.backupStatus)
+	both("GET /v1/backup/list", h.listBackups)
+	both("POST /v1/backup/verify", h.verifyBackup)
+	operator("POST /v1/secrets/export", h.exportSecrets)
+	operator("POST /v1/secrets/rotate", h.rotateSecret)
+	operator("POST /v1/restore", h.restoreBackup)
 	return mux
 }
 
 // AppHandler is the API as the app socket serves it: each request must carry the install's token
 // (HostTokenVar), read from the install at every request, as "Authorization: Bearer <token>".
-// Before the install records one, every request is refused.
+// Before the install records one, every request is refused. The operator's routes answer 403
+// (routes).
 func (h *Hostd) AppHandler() http.Handler {
-	api := h.Handler()
+	api := h.routes(true)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		in, _ := h.run()
 		want := ""
@@ -1318,6 +1347,12 @@ func (h *Hostd) upgrade(w http.ResponseWriter, r *http.Request) {
 	var req UpgradeRequest
 	if err := decodeBody(r, &req); err != nil {
 		replyErr(w, err)
+		return
+	}
+	// The backup before an upgrade is what a failed migration is restored from: the operator's
+	// alone to skip.
+	if req.SkipBackup && fromApp(r) {
+		replyErr(w, fail(http.StatusForbidden, "skip_backup is the operator's: upgrade --skip-backup over SSH"))
 		return
 	}
 	in, _ := h.run()

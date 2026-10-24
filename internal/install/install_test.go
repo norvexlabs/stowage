@@ -766,7 +766,7 @@ func TestL4Routes(t *testing.T) {
 		t.Errorf("err = %v", err)
 	}
 	var out bytes.Buffer
-	if err := e.installer(func(o *Options) { o.Out = &out }).Status(context.Background()); err != nil || !strings.Contains(out.String(), "\ndata      tcp/7443\ndata-udp  udp/7443\n") {
+	if err := e.installer(func(o *Options) { o.Out = &out }).Status(context.Background()); err != nil || !strings.Contains(out.String(), "\ndata      tcp/7443 · on every address, open to whoever reaches this host\ndata-udp  udp/7443 · on every address, open to whoever reaches this host\n") {
 		t.Errorf("%v\n%s", err, out.String())
 	}
 	// The first install: an option over the project's port, and the route's port free.
@@ -807,6 +807,27 @@ func TestL4Routes(t *testing.T) {
 	// The provision hook is handed the endpoint, like the routes' URLs.
 	if keys := e.installer(nil).providedEnv(e.readEnv()); !slices.Contains(keys, "STOWAGE_L4_DATA") {
 		t.Errorf("provided: %v", keys)
+	}
+}
+
+func TestAnL4RoutesExposureIsSaid(t *testing.T) {
+	t.Parallel()
+	bound := spec.L4Route{Name: "data", Protocol: "tcp", Port: 7443, BindInput: "DATA_BIND"}
+	for _, c := range []struct {
+		r        spec.L4Route
+		bind, fw string
+		want     string
+	}{
+		{bound, "192.0.2.7", "", "on 192.0.2.7 alone"},
+		{bound, "", "", "on every address, open to whoever reaches this host (DATA_BIND gives it one address)"},
+		{bound, "0.0.0.0", "", "on every address, open to whoever reaches this host (DATA_BIND gives it one address)"},
+		{spec.L4Route{Name: "data", Protocol: "udp", Port: 7443}, "", "", "on every address, open to whoever reaches this host"},
+		{bound, "", "/run/notes/firewall", ""}, // the VM's firewall applies the allowlist
+	} {
+		in := &Installer{O: Options{Firewall: c.fw}}
+		if got := in.l4Exposure(c.r, func(k string) string { return map[string]string{"DATA_BIND": c.bind}[k] }); got != c.want {
+			t.Errorf("%+v: %q", c, got)
+		}
 	}
 }
 

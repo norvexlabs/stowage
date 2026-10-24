@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/netip"
 	"os"
+	"path"
 	"regexp"
 	"slices"
 	"strconv"
@@ -47,6 +48,10 @@ type Service struct {
 	Volumes     any    `yaml:"volumes"`
 	Devices     any    `yaml:"devices"`
 	NetworkMode string `yaml:"network_mode"`
+	// Privileged, CapAdd and Pid are what the service is given of the host's powers.
+	Privileged any    `yaml:"privileged"`
+	CapAdd     any    `yaml:"cap_add"`
+	Pid        string `yaml:"pid"`
 	// MemLimit, MemReservation, Scale and Deploy are what the service sets of its memory and its
 	// number of containers.
 	MemLimit       any `yaml:"mem_limit"`
@@ -103,8 +108,9 @@ func composeSize(v any) (spec.Bytes, bool) {
 	return 0, false
 }
 
-// inherit fills each service's image, build, network mode and memory settings from the service it
-// extends, where it sets none, and joins its profiles, ports, volumes and devices with the base's, as compose does. It refuses an extends compose would resolve outside this file (a
+// inherit fills each service's image, build, network mode, privileged, pid and memory settings
+// from the service it extends, where it sets none, and joins its profiles, ports, volumes, devices
+// and cap_add with the base's, as compose does. It refuses an extends compose would resolve outside this file (a
 // file the release does not carry), a service the file does not declare, and a cycle.
 func (c *Compose) inherit() map[string]error {
 	errs := map[string]error{}
@@ -166,6 +172,13 @@ func (c *Compose) inherit() map[string]error {
 		if svc.NetworkMode == "" {
 			svc.NetworkMode = b.NetworkMode
 		}
+		if svc.Privileged == nil {
+			svc.Privileged = b.Privileged
+		}
+		if svc.Pid == "" {
+			svc.Pid = b.Pid
+		}
+		svc.CapAdd = joinList(svc.CapAdd, b.CapAdd)
 		// The memory a share's maximum is checked against: each setting the service leaves unset.
 		for _, f := range []struct{ own, base *any }{
 			{&svc.MemLimit, &b.MemLimit}, {&svc.MemReservation, &b.MemReservation}, {&svc.Scale, &b.Scale},
@@ -211,6 +224,76 @@ func mountsVolume(vols any, key string) bool {
 		}
 	}
 	return false
+}
+
+// dockerSockets are where a host's Docker engine listens: a container mounting one drives the
+// engine, so holds the host.
+var dockerSockets = []string{"/var/run/docker.sock", "/run/docker.sock"}
+
+// MountsDockerSocket is whether vols bind-mounts the host's Docker socket, or a directory
+// holding it (/var/run, /run, /).
+func MountsDockerSocket(vols any) bool {
+	list, _ := vols.([]any)
+	for _, m := range list {
+		var src string
+		switch m := m.(type) {
+		case string:
+			src = shortSource(m)
+		case map[string]any:
+			// A bind, or an entry without a type whose source is a path, as compose reads it.
+			if t, _ := m["type"].(string); t == "bind" || t == "" {
+				src, _ = m["source"].(string)
+			}
+		}
+		if !strings.HasPrefix(src, "/") {
+			continue // a named volume, or a path lint cannot read
+		}
+		src = path.Clean(src)
+		// The socket, or a directory holding it.
+		if slices.ContainsFunc(dockerSockets, func(s string) bool { return s == src || strings.HasPrefix(s, strings.TrimSuffix(src, "/")+"/") }) {
+			return true
+		}
+	}
+	return false
+}
+
+// shortSource is the host source of a short-syntax volume, SOURCE:TARGET[:MODE]; a source
+// ${VAR:-default} or ${VAR-default} reads as its default. Empty for a bare TARGET (an anonymous
+// volume) or a source lint cannot read.
+func shortSource(v string) string {
+	if strings.HasPrefix(v, "${") {
+		end := strings.Index(v, "}")
+		if end < 0 || !strings.HasPrefix(v[end+1:], ":") {
+			return ""
+		}
+		// A variable's name holds no '-': the first one starts its default (after ':' or not).
+		_, def, ok := strings.Cut(v[2:end], "-")
+		if !ok {
+			return ""
+		}
+		return def
+	}
+	src, _, ok := strings.Cut(v, ":")
+	if !ok {
+		return ""
+	}
+	return src
+}
+
+// joinCaps is a cap_add list joined with ", ", or its value as written when it is no list.
+func joinCaps(v any) string {
+	list, ok := v.([]any)
+	if !ok {
+		if v == nil {
+			return ""
+		}
+		return fmt.Sprint(v)
+	}
+	var caps []string
+	for _, c := range list {
+		caps = append(caps, fmt.Sprint(c))
+	}
+	return strings.Join(caps, ", ")
 }
 
 // joinList is a service's list joined with its base's; one that is no list is kept as an entry,
@@ -543,4 +626,11 @@ var ProvidedVars = map[string]string{
 	"STOWAGE_LOOPBACK_ADDRESS": "a loopback address, 127.x or ::1 (in loopback mode, the one the front's ports bind to)",
 	"STOWAGE_IPV6":             "true with --ipv6: IPv6 on the stack's network",
 	"STOWAGE_TLS_MODE":         "how the front serves: none (loopback), acme, dns-cloudflare, byo or internal (never set without a front)",
+}
+
+// privilegedText is whether a privileged: compose reads as a string may turn it on: "true", or an
+// interpolation lint cannot read.
+func privilegedText(v any) bool {
+	s, ok := v.(string)
+	return ok && (strings.EqualFold(strings.TrimSpace(s), "true") || strings.Contains(s, "${"))
 }

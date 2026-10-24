@@ -252,6 +252,43 @@ func (o *options) printRelease(r *publish.Ref) error {
 	return nil
 }
 
+// printBootstrap prints how an operator gets the release's bootstrap script: its installer by
+// digest, which a first install trusts as it is run, so checked first when the project signs.
+func (o *options) printBootstrap(p *project.Project, r *publish.Ref) {
+	if o.json || r == nil || r.Manifest.Artifacts.Installer == "" {
+		return // a release published before its installer was recorded names none
+	}
+	m := r.Manifest
+	ref := p.Spec.Registry.Prefix + "/" + m.Name + "-installer@" + m.Artifacts.Installer
+	var keys []string
+	if p.Spec.Signs() {
+		c, err := providers.CosignKey(p.Spec.Signing)
+		if err != nil {
+			fmt.Fprintf(o.out, "Check the installer with the project's public key: signing: %v\n", err)
+		}
+		for _, k := range c.PublicKeys {
+			path, err := spec.ProjectPath(p.Root, k)
+			if err != nil {
+				fmt.Fprintf(o.out, "Check the installer with the project's public key: signing.public_keys: %v\n", err)
+				continue
+			}
+			keys = append(keys, path)
+		}
+	}
+	// Each key the release's installs trust: in a rotation, the one that signs is either.
+	for i, k := range keys {
+		lead := "Check the installer"
+		if i > 0 {
+			lead = "  or, with another key"
+		}
+		fmt.Fprintf(o.out, "%s: cosign verify --key %s --insecure-ignore-tlog=true %s\n", lead, k, ref)
+	}
+	if !p.Spec.Signs() {
+		fmt.Fprintln(o.out, "Not signed (no signing): an install trusts whatever the registry serves.")
+	}
+	fmt.Fprintf(o.out, "Then: docker run --rm %s > %s.sh\n", ref, m.Name)
+}
+
 // ship publishes the tree's release on channel (the default one when empty). want, when set, is
 // the version the caller expects the tree to be at: another one is refused.
 func (o *options) ship(ctx context.Context, channel string, revision int, want string, disks bool) error {
@@ -288,7 +325,11 @@ func (o *options) ship(ctx context.Context, channel string, revision int, want s
 		}
 	}
 	r, err := pub.Ship(ctx, publish.ShipOptions{Version: v, Channel: channel, Revision: revision, Disks: disks})
-	return o.published(r, err)
+	if err := o.published(r, err); err != nil {
+		return err
+	}
+	o.printBootstrap(p, r)
+	return nil
 }
 
 // published prints a release a ship or a promote published. A cleanup that failed after it is
@@ -395,7 +436,11 @@ func promoteCmd(o *options) *cobra.Command {
 				return err
 			}
 			r, err := pub.Promote(cmd.Context(), v, from, to, revision)
-			return o.published(r, err)
+			if err := o.published(r, err); err != nil {
+				return err
+			}
+			o.printBootstrap(p, r)
+			return nil
 		},
 	}
 	c.Flags().StringVar(&from, "from", "", "source channel (required)")

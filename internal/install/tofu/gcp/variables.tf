@@ -82,3 +82,18 @@ variable "nic_type" {
     error_message = "nic_type is GVNIC or VIRTIO_NET."
   }
 }
+
+variable "ssh_sources" {
+  description = "The sources SSH accepts, as CIDR: --ssh-allow's, or this machine's public address."
+  type        = list(string)
+  default     = []
+}
+
+variable "open_ports" {
+  description = "The ports the VM's firewall opens besides SSH: the front's and the L4 routes'."
+  type = list(object({
+    protocol = string
+    port     = number
+  }))
+  default = []
+}

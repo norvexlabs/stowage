@@ -22,6 +22,7 @@ import (
 	"github.com/norvexlabs/stowage/internal/graph"
 	"github.com/norvexlabs/stowage/internal/project"
 	"github.com/norvexlabs/stowage/internal/publish"
+	"github.com/norvexlabs/stowage/internal/release"
 	"github.com/norvexlabs/stowage/internal/spec"
 	"github.com/norvexlabs/stowage/internal/testutil"
 )
@@ -135,6 +136,42 @@ func TestPublishCommands(t *testing.T) {
 	}
 	if out, _, err := run(t, b, env, "-C", root, "prune", "--channel", "beta", "1.0.0"); err != nil || strings.TrimSpace(out) != "beta-1.0.0" {
 		t.Fatalf("prune: %v\n%s", err, out)
+	}
+}
+
+// A release's report ends with the bootstrap by digest: checked with the project's key first when
+// it signs, said unsigned when it does not.
+func TestShipPrintsTheBootstrapByDigest(t *testing.T) {
+	t.Parallel()
+	var b bytes.Buffer
+	o := &options{out: &b}
+	p := &project.Project{Root: "/src/notes", Spec: &spec.Spec{Registry: spec.Registry{Prefix: "ghcr.io/acme/notes"},
+		Signing: &spec.Provider{Name: "cosign-key", Config: map[string]any{"key": "env://K", "public_keys": []any{"keys/old.pub", "keys/new.pub"}}}}}
+	r := &publish.Ref{Manifest: &release.Manifest{Name: "notes", Artifacts: release.Artifacts{Installer: "sha256:abc"}}}
+	o.printBootstrap(p, r)
+	const pinned = "ghcr.io/acme/notes/notes-installer@sha256:abc"
+	// Each key the installs trust, read from the project's root: in a rotation either signs.
+	if want := "Check the installer: cosign verify --key /src/notes/keys/old.pub --insecure-ignore-tlog=true " + pinned +
+		"\n  or, with another key: cosign verify --key /src/notes/keys/new.pub --insecure-ignore-tlog=true " + pinned +
+		"\nThen: docker run --rm " + pinned + " > notes.sh\n"; b.String() != want {
+		t.Errorf("signed:\n%s", b.String())
+	}
+	// A key it cannot name is said, never taken for no signing.
+	b.Reset()
+	p.Spec.Signing.Config["public_keys"] = []any{"../outside.pub"}
+	if o.printBootstrap(p, r); !strings.Contains(b.String(), "Check the installer with the project's public key: signing.public_keys: ") || strings.Contains(b.String(), "Not signed") {
+		t.Errorf("an unreadable key:\n%s", b.String())
+	}
+	b.Reset()
+	p.Spec.Signing = nil
+	o.printBootstrap(p, r)
+	if !strings.HasPrefix(b.String(), "Not signed (no signing): an install trusts whatever the registry serves.\nThen: docker run --rm "+pinned) {
+		t.Errorf("unsigned:\n%s", b.String())
+	}
+	b.Reset()
+	o.json = true
+	if o.printBootstrap(p, r); b.Len() != 0 {
+		t.Errorf("--json: %q", b.String())
 	}
 }
 

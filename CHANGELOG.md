@@ -22,6 +22,39 @@ follow [SemVer](https://semver.org/).
   OpenSSH never reads settings it does not know.
 - `kairos_init` is Kairos 4.4.0's release candidate: a later version moves to the final release.
 
+### Security
+- **The VM's app socket no longer serves the operator's routes**: a service `host_api` names,
+  holding the install's token, is answered 403 for `provision`, `reset-db`, `secrets export`,
+  `secrets rotate` and `restore`, which stay the operator's, over SSH. Its other verbs
+  (status, events, updates, upgrade, rollback, network, backup, service actions, reboot and
+  shutdown) are served as before, but for removing the backup settings and skipping the backup
+  before an upgrade, now the operator's.
+- **The backup settings can be locked against the app**: `backup config --lock` keeps a service
+  holding the install's token from changing where backups go, whom they are encrypted to, how
+  long they are kept or when they run (it still reads them, runs one and verifies them), and
+  each backup setting the app changes is journaled as a `backup.config` event.
+- **`vm create --secrets` sends the secrets only to the VM it made**: the VM serves a one-time
+  SSH host key its cloud-config carries until its install, and `vm create` refuses any other
+  (it used to take whatever key answered first). It then keeps the VM's own key and prints its
+  fingerprint. Without OpenTofu it prints the one-time key's fingerprint to check before sending
+  them.
+- **A cloud's VM takes SSH from this machine alone by default**: `vm create` on AWS, Azure or
+  Google Cloud without `--ssh-allow` lets SSH in from this machine's public address only (it used
+  to accept every source on the VM's public address); `--ssh-allow 0.0.0.0/0,::/0` keeps every
+  source. Google Cloud's module also makes firewall rules for SSH's sources and for the front's
+  and the L4 routes' ports, which a network without them used to block.
+- **`ship` and `promote` print the installer by digest**, with the `cosign verify` that checks it
+  before an operator runs it (or say the release is not signed): a first install trusts the
+  installer it runs, and a digest is what a tag cannot be moved under.
+- **lint warns of a service given the host's powers**: `privileged`, `cap_add`, `pid: host` or the
+  Docker socket mounted.
+- **Docker: a route's allowlist every IPv6 client passes is warned**: with IPv6 off, Docker hands
+  an IPv6 client to the front as its bridge's gateway, so a list holding Docker's private ranges
+  admitted them all. The install warns on a host with a global IPv6 address; `--ipv6` keeps each
+  client's own address.
+- **Docker: each L4 route says where it listens**: `status` and the install's end tell whether a
+  route is on one address or on every address, open to whoever reaches the host.
+
 ## [0.11.2] - 2026-10-23
 
 ### Fixed

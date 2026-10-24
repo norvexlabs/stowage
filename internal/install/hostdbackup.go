@@ -92,6 +92,8 @@ type BackupSettings struct {
 	RetentionDays   int      `json:"retention_days"`
 	Schedule        string   `json:"schedule"`
 	Profile         string   `json:"profile"`
+	// Locked: the settings are the operator's; the app socket may not change them.
+	Locked bool `json:"locked"`
 	// Profiles are the ones the release declares.
 	Profiles []string `json:"profiles"`
 }
@@ -105,6 +107,9 @@ type BackupConfigRequest struct {
 	RetentionDays *int     `json:"retention_days,omitempty"`
 	Schedule      *string  `json:"schedule,omitempty"`
 	Profile       *string  `json:"profile,omitempty"`
+	// Lock locks (true) or unlocks the settings against the app socket; the operator's alone,
+	// kept apart from the settings (BackupLockFile).
+	Lock *bool `json:"lock,omitempty"`
 }
 
 // BackupRequest is POST /v1/backup's body.
@@ -147,6 +152,10 @@ type BackupObject struct {
 // BackupFile and BackupLastFile hold the settings and the last backup, in the install's directory.
 func BackupFile(dir string) string     { return filepath.Join(dir, "backup.yaml") }
 func BackupLastFile(dir string) string { return filepath.Join(dir, "backup-last.json") }
+
+// BackupLockFile marks the backup settings locked against the app socket. It is no part of the
+// settings: removing them keeps it.
+func BackupLockFile(dir string) string { return filepath.Join(dir, "backup-settings.lock") }
 
 // remoteName is an rclone remote's name: a section of its config.
 var remoteName = regexp.MustCompile(`^[A-Za-z0-9_+@][A-Za-z0-9_.+@ -]{0,63}$`)
@@ -263,13 +272,41 @@ func rcloneRemotes(conf string) []string {
 }
 
 // backupSettings is what GET /v1/backup/config shows of c (nil: none).
-func backupSettings(c *BackupConfig, pg *providers.PgAgeRclone) BackupSettings {
-	s := BackupSettings{Recipients: []string{}, RetentionDays: defaultRetentionDays, Schedule: defaultBackupSchedule, Profile: pg.Default, Profiles: sortedKeys(pg.Profiles)}
+func backupSettings(c *BackupConfig, pg *providers.PgAgeRclone, locked bool) BackupSettings {
+	s := BackupSettings{Recipients: []string{}, RetentionDays: defaultRetentionDays, Schedule: defaultBackupSchedule, Profile: pg.Default, Profiles: sortedKeys(pg.Profiles), Locked: locked}
 	if c != nil {
 		s = BackupSettings{Configured: true, Destination: c.Destination, RcloneConfigSet: c.RcloneConfig != "", Recipients: c.Recipients,
-			RetentionDays: c.RetentionDays, Schedule: c.Schedule, Profile: c.Profile, Profiles: s.Profiles}
+			RetentionDays: c.RetentionDays, Schedule: c.Schedule, Profile: c.Profile, Profiles: s.Profiles, Locked: locked}
 	}
 	return s
+}
+
+// settingsLocked is whether the operator locked the settings (BackupLockFile): a lock it
+// cannot read counts as one.
+func (h *Hostd) settingsLocked() bool {
+	_, err := os.Stat(BackupLockFile(h.O.Dir))
+	return !errors.Is(err, os.ErrNotExist)
+}
+
+// setLock sets the lock, or removes it.
+func (h *Hostd) setLock(on bool) error {
+	if !on {
+		if err := os.Remove(BackupLockFile(h.O.Dir)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		return nil
+	}
+	return writeAtomic(BackupLockFile(h.O.Dir), strings.NewReader("the backup settings are the operator's: `backup config --unlock` gives them back to the app socket\n"), 0o600, nil)
+}
+
+// setsAny is whether req changes a setting (Lock is none).
+func (req BackupConfigRequest) setsAny() bool {
+	return req.Destination != nil || req.RcloneConfig != nil || len(req.Recipients) > 0 || req.RetentionDays != nil || req.Schedule != nil || req.Profile != nil
+}
+
+// sameRecipients is whether a and b are one set of keys, whatever their order.
+func sameRecipients(a, b []string) bool {
+	return slices.Equal(slices.Sorted(slices.Values(a)), slices.Sorted(slices.Values(b)))
 }
 
 func (h *Hostd) backupConfig(w http.ResponseWriter, r *http.Request) {
@@ -283,7 +320,7 @@ func (h *Hostd) backupConfig(w http.ResponseWriter, r *http.Request) {
 		replyErr(w, err)
 		return
 	}
-	reply(w, http.StatusOK, backupSettings(c, pg))
+	reply(w, http.StatusOK, backupSettings(c, pg, h.settingsLocked()))
 }
 
 func (h *Hostd) setBackupConfig(w http.ResponseWriter, r *http.Request) {
@@ -304,7 +341,28 @@ func (h *Hostd) setBackupConfig(w http.ResponseWriter, r *http.Request) {
 		replyErr(w, err)
 		return
 	}
+	// Through the app socket, while the operator locked them, the settings stay as they are (a
+	// console saving its whole form unchanged passes): the lock is the operator's to set. The
+	// operator's lock is written before the settings, an unlock after them, so a request refused
+	// or cut halfway leaves them locked.
+	app, locked := fromApp(r), h.settingsLocked()
+	if req.Lock != nil && app {
+		replyErr(w, fail(http.StatusForbidden, "the backup settings' lock is the operator's: backup config --lock over SSH"))
+		return
+	}
 	c := mergeBackup(cur, req, pg)
+	if app && locked && backupChanges(cur, c) != "" {
+		replyErr(w, fail(http.StatusForbidden, "the backup settings are locked: the operator changes them, backup config over SSH"))
+		return
+	}
+	if req.Lock != nil && !req.setsAny() {
+		if err := h.setLock(*req.Lock); err != nil {
+			replyErr(w, err)
+			return
+		}
+		reply(w, http.StatusOK, backupSettings(cur, pg, *req.Lock))
+		return
+	}
 	if _, err := validBackup(c, pg); err != nil {
 		replyErr(w, fail(http.StatusBadRequest, "%v", err))
 		return
@@ -313,15 +371,35 @@ func (h *Hostd) setBackupConfig(w http.ResponseWriter, r *http.Request) {
 		replyErr(w, err)
 		return
 	}
+	if req.Lock != nil && *req.Lock {
+		if err := h.setLock(true); err != nil {
+			replyErr(w, err)
+			return
+		}
+		locked = true
+	}
 	if err := h.writeBackup(c); err != nil {
 		replyErr(w, err)
 		return
+	}
+	if changed := backupChanges(cur, c); app && changed != "" {
+		// The operator reads what the app changed in the journal (`events`).
+		if _, err := h.event(Event{Kind: evBackupConfig, Reason: "changed through the app socket: " + changed}); err != nil {
+			h.O.logf("backup settings: the event: %v", err)
+		}
 	}
 	if err := h.applySchedule(r.Context(), &c); err != nil {
 		replyErr(w, fmt.Errorf("the settings are saved, but the timer did not take the schedule: %w", err))
 		return
 	}
-	reply(w, http.StatusOK, backupSettings(&c, pg))
+	if req.Lock != nil && !*req.Lock {
+		if err := h.setLock(false); err != nil {
+			replyErr(w, fmt.Errorf("the settings are saved and applied, but they stay locked: %w", err))
+			return
+		}
+		locked = false
+	}
+	reply(w, http.StatusOK, backupSettings(&c, pg, locked))
 }
 
 // mergeBackup is the settings req makes of cur (nil: none yet, the defaults): a field req leaves
@@ -352,6 +430,29 @@ func mergeBackup(cur *BackupConfig, req BackupConfigRequest, pg *providers.PgAge
 	return c
 }
 
+// backupChanges names the settings c changes of cur (nil: none yet), the secrets by name only;
+// empty when none.
+func backupChanges(cur *BackupConfig, c BackupConfig) string {
+	var was BackupConfig
+	if cur != nil {
+		was = *cur
+	}
+	var out []string
+	for _, f := range []struct {
+		name    string
+		changed bool
+	}{
+		{"destination", was.Destination != c.Destination}, {"rclone_config", was.RcloneConfig != c.RcloneConfig},
+		{"recipients", !sameRecipients(was.Recipients, c.Recipients)}, {"retention_days", was.RetentionDays != c.RetentionDays},
+		{"schedule", was.Schedule != c.Schedule}, {"profile", was.Profile != c.Profile},
+	} {
+		if f.changed {
+			out = append(out, f.name)
+		}
+	}
+	return strings.Join(out, ", ")
+}
+
 func (h *Hostd) removeBackupConfig(w http.ResponseWriter, r *http.Request) {
 	pg, err := h.pgBackup()
 	if err != nil {
@@ -368,7 +469,7 @@ func (h *Hostd) removeBackupConfig(w http.ResponseWriter, r *http.Request) {
 		replyErr(w, err)
 		return
 	}
-	reply(w, http.StatusOK, backupSettings(nil, pg))
+	reply(w, http.StatusOK, backupSettings(nil, pg, h.settingsLocked()))
 }
 
 // checkSchedule asks systemd whether s is a calendar event it reads.
@@ -1221,7 +1322,11 @@ func (h *Hostd) verifyBackup(w http.ResponseWriter, r *http.Request) {
 		replyErr(w, err)
 		return
 	}
-	proposed := req.Destination != nil || req.RcloneConfig != nil || len(req.Recipients) > 0 || req.RetentionDays != nil || req.Schedule != nil || req.Profile != nil
+	if req.Lock != nil {
+		replyErr(w, fail(http.StatusBadRequest, "lock is a setting to save (POST /v1/backup/config), not one verify tries"))
+		return
+	}
+	proposed := req.setsAny()
 	var in *Installer
 	var c *BackupConfig
 	var err error
@@ -1300,7 +1405,7 @@ func (h *Hostd) backupStatus(w http.ResponseWriter, r *http.Request) {
 		replyErr(w, err)
 		return
 	}
-	st := BackupStatus{Settings: backupSettings(c, pg)}
+	st := BackupStatus{Settings: backupSettings(c, pg, h.settingsLocked())}
 	if out, err := h.Host.Run(r.Context(), Cmd{Args: []string{"systemctl", "show", "--property", "NextElapseUSecRealtime", "--value", h.backupTimer()}}); err == nil {
 		if next := strings.TrimSpace(string(out)); next != "" && next != "n/a" {
 			st.Next = next

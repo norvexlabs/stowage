@@ -166,6 +166,8 @@ host_token=$(sed -n "s/^STOWAGE_HOST_TOKEN='\{0,1\}\([0-9a-f]*\).*/\1/p" "$WORK/
 app_get() { on_vm curl -s -o /dev/null -w '%{http_code}' --unix-socket /run/notes/app/app.sock "$@" http://host/v1/status; }
 [[ $(app_get) == 401 ]] || fail "the app socket answered without the token"
 [[ $(app_get -H "'Authorization: Bearer $host_token'") == 200 ]] || fail "the app socket refused the install's token"
+[[ $(on_vm curl -s -o /dev/null -w '%{http_code}' --unix-socket /run/notes/app/app.sock -X POST -d "'{}'" -H "'Authorization: Bearer $host_token'" http://host/v1/secrets/export) == 403 ]] ||
+	fail "the app socket serves secrets export"
 api=$(on_vm sudo docker ps -q --filter label=com.docker.compose.service=api)
 on_vm sudo docker inspect --format "'{{range .Mounts}}{{.Source}}:{{.Destination}}:{{.RW}}{{println}}{{end}}'" "$api" |
 	grep -qx '/run/notes/app:/run/stowage-host:false' || fail "the api service does not mount the app directory read-only"

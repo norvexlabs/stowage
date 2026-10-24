@@ -59,6 +59,7 @@ const (
 	evInstallFinished = "install.finished"
 	evInstallFailed   = "install.failed"
 	evCertExpiring    = "cert.expiring"
+	evBackupConfig    = "backup.config"
 )
 
 // Why a job was lost, and a reboot cancelled at the daemon's start.

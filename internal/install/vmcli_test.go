@@ -397,6 +397,55 @@ func TestTheAppSocketServesTheAPIToTheInstallsToken(t *testing.T) {
 	}
 }
 
+func TestTheAppSocketRefusesTheOperatorsRoutes(t *testing.T) {
+	t.Parallel()
+	e := vmEnv(t, "1.0.0")
+	if err := e.install(vm); err != nil {
+		t.Fatal(err)
+	}
+	h := daemon(e, &fakeHost{})
+	token := get(e.readEnv(), HostTokenVar)
+	call := func(handler http.Handler, pattern string) int {
+		method, path, _ := strings.Cut(pattern, " ")
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(method, path, strings.NewReader("{}"))
+		req.Header.Set("Authorization", "Bearer "+token)
+		handler.ServeHTTP(w, req)
+		return w.Code
+	}
+	for _, pattern := range []string{"DELETE /v1/backup/config", "POST /v1/provision", "POST /v1/reset-db", "POST /v1/secrets/export", "POST /v1/secrets/rotate", "POST /v1/restore"} {
+		if code := call(h.AppHandler(), pattern); code != http.StatusForbidden {
+			t.Errorf("the app socket answered %s with %d", pattern, code)
+		}
+		if code := call(h.Handler(), pattern); code == http.StatusForbidden || code == http.StatusNotFound || code == http.StatusMethodNotAllowed {
+			t.Errorf("the operator's socket answered %s with %d", pattern, code)
+		}
+	}
+	// The backup before an upgrade is the operator's to skip.
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/v1/upgrade", strings.NewReader(`{"skip_backup": true}`))
+	req.Header.Set("Authorization", "Bearer "+token)
+	if h.AppHandler().ServeHTTP(w, req); w.Code != http.StatusForbidden || !strings.Contains(w.Body.String(), "skip_backup is the operator's") {
+		t.Errorf("an app's upgrade without its backup: %d %s", w.Code, w.Body.String())
+	}
+	// Every route an app's console operates the VM with stays the app's.
+	for _, pattern := range []string{"GET /v1/status", "GET /v1/updates", "POST /v1/upgrade", "GET /v1/job", "GET /v1/rollback", "POST /v1/rollback",
+		"POST /v1/reboot", "POST /v1/shutdown", "GET /v1/events", "GET /v1/network", "POST /v1/network", "POST /v1/network/confirm",
+		"POST /v1/network/revert", "POST /v1/network/reset", "GET /v1/backup/config", "POST /v1/backup/config", "GET /v1/backup/status",
+		"GET /v1/backup/list", "POST /v1/backup", "POST /v1/backup/verify", "GET /v1/services", "GET /v1/health", "GET /v1/reset-db"} {
+		if code := call(h.AppHandler(), pattern); code == http.StatusForbidden || code == http.StatusNotFound || code == http.StatusMethodNotAllowed {
+			t.Errorf("the app socket answered %s with %d", pattern, code)
+		}
+	}
+	// A route the app keeps, and a refused one reached through a path the mux cleans.
+	if code := call(h.AppHandler(), "GET /v1/rollback"); code == http.StatusForbidden {
+		t.Errorf("the app socket refused GET /v1/rollback")
+	}
+	if code := call(h.AppHandler(), "POST /v1/./restore"); code == http.StatusOK {
+		t.Errorf("the app socket served /v1/./restore")
+	}
+}
+
 func TestNoAppSocketWhenNoServiceReachesTheDaemon(t *testing.T) {
 	t.Parallel()
 	e := vmEnv(t, "1.0.0")
