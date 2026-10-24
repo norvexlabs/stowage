@@ -1,8 +1,15 @@
-# Kairos's /system/oem/08_grub.yaml (kairos-init v0.16.2) as {{.Name}}'s OS bundle installs it: the
+# Kairos's /system/oem/08_grub.yaml (kairos-init v4.4.0-rc2) as {{.Name}}'s OS bundle installs it: the
 # boot.before step that removed the boot assessment's sentinels on every boot of the active
 # system is left out. `{{.Ctl}} health-gate` removes them once the install the boot brought up
 # is healthy; before that, a reboot is a failed boot and GRUB boots the fallback (passive) entry.
-# The bundle's build checks that kairos-init's file is the one this is derived from.
+# Besides, the boot assessment's GRUB file gets its mode (kairos-init's spells the key
+# `permsisions`, which yip ignores), the explanation's fourth line names the health gate, and a
+# comment explains after-upgrade's clear of the attempt (kairos-init's own; the host daemon's
+# upgrade job clears it too), and the assessment also runs when a one-shot choice (next_entry)
+# selects the active entry (`cos`): kairos-agent sets that choice after every upgrade, and the
+# upgraded boot must be on trial. While a failed attempt is marked, that choice boots the
+# fallback entry too; a one-shot choice of any other entry is not assessed. The build checks
+# that kairos-init's file is the one this is derived from.
 
 # The boot assessment works in this way:
 # - After we upgrade, we set a grub env sentinel variable indicating that we did run an upgrade
@@ -65,7 +72,7 @@ stages:
       - path: "/tmp/mnt/STATE/grub_boot_assessment"
         owner: 0
         group: 0
-        permsisions: 0600
+        permissions: 0600
         content: |
             set boot_assessment="/boot_assessment"
             search --no-floppy --file --set=boot_assessment_blk "${boot_assessment}"
@@ -73,7 +80,7 @@ stages:
               load_env -f "(${boot_assessment_blk})${boot_assessment}"
             fi
             if [ "${enable_boot_assessment}" = "yes" -o "${enable_boot_assessment_always}" = "yes" ]; then
-              if [ -z "${selected_entry}" ]; then
+              if [ -z "${selected_entry}" -o "${selected_entry}" = "cos" ]; then
                 if [ "${boot_assessment_tentative}" = "yes" ]; then
                   set default="fallback"
                   set extra_passive_cmdline="upgrade_failure"
@@ -98,11 +105,15 @@ stages:
     # Similarly, we could trigger boot assessment in other cases
     after-upgrade:
     - <<: *statemount
+    # The tentative sentinel is cleared here as well: a failed upgrade leaves it set, and GRUB
+    # seeing both sentinels on the next boot would select the fallback entry without ever trying
+    # the image just written.
     - name: "Set upgrade sentinel"
       if: grep -vq "rd.immucore.uki" /proc/cmdline
       commands:
       - |
           grub2-editenv /tmp/mnt/STATE/boot_assessment set enable_boot_assessment=yes
+          grub2-editenv /tmp/mnt/STATE/boot_assessment set boot_assessment_tentative=
     # We do re-install hooks here if needed to track upgrades of boot assessment
     - <<: *customhook
     - <<: *grubinstall

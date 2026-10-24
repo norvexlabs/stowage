@@ -62,10 +62,17 @@ COPY preload/ /usr/share/{{.Name}}-preload/
 COPY --chmod=0755 ctl/{{.Ctl}} /usr/sbin/{{.Ctl}}
 
 # kairos-init's init stage strips the kernel modules; without them netfilter, and so nftables and
-# Docker, fail. They are reinstalled, and the build fails if they did not come back.
+# Docker, fail. They are reinstalled, and the build fails if they did not come back. Its CIS
+# hardening step is skipped: its shell umask (027) would leave the files an operator's run
+# writes unreadable to a stack's non-root containers, and its password ageing and lockout apply
+# to the operator's account. Its SSH hardening stays; the build fails without its drop-in.
 RUN set -e \
-    && /kairos-init -s init -v "{{.OSVersion}}" \
+    && /kairos-init -s init --skip-step cisHardening -v "{{.OSVersion}}" \
     && rm /kairos-init \
+    && grep -qx 'AllowTcpForwarding no' /etc/ssh/sshd_config.d/05-kairos-hardening.conf \
+    && ! test -e /etc/modprobe.d/cis-blocklist.conf \
+    && ! grep -rqsE '^[[:space:]]*umask[[:space:]]+0*27([^0-7]|$)' /etc/profile /etc/profile.d /etc/bash.bashrc \
+    && ! grep -qsE '^[[:space:]]*UMASK[[:space:]]+0*27([^0-7]|$)' /etc/login.defs \
     && mods="$(dpkg-query -W -f='${Package}\n' 'linux-modules-*' 2>/dev/null | sort -u)" \
     && if [ -z "$mods" ]; then echo "no linux-modules-* package installed" >&2; exit 1; fi \
     && apt-get update \
@@ -112,9 +119,11 @@ RUN set -e; f=/system/oem/09_systemd_services.yaml; \
 
 # Kairos's boot assessment, with the health gate as its judge: the bundle's copy of 08_grub.yaml
 # leaves out the step that marks every boot of the active system good (files/usr/share/NAME). The
-# build fails when kairos-init's file is no longer the one that copy is derived from.
+# build fails when kairos-init's file is no longer the one that copy is derived from, naming the
+# release it is derived from.
 RUN set -e; f=/system/oem/08_grub.yaml; \
-    echo "aa7cd9d82f036161eb88c116113864b598d86e4e848f8a01e37f471c05e8fc82  $f" | sha256sum -c -; \
+    echo "25f60229d81892d0ddd437d8f880a4fc92668fd0e8ddcb8a88e26e4c5a04d7e2  $f" | sha256sum -c - || \
+        { echo "shapes.kairos.kairos_init: its $f is not the one this stowage's boot assessment is derived from: use kairos-init v4.4.0-rc2" >&2; exit 1; }; \
     mv /usr/share/{{.Name}}/08_grub.yaml "$f"; \
     rmdir /usr/share/{{.Name}}; \
     ! grep -q 'Remove GRUB sentinels' "$f"

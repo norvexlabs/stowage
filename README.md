@@ -379,8 +379,11 @@ the loop to try before your operators do.
   named in `.Values.stowage.secret`, pulls with `.Values.stowage.pullSecret` and gives its pods
   `.Values.stowage.sysctls` ([Helm chart contract](#the-contracts-a-project-must-honour);
   `examples/minimal/deploy/chart` is a working one). Operators run `sh <name>.sh k8s install`.
-- **Kairos VM**: add `kairos` with a `base` distribution and the `kairos_init` image, both pinned
-  by digest, and the `disk_formats` to publish. `ship` then also builds the OS bundle (about
+- **Kairos VM**: add `kairos` with a `base` distribution (Ubuntu: the bundle installs Docker from
+  its Ubuntu repository; `examples/minimal` pins 26.04 LTS, the release the suites prove) and the
+  `kairos_init` image, both pinned by digest (`kairos_init` the release `examples/minimal` pins, v4.4.0-rc2: the bundle's build
+  checks kairos-init's boot assessment file against the copy Stowage carries, so another release
+  fails it), and the `disk_formats` to publish. `ship` then also builds the OS bundle (about
   3 GB, several minutes) and the disks. Operators run `sh <name>.sh vm create`, boot the disk with
   its seed, and manage the VM with `<short>-stow` on it. Add a `backup` provider for the VM's
   encrypted backups, `health_gate` to tune the boot check, `host_api` for services that may
@@ -989,7 +992,7 @@ These are what `lint` checks; each finding names the key path or `file:line` to 
     `http://<release>-<service>.<namespace>.svc:<port>` as the project's endpoint.
 - **Kairos OS bundle** (`shapes.kairos`): `ship` builds `<prefix>/<name>-os` with `docker buildx`
   from a Dockerfile embedded in `stowage`: `base` converted by `kairos_init` (`-s install`, then
-  `-s init`) into a Kairos image with no Kubernetes provider, carrying the release's version
+  `-s init --skip-step cisHardening`) into a Kairos image with no Kubernetes provider, carrying the release's version
   (without its channel) in `/etc/<name>/os-version` and as its Kairos version (given to the init
   stage only: the slow layers before it — the base's packages, `tzdata` and, where the base has it, `tzdata-legacy` among them, kairos-init's
   install stage and Docker's packages — are the same from one release to the next, so
@@ -1013,8 +1016,13 @@ These are what `lint` checks; each finding names the key path or `file:line` to 
     scheduled backup); see "The installer
     on the Kairos VM" below;
   - Kairos's `/system/oem/08_grub.yaml` (its GRUB boot assessment) without the step that marks
-    every boot of the active system good as it starts: the health gate marks it. The build fails
-    when kairos-init's file is not the one this copy is derived from (by its sha256);
+    every boot of the active system good as it starts: the health gate marks it. A boot of the
+    active entry chosen once (`next_entry`, which an upgrade sets) is judged too, and while a failed
+    attempt is marked that choice boots the passive system as well. The build fails
+    when kairos-init's file is not the one this copy is derived from (by its sha256), naming
+    `shapes.kairos.kairos_init` and the release to use. An OS upgrade also refreshes the boot
+    loader on the EFI partition (shim, GRUB and its `grub.cfg`, when the partition has room for
+    them);
   - Kairos's `/system/oem/09_systemd_services.yaml` without its fixed `net.core.rmem_max`
     (7500000), which its boot stage would set after the tuning units, below what they size from
     RAM; its other settings stay. The build fails when that line is no longer there;
@@ -1022,7 +1030,16 @@ These are what `lint` checks; each finding names the key path or `file:line` to 
     (`/etc/nftables.d/ssh.nft`), `/run/nftables.d` made at boot for the install's ports, and a
     forward chain enforcing the L4 routes' allowlists (see "The firewall" under the installer on
     the Kairos VM);
-  - SSH by key only (`/etc/ssh/sshd_config.d/10-<name>.conf`), an `admin` group (created when the
+  - SSH by key only (`/etc/ssh/sshd_config.d/10-<name>.conf`), over kairos-init's SSH hardening
+    (`/etc/ssh/sshd_config.d/05-kairos-hardening.conf`, read first: modern ciphers, key exchanges
+    and MACs only; no TCP, agent or X11 forwarding and no tunnels; at most 4 authentication tries;
+    a client that stops answering is dropped after 10 minutes: an agent holding more keys than 4 needs `ssh -i
+    KEY -o IdentitiesOnly=yes`), the build failing when that drop-in no longer sets
+    `AllowTcpForwarding no`; kairos-init's CIS hardening step is not run (its shell umask,
+    password ageing and lockout would reach the install's files and the operator's account), the
+    build failing when its module blocklist (`/etc/modprobe.d/cis-blocklist.conf`) or a umask of
+    027 (`/etc/profile`, `/etc/profile.d`, `/etc/bash.bashrc`, `/etc/login.defs`) is there; an
+    `admin` group (created when the
     base lacks it), `sudo` without a password for it (`/etc/sudoers.d/10-<name>`: its members log in with an SSH key and have none), a console banner (`/etc/issue.d/05-<name>.issue`),
     consoles on the screen and the serial port (serial last, so it owns `/dev/console`), the QEMU
     and VMware guest agents, `multipathd` masked; the kernel modules kairos-init strips are
@@ -1036,7 +1053,7 @@ These are what `lint` checks; each finding names the key path or `file:line` to 
   the distribution's and Docker's packages of the day. The build needs network access (apt, kairos-init's
   packages) and takes several minutes; the bundle is about 3 GB.
 - **Disk images** (`shapes.kairos.disk_formats`): made from the bundle by the pinned auroraboot
-  (v0.23.0, run privileged on the host network). auroraboot holds no registry account: it reads the
+  (v0.28.0, run privileged on the host network). auroraboot holds no registry account: it reads the
   bundle by digest from a read-only proxy `ship` serves on a loopback port for the disks' build
   alone (`127.0.0.1:<port>/<repository>@<digest>`), with the proxy's own account — user
   `stowage-proxy` and a random password, new for each proxy, given to auroraboot in a private
@@ -2790,7 +2807,9 @@ in the same installer (bootstrap it as above, then `sh <name>.sh vm create …`,
     CD-ROM, and starts it. A changed disk or seed rebuilds what depends on it, powering the VM off
     and on. A failed apply keeps the state, and the error names `vm destroy`.
   - It then waits, up to `--wait` (default 20m), polling every 10 s over `ssh` (batch mode, the
-    private key next to `--ssh-key`'s `.pub` when it exists) at `--host` (an address or a
+    private key next to `--ssh-key`'s `.pub` alone when it exists, else ssh's own keys and agent:
+    the VM's sshd drops a client after 4 failed keys, so an agent holding more needs that private
+    key next to the `.pub`) at `--host` (an address or a
     host name; an IPv6 address bracketed or not, `[2001:db8::7]` taken as `2001:db8::7`; default
     the static IPv4 address, else the module's `address`, else the host name — with DHCP and a static IPv6 address alone,
     `--host` gives that address when this machine reaches the VM over it; a DHCP server must

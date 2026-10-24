@@ -30,6 +30,18 @@ A finished item is deleted, not ticked. The plan behind it is
 
 ## Should
 
+- **`lint` names the `kairos_init` release the bundle accepts**: the OS bundle's build refuses a
+  kairos-init whose `08_grub.yaml` is not the one Stowage's copy is derived from, minutes into
+  `ship`. Lint could warn when `shapes.kairos.kairos_init`'s tag is not the release Stowage
+  carries the copy for (an equality, not an ordering), so the refusal comes before the build.
+- **`vm create` offers the agent's key matching `--ssh-key`**: with only the `.pub` on this
+  machine, its SSH waits offer ssh's default keys and every agent key, and the VM's sshd drops a
+  client after 4 failed ones. Ask the agent (`ssh-add -L`) and pass `-i <pub> -o
+  IdentitiesOnly=yes` when it holds that key; any `-i` drops ssh's default key files.
+- **Kairos's CIS hardening on the VM**: kairos-init's `cisHardening` step is skipped (its shell
+  umask 027, password ageing and faillock). Adopting it needs the install's writes to set their
+  modes whatever the umask, and the operator account exempt from ageing (it has no password).
+
 - **A front route's guards on Kubernetes are the chart's**: `client_auth`, `allow_input` and
   `forward_auth` are enforced by the Docker and VM fronts; on Kubernetes the chart's ingress
   serves the routes and lint says nothing. Warn per route with a `kubernetes` shape (the examples

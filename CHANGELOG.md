@@ -3,6 +3,20 @@
 Stowage's own releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
+## [0.12.0]
+
+### Changed
+- **The Kairos VM is built on Kairos 4.4** (`kairos_init` v4.4.0-rc2, the disks made by
+  AuroraBoot v0.28.0). A project's `kairos_init` must move to that release: the OS bundle's
+  build refuses another. An OS upgrade now also refreshes the boot loader (shim, GRUB and its
+  configuration) on the EFI partition, which earlier VMs only got by being reinstalled.
+- **The examples' VM base is Ubuntu 26.04 LTS**, the release the suites now prove the OS bundle
+  on (24.04 before).
+- **SSH on the VM is hardened**: modern ciphers, key exchanges and MACs only, no port, agent or X11
+  forwarding, at most 4 authentication tries (an SSH agent holding more keys needs `ssh -i KEY -o
+  IdentitiesOnly=yes`, and `vm create` the private key next to `--ssh-key`'s `.pub`), and a
+  client that stops answering is dropped after 10 minutes.
+
 ## [0.11.2] - 2026-10-23
 
 ### Fixed

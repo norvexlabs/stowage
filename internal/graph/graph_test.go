@@ -343,7 +343,7 @@ func TestBackupRunnerOnlyWithAPgAgeRcloneBackup(t *testing.T) {
 	}{
 		{"no backup", "backup:\n  provider: pg-age-rclone\n  profiles: { full: all }\n  volumes: [uploads]", "#"},
 		{"command backup", "  provider: pg-age-rclone\n  profiles: { full: all }\n  volumes: [uploads]", "  provider: command\n  image: api\n  cmd: [notes-api, backup]\n"},
-		{"neither docker nor kairos", "  docker: {}\n  kubernetes: { chart: deploy/chart, postgres_modes: [external, cnpg] }\n  kairos:\n    base: ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55\n    kairos_init: quay.io/kairos/kairos-init:v0.16.2@sha256:0777266d25e31b653deaaaa084d4e27d98f7a55e82e42f0648e2ba9c756b8664\n    disk_formats: [qcow2]\n    host_api: [api]\n", "  kubernetes: { chart: deploy/chart, postgres_modes: [external, cnpg] }\n"},
+		{"neither docker nor kairos", "  docker: {}\n  kubernetes: { chart: deploy/chart, postgres_modes: [external, cnpg] }\n  kairos:\n    base: ubuntu:26.04@sha256:c098726dd9b9733f3e885f8de0ef375206a311b0a317eadc40d347b1115fb944\n    kairos_init: quay.io/kairos/kairos-init:v4.4.0-rc2@sha256:ac885c9f3002a3f0e7000947e3d1e2a5c95f5e2d0212d5f9bbd663347f1ebe0c\n    disk_formats: [qcow2]\n    host_api: [api]\n", "  kubernetes: { chart: deploy/chart, postgres_modes: [external, cnpg] }\n"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			t.Parallel()
@@ -357,7 +357,7 @@ func TestBackupRunnerOnlyWithAPgAgeRcloneBackup(t *testing.T) {
 	}
 	// Positive control: the Docker shape alone runs backups, with the runner.
 	root := testutil.CopyExample(t, "minimal")
-	testutil.Edit(t, root, "stowage.yaml", "  kairos:\n    base: ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55\n    kairos_init: quay.io/kairos/kairos-init:v0.16.2@sha256:0777266d25e31b653deaaaa084d4e27d98f7a55e82e42f0648e2ba9c756b8664\n    disk_formats: [qcow2]\n    host_api: [api]\n", "")
+	testutil.Edit(t, root, "stowage.yaml", "  kairos:\n    base: ubuntu:26.04@sha256:c098726dd9b9733f3e885f8de0ef375206a311b0a317eadc40d347b1115fb944\n    kairos_init: quay.io/kairos/kairos-init:v4.4.0-rc2@sha256:ac885c9f3002a3f0e7000947e3d1e2a5c95f5e2d0212d5f9bbd663347f1ebe0c\n    disk_formats: [qcow2]\n    host_api: [api]\n", "")
 	if _, ok := build(t, root).Node(BackupID); !ok {
 		t.Error("a Docker release with a pg-age-rclone backup carries no runner")
 	}
@@ -389,7 +389,7 @@ func TestVolumeHelperOnlyWithAVolumeOfAUID(t *testing.T) {
 		name, old, new string
 	}{
 		{"no uid", "    postgres: { uid: 70 }\n    uploads:  { uid: 1000 }\n", "    postgres: {}\n    uploads:  {}\n"},
-		{"neither docker nor kairos", "  docker: {}\n  kubernetes: { chart: deploy/chart, postgres_modes: [external, cnpg] }\n  kairos:\n    base: ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55\n    kairos_init: quay.io/kairos/kairos-init:v0.16.2@sha256:0777266d25e31b653deaaaa084d4e27d98f7a55e82e42f0648e2ba9c756b8664\n    disk_formats: [qcow2]\n    host_api: [api]\n", "  kubernetes: { chart: deploy/chart, postgres_modes: [external, cnpg] }\n"},
+		{"neither docker nor kairos", "  docker: {}\n  kubernetes: { chart: deploy/chart, postgres_modes: [external, cnpg] }\n  kairos:\n    base: ubuntu:26.04@sha256:c098726dd9b9733f3e885f8de0ef375206a311b0a317eadc40d347b1115fb944\n    kairos_init: quay.io/kairos/kairos-init:v4.4.0-rc2@sha256:ac885c9f3002a3f0e7000947e3d1e2a5c95f5e2d0212d5f9bbd663347f1ebe0c\n    disk_formats: [qcow2]\n    host_api: [api]\n", "  kubernetes: { chart: deploy/chart, postgres_modes: [external, cnpg] }\n"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			t.Parallel()
@@ -549,8 +549,8 @@ func TestKairosSettingsReachTheBundle(t *testing.T) {
 		old, new  string
 		os, disks bool
 	}{
-		{"base: ubuntu:24.04@sha256:5", "base: ubuntu:24.04@sha256:6", true, true},
-		{"kairos-init:v0.16.2@sha256:0", "kairos-init:v0.16.2@sha256:1", true, true},
+		{"base: ubuntu:26.04@sha256:c", "base: ubuntu:26.04@sha256:d", true, true},
+		{"kairos-init:v4.4.0-rc2@sha256:a", "kairos-init:v4.4.0-rc2@sha256:b", true, true},
 		{"disk_formats: [raw, qcow2, ova, vhd, gce]", "disk_formats: [raw, qcow2, vhd, gce]", false, true},
 		// The clouds' formats are made whether disk_formats lists them or not.
 		{"disk_formats: [raw, qcow2, ova, vhd, gce]", "disk_formats: [qcow2, ova]", false, false},

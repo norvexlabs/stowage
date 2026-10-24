@@ -1051,10 +1051,15 @@ every shape, the VM end-to-end test upgrading through it), then the health gate.
 - **Health gate** — Kairos's GRUB boot assessment decides the slot; the gate is its judge. Stock
   Kairos marks an upgraded boot good as soon as userspace starts, which catches a kernel that
   does not boot but not a release that does not become ready, so the bundle installs Kairos's
-  `08_grub.yaml` without that step (checked against kairos-init's file by hash at build) and the
+  `08_grub.yaml` without that step (checked against kairos-init's file by hash at build, so a
+  `kairos_init` release with another file needs the copy re-derived) and the
   gate clears the marks once the install is healthy; unhealthy, it reboots and GRUB falls back.
   The trial is GRUB's own mark (enabled *and* attempted), so a boot GRUB did not mark never
-  reboots: no loop. The fallback sticks (the marks stay) until the next upgrade, whose job clears
+  reboots: no loop. kairos-agent points the one-shot `next_entry` at the active entry after
+  every upgrade, which stock Kairos's assessment skips (it marks only a boot with no entry
+  selected); the bundle's copy also marks a boot of the active entry selected so, else no
+  upgraded boot would be on trial (so, while a failed attempt is marked, a one-shot `cos` falls
+  back too). The fallback sticks (the marks stay) until the next upgrade, whose job clears
   the attempt so the new system gets its own trial. `rollback` by hand sets the same marks and
   reboots, rather than a one-shot `next_entry`: a one-shot would boot the newer system again at
   the next reboot, the OS and the install then apart. Before falling back, the gate runs the

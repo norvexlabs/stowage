@@ -874,3 +874,14 @@ func TestExecToolKillsTheGroupAfterTheGrace(t *testing.T) {
 	}
 	t.Errorf("the tool's child %d outlived the grace", pid)
 }
+
+func TestSSHArgsWithoutTheKeyFile(t *testing.T) {
+	t.Parallel()
+	a := sshArgs("known", "ops", "192.0.2.10", filepath.Join(t.TempDir(), "gone.pub"), "true")
+	if slices.Contains(a, "-i") || slices.Contains(a, "IdentitiesOnly=yes") {
+		t.Errorf("ssh %q names a key file that does not exist", a)
+	}
+	if !slices.Equal(a[len(a)-3:], []string{"ops@192.0.2.10", "--", "true"}) {
+		t.Errorf("ssh %q", a)
+	}
+}

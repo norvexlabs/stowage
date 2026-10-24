@@ -21,8 +21,8 @@ import (
 	"github.com/norvexlabs/stowage/internal/spec"
 )
 
-var params = Params{Name: "notes", Ctl: "notes-stow", Base: "ubuntu:24.04@sha256:" + strings.Repeat("a", 64),
-	KairosInit: "quay.io/kairos/kairos-init:v0.16.2@sha256:" + strings.Repeat("b", 64), OSVersion: "1.2.0-r2"}
+var params = Params{Name: "notes", Ctl: "notes-stow", Base: "ubuntu:26.04@sha256:" + strings.Repeat("a", 64),
+	KairosInit: "quay.io/kairos/kairos-init:v4.4.0-rc2@sha256:" + strings.Repeat("b", 64), OSVersion: "1.2.0-r2"}
 
 func TestDockerfileRendersTheParams(t *testing.T) {
 	t.Parallel()
@@ -32,9 +32,10 @@ func TestDockerfileRendersTheParams(t *testing.T) {
 	}
 	s := string(df)
 	for _, want := range []string{"FROM " + params.KairosInit + " AS kairos-init", "FROM " + params.Base + "\n",
-		"-s install -v 0.0.0\n", `-s init -v "1.2.0-r2"`, "nftables open-vm-tools qemu-guest-agent tzdata", "apt-cache show tzdata-legacy", "/usr/share/notes-preload/", "/etc/notes/os-version",
+		"-s install -v 0.0.0\n", `-s init --skip-step cisHardening -v "1.2.0-r2"`, "nftables open-vm-tools qemu-guest-agent tzdata", "apt-cache show tzdata-legacy", "/usr/share/notes-preload/", "/etc/notes/os-version",
 		"notes-preload.service", "chmod 0440 /etc/sudoers.d/10-notes", "notes-health.service", "notes-network.service", "notes-tune.service", "notes-tune-online.service", "ethtool",
-		"mv /usr/share/notes/08_grub.yaml \"$f\"", "sha256sum -c -", "sed -i '/^        net\\.core\\.rmem_max: 7500000$/d'"} {
+		"mv /usr/share/notes/08_grub.yaml \"$f\"", "sha256sum -c -", "shapes.kairos.kairos_init: its", "grep -qx 'AllowTcpForwarding no' /etc/ssh/sshd_config.d/05-kairos-hardening.conf",
+		"! test -e /etc/modprobe.d/cis-blocklist.conf", "umask[[:space:]]+0*27([^0-7]|$)' /etc/profile /etc/profile.d", "UMASK[[:space:]]+0*27", "sed -i '/^        net\\.core\\.rmem_max: 7500000$/d'"} {
 		if !strings.Contains(s, want) {
 			t.Errorf("Dockerfile lacks %q", want)
 		}
@@ -165,12 +166,13 @@ func TestWriteContextNamesEveryFileAfterTheProject(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, want := range []string{"Create upgrade failure sentinel", "enable_boot_assessment=yes", `set default="fallback"`,
-		"save_env -f \"(${boot_assessment_blk})${boot_assessment}\" boot_assessment_tentative", "notes-stow health-gate"} {
+		"save_env -f \"(${boot_assessment_blk})${boot_assessment}\" boot_assessment_tentative", "notes-stow health-gate", `if [ -z "${selected_entry}" -o "${selected_entry}" = "cos" ]; then`,
+		"grub_boot_assessment\"\n        owner: 0\n        group: 0\n        permissions: 0600", "/tmp/mnt/STATE/boot_assessment set boot_assessment_tentative=\n"} {
 		if !strings.Contains(string(grub), want) {
 			t.Errorf("08_grub.yaml lacks %q", want)
 		}
 	}
-	if strings.Contains(string(grub), "Remove GRUB sentinels") || strings.Contains(string(grub), "set boot_assessment_tentative=\n") {
+	if strings.Contains(string(grub), "Remove GRUB sentinels") || strings.Contains(string(grub), "cos-state/boot_assessment set") {
 		t.Error("08_grub.yaml still marks every boot good")
 	}
 	if st, err := os.Stat(filepath.Join(dir, PreloadDir)); err != nil || !st.IsDir() {

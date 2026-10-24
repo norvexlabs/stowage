@@ -288,7 +288,12 @@ step "ship 1.0.2, which never becomes ready: its health gate fails, and Kairos f
 release 1.0.2 false
 boot=$(boot_id)
 on_vm sudo notes-stow upgrade --yes >"$WORK/upgrade3.txt" 2>&1 || { cat "$WORK/upgrade3.txt"; fail "upgrade to 1.0.2 from the passive system"; }
-grep -q 'clearing the boot assessment' "$WORK/upgrade3.txt" || { cat "$WORK/upgrade3.txt"; fail "the upgrade did not give 1.0.2 a trial of its own"; }
+# The fallback left the last attempt marked; the upgrade clears it (Kairos's after-upgrade, or the
+# host daemon's job after it) before the 30 s reboot, so that reboot tries 1.0.2. That 1.0.2 then
+# ran and was judged is the failed boot status below.
+assessment >"$WORK/assess3.txt" || { cat "$WORK/assess3.txt"; fail "the boot assessment cannot be read"; }
+grep -qx 'enable_boot_assessment=yes' "$WORK/assess3.txt" && grep -qx 'boot_assessment_tentative=' "$WORK/assess3.txt" ||
+	{ cat "$WORK/upgrade3.txt" "$WORK/assess3.txt"; fail "the upgrade did not give 1.0.2 a trial of its own"; }
 back_on 1.0.0 passive "after 1.0.2 failed its health gate" "$boot"
 healthy_postgres "after the fallback"
 grep -q '^failed     notes 1.0.2 (revision 1) at .*healthz/ready answered 503, not 200' "$WORK/status.txt" ||
