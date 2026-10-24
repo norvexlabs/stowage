@@ -3,7 +3,7 @@
 Stowage's own releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
-## [0.12.0]
+## [0.12.0] - 2026-10-24
 
 ### Changed
 - **The Kairos VM is built on Kairos 4.4** (`kairos_init` v4.4.0-rc2, the disks made by
