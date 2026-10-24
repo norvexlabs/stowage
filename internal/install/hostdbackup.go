@@ -350,7 +350,7 @@ func (h *Hostd) setBackupConfig(w http.ResponseWriter, r *http.Request) {
 		replyErr(w, fail(http.StatusForbidden, "the backup settings' lock is the operator's: backup config --lock over SSH"))
 		return
 	}
-	if err := appRclone(app, cur, req); err != nil {
+	if err := appRclone(app, req); err != nil {
 		replyErr(w, err)
 		return
 	}
@@ -1254,39 +1254,16 @@ func (h *Hostd) runnerCall(r *http.Request) (*Installer, *BackupConfig, error) {
 	return in, c, nil
 }
 
-// appRclone refuses, from the app socket (app), an rclone config other than the saved one (cur)
-// that has rclone run a program: sftp's `ssh`, or a `*_command` (webdav's bearer_token_command)
-// — the daemon runs rclone as root on the host's network, so such a config is the operator's to
-// give, over SSH.
-func appRclone(app bool, cur *BackupConfig, req BackupConfigRequest) error {
-	if !app || req.RcloneConfig == nil || cur != nil && *req.RcloneConfig == cur.RcloneConfig {
+// appRclone refuses an rclone config from the app socket (app): the daemon runs rclone as root on
+// the host's network, and rclone's options include programs it runs (sftp's ssh, a *_command,
+// S3's credential_process through a credentials file), so the config, the remotes and their
+// credentials, is the operator's to give, over SSH. Even the saved one is refused: answering
+// whether a config is it would let the app test guesses of its secrets (GET never shows it).
+func appRclone(app bool, req BackupConfigRequest) error {
+	if !app || req.RcloneConfig == nil {
 		return nil
 	}
-	if k := rcloneProgram(*req.RcloneConfig); k != "" {
-		return fail(http.StatusForbidden, "rclone_config: %s has rclone run a program on the host: the operator gives such a config, backup config over SSH", k)
-	}
-	return nil
-}
-
-// rcloneProgram is the first `[section] key` of an rclone config that names a program rclone runs
-// (ssh, or a key ending in _command, any case); "" when there is none.
-func rcloneProgram(conf string) string {
-	section := ""
-	for line := range strings.Lines(conf) {
-		l := strings.TrimSpace(line)
-		switch {
-		case l == "" || strings.HasPrefix(l, "#") || strings.HasPrefix(l, ";"):
-		case strings.HasPrefix(l, "[") && strings.HasSuffix(l, "]"):
-			section = strings.TrimSpace(l[1 : len(l)-1])
-		default:
-			k, _, _ := strings.Cut(l, "=")
-			k = strings.ToLower(strings.TrimSpace(k))
-			if k == "ssh" || strings.HasSuffix(k, "_command") {
-				return fmt.Sprintf("[%s] %s", section, k)
-			}
-		}
-	}
-	return ""
+	return fail(http.StatusForbidden, "rclone_config is the operator's: rclone runs the programs its options name, as root on the host; backup config over SSH")
 }
 
 // proposedBackup is verify's run with settings proposed over the saved ones (or none), checked
@@ -1307,7 +1284,7 @@ func (h *Hostd) proposedBackup(req BackupConfigRequest, app bool) (*Installer, *
 	if err != nil {
 		return nil, nil, err
 	}
-	if err := appRclone(app, cur, req); err != nil {
+	if err := appRclone(app, req); err != nil {
 		return nil, nil, err
 	}
 	c := mergeBackup(cur, req, pg)

@@ -401,6 +401,12 @@ Docker shape, 2026-10-24):
 
 ## Could
 
+- **L4 routes on the host's network, leftovers** (review): an image the engine lacks at a start's
+  plan, which `compose up` then pulls itself, leaves its `EXPOSE` out of that start's peer ports
+  and bridge rules (the installer's own re-pull plans again); a plain `upgrade` whose look for a
+  later revision fails says so in the log alone and exits 0; the fetched installer of a later
+  revision looks the channel up again before it upgrades.
+
 - **A built-in module's variables checked by type** (review, Low): only Google Cloud's
   `firewall` is checked (true/false, 1/0) before OpenTofu runs; another built-in bool or number
   (Azure's `accelerated_networking`) given wrong fails at the apply. Read each variable's `type`

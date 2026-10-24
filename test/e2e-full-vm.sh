@@ -132,6 +132,11 @@ on_vm sudo test -s /usr/local/atlas/.stowage-front-logins || fail "the login's h
 [[ $(ops) == 000 && $(ops --cert "$WORK/rogue.pem" --key "$WORK/rogue.key") == 000 ]] || fail "the ops route takes a client without a certificate its client CA issued"
 [[ $(curl -sk -o /dev/null -w '%{http_code}' --max-time 10 --resolve "api.atlas.test:443:$IP" https://api.atlas.test/health) == 200 ]] || fail "the api route asks for a client certificate"
 
+step "on the VM: the echo L4 routes' service runs on the host's network"
+echo_id=$(on_vm sudo docker ps -q --filter label=com.docker.compose.service=echo)
+[[ -n $echo_id && $(on_vm sudo docker inspect --format "'{{.HostConfig.NetworkMode}}'" "$echo_id") == host ]] ||
+	fail "the echo L4 routes' service is not on the host's network"
+
 step "vm destroy: the VM, its disk and its uploads go, and its state"
 "$CTL" vm destroy "$H" --yes >"$WORK/vm-destroy.txt" 2>"$WORK/vm-destroy.log" || { tail -50 "$WORK/vm-destroy.log"; fail "vm destroy"; }
 grep -q "^Destroyed $H" "$WORK/vm-destroy.txt" || fail "vm destroy did not report"

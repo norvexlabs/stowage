@@ -222,16 +222,33 @@ func TestAPlainUpgradeTakesANewRevision(t *testing.T) {
 		}
 		return in.UpgradeRevision(context.Background(), []string{"--no-provision"})
 	}
-	// No new revision: nothing runs.
-	if done, err := run(); !done || err != nil || len(p.ran) != 0 || !strings.Contains(p.out.String(), "already runs notes 1.0.0 (revision 1)") {
+	// No new revision: nothing runs, and Upgrade says the install runs the release.
+	if done, err := run(); done || err != nil || len(p.ran) != 0 {
 		t.Fatalf("%v %v, ran %q\n%s", done, err, p.ran, p.out.String())
 	}
+	// The channel unreadable: logged, nothing run, no failure.
+	tag := p.r.Manifest.Tag
+	p.downFor.Store(&tag)
+	if done, err := run(); done || err != nil || len(p.ran) != 0 || !strings.Contains(p.log.String(), "no later revision of notes 1.0.0 looked for") {
+		t.Fatalf("%v %v, ran %q\n%s", done, err, p.ran, p.log.String())
+	}
+	p.downFor.Store(nil)
 	p.publish("1.0.0", 2, nil, nil)
 	if done, err := run(); !done || err != nil {
 		t.Fatalf("%v %v\n%s", done, err, p.log)
 	}
 	if len(p.ran) != 1 || !slices.Equal(p.ran[0], []string{"upgrade", "--dir", p.dir, "--no-provision"}) || get(p.readEnv(), "STOWAGE_REVISION") != "2" {
 		t.Fatalf("ran %q, revision %s", p.ran, get(p.readEnv(), "STOWAGE_REVISION"))
+	}
+	// Revision 2 yanked, the install on it: the channel's latest is an earlier one, and nothing
+	// runs rather than a refusal.
+	p.publish("1.0.0", 2, nil, &release.Yank{Reason: "bad", Date: time.Now()})
+	pull := p.r.Pull
+	p.r, _ = testInstallerOf(t, "1.0.0", 2, p.spec, nil)
+	p.r.Pull, p.r.Keys = pull, p.runKeys
+	p.ran = nil
+	if done, err := run(); done || err != nil || len(p.ran) != 0 {
+		t.Errorf("on a yanked revision: %v %v, ran %q", done, err, p.ran)
 	}
 	// The installer of another release upgrades to its own: nothing is looked up.
 	other := p.installer(nil)

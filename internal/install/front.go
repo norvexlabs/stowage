@@ -349,7 +349,9 @@ func frontCompose(f spec.Front, l4 []spec.L4Route, get func(string) string, mode
 	}
 	// Each route's domain names the front on the stack's network too: a service reaching a route
 	// as its clients do (an issuer's URL) reaches the front, not the address the name has outside.
-	if mode != Loopback {
+	// Only while the front listens on the port the routes' URLs name: an acme front on a moved
+	// port is reached on 443 through the operator's forward alone.
+	if mode != Loopback && publicHTTPSPort(mode, get(HTTPSPortVar)) == get(HTTPSPortVar) {
 		var aliases []string
 		for _, r := range f.Routes {
 			if d := get(r.DomainInput); d != "" && !slices.Contains(aliases, d) {

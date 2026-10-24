@@ -940,10 +940,19 @@ func TestALoginsHashIsKeptWhileItsPasswordIs(t *testing.T) {
 	if _, err := os.Stat(in.path(FrontLogins)); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("the hashes are left: %v", err)
 	}
-	// A password bcrypt cannot take is named.
+	// A password bcrypt cannot take refuses everyone, logged; 72 bytes is taken.
+	var log bytes.Buffer
+	in.O.Log = &log
 	pw = strings.Repeat("x", 73)
-	if _, err := in.logins(f, get, in.O.Dir); err == nil || !strings.Contains(err.Error(), "route ops's password (PW)") {
-		t.Errorf("%v", err)
+	if l, err := in.logins(f, get, in.O.Dir); err != nil || l["ops"].Hash != "" || !strings.Contains(log.String(), "route ops's password (PW) is 73 bytes, over the 72 bcrypt takes: the route refuses everyone") {
+		t.Errorf("%+v %v %q", l, err, log.String())
+	}
+	pw = strings.Repeat("x", 72)
+	if l, err := in.logins(f, get, in.O.Dir); err != nil || l["ops"].Hash == "" {
+		t.Errorf("72 bytes: %+v %v", l, err)
+	}
+	if checkLoginPassword(strings.Repeat("x", 72)) != nil || checkLoginPassword(strings.Repeat("x", 73)) == nil {
+		t.Error("the input check's bound")
 	}
 }
 

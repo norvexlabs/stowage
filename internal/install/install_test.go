@@ -540,6 +540,12 @@ func TestTheIPv6Loopback(t *testing.T) {
 			t.Errorf("%s = %q, want %q", k, got, want)
 		}
 	}
+	// The peers' addresses of the VM are no front's, on both sides of their /24.
+	for a, ok := range map[string]bool{"127.0.3.255": true, "127.0.4.0": false, "127.0.4.37": false, "::ffff:127.0.4.255": false, "127.0.5.0": true} {
+		if _, err := loopbackAddr(a); (err == nil) != ok || err != nil && !strings.Contains(err.Error(), "is in 127.0.4.0/24, the addresses the VM gives") {
+			t.Errorf("%s: %v", a, err)
+		}
+	}
 	if got, _ := loopbackAddr("::ffff:127.0.0.9"); got != "127.0.0.9" {
 		t.Errorf("an IPv4-mapped loopback address kept as %q", got)
 	}

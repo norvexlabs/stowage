@@ -569,7 +569,7 @@ func smokeCloudflareCaddyfile(t *testing.T, work, frontRef string, f spec.Front)
 	// The route asks an authentication service, serves an allowlist only and requires a client
 	// certificate the client CA issued: Caddy takes all three, the CA loaded where the front reads it.
 	// Another asks for a login, beside its own allowlist.
-	f.Routes = slices.Clone(f.Routes)
+	f.Routes = append(slices.Clone(f.Routes), spec.Route{Name: "api", DomainInput: "API_DOMAIN", Upstream: "web:8080"})
 	f.Routes[0].ForwardAuth = &spec.ForwardAuth{AddressInput: "AUTH", URIInput: "AUTH_URI", CopyHeaders: []string{"X-Auth-Request-User"}}
 	f.Routes[0].AllowInput = "ALLOW"
 	f.Routes[0].ClientAuth = true

@@ -41,24 +41,63 @@ type ExitCode int
 
 func (e ExitCode) Error() string { return "exit status " + strconv.Itoa(int(e)) }
 
-// UpgradeRevision is a plain `upgrade` run by the installer of the release the install runs: it
-// takes the latest revision of that version on the install's channel (UpgradeTo), so a fix
-// shipped as a revision reaches the install. It answers false, doing nothing, when this installer
-// carries another release (Upgrade moves to it) or the install never pulls (made --offline).
+// UpgradeRevision is a plain `upgrade` run by the installer of the release the install runs: when
+// the install's channel holds a later revision of that version, it upgrades to it as UpgradeTo does,
+// so a fix shipped as a revision reaches the install. It answers false, doing nothing, when this
+// installer carries another release (Upgrade moves to it), the install never pulls (made
+// --offline), the channel holds no later revision, or it cannot be read (logged): Upgrade then
+// says the install already runs the release, as before.
 func (in *Installer) UpgradeRevision(ctx context.Context, args []string) (bool, error) {
 	env, err := in.open()
 	if err != nil {
 		return false, err
 	}
 	m := in.R.Manifest
-	_, cur, rev, err := sameProject(in.O.Dir, env, m)
+	name, cur, rev, err := sameProject(in.O.Dir, env, m)
 	if err != nil {
 		return false, err
 	}
 	if cur != m.ProjectVersion || rev != strconv.Itoa(m.Revision) || !pinnedImages(env) {
 		return false, nil
 	}
-	return true, in.UpgradeTo(ctx, cur, args)
+	latest, c, prefix, err := in.channelRelease(ctx, env, name, cur, rev, cur)
+	if err != nil {
+		in.O.logf("no later revision of %s %s looked for: %v", name, cur, err)
+		return false, nil
+	}
+	// findRelease kept the manifests of this version alone, as its scheme reads them.
+	if latest.Revision <= m.Revision {
+		return false, nil
+	}
+	return true, in.runFetched(ctx, c, prefix, name, latest, args)
+}
+
+// channelRelease is version v's latest revision not yanked on the channel of the install's
+// release (it runs name cur, revision rev), signed by a key the install trusts, read from the
+// registry the install pulls from, with that registry's client and prefix.
+func (in *Installer) channelRelease(ctx context.Context, env *EnvFile, name, cur, rev, v string) (*release.Manifest, *registry.Client, string, error) {
+	kept, err := in.keptInstaller(name, cur, rev)
+	if err != nil {
+		return nil, nil, "", err
+	}
+	prefix, _ := env.Get("STOWAGE_REGISTRY")
+	c, err := in.registryClient(prefix)
+	if err != nil {
+		return nil, nil, "", err
+	}
+	// The keys of the install's release decide; the installer run's only when it carries none
+	// (an install of a release from before its project signed): an older installer must not
+	// bring back a key a later release dropped.
+	src, keys := in.ctl(), kept.Keys
+	if len(keys) == 0 {
+		src, keys = "this installer", in.R.Keys
+	}
+	trust, err := trusted(src, keys)
+	if err != nil {
+		return nil, nil, "", err
+	}
+	m, err := findRelease(ctx, c, prefix, name, kept.Manifest.Channel, v, trust, in.O.logf)
+	return m, c, prefix, err
 }
 
 // UpgradeTo moves the install to version v of the project, on the channel the install's release
@@ -77,27 +116,7 @@ func (in *Installer) UpgradeTo(ctx context.Context, v string, args []string) err
 	if !pinnedImages(env) {
 		return errors.New("--version: this install was made with --offline and never pulls: run the new release's installer, `upgrade --dir " + in.O.Dir + "`")
 	}
-	kept, err := in.keptInstaller(name, cur, rev)
-	if err != nil {
-		return err
-	}
-	prefix, _ := env.Get("STOWAGE_REGISTRY")
-	c, err := in.registryClient(prefix)
-	if err != nil {
-		return err
-	}
-	// The keys of the install's release decide; the installer run's only when it carries none
-	// (an install of a release from before its project signed): an older installer must not
-	// bring back a key a later release dropped.
-	src, keys := in.ctl(), kept.Keys
-	if len(keys) == 0 {
-		src, keys = "this installer", in.R.Keys
-	}
-	trust, err := trusted(src, keys)
-	if err != nil {
-		return err
-	}
-	m, err := findRelease(ctx, c, prefix, name, kept.Manifest.Channel, v, trust, in.O.logf)
+	m, c, prefix, err := in.channelRelease(ctx, env, name, cur, rev, v)
 	if err != nil {
 		return err
 	}
@@ -118,6 +137,12 @@ func (in *Installer) UpgradeTo(ctx context.Context, v string, args []string) err
 		fmt.Fprintf(in.O.Out, "%s already runs %s %s (revision %s)\n", in.O.Dir, name, cur, rev)
 		return nil
 	}
+	return in.runFetched(ctx, c, prefix, name, m, args)
+}
+
+// runFetched fetches the installer of release m from the registry c reads at prefix and runs
+// its `upgrade` with args; the installer is kept when that fails.
+func (in *Installer) runFetched(ctx context.Context, c *registry.Client, prefix, name string, m *release.Manifest, args []string) error {
 	in.O.logf("fetching the installer of %s %s (revision %d, %s)", name, m.ProjectVersion, m.Revision, m.Tag)
 	exe, err := in.fetchInstaller(ctx, c, prefix, m)
 	if err != nil {

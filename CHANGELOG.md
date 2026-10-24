@@ -10,7 +10,8 @@ follow [SemVer](https://semver.org/).
   front ask for that user and the password a spec secret (`gen:`) or a secret input holds, after
   the route's allowlist and client certificate, on Docker and the VM. The upstream never sees
   the login's `Authorization` header. The front keeps the password's bcrypt hash, made again only
-  when the password changes; while the password is empty the route refuses everyone. A login
+  when the password changes; while the password is empty, or longer than the 72 bytes bcrypt
+  takes, the route refuses everyone. A login
   page (a form and a session) is planned.
 - **Inside the stack, a route's domain names the front**: in a TLS mode each route's domain is
   an alias of the front on the stack's network, so a service calling another route by its public
@@ -25,27 +26,34 @@ follow [SemVer](https://semver.org/).
   services reach the ports it is reached on inside (the L4 ports, the front's routes to it and
   the ports it exposes). The stack still reaches it by name, at the host's gateway, the provision
   hook and a `command` provider included; it reaches the services it `depends_on` by name too,
-  each published on 127.0.4.1 on the ports it exposes (its `expose:` and its image's). With a
+  each published on a loopback address of its own (127.0.4.n) on the ports it exposes (its
+  `expose:` and its image's). With a
   `kairos` shape, `lint` refuses an L4 route whose port differs from its upstream's (nothing
   maps one to the other on the host's network), and a route's service that declares
   `networks:` or runs more than one container. Docker publishes the routes as before.
 - **A plain `upgrade` takes a new revision of the release the install runs**: run by the
   installer the install keeps, it now looks for that version's latest revision on the install's
   channel and upgrades to it, as `upgrade --version` does, so a fix shipped as a revision
-  reaches the install.
+  reaches the install. With none, or a channel it cannot read, it says the install already
+  runs the release, as before.
 - **The VM's health gate judges the stack's services as an install's start does**: a
   healthcheck still starting is reported as starting, and the next poll asks again.
+- A front's loopback address (`--address`) is refused in `127.0.4.0/24`, the addresses the VM
+  gives the L4 routes' services' dependencies.
 - `vm create`'s SSH offers the agent's key of `--ssh-key` alone when its private key is not
   next to it, rather than every key the agent holds (the VM drops a client after 4 failed
   keys).
 
 ### Security
-- **The app socket gives no rclone config that runs a program**: a service holding the
-  install's token can no longer save or verify backup settings whose rclone config has rclone
-  run a program (sftp's `ssh`, a `*_command` such as webdav's `bearer_token_command`), which the
-  host daemon would run as root; the operator's own such config stays theirs to give over SSH,
-  and the app may save it back unchanged. While the backup settings are locked, the app's
-  `backup verify` tries the saved settings alone.
+- **The rclone config is the operator's alone**: a service holding the install's token can no
+  longer save or verify backup settings with an rclone config other than the one the operator
+  saved over SSH (nor post that one back): rclone's options name programs it runs (sftp's `ssh`,
+  a `*_command`, S3's `credential_process`), and the host daemon runs rclone as root. A config
+  a service saved through the app socket before this release is kept and run: if `events`
+  shows `changed through the app socket: … rclone_config`, save the config again over SSH
+  (`backup config`). The app still moves the destination among the operator's remotes, and sets the
+  recipients, retention, schedule and profile, unless the settings are locked. While they are
+  locked, the app's `backup verify` tries the saved settings alone.
 
 ### Fixed
 - **The Docker warning on an allowlist every IPv6 client passes** now judges the stack

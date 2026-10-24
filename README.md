@@ -1661,8 +1661,9 @@ again, to copy an installer to another host.
   upgraded to that version's latest revision on its channel, as `upgrade --version <its
   version>` does (the other flags passed on), so a fix shipped as a revision reaches it; with no
   later revision it is left as it is, with a note (`<dir> already runs <name> <version>
-  (revision N)`). An install made with `--offline`, which never pulls, is left as it is, with a
-  note. The upgrade follows how the
+  (revision N)`), and so it is when the channel cannot be read (logged: `no later revision of
+  <name> <version> looked for: …`) or holds only an earlier revision (its own yanked). An
+  install made with `--offline`, which never pulls, is left as it is, with a note. The upgrade follows how the
   install pulls its images (an install made with `--offline` upgrades from loaded images). Then it pulls the images, dumps the database (`pg_dump` as the migrate role, gzip,
   `snapshots/<UTC time>.sql.gz`, 0600; a failed dump stops the upgrade), records the schema
   version, keeps the running release — compose files, `.env`, `provision.env`, installer — in
@@ -1827,8 +1828,10 @@ again, to copy an installer to another host.
     then removed, so the upstream never sees the password. The Caddyfile holds the password's
     bcrypt hash (cost 10), which `<dir>/.stowage-front-logins` (0600) keeps by route and makes
     again only when the password changes (a new hash would change the front's configuration,
-    and restart it, at every start). While the password is empty the route answers 403 to
-    everyone. On Kubernetes the chart's ingress serves the routes: Stowage asks for no login
+    and restart it, at every start). While the password is empty, or longer than the 72 bytes
+    bcrypt takes, the route answers 403 to everyone (the second logged at each start: `route R's
+    password (K) is N bytes, over the 72 bcrypt takes …`); an input holding one is checked when
+    given, and refused over 72 bytes. On Kubernetes the chart's ingress serves the routes: Stowage asks for no login
     there.
   - `strip_headers` are removed, whatever the client sent, and so are the headers
     `forward_auth.copy_headers` lists (even while forward auth is off), so a client never forges
@@ -1869,8 +1872,9 @@ again, to copy an installer to another host.
   for no client certificate there.
 - In a TLS mode each route's domain is an alias of the front on the stack's default network
   (`stowage-front.yaml`'s `networks.default.aliases`): a service calling a route by its public
-  name, as its clients do (an identity provider's issuer URL), reaches the front, on the port the
-  front listens on (the host's HTTPS port).
+  name, as its clients do (an identity provider's issuer URL), reaches the front. Not with
+  `acme` on a moved `--https-port`: the routes' URLs name 443, which the operator forwards to
+  the front's port, and the call goes out through that forward.
 - Loopback mode (`none`, the default when the project offers it and no domain is given): each
   route on its own port of a 127.x address, plain HTTP; `loopback_env` relaxes safe defaults.
 - L4 routes (`l4.routes`): in every mode, loopback included, each route's host port is published
@@ -1918,12 +1922,24 @@ again, to copy an installer to another host.
   firewall accepts, from the stack's bridges (`iifname "br-*"`), the ports it is reached on
   inside: its routes' ports, the front's routes' upstream ports to it, and the ports it exposes
   (its `expose:` and its image's `EXPOSE`). It reaches the services it `depends_on` by name too:
-  each is published on `127.0.4.1` on the ports it exposes (its `expose:`, then its image's
-  `EXPOSE`: a port or a range of at most 64, over TCP unless `/udp`; another value fails the
-  start, naming the service), and the service maps their names to that address (another L4
-  route's service to `127.0.0.1`); one exposing no port is logged at each start (`S (an L4
-  route's, on the host's network) depends on P, which exposes no port: it cannot reach P by name
-  (give P's ports in its expose:)`). Upgrades and re-runs count a route's port as the stack's own
+  each one with a network namespace of its own is published on a loopback address of its own,
+  `127.0.4.<n>` (n from 1 to 254, at most 254 such services; n follows from the service's name,
+  the next free one on a clash, so a service added or removed moves another only when their names
+  clash), on the ports it
+  exposes (its `expose:`: a port or a range of at most 64, over TCP unless `/udp`, another value
+  failing the start and naming the service; then its image's `EXPOSE`, one it cannot take left
+  out and logged, as is the whole `EXPOSE` of an image the engine cannot read at that start —
+  the start's re-pull of a gone image writes them again) but those the VM holds on every
+  address — SSH's 22, the TLS front's ports, and the L4 routes' services' own ports (their routes',
+  the front's routes' upstream ports to them and the ports they expose) — each logged (`S's tcp/80 is not
+  published for T: the host holds it on every address`); the service maps their names to those
+  addresses (another L4 route's service to `127.0.0.1`). A dependency in another service's
+  namespace or the host's is logged and not mapped (`S (…) depends on P, whose network is M: it
+  cannot reach P by name`), and so is one left with no port, at each start (`S (an L4 route's, on
+  the host's network) depends on P, which exposes no port it can be published on: it cannot reach
+  P by name (give P's ports in its expose:)`). The front's loopback address (`--address`) is never
+  one of `127.0.4.0/24` (`address A is in 127.0.4.0/24, the addresses the VM gives the L4 routes'
+  services' dependencies: choose another`), on every shape. Upgrades and re-runs count a route's port as the stack's own
   while its service runs on the host's network. The health probe and the disk-pressure call
   reach such a service at `127.0.0.1`. A service of a profile that is off gets none of this.
 - Optional services (an input's `profile`): the install records `COMPOSE_PROFILES` in `.env`, the
@@ -3544,20 +3560,26 @@ sudo <short>-stow install [--channel C] [--set KEY=VALUE]… [--answers FILE] [-
   backup a failed migration is restored from). `network` stays the app's, `revert_secs` 0
   included: a service holding the token can move the VM to an address nothing reaches, which
   the console undoes. The backup settings stay the app's to change —
-  destination, credentials, recipients, retention, schedule and profile, as a console sets them,
-  so a service whose token leaked can send the backups elsewhere, to its own keys, or stop them —
+  destination (a remote of the operator's rclone config, and a path), recipients, retention,
+  schedule and profile, as a console sets them, so a service whose token leaked can send the
+  backups to another of those remotes, to its own keys, or stop them —
   unless the operator locks them (`backup config --lock`, kept in `<dir>/backup-settings.lock`,
   which removing the settings keeps, and a lock file that cannot be read counts as one): the app
   then saves them unchanged alone (its whole form, recipients in any order), and every change is
   the operator's, over SSH. A lock is written before the settings and an unlock after them, so a
   refused or interrupted request leaves the settings locked; while they are locked the app's
   `backup verify` tries the saved settings alone (proposed ones answer 403: `the backup settings
-  are locked: verify the saved ones …`). Locked or not, an rclone config that has rclone run a
-  program — a key `ssh` (sftp's own SSH command) or one ending in `_command` (webdav's
-  `bearer_token_command`), any case — is refused from the app, saved or verified (403,
-  `rclone_config: [<remote>] <key> has rclone run a program on the host: the operator gives such
-  a config, backup config over SSH`), unless it is the config the operator saved: the daemon
-  runs rclone as root on the host's network. Each change the app makes is
+  are locked: verify the saved ones …`). The rclone config — the remotes and their credentials —
+  is the operator's, locked or not: an `rclone_config` from the app, saved or verified, is
+  refused, the saved one too (GET never shows it, and an answer to whether a config is it would
+  let the app test guesses of its secrets) (403, `rclone_config is the operator's: rclone runs the
+  programs its options name, as root on the host; backup config over SSH`), so before the
+  operator's first `backup config` the app sets nothing. A config a service saved through the app
+  socket under an earlier release is kept, and run, until the operator saves one over SSH: the
+  journal names such a change (`backup.config`, `changed through the app socket: …rclone_config…`).
+  The daemon
+  runs rclone as root on the host's network, and its options name programs it runs (sftp's
+  `ssh`, a `*_command`, S3's `credential_process` through a credentials file). Each change the app makes is
   journaled (`backup.config`; a save changing nothing, none).
   A daemon serving elsewhere (the hidden `--socket`) says so, as the services still mount
   `/run/<name>/app`. The services named, and only they, mount `/run/<name>/app` read-only at `/run/stowage-host`

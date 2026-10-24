@@ -1251,14 +1251,19 @@ func (in *Installer) up(ctx context.Context, env *EnvFile) error {
 	if err != nil {
 		return err
 	}
-	hn, err := in.hostNetwork(ctx, m)
-	if err != nil {
-		return err
+	// What the start adds to the services and opens in the firewall, written again after a pull
+	// that brought back an image whose EXPOSE it reads.
+	prepare := func() error {
+		hn, err := in.hostNetwork(ctx, m, in.heldPorts(env))
+		if err != nil {
+			return err
+		}
+		if err := in.writeContent(ctx, m, env, environ, hn); err != nil {
+			return err
+		}
+		return in.openPorts(ctx, env, hn)
 	}
-	if err := in.writeContent(ctx, m, env, environ, hn); err != nil {
-		return err
-	}
-	if err := in.openPorts(ctx, env, hn); err != nil {
+	if err := prepare(); err != nil {
 		return err
 	}
 	// Listed once: a retry finds the volumes its first try made, and they await their uid.
@@ -1300,7 +1305,9 @@ func (in *Installer) up(ctx context.Context, env *EnvFile) error {
 		if gone := in.goneImages(ctx, env); len(gone) > 0 {
 			in.O.logf("%s left the engine as the stack started: pulling again", strings.Join(gone, ", "))
 			if err = in.fetchImages(ctx, env); err == nil {
-				err = run()
+				if err = prepare(); err == nil {
+					err = run()
+				}
 			}
 		}
 	}
@@ -1666,19 +1673,35 @@ func (in *Installer) l4Exposure(r spec.L4Route, get func(string) string) string 
 	}
 }
 
+// heldPorts are the ports the VM holds on every address, which a peer of an L4 route's service
+// cannot be published on beside them: SSH's, the TLS front's and the L4 routes'.
+func (in *Installer) heldPorts(env *EnvFile) map[peerPort]bool {
+	held := map[peerPort]bool{{22, "tcp"}: true}
+	if mode, _ := env.Get("STOWAGE_TLS_MODE"); in.R.Spec.HasFront() && mode != Loopback {
+		for _, k := range []string{HTTPPortVar, HTTPSPortVar} {
+			v, _ := env.Get(k)
+			if n, err := strconv.Atoi(v); err == nil {
+				held[peerPort{n, "tcp"}] = true
+			}
+		}
+	}
+	for _, r := range in.R.Spec.L4.Routes {
+		held[peerPort{r.Port, r.Protocol}] = true
+	}
+	return held
+}
+
 // FirewallConf is the VM's firewall ruleset, which flushes its own table only.
 const FirewallConf = "/etc/nftables.conf"
 
-// openPorts opens the install's host ports in the VM's firewall (O.Firewall): a TLS front's, and
-// every L4 route's in every mode, from the sources its allowlist holds. Two rule files of the
-// install's own, then the ruleset loaded again when either changed:
-//   - O.Firewall/<name>-ports.nft, in the input chain: what Docker's userland proxy takes on the
-//     host meets it (an IPv6 client of a bridge without IPv6, a connection from the host to its
-//     own address). It is under /run: a boot opens nothing until the install starts.
-//   - <dir>/nftables.d/<name>-l4.nft, in the forward chain, which Docker's DNAT sends the rest
-//     through: a connection to a route's port from a source its allowlist leaves out is dropped.
-//     It is on the persistent partition: the boot's ruleset drops them before the stack's
-//     containers restart.
+// openPorts opens the install's host ports in the VM's firewall (O.Firewall): a TLS front's, the
+// ports the stack's bridges reach the L4 routes' services on (hn), and every L4 route's in every
+// mode, from the sources its allowlist holds, on its bind address alone when it has one. The
+// routes' services run on the host's network, so their traffic meets the input chain alone: one
+// rule file of the install's own, O.Firewall/<name>-ports.nft, under /run, so a boot drops the
+// routes' ports (input drops by default) until the install's start writes it. The forward
+// chain's <dir>/nftables.d/<name>-l4.nft, which no release of this Stowage writes, is removed. The
+// ruleset is loaded again when either file changed.
 func (in *Installer) openPorts(ctx context.Context, env *EnvFile, hn hostNet) error {
 	if in.O.Firewall == "" {
 		return nil
@@ -1711,21 +1734,16 @@ func (in *Installer) openPorts(ctx context.Context, env *EnvFile, hn hostNet) er
 	}
 	get := func(k string) string { v, _ := env.Get(k); return v }
 	for _, r := range in.R.Spec.L4.Routes {
-		// A route with a bind address is reached on it alone; the other family's rule could
-		// match nothing.
-		to := map[string]string{"ip": "", "ip6": ""}
+		// A route with a bind address is reached on it alone, over its family alone.
+		daddr, family := "", ""
 		if a := bindAddr(r, get); a != "" {
-			if netip.MustParseAddr(a).Is4() {
-				to = map[string]string{"ip": "ip daddr " + a + " "}
-			} else {
-				to = map[string]string{"ip6": "ip6 daddr " + a + " "}
+			family = "ip"
+			if !netip.MustParseAddr(a).Is4() {
+				family = "ip6"
 			}
+			daddr = family + " daddr " + a + " "
 		}
 		if r.AllowInput == "" {
-			daddr := "" // both families' alike, unbound
-			for _, d := range to {
-				daddr = d
-			}
 			input = fmt.Appendf(input, "%s%s dport %d accept\n", daddr, r.Protocol, r.Port)
 			continue
 		}
@@ -1738,15 +1756,12 @@ func (in *Installer) openPorts(ctx context.Context, env *EnvFile, hn hostNet) er
 			match string
 			set   []string
 		}{{"ip", v4}, {"ip6", v6}} {
-			dst, ok := to[f.match]
-			if !ok || len(f.set) == 0 {
-				continue
+			if len(f.set) > 0 && (family == "" || family == f.match) {
+				input = fmt.Appendf(input, "%s%s dport %d %s saddr { %s } accept\n", daddr, r.Protocol, r.Port, f.match, strings.Join(f.set, ", "))
 			}
-			input = fmt.Appendf(input, "%s%s dport %d %s saddr { %s } accept\n", dst, r.Protocol, r.Port, f.match, strings.Join(f.set, ", "))
 		}
 	}
-	// The forward chain's file, which held the allowlists of releases that published the routes
-	// through Docker's DNAT, goes.
+	// The forward chain's file goes: nothing of this install is forwarded to be judged there.
 	files := []struct {
 		path, what string
 		rule, cur  []byte
@@ -2003,6 +2018,9 @@ func (in *Installer) inputList(mode string) []input {
 		}
 		if slices.ContainsFunc(in.R.Spec.L4.Routes, func(r spec.L4Route) bool { return r.AllowInput == i.Key }) {
 			check = checkSources
+		}
+		if slices.ContainsFunc(in.R.Spec.Front.Routes, func(r spec.Route) bool { return r.BasicAuth != nil && r.BasicAuth.Secret == i.Key }) {
+			check = checkLoginPassword
 		}
 		domain := tls && slices.ContainsFunc(in.R.Spec.Front.Routes, func(r spec.Route) bool { return r.DomainInput == i.Key })
 		if domain {
@@ -2474,6 +2492,9 @@ func loopbackAddr(a string) (string, error) {
 	ip, err := netip.ParseAddr(a)
 	if err != nil || ip.Zone() != "" || !ip.Unmap().IsLoopback() {
 		return "", fmt.Errorf("address %s is not a loopback address (127.x.x.x, ::1): without TLS, the stack would serve sign-in over plain HTTP to the network", a)
+	}
+	if peerNet.Contains(ip.Unmap()) {
+		return "", fmt.Errorf("address %s is in %s, the addresses the VM gives the L4 routes' services' dependencies: choose another", a, peerNet)
 	}
 	return ip.Unmap().String(), nil
 }

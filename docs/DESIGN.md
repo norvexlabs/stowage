@@ -994,8 +994,8 @@ every shape, the VM end-to-end test upgrading through it), then the health gate.
   gateway), so the stack reaches it there, its name mapped to the host's gateway in every other
   service (the front, and the one-off containers Stowage runs, included) and the firewall
   accepting from the bridges the ports it is reached on inside; it reaches the services it
-  depends on by name at a loopback address of the install's where each is published on the
-  ports it exposes — that traffic is the service's own, not its clients'. Rejected: an ipvlan
+  depends on by name, each at a loopback address of its own (two peers often listen on one
+  port) where it is published on the ports it exposes — that traffic is the service's own, not its clients'. Rejected: an ipvlan
   interface beside the bridge (an address per install, which clouds drop unless they assigned
   it, and traffic the host's firewall never sees) — a candidate for an appliance's own
   interfaces on bare metal; a routed bridge (no NAT, but the veth hop and conntrack stay). No
@@ -1186,7 +1186,12 @@ every shape, the VM end-to-end test upgrading through it), then the health gate.
   preloaded, so a VM without internet runs it. The dump streams through the pipe and never lands
   on the VM's disk; a backup counts only when the destination holds the bytes sent. The settings
   are host-owned, on the persistent partition, set over SSH (or the app socket): the rclone
-  config holds credentials, which a cloud-config must not carry. Retention prunes by the
+  config holds credentials, which a cloud-config must not carry. The rclone config itself is the
+  operator's alone: rclone runs as root on the host's network, and its options name programs it
+  runs (sftp's `ssh`, the `*_command` options, S3's `credential_process` read from a credentials
+  file the config names), a set no list of refused options keeps up with, so the app socket gives
+  none, not even the saved one back (an answer to whether a config is the saved one would let the
+  app test guesses of its secrets); the destination it may move among the operator's remotes. Retention prunes by the
   profile's own file names (`<name>-<profile>-<UTC time>-…`, a profile being letters and digits),
   never another project's in a shared destination. The backup before an upgrade warns rather
   than refuses, as the boot dumps the database locally before it migrates anyway. `restore`
