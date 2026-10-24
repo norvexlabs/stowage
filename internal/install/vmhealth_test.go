@@ -471,6 +471,8 @@ func TestTheProbeTakesAnIPv6AddressWithoutIPv4(t *testing.T) {
 		`{"n":{"IPAddress":"","GlobalIPv6Address":"fd00:db8::5","NetworkID":"i"}}`:                                                          "fd00:db8::5",
 		`{"n":{"IPAddress":"10.0.0.5","GlobalIPv6Address":"fd00:db8::5","NetworkID":"i"}}`:                                                  "10.0.0.5",
 		`{"a":{"IPAddress":"","GlobalIPv6Address":"","NetworkID":"i0"},"n":{"IPAddress":"","GlobalIPv6Address":"fd00::7","NetworkID":"i"}}`: "fd00::7",
+		// On the host's network: the loopback.
+		`{"host":{"IPAddress":"","GlobalIPv6Address":"","NetworkID":"h"}}`: "127.0.0.1",
 	} {
 		g := newGate(t, "", nil, false)
 		g.docker.answer = func(a string) ([]byte, bool, error) {
@@ -579,5 +581,28 @@ func TestTheGateReadsItsBootOnceItCan(t *testing.T) {
 	}
 	if strings.Join(ids, ",") != ",boot-1,boot-1" {
 		t.Errorf("judged in boots %q", ids)
+	}
+}
+
+// A healthcheck still starting is not ready yet, named; one that failed fails, as an install's
+// start judges them.
+func TestTheGateJudgesTheServicesAsAStartDoes(t *testing.T) {
+	t.Parallel()
+	for ps, want := range map[string]string{
+		`{"Service":"api","State":"running","Health":"starting","Image":"a"}` + "\n" + `{"Service":"web","State":"running","Health":"starting","Image":"w"}`: "api, web is starting",
+		`{"Service":"api","State":"running","Health":"unhealthy","Image":"a"}`:                                                                               "api is unhealthy",
+		`{"Service":"api","State":"exited","Health":"","Image":"a","ExitCode":3}`:                                                                            "api exited with code 3",
+		``: "no service of the stack runs",
+	} {
+		g := newGate(t, "", nil, false)
+		g.docker.answer = func(a string) ([]byte, bool, error) {
+			if strings.HasSuffix(a, "ps --all --format json") {
+				return []byte(ps), true, nil
+			}
+			return nil, false, nil
+		}
+		if err := g.gate.In.ready(context.Background(), g.readEnv(), g.gate.Probe); err == nil || err.Error() != want {
+			t.Errorf("%s: %v, want %q", ps, err, want)
+		}
 	}
 }

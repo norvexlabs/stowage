@@ -23,6 +23,7 @@ import (
 	"github.com/norvexlabs/stowage/internal/digest"
 	"github.com/norvexlabs/stowage/internal/dockerfile"
 	"github.com/norvexlabs/stowage/internal/helm"
+	"github.com/norvexlabs/stowage/internal/kairos"
 	"github.com/norvexlabs/stowage/internal/lock"
 	"github.com/norvexlabs/stowage/internal/providers"
 	"github.com/norvexlabs/stowage/internal/spec"
@@ -798,6 +799,9 @@ func (l *linter) front() {
 				l.errf(w+".allow_input", "%s is advanced, never asked: the route would refuse everyone until it is set", r.AllowInput)
 			}
 		}
+		if a := r.BasicAuth; a != nil {
+			l.basicAuth(w+".basic_auth", r)
+		}
 		if r.ClientAuth {
 			if !slices.ContainsFunc(f.TLSModes, func(m string) bool { return m != "none" }) {
 				l.errf(w+".client_auth", "no TLS mode is offered: plain HTTP carries no client certificate, so the route would refuse everyone")
@@ -925,6 +929,7 @@ func (l *linter) l4() {
 			l.errf(w+".upstream", "%s is not a port", m[2])
 		} else {
 			l.service(w+".upstream", m[1])
+			l.l4Host(w, r, m[1], p)
 		}
 		if k := r.AddressInput; k != "" {
 			if in, ok := l.s.Input(k); !ok {
@@ -941,6 +946,68 @@ func (l *linter) l4() {
 		if k := r.BindInput; k != "" {
 			l.l4Bind(w+".bind_input", k)
 		}
+	}
+}
+
+// basicAuth checks a front route's login: a user name the Caddyfile holds as one token, and a
+// password from a generated secret or a secret input, never another login beside it.
+func (l *linter) basicAuth(where string, r spec.Route) {
+	a := r.BasicAuth
+	if !basicUserRe.MatchString(a.User) {
+		l.errf(where+".user", "%q must be 1 to 64 letters, digits, '.', '_' or '-'", a.User)
+	}
+	if r.ForwardAuth != nil {
+		l.errf(where, "and forward_auth both ask who the client is: keep one")
+	}
+	if i := slices.IndexFunc(l.s.Secrets, func(s spec.Secret) bool { return s.Key == a.Secret }); i >= 0 {
+		if l.s.Secrets[i].Rotation {
+			l.errf(where+".secret", "%s rotates, and the front holds one password: no rotation", a.Secret)
+		}
+		return
+	}
+	switch in, ok := l.s.Input(a.Secret); {
+	case a.Secret == "":
+		l.errf(where+".secret", "is required: the secret or secret input holding the password")
+	case !ok:
+		l.errf(where+".secret", "%s is neither a secret nor an input", a.Secret)
+	case !in.Secret:
+		l.errf(where+".secret", "%s is not secret: a password is never printed", a.Secret)
+	}
+}
+
+// basicUserRe is a basic_auth user's name.
+var basicUserRe = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
+
+// refTag is an image reference's tag: what follows the last ':' of its name, before its digest;
+// "" without one.
+func refTag(ref string) string {
+	name, _, _ := strings.Cut(ref, "@")
+	if i := strings.LastIndex(name, ":"); i > strings.LastIndex(name, "/") {
+		return name[i+1:]
+	}
+	return ""
+}
+
+// l4Host checks an L4 route's service against how the VM runs it: on the host's network, with no
+// Docker port publishing in between, so the service itself listens on the route's port, holds no
+// network of the stack's, and runs as one container. A Docker host publishes it as it is.
+func (l *linter) l4Host(where string, r spec.L4Route, name string, port int) {
+	if l.s.Shapes.Kairos == nil || l.compose == nil {
+		return
+	}
+	if port != r.Port {
+		l.errf(where+".upstream", "%s: on the VM the service runs on the host's network, where nothing maps one port to another: it listens on the route's port, %d", r.Upstream, r.Port)
+	}
+	svc, ok := l.compose.Services[name]
+	if !ok {
+		return
+	}
+	at := l.s.Stack.Compose + ": services." + name
+	if svc.Networks != nil {
+		l.errf(at+".networks", "the VM runs %s on the host's network (the L4 route %s), which holds no other: leave its networks out", name, r.Name)
+	}
+	if _, n := svc.MemFloor(); n > 1 {
+		l.errf(at, "%d containers: the VM runs %s on the host's network (the L4 route %s), where one container holds the port", n, name, r.Name)
 	}
 }
 
@@ -1263,6 +1330,9 @@ func (l *linter) readInputs() func(spec.Input) bool {
 		if a := r.ForwardAuth; a != nil {
 			inCompose[a.AddressInput], inCompose[a.URIInput] = true, true
 		}
+		if a := r.BasicAuth; a != nil {
+			inCompose[a.Secret] = true
+		}
 	}
 	// The installer reads the L4 routes' inputs.
 	for _, r := range l.s.L4.Routes {
@@ -1536,6 +1606,10 @@ func (l *linter) shapes() {
 			case !pinnedRe.MatchString(f.ref):
 				l.errf(w+"."+f.key, "%q must be pinned by digest (<image>[:<tag>]@sha256:<64 hex>): an unpinned image changes without changing the OS bundle's inputs digest", f.ref)
 			}
+		}
+		// An equality of tags, not an ordering: the bundle's build refuses any other release.
+		if tag := refTag(k.KairosInit); k.KairosInit != "" && tag != kairos.KairosInitRelease {
+			l.warnf(w+".kairos_init", "%s: the OS bundle's build takes kairos-init %s alone, the release its boot assessment is derived from (a digest of another release is refused, minutes into ship)", cmp.Or(tag, "no tag"), kairos.KairosInitRelease)
 		}
 		for _, f := range k.DiskFormats {
 			if !slices.Contains(spec.DiskFormats, f) {

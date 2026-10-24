@@ -319,21 +319,13 @@ func (in *Installer) ready(ctx context.Context, env *EnvFile, probe *http.Client
 	if err != nil {
 		return err
 	}
-	if len(list) == 0 {
-		return errors.New("no service of the stack runs")
-	}
-	slices.SortFunc(list, func(a, b Service) int { return strings.Compare(a.Service, b.Service) })
-	for _, s := range list {
-		switch {
-		case s.State == "running" && (s.Health == "" || s.Health == "healthy"):
-		case s.State == "running":
-			return fmt.Errorf("%s is %s", s.Service, s.Health)
-		case s.State == "exited" && s.ExitCode == 0:
-		case s.State == "exited":
-			return fmt.Errorf("%s exited with code %d", s.Service, s.ExitCode)
-		default:
-			return fmt.Errorf("%s is %s", s.Service, s.State)
-		}
+	// Judged as an install's start judges them (settled): a healthcheck still starting is not
+	// ready yet, which the gate's next poll asks again.
+	switch starting, why := settled(list); {
+	case why != "":
+		return errors.New(why)
+	case len(starting) > 0:
+		return fmt.Errorf("%s is starting", strings.Join(starting, ", "))
 	}
 	switch p := in.R.Spec.Health; p.Name {
 	case "http-json", "http-status":
@@ -422,7 +414,8 @@ var probes = &http.Client{
 
 // address is service's container's address on a network the host reaches: the first network by
 // name that gives it one, its IPv4 address, else its IPv6 one (a network without IPv4); an
-// `internal: true` network skipped (the host has no route to it).
+// `internal: true` network skipped (the host has no route to it). A service on the host's
+// network is the loopback's.
 func (in *Installer) address(ctx context.Context, env *EnvFile, service string) (string, error) {
 	out, err := in.Compose(ctx, env, nil, "ps", "--quiet", service)
 	if err != nil {
@@ -439,6 +432,10 @@ func (in *Installer) address(ctx context.Context, env *EnvFile, service string) 
 	var nets map[string]struct{ IPAddress, GlobalIPv6Address, NetworkID string }
 	if err := json.Unmarshal(bytes.TrimSpace(raw), &nets); err != nil {
 		return "", fmt.Errorf("inspecting %s's container: %w", service, err)
+	}
+	// On the host's network (the VM's L4 routes' services), the service listens on the host.
+	if _, host := nets["host"]; host {
+		return "127.0.0.1", nil
 	}
 	var names, ids []string
 	for _, n := range sortedKeys(nets) {

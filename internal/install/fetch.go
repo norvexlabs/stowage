@@ -41,6 +41,26 @@ type ExitCode int
 
 func (e ExitCode) Error() string { return "exit status " + strconv.Itoa(int(e)) }
 
+// UpgradeRevision is a plain `upgrade` run by the installer of the release the install runs: it
+// takes the latest revision of that version on the install's channel (UpgradeTo), so a fix
+// shipped as a revision reaches the install. It answers false, doing nothing, when this installer
+// carries another release (Upgrade moves to it) or the install never pulls (made --offline).
+func (in *Installer) UpgradeRevision(ctx context.Context, args []string) (bool, error) {
+	env, err := in.open()
+	if err != nil {
+		return false, err
+	}
+	m := in.R.Manifest
+	_, cur, rev, err := sameProject(in.O.Dir, env, m)
+	if err != nil {
+		return false, err
+	}
+	if cur != m.ProjectVersion || rev != strconv.Itoa(m.Revision) || !pinnedImages(env) {
+		return false, nil
+	}
+	return true, in.UpgradeTo(ctx, cur, args)
+}
+
 // UpgradeTo moves the install to version v of the project, on the channel the install's release
 // came from: it fetches that release's installer from the registry the install pulls from (a
 // mirror included, never another one), checks it carries v, and runs its `upgrade` with args.

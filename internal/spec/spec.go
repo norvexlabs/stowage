@@ -234,6 +234,15 @@ type Route struct {
 	// ClientAuth makes the front require a client certificate the install's client CA issued
 	// (--client-ca) on the route: without one given, and in loopback mode, it refuses everyone.
 	ClientAuth bool `yaml:"client_auth"`
+	// BasicAuth makes the front ask for a user and its password before proxying.
+	BasicAuth *BasicAuth `yaml:"basic_auth"`
+}
+
+// BasicAuth is a route's login: the user's name, and the key of the spec secret or secret input
+// holding its password. The front refuses everyone while that value is empty.
+type BasicAuth struct {
+	User   string `yaml:"user"`
+	Secret string `yaml:"secret"`
 }
 
 // ForwardAuth is a route's authentication service: the inputs holding its address and the URI it

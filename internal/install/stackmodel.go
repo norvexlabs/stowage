@@ -43,7 +43,10 @@ const contentPlaceholder = "# Written by the installer: what it adds to each ser
 // ContentCompose.
 type composeModel struct {
 	Services map[string]struct {
+		Image       string            `json:"image"`
 		NetworkMode string            `json:"network_mode"`
+		DependsOn   map[string]any    `json:"depends_on"`
+		Expose      []string          `json:"expose"`
 		Sysctls     map[string]string `json:"sysctls"`
 		Ulimits     map[string]any    `json:"ulimits"`
 		serviceMemory
@@ -144,11 +147,12 @@ func (in *Installer) model(ctx context.Context, environ []string) (*composeModel
 // contentCompose labels each service with an HMAC, under key, of the configs and secrets Compose
 // renders into it (inline content, an environment variable's value from environ): Compose copies
 // them into the container as it creates it, and recreates none when only they change, so the
-// label makes their change one of the service's. It gives each service with a network namespace
+// label makes their change one of the service's. On the VM (hn) it runs the L4 routes' services on
+// the host's network and maps the names between them and the rest of the stack (hostNet.give). It gives each service with a network namespace
 // of its own the sysctls of ctr it does not set itself, each service ctr's open files unless it
 // sets its own, each service mem shares its memory limit, and each bridge network the stack makes
 // ctr's MTU.
-func contentCompose(m *composeModel, environ []string, key []byte, ctr tune.Container, mem memoryPlan) ([]byte, error) {
+func contentCompose(m *composeModel, environ []string, key []byte, ctr tune.Container, mem memoryPlan, hn hostNet) ([]byte, error) {
 	lookup := environLookup(environ)
 	services := map[string]any{}
 	for _, name := range sortedKeys(m.Services) {
@@ -177,8 +181,9 @@ func contentCompose(m *composeModel, environ []string, key []byte, ctr tune.Cont
 		if n > 0 {
 			extra["labels"] = map[string]string{ContentLabel: "hmac-sha256:" + hex.EncodeToString(h.Sum(nil))}
 		}
+		hn.give(extra, name, svc.NetworkMode)
 		// The host's namespace, or another service's, is no service's own to set.
-		if svc.NetworkMode == "" || svc.NetworkMode == "bridge" {
+		if (svc.NetworkMode == "" || svc.NetworkMode == "bridge") && !hn.targets[name] {
 			own := map[string]string{}
 			for k, v := range ctr.Sysctls {
 				if _, set := svc.Sysctls[k]; !set {
@@ -334,7 +339,7 @@ func (in *Installer) networkMTU(ctx context.Context, environ []string, m *compos
 // writeContent writes ContentCompose for the stack as Compose runs it with environ, by the
 // install's record env (never the shell's), and makes the stack's networks again when the host's
 // MTU changed.
-func (in *Installer) writeContent(ctx context.Context, m *composeModel, env *EnvFile, environ []string) error {
+func (in *Installer) writeContent(ctx context.Context, m *composeModel, env *EnvFile, environ []string, hn hostNet) error {
 	key, err := in.contentKey()
 	if err != nil {
 		return fmt.Errorf("%s: %w", ContentKey, err)
@@ -348,7 +353,7 @@ func (in *Installer) writeContent(ctx context.Context, m *composeModel, env *Env
 		// rather than be made again without it.
 		ctr.MTU = in.previousMTU()
 	}
-	raw, err := contentCompose(m, environ, key, ctr, mem)
+	raw, err := contentCompose(m, environ, key, ctr, mem, hn)
 	if err != nil {
 		return err
 	}

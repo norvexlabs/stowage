@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/norvexlabs/stowage/internal/kairos"
 	"github.com/norvexlabs/stowage/internal/testutil"
 )
 
@@ -198,6 +199,17 @@ func TestEachRuleFiresOnFull(t *testing.T) {
 		{"tune profile missing", []edit{{sp, "  profile: network   #", "  other: network   #"}}, nil, "field other not found"},
 		{"tune profile empty", []edit{{sp, "  profile: network   #", "  profile: \"\"   #"}}, nil, "tune.profile: missing"},
 		{"tune left empty", []edit{{sp, "tune:\n  profile: network   # a heavy network load: the hosts are tuned for it (default: Docker's path alone)\n", "tune:\n"}}, nil, "tune.profile: missing"},
+		{"login user", []edit{{sp, "basic_auth: { user: ops, secret: OPS_PASSWORD }", "basic_auth: { user: \"o:ps\", secret: OPS_PASSWORD }"}}, nil, `front.routes[3].basic_auth.user: "o:ps" must be 1 to 64 letters`},
+		{"login user missing", []edit{{sp, "basic_auth: { user: ops, secret: OPS_PASSWORD }", "basic_auth: { secret: OPS_PASSWORD }"}}, nil, `front.routes[3].basic_auth.user: "" must be`},
+		{"login secret missing", []edit{{sp, "basic_auth: { user: ops, secret: OPS_PASSWORD }", "basic_auth: { user: ops }"}}, nil, "front.routes[3].basic_auth.secret: is required"},
+		{"login secret unknown", []edit{{sp, "basic_auth: { user: ops, secret: OPS_PASSWORD }", "basic_auth: { user: ops, secret: NOPE }"}}, nil, "front.routes[3].basic_auth.secret: NOPE is neither a secret nor an input"},
+		{"login secret not secret", []edit{{sp, "basic_auth: { user: ops, secret: OPS_PASSWORD }", "basic_auth: { user: ops, secret: ECHO_ADDRESS }"}}, nil, "front.routes[3].basic_auth.secret: ECHO_ADDRESS is not secret"},
+		{"login secret rotated", []edit{{sp, "basic_auth: { user: ops, secret: OPS_PASSWORD }", "basic_auth: { user: ops, secret: INTERNAL_SERVICE_SECRET }"}}, nil, "front.routes[3].basic_auth.secret: INTERNAL_SERVICE_SECRET rotates"},
+		{"login beside forward auth", []edit{{sp, "copy_headers: [X-Auth-Request-User] }\n", "copy_headers: [X-Auth-Request-User] }\n      basic_auth: { user: ops, secret: OPS_PASSWORD }\n"}}, nil, "front.routes[1].basic_auth: and forward_auth both ask who the client is"},
+		{"login field unknown", []edit{{sp, "basic_auth: { user: ops, secret: OPS_PASSWORD }", "basic_auth: { user: ops, secret: OPS_PASSWORD, realm: x }"}}, nil, "field realm not found"},
+		{"l4 port mapped on the vm", []edit{{sp, "port: 17007, upstream: echo:17007, address_input", "port: 17008, upstream: echo:17007, address_input"}}, nil, "l4.routes[0].upstream: echo:17007: on the VM the service runs on the host's network, where nothing maps one port to another: it listens on the route's port, 17008"},
+		{"l4 service on a network", []edit{{cp, "  echo:\n    image: ${STOWAGE_IMAGE_INGEST}\n", "  echo:\n    networks: [default]\n    image: ${STOWAGE_IMAGE_INGEST}\n"}}, nil, "deploy/compose.yaml: services.echo.networks: the VM runs echo on the host's network (the L4 route echo), which holds no other"},
+		{"l4 service scaled", []edit{{cp, "  echo:\n    image: ${STOWAGE_IMAGE_INGEST}\n", "  echo:\n    scale: 2\n    image: ${STOWAGE_IMAGE_INGEST}\n"}}, nil, "deploy/compose.yaml: services.echo: 2 containers: the VM runs echo on the host's network (the L4 route echo), where one container holds the port"},
 		{"hook env not recorded", []edit{{sp, "env: [ADMIN_EMAIL, ADMIN_PASSWORD, INTERNAL_SERVICE_SECRET]", "env: [ADMIN_EMAIL, API_URL]"}}, nil, "hooks.provision.env[1]: API_URL is no input, secret or safe default"},
 		{"hook returns an input", []edit{{sp, "returns: [ADMIN_API_KEY, ADMIN_LOGIN]", "returns: [ADMIN_API_KEY, ADMIN_EMAIL]"}}, nil, "hooks.provision.returns[1]: ADMIN_EMAIL is an input, a value the install records"},
 		{"hook returns a secret", []edit{{sp, "returns: [ADMIN_API_KEY, ADMIN_LOGIN]", "returns: [INTERNAL_SERVICE_SECRET]"}}, nil, "hooks.provision.returns[0]: INTERNAL_SERVICE_SECRET is a secret"},
@@ -818,10 +830,57 @@ func TestExtendsErrorsOnce(t *testing.T) {
 }
 
 // The front's ports are TCP: an L4 route over UDP on 443 is clean, beside the front and acme.
+// A kairos_init of another release than the bundle's boot assessment is derived from is warned
+// before ship's build refuses it; the release itself is not.
+func TestAnotherKairosInitReleaseIsWarned(t *testing.T) {
+	t.Parallel()
+	const tag = "kairos-init:" + kairos.KairosInitRelease + "@"
+	root := testutil.CopyExample(t, "full")
+	for _, f := range run(t, root).Findings {
+		if strings.Contains(f.String(), "kairos_init") {
+			t.Errorf("the release itself: %s", f)
+		}
+	}
+	for _, other := range []string{"kairos-init:v4.3.0@", "kairos-init@"} {
+		testutil.Edit(t, root, specFile, tag, other)
+		res := run(t, root)
+		if !slices.ContainsFunc(res.Findings, func(f Finding) bool {
+			return f.Severity == Warning && strings.Contains(f.String(), "shapes.kairos.kairos_init:") && strings.Contains(f.String(), "takes kairos-init "+kairos.KairosInitRelease+" alone")
+		}) {
+			t.Errorf("%s: %+v", other, res.Findings)
+		}
+		testutil.Edit(t, root, specFile, other, tag)
+	}
+}
+
+func TestRefTag(t *testing.T) {
+	t.Parallel()
+	for ref, want := range map[string]string{
+		"quay.io/kairos/kairos-init:v4.4.0-rc2@sha256:ab": "v4.4.0-rc2",
+		"localhost:5000/kairos-init@sha256:ab":            "",
+		"localhost:5000/kairos-init:v1":                   "v1",
+		"kairos-init":                                     "",
+	} {
+		if got := refTag(ref); got != want {
+			t.Errorf("%s: %q, want %q", ref, got, want)
+		}
+	}
+}
+
+// A login's password may be a secret input: one an operator gives.
+func TestALoginFromASecretInput(t *testing.T) {
+	t.Parallel()
+	root := testutil.CopyExample(t, "full")
+	testutil.Edit(t, root, specFile, "basic_auth: { user: ops, secret: OPS_PASSWORD }", "basic_auth: { user: ops, secret: SEARCH_KEY }")
+	if errs := errorsOf(run(t, root)); len(errs) > 0 {
+		t.Fatal(strings.Join(errs, "\n"))
+	}
+}
+
 func TestL4UDPOnTheFrontsPort(t *testing.T) {
 	t.Parallel()
 	root := testutil.CopyExample(t, "full")
-	testutil.Edit(t, root, specFile, "protocol: udp, port: 17007", "protocol: udp, port: 443")
+	testutil.Edit(t, root, specFile, "protocol: udp, port: 17007, upstream: echo:17007", "protocol: udp, port: 443, upstream: echo:443")
 	if errs := errorsOf(run(t, root)); len(errs) > 0 {
 		t.Fatal(strings.Join(errs, "\n"))
 	}

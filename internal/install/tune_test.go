@@ -27,7 +27,7 @@ func TestContentComposeGivesEachOwnNamespaceTheSysctls(t *testing.T) {
 		t.Fatal(err)
 	}
 	set := map[string]string{"net.core.somaxconn": "8192", "net.ipv4.tcp_rmem": "4096 131072 16777216"}
-	raw, err := contentCompose(&model, nil, []byte("key"), tune.Container{Sysctls: set}, memoryPlan{})
+	raw, err := contentCompose(&model, nil, []byte("key"), tune.Container{Sysctls: set}, memoryPlan{}, hostNet{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -53,7 +53,7 @@ func TestContentComposeGivesEachOwnNamespaceTheSysctls(t *testing.T) {
 			t.Errorf("%s, on another's namespace, given %v", name, got[name])
 		}
 	}
-	again, _ := contentCompose(&model, nil, []byte("key"), tune.Container{Sysctls: set}, memoryPlan{})
+	again, _ := contentCompose(&model, nil, []byte("key"), tune.Container{Sysctls: set}, memoryPlan{}, hostNet{})
 	if !bytes.Equal(raw, again) {
 		t.Error("the file is not the same from one run to the next")
 	}
@@ -76,7 +76,7 @@ func TestContentComposeGivesTheHostsOpenFilesAndMTU(t *testing.T) {
 		"over": {"driver": "overlay"}}}`), &model); err != nil {
 		t.Fatal(err)
 	}
-	raw, err := contentCompose(&model, nil, []byte("key"), tune.Container{Nofile: 524288, MTU: 9001}, memoryPlan{})
+	raw, err := contentCompose(&model, nil, []byte("key"), tune.Container{Nofile: 524288, MTU: 9001}, memoryPlan{}, hostNet{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -103,11 +103,11 @@ func TestContentComposeGivesTheHostsOpenFilesAndMTU(t *testing.T) {
 		t.Errorf("networks: %+v\n%s", doc.Networks, raw)
 	}
 	// A hard limit below the soft cap: the soft limit is the hard one.
-	raw, _ = contentCompose(&model, nil, []byte("key"), tune.Container{Nofile: 4096}, memoryPlan{})
+	raw, _ = contentCompose(&model, nil, []byte("key"), tune.Container{Nofile: 4096}, memoryPlan{}, hostNet{})
 	if !strings.Contains(string(raw), "hard: 4096\n                soft: 4096\n") {
 		t.Errorf("a hard limit of 4096:\n%s", raw)
 	}
-	if raw, _ := contentCompose(&model, nil, []byte("key"), tune.Container{}, memoryPlan{}); string(raw) != contentPlaceholder {
+	if raw, _ := contentCompose(&model, nil, []byte("key"), tune.Container{}, memoryPlan{}, hostNet{}); string(raw) != contentPlaceholder {
 		t.Errorf("nothing to give:\n%s", raw)
 	}
 }

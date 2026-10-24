@@ -541,3 +541,15 @@ func TestParamsWithoutTheInstallerAreRefused(t *testing.T) {
 		t.Fatal("WriteContext wrote without the installer's name")
 	}
 }
+
+// The bundle's build and its 08_grub.yaml name the release lint holds the project to.
+func TestTheBundleNamesItsKairosInitRelease(t *testing.T) {
+	t.Parallel()
+	grub, err := files.ReadFile("files/usr/share/NAME/08_grub.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(dockerfile, "use kairos-init "+KairosInitRelease+"\"") || !strings.Contains(string(grub), "(kairos-init "+KairosInitRelease+")") {
+		t.Errorf("the Dockerfile or 08_grub.yaml names another release than %s", KairosInitRelease)
+	}
+}

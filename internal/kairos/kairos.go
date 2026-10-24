@@ -36,6 +36,10 @@ type Params struct {
 // placeholder in a file's path is replaced by the project's name.
 const placeholder = "NAME"
 
+// KairosInitRelease is the kairos-init release whose 08_grub.yaml the bundle's boot assessment is
+// derived from: the bundle's build refuses another (the Dockerfile names it too).
+const KairosInitRelease = "v4.4.0-rc2"
+
 // PreloadDir is the directory of the context the image archives go to, and CtlDir the one
 // <short>-stow goes to.
 const (

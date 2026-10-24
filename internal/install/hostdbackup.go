@@ -350,6 +350,10 @@ func (h *Hostd) setBackupConfig(w http.ResponseWriter, r *http.Request) {
 		replyErr(w, fail(http.StatusForbidden, "the backup settings' lock is the operator's: backup config --lock over SSH"))
 		return
 	}
+	if err := appRclone(app, cur, req); err != nil {
+		replyErr(w, err)
+		return
+	}
 	c := mergeBackup(cur, req, pg)
 	if app && locked && backupChanges(cur, c) != "" {
 		replyErr(w, fail(http.StatusForbidden, "the backup settings are locked: the operator changes them, backup config over SSH"))
@@ -1250,9 +1254,45 @@ func (h *Hostd) runnerCall(r *http.Request) (*Installer, *BackupConfig, error) {
 	return in, c, nil
 }
 
+// appRclone refuses, from the app socket (app), an rclone config other than the saved one (cur)
+// that has rclone run a program: sftp's `ssh`, or a `*_command` (webdav's bearer_token_command)
+// — the daemon runs rclone as root on the host's network, so such a config is the operator's to
+// give, over SSH.
+func appRclone(app bool, cur *BackupConfig, req BackupConfigRequest) error {
+	if !app || req.RcloneConfig == nil || cur != nil && *req.RcloneConfig == cur.RcloneConfig {
+		return nil
+	}
+	if k := rcloneProgram(*req.RcloneConfig); k != "" {
+		return fail(http.StatusForbidden, "rclone_config: %s has rclone run a program on the host: the operator gives such a config, backup config over SSH", k)
+	}
+	return nil
+}
+
+// rcloneProgram is the first `[section] key` of an rclone config that names a program rclone runs
+// (ssh, or a key ending in _command, any case); "" when there is none.
+func rcloneProgram(conf string) string {
+	section := ""
+	for line := range strings.Lines(conf) {
+		l := strings.TrimSpace(line)
+		switch {
+		case l == "" || strings.HasPrefix(l, "#") || strings.HasPrefix(l, ";"):
+		case strings.HasPrefix(l, "[") && strings.HasSuffix(l, "]"):
+			section = strings.TrimSpace(l[1 : len(l)-1])
+		default:
+			k, _, _ := strings.Cut(l, "=")
+			k = strings.ToLower(strings.TrimSpace(k))
+			if k == "ssh" || strings.HasSuffix(k, "_command") {
+				return fmt.Sprintf("[%s] %s", section, k)
+			}
+		}
+	}
+	return ""
+}
+
 // proposedBackup is verify's run with settings proposed over the saved ones (or none), checked
-// as a change would be, never saved.
-func (h *Hostd) proposedBackup(req BackupConfigRequest) (*Installer, *BackupConfig, error) {
+// as a change would be, never saved; from the app socket (app), its rclone
+// config checked by appRclone.
+func (h *Hostd) proposedBackup(req BackupConfigRequest, app bool) (*Installer, *BackupConfig, error) {
 	pg, err := h.pgBackup()
 	if err != nil {
 		return nil, nil, err
@@ -1265,6 +1305,9 @@ func (h *Hostd) proposedBackup(req BackupConfigRequest) (*Installer, *BackupConf
 	cur, err := h.decodeBackup()
 	h.backupMu.Unlock()
 	if err != nil {
+		return nil, nil, err
+	}
+	if err := appRclone(app, cur, req); err != nil {
 		return nil, nil, err
 	}
 	c := mergeBackup(cur, req, pg)
@@ -1327,11 +1370,17 @@ func (h *Hostd) verifyBackup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	proposed := req.setsAny()
+	// Locked, the app verifies the saved settings alone: a proposed destination would have the
+	// daemon write where the operator did not say.
+	if proposed && fromApp(r) && h.settingsLocked() {
+		replyErr(w, fail(http.StatusForbidden, "the backup settings are locked: verify the saved ones (a request without settings), or the operator verifies others over SSH"))
+		return
+	}
 	var in *Installer
 	var c *BackupConfig
 	var err error
 	if proposed {
-		in, c, err = h.proposedBackup(req)
+		in, c, err = h.proposedBackup(req, fromApp(r))
 	} else {
 		in, c, err = h.runnerCall(r)
 	}

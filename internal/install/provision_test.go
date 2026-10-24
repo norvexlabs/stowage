@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -109,12 +110,36 @@ func TestTheHookServiceIsConfinedAndGetsTheRecordedValues(t *testing.T) {
 }
 
 func TestADollarInTheHooksCmdStaysLiteral(t *testing.T) {
-	out, err := provisionCompose(&providers.ProvisionHook{Image: "api", Cmd: []string{"sh", "-c", "echo $HOME ${X}"}}, nil)
+	out, err := provisionCompose(&providers.ProvisionHook{Image: "api", Cmd: []string{"sh", "-c", "echo $HOME ${X}"}}, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(out), "echo $$HOME $${X}") {
+	if !strings.Contains(string(out), "echo $$HOME $${X}") || strings.Contains(string(out), "extra_hosts") {
 		t.Fatalf("%s", out)
+	}
+}
+
+// On the VM, a service Stowage runs on demand reaches the L4 routes' services, on the host's
+// network, by name at the host's gateway; on Docker they are on the stack's network.
+func TestOnDemandServicesReachTheVMsL4ServicesByName(t *testing.T) {
+	t.Parallel()
+	r, _ := testInstallerWith(t, "1.0.0", func(s *spec.Spec) {
+		s.L4.Routes = []spec.L4Route{
+			{Name: "echo", Protocol: "tcp", Port: 17007, Upstream: "echo:17007"},
+			{Name: "echo-udp", Protocol: "udp", Port: 17007, Upstream: "echo:17007"},
+			{Name: "db", Protocol: "tcp", Port: 5432, Upstream: "postgres:5432"},
+		}
+	})
+	vm := &Installer{R: r, O: Options{Firewall: t.TempDir()}}
+	if got := vm.targetHosts(); !slices.Equal(got, []string{"echo:host-gateway", "postgres:host-gateway"}) {
+		t.Errorf("hosts %v", got)
+	}
+	out, err := provisionCompose(&providers.ProvisionHook{Image: "api", Cmd: []string{"true"}}, nil, vm.targetHosts())
+	if err != nil || !strings.Contains(string(out), "extra_hosts:\n            - echo:host-gateway\n            - postgres:host-gateway\n") {
+		t.Errorf("%s %v", out, err)
+	}
+	if got := (&Installer{R: r}).targetHosts(); got != nil {
+		t.Errorf("Docker: %v", got)
 	}
 }
 

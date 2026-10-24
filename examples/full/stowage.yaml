@@ -66,6 +66,7 @@ front:
       domain_input: OPS_DOMAIN
       upstream: api:9090
       client_auth: true                                        # a certificate the install's --client-ca issued
+      basic_auth: { user: ops, secret: OPS_PASSWORD }          # then a login (bcrypt in the front's configuration)
   portal: console
   loopback_ports: { console: 3000, api: 9090, ingest: 8080, ops: 9091 }
   loopback_env: { COOKIE_SECURE: "false", TRUSTED_PROXY_HOPS: "0" }
@@ -115,6 +116,7 @@ secrets:
   - { key: INTERNAL_SERVICE_SECRET, gen: hex32, rotation: true }   # secrets rotate
   - { key: POSTGRES_PASSWORD,       gen: pass18 }
   - { key: APP_DB_PASSWORD,         gen: pass18 }
+  - { key: OPS_PASSWORD,            gen: pass18 }   # the ops route's login
 
 safe_defaults:
   COOKIE_SECURE: "true"

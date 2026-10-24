@@ -3,6 +3,56 @@
 Stowage's own releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
+## [0.13.0]
+
+### Added
+- **A front route can ask for a login**: `basic_auth: { user, secret }` on a route makes the
+  front ask for that user and the password a spec secret (`gen:`) or a secret input holds, after
+  the route's allowlist and client certificate, on Docker and the VM. The upstream never sees
+  the login's `Authorization` header. The front keeps the password's bcrypt hash, made again only
+  when the password changes; while the password is empty the route refuses everyone. A login
+  page (a form and a session) is planned.
+- **Inside the stack, a route's domain names the front**: in a TLS mode each route's domain is
+  an alias of the front on the stack's network, so a service calling another route by its public
+  name (an identity provider's issuer URL) reaches the front.
+- `lint` warns when `shapes.kairos.kairos_init` is not the kairos-init release the OS bundle's
+  build takes (today v4.4.0-rc2), before `ship` refuses it minutes into the build.
+
+### Changed
+- **On the VM, an L4 route's service runs on the host's network**: no Docker port publishing,
+  NAT or bridge sits between its clients and it. The VM's firewall opens the route's port from
+  the route's allowlist (on its bind address alone when it has one), and lets the stack's own
+  services reach the ports it is reached on inside (the L4 ports, the front's routes to it and
+  the ports it exposes). The stack still reaches it by name, at the host's gateway, the provision
+  hook and a `command` provider included; it reaches the services it `depends_on` by name too,
+  each published on 127.0.4.1 on the ports it exposes (its `expose:` and its image's). With a
+  `kairos` shape, `lint` refuses an L4 route whose port differs from its upstream's (nothing
+  maps one to the other on the host's network), and a route's service that declares
+  `networks:` or runs more than one container. Docker publishes the routes as before.
+- **A plain `upgrade` takes a new revision of the release the install runs**: run by the
+  installer the install keeps, it now looks for that version's latest revision on the install's
+  channel and upgrades to it, as `upgrade --version` does, so a fix shipped as a revision
+  reaches the install.
+- **The VM's health gate judges the stack's services as an install's start does**: a
+  healthcheck still starting is reported as starting, and the next poll asks again.
+- `vm create`'s SSH offers the agent's key of `--ssh-key` alone when its private key is not
+  next to it, rather than every key the agent holds (the VM drops a client after 4 failed
+  keys).
+
+### Security
+- **The app socket gives no rclone config that runs a program**: a service holding the
+  install's token can no longer save or verify backup settings whose rclone config has rclone
+  run a program (sftp's `ssh`, a `*_command` such as webdav's `bearer_token_command`), which the
+  host daemon would run as root; the operator's own such config stays theirs to give over SSH,
+  and the app may save it back unchanged. While the backup settings are locked, the app's
+  `backup verify` tries the saved settings alone.
+
+### Fixed
+- **The Docker warning on an allowlist every IPv6 client passes** now judges the stack
+  network's own gateway, read once the network exists, rather than Docker's default pools: a
+  daemon given other pools is warned, and a list overlapping a pool without holding the gateway
+  is not.
+
 ## [0.12.0] - 2026-10-24
 
 ### Changed

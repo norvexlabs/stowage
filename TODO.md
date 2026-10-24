@@ -30,20 +30,12 @@ A finished item is deleted, not ticked. The plan behind it is
    SBOM's tag/referrer, the verb and how to verify one by hand with `cosign verify-attestation`.
 3. **Security review (2026-10-24) of the produced artifacts, the findings left** (AWS's and
    Azure's are under 4):
-   - **The mirror's CA is trusted system-wide** (`update-ca-certificates`) rather than for the
-     registry alone: kairos-agent's pull needs it; find what else can carry it (a per-registry
-     `certs.d` its pull reads), else document the scope.
-   - **The Docker IPv6 allowlist warning checks Docker's default pools** (`172.16.0.0/12`,
-     `192.168.0.0/16`), not the stack network's gateway: a daemon given other
-     `default-address-pools` is missed, and a list overlapping a pool without holding the gateway
-     is warned. Read the gateway (`docker network inspect`) once the network exists.
-   - **On a running VM, checked once by hand** (and kept in e2e-vm where cheap): `ss -tulpn` on
-     the active and recovery systems (no kairos-agent web UI, p2p or edgevpn), `passwd -S` of
-     every account (root locked, no `kairos` user with a password: README claims no account
-     logs in on the console with one), no console autologin, the effective `sshd -T`
-     (`PermitRootLogin`), Docker's FORWARD policy with `--ipv6` (the project's forward chain
-     accepts by default and relies on it), whether Kairos reads the cloud's user-data again at
-     each boot.
+   - **On a running VM, what e2e-vm does not check**: it asserts the active system's listeners
+     (no kairos-agent web UI, p2p or edgevpn), every account's `passwd -S` (none with a
+     password), the effective `sshd -T` and no console autologin, and records Docker's FORWARD
+     policy and `/oem`. Left, by hand once: `ss -tulpn` on the recovery system; whether Kairos
+     reads the cloud's user-data again at each boot; Docker's FORWARD policy with `--ipv6` (the
+     project's forward chain accepts by default and relies on it).
 
 4. **Cloud images on AWS and Azure**: `ship` registers the `cloud_publish` images through
    OpenTofu, run for real on Google Cloud only (`STOWAGE_CLOUD_ENV=<file> make e2e-kairos`). Run it
@@ -74,62 +66,45 @@ A finished item is deleted, not ticked. The plan behind it is
 Found packaging a second project (an explicit forward proxy, Docker shape, 2026-10-24); the
 Shoulds it found are under Should:
 
-7. **Docker: an L4 route open to every source** (security): its port was published on `0.0.0.0`
-   and `[::]` while its `allow_input` held one address; for a forward proxy that is an open relay.
-   The security work in progress may close it (bind address / exposure printed) — delete this
-   item when it lands, else enforce `allow_input` on Docker (the host's nftables, as the VM does)
-   or refuse the install without a bind address.
-8. **An admin route needs a password**: the front guards a route by `allow_input`, `client_auth`
-   or `forward_auth`, nothing in between, so a console showing users' traffic is guarded by a
-   CIDR list alone. A route behind a password (Caddy `basic_auth`, a bcrypt hash from a
-   generated secret), on Docker, the VM and in the chart's contract.
-9. **`upgrade` takes a new revision of the same version**: with the channel pointer on `V-r3`, an
-   install of `V` revision 2 answered `already runs V (revision 2)`; only `upgrade --version V`
-   took r3, so a fix shipped as a revision never reaches an install that upgrades plainly (nor
-   the VM's update check, to verify).
-10. **An L4 route pays no Docker networking** (performance): a service an `l4.routes` entry
-    targets is on the stack's bridge, its port published through Docker's DNAT (conntrack on every
-    connection, a veth hop per packet), and the way around it, `network_mode: host`, is a lint
-    error on the VM and a warning on Docker because the port then escapes Stowage. Measured on a
-    pinned 2-vCPU Linux host, one binary and one configuration, native process vs the Docker
-    shape: keep-alive HTTP/2 through the proxy −4.4% req/s and +4.5% CPU per request (median of
-    three interleaved runs, all three agreeing; connection-heavy workloads, where the DNAT's cost is
-    per connection, were not run). An L4 route is chosen for throughput and latency,
-    so its target runs on the host's network by default, still owned by Stowage: the route's port
-    listed and checked, `allow_input` enforced by the host's nftables (closing 7 at the same time)
-    and the VM's firewall opening it; lint stops refusing it for an L4 target, and the bridge stays
-    for every other service. With it, a CPU set per service (compose `cpuset`, the VM's and the
-    chart's equivalent): an unpinned service shares its cores with the rest of the stack.
+7. **A route's login page**: `basic_auth` makes the browser ask (its prompt, no sign-out, the
+   password sent with each request). A login page — a form, a session cookie, a sign-out, a
+   lockout after failed tries — on Docker, the VM and in the chart's contract: a Caddy plugin in
+   the front image (caddy-security, pinned, its local users from the route's secret), or a small
+   login service of Stowage's behind `forward_auth`; `basic_auth` stays for scripts.
 
 ### Network appliances — a stack between networks
 
 A stack whose service sits between networks (routes, filters or intercepts traffic for the
 hosts behind it) rather than serving on one: today only its explicit form fits (clients name it
-as their proxy, one interface, an L4 route), and that form needs 10. The transparent form needs
+as their proxy, one interface, an L4 route on the host's network). The transparent form needs
 the following on a Kairos host, bare metal first (after the bare-metal slice: the ISO and its
 install block, the metal platform, NICs named by MAC); the VM where it applies; on a Docker host,
 whose kernel is the operator's, `tune` reports what is missing and sets nothing.
 
-11. **More than one interface**: the VM has one NIC. An appliance has a client side and an
+8. **More than one interface**: the VM has one NIC. An appliance has a client side and an
     upstream side (and often a management one): `shapes.kairos` declares named interfaces (role,
     addressing: DHCP / static / none, MTU), `vm create` and the OpenTofu modules attach one NIC
     per role on the named network, and the stack's spec names which role an L4 route or the front
-    listens on. The VM's firewall, `allow_input` and the front judge per interface.
-12. **Firewall rules a service declares, in the host's ruleset**: interception and the
+    listens on. The VM's firewall, `allow_input` and the front judge per interface. An L4 route's
+    service runs on the host's network today; with an interface per role, an ipvlan interface
+    for it on its role's NIC (an address of its own, with no NAT and beside the stack's bridge)
+    is the other way: the host's firewall does not see that traffic, so its rules would go in the
+    service's own namespace.
+9. **Firewall rules a service declares, in the host's ruleset**: interception and the
     appliance's egress floor are host rules (nftables: a TPROXY / redirect of the client side's
     TCP to the service's port, a forward chain that default-denies what the service cannot
     inspect, DNS sent to the stack's resolver, UDP 443 rejected), which a container cannot own.
     The spec declares a ruleset fragment per service (a table of its own, its named sets fed by the
     service), Stowage loads it at boot before the service starts, removes it with the service, and
     lint checks it parses and touches only its own table; routing and `ip_forward` with it, on the
-    interfaces 11 names. The host's own firewall stays Stowage's.
-13. **Host tuning a service asks for**: the `network` profile tunes the host as a whole. An
+    interfaces 8 names. The host's own firewall stays Stowage's.
+10. **Host tuning a service asks for**: the `network` profile tunes the host as a whole. An
     appliance places work: the NIC queues' interrupts and RPS/XPS off the service's CPU set (or on
     it, by the service's choice), the queue count — one per core, which a driver may refuse:
     Intel's E810 (`ice`) answers every `ethtool -L` with EBUSY ("Cannot change channels when RDMA
     is active") while `irdma` is bound to the port's `ice.roce.N` auxiliary device, leaving a 100G
-    port at 8 queues on a 16-core host; a project that uses no RDMA declares `block: irdma` (16) —
-    kernel arguments, modules (16), and sysctls past the container-namespaced set. The spec
+    port at 8 queues on a 16-core host; a project that uses no RDMA declares `block: irdma` (13) —
+    kernel arguments, modules (13), and sysctls past the container-namespaced set. The spec
     declares them per service or per host; the host's boot applies them before the service starts,
     and `tune` reports a host that lacks them (the warnings the service logs at its start are the
     list to meet). The host then:
@@ -140,8 +115,8 @@ whose kernel is the operator's, `tune` reports what is missing and sets nothing.
       falls back to the passive system as any other; an opt-out for hosts with untrusted PCIe
       devices (passthrough leaves a host-owned device unconfined). Effective at the next boot,
       said so.
-    - **CPU power**: 15.
-    - **Modules at boot**: those the project declares (16), e.g. `tcp_bbr` and `nf_conntrack`.
+    - **CPU power**: 12.
+    - **Modules at boot**: those the project declares (13), e.g. `tcp_bbr` and `nf_conntrack`.
     - **Conntrack sized from RAM**: `nf_conntrack_max` ~300 B of unswappable memory per entry
       (512 MB → ~89k, 4 GB → ~715k, capped at 1,048,576 from ~6 GB) and the hash buckets at a
       quarter of it (both directions inserted: mean chain 8; the kernel's own 4,096 buckets on a
@@ -151,13 +126,13 @@ whose kernel is the operator's, `tune` reports what is missing and sets nothing.
       pre-set maximums (never a constant: ENA's TX caps at 1024), one combined queue per core with
       RSS spread equally over the CPUs the host allows the appliance (the E810 case above: its
       queues stay at 8 unless `irdma` is blocked).
-14. **An upgrade that keeps the listening sockets**: an appliance's clients cannot be told to
+11. **An upgrade that keeps the listening sockets**: an appliance's clients cannot be told to
     retry, and a container's replacement drops every connection and refuses new ones until the
     new one listens. The service hands its listening sockets to its successor (systemd socket
     passing, or the app's own handoff over a Unix socket: old and new running side by side, the
     old draining). Stowage's upgrade starts the new container beside the old one on the host's
     network with the handoff socket shared, waits for the old one to exit, and keeps the rollback.
-15. **Power management, a declared posture that survives the reboot**: `tune --apply` sets the
+12. **Power management, a declared posture that survives the reboot**: `tune --apply` sets the
     governor on the running Docker host only (a reboot loses it: the Should on the `network`
     profile's interrupts and governor), the VM's boot sets it each time, and nothing stops another
     writer from undoing it. An appliance declares its posture — `performance` (every core held at
@@ -181,7 +156,7 @@ whose kernel is the operator's, `tune` reports what is missing and sets nothing.
     latency; where none is bound, only the firmware's setup menu does, which `tune` can only
     report), and a NIC's Energy Efficient Ethernet and PCIe ASPM, which trade latency for watts the
     same way.
-16. **Kernel modules a project declares**: `shapes.kairos.modules` in the project's own
+13. **Kernel modules a project declares**: `shapes.kairos.modules` in the project's own
     `stowage.yaml`, each entry with a `reason` — `load` (`/etc/modules-load.d`), `block` (a
     `blacklist` and an `install <name> /bin/false`, so neither a dependency nor udev loads it) and
     `options` (`/etc/modprobe.d`, `name` and `value`). The OS bundle carries the files, so they hold
@@ -194,19 +169,15 @@ whose kernel is the operator's, `tune` reports what is missing and sets nothing.
 
 ## Should
 
-- **A driver's RDMA freed per port** (from Must 13): blocking `irdma` (Must 16) takes RDMA off
+- **A CPU set per service** (from the L4 routes on the host's network): an unpinned service
+  shares its cores with the rest of the stack. An advanced input per service giving compose
+  `cpuset` on Docker and the VM, and the chart's equivalent (its values), checked against the
+  host's CPUs at install.
+- **A driver's RDMA freed per port** (from Must 10): blocking `irdma` (Must 13) takes RDMA off
   every port of the host. A port that uses none could instead have its `ice.roce.N` auxiliary
   device unbound only on `ethtool -L`'s EBUSY, logged, and again at each boot, keeping RDMA on
   the others; a device-level action, not a module's setting.
 
-- **`lint` names the `kairos_init` release the bundle accepts**: the OS bundle's build refuses a
-  kairos-init whose `08_grub.yaml` is not the one Stowage's copy is derived from, minutes into
-  `ship`. Lint could warn when `shapes.kairos.kairos_init`'s tag is not the release Stowage
-  carries the copy for (an equality, not an ordering), so the refusal comes before the build.
-- **`vm create` offers the agent's key matching `--ssh-key`**: with only the `.pub` on this
-  machine, its SSH waits offer ssh's default keys and every agent key, and the VM's sshd drops a
-  client after 4 failed ones. Ask the agent (`ssh-add -L`) and pass `-i <pub> -o
-  IdentitiesOnly=yes` when it holds that key; any `-i` drops ssh's default key files.
 - **Kairos's CIS hardening on the VM**: kairos-init's `cisHardening` step is skipped (its shell
   umask 027, password ageing and faillock). Adopting it needs the install's writes to set their
   modes whatever the umask, and the operator account exempt from ageing (it has no password).
@@ -215,9 +186,6 @@ whose kernel is the operator's, `tune` reports what is missing and sets nothing.
   `forward_auth` are enforced by the Docker and VM fronts; on Kubernetes the chart's ingress
   serves the routes and lint says nothing. Warn per route with a `kubernetes` shape (the examples
   would then need the chart to declare it handles them, or the warning accepted there).
-- **One judgement of a stack's services**: the Docker install's `settled` and the VM health gate's
-  `ready` (`vmhealth.go`) judge `compose ps` alike, in two places; one helper, `ready` waiting
-  on a starting healthcheck, when the VM suites next run.
 - **`TestAnUnreachableDaemonIsNamed` flakes under load**: once in a full `go test ./internal/...`
   run its 0000 socket still let the caller connect (`no permission: <nil>`); 30 runs alone pass.
   The chmod and the dial race the served socket's own setup: make the test wait for the daemon to
@@ -373,8 +341,6 @@ whose kernel is the operator's, `tune` reports what is missing and sets nothing.
   lock file when `.env` cannot be written (into a directory the run did not create) has no test;
   `.env` writes through `os.CreateTemp` with no failure seam.
 
-- **`stowage.requires`**: refuse to run outside the project's accepted Stowage range (today only
-  a missing range is reported); `stowage lock` and lint check the pin against it too.
 - **The lock pins a version label, not bytes**: a `stowage` built between two of its releases
   reports the top CHANGELOG version, so it passes the pin with another installer or front. An
   immutable channel still refuses those changed inputs under an existing tag; pinning the
@@ -421,10 +387,6 @@ Docker shape, 2026-10-24):
   reaches a route through the front by its public name must dial that port, and an app that
   builds a URL from the domain alone (an OIDC issuer `https://<domain>/…`) breaks. Keep the
   front on 443 inside, publishing the chosen host port to it.
-- **The stack reaching a route by its public name**: a service that must call another route as
-  clients do (a gateway fetching its IdP's discovery at the issuer URL) has to resolve the
-  route's domain to the front itself (an `/etc/hosts` write at start). Give the front a network
-  alias per route domain on the stack network.
 - **A long-running service reading a file a one-shot service renders**: a re-run re-renders it,
   and the reader (Dex reading its config once) keeps the old file until restarted. Document the
   contract (compose `depends_on: { condition: service_completed_successfully, restart: true }`)
@@ -585,8 +547,8 @@ Docker shape, 2026-10-24):
   runs the daemon on the test host with the default `/etc/issue.d`: past `hard_pct` (99% there)
   it would write the host's login banner; `hostd` could take a hidden directory flag. A banner
   whose `agetty --reload` failed is not reloaded by a later check (the file is unchanged), and a
-  disk that stops reading leaves the last banner up. An address that never comes (a service on
-  the host's network, a broken compose file) is retried every minute, not every 10. pressurePost's
+  disk that stops reading leaves the last banner up. An address that never comes (a broken
+  compose file) is retried every minute, not every 10. pressurePost's
   `(result, ok, again)` could be one struct; TestServeWaitsForTheCheckUnderWay repeats served()'s
   short socket directory.
 - **Backup leftovers** (the VM's backups): a scheduled run refused because another job runs (an

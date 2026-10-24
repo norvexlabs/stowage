@@ -261,8 +261,9 @@ func TestVMCreateWithOpenTofu(t *testing.T) {
 		!slices.Equal(a[len(a)-5:], []string{"ops@notes-1.lan", "--", "notes-stow", "status", "--json"}) {
 		t.Errorf("ssh %q", a)
 	}
-	if slices.Contains(a, "-i") {
-		t.Errorf("ssh %q names a private key that does not exist", a)
+	// No private key beside the public one: the agent's key of it, alone.
+	if i := slices.Index(a, "-i"); i < 0 || !strings.HasSuffix(a[i+1], ".pub") || !slices.Contains(a, "IdentitiesOnly=yes") {
+		t.Errorf("ssh %q does not offer the public key's alone", a)
 	}
 	for _, s := range []string{"The VM notes-1 runs notes 1.0.0", "ssh ops@notes-1.lan notes-stow status", "notes-stow vm destroy notes-1"} {
 		if !strings.Contains(v.out2(), s) {
@@ -927,5 +928,26 @@ func TestSSHArgsWithoutTheKeyFile(t *testing.T) {
 	}
 	if !slices.Equal(a[len(a)-3:], []string{"ops@192.0.2.10", "--", "true"}) {
 		t.Errorf("ssh %q", a)
+	}
+}
+
+// The private key next to the public one is offered alone; with the public key alone, the agent's
+// key of it is, through the public file.
+func TestSSHArgsOfferTheGivenKeyAlone(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	pub := filepath.Join(dir, "ops.pub")
+	if err := os.WriteFile(pub, []byte("ssh-ed25519 AAAA ops\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if a := sshArgs("known", "ops", "192.0.2.10", pub, "true"); !slices.Contains(a, pub) || !slices.Contains(a, "IdentitiesOnly=yes") {
+		t.Errorf("the public key alone: ssh %q", a)
+	}
+	priv := filepath.Join(dir, "ops")
+	if err := os.WriteFile(priv, []byte("k"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if a := sshArgs("known", "ops", "192.0.2.10", pub, "true"); !slices.Contains(a, priv) || slices.Contains(a, pub) || !slices.Contains(a, "IdentitiesOnly=yes") {
+		t.Errorf("both keys: ssh %q", a)
 	}
 }

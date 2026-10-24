@@ -548,13 +548,27 @@ func (in *Installer) l4Moved(ctx context.Context, env, next *EnvFile) error {
 // heldOn reports whether own (publishedPorts' keys) holds r's port on host, an address of the host:
 // there, or on every address.
 // A wildcard is always probed: a socket holding the port on any address keeps Docker from binding
-// it, and only the stack's own on that address is known.
+// it, and only the stack's own on that address is known. A route whose service runs on the
+// host's network holds its port wherever it listens.
 func heldOn(own map[string]bool, r spec.L4Route, host string) bool {
+	if onHost(own, r) {
+		return true
+	}
 	a, err := netip.ParseAddr(host)
 	if err != nil || a.IsUnspecified() {
 		return false
 	}
 	return own[fmt.Sprintf("%s/%d", r.Protocol, r.Port)] || own[fmt.Sprintf("%s/%s/%d", r.Protocol, a.Unmap(), r.Port)]
+}
+
+// hostKey is publishedPorts' key of a service running on the host's network.
+func hostKey(service string) string { return "host:" + service }
+
+// onHost reports whether r's service runs on the host's network (the VM's L4 routes'): it holds
+// the route's port itself, on whatever address it listens on.
+func onHost(own map[string]bool, r spec.L4Route) bool {
+	service, _, _ := strings.Cut(r.Upstream, ":")
+	return own[hostKey(service)]
 }
 
 // bindHere refuses an L4 route bound to an address this host does not have: Docker could not
@@ -1117,12 +1131,16 @@ func (in *Installer) renderStack(env *EnvFile, dir string) error {
 			}
 		}
 	}
+	logins, err := in.logins(f, get, dir)
+	if err != nil {
+		return err
+	}
 	var cf string
 	switch {
 	case !f.Declared():
 		cf = "# Written by the installer: " + in.R.Spec.Name + " has no front, nothing is served over HTTP.\n"
 	case mode == Loopback:
-		cf = loopbackCaddyfile(f, get)
+		cf = loopbackCaddyfile(f, get, logins)
 	default:
 		domains := map[string]string{}
 		for _, r := range f.Routes {
@@ -1131,7 +1149,7 @@ func (in *Installer) renderStack(env *EnvFile, dir string) error {
 		email, _ := env.Get(ACMEEmailVar)
 		httpPort, _ := env.Get(HTTPPortVar)
 		httpsPort, _ := env.Get(HTTPSPortVar)
-		cf = tlsCaddyfile(f, mode, domains, email, httpPort, httpsPort, clientCA != nil, get)
+		cf = tlsCaddyfile(f, mode, domains, email, httpPort, httpsPort, clientCA != nil, get, logins)
 	}
 	// The front's configuration: the Caddyfile, the client CA it reads, and in byo the files of
 	// tls/ it reads.
@@ -1159,8 +1177,7 @@ func (in *Installer) renderStack(env *EnvFile, dir string) error {
 			}
 		}
 	}
-	in.warnIPv6Allowlists(get)
-	fc, err := frontCompose(f, in.R.Spec.L4.Routes, get, mode, in.hostAPI(), "sha256:"+hex.EncodeToString(h.Sum(nil)), ca, clientCA != nil, get(IPv6Var) == "true")
+	fc, err := frontCompose(f, in.R.Spec.L4.Routes, get, mode, in.hostAPI(), "sha256:"+hex.EncodeToString(h.Sum(nil)), ca, clientCA != nil, get(IPv6Var) == "true", in.O.Firewall != "")
 	if err != nil {
 		return err
 	}
@@ -1217,9 +1234,6 @@ func (in *Installer) up(ctx context.Context, env *EnvFile) error {
 	if err := in.volumesSplit(); err != nil {
 		return err
 	}
-	if err := in.openPorts(ctx, env); err != nil {
-		return err
-	}
 	in.O.logf("starting %s", in.R.Spec.Name)
 	base, cleanup, err := in.pullEnviron(env)
 	if err != nil {
@@ -1237,7 +1251,14 @@ func (in *Installer) up(ctx context.Context, env *EnvFile) error {
 	if err != nil {
 		return err
 	}
-	if err := in.writeContent(ctx, m, env, environ); err != nil {
+	hn, err := in.hostNetwork(ctx, m)
+	if err != nil {
+		return err
+	}
+	if err := in.writeContent(ctx, m, env, environ, hn); err != nil {
+		return err
+	}
+	if err := in.openPorts(ctx, env, hn); err != nil {
 		return err
 	}
 	// Listed once: a retry finds the volumes its first try made, and they await their uid.
@@ -1287,8 +1308,9 @@ func (in *Installer) up(ctx context.Context, env *EnvFile) error {
 		return fmt.Errorf("the stack did not become ready: %w (see: docker compose --project-directory %s logs)", err, in.O.Dir)
 	}
 	in.certDone()
+	get := func(k string) string { v, _ := env.Get(k); return v }
 	for _, r := range in.R.Spec.L4.Routes {
-		if e := in.l4Exposure(r, func(k string) string { v, _ := env.Get(k); return v }); e != "" {
+		if e := in.l4Exposure(r, get); e != "" {
 			in.O.logf("L4 route %s: %s/%d %s", r.Name, r.Protocol, r.Port, e)
 		}
 	}
@@ -1296,6 +1318,7 @@ func (in *Installer) up(ctx context.Context, env *EnvFile) error {
 		fmt.Fprintf(in.O.Out, "%s %s is running\n", in.R.Spec.Name, in.R.Manifest.ProjectVersion)
 		return nil
 	}
+	in.warnIPv6Allowlists(get, in.frontGateway(ctx, environ))
 	url, _ := env.Get(spec.URLVar(in.R.Spec.Front.Portal))
 	fmt.Fprintf(in.O.Out, "%s %s is running: %s\n", in.R.Spec.Name, in.R.Manifest.ProjectVersion, url)
 	return nil
@@ -1553,7 +1576,7 @@ func (in *Installer) l4Upgrade(ctx context.Context, env *EnvFile, mode string) e
 	}
 	var added []spec.L4Route
 	for _, r := range in.R.Spec.L4.Routes {
-		held := own[fmt.Sprintf("%s/%d", r.Protocol, r.Port)]
+		held := own[fmt.Sprintf("%s/%d", r.Protocol, r.Port)] || onHost(own, r)
 		if a := bindAddr(r, get); a != "" {
 			held = held || own[fmt.Sprintf("%s/%s/%d", r.Protocol, a, r.Port)]
 		}
@@ -1565,9 +1588,12 @@ func (in *Installer) l4Upgrade(ctx context.Context, env *EnvFile, mode string) e
 }
 
 // publishedPorts are the host ports, as protocol/port, the containers `compose ps --format json`
-// lists publish on every address: one JSON array, or one object a line.
+// lists publish on every address (protocol/address/port on one), and hostKey of each service on
+// the host's network: one JSON array, or one object a line.
 func publishedPorts(out []byte) (map[string]bool, error) {
 	type row struct {
+		Service    string
+		Networks   string
 		Publishers []struct {
 			URL           string
 			PublishedPort int
@@ -1594,6 +1620,9 @@ func publishedPorts(out []byte) (map[string]bool, error) {
 	}
 	ports := map[string]bool{}
 	for _, r := range rows {
+		if r.Networks == "host" {
+			ports[hostKey(r.Service)] = true
+		}
 		for _, p := range r.Publishers {
 			switch a, err := netip.ParseAddr(p.URL); {
 			case p.PublishedPort == 0 || err != nil:
@@ -1650,12 +1679,12 @@ const FirewallConf = "/etc/nftables.conf"
 //     through: a connection to a route's port from a source its allowlist leaves out is dropped.
 //     It is on the persistent partition: the boot's ruleset drops them before the stack's
 //     containers restart.
-func (in *Installer) openPorts(ctx context.Context, env *EnvFile) error {
+func (in *Installer) openPorts(ctx context.Context, env *EnvFile, hn hostNet) error {
 	if in.O.Firewall == "" {
 		return nil
 	}
 	name := in.R.Spec.Name
-	var input, forward []byte
+	var input []byte
 	if mode, _ := env.Get("STOWAGE_TLS_MODE"); in.R.Spec.HasFront() && mode != Loopback {
 		var ports []int
 		for _, k := range []string{HTTPPortVar, HTTPSPortVar} {
@@ -1668,9 +1697,36 @@ func (in *Installer) openPorts(ctx context.Context, env *EnvFile) error {
 		}
 		input = fmt.Appendf(input, "tcp dport { %d, %d } accept\n", ports[0], ports[1])
 	}
+	// The ports the stack's own services reach a target on, from its bridges.
+	for _, proto := range []string{"tcp", "udp"} {
+		var ports []string
+		for _, p := range hn.bridged() {
+			if p.Protocol == proto {
+				ports = append(ports, strconv.Itoa(p.Port))
+			}
+		}
+		if len(ports) > 0 {
+			input = fmt.Appendf(input, "iifname \"br-*\" %s dport { %s } accept\n", proto, strings.Join(ports, ", "))
+		}
+	}
+	get := func(k string) string { v, _ := env.Get(k); return v }
 	for _, r := range in.R.Spec.L4.Routes {
+		// A route with a bind address is reached on it alone; the other family's rule could
+		// match nothing.
+		to := map[string]string{"ip": "", "ip6": ""}
+		if a := bindAddr(r, get); a != "" {
+			if netip.MustParseAddr(a).Is4() {
+				to = map[string]string{"ip": "ip daddr " + a + " "}
+			} else {
+				to = map[string]string{"ip6": "ip6 daddr " + a + " "}
+			}
+		}
 		if r.AllowInput == "" {
-			input = fmt.Appendf(input, "%s dport %d accept\n", r.Protocol, r.Port)
+			daddr := "" // both families' alike, unbound
+			for _, d := range to {
+				daddr = d
+			}
+			input = fmt.Appendf(input, "%s%s dport %d accept\n", daddr, r.Protocol, r.Port)
 			continue
 		}
 		v, _ := env.Get(r.AllowInput)
@@ -1679,26 +1735,25 @@ func (in *Installer) openPorts(ctx context.Context, env *EnvFile) error {
 		}
 		v4, v6 := familySources(v)
 		for _, f := range []struct {
-			family, match string
-			set           []string
-		}{{"ipv4", "ip", v4}, {"ipv6", "ip6", v6}} {
-			dnat := fmt.Sprintf("meta nfproto %s meta l4proto %s ct direction original ct status dnat ct original proto-dst %d", f.family, r.Protocol, r.Port)
-			if len(f.set) == 0 {
-				forward = fmt.Appendf(forward, "%s drop\n", dnat)
+			match string
+			set   []string
+		}{{"ip", v4}, {"ip6", v6}} {
+			dst, ok := to[f.match]
+			if !ok || len(f.set) == 0 {
 				continue
 			}
-			set := strings.Join(f.set, ", ")
-			input = fmt.Appendf(input, "%s dport %d %s saddr { %s } accept\n", r.Protocol, r.Port, f.match, set)
-			forward = fmt.Appendf(forward, "%s %s saddr != { %s } drop\n", dnat, f.match, set)
+			input = fmt.Appendf(input, "%s%s dport %d %s saddr { %s } accept\n", dst, r.Protocol, r.Port, f.match, strings.Join(f.set, ", "))
 		}
 	}
+	// The forward chain's file, which held the allowlists of releases that published the routes
+	// through Docker's DNAT, goes.
 	files := []struct {
 		path, what string
 		rule, cur  []byte
 		had        bool
 	}{
 		{path: filepath.Join(in.O.Firewall, name+"-ports.nft"), what: "ports", rule: input},
-		{path: filepath.Join(in.O.Dir, ForwardRules, name+"-l4.nft"), what: "L4 routes' allowlists", rule: forward},
+		{path: filepath.Join(in.O.Dir, ForwardRules, name+"-l4.nft"), what: "L4 routes' allowlists"},
 	}
 	changed := false
 	for i := range files {

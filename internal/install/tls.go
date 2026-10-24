@@ -502,7 +502,7 @@ const hsts = `header Strict-Transport-Security "max-age=31536000; includeSubDoma
 // so its ACME challenge and its redirects to HTTPS use them. A route with client_auth requires a
 // client certificate chaining to the install's client CA (clientCA: one was given), and refuses
 // everyone while none was.
-func tlsCaddyfile(f spec.Front, mode string, domains map[string]string, email string, httpPort, httpsPort string, clientCA bool, get func(string) string) string {
+func tlsCaddyfile(f spec.Front, mode string, domains map[string]string, email string, httpPort, httpsPort string, clientCA bool, get func(string) string, logins map[string]login) string {
 	public := publicHTTPSPort(mode, httpsPort)
 	var b strings.Builder
 	b.WriteString("# Written by the installer from the project's front routes; rewritten on every run.\n")
@@ -543,7 +543,7 @@ func tlsCaddyfile(f spec.Front, mode string, domains map[string]string, email st
 		if r.ClientAuth && !clientCA {
 			b.WriteString("\trespond 403\n")
 		} else {
-			routeBody(&b, r, get)
+			routeBody(&b, r, get, logins)
 		}
 		b.WriteString("}\n")
 		// Caddy's own redirect leaves out the port it listens on: a public port other than 443 is

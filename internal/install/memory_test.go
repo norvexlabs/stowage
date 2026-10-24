@@ -34,7 +34,7 @@ func TestContentComposeGivesTheMemoryShares(t *testing.T) {
 			"capped": {Percent: 50, Max: 1 << 30}},
 		Host: tune.Host{MemBytes: 4 << 30, CPUs: 3},
 	}
-	raw, err := contentCompose(&model, nil, []byte("key"), tune.Container{}, mem)
+	raw, err := contentCompose(&model, nil, []byte("key"), tune.Container{}, mem, hostNet{})
 	if err != nil {
 		t.Fatal(err)
 	}

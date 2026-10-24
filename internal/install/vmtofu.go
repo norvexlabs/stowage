@@ -515,8 +515,10 @@ func (in *Installer) applyVM(ctx context.Context, dir, ctl string, p Platform, m
 }
 
 // sshArgs are ssh's arguments to run command on the VM at addr as user: in batch mode (no
-// prompt), with the private key next to the public one given when there is one, and the host key
-// taken on first contact into the file known, apart from the operator's known hosts.
+// prompt), with the private key next to the public one given when there is one, else the agent's
+// key of that public one alone (ssh's other keys would spend the VM's few authentication tries),
+// and the host key taken on first contact into the file known, apart from the operator's known
+// hosts.
 func sshArgs(known, user, addr, pubKey string, command ...string) []string {
 	return sshArgsChecking("accept-new", known, user, addr, pubKey, command...)
 }
@@ -526,9 +528,12 @@ func sshArgsChecking(checking, known, user, addr, pubKey string, command ...stri
 	// Quoted: ssh splits an option's value at white space, into several files.
 	args := []string{"-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=" + checking,
 		"-o", `UserKnownHostsFile="` + known + `"`}
-	if priv, ok := strings.CutSuffix(expandHome(pubKey), ".pub"); ok {
+	pub := expandHome(pubKey)
+	if priv, ok := strings.CutSuffix(pub, ".pub"); ok {
 		if _, err := os.Stat(priv); err == nil {
 			args = append(args, "-i", priv, "-o", "IdentitiesOnly=yes")
+		} else if _, err := os.Stat(pub); err == nil {
+			args = append(args, "-i", pub, "-o", "IdentitiesOnly=yes")
 		}
 	}
 	return append(append(args, user+"@"+addr, "--"), command...)

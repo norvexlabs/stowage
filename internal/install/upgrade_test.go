@@ -323,6 +323,9 @@ func TestUpgradeKnowsABoundL4PortItHolds(t *testing.T) {
 		{"unbound by the release, held elsewhere", "192.0.2.7", "192.0.2.7", "", unbound, false, []string{"192.0.2.7", "192.0.2.8"}, ""},
 		// Bound by the release, on every address now: the address is checked though the port is held.
 		{"bound by the release elsewhere than the host", "0.0.0.0", "", "192.0.2.99", bound, false, nil, "192.0.2.99 (DATA_BIND, the L4 route data's address) is not an address of this host"},
+		// The VM: the route's service on the host's network holds the port itself, on every address.
+		{"on the host's network", "host", "", "", unbound, true, []string{"192.0.2.7", "192.0.2.8"}, ""},
+		{"another service on the host's network", "host:web", "", "", unbound, false, []string{"192.0.2.7"}, ""},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			t.Parallel()
@@ -336,6 +339,9 @@ func TestUpgradeKnowsABoundL4PortItHolds(t *testing.T) {
 			}
 			e.docker.answer = func(a string) ([]byte, bool, error) {
 				if strings.HasSuffix(a, " ps --format json") {
+					if svc, host := strings.CutPrefix(c.published, "host"); host {
+						return []byte(`{"Service":"` + cmp.Or(strings.TrimPrefix(svc, ":"), "api") + `","Networks":"host","Publishers":[]}`), true, nil
+					}
 					return []byte(`{"Service":"api","Publishers":[{"URL":"` + c.published + `","TargetPort":7000,"PublishedPort":7443,"Protocol":"tcp"}]}`), true, nil
 				}
 				return nil, false, nil
@@ -362,6 +368,8 @@ func TestPublishedPorts(t *testing.T) {
 		`[{"Publishers":[{"URL":"0.0.0.0","PublishedPort":7443,"Protocol":"udp"},{"URL":"0.0.0.0","PublishedPort":0,"Protocol":"tcp"},{"URL":"127.0.0.1","PublishedPort":5432,"Protocol":"tcp"}]}]`: {"udp/7443", "tcp/127.0.0.1/5432"},
 		`{"Publishers":[{"URL":"::","PublishedPort":7443,"Protocol":"udp"}]}` + "\n\n" + `{"Publishers":null}`:                                                                                      {"udp/7443"},
 		`{"Publishers":[{"URL":"::ffff:192.0.2.7","PublishedPort":17007,"Protocol":"tcp"},{"URL":"","PublishedPort":80,"Protocol":"tcp"}]}`:                                                         {"tcp/192.0.2.7/17007"},
+		// A service on the host's network publishes nothing: it holds its ports itself.
+		`{"Service":"echo","Networks":"host","Publishers":[]}` + "\n" + `{"Service":"api","Networks":"notes_default","Publishers":[]}`: {"host:echo"},
 	} {
 		got, err := publishedPorts([]byte(out))
 		if err != nil || len(got) != len(want) || slices.ContainsFunc(want, func(k string) bool { return !got[k] }) {

@@ -274,6 +274,11 @@ func newCommand(r *Release, self string, stdout, stderr io.Writer, tools K8sOpti
 				}
 				return in.UpgradeTo(cmd.Context(), to, passed(cmd, "version"))
 			}
+			if !in.O.Offline {
+				if done, err := in.UpgradeRevision(cmd.Context(), passed(cmd, "version")); done || err != nil {
+					return err
+				}
+			}
 			if !noInput {
 				in.O.Prompt = terminal(accessible)
 			}

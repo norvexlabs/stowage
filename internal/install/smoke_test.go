@@ -568,14 +568,21 @@ func smokeCloudflareCaddyfile(t *testing.T, work, frontRef string, f spec.Front)
 	}
 	// The route asks an authentication service, serves an allowlist only and requires a client
 	// certificate the client CA issued: Caddy takes all three, the CA loaded where the front reads it.
+	// Another asks for a login, beside its own allowlist.
 	f.Routes = slices.Clone(f.Routes)
 	f.Routes[0].ForwardAuth = &spec.ForwardAuth{AddressInput: "AUTH", URIInput: "AUTH_URI", CopyHeaders: []string{"X-Auth-Request-User"}}
 	f.Routes[0].AllowInput = "ALLOW"
 	f.Routes[0].ClientAuth = true
-	vals := map[string]string{"AUTH": "http://auth:4180", "AUTH_URI": "/oauth2/auth?rd=x", "ALLOW": "10.0.0.0/8, 192.0.2.7"}
-	cf := tlsCaddyfile(f, "dns-cloudflare", map[string]string{"app": "notes.smoke.test"}, "ops@example.com", "80", "443", true, func(k string) string { return vals[k] })
-	if !strings.Contains(cf, "client_auth") {
-		t.Fatalf("no client authentication in:\n%s", cf)
+	f.Routes[1].BasicAuth = &spec.BasicAuth{User: "ops", Secret: "OPS_PASSWORD"}
+	f.Routes[1].AllowInput = "ALLOW"
+	vals := map[string]string{"AUTH": "http://auth:4180", "AUTH_URI": "/oauth2/auth?rd=x", "ALLOW": "10.0.0.0/8, 192.0.2.7", "OPS_PASSWORD": "secret"}
+	logins, err := (&Installer{O: Options{Dir: work}}).logins(f, func(k string) string { return vals[k] }, work)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cf := tlsCaddyfile(f, "dns-cloudflare", map[string]string{"app": "notes.smoke.test", "api": "api.smoke.test"}, "ops@example.com", "80", "443", true, func(k string) string { return vals[k] }, logins)
+	if !strings.Contains(cf, "client_auth") || !strings.Contains(cf, "basic_auth {\n\t\t\tops $2a$") {
+		t.Fatalf("no client authentication or login in:\n%s", cf)
 	}
 	ca, _, _ := writeCAChain(t, "client")
 	if err := os.Chmod(ca, 0o644); err != nil { // the front reads it as its own user

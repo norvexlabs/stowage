@@ -6,7 +6,7 @@
 # extension's input set (to the api itself, standing in for a search service); the provision hook registers the administrator through the api; the api reaches the host
 # daemon's app socket and reads the front's local CA; an event goes through ingest; the ops route
 # refuses everyone until a re-run gives `--client-ca`, then takes a certificate that CA issued
-# alone; then `vm destroy`. Upgrade, rollback and the health gate's fallback are the VM machinery's: e2e-vm. Needs
+# alone, and its login (basic_auth, the generated OPS_PASSWORD); then `vm destroy`. Upgrade, rollback and the health gate's fallback are the VM machinery's: e2e-vm. Needs
 # what e2e-vm needs: Docker (privileged containers, loop devices), network access, about 15 GB
 # on disk under XDG_CACHE_HOME, OpenTofu's `tofu`, ssh, and a TrueNAS host.
 #
@@ -111,7 +111,7 @@ code=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 10 --resolve "ingest.a
 [[ $code == 201 ]] || fail "ingest answered $code to an event"
 [[ $(status events) == 1 ]] || fail "the ingested event did not reach the api"
 
-step "on the VM: the ops route refuses everyone until --client-ca, then a client certificate its CA issued alone"
+step "on the VM: the ops route refuses everyone until --client-ca, then a client certificate its CA issued alone, and its login"
 ops() { curl -sk -o /dev/null -w '%{http_code}' --max-time 10 --resolve "ops.atlas.test:443:$IP" "$@" https://ops.atlas.test/health; }
 [[ $(ops) == 403 ]] || fail "the ops route serves without a client CA"
 for n in client rogue; do
@@ -123,7 +123,12 @@ for n in client rogue; do
 done
 on_vm 'cat >/tmp/client-ca.pem' <"$WORK/client-ca.pem" || fail "copying the client CA"
 on_vm sudo at-stow install --no-input --client-ca /tmp/client-ca.pem >"$WORK/client-ca.txt" 2>&1 || { cat "$WORK/client-ca.txt"; fail "the re-run with --client-ca"; }
-[[ $(ops --cert "$WORK/client.pem" --key "$WORK/client.key") == 200 ]] || fail "the ops route refuses a certificate its client CA issued"
+ops_pw=$(sed -n "s/^OPS_PASSWORD='\{0,1\}\([^']*\).*/\1/p" "$WORK/vm.env")
+[[ -n $ops_pw ]] || fail "no OPS_PASSWORD recorded on the VM"
+[[ $(ops --cert "$WORK/client.pem" --key "$WORK/client.key") == 401 ]] || fail "the ops route serves a certificate without its login"
+[[ $(ops --cert "$WORK/client.pem" --key "$WORK/client.key" -u "ops:wrong") == 401 ]] || fail "the ops route takes a wrong password"
+[[ $(ops --cert "$WORK/client.pem" --key "$WORK/client.key" -u "ops:$ops_pw") == 200 ]] || fail "the ops route refuses a certificate its client CA issued, with its login"
+on_vm sudo test -s /usr/local/atlas/.stowage-front-logins || fail "the login's hash is not kept"
 [[ $(ops) == 000 && $(ops --cert "$WORK/rogue.pem" --key "$WORK/rogue.key") == 000 ]] || fail "the ops route takes a client without a certificate its client CA issued"
 [[ $(curl -sk -o /dev/null -w '%{http_code}' --max-time 10 --resolve "api.atlas.test:443:$IP" https://api.atlas.test/health) == 200 ]] || fail "the api route asks for a client certificate"
 

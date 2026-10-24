@@ -142,10 +142,13 @@ func serviceFile(what, service string, svc map[string]any) ([]byte, error) {
 }
 
 // provisionCompose is the hook's service, confined, which also reads the hook's earlier outputs
-// from ProvisionEnv.
-func provisionCompose(h *providers.ProvisionHook, keys []string) ([]byte, error) {
+// from ProvisionEnv, with hosts (targetHosts) as its extra hosts.
+func provisionCompose(h *providers.ProvisionHook, keys, hosts []string) ([]byte, error) {
 	svc := confined(ProvisionService, "${"+ImageVar(h.Image)+"}", h.Cmd, keys)
 	svc["env_file"] = []string{"./" + ProvisionEnv}
+	if len(hosts) > 0 {
+		svc["extra_hosts"] = hosts
+	}
 	return serviceFile("the provision hook", ProvisionService, svc)
 }
 
@@ -224,7 +227,7 @@ func (in *Installer) runHook(ctx context.Context, env *EnvFile, h *providers.Pro
 	if err := outs.WriteFile(in.path(ProvisionEnv)); err != nil {
 		return err
 	}
-	pc, err := provisionCompose(h, keys)
+	pc, err := provisionCompose(h, keys, in.targetHosts())
 	if err != nil {
 		return err
 	}

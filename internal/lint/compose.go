@@ -48,6 +48,7 @@ type Service struct {
 	Volumes     any    `yaml:"volumes"`
 	Devices     any    `yaml:"devices"`
 	NetworkMode string `yaml:"network_mode"`
+	Networks    any    `yaml:"networks"`
 	// Privileged, CapAdd and Pid are what the service is given of the host's powers.
 	Privileged any    `yaml:"privileged"`
 	CapAdd     any    `yaml:"cap_add"`

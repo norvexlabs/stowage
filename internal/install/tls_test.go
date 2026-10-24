@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"slices"
@@ -19,6 +20,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"golang.org/x/crypto/bcrypt"
 
 	"github.com/norvexlabs/stowage/internal/spec"
 )
@@ -828,7 +831,7 @@ func TestARouteRefusesOtherSourcesThenStripsThenAsksTheAuthService(t *testing.T)
 		ForwardAuth: &spec.ForwardAuth{AddressInput: "AUTH", URIInput: "AUTH_URI", CopyHeaders: []string{"X-Auth-Request-User", "X-Auth-Request-Email"}}}
 	body := func(vals map[string]string) string {
 		var b strings.Builder
-		routeBody(&b, r, func(k string) string { return vals[k] })
+		routeBody(&b, r, func(k string) string { return vals[k] }, nil)
 		return b.String()
 	}
 	if got, want := body(map[string]string{"SOURCES": "10.0.0.0/8, 192.0.2.7", "AUTH": "http://auth:4180", "AUTH_URI": "/check?x=1"}), `	@stowage_denied not remote_ip 10.0.0.0/8 192.0.2.7
@@ -862,26 +865,144 @@ func TestARouteRefusesOtherSourcesThenStripsThenAsksTheAuthService(t *testing.T)
 	}
 }
 
+// A route with a login refuses a source its allowlist leaves out first, then asks for the login,
+// whose Authorization the upstream never sees; with no password it refuses everyone.
+func TestARouteAsksForItsLogin(t *testing.T) {
+	t.Parallel()
+	r := spec.Route{Name: "ops", Upstream: "api:9090", AllowInput: "SOURCES", BasicAuth: &spec.BasicAuth{User: "ops", Secret: "OPS_PASSWORD"}}
+	vals := map[string]string{"SOURCES": "10.0.0.0/8"}
+	body := func(logins map[string]login) string {
+		var b strings.Builder
+		routeBody(&b, r, func(k string) string { return vals[k] }, logins)
+		return b.String()
+	}
+	if got, want := body(map[string]login{"ops": {"ops", "$2a$10$h"}}), "\t@stowage_denied not remote_ip 10.0.0.0/8\n\troute {\n\t\trespond @stowage_denied 403\n"+
+		"\t\tbasic_auth {\n\t\t\tops $2a$10$h\n\t\t}\n\t\trequest_header -Authorization\n\t\treverse_proxy api:9090\n\t}\n"; got != want {
+		t.Errorf("got\n%s\nwant\n%s", got, want)
+	}
+	for _, none := range []map[string]login{nil, {"ops": {User: "ops"}}} {
+		if got := body(none); !strings.Contains(got, "\t\trespond 403\n") || strings.Contains(got, "basic_auth") {
+			t.Errorf("no password:\n%s", got)
+		}
+	}
+	// Without an allowlist: the login alone.
+	r.AllowInput = ""
+	if got := body(map[string]login{"ops": {"ops", "$2a$10$h"}}); !strings.HasPrefix(got, "\troute {\n\t\tbasic_auth {") {
+		t.Errorf("got\n%s", got)
+	}
+}
+
+// A login's hash is made once and kept while its password is the same; a new password gets a new
+// one, an empty one none, and the file goes with the last login.
+func TestALoginsHashIsKeptWhileItsPasswordIs(t *testing.T) {
+	t.Parallel()
+	in := &Installer{O: Options{Dir: t.TempDir()}}
+	f := spec.Front{Routes: []spec.Route{{Name: "web", Upstream: "web:80"}, {Name: "ops", Upstream: "api:9090", BasicAuth: &spec.BasicAuth{User: "ops", Secret: "PW"}}}}
+	pw := "first"
+	get := func(string) string { return pw }
+	first, err := in.logins(f, get, in.O.Dir)
+	if err != nil || first["ops"].User != "ops" || bcrypt.CompareHashAndPassword([]byte(first["ops"].Hash), []byte("first")) != nil || len(first) != 1 {
+		t.Fatalf("%+v %v", first, err)
+	}
+	if st, err := os.Stat(in.path(FrontLogins)); err != nil || st.Mode().Perm() != 0o600 {
+		t.Fatalf("%v %v", st, err)
+	}
+	if again, _ := in.logins(f, get, in.O.Dir); again["ops"].Hash != first["ops"].Hash {
+		t.Error("the hash was made again for the same password")
+	}
+	// The release kept for a rollback, rendered into a directory of its own: the install's hash,
+	// in that directory, the install's own file left as it is.
+	kept := filepath.Join(in.O.Dir, PrevDir+".new")
+	if err := os.Mkdir(kept, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	before, _ := os.ReadFile(in.path(FrontLogins))
+	if prev, err := in.logins(f, get, kept); err != nil || prev["ops"].Hash != first["ops"].Hash {
+		t.Errorf("the kept release's login: %+v %v", prev, err)
+	}
+	if b, _ := os.ReadFile(filepath.Join(kept, FrontLogins)); !bytes.Equal(b, before) {
+		t.Errorf("the kept release's hashes %q", b)
+	}
+	if _, err := in.logins(spec.Front{}, get, kept); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(in.path(FrontLogins)); !bytes.Equal(b, before) {
+		t.Errorf("the install's hashes changed by another directory's: %q", b)
+	}
+	pw = "second"
+	if next, _ := in.logins(f, get, in.O.Dir); next["ops"].Hash == first["ops"].Hash || bcrypt.CompareHashAndPassword([]byte(next["ops"].Hash), []byte("second")) != nil {
+		t.Error("a new password kept the old hash")
+	}
+	pw = ""
+	if none, err := in.logins(f, get, in.O.Dir); err != nil || none["ops"].Hash != "" || none["ops"].User != "ops" {
+		t.Errorf("%+v %v", none, err)
+	}
+	if _, err := os.Stat(in.path(FrontLogins)); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("the hashes are left: %v", err)
+	}
+	// A password bcrypt cannot take is named.
+	pw = strings.Repeat("x", 73)
+	if _, err := in.logins(f, get, in.O.Dir); err == nil || !strings.Contains(err.Error(), "route ops's password (PW)") {
+		t.Errorf("%v", err)
+	}
+}
+
 func TestAnAllowlistIPv6ClientsPassIsWarned(t *testing.T) {
 	t.Parallel()
 	const warn = "warning: route api: SOURCES="
 	for _, c := range []struct {
-		sources, ipv6 string
-		addrs         []string
-		warns         bool
+		sources, ipv6, gw string
+		addrs             []string
+		warns             bool
 	}{
-		{"172.18.0.0/16", "", []string{"192.0.2.10", "2001:db8::10"}, true},
-		{"10.0.0.0/8, 192.168.1.7", "", []string{"2001:db8::10"}, true},
-		{"10.0.0.0/8", "", []string{"2001:db8::10"}, false},                                  // no pool of Docker's
-		{"172.18.0.0/16", "true", []string{"2001:db8::10"}, false},                           // IPv6 on: clients keep their address
-		{"172.18.0.0/16", "", []string{"192.0.2.10", "fd00::10", "::ffff:192.0.2.1"}, false}, // no global IPv6 address
+		// The gateway not read: Docker's default pools.
+		{"172.18.0.0/16", "", "", []string{"192.0.2.10", "2001:db8::10"}, true},
+		{"10.0.0.0/8, 192.168.1.7", "", "", []string{"2001:db8::10"}, true},
+		{"10.0.0.0/8", "", "", []string{"2001:db8::10"}, false},                                  // no pool of Docker's
+		{"172.18.0.0/16", "true", "", []string{"2001:db8::10"}, false},                           // IPv6 on: clients keep their address
+		{"172.18.0.0/16", "", "", []string{"192.0.2.10", "fd00::10", "::ffff:192.0.2.1"}, false}, // no global IPv6 address
+		// The stack network's gateway, on both sides of the list's edge.
+		{"172.18.0.0/16", "", "172.18.0.1", []string{"2001:db8::10"}, true},
+		{"172.19.0.0/16, 192.168.0.0/16", "", "172.18.0.1", []string{"2001:db8::10"}, false}, // pools, not the gateway
+		{"10.0.0.0/8", "", "10.5.0.1", []string{"2001:db8::10"}, true},                       // a daemon's own pool
+		{"10.5.0.1", "", "10.5.0.1", []string{"2001:db8::10"}, true},
+		{"10.5.0.2", "", "10.5.0.1", []string{"2001:db8::10"}, false},
+		{"::ffff:10.5.0.0/112", "", "10.5.0.1", []string{"2001:db8::10"}, true},
 	} {
 		var log bytes.Buffer
 		s := &spec.Spec{Front: spec.Front{Routes: []spec.Route{{Name: "web", Upstream: "web:80"}, {Name: "api", Upstream: "api:9090", AllowInput: "SOURCES"}}}}
 		in := &Installer{R: &Release{Spec: s}, O: Options{Log: &log, HostAddrs: func() []string { return c.addrs }}}
-		in.warnIPv6Allowlists(func(k string) string { return map[string]string{"SOURCES": c.sources, IPv6Var: c.ipv6}[k] })
+		gw, _ := netip.ParseAddr(c.gw)
+		in.warnIPv6Allowlists(func(k string) string { return map[string]string{"SOURCES": c.sources, IPv6Var: c.ipv6}[k] }, gw)
 		if got := strings.Contains(log.String(), warn); got != c.warns {
 			t.Errorf("%+v: %q", c, log.String())
+		}
+	}
+}
+
+// The front's gateway is read from the stack's default network once it exists.
+func TestTheFrontsGatewayIsTheDefaultNetworks(t *testing.T) {
+	t.Parallel()
+	for name, c := range map[string]struct {
+		ids, inspect, want string
+	}{
+		"read":       {"n1\n", "fd00::1 172.18.0.1 \n", "172.18.0.1"},
+		"no network": {"", "", ""},
+		"two":        {"n1\nn2\n", "172.18.0.1 ", ""},
+		"no ipv4":    {"n1\n", "fd00::1 \n", ""},
+	} {
+		d := &fakeDocker{answer: func(a string) ([]byte, bool, error) {
+			switch {
+			case a == "network ls --quiet --filter label=com.docker.compose.project=notes --filter label=com.docker.compose.network=default":
+				return []byte(c.ids), true, nil
+			case strings.HasPrefix(a, "network inspect --format {{range .IPAM.Config}}{{.Gateway}} {{end}} n1"):
+				return []byte(c.inspect), true, nil
+			}
+			return nil, false, nil
+		}}
+		in := &Installer{O: Options{Docker: d}}
+		if got := in.frontGateway(context.Background(), []string{"COMPOSE_PROJECT_NAME=notes"}); (c.want == "" && got.IsValid()) || (c.want != "" && got.String() != c.want) {
+			t.Errorf("%s: %v", name, got)
 		}
 	}
 }

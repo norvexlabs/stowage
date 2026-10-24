@@ -198,6 +198,49 @@ func (p *pubEnv) upgradeTo(v string, args []string, mod func(*Options)) error {
 	return in.UpgradeTo(context.Background(), v, args)
 }
 
+// A plain upgrade run by the installer of the release the install runs takes that version's
+// latest revision on its channel: a fix shipped as a revision reaches the install.
+func TestAPlainUpgradeTakesANewRevision(t *testing.T) {
+	t.Parallel()
+	p := published(t, spec.Provider{Name: "none"}, nil)
+	run := func() (bool, error) {
+		in := p.installer(nil)
+		in.R = p.r
+		in.O.Exec = func(ctx context.Context, exe string, args []string) error {
+			p.ran = append(p.ran, args)
+			files, err := payload.Read(exe)
+			if err != nil {
+				return err
+			}
+			r, err := Load(files)
+			if err != nil {
+				return err
+			}
+			next := p.installer(nil)
+			next.R, next.O.Self = r, exe
+			return next.Upgrade(ctx)
+		}
+		return in.UpgradeRevision(context.Background(), []string{"--no-provision"})
+	}
+	// No new revision: nothing runs.
+	if done, err := run(); !done || err != nil || len(p.ran) != 0 || !strings.Contains(p.out.String(), "already runs notes 1.0.0 (revision 1)") {
+		t.Fatalf("%v %v, ran %q\n%s", done, err, p.ran, p.out.String())
+	}
+	p.publish("1.0.0", 2, nil, nil)
+	if done, err := run(); !done || err != nil {
+		t.Fatalf("%v %v\n%s", done, err, p.log)
+	}
+	if len(p.ran) != 1 || !slices.Equal(p.ran[0], []string{"upgrade", "--dir", p.dir, "--no-provision"}) || get(p.readEnv(), "STOWAGE_REVISION") != "2" {
+		t.Fatalf("ran %q, revision %s", p.ran, get(p.readEnv(), "STOWAGE_REVISION"))
+	}
+	// The installer of another release upgrades to its own: nothing is looked up.
+	other := p.installer(nil)
+	other.R, _ = testInstallerOf(t, "3.0.0", 1, p.spec, nil)
+	if done, err := other.UpgradeRevision(context.Background(), nil); done || err != nil {
+		t.Errorf("another release's installer: %v %v", done, err)
+	}
+}
+
 func TestUpgradeVersionRunsThatReleasesInstaller(t *testing.T) {
 	t.Parallel()
 	p := published(t, spec.Provider{Name: "none"}, nil)

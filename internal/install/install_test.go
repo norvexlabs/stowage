@@ -1231,13 +1231,13 @@ func TestProjectNamesFollowTheDirectory(t *testing.T) {
 func TestFrontStripsHeadersAndPublishesOnTheLoopback(t *testing.T) {
 	e := newEnv(t)
 	e.r.Spec.Front.Routes[1].StripHeaders = []string{"X-Auth-Request-*", "X-Tenant"}
-	cf := loopbackCaddyfile(e.r.Spec.Front, func(string) string { return "" })
+	cf := loopbackCaddyfile(e.r.Spec.Front, func(string) string { return "" }, nil)
 	for _, want := range []string{"http://:10000 {\n\treverse_proxy web:8080", "http://:10001 {\n\trequest_header -X-Auth-Request-*\n\trequest_header -X-Tenant\n\treverse_proxy api:8000", "admin off"} {
 		if !strings.Contains(cf, want) {
 			t.Errorf("Caddyfile lacks %q:\n%s", want, cf)
 		}
 	}
-	fc, err := frontCompose(e.r.Spec.Front, nil, nil, Loopback, hostAPI{}, "sha256:x", "", false, false)
+	fc, err := frontCompose(e.r.Spec.Front, nil, nil, Loopback, hostAPI{}, "sha256:x", "", false, false, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1696,6 +1696,21 @@ func TestAReRunMovingAnL4RouteProbesItsNewAddress(t *testing.T) {
 	}
 	if err := e.install(set("192.0.2.8")); err == nil || !strings.Contains(err.Error(), "port(s) 7443 (data) already in use") {
 		t.Fatalf("onto an address another install holds: %v", err)
+	}
+	// The route's service on the host's network (the VM's) holds the port wherever it listens: a
+	// move is not refused by its own socket.
+	published = "host"
+	e.docker.answer = func(a string) ([]byte, bool, error) {
+		if strings.HasSuffix(a, " ps --format json") {
+			return []byte(`{"Service":"api","Networks":"host","Publishers":[]}`), true, nil
+		}
+		return nil, false, nil
+	}
+	if err := e.install(func(o *Options) {
+		set("0.0.0.0")(o)
+		o.PortFree = func(h string, p int) bool { return p != 7443 }
+	}); err != nil {
+		t.Errorf("the service on the host's network moving: %v", err)
 	}
 	if err := e.install(func(o *Options) {
 		set("192.0.2.99")(o)

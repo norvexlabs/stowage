@@ -5,7 +5,8 @@
 # (`--ipv6`: the LAN's IPv6 address, SSH and the front reached over it);
 # its firewall lets SSH in from this host alone (`--ssh-allow`) and the front's ports, and an L4
 # route's port from the sources its allowlist holds (this host over IPv4: refused over IPv6, and
-# from every source once a re-run changes the allowlist, through the upgrade's reboot), in the time
+# from every source once a re-run changes the allowlist, through the upgrade's reboot), its service
+# (the database) on the host's network and reached by name from the stack's, in the time
 # zone given (`--timezone`); `reset-db` wipes the data and provisions again without a reboot; a
 # backup goes, encrypted, to a WebDAV server on this host — the database and the uploads volume —
 # and `restore` loads both back over newer data; `secrets export` writes the install's secrets encrypted to the operator's key; a newer release crosses the same way and the VM upgrades from the
@@ -58,13 +59,14 @@ KAIROS=1 new_project "$PG"
 # A short health gate: the release that never becomes ready falls back sooner.
 sed -i 's/^    host_api: \[api\]$/&\n    health_gate: { deadline_s: 120, deadline_after_reset_s: 600, poll_s: 10 }/' "$P/stowage.yaml"
 grep -q '^    health_gate: ' "$P/stowage.yaml" || fail "no health_gate in the project"
-# An L4 route to the database, which the VM's firewall opens to the sources DB_SOURCES holds.
+# An L4 route to the database, which the VM's firewall opens to the sources DB_SOURCES holds: on
+# the host's network, the database listens on the route's port itself.
 python3 - "$P/stowage.yaml" <<'PY'
 import sys
 path = sys.argv[1]
 s = open(path).read()
 for old, new in [
-    ("\nhealth:\n", "\nl4:\n  routes:\n    - { name: db, protocol: tcp, port: 15432, upstream: postgres:5432, allow_input: DB_SOURCES }\n\nhealth:\n"),
+    ("\nhealth:\n", "\nl4:\n  routes:\n    - { name: db, protocol: tcp, port: 5432, upstream: postgres:5432, allow_input: DB_SOURCES }\n\nhealth:\n"),
     ("  - { key: ADMIN_EMAIL, prompt: \"Administrator email\", required: true }\n",
      "  - { key: ADMIN_EMAIL, prompt: \"Administrator email\", required: true }\n  - { key: DB_SOURCES, prompt: \"Sources the VM lets reach the database\", shapes: [kairos] }\n"),
 ]:
@@ -120,6 +122,19 @@ for a in "${HOST6[@]}"; do
 done
 [[ $(on_vm readlink /etc/localtime) == */Europe/Paris && $(on_vm date +%Z) =~ ^CES?T$ ]] || fail "the VM is not in Europe/Paris's time zone"
 
+step "on the VM: no agent listens, no account logs in with a password, root logs in by no password, no console autologin"
+on_vm sudo ss -tulpn >"$WORK/ss.txt" || fail "ss on the VM"
+! grep -E 'kairos-agent|edgevpn' "$WORK/ss.txt" || { cat "$WORK/ss.txt"; fail "a Kairos agent listens on the VM"; }
+on_vm sudo passwd -S -a >"$WORK/passwd.txt" || fail "passwd -S on the VM"
+! awk '$2 == "P" {print; found = 1} END {exit !found}' "$WORK/passwd.txt" || fail "an account of the VM has a password"
+on_vm sudo sshd -T >"$WORK/sshd.txt" || fail "sshd -T on the VM"
+grep -qxE 'permitrootlogin (no|prohibit-password|without-password)' "$WORK/sshd.txt" && grep -qx 'passwordauthentication no' "$WORK/sshd.txt" ||
+	{ grep -E '^(permitrootlogin|passwordauthentication) ' "$WORK/sshd.txt"; fail "sshd lets root or a password in"; }
+! on_vm "systemctl cat serial-getty@ttyS0.service getty@tty1.service 2>/dev/null" | grep -qi autologin || fail "a console logs in by itself"
+# Recorded, not judged: Docker's forward policy, and what the agent reads at boot.
+on_vm sudo iptables -S FORWARD 2>/dev/null | head -1 || true
+on_vm "ls /oem" || true
+
 step "on the VM: the boot tuned Docker's path (the release's default profile), and the containers as on the host"
 on_vm systemctl is-active notes-tune.service >/dev/null || { on_vm sudo journalctl -b -u notes-tune.service --no-pager | tail -30; fail "the tuning unit did not run"; }
 grep -q '^tune       default (release)$' "$WORK/status.txt" || { cat "$WORK/status.txt"; fail "status does not show the release's default profile"; }
@@ -141,8 +156,7 @@ grep -q 'tuning: the network profile, the operator' "$WORK/retune.txt" && grep -
 	on_vm sudo sysctl net.core.rmem_max net.core.netdev_budget
 	fail "the re-run did not give the network profile's ceilings"
 }
-[[ $(on_vm cat /proc/sys/net/ipv4/ip_local_port_range | awk '{print $1}') == 10000 ]] && on_vm cat /proc/sys/net/ipv4/ip_local_reserved_ports | grep -qw 15432 ||
-	fail "the network profile's local ports do not hold the L4 route's"
+[[ $(on_vm cat /proc/sys/net/ipv4/ip_local_port_range | awk '{print $1}') == 10000 ]] || fail "the network profile's local ports do not start at 10000"
 on_vm notes-stow status | grep -q '^tune       network (operator)$' || fail "status does not show the operator's network profile"
 tuned=$(on_vm sudo docker ps -q --filter label=com.docker.compose.service=api)
 [[ $(on_vm sudo docker exec "$tuned" cat /proc/sys/net/ipv4/tcp_rmem | awk '{print $3}') -ge 16777216 && $(on_vm sudo docker exec "$tuned" cat /proc/sys/net/ipv4/tcp_tw_reuse) == 1 ]] ||
@@ -153,11 +167,13 @@ step "on the VM: the L4 route's port, open to its allowlist's sources alone (thi
 reach() { python3 -c 'import socket, sys; socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=8).close()' "$@" 2>/dev/null; }
 vm4=$(getent ahostsv4 "$ADDR" | awk '{print $1; exit}') # `getent hosts` gives IPv6 first
 [[ -n $vm4 ]] || fail "$ADDR has no IPv4 address"
-grep -q "tcp dport 15432 ip saddr $MIRROR_IP accept" "$WORK/nft.txt" &&
-	grep -q "ct original proto-dst 15432 ip saddr != $MIRROR_IP drop" "$WORK/nft.txt" && grep -q 'meta nfproto ipv6 .*ct original proto-dst 15432 drop' "$WORK/nft.txt" ||
-	{ cat "$WORK/nft.txt"; fail "the firewall does not open the L4 route's port to $MIRROR_IP alone"; }
-on_vm test -s /usr/local/notes/nftables.d/notes-l4.nft || fail "the allowlists are not on the persistent partition"
-reach "$vm4" 15432 || { on_vm sudo nft list chain inet notes forward; on_vm sudo ss -ltn; fail "the L4 route's port ($vm4:15432) is not reachable from this host ($MIRROR_IP), which its allowlist holds"; }
+grep -q "tcp dport 5432 ip saddr $MIRROR_IP accept" "$WORK/nft.txt" && grep -qE 'iifname "br-\*" tcp dport (\{ )?5432( \})? accept' "$WORK/nft.txt" &&
+	! grep -q 'ct original proto-dst' "$WORK/nft.txt" ||
+	{ cat "$WORK/nft.txt"; fail "the firewall does not open the L4 route's port to $MIRROR_IP and the stack's bridges alone"; }
+on_vm test ! -e /usr/local/notes/nftables.d/notes-l4.nft || fail "the forward chain's allowlists are written"
+[[ $(on_vm sudo docker inspect --format "'{{.HostConfig.NetworkMode}}'" "$(on_vm sudo docker ps -q --filter label=com.docker.compose.service=postgres)") == host ]] ||
+	fail "the L4 route's service (postgres) is not on the host's network"
+reach "$vm4" 5432 || { on_vm sudo nft list chain inet notes input; on_vm sudo ss -ltn; fail "the L4 route's port ($vm4:5432) is not reachable from this host ($MIRROR_IP), which its allowlist holds"; }
 
 step "on the VM: the api service reaches the host daemon's app socket with the install's token"
 on_vm sudo cat /usr/local/notes/.env >"$WORK/vm.env"
@@ -247,7 +263,7 @@ rm -f "$WORK/secrets.yaml"
 
 step "a re-run on the VM changes the L4 route's allowlist: this host is refused"
 on_vm sudo notes-stow install --no-input --set DB_SOURCES=192.0.2.1/32 >"$WORK/allow.txt" 2>&1 || { cat "$WORK/allow.txt"; fail "the re-run changing DB_SOURCES"; }
-! reach "$vm4" 15432 || fail "the L4 route's port still answers this host, which its allowlist no longer holds"
+! reach "$vm4" 5432 || fail "the L4 route's port still answers this host, which its allowlist no longer holds"
 
 step "ship beta 1.0.1, carry it through the mirror; the VM upgrades from it, and its health gate keeps it"
 release 1.0.1
@@ -267,9 +283,10 @@ on_vm notes-stow tune --check >"$WORK/tune.txt" 2>&1 && grep -q '^this host: .* 
 	{ cat "$WORK/tune.txt"; fail "the upgraded boot's tuning differs, or is not the network profile"; }
 tuned=$(on_vm sudo docker ps -q --filter label=com.docker.compose.service=api)
 on_vm sudo docker inspect --format "'{{json .HostConfig.LogConfig}}'" "$tuned" | grep -q '"max-size":"20m"' || fail "the api container's logs do not rotate"
-# The allowlist outlives the reboot: the boot's ruleset holds it before the stack starts.
-on_vm sudo nft list chain inet notes forward | grep -q 'ct original proto-dst 15432 ip saddr != 192.0.2.1 drop' || fail "the upgraded boot lost the L4 route's allowlist"
-! reach "$vm4" 15432 || fail "the L4 route's port answers this host after the upgrade"
+# The allowlist outlives the reboot: the boot's input chain drops the port until the install's
+# start opens it to the allowlist's sources again.
+on_vm sudo nft list chain inet notes input | grep -q 'tcp dport 5432 ip saddr 192.0.2.1 accept' || fail "the upgraded boot lost the L4 route's allowlist"
+! reach "$vm4" 5432 || fail "the L4 route's port answers this host after the upgrade"
 assessment >"$WORK/assess.txt" || { cat "$WORK/assess.txt"; fail "the boot assessment cannot be read"; }
 grep -qx 'enable_boot_assessment=' "$WORK/assess.txt" && grep -qx 'boot_assessment_tentative=' "$WORK/assess.txt" ||
 	{ cat "$WORK/assess.txt"; fail "the health gate did not mark the upgraded boot good"; }
@@ -343,7 +360,7 @@ if ((${#HOST6[@]})); then
 	VM_IP=$vm6 on_vm true || fail "no SSH over IPv6 to $vm6"
 	code=$(curl -6 -sk --connect-timeout 10 --max-time 30 -o /dev/null -w '%{http_code}' --resolve "app.notes.test:443:[$vm6]" https://app.notes.test/)
 	[[ $code =~ ^[23] ]] || fail "https://app.notes.test/ over IPv6 ([$vm6]) answered $code"
-	! reach "$vm6" 15432 || fail "the L4 route's port answered over IPv6, which its allowlist leaves out"
+	! reach "$vm6" 5432 || fail "the L4 route's port answered over IPv6, which its allowlist leaves out"
 else
 	echo "this host has no global IPv6 address: the VM's IPv6 address, SSH and HTTPS over it are not checked"
 fi

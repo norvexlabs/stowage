@@ -1,6 +1,7 @@
 package install
 
 import (
+	"context"
 	"fmt"
 	"net/netip"
 	"regexp"
@@ -56,7 +57,7 @@ func PortVar(route string) string {
 // loopbackCaddyfile serves each route on its own plain-HTTP port, as routeBody says; get reads a
 // recorded value. A route asking for a client certificate refuses everyone: plain HTTP carries
 // none.
-func loopbackCaddyfile(f spec.Front, get func(string) string) string {
+func loopbackCaddyfile(f spec.Front, get func(string) string, logins map[string]login) string {
 	var b strings.Builder
 	b.WriteString("# Written by the installer from the project's front routes; rewritten on every run.\n")
 	b.WriteString("{\n\tadmin off\n\tauto_https off\n\tpersist_config off\n}\n")
@@ -65,7 +66,7 @@ func loopbackCaddyfile(f spec.Front, get func(string) string) string {
 		if r.ClientAuth {
 			b.WriteString("\trespond 403\n")
 		} else {
-			routeBody(&b, r, get)
+			routeBody(&b, r, get, logins)
 		}
 		b.WriteString("}\n")
 	}
@@ -88,11 +89,13 @@ const (
 const clientAuth = "\t\tclient_auth {\n\t\t\tmode require_and_verify\n\t\t\ttrust_pool file " + clientCAPath + "\n\t\t}\n"
 
 // routeBody is a route's handling, in this order: a source the allowlist does not hold is refused
-// (403; everyone while the allowlist is empty), the stripped headers — and the headers
-// forward_auth copies, so a client never forges one, even while it is off — are removed whatever
-// the client sent, the authentication service is asked at its URI (/ when none is given; its
-// answer's listed headers passed on; off while its address is empty), then the upstream serves.
-func routeBody(b *strings.Builder, r spec.Route, get func(string) string) {
+// (403; everyone while the allowlist is empty), the client logs in (basic_auth, its login from
+// logins; everyone refused while the route has none), the stripped headers — and the headers
+// forward_auth copies, so a client never forges one, even while it is off, and the login's
+// Authorization — are removed whatever the client sent, the authentication service is asked at
+// its URI (/ when none is given; its answer's listed headers passed on; off while its address is
+// empty), then the upstream serves.
+func routeBody(b *strings.Builder, r spec.Route, get func(string) string, logins map[string]login) {
 	auth, uri := "", "/"
 	strip := r.StripHeaders
 	if a := r.ForwardAuth; a != nil {
@@ -102,7 +105,10 @@ func routeBody(b *strings.Builder, r spec.Route, get func(string) string) {
 		}
 		strip = append(slices.Clone(strip), a.CopyHeaders...)
 	}
-	if auth == "" && r.AllowInput == "" {
+	if r.BasicAuth != nil {
+		strip = append(slices.Clone(strip), "Authorization")
+	}
+	if auth == "" && r.AllowInput == "" && r.BasicAuth == nil {
 		for _, h := range strip {
 			fmt.Fprintf(b, "\trequest_header -%s\n", h)
 		}
@@ -119,6 +125,13 @@ func routeBody(b *strings.Builder, r spec.Route, get func(string) string) {
 		b.WriteString("\t\trespond @stowage_denied 403\n")
 	case r.AllowInput != "":
 		b.WriteString("\t\trespond 403\n")
+	}
+	if r.BasicAuth != nil {
+		if l := logins[r.Name]; l.Hash != "" {
+			fmt.Fprintf(b, "\t\tbasic_auth {\n\t\t\t%s %s\n\t\t}\n", l.User, l.Hash)
+		} else {
+			b.WriteString("\t\trespond 403\n")
+		}
 	}
 	for _, h := range strip {
 		fmt.Fprintf(b, "\t\trequest_header -%s\n", h)
@@ -143,14 +156,21 @@ var dockerPools = []netip.Prefix{netip.MustParsePrefix("172.16.0.0/12"), netip.M
 
 // warnIPv6Allowlists warns of a route's allowlist that every IPv6 client passes: with IPv6 off on
 // the stack's network, Docker's userland proxy hands the front an IPv6 client as the bridge's
-// IPv4 gateway, an address of Docker's pools, so a list holding one of those admits them all on a
-// host IPv6 reaches (a global address).
-func (in *Installer) warnIPv6Allowlists(get func(string) string) {
+// IPv4 gateway, gw, so a list holding it admits them all on a host IPv6 reaches (a global
+// address). A gateway not read (gw invalid) is judged by Docker's default pools: a list overlapping
+// one may hold it.
+func (in *Installer) warnIPv6Allowlists(get func(string) string, gw netip.Addr) {
 	if get(IPv6Var) == "true" || !slices.ContainsFunc(in.O.hostAddrs(), func(h string) bool {
 		a, err := netip.ParseAddr(h)
 		return err == nil && a.Is6() && !a.Is4In6() && a.IsGlobalUnicast() && !a.IsPrivate()
 	}) {
 		return
+	}
+	holds := func(p netip.Prefix) bool { return slices.ContainsFunc(dockerPools, p.Overlaps) }
+	what := "an address of Docker's default pools, as which"
+	if gw.IsValid() {
+		holds = func(p netip.Prefix) bool { return p.Contains(gw) }
+		what = "the stack network's gateway " + gw.String() + ", as which"
 	}
 	for _, r := range in.R.Spec.Front.Routes {
 		if r.AllowInput == "" {
@@ -165,12 +185,35 @@ func (in *Installer) warnIPv6Allowlists(get func(string) string) {
 				}
 				p = netip.PrefixFrom(a, a.BitLen())
 			}
-			if slices.ContainsFunc(dockerPools, p.Overlaps) {
-				in.O.logf("warning: route %s: %s=%s holds %s, which every IPv6 client passes as Docker's bridge gateway while the stack's IPv6 is off and this host has a global IPv6 address: install --ipv6, or list narrower sources", r.Name, r.AllowInput, get(r.AllowInput), s)
+			if p.Addr().Is4In6() {
+				p = netip.PrefixFrom(p.Addr().Unmap(), max(p.Bits()-96, 0))
+			}
+			if holds(p) {
+				in.O.logf("warning: route %s: %s=%s holds %s, %s every IPv6 client passes while the stack's IPv6 is off and this host has a global IPv6 address: install --ipv6, or list narrower sources", r.Name, r.AllowInput, get(r.AllowInput), what, s)
 				break
 			}
 		}
 	}
+}
+
+// frontGateway is the IPv4 gateway of the stack's default network, the front's, once it exists;
+// invalid when it cannot be read.
+func (in *Installer) frontGateway(ctx context.Context, environ []string) netip.Addr {
+	out, err := in.O.Docker.Run(ctx, Cmd{Args: []string{"network", "ls", "--quiet", "--filter", "label=com.docker.compose.project=" + environLookup(environ)("COMPOSE_PROJECT_NAME"), "--filter", "label=com.docker.compose.network=default"}})
+	ids := strings.Fields(string(out))
+	if err != nil || len(ids) != 1 {
+		return netip.Addr{}
+	}
+	out, err = in.O.Docker.Run(ctx, Cmd{Args: []string{"network", "inspect", "--format", "{{range .IPAM.Config}}{{.Gateway}} {{end}}", ids[0]}})
+	if err != nil {
+		return netip.Addr{}
+	}
+	for _, f := range strings.Fields(string(out)) {
+		if a, err := netip.ParseAddr(f); err == nil && a.Is4() {
+			return a
+		}
+	}
+	return netip.Addr{}
 }
 
 // checkSources accepts an allowlist of IP addresses and CIDRs (empty: refuse everyone).
@@ -274,7 +317,7 @@ func frontCommand(f spec.Front, ca string) []string {
 // digest labels the front with its configuration (the Caddyfile, a byo certificate), so a change
 // recreates it. ca is the CA it publishes (frontCommand). clientCA mounts the install's client CA.
 // ipv6 turns IPv6 on for the default network.
-func frontCompose(f spec.Front, l4 []spec.L4Route, get func(string) string, mode string, host hostAPI, digest, ca string, clientCA, ipv6 bool) ([]byte, error) {
+func frontCompose(f spec.Front, l4 []spec.L4Route, get func(string) string, mode string, host hostAPI, digest, ca string, clientCA, ipv6, vm bool) ([]byte, error) {
 	var ports []string
 	volumes := []string{"./" + Caddyfile + ":/etc/caddy/Caddyfile:ro", "stowage-front-data:/data"}
 	if mode == Loopback {
@@ -304,6 +347,20 @@ func frontCompose(f spec.Front, l4 []spec.L4Route, get func(string) string, mode
 	if mode == "dns-cloudflare" {
 		service["environment"] = map[string]string{"CLOUDFLARE_API_TOKEN": "${" + CloudflareTokenVar + "}"}
 	}
+	// Each route's domain names the front on the stack's network too: a service reaching a route
+	// as its clients do (an issuer's URL) reaches the front, not the address the name has outside.
+	if mode != Loopback {
+		var aliases []string
+		for _, r := range f.Routes {
+			if d := get(r.DomainInput); d != "" && !slices.Contains(aliases, d) {
+				aliases = append(aliases, d)
+			}
+		}
+		if len(aliases) > 0 {
+			slices.Sort(aliases)
+			service["networks"] = map[string]any{"default": map[string]any{"aliases": aliases}}
+		}
+	}
 	services := map[string]any{FrontService: service}
 	volumesDoc := map[string]any{"stowage-front-data": map[string]any{}}
 	if !f.Declared() {
@@ -319,7 +376,11 @@ func frontCompose(f spec.Front, l4 []spec.L4Route, get func(string) string, mode
 		}
 	}
 	// Each L4 route's host port, on every address or its bind address, to its upstream as it is:
-	// compose appends these to the service's own ports.
+	// compose appends these to the service's own ports. The VM publishes none: the route's
+	// service runs on the host's network (hostNet).
+	if vm {
+		l4 = nil
+	}
 	for _, r := range l4 {
 		name, target, _ := strings.Cut(r.Upstream, ":")
 		svc, _ := services[name].(map[string]any)

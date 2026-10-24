@@ -1364,6 +1364,51 @@ func TestTheVolumeScripts(t *testing.T) {
 	}
 }
 
+// Through the app socket, an rclone config that has rclone run a program (sftp's ssh, a
+// *_command) is refused, saved or verified, unless it is the one the operator saved; while the
+// settings are locked, the app verifies the saved ones alone.
+func TestTheAppGivesNoRcloneConfigRunningAProgram(t *testing.T) {
+	t.Parallel()
+	_, d, _, key := backupVM(t)
+	app := d.routes(true)
+	var e errOf
+	program := func(conf string) BackupConfigRequest {
+		req := validConfig(key)
+		req.RcloneConfig = ptr(conf)
+		return req
+	}
+	for conf, want := range map[string]string{
+		"[store]\ntype = sftp\nhost = backup.example\nSSH = sh -c 'id > /tmp/x'\n":    "[store] ssh",
+		"[store]\ntype = webdav\nurl = https://x\n  bearer_token_command = /bin/id\n": "[store] bearer_token_command",
+	} {
+		if code := call(t, app, "POST", "/v1/backup/config", program(conf), &e); code != 403 || !strings.Contains(e.Error, want+" has rclone run a program on the host") {
+			t.Errorf("the app's %q: %d %s", conf, code, e.Error)
+		}
+		if code := call(t, app, "POST", "/v1/backup/verify", program(conf), &e); code != 403 || !strings.Contains(e.Error, want) {
+			t.Errorf("the app verifying %q: %d %s", conf, code, e.Error)
+		}
+	}
+	// The operator's own passes, and the app saving it unchanged too; a comment naming a program
+	// runs none.
+	sftp := "[store]\ntype = sftp\nhost = backup.example\nssh = ssh -i /root/key backup.example\n# md5sum_command = x\n"
+	configure(t, d, program(sftp))
+	var s BackupSettings
+	if code := call(t, app, "POST", "/v1/backup/config", program(sftp), &s); code != 200 {
+		t.Errorf("the operator's config saved unchanged through the app: %d", code)
+	}
+	if code := call(t, app, "POST", "/v1/backup/config", program("[store]\ntype = s3\n#md5sum_command = x\n; bearer_token_command = y\n"), &s); code != 200 {
+		t.Errorf("a config without a program: %d", code)
+	}
+	// Locked: verifying proposed settings is refused, the saved ones pass.
+	configure(t, d, BackupConfigRequest{Lock: ptr(true)})
+	if code := call(t, app, "POST", "/v1/backup/verify", BackupConfigRequest{Destination: ptr("store:elsewhere")}, &e); code != 403 || !strings.Contains(e.Error, "verify the saved ones") {
+		t.Errorf("the app verifying a proposed destination, locked: %d %s", code, e.Error)
+	}
+	if j := verifyJob(t, app, nil); j.State != "done" {
+		t.Errorf("the app verifying the saved settings, locked: %+v", j)
+	}
+}
+
 // Through the app socket the settings change as through the operator's, unless the operator locked
 // them: then the app saves them unchanged alone, and the lock is the operator's. Each change the
 // app makes is in the journal, and a request refused leaves the lock as it was.
@@ -1466,4 +1511,21 @@ func TestTheAppChangesTheBackupSettingsUnlessLocked(t *testing.T) {
 	if want := []string{all, "changed through the app socket: destination", all}; !slices.Equal(reasons, want) {
 		t.Errorf("events %q", reasons)
 	}
+}
+
+// rcloneProgram reads any text without failing, and what it names is a key line of that text.
+func FuzzRcloneProgram(f *testing.F) {
+	for _, s := range []string{"[a]\nssh = x\n", "[a]\ntype = s3\n", "x_command=1", "[\n]=", "#ssh=1\n;a_command=2"} {
+		f.Add(s)
+	}
+	f.Fuzz(func(t *testing.T, conf string) {
+		k := rcloneProgram(conf)
+		if k == "" {
+			return
+		}
+		_, key, _ := strings.Cut(k, "] ")
+		if !strings.Contains(strings.ToLower(conf), key) || key != "ssh" && !strings.HasSuffix(key, "_command") {
+			t.Errorf("%q named %q", conf, k)
+		}
+	})
 }

@@ -914,7 +914,7 @@ func TestEveryStartOpensTheFrontsPortsInTheFirewall(t *testing.T) {
 			t.Fatalf("%s: ran %v, want %d reloads", when, host.ran, n)
 		}
 	}
-	if err := in.openPorts(ctx, env); err != nil {
+	if err := in.openPorts(ctx, env, hostNet{}); err != nil {
 		t.Fatal(err)
 	}
 	if b, _ := os.ReadFile(file); string(b) != "# notes's ports, which every start of the install writes.\ntcp dport { 80, 8443 } accept\n" {
@@ -922,12 +922,12 @@ func TestEveryStartOpensTheFrontsPortsInTheFirewall(t *testing.T) {
 	}
 	reloads(1, "first start")
 	// The same ports: nothing written or loaded again.
-	if err := in.openPorts(ctx, env); err != nil {
+	if err := in.openPorts(ctx, env, hostNet{}); err != nil {
 		t.Fatal(err)
 	}
 	reloads(1, "same ports")
 	env.Set(HTTPSPortVar, "443")
-	if err := in.openPorts(ctx, env); err != nil {
+	if err := in.openPorts(ctx, env, hostNet{}); err != nil {
 		t.Fatal(err)
 	}
 	if b, _ := os.ReadFile(file); !strings.Contains(string(b), "{ 80, 443 }") {
@@ -937,7 +937,7 @@ func TestEveryStartOpensTheFrontsPortsInTheFirewall(t *testing.T) {
 	// Loopback publishes nothing outside: the rule goes, once.
 	env.Set("STOWAGE_TLS_MODE", Loopback)
 	for range 2 {
-		if err := in.openPorts(ctx, env); err != nil {
+		if err := in.openPorts(ctx, env, hostNet{}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -947,109 +947,117 @@ func TestEveryStartOpensTheFrontsPortsInTheFirewall(t *testing.T) {
 	reloads(3, "loopback")
 	env.Set("STOWAGE_TLS_MODE", "internal")
 	env.Set(HTTPPortVar, "80 ; tcp dport 22 accept")
-	if err := in.openPorts(ctx, env); err == nil || !strings.Contains(err.Error(), "is not a TCP port") {
+	if err := in.openPorts(ctx, env, hostNet{}); err == nil || !strings.Contains(err.Error(), "is not a TCP port") {
 		t.Errorf("err = %v", err)
 	}
 	env.Set(HTTPPortVar, "80")
 	host.err = errors.New("nft: no such table")
-	if err := in.openPorts(ctx, env); err == nil || !strings.Contains(err.Error(), "loading the firewall with the install's ports: nft: no such table") {
+	if err := in.openPorts(ctx, env, hostNet{}); err == nil || !strings.Contains(err.Error(), "loading the firewall with the install's ports: nft: no such table") {
 		t.Errorf("err = %v", err)
 	}
 	// The next start loads it again.
 	host.err = nil
-	if err := in.openPorts(ctx, env); err != nil {
+	if err := in.openPorts(ctx, env, hostNet{}); err != nil {
 		t.Fatal(err)
 	}
 	reloads(5, "after a failed load")
 	// Off the VM: no firewall, nothing written or run.
 	off := &Installer{R: in.R, O: Options{Host: host}}
-	if err := off.openPorts(ctx, env); err != nil || len(host.ran) != 5 {
+	if err := off.openPorts(ctx, env, hostNet{}); err != nil || len(host.ran) != 5 {
 		t.Errorf("err = %v, ran %v", err, host.ran)
 	}
 }
 
-// The L4 routes' ports are opened in every mode: from every source without an allowlist, else in
-// the input chain from its sources alone, with the forward chain (on the persistent partition)
-// dropping a DNAT'd connection from any other, per family; an empty allowlist refuses all.
+// The L4 routes' ports are opened in every mode, in the input chain (their services run on the
+// host's network): from every source without an allowlist, else from its sources alone, per
+// family, and on the bind address alone when there is one; an empty allowlist refuses all. The
+// ports the stack's own services reach the routes' services on are opened from its bridges. The
+// forward chain's file of releases that published the routes through Docker's DNAT goes.
 func TestEveryStartOpensTheL4PortsFromTheirSources(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	host := &nftHost{}
 	r, _ := testInstallerWith(t, "1.0.0", func(s *spec.Spec) {
 		s.L4.Routes = []spec.L4Route{
-			{Name: "db", Protocol: "tcp", Port: 15432, Upstream: "postgres:5432"},
+			{Name: "db", Protocol: "tcp", Port: 5432, Upstream: "postgres:5432"},
 			{Name: "feed", Protocol: "udp", Port: 17007, Upstream: "api:17007", AllowInput: "FEED_SOURCES"},
 		}
 	})
 	in := &Installer{R: r, O: Options{Dir: t.TempDir(), Firewall: filepath.Join(t.TempDir(), "nftables.d"), Host: host}}
 	ports, l4 := filepath.Join(in.O.Firewall, "notes-ports.nft"), filepath.Join(in.O.Dir, ForwardRules, "notes-l4.nft")
+	old := []byte("# notes's L4 routes' allowlists, which every start of the install writes.\nmeta nfproto ipv6 meta l4proto udp drop\n")
+	if err := os.MkdirAll(filepath.Dir(l4), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(l4, old, 0o644); err != nil {
+		t.Fatal(err)
+	}
 	env := NewEnvFile()
 	env.Set("STOWAGE_TLS_MODE", Loopback)
 	env.Set("FEED_SOURCES", "192.0.2.7, 10.1.2.3/8 2001:db8::1 10.9.9.9 ::ffff:198.51.100.4 192.0.2.7/32")
-	if err := in.openPorts(ctx, env); err != nil {
-		t.Fatal(err)
-	}
-	const dnat = "ct direction original ct status dnat ct original proto-dst 17007"
-	if b, _ := os.ReadFile(ports); string(b) != "# notes's ports, which every start of the install writes.\n"+
-		"tcp dport 15432 accept\n"+
-		"udp dport 17007 ip saddr { 10.0.0.0/8, 192.0.2.7/32, 198.51.100.4/32 } accept\n"+
-		"udp dport 17007 ip6 saddr { 2001:db8::1/128 } accept\n" {
-		t.Errorf("ports %q", b)
-	}
-	if b, _ := os.ReadFile(l4); string(b) != "# notes's L4 routes' allowlists, which every start of the install writes.\n"+
-		"meta nfproto ipv4 meta l4proto udp "+dnat+" ip saddr != { 10.0.0.0/8, 192.0.2.7/32, 198.51.100.4/32 } drop\n"+
-		"meta nfproto ipv6 meta l4proto udp "+dnat+" ip6 saddr != { 2001:db8::1/128 } drop\n" {
-		t.Errorf("allowlists %q", b)
-	}
-	if len(host.ran) != 1 {
-		t.Fatalf("ran %v", host.ran)
-	}
-	// IPv4 alone: IPv6 is refused whole.
-	env.Set("FEED_SOURCES", "192.0.2.7")
-	if err := in.openPorts(ctx, env); err != nil {
-		t.Fatal(err)
-	}
-	if b, _ := os.ReadFile(l4); !strings.Contains(string(b), "meta nfproto ipv6 meta l4proto udp "+dnat+" drop\n") {
-		t.Errorf("allowlists %q", b)
-	}
-	if b, _ := os.ReadFile(ports); strings.Contains(string(b), "ip6") {
-		t.Errorf("ports %q", b)
-	}
-	// A load that fails puts the allowlists back as they were: the next boot drops as before.
-	before, _ := os.ReadFile(l4)
-	env.Set("FEED_SOURCES", "")
+	hn := hostNet{targets: map[string]bool{"postgres": true, "api": true}, open: []peerPort{{17007, "udp"}, {9090, "tcp"}, {5432, "tcp"}, {9090, "tcp"}}}
+	// A load that fails leaves the old allowlists, which the next boot loads, and no ports file.
 	host.err = errors.New("nft: syntax error")
-	if err := in.openPorts(ctx, env); err == nil {
+	if err := in.openPorts(ctx, env, hn); err == nil {
 		t.Fatal("a failed load passed")
 	}
-	if b, _ := os.ReadFile(l4); !bytes.Equal(b, before) {
+	if b, _ := os.ReadFile(l4); !bytes.Equal(b, old) {
 		t.Errorf("allowlists after a failed load %q", b)
 	}
 	if _, err := os.Stat(ports); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("the ports file is left: %v", err)
 	}
-	// Empty: every source refused, nothing opened in the input chain.
 	host.err = nil
-	if err := in.openPorts(ctx, env); err != nil {
+	if err := in.openPorts(ctx, env, hn); err != nil {
 		t.Fatal(err)
 	}
-	if b, _ := os.ReadFile(l4); strings.Count(string(b), " drop\n") != 2 || strings.Contains(string(b), "saddr") {
-		t.Errorf("allowlists %q", b)
+	if b, _ := os.ReadFile(ports); string(b) != "# notes's ports, which every start of the install writes.\n"+
+		"iifname \"br-*\" tcp dport { 5432, 9090 } accept\n"+
+		"iifname \"br-*\" udp dport { 17007 } accept\n"+
+		"tcp dport 5432 accept\n"+
+		"udp dport 17007 ip saddr { 10.0.0.0/8, 192.0.2.7/32, 198.51.100.4/32 } accept\n"+
+		"udp dport 17007 ip6 saddr { 2001:db8::1/128 } accept\n" {
+		t.Errorf("ports %q", b)
 	}
-	if b, _ := os.ReadFile(ports); strings.Contains(string(b), "17007") {
+	if _, err := os.Stat(l4); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("the forward chain's allowlists are left: %v", err)
+	}
+	if len(host.ran) != 2 {
+		t.Fatalf("ran %v", host.ran)
+	}
+	// IPv4 alone: no IPv6 source is accepted.
+	env.Set("FEED_SOURCES", "192.0.2.7")
+	if err := in.openPorts(ctx, env, hn); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(ports); strings.Contains(string(b), "ip6") || !strings.Contains(string(b), "udp dport 17007 ip saddr { 192.0.2.7/32 } accept\n") {
+		t.Errorf("ports %q", b)
+	}
+	// Bound to one address: reached on it alone, over its family alone.
+	in.R.Spec.L4.Routes[0].BindInput, in.R.Spec.L4.Routes[1].BindInput = "DB_BIND", "FEED_BIND"
+	env.Set("DB_BIND", "::ffff:192.0.2.1")
+	env.Set("FEED_BIND", "2001:db8::5")
+	env.Set("FEED_SOURCES", "192.0.2.7 2001:db8::1")
+	if err := in.openPorts(ctx, env, hn); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(ports); !strings.Contains(string(b), "\nip daddr 192.0.2.1 tcp dport 5432 accept\nip6 daddr 2001:db8::5 udp dport 17007 ip6 saddr { 2001:db8::1/128 } accept\n") || strings.Contains(string(b), "udp dport 17007 ip saddr") {
+		t.Errorf("ports %q", b)
+	}
+	// The wildcard binds every address.
+	env.Set("DB_BIND", "0.0.0.0")
+	env.Set("FEED_BIND", "")
+	// Empty: every source refused, nothing opened but from the bridges.
+	env.Set("FEED_SOURCES", "")
+	if err := in.openPorts(ctx, env, hn); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(ports); strings.Count(string(b), "17007") != 1 || !strings.Contains(string(b), "\ntcp dport 5432 accept\n") {
 		t.Errorf("ports %q", b)
 	}
 	env.Set("FEED_SOURCES", "192.0.2.7; tcp dport 22 accept")
-	if err := in.openPorts(ctx, env); err == nil || !strings.Contains(err.Error(), "FEED_SOURCES: ") {
+	if err := in.openPorts(ctx, env, hn); err == nil || !strings.Contains(err.Error(), "FEED_SOURCES: ") {
 		t.Errorf("err = %v", err)
-	}
-	// No allowlist left: the file goes.
-	in.R.Spec.L4.Routes = in.R.Spec.L4.Routes[:1]
-	if err := in.openPorts(ctx, env); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := os.Stat(l4); !errors.Is(err, os.ErrNotExist) {
-		t.Errorf("the allowlists are left: %v", err)
 	}
 }
 
