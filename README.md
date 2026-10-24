@@ -1031,7 +1031,9 @@ These are what `lint` checks; each finding names the key path or `file:line` to 
     forward chain enforcing the L4 routes' allowlists (see "The firewall" under the installer on
     the Kairos VM);
   - SSH by key only (`/etc/ssh/sshd_config.d/10-<name>.conf`), over kairos-init's SSH hardening
-    (`/etc/ssh/sshd_config.d/05-kairos-hardening.conf`, read first: modern ciphers, key exchanges
+    (`/usr/lib/<name>/sshd_config.d/05-kairos-hardening.conf`, in the image itself, read first
+    through `/etc/ssh/sshd_config.d/00-<name>-hardening.conf`'s `Include`, so a rollback to a
+    release on an older OpenSSH never reads it: modern ciphers, key exchanges
     and MACs only; no TCP, agent or X11 forwarding and no tunnels; at most 4 authentication tries;
     a client that stops answering is dropped after 10 minutes: an agent holding more keys than 4 needs `ssh -i
     KEY -o IdentitiesOnly=yes`), the build failing when that drop-in no longer sets

@@ -7,7 +7,59 @@ A finished item is deleted, not ticked. The plan behind it is
 
 ## Must — parity
 
-1. **Cloud images on AWS and Azure**: `ship` registers the `cloud_publish` images through
+1. **Kairos 4.4.0 final**: the OS bundle is pinned to the release candidate
+   (`kairos_init` `v4.4.0-rc2`). When Kairos 4.4.0 ships: pin its kairos-init by digest in
+   `examples/minimal` and `examples/full`; re-derive the bundle's `08_grub.yaml` from it (Kairos's
+   master already changes the boot step the copy leaves out) and its sha256 in the Dockerfile
+   template; move the release named in the build's refusal, the copy's header, README and the
+   tests; take the AuroraBoot release that goes with it; keep the `selected_entry = cos` guard
+   unless Kairos takes it upstream (an issue was drafted for it); check that kairos-init's SSH
+   drop-in still lands where the build moves it from. Gate: the VM chain (e2e-kairos, e2e-vm,
+   e2e-full-vm), and an upgrade from the last 24.04 release with a rollback to it, as was run
+   by hand for 0.12.0 (the release's VM installed by the older stowage, the next shipped by this
+   one: the upgrade, the health gate, `rollback`, SSH on the older system).
+2. **`audit`: the releases' SBOMs, signed, and a verb that checks them**. `ship` makes an SBOM
+   (SPDX or CycloneDX, by a pinned syft image) of every image it publishes and of the OS bundle,
+   and attaches each to its subject's digest as a cosign attestation signed by the release key,
+   an OCI referrer that `mirror export` carries. `stowage audit` (the publisher) and
+   `<short>-stow audit` (the operator; on the VM through the host daemon) fetch the installed or
+   given release's attestations, verify them against the release's trusted keys (an attestation
+   is never counted as a signature), and scan them for known vulnerabilities (a pinned grype
+   image; its database fetched, or given offline for a mirror without internet), printing them
+   by severity, `--json`, and exiting non-zero at or above `--fail-on`. README documents the
+   SBOM's tag/referrer, the verb and how to verify one by hand with `cosign verify-attestation`.
+3. **Security review (2026-10-24) of the produced artifacts**, to fix in the next version:
+   - **High — the app socket serves the whole host API**: a compromised `host_api` service with
+     the install's token can `secrets/export` to its own key, `reset-db`, `restore` over the
+     data, and rotate secrets. Refuse those four on the app socket (the operator's socket keeps
+     them); the parity app uses none of them, and keeps the rest (upgrade, rollback, network,
+     backup and its settings, reboot, shutdown, status, events, updates, job).
+   - **Medium — `vm create --secrets` trusts the first SSH host key** (`accept-new`), then sends
+     the secrets: pin the VM's host key (one `vm create` generates and gives in the seed, or read
+     from the console), or encrypt the secrets to a key the seed carries.
+   - **Medium — the bootstrap runs `<name>-installer:latest` unverified**, and the trust of every
+     later check comes from it: print and document a digest-pinned `cosign verify` of the
+     installer; lint warns on a project with no `signing`.
+   - **Medium — Docker without `--ipv6`: IPv6 clients reach the front as the bridge's gateway**,
+     which an allowlist of private ranges admits: refuse or warn when an allowlist holds the
+     stack network while IPv6 is off on a host with a global IPv6 address.
+   - **Medium — Docker: L4 routes listen on every address** (`allow_input` is the VM's): the
+     install and `status` print each port and its exposure, and suggest `bind_input`.
+   - **Medium — SSH open to every source by default, public addresses on the clouds**: `vm create`
+     on a cloud requires `--ssh-allow` (or defaults it to this machine's address); the GCP, Azure
+     and AWS modules make a firewall rule / NSG / security group for SSH and the front's ports.
+   - **Low**: the mirror's CA trusted system-wide (`update-ca-certificates`) rather than for the
+     registry alone (kairos-agent's pull needs it: check what else can carry it); no GRUB
+     password and a serial getty (console access = root); AWS EBS not `encrypted`, no Secure
+     Boot or vTPM in the modules; the VM's forward chain accepts by default (relies on Docker's);
+     lint has no rule against `privileged`, a mounted `docker.sock`, `cap_add` or `pid: host`;
+     HSTS `includeSubDomains` reaches the operator's other subdomains.
+   - **To check on a running VM**: `ss -tulpn` on the active and recovery systems (no kairos-agent
+     web UI, p2p or edgevpn), `passwd -S` of every account (root locked, no `kairos` user with a
+     password), no console autologin, the effective `sshd -T` (`PermitRootLogin`), Docker's
+     FORWARD policy with `--ipv6`, whether Kairos reads the cloud's user-data again at each boot.
+
+4. **Cloud images on AWS and Azure**: `ship` registers the `cloud_publish` images through
    OpenTofu, run for real on Google Cloud only (`STOWAGE_CLOUD_ENV=<file> make e2e-kairos`). Run it
    with the AWS and Azure test accounts once they exist, and fix what they find. Azure, known:
    its probe takes an image of the name whatever its provisioning state (its resource list gives
@@ -16,13 +68,13 @@ A finished item is deleted, not ticked. The plan behind it is
    principal needs *Storage Blob Data Contributor* on the storage account (blobs are written with
    Entra ID).
 
-2. **Scaleway**: a platform of `vm create` (OpenTofu module: an instance from the release's
+5. **Scaleway**: a platform of `vm create` (OpenTofu module: an instance from the release's
    disk, the cloud-config as its user data) and a cloud of `cloud_publish` (the disk uploaded to
    Object Storage and imported as an instance image, with the publisher's credentials from the
    environment), as the other clouds. Before writing a module, read the latest
    `scaleway/scaleway` provider's official docs and its schema (`tofu providers schema -json`),
    and pin that release.
-3. **OVHcloud**: the same for OVHcloud Public Cloud (OpenStack): `vm create` and `cloud_publish`
+6. **OVHcloud**: the same for OVHcloud Public Cloud (OpenStack): `vm create` and `cloud_publish`
    (the disk uploaded as a Glance image of the project, `ovh/ovh` and/or
    `terraform-provider-openstack/openstack`, whichever the latest official docs make canonical).
    Before writing a module, read the latest provider's official docs and its schema, and pin that

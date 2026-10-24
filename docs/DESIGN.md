@@ -1094,7 +1094,10 @@ every shape, the VM end-to-end test upgrading through it), then the health gate.
   from, so the first install is the operator's `install` with no terminal; the VM's boot waits
   for the cloud-config's stages. The administrator logs in by SSH key only and has passwordless
   `sudo` (the cloud images' default): no password ever travels in user-data. Secret inputs are
-  never in it: the install waits for them, given over SSH.
+  never in it: the install waits for them, given over SSH. kairos-init's SSH hardening is read
+  from the image's `/usr`, not `/etc/ssh`: `/etc/ssh` is persistent state that each boot fills
+  from its image without deleting, so a drop-in from a newer image (Kairos 4.4's post-quantum
+  key exchange) would reach an older release's sshd after a rollback, which then does not start.
 - **Creating a VM with OpenTofu** — `<short>-stow` embeds a module per canonical platform:
   TrueNAS (proven by `make e2e-vm`), and as previews libvirt/KVM, Proxmox VE and vSphere on
   premises, AWS, Google Cloud and Azure in the clouds — each uploading the disk the platform takes

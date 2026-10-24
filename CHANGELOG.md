@@ -16,6 +16,11 @@ follow [SemVer](https://semver.org/).
   forwarding, at most 4 authentication tries (an SSH agent holding more keys needs `ssh -i KEY -o
   IdentitiesOnly=yes`, and `vm create` the private key next to `--ssh-key`'s `.pub`), and a
   client that stops answering is dropped after 10 minutes.
+- **A VM installed with an earlier release upgrades to this one in place** (Ubuntu 24.04 to
+  26.04, Kairos 4.4 with it), and a `rollback` or a failed health gate's fallback to the earlier
+  release keeps SSH working: each release's SSH hardening comes from its own system, so an older
+  OpenSSH never reads settings it does not know.
+- `kairos_init` is Kairos 4.4.0's release candidate: a later version moves to the final release.
 
 ## [0.11.2] - 2026-10-23
 

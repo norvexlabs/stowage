@@ -65,11 +65,23 @@ COPY --chmod=0755 ctl/{{.Ctl}} /usr/sbin/{{.Ctl}}
 # Docker, fail. They are reinstalled, and the build fails if they did not come back. Its CIS
 # hardening step is skipped: its shell umask (027) would leave the files an operator's run
 # writes unreadable to a stack's non-root containers, and its password ageing and lockout apply
-# to the operator's account. Its SSH hardening stays; the build fails without its drop-in.
+# to the operator's account. Its SSH hardening stays; the build fails without its drop-in. The
+# drop-in moves to this image's /usr, read through an Include: /etc/ssh is persistent state,
+# which every boot fills from its image without deleting, so a file left there by a newer image
+# would reach an older one's sshd on a rollback, which refuses settings it does not know and
+# does not start. On a system without that directory the Include reads nothing. The build fails
+# when sshd's effective settings are not the drop-in's.
 RUN set -e \
     && /kairos-init -s init --skip-step cisHardening -v "{{.OSVersion}}" \
     && rm /kairos-init \
     && grep -qx 'AllowTcpForwarding no' /etc/ssh/sshd_config.d/05-kairos-hardening.conf \
+    && install -d -m 0755 /usr/lib/{{.Name}}/sshd_config.d \
+    && mv /etc/ssh/sshd_config.d/05-kairos-hardening.conf /usr/lib/{{.Name}}/sshd_config.d/ \
+    && printf 'Include /usr/lib/{{.Name}}/sshd_config.d/*.conf\n' > /etc/ssh/sshd_config.d/00-{{.Name}}-hardening.conf \
+    && k="$(mktemp -d)" && ssh-keygen -q -t ed25519 -N '' -f "$k/key" && mkdir -p /run/sshd \
+    && sshd -T -h "$k/key" > "$k/effective" \
+    && grep -qx 'allowtcpforwarding no' "$k/effective" && grep -qx 'maxauthtries 4' "$k/effective" \
+    && rm -rf "$k" \
     && ! test -e /etc/modprobe.d/cis-blocklist.conf \
     && ! grep -rqsE '^[[:space:]]*umask[[:space:]]+0*27([^0-7]|$)' /etc/profile /etc/profile.d /etc/bash.bashrc \
     && ! grep -qsE '^[[:space:]]*UMASK[[:space:]]+0*27([^0-7]|$)' /etc/login.defs \

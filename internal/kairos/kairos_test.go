@@ -35,6 +35,8 @@ func TestDockerfileRendersTheParams(t *testing.T) {
 		"-s install -v 0.0.0\n", `-s init --skip-step cisHardening -v "1.2.0-r2"`, "nftables open-vm-tools qemu-guest-agent tzdata", "apt-cache show tzdata-legacy", "/usr/share/notes-preload/", "/etc/notes/os-version",
 		"notes-preload.service", "chmod 0440 /etc/sudoers.d/10-notes", "notes-health.service", "notes-network.service", "notes-tune.service", "notes-tune-online.service", "ethtool",
 		"mv /usr/share/notes/08_grub.yaml \"$f\"", "sha256sum -c -", "shapes.kairos.kairos_init: its", "grep -qx 'AllowTcpForwarding no' /etc/ssh/sshd_config.d/05-kairos-hardening.conf",
+		"mv /etc/ssh/sshd_config.d/05-kairos-hardening.conf /usr/lib/notes/sshd_config.d/",
+		"printf 'Include /usr/lib/notes/sshd_config.d/*.conf\\n' > /etc/ssh/sshd_config.d/00-notes-hardening.conf", "grep -qx 'allowtcpforwarding no' \"$k/effective\"",
 		"! test -e /etc/modprobe.d/cis-blocklist.conf", "umask[[:space:]]+0*27([^0-7]|$)' /etc/profile /etc/profile.d", "UMASK[[:space:]]+0*27", "sed -i '/^        net\\.core\\.rmem_max: 7500000$/d'"} {
 		if !strings.Contains(s, want) {
 			t.Errorf("Dockerfile lacks %q", want)
