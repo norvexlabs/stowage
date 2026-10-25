@@ -26,10 +26,16 @@ A finished item is deleted, not ticked. The plan behind it is
      policy, `/oem` and the boot's datasource stages. Recorded (0.14.0's e2e-vm): FORWARD is
      DROP for IPv4 and IPv6 with `--ipv6`; `/oem` holds `95_userdata` (the first boot's
      cloud-config, kept) and the boot's datasource stages run again, skipping the old-userdata
-     moves. Left, by hand once: `ss -tulpn` and `passwd -S` on the recovery system — e2e-vm's
-     `next_entry=recovery` reboot is not reached over SSH within 10 minutes (the recovery system
-     may bring up no SSH or no network: read it on the console), and whether a changed cloud
-     user-data is applied again at a later boot.
+     moves. The recovery system (0.14.0's e2e-vm, reached since its own host key is taken): SSH
+     on every address, every account locked (`kairos` and `ops` included), but also **rpcbind on
+     111 TCP/UDP on every address** and snmpd on loopback, on the active system too: kairos-init's
+     Ubuntu package set installs `nfs-common` (rpcbind) and `snmpd`, neither of which Stowage
+     uses. Mask `rpcbind.service`, `rpcbind.socket` and `snmpd.service` in the OS bundle (the build
+     fails if they are not masked), and judge on both systems that nothing but sshd listens
+     beyond loopback (the active system's stack ports aside) — batch A's first item, its VM
+     chain. A changed cloud user-data is never applied again: kairos-init's
+     `00_datasource.yaml` pulls one only while `/oem/95_userdata` is absent, which the first boot
+     writes; e2e-vm judges that file present and the boot's datasource step skipped.
 
 3. **Cloud images on AWS and Azure**: `ship` registers the `cloud_publish` images through
    OpenTofu, run for real on Google Cloud only (`STOWAGE_CLOUD_ENV=<file> make e2e-kairos`). Run it
@@ -66,80 +72,83 @@ the following on a Kairos host, bare metal first (after the bare-metal slice: th
 install block, the metal platform, NICs named by MAC); the VM where it applies; on a Docker host,
 whose kernel is the operator's, `tune` reports what is missing and sets nothing.
 
-6. **More than one interface**: the VM has one NIC. An appliance has a client side and an
-    upstream side (and often a management one): `shapes.kairos` declares named interfaces (role,
-    addressing: DHCP / static / none, MTU), `vm create` and the OpenTofu modules attach one NIC
-    per role on the named network, and the stack's spec names which role an L4 route or the front
-    listens on. The VM's firewall, `allow_input` and the front judge per interface. An L4 route's
-    service runs on the host's network today; with an interface per role, an ipvlan interface
-    for it on its role's NIC (an address of its own, with no NAT and beside the stack's bridge)
-    is the other way: the host's firewall does not see that traffic, so its rules would go in the
-    service's own namespace.
-7. **Firewall rules a service declares, in the host's ruleset**: interception and the
-    appliance's egress floor are host rules (nftables: a TPROXY / redirect of the client side's
-    TCP to the service's port, a forward chain that default-denies what the service cannot
-    inspect, DNS sent to the stack's resolver, UDP 443 rejected), which a container cannot own.
-    The spec declares a ruleset fragment per service (a table of its own, its named sets fed by the
-    service), Stowage loads it at boot before the service starts, removes it with the service, and
-    lint checks it parses and touches only its own table; routing and `ip_forward` with it, on the
-    interfaces 6 names. The host's own firewall stays Stowage's.
-8. **Host tuning a service asks for**: the `network` profile tunes the host as a whole. An
-    appliance places work: the NIC queues' interrupts and RPS/XPS off the service's CPU set (or on
-    it, by the service's choice), the queue count — one per core, which a driver may refuse:
-    Intel's E810 (`ice`) answers every `ethtool -L` with EBUSY ("Cannot change channels when RDMA
-    is active") while `irdma` is bound to the port's `ice.roce.N` auxiliary device, leaving a 100G
-    port at 8 queues on a 16-core host; a project that uses no RDMA declares `block: irdma` (shapes.kairos.modules) —
-    kernel arguments, and sysctls past the container-namespaced set. The spec
-    declares them per service or per host; the host's boot applies them before the service starts,
-    and `tune` reports a host that lacks them (the warnings the service logs at its start are the
-    list to meet). The host then:
-    - **Kernel command line**: IOMMU passthrough, `iommu=pt` (`iommu.passthrough=1` on arm64), in
-      the Kairos install's GRUB options: DMA remapping maps and unmaps every NIC buffer with a
-      cache flush, several percent of CPU under a throughput load on a small host. Written only
-      where an IOMMU is active (none on most cloud VMs: nothing to write); a boot that fails with it
-      falls back to the passive system as any other; an opt-out for hosts with untrusted PCIe
-      devices (passthrough leaves a host-owned device unconfined). Effective at the next boot,
-      said so.
-    - **CPU power**: 10.
-        - **Conntrack sized from RAM**: `nf_conntrack_max` ~300 B of unswappable memory per entry
-      (512 MB → ~89k, 4 GB → ~715k, capped at 1,048,576 from ~6 GB) and the hash buckets at a
-      quarter of it (both directions inserted: mean chain 8; the kernel's own 4,096 buckets on a
-      512 MB box make it 512).
-    - **NICs**: each offload set on its own and only where the driver reports it changeable (one
-      `[fixed]` knob in a combined `ethtool -K` rejects them all — ENA), rings at the device's own
-      pre-set maximums (never a constant: ENA's TX caps at 1024), one combined queue per core with
-      RSS spread equally over the CPUs the host allows the appliance (the E810 case above: its
-      queues stay at 8 unless `irdma` is blocked).
-9. **An upgrade that keeps the listening sockets**: an appliance's clients cannot be told to
-    retry, and a container's replacement drops every connection and refuses new ones until the
-    new one listens. The service hands its listening sockets to its successor (systemd socket
-    passing, or the app's own handoff over a Unix socket: old and new running side by side, the
-    old draining). Stowage's upgrade starts the new container beside the old one on the host's
-    network with the handoff socket shared, waits for the old one to exit, and keeps the rollback.
-10. **Power management, a declared posture that survives the reboot**: `tune --apply` sets the
-    governor on the running Docker host only (a reboot loses it: the Should on the `network`
-    profile's interrupts and governor), the VM's boot sets it each time, and nothing stops another
-    writer from undoing it. An appliance declares its posture — `performance` (every core held at
-    its maximum) or `platform` (the kernel's and firmware's own policy, nothing written) — and
-    Stowage keeps it on every shape it owns the host of. Under `performance`, applied at install
-    and again by a boot unit (sysfs is not on disk):
-    - every core on the `performance` governor, its energy preference (EPP) `performance` where the
-      driver exposes one, its frequency floor raised to its ceiling
-      (`intel_pstate/min_perf_pct=100`, which also keeps thermald from throttling below it; the
-      firmware's own power and thermal limits still apply);
-    - **one writer**: `power-profiles-daemon` (on every Ubuntu Desktop) and `tuned` each
-      re-assert their own profile (`powersave`, `balance_performance`) over another writer's, so
-      both are stopped and masked under `performance` and given back under `platform`; the log
-      says when one of them re-applies its profile as it starts;
-    - a host with no `cpufreq` (most VMs: the hypervisor owns frequency) is told there is nothing
-      to set, never failed — the posture is then the hypervisor host's to apply, and `tune` says so;
-    - the cost stated, no gain claimed: power and heat, and a fanless box held at its turbo
-      frequency can meet its power or thermal limit sooner under a sustained load.
-    Not reached today, and part of this item: idle states (where a cpuidle driver is bound, a
-    service-held PM QoS `/dev/cpu_dma_latency` request or per-state `disable` bounds the wake-up
-    latency; where none is bound, only the firmware's setup menu does, which `tune` can only
-    report), and a NIC's Energy Efficient Ethernet and PCIe ASPM, which trade latency for watts the
-    same way.
+Each item below is a generic key in the platform's own terms (a kernel argument, a sysctl, an
+ethtool setting, an nftables table, a networkd rule), declared with a `reason` as `modules` are;
+Stowage computes a value only where it can (the `network` profile's), and `tune` advises the
+known cases (`iommu=pt`, an E810's `irdma`) rather than writing them unasked. No special case of
+one argument or one driver. What the host must be is one shape-neutral block, `host:` (`modules`,
+moved out of `shapes.kairos` with no compat, `kernel_args`, `sysctls`, `power`): applied where
+Stowage owns the host (the Kairos VM, bare metal), recommended where it does not — a Docker
+host's `tune --check` reports each one missing with what sets it there (the GRUB line, the
+modprobe or sysctl drop-in), and `k8s tune` prints them as what every node must have (with the
+pods' settings it prints today) — never written on a host that is not Stowage's.
+
+6. **Interfaces, named** (`shapes.kairos.interfaces`): the VM has one NIC. An appliance has a
+    client side and an upstream side (and often a management one): each interface is a name (the
+    role is the project's word), its addressing (DHCP, static, none), MTU, and its policy routing
+    in networkd's own terms (`RoutingPolicyRule`/`Route` entries: a TPROXY's `fwmark` → `local`
+    table is two of them). `vm create` and the OpenTofu modules attach one NIC per name, on the
+    network named for it; bare metal names it by MAC. An L4 route, the front and `allow_input`
+    name the interface they listen on (default: the default route's); the VM's firewall judges
+    per interface. A service that needs an address of its own on a side gets an ipvlan network
+    on that interface (no NAT, beside the stack's bridge; its traffic is out of the host's
+    firewall, so its rules are 7's in its own namespace).
+7. **A service's nftables table** (`services.<s>.nftables: <file>`): interception and an egress
+    floor are host rules a container cannot own (a TPROXY or redirect of the client side's TCP, a
+    forward chain that default-denies, DNS sent to the stack's resolver, UDP 443 rejected — the
+    project's rules, none of them Stowage's). The file is one `table inet <s>` in nft's own syntax,
+    its named sets fed by the service through the app socket (an `nft add element` on its own
+    table only); Stowage loads it at boot before the service starts, removes it with the service,
+    and lint checks it with `nft -c` and that it declares that table alone. The host's own
+    firewall stays Stowage's. `ip_forward` and the like are 8's sysctls, the routing 6's rules.
+8. **The host a stack asks for**, each key declared with its reason, applied by the host's boot
+    before the services start, recommended elsewhere as `host:` says, and reported by `tune
+    --check` where missing:
+    - **`host.kernel_args`**: a list of `key` / `key=value` tokens (lint: one token each, none of
+      Kairos's own — `root=`, `rd.*`, `cos.*` — refused) written into the Kairos install's GRUB
+      options, effective at the next boot (said so), a boot that fails with them falling back to
+      the passive system; compared with `/proc/cmdline` everywhere. `tune` advises `iommu=pt` (`iommu.passthrough=1`
+      on arm64) where an IOMMU is active without passthrough (DMA remapping: several percent of
+      CPU under a throughput load; passthrough leaves a host-owned device unconfined) — declared
+      by the project, never written unasked. `examples/full` declares one to prove the key.
+    - **`host.sysctls`**: kernel settings past the container-namespaced set (the ones the
+      `network` profile computes are the defaults these may raise; one that lowers a computed
+      value is a lint error), written to the host's sysctl drop-in.
+    - **`services.<s>.cpus`**: the service's CPU set (Docker's `cpuset`, the pod's on Kubernetes
+      where the node allows it), and where the NICs' interrupts and RPS/XPS go: off it (default)
+      or on it (`irq: on`); two services' sets that overlap are a lint error naming both.
+    - **`shapes.kairos.interfaces.<i>.ethtool`**: the NIC's settings in ethtool's own terms —
+      `channels` (`combined: max` or a count), `rings` (`max` or counts), `features` (each knob
+      on its own, set only where the driver reports it changeable: one `[fixed]` knob in a
+      combined `ethtool -K` rejects them all — ENA), `eee` — over the `network` profile's computed
+      rings and steering. `tune` explains a refused `ethtool -L` it knows: Intel's E810 (`ice`)
+      answers EBUSY while `irdma` holds the port's `ice.roce.N` device, leaving a 100G port at 8
+      queues on a 16 cores (`modules: { irdma: { block: true } }` frees it).
+9. **An upgrade that overlaps** (`services.<s>.update: start-first`, as Swarm's `update_config.order`
+    and a Deployment's `maxSurge` without `maxUnavailable`): an appliance's clients cannot be told
+    to retry, and a stop-then-start drops every connection and refuses new ones until the new
+    container listens. Stowage starts the new container beside the old one, waits for its
+    healthcheck, then stops the old one with its `stop_grace_period` as the drain; the rollback
+    is kept. Sharing the port is the app's, by either canonical way: `SO_REUSEPORT` on the host's
+    network, or its own handoff over a Unix socket in a directory both containers mount
+    (`services.<s>.update_socket: <dir>`); a bridge-network service with a published port is
+    refused (two containers cannot publish one port). On Kubernetes, the chart's strategy.
+10. **Power posture** (`host.power: performance | platform`, default `platform`: nothing
+    written): `tune --apply` sets the governor on a running Docker host only, the VM's boot each
+    time, and nothing stops another writer from undoing it. Under `performance`, applied at
+    install and by a boot unit where Stowage owns the host (sysfs is not on disk), by `tune
+    --apply` and its boot unit on a Docker host whose operator runs it, printed by `k8s tune`:
+    every core on the `performance` governor, its EPP `performance` where exposed, its floor at
+    its ceiling (`intel_pstate/min_perf_pct=100`); `power-profiles-daemon` and `tuned` stopped
+    and masked (each re-asserts its own profile over another writer's), given back under
+    `platform`; a held PM QoS `/dev/cpu_dma_latency` request bounding the idle states where a
+    cpuidle driver is bound. No cpufreq (most VMs: the hypervisor owns frequency) is `n/a`, the
+    posture the hypervisor host's, never a failure. The `network` profile no longer sets the
+    governor. What is a boot's or a NIC's is 8's: the C-state cap and PCIe ASPM are kernel
+    arguments (`intel_idle.max_cstate=`, `pcie_aspm.policy=performance`), EEE an `ethtool`
+    setting, which `tune` advises under `performance`. The cost stated, no gain claimed: power
+    and heat, and a fanless box held at its turbo frequency meets its limits sooner.
+
 ## Should
 
 - **A CPU set per service** (from the L4 routes on the host's network): an unpinned service
@@ -371,6 +380,20 @@ Docker shape, 2026-10-24):
   `$TMPDIR`; a multi-GB image fills a tmpfs. Stage under the user's cache directory, or say so.
 - **Build options an image may need**: `add_hosts` (a build whose tests resolve fixed names;
   BuildKit's `/etc/hosts` is read-only) and a build network.
+- **An L4 route's service on the VM cannot call a route by its public name**: 0.13 makes each
+  route's domain an alias of the front on the stack's network, but on the VM an L4 route's
+  service runs on the host's network, where the alias does not exist; a service whose own
+  clients and itself must reach a route by one name (an identity provider's issuer, called by
+  the service and redirected to by its clients through it) resolves it only when real DNS
+  points the name at the VM. Map each route's domain to the front for that service too (an
+  `extra_hosts` entry to `127.0.0.1`, the front publishing on the VM's addresses), or say in
+  `vm create` that the domains must resolve to the VM.
+- **The IPv6 allowlist warning puts the source after "as which"**: `warnIPv6Allowlists`
+  (`internal/install/front.go`) formats `holds %s, %s every IPv6 client passes` with `what` then
+  the source, so an install prints `ADMIN_CIDR=127.0.0.1/32,172.16.0.0/12 holds the stack
+  network's gateway 172.19.0.1, as which, 172.16.0.0/12 every IPv6 client passes …`. It means
+  `172.16.0.0/12 holds the stack network's gateway 172.19.0.1, as which every IPv6 client passes`:
+  name the source before `holds`, and test the sentence, not only that a warning is printed.
 
 ## Could
 
