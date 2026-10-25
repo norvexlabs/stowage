@@ -3,7 +3,7 @@
 Stowage's own releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
-## [0.13.0]
+## [0.13.0] - 2026-10-25
 
 ### Added
 - **A front route can ask for a login**: `basic_auth: { user, secret }` on a route makes the
