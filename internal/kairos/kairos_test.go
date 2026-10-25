@@ -4,15 +4,18 @@ import (
 	"archive/tar"
 	"context"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"io/fs"
 	"maps"
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -294,7 +297,9 @@ case "$*" in
 	for a; do last=$a; done
 	case "$last" in "$NO_DISK=true") exit 0 ;; esac
 	case "$last" in
-	disk.efi=true) echo raw > "$state/kairos-x.raw"; [ -z "$RAW_SIZE" ] || truncate -s "$RAW_SIZE" "$state/kairos-x.raw" ;;
+	disk.efi=true) echo "$*" | grep -o 'disk.state_size=[0-9]*' >> "$FAKE_LOG.state"
+		raw=$FAKE_RAW; [ -z "$FAKE_RAW2" ] || [ ! -e "$state/../.second" ] || raw=$FAKE_RAW2; touch "$state/../.second"
+		cp "$raw" "$state/kairos-x.raw"; [ -z "$RAW_SIZE" ] || truncate -s "$RAW_SIZE" "$state/kairos-x.raw" ;;
 	esac ;;
 *stowage-disktools*)
 	work=$(vol "$*" work)
@@ -304,18 +309,34 @@ case "$*" in
 esac
 `
 
-// fakeQemu writes its last argument; a vpc one from a raw disk of 1 MiB, the size the script
-// grows the fake raw disk to, is a fixed VHD of that size, unless BAD_VHD is set.
+// fakeQemu writes its last argument; a vpc one from a raw disk of FAKE_VHD_SIZE bytes is a fixed
+// VHD of that size (its footer FAKE_VHD_FOOTER), unless BAD_VHD is set.
 const fakeQemu = `#!/bin/sh
 for a; do prev=$last; last=$a; done
 case "$*:$BAD_VHD:$(stat -c %s "$prev" 2>/dev/null)" in
-*vpc*::1048576)
-	truncate -s 1M "$last"
-	{ printf conectix; head -c 40 /dev/zero; printf '\000\000\000\000\000\020\000\000'
-	  printf '\000\000\000\000\000\000\000\002\377\377\374\220'; head -c 444 /dev/zero; } >> "$last" ;;
+*vpc*::"$FAKE_VHD_SIZE")
+	truncate -s "$FAKE_VHD_SIZE" "$last"
+	cat "$FAKE_VHD_FOOTER" >> "$last" ;;
 *) echo converted > "$last" ;;
 esac
 `
+
+// vhdFooter is a fixed VHD's footer for a disk of size bytes, as checkVHD reads one.
+func vhdFooter(size int64) []byte {
+	f := make([]byte, 512)
+	copy(f, "conectix")
+	binary.BigEndian.PutUint64(f[40:], uint64(size))
+	binary.BigEndian.PutUint64(f[48:], uint64(size))
+	binary.BigEndian.PutUint32(f[60:], 2)
+	var sum uint32
+	for i, c := range f {
+		if i < 64 || i >= 68 {
+			sum += uint32(c)
+		}
+	}
+	binary.BigEndian.PutUint32(f[64:], ^sum)
+	return f
+}
 
 func fakeBuilder(t *testing.T) (*DiskBuilder, string) {
 	bin := t.TempDir()
@@ -326,6 +347,23 @@ func fakeBuilder(t *testing.T) (*DiskBuilder, string) {
 	}
 	log := filepath.Join(t.TempDir(), "log")
 	t.Setenv("FAKE_LOG", log)
+	// A raw disk with a recovery partition of 200 MiB (sparse), and the VHD footer of its size,
+	// which the disk scripts' fake qemu-img writes.
+	raw := filepath.Join(t.TempDir(), "gpt.raw")
+	writeGPT(t, raw, 200)
+	st, err := os.Stat(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The VHD script grows the raw disk to a whole MiB first.
+	vhd := (st.Size() + 1<<20 - 1) &^ (1<<20 - 1)
+	footer := filepath.Join(t.TempDir(), "footer")
+	if err := os.WriteFile(footer, vhdFooter(vhd), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("FAKE_RAW", raw)
+	t.Setenv("FAKE_VHD_SIZE", strconv.FormatInt(vhd, 10))
+	t.Setenv("FAKE_VHD_FOOTER", footer)
 	t.Setenv("FAKE_BIN", bin)
 	saved := OnDisk
 	OnDisk = func(string) error { return nil }
@@ -345,12 +383,13 @@ func TestDiskBuilderMakesEachFormat(t *testing.T) {
 	} {
 		t.Run(strings.Join(c.formats, ","), func(t *testing.T) {
 			b, log := fakeBuilder(t)
-			r := DiskRequest{Source: "127.0.0.1:5000/notes-os@sha256:" + strings.Repeat("c", 64), Registry: "127.0.0.1:5000",
+			r := DiskRequest{Source: "127.0.0.1:5000/notes-os@sha256:" + strings.Repeat("c", 64), Registry: "127.0.0.1:5000", RootfsMiB: 3500,
 				Auth: authn.AuthConfig{Username: "u", Password: "p"}, Formats: c.formats, Base: "notes-1.0.0"}
-			out, cleanup, err := b.Build(context.Background(), r)
+			made, cleanup, err := b.Build(context.Background(), r)
 			if err != nil {
 				t.Fatal(err)
 			}
+			out := made.Files
 			if !slices.Equal(slices.Sorted(maps.Keys(out)), slices.Sorted(slices.Values(c.formats))) {
 				t.Errorf("files = %v", out)
 			}
@@ -370,7 +409,7 @@ func TestDiskBuilderMakesEachFormat(t *testing.T) {
 			var runs []string
 			for _, l := range strings.Split(string(calls), "\n") {
 				if strings.Contains(l, Auroraboot+" --set") {
-					if !strings.Contains(l, "container_image=oci://"+r.Source) || !strings.Contains(l, "--privileged") {
+					if !strings.Contains(l, "container_image=oci://"+r.Source) || !strings.Contains(l, "--privileged") || !strings.Contains(l, fmt.Sprintf("--set disk.state_size=%d ", StateMiB(3500))) {
 						t.Errorf("auroraboot call: %s", l)
 					}
 					runs = append(runs, strings.TrimSuffix(l[strings.LastIndex(l, " ")+1:], "=true"))
@@ -391,7 +430,7 @@ func TestDiskBuilderMakesEachFormat(t *testing.T) {
 func TestDiskBuilderRefusesAMissingDisk(t *testing.T) {
 	b, _ := fakeBuilder(t)
 	t.Setenv("NO_DISK", "disk.efi")
-	_, cleanup, err := b.Build(context.Background(), DiskRequest{Source: "r/notes-os@sha256:" + strings.Repeat("c", 64), Registry: "r",
+	_, cleanup, err := b.Build(context.Background(), DiskRequest{Source: "r/notes-os@sha256:" + strings.Repeat("c", 64), Registry: "r", RootfsMiB: 3500,
 		Formats: []string{"qcow2", "vhd"}, Base: "notes-1.0.0"})
 	if err == nil || !strings.Contains(err.Error(), "auroraboot disk.efi: expected one *.raw file in its output, found 0") {
 		t.Fatalf("Build = %v", err)
@@ -406,7 +445,7 @@ func TestDiskBuilderRefusesAMissingDisk(t *testing.T) {
 func TestDiskBuilderRefusesABadVHD(t *testing.T) {
 	b, _ := fakeBuilder(t)
 	t.Setenv("BAD_VHD", "1")
-	_, cleanup, err := b.Build(context.Background(), DiskRequest{Source: "r/notes-os@sha256:" + strings.Repeat("c", 64), Registry: "r",
+	_, cleanup, err := b.Build(context.Background(), DiskRequest{Source: "r/notes-os@sha256:" + strings.Repeat("c", 64), Registry: "r", RootfsMiB: 3500,
 		Formats: []string{"vhd"}, Base: "notes-1.0.0"})
 	if err == nil || !strings.Contains(err.Error(), "notes-1.0.0.vhd: 10 bytes, no VHD footer") {
 		t.Fatalf("Build = %v", err)
@@ -440,17 +479,18 @@ func TestDiskBuilderRefusesBadRequests(t *testing.T) {
 	}
 }
 
-// The OVA's disk grows to OVADiskBytes, and a raw disk already larger keeps its size.
+// The OVA's disk declares OVADiskBytes, or Kairos's partitions (the raw disk and the state) and the
+// app's least space beyond them when that is more.
 func TestOVANeverShrinksTheDisk(t *testing.T) {
 	b, _ := fakeBuilder(t)
 	t.Setenv("RAW_SIZE", fmt.Sprint(int64(OVADiskBytes)+(1<<30)))
-	out, cleanup, err := b.Build(context.Background(), DiskRequest{Source: "r/notes-os@sha256:" + strings.Repeat("c", 64), Registry: "r",
+	made, cleanup, err := b.Build(context.Background(), DiskRequest{Source: "r/notes-os@sha256:" + strings.Repeat("c", 64), Registry: "r", RootfsMiB: 3500,
 		Formats: []string{"ova"}, Base: "notes-1.0.0"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer cleanup()
-	raw, _ := os.ReadFile(out["ova"])
+	raw, _ := os.ReadFile(made.Files["ova"])
 	files := map[string]string{}
 	tr := tar.NewReader(strings.NewReader(string(raw)))
 	for {
@@ -461,7 +501,9 @@ func TestOVANeverShrinksTheDisk(t *testing.T) {
 		c, _ := io.ReadAll(tr)
 		files[h.Name] = string(c)
 	}
-	if want := fmt.Sprintf(`ovf:capacity="%d"`, int64(OVADiskBytes)+(1<<30)); !strings.Contains(files["notes-1.0.0.ovf"], want) {
+	// The raw disk of 65 GiB, Kairos's partitions (it and the state) and the app's least beyond.
+	capacity := (int64(OVADiskBytes+1<<30)>>20 + StateMiB(3500) + ovaAppMiB) << 20
+	if want := fmt.Sprintf(`ovf:capacity="%d"`, capacity); !strings.Contains(files["notes-1.0.0.ovf"], want) {
 		t.Errorf("descriptor lacks %s:\n%s", want, files["notes-1.0.0.ovf"])
 	}
 }
@@ -542,6 +584,83 @@ func TestParamsWithoutTheInstallerAreRefused(t *testing.T) {
 	}
 }
 
+// The state partition holds three system images and a quarter more; first estimated from the
+// bundle, an image half again its unpacked size.
+func TestTheStateIsSizedFromTheImages(t *testing.T) {
+	t.Parallel()
+	// Images of 3700 MiB: 3 * 3700 * 5/4 + 100.
+	if got := stateFor(3700); got != 13975 {
+		t.Errorf("state %d", got)
+	}
+	// A bundle of 3500 MiB: an image estimated at 3500 * 3/2 + 200.
+	if got := StateMiB(3500); got != stateFor(5450) {
+		t.Errorf("first state %d", got)
+	}
+	if stateFor(3701) <= stateFor(3700) {
+		t.Error("not monotonic")
+	}
+}
+
+// The project's modules reach modprobe's and modules-load's files in the image's /usr, and the
+// build checks them; without any, the build has no such step.
+func TestTheProjectsModulesAreInTheBundle(t *testing.T) {
+	t.Parallel()
+	p := params
+	p.Modules = map[string]spec.KernelModule{
+		"irdma":   {Block: true, Reason: "the port's queues"},
+		"tcp_bbr": {Load: true, Reason: "the service's congestion control"},
+		"ice":     {Load: true, Options: map[string]string{"b": "1", "a": "x,y"}, Reason: "the NIC's settings"},
+	}
+	dir := t.TempDir()
+	if err := WriteContext(dir, p); err != nil {
+		t.Fatal(err)
+	}
+	read := func(name string) string {
+		raw, err := os.ReadFile(filepath.Join(dir, "files", name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(raw)
+	}
+	if got, want := read("usr/lib/modprobe.d/50-notes.conf"), "# notes's kernel modules (shapes.kairos.modules): those blocked, and their options. In the image's\n# /usr, not /etc, which Kairos keeps across upgrades and rollbacks.\n# the NIC's settings\noptions ice a=x,y b=1\n# the port's queues\nblacklist irdma\ninstall irdma /bin/false\n"; got != want {
+		t.Errorf("modprobe.d:\n%s\nwant\n%s", got, want)
+	}
+	if got, want := read("usr/lib/modules-load.d/50-notes.conf"), "# notes's kernel modules (shapes.kairos.modules) loaded at boot.\n# the NIC's settings\nice\n# the service's congestion control\ntcp_bbr\n"; got != want {
+		t.Errorf("modules-load.d:\n%s\nwant\n%s", got, want)
+	}
+	df, err := Dockerfile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(df)
+	for _, want := range []string{
+		"        modinfo -k \"$v\" ice >/dev/null || {", "grep -qx a || {", "grep -qx b || {",
+		"[ \"$(modinfo -k \"$v\" -F filename irdma 2>/dev/null)\" != \"(builtin)\" ]", "[ \"$(modinfo -k \"$v\" -F filename ice 2>/dev/null)\" != \"(builtin)\" ]",
+		"grep -qxF 'install irdma /bin/false'", "grep -qxF 'options ice a=x,y b=1'", "cat-config modules-load.d | grep -qx 'tcp_bbr'",
+	} {
+		if !strings.Contains(s, want) {
+			t.Errorf("Dockerfile lacks %q", want)
+		}
+	}
+	if strings.Contains(s, "modinfo -k \"$v\" irdma >/dev/null") || !strings.Contains(s, "-F filename tcp_bbr 2>/dev/null)\" != \"(builtin)\"") {
+		t.Error("a blocked module need not exist; a loaded one may not be built in")
+	}
+	if plain, _ := Dockerfile(params); strings.Contains(string(plain), "shapes.kairos.modules") {
+		t.Error("a bundle without modules checks them")
+	}
+	for _, bad := range []map[string]spec.KernelModule{
+		{"a b": {Load: true, Reason: "r"}},
+		{"ice": {Load: true, Reason: "two\nlines"}},
+		{"ice": {Options: map[string]string{"a": "x y"}, Reason: "r"}},
+		{"ice": {Options: map[string]string{"a'": "x"}, Reason: "r"}},
+	} {
+		p.Modules = bad
+		if _, err := Dockerfile(p); err == nil {
+			t.Errorf("rendered %v", bad)
+		}
+	}
+}
+
 // The bundle's build and its 08_grub.yaml name the release lint holds the project to.
 func TestTheBundleNamesItsKairosInitRelease(t *testing.T) {
 	t.Parallel()
@@ -551,5 +670,260 @@ func TestTheBundleNamesItsKairosInitRelease(t *testing.T) {
 	}
 	if !strings.Contains(dockerfile, "use kairos-init "+KairosInitRelease+"\"") || !strings.Contains(string(grub), "(kairos-init "+KairosInitRelease+")") {
 		t.Errorf("the Dockerfile or 08_grub.yaml names another release than %s", KairosInitRelease)
+	}
+}
+
+// writeGPT writes a raw disk holding a GPT with a recovery partition of mib, as auroraboot writes
+// one, which sizes the state partition; the file spans its partitions (sparse).
+func writeGPT(t *testing.T, path string, mib int64) {
+	t.Helper()
+	writeGPTSectors(t, path, 2048, 64<<11, mib<<11, (2048+(128+mib)<<11+34)*512) // and the backup GPT
+}
+
+// patchGPT writes b at off in the raw disk at path, in place (the file stays sparse), and sets
+// the GPT's CRC32s to what it then holds; rawPatch leaves them.
+func patchGPT(t *testing.T, path string, off int64, b []byte) {
+	t.Helper()
+	rawPatch(t, path, off, b)
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	hdr := make([]byte, 512)
+	if _, err := f.ReadAt(hdr, 512); err != nil {
+		t.Fatal(err)
+	}
+	// The entries' CRC when the header names entries the fixture can read.
+	lba, n, size := binary.LittleEndian.Uint64(hdr[72:]), binary.LittleEndian.Uint32(hdr[80:]), binary.LittleEndian.Uint32(hdr[84:])
+	if lba < 1<<20 && n <= 1<<12 && size <= 1<<12 {
+		entries := make([]byte, n*size)
+		if _, err := f.ReadAt(entries, int64(lba)*512); err == nil {
+			binary.LittleEndian.PutUint32(hdr[88:], crc32.ChecksumIEEE(entries))
+		}
+	}
+	clear(hdr[16:20])
+	hsize := min(binary.LittleEndian.Uint32(hdr[12:]), 512)
+	binary.LittleEndian.PutUint32(hdr[16:], crc32.ChecksumIEEE(hdr[:hsize]))
+	if _, err := f.WriteAt(hdr, 512); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// rawPatch writes b at off in the raw disk at path, in place.
+func rawPatch(t *testing.T, path string, off int64, b []byte) {
+	t.Helper()
+	f, err := os.OpenFile(path, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if _, err := f.WriteAt(b, off); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// writeGPTSectors writes a raw disk of size bytes, its GPT's EFI and OEM partitions of boot sectors
+// each, from LBA start, and its recovery partition of recovery sectors after them.
+func writeGPTSectors(t *testing.T, path string, start, boot, recovery, size int64) {
+	t.Helper()
+	b := make([]byte, 512*3)
+	copy(b[512:], "EFI PART")
+	binary.LittleEndian.PutUint32(b[512+12:], 92)                  // the header's size
+	binary.LittleEndian.PutUint64(b[512+40:], 34)                  // the first usable LBA
+	binary.LittleEndian.PutUint64(b[512+48:], uint64(size/512-34)) // the last, before the backup GPT
+	binary.LittleEndian.PutUint64(b[512+72:], 2)                   // the entries at LBA 2
+	binary.LittleEndian.PutUint32(b[512+80:], 4)                   // four of them
+	binary.LittleEndian.PutUint32(b[512+84:], 128)                 // of 128 bytes
+	put := func(i int, first, sectors int64, name string) {
+		e := b[1024+i*128:]
+		e[0] = 1 // a type: not an empty entry
+		binary.LittleEndian.PutUint64(e[32:], uint64(first))
+		binary.LittleEndian.PutUint64(e[40:], uint64(first+sectors-1))
+		for j, c := range name {
+			e[56+2*j] = byte(c)
+		}
+	}
+	put(0, start, boot, "efi")
+	put(1, start+boot, boot, "oem")
+	put(2, start+2*boot, recovery, "recovery")
+	if err := os.WriteFile(path, b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Truncate(path, size); err != nil {
+		t.Fatal(err)
+	}
+	patchGPT(t, path, 512, []byte("EFI PART")) // the CRC32s
+}
+
+// The recovery partition auroraboot made sizes the state one: a first estimate too small makes the
+// raw disk again, once, with the state its images call for; the disks record what Kairos takes.
+func TestTheStateFollowsTheRecoveryImage(t *testing.T) {
+	b, log := fakeBuilder(t)
+	big := filepath.Join(t.TempDir(), "big.raw")
+	writeGPT(t, big, 20000) // images of (20000 - 150) / 2: more than the first estimate
+	t.Setenv("FAKE_RAW", big)
+	d, cleanup, err := b.Build(context.Background(), DiskRequest{Source: "r/notes-os@sha256:" + strings.Repeat("c", 64), Registry: "r", RootfsMiB: 3500, Formats: []string{"raw"}, Base: "notes-1.0.0"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	got, _ := os.ReadFile(log + ".state")
+	// Images of (20000 - 150) / 2 = 9925 MiB: 3 * 9925 * 5/4, rounded up, and 100.
+	want := fmt.Sprintf("disk.state_size=%d\ndisk.state_size=%d\n", StateMiB(3500), 37319)
+	rawMiB := (int64(2048+(128+20000)<<11+34)*512 + 1<<20 - 1) >> 20
+	if string(got) != want {
+		t.Errorf("auroraboot runs:\n%s\nwant\n%s", got, want)
+	}
+	if d.OSMiB != rawMiB+37319 { // the raw disk, which spans its partitions, and the state
+		t.Errorf("os %d MiB", d.OSMiB)
+	}
+	// A first estimate large enough makes it once.
+	small := filepath.Join(t.TempDir(), "small.raw")
+	writeGPT(t, small, 1000)
+	t.Setenv("FAKE_RAW", small)
+	_ = os.Remove(log + ".state")
+	d, cleanup2, err := b.Build(context.Background(), DiskRequest{Source: "r/notes-os@sha256:" + strings.Repeat("c", 64), Registry: "r", RootfsMiB: 3500, Formats: []string{"raw"}, Base: "notes-1.0.0"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup2()
+	if got, _ := os.ReadFile(log + ".state"); string(got) != fmt.Sprintf("disk.state_size=%d\n", StateMiB(3500)) || d.OSMiB != 1+128+1000+1+StateMiB(3500) { // the raw disk, its backup GPT a MiB more rounded up
+		t.Errorf("one run: %s, os %d", got, d.OSMiB)
+	}
+}
+
+// A second run whose recovery partition grew again is refused: no third run.
+func TestTheStateIsCheckedAgainAfterItsRebuild(t *testing.T) {
+	b, _ := fakeBuilder(t)
+	first, second := filepath.Join(t.TempDir(), "1.raw"), filepath.Join(t.TempDir(), "2.raw")
+	writeGPT(t, first, 20000)
+	writeGPT(t, second, 30000)
+	t.Setenv("FAKE_RAW", first)
+	t.Setenv("FAKE_RAW2", second)
+	_, cleanup, err := b.Build(context.Background(), DiskRequest{Source: "r/notes-os@sha256:" + strings.Repeat("c", 64), Registry: "r", RootfsMiB: 3500, Formats: []string{"raw"}, Base: "notes-1.0.0"})
+	cleanup()
+	if err == nil || !strings.Contains(err.Error(), "made the recovery partition larger again (30000 MiB)") {
+		t.Errorf("%v", err)
+	}
+}
+
+func TestRawLayoutRefusesWhatIsNoGPT(t *testing.T) {
+	t.Parallel()
+	p := filepath.Join(t.TempDir(), "x.raw")
+	if err := os.WriteFile(p, make([]byte, 4096), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := rawLayout(p); err == nil || !strings.Contains(err.Error(), "no GPT") {
+		t.Errorf("%v", err)
+	}
+	refused := func(what, want string, patch func()) {
+		t.Helper()
+		writeGPT(t, p, 1000)
+		if patch != nil {
+			patch()
+		}
+		if _, _, err := rawLayout(p); err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("%s: %v", what, err)
+		}
+	}
+	u64 := func(v uint64) []byte { b := make([]byte, 8); binary.LittleEndian.PutUint64(b, v); return b }
+	// The entries' LBA: 2 is the GPT's; 1 and past the disk are not.
+	writeGPT(t, p, 1000)
+	if _, _, err := rawLayout(p); err != nil {
+		t.Errorf("valid: %v", err)
+	}
+	refused("entries at LBA 1", "entries at LBA 1", func() { patchGPT(t, p, 512+72, u64(1)) })
+	refused("entries past the disk", "not within", func() { patchGPT(t, p, 512+72, u64(1<<55)) })
+	refused("entries wrapping past 2^64", "not within", func() { patchGPT(t, p, 512+72, u64(^uint64(0))) })
+	refused("usable LBAs wrapping past 2^64", "usable LBAs", func() { patchGPT(t, p, 512+48, u64(^uint64(0)-1)) })
+	refused("a header's CRC32 not its content's", "header's CRC32", func() { rawPatch(t, p, 512+16, []byte{1}) })
+	refused("an entry changed under its CRC32", "entries' CRC32", func() { rawPatch(t, p, 1024+2*128+33, []byte{1}) })
+	refused("a header of 91 bytes", "a GPT header of 91 bytes", func() { patchGPT(t, p, 512+12, []byte{91}) })
+	refused("a header of 513 bytes", "a GPT header of 513 bytes", func() { patchGPT(t, p, 512+12, []byte{1, 2}) })
+	writeGPT(t, p, 1000)
+	patchGPT(t, p, 512+12, []byte{0, 2}) // 512 bytes: the CRC32 over all of them
+	if rec, _, err := rawLayout(p); err != nil || rec != 1000 {
+		t.Errorf("a header of 512 bytes: %d %v", rec, err)
+	}
+	// A GPT naming no recovery partition: another is never taken for it.
+	refused("unnamed", "no partition named recovery", func() { patchGPT(t, p, 1024+2*128+56, make([]byte, 16)) })
+	// The recovery partition within the usable LBAs: at the last one, then one past it, then over the GPT.
+	last := uint64(2048 + 1128<<11)
+	writeGPT(t, p, 1000)
+	patchGPT(t, p, 1024+2*128+40, u64(last))
+	if _, _, err := rawLayout(p); err != nil {
+		t.Errorf("at the last usable LBA: %v", err)
+	}
+	refused("past the usable LBAs", "is not within its usable LBAs", func() { patchGPT(t, p, 1024+2*128+40, u64(last+1)) })
+	refused("over the GPT", "is not within its usable LBAs", func() { patchGPT(t, p, 1024+2*128+32, u64(2)) })
+	// The usable LBAs: after the primary entries (LBA 2, one sector), before the backup ones and
+	// header (the disk's last two sectors here); each just within, then just past.
+	sectors := uint64(2048 + 1128<<11 + 34)
+	for _, c := range []struct {
+		off   int64
+		v     uint64
+		valid bool
+	}{
+		{512 + 40, 3, true}, {512 + 40, 2, false},
+		{512 + 48, sectors - 3, true}, {512 + 48, sectors - 2, false},
+	} {
+		writeGPT(t, p, 1000)
+		patchGPT(t, p, c.off, u64(c.v))
+		if _, _, err := rawLayout(p); (err == nil) != c.valid {
+			t.Errorf("header byte %d = %d: %v", c.off, c.v, err)
+		}
+	}
+	// The entries' count and size, each bound on both sides.
+	u32 := func(v uint32) []byte { b := make([]byte, 4); binary.LittleEndian.PutUint32(b, v); return b }
+	for _, c := range []struct {
+		off   int64
+		v     uint32
+		valid bool
+	}{
+		{512 + 80, 1, true}, {512 + 80, 0, false}, {512 + 80, 1024, true}, {512 + 80, 1025, false},
+		{512 + 84, 128, true}, {512 + 84, 127, false}, {512 + 84, 4096, true}, {512 + 84, 4097, false},
+	} {
+		writeGPT(t, p, 1000)
+		patchGPT(t, p, c.off, u32(c.v))
+		_, _, err := rawLayout(p)
+		if gotValid := err == nil || !strings.Contains(err.Error(), "entries of"); gotValid != c.valid {
+			t.Errorf("header byte %d = %d: %v", c.off, c.v, err)
+		}
+	}
+	// An entry of a zero type GUID is unused; a name past ASCII is no "recovery".
+	refused("a zero type GUID", "no partition named recovery", func() { patchGPT(t, p, 1024+2*128, make([]byte, 16)) })
+	refused("a name past ASCII", "no partition named recovery", func() { patchGPT(t, p, 1024+2*128+56+1, []byte{1}) })
+	// Two named recovery.
+	refused("two", "two partitions named recovery", func() {
+		b := make([]byte, 128)
+		f, _ := os.Open(p)
+		_, _ = f.ReadAt(b, 1024+2*128)
+		f.Close()
+		patchGPT(t, p, 1024+3*128, b)
+	})
+	// One too small to hold an image: 150 MiB and one, then 150.
+	for mib, ok := range map[int64]bool{recoveryExtraMiB + 1: true, recoveryExtraMiB: false} {
+		writeGPT(t, p, mib)
+		if _, _, err := rawLayout(p); (err == nil) != ok {
+			t.Errorf("a recovery partition of %d MiB: %v", mib, err)
+		}
+	}
+}
+
+// The recovery partition is the one named so, though another be larger.
+func TestRawLayoutTakesTheRecoveryByName(t *testing.T) {
+	t.Parallel()
+	p := filepath.Join(t.TempDir(), "x.raw")
+	writeGPTSectors(t, p, 2048, 64<<11, 200<<11, 2000<<20) // a recovery partition of 200 MiB
+	// A larger partition beside it (1000 MiB), named otherwise.
+	e := make([]byte, 128)
+	e[0] = 1
+	binary.LittleEndian.PutUint64(e[32:], 400<<11)
+	binary.LittleEndian.PutUint64(e[40:], 1400<<11-1)
+	copy(e[56:], "s\x00t\x00a\x00t\x00e\x00")
+	patchGPT(t, p, 1024+3*128, e)
+	if rec, _, err := rawLayout(p); err != nil || rec != 200 {
+		t.Errorf("recovery %d MiB, %v", rec, err)
 	}
 }

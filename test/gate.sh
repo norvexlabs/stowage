@@ -42,8 +42,13 @@ vm_side() { need e2e-kairos "$1"; need e2e-vm "$1"; }
 # kairos_lines <spec>: the change touches the spec's kairos shape: one of its own keys. An input's
 # or a route's `shapes:` does not: the VM runs the Docker shape's install, which the short suites
 # prove.
+# The shape's block (`  kairos:` under `shapes:`, to the next key of its level) is compared as a
+# whole, before and after: a key in any form, a module's entry included.
+kairos_block() {
+	awk '/^shapes:/ { s = 1; next } s && /^[^ #]/ { s = 0; k = 0 } s && /^  kairos:/ { k = 1; print; next } k && /^  [^ #]/ { k = 0 } k { print }'
+}
 kairos_lines() {
-	git diff -U0 "$base" -- "$1" | grep -qE '^[-+][[:space:]]*(kairos|base|kairos_init|disk_formats|cloud_publish|health_gate|host_api):'
+	[[ "$(git show "$base:$1" 2>/dev/null | kairos_block)" != "$(kairos_block <"$1")" ]]
 }
 
 code=false
@@ -76,6 +81,11 @@ for f in "${changed[@]}"; do
 		lifecycle "$f"
 		vm_side "$f"
 		;;
+	internal/install/audit.go) # the Docker host's audit, and the VM's scanner (preloaded, or pulled)
+		need smoke-install "$f"
+		lifecycle "$f"
+		vm_side "$f"
+		;;
 	internal/install/vm*.go)
 		need smoke-install "$f"
 		lifecycle "$f"
@@ -97,6 +107,19 @@ for f in "${changed[@]}"; do
 		need e2e-full-k8s "$f"
 		;;
 	internal/kairos/files/* | internal/kairos/Dockerfile.tmpl | internal/backup/*) vm_side "$f" ;;
+	# The SBOMs ship makes, the scanner a release carries, the audits that read them.
+	internal/sbom/*) # every signed ship of every example makes SBOMs; the audits read them
+		need e2e "$f"
+		lifecycle "$f"
+		vm_side "$f"
+		;;
+	# The host's tuning: the Docker host's report and apply, the VM's boot; the project's modules
+	# on examples/full's VM.
+	internal/tune/modules.go) need e2e-full-vm "$f" ;;
+	internal/tune/*)
+		lifecycle "$f"
+		need e2e-vm "$f"
+		;;
 	internal/kairos/* | internal/graph/*) need e2e-kairos "$f" ;;
 	internal/truenas/*) need e2e-vm "$f" ;;
 	examples/minimal/*)

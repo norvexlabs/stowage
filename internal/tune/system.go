@@ -32,6 +32,8 @@ type System struct {
 	Owned bool
 	// Profile is the rules' profile; "" is the one the last apply recorded, else Default.
 	Profile Profile
+	// Modules are the kernel modules the project declares, by name, which Inspect judges.
+	Modules []Module
 }
 
 // Host reads the machine (ReadHost) with the system's profile.
@@ -461,6 +463,7 @@ func (s System) Inspect(ctx context.Context, h Host) []Item {
 			Item{verdict(sameMask(mask, h.RPSMask())), "tun", n.name + " rps_cpus", mask, h.RPSMask()},
 			Item{verdict(atLeast(flows, h.FlowEntries())), "tun", n.name + " rps_flow_cnt", flows, AtLeast.render(nums(h.FlowEntries()))})
 	}
+	items = append(items, s.inspectModules()...)
 	if s.Docker == nil {
 		return items
 	}

@@ -7,10 +7,11 @@ import (
 )
 
 // The least VM vm create makes, whatever the release states: Kairos and the stack's engine need
-// as much (spec.MinVMMemory, spec.MinVMDisk).
+// as much memory (spec.MinVMMemory), and the app as much space (spec.MinVMDisk) besides what
+// Kairos takes of the disk, which vm create adds.
 const (
 	minVMMiB = 1024
-	minVMGiB = 16
+	minVMGiB = 4
 )
 
 // vmCount is a VM's size in vm create's units; 0 is unstated.
@@ -18,7 +19,8 @@ type vmCount struct{ cpus, mib, gib int }
 
 // vmSizes is the size vm create makes a VM of the release's Kairos shape with: the least the flags
 // take (least: the floor, raised by shapes.kairos.size.min), the default (size.recommended, else 2
-// CPUs, 4 GiB and 40 GiB, raised to the least), and the size's min and rec as stated.
+// CPUs, 4 GiB and 20 GiB of the app's, raised to the least), and the size's min and rec as stated.
+// A disk's size is the app's space: Kairos's is added to it (bootDisk.diskGiB).
 type vmSizes struct{ least, def, min, rec vmCount }
 
 func (in *Installer) vmSize() vmSizes {
@@ -32,7 +34,7 @@ func (in *Installer) vmSize() vmSizes {
 		}
 	}
 	z := vmSizes{least: vmCount{max(lo.cpus, 1), max(lo.mib, minVMMiB), max(lo.gib, minVMGiB)}, min: lo, rec: rec}
-	z.def = vmCount{max(cmp.Or(rec.cpus, 2), z.least.cpus), max(cmp.Or(rec.mib, 4096), z.least.mib), max(cmp.Or(rec.gib, 40), z.least.gib)}
+	z.def = vmCount{max(cmp.Or(rec.cpus, 2), z.least.cpus), max(cmp.Or(rec.mib, 4096), z.least.mib), max(cmp.Or(rec.gib, 20), z.least.gib)}
 	return z
 }
 
@@ -46,7 +48,7 @@ func (c vmCount) stated() string {
 		out = append(out, fmt.Sprintf("%d MiB", c.mib))
 	}
 	if c.gib != 0 {
-		out = append(out, fmt.Sprintf("a %d GiB disk", c.gib))
+		out = append(out, fmt.Sprintf("%d GiB for the app", c.gib))
 	}
 	return strings.Join(out, ", ")
 }

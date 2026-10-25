@@ -339,7 +339,7 @@ func (in *Installer) tofuVM(ctx context.Context, p Platform, t *TofuVM, host str
 	if sized["--memory"] {
 		qs = append(qs, Question{Title: "Its memory, in MiB", Key: "--memory", Check: num(size.least.mib, minVMMiB)})
 	}
-	qs = append(qs, Question{Title: "Its disk, in GiB", Key: "--disk", Check: num(size.least.gib, minVMGiB)})
+	qs = append(qs, Question{Title: "The app's space on its disk, in GiB (the OS's is added)", Key: "--disk", Check: num(size.least.gib, minVMGiB)})
 	given := map[string]string{"--vm-name": t.Name, "--pool": t.Pool, "--dataset": t.Dataset, "--bridge": t.Bridge,
 		"--cpus": itoa(t.CPUs), "--memory": itoa(t.MemoryMiB), "--disk": itoa(t.DiskGiB)}
 	own := platformVars(declared, onTrueNAS)
@@ -457,7 +457,7 @@ func (in *Installer) applyVM(ctx context.Context, dir, ctl string, p Platform, m
 	m := in.R.Manifest
 	vars := map[string]any{
 		"name": t.Name, "description": fmt.Sprintf("%s %s (revision %d), created by %s vm create", in.R.Spec.Name, m.ProjectVersion, m.Revision, in.R.Ctl()),
-		"disk_gib": t.DiskGiB, "image": image, "image_sha256": imageSHA, "seed": seed, "seed_sha256": seedSHA,
+		"disk_gib": in.boot.diskGiB(format, t.DiskGiB), "image": image, "image_sha256": imageSHA, "seed": seed, "seed_sha256": seedSHA,
 	}
 	if t.builtinTrueNAS(p) {
 		vars["insecure_skip_verify"] = truenas.Insecure(in.O.getenv(truenas.InsecureVar))

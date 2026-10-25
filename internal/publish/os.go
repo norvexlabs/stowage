@@ -8,8 +8,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/google/go-containerregistry/pkg/name"
@@ -23,16 +25,21 @@ import (
 	"github.com/norvexlabs/stowage/internal/providers"
 	"github.com/norvexlabs/stowage/internal/registry"
 	"github.com/norvexlabs/stowage/internal/release"
+	"github.com/norvexlabs/stowage/internal/sbom"
 	"github.com/norvexlabs/stowage/internal/version"
 )
 
 // DiskMaker makes the disk images of an OS bundle (kairos.DiskBuilder).
 type DiskMaker interface {
-	Build(ctx context.Context, r kairos.DiskRequest) (map[string]string, func(), error)
+	Build(ctx context.Context, r kairos.DiskRequest) (kairos.Disks, func(), error)
 }
 
 // FormatAnnotation names a disk artifact's format.
 const FormatAnnotation = "dev.stowage.disk.format"
+
+// RootfsAnnotation is the OS bundle's unpacked size in MiB, which sizes its disks' state
+// partition; each disk records release.DiskOSAnnotation, as its build measured it.
+const RootfsAnnotation = "dev.stowage.os.rootfs-mib"
 
 // hasOS reports whether the project publishes an OS bundle: it has the kairos shape.
 func (p *Publisher) hasOS() bool { return p.Project.Spec.Shapes.Kairos != nil }
@@ -164,6 +171,9 @@ func (p *Publisher) planOS(ctx context.Context, o ShipOptions, disks bool, tag s
 	if err := p.ensureSigned(ctx, osRef); err != nil {
 		return nil, fmt.Errorf("os bundle: %w", err)
 	}
+	if err := p.ensureSBOM(ctx, osRef); err != nil {
+		return nil, fmt.Errorf("os bundle: %w", err)
+	}
 
 	if !disks {
 		return pl, nil
@@ -206,11 +216,23 @@ func (p *Publisher) planOS(ctx context.Context, o ShipOptions, disks bool, tag s
 		if err := p.ensureSigned(ctx, d); err != nil {
 			return nil, fmt.Errorf("%s: %w", a.what, err)
 		}
+		if err := p.ensureDiskSBOM(ctx, d, osRef); err != nil {
+			return nil, fmt.Errorf("%s: %w", a.what, err)
+		}
 	}
 	if err := p.publishClouds(ctx, pl.disks); err != nil {
 		return nil, err
 	}
 	return pl, nil
+}
+
+// preloaded are the images the OS bundle preloads: every one of the release's but the scanner,
+// which an operator runs off the VM. Its <short>-stow carries the release with all of them, so
+// the bundle's key covers the scanner too.
+func preloaded(images map[string]string) map[string]string {
+	out := maps.Clone(images)
+	delete(out, sbom.Key)
+	return out
 }
 
 // buildOS builds the bundle with the release's images preloaded and pushes it by digest.
@@ -230,7 +252,7 @@ func (p *Publisher) buildOS(ctx context.Context, o ShipOptions, a *artifact, ima
 	if err := kairos.OnDisk(p.WorkDir); err != nil {
 		return fmt.Errorf("os bundle: %w", err)
 	}
-	params := kairos.Params{Name: p.Project.Spec.Name, Ctl: providers.Ctl(p.Project.Spec.Short()), Base: k.Base, KairosInit: k.KairosInit, OSVersion: ov}
+	params := kairos.Params{Name: p.Project.Spec.Name, Ctl: providers.Ctl(p.Project.Spec.Short()), Base: k.Base, KairosInit: k.KairosInit, OSVersion: ov, Modules: k.Modules}
 	dir, err := os.MkdirTemp(p.WorkDir, "os-")
 	if err != nil {
 		return err
@@ -239,7 +261,7 @@ func (p *Publisher) buildOS(ctx context.Context, o ShipOptions, a *artifact, ima
 	if err := kairos.WriteContext(dir, params); err != nil {
 		return fmt.Errorf("os bundle: %w", err)
 	}
-	for _, img := range sortedKeys(images) {
+	for _, img := range sortedKeys(preloaded(images)) {
 		p.logf("os bundle: preload %s", img)
 		if err := p.preload(ctx, img, images[img], manifests[img], filepath.Join(dir, kairos.PreloadDir, img+".tar")); err != nil {
 			return fmt.Errorf("os bundle: preload %s: %w", img, err)
@@ -266,7 +288,15 @@ func (p *Publisher) buildOS(ctx context.Context, o ShipOptions, a *artifact, ima
 	if err != nil {
 		return fmt.Errorf("os bundle: build: %w", err)
 	}
-	annotated, ok := mutate.Annotations(built, map[string]string{registry.InputsAnnotation: a.key}).(v1.Image)
+	rootfs, err := unpackedMiB(built)
+	if err != nil {
+		return fmt.Errorf("os bundle: its size: %w", err)
+	}
+	if rootfs <= 0 {
+		return errors.New("os bundle: its root filesystem holds no file")
+	}
+	p.logf("os bundle: %d MiB unpacked", rootfs)
+	annotated, ok := mutate.Annotations(built, map[string]string{registry.InputsAnnotation: a.key, RootfsAnnotation: strconv.FormatInt(rootfs, 10)}).(v1.Image)
 	if !ok {
 		return errors.New("os bundle: cannot annotate")
 	}
@@ -437,6 +467,45 @@ func writeLayout(w io.Writer, img v1.Image, ref string) error {
 	return tw.Close()
 }
 
+// unpackedMiB is the size of img's root filesystem, its layers flattened (a file a later layer
+// replaces or deletes is not counted), in MiB rounded up.
+func unpackedMiB(img v1.Image) (int64, error) {
+	rc := mutate.Extract(img)
+	defer rc.Close()
+	tr := tar.NewReader(rc)
+	var n int64
+	for {
+		h, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return 0, err
+		}
+		if h.Typeflag == tar.TypeReg {
+			n += h.Size
+		}
+	}
+	return (n + 1<<20 - 1) >> 20, nil
+}
+
+// bundleMiB is the OS bundle's unpacked size, as its build recorded it: a bundle recording none
+// makes no disk.
+func (p *Publisher) bundleMiB(ctx context.Context, osRef name.Digest) (int64, error) {
+	ann, _, ok, err := p.Registry.Annotations(ctx, osRef)
+	if err != nil {
+		return 0, err
+	}
+	if !ok {
+		return 0, fmt.Errorf("disks: the OS bundle %s is not in the registry", osRef)
+	}
+	n, perr := strconv.ParseInt(ann[RootfsAnnotation], 10, 64)
+	if perr != nil || n <= 0 {
+		return 0, fmt.Errorf("disks: the OS bundle %s does not record its size (%s): it was built by an earlier Stowage; publish a new revision", osRef.DigestStr(), RootfsAnnotation)
+	}
+	return n, nil
+}
+
 // buildDisks makes the disks of formats from the bundle at osRef and pushes each by digest.
 func (p *Publisher) buildDisks(ctx context.Context, o ShipOptions, osRef name.Digest, formats []string, plans []*artifact) error {
 	if p.Disks == nil {
@@ -451,6 +520,10 @@ func (p *Publisher) buildDisks(ctx context.Context, o ShipOptions, osRef name.Di
 	// proxy of that one image, with the proxy's own one-run account (in its Docker config file),
 	// while the proxy holds the publisher's; so it never holds a registry credential, and a disk
 	// never depends on who else may read the registry.
+	rootfs, err := p.bundleMiB(ctx, osRef)
+	if err != nil {
+		return err
+	}
 	source, acct, stop, err := p.Registry.ReadProxy(ctx, osRef)
 	if err != nil {
 		return fmt.Errorf("disks: %w", err)
@@ -458,7 +531,8 @@ func (p *Publisher) buildDisks(ctx context.Context, o ShipOptions, osRef name.Di
 	defer stop()
 	host, _, _ := strings.Cut(source, "/")
 	p.logf("disks: make %s", strings.Join(formats, ", "))
-	files, cleanup, err := p.Disks.Build(ctx, kairos.DiskRequest{Source: source, Registry: host, Auth: acct, Formats: formats, Base: base})
+	made, cleanup, err := p.Disks.Build(ctx, kairos.DiskRequest{Source: source, Registry: host, Auth: acct, Formats: formats, Base: base, RootfsMiB: rootfs})
+	files := made.Files
 	defer func() {
 		if cleanup != nil {
 			cleanup()
@@ -466,6 +540,9 @@ func (p *Publisher) buildDisks(ctx context.Context, o ShipOptions, osRef name.Di
 	}()
 	if err != nil {
 		return fmt.Errorf("disks: %w", err)
+	}
+	if made.OSMiB <= 0 {
+		return fmt.Errorf("disks: the builder measured no size of what Kairos takes of a disk (%d MiB)", made.OSMiB)
 	}
 	repo, err := p.Registry.Repo(p.diskRepo())
 	if err != nil {
@@ -497,6 +574,7 @@ func (p *Publisher) buildDisks(ctx context.Context, o ShipOptions, osRef name.Di
 			Annotations: map[string]string{
 				registry.InputsAnnotation: a.key,
 				FormatAnnotation:          f,
+				release.DiskOSAnnotation:  strconv.FormatInt(made.OSMiB, 10),
 			},
 		}
 		p.logf("disk %s: push %s", f, b.Annotations[registry.TitleAnnotation])

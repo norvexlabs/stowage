@@ -276,7 +276,11 @@ func TestAFailedDiskMovesNoTag(t *testing.T) {
 	for _, rt := range [][2]string{{"notes-api", "1.0.0"}, {"notes-os", "1.0.0"}, {"notes-release", "stable"}, {"notes-installer", "latest"}} {
 		eq(t, rt[0]+":"+rt[1], e.digest(rt[0], rt[1]), "")
 	}
-	e.disks.fail = false
+	e.disks.fail, e.disks.noOS = false, true
+	if _, err := e.ship("stable", 1); err == nil || !strings.Contains(err.Error(), "measured no size") {
+		t.Fatalf("no OS size: %v", err)
+	}
+	e.disks.noOS = false
 	r := e.mustShip("stable", 1)
 	eq(t, "disk", e.digest("notes-disk", "1.0.0-qcow2"), r.Manifest.Artifacts.Disks["qcow2"])
 }
@@ -602,6 +606,34 @@ func TestDisksReadTheBundleThroughAProxy(t *testing.T) {
 	eq(t, "password", len(r.Auth.Password), 64)
 	if _, err := remote.Head(ref, remote.WithAuth(authn.FromConfig(r.Auth))); err == nil {
 		t.Error("the proxy outlived the disks")
+	}
+}
+
+// The bundle records its unpacked size, which sizes its disks' state partition; each disk records
+// what Kairos takes of a disk, which vm create adds to the app's space. A bundle without its size
+// makes no disk.
+func TestTheDisksAreSizedFromTheBundle(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	rel := e.mustShip("stable", 1)
+	osRef := mustDigest(t, e, "notes-os", rel.Manifest.Artifacts.OS)
+	ann, _, _, err := e.reg.Annotations(context.Background(), osRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mib, err := strconv.ParseInt(ann[RootfsAnnotation], 10, 64)
+	if err != nil || mib <= 0 || e.disks.requests[0].RootfsMiB != mib {
+		t.Fatalf("the bundle's size %q, the disks' %d", ann[RootfsAnnotation], e.disks.requests[0].RootfsMiB)
+	}
+	for f, d := range rel.Manifest.Artifacts.Disks {
+		ann, _, _, err := e.reg.Annotations(context.Background(), mustDigest(t, e, "notes-disk", d))
+		if err != nil || ann[release.DiskOSAnnotation] != strconv.Itoa(fakeOSMiB) {
+			t.Errorf("disk %s: %q %v", f, ann[release.DiskOSAnnotation], err)
+		}
+	}
+	p, _ := e.publisher()
+	if _, err := p.bundleMiB(context.Background(), mustDigest(t, e, "notes-api", rel.Manifest.Artifacts.Images["api"])); err == nil || !strings.Contains(err.Error(), "does not record its size") {
+		t.Errorf("a bundle without its size: %v", err)
 	}
 }
 

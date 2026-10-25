@@ -3,6 +3,7 @@ package sigverify
 import (
 	"context"
 	"crypto/elliptic"
+	"encoding/json"
 	"errors"
 	"io"
 	"log"
@@ -129,6 +130,50 @@ func TestVerifyKeyTypesAndPredicate(t *testing.T) {
 	}
 }
 
+// An attestation is read only when a trusted key made it, over this digest, of the type asked;
+// a signature is none, and an attestation is no signature.
+func TestAttestation(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	e := newEnv(t)
+	const spdx = "https://spdx.dev/Document"
+	doc := json.RawMessage(`{"spdxVersion":"SPDX-2.3","packages":[{"name":"zlib","versionInfo":"1.3"}]}`)
+	trusted, other := testutil.NewKeySigner(t), testutil.NewKeySigner(t)
+	v := verifier(t, trusted.PEM)
+	trusted.Sign(t, e.d)
+	if _, err := v.Attestation(ctx, e.c, e.d, spdx); !errors.Is(err, ErrNoAttestation) {
+		t.Fatalf("a signature alone: %v", err)
+	}
+	other.Predicate, other.Body = spdx, doc
+	other.Sign(t, e.d)
+	vuln := testutil.NewKeySigner(t)
+	*vuln = *trusted
+	vuln.Predicate, vuln.Body = "https://cosign.sigstore.dev/attestation/vuln/v1", json.RawMessage(`{"x":1}`)
+	vuln.Sign(t, e.d)
+	elsewhere := push(t, e.d.Context().String())
+	att := *trusted
+	att.Predicate, att.Body = spdx, doc
+	att.SignAs(t, e.d, elsewhere)
+	if _, err := v.Attestation(ctx, e.c, e.d, spdx); !errors.Is(err, ErrNoAttestation) {
+		t.Fatalf("by another key, of another type, over another digest: %v", err)
+	}
+	att.Sign(t, e.d)
+	got, err := v.Attestation(ctx, e.c, e.d, spdx)
+	if err != nil || string(got) != string(doc) {
+		t.Fatalf("the trusted key's: %s %v", got, err)
+	}
+	if err := v.Verify(ctx, e.c, e.d); err != nil {
+		t.Fatalf("the signature beside it: %v", err)
+	}
+	e2 := newEnv(t)
+	att2 := *trusted
+	att2.Predicate, att2.Body = spdx, doc
+	att2.Sign(t, e2.d)
+	if err := v.Verify(ctx, e2.c, e2.d); !errors.Is(err, ErrUnsigned) {
+		t.Fatalf("an attestation alone signs nothing: %v", err)
+	}
+}
+
 // A bundle cosign v3 wrote (`cosign sign --key … --tlog-upload=false`) verifies with its key, and
 // with no other.
 func TestVerifiesCosignBundles(t *testing.T) {
@@ -242,5 +287,24 @@ func TestNewRefusesABadKey(t *testing.T) {
 	}
 	if _, err := New(map[string][]byte{"k.pub": []byte("not a key")}); err == nil || !strings.Contains(err.Error(), "k.pub") {
 		t.Errorf("bad key: %v", err)
+	}
+}
+
+// An attestation larger than a signature's read cap is no signature, and is no failure to check:
+// the digest is unsigned; the attestation itself reads.
+func TestALargeAttestationIsNeitherASignatureNorAFailure(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	e := newEnv(t)
+	k := testutil.NewKeySigner(t)
+	k.Predicate = "https://spdx.dev/Document"
+	k.Body = json.RawMessage(`{"spdxVersion":"SPDX-2.3","pad":"` + strings.Repeat("x", registry.MaxArtifactBlob) + `"}`)
+	k.Sign(t, e.d)
+	v := verifier(t, k.PEM)
+	if err := v.Verify(ctx, e.c, e.d); !errors.Is(err, ErrUnsigned) {
+		t.Fatalf("a large attestation alone: %v", err)
+	}
+	if doc, err := v.Attestation(ctx, e.c, e.d, "https://spdx.dev/Document"); err != nil || len(doc) < registry.MaxArtifactBlob {
+		t.Fatalf("the attestation: %d bytes, %v", len(doc), err)
 	}
 }

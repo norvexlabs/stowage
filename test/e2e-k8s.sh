@@ -132,6 +132,16 @@ ctl v2.sh k8s status >"$WORK/status.log" 2>&1 || { cat "$WORK/status.log"; fail 
 grep -q "^notes 1.0.0 (revision 1, stable)$" "$WORK/status.log" && grep -q "^registry  $REG/notes$" "$WORK/status.log" && grep -q 'STATUS: deployed' "$WORK/status.log" ||
 	{ cat "$WORK/status.log"; fail "k8s status"; }
 
+step "audit and sbom export from the operator's machine: the cluster's release, by its version alone"
+grype_db
+scanner_fresh "$REG/notes"
+ctl v1.sh audit --version 1.0.0 --db "$GRYPE_DB" --json >"$WORK/audit.json" 2>"$WORK/audit.log" || { cat "$WORK/audit.log" "$WORK/audit.json"; fail "audit of 1.0.0"; }
+[[ $(jq -r .version "$WORK/audit.json") == 1.0.0 && $(jq '[.subjects[] | select(.error)] | length' "$WORK/audit.json") == 0 && $(jq '[.subjects[] | select(.name == "installer")] | length' "$WORK/audit.json") == 1 ]] ||
+	{ cat "$WORK/audit.json"; fail "not every artifact of 1.0.0 was audited"; }
+ctl v1.sh sbom export --version 1.0.0 "$WORK/sbom" >"$WORK/sbom.txt" 2>&1 || { cat "$WORK/sbom.txt"; fail "sbom export"; }
+jq -e '(.artifacts | length) > 0 and all(.artifacts[]; .error == null and .file != null)' "$WORK/sbom/index.json" >/dev/null &&
+	jq -e '.spdxVersion' "$WORK/sbom/installer.spdx.json" >/dev/null || { cat "$WORK/sbom/index.json"; fail "the exported SBOMs"; }
+
 step "k8s reset-db: uninstalled, its claim deleted, installed again with the same values"
 kubectl exec -n "$NS" deploy/notes-web -- touch /data/marker || fail "no marker written in the uploads claim"
 claim=$(kubectl get -n "$NS" pvc notes-uploads -o jsonpath='{.metadata.uid}')

@@ -62,6 +62,19 @@ sum=$(sha256sum "$D/.env" "$D/compose.yaml")
 [[ $(sha256sum "$D/.env" "$D/compose.yaml") == "$sum" ]] || fail "a re-run changed .env or compose.yaml"
 running 1.0.0 1
 
+step "audit on the Docker host: the release's SBOMs, scanned with its own scanner (the database given)"
+grype_db
+scanner_fresh "$REG/notes"
+"${CTL[@]}" audit --dir "$D" --db "$GRYPE_DB" --json >"$WORK/audit.json" 2>"$WORK/audit.log" || { cat "$WORK/audit.log" "$WORK/audit.json"; fail "audit"; }
+[[ $(jq -r .version "$WORK/audit.json") == 1.0.0 && $(jq '[.subjects[] | select(.error)] | length' "$WORK/audit.json") == 0 && $(jq '.subjects | length' "$WORK/audit.json") -ge 7 ]] ||
+	{ cat "$WORK/audit.json"; fail "not every artifact of 1.0.0 was audited"; }
+"${CTL[@]}" audit --dir "$D" --db "$GRYPE_DB" >"$WORK/audit.txt" 2>&1 || { cat "$WORK/audit.txt"; fail "audit, printed"; }
+grep -q '^notes 1.0.0 (revision 1, stable, ' "$WORK/audit.txt" && grep -q ' artifacts, vulnerabilities: ' "$WORK/audit.txt" || { cat "$WORK/audit.txt"; fail "the audit's report"; }
+[[ -d $D/.stowage-grype/cache ]] || fail "the scanner's database is not kept in the install"
+"${CTL[@]}" sbom export "$WORK/sbom" --dir "$D" >"$WORK/sbom.txt" 2>&1 || { cat "$WORK/sbom.txt"; fail "sbom export"; }
+jq -e '.version == "1.0.0" and (.artifacts | length) >= 7 and all(.artifacts[]; .error == null)' "$WORK/sbom/index.json" >/dev/null &&
+	jq -e '.spdxVersion' "$WORK/sbom/api.spdx.json" >/dev/null || { cat "$WORK/sbom/index.json"; fail "the exported SBOMs"; }
+
 step "the release's default profile: each container takes the host's own settings and open files"
 "${CTL[@]}" status --dir "$D" >"$WORK/status.txt" 2>&1 && grep -qx 'tune      default (release)' "$WORK/status.txt" ||
 	{ cat "$WORK/status.txt"; fail "status does not show the release's default profile"; }
@@ -182,6 +195,13 @@ grep -qx "STOWAGE_REGISTRY='\{0,1\}$SITE'\{0,1\}" "$D/.env" || fail "the install
 cmp -s "$D/registry-ca.pem" "$MIRROR_CA" || fail "the install does not keep the mirror's CA"
 "${OPERATOR[@]}" "$D/notes-stow" upgrade --version 3.0.0 --dir "$D" >"$WORK/site-again.log" 2>&1 || { cat "$WORK/site-again.log"; fail "upgrade --version through the mirror"; }
 grep -q 'already runs' "$WORK/site-again.log" || { cat "$WORK/site-again.log"; fail "upgrade --version did not read the mirror"; }
+# The SBOMs and the scanner came through the mirror: the audit reads only the site (a scanner read
+# from another registry is another local image, so it is pulled from the site).
+scanner_fresh "$SITE"
+"${OPERATOR[@]}" "$D/notes-stow" audit --dir "$D" --db "$GRYPE_DB" --json >"$WORK/audit-site.json" 2>"$WORK/audit-site.log" ||
+	{ cat "$WORK/audit-site.log" "$WORK/audit-site.json"; fail "audit through the mirror"; }
+[[ $(jq '[.subjects[] | select(.error)] | length' "$WORK/audit-site.json") == 0 ]] || { cat "$WORK/audit-site.json"; fail "an SBOM did not reach the mirror"; }
+grep -q "pulling $SITE/notes-audit@" "$WORK/audit-site.log" || { cat "$WORK/audit-site.log"; fail "the scanner was not pulled from the mirror"; }
 D=$D1 APP_PORT=$APP1 API_PORT=$API1
 
 printf '\nPASS\n'

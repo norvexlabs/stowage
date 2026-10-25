@@ -45,7 +45,7 @@ func TestVMCreateSizesFromTheRelease(t *testing.T) {
 	if err := v.create(tofuCreate(), r.mod(nil)); err != nil {
 		t.Fatalf("%v\n%s", err, v.log)
 	}
-	if got := vars(r); got.CPUs != 4 || got.MemoryMiB != 8192 || got.DiskGiB != 60 {
+	if got := vars(r); got.CPUs != 4 || got.MemoryMiB != 8192 || got.DiskGiB != 60+23 { // the app's recommended 60 GiB, and the OS's
 		t.Errorf("defaults %+v", got)
 	}
 	if strings.Contains(v.log.String(), "recommends") {
@@ -88,10 +88,10 @@ func TestVMSizeDefaults(t *testing.T) {
 		lo, rec    *spec.Machine
 		least, def vmCount
 	}{
-		{nil, nil, vmCount{1, 1024, 16}, vmCount{2, 4096, 40}},
-		{&spec.Machine{CPUs: 3}, nil, vmCount{3, 1024, 16}, vmCount{3, 4096, 40}},
+		{nil, nil, vmCount{1, 1024, 4}, vmCount{2, 4096, 20}},
+		{&spec.Machine{CPUs: 3}, nil, vmCount{3, 1024, 4}, vmCount{3, 4096, 20}},
 		{&spec.Machine{Memory: 6 << 30, Disk: 50 << 30}, nil, vmCount{1, 6144, 50}, vmCount{2, 6144, 50}},
-		{nil, &spec.Machine{CPUs: 1, Memory: 2 << 30}, vmCount{1, 1024, 16}, vmCount{1, 2048, 40}},
+		{nil, &spec.Machine{CPUs: 1, Memory: 2 << 30}, vmCount{1, 1024, 4}, vmCount{1, 2048, 20}},
 	} {
 		in := &Installer{R: &Release{Spec: &spec.Spec{Name: "notes", Shapes: spec.Shapes{Kairos: &spec.KairosShape{Size: &spec.VMSize{Min: c.lo, Recommended: c.rec}}}}}}
 		if z := in.vmSize(); z.least != c.least || z.def != c.def {
@@ -110,7 +110,7 @@ func TestVMSizeNoteForAModuleOfItsOwn(t *testing.T) {
 	var log strings.Builder
 	logf := func(f string, a ...any) { fmt.Fprintf(&log, f+"\n", a...) }
 	in.vmSize().warn(logf, "notes", TofuVM{DiskGiB: 60}, false, false)
-	if want := "the module sizes the VM by its own variables: notes runs on at least 2 CPUs, 2048 MiB, a 20 GiB disk; 4 CPUs, 8192 MiB, a 60 GiB disk recommended\n"; log.String() != want {
+	if want := "the module sizes the VM by its own variables: notes runs on at least 2 CPUs, 2048 MiB, 20 GiB for the app; 4 CPUs, 8192 MiB, 60 GiB for the app recommended\n"; log.String() != want {
 		t.Errorf("%q", log.String())
 	}
 	log.Reset()
@@ -128,7 +128,7 @@ func TestVMCreateByHandSaysTheSize(t *testing.T) {
 	if err := v.create(VMCreate{Platform: "proxmox"}, nil); err != nil {
 		t.Fatal(err)
 	}
-	if want := "  Size the VM: notes runs on at least 2 CPUs, 2048 MiB, a 20 GiB disk; 4 CPUs, 8192 MiB, a 60 GiB disk recommended.\n"; !strings.Contains(v.out2(), want) {
+	if want := "  Size the VM: notes runs on at least 2 CPUs, 2048 MiB, 20 GiB for the app; 4 CPUs, 8192 MiB, 60 GiB for the app recommended.\n"; !strings.Contains(v.out2(), want) {
 		t.Errorf("no %q in:\n%s", want, v.out2())
 	}
 	v = newVMCreate(t, "qcow2")

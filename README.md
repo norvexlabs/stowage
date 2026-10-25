@@ -140,7 +140,8 @@ and is the place to copy from once the basics work.
   sha256sum -c SHA256SUMS
   ```
 
-  A release made while the repository is public also carries a build provenance attestation:
+  The release carries the binary's SBOM, `stowage-linux-amd64.spdx.json` (SPDX), checked by the
+  same `SHA256SUMS`. A release made while the repository is public also carries a build provenance attestation:
   `gh attestation verify stowage-linux-amd64 --repo norvexlabs/stowage --signer-workflow
   norvexlabs/stowage/.github/workflows/release.yml --source-ref refs/tags/v<x.y.z>`. Put the
   binary on `PATH` as `stowage`. Or build it: Docker is the only build requirement, and
@@ -490,6 +491,8 @@ stowage -C <project> plan [--revision N] [--channel C] [--json]   # build graph 
 stowage -C <project> lock [--update]                  # pin this stowage in stowage.lock
 stowage -C <project> ship [--channel C] [--revision N] [--disks] [--json]   # build what changed, push, move the pointer
 stowage -C <project> verify [<version>] [--channel C] [--revision N] [--json]
+stowage -C <project> audit [<version>] [--channel C] [--revision N] [--db FILE] [--fail-on S] [--json]   # the release's SBOMs, scanned
+stowage -C <project> sbom export [<version>] DIR [--channel C] [--revision N]   # the release's SBOMs, verified, as files
 stowage -C <project> promote <version> --from C --to C [--revision N] [--json]
 stowage -C <project> yank <version> --reason TEXT [--channel C] [--revision N]
 stowage -C <project> prune --channel C [<version>]    # mutable channels only
@@ -519,6 +522,24 @@ stowage -C <project> --test-registry PREFIX [--test-push USER:ENV] [--test-pull 
   also checks the installer's `:latest` and, with the `kairos` shape, each `latest-<format>` disk
   tag (absent for a format the release has none of). A retired tag counts as absent. With a
   version, it checks that release.
+- `audit` (a project that signs) checks the release as `verify` does, then reads the SBOM each
+  of its images, its installer and its OS bundle carries, attested by a key of
+  `signing.public_keys` (with the pull account alone), and scans each with grype
+  (`docker.io/anchore/grype:v0.121.0`, its linux/amd64 image pinned by digest, on the local
+  engine, as the publisher's user). It prints the vulnerabilities by severity, highest first (the artifact, the CVE, the
+  package and version, its type, the versions that fix it), then their count by severity; an
+  artifact without an SBOM by a trusted key (or whose scan failed) is listed as `not audited:
+  <why>`. `--json` prints the report: `{project, version, revision, channel, tag, db_built,
+  subjects: [{name, digest, error, findings: [{id, severity, package, version, type,
+  fixed_in}]}]}`. It exits 1 when an artifact is not audited, and with `--fail-on
+  negligible|low|medium|high|critical` (default `none`) when a vulnerability is at or above that
+  severity. grype's database is fetched from grype's servers into `~/.cache/stowage/grype` (about
+  1 GB, kept between audits; grype refreshes it when it is older than its servers'); `--db FILE`
+  imports an archive from grype's listing (`https://grype.anchore.io/databases`) instead and
+  fetches nothing, whatever the archive's age (grype's own limit, 5 days, is not applied to it).
+  The database is made ready once, and only when an artifact has an SBOM to scan. A project that does not sign is refused (its releases carry no SBOM).
+- `sbom export [<version>] DIR` checks the release as `verify` does and writes the SBOMs `audit`
+  reads, as the installer's `sbom export` does (`DIR/<artifact>.spdx.json`, `DIR/index.json`).
 - `prune` without a version deletes every release of the channel except the pointer's. With a
   version, it deletes every revision of that version, and the pointer moves back when it held
   one. An immutable channel is refused: yank instead.
@@ -671,6 +692,7 @@ The release manifest (artifact type `application/vnd.stowage.release.v1+json`) h
 | `<name>-front` | the front, built by Stowage, by the release tag |
 | `<name>-backup` | the backup runner, built by Stowage (a `docker` or `kairos` shape with a `pg-age-rclone` backup), by the release tag |
 | `<name>-chown` | the volume helper, built by Stowage (a `docker` or `kairos` shape with a `data.volumes` entry of a `uid`), by the release tag |
+| `<name>-audit` | the vulnerability scanner a signing release carries (grype, mirrored by digest), by the release tag |
 | `<name>-installer` | the release tag, and `:latest` |
 | `<name>-os` | the Kairos OS bundle (an image), by the release tag |
 | `<name>-disk` | each disk image by `<tag>-<format>` (one disk set per channel), and `latest-<format>` |
@@ -689,7 +711,8 @@ On the publisher's machine:
   (`XDG_CACHE_HOME` moves them), and the disks need about 15 GB while they are made;
 - the disks leave a local image `stowage-disktools:<16 hex>` (qemu-img, built from a Debian base
   pinned by digest), and pull the pinned auroraboot image;
-- signing uses `~/.cache/stowage/sign`.
+- signing uses `~/.cache/stowage/sign`, and syft's private Docker config `~/.cache/stowage/sbom`,
+  removed after each call; `audit` keeps grype's database in `~/.cache/stowage/grype`.
 
 Publishing commands read `registry.push` (for `token`, the password from the named environment
 variable); `verify` and `releases` read with `registry.pull` only. A `token` pull account is baked
@@ -874,6 +897,26 @@ which its tag no longer holds`). A signature only counts as one made
 by `cosign sign` (an attestation the key made over the same digest does not), checked with the
 hash cosign uses for the key type.
 
+**SBOMs.** A project that signs gives each image of a release (its own, the mirrored ones and
+Stowage's), its installer, its OS bundle and each disk an SBOM: an SPDX 2.3 JSON document made by syft
+(`docker.io/anchore/syft:v1.55.0`, pinned by digest, run on the local engine on the host network,
+reading the image from the registry with the push account), attached with `cosign attest --type
+spdxjson` signed by the release key as an in-toto attestation (predicate type
+`https://spdx.dev/Document`), stored as a sigstore bundle referrer of the artifact's digest, as the
+signatures are. A disk's is its bundle's, attested on the disk (`attested the SBOM of <ref> (its
+bundle's)`), with no scan of its own. `ship` and `promote` log `attested the SBOM of <ref>` for each one made; an
+artifact that already carries one by a trusted key is left (a re-ship makes none, an SBOM deleted
+from the registry is made again), and one made is read back before the release is written. The
+SBOM of a digest is made once: a later syft makes no new one. An attestation never counts as a
+signature. A signing release also carries the scanner `audit` runs, grype's linux/amd64 image (a
+Docker v2 manifest: the registry must take one — zot does with `http.compat: ["docker2s2"]`),
+mirrored as the image `audit` (`<prefix>/<name>-audit`), which no OS bundle preloads: `mirror
+export` carries it and the SBOMs to a site without internet, where an operator's `<short>-stow
+audit` pulls it. `stowage sbom export` and `<short>-stow sbom export` write the verified SBOMs as
+files for other tools. To check an SBOM by hand: `cosign verify-attestation --key <public key> --type spdxjson
+--insecure-ignore-tlog=true <prefix>/<name>-<key>@sha256:… | jq -r .payload | base64 -d | jq
+.predicate`.
+
 Run one publisher at a time per project (in CI, one concurrency group): a registry offers no
 compare-and-swap.
 
@@ -883,7 +926,7 @@ exactly what was published (same release inputs: images, compose, spec, changelo
 `stowage.lock`, and the same `stowage` and pull account password, which make the installer
 and the front),
 checked before anything is written. Re-shipping a yanked release fails: publish a new revision (the channel never moves forward to it; a pointer an interrupted yank left on it moves back). Image keys `release`,
-`release-seq`, `os`, `disk`, `installer`, `front`, `backup` and `chown` are reserved for Stowage's own repositories. `yank` marks a release (nothing is deleted) and moves the pointer back to the latest
+`release-seq`, `os`, `disk`, `installer`, `front`, `backup`, `chown` and `audit` are reserved for Stowage's own repositories. `yank` marks a release (nothing is deleted) and moves the pointer back to the latest
 release that is not yanked and verifies, removing it when none is left; a broken release can
 always be yanked. `prune` deletes tags (the release's images, installer, chart, OS bundle and
 disk tags first, its manifest last; disks as "Disk sets" says): a registry that deletes no tag
@@ -1067,8 +1110,19 @@ These are what `lint` checks; each finding names the key path or `file:line` to 
     kernel's command line: whoever reaches the hypervisor's console or the serial port has root,
     so they are as trusted as the hypervisor), the QEMU
     and VMware guest agents, `multipathd` masked; the kernel modules kairos-init strips are
-    reinstalled (the build fails with fewer than 100).
+    reinstalled (the build fails with fewer than 100); the project's `shapes.kairos.modules` in
+    `/usr/lib/modules-load.d/50-<name>.conf` (each one `load`ed at boot) and
+    `/usr/lib/modprobe.d/50-<name>.conf` (each one `block`ed, as `blacklist <module>` and `install
+    <module> /bin/false`, so neither a dependency nor udev loads it; each one's `options`), each
+    line under its `reason`, in the image's `/usr` (Kairos keeps `/etc` across upgrades and
+    rollbacks) and so in its initramfs, from the first boot. The build fails, naming the key, when a
+    module loaded or given options is in no kernel of the image, one is built into it (modprobe's
+    files do not reach it, and `tune` could not tell it loaded), an option is not one of the module's
+    parameters, or modprobe and systemd-modules-load do not read the files.
 
+  The build records the bundle's unpacked size on its manifest (`dev.stowage.os.rootfs-mib`),
+  which sizes its disks' partitions, and logs it (`os bundle: N MiB unpacked`). The bundle
+  preloads the release's images but its scanner (`audit`), which no VM runs.
   Its inputs are the version and revision, the name, `base`, `kairos_init`, the embedded recipe,
   the images' inputs, and what its `<short>-stow` carries — the runtime spec less `disk_formats` and
   `cloud_publish`, `stowage.lock`, the changelog section, the version scheme, the compose file,
@@ -1076,7 +1130,27 @@ These are what `lint` checks; each finding names the key path or `file:line` to 
   names no channel and a promotion re-tags it; every new version or revision rebuilds it, with
   the distribution's and Docker's packages of the day. The build needs network access (apt, kairos-init's
   packages) and takes several minutes; the bundle is about 3 GB.
-- **Disk images** (`shapes.kairos.disk_formats`): made from the bundle by the pinned auroraboot
+- **Disk images** (`shapes.kairos.disk_formats`): their first boot lays out Kairos's partitions
+  and gives the rest of the disk to the persistent one (`/usr/local`: the install, Docker's
+  data, the volumes). The state partition (the active, passive and upgrade-transition systems) is
+  sized for three system images and a quarter more for later releases (`disk.state_size`), not
+  auroraboot's 3 × the recovery partition: first estimated from the bundle (each image its
+  unpacked size × 3/2 + 200 MiB), then checked against the recovery partition auroraboot made
+  (two images and 150 MiB, sized by auroraboot from the bundle as it measures it): an estimate
+  short of it (the partition named `recovery` in the raw disk's GPT; none so named fails the
+  build) makes the raw disk again, once, with the size it calls for, and a second run whose
+  recovery partition grew again fails (`disks: the state
+  partition of N MiB holds no three system images of this bundle: made again with M MiB`). Each
+  disk records what Kairos takes of a disk, measured (`dev.stowage.disk.os-mib`: the raw disk's
+  partitions and the state one), which `vm create` adds to the app's space; a release outgrowing
+  its state partition cannot upgrade a VM made before it. A bundle that records no size (built by
+  an earlier Stowage) makes no disk. A raw disk whose GPT is not sound (its header's or entries'
+  CRC32, a header of 92 to 512 bytes, entries and partitions within the disk) fails the build.
+  `vm create` boots a disk set only when every disk of it records a size of 1 MiB to 16 TiB; it
+  then takes the channel's set, or refuses, naming the disk (`records no dev.stowage.disk.os-mib:
+  published by an earlier Stowage`, or `records … "<value>", not a size in MiB (1 to 16777216): not
+  as Stowage publishes it`).
+  Made from the bundle by the pinned auroraboot
   (v0.28.0, run privileged on the host network). auroraboot holds no registry account: it reads the
   bundle by digest from a read-only proxy `ship` serves on a loopback port for the disks' build
   alone (`127.0.0.1:<port>/<repository>@<digest>`), with the proxy's own account — user
@@ -1094,8 +1168,8 @@ These are what `lint` checks; each finding names the key path or `file:line` to 
   to a whole number of GiB, as `disk.raw` alone in a sparse, oldgnu `.tar.gz`, as Google Cloud
   imports it), `qcow2`
   (compressed) and `ova` (an OVF descriptor — EFI firmware, Secure Boot off, 2 vCPUs, 4 GiB, a
-  serial port — then a streamOptimized VMDK of 64 GiB, or the raw disk's size when larger, in a
-  tar). A grown disk (`vhd`, `gce`, `ova`) has its backup GPT moved to its new end (sgdisk). `ship`
+  serial port — then a streamOptimized VMDK of 64 GiB, or Kairos's partitions and 8 GiB beyond them
+  when that is more, in a tar). A grown disk (`vhd`, `gce`, `ova`) has its backup GPT moved to its new end (sgdisk). `ship`
   refuses a `vhd` whose footer is not a fixed disk's, with a valid checksum, of a whole number of
   MiB, and a `gce` that does not hold a `disk.raw` of a whole number of GiB alone.
 - **Cloud images** (`shapes.kairos.cloud_publish`): each cloud listed adds the format it imports
@@ -1346,7 +1420,7 @@ database: reset-db has nothing to reset` (`… there is no backup to restore`). 
 | `hooks.provision` | `container` (`image`, `cmd`, `env`: the inputs, secrets and safe defaults it receives, required, `[]` for none; `returns`: keys it may return, which `provision --set` sets before it returned them; `outputs`) |
 | `hooks.maintenance.disk_pressure` | `soft_pct`, `hard_pct` (1 ≤ soft < hard ≤ 99), `post` (`http://<service>:<port>/…`), `auth_secret` (a `secrets` key). The Kairos VM's host daemon acts on it (see "Disk pressure" under the installer on the Kairos VM), and a Docker install's own timer (see "Backups, restore and the disk-pressure watch on Docker"); Kubernetes ignores it, and without a `docker` or `kairos` shape it is a warning |
 | `backup` | optional, and only with a `database`: `pg-age-rclone` (`profiles`: a name of 1 to 32 lowercase letters and digits each, `all`, a list of the tables whose data it keeps — `table` in any schema, or `schema.table` —, or `{ exclude: [pattern, …] }`, the tables whose rows it leaves out, structure kept (`table` or `schema.table` of letters, digits and `_`, with pg_dump's `*` and `?`); `default_profile`, required with several; `volumes`, the compose volumes every backup also archives and a restore brings back with the database — each listed once, a volume the compose file declares and Compose creates (not `external`), under a literal name (no `${…}` in its `name:`), and none the database's service mounts: its data is the dump's), which the Kairos VM and a Docker install run (see "Backups" under the installer on the Kairos VM); `command`, validated only (with a `kairos` shape, a warning: the VM schedules no backup of it). A `docker` or `kairos` shape with a `pg-age-rclone` backup makes `ship` build and publish the backup runner (`<name>-backup`), which the OS bundle preloads and a Docker install pulls |
-| `shapes` | at least one of `docker: {}`, `kubernetes` (`chart`, a directory holding `Chart.yaml`; `postgres_modes`: `external`, `embedded`, `cnpg`, optional and validated only; an error without a `database`; `schema`: `url_env`, the variable holding the migrate role's URL in the container of the workload running `reads_newer_image`, and `image`, an images key holding `psql` — the schema check of `k8s upgrade` and `k8s rollback`, which needs the `sql` schema-compat provider with `reads_newer_image`; absent with that provider, a warning), `kairos` (`base`, the distribution converted into Kairos, and `kairos_init`, the kairos-init image, both pinned by digest; a `kairos_init` tagged other than the release the OS bundle's build takes, v4.4.0-rc2, is warned, as the build refuses it; `disk_formats`: `raw`, `qcow2`, `ova`, `vhd`, `gce`, none publishing the bundle alone; `cloud_publish`: `aws`, `azure`, `gcp`, each adding the disk format it imports (`raw`, `vhd`, `gce`); `health_gate`: 0 < `poll_s` < `deadline_s` ≤ `deadline_after_reset_s`, the VM's health gate's window and polling (default 600, 1800 and 30 s; `deadline_after_reset_s` is validated only: `reset-db` does not reboot, so no boot is judged after it); `host_api`: the compose services given the host daemon's app socket on the VM, each in the compose file, none twice; `size`: `min` and `recommended`, each of `cpus`, `memory` and `disk` (sizes as `stack.memory`'s `max` reads them; one given as 0 or left empty is an error, and so is `min:` or `recommended:` left empty: leave it out) — the least VM the stack runs on and the one it runs well on, which `vm create` sizes a VM from; at least one of `min` and `recommended`, each stating at least one of the three, `cpus` at least 1, `memory` whole MiB and at least 1G, `disk` whole GiB and at least 16G, and none of `recommended` under `min`'s; no `backup` is a warning when there is a `database`). `ship` publishes the `kubernetes` chart and the `kairos` OS bundle and disks; `docker` and `kubernetes` have a runtime |
+| `shapes` | at least one of `docker: {}`, `kubernetes` (`chart`, a directory holding `Chart.yaml`; `postgres_modes`: `external`, `embedded`, `cnpg`, optional and validated only; an error without a `database`; `schema`: `url_env`, the variable holding the migrate role's URL in the container of the workload running `reads_newer_image`, and `image`, an images key holding `psql` — the schema check of `k8s upgrade` and `k8s rollback`, which needs the `sql` schema-compat provider with `reads_newer_image`; absent with that provider, a warning), `kairos` (`base`, the distribution converted into Kairos, and `kairos_init`, the kairos-init image, both pinned by digest; a `kairos_init` tagged other than the release the OS bundle's build takes, v4.4.0-rc2, is warned, as the build refuses it; `disk_formats`: `raw`, `qcow2`, `ova`, `vhd`, `gce`, none publishing the bundle alone; `cloud_publish`: `aws`, `azure`, `gcp`, each adding the disk format it imports (`raw`, `vhd`, `gce`); `health_gate`: 0 < `poll_s` < `deadline_s` ≤ `deadline_after_reset_s`, the VM's health gate's window and polling (default 600, 1800 and 30 s; `deadline_after_reset_s` is validated only: `reset-db` does not reboot, so no boot is judged after it); `host_api`: the compose services given the host daemon's app socket on the VM, each in the compose file, none twice; `size`: `min` and `recommended`, each of `cpus`, `memory` and `disk` (sizes as `stack.memory`'s `max` reads them; one given as 0 or left empty is an error, and so is `min:` or `recommended:` left empty: leave it out) — the least VM the stack runs on and the one it runs well on, which `vm create` sizes a VM from; at least one of `min` and `recommended`, each stating at least one of the three, `cpus` at least 1, `memory` whole MiB and at least 1G, `disk` (the app's space on the VM's disk: its data, its images loaded, its backups' staging — `vm create` adds what Kairos takes) whole GiB and at least 4G, and none of `recommended` under `min`'s; `modules`: kernel modules by name (lower-case letters, digits and `_`), each with a `reason` (one line, at most 200 bytes) and at least one of `load: true` (loaded at boot), `block: true` (never loaded; not with `load` or `options`) and `options` (the module's parameters by name, `[A-Za-z0-9_]`; values of letters, digits and `_ . , : / + -`), which the OS bundle carries and `tune` reports; no `backup` is a warning when there is a `database`). `ship` publishes the `kubernetes` chart and the `kairos` OS bundle and disks; `docker` and `kubernetes` have a runtime |
 
 A `command` provider answers per op: `version.get` → `{"version"}`; `scheme.validate`
 `{version}` → `{"valid", "reason"}`; `scheme.compare` `{a, b}` → `{"result": -1|0|1}`;
@@ -1397,7 +1471,45 @@ again, to copy an installer to another host.
 <short>-stow tune --apply | --revert [--profile default|network] [--yes] [--restart-docker] [--no-input] [--accessible]
 <short>-stow mirror export [--channel C] [--version V [--revision N]] [--shapes S,…] [--output FILE] [--disks F,…|none]
 <short>-stow mirror import FILE --to PREFIX [--registry-ca FILE] [--older]
+<short>-stow audit [--version V [--channel C] [--revision N]] [--registry PREFIX [--registry-ca FILE]] [--db FILE] [--fail-on S] [--offline] [--json] [--dir D]
+<short>-stow sbom export DIR [--version V [--channel C] [--revision N]] [--registry PREFIX [--registry-ca FILE]] [--dir D]
 ```
+
+- `audit` and `sbom export` run where `<short>-stow` runs — a Docker host, or an operator's own
+  machine with Docker for an install on a VM or on Kubernetes: the VM runs neither, and an
+  operator needs only the version it runs (`status`). They read the release this installer
+  carries, or with `--version` version V's latest revision (or `--revision`'s) on `--channel`
+  (default: the channel the install follows, else this installer's), found and checked as `upgrade --version`
+  finds it; in a directory holding this project's install, the release it runs (without
+  `--version`), from the registry it pulls from with the keys it trusts (with or without `--version`: an older installer never brings back a key a
+  later release dropped), elsewhere from `--registry` (a mirror, `--registry-ca` its CA) or this
+  installer's registry, with this installer's keys. A directory holding an install whose record
+  does not read is refused. The SBOMs of every image, the installer, the
+  OS bundle and each disk (`disk-<format>`) are read as attested by a trusted key.
+- `sbom export DIR` writes each artifact's SBOM, verified, as `DIR/<artifact>.spdx.json` and
+  `DIR/index.json` (`{project, version, revision, channel, tag, format: "spdx-2.3+json",
+  artifacts: [{name, digest, file, error}]}`), for the operator's own tools (Dependency-Track,
+  Trivy, grype); it prints each artifact, its digest and its file, and exits 1 when one has no
+  SBOM by a trusted key (the others are written, the index naming why).
+- `audit` scans each SBOM with the release's own scanner, read by digest with the same registry
+  client (the pull account, `--registry-ca`) and loaded into the local engine as
+  `stowage.local/<8 hex>/<name>-audit:<16 hex>` (`docker load`; the first hex are the registry
+  prefix's hash, the others the scanner's digest, so a scanner read from another registry is
+  another image) and logged as `pulling <ref> as <local>`: the engine's own trust is never changed.
+  The scanner runs only when the engine's image is the release's: its layers' diff IDs, its
+  entrypoint, command, environment, working directory and user those of the config the release
+  names (one tagged so by another image is loaded over), and it runs by the image ID checked, so a
+  tag moved meanwhile runs nothing else
+  (an install made offline, or `--offline`, takes the one loaded by tag under the install's own
+  prefix, `<prefix>/<name>-audit:<tag>`, whatever `--registry` reads,
+  never pulls, and `audit` refuses `--version` — `sbom export --version` pulls no image and
+  takes it; the SBOMs are still read from the registry the install records). Before the scans, grype's database is brought up to date once (`grype
+  db update`; `--db` imports the file instead), and no scan checks it again. It prints and exits as the publisher's `stowage audit` does
+  (`--json`, `--fail-on`, `--db`, `not audited: <why>`). The scanner's database is kept in
+  `<dir>/.stowage-grype` (about 1 GB; in the user's cache dir when the directory holds no
+  install). A disk's SBOM is its bundle's: it is scanned once, and the summary counts a finding
+  shared by several artifacts once. A release that is not signed, or was shipped before releases carried SBOMs (no
+  scanner), is refused, and so is a directory holding another project's install.
 
 - Defaults: `--dir ./<name>`, `--address 127.0.0.1` (a 127.x address or `::1`, recorded bare
   in `STOWAGE_LOOPBACK_ADDRESS` — Compose's port syntax takes `::1:8080:80` — and bracketed in
@@ -2128,7 +2240,13 @@ with `tune` and neither a `docker` nor a `kairos` shape.
   applied with `network` refuses `--profile default` — report, `--check`, `--print` or `--apply`
   — until `--revert`: the network profile's own keys would be neither judged, kept nor put back
   (a `tune.json` written before the profiles, naming `shared`, is read as `default`). `--check`
-  exits non-zero when one differs (monitoring, CI). `--print` prints the files `--apply` writes,
+  exits non-zero when one differs (monitoring, CI). It also reports each of the release's
+  `shapes.kairos.modules` (`module <name>`, its reason beside what is wanted): one to load and
+  not loaded, one blocked and loaded, and each option the loaded module does not hold
+  (`/sys/module/<name>/parameters`; a boolean shown `Y`/`N` holds `1`, `y`, `t`, `on` or `0`,
+  `n`, `f`, `off`; one not loaded or not shown there is `n/a`). On the VM, whose image carries
+  them, they `differ`; on another host, whose kernel is its operator's, they are `advice`:
+  `tune` sets no module there. `--print` prints the files `--apply` writes,
   for a host configured by other means. `--apply` (root) prints what it writes, asks (`--yes`
   without a terminal, else it refuses), writes the files and applies them to the running host;
   `--revert` (root, asks too) removes them and puts back what the first `--apply` found.
@@ -2825,9 +2943,9 @@ in the same installer (bootstrap it as above, then `sh <name>.sh vm create …`,
   | `--platform` | provider | what the module makes | the module's own variables (`--tofu-var`, or asked) |
   |---|---|---|---|
   | `truenas` | `pjsalty/truenas` 3.1.0 | below | its flags: `--pool`, `--dataset`, `--bridge` |
-  | `libvirt` (preview) | `dmacvicar/libvirt` 0.9.9 | the image uploaded as a volume, a copy-on-write qcow2 volume over it grown to `--disk`; the seed as a second, read-only volume; a KVM domain with libvirt's UEFI firmware (Secure Boot off) on `network`, its virtio NIC with a queue per vCPU and a receive ring of 1024, its DHCP lease of an IPv4 address the address (waited for, up to 5 minutes, only with DHCP) | `uri` (default `qemu:///system`), `pool` (`default`), `network` (`default`) |
-  | `proxmox` (preview) | `bpg/proxmox` 0.117.0 | the image uploaded to a datastore with *Import* content (not enabled by default: Datacenter > Storage), the seed to one with *ISO* content, both through the API (the token alone, no SSH to the node); an OVMF VM importing the image, grown to `--disk`, the seed on its CD-ROM, a virtio NIC with a queue per vCPU (at most 64); no address (no guest agent) | `node` (required), `datastore` (`local-lvm`), `import_datastore` (`local`), `iso_datastore` (`local`), `bridge` (`vmbr0`) |
-  | `vmware` (preview) | `vmware/vsphere` 2.17.1 | the OVA deployed, its disk grown to `--disk`, the seed uploaded to the datastore on its CD-ROM; its address when VMware tools report one | `datacenter`, `cluster`, `datastore`, `host` (required), `network` (`VM Network`), `folder` |
+  | `libvirt` (preview) | `dmacvicar/libvirt` 0.9.9 | the image uploaded as a volume, a copy-on-write qcow2 volume over it grown to `disk_gib` (the app's `--disk` and Kairos's share); the seed as a second, read-only volume; a KVM domain with libvirt's UEFI firmware (Secure Boot off) on `network`, its virtio NIC with a queue per vCPU and a receive ring of 1024, its DHCP lease of an IPv4 address the address (waited for, up to 5 minutes, only with DHCP) | `uri` (default `qemu:///system`), `pool` (`default`), `network` (`default`) |
+  | `proxmox` (preview) | `bpg/proxmox` 0.117.0 | the image uploaded to a datastore with *Import* content (not enabled by default: Datacenter > Storage), the seed to one with *ISO* content, both through the API (the token alone, no SSH to the node); an OVMF VM importing the image, grown to `disk_gib` (the app's `--disk` and Kairos's share), the seed on its CD-ROM, a virtio NIC with a queue per vCPU (at most 64); no address (no guest agent) | `node` (required), `datastore` (`local-lvm`), `import_datastore` (`local`), `iso_datastore` (`local`), `bridge` (`vmbr0`) |
+  | `vmware` (preview) | `vmware/vsphere` 2.17.1 | the OVA deployed, its disk grown to `disk_gib` (the app's `--disk` and Kairos's share), the seed uploaded to the datastore on its CD-ROM; its address when VMware tools report one | `datacenter`, `cluster`, `datastore`, `host` (required), `network` (`VM Network`), `folder` |
   | `aws` (preview) | `hashicorp/aws` 6.69.1 | the raw image uploaded to S3, imported as a snapshot (the `vmimport` role), registered as a UEFI image, an instance launched from it with the cloud-config as its user data (IMDSv2); its public address, else its private one | `region`, `bucket`, `subnet_id` (required), `security_group_ids` (comma-separated), `instance_type` (`t3.medium`), `vmimport_role` (`vmimport`) |
   | `gcp` (preview) | `hashicorp/google` 8.7.0 | the image's `tar.gz` uploaded to Cloud Storage, a UEFI image declaring gVNIC, an instance booted from it with the cloud-config as its `user-data`, tagged with its name; with `firewall`, two firewall rules on its network reaching that tag (`<name>-<hash>-ssh`: TCP 22 from `ssh_sources`' IPv4 sources; `<name>-<hash>-ports`: `open_ports` from every source), for which the account OpenTofu runs as must be allowed to create and delete firewall rules (`compute.firewalls.*`, e.g. `roles/compute.securityAdmin`); its external address. Without `firewall`, `vm create` warns `no firewall rule is made on Google Cloud: the network's own rules must let tcp/22, <the opened ports> reach the VM`: the default network's `default-allow-ssh` opens SSH to every source, which the VM's firewall then narrows, and nothing opens the front's ports. With `firewall=true` and `--ssh-allow` naming IPv6 sources alone, no SSH rule is made and `vm create` warns `SSH's sources name no IPv4 address`. A value other than `true`, `false`, `1` or `0` is refused before OpenTofu runs. The network's own rules apply either way | `project`, `zone`, `bucket` (required), `firewall` (`false`), `network` (`default`), `subnetwork`, `machine_type` (`e2-medium`), `nic_type` (`GVNIC`, or `VIRTIO_NET`) |
   | `azure` (preview) | `hashicorp/azurerm` 5.10.0 | the fixed VHD uploaded as a page blob, a generation 2 image, a VM with a static public address and accelerated networking made from it with the cloud-config as its custom data (no VM agent); its public address | `resource_group`, `location`, `storage_account`, `subnet_id` (required), `container` (`vhds`), `vm_size` (`Standard_B2ls_v2`: a size that offers accelerated networking), `accelerated_networking` (`true`) |
@@ -2857,7 +2975,7 @@ in the same installer (bootstrap it as above, then `sh <name>.sh vm create …`,
   - **The module contract**, which `--module DIR` holds (its `*.tf`, `*.tf.json` and
     `.terraform.lock.hcl`, symbolic links followed, not its subdirectories, are copied into the
     VM's directory, so `vm destroy` needs DIR no more): it declares the variables `name`,
-    `description`, `disk_gib`, `image` (the disk on this machine, in the `--platform`'s format),
+    `description`, `disk_gib` (the VM's disk in GiB: the app's `--disk` and what Kairos takes, which the disk records; an OVA's never under the capacity it declares), `image` (the disk on this machine, in the `--platform`'s format),
     `image_sha256`, `seed` (the NoCloud seed ISO on a hypervisor, the cloud-config file on a cloud:
     `--platform` decides) and `seed_sha256`, refused before anything is fetched when one is
     missing. It may declare `cpus` and `memory_mib` (then asked and given `--cpus` and `--memory`;
@@ -2886,8 +3004,12 @@ in the same installer (bootstrap it as above, then `sh <name>.sh vm create …`,
   - After the product's questions it asks the VM's name, where it goes and how big — on TrueNAS
     `--vm-name` (default the host name's letters and digits), `--pool`, `--dataset` (under the pool, e.g. `vms`),
     `--bridge` (the bridge or interface the NIC attaches to), `--cpus` (default 2), `--memory`
-    in MiB (default 4096, at least 1024) and `--disk` in GiB (default 40, at least 16; the OS
-    grows into it at first boot), then elsewhere the module's own variables. A release whose
+    in MiB (default 4096, at least 1024) and `--disk`, the app's space in GiB (default 20, at
+    least 4): the VM's disk is that and what Kairos takes of it, which the disk records (its
+    boot, recovery and state partitions, sized from the OS bundle), and the review says both
+    (`a 43 GiB disk (the OS 23 GiB, the app 20 GiB)`; an OVA's disk is never under the capacity
+    it declares: 64 GiB, or Kairos's partitions and 8 GiB beyond them when that is more); a disk set recording none (published by an earlier Stowage) boots no VM, the
+    channel's set then tried, then elsewhere the module's own variables. A release whose
     `shapes.kairos.size` states a size changes these: each default is its `recommended` size
     (else the default above, raised to its `min`), a value under its `min` is refused (`"1": a
     whole number, at least 2, the least <name> runs on`), and one under its `recommended` is
@@ -2920,7 +3042,7 @@ in the same installer (bootstrap it as above, then `sh <name>.sh vm create …`,
     while it waits for the VM, `vm create` says the VM is kept and names `vm destroy`.
   - It runs `tofu init`, `tofu apply -auto-approve` and `tofu output -json` there
     (`TF_IN_AUTOMATION=1`, `TF_INPUT=0`, and `STOWAGE_CTL` set to the running `<short>-stow`, which
-    the module's steps run). TrueNAS's module creates a staging dataset `<vm-name>-staging` and a zvol `<dataset>/<vm-name>` (16K blocks,
+    the module's steps run). TrueNAS's module creates a staging dataset `<vm-name>-staging` and a zvol `<dataset>/<vm-name>` of `disk_gib` (the app's `--disk` and Kairos's share; 16K blocks,
     LZ4), uploads the disk image (checked against its SHA-256 first; an upload already there at
     its size is not sent again) and converts it into the zvol, uploads the seed, creates the VM
     (UEFI, host CPU, `--cpus` cores, autostart) with the disk, a VirtIO NIC whose MAC is derived
@@ -3027,6 +3149,9 @@ sudo <short>-stow install [--channel C] [--set KEY=VALUE]… [--answers FILE] [-
 <short>-stow reboot|shutdown [--drain-secs N]   # 0 to 600, default 30
 ```
 
+- The VM audits nothing itself, and holds no scanner: an operator audits its release, or
+  exports its SBOMs, from their own machine (`<short>-stow audit --version V`, see the Docker
+  shape), by the version `status` names.
 - `install` is the Docker shape's first install (the same flags, form, checks and refusals) from
   the preloaded images, asking the inputs of the `kairos` shape (`inputs[].shapes`); its re-run
   is the Docker shape's too, moving between TLS modes and taking a new certificate (`--tls`,
@@ -3574,9 +3699,18 @@ sudo <short>-stow install [--channel C] [--set KEY=VALUE]… [--answers FILE] [-
   refused, the saved one too (GET never shows it, and an answer to whether a config is it would
   let the app test guesses of its secrets) (403, `rclone_config is the operator's: rclone runs the
   programs its options name, as root on the host; backup config over SSH`), so before the
-  operator's first `backup config` the app sets nothing. A config a service saved through the app
-  socket under an earlier release is kept, and run, until the operator saves one over SSH: the
-  journal names such a change (`backup.config`, `changed through the app socket: …rclone_config…`).
+  operator's first `backup config` the app sets nothing. Each operator's save of an rclone config
+  keeps its SHA-256 in `<dir>/backup-rclone.sha256` (written before the settings, removed with
+  them); on the VM, a saved config whose digest is not that one — saved before the digest was
+  kept (a service may have saved it through the app socket under an earlier release) or edited
+  on disk — is never run: a backup (scheduled, before an upgrade, or now), `verify`, `list` and
+  `restore` fail with `the saved rclone config is not known to be the operator's … it is not run
+  until the operator saves one over SSH` (409), and `backup status` and the app's settings say so
+  (`rclone_config_from`: `unknown`) until the operator saves one again
+  (`backup config --rclone-config FILE`; saving other settings keeps the doubt). A config the
+  operator's `verify` proposes unsaved runs. On Docker, which has no app socket, every saved
+  config is the operator's. The journal named an app's change of it (`backup.config`, `changed
+  through the app socket: …rclone_config…`).
   The daemon
   runs rclone as root on the host's network, and its options name programs it runs (sftp's
   `ssh`, a `*_command`, S3's `credential_process` through a credentials file). Each change the app makes is
@@ -3619,7 +3753,7 @@ other than the one the install runs, and without the last GET's token, which it 
   network) or `dhcp` (the OS's default); `previous` null is the cloud-config's network), `POST network` (`{"mode", "address", "gateway", "ipv6", "address6", "gateway6",
   "dns", "revert_secs"}`; `ipv6` absent is off), `POST network/confirm`, `POST network/revert`, `POST network/reset`
   (`{"revert_secs"}`), each answering `{"message", "override", "pending"}`, `GET backup/config`
-  (`{"configured", "destination", "rclone_config_set", "recipients", "retention_days", "schedule",
+  (`{"configured", "destination", "rclone_config_set", "rclone_config_from" (`operator`, or `unknown`: not run), "recipients", "retention_days", "schedule",
   "profile", "profiles", "locked"}`), `POST backup/config` (`{"destination", "rclone_config", "recipients",
   "retention_days", "schedule", "profile", "lock"}`: a field left out, or an empty `recipients`, keeps its
   value; answers the settings; `lock`, which `backup config --lock` / `--unlock` set, alone or
@@ -3721,16 +3855,16 @@ make image    # stowage:<version> runtime image (distroless)
 make test     # fast loop: unit tests without the race detector
 make gate     # the commit gate: check, build, lint, then only the end-to-end suites the change (against GATE_BASE, default HEAD, untracked files included) can affect; e2e-kairos, e2e-vm and e2e-full-vm (given STOWAGE_VM_ENV) one at a time beside the others, which run in parallel; each step of a suite prints the time since it began
 make gate-plan  # the suites `make gate` would run, each with the first changed path that needs it; `bash test/gate.sh --plan --paths P…` for given paths
-make e2e      # build, then ship / verify / promote / yank / prune examples/minimal, signed, against zot, and run its installer image; with registry.pull none on a registry refusing anonymous reads, ship stops before it builds
+make e2e      # build, then ship / verify / promote / yank / prune examples/minimal, signed, against zot, and run its installer image; each image's and the installer's SBOM attested (none made again by a re-ship), the scanner mirrored, `audit` reading them all with grype's database given (`--db`, fetched once into the tools cache), an SBOM checked by hand with `cosign verify-attestation`, and refused with a key the release was not signed with; with registry.pull none on a registry refusing anonymous reads, ship stops before it builds
 make smoke-install  # the installer on the local Docker engine: registry, stack, front, provision hook, re-run, status, upgrade, rollback; behind TLS the local CA, then byo with --ca, each one's CA published to the stack and what the front serves chaining to it; the byo install moved to internal and back by re-runs; a loopback install on `::1` with `--ipv6` (the stack's network and the front have IPv6); with a global IPv6 address on the host, a TLS install whose route has an allowlist, called from that address: `--ipv6` and the allowlist holding it serves, an allowlist without it refuses (403), and the same install moved off IPv6 refuses it too (the front sees Docker's IPv4 gateway)
-make e2e-docker     # build, then the real binaries against zot and the local Docker engine: ship examples/minimal 1.0.0, install it with the bootstrap one-liner, re-run, the release's default tuning profile in status and the api container given the host's own settings and open files, ship 2.0.0 and 3.0.0 and reach each with notes-stow upgrade --version (each release's signature checked against the kept installer's key), roll back (allowed, then refused at a rollback barrier); then `mirror export` 3.0.0, `mirror import` into a TLS zot of its own test CA (refused without `--registry-ca`, the signatures carried), a second install from it with `--registry` and `--registry-ca`, and `upgrade --version` reading it with the recorded CA
+make e2e-docker     # build, then the real binaries against zot and the local Docker engine: ship examples/minimal 1.0.0, install it with the bootstrap one-liner, re-run, `notes-stow audit` with its release's scanner and `sbom export` of its SBOMs, the release's default tuning profile in status and the api container given the host's own settings and open files, ship 2.0.0 and 3.0.0 and reach each with notes-stow upgrade --version (each release's signature checked against the kept installer's key), roll back (allowed, then refused at a rollback barrier); then `mirror export` 3.0.0, `mirror import` into a TLS zot of its own test CA (refused without `--registry-ca`, the signatures carried), a second install from it with `--registry` and `--registry-ca`, `upgrade --version` reading it with the recorded CA, and `audit` reading the SBOMs and pulling the scanner from the mirror alone
 make e2e-full       # build, then examples/full as it stands on the Docker shape: ship this month's CalVer release with a token push, signed with the key its environment holds (env://), install it with the bootstrap one-liner (the installer image pulled with the project's own pull account) in loopback mode, every route serving, the api migrating a real Postgres and serving as its app role, the provision hook registering the administrator and its API key through the api and its credentials file 0600; the release's network tuning profile in status, the api's namespace holding its settings, the host's open files and the host route's MTU on the stack's network; the install prints its endpoint (the api route's URL, also in `status`) and ends with the search extension's tip (`atlas-search`, not published on the channel); a re-run sets the search extension's input (`SEARCH_URL`, the api reaching it, no tip), another clears it (the tip again), the hook handed back the key it minted; the app's users revoke that key: `provision` fails naming `provision --set`, `provision --set ADMIN_API_KEY=` mints and registers another (in no log), the next run keeps it; its record lost, `provision --set ADMIN_API_KEY=<key>` gives the key the hook never returned (declared in `hooks.provision.returns`; an undeclared key refused) and no other is minted; re-runs turn forward auth on the api route on (no identity without the authentication service's answer, a forged header stripped) and off, narrow the ingest route's allowlist to another address and to none (403), set an advanced input and give it back to its default (status shows each); `secrets rotate` takes the internal secret through --stage, the swap and --finish, each value accepted while it must be and the old one refused after; ship .2 (a migration), upgrade --version (data kept, a pg_dump snapshot), roll back (allowed by the api image's reads-newer label); ship .3 (a migration that is a rollback barrier), upgrade, and rollback is refused naming the barrier and the snapshot
-make e2e-k8s        # build, then the real binaries against zot and a kind cluster pulling from it with the pull Secret: k8s install with the bootstrap script (the provision hook's Job run, what it returned in its Secret and not the log), upgrade --values, upgrade alone (what the hook returned handed back), upgrade --version 2.0.0, a refused downgrade, a failed upgrade helm rolls back, rollback, status, reset-db (what the hook returned forgotten), uninstall refused without --data (the chart's own claim, which helm deletes), then uninstall --data removing the release, its Secrets, the hook's account and the claim, the namespace kept
+make e2e-k8s        # build, then the real binaries against zot and a kind cluster pulling from it with the pull Secret: k8s install with the bootstrap script (the provision hook's Job run, what it returned in its Secret and not the log), upgrade --values, upgrade alone (what the hook returned handed back), upgrade --version 2.0.0, a refused downgrade, a failed upgrade helm rolls back, rollback, status, `audit --version 1.0.0` and `sbom export` of the cluster's release from the operator's machine (no install directory: the installer's keys and registry), reset-db (what the hook returned forgotten), uninstall refused without --data (the chart's own claim, which helm deletes), then uninstall --data removing the release, its Secrets, the hook's account and the claim, the namespace kept
 make e2e-stateless  # build, then examples/stateless on the Docker shape: ship 1.0.0 (a pulled image, no database, no front) to zot, install it with the bootstrap one-liner (no TLS mode asked or recorded, no front running), the health path and the L4 route serving the input from an inline compose config, the state volume given the server's uid (the server, uid 1000, writes into it at start); a re-run changes the input, and the server is made again with it; `status` lists the L4 route; `--tls` refused, there being no front; ship 1.0.1, `upgrade --version 1.0.1` (nothing dumped) and `rollback` (no schema check), the input kept; `reset-db` refused, the release having no database
 make e2e-full-k8s   # build, then examples/full's chart on a kind cluster pulling from zot: k8s install with the bootstrap script against a Postgres outside the release (its two URLs and the administrator's password secret inputs from the operator's environment), two api replicas migrating once, the provision hook's Job registering the administrator and its API key (recorded in the outputs Secret, in no log; the Job deleted; no helm hook), every service answering, the api reaching the search extension's URL given at the install (`--set SEARCH_URL=…`), the endpoint printed as the api's Service URL; `k8s upgrade` of the same release, the key handed back to the hook; the app's users revoke the key, ship .2 (a migration), upgrade --version: the release runs .2 and the hook fails naming `k8s provision --set`, which mints and registers another key, and `k8s provision` again keeps it; its record lost, `k8s provision --set ADMIN_API_KEY=<key>` gives the key the hook never returned (an undeclared key refused) and no other is minted (data kept); rollback (the previous api on the newer schema); a second release in another namespace with the embedded Postgres, and reset-db deleting its database's claim, forgetting what the hook returned and registering the administrator again; `k8s secrets rotate` through its three passes, the release restarted at each, each value accepted while it must be; `k8s uninstall --yes` of the embedded release keeps its database's claim and its Secrets, and `k8s install` takes them back, the events kept
-make e2e-kairos     # build, then ship examples/minimal's OS bundle and its qcow2 and ova disks and its three clouds' raw, vhd and gce to zot for real (each image docker-loaded from the bundle, each disk's zstd layer decompressed with `zstd -d` and checked in its format, the vhd and the gce as Azure and Google Cloud import them); the bundle's notes-stow on the local Docker engine as on the VM (install from the preloaded images with a settings file, boot, the host daemon's verbs, its disk-pressure POST to the api (the token never logged) and `status` showing it, its app socket and the api service's token and mount, `backup config`, `verify`, `run` to a WebDAV server through the preloaded runner, the backup decrypted and read by `pg_restore` and the uploads volume's archive beside it, `list`, `status`); with `STOWAGE_CLOUD_ENV=<file>` (a shell file of a cloud's `STOWAGE_<CLOUD>_*` settings and credentials, needs `tofu`), the images registered on the clouds it sets up, the others reported left out, and every image it registered destroyed at exit; re-ship (nothing built, nothing registered again), promote, `vm create` from the published notes-stow (the qcow2 by digest, the seed ISO), verify, prune; ship 2.0.0, whose notes-stow's boot upgrades the install, and 1.0.0's boot goes back
-STOWAGE_VM_ENV=<file> make e2e-vm   # build, ship examples/minimal's OS bundle and qcow2 disk to zot, carry the release with `mirror export` / `mirror import` to a TLS zot mirror of its own test CA on this host's address toward TrueNAS, then the published notes-stow's `vm create --create opentofu --registry --registry-ca` boots a real VM on TrueNAS from the mirror's disk: its first boot installs from the cloud-config (`--ssh-allow` this host's address and its global IPv6 addresses, `--ipv6`, `--timezone Europe/Paris`); over SSH, the firewall's table (input dropped by default, SSH from this host alone, over IPv4 and IPv6, the front's ports, an `l4` route to the database open to this host's IPv4 address alone and to the stack's bridges, the database on the host's network: reached from this host, refused over IPv6), no Kairos agent listening, no account with a password, root and passwords refused by sshd, no console autologin, and the time zone, status, ps, passwordless sudo, the boot's tuning by the release's default profile (the connection table sized, no BBR, no sysctl file, the api container given the VM's own settings and open files), then `install --tune-profile network` tuning the VM at once (BBR, the ceilings, the local ports from 10000, status naming the operator's profile, the api container's settings), kept through the upgrade's reboot with the logs rotated, the admin group, the app socket (refused without the install's token, served with it, `secrets export` refused there) and the api service's read-only mount; the install records the mirror and the VM trusts its CA; the front answers HTTPS; `reset-db --yes` wipes the data and provisions again (a new admin password) without a reboot; `backup config` over SSH (the rclone config on standard input, a schedule the timer takes), `backup run` of a partitioned table with a key to a WebDAV server on this host, the backup decrypted and read by `pg_restore`, the uploads volume's archive beside it; a row and files added, then `restore` (the key on standard input) brings the backup's data and the volume back as they were; `secrets export` to the operator's key decrypts into the install's secrets; a re-run changing the route's allowlist refuses this host, through the upgrade's reboot (its input chain rewritten by the boot's start); 1.0.1 is shipped and carried through the mirror, `updates` offers it and `upgrade --yes` takes a backup first, then reboots the VM into it, whose health gate marks the boot good; `rollback --yes` reboots it into the passive system, back on 1.0.0, and a second `rollback` is refused there; 1.0.2, whose api never becomes ready, is upgraded to from the passive system, fails its health gate, and the VM falls back to 1.0.0, `status` naming the failed boot and its diagnostics, `updates` no longer offering 1.0.2; 1.0.3, a rollback barrier that never becomes ready, fails its gate too and is kept (the boot marked good, `status` saying why going back is refused); the cloud-config's network is DHCP with DHCPv6 asked at once, the stack's network has IPv6, the LAN gives the VM a global IPv6 address and an IPv6 default route, and this host reaches it over IPv6 by SSH and HTTPS; `network set` keeps the DHCP lease as a static address, a static unique local IPv6 address beside it, and `network confirm` keeps it (the console banner tells it), a change back to DHCP not confirmed comes undone at its 30 s window's end, and another, a reboot inside its window, at the boot; `vm destroy` removes it all
-STOWAGE_VM_ENV=<file> make e2e-full-vm   # build, ship examples/full's this month's release with its OS bundle and qcow2 disk to zot, carry it through the TLS mirror as e2e-vm does, then the published at-stow's `vm create --create opentofu` boots a real VM on TrueNAS whose first boot installs it with the search extension's input set (`--set SEARCH_URL=http://api:9090`, the api standing in for a search service); through the VM's front over HTTPS, the api answers with the organisation, the administrator the provision hook registered and the search URL reached; the console and ingest serve, and an event reaches the api; the api reads the front's local CA (publish_ca), which the api route's certificate chains to; the hook's credentials file is 0600, the api mounts the app socket's directory read-only; the ops route refuses everyone until a re-run's `--client-ca`, then takes a certificate that CA issued with its login (`basic_auth`, a wrong password refused) alone; the echo L4 routes' service runs on the host's network; `vm destroy` removes it all (upgrade, rollback and the health gate's fallback are e2e-vm's)
+make e2e-kairos     # build, then ship examples/minimal's OS bundle (its SBOM attested) and its qcow2 and ova disks and its three clouds' raw, vhd and gce to zot for real (each image docker-loaded from the bundle, each disk's zstd layer decompressed with `zstd -d` and checked in its format, the vhd and the gce as Azure and Google Cloud import them); the bundle's notes-stow on the local Docker engine as on the VM (install from the preloaded images with a settings file, boot, the host daemon's verbs, its disk-pressure POST to the api (the token never logged) and `status` showing it, its app socket and the api service's token and mount, `backup config`, `verify`, `run` to a WebDAV server through the preloaded runner, the backup decrypted and read by `pg_restore` and the uploads volume's archive beside it, `list`, `status`); with `STOWAGE_CLOUD_ENV=<file>` (a shell file of a cloud's `STOWAGE_<CLOUD>_*` settings and credentials, needs `tofu`), the images registered on the clouds it sets up, the others reported left out, and every image it registered destroyed at exit; re-ship (nothing built, nothing registered again), promote, `vm create` from the published notes-stow (the qcow2 by digest, the seed ISO), verify, prune; ship 2.0.0, whose notes-stow's boot upgrades the install, and 1.0.0's boot goes back
+STOWAGE_VM_ENV=<file> make e2e-vm   # build, ship examples/minimal's OS bundle and qcow2 disk to zot, carry the release with `mirror export` / `mirror import` to a TLS zot mirror of its own test CA on this host's address toward TrueNAS, then the published notes-stow's `vm create --create opentofu --registry --registry-ca` boots a real VM on TrueNAS from the mirror's disk: its first boot installs from the cloud-config (`--ssh-allow` this host's address and its global IPv6 addresses, `--ipv6`, `--timezone Europe/Paris`); over SSH, the firewall's table (input dropped by default, SSH from this host alone, over IPv4 and IPv6, the front's ports, an `l4` route to the database open to this host's IPv4 address alone and to the stack's bridges, the database on the host's network: reached from this host, refused over IPv6), no Kairos agent listening, no account with a password, root and passwords refused by sshd, no console autologin (and recorded in the log, not judged: Docker's IPv4 and IPv6 forward policies, `/oem`'s files and what the boot's journal says of the user-data), and the time zone, status, ps, passwordless sudo, the boot's tuning by the release's default profile (the connection table sized, no BBR, no sysctl file, the api container given the VM's own settings and open files), then `install --tune-profile network` tuning the VM at once (BBR, the ceilings, the local ports from 10000, status naming the operator's profile, the api container's settings), kept through the upgrade's reboot with the logs rotated, the admin group, the app socket (refused without the install's token, served with it, `secrets export` refused there) and the api service's read-only mount; the install records the mirror and the VM trusts its CA; the front answers HTTPS; `reset-db --yes` wipes the data and provisions again (a new admin password) without a reboot; the disk sized as the app's 16 GiB on `/usr/local` with Kairos's partitions added; the published notes-stow's `audit --version 1.0.0` and `sbom export` of the VM's release from this host, through the mirror (the scanner pulled from it, the OS bundle's and the disk's SBOMs among them), the VM holding no scanner; `backup config` over SSH (the rclone config on standard input, a schedule the timer takes), `backup run` of a partitioned table with a key to a WebDAV server on this host, the backup decrypted and read by `pg_restore`, the uploads volume's archive beside it; a row and files added, then `restore` (the key on standard input) brings the backup's data and the volume back as they were; `secrets export` to the operator's key decrypts into the install's secrets; a re-run changing the route's allowlist refuses this host, through the upgrade's reboot (its input chain rewritten by the boot's start); 1.0.1 is shipped and carried through the mirror, `updates` offers it and `upgrade --yes` takes a backup first, then reboots the VM into it, whose health gate marks the boot good; `rollback --yes` reboots it into the passive system, back on 1.0.0, and a second `rollback` is refused there; 1.0.2, whose api never becomes ready, is upgraded to from the passive system, fails its health gate, and the VM falls back to 1.0.0, `status` naming the failed boot and its diagnostics, `updates` no longer offering 1.0.2; 1.0.3, a rollback barrier that never becomes ready, fails its gate too and is kept (the boot marked good, `status` saying why going back is refused); the cloud-config's network is DHCP with DHCPv6 asked at once, the stack's network has IPv6, the LAN gives the VM a global IPv6 address and an IPv6 default route, and this host reaches it over IPv6 by SSH and HTTPS; `network set` keeps the DHCP lease as a static address, a static unique local IPv6 address beside it, and `network confirm` keeps it (the console banner tells it), a change back to DHCP not confirmed comes undone at its 30 s window's end, and another, a reboot inside its window, at the boot; the VM rebooted into its recovery system, what it listens on and its accounts' password state recorded in the log, not judged; `vm destroy` removes it all
+STOWAGE_VM_ENV=<file> make e2e-full-vm   # build, ship examples/full's this month's release with its OS bundle and qcow2 disk to zot, carry it through the TLS mirror as e2e-vm does, then the published at-stow's `vm create --create opentofu` boots a real VM on TrueNAS whose first boot installs it with the search extension's input set (`--set SEARCH_URL=http://api:9090`, the api standing in for a search service); through the VM's front over HTTPS, the api answers with the organisation, the administrator the provision hook registered and the search URL reached; the console and ingest serve, and an event reaches the api; the api reads the front's local CA (publish_ca), which the api route's certificate chains to; the hook's credentials file is 0600, the api mounts the app socket's directory read-only; the ops route refuses everyone until a re-run's `--client-ca`, then takes a certificate that CA issued with its login (`basic_auth`, a wrong password refused) alone; the echo L4 routes' service runs on the host's network; the project's kernel modules: `tcp_diag` loaded at boot, `pcspkr` blocked (modprobe refuses it), `overlay` given its option, and `tune` reporting each as `ok`; `vm destroy` removes it all (upgrade, rollback and the health gate's fallback are e2e-vm's)
 ```
 
 `bash docs/demo/record.sh` records `docs/img/install.gif`, the installer recording at the top of
@@ -3798,7 +3932,9 @@ locally, in `make gate`, not on GitHub. A second job, which runs none of the rep
 signs `SHA256SUMS` keyless with cosign (`SHA256SUMS.sigstore.json`; the certificate names the
 workflow and the tag, and the signature is recorded in Sigstore's public transparency log), attests
 the binary's build provenance when the repository is public (GitHub's attestations need a public
-repository), and publishes the GitHub release `Stowage <x.y.z>` with `stowage-linux-amd64`,
+repository), and publishes the GitHub release `Stowage <x.y.z>` with `stowage-linux-amd64`, its
+SBOM `stowage-linux-amd64.spdx.json` (SPDX, made by the build job with the syft every release's
+SBOMs are made with, its Go modules Stowage's dependencies; in `SHA256SUMS`, so signed with it),
 `SHA256SUMS`, its signature and the tag's CHANGELOG.md entry as its notes. It creates the release
 as a draft and replaces a draft's notes and assets, so a failed run is run again as it is; a
 release already published is refused, never changed. One run per tag at a time. The check that the

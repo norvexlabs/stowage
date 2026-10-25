@@ -76,7 +76,7 @@ vm_cleanup
 "$CTL" vm create --no-input --platform truenas --create opentofu --hostname "$H" --user ops --ssh-key "$KEY.pub" \
 	--tls internal --domains console=console.atlas.test,api=api.atlas.test,ingest=ingest.atlas.test,ops=ops.atlas.test \
 	--set ADMIN_EMAIL=admin@atlas.test --set ORG_NAME=Atlas --set SUPPORT_EMAIL=support@atlas.test --set SEARCH_URL=http://api:9090 \
-	--pool "$POOL" --dataset "$DATASET" --bridge "$BRIDGE" --cpus 2 --memory 4096 --disk 32 --host "$ADDR" --wait "${E2E_VM_WAIT:-45m}" \
+	--pool "$POOL" --dataset "$DATASET" --bridge "$BRIDGE" --cpus 2 --memory 4096 --disk 20 --host "$ADDR" --wait "${E2E_VM_WAIT:-45m}" \
 	--registry "$SITE" --registry-ca "$MIRROR_CA" \
 	>"$WORK/vm-create.txt" 2>"$WORK/vm-create.log" || { tail -80 "$WORK/vm-create.log"; fail "vm create"; }
 grep -q "fetching atlas's qcow2 disk of v$V1" "$WORK/vm-create.log" || { tail -30 "$WORK/vm-create.log"; fail "vm create did not boot $V1's disk"; }
@@ -136,6 +136,16 @@ step "on the VM: the echo L4 routes' service runs on the host's network"
 echo_id=$(on_vm sudo docker ps -q --filter label=com.docker.compose.service=echo)
 [[ -n $echo_id && $(on_vm sudo docker inspect --format "'{{.HostConfig.NetworkMode}}'" "$echo_id") == host ]] ||
 	fail "the echo L4 routes' service is not on the host's network"
+
+step "on the VM: the project's kernel modules (shapes.kairos.modules)"
+on_vm test -d /sys/module/tcp_diag || fail "tcp_diag is not loaded at boot"
+on_vm '! test -d /sys/module/pcspkr' || fail "pcspkr is loaded, though blocked"
+on_vm '! sudo modprobe pcspkr' 2>/dev/null || fail "modprobe loads pcspkr, though blocked"
+[[ $(on_vm cat /sys/module/overlay/parameters/redirect_always_follow) == Y ]] || fail "overlay lacks its option"
+on_vm at-stow tune >"$WORK/tune.txt" 2>&1 || true
+for m in tcp_diag pcspkr "overlay redirect_always_follow"; do
+	grep -qE "^ok +module $m " "$WORK/tune.txt" || { cat "$WORK/tune.txt"; fail "tune does not report module $m as asked"; }
+done
 
 step "vm destroy: the VM, its disk and its uploads go, and its state"
 "$CTL" vm destroy "$H" --yes >"$WORK/vm-destroy.txt" 2>"$WORK/vm-destroy.log" || { tail -50 "$WORK/vm-destroy.log"; fail "vm destroy"; }

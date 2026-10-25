@@ -1050,6 +1050,10 @@ func TestADockerInstallBacksUpThroughItsOwnDaemon(t *testing.T) {
 	if !strings.Contains(fmt.Sprint(host.calls()), "systemctl enable --now "+unit+".timer") {
 		t.Errorf("ran %v", host.calls())
 	}
+	// No app socket on Docker: a config without the operator's digest is the operator's.
+	if err := os.Remove(BackupRcloneFile(d.O.Dir)); err != nil {
+		t.Fatal(err)
+	}
 	h := d.Handler()
 	call(t, h, "POST", "/v1/backup", nil, nil)
 	if j := waitJob(t, h); j.State != "done" || len(f.objects) != 2 {
@@ -1413,6 +1417,86 @@ func TestTheRcloneConfigIsTheOperators(t *testing.T) {
 	}
 	if j := verifyJob(t, app, nil); j.State != "done" {
 		t.Errorf("the app verifying the saved settings, locked: %+v", j)
+	}
+}
+
+// A saved rclone config whose digest is not the one the operator's last save kept (saved before
+// the digest was, maybe by an app) is never run, on any path that runs rclone, until the operator
+// saves one again.
+func TestAnRcloneConfigNotKnownToBeTheOperatorsIsNotRun(t *testing.T) {
+	t.Parallel()
+	_, d, f, key := backupVM(t)
+	h, app := d.Handler(), d.routes(true)
+	if s := configure(t, d, validConfig(key)); s.RcloneConfigFrom != rcloneOperator {
+		t.Fatalf("the operator's save: %+v", s)
+	}
+	if j := verifyJob(t, h, nil); j.State != "done" {
+		t.Fatalf("the operator's config: %+v", j)
+	}
+	// As a release that kept no digest left it.
+	if err := os.Remove(BackupRcloneFile(d.O.Dir)); err != nil {
+		t.Fatal(err)
+	}
+	var st BackupStatus
+	if call(t, h, "GET", "/v1/backup/status", nil, &st); st.Settings.RcloneConfigFrom != rcloneUnknown || !st.Settings.RcloneConfigSet {
+		t.Errorf("status: %+v", st.Settings)
+	}
+	var s BackupSettings
+	if call(t, app, "GET", "/v1/backup/config", nil, &s); s.RcloneConfigFrom != rcloneUnknown {
+		t.Errorf("the app's settings: %+v", s)
+	}
+	var out bytes.Buffer
+	printBackupSettings(&out, d.R.Ctl(), s)
+	if !strings.Contains(out.String(), "not run until saved over SSH") {
+		t.Errorf("printed %s", out.String())
+	}
+	before := len(f.calls())
+	const refused = "not known to be the operator's"
+	call(t, h, "POST", "/v1/backup", nil, nil)
+	if j := waitJob(t, h); j.State != "failed" || !strings.Contains(j.Error, refused) {
+		t.Errorf("a backup: %+v", j)
+	}
+	if j := verifyJob(t, h, nil); j.State != "failed" || !strings.Contains(j.Error, refused) {
+		t.Errorf("verify of the saved settings: %+v", j)
+	}
+	if j := verifyJob(t, app, BackupConfigRequest{Destination: ptr("store:elsewhere")}); j.State != "failed" || !strings.Contains(j.Error, refused) {
+		t.Errorf("the app verifying a destination in it: %+v", j)
+	}
+	var e errOf
+	if code := call(t, h, "GET", "/v1/backup/list", nil, &e); code != 409 || !strings.Contains(e.Error, refused) {
+		t.Errorf("list: %d %s", code, e.Error)
+	}
+	if n := len(f.calls()); n != before {
+		t.Errorf("rclone ran: %v", f.calls()[before:])
+	}
+	// The operator trying one without saving it runs it; saving another field keeps the doubt.
+	if j := verifyJob(t, h, validConfig(key)); j.State != "done" {
+		t.Errorf("the operator's proposed config: %+v", j)
+	}
+	if s := configure(t, d, BackupConfigRequest{RetentionDays: ptr(3)}); s.RcloneConfigFrom != rcloneUnknown {
+		t.Errorf("another setting saved: %+v", s)
+	}
+	// The digest kept, the config edited on disk.
+	configure(t, d, validConfig(key))
+	raw, _ := os.ReadFile(BackupFile(d.O.Dir))
+	if err := os.WriteFile(BackupFile(d.O.Dir), bytes.Replace(raw, []byte("hush"), []byte("other"), 1), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if call(t, h, "GET", "/v1/backup/status", nil, &st); st.Settings.RcloneConfigFrom != rcloneUnknown {
+		t.Errorf("edited on disk: %+v", st.Settings)
+	}
+	if s := configure(t, d, validConfig(key)); s.RcloneConfigFrom != rcloneOperator {
+		t.Errorf("saved again: %+v", s)
+	}
+	call(t, h, "POST", "/v1/backup", nil, nil)
+	if j := waitJob(t, h); j.State != "done" {
+		t.Errorf("a backup, saved again: %+v", j)
+	}
+	if code := call(t, h, "DELETE", "/v1/backup/config", nil, nil); code != 200 {
+		t.Fatalf("remove: %d", code)
+	}
+	if _, err := os.Stat(BackupRcloneFile(d.O.Dir)); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("the digest kept after a remove: %v", err)
 	}
 }
 

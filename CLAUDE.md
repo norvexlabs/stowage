@@ -130,8 +130,8 @@ a self-review against the code it describes is enough. Every other commit clears
    e2e-vm` too (a real VM on TrueNAS, an upgrade of it through a TLS mirror, `reset-db`, `rollback`, a failed health gate's fallback, a backup and the network override's revert, ~85 min; the file is the user's, its path given at run time,
    never written in the tree); it runs beside the parallel suites in one chain with `e2e-kairos` and
    `e2e-full-vm`, one at a time, as they make disks with auroraboot, which races for loop devices. A change to `examples/full`'s kairos
-   shape (its `stowage.yaml`'s `kairos`, `base`, `kairos_init`, `disk_formats`, `cloud_publish`,
-   `health_gate` or `host_api` lines — not an input's or a route's `shapes:`, as the VM runs the Docker
+   shape (its `stowage.yaml`'s `shapes.kairos` block, compared whole: any of its keys, a module's
+   entry included — not an input's or a route's `shapes:`, as the VM runs the Docker
    shape's install, which the short suites prove; the same test picks e2e-kairos for `examples/minimal`), `test/e2e-full-vm.sh` or `test/vm.sh` runs `STOWAGE_VM_ENV=<file> make
    e2e-full-vm` (`examples/full` on a real VM: install from a mirror, the hook, the app socket, the
    published CA; upgrade, rollback and the VM machinery itself are e2e-vm's), in that chain. Each must
@@ -139,7 +139,11 @@ a self-review against the code it describes is enough. Every other commit clears
    runs exactly these, and also: the VM's creation, verbs and health gate (`vmcreate*.go`,
    `vmcli*.go`, `vmhealth*.go`) run e2e-vm; a test script runs its own suite (`test/lib.sh`,
    `pins.sh`, `sweep.sh`: e2e, e2e-docker, e2e-full, e2e-stateless, e2e-k8s, e2e-full-k8s); `go.mod`/`go.sum`
-   run every suite but e2e-full-vm;
+   run every suite but e2e-full-vm; `internal/sbom` (the SBOMs, the scanner, the audits) runs
+   e2e, the lifecycle suites (e2e-docker, e2e-full, e2e-stateless, e2e-k8s, e2e-full-k8s),
+   e2e-kairos and e2e-vm; `internal/tune` the lifecycle suites and e2e-vm, its `modules.go`
+   e2e-full-vm alone; `internal/install/audit.go` smoke-install, the lifecycle suites and the VM's
+   (e2e-kairos, e2e-vm);
    `Dockerfile`/`Makefile` the suites but e2e-kairos, e2e-vm and e2e-full-vm; a `_test.go` file none (`make
    check` runs it), but `smoke_test.go` runs smoke-install.
 2. **Docs in sync**: README.md, docs/DESIGN.md, CLAUDE.md describe what the tree does. Before

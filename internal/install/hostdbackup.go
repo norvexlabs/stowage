@@ -6,6 +6,8 @@ import (
 	"cmp"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -70,6 +72,9 @@ type BackupConfig struct {
 	// Destination is where backups go: an rclone remote of RcloneConfig, and a path in it.
 	Destination  string `yaml:"destination"`
 	RcloneConfig string `yaml:"rclone_config"`
+	// operator: RcloneConfig is the one the request being served gives (only the operator's
+	// socket takes one). A saved config is the operator's when its digest is BackupRcloneFile's.
+	operator bool
 	// Recipients are the age public keys a backup is encrypted to: any one's private key
 	// decrypts it.
 	Recipients []string `yaml:"recipients"`
@@ -85,13 +90,16 @@ type BackupConfig struct {
 // BackupSettings is what GET /v1/backup/config answers: the settings, the rclone config's secrets
 // left out.
 type BackupSettings struct {
-	Configured      bool     `json:"configured"`
-	Destination     string   `json:"destination,omitempty"`
-	RcloneConfigSet bool     `json:"rclone_config_set"`
-	Recipients      []string `json:"recipients"`
-	RetentionDays   int      `json:"retention_days"`
-	Schedule        string   `json:"schedule"`
-	Profile         string   `json:"profile"`
+	Configured      bool   `json:"configured"`
+	Destination     string `json:"destination,omitempty"`
+	RcloneConfigSet bool   `json:"rclone_config_set"`
+	// RcloneConfigFrom: operator (saved over the operator's socket), or unknown (never run until
+	// the operator saves one).
+	RcloneConfigFrom string   `json:"rclone_config_from,omitempty"`
+	Recipients       []string `json:"recipients"`
+	RetentionDays    int      `json:"retention_days"`
+	Schedule         string   `json:"schedule"`
+	Profile          string   `json:"profile"`
 	// Locked: the settings are the operator's; the app socket may not change them.
 	Locked bool `json:"locked"`
 	// Profiles are the ones the release declares.
@@ -156,6 +164,18 @@ func BackupLastFile(dir string) string { return filepath.Join(dir, "backup-last.
 // BackupLockFile marks the backup settings locked against the app socket. It is no part of the
 // settings: removing them keeps it.
 func BackupLockFile(dir string) string { return filepath.Join(dir, "backup-settings.lock") }
+
+// BackupRcloneFile holds the SHA-256 of the last rclone config the operator saved. rclone runs the
+// programs its config names, as root: on the VM, a saved config whose digest is not this one (one
+// an app saved through its socket before that was refused, or saved before the digest was kept)
+// is never run. It is no part of the settings, which an older release decodes strictly.
+func BackupRcloneFile(dir string) string { return filepath.Join(dir, "backup-rclone.sha256") }
+
+// rcloneOperator and rcloneUnknown are BackupSettings.RcloneConfigFrom's values.
+const (
+	rcloneOperator = "operator"
+	rcloneUnknown  = "unknown"
+)
 
 // remoteName is an rclone remote's name: a section of its config.
 var remoteName = regexp.MustCompile(`^[A-Za-z0-9_+@][A-Za-z0-9_.+@ -]{0,63}$`)
@@ -272,13 +292,34 @@ func rcloneRemotes(conf string) []string {
 }
 
 // backupSettings is what GET /v1/backup/config shows of c (nil: none).
-func backupSettings(c *BackupConfig, pg *providers.PgAgeRclone, locked bool) BackupSettings {
+func backupSettings(c *BackupConfig, pg *providers.PgAgeRclone, locked bool, from string) BackupSettings {
 	s := BackupSettings{Recipients: []string{}, RetentionDays: defaultRetentionDays, Schedule: defaultBackupSchedule, Profile: pg.Default, Profiles: sortedKeys(pg.Profiles), Locked: locked}
 	if c != nil {
-		s = BackupSettings{Configured: true, Destination: c.Destination, RcloneConfigSet: c.RcloneConfig != "", Recipients: c.Recipients,
+		s = BackupSettings{Configured: true, Destination: c.Destination, RcloneConfigSet: c.RcloneConfig != "", RcloneConfigFrom: from, Recipients: c.Recipients,
 			RetentionDays: c.RetentionDays, Schedule: c.Schedule, Profile: c.Profile, Profiles: s.Profiles, Locked: locked}
 	}
 	return s
+}
+
+// rcloneFrom says who saved c's rclone config: the operator, when the request gives it or its
+// digest is the one the operator's last save kept; on Docker always, as it has no app socket.
+func (h *Hostd) rcloneFrom(c *BackupConfig) string {
+	switch {
+	case c == nil || c.RcloneConfig == "":
+		return ""
+	case c.operator || h.Docker:
+		return rcloneOperator
+	}
+	raw, err := os.ReadFile(BackupRcloneFile(h.O.Dir))
+	if err == nil && strings.TrimSpace(string(raw)) == rcloneDigest(c.RcloneConfig) {
+		return rcloneOperator
+	}
+	return rcloneUnknown
+}
+
+func rcloneDigest(conf string) string {
+	sum := sha256.Sum256([]byte(conf))
+	return hex.EncodeToString(sum[:])
 }
 
 // settingsLocked is whether the operator locked the settings (BackupLockFile): a lock it
@@ -320,7 +361,7 @@ func (h *Hostd) backupConfig(w http.ResponseWriter, r *http.Request) {
 		replyErr(w, err)
 		return
 	}
-	reply(w, http.StatusOK, backupSettings(c, pg, h.settingsLocked()))
+	reply(w, http.StatusOK, backupSettings(c, pg, h.settingsLocked(), h.rcloneFrom(c)))
 }
 
 func (h *Hostd) setBackupConfig(w http.ResponseWriter, r *http.Request) {
@@ -364,7 +405,7 @@ func (h *Hostd) setBackupConfig(w http.ResponseWriter, r *http.Request) {
 			replyErr(w, err)
 			return
 		}
-		reply(w, http.StatusOK, backupSettings(cur, pg, *req.Lock))
+		reply(w, http.StatusOK, backupSettings(cur, pg, *req.Lock, h.rcloneFrom(cur)))
 		return
 	}
 	if _, err := validBackup(c, pg); err != nil {
@@ -381,6 +422,14 @@ func (h *Hostd) setBackupConfig(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		locked = true
+	}
+	// The digest is written before the settings: a save cut between them leaves a config whose
+	// digest is not the one kept, which is never run.
+	if c.operator {
+		if err := writeAtomic(BackupRcloneFile(h.O.Dir), strings.NewReader(rcloneDigest(c.RcloneConfig)+"\n"), 0o600, nil); err != nil {
+			replyErr(w, err)
+			return
+		}
 	}
 	if err := h.writeBackup(c); err != nil {
 		replyErr(w, err)
@@ -403,7 +452,7 @@ func (h *Hostd) setBackupConfig(w http.ResponseWriter, r *http.Request) {
 		}
 		locked = false
 	}
-	reply(w, http.StatusOK, backupSettings(&c, pg, locked))
+	reply(w, http.StatusOK, backupSettings(&c, pg, locked, h.rcloneFrom(&c)))
 }
 
 // mergeBackup is the settings req makes of cur (nil: none yet, the defaults): a field req leaves
@@ -417,7 +466,7 @@ func mergeBackup(cur *BackupConfig, req BackupConfigRequest, pg *providers.PgAge
 		c.Destination = *req.Destination
 	}
 	if req.RcloneConfig != nil {
-		c.RcloneConfig = *req.RcloneConfig
+		c.RcloneConfig, c.operator = *req.RcloneConfig, true
 	}
 	if len(req.Recipients) > 0 {
 		c.Recipients = req.Recipients
@@ -465,15 +514,17 @@ func (h *Hostd) removeBackupConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	h.backupMu.Lock()
 	defer h.backupMu.Unlock()
-	if err := os.Remove(BackupFile(h.O.Dir)); err != nil && !errors.Is(err, os.ErrNotExist) {
-		replyErr(w, err)
-		return
+	for _, path := range []string{BackupFile(h.O.Dir), BackupRcloneFile(h.O.Dir)} {
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			replyErr(w, err)
+			return
+		}
 	}
 	if err := h.applySchedule(r.Context(), nil); err != nil {
 		replyErr(w, err)
 		return
 	}
-	reply(w, http.StatusOK, backupSettings(nil, pg, h.settingsLocked()))
+	reply(w, http.StatusOK, backupSettings(nil, pg, h.settingsLocked(), ""))
 }
 
 // checkSchedule asks systemd whether s is a calendar event it reads.
@@ -1142,6 +1193,9 @@ func pgQuote(s string) string { return `"` + strings.ReplaceAll(s, `"`, `""`) + 
 
 // rcloneConf writes c's rclone config where the runner mounts it, root's alone; done removes it.
 func (h *Hostd) rcloneConf(c BackupConfig) (string, func(), error) {
+	if h.rcloneFrom(&c) != rcloneOperator {
+		return "", nil, fail(http.StatusConflict, "the saved rclone config is not known to be the operator's (it may have been saved through the app socket, and rclone runs the programs it names as root): it is not run until the operator saves one over SSH, `%s backup config --rclone-config FILE`", h.R.Ctl())
+	}
 	dir, err := os.MkdirTemp(cmp.Or(h.Run, os.TempDir()), "backup-")
 	if err != nil {
 		return "", nil, err
@@ -1431,7 +1485,7 @@ func (h *Hostd) backupStatus(w http.ResponseWriter, r *http.Request) {
 		replyErr(w, err)
 		return
 	}
-	st := BackupStatus{Settings: backupSettings(c, pg, h.settingsLocked())}
+	st := BackupStatus{Settings: backupSettings(c, pg, h.settingsLocked(), h.rcloneFrom(c))}
 	if out, err := h.Host.Run(r.Context(), Cmd{Args: []string{"systemctl", "show", "--property", "NextElapseUSecRealtime", "--value", h.backupTimer()}}); err == nil {
 		if next := strings.TrimSpace(string(out)); next != "" && next != "n/a" {
 			st.Next = next

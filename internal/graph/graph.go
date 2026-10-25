@@ -11,6 +11,7 @@
 package graph
 
 import (
+	"cmp"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -32,6 +33,7 @@ import (
 	"github.com/norvexlabs/stowage/internal/providers"
 	"github.com/norvexlabs/stowage/internal/registry"
 	"github.com/norvexlabs/stowage/internal/release"
+	"github.com/norvexlabs/stowage/internal/sbom"
 	"github.com/norvexlabs/stowage/internal/spec"
 )
 
@@ -64,6 +66,10 @@ const FrontID = KindImage + "/" + front.Key
 // (backup.Dockerfile) for a release whose VM runs backups (providers.RunsBackups), published as the image
 // backup.Key.
 const BackupID = KindImage + "/" + backup.Key
+
+// AuditID is the node of the vulnerability scanner a signing release carries (sbom.Grype),
+// published as the image sbom.Key.
+const AuditID = KindImage + "/" + sbom.Key
 
 // ChownID is the node of the helper that gives data volumes their uid, which Stowage builds from
 // its own recipe (chown.Dockerfile) for a release whose installs give one (providers.OwnsVolumes),
@@ -114,6 +120,9 @@ type Release struct {
 	Installer []byte
 	// Pull is the pull account baked into the installer ("" when the project has none).
 	Pull string
+	// Scanner is the vulnerability scanner a signing release carries, pinned by digest: sbom.Grype
+	// when empty.
+	Scanner string
 }
 
 // Build computes the graph of p for a release. The installer image is the installer executable
@@ -177,6 +186,9 @@ func Build(p *project.Project, r Release) (*Graph, error) {
 	}
 	if providers.OwnsVolumes(s) {
 		stowageImages = append(stowageImages, chownNode())
+	}
+	if s.Signs() {
+		stowageImages = append(stowageImages, auditNode(cmp.Or(r.Scanner, sbom.Grype)))
 	}
 	for _, n := range stowageImages {
 		g.Nodes = append(g.Nodes, n)
@@ -246,7 +258,7 @@ func Build(p *project.Project, r Release) (*Graph, error) {
 		b.Field("base", k.Base)
 		b.Field("kairos_init", k.KairosInit)
 		b.Field("recipe", bundleRecipe())
-		b.Field("images", images)
+		b.Field("images", images) // its <short>-stow names them all, the scanner's included
 		// Its <short>-stow: the installer executable with the release as the bundle carries it.
 		bundleView, err := json.Marshal(s.BundleView())
 		if err != nil {
@@ -323,6 +335,15 @@ func backupNode() Node {
 	b.Field("platform", platform)
 	b.Field("recipe", string(recipe))
 	return Node{ID: BackupID, Kind: KindImage, Inputs: b.Sum(), Recipe: recipe}
+}
+
+// auditNode is the scanner (grype), pinned at ref: a signing release mirrors it, so an install
+// audits the SBOMs it carries with its own release's scanner, wherever it pulls from.
+func auditNode(ref string) Node {
+	b := digest.New(KindImage)
+	b.Field("name", sbom.Key)
+	b.Field("ref", ref)
+	return Node{ID: AuditID, Kind: KindImage, Inputs: b.Sum(), Pinned: ref}
 }
 
 // chownNode is the helper that gives data volumes their uid: like the front, its inputs are the

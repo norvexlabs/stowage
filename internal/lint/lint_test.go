@@ -186,7 +186,7 @@ func TestEachRuleFiresOnFull(t *testing.T) {
 		{"vm size negative cpus", []edit{{sp, vmSizeLine, "size: { min: { cpus: -1 } }"}}, nil, "cpus: -1: at least 1"},
 		{"vm size small memory", []edit{{sp, vmSizeLine, "size: { min: { memory: 1023M } }"}}, nil, "shapes.kairos.size.min.memory: 1023M: whole MiB, at least 1G"},
 		{"vm size partial MiB", []edit{{sp, vmSizeLine, "size: { min: { memory: 2097153K } }"}}, nil, "shapes.kairos.size.min.memory: 2097153K: whole MiB"},
-		{"vm size small disk", []edit{{sp, vmSizeLine, "size: { recommended: { disk: 15G } }"}}, nil, "shapes.kairos.size.recommended.disk: 15G: whole GiB, at least 16G"},
+		{"vm size small disk", []edit{{sp, vmSizeLine, "size: { recommended: { disk: 3G } }"}}, nil, "shapes.kairos.size.recommended.disk: 3G: whole GiB, at least 4G"},
 		{"vm size partial GiB", []edit{{sp, vmSizeLine, "size: { recommended: { disk: 16385M } }"}}, nil, "shapes.kairos.size.recommended.disk: 16385M: whole GiB"},
 		{"vm size min over recommended cpus", []edit{{sp, vmSizeLine, "size: { min: { cpus: 4 }, recommended: { cpus: 3 } }"}}, nil, "shapes.kairos.size.recommended.cpus: 3: under the minimum 4"},
 		{"vm size min over recommended memory", []edit{{sp, vmSizeLine, "size: { min: { memory: 8G }, recommended: { memory: 8191M } }"}}, nil, "shapes.kairos.size.recommended.memory: 8191M: under the minimum 8G"},
@@ -394,6 +394,15 @@ func TestEachRuleFiresOnFull(t *testing.T) {
 		{"cloud", []edit{{sp, "cloud_publish: [aws, azure, gcp]", "cloud_publish: [ovh]"}}, nil, "unknown cloud"},
 		{"host api service", []edit{{sp, "host_api: [api]", "host_api: [admin]"}}, nil, `shapes.kairos.host_api: service "admin" is not in`},
 		{"host api twice", []edit{{sp, "host_api: [api]", "host_api: [api, api]"}}, nil, `service "api" is named twice`},
+		{"module name", []edit{{sp, "      pcspkr: {", "      pc-spkr: {"}}, nil, "shapes.kairos.modules.pc-spkr: not a kernel module's name"},
+		{"module loaded and blocked", []edit{{sp, "pcspkr: { block: true,", "pcspkr: { block: true, load: true,"}}, nil, "shapes.kairos.modules.pcspkr: is both loaded and blocked"},
+		{"module blocked with options", []edit{{sp, "pcspkr: { block: true,", "pcspkr: { block: true, options: { x: \"1\" },"}}, nil, "shapes.kairos.modules.pcspkr.options: a blocked module takes no options"},
+		{"module says nothing", []edit{{sp, "tcp_diag: { load: true,", "tcp_diag: {"}}, nil, "shapes.kairos.modules.tcp_diag: says nothing"},
+		{"module without a reason", []edit{{sp, "reason: a VM has no speaker", "reason: \" \""}}, nil, "shapes.kairos.modules.pcspkr.reason: is required"},
+		{"module reason on two lines", []edit{{sp, "reason: a VM has no speaker", "reason: \"a VM\\nhas no speaker\""}}, nil, "shapes.kairos.modules.pcspkr.reason: one line"},
+		{"module option name", []edit{{sp, "redirect_always_follow: \"Y\"", "redirect-always-follow: \"Y\""}}, nil, `shapes.kairos.modules.overlay.options: "redirect-always-follow" is not a module parameter's name`},
+		{"module option value", []edit{{sp, "redirect_always_follow: \"Y\"", "redirect_always_follow: \"Y N\""}}, nil, `shapes.kairos.modules.overlay.options.redirect_always_follow: "Y N": letters`},
+		{"module key unknown", []edit{{sp, "pcspkr: { block: true,", "pcspkr: { blocked: true,"}}, nil, "field blocked not found"},
 		{"health gate", []edit{{sp, "poll_s: 30 }", "poll_s: 900 }"}}, nil, "poll_s < deadline_s"},
 		{"lock not semver", nil, map[string]string{"stowage.lock": "stowage: one\n"}, "stowage: version \"one\" is not MAJOR.MINOR.PATCH"},
 		{"lock unknown key", nil, map[string]string{"stowage.lock": "stowage: 1.0.0\nruntimes: {}\n"}, "runtimes"},
@@ -902,7 +911,7 @@ func TestPublishedPortOnDockerWarns(t *testing.T) {
 func TestL4AllowlistWithoutKairosWarns(t *testing.T) {
 	t.Parallel()
 	root := testutil.CopyExample(t, "full")
-	testutil.Edit(t, root, specFile, "  kairos:\n    base: ubuntu:26.04@sha256:c098726dd9b9733f3e885f8de0ef375206a311b0a317eadc40d347b1115fb944\n    kairos_init: quay.io/kairos/kairos-init:v4.4.0-rc2@sha256:ac885c9f3002a3f0e7000947e3d1e2a5c95f5e2d0212d5f9bbd663347f1ebe0c\n    disk_formats: [raw, qcow2, ova, vhd, gce]\n    cloud_publish: [aws, azure, gcp]\n    health_gate: { deadline_s: 600, deadline_after_reset_s: 1800, poll_s: 30 }\n    host_api: [api]\n    "+vmSizeLine+"   # vm create's least and default size\n", "")
+	testutil.Edit(t, root, specFile, "  kairos:\n    base: ubuntu:26.04@sha256:c098726dd9b9733f3e885f8de0ef375206a311b0a317eadc40d347b1115fb944\n    kairos_init: quay.io/kairos/kairos-init:v4.4.0-rc2@sha256:ac885c9f3002a3f0e7000947e3d1e2a5c95f5e2d0212d5f9bbd663347f1ebe0c\n    disk_formats: [raw, qcow2, ova, vhd, gce]\n    cloud_publish: [aws, azure, gcp]\n    health_gate: { deadline_s: 600, deadline_after_reset_s: 1800, poll_s: 30 }\n    host_api: [api]\n    "+vmSizeLine+"   # vm create's least and default size\n"+modulesBlock, "")
 	res := run(t, root)
 	if errs := errorsOf(res); len(errs) > 0 {
 		t.Fatalf("errors:\n%s", strings.Join(errs, "\n"))
@@ -1208,6 +1217,12 @@ const memShares = "shares: { postgres: { percent: 25, max: 16G }, api: 10 }"
 
 // vmSizeLine is examples/full's shapes.kairos.size.
 const vmSizeLine = "size: { min: { cpus: 2, memory: 2G, disk: 20G }, recommended: { cpus: 4, memory: 8G, disk: 40G } }"
+
+// modulesBlock is examples/full's shapes.kairos.modules, as the spec writes it.
+const modulesBlock = "    modules:                                                   # the OS bundle's modprobe files; tune reports what differs\n" +
+	"      tcp_diag: { load: true, reason: \"ss -ti reads the TCP sockets' details\" }\n" +
+	"      pcspkr: { block: true, reason: a VM has no speaker }\n" +
+	"      overlay: { options: { redirect_always_follow: \"Y\" }, reason: \"Docker's storage: the kernel's default, stated\" }\n"
 
 // stack.memory's shares at their bounds are clean: 1 % and 90 % each, 90 % together (the errors
 // past them are TestEachRuleFiresOnFull's).

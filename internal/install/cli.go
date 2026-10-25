@@ -361,6 +361,7 @@ func newCommand(r *Release, self string, stdout, stderr io.Writer, tools K8sOpti
 		root.AddCommand(vmCreateCommand(in, &o, prepare, terminal, &sets, &domains, &answers, &noInput, &accessible))
 	}
 	root.AddCommand(mirrorCommand(in, &o, prepare))
+	root.AddCommand(auditCommand(in, &o, prepare, dirFlag, stdout), sbomCommand(in, &o, prepare, dirFlag, stdout))
 	root.AddCommand(tuneCommand(in, prepare, terminal, false))
 	root.AddCommand(dockerHostCommands(in, prepare, dirFlag, stdout, stderr, terminal)...)
 	if r.Spec.Shapes.Kubernetes != nil && r.Spec.Hooks.Provision != nil {
@@ -832,7 +833,7 @@ func vmCreateCommand(in *Installer, o *Options, prepare func() error, terminal f
 	f.StringVar(&c.Bridge, "bridge", "", "OpenTofu on TrueNAS: the bridge or interface the VM's network attaches to")
 	f.IntVar(&c.CPUs, "cpus", 0, "OpenTofu: the VM's CPUs (default: the release's recommended size, else 2; at least its minimum)")
 	f.IntVar(&c.MemoryMiB, "memory", 0, "OpenTofu: the VM's memory in MiB (default: the release's recommended size, else 4096; at least its minimum and 1024)")
-	f.IntVar(&c.DiskGiB, "disk", 0, "OpenTofu: the VM's disk in GiB (default: the release's recommended size, else 40; at least its minimum and 16)")
+	f.IntVar(&c.DiskGiB, "disk", 0, "OpenTofu: the app's space on the VM's disk in GiB, to which vm create adds what Kairos takes (default: the release's recommended size, else 20; at least its minimum and 4)")
 	f.StringVar(&c.Host, "host", "", "OpenTofu: the name or address the VM answers at once booted (default: --address's, else the host name)")
 	f.DurationVar(&c.Wait, "wait", 0, "OpenTofu: how long to wait for the VM to answer over SSH and install (default 20m)")
 

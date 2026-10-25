@@ -36,7 +36,7 @@ func (p *Publisher) installerRepo() string {
 
 // Graph computes the release's build graph with what this publisher's installer carries.
 func (p *Publisher) Graph(v string, revision int, channel string) (*graph.Graph, error) {
-	r := graph.Release{Version: v, Revision: revision, Channel: channel, Installer: p.Installer}
+	r := graph.Release{Version: v, Revision: revision, Channel: channel, Installer: p.Installer, Scanner: p.Scanner}
 	if a := p.Pull; a != nil {
 		r.Pull = a.User + ":" + a.Password
 	}
@@ -241,6 +241,9 @@ func (p *Publisher) publishInstaller(ctx context.Context, img v1.Image, tag stri
 		}
 	}
 	if err := p.ensureSigned(ctx, d); err != nil {
+		return "", fmt.Errorf("installer: %w", err)
+	}
+	if err := p.ensureSBOM(ctx, d); err != nil {
 		return "", fmt.Errorf("installer: %w", err)
 	}
 	t, err := p.Registry.Tag(p.installerRepo(), tag)

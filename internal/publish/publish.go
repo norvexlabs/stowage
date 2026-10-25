@@ -64,7 +64,12 @@ type Publisher struct {
 	Builder                       Builder
 	// Signer signs and checks every image and release manifest when the project configures
 	// signing; it is required then.
-	Signer         Signer
+	Signer Signer
+	// SBOM makes an image's SBOM, which a signing project attests on every image, the installer and
+	// the OS bundle; it is required then.
+	SBOM SBOMMaker
+	// Scanner is the vulnerability scanner a signing release carries, pinned: sbom.Grype when empty.
+	Scanner        string
 	StowageVersion string
 	// Installer is the installer executable every release's installer image is made of; Pull is
 	// the pull account baked into it (nil when registry.pull is not a token).
@@ -186,6 +191,70 @@ func (p *Publisher) ensureSigned(ctx context.Context, d name.Digest) error {
 		return fmt.Errorf("signed %s, and the signature does not verify (is the signing key's public half in signing.public_keys?): %w", d, err)
 	}
 	p.logf("signed %s", d)
+	return nil
+}
+
+// ensureDiskSBOM attests on the disk d the SBOM of the bundle it is made of, unless a trusted key
+// already has: a disk holds the bundle's software, so its SBOM is the bundle's, read back attested.
+func (p *Publisher) ensureDiskSBOM(ctx context.Context, d, bundle name.Digest) error {
+	if !p.signed() {
+		return nil
+	}
+	_, err := p.Signer.Attestation(ctx, d)
+	if err == nil {
+		return nil
+	}
+	if !errors.Is(err, ErrNoAttestation) {
+		return err
+	}
+	doc, err := p.Signer.Attestation(ctx, bundle)
+	if err != nil {
+		return fmt.Errorf("the SBOM of the bundle %s, for its disk: %w", bundle, err)
+	}
+	if err := p.Signer.Attest(ctx, d, doc); err != nil {
+		return fmt.Errorf("attest the SBOM of %s: %w", d, err)
+	}
+	if _, err := p.Signer.Attestation(ctx, d); err != nil {
+		return fmt.Errorf("attested the SBOM of %s, and the attestation does not read back by a trusted key: %w", d, err)
+	}
+	p.logf("attested the SBOM of %s (its bundle's)", d)
+	return nil
+}
+
+// SBOMMaker makes an image's SBOM (SPDX JSON) from the registry.
+type SBOMMaker interface {
+	SBOM(ctx context.Context, d name.Digest) ([]byte, error)
+}
+
+// ensureSBOM attests d's SBOM unless a trusted key already has, so a re-ship makes none, then
+// checks the attestation reads back with a trusted key. A signing project's images, installer
+// and OS bundle each carry one; the SBOM of a digest never changes, so a later syft makes no new
+// one.
+func (p *Publisher) ensureSBOM(ctx context.Context, d name.Digest) error {
+	if !p.signed() {
+		return nil
+	}
+	if p.Signer == nil || p.SBOM == nil {
+		return errors.New("signing is configured and no signer or SBOM maker is set: refusing to publish an image without its SBOM")
+	}
+	_, err := p.Signer.Attestation(ctx, d)
+	if err == nil {
+		return nil
+	}
+	if !errors.Is(err, ErrNoAttestation) {
+		return err
+	}
+	doc, err := p.SBOM.SBOM(ctx, d)
+	if err != nil {
+		return fmt.Errorf("the SBOM of %s: %w", d, err)
+	}
+	if err := p.Signer.Attest(ctx, d, doc); err != nil {
+		return fmt.Errorf("attest the SBOM of %s: %w", d, err)
+	}
+	if _, err := p.Signer.Attestation(ctx, d); err != nil {
+		return fmt.Errorf("attested the SBOM of %s, and the attestation does not read back by a trusted key: %w", d, err)
+	}
+	p.logf("attested the SBOM of %s", d)
 	return nil
 }
 
@@ -443,6 +512,9 @@ func (p *Publisher) Ship(ctx context.Context, o ShipOptions) (*Ref, error) {
 		}
 		manifests[pl.image], configs[pl.image] = pm.String(), pc.String()
 		if err := p.ensureSigned(ctx, d); err != nil {
+			return nil, fmt.Errorf("image %s: %w", pl.image, err)
+		}
+		if err := p.ensureSBOM(ctx, d); err != nil {
 			return nil, fmt.Errorf("image %s: %w", pl.image, err)
 		}
 	}

@@ -3,6 +3,42 @@
 Stowage's own releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
+## [0.14.0]
+
+### Added
+- **SBOMs, signed, exported and audited**: a project that signs gives each image of a release,
+  its installer, its OS bundle and each disk an SPDX SBOM, attested with the release key beside
+  the signatures (`cosign verify-attestation --type spdxjson` reads it), and carries a pinned
+  vulnerability scanner (grype) as the release's `audit` image. `stowage sbom export` and
+  `<short>-stow sbom export DIR` write the verified SBOMs as files for the operator's own tools;
+  `stowage audit` and `<short>-stow audit` scan them, printing the vulnerabilities by severity,
+  `--json`, failing at `--fail-on`, with grype's database fetched or given offline (`--db`). Both
+  run on the operator's machine, by version (`--version`, `--registry` for a mirror), never on
+  the VM; a mirror carries the SBOMs and the scanner. `audit` is a reserved image key. Stowage's
+  own release carries its binary's SBOM, in its signed checksums.
+- **Kernel modules a project declares**: `shapes.kairos.modules` names kernel modules, each with
+  its reason, to load at boot, to block (neither a dependency nor udev loads it) or to give
+  options. The OS bundle carries them from its first boot, its build fails when one does not fit
+  its kernel, `lint` checks them, and `tune` reports a module that is not as asked: on the VM as
+  a difference, on a Docker host, whose kernel is its operator's, as advice.
+
+### Changed
+- **A VM's disk is the app's space and Kairos's**: `vm create --disk` and `shapes.kairos.size`'s
+  `disk` are the app's space (default 20 GiB, at least 4); `vm create` adds what Kairos takes,
+  which each disk records, and says both (`a 43 GiB disk (the OS 23 GiB, the app 20 GiB)`). The
+  state partition is sized from the OS bundle rather than auroraboot's default, which left a
+  large bundle's VM with next to no persistent space (1.5 GB on a 32 GB disk). Disks published by
+  an earlier Stowage are refused: ship a new revision with its disks.
+
+### Security
+- **An rclone config is run only when the operator saved it**: on the VM, the host daemon keeps
+  the digest of each rclone config the operator saves, and a saved config without it — saved
+  before this release, perhaps by an app through its socket under 0.12, or edited on disk — is
+  never run: backups, `verify`, `list` and `restore` fail and say why, and `backup status` and the
+  app's settings show it as not known to be the operator's, until the operator saves one over SSH.
+  An install upgraded to this release saves its rclone config again
+  (`backup config --rclone-config FILE`) to keep its backups running.
+
 ## [0.13.0] - 2026-10-25
 
 ### Added

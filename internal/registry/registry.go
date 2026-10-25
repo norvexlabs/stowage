@@ -34,6 +34,9 @@ const InputsAnnotation = "dev.stowage.inputs"
 // EmptyMediaType is the OCI empty descriptor's media type, used as an artifact's config.
 const EmptyMediaType types.MediaType = "application/vnd.oci.empty.v1+json"
 
+// ErrTooLarge is a blob refused for its size, before it is read.
+var ErrTooLarge = errors.New("larger than the read allows")
+
 // MaxArtifactBlob caps the one blob an artifact read here may hold.
 const MaxArtifactBlob = 4 << 20
 
@@ -600,6 +603,12 @@ func (c *Client) PutManifest(ctx context.Context, repo name.Repository, m Manife
 // GetArtifact reads an artifact of type want. It returns nil when ref does not exist or is a tag
 // holding the retired artifact, and an error when ref holds anything else.
 func (c *Client) GetArtifact(ctx context.Context, ref name.Reference, want types.MediaType) (*Artifact, v1.Hash, error) {
+	return c.GetArtifactMax(ctx, ref, want, maxArtifactBlob)
+}
+
+// GetArtifactMax is GetArtifact with its blob capped at limit bytes rather than MaxArtifactBlob:
+// an attestation's document runs larger than a signature.
+func (c *Client) GetArtifactMax(ctx context.Context, ref name.Reference, want types.MediaType, limit int64) (*Artifact, v1.Hash, error) {
 	d, err := c.Get(ctx, ref)
 	if err != nil || d == nil {
 		return nil, v1.Hash{}, err
@@ -624,7 +633,7 @@ func (c *Client) GetArtifact(ctx context.Context, ref name.Reference, want types
 	if m.ArtifactType != want || len(m.Layers) != 1 || m.Layers[0].MediaType != want {
 		return nil, v1.Hash{}, fmt.Errorf("%s is not a %s artifact: %w", ref, want, ErrNotArtifact)
 	}
-	data, err := c.readLayer(ctx, ref, m.Layers[0], maxArtifactBlob)
+	data, err := c.readLayer(ctx, ref, m.Layers[0], limit)
 	if err != nil {
 		return nil, v1.Hash{}, err
 	}
@@ -635,7 +644,7 @@ func (c *Client) GetArtifact(ctx context.Context, ref name.Reference, want types
 // than max, and checks it is the size and digest the descriptor gives.
 func (c *Client) readLayer(ctx context.Context, ref name.Reference, l v1.Descriptor, max int64) ([]byte, error) {
 	if l.Size > max {
-		return nil, fmt.Errorf("%s: blob of %d bytes exceeds %d", ref, l.Size, max)
+		return nil, fmt.Errorf("%s: blob of %d bytes exceeds %d: %w", ref, l.Size, max, ErrTooLarge)
 	}
 	rl, err := remote.Layer(ref.Context().Digest(l.Digest.String()), c.opts(ctx)...)
 	if err != nil {

@@ -36,6 +36,7 @@ import (
 	"github.com/norvexlabs/stowage/internal/project"
 	"github.com/norvexlabs/stowage/internal/registry"
 	"github.com/norvexlabs/stowage/internal/release"
+	"github.com/norvexlabs/stowage/internal/sbom"
 	"github.com/norvexlabs/stowage/internal/testutil"
 )
 
@@ -74,6 +75,9 @@ func (f *fakeBuilder) names() []string {
 	return out
 }
 
+// fakeOSMiB is what the fake disks say Kairos takes of a disk.
+const fakeOSMiB = 23000
+
 // fakeDisks writes a small file per format, different for each bundle, and records what it made.
 type fakeDisks struct {
 	dir      string // a test's temporary directory
@@ -81,33 +85,38 @@ type fakeDisks struct {
 	requests []kairos.DiskRequest
 	left     []string // the files other than the compressed ones at cleanup
 	fail     bool
+	noOS     bool // the builder measures nothing of what Kairos takes
 }
 
-func (f *fakeDisks) Build(_ context.Context, r kairos.DiskRequest) (map[string]string, func(), error) {
+func (f *fakeDisks) Build(_ context.Context, r kairos.DiskRequest) (kairos.Disks, func(), error) {
 	if f.fail {
-		return nil, func() {}, errors.New("auroraboot failed")
+		return kairos.Disks{}, func() {}, errors.New("auroraboot failed")
 	}
 	f.made, f.requests = append(f.made, r.Formats), append(f.requests, r)
 	// As auroraboot, the bundle is read from the source with the request's account.
 	ref, err := name.NewDigest(r.Source)
 	if err != nil {
-		return nil, nil, err
+		return kairos.Disks{}, nil, err
 	}
 	if _, err := remote.Head(ref, remote.WithAuth(authn.FromConfig(r.Auth))); err != nil {
-		return nil, nil, fmt.Errorf("read the bundle: %w", err)
+		return kairos.Disks{}, nil, fmt.Errorf("read the bundle: %w", err)
 	}
 	dir, err := os.MkdirTemp(f.dir, "disks-")
 	if err != nil {
-		return nil, nil, err
+		return kairos.Disks{}, nil, err
 	}
 	out := map[string]string{}
 	for _, fm := range r.Formats {
 		out[fm] = filepath.Join(dir, r.Base+"."+kairos.Ext[fm])
 		if err := os.WriteFile(out[fm], []byte(fm+" of "+ref.DigestStr()), 0o600); err != nil {
-			return nil, nil, err
+			return kairos.Disks{}, nil, err
 		}
 	}
-	return out, func() {
+	osMiB := int64(fakeOSMiB)
+	if f.noOS {
+		osMiB = 0
+	}
+	return kairos.Disks{Files: out, OSMiB: osMiB}, func() {
 		// What ship left of the disks it made, when it is done with them.
 		entries, _ := os.ReadDir(dir)
 		for _, e := range entries {
@@ -164,6 +173,7 @@ type env struct {
 	root    string
 	host    string
 	reg     *registry.Client
+	scanner string // the scanner image a signing release mirrors
 	builder *fakeBuilder
 	log     *bytes.Buffer
 	now     time.Time
@@ -204,6 +214,39 @@ type fakeSigner struct {
 	// downOn makes checks of the digests containing it fail the same way.
 	downOn string
 	onSign func(d name.Digest) // runs before a signature is recorded
+	// atts are the SBOMs attested, by digest reference; sboms counts those made.
+	atts          map[string][]byte
+	sboms, attest int
+}
+
+func (f *fakeSigner) SBOM(_ context.Context, d name.Digest) ([]byte, error) {
+	f.sboms++
+	return []byte(`{"spdxVersion":"SPDX-2.3","name":"` + d.String() + `"}`), nil
+}
+
+func (f *fakeSigner) Attest(_ context.Context, d name.Digest, doc []byte) error {
+	if f.fail {
+		return errors.New("key unavailable")
+	}
+	if f.atts == nil {
+		f.atts = map[string][]byte{}
+	}
+	if !f.untrusted {
+		f.atts[d.String()] = doc
+	}
+	f.attest++
+	return nil
+}
+
+func (f *fakeSigner) Attestation(_ context.Context, d name.Digest) ([]byte, error) {
+	if f.down || (f.downOn != "" && strings.Contains(d.String(), f.downOn)) {
+		return nil, errors.New("registry unreachable")
+	}
+	doc, ok := f.atts[d.String()]
+	if !ok {
+		return nil, fmt.Errorf("%s: %w", d, ErrNoAttestation)
+	}
+	return doc, nil
 }
 
 func (f *fakeSigner) Sign(_ context.Context, d name.Digest) error {
@@ -323,6 +366,17 @@ func newEnv(t *testing.T) *env {
 	}
 	d, _ := up.Digest()
 	testutil.SetYAML(t, root, "stowage.yaml", []string{"images", "postgres"}, map[string]any{"ref": host + "/upstream/postgres@" + d.String()})
+	// The scanner a signing release mirrors, in place of grype's.
+	scan, err := amd64Image(64, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scanTag, _ := name.NewTag(host + "/upstream/grype:1")
+	if err := remote.Write(scanTag, scan); err != nil {
+		t.Fatal(err)
+	}
+	sd, _ := scan.Digest()
+	e.scanner = host + "/upstream/grype@" + sd.String()
 	e.root, e.host, e.reg, e.builder, e.log = root, host, registry.New(authn.NewMultiKeychain()) /* no keychain: never the host's Docker login */, &fakeBuilder{}, &bytes.Buffer{}
 	e.disks = &fakeDisks{dir: t.TempDir()}
 	e.now = time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC)
@@ -339,10 +393,10 @@ func (e *env) publisher() (*Publisher, string) {
 	if err != nil {
 		e.t.Fatal(err)
 	}
-	pub := &Publisher{Project: p, Registry: e.reg, Upstream: e.reg, Builder: e.builder, StowageVersion: "0.1.0",
+	pub := &Publisher{Project: p, Registry: e.reg, Upstream: e.reg, Builder: e.builder, StowageVersion: "0.1.0", Scanner: e.scanner,
 		Installer: e.installer, Pull: e.pull, Disks: e.disks, WorkDir: e.t.TempDir(), Anonymous: e.anon, Now: func() time.Time { return e.now }, Log: e.log}
 	if e.signer != nil {
-		pub.Signer = e.signer
+		pub.Signer, pub.SBOM = e.signer, e.signer
 	}
 	if e.cloud != nil {
 		pub.Cloud, pub.CloudVars = e.cloud, e.cloudVars
@@ -1121,14 +1175,14 @@ func TestASignedProjectSignsEveryArtifactBeforeItsTagMoves(t *testing.T) {
 	eq(t, "manifest signed", e.signedRef("notes-release", r.Digest.String()), true)
 	eq(t, "os bundle signed", e.signedRef("notes-os", r.Manifest.Artifacts.OS), true)
 	eq(t, "disk signed", e.signedRef("notes-disk", r.Manifest.Artifacts.Disks["qcow2"]), true)
-	eq(t, "signatures", e.signer.signs, 12) // and the channel's disk set record
+	eq(t, "signatures", e.signer.signs, 13) // the scanner's, and the channel's disk set record
 
 	e.mustShip("stable", 1)
-	eq(t, "a re-ship signs nothing", e.signer.signs, 12)
+	eq(t, "a re-ship signs nothing", e.signer.signs, 13)
 	e.signer.onSign = nil
 	delete(e.signer.sigs, e.host+"/acme/notes/notes-release@"+r.Digest.String())
 	eq(t, "a lost signature is made again", e.mustShip("stable", 1).Digest, r.Digest)
-	eq(t, "signatures", e.signer.signs, 13)
+	eq(t, "signatures", e.signer.signs, 14)
 	p, _ := e.publisher()
 	if _, err := p.Verify(context.Background(), "stable", "", 1); err != nil {
 		t.Fatal(err)
@@ -1152,6 +1206,115 @@ func TestASignedProjectSignsEveryArtifactBeforeItsTagMoves(t *testing.T) {
 	// The chart carries the trusted keys.
 	keys := chartValues(t, e.chartAt("stable", "0.1.0")).PublicKeys
 	eq(t, "public keys", len(keys) == 1 && keys[0] == readFile(t, e.root+"/keys/release.pub"), true)
+}
+
+// A signing project attests the SBOM of every image, the installer and the OS bundle, once: a
+// re-ship makes none, a lost one is made again; the chart, the disks and the release manifest
+// carry none.
+func TestASignedProjectAttestsEachImagesSBOM(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	e.sign()
+	r := e.mustShip("stable", 1)
+	ref := func(repo, d string) string { return e.host + "/acme/notes/" + repo + "@" + d }
+	want := map[string]bool{ref("notes-installer", r.Manifest.Artifacts.Installer): true, ref("notes-os", r.Manifest.Artifacts.OS): true}
+	for img, d := range r.Manifest.Artifacts.Images {
+		want[ref("notes-"+img, d)] = true
+	}
+	for d := range want {
+		if doc := e.signer.atts[d]; !strings.Contains(string(doc), d) {
+			t.Errorf("%s: SBOM %q", d, doc)
+		}
+	}
+	// Each disk carries its bundle's SBOM, which no scan makes again.
+	osDoc := e.signer.atts[ref("notes-os", r.Manifest.Artifacts.OS)]
+	for f, d := range r.Manifest.Artifacts.Disks {
+		if doc := e.signer.atts[ref("notes-disk", d)]; string(doc) != string(osDoc) {
+			t.Errorf("disk %s: SBOM %q, not its bundle's", f, doc)
+		}
+	}
+	eq(t, "attested", len(e.signer.atts), len(want)+len(r.Manifest.Artifacts.Disks))
+	// The bundle preloads the stack's images, not the scanner, which an operator runs off the VM.
+	eq(t, "the scanner preloaded", strings.Contains(e.log.String(), "os bundle: preload audit\n"), false)
+	eq(t, "web preloaded", strings.Contains(e.log.String(), "os bundle: preload web\n"), true)
+	eq(t, "SBOMs made", e.signer.sboms, len(want))
+	e.mustShip("stable", 1)
+	eq(t, "a re-ship makes none", e.signer.sboms, len(want))
+	web := ref("notes-web", r.Manifest.Artifacts.Images["web"])
+	delete(e.signer.atts, web)
+	e.mustShip("stable", 1)
+	eq(t, "a lost SBOM is made again", e.signer.atts[web] != nil, true)
+	eq(t, "SBOMs made", e.signer.sboms, len(want)+1)
+	e.signer.downOn = "notes-web@"
+	delete(e.signer.atts, web)
+	if _, err := e.ship("stable", 1); err == nil || !strings.Contains(err.Error(), "registry unreachable") {
+		t.Fatalf("a check that cannot tell: %v", err)
+	}
+}
+
+// An audit scans the SBOM of every artifact that carries one; an artifact whose SBOM is gone is
+// reported as not audited, never left out; a project that does not sign has none to audit.
+func TestAuditScansEachAttestedSBOM(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	e.sign()
+	r := e.mustShip("stable", 1)
+	var scanned []string
+	docker := func(_ context.Context, stdout io.Writer, args ...string) error {
+		if a := strings.Join(args, " "); strings.Contains(a, " sbom:") {
+			scanned = append(scanned, a)
+		}
+		_, err := io.WriteString(stdout, `{"matches":[{"vulnerability":{"id":"CVE-1","severity":"High"},"artifact":{"name":"zlib","version":"1","type":"apk"}}],"descriptor":{"db":{"status":{"built":"b"}}}}`)
+		return err
+	}
+	p, _ := e.publisher()
+	s := sbom.Scanner{Docker: docker, Image: "grype", Cache: t.TempDir()}
+	rep, err := p.Audit(context.Background(), "stable", "", 1, s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := len(r.Manifest.Artifacts.Images) + 2 + len(r.Manifest.Artifacts.Disks)
+	eq(t, "subjects", len(rep.Subjects), want)
+	eq(t, "scanned (a disk's SBOM is its bundle's: scanned once)", len(scanned), want-len(r.Manifest.Artifacts.Disks))
+	eq(t, "the release", rep.Tag, r.Manifest.Tag)
+	eq(t, "the database's build", rep.DBBuilt, "b")
+	out := t.TempDir()
+	idx, err := p.ExportSBOMs(context.Background(), "stable", "", 1, out)
+	if err != nil || len(idx.Artifacts) != want {
+		t.Fatalf("export: %v %+v", err, idx)
+	}
+	if raw, err := os.ReadFile(filepath.Join(out, "installer.spdx.json")); err != nil || !strings.Contains(string(raw), r.Manifest.Artifacts.Installer) {
+		t.Errorf("the installer's SBOM: %s %v", raw, err)
+	}
+	if err := rep.Verdict(sbom.High, true); err == nil {
+		t.Error("a high finding passed --fail-on high")
+	}
+	if err := rep.Verdict(sbom.Critical, true); err != nil {
+		t.Errorf("--fail-on critical: %v", err)
+	}
+	delete(e.signer.atts, e.host+"/acme/notes/notes-os@"+r.Manifest.Artifacts.OS)
+	rep, err = p.Audit(context.Background(), "stable", "", 1, s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var bundle *sbom.Subject
+	for i := range rep.Subjects {
+		if rep.Subjects[i].Name == "os" {
+			bundle = &rep.Subjects[i]
+		}
+	}
+	if bundle == nil || !strings.Contains(bundle.Error, "attestation by a trusted key") {
+		t.Errorf("the OS bundle without its SBOM: %+v", bundle)
+	}
+	if err := rep.Verdict(sbom.Critical, false); err == nil || !strings.Contains(err.Error(), "not audited: os") {
+		t.Errorf("verdict: %v", err)
+	}
+	u := newEnv(t)
+	u.mustShip("stable", 1)
+	up, _ := u.publisher()
+	if _, err := up.Audit(context.Background(), "stable", "", 1, s); err == nil || !strings.Contains(err.Error(), "signs no release") {
+		t.Errorf("an unsigned project: %v", err)
+	}
 }
 
 func TestASigningFailureMovesNoTag(t *testing.T) {

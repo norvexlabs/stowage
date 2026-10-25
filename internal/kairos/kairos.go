@@ -14,6 +14,9 @@ import (
 	"sort"
 	"strings"
 	"text/template"
+	"unicode"
+
+	"github.com/norvexlabs/stowage/internal/spec"
 )
 
 //go:embed Dockerfile.tmpl
@@ -31,6 +34,9 @@ type Params struct {
 	Base, KairosInit string
 	// OSVersion is the version the OS image carries: the release's version, without its channel.
 	OSVersion string
+	// Modules are shapes.kairos.modules: the bundle's modprobe and modules-load files, and the
+	// build's checks of them.
+	Modules map[string]spec.KernelModule
 }
 
 // placeholder in a file's path is replaced by the project's name.
@@ -102,6 +108,17 @@ func (p Params) check() error {
 	if p.Name == "" || p.Ctl == "" {
 		return fmt.Errorf("kairos: the project's name and its installer's are required (%q, %q)", p.Name, p.Ctl)
 	}
+	// What lint checks, again: the modules are written into the build's shell and modprobe's files.
+	for name, m := range p.Modules {
+		if !spec.ModuleName.MatchString(name) || strings.ContainsFunc(m.Reason, unicode.IsControl) {
+			return fmt.Errorf("shapes.kairos.modules.%s: not a module's name, or a reason of more than one line (`stowage lint`)", name)
+		}
+		for o, v := range m.Options {
+			if !spec.ModuleOption.MatchString(o) || !spec.ModuleValue.MatchString(v) {
+				return fmt.Errorf("shapes.kairos.modules.%s.options: %q=%q (`stowage lint`)", name, o, v)
+			}
+		}
+	}
 	return nil
 }
 
@@ -128,7 +145,9 @@ func BundleRecipe() string {
 		return err
 	})
 	sort.Strings(names)
-	kv := []string{"Dockerfile", dockerfile}
+	// The bundle records its unpacked size (publish's RootfsAnnotation), which its disks need: a
+	// bundle built before it did is rebuilt.
+	kv := []string{"Dockerfile", dockerfile, "records", "rootfs-mib"}
 	for _, n := range names {
 		raw, _ := files.ReadFile(n)
 		kv = append(kv, n, fmt.Sprintf("%o:%s", mode(n), raw))
@@ -139,8 +158,8 @@ func BundleRecipe() string {
 // DiskRecipe is a digest of what the disk images are made with: the pinned auroraboot, the
 // qemu-img image's recipe and the OVA descriptor.
 func DiskRecipe() string {
-	return sum("auroraboot", Auroraboot, "flags", strings.Join(auroraFlags, " "), "disktools", disktools, "ovf", ovf,
-		"qcow2", qcow2Cmd, "ova", ovaScript, "vhd", vhdScript, "gce", gceScript, "ova-bytes", fmt.Sprint(OVADiskBytes), "ustar", fmt.Sprint(ustarLimit))
+	return sum("auroraboot", Auroraboot, "flags", strings.Join(auroraFlags, " "), "sizing", sizing, "disktools", disktools, "ovf", ovf,
+		"qcow2", qcow2Cmd, "ova", ovaScript, "vhd", vhdScript, "gce", gceScript, "ustar", fmt.Sprint(ustarLimit))
 }
 
 func sum(kv ...string) string {

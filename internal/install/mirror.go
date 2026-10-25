@@ -25,6 +25,7 @@ import (
 	"github.com/norvexlabs/stowage/internal/providers"
 	"github.com/norvexlabs/stowage/internal/registry"
 	"github.com/norvexlabs/stowage/internal/release"
+	"github.com/norvexlabs/stowage/internal/sbom"
 )
 
 // RegistryCAFile is the install's copy of the CA its registry's certificate chains to (a mirror's
@@ -354,7 +355,7 @@ func (in *Installer) MirrorImport(ctx context.Context, file, prefix string, olde
 	// The release's own repositories, and no other project's: its images are the ones this
 	// installer's project names (an image another release adds needs that release's installer).
 	ours := map[string]bool{name + "-release": true, name + "-installer": true, name + "-os": true, name + "-disk": true}
-	known := map[string]bool{front.Key: true, backup.Key: true, chown.Key: true}
+	known := map[string]bool{front.Key: true, backup.Key: true, chown.Key: true, sbom.Key: true}
 	for _, k := range in.R.Spec.ImageNames() {
 		known[k] = true
 	}

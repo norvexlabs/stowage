@@ -2,6 +2,7 @@ package kairos
 
 import (
 	"archive/tar"
+	"cmp"
 	"compress/gzip"
 	"context"
 	_ "embed"
@@ -10,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"os"
 	"os/exec"
@@ -70,6 +72,54 @@ var ustarMax int64 = ustarLimit
 // gceUnit is the size Google Cloud's disk.raw is a whole number of (gceScript's %1G); tests lower it.
 var gceUnit int64 = 1 << 30
 
+// The partitions a disk's first boot lays out besides the persistent one: auroraboot's recovery
+// partition (its image and a transition one during a recovery upgrade), sized by auroraboot from
+// the bundle as it measures it (by walking its files, which no tar sum reproduces), and the state
+// partition this build sizes itself — auroraboot's default, three times the recovery partition,
+// leaves a large image's persistent partition nothing: the active, passive and upgrade-transition
+// systems, each an image the size of the recovery one, plus a quarter for later releases to grow.
+// A release that outgrows it cannot upgrade a VM made before it.
+const (
+	imageExtraMiB    = 200 // an image of the system: the bundle and this
+	stateGrowth      = 4   // the state partition holds three images and a quarter more: 3 * 5/4
+	stateExtraMiB    = 100
+	recoveryExtraMiB = 150 // auroraboot's recovery partition: two images and this
+	estimateNum      = 3   // the first estimate of an image: the bundle's unpacked size * 3/2
+	estimateDen      = 2
+)
+
+// sizingVersion is the partitions' sizing, for the disks' recipe: raised by a change to how a disk
+// is sized that its terms below do not show (a formula, a rounding), so the disks are made again.
+const sizingVersion = 1
+
+// sizing is the partitions' sizing, for the disks' recipe: a change to a term, the version, or a
+// formula's values makes new disks.
+var sizing = fmt.Sprint(sizingVersion, imageExtraMiB, stateGrowth, stateExtraMiB, recoveryExtraMiB, estimateNum, estimateDen, ovaAppMiB, int64(OVADiskBytes),
+	stateFor(1), stateFor(10000), StateMiB(1), StateMiB(10000), imageOf(1000), imageOf(10001), OVACapacityMiB(1), OVACapacityMiB(1<<20))
+
+// imageOf is the system image a recovery partition of recoveryMiB holds two of, rounded up.
+func imageOf(recoveryMiB int64) int64 { return (recoveryMiB - recoveryExtraMiB + 1) / 2 }
+
+// stateFor is the state partition holding three system images of imageMiB, and a quarter more.
+func stateFor(imageMiB int64) int64 {
+	return (3*imageMiB*(stateGrowth+1)+stateGrowth-1)/stateGrowth + stateExtraMiB
+}
+
+// StateMiB is the state partition first given for a bundle of rootfsMiB unpacked: its image
+// estimated larger than the bundle (auroraboot's measure of it runs larger than the tar's), the
+// disk made again once with the size its recovery image calls for if that is larger.
+func StateMiB(rootfsMiB int64) int64 {
+	return stateFor(rootfsMiB*estimateNum/estimateDen + imageExtraMiB)
+}
+
+// ovaAppMiB is the least the app gets of an OVA's disk, beyond Kairos's partitions: the capacity
+// grows past OVADiskBytes for a bundle that would leave less.
+const ovaAppMiB = 8 << 10
+
+// OVACapacityMiB is the capacity an OVA's disk declares, Kairos taking osMiB of it: OVADiskBytes,
+// or Kairos's partitions and ovaAppMiB beyond them when that is more. No platform shrinks it.
+func OVACapacityMiB(osMiB int64) int64 { return max(int64(OVADiskBytes)>>20, osMiB+ovaAppMiB) }
+
 // OVADiskBytes is the capacity of the OVA's disk: VMware and VirtualBox do not grow an imported
 // disk, so it is declared large and sparse; the persistent partition grows into it at first boot.
 const OVADiskBytes = 64 << 30
@@ -83,6 +133,121 @@ type DiskRequest struct {
 	Formats          []string
 	// Base names the files: <Base>.<ext>.
 	Base string
+	// RootfsMiB is the bundle's unpacked size, which sizes the state partition (StateMiB).
+	RootfsMiB int64
+}
+
+// Disks are the disks a build made: each format's file, and the MiB Kairos takes of a disk a VM
+// boots one on besides the persistent partition (the raw disk's partitions and the state one).
+type Disks struct {
+	Files map[string]string
+	OSMiB int64
+}
+
+// recoveryName is the recovery partition's name in a Kairos disk's GPT.
+const recoveryName = "recovery"
+
+// rawLayout reads a raw disk's GPT: its recovery partition (the one named so: another is never
+// taken for it), and the disk's own size, both in MiB rounded up.
+func rawLayout(path string) (recoveryMiB, diskMiB int64, err error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil {
+		return 0, 0, err
+	}
+	hdr := make([]byte, 512)
+	if _, err := f.ReadAt(hdr, 512); err != nil {
+		return 0, 0, fmt.Errorf("%s: its GPT header: %w", path, err)
+	}
+	if string(hdr[:8]) != "EFI PART" {
+		return 0, 0, fmt.Errorf("%s: no GPT (no \"EFI PART\" at LBA 1)", path)
+	}
+	// The header's CRC32 is of its own size's bytes, the CRC field zeroed.
+	hsize := binary.LittleEndian.Uint32(hdr[12:])
+	if hsize < 92 || hsize > 512 {
+		return 0, 0, fmt.Errorf("%s: a GPT header of %d bytes", path, hsize)
+	}
+	sum := binary.LittleEndian.Uint32(hdr[16:])
+	clear(hdr[16:20])
+	if crc32.ChecksumIEEE(hdr[:hsize]) != sum {
+		return 0, 0, fmt.Errorf("%s: its GPT header's CRC32 is not its content's", path)
+	}
+	sectors := uint64(st.Size() / 512)
+	lba, n, size := binary.LittleEndian.Uint64(hdr[72:]), int64(binary.LittleEndian.Uint32(hdr[80:])), int64(binary.LittleEndian.Uint32(hdr[84:]))
+	if n <= 0 || n > 1024 || size < 128 || size > 4096 || size%8 != 0 {
+		return 0, 0, fmt.Errorf("%s: a GPT of %d entries of %d bytes", path, n, size)
+	}
+	table := uint64((n*size + 511) / 512) // the entries' sectors, primary and backup alike
+	if lba < 2 || lba >= sectors || table > sectors-lba {
+		return 0, 0, fmt.Errorf("%s: its GPT's entries at LBA %d, not within its %d sectors", path, lba, sectors)
+	}
+	// The partitions lie between the header's first and last usable LBAs: after the primary
+	// entries, before the backup ones and the backup header at the disk's end.
+	usable0, usable1 := binary.LittleEndian.Uint64(hdr[40:]), binary.LittleEndian.Uint64(hdr[48:])
+	if usable0 < lba+table || usable1 < usable0 || usable1 >= sectors || table+1 >= sectors-usable1 {
+		return 0, 0, fmt.Errorf("%s: its GPT's usable LBAs %d to %d, not between its entries and the backup GPT of its %d sectors", path, usable0, usable1, sectors)
+	}
+	entries := make([]byte, n*size)
+	if _, err := f.ReadAt(entries, int64(lba)*512); err != nil {
+		return 0, 0, fmt.Errorf("%s: the GPT's entries: %w", path, err)
+	}
+	if crc32.ChecksumIEEE(entries) != binary.LittleEndian.Uint32(hdr[88:]) {
+		return 0, 0, fmt.Errorf("%s: its GPT entries' CRC32 is not the header's", path)
+	}
+	var named int64
+	for i := int64(0); i < n; i++ {
+		e := entries[i*size:]
+		first, last := binary.LittleEndian.Uint64(e[32:]), binary.LittleEndian.Uint64(e[40:])
+		// An entry of a zero type GUID is unused, whatever else it holds.
+		if allZero(e[:16]) || gptName(e[56:128]) != recoveryName {
+			continue
+		}
+		if named != 0 {
+			return 0, 0, fmt.Errorf("%s: two partitions named %s in its GPT", path, recoveryName)
+		}
+		// Within the usable LBAs: a partition over the GPT or past it is no layout to size from.
+		if first < usable0 || last < first || last > usable1 {
+			return 0, 0, fmt.Errorf("%s: its recovery partition, LBA %d to %d, is not within its usable LBAs %d to %d", path, first, last, usable0, usable1)
+		}
+		named = int64(last-first+1) * 512
+	}
+	mib := func(b int64) int64 { return (b + 1<<20 - 1) >> 20 }
+	if named == 0 {
+		return 0, 0, fmt.Errorf("%s: no partition named %s in its GPT", path, recoveryName)
+	}
+	if mib(named) <= recoveryExtraMiB {
+		return 0, 0, fmt.Errorf("%s: a recovery partition of %d MiB holds no system image", path, mib(named))
+	}
+	return mib(named), mib(st.Size()), nil
+}
+
+// gptName is a GPT entry's name: UTF-16LE, NUL-padded; a name with a code unit past ASCII is ""
+// (a Kairos label is ASCII, and no other name stands for one).
+func gptName(b []byte) string {
+	var s []byte
+	for i := 0; i+1 < len(b); i += 2 {
+		if b[i] == 0 && b[i+1] == 0 {
+			break
+		}
+		if b[i+1] != 0 || b[i] >= 0x80 {
+			return ""
+		}
+		s = append(s, b[i])
+	}
+	return string(s)
+}
+
+func allZero(b []byte) bool {
+	for _, c := range b {
+		if c != 0 {
+			return false
+		}
+	}
+	return true
 }
 
 // DiskBuilder makes disk images with Docker: auroraboot (privileged, on the host's network so a
@@ -111,16 +276,16 @@ func (b *DiskBuilder) docker(ctx context.Context, args ...string) error {
 
 // Build makes r's disks and returns each format's file. The cleanup function removes them, and is
 // always safe to call.
-func (b *DiskBuilder) Build(ctx context.Context, r DiskRequest) (map[string]string, func(), error) {
+func (b *DiskBuilder) Build(ctx context.Context, r DiskRequest) (Disks, func(), error) {
 	if err := os.MkdirAll(b.WorkDir, 0o700); err != nil {
-		return nil, nil, err
+		return Disks{}, nil, err
 	}
 	if err := OnDisk(b.WorkDir); err != nil {
-		return nil, nil, err
+		return Disks{}, nil, err
 	}
 	dir, err := os.MkdirTemp(b.WorkDir, "disks-")
 	if err != nil {
-		return nil, nil, err
+		return Disks{}, nil, err
 	}
 	// auroraboot and qemu-img write as root: their files are handed back before they are removed.
 	cleanup := func() {
@@ -129,101 +294,126 @@ func (b *DiskBuilder) Build(ctx context.Context, r DiskRequest) (map[string]stri
 			_ = os.RemoveAll(dir)
 		}
 	}
-	out, err := b.build(ctx, dir, r)
+	files, osMiB, err := b.build(ctx, dir, r)
 	if err != nil {
 		cleanup()
-		return nil, func() {}, err
+		return Disks{}, func() {}, err
 	}
-	return out, cleanup, nil
+	return Disks{Files: files, OSMiB: osMiB}, cleanup, nil
 }
 
-func (b *DiskBuilder) build(ctx context.Context, dir string, r DiskRequest) (map[string]string, error) {
+func (b *DiskBuilder) build(ctx context.Context, dir string, r DiskRequest) (map[string]string, int64, error) {
 	// Base lands in qemu-img's shell command line.
 	if !safeBase.MatchString(r.Base) {
-		return nil, fmt.Errorf("disk name %q: only letters, digits, '.', '_' and '-'", r.Base)
+		return nil, 0, fmt.Errorf("disk name %q: only letters, digits, '.', '_' and '-'", r.Base)
 	}
 	for _, f := range r.Formats {
 		if !slices.Contains(spec.DiskFormats, f) {
-			return nil, fmt.Errorf("unknown disk format %q", f)
+			return nil, 0, fmt.Errorf("unknown disk format %q", f)
 		}
+	}
+	if r.RootfsMiB <= 0 {
+		return nil, 0, errors.New("disks: the bundle's size is unknown")
 	}
 	want := func(f string) bool { return slices.Contains(r.Formats, f) }
 	config := filepath.Join(dir, "docker-config.json")
 	if err := writeDockerConfig(config, r.Registry, r.Auth); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	outDir := filepath.Join(dir, "out")
 	if err := os.Mkdir(outDir, 0o700); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	out := map[string]string{}
 	file := func(f string) string { return filepath.Join(outDir, r.Base+"."+Ext[f]) }
 	// Every format is made from the raw disk.
-	if err := b.auroraboot(ctx, dir, config, r.Source, "disk.efi", ".raw", file("raw")); err != nil {
-		return nil, err
+	state := StateMiB(r.RootfsMiB)
+	if err := b.auroraboot(ctx, dir, config, r.Source, state, "disk.efi", ".raw", file("raw")); err != nil {
+		return nil, 0, err
 	}
+	// The recovery partition auroraboot made says the size of a system image: a state partition
+	// under three of them, and their quarter, is made again once with that size.
+	recovery, rawMiB, err := rawLayout(file("raw"))
+	if err != nil {
+		return nil, 0, err
+	}
+	if need := stateFor(imageOf(recovery)); need > state {
+		fmt.Fprintf(cmp.Or[io.Writer](b.Stderr, io.Discard), "disks: the state partition of %d MiB holds no three system images of this bundle: made again with %d MiB\n", state, need)
+		state = need
+		if err := os.Remove(file("raw")); err != nil {
+			return nil, 0, err
+		}
+		if err := b.auroraboot(ctx, dir, config, r.Source, state, "disk.efi", ".raw", file("raw")); err != nil {
+			return nil, 0, err
+		}
+		// The second run's recovery partition, measured again, must hold to it: no third run.
+		if recovery, rawMiB, err = rawLayout(file("raw")); err != nil {
+			return nil, 0, err
+		}
+		if need := stateFor(imageOf(recovery)); need > state {
+			return nil, 0, fmt.Errorf("disks: auroraboot made the recovery partition larger again (%d MiB): the state partition of %d MiB holds no three system images of it", recovery, state)
+		}
+	}
+	osMiB := rawMiB + state
 	out["raw"] = file("raw")
 	if slices.ContainsFunc(r.Formats, func(f string) bool { return f != "raw" }) {
 		if err := b.disktools(ctx, dir); err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 	}
 	if want("qcow2") {
 		if err := b.qemu(ctx, outDir, fmt.Sprintf(qcow2Cmd, r.Base)); err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 		out["qcow2"] = file("qcow2")
 	}
 	if want("ova") {
 		vmdk := r.Base + "-disk1.vmdk"
-		// The disk grows to OVADiskBytes, never shrinks: a raw disk already larger keeps its size.
-		st, err := os.Stat(file("raw"))
-		if err != nil {
-			return nil, err
-		}
-		capacity := max(st.Size(), OVADiskBytes)
+		// The disk grows to its capacity, never shrinks: Kairos's partitions and the app's least
+		// space fit in it, however large the bundle; never under the raw disk, which osMiB holds.
+		capacity := OVACapacityMiB(osMiB) << 20
 		script := fmt.Sprintf(ovaScript, r.Base, capacity, vmdk)
 		if err := b.qemu(ctx, outDir, script); err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 		if err := writeOVA(file("ova"), r.Base, filepath.Join(outDir, vmdk), capacity); err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 		if err := os.Remove(filepath.Join(outDir, vmdk)); err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 		out["ova"] = file("ova")
 	}
 	if want("vhd") {
 		if err := b.qemu(ctx, outDir, fmt.Sprintf(vhdScript, r.Base)); err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 		if err := checkVHD(file("vhd")); err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 		out["vhd"] = file("vhd")
 	}
 	if want("gce") {
 		if err := b.qemu(ctx, outDir, fmt.Sprintf(gceScript, r.Base)); err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 		if err := checkGCE(file("gce")); err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 		out["gce"] = file("gce")
 	}
 	if !want("raw") {
 		if err := os.Remove(out["raw"]); err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 		delete(out, "raw")
 	}
-	return out, nil
+	return out, osMiB, nil
 }
 
 // auroraboot makes one disk of source with flag set and moves the file it wrote, the one ending in
 // suffix, to dst. auroraboot can exit 0 without writing its disk, so the file is looked for.
-func (b *DiskBuilder) auroraboot(ctx context.Context, dir, config, source, flag, suffix, dst string) error {
+func (b *DiskBuilder) auroraboot(ctx context.Context, dir, config, source string, stateMiB int64, flag, suffix, dst string) error {
 	state, err := os.MkdirTemp(dir, "state-")
 	if err != nil {
 		return err
@@ -236,7 +426,8 @@ func (b *DiskBuilder) auroraboot(ctx context.Context, dir, config, source, flag,
 	for _, f := range auroraFlags {
 		args = append(args, "--set", f)
 	}
-	args = append(args, "--set", "state_dir=/state", "--set", "container_image=oci://"+source, "--set", flag+"=true")
+	args = append(args, "--set", "state_dir=/state", "--set", "container_image=oci://"+source, "--set", fmt.Sprintf("disk.state_size=%d", stateMiB),
+		"--set", flag+"=true")
 	err = b.docker(ctx, args...)
 	if err != nil {
 		return fmt.Errorf("auroraboot %s: %w", flag, err)

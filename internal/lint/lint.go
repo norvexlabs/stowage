@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"go.yaml.in/yaml/v3"
 
@@ -1632,12 +1633,45 @@ func (l *linter) shapes() {
 			seen[svc] = true
 			l.service(w+".host_api", svc)
 		}
+		l.kernelModules(w+".modules", k.Modules)
 		switch {
 		case l.s.Backup == nil && !l.s.HasDatabase():
 		case l.s.Backup == nil:
 			l.warnf("backup", "the VM keeps its data locally and no backup is declared")
 		case !providers.RunsBackups(l.s):
 			l.warnf("backup", "the VM runs %s backups only: it schedules no %s backup", providers.VMBackup, l.s.Backup.Name)
+		}
+	}
+}
+
+// kernelModules checks shapes.kairos.modules: each name, option and value is written into
+// modprobe's files and the OS bundle's build, and each entry says why.
+func (l *linter) kernelModules(w string, mods map[string]spec.KernelModule) {
+	for _, name := range slices.Sorted(maps.Keys(mods)) {
+		m, at := mods[name], w+"."+name
+		switch {
+		case !spec.ModuleName.MatchString(name):
+			l.errf(at, "not a kernel module's name: lower-case letters, digits and _ (modprobe reads - as _), at most 56")
+		case m.Load && m.Block:
+			l.errf(at, "is both loaded and blocked")
+		case m.Block && len(m.Options) > 0:
+			l.errf(at+".options", "a blocked module takes no options")
+		case !m.Load && !m.Block && len(m.Options) == 0:
+			l.errf(at, "says nothing: load, block or options")
+		}
+		switch r := strings.TrimSpace(m.Reason); {
+		case r == "":
+			l.errf(at+".reason", "is required: tune prints it beside what differs")
+		case len(r) > 200 || strings.ContainsFunc(r, unicode.IsControl):
+			l.errf(at+".reason", "one line of at most 200 bytes")
+		}
+		for _, o := range slices.Sorted(maps.Keys(m.Options)) {
+			switch v := m.Options[o]; {
+			case !spec.ModuleOption.MatchString(o):
+				l.errf(at+".options", "%q is not a module parameter's name: letters, digits and _", o)
+			case !spec.ModuleValue.MatchString(v):
+				l.errf(at+".options."+o, "%q: letters, digits and _ . , : / + -, no space or quote, at most 256", v)
+			}
 		}
 	}
 }

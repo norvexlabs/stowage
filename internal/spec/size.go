@@ -130,10 +130,11 @@ func (s *Share) UnmarshalJSON(raw []byte) error {
 	return nil
 }
 
-// The least size `vm create` makes a VM with: Kairos and the stack's engine need as much.
+// The least size `vm create` makes a VM with: the memory Kairos and the stack's engine need, and the
+// app's own space on its disk (Kairos's is added to it).
 const (
 	MinVMMemory Bytes = 1 << 30
-	MinVMDisk   Bytes = 16 << 30
+	MinVMDisk   Bytes = 4 << 30
 )
 
 // VMSize is the size a VM of the Kairos shape needs (Min) and runs well at (Recommended).

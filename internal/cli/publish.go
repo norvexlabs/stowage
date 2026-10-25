@@ -22,6 +22,7 @@ import (
 	"github.com/norvexlabs/stowage/internal/providers"
 	"github.com/norvexlabs/stowage/internal/publish"
 	"github.com/norvexlabs/stowage/internal/registry"
+	"github.com/norvexlabs/stowage/internal/sbom"
 	"github.com/norvexlabs/stowage/internal/spec"
 )
 
@@ -96,6 +97,12 @@ func (o *options) publisher(p *project.Project, a access) (*publish.Publisher, e
 	}
 	var pull *payload.Account
 	var del publish.Deleter
+	var sboms publish.SBOMMaker
+	if a == writeAccess && p.Spec.Signs() {
+		if sboms, err = o.sbomMaker(p, kc); err != nil {
+			return nil, err
+		}
+	}
 	if a == writeAccess {
 		if pull, err = o.pullAccount(p); err != nil {
 			return nil, err
@@ -107,6 +114,8 @@ func (o *options) publisher(p *project.Project, a access) (*publish.Publisher, e
 	return &publish.Publisher{
 		Project:        p,
 		Signer:         signer,
+		SBOM:           sboms,
+		Scanner:        o.scanner,
 		Registry:       reg,
 		Upstream:       registry.New(authn.DefaultKeychain, o.registryOpts...),
 		Anonymous:      registry.New(authn.NewMultiKeychain(), o.registryOpts...),
@@ -168,6 +177,27 @@ func (o *options) pullAccount(p *project.Project) (*payload.Account, error) {
 		return nil, nil
 	}
 	return &payload.Account{User: c.User, Password: pw}, nil
+}
+
+// sbomMaker is syft through the Docker CLI, reaching the registry with the publisher's
+// credentials (o.sboms in tests).
+func (o *options) sbomMaker(p *project.Project, kc authn.Keychain) (publish.SBOMMaker, error) {
+	if o.sboms != nil {
+		return o.sboms, nil
+	}
+	repo, err := name.NewRepository(p.Spec.Registry.Prefix, name.StrictValidation)
+	if err != nil {
+		return nil, err
+	}
+	auth, err := kc.Resolve(repo.Registry)
+	if err != nil {
+		return nil, err
+	}
+	cache, err := os.UserCacheDir()
+	if err != nil {
+		return nil, err
+	}
+	return &publish.SyftMaker{Docker: sbom.DockerCLI, Registry: repo.Registry, Auth: auth, WorkDir: filepath.Join(cache, "stowage", "sbom")}, nil
 }
 
 // keyURI matches the key forms cosign reads other than a file: env://, KMS and Vault URIs, pkcs11:.

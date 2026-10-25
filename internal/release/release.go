@@ -142,6 +142,11 @@ func (a Artifacts) Boot(tag string) (string, map[string]string) {
 // has the file as it is, of media type DiskMediaType(format), titled with its name.
 const DiskArtifactType = "application/vnd.stowage.disk.v1"
 
+// DiskOSAnnotation is, on a disk, the MiB Kairos takes of the disk a VM boots it on besides the
+// persistent partition (the boot, recovery and state partitions): what `vm create` adds to the
+// app's space.
+const DiskOSAnnotation = "dev.stowage.disk.os-mib"
+
 // DiskMediaType is the media type of a disk file of format.
 func DiskMediaType(format string) types.MediaType {
 	return types.MediaType("application/vnd.stowage.disk." + format)

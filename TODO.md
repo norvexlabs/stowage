@@ -18,26 +18,20 @@ A finished item is deleted, not ticked. The plan behind it is
    e2e-full-vm), and an upgrade from the last 24.04 release with a rollback to it, as was run
    by hand for 0.12.0 (the release's VM installed by the older stowage, the next shipped by this
    one: the upgrade, the health gate, `rollback`, SSH on the older system).
-2. **`audit`: the releases' SBOMs, signed, and a verb that checks them**. `ship` makes an SBOM
-   (SPDX or CycloneDX, by a pinned syft image) of every image it publishes and of the OS bundle,
-   and attaches each to its subject's digest as a cosign attestation signed by the release key,
-   an OCI referrer that `mirror export` carries. `stowage audit` (the publisher) and
-   `<short>-stow audit` (the operator; on the VM through the host daemon) fetch the installed or
-   given release's attestations, verify them against the release's trusted keys (an attestation
-   is never counted as a signature), and scan them for known vulnerabilities (a pinned grype
-   image; its database fetched, or given offline for a mirror without internet), printing them
-   by severity, `--json`, and exiting non-zero at or above `--fail-on`. README documents the
-   SBOM's tag/referrer, the verb and how to verify one by hand with `cosign verify-attestation`.
-3. **Security review (2026-10-24) of the produced artifacts, the findings left** (AWS's and
-   Azure's are under 4):
+2. **Security review (2026-10-24) of the produced artifacts, the findings left** (AWS's and
+   Azure's are under 3):
    - **On a running VM, what e2e-vm does not check**: it asserts the active system's listeners
      (no kairos-agent web UI, p2p or edgevpn), every account's `passwd -S` (none with a
      password), the effective `sshd -T` and no console autologin, and records Docker's FORWARD
-     policy and `/oem`. Left, by hand once: `ss -tulpn` on the recovery system; whether Kairos
-     reads the cloud's user-data again at each boot; Docker's FORWARD policy with `--ipv6` (the
-     project's forward chain accepts by default and relies on it).
+     policy, `/oem` and the boot's datasource stages. Recorded (0.14.0's e2e-vm): FORWARD is
+     DROP for IPv4 and IPv6 with `--ipv6`; `/oem` holds `95_userdata` (the first boot's
+     cloud-config, kept) and the boot's datasource stages run again, skipping the old-userdata
+     moves. Left, by hand once: `ss -tulpn` and `passwd -S` on the recovery system — e2e-vm's
+     `next_entry=recovery` reboot is not reached over SSH within 10 minutes (the recovery system
+     may bring up no SSH or no network: read it on the console), and whether a changed cloud
+     user-data is applied again at a later boot.
 
-4. **Cloud images on AWS and Azure**: `ship` registers the `cloud_publish` images through
+3. **Cloud images on AWS and Azure**: `ship` registers the `cloud_publish` images through
    OpenTofu, run for real on Google Cloud only (`STOWAGE_CLOUD_ENV=<file> make e2e-kairos`). Run it
    with the AWS and Azure test accounts once they exist, and fix what they find. Azure, known:
    its probe takes an image of the name whatever its provisioning state (its resource list gives
@@ -51,26 +45,17 @@ A finished item is deleted, not ticked. The plan behind it is
    `encrypted` root volume; Azure's an NSG on the NIC; Secure Boot / vTPM where the image allows.
    Each checked against its provider's schema and applied for real.
 
-5. **Scaleway**: a platform of `vm create` (OpenTofu module: an instance from the release's
+4. **Scaleway**: a platform of `vm create` (OpenTofu module: an instance from the release's
    disk, the cloud-config as its user data) and a cloud of `cloud_publish` (the disk uploaded to
    Object Storage and imported as an instance image, with the publisher's credentials from the
    environment), as the other clouds. Before writing a module, read the latest
    `scaleway/scaleway` provider's official docs and its schema (`tofu providers schema -json`),
    and pin that release.
-6. **OVHcloud**: the same for OVHcloud Public Cloud (OpenStack): `vm create` and `cloud_publish`
+5. **OVHcloud**: the same for OVHcloud Public Cloud (OpenStack): `vm create` and `cloud_publish`
    (the disk uploaded as a Glance image of the project, `ovh/ovh` and/or
    `terraform-provider-openstack/openstack`, whichever the latest official docs make canonical).
    Before writing a module, read the latest provider's official docs and its schema, and pin that
    release.
-
-Found packaging a second project (an explicit forward proxy, Docker shape, 2026-10-24); the
-Shoulds it found are under Should:
-
-7. **A route's login page**: `basic_auth` makes the browser ask (its prompt, no sign-out, the
-   password sent with each request). A login page — a form, a session cookie, a sign-out, a
-   lockout after failed tries — on Docker, the VM and in the chart's contract: a Caddy plugin in
-   the front image (caddy-security, pinned, its local users from the route's secret), or a small
-   login service of Stowage's behind `forward_auth`; `basic_auth` stays for scripts.
 
 ### Network appliances — a stack between networks
 
@@ -81,7 +66,7 @@ the following on a Kairos host, bare metal first (after the bare-metal slice: th
 install block, the metal platform, NICs named by MAC); the VM where it applies; on a Docker host,
 whose kernel is the operator's, `tune` reports what is missing and sets nothing.
 
-8. **More than one interface**: the VM has one NIC. An appliance has a client side and an
+6. **More than one interface**: the VM has one NIC. An appliance has a client side and an
     upstream side (and often a management one): `shapes.kairos` declares named interfaces (role,
     addressing: DHCP / static / none, MTU), `vm create` and the OpenTofu modules attach one NIC
     per role on the named network, and the stack's spec names which role an L4 route or the front
@@ -90,21 +75,21 @@ whose kernel is the operator's, `tune` reports what is missing and sets nothing.
     for it on its role's NIC (an address of its own, with no NAT and beside the stack's bridge)
     is the other way: the host's firewall does not see that traffic, so its rules would go in the
     service's own namespace.
-9. **Firewall rules a service declares, in the host's ruleset**: interception and the
+7. **Firewall rules a service declares, in the host's ruleset**: interception and the
     appliance's egress floor are host rules (nftables: a TPROXY / redirect of the client side's
     TCP to the service's port, a forward chain that default-denies what the service cannot
     inspect, DNS sent to the stack's resolver, UDP 443 rejected), which a container cannot own.
     The spec declares a ruleset fragment per service (a table of its own, its named sets fed by the
     service), Stowage loads it at boot before the service starts, removes it with the service, and
     lint checks it parses and touches only its own table; routing and `ip_forward` with it, on the
-    interfaces 8 names. The host's own firewall stays Stowage's.
-10. **Host tuning a service asks for**: the `network` profile tunes the host as a whole. An
+    interfaces 6 names. The host's own firewall stays Stowage's.
+8. **Host tuning a service asks for**: the `network` profile tunes the host as a whole. An
     appliance places work: the NIC queues' interrupts and RPS/XPS off the service's CPU set (or on
     it, by the service's choice), the queue count — one per core, which a driver may refuse:
     Intel's E810 (`ice`) answers every `ethtool -L` with EBUSY ("Cannot change channels when RDMA
     is active") while `irdma` is bound to the port's `ice.roce.N` auxiliary device, leaving a 100G
-    port at 8 queues on a 16-core host; a project that uses no RDMA declares `block: irdma` (13) —
-    kernel arguments, modules (13), and sysctls past the container-namespaced set. The spec
+    port at 8 queues on a 16-core host; a project that uses no RDMA declares `block: irdma` (shapes.kairos.modules) —
+    kernel arguments, and sysctls past the container-namespaced set. The spec
     declares them per service or per host; the host's boot applies them before the service starts,
     and `tune` reports a host that lacks them (the warnings the service logs at its start are the
     list to meet). The host then:
@@ -115,9 +100,8 @@ whose kernel is the operator's, `tune` reports what is missing and sets nothing.
       falls back to the passive system as any other; an opt-out for hosts with untrusted PCIe
       devices (passthrough leaves a host-owned device unconfined). Effective at the next boot,
       said so.
-    - **CPU power**: 12.
-    - **Modules at boot**: those the project declares (13), e.g. `tcp_bbr` and `nf_conntrack`.
-    - **Conntrack sized from RAM**: `nf_conntrack_max` ~300 B of unswappable memory per entry
+    - **CPU power**: 10.
+        - **Conntrack sized from RAM**: `nf_conntrack_max` ~300 B of unswappable memory per entry
       (512 MB → ~89k, 4 GB → ~715k, capped at 1,048,576 from ~6 GB) and the hash buckets at a
       quarter of it (both directions inserted: mean chain 8; the kernel's own 4,096 buckets on a
       512 MB box make it 512).
@@ -126,13 +110,13 @@ whose kernel is the operator's, `tune` reports what is missing and sets nothing.
       pre-set maximums (never a constant: ENA's TX caps at 1024), one combined queue per core with
       RSS spread equally over the CPUs the host allows the appliance (the E810 case above: its
       queues stay at 8 unless `irdma` is blocked).
-11. **An upgrade that keeps the listening sockets**: an appliance's clients cannot be told to
+9. **An upgrade that keeps the listening sockets**: an appliance's clients cannot be told to
     retry, and a container's replacement drops every connection and refuses new ones until the
     new one listens. The service hands its listening sockets to its successor (systemd socket
     passing, or the app's own handoff over a Unix socket: old and new running side by side, the
     old draining). Stowage's upgrade starts the new container beside the old one on the host's
     network with the handoff socket shared, waits for the old one to exit, and keeps the rollback.
-12. **Power management, a declared posture that survives the reboot**: `tune --apply` sets the
+10. **Power management, a declared posture that survives the reboot**: `tune --apply` sets the
     governor on the running Docker host only (a reboot loses it: the Should on the `network`
     profile's interrupts and governor), the VM's boot sets it each time, and nothing stops another
     writer from undoing it. An appliance declares its posture — `performance` (every core held at
@@ -156,33 +140,13 @@ whose kernel is the operator's, `tune` reports what is missing and sets nothing.
     latency; where none is bound, only the firmware's setup menu does, which `tune` can only
     report), and a NIC's Energy Efficient Ethernet and PCIe ASPM, which trade latency for watts the
     same way.
-13. **Kernel modules a project declares**: `shapes.kairos.modules` in the project's own
-    `stowage.yaml`, each entry with a `reason` — `load` (`/etc/modules-load.d`), `block` (a
-    `blacklist` and an `install <name> /bin/false`, so neither a dependency nor udev loads it) and
-    `options` (`/etc/modprobe.d`, `name` and `value`). The OS bundle carries the files, so they hold
-    from the first boot, before a driver binds (a boot stage would come too late for one the
-    initramfs loads). `lint` checks each name and option, refuses a module both loaded and
-    blocked, and asks for a reason; `tune` reports a blocked module still loaded, a loaded one
-    missing, an option the running module does not hold, each with its reason. No hardware
-    condition: a block of a module the host lacks does nothing. Stowage declares none of its own;
-    `examples/full` shows the key.
-
-14. **An rclone config the app socket saved before 0.13 still runs as root** (security): 0.13
-    refuses one from the app socket, but a config an app saved through it earlier is kept, and
-    the daemon runs it on every scheduled backup, verify and run. Its only trace is the journal's
-    `backup.config` event (0.12 on, rotated after 1000 entries); a project can only tell its
-    operator to save the config again over SSH. Record where the saved config came from (SSH or
-    the app socket, per save), say it in `backup status` and the app's settings, and refuse to run
-    an app-saved one until the operator saves one over SSH — refusing as a failed backup, named,
-    never silently.
-
 ## Should
 
 - **A CPU set per service** (from the L4 routes on the host's network): an unpinned service
   shares its cores with the rest of the stack. An advanced input per service giving compose
   `cpuset` on Docker and the VM, and the chart's equivalent (its values), checked against the
   host's CPUs at install.
-- **A driver's RDMA freed per port** (from Must 10): blocking `irdma` (Must 13) takes RDMA off
+- **A driver's RDMA freed per port** (from Must 8): blocking `irdma` (`shapes.kairos.modules`) takes RDMA off
   every port of the host. A port that uses none could instead have its `ice.roce.N` auxiliary
   device unbound only on `ethtool -L`'s EBUSY, logged, and again at each boot, keeping RDMA on
   the others; a device-level action, not a module's setting.
@@ -430,7 +394,7 @@ Docker shape, 2026-10-24):
 - **Images from packages**: `images.<k>` built from `.deb` packages on a digest-pinned base
   (`base`, `packages`: a build target writing them or a glob, `purge`: the per-install paths a
   maintainer script leaves in an image — a generated CA, a default config), with lint on the pin
-  and the purge list and an SBOM from `dpkg -l`. Turning the packages' systemd units into
+  and the purge list (ship's syft SBOM lists the packages). Turning the packages' systemd units into
   services stays the project's (an entrypoint per unit).
 
 - **`k8s install --unsafe-sysctls` on a kubelet that refuses them**: the pods fail at once
@@ -704,9 +668,17 @@ Docker shape, 2026-10-24):
   Needs a signed, expiring channel record (TUF-style timestamp) that installs check.
 - **Signature counts name referrers**: on a registry without the referrers API every referrer
   listed under the empty config type or none is read, so the 64 cap and the "N signature(s), none
-  by a trusted key" message count non-bundle referrers (an SBOM) as signatures; count the bundles
-  read instead, and cover the tag-fallback shape with a verifier-level test, not only the
+  by a trusted key" message count non-bundle referrers as signatures, and the SBOM attestations
+  (bundles too) everywhere; count the bundles whose predicate is a signature instead, and cover the tag-fallback shape with a verifier-level test, not only the
   registry client's.
+- **The OS bundle's SBOM without the kernel modules' entries**: syft lists each module (6,904
+  entries, no version, most of the document's 57 MB), which no scanner matches; a kernel CVE is
+  found through the `linux-image` package. Its kernel-module cataloger could be left out.
+- **Fewer attestation reads**: `ship`'s check that an artifact carries its SBOM reads and verifies
+  the whole attestation (an OS bundle's runs to MiB), and every signature check reads each SBOM
+  bundle up to 4 MiB before it passes it over. cosign writes the predicate type as an annotation of
+  the referrer: order or skip by it (an unsigned hint, what is read still verified), and read no
+  predicate where presence alone matters.
 - **Signature reads are bounded at 64 referrers per digest**: someone with push access can push
   65 junk referrers on a signed release and every check of it fails ("cannot check"). The same
   access can already delete the release's tags, so it is a denial of service, not a bypass; read
@@ -753,6 +725,8 @@ Docker shape, 2026-10-24):
 ## Won't — not in the first version
 
 - Taking over an install made without Stowage: a project adopting Stowage installs fresh.
+- A route's login page (a form, a session cookie, a sign-out, a lockout): a route's login is
+  `basic_auth`, the browser's own prompt.
 
 - The other extensions of DESIGN § 10 (restore verb on Kubernetes, Kubernetes provision hook +
   portal URL): none exists today; revisit after parity. The Docker backups and restore, the

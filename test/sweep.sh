@@ -63,6 +63,14 @@ for d in "$CACHE"/stowage-e2e.*; do
 		[[ -n $(find "$d" -maxdepth 0 -mmin +60) ]] || continue
 		[[ $mounts == *"$d/"* ]] && continue
 	fi
+	# The scanners its audits loaded (lib.sh's scanner_fresh), by tag, but a name a live run
+	# records too (its registry on the same address again).
+	[[ -f $d/.scanners ]] && sort -u "$d/.scanners" | while read -r repo; do
+		for l in "$CACHE"/stowage-e2e.*/.pid; do
+			[[ -f $l && ${l%/.pid} != "$d" ]] && alive "$(cat "$l")" && grep -qxF "$repo" "${l%/.pid}/.scanners" 2>/dev/null && continue 2
+		done
+		docker images --format '{{.Repository}}:{{.Tag}}' "$repo" | xargs -r docker rmi >/dev/null 2>&1 || true
+	done
 	rm -rf "$d" 2>/dev/null || docker run --rm --network none -v "$d:/w" --entrypoint sh "$HTPASSWD" -c 'rm -rf /w/* /w/.[!.]*' >/dev/null 2>&1
 	rm -rf "$d" 2>/dev/null
 done

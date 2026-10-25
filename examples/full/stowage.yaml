@@ -188,3 +188,7 @@ shapes:
     health_gate: { deadline_s: 600, deadline_after_reset_s: 1800, poll_s: 30 }
     host_api: [api]
     size: { min: { cpus: 2, memory: 2G, disk: 20G }, recommended: { cpus: 4, memory: 8G, disk: 40G } }   # vm create's least and default size
+    modules:                                                   # the OS bundle's modprobe files; tune reports what differs
+      tcp_diag: { load: true, reason: "ss -ti reads the TCP sockets' details" }
+      pcspkr: { block: true, reason: a VM has no speaker }
+      overlay: { options: { redirect_always_follow: "Y" }, reason: "Docker's storage: the kernel's default, stated" }

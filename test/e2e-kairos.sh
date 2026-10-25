@@ -84,7 +84,8 @@ grep -q 'disks: make raw, qcow2, ova, vhd, gce' "$WORK/ship1.log" || fail "the d
 for f in "${FORMATS[@]}"; do
 	grep -q "disk $f: tag .* → beta-1.0.0-$f" "$WORK/ship1.log" || fail "disk $f was not tagged"
 done
-[[ $(grep -c '^signed ' "$WORK/ship1.log") == 16 ]] || { grep '^signed ' "$WORK/ship1.log"; fail "want 16 signatures (9, the bundle, 5 disks, the channel's disk set)"; }
+[[ $(grep -c '^signed ' "$WORK/ship1.log") == 17 ]] || { grep '^signed ' "$WORK/ship1.log"; fail "want 17 signatures (9, the scanner, the bundle, 5 disks, the channel's disk set)"; }
+grep -q "^attested the SBOM of $REG/notes/notes-os@" "$WORK/ship1.log" || { grep '^attested ' "$WORK/ship1.log"; fail "the OS bundle's SBOM was not attested"; }
 for c in "${CLOUDS[@]}"; do
 	if [[ -n ${!CLOUD_KEY[$c]:-} ]]; then
 		grep -q "cloud $c: register notes-[0-9a-f]\{12\}$" "$WORK/ship1.log" && grep -q "cloud $c: image ." "$WORK/ship1.log" || { tail -30 "$WORK/ship1.log"; fail "the $c image was not registered"; }
@@ -270,7 +271,7 @@ rm -rf "$WORK/disks"
 
 step "ship beta again (nothing is built)"
 "${S[@]}" ship --channel beta 2>"$WORK/ship2.log" || { cat "$WORK/ship2.log"; fail "ship"; }
-! grep -qE 'os bundle: (build|tag)|disks: make|disk [a-z0-9]+: (push|tag)|^signed ' "$WORK/ship2.log" || { cat "$WORK/ship2.log"; fail "a second ship wrote something"; }
+! grep -qE 'os bundle: (build|tag)|disks: make|disk [a-z0-9]+: (push|tag)|^signed |^attested ' "$WORK/ship2.log" || { cat "$WORK/ship2.log"; fail "a second ship wrote something"; }
 grep -q 'release beta-1.0.0 unchanged' "$WORK/ship2.log" || fail "release not reported unchanged"
 ! grep -q 'cloud [a-z]*: register' "$WORK/ship2.log" || fail "a second ship registered an image again"
 for c in "${CLOUDS[@]}"; do

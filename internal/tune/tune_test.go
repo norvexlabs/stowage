@@ -631,6 +631,57 @@ func TestInspectLeavesWhatTheDriverFixesOut(t *testing.T) {
 	}
 }
 
+// The project's modules: drift on the VM, whose image carries their files; advice on another
+// host, whose kernel is its operator's.
+func TestInspectJudgesTheProjectsModules(t *testing.T) {
+	t.Parallel()
+	s, _ := fakeHost(t, "1500")
+	for path, v := range map[string]string{"sys/module/ice/parameters/a": "x", "sys/module/ice/parameters/b": "Y", "sys/module/irdma/refcnt": "0"} {
+		write(t, s.Root, path, v)
+	}
+	s.Modules = []Module{
+		{Name: "ice", Load: true, Options: map[string]string{"a": "x", "b": "on", "c": "1"}, Reason: "the NIC"},
+		{Name: "irdma", Block: true, Reason: "the queues"},
+		{Name: "tcp_bbr", Load: true, Reason: "BBR"},
+		{Name: "gone", Options: map[string]string{"a": "1"}, Reason: "r"},
+	}
+	want := map[string]State{"ice": OK, "ice a": OK, "ice b": OK, "ice c": NA, "irdma": Differs, "tcp_bbr": Differs, "gone a": NA}
+	s.Owned = true
+	items := s.Inspect(context.Background(), host(4096, 2))
+	for name, st := range want {
+		if it := find(items, "module", name); it == nil || it.State != st {
+			t.Errorf("owned, %s: %+v, want %s", name, it, st)
+		}
+	}
+	if it := find(items, "module", "irdma"); it == nil || it.Have != "loaded" || it.Want != "blocked (the queues)" {
+		t.Errorf("irdma: %+v", it)
+	}
+	s.Owned = false
+	items = s.Inspect(context.Background(), host(4096, 2))
+	if it := find(items, "module", "tcp_bbr"); it == nil || it.State != Advice || !strings.Contains(it.Have, "not loaded, the project asks for loaded (BBR): this host's kernel is its operator's") {
+		t.Errorf("not owned: %+v", it)
+	}
+	if it := find(items, "module", "ice a"); it == nil || it.State != OK {
+		t.Errorf("not owned, as asked: %+v", it)
+	}
+}
+
+func TestSameParam(t *testing.T) {
+	t.Parallel()
+	for _, c := range []struct {
+		have, want string
+		ok         bool
+	}{
+		{"Y", "1", true}, {"Y", "y", true}, {"Y", "on", true}, {"Y", "True", true}, {"Y", "0", false}, {"Y", "off", false},
+		{"N", "0", true}, {"N", "n", true}, {"N", "off", true}, {"N", "false", true}, {"N", "1", false}, {"N", "", false}, {"Y", "maybe", false},
+		{"8", "8", true}, {"8", "08", false},
+	} {
+		if got := sameParam(c.have, c.want); got != c.ok {
+			t.Errorf("sameParam(%q, %q) = %v", c.have, c.want, got)
+		}
+	}
+}
+
 func TestDockerdFlagsKeepTheirKeysOutOfTheFile(t *testing.T) {
 	t.Parallel()
 	s, _ := fakeHost(t, "9001")

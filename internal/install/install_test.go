@@ -33,11 +33,16 @@ import (
 // fakeDocker answers the docker CLI the installer runs and records every call.
 type fakeDocker struct {
 	// mu guards calls: a backup's dump and upload run at once.
-	mu      sync.Mutex
-	calls   []Cmd
-	loaded  map[string]string // image reference → the ID `image inspect` reports
-	compose string            // `compose version --short`
-	pullErr error
+	mu     sync.Mutex
+	calls  []Cmd
+	loaded map[string]string // image reference → the ID `image inspect` reports
+	// loadedBytes is what `docker load` read; it loads loadAs, which `image inspect` then answers
+	// with loadInspect.
+	loadedBytes         int64
+	loadAs, loadInspect string
+	loadErr             error
+	compose             string // `compose version --short`
+	pullErr             error
 	// pullConfig is the Docker config.json the last pull ran with, and its contexts link.
 	pullConfig, pullContexts string
 	// hookOut is what the provision hook prints on stdout, then fails with hookErr.
@@ -189,6 +194,16 @@ func (f *fakeDocker) Run(_ context.Context, c Cmd) ([]byte, error) {
 		}
 		out, err := f.schema(image, req)
 		_, _ = io.WriteString(c.Stdout, out)
+		return nil, err
+	case a == "load --quiet":
+		if f.loadErr != nil {
+			return nil, f.loadErr // as a daemon that refuses it, before reading it all
+		}
+		n, err := io.Copy(io.Discard, c.Stdin)
+		f.loadedBytes += n
+		if f.loadAs != "" {
+			f.loaded[f.loadAs] = f.loadInspect
+		}
 		return nil, err
 	case strings.HasPrefix(a, "image inspect"):
 		if id, ok := f.loaded[c.Args[len(c.Args)-1]]; ok {

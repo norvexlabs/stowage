@@ -117,6 +117,38 @@ check_backup() {
 	rm -f "$WORK/backup.dump"
 }
 
+# scanner_fresh <prefix> [<project>]: the scanner an audit of the registry prefix loads (the local
+# name the installer gives it: the prefix's hash), untagged now (none an earlier run of the same
+# address left is taken for a pull) and at the end, and recorded in the work directory for
+# test/sweep.sh. By tag alone: another suite's scanner is the same image under another name.
+scanner_fresh() {
+	local repo
+	repo="stowage.local/$(printf %s "$1" | sha256sum | cut -c1-8)/${2:-notes}-audit"
+	echo "$repo" >>"$WORK/.scanners"
+	untag_repo "$repo"
+	CLEANUP+=("untag_repo '$repo'")
+}
+untag_repo() { docker images --format '{{.Repository}}:{{.Tag}}' "$1" | xargs -r docker rmi >/dev/null 2>&1 || true; }
+# grype_db: GRYPE_DB, grype's latest vulnerability database archive, fetched once into the tools
+# cache (older ones removed) and checked against the listing's digest; the audits scan with it
+# (--db), as a site without access to grype's servers does, so no suite fetches its own.
+grype_db() {
+	local dir=$TOOLS/grype-db latest path sum tmp
+	mkdir -p "$dir"
+	latest=$(curl -fsSL https://grype.anchore.io/databases/v6/latest.json) || fail "grype's database listing"
+	path=$(jq -r .path <<<"$latest") sum=$(jq -r .checksum <<<"$latest")
+	[[ $path == vulnerability-db_*.tar.zst && $sum == sha256:* ]] || fail "grype's listing: $latest"
+	GRYPE_DB=$dir/$path
+	if [[ ! -s $GRYPE_DB ]]; then
+		tmp=$(mktemp "$dir/.dl.XXXXXX")
+		CLEANUP+=("rm -f '$tmp'")
+		curl -fsSL "https://grype.anchore.io/databases/v6/$path" -o "$tmp" || fail "download $path"
+		echo "${sum#sha256:}  $tmp" | sha256sum -c --quiet - || fail "$path: the digest is not $sum"
+		mv -f "$tmp" "$GRYPE_DB"
+	fi
+	find "$dir" -maxdepth 1 -name 'vulnerability-db_*.tar.zst' ! -name "$path" -mmin +60 -delete
+}
+
 [[ -x $STOWAGE ]] || fail "$STOWAGE is missing: run make build"
 
 start_zot() {
@@ -136,7 +168,7 @@ start_zot() {
 {
   "storage": { "rootDirectory": "/etc/zot/data" },
   "http": {
-    "address": "0.0.0.0", "port": "5000",
+    "address": "0.0.0.0", "port": "5000", "compat": ["docker2s2"],
     "auth": { "htpasswd": { "path": "/etc/zot/htpasswd" }, "apikey": true },
     "accessControl": {
       "repositories": {
@@ -191,7 +223,7 @@ start_mirror() {
 {
   "storage": { "rootDirectory": "/etc/zot/data" },
   "http": {
-    "address": "0.0.0.0", "port": "5000",
+    "address": "0.0.0.0", "port": "5000", "compat": ["docker2s2"],
     "tls": { "cert": "/etc/zot/tls.crt", "key": "/etc/zot/tls.key" },
     "auth": { "htpasswd": { "path": "/etc/zot/htpasswd" } },
     "accessControl": {

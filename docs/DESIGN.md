@@ -485,6 +485,21 @@ Off until the project configures a key (`signing: { provider: cosign-key, key: �
   extra state; an install of a project that never signed checks nothing.
 - **Rotation**: the baked file holds a key *list*. A release first ships with old + new public keys,
   is signed with the old one; the next release is signed with the new one and may drop the old.
+- **SBOMs**: a signing release attests an SBOM (SPDX JSON, syft) of each image, the installer,
+  the OS bundle and each disk (the bundle's, attested again on the disk, which a VM boots) —
+  everything an install runs — with the release key, as an
+  in-toto attestation stored as a bundle referrer beside the signatures: the same trust anchor,
+  the same storage, so `mirror export` carries it with no new format, and an attestation is
+  never taken for a signature (the predicate decides). The SBOM is a property of the digest, so
+  it is made once per digest and never re-made by a newer syft: re-shipping stays idempotent and
+  needs no graph node; it is not an input of anything. The scanner (grype) is a pinned upstream
+  image mirrored as the release image `audit`, so an operator — at a site without internet
+  included — audits with the release's own scanner from the registry it already reads, and only
+  grype's database comes from outside (fetched, or given as a file). Audits and exports run on
+  the operator's machine, never on the VM: the SBOMs of a version are in the registry, so the
+  version the VM runs is all an audit needs; a VM holds no scanner (the bundle does not preload
+  it) and none of its database (1 GB), and its persistent space stays the app's. The export
+  hands the verified documents to the operator's own tools, which keep watching them.
 
 ### 5.2 Registry and its credentials
 
@@ -1396,7 +1411,17 @@ every shape, the VM end-to-end test upgrading through it), then the health gate.
   image drops that line from Kairos's file, and its build fails when the line moves. The
   hypervisor's part is the VM modules' (a virtio queue per vCPU, gVNIC, accelerated
   networking), and the image carries the drivers they need, the two cloud NICs' copied from the
-  extra modules rather than its 110 MB. Left out: Docker's userland proxy (turning it off breaks
+  extra modules rather than its 110 MB. A VM's disk is the app's space plus Kairos's: the state
+  partition holds three systems (active, passive, an upgrade's transition), sized from the bundle
+  with a quarter more for later releases, where auroraboot's default (three times the recovery
+  partition, itself twice the image) left a large bundle's persistent partition next to nothing;
+  the bundle records its size, each disk what Kairos takes, and `vm create` adds it to the app's
+  declared space, so `size.disk` and `--disk` mean what the app gets. The modules a project declares (`shapes.kairos.modules`)
+  are files of the image's `/usr/lib/modprobe.d` and `modules-load.d`, not a boot stage: they
+  hold from the initramfs on, before a driver binds, and `/etc` is Kairos's persistent state,
+  which every boot fills from the image without deleting (a file a newer image dropped would
+  outlive it, and reach an older one on a rollback). The build proves modprobe and systemd read
+  them; `tune` reports the running kernel against them and sets nothing. Left out: Docker's userland proxy (turning it off breaks
   a loopback install on `::1`, and it carries only local traffic), host networking (the stack's
   isolation), the NICs' offloads beyond forwarded UDP (a driver's defaults are its best).
   On Kubernetes the node is the cluster admin's, so the installer never touches it and reads

@@ -25,6 +25,7 @@ import (
 	"github.com/norvexlabs/stowage/internal/project"
 	"github.com/norvexlabs/stowage/internal/publish"
 	"github.com/norvexlabs/stowage/internal/registry"
+	"github.com/norvexlabs/stowage/internal/sbom"
 	"github.com/norvexlabs/stowage/internal/spec"
 	"github.com/norvexlabs/stowage/internal/version"
 )
@@ -42,6 +43,12 @@ type options struct {
 	registryOpts []registry.Option
 	builder      publish.Builder
 	disks        publish.DiskMaker
+	// sboms and scanner replace syft and the scanner image a signing release mirrors.
+	sboms   publish.SBOMMaker
+	scanner string
+	// dockerRun and scannerImage replace the Docker CLI and grype's image an audit runs.
+	dockerRun    sbom.Docker
+	scannerImage string
 	cloud        publish.CloudUploader
 	// installer is the installer executable releases are published with.
 	installer []byte
@@ -163,7 +170,7 @@ func newRoot(o *options) *cobra.Command {
 	pf.StringVar(&o.test.Push, "test-push", "", "a test release: publish with this account, USER:ENV (the variable holding its password), never the project's token")
 	pf.StringVar(&o.test.Pull, "test-pull", "", "a test release: the pull account its installers carry, USER:ENV, or none; never the project's")
 	root.AddCommand(lintCmd(o), versionCmd(o), changelogCmd(o), planCmd(o), lockCmd(o), hookCmd(o),
-		shipCmd(o), verifyCmd(o), promoteCmd(o), yankCmd(o), pruneCmd(o), releasesCmd(o))
+		shipCmd(o), verifyCmd(o), auditCmd(o), sbomCmd(o), promoteCmd(o), yankCmd(o), pruneCmd(o), releasesCmd(o))
 	return root
 }
 

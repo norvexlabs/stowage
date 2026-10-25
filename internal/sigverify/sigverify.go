@@ -7,6 +7,7 @@ package sigverify
 import (
 	"context"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
@@ -117,7 +118,8 @@ func (v *Verifier) Verify(ctx context.Context, r Registry, d name.Digest) error 
 	var readErr error
 	for _, ref := range refs {
 		a, _, err := r.GetArtifact(ctx, d.Context().Digest(ref.Digest.String()), BundleType)
-		if errors.Is(err, registry.ErrNotArtifact) || (err == nil && a == nil) {
+		// A bundle larger than a signature ever is (an SBOM's attestation) signs nothing.
+		if errors.Is(err, registry.ErrNotArtifact) || errors.Is(err, registry.ErrTooLarge) || (err == nil && a == nil) {
 			continue
 		}
 		if err != nil {
@@ -138,4 +140,78 @@ func (v *Verifier) Verify(ctx context.Context, r Registry, d name.Digest) error 
 		return fmt.Errorf("%s: cannot check signatures: %w", d, readErr)
 	}
 	return fmt.Errorf("%s: %d signature(s), none by a trusted key: %w", d, len(refs), ErrUnsigned)
+}
+
+// MaxAttestation caps an attestation's bundle read.
+const MaxAttestation = 96 << 20
+
+// AttestationRegistry is the part of the registry client an attestation's read uses.
+type AttestationRegistry interface {
+	Referrers(ctx context.Context, d name.Digest, t types.MediaType) ([]v1.Descriptor, error)
+	GetArtifactMax(ctx context.Context, ref name.Reference, want types.MediaType, limit int64) (*registry.Artifact, v1.Hash, error)
+}
+
+// ErrNoAttestation is the answer "no attestation of that type by a trusted key".
+var ErrNoAttestation = errors.New("no attestation by a trusted key")
+
+// Attestation is the predicate of an in-toto attestation of predicateType over d, signed by one
+// of the trusted keys (as `cosign attest` writes it): its JSON as signed. It is never a signature:
+// Verify passes over it. An error wraps ErrNoAttestation when d carries none.
+func (v *Verifier) Attestation(ctx context.Context, r AttestationRegistry, d name.Digest, predicateType string) ([]byte, error) {
+	h, err := v1.NewHash(d.DigestStr())
+	if err != nil {
+		return nil, err
+	}
+	if h.Algorithm != "sha256" {
+		return nil, fmt.Errorf("%s: only sha256 digests are verified", d)
+	}
+	sum, err := hex.DecodeString(h.Hex)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", d, err)
+	}
+	refs, err := r.Referrers(ctx, d, BundleType)
+	if err != nil {
+		return nil, fmt.Errorf("%s: cannot read its attestations: %w", d, err)
+	}
+	if len(refs) > maxBundles {
+		return nil, fmt.Errorf("%s: cannot read its attestations: %d bundles, more than %d", d, len(refs), maxBundles)
+	}
+	policy := verify.NewPolicy(verify.WithArtifactDigest("sha256", sum), verify.WithKey())
+	var readErr error
+	for _, ref := range refs {
+		a, _, err := r.GetArtifactMax(ctx, d.Context().Digest(ref.Digest.String()), BundleType, MaxAttestation)
+		if errors.Is(err, registry.ErrNotArtifact) || (err == nil && a == nil) {
+			continue
+		}
+		if err != nil {
+			readErr = err
+			continue
+		}
+		var b bundle.Bundle
+		if err := b.UnmarshalJSON(a.Data); err != nil {
+			continue
+		}
+		env := b.GetDsseEnvelope()
+		if env == nil {
+			continue
+		}
+		for _, k := range v.keys {
+			res, err := k.v.Verify(&b, policy)
+			if err != nil || res.Statement == nil || res.Statement.PredicateType != predicateType {
+				continue
+			}
+			// The envelope's payload is the statement the key signed: its predicate as written.
+			var st struct {
+				Predicate json.RawMessage `json:"predicate"`
+			}
+			if err := json.Unmarshal(env.Payload, &st); err != nil || len(st.Predicate) == 0 {
+				continue
+			}
+			return st.Predicate, nil
+		}
+	}
+	if readErr != nil {
+		return nil, fmt.Errorf("%s: cannot read its attestations: %w", d, readErr)
+	}
+	return nil, fmt.Errorf("%s: no %s attestation by a trusted key: %w", d, predicateType, ErrNoAttestation)
 }

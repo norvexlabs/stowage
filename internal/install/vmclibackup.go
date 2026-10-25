@@ -250,7 +250,10 @@ func printBackupSettings(w io.Writer, ctl string, s BackupSettings) {
 		return
 	}
 	rc := "not set"
-	if s.RcloneConfigSet {
+	switch {
+	case s.RcloneConfigSet && s.RcloneConfigFrom == rcloneUnknown:
+		rc = fmt.Sprintf("set (not shown), not known to be the operator's: not run until saved over SSH, `%s backup config --rclone-config FILE`", ctl)
+	case s.RcloneConfigSet:
 		rc = "set (not shown)"
 	}
 	keep := fmt.Sprintf("%d days", s.RetentionDays)

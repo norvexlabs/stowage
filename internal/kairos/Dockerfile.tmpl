@@ -109,7 +109,36 @@ RUN set -e; apt-get update; cd /tmp; \
             modinfo -k "$v" "$m" >/dev/null || { echo "kernel $v lacks $m" >&2; exit 1; }; done; done; \
     rm -rf /var/lib/apt/lists/*
 
-# Console on the screen and on the serial port, serial last so it owns /dev/console: the recovery
+{{if .Modules}}# The project's kernel modules (shapes.kairos.modules). The build fails when a module to load or
+# give options is in no kernel, when one is built into it (modprobe's files do not reach those,
+# and tune could not tell one loaded), when an option is not one of the module's parameters, or when
+# modprobe does not read the bundle's files.
+RUN set -e; for k in /lib/modules/*; do v="$(basename "$k")"; \
+{{- range $name, $m := .Modules}}
+{{- if or $m.Load $m.Options}}
+        modinfo -k "$v" {{$name}} >/dev/null || { echo "shapes.kairos.modules.{{$name}}: kernel $v has no such module" >&2; exit 1; }; \
+{{- end}}
+        [ "$(modinfo -k "$v" -F filename {{$name}} 2>/dev/null)" != "(builtin)" ] || { echo "shapes.kairos.modules.{{$name}}: built into kernel $v: modprobe's files do not reach it, and it is always there" >&2; exit 1; }; \
+{{- range $o, $_ := $m.Options}}
+        modinfo -k "$v" -F parm {{$name}} | cut -d: -f1 | grep -qx {{$o}} || { echo "shapes.kairos.modules.{{$name}}.options: {{$o}} is not a parameter of kernel $v's {{$name}}" >&2; exit 1; }; \
+{{- end}}
+{{- end}}
+    done; \
+    c="$(modprobe -c)"; \
+{{- range $name, $m := .Modules}}
+{{- if $m.Block}}
+    { printf '%s\n' "$c" | grep -qxF 'blacklist {{$name}}' && printf '%s\n' "$c" | grep -qxF 'install {{$name}} /bin/false'; } || { echo "modprobe does not block {{$name}}" >&2; exit 1; }; \
+{{- end}}
+{{- if $m.Options}}
+    printf '%s\n' "$c" | grep -qxF 'options {{$name}}{{range $k, $v := $m.Options}} {{$k}}={{$v}}{{end}}' || { echo "modprobe does not give {{$name}} its options" >&2; exit 1; }; \
+{{- end}}
+{{- if $m.Load}}
+    systemd-analyze cat-config modules-load.d | grep -qx '{{$name}}' || { echo "systemd-modules-load does not load {{$name}}" >&2; exit 1; }; \
+{{- end}}
+{{- end}}
+    true
+
+{{end}}# Console on the screen and on the serial port, serial last so it owns /dev/console: the recovery
 # shell must work on a VM without a display. The build fails when kairos-init's boot arguments
 # no longer read as expected.
 RUN set -e; f=/etc/cos/bootargs.cfg; \

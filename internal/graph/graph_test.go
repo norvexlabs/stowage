@@ -551,6 +551,8 @@ func TestKairosSettingsReachTheBundle(t *testing.T) {
 	}{
 		{"base: ubuntu:26.04@sha256:c", "base: ubuntu:26.04@sha256:d", true, true},
 		{"kairos-init:v4.4.0-rc2@sha256:a", "kairos-init:v4.4.0-rc2@sha256:b", true, true},
+		{"pcspkr: { block: true, reason: a VM has no speaker }", "pcspkr: { block: true, reason: no speaker }", true, true},
+		{"redirect_always_follow: \"Y\"", "redirect_always_follow: \"N\"", true, true},
 		{"disk_formats: [raw, qcow2, ova, vhd, gce]", "disk_formats: [raw, qcow2, vhd, gce]", false, true},
 		// The clouds' formats are made whether disk_formats lists them or not.
 		{"disk_formats: [raw, qcow2, ova, vhd, gce]", "disk_formats: [qcow2, ova]", false, false},
@@ -645,4 +647,30 @@ func TestOSAndDiskKeys(t *testing.T) {
 // bundle's <short>-stow (and so its disks), and the release.
 func carriers() map[string]bool {
 	return map[string]bool{"installer": true, "os-bundle": true, "disks": true, "release": true}
+}
+
+// Another scanner changes the release, its installer and its OS bundle (whose <short>-stow
+// names it, though the bundle does not preload it).
+func TestTheScannerReachesTheRelease(t *testing.T) {
+	t.Parallel()
+	root := testutil.CopyExample(t, "full")
+	p, err := project.Open(root, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	v, err := p.Version()
+	if err != nil {
+		t.Fatal(err)
+	}
+	g := func(scanner string) map[string]string {
+		gr, err := Build(p, Release{Version: v, Revision: 1, Channel: firstChannel(p), Scanner: scanner})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return inputs(gr)
+	}
+	c := changed(g(""), g("example.org/grype@sha256:"+strings.Repeat("a", 64)))
+	if !c[AuditID] || !c["release"] || !c["installer"] || !c["os-bundle"] {
+		t.Errorf("changed = %v", c)
+	}
 }

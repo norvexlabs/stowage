@@ -30,6 +30,8 @@ type KeySigner struct {
 	// Predicate is the statement's predicate type: cosign sign's unless a test makes an
 	// attestation of another kind.
 	Predicate string
+	// Body is the statement's predicate, when set (an attestation's document).
+	Body json.RawMessage
 }
 
 // NewKeySigner makes a fresh ECDSA P-256 key pair, as `cosign generate-key-pair` does.
@@ -67,11 +69,15 @@ func (s *KeySigner) SignAs(t testing.TB, d, subject name.Digest, opts ...remote.
 	if err != nil {
 		t.Fatal(err)
 	}
-	stmt, _ := json.Marshal(map[string]any{
+	st := map[string]any{
 		"_type":         "https://in-toto.io/Statement/v1",
 		"subject":       []any{map[string]any{"digest": map[string]string{"sha256": h.Hex}}},
 		"predicateType": s.Predicate,
-	})
+	}
+	if s.Body != nil {
+		st["predicate"] = s.Body
+	}
+	stmt, _ := json.Marshal(st)
 	const payloadType = "application/vnd.in-toto+json"
 	pae := fmt.Sprintf("DSSEv1 %d %s %d %s", len(payloadType), payloadType, len(stmt), stmt)
 	var sum []byte

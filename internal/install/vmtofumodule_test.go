@@ -202,7 +202,7 @@ func TestVMCreateWithABuiltInPreviewModule(t *testing.T) {
 			t.Errorf("no %q in:\n%s", s, v.out2())
 		}
 	}
-	for _, s := range []string{"OpenTofu creates the VM notes-1 on Proxmox VE: 2 CPUs, 4096 MiB, a 40 GiB disk", "    node = pve1",
+	for _, s := range []string{"OpenTofu creates the VM notes-1 on Proxmox VE: 2 CPUs, 4096 MiB, a 43 GiB disk (the OS 23 GiB, the app 20 GiB)", "    node = pve1",
 		"then waits for it at the address its module returns, else notes-1", "OpenTofu created the VM notes-1 (1234567890123456789)"} {
 		if !strings.Contains(v.log.String(), s) {
 			t.Errorf("no %q in the log:\n%s", s, v.log)
@@ -478,7 +478,7 @@ func TestVMCreateOnACloudAsksNoCPUsOrMemory(t *testing.T) {
 	if _, ok := vars["cpus"]; ok || vars["image_format"] != nil || vars["region"] != "eu-west-3" || vars["seed"] == nil {
 		t.Errorf("variables %v", vars)
 	}
-	if !strings.Contains(v.log.String(), "OpenTofu creates the VM notes-1 on Amazon EC2: a 40 GiB disk\n") {
+	if !strings.Contains(v.log.String(), "OpenTofu creates the VM notes-1 on Amazon EC2: a 43 GiB disk (the OS 23 GiB, the app 20 GiB)\n") {
 		t.Errorf("review:\n%s", v.log)
 	}
 }

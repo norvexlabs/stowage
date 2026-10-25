@@ -4,10 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"os/exec"
+	"slices"
 	"strings"
 
+	"github.com/norvexlabs/stowage/internal/spec"
 	"github.com/norvexlabs/stowage/internal/tune"
 	"github.com/spf13/cobra"
 )
@@ -27,6 +30,7 @@ func (in *Installer) tuneSystem(ctx context.Context) (tune.System, error) {
 		return *in.tuned, nil
 	}
 	sys := *in.O.Tune
+	sys.Modules = releaseModules(in.R.Spec)
 	out, err := in.O.Docker.Run(ctx, Cmd{Args: []string{"info", "--format", "{{.ServerVersion}}|{{.OperatingSystem}}|{{json .SecurityOptions}}"}})
 	if err != nil {
 		// Docker Desktop stopped is still Docker Desktop: its CLI context says so.
@@ -233,6 +237,20 @@ func (in *Installer) tuneHint(ctx context.Context) {
 // hostTune is the machine's tune.System, of profile ("" is the last apply's).
 func hostTune(ctl string, run func(ctx context.Context, name string, args ...string) ([]byte, error), look func(string) (string, error), profile tune.Profile) *tune.System {
 	return &tune.System{Root: "/", Run: run, Look: look, Euid: os.Geteuid, Ctl: ctl, Profile: profile}
+}
+
+// releaseModules are the kernel modules the release's shapes.kairos.modules declares, by name.
+func releaseModules(s *spec.Spec) []tune.Module {
+	if s.Shapes.Kairos == nil {
+		return nil
+	}
+	mods := s.Shapes.Kairos.Modules
+	var out []tune.Module
+	for _, name := range slices.Sorted(maps.Keys(mods)) {
+		m := mods[name]
+		out = append(out, tune.Module{Name: name, Load: m.Load, Block: m.Block, Options: m.Options, Reason: m.Reason})
+	}
+	return out
 }
 
 // runHost runs a host program, its error carrying what it wrote to stderr.

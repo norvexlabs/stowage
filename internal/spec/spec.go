@@ -107,7 +107,7 @@ type Image struct {
 // ReservedImageKeys are the image keys whose repository <prefix>/<name>-<key> Stowage publishes
 // its own artifacts to (release manifests, sequence records, OS bundle, disks, installer, front,
 // the VM's backup runner, the volume helper).
-var ReservedImageKeys = []string{"release", "release-seq", "os", "disk", "installer", front.Key, backup.Key, chown.Key}
+var ReservedImageKeys = []string{"release", "release-seq", "os", "disk", "installer", front.Key, backup.Key, chown.Key, "audit" /* sbom.Key */}
 
 // Built reports whether Stowage builds this image (as opposed to pulling a pinned reference).
 func (i Image) Built() bool { return i.Ref == "" }
@@ -425,7 +425,26 @@ type KairosShape struct {
 	HostAPI []string `yaml:"host_api"`
 	// Size is the VM's least and recommended size, which `vm create` sizes a VM from.
 	Size *VMSize `yaml:"size"`
+	// Modules are the kernel modules the OS bundle loads, blocks or gives options, by name.
+	Modules map[string]KernelModule `yaml:"modules"`
 }
+
+// KernelModule is one of shapes.kairos.modules: what the host does with the module, and why.
+type KernelModule struct {
+	Load  bool `yaml:"load"`
+	Block bool `yaml:"block"`
+	// Options are the module's parameters, by name.
+	Options map[string]string `yaml:"options"`
+	Reason  string            `yaml:"reason"`
+}
+
+// ModuleName, ModuleOption and ModuleValue are what a kernel module's name, a parameter's name
+// and its value may hold: they are written into modprobe's files and the bundle's build.
+var (
+	ModuleName   = regexp.MustCompile(`^[a-z0-9_]{1,56}$`)
+	ModuleOption = regexp.MustCompile(`^[A-Za-z0-9_]{1,64}$`)
+	ModuleValue  = regexp.MustCompile(`^[A-Za-z0-9_.,:/+-]{1,256}$`)
+)
 
 // Formats are the shape's disk formats, those cloud_publish's clouds import included, in the
 // order they are made (DiskFormats'), whatever the order the spec lists them in.

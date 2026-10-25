@@ -15,9 +15,11 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/norvexlabs/stowage/internal/kairos"
 	"github.com/norvexlabs/stowage/internal/lint"
 	"github.com/norvexlabs/stowage/internal/registry"
 	"github.com/norvexlabs/stowage/internal/release"
@@ -37,7 +39,7 @@ type Platform struct {
 	// Preview: that module has not run on the platform yet.
 	Tofu, Preview bool
 	// Steps are what the operator does with the files, in order; %[1]s is the disk file, %[2]s the
-	// seed (the ISO or the user-data file).
+	// seed (the ISO or the user-data file), %[3]d the disk's size in GiB (the OS's and the app's).
 	Steps []string
 }
 
@@ -45,37 +47,37 @@ type Platform struct {
 var Platforms = []Platform{
 	{Key: "truenas", Label: "TrueNAS", Formats: []string{"qcow2", "raw"}, ISO: true, Tofu: true, Steps: []string{
 		"Copy %[1]s and %[2]s to the TrueNAS host.",
-		"Create a zvol at least as large as the disk you want, and write the disk into it: qemu-img convert -O raw %[1]s /dev/zvol/<pool>/<zvol>.",
+		"Create a zvol of %[3]d GiB, and write the disk into it: qemu-img convert -O raw %[1]s /dev/zvol/<pool>/<zvol>.",
 		"Create a VM with UEFI boot, that zvol as its disk (VirtIO) and %[2]s as its CD-ROM, then start it.",
 	}},
 	{Key: "proxmox", Label: "Proxmox VE", Formats: []string{"qcow2", "raw"}, ISO: true, Tofu: true, Preview: true, Steps: []string{
 		"Copy %[1]s to the Proxmox host, and %[2]s to an ISO storage (e.g. /var/lib/vz/template/iso/).",
-		"Create a VM with OVMF (UEFI) firmware and no disk, then import the disk: qm disk import <vmid> %[1]s <storage>; attach it and grow it to the size you want.",
+		"Create a VM with OVMF (UEFI) firmware and no disk, then import the disk: qm disk import <vmid> %[1]s <storage>; attach it and grow it to %[3]d GiB.",
 		"Attach %[2]s as the VM's CD-ROM, make the disk the first boot device, then start it.",
 	}},
 	{Key: "libvirt", Label: "libvirt / KVM (virt-install, virt-manager)", Formats: []string{"qcow2", "raw"}, ISO: true, Tofu: true, Preview: true, Steps: []string{
-		"Grow the disk to the size you want: qemu-img resize %[1]s 40G.",
+		"Grow the disk: qemu-img resize %[1]s %[3]dG.",
 		"virt-install --name <name> --memory 4096 --vcpus 2 --boot uefi --osinfo linux2022 --import --disk %[1]s --disk %[2]s,device=cdrom --network default --noautoconsole",
 	}},
 	{Key: "vmware", Label: "VMware vSphere, ESXi or Workstation", Formats: []string{"ova"}, ISO: true, Tofu: true, Preview: true, Steps: []string{
-		"Deploy %[1]s (Deploy OVF Template, or File > Open), and grow its disk to the size you want.",
+		"Deploy %[1]s (Deploy OVF Template, or File > Open), and grow its disk to %[3]d GiB.",
 		"Upload %[2]s to a datastore and attach it as the VM's CD-ROM (connected at power on), then power the VM on.",
 	}},
 	{Key: "hyperv", Label: "Hyper-V", Formats: []string{"vhd"}, ISO: true, Steps: []string{
-		"Convert the disk for a generation 2 VM and grow it: Convert-VHD %[1]s <name>.vhdx; Resize-VHD <name>.vhdx -SizeBytes 40GB.",
+		"Convert the disk for a generation 2 VM and grow it: Convert-VHD %[1]s <name>.vhdx; Resize-VHD <name>.vhdx -SizeBytes %[3]dGB.",
 		"Create a generation 2 VM on <name>.vhdx, with Secure Boot's template \"Microsoft UEFI Certificate Authority\", and %[2]s in its DVD drive, then start it.",
 	}},
 	{Key: "azure", Label: "Microsoft Azure", Formats: []string{"vhd"}, Tofu: true, Preview: true, Steps: []string{
 		"Upload %[1]s as a page blob, and create a managed image from it (az image create --source <blob URL> --os-type Linux --hyper-v-generation V2).",
-		"Create the VM from that image with %[2]s as its custom data (az vm create --custom-data %[2]s).",
+		"Create the VM from that image with %[2]s as its custom data and a %[3]d GiB disk (az vm create --custom-data %[2]s --os-disk-size-gb %[3]d).",
 	}},
 	{Key: "gcp", Label: "Google Cloud", Formats: []string{"gce"}, Tofu: true, Preview: true, Steps: []string{
 		"Upload %[1]s to a bucket, and create an image from it (gcloud compute images create --source-uri gs://<bucket>/<file> --guest-os-features UEFI_COMPATIBLE).",
-		"Create the instance from that image with %[2]s as its user-data (gcloud compute instances create --metadata-from-file user-data=%[2]s).",
+		"Create the instance from that image with %[2]s as its user-data and a %[3]d GiB disk (gcloud compute instances create --metadata-from-file user-data=%[2]s --boot-disk-size %[3]dGB).",
 	}},
 	{Key: "aws", Label: "Amazon EC2", Formats: []string{"raw"}, Tofu: true, Preview: true, Steps: []string{
 		"Upload %[1]s to S3, import it as a snapshot (aws ec2 import-snapshot), and register an image from it (aws ec2 register-image --boot-mode uefi).",
-		"Launch the instance from that image with %[2]s as its user data (aws ec2 run-instances --user-data file://%[2]s).",
+		"Launch the instance from that image with %[2]s as its user data and a %[3]d GiB root volume (aws ec2 run-instances --user-data file://%[2]s, the image's root device mapped to a volume of that size with --block-device-mappings).",
 	}},
 }
 
@@ -364,8 +366,10 @@ func (in *Installer) CreateVM(ctx context.Context, c *VMCreate) error {
 	if n := in.vmSize().note(name); n != "" {
 		fmt.Fprintf(o.Out, "  Size the VM: %s.\n", n)
 	}
+	app := in.vmSize().def.gib
+	fmt.Fprintf(o.Out, "  The disk: %s.\n", in.diskSplit(format, app))
 	for n, s := range p.Steps {
-		fmt.Fprintf(o.Out, "  %d. %s\n", n+1, fmt.Sprintf(s, disk, seed))
+		fmt.Fprintf(o.Out, "  %d. %s\n", n+1, fmt.Sprintf(s, disk, seed, in.boot.diskGiB(format, app)))
 	}
 	if st.AwaitSecrets {
 		fmt.Fprintf(o.Out, "\nIts first install waits for its secrets (the file `secrets export` wrote, decrypted), which the cloud-config never carries: %s\n", secretsSteps(mach.User, "<address>", ctl))
@@ -387,6 +391,36 @@ func (in *Installer) CreateVM(ctx context.Context, c *VMCreate) error {
 type bootDisk struct {
 	release string
 	disks   map[string]string
+	// osMiB is what Kairos takes of a VM's disk besides the app's space, by format.
+	osMiB map[string]int64
+}
+
+// osGiB is what Kairos takes of a VM's disk of format, with room for the partition tables and
+// their alignment: the app keeps every GiB it asked for.
+func (b bootDisk) osGiB(format string) int {
+	return int((b.osMiB[format] + diskSlackMiB + 1023) / 1024)
+}
+
+// diskSlackMiB is the room osGiB leaves for the GPT and the partitions' alignment.
+const diskSlackMiB = 256
+
+// maxOSMiB bounds what a disk may record Kairos takes of it: 16 TiB.
+const maxOSMiB = 16 << 20
+
+// osMiBOf is a disk's DiskOSAnnotation as MiB, 1 to maxOSMiB; false for anything else.
+func osMiBOf(s string) (int64, bool) {
+	n, err := strconv.ParseInt(s, 10, 64)
+	return n, err == nil && n > 0 && n <= maxOSMiB
+}
+
+// diskGiB is the disk a VM of format is made with: the app's space and what Kairos takes; an
+// OVA's never under the capacity it declares (kairos.OVACapacityMiB), which no platform shrinks.
+func (b bootDisk) diskGiB(format string, app int) int {
+	n := app + b.osGiB(format)
+	if format == "ova" {
+		n = max(n, int((kairos.OVACapacityMiB(b.osMiB[format])+1023)/1024))
+	}
+	return n
 }
 
 // switchingStowage is the first stowage whose OS's first boot takes another release's OS bundle
@@ -400,32 +434,45 @@ const switchingStowage = "0.6.0"
 // record, signed too.
 func (in *Installer) bootDisks(ctx context.Context, cl *registry.Client, prefix string) (bootDisk, error) {
 	m, name := in.R.Manifest, in.R.Spec.Name
-	present := func(disks map[string]string) (bool, error) {
+	// cannot is why a set found could not boot this release (an older stowage's, or one recording
+	// no OS size), said when no other one can.
+	var cannot error
+	// present is the size Kairos takes of each disk of the set, by format; nil when one is not in
+	// the registry, or records no size (published by an earlier Stowage: the set boots no VM).
+	present := func(disks map[string]string) (map[string]int64, error) {
+		sizes := map[string]int64{}
 		for _, f := range slices.Sorted(maps.Keys(disks)) {
 			ref, err := cl.Digest(prefix+"/"+name+"-disk", disks[f])
 			if err != nil {
-				return false, err
+				return nil, err
 			}
-			d, err := cl.Head(ctx, ref)
+			ann, _, ok, err := cl.Annotations(ctx, ref)
 			if err != nil {
-				return false, fmt.Errorf("the %s disk: %w", f, err)
+				return nil, fmt.Errorf("the %s disk: %w", f, err)
 			}
-			if d == nil {
-				return false, nil
+			if !ok {
+				return nil, nil
 			}
+			n, valid := osMiBOf(ann[release.DiskOSAnnotation])
+			if !valid {
+				what := fmt.Sprintf("records no %s: published by an earlier Stowage", release.DiskOSAnnotation)
+				if s, set := ann[release.DiskOSAnnotation]; set {
+					what = fmt.Sprintf("records %s %q, not a size in MiB (1 to %d): not as Stowage publishes it", release.DiskOSAnnotation, s, maxOSMiB)
+				}
+				cannot = cmp.Or(cannot, fmt.Errorf("the %s disk %s %s, the publisher ships a new revision with its disks", f, registry.Short(ref.DigestStr()), what))
+				return nil, nil
+			}
+			sizes[f] = n
 		}
-		return true, nil
+		return sizes, nil
 	}
-	// cannot is why a set found could not boot this release (an older stowage's), said when no
-	// other one can.
-	var cannot error
 	usable := func(src *release.Manifest) (bootDisk, bool, error) {
 		tag, disks := src.Artifacts.Boot(src.Tag)
 		if len(disks) == 0 {
 			return bootDisk{}, false, nil
 		}
-		ok, err := present(disks)
-		if err != nil || !ok {
+		sizes, err := present(disks)
+		if err != nil || sizes == nil {
 			return bootDisk{}, false, err
 		}
 		if tag != m.Tag {
@@ -439,7 +486,7 @@ func (in *Installer) bootDisks(ctx context.Context, cl *registry.Client, prefix 
 				return bootDisk{}, false, nil
 			}
 		}
-		return bootDisk{tag, disks}, true, nil
+		return bootDisk{tag, disks, sizes}, true, nil
 	}
 	if d, ok, err := usable(m); err != nil || ok {
 		return d, err
@@ -937,6 +984,13 @@ func (in *Installer) vmSettings(ctx context.Context) (*Settings, []string, error
 	return st, waiting, nil
 }
 
+// diskSplit says the disk a VM of format gets for app GiB of the app's: "a 43 GiB disk (the OS 23
+// GiB, the app 20 GiB)".
+func (in *Installer) diskSplit(format string, app int) string {
+	total, kairosGiB := in.boot.diskGiB(format, app), in.boot.osGiB(format)
+	return fmt.Sprintf("a %d GiB disk (the OS %d GiB, the app %d GiB)", total, kairosGiB, total-kairosGiB)
+}
+
 // confirmVM shows what will be written, and on a terminal asks to go on.
 func (in *Installer) confirmVM(ctx context.Context, p Platform, format string, m Machine, st *Settings, seed string, c *VMCreate, addr string) error {
 	o := &in.O
@@ -946,7 +1000,7 @@ func (in *Installer) confirmVM(ctx context.Context, p Platform, format string, m
 	if tofu {
 		t := c.TofuVM
 		if t.builtinTrueNAS(p) {
-			fmt.Fprintf(&b, "  OpenTofu creates the VM %s at %s: %d CPUs, %d MiB, a %d GiB disk on %s/%s, its network on %s\n", t.Name, o.getenv(truenas.URLVar), t.CPUs, t.MemoryMiB, t.DiskGiB, t.Pool, t.Dataset, t.Bridge)
+			fmt.Fprintf(&b, "  OpenTofu creates the VM %s at %s: %d CPUs, %d MiB, %s on %s/%s, its network on %s\n", t.Name, o.getenv(truenas.URLVar), t.CPUs, t.MemoryMiB, in.diskSplit(format, t.DiskGiB), t.Pool, t.Dataset, t.Bridge)
 		} else {
 			with := ""
 			if t.Module != "" {
@@ -959,7 +1013,7 @@ func (in *Installer) confirmVM(ctx context.Context, p Platform, format string, m
 			if t.MemoryMiB != 0 {
 				size = append(size, fmt.Sprintf("%d MiB", t.MemoryMiB))
 			}
-			size = append(size, fmt.Sprintf("a %d GiB disk", t.DiskGiB))
+			size = append(size, in.diskSplit(format, t.DiskGiB))
 			fmt.Fprintf(&b, "  OpenTofu creates the VM %s on %s%s: %s\n", t.Name, p.Label, with, strings.Join(size, ", "))
 			for _, k := range sortedKeys(t.Vars) {
 				fmt.Fprintf(&b, "    %s = %s\n", k, t.Vars[k])

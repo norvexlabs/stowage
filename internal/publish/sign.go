@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -17,6 +18,7 @@ import (
 	"github.com/google/go-containerregistry/pkg/name"
 
 	"github.com/norvexlabs/stowage/internal/registry"
+	"github.com/norvexlabs/stowage/internal/sbom"
 	"github.com/norvexlabs/stowage/internal/sigverify"
 )
 
@@ -27,7 +29,15 @@ type Signer interface {
 	// wrapping ErrUnsigned when it carries none, and any other error when it could not tell (the
 	// registry, the key store or the signing tool failed).
 	Verify(ctx context.Context, d name.Digest) error
+	// Attest attaches doc, d's SBOM (SPDX JSON), as an attestation signed by the key.
+	Attest(ctx context.Context, d name.Digest, doc []byte) error
+	// Attestation is d's SBOM attested by a trusted key; an error wrapping ErrNoAttestation when
+	// it carries none, any other when it could not tell.
+	Attestation(ctx context.Context, d name.Digest) ([]byte, error)
 }
+
+// ErrNoAttestation is the answer "no SBOM attested by a trusted key".
+var ErrNoAttestation = sigverify.ErrNoAttestation
 
 // ErrUnsigned is the answer "no signature by a trusted key", as opposed to a failure to check.
 var ErrUnsigned = sigverify.ErrUnsigned
@@ -122,6 +132,70 @@ func (s *CosignSigner) PublicKey(ctx context.Context) ([]byte, error) {
 // Verify implements Signer, in-process.
 func (s *CosignSigner) Verify(ctx context.Context, d name.Digest) error {
 	return s.verifier.Verify(ctx, s.Reader, d)
+}
+
+// Attest implements Signer: `cosign attest`, the document in a private file of the call's.
+func (s *CosignSigner) Attest(ctx context.Context, d name.Digest, doc []byte) error {
+	if s.Key == "" {
+		return errors.New("signing: no private key (a read-only command cannot attest)")
+	}
+	if err := os.MkdirAll(s.WorkDir, 0o700); err != nil {
+		return err
+	}
+	dir, err := os.MkdirTemp(s.WorkDir, "sbom-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(dir)
+	pred := filepath.Join(dir, "sbom.spdx.json")
+	if err := os.WriteFile(pred, doc, 0o600); err != nil {
+		return err
+	}
+	args := []string{"--key", s.Key, "--type", sbom.CosignType, "--predicate", pred, "--tlog-upload=false", "--use-signing-config=false", "--yes", d.String()}
+	if registry.Loopback(hostname(s.Registry.RegistryStr())) {
+		args = append([]string{"--allow-http-registry"}, args...)
+	}
+	return s.run(ctx, nil, true, "attest", args...)
+}
+
+// Attestation implements Signer, in-process.
+func (s *CosignSigner) Attestation(ctx context.Context, d name.Digest) ([]byte, error) {
+	r, ok := s.Reader.(sigverify.AttestationRegistry)
+	if !ok {
+		return nil, errors.New("signing: the registry reader cannot read attestations")
+	}
+	return s.verifier.Attestation(ctx, r, d, sbom.PredicateType)
+}
+
+// SyftMaker makes an image's SBOM with syft, from the registry, which syft reaches with the
+// publisher's credentials in a private Docker config of the call's.
+type SyftMaker struct {
+	Docker   sbom.Docker
+	Registry name.Registry
+	Auth     authn.Authenticator
+	WorkDir  string // on disk, private to the user
+}
+
+// SBOM is d's SPDX document.
+func (m *SyftMaker) SBOM(ctx context.Context, d name.Digest) ([]byte, error) {
+	if err := os.MkdirAll(m.WorkDir, 0o700); err != nil {
+		return nil, err
+	}
+	dir, err := os.MkdirTemp(m.WorkDir, "syft-")
+	if err != nil {
+		return nil, err
+	}
+	defer os.RemoveAll(dir)
+	var c *authn.AuthConfig
+	if m.Auth != nil {
+		if c, err = m.Auth.Authorization(); err != nil {
+			return nil, fmt.Errorf("sbom: registry credentials: %w", err)
+		}
+	}
+	if err := registry.WriteDockerConfig(dir, m.Registry, c, nil); err != nil {
+		return nil, err
+	}
+	return sbom.Generate(ctx, m.Docker, sbom.Source{Ref: d.String(), Insecure: m.Registry.Scheme() == "http", Config: dir})
 }
 
 // run runs cosign's verb, with auth the registry's credentials in a private Docker config (an

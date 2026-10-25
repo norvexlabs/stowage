@@ -33,13 +33,20 @@ jobs:
           [ "$(uname -m)" = x86_64 ] || { echo "the runner is $(uname -m), the asset linux-amd64"; exit 1; }
       - run: make check
       - run: make build
-      # The asset is the binary this build made, set aside before anything else runs from bin/.
-      # The notes are the tag's own entry, up to the next entry or a link definition.
+      # The asset is the binary this build made, set aside before anything else runs from bin/, and
+      # its SBOM (SPDX, by the syft every release's SBOMs are made with: internal/sbom's pin), both
+      # in the signed checksums. The notes are the tag's own entry, up to the next entry or a link
+      # definition.
       - name: assets and notes
         run: |
           mkdir dist
           cp bin/stowage dist/stowage-linux-amd64
-          (cd dist && sha256sum stowage-linux-amd64 > SHA256SUMS)
+          docker run --rm --mount "type=bind,src=$PWD/dist,dst=/d,readonly" \
+            docker.io/anchore/syft:v1.55.0@sha256:4cc92b64ca74ffca4c94d4c8fcc01f217731375300be14d0b6eeb2e82eaa110a \
+            file:/d/stowage-linux-amd64 -o spdx-json -q > dist/stowage-linux-amd64.spdx.json
+          jq -e '.spdxVersion and (.packages | map(.name) | index("github.com/norvexlabs/stowage"))' dist/stowage-linux-amd64.spdx.json >/dev/null ||
+            { echo "the SBOM does not name stowage's module"; exit 1; }
+          (cd dist && sha256sum stowage-linux-amd64 stowage-linux-amd64.spdx.json > SHA256SUMS)
           awk -v h="## [${GITHUB_REF_NAME#v}] - " 'index($0, h) == 1 {on = 1; next} on && (/^## \[/ || /^\[[^]]+\]: /) {exit} on' CHANGELOG.md > dist/notes.md
           grep -q . dist/notes.md || { echo "no notes for $GITHUB_REF_NAME"; exit 1; }
       # Uploaded before anything else of the repository runs: what lint runs cannot change it.
@@ -91,5 +98,5 @@ jobs:
             true) gh release edit "$GITHUB_REF_NAME" --title "$title" --notes-file dist/notes.md ;;
             *) echo "release $GITHUB_REF_NAME: already published, or more than one ($drafts)"; exit 1 ;;
           esac
-          gh release upload "$GITHUB_REF_NAME" dist/stowage-linux-amd64 dist/SHA256SUMS dist/SHA256SUMS.sigstore.json --clobber
+          gh release upload "$GITHUB_REF_NAME" dist/stowage-linux-amd64 dist/stowage-linux-amd64.spdx.json dist/SHA256SUMS dist/SHA256SUMS.sigstore.json --clobber
           gh release edit "$GITHUB_REF_NAME" --draft=false

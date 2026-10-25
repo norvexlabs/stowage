@@ -32,12 +32,14 @@ grep -q 'image postgres: mirror' "$WORK/ship1.log" || fail "postgres was not mir
 grep -q 'image front: build' "$WORK/ship1.log" || fail "the front was not built"
 grep -q 'installer: push' "$WORK/ship1.log" || fail "the installer was not pushed"
 grep -q 'chart: tag .* → charts/notes-beta:0.1.0' "$WORK/ship1.log" || fail "the chart was not pushed"
-[[ $(grep -c '^signed ' "$WORK/ship1.log") == 9 ]] || { cat "$WORK/ship1.log"; fail "want 9 signatures (3 images, the front, the backup runner, the volume helper, the chart, the installer, the release manifest)"; }
+[[ $(grep -c '^signed ' "$WORK/ship1.log") == 10 ]] || { cat "$WORK/ship1.log"; fail "want 10 signatures (3 images, the front, the backup runner, the volume helper, the scanner, the chart, the installer, the release manifest)"; }
+grep -q 'image audit: mirror docker.io/anchore/grype' "$WORK/ship1.log" || fail "the scanner was not mirrored"
+[[ $(grep -c '^attested the SBOM of ' "$WORK/ship1.log") == 8 ]] || { cat "$WORK/ship1.log"; fail "want 8 SBOMs (the 7 images, the installer)"; }
 
 step "ship beta again (nothing changes)"
 "${S[@]}" ship --channel beta 2>"$WORK/ship2.log" || { cat "$WORK/ship2.log"; fail "ship"; }
 cat "$WORK/ship2.log"
-! grep -qE 'image [a-z]+: (build|mirror|tag )|installer[: ]|chart: |published \(seq|^signed ' "$WORK/ship2.log" || fail "a second ship wrote something"
+! grep -qE 'image [a-z]+: (build|mirror|tag )|installer[: ]|chart: |published \(seq|^signed |^attested ' "$WORK/ship2.log" || fail "a second ship wrote something"
 grep -q 'release beta-1.0.0 unchanged' "$WORK/ship2.log" || fail "release not reported unchanged"
 
 step "no pull account, and the registry refuses anonymous reads: ship stops before it builds"
@@ -45,6 +47,35 @@ if "${S[@]}" --test-pull none ship --channel beta 2>"$WORK/private.log"; then fa
 grep -q "every install reads $REG/notes anonymously, and .*$REG/notes/notes-api.* refuse an anonymous read" "$WORK/private.log" ||
 	{ cat "$WORK/private.log"; fail "the refusal does not name the private repositories"; }
 ! grep -qE 'image [a-z]+: (build|mirror)' "$WORK/private.log" || fail "ship built before it refused"
+
+step "audit: every SBOM attested by the release key, scanned (the database given), and checked by hand with cosign"
+grype_db
+env -u STOWAGE_PUSH_TOKEN "${S[@]}" audit --channel beta --db "$GRYPE_DB" --json >"$WORK/audit.json" 2>"$WORK/audit.log" ||
+	{ cat "$WORK/audit.log" "$WORK/audit.json"; fail "audit"; }
+[[ $(jq '.subjects | length' "$WORK/audit.json") == 8 && $(jq '[.subjects[] | select(.error)] | length' "$WORK/audit.json") == 0 ]] ||
+	{ cat "$WORK/audit.json"; fail "not every artifact was audited"; }
+[[ $(jq -r '.subjects[] | select(.name == "postgres") | .findings | type' "$WORK/audit.json") == array ]] && jq -e '.db_built | type == "string"' "$WORK/audit.json" >/dev/null ||
+	fail "the audit's report lacks the scan"
+api=$(jq -r '.subjects[] | select(.name == "api") | .digest' "$WORK/audit.json")
+# cosign reads with the pull account, from a Docker config of its own under $WORK.
+mkdir -p "$WORK/pull-config"
+printf '{"auths":{"%s":{"auth":"%s"}}}\n' "$REG" "$(printf 'pull:%s' "$PULL_TOKEN" | base64 -w0)" >"$WORK/pull-config/config.json"
+DOCKER_CONFIG=$WORK/pull-config "$STOWAGE_COSIGN" verify-attestation --key "$P/keys/release.pub" --type spdxjson --insecure-ignore-tlog=true --allow-http-registry "$REG/notes/notes-api@$api" 2>"$WORK/verify-attestation.log" |
+	jq -r .payload | base64 -d | jq -e '.predicateType == "https://spdx.dev/Document" and (.predicate.spdxVersion | startswith("SPDX-"))' >/dev/null ||
+	{ tail -5 "$WORK/verify-attestation.log"; fail "cosign verify-attestation does not read the api's SBOM"; }
+# Negative control: the api's SBOM deleted (its signature kept), the audit names it not audited;
+# promote, below, makes it again.
+att=""
+for ref in $(curl -sf -u "publisher:$STOWAGE_PUSH_TOKEN" "http://$REG/v2/notes/notes-api/referrers/$api" | jq -r '.manifests[].digest'); do
+	layer=$(curl -sf -u "publisher:$STOWAGE_PUSH_TOKEN" -H 'Accept: application/vnd.oci.image.manifest.v1+json' "http://$REG/v2/notes/notes-api/manifests/$ref" | jq -r '.layers[0].digest // empty' 2>/dev/null) || continue
+	pt=$(curl -sfL -u "publisher:$STOWAGE_PUSH_TOKEN" "http://$REG/v2/notes/notes-api/blobs/$layer" | jq -r '.dsseEnvelope.payload // empty | @base64d | fromjson | .predicateType' 2>/dev/null || true)
+	[[ $pt == https://spdx.dev/Document ]] && att=$ref
+done
+[[ -n $att ]] || fail "the api's SBOM attestation is not among its referrers"
+curl -sf -u "publisher:$STOWAGE_PUSH_TOKEN" -X DELETE "http://$REG/v2/notes/notes-api/manifests/$att" || fail "deleting the api's SBOM"
+if env -u STOWAGE_PUSH_TOKEN "${S[@]}" audit --channel beta --db "$GRYPE_DB" >"$WORK/audit-lost.txt" 2>"$WORK/audit-lost.log"; then fail "audit passed with the api's SBOM gone"; fi
+grep -q 'audit: not audited: api$' "$WORK/audit-lost.log" && grep -q '^api .*not audited: .*no https://spdx.dev/Document attestation by a trusted key' "$WORK/audit-lost.txt" ||
+	{ cat "$WORK/audit-lost.txt" "$WORK/audit-lost.log"; fail "the audit does not name the api's SBOM gone"; }
 
 step "verify, promote, verify"
 # Read-only: with the pull account only (zot grants it read, nothing else).
@@ -56,6 +87,7 @@ if env -u STOWAGE_PUSH_TOKEN "${S[@]}" verify --channel beta 2>"$WORK/badkey.log
 grep -q 'no signature by a trusted key' "$WORK/badkey.log" || { cat "$WORK/badkey.log"; fail "wrong-key refusal"; }
 cp "$WORK/release.pub.saved" "$P/keys/release.pub"
 "${S[@]}" promote 1.0.0 --from beta --to stable 2>"$WORK/promote.log" || { cat "$WORK/promote.log"; fail "promote"; }
+grep -q "^attested the SBOM of $REG/notes/notes-api@$api" "$WORK/promote.log" || { cat "$WORK/promote.log"; fail "promote did not make the api's lost SBOM again"; }
 ! grep -qE 'image [a-z]+: (build|mirror)' "$WORK/promote.log" || fail "promote rebuilt or re-mirrored"
 "${S[@]}" verify --channel stable
 grep -q 'installer :latest → 1.0.0' "$WORK/promote.log" || { cat "$WORK/promote.log"; fail "the installer :latest did not move with stable"; }

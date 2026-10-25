@@ -95,7 +95,7 @@ allow=$MIRROR_IP/32
 for a in "${HOST6[@]}"; do allow+=",$a/128"; done
 "$CTL" vm create --no-input --platform truenas --create opentofu --hostname "$H" --user ops --ssh-key "$KEY.pub" \
 	--tls internal --domains app=app.notes.test,api=api.notes.test --set ADMIN_EMAIL=admin@notes.test --set "DB_SOURCES=$MIRROR_IP/32" \
-	--pool "$POOL" --dataset "$DATASET" --bridge "$BRIDGE" --cpus 2 --memory 4096 --disk 32 --host "$ADDR" --wait "${E2E_VM_WAIT:-30m}" \
+	--pool "$POOL" --dataset "$DATASET" --bridge "$BRIDGE" --cpus 2 --memory 4096 --disk 16 --host "$ADDR" --wait "${E2E_VM_WAIT:-30m}" \
 	--registry "$SITE" --registry-ca "$MIRROR_CA" --ssh-allow "$allow" --ipv6 --timezone Europe/Paris \
 	>"$WORK/vm-create.txt" 2>"$WORK/vm-create.log" || { tail -80 "$WORK/vm-create.log"; fail "vm create"; }
 grep -q "^The VM $H runs notes 1.0.0" "$WORK/vm-create.txt" || { cat "$WORK/vm-create.txt"; fail "vm create did not report the install"; }
@@ -133,7 +133,9 @@ grep -qxE 'permitrootlogin (no|prohibit-password|without-password)' "$WORK/sshd.
 ! on_vm "systemctl cat serial-getty@ttyS0.service getty@tty1.service 2>/dev/null" | grep -qi autologin || fail "a console logs in by itself"
 # Recorded, not judged: Docker's forward policy, and what the agent reads at boot.
 on_vm sudo iptables -S FORWARD 2>/dev/null | head -1 || true
+on_vm sudo ip6tables -S FORWARD 2>/dev/null | head -1 || true
 on_vm "ls /oem" || true
+on_vm "sudo journalctl -b --no-pager -o cat | grep -iE 'user-?data|datasource|cloud-config' | head -20" || true
 
 step "on the VM: the boot tuned Docker's path (the release's default profile), and the containers as on the host"
 on_vm systemctl is-active notes-tune.service >/dev/null || { on_vm sudo journalctl -b -u notes-tune.service --no-pager | tail -30; fail "the tuning unit did not run"; }
@@ -191,6 +193,23 @@ on_vm sudo docker inspect --format "'{{range .Mounts}}{{.Source}}:{{.Destination
 step "on the VM: the install reads the mirror, whose CA the VM trusts"
 grep -qx "STOWAGE_REGISTRY='$SITE'" "$WORK/vm.env" || fail "the install does not record the mirror"
 on_vm curl -sf -o /dev/null "https://$MIRROR/v2/" || fail "the VM does not trust the mirror's CA"
+
+step "the disk: the app's 16 GiB on the persistent partition, Kairos's partitions beside it"
+size=$(on_vm "df -BG --output=size /usr/local | tail -1" | tr -dc 0-9)
+((size >= 15)) || { on_vm "df -h; lsblk" || true; fail "/usr/local holds ${size}G, not the app's 16 GiB"; }
+
+step "audit off the VM: the operator's notes-stow reads the VM's release's SBOMs from the mirror, by its version alone, and scans them"
+grype_db
+scanner_fresh "$SITE"
+"$CTL" audit --version 1.0.0 --channel beta --registry "$SITE" --registry-ca "$MIRROR_CA" --db "$GRYPE_DB" --json >"$WORK/audit.json" 2>"$WORK/audit.log" ||
+	{ cat "$WORK/audit.log" "$WORK/audit.json"; fail "audit of the VM's release"; }
+[[ $(jq '[.subjects[] | select(.error)] | length' "$WORK/audit.json") == 0 && $(jq '[.subjects[] | select(.name == "os" or .name == "disk-qcow2")] | length' "$WORK/audit.json") == 2 ]] ||
+	{ cat "$WORK/audit.json"; fail "not every artifact of the VM's release was audited"; }
+grep -q "pulling $SITE/notes-audit@" "$WORK/audit.log" || { cat "$WORK/audit.log"; fail "the scanner was not pulled from the mirror"; }
+"$CTL" sbom export --version 1.0.0 --channel beta --registry "$SITE" --registry-ca "$MIRROR_CA" "$WORK/sbom" >"$WORK/sbom.txt" 2>&1 || { cat "$WORK/sbom.txt"; fail "sbom export"; }
+jq -e '[.artifacts[] | select(.file)] | length > 0 and all(.[]; .error == null)' "$WORK/sbom/index.json" >/dev/null &&
+	jq -e '.spdxVersion' "$WORK/sbom/os.spdx.json" >/dev/null || { cat "$WORK/sbom/index.json"; fail "the exported SBOMs"; }
+! on_vm 'sudo test -e /usr/local/notes/.stowage-grype' || fail "the VM holds a scanner's database"
 
 step "the front serves HTTPS from the VM"
 ip=$(getent hosts "$ADDR" | awk '{print $1; exit}')
@@ -407,6 +426,21 @@ done
 grep -q "^set by     \`notes-stow network set\`: $lease" "$WORK/net.txt" && ! grep -q '^pending' "$WORK/net.txt" ||
 	{ cat "$WORK/net.txt"; fail "the boot did not undo the change not confirmed"; }
 on_vm sudo journalctl -b -u notes-network.service --no-pager | grep -q 'not confirmed before the reboot' || fail "the boot does not say it undid the change"
+
+step "recorded, not judged: what the recovery system listens on, its accounts"
+boot=$(boot_id)
+on_vm 'sudo grub2-editenv /oem/grubenv set next_entry=recovery && sudo systemctl reboot' >/dev/null 2>&1 || true
+deadline=$((SECONDS + 600))
+until [[ $(boot_id 2>/dev/null) != "$boot" ]] && on_vm test -e /run/cos/recovery_mode 2>/dev/null; do
+	((SECONDS < deadline)) || break
+	sleep 15
+done
+if on_vm test -e /run/cos/recovery_mode 2>/dev/null; then
+	on_vm sudo ss -tulpn || true
+	on_vm sudo passwd -S -a || true
+else
+	echo "recovery: not reached over SSH within 10 minutes"
+fi
 
 step "vm destroy: the VM, its disk and its uploads go, and its state"
 "$CTL" vm destroy "$H" --yes >"$WORK/vm-destroy.txt" 2>"$WORK/vm-destroy.log" || { tail -50 "$WORK/vm-destroy.log"; fail "vm destroy"; }

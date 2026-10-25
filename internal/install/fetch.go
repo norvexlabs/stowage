@@ -60,7 +60,7 @@ func (in *Installer) UpgradeRevision(ctx context.Context, args []string) (bool, 
 	if cur != m.ProjectVersion || rev != strconv.Itoa(m.Revision) || !pinnedImages(env) {
 		return false, nil
 	}
-	latest, c, prefix, err := in.channelRelease(ctx, env, name, cur, rev, cur)
+	latest, c, prefix, _, err := in.channelRelease(ctx, env, name, cur, rev, cur)
 	if err != nil {
 		in.O.logf("no later revision of %s %s looked for: %v", name, cur, err)
 		return false, nil
@@ -75,29 +75,35 @@ func (in *Installer) UpgradeRevision(ctx context.Context, args []string) (bool, 
 // channelRelease is version v's latest revision not yanked on the channel of the install's
 // release (it runs name cur, revision rev), signed by a key the install trusts, read from the
 // registry the install pulls from, with that registry's client and prefix.
-func (in *Installer) channelRelease(ctx context.Context, env *EnvFile, name, cur, rev, v string) (*release.Manifest, *registry.Client, string, error) {
-	kept, err := in.keptInstaller(name, cur, rev)
+func (in *Installer) channelRelease(ctx context.Context, env *EnvFile, name, cur, rev, v string) (*release.Manifest, *registry.Client, string, *sigverify.Verifier, error) {
+	trust, kept, err := in.installTrust(name, cur, rev)
 	if err != nil {
-		return nil, nil, "", err
+		return nil, nil, "", nil, err
 	}
 	prefix, _ := env.Get("STOWAGE_REGISTRY")
 	c, err := in.registryClient(prefix)
 	if err != nil {
-		return nil, nil, "", err
+		return nil, nil, "", nil, err
 	}
-	// The keys of the install's release decide; the installer run's only when it carries none
-	// (an install of a release from before its project signed): an older installer must not
-	// bring back a key a later release dropped.
+	m, err := findRelease(ctx, c, prefix, name, kept.Manifest.Channel, v, trust, in.O.logf)
+	return m, c, prefix, trust, err
+}
+
+// installTrust is the keys an install trusts (it runs name cur, revision rev), and its kept
+// release: the keys of the install's release decide; the installer run's only when it carries
+// none (an install of a release from before its project signed): an older installer must not
+// bring back a key a later release dropped.
+func (in *Installer) installTrust(name, cur, rev string) (*sigverify.Verifier, *Release, error) {
+	kept, err := in.keptInstaller(name, cur, rev)
+	if err != nil {
+		return nil, nil, err
+	}
 	src, keys := in.ctl(), kept.Keys
 	if len(keys) == 0 {
 		src, keys = "this installer", in.R.Keys
 	}
 	trust, err := trusted(src, keys)
-	if err != nil {
-		return nil, nil, "", err
-	}
-	m, err := findRelease(ctx, c, prefix, name, kept.Manifest.Channel, v, trust, in.O.logf)
-	return m, c, prefix, err
+	return trust, kept, err
 }
 
 // UpgradeTo moves the install to version v of the project, on the channel the install's release
@@ -116,7 +122,7 @@ func (in *Installer) UpgradeTo(ctx context.Context, v string, args []string) err
 	if !pinnedImages(env) {
 		return errors.New("--version: this install was made with --offline and never pulls: run the new release's installer, `upgrade --dir " + in.O.Dir + "`")
 	}
-	m, c, prefix, err := in.channelRelease(ctx, env, name, cur, rev, v)
+	m, c, prefix, _, err := in.channelRelease(ctx, env, name, cur, rev, v)
 	if err != nil {
 		return err
 	}

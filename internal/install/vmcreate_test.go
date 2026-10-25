@@ -75,7 +75,8 @@ func newVMCreatePulling(t *testing.T, pull spec.Provider, formats ...string) *vm
 		data := []byte("a " + f + " disk")
 		b := registry.Blob{MediaType: release.DiskMediaType(f), Data: data, Annotations: map[string]string{registry.TitleAnnotation: "notes-1.0.0." + f}}
 		h, err := c.PutManifest(context.Background(), repo, registry.Manifest{ArtifactType: release.DiskArtifactType,
-			Config: registry.Blob{MediaType: registry.EmptyMediaType, Data: []byte("{}")}, Layers: []registry.Blob{b}}, nil)
+			Config: registry.Blob{MediaType: registry.EmptyMediaType, Data: []byte("{}")}, Layers: []registry.Blob{b},
+			Annotations: map[string]string{release.DiskOSAnnotation: "23000"}}, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -853,6 +854,63 @@ func TestSeedISOOfWholeSectors(t *testing.T) {
 		}
 		if got, _, label := readSeed(t, path); got != ud || strings.TrimSpace(label) != SeedVolume {
 			t.Errorf("user-data of %d bytes read back as %d, label %q", n, len(got), label)
+		}
+	}
+}
+
+// A disk set that does not say what Kairos takes of a disk boots no VM: vm create cannot size it.
+func TestADiskWithoutItsOSSizeIsRefused(t *testing.T) {
+	t.Parallel()
+	v := newVMCreate(t, "qcow2")
+	c := registry.New(nil)
+	repo, err := c.Repo(v.prefix + "/notes-disk")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := registry.Blob{MediaType: release.DiskMediaType("qcow2"), Data: []byte("an older disk"), Annotations: map[string]string{registry.TitleAnnotation: "notes-1.0.0.qcow2"}}
+	h, err := c.PutManifest(context.Background(), repo, registry.Manifest{ArtifactType: release.DiskArtifactType,
+		Config: registry.Blob{MediaType: registry.EmptyMediaType, Data: []byte("{}")}, Layers: []registry.Blob{b}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v.r.Manifest.Artifacts.Disks = map[string]string{"qcow2": h.String()}
+	if err := v.create(VMCreate{Platform: "proxmox"}, nil); err == nil || !strings.Contains(err.Error(), "records no dev.stowage.disk.os-mib: published by an earlier Stowage") {
+		t.Errorf("%v", err)
+	}
+	// One disk of the set without it: the whole set boots none, even on a platform that takes only
+	// the other format.
+	w := newVMCreate(t, "raw")
+	if err := w.create(VMCreate{Platform: "aws"}, nil); err != nil {
+		t.Fatalf("the set alone: %v", err)
+	}
+	wrepo, err := c.Repo(w.prefix + "/notes-disk")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h, err = c.PutManifest(context.Background(), wrepo, registry.Manifest{ArtifactType: release.DiskArtifactType,
+		Config: registry.Blob{MediaType: registry.EmptyMediaType, Data: []byte("{}")}, Layers: []registry.Blob{b}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	w.r.Manifest.Artifacts.Disks["qcow2"] = h.String()
+	if err := w.create(VMCreate{Platform: "aws", Out: t.TempDir()}, nil); err == nil || !strings.Contains(err.Error(), "the qcow2 disk") || !strings.Contains(err.Error(), "published by an earlier Stowage") {
+		t.Errorf("a set one of whose disks records no size: %v", err)
+	}
+	if h, err = c.PutManifest(context.Background(), wrepo, registry.Manifest{ArtifactType: release.DiskArtifactType,
+		Config: registry.Blob{MediaType: registry.EmptyMediaType, Data: []byte("{}")}, Layers: []registry.Blob{b},
+		Annotations: map[string]string{release.DiskOSAnnotation: "0"}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	w.r.Manifest.Artifacts.Disks["qcow2"] = h.String()
+	if err := w.create(VMCreate{Platform: "aws", Out: t.TempDir()}, nil); err == nil || !strings.Contains(err.Error(), `records dev.stowage.disk.os-mib "0"`) || !strings.Contains(err.Error(), "not as Stowage publishes it") {
+		t.Errorf("a set one of whose disks records 0: %v", err)
+	}
+}
+
+func TestOSMiBIsBounded(t *testing.T) {
+	t.Parallel()
+	for s, want := range map[string]bool{"1": true, "0": false, "-1": false, "16777216": true, "16777217": false, "1e3": false, "": false, "9223372036854775808": false} {
+		if _, ok := osMiBOf(s); ok != want {
+			t.Errorf("%q: %v", s, ok)
 		}
 	}
 }

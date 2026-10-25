@@ -211,7 +211,7 @@ func TestVMCreateWithOpenTofu(t *testing.T) {
 	seed := filepath.Join(dir, "seed.iso")
 	seedSum, _ := truenas.SHA256File(seed)
 	diskSum, _ := truenas.SHA256File(disk) // the layer's digest: the disk's bytes, not its manifest
-	want := tofuVars{Name: "notes1", Pool: "tank", Dataset: "vms", Bridge: "br0", CPUs: 2, MemoryMiB: 4096, DiskGiB: 40,
+	want := tofuVars{Name: "notes1", Pool: "tank", Dataset: "vms", Bridge: "br0", CPUs: 2, MemoryMiB: 4096, DiskGiB: 20 + 23,
 		Image: disk, ImageSHA256: diskSum, Seed: seed, SeedSHA256: seedSum,
 		Description: "notes 1.0.0 (revision 1), created by notes-stow vm create"}
 	if vars != want {
@@ -270,7 +270,7 @@ func TestVMCreateWithOpenTofu(t *testing.T) {
 			t.Errorf("no %q in:\n%s", s, v.out2())
 		}
 	}
-	if !strings.Contains(v.log.String(), "OpenTofu creates the VM notes1 at https://nas.example.org: 2 CPUs, 4096 MiB, a 40 GiB disk on tank/vms, its network on br0") {
+	if !strings.Contains(v.log.String(), "OpenTofu creates the VM notes1 at https://nas.example.org: 2 CPUs, 4096 MiB, a 43 GiB disk (the OS 23 GiB, the app 20 GiB) on tank/vms, its network on br0") {
 		t.Errorf("review:\n%s", v.log)
 	}
 
@@ -336,7 +336,7 @@ func TestVMCreateWithOpenTofuRefusals(t *testing.T) {
 		{"no pool", func(c *VMCreate) { c.Pool = "" }, nil, "--pool is required"},
 		{"bad dataset", func(c *VMCreate) { c.Dataset = "/vms" }, nil, "a dataset path under the pool"},
 		{"bad name", func(c *VMCreate) { c.Name = "notes-1" }, nil, "letters and digits only"},
-		{"small disk", func(c *VMCreate) { c.DiskGiB = 15 }, nil, "at least 16"},
+		{"small disk", func(c *VMCreate) { c.DiskGiB = 3 }, nil, "at least 4"},
 		{"small memory", func(c *VMCreate) { c.MemoryMiB = 1023 }, nil, "at least 1024"},
 		{"bad host", func(c *VMCreate) { c.Host = "not a host" }, nil, "--host"},
 		{"unknown way", func(c *VMCreate) { c.Create = "terraform" }, nil, "--create terraform"},
@@ -658,7 +658,7 @@ func TestVMCreateAsksHowAndWhere(t *testing.T) {
 	var vars tofuVars
 	b, _ := os.ReadFile(filepath.Join(r.state, "notes", "vms", "asked", "terraform.tfvars.json"))
 	_ = json.Unmarshal(b, &vars)
-	if vars.Name != "asked" || vars.Dataset != "vms/notes" || vars.Bridge != "br1" || vars.CPUs != 4 || vars.MemoryMiB != 4096 || vars.DiskGiB != 64 {
+	if vars.Name != "asked" || vars.Dataset != "vms/notes" || vars.Bridge != "br1" || vars.CPUs != 4 || vars.MemoryMiB != 4096 || vars.DiskGiB != 64+23 {
 		t.Errorf("variables %+v", vars)
 	}
 	if a := r.ssh.calls[0]; !slices.Contains(a, "ops@asked") {
