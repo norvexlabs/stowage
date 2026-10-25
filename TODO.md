@@ -167,6 +167,15 @@ whose kernel is the operator's, `tune` reports what is missing and sets nothing.
     condition: a block of a module the host lacks does nothing. Stowage declares none of its own;
     `examples/full` shows the key.
 
+14. **An rclone config the app socket saved before 0.13 still runs as root** (security): 0.13
+    refuses one from the app socket, but a config an app saved through it earlier is kept, and
+    the daemon runs it on every scheduled backup, verify and run. Its only trace is the journal's
+    `backup.config` event (0.12 on, rotated after 1000 entries); a project can only tell its
+    operator to save the config again over SSH. Record where the saved config came from (SSH or
+    the app socket, per save), say it in `backup status` and the app's settings, and refuse to run
+    an app-saved one until the operator saves one over SSH — refusing as a failed backup, named,
+    never silently.
+
 ## Should
 
 - **A CPU set per service** (from the L4 routes on the host's network): an unpinned service
