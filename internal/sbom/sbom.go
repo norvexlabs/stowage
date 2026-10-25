@@ -106,8 +106,9 @@ func Generate(ctx context.Context, docker Docker, src Source) ([]byte, error) {
 	if src.Insecure {
 		args = append(args, "-e", "SYFT_REGISTRY_INSECURE_USE_HTTP=true")
 	}
-	// The platform a release runs on: an index's other platforms are none of the install's.
-	args = append(args, Syft, "registry:"+src.Ref, "--platform", Platform, "-o", "spdx-json", "-q")
+	// The platform a release runs on: an index's other platforms are none of the install's. The
+	// sbom cataloger merges the SBOM documents an image ships (what no other cataloger sees in it).
+	args = append(args, Syft, "registry:"+src.Ref, "--platform", Platform, "--select-catalogers", "+sbom-cataloger", "-o", "spdx-json", "-q")
 	out := &capped{max: MaxDocument}
 	if err := docker(ctx, out, args...); err != nil {
 		return nil, fmt.Errorf("syft %s: %w", src.Ref, err)

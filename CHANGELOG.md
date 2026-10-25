@@ -16,6 +16,9 @@ follow [SemVer](https://semver.org/).
   run on the operator's machine, by version (`--version`, `--registry` for a mirror), never on
   the VM; a mirror carries the SBOMs and the scanner. `audit` is a reserved image key. Stowage's
   own release carries its binary's SBOM, in its signed checksums.
+- **An app's own SBOMs in the stack's**: an SBOM document an image ships (CycloneDX or SPDX JSON,
+  by convention `/usr/share/sbom/<name>.cdx.json`) is merged into the image's attested SBOM, so
+  one audit covers what an app bundles that no scanner sees, such as a front's scripts.
 - **Kernel modules a project declares**: `shapes.kairos.modules` names kernel modules, each with
   its reason, to load at boot, to block (neither a dependency nor udev loads it) or to give
   options. The OS bundle carries them from its first boot, its build fails when one does not fit

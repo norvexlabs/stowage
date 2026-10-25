@@ -500,6 +500,12 @@ Off until the project configures a key (`signing: { provider: cosign-key, key: �
   version the VM runs is all an audit needs; a VM holds no scanner (the bundle does not preload
   it) and none of its database (1 GB), and its persistent space stays the app's. The export
   hands the verified documents to the operator's own tools, which keep watching them.
+- **An app's own SBOM documents**: one audit covers the whole stack only if each image's SBOM
+  names what the app put in it. syft reads what is self-describing (package databases, lock files,
+  Go binaries, Rust binaries built by `cargo auditable`); what it cannot see — scripts a front
+  bundles, vendored C, a downloaded binary — the app declares as an SBOM document in its image,
+  which syft's SBOM cataloger merges. The image is the one carrier: the document is reviewed,
+  built, signed and mirrored with what it describes, and a project needs no spec key for it.
 
 ### 5.2 Registry and its credentials
 

@@ -11,7 +11,7 @@
 # the api. Walks: ship this month's .1 → the bootstrap one-liner installs it in loopback mode
 # (every route serves but ops, which asks for a client certificate plain HTTP never carries; a
 # one-shot service no other one waits for exits 0; the hook's credentials file; the endpoint printed, the tip of the search
-# extension, not published) → re-runs set the search extension's input, then clear it, the hook
+# extension, not published; the ui's SBOM, exported, takes a package from the document its image ships) → re-runs set the search extension's input, then clear it, the hook
 # handed back the key it minted → the app's users revoke that key: `provision` fails
 # naming `--set`, `provision --set ADMIN_API_KEY=` mints and registers another, the next run keeps
 # it → its record lost, `provision --set ADMIN_API_KEY=<key>` gives the key the hook never returned
@@ -126,6 +126,11 @@ grep -qF "tip: the extension atlas-search (Full-text search over the events) is 
 "${CTL[@]}" status --dir "$D" >"$WORK/status.txt" 2>&1 || { cat "$WORK/status.txt"; fail "status"; }
 grep -qxF "endpoint  $url" "$WORK/status.txt" || { cat "$WORK/status.txt"; fail "status does not show the endpoint"; }
 grep -qx "tune      network (release)" "$WORK/status.txt" || { cat "$WORK/status.txt"; fail "status does not show the release's tuning profile"; }
+# The ui image ships a third-party script and the SBOM document declaring it: the image's attested
+# SBOM takes the package from that document.
+"${CTL[@]}" sbom export "$WORK/sbom" --dir "$D" >"$WORK/sbom.txt" 2>&1 || { cat "$WORK/sbom.txt"; fail "sbom export"; }
+jq -e 'any(.packages[]; .name == "escape-html" and .versionInfo == "1.0.3" and .licenseDeclared == "MIT" and (.sourceInfo | endswith("from SBOM: /usr/share/sbom/ui.cdx.json")) and any(.externalRefs[]?; .referenceLocator == "pkg:npm/escape-html@1.0.3"))' "$WORK/sbom/ui.spdx.json" >/dev/null ||
+	{ jq -c '[.packages[] | .name]' "$WORK/sbom/ui.spdx.json"; fail "the ui's SBOM lacks the document its image ships"; }
 
 step "a re-run sets the search extension's input, then clears it"
 pw=$(grep '^ADMIN_PASSWORD=' "$D/credentials.txt") key=$(sed -n 's/^ADMIN_API_KEY=//p' "$D/credentials.txt")
