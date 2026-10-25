@@ -427,20 +427,30 @@ grep -q "^set by     \`notes-stow network set\`: $lease" "$WORK/net.txt" && ! gr
 	{ cat "$WORK/net.txt"; fail "the boot did not undo the change not confirmed"; }
 on_vm sudo journalctl -b -u notes-network.service --no-pager | grep -q 'not confirmed before the reboot' || fail "the boot does not say it undid the change"
 
-step "recorded, not judged: what the recovery system listens on, its accounts"
-boot=$(boot_id)
+step "the recovery system answers over SSH; recorded, not judged: what it listens on, its accounts"
+# The recovery system serves a host key of its own, not the active system's that known_hosts
+# holds: each attempt takes the key it is served into a file of its own (one taken from the active
+# system before it rebooted is never kept), and the recovery mark tells which system answered. Its
+# DHCP lease may not be the active system's: the lease, then the name its DHCP server registers.
+on_recovery() {
+	rm -f "$WORK/known_hosts.recovery"
+	ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$WORK/known_hosts.recovery" \
+		-i "$KEY" -o IdentitiesOnly=yes "ops@$RECOVERY" -- "$@"
+}
 on_vm 'sudo grub2-editenv /oem/grubenv set next_entry=recovery && sudo systemctl reboot' >/dev/null 2>&1 || true
 deadline=$((SECONDS + 600))
-until [[ $(boot_id 2>/dev/null) != "$boot" ]] && on_vm test -e /run/cos/recovery_mode 2>/dev/null; do
-	((SECONDS < deadline)) || break
+until for RECOVERY in "$VM_IP" "$ADDR"; do on_recovery test -e /run/cos/recovery_mode 2>>"$WORK/recovery.log" && break; RECOVERY=; done; [[ -n $RECOVERY ]]; do
+	((SECONDS < deadline)) || {
+		tail -20 "$WORK/recovery.log"
+		# shellcheck disable=SC2016 # expanded on the VM
+		on_vm 'echo "the active system answers, boot $(cat /proc/sys/kernel/random/boot_id)"; sudo grub2-editenv /oem/grubenv list' || true
+		fail "the recovery system was not reached over SSH within 10 minutes"
+	}
 	sleep 15
 done
-if on_vm test -e /run/cos/recovery_mode 2>/dev/null; then
-	on_vm sudo ss -tulpn || true
-	on_vm sudo passwd -S -a || true
-else
-	echo "recovery: not reached over SSH within 10 minutes"
-fi
+echo "recovery: answers at $RECOVERY"
+on_recovery sudo ss -tulpn || true
+on_recovery sudo passwd -S -a || true
 
 step "vm destroy: the VM, its disk and its uploads go, and its state"
 "$CTL" vm destroy "$H" --yes >"$WORK/vm-destroy.txt" 2>"$WORK/vm-destroy.log" || { tail -50 "$WORK/vm-destroy.log"; fail "vm destroy"; }
