@@ -18,17 +18,7 @@ A finished item is deleted, not ticked. The plan behind it is
    e2e-full-vm), and an upgrade from the last 24.04 release with a rollback to it, as was run
    by hand for 0.12.0 (the release's VM installed by the older stowage, the next shipped by this
    one: the upgrade, the health gate, `rollback`, SSH on the older system).
-2. **Security review (2026-10-24) of the produced artifacts, the findings left** (AWS's and
-   Azure's are under 3):
-   - **On a running VM, what e2e-vm does not check**: it asserts the active system's listeners
-     (no kairos-agent web UI, p2p or edgevpn), every account's `passwd -S` (none with a
-     password), the effective `sshd -T` and no console autologin, and records Docker's FORWARD
-     policy, `/oem` and the boot's datasource stages. Recorded (0.14.0's e2e-vm): FORWARD is
-     DROP for IPv4 and IPv6 with `--ipv6`; `/oem` holds `95_userdata` (the first boot's
-     cloud-config, kept) and the boot's datasource stages run again, skipping the old-userdata
-     moves.
-
-3. **Cloud images on AWS and Azure**: `ship` registers the `cloud_publish` images through
+2. **Cloud images on AWS and Azure**: `ship` registers the `cloud_publish` images through
    OpenTofu, run for real on Google Cloud only (`STOWAGE_CLOUD_ENV=<file> make e2e-kairos`). Run it
    with the AWS and Azure test accounts once they exist, and fix what they find. Azure, known:
    its probe takes an image of the name whatever its provisioning state (its resource list gives
@@ -42,19 +32,37 @@ A finished item is deleted, not ticked. The plan behind it is
    `encrypted` root volume; Azure's an NSG on the NIC; Secure Boot / vTPM where the image allows.
    Each checked against its provider's schema and applied for real.
 
-4. **Scaleway**: a platform of `vm create` (OpenTofu module: an instance from the release's
+3. **Scaleway**: a platform of `vm create` (OpenTofu module: an instance from the release's
    disk, the cloud-config as its user data) and a cloud of `cloud_publish` (the disk uploaded to
    Object Storage and imported as an instance image, with the publisher's credentials from the
    environment), as the other clouds. Before writing a module, read the latest
    `scaleway/scaleway` provider's official docs and its schema (`tofu providers schema -json`),
    and pin that release.
-5. **OVHcloud**: the same for OVHcloud Public Cloud (OpenStack): `vm create` and `cloud_publish`
+4. **OVHcloud**: the same for OVHcloud Public Cloud (OpenStack): `vm create` and `cloud_publish`
    (the disk uploaded as a Glance image of the project, `ovh/ovh` and/or
    `terraform-provider-openstack/openstack`, whichever the latest official docs make canonical).
    Before writing a module, read the latest provider's official docs and its schema, and pin that
    release.
 
 ## Should
+
+- **`front.interface` does not hold the front on the VM** (security audit 2026-10-26, Medium):
+  `openPorts` writes the role's `iifname` match into the input chain alone
+  (`internal/install/install.go`), but the front is a bridged container published on every
+  address (`frontCompose`, no `host_ip`) and Docker's DNAT sends its 80/443 through forward,
+  whose chain is `policy accept` with its one include removed. So the front answers on every NIC,
+  against README's "opens the front's ports on alone". Drop DNAT'd http/https arriving on another
+  interface in forward (or `DOCKER-USER`), or publish the front on the role NIC's address; make
+  e2e-full-vm connect from `edge` rather than grep the rule text.
+- **A restore loads a backup it cannot authenticate** (security audit 2026-10-26, Medium): age
+  gives confidentiality only, the recipients are public, and `ownBackup` checks the object's name
+  (`internal/install/hostdsecrets.go`), so whoever can write the destination can plant (or
+  overwrite in place) a dump the operator's identity decrypts. `pg_restore` then runs its TOC as
+  the migrate role with owners kept, the image's superuser in the examples (`COPY … FROM
+  PROGRAM`, `CREATE ROLE … SUPERUSER`), and the volume archives are untarred as root. Record a
+  digest (or a MAC under a key hostd holds) of each object at backup and refuse a restore that
+  does not match, with an operator override for a machine made again; load as a non-superuser
+  owner role, or filter the TOC to schema objects and data.
 
 - **A start-first start's engine calls**: each dependency of each start-first service costs four
   sequential calls (`ps`, `inspect`, `compose config --hash`, `image inspect`), repeated across
@@ -387,6 +395,17 @@ Docker shape, 2026-10-24):
   as the reference deployment does, binding the names under a route's to HTTPS for a year. A spec
   key (`front.hsts_subdomains: false`) for an operator whose route name has other services
   under it.
+- **The TrueNAS seed goes up world-readable with its host key** (security audit 2026-10-26, Low):
+  `Client.Upload` asks `filesystem.put` for mode 0644 (`internal/truenas/client.go`), so the seed
+  ISO that `vm create --secrets` writes 0600 locally, since it holds the one-time SSH host key,
+  sits readable in the staging dataset and is never deleted. A storage reader who is also on
+  the path impersonates the VM to the pinned SSH and receives the secrets. Upload it 0600, and
+  remove it once the key is retired.
+- **The Caddyfile shows the route logins' hashes** (security audit 2026-10-26, Low):
+  `renderStack` writes `stowage-front.Caddyfile` 0644 in the 0755 install dir
+  (`internal/install/install.go`), so another local user reads the bcrypt hashes kept 0600 in
+  `.stowage-front-logins`; a weak password the operator typed falls offline. Write it 0600 (here,
+  in `restoreStack`), or the install dir 0750.
 
 - **Images from packages**: `images.<k>` built from `.deb` packages on a digest-pinned base
   (`base`, `packages`: a build target writing them or a glob, `purge`: the per-install paths a

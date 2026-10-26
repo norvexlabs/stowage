@@ -96,6 +96,10 @@ follow [SemVer](https://semver.org/).
   app's settings show it as not known to be the operator's, until the operator saves one over SSH.
   An install upgraded to this release saves its rclone config again
   (`backup config --rclone-config FILE`) to keep its backups running.
+- **The VM's posture, proven on a real VM**: Docker forwards nothing no rule of its admits, over
+  IPv4 and IPv6 (`--ipv6`), and the OEM partition holds the boot's own state alone — the first
+  boot's user-data, which no later boot pulls again, GRUB's environment and the seed host key's
+  retirement.
 
 ## [0.13.0] - 2026-10-25
 

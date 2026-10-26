@@ -151,9 +151,15 @@ on_vm sudo sshd -T >"$WORK/sshd.txt" || fail "sshd -T on the VM"
 grep -qxE 'permitrootlogin (no|prohibit-password|without-password)' "$WORK/sshd.txt" && grep -qx 'passwordauthentication no' "$WORK/sshd.txt" ||
 	{ grep -E '^(permitrootlogin|passwordauthentication) ' "$WORK/sshd.txt"; fail "sshd lets root or a password in"; }
 ! on_vm "systemctl cat serial-getty@ttyS0.service getty@tty1.service 2>/dev/null" | grep -qi autologin || fail "a console logs in by itself"
-# Recorded, not judged: Docker's forward policy.
-on_vm sudo iptables -S FORWARD 2>/dev/null | head -1 || true
-on_vm sudo ip6tables -S FORWARD 2>/dev/null | head -1 || true
+# Docker's forward policy drops what no rule of its admits, for IPv4 and (--ipv6) IPv6.
+for t in iptables ip6tables; do
+	[[ $(on_vm sudo $t -S FORWARD | head -1) == '-P FORWARD DROP' ]] || { on_vm sudo $t -S FORWARD; fail "$t's FORWARD policy is not DROP"; }
+done
+# /oem holds the boot's state alone: the user-data kept, GRUB's environment, the seed host key's
+# retirement and the file system's lost+found; no cloud-config lands there beside them.
+on_vm sudo ls -A /oem >"$WORK/oem.txt" || fail "ls /oem on the VM"
+! grep -vxE '95_userdata|grubenv|lost\+found|notes-seed-host-key\.retired' "$WORK/oem.txt" ||
+	{ on_vm sudo ls -la /oem; fail "/oem holds more than the user-data, grubenv and the host key's retirement"; }
 # The first boot keeps the cloud-config it pulled as /oem/95_userdata, which no later boot pulls
 # again (the upgrade's boot is judged against it below): a changed user-data is never applied.
 userdata=$(on_vm sudo stat -c "'%Y %s'" /oem/95_userdata) || fail "the first boot kept no user-data (/oem/95_userdata)"
