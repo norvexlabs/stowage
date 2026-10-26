@@ -534,8 +534,8 @@ func (s System) live(ctx context.Context, p *Plan) []string {
 	}
 	if h.network() {
 		notes = append(notes, s.steer(h, all)...)
-		notes = append(notes, s.governor()...)
 	}
+	notes = append(notes, s.power()...)
 	for _, n := range all {
 		if !n.tun || !h.network() {
 			continue

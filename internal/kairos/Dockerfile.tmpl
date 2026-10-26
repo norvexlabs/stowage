@@ -3,14 +3,19 @@
 # The OS bundle of {{.Name}}: a plain distribution converted into a bootable Kairos image by
 # kairos-init (no Kubernetes provider), with Docker running the stack and the release's images
 # preloaded. Rendered and built by `stowage ship`.
+{{/* purge removes the packages of the list that are installed: one kairos-init no longer installs
+is absent already, and apt refuses a name it does not know. */}}{{define "purge"}}p="$(dpkg-query -W -f='${db:Status-Abbrev} ${Package}\n'{{range .}} {{.}}{{end}} 2>/dev/null | awk '$1 ~ /^i/ {print $2}')"; \
+    [ -z "$p" ] || apt-get purge -y $p{{end}}
 
 FROM {{.KairosInit}} AS kairos-init
 
 FROM {{.Base}}
 
-# Guest agents: kairos-init only starts them, on the hypervisor its DMI check matches.
+# The build takes Ubuntu alone: its package names, Docker's repository and the purge below are
+# Ubuntu's. Guest agents: kairos-init only starts them, on the hypervisor its DMI check matches.
 # tzdata-legacy (the zones' old names, e.g. US/Eastern) where the base has it.
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN . /etc/os-release && { [ "$ID" = ubuntu ] || { echo "shapes.kairos.base: $PRETTY_NAME: the OS bundle's build takes Ubuntu" >&2; exit 1; }; } \
+    && apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates curl ethtool gnupg jq nftables open-vm-tools qemu-guest-agent tzdata \
         $(apt-cache show tzdata-legacy >/dev/null 2>&1 && echo tzdata-legacy) \
     && rm -rf /var/lib/apt/lists/*
@@ -20,7 +25,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=kairos-init /kairos-init /kairos-init
 RUN /kairos-init -s install -v 0.0.0
 
-# Docker engine and the compose plugin, from Docker's apt repository.
+{{with .PurgeBeforeInit}}# kairos-init installs one package list on every Debian-family image; what the bundle does without
+# goes before its init stage, so the initrd that stage builds carries none of it. multipath-tools
+# stays: the init stage adds dracut's multipath module, which needs it (its daemon is masked).
+RUN {{template "purge" .}}; \
+    apt-get autoremove -y --purge
+
+{{end}}# Docker engine and the compose plugin, from Docker's apt repository.
 RUN install -m 0755 -d /etc/apt/keyrings \
     && curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg \
     && chmod a+r /etc/apt/keyrings/docker.gpg \
@@ -93,6 +104,30 @@ RUN set -e \
     && n=$(find /lib/modules/ -name '*.ko*' | wc -l) \
     && if [ "$n" -lt 100 ]; then echo "only $n kernel modules after the reinstall" >&2; exit 1; fi
 
+# What goes after the init stage: the packages it enables unconditionally, and the timers that
+# would upgrade an image-based system in place or fetch Canonical's news (masked). The build fails
+# when a purged package is still installed (but those host.packages declares). The project's
+# packages (host.packages) come last, after the stage that would strip a kernel module they ship,
+# with what they depend on (a purged one included), over the image as the init stage built its
+# initrd: the packages the boot and the stack run on are held (those not held already), so apt
+# neither upgrades nor removes one for them (one that needs it fails the build), and the build
+# fails when they bring a package of that kind (a kernel, its modules, a service of the boot's);
+# one declared that is installed already is left as it is.
+RUN set -e{{with .PurgeAfterInit}}; {{template "purge" .}}{{end}}; \
+    for u in apt-daily.timer apt-daily-upgrade.timer motd-news.timer; do ln -sf /dev/null /etc/systemd/system/$u; done; \
+    for p in{{range .Absent}} {{.}}{{end}}; do \
+        if dpkg-query -W -f='${db:Status-Abbrev}' "$p" 2>/dev/null | grep -q '^i'; then echo "the OS bundle has $p, which it purges: host.packages keeps one" >&2; exit 1; fi; done{{with .Packages}}; \
+    t="$(mktemp -d)"; dpkg-query -W -f='${db:Status-Abbrev} ${Package}\n' | awk '$1 ~ /^i/ {print $2}' > "$t/installed"; \
+    apt-mark showhold > "$t/held"; \
+    held="$(grep -E '{{$.Held}}' "$t/installed" | grep -vxF -f "$t/held" || true)"; \
+    want="$(printf '%s\n'{{range $n, $_ := .}} {{$n}}{{end}} | grep -vxF -f "$t/installed" || true)"; \
+    [ -z "$held" ] || printf '%s\n' "$held" | xargs apt-mark hold >/dev/null; \
+    if [ -n "$want" ]; then apt-get update; apt-get install -y --no-install-recommends --no-remove $want; fi; \
+    new="$(dpkg-query -W -f='${db:Status-Abbrev} ${Package}\n' | awk '$1 ~ /^i/ {print $2}' | grep -E '{{$.Held}}' | grep -vxF -f "$t/installed" || true)"; rm -rf "$t"; \
+    [ -z "$new" ] || { echo "host.packages bring packages of the boot's own: $new" >&2; exit 1; }; \
+    [ -z "$held" ] || printf '%s\n' "$held" | xargs apt-mark unhold >/dev/null; \
+    rm -rf /var/lib/apt/lists/*{{end}}
+
 # The clouds' fast NICs, gVNIC (gve) and Azure's MANA, ship in the kernel's extra modules: those two
 # are copied from it, not its 110 MB. The build fails when a kernel lacks one, or a module the
 # boot's tuning loads (TUN devices, the connection tracker, BBR, fq).
@@ -109,18 +144,18 @@ RUN set -e; apt-get update; cd /tmp; \
             modinfo -k "$v" "$m" >/dev/null || { echo "kernel $v lacks $m" >&2; exit 1; }; done; done; \
     rm -rf /var/lib/apt/lists/*
 
-{{if .Modules}}# The project's kernel modules (shapes.kairos.modules). The build fails when a module to load or
+{{if .Modules}}# The project's kernel modules (host.modules). The build fails when a module to load or
 # give options is in no kernel, when one is built into it (modprobe's files do not reach those,
 # and tune could not tell one loaded), when an option is not one of the module's parameters, or when
 # modprobe does not read the bundle's files.
 RUN set -e; for k in /lib/modules/*; do v="$(basename "$k")"; \
 {{- range $name, $m := .Modules}}
 {{- if or $m.Load $m.Options}}
-        modinfo -k "$v" {{$name}} >/dev/null || { echo "shapes.kairos.modules.{{$name}}: kernel $v has no such module" >&2; exit 1; }; \
+        modinfo -k "$v" {{$name}} >/dev/null || { echo "host.modules.{{$name}}: kernel $v has no such module" >&2; exit 1; }; \
 {{- end}}
-        [ "$(modinfo -k "$v" -F filename {{$name}} 2>/dev/null)" != "(builtin)" ] || { echo "shapes.kairos.modules.{{$name}}: built into kernel $v: modprobe's files do not reach it, and it is always there" >&2; exit 1; }; \
+        [ "$(modinfo -k "$v" -F filename {{$name}} 2>/dev/null)" != "(builtin)" ] || { echo "host.modules.{{$name}}: built into kernel $v: modprobe's files do not reach it, and it is always there" >&2; exit 1; }; \
 {{- range $o, $_ := $m.Options}}
-        modinfo -k "$v" -F parm {{$name}} | cut -d: -f1 | grep -qx {{$o}} || { echo "shapes.kairos.modules.{{$name}}.options: {{$o}} is not a parameter of kernel $v's {{$name}}" >&2; exit 1; }; \
+        modinfo -k "$v" -F parm {{$name}} | cut -d: -f1 | grep -qx {{$o}} || { echo "host.modules.{{$name}}.options: {{$o}} is not a parameter of kernel $v's {{$name}}" >&2; exit 1; }; \
 {{- end}}
 {{- end}}
     done; \
@@ -149,7 +184,18 @@ RUN set -e; f=/etc/cos/bootargs.cfg; \
     grep -qF 'set baseExtraConsole="console=tty1 console=ttyS0,115200"' "$f"; \
     ! grep -qE 'set baseCmd=.*console=' "$f"
 
-# Kairos's boot stage sets a fixed receive buffer ceiling after the tune units have run, below the
+{{with .KernelArgs}}# The project's kernel arguments (host.kernel_args), after Kairos's own: the image's boot script
+# gives them, so the active and passive systems each boot with their release's, and the recovery
+# system (COS_SYSTEM, or a recovery image's label set) without them. The build fails when the
+# script no longer ends by computing the command line.
+RUN set -e; f=/etc/cos/bootargs.cfg; \
+    [ "$(tail -n1 "$f")" = setKernelCmd ] || { echo "$f no longer ends with setKernelCmd" >&2; exit 1; }; \
+{{- range $k, $_ := .}}
+    ! grep -E '^[[:space:]]*set (baseCmd|baseRootCmd|baseSelinuxCmd|baseExtraConsole)=' "$f" | grep -qE '[" ]{{$k}}(=|[" ])' || { echo "host.kernel_args.{{$k}}: Kairos's boot sets it ($f)" >&2; exit 1; }; \
+{{- end}}
+    printf '%s\n' 'if test "${label}" != "COS_SYSTEM"; then if [ -z "$recoverylabel" ]; then set kernelcmd="$kernelcmd{{range $k, $v := .}} {{$k}}{{with $v.Value}}={{.}}{{end}}{{end}}"; fi; fi' >> "$f"
+
+{{end}}# Kairos's boot stage sets a fixed receive buffer ceiling after the tune units have run, below the
 # one they size from RAM: its line goes, the stage's other settings stay. The build fails when the
 # line is no longer there to remove.
 RUN set -e; f=/system/oem/09_systemd_services.yaml; \
@@ -168,3 +214,12 @@ RUN set -e; f=/system/oem/08_grub.yaml; \
     mv /usr/share/{{.Name}}/08_grub.yaml "$f"; \
     rmdir /usr/share/{{.Name}}; \
     ! grep -q 'Remove GRUB sentinels' "$f"
+
+# The build fails when a package of the bundle's own boot or a declared one is not installed, or a
+# timer is not masked.
+RUN set -e; for p in{{range .Own}} {{.}}{{end}}; do \
+        dpkg-query -W -f='${db:Status-Abbrev}' "$p" 2>/dev/null | grep -q '^ii' || { echo "the OS bundle lacks $p, a package of its own" >&2; exit 1; }; done; \
+{{- range $n, $_ := .Packages}}
+    dpkg-query -W -f='${db:Status-Abbrev}' {{$n}} 2>/dev/null | grep -q '^ii' || { echo "host.packages.{{$n}}: not installed" >&2; exit 1; }; \
+{{- end}}
+    for u in apt-daily.timer apt-daily-upgrade.timer motd-news.timer; do [ "$(readlink /etc/systemd/system/$u)" = /dev/null ] || { echo "$u is not masked" >&2; exit 1; }; done

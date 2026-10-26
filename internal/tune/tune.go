@@ -38,6 +38,9 @@ type Host struct {
 	// Reserved are the ports the stack listens on that the network profile's range of local
 	// ports holds: the kernel never gives them to an outgoing connection.
 	Reserved []int
+	// Settings are the project's own kernel settings (host.sysctls), written after the profile's:
+	// none is a key a profile sets.
+	Settings []Sysctl
 }
 
 // Profile is how far the rules lean on the network. Both keep every value at the kernel's default
@@ -510,6 +513,27 @@ func (h Host) Sysctls() []Sysctl {
 			out = append(out, Sysctl{r.key, v, r.why, r.judge})
 		}
 	}
+	for _, c := range h.Settings {
+		if !slices.ContainsFunc(out, func(o Sysctl) bool { return o.Key == c.Key }) {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// ProfileKeys are the settings a profile sets on some host, sorted: the project's own
+// (host.sysctls) are other keys.
+func ProfileKeys() []string {
+	var out []string
+	for _, p := range Profiles {
+		h := Host{Profile: p}
+		for _, r := range h.rules() {
+			if !slices.Contains(out, r.key) {
+				out = append(out, r.key)
+			}
+		}
+	}
+	slices.Sort(out)
 	return out
 }
 

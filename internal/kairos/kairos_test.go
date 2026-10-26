@@ -622,10 +622,10 @@ func TestTheProjectsModulesAreInTheBundle(t *testing.T) {
 		}
 		return string(raw)
 	}
-	if got, want := read("usr/lib/modprobe.d/50-notes.conf"), "# notes's kernel modules (shapes.kairos.modules): those blocked, and their options. In the image's\n# /usr, not /etc, which Kairos keeps across upgrades and rollbacks.\n# the NIC's settings\noptions ice a=x,y b=1\n# the port's queues\nblacklist irdma\ninstall irdma /bin/false\n"; got != want {
+	if got, want := read("usr/lib/modprobe.d/50-notes.conf"), "# notes's kernel modules (host.modules): those blocked, and their options. In the image's\n# /usr, not /etc, which Kairos keeps across upgrades and rollbacks.\n# the NIC's settings\noptions ice a=x,y b=1\n# the port's queues\nblacklist irdma\ninstall irdma /bin/false\n"; got != want {
 		t.Errorf("modprobe.d:\n%s\nwant\n%s", got, want)
 	}
-	if got, want := read("usr/lib/modules-load.d/50-notes.conf"), "# notes's kernel modules (shapes.kairos.modules) loaded at boot.\n# the NIC's settings\nice\n# the service's congestion control\ntcp_bbr\n"; got != want {
+	if got, want := read("usr/lib/modules-load.d/50-notes.conf"), "# notes's kernel modules (host.modules) loaded at boot.\n# the NIC's settings\nice\n# the service's congestion control\ntcp_bbr\n"; got != want {
 		t.Errorf("modules-load.d:\n%s\nwant\n%s", got, want)
 	}
 	df, err := Dockerfile(p)
@@ -645,7 +645,7 @@ func TestTheProjectsModulesAreInTheBundle(t *testing.T) {
 	if strings.Contains(s, "modinfo -k \"$v\" irdma >/dev/null") || !strings.Contains(s, "-F filename tcp_bbr 2>/dev/null)\" != \"(builtin)\"") {
 		t.Error("a blocked module need not exist; a loaded one may not be built in")
 	}
-	if plain, _ := Dockerfile(params); strings.Contains(string(plain), "shapes.kairos.modules") {
+	if plain, _ := Dockerfile(params); strings.Contains(string(plain), "host.modules") {
 		t.Error("a bundle without modules checks them")
 	}
 	for _, bad := range []map[string]spec.KernelModule{
@@ -657,6 +657,106 @@ func TestTheProjectsModulesAreInTheBundle(t *testing.T) {
 		p.Modules = bad
 		if _, err := Dockerfile(p); err == nil {
 			t.Errorf("rendered %v", bad)
+		}
+	}
+}
+
+// The purge removes what kairos-init installs and the bundle does without, fail2ban after the init
+// stage that enables it; the project's packages are installed after it, a purged one kept, and the
+// build's last step fails on any purged one but those. A package of the bundle's own is refused.
+func TestThePurgeKeepsTheProjectsPackages(t *testing.T) {
+	t.Parallel()
+	before := func(s, step string) string { i := strings.Index(s, step); return s[:max(i, 0)] }
+	plain, err := Dockerfile(params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(plain)
+	init := "/kairos-init -s init"
+	if !strings.Contains(before(s, init), "${Package}\\n' haveged lldpd ") || !strings.Contains(before(s, init), " rpcbind snmpd ") {
+		t.Error("the purge does not run before the init stage")
+	}
+	if strings.Contains(before(s, init), "fail2ban") || !strings.Contains(s, "${Package}\\n' fail2ban 2>/dev/null") {
+		t.Error("fail2ban is not purged after the init stage")
+	}
+	if strings.Contains(s, "--no-remove $want") || !strings.Contains(s, "for p in fail2ban haveged lldpd ") {
+		t.Error("a bundle without packages installs one, or checks no purged one")
+	}
+	p := params
+	p.Packages = map[string]spec.HostPackage{"tcpdump": {Reason: "capture"}, "nfs-common": {Reason: "an NFS mount"}, "fail2ban": {Reason: "r"}}
+	df, err := Dockerfile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s = string(df)
+	for _, want := range []string{
+		"printf '%s\\n' fail2ban nfs-common tcpdump | grep -vxF -f \"$t/installed\"", "apt-get install -y --no-install-recommends --no-remove $want;",
+		"held=\"$(grep -E '" + heldPackages + "' \"$t/installed\" | grep -vxF -f \"$t/held\" || true)\"", "[ -z \"$new\" ] || { echo \"host.packages bring packages of the boot's own: $new\"",
+		"for p in containerd.io docker-ce docker-compose-plugin dracut linux-image-generic nftables openssh-server systemd systemd-sysv; do",
+		"dpkg-query -W -f='${db:Status-Abbrev}' tcpdump 2>/dev/null | grep -q '^ii' || { echo \"host.packages.tcpdump: not installed\"",
+		" nbd-client open-iscsi ", "for u in apt-daily.timer apt-daily-upgrade.timer motd-news.timer; do ln -sf /dev/null",
+	} {
+		if !strings.Contains(s, want) {
+			t.Errorf("Dockerfile lacks %q", want)
+		}
+	}
+	// A purged package one of the project's depends on comes back with it: the purges are checked
+	// before the project's packages are installed.
+	if i, j := strings.Index(s, "for p in haveged lldpd "), strings.Index(s, "install -y --no-install-recommends --no-remove $want"); i < 0 || j < i {
+		t.Errorf("the purged packages are checked at %d, the project's installed at %d", i, j)
+	}
+	// A declared purged package is purged with the others, then installed again with the project's.
+	if !strings.Contains(s, " nbd-client nfs-common open-iscsi ") || !strings.Contains(s, "${Package}\\n' fail2ban 2>/dev/null") || strings.Contains(s, "for p in fail2ban") || strings.Contains(s, " nfs-common open-iscsi os-prober packagekit rpcbind snmpd ubuntu-advantage-tools xauth xclip xdg-user-dirs zfsutils-linux; do") {
+		t.Error("a declared package is not purged, or is checked absent")
+	}
+	if got := p.Absent(); slices.Contains(got, "nfs-common") || !slices.Contains(got, "rpcbind") || !slices.IsSorted(got) {
+		t.Errorf("absent: %v", got)
+	}
+	for _, bad := range []string{"systemd-boot", "linux-image-generic", "docker-ce", "grub", "-y", "a b", "x"} {
+		p.Packages = map[string]spec.HostPackage{bad: {Reason: "r"}}
+		if _, err := Dockerfile(p); err == nil {
+			t.Errorf("rendered %q", bad)
+		}
+	}
+	for _, ok := range []string{"systemdx", "grubby2", "linux-tools-generic"} {
+		if _, owned := OwnedPackage(ok); owned {
+			t.Errorf("%s is refused", ok)
+		}
+	}
+}
+
+// The project's kernel arguments end the image's boot script, sorted, on every system but the
+// recovery one; without any, the script is left as kairos-init writes it. Kairos's own are refused.
+func TestTheProjectsKernelArgsEndTheBootScript(t *testing.T) {
+	t.Parallel()
+	plain, err := Dockerfile(params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(plain), "host.kernel_args") {
+		t.Error("a bundle without kernel arguments adds some")
+	}
+	p := params
+	p.KernelArgs = map[string]spec.HostValue{"nosmt": {Reason: "r"}, "iommu": {Value: "pt", Reason: "r"}}
+	df, err := Dockerfile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := `grep -qE '[" ]nosmt(=|[" ])' || { echo "host.kernel_args.nosmt: Kairos's boot sets it`; !strings.Contains(string(df), want) {
+		t.Errorf("Dockerfile lacks %s", want)
+	}
+	if want := `printf '%s\n' 'if test "${label}" != "COS_SYSTEM"; then if [ -z "$recoverylabel" ]; then set kernelcmd="$kernelcmd iommu=pt nosmt"; fi; fi' >> "$f"`; !strings.Contains(string(df), want) {
+		t.Errorf("Dockerfile lacks %s", want)
+	}
+	for name, v := range map[string]string{"root": "/dev/sda", "rd.shell": "1", "cos-img": "", "console": "ttyS1", "systemd.unit": "emergency.target", "rdinit": "/bin/sh", "ro": "", "rootflags": "x", "net.ifnames": "0", "net.naming-scheme": "v240", "config_url": "http://x", "install.device": "/dev/sdb", "ip": "dhcp", "lsm": "x", "BOOT_IMAGE": "x", "upgrade_failure": "", "my_upgrade-failure": "", "net.naming_scheme": "v238", "rescue": "", "1": "", "mount.usr": "x", "nosmt": "a,upgrade_failure", "a b": "", "iommu": "pt'", "x": "$(id)"} {
+		p.KernelArgs = map[string]spec.HostValue{name: {Value: v, Reason: "r"}}
+		if _, err := Dockerfile(p); err == nil {
+			t.Errorf("rendered %s=%s", name, v)
+		}
+	}
+	for _, ok := range []string{"rootkit", "consoleblank", "initcall_debug", "rdinit2", "robust", "net.core"} {
+		if _, owned := OwnedKernelArg(ok); owned {
+			t.Errorf("%s is refused", ok)
 		}
 	}
 }

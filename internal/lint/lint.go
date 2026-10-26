@@ -118,6 +118,7 @@ func Run(root, specPath string, now time.Time) (*Result, error) {
 	l.memory()
 	l.vmSize()
 	l.tune()
+	l.host()
 	l.front()
 	l.l4()
 	l.healthAndDatabase()
@@ -1608,6 +1609,14 @@ func (l *linter) shapes() {
 				l.errf(w+"."+f.key, "%q must be pinned by digest (<image>[:<tag>]@sha256:<64 hex>): an unpinned image changes without changing the OS bundle's inputs digest", f.ref)
 			}
 		}
+		// The repository's last element, not the image: the build reads /etc/os-release and
+		// refuses another distribution, so a mirror or a derived image of Ubuntu passes there.
+		if name, _, _ := strings.Cut(k.Base, "@"); k.Base != "" {
+			name = strings.TrimSuffix(name, ":"+refTag(k.Base))
+			if repo := name[strings.LastIndex(name, "/")+1:]; repo != "ubuntu" {
+				l.warnf(w+".base", "%s: the OS bundle's build takes Ubuntu alone (another distribution is refused, minutes into ship)", repo)
+			}
+		}
 		// An equality of tags, not an ordering: the bundle's build refuses any other release.
 		if tag := refTag(k.KairosInit); k.KairosInit != "" && tag != kairos.KairosInitRelease {
 			l.warnf(w+".kairos_init", "%s: the OS bundle's build takes kairos-init %s alone, the release its boot assessment is derived from (a digest of another release is refused, minutes into ship)", cmp.Or(tag, "no tag"), kairos.KairosInitRelease)
@@ -1633,7 +1642,6 @@ func (l *linter) shapes() {
 			seen[svc] = true
 			l.service(w+".host_api", svc)
 		}
-		l.kernelModules(w+".modules", k.Modules)
 		switch {
 		case l.s.Backup == nil && !l.s.HasDatabase():
 		case l.s.Backup == nil:
@@ -1644,8 +1652,84 @@ func (l *linter) shapes() {
 	}
 }
 
-// kernelModules checks shapes.kairos.modules: each name, option and value is written into
-// modprobe's files and the OS bundle's build, and each entry says why.
+// host checks host: its modules and packages are written into the OS bundle's build and printed by
+// tune, and each entry says why.
+func (l *linter) host() {
+	h := l.s.Host
+	if h == nil {
+		return
+	}
+	l.kernelModules("host.modules", h.Modules)
+	for _, name := range slices.Sorted(maps.Keys(h.Packages)) {
+		at := "host.packages." + name
+		if p, owned := kairos.OwnedPackage(name); owned {
+			l.errf(at, "is the OS bundle's own (%s): the kernel, boot, init system, container runtime and Kairos are not the project's", p)
+		} else if !spec.PackageName.MatchString(name) {
+			l.errf(at, "not a package's name: lower-case letters, digits and + - ., starting with a letter or digit, 2 to 64")
+		}
+		l.reason(at+".reason", h.Packages[name].Reason)
+	}
+	for _, name := range slices.Sorted(maps.Keys(h.KernelArgs)) {
+		a, at := h.KernelArgs[name], "host.kernel_args."+name
+		switch k, owned := kairos.OwnedKernelArg(name); {
+		case owned:
+			l.errf(at, "is Kairos's own (%s): the root, the initrd, Kairos, the consoles and the init system are its boot's", k)
+		case !spec.KernelArgName.MatchString(name):
+			l.errf(at, "not a kernel argument's name: letters, digits and _ . -, at most 64")
+		case a.Value != "" && !spec.KernelArgValue.MatchString(a.Value):
+			l.errf(at+".value", "%q: letters, digits and _ . , : / + @ -, no space or quote, at most 128", a.Value)
+		case kairos.MarksFallback(a.Value):
+			l.errf(at+".value", "%q holds upgrade_failure, which marks a boot that fell back to the passive system", a.Value)
+		}
+		l.reason(at+".reason", a.Reason)
+	}
+	profile := tune.ProfileKeys()
+	for _, key := range slices.Sorted(maps.Keys(h.Sysctls)) {
+		c, at := h.Sysctls[key], "host.sysctls."+key
+		switch {
+		case !spec.SysctlKey.MatchString(key):
+			l.errf(at, "not a kernel setting's key: dotted lower-case letters, digits, _ and -")
+		case slices.Contains(profile, key):
+			l.errf(at, "is a tune profile's: tune computes it from the host (`tune` reports it)")
+		case !spec.SysctlValue.MatchString(c.Value):
+			l.errf(at+".value", "%q: letters, digits and _ . , : / + -, fields of one space, at most 8", c.Value)
+		case namespaced(key):
+			l.warnf(at, "a namespace keeps its own: the host's value holds in the host's namespace (Docker's NAT and bridges among it), not in a container's own (the compose file's `sysctls` give a service its value)")
+		}
+		l.reason(at+".reason", c.Reason)
+	}
+	if p := h.Power; p != "" && p != tune.Performance && p != tune.Platform {
+		l.errf("host.power", "%q: %s or %s (the default)", p, tune.Performance, tune.Platform)
+	}
+}
+
+// reason checks a host entry's reason: tune prints it beside what differs.
+func (l *linter) reason(at, reason string) {
+	switch r := strings.TrimSpace(reason); {
+	case r == "":
+		l.errf(at, "is required: tune prints it beside what differs")
+	case len(r) > 200 || strings.ContainsFunc(r, unicode.IsControl):
+		l.errf(at, "one line of at most 200 bytes")
+	}
+}
+
+// namespaced reports whether a kernel setting is, mostly, one a network, IPC or UTS namespace keeps
+// of its own: a container's starts at the kernel's default, whatever the host holds. The TCP and
+// UDP memory limits are the host's, shared by every namespace.
+func namespaced(key string) bool {
+	if key == "net.ipv4.tcp_mem" || key == "net.ipv4.udp_mem" {
+		return false
+	}
+	for _, p := range []string{"net.ipv4.", "net.ipv6.", "net.unix.", "net.netfilter.", "net.mptcp.", "net.sctp.", "kernel.shm", "kernel.msg", "kernel.sem", "fs.mqueue."} {
+		if strings.HasPrefix(key, p) {
+			return true
+		}
+	}
+	return key == "net.core.somaxconn" || key == "kernel.hostname" || key == "kernel.domainname"
+}
+
+// kernelModules checks host.modules: each name, option and value is written into modprobe's files
+// and the OS bundle's build, and each entry says why.
 func (l *linter) kernelModules(w string, mods map[string]spec.KernelModule) {
 	for _, name := range slices.Sorted(maps.Keys(mods)) {
 		m, at := mods[name], w+"."+name
@@ -1659,12 +1743,7 @@ func (l *linter) kernelModules(w string, mods map[string]spec.KernelModule) {
 		case !m.Load && !m.Block && len(m.Options) == 0:
 			l.errf(at, "says nothing: load, block or options")
 		}
-		switch r := strings.TrimSpace(m.Reason); {
-		case r == "":
-			l.errf(at+".reason", "is required: tune prints it beside what differs")
-		case len(r) > 200 || strings.ContainsFunc(r, unicode.IsControl):
-			l.errf(at+".reason", "one line of at most 200 bytes")
-		}
+		l.reason(at+".reason", m.Reason)
 		for _, o := range slices.Sorted(maps.Keys(m.Options)) {
 			switch v := m.Options[o]; {
 			case !spec.ModuleOption.MatchString(o):

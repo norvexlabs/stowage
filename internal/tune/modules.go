@@ -8,7 +8,7 @@ import (
 	"strings"
 )
 
-// Module is a kernel module the project declares (shapes.kairos.modules): loaded at boot,
+// Module is a kernel module the project declares (host.modules): loaded at boot,
 // blocked, or given options, and why.
 type Module struct {
 	Name        string

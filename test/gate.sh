@@ -39,13 +39,15 @@ lifecycle() { need e2e-docker "$1"; need e2e-full "$1"; need e2e-stateless "$1";
 # what the VM test exercises: a real VM's creation, boot, host daemon, upgrade and fallback
 vm_side() { need e2e-kairos "$1"; need e2e-vm "$1"; }
 
-# kairos_lines <spec>: the change touches the spec's kairos shape: one of its own keys. An input's
-# or a route's `shapes:` does not: the VM runs the Docker shape's install, which the short suites
-# prove.
-# The shape's block (`  kairos:` under `shapes:`, to the next key of its level) is compared as a
-# whole, before and after: a key in any form, a module's entry included.
+# kairos_lines <spec>: the change touches the spec's kairos shape (one of its own keys) or its
+# host block, which the OS bundle is built with. An input's or a route's `shapes:` does not: the VM
+# runs the Docker shape's install, which the short suites prove.
+# The shape's block (`  kairos:` under `shapes:`, to the next key of its level) and the top-level
+# `host:` block are compared as a whole, before and after: a key in any form, a module's or a
+# package's entry included.
 kairos_block() {
-	awk '/^shapes:/ { s = 1; next } s && /^[^ #]/ { s = 0; k = 0 } s && /^  kairos:/ { k = 1; print; next } k && /^  [^ #]/ { k = 0 } k { print }'
+	awk '/^host:/ { h = 1; print; next } /^[^ #]/ { h = 0 } h { print; next }
+		/^shapes:/ { s = 1; next } s && /^[^ #]/ { s = 0; k = 0 } s && /^  kairos:/ { k = 1; print; next } k && /^  [^ #]/ { k = 0 } k { print }'
 }
 kairos_lines() {
 	[[ "$(git show "$base:$1" 2>/dev/null | kairos_block)" != "$(kairos_block <"$1")" ]]
@@ -106,16 +108,22 @@ for f in "${changed[@]}"; do
 		need e2e-k8s "$f"
 		need e2e-full-k8s "$f"
 		;;
-	internal/kairos/files/* | internal/kairos/Dockerfile.tmpl | internal/backup/*) vm_side "$f" ;;
+	internal/kairos/files/* | internal/kairos/Dockerfile.tmpl | internal/kairos/kairos.go | internal/backup/*) vm_side "$f" ;;
 	# The SBOMs ship makes, the scanner a release carries, the audits that read them.
 	internal/sbom/*) # every signed ship of every example makes SBOMs; the audits read them
 		need e2e "$f"
 		lifecycle "$f"
 		vm_side "$f"
 		;;
-	# The host's tuning: the Docker host's report and apply, the VM's boot; the project's modules
-	# on examples/full's VM.
+	# The host's tuning: the Docker host's report and apply, the VM's boot (e2e-vm's project declares
+	# a kernel argument and a package); the project's modules on examples/full's VM, and its
+	# settings and power posture (host.go) there too.
 	internal/tune/modules.go) need e2e-full-vm "$f" ;;
+	internal/tune/host.go)
+		lifecycle "$f"
+		need e2e-vm "$f"
+		need e2e-full-vm "$f"
+		;;
 	internal/tune/*)
 		lifecycle "$f"
 		need e2e-vm "$f"

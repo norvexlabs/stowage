@@ -137,7 +137,7 @@ echo_id=$(on_vm sudo docker ps -q --filter label=com.docker.compose.service=echo
 [[ -n $echo_id && $(on_vm sudo docker inspect --format "'{{.HostConfig.NetworkMode}}'" "$echo_id") == host ]] ||
 	fail "the echo L4 routes' service is not on the host's network"
 
-step "on the VM: the project's kernel modules (shapes.kairos.modules)"
+step "on the VM: what the project asks of its host (host): kernel modules, packages, kernel arguments, settings, power"
 on_vm test -d /sys/module/tcp_diag || fail "tcp_diag is not loaded at boot"
 on_vm '! test -d /sys/module/pcspkr' || fail "pcspkr is loaded, though blocked"
 on_vm '! sudo modprobe pcspkr' 2>/dev/null || fail "modprobe loads pcspkr, though blocked"
@@ -146,6 +146,16 @@ on_vm at-stow tune >"$WORK/tune.txt" 2>&1 || true
 for m in tcp_diag pcspkr "overlay redirect_always_follow"; do
 	grep -qE "^ok +module $m " "$WORK/tune.txt" || { cat "$WORK/tune.txt"; fail "tune does not report module $m as asked"; }
 done
+on_vm tcpdump --version >/dev/null 2>&1 || fail "tcpdump (host.packages) is not on the VM"
+grep -qE "^ok +package tcpdump " "$WORK/tune.txt" || { cat "$WORK/tune.txt"; fail "tune does not report package tcpdump as installed"; }
+on_vm cat /proc/cmdline | grep -qw 'iommu=pt' || fail "the VM booted without its kernel argument iommu=pt (host.kernel_args)"
+[[ $(on_vm cat /proc/sys/vm/swappiness) == 10 ]] || fail "vm.swappiness is not the project's 10 (host.sysctls)"
+grep -qE "^ok +kernel iommu=pt " "$WORK/tune.txt" && grep -qE "^ok +sysctl vm.swappiness " "$WORK/tune.txt" ||
+	{ cat "$WORK/tune.txt"; fail "tune does not report the kernel argument and the setting as asked"; }
+# host.power performance: the VM has no cpufreq (the hypervisor drives the CPUs' frequency).
+grep -qE "^n/a +cpu governor " "$WORK/tune.txt" || { cat "$WORK/tune.txt"; fail "tune does not report the governor as the hypervisor's"; }
+# shellcheck disable=SC2016 # expanded on the VM
+on_vm '! dpkg-query -W -f="\${db:Status-Abbrev}" nfs-common rpcbind snmpd 2>/dev/null | grep -q "^i"' || fail "a package the bundle purges is on the VM"
 
 step "vm destroy: the VM, its disk and its uploads go, and its state"
 "$CTL" vm destroy "$H" --yes >"$WORK/vm-destroy.txt" 2>"$WORK/vm-destroy.log" || { tail -50 "$WORK/vm-destroy.log"; fail "vm destroy"; }

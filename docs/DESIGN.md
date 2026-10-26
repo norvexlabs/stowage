@@ -1422,7 +1422,30 @@ every shape, the VM end-to-end test upgrading through it), then the health gate.
   with a quarter more for later releases, where auroraboot's default (three times the recovery
   partition, itself twice the image) left a large bundle's persistent partition next to nothing;
   the bundle records its size, each disk what Kairos takes, and `vm create` adds it to the app's
-  declared space, so `size.disk` and `--disk` mean what the app gets. The modules a project declares (`shapes.kairos.modules`)
+  declared space, so `size.disk` and `--disk` mean what the app gets. What a stack asks of its
+  host (`host`) is one block for every shape, in the platform's own terms, each entry with its
+  reason: Stowage writes it only where it owns the host (the OS bundle), and elsewhere `tune`
+  judges it as advice and `k8s tune` prints it for the nodes, since a Docker host's or a node's
+  kernel and packages are its operator's. The bundle starts from kairos-init's package list, the
+  same on every Debian-family image whatever the machine is for, and purges what an appliance does
+  without (a listener such as rpcbind's, LLDP's announcements, a vendor's reporting, storage stacks
+  it never mounts): no minimal profile exists upstream, and owning the whole list instead
+  (`--skip-step installPackages`) would break at each Kairos release. The purge runs before the
+  init stage, so the initrd it builds carries none of it, except what that stage needs (dracut's
+  multipath module) or enables unconditionally (fail2ban, purged after it). A project's packages
+  (`host.packages`) come after the init stage, which strips kernel modules. Ubuntu alone: the
+  newest kernel (7.0 on 26.04) with long security support; Debian 13 ships 6.12 (a newer one only
+  from backports), the RHEL and SUSE families need another package manager and translated names,
+  Alpine runs OpenRC, Fedora's lifecycle is short, and Hadron (musl, no package manager, no SBOM)
+  would leave `audit` blind on the OS. Kernel arguments go into the image's own boot script, not
+  Kairos's shared GRUB environment (`extra_cmdline`): each system boots with its release's, so a
+  release whose arguments fail to boot falls back to the passive system with its own, a rollback
+  takes its own back, and the recovery system boots without any. The CPUs' frequency is a posture
+  of the stack (`host.power`), not of the network profile: a latency-bound stack wants it on any
+  profile, and a throughput one may not want its power. PM QoS (`/dev/cpu_dma_latency`, held
+  open) is left out: it needs a process holding it for the host's life, and the C-state cap it
+  stands for is a kernel argument. `tune` names `power-profiles-daemon` and `tuned` rather than
+  masking them: on a Docker host they are the operator's, and the VM has neither. The modules a project declares (`host.modules`)
   are files of the image's `/usr/lib/modprobe.d` and `modules-load.d`, not a boot stage: they
   hold from the initramfs on, before a driver binds, and `/etc` is Kairos's persistent state,
   which every boot fills from the image without deleting (a file a newer image dropped would

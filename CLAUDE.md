@@ -126,12 +126,12 @@ a self-review against the code it describes is enough. Every other commit clears
    make e2e-kairos`, which registers them on the test clouds the file sets up (the user's file,
    never in the tree). A change
    to `internal/truenas`, the OpenTofu module (`internal/install/tofu`), `vmtofu.go`, `seed*.go`,
-   the boot (`vm.go`), the host daemon, the backup runner or the OS bundle's files runs `STOWAGE_VM_ENV=<file> make
+   the boot (`vm.go`), the host daemon, the backup runner or the OS bundle's files (its recipe's lists, `internal/kairos/kairos.go`, included) runs `STOWAGE_VM_ENV=<file> make
    e2e-vm` too (a real VM on TrueNAS, an upgrade of it through a TLS mirror, `reset-db`, `rollback`, a failed health gate's fallback, a backup and the network override's revert, ~85 min; the file is the user's, its path given at run time,
    never written in the tree); it runs beside the parallel suites in one chain with `e2e-kairos` and
    `e2e-full-vm`, one at a time, as they make disks with auroraboot, which races for loop devices. A change to `examples/full`'s kairos
-   shape (its `stowage.yaml`'s `shapes.kairos` block, compared whole: any of its keys, a module's
-   entry included — not an input's or a route's `shapes:`, as the VM runs the Docker
+   shape (its `stowage.yaml`'s `shapes.kairos` block and its top-level `host` block, each compared
+   whole: any of their keys, a module's or a package's entry included — not an input's or a route's `shapes:`, as the VM runs the Docker
    shape's install, which the short suites prove; the same test picks e2e-kairos for `examples/minimal`), `test/e2e-full-vm.sh` or `test/vm.sh` runs `STOWAGE_VM_ENV=<file> make
    e2e-full-vm` (`examples/full` on a real VM: install from a mirror, the hook, the app socket, the
    published CA; upgrade, rollback and the VM machinery itself are e2e-vm's), in that chain. Each must
@@ -142,7 +142,7 @@ a self-review against the code it describes is enough. Every other commit clears
    run every suite but e2e-full-vm; `internal/sbom` (the SBOMs, the scanner, the audits) runs
    e2e, the lifecycle suites (e2e-docker, e2e-full, e2e-stateless, e2e-k8s, e2e-full-k8s),
    e2e-kairos and e2e-vm; `internal/tune` the lifecycle suites and e2e-vm, its `modules.go`
-   e2e-full-vm alone; `internal/install/audit.go` smoke-install, the lifecycle suites and the VM's
+   e2e-full-vm alone, its `host.go` e2e-full-vm too (e2e-vm's project declares a kernel argument and a package); `internal/install/audit.go` smoke-install, the lifecycle suites and the VM's
    (e2e-kairos, e2e-vm);
    `Dockerfile`/`Makefile` the suites but e2e-kairos, e2e-vm and e2e-full-vm; a `_test.go` file none (`make
    check` runs it), but `smoke_test.go` runs smoke-install.

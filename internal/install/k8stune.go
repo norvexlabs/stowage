@@ -2,6 +2,8 @@ package install
 
 import (
 	"fmt"
+	"maps"
+	"slices"
 	"strings"
 
 	"github.com/norvexlabs/stowage/internal/tune"
@@ -34,5 +36,37 @@ func (in *Installer) K8sTune() error {
 	}
 	fmt.Fprintf(w, "\nor its flag --allowed-unsafe-sysctls=%s\n", strings.Join(keys, ","))
 	fmt.Fprintf(w, "\nThe nodes' own settings (the TCP buffers a pod's namespace copies, the sockets' memory, the connection\ntracker, the NICs) are the node's: `%s tune` on a node reports them, `tune --apply` applies them,\n`tune --print` prints the files for a node configured by other means.\n", in.R.Ctl())
+	var sys tune.System
+	releaseHost(&sys, in.R.Spec)
+	mods, pkgs := sys.Modules, sys.Packages
+	if len(mods)+len(pkgs)+len(sys.KernelArgs)+len(sys.Settings) == 0 && sys.Power != tune.Performance {
+		return nil
+	}
+	fmt.Fprintf(w, "\nWhat the project asks of every node (host), which the node's operator gives it:\n")
+	for _, m := range mods {
+		var want []string
+		switch {
+		case m.Load:
+			want = append(want, "loaded at boot")
+		case m.Block:
+			want = append(want, "blocked")
+		}
+		for _, o := range slices.Sorted(maps.Keys(m.Options)) {
+			want = append(want, o+"="+m.Options[o])
+		}
+		fmt.Fprintf(w, "  module %s: %s   %s\n", m.Name, strings.Join(want, ", "), m.Reason)
+	}
+	for _, p := range pkgs {
+		fmt.Fprintf(w, "  package %s (Debian's name)   %s\n", p.Name, p.Reason)
+	}
+	for _, a := range sys.KernelArgs {
+		fmt.Fprintf(w, "  kernel argument %s   %s\n", a, a.Reason)
+	}
+	for _, c := range sys.Settings {
+		fmt.Fprintf(w, "  sysctl %s = %s   %s\n", c.Key, c.Want, c.Why)
+	}
+	if sys.Power == tune.Performance {
+		fmt.Fprintf(w, "  power performance: every CPU on the performance governor, its energy preference performance, intel_pstate's min_perf_pct 100\n")
+	}
 	return nil
 }

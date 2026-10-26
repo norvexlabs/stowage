@@ -45,6 +45,19 @@ stack:
 tune:
   profile: network   # a heavy network load: the hosts are tuned for it (default: Docker's path alone)
 
+host:                                                          # written into the OS bundle; tune reports it as advice on another host
+  modules:                                                     # modprobe's files; tune reports what differs
+    tcp_diag: { load: true, reason: "ss -ti reads the TCP sockets' details" }
+    pcspkr: { block: true, reason: a VM has no speaker }
+    overlay: { options: { redirect_always_follow: "Y" }, reason: "Docker's storage: the kernel's default, stated" }
+  packages:                                                    # installed after the OS bundle's own
+    tcpdump: { reason: "capture on the VM's interfaces" }
+  kernel_args:                                                 # the OS bundle's boot; tune reports what differs
+    iommu: { value: pt, reason: "the NICs' DMA passed through, not translated" }
+  sysctls:                                                     # beyond the tune profile's, written at each boot
+    vm.swappiness: { value: "10", reason: "postgres's pages stay in RAM" }
+  power: performance                                           # the CPUs at their full speed (n/a on a VM: the hypervisor's)
+
 front:
   tls_modes: [acme, dns-cloudflare, byo, internal, none]
   routes:
@@ -188,7 +201,3 @@ shapes:
     health_gate: { deadline_s: 600, deadline_after_reset_s: 1800, poll_s: 30 }
     host_api: [api]
     size: { min: { cpus: 2, memory: 2G, disk: 20G }, recommended: { cpus: 4, memory: 8G, disk: 40G } }   # vm create's least and default size
-    modules:                                                   # the OS bundle's modprobe files; tune reports what differs
-      tcp_diag: { load: true, reason: "ss -ti reads the TCP sockets' details" }
-      pcspkr: { block: true, reason: a VM has no speaker }
-      overlay: { options: { redirect_always_follow: "Y" }, reason: "Docker's storage: the kernel's default, stated" }

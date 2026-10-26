@@ -540,7 +540,7 @@ func TestAChartThatCannotBePackagedFailsTheGraph(t *testing.T) {
 	}
 }
 
-// The VM shape's settings reach the bundle and its disks, the disk formats the disks and not the
+// The VM shape's settings and the host block reach the bundle and its disks, the disk formats the disks and not the
 // bundle, the size neither, and none of them an image. (The chart and the installer carry the whole spec.)
 func TestKairosSettingsReachTheBundle(t *testing.T) {
 	root := testutil.CopyExample(t, "full")
@@ -553,6 +553,7 @@ func TestKairosSettingsReachTheBundle(t *testing.T) {
 		{"kairos-init:v4.4.0-rc2@sha256:a", "kairos-init:v4.4.0-rc2@sha256:b", true, true},
 		{"pcspkr: { block: true, reason: a VM has no speaker }", "pcspkr: { block: true, reason: no speaker }", true, true},
 		{"redirect_always_follow: \"Y\"", "redirect_always_follow: \"N\"", true, true},
+		{"tcpdump: { reason:", "tcpdump-dbg: { reason:", true, true},
 		{"disk_formats: [raw, qcow2, ova, vhd, gce]", "disk_formats: [raw, qcow2, vhd, gce]", false, true},
 		// The clouds' formats are made whether disk_formats lists them or not.
 		{"disk_formats: [raw, qcow2, ova, vhd, gce]", "disk_formats: [qcow2, ova]", false, false},

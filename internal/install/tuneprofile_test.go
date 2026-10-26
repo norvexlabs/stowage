@@ -298,6 +298,32 @@ func TestTheVMsProfile(t *testing.T) {
 	}
 }
 
+// The VM's boot applies the release's host block with its profile: its settings written, its kernel
+// arguments judged (tune's report reads the release's too).
+func TestTheVMsBootAppliesTheHostBlock(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	in := e.installer(func(o *Options) { o.TunedAtBoot = true })
+	in.R.Spec.Host = &spec.Host{Sysctls: map[string]spec.HostValue{"vm.swappiness": {Value: "10", Reason: "RAM"}}}
+	root := tuneRoot(t)
+	swappiness := filepath.Join(root, "proc/sys/vm/swappiness")
+	if err := os.MkdirAll(filepath.Dir(swappiness), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(swappiness, []byte("60\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sys := fakeTune(root, 0)
+	sys.Docker = &tune.Docker{}
+	var stderr bytes.Buffer
+	if err := in.bootTune(context.Background(), sys, &stderr); err != nil {
+		t.Fatalf("%v\n%s", err, stderr.String())
+	}
+	if raw, _ := os.ReadFile(swappiness); string(raw) != "10\n" {
+		t.Errorf("vm.swappiness after the boot: %q", raw)
+	}
+}
+
 // `vm create --tune-profile` reaches the VM's first install, which records it.
 func TestTheSettingsFilesTuneProfileIsTheFirstInstalls(t *testing.T) {
 	t.Parallel()

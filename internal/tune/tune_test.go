@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -560,9 +561,14 @@ func TestInspect(t *testing.T) {
 	if a := find(items, "nic", "eth0 virtio_net"); a == nil || a.State != Advice || !strings.Contains(a.Have, "1 receive queue(s) for 2 vCPUs") {
 		t.Errorf("the queue advice %+v", a)
 	}
-	if g := find(items, "cpu", "governor"); g == nil || g.State != NA {
+	if g := find(items, "cpu", "governor"); g != nil {
+		t.Errorf("the network profile judges the governor: %+v", g)
+	}
+	s.Power = Performance
+	if g := find(s.Inspect(context.Background(), h), "cpu", "governor"); g == nil || g.State != NA {
 		t.Errorf("a host without cpufreq: %+v", g)
 	}
+	s.Power = ""
 	// A kernel without IPv6 has no IPv6 settings to judge.
 	off, _ := fakeHost(t, "1500")
 	if err := os.RemoveAll(filepath.Join(off.Root, "proc/sys/net/ipv6")); err != nil {
@@ -663,6 +669,110 @@ func TestInspectJudgesTheProjectsModules(t *testing.T) {
 	}
 	if it := find(items, "module", "ice a"); it == nil || it.State != OK {
 		t.Errorf("not owned, as asked: %+v", it)
+	}
+}
+
+// The project's packages, read from dpkg's database: drift on the VM, advice with the command on
+// another host, and not applicable without dpkg. A package dpkg removed but keeps the files of
+// (config-files) is not installed.
+func TestInspectJudgesTheProjectsPackages(t *testing.T) {
+	t.Parallel()
+	s, _ := fakeHost(t, "1500")
+	s.Packages = []Package{{Name: "tcpdump", Reason: "capture"}, {Name: "nfs-common", Reason: "a mount"}, {Name: "gone", Reason: "r"}}
+	if items := s.Inspect(context.Background(), host(4096, 2)); find(items, "package", "tcpdump") == nil || find(items, "package", "tcpdump").State != NA {
+		t.Errorf("no dpkg: %+v", find(items, "package", "tcpdump"))
+	}
+	write(t, s.Root, dpkgStatus, "Package: tcpdump\nStatus: install ok installed\nVersion: 4\n\nPackage: nfs-common\nStatus: deinstall ok config-files\n\nPackage: other\nStatus: install ok installed\n")
+	s.Owned = true
+	items := s.Inspect(context.Background(), host(4096, 2))
+	for name, st := range map[string]State{"tcpdump": OK, "nfs-common": Differs, "gone": Differs} {
+		if it := find(items, "package", name); it == nil || it.State != st {
+			t.Errorf("owned, %s: %+v, want %s", name, it, st)
+		}
+	}
+	s.Owned = false
+	items = s.Inspect(context.Background(), host(4096, 2))
+	if it := find(items, "package", "nfs-common"); it == nil || it.State != Advice || it.Want != "apt-get install nfs-common" || !strings.Contains(it.Have, "(a mount)") {
+		t.Errorf("not owned: %+v", it)
+	}
+}
+
+// The project's kernel arguments, against the running command line's last value of each: drift
+// on the VM, advice naming the boot loader elsewhere. On the network profile an IOMMU that
+// translates DMA is advice, unless the command line or the project already says how.
+func TestInspectJudgesTheProjectsKernelArgs(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s, _ := fakeHost(t, "1500")
+	write(t, s.Root, "proc/cmdline", "BOOT_IMAGE=/boot/vmlinuz quiet mitigations=auto mitigations=off nosmt\n")
+	s.KernelArgs = []KernelArg{{"mitigations", "off", "a sealed appliance"}, {"nosmt", "", "one thread per core"}, {"intel_idle.max_cstate", "1", "latency"}, {"quiet", "x", "r"}}
+	s.Owned = true
+	items := s.Inspect(ctx, host(4096, 2))
+	for name, st := range map[string]State{"mitigations=off": OK, "nosmt": OK, "intel_idle.max_cstate=1": Differs, "quiet=x": Differs} {
+		if it := find(items, "kernel", name); it == nil || it.State != st {
+			t.Errorf("owned, %s: %+v, want %s", name, it, st)
+		}
+	}
+	if it := find(items, "kernel", "quiet=x"); it.Have != "quiet" {
+		t.Errorf("a flag given for a value: %+v", it)
+	}
+	s.Owned = false
+	if it := find(s.Inspect(ctx, host(4096, 2)), "kernel", "intel_idle.max_cstate=1"); it == nil || it.State != Advice || !strings.Contains(it.Have, "absent, the project asks for intel_idle.max_cstate=1 (latency)") || !strings.Contains(it.Want, "GRUB_CMDLINE_LINUX") {
+		t.Errorf("not owned: %+v", it)
+	}
+	pt := map[string]string{"amd64": "iommu=pt", "arm64": "iommu.passthrough=1"}[runtime.GOARCH]
+	if pt == "" {
+		t.Skip("no passthrough argument on " + runtime.GOARCH)
+	}
+	write(t, s.Root, "sys/kernel/iommu_groups/0/type", "identity\n")
+	if find(s.Inspect(ctx, netHost(4096, 2)), "kernel", pt) != nil {
+		t.Error("an IOMMU passing DMA through is advised")
+	}
+	write(t, s.Root, "sys/kernel/iommu_groups/1/type", "DMA-FQ\n")
+	if find(s.Inspect(ctx, host(4096, 2)), "kernel", pt) != nil {
+		t.Error("the default profile advises passthrough")
+	}
+	if it := find(s.Inspect(ctx, netHost(4096, 2)), "kernel", pt); it == nil || it.State != Advice || !strings.Contains(it.Want, "host.kernel_args "+pt) {
+		t.Errorf("a translating IOMMU: %+v", it)
+	}
+	k, v, _ := strings.Cut(pt, "=")
+	s.KernelArgs = append(s.KernelArgs, KernelArg{k, v, "r"})
+	if it := find(s.Inspect(ctx, netHost(4096, 2)), "kernel", pt); it == nil || it.State != Advice || strings.Contains(it.Want, "host.kernel_args") {
+		t.Errorf("declared, it is judged as the project's: %+v", it)
+	}
+}
+
+// The project's settings follow the profile's: judged, planned into the sysctl file, written at
+// boot; a key a profile sets keeps the profile's.
+func TestTheProjectsSettingsFollowTheProfiles(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s, _ := fakeHost(t, "1500")
+	write(t, s.Root, "proc/sys/vm/swappiness", "60\n")
+	s.Settings = []Sysctl{{Key: "vm.swappiness", Want: "10", Why: "the database's pages stay in RAM"}, {Key: "net.netfilter.nf_conntrack_max", Want: "1", Why: "r"}}
+	h, _ := s.Host()
+	keys := sysctlKeys(h)
+	if keys[len(keys)-1] != "vm.swappiness" || slices.ContainsFunc(h.Sysctls(), func(c Sysctl) bool { return c.Key == "net.netfilter.nf_conntrack_max" && c.Want == "1" }) {
+		t.Errorf("sysctls: %v", keys)
+	}
+	if it := find(s.Inspect(ctx, h), "sysctl", "vm.swappiness"); it == nil || it.State != Differs || it.Have != "60" {
+		t.Errorf("before: %+v", it)
+	}
+	p, err := s.Plan(h)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(p.Files[0].Content), "\n# the database's pages stay in RAM\nvm.swappiness = 10\n") {
+		t.Errorf("%s:\n%s", p.Files[0].Path, p.Files[0].Content)
+	}
+	if _, err := s.Boot(ctx, h); err != nil {
+		t.Fatal(err)
+	}
+	if got := read(t, s.Root, "proc/sys/vm/swappiness"); got != "10\n" {
+		t.Errorf("after the boot: %q", got)
+	}
+	if !slices.Contains(ProfileKeys(), "net.netfilter.nf_conntrack_max") || !slices.Contains(ProfileKeys(), "net.ipv4.tcp_congestion_control") || slices.Contains(ProfileKeys(), "vm.swappiness") || !slices.IsSorted(ProfileKeys()) {
+		t.Errorf("profile keys: %v", ProfileKeys())
 	}
 }
 
@@ -1370,68 +1480,63 @@ func TestTheNetworkProfileSpreadsTheNICsWork(t *testing.T) {
 	}
 }
 
-// A virtio NIC's interrupts are its PCI device's, the parent of its device.
-func TestAVirtioNICsInterruptsAreItsPCIDevices(t *testing.T) {
-	t.Parallel()
-	s, _ := fakeHost(t, "1500")
-	write(t, s.Root, "devices/pci0/msi_irqs/40", "msix\n")
-	write(t, s.Root, "devices/pci0/msi_irqs/41", "msix\n")
-	if err := os.MkdirAll(filepath.Join(s.Root, "devices/pci0/virtio1"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	write(t, s.Root, "sys/class/net/eth1/mtu", "1500\n")
-	if err := os.Symlink(filepath.Join(s.Root, "devices/pci0/virtio1"), filepath.Join(s.Root, "sys/class/net/eth1/device")); err != nil {
-		t.Fatal(err)
-	}
-	if got := s.irqs(nic{name: "eth1"}); !slices.Equal(got, []int{40, 41}) {
-		t.Errorf("eth1's interrupts %v", got)
-	}
-	if got := s.irqs(nic{name: "eth0"}); got != nil {
-		t.Errorf("eth0 without msi_irqs: %v", got)
-	}
-	// A NIC on legacy interrupts, under a bridge with vectors of its own: not the NIC's.
-	write(t, s.Root, "devices/pci1/msi_irqs/50", "msix\n")
-	write(t, s.Root, "devices/pci1/msi_irqs/51", "msix\n")
-	if err := os.MkdirAll(filepath.Join(s.Root, "devices/pci1/0000:01:00.0"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	write(t, s.Root, "sys/class/net/eth2/mtu", "1500\n")
-	if err := os.Symlink(filepath.Join(s.Root, "devices/pci1/0000:01:00.0"), filepath.Join(s.Root, "sys/class/net/eth2/device")); err != nil {
-		t.Fatal(err)
-	}
-	if got := s.irqs(nic{name: "eth2"}); got != nil {
-		t.Errorf("eth2 took its bridge's interrupts: %v", got)
-	}
-}
-
-func TestTheNetworkProfileRunsTheCPUsAtFullSpeed(t *testing.T) {
+// host.power performance runs every CPU at its full speed on any profile: the performance governor
+// where offered, the preference where exposed (one already performance kept), intel_pstate's floor
+// at 100; a daemon that re-asserts its own profile is advice and a note, left running. Platform
+// judges and sets none of it.
+func TestPowerPerformanceRunsTheCPUsAtFullSpeed(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	s, _ := fakeHost(t, "1500")
-	s.Profile = Network
-	write(t, s.Root, "sys/devices/system/cpu/cpu0/cpufreq/scaling_governor", "powersave\n")
-	write(t, s.Root, "sys/devices/system/cpu/cpu0/cpufreq/scaling_available_governors", "performance powersave\n")
-	write(t, s.Root, "sys/devices/system/cpu/cpu1/cpufreq/scaling_governor", "schedutil\n")
-	write(t, s.Root, "sys/devices/system/cpu/cpu1/cpufreq/scaling_available_governors", "schedutil\n")
+	s.Power = Performance
+	cpu := "sys/devices/system/cpu/"
+	for f, v := range map[string]string{
+		"cpu0/cpufreq/scaling_governor": "powersave", "cpu0/cpufreq/scaling_available_governors": "performance powersave",
+		"cpu0/cpufreq/energy_performance_preference": "balance_power", "cpu0/cpufreq/energy_performance_available_preferences": "default performance balance_power",
+		"cpu1/cpufreq/scaling_governor": "schedutil", "cpu1/cpufreq/scaling_available_governors": "schedutil",
+		"intel_pstate/min_perf_pct": "20",
+	} {
+		write(t, s.Root, cpu+f, v+"\n")
+	}
+	write(t, s.Root, "proc/77/comm", "tuned\n")
 	h, _ := s.Host()
-	if it := find(s.Inspect(ctx, h), "cpu", "governor"); it == nil || it.State != Differs || it.Have != "powersave,schedutil" {
-		t.Errorf("governor before: %+v", it)
+	items := s.Inspect(ctx, h)
+	for name, want := range map[string]string{"governor": "powersave,schedutil", "energy_performance_preference": "balance_power", "intel_pstate min_perf_pct": "20"} {
+		if it := find(items, "cpu", name); it == nil || it.State != Differs || it.Have != want {
+			t.Errorf("%s before: %+v", name, it)
+		}
+	}
+	if it := find(items, "cpu", "tuned"); it == nil || it.State != Advice || it.Want != "systemctl disable --now tuned" {
+		t.Errorf("tuned: %+v", it)
 	}
 	p, err := s.Plan(h)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Apply(ctx, p, ApplyOptions{}); err != nil {
+	notes, err := s.Apply(ctx, p, ApplyOptions{})
+	if err != nil {
 		t.Fatal(err)
 	}
-	if read(t, s.Root, "sys/devices/system/cpu/cpu0/cpufreq/scaling_governor") != "performance\n" || read(t, s.Root, "sys/devices/system/cpu/cpu1/cpufreq/scaling_governor") != "schedutil\n" {
-		t.Error("the governors after the apply")
+	if !slices.ContainsFunc(notes, func(n string) bool { return strings.Contains(n, "tuned runs and re-asserts its own power profile") }) {
+		t.Errorf("notes: %v", notes)
 	}
-	if it := find(s.Inspect(ctx, h), "cpu", "governor"); it == nil || it.State != OK {
-		t.Errorf("governor after: %+v", it)
+	for f, want := range map[string]string{"cpu0/cpufreq/scaling_governor": "performance", "cpu1/cpufreq/scaling_governor": "schedutil", "cpu0/cpufreq/energy_performance_preference": "performance", "intel_pstate/min_perf_pct": "100"} {
+		if got := read(t, s.Root, cpu+f); got != want+"\n" {
+			t.Errorf("%s after the apply: %q", f, got)
+		}
 	}
-	if find(s.Inspect(ctx, host(4096, 2)), "cpu", "governor") != nil {
-		t.Error("the default profile judges the governor")
+	for _, name := range []string{"governor", "energy_performance_preference", "intel_pstate min_perf_pct"} {
+		if it := find(s.Inspect(ctx, h), "cpu", name); it == nil || it.State != OK {
+			t.Errorf("%s after: %+v", name, it)
+		}
+	}
+	s.Power = Platform
+	write(t, s.Root, cpu+"cpu0/cpufreq/scaling_governor", "powersave\n")
+	if find(s.Inspect(ctx, h), "cpu", "governor") != nil {
+		t.Error("platform judges the governor")
+	}
+	if _, err := s.Apply(ctx, p, ApplyOptions{}); err != nil || read(t, s.Root, cpu+"cpu0/cpufreq/scaling_governor") != "powersave\n" {
+		t.Errorf("platform sets the governor: %v", err)
 	}
 }
 

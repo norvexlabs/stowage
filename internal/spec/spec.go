@@ -50,6 +50,8 @@ type Spec struct {
 	Hooks        Hooks              `yaml:"hooks"`
 	Backup       *Provider          `yaml:"backup"`
 	Shapes       Shapes             `yaml:"shapes"`
+	// Host is what the stack asks of the machine it runs on: kernel modules and packages.
+	Host *Host `yaml:"host"`
 	// Tune is how the hosts of the docker and kairos shapes are tuned for the stack's network.
 	Tune *Tune `yaml:"tune"`
 	// Extensions are the apps, published on the same registry prefix, whose endpoint an input
@@ -425,11 +427,39 @@ type KairosShape struct {
 	HostAPI []string `yaml:"host_api"`
 	// Size is the VM's least and recommended size, which `vm create` sizes a VM from.
 	Size *VMSize `yaml:"size"`
-	// Modules are the kernel modules the OS bundle loads, blocks or gives options, by name.
-	Modules map[string]KernelModule `yaml:"modules"`
 }
 
-// KernelModule is one of shapes.kairos.modules: what the host does with the module, and why.
+// Host is what the stack asks of the machine it runs on, whatever the shape: written where Stowage
+// owns the host (the kairos shape's OS bundle and its boot); elsewhere `tune` reports its modules,
+// packages and kernel arguments as advice, and its settings and power posture as its profile's,
+// which `tune --apply` writes when the operator runs it.
+type Host struct {
+	// Modules are the kernel modules the host loads, blocks or gives options, by name.
+	Modules map[string]KernelModule `yaml:"modules"`
+	// Packages are the distribution's packages the host has beyond the OS bundle's own, by name.
+	Packages map[string]HostPackage `yaml:"packages"`
+	// KernelArgs are the kernel's command-line parameters the host boots with, by name.
+	KernelArgs map[string]HostValue `yaml:"kernel_args"`
+	// Sysctls are kernel settings beyond those a tune profile sets, by key.
+	Sysctls map[string]HostValue `yaml:"sysctls"`
+	// Power is the CPUs' posture: performance (their full speed) or platform (the host's own, the
+	// default).
+	Power string `yaml:"power"`
+}
+
+// HostPackage is one of host.packages: why the stack needs it.
+type HostPackage struct {
+	Reason string `yaml:"reason"`
+}
+
+// HostValue is one of host.kernel_args or host.sysctls: its value (a kernel argument's may be
+// empty: a flag), and why.
+type HostValue struct {
+	Value  string `yaml:"value"`
+	Reason string `yaml:"reason"`
+}
+
+// KernelModule is one of host.modules: what the host does with the module, and why.
 type KernelModule struct {
 	Load  bool `yaml:"load"`
 	Block bool `yaml:"block"`
@@ -444,6 +474,20 @@ var (
 	ModuleName   = regexp.MustCompile(`^[a-z0-9_]{1,56}$`)
 	ModuleOption = regexp.MustCompile(`^[A-Za-z0-9_]{1,64}$`)
 	ModuleValue  = regexp.MustCompile(`^[A-Za-z0-9_.,:/+-]{1,256}$`)
+)
+
+// PackageName is what a Debian package's name may hold (Debian policy 5.6.1): it is written into
+// the bundle's build.
+var PackageName = regexp.MustCompile(`^[a-z0-9][a-z0-9+.-]{1,63}$`)
+
+// KernelArgName and KernelArgValue are what a kernel argument's name and value may hold, and
+// SysctlKey and SysctlValue a kernel setting's: written into the boot loader's script, sysctl's
+// file and /proc/sys, so no space but a sysctl value's single ones, no quote, no $ and no path.
+var (
+	KernelArgName  = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}$`)
+	KernelArgValue = regexp.MustCompile(`^[A-Za-z0-9_.,:/+@-]{1,128}$`)
+	SysctlKey      = regexp.MustCompile(`^[a-z0-9_]+(\.[a-z0-9_-]+){1,8}$`)
+	SysctlValue    = regexp.MustCompile(`^[A-Za-z0-9_.,:/+-]+( [A-Za-z0-9_.,:/+-]+){0,7}$`)
 )
 
 // Formats are the shape's disk formats, those cloud_publish's clouds import included, in the

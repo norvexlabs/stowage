@@ -45,6 +45,7 @@ func (in *Installer) vmProfile() tune.Profile {
 // bootTune tunes the VM now as its boot does, by its stack's profile.
 func (in *Installer) bootTune(ctx context.Context, sys *tune.System, stderr io.Writer) error {
 	sys.Profile = in.vmProfile()
+	releaseHost(sys, in.R.Spec)
 	h, err := sys.Host()
 	if err != nil {
 		return err

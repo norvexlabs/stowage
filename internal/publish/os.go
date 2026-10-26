@@ -252,7 +252,10 @@ func (p *Publisher) buildOS(ctx context.Context, o ShipOptions, a *artifact, ima
 	if err := kairos.OnDisk(p.WorkDir); err != nil {
 		return fmt.Errorf("os bundle: %w", err)
 	}
-	params := kairos.Params{Name: p.Project.Spec.Name, Ctl: providers.Ctl(p.Project.Spec.Short()), Base: k.Base, KairosInit: k.KairosInit, OSVersion: ov, Modules: k.Modules}
+	params := kairos.Params{Name: p.Project.Spec.Name, Ctl: providers.Ctl(p.Project.Spec.Short()), Base: k.Base, KairosInit: k.KairosInit, OSVersion: ov}
+	if h := p.Project.Spec.Host; h != nil {
+		params.Modules, params.Packages, params.KernelArgs = h.Modules, h.Packages, h.KernelArgs
+	}
 	dir, err := os.MkdirTemp(p.WorkDir, "os-")
 	if err != nil {
 		return err

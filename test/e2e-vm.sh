@@ -60,7 +60,9 @@ KAIROS=1 new_project "$PG"
 sed -i 's/^    host_api: \[api\]$/&\n    health_gate: { deadline_s: 120, deadline_after_reset_s: 600, poll_s: 10 }/' "$P/stowage.yaml"
 grep -q '^    health_gate: ' "$P/stowage.yaml" || fail "no health_gate in the project"
 # An L4 route to the database, which the VM's firewall opens to the sources DB_SOURCES holds: on
-# the host's network, the database listens on the route's port itself.
+# the host's network, the database listens on the route's port itself. A kernel argument the
+# active system boots with and the recovery system without (a module's parameter, which nothing
+# reads), and a package of the project's.
 python3 - "$P/stowage.yaml" <<'PY'
 import sys
 path = sys.argv[1]
@@ -72,6 +74,7 @@ for old, new in [
 ]:
     assert s.count(old) == 1, old
     s = s.replace(old, new)
+s += "\nhost:\n  kernel_args:\n    stowage.e2e: { value: \"1\", reason: \"the recovery system boots without it\" }\n  packages:\n    tcpdump: { reason: \"the bundle installs a package of the project's\" }\n"
 open(path, "w").write(s)
 PY
 "${S[@]}" lint
@@ -120,10 +123,27 @@ grep -q 'hook input .*policy drop;' "$WORK/nft.txt" && grep -q "ip saddr $MIRROR
 for a in "${HOST6[@]}"; do
 	grep -q "ip6 saddr $a tcp dport 22 accept" "$WORK/nft.txt" || { cat "$WORK/nft.txt"; fail "the firewall does not let SSH in from $a"; }
 done
+on_vm cat /proc/cmdline | grep -qw 'stowage.e2e=1' || fail "the VM booted without the project's kernel argument (host.kernel_args)"
+on_vm tcpdump --version >/dev/null 2>&1 || fail "tcpdump (host.packages) is not on the VM"
 [[ $(on_vm readlink /etc/localtime) == */Europe/Paris && $(on_vm date +%Z) =~ ^CES?T$ ]] || fail "the VM is not in Europe/Paris's time zone"
 
-step "on the VM: no agent listens, no account logs in with a password, root logs in by no password, no console autologin"
+step "on the VM: nothing listens beyond loopback but SSH, DHCP and the stack's ports, no account logs in with a password, root logs in by no password, no console autologin"
+# beyond_loopback <ss -tulpn output> <allowed proto/port>…: the sockets listening on an address
+# other than loopback's, as proto/port, that the list leaves out (none: success).
+beyond_loopback() {
+	local ss=$1
+	shift
+	awk 'NR > 1 { a = $5; p = a; sub(/.*:/, "", p); sub(/:[^:]*$/, "", a); gsub(/[][]/, "", a); i = ""
+		if (a ~ /%/) { i = a; sub(/.*%/, "", i); sub(/%.*/, "", a) }
+		if (a ~ /^127\./ || a == "::1" || i == "lo") next; print $1 "/" p }' "$ss" | sort -u |
+		grep -vxF -f <(printf '%s\n' "$@") && return 1
+	return 0
+}
 on_vm sudo ss -tulpn >"$WORK/ss.txt" || fail "ss on the VM"
+# SSH, DHCP's clients, the front's ports (HTTP/3 among them) and the L4 route's: the purged
+# packages' services (rpcbind, snmpd, lldpd, iSCSI) and Kairos's agents listen nowhere.
+beyond_loopback "$WORK/ss.txt" tcp/22 tcp/80 tcp/443 udp/443 tcp/5432 udp/68 udp/546 ||
+	{ cat "$WORK/ss.txt"; fail "the VM listens beyond loopback on more than SSH, DHCP and the stack's ports"; }
 ! grep -E 'kairos-agent|edgevpn' "$WORK/ss.txt" || { cat "$WORK/ss.txt"; fail "a Kairos agent listens on the VM"; }
 on_vm sudo passwd -S -a >"$WORK/passwd.txt" || fail "passwd -S on the VM"
 ! awk '$2 == "P" {print; found = 1} END {exit !found}' "$WORK/passwd.txt" || fail "an account of the VM has a password"
@@ -131,11 +151,12 @@ on_vm sudo sshd -T >"$WORK/sshd.txt" || fail "sshd -T on the VM"
 grep -qxE 'permitrootlogin (no|prohibit-password|without-password)' "$WORK/sshd.txt" && grep -qx 'passwordauthentication no' "$WORK/sshd.txt" ||
 	{ grep -E '^(permitrootlogin|passwordauthentication) ' "$WORK/sshd.txt"; fail "sshd lets root or a password in"; }
 ! on_vm "systemctl cat serial-getty@ttyS0.service getty@tty1.service 2>/dev/null" | grep -qi autologin || fail "a console logs in by itself"
-# Recorded, not judged: Docker's forward policy, and what the agent reads at boot.
+# Recorded, not judged: Docker's forward policy.
 on_vm sudo iptables -S FORWARD 2>/dev/null | head -1 || true
 on_vm sudo ip6tables -S FORWARD 2>/dev/null | head -1 || true
-on_vm "ls /oem" || true
-on_vm "sudo journalctl -b --no-pager -o cat | grep -iE 'user-?data|datasource|cloud-config' | head -20" || true
+# The first boot keeps the cloud-config it pulled as /oem/95_userdata, which no later boot pulls
+# again (the upgrade's boot is judged against it below): a changed user-data is never applied.
+userdata=$(on_vm sudo stat -c "'%Y %s'" /oem/95_userdata) || fail "the first boot kept no user-data (/oem/95_userdata)"
 
 step "on the VM: the boot tuned Docker's path (the release's default profile), and the containers as on the host"
 on_vm systemctl is-active notes-tune.service >/dev/null || { on_vm sudo journalctl -b -u notes-tune.service --no-pager | tail -30; fail "the tuning unit did not run"; }
@@ -300,6 +321,8 @@ healthy_postgres "after the upgrade"
 # the logs.
 on_vm notes-stow tune --check >"$WORK/tune.txt" 2>&1 && grep -q '^this host: .* the network profile$' "$WORK/tune.txt" ||
 	{ cat "$WORK/tune.txt"; fail "the upgraded boot's tuning differs, or is not the network profile"; }
+grep -qE "^ok +package tcpdump " "$WORK/tune.txt" && grep -qE "^ok +kernel stowage.e2e=1 " "$WORK/tune.txt" ||
+	{ cat "$WORK/tune.txt"; fail "tune does not report the project's package and kernel argument as asked"; }
 tuned=$(on_vm sudo docker ps -q --filter label=com.docker.compose.service=api)
 on_vm sudo docker inspect --format "'{{json .HostConfig.LogConfig}}'" "$tuned" | grep -q '"max-size":"20m"' || fail "the api container's logs do not rotate"
 # The allowlist outlives the reboot: the boot's input chain drops the port until the install's
@@ -310,6 +333,8 @@ assessment >"$WORK/assess.txt" || { cat "$WORK/assess.txt"; fail "the boot asses
 grep -qx 'enable_boot_assessment=' "$WORK/assess.txt" && grep -qx 'boot_assessment_tentative=' "$WORK/assess.txt" ||
 	{ cat "$WORK/assess.txt"; fail "the health gate did not mark the upgraded boot good"; }
 on_vm notes-stow health >"$WORK/health.txt" 2>&1 && grep -qx ready "$WORK/health.txt" || { cat "$WORK/health.txt"; fail "health"; }
+[[ $(on_vm sudo stat -c "'%Y %s'" /oem/95_userdata) == "$userdata" ]] && on_vm test ! -e /run/.userdata_load ||
+	fail "the upgrade's boot pulled the user-data again: /oem/95_userdata is not the first boot's"
 
 step "rollback: the VM reboots into the passive system, whose boot goes back to 1.0.0"
 # The job reboots the VM itself: the reboot may close the session following it (ssh: 255).
@@ -427,7 +452,7 @@ grep -q "^set by     \`notes-stow network set\`: $lease" "$WORK/net.txt" && ! gr
 	{ cat "$WORK/net.txt"; fail "the boot did not undo the change not confirmed"; }
 on_vm sudo journalctl -b -u notes-network.service --no-pager | grep -q 'not confirmed before the reboot' || fail "the boot does not say it undid the change"
 
-step "the recovery system answers over SSH; recorded, not judged: what it listens on, its accounts"
+step "the recovery system answers over SSH, behind the bundle's firewall, without the project's kernel arguments; nothing but SSH and DHCP listens beyond loopback, no account has a password"
 # The recovery system serves a host key of its own, not the active system's that known_hosts
 # holds: each attempt takes the key it is served into a file of its own (one taken from the active
 # system before it rebooted is never kept), and the recovery mark tells which system answered. Its
@@ -449,8 +474,15 @@ until for RECOVERY in "$VM_IP" "$ADDR"; do on_recovery test -e /run/cos/recovery
 	sleep 15
 done
 echo "recovery: answers at $RECOVERY"
-on_recovery sudo ss -tulpn || true
-on_recovery sudo passwd -S -a || true
+on_recovery sudo nft list table inet notes >"$WORK/nft.recovery.txt" 2>&1 && grep -q 'hook input .*policy drop;' "$WORK/nft.recovery.txt" ||
+	{ cat "$WORK/nft.recovery.txt"; fail "the recovery system runs without the bundle's firewall"; }
+on_recovery sudo ss -tulpn >"$WORK/ss.recovery.txt" || fail "ss on the recovery system"
+beyond_loopback "$WORK/ss.recovery.txt" tcp/22 udp/68 udp/546 ||
+	{ cat "$WORK/ss.recovery.txt"; fail "the recovery system listens beyond loopback on more than SSH and DHCP"; }
+on_recovery sudo passwd -S -a >"$WORK/passwd.recovery.txt" || fail "passwd -S on the recovery system"
+cmdline=$(on_recovery cat /proc/cmdline) || fail "the recovery system's command line does not read"
+[[ $cmdline != *stowage.e2e* ]] || fail "the recovery system booted with the project's kernel argument: $cmdline"
+! awk '$2 == "P" {print; found = 1} END {exit !found}' "$WORK/passwd.recovery.txt" || fail "an account of the recovery system has a password"
 
 step "vm destroy: the VM, its disk and its uploads go, and its state"
 "$CTL" vm destroy "$H" --yes >"$WORK/vm-destroy.txt" 2>"$WORK/vm-destroy.log" || { tail -50 "$WORK/vm-destroy.log"; fail "vm destroy"; }

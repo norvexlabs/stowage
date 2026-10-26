@@ -34,6 +34,17 @@ type System struct {
 	Profile Profile
 	// Modules are the kernel modules the project declares, by name, which Inspect judges.
 	Modules []Module
+	// Packages are the distribution packages the project declares, by name, which Inspect judges.
+	Packages []Package
+	// KernelArgs are the kernel arguments the project declares, which Inspect judges against the
+	// running kernel's command line.
+	KernelArgs []KernelArg
+	// Settings are the kernel settings the project declares (host.sysctls), which the host's
+	// settings (Host.Sysctls) take after the profile's.
+	Settings []Sysctl
+	// Power is the project's posture (host.power): Performance holds the CPUs at their full speed;
+	// "" or Platform leaves them as the host has them.
+	Power string
 }
 
 // Host reads the machine (ReadHost) with the system's profile.
@@ -43,6 +54,7 @@ func (s System) Host() (Host, error) {
 		return h, err
 	}
 	h.Profile = s.Profile
+	h.Settings = s.Settings
 	if h.Profile == "" {
 		h.Profile = Default
 		if st, err := s.readState(); err == nil && st.Profile != "" {
@@ -202,7 +214,7 @@ const (
 // Item is one line of the report.
 type Item struct {
 	State State
-	Kind  string // sysctl, module, nic, tun, docker
+	Kind  string // sysctl, module, package, kernel, cpu, nic, tun, docker, state
 	Name  string
 	Have  string
 	Want  string
@@ -447,9 +459,8 @@ func (s System) Inspect(ctx context.Context, h Host) []Item {
 			items = append(items, Item{Advice, "nic", n.name + " " + cmp.Or(n.driver, "driver"), a, ""})
 		}
 	}
-	if h.network() {
-		items = append(items, s.inspectGovernor())
-	}
+	items = append(items, s.inspectPower()...)
+	items = append(items, s.inspectKernelArgs(h)...)
 	for _, n := range all {
 		if !n.tun || !h.network() {
 			continue
@@ -464,6 +475,7 @@ func (s System) Inspect(ctx context.Context, h Host) []Item {
 			Item{verdict(atLeast(flows, h.FlowEntries())), "tun", n.name + " rps_flow_cnt", flows, AtLeast.render(nums(h.FlowEntries()))})
 	}
 	items = append(items, s.inspectModules()...)
+	items = append(items, s.inspectPackages()...)
 	if s.Docker == nil {
 		return items
 	}

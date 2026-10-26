@@ -26,16 +26,7 @@ A finished item is deleted, not ticked. The plan behind it is
      policy, `/oem` and the boot's datasource stages. Recorded (0.14.0's e2e-vm): FORWARD is
      DROP for IPv4 and IPv6 with `--ipv6`; `/oem` holds `95_userdata` (the first boot's
      cloud-config, kept) and the boot's datasource stages run again, skipping the old-userdata
-     moves. The recovery system (0.14.0's e2e-vm, reached since its own host key is taken): SSH
-     on every address, every account locked (`kairos` and `ops` included), but also **rpcbind on
-     111 TCP/UDP on every address** and snmpd on loopback, on the active system too: kairos-init's
-     Ubuntu package set installs `nfs-common` (rpcbind) and `snmpd`, neither of which Stowage
-     uses. Mask `rpcbind.service`, `rpcbind.socket` and `snmpd.service` in the OS bundle (the build
-     fails if they are not masked), and judge on both systems that nothing but sshd listens
-     beyond loopback (the active system's stack ports aside) — batch A's first item, its VM
-     chain. A changed cloud user-data is never applied again: kairos-init's
-     `00_datasource.yaml` pulls one only while `/oem/95_userdata` is absent, which the first boot
-     writes; e2e-vm judges that file present and the boot's datasource step skipped.
+     moves.
 
 3. **Cloud images on AWS and Azure**: `ship` registers the `cloud_publish` images through
    OpenTofu, run for real on Google Cloud only (`STOWAGE_CLOUD_ENV=<file> make e2e-kairos`). Run it
@@ -77,7 +68,7 @@ ethtool setting, an nftables table, a networkd rule), declared with a `reason` a
 Stowage computes a value only where it can (the `network` profile's), and `tune` advises the
 known cases (`iommu=pt`, an E810's `irdma`) rather than writing them unasked. No special case of
 one argument or one driver. What the host must be is one shape-neutral block, `host:` (`modules`,
-moved out of `shapes.kairos` with no compat, `kernel_args`, `sysctls`, `power`): applied where
+`packages`, `kernel_args`, `sysctls` and `power` are there): applied where
 Stowage owns the host (the Kairos VM, bare metal), recommended where it does not — a Docker
 host's `tune --check` reports each one missing with what sets it there (the GRUB line, the
 modprobe or sysctl drop-in), and `k8s tune` prints them as what every node must have (with the
@@ -101,29 +92,19 @@ pods' settings it prints today) — never written on a host that is not Stowage'
     table only); Stowage loads it at boot before the service starts, removes it with the service,
     and lint checks it with `nft -c` and that it declares that table alone. The host's own
     firewall stays Stowage's. `ip_forward` and the like are 8's sysctls, the routing 6's rules.
-8. **The host a stack asks for**, each key declared with its reason, applied by the host's boot
-    before the services start, recommended elsewhere as `host:` says, and reported by `tune
-    --check` where missing:
-    - **`host.kernel_args`**: a list of `key` / `key=value` tokens (lint: one token each, none of
-      Kairos's own — `root=`, `rd.*`, `cos.*` — refused) written into the Kairos install's GRUB
-      options, effective at the next boot (said so), a boot that fails with them falling back to
-      the passive system; compared with `/proc/cmdline` everywhere. `tune` advises `iommu=pt` (`iommu.passthrough=1`
-      on arm64) where an IOMMU is active without passthrough (DMA remapping: several percent of
-      CPU under a throughput load; passthrough leaves a host-owned device unconfined) — declared
-      by the project, never written unasked. `examples/full` declares one to prove the key.
-    - **`host.sysctls`**: kernel settings past the container-namespaced set (the ones the
-      `network` profile computes are the defaults these may raise; one that lowers a computed
-      value is a lint error), written to the host's sysctl drop-in.
+8. **The host a stack asks for**, beyond `host:`'s keys:
     - **`services.<s>.cpus`**: the service's CPU set (Docker's `cpuset`, the pod's on Kubernetes
       where the node allows it), and where the NICs' interrupts and RPS/XPS go: off it (default)
-      or on it (`irq: on`); two services' sets that overlap are a lint error naming both.
+      or on it (`irq: on`); two services' sets that overlap are a lint error naming both. With
+      6's interfaces (batch B): the steering is the NICs'.
     - **`shapes.kairos.interfaces.<i>.ethtool`**: the NIC's settings in ethtool's own terms —
       `channels` (`combined: max` or a count), `rings` (`max` or counts), `features` (each knob
       on its own, set only where the driver reports it changeable: one `[fixed]` knob in a
       combined `ethtool -K` rejects them all — ENA), `eee` — over the `network` profile's computed
       rings and steering. `tune` explains a refused `ethtool -L` it knows: Intel's E810 (`ice`)
       answers EBUSY while `irdma` holds the port's `ice.roce.N` device, leaving a 100G port at 8
-      queues on a 16 cores (`modules: { irdma: { block: true } }` frees it).
+      queues on a 16 cores (`host.modules: { irdma: { block: true } }` frees it). Under
+      `host.power: performance`, `tune` advises EEE off. With 6 (batch B).
 9. **An upgrade that overlaps** (`services.<s>.update: start-first`, as Swarm's `update_config.order`
     and a Deployment's `maxSurge` without `maxUnavailable`): an appliance's clients cannot be told
     to retry, and a stop-then-start drops every connection and refuses new ones until the new
@@ -133,29 +114,27 @@ pods' settings it prints today) — never written on a host that is not Stowage'
     network, or its own handoff over a Unix socket in a directory both containers mount
     (`services.<s>.update_socket: <dir>`); a bridge-network service with a published port is
     refused (two containers cannot publish one port). On Kubernetes, the chart's strategy.
-10. **Power posture** (`host.power: performance | platform`, default `platform`: nothing
-    written): `tune --apply` sets the governor on a running Docker host only, the VM's boot each
-    time, and nothing stops another writer from undoing it. Under `performance`, applied at
-    install and by a boot unit where Stowage owns the host (sysfs is not on disk), by `tune
-    --apply` and its boot unit on a Docker host whose operator runs it, printed by `k8s tune`:
-    every core on the `performance` governor, its EPP `performance` where exposed, its floor at
-    its ceiling (`intel_pstate/min_perf_pct=100`); `power-profiles-daemon` and `tuned` stopped
-    and masked (each re-asserts its own profile over another writer's), given back under
-    `platform`; a held PM QoS `/dev/cpu_dma_latency` request bounding the idle states where a
-    cpuidle driver is bound. No cpufreq (most VMs: the hypervisor owns frequency) is `n/a`, the
-    posture the hypervisor host's, never a failure. The `network` profile no longer sets the
-    governor. What is a boot's or a NIC's is 8's: the C-state cap and PCIe ASPM are kernel
-    arguments (`intel_idle.max_cstate=`, `pcie_aspm.policy=performance`), EEE an `ethtool`
-    setting, which `tune` advises under `performance`. The cost stated, no gain claimed: power
-    and heat, and a fanless box held at its turbo frequency meets its limits sooner.
 
 ## Should
+
+- **PM QoS under `host.power: performance`**: a held `/dev/cpu_dma_latency` request bounding the
+  idle states where a cpuidle driver is bound. Needs a process holding it for the host's life
+  (the host daemon on the VM; a unit of its own on a Docker host); the static cap is a kernel
+  argument today (`intel_idle.max_cstate=`, `host.kernel_args`), which `tune` could advise.
+- **`tune` advising the C-state cap and PCIe ASPM under `host.power: performance`**
+  (`intel_idle.max_cstate=1`, `pcie_aspm.policy=performance` as `host.kernel_args`), with their
+  cost stated: power and heat, and a fanless box held at its turbo frequency meets its limits
+  sooner.
+- **Ubuntu's HWE kernel on the OS bundle**: kairos-init installs `linux-image-generic` on 26.04,
+  so the bundle stays on 7.0 (security fixes only). Once 26.04's first HWE kernel ships, a
+  `host.kernel: ga | hwe` key (default `ga`) chooses it; the kernel stays refused in
+  `host.packages`.
 
 - **A CPU set per service** (from the L4 routes on the host's network): an unpinned service
   shares its cores with the rest of the stack. An advanced input per service giving compose
   `cpuset` on Docker and the VM, and the chart's equivalent (its values), checked against the
   host's CPUs at install.
-- **A driver's RDMA freed per port** (from Must 8): blocking `irdma` (`shapes.kairos.modules`) takes RDMA off
+- **A driver's RDMA freed per port** (from Must 8): blocking `irdma` (`host.modules`) takes RDMA off
   every port of the host. A port that uses none could instead have its `ice.roce.N` auxiliary
   device unbound only on `ethtool -L`'s EBUSY, logged, and again at each boot, keeping RDMA on
   the others; a device-level action, not a module's setting.
@@ -397,6 +376,25 @@ Docker shape, 2026-10-24):
 
 ## Could
 
+- **Review findings left from batch A** (host block), minor:
+  - `lint`'s namespaced-setting warning is a prefix heuristic: a few `net.ipv4.*` and
+    `net.netfilter.*` keys are global (`tcp_max_orphans`, `inet_peer_*`, `fib_sync_mem`,
+    `nf_conntrack_expect_max`) and are warned anyway; a table of the kernel's per-namespace keys
+    would be exact.
+  - The OS bundle's refusal of a kernel argument its boot script sets reads the generic lines, not
+    a board's `baseExtraArgs` (Stowage builds the generic model only).
+  - A build with `host.packages` fetches the archive's indexes twice (its step, then the cloud
+    NICs' modules step); `tune` reads each CPU's cpufreq files twice under `host.power:
+    performance`.
+
+- **Debian 13 as the OS bundle's base**: the build takes Ubuntu alone. Debian is the one cheap
+  alternative (apt, the same package names and purge, glibc, Docker's repository), but it ships
+  6.12 (a modern kernel only from backports). Choosing Docker's repository from
+  `/etc/os-release`, and a Debian bundle through e2e-kairos and e2e-vm.
+- **Hadron as the OS bundle's base**: Kairos's own minimal distribution (musl, no package
+  manager). Revisit once it publishes SBOMs (today `audit` would see next to nothing of the OS)
+  and ships nftables and a container runtime; every package is a build from source today.
+
 - **L4 routes on the host's network, leftovers** (review): an image the engine lacks at a start's
   plan, which `compose up` then pulls itself, leaves its `EXPOSE` out of that start's peer ports
   and bridge rules (the installer's own re-pull plans again); a plain `upgrade` whose look for a
@@ -445,8 +443,8 @@ Docker shape, 2026-10-24):
 - **One pass over the stack's networks before `up`**: the IPv6 check and the MTU check each list
   the networks and may each stop the stack; one listing, judging both, would stop it once.
 
-- **A Docker host's interrupts and CPU governor on the `network` profile**: `tune --apply` sets
-  them on the running host only, so the host's reboot loses them until the next apply (the VM's
+- **A Docker host's interrupts (`network` profile) and CPU posture (`host.power: performance`)**:
+  `tune --apply` sets them on the running host only, so the host's reboot loses them until the next apply (the VM's
   boot sets them each time). A unit ordered after the NICs' probe, written by `--apply`, would
   keep them.
 

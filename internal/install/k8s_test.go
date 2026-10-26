@@ -726,7 +726,22 @@ func TestK8sTuneListsWhatTheKubeletMustAllow(t *testing.T) {
 			t.Errorf("no %s in allowedUnsafeSysctls:\n%s", s["name"], out)
 		}
 	}
-	if !strings.Contains(out, "--allowed-unsafe-sysctls="+strings.Join(keys, ",")+"\n") || !strings.Contains(out, "`notes-stow tune` on a node") {
+	if !strings.Contains(out, "--allowed-unsafe-sysctls="+strings.Join(keys, ",")+"\n") || !strings.Contains(out, "`notes-stow tune` on a node") || strings.Contains(out, "every node (host)") {
+		t.Errorf("%s", out)
+	}
+	// The host block is what every node needs, which its operator gives it.
+	e = newKubeEnv(t, spec.Provider{Name: "none"})
+	e.release.Spec.Host = &spec.Host{
+		Modules:    map[string]spec.KernelModule{"irdma": {Block: true, Reason: "the queues"}, "ice": {Load: true, Options: map[string]string{"b": "1", "a": "x"}, Reason: "the NIC"}},
+		Packages:   map[string]spec.HostPackage{"tcpdump": {Reason: "capture"}},
+		KernelArgs: map[string]spec.HostValue{"iommu": {Value: "pt", Reason: "DMA"}, "nosmt": {Reason: "one thread"}},
+		Sysctls:    map[string]spec.HostValue{"vm.swappiness": {Value: "10", Reason: "RAM"}},
+		Power:      "performance",
+	}
+	if err := e.installer(nil).K8sTune(); err != nil {
+		t.Fatal(err)
+	}
+	if out := e.out.String(); !strings.Contains(out, "every node (host)") || !strings.Contains(out, "  module ice: loaded at boot, a=x, b=1   the NIC\n  module irdma: blocked   the queues\n  package tcpdump (Debian's name)   capture\n  kernel argument iommu=pt   DMA\n  kernel argument nosmt   one thread\n  sysctl vm.swappiness = 10   RAM\n  power performance: ") {
 		t.Errorf("%s", out)
 	}
 }

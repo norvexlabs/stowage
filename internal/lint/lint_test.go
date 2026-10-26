@@ -394,14 +394,29 @@ func TestEachRuleFiresOnFull(t *testing.T) {
 		{"cloud", []edit{{sp, "cloud_publish: [aws, azure, gcp]", "cloud_publish: [ovh]"}}, nil, "unknown cloud"},
 		{"host api service", []edit{{sp, "host_api: [api]", "host_api: [admin]"}}, nil, `shapes.kairos.host_api: service "admin" is not in`},
 		{"host api twice", []edit{{sp, "host_api: [api]", "host_api: [api, api]"}}, nil, `service "api" is named twice`},
-		{"module name", []edit{{sp, "      pcspkr: {", "      pc-spkr: {"}}, nil, "shapes.kairos.modules.pc-spkr: not a kernel module's name"},
-		{"module loaded and blocked", []edit{{sp, "pcspkr: { block: true,", "pcspkr: { block: true, load: true,"}}, nil, "shapes.kairos.modules.pcspkr: is both loaded and blocked"},
-		{"module blocked with options", []edit{{sp, "pcspkr: { block: true,", "pcspkr: { block: true, options: { x: \"1\" },"}}, nil, "shapes.kairos.modules.pcspkr.options: a blocked module takes no options"},
-		{"module says nothing", []edit{{sp, "tcp_diag: { load: true,", "tcp_diag: {"}}, nil, "shapes.kairos.modules.tcp_diag: says nothing"},
-		{"module without a reason", []edit{{sp, "reason: a VM has no speaker", "reason: \" \""}}, nil, "shapes.kairos.modules.pcspkr.reason: is required"},
-		{"module reason on two lines", []edit{{sp, "reason: a VM has no speaker", "reason: \"a VM\\nhas no speaker\""}}, nil, "shapes.kairos.modules.pcspkr.reason: one line"},
-		{"module option name", []edit{{sp, "redirect_always_follow: \"Y\"", "redirect-always-follow: \"Y\""}}, nil, `shapes.kairos.modules.overlay.options: "redirect-always-follow" is not a module parameter's name`},
-		{"module option value", []edit{{sp, "redirect_always_follow: \"Y\"", "redirect_always_follow: \"Y N\""}}, nil, `shapes.kairos.modules.overlay.options.redirect_always_follow: "Y N": letters`},
+		{"module name", []edit{{sp, "    pcspkr: {", "    pc-spkr: {"}}, nil, "host.modules.pc-spkr: not a kernel module's name"},
+		{"module loaded and blocked", []edit{{sp, "pcspkr: { block: true,", "pcspkr: { block: true, load: true,"}}, nil, "host.modules.pcspkr: is both loaded and blocked"},
+		{"module blocked with options", []edit{{sp, "pcspkr: { block: true,", "pcspkr: { block: true, options: { x: \"1\" },"}}, nil, "host.modules.pcspkr.options: a blocked module takes no options"},
+		{"module says nothing", []edit{{sp, "tcp_diag: { load: true,", "tcp_diag: {"}}, nil, "host.modules.tcp_diag: says nothing"},
+		{"module without a reason", []edit{{sp, "reason: a VM has no speaker", "reason: \" \""}}, nil, "host.modules.pcspkr.reason: is required"},
+		{"module reason on two lines", []edit{{sp, "reason: a VM has no speaker", "reason: \"a VM\\nhas no speaker\""}}, nil, "host.modules.pcspkr.reason: one line"},
+		{"module option name", []edit{{sp, "redirect_always_follow: \"Y\"", "redirect-always-follow: \"Y\""}}, nil, `host.modules.overlay.options: "redirect-always-follow" is not a module parameter's name`},
+		{"module option value", []edit{{sp, "redirect_always_follow: \"Y\"", "redirect_always_follow: \"Y N\""}}, nil, `host.modules.overlay.options.redirect_always_follow: "Y N": letters`},
+		{"package of the bundle's own", []edit{{sp, "    tcpdump: {", "    linux-image-generic: {"}}, nil, "host.packages.linux-image-generic: is the OS bundle's own (linux-image)"},
+		{"package name", []edit{{sp, "    tcpdump: {", "    -tcpdump: {"}}, nil, "host.packages.-tcpdump: not a package's name"},
+		{"package without a reason", []edit{{sp, "reason: \"capture on the VM's interfaces\"", "reason: \"\""}}, nil, "host.packages.tcpdump.reason: is required"},
+		{"package key unknown", []edit{{sp, "tcpdump: { reason:", "tcpdump: { version: \"4\", reason:"}}, nil, "field version not found"},
+		{"kernel arg of Kairos's own", []edit{{sp, "    iommu: { value: pt,", "    rd.shell: { value: \"1\","}}, nil, "host.kernel_args.rd.shell: is Kairos's own (rd)"},
+		{"kernel arg name", []edit{{sp, "    iommu: { value: pt,", "    \"io mmu\": { value: pt,"}}, nil, "host.kernel_args.io mmu: not a kernel argument's name"},
+		{"kernel arg value", []edit{{sp, "    iommu: { value: pt,", "    iommu: { value: \"pt\\\"\","}}, nil, "host.kernel_args.iommu.value: \"pt\\\"\": letters"},
+		{"kernel arg marks a fallback", []edit{{sp, "    iommu: { value: pt,", "    iommu: { value: \"pt,upgrade_failure\","}}, nil, `host.kernel_args.iommu.value: "pt,upgrade_failure" holds upgrade_failure`},
+		{"kernel arg spelt with _", []edit{{sp, "    iommu: { value: pt,", "    net.naming_scheme: { value: v238,"}}, nil, "host.kernel_args.net.naming_scheme: is Kairos's own (net.naming-scheme)"},
+		{"kernel arg without a reason", []edit{{sp, "reason: \"the NICs' DMA passed through, not translated\"", "reason: \"\""}}, nil, "host.kernel_args.iommu.reason: is required"},
+		{"sysctl of a profile", []edit{{sp, "    vm.swappiness: {", "    net.netfilter.nf_conntrack_max: {"}}, nil, "host.sysctls.net.netfilter.nf_conntrack_max: is a tune profile's"},
+		{"sysctl key", []edit{{sp, "    vm.swappiness: {", "    vm/swappiness: {"}}, nil, "host.sysctls.vm/swappiness: not a kernel setting's key"},
+		{"sysctl value", []edit{{sp, "vm.swappiness: { value: \"10\"", "vm.swappiness: { value: \"10;reboot\""}}, nil, `host.sysctls.vm.swappiness.value: "10;reboot"`},
+		{"sysctl without a reason", []edit{{sp, "reason: \"postgres's pages stay in RAM\"", "reason: \"\""}}, nil, "host.sysctls.vm.swappiness.reason: is required"},
+		{"power", []edit{{sp, "  power: performance", "  power: turbo"}}, nil, `host.power: "turbo": performance or platform`},
 		{"module key unknown", []edit{{sp, "pcspkr: { block: true,", "pcspkr: { blocked: true,"}}, nil, "field blocked not found"},
 		{"health gate", []edit{{sp, "poll_s: 30 }", "poll_s: 900 }"}}, nil, "poll_s < deadline_s"},
 		{"lock not semver", nil, map[string]string{"stowage.lock": "stowage: one\n"}, "stowage: version \"one\" is not MAJOR.MINOR.PATCH"},
@@ -862,6 +877,57 @@ func TestAnotherKairosInitReleaseIsWarned(t *testing.T) {
 	}
 }
 
+// A base whose repository is not ubuntu is warned before ship's build refuses it; Ubuntu itself,
+// from a mirror included, is not.
+func TestABaseOtherThanUbuntuIsWarned(t *testing.T) {
+	t.Parallel()
+	const base = "base: ubuntu:26.04@"
+	warned := func(res *Result) bool {
+		return slices.ContainsFunc(res.Findings, func(f Finding) bool {
+			return f.Severity == Warning && strings.Contains(f.String(), "shapes.kairos.base:") && strings.Contains(f.String(), "takes Ubuntu alone")
+		})
+	}
+	root := testutil.CopyExample(t, "full")
+	for _, b := range []string{base, "base: localhost:5000/mirror/ubuntu:26.04@", "base: ubuntu@"} {
+		testutil.Edit(t, root, specFile, base, b)
+		if res := run(t, root); warned(res) {
+			t.Errorf("%s: %+v", b, res.Findings)
+		}
+		testutil.Edit(t, root, specFile, b, base)
+	}
+	for _, b := range []string{"base: debian:13@", "base: localhost:5000/ubuntu-derived:1@"} {
+		testutil.Edit(t, root, specFile, base, b)
+		if res := run(t, root); !warned(res) {
+			t.Errorf("%s: %+v", b, res.Findings)
+		}
+		testutil.Edit(t, root, specFile, b, base)
+	}
+}
+
+// A host setting a network namespace keeps of its own is warned: the stack's containers miss it.
+// One the namespace does not keep is not.
+func TestAHostSettingOfTheNamespaceIsWarned(t *testing.T) {
+	t.Parallel()
+	warned := func(res *Result) bool {
+		return slices.ContainsFunc(res.Findings, func(f Finding) bool {
+			return f.Severity == Warning && strings.Contains(f.String(), "a namespace keeps its own")
+		})
+	}
+	root := testutil.CopyExample(t, "full")
+	if res := run(t, root); warned(res) {
+		t.Errorf("vm.swappiness: %+v", res.Findings)
+	}
+	testutil.Edit(t, root, specFile, "    vm.swappiness: {", "    net.ipv4.tcp_keepalive_time: {")
+	if res := run(t, root); !warned(res) || len(errorsOf(res)) > 0 {
+		t.Errorf("net.ipv4.tcp_keepalive_time: %+v", res.Findings)
+	}
+	for key, want := range map[string]bool{"kernel.shmmax": true, "kernel.sem": true, "fs.mqueue.msg_max": true, "net.unix.max_dgram_qlen": true, "net.ipv4.tcp_mem": false, "net.core.rmem_default": false, "kernel.pid_max": false, "net.mptcp.enabled": true, "kernel.hostname": true, "kernel.sem_next_id": true} {
+		if namespaced(key) != want {
+			t.Errorf("namespaced(%s) = %v", key, !want)
+		}
+	}
+}
+
 func TestRefTag(t *testing.T) {
 	t.Parallel()
 	for ref, want := range map[string]string{
@@ -911,7 +977,7 @@ func TestPublishedPortOnDockerWarns(t *testing.T) {
 func TestL4AllowlistWithoutKairosWarns(t *testing.T) {
 	t.Parallel()
 	root := testutil.CopyExample(t, "full")
-	testutil.Edit(t, root, specFile, "  kairos:\n    base: ubuntu:26.04@sha256:c098726dd9b9733f3e885f8de0ef375206a311b0a317eadc40d347b1115fb944\n    kairos_init: quay.io/kairos/kairos-init:v4.4.0-rc2@sha256:ac885c9f3002a3f0e7000947e3d1e2a5c95f5e2d0212d5f9bbd663347f1ebe0c\n    disk_formats: [raw, qcow2, ova, vhd, gce]\n    cloud_publish: [aws, azure, gcp]\n    health_gate: { deadline_s: 600, deadline_after_reset_s: 1800, poll_s: 30 }\n    host_api: [api]\n    "+vmSizeLine+"   # vm create's least and default size\n"+modulesBlock, "")
+	testutil.Edit(t, root, specFile, "  kairos:\n    base: ubuntu:26.04@sha256:c098726dd9b9733f3e885f8de0ef375206a311b0a317eadc40d347b1115fb944\n    kairos_init: quay.io/kairos/kairos-init:v4.4.0-rc2@sha256:ac885c9f3002a3f0e7000947e3d1e2a5c95f5e2d0212d5f9bbd663347f1ebe0c\n    disk_formats: [raw, qcow2, ova, vhd, gce]\n    cloud_publish: [aws, azure, gcp]\n    health_gate: { deadline_s: 600, deadline_after_reset_s: 1800, poll_s: 30 }\n    host_api: [api]\n    "+vmSizeLine+"   # vm create's least and default size\n", "")
 	res := run(t, root)
 	if errs := errorsOf(res); len(errs) > 0 {
 		t.Fatalf("errors:\n%s", strings.Join(errs, "\n"))
@@ -1217,12 +1283,6 @@ const memShares = "shares: { postgres: { percent: 25, max: 16G }, api: 10 }"
 
 // vmSizeLine is examples/full's shapes.kairos.size.
 const vmSizeLine = "size: { min: { cpus: 2, memory: 2G, disk: 20G }, recommended: { cpus: 4, memory: 8G, disk: 40G } }"
-
-// modulesBlock is examples/full's shapes.kairos.modules, as the spec writes it.
-const modulesBlock = "    modules:                                                   # the OS bundle's modprobe files; tune reports what differs\n" +
-	"      tcp_diag: { load: true, reason: \"ss -ti reads the TCP sockets' details\" }\n" +
-	"      pcspkr: { block: true, reason: a VM has no speaker }\n" +
-	"      overlay: { options: { redirect_always_follow: \"Y\" }, reason: \"Docker's storage: the kernel's default, stated\" }\n"
 
 // stack.memory's shares at their bounds are clean: 1 % and 90 % each, 90 % together (the errors
 // past them are TestEachRuleFiresOnFull's).

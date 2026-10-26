@@ -19,13 +19,34 @@ follow [SemVer](https://semver.org/).
 - **An app's own SBOMs in the stack's**: an SBOM document an image ships (CycloneDX or SPDX JSON,
   by convention `/usr/share/sbom/<name>.cdx.json`) is merged into the image's attested SBOM, so
   one audit covers what an app bundles that no scanner sees, such as a front's scripts.
-- **Kernel modules a project declares**: `shapes.kairos.modules` names kernel modules, each with
-  its reason, to load at boot, to block (neither a dependency nor udev loads it) or to give
-  options. The OS bundle carries them from its first boot, its build fails when one does not fit
-  its kernel, `lint` checks them, and `tune` reports a module that is not as asked: on the VM as
-  a difference, on a Docker host, whose kernel is its operator's, as advice.
+- **What a stack asks of its host** (`host`), each entry with its reason: kernel modules
+  (`host.modules`) to load at boot, to block or to give options; Ubuntu packages
+  (`host.packages`); kernel arguments (`host.kernel_args`), which the VM's active and passive
+  systems boot with, each with its own release's, the recovery system without them; kernel
+  settings beyond the tune profile's (`host.sysctls`); and the CPUs' posture (`host.power:
+  performance`, their full speed: the performance governor, energy preference and intel_pstate
+  floor; `platform`, the default, leaves them). The OS bundle carries them from its first boot,
+  `lint` checks them (Kairos's own kernel arguments, the boot's own packages and a profile's
+  settings are refused), `tune` reports what is not as asked — on the VM as a difference, on a
+  Docker host, whose kernel, boot loader and packages are its operator's, as advice saying how to
+  set it there; `--apply` writes the settings and the power posture — and `k8s tune` prints them
+  as what every node needs. On the network profile, `tune` advises `iommu=pt` where an IOMMU
+  translates every device's DMA.
 
 ### Changed
+- **A smaller, quieter OS bundle**: the packages kairos-init installs that the appliance does
+  without are removed — NFS and its `rpcbind` (which listened on port 111 on every address),
+  SNMP, LLDP (which announced the host to its network), fail2ban, Canonical's subscription and
+  news tooling, PackageKit, ZFS, iSCSI, RAID and network block devices, haveged, os-prober and X11
+  leftovers — and the apt and news timers masked, so only SSH listens beyond loopback, on the
+  active system as on the recovery one, and the OS's SBOM lists less to audit. `host.packages`
+  keeps one a project needs.
+- **The network profile no longer sets the CPUs' governor**: `host.power: performance` does, on
+  any profile.
+- **A VM's changed user-data is never applied**, as Kairos keeps its first boot's: said, and
+  proven across an upgrade.
+- **The OS bundle is built on Ubuntu alone**: `lint` warns of another `shapes.kairos.base`, and the
+  build refuses it at once, naming the key.
 - **A VM's disk is the app's space and Kairos's**: `vm create --disk` and `shapes.kairos.size`'s
   `disk` are the app's space (default 20 GiB, at least 4); `vm create` adds what Kairos takes,
   which each disk records, and says both (`a 43 GiB disk (the OS 23 GiB, the app 20 GiB)`). The

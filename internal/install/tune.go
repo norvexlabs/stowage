@@ -30,7 +30,7 @@ func (in *Installer) tuneSystem(ctx context.Context) (tune.System, error) {
 		return *in.tuned, nil
 	}
 	sys := *in.O.Tune
-	sys.Modules = releaseModules(in.R.Spec)
+	releaseHost(&sys, in.R.Spec)
 	out, err := in.O.Docker.Run(ctx, Cmd{Args: []string{"info", "--format", "{{.ServerVersion}}|{{.OperatingSystem}}|{{json .SecurityOptions}}"}})
 	if err != nil {
 		// Docker Desktop stopped is still Docker Desktop: its CLI context says so.
@@ -239,18 +239,49 @@ func hostTune(ctl string, run func(ctx context.Context, name string, args ...str
 	return &tune.System{Root: "/", Run: run, Look: look, Euid: os.Geteuid, Ctl: ctl, Profile: profile}
 }
 
-// releaseModules are the kernel modules the release's shapes.kairos.modules declares, by name.
+// releaseModules are the kernel modules the release's host.modules declares, by name.
 func releaseModules(s *spec.Spec) []tune.Module {
-	if s.Shapes.Kairos == nil {
+	if s.Host == nil {
 		return nil
 	}
-	mods := s.Shapes.Kairos.Modules
+	mods := s.Host.Modules
 	var out []tune.Module
 	for _, name := range slices.Sorted(maps.Keys(mods)) {
 		m := mods[name]
 		out = append(out, tune.Module{Name: name, Load: m.Load, Block: m.Block, Options: m.Options, Reason: m.Reason})
 	}
 	return out
+}
+
+// releasePackages are the distribution packages the release's host.packages declares, by name.
+func releasePackages(s *spec.Spec) []tune.Package {
+	if s.Host == nil {
+		return nil
+	}
+	var out []tune.Package
+	for _, name := range slices.Sorted(maps.Keys(s.Host.Packages)) {
+		out = append(out, tune.Package{Name: name, Reason: s.Host.Packages[name].Reason})
+	}
+	return out
+}
+
+// releaseHost gives sys what the release's host block asks of the host: its modules, packages and
+// kernel arguments, which tune judges; its settings and power posture, which it also applies.
+func releaseHost(sys *tune.System, s *spec.Spec) {
+	sys.Modules, sys.Packages = releaseModules(s), releasePackages(s)
+	sys.KernelArgs, sys.Settings, sys.Power = nil, nil, ""
+	if s.Host == nil {
+		return
+	}
+	for _, k := range slices.Sorted(maps.Keys(s.Host.KernelArgs)) {
+		a := s.Host.KernelArgs[k]
+		sys.KernelArgs = append(sys.KernelArgs, tune.KernelArg{Key: k, Value: a.Value, Reason: a.Reason})
+	}
+	for _, k := range slices.Sorted(maps.Keys(s.Host.Sysctls)) {
+		c := s.Host.Sysctls[k]
+		sys.Settings = append(sys.Settings, tune.Sysctl{Key: k, Want: c.Value, Why: c.Reason, Rule: tune.Exact})
+	}
+	sys.Power = s.Host.Power
 }
 
 // runHost runs a host program, its error carrying what it wrote to stderr.
