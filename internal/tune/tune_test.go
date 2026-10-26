@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -697,6 +698,28 @@ func TestInspectJudgesTheProjectsPackages(t *testing.T) {
 	}
 }
 
+// The project's firmware, under /lib/firmware as it is or compressed: drift on the VM when
+// missing, advice naming the firmware package elsewhere. A directory of the name is no file.
+func TestInspectJudgesTheProjectsFirmware(t *testing.T) {
+	t.Parallel()
+	s, _ := fakeHost(t, "1500")
+	write(t, s.Root, "lib/firmware/intel/ice/ddp/ice.pkg.zst", "x")
+	write(t, s.Root, "lib/firmware/plain.bin", "x")
+	write(t, s.Root, "lib/firmware/adir/f", "x")
+	s.Firmware = []Firmware{{"intel/ice/ddp/ice.pkg", "the E810"}, {"plain.bin", "r"}, {"gone.bin", "r"}, {"adir", "r"}}
+	s.Owned = true
+	items := s.Inspect(context.Background(), host(4096, 2))
+	for path, st := range map[string]State{"intel/ice/ddp/ice.pkg": OK, "plain.bin": OK, "gone.bin": Differs, "adir": Differs} {
+		if it := find(items, "firmware", path); it == nil || it.State != st {
+			t.Errorf("owned, %s: %+v, want %s", path, it, st)
+		}
+	}
+	s.Owned = false
+	if it := find(s.Inspect(context.Background(), host(4096, 2)), "firmware", "gone.bin"); it == nil || it.State != Advice || !strings.Contains(it.Want, "linux-firmware") || !strings.Contains(it.Have, "(r)") {
+		t.Errorf("not owned: %+v", it)
+	}
+}
+
 // The project's kernel arguments, against the running command line's last value of each: drift
 // on the VM, advice naming the boot loader elsewhere. On the network profile an IOMMU that
 // translates DMA is advice, unless the command line or the project already says how.
@@ -1059,13 +1082,14 @@ func TestApplyThenRevert(t *testing.T) {
 	if slices.Contains(*ran, "systemctl restart docker") {
 		t.Error("Docker restarted without --restart-docker")
 	}
-	if !slices.Contains(*ran, "/usr/sbin/ethtool -K eth0 rx-udp-gro-forwarding on rx-gro-list off") || !slices.Contains(*ran, "modprobe tun") {
+	// One feature a command, and none already as wanted.
+	if !slices.Contains(*ran, "/usr/sbin/ethtool -K eth0 rx-udp-gro-forwarding on") || slices.ContainsFunc(*ran, func(c string) bool { return strings.Contains(c, "rx-gro-list") }) || !slices.Contains(*ran, "modprobe tun") {
 		t.Errorf("ran %v", *ran)
 	}
 	if !strings.Contains(read(t, s.Root, SysctlFile), "\nnet.core.rmem_max = 33554432\n") {
 		t.Errorf("sysctl file:\n%s", read(t, s.Root, SysctlFile))
 	}
-	if !strings.Contains(read(t, s.Root, UdevFile), `RUN+="/usr/sbin/ethtool -K $name rx-udp-gro-forwarding on rx-gro-list off"`) {
+	if !strings.Contains(read(t, s.Root, UdevFile), `RUN+="/usr/sbin/ethtool -K $name rx-udp-gro-forwarding on", RUN+="/usr/sbin/ethtool -K $name rx-gro-list off"`) {
 		t.Errorf("udev file:\n%s", read(t, s.Root, UdevFile))
 	}
 	daemon := read(t, s.Root, DaemonFile)
@@ -1602,5 +1626,185 @@ func TestASharedRecordIsTheDefault(t *testing.T) {
 	}
 	if got := read(t, s.Root, Sysctl{Key: "net.core.somaxconn"}.Path()); got != "4096\n" {
 		t.Errorf("the revert of a shared record: somaxconn %q", got)
+	}
+}
+
+// The services' whole cores: from the last core down, a core's threads together, never CPU 0's
+// core, the services in their names' order; more than the host has is refused, naming them.
+func TestAllocateGivesWholeCoresFromTheTop(t *testing.T) {
+	t.Parallel()
+	cores := [][]int{{0, 4}, {1, 5}, {2, 6}, {3, 7}}
+	got, err := Allocate([]CoreRequest{{Service: "proxy", Cores: 2}, {Service: "dns", Cores: 1, IRQ: true}}, cores)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(got["dns"], []int{3, 7}) || !slices.Equal(got["proxy"], []int{1, 2, 5, 6}) {
+		t.Errorf("sets %v", got)
+	}
+	if _, err := Allocate([]CoreRequest{{Service: "proxy", Cores: 3}}, cores); err != nil {
+		t.Errorf("three cores of four, CPU 0's aside: %v", err)
+	}
+	if _, err := Allocate([]CoreRequest{{Service: "proxy", Cores: 3}, {Service: "dns", Cores: 1}}, cores); err == nil || !strings.Contains(err.Error(), "dns, proxy ask 4 whole cores, and this host has 3 beside the one of CPU 0") {
+		t.Errorf("four of four: %v", err)
+	}
+	if got, err := Allocate(nil, cores); got != nil || err != nil {
+		t.Errorf("none: %v %v", got, err)
+	}
+}
+
+// Cores read sysfs's topology: SMT siblings together; a CPU whose topology does not read is a
+// core of its own. The NICs' steering stays off the isolated cores (IRQ off), every CPU else.
+func TestCoresAndTheSteeringOffTheServicesCores(t *testing.T) {
+	t.Parallel()
+	s, _ := fakeHost(t, "1500")
+	for cpu, core := range map[int]string{0: "0", 1: "1", 2: "0", 3: "1"} {
+		write(t, s.Root, "sys/devices/system/cpu/cpu"+strconv.Itoa(cpu)+"/topology/core_id", core+"\n")
+		write(t, s.Root, "sys/devices/system/cpu/cpu"+strconv.Itoa(cpu)+"/topology/physical_package_id", "0\n")
+	}
+	h := Host{CPUs: 5, Online: []int{0, 1, 2, 3, 4}}
+	if got := s.Cores(h); len(got) != 3 || !slices.Equal(got[0], []int{0, 2}) || !slices.Equal(got[1], []int{1, 3}) || !slices.Equal(got[2], []int{4}) {
+		t.Errorf("cores %v", got)
+	}
+	s.ServiceCores = []CoreRequest{{Service: "proxy", Cores: 1}}
+	h.Isolated = s.isolated(h)
+	if !slices.Equal(h.Isolated, []int{4}) || h.RPSMask() != "0000000f" || !slices.Equal(h.steerCPUs(), []int{0, 1, 2, 3}) {
+		t.Errorf("isolated %v, mask %s", h.Isolated, h.RPSMask())
+	}
+	s.ServiceCores = []CoreRequest{{Service: "proxy", Cores: 1, IRQ: true}}
+	if got := s.isolated(h); len(got) != 0 {
+		t.Errorf("irq on: isolated %v", got)
+	}
+	if got := (Host{CPUs: 2, Isolated: []int{0, 1}}).steerCPUs(); !slices.Equal(got, []int{0, 1}) {
+		t.Errorf("all isolated: %v", got)
+	}
+	if got := cpuRanges([]int{0, 1, 2, 5, 7, 8}); got != "0-2,5,7-8" {
+		t.Errorf("ranges %s", got)
+	}
+}
+
+// The project's interfaces: on the VM, each NIC by its role's name, its MTU (drift when another),
+// a tun device n/a until its service opens it, and each ethtool setting it asks; elsewhere advice
+// with networkd's settings and the ethtool commands.
+func TestInspectJudgesTheProjectsInterfaces(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s, _ := fakeHost(t, "1500")
+	write(t, s.Root, "sys/class/net/edge/mtu", "9000\n")
+	write(t, s.Root, "sys/class/net/uplink/mtu", "1500\n")
+	s.Interfaces = []Interface{
+		{Role: "uplink", Kind: "nic", Reason: "the default route"},
+		{Role: "edge", Kind: "nic", MTU: 1500, RoutingPolicyRules: []map[string]string{{"FirewallMark": "0x1", "Table": "100"}}, Reason: "the probes",
+			NIC: &NICSettings{Combined: "max", RX: "max", Features: map[string]string{"rx-gro-list": "on", "rx-udp-gro-forwarding": "off"}}},
+		{Role: "vpn0", Kind: "tun", Reason: "the peers"},
+		{Role: "lost", Kind: "nic", Reason: "r"},
+	}
+	s.Owned = true
+	items := s.Inspect(ctx, host(4096, 2))
+	for name, st := range map[string]State{"uplink": OK, "edge": Differs, "vpn0": NA, "lost": Differs, "edge rx-gro-list": Differs, "edge rx-udp-gro-forwarding": OK, "edge rings": Differs} {
+		if it := find(items, "interface", name); it == nil || it.State != st {
+			t.Errorf("owned, %s: %+v, want %s", name, it, st)
+		}
+	}
+	if it := find(items, "interface", "edge rings"); it.Want != "rx 4096 tx 256" {
+		t.Errorf("rings want %q", it.Want)
+	}
+	s.Owned = false
+	it := find(s.Inspect(ctx, host(4096, 2)), "interface", "edge")
+	if it == nil || it.State != Advice || !strings.Contains(it.Want, "[RoutingPolicyRule] FirewallMark=0x1 Table=100") || !strings.Contains(it.Want, "ethtool -L <its NIC> combined max") || !strings.Contains(it.Want, "ethtool -K <its NIC> rx-gro-list on") {
+		t.Errorf("not owned: %+v", it)
+	}
+}
+
+// The project's NIC settings on the VM: each feature on its own where the driver lets it (a fixed
+// one left, noted), the channels to their maximum, the rings on a link not up yet; an E810 whose
+// RDMA holds the port is said so when it refuses its channels.
+func TestTheProjectsNICSettingsApply(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s, ran := fakeHost(t, "1500")
+	run := s.Run
+	s.Run = func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		switch {
+		case args[0] == "-k":
+			return []byte("Features for edge:\nrx-gro-list: off\ntx-checksumming: on [fixed]\n"), nil
+		case args[0] == "-l":
+			return []byte("Channel parameters for edge:\nPre-set maximums:\nRX:\t\tn/a\nTX:\t\tn/a\nOther:\t\t1\nCombined:\t16\nCurrent hardware settings:\nRX:\t\tn/a\nTX:\t\tn/a\nOther:\t\t1\nCombined:\t8\n"), nil
+		case args[0] == "-L":
+			*ran = append(*ran, strings.Join(append([]string{name}, args...), " "))
+			return nil, errors.New("Device or resource busy")
+		}
+		return run(ctx, name, args...)
+	}
+	write(t, s.Root, "sys/class/net/edge/flags", "0x1002\n")
+	write(t, s.Root, "sys/module/irdma/refcnt", "0\n")
+	if err := os.MkdirAll(filepath.Join(s.Root, "sys/bus/pci/drivers/ice"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(s.Root, "sys/class/net/edge/device"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(s.Root, "sys/bus/pci/drivers/ice"), filepath.Join(s.Root, "sys/class/net/edge/device/driver")); err != nil {
+		t.Fatal(err)
+	}
+	i := Interface{Role: "edge", NIC: &NICSettings{Combined: "max", RX: "max", Features: map[string]string{"rx-gro-list": "on", "tx-checksumming": "off"}}}
+	notes := s.applyNIC(ctx, "/usr/sbin/ethtool", i)
+	for _, want := range []string{"/usr/sbin/ethtool -K edge rx-gro-list on", "/usr/sbin/ethtool -L edge combined 16", "/usr/sbin/ethtool -G edge rx 4096"} {
+		if !slices.Contains(*ran, want) {
+			t.Errorf("did not run %q: %v", want, *ran)
+		}
+	}
+	if slices.ContainsFunc(*ran, func(c string) bool { return strings.Contains(c, "tx-checksumming") }) {
+		t.Errorf("set a fixed feature: %v", *ran)
+	}
+	joined := strings.Join(notes, "\n")
+	if !strings.Contains(joined, "edge tx-checksumming: on [fixed], the driver's: left") || !strings.Contains(joined, "the E810's RDMA driver holds the port's queues (irdma); host.modules { irdma: { block: true } } frees them") {
+		t.Errorf("notes:\n%s", joined)
+	}
+	if s.Interfaces = []Interface{i}; !s.declaresRings("edge") || s.declaresRings("uplink") {
+		t.Error("declaresRings")
+	}
+}
+
+// irqbalance's ban, as the report compares it with the services' cores: the running daemon's
+// environment, else the file its family's unit reads (its last assignment), the mask before the
+// list, and the CPUs the kernel isolates when neither is set.
+func TestIrqbalanceBansTheServicesCores(t *testing.T) {
+	t.Parallel()
+	s, _ := fakeHost(t, "1500")
+	if s.irqbalanceBans([]int{2, 3}) {
+		t.Error("no file bans")
+	}
+	write(t, s.Root, "etc/sysconfig/irqbalance", "IRQBALANCE_BANNED_CPULIST=2-3\n")
+	if !s.irqbalanceBans([]int{2, 3}) || s.irqbalanceFile() != "etc/sysconfig/irqbalance" {
+		t.Error("the RHEL family's file")
+	}
+	for line, bans := range map[string]bool{
+		"IRQBALANCE_BANNED_CPULIST=\"2\"":                                       false,
+		"IRQBALANCE_BANNED_CPULIST=2-3\nIRQBALANCE_BANNED_CPULIST=0":            false,
+		"# IRQBALANCE_BANNED_CPULIST=0\nexport IRQBALANCE_BANNED_CPULIST='1-3'": true,
+		"IRQBALANCE_BANNED_CPULIST=2,3":                                         true,
+		"IRQBALANCE_BANNED_CPUS=0000000c":                                       true,
+		"IRQBALANCE_BANNED_CPUS=00000002\nIRQBALANCE_BANNED_CPULIST=2-3":        false,
+	} {
+		write(t, s.Root, "etc/default/irqbalance", line+"\n")
+		if s.irqbalanceBans([]int{2, 3}) != bans || s.irqbalanceFile() != "etc/default/irqbalance" {
+			t.Errorf("%q: bans %v", line, !bans)
+		}
+	}
+	write(t, s.Root, "etc/default/irqbalance", "IRQBALANCE_BANNED_CPULIST=0\n")
+	write(t, s.Root, "sys/devices/system/cpu/isolated", "2-3\n")
+	if s.irqbalanceBans([]int{2, 3}) {
+		t.Error("isolcpus counted beside a list")
+	}
+	write(t, s.Root, "etc/default/irqbalance", "\n")
+	if !s.irqbalanceBans([]int{2, 3}) {
+		t.Error("isolcpus without a ban")
+	}
+	// The running daemon's own environment wins over the file.
+	write(t, s.Root, "proc/4242/comm", "irqbalance\n")
+	write(t, s.Root, "proc/4242/environ", "PATH=/bin\x00IRQBALANCE_BANNED_CPULIST=0\x00")
+	write(t, s.Root, "etc/default/irqbalance", "IRQBALANCE_BANNED_CPULIST=2-3\n")
+	if s.irqbalanceBans([]int{2, 3}) {
+		t.Error("the file over the daemon's environment")
 	}
 }

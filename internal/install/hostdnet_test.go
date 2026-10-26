@@ -324,7 +324,7 @@ func TestRevertWindowBounds(t *testing.T) {
 
 func TestTheNetworkFileNetworkdReads(t *testing.T) {
 	t.Parallel()
-	static := renderNetwork("notes", "notes-stow", NetConfig{Mode: "static", Address: "192.0.2.10/24", Gateway: "192.0.2.1", DNS: []string{"1.1.1.1"}})
+	static := renderNetwork("notes", "notes-stow", "Name=en* eth*", NetConfig{Mode: "static", Address: "192.0.2.10/24", Gateway: "192.0.2.1", DNS: []string{"1.1.1.1"}})
 	for _, want := range []string{"[Match]\nName=en* eth*\n", "Address=192.0.2.10/24\n", "Gateway=192.0.2.1\n", "DNS=1.1.1.1\n"} {
 		if !strings.Contains(static, want) {
 			t.Errorf("no %q in\n%s", want, static)
@@ -337,29 +337,29 @@ func TestTheNetworkFileNetworkdReads(t *testing.T) {
 	if !strings.HasSuffix(static, "\n[DHCPv6]\nUseDNS=no\n\n[IPv6AcceptRA]\nUseDNS=no\n") {
 		t.Errorf("a static file keeps the router advertisements' DNS:\n%s", static)
 	}
-	if noDNS := renderNetwork("notes", "notes-stow", NetConfig{Mode: "static", Address: "192.0.2.10/24"}); strings.Contains(noDNS, "UseDNS") {
+	if noDNS := renderNetwork("notes", "notes-stow", "Name=en* eth*", NetConfig{Mode: "static", Address: "192.0.2.10/24"}); strings.Contains(noDNS, "UseDNS") {
 		t.Errorf("no DNS given, the advertised servers are dropped:\n%s", noDNS)
 	}
 	// IPv6 off: DHCPv4 alone, no link-local address, no router advertisement.
-	dhcp := renderNetwork("notes", "notes-stow", NetConfig{Mode: "dhcp"})
+	dhcp := renderNetwork("notes", "notes-stow", "Name=en* eth*", NetConfig{Mode: "dhcp"})
 	if !strings.HasSuffix(dhcp, "[Network]\nDHCP=ipv4\nLinkLocalAddressing=no\nIPv6AcceptRA=no\n") {
 		t.Errorf("dhcp:\n%s", dhcp)
 	}
-	if on := renderNetwork("notes", "notes-stow", NetConfig{Mode: "dhcp", IPv6: true}); !strings.HasSuffix(on, "[Network]\nDHCP=yes\n\n[DHCPv6]\nWithoutRA=solicit\n") {
+	if on := renderNetwork("notes", "notes-stow", "Name=en* eth*", NetConfig{Mode: "dhcp", IPv6: true}); !strings.HasSuffix(on, "[Network]\nDHCP=yes\n\n[DHCPv6]\nWithoutRA=solicit\n") {
 		t.Errorf("dhcp with IPv6:\n%s", on)
 	}
-	own := renderNetwork("notes", "notes-stow", NetConfig{Mode: "dhcp", DNS: []string{"9.9.9.9"}})
+	own := renderNetwork("notes", "notes-stow", "Name=en* eth*", NetConfig{Mode: "dhcp", DNS: []string{"9.9.9.9"}})
 	for _, want := range []string{"DNS=9.9.9.9\n", "[DHCPv4]\nUseDNS=no\n", "[DHCPv6]\nUseDNS=no\n", "[IPv6AcceptRA]\nUseDNS=no\n"} {
 		if !strings.Contains(own, want) {
 			t.Errorf("dhcp with its own DNS servers keeps others: no %q in\n%s", want, own)
 		}
 	}
 	// A gateway outside the prefix is reached on the link; one inside is a plain Gateway=.
-	onLink := renderNetwork("notes", "notes-stow", NetConfig{Mode: "static", Address: "192.0.2.5/32", Gateway: "198.51.100.1"})
+	onLink := renderNetwork("notes", "notes-stow", "Name=en* eth*", NetConfig{Mode: "static", Address: "192.0.2.5/32", Gateway: "198.51.100.1"})
 	if !strings.Contains(onLink, "\n[Route]\nGateway=198.51.100.1\nGatewayOnLink=yes\n") || strings.Contains(onLink, "[Network]\nAddress=192.0.2.5/32\nGateway=") {
 		t.Errorf("/32:\n%s", onLink)
 	}
-	if p2p := renderNetwork("notes", "notes-stow", NetConfig{Mode: "static", Address: "192.0.2.0/31", Gateway: "192.0.2.1"}); strings.Contains(p2p, "OnLink") || !strings.Contains(p2p, "Gateway=192.0.2.1\n") {
+	if p2p := renderNetwork("notes", "notes-stow", "Name=en* eth*", NetConfig{Mode: "static", Address: "192.0.2.0/31", Gateway: "192.0.2.1"}); strings.Contains(p2p, "OnLink") || !strings.Contains(p2p, "Gateway=192.0.2.1\n") {
 		t.Errorf("/31 with its gateway in the prefix:\n%s", p2p)
 	}
 	if strings.Contains(static, "OnLink") {
@@ -378,7 +378,7 @@ func TestTheNetworkFileNetworkdReads(t *testing.T) {
 		{NetConfig{IPv6: true, Mode: "static", Address: "192.0.2.5/32", Gateway: "198.51.100.1", Address6: "2001:db8::10/128", Gateway6: "2001:db9::1"},
 			"[Network]\nAddress=192.0.2.5/32\nAddress=2001:db8::10/128\n\n[Route]\nGateway=198.51.100.1\nGatewayOnLink=yes\n\n[Route]\nGateway=2001:db9::1\nGatewayOnLink=yes\n"},
 	} {
-		if got := renderNetwork("notes", "notes-stow", c.in); !strings.HasSuffix(got, "\n\n"+c.want) {
+		if got := renderNetwork("notes", "notes-stow", "Name=en* eth*", c.in); !strings.HasSuffix(got, "\n\n"+c.want) {
 			t.Errorf("%+v:\n%s", c.in, got)
 		}
 	}

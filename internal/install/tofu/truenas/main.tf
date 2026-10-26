@@ -17,6 +17,13 @@ locals {
   substr(local.mac_hex, 6, 2), substr(local.mac_hex, 8, 2))
 
   step = "exec \"$STOWAGE_CTL\" vm truenas"
+
+  # The NICs: the release's, the primary first, each on its bridge (default nic_attach) with its
+  # MAC (default the derived one); or one.
+  nics = [for n in(length(var.nics) > 0 ? var.nics : [{ role = "", mac = "", attach = "" }]) : {
+    mac    = n.mac != "" ? n.mac : local.mac
+    attach = n.attach != "" ? n.attach : var.nic_attach
+  }]
 }
 
 # Holds the uploads (the image, the seed): TrueNAS's API deletes no file, so they live as long as
@@ -112,14 +119,20 @@ resource "truenas_vm_device" "disk" {
 }
 
 resource "truenas_vm_device" "nic" {
-  vm    = tonumber(truenas_vm.vm.id)
-  dtype = "NIC"
-  order = 1002
+  for_each = { for i, n in local.nics : tostring(i) => n }
+  vm       = tonumber(truenas_vm.vm.id)
+  dtype    = "NIC"
+  order    = 1002 + tonumber(each.key)
   attributes = {
     type       = "VIRTIO"
-    nic_attach = var.nic_attach
-    mac        = local.mac
+    nic_attach = each.value.attach
+    mac        = each.value.mac
   }
+}
+
+moved {
+  from = truenas_vm_device.nic
+  to   = truenas_vm_device.nic["0"]
 }
 
 resource "truenas_vm_device" "seed" {
@@ -144,10 +157,10 @@ resource "terraform_data" "power" {
     terraform_data.image.id,
     truenas_vm.vm.id,
     truenas_vm_device.disk.id,
-    truenas_vm_device.nic.id,
+    [for d in truenas_vm_device.nic : d.id],
     truenas_vm_device.seed.id,
     [truenas_vm.vm.cores, truenas_vm.vm.memory],
-    [truenas_vm_device.disk.attributes, truenas_vm_device.nic.attributes, truenas_vm_device.seed.attributes],
+    [truenas_vm_device.disk.attributes, [for d in truenas_vm_device.nic : d.attributes], truenas_vm_device.seed.attributes],
   ]
 
   input = truenas_vm.vm.id

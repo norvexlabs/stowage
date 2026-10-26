@@ -15,13 +15,21 @@ data "vsphere_datastore" "ds" {
   datacenter_id = data.vsphere_datacenter.dc.id
 }
 
-data "vsphere_network" "net" {
-  name          = var.network
+data "vsphere_host" "host" {
+  name          = var.host
   datacenter_id = data.vsphere_datacenter.dc.id
 }
 
-data "vsphere_host" "host" {
-  name          = var.host
+locals {
+  nics = [for n in(length(var.nics) > 0 ? var.nics : [{ role = "", mac = "", attach = "" }]) : {
+    mac    = n.mac
+    attach = n.attach != "" ? n.attach : var.network
+  }]
+}
+
+data "vsphere_network" "nic" {
+  for_each      = toset([for n in local.nics : n.attach])
+  name          = each.value
   datacenter_id = data.vsphere_datacenter.dc.id
 }
 
@@ -53,12 +61,19 @@ resource "vsphere_virtual_machine" "vm" {
     local_ovf_path    = var.image
     disk_provisioning = "thin"
     ovf_network_map = {
-      "VM Network" = data.vsphere_network.net.id
+      "VM Network" = data.vsphere_network.nic[local.nics[0].attach].id
     }
   }
 
-  network_interface {
-    network_id = data.vsphere_network.net.id
+  # The release's NICs, the primary first, each on its network (default var.network) with its MAC
+  # (default vSphere's); or one.
+  dynamic "network_interface" {
+    for_each = local.nics
+    content {
+      network_id     = data.vsphere_network.nic[network_interface.value.attach].id
+      use_static_mac = network_interface.value.mac != ""
+      mac_address    = network_interface.value.mac != "" ? network_interface.value.mac : null
+    }
   }
 
   disk {

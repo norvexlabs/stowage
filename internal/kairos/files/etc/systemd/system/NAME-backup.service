@@ -1,5 +1,7 @@
 [Unit]
 Description={{.Name}}: the scheduled backup (`{{.Ctl}} backup`), when one is configured
+# The installer ISO boots this system live, to install it: no host of the stack.
+ConditionPathExists=!/run/cos/live_mode
 Wants={{.Name}}-hostd.service
 After={{.Name}}.service {{.Name}}-hostd.service
 

@@ -80,3 +80,13 @@ variable "dhcp" {
   type        = bool
   default     = true
 }
+
+variable "nics" {
+  description = "The NICs the release names (host.interfaces), the primary first: each by role, its MAC (empty: the platform's) and the network it attaches to (empty: the module's own). None: one NIC."
+  type = list(object({
+    role   = string
+    mac    = string
+    attach = string
+  }))
+  default = []
+}

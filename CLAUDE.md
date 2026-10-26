@@ -132,9 +132,12 @@ a self-review against the code it describes is enough. Every other commit clears
    `e2e-full-vm`, one at a time, as they make disks with auroraboot, which races for loop devices. A change to `examples/full`'s kairos
    shape (its `stowage.yaml`'s `shapes.kairos` block and its top-level `host` block, each compared
    whole: any of their keys, a module's or a package's entry included — not an input's or a route's `shapes:`, as the VM runs the Docker
-   shape's install, which the short suites prove; the same test picks e2e-kairos for `examples/minimal`), `test/e2e-full-vm.sh` or `test/vm.sh` runs `STOWAGE_VM_ENV=<file> make
-   e2e-full-vm` (`examples/full` on a real VM: install from a mirror, the hook, the app socket, the
-   published CA; upgrade, rollback and the VM machinery itself are e2e-vm's), in that chain. Each must
+   shape's install, which the short suites prove; the same test picks e2e-kairos for `examples/minimal`), `test/e2e-full-vm.sh`, `test/vm.sh` or `test/metal-truenas/` runs `STOWAGE_VM_ENV=<file> make
+   e2e-full-vm` (`examples/full` on bare metal a TrueNAS VM plays: its installer ISO, install from a
+   mirror, the hook, the app socket, the published CA; upgrade, rollback and the VM machinery
+   itself are e2e-vm's), in that chain, as does a change to the disks' build
+   (`internal/kairos/disks.go`, the installer ISO), the machine's creation and its seed
+   (`vmcreate*.go`, `seed*.go`). Each must
    print PASS. `make gate`
    runs exactly these, and also: the VM's creation, verbs and health gate (`vmcreate*.go`,
    `vmcli*.go`, `vmhealth*.go`) run e2e-vm; a test script runs its own suite (`test/lib.sh`,
@@ -142,7 +145,7 @@ a self-review against the code it describes is enough. Every other commit clears
    run every suite but e2e-full-vm; `internal/sbom` (the SBOMs, the scanner, the audits) runs
    e2e, the lifecycle suites (e2e-docker, e2e-full, e2e-stateless, e2e-k8s, e2e-full-k8s),
    e2e-kairos and e2e-vm; `internal/tune` the lifecycle suites and e2e-vm, its `modules.go`
-   e2e-full-vm alone, its `host.go` e2e-full-vm too (e2e-vm's project declares a kernel argument and a package); `internal/install/audit.go` smoke-install, the lifecycle suites and the VM's
+   e2e-full-vm alone, its `host.go`, `packages.go` (the firmware), `interfaces.go`, `ethtool.go` and `cores.go` e2e-full-vm too; `internal/install`'s `nftables*.go`, `ipvlan*.go` and `cpus*.go` (a service's table, address and cores) smoke-install, the lifecycle suites and e2e-full-vm (e2e-vm's project declares a kernel argument and a package); `internal/install/audit.go` smoke-install, the lifecycle suites and the VM's
    (e2e-kairos, e2e-vm);
    `Dockerfile`/`Makefile` the suites but e2e-kairos, e2e-vm and e2e-full-vm; a `_test.go` file none (`make
    check` runs it), but `smoke_test.go` runs smoke-install.

@@ -129,8 +129,10 @@ RUN set -e{{with .PurgeAfterInit}}; {{template "purge" .}}{{end}}; \
     rm -rf /var/lib/apt/lists/*{{end}}
 
 # The clouds' fast NICs, gVNIC (gve) and Azure's MANA, ship in the kernel's extra modules: those two
-# are copied from it, not its 110 MB. The build fails when a kernel lacks one, or a module the
-# boot's tuning loads (TUN devices, the connection tracker, BBR, fq).
+# are copied from it, not its 110 MB. The build fails when a kernel lacks one, a module the boot's
+# tuning loads (TUN devices, the connection tracker, BBR, fq), a server's NIC or disk controller
+# a bare-metal install boots with (Intel, Broadcom, Mellanox, Marvell/QLogic, Realtek, NVMe, AHCI,
+# LSI/Broadcom MegaRAID and SAS, Microchip, HPE).
 RUN set -e; apt-get update; cd /tmp; \
     for k in /lib/modules/*; do v="$(basename "$k")"; \
         if ! modinfo -k "$v" gve >/dev/null 2>&1 || ! modinfo -k "$v" mana >/dev/null 2>&1; then \
@@ -140,11 +142,18 @@ RUN set -e; apt-get update; cd /tmp; \
                 if [ -z "$f" ]; then echo "linux-modules-extra-$v has no $m" >&2; exit 1; fi; \
                 install -D -m 0644 "$f" "$k/${f#*/modules/$v/}"; done; \
             rm -rf /tmp/extra linux-modules-extra-*.deb; depmod "$v"; fi; \
-        for m in tun nf_conntrack tcp_bbr sch_fq gve mana mlx5_core; do \
+        for m in tun nf_conntrack tcp_bbr sch_fq gve mana mlx5_core \
+            ice i40e ixgbe igb igc e1000e bnxt_en mlx4_en tg3 qede r8169 nvme ahci megaraid_sas mpt3sas smartpqi hpsa; do \
             modinfo -k "$v" "$m" >/dev/null || { echo "kernel $v lacks $m" >&2; exit 1; }; done; done; \
     rm -rf /var/lib/apt/lists/*
 
-{{if .Modules}}# The project's kernel modules (host.modules). The build fails when a module to load or
+{{with .Firmware}}# The firmware files the project's drivers load (host.firmware). The build fails when one is not
+# under /lib/firmware, as it is or compressed.
+RUN set -e; for f in{{range $p, $_ := .}} {{$p}}{{end}}; do \
+        [ -f "/lib/firmware/$f" ] || [ -f "/lib/firmware/$f.zst" ] || [ -f "/lib/firmware/$f.xz" ] || \
+            { echo "host.firmware.$f: the OS bundle has no /lib/firmware/$f (nor .zst, .xz): host.packages gives the package that ships it" >&2; exit 1; }; done
+
+{{end}}{{if .Modules}}# The project's kernel modules (host.modules). The build fails when a module to load or
 # give options is in no kernel, when one is built into it (modprobe's files do not reach those,
 # and tune could not tell one loaded), when an option is not one of the module's parameters, or when
 # modprobe does not read the bundle's files.

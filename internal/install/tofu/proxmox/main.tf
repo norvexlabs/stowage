@@ -62,11 +62,17 @@ resource "proxmox_virtual_environment_vm" "vm" {
     interface = "ide2"
   }
 
-  # Virtio with a queue per vCPU (Proxmox's limit is 64), each on its own CPU in the guest.
-  network_device {
-    bridge = var.bridge
-    model  = "virtio"
-    queues = min(var.cpus, 64)
+  # Virtio with a queue per vCPU (Proxmox's limit is 64), each on its own CPU in the guest: the
+  # release's NICs, the primary first, each on its bridge (default var.bridge) with its MAC
+  # (default Proxmox's); or one.
+  dynamic "network_device" {
+    for_each = length(var.nics) > 0 ? var.nics : [{ role = "", mac = "", attach = "" }]
+    content {
+      bridge      = network_device.value.attach != "" ? network_device.value.attach : var.bridge
+      model       = "virtio"
+      queues      = min(var.cpus, 64)
+      mac_address = network_device.value.mac != "" ? network_device.value.mac : null
+    }
   }
 
   operating_system {

@@ -24,6 +24,8 @@ type Release struct {
 	Spec     *spec.Spec // the runtime view
 	Compose  []byte
 	Keys     map[string][]byte // trusted public keys by file name
+	// Nftables are the services' nftables tables (services.<name>.nftables), by service.
+	Nftables map[string][]byte
 	// Pull is the project's pull account, baked in at ship time; nil when the project has none.
 	Pull *payload.Account
 }
@@ -54,10 +56,35 @@ func Load(files payload.Files) (*Release, error) {
 	if s.Short() != m.ShortName {
 		return nil, fmt.Errorf("payload: the spec's short name is %q, the release's %q", s.Short(), m.ShortName)
 	}
-	r := &Release{Manifest: m, Spec: &s, Compose: files[payload.Compose], Keys: map[string][]byte{}}
+	r := &Release{Manifest: m, Spec: &s, Compose: files[payload.Compose], Keys: map[string][]byte{}, Nftables: map[string][]byte{}}
 	for n, b := range files {
 		if strings.HasPrefix(n, payload.KeysDir) {
 			r.Keys[path.Base(n)] = b
+		}
+		if t, ok := strings.CutPrefix(n, payload.NftablesDir); ok {
+			name, nft := strings.CutSuffix(t, ".nft")
+			if svc, declared := s.Services[name]; !nft || !declared || svc.Nftables == "" {
+				return nil, fmt.Errorf("payload: %s is no table a service declares (services.<name>.nftables)", n)
+			}
+			r.Nftables[name] = b
+		}
+	}
+	// The VM loads each table as root: a table of the project's name would be its own firewall's,
+	// and a body beyond its table (another table, the ruleset flushed) would reach past it.
+	for _, name := range sortedKeys(s.Services) {
+		svc := s.Services[name]
+		if svc.Nftables == "" {
+			continue
+		}
+		body, ok := r.Nftables[name]
+		switch {
+		case name == s.Name || !spec.NftTableName.MatchString(name) || spec.NftKeyword(name):
+			return nil, fmt.Errorf("payload: services.%s.nftables: no table of the project's name (the VM's own firewall's), nor of a name nft does not take", name)
+		case !ok:
+			return nil, fmt.Errorf("payload: services.%s.nftables has no %s%s.nft", name, payload.NftablesDir, name)
+		}
+		if err := lint.CheckNftTable(string(body), name); err != nil {
+			return nil, fmt.Errorf("payload: services.%s.nftables: %w", name, err)
 		}
 	}
 	if raw, ok := files[payload.Pull]; ok {

@@ -9,5 +9,5 @@ output "address" {
 
 output "mac" {
   description = "The NIC's MAC, which a DHCP lease is keyed on."
-  value       = local.mac
+  value       = local.nics[0].mac
 }

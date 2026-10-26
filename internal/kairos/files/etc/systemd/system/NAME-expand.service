@@ -1,5 +1,7 @@
 [Unit]
 Description={{.Name}}: grow the persistent partition to fill the disk
+# The installer ISO boots this system live, to install it: no host of the stack.
+ConditionPathExists=!/run/cos/live_mode
 After=local-fs.target
 Before={{.Name}}-preload.service docker.service
 

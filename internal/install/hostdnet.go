@@ -19,6 +19,8 @@ import (
 	"time"
 
 	"go.yaml.in/yaml/v3"
+
+	"github.com/norvexlabs/stowage/internal/kairos"
 )
 
 // The VM's network override: the address, gateway and DNS servers an operator sets on a running VM
@@ -140,6 +142,8 @@ type netFiles struct {
 	// name is the project's, which names the files; ctl its installer's, which they name to the
 	// operator.
 	name, ctl, state, networkd, issue string
+	// match is the [Match] section's setting the override's file takes (PrimaryMatch).
+	match string
 	// install is the file the cloud-config records the install's network in.
 	install string
 }
@@ -147,14 +151,14 @@ type netFiles struct {
 // overrideUnit is the override's networkd file: it sorts before the cloud-config's (staticUnit)
 // and Kairos's DHCP default, and networkd takes the first file that matches.
 func (f netFiles) overrideUnit() string {
-	return filepath.Join(f.networkd, "01-"+f.name+"-override.network")
+	return filepath.Join(f.networkd, kairos.PrimaryUnits(f.name)[0])
 }
 
 func (f netFiles) banner() string { return filepath.Join(f.issue, "06-"+f.name+"-network.issue") }
 
 // staticUnit is the networkd file the cloud-config writes for the network `vm create` gave, DHCP
 // included. Its name stays: the seeds of the VMs already made write it.
-func staticUnit(name string) string { return "05-" + name + "-static.network" }
+func staticUnit(name string) string { return kairos.PrimaryUnits(name)[1] }
 
 func (h *Hostd) netFiles() netFiles {
 	f := newNetFiles(h.R.Spec.Name, h.R.Ctl(), h.O.Dir, h.Networkd, h.Issue)
@@ -165,7 +169,7 @@ func (h *Hostd) netFiles() netFiles {
 // newNetFiles are the override's files of the install in dir; an empty networkd is
 // /etc/systemd/network, an empty issue /etc/issue.d.
 func newNetFiles(name, ctl, dir, networkd, issue string) netFiles {
-	return netFiles{
+	f := netFiles{
 		name:     name,
 		ctl:      ctl,
 		state:    NetworkFile(dir),
@@ -173,6 +177,8 @@ func newNetFiles(name, ctl, dir, networkd, issue string) netFiles {
 		issue:    cmp.Or(issue, "/etc/issue.d"),
 		install:  InstallNetworkFile(name),
 	}
+	f.match = seedMatch(f.networkd, name)
+	return f
 }
 
 // readInstall strictly decodes the network the cloud-config records — one NetConfig document,
@@ -325,7 +331,7 @@ func (f netFiles) render(c *NetConfig, st netState) error {
 		if err := os.MkdirAll(f.networkd, 0o755); err != nil {
 			return err
 		}
-		if err := writeAtomic(f.overrideUnit(), strings.NewReader(renderNetwork(f.name, f.ctl, *c)), 0o644, nil); err != nil {
+		if err := writeAtomic(f.overrideUnit(), strings.NewReader(renderNetwork(f.name, f.ctl, f.match, *c)), 0o644, nil); err != nil {
 			return err
 		}
 	}
@@ -355,9 +361,47 @@ func (f netFiles) writeBanner(st netState) error {
 
 // renderNetwork is the networkd file of a valid c: on the VM's one wired interface, whatever its
 // name.
-func renderNetwork(name, ctl string, c NetConfig) string {
+func renderNetwork(name, ctl, match string, c NetConfig) string {
 	return fmt.Sprintf("# %s's network override, rendered from %s at every boot: `%s network` changes it.\n", name, NetworkFile(VMDir(name)), ctl) +
-		"[Match]\nName=en* eth*\n\n" + networkSections(c)
+		"[Match]\n" + match + "\n\n" + networkSections(c)
+}
+
+// everyNIC is the [Match] setting of a VM whose release named no NIC: whatever it has.
+const everyNIC = "Name=en* eth*"
+
+// seedMatch is the [Match] setting of the primary interface's networkd files: the one the VM's
+// cloud-config wrote for its network (staticUnit), which names the NIC as the seed named it — the
+// primary's role, or every NIC's for a VM whose release named none when it was made — whatever the
+// release running now declares. Without that file, the role the seed named its only NIC (one
+// .link), else every NIC: of several, which one the seed made primary is not known.
+func seedMatch(networkd, name string) string {
+	raw, err := os.ReadFile(filepath.Join(networkd, staticUnit(name)))
+	if err != nil {
+		links, _ := filepath.Glob(filepath.Join(networkd, kairos.InterfaceLink(name, "*")))
+		if len(links) == 1 {
+			return "Name=" + strings.TrimSuffix(strings.TrimPrefix(filepath.Base(links[0]), "10-"+name+"-"), ".link")
+		}
+		return everyNIC
+	}
+	inMatch := false
+	for _, line := range strings.Split(string(raw), "\n") {
+		switch line = strings.TrimSpace(line); {
+		case strings.HasPrefix(line, "["):
+			inMatch = line == "[Match]"
+		case inMatch && strings.HasPrefix(line, "Name="):
+			return line
+		}
+	}
+	return everyNIC
+}
+
+// networkdDir holds the VM's networkd files, the seed's .link ones among them; tests move it.
+var networkdDir = "/etc/systemd/network"
+
+// roleNamed reports whether the VM's cloud-config names a NIC role (its .link file).
+func roleNamed(name, role string) bool {
+	_, err := os.Stat(filepath.Join(networkdDir, kairos.InterfaceLink(name, role)))
+	return err == nil
 }
 
 // networkSections is a .network file's sections after [Match]: c's addressing and DNS servers.
@@ -928,7 +972,7 @@ func (h *Hostd) netResume() {
 	// record is applied again.
 	want := ""
 	if st.Config != nil {
-		want = renderNetwork(f.name, f.ctl, *st.Config)
+		want = renderNetwork(f.name, f.ctl, f.match, *st.Config)
 	}
 	if got, _ := os.ReadFile(f.overrideUnit()); string(got) != want {
 		_ = h.undo(1, "the networkd file differs from the record", func(ctx context.Context) error {

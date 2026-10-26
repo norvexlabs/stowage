@@ -30,15 +30,18 @@ type Spec struct {
 	APIVersion string `yaml:"apiVersion"`
 	Name       string `yaml:"name"`
 	// ShortName names the installer, <ShortName>-stow; empty is Name.
-	ShortName    string             `yaml:"short_name"`
-	Stowage      StowageReq         `yaml:"stowage"`
-	Version      VersionSpec        `yaml:"version"`
-	Changelog    Provider           `yaml:"changelog"`
-	Channels     map[string]Channel `yaml:"channels"`
-	Registry     Registry           `yaml:"registry"`
-	Signing      *Provider          `yaml:"signing"`
-	Images       map[string]Image   `yaml:"images"`
-	Stack        Stack              `yaml:"stack"`
+	ShortName string             `yaml:"short_name"`
+	Stowage   StowageReq         `yaml:"stowage"`
+	Version   VersionSpec        `yaml:"version"`
+	Changelog Provider           `yaml:"changelog"`
+	Channels  map[string]Channel `yaml:"channels"`
+	Registry  Registry           `yaml:"registry"`
+	Signing   *Provider          `yaml:"signing"`
+	Images    map[string]Image   `yaml:"images"`
+	Stack     Stack              `yaml:"stack"`
+	// Services are what the project asks for its compose services beyond their compose file, by
+	// service.
+	Services     map[string]Service `yaml:"services"`
 	Front        Front              `yaml:"front"`
 	L4           L4                 `yaml:"l4"`
 	Health       Provider           `yaml:"health"`
@@ -116,15 +119,42 @@ func (i Image) Built() bool { return i.Ref == "" }
 
 type Stack struct {
 	Compose string `yaml:"compose"`
-	// Memory sizes services from the RAM of the host they run on (Docker and the VM).
-	Memory *Memory `yaml:"memory"`
 }
 
-// Memory gives services a share of the host's RAM: Shares maps a compose service to the percent
-// of RAM its memory limit is, capped at the share's maximum, never below the limit its compose
-// file sets itself.
-type Memory struct {
-	Shares map[string]Share `yaml:"shares"`
+// Service is what the project asks for one compose service beyond its compose file
+// (services.<name>): what Stowage gives it from the host it runs on.
+type Service struct {
+	// Memory is its share of the host's RAM (Docker and the VM): the percent of it its memory
+	// limit is, capped at the share's maximum, never below the limit its compose file sets.
+	Memory *Share `yaml:"memory"`
+	// CPUs are the whole cores it runs on alone, which the install picks from the host's.
+	CPUs int `yaml:"cpus"`
+	// IRQ is where the host's NICs' interrupts and receive steering go: off its cores (off, the
+	// default) or on them too (on).
+	IRQ string `yaml:"irq"`
+	// Nftables is its nftables table, a file of the project holding one `table inet <service>`.
+	Nftables string `yaml:"nftables"`
+	// Interface is the host.interfaces NIC it has an address of its own on, an ipvlan network
+	// beside the stack's bridge, the address from AddressInput.
+	Interface    string `yaml:"interface"`
+	AddressInput string `yaml:"address_input"`
+}
+
+// The postures of services.<name>.irq.
+const (
+	IRQOff = "off"
+	IRQOn  = "on"
+)
+
+// MemoryShares are the services' shares of the host's RAM, by service: none for one without.
+func (s *Spec) MemoryShares() map[string]Share {
+	out := map[string]Share{}
+	for name, svc := range s.Services {
+		if svc.Memory != nil {
+			out[name] = *svc.Memory
+		}
+	}
+	return out
 }
 
 // Tune names the tuning profile the stack's hosts take: "default" (Docker's path as fast as the
@@ -163,6 +193,9 @@ type Front struct {
 	// others; 0 is 80 and 443.
 	HTTPPort  int `yaml:"http_port"`
 	HTTPSPort int `yaml:"https_port"`
+	// Interface is the host.interfaces role the front serves on, which the VM's firewall opens
+	// its ports on alone; empty, every interface.
+	Interface string `yaml:"interface"`
 }
 
 // L4 is the stack's layer-4 routes: host ports published to a service as they are, TCP or UDP,
@@ -184,6 +217,9 @@ type L4Route struct {
 	AddressInput string `yaml:"address_input"`
 	AllowInput   string `yaml:"allow_input"`
 	BindInput    string `yaml:"bind_input"`
+	// Interface is the host.interfaces role the route listens on, which the VM's firewall opens
+	// its port on alone; empty, every interface.
+	Interface string `yaml:"interface"`
 }
 
 // L4Var is the variable carrying an L4 route's endpoint, <address>:<port>.
@@ -411,7 +447,7 @@ type K8sSchema struct {
 }
 
 // DiskFormats are the kairos shape's disk image formats, in the order they are made.
-var DiskFormats = []string{"raw", "qcow2", "ova", "vhd", "gce"}
+var DiskFormats = []string{"raw", "qcow2", "ova", "vhd", "gce", "iso"}
 
 // CloudFormat is the disk format each cloud of cloud_publish imports: AWS a raw disk, Azure a
 // fixed VHD, Google Cloud a disk.raw in a tar.gz.
@@ -438,6 +474,11 @@ type Host struct {
 	Modules map[string]KernelModule `yaml:"modules"`
 	// Packages are the distribution's packages the host has beyond the OS bundle's own, by name.
 	Packages map[string]HostPackage `yaml:"packages"`
+	// Firmware are the files the host's drivers load, by their path under /lib/firmware.
+	Firmware map[string]HostPackage `yaml:"firmware"`
+	// Interfaces are the host's network interfaces by role, the role their name: the NICs on each
+	// side of the stack and the devices its services open.
+	Interfaces map[string]HostInterface `yaml:"interfaces"`
 	// KernelArgs are the kernel's command-line parameters the host boots with, by name.
 	KernelArgs map[string]HostValue `yaml:"kernel_args"`
 	// Sysctls are kernel settings beyond those a tune profile sets, by key.
@@ -447,7 +488,84 @@ type Host struct {
 	Power string `yaml:"power"`
 }
 
-// HostPackage is one of host.packages: why the stack needs it.
+// HostInterface is one of host.interfaces: a NIC the host has (kind nic, the default), named by its
+// role from its MAC address where the install knows it, or a device a service of the stack opens
+// (kind tun), which only the routing and the firewall name; its MTU, and its policy routing in
+// networkd's own terms, each entry a [RoutingPolicyRule] or [Route] section's settings.
+type HostInterface struct {
+	Kind string `yaml:"kind"`
+	// Primary is the interface of the default route, which the install's own addressing (vm
+	// create's --network, network set) is.
+	Primary            bool                `yaml:"primary"`
+	MTU                int                 `yaml:"mtu"`
+	RoutingPolicyRules []map[string]string `yaml:"routing_policy_rules"`
+	Routes             []map[string]string `yaml:"routes"`
+	// Ethtool is a NIC's settings in ethtool's own terms, over the tune profile's.
+	Ethtool *Ethtool `yaml:"ethtool"`
+	Reason  string   `yaml:"reason"`
+}
+
+// Ethtool is one of host.interfaces' NIC settings: its channels (combined queues: max or a
+// count), its rings (rx, tx: max or a count), its features by name (on or off, each set where the
+// driver lets it be changed), and its Energy-Efficient Ethernet (on or off).
+type Ethtool struct {
+	Channels *struct {
+		Combined string `yaml:"combined"`
+	} `yaml:"channels"`
+	Rings *struct {
+		RX string `yaml:"rx"`
+		TX string `yaml:"tx"`
+	} `yaml:"rings"`
+	Features map[string]string `yaml:"features"`
+	EEE      string            `yaml:"eee"`
+}
+
+// NftTableName is a service's nftables table's name, the service's: a letter, then letters, digits
+// and _ - . (what both a compose service's name and nft's identifier take, nft's / left out: the
+// installer names a file after it).
+var NftTableName = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_.-]*$`)
+
+// nftKeywords are words nft reads as its own where a table's name goes: a service of one has no
+// table of its own.
+var nftKeywords = []string{"accept", "add", "arp", "bridge", "chain", "comment", "continue", "counter", "create", "ct",
+	"define", "delete", "describe", "destroy", "dnat", "drop", "dup", "element", "elements", "ether", "exthdr", "fib",
+	"filter", "flags", "flow", "flowtable", "flush", "fwd", "goto", "hash", "hook", "icmp", "icmpv6", "include",
+	"inet", "insert", "ip", "ip6", "jhash", "jump", "limit", "list", "log", "map", "masquerade", "meta", "monitor",
+	"nat", "netdev", "notrack", "numgen", "osf", "policy", "priority", "queue", "quota", "redefine", "redirect",
+	"reject", "rename", "replace", "reset", "return", "route", "rt", "rule", "ruleset", "secmark", "set", "size",
+	"snat", "socket", "symhash", "synproxy", "table", "tcp", "timeout", "tproxy", "type", "udp", "undefine", "vlan",
+	"ah", "cgroup", "comp", "dccp", "esp", "export", "geneve", "get", "gre", "handle", "igmp", "iif", "iifname",
+	"import", "index", "last", "mark", "oif", "oifname", "pkttype", "position", "sctp", "skgid", "skuid", "th",
+	"udplite", "vmap", "vxlan"}
+
+// NftKeyword reports whether name is one nft reads as its own (nftKeywords): its keywords are
+// lower-case, and nft's identifiers case-sensitive.
+func NftKeyword(name string) bool { return slices.Contains(nftKeywords, name) }
+
+// EthtoolFeature is a feature's name as ethtool -k lists it.
+var EthtoolFeature = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,63}$`)
+
+// The kinds of host.interfaces.
+const (
+	InterfaceNIC = "nic"
+	InterfaceTUN = "tun"
+)
+
+// InterfaceName is a role's name, the interface's: a kernel's interface name of lower-case letters
+// and digits; ReservedInterfacePrefixes are the names the kernel, udev and Docker give, which a
+// role never takes.
+var (
+	InterfaceName             = regexp.MustCompile(`^[a-z][a-z0-9]{0,14}$`)
+	ReservedInterfacePrefixes = []string{"lo", "en", "eth", "wl", "ww", "ib", "docker", "br", "veth", "virbr", "tun", "tap", "sit", "gre", "ip6", "dummy", "bond"}
+	// RoutingPolicyRuleKeys and RouteKeys are the networkd settings a routing entry may give.
+	RoutingPolicyRuleKeys = []string{"DestinationPort", "Family", "FirewallMark", "From", "IPProtocol", "IncomingInterface", "Invert", "OutgoingInterface", "Priority", "SourcePort", "SuppressPrefixLength", "Table", "To", "Type"}
+	RouteKeys             = []string{"Destination", "Gateway", "GatewayOnLink", "MTUBytes", "Metric", "PreferredSource", "Protocol", "Scope", "Source", "Table", "Type"}
+	// RoutingValue is what a routing setting's value may hold: an address, a prefix, a mark and
+	// its mask, a port range, a word.
+	RoutingValue = regexp.MustCompile(`^[A-Za-z0-9_.:/,+-]{1,64}$`)
+)
+
+// HostPackage is one of host.packages or host.firmware: why the stack needs it.
 type HostPackage struct {
 	Reason string `yaml:"reason"`
 }
@@ -479,6 +597,11 @@ var (
 // PackageName is what a Debian package's name may hold (Debian policy 5.6.1): it is written into
 // the bundle's build.
 var PackageName = regexp.MustCompile(`^[a-z0-9][a-z0-9+.-]{1,63}$`)
+
+// FirmwarePath is a firmware file's path under /lib/firmware, as a driver asks for it: names of
+// letters, digits and _ . + -, none starting with a dot, one / apart, at most 200 (no "..", no
+// leading /). A file there compressed (.zst, .xz) is the same file.
+var FirmwarePath = regexp.MustCompile(`^[A-Za-z0-9_+-][A-Za-z0-9_.+-]*(/[A-Za-z0-9_+-][A-Za-z0-9_.+-]*){0,15}$`)
 
 // KernelArgName and KernelArgValue are what a kernel argument's name and value may hold, and
 // SysctlKey and SysctlValue a kernel setting's: written into the boot loader's script, sysctl's

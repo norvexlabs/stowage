@@ -8,9 +8,11 @@ import (
 	"embed"
 	"fmt"
 	"io/fs"
+	"maps"
 	"os"
 	"path"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"text/template"
@@ -39,6 +41,10 @@ type Params struct {
 	Modules map[string]spec.KernelModule
 	// Packages are host.packages: installed after kairos-init's, a purged one included.
 	Packages map[string]spec.HostPackage
+	// Firmware are host.firmware: the build fails without each one.
+	Firmware map[string]spec.HostPackage
+	// Interfaces are host.interfaces: the image's networkd files of each role (interfaceFiles).
+	Interfaces map[string]spec.HostInterface
 	// KernelArgs are host.kernel_args: the image's boot script adds them to the command line.
 	KernelArgs map[string]spec.HostValue
 }
@@ -204,10 +210,80 @@ func WriteContext(dir string, p Params) error {
 	if err != nil {
 		return err
 	}
+	for f, body := range interfaceFiles(p) {
+		dst := filepath.Join(dir, "files", filepath.FromSlash(f))
+		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+			return err
+		}
+		if err := os.WriteFile(dst, body, 0o644); err != nil {
+			return err
+		}
+	}
 	if err := os.Mkdir(filepath.Join(dir, PreloadDir), 0o755); err != nil {
 		return err
 	}
 	return os.Mkdir(filepath.Join(dir, CtlDir), 0o755)
+}
+
+// networkDir is where the image's own networkd files go: the release's, read-only, so a rollback
+// takes its own back (/etc is Kairos's persistent state, which no image's file is removed from).
+const networkDir = "usr/lib/systemd/network"
+
+// PrimaryUnits are the networkd files of the primary interface's addressing, in the order networkd
+// takes them: the override `network set` makes, then the cloud-config's.
+func PrimaryUnits(name string) []string {
+	return []string{"01-" + name + "-override.network", "05-" + name + "-static.network"}
+}
+
+// InterfaceUnit is the networkd file of a role's: the cloud-config's addressing of a NIC, or the
+// image's own file of a tun device, which a service opens and addresses.
+func InterfaceUnit(name, role string) string { return "10-" + name + "-" + role + ".network" }
+
+// InterfaceLink is the udev .link file the cloud-config names a NIC role's NIC with (by its MAC).
+func InterfaceLink(name, role string) string { return "10-" + name + "-" + role + ".link" }
+
+// interfaceFiles are the image's networkd files of host.interfaces, by path under the image's root:
+// each NIC's MTU and policy routing, a drop-in of the file its addressing comes from (the
+// cloud-config's, at install: the primary's two); each tun device's whole file, which matches it by
+// name once its service opens it, keeps the addresses the service gives it, and waits for no carrier.
+func interfaceFiles(p Params) map[string][]byte {
+	out := map[string][]byte{}
+	for _, role := range slices.Sorted(maps.Keys(p.Interfaces)) {
+		i := p.Interfaces[role]
+		var b strings.Builder
+		fmt.Fprintf(&b, "# %s's interface %s (host.interfaces): %s\n", p.Name, role, i.Reason)
+		if i.Kind == spec.InterfaceTUN {
+			fmt.Fprintf(&b, "[Match]\nName=%s\n\n[Network]\nLinkLocalAddressing=no\nIPv6AcceptRA=no\nKeepConfiguration=yes\nConfigureWithoutCarrier=yes\n\n[Link]\nRequiredForOnline=no\n", role)
+			if i.MTU != 0 {
+				fmt.Fprintf(&b, "MTUBytes=%d\n", i.MTU)
+			}
+		} else if i.MTU != 0 {
+			fmt.Fprintf(&b, "[Link]\nMTUBytes=%d\n", i.MTU)
+		}
+		section := func(name string, entries []map[string]string) {
+			for _, e := range entries {
+				fmt.Fprintf(&b, "\n[%s]\n", name)
+				for _, k := range slices.Sorted(maps.Keys(e)) {
+					fmt.Fprintf(&b, "%s=%s\n", k, e[k])
+				}
+			}
+		}
+		section("RoutingPolicyRule", i.RoutingPolicyRules)
+		section("Route", i.Routes)
+		switch {
+		case i.Kind != spec.InterfaceTUN && i.MTU == 0 && len(i.RoutingPolicyRules)+len(i.Routes) == 0:
+			// A NIC that sets nothing of its own needs no drop-in.
+		case i.Kind == spec.InterfaceTUN:
+			out[networkDir+"/"+InterfaceUnit(p.Name, role)] = []byte(b.String())
+		case i.Primary:
+			for _, u := range PrimaryUnits(p.Name) {
+				out[networkDir+"/"+u+".d/50-"+p.Name+".conf"] = []byte(b.String())
+			}
+		default:
+			out[networkDir+"/"+InterfaceUnit(p.Name, role)+".d/50-"+p.Name+".conf"] = []byte(b.String())
+		}
+	}
+	return out
 }
 
 // mode is a file's mode in the image: the scripts under usr/sbin run.
@@ -239,6 +315,24 @@ func (p Params) check() error {
 	for name := range p.Packages {
 		if _, owned := OwnedPackage(name); owned || !spec.PackageName.MatchString(name) {
 			return fmt.Errorf("host.packages.%s: not a package's name, or one of the bundle's own (`stowage lint`)", name)
+		}
+	}
+	for role, i := range p.Interfaces {
+		valid := spec.InterfaceName.MatchString(role) && !strings.ContainsFunc(i.Reason, unicode.IsControl)
+		for _, entries := range [][]map[string]string{i.RoutingPolicyRules, i.Routes} {
+			for _, e := range entries {
+				for key, v := range e {
+					valid = valid && (slices.Contains(spec.RoutingPolicyRuleKeys, key) || slices.Contains(spec.RouteKeys, key)) && spec.RoutingValue.MatchString(v)
+				}
+			}
+		}
+		if !valid {
+			return fmt.Errorf("host.interfaces.%s: not an interface's name, a reason of one line, or networkd's settings (`stowage lint`)", role)
+		}
+	}
+	for path, f := range p.Firmware {
+		if len(path) > 200 || !spec.FirmwarePath.MatchString(path) || strings.ContainsFunc(f.Reason, unicode.IsControl) {
+			return fmt.Errorf("host.firmware.%s: not a firmware file's path, or a reason of more than one line (`stowage lint`)", path)
 		}
 	}
 	for name, a := range p.KernelArgs {
@@ -286,7 +380,7 @@ func BundleRecipe() string {
 // qemu-img image's recipe and the OVA descriptor.
 func DiskRecipe() string {
 	return sum("auroraboot", Auroraboot, "flags", strings.Join(auroraFlags, " "), "sizing", sizing, "disktools", disktools, "ovf", ovf,
-		"qcow2", qcow2Cmd, "ova", ovaScript, "vhd", vhdScript, "gce", gceScript, "ustar", fmt.Sprint(ustarLimit))
+		"qcow2", qcow2Cmd, "ova", ovaScript, "vhd", vhdScript, "gce", gceScript, "iso", isoConfig, "ustar", fmt.Sprint(ustarLimit))
 }
 
 func sum(kv ...string) string {

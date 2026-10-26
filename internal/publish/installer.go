@@ -9,8 +9,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"path"
+	"slices"
 	"time"
 
 	"github.com/google/go-containerregistry/pkg/name"
@@ -127,6 +129,13 @@ func (p *Publisher) payloadFiles(file string, man []byte, view spec.Spec) (paylo
 		return nil, fmt.Errorf("stack.compose: %w", err)
 	}
 	files := payload.Files{file: man, payload.Spec: viewJSON, payload.Compose: compose}
+	for _, name := range slices.Sorted(maps.Keys(s.Services)) {
+		if f := s.Services[name].Nftables; f != "" {
+			if files[payload.NftablesDir+name+".nft"], err = p.projectFile(f); err != nil {
+				return nil, fmt.Errorf("services.%s.nftables: %w", name, err)
+			}
+		}
+	}
 	if s.Signs() {
 		c, err := providers.CosignKey(s.Signing)
 		if err != nil {

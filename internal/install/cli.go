@@ -123,6 +123,7 @@ func newCommand(r *Release, self string, stdout, stderr io.Writer, tools K8sOpti
 	rf.StringVar(&o.RegistryCA, "registry-ca", "", "a PEM file of the CA the registry's certificate chains to, a mirror's own: kept in the install, given to the Docker daemon (first install only)")
 	ipv6Flag(rf, &o.IPv6, "IPv6 on the stack's network, so the front's IPv6 clients keep their address (Docker 27 or later); --ipv6=false turns it off (default off; on a re-run, the recorded choice)")
 	tuneProfileFlag(rf, &o.TuneProfile, "the containers' tuning profile over the release's tune.profile ("+r.Spec.TuneProfile()+"): default (as fast as on the host's network) or network (the network profile's own settings too); release follows the release's again (default: on a re-run, the recorded choice)")
+	rf.Var(interfacesValue{&o.Interfaces}, "interface", "a NIC of this host playing a role the release names (host.interfaces), ROLE=NIC (repeatable; ROLE= removes the record; a re-run changes it): where a service's address of its own is (services.<name>.interface); the VM names its NICs itself")
 	rf.BoolVar(&o.Offline, "offline", false, "the images are already loaded: never log in or pull")
 	rf.BoolVar(&o.DryRun, "dry-run", false, "check, print what would be written (secrets redacted), write nothing")
 	hideFrontFlags(rf, r.Spec, frontFlagNames)
@@ -802,6 +803,8 @@ func vmCreateCommand(in *Installer, o *Options, prepare func() error, terminal f
 	f.StringSliceVar(&c.DNS, "dns", nil, "--network static: a DNS server (repeatable, or comma-separated)")
 	f.StringSliceVar(&c.SSHAllow, "ssh-allow", nil, "the sources SSH accepts, CIDR (repeatable, or comma-separated; default: every source)")
 	f.StringVar(&c.Timezone, "timezone", "", "the VM's time zone, an IANA name such as Europe/Paris (default UTC)")
+	f.StringArrayVar(&c.Interfaces, "interface", nil, "a NIC the release names (host.interfaces), ROLE=SPEC (repeatable): a secondary's dhcp, static,address=A/P or none (the default), then mac= (default: generated on a hypervisor; a server's own on metal) and attach= (the hypervisor's network or bridge; default the primary's)")
+	f.StringVar(&c.Device, "device", "", "metal: the disk the OS installs on, wiped — a path under /dev/ (a /dev/disk/by-id/ one names it whatever the boot order), or auto (the largest disk); asked on a terminal")
 	f.StringVar(&secretsFile, "secrets", "", "the install's secrets, the file `secrets export` wrote, decrypted: the first install waits for them, given over SSH, never in the cloud-config")
 	tlsVM := "how the VM's front serves: none a VM can take (" + name + " offers " + strings.Join(in.R.Spec.Front.TLSModes, ", ") + ")"
 	if remote := remoteModes(in.R.Spec.Front.TLSModes); len(remote) > 0 {

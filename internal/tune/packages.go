@@ -68,3 +68,38 @@ func (s System) dpkgInstalled() (map[string]bool, bool) {
 	}
 	return out, sc.Err() == nil
 }
+
+// Firmware is a firmware file the project's drivers load (host.firmware), by its path under
+// /lib/firmware, and why.
+type Firmware struct {
+	Path   string
+	Reason string
+}
+
+// firmwareDir is where the kernel loads firmware from, relative to the root.
+const firmwareDir = "lib/firmware"
+
+// inspectFirmware judges each firmware file the project declares: present under /lib/firmware, as
+// it is or compressed. On a host Stowage owns (whose image the build checked) one missing is drift;
+// on another, advice: its firmware is its operator's.
+func (s System) inspectFirmware() []Item {
+	var items []Item
+	for _, f := range s.Firmware {
+		why := " (" + f.Reason + ")"
+		found := false
+		for _, ext := range []string{"", ".zst", ".xz"} {
+			if st, err := os.Stat(s.path(firmwareDir + "/" + f.Path + ext)); err == nil && st.Mode().IsRegular() {
+				found = true
+			}
+		}
+		switch {
+		case found:
+			items = append(items, Item{OK, "firmware", f.Path, "present", "present" + why})
+		case s.Owned:
+			items = append(items, Item{Differs, "firmware", f.Path, "missing", "present" + why})
+		default:
+			items = append(items, Item{Advice, "firmware", f.Path, "missing from /lib/firmware, the project asks for it" + why + ":", "the distribution's firmware package (Debian and Ubuntu: linux-firmware), then the driver reloaded or the host rebooted"})
+		}
+	}
+	return items
+}

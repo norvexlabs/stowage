@@ -292,6 +292,11 @@ echo "$*" >> "$FAKE_LOG"
 vol() { echo "$1" | sed -n "s|.*--volume \([^ ]*\):/$2[ :].*|\1|p"; }
 case "$*" in
 *"--entrypoint chown"*|buildx*) exit 0 ;;
+*auroraboot*" build-iso "*)
+	[ -z "$NO_ISO" ] || exit 0
+	state=$(vol "$*" state)
+	name=$(echo "$*" | sed -n 's/.*--override-name \([^ ]*\) .*/\1/p')
+	cp "$(vol "$*" iso-config.yaml)" "$state/$name.iso" ;;
 *auroraboot*)
 	state=$(vol "$*" state)
 	for a; do last=$a; done
@@ -380,6 +385,8 @@ func TestDiskBuilderMakesEachFormat(t *testing.T) {
 		{[]string{"raw", "qcow2", "ova", "vhd", "gce"}, []string{"disk.efi"}},
 		{[]string{"vhd"}, []string{"disk.efi"}},
 		{[]string{"gce"}, []string{"disk.efi"}},
+		{[]string{"iso"}, []string{"disk.efi"}},
+		{[]string{"raw", "qcow2", "ova", "vhd", "gce", "iso"}, []string{"disk.efi"}},
 	} {
 		t.Run(strings.Join(c.formats, ","), func(t *testing.T) {
 			b, log := fakeBuilder(t)
@@ -418,6 +425,15 @@ func TestDiskBuilderMakesEachFormat(t *testing.T) {
 			if !slices.Equal(runs, c.runs) {
 				t.Errorf("auroraboot runs = %v, want %v", runs, c.runs)
 			}
+			// The installer embeds the raw disk's state partition and the screen's console.
+			if iso, ok := out["iso"]; ok {
+				if cc, _ := os.ReadFile(iso); string(cc) != fmt.Sprintf(isoConfig, StateMiB(3500)) || !strings.Contains(string(cc), "      size: "+strconv.FormatInt(StateMiB(3500), 10)+"\n") {
+					t.Errorf("the ISO's cloud-config:\n%s", cc)
+				}
+				if !strings.Contains(string(calls), " build-iso --output /state --override-name notes-1.0.0 --cloud-config /iso-config.yaml oci://"+r.Source+"\n") || strings.Contains(string(calls), "--privileged --network host --volume "+filepath.Dir(iso)) {
+					t.Errorf("build-iso call:\n%s", calls)
+				}
+			}
 			cleanup()
 			if _, err := os.Stat(dir); !errors.Is(err, fs.ErrNotExist) {
 				t.Errorf("cleanup left %s", dir)
@@ -433,6 +449,21 @@ func TestDiskBuilderRefusesAMissingDisk(t *testing.T) {
 	_, cleanup, err := b.Build(context.Background(), DiskRequest{Source: "r/notes-os@sha256:" + strings.Repeat("c", 64), Registry: "r", RootfsMiB: 3500,
 		Formats: []string{"qcow2", "vhd"}, Base: "notes-1.0.0"})
 	if err == nil || !strings.Contains(err.Error(), "auroraboot disk.efi: expected one *.raw file in its output, found 0") {
+		t.Fatalf("Build = %v", err)
+	}
+	cleanup()
+	if left, _ := os.ReadDir(b.WorkDir); len(left) != 0 {
+		t.Errorf("left %v", left)
+	}
+}
+
+// build-iso can exit 0 without writing its ISO: that is a failure, and nothing is left behind.
+func TestDiskBuilderRefusesAMissingISO(t *testing.T) {
+	b, _ := fakeBuilder(t)
+	t.Setenv("NO_ISO", "1")
+	_, cleanup, err := b.Build(context.Background(), DiskRequest{Source: "r/notes-os@sha256:" + strings.Repeat("c", 64), Registry: "r", RootfsMiB: 3500,
+		Formats: []string{"iso"}, Base: "notes-1.0.0"})
+	if err == nil || !strings.Contains(err.Error(), "auroraboot build-iso:") {
 		t.Fatalf("Build = %v", err)
 	}
 	cleanup()
@@ -722,6 +753,44 @@ func TestThePurgeKeepsTheProjectsPackages(t *testing.T) {
 		if _, owned := OwnedPackage(ok); owned {
 			t.Errorf("%s is refused", ok)
 		}
+	}
+}
+
+// The project's firmware files are checked in the bundle, each as it is or compressed; without
+// any, no step. A path that is not one under /lib/firmware is refused.
+func TestTheBuildChecksTheProjectsFirmware(t *testing.T) {
+	t.Parallel()
+	plain, err := Dockerfile(params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(plain), "host.firmware") {
+		t.Error("a bundle without firmware checks one")
+	}
+	p := params
+	p.Firmware = map[string]spec.HostPackage{"intel/ice/ddp/ice.pkg": {Reason: "the E810"}, "rtl_nic/rtl8125b-2.fw": {Reason: "r"}}
+	df, err := Dockerfile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"for f in intel/ice/ddp/ice.pkg rtl_nic/rtl8125b-2.fw; do",
+		`[ -f "/lib/firmware/$f" ] || [ -f "/lib/firmware/$f.zst" ] || [ -f "/lib/firmware/$f.xz" ] ||`,
+		`echo "host.firmware.$f: the OS bundle has no /lib/firmware/$f (nor .zst, .xz)`,
+	} {
+		if !strings.Contains(string(df), want) {
+			t.Errorf("Dockerfile lacks %q", want)
+		}
+	}
+	for _, bad := range []string{"/intel/ice.pkg", "../etc/shadow", "intel/../x", ".hidden", "a b", "a;b", "intel//ice", "x$y", strings.Repeat("a", 201)} {
+		p.Firmware = map[string]spec.HostPackage{bad: {Reason: "r"}}
+		if _, err := Dockerfile(p); err == nil {
+			t.Errorf("rendered %q", bad)
+		}
+	}
+	p.Firmware = map[string]spec.HostPackage{"ok.bin": {Reason: "two\nlines"}}
+	if _, err := Dockerfile(p); err == nil {
+		t.Error("rendered a reason of two lines")
 	}
 }
 
@@ -1025,5 +1094,54 @@ func TestRawLayoutTakesTheRecoveryByName(t *testing.T) {
 	patchGPT(t, p, 1024+3*128, e)
 	if rec, _, err := rawLayout(p); err != nil || rec != 200 {
 		t.Errorf("recovery %d MiB, %v", rec, err)
+	}
+}
+
+// Each NIC's own settings are a drop-in of the file its addressing comes from (the primary's two),
+// a NIC setting nothing has none, and a tun device's file is the image's whole: it matches the
+// device its service opens, keeps its addresses and waits for no carrier.
+func TestInterfacesAreTheImagesNetworkdFiles(t *testing.T) {
+	t.Parallel()
+	p := params
+	p.Interfaces = map[string]spec.HostInterface{
+		"uplink": {Primary: true, MTU: 9000, Reason: "the default route"},
+		"edge": {MTU: 1500, RoutingPolicyRules: []map[string]string{{"FirewallMark": "0x1", "Table": "100"}},
+			Routes: []map[string]string{{"Type": "local", "Destination": "0.0.0.0/0", "Table": "100"}}, Reason: "the probes"},
+		"mgmt": {Reason: "nothing of its own"},
+		"vpn0": {Kind: spec.InterfaceTUN, Routes: []map[string]string{{"Destination": "10.99.0.0/24"}}, Reason: "the peers"},
+	}
+	got := interfaceFiles(p)
+	want := map[string]string{
+		"usr/lib/systemd/network/01-notes-override.network.d/50-notes.conf": "# notes's interface uplink (host.interfaces): the default route\n[Link]\nMTUBytes=9000\n",
+		"usr/lib/systemd/network/05-notes-static.network.d/50-notes.conf":   "# notes's interface uplink (host.interfaces): the default route\n[Link]\nMTUBytes=9000\n",
+		"usr/lib/systemd/network/10-notes-edge.network.d/50-notes.conf": "# notes's interface edge (host.interfaces): the probes\n[Link]\nMTUBytes=1500\n" +
+			"\n[RoutingPolicyRule]\nFirewallMark=0x1\nTable=100\n\n[Route]\nDestination=0.0.0.0/0\nTable=100\nType=local\n",
+		"usr/lib/systemd/network/10-notes-vpn0.network": "# notes's interface vpn0 (host.interfaces): the peers\n[Match]\nName=vpn0\n\n[Network]\nLinkLocalAddressing=no\nIPv6AcceptRA=no\nKeepConfiguration=yes\nConfigureWithoutCarrier=yes\n\n[Link]\nRequiredForOnline=no\n" +
+			"\n[Route]\nDestination=10.99.0.0/24\n",
+	}
+	if len(got) != len(want) {
+		t.Errorf("files: %v", slices.Sorted(maps.Keys(got)))
+	}
+	for f, w := range want {
+		if string(got[f]) != w {
+			t.Errorf("%s:\n%s\nwant\n%s", f, got[f], w)
+		}
+	}
+	dir := t.TempDir()
+	if err := WriteContext(dir, p); err != nil {
+		t.Fatal(err)
+	}
+	if b, err := os.ReadFile(filepath.Join(dir, "files", "usr/lib/systemd/network/10-notes-vpn0.network")); err != nil || !strings.HasPrefix(string(b), "# notes's interface vpn0") {
+		t.Errorf("the context lacks the tun device's file: %v", err)
+	}
+	for _, bad := range []map[string]string{{"Table": "100\nPostUp=x"}, {"ExecStart": "x"}} {
+		p.Interfaces = map[string]spec.HostInterface{"edge": {RoutingPolicyRules: []map[string]string{bad}, Reason: "r"}}
+		if _, err := Dockerfile(p); err == nil {
+			t.Errorf("rendered %v", bad)
+		}
+	}
+	p.Interfaces = map[string]spec.HostInterface{"Edge": {Reason: "r"}}
+	if _, err := Dockerfile(p); err == nil {
+		t.Error("rendered a role that is no interface's name")
 	}
 }

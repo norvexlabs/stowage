@@ -535,36 +535,43 @@ func (l *linter) stack() {
 	}
 }
 
-// memory checks stack.memory: shares of services the compose file declares (when it reads), from
-// 1 %, together at most spec.MaxMemoryShares, each maximum one the service can be given.
+// memory checks services: each a service the compose file declares (when it reads), asking
+// something; its memory share from 1 %, the shares together at most spec.MaxMemoryShares, each
+// maximum one the service can be given; the rest serviceHost.
 func (l *linter) memory() {
-	m := l.s.Stack.Memory
-	if m == nil && !l.leftEmpty("stack", "memory") {
+	if len(l.s.Services) == 0 {
+		if l.leftEmpty("services") {
+			l.errf("services", "names no service: give one what it asks of the host, or remove services")
+		}
 		return
 	}
-	where := "stack.memory.shares"
-	if m == nil || len(m.Shares) == 0 {
-		l.errf(where, "names no service: give one a percent of the host's RAM, or remove stack.memory")
-		return
-	}
-	total := 0
-	for _, name := range sortedKeys(m.Shares) {
-		share, at := m.Shares[name], where+"."+name
+	total, shares := 0, false
+	for _, name := range sortedKeys(l.s.Services) {
+		svc, at := l.s.Services[name], "services."+name
 		l.service(at, name)
+		if svc == (spec.Service{}) {
+			l.errf(at, "says nothing: memory, cpus, nftables or interface")
+		}
+		l.serviceHost(at, name, svc)
+		share := svc.Memory
+		if share == nil {
+			continue
+		}
+		shares = true
 		if share.Max != 0 {
-			l.shareMax(at, name, share)
+			l.shareMax(at+".memory", name, *share)
 		}
 		if pct := share.Percent; pct < 1 || pct > spec.MaxMemoryShares {
-			l.errf(at, "%d: a percent of the host's RAM, from 1 to %d", pct, spec.MaxMemoryShares)
+			l.errf(at+".memory", "%d: a percent of the host's RAM, from 1 to %d", pct, spec.MaxMemoryShares)
 			continue
 		}
 		total += share.Percent
 	}
 	if total > spec.MaxMemoryShares {
-		l.errf(where, "the shares total %d %%: at most %d, the rest is the OS's, the engine's and Stowage's", total, spec.MaxMemoryShares)
+		l.errf("services", "the memory shares total %d %%: at most %d, the rest is the OS's, the engine's and Stowage's", total, spec.MaxMemoryShares)
 	}
-	if l.s.Shapes.Docker == nil && l.s.Shapes.Kairos == nil {
-		l.warnf("stack.memory", "only the docker and kairos shapes size services from the host: the chart gives its pods their resources")
+	if shares && l.s.Shapes.Docker == nil && l.s.Shapes.Kairos == nil {
+		l.warnf("services", "only the docker and kairos shapes size services from the host: the chart gives its pods their resources")
 	}
 }
 
@@ -1336,9 +1343,12 @@ func (l *linter) readInputs() func(spec.Input) bool {
 			inCompose[a.Secret] = true
 		}
 	}
-	// The installer reads the L4 routes' inputs.
+	// The installer reads the L4 routes' inputs, and the services' addresses of their own.
 	for _, r := range l.s.L4.Routes {
 		inCompose[r.AddressInput], inCompose[r.AllowInput], inCompose[r.BindInput] = true, true, true
+	}
+	for _, svc := range l.s.Services {
+		inCompose[svc.AddressInput] = true
 	}
 	return func(in spec.Input) bool {
 		if in.Profile != "" {
@@ -1669,6 +1679,13 @@ func (l *linter) host() {
 		}
 		l.reason(at+".reason", h.Packages[name].Reason)
 	}
+	for _, path := range slices.Sorted(maps.Keys(h.Firmware)) {
+		at := "host.firmware." + path
+		if len(path) > 200 || !spec.FirmwarePath.MatchString(path) {
+			l.errf(at, "not a firmware file's path under /lib/firmware: names of letters, digits and _ . + -, none starting with a dot, one / apart, at most 200")
+		}
+		l.reason(at+".reason", h.Firmware[path].Reason)
+	}
 	for _, name := range slices.Sorted(maps.Keys(h.KernelArgs)) {
 		a, at := h.KernelArgs[name], "host.kernel_args."+name
 		switch k, owned := kairos.OwnedKernelArg(name); {
@@ -1700,6 +1717,124 @@ func (l *linter) host() {
 	}
 	if p := h.Power; p != "" && p != tune.Performance && p != tune.Platform {
 		l.errf("host.power", "%q: %s or %s (the default)", p, tune.Performance, tune.Platform)
+	}
+	l.interfaces(h.Interfaces)
+}
+
+// interfaces checks host.interfaces: each role is an interface's name, which networkd's files,
+// the firewall's rules and tune's report carry; its routing is networkd's own settings, each
+// written into a .network file; one NIC is the default route's when any NIC is declared (a tun
+// device alone names none). A route or
+// the front that names a role names a declared one.
+func (l *linter) interfaces(ifs map[string]spec.HostInterface) {
+	primaries, nics := 0, 0
+	for _, role := range slices.Sorted(maps.Keys(ifs)) {
+		i, at := ifs[role], "host.interfaces."+role
+		switch {
+		case !spec.InterfaceName.MatchString(role):
+			l.errf(at, "not an interface's name: a lower-case letter, then lower-case letters and digits, at most 15")
+		case slices.ContainsFunc(spec.ReservedInterfacePrefixes, func(p string) bool { return strings.HasPrefix(role, p) }):
+			l.errf(at, "a name the kernel, udev or Docker gives (%s…): name the role, such as client, upstream or vpn0", strings.Join(spec.ReservedInterfacePrefixes, "…, "))
+		}
+		switch i.Kind {
+		case "", spec.InterfaceNIC:
+			nics++
+			if i.Primary {
+				primaries++
+			}
+		case spec.InterfaceTUN:
+			if i.Primary {
+				l.errf(at+".primary", "a tun device a service opens is not the default route's")
+			}
+		default:
+			l.errf(at+".kind", "%q: %s (the default) or %s", i.Kind, spec.InterfaceNIC, spec.InterfaceTUN)
+		}
+		if i.MTU != 0 && (i.MTU < 1280 || i.MTU > 9216) {
+			l.errf(at+".mtu", "%d: 1280 to 9216 (IPv6's least, a jumbo frame's most), or none for the network's", i.MTU)
+		}
+		if e := i.Ethtool; e != nil {
+			l.ethtool(at+".ethtool", i.Kind == spec.InterfaceTUN, e)
+		}
+		l.routing(at+".routing_policy_rules", i.RoutingPolicyRules, spec.RoutingPolicyRuleKeys)
+		l.routing(at+".routes", i.Routes, spec.RouteKeys)
+		l.reason(at+".reason", i.Reason)
+	}
+	if nics > 0 && primaries != 1 {
+		l.errf("host.interfaces", "%d NICs are primary: one is the default route's (primary: true)", primaries)
+	}
+	kairos := l.s.Shapes.Kairos != nil
+	named := func(at, role string) {
+		switch _, ok := ifs[role]; {
+		case role == "":
+		case !ok:
+			l.errf(at, "%q is not one of host.interfaces", role)
+		case !kairos:
+			l.warnf(at, "only the VM's firewall opens a port on one interface alone (a kairos shape): a Docker host's firewall is its operator's")
+		}
+	}
+	named("front.interface", l.s.Front.Interface)
+	for i, r := range l.s.L4.Routes {
+		named(fmt.Sprintf("l4.routes[%d].interface", i), r.Interface)
+	}
+}
+
+// ethtool checks a NIC's ethtool settings: counts or max, each feature on or off by a name ethtool
+// lists, EEE on or off; a tun device has none of them.
+func (l *linter) ethtool(at string, tun bool, e *spec.Ethtool) {
+	if tun {
+		l.errf(at, "a tun device has no NIC's settings")
+		return
+	}
+	count := func(w, v string, most int) {
+		if v == "" || v == "max" {
+			return
+		}
+		if n, err := strconv.Atoi(v); err != nil || n < 1 || n > most {
+			l.errf(w, "%q: max, or a count from 1 to %d", v, most)
+		}
+	}
+	if c := e.Channels; c != nil {
+		if c.Combined == "" {
+			l.errf(at+".channels", "says nothing: combined (max or a count)")
+		}
+		count(at+".channels.combined", c.Combined, 1024)
+	}
+	if r := e.Rings; r != nil {
+		if r.RX == "" && r.TX == "" {
+			l.errf(at+".rings", "says nothing: rx or tx (max or a count)")
+		}
+		count(at+".rings.rx", r.RX, 65536)
+		count(at+".rings.tx", r.TX, 65536)
+	}
+	for _, f := range slices.Sorted(maps.Keys(e.Features)) {
+		switch v := e.Features[f]; {
+		case !spec.EthtoolFeature.MatchString(f):
+			l.errf(at+".features", "%q is not a feature's name as ethtool -k lists it", f)
+		case v != "on" && v != "off":
+			l.errf(at+".features."+f, "%q: on or off", v)
+		}
+	}
+	if v := e.EEE; v != "" && v != "on" && v != "off" {
+		l.errf(at+".eee", "%q: on or off", v)
+	}
+}
+
+// routing checks a list of networkd sections' settings: each key one networkd takes there, each
+// value of the characters an address, a mark or a word holds.
+func (l *linter) routing(at string, entries []map[string]string, keys []string) {
+	for n, e := range entries {
+		w := fmt.Sprintf("%s[%d]", at, n)
+		if len(e) == 0 {
+			l.errf(w, "is empty")
+		}
+		for _, k := range slices.Sorted(maps.Keys(e)) {
+			switch {
+			case !slices.Contains(keys, k):
+				l.errf(w, "%q is not one of networkd's settings here (%s)", k, strings.Join(keys, ", "))
+			case !spec.RoutingValue.MatchString(e[k]):
+				l.errf(w+"."+k, "%q: letters, digits and _ . : / , + -, at most 64", e[k])
+			}
+		}
 	}
 }
 

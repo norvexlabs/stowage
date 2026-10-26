@@ -122,7 +122,7 @@ func TestTheCloudConfigServesTheSeedHostKeyUntilTheInstall(t *testing.T) {
 	if !strings.Contains(out, "It carries no secret but a one-time SSH host key, served until the install.\n") {
 		t.Errorf("header:\n%s", out)
 	}
-	const before, after = "[ ! -e /usr/local/notes/.env ] && [ ! -e /oem/notes-seed-host-key.retired ]", "[ -e /usr/local/notes/.env ] && [ ! -e /oem/notes-seed-host-key.retired ]"
+	const before, after = notLive + " && [ ! -e /usr/local/notes/.env ] && [ ! -e /oem/notes-seed-host-key.retired ]", notLive + " && [ -e /usr/local/notes/.env ] && [ ! -e /oem/notes-seed-host-key.retired ]"
 	files := st["notes: the one-time SSH host key, until the install"]
 	if files.If != before || len(files.Files) != 2 ||
 		files.Files[0] != (cloudFile{Path: "/run/notes-seed-host-key", Permissions: 0o600, Content: string(m.HostKey)}) ||

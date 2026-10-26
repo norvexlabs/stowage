@@ -1450,7 +1450,11 @@ every shape, the VM end-to-end test upgrading through it), then the health gate.
   hold from the initramfs on, before a driver binds, and `/etc` is Kairos's persistent state,
   which every boot fills from the image without deleting (a file a newer image dropped would
   outlive it, and reach an older one on a rollback). The build proves modprobe and systemd read
-  them; `tune` reports the running kernel against them and sets nothing. Left out: Docker's userland proxy (turning it off breaks
+  them; `tune` reports the running kernel against them and sets nothing. Firmware
+  (`host.firmware`) is a file the build checks, not a package: the bundle already carries the
+  distribution's firmware, so a project names what its hardware loads (an E810's DDP package)
+  and the build proves it there, rather than a driver of one NIC being Stowage's special case.
+  Left out: Docker's userland proxy (turning it off breaks
   a loopback install on `::1`, and it carries only local traffic), host networking (the stack's
   isolation), the NICs' offloads beyond forwarded UDP (a driver's defaults are its best).
   On Kubernetes the node is the cluster admin's, so the installer never touches it and reads
@@ -1466,6 +1470,59 @@ every shape, the VM end-to-end test upgrading through it), then the health gate.
   unprivileged, it reads only its own namespace, and reading the node's needs `hostNetwork`,
   which the baseline Pod Security level refuses. The values are written at install time, as
   the release's `stowage` block is written at ship before any cluster is known.
+- **Bare metal is Kairos's installer, not a disk written by hand** (`iso`, `vm create
+  --platform metal`): AuroraBoot's `build-iso` of the same bundle, the machine's seed a NoCloud
+  `cidata` stick, as Kairos documents an automated install, so a server gets the VM's boot, A/B
+  upgrades and health gate unchanged. The raw disk written with `dd` works too, but needs a live
+  system to write a server's internal disk from. What is Stowage's: the ISO embeds the raw disk's
+  state partition (Kairos's installer sizes it to the images it writes, leaving a later release
+  no room) and the screen's console last (`grub_options.extra_cmdline`, which every entry reads,
+  the recovery one included: a server has a screen, a VM a serial port); the disk is named
+  (`--device`), as Kairos's `auto` takes the largest disk, which may be a data disk; the machine
+  powers off rather than reboots, so the installer stick cannot boot again and wipe it. The
+  installer copies the cloud-config it ran with to the installed system (`90_custom.yaml`) and
+  the seed stick is still a datasource: the seed's `after-install-chroot` stage (the one that sees
+  the installed system's OEM partition as `/oem`) moves the copy to `95_userdata/userdata.yaml`, which Kairos's datasource stage takes for the first boot's pull, so the stages
+  run once a boot and no boot pulls the seed again, as on a VM. The live system boots the
+  bundle: its units, its SSH and the seed's stages skip live mode (`/run/cos/live_mode`, the
+  guard Kairos's own stages use), so the installer is no host of the stack and its host key is
+  never the one `vm create` learns. Left out: netboot and Redfish (AuroraBoot has them, a server
+  room's tooling decides), `config_url=` on the command line, Trusted Boot (UKI, a boot chain of
+  its own), and TPM-sealed encryption (TODO).
+- **A stack between networks names its interfaces by role** (`host.interfaces`), in the
+  platform's own terms — networkd's `[RoutingPolicyRule]` and `[Route]` settings, ethtool's —
+  rather than a model of Stowage's: an appliance's routing (a TPROXY's mark to a local table)
+  and its NICs' tuning are the project's, and the keys say what networkd and ethtool say. The role
+  is the interface's name: one udev `.link` file a NIC, by its MAC, written in the seed's
+  initramfs stage so the booted system's udev names it, and renamed at the first boot when it was
+  named before; the firewall's `iifname`, the routing's drop-ins and `tune` then name the role,
+  whatever the hardware calls it. A VM of one such NIC needs no MAC (its original name is
+  matched): a cloud, whose NICs' MACs are its own, takes one; a hypervisor's are generated
+  (random, written once into the seed and the module's variables: two VMs of one host name never
+  share one), a server's are always given (it may have more ports than the release names). A VM
+  keeps its NICs as its cloud-config named them: the override matches what the seed's own file
+  matches, never a guess from the running release; a port on a role no NIC is named for fails
+  closed (warned), as opening it on the other interfaces is what the role was declared against. The routing and MTU are
+  the image's drop-ins (the release's, so each system boots with its own), the addressing the
+  seed's (the install's). A secondary NIC never takes the default route, the DNS servers or the
+  host's name: the primary's addressing is the machine's network. A tun device is the service's:
+  only matched by name and given its routes, its addresses kept. On a Docker host or a node the
+  NICs are the operator's: `tune` advises, `k8s tune` prints, nothing is written. Left out: bonds
+  and VLANs (networkd has them; no project asks), several NICs on a cloud (TODO).
+- **What a service asks of the host is one entry** (`services.<name>`): its memory share (moved
+  from `stack.memory`), its whole cores, its nftables table, its address of its own. Cores are
+  allocated, not named: a release cannot know a host's CPU ids, so the install gives whole cores
+  from the top, a core's threads together, never CPU 0's (the host's timers and default interrupts),
+  the same on every start and boot, and `tune` computes the same sets for the NICs' steering, with
+  no state between them. A service's nftables table is a file of one `table inet <service>`, which
+  the VM replaces whole in one transaction (no doubled rule, no gap) when it is absent or changed,
+  leaving the sets a service fed otherwise, a changed one recreating its service so it feeds them
+  again, and deletes once the release drops it; the host's own table stays Stowage's, and the app socket feeds only
+  a declared set of a declared table, its elements checked before nft runs. An address of its own
+  is an ipvlan (L2) network on the role's NIC, its subnet read from the NIC at each start, because
+  a bridge's NAT is what such a service avoids; its traffic crosses no host firewall, so its rules
+  are its table's. Kubernetes gets the equivalents as the cluster's: the CPU manager's static
+  policy, printed.
 - **Memory follows the host** (`stack.memory`): a service's limit is a share of the RAM, set in
   `stowage-content.yaml` at each start, so a resized VM or host is followed at its next start
   without a new release. A share only raises: the compose file's own limit and its reservation

@@ -45,22 +45,22 @@ func FuzzParseBytes(f *testing.F) {
 
 func TestMemoryShareForms(t *testing.T) {
 	t.Parallel()
-	s, err := Parse([]byte(base + "stack:\n  memory:\n    shares: { db: { percent: 25, max: 16G }, api: 10 }\n"))
+	s, err := Parse([]byte(base + "services:\n  db: { memory: { percent: 25, max: 16G } }\n  api: { memory: 10 }\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := s.Stack.Memory.Shares; got["db"] != (Share{25, 16 << 30}) || got["api"] != (Share{Percent: 10}) {
+	if got := s.MemoryShares(); got["db"] != (Share{25, 16 << 30}) || got["api"] != (Share{Percent: 10}) {
 		t.Errorf("shares: %+v", got)
 	}
 	for in, want := range map[string]string{
-		"{ db: { percent: 25, maximum: 16G } }": "field maximum not found",
-		"{ db: { percent: 25, max: lots } }":    `"lots": a size`,
-		"{ db: [25] }":                          "a percent, or",
-		"{ db: ten }":                           "cannot unmarshal",
-		"{ db: { percent: 25, max: 0 } }":       "max: 0: a size of at least 64M",
-		"{ db: { percent: 25, max: } }":         "max: empty: a size",
+		"{ percent: 25, maximum: 16G }": "field maximum not found",
+		"{ percent: 25, max: lots }":    `"lots": a size`,
+		"[25]":                          "a percent, or",
+		"ten":                           "cannot unmarshal",
+		"{ percent: 25, max: 0 }":       "max: 0: a size of at least 64M",
+		"{ percent: 25, max: }":         "max: empty: a size",
 	} {
-		if _, err := Parse([]byte(base + "stack:\n  memory:\n    shares: " + in + "\n")); err == nil || !strings.Contains(err.Error(), want) {
+		if _, err := Parse([]byte(base + "services:\n  db: { memory: " + in + " }\n")); err == nil || !strings.Contains(err.Error(), want) {
 			t.Errorf("%s: %v, want %q", in, err, want)
 		}
 	}

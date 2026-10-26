@@ -34,7 +34,9 @@ const (
 	Spec    = "spec.json"    // the spec's runtime view
 	Compose = "compose.yaml" // the project's compose file
 	KeysDir = "keys/"        // trusted public keys, by their spec path's base name
-	Pull    = "pull.json"    // the project's pull account (Account), when registry.pull is a token
+	// NftablesDir holds each service's nftables table (services.<name>.nftables) as <name>.nft.
+	NftablesDir = "nftables/"
+	Pull        = "pull.json" // the project's pull account (Account), when registry.pull is a token
 )
 
 // Account is a registry login baked into an installer: the project's read-only pull account.

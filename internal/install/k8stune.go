@@ -6,6 +6,7 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/norvexlabs/stowage/internal/spec"
 	"github.com/norvexlabs/stowage/internal/tune"
 )
 
@@ -39,7 +40,7 @@ func (in *Installer) K8sTune() error {
 	var sys tune.System
 	releaseHost(&sys, in.R.Spec)
 	mods, pkgs := sys.Modules, sys.Packages
-	if len(mods)+len(pkgs)+len(sys.KernelArgs)+len(sys.Settings) == 0 && sys.Power != tune.Performance {
+	if len(mods)+len(pkgs)+len(sys.Firmware)+len(sys.Interfaces)+len(sys.KernelArgs)+len(sys.Settings)+len(sys.ServiceCores) == 0 && sys.Power != tune.Performance {
 		return nil
 	}
 	fmt.Fprintf(w, "\nWhat the project asks of every node (host), which the node's operator gives it:\n")
@@ -58,6 +59,26 @@ func (in *Installer) K8sTune() error {
 	}
 	for _, p := range pkgs {
 		fmt.Fprintf(w, "  package %s (Debian's name)   %s\n", p.Name, p.Reason)
+	}
+	for _, f := range sys.Firmware {
+		fmt.Fprintf(w, "  firmware /lib/firmware/%s (or compressed)   %s\n", f.Path, f.Reason)
+	}
+	for _, r := range sys.ServiceCores {
+		irq := "the NICs' interrupts off them"
+		if r.IRQ {
+			irq = "the NICs' interrupts on them too"
+		}
+		fmt.Fprintf(w, "  service %s: %d whole cores of its own, %s: the chart's pod in the Guaranteed class (CPU requests equal to its limits, whole), on a kubelet of the static CPU manager policy (cpuManagerPolicy: static)\n", r.Service, r.Cores, irq)
+	}
+	for _, i := range sys.Interfaces {
+		what := "a NIC playing it"
+		if i.Kind == spec.InterfaceTUN {
+			what = "a tun device its service opens (the host's network)"
+		}
+		if n := i.Networkd(); n != "" {
+			what += ", networkd's " + n
+		}
+		fmt.Fprintf(w, "  interface %s: %s   %s\n", i.Role, what, i.Reason)
 	}
 	for _, a := range sys.KernelArgs {
 		fmt.Fprintf(w, "  kernel argument %s   %s\n", a, a.Reason)

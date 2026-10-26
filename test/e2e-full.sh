@@ -90,7 +90,7 @@ expect_code 201 -X POST -H 'Content-Type: application/json' -d '{"kind": "probe"
 [[ $(status events) == 1 ]] || fail "the ingested event did not reach the api"
 expect_code 401 -X POST "http://127.0.0.1:$API_PORT/api/v1/maintenance/purge"
 [[ $(status search) == False ]] || fail "the api reaches a search service while SEARCH_URL is empty"
-# stack.memory: postgres's limit is 25 % of this host's RAM (in 64 MiB steps), at most its 16 GiB
+# services.postgres.memory: its limit is 25 % of this host's RAM (in 64 MiB steps), at most its 16 GiB
 # maximum, never under its own 256 MiB, and it sizes its cache from the variable it is given.
 pg=$(docker ps -q --filter "label=com.docker.compose.project=$(project)" --filter label=com.docker.compose.service=postgres)
 host_mb=$(awk '/^MemTotal:/ { print int($2 / 65536) * 64 }' /proc/meminfo)

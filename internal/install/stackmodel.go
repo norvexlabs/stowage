@@ -49,6 +49,8 @@ type composeModel struct {
 		Expose      []string          `json:"expose"`
 		Sysctls     map[string]string `json:"sysctls"`
 		Ulimits     map[string]any    `json:"ulimits"`
+		// Networks are the networks it joins (the default one included), by name.
+		Networks map[string]any `json:"networks"`
 		serviceMemory
 		Configs []struct {
 			Source string `json:"source"`
@@ -152,7 +154,7 @@ func (in *Installer) model(ctx context.Context, environ []string) (*composeModel
 // of its own the sysctls of ctr it does not set itself, each service ctr's open files unless it
 // sets its own, each service mem shares its memory limit, and each bridge network the stack makes
 // ctr's MTU.
-func contentCompose(m *composeModel, environ []string, key []byte, ctr tune.Container, mem memoryPlan, hn hostNet) ([]byte, error) {
+func contentCompose(m *composeModel, environ []string, key []byte, ctr tune.Container, mem hostPlan, hn hostNet) ([]byte, error) {
 	lookup := environLookup(environ)
 	services := map[string]any{}
 	for _, name := range sortedKeys(m.Services) {
@@ -178,8 +180,15 @@ func contentCompose(m *composeModel, environ []string, key []byte, ctr tune.Cont
 			add("secret", m.Secrets, s.Source)
 		}
 		extra := map[string]any{}
+		labels := map[string]string{}
 		if n > 0 {
-			extra["labels"] = map[string]string{ContentLabel: "hmac-sha256:" + hex.EncodeToString(h.Sum(nil))}
+			labels[ContentLabel] = "hmac-sha256:" + hex.EncodeToString(h.Sum(nil))
+		}
+		if d, ok := mem.Tables[name]; ok {
+			labels[TableLabel] = d
+		}
+		if len(labels) > 0 {
+			extra["labels"] = labels
 		}
 		hn.give(extra, name, svc.NetworkMode)
 		// The host's namespace, or another service's, is no service's own to set.
@@ -200,6 +209,10 @@ func contentCompose(m *composeModel, environ []string, key []byte, ctr tune.Cont
 		if share, ok := mem.Shares[name]; ok {
 			mem.give(extra, share, svc.serviceMemory)
 		}
+		mem.giveCPUs(extra, name)
+		if v, ok := mem.IPVlans[name]; ok {
+			giveIPVlan(extra, v, svc.Networks)
+		}
 		if len(extra) > 0 {
 			services[name] = extra
 		}
@@ -211,6 +224,9 @@ func contentCompose(m *composeModel, environ []string, key []byte, ctr tune.Cont
 				networks[name] = map[string]any{"driver_opts": map[string]string{mtuOpt: mtu}}
 			}
 		}
+	}
+	for n, def := range ipvlanNetworks(mem.IPVlans) {
+		networks[n] = def
 	}
 	if len(services) == 0 && len(networks) == 0 {
 		return []byte(contentPlaceholder), nil
@@ -344,10 +360,15 @@ func (in *Installer) writeContent(ctx context.Context, m *composeModel, env *Env
 	if err != nil {
 		return fmt.Errorf("%s: %w", ContentKey, err)
 	}
-	ctr, mem, err := in.containerSizing(ctx, func(k string) string { v, _ := env.Get(k); return v })
+	get := func(k string) string { v, _ := env.Get(k); return v }
+	ctr, mem, err := in.containerSizing(ctx, get)
 	if err != nil {
 		return err
 	}
+	if mem.IPVlans, err = in.ipvlans(ctx, get); err != nil {
+		return err
+	}
+	mem.Tables = in.tableLoads()
 	if ctr.MTUUnread {
 		// No default route this moment: the networks keep the MTU the last start gave them,
 		// rather than be made again without it.

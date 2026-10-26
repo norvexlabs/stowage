@@ -36,6 +36,12 @@ type System struct {
 	Modules []Module
 	// Packages are the distribution packages the project declares, by name, which Inspect judges.
 	Packages []Package
+	// Firmware are the firmware files the project declares, which Inspect judges.
+	Firmware []Firmware
+	// Interfaces are the network interfaces the project declares, by role, which Inspect judges.
+	Interfaces []Interface
+	// ServiceCores are the services' whole cores, which the NICs' steering stays off (isolated).
+	ServiceCores []CoreRequest
 	// KernelArgs are the kernel arguments the project declares, which Inspect judges against the
 	// running kernel's command line.
 	KernelArgs []KernelArg
@@ -55,6 +61,7 @@ func (s System) Host() (Host, error) {
 	}
 	h.Profile = s.Profile
 	h.Settings = s.Settings
+	h.Isolated = s.isolated(h)
 	if h.Profile == "" {
 		h.Profile = Default
 		if st, err := s.readState(); err == nil && st.Profile != "" {
@@ -105,6 +112,16 @@ func (s System) running(name string) bool {
 		}
 	}
 	return false
+}
+
+// steerCPUs are the online CPUs the NICs' interrupts and receive steering go to: all but the
+// Isolated ones, every one when nothing else is left.
+func (h Host) steerCPUs() []int {
+	ids := slices.DeleteFunc(slices.Clone(h.cpuIDs()), func(id int) bool { return slices.Contains(h.Isolated, id) })
+	if len(ids) == 0 {
+		return h.cpuIDs()
+	}
+	return ids
 }
 
 // cpuIDs are the online CPUs' ids.
@@ -214,7 +231,7 @@ const (
 // Item is one line of the report.
 type Item struct {
 	State State
-	Kind  string // sysctl, module, package, kernel, cpu, nic, tun, docker, state
+	Kind  string // sysctl, module, package, firmware, interface, kernel, cpu, nic, tun, docker, nftables, state
 	Name  string
 	Have  string
 	Want  string
@@ -476,6 +493,8 @@ func (s System) Inspect(ctx context.Context, h Host) []Item {
 	}
 	items = append(items, s.inspectModules()...)
 	items = append(items, s.inspectPackages()...)
+	items = append(items, s.inspectFirmware()...)
+	items = append(items, s.inspectInterfaces(ctx)...)
 	if s.Docker == nil {
 		return items
 	}
@@ -511,6 +530,10 @@ func (s System) inspectSteering(h Host, n nic) []Item {
 	var items []Item
 	switch irqs := s.irqs(n); {
 	case len(irqs) < 2 || len(h.cpuIDs()) < 2:
+	case s.running("irqbalance") && len(h.Isolated) > 0 && s.irqbalanceBans(h.Isolated):
+		items = append(items, Item{OK, "nic", n.name + " interrupts", "irqbalance spreads them, off the services' cores", "IRQBALANCE_BANNED_CPULIST=" + cpuRanges(h.Isolated)})
+	case s.running("irqbalance") && len(h.Isolated) > 0:
+		items = append(items, Item{Advice, "nic", n.name + " interrupts", "irqbalance spreads them, the services' cores included:", "IRQBALANCE_BANNED_CPULIST=" + cpuRanges(h.Isolated) + " in /" + s.irqbalanceFile() + ", then restart irqbalance"})
 	case s.running("irqbalance"):
 		items = append(items, Item{NA, "nic", n.name + " interrupts", "irqbalance spreads them", ""})
 	case s.irqsStacked(irqs):
@@ -837,4 +860,108 @@ func (s System) daemonFile() string {
 		return strings.TrimPrefix(filepath.Join("/", f), "/")
 	}
 	return DaemonFile
+}
+
+// cpuRanges is a list of CPUs as the kernel's lists read it: ranges of consecutive ids, comma
+// separated (0-3,8).
+func cpuRanges(ids []int) string {
+	var parts []string
+	for i := 0; i < len(ids); {
+		j := i
+		for j+1 < len(ids) && ids[j+1] == ids[j]+1 {
+			j++
+		}
+		if j > i {
+			parts = append(parts, fmt.Sprintf("%d-%d", ids[i], ids[j]))
+		} else {
+			parts = append(parts, strconv.Itoa(ids[i]))
+		}
+		i = j + 1
+	}
+	return strings.Join(parts, ",")
+}
+
+// irqbalanceFile is irqbalance's environment file on this host: Debian's /etc/default, else the
+// RHEL family's /etc/sysconfig (the one its unit reads), relative to the root.
+func (s System) irqbalanceFile() string {
+	if !s.exists("etc/default/irqbalance") && s.exists("etc/sysconfig/irqbalance") {
+		return "etc/sysconfig/irqbalance"
+	}
+	return "etc/default/irqbalance"
+}
+
+// irqbalanceEnv is the running irqbalance's environment (proc/<pid>/environ), else what its
+// environment file sets (systemd's EnvironmentFile: a line starting with # is a comment, the rest
+// KEY=value, quoted or not, exported or not, the last one winning).
+func (s System) irqbalanceEnv() map[string]string {
+	vals := map[string]string{}
+	entries, _ := os.ReadDir(s.path("proc"))
+	for _, e := range entries {
+		if comm, ok := s.read(filepath.Join("proc", e.Name(), "comm")); !ok || comm != "irqbalance" {
+			continue
+		}
+		raw, err := os.ReadFile(s.path(filepath.Join("proc", e.Name(), "environ")))
+		if err != nil {
+			break
+		}
+		for _, kv := range strings.Split(string(raw), "\x00") {
+			if k, v, ok := strings.Cut(kv, "="); ok {
+				vals[k] = v
+			}
+		}
+		return vals
+	}
+	raw, _ := s.read(s.irqbalanceFile())
+	for _, line := range strings.Split(raw, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "#") {
+			continue
+		}
+		if k, v, ok := strings.Cut(strings.TrimPrefix(line, "export "), "="); ok {
+			vals[strings.TrimSpace(k)] = strings.Trim(strings.TrimSpace(v), `"'`)
+		}
+	}
+	return vals
+}
+
+// irqbalanceBans reports whether irqbalance keeps off every CPU of cpus, as irqbalance reads its
+// environment: IRQBALANCE_BANNED_CPUS (a mask) first, else IRQBALANCE_BANNED_CPULIST (a CPU list),
+// else the CPUs the kernel isolates (isolcpus) or runs without ticks (nohz_full), which it then
+// bans itself.
+func (s System) irqbalanceBans(cpus []int) bool {
+	env := s.irqbalanceEnv()
+	var banned []int
+	switch {
+	case env["IRQBALANCE_BANNED_CPUS"] != "":
+		banned = maskCPUs(env["IRQBALANCE_BANNED_CPUS"])
+	case env["IRQBALANCE_BANNED_CPULIST"] != "":
+		banned, _ = cpuList(env["IRQBALANCE_BANNED_CPULIST"])
+	default:
+		for _, f := range []string{"sys/devices/system/cpu/isolated", "sys/devices/system/cpu/nohz_full"} {
+			if v, ok := s.read(f); ok && v != "" && v != "(null)" {
+				ids, _ := cpuList(v)
+				banned = append(banned, ids...)
+			}
+		}
+	}
+	return !slices.ContainsFunc(cpus, func(c int) bool { return !slices.Contains(banned, c) })
+}
+
+// maskCPUs are the CPUs of a hexadecimal mask as the kernel writes one (32-bit groups, comma
+// separated, the highest first); none for one that does not read.
+func maskCPUs(mask string) []int {
+	groups := strings.Split(mask, ",")
+	var out []int
+	for i := range groups {
+		g, err := strconv.ParseUint(groups[len(groups)-1-i], 16, 32)
+		if err != nil {
+			return nil
+		}
+		for b := range 32 {
+			if g&(1<<b) != 0 {
+				out = append(out, i*32+b)
+			}
+		}
+	}
+	return out
 }

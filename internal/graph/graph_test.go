@@ -554,13 +554,13 @@ func TestKairosSettingsReachTheBundle(t *testing.T) {
 		{"pcspkr: { block: true, reason: a VM has no speaker }", "pcspkr: { block: true, reason: no speaker }", true, true},
 		{"redirect_always_follow: \"Y\"", "redirect_always_follow: \"N\"", true, true},
 		{"tcpdump: { reason:", "tcpdump-dbg: { reason:", true, true},
-		{"disk_formats: [raw, qcow2, ova, vhd, gce]", "disk_formats: [raw, qcow2, vhd, gce]", false, true},
+		{"disk_formats: [raw, qcow2, ova, vhd, gce, iso]", "disk_formats: [raw, qcow2, vhd, gce]", false, true},
 		// The clouds' formats are made whether disk_formats lists them or not.
-		{"disk_formats: [raw, qcow2, ova, vhd, gce]", "disk_formats: [qcow2, ova]", false, false},
+		{"disk_formats: [raw, qcow2, ova, vhd, gce, iso]", "disk_formats: [qcow2, ova, iso]", false, false},
 		{"cloud_publish: [aws, azure, gcp]", "cloud_publish: [aws, azure]", false, false},
-		{"disk_formats: [raw, qcow2, ova, vhd, gce]\n    cloud_publish: [aws, azure, gcp]", "disk_formats: [raw, qcow2, ova, vhd]\n    cloud_publish: [aws, azure]", false, true},
+		{"disk_formats: [raw, qcow2, ova, vhd, gce, iso]\n    cloud_publish: [aws, azure, gcp]", "disk_formats: [raw, qcow2, ova, vhd]\n    cloud_publish: [aws, azure]", false, true},
 		// The order changes no disk; the release follows the spec its installer carries.
-		{"disk_formats: [raw, qcow2, ova, vhd, gce]", "disk_formats: [gce, vhd, ova, qcow2, raw]", false, false},
+		{"disk_formats: [raw, qcow2, ova, vhd, gce, iso]", "disk_formats: [iso, gce, vhd, ova, qcow2, raw]", false, false},
 	} {
 		testutil.Edit(t, root, "stowage.yaml", e.old, e.new)
 		c := changed(base, inputs(build(t, root)))

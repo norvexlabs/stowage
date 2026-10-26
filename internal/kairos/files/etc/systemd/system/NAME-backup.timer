@@ -1,6 +1,8 @@
 # Not enabled: the host daemon starts it once backup settings exist, on their schedule.
 [Unit]
 Description={{.Name}}: the scheduled backup's timer (`{{.Ctl}} backup config --schedule` moves it)
+# The installer ISO boots this system live, to install it: no host of the stack.
+ConditionPathExists=!/run/cos/live_mode
 
 [Timer]
 OnCalendar=*-*-* 03:00:00 UTC

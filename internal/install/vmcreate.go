@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"cmp"
 	"context"
+	"crypto/rand"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
@@ -23,6 +24,7 @@ import (
 	"github.com/norvexlabs/stowage/internal/lint"
 	"github.com/norvexlabs/stowage/internal/registry"
 	"github.com/norvexlabs/stowage/internal/release"
+	"github.com/norvexlabs/stowage/internal/spec"
 	"github.com/norvexlabs/stowage/internal/truenas"
 	"github.com/norvexlabs/stowage/internal/tune"
 	"github.com/norvexlabs/stowage/internal/version"
@@ -35,6 +37,9 @@ type Platform struct {
 	Key, Label string
 	Formats    []string
 	ISO        bool
+	// Install: the disk is the installer ISO, which installs the OS on the machine's own disk
+	// (--device), the seed's install block saying which.
+	Install bool
 	// Tofu: `vm create` can create the VM with OpenTofu, with its built-in module (tofu/<Key>);
 	// Preview: that module has not run on the platform yet.
 	Tofu, Preview bool
@@ -67,6 +72,11 @@ var Platforms = []Platform{
 		"Convert the disk for a generation 2 VM and grow it: Convert-VHD %[1]s <name>.vhdx; Resize-VHD <name>.vhdx -SizeBytes %[3]dGB.",
 		"Create a generation 2 VM on <name>.vhdx, with Secure Boot's template \"Microsoft UEFI Certificate Authority\", and %[2]s in its DVD drive, then start it.",
 	}},
+	{Key: "metal", Label: "Bare metal (amd64)", Formats: []string{"iso"}, ISO: true, Install: true, Steps: []string{
+		"Write %[1]s to a USB stick, and %[2]s to another: dd if=<file> of=/dev/<stick> bs=4M conv=fsync (or any image writer).",
+		"Plug both into the server and boot it from the first, in UEFI mode with Secure Boot off: the installer wipes the --device disk (at least %[3]d GiB), installs the OS on it and powers the server off.",
+		"Take both sticks out, then power the server on: its first boot installs the release.",
+	}},
 	{Key: "azure", Label: "Microsoft Azure", Formats: []string{"vhd"}, Tofu: true, Preview: true, Steps: []string{
 		"Upload %[1]s as a page blob, and create a managed image from it (az image create --source <blob URL> --os-type Linux --hyper-v-generation V2).",
 		"Create the VM from that image with %[2]s as its custom data and a %[3]d GiB disk (az vm create --custom-data %[2]s --os-disk-size-gb %[3]d).",
@@ -97,6 +107,12 @@ type VMCreate struct {
 	DNS      []string
 	SSHAllow []string // CIDR: the sources SSH accepts; none is every source
 	Timezone string
+	// Interfaces are --interface's ROLE=SPEC: a host.interfaces NIC's addressing (dhcp, static with
+	// address=, none), its mac= and the platform's network it attaches to (attach=).
+	Interfaces []string
+	// Device is the disk the installer ISO installs the OS on, wiped (metal): a path under /dev/,
+	// or auto (Kairos's choice: the largest disk).
+	Device string
 	// TuneProfile is the operator's tuning profile, which the VM's boots apply and its first
 	// install records; empty is the release's.
 	TuneProfile string
@@ -221,6 +237,9 @@ func (in *Installer) CreateVM(ctx context.Context, c *VMCreate) error {
 	if tofu {
 		if files, declared, err = in.tofuVM(ctx, p, &c.TofuVM, mach.Hostname); err != nil {
 			return err
+		}
+		if len(mach.Interfaces) > 1 && !slices.ContainsFunc(declared, func(v moduleVar) bool { return v.Name == "nics" }) {
+			return fmt.Errorf("%s names %d NICs (host.interfaces), and the module declares no nics variable to attach them", in.R.Spec.Name, len(mach.Interfaces))
 		}
 		if state, err = o.stateDir(name, mach.Hostname); err != nil {
 			return err
@@ -370,6 +389,19 @@ func (in *Installer) CreateVM(ctx context.Context, c *VMCreate) error {
 	fmt.Fprintf(o.Out, "  The disk: %s.\n", in.diskSplit(format, app))
 	for n, s := range p.Steps {
 		fmt.Fprintf(o.Out, "  %d. %s\n", n+1, fmt.Sprintf(s, disk, seed, in.boot.diskGiB(format, app)))
+	}
+	if len(mach.Interfaces) > 1 {
+		fmt.Fprintf(o.Out, "  Its NICs, each with its MAC (the cloud-config names each by it):\n")
+		for _, i := range mach.Interfaces {
+			on := "the primary's network"
+			switch {
+			case i.Primary:
+				on = "the network of its default route"
+			case i.Attach != "":
+				on = i.Attach
+			}
+			fmt.Fprintf(o.Out, "    %s  %s  on %s\n", i.Role, i.MAC, on)
+		}
 	}
 	if st.AwaitSecrets {
 		fmt.Fprintf(o.Out, "\nIts first install waits for its secrets (the file `secrets export` wrote, decrypted), which the cloud-config never carries: %s\n", secretsSteps(mach.User, "<address>", ctl))
@@ -686,6 +718,146 @@ func checkUser(v string) error {
 	return nil
 }
 
+// devicePath is a disk's path the installer takes: under /dev/, of the characters udev's names use.
+var devicePath = regexp.MustCompile(`^/dev/[A-Za-z0-9][A-Za-z0-9_.:+@/=-]*$`)
+
+// checkDevice checks --device: auto, or a path under /dev/ with no "..".
+func checkDevice(v string) error {
+	if v == "auto" || devicePath.MatchString(v) && !strings.Contains(v, "..") {
+		return nil
+	}
+	return fmt.Errorf("--device %q: a disk's path under /dev/ (e.g. /dev/disk/by-id/nvme-…, /dev/sda), or auto", v)
+}
+
+// macAddr is a MAC address as networkd's and the platforms' files write it.
+var macAddr = regexp.MustCompile(`^[0-9a-f]{2}(:[0-9a-f]{2}){5}$`)
+
+// generatedMAC is a random, locally administered unicast MAC: two VMs of one host name on one
+// network never share one. Each run of vm create draws its own, written into its seed (and, with
+// OpenTofu, the module's variables, which every later apply of that state reuses): the NICs take
+// the MACs the run that wrote their seed gave.
+func generatedMAC() (string, error) {
+	b := make([]byte, 5)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("02:%02x:%02x:%02x:%02x:%02x", b[0], b[1], b[2], b[3], b[4]), nil
+}
+
+// unicastMAC reports whether mac (as macAddr reads it) is a unicast address, its first octet's
+// low bit clear, and not all zeros.
+func unicastMAC(mac string) bool {
+	first, err := strconv.ParseUint(mac[:2], 16, 8)
+	return err == nil && first&1 == 0 && mac != "00:00:00:00:00:00"
+}
+
+// machineInterfaces are the release's host.interfaces NICs on the machine p creates, from
+// --interface: each secondary's addressing (none by default: the link up, no address), each NIC's
+// MAC and the network it attaches to. A VM of one such NIC needs no MAC: it is named from the NIC
+// it has. Of more, each is named by its MAC: given, else generated on a hypervisor (which creates
+// the NICs with them). A server's are its own, given for each NIC (it may have more ports). A
+// cloud names its NICs' MACs itself: it takes one, and no MAC. Nil when the release declares none.
+func machineInterfaces(s *spec.Spec, given []string, p Platform) ([]MachineInterface, error) {
+	var roles []string
+	primary := ""
+	if s.Host != nil {
+		for _, r := range slices.Sorted(maps.Keys(s.Host.Interfaces)) {
+			if i := s.Host.Interfaces[r]; i.Kind == "" || i.Kind == spec.InterfaceNIC {
+				roles = append(roles, r)
+				if i.Primary {
+					primary = r
+				}
+			}
+		}
+	}
+	if len(roles) == 0 {
+		if len(given) > 0 {
+			return nil, fmt.Errorf("--interface: %s declares no NIC (host.interfaces)", s.Name)
+		}
+		return nil, nil
+	}
+	cloud := !p.ISO
+	if cloud && len(roles) > 1 {
+		return nil, fmt.Errorf("%s names its VMs' NICs itself, one here: %s declares %d (host.interfaces: %s)", p.Label, s.Name, len(roles), strings.Join(roles, ", "))
+	}
+	byRole := map[string]MachineInterface{}
+	for _, r := range roles {
+		byRole[r] = MachineInterface{Role: r, Primary: r == primary, Mode: IfaceNone}
+	}
+	set := map[string]bool{}
+	for _, g := range given {
+		role, rest, _ := strings.Cut(g, "=")
+		i, ok := byRole[role]
+		switch {
+		case !ok:
+			return nil, fmt.Errorf("--interface %s: %q is not one of %s's NICs (%s)", g, role, s.Name, strings.Join(roles, ", "))
+		case set[role]:
+			return nil, fmt.Errorf("--interface %s: given twice", role)
+		}
+		set[role] = true
+		for n, f := range strings.Split(rest, ",") {
+			k, val, kv := strings.Cut(f, "=")
+			switch {
+			case n == 0 && !kv && (f == IfaceDHCP || f == IfaceStatic || f == IfaceNone):
+				if i.Primary {
+					return nil, fmt.Errorf("--interface %s: the primary NIC's addressing is --network's", g)
+				}
+				i.Mode = f
+			case k == "address" && !i.Primary:
+				pfx, err := netip.ParsePrefix(val)
+				if err != nil || !pfx.Addr().Is4() || pfx.Bits() < 1 {
+					return nil, fmt.Errorf("--interface %s: address %q is not an IPv4 address with its prefix (192.0.2.10/24)", g, val)
+				}
+				i.Address = pfx.String()
+			case k == "mac":
+				if v := strings.ToLower(val); cloud {
+					return nil, fmt.Errorf("--interface %s: mac=: %s gives its VMs' NICs their MACs", g, p.Label)
+				} else if macAddr.MatchString(v) && unicastMAC(v) {
+					i.MAC = v
+				} else {
+					return nil, fmt.Errorf("--interface %s: mac %q is not a unicast MAC address (02:00:00:00:00:01)", g, val)
+				}
+			case k == "attach" && p.ISO && !p.Install:
+				if !hostNetName.MatchString(val) {
+					return nil, fmt.Errorf("--interface %s: attach %q: the platform's network or bridge, letters, digits and _ . : / -", g, val)
+				}
+				i.Attach = val
+			default:
+				return nil, fmt.Errorf("--interface %s: %q: dhcp, static or none (not the primary's), then address=A/P (static), mac=, attach= (a hypervisor's network)", g, f)
+			}
+		}
+		if (i.Mode == IfaceStatic) != (i.Address != "") {
+			return nil, fmt.Errorf("--interface %s: address= is the static mode's, and the static mode's address is required", g)
+		}
+		byRole[role] = i
+	}
+	out := make([]MachineInterface, 0, len(roles))
+	macs := map[string]string{}
+	for _, r := range roles {
+		i := byRole[r]
+		switch {
+		case i.MAC != "":
+		case p.Install:
+			return nil, fmt.Errorf("--interface %s=mac=…: a server names each NIC the release names (%s) by its MAC, as it may have more ports than those", r, strings.Join(roles, ", "))
+		case !cloud && len(roles) > 1:
+			mac, err := generatedMAC()
+			if err != nil {
+				return nil, err
+			}
+			i.MAC = mac
+		}
+		if other, dup := macs[i.MAC]; dup && i.MAC != "" {
+			return nil, fmt.Errorf("--interface: %s and %s have the MAC %s", other, r, i.MAC)
+		}
+		macs[i.MAC] = r
+		out = append(out, i)
+	}
+	return out, nil
+}
+
+// hostNetName is a platform's network or bridge name, as a module's variable takes it.
+var hostNetName = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9_.:/-]{0,63}$`)
+
 // sshKeyTypes are the public key types an authorized key may have.
 var sshKeyTypes = []string{"ssh-ed25519", "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384", "ecdsa-sha2-nistp521", "ssh-rsa",
 	"sk-ssh-ed25519@openssh.com", "sk-ecdsa-sha2-nistp256@openssh.com"}
@@ -742,7 +914,7 @@ func defaultUser(getenv func(string) string) string {
 // machine asks what the flags did not give of the VM's own settings, and checks them.
 func (in *Installer) machine(ctx context.Context, c *VMCreate, p Platform) (Machine, error) {
 	o := &in.O
-	given := map[string]string{"--hostname": c.Hostname, "--user": c.User, "--ssh-key": c.SSHKey, "--network": c.Network}
+	given := map[string]string{"--hostname": c.Hostname, "--user": c.User, "--ssh-key": c.SSHKey, "--network": c.Network, "--device": c.Device}
 	defaults := map[string]string{"--hostname": in.R.Spec.Name, "--user": defaultUser(o.getenv), "--ssh-key": defaultKey(o.getenv("HOME")), "--network": "dhcp"}
 	checkKey := func(v string) error { _, err := authorizedKey(v); return err }
 	checkNet := func(v string) error {
@@ -757,11 +929,23 @@ func (in *Installer) machine(ctx context.Context, c *VMCreate, p Platform) (Mach
 		{Title: "The administrator's SSH public key file", Key: "--ssh-key", Required: defaults["--ssh-key"] == "", Check: checkKey},
 		{Title: "Its network", Key: "--network", Choices: []Choice{{"dhcp", "DHCP"}, {"static", "A static address"}}},
 	}
+	switch {
+	case p.Install:
+		qs = append(qs, Question{Title: "The disk the OS installs on, wiped (a /dev/disk/by-id/ path names it whatever the boot order; auto: the largest disk)", Key: "--device", Required: true, Check: checkDevice})
+	case c.Device != "":
+		return Machine{}, fmt.Errorf("--device is for a platform whose installer installs the OS on a disk (metal), not %s: its disk image boots", p.Key)
+	}
 	a, err := in.askGiven(ctx, qs, given, defaults)
 	if err != nil {
 		return Machine{}, err
 	}
-	m := Machine{Hostname: a["--hostname"], User: a["--user"]}
+	m := Machine{Hostname: a["--hostname"], User: a["--user"], Install: a["--device"]}
+	if m.Interfaces, err = machineInterfaces(in.R.Spec, c.Interfaces, p); err != nil {
+		return Machine{}, err
+	}
+	if p.Install && m.Install == "" {
+		return Machine{}, errors.New("--device is required: the disk the OS installs on, wiped")
+	}
 	if a["--ssh-key"] == "" {
 		return Machine{}, errors.New("--ssh-key is required: the administrator's SSH public key file (no ~/.ssh/id_ed25519.pub, id_ecdsa.pub or id_rsa.pub)")
 	}
@@ -1027,6 +1211,16 @@ func (in *Installer) confirmVM(ctx context.Context, p Platform, format string, m
 	}
 	fmt.Fprintf(&b, "  host %s, administrator %s (%s key)\n", m.Hostname, m.User, strings.Fields(m.SSHKey)[0])
 	fmt.Fprintf(&b, "  network: %s\n", describeNet(&m.Net))
+	if m.Install != "" {
+		fmt.Fprintf(&b, "  the installer wipes %s, installs the OS on it and powers the machine off\n", m.Install)
+	}
+	for _, i := range m.Interfaces {
+		how := "the network above"
+		if !i.Primary {
+			how = cmp.Or(i.Address, i.Mode)
+		}
+		fmt.Fprintf(&b, "  interface %s: %s, %s\n", i.Role, cmp.Or(i.MAC, "the machine's NIC"), how)
+	}
 	ssh := "every source"
 	if len(m.SSHAllow) > 0 {
 		ssh = fmt.Sprint(m.SSHAllow)

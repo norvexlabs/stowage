@@ -41,6 +41,9 @@ type Host struct {
 	// Settings are the project's own kernel settings (host.sysctls), written after the profile's:
 	// none is a key a profile sets.
 	Settings []Sysctl
+	// Isolated are the CPUs of the services' whole cores that the NICs' interrupts and receive
+	// steering stay off (System.isolated).
+	Isolated []int
 }
 
 // Profile is how far the rules lean on the network. Both keep every value at the kernel's default
@@ -251,15 +254,10 @@ func (h Host) QueueFlows() uint64 {
 	return max(floorPow2(h.FlowEntries()/uint64(max(h.CPUs, 1))), 1)
 }
 
-// RPSMask is the CPU mask of every online CPU, as rps_cpus reads it: 32-bit hex groups, comma
-// separated.
+// RPSMask is the CPU mask of every online CPU the steering may use (steerCPUs), as rps_cpus reads
+// it: 32-bit hex groups, comma separated.
 func (h Host) RPSMask() string {
-	ids := h.Online
-	if len(ids) == 0 {
-		for i := range max(h.CPUs, 1) {
-			ids = append(ids, i)
-		}
-	}
+	ids := h.steerCPUs()
 	groups := make([]uint32, slices.Max(ids)/32+1)
 	for _, id := range ids {
 		groups[id/32] |= 1 << (id % 32)

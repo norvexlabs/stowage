@@ -1,5 +1,7 @@
 [Unit]
 Description={{.Name}}: load the release's images into Docker
+# The installer ISO boots this system live, to install it: no host of the stack.
+ConditionPathExists=!/run/cos/live_mode
 Requires=docker.service
 After=docker.service
 

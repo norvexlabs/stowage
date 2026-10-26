@@ -83,19 +83,20 @@ resource "libvirt_domain" "vm" {
         read_only = true
       },
     ]
-    interfaces = [
-      {
-        model = { type = "virtio" }
-        # A queue per vCPU, each on its own CPU in the guest, and the largest receive ring virtio
-        # offers: the guest's tuning grows its ring to it.
-        driver = { queues = var.cpus, rx_queue_size = 1024 }
-        source = {
-          network = { network = var.network }
-        }
-        # With DHCP the apply waits for the network's lease of an IPv4 address.
-        wait_for_ip = var.dhcp ? { timeout = 300, source = "lease", network = "0.0.0.0/0" } : null
-      },
-    ]
+    # The release's NICs, the primary first, each on its network (default var.network) with its
+    # MAC (default libvirt's); or one.
+    interfaces = [for i, n in(length(var.nics) > 0 ? var.nics : [{ role = "", mac = "", attach = "" }]) : {
+      model = { type = "virtio" }
+      # A queue per vCPU, each on its own CPU in the guest, and the largest receive ring virtio
+      # offers: the guest's tuning grows its ring to it.
+      driver = { queues = var.cpus, rx_queue_size = 1024 }
+      mac    = n.mac != "" ? { address = n.mac } : null
+      source = {
+        network = { network = n.attach != "" ? n.attach : var.network }
+      }
+      # With DHCP the apply waits for the network's lease of an IPv4 address, on the primary.
+      wait_for_ip = var.dhcp && i == 0 ? { timeout = 300, source = "lease", network = "0.0.0.0/0" } : null
+    }]
   }
 }
 

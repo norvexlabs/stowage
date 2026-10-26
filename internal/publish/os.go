@@ -254,7 +254,8 @@ func (p *Publisher) buildOS(ctx context.Context, o ShipOptions, a *artifact, ima
 	}
 	params := kairos.Params{Name: p.Project.Spec.Name, Ctl: providers.Ctl(p.Project.Spec.Short()), Base: k.Base, KairosInit: k.KairosInit, OSVersion: ov}
 	if h := p.Project.Spec.Host; h != nil {
-		params.Modules, params.Packages, params.KernelArgs = h.Modules, h.Packages, h.KernelArgs
+		params.Modules, params.Packages, params.Firmware, params.KernelArgs = h.Modules, h.Packages, h.Firmware, h.KernelArgs
+		params.Interfaces = h.Interfaces
 	}
 	dir, err := os.MkdirTemp(p.WorkDir, "os-")
 	if err != nil {

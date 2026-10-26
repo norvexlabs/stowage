@@ -891,10 +891,19 @@ func TestAnUpgradeToAReleaseNamingHostAPIGeneratesItsToken(t *testing.T) {
 type nftHost struct {
 	ran [][]string
 	err error
+	// listErr fails `nft list`; failOn fails a command whose last argument ends with it.
+	listErr error
+	failOn  string
 }
 
 func (h *nftHost) Run(_ context.Context, c Cmd) ([]byte, error) {
 	h.ran = append(h.ran, c.Args)
+	switch {
+	case len(c.Args) > 1 && c.Args[1] == "list":
+		return nil, h.listErr
+	case h.failOn != "" && strings.HasSuffix(c.Args[len(c.Args)-1], h.failOn):
+		return nil, errors.New("syntax error")
+	}
 	return nil, h.err
 }
 
@@ -1176,5 +1185,90 @@ func TestTheFirstBootTakesTheReleasesOSFirst(t *testing.T) {
 	same := settings(t, "tls: internal\nrelease:\n  version: 1.0.0\n  revision: 1\n  tag: 1.0.0\n  os: "+os1+"\ninputs:\n  APP_DOMAIN: app.example.org\n  API_DOMAIN: api.example.org\n")
 	if err := e.installer(same).Boot(context.Background()); err != nil {
 		t.Fatalf("own OS: %v\n%s", err, e.log)
+	}
+}
+
+// The front, and an L4 route, on a host.interfaces role are opened on that interface alone.
+func TestThePortsOfAnInterfaceAreOpenedOnItAlone(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	host := &nftHost{}
+	r, _ := testInstallerWith(t, "1.0.0", func(s *spec.Spec) {
+		s.Front.Interface = "uplink"
+		s.L4.Routes = []spec.L4Route{
+			{Name: "db", Protocol: "tcp", Port: 5432, Upstream: "postgres:5432"},
+			{Name: "feed", Protocol: "udp", Port: 17007, Upstream: "api:17007", AllowInput: "FEED_SOURCES", Interface: "edge"},
+		}
+	})
+	in := &Installer{R: r, O: Options{Dir: t.TempDir(), Firewall: filepath.Join(t.TempDir(), "nftables.d"), Host: host}}
+	env := NewEnvFile()
+	env.Set("STOWAGE_TLS_MODE", "internal")
+	env.Set(HTTPPortVar, "80")
+	env.Set(HTTPSPortVar, "443")
+	env.Set("FEED_SOURCES", "192.0.2.7")
+	if err := in.openPorts(ctx, env, hostNet{}); err != nil {
+		t.Fatal(err)
+	}
+	b, _ := os.ReadFile(filepath.Join(in.O.Firewall, "notes-ports.nft"))
+	for _, want := range []string{"\niifname \"uplink\" tcp dport { 80, 443 } accept\n", "\ntcp dport 5432 accept\n", "\niifname \"edge\" udp dport 17007 ip saddr { 192.0.2.7/32 } accept\n"} {
+		if !strings.Contains(string(b), want) {
+			t.Errorf("no %q in:\n%s", want, b)
+		}
+	}
+}
+
+// A VM made by a release that named no NIC has none named by its role: after an upgrade to one
+// that names them, a port on a NIC role keeps its match, which no interface meets (fail closed),
+// warned; the network override keeps matching what the VM's cloud-config named.
+func TestARoleWithoutItsNICFailsClosed(t *testing.T) {
+	dir := t.TempDir()
+	saved := networkdDir
+	networkdDir = dir
+	t.Cleanup(func() { networkdDir = saved })
+	if err := os.WriteFile(filepath.Join(dir, "10-notes-uplink.link"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	host := &nftHost{}
+	r, _ := testInstallerWith(t, "1.0.0", func(s *spec.Spec) {
+		s.Host = &spec.Host{Interfaces: map[string]spec.HostInterface{"uplink": {Primary: true}, "edge": {}, "vpn0": {Kind: spec.InterfaceTUN}}}
+		s.Front.Interface = "uplink"
+		s.L4.Routes = []spec.L4Route{
+			{Name: "feed", Protocol: "udp", Port: 17007, Upstream: "api:17007", Interface: "edge"},
+			{Name: "peer", Protocol: "udp", Port: 17008, Upstream: "api:17008", Interface: "vpn0"},
+		}
+	})
+	var log bytes.Buffer
+	in := &Installer{R: r, O: Options{Dir: t.TempDir(), Firewall: filepath.Join(t.TempDir(), "nftables.d"), Host: host, Log: &log}}
+	env := NewEnvFile()
+	env.Set("STOWAGE_TLS_MODE", "internal")
+	env.Set(HTTPPortVar, "80")
+	env.Set(HTTPSPortVar, "443")
+	if err := in.openPorts(ctx, env, hostNet{}); err != nil {
+		t.Fatal(err)
+	}
+	b, _ := os.ReadFile(filepath.Join(in.O.Firewall, "notes-ports.nft"))
+	for _, want := range []string{"\niifname \"uplink\" tcp dport { 80, 443 } accept\n", "\niifname \"edge\" udp dport 17007 accept\n", "\niifname \"vpn0\" udp dport 17008 accept\n"} {
+		if !strings.Contains(string(b), want) {
+			t.Errorf("no %q in:\n%s", want, b)
+		}
+	}
+	if !strings.Contains(log.String(), "warning: no NIC of this VM is named edge") || strings.Contains(log.String(), "named uplink") || strings.Contains(log.String(), "named vpn0") {
+		t.Errorf("log %q", log.String())
+	}
+	if got := seedMatch(dir, "notes"); got != "Name=uplink" {
+		t.Errorf("no seed file, one .link: %s", got)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "10-notes-edge.link"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := seedMatch(dir, "notes"); got != "Name=en* eth*" {
+		t.Errorf("no seed file, two .links: %s", got)
+	}
+	if err := os.WriteFile(filepath.Join(dir, staticUnit("notes")), []byte("[Match]\nName=uplink\n\n[Network]\nDHCP=ipv4\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := seedMatch(dir, "notes"); got != "Name=uplink" {
+		t.Errorf("the seed's: %s", got)
 	}
 }

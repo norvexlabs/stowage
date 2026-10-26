@@ -21,7 +21,7 @@ set -euo pipefail
 
 # The amd64 image of the example's postgres, as e2e-docker.
 PG=postgres:17-alpine@sha256:aa90e97ee862e558111d34cfb8b2c4bec768c2b039fb791341686928560263b3
-FORMATS=(raw qcow2 ova vhd gce)
+FORMATS=(raw qcow2 ova vhd gce iso)
 . "$(dirname "$0")/lib.sh"
 command -v zstd >/dev/null || fail "zstd is needed (the disks are checked decompressed)"
 
@@ -70,7 +70,7 @@ start_zot
 
 step "project, with the kairos shape, two disk formats and three clouds"
 KAIROS=1 new_project "$PG"
-sed -i 's/disk_formats: \[qcow2\]/disk_formats: [qcow2, ova]\n    cloud_publish: [aws, azure, gcp]/' "$P/stowage.yaml"
+sed -i 's/disk_formats: \[qcow2\]/disk_formats: [qcow2, ova, iso]\n    cloud_publish: [aws, azure, gcp]/' "$P/stowage.yaml"
 grep -q 'cloud_publish: \[aws, azure, gcp\]' "$P/stowage.yaml" || fail "disk formats not set"
 # The disk-pressure hook at 1%: the host daemon posts as it starts (the api answers 501, and logs it).
 sed -i 's|^    env: \[ADMIN_EMAIL\]$|&\n  maintenance:\n    disk_pressure: { soft_pct: 1, hard_pct: 99, post: "http://api:8000/maintenance/disk-pressure", auth_secret: SESSION_SECRET }|' "$P/stowage.yaml"
@@ -80,11 +80,11 @@ grep -q 'disk_pressure: { soft_pct: 1,' "$P/stowage.yaml" || fail "disk pressure
 step "ship beta: images, the OS bundle, its disks"
 "${S[@]}" ship --channel beta --disks 2>"$WORK/ship1.log" || { tail -50 "$WORK/ship1.log"; fail "ship"; }
 grep -q 'os bundle: build 1.0.0' "$WORK/ship1.log" || fail "the bundle was not built"
-grep -q 'disks: make raw, qcow2, ova, vhd, gce' "$WORK/ship1.log" || fail "the disks were not made"
+grep -q 'disks: make raw, qcow2, ova, vhd, gce, iso' "$WORK/ship1.log" || fail "the disks were not made"
 for f in "${FORMATS[@]}"; do
 	grep -q "disk $f: tag .* → beta-1.0.0-$f" "$WORK/ship1.log" || fail "disk $f was not tagged"
 done
-[[ $(grep -c '^signed ' "$WORK/ship1.log") == 17 ]] || { grep '^signed ' "$WORK/ship1.log"; fail "want 17 signatures (9, the scanner, the bundle, 5 disks, the channel's disk set)"; }
+[[ $(grep -c '^signed ' "$WORK/ship1.log") == 18 ]] || { grep '^signed ' "$WORK/ship1.log"; fail "want 18 signatures (9, the scanner, the bundle, 6 disks, the channel's disk set)"; }
 grep -q "^attested the SBOM of $REG/notes/notes-os@" "$WORK/ship1.log" || { grep '^attested ' "$WORK/ship1.log"; fail "the OS bundle's SBOM was not attested"; }
 for c in "${CLOUDS[@]}"; do
 	if [[ -n ${!CLOUD_KEY[$c]:-} ]]; then
@@ -267,6 +267,11 @@ PY
 run_tools sh -c 'od -An -c -j 512 -N 8 notes-1.0.0.raw' | tr -d ' ' | grep -q 'EFIPART' || fail "the raw disk has no GPT"
 tar tf "$WORK/disks/notes-1.0.0.ova" >"$WORK/ova.txt"
 [[ $(cat "$WORK/ova.txt") == $'notes-1.0.0.ovf\nnotes-1.0.0-disk1.vmdk' ]] || { cat "$WORK/ova.txt"; fail "the OVA is not the descriptor then the disk"; }
+# The installer ISO boots (El Torito) and embeds the raw disk's state partition and the screen's
+# console, for the installer to lay out on a machine's disk.
+isoinfo -d -i "$WORK/disks/notes-1.0.0.iso" | grep -q 'El Torito' || fail "the installer ISO does not boot"
+7z e -so "$WORK/disks/notes-1.0.0.iso" config.yaml >"$WORK/iso-config.yaml" 2>/dev/null || fail "the installer ISO embeds no config.yaml"
+grep -qE '^ +size: [0-9]+$' "$WORK/iso-config.yaml" && grep -qE '^ +extra_cmdline: "?console=tty1"?$' "$WORK/iso-config.yaml" || { cat "$WORK/iso-config.yaml"; fail "the installer's config lacks the state partition's size or the console"; }
 rm -rf "$WORK/disks"
 
 step "ship beta again (nothing is built)"
@@ -338,7 +343,7 @@ expect_code 200 "${pull_auth[@]}" -H "$ACCEPT" "http://$REG/v2/notes/notes-disk/
 env -u STOWAGE_PUSH_TOKEN "${S[@]}" verify --channel stable
 
 step "ship 2.0.0 (a migration); booting its notes-stow upgrades the install"
-sed -i 's/disk_formats: \[qcow2, ova\]/disk_formats: [qcow2]/; /cloud_publish:/d' "$P/stowage.yaml"
+sed -i 's/disk_formats: \[qcow2, ova, iso\]/disk_formats: [qcow2]/; /cloud_publish:/d' "$P/stowage.yaml"
 grep -q 'disk_formats: \[qcow2\]$' "$P/stowage.yaml" && ! grep -q cloud_publish "$P/stowage.yaml" || fail "disk formats not reset"
 printf '2.0.0\n' >"$P/VERSION"
 printf '### Changed\n- Release 2.0.0.\n' >"$P/changes/2.0.0.md"

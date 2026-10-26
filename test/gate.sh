@@ -82,6 +82,8 @@ for f in "${changed[@]}"; do
 		need smoke-install "$f"
 		lifecycle "$f"
 		vm_side "$f"
+		# A machine's creation and its seed: bare metal's is examples/full's (its installer).
+		[[ $f == internal/install/vmcreate*.go || $f == internal/install/seed*.go ]] && need e2e-full-vm "$f"
 		;;
 	internal/install/audit.go) # the Docker host's audit, and the VM's scanner (preloaded, or pulled)
 		need smoke-install "$f"
@@ -92,6 +94,12 @@ for f in "${changed[@]}"; do
 		need smoke-install "$f"
 		lifecycle "$f"
 		need e2e-kairos "$f"
+		;;
+	# A service's nftables table, its address of its own and its cores: examples/full's on its machine.
+	internal/install/nftables*.go | internal/install/ipvlan*.go | internal/install/cpus*.go)
+		need smoke-install "$f"
+		lifecycle "$f"
+		need e2e-full-vm "$f"
 		;;
 	internal/install/* | internal/payload/* | cmd/stowage-install/*)
 		need smoke-install "$f"
@@ -117,9 +125,10 @@ for f in "${changed[@]}"; do
 		;;
 	# The host's tuning: the Docker host's report and apply, the VM's boot (e2e-vm's project declares
 	# a kernel argument and a package); the project's modules on examples/full's VM, and its
-	# settings and power posture (host.go) there too.
+	# settings, power posture (host.go), firmware (packages.go), interfaces and their ethtool
+	# settings, and the services' cores there too.
 	internal/tune/modules.go) need e2e-full-vm "$f" ;;
-	internal/tune/host.go)
+	internal/tune/host.go | internal/tune/packages.go | internal/tune/interfaces.go | internal/tune/ethtool.go | internal/tune/cores.go)
 		lifecycle "$f"
 		need e2e-vm "$f"
 		need e2e-full-vm "$f"
@@ -127,6 +136,11 @@ for f in "${changed[@]}"; do
 	internal/tune/*)
 		lifecycle "$f"
 		need e2e-vm "$f"
+		;;
+	# The installer ISO is made with the disks, and boots examples/full's bare-metal machine.
+	internal/kairos/disks.go)
+		need e2e-kairos "$f"
+		need e2e-full-vm "$f"
 		;;
 	internal/kairos/* | internal/graph/*) need e2e-kairos "$f" ;;
 	internal/truenas/*) need e2e-vm "$f" ;;
@@ -174,7 +188,7 @@ for f in "${changed[@]}"; do
 	test/e2e-full-k8s.sh) need e2e-full-k8s "$f" ;;
 	test/e2e-kairos.sh) need e2e-kairos "$f" ;;
 	test/e2e-vm.sh) need e2e-vm "$f" ;;
-	test/e2e-full-vm.sh | test/vm.sh) need e2e-full-vm "$f" ;;
+	test/e2e-full-vm.sh | test/vm.sh | test/metal-truenas/*) need e2e-full-vm "$f" ;;
 	test/lib.sh | test/pins.sh | test/sweep.sh) # shared by every suite; the short ones exercise it
 		need e2e "$f"
 		lifecycle "$f"

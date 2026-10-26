@@ -76,7 +76,7 @@ func TestTheVMRunsTheL4RoutesServicesOnTheHostsNetwork(t *testing.T) {
 	if !strings.Contains(log.String(), "echo (an L4 route's, on the host's network) depends on migrate, which exposes no port it can be published on: it cannot reach migrate by name (give migrate's ports in its expose:)") {
 		t.Errorf("log %q", log)
 	}
-	raw, err := contentCompose(m, nil, []byte("key"), tune.Container{Sysctls: map[string]string{"net.core.somaxconn": "4096"}}, memoryPlan{}, hn)
+	raw, err := contentCompose(m, nil, []byte("key"), tune.Container{Sysctls: map[string]string{"net.core.somaxconn": "4096"}}, hostPlan{}, hn)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -129,7 +129,7 @@ func TestDockerRunsTheL4RoutesServicesOnTheStacksNetwork(t *testing.T) {
 	if err != nil || hn.targets != nil || hn.bridged() != nil {
 		t.Fatalf("%+v %v", hn, err)
 	}
-	raw, err := contentCompose(m, nil, []byte("key"), tune.Container{}, memoryPlan{}, hn)
+	raw, err := contentCompose(m, nil, []byte("key"), tune.Container{}, hostPlan{}, hn)
 	if err != nil || strings.Contains(string(raw), "network_mode") || strings.Contains(string(raw), "extra_hosts") || string(raw) != contentPlaceholder {
 		t.Errorf("%s %v", raw, err)
 	}

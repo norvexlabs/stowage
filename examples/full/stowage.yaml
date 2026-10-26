@@ -39,8 +39,13 @@ images:
 
 stack:
   compose: deploy/compose.yaml
-  memory:
-    shares: { postgres: { percent: 25, max: 16G }, api: 10 }   # percent of the host's RAM, recomputed at each start; postgres's capped at 16 GiB
+
+services:                                                      # what a compose service asks of the host, beyond its compose file
+  postgres: { memory: { percent: 25, max: 16G } }              # percent of the host's RAM, recomputed at each start, capped at 16 GiB
+  api: { memory: 10 }
+  echo: { cpus: 1, irq: on }                                   # a whole core of its own, the NICs' interrupts on it too
+  ingest: { nftables: deploy/ingest.nft }                      # its own nftables table, loaded on the VM
+  relay: { interface: edge, address_input: RELAY_ADDRESS }     # an address of its own on the edge NIC (an ipvlan network)
 
 tune:
   profile: network   # a heavy network load: the hosts are tuned for it (default: Docker's path alone)
@@ -52,6 +57,17 @@ host:                                                          # written into th
     overlay: { options: { redirect_always_follow: "Y" }, reason: "Docker's storage: the kernel's default, stated" }
   packages:                                                    # installed after the OS bundle's own
     tcpdump: { reason: "capture on the VM's interfaces" }
+  firmware:                                                    # under /lib/firmware: the build fails without it
+    intel/ice/ddp/ice.pkg: { reason: "the E810's DDP package: without it ice runs in safe mode, one queue a port" }
+  interfaces:                                                  # by role, the interface's name; vm create gives each its NIC
+    uplink: { primary: true, reason: "the default route: the clients of the front, the registry, SSH" }
+    edge:                                                      # the probes' side, whose marked packets are delivered here
+      mtu: 1500
+      routing_policy_rules: [{ FirewallMark: "0x1", Table: "100" }]
+      routes: [{ Type: local, Destination: 0.0.0.0/0, Table: "100" }]
+      ethtool: { channels: { combined: max }, features: { rx-gro-list: "off" } }   # over the tune profile's
+      reason: "the probes' network, which the UDP echo answers on alone"
+    vpn0: { kind: tun, routes: [{ Destination: 10.99.0.0/24 }], reason: "a tunnel to the relay's peers, which a service opens" }
   kernel_args:                                                 # the OS bundle's boot; tune reports what differs
     iommu: { value: pt, reason: "the NICs' DMA passed through, not translated" }
   sysctls:                                                     # beyond the tune profile's, written at each boot
@@ -60,6 +76,7 @@ host:                                                          # written into th
 
 front:
   tls_modes: [acme, dns-cloudflare, byo, internal, none]
+  interface: uplink                                            # the VM's firewall opens the front's ports there alone
   routes:
     - name: console
       domain_input: CONSOLE_DOMAIN
@@ -91,7 +108,7 @@ front:
 l4:
   routes:
     - { name: echo,     protocol: tcp, port: 17007, upstream: echo:17007, address_input: ECHO_ADDRESS, bind_input: ECHO_BIND }
-    - { name: echo-udp, protocol: udp, port: 17007, upstream: echo:17007, allow_input: ECHO_SOURCES }   # the VM's firewall
+    - { name: echo-udp, protocol: udp, port: 17007, upstream: echo:17007, allow_input: ECHO_SOURCES, interface: edge }   # the VM's firewall
 
 health:
   provider: http-json
@@ -150,6 +167,7 @@ inputs:
   - { key: ECHO_BIND,         prompt: "Host address the TCP echo is published on (every address when empty)", advanced: true, shapes: [docker, kairos] }
   - { key: ECHO_SOURCES,      prompt: "Sources (addresses, CIDRs) the VM lets reach the UDP echo", default: "0.0.0.0/0 ::/0", shapes: [kairos] }
   - { key: RELAY_SOURCE,      prompt: "Event source the relay forwards (empty: no relay)", optional: true, profile: relay, shapes: [docker, kairos] }
+  - { key: RELAY_ADDRESS,     prompt: "Address the relay has of its own on the edge network (empty: none)", optional: true, advanced: true, shapes: [docker, kairos] }
   # Kubernetes: the database is external or embedded by the chart's postgres.mode value
   # (embedded: these two URLs are left empty).
   - { key: DATABASE_URL,      prompt: "Migration database URL (external Postgres)", secret: true, optional: true, shapes: [kubernetes] }
@@ -196,7 +214,7 @@ shapes:
   kairos:
     base: ubuntu:26.04@sha256:c098726dd9b9733f3e885f8de0ef375206a311b0a317eadc40d347b1115fb944
     kairos_init: quay.io/kairos/kairos-init:v4.4.0-rc2@sha256:ac885c9f3002a3f0e7000947e3d1e2a5c95f5e2d0212d5f9bbd663347f1ebe0c
-    disk_formats: [raw, qcow2, ova, vhd, gce]
+    disk_formats: [raw, qcow2, ova, vhd, gce, iso]
     cloud_publish: [aws, azure, gcp]
     health_gate: { deadline_s: 600, deadline_after_reset_s: 1800, poll_s: 30 }
     host_api: [api]

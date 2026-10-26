@@ -15,6 +15,8 @@ import (
 	"github.com/diskfs/go-diskfs/backend/file"
 	"github.com/diskfs/go-diskfs/filesystem/iso9660"
 	"go.yaml.in/yaml/v3"
+
+	"github.com/norvexlabs/stowage/internal/kairos"
 )
 
 // Machine is a VM's own settings, which its cloud-config gives: its name, its administrator and
@@ -36,6 +38,78 @@ type Machine struct {
 	// HostKey is a one-time SSH host key (an OpenSSH private key) the VM serves until its first
 	// install, which `vm create --secrets` pins to send the secrets; nil for none.
 	HostKey []byte
+	// Interfaces are the release's host.interfaces NICs as this machine has them, sorted by role,
+	// the primary's addressing Net; none when the release declares none (one NIC, matched by name).
+	Interfaces []MachineInterface
+	// Install is the disk the installer ISO installs the OS on (`vm create --platform metal`): a
+	// device path, or auto (Kairos's: the largest disk); empty for a disk image the machine boots.
+	Install string
+}
+
+// MachineInterface is one of the release's host.interfaces NICs on a machine: the MAC its role is
+// named from, and a secondary NIC's addressing.
+type MachineInterface struct {
+	Role string
+	// MAC is the NIC's; empty, the machine's only NIC the release declares, named from whichever
+	// NIC the machine has (an accelerated networking's virtual function left out).
+	MAC string
+	// Attach is the platform's network the NIC attaches to (OpenTofu: TrueNAS's bridge, libvirt's
+	// network, …); empty, the primary's.
+	Attach string
+	// Primary: its addressing is the machine's Net. Else Mode is dhcp (an address, never the
+	// default route nor the DNS servers), static (Address, with its prefix) or none (the link up,
+	// no address: the stack's own rules use it).
+	Primary       bool
+	Mode, Address string
+}
+
+// The modes of a secondary interface.
+const (
+	IfaceDHCP   = "dhcp"
+	IfaceStatic = "static"
+	IfaceNone   = "none"
+)
+
+// interfaceLink is the networkd .link file naming i's NIC by its role: by MAC, or the only NIC's
+// original name (an accelerated networking's virtual function, bonded under it, left out).
+func interfaceLink(name string, i MachineInterface) string {
+	match := "MACAddress=" + i.MAC
+	if i.MAC == "" {
+		match = "OriginalName=en* eth*\nDriver=!mlx4_core mlx5_core mana"
+	}
+	return fmt.Sprintf("# %s's interface %s (host.interfaces), named at every boot.\n[Match]\n%s\n\n[Link]\nName=%s\n", name, i.Role, match, i.Role)
+}
+
+// secondarySections is a secondary NIC's addressing: never the default route's, the DNS servers'
+// nor the host name's, and the boot waits for none of them.
+func secondarySections(i MachineInterface) string {
+	var b strings.Builder
+	b.WriteString("[Network]\n")
+	switch i.Mode {
+	case IfaceDHCP:
+		b.WriteString("DHCP=ipv4\n")
+	case IfaceStatic:
+		fmt.Fprintf(&b, "Address=%s\n", i.Address)
+	default:
+		b.WriteString("ConfigureWithoutCarrier=yes\n")
+	}
+	b.WriteString("LinkLocalAddressing=no\nIPv6AcceptRA=no\n")
+	if i.Mode == IfaceDHCP {
+		// The host's name is the primary's: a DHCP server registering names maps it there alone.
+		b.WriteString("\n[DHCPv4]\nUseGateway=no\nUseRoutes=no\nUseDNS=no\nSendHostname=no\n")
+	}
+	b.WriteString("\n[Link]\nRequiredForOnline=no\n")
+	return b.String()
+}
+
+// renameScript names i's NIC its role now, when the boot named it before its .link file was
+// written (the first boot): down, renamed, up. A NIC named so already is left.
+func renameScript(i MachineInterface) string {
+	find := `i=$(ip -o route show default | awk '{for (n = 1; n < NF; n++) if ($n == "dev") {print $(n+1); exit}}')`
+	if i.MAC != "" {
+		find = fmt.Sprintf(`i=$(for d in /sys/class/net/*; do [ "$(cat "$d/address")" = %s ] && basename "$d"; done | head -n1)`, i.MAC)
+	}
+	return fmt.Sprintf(`%s; [ -z "$i" ] || [ "$i" = %[2]s ] || { ip link set dev "$i" down && ip link set dev "$i" name %[2]s && ip link set dev %[2]s up; }`, find, i.Role)
 }
 
 // staticAddr is the VM's static IPv4 address, without its prefix; empty with DHCP.
@@ -68,8 +142,29 @@ func connectIssue(m Machine, ctl string) string {
 
 // The cloud-config Kairos reads (yip's stages): written at every boot, as /etc is not kept.
 type cloudConfig struct {
-	Stages map[string][]stage `yaml:"stages"`
+	Install *cloudInstall      `yaml:"install,omitempty"`
+	Stages  map[string][]stage `yaml:"stages"`
 }
+
+// cloudInstall is Kairos's automated install from its installer ISO, merged with the ISO's own
+// (the partitions' sizes, the console). It powers the machine off once installed, so the
+// installer's medium cannot boot again; the cloud-config it ran with is kept as the installed
+// system's first-boot user-data (/oem/95_userdata, the seed's after-install-chroot stage), so no
+// boot pulls the seed again and its stages run once a boot.
+type cloudInstall struct {
+	Auto     bool   `yaml:"auto"`
+	Device   string `yaml:"device"`
+	Poweroff bool   `yaml:"poweroff"`
+}
+
+// afterInstallMove moves the cloud-config the installer kept (one 9N_custom.yaml a source it read,
+// 90 the first) into 95_userdata, the first as its userdata.yaml; the stage fails without one.
+const afterInstallMove = `set -e; ls /oem/9[0-9]_custom.yaml >/dev/null; mkdir -p /oem/95_userdata; ` +
+	`for f in /oem/9[0-9]_custom.yaml; do n=$(basename "$f"); [ "$n" = 90_custom.yaml ] && n=userdata.yaml; mv -f "$f" "/oem/95_userdata/$n"; done`
+
+// notLive is the test of a stage that runs on the installed system only: the installer ISO boots
+// the OS live, with the seed, to install it.
+const notLive = "[ ! -e /run/cos/live_mode ]"
 
 type stage struct {
 	Name     string               `yaml:"name"`
@@ -170,15 +265,35 @@ func UserData(name, ctl string, m Machine, st Settings, ca []byte) ([]byte, erro
 	if err != nil {
 		return nil, err
 	}
+	match := everyNIC
+	var links, secondaries []cloudFile
+	var renames []string
+	for _, i := range m.Interfaces {
+		links = append(links, cloudFile{Path: "/etc/systemd/network/" + kairos.InterfaceLink(name, i.Role), Permissions: 0o644, Content: interfaceLink(name, i)})
+		renames = append(renames, renameScript(i))
+		if i.Primary {
+			match = "Name=" + i.Role
+			continue
+		}
+		secondaries = append(secondaries, cloudFile{Path: "/etc/systemd/network/" + kairos.InterfaceUnit(name, i.Role), Permissions: 0o644,
+			Content: "[Match]\nName=" + i.Role + "\n\n" + secondarySections(i)})
+	}
+	if len(m.Interfaces) > 0 {
+		boot = append(boot, stage{
+			// A step of its own, before the network's: its files match the NICs by their roles.
+			Name:     name + ": the interfaces named by their roles",
+			Commands: renames,
+		})
+	}
 	boot = append(boot, stage{
 		Name: name + ": the network",
-		Files: []cloudFile{
+		Files: append([]cloudFile{
 			// 05- sorts before Kairos's 20-dhcp.network, and after the override `network set`
 			// makes: networkd takes the first file that matches.
-			{Path: "/etc/systemd/network/" + staticUnit(name), Permissions: 0o644, Content: "[Match]\nName=en* eth*\n\n" + networkSections(m.Net)},
+			{Path: "/etc/systemd/network/" + staticUnit(name), Permissions: 0o644, Content: "[Match]\n" + match + "\n\n" + networkSections(m.Net)},
 			// The same network as data, for the host daemon to answer what the install set.
 			{Path: InstallNetworkFile(name), Permissions: 0o644, Content: string(netYAML)},
-		},
+		}, secondaries...),
 		Commands: []string{"networkctl reload"},
 	})
 	if m.HostKey != nil {
@@ -205,7 +320,29 @@ func UserData(name, ctl string, m Machine, st Settings, ca []byte) ([]byte, erro
 	// The host name is set in the initramfs stage, before networkd starts: its DHCP request then
 	// carries it, and a DHCP server registering names registers this one.
 	initramfs := []stage{{Name: name + ": the host name", Hostname: m.Hostname}}
-	out, err := yaml.Marshal(cloudConfig{Stages: map[string][]stage{"initramfs": initramfs, "boot": boot}})
+	if len(links) > 0 {
+		// Before the booted system's udev names the NICs: each by its role from then on.
+		initramfs = append(initramfs, stage{Name: name + ": the interfaces' names", Files: links})
+	}
+	cc := cloudConfig{Stages: map[string][]stage{"initramfs": initramfs, "boot": boot}}
+	for _, ss := range cc.Stages {
+		for i := range ss {
+			ss[i].If = strings.TrimSuffix(notLive+" && "+ss[i].If, " && ")
+		}
+	}
+	if m.Install != "" {
+		cc.Install = &cloudInstall{Auto: true, Device: m.Install, Poweroff: true}
+		// The installer keeps the cloud-config it ran with as the installed system's 90_custom.yaml;
+		// as 95_userdata (the directory a datasource fills, its userdata.yaml) it is the first
+		// boot's cloud-config kept, as on a VM: no boot pulls the seed again, its medium left in or
+		// not, nor runs its stages twice. The chroot's stage sees the installed system's OEM
+		// partition as /oem (the installer's own mounts it under /run/cos/oem).
+		cc.Stages["after-install-chroot"] = []stage{{
+			Name:     name + ": the cloud-config kept as the user-data the first boot pulled",
+			Commands: []string{afterInstallMove},
+		}}
+	}
+	out, err := yaml.Marshal(cc)
 	if err != nil {
 		return nil, err
 	}

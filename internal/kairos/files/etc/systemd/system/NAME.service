@@ -1,5 +1,7 @@
 [Unit]
 Description={{.Name}}: bring the install up with this OS's release (upgrade to it, or go back to it)
+# The installer ISO boots this system live, to install it: no host of the stack.
+ConditionPathExists=!/run/cos/live_mode
 Requires=docker.service {{.Name}}-preload.service
 # After the cloud-config's boot and network stages, which write the first install's settings.
 After=docker.service {{.Name}}-preload.service {{.Name}}-expand.service network-online.target cos-setup-boot.service cos-setup-network.service

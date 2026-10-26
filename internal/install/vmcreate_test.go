@@ -231,6 +231,71 @@ func TestVMCreateWritesTheDiskTheSeedAndTheSteps(t *testing.T) {
 	}
 }
 
+// Bare metal: the installer ISO and a seed whose install block names the disk, which the machine
+// is powered off after; the installer's copy of the cloud-config kept as the first boot's, and
+// every other stage skipped by the installer's live system. The disk must be named, and only
+// there.
+func TestVMCreateOnMetalWritesTheInstallerAndItsDisk(t *testing.T) {
+	t.Parallel()
+	set := func(o *Options) {
+		o.TLS, o.Set = "internal", map[string]string{"APP_DOMAIN": "app.example.org", "API_DOMAIN": "api.example.org"}
+	}
+	v := newVMCreate(t, "iso")
+	if err := v.create(VMCreate{Platform: "metal", Hostname: "notes-1", User: "ops", Device: "/dev/disk/by-id/nvme-Samsung_SSD_990_S7"}, set); err != nil {
+		t.Fatalf("%v\n%s", err, v.log)
+	}
+	if disk, _ := os.ReadFile(filepath.Join(v.out, "notes-1.0.0.iso")); !bytes.Equal(disk, v.disks["iso"]) {
+		t.Errorf("installer %q", disk)
+	}
+	ud, _, _ := readSeed(t, filepath.Join(v.out, "notes-1-seed.iso"))
+	_, cc := cloudSettings(t, ud)
+	if cc.Install == nil || *cc.Install != (cloudInstall{Auto: true, Device: "/dev/disk/by-id/nvme-Samsung_SSD_990_S7", Poweroff: true}) {
+		t.Errorf("install block %+v", cc.Install)
+	}
+	if ai := cc.Stages["after-install-chroot"]; len(ai) != 1 || ai[0].If != "" || !slices.Equal(ai[0].Commands, []string{afterInstallMove}) {
+		t.Errorf("after-install %+v", ai)
+	}
+	for _, at := range []string{"initramfs", "boot"} {
+		for _, st := range cc.Stages[at] {
+			if !strings.HasPrefix(st.If, notLive) {
+				t.Errorf("%s step %q runs in the installer: if %q", at, st.Name, st.If)
+			}
+		}
+	}
+	for _, s := range []string{"On Bare metal (amd64):", "1. Write " + filepath.Join(v.out, "notes-1.0.0.iso"), "the installer wipes the --device disk", "Take both sticks out"} {
+		if !strings.Contains(v.out2(), s) {
+			t.Errorf("no %q in:\n%s", s, v.out2())
+		}
+	}
+	if !strings.Contains(v.log.String(), "the installer wipes /dev/disk/by-id/nvme-Samsung_SSD_990_S7") && !strings.Contains(v.out2(), "the installer wipes /dev/disk/by-id/nvme-Samsung_SSD_990_S7") {
+		t.Errorf("the confirmation names no disk:\n%s\n%s", v.log, v.out2())
+	}
+	for _, c := range []struct {
+		vm   VMCreate
+		want string
+	}{
+		{VMCreate{Platform: "metal", Hostname: "notes-2", User: "ops"}, "--device is required"},
+		{VMCreate{Platform: "metal", Hostname: "notes-3", User: "ops", Device: "/dev/disk/../../etc/passwd"}, "--device \"/dev/disk/../../etc/passwd\""},
+		{VMCreate{Platform: "metal", Hostname: "notes-4", User: "ops", Device: "sda"}, "--device \"sda\""},
+		{VMCreate{Platform: "truenas", Hostname: "notes-5", User: "ops", Device: "/dev/sda"}, "--device is for a platform whose installer"},
+	} {
+		if err := newVMCreate(t, "iso", "qcow2").create(c.vm, set); err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("%+v: %v, want %q", c.vm, err, c.want)
+		}
+	}
+	if err := checkDevice("auto"); err != nil {
+		t.Error(err)
+	}
+	// A disk image boots: no install block, no after-install step.
+	raw, err := UserData("notes", "notes-stow", Machine{Hostname: "notes-1", User: "ops", SSHKey: v.keyLine}, Settings{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ud2 := string(raw); strings.Contains(ud2, "install:") || strings.Contains(ud2, "after-install") {
+		t.Errorf("a VM's seed installs:\n%s", ud2)
+	}
+}
+
 func (v *vmCreate) out2() string { return v.env.out.String() }
 
 func mapsEqual(a, b map[string]string) bool {
@@ -912,5 +977,151 @@ func TestOSMiBIsBounded(t *testing.T) {
 		if _, ok := osMiBOf(s); ok != want {
 			t.Errorf("%q: %v", s, ok)
 		}
+	}
+}
+
+// The release's NICs on a machine: a secondary's addressing (none by default), MACs generated on
+// a hypervisor for more than one NIC, required on metal, none on a cloud of one NIC; refusals
+// name the flag.
+func TestMachineInterfacesFromTheFlags(t *testing.T) {
+	t.Parallel()
+	s := &spec.Spec{Name: "atlas", Host: &spec.Host{Interfaces: map[string]spec.HostInterface{
+		"uplink": {Primary: true}, "edge": {}, "vpn0": {Kind: spec.InterfaceTUN},
+	}}}
+	plat := func(key string) Platform {
+		for _, p := range Platforms {
+			if p.Key == key {
+				return p
+			}
+		}
+		t.Fatalf("no platform %s", key)
+		return Platform{}
+	}
+	got, err := machineInterfaces(s, []string{"edge=static,address=192.0.2.9/24,attach=br1"}, plat("truenas"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0].Role != "edge" || got[0].Attach != "br1" || got[0].Mode != IfaceStatic || got[0].Address != "192.0.2.9/24" ||
+		got[1].Role != "uplink" || !got[1].Primary || got[1].Mode != IfaceNone {
+		t.Errorf("truenas: %+v", got)
+	}
+	for _, i := range got {
+		if !macAddr.MatchString(i.MAC) || !strings.HasPrefix(i.MAC, "02:") || !unicastMAC(i.MAC) {
+			t.Errorf("generated MAC %s", i.MAC)
+		}
+	}
+	if got[0].MAC == got[1].MAC {
+		t.Errorf("two NICs of one MAC %s", got[0].MAC)
+	}
+	// Generated afresh on each run: two VMs of one host name never share one.
+	again, _ := machineInterfaces(s, nil, plat("truenas"))
+	if again[0].MAC == got[0].MAC {
+		t.Errorf("the same MAC on two runs: %s", got[0].MAC)
+	}
+	for mac, uni := range map[string]bool{"02:00:00:00:00:01": true, "0c:00:00:00:00:01": true, "1a:00:00:00:00:01": true, "0b:00:00:00:00:01": false, "0f:00:00:00:00:01": false, "01:00:5e:00:00:01": false, "00:00:00:00:00:00": false} {
+		if unicastMAC(mac) != uni {
+			t.Errorf("unicastMAC(%s) = %v", mac, !uni)
+		}
+	}
+	got, err = machineInterfaces(s, []string{"uplink=mac=02:00:00:00:00:0A", "edge=dhcp,mac=02:00:00:00:00:0b"}, plat("metal"))
+	if err != nil || got[0].MAC != "02:00:00:00:00:0b" || got[0].Mode != IfaceDHCP || got[1].MAC != "02:00:00:00:00:0a" {
+		t.Errorf("metal: %+v %v", got, err)
+	}
+	for _, c := range []struct {
+		given []string
+		plat  string
+		want  string
+	}{
+		{nil, "metal", "--interface edge=mac=…: a server names each NIC"},
+		{[]string{"edge=mac=0b:00:00:00:00:01"}, "truenas", "is not a unicast MAC address"},
+		{[]string{"uplink=mac=02:00:00:00:00:01", "edge=mac=02:00:00:00:00:01"}, "metal", "have the MAC 02:00:00:00:00:01"},
+		{nil, "gcp", "names its VMs' NICs itself, one here: atlas declares 2"},
+		{[]string{"edge=mac=02:00:00:00:00:0b"}, "gcp", "names its VMs' NICs itself"},
+		{[]string{"vpn0=dhcp"}, "truenas", `"vpn0" is not one of atlas's NICs (edge, uplink)`},
+		{[]string{"uplink=dhcp"}, "truenas", "the primary NIC's addressing is --network's"},
+		{[]string{"edge=static"}, "truenas", "the static mode's address is required"},
+		{[]string{"edge=dhcp,address=192.0.2.9/24"}, "truenas", "address= is the static mode's"},
+		{[]string{"edge=static,address=2001:db8::1/64"}, "truenas", "is not an IPv4 address with its prefix"},
+		{[]string{"edge=mac=03:00:00:00:00:01"}, "truenas", "is not a unicast MAC address"},
+		{[]string{"edge=attach=br1"}, "metal", `"attach=br1": dhcp, static or none`},
+		{[]string{"edge=dhcp", "edge=none"}, "truenas", "given twice"},
+		{[]string{"edge=bogus"}, "truenas", `"bogus": dhcp, static or none`},
+	} {
+		if _, err := machineInterfaces(s, c.given, plat(c.plat)); err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("%v on %s: %v, want %q", c.given, c.plat, err, c.want)
+		}
+	}
+	one := &spec.Spec{Name: "atlas", Host: &spec.Host{Interfaces: map[string]spec.HostInterface{"uplink": {Primary: true}}}}
+	if got, err := machineInterfaces(one, nil, plat("gcp")); err != nil || len(got) != 1 || got[0].MAC != "" {
+		t.Errorf("a cloud's one NIC: %+v %v", got, err)
+	}
+	if _, err := machineInterfaces(one, []string{"uplink=mac=02:00:00:00:00:0a"}, plat("gcp")); err == nil || !strings.Contains(err.Error(), "gives its VMs' NICs their MACs") {
+		t.Errorf("a cloud's MAC: %v", err)
+	}
+	if _, err := machineInterfaces(one, nil, plat("metal")); err == nil || !strings.Contains(err.Error(), "a server names each NIC") {
+		t.Errorf("a server's one NIC without its MAC: %v", err)
+	}
+	// A hypervisor's machine of one NIC: named from the NIC it has, whatever MAC its module gives.
+	if got, err := machineInterfaces(one, nil, plat("truenas")); err != nil || len(got) != 1 || got[0].MAC != "" {
+		t.Errorf("a hypervisor's one NIC: %+v %v", got, err)
+	}
+	if _, err := machineInterfaces(&spec.Spec{Name: "notes"}, []string{"edge=dhcp"}, plat("truenas")); err == nil || !strings.Contains(err.Error(), "declares no NIC") {
+		t.Errorf("no interfaces: %v", err)
+	}
+}
+
+// The seed names each NIC by its role before the booted system's udev does (by MAC, or the only
+// NIC's original name), renames one named before, and addresses each: the primary as the machine's
+// network, a secondary never the default route's, the DNS servers' nor the host name's.
+func TestTheSeedNamesAndAddressesTheNICs(t *testing.T) {
+	t.Parallel()
+	m := Machine{Hostname: "h1", User: "ops", SSHKey: "ssh-ed25519 AAAA k", Net: NetConfig{Mode: "dhcp"}, Interfaces: []MachineInterface{
+		{Role: "edge", MAC: "02:00:00:00:00:0b", Mode: IfaceDHCP},
+		{Role: "uplink", MAC: "02:00:00:00:00:0a", Primary: true},
+	}}
+	raw, err := UserData("atlas", "at-stow", m, Settings{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cc cloudConfig
+	if err := yaml.Unmarshal(raw, &cc); err != nil {
+		t.Fatal(err)
+	}
+	files := map[string]string{}
+	var cmds []string
+	for _, at := range []string{"initramfs", "boot"} {
+		for _, st := range cc.Stages[at] {
+			for _, f := range st.Files {
+				files[at+":"+f.Path] = f.Content
+			}
+			cmds = append(cmds, st.Commands...)
+		}
+	}
+	for path, want := range map[string]string{
+		"initramfs:/etc/systemd/network/10-atlas-uplink.link": "[Match]\nMACAddress=02:00:00:00:00:0a\n\n[Link]\nName=uplink\n",
+		"initramfs:/etc/systemd/network/10-atlas-edge.link":   "[Match]\nMACAddress=02:00:00:00:00:0b\n\n[Link]\nName=edge\n",
+		"boot:/etc/systemd/network/05-atlas-static.network":   "[Match]\nName=uplink\n\n[Network]\nDHCP=ipv4\n",
+		"boot:/etc/systemd/network/10-atlas-edge.network":     "[Match]\nName=edge\n\n[Network]\nDHCP=ipv4\nLinkLocalAddressing=no\nIPv6AcceptRA=no\n\n[DHCPv4]\nUseGateway=no\nUseRoutes=no\nUseDNS=no\nSendHostname=no\n\n[Link]\nRequiredForOnline=no\n",
+	} {
+		if !strings.Contains(files[path], want) {
+			t.Errorf("%s:\n%s\nwant it to hold\n%s", path, files[path], want)
+		}
+	}
+	if !slices.ContainsFunc(cmds, func(c string) bool {
+		return strings.Contains(c, `= 02:00:00:00:00:0b ] && basename`) && strings.Contains(c, `ip link set dev "$i" name edge`)
+	}) {
+		t.Errorf("no rename of edge in %q", cmds)
+	}
+	one := m
+	one.Interfaces = []MachineInterface{{Role: "uplink", Primary: true}}
+	raw, _ = UserData("atlas", "at-stow", one, Settings{}, nil)
+	if !strings.Contains(string(raw), "OriginalName=en* eth*") || !strings.Contains(string(raw), "Driver=!mlx4_core mlx5_core mana") || !strings.Contains(string(raw), "ip -o route show default") {
+		t.Errorf("one NIC without its MAC:\n%s", raw)
+	}
+	none := m
+	none.Interfaces = nil
+	raw, _ = UserData("atlas", "at-stow", none, Settings{}, nil)
+	if strings.Contains(string(raw), ".link") || !strings.Contains(string(raw), "Name=en* eth*") {
+		t.Errorf("no interfaces:\n%s", raw)
 	}
 }

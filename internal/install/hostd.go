@@ -538,6 +538,7 @@ func (h *Hostd) routes(app bool) http.Handler {
 	both("POST /v1/network/confirm", h.confirmNetwork)
 	both("POST /v1/network/revert", h.revertNetwork)
 	both("POST /v1/network/reset", h.resetNetwork)
+	both("POST /v1/nftables/{table}/sets/{set}", h.setElements)
 	both("GET /v1/backup/config", h.backupConfig)
 	both("POST /v1/backup/config", h.setBackupConfig) // the lock's checks are its own
 	operator("DELETE /v1/backup/config", h.removeBackupConfig)

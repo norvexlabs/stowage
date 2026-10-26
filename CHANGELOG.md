@@ -32,8 +32,35 @@ follow [SemVer](https://semver.org/).
   set it there; `--apply` writes the settings and the power posture — and `k8s tune` prints them
   as what every node needs. On the network profile, `tune` advises `iommu=pt` where an IOMMU
   translates every device's DMA.
+- **Bare metal** (amd64): the `iso` disk format is an installer, Kairos's live system, and
+  `vm create --platform metal --device <disk>` writes it with the machine's seed for two USB
+  sticks. The installer wipes the named disk, installs the OS with room for later releases and
+  powers the server off; its first boot installs the release, as a VM's, and the seed is never
+  pulled again, its stick left in or not. The console and the recovery shell are on the server's
+  screen; the installer serves no SSH and runs nothing of the stack. The OS bundle's build checks
+  the drivers of servers' common NICs and disk controllers.
+- **Firmware a stack's drivers need** (`host.firmware`, by path under `/lib/firmware`, with its
+  reason): the OS bundle's build fails without it, `tune` reports it missing on a host (advice on
+  a Docker host) and `k8s tune` prints it for the nodes.
+- **Interfaces by role** (`host.interfaces`): a stack between networks names its NICs (a client
+  side, an upstream side, a management one) and the tun devices its services open, each with its
+  MTU, its policy routing in networkd's own terms and, for a NIC, its ethtool settings (channels,
+  rings, features one by one, EEE). `vm create --interface` gives each NIC its addressing, MAC and
+  network; the VM names each NIC by its role, keeps the default route on the primary, and the
+  built-in TrueNAS, libvirt, Proxmox and vSphere modules attach one NIC each. The front and an L4
+  route can listen on one interface alone (`interface`), which the VM's firewall enforces. A
+  Docker host's `tune` advises the settings, `k8s tune` prints them.
+- **What a service asks of the host** (`services.<name>`): whole cores of its own (`cpus`), which
+  the NICs' interrupts and receive steering stay off unless `irq: on`; its own nftables table
+  (`nftables`), loaded on the VM before the service starts, its named sets fed through the host
+  daemon's app socket; an address of its own on a NIC (`interface`, `address_input`), an ipvlan
+  network beside the stack's (`install --interface ROLE=NIC` names the NIC on a Docker host).
 
 ### Changed
+- **Memory shares moved**: `stack.memory.shares.<service>` is now `services.<service>.memory`,
+  beside the service's other host settings.
+- **`tune` sets each NIC feature on its own**, where the driver lets it be changed: a fixed
+  feature no longer makes the driver refuse the others (ENA).
 - **A smaller, quieter OS bundle**: the packages kairos-init installs that the appliance does
   without are removed — NFS and its `rpcbind` (which listened on port 111 on every address),
   SNMP, LLDP (which announced the host to its network), fail2ban, Canonical's subscription and

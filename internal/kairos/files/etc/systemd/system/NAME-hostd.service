@@ -1,5 +1,7 @@
 [Unit]
 Description={{.Name}}: host daemon ({{.Ctl}}'s verbs on this VM)
+# The installer ISO boots this system live, to install it: no host of the stack.
+ConditionPathExists=!/run/cos/live_mode
 Wants=docker.service
 After=docker.service
 

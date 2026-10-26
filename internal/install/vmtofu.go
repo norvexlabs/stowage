@@ -488,6 +488,8 @@ func (in *Installer) applyVM(ctx context.Context, dir, ctl string, p Platform, m
 			vars[v.Name] = src
 		case "open_ports":
 			vars[v.Name] = in.openedPorts(st)
+		case "nics":
+			vars[v.Name] = moduleNICs(mach, t)
 		}
 	}
 	for k, v := range t.Vars {
@@ -512,6 +514,36 @@ func (in *Installer) applyVM(ctx context.Context, dir, ctl string, p Platform, m
 		return "", "", err
 	}
 	return in.tofuOutputs(ctx, dir, ctl)
+}
+
+// moduleNIC is one of a module's nics: a NIC the release names, by role, its MAC and the platform's
+// network it attaches to.
+type moduleNIC struct {
+	Role   string `json:"role"`
+	MAC    string `json:"mac"`
+	Attach string `json:"attach"`
+}
+
+// moduleNICs are the machine's NICs as a module's nics variable takes them, the primary first, each
+// attached to its own network or the primary's (TrueNAS: --bridge); none when the release names
+// none, and the module makes its one NIC.
+func moduleNICs(m Machine, t *TofuVM) []moduleNIC {
+	out := []moduleNIC{}
+	attach := t.Bridge
+	for _, i := range m.Interfaces {
+		if i.Primary && i.Attach != "" {
+			attach = i.Attach
+		}
+	}
+	for _, i := range m.Interfaces {
+		n := moduleNIC{Role: i.Role, MAC: i.MAC, Attach: cmp.Or(i.Attach, attach)}
+		if i.Primary {
+			out = append([]moduleNIC{n}, out...)
+		} else {
+			out = append(out, n)
+		}
+	}
+	return out
 }
 
 // sshArgs are ssh's arguments to run command on the VM at addr as user: in batch mode (no

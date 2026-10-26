@@ -7,7 +7,7 @@ import (
 	"github.com/norvexlabs/stowage/internal/tune"
 )
 
-// The variables stack.memory gives each service it sizes, in its container's environment: a
+// The variables a memory share (services.<name>.memory) gives each service it sizes, in its container's environment: a
 // service sizes its own caches from them.
 const (
 	MemLimitVar = "STOWAGE_MEM_LIMIT_MB" // the container's memory limit, in MiB
@@ -18,28 +18,36 @@ const (
 // MinMemLimit is the least limit a share gives.
 const MinMemLimit = int64(spec.MinMemLimit)
 
-// memoryPlan is stack.memory on a host: no share without one.
-type memoryPlan struct {
+// hostPlan is what a host gives the services: their memory shares (none without one) and their
+// whole cores, by service.
+type hostPlan struct {
 	Shares map[string]spec.Share
 	Host   tune.Host
+	// CPUSets are each service's cores (services.<name>.cpus), as Compose's cpuset reads them.
+	CPUSets map[string]string
+	// IPVlans are each service's address of its own on a NIC (services.<name>.interface).
+	IPVlans map[string]ipvlan
+	// Tables are each service's table's last load's token (TableLabel, tableLoads), on the VM: a
+	// load changes it, so the start that loads a table recreates its service.
+	Tables map[string]string
 }
 
-// memoryPlan is the release's stack.memory on host h, read at each start, so a host given more
+// memoryPlan is the release's memory shares on host h, read at each start, so a host given more
 // RAM gives the services more. None on Docker Desktop: its containers run in a VM of its own,
 // whose RAM is not this host's.
-func (in *Installer) memoryPlan(sys tune.System, h tune.Host) memoryPlan {
-	m := in.R.Spec.Stack.Memory
-	if m == nil || len(m.Shares) == 0 || sys.Docker != nil && sys.Docker.Desktop {
-		return memoryPlan{}
+func (in *Installer) memoryPlan(sys tune.System, h tune.Host) hostPlan {
+	shares := in.R.Spec.MemoryShares()
+	if len(shares) == 0 || sys.Docker != nil && sys.Docker.Desktop {
+		return hostPlan{}
 	}
-	return memoryPlan{Shares: m.Shares, Host: h}
+	return hostPlan{Shares: shares, Host: h}
 }
 
 // limit is a container's part of share of the host's RAM, split among n containers, capped at
 // the share's maximum (the service's, split as well), in whole MiB, from MinMemLimit, and never
 // below floor: the limit the compose file sets itself, or the memory it reserves (Docker refuses a
 // limit under the reservation).
-func (p memoryPlan) limit(share spec.Share, n int, floor int64) int64 {
+func (p hostPlan) limit(share spec.Share, n int, floor int64) int64 {
 	n = max(n, 1)
 	part := int64(p.Host.MemBytes * uint64(share.Percent) / 100 / uint64(n))
 	if share.Max > 0 {
@@ -52,7 +60,7 @@ func (p memoryPlan) limit(share spec.Share, n int, floor int64) int64 {
 // the key its compose file sets the limit with (mem_limit when none, both when both: Compose
 // refuses them distinct), its swap limit moved by as much, and the variables it sizes itself
 // from. The share is the service's: its containers (scale, deploy.replicas) split it.
-func (p memoryPlan) give(extra map[string]any, share spec.Share, svc serviceMemory) {
+func (p hostPlan) give(extra map[string]any, share spec.Share, svc serviceMemory) {
 	memLimit, deploy := int64(svc.MemLimit), int64(svc.Deploy.Resources.Limits.Memory)
 	own := max(memLimit, deploy)
 	reserved := max(int64(svc.MemReservation), int64(svc.Deploy.Resources.Reservations.Memory))

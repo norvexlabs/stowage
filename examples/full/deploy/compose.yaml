@@ -3,7 +3,7 @@
 services:
   postgres:
     image: ${STOWAGE_IMAGE_POSTGRES}
-    # A quarter of its limit (stack.memory) as its cache; its default without the variable.
+    # A quarter of its limit (services.postgres.memory) as its cache; its default without the variable.
     command: [sh, -c, 'exec docker-entrypoint.sh postgres -c shared_buffers=$$(( $${STOWAGE_MEM_LIMIT_MB:-512} / 4 ))MB']
     mem_limit: 256m              # the least it gets: a share never lowers it
     environment:

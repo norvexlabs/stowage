@@ -25,7 +25,7 @@ import (
 // answers, when the platform tells; empty otherwise).
 var (
 	contractVars = []string{"name", "description", "disk_gib", "image", "image_sha256", "seed", "seed_sha256"}
-	optionalVars = []string{"cpus", "memory_mib", "image_format", "dhcp", "admin_user", "ssh_public_key"}
+	optionalVars = []string{"cpus", "memory_mib", "image_format", "dhcp", "admin_user", "ssh_public_key", "nics"}
 	// truenasVars are the TrueNAS module's own variables, which its flags give.
 	truenasVars = []string{"insecure_skip_verify", "pool", "parent_dataset", "nic_attach"}
 )

@@ -202,7 +202,8 @@ func (s System) Plan(h Host) (*Plan, error) {
 		p.Notes = append(p.Notes, "ethtool is not installed: the NICs' UDP receive offload for forwarded traffic is left as it is")
 	} else {
 		b.WriteString("# A NIC keeps forwarded UDP (QUIC, tunnels, traffic to containers) batched.\n")
-		fmt.Fprintf(&b, "ACTION==\"add\", SUBSYSTEM==\"net\", DEVPATH!=\"/devices/virtual/*\", RUN+=\"%s -K $name rx-udp-gro-forwarding on rx-gro-list off\"\n", eth)
+		// One feature a command: a driver's fixed one refuses every feature of its command.
+		fmt.Fprintf(&b, "ACTION==\"add\", SUBSYSTEM==\"net\", DEVPATH!=\"/devices/virtual/*\", RUN+=\"%[1]s -K $name rx-udp-gro-forwarding on\", RUN+=\"%[1]s -K $name rx-gro-list off\"\n", eth)
 	}
 	// A receive queue has a uevent of its own, after its NIC's (whose may come before the queues
 	// exist), and again when a NIC's channels change: queue settings are set on it.
@@ -516,10 +517,10 @@ func (s System) live(ctx context.Context, p *Plan) []string {
 			continue
 		}
 		if lookErr == nil {
-			if _, err := s.Run(ctx, eth, "-K", n.name, "rx-udp-gro-forwarding", "on", "rx-gro-list", "off"); err != nil {
-				notes = append(notes, fmt.Sprintf("ethtool -K %s: %v", n.name, err))
+			notes = append(notes, s.setFeatures(ctx, eth, n.name, map[string]string{"rx-udp-gro-forwarding": "on", "rx-gro-list": "off"}, false)...)
+			if !s.declaresRings(n.name) {
+				notes = append(notes, s.growRing(ctx, h, eth, n)...)
 			}
-			notes = append(notes, s.growRing(ctx, h, eth, n)...)
 		}
 		if q := h.QueueFlows(); q > 0 {
 			for i := range n.queues {
@@ -529,6 +530,14 @@ func (s System) live(ctx context.Context, p *Plan) []string {
 						notes = append(notes, fmt.Sprintf("%s rx-%d rps_flow_cnt: %v", n.name, i, err))
 					}
 				}
+			}
+		}
+	}
+	// The project's own NIC settings, over the profile's, on a host Stowage owns.
+	if lookErr == nil && s.Owned {
+		for _, i := range s.Interfaces {
+			if s.exists(filepath.Join("sys/class/net", i.Role)) {
+				notes = append(notes, s.applyNIC(ctx, eth, i)...)
 			}
 		}
 	}
@@ -571,13 +580,13 @@ func (h Host) steers(n nic) bool {
 	return h.network() && n.physical && n.queues > 0 && n.queues < h.CPUs
 }
 
-// steer spreads each NIC's received packets over the CPUs: a NIC's interrupts that all land on
-// one CPU go one to a CPU, unless irqbalance moves them; a NIC with fewer queues than CPUs has
-// its packets spread by RPS.
+// steer spreads each NIC's received packets over the CPUs, the services' isolated cores left out
+// (steerCPUs): a NIC's interrupts that all land on one CPU go one to a CPU, unless irqbalance
+// moves them; a NIC with fewer queues than CPUs has its packets spread by RPS.
 func (s System) steer(h Host, all []nic) []string {
 	var notes []string
 	balanced := s.running("irqbalance")
-	cpus := h.cpuIDs()
+	cpus := h.steerCPUs()
 	for _, n := range all {
 		if !n.physical {
 			continue

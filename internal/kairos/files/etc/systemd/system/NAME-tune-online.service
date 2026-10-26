@@ -1,5 +1,7 @@
 [Unit]
 Description={{.Name}}: tune the network again once it is up (its MTU, a NIC probed late), before Docker starts
+# The installer ISO boots this system live, to install it: no host of the stack.
+ConditionPathExists=!/run/cos/live_mode
 After=network-online.target {{.Name}}-tune.service
 Wants=network-online.target
 Before=docker.service

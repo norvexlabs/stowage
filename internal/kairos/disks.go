@@ -38,7 +38,7 @@ var ovf string
 var safeBase = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9_.-]*$`)
 
 // Ext is each format's file extension.
-var Ext = map[string]string{"raw": "raw", "qcow2": "qcow2", "ova": "ova", "vhd": "vhd", "gce": "gce.tar.gz"}
+var Ext = map[string]string{"raw": "raw", "qcow2": "qcow2", "ova": "ova", "vhd": "vhd", "gce": "gce.tar.gz", "iso": "iso"}
 
 // The commands that make the disks. They are part of DiskRecipe: a change to one changes the
 // disks it makes.
@@ -59,6 +59,13 @@ const (
 	gceScript = "set -e; mkdir gce; cp --sparse=always %[1]s.raw gce/disk.raw; truncate -s %%1G gce/disk.raw; sgdisk -e gce/disk.raw >/dev/null; " +
 		"tar --format=oldgnu --sparse --numeric-owner --owner=0 --group=0 -C gce -czf %[1]s.gce.tar.gz disk.raw; rm -r gce"
 )
+
+// isoConfig is the cloud-config the installer ISO embeds, merged with the machine's own (its
+// cidata seed, which gives the install's device): the state partition of %d MiB the raw disk is
+// laid out with (Kairos's installer sizes it to the images it writes, leaving a later release no
+// room to grow), and the screen's console last, so that /dev/console, the boot's messages and the
+// recovery shell are on a server's screen rather than its serial port.
+const isoConfig = "#cloud-config\ninstall:\n  partitions:\n    state:\n      size: %d\n  grub_options:\n    extra_cmdline: console=tty1\n"
 
 // auroraFlags are auroraboot's settings besides its state directory, source and disk.
 var auroraFlags = []string{"disable_http_server=true", "disable_netboot=true", "no_default_cloud_config=true"}
@@ -356,7 +363,7 @@ func (b *DiskBuilder) build(ctx context.Context, dir string, r DiskRequest) (map
 	}
 	osMiB := rawMiB + state
 	out["raw"] = file("raw")
-	if slices.ContainsFunc(r.Formats, func(f string) bool { return f != "raw" }) {
+	if slices.ContainsFunc(r.Formats, func(f string) bool { return f != "raw" && f != "iso" }) {
 		if err := b.disktools(ctx, dir); err != nil {
 			return nil, 0, err
 		}
@@ -401,6 +408,13 @@ func (b *DiskBuilder) build(ctx context.Context, dir string, r DiskRequest) (map
 			return nil, 0, err
 		}
 		out["gce"] = file("gce")
+	}
+	// The installer lays out the raw disk's partitions on the machine it installs.
+	if want("iso") {
+		if err := b.iso(ctx, dir, config, r.Source, state, r.Base, file("iso")); err != nil {
+			return nil, 0, err
+		}
+		out["iso"] = file("iso")
 	}
 	if !want("raw") {
 		if err := os.Remove(out["raw"]); err != nil {
@@ -452,6 +466,37 @@ func (b *DiskBuilder) auroraboot(ctx context.Context, dir, config, source string
 		return err
 	}
 	if err := os.Chmod(dst, 0o644); err != nil { // auroraboot leaves it world-writable
+		return err
+	}
+	return os.RemoveAll(state)
+}
+
+// iso makes the installer ISO of the bundle source with auroraboot's build-iso, embedding
+// isoConfig for a state partition of stateMiB, as dst. It needs no device: no loop device is made.
+func (b *DiskBuilder) iso(ctx context.Context, dir, config, source string, stateMiB int64, base, dst string) error {
+	state, err := os.MkdirTemp(dir, "iso-")
+	if err != nil {
+		return err
+	}
+	cc := filepath.Join(dir, "iso-config.yaml")
+	if err := os.WriteFile(cc, fmt.Appendf(nil, isoConfig, stateMiB), 0o644); err != nil {
+		return err
+	}
+	err = b.docker(ctx, "run", "--rm", "--network", "host",
+		"--volume", config+":/root/.docker/config.json:ro",
+		"--volume", cc+":/iso-config.yaml:ro",
+		"--volume", state+":/state",
+		Auroraboot, "build-iso", "--output", "/state", "--override-name", base, "--cloud-config", "/iso-config.yaml", "oci://"+source)
+	if err != nil {
+		return fmt.Errorf("auroraboot build-iso: %w", err)
+	}
+	if err := b.chown(ctx, state); err != nil {
+		return err
+	}
+	if err := os.Rename(filepath.Join(state, base+".iso"), dst); err != nil {
+		return fmt.Errorf("auroraboot build-iso: %w", err)
+	}
+	if err := os.Chmod(dst, 0o644); err != nil {
 		return err
 	}
 	return os.RemoveAll(state)

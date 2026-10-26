@@ -56,56 +56,10 @@ A finished item is deleted, not ticked. The plan behind it is
 
 ### Network appliances — a stack between networks
 
-A stack whose service sits between networks (routes, filters or intercepts traffic for the
-hosts behind it) rather than serving on one: today only its explicit form fits (clients name it
-as their proxy, one interface, an L4 route on the host's network). The transparent form needs
-the following on a Kairos host, bare metal first (after the bare-metal slice: the ISO and its
-install block, the metal platform, NICs named by MAC); the VM where it applies; on a Docker host,
-whose kernel is the operator's, `tune` reports what is missing and sets nothing.
+The interfaces by role (`host.interfaces`, with their routing and ethtool settings), a service's
+cores, nftables table and address of its own (`services.<name>`) are done; what is left:
 
-Each item below is a generic key in the platform's own terms (a kernel argument, a sysctl, an
-ethtool setting, an nftables table, a networkd rule), declared with a `reason` as `modules` are;
-Stowage computes a value only where it can (the `network` profile's), and `tune` advises the
-known cases (`iommu=pt`, an E810's `irdma`) rather than writing them unasked. No special case of
-one argument or one driver. What the host must be is one shape-neutral block, `host:` (`modules`,
-`packages`, `kernel_args`, `sysctls` and `power` are there): applied where
-Stowage owns the host (the Kairos VM, bare metal), recommended where it does not — a Docker
-host's `tune --check` reports each one missing with what sets it there (the GRUB line, the
-modprobe or sysctl drop-in), and `k8s tune` prints them as what every node must have (with the
-pods' settings it prints today) — never written on a host that is not Stowage's.
-
-6. **Interfaces, named** (`shapes.kairos.interfaces`): the VM has one NIC. An appliance has a
-    client side and an upstream side (and often a management one): each interface is a name (the
-    role is the project's word), its addressing (DHCP, static, none), MTU, and its policy routing
-    in networkd's own terms (`RoutingPolicyRule`/`Route` entries: a TPROXY's `fwmark` → `local`
-    table is two of them). `vm create` and the OpenTofu modules attach one NIC per name, on the
-    network named for it; bare metal names it by MAC. An L4 route, the front and `allow_input`
-    name the interface they listen on (default: the default route's); the VM's firewall judges
-    per interface. A service that needs an address of its own on a side gets an ipvlan network
-    on that interface (no NAT, beside the stack's bridge; its traffic is out of the host's
-    firewall, so its rules are 7's in its own namespace).
-7. **A service's nftables table** (`services.<s>.nftables: <file>`): interception and an egress
-    floor are host rules a container cannot own (a TPROXY or redirect of the client side's TCP, a
-    forward chain that default-denies, DNS sent to the stack's resolver, UDP 443 rejected — the
-    project's rules, none of them Stowage's). The file is one `table inet <s>` in nft's own syntax,
-    its named sets fed by the service through the app socket (an `nft add element` on its own
-    table only); Stowage loads it at boot before the service starts, removes it with the service,
-    and lint checks it with `nft -c` and that it declares that table alone. The host's own
-    firewall stays Stowage's. `ip_forward` and the like are 8's sysctls, the routing 6's rules.
-8. **The host a stack asks for**, beyond `host:`'s keys:
-    - **`services.<s>.cpus`**: the service's CPU set (Docker's `cpuset`, the pod's on Kubernetes
-      where the node allows it), and where the NICs' interrupts and RPS/XPS go: off it (default)
-      or on it (`irq: on`); two services' sets that overlap are a lint error naming both. With
-      6's interfaces (batch B): the steering is the NICs'.
-    - **`shapes.kairos.interfaces.<i>.ethtool`**: the NIC's settings in ethtool's own terms —
-      `channels` (`combined: max` or a count), `rings` (`max` or counts), `features` (each knob
-      on its own, set only where the driver reports it changeable: one `[fixed]` knob in a
-      combined `ethtool -K` rejects them all — ENA), `eee` — over the `network` profile's computed
-      rings and steering. `tune` explains a refused `ethtool -L` it knows: Intel's E810 (`ice`)
-      answers EBUSY while `irdma` holds the port's `ice.roce.N` device, leaving a 100G port at 8
-      queues on a 16 cores (`host.modules: { irdma: { block: true } }` frees it). Under
-      `host.power: performance`, `tune` advises EEE off. With 6 (batch B).
-9. **An upgrade that overlaps** (`services.<s>.update: start-first`, as Swarm's `update_config.order`
+6. **An upgrade that overlaps** (`services.<s>.update: start-first`, as Swarm's `update_config.order`
     and a Deployment's `maxSurge` without `maxUnavailable`): an appliance's clients cannot be told
     to retry, and a stop-then-start drops every connection and refuses new ones until the new
     container listens. Stowage starts the new container beside the old one, waits for its
@@ -116,6 +70,26 @@ pods' settings it prints today) — never written on a host that is not Stowage'
     refused (two containers cannot publish one port). On Kubernetes, the chart's strategy.
 
 ## Should
+
+- **Several NICs on a cloud**: `vm create` refuses more than one `host.interfaces` NIC on AWS,
+  Azure and Google Cloud, whose NICs' MACs are the cloud's (the seed cannot name them by MAC) and
+  which need a subnet (AWS, Azure) or a VPC network (Google Cloud) for each. Naming them by their
+  order on the bus (`Path=` in the `.link`), each module taking a list of subnets, once the test
+  accounts can prove it.
+- **`tune` judging a Docker host's mapped NIC**: `install --interface ROLE=NIC` records which NIC
+  plays a role (for an ipvlan's parent); `tune` could judge that NIC's MTU and ethtool settings
+  as it does the VM's, rather than advise them for any NIC.
+
+- **The data partition encrypted with the TPM** (`shapes.kairos.encryption: tpm`): Kairos's LUKS of
+  `COS_PERSISTENT` (`install.encrypted_partitions` from the installer, `kcrypt.encrypt_on_boot` on a disk
+  image's first boot), its key in the TPM's NV memory. `vm create` attaches a virtual TPM where the
+  platform has one (TrueNAS `trusted_platform_module`, Proxmox's TPM state disk, libvirt's swtpm, a
+  Google Cloud Shielded VM, Azure's Trusted Launch, AWS NitroTPM registered with `tpm_support`), metal
+  needs TPM 2.0; a boot without the TPM halts (no plaintext fallback). What it protects, said: the key
+  is not sealed to the boot's measurements, so a disk taken from its machine (a drive, a copied zvol or
+  snapshot) is unreadable, the machine itself is not; sealing to the boot is Kairos's Trusted Boot
+  (UKI, Secure Boot), another boot chain (systemd-boot, no `grub_options`): Won't for the first version.
+  The OEM partition stays clear (the seed holds no secret but the one-time host key).
 
 - **PM QoS under `host.power: performance`**: a held `/dev/cpu_dma_latency` request bounding the
   idle states where a cpuidle driver is bound. Needs a process holding it for the host's life
@@ -130,11 +104,7 @@ pods' settings it prints today) — never written on a host that is not Stowage'
   `host.kernel: ga | hwe` key (default `ga`) chooses it; the kernel stays refused in
   `host.packages`.
 
-- **A CPU set per service** (from the L4 routes on the host's network): an unpinned service
-  shares its cores with the rest of the stack. An advanced input per service giving compose
-  `cpuset` on Docker and the VM, and the chart's equivalent (its values), checked against the
-  host's CPUs at install.
-- **A driver's RDMA freed per port** (from Must 8): blocking `irdma` (`host.modules`) takes RDMA off
+- **A driver's RDMA freed per port** (from the E810's channels): blocking `irdma` (`host.modules`) takes RDMA off
   every port of the host. A port that uses none could instead have its `ice.roce.N` auxiliary
   device unbound only on `ethtool -L`'s EBUSY, logged, and again at each boot, keeping RDMA on
   the others; a device-level action, not a module's setting.
@@ -151,6 +121,9 @@ pods' settings it prints today) — never written on a host that is not Stowage'
   run its 0000 socket still let the caller connect (`no permission: <nil>`); 30 runs alone pass.
   The chmod and the dial race the served socket's own setup: make the test wait for the daemon to
   listen before the chmod.
+- **e2e-docker's uploads-archive check failed once beside the parallel suites** (2026-10-26) and
+  passed alone: `age -d … | tar -t | grep -qx ./e2e.txt` under `pipefail`, where `grep -q` exiting
+  on its match can SIGPIPE `tar` and fail the pipeline. Read the listing into a variable first.
 
 - **A prune on a registry that deletes no tag alone reads every tag per refused delete**: `untag`
   and the sweep after it list the repository and read each tag for each tag they remove, so a
@@ -740,7 +713,7 @@ Docker shape, 2026-10-24):
 - **A test release's key check**: `cosign public-key` runs with a background context (a cancelled
   command waits for it, up to cosign's timeout), and once, when the signer is made: a key file
   changed during the ship would sign unchecked. The check beside each sign call would close it.
-- **An empty `stack.memory:` is caught by lint alone**, from the file: decoding takes it as no
+- **An empty `services:` is caught by lint alone**, from the file: decoding takes it as no
   key. A presence check in spec decoding would give every reader of the spec the refusal.
 
 ## Won't — not in the first version
@@ -751,5 +724,5 @@ Docker shape, 2026-10-24):
 
 - The other extensions of DESIGN § 10 (restore verb on Kubernetes, Kubernetes provision hook +
   portal URL): none exists today; revisit after parity. The Docker backups and restore, the
-  Kubernetes barrier pre-flight are Musts 6 and 10.
+  Kubernetes barrier pre-flight are done.
 - Secret rotation (DESIGN § 7 row 24, an application concern).

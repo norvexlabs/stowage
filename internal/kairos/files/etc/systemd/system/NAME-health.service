@@ -1,5 +1,7 @@
 [Unit]
 Description={{.Name}}: health gate (marks an upgraded boot good, or reboots into the passive slot)
+# The installer ISO boots this system live, to install it: no host of the stack.
+ConditionPathExists=!/run/cos/live_mode
 # Wants, not Requires: a boot that failed to bring the install up fails the gate too.
 Wants={{.Name}}.service
 After={{.Name}}.service

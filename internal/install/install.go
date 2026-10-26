@@ -53,6 +53,9 @@ type Options struct {
 	// TuneProfile is --tune-profile: the operator's tuning profile (TuneProfileVar), "release"
 	// to follow the release's again; nil keeps the recorded choice.
 	TuneProfile *string
+	// Interfaces is --interface: the NIC of this host playing a host.interfaces role, by role
+	// (InterfaceVar), on a host Stowage does not own; "" removes the record.
+	Interfaces map[string]string
 	// TLS is the front's TLS mode (--tls); empty decides it from the domains given, or asks.
 	TLS     string
 	Domains map[string]string // --domains: a route's domain, sugar for its domain input
@@ -686,6 +689,9 @@ func (in *Installer) decide(ctx context.Context, dir, mode string, pub publish, 
 	}
 	in.frontVars(env, mode, pub, domains)
 	in.tuneVar(env)
+	if err := in.interfaceVars(env); err != nil {
+		return nil, nil, err
+	}
 	in.acmeForward(nil, env)
 	in.stowageImageVars(env, prefix)
 	for _, k := range s.ImageNames() {
@@ -1258,6 +1264,11 @@ func (in *Installer) up(ctx context.Context, env *EnvFile) error {
 		if err != nil {
 			return err
 		}
+		// The services' tables first: a table a start loads gives its service the label that
+		// recreates it.
+		if err := in.loadTables(ctx); err != nil {
+			return err
+		}
 		if err := in.writeContent(ctx, m, env, environ, hn); err != nil {
 			return err
 		}
@@ -1696,7 +1707,8 @@ const FirewallConf = "/etc/nftables.conf"
 
 // openPorts opens the install's host ports in the VM's firewall (O.Firewall): a TLS front's, the
 // ports the stack's bridges reach the L4 routes' services on (hn), and every L4 route's in every
-// mode, from the sources its allowlist holds, on its bind address alone when it has one. The
+// mode, from the sources its allowlist holds, on its bind address alone when it has one; the
+// front's and a route's on their host.interfaces role's interface alone when they name one. The
 // routes' services run on the host's network, so their traffic meets the input chain alone: one
 // rule file of the install's own, O.Firewall/<name>-ports.nft, under /run, so a boot drops the
 // routes' ports (input drops by default) until the install's start writes it. The forward
@@ -1718,7 +1730,7 @@ func (in *Installer) openPorts(ctx context.Context, env *EnvFile, hn hostNet) er
 			}
 			ports = append(ports, n)
 		}
-		input = fmt.Appendf(input, "tcp dport { %d, %d } accept\n", ports[0], ports[1])
+		input = fmt.Appendf(input, "%stcp dport { %d, %d } accept\n", in.iif(in.R.Spec.Front.Interface), ports[0], ports[1])
 	}
 	// The ports the stack's own services reach a target on, from its bridges.
 	for _, proto := range []string{"tcp", "udp"} {
@@ -1743,6 +1755,8 @@ func (in *Installer) openPorts(ctx context.Context, env *EnvFile, hn hostNet) er
 			}
 			daddr = family + " daddr " + a + " "
 		}
+		// A route on one interface is reached on it alone.
+		daddr = in.iif(r.Interface) + daddr
 		if r.AllowInput == "" {
 			input = fmt.Appendf(input, "%s%s dport %d accept\n", daddr, r.Protocol, r.Port)
 			continue
@@ -1806,6 +1820,23 @@ func (in *Installer) openPorts(ctx context.Context, env *EnvFile, hn hostNet) er
 		return fmt.Errorf("loading the firewall with the install's ports: %w", err)
 	}
 	return nil
+}
+
+// iif is the firewall's match of a rule on the host.interfaces role given, the interface's name;
+// none for every interface. It fails closed: a NIC role the VM's cloud-config names no NIC for (a
+// VM made by a release that named none) keeps its match, which no interface meets, warned — a port
+// meant for one interface is never opened on the others. A tun device is matched by its name
+// before its service opens it.
+func (in *Installer) iif(role string) string {
+	if role == "" {
+		return ""
+	}
+	if h := in.R.Spec.Host; h != nil {
+		if i, ok := h.Interfaces[role]; ok && i.Kind != spec.InterfaceTUN && !roleNamed(in.R.Spec.Name, role) {
+			in.O.logf("warning: no NIC of this VM is named %s (its cloud-config, from before its release named it, names none): its ports reach nothing, a VM made by this release (vm create --interface) names it", role)
+		}
+	}
+	return fmt.Sprintf("iifname %q ", role)
 }
 
 // familySources splits an allowlist into its IPv4 and IPv6 prefixes, as the firewall's sets

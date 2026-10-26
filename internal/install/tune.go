@@ -1,6 +1,7 @@
 package install
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -55,23 +56,30 @@ func (in *Installer) tuneSystem(ctx context.Context) (tune.System, error) {
 
 // containerSizing is what each container is given from this host, read once: the settings that
 // run it as on the host, by the stack's tuning profile as get reads the install, and the memory
-// limits of stack.memory; none without a host to read. An engine or a host that does not read
+// limits of the services' memory shares and their whole cores; none without a host to read. An engine or a host that does not read
 // fails the start: settings dropped for one start would recreate every service, and again at the
 // next.
-func (in *Installer) containerSizing(ctx context.Context, get func(string) string) (tune.Container, memoryPlan, error) {
+func (in *Installer) containerSizing(ctx context.Context, get func(string) string) (tune.Container, hostPlan, error) {
 	if in.O.Tune == nil {
-		return tune.Container{}, memoryPlan{}, nil
+		return tune.Container{}, hostPlan{}, nil
 	}
 	sys, err := in.tuneSystem(ctx)
 	if err != nil {
-		return tune.Container{}, memoryPlan{}, fmt.Errorf("the containers' network settings and memory: %w", err)
+		return tune.Container{}, hostPlan{}, fmt.Errorf("the containers' network settings and memory: %w", err)
 	}
 	h, err := sys.Host()
 	if err != nil {
-		return tune.Container{}, memoryPlan{}, fmt.Errorf("the containers' network settings and memory: %w", err)
+		return tune.Container{}, hostPlan{}, fmt.Errorf("the containers' network settings and memory: %w", err)
 	}
 	h.Profile, _ = in.tuneProfile(get)
-	return sys.Container(h), in.memoryPlan(sys, h), nil
+	plan := in.memoryPlan(sys, h)
+	if sys.Docker == nil || !sys.Docker.Desktop {
+		if plan.CPUSets, err = cpuSets(in.R.Spec, sys.Cores(h)); err != nil {
+			return tune.Container{}, hostPlan{}, err
+		}
+		plan.Host = h
+	}
+	return sys.Container(h), plan, nil
 }
 
 // Tune reports how the host differs from what its RAM and CPUs call for, prints the files that
@@ -141,6 +149,13 @@ func (in *Installer) Tune(ctx context.Context, t TuneOptions) error {
 			for _, n := range p.Notes {
 				fmt.Fprintf(in.O.Out, "# note: %s\n", n)
 			}
+			// The services' nftables tables are the operator's to load on a host Stowage does not
+			// own: printed, never written.
+			if !sys.Owned {
+				for _, name := range sortedKeys(in.R.Nftables) {
+					fmt.Fprintf(in.O.Out, "# services.%s.nftables (not written: load it with nft -f <file>, the host's firewall is its operator's)\n%s\n", name, in.R.Nftables[name])
+				}
+			}
 			return nil
 		}
 		fmt.Fprintf(in.O.Out, "this host: %d MiB, %d CPUs, the %s profile\n", h.MemBytes>>20, h.CPUs, h.Profile)
@@ -160,6 +175,12 @@ func (in *Installer) Tune(ctx context.Context, t TuneOptions) error {
 		return nil
 	}
 	items := sys.Inspect(ctx, h)
+	if !sys.Owned {
+		for _, name := range sortedKeys(in.R.Nftables) {
+			items = append(items, tune.Item{State: tune.Advice, Kind: "nftables", Name: "table inet " + name,
+				Have: "the service " + name + " asks for its nftables table:", Want: "`" + ctl + " tune --print` prints it; nft -f <file> loads it (the host's firewall is its operator's)"})
+		}
+	}
 	fmt.Fprintf(in.O.Out, "this host: %d MiB, %d CPUs, the %s profile\n", h.MemBytes>>20, h.CPUs, h.Profile)
 	if err := tune.Print(in.O.Out, items); err != nil {
 		return err
@@ -265,13 +286,32 @@ func releasePackages(s *spec.Spec) []tune.Package {
 	return out
 }
 
-// releaseHost gives sys what the release's host block asks of the host: its modules, packages and
-// kernel arguments, which tune judges; its settings and power posture, which it also applies.
+// releaseHost gives sys what the release's host block asks of the host: its modules, packages,
+// firmware, interfaces and kernel arguments, which tune judges; its settings and power posture, which it also applies.
 func releaseHost(sys *tune.System, s *spec.Spec) {
 	sys.Modules, sys.Packages = releaseModules(s), releasePackages(s)
-	sys.KernelArgs, sys.Settings, sys.Power = nil, nil, ""
+	sys.ServiceCores = coreRequests(s)
+	sys.Firmware, sys.Interfaces, sys.KernelArgs, sys.Settings, sys.Power = nil, nil, nil, nil, ""
 	if s.Host == nil {
 		return
+	}
+	for _, r := range slices.Sorted(maps.Keys(s.Host.Interfaces)) {
+		i := s.Host.Interfaces[r]
+		ti := tune.Interface{Role: r, Kind: cmp.Or(i.Kind, spec.InterfaceNIC), MTU: i.MTU,
+			RoutingPolicyRules: i.RoutingPolicyRules, Routes: i.Routes, Reason: i.Reason}
+		if e := i.Ethtool; e != nil {
+			ti.NIC = &tune.NICSettings{Features: e.Features, EEE: e.EEE}
+			if e.Channels != nil {
+				ti.NIC.Combined = e.Channels.Combined
+			}
+			if e.Rings != nil {
+				ti.NIC.RX, ti.NIC.TX = e.Rings.RX, e.Rings.TX
+			}
+		}
+		sys.Interfaces = append(sys.Interfaces, ti)
+	}
+	for _, p := range slices.Sorted(maps.Keys(s.Host.Firmware)) {
+		sys.Firmware = append(sys.Firmware, tune.Firmware{Path: p, Reason: s.Host.Firmware[p].Reason})
 	}
 	for _, k := range slices.Sorted(maps.Keys(s.Host.KernelArgs)) {
 		a := s.Host.KernelArgs[k]

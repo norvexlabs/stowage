@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/norvexlabs/stowage/internal/kairos"
+	"github.com/norvexlabs/stowage/internal/spec"
 	"github.com/norvexlabs/stowage/internal/testutil"
 )
 
@@ -169,18 +170,18 @@ func TestEachRuleFiresOnFull(t *testing.T) {
 		want  string
 	}{
 		{"absolute path", []edit{{sp, "compose: deploy/compose.yaml", "compose: /etc/compose.yaml"}}, nil, "must be relative to the project root"},
-		{"memory share of 0", []edit{{sp, memShares, "shares: { postgres: 0 }"}}, nil, "stack.memory.shares.postgres: 0: a percent of the host's RAM, from 1 to 90"},
-		{"memory share over 90", []edit{{sp, memShares, "shares: { postgres: 91 }"}}, nil, "stack.memory.shares.postgres: 91: a percent of the host's RAM, from 1 to 90"},
-		{"memory shares over 90", []edit{{sp, memShares, "shares: { postgres: 60, api: 31 }"}}, nil, "stack.memory.shares: the shares total 91 %: at most 90"},
-		{"memory share of no service", []edit{{sp, memShares, "shares: { postgres: 25, search: 10 }"}}, nil, `stack.memory.shares.search: service "search" is not in deploy/compose.yaml`},
-		{"memory share max under the least", []edit{{sp, memShares, "shares: { api: { percent: 25, max: 67108863 } }"}}, nil, "stack.memory.shares.api.max: 67108863: 67108863 for api, under 64M, the least limit"},
-		{"memory share max under the least per container", []edit{{sp, memShares, "shares: { api: { percent: 10, max: 255M } }"}, {"deploy/compose.yaml", "  api:\n    image: ${STOWAGE_IMAGE_API}\n", "  api:\n    deploy: { replicas: \"4\" }\n    image: ${STOWAGE_IMAGE_API}\n"}}, nil, "stack.memory.shares.api.max: 255M: 65280K for each of api's 4 containers, under 64M"},
-		{"memory share max under a GiB reservation", []edit{{sp, memShares, "shares: { postgres: { percent: 25, max: 1535M } }"}, {"deploy/compose.yaml", "    mem_limit: 256m ", "    mem_reservation: 1.5GiB\n    mem_limit: 256m "}}, nil, "stack.memory.shares.postgres.max: 1535M: 1535M for postgres, under the 1536M limit"},
-		{"memory share max under the compose limit", []edit{{sp, memShares, "shares: { postgres: { percent: 25, max: 255M } }"}}, nil, "stack.memory.shares.postgres.max: 255M: 255M for postgres, under the 256M limit or reservation deploy/compose.yaml gives it itself"},
-		{"memory share max under the replicas' limits", []edit{{sp, memShares, "shares: { postgres: { percent: 25, max: 511M } }"}, {"deploy/compose.yaml", "    mem_limit: 256m ", "    scale: 2\n    mem_limit: 256m "}}, nil, "stack.memory.shares.postgres.max: 511M: 261632K for each of postgres's 2 containers, under the 256M limit or reservation"},
-		{"memory share max under the reservation", []edit{{sp, memShares, "shares: { postgres: { percent: 25, max: 1G } }"}, {"deploy/compose.yaml", "    mem_limit: 256m ", "    mem_reservation: 1.5g\n    mem_limit: 256m "}}, nil, "stack.memory.shares.postgres.max: 1G: 1G for postgres, under the 1536M limit"},
-		{"memory share max under the base's limit", []edit{{sp, memShares, "shares: { api: { percent: 25, max: 1G } }"}, {"deploy/compose.yaml", "  api:\n    image: ${STOWAGE_IMAGE_API}\n", "  api:\n    extends: postgres\n    image: ${STOWAGE_IMAGE_API}\n"}, {"deploy/compose.yaml", "    mem_limit: 256m ", "    mem_limit: 2g "}}, nil, "stack.memory.shares.api.max: 1G: 1G for api, under the 2G limit"},
-		{"memory share max without percent", []edit{{sp, memShares, "shares: { postgres: { max: 16G } }"}}, nil, "stack.memory.shares.postgres: 0: a percent of the host's RAM"},
+		{"memory share of 0", []edit{{sp, memShares, "services:\n  postgres: { memory: 0 }\n"}}, nil, "services.postgres.memory: 0: a percent of the host's RAM, from 1 to 90"},
+		{"memory share over 90", []edit{{sp, memShares, "services:\n  postgres: { memory: 91 }\n"}}, nil, "services.postgres.memory: 91: a percent of the host's RAM, from 1 to 90"},
+		{"memory shares over 90", []edit{{sp, memShares, "services:\n  postgres: { memory: 60 }\n  api: { memory: 31 }\n"}}, nil, "services: the memory shares total 91 %: at most 90"},
+		{"memory share of no service", []edit{{sp, memShares, "services:\n  postgres: { memory: 25 }\n  search: { memory: 10 }\n"}}, nil, `services.search: service "search" is not in deploy/compose.yaml`},
+		{"memory share max under the least", []edit{{sp, memShares, "services:\n  api: { memory: { percent: 25, max: 67108863 } }\n"}}, nil, "services.api.memory.max: 67108863: 67108863 for api, under 64M, the least limit"},
+		{"memory share max under the least per container", []edit{{sp, memShares, "services:\n  api: { memory: { percent: 10, max: 255M } }\n"}, {"deploy/compose.yaml", "  api:\n    image: ${STOWAGE_IMAGE_API}\n", "  api:\n    deploy: { replicas: \"4\" }\n    image: ${STOWAGE_IMAGE_API}\n"}}, nil, "services.api.memory.max: 255M: 65280K for each of api's 4 containers, under 64M"},
+		{"memory share max under a GiB reservation", []edit{{sp, memShares, "services:\n  postgres: { memory: { percent: 25, max: 1535M } }\n"}, {"deploy/compose.yaml", "    mem_limit: 256m ", "    mem_reservation: 1.5GiB\n    mem_limit: 256m "}}, nil, "services.postgres.memory.max: 1535M: 1535M for postgres, under the 1536M limit"},
+		{"memory share max under the compose limit", []edit{{sp, memShares, "services:\n  postgres: { memory: { percent: 25, max: 255M } }\n"}}, nil, "services.postgres.memory.max: 255M: 255M for postgres, under the 256M limit or reservation deploy/compose.yaml gives it itself"},
+		{"memory share max under the replicas' limits", []edit{{sp, memShares, "services:\n  postgres: { memory: { percent: 25, max: 511M } }\n"}, {"deploy/compose.yaml", "    mem_limit: 256m ", "    scale: 2\n    mem_limit: 256m "}}, nil, "services.postgres.memory.max: 511M: 261632K for each of postgres's 2 containers, under the 256M limit or reservation"},
+		{"memory share max under the reservation", []edit{{sp, memShares, "services:\n  postgres: { memory: { percent: 25, max: 1G } }\n"}, {"deploy/compose.yaml", "    mem_limit: 256m ", "    mem_reservation: 1.5g\n    mem_limit: 256m "}}, nil, "services.postgres.memory.max: 1G: 1G for postgres, under the 1536M limit"},
+		{"memory share max under the base's limit", []edit{{sp, memShares, "services:\n  api: { memory: { percent: 25, max: 1G } }\n"}, {"deploy/compose.yaml", "  api:\n    image: ${STOWAGE_IMAGE_API}\n", "  api:\n    extends: postgres\n    image: ${STOWAGE_IMAGE_API}\n"}, {"deploy/compose.yaml", "    mem_limit: 256m ", "    mem_limit: 2g "}}, nil, "services.api.memory.max: 1G: 1G for api, under the 2G limit"},
+		{"memory share max without percent", []edit{{sp, memShares, "services:\n  postgres: { memory: { max: 16G } }\n"}}, nil, "services.postgres.memory: 0: a percent of the host's RAM"},
 		{"vm size empty", []edit{{sp, vmSizeLine, "size: {}"}}, nil, "shapes.kairos.size: states no size"},
 		{"vm size states nothing", []edit{{sp, vmSizeLine, "size: { min: {} }"}}, nil, "shapes.kairos.size.min: states nothing"},
 		{"vm size negative cpus", []edit{{sp, vmSizeLine, "size: { min: { cpus: -1 } }"}}, nil, "cpus: -1: at least 1"},
@@ -193,8 +194,9 @@ func TestEachRuleFiresOnFull(t *testing.T) {
 		{"vm size min over recommended disk", []edit{{sp, vmSizeLine, "size: { min: { disk: 41G }, recommended: { disk: 40G } }"}}, nil, "shapes.kairos.size.recommended.disk: 40G: under the minimum 41G"},
 		{"vm size min left empty", []edit{{sp, vmSizeLine, "size: { min: , recommended: { cpus: 2 } }"}}, nil, "shapes.kairos.size.min: states nothing"},
 		{"vm size left empty", []edit{{sp, vmSizeLine, "size:"}}, nil, "shapes.kairos.size: states no size"},
-		{"memory shares empty", []edit{{sp, memShares, "shares: {}"}}, nil, "stack.memory.shares: names no service"},
-		{"memory left empty", []edit{{sp, "  memory:\n    " + memShares + "   # percent of the host's RAM, recomputed at each start; postgres's capped at 16 GiB\n", "  memory:\n"}}, nil, "stack.memory.shares: names no service"},
+		{"memory shares empty", []edit{{sp, servicesBlock, "services: {}\n"}}, nil, "services: names no service"},
+		{"services left empty", []edit{{sp, servicesBlock, "services:\n"}}, nil, "services: names no service"},
+		{"service asking nothing", []edit{{sp, memShares, "services:\n  api: {}\n"}}, nil, "services.api: says nothing"},
 		{"tune profile unknown", []edit{{sp, "  profile: network   #", "  profile: shared   #"}}, nil, `tune.profile: "shared": default or network`},
 		{"tune profile missing", []edit{{sp, "  profile: network   #", "  other: network   #"}}, nil, "field other not found"},
 		{"tune profile empty", []edit{{sp, "  profile: network   #", "  profile: \"\"   #"}}, nil, "tune.profile: missing"},
@@ -405,6 +407,39 @@ func TestEachRuleFiresOnFull(t *testing.T) {
 		{"package of the bundle's own", []edit{{sp, "    tcpdump: {", "    linux-image-generic: {"}}, nil, "host.packages.linux-image-generic: is the OS bundle's own (linux-image)"},
 		{"package name", []edit{{sp, "    tcpdump: {", "    -tcpdump: {"}}, nil, "host.packages.-tcpdump: not a package's name"},
 		{"package without a reason", []edit{{sp, "reason: \"capture on the VM's interfaces\"", "reason: \"\""}}, nil, "host.packages.tcpdump.reason: is required"},
+		{"firmware path", []edit{{sp, "    intel/ice/ddp/ice.pkg: {", "    intel/../ice.pkg: {"}}, nil, "host.firmware.intel/../ice.pkg: not a firmware file's path under /lib/firmware"},
+		{"interface name", []edit{{sp, "    edge:   ", "    Edge:   "}, {sp, "interface: edge }", "interface: Edge }"}, {sp, "{ interface: edge, address_input", "{ interface: Edge, address_input"}}, nil, "host.interfaces.Edge: not an interface's name"},
+		{"interface named as the kernel names", []edit{{sp, "    vpn0: { kind: tun", "    eth1: { kind: tun"}}, nil, "host.interfaces.eth1: a name the kernel, udev or Docker gives"},
+		{"interface kind", []edit{{sp, "vpn0: { kind: tun,", "vpn0: { kind: wifi,"}}, nil, `host.interfaces.vpn0.kind: "wifi": nic (the default) or tun`},
+		{"no primary interface", []edit{{sp, "    uplink: { primary: true, ", "    uplink: { "}}, nil, "host.interfaces: 0 NICs are primary"},
+		{"a primary tun", []edit{{sp, "vpn0: { kind: tun,", "vpn0: { kind: tun, primary: true,"}}, nil, "host.interfaces.vpn0.primary: a tun device a service opens is not the default route's"},
+		{"interface MTU", []edit{{sp, "      mtu: 1500\n", "      mtu: 1279\n"}}, nil, "host.interfaces.edge.mtu: 1279: 1280 to 9216"},
+		{"routing setting", []edit{{sp, `FirewallMark: "0x1"`, `ExecStart: "0x1"`}}, nil, `host.interfaces.edge.routing_policy_rules[0]: "ExecStart" is not one of networkd's settings here`},
+		{"routing value", []edit{{sp, `Table: "100" }]
+      routes`, `Table: "100; x" }]
+      routes`}}, nil, `host.interfaces.edge.routing_policy_rules[0].Table: "100; x": letters, digits`},
+		{"route of a policy rule's key", []edit{{sp, "routes: [{ Type: local,", "routes: [{ FirewallMark: local,"}}, nil, `host.interfaces.edge.routes[0]: "FirewallMark" is not one of networkd's settings here`},
+		{"front on an undeclared interface", []edit{{sp, "  interface: uplink ", "  interface: wan "}}, nil, `front.interface: "wan" is not one of host.interfaces`},
+		{"route on an undeclared interface", []edit{{sp, "interface: edge }", "interface: wan }"}}, nil, `l4.routes[1].interface: "wan" is not one of host.interfaces`},
+		{"ethtool channels", []edit{{sp, "channels: { combined: max }", "channels: { combined: lots }"}}, nil, `host.interfaces.edge.ethtool.channels.combined: "lots": max, or a count`},
+		{"ethtool feature", []edit{{sp, `features: { rx-gro-list: "off" }`, `features: { rx-gro-list: "maybe" }`}}, nil, `host.interfaces.edge.ethtool.features.rx-gro-list: "maybe": on or off`},
+		{"ethtool on a tun", []edit{{sp, "vpn0: { kind: tun,", "vpn0: { kind: tun, ethtool: { eee: \"off\" },"}}, nil, "host.interfaces.vpn0.ethtool: a tun device has no NIC's settings"},
+		{"service cpus", []edit{{sp, "echo: { cpus: 1, irq: on }", "echo: { cpus: 65, irq: on }"}}, nil, "services.echo.cpus: 65: whole cores, 1 to 64"},
+		{"service irq", []edit{{sp, "echo: { cpus: 1, irq: on }", "echo: { cpus: 1, irq: maybe }"}}, nil, `services.echo.irq: "maybe": off`},
+		{"service irq without cpus", []edit{{sp, "echo: { cpus: 1, irq: on }", "echo: { irq: on }"}}, nil, "services.echo.irq: is about the service's cores: give it cpus"},
+		{"service of no compose service", []edit{{sp, "echo: { cpus: 1, irq: on }", "echoes: { cpus: 1 }"}}, nil, `services.echoes: service "echoes" is not in deploy/compose.yaml`},
+		{"service nftables table of another name", []edit{{"deploy/ingest.nft", "table inet ingest {", "table inet other {"}}, nil, `services.ingest.nftables: deploy/ingest.nft: does not start with "table inet ingest {"`},
+		{"service nftables beyond its table", []edit{{"deploy/ingest.nft", "\t\tip saddr @probes counter\n", "\t\tip saddr @probes counter\n\t\tinclude \"/etc/x.nft\"\n"}}, nil, "services.ingest.nftables: deploy/ingest.nft: holds an include or names the ruleset"},
+		{"service nftables closing its table in a string", []edit{{"deploy/ingest.nft", "\t\tip saddr @probes counter\n\t}\n}\n", "\t\tip saddr @probes counter comment \"{\"\n\t}\n}\ndelete table inet atlas\ntable inet ingest { comment \"}\" }\n"}}, nil, "services.ingest.nftables: deploy/ingest.nft: holds something after its table"},
+		{"service nftables after its table", []edit{{"deploy/ingest.nft", "\t\tip saddr @probes counter\n\t}\n}\n", "\t\tip saddr @probes counter\n\t}\n}\ntable ip x {}\n"}}, nil, "services.ingest.nftables: deploy/ingest.nft: holds something after its table"},
+		{"service nftables unbalanced", []edit{{"deploy/ingest.nft", "\t\tip saddr @probes counter\n\t}\n}\n", "\t\tip saddr @probes counter\n\t}\n"}}, nil, "services.ingest.nftables: deploy/ingest.nft: its braces do not balance"},
+		{"service nftables missing", []edit{{sp, "nftables: deploy/ingest.nft", "nftables: deploy/none.nft"}}, nil, "services.ingest.nftables: open "},
+		{"service interface without its input", []edit{{sp, "{ interface: edge, address_input: RELAY_ADDRESS }", "{ interface: edge }"}}, nil, "services.relay: interface and address_input go together"},
+		{"service interface not a NIC", []edit{{sp, "{ interface: edge, address_input: RELAY_ADDRESS }", "{ interface: vpn0, address_input: RELAY_ADDRESS }"}}, nil, `services.relay.interface: "vpn0" is not a NIC of host.interfaces`},
+		{"service address input unknown", []edit{{sp, "address_input: RELAY_ADDRESS }", "address_input: NOPE }"}}, nil, "services.relay.address_input: NOPE is not an input"},
+		{"service address default", []edit{{sp, `prompt: "Address the relay has of its own on the edge network (empty: none)", optional: true,`, `prompt: "Address the relay has of its own on the edge network (empty: none)", default: nowhere,`}}, nil, `services.relay.address_input: RELAY_ADDRESS's default "nowhere" is not an address`},
+		{"service on the host's network with an address", []edit{{"deploy/compose.yaml", "    profiles: [relay]\n", "    profiles: [relay]\n    network_mode: host\n"}}, nil, "services.relay.interface: relay runs with network_mode host"},
+		{"firmware without a reason", []edit{{sp, "reason: \"the E810's DDP package: without it ice runs in safe mode, one queue a port\"", "reason: \"\""}}, nil, "host.firmware.intel/ice/ddp/ice.pkg.reason: is required"},
 		{"package key unknown", []edit{{sp, "tcpdump: { reason:", "tcpdump: { version: \"4\", reason:"}}, nil, "field version not found"},
 		{"kernel arg of Kairos's own", []edit{{sp, "    iommu: { value: pt,", "    rd.shell: { value: \"1\","}}, nil, "host.kernel_args.rd.shell: is Kairos's own (rd)"},
 		{"kernel arg name", []edit{{sp, "    iommu: { value: pt,", "    \"io mmu\": { value: pt,"}}, nil, "host.kernel_args.io mmu: not a kernel argument's name"},
@@ -973,17 +1008,35 @@ func TestPublishedPortOnDockerWarns(t *testing.T) {
 	}
 }
 
-// An L4 route's allowlist without a kairos shape is warned: nothing enforces it.
+// An L4 route's allowlist, and the front's or a route's interface, without a kairos shape are
+// warned: nothing enforces them.
 func TestL4AllowlistWithoutKairosWarns(t *testing.T) {
 	t.Parallel()
 	root := testutil.CopyExample(t, "full")
-	testutil.Edit(t, root, specFile, "  kairos:\n    base: ubuntu:26.04@sha256:c098726dd9b9733f3e885f8de0ef375206a311b0a317eadc40d347b1115fb944\n    kairos_init: quay.io/kairos/kairos-init:v4.4.0-rc2@sha256:ac885c9f3002a3f0e7000947e3d1e2a5c95f5e2d0212d5f9bbd663347f1ebe0c\n    disk_formats: [raw, qcow2, ova, vhd, gce]\n    cloud_publish: [aws, azure, gcp]\n    health_gate: { deadline_s: 600, deadline_after_reset_s: 1800, poll_s: 30 }\n    host_api: [api]\n    "+vmSizeLine+"   # vm create's least and default size\n", "")
+	testutil.Edit(t, root, specFile, "  kairos:\n    base: ubuntu:26.04@sha256:c098726dd9b9733f3e885f8de0ef375206a311b0a317eadc40d347b1115fb944\n    kairos_init: quay.io/kairos/kairos-init:v4.4.0-rc2@sha256:ac885c9f3002a3f0e7000947e3d1e2a5c95f5e2d0212d5f9bbd663347f1ebe0c\n    disk_formats: [raw, qcow2, ova, vhd, gce, iso]\n    cloud_publish: [aws, azure, gcp]\n    health_gate: { deadline_s: 600, deadline_after_reset_s: 1800, poll_s: 30 }\n    host_api: [api]\n    "+vmSizeLine+"   # vm create's least and default size\n", "")
 	res := run(t, root)
 	if errs := errorsOf(res); len(errs) > 0 {
 		t.Fatalf("errors:\n%s", strings.Join(errs, "\n"))
 	}
-	if len(res.Findings) != 1 || res.Findings[0].Severity != Warning || !strings.Contains(res.Findings[0].String(), "l4.routes[1].allow_input: only the VM's firewall enforces it, and the project has no kairos shape: the route is open to every source") {
-		t.Fatalf("findings: %+v", res.Findings)
+	// The front's and a route's interface too: only the VM's firewall opens a port on one alone.
+	var got []string
+	for _, f := range res.Findings {
+		if f.Severity != Warning {
+			t.Errorf("not a warning: %s", f)
+		}
+		got = append(got, f.String())
+	}
+	for _, want := range []string{
+		"l4.routes[1].allow_input: only the VM's firewall enforces it, and the project has no kairos shape: the route is open to every source",
+		"front.interface: only the VM's firewall opens a port on one interface alone",
+		"l4.routes[1].interface: only the VM's firewall opens a port on one interface alone",
+	} {
+		if !slices.ContainsFunc(got, func(g string) bool { return strings.Contains(g, want) }) {
+			t.Errorf("no %q in %q", want, got)
+		}
+	}
+	if len(got) != 3 {
+		t.Errorf("findings: %q", got)
 	}
 }
 
@@ -1278,17 +1331,27 @@ func FuzzCheckL4Bind(f *testing.F) {
 	})
 }
 
-// memShares is examples/full's stack.memory.shares.
-const memShares = "shares: { postgres: { percent: 25, max: 16G }, api: 10 }"
+// memShares is examples/full's services block, which gives two services a memory share.
+const memShares = `services:                                                      # what a compose service asks of the host, beyond its compose file
+  postgres: { memory: { percent: 25, max: 16G } }              # percent of the host's RAM, recomputed at each start, capped at 16 GiB
+  api: { memory: 10 }
+`
+
+// servicesBlock is examples/full's whole services block: its memory shares, then the services' cores,
+// nftables table and address of their own.
+const servicesBlock = memShares + `  echo: { cpus: 1, irq: on }                                   # a whole core of its own, the NICs' interrupts on it too
+  ingest: { nftables: deploy/ingest.nft }                      # its own nftables table, loaded on the VM
+  relay: { interface: edge, address_input: RELAY_ADDRESS }     # an address of its own on the edge NIC (an ipvlan network)
+`
 
 // vmSizeLine is examples/full's shapes.kairos.size.
 const vmSizeLine = "size: { min: { cpus: 2, memory: 2G, disk: 20G }, recommended: { cpus: 4, memory: 8G, disk: 40G } }"
 
-// stack.memory's shares at their bounds are clean: 1 % and 90 % each, 90 % together (the errors
+// The memory shares at their bounds are clean: 1 % and 90 % each, 90 % together (the errors
 // past them are TestEachRuleFiresOnFull's).
 func TestMemorySharesBounds(t *testing.T) {
 	t.Parallel()
-	for _, shares := range []string{"shares: { postgres: 1 }", "shares: { postgres: 90 }", "shares: { postgres: 60, api: 30 }"} {
+	for _, shares := range []string{"services:\n  postgres: { memory: 1 }\n", "services:\n  postgres: { memory: 90 }\n", "services:\n  postgres: { memory: 60 }\n  api: { memory: 30 }\n"} {
 		root := testutil.CopyExample(t, "full")
 		testutil.Edit(t, root, specFile, memShares, shares)
 		if errs := errorsOf(run(t, root)); len(errs) > 0 {
@@ -1302,11 +1365,11 @@ func TestMemorySharesBounds(t *testing.T) {
 func TestMemoryShareMaxAndVMSizeBounds(t *testing.T) {
 	t.Parallel()
 	for _, e := range [][]string{
-		{memShares, "shares: { api: { percent: 10, max: 64M } }"},
-		{memShares, "shares: { postgres: { percent: 25, max: 256M } }"},
-		{memShares, "shares: { api: { percent: 10, max: 256M } }", "  api:\n    image: ${STOWAGE_IMAGE_API}\n", "  api:\n    deploy: { replicas: \"4\" }\n    image: ${STOWAGE_IMAGE_API}\n"},
-		{memShares, "shares: { postgres: { percent: 25, max: 512M } }", "    mem_limit: 256m ", "    scale: 2\n    mem_limit: 256m "},
-		{memShares, "shares: { postgres: { percent: 25, max: 1536M } }", "    mem_limit: 256m ", "    mem_reservation: 1.5g\n    mem_limit: 256m "},
+		{memShares, "services:\n  api: { memory: { percent: 10, max: 64M } }\n"},
+		{memShares, "services:\n  postgres: { memory: { percent: 25, max: 256M } }\n"},
+		{memShares, "services:\n  api: { memory: { percent: 10, max: 256M } }\n", "  api:\n    image: ${STOWAGE_IMAGE_API}\n", "  api:\n    deploy: { replicas: \"4\" }\n    image: ${STOWAGE_IMAGE_API}\n"},
+		{memShares, "services:\n  postgres: { memory: { percent: 25, max: 512M } }\n", "    mem_limit: 256m ", "    scale: 2\n    mem_limit: 256m "},
+		{memShares, "services:\n  postgres: { memory: { percent: 25, max: 1536M } }\n", "    mem_limit: 256m ", "    mem_reservation: 1.5g\n    mem_limit: 256m "},
 		{vmSizeLine, "size: { min: { cpus: 1, memory: 1G, disk: 16G }, recommended: { cpus: 1, memory: 1G, disk: 16G } }"},
 		{vmSizeLine, "size: { recommended: { memory: 1025M } }"},
 	} {
@@ -1327,7 +1390,7 @@ func TestMemoryShareMaxAlwaysReachedWarns(t *testing.T) {
 	t.Parallel()
 	warned := func(res *Result) bool {
 		for _, f := range res.Findings {
-			if f.Severity == Warning && f.Where == "stack.memory.shares.postgres.max" {
+			if f.Severity == Warning && f.Where == "services.postgres.memory.max" {
 				return true
 			}
 		}
@@ -1338,7 +1401,7 @@ func TestMemoryShareMaxAlwaysReachedWarns(t *testing.T) {
 		"{ percent: 25, max: 461M }": false, // just above: under it on the least VM
 	} {
 		root := testutil.CopyExample(t, "full")
-		testutil.Edit(t, root, specFile, memShares, "shares: { postgres: "+share+" }")
+		testutil.Edit(t, root, specFile, memShares, "services:\n  postgres: { memory: "+share+" }\n")
 		if warned(run(t, root)) {
 			t.Errorf("%s: warned with a Docker shape", share)
 		}
@@ -1371,12 +1434,12 @@ func TestTuneOnKubernetesAloneWarns(t *testing.T) {
 	}
 }
 
-// The chart sizes its pods: stack.memory on Kubernetes alone is warned.
+// The chart sizes its pods: memory shares on Kubernetes alone are warned.
 func TestMemorySharesOnKubernetesAloneWarn(t *testing.T) {
 	t.Parallel()
 	warned := func(res *Result) bool {
 		for _, f := range res.Findings {
-			if f.Severity == Warning && f.Where == "stack.memory" {
+			if f.Severity == Warning && f.Where == "services" {
 				return true
 			}
 		}
@@ -1405,5 +1468,80 @@ func TestRotationReadThroughTheAcceptedValue(t *testing.T) {
 		"      INTERNAL_SERVICE_SECRET_ACCEPTED: ${INTERNAL_SERVICE_SECRET_ACCEPTED}\n")
 	if errs := errorsOf(run(t, root)); len(errs) > 0 {
 		t.Fatal(errs)
+	}
+}
+
+// A project naming a tun device alone names no primary NIC: its VMs keep their one NIC as it is.
+func TestATunDeviceAloneNeedsNoPrimary(t *testing.T) {
+	t.Parallel()
+	root := testutil.CopyExample(t, "minimal")
+	raw, err := os.ReadFile(filepath.Join(root, specFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw = append(raw, "host:\n  interfaces:\n    vpn0: { kind: tun, reason: \"a tunnel its service opens\" }\n"...)
+	if err := os.WriteFile(filepath.Join(root, specFile), raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if errs := errorsOf(run(t, root)); len(errs) > 0 {
+		t.Errorf("errors: %v", errs)
+	}
+}
+
+// A service of the project's name has no table of its own: it would be the VM's firewall's.
+func TestAServiceTableOfTheProjectsNameIsRefused(t *testing.T) {
+	t.Parallel()
+	root := testutil.CopyExample(t, "minimal")
+	if err := os.WriteFile(filepath.Join(root, "notes.nft"), []byte("table inet notes {\n}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(filepath.Join(root, specFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw = append(raw, "services:\n  notes: { nftables: notes.nft }\n"...)
+	if err := os.WriteFile(filepath.Join(root, specFile), raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	errs := errorsOf(run(t, root))
+	if !slices.ContainsFunc(errs, func(e string) bool {
+		return strings.Contains(e, "services.notes.nftables: the service notes has the project's name")
+	}) {
+		t.Errorf("errors: %v", errs)
+	}
+}
+
+// nft's lexing: a brace or a # in a string is the string's, a comment holds nothing; a name of a
+// word nft has (exactly), a chain hooking the input with a drop policy is warned.
+func TestNftTablesAsNftReadsThem(t *testing.T) {
+	t.Parallel()
+	ok := "table inet svc {\n\tset s { type ipv4_addr; comment \"a } # include\" } # a { comment\n\tchain c { type filter hook prerouting priority 0; policy accept; } # ruleset\n}\n"
+	if err := CheckNftTable(ok, "svc"); err != nil {
+		t.Errorf("clean: %v", err)
+	}
+	for text, want := range map[string]string{
+		"table inet svc { comment \"x }":                          "a string is not closed",
+		"table inet svc { }\ntable inet other { }":                "holds something after its table",
+		"table inet svc { chain c { } ":                           "its braces do not balance",
+		"table ip svc { }":                                        "does not start with",
+		"table inet svc { chain c { jump x; } }\nflush ruleset\n": "holds something after its table",
+		"table inet svc {\r\n}\r\n":                               "holds a carriage return",
+	} {
+		if err := CheckNftTable(text, "svc"); err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("%q: %v, want %q", text, err, want)
+		}
+	}
+	if err := CheckNftTable("table inet \\\nsvc { chain c { } }\\\n", "svc"); err != nil {
+		t.Errorf("a continuation: %v", err)
+	}
+	if !nftDropsInput("table inet svc { chain g { type filter hook ingress device \"eth0\" priority 0; policy drop; } }") {
+		t.Error("ingress drop")
+	}
+	if !nftDropsInput("table inet svc { chain i { type filter hook input priority 0; policy drop; } }") ||
+		nftDropsInput("table inet svc { chain f { type filter hook forward priority 0; policy drop; } chain i { type filter hook input priority 0; policy accept; } }") {
+		t.Error("nftDropsInput")
+	}
+	if !spec.NftKeyword("mark") || spec.NftKeyword("Mark") || spec.NftKeyword("ingest") || spec.NftTableName.MatchString("a/b") {
+		t.Error("names")
 	}
 }

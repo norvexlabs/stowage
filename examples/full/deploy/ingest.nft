@@ -1,0 +1,13 @@
+# The ingest service's own table (services.ingest.nftables): the VM loads it before the service
+# starts, and the service feeds its set through the host daemon's app socket.
+table inet ingest {
+	set probes {
+		type ipv4_addr
+		flags interval
+	}
+
+	chain prerouting {
+		type filter hook prerouting priority -150; policy accept;
+		ip saddr @probes counter
+	}
+}
