@@ -73,10 +73,10 @@ The Serena MCP server is this repository's code tool; use it for every code task
   diagnostics and the package tests are clean, so the review spends itself on what they cannot see.
 - **Narrow later rounds.** Round 1 targets the whole slice. A later round targets only the files its
   fixes touched, and its brief names the fixes and what is deferred — it never re-reads the slice.
-- **Round budget.** At most three rounds per slice. After the third, a Must-class finding
-  (what is published, who may read or write it, what an install trusts, data loss) gets its fix,
-  a test that fails without it, and one more round; any other blocking finding gets the fix and
-  the test, no round.
+- **Round budget.** Three rounds per slice, and more while a round still finds a blocking
+  defect (wrong behaviour, security hole, data loss, a rule of this file broken): each fix gets a
+  test that fails without it, and each later round is narrowed to the files its fixes touched.
+  Rounds that find only minor findings end the loop: those are fixed or deferred, no round.
 - **Overlap.** While a review runs, read and design the next slice; never edit a file under review.
 - **One gate run.** `make gate` (`STOWAGE_VM_ENV=<file> make gate` when it needs e2e-vm), once per
   settled tree: check, build and lint, then only the suites gate 1 lists for the changed paths —

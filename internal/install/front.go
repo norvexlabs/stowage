@@ -112,7 +112,7 @@ func routeBody(b *strings.Builder, r spec.Route, get func(string) string, logins
 		for _, h := range strip {
 			fmt.Fprintf(b, "\trequest_header -%s\n", h)
 		}
-		fmt.Fprintf(b, "\treverse_proxy %s\n", r.Upstream)
+		reverseProxy(b, "\t", r.Upstream)
 		return
 	}
 	sources := splitSources(get(r.AllowInput))
@@ -143,7 +143,18 @@ func routeBody(b *strings.Builder, r spec.Route, get func(string) string, logins
 		}
 		b.WriteString("\t\t}\n")
 	}
-	fmt.Fprintf(b, "\t\treverse_proxy %s\n\t}\n", r.Upstream)
+	reverseProxy(b, "\t\t", r.Upstream)
+	b.WriteString("\t}\n")
+}
+
+// proxyRetry is how long the front tries an upstream it cannot reach again, resolving its name at
+// each try: a container that stops (a start-first overlap's old one, a restart) costs a request
+// a wait, never an error, while the name answers for a container that serves.
+const proxyRetry = "5s"
+
+// reverseProxy writes the route's reverse_proxy to upstream, indented by indent.
+func reverseProxy(b *strings.Builder, indent, upstream string) {
+	fmt.Fprintf(b, "%sreverse_proxy %s {\n%s\tlb_try_duration %s\n%s}\n", indent, upstream, indent, proxyRetry, indent)
 }
 
 // splitSources is an allowlist's addresses and CIDRs, separated by commas or spaces.

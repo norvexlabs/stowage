@@ -54,23 +54,26 @@ A finished item is deleted, not ticked. The plan behind it is
    Before writing a module, read the latest provider's official docs and its schema, and pin that
    release.
 
-### Network appliances — a stack between networks
-
-The interfaces by role (`host.interfaces`, with their routing and ethtool settings), a service's
-cores, nftables table and address of its own (`services.<name>`) are done; what is left:
-
-6. **An upgrade that overlaps** (`services.<s>.update: start-first`, as Swarm's `update_config.order`
-    and a Deployment's `maxSurge` without `maxUnavailable`): an appliance's clients cannot be told
-    to retry, and a stop-then-start drops every connection and refuses new ones until the new
-    container listens. Stowage starts the new container beside the old one, waits for its
-    healthcheck, then stops the old one with its `stop_grace_period` as the drain; the rollback
-    is kept. Sharing the port is the app's, by either canonical way: `SO_REUSEPORT` on the host's
-    network, or its own handoff over a Unix socket in a directory both containers mount
-    (`services.<s>.update_socket: <dir>`); a bridge-network service with a published port is
-    refused (two containers cannot publish one port). On Kubernetes, the chart's strategy.
-
 ## Should
 
+- **A start-first start's engine calls**: each dependency of each start-first service costs four
+  sequential calls (`ps`, `inspect`, `compose config --hash`, `image inspect`), repeated across
+  services sharing one, and `startFirst` renders `compose config` a second time after `model`.
+  One `config --hash` of every service and one batched inspect per start would do. The example
+  api's drain still has a microsecond window (a connection completing between its last accept
+  and the listener's shutdown is reset; the front retries a `GET` alone).
+- **One engine snapshot per start**: each start-first service that reaches its overlap lists and
+  inspects every container of the engine (`ps --all`, a batch `inspect`) to find one joining its
+  old container; one snapshot per start would serve them all, and a batch that fails (a container
+  removed meanwhile) is read again one container at a time, which a retry without the missing
+  IDs would spare. The `:ro`/`:rw` strip of a `volumes_from` value is written three times (the
+  config's joiner, the engine's, lint's).
+- **Lint on a compose list entry that is not a string**: `links`, `external_links` and
+  `volumes_from` entries of another kind (a number) are left out of the start-first checks; Compose
+  refuses them, so lint could say so.
+- **The networks record per service**: `.stowage-networks` digests every network of the project, so
+  a change to a network a start-first service does not join replaces it stop-first all the same;
+  a digest of each service's own networks would keep it overlapping.
 - **Several NICs on a cloud**: `vm create` refuses more than one `host.interfaces` NIC on AWS,
   Azure and Google Cloud, whose NICs' MACs are the cloud's (the seed cannot name them by MAC) and
   which need a subnet (AWS, Azure) or a VPC network (Google Cloud) for each. Naming them by their

@@ -6,6 +6,13 @@ follow [SemVer](https://semver.org/).
 ## [0.14.0]
 
 ### Added
+- **Upgrades that overlap**: `services.<name>.update: start-first` starts a service's new
+  container beside the old one and stops the old one, with its grace period as the drain, only once
+  the new one is healthy; a new container that fails is removed and the old one serves on.
+  `update_socket` gives both containers a directory to hand listening sockets over. Lint refuses
+  what two containers cannot share (a published port off the host's network, a fixed name, an
+  address of its own, several replicas, a disabled healthcheck). The front tries an upstream it
+  cannot reach again for 5 s, so a service that restarts costs a request a wait, not an error.
 - **SBOMs, signed, exported and audited**: a project that signs gives each image of a release,
   its installer, its OS bundle and each disk an SPDX SBOM, attested with the release key beside
   the signatures (`cosign verify-attestation --type spdxjson` reads it), and carries a pinned

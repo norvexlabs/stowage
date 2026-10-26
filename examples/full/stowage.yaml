@@ -42,7 +42,7 @@ stack:
 
 services:                                                      # what a compose service asks of the host, beyond its compose file
   postgres: { memory: { percent: 25, max: 16G } }              # percent of the host's RAM, recomputed at each start, capped at 16 GiB
-  api: { memory: 10 }
+  api: { memory: 10, update: start-first, update_socket: /run/atlas/handoff }  # its new container healthy beside the old before the old stops
   echo: { cpus: 1, irq: on }                                   # a whole core of its own, the NICs' interrupts on it too
   ingest: { nftables: deploy/ingest.nft }                      # its own nftables table, loaded on the VM
   relay: { interface: edge, address_input: RELAY_ADDRESS }     # an address of its own on the edge NIC (an ipvlan network)

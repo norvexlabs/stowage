@@ -75,7 +75,7 @@ func TestDomainsServeHTTPSFromLetsEncryptWithTheSafeDefaults(t *testing.T) {
 	if strings.Contains(cf, "redir") {
 		t.Errorf("a redirect of its own on port 443:\n%s", cf)
 	}
-	for _, want := range []string{"\thttp_port 80\n\thttps_port 443\n\tservers {\n\t\tprotocols h1 h2\n\t}\n\tcert_issuer acme\n\temail ops@example.com\n", "notes.example.com {\n\t" + hsts + "\n\treverse_proxy web:8080\n}", "api.example.com {\n\t" + hsts + "\n"} {
+	for _, want := range []string{"\thttp_port 80\n\thttps_port 443\n\tservers {\n\t\tprotocols h1 h2\n\t}\n\tcert_issuer acme\n\temail ops@example.com\n", "notes.example.com {\n\t" + hsts + "\n\treverse_proxy web:8080 {\n\t\tlb_try_duration 5s\n\t}\n}", "api.example.com {\n\t" + hsts + "\n"} {
 		if !strings.Contains(cf, want) {
 			t.Errorf("Caddyfile lacks %q:\n%s", want, cf)
 		}
@@ -844,7 +844,9 @@ func TestARouteRefusesOtherSourcesThenStripsThenAsksTheAuthService(t *testing.T)
 			uri /check?x=1
 			copy_headers X-Auth-Request-User X-Auth-Request-Email
 		}
-		reverse_proxy api:9090
+		reverse_proxy api:9090 {
+			lb_try_duration 5s
+		}
 	}
 `; got != want {
 		t.Errorf("every directive:\n%s\nwant\n%s", got, want)
@@ -852,15 +854,15 @@ func TestARouteRefusesOtherSourcesThenStripsThenAsksTheAuthService(t *testing.T)
 	// An empty allowlist refuses everyone; an empty address leaves forward auth off, the headers it
 	// would copy still stripped.
 	strips := "request_header -X-Auth-Request-*\n\t\trequest_header -X-Auth-Request-User\n\t\trequest_header -X-Auth-Request-Email\n"
-	if got, want := body(nil), "\troute {\n\t\trespond 403\n\t\t"+strips+"\t\treverse_proxy api:9090\n\t}\n"; got != want {
+	if got, want := body(nil), "\troute {\n\t\trespond 403\n\t\t"+strips+"\t\treverse_proxy api:9090 {\n\t\t\tlb_try_duration 5s\n\t\t}\n\t}\n"; got != want {
 		t.Errorf("empty inputs:\n%s\nwant\n%s", got, want)
 	}
 	r.AllowInput, r.ForwardAuth.URIInput = "", ""
 	// Caddy requires a URI: / without one.
-	if got, want := body(map[string]string{"AUTH": "auth:4180", "AUTH_URI": "/ignored"}), "\troute {\n\t\t"+strips+"\t\tforward_auth auth:4180 {\n\t\t\turi /\n\t\t\tcopy_headers X-Auth-Request-User X-Auth-Request-Email\n\t\t}\n\t\treverse_proxy api:9090\n\t}\n"; got != want {
+	if got, want := body(map[string]string{"AUTH": "auth:4180", "AUTH_URI": "/ignored"}), "\troute {\n\t\t"+strips+"\t\tforward_auth auth:4180 {\n\t\t\turi /\n\t\t\tcopy_headers X-Auth-Request-User X-Auth-Request-Email\n\t\t}\n\t\treverse_proxy api:9090 {\n\t\t\tlb_try_duration 5s\n\t\t}\n\t}\n"; got != want {
 		t.Errorf("no allowlist, no URI input:\n%s\nwant\n%s", got, want)
 	}
-	if got, want := body(nil), "\trequest_header -X-Auth-Request-*\n\trequest_header -X-Auth-Request-User\n\trequest_header -X-Auth-Request-Email\n\treverse_proxy api:9090\n"; got != want {
+	if got, want := body(nil), "\trequest_header -X-Auth-Request-*\n\trequest_header -X-Auth-Request-User\n\trequest_header -X-Auth-Request-Email\n\treverse_proxy api:9090 {\n\t\tlb_try_duration 5s\n\t}\n"; got != want {
 		t.Errorf("forward auth off:\n%s\nwant\n%s", got, want)
 	}
 }
@@ -877,7 +879,7 @@ func TestARouteAsksForItsLogin(t *testing.T) {
 		return b.String()
 	}
 	if got, want := body(map[string]login{"ops": {"ops", "$2a$10$h"}}), "\t@stowage_denied not remote_ip 10.0.0.0/8\n\troute {\n\t\trespond @stowage_denied 403\n"+
-		"\t\tbasic_auth {\n\t\t\tops $2a$10$h\n\t\t}\n\t\trequest_header -Authorization\n\t\treverse_proxy api:9090\n\t}\n"; got != want {
+		"\t\tbasic_auth {\n\t\t\tops $2a$10$h\n\t\t}\n\t\trequest_header -Authorization\n\t\treverse_proxy api:9090 {\n\t\t\tlb_try_duration 5s\n\t\t}\n\t}\n"; got != want {
 		t.Errorf("got\n%s\nwant\n%s", got, want)
 	}
 	for _, none := range []map[string]login{nil, {"ops": {User: "ops"}}} {

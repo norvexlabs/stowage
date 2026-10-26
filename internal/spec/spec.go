@@ -138,7 +138,19 @@ type Service struct {
 	// beside the stack's bridge, the address from AddressInput.
 	Interface    string `yaml:"interface"`
 	AddressInput string `yaml:"address_input"`
+	// Update is how a start replaces its container: stop-first (the default), or start-first, the
+	// new container healthy beside the old before the old one stops.
+	Update string `yaml:"update"`
+	// UpdateSocket is a directory, in the container, both containers of a start-first overlap
+	// mount: where the old one hands its listening sockets to the new.
+	UpdateSocket string `yaml:"update_socket"`
 }
+
+// The orders of services.<name>.update.
+const (
+	UpdateStopFirst  = "stop-first"
+	UpdateStartFirst = "start-first"
+)
 
 // The postures of services.<name>.irq.
 const (

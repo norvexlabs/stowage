@@ -165,10 +165,16 @@ type Installer struct {
 	// before .env removes it again.
 	removeDir bool
 	// tuned is the host's tune.System once its engine read: one `docker info` per run.
-	tuned    *tune.System
-	byo      *byoCert          // --tls byo: the operator's certificate, checked
-	newCert  *byoCert          // a re-run's byo certificate, written before the stack comes up again
-	answered map[string]string // the form's answers, kept when it goes back to the TLS mode
+	tuned *tune.System
+	// networks is the digest of the stack's networks this start runs (NetworksFile), once read;
+	// prevNetworks the last start's that came up, as takeNetworks read it (prevNetworksErr when it
+	// could not); networksMoved is set once this start may have changed the engine's networks.
+	networks, prevNetworks string
+	prevNetworksErr        error
+	networksMoved          bool
+	byo                    *byoCert          // --tls byo: the operator's certificate, checked
+	newCert                *byoCert          // a re-run's byo certificate, written before the stack comes up again
+	answered               map[string]string // the form's answers, kept when it goes back to the TLS mode
 	// recorded are the values an upgrade keeps, which an added input's default may name.
 	recorded map[string]string
 	// again: this run is a re-run of an install.
@@ -1236,10 +1242,21 @@ func (in *Installer) composeFiles(content bool, extra ...string) []string {
 // fails with one of the release's images gone from the engine since it was pulled (removed
 // meanwhile: Compose then refuses to create its container), the images are pulled again and the
 // stack started once more.
-func (in *Installer) up(ctx context.Context, env *EnvFile) error {
+func (in *Installer) up(ctx context.Context, env *EnvFile) (err error) {
 	if err := in.volumesSplit(); err != nil {
 		return err
 	}
+	if err := in.takeNetworks(); err != nil {
+		return err
+	}
+	// A start that fails having moved no network puts the record back: the engine runs the
+	// networks it records.
+	in.networksMoved = false
+	defer func() {
+		if err != nil && !in.networksMoved {
+			in.keepNetworks()
+		}
+	}()
 	in.O.logf("starting %s", in.R.Spec.Name)
 	base, cleanup, err := in.pullEnviron(env)
 	if err != nil {
@@ -1286,6 +1303,12 @@ func (in *Installer) up(ctx context.Context, env *EnvFile) error {
 		return err
 	}
 	run := func() error {
+		// The start-first services first: the stack's start then finds them as it runs them.
+		if err := in.startFirst(ctx, environ, m, names); err != nil {
+			return err
+		}
+		// From here the stack's start can make networks again.
+		in.networksMoved = true
 		// The containers are made first when a new volume is given its uid: it then holds what
 		// the image put in it.
 		if len(names) > 0 {
@@ -1326,6 +1349,9 @@ func (in *Installer) up(ctx context.Context, env *EnvFile) error {
 		return fmt.Errorf("the stack did not become ready: %w (see: docker compose --project-directory %s logs)", err, in.O.Dir)
 	}
 	in.certDone()
+	if err := in.recordNetworks(); err != nil {
+		in.O.logf("warning: recording the stack's networks: %v", err)
+	}
 	get := func(k string) string { v, _ := env.Get(k); return v }
 	for _, r := range in.R.Spec.L4.Routes {
 		if e := in.l4Exposure(r, get); e != "" {
@@ -1453,6 +1479,7 @@ func (in *Installer) ipv6Network(ctx context.Context, env *EnvFile) error {
 	}
 	in.O.logf("IPv6 turned %s: the stack stops, and its network is made again", map[bool]string{true: "on", false: "off"}[want])
 	// Orphans too: a container left on the network would keep it.
+	in.networksMoved = true
 	if _, err := in.Compose(ctx, env, in.O.Log, "down", "--remove-orphans"); err != nil {
 		return fmt.Errorf("stopping the stack to make its network again: %w", err)
 	}

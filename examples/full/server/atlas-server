@@ -25,6 +25,7 @@ import glob
 import json
 import os
 import re
+import signal
 import socket
 import socketserver
 import subprocess
@@ -210,6 +211,11 @@ class Ingest(Handler):
             return self.reply(502, {"error": str(e)})
 
 
+class Server(ThreadingHTTPServer):
+    # server_close waits for the requests in flight (one per connection: HTTP/1.0).
+    daemon_threads = False
+
+
 class EchoTCP(socketserver.StreamRequestHandler):
     def handle(self):
         prefix = os.environ.get("ECHO_ENDPOINT", "").encode()
@@ -268,7 +274,27 @@ def main():
     if len(sys.argv) > 2:
         port = int(sys.argv[2])
     log(f"atlas {role} {os.environ.get('ATLAS_VERSION', 'dev')} on :{port}")
-    ThreadingHTTPServer(("", port), handler).serve_forever()
+    server = Server(("", port), handler)
+    # SIGTERM drains (a start-first upgrade stops the old container once the new one is healthy):
+    # the connections already queued accepted, then the listener closed, so a new connection is
+    # refused and the front dials the name's other address; the requests in flight answered; then
+    # the process exits.
+    def drain(*_):
+        server.socket.setblocking(False)
+        while True:
+            try:
+                conn, addr = server.socket.accept()
+            except OSError:
+                break
+            conn.setblocking(True)
+            server.process_request(conn, addr)
+        server.socket.shutdown(socket.SHUT_RDWR)
+        threading.Thread(target=server.shutdown).start()
+
+    signal.signal(signal.SIGTERM, drain)
+    server.serve_forever()
+    server.server_close()
+    log(f"atlas {role} drained")
 
 
 if __name__ == "__main__":

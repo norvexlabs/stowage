@@ -263,11 +263,32 @@ event "http://127.0.0.1:$INGEST_PORT/events"
 atlas_running "$V1" 1
 EV=$(status events) # the events so far, which the upgrades keep
 
-step "ship $V2 (a migration), upgrade --version $V2"
+step "ship $V2 (a migration), upgrade --version $V2: the api start-first, no request lost"
 full_release 2 002_event_source.sql "-- 002: where an event came from
 ALTER TABLE events ADD COLUMN source text;"
-"${CTL[@]}" upgrade --version "$V2" --dir "$D" --no-input >"$WORK/up2.log" 2>&1 || { cat "$WORK/up2.log"; fail "upgrade to $V2"; }
+# The api route asked every 0.1 s through the upgrade: its new container serves before the old one
+# stops, which drains.
+(while [[ ! -e $WORK/up2.done ]]; do
+	curl -s -o /dev/null -w '%{http_code}\n' --max-time 5 "http://127.0.0.1:$API_PORT/health" >>"$WORK/poll2.log" || true
+	sleep 0.1
+done) &
+poller=$!
+up2=0
+"${CTL[@]}" upgrade --version "$V2" --dir "$D" --no-input >"$WORK/up2.log" 2>&1 || up2=$?
+touch "$WORK/up2.done"
+wait "$poller"
+((up2 == 0)) || { cat "$WORK/up2.log"; fail "upgrade to $V2"; }
 atlas_running "$V2" 2
+grep -q 'services.api: the new container is healthy, the old one stopped' "$WORK/up2.log" || { cat "$WORK/up2.log"; fail "the upgrade did not replace the api start-first"; }
+lost=$(grep -cv '^200$' "$WORK/poll2.log" || true)
+((lost == 0 && $(wc -l <"$WORK/poll2.log") > 10)) || fail "the api route failed $lost of $(wc -l <"$WORK/poll2.log") requests through the upgrade: $(sort "$WORK/poll2.log" | uniq -c | tr '\n' ' ')"
+api=$(docker ps --filter "label=com.docker.compose.project=$(project)" --filter label=com.docker.compose.service=api --format '{{.ID}}')
+[[ $(docker inspect --format '{{range .Mounts}}{{.Name}} {{.Destination}};{{end}}' "$api") == *"$(project)_stowage-update-api /run/atlas/handoff;"* ]] ||
+	fail "the api does not mount its update_socket volume at /run/atlas/handoff"
+# A start that changes nothing leaves it: the configuration's digest matches its container's.
+"${CTL[@]}" --dir "$D" --no-input >"$WORK/rerun2.log" 2>&1 || { cat "$WORK/rerun2.log"; fail "re-run after the upgrade"; }
+! grep -q 'services.api' "$WORK/rerun2.log" && [[ $(docker ps --filter "label=com.docker.compose.project=$(project)" --filter label=com.docker.compose.service=api --format '{{.ID}}') == "$api" ]] ||
+	{ cat "$WORK/rerun2.log"; fail "a re-run that changes nothing replaced the api"; }
 kept "$V2"
 [[ $(status events) == "$EV" && $(status admins) == 1 ]] || fail "the upgrade lost data"
 gzip -dc "$D"/snapshots/*.sql.gz >"$WORK/snapshot.sql" && grep -q 'PostgreSQL database dump' "$WORK/snapshot.sql" || fail "the upgrade took no pg_dump snapshot"

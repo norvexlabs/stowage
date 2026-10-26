@@ -156,7 +156,7 @@ func (in *Installer) model(ctx context.Context, environ []string) (*composeModel
 // ctr's MTU.
 func contentCompose(m *composeModel, environ []string, key []byte, ctr tune.Container, mem hostPlan, hn hostNet) ([]byte, error) {
 	lookup := environLookup(environ)
-	services := map[string]any{}
+	services, volumes := map[string]any{}, map[string]any{}
 	for _, name := range sortedKeys(m.Services) {
 		svc := m.Services[name]
 		h := hmac.New(sha256.New, key)
@@ -213,6 +213,10 @@ func contentCompose(m *composeModel, environ []string, key []byte, ctr tune.Cont
 		if v, ok := mem.IPVlans[name]; ok {
 			giveIPVlan(extra, v, svc.Networks)
 		}
+		if dir, ok := mem.Sockets[name]; ok {
+			extra["volumes"] = []string{UpdateVolume(name) + ":" + dir}
+			volumes[UpdateVolume(name)] = map[string]any{}
+		}
 		if len(extra) > 0 {
 			services[name] = extra
 		}
@@ -232,11 +236,10 @@ func contentCompose(m *composeModel, environ []string, key []byte, ctr tune.Cont
 		return []byte(contentPlaceholder), nil
 	}
 	doc := map[string]any{}
-	if len(services) > 0 {
-		doc["services"] = services
-	}
-	if len(networks) > 0 {
-		doc["networks"] = networks
+	for k, v := range map[string]map[string]any{"services": services, "networks": networks, "volumes": volumes} {
+		if len(v) > 0 {
+			doc[k] = v
+		}
 	}
 	out, err := yaml.Marshal(doc)
 	if err != nil {
@@ -344,6 +347,7 @@ func (in *Installer) networkMTU(ctx context.Context, environ []string, m *compos
 			continue
 		}
 		in.O.logf("the host's MTU is %d, network %s was made with %s: the stack stops, and its networks are made again", mtu, name, madeMTU(made))
+		in.networksMoved = true
 		if _, err := in.O.Docker.Run(ctx, Cmd{Args: append(in.composeBase(), "down", "--remove-orphans"), Env: environ, Stream: in.O.Log}); err != nil {
 			return fmt.Errorf("stopping the stack to make its networks again: %w", err)
 		}
@@ -369,6 +373,14 @@ func (in *Installer) writeContent(ctx context.Context, m *composeModel, env *Env
 		return err
 	}
 	mem.Tables = in.tableLoads()
+	for name, svc := range in.R.Spec.Services {
+		if svc.UpdateSocket != "" {
+			if mem.Sockets == nil {
+				mem.Sockets = map[string]string{}
+			}
+			mem.Sockets[name] = svc.UpdateSocket
+		}
+	}
 	if ctr.MTUUnread {
 		// No default route this moment: the networks keep the MTU the last start gave them,
 		// rather than be made again without it.

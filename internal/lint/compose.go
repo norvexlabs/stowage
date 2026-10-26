@@ -1,6 +1,7 @@
 package lint
 
 import (
+	"cmp"
 	"errors"
 	"fmt"
 	"net/netip"
@@ -49,6 +50,20 @@ type Service struct {
 	Devices     any    `yaml:"devices"`
 	NetworkMode string `yaml:"network_mode"`
 	Networks    any    `yaml:"networks"`
+	// ContainerName, MacAddress, Healthcheck, Ipc and VolumesFrom are what an overlapping start reads
+	// (services.<name>.update).
+	ContainerName string `yaml:"container_name"`
+	MacAddress    string `yaml:"mac_address"`
+	// NetworksFrom is the extends base its networks come from when it declares none itself.
+	NetworksFrom string `yaml:"-"`
+	Ipc          string `yaml:"ipc"`
+	VolumesFrom  any    `yaml:"volumes_from"`
+	Links        any    `yaml:"links"`
+	ExtLinks     any    `yaml:"external_links"`
+	Healthcheck  *struct {
+		Disable any `yaml:"disable"`
+		Test    any `yaml:"test"`
+	} `yaml:"healthcheck"`
 	// Privileged, CapAdd and Pid are what the service is given of the host's powers.
 	Privileged any    `yaml:"privileged"`
 	CapAdd     any    `yaml:"cap_add"`
@@ -179,6 +194,35 @@ func (c *Compose) inherit() map[string]error {
 		if svc.Pid == "" {
 			svc.Pid = b.Pid
 		}
+		if svc.ContainerName == "" {
+			svc.ContainerName = b.ContainerName
+		}
+		// Compose merges a healthcheck key by key: the service's own over its base's.
+		if b.Healthcheck != nil {
+			h := *b.Healthcheck
+			if own := svc.Healthcheck; own != nil {
+				if own.Disable != nil {
+					h.Disable = own.Disable
+				}
+				if own.Test != nil {
+					h.Test = own.Test
+				}
+			}
+			svc.Healthcheck = &h
+		}
+		if svc.Ipc == "" {
+			svc.Ipc = b.Ipc
+		}
+		if svc.MacAddress == "" {
+			svc.MacAddress = b.MacAddress
+		}
+		if svc.Networks == nil && b.Networks != nil {
+			svc.NetworksFrom = cmp.Or(b.NetworksFrom, from)
+		}
+		svc.Networks = mergeNetworks(svc.Networks, b.Networks)
+		svc.VolumesFrom = joinList(svc.VolumesFrom, b.VolumesFrom)
+		svc.Links = joinList(svc.Links, b.Links)
+		svc.ExtLinks = joinList(svc.ExtLinks, b.ExtLinks)
 		svc.CapAdd = joinList(svc.CapAdd, b.CapAdd)
 		// The memory a share's maximum is checked against: each setting the service leaves unset.
 		for _, f := range []struct{ own, base *any }{
@@ -629,9 +673,72 @@ var ProvidedVars = map[string]string{
 	"STOWAGE_TLS_MODE":         "how the front serves: none (loopback), acme, dns-cloudflare, byo or internal (never set without a front)",
 }
 
-// privilegedText is whether a privileged: compose reads as a string may turn it on: "true", or an
-// interpolation lint cannot read.
-func privilegedText(v any) bool {
-	s, ok := v.(string)
-	return ok && (strings.EqualFold(strings.TrimSpace(s), "true") || strings.Contains(s, "${"))
+// mergeNetworks is a service's networks merged with its extends base's, as Compose merges them:
+// by network, the service's settings of one over its base's, key by key; a list names networks
+// without settings.
+func mergeNetworks(own, base any) any {
+	if base == nil {
+		return own
+	}
+	if own == nil {
+		return base
+	}
+	asMap := func(v any) (map[string]any, bool) {
+		out := map[string]any{}
+		switch t := v.(type) {
+		case map[string]any:
+			for k, c := range t {
+				out[k] = c
+			}
+		case []any:
+			for _, n := range t {
+				name, ok := n.(string)
+				if !ok {
+					return nil, false
+				}
+				out[name] = nil
+			}
+		default:
+			return nil, false
+		}
+		return out, true
+	}
+	out, okB := asMap(base)
+	ownMap, okO := asMap(own)
+	if !okB || !okO {
+		return own // a shape this does not read: the service's own, as before extends
+	}
+	for n, c := range ownMap {
+		b, _ := out[n].(map[string]any)
+		o, _ := c.(map[string]any)
+		merged := map[string]any{}
+		for k, v := range b {
+			merged[k] = v
+		}
+		for k, v := range o {
+			merged[k] = v
+		}
+		out[n] = merged
+	}
+	return out
+}
+
+// composeBool is a boolean key as Compose casts it: the YAML boolean, or a string of true, yes, y
+// or on (false, no, n, off), whatever their case. known is false for any other string: an
+// interpolation only a run resolves, or one Compose refuses. Absent is a known false.
+func composeBool(v any) (b, known bool) {
+	switch t := v.(type) {
+	case nil:
+		return false, true
+	case bool:
+		return t, true
+	case string:
+		switch strings.ToLower(t) {
+		case "true", "yes", "y", "on":
+			return true, true
+		case "false", "no", "n", "off":
+			return false, true
+		}
+	}
+	return false, false
 }

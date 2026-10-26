@@ -30,6 +30,8 @@ type hostPlan struct {
 	// Tables are each service's table's last load's token (TableLabel, tableLoads), on the VM: a
 	// load changes it, so the start that loads a table recreates its service.
 	Tables map[string]string
+	// Sockets are each start-first service's update_socket directory, which UpdateVolume mounts.
+	Sockets map[string]string
 }
 
 // memoryPlan is the release's memory shares on host h, read at each start, so a host given more

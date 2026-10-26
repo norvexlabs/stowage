@@ -1523,6 +1523,33 @@ every shape, the VM end-to-end test upgrading through it), then the health gate.
   a bridge's NAT is what such a service avoids; its traffic crosses no host firewall, so its rules
   are its table's. Kubernetes gets the equivalents as the cluster's: the CPU manager's static
   policy, printed.
+- **An upgrade that overlaps is Compose's own scaling, not a proxy** (`services.<name>.update:
+  start-first`): an appliance's clients cannot be told to retry, so its new container must serve
+  before the old one stops. Compose has no start-first order outside Swarm, so the start scales the
+  service to two with `--no-recreate` (the old container kept, the new one made with this start's
+  configuration), waits for it with `--wait`, then stops and removes the old one, before the
+  stack's own `up`, which then finds the service as it runs it. Stowage holds no port in between:
+  two containers cannot publish one port, so a service reached from outside runs on the host's
+  network and shares its port the canonical ways, `SO_REUSEPORT` or the app's own socket handoff
+  (`update_socket`, a volume both containers mount); one behind the front is reached by name,
+  which answers for both. A failed new container is removed and the old one keeps serving: the
+  start fails as any other, and the release's rollback is unchanged. The overlap starts only
+  against what already runs: a dependency the start makes or changes, an anonymous volume, a
+  container not healthy leave the service to the stack's start, stop-first, rather than start the
+  new container against the old world. The front tries an unreachable upstream again for 5 s on
+  every route, not only a start-first one's: a restart of any service then costs a wait, and a
+  down upstream answers 502 after 5 s instead of at once. Compose makes a network whose
+  configuration changed again under every container on it, so an overlap runs only on the networks
+  the last start that came up ran: their digest is recorded (`.stowage-networks`), read and
+  removed as a start begins, before it changes anything (one it cannot remove fails it there),
+  put back only when the start fails before it may have moved a network (the overlaps make none;
+  the stack's own start and a teardown for a changed MTU or IPv6 can), so a start that fails later
+  leaves none and the next replaces its start-first services stop-first. The record is
+  for availability alone: a stale one (the engine's networks moved by a run that never reached the
+  start, a power loss between writing the stack and starting it) lets an overlap's `up` make the
+  diverged network again, stopping what is on it until the stack's start brings it back or the
+  start fails, never losing data, so the engine's networks are not compared with it. Kubernetes has it as a
+  Deployment's strategy, which the chart sets.
 - **Memory follows the host** (`stack.memory`): a service's limit is a share of the RAM, set in
   `stowage-content.yaml` at each start, so a resized VM or host is followed at its next start
   without a new release. A share only raises: the compose file's own limit and its reservation

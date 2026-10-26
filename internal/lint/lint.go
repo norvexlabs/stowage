@@ -500,8 +500,11 @@ func (l *linter) stack() {
 		}
 		// Not refused: a stack may need one (a VPN's NET_ADMIN). Each makes a compromise of the
 		// service one of the host.
-		if b, _ := svc.Privileged.(bool); b || privilegedText(svc.Privileged) {
+		switch b, known := composeBool(svc.Privileged); {
+		case b:
 			l.warnf(w+".privileged", "true: the container holds every power of the host's root, its devices included; a compromise of the service is the host's")
+		case !known:
+			l.warnf(w+".privileged", "%v, which only a run knows or Compose does not read as a boolean: if true, the container holds every power of the host's root, its devices included; a compromise of the service is the host's", svc.Privileged)
 		}
 		if caps := joinCaps(svc.CapAdd); caps != "" {
 			l.warnf(w+".cap_add", "%s: powers of the host's root beyond Docker's defaults; give the fewest the service needs", caps)
@@ -550,7 +553,7 @@ func (l *linter) memory() {
 		svc, at := l.s.Services[name], "services."+name
 		l.service(at, name)
 		if svc == (spec.Service{}) {
-			l.errf(at, "says nothing: memory, cpus, nftables or interface")
+			l.errf(at, "says nothing: memory, cpus, nftables, interface or update")
 		}
 		l.serviceHost(at, name, svc)
 		share := svc.Memory
@@ -567,6 +570,7 @@ func (l *linter) memory() {
 		}
 		total += share.Percent
 	}
+	l.containerJoins()
 	if total > spec.MaxMemoryShares {
 		l.errf("services", "the memory shares total %d %%: at most %d, the rest is the OS's, the engine's and Stowage's", total, spec.MaxMemoryShares)
 	}
@@ -1012,7 +1016,10 @@ func (l *linter) l4Host(where string, r spec.L4Route, name string, port int) {
 		return
 	}
 	at := l.s.Stack.Compose + ": services." + name
-	if svc.Networks != nil {
+	switch {
+	case svc.NetworksFrom != "":
+		l.errf(l.s.Stack.Compose+": services."+svc.NetworksFrom+".networks", "%s extends %s, whose networks it takes: the VM runs %s on the host's network (the L4 route %s), which holds no other: leave them out of %s, or extend another", name, svc.NetworksFrom, name, r.Name, svc.NetworksFrom)
+	case svc.Networks != nil:
 		l.errf(at+".networks", "the VM runs %s on the host's network (the L4 route %s), which holds no other: leave its networks out", name, r.Name)
 	}
 	if _, n := svc.MemFloor(); n > 1 {

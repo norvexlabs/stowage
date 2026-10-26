@@ -4,6 +4,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"testing"
@@ -439,6 +440,44 @@ func TestEachRuleFiresOnFull(t *testing.T) {
 		{"service address input unknown", []edit{{sp, "address_input: RELAY_ADDRESS }", "address_input: NOPE }"}}, nil, "services.relay.address_input: NOPE is not an input"},
 		{"service address default", []edit{{sp, `prompt: "Address the relay has of its own on the edge network (empty: none)", optional: true,`, `prompt: "Address the relay has of its own on the edge network (empty: none)", default: nowhere,`}}, nil, `services.relay.address_input: RELAY_ADDRESS's default "nowhere" is not an address`},
 		{"service on the host's network with an address", []edit{{"deploy/compose.yaml", "    profiles: [relay]\n", "    profiles: [relay]\n    network_mode: host\n"}}, nil, "services.relay.interface: relay runs with network_mode host"},
+		{"update order", []edit{{sp, "update: start-first, update_socket: /run/atlas/handoff", "update: rolling"}}, nil, `services.api.update: "rolling": stop-first (the default) or start-first`},
+		{"update socket without start-first", []edit{{sp, "update: start-first, update_socket:", "update_socket:"}}, nil, "services.api.update_socket: is the directory a start-first overlap hands its sockets over in"},
+		{"update socket relative", []edit{{sp, "update_socket: /run/atlas/handoff", "update_socket: run/atlas"}}, nil, `services.api.update_socket: "run/atlas": a directory of the container`},
+		{"update socket /", []edit{{sp, "update_socket: /run/atlas/handoff", "update_socket: /"}}, nil, `services.api.update_socket: "/": a directory of the container`},
+		{"start-first with an address", []edit{{sp, "address_input: RELAY_ADDRESS }", "address_input: RELAY_ADDRESS, update: start-first }"}}, nil, "services.relay.update: relay has an address of its own"},
+		{"start-first with a container name", []edit{{cp, "  api:\n    image: ${STOWAGE_IMAGE_API}\n", "  api:\n    container_name: atlas-api\n    image: ${STOWAGE_IMAGE_API}\n"}}, nil, "services.api.update: api sets container_name atlas-api"},
+		{"start-first with replicas", []edit{{cp, "  api:\n    image: ${STOWAGE_IMAGE_API}\n", "  api:\n    deploy: { replicas: 2 }\n    image: ${STOWAGE_IMAGE_API}\n"}}, nil, "services.api.update: api runs 2 containers"},
+		{"start-first publishing a port", []edit{{cp, "  api:\n    image: ${STOWAGE_IMAGE_API}\n", "  api:\n    ports: [\"127.0.0.1:9090:9090\"]\n    image: ${STOWAGE_IMAGE_API}\n"}}, nil, "services.api.update: api publishes ports from its own network"},
+		{"start-first without its healthcheck", []edit{{cp, "    healthcheck:\n      test: [\"CMD\", \"atlas-server\", \"probe\", \"9090\"]\n      interval: 2s\n      retries: 30\n", "    healthcheck: { disable: true }\n"}}, nil, "services.api.update: api disables its healthcheck"},
+		{"start-first with replicas from a variable", []edit{{cp, "  api:\n    image: ${STOWAGE_IMAGE_API}\n", "  api:\n    deploy: { replicas: \"${API_REPLICAS}\" }\n    image: ${STOWAGE_IMAGE_API}\n"}}, nil, `services.api.update: api's number of containers is "${API_REPLICAS}", which only a run knows`},
+		{"start-first with a NONE healthcheck", []edit{{cp, "      test: [\"CMD\", \"atlas-server\", \"probe\", \"9090\"]\n", "      test: [\"NONE\"]\n"}}, nil, "services.api.update: api disables its healthcheck"},
+		{"start-first with a namespace sidecar", []edit{{cp, "    profiles: [relay]\n", "    profiles: [relay]\n    network_mode: service:api\n"}}, nil, "services.api.update: relay joins api's namespace (network_mode: service:api)"},
+		{"start-first with a pid sidecar", []edit{{cp, "    profiles: [relay]\n", "    profiles: [relay]\n    pid: service:api\n"}}, nil, "services.api.update: relay joins api's namespace (pid: service:api)"},
+		{"start-first with an ipc sidecar", []edit{{cp, "    profiles: [relay]\n", "    profiles: [relay]\n    ipc: service:api\n"}}, nil, "services.api.update: relay joins api's namespace (ipc: service:api)"},
+		{"start-first lending its volumes", []edit{{cp, "    profiles: [relay]\n", "    profiles: [relay]\n    volumes_from: [\"api:ro\"]\n"}}, nil, "services.api.update: relay mounts api's volumes (volumes_from: api:ro)"},
+		{"start-first in another's namespace", []edit{{cp, "  api:\n    image: ${STOWAGE_IMAGE_API}\n", "  api:\n    network_mode: service:ui\n    image: ${STOWAGE_IMAGE_API}\n"}}, nil, "services.api.update: api runs in another's network namespace (network_mode service:ui)"},
+		{"start-first lending its volumes through extends", []edit{{cp, "    profiles: [relay]\n", "    profiles: [relay]\n    extends: ui\n"}, {cp, "  ui:\n    image: ${STOWAGE_IMAGE_UI}\n", "  ui:\n    volumes_from: [api]\n    image: ${STOWAGE_IMAGE_UI}\n"}}, nil, "services.api.update: relay mounts api's volumes (volumes_from: api)"},
+		{"start-first with a disabled base healthcheck", []edit{{cp, "  api:\n    image: ${STOWAGE_IMAGE_API}\n", "  api:\n    extends: ui\n    image: ${STOWAGE_IMAGE_API}\n"}, {cp, "  ui:\n    image: ${STOWAGE_IMAGE_UI}\n", "  ui:\n    healthcheck: { disable: true }\n    image: ${STOWAGE_IMAGE_UI}\n"}}, nil, "services.api.update: api disables its healthcheck"},
+		{"start-first with a test of no probe", []edit{{cp, "      test: [\"CMD\", \"atlas-server\", \"probe\", \"9090\"]\n", "      test: [\"curl\", \"-f\", \"http://localhost:9090\"]\n"}}, nil, "services.api.update: api's healthcheck test starts with curl, not CMD, CMD-SHELL or NONE"},
+		{"start-first with a test of no command", []edit{{cp, "      test: [\"CMD\", \"atlas-server\", \"probe\", \"9090\"]\n", "      test: [\"CMD-SHELL\", \"\"]\n"}}, nil, "services.api.update: api's healthcheck test runs no command"},
+		{"start-first with a blank string test", []edit{{cp, "      test: [\"CMD\", \"atlas-server\", \"probe\", \"9090\"]\n", "      test: \" \"\n"}}, nil, "api's healthcheck test runs no command"},
+		{"start-first with an empty string test", []edit{{cp, "      test: [\"CMD\", \"atlas-server\", \"probe\", \"9090\"]\n", "      test: \"\"\n"}}, nil, "api's healthcheck test runs no command"},
+		{"start-first with CMD alone", []edit{{cp, "      test: [\"CMD\", \"atlas-server\", \"probe\", \"9090\"]\n", "      test: [\"CMD\"]\n"}}, nil, "api's healthcheck test runs no command"},
+		{"start-first with a blank CMD-SHELL and args", []edit{{cp, "      test: [\"CMD\", \"atlas-server\", \"probe\", \"9090\"]\n", "      test: [\"CMD-SHELL\", \"\", \"probe\"]\n"}}, nil, "api's healthcheck test runs no command"},
+		{"start-first with a blank CMD and args", []edit{{cp, "      test: [\"CMD\", \"atlas-server\", \"probe\", \"9090\"]\n", "      test: [\"CMD\", \" \", \"probe\"]\n"}}, nil, "api's healthcheck test runs no command"},
+		{"start-first with a NONE string", []edit{{cp, "      test: [\"CMD\", \"atlas-server\", \"probe\", \"9090\"]\n", "      test: NONE\n"}}, nil, "api's healthcheck test is the string NONE"},
+		{"start-first with a command not a string", []edit{{cp, "      test: [\"CMD\", \"atlas-server\", \"probe\", \"9090\"]\n", "      test: [\"CMD\", 1]\n"}}, nil, "api's healthcheck test has a command (after CMD) that is not a string"},
+		{"start-first with disable as a string", []edit{{cp, "      test: [\"CMD\", \"atlas-server\", \"probe\", \"9090\"]\n", "      test: [\"CMD\", \"atlas-server\", \"probe\", \"9090\"]\n      disable: \"true\"\n"}}, nil, "services.api.update: api disables its healthcheck"},
+		{"start-first with disable: yes", []edit{{cp, "      test: [\"CMD\", \"atlas-server\", \"probe\", \"9090\"]\n", "      test: [\"CMD\", \"atlas-server\", \"probe\", \"9090\"]\n      disable: yes\n"}}, nil, "services.api.update: api disables its healthcheck"},
+		{"start-first with a fixed address", []edit{{cp, "  api:\n    image: ${STOWAGE_IMAGE_API}\n", "  api:\n    networks: { default: { ipv4_address: 172.30.0.5 } }\n    image: ${STOWAGE_IMAGE_API}\n"}}, nil, "services.api.update: api sets networks.default.ipv4_address"},
+		{"start-first with a fixed MAC", []edit{{cp, "  api:\n    image: ${STOWAGE_IMAGE_API}\n", "  api:\n    mac_address: 02:42:ac:11:00:02\n    image: ${STOWAGE_IMAGE_API}\n"}}, nil, "services.api.update: api sets mac_address"},
+		{"start-first with a broken test from a variable", []edit{{cp, "      test: [\"CMD\", \"atlas-server\", \"probe\", \"9090\"]\n", "      test: [\"curl\", \"-f\", \"http://localhost:${API_PORT:-9090}\"]\n"}}, nil, "api's healthcheck test starts with curl"},
+		{"start-first inheriting a fixed address", []edit{{cp, "  api:\n    image: ${STOWAGE_IMAGE_API}\n", "  api:\n    extends: ui\n    image: ${STOWAGE_IMAGE_API}\n"}, {cp, "  ui:\n    image: ${STOWAGE_IMAGE_UI}\n", "  ui:\n    mac_address: 02:42:ac:11:00:02\n    image: ${STOWAGE_IMAGE_UI}\n"}}, nil, "services.api.update: api sets mac_address"},
+		{"start-first inheriting a base network's address", []edit{{cp, "  api:\n    image: ${STOWAGE_IMAGE_API}\n", "  api:\n    extends: ui\n    networks: { default: { aliases: [atlas-api] } }\n    image: ${STOWAGE_IMAGE_API}\n"}, {cp, "  ui:\n    image: ${STOWAGE_IMAGE_UI}\n", "  ui:\n    networks: { default: { ipv4_address: 172.30.0.5 } }\n    image: ${STOWAGE_IMAGE_UI}\n"}}, nil, "services.api.update: api sets networks.default.ipv4_address"},
+		{"L4 upstream inheriting networks", []edit{{cp, "  echo:\n", "  echo:\n    extends: ui\n"}, {cp, "  ui:\n    image: ${STOWAGE_IMAGE_UI}\n", "  ui:\n    networks: [default]\n    image: ${STOWAGE_IMAGE_UI}\n"}}, nil, "deploy/compose.yaml: services.ui.networks: echo extends ui, whose networks it takes"},
+		{"start-first linked to", []edit{{cp, "    profiles: [relay]\n", "    profiles: [relay]\n    links: [\"api:www\"]\n"}}, nil, "services.api.update: relay links to api (links: api:www)"},
+		{"start-first linked to through extends", []edit{{cp, "    profiles: [relay]\n", "    profiles: [relay]\n    extends: ui\n"}, {cp, "  ui:\n    image: ${STOWAGE_IMAGE_UI}\n", "  ui:\n    links: [api]\n    image: ${STOWAGE_IMAGE_UI}\n"}}, nil, "services.api.update: relay links to api (links: api)"},
+		{"start-first inheriting a container name", []edit{{cp, "  api:\n    image: ${STOWAGE_IMAGE_API}\n", "  api:\n    extends: ui\n    image: ${STOWAGE_IMAGE_API}\n"}, {cp, "  ui:\n    image: ${STOWAGE_IMAGE_UI}\n", "  ui:\n    container_name: atlas-ui\n    image: ${STOWAGE_IMAGE_UI}\n"}}, nil, "services.api.update: api sets container_name atlas-ui"},
 		{"firmware without a reason", []edit{{sp, "reason: \"the E810's DDP package: without it ice runs in safe mode, one queue a port\"", "reason: \"\""}}, nil, "host.firmware.intel/ice/ddp/ice.pkg.reason: is required"},
 		{"package key unknown", []edit{{sp, "tcpdump: { reason:", "tcpdump: { version: \"4\", reason:"}}, nil, "field version not found"},
 		{"kernel arg of Kairos's own", []edit{{sp, "    iommu: { value: pt,", "    rd.shell: { value: \"1\","}}, nil, "host.kernel_args.rd.shell: is Kairos's own (rd)"},
@@ -818,6 +857,213 @@ func TestVMBackupCommandWarns(t *testing.T) {
 	}
 }
 
+// nextKey is the next top-level or shapes key of a spec: where a shape's block ends.
+var nextKey = regexp.MustCompile(`\n(  )?[a-z]`)
+
+// A start-first service without a healthcheck of its compose file is warned (the image's own is
+// what the overlap waits for), as is one an L4 route targets with the Docker shape (its port is
+// published there, so it is replaced stop-first) and with the kairos shape (both containers
+// listen on its port there); the example's api warns of none.
+func TestStartFirstWarnings(t *testing.T) {
+	t.Parallel()
+	warned := func(res *Result, msg string) bool {
+		for _, f := range res.Findings {
+			if f.Severity == Warning && strings.Contains(f.Message, msg) {
+				return true
+			}
+		}
+		return false
+	}
+	const health, l4 = "api sets no healthcheck", "echo is l4.routes[0]'s upstream: on Docker"
+	root := testutil.CopyExample(t, "full")
+	if res := run(t, root); warned(res, health) || warned(res, "upstream: on Docker") {
+		t.Fatalf("the example warns: %+v", res.Findings)
+	}
+	testutil.Edit(t, root, composeFile, "    healthcheck:\n      test: [\"CMD\", \"atlas-server\", \"probe\", \"9090\"]\n      interval: 2s\n      retries: 30\n", "")
+	testutil.Edit(t, root, specFile, "echo: { cpus: 1, irq: on }", "echo: { cpus: 1, irq: on, update: start-first }")
+	if res := run(t, root); !warned(res, health) || !warned(res, l4) || !warned(res, "echo is l4.routes[0]'s upstream: on the VM it runs on the host's network") {
+		t.Fatalf("findings: %+v", res.Findings)
+	}
+	testutil.Edit(t, root, composeFile, "      test: [\"CMD\", \"atlas-server\", \"probe\", \"8080\"]\n", "")
+	testutil.Edit(t, root, specFile, "ingest: { nftables: deploy/ingest.nft }", "ingest: { nftables: deploy/ingest.nft, update: start-first }")
+	if res := run(t, root); !warned(res, "ingest's healthcheck sets no test") {
+		t.Fatalf("findings: %+v", res.Findings)
+	}
+	// A healthcheck merges key by key through extends: the base's test with the service's interval.
+	testutil.Edit(t, root, composeFile, "  ingest:\n", "  ingest:\n    extends: relay\n")
+	if res := run(t, root); warned(res, "ingest's healthcheck sets no test") || warned(res, "ingest sets no healthcheck") {
+		t.Fatalf("an inherited test: %+v", res.Findings)
+	}
+	// The service's own test and disable win over its base's.
+	root = testutil.CopyExample(t, "full")
+	testutil.Edit(t, root, composeFile, "  api:\n    image: ${STOWAGE_IMAGE_API}\n", "  api:\n    extends: ui\n    image: ${STOWAGE_IMAGE_API}\n")
+	testutil.Edit(t, root, composeFile, "      test: [\"CMD\", \"atlas-server\", \"probe\", \"9090\"]\n", "      test: [\"CMD\", \"atlas-server\", \"probe\", \"9090\"]\n      disable: false\n")
+	testutil.Edit(t, root, composeFile, "  ui:\n    image: ${STOWAGE_IMAGE_UI}\n", "  ui:\n    healthcheck: { test: [\"NONE\"], disable: true }\n    image: ${STOWAGE_IMAGE_UI}\n")
+	if res := run(t, root); slices.ContainsFunc(res.Findings, func(f Finding) bool { return strings.Contains(f.Message, "api disables its healthcheck") }) {
+		t.Fatalf("its own healthcheck: %+v", res.Findings)
+	}
+	// On the host's network without update_socket, both containers listen on its ports.
+	root = testutil.CopyExample(t, "full")
+	testutil.Edit(t, root, specFile, ", update_socket: /run/atlas/handoff }", " }")
+	testutil.Edit(t, root, composeFile, "  api:\n    image: ${STOWAGE_IMAGE_API}\n", "  api:\n    network_mode: host\n    image: ${STOWAGE_IMAGE_API}\n")
+	if res := run(t, root); !warned(res, "api runs on the host's network, where both containers of an overlap listen on its ports") {
+		t.Fatalf("host network: %+v", res.Findings)
+	}
+	// With update_socket it is the app's handoff: no warning.
+	testutil.Edit(t, root, specFile, "update: start-first }", "update: start-first, update_socket: /run/atlas/handoff }")
+	if res := run(t, root); warned(res, "api runs on the host's network") {
+		t.Fatalf("host network with update_socket: %+v", res.Findings)
+	}
+	// An L4 upstream: on the VM, warned without update_socket alone; on Docker, warned unless on
+	// the host's network.
+	root = testutil.CopyExample(t, "full")
+	testutil.Edit(t, root, specFile, "echo: { cpus: 1, irq: on }", "echo: { cpus: 1, irq: on, update: start-first, update_socket: /run/echo }")
+	if res := run(t, root); warned(res, "echo is l4.routes[0]'s upstream: on the VM") || !warned(res, l4) {
+		t.Fatalf("an L4 upstream with update_socket: %+v", res.Findings)
+	}
+	testutil.Edit(t, root, composeFile, "    command: [atlas-server, echo, \"17007\"]\n", "    command: [atlas-server, echo, \"17007\"]\n    network_mode: host\n")
+	if res := run(t, root); warned(res, l4) {
+		t.Fatalf("an L4 upstream on the host's network: %+v", res.Findings)
+	}
+	// Each L4 warning is its shape's: without the kairos shape no VM warning, without the docker
+	// shape no Docker one.
+	for _, c := range []struct{ shape, gone, kept string }{
+		{"kairos", "echo is l4.routes[0]'s upstream: on the VM", l4},
+		{"docker", l4, "echo is l4.routes[0]'s upstream: on the VM"},
+	} {
+		root = testutil.CopyExample(t, "full")
+		testutil.Edit(t, root, specFile, "echo: { cpus: 1, irq: on }", "echo: { cpus: 1, irq: on, update: start-first }")
+		raw, err := os.ReadFile(filepath.Join(root, specFile))
+		if err != nil {
+			t.Fatal(err)
+		}
+		y := string(raw)
+		start := strings.Index(y, "\n  "+c.shape+":")
+		if start < 0 {
+			t.Fatalf("the example has no %s shape", c.shape)
+		}
+		end := len(y)
+		if next := nextKey.FindStringIndex(y[start+1:]); next != nil {
+			end = start + 1 + next[0]
+		}
+		testutil.Write(t, root, specFile, y[:start]+y[end:])
+		if res := run(t, root); warned(res, c.gone) || !warned(res, c.kept) {
+			t.Fatalf("without the %s shape: %+v", c.shape, res.Findings)
+		}
+	}
+	// disable as a string that casts to false leaves the healthcheck on.
+	root = testutil.CopyExample(t, "full")
+	testutil.Edit(t, root, composeFile, "      test: [\"CMD\", \"atlas-server\", \"probe\", \"9090\"]\n", "      test: [\"CMD\", \"atlas-server\", \"probe\", \"9090\"]\n      disable: \"off\"\n")
+	if res := run(t, root); slices.ContainsFunc(res.Findings, func(f Finding) bool { return strings.Contains(f.Message, "api disables its healthcheck") }) {
+		t.Fatalf("disable: off: %+v", res.Findings)
+	}
+	// disable that Compose does not read as a boolean is warned; a $$ escape is no variable.
+	root = testutil.CopyExample(t, "full")
+	testutil.Edit(t, root, composeFile, "      test: [\"CMD\", \"atlas-server\", \"probe\", \"9090\"]\n", "      test: [\"CMD-SHELL\", \"atlas-server probe $$((9000 + 90))\"]\n")
+	if res := run(t, root); warned(res, "api's healthcheck test comes from a variable") {
+		t.Fatalf("an escaped $: %+v", res.Findings)
+	}
+	testutil.Edit(t, root, composeFile, "$$((9000 + 90))\"]\n", "$$((9000 + 90))\"]\n      disable: \"1\"\n")
+	if res := run(t, root); !warned(res, "api's healthcheck disable is 1, which only a run knows or Compose does not read as a boolean") {
+		t.Fatalf("disable 1: %+v", res.Findings)
+	}
+	root = testutil.CopyExample(t, "full")
+	testutil.Edit(t, root, composeFile, "      test: [\"CMD\", \"atlas-server\", \"probe\", \"9090\"]\n", "      test: [\"CMD\", \"atlas-server\", \"probe\", \"9090\"]\n      disable: ${HC_OFF:-false}\n")
+	if res := run(t, root); !warned(res, "api's healthcheck disable is ${HC_OFF:-false}, which only a run knows") {
+		t.Fatalf("disable from a variable: %+v", res.Findings)
+	}
+	// A test whose head comes from a variable is warned, not refused; with a disable from a
+	// variable, both are warned.
+	root = testutil.CopyExample(t, "full")
+	testutil.Edit(t, root, composeFile, "      test: [\"CMD\", \"atlas-server\", \"probe\", \"9090\"]\n", "      test: [\"${HC_KIND:-CMD}\", \"atlas-server\", \"probe\", \"9090\"]\n      disable: ${HC_OFF:-false}\n")
+	if res := run(t, root); !warned(res, "api's healthcheck test comes from a variable") || !warned(res, "api's healthcheck disable is ${HC_OFF:-false}") ||
+		slices.ContainsFunc(res.Findings, func(f Finding) bool { return f.Severity == Error && strings.Contains(f.Message, "api's healthcheck") }) {
+		t.Fatalf("a head from a variable: %+v", res.Findings)
+	}
+	// A service joining a container by name may be joining the start-first service's: warned.
+	root = testutil.CopyExample(t, "full")
+	testutil.Edit(t, root, composeFile, "    profiles: [relay]\n", "    profiles: [relay]\n    ipc: container:atlas-api-1\n")
+	testutil.Edit(t, root, composeFile, "    ipc: container:atlas-api-1\n", "    ipc: container:atlas-api-1\n    volumes_from: [\"container:atlas-api-1:ro\", \"container:atlas-api-2\"]\n")
+	res := run(t, root)
+	n := 0
+	for _, f := range res.Findings {
+		if strings.Contains(f.Message, "joins a container by its name or ID") {
+			n++
+		}
+	}
+	if !warned(res, "joins a container by its name or ID (container:atlas-api-1)") || !warned(res, "joins a container by its name or ID (container:atlas-api-1:ro)") || n != 2 {
+		t.Fatalf("a container joined by name: %+v", res.Findings)
+	}
+	// One from a variable is warned too; a start-first service's own network_mode is an error alone.
+	root = testutil.CopyExample(t, "full")
+	testutil.Edit(t, root, composeFile, "    profiles: [relay]\n", "    profiles: [relay]\n    ipc: ${RELAY_IPC:-service:api}\n")
+	testutil.Edit(t, root, composeFile, "  api:\n    image: ${STOWAGE_IMAGE_API}\n", "  api:\n    network_mode: container:vpn\n    image: ${STOWAGE_IMAGE_API}\n")
+	res = run(t, root)
+	if !warned(res, "${RELAY_IPC:-service:api}, which only a run resolves") || warned(res, "(container:vpn)") ||
+		!slices.ContainsFunc(res.Findings, func(f Finding) bool {
+			return f.Severity == Error && strings.Contains(f.Message, "api runs in another's network namespace (network_mode container:vpn)")
+		}) {
+		t.Fatalf("a join from a variable, the service's own: %+v", res.Findings)
+	}
+	// A start-first service's own network_mode from a variable is warned.
+	root = testutil.CopyExample(t, "full")
+	testutil.Edit(t, root, composeFile, "  api:\n    image: ${STOWAGE_IMAGE_API}\n", "  api:\n    network_mode: ${API_NET:-host}\n    ports: [\"127.0.0.1:9090:9090\"]\n    image: ${STOWAGE_IMAGE_API}\n")
+	if res := run(t, root); !warned(res, "${API_NET:-host}, which only a run resolves: if it is service:… or container:…, or a network of its own while it publishes ports, the install replaces api stop-first") || warned(res, "api stop-first, and if it is host") ||
+		slices.ContainsFunc(res.Findings, func(f Finding) bool {
+			return f.Severity == Error && strings.Contains(f.Message, "api publishes ports from its own network")
+		}) {
+		t.Fatalf("its own network_mode from a variable: %+v", res.Findings)
+	}
+	// A start-first service named after a keyword is no volumes_from of a container.
+	root = testutil.CopyExample(t, "full")
+	testutil.Edit(t, root, composeFile, "    profiles: [relay]\n", "    profiles: [relay]\n    volumes_from: [\"container:atlas-db-1\"]\n")
+	testutil.Edit(t, root, specFile, "echo: { cpus: 1, irq: on }", "echo: { cpus: 1, irq: on, update: start-first }")
+	if res := run(t, root); slices.ContainsFunc(res.Findings, func(f Finding) bool { return strings.Contains(f.Message, "mounts echo's volumes") }) {
+		t.Fatalf("an unrelated container's volumes: %+v", res.Findings)
+	}
+	// external_links name a container: warned as one; an unbraced $VAR network_mode is a variable,
+	// which spares an L4 upstream the Docker warning.
+	root = testutil.CopyExample(t, "full")
+	testutil.Edit(t, root, composeFile, "    profiles: [relay]\n", "    profiles: [relay]\n    external_links: [\"atlas-api-1:api\"]\n")
+	testutil.Edit(t, root, specFile, "echo: { cpus: 1, irq: on }", "echo: { cpus: 1, irq: on, update: start-first }")
+	testutil.Edit(t, root, composeFile, "    command: [atlas-server, echo, \"17007\"]\n", "    command: [atlas-server, echo, \"17007\"]\n    network_mode: $ECHO_NET\n")
+	res = run(t, root)
+	if !warned(res, "links to a container by its name (atlas-api-1:api)") || !warned(res, "$ECHO_NET, which only a run resolves: if it is service:… or container:…, or a network of its own while it publishes ports (its L4 route's on Docker included), the install replaces echo stop-first") || warned(res, l4) {
+		t.Fatalf("external_links, an unbraced variable: %+v", res.Findings)
+	}
+	// Without ports, its own network_mode from a variable names no ports case; service:${X} is the
+	// refusal's alone.
+	root = testutil.CopyExample(t, "full")
+	testutil.Edit(t, root, composeFile, "  api:\n    image: ${STOWAGE_IMAGE_API}\n", "  api:\n    network_mode: ${API_NET:-bridge}\n    image: ${STOWAGE_IMAGE_API}\n")
+	if res := run(t, root); !warned(res, "${API_NET:-bridge}, which only a run resolves") || warned(res, "while it publishes ports") {
+		t.Fatalf("no ports: %+v", res.Findings)
+	}
+	root = testutil.CopyExample(t, "full")
+	testutil.Edit(t, root, composeFile, "  api:\n    image: ${STOWAGE_IMAGE_API}\n", "  api:\n    network_mode: service:${PEER:-ui}\n    image: ${STOWAGE_IMAGE_API}\n")
+	if res := run(t, root); warned(res, "which only a run resolves") {
+		t.Fatalf("service:${X}: %+v", res.Findings)
+	}
+	// links from a variable is warned; a non-string entry is none.
+	root = testutil.CopyExample(t, "full")
+	testutil.Edit(t, root, composeFile, "    profiles: [relay]\n", "    profiles: [relay]\n    links: [\"${PEER:-api}\"]\n    external_links: [123]\n")
+	res = run(t, root)
+	if !warned(res, "${PEER:-api}, which only a run resolves: if it names a start-first service, the install") || warned(res, "links to a container by its name") {
+		t.Fatalf("links from a variable: %+v", res.Findings)
+	}
+	// A test from a variable is warned: lint cannot tell it runs a probe.
+	root = testutil.CopyExample(t, "full")
+	testutil.Edit(t, root, composeFile, "      test: [\"CMD\", \"atlas-server\", \"probe\", \"9090\"]\n", "      test: [\"CMD-SHELL\", \"${API_PROBE:-atlas-server probe 9090}\"]\n")
+	if res := run(t, root); !warned(res, "api's healthcheck test comes from a variable") {
+		t.Fatalf("a test from a variable: %+v", res.Findings)
+	}
+	// An empty test is the image's.
+	root = testutil.CopyExample(t, "full")
+	testutil.Edit(t, root, composeFile, "      test: [\"CMD\", \"atlas-server\", \"probe\", \"9090\"]\n", "      test: []\n")
+	if res := run(t, root); !warned(res, "api's healthcheck sets no test") {
+		t.Fatalf("an empty test: %+v", res.Findings)
+	}
+}
+
 // An input counts as read when the provision hook's env lists it, and only then: a hook no longer
 // receives every input.
 func TestInputOnlyTheHookReads(t *testing.T) {
@@ -1065,7 +1311,10 @@ func TestHostPrivilegesWarn(t *testing.T) {
 		{vol, "      - /var/run:/host/run:ro\n", "services.server.volumes: the Docker socket is mounted"},
 		{vol, "      - /:/host:ro\n", "services.server.volumes: the Docker socket is mounted"},
 		{vol, "      - ${SOCK:-/var/run/docker.sock}:/var/run/docker.sock\n", "services.server.volumes: the Docker socket is mounted"},
-		{img, "    privileged: ${PRIVILEGED:-true}\n", "services.server.privileged: true"},
+		{img, "    privileged: ${PRIVILEGED:-true}\n", "services.server.privileged: ${PRIVILEGED:-true}, which only a run knows"},
+		{img, "    privileged: \"1\"\n", "services.server.privileged: 1, which only a run knows or Compose does not read as a boolean"},
+		{img, "    privileged: \"Yes\"\n", "services.server.privileged: true"},
+		{img, "    privileged: \"on\"\n", "services.server.privileged: true"},
 	} {
 		root := testutil.CopyExample(t, "stateless")
 		testutil.Edit(t, root, "deploy/compose.yaml", c.old, c.old+c.add)
@@ -1089,7 +1338,8 @@ func TestHostPrivilegesWarn(t *testing.T) {
 	}
 	// What gives none: privileged false, another socket.
 	root = testutil.CopyExample(t, "stateless")
-	testutil.Edit(t, root, "deploy/compose.yaml", img, img+"    privileged: false\n")
+	testutil.Edit(t, root, "deploy/compose.yaml", img, img+"    privileged: \"off\"\n")
+	testutil.Edit(t, root, "deploy/compose.yaml", "  server:\n", "  other:\n    image: ${STOWAGE_IMAGE_SERVER}\n    privileged: false\n  server:\n")
 	testutil.Edit(t, root, "deploy/compose.yaml", vol, vol+"      - /run/other.sock:/run/other.sock\n      - /var/lib/data:/data\n      - /var/run/docker.sock\n      - ${DATA:-/srv/data}:/data2\n")
 	if res := run(t, root); len(res.Findings) != 0 {
 		t.Errorf("findings %+v", res.Findings)
@@ -1334,7 +1584,7 @@ func FuzzCheckL4Bind(f *testing.F) {
 // memShares is examples/full's services block, which gives two services a memory share.
 const memShares = `services:                                                      # what a compose service asks of the host, beyond its compose file
   postgres: { memory: { percent: 25, max: 16G } }              # percent of the host's RAM, recomputed at each start, capped at 16 GiB
-  api: { memory: 10 }
+  api: { memory: 10, update: start-first, update_socket: /run/atlas/handoff }  # its new container healthy beside the old before the old stops
 `
 
 // servicesBlock is examples/full's whole services block: its memory shares, then the services' cores,
