@@ -3,7 +3,7 @@
 Stowage's own releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
-## [0.14.0]
+## [0.14.0] - 2026-10-26
 
 ### Added
 - **Upgrades that overlap**: `services.<name>.update: start-first` starts a service's new
