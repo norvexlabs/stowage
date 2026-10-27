@@ -32,6 +32,21 @@ func lockFile(path string) (func(), error) {
 	}, nil
 }
 
+// lockHeld reports whether another process holds the lock on path, without taking it or making
+// the file.
+func lockHeld(path string) bool {
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	if err := unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		return errors.Is(err, unix.EWOULDBLOCK)
+	}
+	_ = unix.Flock(int(f.Fd()), unix.LOCK_UN)
+	return false
+}
+
 // flockWait takes a lock on path, created 0600 if absent, waiting for another holder to release
 // it: exclusive, or shared when exclusive is false. The lock goes with the process, however it
 // ends.

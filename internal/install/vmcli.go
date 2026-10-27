@@ -347,7 +347,7 @@ func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(
 			return nil
 		},
 	}
-	updates.Flags().StringVar(&channel, "channel", "", "the channel to look on (default: the install's)")
+	updates.Flags().StringVar(&channel, "channel", "", "the channel to look on (default: the install's; before the first install, its settings')")
 	updates.Flags().StringVar(&version, "version", "", "this version's latest revision, not the channel's latest release")
 	jsonFlag(updates)
 	upgrade := &cobra.Command{
@@ -390,7 +390,7 @@ func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(
 		},
 	}
 	uf := upgrade.Flags()
-	uf.StringVar(&channel, "channel", "", "the channel to upgrade on (default: the install's)")
+	uf.StringVar(&channel, "channel", "", "the channel to upgrade on (default: the install's; before the first install, its settings')")
 	uf.StringVar(&version, "version", "", "this version's latest revision, not the channel's latest release")
 	uf.BoolVarP(&yes, "yes", "y", false, "upgrade without asking")
 	uf.BoolVar(&noReboot, "no-reboot", false, "write the new OS but do not reboot (the next boot runs it)")

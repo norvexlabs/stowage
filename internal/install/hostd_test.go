@@ -975,3 +975,65 @@ func TestTheSocketAppearsListeningAndGuarded(t *testing.T) {
 		t.Errorf("left after a failure: %v", entries)
 	}
 }
+
+// Before the first install (none made, or one refused), updates and upgrade read the first
+// install's settings: a newer release's OS replaces the one whose install was refused, and the boot
+// into it makes the first install of that release.
+func TestAnUpgradeBeforeTheFirstInstall(t *testing.T) {
+	t.Parallel()
+	p := vmPublished(t, spec.Provider{Name: "none"}, nil)
+	p.release("1.0.0", 2, nil)
+	if err := os.RemoveAll(p.env.dir); err != nil {
+		t.Fatal(err)
+	}
+	host := &fakeHost{}
+	h := daemon(p.env, host)
+	h.O.Settings = filepath.Join(t.TempDir(), "install.yaml")
+	hh := h.Handler()
+	// No settings: the request names the channel.
+	var e errOf
+	if code := call(t, hh, "POST", "/v1/upgrade", UpgradeRequest{}, &e); code != 400 || !strings.Contains(e.Error, "follows no channel") {
+		t.Fatalf("no channel: %d %s", code, e.Error)
+	}
+	if err := os.WriteFile(h.O.Settings, []byte("channel: stable\nregistry: "+p.prefix+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if code := call(t, hh, "POST", "/v1/upgrade", UpgradeRequest{Channel: "beta"}, &e); code != 409 || !strings.Contains(e.Error, "the first install follows stable (its settings)") {
+		t.Fatalf("another channel: %d %s", code, e.Error)
+	}
+	var u Update
+	if code := call(t, hh, "GET", "/v1/updates", nil, &u); code != 200 || !u.Available || u.Target != (Version{"1.0.0", 2}) {
+		t.Fatalf("updates: %d %+v", code, u)
+	}
+	// An operator's first install holding the lock, .env not written yet.
+	if err := os.MkdirAll(p.env.dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	unlock, err := lockFile(filepath.Join(p.env.dir, lifecycleLock))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if code := call(t, hh, "POST", "/v1/upgrade", UpgradeRequest{}, &e); code != 409 || !strings.Contains(e.Error, "an install is running") {
+		t.Fatalf("an install running: %d %s", code, e.Error)
+	}
+	unlock()
+	no := false
+	if code := call(t, hh, "POST", "/v1/upgrade", UpgradeRequest{Reboot: &no}, nil); code != 202 {
+		t.Fatalf("%d", code)
+	}
+	j := waitJob(t, hh)
+	if log := strings.Join(j.Log, "\n"); j.State != "done" || !strings.Contains(log, "the next boot runs it and makes the first install") || strings.Contains(log, "backup") {
+		t.Fatalf("%+v", j)
+	}
+	if !strings.Contains(fmt.Sprint(host.calls()), "kairos-agent upgrade --source oci:"+p.prefix+"/notes-os@") {
+		t.Errorf("ran %v", host.calls())
+	}
+	if raw, err := os.ReadFile(osUpgradeFile(p.env.dir)); err != nil || string(raw) != "1.0.0-2\n" {
+		t.Errorf("mark: %q %v", raw, err)
+	}
+	// A Docker host's daemon has no OS to write: still the install's alone.
+	h.Docker = true
+	if code := call(t, h.Handler(), "GET", "/v1/updates", nil, &e); code != 409 || !strings.Contains(e.Error, "not installed yet") {
+		t.Errorf("Docker: %d %s", code, e.Error)
+	}
+}

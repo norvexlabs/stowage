@@ -1353,3 +1353,51 @@ func TestARoleWithoutItsNICFailsClosed(t *testing.T) {
 		t.Errorf("the seed's: %s", got)
 	}
 }
+
+// An upgrade before the first install wrote this OS: its boot installs its release, not the one
+// the settings name.
+func TestTheFirstBootInstallsTheReleaseAnUpgradeWrote(t *testing.T) {
+	t.Parallel()
+	e := vmEnv(t, "1.0.0")
+	os1 := "sha256:" + strings.Repeat("a", 64)
+	with := settings(t, "tls: internal\nrelease:\n  version: 0.9.0\n  revision: 1\n  tag: 0.9.0\n  os: "+os1+"\ninputs:\n  APP_DOMAIN: app.example.org\n  API_DOMAIN: api.example.org\n")
+	host := &fakeHost{}
+	in := e.installer(func(o *Options) { with(o); o.Host = host })
+	// Another release's mark switches as ever.
+	if err := os.WriteFile(osUpgradeFile(e.dir), []byte("0.8.0\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := in.Boot(context.Background()); err != nil || len(host.calls()) == 0 {
+		t.Fatalf("another mark: %v %v", err, host.calls())
+	}
+	if err := os.Remove(osSwitchFile(e.dir)); err != nil {
+		t.Fatal(err)
+	}
+	host = &fakeHost{}
+	in = e.installer(func(o *Options) { with(o); o.Host = host })
+	if err := os.WriteFile(osUpgradeFile(e.dir), []byte(in.R.Manifest.Tag+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := in.Boot(context.Background()); err != nil {
+		t.Fatalf("%v\n%s", err, e.log)
+	}
+	if len(host.calls()) != 0 {
+		t.Errorf("switched: %v", host.calls())
+	}
+	if _, err := os.Stat(filepath.Join(e.dir, envName)); err != nil {
+		t.Errorf("not installed: %v", err)
+	}
+	if _, err := os.Stat(osUpgradeFile(e.dir)); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("the mark outlived the first install: %v", err)
+	}
+	// A first install made otherwise (over SSH): the next boot finding it drops the mark.
+	if err := os.WriteFile(osUpgradeFile(e.dir), []byte(in.R.Manifest.Tag+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.installer(with).Boot(context.Background()); err != nil {
+		t.Fatalf("%v\n%s", err, e.log)
+	}
+	if _, err := os.Stat(osUpgradeFile(e.dir)); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("the mark outlived a boot of the install: %v", err)
+	}
+}

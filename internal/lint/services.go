@@ -96,22 +96,7 @@ func (l *linter) serviceNetwork(at, name string, svc spec.Service) {
 		return
 	}
 	at += ".transparent"
-	if len(svc.Transparent) == 0 {
-		l.errf(at, "is empty: the host.interfaces roles its table intercepts traffic on, like [vpn0]")
-	}
-	for i, role := range svc.Transparent {
-		w := fmt.Sprintf("%s[%d]", at, i)
-		var ok bool
-		if l.s.Host != nil {
-			_, ok = l.s.Host.Interfaces[role]
-		}
-		switch {
-		case !ok:
-			l.errf(w, "%q is not one of host.interfaces", role)
-		case slices.Index(svc.Transparent, role) < i:
-			l.errf(w, "%s is given twice", role)
-		}
-	}
+	l.roleList(at, svc.Transparent, "the host.interfaces roles its table intercepts traffic on, like [vpn0]", nil)
 	if svc.Nftables == "" {
 		l.errf(at, "%s's own table steers the traffic to its sockets: give it nftables", name)
 	}
@@ -354,6 +339,37 @@ func (l *linter) containerJoins() {
 					continue
 				}
 				break values // once a key
+			}
+		}
+	}
+}
+
+// composeLists refuses a compose service's volumes_from, links or external_links that is not a
+// list of strings, which Compose refuses: the checks reading them would leave the entry out. Each
+// is the service's own, before extends joins its base's.
+func (l *linter) composeLists() {
+	if l.compose == nil {
+		return
+	}
+	for _, name := range sortedKeys(l.compose.Services) {
+		o := l.compose.Services[name]
+		for _, k := range []struct {
+			key string
+			v   any
+		}{{"volumes_from", o.OwnVolumesFrom}, {"links", o.OwnLinks}, {"external_links", o.OwnExtLinks}} {
+			if k.v == nil {
+				continue
+			}
+			at := l.s.Stack.Compose + ": services." + name + "." + k.key
+			items, ok := k.v.([]any)
+			if !ok {
+				l.errf(at, "is not a list: Compose takes a list of strings")
+				continue
+			}
+			for i, item := range items {
+				if _, ok := item.(string); !ok {
+					l.errf(fmt.Sprintf("%s[%d]", at, i), "%v is not a string, which Compose refuses", item)
+				}
 			}
 		}
 	}

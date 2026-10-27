@@ -134,6 +134,17 @@ type OSRelease struct {
 // writing it again.
 func osSwitchFile(dir string) string { return filepath.Clean(dir) + ".os-switch" }
 
+// osUpgradeFile records, on the persistent partition beside the install directory, the release
+// whose OS an `upgrade` before the first install wrote: a boot on that release's OS makes the first
+// install of it, not of the release the settings name.
+func osUpgradeFile(dir string) string { return filepath.Clean(dir) + ".os-upgrade" }
+
+// upgradedTo reports whether an upgrade before the first install wrote this OS's release.
+func (in *Installer) upgradedTo() bool {
+	raw, err := os.ReadFile(osUpgradeFile(in.O.Dir))
+	return err == nil && strings.TrimSpace(string(raw)) == in.R.Manifest.Tag
+}
+
 // switchOS writes the OS bundle of the release the settings name into the passive slot and
 // reboots into it; the boot after it makes the first install from that OS. A second boot still
 // on another OS stops.
@@ -398,7 +409,10 @@ func (in *Installer) firstBoot(ctx context.Context, path string) error {
 		return nil
 	}
 	if t := st.Release; t != nil && (t.Version != in.R.Manifest.ProjectVersion || t.Revision != in.R.Manifest.Revision) {
-		return in.switchOS(ctx, st)
+		if !in.upgradedTo() {
+			return in.switchOS(ctx, st)
+		}
+		o.logf("%s names %s; `upgrade` wrote this OS's %s since: the first install runs it", path, t.Tag, in.R.Manifest.Tag)
 	}
 	if st.AwaitSecrets {
 		o.logf("the first install waits for its secrets, which the cloud-config never carries: `sudo %s install --secrets FILE` gives them", ctl)
@@ -416,7 +430,14 @@ func (in *Installer) firstBoot(ctx context.Context, path string) error {
 		return nil
 	}
 	o.logf("installing %s %s with the settings in %s", in.R.Spec.Name, in.R.Manifest.ProjectVersion, path)
-	return in.Install(ctx)
+	if err := in.Install(ctx); err != nil {
+		return err
+	}
+	// Made: the mark says nothing of a later first install (the install removed).
+	if err := os.Remove(osUpgradeFile(o.Dir)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		o.logf("warning: removing %s: %v", osUpgradeFile(o.Dir), err)
+	}
+	return nil
 }
 
 // Boot brings the VM's install up with the release this OS carries. With no install yet it makes
@@ -435,6 +456,10 @@ func (in *Installer) Boot(ctx context.Context) error {
 	o := &in.O
 	if _, err := os.Stat(filepath.Join(o.Dir, envName)); errors.Is(err, os.ErrNotExist) {
 		return in.firstBoot(ctx, cmp.Or(o.Settings, SettingsFile(in.R.Spec.Name)))
+	}
+	// An install exists: the mark of an upgrade before it says nothing of a later first install.
+	if err := os.Remove(osUpgradeFile(o.Dir)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		o.logf("warning: removing %s: %v", osUpgradeFile(o.Dir), err)
 	}
 	env, err := in.open()
 	if err != nil {

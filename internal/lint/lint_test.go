@@ -89,6 +89,7 @@ func TestEachRuleFires(t *testing.T) {
 		{"stowage short name", []edit{{specFile, "\nname: notes\n", "\nname: notes\nshort_name: stowage-notes\n"}}, nil, "keeps for Stowage's own files"},
 		{"compose build", []edit{{composeFile, "image: ${STOWAGE_IMAGE_WEB}", "image: ${STOWAGE_IMAGE_WEB}\n    build: ./web"}}, nil, "build: is forbidden"},
 		{"compose name", []edit{{composeFile, "services:", "name: notes\nservices:"}}, nil, "top-level name"},
+		{"compose links not a list", []edit{{composeFile, "  api:\n    image: ${STOWAGE_IMAGE_API}\n", "  api:\n    image: ${STOWAGE_IMAGE_API}\n    links: postgres\n"}}, nil, "deploy/compose.yaml: services.api.links: is not a list"},
 		{"extends another file", []edit{{composeFile, "  web:\n    image: ${STOWAGE_IMAGE_WEB}\n", "  web:\n    extends: { file: base.yaml, service: api }\n"}}, nil, "services.web.extends: file: names another compose file"},
 		{"extends unknown service", []edit{{composeFile, "  web:\n    image: ${STOWAGE_IMAGE_WEB}\n", "  web:\n    extends: www\n"}}, nil, `services.web.extends: extends "www", which is not a service`},
 		{"extends loop", []edit{{composeFile, "  web:\n    image: ${STOWAGE_IMAGE_WEB}\n", "  web:\n    extends: { service: web }\n"}}, nil, "extends loops: web → web"},
@@ -511,6 +512,8 @@ func TestEachRuleFiresOnFull(t *testing.T) {
 		{"start-first inheriting a base network's address", []edit{{cp, "  api:\n    image: ${STOWAGE_IMAGE_API}\n", "  api:\n    extends: ui\n    networks: { default: { aliases: [atlas-api] } }\n    image: ${STOWAGE_IMAGE_API}\n"}, {cp, "  ui:\n    image: ${STOWAGE_IMAGE_UI}\n", "  ui:\n    networks: { default: { ipv4_address: 172.30.0.5 } }\n    image: ${STOWAGE_IMAGE_UI}\n"}}, nil, "services.api.update: api sets networks.default.ipv4_address"},
 		{"L4 upstream inheriting networks", []edit{{cp, "  echo:\n", "  echo:\n    extends: ui\n"}, {cp, "  ui:\n    image: ${STOWAGE_IMAGE_UI}\n", "  ui:\n    networks: [default]\n    image: ${STOWAGE_IMAGE_UI}\n"}}, nil, "deploy/compose.yaml: services.ui.networks: echo extends ui, whose networks it takes"},
 		{"start-first linked to", []edit{{cp, "    profiles: [relay]\n", "    profiles: [relay]\n    links: [\"api:www\"]\n"}}, nil, "services.api.update: relay links to api (links: api:www)"},
+		{"links entry not a string", []edit{{cp, "    profiles: [relay]\n", "    profiles: [relay]\n    links: [api, 123]\n"}}, nil, "deploy/compose.yaml: services.relay.links[1]: 123 is not a string, which Compose refuses"},
+		{"volumes_from not a list", []edit{{cp, "    profiles: [relay]\n", "    profiles: [relay]\n    volumes_from: api\n"}}, nil, "deploy/compose.yaml: services.relay.volumes_from: is not a list"},
 		{"start-first linked to through extends", []edit{{cp, "    profiles: [relay]\n", "    profiles: [relay]\n    extends: ui\n"}, {cp, "  ui:\n    image: ${STOWAGE_IMAGE_UI}\n", "  ui:\n    links: [api]\n    image: ${STOWAGE_IMAGE_UI}\n"}}, nil, "services.api.update: relay links to api (links: api)"},
 		{"start-first inheriting a container name", []edit{{cp, "  api:\n    image: ${STOWAGE_IMAGE_API}\n", "  api:\n    extends: ui\n    image: ${STOWAGE_IMAGE_API}\n"}, {cp, "  ui:\n    image: ${STOWAGE_IMAGE_UI}\n", "  ui:\n    container_name: atlas-ui\n    image: ${STOWAGE_IMAGE_UI}\n"}}, nil, "services.api.update: api sets container_name atlas-ui"},
 		{"firmware without a reason", []edit{{sp, "reason: \"the E810's DDP package: without it ice runs in safe mode, one queue a port\"", "reason: \"\""}}, nil, "host.firmware.intel/ice/ddp/ice.pkg.reason: is required"},
@@ -1078,7 +1081,7 @@ func TestStartFirstWarnings(t *testing.T) {
 	if res := run(t, root); warned(res, "which only a run resolves") {
 		t.Fatalf("service:${X}: %+v", res.Findings)
 	}
-	// links from a variable is warned; a non-string entry is none.
+	// links from a variable is warned; a non-string entry is no link (refused, not warned).
 	root = testutil.CopyExample(t, "full")
 	testutil.Edit(t, root, composeFile, "    profiles: [relay]\n", "    profiles: [relay]\n    links: [\"${PEER:-api}\"]\n    external_links: [123]\n")
 	res = run(t, root)
@@ -1901,5 +1904,22 @@ func TestNftTablesAsNftReadsThem(t *testing.T) {
 	}
 	if !spec.NftKeyword("mark") || !spec.NftKeyword("tunnel") || !spec.NftKeyword("typeof") || spec.NftKeyword("vpn") || spec.NftKeyword("Mark") || spec.NftKeyword("ingest") || spec.NftTableName.MatchString("a/b") {
 		t.Error("names")
+	}
+}
+
+// A compose list's fault is reported on the service that writes it, not on one extending it.
+func TestAComposeListIsCheckedBeforeExtends(t *testing.T) {
+	t.Parallel()
+	root := testutil.CopyExample(t, "full")
+	testutil.Edit(t, root, composeFile, "    profiles: [relay]\n", "    profiles: [relay]\n    extends: ui\n    links: [api]\n")
+	testutil.Edit(t, root, composeFile, "  ui:\n    image: ${STOWAGE_IMAGE_UI}\n", "  ui:\n    links: api\n    image: ${STOWAGE_IMAGE_UI}\n")
+	var wheres []string
+	for _, f := range run(t, root).Findings {
+		if strings.Contains(f.Where, ".links") {
+			wheres = append(wheres, f.Where)
+		}
+	}
+	if !slices.Equal(wheres, []string{"deploy/compose.yaml: services.ui.links"}) {
+		t.Errorf("reported at %v", wheres)
 	}
 }

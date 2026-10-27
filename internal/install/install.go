@@ -129,6 +129,8 @@ type Options struct {
 	UDPPortFree func(host string, port int) bool
 	// HostAddrs replaces the host's addresses (L4 routes are probed and bound on them) in tests.
 	HostAddrs func() []string
+	// PortHolders replaces the addresses a refusal names (read from /proc/net) in tests.
+	PortHolders func(protocol string, port int) []string
 	// Firewall is the directory the VM's firewall includes runtime rules from, where every start
 	// opens the front's ports (openPorts); empty opens none. Host runs host programs (nft): Args[0]
 	// is the program.
@@ -496,7 +498,9 @@ func (in *Installer) given(key string) string {
 
 // l4Free refuses a port of routes a process of the host already holds, on any of its addresses or
 // on the one a route is bound to (its bind input's value): a TCP port one listens on, a UDP port
-// one is bound to. The addresses own says the stack holds the port on are not probed.
+// one is bound to. A route to a service on the host's network is probed where that service binds,
+// over its protocol: the host's addresses and the loopback's. The addresses own says the stack holds
+// the port on are not probed. The refusal names the addresses holding the port.
 func (in *Installer) l4Free(routes []spec.L4Route, value func(string) string, own map[string]bool) error {
 	if err := in.bindHere(routes, value); err != nil {
 		return err
@@ -507,10 +511,19 @@ func (in *Installer) l4Free(routes []spec.L4Route, value func(string) string, ow
 			hosts = append(hosts, h)
 		}
 	}
+	onHostNet := in.hostServices()
 	var busy []string
 	for _, r := range routes {
 		free, on := in.O.portFree, hosts
-		if r.Protocol == "udp" {
+		service, _, _ := strings.Cut(r.Upstream, ":")
+		switch {
+		case slices.Contains(onHostNet, service):
+			// Published by no one: the service binds the addresses it chooses among the host's and
+			// the loopback's, never the wildcard a local resolver's 127.0.0.53:53 keeps a bind from.
+			if r.Protocol == "udp" {
+				free = in.O.udpPortFree
+			}
+		case r.Protocol == "udp":
 			// Docker binds the wildcard, which a socket holding the port on any address
 			// keeps from binding (a local resolver's 127.0.0.53:53).
 			free, on = in.O.udpPortFree, []string{"0.0.0.0", "::"}
@@ -523,7 +536,11 @@ func (in *Installer) l4Free(routes []spec.L4Route, value func(string) string, ow
 		// An address the stack holds the port on already is its own (own, publishedPorts' keys).
 		on = slices.DeleteFunc(slices.Clone(on), func(h string) bool { return heldOn(own, r, h) })
 		if slices.ContainsFunc(on, func(h string) bool { return !free(h, r.Port) }) {
-			busy = append(busy, fmt.Sprintf("%d (%s)", r.Port, r.Name))
+			b := fmt.Sprintf("%d (%s", r.Port, r.Name)
+			if held := holdersOn(in.O.portHolders(r.Protocol, r.Port), on); len(held) > 0 {
+				b += ", held on " + strings.Join(held, ", ")
+			}
+			busy = append(busy, b+")")
 		}
 	}
 	if len(busy) > 0 {
@@ -555,6 +572,22 @@ func (in *Installer) l4Moved(ctx context.Context, env, next *EnvFile) error {
 		return err
 	}
 	return in.l4Free(moved, now, own)
+}
+
+// holdersOn are the holders (portHolders) of a port a probe of the addresses on met: all of them
+// when it probed a wildcard, which any of them keeps from binding; else those on a probed address
+// or on every address.
+func holdersOn(holders, on []string) []string {
+	if slices.ContainsFunc(on, unspecified) {
+		return holders
+	}
+	return slices.DeleteFunc(holders, func(h string) bool { return !slices.Contains(on, h) && !unspecified(h) })
+}
+
+// unspecified reports whether a is a wildcard address (0.0.0.0, ::).
+func unspecified(a string) bool {
+	ip, err := netip.ParseAddr(a)
+	return err == nil && ip.IsUnspecified()
 }
 
 // heldOn reports whether own (publishedPorts' keys) holds r's port on host, an address of the host:
@@ -1272,7 +1305,8 @@ func (in *Installer) up(ctx context.Context, env *EnvFile) (err error) {
 	if err := in.ipv6Network(ctx, env); err != nil {
 		return err
 	}
-	if err := in.profilesOff(ctx, env); err != nil {
+	off, err := in.profilesOff(ctx, env)
+	if err != nil {
 		return err
 	}
 	environ := env.Environ(base)
@@ -1362,7 +1396,7 @@ func (in *Installer) up(ctx context.Context, env *EnvFile) (err error) {
 	}
 	get := func(k string) string { v, _ := env.Get(k); return v }
 	for _, r := range in.R.Spec.L4.Routes {
-		if e := in.l4Exposure(r, get); e != "" {
+		if e := in.l4Exposure(r, get, off); e != "" {
 			in.O.logf("L4 route %s: %s/%d %s", r.Name, r.Protocol, r.Port, e)
 		}
 	}
@@ -1518,14 +1552,30 @@ func (in *Installer) profilesVar(env *EnvFile) {
 // profilesOff removes the containers of the services whose profiles are all off: `up` leaves a
 // service of a profile turned off running, as it is still the project's. Each profile is named
 // to compose for the removal, so it finds the services.
-func (in *Installer) profilesOff(ctx context.Context, env *EnvFile) error {
-	all := in.R.Spec.Profiles()
-	if len(all) == 0 {
-		return nil
+func (in *Installer) profilesOff(ctx context.Context, env *EnvFile) ([]string, error) {
+	off, err := in.servicesOff(env)
+	if err != nil || len(off) == 0 {
+		return off, err
+	}
+	args := in.composeBase()
+	for _, p := range in.R.Spec.Profiles() {
+		args = append(args, "--profile", p)
+	}
+	args = append(append(args, "rm", "--stop", "--force"), off...)
+	if _, err := in.O.Docker.Run(ctx, Cmd{Args: args, Env: env.Environ(in.O.environ())}); err != nil {
+		return nil, fmt.Errorf("removing %s, whose profiles are off: %w", strings.Join(off, ", "), err)
+	}
+	return off, nil
+}
+
+// servicesOff are the compose services whose profiles are all off (ProfilesVar), sorted.
+func (in *Installer) servicesOff(env *EnvFile) ([]string, error) {
+	if len(in.R.Spec.Profiles()) == 0 {
+		return nil, nil
 	}
 	profiles, err := lint.ServiceProfiles(in.R.Compose)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	v, _ := env.Get(ProfilesVar)
 	on := strings.Split(v, ",")
@@ -1535,18 +1585,7 @@ func (in *Installer) profilesOff(ctx context.Context, env *EnvFile) error {
 			off = append(off, name)
 		}
 	}
-	if len(off) == 0 {
-		return nil
-	}
-	args := in.composeBase()
-	for _, p := range all {
-		args = append(args, "--profile", p)
-	}
-	args = append(append(args, "rm", "--stop", "--force"), off...)
-	if _, err := in.O.Docker.Run(ctx, Cmd{Args: args, Env: env.Environ(in.O.environ())}); err != nil {
-		return fmt.Errorf("removing %s, whose profiles are off: %w", strings.Join(off, ", "), err)
-	}
-	return nil
+	return off, nil
 }
 
 // l4Vars records each L4 route's endpoint the stack reads, <address>:<port> from its address
@@ -1706,10 +1745,13 @@ func bindAddr(r spec.L4Route, get func(string) string) string {
 // l4Exposure says where a Docker install's L4 route listens and who decides its sources: Docker
 // publishes the port past the host's own firewall rules, so on every address it is open to
 // whoever reaches the host; a service on the host's network listens on it itself, behind them.
-// Empty on the VM, whose firewall applies the route's allowlist.
-func (in *Installer) l4Exposure(r spec.L4Route, get func(string) string) string {
+// A route to a service off (its profiles all off) is served by no one. Otherwise empty on the VM,
+// whose firewall applies the route's allowlist.
+func (in *Installer) l4Exposure(r spec.L4Route, get func(string) string, off []string) string {
 	name, _, _ := strings.Cut(r.Upstream, ":")
 	switch a := bindAddr(r, get); {
+	case slices.Contains(off, name):
+		return "not served: " + name + "'s profiles are off"
 	case in.O.Firewall != "":
 		return ""
 	case slices.Contains(in.hostServices(), name):
@@ -2070,9 +2112,13 @@ func (in *Installer) Status(ctx context.Context) error {
 		fmt.Fprintf(in.O.Out, "%-9s %s\n", r.Name, get(spec.URLVar(r.Name)))
 	}
 	// Each L4 route: its protocol and host port, and the endpoint the stack reads when it has one.
+	off, err := in.servicesOff(env)
+	if err != nil {
+		fmt.Fprintf(in.O.Out, "warning: the services whose profiles are off could not be read: %v\n", err)
+	}
 	for _, r := range in.R.Spec.L4.Routes {
 		line := strings.TrimSpace(fmt.Sprintf("%s/%d %s", r.Protocol, r.Port, get(spec.L4Var(r.Name))))
-		if e := in.l4Exposure(r, get); e != "" {
+		if e := in.l4Exposure(r, get, off); e != "" {
 			line += " · " + e
 		}
 		fmt.Fprintf(in.O.Out, "%-9s %s\n", r.Name, line)
@@ -2816,6 +2862,15 @@ func (o *Options) hostAddrs() []string {
 		return o.HostAddrs()
 	}
 	return hostAddrs()
+}
+
+// portHolders are the addresses a socket of the host holds protocol's port on (PortHolders in
+// tests).
+func (o *Options) portHolders(protocol string, port int) []string {
+	if o.PortHolders != nil {
+		return o.PortHolders(protocol, port)
+	}
+	return portHolders("/proc/net", protocol, port)
 }
 
 func (o *Options) udpPortFree(host string, port int) bool {

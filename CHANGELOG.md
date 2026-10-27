@@ -3,6 +3,25 @@
 Stowage's own releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
+## [0.17.0]
+
+### Added
+- **An upgrade before the first install on the VM**: when a VM's first install was refused (or
+  none was made yet), `updates` and `upgrade` read the channel and registry of the VM's settings
+  and write a newer release's OS; the boot into it makes the first install of that release. A
+  fixed release, a revision of the same version included, no longer needs the VM made again.
+- Lint refuses a compose service's `volumes_from`, `links` or `external_links` that is not a list
+  of strings, as Compose does.
+
+### Fixed
+- **A DNS service on the VM**: an L4 route to a service on the host's network (every route on
+  the VM, `host_network` on Docker) is probed where that service binds — the host's addresses
+  and the loopback's — not on the wildcard, which a local resolver's stub on
+  `127.0.0.53:53` held, so a UDP route on port 53 was refused. A port refused as in use now names
+  the addresses holding it.
+- An L4 route to a service whose profiles are all off is said to be served by no one, in the
+  install's log and `status`, rather than to listen.
+
 ## [0.16.0] - 2026-10-27
 
 ### Added

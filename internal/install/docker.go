@@ -3,12 +3,17 @@ package install
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
+	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -126,6 +131,49 @@ func hostAddrs() []string {
 		}
 	}
 	return out
+}
+
+// portHolders are the local addresses holding protocol's port (tcp: listening; udp: bound) in the
+// kernel's socket tables under dir (/proc/net's tcp, tcp6, udp, udp6), sorted, each once; none
+// when they cannot be read.
+func portHolders(dir, protocol string, port int) []string {
+	var out []string
+	for _, file := range []string{protocol, protocol + "6"} {
+		raw, err := os.ReadFile(filepath.Join(dir, file))
+		if err != nil {
+			continue
+		}
+		lines := strings.Split(string(raw), "\n")
+		for _, line := range lines[min(1, len(lines)):] {
+			f := strings.Fields(line)
+			if len(f) < 4 || (protocol == "tcp" && f[3] != "0A") {
+				continue
+			}
+			hexAddr, hexPort, ok := strings.Cut(f[1], ":")
+			if p, err := strconv.ParseUint(hexPort, 16, 16); !ok || err != nil || int(p) != port {
+				continue
+			}
+			if a, ok := procAddr(hexAddr); ok {
+				out = append(out, a.String())
+			}
+		}
+	}
+	slices.Sort(out)
+	return slices.Compact(out)
+}
+
+// procAddr decodes /proc/net's address: 8 or 32 hex digits, each the value of a 32-bit word of
+// the address as the host's byte order reads it.
+func procAddr(h string) (netip.Addr, bool) {
+	b, err := hex.DecodeString(h)
+	if err != nil || (len(b) != 4 && len(b) != 16) {
+		return netip.Addr{}, false
+	}
+	for i := 0; i < len(b); i += 4 {
+		binary.NativeEndian.PutUint32(b[i:], binary.BigEndian.Uint32(b[i:]))
+	}
+	a, _ := netip.AddrFromSlice(b)
+	return a.Unmap(), true
 }
 
 // udpPortFree reports whether no socket of the host holds the UDP port on host: a bind to it

@@ -895,16 +895,19 @@ func TestAnL4RoutesExposureIsSaid(t *testing.T) {
 		r        spec.L4Route
 		bind, fw string
 		want     string
+		off      []string
 	}{
-		{bound, "192.0.2.7", "", "on 192.0.2.7 alone"},
-		{bound, "", "", "on every address, open to whoever reaches this host (DATA_BIND gives it one address)"},
-		{bound, "0.0.0.0", "", "on every address, open to whoever reaches this host (DATA_BIND gives it one address)"},
-		{spec.L4Route{Name: "data", Protocol: "udp", Port: 7443}, "", "", "on every address, open to whoever reaches this host"},
-		{bound, "", "/run/notes/firewall", ""}, // the VM's firewall applies the allowlist
-		{spec.L4Route{Name: "data", Protocol: "tcp", Port: 7443, Upstream: "proxy:7443"}, "", "", "on the addresses proxy binds on the host's network, behind this host's own firewall"},
+		{bound, "192.0.2.7", "", "on 192.0.2.7 alone", nil},
+		{bound, "", "", "on every address, open to whoever reaches this host (DATA_BIND gives it one address)", nil},
+		{bound, "0.0.0.0", "", "on every address, open to whoever reaches this host (DATA_BIND gives it one address)", nil},
+		{spec.L4Route{Name: "data", Protocol: "udp", Port: 7443}, "", "", "on every address, open to whoever reaches this host", nil},
+		{bound, "", "/run/notes/firewall", "", nil}, // the VM's firewall applies the allowlist
+		{spec.L4Route{Name: "data", Protocol: "tcp", Port: 7443, Upstream: "proxy:7443"}, "", "", "on the addresses proxy binds on the host's network, behind this host's own firewall", nil},
+		{spec.L4Route{Name: "data", Protocol: "tcp", Port: 7443, Upstream: "proxy:7443"}, "", "", "not served: proxy's profiles are off", []string{"proxy"}},
+		{spec.L4Route{Name: "data", Protocol: "tcp", Port: 7443, Upstream: "proxy:7443"}, "", "/run/notes/firewall", "not served: proxy's profiles are off", []string{"proxy"}},
 	} {
 		in := &Installer{R: &Release{Spec: &spec.Spec{Services: map[string]spec.Service{"proxy": {HostNetwork: true}}}}, O: Options{Firewall: c.fw}}
-		if got := in.l4Exposure(c.r, func(k string) string { return map[string]string{"DATA_BIND": c.bind}[k] }); got != c.want {
+		if got := in.l4Exposure(c.r, func(k string) string { return map[string]string{"DATA_BIND": c.bind}[k] }, c.off); got != c.want {
 			t.Errorf("%+v: %q", c, got)
 		}
 	}
@@ -1814,5 +1817,90 @@ func TestUDPPortFree(t *testing.T) {
 	c.Close()
 	if !udpPortFree("127.0.0.1", port) {
 		t.Error("a released port is busy")
+	}
+}
+
+// A route to a service on the host's network is probed where the service binds, never on the
+// wildcard a local resolver's stub keeps a bind from; another route's UDP port is probed there.
+func TestAHostNetworkRouteIsProbedWhereItsServiceBinds(t *testing.T) {
+	t.Parallel()
+	dns := spec.L4Route{Name: "dns", Protocol: "udp", Port: 53, Upstream: "resolver:53", Interface: "vpn0"}
+	run := func(r spec.L4Route, fw string) ([]string, error) {
+		var probed []string
+		in := &Installer{
+			R: &Release{Spec: &spec.Spec{Services: map[string]spec.Service{"resolver": {HostNetwork: true}, "api": {}}}},
+			O: Options{
+				Firewall:  fw,
+				HostAddrs: func() []string { return []string{"127.0.0.1", "192.0.2.5", "10.8.0.1"} },
+				// systemd-resolved's stub: a bind of the wildcard fails, of any other address succeeds.
+				UDPPortFree: func(h string, p int) bool {
+					probed = append(probed, h)
+					return p != 53 || (h != "0.0.0.0" && h != "::")
+				},
+				PortFree:    func(h string, p int) bool { probed = append(probed, "tcp:"+h); return true },
+				PortHolders: func(proto string, p int) []string { return []string{"127.0.0.53", "127.0.0.54"} },
+			},
+		}
+		in.R.Spec.L4.Routes = []spec.L4Route{r}
+		err := in.l4Free(in.R.Spec.L4.Routes, func(string) string { return "" }, nil)
+		return probed, err
+	}
+	if probed, err := run(dns, ""); err != nil || !slices.Equal(probed, []string{"127.0.0.1", "::1", "192.0.2.5", "10.8.0.1"}) {
+		t.Errorf("host network: %v %v", probed, err)
+	}
+	// On the VM every route's upstream is on the host's network.
+	api := spec.L4Route{Name: "dns", Protocol: "udp", Port: 53, Upstream: "api:53"}
+	if probed, err := run(api, "/run/notes/firewall"); err != nil || slices.Contains(probed, "0.0.0.0") {
+		t.Errorf("VM: %v %v", probed, err)
+	}
+	// Published by Docker: the wildcard, refused, naming who holds it.
+	if _, err := run(api, ""); err == nil || !strings.Contains(err.Error(), "port(s) 53 (dns, held on 127.0.0.53, 127.0.0.54) already in use on this host") {
+		t.Errorf("Docker: %v", err)
+	}
+	// TCP to the host's network: the same addresses, as TCP.
+	tcp := dns
+	tcp.Protocol = "tcp"
+	if probed, err := run(tcp, ""); err != nil || !slices.Equal(probed, []string{"tcp:127.0.0.1", "tcp:::1", "tcp:192.0.2.5", "tcp:10.8.0.1"}) {
+		t.Errorf("tcp: %v %v", probed, err)
+	}
+}
+
+func TestPortHoldersReadTheKernelsTables(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	head := "  sl  local_address rem_address   st\n"
+	write := func(name, body string) {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(head+body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// 127.0.0.53:53 and 127.0.0.54:53 bound, 0.0.0.0:5353 another port.
+	write("udp", "   1: 3500007F:0035 00000000:0000 07\n   2: 3600007F:0035 00000000:0000 07\n   3: 00000000:14E9 00000000:0000 07\n")
+	// ::1:53 bound.
+	write("udp6", "   1: 00000000000000000000000001000000:0035 00000000000000000000000000000000:0000 07\n")
+	// 0.0.0.0:53 listening; 10.0.0.1:53 an established connection (01), not a listener.
+	write("tcp", "   1: 00000000:0035 00000000:0000 0A\n   2: 0100000A:0035 0200000A:C350 01\n")
+	if got := portHolders(dir, "udp", 53); !slices.Equal(got, []string{"127.0.0.53", "127.0.0.54", "::1"}) {
+		t.Errorf("udp: %v", got)
+	}
+	if got := portHolders(dir, "tcp", 53); !slices.Equal(got, []string{"0.0.0.0"}) {
+		t.Errorf("tcp: %v", got)
+	}
+	if got := portHolders(filepath.Join(dir, "none"), "udp", 53); got != nil {
+		t.Errorf("unreadable: %v", got)
+	}
+}
+
+func TestARefusalNamesTheHoldersItsProbeMet(t *testing.T) {
+	t.Parallel()
+	held := []string{"0.0.0.0", "10.0.0.1", "127.0.0.53", "192.0.2.7"}
+	for _, c := range []struct{ on, want []string }{
+		{[]string{"0.0.0.0", "::"}, held},
+		{[]string{"192.0.2.7"}, []string{"0.0.0.0", "192.0.2.7"}},
+		{[]string{"127.0.0.1", "::1"}, []string{"0.0.0.0"}},
+	} {
+		if got := holdersOn(slices.Clone(held), c.on); !slices.Equal(got, c.want) {
+			t.Errorf("on %v: %v", c.on, got)
+		}
 	}
 }

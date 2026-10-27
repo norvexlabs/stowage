@@ -47,15 +47,37 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
    Before writing a module, read the latest provider's official docs and its schema, and pin that
    release.
 
+### Open
+
+5. **A gateway stack on a Docker host is advice, not an install**: on the VM, a stack declaring
+   `services.<name>.nftables`, `transparent`, `host.interfaces.<role>.forward` and a role's
+   `routing_policy_rules` / `routes` runs as declared; on the `docker` shape `tune` only prints
+   them, so the same release installs a gateway that forwards nothing it should and enforces no
+   table until the operator copies each rule by hand — and nothing records, reverts or re-applies
+   them at the next start or upgrade (a table changed by a release stays the old one). The
+   operator's consent is the point of the Docker host's stance, so keep it, but make it one act:
+   `tune --apply` (or an install flag the operator gives) loads the service tables as the VM does
+   (replaced whole, recorded, deleted when a release drops one), the transparent roles' input
+   accept and the `forward` roles' `DOCKER-USER` chain, and the roles' policy rules and routes
+   (`ip rule` / `ip route`, or a networkd drop-in where networkd runs), re-applied by each start
+   while consented, removed by `tune --revert`; `status` says which are applied and which differ.
+   Without consent the install says plainly that the stack's network declarations are not in
+   force (a warning at the end of the install, not only in `tune`).
+6. **An upgrade that adds a front route is refused, after the stack is up** (was a Could: "Upgrade
+   with a new route"): `upgrade.go` refuses every route the install does not publish, `a new route
+   needs a new install` — even a `path` route on a domain the install already serves, which
+   decides no port and no domain (the case met: `/ca` and `/ca.crt` routes to an existing service
+   on the console's domain). On the VM the refusal comes after the boot brought every service up
+   healthy, so it fails `<name>.service`, the health gate judges the boot `went_back` and
+   the VM reboots into the passive release: an upgrade costs two reboots and ends where it began,
+   and the only way forward is a new install (a VM made again). Accept, at upgrade, a route
+   whose domain and port the install already decides (a `path` route on a published domain, a
+   route sharing a published domain input), and decide the rest as a first install does (ask the
+   new domain input, `--set` it, or refuse naming the input); and refuse what cannot be decided
+   before any service is replaced — on the VM at `upgrade` time, never in the boot.
+
 ## Should
 
-- **An L4 route to a `host_network` service a profile turned off is said to listen**: `l4Exposure`
-  (`internal/install/install.go`) reads the spec's services on the host's network, not the ones
-  the start runs (`hostNetwork`'s targets), so the start's log and `status` describe a route no
-  container serves. Pass the start's targets, as `transparentRoles` takes them.
-- **One check of a list of `host.interfaces` roles**: `transparent`
-  (`internal/lint/services.go`), `forward` and the routes' `interface` (`internal/lint/lint.go`)
-  each check that a role is declared, given once and the list not empty: one helper.
 - **`front.interface` does not hold the front on the VM** (security audit 2026-10-26, Medium):
   `openPorts` writes the role's `iifname` match into the input chain alone
   (`internal/install/install.go`), but the front is a bridged container published on every
@@ -86,9 +108,6 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
   removed meanwhile) is read again one container at a time, which a retry without the missing
   IDs would spare. The `:ro`/`:rw` strip of a `volumes_from` value is written three times (the
   config's joiner, the engine's, lint's).
-- **Lint on a compose list entry that is not a string**: `links`, `external_links` and
-  `volumes_from` entries of another kind (a number) are left out of the start-first checks; Compose
-  refuses them, so lint could say so.
 - **The networks record per service**: `.stowage-networks` digests every network of the project, so
   a change to a network a start-first service does not join replaces it stop-first all the same;
   a digest of each service's own networks would keep it overlapping.
@@ -652,8 +671,6 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
 - **A first install refused by the lock** leaves the directory it created (holding only the lock
   file): another run holds it, so it is not removed.
 
-- **Upgrade with a new route**: refused today (a new route needs a port or a domain decided);
-  decide it as a first install does.
 - **`<short>-stow updates`**: list the channel's releases after the installed one, from the release
   manifest (DESIGN's verb set).
 - **Upgrade order under a `command` scheme**: the project's scheme command does not run on an

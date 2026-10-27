@@ -63,7 +63,9 @@ type Service struct {
 	VolumesFrom any `yaml:"volumes_from"`
 	Links       any `yaml:"links"`
 	ExtLinks    any `yaml:"external_links"`
-	Healthcheck *struct {
+	// OwnVolumesFrom, OwnLinks and OwnExtLinks are its own lists, before extends joins its base's.
+	OwnVolumesFrom, OwnLinks, OwnExtLinks any `yaml:"-"`
+	Healthcheck                           *struct {
 		Disable any `yaml:"disable"`
 		Test    any `yaml:"test"`
 	} `yaml:"healthcheck"`
@@ -177,6 +179,7 @@ func (c *Compose) inherit() map[string]error {
 	var resolve func(name string) Service
 	resolve = func(name string) Service {
 		svc := c.Services[name]
+		svc.OwnVolumesFrom, svc.OwnLinks, svc.OwnExtLinks = svc.VolumesFrom, svc.Links, svc.ExtLinks
 		from, ok := base[name]
 		if !ok {
 			return svc // nothing to inherit, or an error its own extends reports

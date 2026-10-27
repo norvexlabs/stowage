@@ -626,6 +626,31 @@ func (h *Hostd) installed(in *Installer) (*EnvFile, error) {
 	return in.open()
 }
 
+// source opens what a release is looked up for: the install, or on the VM before its first install
+// (none made, or one refused) the first install's settings — their channel, and their registry
+// (a mirror, its CA trusted) or the release's — so a newer release's OS can replace the one whose
+// install was refused. An empty settings file names no channel: the request names one.
+func (h *Hostd) source(in *Installer) (env *EnvFile, first bool, err error) {
+	if h.Docker || !notInstalled(in) {
+		env, err = h.installed(in)
+		return env, false, err
+	}
+	st, err := ReadSettings(cmp.Or(in.O.Settings, SettingsFile(h.R.Spec.Name)))
+	if err != nil {
+		return nil, false, err
+	}
+	if st == nil {
+		st = &Settings{}
+	}
+	env = NewEnvFile()
+	if st.Channel != "" {
+		env.Set(ChannelVar, st.Channel)
+	}
+	env.Set("STOWAGE_REGISTRY", cmp.Or(st.Registry, h.R.Spec.Registry.Prefix))
+	in.O.RegistryCA = cmp.Or(in.O.RegistryCA, st.RegistryCA)
+	return env, true, nil
+}
+
 // notInstalled reports whether in has no install yet.
 func notInstalled(in *Installer) bool {
 	_, err := os.Stat(filepath.Join(in.O.Dir, envName))
@@ -1083,7 +1108,7 @@ func (h *Hostd) after(m *release.Manifest) (bool, error) {
 
 func (h *Hostd) updates(w http.ResponseWriter, r *http.Request) {
 	in, _ := h.run()
-	env, err := h.installed(in)
+	env, _, err := h.source(in)
 	if err != nil {
 		replyErr(w, err)
 		return
@@ -1357,7 +1382,7 @@ func (h *Hostd) upgrade(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	in, _ := h.run()
-	env, err := h.installed(in)
+	env, first, err := h.source(in)
 	if err != nil {
 		replyErr(w, err)
 		return
@@ -1369,6 +1394,18 @@ func (h *Hostd) upgrade(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := h.judged(r.Context()); err != nil {
 		replyErr(w, err)
+		return
+	}
+	// An operator's first install running (it holds the lock before it writes .env): the reboot
+	// would cut it.
+	if first && lockHeld(in.path(lifecycleLock)) {
+		replyErr(w, fail(http.StatusConflict, "an install is running: wait for it to finish"))
+		return
+	}
+	// The first install follows its settings' channel: a release from another would be followed
+	// on a channel it is not on.
+	if c, _ := env.Get(ChannelVar); first && c != "" && req.Channel != "" && req.Channel != c {
+		replyErr(w, fail(http.StatusConflict, "the first install follows %s (its settings): an upgrade before it takes that channel's release, not %s's", c, req.Channel))
 		return
 	}
 	m, _, err := h.target(r.Context(), in, env, req.Channel, req.Version)
@@ -1416,13 +1453,22 @@ func (h *Hostd) upgrade(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	reboot := req.Reboot == nil || *req.Reboot
+	does := "upgrades the install"
+	if first {
+		does = "makes the first install"
+	}
 	go func() {
-		if !req.SkipBackup {
+		if !req.SkipBackup && !first {
 			h.preflightBackup(in, func(format string, a ...any) { h.logf(j, format, a...) })
 		}
 		// Marked before kairos-agent runs, and kept when it fails: it may have moved the running
 		// system to the passive slot already.
 		err := os.WriteFile(filepath.Join(h.Run, osWritten), []byte(m.Tag+"\n"), 0o600)
+		if err == nil && first {
+			// The boot into it makes the first install of that release, whatever release the
+			// settings name.
+			err = writeAtomic(osUpgradeFile(in.O.Dir), strings.NewReader(m.Tag+"\n"), 0o600, nil)
+		}
 		if err == nil {
 			err = h.writeOS(in, j, prefix, src)
 		}
@@ -1431,11 +1477,11 @@ func (h *Hostd) upgrade(w http.ResponseWriter, r *http.Request) {
 		}
 		switch {
 		case err == nil && reboot:
-			if err = h.schedule("reboot", 30, false, j, fmt.Sprintf("rebooting into %s in 30 s: the boot upgrades the install", m.Tag)); err == nil {
+			if err = h.schedule("reboot", 30, false, j, fmt.Sprintf("rebooting into %s in 30 s: the boot %s", m.Tag, does)); err == nil {
 				return // ended by schedule, with its reboot
 			}
 		case err == nil:
-			h.logf(j, "%s is written: the next boot runs it and upgrades the install", m.Tag)
+			h.logf(j, "%s is written: the next boot runs it and %s", m.Tag, does)
 		}
 		h.finish(j, err)
 	}()

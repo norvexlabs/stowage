@@ -121,6 +121,7 @@ func Run(root, specPath string, now time.Time) (*Result, error) {
 	l.images()
 	l.stack()
 	l.memory()
+	l.composeLists()
 	l.vmSize()
 	l.tune()
 	l.host()
@@ -1875,22 +1876,40 @@ func (l *linter) interfaces(ifs map[string]spec.HostInterface) {
 	}
 	for _, role := range slices.Sorted(maps.Keys(ifs)) {
 		fw, at := ifs[role].Forward, "host.interfaces."+role+".forward"
-		if fw != nil && len(fw) == 0 {
-			l.errf(at, "is empty: the roles the host forwards %s's traffic out of, like [uplink]", role)
-		}
-		for j, out := range fw {
-			w := fmt.Sprintf("%s[%d]", at, j)
-			switch _, ok := ifs[out]; {
-			case !ok:
-				l.errf(w, "%q is not one of host.interfaces", out)
-			case out == role:
-				l.errf(w, "is %s itself: the host forwards from one interface out of another", role)
-			case slices.Index(fw, out) < j:
-				l.errf(w, "%s is given twice", out)
-			}
+		if fw != nil {
+			l.roleList(at, fw, fmt.Sprintf("the roles the host forwards %s's traffic out of, like [uplink]", role), func(w, out string) bool {
+				if out == role {
+					l.errf(w, "is %s itself: the host forwards from one interface out of another", role)
+				}
+				return out == role
+			})
 		}
 		if len(fw) > 0 && !kairos {
 			l.warnf(at, "only the VM's firewall is Stowage's (a kairos shape): a Docker host's operator accepts the forwarding in DOCKER-USER (tune advises it)")
+		}
+	}
+}
+
+// roleList checks a list of host.interfaces roles at at: not empty (empty says what it lists),
+// each role declared and given once. extra, when set, checks a declared role further: it reports
+// its own error and returns true when it found one.
+func (l *linter) roleList(at string, roles []string, empty string, extra func(w, role string) bool) {
+	if len(roles) == 0 {
+		l.errf(at, "is empty: %s", empty)
+		return
+	}
+	for i, role := range roles {
+		w := fmt.Sprintf("%s[%d]", at, i)
+		var ok bool
+		if l.s.Host != nil {
+			_, ok = l.s.Host.Interfaces[role]
+		}
+		switch {
+		case !ok:
+			l.errf(w, "%q is not one of host.interfaces", role)
+		case extra != nil && extra(w, role):
+		case slices.Index(roles, role) < i:
+			l.errf(w, "%s is given twice", role)
 		}
 	}
 }
