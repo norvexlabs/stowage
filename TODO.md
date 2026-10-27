@@ -47,6 +47,59 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
    Before writing a module, read the latest provider's official docs and its schema, and pin that
    release.
 
+### Batch F — a gateway's host networking, a build's multi-address names
+
+Gate: the full chain (graph and lint: e2e and the lifecycle suites; the VM's firewall and
+Docker's: e2e-kairos, e2e-vm, e2e-full-vm).
+
+5. **`images.<key>.add_hosts`: a name with several addresses.** The map gives a name one
+   address, while `docker build --add-host` takes a name more than once and a step resolves it
+   to every address given (checked: BuildKit writes each line to the step's `/etc/hosts`,
+   `getent` returns both). A build whose in-image tests exercise a client's failover across a
+   name's addresses cannot be expressed. The value becomes a list only
+   (`{origin.test: [127.0.0.1, 127.0.0.2]}`): each address enters the inputs digest in order,
+   an empty list or the same address twice for one name is an error, the addresses are checked
+   as now.
+6. **A transparent proxy on the VM (TPROXY).** A service's table may steer traffic crossing the
+   host to a local socket (`tproxy … to :<port>` with a policy route to the `local` table). The
+   packet keeps its original destination (80/443 of a remote host), so the VM's input chain
+   (policy drop) drops it, and an accept in the service's table cannot override that drop.
+   REDIRECT, the only way left, tracks every connection and costs a gateway throughput. Let a
+   service name the roles it intercepts on (`services.<name>.transparent: [<role>, …]`, roles of
+   `host.interfaces`, a `kind: tun` one included; the uplink is the operator's to leave out):
+   the VM's input chain accepts `iifname "<role>" meta l4proto { tcp, udp } socket transparent
+   1` before its drop. The roles are mandatory: the listeners bind the wildcard address, so an
+   unrestricted match would also accept a direct connection to their own ports from every
+   interface. No mark is read (the service's own policy route keeps its). Lint: the roles exist,
+   the service has a table (`nftables`), a kairos shape (warned without one: a Docker host's
+   firewall is its operator's); `tune` advises the same on a Docker host. First check that the
+   VM's kernel loads the `socket` expression in an input chain (it was prerouting-only at first).
+7. **On Docker, a service on the host's network as on the VM.** The VM runs an `l4` route's
+   service on the host's network, but on Docker the route is published from the service's
+   bridge, and with a `kairos` shape the compose file may not write `network_mode: host`. A
+   service that must see the host's interfaces and addresses (a VPN daemon and its tun device, a
+   resolver bound to it, a transparent proxy reading `SO_ORIGINAL_DST`, which returns Docker's
+   DNAT target) therefore works on the VM alone. Some such services are no route at all (the VPN
+   daemon, the resolver), yet must be modelled as one to reach the host's network. Let a service
+   ask for it (`services.<name>.host_network: true`) on both shapes: the same lint as the VM's
+   (one container, no `networks:`); the stack reaches it by name at the host's gateway on Docker
+   as on the VM (the front's routes and the stack's services calling `proxy:9090`); an `l4`
+   route to it keeps its port as the service's own (no install-time move) and takes no
+   `bind_input` (nothing enforces it on Docker). Decide whether the VM's implicit host network
+   for every `l4` route's upstream then goes, the key being the one way onto the host's network.
+8. **A stack that forwards between host interfaces: Docker's FORWARD DROP.** Docker sets the
+   FORWARD policy of `ip filter` and `ip6 filter` to DROP, so a stack routing for others (a VPN
+   exit node, a gateway between two `host.interfaces` roles) has every forwarded packet dropped,
+   whatever its own table accepts. Let a role declare that the host forwards from it
+   (`host.interfaces.<role>.forward: <out role>`, or a list: tailnet → uplink, lan → wan): the
+   VM accepts in `DOCKER-USER` (iptables and ip6tables) `-i <role> -o <out>` and its replies
+   `-i <out> -o <role> -m conntrack --ctstate ESTABLISHED,RELATED`, nothing new into the role.
+   README states that this accept leaves the judging to the stack's own table (its forward
+   chain decides), not "the role forwards anything". `DOCKER-USER` exists with Docker's iptables
+   backend alone: check the VM's daemon uses it. `tune` advises the same on a Docker host and
+   `k8s tune` prints it for the nodes. Not `ip-forward-no-drop`: the VM would then forward
+   between all its interfaces.
+
 ## Should
 
 - **`front.interface` does not hold the front on the VM** (security audit 2026-10-26, Medium):
