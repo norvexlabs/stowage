@@ -4,9 +4,11 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 
@@ -115,6 +117,15 @@ func (b *DockerBuilder) Build(ctx context.Context, p *project.Project, r BuildRe
 	}
 	if r.Version != "" {
 		args = append(args, "--build-arg", graph.VersionArg+"="+r.Version)
+	}
+	for _, h := range slices.Sorted(maps.Keys(img.AddHosts)) {
+		args = append(args, "--add-host", h+"="+img.AddHosts[h])
+	}
+	if img.Network == "host" {
+		args = append(args, "--allow", "network.host") // BuildKit's entitlement for it
+	}
+	if img.Network != "" && img.Network != "default" {
+		args = append(args, "--network", img.Network)
 	}
 	args = append(args, ctxDir)
 	if err := b.run(ctx, args...); err != nil {

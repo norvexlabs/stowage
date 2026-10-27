@@ -69,12 +69,19 @@ func (l *linter) serviceHost(at, name string, svc spec.Service) {
 // serviceUpdate checks a start-first service: one container, no fixed name, no address of its
 // own and no port published from a network of its own (two containers hold neither at once), and
 // a healthcheck its compose file sets (the overlap waits for it; an image's own is warned about).
-// update_socket is a directory of the container, for a start-first service alone.
+// update_socket is a directory of the container, update_signal one of spec.UpdateSignals, each
+// for a start-first service alone.
 func (l *linter) serviceUpdate(at, name string, svc spec.Service) {
+	if g := svc.UpdateSignal; g != "" && !slices.Contains(spec.UpdateSignals, g) {
+		l.errf(at+".update_signal", "%q: one of %s", g, strings.Join(spec.UpdateSignals, ", "))
+	}
 	switch svc.Update {
 	case "", spec.UpdateStopFirst:
 		if svc.UpdateSocket != "" {
 			l.errf(at+".update_socket", "is the directory a start-first overlap hands its sockets over in: set update: %s", spec.UpdateStartFirst)
+		}
+		if svc.UpdateSignal != "" {
+			l.errf(at+".update_signal", "is what a start-first overlap sends the old container: set update: %s", spec.UpdateStartFirst)
 		}
 		return
 	case spec.UpdateStartFirst:

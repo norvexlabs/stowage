@@ -43,6 +43,9 @@ atlas_on() {
 		fail "the console route does not serve the ui"
 	[[ $(curl -sk -o /dev/null -w '%{http_code}' --max-time 10 --resolve "ingest.atlas.test:443:$IP" https://ingest.atlas.test/health) == 200 ]] ||
 		fail "the ingest route does not serve"
+	# The status route: the console's domain, under its path, to the api.
+	[[ $(curl -sfk --max-time 10 --resolve "console.atlas.test:443:$IP" https://console.atlas.test/api/v1/status) == *'"version"'* ]] ||
+		fail "the status route does not serve the api's status on the console's domain"
 }
 
 step "start zot"

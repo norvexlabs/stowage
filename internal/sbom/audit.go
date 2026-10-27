@@ -17,6 +17,9 @@ import (
 type Target struct {
 	Name   string
 	Digest name.Digest
+	// Optional is an artifact a mirror may leave out: the OS bundle and the disks, which an
+	// export carries only for the shapes and the disk formats it names.
+	Optional bool
 }
 
 // Targets are the artifacts of a release (a) that carry an SBOM, under the registry prefix the
@@ -29,7 +32,7 @@ func Targets(prefix, project string, a release.Artifacts) ([]Target, error) {
 		if err != nil {
 			return err
 		}
-		out = append(out, Target{Name: n, Digest: r.Digest(d)})
+		out = append(out, Target{Name: n, Digest: r.Digest(d), Optional: repo == "os" || repo == "disk"})
 		return nil
 	}
 	keys := make([]string, 0, len(a.Images))

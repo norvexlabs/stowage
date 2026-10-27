@@ -418,6 +418,8 @@ func planCmd(o *options) *cobra.Command {
 				switch {
 				case n.Pinned != "":
 					note = "pinned " + n.Pinned
+				case n.Converts != "":
+					note = "converts " + n.Converts
 				case n.ReadsVersion:
 					note = "reads " + graph.VersionArg
 				}

@@ -63,14 +63,15 @@ grep -q 'not in the current month' "$WORK/ship-$V1.log" && fail "this month's re
 
 step "install $V1 with the bootstrap one-liner (loopback)"
 # Three distinct free ports for the stack, picked just before they are bound.
-CONSOLE_PORT=$(free_port) API_PORT=$(free_port) INGEST_PORT=$(free_port) OPS_PORT=$(free_port)
+CONSOLE_PORT=$(free_port) API_PORT=$(free_port) INGEST_PORT=$(free_port) OPS_PORT=$(free_port) STATUS_PORT=$(free_port)
 while [[ $API_PORT == "$CONSOLE_PORT" ]]; do API_PORT=$(free_port); done
 while [[ $INGEST_PORT == "$CONSOLE_PORT" || $INGEST_PORT == "$API_PORT" ]]; do INGEST_PORT=$(free_port); done
 while [[ $OPS_PORT == "$CONSOLE_PORT" || $OPS_PORT == "$API_PORT" || $OPS_PORT == "$INGEST_PORT" ]]; do OPS_PORT=$(free_port); done
+while [[ " $CONSOLE_PORT $API_PORT $INGEST_PORT $OPS_PORT " == *" $STATUS_PORT "* ]]; do STATUS_PORT=$(free_port); done
 login_pull
 docker run --rm --pull always "$REG/atlas/atlas-installer:latest" >"$WORK/atlas.sh" || fail "docker run of the installer image"
 unset DOCKER_CONFIG # for the next ships; the installer's environment never has it (OPERATOR)
-(cd "$WORK" && "${OPERATOR[@]}" sh atlas.sh --no-input --dir "$D" --ports "console=$CONSOLE_PORT,api=$API_PORT,ingest=$INGEST_PORT,ops=$OPS_PORT" \
+(cd "$WORK" && "${OPERATOR[@]}" sh atlas.sh --no-input --dir "$D" --ports "console=$CONSOLE_PORT,api=$API_PORT,ingest=$INGEST_PORT,ops=$OPS_PORT,status=$STATUS_PORT" \
 	--set ADMIN_EMAIL=admin@atlas.test --set ORG_NAME=Atlas) >"$WORK/install.log" 2>&1 || { cat "$WORK/install.log"; fail "install"; }
 atlas_running "$V1" 1
 # The one-shot echo-check, which no service waits for, exited 0: the install came up all the same.
@@ -78,6 +79,10 @@ atlas_running "$V1" 1
 	{ stack_logs >&2; fail "echo-check did not exit 0"; }
 # The ops route asks for a client certificate, which plain HTTP never carries: it refuses everyone.
 expect_code 403 --max-time 10 "http://127.0.0.1:$OPS_PORT/health"
+# The status route serves its path on its own port, the path kept for the api; nothing else there.
+[[ $(curl -sf --max-time 10 "http://127.0.0.1:$STATUS_PORT/api/v1/status") == *'"version"'* ]] || fail "the status route does not serve the api's status"
+expect_code 404 --max-time 10 "http://127.0.0.1:$STATUS_PORT/health"
+grep -qx "STOWAGE_URL_STATUS='\{0,1\}http://[^:]*:$STATUS_PORT/api/v1/status'\{0,1\}" "$D/.env" || fail "the status route's URL does not carry its path"
 grep -qF 'ops refuse(s) everyone in loopback mode' "$WORK/install.log" || { cat "$WORK/install.log"; fail "the install does not say the ops route refuses everyone"; }
 kept "$V1"
 [[ $(status organisation) == Atlas ]] || fail "the api did not record ORG_NAME"
@@ -280,6 +285,7 @@ wait "$poller"
 ((up2 == 0)) || { cat "$WORK/up2.log"; fail "upgrade to $V2"; }
 atlas_running "$V2" 2
 grep -q 'services.api: the new container is healthy, the old one stopped' "$WORK/up2.log" || { cat "$WORK/up2.log"; fail "the upgrade did not replace the api start-first"; }
+grep -q 'services.api: the new container runs: SIGUSR2 sent to the old one (update_signal)' "$WORK/up2.log" || { cat "$WORK/up2.log"; fail "the upgrade did not send the old api its update_signal"; }
 lost=$(grep -cv '^200$' "$WORK/poll2.log" || true)
 ((lost == 0 && $(wc -l <"$WORK/poll2.log") > 10)) || fail "the api route failed $lost of $(wc -l <"$WORK/poll2.log") requests through the upgrade: $(sort "$WORK/poll2.log" | uniq -c | tr '\n' ' ')"
 api=$(docker ps --filter "label=com.docker.compose.project=$(project)" --filter label=com.docker.compose.service=api --format '{{.ID}}')

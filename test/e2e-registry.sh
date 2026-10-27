@@ -19,8 +19,9 @@ set -euo pipefail
 PINNED=busybox:1.37@sha256:bdf57e528e45e4433820e045b29b4597825a1c9e38353532d90a01445013f82e
 . "$(dirname "$0")/lib.sh"
 
-step "start zot"
-start_zot
+step "start zot, which takes OCI manifests alone (no docker2s2): every image Stowage publishes is one"
+ZOT_COMPAT='' start_zot
+grep -q '"compat": \[\]' "$WORK/zot/config.json" || fail "zot takes Docker manifests"
 
 step "project"
 new_project "$PINNED"
@@ -33,7 +34,7 @@ grep -q 'image front: build' "$WORK/ship1.log" || fail "the front was not built"
 grep -q 'installer: push' "$WORK/ship1.log" || fail "the installer was not pushed"
 grep -q 'chart: tag .* → charts/notes-beta:0.1.0' "$WORK/ship1.log" || fail "the chart was not pushed"
 [[ $(grep -c '^signed ' "$WORK/ship1.log") == 10 ]] || { cat "$WORK/ship1.log"; fail "want 10 signatures (3 images, the front, the backup runner, the volume helper, the scanner, the chart, the installer, the release manifest)"; }
-grep -q 'image audit: mirror docker.io/anchore/grype' "$WORK/ship1.log" || fail "the scanner was not mirrored"
+grep -q 'image audit: convert docker.io/anchore/grype' "$WORK/ship1.log" || fail "the scanner was not converted"
 [[ $(grep -c '^attested the SBOM of ' "$WORK/ship1.log") == 8 ]] || { cat "$WORK/ship1.log"; fail "want 8 SBOMs (the 7 images, the installer)"; }
 
 step "ship beta again (nothing changes)"

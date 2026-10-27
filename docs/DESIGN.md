@@ -11,8 +11,9 @@ including signing and the release manifest, is phase 1) and **extensions** (**X*
 [§ 10 Extensions](#10-extensions) so each can be accepted or cut.
 
 Target project shape: one Postgres, one or more backends, one frontend, behind a TLS front that
-routes by hostname. Sessions are the application's cookies; the front does plain vhost routing (no
-sticky routing).
+routes by hostname, then by path prefix. Sessions are the application's cookies; the front does
+plain vhost and prefix routing (no sticky routing, no prefix stripped: an app served under a path
+knows it from its URL).
 
 Non-goals: generating Helm charts, orchestrating more than one host per Docker/VM install, what a
 rotated secret protects (re-encrypting data under a new key is the application's: Stowage rotates
@@ -58,9 +59,9 @@ Full examples: [full](../examples/full/stowage.yaml) (every key),
 | `stowage.requires` | accepted Stowage range (SemVer comparators, all holding), read before the rest of the spec and enforced by every command and on the lock; exact version in `stowage.lock` |
 | `version`, `changelog`, `channels` | § 3 |
 | `registry` | prefix, pull credentials (baked into the installer), push auth |
-| `images` | build table: `context`/`dockerfile`/`target`/`args`/`inputs`, or `ref` for a pinned upstream image |
+| `images` | build table: `context`/`dockerfile`/`target`/`args`/`add_hosts`/`network`/`inputs`, or `ref` for a pinned upstream image |
 | `stack.compose` | **the single service definition**, no `build:` (lint-enforced); `extends` within the file, `profiles:` only those an input turns on, no `ports:` of its own nor `network_mode: host` on the VM |
-| `front` | optional (absent or empty: no front, the `l4` routes alone); TLS modes offered, hostname → upstream routes, header stripping, forward auth, a source allowlist, client certificates and a login per route, which route is the portal, the CA published to the stack, the project's default host ports |
+| `front` | optional (absent or empty: no front, the `l4` routes alone); TLS modes offered, hostname (and path prefix) → upstream routes, header stripping, forward auth, a source allowlist, client certificates and a login per route, which route is the portal, the CA published to the stack, the project's default host ports |
 | `l4` | host ports published to a service as they are (TCP or UDP), beside the front; the input holding the address clients dial; the input holding the sources the VM lets reach it; the advanced input holding the host address the port is bound to |
 | `health` | readiness probe (provider) used by every consumer: compose healthcheck, health gate, install wait |
 | `database` | optional: engine, service, db name, migration and app roles, schema-compat provider; without it, no backup, `data.reset`, `reset-db`, restore or schema check |
@@ -248,7 +249,9 @@ images ──► os-bundle ──► disk images
 Each node has an **inputs digest**: a content hash of its declared paths (working tree, so an
 uncommitted edit counts; for an image, its `.dockerignore` applied exactly as docker applies it;
 `.git` is never read, so inside a build context it must be excluded by `.dockerignore`, which lint
-enforces) + dockerfile + target + build args, and for the nodes that carry Stowage's runtime
+enforces) + dockerfile + target + build args + added hosts + a build network other than BuildKit's
+default (each entered only when set, so an image naming neither keeps the digest it has without
+them), and for the nodes that carry Stowage's runtime
 (chart, OS bundle, disks, installer, release), the `stowage.lock` version. Base images enter through the Dockerfile's bytes: lint requires every
 `FROM` to be pinned by digest, so a base-image update is a Dockerfile change and reaches the
 digest (an unpinned base would change without one). The project version enters an image's digest
@@ -493,9 +496,15 @@ Off until the project configures a key (`signing: { provider: cosign-key, key: �
   never taken for a signature (the predicate decides). The SBOM is a property of the digest, so
   it is made once per digest and never re-made by a newer syft: re-shipping stays idempotent and
   needs no graph node; it is not an input of anything. The scanner (grype) is a pinned upstream
-  image mirrored as the release image `audit`, so an operator — at a site without internet
+  image published as the release image `audit`, so an operator — at a site without internet
   included — audits with the release's own scanner from the registry it already reads, and only
-  grype's database comes from outside (fetched, or given as a file). Audits and exports run on
+  grype's database comes from outside (fetched, or given as a file). It is published converted to
+  OCI media types (upstream's is a Docker v2 manifest), its own digest found again by its inputs
+  as a built image's, so a registry that takes OCI manifests alone takes every image Stowage
+  publishes for itself. No SBOM lists the kernel itself or its modules (syft's kernel cataloger
+  is left out): a scanner matched the kernel's upstream version against fixes a distribution
+  backports, failing every OS bundle on false findings, while the distribution's kernel packages
+  carry versions its own tracker reads. Audits and exports run on
   the operator's machine, never on the VM: the SBOMs of a version are in the registry, so the
   version the VM runs is all an audit needs; a VM holds no scanner (the bundle does not preload
   it) and none of its database (1 GB), and its persistent space stays the app's. The export
@@ -613,8 +622,9 @@ point.
    extended and rewritten, `up --wait`, provision. `rollback` is run by the installer the install
    keeps: the schema-compat provider decides on proof only (a barrier since the recorded version,
    or a previous release that does not read a newer schema; `schema.reads_newer` runs in the
-   previous release's image), then the previous files come back and only the release's own
-   values (version, revision, images) are taken from the kept `.env`.
+   previous release's image), then the previous files come back, only the release's own
+   values (version, revision, images) are taken from the kept `.env`, and the previous release's
+   own installer starts it (a re-run of it without the provision hook; a VM's, its boot).
    A schema baseline is an epoch: a release that starts a new one carries a new initial
    migration, so no schema check between two baselines can answer. Both sides of the decision
    are in the two releases' specs (the kept installer carries the installed one's), so the
@@ -827,7 +837,7 @@ Rules:
 | Piece | Built from | Behaviour |
 |---|---|---|
 | Installer / `<short>-stow` | one static Go binary (linux/amd64; arm64 later) carried by the installer image, the release payload appended at ship time; terminal UI on Charm huh / bubbles / lipgloss | one binary, three shapes, interactive or fully non-interactive |
-| Front | Caddy 2.11.7 + the Cloudflare DNS plugin, from a Dockerfile embedded in `stowage` (bases pinned by digest, never 2.11.6), built by `ship` into the project registry | Caddyfile generated by the installer from `front.routes` × TLS mode (no entrypoint script); per route, in one ordered `route` block: the source allowlist (an input of CIDRs, empty refusing everyone: a scraper's route needs no port of its own), the login (`basic_auth`, its bcrypt hash kept), header stripping (the login's `Authorization` with it), then `forward_auth` (its address an input, off while empty; the answer's headers copied after the strip, so a client never forges an identity); the values the front reads are checked when given and written into the Caddyfile, and the front carries the digest of its configuration as a label, so a change recreates it; `publish_ca` copies the local CA's root (or byo's `--ca`) into a project volume from the front's own container (a shell loop before `exec caddy`, as the root exists only once Caddy started), not from a second service `up --wait` would have to tolerate exiting; HSTS except `internal`; domains are the routes' `domain_input` inputs (`--domains` is shorthand), checked at install; Stowage owns the ACME contact (`STOWAGE_ACME_EMAIL`, refused when malformed, never silently dropped); a byo certificate is checked against every domain at install; `dns-cloudflare` takes its token as a secret given to the front's container (not to the project's services or the hook; a stack that reads `.env` itself sees it), checked in the form the plugin accepts, since the plugin's own refusal prints it; one issuer per mode |
+| Front | Caddy 2.11.7 + the Cloudflare DNS plugin, from a Dockerfile embedded in `stowage` (bases pinned by digest, never 2.11.6), built by `ship` into the project registry | Caddyfile generated by the installer from `front.routes` × TLS mode (no entrypoint script); a site per domain, its routes told apart by path prefix (each a named `path` matcher, `/p` and `/p/*`, in a `handle`, the longest first, the route without one last: a prefix never matches `/pfoo`), a client certificate asked for a whole site so a `client_auth` route has its domain alone; the front listens on 80 and 443 in its container whatever host ports publish them, and on the public HTTPS port too when it is moved (a second site address), so the domains it is an alias of on the stack's network answer on the port a route's URL names, which an app building a URL from its domain alone (an OIDC issuer) needs; per route, in one ordered `route` block: the source allowlist (an input of CIDRs, empty refusing everyone: a scraper's route needs no port of its own), the login (`basic_auth`, its bcrypt hash kept), header stripping (the login's `Authorization` with it), then `forward_auth` (its address an input, off while empty; the answer's headers copied after the strip, so a client never forges an identity); the values the front reads are checked when given and written into the Caddyfile, and the front carries the digest of its configuration as a label, so a change recreates it; `publish_ca` copies the local CA's root (or byo's `--ca`) into a project volume from the front's own container (a shell loop before `exec caddy`, as the root exists only once Caddy started), not from a second service `up --wait` would have to tolerate exiting; HSTS except `internal`; domains are the routes' `domain_input` inputs (`--domains` is shorthand), checked at install; Stowage owns the ACME contact (`STOWAGE_ACME_EMAIL`, refused when malformed, never silently dropped); a byo certificate is checked against every domain at install; `dns-cloudflare` takes its token as a secret given to the front's container (not to the project's services or the hook; a stack that reads `.env` itself sees it), checked in the form the plugin accepts, since the plugin's own refusal prints it; one issuer per mode |
 | Volume helper | busybox 1.37.0, from a Dockerfile embedded in `stowage` (base pinned by digest), built by `ship` into the project registry for a `docker` or `kairos` shape with a data volume of a `uid`, pulled with the stack's images on Docker, preloaded by the bundle | run once per start that makes such a volume, after `up --no-start` and before the services start: as root, no network, the new volumes mounted, `chown -hR <uid>` of each whose root belongs to another user |
 | Backup | the host daemon (pg_dump inside the database service, age in Go) and a runner image (rclone, from a Dockerfile embedded in `stowage`, base pinned by digest, built by `ship` into the project registry for a `kairos` shape with a `pg-age-rclone` backup, preloaded by the bundle) | the dump streamed through age to rclone `rcat`, never on the VM's disk, after each listed volume's tar (the runner's own, the volume read-only, no network) streamed the same way beside it; the size reached checked; the dump last, so a backup holds a dump only once whole; retention by `rclone delete --min-age` on the profile's own dumps, then the volume archives whose dump is gone (an archive is older than its dump); settings (destination, rclone config, recipients, retention, schedule, profile) the operator's, on the persistent partition, set over SSH; the timer's schedule a runtime drop-in; a backup before each upgrade, warn-only |
 | Host daemon (`hostd`) | Go, in `stowage`: `<short>-stow hostd`, a systemd service on the VM (not a privileged container) | JSON over HTTP on a unix socket (`root:admin` 0660): status, services, logs, service actions, provision, updates, upgrade (kairos-agent writes the release's bundle, by digest, to the passive slot; then a reboot), reboot / shutdown after a drain; one job at a time; the same API on an app socket, behind the install's token, mounted only into the services `shapes.kairos.host_api` names. health, rollback to the passive system (a job: the boot assessment marked, then a reboot), reset-db (a job, no reboot), the network override (set / confirm / revert / reset, its revert timer), backups (settings, a job, status, list, verify — a job too), an event journal in the install (jobs started, ended or lost, reboots scheduled and cancelled, boots and the health gate's verdicts, the first install's end; appended by the daemon and the gate under one lock, numbered for the journal's life, read with a long poll), the disk-pressure watch (the persistent partition read at start and every 10 min; at `soft_pct` a POST to the hook's service at its container address, bearer `auth_secret`; past `hard_pct` a console banner) |
@@ -1532,7 +1542,10 @@ every shape, the VM end-to-end test upgrading through it), then the health gate.
   two containers cannot publish one port, so a service reached from outside runs on the host's
   network and shares its port the canonical ways, `SO_REUSEPORT` or the app's own socket handoff
   (`update_socket`, a volume both containers mount); one behind the front is reached by name,
-  which answers for both. A failed new container is removed and the old one keeps serving: the
+  which answers for both. A handoff the old process starts when told to go (`update_signal`)
+  cannot wait for the new container's health, which follows the handoff: the new one is started
+  without `--wait`, the old one signalled once the new one runs, and the new one's health read
+  until it decides. A failed new container is removed and the old one keeps serving: the
   start fails as any other, and the release's rollback is unchanged. The overlap starts only
   against what already runs: a dependency the start makes or changes, an anonymous volume, a
   container not healthy leave the service to the stack's start, stop-first, rather than start the
@@ -1619,6 +1632,17 @@ every shape, the VM end-to-end test upgrading through it), then the health gate.
   needs a build anyway. Its inputs are the recipe's bytes and the platform, so each project builds
   it once per recipe and every later release re-tags it; the cost is one Caddy build, with
   network access, on the publisher's machine.
+- **A release is run by the Stowage that built it** — an installer reads only its own Stowage's
+  spec format: a kept installer is identified by its release manifest, its spec read only when it
+  loads as this Stowage's; a payload this Stowage refuses is put to that installer itself, which
+  reads its own before anything else: read, it is another format; not, it is corrupt and refused
+  (no outside rule tells a moved key from damage), and a rollback starts the previous release with its own installer, through a
+  verb every installer has (a re-run on Docker, `boot` on the VM). So no installer tolerates or
+  migrates another format (no compat until 1.0), an install crosses Stowage versions anyway, and
+  the checks keep running wherever the two formats agree; what only a spec of another format
+  tells (its baseline, its dropped inputs, whether it reads a newer schema) is logged as not
+  known, which the checks already treat as no proof. The barrier check, the current release's
+  own, still refuses.
 - **No Stowage registry** — every runtime piece is in the `stowage` binary (an executable or a
   recipe `ship` builds into the project registry), so `stowage.lock` pins a version, not digests;
   operators only ever pull from the project registry.

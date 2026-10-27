@@ -116,6 +116,7 @@ func TestDockerBuilderPassesTheSpecAndYieldsAnOCIImage(t *testing.T) {
 		"--tag stowage-build/" + p.Spec.Name + "-" + built + ":0123456789abcdef-",
 		"--target " + spec.Target,
 		"--build-arg STOWAGE_PROJECT_VERSION=2026.10.25",
+		"--add-host packages.atlas.test=192.0.2.10",
 		filepath.Join(root, spec.Context),
 	} {
 		if !strings.Contains(buildCall, want) {
@@ -126,6 +127,9 @@ func TestDockerBuilderPassesTheSpecAndYieldsAnOCIImage(t *testing.T) {
 		if !strings.Contains(buildCall, "--build-arg "+k+"="+v) {
 			t.Errorf("build call lacks arg %s", k)
 		}
+	}
+	if strings.Contains(buildCall, "--network") {
+		t.Errorf("network default is BuildKit's own, passed:\n%s", buildCall)
 	}
 	built1 := regexp.MustCompile(`--tag (\S+)`).FindStringSubmatch(buildCall)[1]
 	if !strings.HasPrefix(calls[1], "image save --output ") || !strings.HasSuffix(calls[1], " "+built1) || calls[2] != "image rm --no-prune "+built1 {

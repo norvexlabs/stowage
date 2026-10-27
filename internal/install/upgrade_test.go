@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"math/big"
 	"os"
@@ -14,8 +15,10 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/norvexlabs/stowage/internal/command"
+	"github.com/norvexlabs/stowage/internal/payload"
 	"github.com/norvexlabs/stowage/internal/spec"
 )
 
@@ -152,6 +155,26 @@ func TestUpgradeKeepsTheRecordedValuesAndAddsTheNew(t *testing.T) {
 	}
 	if strings.Join(order, ",") != "pg_dump,up --detach,"+ProvisionService {
 		t.Errorf("order: %v", order)
+	}
+}
+
+// A release that gives a route a path moves its recorded URL there, the address and port kept.
+func TestAnUpgradeGivesARouteItsPath(t *testing.T) {
+	t.Parallel()
+	e := installed(t)
+	was := get(e.readEnv(), "STOWAGE_URL_API")
+	e.to("2.0.0", func(s *spec.Spec) {
+		for i := range s.Front.Routes {
+			if s.Front.Routes[i].Name == "api" {
+				s.Front.Routes[i].Path = "/v2"
+			}
+		}
+	})
+	if err := e.upgrade(nil); err != nil {
+		t.Fatalf("%v\n%s", err, e.log)
+	}
+	if got := get(e.readEnv(), "STOWAGE_URL_API"); was == "" || got != was+"/v2" {
+		t.Errorf("STOWAGE_URL_API %q → %q", was, got)
 	}
 }
 
@@ -1156,7 +1179,7 @@ func TestARollbackStoppedAtTheEndKeepsWhatFailed(t *testing.T) {
 	// As if it stopped before removing what it kept: .env, the installer and the kept release are
 	// all 1.0.0.
 	e.r, e.self = testInstaller(t, "1.0.0")
-	if err := e.installer(nil).keepPrev(e.readEnv(), state{ProjectVersion: "1.0.0", Revision: 1, Schema: "5"}); err != nil {
+	if err := e.installer(nil).keepPrev(e.readEnv(), state{ProjectVersion: "1.0.0", Revision: 1, Schema: "5"}, &keptRelease{Manifest: e.r.Manifest, Release: e.r}); err != nil {
 		t.Fatal(err)
 	}
 	if err := e.rollback(nil); err != nil {
@@ -1218,7 +1241,7 @@ func TestFinishingAStoppedUpgradeRestoresTheStackFiles(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := in.keepPrev(env, state{ProjectVersion: "1.0.0", Revision: 1}); err != nil {
+	if err := in.keepPrev(env, state{ProjectVersion: "1.0.0", Revision: 1}, &keptRelease{Manifest: e.r.Manifest, Release: e.r}); err != nil {
 		t.Fatal(err)
 	}
 	want := read(t, filepath.Join(e.dir, "compose.yaml"))
@@ -1306,5 +1329,219 @@ func TestUpgradeRefusesVolumesHalfRestored(t *testing.T) {
 	}
 	if after, _ := os.ReadFile(filepath.Join(e.dir, envName)); !bytes.Equal(before, after) {
 		t.Error("the refused upgrade changed .env")
+	}
+}
+
+// anotherStowages makes the install's kept installer one another Stowage built: its manifest
+// records Stowage 0.0.9, and its spec a field this one does not know.
+func anotherStowages(t *testing.T, e *env) []byte {
+	t.Helper()
+	ctl := filepath.Join(e.dir, "notes-stow")
+	files, err := payload.Read(ctl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, err := payloadRelease(files)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.StowageVersion = "0.0.9"
+	if files[payload.Release], err = m.Encode(); err != nil {
+		t.Fatal(err)
+	}
+	files[payload.Spec] = append([]byte(`{"Retired":1,`), files[payload.Spec][1:]...)
+	var buf bytes.Buffer
+	if err := payload.Write(&buf, strings.NewReader("exe"), files); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(ctl, buf.Bytes(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
+// An install of a release another Stowage built upgrades without reading its spec, and goes back
+// by its own installer: a re-run of it starts it. What only its spec tells is not checked, but
+// the barriers the current release's database records still refuse.
+func TestAReleaseOfAnotherStowageUpgradesAndGoesBack(t *testing.T) {
+	t.Parallel()
+	e := installed(t)
+	old := anotherStowages(t, e)
+	e.to("2.0.0", nil)
+	if err := e.upgrade(nil); err != nil {
+		t.Fatalf("%v\n%s", err, e.log)
+	}
+	const foreign = `notes 1.0.0 (revision 1), built by Stowage 0.0.9, carries a spec this one does not read (its own installer does): payload spec.json: json: unknown field "Retired" (an installer of another Stowage?)`
+	for _, want := range []string{"the schema baseline of notes 1.0.0 is not known (" + foreign + "): not checked",
+		"the inputs and provision hook returns notes 2.0.0 removes are not known (" + foreign + "): kept"} {
+		if !strings.Contains(e.log.String(), want) {
+			t.Errorf("not logged: %s\n%s", want, e.log)
+		}
+	}
+	if !bytes.Equal([]byte(read(t, filepath.Join(e.dir, PrevDir, "notes-stow"))), old) {
+		t.Error("the upgrade did not keep the older installer")
+	}
+	var ran [][]string
+	var exe string
+	start := func(o *Options) {
+		o.Exec = func(_ context.Context, x string, args []string) error {
+			if args[0] == "--help" { // reading its own payload: the kept installer, in PrevDir by then
+				if x != filepath.Join(e.dir, PrevDir, "notes-stow") {
+					return errors.New("probed " + x)
+				}
+				return nil
+			}
+			exe, ran = x, append(ran, args)
+			return nil
+		}
+	}
+	e.schemaAt("7", []string{"7 (drop x)"}, true)
+	if err := e.rollback(start); err == nil || !strings.Contains(err.Error(), "the database carries 7 (drop x)") || len(ran) != 0 {
+		t.Fatalf("a barrier: %v, ran %v", err, ran)
+	}
+	e.log.Reset()
+	e.schemaAt("6", nil, true)
+	if err := e.rollback(start); err != nil {
+		t.Fatalf("%v\n%s", err, e.log)
+	}
+	if want := [][]string{{"--dir", e.dir, "--no-input", "--no-provision"}}; !slices.EqualFunc(ran, want, slices.Equal) || exe != filepath.Join(e.dir, "notes-stow") {
+		t.Errorf("ran %s %v, want %v", exe, ran, want)
+	}
+	if !bytes.Equal([]byte(read(t, exe)), old) || get(e.readEnv(), "STOWAGE_PROJECT_VERSION") != "1.0.0" {
+		t.Error("the install does not record 1.0.0 with its own installer")
+	}
+	for _, want := range []string{foreign + ": what only its spec tells is not checked",
+		"starting notes 1.0.0 (revision 1) with its own installer: " + exe + " --dir " + e.dir + " --no-input --no-provision",
+		"going back unchecked: whether 1.0.0 reads the newer schema 6 is not known: another Stowage built it"} {
+		if !strings.Contains(e.log.String(), want) {
+			t.Errorf("not logged: %s\n%s", want, e.log)
+		}
+	}
+}
+
+// A kept installer whose payload this Stowage refuses is another Stowage's when it reads that
+// payload itself, and goes back unchecked; one that does not read it either (another project's
+// spec, one cut short) refuses the rollback before anything changes.
+func TestARollbackRefusesAPreviousInstallerItCannotTrust(t *testing.T) {
+	t.Parallel()
+	other := func(b []byte) []byte { return bytes.Replace(b, []byte(`"Name":"notes"`), []byte(`"Name":"other"`), 1) }
+	for name, c := range map[string]struct {
+		spec   func([]byte) []byte
+		itself error  // what the kept installer says, reading its own payload
+		refuse string // "" = goes back
+	}{
+		"another project":   {other, errors.New("exit status 1"), `payload: the spec is "other"'s, the release "notes"'s, nor does that installer read it (exit status 1)`},
+		"cut short":         {func(b []byte) []byte { return b[:len(b)/2] }, errors.New("exit status 1"), "payload spec.json: unexpected EOF"},
+		"another stowage's": {other, nil, ""},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			e := upgraded(t)
+			ctl := filepath.Join(e.dir, PrevDir, "notes-stow")
+			files, err := payload.Read(ctl)
+			if err != nil {
+				t.Fatal(err)
+			}
+			m, err := payloadRelease(files)
+			if err != nil {
+				t.Fatal(err)
+			}
+			m.StowageVersion = "0.0.9"
+			if files[payload.Release], err = m.Encode(); err != nil {
+				t.Fatal(err)
+			}
+			files[payload.Spec] = c.spec(files[payload.Spec])
+			var buf bytes.Buffer
+			if err := payload.Write(&buf, strings.NewReader("exe"), files); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(ctl, buf.Bytes(), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			err = e.rollback(func(o *Options) {
+				o.Exec = func(_ context.Context, exe string, args []string) error {
+					if args[0] == "--help" {
+						if exe != ctl {
+							return errors.New("probed " + exe)
+						}
+						return c.itself
+					}
+					return nil
+				}
+			})
+			if c.refuse == "" {
+				if err != nil || !strings.Contains(e.log.String(), "built by Stowage 0.0.9, carries a spec this one does not read (its own installer does)") {
+					t.Fatalf("%v\n%s", err, e.log)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), c.refuse) {
+				t.Fatalf("%v\n%s", err, e.log)
+			}
+			if get(e.readEnv(), "STOWAGE_PROJECT_VERSION") != "2.0.0" {
+				t.Error("the refused rollback changed .env")
+			}
+			if _, err := os.Stat(filepath.Join(e.dir, PrevDir)); err != nil {
+				t.Errorf("the refused rollback removed what it keeps: %v", err)
+			}
+		})
+	}
+}
+
+// An install's kept installer carrying no key falls back to this installer's keys only when this
+// Stowage reads its payload: another Stowage's may keep its keys where this one does not look.
+func TestTheTrustOfAnotherStowagesReleaseIsNotGuessed(t *testing.T) {
+	t.Parallel()
+	e := installed(t)
+	if _, _, err := e.installer(nil).installTrust(context.Background(), "notes", "1.0.0", "1"); err != nil {
+		t.Fatalf("this Stowage's release without keys: %v", err)
+	}
+	anotherStowages(t, e)
+	if _, _, err := e.installer(nil).installTrust(context.Background(), "notes", "1.0.0", "1"); err == nil || !strings.Contains(err.Error(), "the keys the install trusts cannot be told") {
+		t.Fatalf("another Stowage's release without keys: %v", err)
+	}
+}
+
+// A kept installer reads its own payload when its --help exits 0; one that exits otherwise says
+// why (its stderr, capped); one that does not answer within the bound, or a run stopped
+// meanwhile, is no verdict on the payload.
+func TestAKeptInstallerReadsItself(t *testing.T) {
+	readsItselfWithin = 200 * time.Millisecond
+	t.Cleanup(func() { readsItselfWithin = 30 * time.Second })
+	dir := t.TempDir()
+	script := func(name, body string) string {
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, []byte("#!/bin/sh\n"+body+"\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	o := &Options{}
+	ctx := context.Background()
+	if err := o.readsItself(ctx, script("reads", `[ "$1" = --help ] && echo usage`)); err != nil {
+		t.Errorf("one that reads it: %v", err)
+	}
+	if err := o.readsItself(ctx, script("refuses", "echo 'error: payload spec.json: bad' >&2; exit 1")); err == nil || err.Error() != "exit status 1: error: payload spec.json: bad" {
+		t.Errorf("one that refuses it: %v", err)
+	}
+	if err := o.readsItself(ctx, script("silent", "exit 3")); err == nil || err.Error() != "exit status 3" {
+		t.Errorf("one that refuses it silently: %v", err)
+	}
+	if err := o.readsItself(ctx, script("loud", "head -c 9000 /dev/zero | tr '\\0' x >&2; exit 1")); err == nil || !strings.HasSuffix(err.Error(), " …") || len(err.Error()) > 4200 {
+		t.Errorf("one that says too much: %d bytes", len(fmt.Sprint(err)))
+	}
+	slow := script("slow", "exec sleep 5")
+	if err := o.readsItself(ctx, slow); !errors.Is(err, errProbeTimeout) {
+		t.Errorf("one that does not answer: %v", err)
+	}
+	stop, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
+	defer cancel()
+	if err := o.readsItself(stop, slow); !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("a run stopped meanwhile: %v", err)
+	}
+	done, cancelDone := context.WithCancel(ctx)
+	cancelDone()
+	if err := o.readsItself(done, slow); !errors.Is(err, context.Canceled) {
+		t.Errorf("a run already stopped: %v", err)
 	}
 }

@@ -114,6 +114,11 @@ func (s System) running(name string) bool {
 	return false
 }
 
+// isolating reports whether some CPUs are the services' alone, with others left for the NICs.
+func (h Host) isolating() bool {
+	return len(h.steerCPUs()) < len(h.cpuIDs())
+}
+
 // steerCPUs are the online CPUs the NICs' interrupts and receive steering go to: all but the
 // Isolated ones, every one when nothing else is left.
 func (h Host) steerCPUs() []int {
@@ -172,12 +177,9 @@ func (s System) irqsStacked(irqs []int) bool {
 	}
 	first := ""
 	for i, irq := range irqs {
-		dir := filepath.Join("proc/irq", strconv.Itoa(irq))
-		cpus, ok := s.read(filepath.Join(dir, "effective_affinity_list"))
-		if !ok || cpus == "" {
-			if cpus, ok = s.read(filepath.Join(dir, "smp_affinity_list")); !ok {
-				return false
-			}
+		cpus, ok := s.irqCPUs(irq)
+		if !ok {
+			return false
 		}
 		if i == 0 {
 			first = cpus
@@ -186,6 +188,32 @@ func (s System) irqsStacked(irqs []int) bool {
 		}
 	}
 	return true
+}
+
+// irqCPUs are the CPUs an interrupt runs on: its effective affinity, else the one asked.
+func (s System) irqCPUs(irq int) (string, bool) {
+	dir := filepath.Join("proc/irq", strconv.Itoa(irq))
+	cpus, ok := s.read(filepath.Join(dir, "effective_affinity_list"))
+	if !ok || cpus == "" {
+		cpus, ok = s.read(filepath.Join(dir, "smp_affinity_list"))
+	}
+	return cpus, ok
+}
+
+// irqsOn are the interrupts whose CPUs (irqCPUs) reach one of cpus, and those whose CPUs do not
+// read.
+func (s System) irqsOn(irqs []int, cpus []int) (on, unread []int) {
+	for _, irq := range irqs {
+		list, ok := s.irqCPUs(irq)
+		ids, parsed := cpuList(list)
+		switch {
+		case !ok || !parsed || len(ids) == 0:
+			unread = append(unread, irq)
+		case slices.ContainsFunc(ids, func(id int) bool { return slices.Contains(cpus, id) }):
+			on = append(on, irq)
+		}
+	}
+	return on, unread
 }
 
 // cpuGovernor is one CPU's frequency governor: its file, its value, whether it offers performance.
@@ -469,7 +497,7 @@ func (s System) Inspect(ctx context.Context, h Host) []Item {
 				items = append(items, Item{verdict(atLeast(flows, q)), "nic", fmt.Sprintf("%s rx-%d rps_flow_cnt", n.name, i), flows, AtLeast.render(nums(q))})
 			}
 		}
-		if h.network() {
+		if h.network() || h.isolating() {
 			items = append(items, s.inspectSteering(h, n)...)
 		}
 		if a := s.advice(n, all, h.CPUs); a != "" {
@@ -528,14 +556,32 @@ func (s System) Inspect(ctx context.Context, h Host) []Item {
 // RPS on a NIC with fewer queues than CPUs.
 func (s System) inspectSteering(h Host, n nic) []Item {
 	var items []Item
-	switch irqs := s.irqs(n); {
-	case len(irqs) < 2 || len(h.cpuIDs()) < 2:
-	case s.running("irqbalance") && len(h.Isolated) > 0 && s.irqbalanceBans(h.Isolated):
+	balanced := s.running("irqbalance")
+	off := "off CPUs " + cpuRanges(h.Isolated) + ", the services' cores"
+	irqs := s.irqs(n)
+	isolating := h.isolating()
+	var on, unread []int
+	if isolating {
+		on, unread = s.irqsOn(irqs, h.Isolated)
+	}
+	switch {
+	// One interrupt, or one CPU, is spread as it can be; it is judged only against isolated cores.
+	case len(irqs) == 0, !isolating && (len(irqs) < 2 || len(h.cpuIDs()) < 2):
+	case balanced && len(h.Isolated) > 0 && s.irqbalanceBans(h.Isolated):
 		items = append(items, Item{OK, "nic", n.name + " interrupts", "irqbalance spreads them, off the services' cores", "IRQBALANCE_BANNED_CPULIST=" + cpuRanges(h.Isolated)})
-	case s.running("irqbalance") && len(h.Isolated) > 0:
+	case balanced && len(h.Isolated) > 0:
 		items = append(items, Item{Advice, "nic", n.name + " interrupts", "irqbalance spreads them, the services' cores included:", "IRQBALANCE_BANNED_CPULIST=" + cpuRanges(h.Isolated) + " in /" + s.irqbalanceFile() + ", then restart irqbalance"})
-	case s.running("irqbalance"):
+	case balanced:
 		items = append(items, Item{NA, "nic", n.name + " interrupts", "irqbalance spreads them", ""})
+	case len(on) > 0:
+		// Drift: --apply (the VM's boot) moves each off them; one the kernel manages refuses the
+		// move, which its note says.
+		items = append(items, Item{Differs, "nic", n.name + " interrupts", fmt.Sprintf("%d of %d on the services' cores (IRQ %s)", len(on), len(irqs), cpuRanges(on)), off})
+	case len(unread) > 0:
+		items = append(items, Item{Advice, "nic", n.name + " interrupts", fmt.Sprintf("%d of %d whose CPUs do not read (IRQ %s): whether they reach the services' cores is not known", len(unread), len(irqs), cpuRanges(unread)), off})
+	case isolating && (!h.network() || len(irqs) < 2 || len(h.steerCPUs()) < 2):
+		items = append(items, Item{OK, "nic", n.name + " interrupts", fmt.Sprintf("%d, off the services' cores", len(irqs)), off})
+	case len(irqs) < 2 || len(h.steerCPUs()) < 2:
 	case s.irqsStacked(irqs):
 		// Advice, never drift: a driver whose interrupts the kernel manages refuses the move.
 		items = append(items, Item{Advice, "nic", n.name + " interrupts", fmt.Sprintf("%d, all on the same CPUs: --apply (the VM's boot) spreads them, unless the kernel manages them", len(irqs)), ""})

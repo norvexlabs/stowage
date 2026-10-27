@@ -292,6 +292,9 @@ def main():
         threading.Thread(target=server.shutdown).start()
 
     signal.signal(signal.SIGTERM, drain)
+    # SIGUSR2 is the start-first upgrade's word that the new container runs (update_signal): a
+    # server handing its listeners over would send them now; this one serves on until SIGTERM.
+    signal.signal(signal.SIGUSR2, lambda *_: log(f"atlas {role}: told to go, serving until SIGTERM"))
     server.serve_forever()
     server.server_close()
     log(f"atlas {role} drained")

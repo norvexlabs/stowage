@@ -1,6 +1,7 @@
 package install
 
 import (
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -11,6 +12,7 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/norvexlabs/stowage/internal/spec"
 )
@@ -280,6 +282,11 @@ func (c container) serving(done bool) bool {
 	return c.State == "running" && (c.Health == "" || c.Health == "healthy")
 }
 
+// containerFormat renders a container as containers reads it. A container without a healthcheck
+// has no State.Health: read through index, which renders nothing for a key the inspected object
+// lacks, where a field reference fails the template.
+const containerFormat = "{{.Id}}|{{.Name}}|{{.State.Status}}|{{.State.ExitCode}}|{{with index .State \"Health\"}}{{.Status}}{{end}}|{{index .Config.Labels \"" + hashLabel + "\"}}|{{.Image}}|{{range .Mounts}}{{if eq .Type \"volume\"}}{{.Name}},{{end}}{{end}}"
+
 // containers reads service's containers (`ps --all`) and what each runs.
 func (in *Installer) containers(ctx context.Context, environ []string, service string) ([]container, error) {
 	out, err := in.O.Docker.Run(ctx, Cmd{Args: append(in.composeBase(), "ps", "--all", "--quiet", service), Env: environ})
@@ -290,8 +297,13 @@ func (in *Installer) containers(ctx context.Context, environ []string, service s
 	if len(ids) == 0 {
 		return nil, nil
 	}
-	format := "{{.Id}}|{{.Name}}|{{.State.Status}}|{{.State.ExitCode}}|{{if .State.Health}}{{.State.Health.Status}}{{end}}|{{index .Config.Labels \"" + hashLabel + "\"}}|{{.Image}}|{{range .Mounts}}{{if eq .Type \"volume\"}}{{.Name}},{{end}}{{end}}"
-	if out, err = in.O.Docker.Run(ctx, Cmd{Args: append([]string{"inspect", "--format", format}, ids...)}); err != nil {
+	return in.inspectContainers(ctx, ids...)
+}
+
+// inspectContainers reads the containers ids (containerFormat).
+func (in *Installer) inspectContainers(ctx context.Context, ids ...string) ([]container, error) {
+	out, err := in.O.Docker.Run(ctx, Cmd{Args: append([]string{"inspect", "--type", "container", "--format", containerFormat}, ids...)})
+	if err != nil {
 		return nil, fmt.Errorf("reading its containers: %w", err)
 	}
 	var cs []container
@@ -443,8 +455,12 @@ func (in *Installer) overlap(ctx context.Context, environ []string, m *composeMo
 	}
 	old := cs[0].ID
 	in.O.logf("services.%s: start-first: the new container starts beside the old one", service)
-	if _, err := in.O.Docker.Run(ctx, Cmd{Args: append(in.composeBase(), "up", "--detach", "--wait", "--no-deps", "--no-recreate", "--scale", service+"=2", service), Env: environ, Stream: in.O.Log}); err != nil {
-		failed := fmt.Errorf("services.%s: its new container did not become healthy beside the old one, which serves on: %w", service, err)
+	if signalled, err := in.startBeside(ctx, environ, service, old); err != nil {
+		serves := "which serves on"
+		if signalled {
+			serves = "which was sent " + in.R.Spec.Services[service].UpdateSignal + " (update_signal) and serves on as far as the app keeps serving after it"
+		}
+		failed := fmt.Errorf("services.%s: its new container did not become healthy beside the old one, %s: %w", service, serves, err)
 		now, lerr := in.containers(ctx, environ, service)
 		if lerr != nil {
 			return fmt.Errorf("%w (removing the new one: %v)", failed, lerr)
@@ -466,6 +482,61 @@ func (in *Installer) overlap(ctx context.Context, environ []string, m *composeMo
 	}
 	in.O.logf("services.%s: the new container is healthy, the old one stopped", service)
 	return nil
+}
+
+// overlapPoll is how often startBeside reads the new container's health.
+var overlapPoll = 500 * time.Millisecond
+
+// startBeside starts service's new container beside its old one and returns once the new one
+// serves: running, healthy when it has a healthcheck. With update_signal, the new container is
+// started without waiting, the old one sent the signal once the new one runs (signalled), and the
+// new one's health read until it is healthy, or unhealthy or no longer running (an error).
+func (in *Installer) startBeside(ctx context.Context, environ []string, service, old string) (signalled bool, err error) {
+	signal := in.R.Spec.Services[service].UpdateSignal
+	up := append(in.composeBase(), "up", "--detach")
+	if signal == "" {
+		up = append(up, "--wait")
+	}
+	up = append(up, "--no-deps", "--no-recreate", "--scale", service+"=2", service)
+	if _, err := in.O.Docker.Run(ctx, Cmd{Args: up, Env: environ, Stream: in.O.Log}); err != nil || signal == "" {
+		return false, err
+	}
+	cs, err := in.containers(ctx, environ, service)
+	if err != nil {
+		return false, err
+	}
+	i := slices.IndexFunc(cs, func(c container) bool { return c.ID != old })
+	if i < 0 {
+		return false, errors.New("no new container beside the old one")
+	}
+	c := cs[i]
+	for {
+		switch {
+		case c.State != "running" && c.State != "created":
+			return signalled, fmt.Errorf("its new container %s is %s (exit code %s)", c.Name, c.State, c.Exit)
+		case c.Health == "unhealthy":
+			return signalled, fmt.Errorf("its new container %s is unhealthy", c.Name)
+		case c.State == "running" && !signalled:
+			if _, err := in.O.Docker.Run(ctx, Cmd{Args: []string{"kill", "--signal", signal, old}}); err != nil {
+				return false, fmt.Errorf("sending %s to its old container: %w", signal, err)
+			}
+			in.O.logf("services.%s: the new container runs: %s sent to the old one (update_signal)", service, signal)
+			signalled = true
+			continue // judged again as read: one without a healthcheck serves at once
+		case c.serving(false):
+			return signalled, nil
+		}
+		select {
+		case <-ctx.Done():
+			return signalled, ctx.Err()
+		case <-time.After(overlapPoll):
+		}
+		now, err := in.inspectContainers(ctx, c.ID)
+		if err != nil || len(now) != 1 {
+			return signalled, cmp.Or(err, fmt.Errorf("its new container %s is gone", c.Name))
+		}
+		c = now[0]
+	}
 }
 
 // takeNetworks reads the networks' record into the start (prevNetworks, prevNetworksErr when it

@@ -189,6 +189,24 @@ func TestBuildInputsReachTheImage(t *testing.T) {
 	if c := changed(before, inputs(build(t, root))); !c["image/api"] {
 		t.Errorf("a target change: %v", c)
 	}
+	before = inputs(build(t, root))
+	testutil.Edit(t, root, "stowage.yaml", "packages.atlas.test: 192.0.2.10", "packages.atlas.test: 192.0.2.11")
+	if c := changed(before, inputs(build(t, root))); !c["image/api"] || c["image/ingest"] {
+		t.Errorf("an add_hosts change: %v", c)
+	}
+	before = inputs(build(t, root))
+	testutil.Edit(t, root, "stowage.yaml", "network: default", "network: host")
+	if c := changed(before, inputs(build(t, root))); !c["image/api"] {
+		t.Errorf("a network change: %v", c)
+	}
+	// default is BuildKit's own network: the same build as none named.
+	before = inputs(build(t, root))
+	testutil.Edit(t, root, "stowage.yaml", "network: host", "network: default")
+	mid := inputs(build(t, root))
+	testutil.Edit(t, root, "stowage.yaml", "    network: default\n", "")
+	if c := changed(mid, inputs(build(t, root))); c["image/api"] || !changed(before, mid)["image/api"] {
+		t.Errorf("network default and none named differ, or host and default do not")
+	}
 }
 
 // A revision repackages what embeds it and re-tags every image.

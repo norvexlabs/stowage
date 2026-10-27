@@ -454,7 +454,7 @@ func (in *Installer) Boot(ctx context.Context) error {
 	if cur == m.ProjectVersion && rev == strconv.Itoa(m.Revision) {
 		return in.Install(ctx)
 	}
-	if _, err := in.keptInstaller(name, cur, rev); err != nil {
+	if _, err := in.keptInstaller(ctx, name, cur, rev); err != nil {
 		return err
 	}
 	switch {

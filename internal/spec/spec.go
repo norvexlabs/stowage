@@ -105,9 +105,17 @@ type Image struct {
 	Dockerfile string            `yaml:"dockerfile"`
 	Target     string            `yaml:"target"`
 	Args       map[string]string `yaml:"args"`
-	Inputs     []string          `yaml:"inputs"`
-	Ref        string            `yaml:"ref"`
+	// AddHosts are the names the build's steps resolve to fixed addresses, by name (BuildKit's
+	// /etc/hosts is read-only to a step).
+	AddHosts map[string]string `yaml:"add_hosts"`
+	// Network is the build steps' network: default (BuildKit's own), host or none.
+	Network string   `yaml:"network"`
+	Inputs  []string `yaml:"inputs"`
+	Ref     string   `yaml:"ref"`
 }
+
+// BuildNetworks are the networks an image's build steps may run on (images.<key>.network).
+var BuildNetworks = []string{"default", "host", "none"}
 
 // ReservedImageKeys are the image keys whose repository <prefix>/<name>-<key> Stowage publishes
 // its own artifacts to (release manifests, sequence records, OS bundle, disks, installer, front,
@@ -144,7 +152,15 @@ type Service struct {
 	// UpdateSocket is a directory, in the container, both containers of a start-first overlap
 	// mount: where the old one hands its listening sockets to the new.
 	UpdateSocket string `yaml:"update_socket"`
+	// UpdateSignal is the signal a start-first overlap sends the old container once the new one
+	// runs, before it waits for the new one's health: for a handoff the old process starts when
+	// told to go.
+	UpdateSignal string `yaml:"update_signal"`
 }
+
+// UpdateSignals are the signals services.<name>.update_signal may name: those a process can
+// catch, Docker's names for them.
+var UpdateSignals = []string{"SIGHUP", "SIGINT", "SIGQUIT", "SIGTERM", "SIGUSR1", "SIGUSR2", "SIGWINCH"}
 
 // The orders of services.<name>.update.
 const (
@@ -265,15 +281,18 @@ func CheckEnvValue(v string) error {
 // MAX_ARG_STRLEN is 128 KiB for the whole KEY=value string).
 const MaxEnvValue = 64 << 10
 
-// URLVar is the variable carrying a route's public URL: https://<domain> behind TLS,
-// http://<address>:<port> in loopback mode.
+// URLVar is the variable carrying a route's public URL: https://<domain>[:<port>][<path>] behind
+// TLS, http://<address>:<port>[<path>] in loopback mode.
 func URLVar(route string) string {
 	return "STOWAGE_URL_" + strings.ToUpper(strings.NewReplacer("-", "_", ".", "_").Replace(route))
 }
 
 type Route struct {
-	Name         string   `yaml:"name"`
-	DomainInput  string   `yaml:"domain_input"`
+	Name        string `yaml:"name"`
+	DomainInput string `yaml:"domain_input"`
+	// Path is the prefix the route serves on its domain (/idp: /idp and what is under it), kept in
+	// the request the upstream gets; empty, every path another route of the domain does not.
+	Path         string   `yaml:"path"`
 	Upstream     string   `yaml:"upstream"`
 	StripHeaders []string `yaml:"strip_headers"`
 	// ForwardAuth asks an authentication service before proxying; off while its address is empty.

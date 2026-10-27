@@ -63,14 +63,52 @@ func loopbackCaddyfile(f spec.Front, get func(string) string, logins map[string]
 	b.WriteString("{\n\tadmin off\n\tauto_https off\n\tpersist_config off\n}\n")
 	for i, r := range f.Routes {
 		fmt.Fprintf(&b, "\n# %s\nhttp://:%d {\n", r.Name, frontPort(i))
-		if r.ClientAuth {
-			b.WriteString("\trespond 403\n")
-		} else {
-			routeBody(&b, r, get, logins)
-		}
+		serveRoutes(&b, []indexed{{i, r}}, func(b *strings.Builder, r spec.Route) {
+			if r.ClientAuth {
+				b.WriteString("\trespond 403\n")
+			} else {
+				routeBody(b, r, get, logins)
+			}
+		})
 		b.WriteString("}\n")
 	}
 	return b.String()
+}
+
+// indexed is a route and its index among the front's routes.
+type indexed struct {
+	i int
+	r spec.Route
+}
+
+// serveRoutes writes the routes one site serves, each as body writes it: a route without a path
+// alone as it is; else each route with a path by its prefix (the path itself and what is under
+// it), the longest first, then the one without (every other path), else a 404.
+func serveRoutes(b *strings.Builder, routes []indexed, body func(*strings.Builder, spec.Route)) {
+	if len(routes) == 1 && routes[0].r.Path == "" {
+		body(b, routes[0].r)
+		return
+	}
+	sorted := slices.Clone(routes)
+	slices.SortStableFunc(sorted, func(x, y indexed) int { return len(y.r.Path) - len(x.r.Path) })
+	catchAll := false
+	for _, x := range sorted {
+		var inner strings.Builder
+		body(&inner, x.r)
+		if x.r.Path == "" {
+			catchAll = true
+			b.WriteString("\thandle {\n")
+		} else {
+			fmt.Fprintf(b, "\t@stowage_path_%d path %s %s/*\n\thandle @stowage_path_%d {\n", x.i, x.r.Path, x.r.Path, x.i)
+		}
+		for l := range strings.Lines(inner.String()) {
+			b.WriteString("\t" + l)
+		}
+		b.WriteString("\t}\n")
+	}
+	if !catchAll {
+		b.WriteString("\thandle {\n\t\trespond 404\n\t}\n")
+	}
 }
 
 // ClientCAFile is the install's client CA (--client-ca), PEM: the CAs a client certificate of a
@@ -200,7 +238,7 @@ func (in *Installer) warnIPv6Allowlists(get func(string) string, gw netip.Addr) 
 				p = netip.PrefixFrom(p.Addr().Unmap(), max(p.Bits()-96, 0))
 			}
 			if holds(p) {
-				in.O.logf("warning: route %s: %s=%s holds %s, %s every IPv6 client passes while the stack's IPv6 is off and this host has a global IPv6 address: install --ipv6, or list narrower sources", r.Name, r.AllowInput, get(r.AllowInput), what, s)
+				in.O.logf("warning: route %s: %s=%s: %s holds %s every IPv6 client passes while the stack's IPv6 is off and this host has a global IPv6 address: install --ipv6, or list narrower sources", r.Name, r.AllowInput, get(r.AllowInput), s, what)
 				break
 			}
 		}
@@ -336,7 +374,7 @@ func frontCompose(f spec.Front, l4 []spec.L4Route, get func(string) string, mode
 			ports = append(ports, fmt.Sprintf("${STOWAGE_LOOPBACK_ADDRESS}:${%s}:%d", PortVar(r.Name), frontPort(i)))
 		}
 	} else {
-		ports = []string{"${" + HTTPPortVar + "}:${" + HTTPPortVar + "}", "${" + HTTPSPortVar + "}:${" + HTTPSPortVar + "}"}
+		ports = []string{"${" + HTTPPortVar + "}:80", "${" + HTTPSPortVar + "}:443"}
 	}
 	if mode == "byo" {
 		volumes = append(volumes, "./"+TLSDir+":/etc/caddy/"+TLSDir+":ro")
@@ -359,20 +397,10 @@ func frontCompose(f spec.Front, l4 []spec.L4Route, get func(string) string, mode
 		service["environment"] = map[string]string{"CLOUDFLARE_API_TOKEN": "${" + CloudflareTokenVar + "}"}
 	}
 	// Each route's domain names the front on the stack's network too: a service reaching a route
-	// as its clients do (an issuer's URL) reaches the front, not the address the name has outside.
-	// Only while the front listens on the port the routes' URLs name: an acme front on a moved
-	// port is reached on 443 through the operator's forward alone.
-	if mode != Loopback && publicHTTPSPort(mode, get(HTTPSPortVar)) == get(HTTPSPortVar) {
-		var aliases []string
-		for _, r := range f.Routes {
-			if d := get(r.DomainInput); d != "" && !slices.Contains(aliases, d) {
-				aliases = append(aliases, d)
-			}
-		}
-		if len(aliases) > 0 {
-			slices.Sort(aliases)
-			service["networks"] = map[string]any{"default": map[string]any{"aliases": aliases}}
-		}
+	// as its clients do (an issuer's URL) reaches the front, not the address the name has outside,
+	// on the port its URL names (443 in the container, or the site's other address).
+	if aliases := routeAliases(f, mode, get); len(aliases) > 0 {
+		service["networks"] = map[string]any{"default": map[string]any{"aliases": aliases}}
 	}
 	services := map[string]any{FrontService: service}
 	volumesDoc := map[string]any{"stowage-front-data": map[string]any{}}
@@ -425,4 +453,30 @@ func frontCompose(f spec.Front, l4 []spec.L4Route, get func(string) string, mode
 		return nil, err
 	}
 	return append([]byte("# Written by the installer: the front Stowage adds to the stack.\n"), out...), nil
+}
+
+// hostDomains are the routes' domains a service on the host's network reaches the front by at the
+// loopback: only where the front publishes the port the routes' URLs name (acme's URLs keep 443
+// when its host port moves, which nothing on the host holds).
+func hostDomains(f spec.Front, mode string, get func(string) string) []string {
+	if publicHTTPSPort(mode, get(HTTPSPortVar)) != get(HTTPSPortVar) {
+		return nil
+	}
+	return routeAliases(f, mode, get)
+}
+
+// routeAliases are the front's routes' domains in a TLS mode, sorted, each once: the names the
+// stack's services reach the front by. None in loopback mode, which serves no domain.
+func routeAliases(f spec.Front, mode string, get func(string) string) []string {
+	if mode == Loopback {
+		return nil
+	}
+	var aliases []string
+	for _, r := range f.Routes {
+		if d := get(r.DomainInput); d != "" && !slices.Contains(aliases, d) {
+			aliases = append(aliases, d)
+		}
+	}
+	slices.Sort(aliases)
+	return aliases
 }

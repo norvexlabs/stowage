@@ -369,11 +369,68 @@ func (e *env) installer(mod func(*Options)) *Installer {
 		Environ:     []string{"PATH=/bin", "SESSION_SECRET=from-the-shell", "COMPOSE_PROJECT_NAME=other"},
 		PortFree:    func(_ string, p int) bool { return !e.busy[p] },
 		HostAddrs:   func() []string { return []string{"127.0.0.1", "::1", "192.0.2.7", "192.0.2.8"} },
-		UDPPortFree: func(_ string, p int) bool { return !e.udpBusy[p] }}
+		UDPPortFree: func(_ string, p int) bool { return !e.udpBusy[p] },
+		Exec:        inProcess(e, mod, nil)}
 	if mod != nil {
 		mod(&o)
 	}
 	return &Installer{R: e.r, O: o}
+}
+
+// inProcess runs the installers a run starts as the host would, in this process: each loads its
+// own release from its file and runs its verb — boot, boot-rollback, or a re-run of the install
+// (--dir and its flags) — with the options mod gives, running the next the same way; ran, when not
+// nil, records each one's arguments.
+func inProcess(e *env, mod func(*Options), ran *[][]string) func(context.Context, string, []string) error {
+	var run func(context.Context, string, []string) error
+	run = func(ctx context.Context, exe string, args []string) error {
+		if ran != nil {
+			*ran = append(*ran, args)
+		}
+		files, err := payload.Read(exe)
+		if err != nil {
+			return err
+		}
+		if args[0] == "--help" { // its own payload, as its Stowage reads it: anotherStowages's knows Retired
+			files[payload.Spec] = bytes.Replace(files[payload.Spec], []byte(`{"Retired":1,`), []byte(`{`), 1)
+		}
+		r, err := Load(files)
+		if err != nil {
+			return err
+		}
+		if args[0] == "--help" {
+			return nil
+		}
+		in := e.installer(mod)
+		in.R, in.O.Self, in.O.Exec = r, exe, run
+		switch args[0] {
+		case bootCmd:
+			return in.Boot(ctx)
+		case bootRollbackCmd:
+			return in.BootRollback(ctx)
+		case "--dir":
+			if r.Manifest.Bundled() {
+				return errors.New("a VM's installer has no re-run: unknown flag --dir")
+			}
+			for i := 0; i < len(args); i++ {
+				switch args[i] {
+				case "--dir":
+					i++
+					in.O.Dir = args[i]
+				case "--no-input":
+				case "--no-provision":
+					in.O.NoProvision = true
+				case "--offline":
+					in.O.Offline = true
+				default:
+					return errors.New("no flag " + args[i])
+				}
+			}
+			return in.Install(ctx)
+		}
+		return errors.New("no verb " + args[0])
+	}
+	return run
 }
 
 func (e *env) install(mod func(*Options)) error {

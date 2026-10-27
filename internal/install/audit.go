@@ -75,8 +75,8 @@ func (in *Installer) auditRelease(ctx context.Context, o AuditOptions) (*auditSo
 		}
 		// The install's keys decide, as for its upgrades: an older installer never brings back a
 		// key a later release dropped; and the release audited is the one it runs.
-		var kept *Release
-		if src.trust, kept, err = in.installTrust(pname, cur, rev); err != nil {
+		var kept *keptRelease
+		if src.trust, kept, err = in.installTrust(ctx, pname, cur, rev); err != nil {
 			return nil, err
 		}
 		src.m, channel = kept.Manifest, kept.Manifest.Channel
@@ -124,6 +124,34 @@ func attested(c *registry.Client, trust *sigverify.Verifier) sbom.Attested {
 	}
 }
 
+// carried are the release's artifacts that carry an SBOM, less an optional one (the OS bundle, a
+// disk) a mirror does not hold: a mirror carries only the shapes and the disk formats its export
+// named, and what it left out is logged, not read. Any other artifact, and every one in the
+// project's own registry, is read, its error reported, whether or not it is there.
+func (in *Installer) carried(ctx context.Context, src *auditSource) ([]sbom.Target, error) {
+	targets, err := sbom.Targets(src.prefix, src.m.Name, src.m.Artifacts)
+	if err != nil {
+		return nil, err
+	}
+	// The project's own registry holds the whole release: one missing there is reported.
+	mirror := src.prefix != strings.TrimSuffix(in.R.Spec.Registry.Prefix, "/")
+	var out []sbom.Target
+	for _, t := range targets {
+		if t.Optional && mirror {
+			d, err := src.c.Head(ctx, t.Digest)
+			if err != nil {
+				return nil, err
+			}
+			if d == nil {
+				in.O.logf("%s %s is not in %s (a mirror carries the shapes and the disk formats its export named): not read", t.Name, registry.Short(t.Digest.DigestStr()), src.prefix)
+				continue
+			}
+		}
+		out = append(out, t)
+	}
+	return out, nil
+}
+
 // Audit reads the SBOM each artifact of the release carries, attested by a key it trusts, and scans
 // it on the local engine with the release's own scanner, read from the registry it reads.
 func (in *Installer) Audit(ctx context.Context, o AuditOptions) (*sbom.Report, error) {
@@ -144,7 +172,7 @@ func (in *Installer) Audit(ctx context.Context, o AuditOptions) (*sbom.Report, e
 	if m.Artifacts.Images[sbom.Key] == "" {
 		return nil, fmt.Errorf("%s %s (revision %d) carries no scanner: a release shipped before audit existed has no SBOM", m.Name, m.ProjectVersion, m.Revision)
 	}
-	targets, err := sbom.Targets(src.prefix, m.Name, m.Artifacts)
+	targets, err := in.carried(ctx, src)
 	if err != nil {
 		return nil, err
 	}
@@ -177,7 +205,7 @@ func (in *Installer) ExportSBOMs(ctx context.Context, o AuditOptions, dir string
 		return sbom.Index{}, err
 	}
 	m := src.m
-	targets, err := sbom.Targets(src.prefix, m.Name, m.Artifacts)
+	targets, err := in.carried(ctx, src)
 	if err != nil {
 		return sbom.Index{}, err
 	}

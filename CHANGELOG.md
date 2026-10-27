@@ -3,6 +3,56 @@
 Stowage's own releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
+## [0.15.0]
+
+### Added
+- **A handoff the old process starts**: `services.<name>.update_signal` names the signal a
+  start-first overlap sends the old container once the new one runs, before it waits for the new
+  one's health, for a server whose old process hands its listeners over only when told to go.
+- **Routes by path**: `front.routes[].path` serves a route under a path prefix of a domain other
+  routes share (a console, an identity provider and metrics on one name and one certificate); the
+  route's URL carries the path.
+- **Build options**: `images.<key>.add_hosts` gives a build's steps names resolved to fixed
+  addresses, and `images.<key>.network` runs them on the host's network or none; both enter the
+  image's inputs digest.
+
+### Changed
+- **Installs cross Stowage versions**: an install of a release an older Stowage built upgrades to
+  one this Stowage built (it was refused when the older spec held a key this one moved, such as
+  memory shares), and `rollback` starts the previous release with its own installer. When the
+  older release's spec is in another format, what only it tells (its schema baseline, the inputs
+  it drops, whether it reads a newer schema) is logged as not known and not checked; rollback
+  barriers still refuse.
+- **Loopback ports only where loopback is offered**: `front.loopback_ports` is required only
+  when `tls_modes` offers `none`, and it and `loopback_env` are refused otherwise.
+- Lint warns of a service that waits for a one-shot without `restart: true`, which keeps what
+  it read of the one-shot's last run when a re-run makes it again.
+
+### Fixed
+- A start-first overlap reads a dependency without a healthcheck on a Docker that renders an
+  absent health as a missing key.
+- The IPv6 allowlist warning names the source that holds the gateway before "holds".
+- **The front listens on 80 and 443 in its container** whatever host ports an install gives it,
+  and serves its domains on a moved HTTPS port too: a service calling a route by its URL reaches
+  the front on every mode and port, `acme` on moved ports included. On the VM, an L4 route's
+  service on the host's network reaches the routes' domains too.
+- The OS bundle's boot, SSH sessions and `sudo` log no error on a healthy system: the boot no
+  longer enables the purged `iscsid`, the initrd's crypt generator exits cleanly without an
+  encrypted disk, and the locale file every login reads exists.
+- `audit` no longer fails an OS bundle on its kernel: no SBOM lists the kernel by upstream's
+  version (which a scanner matched against fixes the distribution backports) or its modules; the
+  kernel is scanned through its distribution's packages.
+- A service's own cores (`services.<name>.cpus`, `irq: off`) no longer take the NICs'
+  interrupts when the kernel spread them onto those cores: `tune --apply` and the VM's boot move
+  every NIC interrupt off them, and `tune --check` reports one that reaches them.
+- A signing release ships to, and `mirror import`s into, a registry that takes OCI manifests
+  alone (zot's default): its scanner image is published with OCI media types, no longer as
+  upstream's Docker v2 manifest.
+- `vm create` boots from a mirror that carries only some of a release's disk formats (`mirror
+  export --disks`): it needs only the format the platform boots, and names that format when the
+  mirror lacks it. `audit` and `sbom export` leave out, and log, an OS bundle or a disk the
+  registry does not hold, instead of failing on it.
+
 ## [0.14.0] - 2026-10-26
 
 ### Added

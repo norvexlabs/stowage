@@ -23,6 +23,7 @@ import (
 
 	"golang.org/x/crypto/bcrypt"
 
+	"github.com/norvexlabs/stowage/internal/release"
 	"github.com/norvexlabs/stowage/internal/spec"
 )
 
@@ -80,7 +81,7 @@ func TestDomainsServeHTTPSFromLetsEncryptWithTheSafeDefaults(t *testing.T) {
 			t.Errorf("Caddyfile lacks %q:\n%s", want, cf)
 		}
 	}
-	if fc := e.file(FrontCompose); !strings.Contains(fc, "${STOWAGE_HTTP_PORT}:${STOWAGE_HTTP_PORT}") || !strings.Contains(fc, "${STOWAGE_HTTPS_PORT}:${STOWAGE_HTTPS_PORT}") || strings.Contains(fc, "LOOPBACK") {
+	if fc := e.file(FrontCompose); !strings.Contains(fc, "${STOWAGE_HTTP_PORT}:80") || !strings.Contains(fc, "${STOWAGE_HTTPS_PORT}:443") || strings.Contains(fc, "LOOPBACK") {
 		t.Errorf("front compose:\n%s", fc)
 	}
 	if !strings.Contains(e.out.String(), "https://notes.example.com") {
@@ -236,7 +237,7 @@ func TestADomainOrAContactTheFrontCannotUseIsRefused(t *testing.T) {
 			t.Errorf("%v accepted", bad)
 			continue
 		}
-		if len(e.docker.calls) != 0 && !strings.Contains(err.Error(), "both have the domain") {
+		if len(e.docker.calls) != 0 && !strings.Contains(err.Error(), "both serve the domain") {
 			t.Errorf("%v refused after the host was checked: %v", bad, err)
 		}
 		e.nothingWritten()
@@ -257,7 +258,9 @@ func TestTheLocalCASendsNoHSTSAndOtherPortsReachTheURLs(t *testing.T) {
 		t.Fatal(err)
 	}
 	cf := e.file(Caddyfile)
-	if strings.Contains(cf, "Strict-Transport-Security") || !strings.Contains(cf, "\thttps_port 8443\n") || !strings.Contains(cf, "\tlocal_certs\n") || strings.Contains(cf, "acme") {
+	// The front listens on 443 in its container, and on the URL's port for the stack's services.
+	if strings.Contains(cf, "Strict-Transport-Security") || !strings.Contains(cf, "\thttps_port 443\n") || !strings.Contains(cf, "\tlocal_certs\n") || strings.Contains(cf, "acme") ||
+		!strings.Contains(cf, "\nnotes.example.com, notes.example.com:8443 {\n") {
 		t.Errorf("Caddyfile:\n%s", cf)
 	}
 	if !strings.Contains(cf, "http://notes.example.com {\n\tredir https://notes.example.com:8443{uri} 308\n}") {
@@ -327,7 +330,7 @@ func TestOwnCertificateIsCheckedAndCopiedIntoTheInstall(t *testing.T) {
 		want string
 	}{
 		"uncovered":  {func(o *Options) { o.Domains = map[string]string{"app": "notes.example.org"} }, "APP_DOMAIN: the certificate does not cover notes.example.org"},
-		"same":       {func(o *Options) { o.Domains = map[string]string{"app": "api.example.com"} }, "both have the domain api.example.com"},
+		"same":       {func(o *Options) { o.Domains = map[string]string{"app": "api.example.com"} }, "both serve the domain api.example.com"},
 		"--ports":    {func(o *Options) { o.Ports = map[string]int{"app": 9000} }, "--ports is for loopback mode"},
 		"same ports": {func(o *Options) { o.HTTPPort = 443 }, "--http-port and --https-port are both 443"},
 	} {
@@ -348,7 +351,7 @@ func TestOwnCertificateIsCheckedAndCopiedIntoTheInstall(t *testing.T) {
 	if f := e.readEnv(); get(f, "STOWAGE_URL_APP") != "https://app.example.com:8443" || get(f, "STOWAGE_URL_API") != "https://api.example.com:8443" || get(f, HTTPSPortVar) != "8443" || get(f, HTTPPortVar) != "80" {
 		t.Fatalf("after the re-run: %s %s", get(f, "STOWAGE_URL_APP"), get(f, "STOWAGE_URL_API"))
 	}
-	if cf := e.file(Caddyfile); !strings.Contains(cf, "https_port 8443") || !strings.Contains(cf, "app.example.com {") {
+	if cf := e.file(Caddyfile); !strings.Contains(cf, "https_port 443\n") || !strings.Contains(cf, "\napp.example.com, app.example.com:8443 {") {
 		t.Errorf("Caddyfile after the re-run:\n%s", cf)
 	}
 	// An expired certificate never stops a re-run given no domain: the VM's boot is one.
@@ -481,7 +484,8 @@ func TestMovedPortsBehindLetsEncryptStayPublicOn443(t *testing.T) {
 	if u := get(e.readEnv(), "STOWAGE_URL_APP"); u != "https://notes.example.com" {
 		t.Errorf("URL %q", u)
 	}
-	if cf := e.file(Caddyfile); strings.Contains(cf, "redir") || !strings.Contains(cf, "\thttps_port 8443\n") {
+	// The URLs keep 443, which the front listens on in its container: no other address of the site.
+	if cf := e.file(Caddyfile); strings.Contains(cf, "redir") || !strings.Contains(cf, "\thttps_port 443\n") || !strings.Contains(cf, "\nnotes.example.com {\n") || strings.Contains(cf, ":8443") {
 		t.Errorf("Caddyfile:\n%s", cf)
 	}
 	if !strings.Contains(e.log.String(), "forward them to 8080 and 8443") {
@@ -492,6 +496,171 @@ func TestMovedPortsBehindLetsEncryptStayPublicOn443(t *testing.T) {
 	e.r.Spec.Front.TLSModes = []string{"none"}
 	if err := e.install(tlsDomains); err == nil || !strings.Contains(err.Error(), "over no HTTPS mode") {
 		t.Fatalf("err = %v", err)
+	}
+}
+
+// Routes of one domain are one site, told apart by their paths, the longest first, a route
+// without a path serving every other one; the URLs carry the path. In loopback mode each route
+// keeps its port and serves its path there.
+func TestRoutesOfOneDomainAreToldApartByTheirPaths(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	e.r.Spec.Front.Routes = []spec.Route{
+		{Name: "app", DomainInput: "APP_DOMAIN", Upstream: "web:8080"},
+		{Name: "idp", DomainInput: "APP_DOMAIN", Path: "/idp", Upstream: "idp:5556"},
+		{Name: "admin", DomainInput: "APP_DOMAIN", Path: "/idp/admin", Upstream: "idp:5557", AllowInput: "ADMIN_SOURCES"},
+		{Name: "api", DomainInput: "API_DOMAIN", Path: "/v2", Upstream: "api:8000"},
+	}
+	e.r.Spec.Front.LoopbackPorts = map[string]int{"app": 8080, "idp": 8081, "admin": 8082, "api": 8000}
+	e.r.Spec.Front.Portal = "app"
+	if err := e.install(func(o *Options) { tlsDomains(o); o.TLS = "internal"; o.HTTPSPort = 8443 }); err != nil {
+		t.Fatalf("%v\n%s", err, e.log)
+	}
+	f := e.readEnv()
+	for k, want := range map[string]string{"STOWAGE_URL_APP": "https://notes.example.com:8443", "STOWAGE_URL_IDP": "https://notes.example.com:8443/idp",
+		"STOWAGE_URL_ADMIN": "https://notes.example.com:8443/idp/admin", "STOWAGE_URL_API": "https://api.example.com:8443/v2"} {
+		if got := get(f, k); got != want {
+			t.Errorf("%s = %q, want %q", k, got, want)
+		}
+	}
+	cf := e.file(Caddyfile)
+	site := "\n# app, idp, admin\nnotes.example.com, notes.example.com:8443 {\n" +
+		"\t@stowage_path_2 path /idp/admin /idp/admin/*\n\thandle @stowage_path_2 {\n" +
+		"\t\troute {\n\t\t\trespond 403\n\t\t\treverse_proxy idp:5557 {\n\t\t\t\tlb_try_duration 5s\n\t\t\t}\n\t\t}\n\t}\n" +
+		"\t@stowage_path_1 path /idp /idp/*\n\thandle @stowage_path_1 {\n\t\treverse_proxy idp:5556 {\n\t\t\tlb_try_duration 5s\n\t\t}\n\t}\n" +
+		"\thandle {\n\t\treverse_proxy web:8080 {\n\t\t\tlb_try_duration 5s\n\t\t}\n\t}\n}\n"
+	api := "\n# api\napi.example.com, api.example.com:8443 {\n" +
+		"\t@stowage_path_3 path /v2 /v2/*\n\thandle @stowage_path_3 {\n\t\treverse_proxy api:8000 {\n\t\t\tlb_try_duration 5s\n\t\t}\n\t}\n" +
+		"\thandle {\n\t\trespond 404\n\t}\n}\n"
+	if !strings.Contains(cf, site) || !strings.Contains(cf, api) || strings.Count(cf, "redir https://notes.example.com:8443{uri}") != 1 {
+		t.Errorf("Caddyfile:\n%s", cf)
+	}
+	// In the cluster the endpoint's URL carries the path too.
+	k := &Installer{R: &Release{Spec: &spec.Spec{Endpoint: "idp", Front: e.r.Spec.Front}}, O: Options{K8s: K8sOptions{Namespace: "notes", Release: "notes"}}}
+	if got := k.k8sEndpoint(); got != "http://notes-idp.notes.svc:5556/idp" {
+		t.Errorf("k8s endpoint %s", got)
+	}
+	// Loopback: a port per route, its path served there, its URL carrying it.
+	l := newEnv(t)
+	l.r.Spec.Front = e.r.Spec.Front
+	if err := l.install(func(o *Options) { o.Ports = map[string]int{"app": 18080, "idp": 18081, "admin": 18082, "api": 18000} }); err != nil {
+		t.Fatalf("%v\n%s", err, l.log)
+	}
+	if u := get(l.readEnv(), "STOWAGE_URL_IDP"); !strings.HasSuffix(u, ":18081/idp") {
+		t.Errorf("loopback URL %q", u)
+	}
+	lb := loopbackCaddyfile(e.r.Spec.Front, func(string) string { return "" }, nil)
+	if !strings.Contains(lb, "\n# idp\nhttp://:10001 {\n\t@stowage_path_1 path /idp /idp/*\n\thandle @stowage_path_1 {\n\t\treverse_proxy idp:5556 {\n\t\t\tlb_try_duration 5s\n\t\t}\n\t}\n\thandle {\n\t\trespond 404\n\t}\n}\n") ||
+		!strings.Contains(lb, "\n# app\nhttp://:10000 {\n\treverse_proxy web:8080 {") {
+		t.Errorf("loopback Caddyfile:\n%s", lb)
+	}
+}
+
+// Routes of one domain value serve distinct paths, and a client certificate is asked for a whole
+// domain: two routes given one domain are refused when they serve the same path, or when one asks
+// for a client certificate.
+func TestRoutesGivenOneDomainAreRefusedWhereTheyClash(t *testing.T) {
+	t.Parallel()
+	in := &Installer{R: &Release{Spec: &spec.Spec{Front: spec.Front{Routes: []spec.Route{
+		{Name: "app", DomainInput: "APP_DOMAIN", Upstream: "web:80"},
+		{Name: "idp", DomainInput: "IDP_DOMAIN", Path: "/idp", Upstream: "idp:80"},
+		{Name: "ops", DomainInput: "OPS_DOMAIN", Upstream: "ops:80", ClientAuth: true},
+	}}}}}
+	vals := map[string]string{"APP_DOMAIN": "a.example.com", "IDP_DOMAIN": "a.example.com", "OPS_DOMAIN": "o.example.com"}
+	get := func(k string) string { return vals[k] }
+	if d, err := in.routeDomains("internal", get); err != nil || d["idp"] != "a.example.com" {
+		t.Fatalf("distinct paths: %v %v", d, err)
+	}
+	in.R.Spec.Front.Routes[1].Path = ""
+	if _, err := in.routeDomains("internal", get); err == nil || err.Error() != "app and idp both serve the domain a.example.com: routes of one domain differ by their path" {
+		t.Errorf("one path: %v", err)
+	}
+	in.R.Spec.Front.Routes[1].Path = "/idp"
+	in.R.Spec.Front.Routes[2].Path = "/ops"
+	vals["OPS_DOMAIN"] = "a.example.com"
+	if _, err := in.routeDomains("internal", get); err == nil || err.Error() != "ops asks for a client certificate on a.example.com, which app has too: a certificate is asked for a whole domain" {
+		t.Errorf("a client certificate on a shared domain: %v", err)
+	}
+	if d, err := in.routeDomains(Loopback, get); err != nil || len(d) != 0 {
+		t.Errorf("loopback: %v %v", d, err)
+	}
+	// Paths differing by case alone clash: the front matches them whatever their case.
+	in.R.Spec.Front.Routes[2].Path = "/IDP"
+	if _, err := in.routeDomains("internal", get); err == nil || !strings.Contains(err.Error(), "idp and ops both serve a.example.com/IDP") {
+		t.Errorf("paths of one case: %v", err)
+	}
+	in.R.Spec.Front.Routes[2].Path = "/ops"
+	// Rendered all the same (an upgrade's checks aside), the route refuses everyone: its site
+	// asks no certificate.
+	cf := tlsCaddyfile(in.R.Spec.Front, "internal", map[string]string{"app": "a.example.com", "idp": "a.example.com", "ops": "a.example.com"}, "", "443", true, get, nil)
+	if !strings.Contains(cf, "\t@stowage_path_2 path /ops /ops/*\n\thandle @stowage_path_2 {\n\t\trespond 403\n\t}\n") || strings.Contains(cf, "client_auth") {
+		t.Errorf("a client_auth route on a shared site:\n%s", cf)
+	}
+	if _, err := tlsPublish(8080, 80); err == nil || !strings.Contains(err.Error(), "--https-port 80") {
+		t.Errorf("https on 80: %v", err)
+	}
+	// An upgrade to a release whose routes clash on the recorded domains is refused.
+	in.R.Manifest = &release.Manifest{Name: "notes", ProjectVersion: "2.0.0"}
+	in.R.Spec.Front.TLSModes = []string{"internal"}
+	vals["OPS_DOMAIN"] = "o.example.com"
+	rec := NewEnvFile()
+	rec.Set("STOWAGE_TLS_MODE", "internal")
+	for _, r := range in.R.Spec.Front.Routes {
+		rec.Set(spec.URLVar(r.Name), "https://a.example.com")
+		rec.Set(r.DomainInput, vals[r.DomainInput])
+	}
+	if err := in.sameFront(rec, "internal"); err != nil {
+		t.Fatalf("distinct paths: %v", err)
+	}
+	in.R.Spec.Front.Routes[1].Path = ""
+	if err := in.sameFront(rec, "internal"); err == nil || !strings.Contains(err.Error(), "notes 2.0.0: app and idp both serve the domain a.example.com") {
+		t.Errorf("an upgrade whose routes clash: %v", err)
+	}
+	in.R.Spec.Front.Routes[1].Path = "/idp"
+	rec.Set("OPS_DOMAIN", "")
+	if err := in.sameFront(rec, "internal"); err == nil || !strings.Contains(err.Error(), "takes the domain of ops from OPS_DOMAIN, which this install does not record (or records empty): give it to a re-run") {
+		t.Errorf("a domain recorded empty: %v", err)
+	}
+	// An upgrade gives each recorded URL the release's path, its host and port kept.
+	env := NewEnvFile()
+	env.Set("STOWAGE_URL_APP", "http://127.0.0.1:9090")
+	env.Set("STOWAGE_URL_IDP", "http://127.0.0.1:9092/old")
+	env.Set("STOWAGE_URL_OPS", "http://127.0.0.1:9091")
+	if err := in.routePaths(env, Loopback); err != nil {
+		t.Fatal(err)
+	}
+	for k, want := range map[string]string{"STOWAGE_URL_APP": "http://127.0.0.1:9090", "STOWAGE_URL_IDP": "http://127.0.0.1:9092/idp", "STOWAGE_URL_OPS": "http://127.0.0.1:9091/ops"} {
+		if v, _ := env.Get(k); v != want {
+			t.Errorf("loopback %s = %q, want %q", k, v, want)
+		}
+	}
+	// In a TLS mode, the release's domain input and the public port: a route moved to another
+	// recorded domain names it.
+	env.Set("STOWAGE_URL_OPS", "https://old.example.com:8443/x")
+	env.Set("OPS_DOMAIN", "o.example.com")
+	env.Set(HTTPSPortVar, "8443")
+	if err := in.routePaths(env, "internal"); err != nil {
+		t.Fatal(err)
+	}
+	if v, _ := env.Get("STOWAGE_URL_OPS"); v != "https://o.example.com:8443/ops" {
+		t.Errorf("TLS STOWAGE_URL_OPS = %q", v)
+	}
+	// Routes sharing a domain input: it is asked once, and --domains gives it one value.
+	in.R.Spec.Front.Routes[1].DomainInput = "APP_DOMAIN"
+	var keys []string
+	for _, i := range in.frontInputs("internal") {
+		keys = append(keys, i.Key+"="+i.Prompt)
+	}
+	if !slices.Equal(keys, []string{"APP_DOMAIN=Domain for app, idp", "OPS_DOMAIN=Domain for ops"}) {
+		t.Errorf("inputs %v", keys)
+	}
+	in.O.Domains = map[string]string{"app": "a.example.com", "idp": "b.example.com"}
+	if err := in.applyDomains(); err == nil || err.Error() != "--domains app=a.example.com and idp=b.example.com disagree: both routes take their domain from APP_DOMAIN" {
+		t.Errorf("two values for one input: %v", err)
+	}
+	in.O.Domains, in.O.Set = map[string]string{"app": "a.example.com", "idp": "a.example.com"}, nil
+	if err := in.applyDomains(); err != nil || in.O.Set["APP_DOMAIN"] != "a.example.com" {
+		t.Errorf("one value: %v %v", in.O.Set, err)
 	}
 }
 
@@ -987,6 +1156,20 @@ func TestAnAllowlistIPv6ClientsPassIsWarned(t *testing.T) {
 		in.warnIPv6Allowlists(func(k string) string { return map[string]string{"SOURCES": c.sources, IPv6Var: c.ipv6}[k] }, gw)
 		if got := strings.Contains(log.String(), warn); got != c.warns {
 			t.Errorf("%+v: %q", c, log.String())
+		}
+	}
+	// The sentence names the source that holds the gateway, or overlaps the pools, before "holds".
+	for gw, want := range map[string]string{
+		"172.18.0.1": "warning: route api: SOURCES=10.0.0.0/8, 172.18.0.0/16: 172.18.0.0/16 holds the stack network's gateway 172.18.0.1, as which every IPv6 client passes while the stack's IPv6 is off and this host has a global IPv6 address: install --ipv6, or list narrower sources\n",
+		"":           "warning: route api: SOURCES=10.0.0.0/8, 172.18.0.0/16: 172.18.0.0/16 holds an address of Docker's default pools, as which every IPv6 client passes while the stack's IPv6 is off and this host has a global IPv6 address: install --ipv6, or list narrower sources\n",
+	} {
+		var log bytes.Buffer
+		s := &spec.Spec{Front: spec.Front{Routes: []spec.Route{{Name: "api", Upstream: "api:9090", AllowInput: "SOURCES"}}}}
+		in := &Installer{R: &Release{Spec: s}, O: Options{Log: &log, HostAddrs: func() []string { return []string{"2001:db8::10"} }}}
+		addr, _ := netip.ParseAddr(gw)
+		in.warnIPv6Allowlists(func(k string) string { return map[string]string{"SOURCES": "10.0.0.0/8, 172.18.0.0/16"}[k] }, addr)
+		if log.String() != want {
+			t.Errorf("gateway %q:\n%q\nwant\n%q", gw, log.String(), want)
 		}
 	}
 }

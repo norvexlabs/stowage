@@ -108,7 +108,10 @@ func Generate(ctx context.Context, docker Docker, src Source) ([]byte, error) {
 	}
 	// The platform a release runs on: an index's other platforms are none of the install's. The
 	// sbom cataloger merges the SBOM documents an image ships (what no other cataloger sees in it).
-	args = append(args, Syft, "registry:"+src.Ref, "--platform", Platform, "--select-catalogers", "+sbom-cataloger", "-o", "spdx-json", "-q")
+	// The kernel cataloger is left out: it lists a kernel by upstream's version, which a scanner
+	// matches against fixes a distribution backports, and each module without one; the OS
+	// bundle's kernel is its distribution's packages, which the package catalogers read.
+	args = append(args, Syft, "registry:"+src.Ref, "--platform", Platform, "--select-catalogers", "+sbom-cataloger,-linux-kernel-cataloger", "-o", "spdx-json", "-q")
 	out := &capped{max: MaxDocument}
 	if err := docker(ctx, out, args...); err != nil {
 		return nil, fmt.Errorf("syft %s: %w", src.Ref, err)

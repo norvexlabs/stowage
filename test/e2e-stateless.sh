@@ -11,7 +11,9 @@
 # front runs → a re-run changes an input its page is rendered from (an inline config: the server is
 # made again) → status lists the L4 route → --tls is refused → ship 1.0.1, `upgrade --version
 # 1.0.1` (nothing dumped) → rollback (no schema check) → reset-db is refused: the release has no
-# database.
+# database → an install of 0.9.0, which the last release's stowage (built from its tag) shipped
+# before 1.0.0, upgrades to 1.0.1 with this one's, and a rollback goes back to it with its own
+# installer.
 set -euo pipefail
 . "$(dirname "$0")/lib.sh"
 
@@ -24,13 +26,10 @@ page() { curl -sf --max-time 10 "http://127.0.0.1:$PORT/${1:-}"; }
 step "start zot"
 start_zot
 
-step "project, ship 1.0.0"
-# zot's notes/** repositories, read with the pull account: the example's public images become
-# private ones there.
-P=$WORK/lookup
-cp -r "$REPO/examples/stateless" "$P"
-PORT=$(free_port)
-python3 - "$P/stowage.yaml" "$REG" "$PORT" <<'PY'
+# private: the example in $1 published to zot's notes/** repositories, read with the pull account
+# (its public images become private ones there), its L4 route on $PORT.
+private() {
+	python3 - "$1/stowage.yaml" "$REG" "$PORT" <<'PY'
 import sys
 path, reg, port = sys.argv[1:]
 s = open(path).read()
@@ -43,6 +42,45 @@ for old, new in [
     s = s.replace(old, new)
 open(path, "w").write(s)
 PY
+}
+PORT=$(free_port)
+
+step "the last release's stowage, built from its tag, ships 0.9.0"
+# The nearest release tag in this branch's history that is not this build's version (by history,
+# never by sorting tags); its checks ran when it was released.
+THIS=$("$STOWAGE" --version | awk '{print $NF}')
+OLDV=$(git -C "$REPO" describe --tags --abbrev=0 --match 'v*' --exclude "v$THIS" HEAD) || fail "no release before $THIS to install with"
+OLDV=${OLDV#v}
+OLD=$WORK/stowage-$OLDV
+mkdir -p "$OLD" "$CACHE/stowage-go"
+git -C "$REPO" archive "v$OLDV" | tar -x -C "$OLD"
+docker run --rm -u "$(id -u):$(id -g)" -e HOME=/tmp -e GOCACHE=/cache/build -e GOMODCACHE=/cache/mod -e CGO_ENABLED=0 -e GOFLAGS=-trimpath \
+	-v "$CACHE/stowage-go:/cache" -v "$OLD:/src" -w /src "golang:$(sed -n 's/^GO_VERSION ?= //p' "$OLD/Makefile")-bookworm" sh -ec "
+	GOOS=linux GOARCH=amd64 go build -ldflags '-s -w -buildid= -X main.version=$OLDV' -o out/stowage-install ./cmd/stowage-install
+	cp out/stowage-install internal/installerbin/stowage-install
+	go build -tags stowage_installer -ldflags '-s -w -buildid= -X main.version=$OLDV' -o out/stowage ./cmd/stowage" >"$WORK/old-build.log" 2>&1 ||
+	{ cat "$WORK/old-build.log"; fail "building stowage $OLDV"; }
+P0=$WORK/lookup-$OLDV
+cp -r "$OLD/examples/stateless" "$P0"
+private "$P0"
+python3 - "$P0/CHANGELOG.md" <<'PY'
+import re, sys
+p = sys.argv[1]
+s, n = re.subn(r"^## \[[^]]+\].*$", "## [0.9.0]", open(p).read(), count=1, flags=re.M)
+assert n == 1, "no top entry in " + p
+open(p, "w").write(s)
+PY
+S0=("$OLD/out/stowage" -C "$P0")
+"${S0[@]}" lock --update >/dev/null
+"${S0[@]}" ship --channel stable >"$WORK/ship-0.9.0.out" 2>"$WORK/ship-0.9.0.log" || { cat "$WORK/ship-0.9.0.log"; fail "ship 0.9.0 with stowage $OLDV"; }
+# The installer image as the ship names it, by digest.
+INSTALLER0=$(sed -n 's/^Then: docker run --rm \([^ ]*\) > .*/\1/p' "$WORK/ship-0.9.0.out")
+[[ -n $INSTALLER0 ]] || { cat "$WORK/ship-0.9.0.out"; fail "ship 0.9.0 names no installer image"; }
+
+step "project, ship 1.0.0"
+P=$WORK/lookup
+cp -r "$REPO/examples/stateless" "$P"
+private "$P"
 S=("$STOWAGE" -C "$P")
 "${S[@]}" lock --update >/dev/null # the example pins a stowage; publish with the one built
 "${S[@]}" lint
@@ -95,5 +133,24 @@ step "reset-db is refused: the release has no database"
 if "${CTL[@]}" reset-db --dir "$D" --yes >"$WORK/reset.log" 2>&1; then cat "$WORK/reset.log"; fail "reset-db passed"; fi
 grep -qF 'lookup 1.0.0 has no database: reset-db has nothing to reset' "$WORK/reset.log" || { cat "$WORK/reset.log"; fail "reset-db's refusal does not say the release has no database"; }
 [[ $(page) == salut ]] || fail "the refused reset-db changed the stack"
+
+step "an install by stowage $OLDV upgrades with this one's, and goes back by its own installer"
+remove_install
+D=$WORK/stowage-e2e-install-$OLDV # removed at exit in its turn
+CTL=("${OPERATOR[@]}" "$D/lookup-stow")
+login_pull
+docker run --rm --pull always "$INSTALLER0" >"$WORK/lookup-0.9.0.sh" || fail "docker run of the 0.9.0 installer image"
+unset DOCKER_CONFIG # the installer's environment never has it (OPERATOR)
+(cd "$WORK" && "${OPERATOR[@]}" sh lookup-0.9.0.sh --no-input --dir "$D" --set GREETING=hola) \
+	>"$WORK/install-0.9.0.log" 2>&1 || { cat "$WORK/install-0.9.0.log"; fail "install 0.9.0"; }
+[[ $(page version) == 0.9.0 && $(page) == hola ]] || { stack_logs >&2; fail "the install does not run 0.9.0"; }
+cp "$D/lookup-stow" "$WORK/lookup-stow-0.9.0"
+"${CTL[@]}" upgrade --version 1.0.1 --dir "$D" --no-input >"$WORK/upgrade-0.9.0.log" 2>&1 || { cat "$WORK/upgrade-0.9.0.log"; fail "upgrade from 0.9.0 to 1.0.1"; }
+[[ $(page version) == 1.0.1 && $(page) == hola ]] || { stack_logs >&2; fail "the upgrade from 0.9.0 does not run 1.0.1 with the recorded input"; }
+"${CTL[@]}" rollback --dir "$D" >"$WORK/rollback-0.9.0.log" 2>&1 || { cat "$WORK/rollback-0.9.0.log"; fail "rollback to 0.9.0"; }
+[[ $(page version) == 0.9.0 && $(page) == hola ]] || { stack_logs >&2; fail "the rollback does not run 0.9.0 with the recorded input"; }
+grep -qF "starting lookup 0.9.0 (revision 1) with its own installer: $D/lookup-stow --dir $D --no-input --no-provision" "$WORK/rollback-0.9.0.log" ||
+	{ cat "$WORK/rollback-0.9.0.log"; fail "the rollback did not start 0.9.0 with its own installer"; }
+cmp -s "$D/lookup-stow" "$WORK/lookup-stow-0.9.0" || fail "the install does not keep 0.9.0's installer, which stowage $OLDV built"
 
 echo PASS

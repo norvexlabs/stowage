@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
@@ -43,7 +44,7 @@ func (in *Installer) changes(env *EnvFile) (next *EnvFile, secrets map[string]bo
 		if !ok {
 			v, ok = o.Answers[r.DomainInput]
 		}
-		if was, _ := env.Get(r.DomainInput); ok && v != was {
+		if was, _ := env.Get(r.DomainInput); ok && v != was && !slices.Contains(domainGiven, r.DomainInput) {
 			domainGiven = append(domainGiven, r.DomainInput)
 		}
 	}
@@ -344,20 +345,33 @@ func redact(v string) string {
 	return "<redacted>"
 }
 
-// routeDomains is each route's domain in a TLS mode, as get reads its input; two routes on one
-// domain are refused. Loopback mode serves none.
+// routeDomains is each route's domain in a TLS mode, as get reads its input. Routes on one
+// domain are told apart by their paths: two serving the same path of it are refused, and so is a
+// route asking for a client certificate on a domain another route has, as a certificate is asked
+// for a whole domain. Loopback mode serves none.
 func (in *Installer) routeDomains(mode string, get func(string) string) (map[string]string, error) {
 	domains := map[string]string{}
 	if mode == Loopback {
 		return domains, nil
 	}
-	seen := map[string]string{}
-	for _, r := range in.R.Spec.Front.Routes {
+	routes := in.R.Spec.Front.Routes
+	seen := map[string]string{} // domain and path → route
+	for _, r := range routes {
 		d := get(r.DomainInput)
-		if other, dup := seen[d]; dup {
-			return nil, fmt.Errorf("%s and %s both have the domain %s: the front routes by domain", other, r.Name, d)
+		// The front matches paths whatever their case.
+		if other, dup := seen[d+" "+strings.ToLower(r.Path)]; dup {
+			what := "the domain " + d
+			if r.Path != "" {
+				what = d + r.Path
+			}
+			return nil, fmt.Errorf("%s and %s both serve %s: routes of one domain differ by their path", other, r.Name, what)
 		}
-		seen[d], domains[r.Name] = r.Name, d
+		seen[d+" "+strings.ToLower(r.Path)], domains[r.Name] = r.Name, d
+	}
+	for _, r := range routes {
+		if i := slices.IndexFunc(routes, func(o spec.Route) bool { return o.Name != r.Name && domains[o.Name] == domains[r.Name] }); r.ClientAuth && i >= 0 {
+			return nil, fmt.Errorf("%s asks for a client certificate on %s, which %s has too: a certificate is asked for a whole domain", r.Name, domains[r.Name], routes[i].Name)
+		}
 	}
 	return domains, nil
 }
@@ -378,7 +392,7 @@ func (in *Installer) frontVars(env *EnvFile, mode string, pub publish, domains m
 	if mode == Loopback {
 		for _, r := range routes {
 			env.Set(PortVar(r.Name), strconv.Itoa(pub.ports[r.Name]))
-			env.Set(spec.URLVar(r.Name), "http://"+urlHost(pub.addr)+":"+strconv.Itoa(pub.ports[r.Name]))
+			env.Set(spec.URLVar(r.Name), "http://"+urlHost(pub.addr)+":"+strconv.Itoa(pub.ports[r.Name])+r.Path)
 		}
 		return
 	}
@@ -389,8 +403,37 @@ func (in *Installer) frontVars(env *EnvFile, mode string, pub publish, domains m
 		port = ":" + p
 	}
 	for _, r := range routes {
-		env.Set(spec.URLVar(r.Name), "https://"+domains[r.Name]+port)
+		env.Set(spec.URLVar(r.Name), "https://"+domains[r.Name]+port+r.Path)
 	}
+}
+
+// routePaths gives each route's recorded URL the release's domain and path, as the front serves
+// them: in a TLS mode its domain input's recorded value and the public HTTPS port; in loopback
+// mode the address and port the install chose, with the release's path.
+func (in *Installer) routePaths(env *EnvFile, mode string) error {
+	get := func(k string) string { v, _ := env.Get(k); return v }
+	port := ""
+	if p := publicHTTPSPort(mode, get(HTTPSPortVar)); p != "443" {
+		port = ":" + p
+	}
+	for _, r := range in.R.Spec.Front.Routes {
+		k := spec.URLVar(r.Name)
+		v, ok := env.Get(k)
+		if !ok || v == "" {
+			continue
+		}
+		if mode != Loopback {
+			env.Set(k, "https://"+get(r.DomainInput)+port+r.Path)
+			continue
+		}
+		u, err := url.Parse(v)
+		if err != nil {
+			return fmt.Errorf("%s: %w", k, err)
+		}
+		u.Path, u.RawPath = r.Path, ""
+		env.Set(k, u.String())
+	}
+	return nil
 }
 
 // acmeForward reminds, when the front's ports change from was's (nil on a first install), that

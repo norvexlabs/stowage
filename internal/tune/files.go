@@ -541,7 +541,7 @@ func (s System) live(ctx context.Context, p *Plan) []string {
 			}
 		}
 	}
-	if h.network() {
+	if h.network() || h.isolating() {
 		notes = append(notes, s.steer(h, all)...)
 	}
 	notes = append(notes, s.power()...)
@@ -581,8 +581,10 @@ func (h Host) steers(n nic) bool {
 }
 
 // steer spreads each NIC's received packets over the CPUs, the services' isolated cores left out
-// (steerCPUs): a NIC's interrupts that all land on one CPU go one to a CPU, unless irqbalance
-// moves them; a NIC with fewer queues than CPUs has its packets spread by RPS.
+// (steerCPUs), unless irqbalance moves the interrupts: with isolated cores, every interrupt of a
+// NIC goes one to a CPU off them, wherever it lands now (an interrupt the kernel spread may land
+// on one); else, with the network profile, a NIC's interrupts that all land on one CPU go one to
+// a CPU. A NIC with fewer queues than CPUs has its packets spread by RPS (the network profile).
 func (s System) steer(h Host, all []nic) []string {
 	var notes []string
 	balanced := s.running("irqbalance")
@@ -591,7 +593,7 @@ func (s System) steer(h Host, all []nic) []string {
 		if !n.physical {
 			continue
 		}
-		if irqs := s.irqs(n); !balanced && len(cpus) > 1 && s.irqsStacked(irqs) {
+		if irqs := s.irqs(n); !balanced && len(irqs) > 0 && (h.isolating() || h.network() && len(cpus) > 1 && s.irqsStacked(irqs)) {
 			refused := 0
 			for i, irq := range irqs {
 				f := filepath.Join("proc/irq", strconv.Itoa(irq), "smp_affinity_list")

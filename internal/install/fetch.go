@@ -76,7 +76,7 @@ func (in *Installer) UpgradeRevision(ctx context.Context, args []string) (bool, 
 // release (it runs name cur, revision rev), signed by a key the install trusts, read from the
 // registry the install pulls from, with that registry's client and prefix.
 func (in *Installer) channelRelease(ctx context.Context, env *EnvFile, name, cur, rev, v string) (*release.Manifest, *registry.Client, string, *sigverify.Verifier, error) {
-	trust, kept, err := in.installTrust(name, cur, rev)
+	trust, kept, err := in.installTrust(ctx, name, cur, rev)
 	if err != nil {
 		return nil, nil, "", nil, err
 	}
@@ -93,13 +93,17 @@ func (in *Installer) channelRelease(ctx context.Context, env *EnvFile, name, cur
 // release: the keys of the install's release decide; the installer run's only when it carries
 // none (an install of a release from before its project signed): an older installer must not
 // bring back a key a later release dropped.
-func (in *Installer) installTrust(name, cur, rev string) (*sigverify.Verifier, *Release, error) {
-	kept, err := in.keptInstaller(name, cur, rev)
+func (in *Installer) installTrust(ctx context.Context, name, cur, rev string) (*sigverify.Verifier, *keptRelease, error) {
+	kept, err := in.keptInstaller(ctx, name, cur, rev)
 	if err != nil {
 		return nil, nil, err
 	}
 	src, keys := in.ctl(), kept.Keys
-	if len(keys) == 0 {
+	switch {
+	case len(keys) == 0 && kept.Release == nil:
+		// Another Stowage's payload may keep its keys elsewhere: none found is not none carried.
+		return nil, nil, fmt.Errorf("%s carries no key this installer finds, and %s: the keys the install trusts cannot be told; run its own installer", in.ctl(), kept.foreign())
+	case len(keys) == 0:
 		src, keys = "this installer", in.R.Keys
 	}
 	trust, err := trusted(src, keys)

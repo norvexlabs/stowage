@@ -216,17 +216,44 @@ func TestTheFrontAnswersToItsRoutesDomainsInside(t *testing.T) {
 	if got := aliases(Loopback); got != nil {
 		t.Errorf("loopback: %v", got)
 	}
-	// A moved port: the front still answers its URLs inside, but for acme, whose URLs keep 443.
+	// A moved port: the front answers its URLs inside all the same, on 443 in its container (acme's
+	// URLs) or on the URL's port (the site's other address).
 	vals[HTTPSPortVar] = "8443"
-	if got := aliases("internal"); len(got) != 2 {
-		t.Errorf("internal on 8443: %v", got)
+	for _, mode := range []string{"internal", "acme"} {
+		if got := aliases(mode); len(got) != 2 {
+			t.Errorf("%s on 8443: %v", mode, got)
+		}
 	}
-	if got := aliases("acme"); got != nil {
+}
+
+// On the host's network an L4 route's service reaches each route's domain at the loopback, where
+// the front publishes its ports: the alias the stack's network gives the front is not there.
+func TestATargetReachesTheRoutesDomainsAtTheLoopback(t *testing.T) {
+	t.Parallel()
+	hn := hostNet{targets: map[string]bool{"idp": true, "dns": true}, domains: []string{"api.example.com", "notes.example.com"}}
+	extra := map[string]any{}
+	hn.give(extra, "idp", "")
+	if got := extra["extra_hosts"]; !slices.Equal(got.([]string), []string{"dns:127.0.0.1", "api.example.com:127.0.0.1", "notes.example.com:127.0.0.1"}) {
+		t.Errorf("a target's hosts %v", got)
+	}
+	extra = map[string]any{}
+	hn.give(extra, "web", "")
+	if got := extra["extra_hosts"]; !slices.Equal(got.([]string), []string{"dns:host-gateway", "idp:host-gateway"}) {
+		t.Errorf("another service's hosts %v", got)
+	}
+	f := spec.Front{Routes: []spec.Route{{Name: "a", DomainInput: "A"}, {Name: "b", DomainInput: "A", Path: "/b"}}}
+	vals := map[string]string{"A": "x.example.com", HTTPSPortVar: "443"}
+	get := func(k string) string { return vals[k] }
+	if got := hostDomains(f, "acme", get); !slices.Equal(got, []string{"x.example.com"}) {
+		t.Errorf("one domain of two routes: %v", got)
+	}
+	// acme on a moved port: its URLs name 443, which nothing on the host holds.
+	vals[HTTPSPortVar] = "8443"
+	if got := hostDomains(f, "acme", get); got != nil {
 		t.Errorf("acme on 8443: %v", got)
 	}
-	vals[HTTPSPortVar] = "443"
-	if got := aliases("acme"); len(got) != 2 {
-		t.Errorf("acme on 443: %v", got)
+	if got := hostDomains(f, "internal", get); len(got) != 1 {
+		t.Errorf("internal on 8443: %v", got)
 	}
 }
 

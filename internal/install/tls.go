@@ -8,6 +8,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -57,11 +58,17 @@ func (in *Installer) applyDomains() error {
 		return in.frontFlags()
 	}
 	keys := in.domainKeys()
-	for route, host := range o.Domains {
+	by := map[string]string{} // input → the route --domains gave it for
+	for _, route := range slices.Sorted(maps.Keys(o.Domains)) {
+		host := o.Domains[route]
 		k, ok := keys[route]
 		if !ok {
 			return fmt.Errorf("--domains: %q is no route (%s)", route, strings.Join(in.R.Spec.Front.RouteNames(), ", "))
 		}
+		if other, given := by[k]; given && o.Domains[other] != host {
+			return fmt.Errorf("--domains %s=%s and %s=%s disagree: both routes take their domain from %s", other, o.Domains[other], route, host, k)
+		}
+		by[k] = route
 		if v, set := o.Set[k]; set && v != host {
 			return fmt.Errorf("--domains %s=%s and --set %s=%s disagree", route, host, k, v)
 		}
@@ -467,11 +474,19 @@ func (in *Installer) frontInputs(mode string) []input {
 	if mode == Loopback {
 		return nil
 	}
+	// One input per domain, which the routes sharing it name.
 	var out []input
+	routes := map[string][]string{}
 	for _, r := range in.R.Spec.Front.Routes {
 		if _, ok := in.R.Spec.Input(r.DomainInput); !ok {
-			out = append(out, input{spec.Input{Key: r.DomainInput, Prompt: "Domain for " + r.Name, Required: true}, in.domainCheck, true})
+			if routes[r.DomainInput] == nil {
+				out = append(out, input{spec.Input{Key: r.DomainInput, Required: true}, in.domainCheck, true})
+			}
+			routes[r.DomainInput] = append(routes[r.DomainInput], r.Name)
 		}
+	}
+	for i := range out {
+		out[i].Prompt = "Domain for " + strings.Join(routes[out[i].Key], ", ")
 	}
 	if mode == "acme" || mode == "dns-cloudflare" {
 		out = append(out, input{spec.Input{Key: ACMEEmailVar, Prompt: "Email Let's Encrypt writes to before a certificate expires (optional)"}, checkEmail, false})
@@ -498,16 +513,17 @@ const hsts = `header Strict-Transport-Security "max-age=31536000; includeSubDoma
 // fallback: a failed issuance shows, rather than an untrusted certificate. dns-cloudflare proves
 // each domain to Let's Encrypt through Cloudflare's DNS, with the token from the front's
 // environment. HSTS is sent except
-// with the local CA, which browsers do not trust. The front listens on the host's port numbers,
-// so its ACME challenge and its redirects to HTTPS use them. A route with client_auth requires a
+// with the local CA, which browsers do not trust. The front listens on 80 and 443 in its
+// container, whatever host ports publish them; its redirects to HTTPS name the public port. Routes
+// of one domain are one site, told apart by their paths. A route with client_auth requires a
 // client certificate chaining to the install's client CA (clientCA: one was given), and refuses
 // everyone while none was.
-func tlsCaddyfile(f spec.Front, mode string, domains map[string]string, email string, httpPort, httpsPort string, clientCA bool, get func(string) string, logins map[string]login) string {
+func tlsCaddyfile(f spec.Front, mode string, domains map[string]string, email string, httpsPort string, clientCA bool, get func(string) string, logins map[string]login) string {
 	public := publicHTTPSPort(mode, httpsPort)
 	var b strings.Builder
 	b.WriteString("# Written by the installer from the project's front routes; rewritten on every run.\n")
 	// HTTP/1.1 and HTTP/2 only: HTTP/3 would need UDP published, probed and forwarded too.
-	fmt.Fprintf(&b, "{\n\tadmin off\n\tpersist_config off\n\thttp_port %s\n\thttps_port %s\n\tservers {\n\t\tprotocols h1 h2\n\t}\n", httpPort, httpsPort)
+	fmt.Fprintf(&b, "{\n\tadmin off\n\tpersist_config off\n\thttp_port 80\n\thttps_port 443\n\tservers {\n\t\tprotocols h1 h2\n\t}\n")
 	switch mode {
 	case "acme", "dns-cloudflare":
 		if mode == "acme" {
@@ -522,14 +538,38 @@ func tlsCaddyfile(f spec.Front, mode string, domains map[string]string, email st
 		b.WriteString("\tlocal_certs\n")
 	}
 	b.WriteString("}\n")
-	for _, r := range f.Routes {
-		fmt.Fprintf(&b, "\n# %s\n%s {\n", r.Name, domains[r.Name])
+	// One site per domain, in the order of its first route.
+	var order []string
+	sites := map[string][]indexed{}
+	for i, r := range f.Routes {
+		d := domains[r.Name]
+		if _, ok := sites[d]; !ok {
+			order = append(order, d)
+		}
+		sites[d] = append(sites[d], indexed{i, r})
+	}
+	for _, d := range order {
+		routes := sites[d]
+		var names []string
+		for _, x := range routes {
+			names = append(names, x.r.Name)
+		}
+		// On the stack's network the domain names the front itself (frontCompose's aliases), which
+		// a service dials at the URL's port: the front serves the site there too.
+		addrs := d
+		if public != "443" {
+			addrs += ", " + d + ":" + public
+		}
+		fmt.Fprintf(&b, "\n# %s\n%s {\n", strings.Join(names, ", "), addrs)
 		tls := ""
 		if mode == "byo" {
 			tls = fmt.Sprintf("/etc/caddy/%s/cert.pem /etc/caddy/%s/key.pem", TLSDir, TLSDir)
 		}
+		// A client certificate is asked for a whole site: a route asking for one has its domain
+		// alone (routeDomains).
+		auth := len(routes) == 1 && routes[0].r.ClientAuth
 		switch {
-		case r.ClientAuth && clientCA:
+		case auth && clientCA:
 			if tls != "" {
 				tls += " "
 			}
@@ -540,16 +580,20 @@ func tlsCaddyfile(f spec.Front, mode string, domains map[string]string, email st
 		if mode != "internal" {
 			fmt.Fprintf(&b, "\t%s\n", hsts)
 		}
-		if r.ClientAuth && !clientCA {
-			b.WriteString("\trespond 403\n")
-		} else {
-			routeBody(&b, r, get, logins)
-		}
+		serveRoutes(&b, routes, func(b *strings.Builder, r spec.Route) {
+			// A route asking for a certificate on a site it shares refuses everyone, as the site
+			// asks none.
+			if r.ClientAuth && (!clientCA || !auth) {
+				b.WriteString("\trespond 403\n")
+			} else {
+				routeBody(b, r, get, logins)
+			}
+		})
 		b.WriteString("}\n")
 		// Caddy's own redirect leaves out the port it listens on: a public port other than 443 is
 		// named here.
 		if public != "443" {
-			fmt.Fprintf(&b, "http://%s {\n\tredir https://%s:%s{uri} 308\n}\n", domains[r.Name], domains[r.Name], public)
+			fmt.Fprintf(&b, "http://%s {\n\tredir https://%s:%s{uri} 308\n}\n", d, d, public)
 		}
 	}
 	return b.String()

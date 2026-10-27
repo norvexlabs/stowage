@@ -72,6 +72,17 @@ COPY preload/ /usr/share/{{.Name}}-preload/
 # daemon.
 COPY --chmod=0755 ctl/{{.Ctl}} /usr/sbin/{{.Ctl}}
 
+# dracut's crypt generator, which the init stage puts in the initrd, ends with `return` outside
+# a function when no disk is encrypted, which sh refuses (exit 2): every boot would log its
+# failure. Its returns become exits, before the initrd is built; the build fails when the script
+# no longer reads as expected.
+RUN set -e; f=/usr/lib/dracut/modules.d/70crypt/crypt-generator.sh; \
+    grep -qxF '[ -e /etc/crypttab ] || return 0' "$f"; \
+    [ "$(grep -cw return "$f")" = 3 ]; \
+    sed -i 's/\breturn \([0-9]\)$/exit \1/' "$f"; \
+    ! grep -qw return "$f"; \
+    sh -n "$f"
+
 # kairos-init's init stage strips the kernel modules; without them netfilter, and so nftables and
 # Docker, fail. They are reinstalled, and the build fails if they did not come back. Its CIS
 # hardening step is skipped: its shell umask (027) would leave the files an operator's run
@@ -212,6 +223,23 @@ RUN set -e; f=/system/oem/09_systemd_services.yaml; \
     sed -i '/^        net\.core\.rmem_max: 7500000$/d' "$f"; \
     ! grep -q 'rmem_max' "$f"; \
     grep -qF 'vm.max_map_count: 262144' "$f"
+
+# The same stage enables iscsid, which the purge of open-iscsi removed (unless host.packages
+# brings it back): every boot would log the enable's failure. The build fails when the stage no
+# longer enables it, or still does without the unit.
+RUN set -e; f=/system/oem/09_systemd_services.yaml; \
+    grep -qxF '          - iscsid' "$f"; \
+    u=; for d in /usr/lib /lib /etc; do [ ! -e "$d/systemd/system/iscsid.service" ] || u=1; done; \
+    if [ -z "$u" ]; then \
+        sed -i '/^          - iscsid$/d' "$f"; ! grep -q iscsid "$f"; fi
+
+# The locale every login's PAM reads: Ubuntu's /etc/default/locale is a link to /etc/locale.conf,
+# which the base image lacks, so each SSH session and sudo would log the missing file. The build
+# fails when the file does not read after.
+RUN set -e; if [ ! -e /etc/default/locale ]; then \
+        if [ -L /etc/default/locale ]; then t="$(readlink -f /etc/default/locale)"; else t=/etc/default/locale; fi; \
+        printf 'LANG=C.UTF-8\n' > "$t"; fi; \
+    grep -q '^LANG=' /etc/default/locale
 
 # Kairos's boot assessment, with the health gate as its judge: the bundle's copy of 08_grub.yaml
 # leaves out the step that marks every boot of the active system good (files/usr/share/NAME). The

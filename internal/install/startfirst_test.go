@@ -13,6 +13,8 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"text/template"
+	"time"
 
 	"go.yaml.in/yaml/v3"
 
@@ -31,6 +33,9 @@ type engineState struct {
 	// joins are the engine's running containers as the join check reads them
 	// (id|name|network|pid|ipc|volumes_from).
 	joins []string
+	// news are new1's states as an `up` without --wait leaves it, one more each time it is read
+	// (the last stays).
+	news []string
 }
 
 func (e *engineState) docker(cfg string) *fakeDocker {
@@ -86,14 +91,24 @@ func (e *engineState) docker(cfg string) *fakeDocker {
 				}
 			}
 			return []byte(strings.Join(out, "\n") + "\n"), true, nil
-		case strings.HasPrefix(a, "inspect --format "):
+		case strings.HasPrefix(a, "inspect --type container --format "):
 			var out []string
 			for _, id := range args {
 				if c, ok := byID[id]; ok {
 					out = append(out, c)
 				}
 			}
+			if slices.Contains(args, "new1") && len(e.news) > 1 {
+				e.news = e.news[1:]
+				byID["new1"] = e.news[0]
+			}
 			return []byte(strings.Join(out, "\n") + "\n"), true, nil
+		case strings.Contains(a, " up --detach --no-deps --no-recreate --scale "):
+			e.containers["api"] = append(e.containers["api"], "new1")
+			byID["new1"] = e.news[0]
+			return nil, true, e.upErr
+		case strings.HasPrefix(a, "kill "):
+			return nil, true, nil
 		case strings.Contains(a, " up --detach --wait --no-deps --no-recreate --scale "):
 			e.containers["api"] = append(e.containers["api"], "new1|/p-new1|running|0|healthy|h2|sha256:img|")
 			byID["new1"] = "new1|/p-new1|running|0|healthy|h2|sha256:img|"
@@ -114,7 +129,7 @@ func (f *fakeDocker) engine() []string {
 		if i := strings.Index(a, " up "); i >= 0 {
 			a = a[i+1:]
 		}
-		if strings.HasPrefix(a, "up ") || strings.HasPrefix(a, "stop ") || strings.HasPrefix(a, "rm ") {
+		if strings.HasPrefix(a, "up ") || strings.HasPrefix(a, "stop ") || strings.HasPrefix(a, "rm ") || strings.HasPrefix(a, "kill ") {
 			out = append(out, a)
 		}
 	}
@@ -270,6 +285,88 @@ func TestAStartFirstServiceOverlaps(t *testing.T) {
 	}
 	if got := dependencies(&mixed, "api"); !maps.Equal(got, map[string]bool{"x": false, "y": false, "z": true}) {
 		t.Errorf("dependencies %v", got)
+	}
+}
+
+// With update_signal, the new container starts without waiting, the old one is sent the signal
+// once the new one runs, and the old one stops once the new one is healthy; a new one that ends
+// or turns unhealthy is removed, the old one sent the signal or not as far as the new one ran.
+func TestAnUpdateSignalTellsTheOldContainerToGo(t *testing.T) {
+	overlapPoll = time.Millisecond
+	t.Cleanup(func() { overlapPoll = 500 * time.Millisecond })
+	const model = `{"services": {"api": {"image": "reg/api:2"}}}`
+	var m composeModel
+	if err := json.Unmarshal([]byte(model), &m); err != nil {
+		t.Fatal(err)
+	}
+	none := sha256.Sum256([]byte("null"))
+	run := func(news ...string) (*fakeDocker, string, error) {
+		r := testRelease(t, "1.0.0")
+		r.Spec.Services = map[string]spec.Service{"api": {Update: spec.UpdateStartFirst, UpdateSignal: "SIGUSR2"}}
+		var log bytes.Buffer
+		e := &engineState{containers: map[string][]string{"api": {"old1|/p-old1|running|0|healthy|h1|sha256:img|"}}, hash: map[string]string{"api": "h2"}, news: news}
+		f := e.docker(`{"services": {"api": {}}}`)
+		in := &Installer{R: r, O: Options{Dir: t.TempDir(), Docker: f, Log: &log}}
+		if err := os.WriteFile(in.path(NetworksFile), []byte(hex.EncodeToString(none[:])+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := in.takeNetworks(); err != nil {
+			t.Fatal(err)
+		}
+		err := in.startFirst(context.Background(), nil, &m, nil)
+		return f, log.String(), err
+	}
+	const (
+		up      = "up --detach --no-deps --no-recreate --scale api=2 api"
+		kill    = "kill --signal SIGUSR2 old1"
+		created = "new1|/p-new1|created|0||h2|sha256:img|"
+		start   = "new1|/p-new1|running|0|starting|h2|sha256:img|"
+		healthy = "new1|/p-new1|running|0|healthy|h2|sha256:img|"
+	)
+	f, log, err := run(created, start, start, healthy)
+	if err != nil || !slices.Equal(f.engine(), []string{up, kill, "stop old1", "rm old1"}) ||
+		!strings.Contains(log, "services.api: the new container runs: SIGUSR2 sent to the old one (update_signal)") {
+		t.Errorf("a new container that becomes healthy: %v, ran %q, logged %s", err, f.engine(), log)
+	}
+	if f, _, err := run("new1|/p-new1|running|0||h2|sha256:img|"); err != nil || !slices.Equal(f.engine(), []string{up, kill, "stop old1", "rm old1"}) {
+		t.Errorf("a new container without a healthcheck: %v, ran %q", err, f.engine())
+	}
+	f, _, err = run(start, "new1|/p-new1|running|0|unhealthy|h2|sha256:img|")
+	if err == nil || !strings.Contains(err.Error(), "services.api: its new container did not become healthy beside the old one, which was sent SIGUSR2 (update_signal) and serves on as far as the app keeps serving after it: its new container /p-new1 is unhealthy") ||
+		!slices.Equal(f.engine(), []string{up, kill, "rm --force new1"}) {
+		t.Errorf("a new container that turns unhealthy: %v, ran %q", err, f.engine())
+	}
+	f, _, err = run(created, "new1|/p-new1|exited|1||h2|sha256:img|")
+	if err == nil || !strings.Contains(err.Error(), "beside the old one, which serves on: its new container /p-new1 is exited (exit code 1)") || !slices.Equal(f.engine(), []string{up, "rm --force new1"}) {
+		t.Errorf("a new container that ends before it runs: %v, ran %q", err, f.engine())
+	}
+}
+
+// The engine renders an inspect template over the container's JSON, failing on a key it lacks: a
+// container without a healthcheck has no State.Health, and reads as one with no health.
+func TestTheContainerFormatReadsAContainerWithoutAHealthcheck(t *testing.T) {
+	t.Parallel()
+	tpl := template.Must(template.New("").Option("missingkey=error").Parse(containerFormat))
+	c := func(state map[string]any) map[string]any {
+		return map[string]any{"Id": "c1", "Name": "/p-api-1", "State": state, "Image": "sha256:img",
+			"Config": map[string]any{"Labels": map[string]any{hashLabel: "h1"}},
+			"Mounts": []any{map[string]any{"Type": "volume", "Name": "p_data"}, map[string]any{"Type": "bind", "Name": ""}}}
+	}
+	for _, tc := range []struct {
+		state map[string]any
+		want  string
+	}{
+		{map[string]any{"Status": "running", "ExitCode": 0}, "c1|/p-api-1|running|0||h1|sha256:img|p_data,"},
+		{map[string]any{"Status": "running", "ExitCode": 0, "Health": nil}, "c1|/p-api-1|running|0||h1|sha256:img|p_data,"},
+		{map[string]any{"Status": "running", "ExitCode": 0, "Health": map[string]any{"Status": "healthy"}}, "c1|/p-api-1|running|0|healthy|h1|sha256:img|p_data,"},
+	} {
+		var b bytes.Buffer
+		if err := tpl.Execute(&b, c(tc.state)); err != nil {
+			t.Fatalf("%v: %v", tc.state, err)
+		}
+		if b.String() != tc.want {
+			t.Errorf("%v: %q, want %q", tc.state, b.String(), tc.want)
+		}
 	}
 }
 

@@ -423,8 +423,11 @@ func (in *Installer) CreateVM(ctx context.Context, c *VMCreate) error {
 type bootDisk struct {
 	release string
 	disks   map[string]string
-	// osMiB is what Kairos takes of a VM's disk besides the app's space, by format.
+	// osMiB is what Kairos takes of a VM's disk besides the app's space, by format: the formats
+	// the registry holds, each recording its size.
 	osMiB map[string]int64
+	// missing is why each other format of the set boots nothing from this registry.
+	missing map[string]error
 }
 
 // osGiB is what Kairos takes of a VM's disk of format, with room for the partition tables and
@@ -469,21 +472,23 @@ func (in *Installer) bootDisks(ctx context.Context, cl *registry.Client, prefix 
 	// cannot is why a set found could not boot this release (an older stowage's, or one recording
 	// no OS size), said when no other one can.
 	var cannot error
-	// present is the size Kairos takes of each disk of the set, by format; nil when one is not in
-	// the registry, or records no size (published by an earlier Stowage: the set boots no VM).
-	present := func(disks map[string]string) (map[string]int64, error) {
-		sizes := map[string]int64{}
+	// present is the size Kairos takes of each disk of the set the registry holds, by format, and
+	// why each other format is not there (a mirror exported with --disks carries some formats
+	// alone) or records no size (published by an earlier Stowage).
+	present := func(disks map[string]string) (map[string]int64, map[string]error, error) {
+		sizes, missing := map[string]int64{}, map[string]error{}
 		for _, f := range slices.Sorted(maps.Keys(disks)) {
 			ref, err := cl.Digest(prefix+"/"+name+"-disk", disks[f])
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 			ann, _, ok, err := cl.Annotations(ctx, ref)
 			if err != nil {
-				return nil, fmt.Errorf("the %s disk: %w", f, err)
+				return nil, nil, fmt.Errorf("the %s disk: %w", f, err)
 			}
 			if !ok {
-				return nil, nil
+				missing[f] = fmt.Errorf("the %s disk %s is not in %s (a mirror carries the formats its `mirror export --disks` named)", f, registry.Short(ref.DigestStr()), prefix)
+				continue
 			}
 			n, valid := osMiBOf(ann[release.DiskOSAnnotation])
 			if !valid {
@@ -491,20 +496,23 @@ func (in *Installer) bootDisks(ctx context.Context, cl *registry.Client, prefix 
 				if s, set := ann[release.DiskOSAnnotation]; set {
 					what = fmt.Sprintf("records %s %q, not a size in MiB (1 to %d): not as Stowage publishes it", release.DiskOSAnnotation, s, maxOSMiB)
 				}
-				cannot = cmp.Or(cannot, fmt.Errorf("the %s disk %s %s, the publisher ships a new revision with its disks", f, registry.Short(ref.DigestStr()), what))
-				return nil, nil
+				missing[f] = fmt.Errorf("the %s disk %s %s, the publisher ships a new revision with its disks", f, registry.Short(ref.DigestStr()), what)
+				cannot = cmp.Or(cannot, missing[f])
+				continue
 			}
 			sizes[f] = n
 		}
-		return sizes, nil
+		return sizes, missing, nil
 	}
+	// usable is the set when the registry holds one of its formats at least: which one the
+	// platform boots is told by platform.
 	usable := func(src *release.Manifest) (bootDisk, bool, error) {
 		tag, disks := src.Artifacts.Boot(src.Tag)
 		if len(disks) == 0 {
 			return bootDisk{}, false, nil
 		}
-		sizes, err := present(disks)
-		if err != nil || sizes == nil {
+		sizes, missing, err := present(disks)
+		if err != nil || len(sizes) == 0 {
 			return bootDisk{}, false, err
 		}
 		if tag != m.Tag {
@@ -518,7 +526,7 @@ func (in *Installer) bootDisks(ctx context.Context, cl *registry.Client, prefix 
 				return bootDisk{}, false, nil
 			}
 		}
-		return bootDisk{tag, disks, sizes}, true, nil
+		return bootDisk{tag, disks, sizes, missing}, true, nil
 	}
 	if d, ok, err := usable(m); err != nil || ok {
 		return d, err
@@ -636,13 +644,13 @@ func (in *Installer) sshAllows(addr string, m Machine) {
 }
 
 // platform is the platform the VM runs on, and the disk format it takes: the first of the
-// platform's formats the release publishes. Only the platforms the release has a disk for are
-// offered.
+// platform's formats the registry holds. Only the platforms the registry has a disk for are
+// offered; one whose formats the release publishes but the registry lacks is told which.
 func (in *Installer) platform(ctx context.Context, key string) (Platform, string, error) {
-	disks := in.boot.disks
+	held := in.boot.osMiB
 	var offered []Platform
 	for _, p := range Platforms {
-		if slices.ContainsFunc(p.Formats, func(f string) bool { return disks[f] != "" }) {
+		if slices.ContainsFunc(p.Formats, func(f string) bool { _, ok := held[f]; return ok }) {
 			offered = append(offered, p)
 		}
 	}
@@ -675,10 +683,17 @@ func (in *Installer) platform(ctx context.Context, key string) (Platform, string
 	}
 	i := slices.IndexFunc(offered, func(p Platform) bool { return p.Key == key })
 	if i < 0 {
+		if j := slices.IndexFunc(Platforms, func(p Platform) bool { return p.Key == key }); j >= 0 {
+			for _, f := range Platforms[j].Formats {
+				if why := in.boot.missing[f]; why != nil {
+					return Platform{}, "", fmt.Errorf("--platform %s: %w; this registry offers %s", key, why, keys())
+				}
+			}
+		}
 		return Platform{}, "", fmt.Errorf("--platform %s: %s %s offers %s", key, in.R.Spec.Name, in.R.Manifest.ProjectVersion, keys())
 	}
 	p := offered[i]
-	f := p.Formats[slices.IndexFunc(p.Formats, func(f string) bool { return disks[f] != "" })]
+	f := p.Formats[slices.IndexFunc(p.Formats, func(f string) bool { _, ok := held[f]; return ok })]
 	return p, f, nil
 }
 
@@ -1118,6 +1133,22 @@ func (in *Installer) vmSettings(ctx context.Context) (*Settings, []string, error
 	if err := in.applyDomains(); err != nil {
 		return nil, nil, err
 	}
+	// The front's ports, as the VM's install takes them (a TLS mode's, whichever it is), before
+	// the form: its first boot would refuse them, and one the VM's SSH holds.
+	if in.R.Spec.HasFront() && len(remoteModes(in.R.Spec.Front.TLSModes)) > 0 {
+		pub, err := in.publish("")
+		if err == nil {
+			err = in.l4Clash(pub)
+		}
+		for _, k := range sortedKeys(pub.ports) {
+			if err == nil && pub.ports[k] == 22 {
+				err = fmt.Errorf("--%s-port 22 is the VM's SSH: choose another", k)
+			}
+		}
+		if err != nil {
+			return nil, nil, err
+		}
+	}
 	var mode string
 	var values map[string]string
 	var list []input
@@ -1149,6 +1180,12 @@ func (in *Installer) vmSettings(ctx context.Context) (*Settings, []string, error
 			return nil, nil, err
 		}
 		break
+	}
+	// The VM's install would refuse them at its first boot: refused here, before a VM exists.
+	if in.R.Spec.HasFront() {
+		if _, err := in.routeDomains(mode, func(k string) string { return cmp.Or(values[k], o.Set[k]) }); err != nil {
+			return nil, nil, err
+		}
 	}
 	st := &Settings{Channel: in.R.Manifest.Channel, TLS: mode, HTTPPort: o.HTTPPort, HTTPSPort: o.HTTPSPort}
 	for _, i := range list {

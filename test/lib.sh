@@ -151,6 +151,8 @@ grype_db() {
 
 [[ -x $STOWAGE ]] || fail "$STOWAGE is missing: run make build"
 
+# start_zot runs the project's registry. It takes Docker v2 manifests (a project's pinned image may
+# be one) unless ZOT_COMPAT says otherwise: ZOT_COMPAT='' takes OCI manifests alone.
 start_zot() {
 	local port code
 	port=$(free_port)
@@ -168,7 +170,7 @@ start_zot() {
 {
   "storage": { "rootDirectory": "/etc/zot/data" },
   "http": {
-    "address": "0.0.0.0", "port": "5000", "compat": ["docker2s2"],
+    "address": "0.0.0.0", "port": "5000", "compat": [${ZOT_COMPAT-\"docker2s2\"}],
     "auth": { "htpasswd": { "path": "/etc/zot/htpasswd" }, "apikey": true },
     "accessControl": {
       "repositories": {

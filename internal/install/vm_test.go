@@ -440,33 +440,6 @@ func TestBootDoesNotUpgradeAgainToTheReleaseARollbackLeft(t *testing.T) {
 	}
 }
 
-// inProcess runs the installers a boot runs as the VM would, in this process: each loads its own
-// release from its file and runs its boot or boot-rollback, running the next the same way.
-func inProcess(e *env, ran *[][]string) func(context.Context, string, []string) error {
-	var run func(context.Context, string, []string) error
-	run = func(ctx context.Context, exe string, args []string) error {
-		*ran = append(*ran, args)
-		files, err := payload.Read(exe)
-		if err != nil {
-			return err
-		}
-		r, err := Load(files)
-		if err != nil {
-			return err
-		}
-		in := e.installer(vm)
-		in.R, in.O.Self, in.O.Exec = r, exe, run
-		switch args[0] {
-		case bootCmd:
-			return in.Boot(ctx)
-		case bootRollbackCmd:
-			return in.BootRollback(ctx)
-		}
-		return errors.New("no verb " + args[0])
-	}
-	return run
-}
-
 func TestBootFinishesAnUpgradeARebootStoppedBeforeItSwitched(t *testing.T) {
 	t.Parallel()
 	e := vmEnv(t, "1.0.0")
@@ -479,18 +452,19 @@ func TestBootFinishesAnUpgradeARebootStoppedBeforeItSwitched(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := in.keepPrev(env, state{ProjectVersion: "1.0.0", Revision: 1}); err != nil {
+	if err := in.keepPrev(env, state{ProjectVersion: "1.0.0", Revision: 1}, &keptRelease{Manifest: in.R.Manifest, Release: in.R}); err != nil {
 		t.Fatal(err)
 	}
 	e.r, e.self = bundledInstaller(t, "2.0.0", 1, nil)
 	var ran [][]string
 	boot := e.installer(vm)
-	boot.O.Exec = inProcess(e, &ran)
+	boot.O.Exec = inProcess(e, vm, &ran)
 	e.docker.calls = nil
 	if err := boot.Boot(context.Background()); err != nil {
 		t.Fatalf("%v\n%s", err, e.log)
 	}
-	if fmt.Sprint(ran) != fmt.Sprintf("[[boot-rollback --dir %s] [boot --dir %s]]", e.dir, e.dir) {
+	// Finishing starts the kept release with its own installer: a VM's boots it.
+	if fmt.Sprint(ran) != fmt.Sprintf("[[boot-rollback --dir %s] [boot --dir %s] [boot --dir %s]]", e.dir, e.dir, e.dir) {
 		t.Errorf("ran %v", ran)
 	}
 	// Finishing checks Docker first, and nothing else, so it brings no database up first.
@@ -522,11 +496,11 @@ func TestBootFinishesARollbackARebootStoppedAfterItSwitched(t *testing.T) {
 	e.r, e.self = bundledInstaller(t, "1.0.0", 1, nil) // the VM booted the passive slot
 	var ran [][]string
 	boot := e.installer(vm)
-	boot.O.Exec = inProcess(e, &ran)
+	boot.O.Exec = inProcess(e, vm, &ran)
 	if err := boot.Boot(context.Background()); err != nil {
 		t.Fatalf("%v\n%s", err, e.log)
 	}
-	if fmt.Sprint(ran) != fmt.Sprintf("[[boot-rollback --dir %s]]", e.dir) {
+	if fmt.Sprint(ran) != fmt.Sprintf("[[boot-rollback --dir %s] [boot --dir %s]]", e.dir, e.dir) {
 		t.Errorf("ran %v", ran)
 	}
 	if v := get(e.readEnv(), "STOWAGE_PROJECT_VERSION"); v != "1.0.0" {

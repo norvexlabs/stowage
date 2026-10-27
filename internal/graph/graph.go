@@ -84,6 +84,9 @@ type Node struct {
 	Inputs string   `json:"inputs"`
 	// Pinned is set for an upstream image taken by reference: nothing is built.
 	Pinned string `json:"pinned,omitempty"`
+	// Converts is set for an upstream image, pinned by digest, published with OCI media types:
+	// its digest is the conversion's, found again by its inputs as a built image's is.
+	Converts string `json:"converts,omitempty"`
 	// ReadsVersion is set for an image whose Dockerfile declares VersionArg.
 	ReadsVersion bool `json:"reads_version,omitempty"`
 	// Recipe is the Dockerfile of an image Stowage supplies (the front): what its inputs digest
@@ -343,13 +346,15 @@ func backupNode() Node {
 	return Node{ID: BackupID, Kind: KindImage, Inputs: b.Sum(), Recipe: recipe}
 }
 
-// auditNode is the scanner (grype), pinned at ref: a signing release mirrors it, so an install
-// audits the SBOMs it carries with its own release's scanner, wherever it pulls from.
+// auditNode is the scanner (grype), pinned at ref: a signing release publishes it converted to
+// OCI media types (a registry need not take Docker's), so an install audits the SBOMs it carries
+// with its own release's scanner, wherever it pulls from.
 func auditNode(ref string) Node {
 	b := digest.New(KindImage)
 	b.Field("name", sbom.Key)
 	b.Field("ref", ref)
-	return Node{ID: AuditID, Kind: KindImage, Inputs: b.Sum(), Pinned: ref}
+	b.Field("media-types", "oci")
+	return Node{ID: AuditID, Kind: KindImage, Inputs: b.Sum(), Converts: ref}
 }
 
 // chownNode is the helper that gives data volumes their uid: like the front, its inputs are the
@@ -397,6 +402,14 @@ func imageNode(p *project.Project, name, projectVersion string) (Node, error) {
 	sort.Strings(argKeys)
 	for _, k := range argKeys {
 		b.Field("arg", k+"="+img.Args[k])
+	}
+	for _, h := range slices.Sorted(maps.Keys(img.AddHosts)) {
+		b.Field("add-host", h+"="+img.AddHosts[h])
+	}
+	// Entered only when set (default is BuildKit's own network): a build naming neither digests as
+	// one that has no such keys.
+	if img.Network != "" && img.Network != "default" {
+		b.Field("network", img.Network)
 	}
 	parsed, err := dockerfile.Parse(df)
 	if err != nil {

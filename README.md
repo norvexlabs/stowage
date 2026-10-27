@@ -271,8 +271,8 @@ data:
   reset: [postgres, uploads]                        # what reset-db wipes
 ```
 
-The front routes by hostname only; each route's domain is an input the installer asks in TLS
-mode. `schema_compat` is what makes `rollback` safe: it reports the schema's migration number
+The front routes by hostname, then by path: each route's domain is an input the installer asks
+in TLS mode, and routes sharing one tell themselves apart by their `path`. `schema_compat` is what makes `rollback` safe: it reports the schema's migration number
 and whether a migration since an upgrade is a rollback barrier
 ([Schema compat](#the-contracts-a-project-must-honour)). Without it (`none`), a rollback is not
 checked against the database.
@@ -409,7 +409,9 @@ API it is set up through) packages without changing the software, through the co
 - **Material minted once** (a CA, a server key and certificate, a token): a one-shot service of a
   small image (openssl, step-cli) writes it into a named volume, keeping what it finds there, and
   the services that read it `depends_on` it with `condition: service_completed_successfully` and
-  mount the volume `:ro`. The installer counts a one-shot done when it exits 0. Its inputs (a
+  `restart: true` (a re-run that changes the one-shot makes it again, and Compose then restarts
+  them, so a service that reads the file once at start reads the new one), and mount the volume
+  `:ro`. The installer counts a one-shot done when it exits 0. Its inputs (a
   hostname for a SAN) are inputs like any other; its policy is the project's. List the volume in
   the backup's `volumes`, so a restore brings the material back with the data it belongs to.
 - **A daemon's own config format**: a thin entrypoint renders it from the environment (the
@@ -657,7 +659,7 @@ release for a test run, never the project's, without editing the spec:
 | Command | Output |
 |---|---|
 | `lint` | `{"findings": [{"severity", "where", "message"}], "version"}`, errors first |
-| `plan` | `{"project_version", "revision", "channel", "nodes": [{"id", "kind", "deps", "inputs", "pinned", "reads_version"}]}` |
+| `plan` | `{"project_version", "revision", "channel", "nodes": [{"id", "kind", "deps", "inputs", "pinned", "converts", "reads_version"}]}` |
 | `project-version` | `{"name", "project_version", "revision"}`, plus `"channel"` and `"tag"` with `--channel` |
 | `changelog` | `[{"version", "text"}]` |
 | `ship`, `verify`, `promote` | `{"digest", "manifest"}` |
@@ -910,15 +912,23 @@ from the registry is made again), and one made is read back before the release i
 SBOM of a digest is made once: a later syft makes no new one, and a digest that already carries
 one (a pulled image's included) keeps it, so a document added to a built image is merged when the
 image is next built (a new digest). An attestation never counts as a
-signature. A signing release also carries the scanner `audit` runs, grype's linux/amd64 image (a
-Docker v2 manifest: the registry must take one — zot does with `http.compat: ["docker2s2"]`),
-mirrored as the image `audit` (`<prefix>/<name>-audit`), which no OS bundle preloads: `mirror
+signature. A signing release also carries the scanner `audit` runs, grype's linux/amd64 image, published
+as the image `audit` (`<prefix>/<name>-audit`) with OCI media types (`image audit: convert <ref>
+to OCI media types`: upstream's is a Docker v2 manifest; its layers and config are upstream's, its
+digest the conversion's, which the release pins, signs and attests; a later ship finds it by its
+inputs, as a built image), so a registry that takes OCI manifests alone (zot's default) takes
+every image Stowage publishes for itself — a project's own pinned image (`images.<key>.ref`) is
+mirrored as is, a Docker v2 one needing a registry that takes those (zot: `http.compat:
+["docker2s2"]`). No OS bundle preloads the scanner: `mirror
 export` carries it and the SBOMs to a site without internet, where an operator's `<short>-stow
 audit` pulls it. `stowage sbom export` and `<short>-stow sbom export` write the verified SBOMs as
 files for other tools. **An image's own SBOM documents are merged**: syft runs with its SBOM cataloger
-(`--select-catalogers +sbom-cataloger`), so each SBOM document found anywhere in an image, a base
-image's included, adds its packages, with their purls and CPEs, to the image's SBOM, which `audit`
-scans and `sbom export` writes. A document is a file named `*.cdx`, `*.cdx.*`, `*.spdx`, `*.spdx.*`,
+and without its kernel cataloger (`--select-catalogers +sbom-cataloger,-linux-kernel-cataloger`),
+so each SBOM document found anywhere in an image, a base image's included, adds its packages, with
+their purls and CPEs, to the image's SBOM, which `audit` scans and `sbom export` writes, and no
+SBOM lists a kernel (`linux-kernel`) or its modules: an OS bundle's kernel is its distribution's
+packages (`linux-image-*`, `linux-modules-*`), scanned by their own versions, which carry the
+fixes the distribution backports. A document is a file named `*.cdx`, `*.cdx.*`, `*.spdx`, `*.spdx.*`,
 `*.bom`, `*.bom.*`, `bom`, `*.sbom`, `*.sbom.*`, `sbom` or `*.syft.json`, in CycloneDX (JSON or XML),
 SPDX (JSON or tag-value) or syft JSON; a file of such a name that is none is skipped. The convention
 for an app's: `/usr/share/sbom/<name>.cdx.json`. A package a document names that a cataloger also
@@ -992,6 +1002,12 @@ These are what `lint` checks; each finding names the key path or `file:line` to 
     holding it (`/var/run`, `/run`, `/`; a long-syntax entry without a `type` counts as a bind, a
     `${VAR:-default}` source reads as its default, and a bare container path is no bind) (`the service drives the host's engine, so holds the
     host`); a service extending another takes its `privileged`, `pid` and `cap_add` too;
+  - a service that waits for a one-shot to complete (`depends_on: { <one-shot>: { condition:
+    service_completed_successfully } }`) without `restart: true` in that entry is warned (`waits
+    for the one-shot <one-shot> without restart: true …`; a `restart` from a variable, or one
+    Compose does not read as a boolean, is warned as only a run knowing): a re-run that changes the one-shot makes
+    it again, and only `restart: true` has Compose restart the service then, so one that reads a
+    file the one-shot renders once at start keeps the old one;
   - a service with `profiles:` runs only while an input turns one of its profiles on (an input's
     `profile`, see "Spec keys"); a profile no input names is an error (no install would ever
     start the service);
@@ -1000,7 +1016,7 @@ These are what `lint` checks; each finding names the key path or `file:line` to 
   - each `safe_defaults` key appears as `${KEY:-<safe value>}`: the safe value is the default and
     only the installer relaxes it;
   - `STOWAGE_` is reserved. Stowage provides `STOWAGE_IMAGE_<KEY>`, `STOWAGE_URL_<ROUTE>` (the
-    route's public URL — use it rather than building one from a domain), `STOWAGE_NAME`,
+    route's public URL, its path included — use it rather than building one from a domain), `STOWAGE_NAME`,
     `STOWAGE_PROJECT_VERSION`, `STOWAGE_REVISION`, `STOWAGE_TLS_MODE` (never set without a
     front: lint refuses it then), `STOWAGE_LOOPBACK_ADDRESS`
     (a loopback address in every mode and without a front, for a port only this host may reach: 127.x or `::1`,
@@ -1116,7 +1132,14 @@ These are what `lint` checks; each finding names the key path or `file:line` to 
     them);
   - Kairos's `/system/oem/09_systemd_services.yaml` without its fixed `net.core.rmem_max`
     (7500000), which its boot stage would set after the tuning units, below what they size from
-    RAM; its other settings stay. The build fails when that line is no longer there;
+    RAM, and without its enable of `iscsid` when `open-iscsi` is purged (host.packages bringing
+    it back keeps it); its other settings stay. The build fails when either line is no longer
+    there;
+  - dracut's crypt generator in the initrd exiting cleanly when no disk is encrypted (its
+    `return` outside a function, which `sh` refuses with status 2, becomes `exit`; the build fails
+    when the script is no longer that one), and `/etc/default/locale` reading `LANG=C.UTF-8`
+    (written to `/etc/locale.conf`, which Ubuntu links it to), so a healthy boot, an SSH session
+    and `sudo` log no error (`journalctl -p err` is empty);
   - a default-deny firewall, `/etc/nftables.conf`, with SSH open to every source
     (`/etc/nftables.d/ssh.nft`), `/run/nftables.d` made at boot for the install's ports, and a
     forward chain including the install's `nftables.d` (see "The firewall" under the installer on
@@ -1329,10 +1352,12 @@ These are what `lint` checks; each finding names the key path or `file:line` to 
   input, a secret, a safe default or a route's domain input is an error (the install records it),
   as is a key listed twice, one that is not a variable name, or one starting `STOWAGE_` or
   `COMPOSE_`.
-- **Front**: every route has a `loopback_ports` entry (distinct ports); `loopback_env` relaxes a
-  `safe_defaults` key in loopback mode only (plain HTTP on the operator's machine).
+- **Front**: when `tls_modes` offers `none` (loopback mode), every route has a `loopback_ports`
+  entry (distinct ports); `loopback_env` relaxes a `safe_defaults` key in loopback mode only (plain
+  HTTP on the operator's machine). A project that does not offer `none` owes no loopback port, and
+  either key is then an error (no install would use it).
 - **Images**: keys are lowercase words joined by single `-`. Built (`context` + `dockerfile`,
-  optional `target` naming a stage, `args`, `inputs`) or pinned upstream
+  optional `target` naming a stage, `args`, `add_hosts`, `network`, `inputs`) or pinned upstream
   (`ref: name:tag@sha256:<64 hex>`). Every `FROM` of a built image is pinned by digest (or names an
   earlier stage, or `scratch`). An image whose Dockerfile declares `ARG STOWAGE_PROJECT_VERSION`
   receives the project version; any other image is re-tagged, not rebuilt, on a version bump.
@@ -1341,8 +1366,9 @@ These are what `lint` checks; each finding names the key path or `file:line` to 
   publisher's machine).
 - **Build contexts** that contain `.git` exclude it in their `.dockerignore` (`**/.git` also covers
   submodules).
-- **The front** routes by hostname only: each route maps a `domain_input` to `<service>:<port>`;
-  `front.portal` names the route whose URL the installer prints at the end.
+- **The front** routes by hostname, then by path: each route maps a `domain_input` (and, for
+  routes sharing one, a `path` prefix) to `<service>:<port>`; `front.portal` names the route whose
+  URL the installer prints at the end.
 - **Signing** (`cosign-key`): `key` and `public_keys` are required; each public key is a project
   file holding a PEM `PUBLIC KEY` block (as `cosign generate-key-pair` writes it).
 - **Providers**: every project-specific concern is `{ provider: <name>, …config }`
@@ -1460,11 +1486,11 @@ database: reset-db has nothing to reset` (`… there is no backup to restore`). 
 | `registry.delete` | how the publisher deletes a manifest by digest (an older disk set, a pruned release's): `oci` (the default, the distribution API) or `github` (GitHub's packages API: `api`, default `https://api.github.com`; `token_env`, default `registry.push`'s, a token with `delete:packages`) |
 | `registry.pull`, `registry.push` | `token` (`user`, `token_env`), `docker-config` (`config`, a Docker config directory; empty: the default Docker login), `none` (pull only). `registry.pull` is baked into every installer: it may not use `registry.push`'s `token_env` or Docker config. With `none`, `ship` refuses a repository the release writes that an anonymous read is refused (see `ship`) |
 | `signing` | `cosign-key` (`key`, `public_keys`), or absent / `none` |
-| `images.<key>` | built (`context`, `dockerfile`, `target`, `args`, `inputs`: the paths whose content enters the image's inputs digest, default the whole context less `.dockerignore`) or `ref` (exclusive with the build keys). An image no service or hook uses is a warning; a `# syntax=` frontend or a `FROM $ARG` cannot be checked (warning) |
+| `images.<key>` | built (`context`, `dockerfile`, `target`, `args`, `add_hosts`: `{<host name>: <IP>}`, the names the build's steps resolve to fixed addresses — BuildKit's `/etc/hosts` is read-only to a step — passed as `--add-host`; `network`: `default` (BuildKit's own), `host` or `none`, the steps' network, passed as `--network` (`host` with `--allow network.host`, its entitlement, which the builder must grant); `inputs`: the paths whose content enters the image's inputs digest, default the whole context less `.dockerignore`) or `ref` (exclusive with the build keys). `add_hosts` and a `network` other than `default` enter the image's inputs digest. A host name that is not lowercase, an address that is not an IP (or carries a zone) and another network are errors. An image no service or hook uses is a warning; a `# syntax=` frontend or a `FROM $ARG` cannot be checked (warning) |
 | `stack.compose` | the compose file (its contract: "The contracts a project must honour"): `extends` within the file, `profiles:` only those an input's `profile` names, a `ports:` entry past this host an error with a `kairos` shape and a warning on `docker` |
 | `tune.profile` | optional: the tuning profile of the hosts the `docker` and `kairos` shapes run on (see "Network tuning" under the installer): `default` (the same as no `tune`: Docker's path as fast as the host's network) or `network` (a host serving a heavy network load); the operator may choose another (`--tune-profile`). Another name is an error, and so is `tune:` without a profile; a project with neither a `docker` nor a `kairos` shape is warned: a node is the cluster's |
-| `services` | optional: what a compose service asks of the host beyond its compose file, by service (one the compose file does not declare is an error, as are `services:` left empty and a service asking nothing): `memory`: the percent of the host's RAM its memory limit is (`memory: 25`), or that percent with a maximum (`memory: { percent: 25, max: 16G }`), on Docker and the VM, recomputed at each start (see "What a service asks of the host" under the installer). Each share is a whole percent from 1 to 90, together at most 90 (the rest is the OS's, the engine's and Stowage's). A share's map takes `percent` and `max` alone. `max` is a size (`512M`, `1.5G`, `16GiB`: binary units, `k` to `p`; a bare number is bytes, a fraction of a byte dropped). Split among the service's containers (`scale`, `deploy.replicas`; one written as a variable counts as 1), each part under 64 MiB is an error (`max: 0`, or `max:` left empty, too: leave it out for none), and so is a part under what the compose file gives each container itself — the largest of `mem_limit`, `mem_reservation`, `deploy.resources.limits.memory` and `deploy.resources.reservations.memory` written as a number of bytes or a size Compose reads (not a variable), its `extends` base's included. With a `kairos` shape stating `size.min.memory` and no `docker` shape, a maximum the percent already reaches on that least VM is warned, counting 90 % of its memory as the RAM its kernel shows: the limit is then always the maximum, and a compose limit of the maximum's part for each container says it plainly. A project with neither a `docker` nor a `kairos` shape is warned: the chart gives its pods their resources; `cpus`: whole cores of its own, 1 to 64, which the install gives it from the host's (Docker and the VM: its `cpuset`, from the last core down, a core's SMT threads together, never the core of CPU 0; a host of too few cores fails the start); `irq`: `off` (the default) or `on`, whether the host's NICs' interrupts and receive steering go on those cores too (it needs `cpus`); `nftables`: a file of the project holding its nftables table, one `table inet <service> { … }` alone, as nft lexes it (a quoted string's braces and `#` are the string's, a comment is nothing, a backslash before a newline continues the line; no carriage return, form feed or vertical tab, which nft refuses: no `include`, no word `ruleset`, nothing before or after the table, its braces balanced; the service's name a table's: a letter, then letters, digits and `_ - .`, never the project's, whose table is the VM's own firewall's, nor a word of nft's own such as `queue`, `log`, `meta` or `mark`, compared exactly: nft's are lower-case); a chain hooking the input, prerouting or ingress with a drop policy is warned (a base chain of any table judges every packet, so it drops what the VM's own firewall accepts — SSH, the stack's ports — unless it accepts them itself), which the VM loads before the service starts (see "A service's nftables table" under the installer); `interface` and `address_input`, together: a `host.interfaces` NIC and an input (not `secret`; a `default` must be an IP address) holding the address the service has of its own on it, an ipvlan network beside the stack's (the service not on the host's network: `network_mode` is an error); lint counts that input as read; `update`: how a start replaces its container, `stop-first` (the default: Compose's own) or `start-first` (the new container healthy beside the old before the old one stops — see "An upgrade that overlaps" under the installer), which is an error for a service with an `interface`, a `container_name` (its `extends` base's included), a fixed address (`mac_address`, or a network's `ipv4_address`, `ipv6_address` or `mac_address`; its `extends` base's included), more than one container (`scale`, `deploy.replicas`, or either written as a variable), another service in its namespaces (`network_mode`, `pid` or `ipc: service:<name>`) or mounting its volumes (`volumes_from: [<name>]` or `[service:<name>]`, with `:ro` or `:rw`; its `extends` base's included), another service linking to it (`links: [<name>[:alias]]`: reach it by its name), a network namespace of another (`network_mode: service:…` or `container:…`), `ports:` while it is not on the host's network (two containers cannot publish one port: run it with `network_mode: host`, the port shared by `SO_REUSEPORT` or `update_socket`, or reach it through the front), or a healthcheck with `disable: true` or `test: ["NONE"]`, or whose test never tells when the new container serves (a list not of `CMD`, `CMD-SHELL` or `NONE`, for which Docker runs no probe; a blank command — a blank string or `CMD-SHELL ""` passes at once, a `CMD` without one never passes; a command that is not a string; the string `NONE`, a shell command that never passes), or whose `disable` is true as Compose casts it (`true`, `yes`, `y`, `on`, any case, as a boolean or a string); a `disable` from a variable or a string Compose does not read as a boolean, and a test from a variable (a `$$` escape is none; its head included, which is then not refused), are warned (lint cannot tell); one whose compose file sets no healthcheck, or one without a `test` (or an empty one), is warned (the overlap then waits for the image's own, and without one only for the new container to run), and so is one an L4 route targets with a `docker` shape while it is not on the host's network (its port is published from its network there, so its starts on Docker are stop-first), and, without `update_socket`, one on the host's network (`network_mode: host`, or an L4 route's upstream with a `kairos` shape: both containers then listen on its ports, so the app sets `SO_REUSEPORT`); `update_socket`: a directory of the container (absolute and clean, not `/`; with `update: start-first` alone) both containers of an overlap mount, for the old one to hand its listening sockets to the new; with a start-first service, each key of a service joining a container by name or ID (`network_mode`, `pid`, `ipc` or `volumes_from: container:…`, `external_links`), or holding a variable (`links` included), is warned once (the install replaces that start-first service stop-first if it is its), but a start-first service's own `network_mode: container:…`, refused above; its own `network_mode` from a variable is warned (stop-first if it resolves to `service:…` or `container:…`, or to a network of its own while it publishes ports, an L4 route's on Docker included; without `update_socket`, the app's to share its ports if `host`), and spares it the `ports:` refusal and the Docker L4 warning |
-| `front` | optional: absent or empty, the project has no front (see "A project without a front"). `tls_modes` (`acme`, `dns-cloudflare`, `byo`, `internal`, `none`), `routes[]` (`name`, `domain_input`, `upstream: <service>:<port>`, `strip_headers`, where a trailing `*` matches a prefix; `forward_auth`: `address_input` (required), `uri_input`, `copy_headers` (header names); `allow_input`; `client_auth` (`true`: the route requires a client certificate the install's `--client-ca` issued; refused when the project offers no TLS mode, `none` alone, as the route would refuse everyone — see the installer's front); `basic_auth`: `user` and `secret`, a login the front asks for (the key of a spec secret without `rotation` or of a `secret: true` input; not beside `forward_auth`) — see the installer's front), `portal`, `loopback_ports`, `loopback_env`, `publish_ca` (`volume`: a volume the compose file declares; refused when the project offers neither `internal` nor `byo`), `http_port` and `https_port` (the host ports a TLS front publishes unless an install's `--http-port` / `--https-port` move them; absent or 0 is 80 and 443; they must differ). `interface`: a `host.interfaces` role the VM's firewall opens the front's ports on alone (none: every interface; an undeclared one is an error; without a `kairos` shape, a warning: a Docker host's firewall is its operator's). Route names must give distinct `STOWAGE_URL_` variables; each `domain_input` routes one upstream. An input `forward_auth` or `allow_input` names must be an input of the `docker` shape and, with a `kairos` shape, of that one too, and neither `required` (empty is how the front leaves it off) nor asked in one mode only (`when`); an `allow_input` input is not `advanced` (never asked, it would refuse everyone). Lint counts these inputs, and a `basic_auth` input, as read |
+| `services` | optional: what a compose service asks of the host beyond its compose file, by service (one the compose file does not declare is an error, as are `services:` left empty and a service asking nothing): `memory`: the percent of the host's RAM its memory limit is (`memory: 25`), or that percent with a maximum (`memory: { percent: 25, max: 16G }`), on Docker and the VM, recomputed at each start (see "What a service asks of the host" under the installer). Each share is a whole percent from 1 to 90, together at most 90 (the rest is the OS's, the engine's and Stowage's). A share's map takes `percent` and `max` alone. `max` is a size (`512M`, `1.5G`, `16GiB`: binary units, `k` to `p`; a bare number is bytes, a fraction of a byte dropped). Split among the service's containers (`scale`, `deploy.replicas`; one written as a variable counts as 1), each part under 64 MiB is an error (`max: 0`, or `max:` left empty, too: leave it out for none), and so is a part under what the compose file gives each container itself — the largest of `mem_limit`, `mem_reservation`, `deploy.resources.limits.memory` and `deploy.resources.reservations.memory` written as a number of bytes or a size Compose reads (not a variable), its `extends` base's included. With a `kairos` shape stating `size.min.memory` and no `docker` shape, a maximum the percent already reaches on that least VM is warned, counting 90 % of its memory as the RAM its kernel shows: the limit is then always the maximum, and a compose limit of the maximum's part for each container says it plainly. A project with neither a `docker` nor a `kairos` shape is warned: the chart gives its pods their resources; `cpus`: whole cores of its own, 1 to 64, which the install gives it from the host's (Docker and the VM: its `cpuset`, from the last core down, a core's SMT threads together, never the core of CPU 0; a host of too few cores fails the start); `irq`: `off` (the default) or `on`, whether the host's NICs' interrupts and receive steering go on those cores too (it needs `cpus`); `nftables`: a file of the project holding its nftables table, one `table inet <service> { … }` alone, as nft lexes it (a quoted string's braces and `#` are the string's, a comment is nothing, a backslash before a newline continues the line; no carriage return, form feed or vertical tab, which nft refuses: no `include`, no word `ruleset`, nothing before or after the table, its braces balanced; the service's name a table's: a letter, then letters, digits and `_ - .`, never the project's, whose table is the VM's own firewall's, nor a word of nft's own such as `queue`, `log`, `meta` or `mark`, compared exactly: nft's are lower-case); a chain hooking the input, prerouting or ingress with a drop policy is warned (a base chain of any table judges every packet, so it drops what the VM's own firewall accepts — SSH, the stack's ports — unless it accepts them itself), which the VM loads before the service starts (see "A service's nftables table" under the installer); `interface` and `address_input`, together: a `host.interfaces` NIC and an input (not `secret`; a `default` must be an IP address) holding the address the service has of its own on it, an ipvlan network beside the stack's (the service not on the host's network: `network_mode` is an error); lint counts that input as read; `update`: how a start replaces its container, `stop-first` (the default: Compose's own) or `start-first` (the new container healthy beside the old before the old one stops — see "An upgrade that overlaps" under the installer), which is an error for a service with an `interface`, a `container_name` (its `extends` base's included), a fixed address (`mac_address`, or a network's `ipv4_address`, `ipv6_address` or `mac_address`; its `extends` base's included), more than one container (`scale`, `deploy.replicas`, or either written as a variable), another service in its namespaces (`network_mode`, `pid` or `ipc: service:<name>`) or mounting its volumes (`volumes_from: [<name>]` or `[service:<name>]`, with `:ro` or `:rw`; its `extends` base's included), another service linking to it (`links: [<name>[:alias]]`: reach it by its name), a network namespace of another (`network_mode: service:…` or `container:…`), `ports:` while it is not on the host's network (two containers cannot publish one port: run it with `network_mode: host`, the port shared by `SO_REUSEPORT` or `update_socket`, or reach it through the front), or a healthcheck with `disable: true` or `test: ["NONE"]`, or whose test never tells when the new container serves (a list not of `CMD`, `CMD-SHELL` or `NONE`, for which Docker runs no probe; a blank command — a blank string or `CMD-SHELL ""` passes at once, a `CMD` without one never passes; a command that is not a string; the string `NONE`, a shell command that never passes), or whose `disable` is true as Compose casts it (`true`, `yes`, `y`, `on`, any case, as a boolean or a string); a `disable` from a variable or a string Compose does not read as a boolean, and a test from a variable (a `$$` escape is none; its head included, which is then not refused), are warned (lint cannot tell); one whose compose file sets no healthcheck, or one without a `test` (or an empty one), is warned (the overlap then waits for the image's own, and without one only for the new container to run), and so is one an L4 route targets with a `docker` shape while it is not on the host's network (its port is published from its network there, so its starts on Docker are stop-first), and, without `update_socket`, one on the host's network (`network_mode: host`, or an L4 route's upstream with a `kairos` shape: both containers then listen on its ports, so the app sets `SO_REUSEPORT`); `update_socket`: a directory of the container (absolute and clean, not `/`; with `update: start-first` alone) both containers of an overlap mount, for the old one to hand its listening sockets to the new; `update_signal`: the signal the overlap sends the old container once the new one runs, before it waits for the new one's health (`SIGHUP`, `SIGINT`, `SIGQUIT`, `SIGTERM`, `SIGUSR1`, `SIGUSR2` or `SIGWINCH`; with `update: start-first` alone), for a server whose old process hands its listeners over only when told to go (Docker and the VM; a chart's rolling update has no equivalent); with a start-first service, each key of a service joining a container by name or ID (`network_mode`, `pid`, `ipc` or `volumes_from: container:…`, `external_links`), or holding a variable (`links` included), is warned once (the install replaces that start-first service stop-first if it is its), but a start-first service's own `network_mode: container:…`, refused above; its own `network_mode` from a variable is warned (stop-first if it resolves to `service:…` or `container:…`, or to a network of its own while it publishes ports, an L4 route's on Docker included; without `update_socket`, the app's to share its ports if `host`), and spares it the `ports:` refusal and the Docker L4 warning |
+| `front` | optional: absent or empty, the project has no front (see "A project without a front"). `tls_modes` (`acme`, `dns-cloudflare`, `byo`, `internal`, `none`), `routes[]` (`name`, `domain_input`, `path` (optional: the prefix the route serves on its domain — `/idp` serves `/idp` and what is under it, kept in the request the upstream gets; `/`, then segments of letters, digits, `.`, `_`, `~` or `-`, no `.` or `..` segment, no trailing `/`, no wildcard, matched whatever its case; without one, every path another route of the domain does not serve), `upstream: <service>:<port>`, `strip_headers`, where a trailing `*` matches a prefix; `forward_auth`: `address_input` (required), `uri_input`, `copy_headers` (header names); `allow_input`; `client_auth` (`true`: the route requires a client certificate the install's `--client-ca` issued; refused when the project offers no TLS mode, `none` alone, as the route would refuse everyone — see the installer's front); `basic_auth`: `user` and `secret`, a login the front asks for (the key of a spec secret without `rotation` or of a `secret: true` input; not beside `forward_auth`) — see the installer's front), `portal`, `loopback_ports` and `loopback_env` (only when `tls_modes` offers `none`), `publish_ca` (`volume`: a volume the compose file declares; refused when the project offers neither `internal` nor `byo`), `http_port` and `https_port` (the host ports a TLS front publishes unless an install's `--http-port` / `--https-port` move them; absent or 0 is 80 and 443; they must differ, and, where a TLS mode is offered, `https_port` is not 80, the front's plain HTTP port in its container). `interface`: a `host.interfaces` role the VM's firewall opens the front's ports on alone (none: every interface; an undeclared one is an error; without a `kairos` shape, a warning: a Docker host's firewall is its operator's). Route names must give distinct `STOWAGE_URL_` variables; routes sharing a `domain_input` differ by their `path` (two without one, or with the same one, are an error), and a route with `client_auth` has its `domain_input` alone (a client certificate is asked for a whole domain). An input `forward_auth` or `allow_input` names must be an input of the `docker` shape and, with a `kairos` shape, of that one too, and neither `required` (empty is how the front leaves it off) nor asked in one mode only (`when`); an `allow_input` input is not `advanced` (never asked, it would refuse everyone). Lint counts these inputs, and a `basic_auth` input, as read |
 | `l4` | `routes[]`: host ports published to a service as they are, beside the front and never through it — `name` (1 to 15 lowercase letters, digits or `-`, starting with a letter, no `-` at its end or beside another, as a chart names a Service port after it; neither another L4 route's nor a front route's name), `protocol` (`tcp` or `udp`), `port` (the host port, 1–65535; one route per protocol and port), `upstream: <service>:<port>` (a compose service; with a `kairos` shape its port is the route's, as the VM runs the service on the host's network, where nothing maps one port to another, and the service declares no `networks:` (its `extends` base's included) and runs one container — see "L4 routes" under the installer), `address_input` (optional: an input, not `secret`, holding the host name or address clients dial — a lowercase host name whose last label is not all digits, or an IP address; no port, scheme or zone. It is checked when given, and lint checks its `default`; the install records the route's endpoint `STOWAGE_L4_<ROUTE>` from it, and lint counts it as read), `allow_input` (optional: an input holding the source addresses and CIDRs, separated by commas or spaces, the VM's firewall lets reach the port — empty refuses every source; checked when given. Only the VM enforces it, so without a `kairos` shape it is a warning (the route is open to every source), and its input is asked on that shape alone (`shapes: [kairos]`: a Docker host's firewall is the operator's), is neither `secret` (the firewall's rules show it) nor `advanced` (never asked, it would refuse every source) nor asked in one mode only (`when`); lint counts it as read), `bind_input` (optional: an input holding the host address the route's port is published on, every address while it is empty; on the VM, the address the firewall accepts the port on — `advanced`, as only a host serving several installs sets it, and not `secret` (the published ports show it); checked as an IP address without a zone when given; lint counts it as read), `interface` (optional: a `host.interfaces` role the VM's firewall opens the route's port on alone, `iifname`; an undeclared one is an error; without a `kairos` shape, a warning). With a `kubernetes` shape, a chart whose templates never read `.Values.stowage.l4` is warned. Over TCP a route's port may not be one the front publishes by default: `front.http_port` / `https_port` (80 and 443) in a TLS mode, a route's `loopback_ports` in loopback mode, and 80 and 443 while `acme` is offered (its challenges need them). The same port over UDP is free. See "L4 routes" under the installer |
 | `health` | `http-json` (`service`, `port`, `path`, `liveness_path`, `expect`: the JSON fields a ready answer carries), `http-status` (the same, `expect` a 200–399 status, default 200), `command` (`image`, `cmd`, `timeout_s`). The VM's health gate and `<short>-stow health` run it; the Docker installer waits on the compose healthchecks (`up --wait`), then judges a stack `--wait` refused by each service's state (every one running, healthy when it has a healthcheck, or exited 0) |
 | `database` | optional (see "A project without a database" above); given, `engine` (`postgres` only), `service`, `name`, `roles.migrate`, `roles.app` (all required; one role twice is allowed), `schema_compat` (`sql`, `command`, `none`; `sql`'s `baseline`, an integer ≥ 0 where absent or 0 means 1 (every other provider is at 1), is the schema epoch the release's migrations start from: see the upgrade notes on schema baselines) |
@@ -1544,7 +1570,10 @@ again, to copy an installer to another host.
   later release dropped), elsewhere from `--registry` (a mirror, `--registry-ca` its CA) or this
   installer's registry, with this installer's keys. A directory holding an install whose record
   does not read is refused. The SBOMs of every image, the installer, the
-  OS bundle and each disk (`disk-<format>`) are read as attested by a trusted key.
+  OS bundle and each disk (`disk-<format>`) are read as attested by a trusted key; an OS bundle
+  or a disk a mirror (`--registry`, or the one the install pulls from) does not hold (exported
+  without the `kairos` shape, or with `--disks` naming other formats) is left out, logged as `<artifact> <digest> is not in <prefix>
+  (…): not read`.
 - `sbom export DIR` writes each artifact's SBOM, verified, as `DIR/<artifact>.spdx.json` and
   `DIR/index.json` (`{project, version, revision, channel, tag, format: "spdx-2.3+json",
   artifacts: [{name, digest, file, error}]}`), for the operator's own tools (Dependency-Track,
@@ -1888,8 +1917,11 @@ again, to copy an installer to another host.
   before anything changes (no dump, no pull), saying the install moves to that release only by a
   fresh install; `rollback` — and so the VM's boot going back and its health gate, which then
   keeps the boot — refuses a previous release at another baseline, decided from the two releases'
-  specs before any image is pulled. A baseline that does not read (a spec this Stowage's decoder
-  refuses) is logged and not checked, like the rest of the schema check. On Kubernetes the
+  specs before any image is pulled. A baseline that does not read is logged and not checked, like
+  the rest of the schema check, and so is the baseline of a release whose spec is not this
+  Stowage's format (it does not decode strictly: another Stowage moved a key), which is never
+  read otherwise (`the schema baseline of <name> <v> is not known (<name> <v> (revision <r>),
+  built by Stowage <s>, carries a spec this one does not read: …): not checked`). On Kubernetes the
   baseline of the release a helm release runs is read from that release's installer (its spec
   travels in it), fetched by the tag the release records from the registry it was installed from
   and checked against this installer's keys (an installer carrying none checks no signature, as
@@ -1897,9 +1929,34 @@ again, to copy an installer to another host.
   `k8s reset-db --new-baseline`, run by the new release's installer, is the way across (it wipes
   the data). One that cannot be read is logged and not checked by `upgrade`. On the VM an upgrade is decided at the boot that follows the OS write:
   the boot keeps the install on its release and the health gate falls back to the passive system.
+- **Across Stowage versions.** The installer an install keeps is identified by its release
+  manifest alone, whichever Stowage built it; its spec is read only when this Stowage reads the
+  payload as its own (none is read leniently or migrated). A payload this Stowage refuses is put
+  to that installer itself (`<short>-stow --help`, which reads its own payload before anything
+  else, its output discarded, given 30 s), once its manifest names the release expected: one it
+  reads is another Stowage's format; one that does not answer in time stops as below (`…, and
+  whether that installer reads it is not known (it did not answer within 30s)`); one it does
+  not read either (a spec cut short, another project's) stops `upgrade`, `rollback` and `audit` before
+  anything changes (`the previous release's installer: payload …, nor does that installer read
+  it (…)`, or `<short>-stow is not the installer of …`): running that release's installer again
+  keeps a sound copy. Such an installer carrying no key where this Stowage looks is not taken as
+  carrying none: `upgrade --version` and `audit` refuse (`the keys the install trusts cannot be
+  told; run its own installer`) rather than trust this installer's keys. So an install of a release whose spec an
+  older Stowage wrote in another format (a key moved since) upgrades to one this Stowage built,
+  and what only that spec tells is not checked: its schema baseline, the inputs and provision hook
+  returns it had that the new release drops, which are kept (`the inputs and provision hook
+  returns <name> <v> removes are not known (…): kept`), and, going back, whether it reads a
+  newer schema (`going back unchecked: whether <v> reads the newer schema <s> is not known:
+  another Stowage built it`). The rollback barriers, the current release's own, still refuse.
 - `rollback`, run by the installer the install keeps, goes back to `.stowage-prev/`: the previous
   compose files, installer, version and images; every other value stays as it is now
-  (a secret the upgrade added is kept for the next upgrade). The release it leaves is kept in
+  (a secret the upgrade added is kept for the next upgrade). The previous release is then started
+  by its own installer (`starting <name> <v> (revision <r>) with its own installer: …`): on Docker
+  a re-run of it (`<short>-stow --dir <dir> --no-input --no-provision`, and `--offline` for an
+  install that runs loaded images), on the VM its `boot` (which runs the provision hook, as every
+  boot of the VM does); a release is always started by the
+  Stowage that built it. Should that start fail (another run holding the install meanwhile), the
+  install already records the previous release: running its installer again starts it. The release it leaves is kept in
   `.stowage-failed/`. Like an upgrade it switches `.env` before the installer, and keeps
   `.stowage-prev/` until the end: a rollback that stopped is finished by running it again (so is
   an upgrade that stopped before it switched `.env`: the kept release's compose files, installer
@@ -1993,11 +2050,11 @@ again, to copy an installer to another host.
     client while the stack's IPv6 is off (no `--ipv6`): Docker's userland proxy hands it to the
     front as the gateway of the stack's network. On a host with a global IPv6 address, an
     install, re-run or upgrade with IPv6 off warns, once the stack is up, of each list holding
-    that gateway, read from the stack's default network (`warning: route R: K=… holds the stack
+    that gateway, read from the stack's default network (`warning: route R: K=…: S holds the stack
     network's gateway G, as which every IPv6 client passes …: install --ipv6, or list narrower
-    sources`); when the gateway cannot be read, of each list overlapping Docker's default pools,
-    `172.16.0.0/12` or `192.168.0.0/16` (`… holds an address of Docker's default pools, as
-    which …`).
+    sources`, S the list's source that holds it); when the gateway cannot be read, of each list
+    overlapping Docker's default pools, `172.16.0.0/12` or `192.168.0.0/16` (`…: S holds an
+    address of Docker's default pools, as which …`).
   - `basic_auth: { user, secret }`: the client logs in, as the user named (1 to 64 letters,
     digits, `.`, `_` or `-`) with the password the key `secret` names holds — a spec `secrets:`
     key (one with `rotation` is refused: the front holds one password) or a `secret: true`
@@ -2052,12 +2109,17 @@ again, to copy an installer to another host.
   certificate (client_auth)`). On Kubernetes the chart's ingress serves the routes: Stowage asks
   for no client certificate there.
 - In a TLS mode each route's domain is an alias of the front on the stack's default network
-  (`stowage-front.yaml`'s `networks.default.aliases`): a service calling a route by its public
-  name, as its clients do (an identity provider's issuer URL), reaches the front. Not with
-  `acme` on a moved `--https-port`: the routes' URLs name 443, which the operator forwards to
-  the front's port, and the call goes out through that forward.
+  (`stowage-front.yaml`'s `networks.default.aliases`), whatever the front's ports: a service
+  calling a route by its URL, as its clients do (an identity provider's issuer URL), reaches the
+  front, on 443 in its container or on the URL's moved port, which it serves too. On the VM an L4
+  route's service, on the host's network where that alias is not, maps each route's domain to
+  `127.0.0.1` instead (`extra_hosts: <domain>:127.0.0.1`), where the front publishes its ports;
+  with `acme` on a moved `--https-port` its URLs name 443, which nothing on the VM holds, so it
+  reaches a route by name only through the operator's forward.
 - Loopback mode (`none`, the default when the project offers it and no domain is given): each
-  route on its own port of a 127.x address, plain HTTP; `loopback_env` relaxes safe defaults.
+  route on its own port of a 127.x address, plain HTTP, a route with a `path` serving its prefix
+  alone there (another path answers 404), its URL `http://<address>:<port><path>`;
+  `loopback_env` relaxes safe defaults.
 - L4 routes (`l4.routes`): in every mode, loopback included, each route's host port is published
   on every address to its upstream, over its protocol, in the front's compose file
   (`stowage-front.yaml`; compose adds it to the service's own); the front never sees that traffic.
@@ -2131,16 +2193,35 @@ again, to copy an installer to another host.
   (compose prefers the environment). A run that turns a profile off removes its services'
   containers before the stack comes up (`docker compose --profile <each> rm --stop --force
   <services>`: `up` would leave them running).
-- TLS mode: each route on its own domain over HTTPS, only the HTTP and HTTPS ports published (80
+- TLS mode: each route on its domain over HTTPS, only the HTTP and HTTPS ports published (80
   and 443 on every address, HTTP/1.1 and HTTP/2; `--http-port` / `--https-port` move them: with
   `acme` the public ports stay 80 and 443, forwarded to them, otherwise the moved HTTPS port is the
-  public one, in the URLs and the redirect from plain HTTP). Given values are checked before the
+  public one, in the URLs and the redirect from plain HTTP; `--https-port 80` is refused, 80
+  being the front's plain HTTP in its container). An upgrade writes each route's URL again from
+  the release's routes: its domain input's recorded value, the recorded port and its path (in
+  loopback mode the recorded address and port, with its path); it refuses a release whose route
+  takes its domain from an input the install does not record, or records empty, and one whose
+  routes clash on the recorded domains, naming the re-run that gives them (`<ctl> --dir <dir>`). `vm create` refuses these ports
+  (an L4 route's, and 22, the VM's SSH, included) before its form, and the domains after it, as the VM's install would,
+  before anything is written. The front listens on 80 and 443 in
+  its container whatever the host ports (`stowage-front.yaml` publishes `${STOWAGE_HTTP_PORT}:80`
+  and `${STOWAGE_HTTPS_PORT}:443`), and with a moved public HTTPS port it also serves each domain
+  on that port (the site `<domain>, <domain>:<port>`), for the stack's services that dial a
+  route's URL. The routes of one domain are one site: each route with a `path` serves its prefix
+  (the path itself and what is under it; the longest first), the route without one every other
+  path, and without such a route another path answers 404 (paths match whatever their case, so
+  two differing by case alone are one path). Each route's URL is
+  `https://<domain>[:<port>]<path>` (`STOWAGE_URL_<ROUTE>`). Two routes given one domain (two
+  inputs of one value) are refused when they serve the same path, at an install, a re-run and an
+  upgrade, and so is a route with `client_auth` given a domain another route has (rendered all
+  the same, it answers 403 to everyone) (`<route> asks for a client certificate on
+  <domain>, which <route> has too: a certificate is asked for a whole domain`). Given values are checked before the
   form opens. `--domains`, `--set` and `--answers` give a domain; an exported variable alone picks TLS only
   for a project that offers no loopback mode, and on a terminal it is asked, as the default, never
   recorded unseen. `--cert` picks `byo`; a `byo` install refuses a directory already holding a
   `tls/`, and a mismatched certificate and key re-open their form, saying why. A route's domain is its `domain_input`, an input like any other
   (`--domains route=host` is the shorthand); giving one picks TLS: `acme`, or the project's
-  first HTTPS mode when it does not offer `acme`, unless `--tls` says otherwise. Domains are lowercase DNS names, one per route. Safe defaults stay safe. One
+  first HTTPS mode when it does not offer `acme`, unless `--tls` says otherwise. Domains are lowercase DNS names, one per `domain_input` (asked once for the routes sharing it; `--domains` giving those routes two values is refused). Safe defaults stay safe. One
   certificate source per mode, never a fallback: `acme` (Let's Encrypt alone, HTTP-01 or
   TLS-ALPN, so ports 80 and 443 must reach the host — with moved ports, a run says to forward
   them, and that IPv6 forwards no port: a domain whose AAAA record names the host is reached on
@@ -2246,8 +2327,13 @@ which stays the host's: the same host gives the same sets at every start and eve
 with fewer cores beside CPU 0's than the services ask fails the start (`services.*.cpus: <services>
 ask N whole cores, and this host has M beside the one of CPU 0, which stays the host's`). With
 `irq: off` (the default) `tune` keeps the NICs' interrupts and their receive steering (RPS) off
-those cores: `--apply` and the VM's boot spread the interrupts and set `rps_cpus` over the other
-CPUs alone (all of them when none is left), and where `irqbalance` runs, `tune` advises
+those cores: `--apply` and the VM's boot write every NIC interrupt's affinity, on any profile,
+one to a CPU in turn over the other CPUs alone (all of them when none is left), wherever the
+kernel spread it, and the network profile sets `rps_cpus` over them; `--check` reports an
+interrupt whose affinity (its effective one, else the one asked) reaches those cores as a
+difference (`<nic> interrupts: N of M on the services' cores (IRQ …)`; an interrupt the kernel
+manages refuses the move, which `--apply` notes; one whose CPUs do not read is advice), and where
+`irqbalance` runs, `tune` advises
 `IRQBALANCE_BANNED_CPULIST=<their CPUs>` in its environment file (`/etc/default/irqbalance`, or
 `/etc/sysconfig/irqbalance` where the RHEL family's is alone), `ok` once irqbalance bans each of
 them, as it reads its environment: the running daemon's own (`/proc/<pid>/environ`), else the
@@ -2308,7 +2394,15 @@ until the old one stops, so the old one drains on SIGTERM (no new request, those
 answered), and the front tries a request it could not deliver again; on the host's network, both listen on one port with `SO_REUSEPORT`, or the old one
 hands its listening sockets to the new over a Unix socket in `update_socket`, a volume of the
 service's own (`<project>_stowage-update-<service>`, Docker's: made from the image's directory
-at its first mount, kept between starts). The start replaces it stop-first, logging why
+at its first mount, kept between starts). A server whose old process sends its listeners only
+once told to go names that signal in `update_signal`: the new container is started without
+waiting (`docker compose up --detach --no-deps --no-recreate --scale <service>=2`), and once it
+runs the old one is sent the signal (`docker kill --signal <signal>`; `services.<name>: the new
+container runs: <signal> sent to the old one (update_signal)`); the overlap then reads the new
+one's health until it is healthy (or, without a healthcheck, at once), and stops the old one as
+above (one that ended on its own after the handoff is removed). A new container that stops
+running or turns unhealthy fails the start as above, its message saying the old one was sent the
+signal and serves on as far as the app keeps serving after it. The start replaces it stop-first, logging why
 (`services.<name>.update: <why>, so this start replaces it stop-first`), when the stack it runs
 publishes the service's ports from its own network (an L4 route's upstream on Docker), gives it a
 fixed name or address (`mac_address`, a network's `ipv4_address`, `ipv6_address` or `mac_address`), runs it in another's network namespace, has another service join its namespaces or mount its volumes (`network_mode`, `pid` or `ipc: service:<name>` or `container:<project>-<name>-<n>`, `volumes_from: [<name>]`, `[service:<name>]` or its container, `links: [<name>[:alias]]`, `external_links: [<its container>[:alias]]`, its container named `<project>-<name>-<n>` or `<project>_<name>_<n>`, written or from a variable), or has a container of the engine, running or not, the stack's or not, join its container by ID (a prefix of it no container is named, too) or name, mount its volumes or link to it (`links:`, on any network), as the engine records them, or mounts a new volume that awaits its `uid` (the containers are then made first), and
@@ -2448,8 +2542,9 @@ with `tune` and neither a `docker` nor a `kairos` shape.
   gives is left out of the profile's ring sizing; an `ethtool -L` an Intel E810 refuses while its
   RDMA driver holds the port is noted with what frees it: `host.modules { irdma: { block: true } }`);
   on a Docker host, `advice` naming networkd's settings and the ethtool commands that give a NIC
-  of this host the role's. And under `services.<name>.cpus` (`irq: off`), the NICs' interrupts and
-  RPS steer off those cores, and a running `irqbalance` is `advice` (`IRQBALANCE_BANNED_CPULIST=…`).
+  of this host the role's. And under `services.<name>.cpus` (`irq: off`), on any profile, the NICs'
+  interrupts (and, with the network profile, RPS) steer off those cores (an interrupt that reaches one is `differs`), and a
+  running `irqbalance` is `advice` (`IRQBALANCE_BANNED_CPULIST=…`).
   And on a Docker host each service's nftables table is `advice` (`nftables table inet <name>`),
   which `--print` prints after the files, never written. `--print` prints the files `--apply` writes,
   for a host configured by other means. `--apply` (root) prints what it writes, asks (`--yes`
@@ -3027,8 +3122,11 @@ in the same installer (bootstrap it as above, then `sh <name>.sh vm create …`,
 ```
 
 - A project whose front offers no mode a VM can take (only `none` and `byo`) is refused first.
-- The platform decides the disk format (the first of its formats the release publishes) and how
-  the cloud-config reaches the VM. Only the platforms the release has a disk for are offered:
+- The platform decides the disk format (the first of its formats the registry holds: a mirror
+  carries the formats its `mirror export --disks` named) and how the cloud-config reaches the VM.
+  Only the platforms the registry has a disk for are offered; a `--platform` whose formats the
+  release publishes but the registry lacks is refused with `--platform P: the <format> disk
+  <digest> is not in <prefix> (…)` and the platforms it does offer:
 
   | `--platform` | disk | cloud-config |
   |---|---|---|

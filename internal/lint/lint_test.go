@@ -111,7 +111,16 @@ func TestEachRuleFires(t *testing.T) {
 		{"missing input", []edit{{specFile, "inputs: [web/]", "inputs: [nope/]"}}, nil, "nope/"},
 		{"route upstream not a service", []edit{{specFile, "upstream: web:8080", "upstream: www:8080"}}, nil, `service "www"`},
 		{"portal names no route", []edit{{specFile, "portal: app", "portal: home"}}, nil, "names no route"},
-		{"duplicate domain", []edit{{specFile, "domain_input: API_DOMAIN", "domain_input: APP_DOMAIN"}}, nil, "routing is by hostname"},
+		{"duplicate domain", []edit{{specFile, "domain_input: API_DOMAIN", "domain_input: APP_DOMAIN"}}, nil, "front.routes[1].domain_input: app serves every path of APP_DOMAIN already: routes of one domain differ by their path"},
+		{"duplicate path", []edit{{specFile, "domain_input: API_DOMAIN,", "domain_input: APP_DOMAIN, path: /api,"}, {specFile, "domain_input: APP_DOMAIN, upstream: web:8080", "domain_input: APP_DOMAIN, path: /api, upstream: web:8080"}}, nil, "front.routes[1].path: app serves /api of APP_DOMAIN already"},
+		{"paths of one case", []edit{{specFile, "domain_input: API_DOMAIN,", "domain_input: APP_DOMAIN, path: /API,"}, {specFile, "domain_input: APP_DOMAIN, upstream: web:8080", "domain_input: APP_DOMAIN, path: /api, upstream: web:8080"}}, nil, "front.routes[1].path: app serves /API of APP_DOMAIN already"},
+		{"https on 80", []edit{{specFile, "loopback_ports:", "http_port: 8080\n  https_port: 80\n  loopback_ports:"}}, nil, "front.https_port: 80 is the front's plain HTTP port in its container"},
+		{"path not absolute", []edit{{specFile, "domain_input: API_DOMAIN,", "domain_input: APP_DOMAIN, path: api,"}}, nil, `front.routes[1].path: "api" is not a path prefix`},
+		{"path trailing slash", []edit{{specFile, "domain_input: API_DOMAIN,", "domain_input: APP_DOMAIN, path: /api/,"}}, nil, `"/api/" is not a path prefix`},
+		{"path root", []edit{{specFile, "domain_input: API_DOMAIN,", "domain_input: APP_DOMAIN, path: /,"}}, nil, `"/" is not a path prefix`},
+		{"path wildcard", []edit{{specFile, "domain_input: API_DOMAIN,", "domain_input: APP_DOMAIN, path: /api*,"}}, nil, `"/api*" is not a path prefix`},
+		{"path dot segment", []edit{{specFile, "domain_input: API_DOMAIN,", "domain_input: APP_DOMAIN, path: /api/..,"}}, nil, `"/api/.." is not a path prefix`},
+		{"client_auth on a shared domain", []edit{{specFile, "domain_input: API_DOMAIN,", "domain_input: APP_DOMAIN, path: /api, client_auth: true,"}}, nil, "front.routes[1].client_auth: APP_DOMAIN is shared with another route"},
 		{"unknown tls mode", []edit{{specFile, "tls_modes: [acme, byo, internal, none]", "tls_modes: [acme, letsencrypt]"}}, nil, "unknown mode"},
 		{"health service missing", []edit{{specFile, "  service: api\n  port: 8000", "  service: backend\n  port: 8000"}}, nil, `service "backend"`},
 		{"health bad path", []edit{{specFile, "path: /healthz/ready", "path: healthz"}}, nil, "must start with /"},
@@ -171,6 +180,11 @@ func TestEachRuleFiresOnFull(t *testing.T) {
 		want  string
 	}{
 		{"absolute path", []edit{{sp, "compose: deploy/compose.yaml", "compose: /etc/compose.yaml"}}, nil, "must be relative to the project root"},
+		{"add_hosts name", []edit{{sp, "packages.atlas.test: 192.0.2.10", "Packages.atlas.test: 192.0.2.10"}}, nil, `images.api.add_hosts: "Packages.atlas.test" is not a host name`},
+		{"add_hosts address", []edit{{sp, "packages.atlas.test: 192.0.2.10", "packages.atlas.test: 192.0.2"}}, nil, `images.api.add_hosts.packages.atlas.test: "192.0.2" is not an IP address without a zone`},
+		{"add_hosts zone", []edit{{sp, "packages.atlas.test: 192.0.2.10", "packages.atlas.test: fe80::1%eth0"}}, nil, `"fe80::1%eth0" is not an IP address without a zone`},
+		{"build network", []edit{{sp, "    network: default\n", "    network: bridge\n"}}, nil, `images.api.network: "bridge" is not a build network: default, host, none`},
+		{"build keys with ref", []edit{{sp, "postgres:  { ref: ", "postgres:  { network: none, ref: "}}, nil, "images.postgres: ref and build fields are exclusive"},
 		{"memory share of 0", []edit{{sp, memShares, "services:\n  postgres: { memory: 0 }\n"}}, nil, "services.postgres.memory: 0: a percent of the host's RAM, from 1 to 90"},
 		{"memory share over 90", []edit{{sp, memShares, "services:\n  postgres: { memory: 91 }\n"}}, nil, "services.postgres.memory: 91: a percent of the host's RAM, from 1 to 90"},
 		{"memory shares over 90", []edit{{sp, memShares, "services:\n  postgres: { memory: 60 }\n  api: { memory: 31 }\n"}}, nil, "services: the memory shares total 91 %: at most 90"},
@@ -244,14 +258,16 @@ func TestEachRuleFiresOnFull(t *testing.T) {
 		{"k8s schema image", []edit{{sp, "schema: { url_env: DATABASE_URL, image: postgres }", "schema: { url_env: DATABASE_URL, image: psql }"}}, nil, `shapes.kubernetes.schema.image: "psql" is not an images key`},
 		{"signing without public keys", []edit{{sp, "  public_keys: [keys/release-2026.pub]\n", ""}}, nil, "public_keys is required"},
 		{"loopback env not a safe default", []edit{{sp, `loopback_env: { COOKIE_SECURE: "false",`, `loopback_env: { DEBUG: "1", COOKIE_SECURE: "false",`}}, nil, "front.loopback_env.DEBUG: is not a safe_defaults key"},
-		{"route without loopback port", []edit{{sp, "loopback_ports: { console: 3000, api: 9090, ingest: 8080, ops: 9091 }", "loopback_ports: { console: 3000, api: 9090, ops: 9091 }"}}, nil, "route ingest has no port"},
-		{"duplicate loopback port", []edit{{sp, "ops: 9091 }", "ops: 9090 }"}}, nil, "is already api's port"},
+		{"route without loopback port", []edit{{sp, "loopback_ports: { console: 3000, api: 9090, ingest: 8080, ops: 9091, status: 9092 }", "loopback_ports: { console: 3000, api: 9090, ops: 9091 }"}}, nil, "route ingest has no port"},
+		{"loopback ports without none", []edit{{sp, "tls_modes: [acme, dns-cloudflare, byo, internal, none]", "tls_modes: [acme, dns-cloudflare, byo, internal]"}}, nil, "front.loopback_ports: tls_modes does not offer none"},
+		{"loopback env without none", []edit{{sp, "tls_modes: [acme, dns-cloudflare, byo, internal, none]", "tls_modes: [acme, dns-cloudflare, byo, internal]"}}, nil, "front.loopback_env: tls_modes does not offer none"},
+		{"duplicate loopback port", []edit{{sp, "status: 9092 }", "status: 9090 }"}}, nil, "is already api's port"},
 		{"reserved service name", nil, map[string]string{cp: "services:\n  stowage-front:\n    image: ${STOWAGE_IMAGE_API}\n"}, "names starting stowage- are Stowage's own"},
 		{"reserved volume name", nil, map[string]string{cp: "services:\n  api:\n    image: ${STOWAGE_IMAGE_API}\nvolumes:\n  stowage-front-data: {}\n"}, "volumes.stowage-front-data: names starting stowage- are Stowage's own"},
 		{"compose variable claimed", []edit{{sp, "  COOKIE_SECURE: \"true\"\n", "  COOKIE_SECURE: \"true\"\n  COMPOSE_PROFILES: \"x\"\n"}}, nil, "COMPOSE_PROFILES: the COMPOSE_ prefix is reserved"},
 		{"process variable claimed", []edit{{sp, "  COOKIE_SECURE: \"true\"\n", "  COOKIE_SECURE: \"true\"\n  HOME: \"/\"\n"}}, nil, "HOME: the Docker client reads it"},
 		{"unrecordable loopback value", []edit{{sp, `loopback_env: { COOKIE_SECURE: "false"`, `loopback_env: { COOKIE_SECURE: "it's false"`}}, nil, "front.loopback_env.COOKIE_SECURE: a value cannot hold a single quote"},
-		{"routes sharing a variable", []edit{{sp, "- name: api", "- name: in_gest"}, {sp, "- name: ingest", "- name: in-gest"}, {sp, "loopback_ports: { console: 3000, api: 9090, ingest: 8080, ops: 9091 }", "loopback_ports: { console: 3000, in_gest: 9090, in-gest: 8080, ops: 9091 }"}}, nil, `"in_gest" and "in-gest" both give STOWAGE_URL_IN_GEST`},
+		{"routes sharing a variable", []edit{{sp, "- name: api", "- name: in_gest"}, {sp, "- name: ingest", "- name: in-gest"}, {sp, "loopback_ports: { console: 3000, api: 9090, ingest: 8080, ops: 9091, status: 9092 }", "loopback_ports: { console: 3000, in_gest: 9090, in-gest: 8080, ops: 9091 }"}}, nil, `"in_gest" and "in-gest" both give STOWAGE_URL_IN_GEST`},
 		{"url of no route", []edit{{cp, "${STOWAGE_URL_INGEST}", "${STOWAGE_URL_INGRESS}"}}, nil, "STOWAGE_URL_INGRESS names no front route"},
 		{"public key missing", []edit{{sp, "public_keys: [keys/release-2026.pub]", "public_keys: [keys/nope.pub]"}}, nil, "signing.public_keys[0]: keys/nope.pub"},
 		{"public key not PEM", nil, map[string]string{"keys/release-2026.pub": "ssh-ed25519 AAAA\n"}, "is not a PEM public key"},
@@ -287,8 +303,8 @@ func TestEachRuleFiresOnFull(t *testing.T) {
 		{"bad domain input", []edit{{sp, "domain_input: INGEST_DOMAIN", "domain_input: ingest-domain"}}, nil, "not an environment variable name"},
 		{"bad upstream", []edit{{sp, "upstream: ingest:8080", "upstream: ingest"}}, nil, "must be <service>:<port>"},
 		{"bad header", []edit{{sp, "strip_headers: [X-Auth-Request-*, X-Atlas-Tenant]\n    - name: api", "strip_headers: [\"X Bad\"]\n    - name: api"}}, nil, "not a header name"},
-		{"loopback names no route", []edit{{sp, "ops: 9091 }", "ops: 9091, admin: 8081 }"}}, nil, "loopback_ports.admin"},
-		{"loopback bad port", []edit{{sp, "ops: 9091 }", "ops: 80800 }"}}, nil, "80800 is not a TCP port"},
+		{"loopback names no route", []edit{{sp, "status: 9092 }", "status: 9092, admin: 8081 }"}}, nil, "loopback_ports.admin"},
+		{"loopback bad port", []edit{{sp, "status: 9092 }", "status: 80800 }"}}, nil, "80800 is not a TCP port"},
 		{"health unknown provider", []edit{{sp, "provider: http-json", "provider: grpc"}}, nil, "health: unknown provider"},
 		{"health no expect", []edit{{sp, "  expect: { status: ready }\n", ""}}, nil, "expect is required"},
 		{"health bad port", []edit{{sp, "  port: 9090\n  path: /ready", "  port: 0\n  path: /ready"}}, nil, "is not a TCP port"},
@@ -369,7 +385,7 @@ func TestEachRuleFiresOnFull(t *testing.T) {
 		{"backup volume twice", []edit{{sp, "volumes: [spool] ", "volumes: [spool, spool] "}}, nil, `backup: pg-age-rclone: volumes[1] "spool" is listed twice`},
 		{"published port on the VM", []edit{{cp, "    command: [atlas-server, echo, \"17007\"]\n", "    command: [atlas-server, echo, \"17007\"]\n    ports: [\"17008:17007\"]\n"}}, nil, "services.echo.ports: the VM's firewall opens only what Stowage publishes"},
 		{"profile on kubernetes only", []edit{{sp, "profile: relay, shapes: [docker, kairos]", "profile: relay, shapes: [kubernetes]"}}, nil, "this input is asked on neither"},
-		{"endpoint no route", []edit{{sp, "endpoint: api\n", "endpoint: admin\n"}}, nil, `endpoint: "admin" is not a route of front.routes (console, api, ingest, ops)`},
+		{"endpoint no route", []edit{{sp, "endpoint: api\n", "endpoint: admin\n"}}, nil, `endpoint: "admin" is not a route of front.routes (console, api, ingest, ops, status)`},
 		{"bad when", []edit{{sp, "when: tls,", "when: always,"}}, nil, "expected tls or loopback"},
 		{"bad shape", []edit{{sp, "shapes: [docker, kairos] }\n  - { key: ADMIN_EMAIL", "shapes: [docker, nomad] }\n  - { key: ADMIN_EMAIL"}}, nil, "unknown shape"},
 		{"unknown image var", []edit{{cp, "ATLAS_VERSION: ${STOWAGE_PROJECT_VERSION}", "ATLAS_VERSION: ${STOWAGE_IMAGE_TYPO}"}}, nil, "STOWAGE_IMAGE_TYPO names no image"},
@@ -440,10 +456,12 @@ func TestEachRuleFiresOnFull(t *testing.T) {
 		{"service address input unknown", []edit{{sp, "address_input: RELAY_ADDRESS }", "address_input: NOPE }"}}, nil, "services.relay.address_input: NOPE is not an input"},
 		{"service address default", []edit{{sp, `prompt: "Address the relay has of its own on the edge network (empty: none)", optional: true,`, `prompt: "Address the relay has of its own on the edge network (empty: none)", default: nowhere,`}}, nil, `services.relay.address_input: RELAY_ADDRESS's default "nowhere" is not an address`},
 		{"service on the host's network with an address", []edit{{"deploy/compose.yaml", "    profiles: [relay]\n", "    profiles: [relay]\n    network_mode: host\n"}}, nil, "services.relay.interface: relay runs with network_mode host"},
-		{"update order", []edit{{sp, "update: start-first, update_socket: /run/atlas/handoff", "update: rolling"}}, nil, `services.api.update: "rolling": stop-first (the default) or start-first`},
-		{"update socket without start-first", []edit{{sp, "update: start-first, update_socket:", "update_socket:"}}, nil, "services.api.update_socket: is the directory a start-first overlap hands its sockets over in"},
+		{"update order", []edit{{sp, "update: start-first,", "update: rolling,"}}, nil, `services.api.update: "rolling": stop-first (the default) or start-first`},
+		{"update socket without start-first", []edit{{sp, "update: start-first, update_signal: SIGUSR2, update_socket:", "update_socket:"}}, nil, "services.api.update_socket: is the directory a start-first overlap hands its sockets over in"},
 		{"update socket relative", []edit{{sp, "update_socket: /run/atlas/handoff", "update_socket: run/atlas"}}, nil, `services.api.update_socket: "run/atlas": a directory of the container`},
 		{"update socket /", []edit{{sp, "update_socket: /run/atlas/handoff", "update_socket: /"}}, nil, `services.api.update_socket: "/": a directory of the container`},
+		{"update signal without start-first", []edit{{sp, "update: start-first, update_signal: SIGUSR2", "update_signal: SIGUSR2"}}, nil, "services.api.update_signal: is what a start-first overlap sends the old container"},
+		{"update signal unknown", []edit{{sp, "update_signal: SIGUSR2", "update_signal: SIGKILL"}}, nil, `services.api.update_signal: "SIGKILL": one of SIGHUP, SIGINT, SIGQUIT, SIGTERM, SIGUSR1, SIGUSR2, SIGWINCH`},
 		{"start-first with an address", []edit{{sp, "address_input: RELAY_ADDRESS }", "address_input: RELAY_ADDRESS, update: start-first }"}}, nil, "services.relay.update: relay has an address of its own"},
 		{"start-first with a container name", []edit{{cp, "  api:\n    image: ${STOWAGE_IMAGE_API}\n", "  api:\n    container_name: atlas-api\n    image: ${STOWAGE_IMAGE_API}\n"}}, nil, "services.api.update: api sets container_name atlas-api"},
 		{"start-first with replicas", []edit{{cp, "  api:\n    image: ${STOWAGE_IMAGE_API}\n", "  api:\n    deploy: { replicas: 2 }\n    image: ${STOWAGE_IMAGE_API}\n"}}, nil, "services.api.update: api runs 2 containers"},
@@ -607,7 +625,7 @@ func TestRevisionLikeVersionRefused(t *testing.T) {
 // Findings come out in the same order on every run.
 func TestFindingsAreDeterministic(t *testing.T) {
 	root := testutil.CopyExample(t, "full")
-	testutil.Edit(t, root, specFile, "{ console: 3000, api: 9090, ingest: 8080, ops: 9091 }", "{ console: 0, api: 70000, ingest: 99999, ops: 9091, a: 1, b: 2 }")
+	testutil.Edit(t, root, specFile, "{ console: 3000, api: 9090, ingest: 8080, ops: 9091, status: 9092 }", "{ console: 0, api: 70000, ingest: 99999, ops: 9091, a: 1, b: 2 }")
 	first := run(t, root).Findings
 	for range 20 {
 		again := run(t, root).Findings
@@ -910,7 +928,7 @@ func TestStartFirstWarnings(t *testing.T) {
 		t.Fatalf("host network: %+v", res.Findings)
 	}
 	// With update_socket it is the app's handoff: no warning.
-	testutil.Edit(t, root, specFile, "update: start-first }", "update: start-first, update_socket: /run/atlas/handoff }")
+	testutil.Edit(t, root, specFile, "update_signal: SIGUSR2 }", "update_signal: SIGUSR2, update_socket: /run/atlas/handoff }")
 	if res := run(t, root); warned(res, "api runs on the host's network") {
 		t.Fatalf("host network with update_socket: %+v", res.Findings)
 	}
@@ -1230,6 +1248,47 @@ func TestALoginFromASecretInput(t *testing.T) {
 	testutil.Edit(t, root, specFile, "basic_auth: { user: ops, secret: OPS_PASSWORD }", "basic_auth: { user: ops, secret: SEARCH_KEY }")
 	if errs := errorsOf(run(t, root)); len(errs) > 0 {
 		t.Fatal(strings.Join(errs, "\n"))
+	}
+}
+
+// A project that does not offer none, the mode loopback serves, owes no loopback port.
+func TestNoLoopbackPortsWithoutNone(t *testing.T) {
+	t.Parallel()
+	root := testutil.CopyExample(t, "full")
+	testutil.Edit(t, root, specFile, "tls_modes: [acme, dns-cloudflare, byo, internal, none]", "tls_modes: [acme, dns-cloudflare, byo, internal]")
+	testutil.Edit(t, root, specFile, "  loopback_ports: { console: 3000, api: 9090, ingest: 8080, ops: 9091, status: 9092 }\n", "")
+	testutil.Edit(t, root, specFile, "  loopback_env: { COOKIE_SECURE: \"false\", TRUSTED_PROXY_HOPS: \"0\" }\n", "")
+	if errs := errorsOf(run(t, root)); len(errs) > 0 {
+		t.Fatal(strings.Join(errs, "\n"))
+	}
+}
+
+// https_port 80 is refused where a TLS front publishes it, and is nothing to a project offering
+// loopback alone.
+func TestHTTPSOn80OnlyWhereATLSFrontServes(t *testing.T) {
+	t.Parallel()
+	root := testutil.CopyExample(t, "minimal")
+	testutil.Edit(t, root, specFile, "  loopback_ports:", "  https_port: 80\n  loopback_ports:")
+	testutil.Edit(t, root, specFile, "tls_modes: [acme, byo, internal, none]", "tls_modes: [none]")
+	if errs := errorsOf(run(t, root)); len(errs) > 0 {
+		t.Fatal(strings.Join(errs, "\n"))
+	}
+}
+
+// A service waiting for a one-shot to complete is warned unless Compose restarts it when a re-run
+// makes the one-shot again (restart: true).
+func TestAOneShotsReaderRestarts(t *testing.T) {
+	t.Parallel()
+	const without, unknown = "services.ingest.depends_on.echo-check: waits for the one-shot echo-check without restart: true",
+		"services.ingest.depends_on.echo-check: restart: ${RESTART_DEPS:-true}, which only a run knows"
+	for restart, warning := range map[string]string{"": without, ", restart: false": without, ", restart: true": "", `, restart: "${RESTART_DEPS:-true}"`: unknown} {
+		root := testutil.CopyExample(t, "full")
+		testutil.Edit(t, root, "deploy/compose.yaml", "      - spool:/var/spool/atlas\n", "      - spool:/var/spool/atlas\n    depends_on:\n      echo-check: { condition: service_completed_successfully"+restart+" }\n")
+		res := run(t, root)
+		got := slices.ContainsFunc(res.Findings, func(f Finding) bool { return f.Severity == Warning && strings.Contains(f.String(), warning) })
+		if warning == "" && len(res.Findings) != 0 || warning != "" && (!got || len(res.Findings) != 1) {
+			t.Errorf("%q: %+v", restart, res.Findings)
+		}
 	}
 }
 
@@ -1584,7 +1643,7 @@ func FuzzCheckL4Bind(f *testing.F) {
 // memShares is examples/full's services block, which gives two services a memory share.
 const memShares = `services:                                                      # what a compose service asks of the host, beyond its compose file
   postgres: { memory: { percent: 25, max: 16G } }              # percent of the host's RAM, recomputed at each start, capped at 16 GiB
-  api: { memory: 10, update: start-first, update_socket: /run/atlas/handoff }  # its new container healthy beside the old before the old stops
+  api: { memory: 10, update: start-first, update_signal: SIGUSR2, update_socket: /run/atlas/handoff }  # its new container healthy beside the old before the old stops; the old one told to go once the new one runs
 `
 
 // servicesBlock is examples/full's whole services block: its memory shares, then the services' cores,

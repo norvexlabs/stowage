@@ -65,7 +65,8 @@ func (in *Installer) dockerEndpoint(env *EnvFile) string {
 }
 
 // k8sEndpoint is the URL the endpoint route is served at inside the cluster: the route's upstream
-// <service>:<port>, which the chart exposes as the Service <release>-<service> on that port. ""
+// <service>:<port>, which the chart exposes as the Service <release>-<service> on that port, and
+// its path (the upstream gets it, as through the front). ""
 // when the spec names no endpoint.
 func (in *Installer) k8sEndpoint() string {
 	s, k := in.R.Spec, in.O.K8s
@@ -77,7 +78,7 @@ func (in *Installer) k8sEndpoint() string {
 		if !ok {
 			return ""
 		}
-		return fmt.Sprintf("http://%s-%s.%s.svc:%s", k.Release, svc, k.Namespace, port)
+		return fmt.Sprintf("http://%s-%s.%s.svc:%s%s", k.Release, svc, k.Namespace, port, r.Path)
 	}
 	return ""
 }

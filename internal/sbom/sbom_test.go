@@ -145,7 +145,7 @@ func TestGenerate(t *testing.T) {
 		t.Fatalf("%s %v", doc, err)
 	}
 	args := strings.Join(f.runs[0], " ")
-	for _, want := range []string{"-e DOCKER_CONFIG=/config --mount type=bind,src=/cfg,dst=/config,readonly", "SYFT_REGISTRY_INSECURE_USE_HTTP=true", Syft + " registry:localhost:5000/a/b@sha256:1 --platform linux/amd64 --select-catalogers +sbom-cataloger -o spdx-json"} {
+	for _, want := range []string{"-e DOCKER_CONFIG=/config --mount type=bind,src=/cfg,dst=/config,readonly", "SYFT_REGISTRY_INSECURE_USE_HTTP=true", Syft + " registry:localhost:5000/a/b@sha256:1 --platform linux/amd64 --select-catalogers +sbom-cataloger,-linux-kernel-cataloger -o spdx-json"} {
 		if !strings.Contains(args, want) {
 			t.Errorf("lacks %q: %s", want, args)
 		}

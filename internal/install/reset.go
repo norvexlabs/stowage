@@ -154,7 +154,7 @@ func (in *Installer) Reset(ctx context.Context) error {
 	}
 	// Checked before the confirmation, which holds no lock, and again under the lock.
 	check := func(env *EnvFile) (string, error) {
-		if err := in.sameRelease(env); err != nil {
+		if err := in.sameRelease(ctx, env); err != nil {
 			return "", err
 		}
 		project, _ := env.Get("COMPOSE_PROJECT_NAME")

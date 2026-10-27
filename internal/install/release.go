@@ -4,11 +4,16 @@ package install
 
 import (
 	"bytes"
+	"cmp"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"os/exec"
 	"path"
 	"strings"
+	"time"
 
 	"github.com/norvexlabs/stowage/internal/front"
 	"github.com/norvexlabs/stowage/internal/lint"
@@ -48,7 +53,7 @@ func Load(files payload.Files) (*Release, error) {
 	dec := json.NewDecoder(bytes.NewReader(files[payload.Spec]))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&s); err != nil {
-		return nil, fmt.Errorf("payload %s: %w (an installer from a newer Stowage?)", payload.Spec, err)
+		return nil, fmt.Errorf("payload %s: %w (an installer of another Stowage?)", payload.Spec, err)
 	}
 	if s.Name != m.Name {
 		return nil, fmt.Errorf("payload: the spec is %q's, the release %q's", s.Name, m.Name)
@@ -56,11 +61,8 @@ func Load(files payload.Files) (*Release, error) {
 	if s.Short() != m.ShortName {
 		return nil, fmt.Errorf("payload: the spec's short name is %q, the release's %q", s.Short(), m.ShortName)
 	}
-	r := &Release{Manifest: m, Spec: &s, Compose: files[payload.Compose], Keys: map[string][]byte{}, Nftables: map[string][]byte{}}
+	r := &Release{Manifest: m, Spec: &s, Compose: files[payload.Compose], Keys: payloadKeys(files), Nftables: map[string][]byte{}}
 	for n, b := range files {
-		if strings.HasPrefix(n, payload.KeysDir) {
-			r.Keys[path.Base(n)] = b
-		}
 		if t, ok := strings.CutPrefix(n, payload.NftablesDir); ok {
 			name, nft := strings.CutSuffix(t, ".nft")
 			if svc, declared := s.Services[name]; !nft || !declared || svc.Nftables == "" {
@@ -123,6 +125,109 @@ func payloadRelease(files payload.Files) (*release.Manifest, error) {
 		return release.DecodeBundled(bundled)
 	}
 	return nil, fmt.Errorf("the installer's payload has no %s", payload.Release)
+}
+
+// payloadKeys are the trusted public keys an installer's payload carries, by file name.
+func payloadKeys(files payload.Files) map[string][]byte {
+	keys := map[string][]byte{}
+	for n, b := range files {
+		if strings.HasPrefix(n, payload.KeysDir) {
+			keys[path.Base(n)] = b
+		}
+	}
+	return keys
+}
+
+// keptRelease is the release an installer the install keeps carries (its own, or PrevDir's), read
+// as every Stowage writes one: its release manifest and its trusted keys. Release is nil when this
+// Stowage refuses its payload and that installer reads it (another Stowage's format: a key
+// moved, a check that differs), which this one never reads otherwise, so what only its spec
+// tells is that installer's own run's.
+type keptRelease struct {
+	Manifest *release.Manifest
+	Keys     map[string][]byte
+	Release  *Release
+	unread   error // why Release is nil
+}
+
+// readKept reads the installer at exe the install keeps, refusing it when its manifest is not the
+// release expect wants (nil: any), before anything else is read of it. A payload this Stowage
+// refuses is another Stowage's when that installer reads it itself (readsItself), and an error
+// otherwise: not as its Stowage wrote it, or not told.
+func (in *Installer) readKept(ctx context.Context, exe string, expect func(*release.Manifest) error) (*keptRelease, error) {
+	files, err := payload.Read(exe)
+	if err != nil {
+		return nil, err
+	}
+	m, err := payloadRelease(files)
+	if err != nil {
+		return nil, err
+	}
+	if expect != nil {
+		if err := expect(m); err != nil {
+			return nil, err
+		}
+	}
+	k := &keptRelease{Manifest: m, Keys: payloadKeys(files)}
+	if k.Release, err = Load(files); err == nil {
+		return k, nil
+	}
+	switch ierr := in.O.readsItself(ctx, exe); {
+	case ctx.Err() != nil:
+		return nil, ctx.Err()
+	case errors.Is(ierr, errProbeTimeout):
+		return nil, fmt.Errorf("%w, and whether that installer reads it is not known (%v)", err, ierr)
+	case ierr != nil:
+		return nil, fmt.Errorf("%w, nor does that installer read it (%v)", err, ierr)
+	}
+	k.unread = err
+	return k, nil
+}
+
+// errProbeTimeout is readsItself's installer that did not answer within readsItselfWithin.
+var errProbeTimeout = errors.New("it did not answer")
+
+// readsItselfWithin bounds readsItself: reading a payload and printing a help takes moments.
+var readsItselfWithin = 30 * time.Second
+
+// readsItself runs the installer at exe as far as reading its own payload, which every installer
+// does before anything else (its help printed, nothing run): nil when it reads it. A run stopped
+// meanwhile is its own error, never a verdict on the payload.
+func (o *Options) readsItself(ctx context.Context, exe string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if o.Exec != nil {
+		return o.Exec(ctx, exe, []string{"--help"})
+	}
+	pctx, cancel := context.WithTimeout(ctx, readsItselfWithin)
+	defer cancel()
+	stderr := &capped{limit: 4 << 10}
+	cmd := exec.CommandContext(pctx, exe, "--help")
+	cmd.Stdout, cmd.Stderr = io.Discard, stderr
+	cmd.WaitDelay = time.Second // a child left holding its output does not hold the bound
+	err := cmd.Run()
+	switch {
+	case ctx.Err() != nil:
+		return ctx.Err()
+	case pctx.Err() != nil:
+		return fmt.Errorf("%w within %s", errProbeTimeout, readsItselfWithin)
+	case err != nil:
+		if msg := strings.TrimSpace(stderr.buf.String()); msg != "" {
+			if stderr.over {
+				msg += " …"
+			}
+			return fmt.Errorf("%w: %s", err, msg)
+		}
+		return err
+	}
+	return nil
+}
+
+// foreign says why the kept release's spec is not read.
+func (k *keptRelease) foreign() string {
+	return fmt.Sprintf("%s %s (revision %d), built by Stowage %s, carries a spec this one does not read (its own installer does): %v",
+		k.Manifest.Name, k.Manifest.ProjectVersion, k.Manifest.Revision, cmp.Or(k.Manifest.StowageVersion, "of no recorded version"), k.unread)
 }
 
 // checkFront refuses to install a release of a project with a front that records no front image.

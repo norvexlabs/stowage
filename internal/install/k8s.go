@@ -1091,6 +1091,8 @@ func (in *Installer) k8sRunning(ctx context.Context, cur *deployed, prefix strin
 			in.O.logf("the fetched installer could not be removed: %v", err)
 		}
 	}()
+	// Read as this Stowage reads it: a release it cannot read is not known, whatever the reason
+	// (nothing here runs a fetched installer).
 	files, err := payload.Read(exe)
 	if err != nil {
 		return unknown(err)

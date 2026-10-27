@@ -26,6 +26,7 @@ import (
 	"github.com/google/go-containerregistry/pkg/v1/mutate"
 	"github.com/google/go-containerregistry/pkg/v1/random"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
+	"github.com/google/go-containerregistry/pkg/v1/types"
 
 	"github.com/norvexlabs/stowage/internal/backup"
 	"github.com/norvexlabs/stowage/internal/chown"
@@ -1206,6 +1207,50 @@ func TestASignedProjectSignsEveryArtifactBeforeItsTagMoves(t *testing.T) {
 	// The chart carries the trusted keys.
 	keys := chartValues(t, e.chartAt("stable", "0.1.0")).PublicKeys
 	eq(t, "public keys", len(keys) == 1 && keys[0] == readFile(t, e.root+"/keys/release.pub"), true)
+}
+
+// The scanner, a Docker v2 image upstream, is published with OCI media types (a registry need take
+// no Docker manifest): converted once, its layers and its config the upstream's, kept by a
+// re-ship and by a promotion.
+func TestTheScannerIsPublishedAsOCI(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	e.sign()
+	r := e.mustShip("stable", 1)
+	d := r.Manifest.Artifacts.Images[sbom.Key]
+	up, _ := pinnedDigest(e.scanner)
+	if d == "" || d == up.DigestStr() {
+		t.Fatalf("the scanner's digest %q, upstream %s", d, up.DigestStr())
+	}
+	ref, _ := e.reg.Digest(e.host+"/acme/notes/notes-"+sbom.Key, d)
+	img, err := e.reg.Image(context.Background(), ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, _ := img.Manifest()
+	if m.MediaType != types.OCIManifestSchema1 || m.Config.MediaType != types.OCIConfigJSON || len(m.Layers) == 0 || slices.ContainsFunc(m.Layers, func(l v1.Descriptor) bool { return l.MediaType != types.OCILayer }) {
+		t.Errorf("media types %+v", m)
+	}
+	upImg, _ := e.reg.Image(context.Background(), up)
+	if um, _ := upImg.Manifest(); um.MediaType != types.DockerManifestSchema2 {
+		t.Fatalf("upstream %s: not the Docker image this test converts", um.MediaType)
+	}
+	cf, _ := img.ConfigFile()
+	ucf, _ := upImg.ConfigFile()
+	if !slices.Equal(cf.RootFS.DiffIDs, ucf.RootFS.DiffIDs) || !slices.Equal(cf.Config.Entrypoint, ucf.Config.Entrypoint) || cf.Architecture != "amd64" {
+		t.Errorf("config %+v, upstream %+v", cf, ucf)
+	}
+	eq(t, "the scanner signed", e.signedRef("notes-"+sbom.Key, d), true)
+	eq(t, "conversions", strings.Count(e.log.String(), "image audit: convert "), 1)
+	e.mustShip("stable", 1)
+	eq(t, "a re-ship converts nothing", strings.Count(e.log.String(), "image audit: convert "), 1)
+	p, v := e.publisher()
+	st, err := p.Promote(context.Background(), v, "stable", "beta", 1)
+	if err != nil {
+		t.Fatalf("%v\n%s", err, e.log)
+	}
+	eq(t, "the promoted scanner", st.Manifest.Artifacts.Images[sbom.Key], d)
+	eq(t, "a promotion converts nothing", strings.Count(e.log.String(), "image audit: convert "), 1)
 }
 
 // A signing project attests the SBOM of every image, the installer and the OS bundle, once: a

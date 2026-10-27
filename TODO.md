@@ -7,6 +7,10 @@ A finished item is deleted, not ticked. The plan behind it is
 
 ## Must — parity
 
+Batched by the gate they share: a batch is one slice, one review, one gate run.
+
+### Blocked — upstream or accounts
+
 1. **Kairos 4.4.0 final**: the OS bundle is pinned to the release candidate
    (`kairos_init` `v4.4.0-rc2`). When Kairos 4.4.0 ships: pin its kairos-init by digest in
    `examples/minimal` and `examples/full`; re-derive the bundle's `08_grub.yaml` from it (Kairos's
@@ -31,7 +35,6 @@ A finished item is deleted, not ticked. The plan behind it is
    `security_group_ids` is given (a VPC's default group admits nothing from outside) and an
    `encrypted` root volume; Azure's an NSG on the NIC; Secure Boot / vTPM where the image allows.
    Each checked against its provider's schema and applied for real.
-
 3. **Scaleway**: a platform of `vm create` (OpenTofu module: an instance from the release's
    disk, the cloud-config as its user data) and a cloud of `cloud_publish` (the disk uploaded to
    Object Storage and imported as an instance image, with the publisher's credentials from the
@@ -115,10 +118,10 @@ A finished item is deleted, not ticked. The plan behind it is
   `host.kernel: ga | hwe` key (default `ga`) chooses it; the kernel stays refused in
   `host.packages`.
 
-- **A driver's RDMA freed per port** (from the E810's channels): blocking `irdma` (`host.modules`) takes RDMA off
-  every port of the host. A port that uses none could instead have its `ice.roce.N` auxiliary
-  device unbound only on `ethtool -L`'s EBUSY, logged, and again at each boot, keeping RDMA on
-  the others; a device-level action, not a module's setting.
+- **A driver's RDMA freed per port** (a NIC whose RDMA function holds its channels): blocking the
+  RDMA module (`host.modules`) takes RDMA off every port of the host. A port that uses none could
+  instead have its RDMA auxiliary device unbound only on `ethtool -L`'s EBUSY, logged, and again
+  at each boot, keeping RDMA on the others; a device-level action, not a module's setting.
 
 - **Kairos's CIS hardening on the VM**: kairos-init's `cisHardening` step is skipped (its shell
   umask 027, password ageing and faillock). Adopting it needs the install's writes to set their
@@ -252,7 +255,7 @@ A finished item is deleted, not ticked. The plan behind it is
   `docker events --filter type=image` across a parallel gate.
 - **Reconfigure beyond the re-run**: on a terminal, a re-run asks nothing; a form pre-filled with
   the recorded values would let an operator change inputs without naming them. A re-run also keeps
-  the loopback address, the registry and its CA, and the channel (TLS: done, the VM's in Must 4); changing them
+  the loopback address, the registry and its CA, and the channel (TLS: done); changing them
   needs a new install today. Rotating the pull password is its variable at the next run.
 - **`make smoke-install` leaves two stacks behind**: after a passing run, the
   `stowage-smoke-notes` and `stowage-smoke-notes-internal` stacks (their front containers) and the
@@ -322,43 +325,29 @@ A finished item is deleted, not ticked. The plan behind it is
   project's own keys; meanwhile README asks for an account that cannot write the project's
   repositories.
 
-Found packaging a second project (an explicit forward proxy with an IdP, a scanner and sidecars,
-Docker shape, 2026-10-24):
-
-- **Routes by path on one domain**: the front routes by hostname only, so a console, an IdP and
-  metrics need three names (and three certificates) where one host with `/`, `/dex`, `/metrics`
-  would do.
-- **A moved `--https-port` is also the front's port inside the stack network**: a service that
-  reaches a route through the front by its public name must dial that port, and an app that
-  builds a URL from the domain alone (an OIDC issuer `https://<domain>/…`) breaks. Keep the
-  front on 443 inside, publishing the chosen host port to it.
-- **A long-running service reading a file a one-shot service renders**: a re-run re-renders it,
-  and the reader (Dex reading its config once) keeps the old file until restarted. Document the
-  contract (compose `depends_on: { condition: service_completed_successfully, restart: true }`)
-  or lint a one-shot feeding a volume another service mounts.
-- **Loopback mode when no route can work in it**: `loopback_ports` is required for every route
-  though a project whose IdP needs an https issuer cannot serve in loopback; a project could
-  leave `none` out of `tls_modes` and owe no loopback ports.
-- **`ship` on a host whose `/tmp` is RAM**: the staged context and the `image save` tarball go to
-  `$TMPDIR`; a multi-GB image fills a tmpfs. Stage under the user's cache directory, or say so.
-- **Build options an image may need**: `add_hosts` (a build whose tests resolve fixed names;
-  BuildKit's `/etc/hosts` is read-only) and a build network.
-- **An L4 route's service on the VM cannot call a route by its public name**: 0.13 makes each
-  route's domain an alias of the front on the stack's network, but on the VM an L4 route's
-  service runs on the host's network, where the alias does not exist; a service whose own
-  clients and itself must reach a route by one name (an identity provider's issuer, called by
-  the service and redirected to by its clients through it) resolves it only when real DNS
-  points the name at the VM. Map each route's domain to the front for that service too (an
-  `extra_hosts` entry to `127.0.0.1`, the front publishing on the VM's addresses), or say in
-  `vm create` that the domains must resolve to the VM.
-- **The IPv6 allowlist warning puts the source after "as which"**: `warnIPv6Allowlists`
-  (`internal/install/front.go`) formats `holds %s, %s every IPv6 client passes` with `what` then
-  the source, so an install prints `ADMIN_CIDR=127.0.0.1/32,172.16.0.0/12 holds the stack
-  network's gateway 172.19.0.1, as which, 172.16.0.0/12 every IPv6 client passes …`. It means
-  `172.16.0.0/12 holds the stack network's gateway 172.19.0.1, as which every IPv6 client passes`:
-  name the source before `holds`, and test the sentence, not only that a warning is printed.
-
 ## Could
+
+- **`vm create` takes the first disk set holding any format**: `bootDisks`' `usable`
+  (`internal/install/vmcreate.go`) settles on the release's own set as soon as the registry
+  holds one of its formats, before the platform is chosen, so a mirror holding the release's raw
+  disk alone and the channel's set in qcow2 refuses `--platform truenas` naming the missing
+  qcow2 instead of booting the channel's set. Choose the platform first, or try the next set
+  when the platform's formats are missing.
+- **A NIC interrupt the kernel manages stays drift under isolated cores**: `inspectSteering`
+  (`internal/tune/system.go`) reports an interrupt reaching a service's cores as `differs`, and a
+  driver with managed affinity refuses the move `--apply` makes, so `tune --check` never clears
+  there. Tell a managed interrupt apart (the write's `EIO`, recorded at apply) and make it advice.
+
+- **Review findings left from batch D** (cross-Stowage rollback, `update_signal`), minor:
+  a rollback releases the install's lock before the previous installer's start takes it (the
+  install then records the previous release, consistent, but another run may slip in: hand the
+  held lock to the child); finishing a stopped upgrade or rollback on the VM starts the kept
+  release twice (the child's `boot`, then the outer boot's own); a rollback to a release of
+  another spec format fetches none of its images before the switch (they need its spec), and one
+  of the same format fetches them twice (before the switch, then its installer's re-run); for
+  such a release `keepPrev` copies the install's stack files rather than rendering them; with
+  `update_signal`, a new container found `restarting` fails the overlap at once, where
+  `up --wait` would judge it.
 
 - **Review findings left from batch A** (host block), minor:
   - `lint`'s namespaced-setting warning is a prefix heuristic: a few `net.ipv4.*` and
@@ -687,9 +676,6 @@ Docker shape, 2026-10-24):
   by a trusted key" message count non-bundle referrers as signatures, and the SBOM attestations
   (bundles too) everywhere; count the bundles whose predicate is a signature instead, and cover the tag-fallback shape with a verifier-level test, not only the
   registry client's.
-- **The OS bundle's SBOM without the kernel modules' entries**: syft lists each module (6,904
-  entries, no version, most of the document's 57 MB), which no scanner matches; a kernel CVE is
-  found through the `linux-image` package. Its kernel-module cataloger could be left out.
 - **Fewer attestation reads**: `ship`'s check that an artifact carries its SBOM reads and verifies
   the whole attestation (an OS bundle's runs to MiB), and every signature check reads each SBOM
   bundle up to 4 MiB before it passes it over. cosign writes the predicate type as an annotation of

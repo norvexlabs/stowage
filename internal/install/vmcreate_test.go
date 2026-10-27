@@ -881,6 +881,33 @@ func TestVMCreateRefusesADiskSetThatCannotSwitch(t *testing.T) {
 	}
 }
 
+// What the VM's first install would refuse of the front is refused before any file is written.
+func TestVMCreateRefusesTheFrontsPortsAndDomainsFirst(t *testing.T) {
+	t.Parallel()
+	v := newVMCreate(t, "qcow2")
+	err := v.create(VMCreate{Platform: "truenas", Hostname: "notes-1", User: "ops"}, func(o *Options) { o.TLS = "internal"; o.HTTPPort, o.HTTPSPort = 8080, 80 })
+	if err == nil || !strings.Contains(err.Error(), "--https-port 80") {
+		t.Fatalf("https on 80: %v", err)
+	}
+	err = v.create(VMCreate{Platform: "truenas", Hostname: "notes-1", User: "ops"}, func(o *Options) {
+		o.TLS, o.Set = "internal", map[string]string{"APP_DOMAIN": "x.example.com", "API_DOMAIN": "x.example.com"}
+	})
+	if err == nil || !strings.Contains(err.Error(), "app and api both serve the domain x.example.com") {
+		t.Fatalf("one domain for two routes: %v", err)
+	}
+	if err := v.create(VMCreate{Platform: "truenas", Hostname: "notes-1", User: "ops"}, func(o *Options) { o.TLS, o.HTTPPort = "internal", 22 }); err == nil || !strings.Contains(err.Error(), "--http-port 22 is the VM's SSH") {
+		t.Fatalf("the SSH port: %v", err)
+	}
+	v.r.Spec.L4.Routes = []spec.L4Route{{Name: "data", Protocol: "tcp", Port: 7443, Upstream: "api:7443"}}
+	err = v.create(VMCreate{Platform: "truenas", Hostname: "notes-1", User: "ops"}, func(o *Options) { o.TLS, o.HTTPSPort = "internal", 7443 })
+	if err == nil || !strings.Contains(err.Error(), "7443 is the L4 route data's") {
+		t.Fatalf("an L4 route's port: %v", err)
+	}
+	if _, err := os.Stat(v.out); err == nil {
+		t.Error("a refused run wrote", v.out)
+	}
+}
+
 // With neither the release's disks nor the pointer's there, the channel's disk set record
 // gives the set.
 func TestVMCreateBootsTheChannelsDiskSetRecord(t *testing.T) {
@@ -942,12 +969,9 @@ func TestADiskWithoutItsOSSizeIsRefused(t *testing.T) {
 	if err := v.create(VMCreate{Platform: "proxmox"}, nil); err == nil || !strings.Contains(err.Error(), "records no dev.stowage.disk.os-mib: published by an earlier Stowage") {
 		t.Errorf("%v", err)
 	}
-	// One disk of the set without it: the whole set boots none, even on a platform that takes only
-	// the other format.
+	// One disk of the set without it: a platform that takes the other format boots it, one that
+	// takes only that format is told why.
 	w := newVMCreate(t, "raw")
-	if err := w.create(VMCreate{Platform: "aws"}, nil); err != nil {
-		t.Fatalf("the set alone: %v", err)
-	}
 	wrepo, err := c.Repo(w.prefix + "/notes-disk")
 	if err != nil {
 		t.Fatal(err)
@@ -956,18 +980,35 @@ func TestADiskWithoutItsOSSizeIsRefused(t *testing.T) {
 		Config: registry.Blob{MediaType: registry.EmptyMediaType, Data: []byte("{}")}, Layers: []registry.Blob{b}}, nil); err != nil {
 		t.Fatal(err)
 	}
-	w.r.Manifest.Artifacts.Disks["qcow2"] = h.String()
-	if err := w.create(VMCreate{Platform: "aws", Out: t.TempDir()}, nil); err == nil || !strings.Contains(err.Error(), "the qcow2 disk") || !strings.Contains(err.Error(), "published by an earlier Stowage") {
-		t.Errorf("a set one of whose disks records no size: %v", err)
+	w.r.Manifest.Artifacts.Disks["ova"] = h.String()
+	if err := w.create(VMCreate{Platform: "aws"}, nil); err != nil {
+		t.Fatalf("the raw disk of a set whose ova records no size: %v", err)
+	}
+	if err := w.create(VMCreate{Platform: "vmware", Out: t.TempDir()}, nil); err == nil || !strings.Contains(err.Error(), "--platform vmware: the ova disk") || !strings.Contains(err.Error(), "published by an earlier Stowage") {
+		t.Errorf("a platform whose format records no size: %v", err)
 	}
 	if h, err = c.PutManifest(context.Background(), wrepo, registry.Manifest{ArtifactType: release.DiskArtifactType,
 		Config: registry.Blob{MediaType: registry.EmptyMediaType, Data: []byte("{}")}, Layers: []registry.Blob{b},
 		Annotations: map[string]string{release.DiskOSAnnotation: "0"}}, nil); err != nil {
 		t.Fatal(err)
 	}
-	w.r.Manifest.Artifacts.Disks["qcow2"] = h.String()
-	if err := w.create(VMCreate{Platform: "aws", Out: t.TempDir()}, nil); err == nil || !strings.Contains(err.Error(), `records dev.stowage.disk.os-mib "0"`) || !strings.Contains(err.Error(), "not as Stowage publishes it") {
-		t.Errorf("a set one of whose disks records 0: %v", err)
+	w.r.Manifest.Artifacts.Disks["ova"] = h.String()
+	if err := w.create(VMCreate{Platform: "vmware", Out: t.TempDir()}, nil); err == nil || !strings.Contains(err.Error(), `records dev.stowage.disk.os-mib "0"`) || !strings.Contains(err.Error(), "not as Stowage publishes it") {
+		t.Errorf("a platform whose format records 0: %v", err)
+	}
+}
+
+// A mirror exported with some of a release's disk formats boots the platforms that take one of
+// them; a platform that takes only another is told which format the registry lacks.
+func TestVMCreateBootsTheFormatsAMirrorCarries(t *testing.T) {
+	t.Parallel()
+	v := newVMCreate(t, "qcow2")
+	v.r.Manifest.Artifacts.Disks["raw"] = "sha256:" + strings.Repeat("e", 64)
+	if err := v.create(VMCreate{Platform: "aws", Out: t.TempDir()}, nil); err == nil || !strings.Contains(err.Error(), "--platform aws: the raw disk sha256:eeeeeeeeeeee is not in "+v.prefix) {
+		t.Errorf("a platform whose format is not there: %v", err)
+	}
+	if err := v.create(VMCreate{Platform: "truenas", Hostname: "notes-1", User: "ops"}, func(o *Options) { o.TLS = "internal" }); err != nil {
+		t.Fatalf("the format there: %v\n%s", err, v.log)
 	}
 }
 

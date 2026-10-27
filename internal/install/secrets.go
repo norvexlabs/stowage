@@ -2,6 +2,7 @@ package install
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -133,7 +134,7 @@ func (in *Installer) ExportSecrets(recipients []string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := in.sameRelease(env); err != nil {
+	if err := in.sameRelease(context.Background(), env); err != nil {
 		return nil, err
 	}
 	f, err := in.exportSecrets(env)

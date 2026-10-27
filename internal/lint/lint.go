@@ -8,6 +8,7 @@ import (
 	"encoding/pem"
 	"fmt"
 	"maps"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -96,6 +97,9 @@ var (
 	prefixRe    = regexp.MustCompile(`^(?:[a-z0-9.-]+|\[[0-9a-f:]+\])(?::[0-9]+)?(?:/[a-z0-9]+(?:[._-][a-z0-9]+)*)*$`)
 	upstreamRe  = regexp.MustCompile(`^([a-z0-9][a-z0-9_.-]*):([0-9]{1,5})$`)
 	imageVarRe  = regexp.MustCompile(`^\$\{([A-Z0-9_]+)\}$`)
+	// routePathRe is a route's path prefix: clean, absolute, no trailing '/', no wildcard or
+	// placeholder the front would read.
+	routePathRe = regexp.MustCompile(`^(/[A-Za-z0-9._~-]+)+$`)
 )
 
 // Run lints the spec at specPath with paths relative to root. now feeds the scheme's commit guard.
@@ -361,7 +365,7 @@ func (l *linter) images() {
 			l.errf(where, "image key %q is reserved: %s-%s is where Stowage publishes its own artifacts", name, l.s.Name, name)
 		}
 		if !img.Built() {
-			if img.Context != "" || img.Dockerfile != "" || img.Target != "" || len(img.Args) > 0 || len(img.Inputs) > 0 {
+			if img.Context != "" || img.Dockerfile != "" || img.Target != "" || len(img.Args) > 0 || len(img.AddHosts) > 0 || img.Network != "" || len(img.Inputs) > 0 {
 				l.errf(where, "ref and build fields are exclusive")
 			}
 			if !pinnedRe.MatchString(img.Ref) {
@@ -387,6 +391,17 @@ func (l *linter) images() {
 		}
 		for i, in := range img.Inputs {
 			l.exists(fmt.Sprintf("%s.inputs[%d]", where, i), in, isDirHint(spec.Path(l.root, in)))
+		}
+		for _, h := range slices.Sorted(maps.Keys(img.AddHosts)) {
+			if !hostName(h) {
+				l.errf(where+".add_hosts", "%q is not a host name (lowercase, like registry.example.test)", h)
+			}
+			if a, err := netip.ParseAddr(img.AddHosts[h]); err != nil || a.Zone() != "" {
+				l.errf(where+".add_hosts."+h, "%q is not an IP address without a zone (like 192.0.2.7 or 2001:db8::7)", img.AddHosts[h])
+			}
+		}
+		if img.Network != "" && !slices.Contains(spec.BuildNetworks, img.Network) {
+			l.errf(where+".network", "%q is not a build network: %s", img.Network, strings.Join(spec.BuildNetworks, ", "))
 		}
 	}
 }
@@ -511,6 +526,22 @@ func (l *linter) stack() {
 		}
 		if svc.Pid == "host" {
 			l.warnf(w+".pid", "host: the service sees and signals every process of the host")
+		}
+		// A one-shot is made again when a re-run changes it; Compose restarts a service waiting for
+		// it only with restart: true.
+		if deps, ok := svc.DependsOn.(map[string]any); ok {
+			for _, d := range sortedKeys(deps) {
+				on, _ := deps[d].(map[string]any)
+				if on["condition"] != "service_completed_successfully" {
+					continue
+				}
+				switch b, known := composeBool(on["restart"]); {
+				case !known:
+					l.warnf(w+".depends_on."+d, "restart: %v, which only a run knows or Compose does not read as a boolean: unless true, when a re-run makes the one-shot %s again, %s keeps what it read of its last run (a file it renders, read once)", on["restart"], d, name)
+				case !b:
+					l.warnf(w+".depends_on."+d, "waits for the one-shot %s without restart: true: when a re-run makes %s again, %s keeps what it read of its last run (a file it renders, read once)", d, d, name)
+				}
+			}
 		}
 		if MountsDockerSocket(svc.Volumes) {
 			l.warnf(w+".volumes", "the Docker socket is mounted, or a directory holding it: the service drives the host's engine, so holds the host")
@@ -759,9 +790,16 @@ func (l *linter) front() {
 	}
 	names := map[string]bool{}
 	vars := map[string]string{}
-	domains := map[string]bool{}
+	domains := map[string]string{} // domain_input and path → route
+	shared := map[string]int{}     // domain_input → its routes
+	for _, r := range f.Routes {
+		shared[r.DomainInput]++
+	}
 	for i, r := range f.Routes {
 		w := fmt.Sprintf("front.routes[%d]", i)
+		if r.ClientAuth && shared[r.DomainInput] > 1 {
+			l.errf(w+".client_auth", "%s is shared with another route, and a client certificate is asked for a whole domain (TLS): give the route a domain of its own", r.DomainInput)
+		}
 		if !imageKeyRe.MatchString(r.Name) {
 			l.errf(w+".name", "%q must be lowercase letters, digits, '.', '_' or '-'", r.Name)
 		}
@@ -776,10 +814,18 @@ func (l *linter) front() {
 		if !providers.EnvName.MatchString(r.DomainInput) {
 			l.errf(w+".domain_input", "%q is not an environment variable name", r.DomainInput)
 		}
-		if domains[r.DomainInput] {
-			l.errf(w+".domain_input", "%s already routes another upstream: routing is by hostname", r.DomainInput)
+		if seg := strings.Split(r.Path, "/"); r.Path != "" && (!routePathRe.MatchString(r.Path) || slices.Contains(seg, ".") || slices.Contains(seg, "..")) {
+			l.errf(w+".path", "%q is not a path prefix: /, then segments of letters, digits, '.', '_', '~' or '-', no trailing / (like /idp or /api/v2)", r.Path)
 		}
-		domains[r.DomainInput] = true
+		// The front matches paths whatever their case.
+		if other, dup := domains[r.DomainInput+" "+strings.ToLower(r.Path)]; dup {
+			key, where := ".domain_input", "every path"
+			if r.Path != "" {
+				key, where = ".path", r.Path
+			}
+			l.errf(w+key, "%s serves %s of %s already: routes of one domain differ by their path", other, where, r.DomainInput)
+		}
+		domains[r.DomainInput+" "+strings.ToLower(r.Path)] = r.Name
 		m := upstreamRe.FindStringSubmatch(r.Upstream)
 		if m == nil {
 			l.errf(w+".upstream", "%q must be <service>:<port>", r.Upstream)
@@ -848,9 +894,20 @@ func (l *linter) front() {
 		}
 		ports[port] = name
 	}
-	for _, r := range f.Routes {
-		if _, ok := f.LoopbackPorts[r.Name]; !ok {
-			l.errf("front.loopback_ports", "route %s has no port: loopback mode serves every route on its own port", r.Name)
+	// Loopback mode is the mode none: a project that does not offer it owes no loopback port, and
+	// a loopback key would do nothing.
+	if slices.Contains(f.TLSModes, "none") {
+		for _, r := range f.Routes {
+			if _, ok := f.LoopbackPorts[r.Name]; !ok {
+				l.errf("front.loopback_ports", "route %s has no port: loopback mode serves every route on its own port", r.Name)
+			}
+		}
+	} else {
+		if len(f.LoopbackPorts) > 0 {
+			l.errf("front.loopback_ports", "tls_modes does not offer none, the mode loopback serves: no install serves these ports")
+		}
+		if len(f.LoopbackEnv) > 0 {
+			l.errf("front.loopback_env", "tls_modes does not offer none, the mode loopback serves: no install relaxes these defaults")
 		}
 	}
 	for _, k := range sortedKeys(f.LoopbackEnv) {
@@ -894,12 +951,17 @@ func (l *linter) l4() {
 			l.errf(p.key, "%d is not a TCP port", p.port)
 		}
 	}
+	// The ports a TLS front publishes: nothing to a project offering loopback alone.
+	tls := slices.ContainsFunc(f.TLSModes, func(m string) bool { return m != "none" })
 	httpPort, httpsPort := cmp.Or(f.HTTPPort, 80), cmp.Or(f.HTTPSPort, 443)
-	if httpPort == httpsPort {
+	switch {
+	case !tls:
+	case httpPort == httpsPort:
 		l.errf("front.https_port", "%d is the HTTP port too", httpsPort)
+	case httpsPort == 80:
+		l.errf("front.https_port", "80 is the front's plain HTTP port in its container: choose another")
 	}
 	taken := map[string]string{}
-	tls := slices.ContainsFunc(f.TLSModes, func(m string) bool { return m != "none" })
 	if tls {
 		taken[fmt.Sprintf("tcp/%d", httpPort)] = "the front's HTTP port"
 		taken[fmt.Sprintf("tcp/%d", httpsPort)] = "the front's HTTPS port"

@@ -1504,6 +1504,97 @@ func TestTheNetworkProfileSpreadsTheNICsWork(t *testing.T) {
 	}
 }
 
+// With a service's cores (irq off), every NIC interrupt goes off them, on any profile, though the
+// kernel spread them already: one landing on an isolated core is drift until --apply moves it.
+func TestTheNICsInterruptsLeaveTheServicesCores(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s, _ := fakeHost(t, "1500")
+	write(t, s.Root, "sys/devices/system/cpu/online", "0-3\n")
+	for cpu := range 4 {
+		write(t, s.Root, "sys/devices/system/cpu/cpu"+strconv.Itoa(cpu)+"/topology/core_id", strconv.Itoa(cpu)+"\n")
+		write(t, s.Root, "sys/devices/system/cpu/cpu"+strconv.Itoa(cpu)+"/topology/physical_package_id", "0\n")
+	}
+	s.ServiceCores = []CoreRequest{{Service: "proxy", Cores: 2}}
+	for irq, eff := range map[string]string{"24": "2", "25": "3"} {
+		write(t, s.Root, "sys/class/net/eth0/device/msi_irqs/"+irq, "msix\n")
+		write(t, s.Root, "proc/irq/"+irq+"/smp_affinity_list", "0-3\n")
+		write(t, s.Root, "proc/irq/"+irq+"/effective_affinity_list", eff+"\n")
+	}
+	h, _ := s.Host()
+	if !slices.Equal(h.Isolated, []int{2, 3}) {
+		t.Fatalf("isolated %v", h.Isolated)
+	}
+	if it := find(s.Inspect(ctx, h), "nic", "eth0 interrupts"); it == nil || it.State != Differs || it.Have != "2 of 2 on the services' cores (IRQ 24-25)" || it.Want != "off CPUs 2-3, the services' cores" {
+		t.Errorf("spread onto the services' cores: %+v", it)
+	}
+	p, err := s.Plan(h)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Apply(ctx, p, ApplyOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	for irq, cpu := range map[string]string{"24": "0\n", "25": "1\n"} {
+		if got := read(t, s.Root, "proc/irq/"+irq+"/smp_affinity_list"); got != cpu {
+			t.Errorf("IRQ %s on %q, want %q", irq, got, cpu)
+		}
+		write(t, s.Root, "proc/irq/"+irq+"/effective_affinity_list", cpu)
+	}
+	if it := find(s.Inspect(ctx, h), "nic", "eth0 interrupts"); it == nil || it.State != OK || it.Have != "2, off the services' cores" {
+		t.Errorf("after the apply: %+v", it)
+	}
+	// The asked affinity is read where the effective one is not.
+	write(t, s.Root, "proc/irq/25/effective_affinity_list", "")
+	write(t, s.Root, "proc/irq/25/smp_affinity_list", "1-2\n")
+	if it := find(s.Inspect(ctx, h), "nic", "eth0 interrupts"); it == nil || it.State != Differs || it.Have != "1 of 2 on the services' cores (IRQ 25)" {
+		t.Errorf("an asked affinity reaching CPU 2: %+v", it)
+	}
+	// One whose CPUs do not read is not known to be off them.
+	write(t, s.Root, "proc/irq/25/smp_affinity_list", "\n")
+	if it := find(s.Inspect(ctx, h), "nic", "eth0 interrupts"); it == nil || it.State != Advice || !strings.HasPrefix(it.Have, "1 of 2 whose CPUs do not read (IRQ 25)") {
+		t.Errorf("an affinity that does not read: %+v", it)
+	}
+	// A NIC of one interrupt is judged against the services' cores too.
+	_ = os.Remove(filepath.Join(s.Root, "sys/class/net/eth0/device/msi_irqs/25"))
+	write(t, s.Root, "proc/irq/24/effective_affinity_list", "3\n")
+	if it := find(s.Inspect(ctx, h), "nic", "eth0 interrupts"); it == nil || it.State != Differs || it.Have != "1 of 1 on the services' cores (IRQ 24)" {
+		t.Errorf("one interrupt on a service's core: %+v", it)
+	}
+	// Off them, it is ok on any profile.
+	write(t, s.Root, "proc/irq/24/effective_affinity_list", "0\n")
+	for _, p := range []Profile{Default, Network} {
+		s.Profile = p
+		if h, _ := s.Host(); find(s.Inspect(ctx, h), "nic", "eth0 interrupts") == nil || find(s.Inspect(ctx, h), "nic", "eth0 interrupts").State != OK {
+			t.Errorf("%s: one interrupt off the services' cores: %+v", p, find(s.Inspect(ctx, h), "nic", "eth0 interrupts"))
+		}
+	}
+	s.Profile = Default
+	// No service's cores: the default profile leaves the interrupts where they are, and a NIC of
+	// one interrupt is not judged, irqbalance or not.
+	write(t, s.Root, "proc/610/comm", "irqbalance\n")
+	s.Profile, s.ServiceCores = Network, nil
+	if h, _ := s.Host(); find(s.Inspect(ctx, h), "nic", "eth0 interrupts") != nil {
+		t.Errorf("one interrupt under irqbalance, no isolated core: %+v", find(s.Inspect(ctx, h), "nic", "eth0 interrupts"))
+	}
+	s.Profile = Default
+	_ = os.Remove(filepath.Join(s.Root, "proc/610/comm"))
+	write(t, s.Root, "sys/class/net/eth0/device/msi_irqs/25", "msix\n")
+	write(t, s.Root, "proc/irq/25/smp_affinity_list", "1-2\n")
+	s.ServiceCores = nil
+	h, _ = s.Host()
+	if it := find(s.Inspect(ctx, h), "nic", "eth0 interrupts"); it != nil {
+		t.Errorf("the default profile judges the interrupts: %+v", it)
+	}
+	p, _ = s.Plan(h)
+	if _, err := s.Apply(ctx, p, ApplyOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := read(t, s.Root, "proc/irq/25/smp_affinity_list"); got != "1-2\n" {
+		t.Errorf("the default profile moved an interrupt: %q", got)
+	}
+}
+
 // host.power performance runs every CPU at its full speed on any profile: the performance governor
 // where offered, the preference where exposed (one already performance kept), intel_pstate's floor
 // at 100; a daemon that re-asserts its own profile is advice and a note, left running. Platform

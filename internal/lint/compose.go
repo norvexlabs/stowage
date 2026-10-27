@@ -57,10 +57,13 @@ type Service struct {
 	// NetworksFrom is the extends base its networks come from when it declares none itself.
 	NetworksFrom string `yaml:"-"`
 	Ipc          string `yaml:"ipc"`
-	VolumesFrom  any    `yaml:"volumes_from"`
-	Links        any    `yaml:"links"`
-	ExtLinks     any    `yaml:"external_links"`
-	Healthcheck  *struct {
+	// DependsOn is the long form's map (a service: its condition and restart); the short list
+	// waits for nothing a one-shot writes.
+	DependsOn   any `yaml:"depends_on"`
+	VolumesFrom any `yaml:"volumes_from"`
+	Links       any `yaml:"links"`
+	ExtLinks    any `yaml:"external_links"`
+	Healthcheck *struct {
 		Disable any `yaml:"disable"`
 		Test    any `yaml:"test"`
 	} `yaml:"healthcheck"`
@@ -420,11 +423,16 @@ func CheckL4Address(v string) error {
 		}
 		return nil
 	}
-	labels := strings.Split(v, ".")
-	if len(v) > 253 || strings.Trim(labels[len(labels)-1], "0123456789") == "" || slices.ContainsFunc(labels, func(l string) bool { return !hostLabel.MatchString(l) }) {
+	if !hostName(v) {
 		return fmt.Errorf("%q is not a host name or an IP address (lowercase, no port: like data.example.com or 192.0.2.7)", v)
 	}
 	return nil
+}
+
+// hostName reports whether v is a lowercase host name whose last label is not all digits.
+func hostName(v string) bool {
+	labels := strings.Split(v, ".")
+	return len(v) <= 253 && strings.Trim(labels[len(labels)-1], "0123456789") != "" && !slices.ContainsFunc(labels, func(l string) bool { return !hostLabel.MatchString(l) })
 }
 
 // CheckL4Bind accepts the host address an L4 route's port is published on: nothing (every

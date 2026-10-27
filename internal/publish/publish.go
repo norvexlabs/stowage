@@ -911,19 +911,28 @@ func (p *Publisher) prepareImage(ctx context.Context, v string, pl *imagePlan) e
 	default:
 		return nil
 	}
-	p.logf("image %s: build", pl.image)
-	req := BuildRequest{Image: pl.image, Inputs: pl.node.Inputs, Recipe: pl.node.Recipe}
-	if pl.node.ReadsVersion {
-		req.Version = v
-	}
-	img, cleanup, err := p.Builder.Build(ctx, p.Project, req)
-	defer func() {
-		if cleanup != nil {
-			cleanup()
+	var img v1.Image
+	if pl.node.Converts != "" {
+		var err error
+		if img, err = p.convert(ctx, pl); err != nil {
+			return fmt.Errorf("image %s: %w", pl.image, err)
 		}
-	}()
-	if err != nil {
-		return fmt.Errorf("image %s: build: %w", pl.image, err)
+	} else {
+		p.logf("image %s: build", pl.image)
+		req := BuildRequest{Image: pl.image, Inputs: pl.node.Inputs, Recipe: pl.node.Recipe}
+		if pl.node.ReadsVersion {
+			req.Version = v
+		}
+		built, cleanup, err := p.Builder.Build(ctx, p.Project, req)
+		defer func() {
+			if cleanup != nil {
+				cleanup()
+			}
+		}()
+		if err != nil {
+			return fmt.Errorf("image %s: build: %w", pl.image, err)
+		}
+		img = built
 	}
 	annotated, ok := mutate.Annotations(img, map[string]string{registry.InputsAnnotation: pl.node.Inputs}).(v1.Image)
 	if !ok {
@@ -942,6 +951,25 @@ func (p *Publisher) prepareImage(ctx context.Context, v string, pl *imagePlan) e
 	}
 	pl.action, pl.from, pl.digest = actRetag, dst, d.String()
 	return nil
+}
+
+// convert reads the upstream image a node converts (by its pinned digest, which the read checks)
+// and gives it OCI media types: its layers' bytes and its config are the upstream's.
+func (p *Publisher) convert(ctx context.Context, pl *imagePlan) (v1.Image, error) {
+	ud, err := pinnedDigest(pl.node.Converts)
+	if err != nil {
+		return nil, err
+	}
+	p.logf("image %s: convert %s to OCI media types", pl.image, pl.node.Converts)
+	from := p.Upstream
+	if from == nil {
+		from = p.Registry
+	}
+	up, err := from.Image(ctx, ud)
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", pl.node.Converts, err)
+	}
+	return toOCI(up)
 }
 
 // tagImage points the image's release tag at its digest.

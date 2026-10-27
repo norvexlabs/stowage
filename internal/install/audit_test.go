@@ -136,6 +136,58 @@ func TestTheScannerIsTheReleasesOwn(t *testing.T) {
 	}
 }
 
+// An OS bundle or a disk the registry does not hold (a mirror exported without them) is left
+// out, logged; any other artifact is read whether or not it is there.
+func TestAnAuditReadsWhatAMirrorCarries(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	srv := httptest.NewServer(ggcrregistry.New(ggcrregistry.Logger(log.New(io.Discard, "", 0))))
+	t.Cleanup(srv.Close)
+	prefix := strings.TrimPrefix(srv.URL, "http://") + "/acme/notes"
+	push := func(repo string) string {
+		img, err := random.Image(64, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		h, _ := img.Digest()
+		dst, _ := name.NewDigest(prefix + "/notes-" + repo + "@" + h.String())
+		if err := remote.Write(dst, img); err != nil {
+			t.Fatal(err)
+		}
+		return h.String()
+	}
+	m := *e.r.Manifest
+	gone := "sha256:" + strings.Repeat("e", 64)
+	m.Artifacts.Images = map[string]string{"api": gone}
+	m.Artifacts.Installer, m.Artifacts.OS = gone, push("os")
+	m.Artifacts.Disks = map[string]string{"qcow2": push("disk"), "raw": gone}
+	src := &auditSource{m: &m, prefix: prefix, c: registry.New(authn.NewMultiKeychain())}
+	in := e.installer(nil)
+	targets, err := in.carried(context.Background(), src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, tg := range targets {
+		names = append(names, tg.Name)
+	}
+	if got := strings.Join(names, " "); got != "api installer os disk-qcow2" {
+		t.Errorf("targets %s", got)
+	}
+	if !strings.Contains(e.log.String(), "disk-raw sha256:eeeeeeeeeeee is not in "+prefix+" (a mirror carries the shapes and the disk formats its export named): not read") {
+		t.Errorf("log %s", e.log)
+	}
+	m.Artifacts.OS = gone
+	if targets, err = in.carried(context.Background(), src); err != nil || len(targets) != 3 {
+		t.Errorf("without the OS bundle: %v %v", targets, err)
+	}
+	// The project's own registry holds the whole release: nothing is left out, its error reported.
+	e.r.Spec.Registry.Prefix = prefix
+	if targets, err = in.carried(context.Background(), src); err != nil || len(targets) != 5 {
+		t.Errorf("the project's registry: %v %v", targets, err)
+	}
+}
+
 // An install recorded by tag was made offline; the VM, preloaded, is not; another project's
 // directory is refused.
 func TestAuditOfflineAndProject(t *testing.T) {

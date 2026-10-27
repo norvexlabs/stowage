@@ -54,8 +54,11 @@ release() {
 step "start zot"
 start_zot
 
-step "project, with the kairos shape and a qcow2 disk"
+step "project, with the kairos shape and its qcow2 and raw disks"
 KAIROS=1 new_project "$PG"
+# Two formats: the site's mirror carries the qcow2 one alone, which vm create boots TrueNAS from.
+sed -i 's/^    disk_formats: \[qcow2\]$/    disk_formats: [qcow2, raw]/' "$P/stowage.yaml"
+grep -qx '    disk_formats: \[qcow2, raw\]' "$P/stowage.yaml" || fail "the disk formats were not edited"
 # A short health gate: the release that never becomes ready falls back sooner.
 sed -i 's/^    host_api: \[api\]$/&\n    health_gate: { deadline_s: 120, deadline_after_reset_s: 600, poll_s: 10 }/' "$P/stowage.yaml"
 grep -q '^    health_gate: ' "$P/stowage.yaml" || fail "no health_gate in the project"
@@ -82,12 +85,12 @@ vm_names
 
 step "ship beta with its disk (--disks): images, the OS bundle, its disk"
 "${S[@]}" ship --channel beta --disks 2>"$WORK/ship.log" || { tail -50 "$WORK/ship.log"; fail "ship"; }
-grep -q 'disk qcow2: tag .* → beta-1.0.0-qcow2' "$WORK/ship.log" || fail "the qcow2 disk was not tagged"
+grep -q 'disk qcow2: tag .* → beta-1.0.0-qcow2' "$WORK/ship.log" && grep -q 'disk raw: tag .* → beta-1.0.0-raw' "$WORK/ship.log" || fail "the disks were not tagged"
 
 step "the published notes-stow; the site's mirror, TLS of its own CA, on the address the VM reaches this host at"
 vm_ctl beta-1.0.0
 vm_mirror
-mirror "$WORK/r1.oci.tar"
+mirror "$WORK/r1.oci.tar" --disks qcow2
 grep -q '^Exported notes 1.0.0' "$WORK/r1.oci.tar.txt" || { cat "$WORK/r1.oci.tar.txt"; fail "export of 1.0.0"; }
 
 step "vm create with OpenTofu on TrueNAS, from the mirror, IPv6 on: the disk, the seed, the VM; it boots and installs"
@@ -112,6 +115,10 @@ on_vm notes-stow status >"$WORK/status.txt" || fail "status over SSH"
 grep -q '^installed  notes 1.0.0 (revision 1)' "$WORK/status.txt" && grep -q '^channel    beta' "$WORK/status.txt" ||
 	{ cat "$WORK/status.txt"; fail "status does not show the install"; }
 healthy_postgres "after the install"
+# A healthy boot logs no error: the journal at priority err holds nothing of this boot.
+# Its standard output alone: SSH's banner comes on its standard error.
+on_vm sudo journalctl -b -p err --no-pager -q >"$WORK/journal-err.txt" 2>"$WORK/journal-err.log" || { cat "$WORK/journal-err.log"; fail "journalctl on the VM"; }
+[[ ! -s $WORK/journal-err.txt ]] || { cat "$WORK/journal-err.txt"; fail "the VM's boot logged errors"; }
 on_vm sudo -n true || fail "the administrator has no passwordless sudo"
 on_vm id -nG | grep -qw admin || fail "the administrator is not in the admin group"
 
@@ -233,9 +240,16 @@ scanner_fresh "$SITE"
 [[ $(jq '[.subjects[] | select(.error)] | length' "$WORK/audit.json") == 0 && $(jq '[.subjects[] | select(.name == "os" or .name == "disk-qcow2")] | length' "$WORK/audit.json") == 2 ]] ||
 	{ cat "$WORK/audit.json"; fail "not every artifact of the VM's release was audited"; }
 grep -q "pulling $SITE/notes-audit@" "$WORK/audit.log" || { cat "$WORK/audit.log"; fail "the scanner was not pulled from the mirror"; }
+# The mirror carries the qcow2 disk alone: the raw one is left out, not failed.
+grep -q "^disk-raw sha256:[0-9a-f]* is not in $SITE (a mirror carries the shapes and the disk formats its export named): not read$" "$WORK/audit.log" ||
+	{ cat "$WORK/audit.log"; fail "the raw disk the mirror lacks was not left out"; }
 "$CTL" sbom export --version 1.0.0 --channel beta --registry "$SITE" --registry-ca "$MIRROR_CA" "$WORK/sbom" >"$WORK/sbom.txt" 2>&1 || { cat "$WORK/sbom.txt"; fail "sbom export"; }
 jq -e '[.artifacts[] | select(.file)] | length > 0 and all(.[]; .error == null)' "$WORK/sbom/index.json" >/dev/null &&
 	jq -e '.spdxVersion' "$WORK/sbom/os.spdx.json" >/dev/null || { cat "$WORK/sbom/index.json"; fail "the exported SBOMs"; }
+# The kernel is its distribution's packages: no SBOM lists it by upstream's version, nor its
+# modules (syft's SPDX IDs carry the package type: linux-kernel, linux-kernel-module).
+jq -e '[.packages[] | select(.name == "linux-kernel" or (.SPDXID | test("^SPDXRef-Package-linux-kernel")))] | length == 0' "$WORK/sbom/os.spdx.json" >/dev/null ||
+	fail "the OS bundle's SBOM lists the kernel itself"
 ! on_vm 'sudo test -e /usr/local/notes/.stowage-grype' || fail "the VM holds a scanner's database"
 
 step "the front serves HTTPS from the VM"

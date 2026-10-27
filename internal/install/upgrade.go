@@ -12,9 +12,9 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
-	"github.com/norvexlabs/stowage/internal/payload"
 	"github.com/norvexlabs/stowage/internal/providers"
 	"github.com/norvexlabs/stowage/internal/release"
 	"github.com/norvexlabs/stowage/internal/spec"
@@ -197,11 +197,15 @@ func (in *Installer) Upgrade(ctx context.Context) error {
 			return fmt.Errorf("an upgrade from or a rollback to %s %s stopped before it finished: `%s rollback --dir %s` finishes it, back on %s %s", name, cur, in.ctl(), o.Dir, name, cur)
 		}
 	}
-	kept, err := in.keptInstaller(name, cur, rev)
+	kept, err := in.keptInstaller(ctx, name, cur, rev)
 	if err != nil {
 		return err
 	}
-	if from, to, ok := baselines(o, &Installer{R: kept, O: in.O}, in); ok && from != to {
+	if kept.Release == nil {
+		if in.R.Spec.HasDatabase() {
+			o.logf("the schema baseline of %s %s is not known (%s): not checked", name, cur, kept.foreign())
+		}
+	} else if from, to, ok := baselines(o, &Installer{R: kept.Release, O: in.O}, in); ok && from != to {
 		return fmt.Errorf("%s %s starts schema baseline %d, and the install runs %s %s, at baseline %d: its data cannot carry over, so it moves to %s only by a fresh install",
 			m.Name, m.ProjectVersion, to, name, cur, from, m.ProjectVersion)
 	}
@@ -225,7 +229,11 @@ func (in *Installer) Upgrade(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	in.dropped = removedBy(kept, in.R)
+	if kept.Release != nil {
+		in.dropped = removedBy(kept.Release, in.R)
+	} else {
+		o.logf("the inputs and provision hook returns %s %s removes are not known (%s): kept", name, m.ProjectVersion, kept.foreign())
+	}
 	for _, k := range in.dropped.inputs {
 		if _, ok := env.Get(k); ok {
 			o.logf("input %s is not in %s %s: dropped", k, name, m.ProjectVersion)
@@ -233,6 +241,9 @@ func (in *Installer) Upgrade(ctx context.Context) error {
 	}
 	next, secrets, err := in.upgradeEnv(env, mode, added, values)
 	if err != nil {
+		return err
+	}
+	if err := in.routePaths(next, mode); err != nil {
 		return err
 	}
 	if o.DryRun {
@@ -270,7 +281,7 @@ func (in *Installer) Upgrade(ctx context.Context) error {
 	if st.Snapshot, err = in.snapshot(ctx, env); err != nil {
 		return err
 	}
-	if err := (&Installer{R: kept, O: in.O}).keepPrev(env, st); err != nil {
+	if err := in.keepPrev(env, st, kept); err != nil {
 		return err
 	}
 	// .env is the switch: before it the install still runs the release it ran (a re-run of its
@@ -300,20 +311,18 @@ func (in *Installer) Upgrade(ctx context.Context) error {
 	return nil
 }
 
-// keptInstaller returns the release the install's kept installer carries, and refuses one that is
-// not the release it runs: kept with it in PrevDir, that installer is what a rollback goes back
-// with.
-func (in *Installer) keptInstaller(name, version, revision string) (*Release, error) {
-	files, err := payload.Read(in.ctl())
-	if err == nil {
-		var r *Release
-		if r, err = Load(files); err == nil {
-			m := r.Manifest
-			if m.Name == name && m.ProjectVersion == version && strconv.Itoa(m.Revision) == revision {
-				return r, nil
-			}
-			err = fmt.Errorf("it carries %s %s (revision %d)", m.Name, m.ProjectVersion, m.Revision)
+// keptInstaller returns the release the install's kept installer carries (readKept), and refuses
+// one that is not the release it runs: kept with it in PrevDir, that installer is what a rollback
+// goes back with.
+func (in *Installer) keptInstaller(ctx context.Context, name, version, revision string) (*keptRelease, error) {
+	k, err := in.readKept(ctx, in.ctl(), func(m *release.Manifest) error {
+		if m.Name == name && m.ProjectVersion == version && strconv.Itoa(m.Revision) == revision {
+			return nil
 		}
+		return fmt.Errorf("it carries %s %s (revision %d)", m.Name, m.ProjectVersion, m.Revision)
+	})
+	if err == nil {
+		return k, nil
 	}
 	return nil, fmt.Errorf("%s is not the installer of %s %s (revision %s), so a rollback could not go back: re-run that release's installer in %s first (%w)",
 		in.ctl(), name, version, revision, in.O.Dir, err)
@@ -345,7 +354,8 @@ func (in *Installer) newer(cur, rev string) error {
 
 // sameFront refuses a release whose front the install cannot keep: a front where the install has
 // none or none where it has one, a TLS mode it no longer offers, a route the install does not
-// publish, a route's domain under an input the install does not record.
+// publish, a route's domain under an input the install does not record, routes the recorded
+// domains make clash (routeDomains).
 func (in *Installer) sameFront(env *EnvFile, mode string) error {
 	m := in.R.Manifest
 	_, served := env.Get("STOWAGE_TLS_MODE") // recorded by an install with a front
@@ -364,9 +374,14 @@ func (in *Installer) sameFront(env *EnvFile, mode string) error {
 		if _, ok := env.Get(spec.URLVar(r.Name)); !ok {
 			return fmt.Errorf("%s %s adds the route %s, which this install does not publish: a new route needs a new install", m.Name, m.ProjectVersion, r.Name)
 		}
-		if _, ok := env.Get(r.DomainInput); mode != Loopback && !ok {
-			return fmt.Errorf("%s %s takes the domain of %s from %s, which this install does not record", m.Name, m.ProjectVersion, r.Name, r.DomainInput)
+		if v, _ := env.Get(r.DomainInput); mode != Loopback && v == "" {
+			return fmt.Errorf("%s %s takes the domain of %s from %s, which this install does not record (or records empty): give it to a re-run of the installer the install runs, `%s --dir %s --set %s=<domain>`, then upgrade",
+				m.Name, m.ProjectVersion, r.Name, r.DomainInput, in.ctl(), in.O.Dir, r.DomainInput)
 		}
+	}
+	_, err := in.routeDomains(mode, func(k string) string { v, _ := env.Get(k); return v })
+	if err != nil {
+		return fmt.Errorf("%s %s: %w; give the routes their domains with a re-run of the installer the install runs, `%s --dir %s`, then upgrade", m.Name, m.ProjectVersion, err, in.ctl(), in.O.Dir)
 	}
 	return nil
 }
@@ -495,10 +510,12 @@ func (in *Installer) snapshot(ctx context.Context, env *EnvFile) (string, error)
 	return final, nil
 }
 
-// keepPrev keeps the running release — in.R, from the kept installer — in PrevDir, replacing the
-// one kept before. Its stack files are rendered from that release, not copied from the install,
-// whose files an interrupted upgrade may have left at another release.
-func (in *Installer) keepPrev(env *EnvFile, st state) error {
+// keepPrev keeps the running release — kept, the install's kept installer — in PrevDir, replacing
+// the one kept before. Its stack files are rendered from that release, not copied from the
+// install, whose files an interrupted upgrade may have left at another release; another
+// Stowage's release is copied as the install holds it, as its installer, which a rollback starts
+// it with, writes them again.
+func (in *Installer) keepPrev(env *EnvFile, st state, kept *keptRelease) error {
 	tmp := in.path(PrevDir + ".new")
 	if err := os.RemoveAll(tmp); err != nil {
 		return err
@@ -506,8 +523,17 @@ func (in *Installer) keepPrev(env *EnvFile, st state) error {
 	if err := os.Mkdir(tmp, 0o700); err != nil {
 		return err
 	}
-	if err := in.renderStack(env, tmp); err != nil {
-		return err
+	if kept.Release != nil {
+		if err := (&Installer{R: kept.Release, O: in.O}).renderStack(env, tmp); err != nil {
+			return err
+		}
+	} else {
+		// Another Stowage's stack files are its own to render: those its last start wrote.
+		for _, f := range stackFiles {
+			if err := copyFile(in.path(f), filepath.Join(tmp, f), 0o644); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return err
+			}
+		}
 	}
 	if err := copyFile(in.ctl(), filepath.Join(tmp, in.R.Ctl()), 0o755); err != nil {
 		return err
@@ -590,10 +616,12 @@ func releaseKey(k string) bool {
 // read a newer schema. A check that cannot run does not refuse.
 func (in *Installer) Rollback(ctx context.Context) error {
 	o := &in.O
-	env, unlock, err := in.openLocked(ctx)
+	env, locked, err := in.openLocked(ctx)
 	if err != nil {
 		return err
 	}
+	// The previous release's installer starts it, taking the lock itself.
+	unlock := sync.OnceFunc(locked)
 	defer unlock()
 	m := in.R.Manifest
 	name, cur, rev, err := sameProject(o.Dir, env, m)
@@ -616,19 +644,21 @@ func (in *Installer) Rollback(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	files, err := payload.Read(filepath.Join(prev, in.R.Ctl()))
-	if err != nil {
-		return fmt.Errorf("the previous release's installer: %w", err)
-	}
-	pr, err := Load(files)
-	if err != nil {
-		return fmt.Errorf("the previous release's installer: %w", err)
-	}
 	pname, pversion, prevRev := runs(prevEnv)
-	if pm := pr.Manifest; pm.Name != name || pm.ProjectVersion != st.ProjectVersion || pm.Revision != st.Revision ||
-		pname != name || pversion != st.ProjectVersion || prevRev != strconv.Itoa(st.Revision) {
-		return fmt.Errorf("%s does not hold one release: its installer carries %s %s (revision %d), its record says %s (revision %d), its .env %s %s (revision %s)",
-			prev, pm.Name, pm.ProjectVersion, pm.Revision, st.ProjectVersion, st.Revision, pname, pversion, prevRev)
+	var mixed error // PrevDir holding more than one release, told before its installer is run
+	pk, err := in.readKept(ctx, filepath.Join(prev, in.R.Ctl()), func(pm *release.Manifest) error {
+		if pm.Name != name || pm.ProjectVersion != st.ProjectVersion || pm.Revision != st.Revision ||
+			pname != name || pversion != st.ProjectVersion || prevRev != strconv.Itoa(st.Revision) {
+			mixed = fmt.Errorf("%s does not hold one release: its installer carries %s %s (revision %d), its record says %s (revision %d), its .env %s %s (revision %s)",
+				prev, pm.Name, pm.ProjectVersion, pm.Revision, st.ProjectVersion, st.Revision, pname, pversion, prevRev)
+		}
+		return mixed
+	})
+	switch {
+	case mixed != nil:
+		return mixed
+	case err != nil:
+		return fmt.Errorf("the previous release's installer: %w", err)
 	}
 	if cur == st.ProjectVersion && rev == strconv.Itoa(st.Revision) {
 		// A rollback that stopped after .env switched, or an upgrade that stopped before it (its
@@ -648,14 +678,22 @@ func (in *Installer) Rollback(ctx context.Context) error {
 		if err := os.RemoveAll(prev); err != nil {
 			return err
 		}
-		return (&Installer{R: pr, O: in.O}).up(ctx, env)
+		unlock()
+		return in.startKept(ctx, pk.Manifest, o.Offline || !pinnedImages(env))
 	}
 	if cur != m.ProjectVersion || rev != strconv.Itoa(m.Revision) {
 		return fmt.Errorf("%s runs %s %s (revision %s), and this installer carries %s (revision %d): a rollback is run by the installer the install keeps, `%s rollback --dir %s`",
 			o.Dir, name, cur, rev, m.ProjectVersion, m.Revision, in.ctl(), o.Dir)
 	}
 	o.Offline = o.Offline || !pinnedImages(prevEnv)
-	back := &Installer{R: pr, O: in.O}
+	// back is the previous release as this Stowage reads it: nil when another built it, whose
+	// spec only its own installer reads.
+	var back *Installer
+	if pk.Release != nil {
+		back = &Installer{R: pk.Release, O: in.O}
+	} else {
+		o.logf("%s: what only its spec tells is not checked", pk.foreign())
+	}
 	rolled := NewEnvFile()
 	// A value the release sets is the previous release's, or none where it records none (an image
 	// only the newer release has).
@@ -686,7 +724,7 @@ func (in *Installer) Rollback(ctx context.Context) error {
 		return err
 	}
 	// A dry run pulls them only when the check may read them.
-	if !o.DryRun || in.schemaOn() && back.schemaOn() {
+	if back != nil && (!o.DryRun || in.schemaOn() && back.schemaOn()) {
 		if err := back.fetchImages(ctx, rolled); err != nil {
 			return err
 		}
@@ -698,7 +736,7 @@ func (in *Installer) Rollback(ctx context.Context) error {
 		return fmt.Errorf("stopped before anything changed: %w", err)
 	}
 	if o.DryRun {
-		o.logf("a run would go back to %s %s (revision %d)", pr.Manifest.Name, st.ProjectVersion, st.Revision)
+		o.logf("a run would go back to %s %s (revision %d)", pk.Manifest.Name, st.ProjectVersion, st.Revision)
 		return nil
 	}
 	failed := in.path(FailedDir)
@@ -722,7 +760,7 @@ func (in *Installer) Rollback(ctx context.Context) error {
 	}
 	// As an upgrade: stack files, then .env (the switch), then the installer; PrevDir stays whole
 	// until the end, so an interrupted rollback can run again.
-	if err := in.restoreStack(prev, false); err != nil {
+	if err := in.restoreStack(prev, back == nil); err != nil {
 		return err
 	}
 	if err := rolled.WriteFile(in.path(envName)); err != nil {
@@ -738,10 +776,27 @@ func (in *Installer) Rollback(ctx context.Context) error {
 	if err := os.RemoveAll(prev); err != nil {
 		return err
 	}
-	if err := back.up(ctx, rolled); err != nil {
-		return fmt.Errorf("%w\nthe release left is kept in %s", err, failed)
+	unlock()
+	if err := in.startKept(ctx, pk.Manifest, o.Offline); err != nil {
+		return fmt.Errorf("%w\nthe install records %s %s; the release left is kept in %s", err, pk.Manifest.Name, st.ProjectVersion, failed)
 	}
 	return nil
+}
+
+// startKept starts the release the install now records, m, with the installer it keeps: a release
+// is started by its own Stowage's code, whichever Stowage built the one this installer carries.
+// On Docker that is a re-run of it (without the provision hook); a VM's installer (an OS
+// bundle's) runs its boot, which brings up the release the install records. The install is
+// unlocked: the child locks it, and says how to start it again if it cannot.
+func (in *Installer) startKept(ctx context.Context, m *release.Manifest, offline bool) error {
+	args := []string{"--dir", in.O.Dir, "--no-input", "--no-provision"}
+	if m.Bundled() {
+		args = []string{bootCmd, "--dir", in.O.Dir}
+	} else if offline {
+		args = append(args, "--offline")
+	}
+	in.O.logf("starting %s %s (revision %d) with its own installer: %s %s", m.Name, m.ProjectVersion, m.Revision, in.ctl(), strings.Join(args, " "))
+	return in.O.exec(ctx, in.ctl(), args)
 }
 
 // rollbackRefused is the rollback check's refusal: the database moved past what the previous
@@ -789,6 +844,9 @@ func (in *Installer) rollbackCheck(ctx context.Context, back *Installer, env, pr
 	} else if barriers != "" {
 		return refuse(fmt.Sprintf("the database carries %s, which removed something %s may still use", barriers, st.ProjectVersion))
 	}
+	if back == nil {
+		return unchecked("whether %s reads the newer schema %s is not known: another Stowage built it", st.ProjectVersion, now)
+	}
 	if !back.schemaOn() {
 		return unchecked("%s declares no schema compatibility", st.ProjectVersion)
 	}
@@ -830,8 +888,12 @@ func baselines(o *Options, from, to *Installer) (int, int, bool) {
 }
 
 // baselineCheck refuses to go back to the release back when it starts another schema baseline
-// than the installed one: decided from the two specs alone, before Docker is asked anything.
+// than the installed one: decided from the two specs alone, before Docker is asked anything. A
+// release another Stowage built (back nil) is not checked.
 func (in *Installer) baselineCheck(back *Installer, st state) error {
+	if back == nil {
+		return nil // another Stowage's release: said by Rollback
+	}
 	from, to, ok := baselines(&in.O, in, back)
 	if !ok || from == to {
 		return nil

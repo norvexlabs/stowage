@@ -291,11 +291,40 @@ volumes:
 		b, _ := io.ReadAll(resp.Body)
 		return strings.TrimSpace(string(b))
 	}
+	// child runs an installer a run starts (a rollback's re-run of the kept one) in this process,
+	// as its file's release: the installers here are payloads without a program.
+	var child func(context.Context, string, []string) error
+	child = func(ctx context.Context, exe string, args []string) error {
+		files, err := payload.Read(exe)
+		if err != nil {
+			return err
+		}
+		r, err := Load(files)
+		if err != nil {
+			return err
+		}
+		in := &Installer{R: r, O: Options{Out: &out, Log: &log, Docker: ExecTool{Bin: "docker"}, Self: exe, Exec: child}}
+		for i := 0; i < len(args); i++ {
+			switch args[i] {
+			case "--dir":
+				i++
+				in.O.Dir = args[i]
+			case "--no-input":
+			case "--no-provision":
+				in.O.NoProvision = true
+			case "--offline":
+				in.O.Offline = true
+			default:
+				return fmt.Errorf("no flag %s", args[i])
+			}
+		}
+		return in.Install(ctx)
+	}
 	// step runs the installer of version, which carries barriers, then the stack serves serves.
 	step := func(what string, version int, barriers string, run func(*Installer) error, serves int) error {
 		t.Helper()
 		r, self := build(version, barriers)
-		in := &Installer{R: r, O: Options{Dir: dir, Out: &out, Log: &log, Docker: ExecTool{Bin: "docker"}, Self: self}}
+		in := &Installer{R: r, O: Options{Dir: dir, Out: &out, Log: &log, Docker: ExecTool{Bin: "docker"}, Self: self, Exec: child}}
 		err := run(in)
 		if want := fmt.Sprintf("v=%d", serves); !strings.HasSuffix(page(), want) {
 			t.Fatalf("%s (%v): serves %q, want %s\n%s", what, err, page(), want, log.String())
@@ -580,7 +609,7 @@ func smokeCloudflareCaddyfile(t *testing.T, work, frontRef string, f spec.Front)
 	if err != nil {
 		t.Fatal(err)
 	}
-	cf := tlsCaddyfile(f, "dns-cloudflare", map[string]string{"app": "notes.smoke.test", "api": "api.smoke.test"}, "ops@example.com", "80", "443", true, func(k string) string { return vals[k] }, logins)
+	cf := tlsCaddyfile(f, "dns-cloudflare", map[string]string{"app": "notes.smoke.test", "api": "api.smoke.test"}, "ops@example.com", "443", true, func(k string) string { return vals[k] }, logins)
 	if !strings.Contains(cf, "client_auth") || !strings.Contains(cf, "basic_auth {\n\t\t\tops $2a$") {
 		t.Fatalf("no client authentication or login in:\n%s", cf)
 	}

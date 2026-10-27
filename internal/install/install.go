@@ -117,7 +117,10 @@ type Options struct {
 	Tofu Tool
 	SSH  Tool
 	Rand io.Reader
-	// Exec runs an installer as a child (upgrade --version); nil runs it on this terminal.
+	// Exec runs an installer as a child: the installers a run starts (upgrade --version and a
+	// revision's, a rollback's start, the VM boot's boot-rollback and boot), on this terminal when
+	// nil, and a kept installer's `--help` reading its own payload (readsItself), whose output is
+	// discarded and its run bounded when nil.
 	Exec func(ctx context.Context, exe string, args []string) error
 	// K8s is a run of `k8s`.
 	K8s K8sOptions
@@ -622,6 +625,10 @@ func tlsPublish(http, https int) (publish, error) {
 	if http == https {
 		return publish{}, fmt.Errorf("--http-port and --https-port are both %d", http)
 	}
+	// The front serves a moved HTTPS port in its container too, where 80 is its plain HTTP.
+	if https == 80 {
+		return publish{}, errors.New("--https-port 80: the front's plain HTTP port in its container; choose another")
+	}
 	return p, nil
 }
 
@@ -754,7 +761,7 @@ func (in *Installer) rerun(ctx context.Context) (err error) {
 		return err
 	}
 	defer unlock()
-	if err := in.sameRelease(env); err != nil {
+	if err := in.sameRelease(ctx, env); err != nil {
 		return err
 	}
 	// Before anything is recorded: nothing would come up to use it.
@@ -1099,7 +1106,7 @@ func (in *Installer) provisionUp(ctx context.Context, env *EnvFile, h *providers
 }
 
 // sameRelease refuses an install of another release: changing release is an upgrade.
-func (in *Installer) sameRelease(env *EnvFile) error {
+func (in *Installer) sameRelease(ctx context.Context, env *EnvFile) error {
 	m := in.R.Manifest
 	name, v, rev, err := sameProject(in.O.Dir, env, m)
 	if err != nil {
@@ -1107,7 +1114,7 @@ func (in *Installer) sameRelease(env *EnvFile) error {
 	}
 	if v != m.ProjectVersion || rev != strconv.Itoa(m.Revision) {
 		if in.newer(v, rev) != nil {
-			if _, err := in.keptInstaller(name, m.ProjectVersion, strconv.Itoa(m.Revision)); err == nil {
+			if _, err := in.keptInstaller(ctx, name, m.ProjectVersion, strconv.Itoa(m.Revision)); err == nil {
 				return fmt.Errorf("%s runs %s %s (revision %s), and keeps this installer, of %s (revision %d): the upgrade stopped before keeping its own; run the installer of %s with --dir %s", in.O.Dir, name, v, rev, m.ProjectVersion, m.Revision, v, in.O.Dir)
 			}
 			return fmt.Errorf("%s runs %s %s (revision %s), after this installer's %s (revision %d): run the installer it keeps, %s", in.O.Dir, name, v, rev, m.ProjectVersion, m.Revision, in.ctl())
@@ -1159,9 +1166,8 @@ func (in *Installer) renderStack(env *EnvFile, dir string) error {
 			domains[r.Name], _ = env.Get(r.DomainInput)
 		}
 		email, _ := env.Get(ACMEEmailVar)
-		httpPort, _ := env.Get(HTTPPortVar)
 		httpsPort, _ := env.Get(HTTPSPortVar)
-		cf = tlsCaddyfile(f, mode, domains, email, httpPort, httpsPort, clientCA != nil, get, logins)
+		cf = tlsCaddyfile(f, mode, domains, email, httpsPort, clientCA != nil, get, logins)
 	}
 	// The front's configuration: the Caddyfile, the client CA it reads, and in byo the files of
 	// tls/ it reads.
@@ -1281,6 +1287,8 @@ func (in *Installer) up(ctx context.Context, env *EnvFile) (err error) {
 		if err != nil {
 			return err
 		}
+		mode, _ := env.Get("STOWAGE_TLS_MODE")
+		hn.domains = hostDomains(in.R.Spec.Front, mode, func(k string) string { v, _ := env.Get(k); return v })
 		// The services' tables first: a table a start loads gives its service the label that
 		// recreates it.
 		if err := in.loadTables(ctx); err != nil {

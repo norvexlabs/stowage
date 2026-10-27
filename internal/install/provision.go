@@ -515,7 +515,7 @@ func (in *Installer) Provision(ctx context.Context) error {
 		return err
 	}
 	defer unlock()
-	if err := in.sameRelease(env); err != nil {
+	if err := in.sameRelease(ctx, env); err != nil {
 		return err
 	}
 	var inputs, outs map[string]string

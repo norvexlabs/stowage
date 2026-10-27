@@ -36,6 +36,10 @@ type hostNet struct {
 	addrs map[string]string
 	reach map[string][]string
 	open  []peerPort
+	// domains are the front's routes' domains, which a target reaches the front by at the
+	// loopback, where the front publishes its ports: the alias the stack's network gives them is
+	// not on the host's.
+	domains []string
 }
 
 // bridged is the targets' ports the firewall accepts from the stack's bridges, sorted, each once.
@@ -67,7 +71,7 @@ type peerPort struct {
 }
 
 // give adds to extra, the service name's settings, what hn gives it: the host's network and the
-// names it maps for a target, the ports at its address for a peer, and every target's name for a
+// names it maps for a target (its peers, the other targets, the routes' domains), the ports at its address for a peer, and every target's name for a
 // service of a network of its own (another's namespace or none maps nothing).
 func (hn hostNet) give(extra map[string]any, name, mode string) {
 	if len(hn.targets) == 0 {
@@ -83,6 +87,9 @@ func (hn hostNet) give(extra map[string]any, name, mode string) {
 			if t != name {
 				hosts = append(hosts, t+":127.0.0.1")
 			}
+		}
+		for _, d := range hn.domains {
+			hosts = append(hosts, d+":127.0.0.1")
 		}
 	} else if mode == "" || mode == "bridge" {
 		for _, t := range sortedKeys(hn.targets) {
