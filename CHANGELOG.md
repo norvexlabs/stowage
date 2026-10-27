@@ -3,7 +3,7 @@
 Stowage's own releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
-## [0.15.0]
+## [0.15.0] - 2026-10-27
 
 ### Added
 - **A handoff the old process starts**: `services.<name>.update_signal` names the signal a
