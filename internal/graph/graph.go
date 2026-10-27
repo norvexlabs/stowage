@@ -403,8 +403,11 @@ func imageNode(p *project.Project, name, projectVersion string) (Node, error) {
 	for _, k := range argKeys {
 		b.Field("arg", k+"="+img.Args[k])
 	}
+	// Each address in its order: a step's resolver returns them so.
 	for _, h := range slices.Sorted(maps.Keys(img.AddHosts)) {
-		b.Field("add-host", h+"="+img.AddHosts[h])
+		for _, a := range img.AddHosts[h] {
+			b.Field("add-host", h+"="+a)
+		}
 	}
 	// Entered only when set (default is BuildKit's own network): a build naming neither digests as
 	// one that has no such keys.

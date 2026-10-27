@@ -1804,6 +1804,22 @@ func TestInspectJudgesTheProjectsInterfaces(t *testing.T) {
 	if it == nil || it.State != Advice || !strings.Contains(it.Want, "[RoutingPolicyRule] FirewallMark=0x1 Table=100") || !strings.Contains(it.Want, "ethtool -L <its NIC> combined max") || !strings.Contains(it.Want, "ethtool -K <its NIC> rx-gro-list on") {
 		t.Errorf("not owned: %+v", it)
 	}
+	// A role the host forwards from, and one a service intercepts on: its firewall's rules, in
+	// DOCKER-USER for IPv4 and IPv6, as advice beside the interface's own. Neither, none.
+	s.Interfaces[2].Forward, s.Interfaces[2].Transparent = []string{"uplink"}, true
+	var fw []Item
+	for _, it := range s.Inspect(ctx, host(4096, 2)) {
+		if it.Kind == "interface" && strings.Contains(it.Have, "forwards or intercepts") {
+			fw = append(fw, it)
+		}
+	}
+	if len(fw) != 1 || fw[0].Name != "vpn0" || fw[0].State != Advice || fw[0].Want != "iptables -I DOCKER-USER -i vpn0 -o uplink -j ACCEPT; "+
+		"iptables -I DOCKER-USER -i uplink -o vpn0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT; "+
+		"ip6tables -I DOCKER-USER -i vpn0 -o uplink -j ACCEPT; "+
+		"ip6tables -I DOCKER-USER -i uplink -o vpn0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT; "+
+		`nft: iifname "vpn0" meta l4proto { tcp, udp } socket transparent 1 accept, in an input chain that drops` {
+		t.Errorf("firewall advice %+v", fw)
+	}
 }
 
 // The project's NIC settings on the VM: each feature on its own where the driver lets it (a fixed

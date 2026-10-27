@@ -365,8 +365,9 @@ func frontCommand(f spec.Front, ca string) []string {
 // reads a recorded value).
 // digest labels the front with its configuration (the Caddyfile, a byo certificate), so a change
 // recreates it. ca is the CA it publishes (frontCommand). clientCA mounts the install's client CA.
-// ipv6 turns IPv6 on for the default network.
-func frontCompose(f spec.Front, l4 []spec.L4Route, get func(string) string, mode string, host hostAPI, digest, ca string, clientCA, ipv6, vm bool) ([]byte, error) {
+// ipv6 turns IPv6 on for the default network. onHost are the services on the host's network
+// (hostServices), whose L4 routes' ports are their own.
+func frontCompose(f spec.Front, l4 []spec.L4Route, get func(string) string, mode string, host hostAPI, digest, ca string, clientCA, ipv6 bool, onHost []string) ([]byte, error) {
 	var ports []string
 	volumes := []string{"./" + Caddyfile + ":/etc/caddy/Caddyfile:ro", "stowage-front-data:/data"}
 	if mode == Loopback {
@@ -417,13 +418,13 @@ func frontCompose(f spec.Front, l4 []spec.L4Route, get func(string) string, mode
 		}
 	}
 	// Each L4 route's host port, on every address or its bind address, to its upstream as it is:
-	// compose appends these to the service's own ports. The VM publishes none: the route's
-	// service runs on the host's network (hostNet).
-	if vm {
-		l4 = nil
-	}
+	// compose appends these to the service's own ports. None for a service on the host's network
+	// (hostNet), which listens on the port itself: on the VM, every route's.
 	for _, r := range l4 {
 		name, target, _ := strings.Cut(r.Upstream, ":")
+		if slices.Contains(onHost, name) {
+			continue
+		}
 		svc, _ := services[name].(map[string]any)
 		if svc == nil {
 			svc = map[string]any{}

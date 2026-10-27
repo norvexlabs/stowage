@@ -180,9 +180,26 @@ func TestEachRuleFiresOnFull(t *testing.T) {
 		want  string
 	}{
 		{"absolute path", []edit{{sp, "compose: deploy/compose.yaml", "compose: /etc/compose.yaml"}}, nil, "must be relative to the project root"},
-		{"add_hosts name", []edit{{sp, "packages.atlas.test: 192.0.2.10", "Packages.atlas.test: 192.0.2.10"}}, nil, `images.api.add_hosts: "Packages.atlas.test" is not a host name`},
-		{"add_hosts address", []edit{{sp, "packages.atlas.test: 192.0.2.10", "packages.atlas.test: 192.0.2"}}, nil, `images.api.add_hosts.packages.atlas.test: "192.0.2" is not an IP address without a zone`},
-		{"add_hosts zone", []edit{{sp, "packages.atlas.test: 192.0.2.10", "packages.atlas.test: fe80::1%eth0"}}, nil, `"fe80::1%eth0" is not an IP address without a zone`},
+		{"add_hosts name", []edit{{sp, "packages.atlas.test: [", "Packages.atlas.test: ["}}, nil, `images.api.add_hosts: "Packages.atlas.test" is not a host name`},
+		{"add_hosts address", []edit{{sp, "[192.0.2.10, 192.0.2.11]", "[192.0.2.10, 192.0.2]"}}, nil, `images.api.add_hosts.packages.atlas.test[1]: "192.0.2" is not an IP address without a zone`},
+		{"add_hosts zone", []edit{{sp, "[192.0.2.10, 192.0.2.11]", "[fe80::1%eth0]"}}, nil, `"fe80::1%eth0" is not an IP address without a zone`},
+		{"add_hosts empty", []edit{{sp, "[192.0.2.10, 192.0.2.11]", "[]"}}, nil, `images.api.add_hosts.packages.atlas.test: is empty`},
+		{"add_hosts twice", []edit{{sp, "[192.0.2.10, 192.0.2.11]", "[192.0.2.10, 192.0.2.10]"}}, nil, `images.api.add_hosts.packages.atlas.test[1]: 192.0.2.10 is given twice`},
+		{"transparent unknown role", []edit{{sp, "transparent: [vpn0]", "transparent: [vpn1]"}}, nil, `services.vpn.transparent[0]: "vpn1" is not one of host.interfaces`},
+		{"transparent twice", []edit{{sp, "transparent: [vpn0]", "transparent: [vpn0, vpn0]"}}, nil, "services.vpn.transparent[1]: vpn0 is given twice"},
+		{"transparent empty", []edit{{sp, "transparent: [vpn0]", "transparent: []"}}, nil, "services.vpn.transparent: is empty"},
+		{"transparent without a table", []edit{{sp, "nftables: deploy/vpn.nft, transparent", "transparent"}}, nil, "services.vpn.transparent: vpn's own table steers the traffic to its sockets: give it nftables"},
+		{"transparent off the host's network", []edit{{sp, "host_network: true, nftables: deploy/vpn.nft", "nftables: deploy/vpn.nft"}}, nil, "services.vpn.transparent: a transparent socket is on the host's network"},
+		{"host network with network_mode", []edit{{cp, "    command: [atlas-server, echo, \"17008\"]\n", "    command: [atlas-server, echo, \"17008\"]\n    network_mode: none\n"}}, nil, "services.vpn.host_network: vpn sets network_mode none in deploy/compose.yaml"},
+		{"host network with ports", []edit{{cp, "    expose: [\"17008\"]\n", "    expose: [\"17008\"]\n    ports: [\"127.0.0.1:17009:17008\"]\n"}}, nil, "deploy/compose.yaml: services.vpn.ports: vpn runs on the host's network (services.vpn.host_network), where it listens on its ports itself"},
+		{"host network with networks", []edit{{cp, "    expose: [\"17008\"]\n", "    expose: [\"17008\"]\n    networks: [default]\n"}}, nil, "deploy/compose.yaml: services.vpn.networks: vpn runs on the host's network (services.vpn.host_network), which holds no other"},
+		{"host network scaled", []edit{{cp, "    expose: [\"17008\"]\n", "    expose: [\"17008\"]\n    scale: 2\n"}}, nil, "deploy/compose.yaml: services.vpn: 2 containers: vpn runs on the host's network (services.vpn.host_network), where one container holds its ports"},
+		{"host network with an address of its own", []edit{{sp, "relay: { interface: edge", "relay: { host_network: true, interface: edge"}}, nil, "services.relay.interface: relay runs on the host's network (host_network)"},
+		{"host network route bound on Docker", []edit{{sp, "echo: { cpus: 1, irq: on }", "echo: { cpus: 1, irq: on, host_network: true }"}}, nil, "l4.routes[0].bind_input: echo runs on the host's network (services.echo.host_network)"},
+		{"forward to an unknown role", []edit{{sp, "forward: [uplink]", "forward: [wan]"}}, nil, `host.interfaces.vpn0.forward[0]: "wan" is not one of host.interfaces`},
+		{"forward to itself", []edit{{sp, "forward: [uplink]", "forward: [vpn0]"}}, nil, "host.interfaces.vpn0.forward[0]: is vpn0 itself"},
+		{"forward twice", []edit{{sp, "forward: [uplink]", "forward: [uplink, uplink]"}}, nil, "host.interfaces.vpn0.forward[1]: uplink is given twice"},
+		{"forward empty", []edit{{sp, "forward: [uplink]", "forward: []"}}, nil, "host.interfaces.vpn0.forward: is empty"},
 		{"build network", []edit{{sp, "    network: default\n", "    network: bridge\n"}}, nil, `images.api.network: "bridge" is not a build network: default, host, none`},
 		{"build keys with ref", []edit{{sp, "postgres:  { ref: ", "postgres:  { network: none, ref: "}}, nil, "images.postgres: ref and build fields are exclusive"},
 		{"memory share of 0", []edit{{sp, memShares, "services:\n  postgres: { memory: 0 }\n"}}, nil, "services.postgres.memory: 0: a percent of the host's RAM, from 1 to 90"},
@@ -226,7 +243,7 @@ func TestEachRuleFiresOnFull(t *testing.T) {
 		{"login field unknown", []edit{{sp, "basic_auth: { user: ops, secret: OPS_PASSWORD }", "basic_auth: { user: ops, secret: OPS_PASSWORD, realm: x }"}}, nil, "field realm not found"},
 		{"l4 port mapped on the vm", []edit{{sp, "port: 17007, upstream: echo:17007, address_input", "port: 17008, upstream: echo:17007, address_input"}}, nil, "l4.routes[0].upstream: echo:17007: on the VM the service runs on the host's network, where nothing maps one port to another: it listens on the route's port, 17008"},
 		{"l4 service on a network", []edit{{cp, "  echo:\n    image: ${STOWAGE_IMAGE_INGEST}\n", "  echo:\n    networks: [default]\n    image: ${STOWAGE_IMAGE_INGEST}\n"}}, nil, "deploy/compose.yaml: services.echo.networks: the VM runs echo on the host's network (the L4 route echo), which holds no other"},
-		{"l4 service scaled", []edit{{cp, "  echo:\n    image: ${STOWAGE_IMAGE_INGEST}\n", "  echo:\n    scale: 2\n    image: ${STOWAGE_IMAGE_INGEST}\n"}}, nil, "deploy/compose.yaml: services.echo: 2 containers: the VM runs echo on the host's network (the L4 route echo), where one container holds the port"},
+		{"l4 service scaled", []edit{{cp, "  echo:\n    image: ${STOWAGE_IMAGE_INGEST}\n", "  echo:\n    scale: 2\n    image: ${STOWAGE_IMAGE_INGEST}\n"}}, nil, "deploy/compose.yaml: services.echo: 2 containers: the VM runs echo on the host's network (the L4 route echo), where one container holds its ports"},
 		{"hook env not recorded", []edit{{sp, "env: [ADMIN_EMAIL, ADMIN_PASSWORD, INTERNAL_SERVICE_SECRET]", "env: [ADMIN_EMAIL, API_URL]"}}, nil, "hooks.provision.env[1]: API_URL is no input, secret or safe default"},
 		{"hook returns an input", []edit{{sp, "returns: [ADMIN_API_KEY, ADMIN_LOGIN]", "returns: [ADMIN_API_KEY, ADMIN_EMAIL]"}}, nil, "hooks.provision.returns[1]: ADMIN_EMAIL is an input, a value the install records"},
 		{"hook returns a secret", []edit{{sp, "returns: [ADMIN_API_KEY, ADMIN_LOGIN]", "returns: [INTERNAL_SERVICE_SECRET]"}}, nil, "hooks.provision.returns[0]: INTERNAL_SERVICE_SECRET is a secret"},
@@ -1315,6 +1332,34 @@ func TestPublishedPortOnDockerWarns(t *testing.T) {
 
 // An L4 route's allowlist, and the front's or a route's interface, without a kairos shape are
 // warned: nothing enforces them.
+// A service on the host's network with neither a docker nor a kairos shape is warned: only those
+// run it there, the chart's pod sets hostNetwork itself.
+func TestHostNetworkWithoutDockerNorKairosWarns(t *testing.T) {
+	t.Parallel()
+	const msg = "services.vpn.host_network: only the docker and kairos shapes run a service on the host's network"
+	root := testutil.CopyExample(t, "full")
+	if res := run(t, root); slices.ContainsFunc(res.Findings, func(f Finding) bool { return strings.Contains(f.String(), msg) }) {
+		t.Fatalf("warned with both shapes: %+v", res.Findings)
+	}
+	raw, err := os.ReadFile(filepath.Join(root, specFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	y := string(raw)
+	for _, shape := range []string{"docker", "kairos"} {
+		start := strings.Index(y, "\n  "+shape+":")
+		end := len(y)
+		if next := nextKey.FindStringIndex(y[start+1:]); next != nil {
+			end = start + 1 + next[0]
+		}
+		y = y[:start] + y[end:]
+	}
+	testutil.Write(t, root, specFile, y)
+	if res := run(t, root); !slices.ContainsFunc(res.Findings, func(f Finding) bool { return f.Severity == Warning && strings.Contains(f.String(), msg) }) {
+		t.Fatalf("not warned: %+v", res.Findings)
+	}
+}
+
 func TestL4AllowlistWithoutKairosWarns(t *testing.T) {
 	t.Parallel()
 	root := testutil.CopyExample(t, "full")
@@ -1323,7 +1368,8 @@ func TestL4AllowlistWithoutKairosWarns(t *testing.T) {
 	if errs := errorsOf(res); len(errs) > 0 {
 		t.Fatalf("errors:\n%s", strings.Join(errs, "\n"))
 	}
-	// The front's and a route's interface too: only the VM's firewall opens a port on one alone.
+	// The front's and a route's interface too, a service's interception and a role's forwarding:
+	// only the VM's firewall is Stowage's.
 	var got []string
 	for _, f := range res.Findings {
 		if f.Severity != Warning {
@@ -1335,12 +1381,14 @@ func TestL4AllowlistWithoutKairosWarns(t *testing.T) {
 		"l4.routes[1].allow_input: only the VM's firewall enforces it, and the project has no kairos shape: the route is open to every source",
 		"front.interface: only the VM's firewall opens a port on one interface alone",
 		"l4.routes[1].interface: only the VM's firewall opens a port on one interface alone",
+		"services.vpn.transparent: only the VM's firewall is Stowage's (a kairos shape)",
+		"host.interfaces.vpn0.forward: only the VM's firewall is Stowage's (a kairos shape)",
 	} {
 		if !slices.ContainsFunc(got, func(g string) bool { return strings.Contains(g, want) }) {
 			t.Errorf("no %q in %q", want, got)
 		}
 	}
-	if len(got) != 3 {
+	if len(got) != 5 {
 		t.Errorf("findings: %q", got)
 	}
 }
@@ -1651,6 +1699,7 @@ const memShares = `services:                                                    
 const servicesBlock = memShares + `  echo: { cpus: 1, irq: on }                                   # a whole core of its own, the NICs' interrupts on it too
   ingest: { nftables: deploy/ingest.nft }                      # its own nftables table, loaded on the VM
   relay: { interface: edge, address_input: RELAY_ADDRESS }     # an address of its own on the edge NIC (an ipvlan network)
+  vpn: { host_network: true, nftables: deploy/vpn.nft, transparent: [vpn0] }   # on the host's network; its table steers vpn0's traffic to its own sockets
 `
 
 // vmSizeLine is examples/full's shapes.kairos.size.
@@ -1850,7 +1899,7 @@ func TestNftTablesAsNftReadsThem(t *testing.T) {
 		nftDropsInput("table inet svc { chain f { type filter hook forward priority 0; policy drop; } chain i { type filter hook input priority 0; policy accept; } }") {
 		t.Error("nftDropsInput")
 	}
-	if !spec.NftKeyword("mark") || spec.NftKeyword("Mark") || spec.NftKeyword("ingest") || spec.NftTableName.MatchString("a/b") {
+	if !spec.NftKeyword("mark") || !spec.NftKeyword("tunnel") || !spec.NftKeyword("typeof") || spec.NftKeyword("vpn") || spec.NftKeyword("Mark") || spec.NftKeyword("ingest") || spec.NftTableName.MatchString("a/b") {
 		t.Error("names")
 	}
 }

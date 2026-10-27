@@ -71,12 +71,20 @@ services:
       ECHO_ENDPOINT: ${STOWAGE_L4_ECHO}
     restart: unless-stopped
 
-  # A one-shot no other service waits for: it checks the echo service answers, then exits. The
-  # install judges it by its exit code.
+  # A one-shot no other service waits for: it checks the echo and vpn services answer by their
+  # names, then exits. The install judges it by its exit code.
   echo-check:
     image: ${STOWAGE_IMAGE_INGEST}
-    command: [python3, -c, "import socket, time\nfor _ in range(50):\n    try:\n        socket.create_connection(('echo', 17007), 2).close()\n        break\n    except OSError:\n        time.sleep(0.2)\nelse:\n    raise SystemExit('echo does not answer')"]
-    depends_on: [echo]
+    command: [python3, -c, "import socket, time\nfor name, port in (('echo', 17007), ('vpn', 17008)):\n    for _ in range(50):\n        try:\n            socket.create_connection((name, port), 2).close()\n            break\n        except OSError:\n            time.sleep(0.2)\n    else:\n        raise SystemExit(name + ' does not answer')"]
+    depends_on: [echo, vpn]
+
+  # On the host's network (services.vpn.host_network): it would open vpn0, and echoes on 17008,
+  # where the stack reaches it by its name.
+  vpn:
+    image: ${STOWAGE_IMAGE_INGEST}
+    command: [atlas-server, echo, "17008"]
+    expose: ["17008"]
+    restart: unless-stopped
 
   # Optional: runs only while RELAY_SOURCE holds a value (its input turns the relay profile on).
   relay:

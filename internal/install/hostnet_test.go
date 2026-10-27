@@ -73,7 +73,7 @@ func TestTheVMRunsTheL4RoutesServicesOnTheHostsNetwork(t *testing.T) {
 	if want := []peerPort{{8080, "tcp"}, {9090, "tcp"}, {9100, "tcp"}, {17007, "tcp"}, {17007, "udp"}}; !slices.Equal(hn.bridged(), want) {
 		t.Errorf("bridged %v, want %v", hn.bridged(), want)
 	}
-	if !strings.Contains(log.String(), "echo (an L4 route's, on the host's network) depends on migrate, which exposes no port it can be published on: it cannot reach migrate by name (give migrate's ports in its expose:)") {
+	if !strings.Contains(log.String(), "echo (on the host's network) depends on migrate, which exposes no port it can be published on: it cannot reach migrate by name (give migrate's ports in its expose:)") {
 		t.Errorf("log %q", log)
 	}
 	raw, err := contentCompose(m, nil, []byte("key"), tune.Container{Sysctls: map[string]string{"net.core.somaxconn": "4096"}}, hostPlan{}, hn)
@@ -132,6 +132,51 @@ func TestDockerRunsTheL4RoutesServicesOnTheStacksNetwork(t *testing.T) {
 	raw, err := contentCompose(m, nil, []byte("key"), tune.Container{}, hostPlan{}, hn)
 	if err != nil || strings.Contains(string(raw), "network_mode") || strings.Contains(string(raw), "extra_hosts") || string(raw) != contentPlaceholder {
 		t.Errorf("%s %v", raw, err)
+	}
+}
+
+// On Docker a service asking for the host's network (host_network) runs there as the VM runs an L4
+// route's: it reaches its peers by name at their addresses, the stack and the services run on
+// demand reach it at the host's gateway, and its routes' ports are its own, published by no one.
+// The firewall's ports are the VM's alone.
+func TestDockerRunsAHostNetworkServiceOnTheHostsNetwork(t *testing.T) {
+	t.Parallel()
+	in, m, _ := hostNetInstaller(t, false)
+	in.R.Spec.Services = map[string]spec.Service{"echo": {HostNetwork: true}}
+	hn, err := in.hostNetwork(context.Background(), m, nil)
+	if err != nil || !hn.targets["echo"] || len(hn.targets) != 1 {
+		t.Fatalf("%+v %v", hn, err)
+	}
+	raw, err := contentCompose(m, nil, []byte("key"), tune.Container{}, hostPlan{}, hn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc struct {
+		Services map[string]struct {
+			NetworkMode string   `yaml:"network_mode"`
+			ExtraHosts  []string `yaml:"extra_hosts"`
+		} `yaml:"services"`
+	}
+	if err := yaml.Unmarshal(raw, &doc); err != nil {
+		t.Fatalf("%v\n%s", err, raw)
+	}
+	if echo := doc.Services["echo"]; echo.NetworkMode != "host" || !slices.Equal(echo.ExtraHosts, []string{"cache:" + hn.addrs["cache"], "db:" + hn.addrs["db"]}) {
+		t.Errorf("echo %+v", echo)
+	}
+	if d := doc.Services["data"]; d.NetworkMode != "" || !slices.Equal(d.ExtraHosts, []string{"echo:host-gateway"}) {
+		t.Errorf("data %+v", d)
+	}
+	if got := in.targetHosts(); !slices.Equal(got, []string{"echo:host-gateway"}) {
+		t.Errorf("target hosts %v", got)
+	}
+	fc, err := frontCompose(in.R.Spec.Front, in.R.Spec.L4.Routes, func(string) string { return "" }, "internal", hostAPI{}, "sha256:x", "", false, false, in.hostServices())
+	if err != nil || strings.Contains(string(fc), "17007") {
+		t.Errorf("the front publishes the route of a service on the host's network: %v\n%s", err, fc)
+	}
+	// Without it, Docker publishes the route's port from the stack's network.
+	in.R.Spec.Services = nil
+	if fc, err := frontCompose(in.R.Spec.Front, in.R.Spec.L4.Routes, func(string) string { return "" }, "internal", hostAPI{}, "sha256:x", "", false, false, in.hostServices()); err != nil || !strings.Contains(string(fc), "published: \"17007\"") {
+		t.Errorf("no route's port: %v\n%s", err, fc)
 	}
 }
 
@@ -194,7 +239,7 @@ func TestTheFrontAnswersToItsRoutesDomainsInside(t *testing.T) {
 	get := func(k string) string { return vals[k] }
 	aliases := func(mode string) []string {
 		t.Helper()
-		raw, err := frontCompose(f, nil, get, mode, hostAPI{}, "sha256:x", "", false, false, false)
+		raw, err := frontCompose(f, nil, get, mode, hostAPI{}, "sha256:x", "", false, false, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -350,6 +395,24 @@ func TestAnImageGoneLeavesItsExposeOut(t *testing.T) {
 // A peer is published on none of the ports the host holds on every address, nor at all when its
 // network is another service's or the host's; an image's EXPOSE the start cannot take is left
 // out, logged, where a compose `expose:` fails.
+// Two installs on one host give a peer of one name addresses of their own: each follows from the
+// install's project too.
+func TestTwoInstallsGiveAPeerTwoAddresses(t *testing.T) {
+	t.Parallel()
+	addr := func(project string) string {
+		in, m, _ := hostNetInstaller(t, true)
+		m.Name = project
+		hn, err := in.hostNetwork(context.Background(), m, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return hn.addrs["db"]
+	}
+	if a, b := addr("notes-prod-1"), addr("notes-staging-2"); a == "" || a == b {
+		t.Errorf("db at %q and %q", a, b)
+	}
+}
+
 func TestPeersPortsTheHostHoldsAreNotPublished(t *testing.T) {
 	t.Parallel()
 	in, m, log := hostNetInstaller(t, true)

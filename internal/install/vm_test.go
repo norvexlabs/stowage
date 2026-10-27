@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -1041,6 +1042,112 @@ func TestEveryStartOpensTheL4PortsFromTheirSources(t *testing.T) {
 	env.Set("FEED_SOURCES", "192.0.2.7; tcp dport 22 accept")
 	if err := in.openPorts(ctx, env, hn); err == nil || !strings.Contains(err.Error(), "FEED_SOURCES: ") {
 		t.Errorf("err = %v", err)
+	}
+}
+
+// iptHost records each host command as a line and what it reads from stdin; a command starting
+// with fail fails, and so does a check of a rule (-C) while noJump.
+type iptHost struct {
+	ran, stdin []string
+	fail       string
+	noJump     bool
+}
+
+func (h *iptHost) Run(_ context.Context, c Cmd) ([]byte, error) {
+	line := strings.Join(c.Args, " ")
+	h.ran = append(h.ran, line)
+	if c.Stdin != nil {
+		b, _ := io.ReadAll(c.Stdin)
+		h.stdin = append(h.stdin, string(b))
+	}
+	if h.fail != "" && strings.HasPrefix(line, h.fail) || h.noJump && slices.Contains(c.Args, "-C") {
+		return nil, errors.New("iptables: no chain/target/match by that name")
+	}
+	return nil, nil
+}
+
+// A service's interception is accepted on its roles alone, and a role's forwarding past Docker's
+// FORWARD policy in a chain DOCKER-USER jumps to, for IPv4 and IPv6: the role's traffic out, the
+// replies back. A start that changes nothing runs no iptables; a failed one applies again at the
+// next start; a release that forwards nothing empties the chain once, then leaves iptables alone.
+// A kernel without IPv6 has no ip6tables chain of Docker's: the forwarding is IPv4's alone. It
+// sets ipv6Proc, so it runs alone.
+func TestForwardingWithoutIPv6IsIPv4s(t *testing.T) {
+	ipv6Proc = filepath.Join(t.TempDir(), "absent")
+	t.Cleanup(func() { ipv6Proc = "/proc/sys/net/ipv6" })
+	host := &iptHost{}
+	r, _ := testInstallerWith(t, "1.0.0", func(s *spec.Spec) {
+		s.Host = &spec.Host{Interfaces: map[string]spec.HostInterface{"uplink": {Primary: true}, "lan": {Forward: []string{"uplink"}}}}
+	})
+	in := &Installer{R: r, O: Options{Firewall: t.TempDir(), Host: host}}
+	if err := in.forwardRoles(context.Background()); err != nil || !slices.Equal(host.ran, []string{"iptables-restore -w --noflush", "iptables -w -C DOCKER-USER -j STOWAGE-FORWARD"}) {
+		t.Errorf("ran %q %v", host.ran, err)
+	}
+}
+
+func TestEveryStartForwardsAndInterceptsOnTheRoles(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	host := &iptHost{noJump: true}
+	r, _ := testInstallerWith(t, "1.0.0", func(s *spec.Spec) {
+		s.Host = &spec.Host{Interfaces: map[string]spec.HostInterface{
+			"uplink": {Primary: true},
+			"vpn0":   {Kind: spec.InterfaceTUN, Forward: []string{"uplink"}},
+		}}
+		s.Services = map[string]spec.Service{"proxy": {HostNetwork: true, Transparent: []string{"vpn0"}}, "api": {CPUs: 1}}
+	})
+	in := &Installer{R: r, O: Options{Dir: t.TempDir(), Firewall: filepath.Join(t.TempDir(), "nftables.d"), Host: host}}
+	env := NewEnvFile()
+	env.Set("STOWAGE_TLS_MODE", Loopback)
+	hn := hostNet{targets: map[string]bool{"proxy": true}}
+	host.fail = "ip6tables-restore"
+	if err := in.openPorts(ctx, env, hn); err == nil || !strings.Contains(err.Error(), "ip6tables") {
+		t.Fatalf("a failed restore: %v", err)
+	}
+	host.fail, host.ran, host.stdin = "", nil, nil
+	if err := in.openPorts(ctx, env, hn); err != nil {
+		t.Fatal(err)
+	}
+	rules := "*filter\n:STOWAGE-FORWARD - [0:0]\n" +
+		"-A STOWAGE-FORWARD -i vpn0 -o uplink -j ACCEPT\n" +
+		"-A STOWAGE-FORWARD -i uplink -o vpn0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT\n" +
+		"COMMIT\n"
+	want := []string{
+		"iptables-restore -w --noflush", "iptables -w -C DOCKER-USER -j STOWAGE-FORWARD", "iptables -w -I DOCKER-USER -j STOWAGE-FORWARD",
+		"ip6tables-restore -w --noflush", "ip6tables -w -C DOCKER-USER -j STOWAGE-FORWARD", "ip6tables -w -I DOCKER-USER -j STOWAGE-FORWARD",
+		"nft -f /etc/nftables.conf",
+	}
+	if !slices.Equal(host.ran, want) || !slices.Equal(host.stdin, []string{rules, rules}) {
+		t.Errorf("ran %q\nstdin %q", host.ran, host.stdin)
+	}
+	if b, _ := os.ReadFile(filepath.Join(in.O.Firewall, "notes-ports.nft")); !strings.HasSuffix(string(b), "\niifname \"vpn0\" meta l4proto { tcp, udp } socket transparent 1 accept\n") {
+		t.Errorf("ports %q", b)
+	}
+	// Nothing changed: no iptables, no reload.
+	host.ran, host.noJump = nil, false
+	if err := in.openPorts(ctx, env, hn); err != nil || host.ran != nil {
+		t.Errorf("ran %q %v", host.ran, err)
+	}
+	// No role forwards: the chain is emptied once, its jump kept.
+	in.R.Spec.Host.Interfaces["vpn0"] = spec.HostInterface{Kind: spec.InterfaceTUN}
+	host.stdin = nil
+	if err := in.openPorts(ctx, env, hn); err != nil {
+		t.Fatal(err)
+	}
+	empty := "*filter\n:STOWAGE-FORWARD - [0:0]\nCOMMIT\n"
+	if !slices.Equal(host.ran, []string{"iptables-restore -w --noflush", "iptables -w -C DOCKER-USER -j STOWAGE-FORWARD", "ip6tables-restore -w --noflush", "ip6tables -w -C DOCKER-USER -j STOWAGE-FORWARD"}) || !slices.Equal(host.stdin, []string{empty, empty}) {
+		t.Errorf("ran %q\nstdin %q", host.ran, host.stdin)
+	}
+	host.ran = nil
+	if err := in.openPorts(ctx, env, hn); err != nil || host.ran != nil {
+		t.Errorf("ran %q %v", host.ran, err)
+	}
+	// The intercepting service off (a profile): nothing is accepted on its role.
+	if err := in.openPorts(ctx, env, hostNet{}); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(filepath.Join(in.O.Firewall, "notes-ports.nft")); strings.Contains(string(b), "socket transparent") {
+		t.Errorf("ports %q", b)
 	}
 }
 

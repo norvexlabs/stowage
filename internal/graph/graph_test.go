@@ -190,7 +190,7 @@ func TestBuildInputsReachTheImage(t *testing.T) {
 		t.Errorf("a target change: %v", c)
 	}
 	before = inputs(build(t, root))
-	testutil.Edit(t, root, "stowage.yaml", "packages.atlas.test: 192.0.2.10", "packages.atlas.test: 192.0.2.11")
+	testutil.Edit(t, root, "stowage.yaml", "packages.atlas.test: [192.0.2.10, 192.0.2.11]", "packages.atlas.test: [192.0.2.11, 192.0.2.10]")
 	if c := changed(before, inputs(build(t, root))); !c["image/api"] || c["image/ingest"] {
 		t.Errorf("an add_hosts change: %v", c)
 	}

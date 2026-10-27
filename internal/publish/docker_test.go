@@ -116,7 +116,7 @@ func TestDockerBuilderPassesTheSpecAndYieldsAnOCIImage(t *testing.T) {
 		"--tag stowage-build/" + p.Spec.Name + "-" + built + ":0123456789abcdef-",
 		"--target " + spec.Target,
 		"--build-arg STOWAGE_PROJECT_VERSION=2026.10.25",
-		"--add-host packages.atlas.test=192.0.2.10",
+		"--add-host packages.atlas.test=192.0.2.10 --add-host packages.atlas.test=192.0.2.11",
 		filepath.Join(root, spec.Context),
 	} {
 		if !strings.Contains(buildCall, want) {

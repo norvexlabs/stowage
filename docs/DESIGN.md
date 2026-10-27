@@ -60,7 +60,7 @@ Full examples: [full](../examples/full/stowage.yaml) (every key),
 | `version`, `changelog`, `channels` | § 3 |
 | `registry` | prefix, pull credentials (baked into the installer), push auth |
 | `images` | build table: `context`/`dockerfile`/`target`/`args`/`add_hosts`/`network`/`inputs`, or `ref` for a pinned upstream image |
-| `stack.compose` | **the single service definition**, no `build:` (lint-enforced); `extends` within the file, `profiles:` only those an input turns on, no `ports:` of its own nor `network_mode: host` on the VM |
+| `stack.compose` | **the single service definition**, no `build:` (lint-enforced); `extends` within the file, `profiles:` only those an input turns on, no `ports:` of its own nor `network_mode: host` (`services.<name>.host_network` asks for the host's network) on the VM |
 | `front` | optional (absent or empty: no front, the `l4` routes alone); TLS modes offered, hostname (and path prefix) → upstream routes, header stripping, forward auth, a source allowlist, client certificates and a login per route, which route is the portal, the CA published to the stack, the project's default host ports |
 | `l4` | host ports published to a service as they are (TCP or UDP), beside the front; the input holding the address clients dial; the input holding the sources the VM lets reach it; the advanced input holding the host address the port is bound to |
 | `health` | readiness probe (provider) used by every consumer: compose healthcheck, health gate, install wait |
@@ -1039,6 +1039,17 @@ every shape, the VM end-to-end test upgrading through it), then the health gate.
   is the VM's alone: only there does Stowage own the firewall, so lint makes its input a `kairos`
   one rather than let Docker ask for a restriction nothing enforces. A service on the host's
   network is refused with a `kairos` shape for the same reason as its own `ports:`.
+- **The host's network asked for in the spec, on both shapes** — some services must see the
+  host's interfaces and addresses (a VPN daemon and the tun device it opens, a resolver bound to
+  it, a transparent proxy, whose `SO_ORIGINAL_DST` on a bridge is Docker's DNAT target) and are
+  no route at all. `services.<name>.host_network` runs one as the VM runs an L4 route's service,
+  on Docker too: one model, so a stack works the same on both, its peers by name at their
+  loopback addresses and the stack reaching it at the host's gateway. Its routes' ports are then
+  its own on Docker as well: nothing publishes them, so no install-time move and no bind address,
+  which nothing on Docker would enforce. The VM still runs every L4 route's service on the host's
+  network unasked: the input chain is what enforces a route's allowlist and bind address there,
+  and making the key the only way would also put those services on the host's network on
+  Docker, where a fixed host port clashes with the host's other tenants.
 - **Volumes in backups beside the dump, not in it** — pg_dump's archive has no room for files and
   its size is unknown until it ends, so a tar cannot hold it without a disk copy the VM never
   makes: each volume is an object of its own, named after the dump, uploaded first so the dump's
@@ -1159,7 +1170,23 @@ every shape, the VM end-to-end test upgrading through it), then the health gate.
   network, so its traffic meets the input chain, which drops by default: the allowlist is an
   input rule under /run, and a boot drops the port until the install's start writes it again
   (fail closed), though Docker restarts the service before that start. A bind address is a
-  destination match there, as nothing binds the port for the service.
+  destination match there, as nothing binds the port for the service. A service's TPROXY keeps a
+  packet's destination (a remote host's), so the input chain's drop would take it and no accept
+  of the service's own table can override a drop of another: the VM accepts what the kernel
+  hands a transparent socket (`socket transparent 1`, which the VM's kernel allows in an input
+  chain; the OS bundle's build fails without its module), on the roles the service names alone, as its listeners bind every address and an
+  unrestricted match would open their own ports on every interface. REDIRECT, the alternative,
+  tracks every connection, which a gateway pays in throughput.
+- **Forwarding past Docker's FORWARD policy** — Docker sets `ip filter` and `ip6 filter`'s FORWARD
+  policy to DROP, and a base chain's accept ends that chain alone, so the VM's own forward chain
+  cannot let through what Docker's drops: the accept goes in `DOCKER-USER`, Docker's place for
+  it, which exists with its iptables backend alone (the VM's). A chain of Stowage's own, jumped
+  to from there, holds the rules, replaced in one `iptables-restore --noflush` transaction, so
+  a start never leaves a moment without them and a role taken out of the spec loses its rules.
+  The accept is narrow — the declared role out of the declared one, the replies back — and
+  leaves the judging to the stack's own table, which decides and masquerades what it forwards.
+  Rejected: Docker's `ip-forward-no-drop`, which would forward between every interface of the
+  VM.
 - **Creating a VM** — one entry, `<short>-stow vm create`, in the order an administrator decides:
   the platform (it decides the disk format, the cloud-config's medium and whether OpenTofu can
   create the VM), then the machine (host name, administrator and SSH key, network), then the

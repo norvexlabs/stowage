@@ -119,7 +119,9 @@ func (b *DockerBuilder) Build(ctx context.Context, p *project.Project, r BuildRe
 		args = append(args, "--build-arg", graph.VersionArg+"="+r.Version)
 	}
 	for _, h := range slices.Sorted(maps.Keys(img.AddHosts)) {
-		args = append(args, "--add-host", h+"="+img.AddHosts[h])
+		for _, a := range img.AddHosts[h] {
+			args = append(args, "--add-host", h+"="+a)
+		}
 	}
 	if img.Network == "host" {
 		args = append(args, "--allow", "network.host") // BuildKit's entitlement for it

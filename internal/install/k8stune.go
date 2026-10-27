@@ -79,6 +79,9 @@ func (in *Installer) K8sTune() error {
 			what += ", networkd's " + n
 		}
 		fmt.Fprintf(w, "  interface %s: %s   %s\n", i.Role, what, i.Reason)
+		for _, f := range i.Firewall("FORWARD") {
+			fmt.Fprintf(w, "    %s\n", f)
+		}
 	}
 	for _, a := range sys.KernelArgs {
 		fmt.Fprintf(w, "  kernel argument %s   %s\n", a, a.Reason)

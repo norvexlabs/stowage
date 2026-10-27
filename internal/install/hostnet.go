@@ -12,8 +12,8 @@ import (
 	"strings"
 )
 
-// peerAddress is the loopback address the VM publishes the nth (from 1) peer of the L4 routes'
-// services on — a service one depends on, which it reaches by name there from the host's network:
+// peerAddress is the loopback address the install publishes the nth (from 1) peer of the
+// services on the host's network on — a service one depends on, which it reaches by name there from the host's network:
 // 127.0.4.n, one address each, so two peers listening on one port never clash.
 func peerAddress(n int) string { return fmt.Sprintf("127.0.4.%d", n) }
 
@@ -23,11 +23,12 @@ const maxPeers = 254
 // peerNet holds the peers' addresses, which the front's loopback address never takes.
 var peerNet = netip.MustParsePrefix("127.0.4.0/24")
 
-// hostNet is how the VM runs the stack's L4 routes' services (targets): on the host's network,
-// with no Docker networking between their clients and them. A target reaches each service it
-// depends on by name at that peer's own address (peerAddress), where its ports are published, and another target
-// at the loopback; every other service reaches a target by name at the host's gateway. Zero on
-// Docker, which publishes the routes' ports from the stack's network.
+// hostNet is how the install runs the stack's services on the host's network (targets): those
+// asking for it (services.<name>.host_network), and on the VM the L4 routes' services, with no
+// Docker networking between their clients and them. A target reaches each service it depends on by
+// name at that peer's own address (peerAddress), where its ports are published, and another target
+// at the loopback; every other service reaches a target by name at the host's gateway. Docker
+// publishes the other L4 routes' ports from the stack's network.
 type hostNet struct {
 	targets map[string]bool
 	// peers are the ports each peer is published on at its address (addrs); reach, the peers each
@@ -109,38 +110,50 @@ func (hn hostNet) give(extra map[string]any, name, mode string) {
 }
 
 // targetHosts are the extra hosts a service Stowage runs on demand on the stack's network (the
-// provision hook, a command provider) reaches the VM's L4 routes' services by: each at the host's
-// gateway (one a profile turned off too: its name then reaches nothing). None on Docker.
+// provision hook, a command provider) reaches the services on the host's network by: each at the
+// host's gateway (one a profile turned off too: its name then reaches nothing).
 func (in *Installer) targetHosts() []string {
-	if in.O.Firewall == "" {
-		return nil
-	}
 	var hosts []string
-	for _, r := range in.R.Spec.L4.Routes {
-		name, _, _ := strings.Cut(r.Upstream, ":")
-		if h := name + ":host-gateway"; !slices.Contains(hosts, h) {
-			hosts = append(hosts, h)
-		}
+	for _, name := range in.hostServices() {
+		hosts = append(hosts, name+":host-gateway")
 	}
-	slices.Sort(hosts)
 	return hosts
 }
 
-// hostNetwork is the VM's hostNet for the stack m (zero on Docker): the services the L4 routes
-// target that m runs (a profile that is off leaves one out), and each one's peers, the services
+// hostServices are the services the spec runs on the host's network, sorted, each once: those of
+// services.<name>.host_network, and on the VM the L4 routes'.
+func (in *Installer) hostServices() []string {
+	var names []string
+	for _, name := range sortedKeys(in.R.Spec.Services) {
+		if in.R.Spec.Services[name].HostNetwork {
+			names = append(names, name)
+		}
+	}
+	if in.O.Firewall != "" {
+		for _, r := range in.R.Spec.L4.Routes {
+			name, _, _ := strings.Cut(r.Upstream, ":")
+			names = append(names, name)
+		}
+	}
+	slices.Sort(names)
+	return slices.Compact(names)
+}
+
+// hostNetwork is the hostNet for the stack m: the services on the host's network (hostServices)
+// that m runs (a profile that is off leaves one out), and each one's peers, the services
 // of m it depends on with a network namespace of their own, with the ports each exposes (its
 // `expose:`, then its image's EXPOSE) but those taken, which the stack or the host holds on every
 // address (a peer's can then not be published on its own). A peer exposing none, and one in
 // another's namespace, are logged: the target cannot reach it by name.
 func (in *Installer) hostNetwork(ctx context.Context, m *composeModel, taken map[peerPort]bool) (hostNet, error) {
 	hn := hostNet{targets: map[string]bool{}, peers: map[string][]peerPort{}, addrs: map[string]string{}, reach: map[string][]string{}}
-	if in.O.Firewall == "" {
-		return hostNet{}, nil
-	}
-	for _, r := range in.R.Spec.L4.Routes {
-		name, _, _ := strings.Cut(r.Upstream, ":")
+	for _, name := range in.hostServices() {
 		if _, ok := m.Services[name]; ok {
 			hn.targets[name] = true
+		}
+	}
+	for _, r := range in.R.Spec.L4.Routes {
+		if name, _, _ := strings.Cut(r.Upstream, ":"); hn.targets[name] {
 			hn.open = append(hn.open, peerPort{r.Port, r.Protocol})
 		}
 	}
@@ -174,7 +187,7 @@ func (in *Installer) hostNetwork(ctx context.Context, m *composeModel, taken map
 				continue
 			}
 			if mode := svc.NetworkMode; mode != "" && mode != "bridge" {
-				in.O.logf("%s (an L4 route's, on the host's network) depends on %s, whose network is %s: it cannot reach %s by name", t, p, mode, p)
+				in.O.logf("%s (on the host's network) depends on %s, whose network is %s: it cannot reach %s by name", t, p, mode, p)
 				continue
 			}
 			if _, done := hn.peers[p]; !done {
@@ -196,24 +209,25 @@ func (in *Installer) hostNetwork(ctx context.Context, m *composeModel, taken map
 				}
 			}
 			if len(hn.peers[p]) == 0 {
-				in.O.logf("%s (an L4 route's, on the host's network) depends on %s, which exposes no port it can be published on: it cannot reach %s by name (give %s's ports in its expose:)", t, p, p, p)
+				in.O.logf("%s (on the host's network) depends on %s, which exposes no port it can be published on: it cannot reach %s by name (give %s's ports in its expose:)", t, p, p, p)
 				continue
 			}
 			hn.reach[t] = append(hn.reach[t], p)
 		}
 	}
 	if len(peers) > maxPeers {
-		return hostNet{}, fmt.Errorf("the L4 routes' services depend on more than %d services, each given an address of 127.0.4.0/24", maxPeers)
+		return hostNet{}, fmt.Errorf("the services on the host's network depend on more than %d services, each given an address of 127.0.4.0/24", maxPeers)
 	}
-	// Each peer's address follows from its name, the next free one on a clash: a peer added or
-	// removed moves another only when their names clash.
+	// Each peer's address follows from its name and the install's project, the next free one on
+	// a clash: a peer added or removed moves another only when their names clash, and two installs
+	// on one host seldom give a peer of one name the same address.
 	used := map[int]bool{}
 	for _, p := range sortedKeys(hn.peers) {
 		if !slices.Contains(peers, p) {
 			continue
 		}
 		h := fnv.New32a()
-		h.Write([]byte(p))
+		h.Write([]byte(m.Name + "/" + p))
 		n := int(h.Sum32()%maxPeers) + 1
 		for used[n] {
 			n = n%maxPeers + 1

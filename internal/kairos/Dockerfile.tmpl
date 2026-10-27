@@ -141,7 +141,8 @@ RUN set -e{{with .PurgeAfterInit}}; {{template "purge" .}}{{end}}; \
 
 # The clouds' fast NICs, gVNIC (gve) and Azure's MANA, ship in the kernel's extra modules: those two
 # are copied from it, not its 110 MB. The build fails when a kernel lacks one, a module the boot's
-# tuning loads (TUN devices, the connection tracker, BBR, fq), a server's NIC or disk controller
+# tuning loads (TUN devices, the connection tracker, BBR, fq), nftables' socket and TPROXY matches
+# (services.<name>.transparent), a server's NIC or disk controller
 # a bare-metal install boots with (Intel, Broadcom, Mellanox, Marvell/QLogic, Realtek, NVMe, AHCI,
 # LSI/Broadcom MegaRAID and SAS, Microchip, HPE).
 RUN set -e; apt-get update; cd /tmp; \
@@ -153,7 +154,7 @@ RUN set -e; apt-get update; cd /tmp; \
                 if [ -z "$f" ]; then echo "linux-modules-extra-$v has no $m" >&2; exit 1; fi; \
                 install -D -m 0644 "$f" "$k/${f#*/modules/$v/}"; done; \
             rm -rf /tmp/extra linux-modules-extra-*.deb; depmod "$v"; fi; \
-        for m in tun nf_conntrack tcp_bbr sch_fq gve mana mlx5_core \
+        for m in tun nf_conntrack tcp_bbr sch_fq nft_socket nft_tproxy gve mana mlx5_core \
             ice i40e ixgbe igb igc e1000e bnxt_en mlx4_en tg3 qede r8169 nvme ahci megaraid_sas mpt3sas smartpqi hpsa; do \
             modinfo -k "$v" "$m" >/dev/null || { echo "kernel $v lacks $m" >&2; exit 1; }; done; done; \
     rm -rf /var/lib/apt/lists/*

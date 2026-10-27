@@ -105,9 +105,9 @@ type Image struct {
 	Dockerfile string            `yaml:"dockerfile"`
 	Target     string            `yaml:"target"`
 	Args       map[string]string `yaml:"args"`
-	// AddHosts are the names the build's steps resolve to fixed addresses, by name (BuildKit's
-	// /etc/hosts is read-only to a step).
-	AddHosts map[string]string `yaml:"add_hosts"`
+	// AddHosts are the names the build's steps resolve to fixed addresses, by name, each to every
+	// address of its list in order (BuildKit's /etc/hosts is read-only to a step).
+	AddHosts map[string][]string `yaml:"add_hosts"`
 	// Network is the build steps' network: default (BuildKit's own), host or none.
 	Network string   `yaml:"network"`
 	Inputs  []string `yaml:"inputs"`
@@ -142,6 +142,13 @@ type Service struct {
 	IRQ string `yaml:"irq"`
 	// Nftables is its nftables table, a file of the project holding one `table inet <service>`.
 	Nftables string `yaml:"nftables"`
+	// Transparent are the host.interfaces roles its table steers traffic crossing the host to its
+	// own sockets on (TPROXY): the VM's input chain accepts there what the kernel hands a
+	// transparent socket.
+	Transparent []string `yaml:"transparent"`
+	// HostNetwork runs it on the host's network (Docker and the VM), as the VM runs an L4 route's
+	// service: the stack reaches it by name at the host's gateway.
+	HostNetwork bool `yaml:"host_network"`
 	// Interface is the host.interfaces NIC it has an address of its own on, an ipvlan network
 	// beside the stack's bridge, the address from AddressInput.
 	Interface    string `yaml:"interface"`
@@ -531,6 +538,9 @@ type HostInterface struct {
 	MTU                int                 `yaml:"mtu"`
 	RoutingPolicyRules []map[string]string `yaml:"routing_policy_rules"`
 	Routes             []map[string]string `yaml:"routes"`
+	// Forward are the roles the host forwards this role's traffic out of (and their replies back),
+	// past Docker's FORWARD policy: the stack's own table judges it.
+	Forward []string `yaml:"forward"`
 	// Ethtool is a NIC's settings in ethtool's own terms, over the tune profile's.
 	Ethtool *Ethtool `yaml:"ethtool"`
 	Reason  string   `yaml:"reason"`
@@ -556,18 +566,25 @@ type Ethtool struct {
 // installer names a file after it).
 var NftTableName = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_.-]*$`)
 
-// nftKeywords are words nft reads as its own where a table's name goes: a service of one has no
-// table of its own.
-var nftKeywords = []string{"accept", "add", "arp", "bridge", "chain", "comment", "continue", "counter", "create", "ct",
-	"define", "delete", "describe", "destroy", "dnat", "drop", "dup", "element", "elements", "ether", "exthdr", "fib",
-	"filter", "flags", "flow", "flowtable", "flush", "fwd", "goto", "hash", "hook", "icmp", "icmpv6", "include",
-	"inet", "insert", "ip", "ip6", "jhash", "jump", "limit", "list", "log", "map", "masquerade", "meta", "monitor",
-	"nat", "netdev", "notrack", "numgen", "osf", "policy", "priority", "queue", "quota", "redefine", "redirect",
-	"reject", "rename", "replace", "reset", "return", "route", "rt", "rule", "ruleset", "secmark", "set", "size",
-	"snat", "socket", "symhash", "synproxy", "table", "tcp", "timeout", "tproxy", "type", "udp", "undefine", "vlan",
-	"ah", "cgroup", "comp", "dccp", "esp", "export", "geneve", "get", "gre", "handle", "igmp", "iif", "iifname",
-	"import", "index", "last", "mark", "oif", "oifname", "pkttype", "position", "sctp", "skgid", "skuid", "th",
-	"udplite", "vmap", "vxlan"}
+// nftKeywords are words nft reads as its own where a table's name goes (each nft 1.1.6 refuses
+// there, from its scanner, and those older releases refuse): a service of one has no table of
+// its own.
+var nftKeywords = []string{
+	"accept", "add", "ah", "all", "and", "arp", "auto-merge", "bridge", "cgroup", "chain", "comment", "comp",
+	"constant", "continue", "counter", "cpu", "create", "ct", "day", "dccp", "define", "delete", "describe",
+	"destroy", "device", "devices", "dnat", "drop", "dst", "dup", "dynamic", "ecn", "element", "elements", "eq",
+	"esp", "ether", "exists", "expires", "export", "exthdr", "fib", "filter", "flags", "flow", "flowtable",
+	"flush", "frag", "fwd", "gc-interval", "ge", "geneve", "get", "goto", "gre", "gretap", "gt", "handle",
+	"hash", "hbh", "hook", "hour", "ibriport", "ibrname", "icmp", "icmpv6", "igmp", "iif", "iifgroup",
+	"iifname", "iiftype", "import", "include", "index", "inet", "insert", "interval", "ip", "ip6", "ipsec",
+	"jhash", "jump", "last", "le", "limit", "list", "log", "lshift", "lt", "map", "mark", "masquerade", "meta",
+	"meter", "mh", "missing", "monitor", "nat", "ne", "netdev", "nftrace", "not", "notrack", "numgen",
+	"obriport", "obrname", "offload", "oif", "oifgroup", "oifname", "oiftype", "or", "osf", "pkttype", "policy",
+	"position", "priority", "queue", "quota", "random", "redefine", "redirect", "reject", "rename", "replace",
+	"reset", "return", "route", "rshift", "rt", "rt0", "rt2", "rtclassid", "rule", "ruleset", "sctp", "secmark",
+	"set", "size", "skgid", "skuid", "snat", "socket", "srh", "symhash", "synproxy", "table", "tcp", "th",
+	"time", "timeout", "tproxy", "tunnel", "type", "typeof", "udp", "udplite", "undefine", "update", "vlan",
+	"vmap", "vni", "vxlan", "xor", "xt"}
 
 // NftKeyword reports whether name is one nft reads as its own (nftKeywords): its keywords are
 // lower-case, and nft's identifiers case-sensitive.

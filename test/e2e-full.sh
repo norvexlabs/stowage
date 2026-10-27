@@ -77,6 +77,11 @@ atlas_running "$V1" 1
 # The one-shot echo-check, which no service waits for, exited 0: the install came up all the same.
 [[ $(docker ps -a --filter "label=com.docker.compose.project=$(project)" --filter label=com.docker.compose.service=echo-check --format '{{.State}} {{.Status}}') == "exited Exited (0)"* ]] ||
 	{ stack_logs >&2; fail "echo-check did not exit 0"; }
+# The vpn service runs on the host's network (services.vpn.host_network), where echo-check
+# reached it by its name, at the host's gateway.
+vpn_id=$(docker ps -q --filter "label=com.docker.compose.project=$(project)" --filter label=com.docker.compose.service=vpn)
+[[ -n $vpn_id && $(docker inspect --format '{{.HostConfig.NetworkMode}}' "$vpn_id") == host ]] ||
+	{ stack_logs >&2; fail "the vpn service is not on the host's network"; }
 # The ops route asks for a client certificate, which plain HTTP never carries: it refuses everyone.
 expect_code 403 --max-time 10 "http://127.0.0.1:$OPS_PORT/health"
 # The status route serves its path on its own port, the path kept for the api; nothing else there.

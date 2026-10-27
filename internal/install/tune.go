@@ -298,7 +298,10 @@ func releaseHost(sys *tune.System, s *spec.Spec) {
 	for _, r := range slices.Sorted(maps.Keys(s.Host.Interfaces)) {
 		i := s.Host.Interfaces[r]
 		ti := tune.Interface{Role: r, Kind: cmp.Or(i.Kind, spec.InterfaceNIC), MTU: i.MTU,
-			RoutingPolicyRules: i.RoutingPolicyRules, Routes: i.Routes, Reason: i.Reason}
+			RoutingPolicyRules: i.RoutingPolicyRules, Routes: i.Routes, Forward: i.Forward, Reason: i.Reason}
+		for _, svc := range s.Services {
+			ti.Transparent = ti.Transparent || slices.Contains(svc.Transparent, r)
+		}
 		if e := i.Ethtool; e != nil {
 			ti.NIC = &tune.NICSettings{Features: e.Features, EEE: e.EEE}
 			if e.Channels != nil {

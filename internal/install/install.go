@@ -576,7 +576,7 @@ func heldOn(own map[string]bool, r spec.L4Route, host string) bool {
 // hostKey is publishedPorts' key of a service running on the host's network.
 func hostKey(service string) string { return "host:" + service }
 
-// onHost reports whether r's service runs on the host's network (the VM's L4 routes'): it holds
+// onHost reports whether r's service runs on the host's network (hostServices): it holds
 // the route's port itself, on whatever address it listens on.
 func onHost(own map[string]bool, r spec.L4Route) bool {
 	service, _, _ := strings.Cut(r.Upstream, ":")
@@ -1195,7 +1195,7 @@ func (in *Installer) renderStack(env *EnvFile, dir string) error {
 			}
 		}
 	}
-	fc, err := frontCompose(f, in.R.Spec.L4.Routes, get, mode, in.hostAPI(), "sha256:"+hex.EncodeToString(h.Sum(nil)), ca, clientCA != nil, get(IPv6Var) == "true", in.O.Firewall != "")
+	fc, err := frontCompose(f, in.R.Spec.L4.Routes, get, mode, in.hostAPI(), "sha256:"+hex.EncodeToString(h.Sum(nil)), ca, clientCA != nil, get(IPv6Var) == "true", in.hostServices())
 	if err != nil {
 		return err
 	}
@@ -1705,11 +1705,15 @@ func bindAddr(r spec.L4Route, get func(string) string) string {
 
 // l4Exposure says where a Docker install's L4 route listens and who decides its sources: Docker
 // publishes the port past the host's own firewall rules, so on every address it is open to
-// whoever reaches the host. Empty on the VM, whose firewall applies the route's allowlist.
+// whoever reaches the host; a service on the host's network listens on it itself, behind them.
+// Empty on the VM, whose firewall applies the route's allowlist.
 func (in *Installer) l4Exposure(r spec.L4Route, get func(string) string) string {
+	name, _, _ := strings.Cut(r.Upstream, ":")
 	switch a := bindAddr(r, get); {
 	case in.O.Firewall != "":
 		return ""
+	case slices.Contains(in.hostServices(), name):
+		return "on the addresses " + name + " binds on the host's network, behind this host's own firewall"
 	case a != "":
 		return "on " + a + " alone"
 	case r.BindInput != "":
@@ -1719,8 +1723,10 @@ func (in *Installer) l4Exposure(r spec.L4Route, get func(string) string) string 
 	}
 }
 
-// heldPorts are the ports the VM holds on every address, which a peer of an L4 route's service
-// cannot be published on beside them: SSH's, the TLS front's and the L4 routes'.
+// heldPorts are the ports the host holds on every address, which a peer of a service on the
+// host's network cannot be published on beside them: SSH's, the TLS front's and the L4 routes'.
+// A Docker host's own other listeners are its operator's: a peer's port one of them holds fails
+// the start, naming it.
 func (in *Installer) heldPorts(env *EnvFile) map[peerPort]bool {
 	held := map[peerPort]bool{{22, "tcp"}: true}
 	if mode, _ := env.Get("STOWAGE_TLS_MODE"); in.R.Spec.HasFront() && mode != Loopback {
@@ -1810,6 +1816,14 @@ func (in *Installer) openPorts(ctx context.Context, env *EnvFile, hn hostNet) er
 			}
 		}
 	}
+	// What a service's table steers to its own transparent sockets (TPROXY), on the roles it names:
+	// the packet keeps the destination it had, no address of this host's.
+	for _, role := range in.transparentRoles(hn) {
+		input = fmt.Appendf(input, "%smeta l4proto { tcp, udp } socket transparent 1 accept\n", in.iif(role))
+	}
+	if err := in.forwardRoles(ctx); err != nil {
+		return err
+	}
 	// The forward chain's file goes: nothing of this install is forwarded to be judged there.
 	files := []struct {
 		path, what string
@@ -1855,6 +1869,94 @@ func (in *Installer) openPorts(ctx context.Context, env *EnvFile, hn hostNet) er
 		return fmt.Errorf("loading the firewall with the install's ports: %w", err)
 	}
 	return nil
+}
+
+// transparentRoles are the roles the services this start runs on the host's network (hn) intercept
+// traffic on (services.<name>.transparent), sorted, each once: none for a service a profile turned
+// off.
+func (in *Installer) transparentRoles(hn hostNet) []string {
+	var roles []string
+	for name, svc := range in.R.Spec.Services {
+		if hn.targets[name] {
+			roles = append(roles, svc.Transparent...)
+		}
+	}
+	slices.Sort(roles)
+	return slices.Compact(roles)
+}
+
+// ipv6Proc is the kernel's IPv6 settings, absent where it runs without IPv6 (ipv6.disable=1).
+var ipv6Proc = "/proc/sys/net/ipv6"
+
+// ForwardChain is the iptables chain, jumped to from Docker's DOCKER-USER, that accepts what the
+// VM forwards between host.interfaces roles (forwardRules) past Docker's FORWARD policy (DROP):
+// one name, as a VM holds one install. Each command waits for the xtables lock (-w), so a
+// check failing on Docker's hold never adds a second jump.
+const ForwardChain = "STOWAGE-FORWARD"
+
+// forwardRules are ForwardChain's rules, as iptables-restore reads them: each role's traffic out
+// of each role it forwards to (host.interfaces.<role>.forward), and the replies back, nothing new
+// into the role; nil when no role forwards. The stack's own table judges what is forwarded.
+func forwardRules(h *spec.Host) []byte {
+	b := fmt.Appendf(nil, "*filter\n:%s - [0:0]\n", ForwardChain)
+	n := 0
+	if h != nil {
+		for _, role := range sortedKeys(h.Interfaces) {
+			for _, out := range h.Interfaces[role].Forward {
+				b = fmt.Appendf(b, "-A %s -i %s -o %s -j ACCEPT\n", ForwardChain, role, out)
+				b = fmt.Appendf(b, "-A %s -i %s -o %s -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT\n", ForwardChain, out, role)
+				n++
+			}
+		}
+	}
+	if n == 0 {
+		return nil
+	}
+	return append(b, "COMMIT\n"...)
+}
+
+// forwardRoles gives ForwardChain its rules (forwardRules), for IPv4 and IPv6, in one transaction
+// each that replaces the chain's rules alone, and makes sure DOCKER-USER jumps to it. A record of
+// them under O.Firewall (/run, which a boot empties as it does iptables's rules) skips a start that
+// changes nothing; with no role forwarding and no record, iptables is left alone.
+func (in *Installer) forwardRoles(ctx context.Context) error {
+	want := forwardRules(in.R.Spec.Host)
+	record := filepath.Join(in.O.Firewall, in.R.Spec.Name+"-forward.rules")
+	cur, _ := os.ReadFile(record)
+	if bytes.Equal(cur, want) {
+		return nil
+	}
+	// The record goes first: a start that fails here finds a change, and applies again.
+	if err := os.Remove(record); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("the forwarding between the host's interfaces: %w", err)
+	}
+	rules := want
+	if rules == nil {
+		rules = fmt.Appendf(nil, "*filter\n:%s - [0:0]\nCOMMIT\n", ForwardChain)
+	}
+	tables := []string{"iptables", "ip6tables"}
+	if _, err := os.Stat(ipv6Proc); err != nil {
+		tables = tables[:1] // a kernel without IPv6: Docker keeps no ip6tables chain either
+	}
+	for _, t := range tables {
+		if _, err := in.O.Host.Run(ctx, Cmd{Args: []string{t + "-restore", "-w", "--noflush"}, Stdin: bytes.NewReader(rules)}); err != nil {
+			return fmt.Errorf("the forwarding between the host's interfaces (%s): %w", t, err)
+		}
+		jump := []string{"DOCKER-USER", "-j", ForwardChain}
+		if _, err := in.O.Host.Run(ctx, Cmd{Args: append([]string{t, "-w", "-C"}, jump...)}); err == nil {
+			continue
+		}
+		if _, err := in.O.Host.Run(ctx, Cmd{Args: append([]string{t, "-w", "-I"}, jump...)}); err != nil {
+			return fmt.Errorf("the forwarding between the host's interfaces (%s's DOCKER-USER): %w", t, err)
+		}
+	}
+	if want == nil {
+		return nil
+	}
+	if err := os.MkdirAll(in.O.Firewall, 0o755); err != nil {
+		return err
+	}
+	return writeAtomic(record, bytes.NewReader(want), 0o644, nil)
 }
 
 // iif is the firewall's match of a rule on the host.interfaces role given, the interface's name;
@@ -2560,7 +2662,7 @@ func loopbackAddr(a string) (string, error) {
 		return "", fmt.Errorf("address %s is not a loopback address (127.x.x.x, ::1): without TLS, the stack would serve sign-in over plain HTTP to the network", a)
 	}
 	if peerNet.Contains(ip.Unmap()) {
-		return "", fmt.Errorf("address %s is in %s, the addresses the VM gives the L4 routes' services' dependencies: choose another", a, peerNet)
+		return "", fmt.Errorf("address %s is in %s, the addresses the services on the host's network reach their dependencies at: choose another", a, peerNet)
 	}
 	return ip.Unmap().String(), nil
 }

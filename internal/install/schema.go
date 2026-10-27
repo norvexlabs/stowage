@@ -205,7 +205,7 @@ type commandRun struct {
 
 // runCommand runs one op of a `command` provider, c, in a confined container of the image its
 // config names, taken from image; the command reaches the stack on its network and receives the
-// recorded values (recordedEnv), the VM's L4 routes' services by name (targetHosts). Exit 2 is
+// recorded values (recordedEnv), the services on the host's network by name (targetHosts). Exit 2 is
 // command.ErrNoAnswer.
 func (in *Installer) runCommand(ctx context.Context, r commandRun, c providers.RuntimeCommand, image, stack *EnvFile, req map[string]any, resp any) error {
 	ref, ok := image.Get(ImageVar(c.Image))

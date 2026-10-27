@@ -737,11 +737,16 @@ func TestK8sTuneListsWhatTheKubeletMustAllow(t *testing.T) {
 		KernelArgs: map[string]spec.HostValue{"iommu": {Value: "pt", Reason: "DMA"}, "nosmt": {Reason: "one thread"}},
 		Sysctls:    map[string]spec.HostValue{"vm.swappiness": {Value: "10", Reason: "RAM"}},
 		Power:      "performance",
+		Interfaces: map[string]spec.HostInterface{"uplink": {Primary: true, Reason: "out"}, "vpn0": {Kind: spec.InterfaceTUN, Forward: []string{"uplink"}, Reason: "the peers"}},
 	}
+	e.release.Spec.Services = map[string]spec.Service{"proxy": {HostNetwork: true, Transparent: []string{"vpn0"}}}
 	if err := e.installer(nil).K8sTune(); err != nil {
 		t.Fatal(err)
 	}
-	if out := e.out.String(); !strings.Contains(out, "every node (host)") || !strings.Contains(out, "  module ice: loaded at boot, a=x, b=1   the NIC\n  module irdma: blocked   the queues\n  package tcpdump (Debian's name)   capture\n  kernel argument iommu=pt   DMA\n  kernel argument nosmt   one thread\n  sysctl vm.swappiness = 10   RAM\n  power performance: ") {
+	if out := e.out.String(); !strings.Contains(out, "  interface vpn0: a tun device its service opens (the host's network)   the peers\n    iptables -I FORWARD -i vpn0 -o uplink -j ACCEPT\n    iptables -I FORWARD -i uplink -o vpn0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT\n    ip6tables -I FORWARD -i vpn0 -o uplink -j ACCEPT\n") || !strings.Contains(out, `    nft: iifname "vpn0" meta l4proto { tcp, udp } socket transparent 1 accept`) {
+		t.Errorf("no forwarding nor interception:\n%s", out)
+	}
+	if out := e.out.String(); !strings.Contains(out, "every node (host)") || !strings.Contains(out, "  module ice: loaded at boot, a=x, b=1   the NIC\n  module irdma: blocked   the queues\n  package tcpdump (Debian's name)   capture\n") || !strings.Contains(out, "\n  kernel argument iommu=pt   DMA\n  kernel argument nosmt   one thread\n  sysctl vm.swappiness = 10   RAM\n  power performance: ") {
 		t.Errorf("%s", out)
 	}
 }

@@ -17,8 +17,31 @@ type Interface struct {
 	RoutingPolicyRules []map[string]string
 	Routes             []map[string]string
 	// NIC is a NIC's ethtool settings; nil for none.
-	NIC    *NICSettings
-	Reason string
+	NIC *NICSettings
+	// Forward are the roles the host forwards its traffic out of; Transparent, whether a service
+	// intercepts traffic on it (a transparent socket).
+	Forward     []string
+	Transparent bool
+	Reason      string
+}
+
+// Firewall are the rules a host's firewall gives the interface's traffic for the project, where
+// Stowage does not own the host: its traffic out of each Forward role accepted in chain (Docker's
+// DOCKER-USER, ahead of its FORWARD policy, DROP), and the replies back, for IPv4 and IPv6; and,
+// when Transparent, what the kernel hands a transparent socket accepted by an input chain that
+// drops.
+func (i Interface) Firewall(chain string) []string {
+	var out []string
+	for _, o := range i.Forward {
+		for _, t := range []string{"iptables", "ip6tables"} {
+			out = append(out, fmt.Sprintf("%s -I %s -i %s -o %s -j ACCEPT", t, chain, i.Role, o),
+				fmt.Sprintf("%s -I %s -i %s -o %s -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT", t, chain, o, i.Role))
+		}
+	}
+	if i.Transparent {
+		out = append(out, fmt.Sprintf("nft: iifname %q meta l4proto { tcp, udp } socket transparent 1 accept, in an input chain that drops", i.Role))
+	}
+	return out
 }
 
 // Networkd is the interface's settings as a networkd .network file's sections, for the operator
@@ -71,6 +94,9 @@ func (s System) inspectInterfaces(ctx context.Context) []Item {
 				}
 			}
 			items = append(items, Item{Advice, "interface", i.Role, "the project names an interface " + i.Role + why + ":", want})
+			if fw := i.Firewall("DOCKER-USER"); len(fw) > 0 {
+				items = append(items, Item{Advice, "interface", i.Role, "the project forwards or intercepts traffic on " + i.Role + ", which this host's firewall drops:", strings.Join(fw, "; ")})
+			}
 			continue
 		}
 		mtu, ok := s.read("sys/class/net/" + i.Role + "/mtu")

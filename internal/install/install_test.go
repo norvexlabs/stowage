@@ -612,9 +612,9 @@ func TestTheIPv6Loopback(t *testing.T) {
 			t.Errorf("%s = %q, want %q", k, got, want)
 		}
 	}
-	// The peers' addresses of the VM are no front's, on both sides of their /24.
+	// The peers' addresses are no front's, on both sides of their /24.
 	for a, ok := range map[string]bool{"127.0.3.255": true, "127.0.4.0": false, "127.0.4.37": false, "::ffff:127.0.4.255": false, "127.0.5.0": true} {
-		if _, err := loopbackAddr(a); (err == nil) != ok || err != nil && !strings.Contains(err.Error(), "is in 127.0.4.0/24, the addresses the VM gives") {
+		if _, err := loopbackAddr(a); (err == nil) != ok || err != nil && !strings.Contains(err.Error(), "is in 127.0.4.0/24, the addresses the services on the host") {
 			t.Errorf("%s: %v", a, err)
 		}
 	}
@@ -901,8 +901,9 @@ func TestAnL4RoutesExposureIsSaid(t *testing.T) {
 		{bound, "0.0.0.0", "", "on every address, open to whoever reaches this host (DATA_BIND gives it one address)"},
 		{spec.L4Route{Name: "data", Protocol: "udp", Port: 7443}, "", "", "on every address, open to whoever reaches this host"},
 		{bound, "", "/run/notes/firewall", ""}, // the VM's firewall applies the allowlist
+		{spec.L4Route{Name: "data", Protocol: "tcp", Port: 7443, Upstream: "proxy:7443"}, "", "", "on the addresses proxy binds on the host's network, behind this host's own firewall"},
 	} {
-		in := &Installer{O: Options{Firewall: c.fw}}
+		in := &Installer{R: &Release{Spec: &spec.Spec{Services: map[string]spec.Service{"proxy": {HostNetwork: true}}}}, O: Options{Firewall: c.fw}}
 		if got := in.l4Exposure(c.r, func(k string) string { return map[string]string{"DATA_BIND": c.bind}[k] }); got != c.want {
 			t.Errorf("%+v: %q", c, got)
 		}
@@ -1315,7 +1316,7 @@ func TestFrontStripsHeadersAndPublishesOnTheLoopback(t *testing.T) {
 			t.Errorf("Caddyfile lacks %q:\n%s", want, cf)
 		}
 	}
-	fc, err := frontCompose(e.r.Spec.Front, nil, nil, Loopback, hostAPI{}, "sha256:x", "", false, false, false)
+	fc, err := frontCompose(e.r.Spec.Front, nil, nil, Loopback, hostAPI{}, "sha256:x", "", false, false, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

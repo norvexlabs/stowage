@@ -11,6 +11,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"slices"
 	"sort"
@@ -396,8 +397,19 @@ func (l *linter) images() {
 			if !hostName(h) {
 				l.errf(where+".add_hosts", "%q is not a host name (lowercase, like registry.example.test)", h)
 			}
-			if a, err := netip.ParseAddr(img.AddHosts[h]); err != nil || a.Zone() != "" {
-				l.errf(where+".add_hosts."+h, "%q is not an IP address without a zone (like 192.0.2.7 or 2001:db8::7)", img.AddHosts[h])
+			if len(img.AddHosts[h]) == 0 {
+				l.errf(where+".add_hosts."+h, "is empty: the addresses the name resolves to, like [192.0.2.7]")
+			}
+			seen := map[netip.Addr]bool{}
+			for i, v := range img.AddHosts[h] {
+				a, err := netip.ParseAddr(v)
+				switch {
+				case err != nil || a.Zone() != "":
+					l.errf(fmt.Sprintf("%s.add_hosts.%s[%d]", where, h, i), "%q is not an IP address without a zone (like 192.0.2.7 or 2001:db8::7)", v)
+				case seen[a]:
+					l.errf(fmt.Sprintf("%s.add_hosts.%s[%d]", where, h, i), "%s is given twice", v)
+				}
+				seen[a] = true
 			}
 		}
 		if img.Network != "" && !slices.Contains(spec.BuildNetworks, img.Network) {
@@ -583,8 +595,8 @@ func (l *linter) memory() {
 	for _, name := range sortedKeys(l.s.Services) {
 		svc, at := l.s.Services[name], "services."+name
 		l.service(at, name)
-		if svc == (spec.Service{}) {
-			l.errf(at, "says nothing: memory, cpus, nftables, interface or update")
+		if reflect.ValueOf(svc).IsZero() {
+			l.errf(at, "says nothing: memory, cpus, nftables, transparent, host_network, interface or update")
 		}
 		l.serviceHost(at, name, svc)
 		share := svc.Memory
@@ -1067,12 +1079,28 @@ func refTag(ref string) string {
 // Docker port publishing in between, so the service itself listens on the route's port, holds no
 // network of the stack's, and runs as one container. A Docker host publishes it as it is.
 func (l *linter) l4Host(where string, r spec.L4Route, name string, port int) {
-	if l.s.Shapes.Kairos == nil || l.compose == nil {
+	host := l.s.Services[name].HostNetwork
+	if host && r.BindInput != "" && l.s.Shapes.Docker != nil {
+		l.errf(where+".bind_input", "%s runs on the host's network (services.%s.host_network), where it listens on the addresses it binds itself: on Docker nothing holds it to %s's", name, name, r.BindInput)
+	}
+	if l.s.Shapes.Kairos == nil && !host || l.compose == nil {
 		return
 	}
 	if port != r.Port {
-		l.errf(where+".upstream", "%s: on the VM the service runs on the host's network, where nothing maps one port to another: it listens on the route's port, %d", r.Upstream, r.Port)
+		on := "on the VM the service runs"
+		if host {
+			on = "the service runs"
+		}
+		l.errf(where+".upstream", "%s: %s on the host's network, where nothing maps one port to another: it listens on the route's port, %d", r.Upstream, on, r.Port)
 	}
+	if !host {
+		l.hostNetService(name, "the VM runs "+name+" on the host's network (the L4 route "+r.Name+")")
+	}
+}
+
+// hostNetService checks a service that runs on the host's network (why says who runs it so)
+// against it: no network of the stack's, one container.
+func (l *linter) hostNetService(name, why string) {
 	svc, ok := l.compose.Services[name]
 	if !ok {
 		return
@@ -1080,12 +1108,12 @@ func (l *linter) l4Host(where string, r spec.L4Route, name string, port int) {
 	at := l.s.Stack.Compose + ": services." + name
 	switch {
 	case svc.NetworksFrom != "":
-		l.errf(l.s.Stack.Compose+": services."+svc.NetworksFrom+".networks", "%s extends %s, whose networks it takes: the VM runs %s on the host's network (the L4 route %s), which holds no other: leave them out of %s, or extend another", name, svc.NetworksFrom, name, r.Name, svc.NetworksFrom)
+		l.errf(l.s.Stack.Compose+": services."+svc.NetworksFrom+".networks", "%s extends %s, whose networks it takes: %s, which holds no other: leave them out of %s, or extend another", name, svc.NetworksFrom, why, svc.NetworksFrom)
 	case svc.Networks != nil:
-		l.errf(at+".networks", "the VM runs %s on the host's network (the L4 route %s), which holds no other: leave its networks out", name, r.Name)
+		l.errf(at+".networks", "%s, which holds no other: leave its networks out", why)
 	}
 	if _, n := svc.MemFloor(); n > 1 {
-		l.errf(at, "%d containers: the VM runs %s on the host's network (the L4 route %s), where one container holds the port", n, name, r.Name)
+		l.errf(at, "%d containers: %s, where one container holds its ports", n, why)
 	}
 }
 
@@ -1844,6 +1872,26 @@ func (l *linter) interfaces(ifs map[string]spec.HostInterface) {
 	named("front.interface", l.s.Front.Interface)
 	for i, r := range l.s.L4.Routes {
 		named(fmt.Sprintf("l4.routes[%d].interface", i), r.Interface)
+	}
+	for _, role := range slices.Sorted(maps.Keys(ifs)) {
+		fw, at := ifs[role].Forward, "host.interfaces."+role+".forward"
+		if fw != nil && len(fw) == 0 {
+			l.errf(at, "is empty: the roles the host forwards %s's traffic out of, like [uplink]", role)
+		}
+		for j, out := range fw {
+			w := fmt.Sprintf("%s[%d]", at, j)
+			switch _, ok := ifs[out]; {
+			case !ok:
+				l.errf(w, "%q is not one of host.interfaces", out)
+			case out == role:
+				l.errf(w, "is %s itself: the host forwards from one interface out of another", role)
+			case slices.Index(fw, out) < j:
+				l.errf(w, "%s is given twice", out)
+			}
+		}
+		if len(fw) > 0 && !kairos {
+			l.warnf(at, "only the VM's firewall is Stowage's (a kairos shape): a Docker host's operator accepts the forwarding in DOCKER-USER (tune advises it)")
+		}
 	}
 }
 

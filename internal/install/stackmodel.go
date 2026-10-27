@@ -42,6 +42,8 @@ const contentPlaceholder = "# Written by the installer: what it adds to each ser
 // it, its variables interpolated and the services of profiles that are off left out, without
 // ContentCompose.
 type composeModel struct {
+	// Name is the compose project's (COMPOSE_PROJECT_NAME), one per install.
+	Name     string `json:"name"`
 	Services map[string]struct {
 		Image       string            `json:"image"`
 		NetworkMode string            `json:"network_mode"`
@@ -149,8 +151,7 @@ func (in *Installer) model(ctx context.Context, environ []string) (*composeModel
 // contentCompose labels each service with an HMAC, under key, of the configs and secrets Compose
 // renders into it (inline content, an environment variable's value from environ): Compose copies
 // them into the container as it creates it, and recreates none when only they change, so the
-// label makes their change one of the service's. On the VM (hn) it runs the L4 routes' services on
-// the host's network and maps the names between them and the rest of the stack (hostNet.give). It gives each service with a network namespace
+// label makes their change one of the service's. On Docker and the VM it runs the services on the host's network (hn) there and maps the names between them and the rest of the stack (hostNet.give). It gives each service with a network namespace
 // of its own the sysctls of ctr it does not set itself, each service ctr's open files unless it
 // sets its own, each service mem shares its memory limit, and each bridge network the stack makes
 // ctr's MTU.

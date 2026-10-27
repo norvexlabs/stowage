@@ -3,6 +3,27 @@
 Stowage's own releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
+## [0.16.0]
+
+### Added
+- **Services on the host's network, on Docker too**: `services.<name>.host_network` runs a service
+  on the host's network on Docker and the VM, as the VM runs an L4 route's service: the stack
+  reaches it by its name, and an L4 route to it is its own port, published by no one.
+- **A transparent proxy on the VM**: `services.<name>.transparent` names the interfaces a
+  service's table intercepts traffic on (TPROXY); the VM's firewall accepts there what reaches
+  the service's transparent sockets, and `tune` advises the rule on a Docker host.
+- **Forwarding between the host's interfaces**: `host.interfaces.<role>.forward` names the roles
+  the host forwards a role's traffic out of, past Docker's FORWARD policy: the VM accepts it and
+  its replies in `DOCKER-USER`, the stack's own table judging it; `tune` and `k8s tune` print the
+  rules for a host the operator runs.
+
+### Changed
+- **A build's name with several addresses**: `images.<key>.add_hosts` gives each name a list of
+  addresses (`{origin.test: [127.0.0.1, 127.0.0.2]}`), each passed to the build in its order; a
+  single address is no longer accepted.
+- **Service tables' names**: lint refuses every word nft 1.1.6 reads as its own as a service's
+  table name (`tunnel`, `typeof`, `time` among them), which the VM's nft refused at install.
+
 ## [0.15.0] - 2026-10-27
 
 ### Added

@@ -433,7 +433,7 @@ func (in *Installer) address(ctx context.Context, env *EnvFile, service string) 
 	if err := json.Unmarshal(bytes.TrimSpace(raw), &nets); err != nil {
 		return "", fmt.Errorf("inspecting %s's container: %w", service, err)
 	}
-	// On the host's network (the VM's L4 routes' services), the service listens on the host.
+	// On the host's network (hostServices), the service listens on the host.
 	if _, host := nets["host"]; host {
 		return "127.0.0.1", nil
 	}

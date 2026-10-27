@@ -35,6 +35,7 @@ func (l *linter) serviceHost(at, name string, svc spec.Service) {
 	if f := svc.Nftables; f != "" {
 		l.nftTable(at+".nftables", name, f)
 	}
+	l.serviceNetwork(at, name, svc)
 	switch {
 	case (svc.Interface == "") != (svc.AddressInput == ""):
 		l.errf(at, "interface and address_input go together: the NIC its address is on, and the input giving it")
@@ -63,6 +64,62 @@ func (l *linter) serviceHost(at, name string, svc spec.Service) {
 				l.errf(at+".interface", "%s runs with network_mode %s: its address of its own is a network beside the stack's", name, s.NetworkMode)
 			}
 		}
+	}
+}
+
+// serviceNetwork checks a service on the host's network (host_network): one container, no network
+// of the stack's, no address of its own, no port published (the host's network publishes none);
+// and the roles it intercepts on (transparent): each one of host.interfaces, once, for a service
+// on the host's network with its own table, which steers the traffic there. Only the VM's
+// firewall is Stowage's: without a kairos shape, warned.
+func (l *linter) serviceNetwork(at, name string, svc spec.Service) {
+	if svc.HostNetwork {
+		if svc.Interface != "" {
+			l.errf(at+".interface", "%s runs on the host's network (host_network), which holds no network beside it", name)
+		}
+		if l.compose != nil {
+			if s, ok := l.compose.Services[name]; ok {
+				if s.NetworkMode != "" {
+					l.errf(at+".host_network", "%s sets network_mode %s in %s: host_network gives it the host's", name, s.NetworkMode, l.s.Stack.Compose)
+				}
+				if !emptyList(s.Ports) {
+					l.errf(l.s.Stack.Compose+": services."+name+".ports", "%s runs on the host's network (services.%s.host_network), where it listens on its ports itself: publish none", name, name)
+				}
+				l.hostNetService(name, name+" runs on the host's network (services."+name+".host_network)")
+			}
+		}
+		if l.s.Shapes.Docker == nil && l.s.Shapes.Kairos == nil {
+			l.warnf(at+".host_network", "only the docker and kairos shapes run a service on the host's network: the chart's pod sets hostNetwork itself")
+		}
+	}
+	if svc.Transparent == nil {
+		return
+	}
+	at += ".transparent"
+	if len(svc.Transparent) == 0 {
+		l.errf(at, "is empty: the host.interfaces roles its table intercepts traffic on, like [vpn0]")
+	}
+	for i, role := range svc.Transparent {
+		w := fmt.Sprintf("%s[%d]", at, i)
+		var ok bool
+		if l.s.Host != nil {
+			_, ok = l.s.Host.Interfaces[role]
+		}
+		switch {
+		case !ok:
+			l.errf(w, "%q is not one of host.interfaces", role)
+		case slices.Index(svc.Transparent, role) < i:
+			l.errf(w, "%s is given twice", role)
+		}
+	}
+	if svc.Nftables == "" {
+		l.errf(at, "%s's own table steers the traffic to its sockets: give it nftables", name)
+	}
+	if !svc.HostNetwork {
+		l.errf(at, "a transparent socket is on the host's network, where the traffic is steered: set host_network: true")
+	}
+	if l.s.Shapes.Kairos == nil {
+		l.warnf(at, "only the VM's firewall is Stowage's (a kairos shape): a Docker host's operator accepts the intercepted traffic in its input chain (tune advises it)")
 	}
 }
 
@@ -104,12 +161,12 @@ func (l *linter) serviceUpdate(at, name string, svc spec.Service) {
 	}
 	route := l.l4Route(name)
 	switch {
-	case s.NetworkMode == "host" && svc.UpdateSocket == "":
+	case (s.NetworkMode == "host" || svc.HostNetwork) && svc.UpdateSocket == "":
 		l.warnf(at+".update", "%s runs on the host's network, where both containers of an overlap listen on its ports: the app sets SO_REUSEPORT, or hands its sockets over (update_socket)", name)
 	case route >= 0 && l.s.Shapes.Kairos != nil && svc.UpdateSocket == "":
 		l.warnf(at+".update", "%s is l4.routes[%d]'s upstream: on the VM it runs on the host's network, where both containers of an overlap listen on the route's port: the app sets SO_REUSEPORT, or hands its socket over (update_socket)", name, route)
 	}
-	if route >= 0 && l.s.Shapes.Docker != nil && s.NetworkMode != "host" && !hasVar(s.NetworkMode) {
+	if route >= 0 && l.s.Shapes.Docker != nil && s.NetworkMode != "host" && !svc.HostNetwork && !hasVar(s.NetworkMode) {
 		l.warnf(at+".update", "%s is l4.routes[%d]'s upstream: on Docker its port is published from its own network, so a start there replaces it stop-first", name, route)
 	}
 	if s.ContainerName != "" {
@@ -131,7 +188,7 @@ func (l *linter) serviceUpdate(at, name string, svc spec.Service) {
 	if strings.HasPrefix(s.NetworkMode, "service:") || strings.HasPrefix(s.NetworkMode, "container:") {
 		l.errf(at+".update", "%s runs in another's network namespace (network_mode %s), where two containers cannot listen on one port", name, s.NetworkMode)
 	}
-	if s.NetworkMode != "host" && !hasVar(s.NetworkMode) && !emptyList(s.Ports) {
+	if s.NetworkMode != "host" && !svc.HostNetwork && !hasVar(s.NetworkMode) && !emptyList(s.Ports) {
 		l.errf(at+".update", "%s publishes ports from its own network, which two containers cannot publish at once: run it on the host's network (network_mode: host, the port shared by SO_REUSEPORT or update_socket), or reach it through the front", name)
 	}
 	for _, other := range sortedKeys(l.compose.Services) {

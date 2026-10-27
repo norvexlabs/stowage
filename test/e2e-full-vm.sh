@@ -172,16 +172,33 @@ on_vm sudo ip tuntap del vpn0 mode tun
 on_vm sudo nft list ruleset >"$WORK/ruleset.txt"
 grep -q 'iifname "uplink" tcp dport { 80, 443 } accept' "$WORK/ruleset.txt" && grep -q 'iifname "edge" udp dport 17007 ' "$WORK/ruleset.txt" ||
 	{ grep -n 'dport' "$WORK/ruleset.txt"; fail "the front's or the UDP echo's ports are not on their interfaces alone"; }
+# The vpn service's table steers vpn0's traffic to its sockets, which the input chain accepts on
+# vpn0 alone (services.vpn.transparent); vpn0's traffic out of the uplink and its replies pass
+# Docker's FORWARD policy (host.interfaces.vpn0.forward), for IPv4 and IPv6.
+grep -q 'tproxy to :17008' "$WORK/ruleset.txt" || { grep -n 'tproxy' "$WORK/ruleset.txt"; fail "the vpn service's table is not loaded"; }
+grep -q 'iifname "vpn0" meta l4proto { tcp, udp } socket transparent 1 accept' "$WORK/ruleset.txt" ||
+	{ grep -n 'socket' "$WORK/ruleset.txt"; fail "the input chain does not accept vpn0's intercepted traffic"; }
+for t in iptables ip6tables; do
+	on_vm sudo $t -S DOCKER-USER >"$WORK/docker-user.txt" && on_vm sudo $t -S STOWAGE-FORWARD >"$WORK/forward.txt" || fail "$t lists no DOCKER-USER or STOWAGE-FORWARD"
+	grep -qxF -e '-A DOCKER-USER -j STOWAGE-FORWARD' "$WORK/docker-user.txt" &&
+		grep -qxF -e '-A STOWAGE-FORWARD -i vpn0 -o uplink -j ACCEPT' "$WORK/forward.txt" &&
+		grep -qxF -e '-A STOWAGE-FORWARD -i uplink -o vpn0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT' "$WORK/forward.txt" &&
+		[[ $(wc -l <"$WORK/forward.txt") == 3 ]] ||
+		{ cat "$WORK/docker-user.txt" "$WORK/forward.txt"; fail "$t does not forward vpn0 out of the uplink alone"; }
+done
 on_vm at-stow tune >"$WORK/tune-ifaces.txt" 2>&1 || true
 for r in uplink edge; do
 	grep -qE "^ok +interface $r " "$WORK/tune-ifaces.txt" || { cat "$WORK/tune-ifaces.txt"; fail "tune does not report $r ok"; }
 done
 grep -qE '^ok +firmware intel/ice/ddp/ice.pkg ' "$WORK/tune-ifaces.txt" || { cat "$WORK/tune-ifaces.txt"; fail "tune does not report the E810's firmware ok"; }
 
-step "on the VM: the echo L4 routes' service runs on the host's network"
+step "on the VM: the echo L4 routes' service and the vpn service run on the host's network"
 echo_id=$(on_vm sudo docker ps -q --filter label=com.docker.compose.service=echo)
 [[ -n $echo_id && $(on_vm sudo docker inspect --format "'{{.HostConfig.NetworkMode}}'" "$echo_id") == host ]] ||
 	fail "the echo L4 routes' service is not on the host's network"
+vpn_id=$(on_vm sudo docker ps -q --filter label=com.docker.compose.service=vpn)
+[[ -n $vpn_id && $(on_vm sudo docker inspect --format "'{{.HostConfig.NetworkMode}}'" "$vpn_id") == host ]] ||
+	fail "the vpn service (host_network) is not on the host's network"
 
 step "on the VM: what the project asks of its host (host): kernel modules, packages, kernel arguments, settings, power"
 on_vm test -d /sys/module/tcp_diag || fail "tcp_diag is not loaded at boot"
