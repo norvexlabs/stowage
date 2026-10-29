@@ -3,7 +3,7 @@
 Stowage's own releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
-## [0.17.0]
+## [0.17.0] - 2026-10-29
 
 ### Added
 - **An upgrade before the first install on the VM**: when a VM's first install was refused (or
