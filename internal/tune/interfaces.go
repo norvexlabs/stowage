@@ -23,6 +23,24 @@ type Interface struct {
 	Forward     []string
 	Transparent bool
 	Reason      string
+	// Applied: the install's starts apply its forwarding (a consented Docker host): reported so,
+	// not advised.
+	Applied bool
+	// Devices are the devices of the roles it names (its own, its Forward's) where a role is not
+	// its interface's name (a Docker host, a node); nil where it is (a host Stowage owns).
+	Devices map[string]string
+}
+
+// dev is role's device in a rule: its own name where roles are names, else the device known, or
+// a placeholder naming the NIC to put there.
+func (i Interface) dev(role string) string {
+	if i.Devices == nil {
+		return role
+	}
+	if d := i.Devices[role]; d != "" {
+		return d
+	}
+	return "<the NIC playing " + role + ">"
 }
 
 // Firewall are the rules a host's firewall gives the interface's traffic for the project, where
@@ -34,12 +52,12 @@ func (i Interface) Firewall(chain string) []string {
 	var out []string
 	for _, o := range i.Forward {
 		for _, t := range []string{"iptables", "ip6tables"} {
-			out = append(out, fmt.Sprintf("%s -I %s -i %s -o %s -j ACCEPT", t, chain, i.Role, o),
-				fmt.Sprintf("%s -I %s -i %s -o %s -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT", t, chain, o, i.Role))
+			out = append(out, fmt.Sprintf("%s -I %s -i %s -o %s -j ACCEPT", t, chain, i.dev(i.Role), i.dev(o)),
+				fmt.Sprintf("%s -I %s -i %s -o %s -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT", t, chain, i.dev(o), i.dev(i.Role)))
 		}
 	}
 	if i.Transparent {
-		out = append(out, fmt.Sprintf("nft: iifname %q meta l4proto { tcp, udp } socket transparent 1 accept, in an input chain that drops", i.Role))
+		out = append(out, fmt.Sprintf("nft: iifname %q meta l4proto { tcp, udp } socket transparent 1 accept, in an input chain that drops", i.dev(i.Role)))
 	}
 	return out
 }
@@ -94,7 +112,12 @@ func (s System) inspectInterfaces(ctx context.Context) []Item {
 				}
 			}
 			items = append(items, Item{Advice, "interface", i.Role, "the project names an interface " + i.Role + why + ":", want})
-			if fw := i.Firewall("DOCKER-USER"); len(fw) > 0 {
+			fw := i.Firewall("DOCKER-USER")
+			if i.Applied && len(i.Forward) > 0 {
+				fw = slices.DeleteFunc(fw, func(r string) bool { return strings.HasPrefix(r, "ip") })
+				items = append(items, Item{OK, "interface", i.Role, "its forwarding out of " + strings.Join(i.Forward, ", ") + " applied by each start (tune --apply)", "applied"})
+			}
+			if len(fw) > 0 {
 				items = append(items, Item{Advice, "interface", i.Role, "the project forwards or intercepts traffic on " + i.Role + ", which this host's firewall drops:", strings.Join(fw, "; ")})
 			}
 			continue

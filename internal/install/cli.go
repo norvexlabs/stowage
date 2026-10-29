@@ -296,6 +296,7 @@ func newCommand(r *Release, self string, stdout, stderr io.Writer, tools K8sOpti
 	uf.StringVar(&to, "version", "", "fetch the installer of this version (its latest revision, on the install's channel) from the install's registry, and upgrade with it")
 	uf.StringArrayVar(&sets, "set", nil, "an input this release adds, KEY=VALUE (repeatable)")
 	uf.StringVar(&answers, "answers", "", "a YAML file of the inputs this release adds, KEY: value")
+	uf.StringSliceVar(&ports, "ports", nil, "the port of a route this release adds, route=port (loopback mode; default the release's front.loopback_ports)")
 	uf.BoolVar(&noInput, "no-input", false, "never ask: an added input nothing gave takes its default")
 	uf.BoolVar(&accessible, "accessible", false, "ask with plain line prompts")
 	uf.BoolVar(&o.Offline, "offline", false, "the images are already loaded: never log in or pull")

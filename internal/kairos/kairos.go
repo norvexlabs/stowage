@@ -250,40 +250,48 @@ func interfaceFiles(p Params) map[string][]byte {
 	out := map[string][]byte{}
 	for _, role := range slices.Sorted(maps.Keys(p.Interfaces)) {
 		i := p.Interfaces[role]
-		var b strings.Builder
-		fmt.Fprintf(&b, "# %s's interface %s (host.interfaces): %s\n", p.Name, role, i.Reason)
-		if i.Kind == spec.InterfaceTUN {
-			fmt.Fprintf(&b, "[Match]\nName=%s\n\n[Network]\nLinkLocalAddressing=no\nIPv6AcceptRA=no\nKeepConfiguration=yes\nConfigureWithoutCarrier=yes\n\n[Link]\nRequiredForOnline=no\n", role)
-			if i.MTU != 0 {
-				fmt.Fprintf(&b, "MTUBytes=%d\n", i.MTU)
-			}
-		} else if i.MTU != 0 {
-			fmt.Fprintf(&b, "[Link]\nMTUBytes=%d\n", i.MTU)
-		}
-		section := func(name string, entries []map[string]string) {
-			for _, e := range entries {
-				fmt.Fprintf(&b, "\n[%s]\n", name)
-				for _, k := range slices.Sorted(maps.Keys(e)) {
-					fmt.Fprintf(&b, "%s=%s\n", k, e[k])
-				}
-			}
-		}
-		section("RoutingPolicyRule", i.RoutingPolicyRules)
-		section("Route", i.Routes)
+		content := []byte(InterfaceNetwork(p.Name, role, i))
 		switch {
 		case i.Kind != spec.InterfaceTUN && i.MTU == 0 && len(i.RoutingPolicyRules)+len(i.Routes) == 0:
 			// A NIC that sets nothing of its own needs no drop-in.
 		case i.Kind == spec.InterfaceTUN:
-			out[networkDir+"/"+InterfaceUnit(p.Name, role)] = []byte(b.String())
+			out[networkDir+"/"+InterfaceUnit(p.Name, role)] = content
 		case i.Primary:
 			for _, u := range PrimaryUnits(p.Name) {
-				out[networkDir+"/"+u+".d/50-"+p.Name+".conf"] = []byte(b.String())
+				out[networkDir+"/"+u+".d/50-"+p.Name+".conf"] = content
 			}
 		default:
-			out[networkDir+"/"+InterfaceUnit(p.Name, role)+".d/50-"+p.Name+".conf"] = []byte(b.String())
+			out[networkDir+"/"+InterfaceUnit(p.Name, role)+".d/50-"+p.Name+".conf"] = content
 		}
 	}
 	return out
+}
+
+// InterfaceNetwork is a role's networkd settings as project name's file gives them: a tun device's
+// whole file (it matches the device by name once its service opens it, keeps the addresses the
+// service gives it, and waits for no carrier), a NIC's drop-in of its MTU and policy routing.
+func InterfaceNetwork(name, role string, i spec.HostInterface) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "# %s's interface %s (host.interfaces): %s\n", name, role, i.Reason)
+	if i.Kind == spec.InterfaceTUN {
+		fmt.Fprintf(&b, "[Match]\nName=%s\n\n[Network]\nLinkLocalAddressing=no\nIPv6AcceptRA=no\nKeepConfiguration=yes\nConfigureWithoutCarrier=yes\n\n[Link]\nRequiredForOnline=no\n", role)
+		if i.MTU != 0 {
+			fmt.Fprintf(&b, "MTUBytes=%d\n", i.MTU)
+		}
+	} else if i.MTU != 0 {
+		fmt.Fprintf(&b, "[Link]\nMTUBytes=%d\n", i.MTU)
+	}
+	section := func(name string, entries []map[string]string) {
+		for _, e := range entries {
+			fmt.Fprintf(&b, "\n[%s]\n", name)
+			for _, k := range slices.Sorted(maps.Keys(e)) {
+				fmt.Fprintf(&b, "%s=%s\n", k, e[k])
+			}
+		}
+	}
+	section("RoutingPolicyRule", i.RoutingPolicyRules)
+	section("Route", i.Routes)
+	return b.String()
 }
 
 // mode is a file's mode in the image: the scripts under usr/sbin run.

@@ -1,6 +1,7 @@
 package install
 
 import (
+	"bytes"
 	"cmp"
 	"context"
 	"errors"
@@ -8,6 +9,7 @@ import (
 	"maps"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"slices"
 	"strings"
 
@@ -32,6 +34,20 @@ func (in *Installer) tuneSystem(ctx context.Context) (tune.System, error) {
 	}
 	sys := *in.O.Tune
 	releaseHost(&sys, in.R.Spec)
+	if !sys.Owned {
+		get, _ := in.installedEnv()
+		roleDevices(&sys, in.R.Spec, func(r string) string { return in.roleDevice(r, get) })
+		// The forwarding a start as root applied as the release and the devices now give it (its
+		// record holds those rules), through roles that each have a device here, is reported so
+		// rather than advised.
+		cur, _ := os.ReadFile(in.forwardRecord())
+		want, _ := forwardRules(in.R.Spec.Host, in.forwardChain(), func(r string) string { return in.roleDevice(r, get) })
+		applied := in.gatewayConsented() && want != nil && bytes.Equal(cur, want)
+		for i := range sys.Interfaces {
+			ti := &sys.Interfaces[i]
+			ti.Applied = applied && !slices.Contains(slices.Collect(maps.Values(ti.Devices)), "")
+		}
+	}
 	out, err := in.O.Docker.Run(ctx, Cmd{Args: []string{"info", "--format", "{{.ServerVersion}}|{{.OperatingSystem}}|{{json .SecurityOptions}}"}})
 	if err != nil {
 		// Docker Desktop stopped is still Docker Desktop: its CLI context says so.
@@ -88,6 +104,14 @@ func (in *Installer) Tune(ctx context.Context, t TuneOptions) error {
 	if in.O.Tune == nil {
 		return errors.New("tune: no host to tune")
 	}
+	// The gateway's names and its boot unit take the directory absolute, as a start does.
+	if in.O.Dir != "" {
+		dir, err := filepath.Abs(in.O.Dir)
+		if err != nil {
+			return err
+		}
+		in.O.Dir = dir
+	}
 	if in.O.TunedAtBoot && (t.Print || t.Apply || t.Revert) {
 		return fmt.Errorf("this VM tunes itself at each boot, before its network and Docker start: `%s tune` reports, --check checks", in.R.Ctl())
 	}
@@ -117,21 +141,43 @@ func (in *Installer) Tune(ctx context.Context, t TuneOptions) error {
 		}
 	}
 	ctl := in.R.Ctl()
+	// A record of another directory refuses an apply of the declarations before the host is changed
+	// in anything; a revert there leaves the record alone, as it applied nothing here.
+	rec, elsewhere := in.gatewayOtherDir()
+	if _, err := in.readGateway(); err != nil && in.gatewayRecorded() && (t.Revert || t.Apply && !sys.Owned && in.gatewayDeclared()) {
+		return fmt.Errorf("%w: fix or remove it, then tune again", err)
+	}
+	if elsewhere && t.Apply && !sys.Owned && in.gatewayDeclared() {
+		return errors.New(in.gatewayElsewhere(rec))
+	}
+	revertGateway := in.gatewayRecorded() && in.gatewayRevertsHere(rec)
 	switch {
 	case t.Revert:
 		if err := sys.CheckRoot(); err != nil {
 			return err
 		}
-		if err := confirmTune(ctx, in.O.Prompt, in.O.Yes, "Remove the tuning files and put back what the first --apply found"); err != nil {
+		what := "Remove the tuning files and put back what the first --apply found"
+		if elsewhere && !revertGateway {
+			in.O.logf("note: %s", in.gatewayElsewhere(rec))
+		}
+		if revertGateway {
+			what += ", and remove " + in.gatewayWhat() + " (the consent withdrawn)"
+		}
+		if err := confirmTune(ctx, in.O.Prompt, in.O.Yes, what); err != nil {
 			return err
+		}
+		// The install's own first: a tuning revert that fails does not keep them.
+		var gwErr error
+		if revertGateway {
+			gwErr = in.lockedRevert(ctx)
 		}
 		notes, err := sys.Revert(ctx, t.RestartDocker)
 		if err != nil {
-			return err
+			return errors.Join(gwErr, err)
 		}
 		in.notes(notes)
 		fmt.Fprintln(in.O.Out, "the tuning files are removed")
-		return nil
+		return gwErr
 	case t.Print || t.Apply:
 		if t.Apply {
 			if err := sys.CheckRoot(); err != nil {
@@ -163,6 +209,14 @@ func (in *Installer) Tune(ctx context.Context, t TuneOptions) error {
 		if !p.Changes() {
 			fmt.Fprintln(in.O.Out, "the files hold these values already: the running host is set from them")
 		}
+		gateway := !sys.Owned && in.gatewayDeclared()
+		switch {
+		case gateway && !fileExists(in.path(envName)):
+			in.O.logf("note: no install in %s (--dir): %s are applied once one is", in.O.Dir, in.gatewayWhat())
+			gateway = false
+		case gateway:
+			fmt.Fprintf(in.O.Out, "and %s: applied by the install's start now, by every start and at every boot (a unit), until --revert\n", in.gatewayWhat())
+		}
 		if err := confirmTune(ctx, in.O.Prompt, in.O.Yes, "Write these files and apply them to the running host"); err != nil {
 			return err
 		}
@@ -171,14 +225,39 @@ func (in *Installer) Tune(ctx context.Context, t TuneOptions) error {
 			return err
 		}
 		in.notes(notes)
+		if gateway {
+			if err := in.gatewayApply(ctx); err != nil {
+				return err
+			}
+		}
 		fmt.Fprintf(in.O.Out, "tuned: `%s tune` reports what still differs\n", ctl)
 		return nil
 	}
 	items := sys.Inspect(ctx, h)
 	if !sys.Owned {
+		consented := in.gatewayConsented()
+		rec, recErr := in.readGateway()
+		revoked := recErr == nil && rec.Revoked && in.gatewayHere(rec)
+		var loaded []string
+		if consented || revoked {
+			loaded = in.loadedTables(ctx)
+		}
 		for _, name := range sortedKeys(in.R.Nftables) {
-			items = append(items, tune.Item{State: tune.Advice, Kind: "nftables", Name: "table inet " + name,
-				Have: "the service " + name + " asks for its nftables table:", Want: "`" + ctl + " tune --print` prints it; nft -f <file> loads it (the host's firewall is its operator's)"})
+			item := tune.Item{State: tune.Advice, Kind: "nftables", Name: "table inet " + name,
+				Have: "the service " + name + " asks for its nftables table:", Want: "`" + ctl + " tune --apply` loads it at each start, or nft -f <file> from `" + ctl + " tune --print` (the host's firewall is its operator's)"}
+			switch {
+			case consented && slices.Contains(loaded, name):
+				item.State, item.Have, item.Want = tune.OK, "loaded by each start (tune --apply)", "loaded"
+			case consented:
+				item.State, item.Have, item.Want = tune.Differs, "not loaded", "loaded by the next start as root (tune --apply)"
+			case revoked && slices.Contains(loaded, name):
+				item.State, item.Have, item.Want = tune.Differs, "still loaded, the consent withdrawn", "`"+ctl+" tune --revert` again removes it"
+			case recErr == nil && in.gatewayRecorded() && !in.gatewayHere(rec):
+				item.Want = in.gatewayElsewhere(rec)
+			case recErr != nil:
+				item.Want = recErr.Error() + ": fix or remove it, then `" + ctl + " tune --apply` loads it at each start"
+			}
+			items = append(items, item)
 		}
 	}
 	fmt.Fprintf(in.O.Out, "this host: %d MiB, %d CPUs, the %s profile\n", h.MemBytes>>20, h.CPUs, h.Profile)
@@ -252,6 +331,18 @@ func (in *Installer) tuneHint(ctx context.Context) {
 	h = in.hostProfile(sys, h)
 	if n := tune.Drift(sys.Inspect(ctx, h)); n > 0 {
 		fmt.Fprintf(in.O.Out, "tuning   %d network settings of this host differ from what the %s profile calls for on its RAM and CPUs: `%s tune` shows them\n", n, h.Profile, in.R.Ctl())
+	}
+}
+
+// roleDevices gives each interface the devices of the roles it names (dev), where roles are not
+// their interfaces' names: a tun role's is its own, a NIC role's the one dev knows, if any.
+func roleDevices(sys *tune.System, s *spec.Spec, dev func(string) string) {
+	for i := range sys.Interfaces {
+		ti := &sys.Interfaces[i]
+		ti.Devices = map[string]string{}
+		for _, r := range append([]string{ti.Role}, ti.Forward...) {
+			ti.Devices[r] = dev(r)
+		}
 	}
 }
 

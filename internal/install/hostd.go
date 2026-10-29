@@ -1434,6 +1434,13 @@ func (h *Hostd) upgrade(w http.ResponseWriter, r *http.Request) {
 		replyErr(w, fail(http.StatusConflict, "%s %s was published without an OS bundle", m.Name, m.Tag))
 		return
 	}
+	// What the boot into it would refuse is refused now, before its OS is written.
+	if !first {
+		if err := h.checkUpgrade(r.Context(), in, env, m); err != nil {
+			replyErr(w, err)
+			return
+		}
+	}
 	prefix, _ := env.Get("STOWAGE_REGISTRY")
 	src := fmt.Sprintf("%s/%s-os@%s", prefix, m.Name, m.Artifacts.OS)
 	// Checked as the job starts: another upgrade could replace the running system's copy in the

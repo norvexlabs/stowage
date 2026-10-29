@@ -1885,7 +1885,7 @@ func (l *linter) interfaces(ifs map[string]spec.HostInterface) {
 			})
 		}
 		if len(fw) > 0 && !kairos {
-			l.warnf(at, "only the VM's firewall is Stowage's (a kairos shape): a Docker host's operator accepts the forwarding in DOCKER-USER (tune advises it)")
+			l.warnf(at, "only the VM's firewall is Stowage's (a kairos shape): a Docker host applies it in DOCKER-USER once its operator consents (tune --apply)")
 		}
 	}
 }

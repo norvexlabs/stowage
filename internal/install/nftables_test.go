@@ -109,7 +109,7 @@ func TestEveryStartLoadsTheServicesTables(t *testing.T) {
 	var log bytes.Buffer
 	docker := &Installer{R: r, O: Options{Dir: t.TempDir(), Host: host, Log: &log}}
 	host.ran = nil
-	if err := docker.loadTables(ctx); err != nil || len(host.ran) != 0 || !strings.Contains(log.String(), "warning: services.ingest.nftables: the host's firewall is its operator's") || docker.tableLoads() != nil {
+	if err := docker.loadTables(ctx); err != nil || len(host.ran) != 0 || docker.gatewayStart(ctx, none) != nil || !strings.Contains(log.String(), "the services' nftables tables (ingest) are not in force on this host") || docker.tableLoads() != nil {
 		t.Errorf("Docker host: %v, ran %v, log %q", err, host.ran, log.String())
 	}
 }

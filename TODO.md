@@ -47,37 +47,39 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
    Before writing a module, read the latest provider's official docs and its schema, and pin that
    release.
 
-### Open
-
-5. **A gateway stack on a Docker host is advice, not an install**: on the VM, a stack declaring
-   `services.<name>.nftables`, `transparent`, `host.interfaces.<role>.forward` and a role's
-   `routing_policy_rules` / `routes` runs as declared; on the `docker` shape `tune` only prints
-   them, so the same release installs a gateway that forwards nothing it should and enforces no
-   table until the operator copies each rule by hand — and nothing records, reverts or re-applies
-   them at the next start or upgrade (a table changed by a release stays the old one). The
-   operator's consent is the point of the Docker host's stance, so keep it, but make it one act:
-   `tune --apply` (or an install flag the operator gives) loads the service tables as the VM does
-   (replaced whole, recorded, deleted when a release drops one), the transparent roles' input
-   accept and the `forward` roles' `DOCKER-USER` chain, and the roles' policy rules and routes
-   (`ip rule` / `ip route`, or a networkd drop-in where networkd runs), re-applied by each start
-   while consented, removed by `tune --revert`; `status` says which are applied and which differ.
-   Without consent the install says plainly that the stack's network declarations are not in
-   force (a warning at the end of the install, not only in `tune`).
-6. **An upgrade that adds a front route is refused, after the stack is up** (was a Could: "Upgrade
-   with a new route"): `upgrade.go` refuses every route the install does not publish, `a new route
-   needs a new install` — even a `path` route on a domain the install already serves, which
-   decides no port and no domain (the case met: `/ca` and `/ca.crt` routes to an existing service
-   on the console's domain). On the VM the refusal comes after the boot brought every service up
-   healthy, so it fails `<name>.service`, the health gate judges the boot `went_back` and
-   the VM reboots into the passive release: an upgrade costs two reboots and ends where it began,
-   and the only way forward is a new install (a VM made again). Accept, at upgrade, a route
-   whose domain and port the install already decides (a `path` route on a published domain, a
-   route sharing a published domain input), and decide the rest as a first install does (ask the
-   new domain input, `--set` it, or refuse naming the input); and refuse what cannot be decided
-   before any service is replaced — on the VM at `upgrade` time, never in the boot.
-
 ## Should
 
+- **A NIC role's device on a Docker host, beyond `--interface`**: the forwarding and `tune`'s
+  rules name the NIC `--interface ROLE=NIC` recorded; the `primary` role could default to the
+  default route's NIC (said in the output), and `status` / `tune --check` could judge each role's
+  device (it exists, is up, holds the default route for `primary`).
+- **An upgrade adding a route on the VM, leftovers**: the daemon's check refuses a route the boot
+  could not decide, but a new domain input cannot be given on the VM (neither the daemon nor the
+  boot takes `--set`: `UpgradeRequest` would carry values to the boot), and its loopback-port
+  refusals name `--ports`, which the VM's `upgrade` does not take. The daemon judges with its own
+  Stowage's rules (an older one may refuse what the boot's would accept), and leaves out the
+  kept-installer, schema-baseline and L4 checks, which need the boot's OS. `k8s upgrade` was not
+  looked at for a release adding a route.
+  The daemon's check downloads the target's whole installer in the request, before the job, with
+  no progress (the job, or reading the spec alone, would show it). A route the release adds on the
+  port of a route it removes is refused in loopback mode as in use (the running front holds it).
+- **`tune`'s report of a consented host's tables**: `ok` once the install's record lists the table
+  loaded (`.stowage-nftables`), not from `nft list table` (a reboot before the boot unit ran
+  leaves it listed); no test runs `tune`'s report on a consented host.
+- **A Docker host's gateway, leftovers** (review): a consent whose record write fails after the
+  unit was enabled leaves the unit for a record that was there before (untested: no fault
+  injection of the record's write); a moved install's applied chain, unit and files are reverted
+  only from its old directory (moved back); two installs of one project on a host share their
+  tables' names; the record is read several times per start (one read per run, cached, would do).
+  A host firewall that flushes DOCKER-USER (`firewall-cmd --reload`) drops the chain's jump while
+  the /run record stays: starts skip it and `tune`/`status` call it applied until a reboot
+  (check the jump with `-C` before trusting the record). `tune` run not as root cannot read a
+  0600 `.env`, so it does not see a role's recorded NIC. `tune --print` still says a table is
+  "not written: load it with nft -f", beside the consent path.
+- **A Docker host's gateway proven end to end**: `tune --apply`'s tables, forwarding chain,
+  networkd files and boot unit are unit-tested; no suite applies them to a real Docker host (the
+  gate's host is not one to change). A disposable Docker host (a VM of the Docker shape) running
+  e2e-full's `tune --apply --dir`, a reboot, `status`, then `tune --revert`, would prove them.
 - **`front.interface` does not hold the front on the VM** (security audit 2026-10-26, Medium):
   `openPorts` writes the role's `iifname` match into the input chain alone
   (`internal/install/install.go`), but the front is a bridged container published on every
@@ -353,6 +355,62 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
 
 ## Could
 
+- **Images from packages** (a project hand-writes the Dockerfile stage today, which works): a project that ships Debian packages — software its
+  operators install on a host, whose stack runs the same packages one service per container —
+  hand-writes a Dockerfile today that repeats what Stowage could own, and gets it subtly wrong:
+  the distribution base pinned again beside the project's other pins (two pins drift), the
+  packages of exactly the release picked out of a directory holding several versions (a lexical
+  "latest" glob installs an older build without a word), maintainer scripts that try to start
+  services in a build, and the per-install files a postinst generates (a CA, a default
+  configuration) left in an image every install then shares. Debian and Ubuntu bases (`dpkg`,
+  `apt`); another family is refused by lint. `images.<k>` built from packages, linted, signed
+  and SBOM'd as any image:
+  - `base`: the distribution image, tag and digest (lint: pinned; the release records it);
+  - `apt`: the distribution's packages the image needs beside them (Debian's name rule);
+  - `packages`: the project's `.deb` files, each a pattern relative to the project with
+    `{version}` (the release's version, an optional Debian revision `-N` after it) and `{arch}`
+    (the build platform's Debian architecture, `amd64`/`arm64`), each `required: true` or not;
+    exactly one file per pattern (none: a required one fails `ship` naming the pattern and the
+    files it saw; several: refused, naming them); installed together with `apt` so their
+    dependencies come from the base's repositories, with a `policy-rc.d` refusing every service
+    start for the build's length (removed after); the files are the image's inputs, so a new build
+    of a package is a new image;
+  - `files`: project files and directories copied in (source → absolute path; a directory whole;
+    a glob into a directory), as a stack's renderers, templates and entrypoint are;
+  - `ca_certificates`: project PEM files (a glob) added to the image's trust store
+    (`update-ca-certificates`);
+  - `purge`: absolute paths (globs allowed) removed after the install — the files maintainer
+    scripts generated per install; a path that removed nothing warns at build (a stale list),
+    and `/`, a top-level directory or a whole `/usr`, `/etc`, `/var` are refused;
+  - `entrypoint` / `cmd`: as a Dockerfile's.
+  The second form builds the packages first: `packages: { image: <key>, path: <dir in it> }`, where
+  `<key>` is a Dockerfile image of the project marked build-only (never published, no SBOM of its
+  own) whose target writes the `.deb`s at `path` — `ship` alone then builds the release, the
+  build-only image's `add_hosts` and `args` applying to its build. The packages' systemd units
+  stay the project's to turn into services (an entrypoint per unit). The SBOM lists the packages
+  (syft), and a package's own CycloneDX documents under `/usr/share/sbom` merge in as an image's
+  do.
+- **What packages install on a host, taken from them** (a project renders its table at development time and feeds its sets over the app socket today, which works): a package does more than its files in a
+  container — it installs what only a host applies, and a stack built from it repeats each piece
+  by hand in the spec, a second declaration that drifts from the package's. Three kinds:
+  - **A service table generated by its image**: `services.<name>.nftables` as `{ command: [...] }`
+    besides a file — run in the service's image at install (and at each start whose inputs
+    changed), the stack's inputs in its environment, its output the one `table inet <name>` lint
+    and the loader judge today (refused as a file's would be, the previous table kept). A package
+    shipping its ruleset as a generator (rendered from its own declaration and its operator's
+    settings) then has one source: no table copied into the project, no drift, and a setting that
+    shapes the table is an ordinary input, changed by a re-run.
+  - **Static host files read from the packages**: `usr/lib/sysctl.d`, `etc/sysctl.d` →
+    `host.sysctls`; `modules-load.d`, `modprobe.d` → `host.modules` (`load`, `options`,
+    `blacklist` → `block`); `udev/rules.d` → the OS bundle and `tune`'s advice; each with the
+    package and file as its `reason`, the spec's own key winning (said by lint), a tune profile's
+    key refused as today.
+  - **The rest reported**: systemd units, timers and sockets (and their `AmbientCapabilities`,
+    `User=`), `tmpfiles.d`, AppArmor profiles, cron and logrotate files — what no container
+    applies — listed by `lint` and `ship` for each image from packages, with the services and
+    keys the project mapped them to (`# stowage: <unit> -> <service>`, or a spec list), so none is
+    lost without a word.
+
 - **`vm create` takes the first disk set holding any format**: `bootDisks`' `usable`
   (`internal/install/vmcreate.go`) settles on the release's own set as soon as the registry
   holds one of its formats, before the platform is chosen, so a mirror holding the release's raw
@@ -422,11 +480,6 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
   `.stowage-front-logins`; a weak password the operator typed falls offline. Write it 0600 (here,
   in `restoreStack`), or the install dir 0750.
 
-- **Images from packages**: `images.<k>` built from `.deb` packages on a digest-pinned base
-  (`base`, `packages`: a build target writing them or a glob, `purge`: the per-install paths a
-  maintainer script leaves in an image — a generated CA, a default config), with lint on the pin
-  and the purge list (ship's syft SBOM lists the packages). Turning the packages' systemd units into
-  services stays the project's (an entrypoint per unit).
 
 - **`k8s install --unsafe-sysctls` on a kubelet that refuses them**: the pods fail at once
   (`SysctlForbidden`), yet helm waits out `--timeout` before it rolls back. Watch the rollout's

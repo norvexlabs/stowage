@@ -10,6 +10,18 @@ follow [SemVer](https://semver.org/).
   none was made yet), `updates` and `upgrade` read the channel and registry of the VM's settings
   and write a newer release's OS; the boot into it makes the first install of that release. A
   fixed release, a revision of the same version included, no longer needs the VM made again.
+- **A gateway stack on a Docker host**: `tune --apply` on an install is also the operator's
+  consent to the stack's network declarations — the services' nftables tables, the forwarding
+  between `host.interfaces` roles (in `DOCKER-USER`), and each `tun` device's networkd file (a
+  NIC's MTU and policy routing stay the operator's). From then on every start as root, and a boot
+  unit, apply them as the VM does;
+  `tune --revert` removes them. Without consent, each start warns they are not in force, and
+  `status` says which are applied.
+- **An upgrade adding a front route**: a route the release adds is decided as a first install
+  decides it — on a domain the install serves (a `path` route) without asking, a new domain input
+  given or asked like any added input, a loopback route's port by the new `upgrade --ports` or the
+  release's — rather than refused. On the VM, `upgrade` checks the target release's installer
+  before it writes the OS, and refuses there a route or an input its boot could not decide.
 - Lint refuses a compose service's `volumes_from`, `links` or `external_links` that is not a list
   of strings, as Compose does.
 

@@ -167,27 +167,15 @@ func (in *Installer) Upgrade(ctx context.Context) error {
 		return err
 	}
 	mode, _ := env.Get("STOWAGE_TLS_MODE")
-	if err := in.sameFront(env, mode); err != nil {
+	pub, err := in.upgradeFits(env, mode)
+	if err != nil {
 		return err
-	}
-	if _, err := in.hook(); err != nil {
-		return err
-	}
-	if in.schemaOn() {
-		if err := providers.SchemaCompat(in.R.Spec.DB().SchemaCompat, in.R.Spec.Images); err != nil {
-			return fmt.Errorf("database.schema_compat: %w", err)
-		}
 	}
 	if o.Offline && pinnedImages(env) {
 		return errors.New("--offline: this install pulls its images by digest; an install made with --offline upgrades from loaded images")
 	}
 	o.Offline = !pinnedImages(env)
-	var added []input
-	for _, i := range in.inputList(mode) {
-		if _, ok := env.Get(i.Key); !ok {
-			added = append(added, i)
-		}
-	}
+	added := in.addedInputs(env, mode)
 	if err := in.onlyAdded(env, added); err != nil {
 		return err
 	}
@@ -243,7 +231,7 @@ func (in *Installer) Upgrade(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if err := in.routePaths(next, mode); err != nil {
+	if err := in.upgradeRoutes(env, next, mode, pub); err != nil {
 		return err
 	}
 	if o.DryRun {
@@ -311,6 +299,39 @@ func (in *Installer) Upgrade(ctx context.Context) error {
 	return nil
 }
 
+// upgradeFits refuses a release the install cannot move to as it stands, before anything is asked:
+// its front (sameFront) and where it listens (upgradePorts, returned), its provision hook, its
+// database.schema_compat.
+func (in *Installer) upgradeFits(env *EnvFile, mode string) (publish, error) {
+	if err := in.sameFront(env, mode); err != nil {
+		return publish{}, err
+	}
+	pub, err := in.upgradePorts(env, mode)
+	if err != nil {
+		return publish{}, err
+	}
+	if _, err := in.hook(); err != nil {
+		return publish{}, err
+	}
+	if in.schemaOn() {
+		if err := providers.SchemaCompat(in.R.Spec.DB().SchemaCompat, in.R.Spec.Images); err != nil {
+			return publish{}, fmt.Errorf("database.schema_compat: %w", err)
+		}
+	}
+	return pub, nil
+}
+
+// addedInputs are the inputs of the release in this mode the install does not record.
+func (in *Installer) addedInputs(env *EnvFile, mode string) []input {
+	var added []input
+	for _, i := range in.inputList(mode) {
+		if _, ok := env.Get(i.Key); !ok {
+			added = append(added, i)
+		}
+	}
+	return added
+}
+
 // keptInstaller returns the release the install's kept installer carries (readKept), and refuses
 // one that is not the release it runs: kept with it in PrevDir, that installer is what a rollback
 // goes back with.
@@ -353,9 +374,11 @@ func (in *Installer) newer(cur, rev string) error {
 }
 
 // sameFront refuses a release whose front the install cannot keep: a front where the install has
-// none or none where it has one, a TLS mode it no longer offers, a route the install does not
-// publish, a route's domain under an input the install does not record, routes the recorded
-// domains make clash (routeDomains).
+// none or none where it has one, a TLS mode it no longer offers, a route's domain under an input
+// the install records empty, or one it does not record for a route the install publishes, routes
+// the recorded domains make clash (routeDomains). A route the release adds is decided as a first
+// install decides it: on its domain input's recorded value, or on the value given to that input
+// the release adds (upgradeRoutes); in loopback mode on its own port (upgradePorts).
 func (in *Installer) sameFront(env *EnvFile, mode string) error {
 	m := in.R.Manifest
 	_, served := env.Get("STOWAGE_TLS_MODE") // recorded by an install with a front
@@ -370,18 +393,133 @@ func (in *Installer) sameFront(env *EnvFile, mode string) error {
 	if !slices.Contains(in.R.Spec.Front.TLSModes, mode) {
 		return fmt.Errorf("%s %s does not offer the TLS mode this install uses (%s)", m.Name, m.ProjectVersion, mode)
 	}
+	if mode == Loopback {
+		return nil
+	}
+	unrecorded := false
 	for _, r := range in.R.Spec.Front.Routes {
-		if _, ok := env.Get(spec.URLVar(r.Name)); !ok {
-			return fmt.Errorf("%s %s adds the route %s, which this install does not publish: a new route needs a new install", m.Name, m.ProjectVersion, r.Name)
-		}
-		if v, _ := env.Get(r.DomainInput); mode != Loopback && v == "" {
+		v, recorded := env.Get(r.DomainInput)
+		_, published := env.Get(spec.URLVar(r.Name))
+		switch {
+		case !recorded && !published:
+			unrecorded = true // an input the release adds: given with the others
+		case v == "":
 			return fmt.Errorf("%s %s takes the domain of %s from %s, which this install does not record (or records empty): give it to a re-run of the installer the install runs, `%s --dir %s --set %s=<domain>`, then upgrade",
 				m.Name, m.ProjectVersion, r.Name, r.DomainInput, in.ctl(), in.O.Dir, r.DomainInput)
 		}
 	}
+	if unrecorded {
+		return nil // the routes' domains are checked once given (upgradeRoutes)
+	}
 	_, err := in.routeDomains(mode, func(k string) string { v, _ := env.Get(k); return v })
 	if err != nil {
 		return fmt.Errorf("%s %s: %w; give the routes their domains with a re-run of the installer the install runs, `%s --dir %s`, then upgrade", m.Name, m.ProjectVersion, err, in.ctl(), in.O.Dir)
+	}
+	return nil
+}
+
+// upgradePorts is where the upgraded install's front listens: in a TLS mode the recorded HTTP and
+// HTTPS ports; in loopback mode the recorded address, each route the install publishes on its
+// recorded port, and each route the release adds on its port from --ports, else the release's
+// front.loopback_ports — one no other route has, no L4 route publishes, and free on the host.
+// --ports names only a route the release adds.
+func (in *Installer) upgradePorts(env *EnvFile, mode string) (publish, error) {
+	s, o, m := in.R.Spec, &in.O, in.R.Manifest
+	get := func(k string) string { v, _ := env.Get(k); return v }
+	port := func(k string) int { p, _ := strconv.Atoi(get(k)); return p }
+	switch {
+	case !s.HasFront() && len(o.Ports) > 0:
+		return publish{}, fmt.Errorf("--ports: %s %s has no front", m.Name, m.ProjectVersion)
+	case !s.HasFront():
+		return publish{}, nil
+	case mode != Loopback && len(o.Ports) > 0:
+		return publish{}, fmt.Errorf("--ports is for loopback mode: this install's front serves %s, on its recorded ports", mode)
+	case mode != Loopback:
+		return publish{addr: "127.0.0.1", all: true, ports: map[string]int{"http": port(HTTPPortVar), "https": port(HTTPSPortVar)}}, nil
+	}
+	pub := publish{addr: get("STOWAGE_LOOPBACK_ADDRESS"), ports: map[string]int{}}
+	added := publish{addr: pub.addr, ports: map[string]int{}}
+	for _, r := range s.Front.Routes {
+		if _, ok := env.Get(spec.URLVar(r.Name)); ok {
+			if _, given := o.Ports[r.Name]; given {
+				return publish{}, fmt.Errorf("--ports: the route %s is recorded at the install, and an upgrade keeps its port (only a route the release adds is given one)", r.Name)
+			}
+			pub.ports[r.Name] = port(PortVar(r.Name))
+			continue
+		}
+		p, ok := o.Ports[r.Name]
+		if !ok {
+			p, ok = s.Front.LoopbackPorts[r.Name]
+		}
+		if !ok {
+			return publish{}, fmt.Errorf("%s %s adds the route %s, which has no loopback port: give it one with --ports %s=PORT", m.Name, m.ProjectVersion, r.Name, r.Name)
+		}
+		if p < 1 || p > 65535 {
+			return publish{}, fmt.Errorf("--ports: %s=%d is not a TCP port", r.Name, p)
+		}
+		pub.ports[r.Name], added.ports[r.Name] = p, p
+	}
+	for _, k := range sortedKeys(o.Ports) {
+		if _, ok := pub.ports[k]; !ok {
+			return publish{}, fmt.Errorf("--ports: %q is no route (%s)", k, strings.Join(s.Front.RouteNames(), ", "))
+		}
+	}
+	for _, k := range sortedKeys(added.ports) {
+		for _, other := range sortedKeys(pub.ports) {
+			if other != k && pub.ports[other] == added.ports[k] {
+				return publish{}, fmt.Errorf("%s %s adds the route %s on port %d, which %s has: choose another with --ports %s=PORT", m.Name, m.ProjectVersion, k, added.ports[k], other, k)
+			}
+		}
+	}
+	if err := in.l4Clash(added); err != nil {
+		return publish{}, err
+	}
+	return pub, in.portsFree(added)
+}
+
+// upgradeRoutes records in next the URL of each route the release adds (and its port in loopback
+// mode) as a first install records it, where pub has the front listen; the routes the install
+// publishes keep theirs (routePaths). In a TLS mode every route's domain is its domain input's
+// value — recorded, or given to an input the release adds — and the routes must not clash on
+// them (routeDomains).
+func (in *Installer) upgradeRoutes(env, next *EnvFile, mode string, pub publish) error {
+	s, m := in.R.Spec, in.R.Manifest
+	if !s.HasFront() {
+		return nil
+	}
+	get := func(k string) string { v, _ := next.Get(k); return v }
+	if mode != Loopback {
+		for _, r := range s.Front.Routes {
+			if get(r.DomainInput) == "" {
+				return fmt.Errorf("%s %s adds the route %s, whose domain %s nothing gives: --set %s=<domain>", m.Name, m.ProjectVersion, r.Name, r.DomainInput, r.DomainInput)
+			}
+		}
+	}
+	// In byo mode the install's certificate must cover the domain of a route the release adds, as
+	// a re-run's.
+	adds := slices.ContainsFunc(s.Front.Routes, func(r spec.Route) bool { _, ok := env.Get(spec.URLVar(r.Name)); return !ok })
+	if mode == "byo" && adds {
+		_, leaf, err := readLeaf(filepath.Join(in.O.Dir, TLSDir, "cert.pem"))
+		if err != nil {
+			return fmt.Errorf("the install's certificate: %w", err)
+		}
+		for _, r := range s.Front.Routes {
+			if _, ok := env.Get(spec.URLVar(r.Name)); !ok && leaf.VerifyHostname(get(r.DomainInput)) != nil {
+				return fmt.Errorf("%s %s adds the route %s: the install's certificate does not cover %s (%s)", m.Name, m.ProjectVersion, r.Name, get(r.DomainInput), r.DomainInput)
+			}
+		}
+	}
+	domains, err := in.routeDomains(mode, get)
+	if err != nil {
+		return fmt.Errorf("%s %s: %w", m.Name, m.ProjectVersion, err)
+	}
+	if err := in.routePaths(next, mode); err != nil {
+		return err
+	}
+	for _, r := range s.Front.Routes {
+		if _, ok := env.Get(spec.URLVar(r.Name)); !ok {
+			routeVars(next, mode, r, pub, domains[r.Name])
+		}
 	}
 	return nil
 }

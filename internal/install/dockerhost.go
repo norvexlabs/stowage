@@ -40,8 +40,13 @@ const pressureFile = "disk-pressure.json"
 // kind, and the first hex digits of the install directory's digest, so two installs on one host
 // never share one.
 func installUnit(name, kind, dir string) string {
+	return name + "-" + kind + "-" + dirDigest(dir)
+}
+
+// dirDigest is the first hex digits of the install directory's digest.
+func dirDigest(dir string) string {
 	sum := sha256.Sum256([]byte(filepath.Clean(dir)))
-	return name + "-" + kind + "-" + hex.EncodeToString(sum[:])[:8]
+	return hex.EncodeToString(sum[:])[:8]
 }
 
 // hostLock is the lock in the install directory a Docker install's daemon holds while it runs

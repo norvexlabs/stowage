@@ -138,6 +138,11 @@ type Options struct {
 	Host     Tool
 	// Systemd is where a Docker install's units are written; empty is /etc/systemd/system.
 	Systemd string
+	// Euid replaces the run's effective user, NetworkdDir the host's networkd directory and
+	// GatewayRun /run, in tests (a Docker host's network declarations, gateway.go).
+	Euid        func() int
+	NetworkdDir string
+	GatewayRun  string
 	// Roots are the host's trusted CAs a byo chain is checked against; nil is the system's.
 	Roots func() (*x509.CertPool, error)
 	// Tune is the host tune reads and changes (`tune`, the containers' network settings, the
@@ -1328,6 +1333,9 @@ func (in *Installer) up(ctx context.Context, env *EnvFile) (err error) {
 		if err := in.loadTables(ctx); err != nil {
 			return err
 		}
+		if err := in.gatewayStart(ctx, func(k string) string { v, _ := env.Get(k); return v }); err != nil {
+			return err
+		}
 		if err := in.writeContent(ctx, m, env, environ, hn); err != nil {
 			return err
 		}
@@ -1863,7 +1871,7 @@ func (in *Installer) openPorts(ctx context.Context, env *EnvFile, hn hostNet) er
 	for _, role := range in.transparentRoles(hn) {
 		input = fmt.Appendf(input, "%smeta l4proto { tcp, udp } socket transparent 1 accept\n", in.iif(role))
 	}
-	if err := in.forwardRoles(ctx); err != nil {
+	if err := in.forwardRoles(ctx, get); err != nil {
 		return err
 	}
 	// The forward chain's file goes: nothing of this install is forwarded to be judged there.
@@ -1936,34 +1944,78 @@ var ipv6Proc = "/proc/sys/net/ipv6"
 // check failing on Docker's hold never adds a second jump.
 const ForwardChain = "STOWAGE-FORWARD"
 
-// forwardRules are ForwardChain's rules, as iptables-restore reads them: each role's traffic out
-// of each role it forwards to (host.interfaces.<role>.forward), and the replies back, nothing new
-// into the role; nil when no role forwards. The stack's own table judges what is forwarded.
-func forwardRules(h *spec.Host) []byte {
-	b := fmt.Appendf(nil, "*filter\n:%s - [0:0]\n", ForwardChain)
+// forwardRules are chain's rules, as iptables-restore reads them: each role's traffic out of each
+// role it forwards to (host.interfaces.<role>.forward), and the replies back, nothing new into the
+// role, each role by its device on this host (dev; "" leaves the pair out, and names the role in
+// unmapped); nil when no pair is forwarded. The stack's own table judges what is forwarded.
+func forwardRules(h *spec.Host, chain string, dev func(role string) string) (rules []byte, unmapped []string) {
+	b := fmt.Appendf(nil, "*filter\n:%s - [0:0]\n", chain)
 	n := 0
 	if h != nil {
 		for _, role := range sortedKeys(h.Interfaces) {
 			for _, out := range h.Interfaces[role].Forward {
-				b = fmt.Appendf(b, "-A %s -i %s -o %s -j ACCEPT\n", ForwardChain, role, out)
-				b = fmt.Appendf(b, "-A %s -i %s -o %s -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT\n", ForwardChain, out, role)
+				in, o := dev(role), dev(out)
+				for r, d := range map[string]string{role: in, out: o} {
+					if d == "" && !slices.Contains(unmapped, r) {
+						unmapped = append(unmapped, r)
+					}
+				}
+				if in == "" || o == "" {
+					continue
+				}
+				b = fmt.Appendf(b, "-A %s -i %s -o %s -j ACCEPT\n", chain, in, o)
+				b = fmt.Appendf(b, "-A %s -i %s -o %s -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT\n", chain, o, in)
 				n++
 			}
 		}
 	}
+	slices.Sort(unmapped)
 	if n == 0 {
-		return nil
+		return nil, unmapped
 	}
-	return append(b, "COMMIT\n"...)
+	return append(b, "COMMIT\n"...), unmapped
 }
 
-// forwardRoles gives ForwardChain its rules (forwardRules), for IPv4 and IPv6, in one transaction
-// each that replaces the chain's rules alone, and makes sure DOCKER-USER jumps to it. A record of
-// them under O.Firewall (/run, which a boot empties as it does iptables's rules) skips a start that
-// changes nothing; with no role forwarding and no record, iptables is left alone.
-func (in *Installer) forwardRoles(ctx context.Context) error {
-	want := forwardRules(in.R.Spec.Host)
-	record := filepath.Join(in.O.Firewall, in.R.Spec.Name+"-forward.rules")
+// forwards reports whether the release forwards between host.interfaces roles.
+func forwards(h *spec.Host) bool {
+	if h == nil {
+		return false
+	}
+	for _, i := range h.Interfaces {
+		if len(i.Forward) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// roleDevice is a host.interfaces role's device on this host: on the VM, and for a tun role, its
+// own name (the VM names its NICs by their roles, a service its tun device); on a Docker host a
+// NIC role's is the NIC --interface named, as given or recorded (get); "" when none is.
+func (in *Installer) roleDevice(role string, get func(string) string) string {
+	h := in.R.Spec.Host
+	if in.O.Firewall != "" || h == nil || h.Interfaces[role].Kind == spec.InterfaceTUN {
+		return role
+	}
+	// A recorded name is read back as a flag's is checked: it goes into the host's rules as root.
+	if d := cmp.Or(in.O.Interfaces[role], get(InterfaceVar(role))); ifName.MatchString(d) {
+		return d
+	}
+	return ""
+}
+
+// forwardRoles gives the install's forwarding chain (forwardChain) its rules (forwardRules), for
+// IPv4 and IPv6, in one transaction each that replaces the chain's rules alone, and makes sure
+// DOCKER-USER jumps to it. A record of them under /run (forwardRecord), which a boot empties as it
+// does iptables's rules, skips a start that changes nothing; with no role forwarding and no record,
+// iptables is left alone.
+func (in *Installer) forwardRoles(ctx context.Context, get func(string) string) error {
+	chain, host := in.forwardChain(), in.O.host()
+	want, unmapped := forwardRules(in.R.Spec.Host, chain, func(r string) string { return in.roleDevice(r, get) })
+	for _, r := range unmapped {
+		in.O.logf("warning: host.interfaces.%s: no NIC of this host plays it (`--interface %s=<NIC>` on a re-run names one): the forwarding through it is not applied", r, r)
+	}
+	record := in.forwardRecord()
 	cur, _ := os.ReadFile(record)
 	if bytes.Equal(cur, want) {
 		return nil
@@ -1974,28 +2026,28 @@ func (in *Installer) forwardRoles(ctx context.Context) error {
 	}
 	rules := want
 	if rules == nil {
-		rules = fmt.Appendf(nil, "*filter\n:%s - [0:0]\nCOMMIT\n", ForwardChain)
+		rules = fmt.Appendf(nil, "*filter\n:%s - [0:0]\nCOMMIT\n", chain)
 	}
 	tables := []string{"iptables", "ip6tables"}
 	if _, err := os.Stat(ipv6Proc); err != nil {
 		tables = tables[:1] // a kernel without IPv6: Docker keeps no ip6tables chain either
 	}
 	for _, t := range tables {
-		if _, err := in.O.Host.Run(ctx, Cmd{Args: []string{t + "-restore", "-w", "--noflush"}, Stdin: bytes.NewReader(rules)}); err != nil {
+		if _, err := host.Run(ctx, Cmd{Args: []string{t + "-restore", "-w", "--noflush"}, Stdin: bytes.NewReader(rules)}); err != nil {
 			return fmt.Errorf("the forwarding between the host's interfaces (%s): %w", t, err)
 		}
-		jump := []string{"DOCKER-USER", "-j", ForwardChain}
-		if _, err := in.O.Host.Run(ctx, Cmd{Args: append([]string{t, "-w", "-C"}, jump...)}); err == nil {
+		jump := []string{"DOCKER-USER", "-j", chain}
+		if _, err := host.Run(ctx, Cmd{Args: append([]string{t, "-w", "-C"}, jump...)}); err == nil {
 			continue
 		}
-		if _, err := in.O.Host.Run(ctx, Cmd{Args: append([]string{t, "-w", "-I"}, jump...)}); err != nil {
+		if _, err := host.Run(ctx, Cmd{Args: append([]string{t, "-w", "-I"}, jump...)}); err != nil {
 			return fmt.Errorf("the forwarding between the host's interfaces (%s's DOCKER-USER): %w", t, err)
 		}
 	}
 	if want == nil {
-		return nil
+		return nil // the record went above: nothing is forwarded
 	}
-	if err := os.MkdirAll(in.O.Firewall, 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(record), 0o755); err != nil {
 		return err
 	}
 	return writeAtomic(record, bytes.NewReader(want), 0o644, nil)
@@ -2097,6 +2149,9 @@ func (in *Installer) Status(ctx context.Context) error {
 	fmt.Fprintf(in.O.Out, "%s %s (revision %s)\nregistry  %s\n", get("STOWAGE_NAME"), get("STOWAGE_PROJECT_VERSION"), get("STOWAGE_REVISION"), get("STOWAGE_REGISTRY"))
 	p, by := in.tuneProfile(get)
 	fmt.Fprintf(in.O.Out, "%-9s %s (%s)\n", "tune", p, by)
+	if g := in.gatewayStatus(get); g != "" {
+		fmt.Fprintf(in.O.Out, "%-9s %s\n", "gateway", g)
+	}
 	split := in.volumesSplit()
 	switch unfinished, failed, _ := in.firstInstall(); {
 	case split != nil:
@@ -2872,6 +2927,31 @@ func (o *Options) portHolders(protocol string, port int) []string {
 	}
 	return portHolders("/proc/net", protocol, port)
 }
+
+// host is the tool running host programs (Host in tests).
+func (o *Options) host() Tool {
+	if o.Host != nil {
+		return o.Host
+	}
+	return HostTool{}
+}
+
+// euid is the run's effective user (Euid in tests).
+func (o *Options) euid() int {
+	if o.Euid != nil {
+		return o.Euid()
+	}
+	return os.Geteuid()
+}
+
+// networkdDir is where a Docker host's networkd files are written (NetworkdDir in tests).
+func (o *Options) networkdDir() string { return cmp.Or(o.NetworkdDir, networkdDir) }
+
+// gatewayRun is where a Docker install's forwarding record is kept (GatewayRun in tests): /run.
+func (o *Options) gatewayRun() string { return cmp.Or(o.GatewayRun, "/run") }
+
+// systemd is where a Docker install's units are written.
+func (o *Options) systemd() string { return cmp.Or(o.Systemd, systemdDir) }
 
 func (o *Options) udpPortFree(host string, port int) bool {
 	if o.UDPPortFree != nil {

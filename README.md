@@ -1504,7 +1504,7 @@ database: reset-db has nothing to reset` (`… there is no backup to restore`). 
 | `hooks.provision` | `container` (`image`, `cmd`, `env`: the inputs, secrets and safe defaults it receives, required, `[]` for none; `returns`: keys it may return, which `provision --set` sets before it returned them; `outputs`) |
 | `hooks.maintenance.disk_pressure` | `soft_pct`, `hard_pct` (1 ≤ soft < hard ≤ 99), `post` (`http://<service>:<port>/…`), `auth_secret` (a `secrets` key). The Kairos VM's host daemon acts on it (see "Disk pressure" under the installer on the Kairos VM), and a Docker install's own timer (see "Backups, restore and the disk-pressure watch on Docker"); Kubernetes ignores it, and without a `docker` or `kairos` shape it is a warning |
 | `backup` | optional, and only with a `database`: `pg-age-rclone` (`profiles`: a name of 1 to 32 lowercase letters and digits each, `all`, a list of the tables whose data it keeps — `table` in any schema, or `schema.table` —, or `{ exclude: [pattern, …] }`, the tables whose rows it leaves out, structure kept (`table` or `schema.table` of letters, digits and `_`, with pg_dump's `*` and `?`); `default_profile`, required with several; `volumes`, the compose volumes every backup also archives and a restore brings back with the database — each listed once, a volume the compose file declares and Compose creates (not `external`), under a literal name (no `${…}` in its `name:`), and none the database's service mounts: its data is the dump's), which the Kairos VM and a Docker install run (see "Backups" under the installer on the Kairos VM); `command`, validated only (with a `kairos` shape, a warning: the VM schedules no backup of it). A `docker` or `kairos` shape with a `pg-age-rclone` backup makes `ship` build and publish the backup runner (`<name>-backup`), which the OS bundle preloads and a Docker install pulls |
-| `host` | optional: what the stack asks of the machine it runs on, whatever the shape — written into the OS bundle on the `kairos` shape and applied by its boot; on a Docker host `tune` reports its `modules`, `packages`, `firmware` and `kernel_args` as advice (the kernel, packages and boot loader are the operator's: `tune` never writes them) and judges its `sysctls` and `power` as its profile's settings, which `tune --apply` writes when the operator runs it; `k8s tune` prints it all for the nodes. `modules`: kernel modules by name (lower-case letters, digits and `_`), each with a `reason` (one line, at most 200 bytes) and at least one of `load: true` (loaded at boot), `block: true` (never loaded; not with `load` or `options`) and `options` (the module's parameters by name, `[A-Za-z0-9_]`; values of letters, digits and `_ . , : / + -`). `packages`: Ubuntu packages by name (Debian's rule: lower-case letters, digits and `+ - .`, starting with a letter or digit, 2 to 64), each with a `reason`, installed into the OS bundle after its own (a package it purges included); one of the bundle's own boot — a name that is or starts with `cloud-init`, `containerd`, `docker`, `dracut`, `grub`, `immucore`, `kairos`, `linux-generic`, `linux-image`, `linux-modules`, `shim`, `systemd` or `udev`, followed by `-` or `.` — is an error. `interfaces`: the host's network interfaces by role, the role their name (a lower-case letter, then lower-case letters and digits, at most 15; never one the kernel, udev or Docker gives: `lo`, `en`, `eth`, `wl`, `ww`, `ib`, `docker`, `br`, `veth`, `virbr`, `tun`, `tap`, `sit`, `gre`, `ip6`, `dummy`, `bond`…), each with a `reason`: `kind` `nic` (the default: a NIC, which `vm create` attaches and names by its MAC; exactly one is `primary: true` when any NIC is named, the default route's, whose addressing is the VM's network) or `tun` (a device a service opens on the host's network, which networkd matches by name once it is there, keeping the addresses the service gives it); `mtu` (1280 to 9216); `routing_policy_rules` and `routes`, lists of networkd's `[RoutingPolicyRule]` settings (`DestinationPort`, `Family`, `FirewallMark`, `From`, `IPProtocol`, `IncomingInterface`, `Invert`, `OutgoingInterface`, `Priority`, `SourcePort`, `SuppressPrefixLength`, `Table`, `To`, `Type`) and `[Route]` settings (`Destination`, `Gateway`, `GatewayOnLink`, `MTUBytes`, `Metric`, `PreferredSource`, `Protocol`, `Scope`, `Source`, `Table`, `Type`), each value of letters, digits and `_ . : / , + -`, at most 64 (a TPROXY's `fwmark` → `local` table is `routing_policy_rules: [{ FirewallMark: "0x1", Table: "100" }]` and `routes: [{ Type: local, Destination: 0.0.0.0/0, Table: "100" }]`); `forward`: the roles the host forwards this role's traffic out of (`vpn0: { kind: tun, forward: [uplink] }`, a VPN exit node; `lan: { forward: [wan] }`, a gateway), past Docker's FORWARD policy (DROP for IPv4 and IPv6): the VM accepts each one's traffic out and its replies back, nothing new into the role, and the stack's own table (its forward chain) judges what is forwarded, not the role (see "The firewall" under the installer on the Kairos VM); a role not declared, the role itself, one given twice and an empty list are errors, and without a `kairos` shape it is a warning (a Docker host's DOCKER-USER chain is its operator's: `tune` advises its rules); `ethtool` (a NIC's alone): `channels: { combined: max | N }` (1 to 1024), `rings: { rx: max | N, tx: max | N }` (1 to 65536), `features` by the name `ethtool -k` lists (`on` or `off`), `eee` (`on` or `off`). The OS bundle carries each NIC's MTU and routing as networkd drop-ins under `/usr/lib/systemd/network` (the image's, so each system boots with its release's) and each tun device's whole file; `tune` applies the NICs' `ethtool` settings on the VM and judges them, and reports each interface as advice on a Docker host, with networkd's settings and the ethtool commands that give a NIC of that host the role's, and the firewall's rules its `forward` and a service's `transparent` need there; `k8s tune` prints them. `firmware`: firmware files the host's drivers load, by their path under `/lib/firmware` (names of letters, digits and `_ . + -`, none starting with a dot, one `/` apart, at most 200 bytes), each with a `reason`: the OS bundle's build fails when one is not there, as it is or compressed (`.zst`, `.xz`), naming `host.packages` for the package that ships it (the bundle has the distribution's `linux-firmware`); `tune` judges it on the host. `kernel_args`: kernel command-line parameters by name (letters, digits and `_ . -`, at most 64), each with an optional `value` (letters, digits and `_ . , : / + @ -`, at most 128; none: a flag) and a `reason`, which the OS bundle's active and passive systems boot with (its recovery system without them); Kairos's own boot's — `BOOT_IMAGE`, `apparmor`, `biosdevname`, `bundles`, `config_url`, `console`, `cos`, `enforcing`, `immucore`, `init`, `initrd`, `install`, `ip`, `kairos`, `lsm`, `net.ifnames`, `net.naming-scheme`, `panic`, `rd`, `rdinit`, `reset`, `ro`, `root`, `rootdelay`, `rootflags`, `rootfstype`, `rootwait`, `rw`, `security`, `selinux`, `stages`, `systemd`, `upgrade`, `users`, systemd's targets and mounts (`1` to `5`, `S`, `s`, `single`, `rescue`, `emergency`, `fstab`, `luks`, `mount.usr`, `mount.usrflags`, `resume`, `noresume`, `roothash`, `usrhash`), and dracut's network and the agent's flags (`bond`, `bootdev`, `bridge`, `cloud-init-paths`, `debug`, `eject-cd`, `env`, `fail_on_bundles_errors`, `grub_options`, `ifname`, `k3s`, `nameserver`, `options`, `p2p`, `strict`, `team`, `udev`, `vlan`) — the root and its mount, the boot loader's and the initrd's, Kairos's and the configuration keys its agent reads from the command line, the consoles, the init system, the security modules, the interfaces' names, a panic — or one starting with one of them and `.` or `-`, compared with `_` read as `-` (as systemd and udev read them), is an error, as is a name or a value holding `upgrade_failure`, the mark of a boot that fell back to the passive system; the OS bundle's build also refuses one Kairos's boot script sets (its `baseCmd`, `baseRootCmd`, `baseSelinuxCmd` or `baseExtraConsole`, such as `splash` or `quiet`), naming the key. `sysctls`: kernel settings by key (dotted lower-case letters, digits, `_` and `-`), each with a `value` (at most 8 fields of letters, digits and `_ . , : / + -`, one space apart) and a `reason`, set as `tune` sets its profile's, on the host; a key a tune profile sets is an error (`tune` computes it); a key a network, IPC or UTS namespace mostly keeps of its own (`net.ipv4.*` but `tcp_mem` and `udp_mem`, `net.ipv6.*`, `net.unix.*`, `net.netfilter.*`, `net.mptcp.*`, `net.sctp.*`, `net.core.somaxconn`, `kernel.shm*`, `kernel.msg*`, `kernel.sem*`, `fs.mqueue.*`, `kernel.hostname`, `kernel.domainname`) is warned: the host's value holds in the host's namespace (Docker's NAT and bridges among it), not in a container's own (the compose file's `sysctls` give a service its value). A key that appears only with a module (`net.bridge.*` with `br_netfilter`) is set by the VM's boot when `host.modules` loads that module at boot; else the boot notes it missing and `tune` reports it `differs`. `power`: `performance` (the CPUs at their full speed, as `tune` says) or `platform` (the default: their frequency left to the host) |
+| `host` | optional: what the stack asks of the machine it runs on, whatever the shape — written into the OS bundle on the `kairos` shape and applied by its boot; on a Docker host `tune` reports its `modules`, `packages`, `firmware` and `kernel_args` as advice (the kernel, packages and boot loader are the operator's: `tune` never writes them) and judges its `sysctls` and `power` as its profile's settings, which `tune --apply` writes when the operator runs it; `k8s tune` prints it all for the nodes. `modules`: kernel modules by name (lower-case letters, digits and `_`), each with a `reason` (one line, at most 200 bytes) and at least one of `load: true` (loaded at boot), `block: true` (never loaded; not with `load` or `options`) and `options` (the module's parameters by name, `[A-Za-z0-9_]`; values of letters, digits and `_ . , : / + -`). `packages`: Ubuntu packages by name (Debian's rule: lower-case letters, digits and `+ - .`, starting with a letter or digit, 2 to 64), each with a `reason`, installed into the OS bundle after its own (a package it purges included); one of the bundle's own boot — a name that is or starts with `cloud-init`, `containerd`, `docker`, `dracut`, `grub`, `immucore`, `kairos`, `linux-generic`, `linux-image`, `linux-modules`, `shim`, `systemd` or `udev`, followed by `-` or `.` — is an error. `interfaces`: the host's network interfaces by role, the role their name (a lower-case letter, then lower-case letters and digits, at most 15; never one the kernel, udev or Docker gives: `lo`, `en`, `eth`, `wl`, `ww`, `ib`, `docker`, `br`, `veth`, `virbr`, `tun`, `tap`, `sit`, `gre`, `ip6`, `dummy`, `bond`…), each with a `reason`: `kind` `nic` (the default: a NIC, which `vm create` attaches and names by its MAC; exactly one is `primary: true` when any NIC is named, the default route's, whose addressing is the VM's network) or `tun` (a device a service opens on the host's network, which networkd matches by name once it is there, keeping the addresses the service gives it); `mtu` (1280 to 9216); `routing_policy_rules` and `routes`, lists of networkd's `[RoutingPolicyRule]` settings (`DestinationPort`, `Family`, `FirewallMark`, `From`, `IPProtocol`, `IncomingInterface`, `Invert`, `OutgoingInterface`, `Priority`, `SourcePort`, `SuppressPrefixLength`, `Table`, `To`, `Type`) and `[Route]` settings (`Destination`, `Gateway`, `GatewayOnLink`, `MTUBytes`, `Metric`, `PreferredSource`, `Protocol`, `Scope`, `Source`, `Table`, `Type`), each value of letters, digits and `_ . : / , + -`, at most 64 (a TPROXY's `fwmark` → `local` table is `routing_policy_rules: [{ FirewallMark: "0x1", Table: "100" }]` and `routes: [{ Type: local, Destination: 0.0.0.0/0, Table: "100" }]`); `forward`: the roles the host forwards this role's traffic out of (`vpn0: { kind: tun, forward: [uplink] }`, a VPN exit node; `lan: { forward: [wan] }`, a gateway), past Docker's FORWARD policy (DROP for IPv4 and IPv6): the VM accepts each one's traffic out and its replies back, nothing new into the role, and the stack's own table (its forward chain) judges what is forwarded, not the role (see "The firewall" under the installer on the Kairos VM); a role not declared, the role itself, one given twice and an empty list are errors, and without a `kairos` shape it is a warning (a Docker host's DOCKER-USER chain is its operator's: `tune` advises its rules, and `tune --apply` applies them once the operator consents — see "A Docker host's gateway" under `tune`); `ethtool` (a NIC's alone): `channels: { combined: max | N }` (1 to 1024), `rings: { rx: max | N, tx: max | N }` (1 to 65536), `features` by the name `ethtool -k` lists (`on` or `off`), `eee` (`on` or `off`). The OS bundle carries each NIC's MTU and routing as networkd drop-ins under `/usr/lib/systemd/network` (the image's, so each system boots with its release's) and each tun device's whole file; `tune` applies the NICs' `ethtool` settings on the VM and judges them, and reports each interface as advice on a Docker host, with networkd's settings and the ethtool commands that give a NIC of that host the role's, and the firewall's rules its `forward` and a service's `transparent` need there, each NIC role by the NIC `--interface` recorded for it, else `<the NIC playing <role>>` (a NIC keeps its own name there; a `tun` role's name is its device's); `k8s tune` prints them, a NIC role as that placeholder. A service's own `nftables` table is loaded as written, on every shape: it names a `tun` role or the host's own devices, never a NIC role (which is a device's name on the VM alone). `firmware`: firmware files the host's drivers load, by their path under `/lib/firmware` (names of letters, digits and `_ . + -`, none starting with a dot, one `/` apart, at most 200 bytes), each with a `reason`: the OS bundle's build fails when one is not there, as it is or compressed (`.zst`, `.xz`), naming `host.packages` for the package that ships it (the bundle has the distribution's `linux-firmware`); `tune` judges it on the host. `kernel_args`: kernel command-line parameters by name (letters, digits and `_ . -`, at most 64), each with an optional `value` (letters, digits and `_ . , : / + @ -`, at most 128; none: a flag) and a `reason`, which the OS bundle's active and passive systems boot with (its recovery system without them); Kairos's own boot's — `BOOT_IMAGE`, `apparmor`, `biosdevname`, `bundles`, `config_url`, `console`, `cos`, `enforcing`, `immucore`, `init`, `initrd`, `install`, `ip`, `kairos`, `lsm`, `net.ifnames`, `net.naming-scheme`, `panic`, `rd`, `rdinit`, `reset`, `ro`, `root`, `rootdelay`, `rootflags`, `rootfstype`, `rootwait`, `rw`, `security`, `selinux`, `stages`, `systemd`, `upgrade`, `users`, systemd's targets and mounts (`1` to `5`, `S`, `s`, `single`, `rescue`, `emergency`, `fstab`, `luks`, `mount.usr`, `mount.usrflags`, `resume`, `noresume`, `roothash`, `usrhash`), and dracut's network and the agent's flags (`bond`, `bootdev`, `bridge`, `cloud-init-paths`, `debug`, `eject-cd`, `env`, `fail_on_bundles_errors`, `grub_options`, `ifname`, `k3s`, `nameserver`, `options`, `p2p`, `strict`, `team`, `udev`, `vlan`) — the root and its mount, the boot loader's and the initrd's, Kairos's and the configuration keys its agent reads from the command line, the consoles, the init system, the security modules, the interfaces' names, a panic — or one starting with one of them and `.` or `-`, compared with `_` read as `-` (as systemd and udev read them), is an error, as is a name or a value holding `upgrade_failure`, the mark of a boot that fell back to the passive system; the OS bundle's build also refuses one Kairos's boot script sets (its `baseCmd`, `baseRootCmd`, `baseSelinuxCmd` or `baseExtraConsole`, such as `splash` or `quiet`), naming the key. `sysctls`: kernel settings by key (dotted lower-case letters, digits, `_` and `-`), each with a `value` (at most 8 fields of letters, digits and `_ . , : / + -`, one space apart) and a `reason`, set as `tune` sets its profile's, on the host; a key a tune profile sets is an error (`tune` computes it); a key a network, IPC or UTS namespace mostly keeps of its own (`net.ipv4.*` but `tcp_mem` and `udp_mem`, `net.ipv6.*`, `net.unix.*`, `net.netfilter.*`, `net.mptcp.*`, `net.sctp.*`, `net.core.somaxconn`, `kernel.shm*`, `kernel.msg*`, `kernel.sem*`, `fs.mqueue.*`, `kernel.hostname`, `kernel.domainname`) is warned: the host's value holds in the host's namespace (Docker's NAT and bridges among it), not in a container's own (the compose file's `sysctls` give a service its value). A key that appears only with a module (`net.bridge.*` with `br_netfilter`) is set by the VM's boot when `host.modules` loads that module at boot; else the boot notes it missing and `tune` reports it `differs`. `power`: `performance` (the CPUs at their full speed, as `tune` says) or `platform` (the default: their frequency left to the host) |
 | `shapes` | at least one of `docker: {}`, `kubernetes` (`chart`, a directory holding `Chart.yaml`; `postgres_modes`: `external`, `embedded`, `cnpg`, optional and validated only; an error without a `database`; `schema`: `url_env`, the variable holding the migrate role's URL in the container of the workload running `reads_newer_image`, and `image`, an images key holding `psql` — the schema check of `k8s upgrade` and `k8s rollback`, which needs the `sql` schema-compat provider with `reads_newer_image`; absent with that provider, a warning), `kairos` (`base`, the distribution converted into Kairos, and `kairos_init`, the kairos-init image, both pinned by digest; a `kairos_init` tagged other than the release the OS bundle's build takes, v4.4.0-rc2, is warned, as the build refuses it; `disk_formats`: `raw`, `qcow2`, `ova`, `vhd`, `gce`, `iso` (the installer, for bare metal), none publishing the bundle alone; `cloud_publish`: `aws`, `azure`, `gcp`, each adding the disk format it imports (`raw`, `vhd`, `gce`); `health_gate`: 0 < `poll_s` < `deadline_s` ≤ `deadline_after_reset_s`, the VM's health gate's window and polling (default 600, 1800 and 30 s; `deadline_after_reset_s` is validated only: `reset-db` does not reboot, so no boot is judged after it); `host_api`: the compose services given the host daemon's app socket on the VM, each in the compose file, none twice; `size`: `min` and `recommended`, each of `cpus`, `memory` and `disk` (sizes as a memory share's `max` reads them; one given as 0 or left empty is an error, and so is `min:` or `recommended:` left empty: leave it out) — the least VM the stack runs on and the one it runs well on, which `vm create` sizes a VM from; at least one of `min` and `recommended`, each stating at least one of the three, `cpus` at least 1, `memory` whole MiB and at least 1G, `disk` (the app's space on the VM's disk: its data, its images loaded, its backups' staging — `vm create` adds what Kairos takes) whole GiB and at least 4G, and none of `recommended` under `min`'s; a `base` whose repository (its path's last element) is not `ubuntu` is warned, as the build refuses another distribution; no `backup` is a warning when there is a `database`). `ship` publishes the `kubernetes` chart and the `kairos` OS bundle and disks; `docker` and `kubernetes` have a runtime |
 
 A `command` provider answers per op: `version.get` → `{"version"}`; `scheme.validate`
@@ -1545,9 +1545,9 @@ again, to copy an installer to another host.
 <short>-stow secrets rotate KEY [--stage | --finish] [--dir D]           # a secret with rotation: true
 <short>-stow provision [--dir D] [--set KEY=VALUE]…                      # run the provision hook again; --set an input only it reads, or a value it returned or declares it returns
 <short>-stow upgrade [--dir D] [--set KEY=VALUE]… [--answers FILE] [--no-input] # the NEW release's installer
-          [--offline] [--dry-run] [--no-provision] [--accessible]
+          [--ports route=port]… [--offline] [--dry-run] [--no-provision] [--accessible]
 <short>-stow upgrade --version V [--dir D] [--set KEY=VALUE]… [--answers FILE] # fetches V's installer
-          [--no-input] [--accessible] [--dry-run] [--no-provision]
+          [--ports route=port]… [--no-input] [--accessible] [--dry-run] [--no-provision]
 <short>-stow rollback [--dir D] [--offline] [--dry-run]                  # the installer the install keeps
 <short>-stow reset-db [--dir D] [--yes] [--no-input] [--accessible] [--dry-run] [--no-provision]
 <short>-stow backup config|run|status|list|verify [--dir D] [the VM's flags]   # a pg-age-rclone backup
@@ -1708,7 +1708,13 @@ again, to copy an installer to another host.
   unless `--yes`, which keeps the data unless `--data`. The install's timers on the host — the
   scheduled backup's and the disk-pressure watch's units — are disabled and removed either way;
   a later install on the kept data writes both again (the schedule from the settings `backup
-  config` keeps in D). Removing a unit written as root takes root: a run as another user refuses
+  config` keeps in D). The network declarations `tune --apply` applied (see "A Docker host's
+  gateway") are removed too, as `tune --revert` removes them, consent included: a later install
+  applies them again only after another `tune --apply`; without root it refuses first (`the
+  stack's network declarations are applied on this host (tune --apply), and removing them takes
+  root: …`). A record that does not read refuses the uninstall before anything goes (`…: fix or
+  remove it, then uninstall again`); one of another directory (copied there) is left as it is
+  (`note: …: left as it is`); one of a directory gone (moved) is this install's, removed. Removing a unit written as root takes root: a run as another user refuses
   before anything goes (`<unit> is the install's, and removing it takes root: run \`sudo … uninstall
   --dir D\``). It runs under the install's lifecycle
   lock, and refuses a directory holding an install of another project. `--dry-run` prints what
@@ -1857,10 +1863,30 @@ again, to copy an installer to another host.
     given one is refused.
 - `upgrade`, run by the new release's installer, moves an install of an earlier release (ordered
   by the scheme the release records; a `command` scheme is not checked) to it. It refuses, before
-  anything changes, a release that adds a route, drops the install's TLS mode, or names an input
-  the release does not add (`--set` and `--answers` only give what it adds; on a terminal those
-  are asked), or an install whose kept `<short>-stow` is not the installer of the release it runs
-  (a rollback goes back with it). It also refuses:
+  anything changes, a release that drops the install's TLS mode, or names an input the release
+  does not add (`--set` and `--answers` only give what it adds; on a terminal those are asked),
+  or an install whose kept `<short>-stow` is not the installer of the release it runs (a rollback
+  goes back with it). A route the release adds is decided as a first install decides it, and
+  recorded as one records it (`STOWAGE_URL_<ROUTE>`; in loopback mode `STOWAGE_PORT_<ROUTE>` too;
+  `--dry-run` prints them), the front then serving it:
+  - in a TLS mode, on its `domain_input`: one the install records (a `path` route on a domain it
+    serves) asks nothing; one the release adds is given as any added input (`--set`, `--answers`,
+    asked on a terminal, else `missing required input(s)`), and one nothing asks is refused
+    (`<name> <version> adds the route <r>, whose domain <KEY> nothing gives: --set
+    <KEY>=<domain>`); routes the domains given make clash are refused (`<name> <version>: <a> and
+    <b> both serve the domain <d>`); in `byo` mode the install's certificate must cover the domain of
+    a route the release adds (`<name> <version> adds the route <r>: the install's certificate does
+    not cover <domain> (<KEY>)`; one that does not read, or expired, is refused: `the install's
+    certificate: …`), and is not read when the release adds none;
+  - in loopback mode, on its port: `--ports route=port` (repeatable; a route the release adds
+    alone: `--ports: the route <r> is recorded at the install, and an upgrade keeps its port`),
+    else the release's `front.loopback_ports`, else refused (`<name> <version> adds the route <r>,
+    which has no loopback port: give it one with --ports <r>=PORT`); a port another route has, an
+    L4 route's, or one in use on the host is refused as at a first install; `--ports` in a TLS mode
+    is refused (`--ports is for loopback mode: …`).
+
+  A route the install publishes whose `domain_input` it does not record (a release that renames
+  the input) is refused, as is one it records empty. It also refuses:
   - an install of a later release (the message points to `rollback`);
   - `--set` of a value already recorded, which an upgrade keeps;
   - an install that a stopped rollback left, until `rollback` is run again;
@@ -1887,7 +1913,7 @@ again, to copy an installer to another host.
   values that would change (secrets redacted).
 - `upgrade --version V`, run by any installer of the project (the one the install keeps,
   `<dir>/<short>-stow`, is the usual one), fetches V's installer and runs its `upgrade` with the other
-  flags given (`--set`, `--answers`, `--no-input`, `--accessible`, `--dry-run`,
+  flags given (`--set`, `--answers`, `--ports`, `--no-input`, `--accessible`, `--dry-run`,
   `--no-provision`); its exit status is the command's. V is looked up among the release
   manifests (`<prefix>/<name>-release`) of the registry the install pulls from
   (`STOWAGE_REGISTRY`, a mirror included: nothing is read from anywhere else), on the channel of
@@ -2384,10 +2410,10 @@ table
 of a service the release no longer declares is deleted (the tables loaded are recorded in
 `<dir>/.stowage-nftables`). The host's own table stays Stowage's. A service the release gives the
 app socket feeds its table's named sets through it (`POST /v1/nftables/<table>/sets/<set>`, below).
-On a Docker host, whose firewall is its operator's, nothing is loaded: each start warns
-(`warning: services.<name>.nftables: the host's firewall is its operator's, and its table is not
-loaded: `<short>-stow tune --print` prints it`), `tune` gives it as advice (`nftables table inet
-<name>`) and `tune --print` prints it, never written by `--apply`.
+On a Docker host, whose firewall is its operator's, a table is loaded only once the operator
+consented with `tune --apply` (see "A Docker host's gateway" under `tune`), by each start as
+root; until then each start warns that the stack's network declarations are not in force, `tune`
+gives the table as advice (`nftables table inet <name>`) and `tune --print` prints it.
 
 **An address of its own** (`services.<name>.interface` and `address_input`). A service with an
 address in its input joins an ipvlan network (L2 mode) on the NIC playing that role beside the
@@ -2575,10 +2601,99 @@ with `tune` and neither a `docker` nor a `kairos` shape.
   interrupts (and, with the network profile, RPS) steer off those cores (an interrupt that reaches one is `differs`), and a
   running `irqbalance` is `advice` (`IRQBALANCE_BANNED_CPULIST=…`).
   And on a Docker host each service's nftables table is `advice` (`nftables table inet <name>`),
-  which `--print` prints after the files, never written. `--print` prints the files `--apply` writes,
-  for a host configured by other means. `--apply` (root) prints what it writes, asks (`--yes`
-  without a terminal, else it refuses), writes the files and applies them to the running host;
-  `--revert` (root, asks too) removes them and puts back what the first `--apply` found.
+  which `--print` prints after the files (consented and applied by a start as root,
+  through roles that each have a device here, a role's forwarding is reported `ok`, `its
+  forwarding out of <roles> applied by each start (tune --apply)`, its rules no longer advised) — once the operator consented, `ok`, `loaded by each
+  start (tune --apply)`, when it is loaded, else `differs`, `not loaded` (`loaded by the next start
+  as root`); with the consent revoked and the table still loaded, `differs`, `still loaded, the
+  consent withdrawn` (`<short>-stow tune --revert` again removes it). Loaded means listed in
+  `.stowage-nftables` and, as root, held by the kernel (`nft list table`: a boot drops it until
+  the next start loads it); `status`'s `tables` are the same. `--print` prints the files `--apply` writes, for a host configured by other
+  means. `--apply` (root) prints what it writes, asks (`--yes` without a terminal, else it
+  refuses), writes the files and applies them to the running host; `--revert` (root, asks too)
+  removes them and puts back what the first `--apply` found.
+- **A Docker host's gateway** (`--apply` with `--dir` on an install whose release declares a
+  service's `nftables`, a role's `forward`, or a `tun` role): the same `--apply` is the operator's
+  consent to the stack's network declarations, said before it asks (`and the stack's network
+  declarations, …: applied by the install's start now, by every start and at every boot (a unit),
+  until --revert`). It records the consent in `<dir>/.stowage-gateway`, enables a boot unit,
+  `/etc/systemd/system/<name>-gateway-<8 hex>.service` (the 8 hex digits are the first of the
+  sha256 of the install directory's real path (absolute, its links resolved) when `--apply` first ran, recorded in
+  `.stowage-gateway` with that directory — 0644: nothing in it is secret, and a start not as root
+  reads it; the unit is enabled before the consent is recorded, and when systemd does not enable
+  it the record and the unit stay as they were, a unit this run wrote removed again; after Docker and the network: `<dir>/<short>-stow --dir <dir>
+  --no-input --no-provision`, the install's start, since the kernel keeps no table or chain across
+  a reboot), and runs that start now. From then on each start as root applies, as the VM's does:
+  the services' tables (loaded whole, recorded in `<dir>/.stowage-nftables`, deleted once a release
+  drops them; the services whose table a start loads are recreated, and feed its sets again); the
+  forwarding between roles, the chain `STOWAGE-FWD-<8 hex>` (the VM's `STOWAGE-FORWARD`), which
+  `DOCKER-USER` jumps to, recorded under `/run/<name>-gateway-<8 hex>-forward.rules`, each role
+  by its device on this host — a `tun` role's own name, a NIC role's the NIC `--interface
+  ROLE=NIC` named (recorded in `.env`; a re-run sets it; a recorded name that is not an
+  interface's, a wildcard `+` included, names none), as a NIC keeps its own name on a Docker
+  host; a pair through a NIC role with no NIC named is not applied (`warning: host.interfaces.<role>:
+  no NIC of this host plays it (`--interface <role>=<NIC>` on a re-run names one): the forwarding
+  through it is not applied`, and `status` adds `no forwarding through <roles> (no NIC named:
+  --interface)`); and each
+  `tun` role's whole networkd file, as the VM's image carries it,
+  `/etc/systemd/network/10-<name>-<8 hex>-<role>.network`, which matches the device by name once
+  its service opens it (networkd reloads when one changed, which applies it; a file whose role a
+  release drops is removed). Each file is listed in `.stowage-gateway` before it is written,
+  `pending` until networkd reloaded (a start that fails in between is applied again by the next;
+  `status` counts them as pending); a listed path that is not such a file is never followed: a
+  record that names one does not read (below), and a revert refuses before anything is removed.
+  The record is its directory's, compared by file identity (a link to it is the same): at another
+  directory — the install moved or copied — it applies nothing, and a start warns (`warning: this
+  install's .stowage-gateway is <dir>'s (the directory moved or copied): nothing of the stack's
+  network declarations is applied here; `<short>-stow tune --revert --dir <dir>` removes what it
+  applied, from there, or remove the file and `<short>-stow tune --apply` here`), as `status`
+  does (`not applied: …`); `--apply` there refuses with it before changing the host, and
+  `--revert` there leaves the record (a note) and reverts the tuning alone. When that directory is
+  gone (the install moved), the revert is this one's: `… is <dir>'s, which is gone (the directory
+  moved): nothing … is applied here until `<short>-stow tune --revert` here removes what it
+  applied, then `<short>-stow tune --apply` here`. A record naming no directory applies nothing
+  either (`… names no directory: … remove it, then `<short>-stow tune --apply` here`). The services' tables are
+  named after the services, as on the VM: one install of a project per host applies them. A host where `systemd-networkd` does not run is
+  warned and given no file (`warning: systemd-networkd does not run on this host: the networkd
+  files of <roles> are not written or reloaded (`<short>-stow tune` gives their settings)`, or, a
+  release declaring none, `the networkd files an earlier
+  release wrote (…) stay until a start as root finds it running`). What stays the operator's: a
+  NIC role's MTU and policy routing, its NIC configured by the host's own files (each start warns:
+  `warning: the MTU and policy routing of <roles> are this host's NICs', its operator's: `<short>-stow
+  tune` gives networkd's settings for them`), and a transparent role's input accept (an accept in
+  a table of the install's cannot override a drop in the host's own input chain): `tune` advises
+  both. A start not as root applies none of them (`warning: … are applied by a start as root
+  alone`; a release declaring none, with something still applied: `warning: what an earlier
+  release applied of the stack's network declarations is removed by a start as root alone`).
+  While the consent stands, a release that declares none of them has each start as root remove
+  what earlier ones applied. Without the consent, each start warns (`warning: the stack's network
+  declarations, … are not in force on this host, whose firewall and routing are its operator's:
+  `<short>-stow tune` lists them, `<short>-stow tune --apply` (as root) applies them, and each
+  start then again`). `--revert` also removes them — the boot unit, the tables, the chain and
+  `DOCKER-USER`'s jump to it, the networkd files (networkd reloaded when it runs) — and the
+  consent. A step that fails (a table nft keeps: `the nftables tables <names> are still loaded`)
+  leaves the consent revoked: no start applies anything, the record stays, and `--revert` again
+  removes the rest (`the consent is withdrawn, but not all it applied is removed (`<short>-stow
+  tune --revert` again removes the rest): …`); a record that does not read refuses `--revert`, and an `--apply` of
+  declarations, before the host is changed (`…: fix or remove it, then tune again`). `--apply` and `--revert` take the install's
+  lock, refused while a start, upgrade, rollback, provision or reset-db holds it (`… runs: wait for
+  it to finish, then tune --apply again`); `--dir` relative is taken from the current directory.
+  `--revert` asks for both (`… and remove the stack's network declarations, … (the consent
+  withdrawn)`) and removes the install's first, so a tuning revert that fails does not keep them.
+  A record that does not read is no consent: nothing is applied from it, each start warns
+  (`warning: <why>: nothing of the stack's network declarations is applied (fix it, or remove it
+  and `<short>-stow tune --apply` again)`), and a revert refuses until it is fixed or removed; a
+  revoked one makes each start warn (`warning: the consent to the stack's network declarations is
+  withdrawn, but not all it applied is removed: `<short>-stow tune --revert` again removes the
+  rest`). `status` says `gateway   not in force: …`, `applied at each start (tune
+  --apply): tables <names>; forwarding; <n> networkd file(s)` (and `<n> networkd file(s) pending
+  (written, not yet seen loaded by networkd: the next start as root reloads it)`), `not applied: <why the record does not
+  read> (fix it, or remove it and `<short>-stow tune --apply` again)`, `not applied: this install's
+  .stowage-gateway is <dir>'s (the directory moved or copied): …` (or `…, which is gone (the
+  directory moved): …`, `… names no directory: …`), `consented (tune --apply): nothing applied yet, the
+  next start as root applies them`, `revoked, but not all it applied is removed: `<short>-stow tune --revert`
+  again removes the rest`, or, consented to a release that declares none, `consented (tune
+  --apply): the release declares none (`<short>-stow tune --revert` withdraws the consent)`.
 - The rules, from the host's RAM (`MemTotal`, rounded down to 64 MiB, so a few KiB from one
   kernel to the next is the same host) and its online CPUs. The value is the one written; "at
   least" (and "at most"): a host holding more (less) keeps it, field by field — judged, while a
@@ -3681,6 +3796,17 @@ sudo <short>-stow install [--channel C] [--set KEY=VALUE]… [--answers FILE] [-
   reboot. It is refused for a
   yanked release, one that does not come after the OS's, one published without an OS bundle, one
   the install went back from, and one other than the release confirmed (published meanwhile).
+  Before the job starts it fetches the target's installer (`<prefix>/<name>-installer@<digest>`,
+  by the digest of its signed manifest, the payload checked to carry that release; a copy under
+  `<dir>/.stowage-next-*`, removed after), reads its spec without running it, and checks the
+  upgrade's front and inputs as the boot would, given no input: a route it could not decide, or an
+  input the release adds that is required with no default, is refused then (the schema baseline
+  and the L4 routes' ports are still the boot's to check) (409: `<why>\nthe boot into <tag>
+  would refuse this upgrade (it is given no input), so its OS is not written`), rather than by a
+  boot that would fall back; an installer that cannot be fetched is a 502 (`the installer of
+  <tag>: …`); a spec this daemon's Stowage does not read is logged and left to the boot (`the
+  installer of <tag> carries a spec this Stowage does not read (…): the boot into it checks the
+  upgrade`).
   Before the first install, it reads the release as `updates` does, takes no backup, records the
   release's tag in `/usr/local/<name>.os-upgrade` before `kairos-agent` runs (removed once the
   first install is made: any boot finding an install removes it), refuses a `--channel` other

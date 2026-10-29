@@ -241,7 +241,7 @@ func TestUpgradeRefusesBeforeChangingAnything(t *testing.T) {
 		"older": {"0.9.0", nil, nil, "after this installer's 0.9.0"},
 		"new route": {"2.0.0", func(s *spec.Spec) {
 			s.Front.Routes = append(s.Front.Routes, spec.Route{Name: "docs", DomainInput: "DOCS_DOMAIN", Upstream: "web:9000"})
-		}, nil, "adds the route docs"},
+		}, nil, "adds the route docs, which has no loopback port: give it one with --ports docs=PORT"},
 		"tls mode":          {"2.0.0", func(s *spec.Spec) { s.Front.TLSModes = []string{"acme"} }, nil, "does not offer the TLS mode"},
 		"pull fails":        {"2.0.0", nil, func(f *fakeDocker) { f.loaded = map[string]string{}; f.pullErr = errors.New("denied") }, "denied"},
 		"dump fails":        {"2.0.0", nil, func(f *fakeDocker) { f.dumpErr = errors.New("exit status 1") }, "the database could not be dumped, so nothing was changed"},
@@ -277,6 +277,164 @@ func TestUpgradeRefusesBeforeChangingAnything(t *testing.T) {
 				t.Errorf("snapshots left: %v", entries)
 			}
 		})
+	}
+}
+
+// docsRoute is a release adding the route docs: on its own domain input, and in loopback mode on
+// port.
+func docsRoute(port int) func(*spec.Spec) {
+	return func(s *spec.Spec) {
+		s.Front.Routes = append(s.Front.Routes, spec.Route{Name: "docs", DomainInput: "DOCS_DOMAIN", Upstream: "web:9000"})
+		s.Front.LoopbackPorts["docs"] = port
+	}
+}
+
+// An upgrade in loopback mode serves a route the release adds on its own port: the release's, or
+// one --ports gives it, refused when another route has it or the host does; the routes the install
+// publishes keep theirs.
+func TestUpgradeAddsALoopbackRoute(t *testing.T) {
+	t.Parallel()
+	e := installed(t)
+	before := e.readEnv()
+	for name, c := range map[string]struct {
+		port  int
+		ports map[string]int
+		want  string
+	}{
+		"another route's":  {8080, nil, "notes 2.0.0 adds the route docs on port 8080, which app has: choose another with --ports docs=PORT"},
+		"--ports over one": {9000, map[string]int{"docs": 8000}, "notes 2.0.0 adds the route docs on port 8000, which api has"},
+		"a recorded route": {9000, map[string]int{"app": 9001}, "--ports: the route app is recorded at the install, and an upgrade keeps its port"},
+		"no route":         {9000, map[string]int{"nope": 9001}, `--ports: "nope" is no route (app, api, docs)`},
+		"not a port":       {9000, map[string]int{"docs": 70000}, "--ports: docs=70000 is not a TCP port"},
+		"busy":             {9000, nil, "port(s) 9000 (docs) already in use on 127.0.0.1: choose others with --ports"},
+	} {
+		e.busy[9000] = name == "busy"
+		e.to("2.0.0", docsRoute(c.port))
+		if err := e.upgrade(func(o *Options) { o.Ports = c.ports }); err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("%s: %v, want %q", name, err, c.want)
+		}
+	}
+	e.busy[9000] = false
+	e.to("2.0.0", func(s *spec.Spec) {
+		docsRoute(9000)(s)
+		s.L4.Routes = []spec.L4Route{{Name: "data", Protocol: "tcp", Port: 9000, Upstream: "api:7000"}}
+	})
+	if err := e.upgrade(nil); err == nil || !strings.Contains(err.Error(), "the front's docs port 9000 is the L4 route data's: choose another with --ports") {
+		t.Errorf("an L4 route's port: %v", err)
+	}
+	if get(e.readEnv(), "STOWAGE_PROJECT_VERSION") != "1.0.0" {
+		t.Fatal("a refused upgrade changed .env")
+	}
+	// The port free: the route is served there, and recorded as a first install records it.
+	e.to("2.0.0", docsRoute(9000))
+	if err := e.upgrade(nil); err != nil {
+		t.Fatalf("%v\n%s", err, e.log)
+	}
+	env := e.readEnv()
+	for k, want := range map[string]string{"STOWAGE_PORT_DOCS": "9000", "STOWAGE_URL_DOCS": "http://localhost:9000", "STOWAGE_URL_APP": get(before, "STOWAGE_URL_APP"), "STOWAGE_PORT_APP": "8080"} {
+		if got := get(env, k); got != want {
+			t.Errorf("%s = %q, want %q", k, got, want)
+		}
+	}
+	if fc := read(t, filepath.Join(e.dir, FrontCompose)); !strings.Contains(fc, "${STOWAGE_LOOPBACK_ADDRESS}:${STOWAGE_PORT_DOCS}:") {
+		t.Errorf("the front does not publish docs:\n%s", fc)
+	}
+	// --ports gives a route the release adds another port.
+	e = installed(t)
+	e.to("2.0.0", docsRoute(9000))
+	if err := e.upgrade(func(o *Options) { o.Ports = map[string]int{"docs": 9001} }); err != nil {
+		t.Fatal(err)
+	}
+	if got := get(e.readEnv(), "STOWAGE_URL_DOCS"); got != "http://localhost:9001" {
+		t.Errorf("STOWAGE_URL_DOCS = %q", got)
+	}
+}
+
+// upgrade takes --ports, read as a first install reads it.
+func TestUpgradeTakesPorts(t *testing.T) {
+	t.Parallel()
+	r, self := testInstaller(t, "1.0.0")
+	cmd := Command(r, self, io.Discard, io.Discard)
+	cmd.SetArgs([]string{"upgrade", "--ports", "docs=x", "--dir", t.TempDir()})
+	if err := cmd.Execute(); err == nil || err.Error() != `--ports: "docs=x" is not route=port` {
+		t.Fatalf("%v", err)
+	}
+}
+
+// tlsInstalled is installed in the TLS mode internal, app and api on their domains.
+func tlsInstalled(t *testing.T) *env {
+	t.Helper()
+	e := newEnv(t)
+	e.docker.dump = "DUMP"
+	e.schemaAt("5", nil, true)
+	e.vars["APP_DOMAIN"], e.vars["API_DOMAIN"] = "app.example.org", "api.example.org"
+	if err := e.install(func(o *Options) { o.TLS = "internal" }); err != nil {
+		t.Fatal(err)
+	}
+	return e
+}
+
+// An upgrade in a TLS mode serves a route the release adds on a domain the install records with
+// nothing asked; one on a domain input the release adds takes it as an added input — given, or
+// refused naming it — and a route the install publishes keeps a recorded domain.
+func TestUpgradeAddsATLSRoute(t *testing.T) {
+	t.Parallel()
+	e := tlsInstalled(t)
+	ca := func(s *spec.Spec) {
+		s.Front.Routes = append(s.Front.Routes, spec.Route{Name: "ca", DomainInput: "APP_DOMAIN", Path: "/ca", Upstream: "web:8080"})
+	}
+	e.to("2.0.0", ca)
+	if err := e.upgrade(nil); err != nil {
+		t.Fatalf("a path route on a recorded domain: %v\n%s", err, e.log)
+	}
+	if got := get(e.readEnv(), "STOWAGE_URL_CA"); got != "https://app.example.org/ca" {
+		t.Errorf("STOWAGE_URL_CA = %q", got)
+	}
+	if cf := read(t, filepath.Join(e.dir, Caddyfile)); !strings.Contains(cf, "path /ca /ca/*") {
+		t.Errorf("the front does not serve /ca:\n%s", cf)
+	}
+	// A route on a domain input the release adds.
+	docs := func(s *spec.Spec) { ca(s); docsRoute(9000)(s) }
+	e.to("3.0.0", docs)
+	for _, c := range []struct{ set, want string }{
+		{"", "missing required input(s), set by --set KEY=VALUE, the environment or --answers: DOCS_DOMAIN (Domain for docs)"},
+		{"app.example.org", "notes 3.0.0: app and docs both serve the domain app.example.org"},
+		{"docs.example.org", ""},
+	} {
+		var given map[string]string
+		if c.set != "" {
+			given = map[string]string{"DOCS_DOMAIN": c.set}
+		}
+		err := e.upgrade(func(o *Options) { o.Set = given })
+		if (c.want == "") != (err == nil) || (err != nil && !strings.Contains(err.Error(), c.want)) {
+			t.Fatalf("DOCS_DOMAIN=%q: %v, want %q", c.set, err, c.want)
+		}
+	}
+	env := e.readEnv()
+	for k, want := range map[string]string{"DOCS_DOMAIN": "docs.example.org", "STOWAGE_URL_DOCS": "https://docs.example.org", "STOWAGE_URL_APP": "https://app.example.org"} {
+		if got := get(env, k); got != want {
+			t.Errorf("%s = %q, want %q", k, got, want)
+		}
+	}
+	// The domain input of a route the release adds that this shape never asks: refused
+	// naming it.
+	e.to("4.0.0", func(s *spec.Spec) {
+		docs(s)
+		s.Inputs = append(s.Inputs, spec.Input{Key: "WIKI_HOST", Prompt: "Wiki host", Shapes: []string{"kairos"}})
+		s.Front.Routes = append(s.Front.Routes, spec.Route{Name: "wiki", DomainInput: "WIKI_HOST", Upstream: "web:8080"})
+	})
+	if err := e.upgrade(nil); err == nil || !strings.Contains(err.Error(), "notes 4.0.0 adds the route wiki, whose domain WIKI_HOST nothing gives: --set WIKI_HOST=<domain>") {
+		t.Errorf("an empty domain: %v", err)
+	}
+	// A route the install publishes on a domain input it does not record is not given a domain.
+	e.to("4.0.0", func(s *spec.Spec) { docs(s); s.Front.Routes[0].DomainInput = "WEB_DOMAIN" })
+	if err := e.upgrade(func(o *Options) { o.Set = map[string]string{"WEB_DOMAIN": "web.example.org"} }); err == nil || !strings.Contains(err.Error(), "takes the domain of app from WEB_DOMAIN, which this install does not record") {
+		t.Errorf("a published route's new domain input: %v", err)
+	}
+	// --ports is loopback mode's.
+	e.to("4.0.0", docs)
+	if err := e.upgrade(func(o *Options) { o.Ports = map[string]int{"docs": 9001} }); err == nil || !strings.Contains(err.Error(), "--ports is for loopback mode: this install's front serves internal") {
+		t.Errorf("--ports in a TLS mode: %v", err)
 	}
 }
 
@@ -1543,5 +1701,33 @@ func TestAKeptInstallerReadsItself(t *testing.T) {
 	cancelDone()
 	if err := o.readsItself(done, slow); !errors.Is(err, context.Canceled) {
 		t.Errorf("a run already stopped: %v", err)
+	}
+}
+
+// In byo mode a route the release adds is served on a domain the install's certificate covers
+// alone.
+func TestUpgradeAddsAByoRouteTheCertificateCovers(t *testing.T) {
+	t.Parallel()
+	cert, key := writeCert(t, time.Now().Add(90*24*time.Hour), "*.example.com")
+	e := newEnv(t)
+	e.docker.dump = "DUMP"
+	e.schemaAt("5", nil, true)
+	if err := e.install(func(o *Options) { tlsDomains(o); o.TLS, o.Cert, o.Key = "byo", cert, key }); err != nil {
+		t.Fatal(err)
+	}
+	e.to("2.0.0", docsRoute(9000))
+	if err := e.upgrade(func(o *Options) { o.Set = map[string]string{"DOCS_DOMAIN": "docs.example.org"} }); err == nil || !strings.Contains(err.Error(), "notes 2.0.0 adds the route docs: the install's certificate does not cover docs.example.org (DOCS_DOMAIN)") {
+		t.Fatalf("a domain the certificate does not cover: %v", err)
+	}
+	if err := e.upgrade(func(o *Options) { o.Set = map[string]string{"DOCS_DOMAIN": "docs.example.com"} }); err != nil {
+		t.Fatalf("a covered domain: %v\n%s", err, e.log)
+	}
+	// A release adding no route never reads the certificate (expired, or gone).
+	if err := os.Remove(filepath.Join(e.dir, TLSDir, "cert.pem")); err != nil {
+		t.Fatal(err)
+	}
+	e.to("3.0.0", docsRoute(9000))
+	if err := e.upgrade(nil); err != nil {
+		t.Fatalf("no route added: %v", err)
 	}
 }

@@ -1,11 +1,13 @@
 package install
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -229,5 +231,59 @@ func TestUninstallOnDocker(t *testing.T) {
 	}
 	if err := e.installer(func(o *Options) { o.Yes = true }).Uninstall(ctx, false); err == nil || !strings.Contains(err.Error(), "holds no install") {
 		t.Errorf("uninstalled already: %v", err)
+	}
+}
+
+// An uninstall removes what the operator's consent applied (tune --apply), and refuses without root.
+func TestUninstallOnDockerRevertsTheGateway(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	e := servicesEnv(t)
+	e.r.Nftables = map[string][]byte{"vpn": []byte("table inet vpn {\n}\n")}
+	if err := os.WriteFile(filepath.Join(e.dir, GatewayFile), []byte(`{"digest":"00000000","dir":"`+e.dir+`"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	units, host := t.TempDir(), &gwHost{tables: map[string]bool{}}
+	opts := func(euid int) func(o *Options) {
+		return func(o *Options) {
+			o.Yes, o.Systemd, o.Host, o.GatewayRun, o.Euid = true, units, host, t.TempDir(), func() int { return euid }
+		}
+	}
+	if err := e.installer(opts(1000)).Uninstall(ctx, false); err == nil || !strings.Contains(err.Error(), "removing them takes root") {
+		t.Fatalf("not root: %v", err)
+	}
+	if err := e.installer(opts(0)).Uninstall(ctx, false); err != nil {
+		t.Fatal(err)
+	}
+	if fileExists(filepath.Join(e.dir, GatewayFile)) {
+		t.Error("the consent outlived the uninstall")
+	}
+}
+
+// An uninstall refuses a gateway record that does not read before anything goes, and leaves one
+// of another directory as it is.
+func TestUninstallOnDockerReadsTheGatewaysRecordFirst(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	e := servicesEnv(t)
+	if err := os.WriteFile(filepath.Join(e.dir, GatewayFile), []byte("{"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.installer(func(o *Options) { o.Yes = true }).Uninstall(ctx, false); err == nil || !strings.Contains(err.Error(), "fix or remove it, then uninstall again") || slices.ContainsFunc(e.docker.calls, func(c Cmd) bool { return slices.Contains(c.Args, "down") }) {
+		t.Fatalf("a record that does not read: %v", err)
+	}
+	other := t.TempDir()
+	if err := os.WriteFile(filepath.Join(other, GatewayFile), []byte(`{"digest":"00000000","dir":"`+other+`"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(e.dir, GatewayFile), []byte(`{"digest":"00000000","dir":"`+other+`"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var log bytes.Buffer
+	host := &gwHost{tables: map[string]bool{}}
+	if err := e.installer(func(o *Options) {
+		o.Yes, o.Log, o.Host, o.Systemd, o.Euid = true, &log, host, t.TempDir(), func() int { return 1000 }
+	}).Uninstall(ctx, false); err != nil || !strings.Contains(log.String(), "(the directory moved or copied)") || host.did("iptables") {
+		t.Errorf("another directory's: %v %q", err, log.String())
 	}
 }

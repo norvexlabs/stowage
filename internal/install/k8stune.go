@@ -39,6 +39,8 @@ func (in *Installer) K8sTune() error {
 	fmt.Fprintf(w, "\nThe nodes' own settings (the TCP buffers a pod's namespace copies, the sockets' memory, the connection\ntracker, the NICs) are the node's: `%s tune` on a node reports them, `tune --apply` applies them,\n`tune --print` prints the files for a node configured by other means.\n", in.R.Ctl())
 	var sys tune.System
 	releaseHost(&sys, in.R.Spec)
+	// A node names its NICs itself: a NIC role's device is the node's to put in.
+	roleDevices(&sys, in.R.Spec, func(r string) string { return in.roleDevice(r, func(string) string { return "" }) })
 	mods, pkgs := sys.Modules, sys.Packages
 	if len(mods)+len(pkgs)+len(sys.Firmware)+len(sys.Interfaces)+len(sys.KernelArgs)+len(sys.Settings)+len(sys.ServiceCores) == 0 && sys.Power != tune.Performance {
 		return nil

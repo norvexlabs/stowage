@@ -136,6 +136,11 @@ grep -qF "tip: the extension atlas-search (Full-text search over the events) is 
 "${CTL[@]}" status --dir "$D" >"$WORK/status.txt" 2>&1 || { cat "$WORK/status.txt"; fail "status"; }
 grep -qxF "endpoint  $url" "$WORK/status.txt" || { cat "$WORK/status.txt"; fail "status does not show the endpoint"; }
 grep -qx "tune      network (release)" "$WORK/status.txt" || { cat "$WORK/status.txt"; fail "status does not show the release's tuning profile"; }
+# The stack's network declarations (its vpn table, forwarding, routing) are the Docker host's
+# operator's until tune --apply: said by the install's end and by status.
+grep -qF "are not in force on this host, whose firewall and routing are its operator's" "$WORK/install.log" &&
+	grep -q "^gateway   not in force: " "$WORK/status.txt" ||
+	{ cat "$WORK/install.log" "$WORK/status.txt"; fail "the install or status does not say the network declarations are not in force"; }
 # The ui image ships a third-party script and the SBOM document declaring it: the image's attested
 # SBOM takes the package from that document.
 "${CTL[@]}" sbom export "$WORK/sbom" --dir "$D" >"$WORK/sbom.txt" 2>&1 || { cat "$WORK/sbom.txt"; fail "sbom export"; }

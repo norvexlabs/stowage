@@ -12,6 +12,7 @@ import (
 
 	"go.yaml.in/yaml/v3"
 
+	"github.com/norvexlabs/stowage/internal/spec"
 	"github.com/norvexlabs/stowage/internal/tune"
 )
 
@@ -502,5 +503,125 @@ func TestTuneRefusesTheDefaultProfileOnANetworkHost(t *testing.T) {
 	}
 	if err := in.Tune(context.Background(), TuneOptions{}); err != nil || !strings.Contains(e.out.String(), "the network profile") {
 		t.Errorf("the report follows the recorded profile: %v\n%s", err, e.out)
+	}
+}
+
+// On a Docker host tune's rules name the NIC a re-run's --interface recorded for a role.
+func TestTuneNamesARolesRecordedNIC(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	e.r.Spec.Host = &spec.Host{Interfaces: map[string]spec.HostInterface{
+		"uplink": {Primary: true}, "vpn0": {Kind: spec.InterfaceTUN, Forward: []string{"uplink"}},
+	}}
+	if err := e.install(nil); err != nil {
+		t.Fatal(err)
+	}
+	env := e.readEnv()
+	env.Set(InterfaceVar("uplink"), "enp1s0")
+	if err := env.WriteFile(filepath.Join(e.dir, envName)); err != nil {
+		t.Fatal(err)
+	}
+	dockerInfo(e.docker, "27.0.0|Ubuntu|[]")
+	in := e.installer(func(o *Options) { o.Tune = fakeTune(tuneRoot(t), 1000) })
+	sys, err := in.tuneSystem(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, i := range sys.Interfaces {
+		if i.Role == "vpn0" {
+			if fw := strings.Join(i.Firewall("DOCKER-USER"), "\n"); !strings.Contains(fw, "-i vpn0 -o enp1s0 -j ACCEPT") {
+				t.Errorf("rules:\n%s", fw)
+			}
+			return
+		}
+	}
+	t.Fatal("no vpn0")
+}
+
+// tune with a gateway record: another directory's refuses an apply of the declarations before the
+// host is changed, and a revert there leaves it and reverts the tuning; one that does not read
+// refuses both first; the forwarding a start applied, through roles with devices, is reported so.
+func TestTuneWithAGatewayRecord(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	e := newEnv(t)
+	e.r.Nftables = map[string][]byte{"vpn": []byte("table inet vpn {\n}\n")}
+	e.r.Spec.Host = &spec.Host{Interfaces: map[string]spec.HostInterface{
+		"uplink": {Primary: true}, "vpn0": {Kind: spec.InterfaceTUN, Forward: []string{"uplink"}},
+	}}
+	if err := e.install(nil); err != nil {
+		t.Fatal(err)
+	}
+	dockerInfo(e.docker, `27.3.1|Ubuntu 24.04 LTS|[]`)
+	root := tuneRoot(t)
+	in := e.installer(func(o *Options) {
+		o.Tune, o.Yes, o.Host, o.Systemd, o.GatewayRun, o.Euid = fakeTune(root, 0), true, &gwHost{tables: map[string]bool{}}, t.TempDir(), t.TempDir(), func() int { return 0 }
+	})
+	other := t.TempDir()
+	record := []byte(`{"digest":"00000000","dir":"` + other + `"}`)
+	for _, d := range []string{other, e.dir} {
+		if err := os.WriteFile(filepath.Join(d, GatewayFile), record, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := in.Tune(ctx, TuneOptions{Apply: true}); err == nil || !strings.Contains(err.Error(), "(the directory moved or copied)") || fileExists(filepath.Join(root, tune.SysctlFile)) {
+		t.Errorf("apply of another directory's: %v", err)
+	}
+	e.log.Reset()
+	if err := in.Tune(ctx, TuneOptions{Revert: true}); err != nil || !strings.Contains(e.log.String(), "note: this install's .stowage-gateway is "+other+"'s") || !strings.Contains(e.out.String(), "the tuning files are removed") || !fileExists(filepath.Join(e.dir, GatewayFile)) {
+		t.Errorf("revert of another directory's: %v\n%s%s", err, e.log, e.out)
+	}
+	if err := os.WriteFile(filepath.Join(e.dir, GatewayFile), []byte("{"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	e.out.Reset()
+	if err := in.Tune(ctx, TuneOptions{Revert: true}); err == nil || !strings.Contains(err.Error(), "fix or remove it, then tune again") || strings.Contains(e.out.String(), "the tuning files are removed") {
+		t.Errorf("revert of a record that does not read: %v\n%s", err, e.out)
+	}
+	if err := in.Tune(ctx, TuneOptions{Apply: true}); err == nil || !strings.Contains(err.Error(), "fix or remove it, then tune again") || fileExists(filepath.Join(root, tune.SysctlFile)) {
+		t.Errorf("apply of a record that does not read: %v", err)
+	}
+	// Consented and applied by a start, through a role with a NIC: reported, not advised.
+	if err := os.WriteFile(filepath.Join(e.dir, GatewayFile), []byte(`{"digest":"`+dirDigest(in.gatewayDir())+`","dir":"`+in.gatewayDir()+`"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	applied := func() bool {
+		in.tuned = nil
+		sys, err := in.tuneSystem(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, i := range sys.Interfaces {
+			if i.Role == "vpn0" {
+				return i.Applied
+			}
+		}
+		return false
+	}
+	if applied() {
+		t.Error("applied through a role with no NIC")
+	}
+	in.O.Interfaces = map[string]string{"uplink": "enp1s0"}
+	if applied() {
+		t.Error("applied before a start applied it")
+	}
+	rules, _ := forwardRules(in.R.Spec.Host, in.forwardChain(), func(r string) string { return in.roleDevice(r, none) })
+	if err := os.WriteFile(in.forwardRecord(), rules, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if !applied() {
+		t.Error("not applied though a start applied it")
+	}
+	// Another NIC named since: the chain holds the old one's rules.
+	in.O.Interfaces = map[string]string{"uplink": "enp2s0"}
+	if applied() {
+		t.Error("applied for a NIC the chain does not name")
+	}
+	in.O.Interfaces = map[string]string{"uplink": "enp1s0"}
+	if err := os.Remove(in.forwardRecord()); err != nil {
+		t.Fatal(err)
+	}
+	if applied() {
+		t.Error("applied before a start applied it")
 	}
 }

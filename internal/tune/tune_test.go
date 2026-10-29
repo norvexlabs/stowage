@@ -1915,3 +1915,49 @@ func TestIrqbalanceBansTheServicesCores(t *testing.T) {
 		t.Error("the file over the daemon's environment")
 	}
 }
+
+// Where roles are not their interfaces' names, a rule names the role's device, or a placeholder
+// naming the NIC to put there.
+func TestAFirewallRuleNamesARolesDevice(t *testing.T) {
+	t.Parallel()
+	i := Interface{Role: "vpn0", Forward: []string{"uplink", "lan"}, Transparent: true, Devices: map[string]string{"vpn0": "vpn0", "uplink": "enp1s0"}}
+	got := strings.Join(i.Firewall("DOCKER-USER"), "\n")
+	for _, want := range []string{
+		"iptables -I DOCKER-USER -i vpn0 -o enp1s0 -j ACCEPT",
+		"iptables -I DOCKER-USER -i enp1s0 -o vpn0 -m conntrack",
+		"iptables -I DOCKER-USER -i vpn0 -o <the NIC playing lan> -j ACCEPT",
+		`nft: iifname "vpn0"`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("no %q in\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "uplink") {
+		t.Errorf("a role named:\n%s", got)
+	}
+}
+
+// Consented, the forwarding is the starts' to apply: reported so, never advised again; the
+// transparent accept stays advice.
+func TestAppliedForwardingIsNotAdvised(t *testing.T) {
+	t.Parallel()
+	s := System{Look: func(string) (string, error) { return "", errors.New("no") }, Interfaces: []Interface{{
+		Role: "vpn0", Kind: "tun", Forward: []string{"uplink"}, Transparent: true, Applied: true, Devices: map[string]string{"vpn0": "vpn0", "uplink": "enp1s0"},
+	}}}
+	items := s.inspectInterfaces(context.Background())
+	var advice, ok []string
+	for _, it := range items {
+		switch it.State {
+		case Advice:
+			advice = append(advice, it.Want)
+		case OK:
+			ok = append(ok, it.Have)
+		}
+	}
+	if a := strings.Join(advice, "\n"); strings.Contains(a, "iptables") || !strings.Contains(a, "socket transparent") {
+		t.Errorf("advice: %s", a)
+	}
+	if !slices.Contains(ok, "its forwarding out of uplink applied by each start (tune --apply)") {
+		t.Errorf("ok: %v", ok)
+	}
+}

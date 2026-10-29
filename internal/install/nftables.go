@@ -31,7 +31,7 @@ const (
 )
 
 // loadTables loads each service's nftables table (services.<name>.nftables) into the VM's
-// firewall before the services start: at a start that finds it absent (a boot) or its file
+// firewall, or a consented Docker host's (gatewayApplies), before the services start (syncTables): at a start that finds it absent (a boot) or its file
 // changed, replaced whole in one transaction (the table made if absent, deleted, then its file's,
 // so a rule never doubles nor goes missing in between; nft checks it before it commits). A table
 // that holds already leaves its sets as the service fed them. Each load empties its sets, so it
@@ -42,12 +42,16 @@ const (
 // host's own table stays Stowage's: a file holds its service's table alone, never of the
 // project's name (lint, the release's decoding).
 func (in *Installer) loadTables(ctx context.Context) error {
-	if in.O.Firewall == "" {
-		for _, name := range sortedKeys(in.R.Nftables) {
-			in.O.logf("warning: services.%s.nftables: the host's firewall is its operator's, and its table is not loaded: `%s tune --print` prints it", name, in.R.Ctl())
-		}
-		return nil
+	if !in.gatewayApplies() {
+		return nil // gatewayStart says why
 	}
+	return in.syncTables(ctx, in.R.Nftables)
+}
+
+// syncTables makes the tables loaded those of want, by service: each loaded as loadTables says, a
+// table recorded and not wanted deleted.
+func (in *Installer) syncTables(ctx context.Context, want map[string][]byte) error {
+	host := in.O.host()
 	record := map[string]bool{}
 	if prev, err := os.ReadFile(in.path(TablesFile)); err == nil {
 		for _, name := range strings.Fields(string(prev)) {
@@ -59,16 +63,16 @@ func (in *Installer) loadTables(ctx context.Context) error {
 	save := func() error {
 		return writeAtomic(in.path(TablesFile), strings.NewReader(strings.Join(slices.Sorted(maps.Keys(record)), "\n")+"\n"), 0o644, nil)
 	}
-	for _, name := range sortedKeys(in.R.Nftables) {
+	for _, name := range sortedKeys(want) {
 		var b bytes.Buffer
 		fmt.Fprintf(&b, "# %s's nftables table, as services.%s.nftables gives it, loaded whole.\ntable inet %s\ndelete table inet %s\n", name, name, name, name)
-		b.Write(in.R.Nftables[name])
-		if !bytes.HasSuffix(in.R.Nftables[name], []byte("\n")) {
+		b.Write(want[name])
+		if !bytes.HasSuffix(want[name], []byte("\n")) {
 			b.WriteByte('\n') // nft takes a comment on the last line only before a newline
 		}
 		f := filepath.Join(in.O.Dir, TablesDir, name+".nft")
 		if cur, err := os.ReadFile(f); err == nil && bytes.Equal(cur, b.Bytes()) {
-			if _, err := in.O.Host.Run(ctx, Cmd{Args: []string{"nft", "list", "table", "inet", name}}); err == nil {
+			if _, err := host.Run(ctx, Cmd{Args: []string{"nft", "list", "table", "inet", name}}); err == nil {
 				continue
 			}
 		}
@@ -90,7 +94,7 @@ func (in *Installer) loadTables(ctx context.Context) error {
 		if err := writeAtomic(strings.TrimSuffix(f, ".nft")+".load", strings.NewReader(hex.EncodeToString(token)+"\n"), 0o644, nil); err != nil {
 			return err
 		}
-		if _, err := in.O.Host.Run(ctx, Cmd{Args: []string{"nft", "-f", next}}); err != nil {
+		if _, err := host.Run(ctx, Cmd{Args: []string{"nft", "-f", next}}); err != nil {
 			_ = os.Remove(next)
 			return fmt.Errorf("services.%s.nftables: nft refuses its table: %w", name, err)
 		}
@@ -103,12 +107,12 @@ func (in *Installer) loadTables(ctx context.Context) error {
 		}
 	}
 	for _, name := range slices.Sorted(maps.Keys(record)) {
-		if _, ok := in.R.Nftables[name]; ok {
+		if _, ok := want[name]; ok {
 			continue
 		}
 		// One a boot already dropped (the kernel's ruleset is not kept) is deleted.
-		if _, err := in.O.Host.Run(ctx, Cmd{Args: []string{"nft", "list", "table", "inet", name}}); err == nil {
-			if _, err := in.O.Host.Run(ctx, Cmd{Args: []string{"nft", "delete", "table", "inet", name}}); err != nil {
+		if _, err := host.Run(ctx, Cmd{Args: []string{"nft", "list", "table", "inet", name}}); err == nil {
+			if _, err := host.Run(ctx, Cmd{Args: []string{"nft", "delete", "table", "inet", name}}); err != nil {
 				in.O.logf("warning: the nftables table inet %s of a service the release no longer declares stays: %v", name, err)
 				continue
 			}
@@ -127,10 +131,11 @@ func (in *Installer) loadTables(ctx context.Context) error {
 	return save()
 }
 
-// tableLoads are the services' tables' load tokens on the VM (TableLabel): a service whose table
+// tableLoads are the services' tables' load tokens where they are loaded (TableLabel): a service whose table
 // a start loads is recreated by it.
 func (in *Installer) tableLoads() map[string]string {
-	if in.O.Firewall == "" {
+	// Consent alone, not who runs the start: a start not as root keeps the services' labels.
+	if in.O.Firewall == "" && !in.gatewayConsented() {
 		return nil
 	}
 	out := map[string]string{}

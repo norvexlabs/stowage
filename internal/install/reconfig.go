@@ -388,23 +388,28 @@ func (in *Installer) frontVars(env *EnvFile, mode string, pub publish, domains m
 	if !in.R.Spec.HasFront() {
 		return
 	}
-	routes := in.R.Spec.Front.Routes
+	if mode != Loopback {
+		env.Set(HTTPPortVar, strconv.Itoa(pub.ports["http"]))
+		env.Set(HTTPSPortVar, strconv.Itoa(pub.ports["https"]))
+	}
+	for _, r := range in.R.Spec.Front.Routes {
+		routeVars(env, mode, r, pub, domains[r.Name])
+	}
+}
+
+// routeVars records route r's URL as the front serves it, and in loopback mode its port: in
+// loopback mode its port on pub's address; in a TLS mode its domain on the public HTTPS port.
+func routeVars(env *EnvFile, mode string, r spec.Route, pub publish, domain string) {
 	if mode == Loopback {
-		for _, r := range routes {
-			env.Set(PortVar(r.Name), strconv.Itoa(pub.ports[r.Name]))
-			env.Set(spec.URLVar(r.Name), "http://"+urlHost(pub.addr)+":"+strconv.Itoa(pub.ports[r.Name])+r.Path)
-		}
+		env.Set(PortVar(r.Name), strconv.Itoa(pub.ports[r.Name]))
+		env.Set(spec.URLVar(r.Name), "http://"+urlHost(pub.addr)+":"+strconv.Itoa(pub.ports[r.Name])+r.Path)
 		return
 	}
-	env.Set(HTTPPortVar, strconv.Itoa(pub.ports["http"]))
-	env.Set(HTTPSPortVar, strconv.Itoa(pub.ports["https"]))
 	port := ""
 	if p := publicHTTPSPort(mode, strconv.Itoa(pub.ports["https"])); p != "443" {
 		port = ":" + p
 	}
-	for _, r := range routes {
-		env.Set(spec.URLVar(r.Name), "https://"+domains[r.Name]+port+r.Path)
-	}
+	env.Set(spec.URLVar(r.Name), "https://"+domain+port+r.Path)
 }
 
 // routePaths gives each route's recorded URL the release's domain and path, as the front serves

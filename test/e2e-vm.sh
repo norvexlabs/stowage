@@ -118,7 +118,10 @@ healthy_postgres "after the install"
 # A healthy boot logs no error: the journal at priority err holds nothing of this boot.
 # Its standard output alone: SSH's banner comes on its standard error.
 on_vm sudo journalctl -b -p err --no-pager -q >"$WORK/journal-err.txt" 2>"$WORK/journal-err.log" || { cat "$WORK/journal-err.log"; fail "journalctl on the VM"; }
-[[ ! -s $WORK/journal-err.txt ]] || { cat "$WORK/journal-err.txt"; fail "the VM's boot logged errors"; }
+# The test's own SSH logins are not the boot's: systemd's user manager, ending one, may find
+# logind released the session already (pam_systemd's ReleaseSession, NoSuchSession).
+grep -vE '\(sd-pam\)\[[0-9]+\]: pam_systemd\(systemd-user:session\): Varlink call io\.systemd\.Login\.ReleaseSession failed: io\.systemd\.Login\.NoSuchSession$' "$WORK/journal-err.txt" >"$WORK/journal-err-boot.txt" || true
+[[ ! -s $WORK/journal-err-boot.txt ]] || { cat "$WORK/journal-err-boot.txt"; fail "the VM's boot logged errors"; }
 on_vm sudo -n true || fail "the administrator has no passwordless sudo"
 on_vm id -nG | grep -qw admin || fail "the administrator is not in the admin group"
 

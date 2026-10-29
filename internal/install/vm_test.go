@@ -1080,7 +1080,7 @@ func TestForwardingWithoutIPv6IsIPv4s(t *testing.T) {
 		s.Host = &spec.Host{Interfaces: map[string]spec.HostInterface{"uplink": {Primary: true}, "lan": {Forward: []string{"uplink"}}}}
 	})
 	in := &Installer{R: r, O: Options{Firewall: t.TempDir(), Host: host}}
-	if err := in.forwardRoles(context.Background()); err != nil || !slices.Equal(host.ran, []string{"iptables-restore -w --noflush", "iptables -w -C DOCKER-USER -j STOWAGE-FORWARD"}) {
+	if err := in.forwardRoles(context.Background(), none); err != nil || !slices.Equal(host.ran, []string{"iptables-restore -w --noflush", "iptables -w -C DOCKER-USER -j STOWAGE-FORWARD"}) {
 		t.Errorf("ran %q %v", host.ran, err)
 	}
 }

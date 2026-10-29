@@ -202,8 +202,18 @@ func (in *Installer) Uninstall(ctx context.Context, data bool) error {
 	dir := in.O.Dir
 	project, _ := env.Get("COMPOSE_PROJECT_NAME")
 	what := fmt.Sprintf("uninstall %s %s from %s (Compose project %s)", name, version, dir, project)
+	// The gateway's record, read before anything goes: one that does not read refuses.
+	gwRec, gwErr := in.readGateway()
+	if in.gatewayRecorded() && gwErr != nil {
+		return fmt.Errorf("%w: fix or remove it, then uninstall again", gwErr)
+	}
+	gateway := in.gatewayRecorded() && in.gatewayRevertsHere(gwRec)
 	if in.O.DryRun {
-		in.O.logf("a run would %s: its containers and networks, and its backup and disk-pressure timers", what)
+		removes := "its containers and networks, its backup and disk-pressure timers"
+		if gateway {
+			removes += ", and the network declarations tune --apply applied"
+		}
+		in.O.logf("a run would %s: %s", what, removes)
 		if data {
 			in.O.logf("and delete its volumes and %s", dir)
 		} else {
@@ -249,6 +259,10 @@ func (in *Installer) Uninstall(ctx context.Context, data bool) error {
 			}
 		}
 	}
+	// So would the gateway's boot unit, and its tables and forwarding stay in the host's.
+	if gateway && in.O.euid() != 0 {
+		return fmt.Errorf("the stack's network declarations are applied on this host (tune --apply), and removing them takes root: run `sudo %s uninstall --dir %s`", in.ctl(), dir)
+	}
 	args := []string{"down", "--remove-orphans"}
 	if data {
 		args = append(args, "--volumes")
@@ -259,6 +273,14 @@ func (in *Installer) Uninstall(ctx context.Context, data bool) error {
 	for _, kind := range []string{"backup", "disk"} {
 		if err := h.dockerUnits(ctx, kind, "", ""); err != nil {
 			return fmt.Errorf("the stack is down, but its %s timer: %w", kind, err)
+		}
+	}
+	if in.gatewayRecorded() && !gateway {
+		in.O.logf("note: %s: left as it is", in.gatewayElsewhere(gwRec))
+	}
+	if gateway {
+		if err := in.gatewayRevert(ctx); err != nil {
+			return fmt.Errorf("the stack is down, but its network declarations: %w", err)
 		}
 	}
 	if data {
