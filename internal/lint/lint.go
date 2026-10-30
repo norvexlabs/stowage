@@ -1739,6 +1739,9 @@ func (l *linter) shapes() {
 				l.errf(w+".cloud_publish", "unknown cloud %q (%s)", c, strings.Join(slices.Sorted(maps.Keys(spec.CloudFormat)), ", "))
 			}
 		}
+		if k.Disks != "" && k.Disks != spec.DisksAlways && k.Disks != spec.DisksOptIn {
+			l.errf(w+".disks", "unknown policy %q (%s, %s)", k.Disks, spec.DisksAlways, spec.DisksOptIn)
+		}
 		if g := k.HealthGate; g != nil && (g.DeadlineS <= 0 || g.PollS <= 0 || g.PollS >= g.DeadlineS || g.DeadlineAfterResetS < g.DeadlineS) {
 			l.errf(w+".health_gate", "need 0 < poll_s < deadline_s <= deadline_after_reset_s")
 		}

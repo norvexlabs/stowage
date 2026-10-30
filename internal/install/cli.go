@@ -339,6 +339,7 @@ func newCommand(r *Release, self string, stdout, stderr io.Writer, tools K8sOpti
 	rsf.BoolVar(&accessible, "accessible", false, "confirm with a plain line prompt")
 	rsf.BoolVar(&o.DryRun, "dry-run", false, "print what would be wiped, change nothing")
 	rsf.BoolVar(&o.NoProvision, "no-provision", false, "start the stack without running the provision hook")
+	rsf.BoolVar(&o.NewBaseline, "new-baseline", false, "the install runs another schema baseline: wipe it and install this installer's release instead")
 	dirFlag(reset)
 	root.AddCommand(reset)
 	var rotate func(cmd *cobra.Command, key, pass string) error
@@ -485,7 +486,7 @@ func k8sCommand(in *Installer, o *Options, prepare func() error, terminal func(b
 	rf.StringVar(&o.RegistryCA, "registry-ca", "", "a PEM file of the CA the release's registry's certificate chains to, a mirror's own")
 	rf.DurationVar(&resetTimeout, "timeout", 10*time.Minute, "how long helm and kubectl wait at each step")
 	rf.BoolVar(&o.NoProvision, "no-provision", false, "install again without running the provision hook")
-	rf.BoolVar(&o.K8s.NewBaseline, "new-baseline", false, "the release runs another schema baseline: wipe it and install this installer's release instead")
+	rf.BoolVar(&o.NewBaseline, "new-baseline", false, "the release runs another schema baseline: wipe it and install this installer's release instead")
 	var uninstallTimeout time.Duration
 	uninstall := &cobra.Command{
 		Use:   "uninstall",

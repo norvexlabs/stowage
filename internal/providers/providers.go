@@ -439,11 +439,22 @@ func DecodeProvision(short string, p *spec.Provider, images map[string]spec.Imag
 		}
 		seen[k] = true
 	}
-	if c.Outputs != "" && (strings.ContainsAny(c.Outputs, "/\\\x00\n\r") || strings.HasPrefix(c.Outputs, ".") ||
-		strings.HasPrefix(c.Outputs, "stowage-") || slices.Contains(InstallFiles, c.Outputs) || c.Outputs == Ctl(short)) {
-		return nil, fmt.Errorf("container: outputs %q must be a file name, not hidden and not one the install writes (%s, %s, stowage-*)", c.Outputs, strings.Join(InstallFiles, ", "), Ctl(short))
+	if c.Outputs != "" {
+		if err := OutputsFile(short, c.Outputs); err != nil {
+			return nil, fmt.Errorf("container: %w", err)
+		}
 	}
 	return &c, nil
+}
+
+// OutputsFile refuses a provision hook's outputs file name that is not a plain file name of its
+// own in the install directory of the project whose short name is short.
+func OutputsFile(short, name string) error {
+	if strings.ContainsAny(name, "/\\\x00\n\r") || name == "" || strings.HasPrefix(name, ".") ||
+		strings.HasPrefix(name, "stowage-") || slices.Contains(InstallFiles, name) || name == Ctl(short) {
+		return fmt.Errorf("outputs %q must be a file name, not hidden and not one the install writes (%s, %s, stowage-*)", name, strings.Join(InstallFiles, ", "), Ctl(short))
+	}
+	return nil
 }
 
 // Provision validates `hooks.provision` of the project whose short name is short (nil = no

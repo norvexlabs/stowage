@@ -139,10 +139,55 @@ func osSwitchFile(dir string) string { return filepath.Clean(dir) + ".os-switch"
 // install of it, not of the release the settings name.
 func osUpgradeFile(dir string) string { return filepath.Clean(dir) + ".os-upgrade" }
 
+// newBaselineFile records, on the persistent partition beside the install directory, the release
+// whose OS a `reset-db --new-baseline` wrote: the boot on that release's OS wipes the install's
+// data and installs it (Upgrade with crossing), until it did.
+func newBaselineFile(dir string) string { return filepath.Clean(dir) + ".new-baseline" }
+
+// crossingAsked reports whether a reset-db --new-baseline asked this OS's release to cross a schema
+// baseline. A mark naming another release is removed: its OS is not the one booted (the write
+// failed, or the health gate went back), so no later boot of that release acts on it unasked. One
+// naming this release stays until the crossing is made (crossed): a boot whose crossing failed
+// tries it again, as the operator cannot ask it again from this OS.
+func (in *Installer) crossingAsked() (bool, error) {
+	mark := newBaselineFile(in.O.Dir)
+	raw, err := os.ReadFile(mark)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if tag := strings.TrimSpace(string(raw)); tag != "" && tag == in.R.Manifest.Tag {
+		return true, nil
+	}
+	if err := os.Remove(mark); err != nil {
+		in.O.logf("warning: removing %s: %v", mark, err)
+	}
+	return false, nil
+}
+
+// fellBackFromCrossing reports whether the install's release, version at revision, is one a
+// reset-db --new-baseline crossed to from this OS's release: the boot into the crossed release
+// fell back here, and the install keeps no release to go back to. A later OS is an upgrade.
+func (in *Installer) fellBackFromCrossing(version, revision string) bool {
+	raw, err := os.ReadFile(in.path(crossedFile))
+	m := in.R.Manifest
+	return err == nil && strings.TrimSpace(string(raw)) == fmt.Sprintf("%s %d %s %s", m.ProjectVersion, m.Revision, version, revision)
+}
+
+// crossed removes the mark of a crossing made.
+func (in *Installer) crossed() error {
+	if err := os.Remove(newBaselineFile(in.O.Dir)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
+}
+
 // upgradedTo reports whether an upgrade before the first install wrote this OS's release.
 func (in *Installer) upgradedTo() bool {
 	raw, err := os.ReadFile(osUpgradeFile(in.O.Dir))
-	return err == nil && strings.TrimSpace(string(raw)) == in.R.Manifest.Tag
+	return err == nil && in.R.Manifest.Tag != "" && strings.TrimSpace(string(raw)) == in.R.Manifest.Tag
 }
 
 // switchOS writes the OS bundle of the release the settings name into the passive slot and
@@ -259,8 +304,9 @@ func (in *Installer) applySettings(path string, st *Settings) error {
 	return nil
 }
 
-// withSettings applies the settings file to a first install run by the operator; an install that
-// exists already keeps what it recorded.
+// withSettings applies the settings file to a first install run by the operator, refusing it on an
+// OS of another release than the one the settings name; an install that exists already keeps what
+// it recorded.
 func (in *Installer) withSettings() error {
 	if _, err := os.Stat(in.path(envName)); err == nil {
 		return nil
@@ -269,6 +315,12 @@ func (in *Installer) withSettings() error {
 	st, err := ReadSettings(path)
 	if err != nil || st == nil {
 		return err
+	}
+	// One release decides the first install: the one the settings name, which the first boot
+	// writes the OS of before it installs, unless an upgrade wrote this OS's since.
+	if t := st.Release; t != nil && (t.Version != in.R.Manifest.ProjectVersion || t.Revision != in.R.Manifest.Revision) && !in.upgradedTo() {
+		return fmt.Errorf("%s names %s %s (revision %d) as the first install, and this OS carries %s (revision %d): the boot writes that release's OS bundle and reboots into it (`journalctl -u %s` follows it); install once the VM runs it",
+			path, in.R.Spec.Name, t.Version, t.Revision, in.R.Manifest.ProjectVersion, in.R.Manifest.Revision, in.R.Spec.Name+".service")
 	}
 	return in.applySettings(path, st)
 }
@@ -461,6 +513,11 @@ func (in *Installer) Boot(ctx context.Context) error {
 	if err := os.Remove(osUpgradeFile(o.Dir)); err != nil && !errors.Is(err, os.ErrNotExist) {
 		o.logf("warning: removing %s: %v", osUpgradeFile(o.Dir), err)
 	}
+	// A mark of another release goes whichever way the boot goes.
+	asked, err := in.crossingAsked()
+	if err != nil {
+		return err
+	}
 	env, err := in.open()
 	if err != nil {
 		return err
@@ -477,12 +534,25 @@ func (in *Installer) Boot(ctx context.Context) error {
 		_, cur, rev = runs(env)
 	}
 	if cur == m.ProjectVersion && rev == strconv.Itoa(m.Revision) {
+		if asked { // the crossing switched .env: made, its start brought up again here
+			if err := in.crossed(); err != nil {
+				return err
+			}
+		}
 		return in.Install(ctx)
 	}
 	if _, err := in.keptInstaller(ctx, name, cur, rev); err != nil {
 		return err
 	}
 	switch {
+	case asked:
+		o.logf("the install runs %s %s (revision %s); this OS carries %s (revision %d), which reset-db --new-baseline asked: wiping the data and installing it", name, cur, rev, m.ProjectVersion, m.Revision)
+		// What the old release wipes is read under the upgrade's lock (upgradeRefusals).
+		in.crossing = &crossing{version: cur, revision: rev}
+		if err := in.Upgrade(ctx); err != nil {
+			return err
+		}
+		return in.crossed()
 	case in.prevIs(m.ProjectVersion, strconv.Itoa(m.Revision)):
 		o.logf("this OS carries %s %s (revision %d), which the install's last upgrade replaced: going back to it", name, m.ProjectVersion, m.Revision)
 		return o.exec(ctx, in.ctl(), []string{bootRollbackCmd, "--dir", o.Dir})
@@ -490,6 +560,12 @@ func (in *Installer) Boot(ctx context.Context) error {
 		o.logf("the install went back from %s %s (revision %d), which this OS carries: it stays on %s (revision %s); upgrade to a later release, or remove %s to try this one again",
 			name, m.ProjectVersion, m.Revision, cur, rev, in.path(FailedDir))
 		return o.exec(ctx, in.ctl(), []string{bootCmd, "--dir", o.Dir})
+	}
+	// An install of a later release with none kept to go back to: a crossing's (reset-db
+	// --new-baseline), whose boot fell back to this OS. Only that release's OS runs it.
+	if in.fellBackFromCrossing(cur, rev) {
+		return fmt.Errorf("the install runs %s %s (revision %s), after this OS's %s (revision %d), and keeps no release to go back to (a reset-db --new-baseline crossed to it): `%s upgrade --version %s` writes its OS again",
+			name, cur, rev, m.ProjectVersion, m.Revision, in.R.Ctl(), cur)
 	}
 	o.logf("the install runs %s %s (revision %s); this OS carries %s (revision %d): upgrading", name, cur, rev, m.ProjectVersion, m.Revision)
 	if err := o.exec(ctx, in.ctl(), []string{bootCmd, "--dir", o.Dir}); err != nil {

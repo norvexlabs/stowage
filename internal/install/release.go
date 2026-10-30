@@ -148,7 +148,93 @@ type keptRelease struct {
 	Keys     map[string][]byte
 	Release  *Release
 	unread   error // why Release is nil
+	// schema is its schema baseline (0: no database), read apart from Release (payloadBaseline):
+	// told even when Release is nil; schemaErr is why it is not.
+	schema    int
+	schemaErr error
+	// reset and compose are its data.reset and compose file, read as the baseline is: what a
+	// crossing wipes of it (wipeOf) when Release is nil.
+	reset    []string
+	resetErr error
+	compose  []byte
+	outputs  string                 // its provision hook's outputs file, read as reset is
+	volumes  map[string]spec.Volume // its data.volumes' keep_on_reset, read as reset is
 }
+
+// keptOf reads a kept release from its installer's payload files: Release nil, and unread why,
+// when this Stowage refuses its payload.
+func keptOf(files payload.Files) (*keptRelease, error) {
+	m, err := payloadRelease(files)
+	if err != nil {
+		return nil, err
+	}
+	k := &keptRelease{Manifest: m, Keys: payloadKeys(files)}
+	k.schema, k.schemaErr = payloadBaseline(files[payload.Spec])
+	k.reset, k.volumes, k.outputs, k.resetErr = payloadReset(files[payload.Spec])
+	k.compose = files[payload.Compose]
+	k.Release, k.unread = Load(files)
+	return k, nil
+}
+
+// payloadBaseline is the schema baseline a release's spec.json records, 0 when it declares no
+// database. Only that is read of it, tolerating every other field: a spec of another Stowage,
+// which Load refuses whole, still tells it. It is where every Stowage since 0.4.1 writes it
+// (Database.SchemaCompat, the spec's Go field names); a test pins the path.
+func payloadBaseline(raw []byte) (int, error) {
+	var s struct {
+		Database *struct{ SchemaCompat spec.Provider }
+	}
+	if err := json.Unmarshal(raw, &s); err != nil {
+		return 0, fmt.Errorf("payload %s: %w", payload.Spec, err)
+	}
+	if s.Database == nil {
+		return 0, nil
+	}
+	return providers.SchemaBaseline(s.Database.SchemaCompat)
+}
+
+// payloadReset is the data.reset a release's spec.json records, and its provision hook's outputs
+// file, read as payloadBaseline reads the baseline (Data.Reset, Hooks.Provision.Config, the spec's
+// Go field names since 0.4.1), every other field ignored.
+func payloadReset(raw []byte) (reset []string, volumes map[string]spec.Volume, outputs string, err error) {
+	var s struct {
+		Data struct {
+			Reset   []string
+			Volumes map[string]json.RawMessage
+		}
+		Hooks struct {
+			Provision *struct{ Config map[string]any }
+		}
+	}
+	if err := json.Unmarshal(raw, &s); err != nil {
+		return nil, nil, "", fmt.Errorf("payload %s: %w", payload.Spec, err)
+	}
+	// Each volume read alone: one of another shape keeps nothing, and fails nothing else.
+	for v, raw := range s.Data.Volumes {
+		var d struct{ KeepOnReset bool }
+		if json.Unmarshal(raw, &d) == nil && d.KeepOnReset {
+			if volumes == nil {
+				volumes = map[string]spec.Volume{}
+			}
+			volumes[v] = spec.Volume{KeepOnReset: true}
+		}
+	}
+	if p := s.Hooks.Provision; p != nil {
+		switch v := p.Config["outputs"].(type) {
+		case nil:
+		case string:
+			outputs = v
+		default:
+			return nil, nil, "", fmt.Errorf("payload %s: hooks.provision outputs %v is not a file name", payload.Spec, v)
+		}
+	}
+	return s.Data.Reset, volumes, outputs, nil
+}
+
+// baseline is the kept release's schema baseline, 0 when it has no database.
+func (k *keptRelease) baseline() (int, error) { return k.schema, k.schemaErr }
+
+func (k *keptRelease) projectVersion() string { return k.Manifest.ProjectVersion }
 
 // readKept reads the installer at exe the install keeps, refusing it when its manifest is not the
 // release expect wants (nil: any), before anything else is read of it. A payload this Stowage
@@ -168,10 +254,14 @@ func (in *Installer) readKept(ctx context.Context, exe string, expect func(*rele
 			return nil, err
 		}
 	}
-	k := &keptRelease{Manifest: m, Keys: payloadKeys(files)}
-	if k.Release, err = Load(files); err == nil {
+	k, err := keptOf(files)
+	if err != nil {
+		return nil, err
+	}
+	if k.Release != nil {
 		return k, nil
 	}
+	err = k.unread
 	switch ierr := in.O.readsItself(ctx, exe); {
 	case ctx.Err() != nil:
 		return nil, ctx.Err()
@@ -180,7 +270,6 @@ func (in *Installer) readKept(ctx context.Context, exe string, expect func(*rele
 	case ierr != nil:
 		return nil, fmt.Errorf("%w, nor does that installer read it (%v)", err, ierr)
 	}
-	k.unread = err
 	return k, nil
 }
 

@@ -76,15 +76,17 @@ func (in *Installer) registryClient(prefix string) (*registry.Client, error) {
 }
 
 func (in *Installer) clientWith(kc authn.Keychain) (*registry.Client, error) {
+	// A download's resumes are said where the run logs.
+	opts := []registry.Option{registry.WithLog(in.O.Log)}
 	ca, err := in.registryCA()
 	if err != nil || ca == nil {
-		return registry.New(kc), err
+		return registry.New(kc, opts...), err
 	}
 	pool, err := registry.CertPool(ca)
 	if err != nil {
 		return nil, err
 	}
-	return registry.New(kc, registry.WithRootCAs(pool)), nil
+	return registry.New(kc, append(opts, registry.WithRootCAs(pool))...), nil
 }
 
 // dockerCA makes the Docker daemon trust the registry's CA before it pulls from prefix: the

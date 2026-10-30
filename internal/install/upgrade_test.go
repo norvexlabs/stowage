@@ -1494,7 +1494,12 @@ func TestUpgradeRefusesVolumesHalfRestored(t *testing.T) {
 // records Stowage 0.0.9, and its spec a field this one does not know.
 func anotherStowages(t *testing.T, e *env) []byte {
 	t.Helper()
-	ctl := filepath.Join(e.dir, "notes-stow")
+	return anotherStowagesAt(t, filepath.Join(e.dir, "notes-stow"))
+}
+
+// anotherStowagesAt makes the installer at ctl one another Stowage built, as anotherStowages.
+func anotherStowagesAt(t *testing.T, ctl string) []byte {
+	t.Helper()
 	files, err := payload.Read(ctl)
 	if err != nil {
 		t.Fatal(err)
@@ -1530,8 +1535,7 @@ func TestAReleaseOfAnotherStowageUpgradesAndGoesBack(t *testing.T) {
 		t.Fatalf("%v\n%s", err, e.log)
 	}
 	const foreign = `notes 1.0.0 (revision 1), built by Stowage 0.0.9, carries a spec this one does not read (its own installer does): payload spec.json: json: unknown field "Retired" (an installer of another Stowage?)`
-	for _, want := range []string{"the schema baseline of notes 1.0.0 is not known (" + foreign + "): not checked",
-		"the inputs and provision hook returns notes 2.0.0 removes are not known (" + foreign + "): kept"} {
+	for _, want := range []string{"the inputs and provision hook returns notes 2.0.0 removes are not known (" + foreign + "): kept"} {
 		if !strings.Contains(e.log.String(), want) {
 			t.Errorf("not logged: %s\n%s", want, e.log)
 		}

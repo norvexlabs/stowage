@@ -11,9 +11,13 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 
 	"go.yaml.in/yaml/v3"
+
+	"github.com/norvexlabs/stowage/internal/providers"
+	"github.com/norvexlabs/stowage/internal/spec"
 )
 
 // resetVolumes is what a reset wipes (data.reset) and what it keeps (the data volumes marked
@@ -135,39 +139,32 @@ func (in *Installer) Reset(ctx context.Context) error {
 		return err
 	}
 	wipe, _ := in.resetVolumes()
+	if _, err := in.composeVolumes(wipe); err != nil {
+		return err
+	}
+	if _, err := in.hook(); err != nil {
+		return err
+	}
+	// A crossing also wipes what the release the install runs names: checked there.
+	if o.NewBaseline {
+		return in.resetBaseline(ctx)
+	}
 	if len(wipe) == 0 {
 		return fmt.Errorf("%s names no volume in data.reset: reset-db has nothing to wipe", name)
 	}
-	named, err := in.composeVolumes(wipe)
-	if err != nil {
-		return err
-	}
-	h, err := in.hook()
-	if err != nil {
-		return err
-	}
-	// The restored values a --secrets install waited to provision go with the record: the
-	// reset database is provisioned afresh.
-	forget := []string{ProvisionEnv, restoreAwaitedFile}
-	if h != nil && h.Outputs != "" {
-		forget = append(forget, h.Outputs)
-	}
 	// Checked before the confirmation, which holds no lock, and again under the lock.
-	check := func(env *EnvFile) (string, error) {
+	check := func(env *EnvFile) error {
 		if err := in.sameRelease(ctx, env); err != nil {
-			return "", err
+			return err
 		}
-		project, _ := env.Get("COMPOSE_PROJECT_NAME")
-		if project == "" {
-			return "", fmt.Errorf("%s records no COMPOSE_PROJECT_NAME: its volumes cannot be found", in.path(envName))
-		}
-		return project, nil
+		_, err := in.composeProject(env)
+		return err
 	}
 	env, err := in.open()
 	if err != nil {
 		return err
 	}
-	if _, err := check(env); err != nil {
+	if err := check(env); err != nil {
 		return err
 	}
 	what := in.resetPlan()
@@ -183,8 +180,7 @@ func (in *Installer) Reset(ctx context.Context) error {
 		return err
 	}
 	defer unlock()
-	project, err := check(env)
-	if err != nil {
+	if err := check(env); err != nil {
 		return err
 	}
 	if err := in.volumesSplit(); err != nil {
@@ -193,8 +189,75 @@ func (in *Installer) Reset(ctx context.Context) error {
 	if err := in.checkDocker(ctx); err != nil {
 		return err
 	}
-	// The volumes the stack's containers mount, read before `down` removes them: a volume found by
-	// its name alone is deleted only when the stack used it.
+	if err := in.wipeData(ctx, env, nil); err != nil {
+		return err
+	}
+	return in.start(ctx, env)
+}
+
+// wipeSet is what wipeData deletes: the data.reset volumes, sorted, each with the name its compose
+// file gives it (empty: the one Compose gives), and the files that record a provisioning. With old
+// (a crossing), old's are added to this release's — its stack is the one stopped, whose volumes
+// carry the data, and its names win.
+func (in *Installer) wipeSet(old *Installer) (wipe, keep []string, named map[string]string, forget []string, err error) {
+	named = map[string]string{}
+	forget = []string{ProvisionEnv, restoreAwaitedFile}
+	var kept []string
+	_, ours := in.resetVolumes() // what this release keeps on a reset, never wiped
+	for _, src := range []*Installer{old, in} {
+		if src == nil {
+			continue
+		}
+		keys, k := src.resetVolumes()
+		kept = append(kept, k...)
+		keys = slices.DeleteFunc(slices.Clone(keys), func(v string) bool { return slices.Contains(ours, v) })
+		names, err := src.composeVolumes(keys)
+		if err != nil {
+			return nil, nil, nil, nil, err
+		}
+		for _, k := range keys {
+			if _, ok := named[k]; !ok {
+				named[k] = names[k]
+				wipe = append(wipe, k)
+			}
+		}
+		h, err := src.hook()
+		if err != nil {
+			return nil, nil, nil, nil, err
+		}
+		out := src.outputs // another Stowage's release, read for that alone (wipeOf)
+		if h != nil {
+			out = h.Outputs
+		}
+		if out != "" && !slices.Contains(forget, out) {
+			forget = append(forget, out)
+		}
+	}
+	slices.Sort(wipe)
+	for _, v := range kept {
+		if !slices.Contains(wipe, v) && !slices.Contains(keep, v) {
+			keep = append(keep, v)
+		}
+	}
+	slices.Sort(keep)
+	return wipe, keep, named, forget, nil
+}
+
+// wipeData stops the stack env runs and deletes the volumes data.reset names, with what the
+// provision hook returned and the restored values a --secrets install waited to provision: the
+// database is provisioned afresh at the next start; with old, a crossing's, its volumes too
+// (wipeSet). A volume found by its name alone is deleted only when the stack used it.
+func (in *Installer) wipeData(ctx context.Context, env *EnvFile, old *Installer) error {
+	o, name := &in.O, in.R.Spec.Name
+	wipe, _, named, forget, err := in.wipeSet(old)
+	if err != nil {
+		return err
+	}
+	project, err := in.composeProject(env)
+	if err != nil {
+		return err
+	}
+	// The volumes the stack's containers mount, read before `down` removes them.
 	mounts, err := o.Docker.Run(ctx, Cmd{Args: []string{"ps", "--all", "--filter", "label=com.docker.compose.project=" + project, "--format", "{{.Mounts}}"}})
 	if err != nil {
 		return fmt.Errorf("listing the stack's containers: %w", err)
@@ -247,7 +310,111 @@ func (in *Installer) Reset(ctx context.Context) error {
 			return err
 		}
 	}
-	return in.start(ctx, env)
+	return nil
+}
+
+// composeProject is the Compose project env records, whose volumes reset-db finds by its label.
+func (in *Installer) composeProject(env *EnvFile) (string, error) {
+	project, _ := env.Get("COMPOSE_PROJECT_NAME")
+	if project == "" {
+		return "", fmt.Errorf("%s records no COMPOSE_PROJECT_NAME: its volumes cannot be found", in.path(envName))
+	}
+	return project, nil
+}
+
+// crossing is the release a reset-db --new-baseline confirmed wiping: the upgrade it runs wipes
+// the install's data only while the install still runs it, across a baseline it still crosses.
+type crossing struct {
+	version, revision string
+	// old is that release as far as its wipe goes (wipeOf): the stack the wipe stops is its.
+	old *Installer
+}
+
+// wipeOf is the release the install runs, kept, as far as a crossing's wipe goes: its data.reset
+// and compose file — its whole Release when this Stowage reads it, else those two alone — refused
+// when they do not tell what to delete, before anything changes.
+func (in *Installer) wipeOf(kept *keptRelease) (*Installer, error) {
+	m := kept.Manifest
+	old := &Installer{R: kept.Release, O: in.O}
+	if kept.Release == nil {
+		if kept.resetErr != nil {
+			return nil, fmt.Errorf("what %s %s wipes cannot be told (%v): --new-baseline never wipes on a guess", m.Name, m.ProjectVersion, kept.resetErr)
+		}
+		old.R = &Release{Manifest: m, Spec: &spec.Spec{Name: m.Name, Data: spec.Data{Reset: kept.reset, Volumes: kept.volumes}}, Compose: kept.compose}
+		if kept.outputs != "" {
+			if err := providers.OutputsFile(m.ShortName, kept.outputs); err != nil {
+				return nil, fmt.Errorf("%s %s's hooks.provision: %w: --new-baseline cannot tell what to forget of it", m.Name, m.ProjectVersion, err)
+			}
+			old.outputs = kept.outputs
+		}
+	}
+	wipe, _ := old.resetVolumes()
+	if _, err := old.composeVolumes(wipe); err != nil {
+		return nil, fmt.Errorf("%s %s's %w: --new-baseline cannot tell what to wipe of it", m.Name, m.ProjectVersion, err)
+	}
+	return old, nil
+}
+
+// resetBaseline is reset-db --new-baseline: an install of another release, at another schema
+// baseline than this installer's, is wiped and upgraded to this release with its recorded values
+// (Upgrade with in.crossing). Every check runs before anything changes; nothing is dumped, and
+// no previous release is kept: going back across a baseline is refused anyway.
+func (in *Installer) resetBaseline(ctx context.Context) error {
+	o, m := &in.O, in.R.Manifest
+	env, err := in.open()
+	if err != nil {
+		return err
+	}
+	name, cur, rev, err := sameProject(o.Dir, env, m)
+	if err != nil {
+		return err
+	}
+	if cur == m.ProjectVersion && rev == strconv.Itoa(m.Revision) {
+		return fmt.Errorf("%s already runs %s %s (revision %s): --new-baseline installs another release, which this installer does not carry; reset-db without it wipes this one",
+			o.Dir, name, cur, rev)
+	}
+	if err := in.newer(cur, rev); err != nil {
+		return err
+	}
+	// Every refusal of the upgrade comes before the question, as the crossing would meet them
+	// after it — the baselines and what the release the install runs wipes among them; the
+	// upgrade runs them again under the lock.
+	in.crossing = &crossing{version: cur, revision: rev}
+	if _, _, _, _, err := in.upgradeRefusals(ctx, env, name, cur, rev); err != nil {
+		return err
+	}
+	wipe, keep, _, _, err := in.wipeSet(in.crossing.old) // not empty: upgradeRefusals refuses that
+	if err != nil {
+		return err
+	}
+	what := "stop it, delete its volumes " + strings.Join(wipe, ", ")
+	if len(keep) > 0 {
+		what += " (keeping " + strings.Join(keep, ", ") + ")"
+	}
+	what += fmt.Sprintf(", forget what its provision hook returned, then install %s %s, at the new schema baseline, with the same values", name, m.ProjectVersion)
+	if o.DryRun {
+		fmt.Fprintf(o.Out, "a run would %s\n", what)
+		return nil
+	}
+	if err := confirmReset(ctx, o.Prompt, o.Yes, name, what); err != nil {
+		return err
+	}
+	return in.Upgrade(ctx) // which reads what the old release wipes again, under its lock
+}
+
+// crosses refuses unless the install's release, kept, and this installer's start different schema
+// baselines, both told: --new-baseline never wipes on a guess, and within a baseline an upgrade
+// moves the install.
+func (in *Installer) crosses(kept *keptRelease, name, cur string) error {
+	from, to, ok := baselines(&in.O, kept, in)
+	switch {
+	case !ok:
+		return fmt.Errorf("the schema baseline of %s %s, which the install runs, cannot be told (the log says why): --new-baseline never wipes on a guess", name, cur)
+	case from == to:
+		return fmt.Errorf("%s runs %s %s, at the schema baseline of %s %s: --new-baseline only crosses a baseline; `%s upgrade --dir %s` moves it",
+			in.O.Dir, name, cur, name, in.R.Manifest.ProjectVersion, cmp.Or(in.O.Self, in.ctl()), in.O.Dir)
+	}
+	return nil
 }
 
 // K8sReset is `k8s reset-db`: the helm release back to its first setup. The release is
@@ -294,7 +461,7 @@ func (in *Installer) K8sReset(ctx context.Context) error {
 	// A reset installs the release it wipes again, with its installer; only across a schema
 	// baseline, asked for by --new-baseline, does it install this installer's release instead.
 	other := cur.Release.Version != m.ProjectVersion || cur.Release.Revision != m.Revision
-	if other || k.NewBaseline {
+	if other || in.O.NewBaseline {
 		r := cur.Release
 		if !other {
 			return fmt.Errorf("release %s in %s already runs %s %s (revision %d): --new-baseline installs another release, which this installer does not carry; reset-db without it wipes this one",
@@ -304,10 +471,10 @@ func (in *Installer) K8sReset(ctx context.Context) error {
 		from, to, ok := in.k8sBaselines(running, runErr, cur)
 		crosses := ok && from != to
 		switch {
-		case !k.NewBaseline && crosses:
+		case !in.O.NewBaseline && crosses:
 			return fmt.Errorf("release %s in %s runs %s %s (revision %d), at schema baseline %d, and this installer carries %s (revision %d), at baseline %d: `%s --new-baseline` wipes it and installs %s; the installer of %s resets it as it is",
 				k.Release, k.Namespace, m.Name, r.Version, r.Revision, from, m.ProjectVersion, m.Revision, to, in.k8sCtl("reset-db"), m.ProjectVersion, r.Version)
-		case !k.NewBaseline:
+		case !in.O.NewBaseline:
 			return fmt.Errorf("release %s in %s runs %s %s (revision %d), and this installer carries %s (revision %d): reset it with the installer of %s",
 				k.Release, k.Namespace, m.Name, r.Version, r.Revision, m.ProjectVersion, m.Revision, r.Version)
 		case !ok:

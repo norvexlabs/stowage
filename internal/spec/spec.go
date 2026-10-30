@@ -501,7 +501,20 @@ type KairosShape struct {
 	HostAPI []string `yaml:"host_api"`
 	// Size is the VM's least and recommended size, which `vm create` sizes a VM from.
 	Size *VMSize `yaml:"size"`
+	// Disks is whether every ship publishes the disks (DisksAlways) or only one asked to
+	// (DisksOptIn, the default). The publisher's alone: RuntimeView drops it, so no artifact
+	// carries it and no inputs digest reads it.
+	Disks string `yaml:"disks" json:",omitempty"`
 }
+
+// The values of shapes.kairos.disks.
+const (
+	DisksAlways = "always"
+	DisksOptIn  = "opt-in"
+)
+
+// AlwaysDisks reports whether every ship publishes the shape's disks (disks: always).
+func (k *KairosShape) AlwaysDisks() bool { return k != nil && k.Disks == DisksAlways }
 
 // Host is what the stack asks of the machine it runs on, whatever the shape: written where Stowage
 // owns the host (the kairos shape's OS bundle and its boot); elsewhere `tune` reports its modules,
@@ -800,7 +813,7 @@ func (s *Spec) Signs() bool { return s.Signing != nil && s.Signing.Name != "none
 
 // RuntimeView is the part of the spec that reaches an install: the spec without the fields only
 // the publisher reads (version and changelog providers, channels, push credentials, the signing
-// key, the delete provider). Artifacts embed this view, so their inputs digests hash it and nothing else: fixing push
+// key, the delete provider, the kairos shape's disks policy). Artifacts embed this view, so their inputs digests hash it and nothing else: fixing push
 // credentials or a channel template must not change what a release contains.
 func (s *Spec) RuntimeView() Spec {
 	v := *s
@@ -816,6 +829,11 @@ func (s *Spec) RuntimeView() Spec {
 		}
 		v.Signing = &pub
 	}
+	if k := s.Shapes.Kairos; k != nil {
+		c := *k
+		c.Disks = ""
+		v.Shapes.Kairos = &c
+	}
 	return v
 }
 
@@ -824,7 +842,7 @@ func (s *Spec) RuntimeView() Spec {
 // builds only its disk.
 func (s *Spec) BundleView() Spec {
 	v := s.RuntimeView()
-	if k := s.Shapes.Kairos; k != nil {
+	if k := v.Shapes.Kairos; k != nil {
 		c := *k
 		c.DiskFormats, c.CloudPublish, c.Size = nil, nil, nil
 		v.Shapes.Kairos = &c

@@ -37,9 +37,6 @@ type K8sOptions struct {
 	Registry string
 	Timeout  time.Duration
 	Revision int // rollback: the helm revision to go back to; 0 is the one before the last upgrade
-	// NewBaseline lets reset-db wipe a release that runs another schema baseline than this
-	// installer's release, and install this one: the only way a release crosses a baseline.
-	NewBaseline bool
 	// Data lets uninstall delete the release's PersistentVolumeClaims without asking.
 	Data bool
 	// UnsafeSysctls gives the pods the network settings the kubelet must allow (tune.Pod): true
@@ -482,10 +479,13 @@ func (in *Installer) k8sDeploy(ctx context.Context, upgrade bool) error {
 		// The same release applied again shares its baseline and its inputs: nothing to fetch.
 		if cur.Release.Version != m.ProjectVersion || cur.Release.Revision != m.Revision {
 			running, runErr := in.k8sRunning(ctx, cur, prefix)
-			if runErr == nil {
-				in.dropped = removedBy(running, in.R)
-			} else {
+			switch {
+			case runErr != nil:
 				in.O.logf("the release %s %s runs could not be read (%v): the inputs it removes are kept", cur.Release.Name, cur.Release.Version, runErr)
+			case running.Release == nil:
+				in.O.logf("the release %s %s runs could not be read (%s): the inputs it removes are kept", cur.Release.Name, cur.Release.Version, running.foreign())
+			default:
+				in.dropped = removedBy(running.Release, in.R)
 			}
 			if from, to, ok := in.k8sBaselines(running, runErr, cur); ok && from != to {
 				return fmt.Errorf("%s %s starts schema baseline %d, and release %s in %s runs %s %s, at baseline %d: its data cannot carry over, so it moves to %s only by a fresh install: `%s --new-baseline` wipes it and installs %s",
@@ -1037,7 +1037,7 @@ func (in *Installer) K8sUpgradeTo(ctx context.Context, v string, args []string) 
 // installer's (to), running being that release (k8sRunning). ok is false when either has no
 // database or a baseline cannot be told (said in the log): the check then does not refuse, as on
 // Docker.
-func (in *Installer) k8sBaselines(running *Release, runErr error, cur *deployed) (int, int, bool) {
+func (in *Installer) k8sBaselines(running *keptRelease, runErr error, cur *deployed) (int, int, bool) {
 	if !in.R.Spec.HasDatabase() {
 		return 0, 0, false
 	}
@@ -1045,15 +1045,16 @@ func (in *Installer) k8sBaselines(running *Release, runErr error, cur *deployed)
 		in.O.logf("the schema baseline of %s %s is not known (%v): not checked", cur.Release.Name, cur.Release.Version, runErr)
 		return 0, 0, false
 	}
-	return baselines(&in.O, &Installer{R: running, O: in.O}, in)
+	return baselines(&in.O, running, in)
 }
 
 // k8sRunning is the release the helm release runs, as its installer carries it: a release's spec
 // travels in its installer, which is fetched by the tag the release was installed from, from
-// prefix, signature-checked against this installer's keys, and read.
-func (in *Installer) k8sRunning(ctx context.Context, cur *deployed, prefix string) (*Release, error) {
+// prefix, signature-checked against this installer's keys, and read — its Release nil when this
+// Stowage refuses its spec, whose schema baseline it still tells.
+func (in *Installer) k8sRunning(ctx context.Context, cur *deployed, prefix string) (*keptRelease, error) {
 	r := cur.Release
-	unknown := func(err error) (*Release, error) { return nil, err }
+	unknown := func(err error) (*keptRelease, error) { return nil, err }
 	if r.Tag == "" {
 		return unknown(errors.New("the release records no tag"))
 	}
@@ -1097,11 +1098,7 @@ func (in *Installer) k8sRunning(ctx context.Context, cur *deployed, prefix strin
 	if err != nil {
 		return unknown(err)
 	}
-	running, err := Load(files)
-	if err != nil {
-		return unknown(err)
-	}
-	return running, nil
+	return keptOf(files)
 }
 
 // PodSecurityEnforce is the namespace label naming the Pod Security level its pods must meet.

@@ -1,11 +1,13 @@
 package install
 
 import (
+	"bytes"
 	"context"
 	"os"
 	"strings"
 	"testing"
 
+	"github.com/norvexlabs/stowage/internal/payload"
 	"github.com/norvexlabs/stowage/internal/release"
 	"github.com/norvexlabs/stowage/internal/spec"
 	"github.com/norvexlabs/stowage/internal/testutil"
@@ -19,6 +21,11 @@ func (e *kubeEnv) publishAt(version string, b int) {
 
 // publishWith is publishAt with the spec mod changes.
 func (e *kubeEnv) publishWith(version string, mod func(*spec.Spec)) {
+	e.publishExe(version, mod, nil)
+}
+
+// publishExe is publishWith with exe changing the installer's file before it is pushed.
+func (e *kubeEnv) publishExe(version string, mod func(*spec.Spec), change func(path string)) {
 	t := e.t
 	r, exe := testInstallerOf(t, version, 1, func(s *spec.Spec) {
 		e.spec(s)
@@ -26,6 +33,9 @@ func (e *kubeEnv) publishWith(version string, mod func(*spec.Spec)) {
 	}, func(m *release.Manifest) {
 		m.Artifacts.Chart = &release.Chart{Repository: "charts/notes-stable", Version: "0.1.0", Digest: e.digest}
 	})
+	if change != nil {
+		change(exe)
+	}
 	raw, err := os.ReadFile(exe)
 	if err != nil {
 		t.Fatal(err)
@@ -95,12 +105,12 @@ func TestK8sResetCrossesASchemaBaselineOnlyWhenAsked(t *testing.T) {
 		t.Fatalf("%d uninstalls without the flag", n)
 	}
 	// The dry run names the release it installs instead.
-	if err := e.reset(func(o *Options) { o.K8s.NewBaseline, o.DryRun = true, true }); err != nil ||
+	if err := e.reset(func(o *Options) { o.NewBaseline, o.DryRun = true, true }); err != nil ||
 		!strings.Contains(e.out.String(), "then install notes 2.0.0, at the new schema baseline, with the same values") {
 		t.Fatalf("dry run: %v %s", err, e.out)
 	}
 	e.out.Reset()
-	if err := e.reset(func(o *Options) { o.Yes, o.K8s.NewBaseline = true, true }); err != nil {
+	if err := e.reset(func(o *Options) { o.Yes, o.NewBaseline = true, true }); err != nil {
 		t.Fatalf("with the flag: %v\n%s", err, e.log)
 	}
 	if len(e.f.ran("helm uninstall")) != 1 || len(e.f.ran("helm upgrade")) != 1 || string(e.f.chart) != string(e.chart) {
@@ -113,7 +123,7 @@ func TestK8sResetCrossesASchemaBaselineOnlyWhenAsked(t *testing.T) {
 
 func TestK8sResetNewBaselineRefusals(t *testing.T) {
 	t.Parallel()
-	flag := func(o *Options) { o.Yes, o.K8s.NewBaseline = true, true }
+	flag := func(o *Options) { o.Yes, o.NewBaseline = true, true }
 	// Another release at the same baseline: an upgrade moves it, the flag wipes nothing.
 	e := baselineKube(t, 2, 2)
 	if err := e.reset(flag); err == nil || !strings.Contains(err.Error(), "--new-baseline only crosses a baseline; `notes-stow k8s upgrade --namespace notes --release notes` moves it") {
@@ -151,11 +161,11 @@ func TestK8sResetAcrossABaselineWritesWhatTheNewReleaseAdds(t *testing.T) {
 		atBaseline(2)(s)
 		s.Secrets = append(s.Secrets, spec.Secret{Key: "NEW_KEY", Gen: "hex16"})
 	})
-	if err := e.reset(func(o *Options) { o.K8s.NewBaseline, o.DryRun = true, true }); err != nil ||
+	if err := e.reset(func(o *Options) { o.NewBaseline, o.DryRun = true, true }); err != nil ||
 		!strings.HasPrefix(e.out.String(), "a run would write the secrets and inputs notes 2.0.0 adds (NEW_KEY), uninstall release notes") {
 		t.Fatalf("dry run: %v %s", err, e.out)
 	}
-	if err := e.reset(func(o *Options) { o.Yes, o.K8s.NewBaseline = true, true }); err != nil {
+	if err := e.reset(func(o *Options) { o.Yes, o.NewBaseline = true, true }); err != nil {
 		t.Fatalf("%v\n%s", err, e.log)
 	}
 	if got := e.secretData("notes-stowage"); len(got["NEW_KEY"]) != 32 || got["SESSION_SECRET"] != "s" {
@@ -214,5 +224,51 @@ func mustRelease(t *testing.T, e *kubeEnv, version string) *Release {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return r
+	if r.Release == nil {
+		t.Fatal(r.foreign())
+	}
+	return r.Release
+}
+
+// The running release another Stowage built (its spec refused whole: a field this one dropped)
+// still tells its baseline: --new-baseline crosses it, and an upgrade across it is refused.
+func TestK8sAnotherStowagesReleaseTellsItsBaseline(t *testing.T) {
+	t.Parallel()
+	foreign := func(e *kubeEnv) {
+		e.publishExe("1.0.0", atBaseline(1), func(exe string) { droppedField(e.t, exe) })
+	}
+	e := baselineKube(t, 1, 2)
+	foreign(e)
+	if err := e.installer(nil).K8sUpgrade(context.Background()); err == nil || !strings.Contains(err.Error(), "at baseline 1") {
+		t.Fatalf("upgrade: %v\n%s", err, e.log)
+	}
+	if !strings.Contains(e.log.String(), `unknown field "Retired"`) {
+		t.Errorf("why its inputs are kept is not said: %s", e.log)
+	}
+	e = baselineKube(t, 1, 2)
+	foreign(e)
+	if err := e.reset(func(o *Options) { o.Yes, o.NewBaseline = true, true }); err != nil {
+		t.Fatalf("--new-baseline: %v\n%s", err, e.log)
+	}
+	if len(e.f.ran("helm uninstall")) != 1 || len(e.f.ran("helm upgrade")) != 1 {
+		t.Errorf("uninstalls %d, installs %d", len(e.f.ran("helm uninstall")), len(e.f.ran("helm upgrade")))
+	}
+}
+
+// droppedField gives the spec in the installer at exe a field this Stowage does not know, its
+// manifest unchanged (the release's in the registry is that one).
+func droppedField(t *testing.T, exe string) {
+	t.Helper()
+	files, err := payload.Read(exe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	files[payload.Spec] = append([]byte(`{"Retired":1,`), files[payload.Spec][1:]...)
+	var buf bytes.Buffer
+	if err := payload.Write(&buf, strings.NewReader("exe"), files); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(exe, buf.Bytes(), 0o755); err != nil {
+		t.Fatal(err)
+	}
 }

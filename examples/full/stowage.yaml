@@ -223,6 +223,7 @@ shapes:
     kairos_init: quay.io/kairos/kairos-init:v4.4.0-rc2@sha256:ac885c9f3002a3f0e7000947e3d1e2a5c95f5e2d0212d5f9bbd663347f1ebe0c
     disk_formats: [raw, qcow2, ova, vhd, gce, iso]
     cloud_publish: [aws, azure, gcp]
+    disks: opt-in   # always: every ship publishes the disks; opt-in (the default): a ship asked to (--disks)
     health_gate: { deadline_s: 600, deadline_after_reset_s: 1800, poll_s: 30 }
     host_api: [api]
     size: { min: { cpus: 2, memory: 2G, disk: 20G }, recommended: { cpus: 4, memory: 8G, disk: 40G } }   # vm create's least and default size

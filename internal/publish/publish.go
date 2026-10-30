@@ -312,7 +312,8 @@ type ShipOptions struct {
 	Promoted *Ref
 	// Disks publishes the kairos shape's disks (and registers cloud_publish's images); without
 	// it the release publishes none and its installs boot its channel's disk set. A promotion
-	// publishes the disks the release it promotes published.
+	// publishes the disks the release it promotes published. shapes.kairos.disks: always sets it
+	// for every ship but a promotion.
 	Disks bool
 }
 
@@ -346,6 +347,11 @@ func (p *Publisher) Ship(ctx context.Context, o ShipOptions) (*Ref, error) {
 	ch, ok := s.Channels[o.Channel]
 	if !ok {
 		return nil, fmt.Errorf("channel %q is not declared", o.Channel)
+	}
+	// shapes.kairos.disks: always asks every ship for the disks; a promotion builds nothing, and
+	// publishes the disks of the release it promotes.
+	if !o.NoBuild && s.Shapes.Kairos.AlwaysDisks() {
+		o.Disks = true
 	}
 	// The disk builder is checked before anything is built; a promotion builds nothing.
 	if p.hasOS() && len(s.Shapes.Kairos.Formats()) > 0 && o.Disks && !o.NoBuild && p.Disks == nil {

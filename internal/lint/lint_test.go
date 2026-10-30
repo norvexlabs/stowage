@@ -429,6 +429,7 @@ func TestEachRuleFiresOnFull(t *testing.T) {
 		{"pull shares the push token", []edit{{sp, "token_env: STOWAGE_PULL_TOKEN", "token_env: STOWAGE_PUSH_TOKEN"}}, nil, "registry.pull: token_env STOWAGE_PUSH_TOKEN is registry.push's"},
 		{"pull is the push docker config", []edit{{sp, "pull: { provider: token, user: atlas-pull, token_env: STOWAGE_PULL_TOKEN }", "pull: { provider: docker-config, config: ci }"}, {sp, "push: { provider: token, user: publisher, token_env: STOWAGE_PUSH_TOKEN }", "push: { provider: docker-config, config: ci/ }"}}, nil, "registry.pull: is registry.push's Docker config"},
 		{"cloud", []edit{{sp, "cloud_publish: [aws, azure, gcp]", "cloud_publish: [ovh]"}}, nil, "unknown cloud"},
+		{"kairos disks policy", []edit{{sp, "disks: opt-in", "disks: sometimes"}}, nil, `shapes.kairos.disks: unknown policy "sometimes" (always, opt-in)`},
 		{"host api service", []edit{{sp, "host_api: [api]", "host_api: [admin]"}}, nil, `shapes.kairos.host_api: service "admin" is not in`},
 		{"host api twice", []edit{{sp, "host_api: [api]", "host_api: [api, api]"}}, nil, `service "api" is named twice`},
 		{"module name", []edit{{sp, "    pcspkr: {", "    pc-spkr: {"}}, nil, "host.modules.pc-spkr: not a kernel module's name"},
@@ -1366,7 +1367,7 @@ func TestHostNetworkWithoutDockerNorKairosWarns(t *testing.T) {
 func TestL4AllowlistWithoutKairosWarns(t *testing.T) {
 	t.Parallel()
 	root := testutil.CopyExample(t, "full")
-	testutil.Edit(t, root, specFile, "  kairos:\n    base: ubuntu:26.04@sha256:c098726dd9b9733f3e885f8de0ef375206a311b0a317eadc40d347b1115fb944\n    kairos_init: quay.io/kairos/kairos-init:v4.4.0-rc2@sha256:ac885c9f3002a3f0e7000947e3d1e2a5c95f5e2d0212d5f9bbd663347f1ebe0c\n    disk_formats: [raw, qcow2, ova, vhd, gce, iso]\n    cloud_publish: [aws, azure, gcp]\n    health_gate: { deadline_s: 600, deadline_after_reset_s: 1800, poll_s: 30 }\n    host_api: [api]\n    "+vmSizeLine+"   # vm create's least and default size\n", "")
+	testutil.Edit(t, root, specFile, "  kairos:\n    base: ubuntu:26.04@sha256:c098726dd9b9733f3e885f8de0ef375206a311b0a317eadc40d347b1115fb944\n    kairos_init: quay.io/kairos/kairos-init:v4.4.0-rc2@sha256:ac885c9f3002a3f0e7000947e3d1e2a5c95f5e2d0212d5f9bbd663347f1ebe0c\n    disk_formats: [raw, qcow2, ova, vhd, gce, iso]\n    cloud_publish: [aws, azure, gcp]\n    disks: opt-in   # always: every ship publishes the disks; opt-in (the default): a ship asked to (--disks)\n    health_gate: { deadline_s: 600, deadline_after_reset_s: 1800, poll_s: 30 }\n    host_api: [api]\n    "+vmSizeLine+"   # vm create's least and default size\n", "")
 	res := run(t, root)
 	if errs := errorsOf(res); len(errs) > 0 {
 		t.Fatalf("errors:\n%s", strings.Join(errs, "\n"))

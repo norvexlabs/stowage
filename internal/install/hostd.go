@@ -6,6 +6,7 @@ import (
 	"cmp"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
@@ -115,9 +116,17 @@ type Hostd struct {
 	// slotGen, under mu, moves at every claim of the job slot and every job's end: a run that
 	// read what it runs with at one generation starts only at that same one (startJobWhenFree).
 	slotGen uint64
-	// resetToken is the token the last GET reset-db made, which one POST may use.
+	// resetToken is the token the last GET reset-db made, which one POST may use, for the plan
+	// that GET showed: resetShown (a crossing or not, and its target).
 	resetToken string
-	ctx        context.Context // the daemon's: a job outlives its request
+	resetShown shownReset
+	// checkedPlan is the crossing a GET's resetPlan just checked, which the GET turns into
+	// crossPlan with its token.
+	checkedPlan *crossPlanned
+	// crossPlan is the last crossing a reset-db plan checked (resetPlan), which the next plan of
+	// the same target installer for the same install takes as it is.
+	crossPlan *crossPlanned
+	ctx       context.Context // the daemon's: a job outlives its request
 
 	// netMu orders the network changes and their revert; netTimer is the armed revert, netGen
 	// counts disarms (a revert that fired after one does nothing).
@@ -294,8 +303,16 @@ type Update struct {
 	Available bool    `json:"available"` // the target comes after the current release, and may be installed
 	// LeftByRollback: the install went back from the target, and the boot does not upgrade to it
 	// again.
-	LeftByRollback bool   `json:"left_by_rollback,omitempty"`
-	Changelog      string `json:"changelog,omitempty"`
+	LeftByRollback bool `json:"left_by_rollback,omitempty"`
+	// Rewrite: the VM runs the passive system (a boot that failed went back to it), and the
+	// target is the release it runs, whose OS an upgrade writes to the active slot again.
+	Rewrite bool `json:"rewrite,omitempty"`
+	// Installed is the release the install runs (none before the first install): after a crossing
+	// whose boot fell back, a later one than the OS's.
+	Installed *Version `json:"installed,omitempty"`
+	// Passive: the VM runs the passive system, whose release `upgrade --version` finds to rewrite.
+	Passive   bool   `json:"passive,omitempty"`
+	Changelog string `json:"changelog,omitempty"`
 }
 
 // UpgradeRequest is POST /v1/upgrade's body.
@@ -933,6 +950,12 @@ type ResetRequest struct {
 	Confirm     *Version `json:"confirm"`
 	Token       string   `json:"token"`                  // the token of the GET that showed the plan
 	NoProvision bool     `json:"no_provision,omitempty"` // start the stack without running the provision hook
+	// NewBaseline crosses a schema baseline: the release Channel and Version find (as an upgrade
+	// finds it) is installed instead, its OS written and booted, the data wiped by that boot.
+	// Confirm is then that release.
+	NewBaseline bool   `json:"new_baseline,omitempty"`
+	Channel     string `json:"channel,omitempty"`
+	Version     string `json:"version,omitempty"`
 }
 
 // ResetPlan is what GET /v1/reset-db answers: the release the job resets and what it does.
@@ -975,16 +998,123 @@ func (h *Hostd) resetCheck(ctx context.Context, in *Installer) (ResetPlan, error
 
 func (h *Hostd) resetDBPlan(w http.ResponseWriter, r *http.Request) {
 	in, _ := h.run()
-	p, err := h.resetCheck(r.Context(), in)
+	q := r.URL.Query()
+	nb := q.Get("new_baseline") == "true"
+	p, _, _, err := h.resetPlan(r.Context(), in, nb, q.Get("channel"), q.Get("version"), "", true)
 	if err != nil {
 		replyErr(w, err)
 		return
 	}
+	// The token, the plan it shows and that plan's check, set together: a later GET replaces all.
 	p.Token = rand.Text()
 	h.mu.Lock()
-	h.resetToken = p.Token
+	h.resetToken, h.resetShown = p.Token, shownReset{nb, p.Target}
+	if c := h.checkedPlan; nb && c != nil {
+		c.token = p.Token
+		h.crossPlan, h.checkedPlan = c, nil
+	} else {
+		h.crossPlan = nil
+	}
 	h.mu.Unlock()
 	reply(w, http.StatusOK, p)
+}
+
+// resetPlan is resetCheck's plan, or with newBaseline the crossing's: the release found on
+// channel (version's latest revision, or the channel's latest) as an upgrade finds it, m, which
+// must come after this OS's and start another schema baseline, both told, and take the install's
+// values as its boot takes them (upgradeCheck); prefix is the registry it comes from.
+func (h *Hostd) resetPlan(ctx context.Context, in *Installer, newBaseline bool, channel, version, token string, shown bool) (p ResetPlan, m *release.Manifest, prefix string, err error) {
+	if !newBaseline && (channel != "" || version != "") {
+		return ResetPlan{}, nil, "", fail(http.StatusBadRequest, "a channel or a version names the release new_baseline installs: reset-db resets the release the OS carries")
+	}
+	if p, err = h.resetCheck(ctx, in); err != nil || !newBaseline {
+		return p, nil, "", err
+	}
+	env, err := h.installed(in)
+	if err != nil {
+		return ResetPlan{}, nil, "", err
+	}
+	if m, _, err = h.target(ctx, in, env, channel, version); err != nil {
+		return ResetPlan{}, nil, "", err
+	}
+	newer, err := h.after(m)
+	switch {
+	case err != nil:
+		return ResetPlan{}, nil, "", err
+	case m.Yanked != nil:
+		return ResetPlan{}, nil, "", fail(http.StatusConflict, "%s %s is yanked: %s", m.Name, m.Tag, m.Yanked.Reason)
+	case in.leftByRollback(m.ProjectVersion, m.Revision):
+		return ResetPlan{}, nil, "", fail(http.StatusConflict, "the install went back from %s %s (revision %d): remove %s to cross to it again", m.Name, m.ProjectVersion, m.Revision, in.path(FailedDir))
+	case !newer:
+		return ResetPlan{}, nil, "", fail(http.StatusConflict, "%s %s (revision %d) does not come after %s (revision %d), which this OS runs: --new-baseline installs a later release", m.Name, m.ProjectVersion, m.Revision, h.R.Manifest.ProjectVersion, h.R.Manifest.Revision)
+	case m.Artifacts.OS == "":
+		return ResetPlan{}, nil, "", fail(http.StatusConflict, "%s %s was published without an OS bundle", m.Name, m.Tag)
+	}
+	prefix, _ = env.Get("STOWAGE_REGISTRY")
+	key := crossPlanned{installer: m.Artifacts.Installer, install: sha256.Sum256([]byte(strings.Join(env.Environ(nil), "\x00")))}
+	h.mu.Lock()
+	c := h.crossPlan
+	h.mu.Unlock()
+	if c != nil && !shown && token != "" && c.token == token && c.installer == key.installer && c.install == key.install {
+		return c.plan, m, prefix, nil
+	}
+	k, err := h.targetRelease(ctx, in, env, m)
+	if err != nil {
+		return ResetPlan{}, nil, "", err
+	}
+	from, to, ok := baselines(&in.O, in, k)
+	switch {
+	case !ok:
+		return ResetPlan{}, nil, "", fail(http.StatusConflict, "the schema baseline of %s %s or of %s %s cannot be told (the daemon's log says why): --new-baseline never wipes on a guess", m.Name, h.R.Manifest.ProjectVersion, m.Name, m.ProjectVersion)
+	case from == to:
+		return ResetPlan{}, nil, "", fail(http.StatusConflict, "%s %s starts the schema baseline the install runs: --new-baseline only crosses a baseline; `%s upgrade` moves it", m.Name, m.ProjectVersion, in.R.Ctl())
+	}
+	// What the boot's crossing wipes is told now, before the OS is written.
+	t, err := in.wipeOf(k)
+	var wipe, keep []string
+	if err == nil {
+		wipe, keep, _, _, err = t.wipeSet(in)
+	}
+	if err != nil {
+		return ResetPlan{}, nil, "", fail(http.StatusConflict, "%v", err)
+	}
+	if len(wipe) == 0 {
+		return ResetPlan{}, nil, "", fail(http.StatusConflict, "neither %s %s nor %s %s names a volume in data.reset: --new-baseline has nothing to wipe", m.Name, h.R.Manifest.ProjectVersion, m.Name, m.ProjectVersion)
+	}
+	kept := ""
+	if len(keep) > 0 {
+		kept = " (keeping " + strings.Join(keep, ", ") + ")"
+	}
+	if k.Release != nil {
+		if err := (&Installer{R: k.Release, O: in.O}).upgradeCheck(ctx, env); err != nil {
+			return ResetPlan{}, nil, "", fail(http.StatusConflict, "%v\nthe boot into %s would refuse it (it is given no input), so its OS is not written", err, m.Tag)
+		}
+	}
+	key.plan = ResetPlan{Target: Version{m.ProjectVersion, m.Revision},
+		Plan: fmt.Sprintf("write %s's OS and reboot into it; that boot stops %s, deletes its volumes %s%s, forgets what its provision hook returned, then installs %s, at schema baseline %d (from %d), with the same values",
+			m.Tag, m.Name, strings.Join(wipe, ", "), kept, m.ProjectVersion, to, from)}
+	if shown {
+		h.mu.Lock()
+		h.checkedPlan = &key
+		h.mu.Unlock()
+	}
+	return key.plan, m, prefix, nil
+}
+
+// shownReset is the plan a reset-db GET showed: a crossing or not, and its target.
+type shownReset struct {
+	newBaseline bool
+	target      Version
+}
+
+// crossPlanned is a crossing resetPlan checked: the target's installer (its digest), the install
+// it was checked against (its .env's digest), the plan, and the token of the GET that showed it,
+// whose POST alone takes it as it is.
+type crossPlanned struct {
+	installer string
+	install   [32]byte
+	plan      ResetPlan
+	token     string
 }
 
 // resetDB runs reset-db as a job: the install back to its first setup, without a reboot.
@@ -998,14 +1128,34 @@ func (h *Hostd) resetDB(w http.ResponseWriter, r *http.Request) {
 		replyErr(w, fail(http.StatusBadRequest, "reset-db wipes the install's data: confirm the release it resets (\"confirm\": {\"version\", \"revision\"}, GET reset-db's target)"))
 		return
 	}
+	if req.NewBaseline && req.NoProvision {
+		replyErr(w, fail(http.StatusBadRequest, "no_provision is not given to the boot that crosses the baseline: provision runs the hook afterwards"))
+		return
+	}
+	// A crossing's token for another plan is refused before the crossing is checked again, which
+	// fetches the target's installer (the job's start checks it once more, and uses it up).
+	if req.NewBaseline {
+		h.mu.Lock()
+		known := req.Token != "" && subtle.ConstantTimeCompare([]byte(req.Token), []byte(h.resetToken)) == 1
+		other := h.resetShown.newBaseline != req.NewBaseline
+		h.mu.Unlock()
+		switch {
+		case !known:
+			replyErr(w, fail(http.StatusConflict, "reset-db needs the token of the GET that showed its plan, once: look again"))
+			return
+		case other:
+			replyErr(w, fail(http.StatusConflict, "reset-db's token is the GET's that showed another plan: look again"))
+			return
+		}
+	}
 	in, _ := h.run()
-	p, err := h.resetCheck(r.Context(), in)
+	p, m, prefix, err := h.resetPlan(r.Context(), in, req.NewBaseline, req.Channel, req.Version, req.Token, false)
 	if err != nil {
 		replyErr(w, err)
 		return
 	}
 	if *req.Confirm != p.Target {
-		replyErr(w, fail(http.StatusConflict, "the install runs %s %s, not %s, which was confirmed: look again", h.R.Manifest.Name, p.Target, *req.Confirm))
+		replyErr(w, fail(http.StatusConflict, "reset-db would reset to %s %s, not %s, which was confirmed: look again", h.R.Manifest.Name, p.Target, *req.Confirm))
 		return
 	}
 	// The token a GET made, used once: a POST sent again, or one no GET preceded, is refused.
@@ -1013,11 +1163,32 @@ func (h *Hostd) resetDB(w http.ResponseWriter, r *http.Request) {
 		if req.Token == "" || subtle.ConstantTimeCompare([]byte(req.Token), []byte(h.resetToken)) != 1 {
 			return fail(http.StatusConflict, "reset-db needs the token of the GET that showed its plan, once: look again")
 		}
-		h.resetToken = ""
+		shown := h.resetShown
+		h.resetToken, h.resetShown = "", shownReset{}
+		if shown != (shownReset{req.NewBaseline, p.Target}) {
+			return fail(http.StatusConflict, "reset-db's token is the GET's that showed another plan: look again")
+		}
+		if m == nil {
+			return nil
+		}
+		if err := h.osWritten(); err != nil {
+			return fail(http.StatusConflict, "%v: reboot first, then reset-db", err)
+		}
+		if err := in.volumesSplit(); err != nil {
+			return fail(http.StatusConflict, "%v", err)
+		}
 		return nil
 	})
 	if err != nil {
 		replyErr(w, err)
+		return
+	}
+	if m != nil {
+		src := fmt.Sprintf("%s/%s-os@%s", prefix, m.Name, m.Artifacts.OS)
+		go h.osJob(j, in, m.Tag, prefix, src, true, "wipes the data and installs it", func() error {
+			return writeAtomic(newBaselineFile(in.O.Dir), strings.NewReader(m.Tag+"\n"), 0o600, nil)
+		})
+		accepted(w, j)
 		return
 	}
 	go func() {
@@ -1126,10 +1297,27 @@ func (h *Hostd) updates(w http.ResponseWriter, r *http.Request) {
 	}
 	cur := h.R.Manifest
 	left := in.leftByRollback(m.ProjectVersion, m.Revision)
+	rewrite := h.rewrites(m, env)
+	var installed *Version
+	if _, v, rev := runs(env); v != "" {
+		r, _ := strconv.Atoi(rev)
+		installed = &Version{v, r}
+	}
 	reply(w, http.StatusOK, Update{
 		Channel: channel, Current: Version{cur.ProjectVersion, cur.Revision}, Target: Version{m.ProjectVersion, m.Revision},
-		Available: newer && m.Yanked == nil && m.Artifacts.OS != "" && !left, LeftByRollback: left, Changelog: m.Changelog.Project,
+		Available: (newer || rewrite) && m.Yanked == nil && m.Artifacts.OS != "" && !left, LeftByRollback: left, Rewrite: rewrite, Installed: installed, Passive: !h.Docker && bootMode(h.O.cos()) == "passive", Changelog: m.Changelog.Project,
 	})
+}
+
+// rewrites reports whether an upgrade to m writes the running release's OS to the active slot
+// again: the VM runs the passive system, which a boot that failed went back to, and m is that
+// system's release. The active slot then holds the release that failed, which no later upgrade
+// replaces until one is published.
+func (h *Hostd) rewrites(m *release.Manifest, env *EnvFile) bool {
+	_, v, rev := runs(env)
+	this := h.R.Manifest
+	return !h.Docker && bootMode(h.O.cos()) == "passive" && m.ProjectVersion == this.ProjectVersion && m.Revision == this.Revision &&
+		v == this.ProjectVersion && rev == strconv.Itoa(this.Revision)
 }
 
 // booting refuses until <name>.service ran (active, or failed): before, the boot is queued or is
@@ -1414,6 +1602,7 @@ func (h *Hostd) upgrade(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	newer, err := h.after(m)
+	rewrite := !newer && h.rewrites(m, env)
 	switch {
 	case err != nil:
 		replyErr(w, err)
@@ -1427,15 +1616,16 @@ func (h *Hostd) upgrade(w http.ResponseWriter, r *http.Request) {
 	case m.Yanked != nil:
 		replyErr(w, fail(http.StatusConflict, "%s %s is yanked: %s", m.Name, m.Tag, m.Yanked.Reason))
 		return
-	case !newer:
+	case !newer && !rewrite:
 		replyErr(w, fail(http.StatusConflict, "%s %s (revision %d) does not come after %s (revision %d), which this OS runs", m.Name, m.ProjectVersion, m.Revision, h.R.Manifest.ProjectVersion, h.R.Manifest.Revision))
 		return
 	case m.Artifacts.OS == "":
 		replyErr(w, fail(http.StatusConflict, "%s %s was published without an OS bundle", m.Name, m.Tag))
 		return
 	}
-	// What the boot into it would refuse is refused now, before its OS is written.
-	if !first {
+	// What the boot into it would refuse is refused now, before its OS is written. The release
+	// the install runs, rewritten, has nothing to refuse.
+	if !first && !rewrite {
 		if err := h.checkUpgrade(r.Context(), in, env, m); err != nil {
 			replyErr(w, err)
 			return
@@ -1461,38 +1651,57 @@ func (h *Hostd) upgrade(w http.ResponseWriter, r *http.Request) {
 	}
 	reboot := req.Reboot == nil || *req.Reboot
 	does := "upgrades the install"
-	if first {
+	switch {
+	case first:
 		does = "makes the first install"
+	case rewrite:
+		does = "runs it from the active slot again"
 	}
 	go func() {
-		if !req.SkipBackup && !first {
+		if !req.SkipBackup && !first && !rewrite {
 			h.preflightBackup(in, func(format string, a ...any) { h.logf(j, format, a...) })
 		}
-		// Marked before kairos-agent runs, and kept when it fails: it may have moved the running
-		// system to the passive slot already.
-		err := os.WriteFile(filepath.Join(h.Run, osWritten), []byte(m.Tag+"\n"), 0o600)
-		if err == nil && first {
+		h.osJob(j, in, m.Tag, prefix, src, reboot, does, func() error {
+			// An upgrade crosses no baseline: a crossing asked before, whose OS never booted, is
+			// not this release's to make.
+			if err := os.Remove(newBaselineFile(in.O.Dir)); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return err
+			}
+			if !first {
+				return nil
+			}
 			// The boot into it makes the first install of that release, whatever release the
 			// settings name.
-			err = writeAtomic(osUpgradeFile(in.O.Dir), strings.NewReader(m.Tag+"\n"), 0o600, nil)
-		}
-		if err == nil {
-			err = h.writeOS(in, j, prefix, src)
-		}
-		if err == nil {
-			err = h.retry(j)
-		}
-		switch {
-		case err == nil && reboot:
-			if err = h.schedule("reboot", 30, false, j, fmt.Sprintf("rebooting into %s in 30 s: the boot %s", m.Tag, does)); err == nil {
-				return // ended by schedule, with its reboot
-			}
-		case err == nil:
-			h.logf(j, "%s is written: the next boot runs it and %s", m.Tag, does)
-		}
-		h.finish(j, err)
+			return writeAtomic(osUpgradeFile(in.O.Dir), strings.NewReader(m.Tag+"\n"), 0o600, nil)
+		})
 	}()
 	accepted(w, j)
+}
+
+// osJob ends job j: it writes the OS of release tag from src into the passive slot, mark run
+// first, and reboots into it (unless reboot is false: the next boot runs it), whose boot does
+// what does says. The written mark is set before kairos-agent runs and kept when it fails: it may
+// have moved the running system to the passive slot already.
+func (h *Hostd) osJob(j *job, in *Installer, tag, prefix, src string, reboot bool, does string, mark func() error) {
+	err := os.WriteFile(filepath.Join(h.Run, osWritten), []byte(tag+"\n"), 0o600)
+	if err == nil {
+		err = mark()
+	}
+	if err == nil {
+		err = h.writeOS(in, j, prefix, src)
+	}
+	if err == nil {
+		err = h.retry(j)
+	}
+	switch {
+	case err == nil && reboot:
+		if err = h.schedule("reboot", 30, false, j, fmt.Sprintf("rebooting into %s in 30 s: the boot %s", tag, does)); err == nil {
+			return // ended by schedule, with its reboot
+		}
+	case err == nil:
+		h.logf(j, "%s is written: the next boot runs it and %s", tag, does)
+	}
+	h.finish(j, err)
 }
 
 // writeOS runs kairos-agent upgrade from src, with a private Docker config holding the pull

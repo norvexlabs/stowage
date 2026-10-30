@@ -19,7 +19,10 @@
 # reset-db` deletes the release's claim, forgets what the hook returned and installs it again with
 # the same values and Secret → `k8s uninstall` is refused without --data (helm would delete the
 # chart's own claim), then `--data` removes the release, its Secrets, the hook's account and the
-# claim, and keeps the namespace.
+# claim, and keeps the namespace → the previous Stowage (the latest release tag, built once from it)
+# ships 3.0.0 at schema baseline 1 and installs it; this one ships 4.0.0 at baseline 2, whose
+# `k8s upgrade` is refused naming the previous release's baseline, and `k8s reset-db
+# --new-baseline` crosses.
 set -euo pipefail
 
 # The amd64 image of the example's postgres: mirroring copies every platform of an index.
@@ -166,5 +169,39 @@ for o in secret/notes-stowage secret/notes-stowage-provision serviceaccount/note
 	[[ -z $(kubectl get -n "$NS" "$o" --ignore-not-found -o name) ]] || fail "$o is left"
 done
 kubectl get namespace "$NS" >/dev/null || fail "the namespace was deleted"
+
+# baseline <n>: the project's schema compat becomes sql at schema baseline n.
+baseline() {
+	python3 - "$P/stowage.yaml" "$1" <<'PY'
+import re, sys
+path, n = sys.argv[1:]
+s = open(path).read()
+s, k = re.subn(r"  schema_compat:\n(    .*\n)+", f"  schema_compat:\n    provider: sql\n    current: \"SELECT 1\"\n    baseline: {n}\n", s, count=1)
+assert k == 1, "schema_compat"
+open(path, "w").write(s)
+PY
+}
+step "across Stowage versions: the previous Stowage's release, at baseline 1, crosses to this one's at baseline 2"
+prev=$(prev_stowage)
+S_NOW=("${S[@]}")
+S=("$prev" "${S[@]:1}")
+"${S[@]}" lock --update >/dev/null # a project publishes with the stowage its lock pins
+baseline 1
+release 3.0.0
+installer v3.sh
+ctl v3.sh k8s install --no-input --set ADMIN_EMAIL=admin@notes.test --timeout 3m >"$WORK/install3.log" 2>&1 ||
+	{ cat "$WORK/install3.log"; cluster_logs >&2; fail "k8s install of the previous Stowage's 3.0.0"; }
+runs 3.0.0 1
+S=("${S_NOW[@]}")
+"${S[@]}" lock --update >/dev/null
+baseline 2
+release 4.0.0
+installer v4.sh
+if ctl v4.sh k8s upgrade --no-input --timeout 3m >"$WORK/up4.log" 2>&1; then fail "an upgrade crossed a schema baseline"; fi
+grep -q 'notes 4.0.0 starts schema baseline 2, and release notes in notes runs notes 3.0.0, at baseline 1' "$WORK/up4.log" && grep -q -- '--new-baseline` wipes it' "$WORK/up4.log" ||
+	{ cat "$WORK/up4.log"; fail "the upgrade's refusal does not tell the previous Stowage's baseline"; }
+ctl v4.sh k8s reset-db --new-baseline --yes --timeout 3m >"$WORK/cross.log" 2>&1 || { cat "$WORK/cross.log"; cluster_logs >&2; fail "k8s reset-db --new-baseline"; }
+runs 4.0.0 1
+ctl v4.sh k8s uninstall --data --yes --timeout 3m >"$WORK/uninstall4.log" 2>&1 || { cat "$WORK/uninstall4.log"; fail "k8s uninstall --data after the crossing"; }
 
 printf '\nPASS\n'

@@ -555,6 +555,32 @@ remove_cluster() {
 	[[ -n ${REG:-} ]] || return 0
 	docker images --format '{{.Repository}}:{{.Tag}}' --filter "reference=$REG/${NAME:-notes}/*" | xargs -r docker rmi >/dev/null 2>&1 || true
 }
+# prev_stowage: the path of the previous release's stowage — the latest v* tag but this tree's
+# own version — built from that tag with its own `make build` (in Docker) once, then kept in
+# ~/.cache/stowage-prev/<tag>; its git worktree is removed once built.
+prev_stowage() (
+	# A subshell: its EXIT trap cleans the build up however it ends, and leaves the suite's own.
+	local cur tag dir out
+	cur=$(sed -n 's/^## \[\([^]]*\)\].*/\1/p' "$REPO/CHANGELOG.md" | head -n1)
+	tag=$(git -C "$REPO" tag --list 'v*' --sort=-v:refname | { grep -vxF "v$cur" || true; } | head -n1)
+	[[ -n $tag ]] || fail "no previous release tag"
+	out=$HOME/.cache/stowage-prev/$tag/stowage
+	if [[ ! -x $out ]]; then
+		mkdir -p "$HOME/.cache" || fail "no $HOME/.cache"
+		dir=$(mktemp -d "$HOME/.cache/stowage-prev-tree.XXXXXX") || fail "mktemp in $HOME/.cache"
+		# The tree, its log and a half-kept binary go whichever way the build ends.
+		trap 'git -C "$REPO" worktree remove --force "$dir" >/dev/null 2>&1; rm -rf "$dir" "$dir.log" "$out.tmp"' EXIT
+		git -C "$REPO" worktree add --detach "$dir" "$tag" >&2 || fail "worktree of $tag"
+		# Its binary alone: the tag's checks ran when it was released, and a vulnerability
+		# published since says nothing of this tree.
+		sed -i '/^COPY --from=checks /d' "$dir/Dockerfile"
+		# Its output goes to stderr: the caller takes the path from stdout.
+		make -C "$dir" build >"$dir.log" 2>&1 || { cat "$dir.log" >&2; fail "build of $tag"; }
+		mkdir -p "$(dirname "$out")"
+		{ cp "$dir/bin/stowage" "$out.tmp" && mv "$out.tmp" "$out"; } || fail "keeping the build of $tag in $out"
+	fi
+	printf '%s\n' "$out"
+)
 # ctl <installer script> <args…>: the bootstrap script, run as the operator in $OP.
 ctl() {
 	local s=$1

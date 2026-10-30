@@ -22,6 +22,7 @@ import (
 	"github.com/norvexlabs/stowage/internal/providers"
 	"github.com/norvexlabs/stowage/internal/publish"
 	"github.com/norvexlabs/stowage/internal/registry"
+	"github.com/norvexlabs/stowage/internal/release"
 	"github.com/norvexlabs/stowage/internal/sbom"
 	"github.com/norvexlabs/stowage/internal/spec"
 )
@@ -273,13 +274,62 @@ func (o *options) openPublisher(channel *string, a access) (*project.Project, *p
 	return p, pub, err
 }
 
-func (o *options) printRelease(r *publish.Ref) error {
+func (o *options) printRelease(p *project.Project, r *publish.Ref) error {
 	if o.json {
 		return o.emitJSON(map[string]any{"digest": r.Digest.String(), "manifest": r.Manifest})
 	}
 	m := r.Manifest
 	fmt.Fprintf(o.out, "%s %s revision %d · channel %s · tag %s · seq %d\n%s\n", m.Name, m.ProjectVersion, m.Revision, m.Channel, m.Tag, m.ReleaseSeq, r.Digest)
+	for _, l := range shapeLines(p.Spec, m) {
+		fmt.Fprintln(o.out, l)
+	}
 	return nil
+}
+
+// shapeLines name what the release can install, one line per shape the spec declares: the kairos
+// shape's says whether vm create has disks to boot (the release's own, or those its manifest
+// records from its channel) or is refused, with the ship that publishes them. A release on an
+// immutable channel keeps the artifacts it was published with, so its disks come with the next
+// revision; a mutable channel's same revision takes them.
+func shapeLines(s *spec.Spec, m *release.Manifest) []string {
+	var out []string
+	a := m.Artifacts
+	for _, sh := range s.Shapes.Names() {
+		// What the release carries tells its shapes where it can: a chart, an OS bundle.
+		switch {
+		case sh == "kubernetes" && a.Chart == nil:
+			out = append(out, "kubernetes: no chart — k8s install refused")
+			continue
+		case sh == "kairos" && a.OS == "":
+			out = append(out, "kairos: no OS bundle — vm create and VM upgrades refused")
+			continue
+		case sh != "kairos":
+			out = append(out, sh+": installable")
+			continue
+		}
+		switch {
+		case len(a.Disks) > 0:
+			var formats []string
+			for _, f := range spec.DiskFormats {
+				if a.Disks[f] != "" {
+					formats = append(formats, f)
+				}
+			}
+			out = append(out, "kairos: disks "+strings.Join(formats, ", "))
+		case a.BootDisks != nil:
+			out = append(out, fmt.Sprintf("kairos: no disks of its own — vm create boots %s's disks, then writes this release's OS", a.BootDisks.Release))
+		case len(s.Shapes.Kairos.DiskFormats) == 0:
+			out = append(out, "kairos: no disk_formats — the OS bundle alone, which upgrades a VM; vm create refused")
+		default:
+			rev := m.Revision + 1
+			if ch, ok := s.Channels[m.Channel]; ok && ch.Mutable {
+				rev = m.Revision
+			}
+			out = append(out, fmt.Sprintf("kairos: no disks — vm create refused; a ship of %s with them publishes them (stowage ship --disks --channel %s --revision %d, from a tree at %s)",
+				m.ProjectVersion, m.Channel, rev, m.ProjectVersion))
+		}
+	}
+	return out
 }
 
 // printBootstrap prints how an operator gets the release's bootstrap script: its installer by
@@ -355,7 +405,7 @@ func (o *options) ship(ctx context.Context, channel string, revision int, want s
 		}
 	}
 	r, err := pub.Ship(ctx, publish.ShipOptions{Version: v, Channel: channel, Revision: revision, Disks: disks})
-	if err := o.published(r, err); err != nil {
+	if err := o.published(p, r, err); err != nil {
 		return err
 	}
 	o.printBootstrap(p, r)
@@ -364,10 +414,10 @@ func (o *options) ship(ctx context.Context, channel string, revision int, want s
 
 // published prints a release a ship or a promote published. A cleanup that failed after it is
 // said apart, with exit status 3: the release is out, and is not shipped again.
-func (o *options) published(r *publish.Ref, err error) error {
+func (o *options) published(p *project.Project, r *publish.Ref, err error) error {
 	var ce *publish.CleanupError
 	if errors.As(err, &ce) && r != nil {
-		if perr := o.printRelease(r); perr != nil {
+		if perr := o.printRelease(p, r); perr != nil {
 			return perr
 		}
 		fmt.Fprintf(o.err, "stowage: %v\n", ce)
@@ -376,7 +426,7 @@ func (o *options) published(r *publish.Ref, err error) error {
 	if err != nil {
 		return err
 	}
-	return o.printRelease(r)
+	return o.printRelease(p, r)
 }
 
 func shipCmd(o *options) *cobra.Command {
@@ -406,7 +456,7 @@ func verifyCmd(o *options) *cobra.Command {
 		Short: "Check a release (or the channel pointer's) is complete and digest-exact on the registry",
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			_, pub, err := o.openPublisher(&channel, readAccess)
+			p, pub, err := o.openPublisher(&channel, readAccess)
 			if err != nil {
 				return err
 			}
@@ -418,7 +468,7 @@ func verifyCmd(o *options) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			if err := o.printRelease(r); err != nil {
+			if err := o.printRelease(p, r); err != nil {
 				return err
 			}
 			if !o.json {
@@ -466,7 +516,7 @@ func promoteCmd(o *options) *cobra.Command {
 				return err
 			}
 			r, err := pub.Promote(cmd.Context(), v, from, to, revision)
-			if err := o.published(r, err); err != nil {
+			if err := o.published(p, r, err); err != nil {
 				return err
 			}
 			o.printBootstrap(p, r)

@@ -18,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/norvexlabs/stowage/internal/release"
 	"github.com/norvexlabs/stowage/internal/spec"
 	"github.com/norvexlabs/stowage/internal/truenas"
 )
@@ -816,6 +817,40 @@ func TestDestroyVMAfterAFailedApply(t *testing.T) {
 	in := v.installer(r.mod(nil))
 	if err := in.DestroyVM(context.Background(), &VMDestroy{Host: "notes-1", Yes: true, Ctl: "/opt/notes-stow"}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// vm destroy says, before it asks, when no disk of the release or its channel would make the VM
+// again, or when whether one would is not known; neither stops the destroy.
+func TestDestroyVMSaysWhenNoDiskMakesItAgain(t *testing.T) {
+	t.Parallel()
+	v := newVMCreate(t, "qcow2")
+	r := newTofuRun(t)
+	if err := v.create(tofuCreate(), r.mod(nil)); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	destroy := func(yes bool) (string, error) {
+		v.env.out.Reset()
+		err := v.installer(r.mod(nil)).DestroyVM(ctx, &VMDestroy{Host: "notes-1", Yes: yes, Ctl: "/opt/notes-stow"})
+		return v.out2(), err
+	}
+	if out, err := destroy(false); err == nil || !strings.Contains(err.Error(), "give --yes") || strings.Contains(out, "Warning") || strings.Contains(out, "not known") {
+		t.Fatalf("its disk there: %v %q", err, out)
+	}
+	v.r.Manifest.Artifacts.Disks = nil
+	want := "Warning: notes 1.0.0 has no disk in " + v.prefix + ", nor does its channel stable: the publisher ships a release with its disks (stowage ship --disks); until then, a VM destroyed is not created again.\n"
+	if out, err := destroy(false); err == nil || !strings.Contains(err.Error(), "give --yes") || out != want {
+		t.Fatalf("no disk: %v %q", err, out)
+	}
+	unread := release.DiskSetTag("stable")
+	v.downFor.Store(&unread)
+	if out, err := destroy(false); err == nil || !strings.HasPrefix(out, "Whether a VM of notes 1.0.0 can be created again is not known: its disks in "+v.prefix+" could not be read (") {
+		t.Fatalf("a registry refusing: %v %q", err, out)
+	}
+	v.downFor.Store(nil)
+	if out, err := destroy(true); err != nil || !strings.HasPrefix(out, want) || !strings.Contains(out, "Destroyed notes-1.") {
+		t.Fatalf("--yes: %v %q", err, out)
 	}
 }
 

@@ -147,6 +147,7 @@ func TestPublisherFieldsChangeNoDigest(t *testing.T) {
 	testutil.Edit(t, root, "stowage.yaml", "user: publisher, token_env: STOWAGE_PUSH_TOKEN", "user: ci, token_env: CI_PUSH_TOKEN")
 	testutil.Edit(t, root, "stowage.yaml", `dev:    { tag: "v{v}-dev"`, `dev:    { tag: "v{v}-nightly"`)
 	testutil.Edit(t, root, "stowage.yaml", "key: env://ATLAS_SIGNING_KEY", "key: hashivault://atlas")
+	testutil.Edit(t, root, "stowage.yaml", "disks: opt-in", "disks: always")
 	if c := changed(before, inputs(build(t, root))); len(c) > 0 {
 		t.Errorf("publisher-only edits changed %v", c)
 	}

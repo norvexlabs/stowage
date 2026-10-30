@@ -1375,6 +1375,7 @@ func TestTheFirstBootInstallsTheReleaseAnUpgradeWrote(t *testing.T) {
 	}
 	host = &fakeHost{}
 	in = e.installer(func(o *Options) { with(o); o.Host = host })
+	in.R.Manifest.Tag = "1.0.0-1" // as a release's: an empty mark names no release
 	if err := os.WriteFile(osUpgradeFile(e.dir), []byte(in.R.Manifest.Tag+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -1399,5 +1400,166 @@ func TestTheFirstBootInstallsTheReleaseAnUpgradeWrote(t *testing.T) {
 	}
 	if _, err := os.Stat(osUpgradeFile(e.dir)); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("the mark outlived a boot of the install: %v", err)
+	}
+}
+
+// The boot on the OS a reset-db --new-baseline wrote wipes the data and installs its release,
+// once; without its mark, or with one naming another release, it refuses as an upgrade does.
+func TestBootCrossesTheBaselineAResetAsked(t *testing.T) {
+	t.Parallel()
+	boot := func(t *testing.T, mark string) (*env, [][]string, error) {
+		t.Helper()
+		e := vmEnv(t, "1.0.0")
+		if err := e.install(vm); err != nil {
+			t.Fatal(err)
+		}
+		e.docker.answer = volumes(get(e.readEnv(), "COMPOSE_PROJECT_NAME"), e.docker.answer)
+		e.r, e.self = bundledInstaller(t, "2.0.0", 1, atBaseline(2))
+		e.r.Manifest.Tag = "2.0.0-1"
+		if mark == "this OS's" {
+			mark = e.r.Manifest.Tag
+		}
+		if mark != "" {
+			if err := os.WriteFile(newBaselineFile(e.dir), []byte(mark+"\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		var ran [][]string
+		in := e.installer(vm)
+		in.O.Exec = func(_ context.Context, _ string, args []string) error {
+			ran = append(ran, args)
+			return nil
+		}
+		return e, ran, in.Boot(context.Background())
+	}
+	_, _, err := boot(t, "")
+	if err == nil || !strings.Contains(err.Error(), "starts schema baseline 2") {
+		t.Fatalf("no mark: %v", err)
+	}
+	e, _, err := boot(t, "1.9.0-1")
+	if err == nil || !strings.Contains(err.Error(), "starts schema baseline 2") {
+		t.Fatalf("another release's mark: %v", err)
+	}
+	if _, err := os.Stat(newBaselineFile(e.dir)); !os.IsNotExist(err) {
+		t.Errorf("another release's mark is kept: %v", err)
+	}
+	e, ran, err := boot(t, "this OS's")
+	if err != nil {
+		t.Fatalf("%v\n%s", err, e.log)
+	}
+	if v := get(e.readEnv(), "STOWAGE_PROJECT_VERSION"); v != "2.0.0" {
+		t.Errorf("the install runs %s", v)
+	}
+	if n := len(e.docker.ran("volume rm")); n != 2 {
+		t.Errorf("%d volumes removed", n)
+	}
+	if len(ran) != 0 {
+		t.Errorf("brought the old stack up for a dump: %v", ran)
+	}
+	if _, err := os.Stat(newBaselineFile(e.dir)); !os.IsNotExist(err) {
+		t.Errorf("the mark is kept: %v", err)
+	} // Its health gate failed: Kairos boots the older OS, which cannot run the install, nor go back.
+	e.r, e.self = bundledInstaller(t, "1.0.0", 1, nil)
+	if err := e.installer(vm).Boot(context.Background()); err == nil ||
+		!strings.Contains(err.Error(), "the install runs notes 2.0.0 (revision 1), after this OS's 1.0.0 (revision 1), and keeps no release to go back to") ||
+		!strings.Contains(err.Error(), "`notes-stow upgrade --version 2.0.0` writes its OS again") {
+		t.Fatalf("on the older OS: %v", err)
+	}
+	// A later OS is an upgrade like any, which drops the record of the crossing.
+	e.r, e.self = bundledInstaller(t, "3.0.0", 1, atBaseline(2))
+	if err := e.installer(vm).Boot(context.Background()); err != nil {
+		t.Fatalf("on a later OS: %v\n%s", err, e.log)
+	}
+	if v := get(e.readEnv(), "STOWAGE_PROJECT_VERSION"); v != "3.0.0" {
+		t.Errorf("runs %s", v)
+	}
+	if _, err := os.Stat(filepath.Join(e.dir, crossedFile)); !os.IsNotExist(err) {
+		t.Errorf("the record of the crossing outlived the upgrade: %v", err)
+	}
+}
+
+// The first install has one decider: the release the settings name. An operator's install on the
+// OS of another release, before the boot wrote that release's OS, is refused; once an upgrade
+// wrote this OS's release, or the settings name it, it installs.
+func TestTheOperatorsFirstInstallWaitsForTheReleaseTheSettingsName(t *testing.T) {
+	t.Parallel()
+	e := vmEnv(t, "1.0.0")
+	e.r.Manifest.Tag = "1.0.0-1"
+	with := settings(t, "inputs: { ADMIN_EMAIL: ops@example.org }\nrelease: { version: 0.9.0, revision: 1, tag: 0.9.0-1, os: \"sha256:"+strings.Repeat("a", 64)+"\" }\n")
+	err := e.installer(with).withSettings()
+	if err == nil || !strings.Contains(err.Error(), "names notes 0.9.0 (revision 1) as the first install, and this OS carries 1.0.0 (revision 1): the boot writes that release's OS bundle and reboots into it") {
+		t.Fatalf("%v", err)
+	}
+	e.nothingWritten()
+	if err := os.WriteFile(osUpgradeFile(e.dir), []byte("1.0.0-1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.installer(with).withSettings(); err != nil {
+		t.Fatalf("after an upgrade wrote this OS: %v", err)
+	}
+	same := settings(t, "inputs: { ADMIN_EMAIL: ops@example.org }\nrelease: { version: 1.0.0, revision: 1, tag: 1.0.0-1, os: \"sha256:"+strings.Repeat("a", 64)+"\" }\n")
+	if err := os.Remove(osUpgradeFile(e.dir)); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.installer(same).withSettings(); err != nil {
+		t.Fatalf("the release the settings name: %v", err)
+	}
+}
+
+// A crossing's mark is used up by the next boot whichever way it goes: a boot that brings its own
+// release up again removes one naming another release.
+func TestABootOnItsOwnReleaseUsesTheCrossingsMarkUp(t *testing.T) {
+	t.Parallel()
+	e := vmEnv(t, "1.0.0")
+	if err := e.install(vm); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(newBaselineFile(e.dir), []byte("2.0.0-1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.installer(vm).Boot(context.Background()); err != nil {
+		t.Fatalf("%v\n%s", err, e.log)
+	}
+	if _, err := os.Stat(newBaselineFile(e.dir)); !os.IsNotExist(err) {
+		t.Errorf("the mark outlived the boot: %v", err)
+	}
+}
+
+// A crossing that fails keeps its mark: the next boot on that OS tries it again, as the operator
+// cannot ask it from there; the one that makes it removes the mark.
+func TestACrossingThatFailsIsTriedAgainByTheNextBoot(t *testing.T) {
+	t.Parallel()
+	e := vmEnv(t, "1.0.0")
+	if err := e.install(vm); err != nil {
+		t.Fatal(err)
+	}
+	project := get(e.readEnv(), "COMPOSE_PROJECT_NAME")
+	down := errors.New("down failed")
+	e.docker.answer = volumes(project, func(a string) ([]byte, bool, error) {
+		if strings.Contains(a, " down ") && down != nil {
+			return nil, true, down
+		}
+		return nil, false, nil
+	})
+	e.r, e.self = bundledInstaller(t, "2.0.0", 1, atBaseline(2))
+	e.r.Manifest.Tag = "2.0.0-1"
+	if err := os.WriteFile(newBaselineFile(e.dir), []byte("2.0.0-1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.installer(vm).Boot(context.Background()); err == nil || !strings.Contains(err.Error(), "down failed") {
+		t.Fatalf("%v", err)
+	}
+	if _, err := os.Stat(newBaselineFile(e.dir)); err != nil {
+		t.Fatalf("the failed crossing's mark is gone: %v", err)
+	}
+	down = nil
+	if err := e.installer(vm).Boot(context.Background()); err != nil {
+		t.Fatalf("%v\n%s", err, e.log)
+	}
+	if v := get(e.readEnv(), "STOWAGE_PROJECT_VERSION"); v != "2.0.0" {
+		t.Errorf("runs %s", v)
+	}
+	if _, err := os.Stat(newBaselineFile(e.dir)); !os.IsNotExist(err) {
+		t.Errorf("the mark outlived the crossing: %v", err)
 	}
 }

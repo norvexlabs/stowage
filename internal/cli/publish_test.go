@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -85,7 +86,7 @@ func TestPublishCommands(t *testing.T) {
 	if err != nil {
 		t.Fatalf("%v\n%s", err, logs)
 	}
-	if !strings.Contains(out, "notes 1.0.0 revision 1 · channel beta · tag beta-1.0.0 · seq 1") || b.n != 6 {
+	if !strings.Contains(out, "notes 1.0.0 revision 1 · channel beta · tag beta-1.0.0 · seq 1") || !strings.Contains(out, "\ndocker: installable\nkubernetes: installable\n") || b.n != 6 {
 		t.Fatalf("ship output (%d builds):\n%s", b.n, out)
 	}
 	// Read-only commands use the pull account (here anonymous): no publisher token needed.
@@ -393,4 +394,48 @@ func runAt(t *testing.T, b *randomBuilder, env map[string]string, now time.Time,
 	cmd.SetArgs(args)
 	err := cmd.ExecuteContext(context.Background())
 	return out.String(), errOut.String(), err
+}
+
+// The summary names what each shape can install: the kairos shape's says whether vm create has
+// disks to boot, and the ship that publishes them, a new revision on an immutable channel.
+func TestShapeLines(t *testing.T) {
+	t.Parallel()
+	s, err := spec.Parse([]byte(`apiVersion: stowage/v1
+name: notes
+channels:
+  stable: { tag: "{v}" }
+  beta: { tag: "beta-{v}", mutable: true }
+shapes:
+  docker: {}
+  kairos: { disk_formats: [qcow2] }
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct {
+		name    string
+		channel string
+		a       release.Artifacts
+		want    string
+	}{
+		{"own disks", "stable", release.Artifacts{Disks: map[string]string{"qcow2": "sha256:a", "raw": "sha256:b"}}, "kairos: disks raw, qcow2"},
+		{"channel's disks", "stable", release.Artifacts{BootDisks: &release.BootDisks{Release: "1.0.0"}}, "kairos: no disks of its own — vm create boots 1.0.0's disks, then writes this release's OS"},
+		{"none, immutable", "stable", release.Artifacts{}, "kairos: no disks — vm create refused; a ship of 1.2.0 with them publishes them (stowage ship --disks --channel stable --revision 3, from a tree at 1.2.0)"},
+		{"none, mutable", "beta", release.Artifacts{}, "kairos: no disks — vm create refused; a ship of 1.2.0 with them publishes them (stowage ship --disks --channel beta --revision 2, from a tree at 1.2.0)"},
+	} {
+		c.a.OS = "sha256:os"
+		got := shapeLines(s, &release.Manifest{ProjectVersion: "1.2.0", Channel: c.channel, Revision: 2, Artifacts: c.a})
+		if want := []string{"docker: installable", c.want}; !slices.Equal(got, want) {
+			t.Errorf("%s: %q, want %q", c.name, got, want)
+		}
+	}
+	// A release without an OS bundle (published before the tree declared the shape, or a build
+	// that left it out) says the VM refuses it.
+	if got := shapeLines(s, &release.Manifest{Channel: "stable", Revision: 2}); !slices.Equal(got, []string{"docker: installable", "kairos: no OS bundle — vm create and VM upgrades refused"}) {
+		t.Errorf("no OS bundle: %q", got)
+	}
+	s.Shapes.Kairos.DiskFormats = nil
+	if got := shapeLines(s, &release.Manifest{Channel: "stable", Revision: 2, Artifacts: release.Artifacts{OS: "sha256:os"}}); got[1] != "kairos: no disk_formats — the OS bundle alone, which upgrades a VM; vm create refused" {
+		t.Errorf("no disk_formats: %q", got)
+	}
 }

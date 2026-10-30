@@ -58,7 +58,7 @@ func TestHookPostCommit(t *testing.T) {
 		strings.Join(l[0].args, " ") != "-C "+root+" hook post-commit --channel stable --ship 1.0.0 --commit "+head {
 		t.Fatalf("launch: %v %+v", err, l)
 	}
-	if want := "stowage hook: release 1.0.0: ship to channel stable started in the background\n  follow: tail -f " + wantLog + "\n"; out != want {
+	if want := "stowage hook: release 1.0.0: ship to channel stable started in the background, without disks (vm create of it refused unless the channel's disks boot it)\n  follow: tail -f " + wantLog + "\n"; out != want {
 		t.Fatalf("output:\n%s", out)
 	}
 	// The disks: by the hook's flag, or by the commit's environment.
@@ -68,14 +68,31 @@ func TestHookPostCommit(t *testing.T) {
 	}{{nil, []string{"--disks"}}, {map[string]string{"STOWAGE_SHIP_DISKS": "1"}, nil}, {map[string]string{"STOWAGE_SHIP_DISKS": "TRUE"}, nil}} {
 		out, _, l, err := runHook(t, nil, c.env, append([]string{"-C", root, "hook", "post-commit"}, c.args...)...)
 		if err != nil || len(l) != 1 || !strings.HasSuffix(strings.Join(l[0].args, " "), "--commit "+head+" --disks") ||
-			!strings.HasPrefix(out, "stowage hook: release 1.0.0, with its disks,: ship") {
+			!strings.HasPrefix(out, "stowage hook: release 1.0.0: ship to channel stable started in the background, with its disks\n") {
 			t.Fatalf("disks %v %v: %v %+v %q", c.env, c.args, err, l, out)
 		}
 	}
 	if _, _, l, _ := runHook(t, nil, map[string]string{"STOWAGE_SHIP_DISKS": "0"}, "-C", root, "hook", "post-commit"); len(l) != 1 || slices.Contains(l[0].args, "--disks") {
 		t.Fatalf("STOWAGE_SHIP_DISKS=0: %+v", l)
 	}
+	// Or by the spec's policy; a project without the kairos shape has no disks to speak of.
 	spec := filepath.Join(root, "stowage.yaml")
+	raw, err := os.ReadFile(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	testutil.Edit(t, root, "stowage.yaml", "    disk_formats: [qcow2]\n", "    disk_formats: [qcow2]\n    disks: always\n")
+	if out, _, l, err := runHook(t, nil, nil, "-C", root, "hook", "post-commit"); err != nil || len(l) != 1 || !slices.Contains(l[0].args, "--disks") ||
+		!strings.Contains(out, "started in the background, with its disks\n") {
+		t.Fatalf("disks: always: %v %+v %q", err, l, out)
+	}
+	testutil.SetYAML(t, root, "stowage.yaml", []string{"shapes", "kairos"}, nil)
+	if out, _, l, err := runHook(t, nil, nil, "-C", root, "hook", "post-commit"); err != nil || len(l) != 1 || strings.Contains(out, "disks") {
+		t.Fatalf("no kairos shape: %v %+v %q", err, l, out)
+	}
+	if err := os.WriteFile(spec, raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
 	if _, _, l, _ := runHook(t, nil, nil, "-C", root, "-f", spec, "hook", "post-commit", "--channel", "beta"); len(l) != 1 ||
 		strings.Join(l[0].args, " ") != "-C "+root+" -f "+spec+" hook post-commit --channel beta --ship 1.0.0 --commit "+head {
 		t.Fatalf("launch with -f and --channel: %+v", l)

@@ -93,6 +93,9 @@ type Options struct {
 	DryRun      bool // check and print what would be written, write nothing
 	NoProvision bool // start the stack without running the provision hook
 	Yes         bool // reset-db: wipe without asking
+	// NewBaseline lets reset-db wipe an install of a release that runs another schema baseline
+	// than this installer's release, and install this one: the only way across a baseline.
+	NewBaseline bool
 	// Self is the running installer, kept in the install as <short>-stow; empty keeps none.
 	Self string
 	// SelfExe is the running executable itself (/proc/self/exe), copied in Self's place: the file
@@ -195,6 +198,11 @@ type Installer struct {
 	dropped removed
 	// upgraded: Upgrade moved the install to this release (not a no-op, not a dry run).
 	upgraded bool
+	// crossing makes Upgrade cross a schema baseline, wiping the data (reset-db --new-baseline).
+	crossing *crossing
+	// outputs is the provision hook's outputs file of a release another Stowage built, whose spec
+	// is read for its wipe alone (wipeOf).
+	outputs string
 	// preloadErr: the VM's preload unit failed when this run waited for it (awaitPreload).
 	preloadErr error
 	// goOn names the inputs review's choice to go on; empty is the install's.

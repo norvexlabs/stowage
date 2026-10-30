@@ -317,11 +317,24 @@ pushed artifact.
   registry deletes tags alone; another retired tag stays.
 - **Disk sets.** A disk set is several GB a release, while most releases move only the OS bundle
   and the images: `ship` publishes disks only with `--disks`, the publisher's call (the post-commit
-  hook passes it from the hook's own flag or the commit's environment). A release without disks
+  hook passes it from the hook's own flag or the commit's environment), or with every ship when
+  the spec says `shapes.kairos.disks: always` — a publisher-only key, dropped from the runtime
+  view (`RuntimeView`, which the bundle view copies from) so it enters no inputs digest. The
+  decision is shown where it is made: the ship's summary says per shape what the release can
+  install, and for kairos whether `vm create` boots its own disks, its channel's, or is refused,
+  with the ship that fixes it; `vm destroy` reuses `vm create`'s lookup to warn of the outage it
+  would cause, never blocking on it. A release without disks
   records the set its installs boot (`boot_disks`: the channel's, the newest release's that
   published disks, with the stowage that published them); `vm create` boots it and the VM's first
   boot writes the requested release's OS bundle and reboots into it before installing, so a VM
-  always comes up on the release asked for. The channel's set is a signed record in the disk
+  always comes up on the release asked for. That release is the first install's one decider: an
+  operator's `install` on the VM before the switch is refused, since it would run the OS's own
+  installer and install the OS's release, which the switch's reboot then contradicts. After a
+  fallback the VM runs the passive system with the failed release in the active slot; `upgrade`
+  to the running release rewrites the active slot, the one way to clear it short of a newer
+  release. A disk download resumes a cut stream with ranged requests against the blob's digest,
+  verifying the digest and size itself (go-containerregistry's own reader checks only a whole
+  stream), bounded by attempts in a row that bring no new byte, so a slow transfer always ends. The channel's set is a signed record in the disk
   repository (`set-<channel>`), written only by a ship that published disks once its channel
   points at it — never inferred from the releases, so a yank, a prune or a promotion cannot make
   two commands disagree about it. That ship then removes the disks the channel's releases name
@@ -628,12 +641,27 @@ point.
    A schema baseline is an epoch: a release that starts a new one carries a new initial
    migration, so no schema check between two baselines can answer. Both sides of the decision
    are in the two releases' specs (the kept installer carries the installed one's), so the
-   database is not read for it; an upgrade or a rollback across one is refused, and a fresh
-   install is the way across. On Kubernetes nothing on the cluster holds the running release's
-   spec, so it is read from that release's installer, fetched by the tag the helm release records
-   and signature-checked like an upgrade's; the way across is `k8s reset-db --new-baseline`, run
-   by the new release's installer — the reset's wipe, then the new release installed with the
-   release's own values. It refuses a baseline it cannot read: a reset never wipes on a guess.
+   database is not read for it; an upgrade or a rollback across one is refused. The other
+   release's baseline is read from its installer's `spec.json` alone — that one field, every
+   other one ignored — because it is the one fact about another release a baseline decision
+   needs, and a release of an older Stowage must tell it to cross out of it: a strict read of
+   the whole spec would make every Stowage upgrade that drops a field a release whose baseline
+   is unknown, and a crossing that never wipes on a guess impossible. The field's path is the
+   spec's Go field names (`Database.SchemaCompat`), unchanged since 0.4.1, pinned by a test.
+   On Kubernetes nothing on the cluster holds the running release's spec, so it is read from
+   that release's installer, fetched by the tag the helm release records and signature-checked
+   like an upgrade's. The way across is `reset-db --new-baseline`, on every shape, run by the
+   new release's installer: the reset's wipe, then the new release installed with the install's
+   own values; it refuses a baseline it cannot read: a reset never wipes on a guess. On Docker it
+   is the upgrade with the dump and the kept release replaced by the wipe (nothing to go back to
+   across a baseline). On the VM the release lives in its OS, so the daemon checks the crossing,
+   writes the new release's OS and a one-shot mark naming it (`<dir>.new-baseline`), and the boot
+   on that OS runs the Docker crossing. The mark stays until the crossing is made — from that OS
+   nothing could ask it again — and goes at any boot of another release, so no later boot of
+   that release acts on it unasked. The crossing wipes the `data.reset` of both releases (the old
+   one's stack holds the data, the new one's names what it will mount), and the plan resolves
+   that set before the OS is written. The VM's `upgrade` checks the
+   baseline before it writes an OS, so a crossing never costs a reboot and a fallback.
 
 ### The Kubernetes shape — `<short>-stow k8s`
 
@@ -1667,8 +1695,9 @@ every shape, the VM end-to-end test upgrading through it), then the health gate.
   verb every installer has (a re-run on Docker, `boot` on the VM). So no installer tolerates or
   migrates another format (no compat until 1.0), an install crosses Stowage versions anyway, and
   the checks keep running wherever the two formats agree; what only a spec of another format
-  tells (its baseline, its dropped inputs, whether it reads a newer schema) is logged as not
-  known, which the checks already treat as no proof. The barrier check, the current release's
+  tells (its dropped inputs, whether it reads a newer schema) is logged as not known, which the
+  checks already treat as no proof. The schema baseline is the exception: read alone from the
+  spec (§ 6), it is told whichever Stowage wrote it. The barrier check, the current release's
   own, still refuses.
 - **No Stowage registry** — every runtime piece is in the `stowage` binary (an executable or a
   recipe `ship` builds into the project registry), so `stowage.lock` pins a version, not digests;

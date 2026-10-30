@@ -449,16 +449,34 @@ func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(
 	}
 	rollback.Flags().BoolVarP(&yes, "yes", "y", false, "go back without asking")
 	rollback.Flags().BoolVar(&accessible, "accessible", false, "confirm with a plain line prompt")
-	var noProvision bool
+	var noProvision, newBaseline bool
+	var resetChannel, resetVersion string
 	reset := &cobra.Command{
 		Use:   "reset-db",
-		Short: "Wipe the data (the volumes data.reset names) and start again as first installed, without a reboot; the service stops meanwhile, nothing is dumped",
+		Short: "Wipe the data (the volumes data.reset names) and start again as first installed, without a reboot; the service stops meanwhile, nothing is dumped. With --new-baseline, a later release at another schema baseline is installed instead: its OS is written and booted, and that boot wipes the data",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			ctx := cmd.Context()
 			// The daemon's refusals come before the question.
+			switch {
+			case !newBaseline && (resetChannel != "" || resetVersion != ""):
+				return errors.New("--channel and --version name the release --new-baseline installs: give --new-baseline, or neither")
+			case newBaseline && noProvision:
+				return errors.New("--no-provision is not given to the boot that crosses the baseline: `provision` runs the hook afterwards")
+			}
+			path := "/v1/reset-db"
+			if newBaseline {
+				q := url.Values{"new_baseline": {"true"}}
+				if resetChannel != "" {
+					q.Set("channel", resetChannel)
+				}
+				if resetVersion != "" {
+					q.Set("version", resetVersion)
+				}
+				path += "?" + q.Encode()
+			}
 			var p ResetPlan
-			if err := c.do(ctx, http.MethodGet, "/v1/reset-db", nil, &p); err != nil {
+			if err := c.do(ctx, http.MethodGet, path, nil, &p); err != nil {
 				return err
 			}
 			var t Prompter
@@ -469,7 +487,8 @@ func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(
 				return err
 			}
 			var started JobStarted
-			if err := c.do(ctx, http.MethodPost, "/v1/reset-db", ResetRequest{Confirm: &p.Target, Token: p.Token, NoProvision: noProvision}, &started); err != nil {
+			if err := c.do(ctx, http.MethodPost, "/v1/reset-db", ResetRequest{Confirm: &p.Target, Token: p.Token, NoProvision: noProvision,
+				NewBaseline: newBaseline, Channel: resetChannel, Version: resetVersion}, &started); err != nil {
 				return err
 			}
 			return c.follow(ctx, stderr, started)
@@ -478,6 +497,9 @@ func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(
 	reset.Flags().BoolVarP(&yes, "yes", "y", false, "wipe without asking")
 	reset.Flags().BoolVar(&noProvision, "no-provision", false, "start the stack without running the provision hook")
 	reset.Flags().BoolVar(&accessible, "accessible", false, "confirm with a plain line prompt")
+	reset.Flags().BoolVar(&newBaseline, "new-baseline", false, "install a later release at another schema baseline instead: its OS is written and booted, and that boot wipes the data")
+	reset.Flags().StringVar(&resetChannel, "channel", "", "with --new-baseline: the channel to find the release on (default: the install's)")
+	reset.Flags().StringVar(&resetVersion, "version", "", "with --new-baseline: this version's latest revision, not the channel's latest release")
 	var rotate func(cmd *cobra.Command, key, pass string) error
 	if slices.ContainsFunc(r.Spec.Secrets, func(s spec.Secret) bool { return s.Rotation }) {
 		rotate = func(cmd *cobra.Command, key, pass string) error {
@@ -756,12 +778,22 @@ func (c *hostClient) updates(ctx context.Context, channel, version string) (Upda
 }
 
 func printUpdate(w io.Writer, u Update) {
+	switch {
+	case u.Passive && u.Installed != nil && *u.Installed != u.Current && !u.Available:
+		defer fmt.Fprintf(w, "the install runs %s, which this OS (%s) does not carry: `upgrade --version %s` writes its OS\n", *u.Installed, u.Current, u.Installed.Version)
+	case u.Passive && !u.Rewrite && !u.Available:
+		defer fmt.Fprintf(w, "the VM runs the passive system (a boot that failed went back to it): `upgrade --version %s` writes %s's latest revision (%s again when it is that one) to the active slot\n", u.Current.Version, u.Current.Version, u.Current)
+	}
 	if u.LeftByRollback {
 		fmt.Fprintf(w, "no upgrade on %s: the install went back from %s, and the boot does not upgrade to it again\n", u.Channel, u.Target)
 		return
 	}
 	if !u.Available {
 		fmt.Fprintf(w, "no upgrade on %s: this OS runs %s, the release found is %s\n", u.Channel, u.Current, u.Target)
+		return
+	}
+	if u.Rewrite {
+		fmt.Fprintf(w, "%s on %s: the VM runs it from the passive system (a boot that failed went back to it); an upgrade writes it to the active slot again\n", u.Target, u.Channel)
 		return
 	}
 	fmt.Fprintf(w, "%s on %s: this OS runs %s\n", u.Target, u.Channel, u.Current)

@@ -318,6 +318,12 @@ func findRevision(ctx context.Context, c *registry.Client, prefix, name, channel
 	return nil, fmt.Errorf("%s %s is not published on %s in %s (a mirror holds the %s-release and %s-installer repositories too)", name, v, channel, repo, name, name)
 }
 
+// foreignManifest is readRelease's answer that the registry holds a release manifest this Stowage
+// does not read: an answer, not a registry that could not be read.
+type foreignManifest struct{ error }
+
+func (e foreignManifest) Unwrap() error { return e.error }
+
 // readRelease reads the release manifest under tag and its digest; nil when the tag holds
 // something else or is gone. A manifest this installer cannot read, or whose scheme it cannot
 // build, is an error.
@@ -338,7 +344,7 @@ func readRelease(ctx context.Context, c *registry.Client, repo, tag string) (*re
 		_, err = scheme(m)
 	}
 	if err != nil {
-		return nil, v1.Hash{}, fmt.Errorf("release manifest %s could not be read (from another Stowage? run that release's installer): %w", tag, err)
+		return nil, v1.Hash{}, foreignManifest{fmt.Errorf("release manifest %s could not be read (from another Stowage? run that release's installer): %w", tag, err)}
 	}
 	return m, h, nil
 }

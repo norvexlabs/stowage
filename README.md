@@ -547,6 +547,19 @@ stowage -C <project> --test-registry PREFIX [--test-push USER:ENV] [--test-pull 
   one. An immutable channel is refused: yank instead.
 - `releases` lists the published releases, oldest first in each channel. It checks no signature.
   A release whose version the current scheme refuses is skipped with a warning.
+- `ship`, `promote` and `verify` print, besides the release line and its digest (not with
+  `--json`), one line per shape the spec declares, saying what the release can install:
+  `docker: installable`, `kubernetes: installable` (`kubernetes: no chart — k8s install
+  refused` for a release carrying none), and for kairos `kairos: no OS bundle — vm create and VM
+  upgrades refused` for a release carrying none, else one of `kairos: disks
+  <formats>`, `kairos: no disks of its own — vm create boots <release>'s disks, then writes this
+  release's OS`, `kairos: no disks — vm create refused; a ship of <v> with them publishes them
+  (stowage ship --disks --channel <channel> --revision N, from a tree at <v>)` (N the same
+  revision on a mutable channel, the next on an immutable one, whose published releases take no
+  new artifact), or, for a kairos shape with no `disk_formats`, `kairos: no disk_formats — the OS
+  bundle alone, which upgrades a VM; vm create refused`. Disks are published by a ship
+  asked to (`--disks`), or by every ship when `shapes.kairos.disks` is `always`; a promotion
+  publishes the disks of the release it promotes alone.
 - `ship` refuses a version that `version.scheme`'s `month_guard` puts out of its month (`lint`
   only warns of it) unless the channel holds a release of it already — a ship resumed after the
   month's turn, or a later revision of a version out: `version.scheme month_guard: version V is
@@ -625,10 +638,13 @@ release for a test run, never the project's, without editing the spec:
   A version `HEAD` records that the scheme refuses is reported as an error, and so is one
   `month_guard` puts out of its month (no ship starts; a ship of a version the channel holds
   already is `stowage ship`'s). Every outcome exits 0: a commit never fails on its release.
-- The ship publishes the disks (as `ship --disks`) when the hook was written with `--disks`, or
-  when the commit was made with `STOWAGE_SHIP_DISKS=1` (or `true`) in its environment — so a
-  project chooses its own cadence, a release at a time; the started line then says `, with its
-  disks,`.
+- The ship publishes the disks (as `ship --disks`) when the hook was written with `--disks`, when
+  the commit was made with `STOWAGE_SHIP_DISKS=1` (or `true`) in its environment, or when
+  `shapes.kairos.disks` is `always` — so a project chooses its own cadence, a release at a time;
+  the started line then ends `, with its disks`. A project with the kairos shape and
+  `disk_formats` whose ship publishes none is told so on that line (`…, without disks (vm create of it refused unless the
+  channel's disks boot it)`). The background run's log ends with the ship's summary, its shape
+  lines included.
 - The ship runs in the background, in a session of its own with no input, and `hook post-commit`
   returns at once, printing `follow: tail -f <log>`. The background run is `stowage -C <project>
   hook post-commit --channel C --ship <version> --commit <id> [--disks]` (`--ship` and `--commit`
@@ -1505,7 +1521,7 @@ database: reset-db has nothing to reset` (`… there is no backup to restore`). 
 | `hooks.maintenance.disk_pressure` | `soft_pct`, `hard_pct` (1 ≤ soft < hard ≤ 99), `post` (`http://<service>:<port>/…`), `auth_secret` (a `secrets` key). The Kairos VM's host daemon acts on it (see "Disk pressure" under the installer on the Kairos VM), and a Docker install's own timer (see "Backups, restore and the disk-pressure watch on Docker"); Kubernetes ignores it, and without a `docker` or `kairos` shape it is a warning |
 | `backup` | optional, and only with a `database`: `pg-age-rclone` (`profiles`: a name of 1 to 32 lowercase letters and digits each, `all`, a list of the tables whose data it keeps — `table` in any schema, or `schema.table` —, or `{ exclude: [pattern, …] }`, the tables whose rows it leaves out, structure kept (`table` or `schema.table` of letters, digits and `_`, with pg_dump's `*` and `?`); `default_profile`, required with several; `volumes`, the compose volumes every backup also archives and a restore brings back with the database — each listed once, a volume the compose file declares and Compose creates (not `external`), under a literal name (no `${…}` in its `name:`), and none the database's service mounts: its data is the dump's), which the Kairos VM and a Docker install run (see "Backups" under the installer on the Kairos VM); `command`, validated only (with a `kairos` shape, a warning: the VM schedules no backup of it). A `docker` or `kairos` shape with a `pg-age-rclone` backup makes `ship` build and publish the backup runner (`<name>-backup`), which the OS bundle preloads and a Docker install pulls |
 | `host` | optional: what the stack asks of the machine it runs on, whatever the shape — written into the OS bundle on the `kairos` shape and applied by its boot; on a Docker host `tune` reports its `modules`, `packages`, `firmware` and `kernel_args` as advice (the kernel, packages and boot loader are the operator's: `tune` never writes them) and judges its `sysctls` and `power` as its profile's settings, which `tune --apply` writes when the operator runs it; `k8s tune` prints it all for the nodes. `modules`: kernel modules by name (lower-case letters, digits and `_`), each with a `reason` (one line, at most 200 bytes) and at least one of `load: true` (loaded at boot), `block: true` (never loaded; not with `load` or `options`) and `options` (the module's parameters by name, `[A-Za-z0-9_]`; values of letters, digits and `_ . , : / + -`). `packages`: Ubuntu packages by name (Debian's rule: lower-case letters, digits and `+ - .`, starting with a letter or digit, 2 to 64), each with a `reason`, installed into the OS bundle after its own (a package it purges included); one of the bundle's own boot — a name that is or starts with `cloud-init`, `containerd`, `docker`, `dracut`, `grub`, `immucore`, `kairos`, `linux-generic`, `linux-image`, `linux-modules`, `shim`, `systemd` or `udev`, followed by `-` or `.` — is an error. `interfaces`: the host's network interfaces by role, the role their name (a lower-case letter, then lower-case letters and digits, at most 15; never one the kernel, udev or Docker gives: `lo`, `en`, `eth`, `wl`, `ww`, `ib`, `docker`, `br`, `veth`, `virbr`, `tun`, `tap`, `sit`, `gre`, `ip6`, `dummy`, `bond`…), each with a `reason`: `kind` `nic` (the default: a NIC, which `vm create` attaches and names by its MAC; exactly one is `primary: true` when any NIC is named, the default route's, whose addressing is the VM's network) or `tun` (a device a service opens on the host's network, which networkd matches by name once it is there, keeping the addresses the service gives it); `mtu` (1280 to 9216); `routing_policy_rules` and `routes`, lists of networkd's `[RoutingPolicyRule]` settings (`DestinationPort`, `Family`, `FirewallMark`, `From`, `IPProtocol`, `IncomingInterface`, `Invert`, `OutgoingInterface`, `Priority`, `SourcePort`, `SuppressPrefixLength`, `Table`, `To`, `Type`) and `[Route]` settings (`Destination`, `Gateway`, `GatewayOnLink`, `MTUBytes`, `Metric`, `PreferredSource`, `Protocol`, `Scope`, `Source`, `Table`, `Type`), each value of letters, digits and `_ . : / , + -`, at most 64 (a TPROXY's `fwmark` → `local` table is `routing_policy_rules: [{ FirewallMark: "0x1", Table: "100" }]` and `routes: [{ Type: local, Destination: 0.0.0.0/0, Table: "100" }]`); `forward`: the roles the host forwards this role's traffic out of (`vpn0: { kind: tun, forward: [uplink] }`, a VPN exit node; `lan: { forward: [wan] }`, a gateway), past Docker's FORWARD policy (DROP for IPv4 and IPv6): the VM accepts each one's traffic out and its replies back, nothing new into the role, and the stack's own table (its forward chain) judges what is forwarded, not the role (see "The firewall" under the installer on the Kairos VM); a role not declared, the role itself, one given twice and an empty list are errors, and without a `kairos` shape it is a warning (a Docker host's DOCKER-USER chain is its operator's: `tune` advises its rules, and `tune --apply` applies them once the operator consents — see "A Docker host's gateway" under `tune`); `ethtool` (a NIC's alone): `channels: { combined: max | N }` (1 to 1024), `rings: { rx: max | N, tx: max | N }` (1 to 65536), `features` by the name `ethtool -k` lists (`on` or `off`), `eee` (`on` or `off`). The OS bundle carries each NIC's MTU and routing as networkd drop-ins under `/usr/lib/systemd/network` (the image's, so each system boots with its release's) and each tun device's whole file; `tune` applies the NICs' `ethtool` settings on the VM and judges them, and reports each interface as advice on a Docker host, with networkd's settings and the ethtool commands that give a NIC of that host the role's, and the firewall's rules its `forward` and a service's `transparent` need there, each NIC role by the NIC `--interface` recorded for it, else `<the NIC playing <role>>` (a NIC keeps its own name there; a `tun` role's name is its device's); `k8s tune` prints them, a NIC role as that placeholder. A service's own `nftables` table is loaded as written, on every shape: it names a `tun` role or the host's own devices, never a NIC role (which is a device's name on the VM alone). `firmware`: firmware files the host's drivers load, by their path under `/lib/firmware` (names of letters, digits and `_ . + -`, none starting with a dot, one `/` apart, at most 200 bytes), each with a `reason`: the OS bundle's build fails when one is not there, as it is or compressed (`.zst`, `.xz`), naming `host.packages` for the package that ships it (the bundle has the distribution's `linux-firmware`); `tune` judges it on the host. `kernel_args`: kernel command-line parameters by name (letters, digits and `_ . -`, at most 64), each with an optional `value` (letters, digits and `_ . , : / + @ -`, at most 128; none: a flag) and a `reason`, which the OS bundle's active and passive systems boot with (its recovery system without them); Kairos's own boot's — `BOOT_IMAGE`, `apparmor`, `biosdevname`, `bundles`, `config_url`, `console`, `cos`, `enforcing`, `immucore`, `init`, `initrd`, `install`, `ip`, `kairos`, `lsm`, `net.ifnames`, `net.naming-scheme`, `panic`, `rd`, `rdinit`, `reset`, `ro`, `root`, `rootdelay`, `rootflags`, `rootfstype`, `rootwait`, `rw`, `security`, `selinux`, `stages`, `systemd`, `upgrade`, `users`, systemd's targets and mounts (`1` to `5`, `S`, `s`, `single`, `rescue`, `emergency`, `fstab`, `luks`, `mount.usr`, `mount.usrflags`, `resume`, `noresume`, `roothash`, `usrhash`), and dracut's network and the agent's flags (`bond`, `bootdev`, `bridge`, `cloud-init-paths`, `debug`, `eject-cd`, `env`, `fail_on_bundles_errors`, `grub_options`, `ifname`, `k3s`, `nameserver`, `options`, `p2p`, `strict`, `team`, `udev`, `vlan`) — the root and its mount, the boot loader's and the initrd's, Kairos's and the configuration keys its agent reads from the command line, the consoles, the init system, the security modules, the interfaces' names, a panic — or one starting with one of them and `.` or `-`, compared with `_` read as `-` (as systemd and udev read them), is an error, as is a name or a value holding `upgrade_failure`, the mark of a boot that fell back to the passive system; the OS bundle's build also refuses one Kairos's boot script sets (its `baseCmd`, `baseRootCmd`, `baseSelinuxCmd` or `baseExtraConsole`, such as `splash` or `quiet`), naming the key. `sysctls`: kernel settings by key (dotted lower-case letters, digits, `_` and `-`), each with a `value` (at most 8 fields of letters, digits and `_ . , : / + -`, one space apart) and a `reason`, set as `tune` sets its profile's, on the host; a key a tune profile sets is an error (`tune` computes it); a key a network, IPC or UTS namespace mostly keeps of its own (`net.ipv4.*` but `tcp_mem` and `udp_mem`, `net.ipv6.*`, `net.unix.*`, `net.netfilter.*`, `net.mptcp.*`, `net.sctp.*`, `net.core.somaxconn`, `kernel.shm*`, `kernel.msg*`, `kernel.sem*`, `fs.mqueue.*`, `kernel.hostname`, `kernel.domainname`) is warned: the host's value holds in the host's namespace (Docker's NAT and bridges among it), not in a container's own (the compose file's `sysctls` give a service its value). A key that appears only with a module (`net.bridge.*` with `br_netfilter`) is set by the VM's boot when `host.modules` loads that module at boot; else the boot notes it missing and `tune` reports it `differs`. `power`: `performance` (the CPUs at their full speed, as `tune` says) or `platform` (the default: their frequency left to the host) |
-| `shapes` | at least one of `docker: {}`, `kubernetes` (`chart`, a directory holding `Chart.yaml`; `postgres_modes`: `external`, `embedded`, `cnpg`, optional and validated only; an error without a `database`; `schema`: `url_env`, the variable holding the migrate role's URL in the container of the workload running `reads_newer_image`, and `image`, an images key holding `psql` — the schema check of `k8s upgrade` and `k8s rollback`, which needs the `sql` schema-compat provider with `reads_newer_image`; absent with that provider, a warning), `kairos` (`base`, the distribution converted into Kairos, and `kairos_init`, the kairos-init image, both pinned by digest; a `kairos_init` tagged other than the release the OS bundle's build takes, v4.4.0-rc2, is warned, as the build refuses it; `disk_formats`: `raw`, `qcow2`, `ova`, `vhd`, `gce`, `iso` (the installer, for bare metal), none publishing the bundle alone; `cloud_publish`: `aws`, `azure`, `gcp`, each adding the disk format it imports (`raw`, `vhd`, `gce`); `health_gate`: 0 < `poll_s` < `deadline_s` ≤ `deadline_after_reset_s`, the VM's health gate's window and polling (default 600, 1800 and 30 s; `deadline_after_reset_s` is validated only: `reset-db` does not reboot, so no boot is judged after it); `host_api`: the compose services given the host daemon's app socket on the VM, each in the compose file, none twice; `size`: `min` and `recommended`, each of `cpus`, `memory` and `disk` (sizes as a memory share's `max` reads them; one given as 0 or left empty is an error, and so is `min:` or `recommended:` left empty: leave it out) — the least VM the stack runs on and the one it runs well on, which `vm create` sizes a VM from; at least one of `min` and `recommended`, each stating at least one of the three, `cpus` at least 1, `memory` whole MiB and at least 1G, `disk` (the app's space on the VM's disk: its data, its images loaded, its backups' staging — `vm create` adds what Kairos takes) whole GiB and at least 4G, and none of `recommended` under `min`'s; a `base` whose repository (its path's last element) is not `ubuntu` is warned, as the build refuses another distribution; no `backup` is a warning when there is a `database`). `ship` publishes the `kubernetes` chart and the `kairos` OS bundle and disks; `docker` and `kubernetes` have a runtime |
+| `shapes` | at least one of `docker: {}`, `kubernetes` (`chart`, a directory holding `Chart.yaml`; `postgres_modes`: `external`, `embedded`, `cnpg`, optional and validated only; an error without a `database`; `schema`: `url_env`, the variable holding the migrate role's URL in the container of the workload running `reads_newer_image`, and `image`, an images key holding `psql` — the schema check of `k8s upgrade` and `k8s rollback`, which needs the `sql` schema-compat provider with `reads_newer_image`; absent with that provider, a warning), `kairos` (`base`, the distribution converted into Kairos, and `kairos_init`, the kairos-init image, both pinned by digest; a `kairos_init` tagged other than the release the OS bundle's build takes, v4.4.0-rc2, is warned, as the build refuses it; `disk_formats`: `raw`, `qcow2`, `ova`, `vhd`, `gce`, `iso` (the installer, for bare metal), none publishing the bundle alone; `cloud_publish`: `aws`, `azure`, `gcp`, each adding the disk format it imports (`raw`, `vhd`, `gce`); `disks`: `opt-in` (the default: a ship publishes the disks when asked to, `--disks`) or `always` (every ship does, the commit hook's included), any other value an error — read by the publisher alone, it enters no release's inputs; `health_gate`: 0 < `poll_s` < `deadline_s` ≤ `deadline_after_reset_s`, the VM's health gate's window and polling (default 600, 1800 and 30 s; `deadline_after_reset_s` is validated only: `reset-db` does not reboot, so no boot is judged after it); `host_api`: the compose services given the host daemon's app socket on the VM, each in the compose file, none twice; `size`: `min` and `recommended`, each of `cpus`, `memory` and `disk` (sizes as a memory share's `max` reads them; one given as 0 or left empty is an error, and so is `min:` or `recommended:` left empty: leave it out) — the least VM the stack runs on and the one it runs well on, which `vm create` sizes a VM from; at least one of `min` and `recommended`, each stating at least one of the three, `cpus` at least 1, `memory` whole MiB and at least 1G, `disk` (the app's space on the VM's disk: its data, its images loaded, its backups' staging — `vm create` adds what Kairos takes) whole GiB and at least 4G, and none of `recommended` under `min`'s; a `base` whose repository (its path's last element) is not `ubuntu` is warned, as the build refuses another distribution; no `backup` is a warning when there is a `database`). `ship` publishes the `kubernetes` chart and the `kairos` OS bundle and disks; `docker` and `kubernetes` have a runtime |
 
 A `command` provider answers per op: `version.get` → `{"version"}`; `scheme.validate`
 `{version}` → `{"valid", "reason"}`; `scheme.compare` `{a, b}` → `{"result": -1|0|1}`;
@@ -1550,6 +1566,7 @@ again, to copy an installer to another host.
           [--ports route=port]… [--no-input] [--accessible] [--dry-run] [--no-provision]
 <short>-stow rollback [--dir D] [--offline] [--dry-run]                  # the installer the install keeps
 <short>-stow reset-db [--dir D] [--yes] [--no-input] [--accessible] [--dry-run] [--no-provision]
+          [--new-baseline]                                               # the NEW release's installer, across a baseline
 <short>-stow backup config|run|status|list|verify [--dir D] [the VM's flags]   # a pg-age-rclone backup
 <short>-stow restore OBJECT [--dir D] [--identity FILE|-] [--yes] [--accessible]
 <short>-stow script                                                      # print the bootstrap script
@@ -1765,7 +1782,8 @@ again, to copy an installer to another host.
     `restore` that loaded and `reset-db` remove it;
   - `<short>-stow`, `tls/cert.pem` and `tls/key.pem` (`byo`);
   - `snapshots/`, `.stowage-prev/`, `.stowage-failed/`, `.stowage-next-*/` (an installer
-    `upgrade --version` fetched, kept only when its run failed), and `.stowage.lock` (the run
+    `upgrade --version` fetched, kept only when its run failed), `.stowage-crossed` (the releases
+    a `reset-db --new-baseline` crossed from and to, until the next upgrade), and `.stowage.lock` (the run
     lock).
 
   The front keeps its certificates in the volume `stowage-front-data`.
@@ -1942,21 +1960,27 @@ again, to copy an installer to another host.
 - **Schema baselines.** A release's schema baseline is the `sql` schema-compat's `baseline`
   (absent, 0 and every other provider are baseline 1; a release without a database has none and
   is never checked). Two releases at different baselines share no schema: `upgrade` refuses
-  before anything changes (no dump, no pull), saying the install moves to that release only by a
-  fresh install; `rollback` — and so the VM's boot going back and its health gate, which then
+  before anything changes (no dump, no pull), naming the way across, `reset-db --new-baseline`
+  (`… only with its data wiped: `<installer> reset-db --new-baseline --dir D` wipes it and installs
+  <v>`); `rollback` — and so the VM's boot going back and its health gate, which then
   keeps the boot — refuses a previous release at another baseline, decided from the two releases'
   specs before any image is pulled. A baseline that does not read is logged and not checked, like
-  the rest of the schema check, and so is the baseline of a release whose spec is not this
-  Stowage's format (it does not decode strictly: another Stowage moved a key), which is never
-  read otherwise (`the schema baseline of <name> <v> is not known (<name> <v> (revision <r>),
-  built by Stowage <s>, carries a spec this one does not read: …): not checked`). On Kubernetes the
+  the rest of the schema check (`the schema baseline of <v> is not known (…): not checked`). The
+  baseline of another release — the one the install runs, the one it goes back to, the one a
+  helm release runs, the one a VM upgrade writes — is read from its installer's `spec.json`
+  alone (`database.schema_compat`, wherever any Stowage since 0.4.1 writes it), every other field
+  ignored: a release an older or newer Stowage built, whose spec this one refuses whole, still
+  tells it. On Kubernetes the
   baseline of the release a helm release runs is read from that release's installer (its spec
   travels in it), fetched by the tag the release records from the registry it was installed from
   and checked against this installer's keys (an installer carrying none checks no signature, as
   `upgrade --version`): `k8s upgrade` refuses another baseline, and
   `k8s reset-db --new-baseline`, run by the new release's installer, is the way across (it wipes
-  the data). One that cannot be read is logged and not checked by `upgrade`. On the VM an upgrade is decided at the boot that follows the OS write:
-  the boot keeps the install on its release and the health gate falls back to the passive system.
+  the data). One that cannot be read is logged and not checked by `upgrade`. On Docker,
+  `reset-db --new-baseline` (below) is the way across; on the VM, `upgrade` refuses another
+  baseline before it writes the OS (`… its data cannot carry over, so its OS is not written;
+  `<short>-stow reset-db --new-baseline` wipes the data and installs <v>`), and the VM's
+  `reset-db --new-baseline` is the way across.
 - **Across Stowage versions.** The installer an install keeps is identified by its release
   manifest alone, whichever Stowage built it; its spec is read only when this Stowage reads the
   payload as its own (none is read leniently or migrated). A payload this Stowage refuses is put
@@ -2068,6 +2092,35 @@ again, to copy an installer to another host.
   `--dry-run` prints what it would delete. A `data.reset` that names nothing is refused. It holds
   the install's lifecycle lock; one that stops after the stack went down is finished by running
   it again.
+- `reset-db --new-baseline`, run by the installer of a later release at another schema baseline
+  than the one the install runs, crosses it: it checks as `upgrade` does (the release the
+  install runs read from the installer it keeps; every refusal of the upgrade — front, ports,
+  hook, an upgrade that stopped, Docker, the L4 routes — before the question, and again under
+  the lock after it; the inputs this release adds asked as an upgrade asks them, its images
+  fetched), then wipes the data as `reset-db` does — the stack
+  down, the `data.reset` volumes deleted, what the hook returned forgotten, nothing dumped — and
+  installs this release with the values `.env` records, provisioned afresh. `.stowage-prev/` and
+  `.stowage-failed/` go only once the wipe is done (a wipe that fails leaves them), and with the
+  `.env` switch the install records the releases it crossed from and to in `.stowage-crossed`
+  (`<from version> <revision> <to version> <revision>`), which the next upgrade removes. A new release naming
+  no volume in `data.reset` crosses all the same when the old one names some. No release is kept to
+  go back to: `.stowage-prev/` and `.stowage-failed/` are removed. It refuses, before anything changes, the
+  release it carries (`… already runs <name> <v> (revision <r>): --new-baseline installs another
+  release, which this installer does not carry; reset-db without it wipes this one`), an earlier
+  release, a release at the same baseline (`… --new-baseline only crosses a baseline; `<installer>
+  upgrade --dir D` moves it`) and a baseline that cannot be told (`the schema baseline of <name>
+  <v>, which the install runs, cannot be told (the log says why): --new-baseline never wipes on a
+  guess`). It wipes the `data.reset` volumes of both releases — the one the install runs, whose
+  stack holds the data (read from the installer it keeps, its `data.reset`, compose file and
+  provision outputs file alone when another Stowage built it; one that does not tell what to
+  wipe is refused), and this one's, but for a volume this release keeps on a reset
+  (`keep_on_reset`), which is kept whatever the old one said; it forgets both releases'
+  provision outputs files. Neither
+  naming a volume is refused (`… --new-baseline has nothing to wipe`).
+  It asks as `reset-db` does (`… then install <name> <v>, at the new schema baseline,
+  with the same values`); `--dry-run` prints that and changes nothing. An install that moved to
+  another release after the answer is refused, nothing wiped. Should the new release not come up,
+  the error names the re-run that starts it again: its data is already wiped.
 - The front is the Caddy Stowage adds (`stowage-front`), the release's `front` image. An
   installer refuses a release of a project with a front that records no front image. `STOWAGE_TLS_MODE` records how it serves.
   On each route, in this order:
@@ -3412,13 +3465,29 @@ in the same installer (bootstrap it as above, then `sh <name>.sh vm create …`,
   bundle into the passive slot (`kairos-agent upgrade`, by digest, from the registry or the
   mirror the settings name), records it in `/usr/local/<name>.os-switch`, and reboots into it;
   the boot after it installs (a boot still on another OS after that stops, naming the file).
-  `vm create --create opentofu` waits 40 minutes by default then, rather than 20.
+  `vm create --create opentofu` waits 40 minutes by default then, rather than 20, and says so as
+  it fetches the disk (`fetching <name>'s <format> disk of <tag> (…): <name> <v> published none`,
+  or `has none left in <prefix> (a later ship's disk set replaced them)`, `. The VM boots <tag>'s
+  OS first; its first boot writes <tag>'s OS bundle and reboots into it, and an install on the VM
+  is refused until then`). That release alone decides the first install: an operator's `sudo
+  <short>-stow install` on the VM before it, on the OS of another release, is refused (`<settings>
+  names <name> <v> (revision <r>) as the first install, and this OS carries <v'> (revision <r'>):
+  the boot writes that release's OS bundle and reboots into it (`journalctl -u <name>.service`
+  follows it); install once the VM runs it`), unless an `upgrade` before the first install wrote
+  this OS's release since (below).
 - It fetches that disk of the format (`<prefix>/<name>-disk@<digest>`, the digest the
   release records) with the pull account, as `upgrade --version` reads the registry, into
   `--out` (default the current directory) under the layer's title less its `.zst`
   (`<name>-<version>.<format>`), decompressed as it is written, checking the compressed layer's
   size and digest and the disk file's own digest; a file of that name holding that disk is kept,
-  any other is refused, never replaced. Progress (of the compressed bytes) is reported every tenth. With `--registry
+  any other is refused, never replaced. Progress (of the compressed bytes) is reported every tenth.
+  A download cut short (a dropped connection, a stream reset) resumes from the byte reached with
+  a ranged request (`Range: bytes=N-`; a registry or CDN that ignores the range is read again with
+  the bytes already read skipped), logging `download <file> (<digest>): <error>; resuming at N of
+  M bytes`; it fails after 5 attempts in a row that bring no new byte (waits of 2 s doubling to
+  30 s), and at once on a refusal (a 4xx but 408 and 429) or an interrupt. A stream that stays
+  open but brings no byte for 120 s while it is read is dropped and resumed the same way (`no
+  byte for 120 s`); bytes skipped from a range ignored count as bytes brought. With `--registry
   PREFIX` (a mirror, checked as a repository name) the disk is read there instead, with the
   Docker client's login, and `--registry-ca FILE` (certificates only) is trusted for that read;
   the review shows the registry and the CA file.
@@ -3622,7 +3691,13 @@ in the same installer (bootstrap it as above, then `sh <name>.sh vm create …`,
   environment and `tofu` (the TrueNAS API's variables for TrueNAS's built-in module, as its
   `platform` file records; a VM made before that file is TrueNAS's), asks on a terminal ("Destroy
   the VM H: its disk, its data and its uploads on <platform>", default no), and without one refuses
-  unless `--yes`. On TrueNAS, snapshots of the zvol and the staging dataset (a periodic task's) are
+  unless `--yes`. Before asking (and before `--yes` goes on) it looks, as `vm create` does (in
+  `--registry` when given; for 30 s at most), for a disk set that could make the VM again, and
+  warns when the registry answers there is none (the channel's release read, or one this
+  Stowage does not read) (`Warning: <name> <version> has no disk in <prefix>, nor does its channel <channel>: …
+  (stowage ship --disks); until then, a VM destroyed is not created again.`) or when the
+  registry cannot be read (`Whether a VM of <name> <version> can be created again is not known:
+  …`); neither stops the destroy. On TrueNAS, snapshots of the zvol and the staging dataset (a periodic task's) are
   deleted first, as TrueNAS refuses to delete a dataset that has any. The cached disk stays.
 - `vm truenas import-image|seed|start|stop|drop-snapshots` (hidden) are the module's steps, run
   by OpenTofu: each reads `TRUENAS_URL`, `TRUENAS_API_KEY`, `TRUENAS_INSECURE_SKIP_VERIFY` and its
@@ -3657,6 +3732,7 @@ sudo <short>-stow install [--channel C] [--set KEY=VALUE]… [--answers FILE] [-
 <short>-stow upgrade [--channel C] [--version V] [--yes] [--no-reboot] [--skip-backup] [--accessible]   # ends at the reboot it schedules: status and events after it tell how it went
 <short>-stow rollback [--yes] [--accessible]   # reboot into the passive system: back to the release the last upgrade replaced; ends at that reboot
 <short>-stow reset-db [--yes] [--no-provision] [--accessible]   # wipe the data, start again as first installed
+          [--new-baseline [--channel C] [--version V]]   # instead: a later release at another schema baseline, its OS written and booted, that boot wiping the data
 <short>-stow restore OBJECT [--identity FILE|-] [--yes] [--accessible]   # load a backup into the database
 <short>-stow secrets export --recipient age1…… [-o FILE|-]   # the install's secrets, encrypted
 <short>-stow secrets rotate KEY [--stage | --finish]   # a secret with rotation: true
@@ -3774,7 +3850,19 @@ sudo <short>-stow install [--channel C] [--set KEY=VALUE]… [--answers FILE] [-
   revision on the channel) with the pull account, refuses it unless it is signed by a key the
   OS's `<short>-stow` carries (when it carries any), and says whether it comes after the OS's
   release (by the scheme the release records; revisions order one version), with its changelog;
-  a release the install went back from (`.stowage-failed/`) is not offered. Before the first
+  a release the install went back from (`.stowage-failed/`) is not offered. On the passive
+  system (a boot that failed went back to it), the release it runs is offered too (`rewrite` in
+  JSON; `<release> on <channel>: the VM runs it from the passive system (a boot that failed went
+  back to it); an upgrade writes it to the active slot again`): `upgrade` then writes its OS to
+  the active slot, which held the release that failed, without a backup or the checks below, and
+  its boot `runs it from the active slot again`. When the channel offers nothing to upgrade to
+  (most often the release that failed, not offered again), `updates` adds `the VM runs the passive system (a
+  boot that failed went back to it): `upgrade --version <v>` writes <v>'s latest revision (<v>
+  (revision <r>) again when it is that one) to the active slot` (`passive` in JSON); when the
+  install runs another release than the OS (a crossing whose boot fell back), it names that one
+  instead (`the install runs <v> (revision <r>), which this OS (<v'> (revision <r'>)) does not
+  carry: `upgrade --version <v>` writes its OS`; `installed` in JSON), and the passive system's
+  own release is not offered. Before the first
   install (none made, or one refused), it reads the channel and registry of the first install's
   settings (`/etc/<name>/install.yaml`: `channel`, `registry` and `registry_ca`, else the
   release's registry), `--channel` naming one when they name none (`the install follows no
@@ -3800,13 +3888,18 @@ sudo <short>-stow install [--channel C] [--set KEY=VALUE]… [--answers FILE] [-
   by the digest of its signed manifest, the payload checked to carry that release; a copy under
   `<dir>/.stowage-next-*`, removed after), reads its spec without running it, and checks the
   upgrade's front and inputs as the boot would, given no input: a route it could not decide, or an
-  input the release adds that is required with no default, is refused then (the schema baseline
-  and the L4 routes' ports are still the boot's to check) (409: `<why>\nthe boot into <tag>
-  would refuse this upgrade (it is given no input), so its OS is not written`), rather than by a
+  input the release adds that is required with no default, is refused then (the L4 routes' ports
+  are still the boot's to check) (409: `<why>\nthe boot into <tag>
+  would refuse this upgrade (it is given no input), so its OS is not written`), and so is a release
+  at another schema baseline, read from that installer whichever Stowage built it (409: `<name> <v>
+  starts schema baseline <n>, and the install runs <name> <v'>, at baseline <m>: its data cannot
+  carry over, so its OS is not written; `<short>-stow reset-db --new-baseline` wipes the data and
+  installs <v>`), rather than by a
   boot that would fall back; an installer that cannot be fetched is a 502 (`the installer of
   <tag>: …`); a spec this daemon's Stowage does not read is logged and left to the boot (`the
   installer of <tag> carries a spec this Stowage does not read (…): the boot into it checks the
-  upgrade`).
+  upgrade`), its baseline checked all the same. An upgrade removes the mark a `reset-db
+  --new-baseline` left whose OS never booted (`/usr/local/<name>.new-baseline`, below).
   Before the first install, it reads the release as `updates` does, takes no backup, records the
   release's tag in `/usr/local/<name>.os-upgrade` before `kairos-agent` runs (removed once the
   first install is made: any boot finding an install removes it), refuses a `--channel` other
@@ -3982,6 +4075,38 @@ sudo <short>-stow install [--channel C] [--set KEY=VALUE]… [--answers FILE] [-
   job fails on the Docker shape's refusals. The question names the release; the request names
   it, and another is refused, and carries the plan's single-use token. Nothing is dumped first. The app socket serves it too,
   as the whole API.
+- `reset-db --new-baseline` crosses a schema baseline on the VM: it finds the release as
+  `upgrade` does (`--channel`, `--version`, refused without `--new-baseline`; `--no-provision`
+  is refused with it, as the boot that crosses is given no flag: `provision` runs the hook
+  afterwards), which must come after the OS's, carry an OS bundle,
+  not be yanked, start another baseline than the install's — both told, read from the two
+  installers (`… cannot be told (the daemon's log says why): --new-baseline never wipes on a
+  guess`; the same baseline: `… --new-baseline only crosses a baseline; `<short>-stow upgrade`
+  moves it`) — and pass `upgrade`'s checks given no input. The question names that release and
+  the plan (`write <tag>'s OS and reboot into it; that boot stops <name>, deletes the volumes
+  data.reset names, forgets what its provision hook returned, then installs <v>, at schema
+  baseline <n> (from <m>), with the same values`, naming the volumes of both releases it deletes
+  and those it keeps). A release the install went back from is refused (`remove
+  <dir>/.stowage-failed to cross to it again`). The POST takes the check of the GET that showed the plan when the
+  target's installer and the install's `.env` are unchanged, rather than fetching the installer
+  again (the check of that GET alone: its token). The job, as `upgrade`'s, records the tag in
+  `/usr/local/<name>.new-baseline`, writes the OS and reboots; the boot on that OS runs the
+  Docker shape's `reset-db --new-baseline` (no dump, no previous release kept),
+  logging `… which reset-db --new-baseline asked: wiping the data and installing it`. A mark
+  naming another release is removed by the next boot (its OS was not written, or the health gate
+  went back from it); one naming the OS's release stays until the crossing is made, so a boot
+  whose crossing failed tries it again (nothing else can ask it from that OS). Should the new
+  release fail its health gate, the VM falls back to the passive system with the data already
+  wiped: its boot, finding `.stowage-crossed` naming a crossing from its OS's release to the
+  install's, refuses (`the install runs <name> <v> (revision <r>), after this OS's <v'>
+  (revision <r'>), and keeps no release to go back to (a reset-db --new-baseline crossed to it):
+  `<short>-stow upgrade --version <v>` writes its OS again`), and that `upgrade` checks no
+  baseline when it writes the release the install runs; to another release it checks the
+  baseline of the release the install runs (its own installer's), not the OS's, and across one
+  names `upgrade --version <v>` (the install's release back first: `reset-db` resets the OS's
+  release), then `reset-db --new-baseline`. A later OS
+  boots as an upgrade like any. The plan resolves what that boot would wipe (both releases' `data.reset`) before the OS
+  is written, and refuses one it cannot tell.
 - `network` shows the interface (that of the default route, else the first `en*`/`eth*`), its
   MAC, its global IPv4 and IPv6 addresses (static, leased or from router advertisements; an IPv6
   one once duplicate address detection passed), the default gateways (IPv4's, then each IPv6
@@ -4285,8 +4410,13 @@ sudo <short>-stow install [--channel C] [--set KEY=VALUE]… [--answers FILE] [-
 resets, what it does, and a new token, which replaces the last; refusals as `reset-db`'s, a
 running job and a scheduled reboot included), `POST reset-db` (`{"confirm": {"version",
 "revision"}, "token", "no_provision"}`, 202, a job; refused without `confirm`, with a release
-other than the one the install runs, and without the last GET's token, which it uses up), `GET updates?channel=&version=` (`left_by_rollback` marks a release the
-  install went back from), `POST upgrade` (`{"channel", "version", "confirm": {"version", "revision"}, "reboot", "skip_backup"}`, 202), `GET job?since=N` (`log_total` is the line to ask from next; the last job's `started` (its identity), kind, target, state — `idle`, `running`, `done`, `failed`
+other than the one the install runs, and without the last GET's token, which it uses up; `GET
+reset-db?new_baseline=true&channel=&version=` and `"new_baseline": true, "channel", "version"` in
+the POST, `confirm` then naming the release found, cross a baseline; a channel or version without
+it, or `no_provision` with it, is a 400; a token is good for the plan its GET showed alone — a
+crossing or not, and its target — and another is refused: `reset-db's token is the GET's that
+showed another plan: look again`), `GET updates?channel=&version=` (`left_by_rollback` marks a release the
+  install went back from; `rewrite` the running release offered on the passive system), `POST upgrade` (`{"channel", "version", "confirm": {"version", "revision"}, "reboot", "skip_backup"}`, 202), `GET job?since=N` (`log_total` is the line to ask from next; the last job's `started` (its identity), kind, target, state — `idle`, `running`, `done`, `failed`
   — and its log from line N; `result`, what a job that is done found: `backup-verify`'s message;
   `reboot`, `{"action", "drain_secs"}`, the reboot a job that is done scheduled as its last step), `GET events?after=N&wait=S` (`{"events": [...],
   "last", "dropped", "truncated"}`: the journal's entries after N (default 0), at most 200,
@@ -4436,7 +4566,7 @@ make e2e      # build, then ship / verify / promote / yank / prune examples/mini
 make smoke-install  # the installer on the local Docker engine: registry, stack, front, provision hook, re-run, status, upgrade, rollback; behind TLS the local CA, then byo with --ca, each one's CA published to the stack and what the front serves chaining to it; the byo install moved to internal and back by re-runs; a loopback install on `::1` with `--ipv6` (the stack's network and the front have IPv6); with a global IPv6 address on the host, a TLS install whose route has an allowlist, called from that address: `--ipv6` and the allowlist holding it serves, an allowlist without it refuses (403), and the same install moved off IPv6 refuses it too (the front sees Docker's IPv4 gateway)
 make e2e-docker     # build, then the real binaries against zot and the local Docker engine: ship examples/minimal 1.0.0, install it with the bootstrap one-liner, re-run, `notes-stow audit` with its release's scanner and `sbom export` of its SBOMs, the release's default tuning profile in status and the api container given the host's own settings and open files, ship 2.0.0 and 3.0.0 and reach each with notes-stow upgrade --version (each release's signature checked against the kept installer's key), roll back (allowed, then refused at a rollback barrier); then `mirror export` 3.0.0, `mirror import` into a TLS zot of its own test CA (refused without `--registry-ca`, the signatures carried), a second install from it with `--registry` and `--registry-ca`, `upgrade --version` reading it with the recorded CA, and `audit` reading the SBOMs and pulling the scanner from the mirror alone
 make e2e-full       # build, then examples/full as it stands on the Docker shape: ship this month's CalVer release with a token push, signed with the key its environment holds (env://), install it with the bootstrap one-liner (the installer image pulled with the project's own pull account) in loopback mode, every route serving, the api migrating a real Postgres and serving as its app role, the provision hook registering the administrator and its API key through the api and its credentials file 0600; the release's network tuning profile in status, `sbom export` of its SBOMs (the ui's taking a third-party script's package from the SBOM document its image ships), the api's namespace holding its settings, the host's open files and the host route's MTU on the stack's network; the install prints its endpoint (the api route's URL, also in `status`) and ends with the search extension's tip (`atlas-search`, not published on the channel); a re-run sets the search extension's input (`SEARCH_URL`, the api reaching it, no tip), another clears it (the tip again), the hook handed back the key it minted; the app's users revoke that key: `provision` fails naming `provision --set`, `provision --set ADMIN_API_KEY=` mints and registers another (in no log), the next run keeps it; its record lost, `provision --set ADMIN_API_KEY=<key>` gives the key the hook never returned (declared in `hooks.provision.returns`; an undeclared key refused) and no other is minted; re-runs turn forward auth on the api route on (no identity without the authentication service's answer, a forged header stripped) and off, narrow the ingest route's allowlist to another address and to none (403), set an advanced input and give it back to its default (status shows each); `secrets rotate` takes the internal secret through --stage, the swap and --finish, each value accepted while it must be and the old one refused after; ship .2 (a migration), upgrade --version (data kept, a pg_dump snapshot), roll back (allowed by the api image's reads-newer label); ship .3 (a migration that is a rollback barrier), upgrade, and rollback is refused naming the barrier and the snapshot
-make e2e-k8s        # build, then the real binaries against zot and a kind cluster pulling from it with the pull Secret: k8s install with the bootstrap script (the provision hook's Job run, what it returned in its Secret and not the log), upgrade --values, upgrade alone (what the hook returned handed back), upgrade --version 2.0.0, a refused downgrade, a failed upgrade helm rolls back, rollback, status, `audit --version 1.0.0` and `sbom export` of the cluster's release from the operator's machine (no install directory: the installer's keys and registry), reset-db (what the hook returned forgotten), uninstall refused without --data (the chart's own claim, which helm deletes), then uninstall --data removing the release, its Secrets, the hook's account and the claim, the namespace kept
+make e2e-k8s        # build, then the real binaries against zot and a kind cluster pulling from it with the pull Secret: k8s install with the bootstrap script (the provision hook's Job run, what it returned in its Secret and not the log), upgrade --values, upgrade alone (what the hook returned handed back), upgrade --version 2.0.0, a refused downgrade, a failed upgrade helm rolls back, rollback, status, `audit --version 1.0.0` and `sbom export` of the cluster's release from the operator's machine (no install directory: the installer's keys and registry), reset-db (what the hook returned forgotten), uninstall refused without --data (the chart's own claim, which helm deletes), then uninstall --data removing the release, its Secrets, the hook's account and the claim, the namespace kept; then across Stowage versions: the previous release's stowage (the latest `v*` tag but this tree's version, built from that tag with its own `make build` once and kept in `~/.cache/stowage-prev/<tag>`) ships 3.0.0 at schema baseline 1 and its installer installs it, this stowage ships 4.0.0 at baseline 2, whose `k8s upgrade` is refused naming 3.0.0's baseline, and `k8s reset-db --new-baseline` crosses
 make e2e-stateless  # build, then examples/stateless on the Docker shape: ship 1.0.0 (a pulled image, no database, no front) to zot, install it with the bootstrap one-liner (no TLS mode asked or recorded, no front running), the health path and the L4 route serving the input from an inline compose config, the state volume given the server's uid (the server, uid 1000, writes into it at start); a re-run changes the input, and the server is made again with it; `status` lists the L4 route; `--tls` refused, there being no front; ship 1.0.1, `upgrade --version 1.0.1` (nothing dumped) and `rollback` (no schema check), the input kept; `reset-db` refused, the release having no database
 make e2e-full-k8s   # build, then examples/full's chart on a kind cluster pulling from zot: k8s install with the bootstrap script against a Postgres outside the release (its two URLs and the administrator's password secret inputs from the operator's environment), two api replicas migrating once, the provision hook's Job registering the administrator and its API key (recorded in the outputs Secret, in no log; the Job deleted; no helm hook), every service answering, the api reaching the search extension's URL given at the install (`--set SEARCH_URL=…`), the endpoint printed as the api's Service URL; `k8s upgrade` of the same release, the key handed back to the hook; the app's users revoke the key, ship .2 (a migration), upgrade --version: the release runs .2 and the hook fails naming `k8s provision --set`, which mints and registers another key, and `k8s provision` again keeps it; its record lost, `k8s provision --set ADMIN_API_KEY=<key>` gives the key the hook never returned (an undeclared key refused) and no other is minted (data kept); rollback (the previous api on the newer schema); a second release in another namespace with the embedded Postgres, and reset-db deleting its database's claim, forgetting what the hook returned and registering the administrator again; `k8s secrets rotate` through its three passes, the release restarted at each, each value accepted while it must be; `k8s uninstall --yes` of the embedded release keeps its database's claim and its Secrets, and `k8s install` takes them back, the events kept
 make e2e-kairos     # build, then ship examples/minimal's OS bundle (its SBOM attested) and its qcow2 and ova disks and its three clouds' raw, vhd and gce to zot for real (each image docker-loaded from the bundle, each disk's zstd layer decompressed with `zstd -d` and checked in its format, the vhd and the gce as Azure and Google Cloud import them); the bundle's notes-stow on the local Docker engine as on the VM (install from the preloaded images with a settings file, boot, the host daemon's verbs, its disk-pressure POST to the api (the token never logged) and `status` showing it, its app socket and the api service's token and mount, `backup config`, `verify`, `run` to a WebDAV server through the preloaded runner, the backup decrypted and read by `pg_restore` and the uploads volume's archive beside it, `list`, `status`); with `STOWAGE_CLOUD_ENV=<file>` (a shell file of a cloud's `STOWAGE_<CLOUD>_*` settings and credentials, needs `tofu`), the images registered on the clouds it sets up, the others reported left out, and every image it registered destroyed at exit; re-ship (nothing built, nothing registered again), promote, `vm create` from the published notes-stow (the qcow2 by digest, the seed ISO), verify, prune; ship 2.0.0, whose notes-stow's boot upgrades the install, and 1.0.0's boot goes back

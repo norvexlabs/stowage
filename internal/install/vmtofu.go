@@ -643,6 +643,10 @@ func (in *Installer) awaitVM(ctx context.Context, dir, pin, user, addr, pubKey s
 	}
 }
 
+// destroyLookup bounds vm destroy's look for a disk to make the VM again: a registry that does
+// not answer delays the question no longer.
+var destroyLookup = 30 * time.Second
+
 // VMDestroy is a run of `vm destroy`.
 type VMDestroy struct {
 	Host string
@@ -677,6 +681,29 @@ func (in *Installer) DestroyVM(ctx context.Context, d *VMDestroy) error {
 	label := key
 	if i := slices.IndexFunc(Platforms, func(p Platform) bool { return p.Key == key }); i >= 0 {
 		label = Platforms[i].Label
+	}
+	// vm create makes a VM again from a disk of this release or of its channel: when there is
+	// none, or whether there is one is not known, it is said before the destroy is confirmed. It
+	// never stops the destroy.
+	if in.R.Spec.Shapes.Kairos != nil && in.R.Manifest.Artifacts.OS != "" {
+		prefix := in.R.Spec.Registry.Prefix
+		if o.Registry != "" {
+			prefix = strings.TrimSuffix(o.Registry, "/")
+		}
+		cl, err := in.registryClient(prefix)
+		if err == nil {
+			lctx, cancel := context.WithTimeout(ctx, destroyLookup)
+			_, err = in.bootDisks(lctx, cl, prefix)
+			cancel()
+		}
+		known := errors.As(err, new(noBootDisk))
+		switch m := in.R.Manifest; {
+		case err == nil:
+		case known:
+			fmt.Fprintf(o.Out, "Warning: %v; until then, a VM destroyed is not created again.\n", err)
+		default:
+			fmt.Fprintf(o.Out, "Whether a VM of %s %s can be created again is not known: its disks in %s could not be read (%v).\n", in.R.Spec.Name, m.ProjectVersion, prefix, err)
+		}
 	}
 	if !d.Yes {
 		if o.Prompt == nil {

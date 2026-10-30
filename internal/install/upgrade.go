@@ -29,6 +29,10 @@ const (
 	// SnapshotsDir holds the database dumps taken before each upgrade.
 	SnapshotsDir = "snapshots"
 	prevState    = "state.json"
+	// crossedFile records the releases a reset-db --new-baseline crossed from and to ("<from
+	// version> <revision> <to version> <revision>"): the install keeps no release to go back to;
+	// the next upgrade removes it.
+	crossedFile = ".stowage-crossed"
 )
 
 // stackFiles are the files an install's release writes (writeStack): the project's compose file,
@@ -141,6 +145,10 @@ func pinnedImages(env *EnvFile) bool {
 // database is dumped, the running release is kept in PrevDir for `rollback`, and this one is
 // written and started. Recorded values are kept; what the release adds — inputs, secrets, safe
 // defaults — is decided as a first install decides it.
+//
+// Across a schema baseline it refuses, unless in.crossing (reset-db --new-baseline) names the
+// release the install runs: the data is then wiped (wipeData) where the database would be dumped,
+// and no release is kept to go back to.
 func (in *Installer) Upgrade(ctx context.Context) error {
 	o := &in.O
 	if err := in.R.checkFront(); err != nil {
@@ -163,52 +171,17 @@ func (in *Installer) Upgrade(ctx context.Context) error {
 		}
 		return nil
 	}
+	if c := in.crossing; c != nil && (c.version != cur || c.revision != rev) {
+		return fmt.Errorf("%s runs %s %s (revision %s) now, not %s (revision %s), which was confirmed: nothing was wiped; reset-db --new-baseline again", o.Dir, name, cur, rev, c.version, c.revision)
+	}
 	if err := in.newer(cur, rev); err != nil {
 		return err
 	}
-	mode, _ := env.Get("STOWAGE_TLS_MODE")
-	pub, err := in.upgradeFits(env, mode)
+	mode, pub, added, kept, err := in.upgradeRefusals(ctx, env, name, cur, rev)
 	if err != nil {
 		return err
-	}
-	if o.Offline && pinnedImages(env) {
-		return errors.New("--offline: this install pulls its images by digest; an install made with --offline upgrades from loaded images")
 	}
 	o.Offline = !pinnedImages(env)
-	added := in.addedInputs(env, mode)
-	if err := in.onlyAdded(env, added); err != nil {
-		return err
-	}
-	if raw, err := os.ReadFile(filepath.Join(in.path(PrevDir), prevState)); err == nil {
-		var st state
-		if json.Unmarshal(raw, &st) == nil && st.ProjectVersion == cur && strconv.Itoa(st.Revision) == rev {
-			return fmt.Errorf("an upgrade from or a rollback to %s %s stopped before it finished: `%s rollback --dir %s` finishes it, back on %s %s", name, cur, in.ctl(), o.Dir, name, cur)
-		}
-	}
-	kept, err := in.keptInstaller(ctx, name, cur, rev)
-	if err != nil {
-		return err
-	}
-	if kept.Release == nil {
-		if in.R.Spec.HasDatabase() {
-			o.logf("the schema baseline of %s %s is not known (%s): not checked", name, cur, kept.foreign())
-		}
-	} else if from, to, ok := baselines(o, &Installer{R: kept.Release, O: in.O}, in); ok && from != to {
-		return fmt.Errorf("%s %s starts schema baseline %d, and the install runs %s %s, at baseline %d: its data cannot carry over, so it moves to %s only by a fresh install",
-			m.Name, m.ProjectVersion, to, name, cur, from, m.ProjectVersion)
-	}
-	if o.Self == "" {
-		return errors.New("an upgrade keeps the installer it runs as the install's: its path is not known")
-	}
-	if err := in.volumesSplit(); err != nil {
-		return err
-	}
-	if err := in.checkDocker(ctx); err != nil {
-		return err
-	}
-	if err := in.l4Upgrade(ctx, env, mode); err != nil {
-		return err
-	}
 	in.recorded = map[string]string{}
 	for _, k := range env.Keys() {
 		in.recorded[k], _ = env.Get(k)
@@ -257,7 +230,7 @@ func (in *Installer) Upgrade(ctx context.Context) error {
 	}
 	st := state{ProjectVersion: cur}
 	st.Revision, _ = strconv.Atoi(rev)
-	if in.schemaOn() {
+	if in.schemaOn() && in.crossing == nil {
 		st.Schema, err = (schema{in: in, stack: env}).current(ctx, next)
 		if ctx.Err() == nil && err != nil {
 			o.logf("the schema version could not be read (%v): a rollback will not be checked against it", err)
@@ -266,25 +239,53 @@ func (in *Installer) Upgrade(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("stopped before anything changed: %w", err)
 	}
-	if st.Snapshot, err = in.snapshot(ctx, env); err != nil {
-		return err
-	}
-	if err := in.keepPrev(env, st, kept); err != nil {
-		return err
+	if in.crossing != nil {
+		// No release is kept to go back to, nor one left by a rollback: across a baseline neither
+		// reads the data.
+		if err := in.wipeData(ctx, env, in.crossing.old); err != nil {
+			return err
+		}
+		for _, d := range []string{PrevDir, FailedDir} {
+			if err := os.RemoveAll(in.path(d)); err != nil {
+				return err
+			}
+		}
+	} else {
+		if st.Snapshot, err = in.snapshot(ctx, env); err != nil {
+			return err
+		}
+		if err := in.keepPrev(env, st, kept); err != nil {
+			return err
+		}
 	}
 	// .env is the switch: before it the install still runs the release it ran (a re-run of its
 	// installer rewrites the stack files), after it this release.
 	if err := in.writeStack(next); err != nil {
 		return err
 	}
+	// A crossing's releases are recorded before the switch, the record dropped by another
+	// upgrade after it: a record naming releases the install does not run means nothing.
+	if in.crossing != nil {
+		if err := writeAtomic(in.path(crossedFile), strings.NewReader(fmt.Sprintf("%s %s %s %d\n", cur, rev, m.ProjectVersion, m.Revision)), 0o600, nil); err != nil {
+			return err
+		}
+	}
 	if err := next.WriteFile(in.path(envName)); err != nil {
 		return err
+	}
+	if in.crossing == nil {
+		if err := os.Remove(in.path(crossedFile)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			o.logf("warning: removing %s: %v", in.path(crossedFile), err)
+		}
 	}
 	in.forgetChanges()
 	if err := in.copySelf(); err != nil {
 		return fmt.Errorf("the installer could not be kept (%w)\nthe install runs %s now: `%s --dir %s` keeps it and starts it", err, m.ProjectVersion, o.Self, o.Dir)
 	}
 	if err := in.up(ctx, next); err != nil {
+		if in.crossing != nil {
+			return fmt.Errorf("%w\nthe install runs %s %s, its data wiped: `%s --dir %s` starts it again", err, name, m.ProjectVersion, in.ctl(), o.Dir)
+		}
 		return fmt.Errorf("%w\n%s %s is kept: `%s rollback --dir %s` goes back to it", err, name, cur, in.ctl(), o.Dir)
 	}
 	h, err := in.hook()
@@ -297,6 +298,66 @@ func (in *Installer) Upgrade(ctx context.Context) error {
 	in.installDone() // a first install that stopped is finished by an upgrade whose stack came up
 	in.upgraded = true
 	return nil
+}
+
+// upgradeRefusals runs what an upgrade of the install env records (name cur at revision rev) to
+// this release refuses before it asks or changes anything: its front, ports, hook and schema
+// compat (upgradeFits, returning the TLS mode and the ports), the inputs it adds (returned), an
+// upgrade or rollback that stopped, the release the install runs (its kept installer, returned)
+// and the schema baseline — crossed only with in.crossing, whose old release it reads (wipeOf)
+// each time, under whatever lock its caller holds —, Docker and the L4 routes' ports. It writes
+// nothing but in.crossing.old.
+func (in *Installer) upgradeRefusals(ctx context.Context, env *EnvFile, name, cur, rev string) (mode string, pub publish, added []input, kept *keptRelease, err error) {
+	o, m := &in.O, in.R.Manifest
+	mode, _ = env.Get("STOWAGE_TLS_MODE")
+	pub, err = in.upgradeFits(env, mode)
+	if err != nil {
+		return "", publish{}, nil, nil, err
+	}
+	if o.Offline && pinnedImages(env) {
+		return "", publish{}, nil, nil, errors.New("--offline: this install pulls its images by digest; an install made with --offline upgrades from loaded images")
+	}
+	added = in.addedInputs(env, mode)
+	if err := in.onlyAdded(env, added); err != nil {
+		return "", publish{}, nil, nil, err
+	}
+	if raw, err := os.ReadFile(filepath.Join(in.path(PrevDir), prevState)); err == nil {
+		var st state
+		if json.Unmarshal(raw, &st) == nil && st.ProjectVersion == cur && strconv.Itoa(st.Revision) == rev {
+			return "", publish{}, nil, nil, fmt.Errorf("an upgrade from or a rollback to %s %s stopped before it finished: `%s rollback --dir %s` finishes it, back on %s %s", name, cur, in.ctl(), o.Dir, name, cur)
+		}
+	}
+	kept, err = in.keptInstaller(ctx, name, cur, rev)
+	if err != nil {
+		return "", publish{}, nil, nil, err
+	}
+	if in.crossing != nil {
+		if err := in.crosses(kept, name, cur); err != nil {
+			return "", publish{}, nil, nil, err
+		}
+		if in.crossing.old, err = in.wipeOf(kept); err != nil {
+			return "", publish{}, nil, nil, err
+		}
+		if wipe, _, _, _, err := in.wipeSet(in.crossing.old); err != nil || len(wipe) == 0 {
+			return "", publish{}, nil, nil, cmp.Or(err, fmt.Errorf("neither %s %s nor %s %s names a volume in data.reset: --new-baseline has nothing to wipe, and the new release would start on the old baseline's data", name, cur, name, m.ProjectVersion))
+		}
+	} else if from, to, ok := baselines(o, kept, in); ok && from != to {
+		return "", publish{}, nil, nil, fmt.Errorf("%s %s starts schema baseline %d, and the install runs %s %s, at baseline %d: its data cannot carry over, so it moves to %s only with its data wiped: `%s reset-db --new-baseline --dir %s` wipes it and installs %s",
+			m.Name, m.ProjectVersion, to, name, cur, from, m.ProjectVersion, cmp.Or(o.Self, in.ctl()), o.Dir, m.ProjectVersion)
+	}
+	if o.Self == "" {
+		return "", publish{}, nil, nil, errors.New("an upgrade keeps the installer it runs as the install's: its path is not known")
+	}
+	if err := in.volumesSplit(); err != nil {
+		return "", publish{}, nil, nil, err
+	}
+	if err := in.checkDocker(ctx); err != nil {
+		return "", publish{}, nil, nil, err
+	}
+	if err := in.l4Upgrade(ctx, env, mode); err != nil {
+		return "", publish{}, nil, nil, err
+	}
+	return mode, pub, added, kept, nil
 }
 
 // upgradeFits refuses a release the install cannot move to as it stands, before anything is asked:
@@ -852,7 +913,7 @@ func (in *Installer) Rollback(ctx context.Context) error {
 			rolled.Set(k, v)
 		}
 	}
-	if err := in.baselineCheck(back, st); err != nil {
+	if err := in.baselineCheck(pk, st); err != nil {
 		return err
 	}
 	if err := in.volumesSplit(); err != nil {
@@ -1008,30 +1069,36 @@ func (in *Installer) baseline() (int, error) {
 	return providers.SchemaBaseline(in.R.Spec.DB().SchemaCompat)
 }
 
+func (in *Installer) projectVersion() string { return in.R.Manifest.ProjectVersion }
+
+// baselined is a release whose schema baseline is told: an installer's own, or a kept release's,
+// read from its payload whichever Stowage built it.
+type baselined interface {
+	baseline() (int, error)
+	projectVersion() string
+}
+
 // baselines are the schema baselines of the releases from (the install's) and to; ok is false
 // when either has no database or its baseline does not read (said in the log): the check then
 // does not refuse.
-func baselines(o *Options, from, to *Installer) (int, int, bool) {
+func baselines(o *Options, from, to baselined) (int, int, bool) {
 	a, err := from.baseline()
 	if err != nil {
-		o.logf("the schema baseline of %s is not known (%v): not checked", from.R.Manifest.ProjectVersion, err)
+		o.logf("the schema baseline of %s is not known (%v): not checked", from.projectVersion(), err)
 		return 0, 0, false
 	}
 	b, err := to.baseline()
 	if err != nil {
-		o.logf("the schema baseline of %s is not known (%v): not checked", to.R.Manifest.ProjectVersion, err)
+		o.logf("the schema baseline of %s is not known (%v): not checked", to.projectVersion(), err)
 		return 0, 0, false
 	}
 	return a, b, a != 0 && b != 0
 }
 
 // baselineCheck refuses to go back to the release back when it starts another schema baseline
-// than the installed one: decided from the two specs alone, before Docker is asked anything. A
-// release another Stowage built (back nil) is not checked.
-func (in *Installer) baselineCheck(back *Installer, st state) error {
-	if back == nil {
-		return nil // another Stowage's release: said by Rollback
-	}
+// than the installed one: decided from the two specs alone, before Docker is asked anything, back's
+// read from its payload whichever Stowage built it.
+func (in *Installer) baselineCheck(back *keptRelease, st state) error {
 	from, to, ok := baselines(&in.O, in, back)
 	if !ok || from == to {
 		return nil

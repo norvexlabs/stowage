@@ -310,7 +310,12 @@ func (in *Installer) CreateVM(ctx context.Context, c *VMCreate) error {
 		return err
 	}
 	if boot.release != m.Tag {
-		o.logf("fetching %s's %s disk of %s (%s): %s %s published none, its first boot takes its OS bundle", name, format, boot.release, registry.Short(ref.DigestStr()), name, m.ProjectVersion)
+		why := "published none"
+		if len(m.Artifacts.Disks) > 0 {
+			why = "has none left in " + prefix + " (a later ship's disk set replaced them)"
+		}
+		o.logf("fetching %s's %s disk of %s (%s): %s %s %s. The VM boots %s's OS first; its first boot writes %s's OS bundle and reboots into it, and an install on the VM is refused until then",
+			name, format, boot.release, registry.Short(ref.DigestStr()), name, m.ProjectVersion, why, boot.release, m.Tag)
 	} else {
 		o.logf("fetching %s's %s disk (%s)", name, format, registry.Short(ref.DigestStr()))
 	}
@@ -537,10 +542,15 @@ func (in *Installer) bootDisks(ctx context.Context, cl *registry.Client, prefix 
 	}
 	repo := prefix + "/" + name + "-release"
 	ptr, h, err := readRelease(ctx, cl, repo, m.Channel)
+	// unread is why the channel's release was not read: then "no disk" is no answer.
+	var unread error
 	if err != nil {
 		// Unread (another stowage's), it boots nothing here: the record may.
 		in.O.logf("the channel %s's release could not be read (%v): its disk set record is tried", m.Channel, err)
 		ptr = nil
+		if !errors.As(err, new(foreignManifest)) {
+			unread = err
+		}
 	}
 	if ptr != nil && ptr.Name == name && ptr.Channel == m.Channel {
 		r, err := cl.Repo(repo)
@@ -586,11 +596,20 @@ func (in *Installer) bootDisks(ctx context.Context, cl *registry.Client, prefix 
 			return d, err
 		}
 	}
-	if cannot != nil {
-		return bootDisk{}, cannot
+	if unread != nil {
+		return bootDisk{}, fmt.Errorf("%s %s has no disk in %s, and its channel %s's release could not be read: %w", name, m.ProjectVersion, prefix, m.Channel, unread)
 	}
-	return bootDisk{}, fmt.Errorf("%s %s has no disk in %s, nor does its channel %s: the publisher ships a release with its disks (stowage ship --disks)", name, m.ProjectVersion, prefix, m.Channel)
+	if cannot != nil {
+		return bootDisk{}, noBootDisk{cannot}
+	}
+	return bootDisk{}, noBootDisk{fmt.Errorf("%s %s has no disk in %s, nor does its channel %s: the publisher ships a release with its disks (stowage ship --disks)", name, m.ProjectVersion, prefix, m.Channel)}
 }
+
+// noBootDisk is bootDisks' answer that the registry holds no disk set a VM of the release boots,
+// told apart from a registry that could not be read.
+type noBootDisk struct{ error }
+
+func (e noBootDisk) Unwrap() error { return e.error }
 
 // secretsSteps tells how to give a VM's install its secrets file: copied over, its mode kept
 // 0600, then an install on a terminal, which can ask what the file does not hold.

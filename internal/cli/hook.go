@@ -107,6 +107,7 @@ func (o *options) postCommit(channel string, disks bool) error {
 		args = append(args, "-f", spec)
 	}
 	args = append(args, "hook", "post-commit", "--channel", channel, "--ship", d.Version, "--commit", d.Commit)
+	disks = disks || p.Spec.Shapes.Kairos.AlwaysDisks()
 	if disks {
 		args = append(args, "--disks")
 	}
@@ -114,11 +115,16 @@ func (o *options) postCommit(channel string, disks bool) error {
 	if err := o.launch(exe, args, logPath); err != nil {
 		return fmt.Errorf("start the ship of %s: %w", d.Version, err)
 	}
+	// The disks are said where they are decided: a release without them is one vm create refuses
+	// unless the channel's disks boot it.
 	with := ""
-	if disks {
-		with = ", with its disks,"
+	switch {
+	case disks:
+		with = ", with its disks"
+	case p.Spec.Shapes.Kairos != nil && len(p.Spec.Shapes.Kairos.DiskFormats) > 0:
+		with = ", without disks (vm create of it refused unless the channel's disks boot it)"
 	}
-	fmt.Fprintf(o.out, "stowage hook: release %s%s: ship to channel %s started in the background\n  follow: tail -f %s\n", d.Version, with, channel, logPath)
+	fmt.Fprintf(o.out, "stowage hook: release %s: ship to channel %s started in the background%s\n  follow: tail -f %s\n", d.Version, channel, with, logPath)
 	return nil
 }
 

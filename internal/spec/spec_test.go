@@ -1,6 +1,7 @@
 package spec
 
 import (
+	"encoding/json"
 	"reflect"
 	"strings"
 	"testing"
@@ -85,6 +86,32 @@ signing: { provider: cosign-key, key: env://SECRET, public_keys: [a.pub] }
 	// The original is untouched.
 	if s.Signing.Config["key"] != "env://SECRET" || s.Channels == nil {
 		t.Error("RuntimeView mutated the spec")
+	}
+}
+
+// The disks policy is the publisher's: no view an artifact carries keeps it, and the spec does.
+func TestTheDisksPolicyIsThePublishers(t *testing.T) {
+	t.Parallel()
+	s, err := Parse([]byte(base + "shapes:\n  kairos:\n    disks: always\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v := s.RuntimeView(); v.Shapes.Kairos.Disks != "" || v.Shapes.Kairos.AlwaysDisks() {
+		t.Errorf("the runtime view keeps the policy: %+v", v.Shapes.Kairos)
+	}
+	if v := s.BundleView(); v.Shapes.Kairos.Disks != "" {
+		t.Errorf("the bundle view keeps the policy: %+v", v.Shapes.Kairos)
+	}
+	// Left out of the view's JSON, which inputs digests hash: a release's inputs are as before it.
+	if b, err := json.Marshal(s.RuntimeView()); err != nil || strings.Contains(string(b), `"Disks"`) {
+		t.Errorf("the runtime view's JSON names the policy: %v %s", err, b)
+	}
+	if !s.Shapes.Kairos.AlwaysDisks() {
+		t.Error("a view dropped the spec's own policy")
+	}
+	var none *KairosShape
+	if none.AlwaysDisks() || (&KairosShape{Disks: DisksOptIn}).AlwaysDisks() {
+		t.Error("AlwaysDisks without disks: always")
 	}
 }
 

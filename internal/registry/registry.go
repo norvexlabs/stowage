@@ -62,7 +62,8 @@ func WithTransport(rt http.RoundTripper) Option { return func(c *Client) { c.rt 
 // transport; one WithTransport gives is used as it is.
 func WithRootCAs(pool *x509.CertPool) Option { return func(c *Client) { c.roots = pool } }
 
-// WithLog has the client write a large blob's push progress, and its retries, to w.
+// WithLog has the client write a large blob's push progress and its retries, and a download's
+// resumes, to w.
 func WithLog(w io.Writer) Option { return func(c *Client) { c.log = w } }
 
 // maxCA bounds a CA file.

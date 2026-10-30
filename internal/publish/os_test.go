@@ -234,6 +234,35 @@ func TestPromoteRetagsTheBundleAndDisks(t *testing.T) {
 	eq(t, "built", len(e.builder.built), 0)
 }
 
+// shapes.kairos.disks: always publishes the disks with every ship not asked for them; a promotion,
+// which builds nothing, still publishes the disks of the release it promotes, here none.
+func TestTheDisksPolicyAlways(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	e.noDisks = true
+	beta := e.mustShip("beta", 1)
+	eq(t, "opt-in: disks", len(beta.Manifest.Artifacts.Disks)+len(e.disks.made), 0)
+	b, err := os.ReadFile(filepath.Join(e.root, "stowage.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	at := bytes.Index(b, []byte("disk_formats:"))
+	line := b[bytes.LastIndexByte(b[:at], '\n')+1 : at+len("disk_formats:")]
+	testutil.Edit(t, e.root, "stowage.yaml", string(line), strings.TrimSuffix(string(line), "disk_formats:")+"disks: always\n"+string(line))
+	p, v := e.publisher()
+	e.builder.built, e.disks.made = nil, nil
+	st, err := p.Promote(context.Background(), v, "beta", "stable", 1)
+	if err != nil {
+		t.Fatalf("promote: %v\n%s", err, e.log)
+	}
+	eq(t, "promoted: disks", len(st.Manifest.Artifacts.Disks)+len(e.disks.made), 0)
+	e.bump("1.1.0")
+	next := e.mustShip("beta", 1)
+	if len(e.disks.made) == 0 || next.Manifest.Artifacts.Disks["qcow2"] == "" {
+		t.Fatalf("always: made %v, disks %v", e.disks.made, next.Manifest.Artifacts.Disks)
+	}
+}
+
 // Each disk is kept on its bundle and format: a format added is the only disk made, and a format
 // dropped loses its latest tag.
 func TestDiskFormatsAreMadeOneByOne(t *testing.T) {

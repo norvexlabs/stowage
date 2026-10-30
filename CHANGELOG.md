@@ -3,6 +3,38 @@
 Stowage's own releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
+## [0.18.0]
+
+### Added
+- **`reset-db --new-baseline` on Docker and the VM**: run by the installer of a later release at
+  another schema baseline, it wipes the data and installs that release with the install's
+  values, keeping the host, its keys, certificates and generated secrets. On the VM it writes
+  the release's OS and its boot does the crossing. Kubernetes had it already.
+- **`shapes.kairos.disks: always`** publishes the VM disks with every ship, the commit hook's
+  included (default `opt-in`, as before).
+- A release's summary (`ship`, `promote`, `verify`) names what each shape can install; for VMs
+  it says whether `vm create` has disks to boot, and the exact `ship --disks` that publishes
+  them when it does not. The commit hook's started line says whether its ship publishes disks.
+- `vm destroy` warns, before asking, when neither the release nor its channel has a disk to
+  create the VM again.
+- On a VM that fell back to its passive system, `updates` offers the release it runs and
+  `upgrade` writes it to the active slot again, replacing the release that failed.
+
+### Changed
+- An upgrade across a schema baseline names `reset-db --new-baseline` as the way across. The
+  VM's `upgrade` refuses it before writing the OS, instead of a boot that falls back.
+- `vm create` booting another release's disk says so, and why, as it fetches it.
+
+### Fixed
+- The schema baseline of a release an older (or newer) Stowage built is read again: it was
+  unknown whenever that release's spec held a field this Stowage dropped, so `k8s reset-db
+  --new-baseline` refused to cross out of it and an upgrade across a baseline went unchecked.
+- A VM's first install had two deciders: an operator's `install` run while the first boot
+  switched to the release the settings name installed the OS's own release, and the switch's
+  reboot then left the VM on its passive slot. That `install` now waits for the switch.
+- A disk download cut short (a dropped connection, an HTTP/2 stream reset) or stalled resumes
+  from the byte reached instead of failing, or hanging, `vm create`.
+
 ## [0.17.0] - 2026-10-29
 
 ### Added
