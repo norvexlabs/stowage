@@ -3,7 +3,7 @@
 Stowage's own releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
-## [0.18.0]
+## [0.18.0] - 2026-10-30
 
 ### Added
 - **`reset-db --new-baseline` on Docker and the VM**: run by the installer of a later release at
