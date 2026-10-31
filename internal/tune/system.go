@@ -169,15 +169,15 @@ func (s System) irqs(n nic) []int {
 	return nil
 }
 
-// irqsStacked reports whether two or more interrupts all land on the same CPUs (their effective
-// affinity, else the one asked for): a NIC whose queues are all served by one CPU.
+// irqsStacked reports whether two or more interrupts all land on the same CPUs now (irqRunsOn): a
+// NIC whose queues are all served by one CPU.
 func (s System) irqsStacked(irqs []int) bool {
 	if len(irqs) < 2 {
 		return false
 	}
 	first := ""
 	for i, irq := range irqs {
-		cpus, ok := s.irqCPUs(irq)
+		cpus, ok := s.irqRunsOn(irq)
 		if !ok {
 			return false
 		}
@@ -190,14 +190,56 @@ func (s System) irqsStacked(irqs []int) bool {
 	return true
 }
 
-// irqCPUs are the CPUs an interrupt runs on: its effective affinity, else the one asked.
+// irqCPUs are the CPUs an interrupt is judged on against the services' cores: where it runs
+// (irqRunsOn), but the affinity asked for one that never fired whose effective CPUs lie outside
+// it, which it takes when it first fires.
 func (s System) irqCPUs(irq int) (string, bool) {
-	dir := filepath.Join("proc/irq", strconv.Itoa(irq))
-	cpus, ok := s.read(filepath.Join(dir, "effective_affinity_list"))
-	if !ok || cpus == "" {
-		cpus, ok = s.read(filepath.Join(dir, "smp_affinity_list"))
+	cpus, ok := s.irqRunsOn(irq)
+	if !ok {
+		return cpus, ok
+	}
+	// The kernel moves an MSI interrupt when it next fires: one that never fired (a virtio NIC's
+	// config interrupt) keeps the effective affinity it had before the one asked, and runs on the
+	// one asked when it does. One that fired is where its effective affinity says.
+	asked, askedOK := s.read(filepath.Join("proc/irq", strconv.Itoa(irq), "smp_affinity_list"))
+	if _, parsed := cpuList(asked); askedOK && parsed && !within(cpus, asked) && s.neverFired(irq) {
+		return asked, true
 	}
 	return cpus, ok
+}
+
+// irqRunsOn are the CPUs an interrupt runs on as the kernel says now: its effective affinity, else
+// the one asked (empty reads as unread).
+func (s System) irqRunsOn(irq int) (string, bool) {
+	dir := filepath.Join("proc/irq", strconv.Itoa(irq))
+	if cpus, ok := s.read(filepath.Join(dir, "effective_affinity_list")); ok && cpus != "" {
+		return cpus, true
+	}
+	cpus, ok := s.read(filepath.Join(dir, "smp_affinity_list"))
+	return cpus, ok && cpus != ""
+}
+
+// neverFired reports whether the interrupt has fired on no CPU since boot (its per_cpu_count all
+// zeros); false when the count does not read.
+func (s System) neverFired(irq int) bool {
+	raw, ok := s.read(filepath.Join("sys/kernel/irq", strconv.Itoa(irq), "per_cpu_count"))
+	if !ok || raw == "" {
+		return false
+	}
+	for f := range strings.SplitSeq(raw, ",") {
+		if n, err := strconv.ParseUint(strings.TrimSpace(f), 10, 64); err != nil || n != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// within reports whether every CPU of the list a lies in the list b; false when either does not
+// parse.
+func within(a, b string) bool {
+	x, ok1 := cpuList(a)
+	y, ok2 := cpuList(b)
+	return ok1 && ok2 && !slices.ContainsFunc(x, func(id int) bool { return !slices.Contains(y, id) })
 }
 
 // irqsOn are the interrupts whose CPUs (irqCPUs) reach one of cpus, and those whose CPUs do not

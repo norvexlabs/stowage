@@ -3,6 +3,13 @@
 Stowage's own releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
+## [0.19.1]
+
+### Fixed
+- **`tune --check` no longer reports an interrupt that never fired** (a virtio NIC's config
+  interrupt) as one on the services' cores after every boot: it is judged by the CPUs it was
+  given, which it takes when it first fires.
+
 ## [0.19.0] - 2026-10-31
 
 ### Added

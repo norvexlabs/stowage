@@ -355,6 +355,12 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
 
 ## Could
 
+- **An interrupt that fired once before the boot moved it**: `tune --check` judges a NIC
+  interrupt that never fired (`per_cpu_count` all zeros) by the affinity asked, since the kernel
+  moves it only when it next fires; one that fired once before the boot's write (a virtio config
+  interrupt at probe) and never again keeps its old effective CPU and is still reported. Record
+  the counts when the boot writes the affinity, and judge by the asked one while they have not
+  grown.
 - **The update volume's name is Compose's default**: the overlap finds the old container's mount
   of `<project>_stowage-update-<service>`, the name Compose gives the volume the installer declares
   without a `name:`. Declare it with an explicit `name:` from one helper both use, so a change to
@@ -832,6 +838,10 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
   changed during the ship would sign unchecked. The check beside each sign call would close it.
 - **An empty `services:` is caught by lint alone**, from the file: decoding takes it as no
   key. A presence check in spec decoding would give every reader of the spec the refusal.
+- **A suite's free port can be taken before it binds**: `free_port` hands out a port from the
+  kernel's ephemeral range, which the parallel suites' connections and docker-proxy draw from
+  too; e2e-docker once lost its mirror install's front port that way and passed alone. A port
+  range of its own per suite, outside the ephemeral one, would close it.
 
 ## Won't — not in the first version
 

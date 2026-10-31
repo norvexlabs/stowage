@@ -1597,7 +1597,13 @@ every shape, the VM end-to-end test upgrading through it), then the health gate.
   allocated, not named: a release cannot know a host's CPU ids, so the install gives whole cores
   from the top, a core's threads together, never CPU 0's (the host's timers and default interrupts),
   the same on every start and boot, and `tune` computes the same sets for the NICs' steering, with
-  no state between them. A service's nftables table is a file of one `table inet <service>`, which
+  no state between them. An interrupt is judged where it runs,
+  its effective affinity, but the kernel moves an MSI interrupt only when it next fires: one that
+  never fired (a virtio NIC's config interrupt) would keep its old CPUs for good, so when those lie
+  outside the affinity asked it is judged by the one asked. One that fires is judged by its
+  effective CPUs even outside the ones asked: the kernel may place a vector elsewhere for good (no
+  vector free there), which is the drift `--check` exists to show. Whether a NIC's interrupts are
+  stacked is where they run now. A service's nftables table is a file of one `table inet <service>`, which
   the VM replaces whole in one transaction (no doubled rule, no gap) when it is absent or changed,
   leaving the sets a service fed otherwise, a changed one recreating its service so it feeds them
   again, and deletes once the release drops it; the host's own table stays Stowage's, and the app socket feeds only

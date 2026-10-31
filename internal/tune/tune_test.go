@@ -1555,8 +1555,40 @@ func TestTheNICsInterruptsLeaveTheServicesCores(t *testing.T) {
 	if it := find(s.Inspect(ctx, h), "nic", "eth0 interrupts"); it == nil || it.State != Advice || !strings.HasPrefix(it.Have, "1 of 2 whose CPUs do not read (IRQ 25)") {
 		t.Errorf("an affinity that does not read: %+v", it)
 	}
-	// A NIC of one interrupt is judged against the services' cores too.
+	// The kernel moves an MSI interrupt when it next fires: one that never fired (a virtio NIC's
+	// config interrupt), its effective CPUs outside the ones asked, even in part, is judged by the
+	// ones asked; one that fired, by its effective CPUs, outside the asked ones or not.
+	write(t, s.Root, "proc/irq/25/smp_affinity_list", "1\n")
+	for eff, want := range map[string]bool{"3\n": true, "1-3\n": true} {
+		write(t, s.Root, "proc/irq/25/effective_affinity_list", eff)
+		for count, ok := range map[string]bool{"0,0,0,0\n": want, "0,0,0,7\n": false, "": false} {
+			if count == "" {
+				_ = os.Remove(filepath.Join(s.Root, "sys/kernel/irq/25/per_cpu_count"))
+			} else {
+				write(t, s.Root, "sys/kernel/irq/25/per_cpu_count", count)
+			}
+			it := find(s.Inspect(ctx, h), "nic", "eth0 interrupts")
+			switch {
+			case ok && (it == nil || it.State != OK || it.Have != "2, off the services' cores"):
+				t.Errorf("effective %q, counts %q, judged by the asked CPU: %+v", eff, count, it)
+			case !ok && (it == nil || it.State != Differs || it.Have != "1 of 2 on the services' cores (IRQ 25)"):
+				t.Errorf("effective %q, counts %q, judged by the effective CPUs: %+v", eff, count, it)
+			}
+		}
+	}
+	// An asked affinity that does not read leaves the effective one to judge.
+	write(t, s.Root, "sys/kernel/irq/25/per_cpu_count", "0,0,0,0\n")
+	write(t, s.Root, "proc/irq/25/effective_affinity_list", "3\n")
+	write(t, s.Root, "proc/irq/25/smp_affinity_list", "\n")
+	if it := find(s.Inspect(ctx, h), "nic", "eth0 interrupts"); it == nil || it.State != Differs || it.Have != "1 of 2 on the services' cores (IRQ 25)" {
+		t.Errorf("an asked affinity that does not read: %+v", it)
+	}
+	_ = os.Remove(filepath.Join(s.Root, "sys/kernel/irq/25/per_cpu_count"))
+	// A NIC of one interrupt is judged against the services' cores too: one that never fired, by
+	// an effective affinity within the one asked.
 	_ = os.Remove(filepath.Join(s.Root, "sys/class/net/eth0/device/msi_irqs/25"))
+	write(t, s.Root, "sys/kernel/irq/24/per_cpu_count", "0,0,0,0\n")
+	write(t, s.Root, "proc/irq/24/smp_affinity_list", "0-3\n")
 	write(t, s.Root, "proc/irq/24/effective_affinity_list", "3\n")
 	if it := find(s.Inspect(ctx, h), "nic", "eth0 interrupts"); it == nil || it.State != Differs || it.Have != "1 of 1 on the services' cores (IRQ 24)" {
 		t.Errorf("one interrupt on a service's core: %+v", it)
@@ -1959,5 +1991,24 @@ func TestAppliedForwardingIsNotAdvised(t *testing.T) {
 	}
 	if !slices.Contains(ok, "its forwarding out of uplink applied by each start (tune --apply)") {
 		t.Errorf("ok: %v", ok)
+	}
+}
+
+// Whether a NIC's interrupts are stacked is where they run now: one that never fired, asked
+// elsewhere, does not make the queues look spread.
+func TestStackedInterruptsAreWhereTheyRunNow(t *testing.T) {
+	t.Parallel()
+	s, _ := fakeHost(t, "1500")
+	for _, irq := range []string{"24", "25", "26"} {
+		write(t, s.Root, "proc/irq/"+irq+"/effective_affinity_list", "0\n")
+		write(t, s.Root, "proc/irq/"+irq+"/smp_affinity_list", "0-3\n")
+	}
+	write(t, s.Root, "proc/irq/26/smp_affinity_list", "2\n")
+	write(t, s.Root, "sys/kernel/irq/26/per_cpu_count", "0,0,0,0\n")
+	if !s.irqsStacked([]int{24, 25, 26}) {
+		t.Error("the queues on CPU 0 are not stacked")
+	}
+	if cpus, _ := s.irqCPUs(26); cpus != "2" {
+		t.Errorf("the never-fired interrupt judged on %q, want the asked 2", cpus)
 	}
 }
