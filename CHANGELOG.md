@@ -3,7 +3,7 @@
 Stowage's own releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
-## [0.19.1]
+## [0.19.1] - 2026-10-31
 
 ### Fixed
 - **`tune --check` no longer reports an interrupt that never fired** (a virtio NIC's config
