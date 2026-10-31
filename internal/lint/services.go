@@ -36,6 +36,7 @@ func (l *linter) serviceHost(at, name string, svc spec.Service) {
 		l.nftTable(at+".nftables", name, f)
 	}
 	l.serviceNetwork(at, name, svc)
+	l.frontHosts(at, name, svc)
 	switch {
 	case (svc.Interface == "") != (svc.AddressInput == ""):
 		l.errf(at, "interface and address_input go together: the NIC its address is on, and the input giving it")
@@ -64,6 +65,22 @@ func (l *linter) serviceHost(at, name string, svc spec.Service) {
 				l.errf(at+".interface", "%s runs with network_mode %s: its address of its own is a network beside the stack's", name, s.NetworkMode)
 			}
 		}
+	}
+}
+
+// frontHosts checks front_hosts: loopback, host-gateway or none, for a service the install runs
+// on the host's network (host_network, or with a kairos shape an L4 route's upstream).
+func (l *linter) frontHosts(at, name string, svc spec.Service) {
+	switch svc.FrontHosts {
+	case "":
+		return
+	case spec.FrontHostsLoopback, spec.FrontHostsGateway, spec.FrontHostsNone:
+	default:
+		l.errf(at+".front_hosts", "%q: %s (the default), %s or %s", svc.FrontHosts, spec.FrontHostsLoopback, spec.FrontHostsGateway, spec.FrontHostsNone)
+		return
+	}
+	if !svc.HostNetwork && (l.s.Shapes.Kairos == nil || l.l4Route(name) < 0) {
+		l.errf(at+".front_hosts", "is where a service on the host's network reaches the front's domains: %s is not on it (host_network, or an L4 route's upstream on the VM)", name)
 	}
 }
 
@@ -125,6 +142,12 @@ func (l *linter) serviceUpdate(at, name string, svc spec.Service) {
 		if svc.UpdateSignal != "" {
 			l.errf(at+".update_signal", "is what a start-first overlap sends the old container: set update: %s", spec.UpdateStartFirst)
 		}
+		if svc.UpdateReady != "" {
+			l.errf(at+".update_ready", "is the file a start-first overlap's new container writes once ready: set update: %s", spec.UpdateStartFirst)
+		}
+		if svc.UpdateDeclineStatus != nil {
+			l.errf(at+".update_decline_status", "is how a start-first overlap's new container declines it: set update: %s", spec.UpdateStartFirst)
+		}
 		return
 	case spec.UpdateStartFirst:
 	default:
@@ -134,6 +157,7 @@ func (l *linter) serviceUpdate(at, name string, svc spec.Service) {
 	if d := svc.UpdateSocket; d != "" && (!path.IsAbs(d) || path.Clean(d) != d || d == "/") {
 		l.errf(at+".update_socket", "%q: a directory of the container, an absolute clean path other than /", d)
 	}
+	l.updateReady(at, svc)
 	if svc.Interface != "" {
 		l.errf(at+".update", "%s has an address of its own (interface), which two containers cannot hold at once", name)
 	}
@@ -214,6 +238,32 @@ func (l *linter) serviceUpdate(at, name string, svc spec.Service) {
 	}
 	if h != nil && !offKnown {
 		l.warnf(at+".update", "%s's healthcheck disable is %v, which only a run knows or Compose does not read as a boolean: the overlap waits for its healthcheck", name, h.Disable)
+	}
+}
+
+// updateReady checks a start-first service's update_ready, a file name of its update_socket
+// directory with update_signal (the overlap holds the signal until the file is written), and its
+// update_decline_status, an exit status from 1 to spec.MaxDeclineStatus, warned with update_signal
+// and no update_ready (the old container is signalled as soon as the new one runs, and a decline
+// after that fails the start).
+func (l *linter) updateReady(at string, svc spec.Service) {
+	if f := svc.UpdateReady; f != "" {
+		switch {
+		case strings.Contains(f, "/") || f == "." || f == "..":
+			l.errf(at+".update_ready", "%q: a file name of update_socket's directory, without a /", f)
+		case svc.UpdateSocket == "":
+			l.errf(at+".update_ready", "is a file of update_socket's directory: set update_socket")
+		case svc.UpdateSignal == "":
+			l.errf(at+".update_ready", "holds update_signal until the new container writes it: set update_signal")
+		}
+	}
+	if svc.UpdateDeclineStatus != nil {
+		switch n := *svc.UpdateDeclineStatus; {
+		case n < 1 || n > spec.MaxDeclineStatus:
+			l.errf(at+".update_decline_status", "%d: an exit status from 1 to %d (those above are the engine's, the shell's and the signals')", n, spec.MaxDeclineStatus)
+		case svc.UpdateSignal != "" && svc.UpdateReady == "":
+			l.warnf(at+".update_decline_status", "the overlap sends update_signal as soon as the new container runs, and a decline after it fails the start: set update_ready, which the new container writes once it will not decline")
+		}
 	}
 }
 
@@ -401,6 +451,35 @@ func (l *linter) l4Route(service string) int {
 		}
 	}
 	return -1
+}
+
+// hostNetworkServices are the services that run on the host's network, each sorted and once:
+// always, those of services.<name>.host_network and a compose service of network_mode host; onVM,
+// with a kairos shape, every other L4 route's upstream, which the VM alone runs there.
+func (l *linter) hostNetworkServices() (always, onVM []string) {
+	for name, svc := range l.s.Services {
+		if svc.HostNetwork {
+			always = append(always, name)
+		}
+	}
+	if l.compose != nil {
+		for name, svc := range l.compose.Services {
+			if svc.NetworkMode == "host" {
+				always = append(always, name)
+			}
+		}
+	}
+	slices.Sort(always)
+	always = slices.Compact(always)
+	if l.s.Shapes.Kairos != nil {
+		for _, r := range l.s.L4.Routes {
+			if m := upstreamRe.FindStringSubmatch(r.Upstream); m != nil && !slices.Contains(always, m[1]) {
+				onVM = append(onVM, m[1])
+			}
+		}
+	}
+	slices.Sort(onVM)
+	return always, slices.Compact(onVM)
 }
 
 // stringList is a compose list's strings; an entry of another kind is left out.

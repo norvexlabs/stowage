@@ -89,10 +89,10 @@ func (in *Installer) containerSizing(ctx context.Context, get func(string) strin
 	}
 	h.Profile, _ = in.tuneProfile(get)
 	plan := in.memoryPlan(sys, h)
+	if plan.CPUSets, err = hostCPUSets(in.R.Spec, sys, h); err != nil {
+		return tune.Container{}, hostPlan{}, err
+	}
 	if sys.Docker == nil || !sys.Docker.Desktop {
-		if plan.CPUSets, err = cpuSets(in.R.Spec, sys.Cores(h)); err != nil {
-			return tune.Container{}, hostPlan{}, err
-		}
 		plan.Host = h
 	}
 	return sys.Container(h), plan, nil

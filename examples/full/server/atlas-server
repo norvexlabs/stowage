@@ -37,6 +37,8 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 MIGRATIONS = os.environ.get("ATLAS_MIGRATIONS", "/srv/migrations")
+# The start-first overlap's shared directory (update_socket).
+HANDOFF = "/run/atlas/handoff"
 SECRET = os.environ.get("INTERNAL_SERVICE_SECRET", "")
 # The values accepted: the secret, and while it rotates the staged and the previous one.
 ACCEPTED = [v for v in (SECRET, os.environ.get("INTERNAL_SERVICE_SECRET_NEXT", ""),
@@ -295,6 +297,16 @@ def main():
     # SIGUSR2 is the start-first upgrade's word that the new container runs (update_signal): a
     # server handing its listeners over would send them now; this one serves on until SIGTERM.
     signal.signal(signal.SIGUSR2, lambda *_: log(f"atlas {role}: told to go, serving until SIGTERM"))
+    # Listening, it is ready for the handoff (update_ready): the upgrade sends SIGUSR2 only once
+    # the file is written in the update_socket directory (the image makes it; Docker and the VM
+    # mount its volume there, and only their overlap reads the file).
+    if os.path.isdir(HANDOFF):
+        try:
+            with open(os.path.join(HANDOFF, "ready"), "w"):
+                pass
+            log(f"atlas {role}: ready for the handoff")
+        except OSError as e:
+            log(f"atlas {role}: the handoff's ready file is not written: {e}")
     server.serve_forever()
     server.server_close()
     log(f"atlas {role} drained")

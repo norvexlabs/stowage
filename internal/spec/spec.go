@@ -163,11 +163,31 @@ type Service struct {
 	// runs, before it waits for the new one's health: for a handoff the old process starts when
 	// told to go.
 	UpdateSignal string `yaml:"update_signal"`
+	// UpdateReady is a file name the new container of an overlap writes in UpdateSocket once it
+	// is ready to take the old one's sockets: the overlap sends UpdateSignal only then.
+	UpdateReady string `yaml:"update_ready"`
+	// UpdateDeclineStatus is the exit status by which the new container of an overlap declines
+	// it: the start removes it and replaces the service stop-first. Nil: none declines.
+	UpdateDeclineStatus *int `yaml:"update_decline_status"`
+	// FrontHosts is what a service on the host's network reaches the front's domains at: the
+	// loopback (FrontHostsLoopback, the default), Docker's host-gateway address, or what DNS answers.
+	FrontHosts string `yaml:"front_hosts"`
 }
+
+// The values of services.<name>.front_hosts.
+const (
+	FrontHostsLoopback = "loopback"
+	FrontHostsGateway  = "host-gateway"
+	FrontHostsNone     = "none"
+)
 
 // UpdateSignals are the signals services.<name>.update_signal may name: those a process can
 // catch, Docker's names for them.
 var UpdateSignals = []string{"SIGHUP", "SIGINT", "SIGQUIT", "SIGTERM", "SIGUSR1", "SIGUSR2", "SIGWINCH"}
+
+// MaxDeclineStatus is the highest exit status services.<name>.update_decline_status may name: 125
+// and above are the engine's (125), the shell's (126, 127) and a signal's (128 and up).
+const MaxDeclineStatus = 124
 
 // The orders of services.<name>.update.
 const (

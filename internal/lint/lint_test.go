@@ -481,6 +481,17 @@ func TestEachRuleFiresOnFull(t *testing.T) {
 		{"update socket /", []edit{{sp, "update_socket: /run/atlas/handoff", "update_socket: /"}}, nil, `services.api.update_socket: "/": a directory of the container`},
 		{"update signal without start-first", []edit{{sp, "update: start-first, update_signal: SIGUSR2", "update_signal: SIGUSR2"}}, nil, "services.api.update_signal: is what a start-first overlap sends the old container"},
 		{"update signal unknown", []edit{{sp, "update_signal: SIGUSR2", "update_signal: SIGKILL"}}, nil, `services.api.update_signal: "SIGKILL": one of SIGHUP, SIGINT, SIGQUIT, SIGTERM, SIGUSR1, SIGUSR2, SIGWINCH`},
+		{"update ready without start-first", []edit{{sp, "update: start-first, update_signal: SIGUSR2, update_socket: /run/atlas/handoff, update_ready: ready, update_decline_status: 75", "update_ready: ready"}}, nil, "services.api.update_ready: is the file a start-first overlap's new container writes once ready: set update: start-first"},
+		{"update decline without start-first", []edit{{sp, "update: start-first, update_signal: SIGUSR2, update_socket: /run/atlas/handoff, update_ready: ready, update_decline_status: 75", "update_decline_status: 75"}}, nil, "services.api.update_decline_status: is how a start-first overlap's new container declines it: set update: start-first"},
+		{"update ready a path", []edit{{sp, "update_ready: ready", "update_ready: a/ready"}}, nil, `services.api.update_ready: "a/ready": a file name of update_socket's directory, without a /`},
+		{"update ready ..", []edit{{sp, "update_ready: ready", "update_ready: .."}}, nil, `services.api.update_ready: "..": a file name`},
+		{"update ready without its socket", []edit{{sp, "update_socket: /run/atlas/handoff, ", ""}}, nil, "services.api.update_ready: is a file of update_socket's directory: set update_socket"},
+		{"update ready without its signal", []edit{{sp, "update_signal: SIGUSR2, ", ""}}, nil, "services.api.update_ready: holds update_signal until the new container writes it: set update_signal"},
+		{"update decline status -1", []edit{{sp, "update_decline_status: 75", "update_decline_status: -1"}}, nil, "services.api.update_decline_status: -1: an exit status from 1 to 124"},
+		{"update decline status 0", []edit{{sp, "update_decline_status: 75", "update_decline_status: 0"}}, nil, "services.api.update_decline_status: 0: an exit status from 1 to 124"},
+		{"front hosts unknown", []edit{{sp, "front_hosts: host-gateway", "front_hosts: public"}}, nil, `services.vpn.front_hosts: "public": loopback (the default), host-gateway or none`},
+		{"front hosts off the host's network", []edit{{sp, "api: { memory: 10,", "api: { front_hosts: none, memory: 10,"}}, nil, "services.api.front_hosts: is where a service on the host's network reaches the front's domains: api is not on it"},
+		{"update decline status 125", []edit{{sp, "update_decline_status: 75", "update_decline_status: 125"}}, nil, "services.api.update_decline_status: 125: an exit status from 1 to 124"},
 		{"start-first with an address", []edit{{sp, "address_input: RELAY_ADDRESS }", "address_input: RELAY_ADDRESS, update: start-first }"}}, nil, "services.relay.update: relay has an address of its own"},
 		{"start-first with a container name", []edit{{cp, "  api:\n    image: ${STOWAGE_IMAGE_API}\n", "  api:\n    container_name: atlas-api\n    image: ${STOWAGE_IMAGE_API}\n"}}, nil, "services.api.update: api sets container_name atlas-api"},
 		{"start-first with replicas", []edit{{cp, "  api:\n    image: ${STOWAGE_IMAGE_API}\n", "  api:\n    deploy: { replicas: 2 }\n    image: ${STOWAGE_IMAGE_API}\n"}}, nil, "services.api.update: api runs 2 containers"},
@@ -943,7 +954,7 @@ func TestStartFirstWarnings(t *testing.T) {
 	}
 	// On the host's network without update_socket, both containers listen on its ports.
 	root = testutil.CopyExample(t, "full")
-	testutil.Edit(t, root, specFile, ", update_socket: /run/atlas/handoff }", " }")
+	testutil.Edit(t, root, specFile, ", update_socket: /run/atlas/handoff, update_ready: ready, update_decline_status: 75 }", " }")
 	testutil.Edit(t, root, composeFile, "  api:\n    image: ${STOWAGE_IMAGE_API}\n", "  api:\n    network_mode: host\n    image: ${STOWAGE_IMAGE_API}\n")
 	if res := run(t, root); !warned(res, "api runs on the host's network, where both containers of an overlap listen on its ports") {
 		t.Fatalf("host network: %+v", res.Findings)
@@ -1103,6 +1114,38 @@ func TestStartFirstWarnings(t *testing.T) {
 	}
 }
 
+// update_decline_status is accepted from 1 to 124 (the example's 75 between), and warned with
+// update_signal and no update_ready, where a decline after the signal fails the start.
+func TestUpdateDeclineStatus(t *testing.T) {
+	t.Parallel()
+	const decline = "the overlap sends update_signal as soon as the new container runs"
+	warned := func(res *Result, msg string) bool {
+		return slices.ContainsFunc(res.Findings, func(f Finding) bool { return f.Severity == Warning && strings.Contains(f.Message, msg) })
+	}
+	for _, n := range []string{"1", "124"} {
+		root := testutil.CopyExample(t, "full")
+		testutil.Edit(t, root, specFile, "update_decline_status: 75", "update_decline_status: "+n)
+		if res := run(t, root); res.Errors() != 0 || warned(res, decline) {
+			t.Fatalf("%s: %+v", n, res.Findings)
+		}
+	}
+	root := testutil.CopyExample(t, "full")
+	testutil.Edit(t, root, specFile, ", update_ready: ready", "")
+	if res := run(t, root); !warned(res, decline) {
+		t.Fatalf("without update_ready: %+v", res.Findings)
+	}
+}
+
+// An L4 route's upstream runs on the host's network on the VM: front_hosts is its to set.
+func TestFrontHostsOfAnL4Upstream(t *testing.T) {
+	t.Parallel()
+	root := testutil.CopyExample(t, "full")
+	testutil.Edit(t, root, specFile, "echo: { cpus: 1, irq: on }", "echo: { cpus: 1, irq: on, front_hosts: none }")
+	if res := run(t, root); res.Errors() != 0 {
+		t.Fatalf("%+v", res.Findings)
+	}
+}
+
 // An input counts as read when the provision hook's env lists it, and only then: a hook no longer
 // receives every input.
 func TestInputOnlyTheHookReads(t *testing.T) {
@@ -1240,6 +1283,32 @@ func TestAHostSettingOfTheNamespaceIsWarned(t *testing.T) {
 	testutil.Edit(t, root, specFile, "    vm.swappiness: {", "    net.ipv4.tcp_keepalive_time: {")
 	if res := run(t, root); !warned(res) || len(errorsOf(res)) > 0 {
 		t.Errorf("net.ipv4.tcp_keepalive_time: %+v", res.Findings)
+	}
+	// Two keys are said once, with the services on the host's network the host's value holds for.
+	testutil.Edit(t, root, specFile, "    net.ipv4.tcp_keepalive_time: {", "    net.ipv4.tcp_fin_timeout: { value: \"30\", reason: test }\n    net.ipv4.tcp_keepalive_time: {")
+	res := run(t, root)
+	var said []string
+	for _, f := range res.Findings {
+		if f.Severity == Warning && strings.Contains(f.String(), "a namespace keeps its own") {
+			said = append(said, f.String())
+		}
+	}
+	if len(said) != 1 || !strings.Contains(said[0], "host.sysctls: a namespace keeps its own net.ipv4.tcp_fin_timeout, net.ipv4.tcp_keepalive_time: ") ||
+		!strings.Contains(said[0], "among it, vpn (on the host's network) and echo (on the VM's) included, for its network settings)") {
+		t.Errorf("two keys: %q", said)
+	}
+	// An IPC key alone stays each container's, the host's network or not: none named.
+	ipc := testutil.CopyExample(t, "full")
+	testutil.Edit(t, ipc, specFile, "    vm.swappiness: {", "    kernel.shmmax: {")
+	if res := run(t, ipc); !warned(res) || slices.ContainsFunc(res.Findings, func(f Finding) bool { return strings.Contains(f.String(), "included") }) {
+		t.Errorf("kernel.shmmax: %+v", res.Findings)
+	}
+	// A compose service of network_mode host is on it too.
+	testutil.Edit(t, root, composeFile, "  ui:\n    image: ${STOWAGE_IMAGE_UI}\n", "  ui:\n    network_mode: host\n    image: ${STOWAGE_IMAGE_UI}\n")
+	if res := run(t, root); !slices.ContainsFunc(res.Findings, func(f Finding) bool {
+		return strings.Contains(f.String(), "among it, ui, vpn (on the host's network) and echo (on the VM's) included, for its network settings)")
+	}) {
+		t.Errorf("network_mode host: %+v", res.Findings)
 	}
 	for key, want := range map[string]bool{"kernel.shmmax": true, "kernel.sem": true, "fs.mqueue.msg_max": true, "net.unix.max_dgram_qlen": true, "net.ipv4.tcp_mem": false, "net.core.rmem_default": false, "kernel.pid_max": false, "net.mptcp.enabled": true, "kernel.hostname": true, "kernel.sem_next_id": true} {
 		if namespaced(key) != want {
@@ -1695,7 +1764,7 @@ func FuzzCheckL4Bind(f *testing.F) {
 // memShares is examples/full's services block, which gives two services a memory share.
 const memShares = `services:                                                      # what a compose service asks of the host, beyond its compose file
   postgres: { memory: { percent: 25, max: 16G } }              # percent of the host's RAM, recomputed at each start, capped at 16 GiB
-  api: { memory: 10, update: start-first, update_signal: SIGUSR2, update_socket: /run/atlas/handoff }  # its new container healthy beside the old before the old stops; the old one told to go once the new one runs
+  api: { memory: 10, update: start-first, update_signal: SIGUSR2, update_socket: /run/atlas/handoff, update_ready: ready, update_decline_status: 75 }  # its new container healthy beside the old before the old stops; the old one told to go once the new one wrote ready; exit 75 asks for stop-first
 `
 
 // servicesBlock is examples/full's whole services block: its memory shares, then the services' cores,
@@ -1703,7 +1772,7 @@ const memShares = `services:                                                    
 const servicesBlock = memShares + `  echo: { cpus: 1, irq: on }                                   # a whole core of its own, the NICs' interrupts on it too
   ingest: { nftables: deploy/ingest.nft }                      # its own nftables table, loaded on the VM
   relay: { interface: edge, address_input: RELAY_ADDRESS }     # an address of its own on the edge NIC (an ipvlan network)
-  vpn: { host_network: true, nftables: deploy/vpn.nft, transparent: [vpn0] }   # on the host's network; its table steers vpn0's traffic to its own sockets
+  vpn: { host_network: true, nftables: deploy/vpn.nft, transparent: [vpn0], front_hosts: host-gateway }   # on the host's network; its table steers vpn0's traffic to its own sockets; the front's domains at Docker's host-gateway address
 `
 
 // vmSizeLine is examples/full's shapes.kairos.size.
@@ -1732,7 +1801,7 @@ func TestMemoryShareMaxAndVMSizeBounds(t *testing.T) {
 		{memShares, "services:\n  api: { memory: { percent: 10, max: 256M } }\n", "  api:\n    image: ${STOWAGE_IMAGE_API}\n", "  api:\n    deploy: { replicas: \"4\" }\n    image: ${STOWAGE_IMAGE_API}\n"},
 		{memShares, "services:\n  postgres: { memory: { percent: 25, max: 512M } }\n", "    mem_limit: 256m ", "    scale: 2\n    mem_limit: 256m "},
 		{memShares, "services:\n  postgres: { memory: { percent: 25, max: 1536M } }\n", "    mem_limit: 256m ", "    mem_reservation: 1.5g\n    mem_limit: 256m "},
-		{vmSizeLine, "size: { min: { cpus: 1, memory: 1G, disk: 16G }, recommended: { cpus: 1, memory: 1G, disk: 16G } }"},
+		{vmSizeLine, "size: { min: { cpus: 2, memory: 1G, disk: 16G }, recommended: { cpus: 2, memory: 1G, disk: 16G } }"},
 		{vmSizeLine, "size: { recommended: { memory: 1025M } }"},
 	} {
 		root := testutil.CopyExample(t, "full")
@@ -1922,5 +1991,34 @@ func TestAComposeListIsCheckedBeforeExtends(t *testing.T) {
 	}
 	if !slices.Equal(wheres, []string{"deploy/compose.yaml: services.ui.links"}) {
 		t.Errorf("reported at %v", wheres)
+	}
+}
+
+// The services' whole cores are checked against the VM's size, a vCPU a core, CPU 0's kept: over
+// size.min's an error, over size.recommended's a warning, each on both sides of its bound.
+func TestTheServicesCoresFitTheVM(t *testing.T) {
+	t.Parallel()
+	const kept = "beside the one of CPU 0, which stays the host's: its start fails"
+	for _, c := range []struct {
+		cpus, size string
+		err, warn  bool
+	}{
+		{"1", "size: { min: { cpus: 2 }, recommended: { cpus: 2 } }", false, false},
+		{"2", "size: { min: { cpus: 2 }, recommended: { cpus: 4 } }", true, false},
+		{"3", "size: { min: { cpus: 4 }, recommended: { cpus: 4 } }", false, false},
+		{"3", "size: { recommended: { cpus: 4 } }", false, false},
+		{"3", "size: { recommended: { cpus: 3 } }", false, true},
+		{"3", "size: { min: { memory: 2G }, recommended: { cpus: 3 } }", false, true},
+		{"64", "size: { min: { memory: 2G } }", false, false},
+	} {
+		root := testutil.CopyExample(t, "full")
+		testutil.Edit(t, root, specFile, "echo: { cpus: 1, irq: on }", "echo: { cpus: "+c.cpus+", irq: on }")
+		testutil.Edit(t, root, specFile, vmSizeLine, c.size)
+		res := run(t, root)
+		gotErr := slices.ContainsFunc(errorsOf(res), func(e string) bool { return strings.Contains(e, kept) })
+		gotWarn := slices.ContainsFunc(res.Findings, func(f Finding) bool { return f.Severity == Warning && strings.Contains(f.Message, kept) })
+		if gotErr != c.err || gotWarn != c.warn || len(errorsOf(res)) > 0 && !c.err {
+			t.Errorf("cpus %s, %s: %+v", c.cpus, c.size, res.Findings)
+		}
 	}
 }

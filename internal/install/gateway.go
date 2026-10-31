@@ -13,6 +13,7 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/norvexlabs/stowage/internal/kairos"
 	"github.com/norvexlabs/stowage/internal/spec"
@@ -159,6 +160,11 @@ func (in *Installer) gatewayUnitName(digest string) string {
 	return in.R.Spec.Name + "-gateway-" + digest + ".service"
 }
 
+// gatewayTablesUnitName is the tables' boot unit of the install whose names digest gives.
+func (in *Installer) gatewayTablesUnitName(digest string) string {
+	return in.R.Spec.Name + "-gateway-" + digest + "-tables.service"
+}
+
 // gatewayRecorded reports whether this Docker install keeps a gateway record: consented, or revoked
 // with something left to remove (a revert takes it from there).
 func (in *Installer) gatewayRecorded() bool {
@@ -252,6 +258,11 @@ func (in *Installer) gatewayStart(ctx context.Context, get func(string) string) 
 			in.O.logf("warning: what an earlier release applied of the stack's network declarations is removed by a start as root alone: this start removes nothing")
 		}
 		return nil
+	}
+	// The boot units as this release writes them: a consent an earlier release recorded gets the
+	// tables' unit too.
+	if _, err := in.writeUnits(ctx, false); err != nil {
+		in.O.logf("warning: the boot units of %s are not written (%v): `%s tune --apply` writes them again", in.gatewayWhat(), err, ctl)
 	}
 	if err := in.forwardRoles(ctx, get); err != nil {
 		return err
@@ -410,7 +421,50 @@ func (in *Installer) gatewayUnit() (name, content string) {
 	name = in.gatewayUnitName(in.gatewayDigest())
 	ctl := filepath.Join(dir, in.R.Ctl())
 	return name, fmt.Sprintf("[Unit]\nDescription=%s (%s): the stack's network declarations, applied by its start (tune --apply)\nAfter=docker.service network-online.target\nWants=docker.service network-online.target\n\n[Service]\nType=oneshot\nExecStart=%s --dir %s --no-input --no-provision\nTimeoutStartSec=30min\n\n[Install]\nWantedBy=multi-user.target\n",
-		in.R.Spec.Name, dir, ctl, dir)
+		in.R.Spec.Name, systemdText(dir), systemdArg(ctl), systemdArg(dir))
+}
+
+// gatewayTablesUnit is the boot unit of a consented Docker install that loads the services' tables
+// the last start loaded (tables-boot) before Docker restores their containers, once the network
+// is up (a table may name a device by its index).
+func (in *Installer) gatewayTablesUnit() (name, content string) {
+	dir := in.gatewayDir()
+	name = in.gatewayTablesUnitName(in.gatewayDigest())
+	ctl := filepath.Join(dir, in.R.Ctl())
+	return name, fmt.Sprintf("[Unit]\nDescription=%s (%s): the services' nftables tables, before Docker restores their containers (tune --apply)\nAfter=network-online.target\nWants=network-online.target\nBefore=docker.service\n\n[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=%s %s --dir %s\n\n[Install]\nWantedBy=multi-user.target\n",
+		in.R.Spec.Name, systemdText(dir), systemdArg(ctl), tablesBootCmd, systemdArg(dir))
+}
+
+// systemdArg is s as one argument of a unit's ExecStart: double-quoted, its backslashes and quotes
+// escaped, its % (systemd's specifiers) and $ (its variables, expanded in quotes too) doubled, so
+// a path with a space, a % or a $ stays the one argument it is.
+func systemdArg(s string) string {
+	s = strings.NewReplacer(`\`, `\\`, `"`, `\"`, "%", "%%", "$", "$$").Replace(s)
+	// A control character (a newline would end the line and start a directive) as a C escape,
+	// which systemd reads in a quoted argument.
+	// So is a byte outside UTF-8, kept as the byte it is.
+	var b strings.Builder
+	for i := 0; i < len(s); {
+		r, n := utf8.DecodeRuneInString(s[i:])
+		if r < 0x20 || r == 0x7f || r == utf8.RuneError && n == 1 {
+			fmt.Fprintf(&b, `\x%02x`, s[i])
+		} else {
+			b.WriteString(s[i : i+n])
+		}
+		i += n
+	}
+	return `"` + b.String() + `"`
+}
+
+// systemdText is s as a unit's free text (Description=): its % doubled, a control character a ?
+// (no escape is read there, and a newline would end the line).
+func systemdText(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return '?'
+		}
+		return r
+	}, strings.ReplaceAll(s, "%", "%%"))
 }
 
 // gatewayApply records the operator's consent, enables the boot unit, and runs the install's
@@ -449,43 +503,79 @@ func (in *Installer) consent(ctx context.Context) error {
 	rec := prev
 	rec.Digest = in.digestOf(prev)
 	rec.Revoked, rec.Dir = false, cmp.Or(prev.Dir, in.gatewayDir())
-	name, content := in.gatewayUnit()
-	unit := filepath.Join(in.O.systemd(), in.gatewayUnitName(rec.Digest))
-	old, readErr := os.ReadFile(unit)
-	had := readErr == nil
-	host := in.O.host()
-	// The unit as it was: removed when this run wrote it, its content back when it had one.
-	undo := func(err error) error {
-		if had {
-			_ = writeAtomic(unit, bytes.NewReader(old), 0o644, nil)
-		} else {
-			_, _ = host.Run(ctx, Cmd{Args: []string{"systemctl", "disable", name}})
-			_ = os.Remove(unit)
-		}
-		_, _ = host.Run(ctx, Cmd{Args: []string{"systemctl", "daemon-reload"}})
+	undo, err := in.writeUnits(ctx, true)
+	if err != nil {
 		return err
-	}
-	if err := os.MkdirAll(filepath.Dir(unit), 0o755); err != nil {
-		return undo(err)
-	}
-	if !had || string(old) != content {
-		if err := writeAtomic(unit, strings.NewReader(content), 0o644, nil); err != nil {
-			return undo(err)
-		}
-		if _, err := host.Run(ctx, Cmd{Args: []string{"systemctl", "daemon-reload"}}); err != nil {
-			return undo(err)
-		}
-	}
-	if _, err := host.Run(ctx, Cmd{Args: []string{"systemctl", "enable", name}}); err != nil {
-		return undo(err)
 	}
 	if err := in.writeGateway(rec); err != nil {
 		if recorded {
-			return err // the record as it was, the unit enabled for it: a revert reaches both
+			return err // the record as it was, the units enabled for it: a revert reaches both
 		}
-		return undo(err)
+		undo()
+		return err
 	}
 	return nil
+}
+
+// writeUnits writes and enables the consented install's boot units (gatewayUnit,
+// gatewayTablesUnit), each written only when its content differs, and enabled when one was written
+// or enable says so. One that fails leaves every unit as it was (a unit this run wrote is removed
+// again); undo puts them back so after a success.
+func (in *Installer) writeUnits(ctx context.Context, enable bool) (undo func(), err error) {
+	host := in.O.host()
+	type was struct {
+		name, path string
+		old        []byte
+		had        bool
+	}
+	var done []was
+	undo = func() {
+		for _, w := range done {
+			if w.had {
+				_ = writeAtomic(w.path, bytes.NewReader(w.old), 0o644, nil)
+			} else {
+				_, _ = host.Run(ctx, Cmd{Args: []string{"systemctl", "disable", w.name}})
+				_ = os.Remove(w.path)
+			}
+		}
+		_, _ = host.Run(ctx, Cmd{Args: []string{"systemctl", "daemon-reload"}})
+	}
+	fail := func(err error) (func(), error) {
+		undo()
+		return nil, err
+	}
+	var names []string
+	reload := false
+	for _, unit := range []func() (string, string){in.gatewayUnit, in.gatewayTablesUnit} {
+		name, content := unit()
+		path := filepath.Join(in.O.systemd(), name)
+		old, readErr := os.ReadFile(path)
+		w := was{name: name, path: path, old: old, had: readErr == nil}
+		done = append(done, w)
+		names = append(names, name)
+		if w.had && string(old) == content {
+			continue
+		}
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			return fail(err)
+		}
+		if err := writeAtomic(path, strings.NewReader(content), 0o644, nil); err != nil {
+			return fail(err)
+		}
+		reload = true
+	}
+	if !reload && !enable {
+		return undo, nil
+	}
+	if reload {
+		if _, err := host.Run(ctx, Cmd{Args: []string{"systemctl", "daemon-reload"}}); err != nil {
+			return fail(err)
+		}
+	}
+	if _, err := host.Run(ctx, Cmd{Args: append([]string{"systemctl", "enable"}, names...)}); err != nil {
+		return fail(err)
+	}
+	return undo, nil
 }
 
 // lockedRevert is gatewayRevert under the install's lock (tune --revert).
@@ -517,12 +607,19 @@ func (in *Installer) gatewayRevert(ctx context.Context) error {
 	}
 	host := in.O.host()
 	var errs []error
-	name := in.gatewayUnitName(in.digestOf(rec))
-	if unit := filepath.Join(in.O.systemd(), name); fileExists(unit) {
-		_, _ = host.Run(ctx, Cmd{Args: []string{"systemctl", "disable", name}})
-		if err := os.Remove(unit); err != nil {
-			errs = append(errs, err)
-		} else if _, err := host.Run(ctx, Cmd{Args: []string{"systemctl", "daemon-reload"}}); err != nil {
+	reload := false
+	for _, name := range []string{in.gatewayUnitName(in.digestOf(rec)), in.gatewayTablesUnitName(in.digestOf(rec))} {
+		if unit := filepath.Join(in.O.systemd(), name); fileExists(unit) {
+			_, _ = host.Run(ctx, Cmd{Args: []string{"systemctl", "disable", name}})
+			if err := os.Remove(unit); err != nil {
+				errs = append(errs, err)
+			} else {
+				reload = true
+			}
+		}
+	}
+	if reload {
+		if _, err := host.Run(ctx, Cmd{Args: []string{"systemctl", "daemon-reload"}}); err != nil {
 			errs = append(errs, err)
 		}
 	}

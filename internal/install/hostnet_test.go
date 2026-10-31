@@ -302,6 +302,70 @@ func TestATargetReachesTheRoutesDomainsAtTheLoopback(t *testing.T) {
 	}
 }
 
+// front_hosts maps a target's routes' domains to Docker's host-gateway address, or to nothing
+// (DNS answers them), rather than to the loopback; the other targets stay at the loopback.
+func TestFrontHostsMapsTheDomainsElsewhere(t *testing.T) {
+	t.Parallel()
+	in, m, _ := hostNetInstaller(t, false)
+	in.R.Spec.Services = map[string]spec.Service{"echo": {HostNetwork: true, FrontHosts: spec.FrontHostsGateway}, "db": {HostNetwork: true}}
+	hn, err := in.hostNetwork(context.Background(), m, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hn.domains = []string{"api.example.com"}
+	for _, c := range []struct {
+		hosts string
+		want  []string
+	}{
+		{"", []string{"echo:127.0.0.1", "api.example.com:127.0.0.1"}},
+		{spec.FrontHostsLoopback, []string{"echo:127.0.0.1", "api.example.com:127.0.0.1"}},
+		{spec.FrontHostsGateway, []string{"echo:127.0.0.1", "api.example.com:host-gateway"}},
+		{spec.FrontHostsNone, []string{"echo:127.0.0.1"}},
+	} {
+		hn.frontHosts = map[string]string{"db": c.hosts}
+		extra := map[string]any{}
+		hn.give(extra, "db", "")
+		if got, _ := extra["extra_hosts"].([]string); !slices.Equal(got, c.want) {
+			t.Errorf("%q: %v, want %v", c.hosts, got, c.want)
+		}
+	}
+	if !maps.Equal(hn.frontHosts, map[string]string{"db": spec.FrontHostsNone}) {
+		t.Fatalf("frontHosts %v", hn.frontHosts)
+	}
+	hn, _ = in.hostNetwork(context.Background(), m, nil)
+	if !maps.Equal(hn.frontHosts, map[string]string{"echo": spec.FrontHostsGateway}) {
+		t.Errorf("read from the spec: %v", hn.frontHosts)
+	}
+}
+
+// A dependency a target reaches over a file is not warned as unreachable by name: one sharing a
+// volume or a host path with it, and one without a network; one sharing nothing is.
+func TestADependencyOverAFileIsNotWarned(t *testing.T) {
+	t.Parallel()
+	in, _, log := hostNetInstaller(t, false)
+	in.R.Spec.Services = map[string]spec.Service{"echo": {HostNetwork: true}}
+	var m composeModel
+	if err := json.Unmarshal([]byte(`{"services":{
+	"echo":{"image":"ingest","depends_on":{"sock":{},"path":{},"nonet":{},"apart":{}},"volumes":[{"type":"volume","source":"run"},{"type":"bind","source":"/srv/x"}]},
+	"sock":{"image":"tool","volumes":[{"type":"volume","source":"run"}]},
+	"path":{"image":"tool","volumes":[{"type":"bind","source":"/srv/x"}]},
+	"nonet":{"image":"tool","network_mode":"none"},
+	"apart":{"image":"tool","volumes":[{"type":"volume","source":"/srv/x"}]}}}`), &m); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := in.hostNetwork(context.Background(), &m, nil); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"sock", "path", "nonet"} {
+		if strings.Contains(log.String(), "depends on "+name) {
+			t.Errorf("%s warned: %s", name, log)
+		}
+	}
+	if !strings.Contains(log.String(), "echo (on the host's network) depends on apart, which exposes no port") {
+		t.Errorf("apart not warned: %s", log)
+	}
+}
+
 // Two L4 routes' services sharing a peer reach it at one address; each peer has its own, up to
 // maxPeers.
 func TestEachPeerHasAnAddressOfItsOwn(t *testing.T) {

@@ -36,7 +36,7 @@ func TestDockerfileRendersTheParams(t *testing.T) {
 	s := string(df)
 	for _, want := range []string{"FROM " + params.KairosInit + " AS kairos-init", "FROM " + params.Base + "\n",
 		"-s install -v 0.0.0\n", `-s init --skip-step cisHardening -v "1.2.0-r2"`, "nftables open-vm-tools qemu-guest-agent tzdata", "apt-cache show tzdata-legacy", "/usr/share/notes-preload/", "/etc/notes/os-version",
-		"notes-preload.service", "chmod 0440 /etc/sudoers.d/10-notes", "notes-health.service", "notes-network.service", "notes-tune.service", "notes-tune-online.service", "ethtool",
+		"notes-preload.service", "chmod 0440 /etc/sudoers.d/10-notes", "notes-health.service", "notes-network.service", "notes-tune.service", "notes-tune-online.service", "notes-tables.service", "ethtool",
 		"mv /usr/share/notes/08_grub.yaml \"$f\"", "sha256sum -c -", "shapes.kairos.kairos_init: its", "grep -qx 'AllowTcpForwarding no' /etc/ssh/sshd_config.d/05-kairos-hardening.conf",
 		"mv /etc/ssh/sshd_config.d/05-kairos-hardening.conf /usr/lib/notes/sshd_config.d/",
 		"printf 'Include /usr/lib/notes/sshd_config.d/*.conf\\n' > /etc/ssh/sshd_config.d/00-notes-hardening.conf", "grep -qx 'allowtcpforwarding no' \"$k/effective\"",
@@ -136,6 +136,16 @@ func TestWriteContextNamesEveryFileAfterTheProject(t *testing.T) {
 	for _, want := range []string{"ExecStart=/usr/sbin/notes-stow tune-boot\n", "After=network-online.target notes-tune.service\n", "Before=docker.service\n"} {
 		if !strings.Contains(string(tuo), want) {
 			t.Errorf("tune-online unit lacks %q:\n%s", want, tuo)
+		}
+	}
+	// The services' tables before Docker restores their containers, once the network is up.
+	tb, err := os.ReadFile(filepath.Join(dir, "files/etc/systemd/system/notes-tables.service"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"ExecStart=/usr/sbin/notes-stow tables-boot\n", "After=network-online.target nftables.service notes-tune-online.service\n", "Before=docker.service\n", "ConditionPathExists=!/run/cos/live_mode\n"} {
+		if !strings.Contains(string(tb), want) {
+			t.Errorf("tables unit lacks %q:\n%s", want, tb)
 		}
 	}
 	// Azure's virtual function stays networkd's to leave alone, on Hyper-V alone.

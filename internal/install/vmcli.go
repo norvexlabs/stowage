@@ -218,7 +218,9 @@ func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(
 	dirFlag(gate)
 	netBoot := netBootCommand(name, c.ctl, &o.Dir, stderr)
 	dirFlag(netBoot)
-	root.AddCommand(install, boot, back, hostd, gate, netBoot, tuneBootCommand(r, stderr), tuneCommand(in, prepare, terminal, true))
+	tablesBoot := tablesBootCommand(func(*cobra.Command) (*Installer, error) { return in, prepare() })
+	dirFlag(tablesBoot)
+	root.AddCommand(install, boot, back, hostd, gate, netBoot, tuneBootCommand(r, stderr), tablesBoot, tuneCommand(in, prepare, terminal, true))
 
 	jsonFlag := func(cmd *cobra.Command) {
 		cmd.Flags().BoolVar(&asJSON, "json", false, "print the daemon's JSON answer")

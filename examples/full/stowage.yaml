@@ -44,11 +44,11 @@ stack:
 
 services:                                                      # what a compose service asks of the host, beyond its compose file
   postgres: { memory: { percent: 25, max: 16G } }              # percent of the host's RAM, recomputed at each start, capped at 16 GiB
-  api: { memory: 10, update: start-first, update_signal: SIGUSR2, update_socket: /run/atlas/handoff }  # its new container healthy beside the old before the old stops; the old one told to go once the new one runs
+  api: { memory: 10, update: start-first, update_signal: SIGUSR2, update_socket: /run/atlas/handoff, update_ready: ready, update_decline_status: 75 }  # its new container healthy beside the old before the old stops; the old one told to go once the new one wrote ready; exit 75 asks for stop-first
   echo: { cpus: 1, irq: on }                                   # a whole core of its own, the NICs' interrupts on it too
   ingest: { nftables: deploy/ingest.nft }                      # its own nftables table, loaded on the VM
   relay: { interface: edge, address_input: RELAY_ADDRESS }     # an address of its own on the edge NIC (an ipvlan network)
-  vpn: { host_network: true, nftables: deploy/vpn.nft, transparent: [vpn0] }   # on the host's network; its table steers vpn0's traffic to its own sockets
+  vpn: { host_network: true, nftables: deploy/vpn.nft, transparent: [vpn0], front_hosts: host-gateway }   # on the host's network; its table steers vpn0's traffic to its own sockets; the front's domains at Docker's host-gateway address
 
 tune:
   profile: network   # a heavy network load: the hosts are tuned for it (default: Docker's path alone)

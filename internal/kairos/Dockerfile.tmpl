@@ -57,7 +57,7 @@ RUN chmod 0440 /etc/sudoers.d/10-{{.Name}} \
     && echo "{{.OSVersion}}" > /etc/{{.Name}}/os-version \
     && mkdir -p /etc/systemd/system/multi-user.target.wants /etc/systemd/system/getty.target.wants \
     && (getent group admin >/dev/null || groupadd --system admin) \
-    && for u in {{.Name}}-expand.service {{.Name}}-preload.service {{.Name}}.service {{.Name}}-health.service {{.Name}}-hostd.service {{.Name}}-network.service {{.Name}}-tune.service {{.Name}}-tune-online.service; do \
+    && for u in {{.Name}}-expand.service {{.Name}}-preload.service {{.Name}}.service {{.Name}}-health.service {{.Name}}-hostd.service {{.Name}}-network.service {{.Name}}-tune.service {{.Name}}-tune-online.service {{.Name}}-tables.service; do \
            ln -sf /etc/systemd/system/$u /etc/systemd/system/multi-user.target.wants/$u; done \
     && ln -sf /lib/systemd/system/docker.service /etc/systemd/system/multi-user.target.wants/docker.service \
     && ln -sf /lib/systemd/system/nftables.service /etc/systemd/system/multi-user.target.wants/nftables.service \

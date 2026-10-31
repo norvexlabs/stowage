@@ -1089,7 +1089,13 @@ every shape, the VM end-to-end test upgrading through it), then the health gate.
   which nothing on Docker would enforce. The VM still runs every L4 route's service on the host's
   network unasked: the input chain is what enforces a route's allowlist and bind address there,
   and making the key the only way would also put those services on the host's network on
-  Docker, where a fixed host port clashes with the host's other tenants.
+  Docker, where a fixed host port clashes with the host's other tenants. The front's domains map to the
+  loopback there by default, where the front publishes; a server that refuses the loopback as a
+  destination by design (a forward proxy's egress guard) is given Docker's `host-gateway` address
+  instead (`front_hosts`), an address of the host's own that Docker resolves itself, rather than
+  one Stowage reads off a NIC, which a cloud's NAT or a moved interface would make wrong. A
+  dependency reached over a file (a socket in a shared volume, or one with no network) is no
+  peer to publish: only one that shares nothing is warned unreachable.
 - **Volumes in backups beside the dump, not in it** — pg_dump's archive has no room for files and
   its size is unknown until it ends, so a tar cannot hold it without a disk copy the VM never
   makes: each volume is an object of its own, named after the dump, uploaded first so the dump's
@@ -1595,7 +1601,19 @@ every shape, the VM end-to-end test upgrading through it), then the health gate.
   the VM replaces whole in one transaction (no doubled rule, no gap) when it is absent or changed,
   leaving the sets a service fed otherwise, a changed one recreating its service so it feeds them
   again, and deletes once the release drops it; the host's own table stays Stowage's, and the app socket feeds only
-  a declared set of a declared table, its elements checked before nft runs. An address of its own
+  a declared set of a declared table, its elements checked before nft runs. The kernel keeps no
+  table over a reboot while Docker's restart policy brings the containers back as soon as it
+  starts, so a unit ordered before `docker.service` loads again the files the last start loaded
+  (on the VM a unit of the OS bundle, as its tuning units are, its files on the persistent
+  partition; on a consented Docker host a second unit beside the start's): a service never runs
+  a moment without its table. Not `nftables.service` and `/etc/nftables.conf`: the firewall is
+  reloaded from that file while the stack runs, and a table reload empties the sets its service
+  fed. Each boot load writes a new token, so the boot's start still recreates the services, which
+  feed their sets once the host daemon serves. What is left for the start is closed meanwhile: the
+  input chain drops by default, and Docker's FORWARD policy drops what the roles forward.
+  Cores are checked against the host before an upgrade changes anything, and against the VM's
+  least size by lint: on the VM a start that fails for them would follow a written OS, a reboot
+  and the health gate's way back. An address of its own
   is an ipvlan (L2) network on the role's NIC, its subnet read from the NIC at each start, because
   a bridge's NAT is what such a service avoids; its traffic crosses no host firewall, so its rules
   are its table's. Kubernetes gets the equivalents as the cluster's: the CPU manager's static
@@ -1612,7 +1630,15 @@ every shape, the VM end-to-end test upgrading through it), then the health gate.
   which answers for both. A handoff the old process starts when told to go (`update_signal`)
   cannot wait for the new container's health, which follows the handoff: the new one is started
   without `--wait`, the old one signalled once the new one runs, and the new one's health read
-  until it decides. A failed new container is removed and the old one keeps serving: the
+  until it decides. Running is not ready: a new container still preparing, or failing during it,
+  must not have the old one hand its listeners over, so `update_ready` names a file the new one
+  writes in the shared directory once it can take them, and the signal waits for it (read with
+  `docker cp`, which needs nothing in the image; against what the old container saw before the new
+  one started, not against a clock: the engine's start time and a file's are not one clock, and an
+  earlier overlap's file must never count). The overlap is the spec's for every
+  start, yet a handoff may be sound only while the listeners are unchanged: the new container
+  declines it by exiting with `update_decline_status` before the signal, and the start replaces
+  the service stop-first rather than failing. Both are the app's word, not a probe Stowage runs. A failed new container is removed and the old one keeps serving: the
   start fails as any other, and the release's rollback is unchanged. The overlap starts only
   against what already runs: a dependency the start makes or changes, an anonymous volume, a
   container not healthy leave the service to the stack's start, stop-first, rather than start the

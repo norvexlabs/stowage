@@ -1,6 +1,8 @@
 package install
 
 import (
+	"archive/tar"
+	"bytes"
 	"cmp"
 	"context"
 	"crypto/sha256"
@@ -8,9 +10,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
+	"path"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -454,13 +459,28 @@ func (in *Installer) overlap(ctx context.Context, environ []string, m *composeMo
 		return stopFirst("the container " + j + " joins its container's namespaces, mounts its volumes or links to it")
 	}
 	old := cs[0].ID
-	in.O.logf("services.%s: start-first: the new container starts beside the old one", service)
-	if signalled, err := in.startBeside(ctx, environ, service, old); err != nil {
+	if signalled, err := in.startBeside(ctx, environ, m.Name, service, old); err != nil {
+		var before beforeUp
+		switch {
+		case errors.Is(err, errNoHandoff):
+			return stopFirst("its old container does not mount the update_socket volume (no socket to hand over)")
+		case errors.As(err, &before):
+			// Nothing changed yet: the old container serves on, the start fails (a cancelled one
+			// as cancelled).
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return fmt.Errorf("services.%s: before its new container starts, which it does not: %w", service, before.err)
+		}
+		declined := errors.Is(err, errDeclined)
 		serves := "which serves on"
 		if signalled {
 			serves = "which was sent " + in.R.Spec.Services[service].UpdateSignal + " (update_signal) and serves on as far as the app keeps serving after it"
 		}
 		failed := fmt.Errorf("services.%s: its new container did not become healthy beside the old one, %s: %w", service, serves, err)
+		if declined {
+			failed = fmt.Errorf("services.%s: its new container declined the overlap (exit status %d, update_decline_status), and the old one serves on", service, *in.R.Spec.Services[service].UpdateDeclineStatus)
+		}
 		now, lerr := in.containers(ctx, environ, service)
 		if lerr != nil {
 			return fmt.Errorf("%w (removing the new one: %v)", failed, lerr)
@@ -468,9 +488,15 @@ func (in *Installer) overlap(ctx context.Context, environ []string, m *composeMo
 		for _, c := range now {
 			if c.ID != old {
 				if _, rerr := in.O.Docker.Run(ctx, Cmd{Args: []string{"rm", "--force", c.ID}}); rerr != nil {
+					if declined {
+						return fmt.Errorf("%w: removing the new container %s: %v", failed, c.ID, rerr)
+					}
 					in.O.logf("warning: services.%s: the failed new container %s stays: %v", service, c.ID, rerr)
 				}
 			}
+		}
+		if declined {
+			return stopFirst(fmt.Sprintf("its new container declined the overlap (exit status %d, update_decline_status)", *in.R.Spec.Services[service].UpdateDeclineStatus))
 		}
 		return failed
 	}
@@ -487,18 +513,56 @@ func (in *Installer) overlap(ctx context.Context, environ []string, m *composeMo
 // overlapPoll is how often startBeside reads the new container's health.
 var overlapPoll = 500 * time.Millisecond
 
+// readyWait is how long startBeside waits for the new container to write its update_ready file.
+var readyWait = 10 * time.Minute
+
 // startBeside starts service's new container beside its old one and returns once the new one
 // serves: running, healthy when it has a healthcheck. With update_signal, the new container is
-// started without waiting, the old one sent the signal once the new one runs (signalled), and the
-// new one's health read until it is healthy, or unhealthy or no longer running (an error).
-func (in *Installer) startBeside(ctx context.Context, environ []string, service, old string) (signalled bool, err error) {
-	signal := in.R.Spec.Services[service].UpdateSignal
+// started without waiting, the old one sent the signal once the new one runs (signalled) and, with
+// update_ready, once it wrote that file in update_socket: one that differs from what the directory
+// held before it started, read through the old container (within readyWait, else an error, the old
+// one never signalled), and the new one's health read until it is healthy, or unhealthy or no
+// longer running (an error). A new container that ends with update_decline_status before the
+// signal is errDeclined. Before the new container is made: with update_socket and update_signal,
+// an old container that does not mount the update volume is errNoHandoff, and a read of where it
+// does, or of its ready file, that fails is a beforeUp: the caller replaces the service stop-first
+// on the one, and fails the start on the other, nothing to remove either way.
+func (in *Installer) startBeside(ctx context.Context, environ []string, project, service, old string) (signalled bool, err error) {
+	svc := in.R.Spec.Services[service]
+	signal := svc.UpdateSignal
 	up := append(in.composeBase(), "up", "--detach")
 	if signal == "" {
 		up = append(up, "--wait")
 	}
 	up = append(up, "--no-deps", "--no-recreate", "--scale", service+"=2", service)
+	// The ready file as the shared volume holds it before the new container starts (an earlier
+	// overlap's, or none), read where the old container mounts the volume (an earlier release's
+	// update_socket may be another directory): the new container's is one that differs.
+	file := path.Join(svc.UpdateSocket, svc.UpdateReady)
+	var before readyStamp
+	var had bool
+	if svc.UpdateSocket != "" && signal != "" {
+		// The signal asks the old container to hand its sockets over in the volume: one that does
+		// not mount it has none to hand.
+		dir, mounted, err := in.updateMount(ctx, old, project+"_"+UpdateVolume(service))
+		if err != nil {
+			return false, beforeUp{fmt.Errorf("reading where its old container mounts its update_socket volume: %w", err)}
+		}
+		if !mounted {
+			return false, errNoHandoff
+		}
+		if svc.UpdateReady != "" {
+			at := path.Join(dir, svc.UpdateReady)
+			if before, had, err = in.readyFile(ctx, old, at); err != nil {
+				return false, beforeUp{fmt.Errorf("reading %s (update_ready) through its old container: %w", at, err)}
+			}
+		}
+	}
+	in.O.logf("services.%s: start-first: the new container starts beside the old one", service)
 	if _, err := in.O.Docker.Run(ctx, Cmd{Args: up, Env: environ, Stream: in.O.Log}); err != nil || signal == "" {
+		if err != nil && in.declinedBeside(ctx, environ, service, old) {
+			return false, errDeclined
+		}
 		return false, err
 	}
 	cs, err := in.containers(ctx, environ, service)
@@ -510,13 +574,34 @@ func (in *Installer) startBeside(ctx context.Context, environ []string, service,
 		return false, errors.New("no new container beside the old one")
 	}
 	c := cs[i]
+	ready := svc.UpdateReady == ""
+	var unread error
+	deadline := time.Now().Add(readyWait)
 	for {
 		switch {
 		case c.State != "running" && c.State != "created":
+			if !signalled && declines(svc, c) {
+				return false, errDeclined
+			}
 			return signalled, fmt.Errorf("its new container %s is %s (exit code %s)", c.Name, c.State, c.Exit)
 		case c.Health == "unhealthy":
 			return signalled, fmt.Errorf("its new container %s is unhealthy", c.Name)
 		case c.State == "running" && !signalled:
+			if !ready {
+				now, there, err := in.readyFile(ctx, c.ID, file)
+				unread, ready = err, there && (!had || now != before)
+				if !ready {
+					if time.Now().After(deadline) {
+						msg := fmt.Sprintf("its new container %s did not write %s (update_ready) within %s: the directory must be writable by the container's user (a volume made before keeps its owner)", c.Name, file, readyWait)
+						if unread != nil {
+							msg += fmt.Sprintf(" (%v)", unread)
+						}
+						return false, errors.New(msg)
+					}
+					break // read again after a poll
+				}
+				in.O.logf("services.%s: the new container wrote %s (update_ready)", service, file)
+			}
 			if _, err := in.O.Docker.Run(ctx, Cmd{Args: []string{"kill", "--signal", signal, old}}); err != nil {
 				return false, fmt.Errorf("sending %s to its old container: %w", signal, err)
 			}
@@ -537,6 +622,102 @@ func (in *Installer) startBeside(ctx context.Context, environ []string, service,
 		}
 		c = now[0]
 	}
+}
+
+// errDeclined is startBeside's when the new container exits with its service's
+// update_decline_status before the old one was signalled.
+var errDeclined = errors.New("the new container declined the overlap")
+
+// declines tells whether c, a new container of an overlap of svc, ended declining it: exited
+// with update_decline_status, or restarting after it (its restart policy's; the engine keeps the
+// exit code until it runs again).
+func declines(svc spec.Service, c container) bool {
+	return svc.UpdateDeclineStatus != nil && (c.State == "exited" || c.State == "restarting") && c.Exit == strconv.Itoa(*svc.UpdateDeclineStatus)
+}
+
+// declinedBeside tells whether the service's new container beside old (a failed up --wait's)
+// ended declining the overlap; one that cannot be read did not.
+func (in *Installer) declinedBeside(ctx context.Context, environ []string, service, old string) bool {
+	svc := in.R.Spec.Services[service]
+	if svc.UpdateDeclineStatus == nil {
+		return false
+	}
+	cs, err := in.containers(ctx, environ, service)
+	if err != nil {
+		return false
+	}
+	for _, c := range cs {
+		if c.ID != old && declines(svc, c) {
+			return true
+		}
+	}
+	return false
+}
+
+// errNoHandoff is startBeside's when, with update_signal, the old container does not mount the
+// service's update_socket volume: it has no socket to hand over, nor a ready file to tell an
+// earlier one by.
+var errNoHandoff = errors.New("its old container does not mount the update_socket volume")
+
+// beforeUp is an error of startBeside's before the new container is made: the old one serves on,
+// and there is nothing to remove.
+type beforeUp struct{ err error }
+
+func (b beforeUp) Error() string { return b.err.Error() }
+func (b beforeUp) Unwrap() error { return b.err }
+
+// updateMount is where the container id mounts the volume of that name (the service's update
+// volume as Compose names it, <project>_<UpdateVolume>); mounted false when it does not.
+func (in *Installer) updateMount(ctx context.Context, id, volume string) (dir string, mounted bool, err error) {
+	out, err := in.O.Docker.Run(ctx, Cmd{Args: []string{"inspect", "--type", "container", "--format", "{{json .Mounts}}", id}})
+	if err != nil {
+		return "", false, err
+	}
+	var mounts []struct {
+		Type, Name, Destination string
+	}
+	if err := json.Unmarshal(bytes.TrimSpace(out), &mounts); err != nil {
+		return "", false, fmt.Errorf("its mounts: %w", err)
+	}
+	for _, mt := range mounts {
+		if mt.Type == "volume" && mt.Name == volume {
+			return mt.Destination, true, nil
+		}
+	}
+	return "", false, nil
+}
+
+// readyStamp is what tells one ready file from another: its time as the engine's archive keeps it
+// (whole seconds), its size and the digest of its content.
+type readyStamp struct {
+	mod  time.Time
+	size int64
+	sum  [sha256.Size]byte
+}
+
+// readyFile reads file in the container id (`docker cp`, which needs nothing in the image): its
+// stamp, there false when the engine answers that the container holds none.
+func (in *Installer) readyFile(ctx context.Context, id, file string) (st readyStamp, there bool, err error) {
+	out, err := in.O.Docker.Run(ctx, Cmd{Args: []string{"cp", id + ":" + file, "-"}})
+	if err != nil {
+		// The engine's answers for a path the container lacks, never a connection's or the CLI's.
+		if e := strings.ToLower(err.Error()); strings.Contains(e, "could not find the file") || strings.Contains(e, "no such container:path") {
+			return readyStamp{}, false, nil
+		}
+		return readyStamp{}, false, err
+	}
+	r := tar.NewReader(bytes.NewReader(out))
+	h, err := r.Next()
+	if err != nil {
+		return readyStamp{}, false, fmt.Errorf("reading %s: %w", file, err)
+	}
+	d := sha256.New()
+	if _, err := io.Copy(d, r); err != nil {
+		return readyStamp{}, false, fmt.Errorf("reading %s: %w", file, err)
+	}
+	st = readyStamp{mod: h.ModTime.UTC(), size: h.Size}
+	copy(st.sum[:], d.Sum(nil))
+	return st, true, nil
 }
 
 // takeNetworks reads the networks' record into the start (prevNetworks, prevNetworksErr when it

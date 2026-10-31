@@ -13,6 +13,8 @@ RUN apk add --no-cache postgresql17-client
 COPY --from=build /src/server/atlas-server /usr/local/bin/atlas-server
 COPY --from=build /src/build-info /srv/build-info
 COPY migrations/ /srv/migrations/
+# The update_socket directory, the user's: a new volume takes it, owner included.
+RUN install -d -o 65532 -g 65532 /run/atlas/handoff
 USER 65532
 EXPOSE 9090
 CMD ["atlas-server", "api"]

@@ -355,6 +355,29 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
 
 ## Could
 
+- **The update volume's name is Compose's default**: the overlap finds the old container's mount
+  of `<project>_stowage-update-<service>`, the name Compose gives the volume the installer declares
+  without a `name:`. Declare it with an explicit `name:` from one helper both use, so a change to
+  either cannot make every handoff fall back to stop-first unseen.
+- **The ready file's reads are unbounded**: each poll of an overlap's `update_ready` copies the
+  whole file (a directory's whole tree) through `docker cp … -` into memory, every 500 ms for up
+  to 10 minutes, though only its first entry is judged. Stop the copy after the first entry (a
+  `Cmd.Stdout` writer that fails past a bound), or refuse a ready path that is a directory. Of
+  the same reads: a symlink or a directory at the ready path is judged by its header alone (its
+  time), and a missing file is told by the Docker engine's wording (`Could not find the file`,
+  `No such container:path`), which Podman's compatible CLI does not share.
+- **A Docker host's tables unit after a rollback to an older Stowage**: the tables' boot unit
+  (`<name>-gateway-<8 hex>-tables.service`) is written by this Stowage's starts alone; a rollback
+  to a release built with an earlier one leaves it enabled, running a `tables-boot` that release's
+  installer does not know (it fails at boot, the start loads the tables), and that release's
+  `tune --revert` or uninstall does not remove it. Remove it by its name whatever the release, or
+  have the older verb set absent be a no-op.
+- **A decline under `up --wait` with a restart policy**: without `update_signal` the overlap waits
+  with `docker compose up --wait`; a new container that exits with `update_decline_status` and is
+  restarted by its `restart:` policy is Compose's to judge (it may wait on it) before the decline
+  is read. Read the new container as the signalled overlap does (no `--wait`) when the service
+  has a decline status, and prove it with a real decline in e2e-full.
+
 - **A chunk ceiling that recovers**: a registry's chunk ceiling only drops within a run, and is
   keyed by host, so one transient 413 slows every later disk of that run to the host. Probe a
   larger chunk again after a run of successes, or key it by repository; it is half the chunk

@@ -338,3 +338,40 @@ func TestAnUpgradeFromACrossedInstallUsesItsBaseline(t *testing.T) {
 		t.Fatalf("%+v", j)
 	}
 }
+
+// A release whose services ask more whole cores than the VM has beside CPU 0's is refused before
+// its OS is written: its boot would fail the start, and the health gate go back.
+func TestUpgradeRefusesCoresTheVMLacksBeforeWritingTheOS(t *testing.T) {
+	t.Parallel()
+	p := vmPublished(t, spec.Provider{Name: "none"}, nil)
+	p.releaseOf("2.0.0", func(s *spec.Spec) { s.Services = map[string]spec.Service{"api": {CPUs: 2}} })
+	root := tuneRoot(t)
+	if err := os.MkdirAll(filepath.Join(root, "sys/devices/system/cpu"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "sys/devices/system/cpu/online"), []byte("0-1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	prev := p.env.docker.answer
+	p.env.docker.answer = func(a string) ([]byte, bool, error) {
+		if strings.HasPrefix(a, "info --format") {
+			return []byte(`27.3.1|Kairos|["name=seccomp,profile=builtin"]` + "\n"), true, nil
+		}
+		if prev != nil {
+			return prev(a)
+		}
+		return nil, false, nil
+	}
+	host := &fakeHost{}
+	d := daemon(p.env, host)
+	d.O.Tune = fakeTune(root, 0)
+	var e errOf
+	if code := call(t, d.Handler(), "POST", "/v1/upgrade", UpgradeRequest{Channel: "stable"}, &e); code != 409 ||
+		!strings.Contains(e.Error, "notes 2.0.0 cannot run here, and nothing was changed: services.*.cpus: api ask 2 whole cores, and this host has 1 beside the one of CPU 0") ||
+		!strings.HasSuffix(e.Error, "so its OS is not written") {
+		t.Fatalf("%d %s", code, e.Error)
+	}
+	if calls := fmt.Sprint(host.calls()); strings.Contains(calls, "kairos-agent") {
+		t.Errorf("the OS was written: %v", calls)
+	}
+}

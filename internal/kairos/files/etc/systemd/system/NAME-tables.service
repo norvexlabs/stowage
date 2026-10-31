@@ -1,0 +1,17 @@
+[Unit]
+Description={{.Name}}: the services' nftables tables the install's last start loaded, before Docker restores their containers
+# The installer ISO boots this system live, to install it: no host of the stack.
+ConditionPathExists=!/run/cos/live_mode
+# Once the network is up (a table may name a device by its index: iif), after the VM's own
+# firewall; before Docker, whose restart policy brings the stack's containers back.
+After=network-online.target nftables.service {{.Name}}-tune-online.service
+Wants=network-online.target
+Before=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/{{.Ctl}} tables-boot
+
+[Install]
+WantedBy=multi-user.target

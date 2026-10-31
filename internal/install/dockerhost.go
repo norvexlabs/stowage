@@ -220,7 +220,7 @@ func (h *Hostd) dockerUnits(ctx context.Context, kind string, service, timer str
 func (h *Hostd) unitService(what string, timeout time.Duration, args ...string) string {
 	ctl := filepath.Join(h.O.Dir, h.R.Ctl())
 	return fmt.Sprintf("[Unit]\nDescription=%s (%s): %s\nAfter=docker.service\nWants=docker.service\n\n[Service]\nType=oneshot\nExecStart=%s %s --dir %s\nTimeoutStartSec=%dmin\n",
-		h.R.Spec.Name, h.O.Dir, what, ctl, strings.Join(args, " "), h.O.Dir, int(timeout.Minutes()))
+		h.R.Spec.Name, systemdText(h.O.Dir), what, systemdArg(ctl), strings.Join(args, " "), systemdArg(h.O.Dir), int(timeout.Minutes()))
 }
 
 // dockerSchedule writes the scheduled backup's units for c's schedule (nil: removes them).
@@ -230,7 +230,7 @@ func (h *Hostd) dockerSchedule(ctx context.Context, c *BackupConfig) error {
 	}
 	return h.dockerUnits(ctx, "backup", h.unitService("the scheduled backup", 75*time.Minute, "backup", "run", "--if-configured"),
 		fmt.Sprintf("[Unit]\nDescription=%s (%s): the scheduled backup's timer\n\n[Timer]\nOnCalendar=%s\nRandomizedDelaySec=15min\nPersistent=true\n\n[Install]\nWantedBy=timers.target\n",
-			h.R.Spec.Name, h.O.Dir, c.Schedule))
+			h.R.Spec.Name, systemdText(h.O.Dir), c.Schedule))
 }
 
 // InstallWatch writes the disk-pressure watch's units of a Docker install: `disk-check` at boot
@@ -245,7 +245,7 @@ func (in *Installer) InstallWatch(ctx context.Context) error {
 	}
 	return h.dockerUnits(ctx, "disk", h.unitService("the disk-pressure check", 5*time.Minute, "disk-check"),
 		fmt.Sprintf("[Unit]\nDescription=%s (%s): the disk-pressure watch\n\n[Timer]\nOnBootSec=2min\nOnUnitActiveSec=%ds\n\n[Install]\nWantedBy=timers.target\n",
-			in.R.Spec.Name, in.O.Dir, pressureEvery))
+			in.R.Spec.Name, systemdText(in.O.Dir), pressureEvery))
 }
 
 // InstallSchedule writes the scheduled backup's units of a Docker install from the settings it

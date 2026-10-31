@@ -308,10 +308,15 @@ func TestTuneApplyConsentsAndRevertRemovesTheGateway(t *testing.T) {
 		t.Fatal(err)
 	}
 	name, content := in.gatewayUnit()
-	if raw, err := os.ReadFile(filepath.Join(in.O.Systemd, name)); err != nil || string(raw) != content || !strings.Contains(content, "ExecStart="+filepath.Join(in.O.Dir, "notes-stow")+" --dir "+in.O.Dir+" --no-input --no-provision\n") || !strings.Contains(content, "WantedBy=multi-user.target") {
+	if raw, err := os.ReadFile(filepath.Join(in.O.Systemd, name)); err != nil || string(raw) != content || !strings.Contains(content, "ExecStart=\""+filepath.Join(in.O.Dir, "notes-stow")+"\" --dir \""+in.O.Dir+"\" --no-input --no-provision\n") || !strings.Contains(content, "WantedBy=multi-user.target") {
 		t.Errorf("unit: %q %v", raw, err)
 	}
-	if !host.did("systemctl enable "+name) || !slices.Equal(started, []string{filepath.Join(in.O.Dir, "notes-stow"), "--dir", in.O.Dir, "--no-input", "--no-provision"}) {
+	tname, tcontent := in.gatewayTablesUnit()
+	if raw, err := os.ReadFile(filepath.Join(in.O.Systemd, tname)); err != nil || string(raw) != tcontent || tname != "notes-gateway-"+in.gatewayDigest()+"-tables.service" ||
+		!strings.Contains(tcontent, "ExecStart=\""+filepath.Join(in.O.Dir, "notes-stow")+"\" tables-boot --dir \""+in.O.Dir+"\"\n") || !strings.Contains(tcontent, "Before=docker.service\n") || !strings.Contains(tcontent, "After=network-online.target\n") {
+		t.Errorf("tables unit %s: %q %v", tname, raw, err)
+	}
+	if !host.did("systemctl enable "+name+" "+tname) || !slices.Equal(started, []string{filepath.Join(in.O.Dir, "notes-stow"), "--dir", in.O.Dir, "--no-input", "--no-provision"}) {
 		t.Errorf("ran %v, started %v", host.ran, started)
 	}
 	if !in.gatewayConsented() || !host.tables["vpn"] || host.jumps != 1 || !fileExists(in.tunFile("vpn0")) {
@@ -323,13 +328,13 @@ func TestTuneApplyConsentsAndRevertRemovesTheGateway(t *testing.T) {
 	if err := in.gatewayRevert(ctx); err == nil || !strings.Contains(err.Error(), "the consent is withdrawn, but not all it applied is removed (`notes-stow tune --revert` again removes the rest)") || strings.Contains(err.Error(), "networkctl") {
 		t.Fatalf("revert: %v", err)
 	}
-	if in.gatewayConsented() || !in.gatewayRecorded() || host.tables["vpn"] || host.jumps != 0 || fileExists(filepath.Join(in.O.Systemd, name)) || fileExists(in.tunFile("vpn0")) {
+	if in.gatewayConsented() || !in.gatewayRecorded() || host.tables["vpn"] || host.jumps != 0 || fileExists(filepath.Join(in.O.Systemd, name)) || fileExists(filepath.Join(in.O.Systemd, tname)) || fileExists(in.tunFile("vpn0")) {
 		t.Errorf("left: consented %v, tables %v, jumps %d", in.gatewayConsented(), host.tables, host.jumps)
 	}
 	if st := in.gatewayStatus(none); !strings.HasPrefix(st, "revoked, but not all it applied is removed") {
 		t.Errorf("status %q", st)
 	}
-	if !host.did("systemctl disable " + name) {
+	if !host.did("systemctl disable "+name) || !host.did("systemctl disable "+tname) {
 		t.Errorf("ran %v", host.ran)
 	}
 	// Revoked: a start as root applies nothing, and says what is left.
@@ -371,7 +376,7 @@ func TestTuneApplyConsentsAndRevertRemovesTheGateway(t *testing.T) {
 	if err := os.Remove(in.path(GatewayFile)); err != nil {
 		t.Fatal(err)
 	}
-	if err := in.gatewayApply(ctx); err == nil || in.gatewayRecorded() || fileExists(filepath.Join(in.O.Systemd, name)) {
+	if err := in.gatewayApply(ctx); err == nil || in.gatewayRecorded() || fileExists(filepath.Join(in.O.Systemd, name)) || fileExists(filepath.Join(in.O.Systemd, tname)) {
 		t.Errorf("a unit not enabled: %v, recorded %v", err, in.gatewayRecorded())
 	}
 	host.enableErr = nil
@@ -490,7 +495,7 @@ func TestTheGatewaysRecordIsItsDirectorys(t *testing.T) {
 	}
 	rel := *in
 	rel.O.Dir = "relative-dir"
-	if _, content := rel.gatewayUnit(); !strings.Contains(content, "ExecStart="+filepath.Join(cwd, "relative-dir", "notes-stow")+" --dir "+filepath.Join(cwd, "relative-dir")+" ") {
+	if _, content := rel.gatewayUnit(); !strings.Contains(content, "ExecStart=\""+filepath.Join(cwd, "relative-dir", "notes-stow")+"\" --dir \""+filepath.Join(cwd, "relative-dir")+"\" ") {
 		t.Errorf("unit %q", content)
 	}
 }
@@ -605,5 +610,132 @@ func TestAMovedInstallRevertsWhereItIs(t *testing.T) {
 	}
 	if err := in.gatewayRevert(ctx); err != nil || in.gatewayRecorded() || host.tables["vpn"] || fileExists(filepath.Join(in.O.Systemd, name)) {
 		t.Errorf("revert: %v, tables %v", err, host.tables)
+	}
+}
+
+// At boot, before Docker, the tables the last start loaded are loaded again from their files, each
+// with a load token of its own (the boot's start recreates its service, which feeds its sets); a
+// Docker host's without the consent loads none; one that does not load is said, the others load.
+func TestTheBootLoadsTheTablesBeforeDocker(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	in, host, log := gateway(t, 0)
+	in.R.Nftables["probe"] = []byte("table inet probe {\n}\n")
+	if err := in.writeGateway(gatewayRecord{Digest: dirDigest(in.gatewayDir()), Dir: in.gatewayDir()}); err != nil {
+		t.Fatal(err)
+	}
+	if err := in.loadTables(ctx); err != nil {
+		t.Fatal(err)
+	}
+	before := in.tableLoads()
+	host.tables, host.ran = map[string]bool{}, nil // a reboot: the kernel keeps no table
+	// The consent's record gone: the tables recorded load none.
+	rec, err := os.ReadFile(in.path(GatewayFile))
+	if err != nil || os.Remove(in.path(GatewayFile)) != nil {
+		t.Fatal(err)
+	}
+	if err := in.bootTables(ctx); err != nil || host.did("nft") {
+		t.Fatalf("no consent: %v, ran %v", err, host.ran)
+	}
+	if err := os.WriteFile(in.path(GatewayFile), rec, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := in.bootTables(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"probe", "vpn"} {
+		if !host.tables[name] || !host.did("nft -f "+filepath.Join(in.O.Dir, TablesDir, name+".nft")) {
+			t.Errorf("%s not loaded: %v", name, host.ran)
+		}
+		if after := in.tableLoads(); after[name] == before[name] || after[name] == "" {
+			t.Errorf("%s's token %q, before %q", name, after[name], before[name])
+		}
+	}
+	if !strings.Contains(strings.Join(*log, ""), "loaded the nftables table inet vpn, before the containers start") {
+		t.Errorf("log %q", *log)
+	}
+	// The boot's start finds them loaded: it loads none again.
+	host.ran = nil
+	if err := in.loadTables(ctx); err != nil || host.did("nft -f") {
+		t.Errorf("the start loaded again: %v %v", err, host.ran)
+	}
+	// One whose file nft refuses: the other loads, the error names it.
+	if err := os.WriteFile(filepath.Join(in.O.Dir, TablesDir, "probe.nft"), []byte("refused\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	host.tables = map[string]bool{}
+	in.O.Host = refusing{host, filepath.Join(in.O.Dir, TablesDir, "probe.nft")}
+	if err := in.bootTables(ctx); err == nil || !strings.Contains(err.Error(), "services.probe.nftables: its table does not load at boot (the install's start loads it again)") || !host.tables["vpn"] {
+		t.Errorf("a table refused: %v, tables %v", err, host.tables)
+	}
+	// The VM's firewall is Stowage's: no consent to look for.
+	in.O.Host, in.O.Firewall = host, t.TempDir()
+	if err := os.Remove(in.path(GatewayFile)); err != nil {
+		t.Fatal(err)
+	}
+	host.tables = map[string]bool{}
+	if err := in.bootTables(ctx); err != nil || !host.tables["vpn"] {
+		t.Errorf("the VM: %v, tables %v", err, host.tables)
+	}
+}
+
+// refusing is a host whose nft refuses to load one file.
+type refusing struct {
+	*gwHost
+	file string
+}
+
+func (r refusing) Run(ctx context.Context, c Cmd) ([]byte, error) {
+	if len(c.Args) == 3 && c.Args[0] == "nft" && c.Args[1] == "-f" && c.Args[2] == r.file {
+		return nil, errors.New("syntax error")
+	}
+	return r.gwHost.Run(ctx, c)
+}
+
+// A consent an earlier release recorded, with the start's unit alone, gets the tables' unit at its
+// next start as root; a start that finds both as they are writes and enables nothing.
+func TestAStartWritesTheBootUnitsOfAnEarlierConsent(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	in, host, _ := gateway(t, 0)
+	if err := in.writeGateway(gatewayRecord{Digest: dirDigest(in.gatewayDir()), Dir: in.gatewayDir()}); err != nil {
+		t.Fatal(err)
+	}
+	name, content := in.gatewayUnit()
+	if err := os.WriteFile(filepath.Join(in.O.Systemd, name), []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := in.gatewayStart(ctx, none); err != nil {
+		t.Fatal(err)
+	}
+	tname, tcontent := in.gatewayTablesUnit()
+	if raw, err := os.ReadFile(filepath.Join(in.O.Systemd, tname)); err != nil || string(raw) != tcontent || !host.did("systemctl daemon-reload") || !host.did("systemctl enable "+name+" "+tname) {
+		t.Errorf("the tables' unit: %q %v, ran %v", raw, err, host.ran)
+	}
+	host.ran = nil
+	if err := in.gatewayStart(ctx, none); err != nil || host.did("systemctl") {
+		t.Errorf("again: %v, ran %v", err, host.ran)
+	}
+}
+
+// A unit's argument stays one argument, whatever the path: quoted, its quotes, backslashes and
+// systemd's % escaped.
+func TestSystemdArg(t *testing.T) {
+	t.Parallel()
+	if got := systemdText("/srv/a%b\nX=1"); got != "/srv/a%%b?X=1" {
+		t.Errorf("text %q", got)
+	}
+	for in, want := range map[string]string{
+		"/srv/caf\xe9":                 `"/srv/caf\xe9"`,
+		"/srv/café":                    `"/srv/café"`,
+		"/srv/notes":                   `"/srv/notes"`,
+		"/srv/my stack":                `"/srv/my stack"`,
+		"/opt/app$1":                   `"/opt/app$$1"`,
+		`/srv/a"b\c%d`:                 `"/srv/a\"b\\c%%d"`,
+		"/srv/x\nExecStartPre=/bin/sh": `"/srv/x\x0aExecStartPre=/bin/sh"`,
+	} {
+		if got := systemdArg(in); got != want {
+			t.Errorf("%q: %s, want %s", in, got, want)
+		}
 	}
 }

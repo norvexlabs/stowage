@@ -1,12 +1,15 @@
 package install
 
 import (
+	"archive/tar"
 	"bytes"
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"io"
 	"maps"
 	"os"
 	"path/filepath"
@@ -339,6 +342,246 @@ func TestAnUpdateSignalTellsTheOldContainerToGo(t *testing.T) {
 	f, _, err = run(created, "new1|/p-new1|exited|1||h2|sha256:img|")
 	if err == nil || !strings.Contains(err.Error(), "beside the old one, which serves on: its new container /p-new1 is exited (exit code 1)") || !slices.Equal(f.engine(), []string{up, "rm --force new1"}) {
 		t.Errorf("a new container that ends before it runs: %v, ran %q", err, f.engine())
+	}
+}
+
+// overlapRun runs startFirst on api, start-first with svc's update keys, its old container old1
+// running healthy and new1 taking the states news; answer answers a call first, when it does.
+func overlapRun(t *testing.T, svc spec.Service, answer func(a string) ([]byte, bool, error), news ...string) (*fakeDocker, string, error) {
+	t.Helper()
+	var m composeModel
+	if err := json.Unmarshal([]byte(`{"name": "p", "services": {"api": {"image": "reg/api:2"}}}`), &m); err != nil {
+		t.Fatal(err)
+	}
+	none := sha256.Sum256([]byte("null"))
+	r := testRelease(t, "1.0.0")
+	svc.Update = spec.UpdateStartFirst
+	r.Spec.Services = map[string]spec.Service{"api": svc}
+	var log bytes.Buffer
+	e := &engineState{containers: map[string][]string{"api": {"old1|/p-old1|running|0|healthy|h1|sha256:img|"}}, hash: map[string]string{"api": "h2"}, news: news, answer: answer}
+	f := e.docker(`{"services": {"api": {}}}`)
+	in := &Installer{R: r, O: Options{Dir: t.TempDir(), Docker: f, Log: &log}}
+	if err := os.WriteFile(in.path(NetworksFile), []byte(hex.EncodeToString(none[:])+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := in.takeNetworks(); err != nil {
+		t.Fatal(err)
+	}
+	// A wait the change under test leaves unbounded ends the test, not the suite.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	err := in.startFirst(ctx, nil, &m, nil)
+	return f, log.String(), err
+}
+
+// tarOf is the archive `docker cp … -` writes of one empty file modified at mod.
+func tarOf(t *testing.T, name string, mod time.Time) []byte {
+	t.Helper()
+	return tarOfContent(t, name, mod, "")
+}
+
+// tarOfContent is the archive of one file of content modified at mod.
+func tarOfContent(t *testing.T, name string, mod time.Time, content string) []byte {
+	t.Helper()
+	var b bytes.Buffer
+	w := tar.NewWriter(&b)
+	if err := w.WriteHeader(&tar.Header{Name: name, Mode: 0o644, ModTime: mod, Typeflag: tar.TypeReg, Size: int64(len(content))}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.WriteString(w, content); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return b.Bytes()
+}
+
+// With update_ready, the old container is sent update_signal only once the new one holds that file
+// in update_socket as it was not before the new one started (none, or another than an earlier
+// overlap's, read through the old container); a new one that never writes it in readyWait, or ends
+// first, is removed and the old one is never signalled.
+func TestAnUpdateReadyFileHoldsTheSignal(t *testing.T) {
+	overlapPoll = time.Millisecond
+	t.Cleanup(func() { overlapPoll = 500 * time.Millisecond; readyWait = 10 * time.Minute })
+	svc := spec.Service{UpdateSocket: "/run/hand", UpdateSignal: "SIGUSR2", UpdateReady: "ready"}
+	const (
+		up      = "up --detach --no-deps --no-recreate --scale api=2 api"
+		kill    = "kill --signal SIGUSR2 old1"
+		start   = "new1|/p-new1|running|0|starting|h2|sha256:img|"
+		healthy = "new1|/p-new1|running|0|healthy|h2|sha256:img|"
+	)
+	missing := errors.New("Error: No such container:path: new1:/run/hand/ready")
+	// mounts is where old1 mounts the update volume ("" none).
+	mounts := "/run/hand"
+	// answer answers the old container's read of the file with old, and the new one's with news in
+	// turn, the last again; nil is a file not there.
+	answer := func(old []byte, oldErr error, news ...[]byte) func(a string) ([]byte, bool, error) {
+		return func(a string) ([]byte, bool, error) {
+			switch a {
+			case "inspect --type container --format {{json .Mounts}} old1":
+				if mounts == "" {
+					return []byte(`[{"Type":"volume","Name":"p_other","Destination":"/data"}]` + "\n"), true, nil
+				}
+				return []byte(`[{"Type":"bind","Name":"","Destination":"/etc/x"},{"Type":"volume","Name":"p_stowage-update-api","Destination":"` + mounts + `"}]` + "\n"), true, nil
+			case "cp old1:" + mounts + "/ready -":
+				if old == nil {
+					return nil, true, cmp.Or(oldErr, missing)
+				}
+				return old, true, nil
+			case "cp new1:/run/hand/ready -":
+				out := news[0]
+				if len(news) > 1 {
+					news = news[1:]
+				}
+				if out == nil {
+					return nil, true, missing
+				}
+				return out, true, nil
+			}
+			return nil, false, nil
+		}
+	}
+	// signalledAfter is the new container's reads of the file before the old one was signalled; -1
+	// when it never was.
+	signalledAfter := func(f *fakeDocker) int {
+		reads := 0
+		for _, c := range f.calls {
+			switch a := strings.Join(c.Args, " "); {
+			case a == "cp new1:/run/hand/ready -":
+				reads++
+			case a == kill:
+				return reads
+			}
+		}
+		return -1
+	}
+	t0 := time.Date(2026, 10, 31, 10, 0, 0, 0, time.UTC)
+	stale, fresh := tarOf(t, "ready", t0), tarOf(t, "ready", t0.Add(time.Second))
+	// An earlier overlap's file: the signal waits for one that differs.
+	f, log, err := overlapRun(t, svc, answer(stale, nil, nil, stale, fresh), start, healthy)
+	if err != nil || !slices.Equal(f.engine(), []string{up, kill, "stop old1", "rm old1"}) || signalledAfter(f) != 3 ||
+		!strings.Contains(log, "services.api: the new container wrote /run/hand/ready (update_ready)") {
+		t.Errorf("a new container that writes the file: %v, ran %q, signalled after %d reads, logged %s", err, f.engine(), signalledAfter(f), log)
+	}
+	// None before: any file the new one holds is its own, whatever its time (an earlier one's
+	// included: the clocks are not compared).
+	f, _, err = overlapRun(t, svc, answer(nil, nil, nil, stale), start, healthy)
+	if err != nil || signalledAfter(f) != 2 {
+		t.Errorf("none before: %v, signalled after %d reads", err, signalledAfter(f))
+	}
+	// The same time (whole seconds, or a copy keeping it), another content: written.
+	same := tarOfContent(t, "ready", t0, "2")
+	f, _, err = overlapRun(t, svc, answer(tarOfContent(t, "ready", t0, "1"), nil, tarOfContent(t, "ready", t0, "1"), same), start, healthy)
+	if err != nil || signalledAfter(f) != 2 {
+		t.Errorf("another content at the same time: %v, signalled after %d reads", err, signalledAfter(f))
+	}
+	// An earlier release's update_socket elsewhere: the old container's mount is read.
+	mounts = "/run/old"
+	f, _, err = overlapRun(t, svc, answer(stale, nil, stale, fresh), start, healthy)
+	if err != nil || signalledAfter(f) != 2 {
+		t.Errorf("the volume at another directory: %v, signalled after %d reads", err, signalledAfter(f))
+	}
+	// An old container without the volume: no handoff to make, stop-first.
+	mounts = ""
+	f, log, err = overlapRun(t, svc, answer(nil, nil, fresh), start, healthy)
+	if err != nil || len(f.engine()) != 0 || !strings.Contains(log, "services.api.update: its old container does not mount the update_socket volume (no socket to hand over), so this start replaces it stop-first") {
+		t.Errorf("no volume: %v, ran %q, logged %s", err, f.engine(), log)
+	}
+	// So without update_ready too: the signal would ask for a handoff it cannot make.
+	noReady := svc
+	noReady.UpdateReady = ""
+	if f, log, err := overlapRun(t, noReady, answer(nil, nil), start, healthy); err != nil || len(f.engine()) != 0 || !strings.Contains(log, "does not mount the update_socket volume (no socket to hand over), so this start replaces it stop-first") {
+		t.Errorf("no volume, no update_ready: %v, ran %q, logged %s", err, f.engine(), log)
+	}
+	// A volume of the name's suffix, another project's: not the service's.
+	mounts = "/run/hand"
+	if f, log, err := overlapRun(t, svc, func(a string) ([]byte, bool, error) {
+		if a == "inspect --type container --format {{json .Mounts}} old1" {
+			return []byte(`[{"Type":"volume","Name":"q_stowage-update-api","Destination":"/run/hand"}]`), true, nil
+		}
+		return answer(nil, nil, fresh)(a)
+	}, start, healthy); err != nil || len(f.engine()) != 0 || !strings.Contains(log, "stop-first") {
+		t.Errorf("another project's volume: %v, ran %q, logged %s", err, f.engine(), log)
+	}
+	// The old container's read failing otherwise (a connection's error naming a missing socket
+	// included): the overlap does not start.
+	f, log, err = overlapRun(t, svc, answer(nil, errors.New("error during connect: dial unix /run/docker.sock: connect: no such file or directory")), start)
+	if err == nil || err.Error() != "services.api: before its new container starts, which it does not: reading /run/hand/ready (update_ready) through its old container: error during connect: dial unix /run/docker.sock: connect: no such file or directory" || len(f.engine()) != 0 || strings.Contains(log, "stop-first") {
+		t.Errorf("an old read failing: %v, ran %q, logged %s", err, f.engine(), log)
+	}
+	readyWait = 20 * time.Millisecond
+	f, _, err = overlapRun(t, svc, answer(stale, nil, stale), start)
+	if err == nil || !strings.Contains(err.Error(), "which serves on: its new container /p-new1 did not write /run/hand/ready (update_ready) within 20ms") ||
+		!slices.Equal(f.engine(), []string{up, "rm --force new1"}) {
+		t.Errorf("a new container that never writes it: %v, ran %q", err, f.engine())
+	}
+	readyWait = 10 * time.Minute
+	f, _, err = overlapRun(t, svc, answer(nil, nil, nil), start, start, "new1|/p-new1|exited|1||h2|sha256:img|")
+	if err == nil || !strings.Contains(err.Error(), "which serves on: its new container /p-new1 is exited (exit code 1)") ||
+		!slices.Equal(f.engine(), []string{up, "rm --force new1"}) {
+		t.Errorf("a new container that ends during its setup: %v, ran %q", err, f.engine())
+	}
+}
+
+// A new container that ends with update_decline_status before the old one is signalled declines
+// the overlap: it is removed and the stack's start replaces the service stop-first, with or
+// without update_signal; another status, or one after the signal, fails the start.
+func TestANewContainerDeclinesTheOverlap(t *testing.T) {
+	overlapPoll = time.Millisecond
+	t.Cleanup(func() { overlapPoll = 500 * time.Millisecond })
+	const (
+		up       = "up --detach --no-deps --no-recreate --scale api=2 api"
+		created  = "new1|/p-new1|created|0||h2|sha256:img|"
+		start    = "new1|/p-new1|running|0|starting|h2|sha256:img|"
+		declines = "new1|/p-new1|exited|75||h2|sha256:img|"
+		says     = "services.api.update: its new container declined the overlap (exit status 75, update_decline_status), so this start replaces it stop-first"
+	)
+	decline75 := 75
+	signal := spec.Service{UpdateSignal: "SIGUSR2", UpdateDeclineStatus: &decline75}
+	f, log, err := overlapRun(t, signal, nil, created, declines)
+	if err != nil || !slices.Equal(f.engine(), []string{up, "rm --force new1"}) || !strings.Contains(log, says) {
+		t.Errorf("a decline before the signal: %v, ran %q, logged %s", err, f.engine(), log)
+	}
+	// Its restart policy restarting it: the engine keeps the exit code meanwhile.
+	f, log, err = overlapRun(t, signal, nil, created, "new1|/p-new1|restarting|75||h2|sha256:img|")
+	if err != nil || !slices.Equal(f.engine(), []string{up, "rm --force new1"}) || !strings.Contains(log, says) {
+		t.Errorf("a decline the restart policy restarts: %v, ran %q, logged %s", err, f.engine(), log)
+	}
+	f, _, err = overlapRun(t, signal, nil, created, "new1|/p-new1|exited|1||h2|sha256:img|")
+	if err == nil || !strings.Contains(err.Error(), "exited (exit code 1)") || !slices.Equal(f.engine(), []string{up, "rm --force new1"}) {
+		t.Errorf("another exit status: %v, ran %q", err, f.engine())
+	}
+	f, _, err = overlapRun(t, signal, nil, start, declines)
+	if err == nil || !strings.Contains(err.Error(), "which was sent SIGUSR2 (update_signal)") || !strings.Contains(err.Error(), "exited (exit code 75)") ||
+		!slices.Equal(f.engine(), []string{up, "kill --signal SIGUSR2 old1", "rm --force new1"}) {
+		t.Errorf("a decline after the signal: %v, ran %q", err, f.engine())
+	}
+	// Without update_signal, up --wait fails on the new container's end, which is then read.
+	wait := func(exit string) func(a string) ([]byte, bool, error) {
+		upped := false
+		return func(a string) ([]byte, bool, error) {
+			switch {
+			case strings.Contains(a, " up --detach --wait "):
+				upped = true
+				return nil, true, errors.New("container p-new1 exited (" + exit + ")")
+			case upped && strings.Contains(a, " ps --all --quiet api"):
+				return []byte("old1\nnew1\n"), true, nil
+			case upped && a == "inspect --type container --format "+containerFormat+" old1 new1":
+				return []byte("old1|/p-old1|running|0|healthy|h1|sha256:img|\nnew1|/p-new1|exited|" + exit + "||h2|sha256:img|\n"), true, nil
+			}
+			return nil, false, nil
+		}
+	}
+	waitUp := "up --detach --wait --no-deps --no-recreate --scale api=2 api"
+	f, log, err = overlapRun(t, spec.Service{UpdateDeclineStatus: &decline75}, wait("75"))
+	if err != nil || !slices.Equal(f.engine(), []string{waitUp, "rm --force new1"}) || !strings.Contains(log, says) {
+		t.Errorf("a decline under up --wait: %v, ran %q, logged %s", err, f.engine(), log)
+	}
+	f, _, err = overlapRun(t, spec.Service{UpdateDeclineStatus: &decline75}, wait("1"))
+	if err == nil || !strings.Contains(err.Error(), "did not become healthy beside the old one, which serves on: container p-new1 exited (1)") ||
+		!slices.Equal(f.engine(), []string{waitUp, "rm --force new1"}) {
+		t.Errorf("another status under up --wait: %v, ran %q", err, f.engine())
 	}
 }
 

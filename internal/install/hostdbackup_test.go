@@ -1044,7 +1044,7 @@ func TestADockerInstallBacksUpThroughItsOwnDaemon(t *testing.T) {
 		t.Fatalf("timer %q %v", timer, err)
 	}
 	svc, _ := os.ReadFile(filepath.Join(units, unit+".service"))
-	if !strings.Contains(string(svc), "ExecStart="+filepath.Join(e.dir, "notes-stow")+" backup run --if-configured --dir "+e.dir+"\n") {
+	if !strings.Contains(string(svc), "ExecStart=\""+filepath.Join(e.dir, "notes-stow")+"\" backup run --if-configured --dir \""+e.dir+"\"\n") {
 		t.Errorf("service %s", svc)
 	}
 	if !strings.Contains(fmt.Sprint(host.calls()), "systemctl enable --now "+unit+".timer") {
@@ -1109,7 +1109,7 @@ func TestADockerInstallWatchesItsDisk(t *testing.T) {
 	if timer, err := os.ReadFile(filepath.Join(units, unit+".timer")); err != nil || !strings.Contains(string(timer), "OnUnitActiveSec=600s") {
 		t.Fatalf("timer %q %v", timer, err)
 	}
-	if svc, _ := os.ReadFile(filepath.Join(units, unit+".service")); !strings.Contains(string(svc), " disk-check --dir "+e.dir) {
+	if svc, _ := os.ReadFile(filepath.Join(units, unit+".service")); !strings.Contains(string(svc), " disk-check --dir \""+e.dir+"\"") {
 		t.Errorf("service %s", svc)
 	}
 }

@@ -123,6 +123,7 @@ func Run(root, specPath string, now time.Time) (*Result, error) {
 	l.memory()
 	l.composeLists()
 	l.vmSize()
+	l.vmCores()
 	l.tune()
 	l.host()
 	l.front()
@@ -714,6 +715,38 @@ func (l *linter) vmSize() {
 	}
 	if lo.Disk != 0 && hi.Disk != 0 && lo.Disk > hi.Disk {
 		l.errf(at+"disk", "%s: under the minimum %s", hi.Disk, lo.Disk)
+	}
+}
+
+// vmCores checks the whole cores the services ask (services.<name>.cpus) against the VM's size:
+// more than shapes.kairos.size.min.cpus less the core of CPU 0 is an error (the least VM's start
+// fails), more than recommended's a warning. A vCPU counts as a core: a VM whose CPUs are SMT
+// threads has fewer.
+func (l *linter) vmCores() {
+	k := l.s.Shapes.Kairos
+	if k == nil || k.Size == nil {
+		return
+	}
+	asked := 0
+	var names []string
+	for _, name := range slices.Sorted(maps.Keys(l.s.Services)) {
+		if n := l.s.Services[name].CPUs; n >= 1 && n <= MaxServiceCPUs {
+			asked += n
+			names = append(names, name)
+		}
+	}
+	if asked == 0 {
+		return
+	}
+	say := func(m *spec.Machine, key string, f func(at, format string, args ...any)) bool {
+		if m == nil || m.CPUs < 1 || asked <= m.CPUs-1 {
+			return false
+		}
+		f("shapes.kairos.size."+key+".cpus", "%d: services.*.cpus (%s) ask %d whole cores, and a VM of %d CPUs has %d beside the one of CPU 0, which stays the host's: its start fails", m.CPUs, strings.Join(names, ", "), asked, m.CPUs, m.CPUs-1)
+		return true
+	}
+	if !say(k.Size.Min, "min", l.errf) {
+		say(k.Size.Recommended, "recommended", l.warnf)
 	}
 }
 
@@ -1802,6 +1835,7 @@ func (l *linter) host() {
 		l.reason(at+".reason", a.Reason)
 	}
 	profile := tune.ProfileKeys()
+	var kept []string
 	for _, key := range slices.Sorted(maps.Keys(h.Sysctls)) {
 		c, at := h.Sysctls[key], "host.sysctls."+key
 		switch {
@@ -1812,9 +1846,27 @@ func (l *linter) host() {
 		case !spec.SysctlValue.MatchString(c.Value):
 			l.errf(at+".value", "%q: letters, digits and _ . , : / + -, fields of one space, at most 8", c.Value)
 		case namespaced(key):
-			l.warnf(at, "a namespace keeps its own: the host's value holds in the host's namespace (Docker's NAT and bridges among it), not in a container's own (the compose file's `sysctls` give a service its value)")
+			kept = append(kept, key)
 		}
 		l.reason(at+".reason", c.Reason)
+	}
+	if len(kept) > 0 {
+		// The host's network namespace alone is theirs: an IPC or UTS key stays a container's.
+		also := ""
+		if slices.ContainsFunc(kept, func(k string) bool { return strings.HasPrefix(k, "net.") }) {
+			always, onVM := l.hostNetworkServices()
+			var parts []string
+			if len(always) > 0 {
+				parts = append(parts, strings.Join(always, ", ")+" (on the host's network)")
+			}
+			if len(onVM) > 0 {
+				parts = append(parts, strings.Join(onVM, ", ")+" (on the VM's)")
+			}
+			if len(parts) > 0 {
+				also = ", " + strings.Join(parts, " and ") + " included, for its network settings"
+			}
+		}
+		l.warnf("host.sysctls", "a namespace keeps its own %s: the host's value holds in the host's namespace (Docker's NAT and bridges among it%s), not in a container's own (the compose file's `sysctls` give a service its value)", strings.Join(kept, ", "), also)
 	}
 	if p := h.Power; p != "" && p != tune.Performance && p != tune.Platform {
 		l.errf("host.power", "%q: %s or %s (the default)", p, tune.Performance, tune.Platform)

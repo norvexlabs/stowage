@@ -1735,3 +1735,69 @@ func TestUpgradeAddsAByoRouteTheCertificateCovers(t *testing.T) {
 		t.Fatalf("no route added: %v", err)
 	}
 }
+
+// An upgrade refuses, before anything changes, a release whose services ask more whole cores
+// than the host has beside CPU 0's; one that fits, a host it cannot read (no tune) and Docker
+// Desktop (no cores) are the start's to judge.
+func TestAnUpgradeRefusesCoresTheHostLacks(t *testing.T) {
+	t.Parallel()
+	check := func(cpus int, info string, withTune bool) error {
+		root := tuneRoot(t)
+		if err := os.MkdirAll(filepath.Join(root, "sys/devices/system/cpu"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(root, "sys/devices/system/cpu/online"), []byte("0-2\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		r := testRelease(t, "2.0.0")
+		r.Spec.Services = map[string]spec.Service{"echo": {CPUs: cpus}}
+		d := &fakeDocker{}
+		dockerInfo(d, info)
+		in := &Installer{R: r, O: Options{Docker: d, Log: io.Discard}}
+		if withTune {
+			in.O.Tune = fakeTune(root, 0)
+		}
+		err := in.coresUpgrade(context.Background())
+		if in.tuned != nil {
+			t.Errorf("the check left its reading of the host for the upgrade's start")
+		}
+		return err
+	}
+	const engine = `27.3.1|Ubuntu 24.04 LTS|["name=seccomp,profile=builtin"]`
+	if err := check(2, engine, true); err != nil {
+		t.Errorf("2 cores of 3, CPU 0's kept: %v", err)
+	}
+	err := check(3, engine, true)
+	if err == nil || !strings.Contains(err.Error(), "2.0.0 cannot run here, and nothing was changed: services.*.cpus: echo ask 3 whole cores, and this host has 2 beside the one of CPU 0") {
+		t.Errorf("3 cores of 3: %v", err)
+	}
+	if err := check(3, engine, false); err != nil {
+		t.Errorf("no host to read: %v", err)
+	}
+	if err := check(3, `27.3.1|Docker Desktop|[]`, true); err != nil {
+		t.Errorf("Docker Desktop: %v", err)
+	}
+	// An engine not answering refuses, nothing changed: the upgrade is tried again.
+	if err := check(2, "", true); err == nil || !strings.Contains(err.Error(), "reading this host's cores for the services' cpus: the Docker engine is not reachable") {
+		t.Errorf("an engine not answering: %v", err)
+	}
+	// Docker Desktop stopped, which its CLI's context tells: no cores to check.
+	root := tuneRoot(t)
+	d := &fakeDocker{answer: func(a string) ([]byte, bool, error) {
+		switch {
+		case strings.HasPrefix(a, "info --format"):
+			return nil, true, errors.New("cannot connect")
+		case a == "context show":
+			return []byte("desktop-linux\n"), true, nil
+		}
+		return nil, false, nil
+	}}
+	r := testRelease(t, "2.0.0")
+	r.Spec.Services = map[string]spec.Service{"echo": {CPUs: 64}}
+	if err := (&Installer{R: r, O: Options{Docker: d, Log: io.Discard, Tune: fakeTune(root, 0)}}).coresUpgrade(context.Background()); err != nil {
+		t.Errorf("Docker Desktop stopped: %v", err)
+	}
+	if err := check(3, "garbled", true); err == nil || !strings.Contains(err.Error(), "reading this host's cores for the services' cpus: docker info") {
+		t.Errorf("an engine answering garbled: %v", err)
+	}
+}

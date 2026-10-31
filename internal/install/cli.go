@@ -319,6 +319,9 @@ func newCommand(r *Release, self string, stdout, stderr io.Writer, tools K8sOpti
 	back.Flags().BoolVar(&o.DryRun, "dry-run", false, "check (pulling the previous images the check reads), change nothing")
 	dirFlag(back)
 	root.AddCommand(back)
+	tablesBoot := tablesBootCommand(func(*cobra.Command) (*Installer, error) { return in, prepare() })
+	dirFlag(tablesBoot)
+	root.AddCommand(tablesBoot)
 	reset := &cobra.Command{
 		Use:   "reset-db",
 		Short: "Wipe the data (the volumes data.reset names) and start again as first installed; the service stops meanwhile, nothing is dumped",

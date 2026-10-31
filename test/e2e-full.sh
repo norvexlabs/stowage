@@ -296,6 +296,7 @@ wait "$poller"
 atlas_running "$V2" 2
 grep -q 'services.api: the new container is healthy, the old one stopped' "$WORK/up2.log" || { cat "$WORK/up2.log"; fail "the upgrade did not replace the api start-first"; }
 grep -q 'services.api: the new container runs: SIGUSR2 sent to the old one (update_signal)' "$WORK/up2.log" || { cat "$WORK/up2.log"; fail "the upgrade did not send the old api its update_signal"; }
+grep -q "services.api: the new container wrote /run/atlas/handoff/ready (update_ready)" "$WORK/up2.log" || { cat "$WORK/up2.log"; fail "the upgrade did not wait for the api's update_ready file"; }
 lost=$(grep -cv '^200$' "$WORK/poll2.log" || true)
 ((lost == 0 && $(wc -l <"$WORK/poll2.log") > 10)) || fail "the api route failed $lost of $(wc -l <"$WORK/poll2.log") requests through the upgrade: $(sort "$WORK/poll2.log" | uniq -c | tr '\n' ' ')"
 api=$(docker ps --filter "label=com.docker.compose.project=$(project)" --filter label=com.docker.compose.service=api --format '{{.ID}}')

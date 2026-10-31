@@ -16,7 +16,8 @@ import (
 // decides before it changes anything, as the VM's boot runs it: given no input, asking nothing.
 // The release must be this project's, its front one the install keeps (upgradeFits), and every
 // input it adds must take a value without being given one, so each route it adds has its domain
-// (upgradeRoutes). It reads and writes nothing but env.
+// (upgradeRoutes), and its services' whole cores fit this host (coresUpgrade). It reads and writes
+// nothing but env.
 func (in *Installer) upgradeCheck(ctx context.Context, env *EnvFile) error {
 	o := &in.O
 	o.Set, o.Answers, o.Ports, o.Prompt = nil, nil, nil, nil
@@ -45,7 +46,10 @@ func (in *Installer) upgradeCheck(ctx context.Context, env *EnvFile) error {
 	if err != nil {
 		return err
 	}
-	return in.upgradeRoutes(env, next, mode, pub)
+	if err := in.upgradeRoutes(env, next, mode, pub); err != nil {
+		return err
+	}
+	return in.coresUpgrade(ctx)
 }
 
 // checkUpgrade refuses, before the OS of release m is written, an upgrade the boot into it would

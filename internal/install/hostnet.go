@@ -10,6 +10,8 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+
+	"github.com/norvexlabs/stowage/internal/spec"
 )
 
 // peerAddress is the loopback address the install publishes the nth (from 1) peer of the
@@ -38,9 +40,11 @@ type hostNet struct {
 	reach map[string][]string
 	open  []peerPort
 	// domains are the front's routes' domains, which a target reaches the front by at the
-	// loopback, where the front publishes its ports: the alias the stack's network gives them is
-	// not on the host's.
-	domains []string
+	// loopback, where the front publishes its ports, or at Docker's host-gateway address, another
+	// of the host's, as its services.<name>.front_hosts says (frontHosts): the alias the stack's
+	// network gives them is not on the host's.
+	domains    []string
+	frontHosts map[string]string
 }
 
 // bridged is the targets' ports the firewall accepts from the stack's bridges, sorted, each once.
@@ -89,8 +93,17 @@ func (hn hostNet) give(extra map[string]any, name, mode string) {
 				hosts = append(hosts, t+":127.0.0.1")
 			}
 		}
+		at := "127.0.0.1"
+		switch hn.frontHosts[name] {
+		case spec.FrontHostsGateway:
+			at = "host-gateway"
+		case spec.FrontHostsNone:
+			at = ""
+		}
 		for _, d := range hn.domains {
-			hosts = append(hosts, d+":127.0.0.1")
+			if at != "" {
+				hosts = append(hosts, d+":"+at)
+			}
 		}
 	} else if mode == "" || mode == "bridge" {
 		for _, t := range sortedKeys(hn.targets) {
@@ -144,12 +157,19 @@ func (in *Installer) hostServices() []string {
 // of m it depends on with a network namespace of their own, with the ports each exposes (its
 // `expose:`, then its image's EXPOSE) but those taken, which the stack or the host holds on every
 // address (a peer's can then not be published on its own). A peer exposing none, and one in
-// another's namespace, are logged: the target cannot reach it by name.
+// another's namespace, are logged (the target cannot reach it by name), but one sharing a volume
+// or a host path with the target and one without a network (none), which it reaches over a file.
 func (in *Installer) hostNetwork(ctx context.Context, m *composeModel, taken map[peerPort]bool) (hostNet, error) {
 	hn := hostNet{targets: map[string]bool{}, peers: map[string][]peerPort{}, addrs: map[string]string{}, reach: map[string][]string{}}
 	for _, name := range in.hostServices() {
 		if _, ok := m.Services[name]; ok {
 			hn.targets[name] = true
+			if f := in.R.Spec.Services[name].FrontHosts; f != "" {
+				if hn.frontHosts == nil {
+					hn.frontHosts = map[string]string{}
+				}
+				hn.frontHosts[name] = f
+			}
 		}
 	}
 	for _, r := range in.R.Spec.L4.Routes {
@@ -187,7 +207,9 @@ func (in *Installer) hostNetwork(ctx context.Context, m *composeModel, taken map
 				continue
 			}
 			if mode := svc.NetworkMode; mode != "" && mode != "bridge" {
-				in.O.logf("%s (on the host's network) depends on %s, whose network is %s: it cannot reach %s by name", t, p, mode, p)
+				if mode != "none" { // none has no address to reach: a dependency over a file
+					in.O.logf("%s (on the host's network) depends on %s, whose network is %s: it cannot reach %s by name", t, p, mode, p)
+				}
 				continue
 			}
 			if _, done := hn.peers[p]; !done {
@@ -209,6 +231,9 @@ func (in *Installer) hostNetwork(ctx context.Context, m *composeModel, taken map
 				}
 			}
 			if len(hn.peers[p]) == 0 {
+				if sharesVolume(m, t, p) {
+					continue // reached over a file of the volume they share (a Unix socket)
+				}
 				in.O.logf("%s (on the host's network) depends on %s, which exposes no port it can be published on: it cannot reach %s by name (give %s's ports in its expose:)", t, p, p, p)
 				continue
 			}
@@ -239,6 +264,18 @@ func (in *Installer) hostNetwork(ctx context.Context, m *composeModel, taken map
 		return hostNet{}, nil
 	}
 	return hn, nil
+}
+
+// sharesVolume tells whether services a and b of m mount a volume or a host path in common.
+func sharesVolume(m *composeModel, a, b string) bool {
+	for _, x := range m.Services[a].Volumes {
+		for _, y := range m.Services[b].Volumes {
+			if x.Source != "" && x.Type == y.Type && x.Source == y.Source && (x.Type == "volume" || x.Type == "bind") {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // exposed is the ports service exposes: its `expose:` entries (a port or a range, over tcp unless

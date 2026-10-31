@@ -357,6 +357,9 @@ func (in *Installer) upgradeRefusals(ctx context.Context, env *EnvFile, name, cu
 	if err := in.l4Upgrade(ctx, env, mode); err != nil {
 		return "", publish{}, nil, nil, err
 	}
+	if err := in.coresUpgrade(ctx); err != nil {
+		return "", publish{}, nil, nil, err
+	}
 	return mode, pub, added, kept, nil
 }
 
@@ -380,6 +383,33 @@ func (in *Installer) upgradeFits(env *EnvFile, mode string) (publish, error) {
 		}
 	}
 	return pub, nil
+}
+
+// coresUpgrade refuses, before an upgrade changes anything, a release whose services ask more
+// whole cores (services.<name>.cpus) than this host has beside CPU 0's: its start would fail, on
+// the VM after the release's OS is written. Without a host to read, or on Docker Desktop, which
+// gives no cores, the start judges.
+func (in *Installer) coresUpgrade(ctx context.Context) error {
+	if in.O.Tune == nil || len(coreRequests(in.R.Spec)) == 0 {
+		return nil
+	}
+	// Read for this check alone: the upgrade's start reads the host again, from the env it writes.
+	prev := in.tuned
+	defer func() { in.tuned = prev }()
+	// An engine or a host that does not read refuses: nothing changed yet, and the upgrade is
+	// tried again once it answers (the start would fail on it all the same).
+	sys, err := in.tuneSystem(ctx)
+	if err != nil {
+		return fmt.Errorf("reading this host's cores for the services' cpus: %w", err)
+	}
+	h, err := sys.Host()
+	if err != nil {
+		return fmt.Errorf("reading this host's cores for the services' cpus: %w", err)
+	}
+	if _, err := hostCPUSets(in.R.Spec, sys, h); err != nil {
+		return fmt.Errorf("%s %s cannot run here, and nothing was changed: %w", in.R.Spec.Name, in.R.Manifest.ProjectVersion, err)
+	}
+	return nil
 }
 
 // addedInputs are the inputs of the release in this mode the install does not record.

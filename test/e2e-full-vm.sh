@@ -200,6 +200,21 @@ vpn_id=$(on_vm sudo docker ps -q --filter label=com.docker.compose.service=vpn)
 [[ -n $vpn_id && $(on_vm sudo docker inspect --format "'{{.HostConfig.NetworkMode}}'" "$vpn_id") == host ]] ||
 	fail "the vpn service (host_network) is not on the host's network"
 
+step "on the VM: a reboot loads the services' tables before Docker brings their containers back"
+boot=$(boot_id)
+on_vm sudo systemctl reboot >/dev/null 2>&1 || true
+deadline=$((SECONDS + 900))
+until [[ $(boot_id 2>/dev/null) != "$boot" ]] && [[ $(on_vm systemctl is-active atlas.service 2>/dev/null) == active ]]; do
+	((SECONDS < deadline)) || { on_vm sudo journalctl -b -u atlas.service --no-pager 2>&1 | tail -40; fail "the VM did not come back from its reboot"; }
+	sleep 10
+done
+on_vm sudo journalctl -b -u atlas-tables.service --no-pager >"$WORK/tables.log" 2>&1 || true
+grep -q 'loaded the nftables table inet vpn, before the containers start' "$WORK/tables.log" || { cat "$WORK/tables.log"; fail "the boot did not load the vpn table"; }
+tables=$(on_vm systemctl show -p ExecMainExitTimestampMonotonic --value atlas-tables.service)
+docker=$(on_vm systemctl show -p ExecMainStartTimestampMonotonic --value docker.service)
+((tables > 0 && tables <= docker)) || fail "the tables loaded at $tables µs, after Docker started at $docker µs (since boot)"
+on_vm sudo nft list table inet vpn | grep -q 'tproxy to :17008' || fail "the vpn table is not loaded after the reboot"
+
 step "on the VM: what the project asks of its host (host): kernel modules, packages, kernel arguments, settings, power"
 on_vm test -d /sys/module/tcp_diag || fail "tcp_diag is not loaded at boot"
 on_vm '! test -d /sys/module/pcspkr' || fail "pcspkr is loaded, though blocked"

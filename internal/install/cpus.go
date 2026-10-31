@@ -41,6 +41,16 @@ func cpuSets(s *spec.Spec, cores [][]int) (map[string]string, error) {
 	return out, nil
 }
 
+// hostCPUSets are the services' whole cores on the host sys reads (h), as cpuSets gives them:
+// none on Docker Desktop, whose engine runs in a VM of its own. The start's sizing and the
+// upgrade's check share it, so neither accepts what the other refuses.
+func hostCPUSets(s *spec.Spec, sys tune.System, h tune.Host) (map[string]string, error) {
+	if sys.Docker != nil && sys.Docker.Desktop {
+		return nil, nil
+	}
+	return cpuSets(s, sys.Cores(h))
+}
+
 // giveCPUs adds to a service's content entry its cpuset, and the count of its CPUs to its
 // environment (beside a memory share's variables).
 func (p hostPlan) giveCPUs(extra map[string]any, name string) {

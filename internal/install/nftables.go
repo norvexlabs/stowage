@@ -16,6 +16,7 @@ import (
 	"strings"
 
 	"github.com/norvexlabs/stowage/internal/spec"
+	"github.com/spf13/cobra"
 )
 
 // TableLabel is the label of a service with an nftables table: its table's last load's token, so
@@ -145,6 +146,67 @@ func (in *Installer) tableLoads() map[string]string {
 		}
 	}
 	return out
+}
+
+// tablesBootCmd loads the services' tables at boot, before Docker restores their containers.
+const tablesBootCmd = "tables-boot"
+
+// bootTables loads again, at boot before Docker starts and restores the stack's containers, each
+// table the install's last start loaded (TablesFile, from its file under TablesDir), so no service
+// runs a moment without its table (the kernel keeps no ruleset over a reboot). Each load writes a
+// load token of its own first, as syncTables does: the boot's start, which finds the table loaded,
+// recreates its service, which feeds its sets again. A Docker host's without the consent loads
+// nothing. A table that does not load is the boot's start's to load again: the others load still,
+// and the error names it.
+func (in *Installer) bootTables(ctx context.Context) error {
+	if in.O.Firewall == "" && !in.gatewayConsented() {
+		return nil
+	}
+	raw, err := os.ReadFile(in.path(TablesFile))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var errs []error
+	for _, name := range strings.Fields(string(raw)) {
+		f := filepath.Join(in.O.Dir, TablesDir, name+".nft")
+		if !spec.NftTableName.MatchString(name) || name == in.R.Spec.Name || !fileExists(f) {
+			continue
+		}
+		token := make([]byte, 8)
+		if _, err := rand.Read(token); err != nil {
+			return err
+		}
+		if err := writeAtomic(strings.TrimSuffix(f, ".nft")+".load", strings.NewReader(hex.EncodeToString(token)+"\n"), 0o644, nil); err != nil {
+			return err
+		}
+		if _, err := in.O.host().Run(ctx, Cmd{Args: []string{"nft", "-f", f}}); err != nil {
+			errs = append(errs, fmt.Errorf("services.%s.nftables: its table does not load at boot (the install's start loads it again): %w", name, err))
+			continue
+		}
+		in.O.logf("loaded the nftables table inet %s, before the containers start", name)
+	}
+	return errors.Join(errs...)
+}
+
+// tablesBootCommand is the hidden verb a boot unit runs as root before Docker starts: the
+// services' tables the last start loaded (bootTables) into the install of dir's.
+func tablesBootCommand(prepare func(cmd *cobra.Command) (*Installer, error)) *cobra.Command {
+	return &cobra.Command{
+		Use:    tablesBootCmd,
+		Short:  "Load the services' nftables tables before Docker restores their containers (run at boot)",
+		Args:   cobra.NoArgs,
+		Hidden: true,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			in, err := prepare(cmd)
+			if err != nil {
+				return err
+			}
+			return in.bootTables(cmd.Context())
+		},
+	}
 }
 
 // nftSet is a named set a table declares, and nftElement one element of a set as nft reads it: an

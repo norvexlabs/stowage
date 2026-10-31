@@ -3,9 +3,27 @@
 Stowage's own releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
-## [0.18.1]
+## [0.19.0]
+
+### Added
+- **`services.<name>.update_ready`**: a start-first overlap sends `update_signal` only once the
+  new container wrote that file in its `update_socket` directory, so a new container still
+  preparing, or failing while it does, never makes the old one hand its listeners over.
+- **`services.<name>.update_decline_status`**: a new container exiting with that status before
+  the signal declines the overlap, and the start replaces the service stop-first instead.
+- **`services.<name>.front_hosts`** (`loopback`, `host-gateway`, `none`): what a service on the
+  host's network reaches the front's domains at, for a server that refuses the loopback.
+- **`lint` checks the services' `cpus` against the VM's size**, and an upgrade to a release
+  asking more cores than the host has is refused before it changes anything (on the VM, before
+  its OS is written).
 
 ### Fixed
+- **At boot, the services' nftables tables load before Docker brings their containers back**
+  (the VM and a Docker host after `tune --apply`), instead of a few seconds after.
+- **A dependency a host-network service reaches over a shared volume**, or one without a network,
+  is no longer warned unreachable at every install.
+- **`lint` says the `host.sysctls` namespace warning once**, naming every key and the services on
+  the host's network, instead of once per key.
 - **A disk's push to a registry that caps a request's size** (ghcr.io, at 4 MiB) shrinks its
   chunks and goes on, instead of losing the upload four times and falling back to one stream.
 
