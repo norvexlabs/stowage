@@ -355,6 +355,15 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
 
 ## Could
 
+- **A chunk ceiling that recovers**: a registry's chunk ceiling only drops within a run, and is
+  keyed by host, so one transient 413 slows every later disk of that run to the host. Probe a
+  larger chunk again after a run of successes, or key it by repository; it is half the chunk
+  refused, so it can settle under the registry's real cap (2.3 MiB from a 37 MiB chunk on ghcr.io).
+  Edges of the same classification: a registry that refuses a short last chunk on every attempt
+  is retried until the stall bound fails the push (no fall back to one stream); one that answers
+  only partial ranges and then refuses the smallest chunk gets one stream from the first byte; a
+  416 whose status cannot be read lowers no ceiling, so each disk climbs back and pays it again.
+
 - **Images from packages** (a project hand-writes the Dockerfile stage today, which works): a project that ships Debian packages — software its
   operators install on a host, whose stack runs the same packages one service per container —
   hand-writes a Dockerfile today that repeats what Stowage could own, and gets it subtly wrong:

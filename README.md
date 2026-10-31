@@ -851,23 +851,33 @@ other tag holds it, through `registry.delete` (`oci`: the distribution API, the 
 `github`: GitHub's packages API, for ghcr, whose distribution API deletes nothing — the token
 needs `delete:packages`).
 
-**A disk's push** goes up in chunks (the OCI distribution API's chunked upload, 1 to 64 MiB each,
-never under the `OCI-Chunk-Min-Length` a registry answers, sized to about a minute at the rate the
-last one went and halved after a failure). After a failure (a dropped or stalled connection, a 5xx,
-a 408, 413 or 429, with `Retry-After` not read) it waits (2 s, doubled up to a minute) and goes on
-from the last byte the registry acknowledged, asking it how far it got. A registry that lost the
-upload (a 404, a 416 or a 400 `BLOB_UPLOAD_*`, which Docker Distribution answers to an upload
-resumed after a chunk cut short; one that cannot tell how far it got keeps the last offset
-acknowledged) is asked again whether it holds the blob, then gets a new upload,
-from the first byte, said in the log. A push with no byte acknowledged for 5 minutes fails, naming
-the disk (its file and digest); so does, at once, a refusal no retry changes: a credential (401,
-403), the repository (`NAME_UNKNOWN`, `NAME_INVALID`, `DENIED`), a registry that takes no push
-(405, `UNSUPPORTED`), the digest or size, or any other 400. Between chunks, every 30 s at most,
-the push logs its progress to stderr (bytes sent, of the total, and the rate since its upload
-began), and each retry with its cause. A registry that refuses the first chunk of an upload
-(400, 405, 416 or 501), or that lost the upload 4 times, gets the disk in one stream, as any
-other blob. An upload given up (lost, failed, or replaced by the one stream) is deleted, unless it
-holds every byte: its commit may be under way.
+**A disk's push** goes up in chunks (the OCI distribution API's chunked upload, 1 to 64 MiB each but
+the last, raised to the `OCI-Chunk-Min-Length` a registry answers, sized to about a minute at the
+rate the last one went and halved after a failure). A 413 to a chunk, or a 416 to any but the first
+chunk of a disk's upload (below), asks the registry how far the upload got: an upload it no longer
+knows is lost (below), one further on goes on from there, one behind is retried from there, and a
+416 it cannot tell is retried while the chunk can shrink. Otherwise — the upload still at the last
+byte acknowledged (ghcr.io caps a request at 4 MiB and answers 416), or a 413 it cannot tell — the
+chunk's size was refused: the chunk is halved at once, said in the log, and no later chunk to that
+registry in the same run (the other disks of a `ship` included) is larger, unless the registry's own
+minimum is. The smallest chunk refused so is retried once this disk's upload had a whole chunk that
+large acknowledged, and before that gets the disk in one stream. A 413 or 416 naming a refusal of
+the push (`DENIED`, `SIZE_INVALID`, …) fails it at once. After a failure (a dropped or stalled
+connection, a 5xx, a 408 or 429, a 413 to any other request, with `Retry-After` not read) it waits
+(2 s, doubled up to a minute) and goes on from the last byte the registry acknowledged, asking it
+how far it got. A registry that lost the upload (a 404, a 416 it no longer knows the upload after, a
+status claiming bytes never sent, or a 400 `BLOB_UPLOAD_*`, which Docker Distribution answers to an
+upload resumed after a chunk cut short; one that cannot tell how far it got keeps the last offset
+acknowledged) is asked again whether it holds the blob, then gets a new upload, from the first byte,
+said in the log. A push with no byte acknowledged for 5 minutes fails, naming the disk (its file and
+digest); so does, at once, a refusal no retry changes: a credential (401, 403), the repository
+(`NAME_UNKNOWN`, `NAME_INVALID`, `DENIED`), a registry that takes no push (405, `UNSUPPORTED`), the
+digest or size, or any other 400. Between chunks, every 30 s at most, the push logs its progress to
+stderr (bytes sent, of the total, and the rate since its upload began), and each retry with its
+cause. A registry that refuses the first chunk of a disk's upload, before any was acknowledged (400,
+405, 416 or 501), or that lost the upload 4 times, gets the disk in one stream, as any other blob.
+An upload given up (lost, failed, or replaced by the one stream) is deleted, unless it holds every
+byte: its commit may be under way.
 
 **Signing** (`signing: { provider: cosign-key, key: …, public_keys: [...] }`): every image, chart,
 OS bundle, disk image, installer and release manifest is signed by digest before its tag moves, with the `cosign` CLI (v3, on

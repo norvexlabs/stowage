@@ -351,14 +351,26 @@ pushed artifact.
   makes that disk alone. A disk's layer is its file compressed with zstd, every format alike (a
   raw or fixed VHD disk is mostly unallocated space: −66 %; the others −1 to −3 %), annotated
   with the file's own digest: a reader decompresses it as a stream into the file and checks that
-  digest, the compressed one being checked as it is read. A disk goes up by chunks, resumed from
-  the registry's acknowledged range after a failure and failed when no byte is acknowledged for
-  a bounded time: a multi-GB stream restarted from zero on each drop, or stalled without a word,
-  never finishes on a lossy link. The bound counts acknowledged bytes, not bytes sent (a link
-  that drops everything still takes a socket buffer's worth on each attempt), so chunks are small
-  enough to be acknowledged within it down to a few KB/s; the sessions are capped, as a registry
-  that keeps losing the upload acknowledges the same bytes again, and past the cap, or for a
-  registry without chunked uploads, the blob goes up in one stream. Both
+  digest, the compressed one being checked as it is read. A disk goes up by chunks, resumed from the
+  registry's acknowledged range after a failure and failed when no byte is acknowledged for a
+  bounded time: a multi-GB stream restarted from zero on each drop, or stalled without a word, never
+  finishes on a lossy link. The bound counts acknowledged bytes, not bytes sent (a link that drops
+  everything still takes a socket buffer's worth on each attempt), so chunks are small enough to be
+  acknowledged within it down to a few KB/s; the sessions are capped, as a registry that keeps
+  losing the upload acknowledges the same bytes again. A chunk refused for its size (a 413 or 416
+  the session survives at the acknowledged offset: a proxy capping a request's body answers it,
+  ghcr.io at 4 MiB) is a ceiling, not a lost session: the chunk is halved and the ceiling held for
+  the client's later chunks to that registry, so the first disk pays a few refused bodies (from a 64
+  MiB chunk on ghcr.io: 64, 32, 16, 8) and the others none, instead of four sessions each. The
+  session's status (`GET`) classifies, once, every 413 and 416 but one to a disk's first chunk or
+  one naming a refusal: at the acknowledged offset it is a size (so is a 413 it cannot answer),
+  elsewhere it is followed, a session the registry no longer knows (or one claiming bytes never
+  sent) is lost, and a 416 it cannot answer is retried without touching the shared ceiling, as a
+  guess must not slow every later disk. The smallest chunk refused is a registry without chunks only
+  before the disk's upload had a whole chunk that large acknowledged; after, the registry took one,
+  so it is retried. A refusal naming the push itself (`DENIED`, …) stays final whatever its status.
+  The ceiling only drops within a run: a transient 413 costs that run speed, never the upload. Past
+  the session cap, or for a registry without chunked uploads, the blob goes up in one stream. Both
   are planned once the images are pushed by digest — still before any tag moves; on an immutable
   channel the images are then all kept, so a refusal still writes nothing.
 - Floating tags follow the channel that sets latest and are re-tagged in place: the installer's

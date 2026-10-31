@@ -3,6 +3,12 @@
 Stowage's own releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
+## [0.18.1]
+
+### Fixed
+- **A disk's push to a registry that caps a request's size** (ghcr.io, at 4 MiB) shrinks its
+  chunks and goes on, instead of losing the upload four times and falling back to one stream.
+
 ## [0.18.0] - 2026-10-30
 
 ### Added

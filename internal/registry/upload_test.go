@@ -126,6 +126,12 @@ func uploadFixtureOf(t *testing.T, n int) (*faulty, *Client, *bytes.Buffer, stri
 	t.Cleanup(srv.Close)
 	var out bytes.Buffer
 	c := New(authn.NewMultiKeychain(), WithLog(&out))
+	return f, c, &out, strings.TrimPrefix(srv.URL, "http://") + "/acme/disk", fileBlob(t, n)
+}
+
+// fileBlob is a file blob of n random bytes.
+func fileBlob(t *testing.T, n int) Blob {
+	t.Helper()
 	file := filepath.Join(t.TempDir(), "disk.raw")
 	data := make([]byte, n)
 	_, _ = rand.Read(data)
@@ -137,7 +143,7 @@ func uploadFixtureOf(t *testing.T, n int) (*faulty, *Client, *bytes.Buffer, stri
 		t.Fatal(err)
 	}
 	b.Annotations = map[string]string{TitleAnnotation: "disk.raw"}
-	return f, c, &out, strings.TrimPrefix(srv.URL, "http://") + "/acme/disk", b
+	return b
 }
 
 // pushed pushes b alone and checks the registry holds it, whole.
@@ -282,21 +288,128 @@ func TestAFileBlobGoesUpInChunksAndResumes(t *testing.T) {
 		if !strings.Contains(out.String(), "refuses chunked uploads") || !strings.Contains(out.String(), "pushing it in one stream") {
 			t.Errorf("log:\n%s", out)
 		}
-		// A refusal after a chunk was sent may be a session lost: a new session tells, its first
-		// chunk refused; then the stream's own.
-		if f.posts != 3 {
+		// A refusal after a chunk was sent may be a session lost: the session's status tells it
+		// holds the offset, the smallest chunk refused; then the stream's own.
+		if f.posts != 2 {
 			t.Errorf("%d sessions", f.posts)
 		}
-		// Neither session it opened is left behind.
-		if f.deletes != 2 {
+		// The session it opened is not left behind.
+		if f.deletes != 1 {
 			t.Errorf("%d sessions deleted", f.deletes)
+		}
+	})
+
+	t.Run("the smallest chunk refused while the status cannot be read gets one stream", func(t *testing.T) {
+		f, c, out, repo, b := uploadFixture(t)
+		f.patch = func(n int, w http.ResponseWriter, r *http.Request) bool {
+			if n == 0 {
+				drop(w, r)
+			}
+			w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+			return true
+		}
+		f.status = func(w http.ResponseWriter, r *http.Request) bool {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return true
+		}
+		if err := pushed(t, c, repo, b); err != nil || f.posts != 2 || !strings.Contains(out.String(), "pushing it in one stream") {
+			t.Fatalf("%v, %d sessions, log:\n%s", err, f.posts, out)
 		}
 	})
 
 	t.Run("a refusal after chunks went up is a session lost, not a refusal of chunks", func(t *testing.T) {
 		f, c, out, repo, b := uploadFixture(t)
+		gone := false
 		f.patch = func(n int, w http.ResponseWriter, r *http.Request) bool {
 			if n == 3 {
+				gone = true
+				w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+				return true
+			}
+			return false
+		}
+		// The registry dropped the session with its 416: it no longer knows it.
+		f.status = func(w http.ResponseWriter, r *http.Request) bool {
+			if gone {
+				w.WriteHeader(http.StatusNotFound)
+				return true
+			}
+			return false
+		}
+		if err := pushed(t, c, repo, b); err != nil {
+			t.Fatal(err)
+		}
+		if f.posts != 2 || strings.Contains(out.String(), "one stream") || strings.Contains(out.String(), "refuses a chunk") {
+			t.Fatalf("%d sessions, log:\n%s", f.posts, out)
+		}
+	})
+
+	// A registry that caps a request's body (ghcr.io: 416 over 4 MiB, others 413): the chunk
+	// shrinks, the session goes on, and the client's later uploads to it stay under the cap.
+	for _, status := range []int{http.StatusRequestedRangeNotSatisfiable, http.StatusRequestEntityTooLarge} {
+		t.Run(fmt.Sprintf("a chunk refused with %d for its size shrinks", status), func(t *testing.T) {
+			f, c, out, repo, b := uploadFixture(t)
+			const limit = 2 << 10
+			refused := 0
+			f.patch = func(n int, w http.ResponseWriter, r *http.Request) bool {
+				if r.ContentLength > limit {
+					refused++
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(status)
+					_, _ = w.Write([]byte(`{"errors":[{"code":"REQUESTED_RANGE_NOT_SATISFIABLE","message":"the request body is too large"}]}`))
+					return true
+				}
+				return false
+			}
+			if err := pushed(t, c, repo, b); err != nil {
+				t.Fatal(err)
+			}
+			if f.posts != 1 || refused != 1 || strings.Contains(out.String(), "one stream") || strings.Contains(out.String(), "again in") ||
+				!strings.Contains(out.String(), "refuses a chunk of 4.0 KiB; chunks of at most 2.0 KiB from now") {
+				t.Fatalf("%d sessions, %d refused, log:\n%s", f.posts, refused, out)
+			}
+			// The chunk at the cap went up: the boundary's other side.
+			if f.sizes[len(f.sizes)-2] != limit {
+				t.Fatalf("chunks %v", f.sizes)
+			}
+			// Another blob, same client: no chunk over the cap is sent.
+			f.posts, refused = 0, 0
+			if err := pushed(t, c, repo, fileBlob(t, 20<<10)); err != nil || refused != 0 || f.posts != 1 {
+				t.Fatalf("%v, %d refused, %d sessions", err, refused, f.posts)
+			}
+		})
+
+		// The smallest chunk refused for its size before any was acknowledged: no smaller one to
+		// try, the registry gets one stream.
+		t.Run(fmt.Sprintf("the smallest chunk refused with %d gets one stream", status), func(t *testing.T) {
+			f, c, out, repo, b := uploadFixture(t)
+			f.patch = func(n int, w http.ResponseWriter, r *http.Request) bool {
+				if r.ContentLength >= chunkMin {
+					w.WriteHeader(status)
+					return true
+				}
+				return false
+			}
+			if err := pushed(t, c, repo, b); err != nil {
+				t.Fatal(err)
+			}
+			if f.posts != 2 || f.deletes != 1 || !strings.Contains(out.String(), "pushing it in one stream") {
+				t.Fatalf("%d sessions, %d deleted, log:\n%s", f.posts, f.deletes, out)
+			}
+		})
+	}
+
+	// A 416 the session's status explains otherwise: not a chunk's size.
+	t.Run("a 416 while the session holds another offset goes on from there", func(t *testing.T) {
+		f, c, out, repo, b := uploadFixture(t)
+		f.patch = func(n int, w http.ResponseWriter, r *http.Request) bool {
+			if n == 2 { // the registry took the chunk, then answered 416
+				f.next.ServeHTTP(httptest.NewRecorder(), r)
+				f.mu.Lock()
+				_, last, _ := strings.Cut(r.Header.Get("Content-Range"), "-")
+				end, _ := strconv.ParseInt(last, 10, 64)
+				f.held[path.Base(r.URL.Path)] = end + 1
+				f.mu.Unlock()
 				w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
 				return true
 			}
@@ -305,10 +418,176 @@ func TestAFileBlobGoesUpInChunksAndResumes(t *testing.T) {
 		if err := pushed(t, c, repo, b); err != nil {
 			t.Fatal(err)
 		}
-		if f.posts != 2 || strings.Contains(out.String(), "one stream") {
+		// Further than the chunk's start: the upload goes on at once, its chunk kept.
+		if f.posts != 1 || strings.Contains(out.String(), "refuses a chunk") || strings.Contains(out.String(), "again in") {
 			t.Fatalf("%d sessions, log:\n%s", f.posts, out)
 		}
 	})
+
+	t.Run("a 416 the session's status cannot explain is retried, not a ceiling", func(t *testing.T) {
+		f, c, out, repo, b := uploadFixture(t)
+		refused := false
+		f.patch = func(n int, w http.ResponseWriter, r *http.Request) bool {
+			if n == 2 {
+				refused = true
+				w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+				return true
+			}
+			return false
+		}
+		f.status = func(w http.ResponseWriter, r *http.Request) bool {
+			if refused {
+				refused = false
+				w.WriteHeader(http.StatusServiceUnavailable)
+				return true
+			}
+			return false
+		}
+		if err := pushed(t, c, repo, b); err != nil {
+			t.Fatal(err)
+		}
+		if f.posts != 1 || strings.Contains(out.String(), "refuses a chunk") || !strings.Contains(out.String(), "again in") {
+			t.Fatalf("%d sessions, log:\n%s", f.posts, out)
+		}
+	})
+
+	t.Run("a 416 while the session claims bytes never sent is a session lost", func(t *testing.T) {
+		f, c, out, repo, b := uploadFixture(t)
+		claim := false
+		f.patch = func(n int, w http.ResponseWriter, r *http.Request) bool {
+			if n == 2 {
+				claim = true
+				w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+				return true
+			}
+			return false
+		}
+		f.status = func(w http.ResponseWriter, r *http.Request) bool {
+			if claim {
+				claim = false
+				w.Header().Set("Range", fmt.Sprintf("0-%d", b.size-1))
+				w.WriteHeader(http.StatusNoContent)
+				return true
+			}
+			return false
+		}
+		if err := pushed(t, c, repo, b); err != nil || f.posts != 2 || strings.Contains(out.String(), "refuses a chunk") {
+			t.Fatalf("%v, %d sessions, log:\n%s", err, f.posts, out)
+		}
+	})
+
+	t.Run("a 416 while the session holds less goes on from there, not a ceiling", func(t *testing.T) {
+		f, c, out, repo, b := uploadFixture(t)
+		back := int64(-1)
+		f.patch = func(n int, w http.ResponseWriter, r *http.Request) bool {
+			if n == 2 {
+				first, _, _ := strings.Cut(r.Header.Get("Content-Range"), "-")
+				back, _ = strconv.ParseInt(first, 10, 64)
+				back -= 512
+				w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+				return true
+			}
+			return false
+		}
+		f.status = func(w http.ResponseWriter, r *http.Request) bool {
+			if back > 0 {
+				w.Header().Set("Range", fmt.Sprintf("0-%d", back-1))
+				w.WriteHeader(http.StatusNoContent)
+				back = 0
+				return true
+			}
+			return false
+		}
+		if err := pushed(t, c, repo, b); err != nil || f.posts != 1 || strings.Contains(out.String(), "refuses a chunk") {
+			t.Fatalf("%v, %d sessions, log:\n%s", err, f.posts, out)
+		}
+	})
+
+	t.Run("a 416 to the last chunk whose status cannot be read is retried", func(t *testing.T) {
+		f, c, out, repo, _ := uploadFixture(t)
+		b := fileBlob(t, 1<<10+4*4<<10+512)
+		refused, unread := 0, false
+		f.patch = func(n int, w http.ResponseWriter, r *http.Request) bool {
+			if r.ContentLength < chunkMin && refused == 0 {
+				refused, unread = 1, true
+				w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+				return true
+			}
+			return false
+		}
+		f.status = func(w http.ResponseWriter, r *http.Request) bool {
+			if unread {
+				unread = false
+				w.WriteHeader(http.StatusServiceUnavailable)
+				return true
+			}
+			return false
+		}
+		if err := pushed(t, c, repo, b); err != nil || refused != 1 || f.posts != 1 || strings.Contains(out.String(), "one stream") {
+			t.Fatalf("%v, %d refused, %d sessions, log:\n%s", err, refused, f.posts, out)
+		}
+	})
+
+	t.Run("a ceiling another upload learnt bounds the next chunk", func(t *testing.T) {
+		f, c, _, repo, b := uploadFixture(t)
+		r, err := c.Repo(repo)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Learnt while this upload's chunk is past it, as by a disk going up beside it.
+		ceiling := c.ceiling(r.RegistryStr())
+		f.patch = func(n int, w http.ResponseWriter, r *http.Request) bool {
+			if n == 1 {
+				ceiling.Store(2 << 10)
+			}
+			return false
+		}
+		if err := pushed(t, c, repo, b); err != nil {
+			t.Fatal(err)
+		}
+		for _, n := range f.sizes[2:] {
+			if n > 2<<10 {
+				t.Fatalf("chunks %v", f.sizes)
+			}
+		}
+	})
+
+	t.Run("a last chunk under the smallest refused for its size is retried", func(t *testing.T) {
+		f, c, out, repo, _ := uploadFixture(t)
+		b := fileBlob(t, 1<<10+4*4<<10+512) // 1 KiB, then 4 KiB chunks, then 512 B
+		refused := 0
+		f.patch = func(n int, w http.ResponseWriter, r *http.Request) bool {
+			if r.ContentLength < chunkMin && refused == 0 {
+				refused++
+				w.WriteHeader(http.StatusRequestEntityTooLarge)
+				return true
+			}
+			return false
+		}
+		if err := pushed(t, c, repo, b); err != nil || refused != 1 || f.posts != 1 || strings.Contains(out.String(), "one stream") || strings.Contains(out.String(), "refuses a chunk") {
+			t.Fatalf("%v, %d refused, %d sessions, log:\n%s", err, refused, f.posts, out)
+		}
+	})
+
+	// A size refusal that names a refusal of the push itself fails it at once.
+	for _, status := range []int{http.StatusRequestEntityTooLarge, http.StatusRequestedRangeNotSatisfiable} {
+		t.Run(fmt.Sprintf("a %d DENIED after chunks went up fails the push", status), func(t *testing.T) {
+			f, c, out, repo, b := uploadFixture(t)
+			f.patch = func(n int, w http.ResponseWriter, r *http.Request) bool {
+				if n == 2 {
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(status)
+					_, _ = w.Write([]byte(`{"errors":[{"code":"DENIED","message":"over quota"}]}`))
+					return true
+				}
+				return false
+			}
+			err := pushed(t, c, repo, b)
+			if err == nil || !strings.Contains(err.Error(), "over quota") || f.posts != 1 || strings.Contains(out.String(), "refuses a chunk") || strings.Contains(out.String(), "again in") {
+				t.Fatalf("%v, %d sessions, log:\n%s", err, f.posts, out)
+			}
+		})
+	}
 
 	// A 400 mid-upload: the session lost when the registry says so, otherwise a refusal.
 	for _, c := range []struct {

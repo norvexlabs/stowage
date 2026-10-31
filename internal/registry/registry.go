@@ -49,6 +49,7 @@ type Client struct {
 	rt       http.RoundTripper
 	roots    *x509.CertPool
 	log      io.Writer // a large blob's push: its progress and its retries
+	ceilings sync.Map  // registry → *atomic.Int64: the largest chunk it takes, 0 until it refused one for its size
 }
 
 // Option configures a Client.

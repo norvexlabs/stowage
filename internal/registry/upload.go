@@ -53,8 +53,8 @@ const maxSessions = 4
 // errSessions is a registry that keeps losing an upload.
 var errSessions = errors.New("the registry lost the upload")
 
-// errChunkRefused is a registry refusing a chunk at the start of an upload: it takes a blob in one
-// stream only.
+// errChunkRefused is a registry refusing chunks: the first of an upload, or the smallest one before
+// it acknowledged a whole chunk that large. It takes the blob in one stream only.
 var errChunkRefused = errors.New("the registry refuses chunked uploads")
 
 // pushFile pushes a file blob in chunks (the OCI distribution spec's chunked upload): after a
@@ -76,14 +76,15 @@ func (c *Client) pushFile(ctx context.Context, repo name.Repository, b Blob) err
 	}
 	defer f.Close()
 	u := &upload{
-		hc:    &http.Client{Transport: rt},
-		repo:  repo,
-		b:     b,
-		f:     f,
-		log:   c.log,
-		label: cmpLabel(b),
-		chunk: chunkMin,
-		least: chunkMin,
+		hc:      &http.Client{Transport: rt},
+		repo:    repo,
+		b:       b,
+		f:       f,
+		log:     c.log,
+		label:   cmpLabel(b),
+		chunk:   chunkMin,
+		least:   chunkMin,
+		ceiling: c.ceiling(repo.RegistryStr()),
 	}
 	err = u.run(ctx)
 	if err != nil {
@@ -94,6 +95,13 @@ func (c *Client) pushFile(ctx context.Context, repo name.Repository, b Blob) err
 		return remote.WriteLayer(repo, b.layer(), c.opts(ctx)...)
 	}
 	return err
+}
+
+// ceiling is the largest chunk a registry takes, shared by every upload of this client to it: 0
+// until it refused a chunk for its size.
+func (c *Client) ceiling(registry string) *atomic.Int64 {
+	v, _ := c.ceilings.LoadOrStore(registry, new(atomic.Int64))
+	return v.(*atomic.Int64)
 }
 
 // cmpLabel names a blob in messages: its title, with its digest.
@@ -116,13 +124,17 @@ type upload struct {
 	sessions int       // the sessions begun
 	checked  bool      // the registry was asked whether it holds the blob
 	ever     bool      // the registry acknowledged a chunk once
+	took     int64     // the largest chunk the registry acknowledged whole
 	patched  bool      // a chunk was sent in this session
 	from     time.Time // the session began: the rate is measured from then
 	lostAt   int64     // the bytes the last session lost held
 	chunk    int64
-	least    int64        // the smallest chunk but the last
-	acked    time.Time    // when the registry last acknowledged a byte (or the upload began)
-	sent     atomic.Int64 // when a request's body was last read, in Unix nanoseconds
+	last     int64         // the last chunk's length
+	reach    int64         // the furthest byte sent in this session: a registry holds no more
+	least    int64         // the smallest chunk but the last
+	ceiling  *atomic.Int64 // the largest chunk the registry takes, 0 when unknown
+	acked    time.Time     // when the registry last acknowledged a byte (or the upload began)
+	sent     atomic.Int64  // when a request's body was last read, in Unix nanoseconds
 }
 
 func (u *upload) logf(format string, a ...any) {
@@ -199,7 +211,10 @@ func (u *upload) run(ctx context.Context) error {
 		case <-time.After(wait):
 		}
 		wait = min(2*wait, retryMax*uploadUnit)
-		u.chunk = max(u.chunk/2, u.least)
+		if u.last > 0 && u.off < u.b.size {
+			u.chunk = min(u.chunk, u.last) // a last chunk shorter than the chunk
+		}
+		u.chunk = u.bounded(u.chunk / 2)
 		if u.loc != nil {
 			u.resync(ctx)
 		}
@@ -247,7 +262,8 @@ func (u *upload) do(ctx context.Context, req *http.Request) (*http.Response, err
 // final reports whether err is a refusal no retry changes: the credentials, the repository, a
 // registry that takes no push, the blob's digest or size, or any other request refused (400) but
 // an upload session lost. A session lost (404, 416, 400 BLOB_UPLOAD_*), a request timed out (408),
-// a chunk too large (413), a rate limit (429) and a server error are retried.
+// a chunk too large (413, or a 416 the session survives: see sized), a rate limit (429) and a
+// server error are retried.
 func final(err error) bool {
 	var te *transport.Error
 	if !errors.As(err, &te) {
@@ -339,7 +355,7 @@ func (u *upload) begin(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	u.loc, u.off, u.patched = loc, 0, false
+	u.loc, u.off, u.patched, u.reach, u.last = loc, 0, false, 0, 0
 	u.from = time.Now()
 	u.sessions++
 	if u.sessions > 1 {
@@ -386,8 +402,9 @@ func acknowledged(resp *http.Response, before int64) int64 {
 func (u *upload) patch(ctx context.Context) error {
 	fresh := !u.ever && !u.patched
 	u.patched = true
-	n := min(u.chunk, u.b.size-u.off)
+	n := min(u.bounded(u.chunk), u.b.size-u.off)
 	off := u.off
+	u.last, u.reach = n, max(u.reach, off+n)
 	body := func() io.Reader { return &touch{io.NewSectionReader(u.f, off, n), &u.sent} }
 	req, err := http.NewRequest(http.MethodPatch, u.loc.String(), body())
 	if err != nil {
@@ -404,13 +421,17 @@ func (u *upload) patch(ctx context.Context) error {
 	}
 	if err := transport.CheckError(resp, http.StatusAccepted, http.StatusNoContent); err != nil {
 		te := (*transport.Error)(nil)
+		named := errors.As(err, &te) && refusal(te)
 		switch resp.StatusCode {
 		case http.StatusBadRequest, http.StatusMethodNotAllowed, http.StatusRequestedRangeNotSatisfiable, http.StatusNotImplemented:
-			if fresh && !(errors.As(err, &te) && refusal(te)) {
+			if fresh && !named {
 				return fmt.Errorf("%w: %w", errChunkRefused, err)
 			}
 		}
-		if errors.As(err, &te) && sessionLost(te) {
+		if !named && (resp.StatusCode == http.StatusRequestEntityTooLarge || resp.StatusCode == http.StatusRequestedRangeNotSatisfiable) {
+			return u.sized(ctx, resp.StatusCode, n, err)
+		}
+		if !named && te != nil && sessionLost(te) {
 			u.lost(ctx)
 		}
 		return err
@@ -428,10 +449,66 @@ func (u *upload) patch(ctx context.Context) error {
 	}
 	u.advance(got)
 	u.ever = true
+	if got == off+n {
+		u.took = max(u.took, n)
+	}
 	if d := time.Since(t0).Seconds(); d > 0 {
 		rate := float64(got-off) / d
-		u.chunk = max(min(int64(rate*chunkTime*uploadUnit.Seconds()), chunkMax), u.least)
+		u.chunk = u.bounded(int64(rate * chunkTime * uploadUnit.Seconds()))
 	}
+	return nil
+}
+
+// bounded is a chunk of about n bytes: at most chunkMax and the registry's ceiling, at least the
+// smallest chunk it takes.
+func (u *upload) bounded(n int64) int64 {
+	n = min(n, chunkMax)
+	if c := u.ceiling.Load(); c > 0 {
+		n = min(n, c)
+	}
+	return max(n, u.least)
+}
+
+// sized answers a 413 or a 416 to a chunk of n bytes that names no refusal of the push, from the
+// session's status. A session the registry no longer knows is lost; one further on goes on from
+// there at once, one behind is retried from there; a 416 it cannot answer is retried (run halves
+// the chunk and asks again) while the chunk can shrink. Otherwise — the session at the
+// acknowledged offset, a 413 the status does not explain, the smallest chunk unexplained — it is a
+// refusal of the chunk's size (a registry that caps a request's body answers it, ghcr.io a 416
+// over 4 MiB): the chunk is halved, from the last byte acknowledged, and the registry's ceiling
+// drops below n for every later chunk of this client to it. A chunk that cannot shrink (the
+// smallest the upload takes, or a last one under it) is retried when the registry took a whole
+// chunk as large: before that, it is a registry that takes no chunk that small (errChunkRefused).
+func (u *upload) sized(ctx context.Context, status int, n int64, err error) error {
+	got, lost := u.held(ctx)
+	switch {
+	case lost:
+		u.lost(ctx)
+		return err
+	case got > u.off:
+		u.advance(got)
+		return nil
+	case got >= 0 && got < u.off:
+		u.advance(got)
+		return err
+	case got < 0 && status == http.StatusRequestedRangeNotSatisfiable && n > u.least:
+		return err
+	}
+	if n <= u.least {
+		if u.took >= n {
+			return err
+		}
+		return fmt.Errorf("%w: a chunk of %s refused: %w", errChunkRefused, size(n), err)
+	}
+	c := max(n/2, u.least)
+	for {
+		old := u.ceiling.Load()
+		if old > 0 && old <= c || u.ceiling.CompareAndSwap(old, c) {
+			break
+		}
+	}
+	u.chunk = u.bounded(u.chunk)
+	u.logf("push %s: the registry refuses a chunk of %s; chunks of at most %s from now", u.label, size(n), size(max(u.ceiling.Load(), u.least)))
 	return nil
 }
 
@@ -443,30 +520,45 @@ func (u *upload) advance(to int64) {
 }
 
 // resync reads the session's progress after a failure. A registry that cannot tell keeps the
-// offset last acknowledged; one that lost the session (404, or 400 BLOB_UPLOAD_*, as one that
-// cancels an upload resumed at another offset answers) gets a new one.
+// offset last acknowledged; one that lost the session gets a new one.
 func (u *upload) resync(ctx context.Context) {
+	got, lost := u.held(ctx)
+	switch {
+	case lost:
+		u.lost(ctx)
+	case got >= 0:
+		u.advance(got)
+	}
+}
+
+// held asks the registry for the bytes the session holds: -1 when it cannot tell, and lost when it
+// no longer knows the session (404, 416, or 400 BLOB_UPLOAD_*, as one that cancels an upload
+// resumed at another offset answers) or claims bytes never sent to it.
+func (u *upload) held(ctx context.Context) (got int64, lost bool) {
 	req, err := http.NewRequest(http.MethodGet, u.loc.String(), nil)
 	if err != nil {
-		return
+		return -1, false
 	}
 	resp, err := u.do(ctx, req)
 	if err != nil {
-		return
+		return -1, false
 	}
 	switch resp.StatusCode {
 	case http.StatusNoContent, http.StatusOK, http.StatusAccepted:
-		if got := acknowledged(resp, u.off); got >= 0 && got <= u.b.size {
+		got := acknowledged(resp, u.off)
+		if got > u.reach {
+			return -1, true
+		}
+		if got >= 0 {
 			if loc, err := location(u.loc, resp); err == nil {
 				u.loc = loc
 			}
-			u.advance(got)
+			return got, false
 		}
-	default:
-		if te := (*transport.Error)(nil); errors.As(transport.CheckError(resp), &te) && sessionLost(te) {
-			u.lost(ctx)
-		}
+		return -1, false
 	}
+	te := (*transport.Error)(nil)
+	return -1, errors.As(transport.CheckError(resp), &te) && sessionLost(te)
 }
 
 // commit closes the session with the blob's digest. A commit whose answer was lost may have
