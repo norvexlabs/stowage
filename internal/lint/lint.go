@@ -1624,9 +1624,14 @@ func (l *linter) hooks() {
 			l.service(w+".post", m[1])
 		}
 	}
-	if l.s.Backup != nil && !l.s.HasDatabase() {
-		l.errf("backup", "a backup dumps the database, and the project declares none")
-	} else if err := providers.Backup(l.s.Backup, l.s.Images); err != nil {
+	switch {
+	case l.s.Backup == nil:
+	case !l.s.HasDatabase() && (l.s.Backup.Name == providers.VMBackup || l.s.Backup.Name == "command"):
+		l.errf("backup", "a %s backup backs a database up, and the project declares none (%s backs up the volumes of a project without one)", l.s.Backup.Name, providers.VolumesBackup)
+	case l.s.HasDatabase() && l.s.Backup.Name == providers.VolumesBackup:
+		l.errf("backup", "%s leaves the database out, and the project declares one: %s backs it up with its volumes", providers.VolumesBackup, providers.VMBackup)
+	}
+	if err := providers.Backup(l.s.Backup, l.s.Images); err != nil {
 		l.errf("backup", "%v", err)
 	} else if pg, err := providers.DecodeBackup(l.s.Backup); err == nil {
 		l.backupVolumes(pg.Volumes)
@@ -1825,11 +1830,13 @@ func (l *linter) shapes() {
 			l.service(w+".host_api", svc)
 		}
 		switch {
+		case l.s.Backup == nil && !l.s.HasDatabase() && len(l.s.Data.Volumes) > 0:
+			l.warnf("backup", "the VM keeps its data volumes locally and no backup is declared (%s archives them)", providers.VolumesBackup)
 		case l.s.Backup == nil && !l.s.HasDatabase():
 		case l.s.Backup == nil:
 			l.warnf("backup", "the VM keeps its data locally and no backup is declared")
 		case !providers.RunsBackups(l.s):
-			l.warnf("backup", "the VM runs %s backups only: it schedules no %s backup", providers.VMBackup, l.s.Backup.Name)
+			l.warnf("backup", "the VM runs %s and %s backups only: it schedules no %s backup", providers.VMBackup, providers.VolumesBackup, l.s.Backup.Name)
 		}
 	}
 }

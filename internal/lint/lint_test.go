@@ -149,6 +149,7 @@ func TestEachRuleFires(t *testing.T) {
 		{"unknown disk format", []edit{{specFile, "disk_formats: [qcow2]", "disk_formats: [vmdk]"}}, nil, "unknown format"},
 		{"bad lock", nil, map[string]string{"stowage.lock": "stowage: 1.0.0\nruntime: {}\n"}, "field runtime not found"},
 		{"backup default profile", []edit{{specFile, "profiles: { full: all }", "profiles: { full: all, config: [users] }"}}, nil, "default_profile is required"},
+		{"backup of the volumes alone", []edit{{specFile, "  provider: pg-age-rclone\n  profiles: { full: all }\n", "  provider: volumes-age-rclone\n"}}, nil, "backup: volumes-age-rclone leaves the database out, and the project declares one: pg-age-rclone backs it up with its volumes"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -591,7 +592,11 @@ func TestEachRuleFiresOnFull(t *testing.T) {
 // refused where it is declared. examples/stateless being clean is the positive control.
 func TestEachRuleFiresOnStateless(t *testing.T) {
 	for _, c := range []struct{ name, old, new, want string }{
-		{"backup", "\nshapes:\n", "\nbackup:\n  provider: pg-age-rclone\n  profiles: { full: all }\n\nshapes:\n", "backup: a backup dumps the database, and the project declares none"},
+		{"backup", "provider: volumes-age-rclone, volumes: [state]", "provider: pg-age-rclone, profiles: { full: all }", "backup: a pg-age-rclone backup backs a database up, and the project declares none (volumes-age-rclone backs up the volumes of a project without one)"},
+		{"command backup", "provider: volumes-age-rclone, volumes: [state]", "provider: command, image: server, cmd: [x]", "backup: a command backup backs a database up, and the project declares none"},
+		{"unknown backup", "provider: volumes-age-rclone, volumes: [state]", "provider: restic", `backup: unknown provider "restic" (pg-age-rclone, volumes-age-rclone, command)`},
+		{"backup without volumes", "provider: volumes-age-rclone, volumes: [state]", "provider: volumes-age-rclone", "backup: volumes-age-rclone: volumes is required"},
+		{"backup of a volume undeclared", "volumes: [state] }", "volumes: [gone] }", `backup.volumes[0]: "gone" is not a volume deploy/compose.yaml declares`},
 		{"data reset", "    state: { uid: 1000 }", "    state: { uid: 1000 }\n  reset: [state]", "data.reset: reset-db resets a database, and the project declares none"},
 		{"postgres modes", "kubernetes: { chart: deploy/chart }", "kubernetes: { chart: deploy/chart, postgres_modes: [external] }", "shapes.kubernetes.postgres_modes: the database's modes, and the project declares no database"},
 		// Without a front there is no TLS mode to ask an input in.
@@ -917,7 +922,7 @@ func TestVMBackupCommandWarns(t *testing.T) {
 	if errs := errorsOf(res); len(errs) > 0 {
 		t.Fatalf("errors:\n%s", strings.Join(errs, "\n"))
 	}
-	if len(res.Findings) != 1 || !strings.Contains(res.Findings[0].Message, "the VM runs pg-age-rclone backups only") {
+	if len(res.Findings) != 1 || !strings.Contains(res.Findings[0].Message, "the VM runs pg-age-rclone and volumes-age-rclone backups only") {
 		t.Fatalf("findings: %+v", res.Findings)
 	}
 }
@@ -2074,6 +2079,29 @@ func TestAGuardedRouteToTheHostsNetworkIsWarned(t *testing.T) {
 		}
 		if !slices.ContainsFunc(got, func(g string) bool { return strings.Contains(g, "warning: "+c.want) }) {
 			t.Errorf("%s: findings %q", c.upstream, got)
+		}
+	}
+}
+
+// A VM of a project without a database still keeps its data volumes: without a backup, warned.
+func TestAVMsDataVolumesWithoutABackupAreWarned(t *testing.T) {
+	t.Parallel()
+	kairos := "  docker: {}\n  kairos:\n    base: ubuntu:26.04@sha256:c098726dd9b9733f3e885f8de0ef375206a311b0a317eadc40d347b1115fb944\n    kairos_init: quay.io/kairos/kairos-init:v4.4.0-rc2@sha256:ac885c9f3002a3f0e7000947e3d1e2a5c95f5e2d0212d5f9bbd663347f1ebe0c\n    disk_formats: [qcow2]\n"
+	const want = "the VM keeps its data volumes locally and no backup is declared (volumes-age-rclone archives them)"
+	for _, backup := range []bool{true, false} {
+		root := testutil.CopyExample(t, "stateless")
+		testutil.Edit(t, root, specFile, "  docker: {}\n", kairos)
+		testutil.Edit(t, root, specFile, "upstream: server:8080", "upstream: server:8090")
+		if !backup {
+			testutil.Edit(t, root, specFile, "backup: { provider: volumes-age-rclone, volumes: [state] }", "")
+		}
+		res := run(t, root)
+		if errs := errorsOf(res); len(errs) > 0 {
+			t.Fatalf("errors:\n%s", strings.Join(errs, "\n"))
+		}
+		warned := slices.ContainsFunc(res.Findings, func(f Finding) bool { return strings.Contains(f.Message, want) })
+		if warned == backup {
+			t.Errorf("backup %v: findings %+v", backup, res.Findings)
 		}
 	}
 }

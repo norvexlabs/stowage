@@ -1,6 +1,6 @@
 # A stateless app without a front: one pulled image, nothing built, no database (so no
-# schema_compat, data.reset, backup or reset-db), and no front: its one L4 route publishes the
-# server's port as it is, the stack's only way in.
+# schema_compat, data.reset or reset-db, and a backup of its volume alone), and no front: its one
+# L4 route publishes the server's port as it is, the stack's only way in.
 apiVersion: stowage/v1
 name: lookup
 
@@ -40,6 +40,8 @@ health:
 data:
   volumes:
     state: { uid: 1000 }                                       # the server's user; busybox has no /state
+
+backup: { provider: volumes-age-rclone, volumes: [state] }    # no database: the volume, with a manifest
 
 inputs:
   - { key: GREETING, prompt: "What the lookup page says", default: "hello" }

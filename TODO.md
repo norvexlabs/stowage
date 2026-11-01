@@ -59,17 +59,13 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
    VM (the platform's NIC on the module's state, the `.link` and `.network` written over SSH,
    then a reboot), and `network set --role ROLE --mode static|dhcp|none` for a secondary NIC,
    with the same revert window as the primary's.
-2. **A stack without a database cannot back up its volumes, so a disaster recovery loses
-   them**: `backup` (and its `volumes`) is refused without a `database` ("a backup dumps the
-   database, and the project declares none"), so `secrets export` → `vm create --secrets` brings
-   back the secrets alone. A stack whose state is files — a private CA's key, a VPN node's
-   identity, an operator-edited configuration — comes back empty: new CA (every client must
-   trust it again), a new VPN node (approved again), edits lost, unless the operator tars the
-   volumes over SSH by hand. Allow `backup: { provider: volumes-age-rclone, volumes: […] }` (or
-   `backup.volumes` with no database), restored by `restore` onto a machine made with
-   `--secrets`, which then awaits it as it awaits a dump.
 
 ## Should
+
+- **A volumes-age-rclone backup reads its volumes live**: without a dump, the archive is the
+  whole backup, and files a service writes together (a CA's index and serial) may be archived
+  between two writes. A provider option stopping the services that mount the volumes for the
+  archive (a short downtime per backup), or a service's own quiesce hook, would make it consistent.
 
 - **A set's input default holding a variable is checked at the start only**: lint skips a
   `services.<name>.sets` input whose `default` holds `${…}`, and the expanded default is not

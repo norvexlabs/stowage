@@ -531,7 +531,7 @@ func restoreCommand(c *hostClient, name, install string, stderr io.Writer, termi
 	var identity string
 	restore := &cobra.Command{
 		Use:   "restore OBJECT",
-		Short: "Load a backup (`backup list` names them) of the release the install runs into its database; the age identity that decrypts it is read from standard input or --identity, and kept nowhere; the services but the database stop meanwhile",
+		Short: "Load a backup (`backup list` names them) of the release the install runs into its database and its volumes; the age identity that decrypts it is read from standard input or --identity, and kept nowhere; the services but the database (every service, without one) stop meanwhile",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()

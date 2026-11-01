@@ -354,8 +354,8 @@ func TestBackupRecipeReachesTheRunnerOnly(t *testing.T) {
 	}
 }
 
-// Only a release whose VM runs a pg-age-rclone backup carries the runner.
-func TestBackupRunnerOnlyWithAPgAgeRcloneBackup(t *testing.T) {
+// Only a release whose installs run a pg-age-rclone or volumes-age-rclone backup carries the runner.
+func TestBackupRunnerOnlyWithAnAgeRcloneBackup(t *testing.T) {
 	t.Parallel()
 	for _, c := range []struct {
 		name, old, new string
@@ -379,6 +379,15 @@ func TestBackupRunnerOnlyWithAPgAgeRcloneBackup(t *testing.T) {
 	testutil.Edit(t, root, "stowage.yaml", "  kairos:\n    base: ubuntu:26.04@sha256:c098726dd9b9733f3e885f8de0ef375206a311b0a317eadc40d347b1115fb944\n    kairos_init: quay.io/kairos/kairos-init:v4.4.0-rc2@sha256:ac885c9f3002a3f0e7000947e3d1e2a5c95f5e2d0212d5f9bbd663347f1ebe0c\n    disk_formats: [qcow2]\n    host_api: [api]\n", "")
 	if _, ok := build(t, root).Node(BackupID); !ok {
 		t.Error("a Docker release with a pg-age-rclone backup carries no runner")
+	}
+	// A project without a database backs its volumes up with the runner too.
+	root = testutil.CopyExample(t, "stateless")
+	if _, ok := build(t, root).Node(BackupID); !ok {
+		t.Error("a release with a volumes-age-rclone backup carries no runner")
+	}
+	testutil.Edit(t, root, "stowage.yaml", "backup: { provider: volumes-age-rclone, volumes: [state] }", "")
+	if _, ok := build(t, root).Node(BackupID); ok {
+		t.Error("a release without a backup carries the runner")
 	}
 }
 

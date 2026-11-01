@@ -476,7 +476,7 @@ func TestABackupStreamsTheEncryptedDumpThenChecksAndPrunes(t *testing.T) {
 	for _, want := range []string{
 		"[rcat " + obj + "]",
 		"[lsjson --files-only --no-mimetype " + obj + "]",
-		`[delete --min-age 30d --max-depth 1 --include notes-full-{{\d{8}T\d{6}Z}}-*.pgdump.age store:backups/notes]`,
+		`[delete --min-age 30d --max-depth 1 --include notes-full-{{\d{8}T\d{6}Z}}-*{{\.(pgdump|manifest)\.age}} store:backups/notes]`,
 	} {
 		if !strings.Contains(calls, want) {
 			t.Errorf("rclone ran %s, not %s", calls, want)
@@ -720,12 +720,12 @@ func TestAReleaseWithoutABackupRefuses(t *testing.T) {
 	e.r, e.self = bundledInstaller(t, "1.0.0", 1, func(s *spec.Spec) { s.Backup = nil })
 	h := daemon(e, &fakeHost{}).Handler()
 	var e409 errOf
-	if code := call(t, h, "GET", "/v1/backup/config", nil, &e409); code != 409 || !strings.Contains(e409.Error, "declares no pg-age-rclone backup") {
+	if code := call(t, h, "GET", "/v1/backup/config", nil, &e409); code != 409 || !strings.Contains(e409.Error, "declares no pg-age-rclone or volumes-age-rclone backup") {
 		t.Errorf("%d %s", code, e409.Error)
 	}
 	// The timer's run skips it, saying why; a run asked for is refused.
 	var skipped struct{ Skipped string }
-	if code := call(t, h, "POST", "/v1/backup", BackupRequest{IfConfigured: true}, &skipped); code != 200 || !strings.Contains(skipped.Skipped, "declares no pg-age-rclone backup") {
+	if code := call(t, h, "POST", "/v1/backup", BackupRequest{IfConfigured: true}, &skipped); code != 200 || !strings.Contains(skipped.Skipped, "declares no pg-age-rclone or volumes-age-rclone backup") {
 		t.Errorf("%d %+v", code, skipped)
 	}
 	if code := call(t, h, "POST", "/v1/backup", nil, nil); code != 409 {

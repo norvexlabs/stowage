@@ -9,7 +9,9 @@
 # Walks: ship 1.0.0 → the bootstrap one-liner installs it, with no TLS mode asked → the health path
 # and the L4 route serve, the volume was given the server's uid (the server writes into it), no
 # front runs → a re-run changes an input its page is rendered from (an inline config: the server is
-# made again) → status lists the L4 route → --tls is refused → ship 1.0.1, `upgrade --version
+# made again) → status lists the L4 route → --tls is refused → a backup of its volume alone
+# (volumes-age-rclone: the archive and a manifest, no dump) to WebDAV, and a restore that brings the
+# volume back → ship 1.0.1, `upgrade --version
 # 1.0.1` (nothing dumped) → rollback (no schema check) → reset-db is refused: the release has no
 # database → an install of 0.9.0, which the last release's stowage (built from its tag) shipped
 # before 1.0.0, upgrades to 1.0.1 with this one's, and a rollback goes back to it with its own
@@ -96,7 +98,7 @@ unset DOCKER_CONFIG # the installer's environment never has it (OPERATOR)
 [[ $(page) == bonjour ]] || fail "the route does not serve the input GREETING"
 grep -q 'volume .*_state given to its uid' "$WORK/install.log" || { cat "$WORK/install.log"; fail "the install did not give the state volume its uid"; }
 ! grep -q 'TLS\|https://\|portal\|served' "$WORK/install.log" || { cat "$WORK/install.log"; fail "the install of a project without a front speaks of one"; }
-[[ -z $(docker ps -q --filter "label=com.docker.compose.project=$(sed -n 's/^COMPOSE_PROJECT_NAME=//p' "$D/.env")" --filter label=com.docker.compose.service=stowage-front) ]] ||
+[[ -z $(docker ps -q --filter "label=com.docker.compose.project=$(project)" --filter label=com.docker.compose.service=stowage-front) ]] ||
 	fail "a front runs"
 ! grep -q '^STOWAGE_TLS_MODE=\|^STOWAGE_URL_' "$D/.env" || fail "the install recorded a TLS mode or a route URL"
 ! grep -qi 'database\|snapshot' "$WORK/install.log" || { cat "$WORK/install.log"; fail "the install of a release without a database names one"; }
@@ -110,6 +112,30 @@ grep -q 'changing GREETING: bonjour → salut' "$WORK/rerun.log" || { cat "$WORK
 grep -q "lookup.*tcp.*$PORT" "$WORK/status.txt" || { cat "$WORK/status.txt"; fail "status does not list the L4 route"; }
 if "${CTL[@]}" --dir "$D" --no-input --tls acme >"$WORK/tls.log" 2>&1; then cat "$WORK/tls.log"; fail "--tls was taken"; fi
 grep -qF 'lookup has no front: --tls' "$WORK/tls.log" || { cat "$WORK/tls.log"; fail "the refusal of --tls does not say there is no front"; }
+
+step "a backup of the volume alone (no database): config, run to WebDAV, list, restore"
+start_dav
+age_key
+server() { docker ps --quiet --filter "label=com.docker.compose.project=$(project)" --filter label=com.docker.compose.service=server; }
+docker exec "$(server)" sh -c 'echo at-the-backup >/state/e2e.txt' || fail "a file to back up in the state volume"
+"${CTL[@]}" backup config --dir "$D" --destination dav:backups --rclone-config "$DAV_CONF" --recipient "$AGE_RECIPIENT" >"$WORK/backup-config.txt" 2>&1 ||
+	{ cat "$WORK/backup-config.txt"; fail "backup config"; }
+"${CTL[@]}" backup run --dir "$D" >"$WORK/backup-run.txt" 2>&1 || { cat "$WORK/backup-run.txt"; fail "backup run"; }
+! grep -qi 'dump\|database' "$WORK/backup-run.txt" || { cat "$WORK/backup-run.txt"; fail "the backup of a release without a database names one"; }
+manifests=("$WORK"/dav/backups/lookup-volumes-*-1.0.0-r1.manifest.age)
+[[ ${#manifests[@]} == 1 && -s ${manifests[0]} ]] || { ls -la "$WORK/dav/backups"; fail "no backup's manifest in the destination"; }
+[[ -s ${manifests[0]%.manifest.age}.state.tar.age ]] || { ls -la "$WORK/dav/backups"; fail "no archive of the state volume beside the manifest"; }
+"$BIN/age" -d -i "$AGE_KEY" "${manifests[0]}" | grep -qF '"project":"lookup","release":{"version":"1.0.0","revision":1},"volumes":["state"]' ||
+	fail "the manifest does not decrypt with the key into the release and its volume"
+"${CTL[@]}" backup list --dir "$D" >"$WORK/backup-list.txt" 2>&1 || { cat "$WORK/backup-list.txt"; fail "backup list"; }
+grep -q "^${manifests[0]##*/} " "$WORK/backup-list.txt" && ! grep -q 'tar\.age' "$WORK/backup-list.txt" ||
+	{ cat "$WORK/backup-list.txt"; fail "backup list does not show the backup by its manifest alone"; }
+docker exec "$(server)" sh -c 'echo since >/state/e2e.txt && echo later >/state/later.txt' || fail "files after the backup"
+"${CTL[@]}" restore "${manifests[0]##*/}" --dir "$D" --identity "$AGE_KEY" --yes >"$WORK/restore.txt" 2>&1 || { cat "$WORK/restore.txt"; fail "restore"; }
+[[ $(docker exec "$(server)" sh -c 'cat /state/e2e.txt; stat -c %u /state/e2e.txt; test -e /state/later.txt || echo gone') == $'at-the-backup\n1000\ngone' ]] ||
+	{ docker exec "$(server)" ls -lan /state; fail "the restore did not bring the state volume back as it was"; }
+[[ $(page) == salut ]] || { stack_logs >&2; fail "the stack does not serve after the restore"; }
+"${CTL[@]}" backup config --dir "$D" --remove >/dev/null 2>&1 || fail "backup config --remove"
 
 step "ship 1.0.1, upgrade --version 1.0.1, rollback: no database to dump or check"
 python3 - "$P/CHANGELOG.md" <<'PY'

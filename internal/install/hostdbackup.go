@@ -29,11 +29,12 @@ import (
 	"github.com/norvexlabs/stowage/internal/providers"
 )
 
-// The VM's backups (a pg-age-rclone `backup`): the host daemon dumps the database inside its own
-// service (pg_dump of the server's own version), encrypts the dump to the operator's age
-// recipients as it streams, and hands it to the backup runner (rclone, preloaded with the
-// release), which uploads it to the destination: nothing is written to the VM's disk, and the VM
-// holds no key that decrypts a backup. The settings are the operator's, on the persistent
+// The VM's backups (a pg-age-rclone or volumes-age-rclone `backup`): the host daemon dumps the
+// database inside its own service (pg_dump of the server's own version) and archives the volumes
+// the backup lists, encrypts each to the operator's age recipients as it streams, and hands it to
+// the backup runner (rclone, preloaded with the release), which uploads it to the destination:
+// nothing is written to the VM's disk, and the VM holds no key that decrypts a backup. Without a
+// database (volumes-age-rclone), a manifest takes the dump's place as the backup's last object. The settings are the operator's, on the persistent
 // partition; a systemd timer runs a backup on their schedule.
 //
 //	GET    /v1/backup/config  the settings, the rclone config only said to be set
@@ -180,16 +181,19 @@ const (
 // remoteName is an rclone remote's name: a section of its config.
 var remoteName = regexp.MustCompile(`^[A-Za-z0-9_+@][A-Za-z0-9_.+@ -]{0,63}$`)
 
-// pgBackup is the release's pg-age-rclone backup; a 409 when it declares none, or when the OS
-// carries no runner.
-func (h *Hostd) pgBackup() (*providers.PgAgeRclone, error) {
+// pgBackup is the release's pg-age-rclone or volumes-age-rclone backup; a 409 when it declares
+// none, when the OS carries no runner, or when a pg-age-rclone backup has no database to dump.
+func (h *Hostd) pgBackup() (*providers.AgeRclone, error) {
 	s := h.R.Spec
 	if !providers.RunsBackups(s) {
-		return nil, fail(http.StatusConflict, "%s declares no pg-age-rclone backup: the install runs none", s.Name)
+		return nil, fail(http.StatusConflict, "%s declares no %s or %s backup: the install runs none", s.Name, providers.VMBackup, providers.VolumesBackup)
 	}
 	pg, err := providers.DecodeBackup(s.Backup)
 	if err != nil {
 		return nil, err
+	}
+	if pg.Dump && !s.HasDatabase() {
+		return nil, fail(http.StatusConflict, "%s %s has no database: its %s backup has nothing to dump", s.Name, h.R.Manifest.ProjectVersion, providers.VMBackup)
 	}
 	if h.R.Manifest.Artifacts.Images[backup.Key] == "" {
 		return nil, fail(http.StatusConflict, "this release carries no backup runner")
@@ -198,7 +202,7 @@ func (h *Hostd) pgBackup() (*providers.PgAgeRclone, error) {
 }
 
 // readBackup strictly decodes the settings and checks them; none is nil.
-func (h *Hostd) readBackup(pg *providers.PgAgeRclone) (*BackupConfig, error) {
+func (h *Hostd) readBackup(pg *providers.AgeRclone) (*BackupConfig, error) {
 	c, err := h.decodeBackup()
 	if err != nil || c == nil {
 		return c, err
@@ -241,7 +245,7 @@ func (h *Hostd) writeBackup(c BackupConfig) error {
 
 // validBackup checks settings complete and well-formed, and returns their recipients. The
 // schedule's syntax is systemd's to judge (checkSchedule).
-func validBackup(c BackupConfig, pg *providers.PgAgeRclone) ([]age.Recipient, error) {
+func validBackup(c BackupConfig, pg *providers.AgeRclone) ([]age.Recipient, error) {
 	remote, path, ok := strings.Cut(c.Destination, ":")
 	switch {
 	case c.Destination == "":
@@ -292,7 +296,7 @@ func rcloneRemotes(conf string) []string {
 }
 
 // backupSettings is what GET /v1/backup/config shows of c (nil: none).
-func backupSettings(c *BackupConfig, pg *providers.PgAgeRclone, locked bool, from string) BackupSettings {
+func backupSettings(c *BackupConfig, pg *providers.AgeRclone, locked bool, from string) BackupSettings {
 	s := BackupSettings{Recipients: []string{}, RetentionDays: defaultRetentionDays, Schedule: defaultBackupSchedule, Profile: pg.Default, Profiles: sortedKeys(pg.Profiles), Locked: locked}
 	if c != nil {
 		s = BackupSettings{Configured: true, Destination: c.Destination, RcloneConfigSet: c.RcloneConfig != "", RcloneConfigFrom: from, Recipients: c.Recipients,
@@ -457,7 +461,7 @@ func (h *Hostd) setBackupConfig(w http.ResponseWriter, r *http.Request) {
 
 // mergeBackup is the settings req makes of cur (nil: none yet, the defaults): a field req leaves
 // out keeps its value.
-func mergeBackup(cur *BackupConfig, req BackupConfigRequest, pg *providers.PgAgeRclone) BackupConfig {
+func mergeBackup(cur *BackupConfig, req BackupConfigRequest, pg *providers.AgeRclone) BackupConfig {
 	c := BackupConfig{RetentionDays: defaultRetentionDays, Schedule: defaultBackupSchedule, Profile: pg.Default}
 	if cur != nil {
 		c = *cur
@@ -617,10 +621,52 @@ func (h *Hostd) backupResume() {
 	}
 }
 
+// A backup's last object, which names it: a pg-age-rclone backup's dump, a volumes-age-rclone
+// backup's manifest. ownSuffixes matches both, as rclone's filter does.
+const (
+	dumpSuffix     = ".pgdump.age"
+	manifestSuffix = ".manifest.age"
+	ownSuffixes    = `{{\.(pgdump|manifest)\.age}}`
+)
+
+// lastSuffix is the suffix of pg's backups' last object.
+func lastSuffix(pg *providers.AgeRclone) string {
+	if pg.Dump {
+		return dumpSuffix
+	}
+	return manifestSuffix
+}
+
+// backupProvider names pg's provider.
+func backupProvider(pg *providers.AgeRclone) string {
+	if pg.Dump {
+		return providers.VMBackup
+	}
+	return providers.VolumesBackup
+}
+
+// backupBase is a backup's name without its last object's suffix, and whether name is a backup's
+// last object.
+func backupBase(name string) (string, bool) {
+	if base, ok := strings.CutSuffix(name, dumpSuffix); ok {
+		return base, true
+	}
+	return strings.CutSuffix(name, manifestSuffix)
+}
+
 // backupObject names a backup: the project, the profile, when (UTC) and the release it was taken
-// from, which a restore needs.
-func backupObject(name, profile string, at time.Time, v Version) string {
-	return fmt.Sprintf("%s-%s-%s-%s-r%d.pgdump.age", name, profile, at.UTC().Format("20060102T150405Z"), v.Version, v.Revision)
+// from, which a restore needs, then pg's last object's suffix.
+func backupObject(name, profile string, at time.Time, v Version, pg *providers.AgeRclone) string {
+	return fmt.Sprintf("%s-%s-%s-%s-r%d%s", name, profile, at.UTC().Format("20060102T150405Z"), v.Version, v.Revision, lastSuffix(pg))
+}
+
+// BackupManifest is a volumes-age-rclone backup's last object, encrypted as its archives are: the
+// project, the release it was taken from and the volumes archived beside it. A restore decrypts it
+// first, before anything stops.
+type BackupManifest struct {
+	Project string   `json:"project"`
+	Release Version  `json:"release"`
+	Volumes []string `json:"volumes"`
 }
 
 // ownBackups is the rclone filter of a profile's backups: the project's, by their name's
@@ -629,7 +675,7 @@ func backupObject(name, profile string, at time.Time, v Version) string {
 const anyProfile = `{{[a-z0-9]+}}` // no "}}" inside: rclone ends a regexp at the first
 
 func ownBackups(name, profile string) string {
-	return name + "-" + profile + `-{{\d{8}T\d{6}Z}}-*.pgdump.age`
+	return name + "-" + profile + `-{{\d{8}T\d{6}Z}}-*` + ownSuffixes
 }
 
 // composeKV is a compose mapping as key=value entries: a mapping's sorted by key, a list's as
@@ -655,9 +701,10 @@ func ownArchives(name, profile string) string {
 }
 
 // volumeObject names the archive of the volume vol beside the backup obj: obj's name, the volume
-// in place of the dump.
+// in place of the dump or the manifest.
 func volumeObject(obj, vol string) string {
-	return strings.TrimSuffix(obj, ".pgdump.age") + "." + vol + ".tar.age"
+	base, _ := backupBase(obj)
+	return base + "." + vol + ".tar.age"
 }
 
 // stackVolume is the Docker volume of the stack's compose volume key: the one Compose labelled as
@@ -795,7 +842,7 @@ type backupPlan struct {
 	in      *Installer
 	env     *EnvFile
 	c       *BackupConfig
-	pg      *providers.PgAgeRclone
+	pg      *providers.AgeRclone
 	profile string
 	obj     string
 }
@@ -852,7 +899,7 @@ func (h *Hostd) planBackup(ctx context.Context, req BackupRequest) (*backupPlan,
 		return nil, err
 	}
 	m := h.R.Manifest
-	obj := backupObject(h.R.Spec.Name, profile, time.Now(), Version{m.ProjectVersion, m.Revision})
+	obj := backupObject(h.R.Spec.Name, profile, time.Now(), Version{m.ProjectVersion, m.Revision}, pg)
 	return &backupPlan{in: in, env: env, c: c, pg: pg, profile: profile, obj: obj}, nil
 }
 
@@ -880,7 +927,7 @@ func (h *Hostd) preflightBackup(in *Installer, logf func(string, ...any)) {
 		return
 	}
 	m := h.R.Manifest
-	obj := backupObject(h.R.Spec.Name, c.Profile, time.Now(), Version{m.ProjectVersion, m.Revision})
+	obj := backupObject(h.R.Spec.Name, c.Profile, time.Now(), Version{m.ProjectVersion, m.Revision}, pg)
 	logf("a backup first: %s", obj)
 	h.backingUp.Store(true)
 	defer h.backingUp.Store(false)
@@ -892,7 +939,7 @@ func (h *Hostd) preflightBackup(in *Installer, logf func(string, ...any)) {
 }
 
 // takeBackup runs one backup and records it as the last.
-func (h *Hostd) takeBackup(in *Installer, env *EnvFile, c BackupConfig, pg *providers.PgAgeRclone, profile, obj string, logf func(string, ...any)) BackupRun {
+func (h *Hostd) takeBackup(in *Installer, env *EnvFile, c BackupConfig, pg *providers.AgeRclone, profile, obj string, logf func(string, ...any)) BackupRun {
 	m := h.R.Manifest
 	run := BackupRun{Object: obj, Profile: profile, Release: Version{m.ProjectVersion, m.Revision}, Started: time.Now().UTC()}
 	ctx, cancel := context.WithTimeout(h.ctx, backupTimeout)
@@ -916,11 +963,12 @@ func (h *Hostd) takeBackup(in *Installer, env *EnvFile, c BackupConfig, pg *prov
 	return run
 }
 
-// dumpUpload streams each volume's encrypted archive, then the encrypted dump, to the destination,
-// checking the size each reached, then prunes the profile's backups past the retention; it
-// returns the bytes uploaded and the pruning's error apart. The dump is the backup's last object:
-// one that failed leaves none of them.
-func (h *Hostd) dumpUpload(ctx context.Context, in *Installer, env *EnvFile, c BackupConfig, pg *providers.PgAgeRclone, profile, obj string, logf func(string, ...any)) (int64, error, error) {
+// dumpUpload streams each volume's encrypted archive, then the encrypted dump (a volumes-age-rclone
+// backup's manifest), to the destination, checking the size each reached, then prunes the
+// profile's backups past the retention; it returns the bytes uploaded and the pruning's error
+// apart. The dump or the manifest is the backup's last object: one that failed leaves none of
+// them.
+func (h *Hostd) dumpUpload(ctx context.Context, in *Installer, env *EnvFile, c BackupConfig, pg *providers.AgeRclone, profile, obj string, logf func(string, ...any)) (int64, error, error) {
 	recips, err := validBackup(c, pg)
 	if err != nil {
 		return 0, nil, err
@@ -934,9 +982,12 @@ func (h *Hostd) dumpUpload(ctx context.Context, in *Installer, env *EnvFile, c B
 		return 0, nil, err
 	}
 	defer done()
-	d := h.R.Spec.DB()
-	dump := []string{"exec", "-T", d.Service, "pg_dump", "-U", d.Roles.Migrate, "-d", d.Name, "--format=custom", "--compress=9"}
-	if tables := pg.Profiles[profile]; tables != nil {
+	var dump []string
+	if pg.Dump {
+		d := h.R.Spec.DB()
+		dump = []string{"exec", "-T", d.Service, "pg_dump", "-U", d.Roles.Migrate, "-d", d.Name, "--format=custom", "--compress=9"}
+	}
+	if tables := pg.Profiles[profile]; pg.Dump && tables != nil {
 		ex, missing, err := excludedData(ctx, in, env, tables)
 		if err != nil {
 			return 0, nil, err
@@ -991,14 +1042,29 @@ func (h *Hostd) dumpUpload(ctx context.Context, in *Installer, env *EnvFile, c B
 		sent, total = append(sent, dest), total+n
 	}
 	dest := within(c.Destination, obj)
-	logf("dumping %s's database (profile %s), encrypted to %d recipient(s), to %s", h.R.Spec.Name, profile, len(recips), dest)
-	n, err := h.encryptUpload(ctx, in, conf, recips, dest, func(w io.Writer) error {
+	produce := func(w io.Writer) error {
 		_, err := in.O.Docker.Run(ctx, Cmd{Args: append(in.composeBase(), dump...), Env: env.Environ(in.O.environ()), Stdout: w})
 		if err != nil {
 			err = fmt.Errorf("the dump: %w", err)
 		}
 		return err
-	}, logf)
+	}
+	if pg.Dump {
+		logf("dumping %s's database (profile %s), encrypted to %d recipient(s), to %s", h.R.Spec.Name, profile, len(recips), dest)
+	} else {
+		m := h.R.Manifest
+		raw, err := json.Marshal(BackupManifest{Project: h.R.Spec.Name, Release: Version{m.ProjectVersion, m.Revision}, Volumes: pg.Volumes})
+		if err != nil {
+			discard()
+			return 0, nil, err
+		}
+		logf("writing the backup's manifest, encrypted to %d recipient(s), to %s", len(recips), dest)
+		produce = func(w io.Writer) error {
+			_, err := w.Write(append(raw, '\n'))
+			return err
+		}
+	}
+	n, err := h.encryptUpload(ctx, in, conf, recips, dest, produce, logf)
 	if err != nil {
 		discard()
 		return 0, nil, err
@@ -1035,7 +1101,7 @@ func (h *Hostd) pruneArchives(ctx context.Context, in *Installer, conf, dest, pr
 	}
 	var dumps []string
 	for _, f := range found {
-		if base, ok := strings.CutSuffix(f.Name, ".pgdump.age"); ok {
+		if base, ok := backupBase(f.Name); ok {
 			dumps = append(dumps, base+".")
 		}
 	}

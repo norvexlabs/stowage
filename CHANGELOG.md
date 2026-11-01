@@ -3,6 +3,14 @@
 Stowage's own releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
+## [0.21.0]
+
+### Added
+- **`backup: { provider: volumes-age-rclone, volumes: […] }`**: a project without a database backs
+  its volumes up, encrypted, on the same schedule, settings and destination as a database's
+  backup, and `restore` brings them back (on a machine made again with `--secrets` too): a private
+  CA's key, a VPN node's identity or an operator's edits survive a disaster recovery.
+
 ## [0.20.0] - 2026-11-01
 
 ### Added

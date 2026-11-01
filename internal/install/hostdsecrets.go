@@ -1,6 +1,7 @@
 package install
 
 import (
+	"bytes"
 	"cmp"
 	"context"
 	"encoding/json"
@@ -152,10 +153,6 @@ func (h *Hostd) restoreBackup(w http.ResponseWriter, r *http.Request) {
 		replyErr(w, err)
 		return
 	}
-	if err := (&Installer{R: h.R}).hasDatabase("there is no backup to restore"); err != nil {
-		replyErr(w, fail(http.StatusConflict, "%v", err))
-		return
-	}
 	if req.Confirm == nil {
 		replyErr(w, fail(http.StatusBadRequest, "restore replaces the install's data: confirm the release it runs (\"confirm\": {\"version\", \"revision\"})"))
 		return
@@ -226,22 +223,28 @@ func (h *Hostd) restoreBackup(w http.ResponseWriter, r *http.Request) {
 // restores onto the release whose schema it holds), or not of a profile keeping every table's
 // rows: the restore replaces the whole database, and a partial profile's dump holds every
 // table's structure, so the rows it left out would be lost.
-func ownBackup(name, object string, v Version, pg *providers.PgAgeRclone) error {
+func ownBackup(name, object string, v Version, pg *providers.AgeRclone) error {
 	if !matchesOwnBackup(name, object) {
 		return fail(http.StatusBadRequest, "%q is not a backup of %s (`backup list` shows them)", object, name)
 	}
+	if !strings.HasSuffix(object, lastSuffix(pg)) {
+		return fail(http.StatusConflict, "%s is not a %s backup, which %s takes: its backups end in %s", object, backupProvider(pg), name, lastSuffix(pg))
+	}
 	profile, _, _ := strings.Cut(strings.TrimPrefix(object, name+"-"), "-")
+	if _, ok := pg.Profiles[profile]; !ok && !pg.Dump {
+		return fail(http.StatusConflict, "%s is a backup of the profile %s: a %s backup's profile is %s", object, profile, providers.VolumesBackup, providers.VolumesProfile)
+	}
 	if tables, ok := pg.Profiles[profile]; !ok || tables != nil || len(pg.Exclude[profile]) > 0 {
 		return fail(http.StatusConflict, "%s is a backup of the profile %s, which does not keep every table's rows: restoring it would empty the others (restore a backup of a profile `all`: %s)", object, profile, strings.Join(fullProfiles(pg), ", "))
 	}
-	if want := fmt.Sprintf("-%s-r%d.pgdump.age", v.Version, v.Revision); !strings.HasSuffix(object, want) {
+	if want := fmt.Sprintf("-%s-r%d%s", v.Version, v.Revision, lastSuffix(pg)); !strings.HasSuffix(object, want) {
 		return fail(http.StatusConflict, "%s was not taken from %s %s, which the install runs: a backup restores onto the release it was taken from", object, name, v)
 	}
 	return nil
 }
 
 // fullProfiles are the profiles keeping every table's rows.
-func fullProfiles(pg *providers.PgAgeRclone) []string {
+func fullProfiles(pg *providers.AgeRclone) []string {
 	var out []string
 	for _, p := range sortedKeys(pg.Profiles) {
 		if pg.Profiles[p] == nil && len(pg.Exclude[p]) == 0 {
@@ -254,8 +257,12 @@ func fullProfiles(pg *providers.PgAgeRclone) []string {
 // matchesOwnBackup reports whether object is named as backupObject names name's backups: the
 // project, a profile, a UTC time, then the release.
 func matchesOwnBackup(name, object string) bool {
-	return regexp.MustCompile(`^` + regexp.QuoteMeta(name) + `-[a-z0-9]+-\d{8}T\d{6}Z-[^/\\]+-r\d+\.pgdump\.age$`).MatchString(object)
+	rest, ok := strings.CutPrefix(object, name+"-")
+	return ok && ownBackupRest.MatchString(rest)
 }
+
+// ownBackupRest is a backup's name after its project's: a profile, a UTC time, the release.
+var ownBackupRest = regexp.MustCompile(`^[a-z0-9]+-\d{8}T\d{6}Z-[^/\\]+-r\d+\.(pgdump|manifest)\.age$`)
 
 // The restore's two scripts, run in the database's container as role $1 for database $2, through
 // the maintenance database $3 (postgres, or template1 for a database named postgres): a database
@@ -407,6 +414,13 @@ func (h *Hostd) runRestore(in *Installer, object string, ids []age.Identity, log
 			others = append(others, s)
 		}
 	}
+	// A volumes-age-rclone backup's manifest is read before anything stops: the identity decrypts
+	// it, and it is a whole backup of this release's volumes.
+	if !pg.Dump {
+		if err := h.checkManifest(ctx, in, conf, within(c.Destination, object), ids, pg); err != nil {
+			return fmt.Errorf("%w: nothing restored", err)
+		}
+	}
 	// Every volume's archive is there before anything stops.
 	for _, v := range pg.Volumes {
 		src := within(c.Destination, volumeObject(object, v))
@@ -477,14 +491,18 @@ func (h *Hostd) runRestore(in *Installer, object string, ids []age.Identity, log
 	}
 	// The database alone comes up when an earlier restore left the stack down: the load runs in
 	// its service.
-	if hadSplit {
+	if hadSplit && pg.Dump {
 		if _, err := in.Compose(ctx, env, in.O.Log, "up", "--detach", "--wait", "--no-deps", d.Service); err != nil {
 			return fmt.Errorf("starting the database: %w (the volumes are still half restored: restore again)", err)
 		}
 	}
 	// Without a service to name, `stop` would stop them all, the database included.
 	if len(others) > 0 {
-		logf("stopping %s but its database: %s", in.R.Spec.Name, strings.Join(others, ", "))
+		if pg.Dump {
+			logf("stopping %s but its database: %s", in.R.Spec.Name, strings.Join(others, ", "))
+		} else {
+			logf("stopping %s: %s", in.R.Spec.Name, strings.Join(others, ", "))
+		}
 		if _, err := in.Compose(ctx, env, in.O.Log, append([]string{"stop", "--timeout", "30"}, others...)...); err != nil {
 			return fmt.Errorf("stopping the services: %w", err)
 		}
@@ -519,18 +537,20 @@ func (h *Hostd) runRestore(in *Installer, object string, ids []age.Identity, log
 			return fmt.Errorf("the volume %s: %w %s", v, err, asWas("data"))
 		}
 	}
-	src := within(c.Destination, object)
-	logf("restoring %s into %s's database", src, in.R.Spec.Name)
-	if err := h.fetchDecrypted(ctx, in, conf, src, ids, func(plain io.Reader) error {
-		load := []string{"exec", "-T", d.Service, "sh", "-c", loadScript, "restore", d.Roles.Migrate, d.Name, maintenanceDB(d.Name)}
-		if _, err := in.O.Docker.Run(ctx, Cmd{Args: append(in.composeBase(), load...), Env: env.Environ(in.O.environ()), Stdin: plain, Stream: in.O.Log}); err != nil {
-			return fmt.Errorf("loading %s: %w", object, err)
+	if pg.Dump {
+		src := within(c.Destination, object)
+		logf("restoring %s into %s's database", src, in.R.Spec.Name)
+		if err := h.fetchDecrypted(ctx, in, conf, src, ids, func(plain io.Reader) error {
+			load := []string{"exec", "-T", d.Service, "sh", "-c", loadScript, "restore", d.Roles.Migrate, d.Name, maintenanceDB(d.Name)}
+			if _, err := in.O.Docker.Run(ctx, Cmd{Args: append(in.composeBase(), load...), Env: env.Environ(in.O.environ()), Stdin: plain, Stream: in.O.Log}); err != nil {
+				return fmt.Errorf("loading %s: %w", object, err)
+			}
+			return nil
+		}); err != nil {
+			unstage()
+			// The load writes only its own database: whatever ended it, the install's is as it was.
+			return fmt.Errorf("%w %s", err, asWas("database"))
 		}
-		return nil
-	}); err != nil {
-		unstage()
-		// The load writes only its own database: whatever ended it, the install's is as it was.
-		return fmt.Errorf("%w %s", err, asWas("database"))
 	}
 	inDB := func(base context.Context, timeout time.Duration, script, verb string, stream bool) ([]byte, error) {
 		cctx, cancel := context.WithTimeout(base, timeout)
@@ -558,7 +578,15 @@ func (h *Hostd) runRestore(in *Installer, object string, ids []age.Identity, log
 			return fmt.Errorf("%w %s", err, asWas("data"))
 		}
 	}
-	if _, err := inDB(firm, 3*time.Minute, swapScript, "swap", true); err != nil {
+	// A volumes-age-rclone backup has no database to swap in: its volumes are the whole of it.
+	swapDB := func() error {
+		if !pg.Dump {
+			return nil
+		}
+		_, err := inDB(firm, 3*time.Minute, swapScript, "swap", true)
+		return err
+	}
+	if err := swapDB(); err != nil {
 		// The swap's one transaction either committed or not, whatever the exit: stowage_replaced,
 		// which only its rename makes, tells which.
 		out, qerr := inDB(firm, 30*time.Second, swappedCheck, "check", false)
@@ -591,8 +619,10 @@ func (h *Hostd) runRestore(in *Installer, object string, ids []age.Identity, log
 	dropReplaced = func() {
 		// Optional, once the stack is up and provisioned: never holding either back, and with a
 		// context of its own, which the load's long hour cannot have used up.
-		if _, err := inDB(firm, 10*time.Minute, dropScript, "drop", true); err != nil {
-			logf("the replaced database was not dropped (%v): the next restore drops stowage_replaced", err)
+		if pg.Dump {
+			if _, err := inDB(firm, 10*time.Minute, dropScript, "drop", true); err != nil {
+				logf("the replaced database was not dropped (%v): the next restore drops stowage_replaced", err)
+			}
 		}
 		// Bounded, and cut by the daemon's stop: the install's lock is held until it ends. One
 		// left is removed by the next restore's staging.
@@ -619,7 +649,11 @@ func (h *Hostd) runRestore(in *Installer, object string, ids []age.Identity, log
 	}
 	if len(failed) > 0 {
 		halfSwapped = true
-		return fmt.Errorf("restored %s's database, but not every volume was swapped in (%w; its files are split between its root, %s — the backup's — and %s — its own): the services stay stopped, restore again", object, errors.Join(failed...), restoreStage, restoreReplaced)
+		what := "restored " + object + "'s database, but not"
+		if !pg.Dump {
+			what = "restoring " + object + ": not"
+		}
+		return fmt.Errorf("%s every volume was swapped in (%w; its files are split between its root, %s — the backup's — and %s — its own): the services stay stopped, restore again", what, errors.Join(failed...), restoreStage, restoreReplaced)
 	}
 	if err := os.Remove(split); err != nil && !errors.Is(err, os.ErrNotExist) {
 		halfSwapped = true
@@ -630,6 +664,39 @@ func (h *Hostd) runRestore(in *Installer, object string, ids []age.Identity, log
 	in.restoreDone()
 	logf("restored %s", object)
 	return nil
+}
+
+// maxManifest bounds a backup's manifest: a project, a release and volume keys.
+const maxManifest = 64 << 10
+
+// checkManifest reads the volumes-age-rclone backup's manifest src, decrypted by ids, and
+// refuses one that is not of this release's project, release and volumes.
+func (h *Hostd) checkManifest(ctx context.Context, in *Installer, conf, src string, ids []age.Identity, pg *providers.AgeRclone) error {
+	var raw []byte
+	if err := h.fetchDecrypted(ctx, in, conf, src, ids, func(plain io.Reader) error {
+		var err error
+		raw, err = io.ReadAll(io.LimitReader(plain, maxManifest+1))
+		return err
+	}); err != nil {
+		return err
+	}
+	var mf BackupManifest
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	if len(raw) > maxManifest || dec.Decode(&mf) != nil || !trailingSpace(dec) {
+		return fmt.Errorf("%s is not a backup's manifest", src)
+	}
+	m := h.R.Manifest
+	if v := (Version{m.ProjectVersion, m.Revision}); mf.Project != h.R.Spec.Name || mf.Release != v || !slices.Equal(mf.Volumes, pg.Volumes) {
+		return fmt.Errorf("%s is the manifest of the volumes %s of %s %s, not of the volumes %s of %s %s", src, strings.Join(mf.Volumes, ", "), mf.Project, mf.Release, strings.Join(pg.Volumes, ", "), h.R.Spec.Name, v)
+	}
+	return nil
+}
+
+// trailingSpace reports whether dec has nothing left but white space.
+func trailingSpace(dec *json.Decoder) bool {
+	_, err := dec.Token()
+	return err == io.EOF
 }
 
 // restoreStage is the directory, at a volume's root, a restore extracts the volume's archive into;

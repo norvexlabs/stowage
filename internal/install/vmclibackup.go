@@ -21,7 +21,7 @@ func backupCommand(c *hostClient, name string, stdout, stderr io.Writer) *cobra.
 	}
 	root := &cobra.Command{
 		Use:   "backup",
-		Short: "Back the database up, encrypted, to an rclone destination: on a schedule, before an upgrade, or now",
+		Short: "Back the data up (the database's dump and the volumes the backup lists, or those volumes alone), encrypted, to an rclone destination: on a schedule, before an upgrade, or now",
 		Args:  cobra.NoArgs,
 	}
 
@@ -149,7 +149,7 @@ func backupCommand(c *hostClient, name string, stdout, stderr io.Writer) *cobra.
 	var run BackupRequest
 	runCmd := &cobra.Command{
 		Use:   "run",
-		Short: "Back the database up now, and wait for it",
+		Short: "Back the data up now, and wait for it",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			ctx := cmd.Context()

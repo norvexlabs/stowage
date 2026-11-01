@@ -467,14 +467,21 @@ func Provision(short string, p *spec.Provider, images map[string]spec.Image) err
 // profileName is a backup profile's name: a backup's file name holds it between dashes.
 var profileName = regexp.MustCompile(`^[a-z0-9]{1,32}$`)
 
-// VMBackup is the backup provider the Kairos VM runs.
-const VMBackup = "pg-age-rclone"
+// VMBackup is the backup provider the installs run for a project with a database: its dump and
+// the volumes it lists; VolumesBackup the one for a project without: the volumes alone.
+const (
+	VMBackup      = "pg-age-rclone"
+	VolumesBackup = "volumes-age-rclone"
+)
 
-// RunsBackups reports whether s's installs run backups: a pg-age-rclone backup, with the Docker or
-// the kairos shape (whose VM runs the Docker shape's install).
+// VolumesProfile is a volumes-age-rclone backup's one profile: it names the backup's files.
+const VolumesProfile = "volumes"
+
+// RunsBackups reports whether s's installs run backups: a pg-age-rclone or volumes-age-rclone
+// backup, with the Docker or the kairos shape (whose VM runs the Docker shape's install).
 // Its releases carry the backup runner.
 func RunsBackups(s *spec.Spec) bool {
-	return (s.Shapes.Kairos != nil || s.Shapes.Docker != nil) && s.Backup != nil && s.Backup.Name == VMBackup
+	return (s.Shapes.Kairos != nil || s.Shapes.Docker != nil) && s.Backup != nil && (s.Backup.Name == VMBackup || s.Backup.Name == VolumesBackup)
 }
 
 // OwnsVolumes reports whether s's installs give data volumes their uid: a data volume with a uid,
@@ -492,16 +499,19 @@ func OwnsVolumes(s *spec.Spec) bool {
 	return false
 }
 
-// PgAgeRclone is a decoded pg-age-rclone backup: Profiles maps each profile to the tables whose
-// data it keeps (nil: every table's), and Exclude a profile to the pg_dump patterns of the tables
-// whose data it leaves out (their structure kept); Default is the profile a backup takes unless
-// told another. Volumes are the compose volumes every backup also takes, each an archive beside
-// the dump, which a restore brings back with it.
-type PgAgeRclone struct {
+// AgeRclone is a decoded pg-age-rclone or volumes-age-rclone backup: Profiles maps each profile
+// to the tables whose data it keeps (nil: every table's), and Exclude a profile to the pg_dump
+// patterns of the tables whose data it leaves out (their structure kept); Default is the profile a
+// backup takes unless told another. Volumes are the compose volumes every backup also takes, each
+// an archive beside the dump, which a restore brings back with it. Dump is false for
+// volumes-age-rclone: no database is dumped, its one profile is VolumesProfile, and a manifest
+// takes the dump's place as the backup's last object.
+type AgeRclone struct {
 	Profiles map[string][]string
 	Exclude  map[string][]string
 	Default  string
 	Volumes  []string
+	Dump     bool
 }
 
 // volumeKey is a compose volume's key: it names its archive in the destination.
@@ -511,8 +521,11 @@ var volumeKey = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]*$`)
 // pg_dump's wildcards * and ?.
 var tablePattern = regexp.MustCompile(`^[A-Za-z0-9_*?]+(\.[A-Za-z0-9_*?]+)?$`)
 
-// DecodeBackup decodes and validates a pg-age-rclone `backup`.
-func DecodeBackup(p *spec.Provider) (*PgAgeRclone, error) {
+// DecodeBackup decodes and validates a pg-age-rclone or volumes-age-rclone `backup`.
+func DecodeBackup(p *spec.Provider) (*AgeRclone, error) {
+	if p != nil && p.Name == VolumesBackup {
+		return decodeVolumesBackup(p)
+	}
 	if p == nil || p.Name != VMBackup {
 		return nil, errors.New("backup: not pg-age-rclone")
 	}
@@ -524,18 +537,13 @@ func DecodeBackup(p *spec.Provider) (*PgAgeRclone, error) {
 	if err := p.Decode(&c); err != nil {
 		return nil, err
 	}
-	for i, v := range c.Volumes {
-		if !volumeKey.MatchString(v) {
-			return nil, fmt.Errorf("pg-age-rclone: volumes[%d] %q is not a compose volume's key", i, v)
-		}
-		if slices.Contains(c.Volumes[:i], v) {
-			return nil, fmt.Errorf("pg-age-rclone: volumes[%d] %q is listed twice", i, v)
-		}
+	if err := checkVolumes(VMBackup, c.Volumes); err != nil {
+		return nil, err
 	}
 	if len(c.Profiles) == 0 {
 		return nil, errors.New("pg-age-rclone: profiles is required (e.g. { full: all })")
 	}
-	out := &PgAgeRclone{Profiles: map[string][]string{}, Exclude: map[string][]string{}, Default: c.DefaultProfile, Volumes: c.Volumes}
+	out := &AgeRclone{Profiles: map[string][]string{}, Exclude: map[string][]string{}, Default: c.DefaultProfile, Volumes: c.Volumes, Dump: true}
 	names := make([]string, 0, len(c.Profiles))
 	for name := range c.Profiles {
 		names = append(names, name)
@@ -593,13 +601,44 @@ func DecodeBackup(p *spec.Provider) (*PgAgeRclone, error) {
 	return out, nil
 }
 
+// decodeVolumesBackup decodes and validates a volumes-age-rclone `backup`: the volumes, one at
+// least.
+func decodeVolumesBackup(p *spec.Provider) (*AgeRclone, error) {
+	var c struct {
+		Volumes []string `yaml:"volumes"`
+	}
+	if err := p.Decode(&c); err != nil {
+		return nil, err
+	}
+	if len(c.Volumes) == 0 {
+		return nil, fmt.Errorf("%s: volumes is required: the compose volumes a backup archives", VolumesBackup)
+	}
+	if err := checkVolumes(VolumesBackup, c.Volumes); err != nil {
+		return nil, err
+	}
+	return &AgeRclone{Profiles: map[string][]string{VolumesProfile: nil}, Exclude: map[string][]string{}, Default: VolumesProfile, Volumes: c.Volumes}, nil
+}
+
+// checkVolumes checks a backup's volumes: compose volume keys, each once.
+func checkVolumes(provider string, vols []string) error {
+	for i, v := range vols {
+		if !volumeKey.MatchString(v) {
+			return fmt.Errorf("%s: volumes[%d] %q is not a compose volume's key", provider, i, v)
+		}
+		if slices.Contains(vols[:i], v) {
+			return fmt.Errorf("%s: volumes[%d] %q is listed twice", provider, i, v)
+		}
+	}
+	return nil
+}
+
 // Backup validates `backup` (nil = no backup on the shapes that keep data locally).
 func Backup(p *spec.Provider, images map[string]spec.Image) error {
 	if p == nil {
 		return nil
 	}
 	switch p.Name {
-	case VMBackup:
+	case VMBackup, VolumesBackup:
 		_, err := DecodeBackup(p)
 		return err
 	case "command":
@@ -609,7 +648,7 @@ func Backup(p *spec.Provider, images map[string]spec.Image) error {
 		}
 		return c.check(images)
 	default:
-		return fmt.Errorf("unknown provider %q (pg-age-rclone, command)", p.Name)
+		return fmt.Errorf("unknown provider %q (pg-age-rclone, volumes-age-rclone, command)", p.Name)
 	}
 }
 

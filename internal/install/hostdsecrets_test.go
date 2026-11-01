@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -410,7 +411,7 @@ func TestRestoreRefusals(t *testing.T) {
 	r.Spec = &sp
 	d.R = &r
 	var got errOf
-	if code := call(t, h, "POST", "/v1/restore", RestoreRequest{Object: obj, Identity: key.String(), Confirm: v}, &got); code != 409 || !strings.Contains(got.Error, "notes 1.0.0 has no database: there is no backup to restore") {
+	if code := call(t, h, "POST", "/v1/restore", RestoreRequest{Object: obj, Identity: key.String(), Confirm: v}, &got); code != 409 || !strings.Contains(got.Error, "notes 1.0.0 has no database: its pg-age-rclone backup has nothing to dump") {
 		t.Errorf("no database: %d %s", code, got.Error)
 	}
 	if code := call(t, h, "GET", "/v1/reset-db", nil, &got); code != 409 || !strings.Contains(got.Error, "has no database: reset-db has nothing to reset") {
@@ -673,5 +674,176 @@ func TestARestoreWaitsForAnUpgradesBoot(t *testing.T) {
 	var e409 errOf
 	if code := call(t, d.Handler(), "POST", "/v1/restore", RestoreRequest{Object: obj, Identity: key.String(), Confirm: &Version{"1.0.0", 1}}, &e409); code != 409 || !strings.Contains(e409.Error, "reboot first, then restore") {
 		t.Errorf("%d %s", code, e409.Error)
+	}
+}
+
+// volumesVM is an installed VM of a release without a database whose volumes-age-rclone backup
+// archives uploads, configured to back up to f; key decrypts its backups.
+func volumesVM(t *testing.T) (*env, *Hostd, *fakeRclone, *age.X25519Identity, string) {
+	t.Helper()
+	e := vmEnv(t, "1.0.0")
+	e.r, e.self = bundledInstaller(t, "1.0.0", 1, func(s *spec.Spec) {
+		s.Database, s.Data.Reset = nil, nil
+		s.Backup = &spec.Provider{Name: "volumes-age-rclone", Config: map[string]any{"volumes": []any{"uploads"}}}
+	})
+	if err := e.install(vm); err != nil {
+		t.Fatal(err)
+	}
+	f := &fakeRclone{objects: map[string][]byte{}}
+	e.docker.runner = f.run
+	key, err := age.GenerateX25519Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := daemon(e, &fakeHost{})
+	configure(t, d, validConfig(key))
+	e.docker.answer = func(a string) ([]byte, bool, error) {
+		return []byte("api\nweb\npostgres\n"), strings.HasSuffix(a, "config --services"), nil
+	}
+	return e, d, f, key, stackVolumeOf(t, d, "uploads")
+}
+
+func TestAStackWithoutADatabaseBacksUpAndRestoresItsVolumes(t *testing.T) {
+	t.Parallel()
+	e, d, f, key, vol := volumesVM(t)
+	f.volumes, f.staged = map[string][]byte{vol: []byte("at the backup")}, map[string][]byte{}
+	// An earlier backup's archive stays beside its manifest; an archive whose manifest is gone is
+	// pruned.
+	const dest = "store:backups/notes/"
+	kept, orphan := dest+"notes-volumes-20200101T000000Z-1.0.0-r1.uploads.tar.age", dest+"notes-volumes-20200102T000000Z-1.0.0-r1.uploads.tar.age"
+	f.objects[dest+"notes-volumes-20200101T000000Z-1.0.0-r1.manifest.age"] = []byte("m")
+	f.objects[kept], f.objects[orphan] = []byte("a"), []byte("a")
+	h := d.Handler()
+	call(t, h, "POST", "/v1/backup", BackupRequest{}, nil)
+	j := waitJob(t, h)
+	obj := j.Target
+	if _, ok := f.objects[orphan]; ok {
+		t.Error("an archive whose manifest is gone was kept")
+	}
+	if _, ok := f.objects[kept]; !ok {
+		t.Error("an archive beside its manifest was pruned")
+	}
+	delete(f.objects, kept)
+	delete(f.objects, dest+"notes-volumes-20200101T000000Z-1.0.0-r1.manifest.age")
+	if j.State != "done" || !strings.HasPrefix(obj, "notes-volumes-") || !strings.HasSuffix(obj, "-1.0.0-r1.manifest.age") {
+		t.Fatalf("%+v", j)
+	}
+	// Nothing is dumped: the manifest, encrypted, names the release and its volumes.
+	for _, c := range e.docker.ran("compose") {
+		if strings.Contains(strings.Join(c.Args, " "), "pg_dump") {
+			t.Fatalf("dumped: %v", c.Args)
+		}
+	}
+	plain, err := age.Decrypt(bytes.NewReader(f.objects["store:backups/notes/"+obj]), key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mf bytes.Buffer
+	if _, err := mf.ReadFrom(plain); err != nil || mf.String() != `{"project":"notes","release":{"version":"1.0.0","revision":1},"volumes":["uploads"]}`+"\n" {
+		t.Fatalf("manifest %q %v", mf.String(), err)
+	}
+	archive := "store:backups/notes/" + strings.TrimSuffix(obj, ".manifest.age") + ".uploads.tar.age"
+	if _, ok := f.objects[archive]; !ok {
+		t.Fatalf("no archive %s in %v", archive, slices.Collect(maps.Keys(f.objects)))
+	}
+	// The list shows the backup by its manifest, never its archive.
+	var list []BackupObject
+	call(t, h, "GET", "/v1/backup/list", nil, &list)
+	if len(list) != 1 || list[0].Name != obj {
+		t.Errorf("listed %+v", list)
+	}
+	// The restore stops every service (no database to keep up), loads no dump and swaps the
+	// volume in.
+	f.volumes[vol] = []byte("since the backup")
+	// An earlier restore left the volumes half restored: no database comes up first.
+	if err := os.WriteFile(filepath.Join(d.O.Dir, volumesSplitFile), []byte(obj+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	n := len(e.docker.ran("compose"))
+	req := RestoreRequest{Object: obj, Identity: key.String(), Confirm: &Version{"1.0.0", 1}}
+	call(t, h, "POST", "/v1/restore", req, nil)
+	if j := waitJob(t, h); j.State != "done" {
+		t.Fatalf("%+v", j)
+	}
+	if string(f.volumes[vol]) != "at the backup" || len(f.staged) != 0 || e.docker.restored != "" || !slices.Equal(f.dropped, []string{vol}) {
+		t.Errorf("volume %q, staged %q, database %q, dropped %v", f.volumes[vol], f.staged, e.docker.restored, f.dropped)
+	}
+	if got := strings.Join(composeCalls(e, n), ", "); got != "stop, up --detach" {
+		t.Errorf("ran %s", got)
+	}
+	for _, c := range e.docker.ran("compose")[n:] {
+		switch a := strings.Join(c.Args, " "); {
+		case strings.Contains(a, " stop ") && !strings.HasSuffix(a, "stop --timeout 30 api web postgres"):
+			t.Errorf("stopped %s", a)
+		case strings.Contains(a, "stowage_"):
+			t.Errorf("ran a database's script: %s", a)
+		}
+	}
+	if _, err := os.Lstat(filepath.Join(d.O.Dir, volumesSplitFile)); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("the split mark: %v", err)
+	}
+}
+
+func TestAManifestNotOfTheReleaseRestoresNothing(t *testing.T) {
+	t.Parallel()
+	e, d, f, key, vol := volumesVM(t)
+	f.volumes, f.staged = map[string][]byte{vol: []byte("at the backup")}, map[string][]byte{}
+	h := d.Handler()
+	call(t, h, "POST", "/v1/backup", BackupRequest{}, nil)
+	obj := waitJob(t, h).Target
+	other, _ := age.GenerateX25519Identity()
+	seal := func(plain string) []byte {
+		var b bytes.Buffer
+		w, err := age.Encrypt(&b, key.Recipient())
+		if err != nil {
+			t.Fatal(err)
+		}
+		w.Write([]byte(plain))
+		w.Close()
+		return b.Bytes()
+	}
+	good := f.objects["store:backups/notes/"+obj]
+	for _, c := range []struct {
+		name, want string
+		identity   string
+		manifest   []byte
+	}{
+		{"another identity", "is the identity one of the backup's recipients?", other.String(), good},
+		{"another project's", "is the manifest of the volumes uploads of other 1.0.0 (revision 1), not of the volumes uploads of notes 1.0.0 (revision 1)", key.String(), seal(`{"project":"other","release":{"version":"1.0.0","revision":1},"volumes":["uploads"]}`)},
+		{"other volumes", "is the manifest of the volumes keys of notes 1.0.0 (revision 1), not of the volumes uploads", key.String(), seal(`{"project":"notes","release":{"version":"1.0.0","revision":1},"volumes":["keys"]}`)},
+		{"not a manifest", "is not a backup's manifest", key.String(), seal("PGDMP")},
+		{"an unknown field", "is not a backup's manifest", key.String(), seal(`{"project":"notes","release":{"version":"1.0.0","revision":1},"volumes":["uploads"],"x":1}`)},
+		{"too long", "is not a backup's manifest", key.String(), seal(`{"project":"notes","release":{"version":"1.0.0","revision":1},"volumes":["uploads"]}` + strings.Repeat(" ", maxManifest))},
+		{"something after", "is not a backup's manifest", key.String(), seal(`{"project":"notes","release":{"version":"1.0.0","revision":1},"volumes":["uploads"]} {}`)},
+	} {
+		f.objects["store:backups/notes/"+obj] = c.manifest
+		n := len(e.docker.ran("compose"))
+		call(t, h, "POST", "/v1/restore", RestoreRequest{Object: obj, Identity: c.identity, Confirm: &Version{"1.0.0", 1}}, nil)
+		j := waitJob(t, h)
+		if j.State != "failed" || !strings.Contains(j.Error, c.want) || !strings.Contains(j.Error, "nothing restored") {
+			t.Errorf("%s: %+v", c.name, j)
+		}
+		if calls := composeCalls(e, n); slices.Contains(calls, "stop") {
+			t.Errorf("%s: ran %v", c.name, calls)
+		}
+		if len(f.staged) != 0 {
+			t.Errorf("%s: staged %v", c.name, f.staged)
+		}
+	}
+	// A dump's name, or another profile's, is refused before any job, saying which.
+	for bad, want := range map[string]string{
+		strings.TrimSuffix(obj, ".manifest.age") + ".pgdump.age": "is not a volumes-age-rclone backup, which notes takes: its backups end in .manifest.age",
+		strings.Replace(obj, "notes-volumes-", "notes-full-", 1): "a volumes-age-rclone backup's profile is volumes",
+	} {
+		var got errOf
+		if code := call(t, h, "POST", "/v1/restore", RestoreRequest{Object: bad, Identity: key.String(), Confirm: &Version{"1.0.0", 1}}, &got); code != 409 || !strings.Contains(got.Error, want) {
+			t.Errorf("%s: %d %s", bad, code, got.Error)
+		}
+	}
+	// Positive control: the manifest it wrote restores.
+	f.objects["store:backups/notes/"+obj] = good
+	call(t, h, "POST", "/v1/restore", RestoreRequest{Object: obj, Identity: key.String(), Confirm: &Version{"1.0.0", 1}}, nil)
+	if j := waitJob(t, h); j.State != "done" {
+		t.Errorf("%+v", j)
 	}
 }

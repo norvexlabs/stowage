@@ -1,6 +1,7 @@
 package providers
 
 import (
+	"slices"
 	"strings"
 	"testing"
 
@@ -195,11 +196,30 @@ func TestBackup(t *testing.T) {
 		{"volumes", prov("pg-age-rclone", "profiles", map[string]any{"full": "all"}, "volumes", []any{"uploads", "keys.d_1"}), ""},
 		{"volume not a key", prov("pg-age-rclone", "profiles", map[string]any{"full": "all"}, "volumes", []any{"../uploads"}), `volumes[0] "../uploads" is not a compose volume's key`},
 		{"volume twice", prov("pg-age-rclone", "profiles", map[string]any{"full": "all"}, "volumes", []any{"a", "b", "a"}), `volumes[2] "a" is listed twice`},
+		{"volumes alone", prov("volumes-age-rclone", "volumes", []any{"state"}), ""},
+		{"volumes alone, none", prov("volumes-age-rclone"), "volumes-age-rclone: volumes is required"},
+		{"volumes alone, empty", prov("volumes-age-rclone", "volumes", []any{}), "volumes-age-rclone: volumes is required"},
+		{"volumes alone, twice", prov("volumes-age-rclone", "volumes", []any{"a", "a"}), `volumes-age-rclone: volumes[1] "a" is listed twice`},
+		{"volumes alone, not a key", prov("volumes-age-rclone", "volumes", []any{"../a"}), `volumes-age-rclone: volumes[0] "../a" is not a compose volume's key`},
+		{"volumes alone, profiles", prov("volumes-age-rclone", "volumes", []any{"a"}, "profiles", map[string]any{"full": "all"}), "profiles"},
 		{"command", prov("command", "image", "api", "cmd", []any{"x"}), ""},
 		{"unknown", prov("restic"), "unknown provider"},
 	}
 	for _, c := range cases {
 		check(t, c.name, Backup(&c.p, images), c.want)
+	}
+}
+
+// A volumes-age-rclone backup dumps nothing and has one profile, which names its files.
+func TestAVolumesBackupDumpsNothing(t *testing.T) {
+	p := prov("volumes-age-rclone", "volumes", []any{"state", "keys"})
+	got, err := DecodeBackup(&p)
+	if err != nil || got.Dump || got.Default != VolumesProfile || len(got.Profiles) != 1 || got.Profiles[VolumesProfile] != nil || !slices.Equal(got.Volumes, []string{"state", "keys"}) {
+		t.Fatalf("%+v %v", got, err)
+	}
+	p = prov("pg-age-rclone", "profiles", map[string]any{"full": "all"})
+	if got, err := DecodeBackup(&p); err != nil || !got.Dump {
+		t.Fatalf("%+v %v", got, err)
 	}
 }
 
