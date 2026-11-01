@@ -961,11 +961,6 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
   too; e2e-docker once lost its mirror install's front port that way and passed alone. A port
   range of its own per suite, outside the ephemeral one, would close it.
 
-- **A debug toolbox on the VM**: the VM carries no `tcpdump` nor `dig` unless the project's
-  `host.packages` names them. `<short>-stow debug [CMD]`: a pinned toolbox image (by digest,
-  carried or pulled through the registry) run on the host's network with `NET_ADMIN` and `NET_RAW`
-  for one session, removed after, never part of the stack.
-
 ## Won't — not in the first version
 
 - Taking over an install made without Stowage: a project adopting Stowage installs fresh.
