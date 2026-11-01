@@ -74,8 +74,9 @@ The Serena MCP server is this repository's code tool; use it for every code task
 - **Narrow later rounds.** Round 1 targets the whole slice. A later round targets only the files its
   fixes touched, and its brief names the fixes and what is deferred — it never re-reads the slice.
 - **Round budget.** Three rounds per slice, and more while a round still finds a blocking
-  defect (wrong behaviour, security hole, data loss, a rule of this file broken): each fix gets a
-  test that fails without it, and each later round is narrowed to the files its fixes touched.
+  defect (wrong behaviour, security hole, data loss, a rule of this file broken): each round is
+  preceded by the self-review (gate 4), each fix gets a test that fails without it, and each later
+  round is narrowed to the files its fixes touched.
   Rounds that find only minor findings end the loop: those are fixed or deferred, no round.
 - **Overlap.** While a review runs, read and design the next slice; never edit a file under review.
 - **One gate run.** `make gate` (`STOWAGE_VM_ENV=<file> make gate` when it needs e2e-vm), once per
@@ -158,9 +159,14 @@ a self-review against the code it describes is enough. Every other commit clears
 4. **Code review via the `code-review` skill** — the gate is that skill only, run with the change's
    paths as an explicit target (untracked files included): `/code-review <level> <path> …`.
    - Always a structured self-review first, before every round: for each hunk, the concrete failure
-     ruled out (input/state → wrong result). **Sabotage every new check or test and watch it fail.**
-     Fix what you find. Timeboxed: one sabotage pass, plus one re-run on the checks a fix touched; a
-     survivor left after that is noted (TODO.md when it matters), not chased.
+     ruled out (input/state → wrong result) — every step walked, not only the happy path: what if
+     it fails right here, what state it leaves, what a re-run does then, what two overlapping runs
+     do, whether each message or hint works when followed literally, and whether each refusal and
+     branch has a test. Prefer the simplest rule (refuse, naming the exact fix) over recovery
+     logic. **Sabotage every new check or test and watch it fail.** Fix what you find. Timeboxed:
+     one sabotage pass, plus one re-run on the checks a fix touched; a survivor left after that is
+     noted (TODO.md when it matters), not chased. A slice reaching a fourth round is a sign this
+     walk was skipped: do it on the whole slice before the next round.
    - Every change → `/code-review medium <paths>`; a complex change → `/code-review high <paths>`
      (one that touches a costly area listed below, or a concurrency, process or security boundary);
      never `xhigh` or above. Looped while a round finds a blocking defect (wrong behaviour, security
