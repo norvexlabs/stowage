@@ -92,6 +92,9 @@ type Hostd struct {
 	// Networkd is networkd's directory, where the network override is rendered; empty is
 	// /etc/systemd/network. Issue is the console banner's directory; empty is /etc/issue.d.
 	Networkd, Issue string
+	// RunNetworkd is where the secondary NICs' overrides are rendered; empty is
+	// /run/systemd/network.
+	RunNetworkd string
 	// InstallNet is the file the cloud-config writes the install's network to; empty is
 	// InstallNetworkFile.
 	InstallNet string
@@ -133,6 +136,9 @@ type Hostd struct {
 	netMu    sync.Mutex
 	netTimer *time.Timer
 	netGen   int
+	// netOwner is the role of the NIC whose change netTimer undoes (empty: the primary): another
+	// NIC's change waits for it, as it would disarm it.
+	netOwner string
 	// netFired is the netGen of the last revert timer that fired.
 	netFired atomic.Int64
 	// installNetLogged is the last bad install network record's error logged: the network is

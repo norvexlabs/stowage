@@ -813,6 +813,19 @@ Rules:
   once, and nothing is persisted on the VM (the reading is the disk's, the last POST is the
   daemon's memory); a Docker install keeps its last POST in the install directory, as each check
   is a process of its own.
+- A secondary NIC's override (`network set --role`) is a record of its own beside the primary's
+  (`network-<role>.yaml`), so a release older than it still reads the primary's, and its file is
+  rendered under `/run/systemd/network`, not `/etc` (Kairos's persistent state): every boot
+  renders it again, so after a rollback to a release that does not know it nothing of it applies,
+  and no unit outlives its record. Its unit is `09-<name>-<role>-override.network`, sorting before
+  the role's `10-` file, and the image ships the role's MTU and routing drop-in for both names
+  (networkd finds a drop-in by the file's name in any of its directories). One revert timer
+  serves every NIC, and it records the NIC it is armed for: a change disarms it, so another NIC's
+  change is refused while it is armed (a window, or the retries of a revert that failed), and one
+  change awaits confirmation at a time across them. A record that does not read may hold that
+  change, so every verb but `network` stops on it and names its `network reset`, which never
+  waits on another NIC (it drops the record, disarming the timer only when armed for that NIC):
+  one rule with one way out, rather than recovery paths per verb.
 - The VM's network override has one record, a state file on the persistent partition (the
   override, and the change awaiting confirmation with the settings before it); networkd's file is
   rendered from it — at boot by a unit ordered before networkd, which first undoes a change never

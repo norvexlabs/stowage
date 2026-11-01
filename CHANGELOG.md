@@ -13,6 +13,9 @@ follow [SemVer](https://semver.org/).
 - **`vm attach HOSTNAME --interface ROLE=SPEC`** and **`network attach`**: a VM made on TrueNAS
   gains the NIC a newer release names (a gateway's client LAN beside its uplink), named by its MAC
   and addressed from its next boot, without making the VM again.
+- **`network set --role ROLE`** and **`network reset --role ROLE`**: a secondary NIC is
+  re-addressed on a running VM (DHCP, a static address, or none) with the primary's revert
+  window, one change awaiting confirmation at a time across the NICs.
 
 ## [0.20.0] - 2026-11-01
 

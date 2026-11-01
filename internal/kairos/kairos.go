@@ -239,12 +239,19 @@ func PrimaryUnits(name string) []string {
 // image's own file of a tun device, which a service opens and addresses.
 func InterfaceUnit(name, role string) string { return "10-" + name + "-" + role + ".network" }
 
+// InterfaceUnits are the networkd files of a secondary NIC's addressing, in the order networkd
+// takes them: the override `network set --role` makes (rendered under /run, so a release that
+// does not render it has none), then the cloud-config's or `network attach`'s.
+func InterfaceUnits(name, role string) []string {
+	return []string{"09-" + name + "-" + role + "-override.network", InterfaceUnit(name, role)}
+}
+
 // InterfaceLink is the udev .link file the cloud-config names a NIC role's NIC with (by its MAC).
 func InterfaceLink(name, role string) string { return "10-" + name + "-" + role + ".link" }
 
 // interfaceFiles are the image's networkd files of host.interfaces, by path under the image's root:
 // each NIC's MTU and policy routing, a drop-in of the file its addressing comes from (the
-// cloud-config's, at install: the primary's two); each tun device's whole file, which matches it by
+// cloud-config's, at install, and the override's: the primary's two, a secondary's two); each tun device's whole file, which matches it by
 // name once its service opens it, keeps the addresses the service gives it, and waits for no carrier.
 func interfaceFiles(p Params) map[string][]byte {
 	out := map[string][]byte{}
@@ -261,7 +268,9 @@ func interfaceFiles(p Params) map[string][]byte {
 				out[networkDir+"/"+u+".d/50-"+p.Name+".conf"] = content
 			}
 		default:
-			out[networkDir+"/"+InterfaceUnit(p.Name, role)+".d/50-"+p.Name+".conf"] = content
+			for _, u := range InterfaceUnits(p.Name, role) {
+				out[networkDir+"/"+u+".d/50-"+p.Name+".conf"] = content
+			}
 		}
 	}
 	return out

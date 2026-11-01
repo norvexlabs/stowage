@@ -153,7 +153,7 @@ func (f *fakeHost) calls() [][]string {
 // daemon is a host daemon over e's install, carrying e's release.
 func daemon(e *env, host *fakeHost) *Hostd {
 	o := e.installer(vm).O
-	return &Hostd{R: e.r, O: o, Host: host, Unit: time.Millisecond, Run: e.t.TempDir(), State: e.t.TempDir(), Networkd: e.t.TempDir(), Issue: e.t.TempDir(), InstallNet: filepath.Join(e.t.TempDir(), "install-network.yaml"), Systemd: e.t.TempDir()}
+	return &Hostd{R: e.r, O: o, Host: host, Unit: time.Millisecond, Run: e.t.TempDir(), State: e.t.TempDir(), Networkd: e.t.TempDir(), RunNetworkd: e.t.TempDir(), Issue: e.t.TempDir(), InstallNet: filepath.Join(e.t.TempDir(), "install-network.yaml"), Systemd: e.t.TempDir()}
 }
 
 // call asks h and decodes its JSON answer into out; it returns the status.

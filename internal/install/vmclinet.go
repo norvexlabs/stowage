@@ -1,6 +1,7 @@
 package install
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"io"
@@ -15,14 +16,15 @@ import (
 const netBootCmd = "network-boot"
 
 // netBootCommand is the hidden verb the boot runs as root: NetBoot over the install in *dir.
-func netBootCommand(name, ctl string, dir *string, stderr io.Writer) *cobra.Command {
+func netBootCommand(r *Release, dir *string, stderr io.Writer) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:    netBootCmd,
 		Short:  "Render the network override for networkd, a change never confirmed undone first (run at boot)",
 		Args:   cobra.NoArgs,
 		Hidden: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			return NetBoot(name, ctl, *dir, stderr)
+			roles, _ := secondaryNICs(r.Spec)
+			return NetBoot(r.Spec.Name, r.Ctl(), *dir, roles, stderr)
 		},
 	}
 	return cmd
@@ -118,7 +120,8 @@ func networkCommand(c *hostClient, name string, stdout io.Writer) *cobra.Command
 		},
 	}
 	sf := set.Flags()
-	sf.StringVar(&req.Mode, "mode", "", "dhcp or static")
+	sf.StringVar(&req.Role, "role", "", "a secondary NIC's role (host.interfaces), whose override this sets: --mode dhcp, static with --address, or none (default: the primary's)")
+	sf.StringVar(&req.Mode, "mode", "", "dhcp or static; with --role, also none (the link up, no address)")
 	sf.StringVar(&req.Address, "address", "", "static: the address with its prefix (192.0.2.10/24)")
 	sf.StringVar(&req.Gateway, "gateway", "", "static: the default gateway, in the address's subnet")
 	sf.BoolVar(&req.IPv6, "ipv6", false, "turn IPv6 on: router advertisements (and DHCPv6 with dhcp), and --address6 (default: no IPv6 on the link)")
@@ -143,6 +146,7 @@ func networkCommand(c *hostClient, name string, stdout io.Writer) *cobra.Command
 			return answer(cmd.Context(), "/v1/network/revert", nil)
 		},
 	}
+	var resetRole string
 	reset := &cobra.Command{
 		Use:   "reset",
 		Short: "Drop the override: back to the cloud-config's network, which `network confirm` keeps in time, like any addressing change",
@@ -152,9 +156,10 @@ func networkCommand(c *hostClient, name string, stdout io.Writer) *cobra.Command
 			if err != nil {
 				return err
 			}
-			return answer(cmd.Context(), "/v1/network/reset", NetResetRequest{RevertSecs: w})
+			return answer(cmd.Context(), "/v1/network/reset", NetResetRequest{Role: resetRole, RevertSecs: w})
 		},
 	}
+	reset.Flags().StringVar(&resetRole, "role", "", "a secondary NIC's role, whose override this drops (default: the primary's)")
 	windowFlags(reset)
 	show.AddCommand(set, confirm, revertCmd, reset)
 	return show
@@ -182,9 +187,40 @@ func printNetwork(w io.Writer, ctl string, n Network) {
 	default:
 		fmt.Fprintln(w, "set by     DHCP")
 	}
-	if p := n.Pending; p != nil {
-		fmt.Fprintf(w, "pending    not confirmed: in %d s, %s comes back unless `%s network confirm` keeps it\n", p.SecsLeft, describeNet(p.Previous), ctl)
+	for _, r := range n.Roles {
+		nic := "no NIC is named so"
+		if r.MAC != "" {
+			nic = r.MAC + " " + cmp.Or(strings.Join(r.Addresses, ", "), "no address")
+		}
+		set := "the cloud-config or `network attach`"
+		switch {
+		case r.Error != "":
+			set = "the cloud-config or `network attach`, as its override's record does not read: " + r.Error
+		case r.Override != nil:
+			set = fmt.Sprintf("`%s network set --role %s`: %s", ctl, r.Role, describeRole(r.Override))
+		}
+		fmt.Fprintf(w, "role       %s: %s; set by %s\n", r.Role, nic, set)
 	}
+	if p := n.Pending; p != nil {
+		prev := describeNet(p.Previous)
+		if p.Role != "" {
+			prev = p.Role + "'s " + describeRole(p.Previous)
+		}
+		fmt.Fprintf(w, "pending    not confirmed: in %d s, %s comes back unless `%s network confirm` keeps it\n", p.SecsLeft, prev, ctl)
+	}
+}
+
+// describeRole names a secondary NIC's setting; nil is the cloud-config's or `network attach`'s.
+func describeRole(c *NetConfig) string {
+	switch {
+	case c == nil:
+		return "settings from the cloud-config or `network attach`"
+	case c.Mode == IfaceStatic:
+		return c.Address
+	case c.Mode == IfaceDHCP:
+		return "DHCP"
+	}
+	return "no address (the link up)"
 }
 
 // describeNet names a network setting; nil is the cloud-config's.

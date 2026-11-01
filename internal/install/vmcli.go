@@ -216,7 +216,7 @@ func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(
 		},
 	}
 	dirFlag(gate)
-	netBoot := netBootCommand(name, c.ctl, &o.Dir, stderr)
+	netBoot := netBootCommand(r, &o.Dir, stderr)
 	dirFlag(netBoot)
 	tablesBoot := tablesBootCommand(func(*cobra.Command) (*Installer, error) { return in, prepare() })
 	dirFlag(tablesBoot)

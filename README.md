@@ -3894,6 +3894,8 @@ sudo <short>-stow install [--channel C] [--set KEY=VALUE]… [--answers FILE] [-
 <short>-stow network set --mode dhcp|static [--address A/P] [--gateway G] [--ipv6 [--address6 A/P] [--gateway6 G]] [--dns D,…] [--revert-secs N | --no-revert]
 <short>-stow network confirm|revert   # keep the change awaiting confirmation, or undo it now
 <short>-stow network reset [--revert-secs N | --no-revert]   # drop the override: back to the cloud-config's network
+<short>-stow network set --role ROLE --mode dhcp|static|none [--address A/P] [--revert-secs N | --no-revert]   # a secondary NIC's override
+<short>-stow network reset --role ROLE [--revert-secs N | --no-revert]   # drop it
 sudo <short>-stow network attach --role ROLE --mac MAC [--mode dhcp|static|none] [--address A/P]   # a NIC the release names, from the next boot
 <short>-stow backup config [--json] [--destination REMOTE:PATH] [--rclone-config FILE|-] [--recipient age1…]…
           [--retention-days N] [--schedule CALENDAR] [--profile P] [--remove]   # show, change or drop the backup settings
@@ -4280,6 +4282,11 @@ sudo <short>-stow network attach --role ROLE --mac MAC [--mode dhcp|static|none]
   `vm create` gave (its cloud-config's file; with its settings, which the cloud-config also
   records in `/etc/<name>/install-network.yaml`, rewritten at every boot — a record that does not
   read is logged, once per error, and left out), or DHCP (a VM whose cloud-config wrote none).
+  Then a `role` line for each of the release's secondary NICs (`role       <role>: <MAC>
+  <addresses, or no address>; set by …` — `no NIC is named so` when the VM names none — set by
+  `` `<short>-stow network set --role <role>`: `` and the override's settings, or by `the
+  cloud-config or \`network attach\``), and the change awaiting confirmation, a secondary's
+  named with its role (`roles` and `pending.role` in `--json`).
 - `network attach` (as root; `vm attach` runs it) names and addresses a NIC the VM's
   cloud-config does not name, for a secondary role of the release's `host.interfaces` (`kind:
   nic`), from the next boot: by its `--mac` (a unicast MAC), with `--mode` `dhcp`, `static` with
@@ -4292,7 +4299,8 @@ sudo <short>-stow network attach --role ROLE --mac MAC [--mode dhcp|static|none]
   alone (a VM made by a release with one NIC) is named by its MAC too, the MAC of the NIC its role
   names now (`<role>: its NIC (<MAC>) is named by its MAC from the next boot, as another NIC joins
   it`), so the new NIC never takes its name. Given again for a role, it replaces the role's MAC
-  and addressing (applied at the next boot). Refused: a role that is not one of the release's
+  and addressing (applied at the next boot, with no window: `network set --role` re-addresses
+  with one, and its override outranks this addressing). Refused: a role that is not one of the release's
   NICs, the primary (`network set` addresses it), a role the cloud-config names, a MAC another
   recorded NIC has, that the cloud-config names another NIC by, or that a NIC named as another
   role has, `--address` without `static` or `static` without an IPv4 one, a mode other
@@ -4351,10 +4359,41 @@ sudo <short>-stow network attach --role ROLE --mac MAC [--mode dhcp|static|none]
   15 s, 5 times in all; a later change stops it.
 - `network reset` drops the override, back to the cloud-config's static address or DHCP, on the
   same window (the override comes back unless confirmed); with no override it changes nothing.
+- `network set --role ROLE` sets a secondary NIC's override, on the release's secondary NIC
+  (`host.interfaces`, `kind: nic`, not `primary`) of that role, which the VM names (by its
+  cloud-config, `vm create --interface`, or `network attach` once a boot named it), whatever set
+  its addressing before: `--mode dhcp` (DHCPv4, never its gateway, routes, DNS servers or the
+  host name), `static` with `--address` (IPv4 with its prefix, checked as the primary's) or
+  `none` (the link up, no address) — as a whole, never a gateway, IPv6 or DNS servers, which are
+  the primary's. It is recorded in `/usr/local/<name>/network-<role>.yaml` (0600, strictly read,
+  `version: 2`) and rendered as `/run/systemd/network/09-<name>-<role>-override.network`
+  (`Name=<role>`; it sorts before the cloud-config's and `network attach`'s `10-` file, and the
+  release's MTU and routing drop-ins apply to it; under `/run`, a release older than `--role`
+  renders none: after `rollback` to one, the cloud-config's or `network attach`'s settings
+  apply, and the record is kept for a later release), then `networkctl reload` and `networkctl
+  reconfigure <role>`; a static address must reach the link within 10 s. It follows the
+  primary's rules otherwise: the window (`--revert-secs`, `--no-revert`, `network confirm`,
+  `network revert`, undone at the window's end, at the daemon's start and at a reboot inside
+  it), a change that fails undone at once, and `network reset --role ROLE` back to the settings
+  the cloud-config or `network attach` gave the role. One change awaits confirmation at a time,
+  across the primary and the secondaries. Refused before anything changes: the primary's role
+  (`network set` without `--role`), a role that is not one of the release's secondary NICs, a
+  role no NIC is named for on the VM (409: `vm attach` attaches one), a gateway, IPv6 or DNS
+  server, an address without `static`, `static` without one, another mode, and any NIC's change
+  while a revert is armed for another NIC's (at its window's end, or tried again while it
+  fails: `<NIC>'s network change has a revert armed`); a change awaiting confirmation names
+  its NIC (`<role>'s network change awaits confirmation`). A record that does not read, the
+  primary's or a secondary's, sets nothing at boot and stops every change, `network confirm`
+  and `network revert` (it may hold the change awaiting confirmation), each naming the `network
+  reset [--role ROLE]` that drops it, which goes ahead whatever another NIC does (with no window,
+  another NIC's revert kept); `network` shows a secondary's on its role's line (`as its
+  override's record does not read: <why>`; `error` in `--json`). A record of a role the
+  release no longer names is kept and not read.
 - The console's login screen (`/etc/issue.d`, after the host name and `IPv4: <address>`) tells
   what sets the network (`network: <the override's settings, as \`network\` prints them>; set
   with \`<short>-stow network set\``; else "the VM's cloud-config (DHCP, or its static
-  address)") and, while a change awaits confirmation, when it goes back
+  address)"), each secondary NIC's override (`<role>: <its settings>; set with \`<short>-stow
+  network set --role <role>\``) and, while a change awaits confirmation, when it goes back
   (`06-<name>-network.issue`, written at boot and at each change, then `agetty --reload`); the
   cloud-config adds the connect line.
 - Disk pressure (`hooks.maintenance.disk_pressure`; the VM only): the daemon reads the use of the

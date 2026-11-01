@@ -1107,7 +1107,8 @@ func TestRawLayoutTakesTheRecoveryByName(t *testing.T) {
 	}
 }
 
-// Each NIC's own settings are a drop-in of the file its addressing comes from (the primary's two),
+// Each NIC's own settings are a drop-in of the files its addressing comes from (two each: the
+// override's and the cloud-config's),
 // a NIC setting nothing has none, and a tun device's file is the image's whole: it matches the
 // device its service opens, keeps its addresses and waits for no carrier.
 func TestInterfacesAreTheImagesNetworkdFiles(t *testing.T) {
@@ -1121,11 +1122,13 @@ func TestInterfacesAreTheImagesNetworkdFiles(t *testing.T) {
 		"vpn0": {Kind: spec.InterfaceTUN, Routes: []map[string]string{{"Destination": "10.99.0.0/24"}}, Reason: "the peers"},
 	}
 	got := interfaceFiles(p)
+	edge := "# notes's interface edge (host.interfaces): the probes\n[Link]\nMTUBytes=1500\n" +
+		"\n[RoutingPolicyRule]\nFirewallMark=0x1\nTable=100\n\n[Route]\nDestination=0.0.0.0/0\nTable=100\nType=local\n"
 	want := map[string]string{
-		"usr/lib/systemd/network/01-notes-override.network.d/50-notes.conf": "# notes's interface uplink (host.interfaces): the default route\n[Link]\nMTUBytes=9000\n",
-		"usr/lib/systemd/network/05-notes-static.network.d/50-notes.conf":   "# notes's interface uplink (host.interfaces): the default route\n[Link]\nMTUBytes=9000\n",
-		"usr/lib/systemd/network/10-notes-edge.network.d/50-notes.conf": "# notes's interface edge (host.interfaces): the probes\n[Link]\nMTUBytes=1500\n" +
-			"\n[RoutingPolicyRule]\nFirewallMark=0x1\nTable=100\n\n[Route]\nDestination=0.0.0.0/0\nTable=100\nType=local\n",
+		"usr/lib/systemd/network/01-notes-override.network.d/50-notes.conf":      "# notes's interface uplink (host.interfaces): the default route\n[Link]\nMTUBytes=9000\n",
+		"usr/lib/systemd/network/05-notes-static.network.d/50-notes.conf":        "# notes's interface uplink (host.interfaces): the default route\n[Link]\nMTUBytes=9000\n",
+		"usr/lib/systemd/network/09-notes-edge-override.network.d/50-notes.conf": edge,
+		"usr/lib/systemd/network/10-notes-edge.network.d/50-notes.conf":          edge,
 		"usr/lib/systemd/network/10-notes-vpn0.network": "# notes's interface vpn0 (host.interfaces): the peers\n[Match]\nName=vpn0\n\n[Network]\nLinkLocalAddressing=no\nIPv6AcceptRA=no\nKeepConfiguration=yes\nConfigureWithoutCarrier=yes\n\n[Link]\nRequiredForOnline=no\n" +
 			"\n[Route]\nDestination=10.99.0.0/24\n",
 	}

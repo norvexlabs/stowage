@@ -47,15 +47,6 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
    Before writing a module, read the latest provider's official docs and its schema, and pin that
    release.
 
-### Next batch — found iterating a release on the VM
-
-1. **`network set --role ROLE` for a secondary NIC, with the primary's revert window**: `network
-   attach` given again re-addresses a NIC it attached, at the next boot and with no window, and a
-   NIC the cloud-config named (`vm create --interface`) cannot be re-addressed at all. Extend the
-   override (hostdnet.go's netState, primary-only) to a secondary role: its own unit sorting
-   first (`09-<name>-<role>-override.network`) and the image's MTU and routing drop-ins for it too
-   (an `InterfaceUnits` helper beside `PrimaryUnits`), one pending change across all roles.
-
 ## Should
 
 - **`vm create` takes no lock on its state directory**: `vm attach` and `vm destroy` hold
@@ -392,6 +383,12 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
 
 ## Could
 
+- **The daemon's start applies a record its networkd file differs from once**: a failure (networkd
+  not ready) is logged and the boot renders the record again, where it was retried every 15 s;
+  retries would need the one revert timer, which a pending change on another NIC owns. A timer
+  per NIC would bring them back, and would undo two records each holding a change awaiting
+  confirmation at the daemon's start (only a record repaired by hand leaves two) without one's
+  failing revert disarming the other's.
 - **`vm attach` with a wrong `attach=` bridge**: the plan passes, the variables record it, and the
   apply fails; a re-run with the right bridge is refused against the recorded one, and the hint's
   `tofu apply` fails the same way. Let a re-run correct a NIC whose device the state lacks.

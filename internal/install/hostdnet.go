@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"net/netip"
 	"os"
@@ -21,6 +22,7 @@ import (
 	"go.yaml.in/yaml/v3"
 
 	"github.com/norvexlabs/stowage/internal/kairos"
+	"github.com/norvexlabs/stowage/internal/spec"
 )
 
 // The VM's network override: the address, gateway and DNS servers an operator sets on a running VM
@@ -30,11 +32,15 @@ import (
 // kept only once confirmed: until then a timer, the daemon's start and the boot each restore the
 // settings it replaced.
 //
-//	GET  /v1/network          {live, source, override, pending}
-//	POST /v1/network          {mode, address, gateway, address6, gateway6, dns, revert_secs}: set the override
+// A secondary NIC of the release (host.interfaces) has an override of its own, in a state file of
+// its own, rendered under /run (a release that does not render it has none); one change awaits
+// confirmation at a time, across the primary and the secondaries.
+//
+//	GET  /v1/network          {live, source, override, roles, pending}
+//	POST /v1/network          {role, mode, address, gateway, address6, gateway6, dns, revert_secs}: set the override
 //	POST /v1/network/confirm  keep the change awaiting confirmation
 //	POST /v1/network/revert   undo it now
-//	POST /v1/network/reset    {revert_secs}: drop the override, back to the cloud-config's settings
+//	POST /v1/network/reset    {role, revert_secs}: drop the override, back to the cloud-config's settings
 
 // The auto-revert's window, in seconds: 0 is none.
 const (
@@ -53,7 +59,7 @@ const (
 
 // NetConfig is a VM's network as `<short>-stow network set` gives it.
 type NetConfig struct {
-	Mode    string `json:"mode" yaml:"mode"`                           // dhcp or static
+	Mode    string `json:"mode" yaml:"mode"`                           // dhcp or static; a secondary's also none
 	Address string `json:"address,omitempty" yaml:"address,omitempty"` // static: the IPv4 address with its prefix
 	Gateway string `json:"gateway,omitempty" yaml:"gateway,omitempty"` // static
 	// IPv6 turns IPv6 on: off, the link has none (no link-local address, router advertisement
@@ -68,6 +74,9 @@ type NetConfig struct {
 
 // NetRequest is POST /v1/network's body.
 type NetRequest struct {
+	// Role is a secondary NIC's role, whose override this sets: mode and address alone. Empty is
+	// the primary's.
+	Role string `json:"role,omitempty"`
 	NetConfig
 	// RevertSecs is the window an addressing change must be confirmed in: default 90, 0 for none,
 	// else 30 to 3600.
@@ -76,7 +85,8 @@ type NetRequest struct {
 
 // NetResetRequest is POST /v1/network/reset's body.
 type NetResetRequest struct {
-	RevertSecs *int `json:"revert_secs,omitempty"`
+	Role       string `json:"role,omitempty"` // a secondary NIC's role; empty is the primary's
+	RevertSecs *int   `json:"revert_secs,omitempty"`
 }
 
 // Network is what GET /v1/network answers.
@@ -89,8 +99,20 @@ type Network struct {
 	// Install is the network `vm create` gave, which `network reset` returns to while its
 	// networkd file applies it (Source install); absent when the cloud-config does not record it
 	// or the record does not read (logged).
-	Install *NetConfig  `json:"install,omitempty"`
-	Pending *NetPending `json:"pending,omitempty"`
+	Install *NetConfig `json:"install,omitempty"`
+	// Roles are the release's secondary NICs, in role order.
+	Roles   []RoleNetwork `json:"roles,omitempty"`
+	Pending *NetPending   `json:"pending,omitempty"`
+}
+
+// RoleNetwork is a secondary NIC's network.
+type RoleNetwork struct {
+	Role      string     `json:"role"`
+	MAC       string     `json:"mac,omitempty"` // empty: no NIC is named so on the VM
+	Addresses []string   `json:"addresses"`
+	Override  *NetConfig `json:"override"` // nil: the cloud-config's or `network attach`'s settings
+	// Error is why its record does not read, which then sets nothing.
+	Error string `json:"error,omitempty"`
 }
 
 // NetLive is the network the VM runs, as the kernel and the resolver report it.
@@ -106,6 +128,7 @@ type NetLive struct {
 // NetPending is a change awaiting confirmation: past Deadline, Previous comes back (nil: the
 // cloud-config's settings).
 type NetPending struct {
+	Role     string     `json:"role,omitempty"` // a secondary NIC's change; empty is the primary's
 	Previous *NetConfig `json:"previous"`
 	Deadline time.Time  `json:"deadline"`
 	SecsLeft int        `json:"secs_left"`
@@ -137,21 +160,101 @@ type netPending struct {
 // NetworkFile is the override's state file in the install directory dir.
 func NetworkFile(dir string) string { return filepath.Join(dir, "network.yaml") }
 
-// netFiles are where the override is rendered: networkd's directory and the console banner's.
+// RoleNetworkFile is a secondary NIC's override's state file in the install directory dir.
+func RoleNetworkFile(dir, role string) string { return filepath.Join(dir, "network-"+role+".yaml") }
+
+// netFiles are where one NIC's override is recorded and rendered: its state file, networkd's
+// directory and the console banner's.
 type netFiles struct {
 	// name is the project's, which names the files; ctl its installer's, which they name to the
-	// operator.
-	name, ctl, state, networkd, issue string
-	// match is the [Match] section's setting the override's file takes (PrimaryMatch).
-	match string
+	// operator; dir the install's directory.
+	name, ctl, dir string
+	// etc is the primary's networkd directory, run the secondaries' (lost at every boot, which
+	// renders them again); issue the banner's.
+	etc, run, issue string
+	// roles are the release's secondary NICs; role the one these files are of (empty: the
+	// primary).
+	roles []string
+	role  string
+	// state and networkd are role's state file and networkd directory.
+	state, networkd string
+	// match is the [Match] section's setting the override's file takes (the role's, or
+	// primaryMatch: seedMatch, read once).
+	match, primaryMatch string
 	// install is the file the cloud-config records the install's network in.
 	install string
 }
 
-// overrideUnit is the override's networkd file: it sorts before the cloud-config's (staticUnit)
-// and Kairos's DHCP default, and networkd takes the first file that matches.
+// forRole are the files of role's override (empty: the primary's).
+func (f netFiles) forRole(role string) netFiles {
+	f.role = role
+	if role == "" {
+		f.state, f.networkd, f.match = NetworkFile(f.dir), f.etc, f.primaryMatch
+		return f
+	}
+	f.state, f.networkd, f.match = RoleNetworkFile(f.dir, role), f.run, "Name="+role
+	return f
+}
+
+// all are the files of every override: the primary's, then the secondaries' in role order.
+func (f netFiles) all() []netFiles {
+	out := []netFiles{f.forRole("")}
+	for _, r := range f.roles {
+		out = append(out, f.forRole(r))
+	}
+	return out
+}
+
+// what names the override in a message.
+func (f netFiles) what() string {
+	if f.role == "" {
+		return "the network override"
+	}
+	return "the network override of " + f.role
+}
+
+// valid checks a config of f's override: validRoleNet for a secondary's, validNet for the
+// primary's.
+func (f netFiles) valid(c NetConfig) (NetConfig, error) {
+	if f.role != "" {
+		return validRoleNet(c)
+	}
+	return validNet(c)
+}
+
+// base names the settings f's NIC has without an override.
+func (f netFiles) base() string {
+	if f.role == "" {
+		return "the cloud-config's settings"
+	}
+	return "the settings the cloud-config or `network attach` gave " + f.role
+}
+
+// roleFlag is the flag naming the role in a command: empty for the primary.
+func (f netFiles) roleFlag() string {
+	if f.role == "" {
+		return ""
+	}
+	return " --role " + f.role
+}
+
+// overrideUnit is the override's networkd file: it sorts before the cloud-config's (staticUnit,
+// a secondary's InterfaceUnit) and Kairos's DHCP default, and networkd takes the first file that
+// matches.
 func (f netFiles) overrideUnit() string {
+	if f.role != "" {
+		return filepath.Join(f.networkd, kairos.InterfaceUnits(f.name, f.role)[0])
+	}
 	return filepath.Join(f.networkd, kairos.PrimaryUnits(f.name)[0])
+}
+
+// unit is the override's networkd file for a valid c.
+func (f netFiles) unit(c NetConfig) string {
+	if f.role == "" {
+		return renderNetwork(f.name, f.ctl, f.match, c)
+	}
+	return fmt.Sprintf("# %s's network override of %s, rendered from %s at every boot: `%s network set --role %s` changes it.\n", f.name, f.role, RoleNetworkFile(VMDir(f.name), f.role), f.ctl, f.role) +
+		"[Match]\n" + f.match + "\n\n" + secondarySections(MachineInterface{Role: f.role, Mode: c.Mode, Address: c.Address})
 }
 
 func (f netFiles) banner() string { return filepath.Join(f.issue, "06-"+f.name+"-network.issue") }
@@ -160,25 +263,30 @@ func (f netFiles) banner() string { return filepath.Join(f.issue, "06-"+f.name+"
 // included. Its name stays: the seeds of the VMs already made write it.
 func staticUnit(name string) string { return kairos.PrimaryUnits(name)[1] }
 
+// netFiles are the primary's override's files; forRole a secondary's.
 func (h *Hostd) netFiles() netFiles {
-	f := newNetFiles(h.R.Spec.Name, h.R.Ctl(), h.O.Dir, h.Networkd, h.Issue)
+	roles, _ := secondaryNICs(h.R.Spec)
+	f := newNetFiles(h.R.Spec.Name, h.R.Ctl(), h.O.Dir, h.Networkd, h.RunNetworkd, h.Issue, roles)
 	f.install = cmp.Or(h.InstallNet, f.install)
 	return f
 }
 
-// newNetFiles are the override's files of the install in dir; an empty networkd is
-// /etc/systemd/network, an empty issue /etc/issue.d.
-func newNetFiles(name, ctl, dir, networkd, issue string) netFiles {
+// newNetFiles are the primary's override's files of the install in dir, of a release whose
+// secondary NICs are roles; an empty networkd is /etc/systemd/network, an empty run
+// /run/systemd/network, an empty issue /etc/issue.d.
+func newNetFiles(name, ctl, dir, networkd, run, issue string, roles []string) netFiles {
 	f := netFiles{
-		name:     name,
-		ctl:      ctl,
-		state:    NetworkFile(dir),
-		networkd: cmp.Or(networkd, "/etc/systemd/network"),
-		issue:    cmp.Or(issue, "/etc/issue.d"),
-		install:  InstallNetworkFile(name),
+		name:    name,
+		ctl:     ctl,
+		dir:     dir,
+		etc:     cmp.Or(networkd, "/etc/systemd/network"),
+		run:     cmp.Or(run, "/run/systemd/network"),
+		issue:   cmp.Or(issue, "/etc/issue.d"),
+		roles:   roles,
+		install: InstallNetworkFile(name),
 	}
-	f.match = seedMatch(f.networkd, name)
-	return f
+	f.primaryMatch = seedMatch(f.etc, name)
+	return f.forRole("")
 }
 
 // readInstall strictly decodes the network the cloud-config records — one NetConfig document,
@@ -245,7 +353,7 @@ func (f netFiles) read() (netState, error) {
 			}
 			c.IPv6 = true // a record without a version: IPv6 on
 		}
-		if _, err := validNet(*c); err != nil {
+		if _, err := f.valid(*c); err != nil {
 			return st, unreadable{f, fmt.Errorf("%s: %w", f.state, err)}
 		}
 	}
@@ -259,7 +367,7 @@ type unreadable struct {
 }
 
 func (e unreadable) Error() string {
-	return fmt.Sprintf("%v (`%s network reset` drops it)", e.err, e.f.ctl)
+	return fmt.Sprintf("%v (`%s network reset%s` drops it)", e.err, e.f.ctl, e.f.roleFlag())
 }
 
 func (e unreadable) Unwrap() error { return e.err }
@@ -298,6 +406,9 @@ func (f netFiles) write(st netState) error {
 		return err
 	}
 	head := fmt.Sprintf("# %s's network override, which `%s network` changes: the boot renders it.\n", f.name, f.ctl)
+	if f.role != "" {
+		head = fmt.Sprintf("# %s's network override of %s, which `%s network set --role %s` changes: the boot renders it.\n", f.name, f.role, f.ctl, f.role)
+	}
 	return writePrivate(f.state, append([]byte(head), raw...))
 }
 
@@ -321,8 +432,8 @@ func legacyState(st netState) netState {
 }
 
 // render writes the networkd file of c, or removes it when c is nil (the cloud-config's settings),
-// and the console banner of st.
-func (f netFiles) render(c *NetConfig, st netState) error {
+// and the console banner of the state files.
+func (f netFiles) render(c *NetConfig) error {
 	if c == nil {
 		if err := os.Remove(f.overrideUnit()); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return err
@@ -331,27 +442,41 @@ func (f netFiles) render(c *NetConfig, st netState) error {
 		if err := os.MkdirAll(f.networkd, 0o755); err != nil {
 			return err
 		}
-		if err := writeAtomic(f.overrideUnit(), strings.NewReader(renderNetwork(f.name, f.ctl, f.match, *c)), 0o644, nil); err != nil {
+		if err := writeAtomic(f.overrideUnit(), strings.NewReader(f.unit(*c)), 0o644, nil); err != nil {
 			return err
 		}
 	}
-	return f.writeBanner(st)
+	return f.writeBanner()
 }
 
-// writeBanner tells, on the console's login screen, what sets the network and whether a change
-// awaits confirmation; the line before it gives the address (\4).
-func (f netFiles) writeBanner(st netState) error {
+// writeBanner tells, on the console's login screen, what sets the network, each secondary NIC's
+// override and whether a change awaits confirmation, as the state files record them (a file that
+// does not read sets nothing); the line before it gives the address (\4).
+func (f netFiles) writeBanner() error {
 	ctl := f.ctl
 	var b strings.Builder
-	switch {
-	case st.Config != nil:
-		fmt.Fprintf(&b, "network: %s; set with `%s network set`\n", describeNet(st.Config), ctl)
-	default:
-		// At boot the cloud-config's static file is not written yet: the banner cannot tell.
-		b.WriteString("network: the VM's cloud-config (DHCP, or its static address)\n")
+	var pending *netPending
+	for _, g := range f.all() {
+		st, err := g.read()
+		if err != nil {
+			st = netState{}
+		}
+		if st.Pending != nil {
+			pending = st.Pending
+		}
+		switch {
+		case g.role != "" && st.Config != nil:
+			fmt.Fprintf(&b, "%s: %s; set with `%s network set --role %s`\n", g.role, describeRole(st.Config), ctl, g.role)
+		case g.role != "":
+		case st.Config != nil:
+			fmt.Fprintf(&b, "network: %s; set with `%s network set`\n", describeNet(st.Config), ctl)
+		default:
+			// At boot the cloud-config's static file is not written yet: the banner cannot tell.
+			b.WriteString("network: the VM's cloud-config (DHCP, or its static address)\n")
+		}
 	}
-	if st.Pending != nil {
-		fmt.Fprintf(&b, "         not confirmed: it goes back at %s unless `%s network confirm` keeps it\n", st.Pending.Deadline.UTC().Format("15:04:05 UTC"), ctl)
+	if pending != nil {
+		fmt.Fprintf(&b, "         not confirmed: it goes back at %s unless `%s network confirm` keeps it\n", pending.Deadline.UTC().Format("15:04:05 UTC"), ctl)
 	}
 	if err := os.MkdirAll(f.issue, 0o755); err != nil {
 		return err
@@ -630,6 +755,47 @@ func validNet6(address, gateway string) (string, string, error) {
 	return p.String(), g.String(), nil
 }
 
+// validRoleNet checks a secondary NIC's c and returns it in canonical form: dhcp, static with an
+// IPv4 address (checked as the primary's), or none (the link up, no address) — never a gateway,
+// IPv6 or DNS servers, which are the primary's.
+func validRoleNet(c NetConfig) (NetConfig, error) {
+	if c.Gateway != "" || c.IPv6 || c.Address6 != "" || c.Gateway6 != "" || len(c.DNS) > 0 {
+		return NetConfig{}, errors.New("a gateway, IPv6 and DNS servers are the primary NIC's (without a role): a secondary NIC carries none of them")
+	}
+	switch c.Mode {
+	case IfaceDHCP, IfaceNone:
+		if c.Address != "" {
+			return NetConfig{}, errors.New("an address is for the static mode")
+		}
+		return NetConfig{Mode: c.Mode}, nil
+	case IfaceStatic:
+		if c.Address == "" {
+			return NetConfig{}, errors.New("the static mode needs an address")
+		}
+		return validNet(NetConfig{Mode: c.Mode, Address: c.Address})
+	}
+	return NetConfig{}, fmt.Errorf("mode %q: dhcp, static or none", c.Mode)
+}
+
+// secondaryNICs are the release's secondary NIC roles (host.interfaces), in order, and its primary.
+func secondaryNICs(s *spec.Spec) ([]string, string) {
+	var roles []string
+	primary := ""
+	if s.Host == nil {
+		return nil, ""
+	}
+	for _, k := range slices.Sorted(maps.Keys(s.Host.Interfaces)) {
+		switch i := s.Host.Interfaces[k]; {
+		case i.Kind != "" && i.Kind != spec.InterfaceNIC:
+		case i.Primary:
+			primary = k
+		default:
+			roles = append(roles, k)
+		}
+	}
+	return roles, primary
+}
+
 // revertSecs checks the window asked for: nil is the default.
 func revertSecs(v *int) (int, error) {
 	if v == nil {
@@ -648,32 +814,42 @@ func addressing(cur *NetConfig, next NetConfig) bool {
 		cur.IPv6 != next.IPv6 || cur.Address6 != next.Address6 || cur.Gateway6 != next.Gateway6
 }
 
-// NetBoot renders the override of the install in dir for the boot, before networkd starts: a
-// change still awaiting confirmation is undone first, as a reboot inside its window means it was
-// never confirmed.
-func NetBoot(name, ctl, dir string, log io.Writer) error {
-	return newNetFiles(name, ctl, dir, "", "").boot(log)
+// NetBoot renders the overrides of the install in dir, of a release whose secondary NICs are
+// roles, for the boot, before networkd starts: a change still awaiting confirmation is undone
+// first, as a reboot inside its window means it was never confirmed. The primary's comes last, so
+// the banner it writes tells the secondaries' as recorded.
+func NetBoot(name, ctl, dir string, roles []string, log io.Writer) error {
+	f := newNetFiles(name, ctl, dir, "", "", "", roles)
+	var errs []error
+	for _, r := range roles {
+		errs = append(errs, f.forRole(r).boot(log))
+	}
+	return errors.Join(append(errs, f.boot(log))...)
 }
 
 func (f netFiles) boot(log io.Writer) error {
 	st, err := f.read()
 	if err != nil {
 		// Unreadable, it sets nothing: the cloud-config's settings bring the VM up.
-		return errors.Join(fmt.Errorf("the network override: %w (the cloud-config's settings apply)", err), f.render(nil, netState{}))
+		return errors.Join(fmt.Errorf("%s: %w (the cloud-config's settings apply)", f.what(), err), f.render(nil))
 	}
 	if st.Pending != nil {
 		fmt.Fprintf(log, "the network change awaiting confirmation was not confirmed before the reboot: the settings before it come back\n")
 		st = netState{Config: st.Pending.Previous}
 		if err := f.write(st); err != nil {
-			return errors.Join(err, f.render(nil, netState{}))
+			return errors.Join(err, f.render(nil))
 		}
 	}
-	return f.render(st.Config, st)
+	return f.render(st.Config)
 }
 
 // netLive reads the network the VM runs: the interface of the default route (else the first
 // wired one), its addresses, the gateway, the DNS servers.
-func (h *Hostd) netLive(ctx context.Context) (NetLive, error) {
+func (h *Hostd) netLive(ctx context.Context) (NetLive, error) { return h.netLiveOn(ctx, "") }
+
+// netLiveOn is netLive on the interface iface (empty: the default route's), whose Interface is
+// empty when no link is named so.
+func (h *Hostd) netLiveOn(ctx context.Context, iface string) (NetLive, error) {
 	live := NetLive{Addresses: []string{}, DNS: []string{}}
 	routes, err := h.Host.Run(ctx, Cmd{Args: []string{"ip", "-j", "route", "show", "default"}})
 	if err != nil {
@@ -688,12 +864,15 @@ func (h *Hostd) netLive(ctx context.Context) (NetLive, error) {
 	var ls []ipLink
 	_ = json.Unmarshal(links, &ls)
 	for _, r := range rs {
-		if r.Dev != "" && (r.Dst == "default" || r.Dst == "") {
+		if iface == "" && r.Dev != "" && (r.Dst == "default" || r.Dst == "") {
 			live.Interface, live.Gateway = r.Dev, r.Gateway
 			break
 		}
 	}
-	if live.Interface == "" {
+	if iface != "" && slices.ContainsFunc(ls, func(l ipLink) bool { return l.Name == iface }) {
+		live.Interface = iface
+	}
+	if live.Interface == "" && iface == "" {
 		for _, l := range ls {
 			if strings.HasPrefix(l.Name, "en") || strings.HasPrefix(l.Name, "eth") {
 				live.Interface = l.Name
@@ -724,6 +903,19 @@ func (h *Hostd) netLive(ctx context.Context) (NetLive, error) {
 		live.DNS = parseResolvectl(string(out), live.Interface)
 	}
 	return live, nil
+}
+
+// links are the VM's links as `ip -j address show` prints them.
+func (h *Hostd) links(ctx context.Context) ([]ipLink, error) {
+	out, err := h.Host.Run(ctx, Cmd{Args: []string{"ip", "-j", "address", "show"}})
+	if err != nil {
+		return nil, fmt.Errorf("ip address: %w", err)
+	}
+	var ls []ipLink
+	if err := json.Unmarshal(out, &ls); err != nil {
+		return nil, fmt.Errorf("ip address: %w", err)
+	}
+	return ls, nil
 }
 
 // ipRoute and ipLink are what `ip -j` prints of a route and of a link.
@@ -789,13 +981,12 @@ func parseResolvectl(out, iface string) []string {
 	return global
 }
 
-// netApply renders c (nil: the cloud-config's settings) and the banner of st, has networkd reload
+// netApply renders f's c (nil: the cloud-config's settings) and the banner, has networkd reload
 // and reconfigure iface, then, for static addresses (IPv4, IPv6 or both), waits for them and their
 // default routes to reach iface: a change networkd took but did not apply is an error, as is an
-// IPv6 address another host has.
-func (h *Hostd) netApply(ctx context.Context, c *NetConfig, st netState, iface string) error {
-	f := h.netFiles()
-	if err := f.render(c, st); err != nil {
+// IPv6 address another host has. A secondary's address is read on its own link.
+func (h *Hostd) netApply(ctx context.Context, f netFiles, c *NetConfig, iface string) error {
+	if err := f.render(c); err != nil {
 		return err
 	}
 	if _, err := h.Host.Run(ctx, Cmd{Args: []string{"networkctl", "reload"}}); err != nil {
@@ -819,7 +1010,7 @@ func (h *Hostd) netApply(ctx context.Context, c *NetConfig, st netState, iface s
 	}
 	deadline := time.Now().Add(netVerifySecs * h.unit())
 	for {
-		live, err := h.netLive(ctx)
+		live, err := h.netLiveOn(ctx, f.role)
 		if err == nil {
 			// missing is the first static setting the link does not run: an address (an IPv6
 			// one only once duplicate address detection passed), then a default route.
@@ -875,11 +1066,12 @@ func (h *Hostd) unit() time.Duration {
 	return h.Unit
 }
 
-// armRevert runs undo at deadline, as attempt (1 for a window's end); when undo fails, it is tried
+// armRevert runs undo of owner's NIC's change (empty: the primary's) at deadline, as attempt (1 for a window's end); when undo fails, it is tried
 // again every revertRetrySecs, revertAttempts times in all: the VM may be unreachable until it
 // succeeds. Any later change to the network disarms it (netDisarm).
-func (h *Hostd) armRevert(deadline time.Time, attempt int, why string, undo func(context.Context) error) {
+func (h *Hostd) armRevert(owner string, deadline time.Time, attempt int, why string, undo func(context.Context) error) {
 	h.netDisarm()
+	h.netOwner = owner
 	gen := h.netGen
 	h.netTimer = time.AfterFunc(time.Until(deadline), func() {
 		h.netFired.Store(int64(gen)) // a confirmation from now on comes too late
@@ -889,12 +1081,12 @@ func (h *Hostd) armRevert(deadline time.Time, attempt int, why string, undo func
 			return // disarmed while this waited for the lock
 		}
 		h.netTimer = nil
-		_ = h.undo(attempt, why, undo)
+		_ = h.undo(owner, attempt, why, undo)
 	})
 }
 
 // undo runs undo now, as attempt; when it fails, armRevert tries it again. netMu is held.
-func (h *Hostd) undo(attempt int, why string, undo func(context.Context) error) error {
+func (h *Hostd) undo(owner string, attempt int, why string, undo func(context.Context) error) error {
 	err := undo(h.ctx)
 	switch {
 	case err == nil:
@@ -903,7 +1095,7 @@ func (h *Hostd) undo(attempt int, why string, undo func(context.Context) error) 
 		h.O.logf("undoing the network change (%s): %v; the daemon stops: its start undoes it", why, err)
 	case attempt < revertAttempts:
 		h.O.logf("undoing the network change (%s, attempt %d of %d): %v; trying again in %d s", why, attempt, revertAttempts, err, revertRetrySecs)
-		h.armRevert(time.Now().Add(revertRetrySecs*h.unit()), attempt+1, why, undo)
+		h.armRevert(owner, time.Now().Add(revertRetrySecs*h.unit()), attempt+1, why, undo)
 	default:
 		h.O.logf("undoing the network change (%s): %v; given up after %d attempts", why, err, revertAttempts)
 	}
@@ -913,6 +1105,7 @@ func (h *Hostd) undo(attempt int, why string, undo func(context.Context) error) 
 // netDisarm stops the armed revert, one whose timer already fired included. netMu is held.
 func (h *Hostd) netDisarm() {
 	h.netGen++
+	h.netOwner = ""
 	if h.netTimer != nil {
 		h.netTimer.Stop()
 		h.netTimer = nil
@@ -922,9 +1115,8 @@ func (h *Hostd) netDisarm() {
 // revertWindow undoes the change awaiting confirmation in the window id: the settings before it are
 // recorded, then rendered and applied. Once recorded, a later attempt renders and applies the state
 // again. netMu is held.
-func (h *Hostd) revertWindow(id string) func(context.Context) error {
+func (h *Hostd) revertWindow(f netFiles, id string) func(context.Context) error {
 	return func(ctx context.Context) error {
-		f := h.netFiles()
 		st, err := f.read()
 		if err != nil {
 			return err
@@ -938,20 +1130,28 @@ func (h *Hostd) revertWindow(id string) func(context.Context) error {
 				return err
 			}
 		}
-		live, _ := h.netLive(ctx)
-		return h.netApply(ctx, st.Config, st, live.Interface)
+		return h.netApply(ctx, f, st.Config, h.netIface(ctx, f))
 	}
+}
+
+// netIface is the interface f's override applies on: a secondary's role, the primary's default
+// route's.
+func (h *Hostd) netIface(ctx context.Context, f netFiles) string {
+	if f.role != "" {
+		return f.role
+	}
+	live, _ := h.netLive(ctx)
+	return live.Interface
 }
 
 // restore records c (nil: the cloud-config's settings) as the override, with no window, and
 // applies it on iface. netMu is held.
-func (h *Hostd) restore(c *NetConfig, iface string) func(context.Context) error {
+func (h *Hostd) restore(f netFiles, c *NetConfig, iface string) func(context.Context) error {
 	return func(ctx context.Context) error {
-		st := netState{Config: c}
-		if err := h.netFiles().write(st); err != nil {
+		if err := f.write(netState{Config: c}); err != nil {
 			return err
 		}
-		return h.netApply(ctx, c, st, iface)
+		return h.netApply(ctx, f, c, iface)
 	}
 }
 
@@ -965,27 +1165,30 @@ func (h *Hostd) NetResume() {
 
 // netResume is NetResume with netMu held.
 func (h *Hostd) netResume() {
-	f := h.netFiles()
-	st, err := f.read()
-	if err != nil {
-		h.O.logf("the network override: %v", err)
-		return
-	}
-	if st.Pending != nil {
-		_ = h.undo(1, "the host daemon restarted before it was confirmed", h.revertWindow(st.Pending.ID))
-		return
-	}
-	// A daemon stopped between recording a change and applying it left networkd on another: the
-	// record is applied again.
-	want := ""
-	if st.Config != nil {
-		want = renderNetwork(f.name, f.ctl, f.match, *st.Config)
-	}
-	if got, _ := os.ReadFile(f.overrideUnit()); string(got) != want {
-		_ = h.undo(1, "the networkd file differs from the record", func(ctx context.Context) error {
-			live, _ := h.netLive(ctx)
-			return h.netApply(ctx, st.Config, st, live.Interface)
-		})
+	for _, f := range h.netFiles().all() {
+		st, err := f.read()
+		if err != nil {
+			h.O.logf("%s: %v", f.what(), err)
+			continue
+		}
+		if st.Pending != nil {
+			_ = h.undo(f.role, 1, "the host daemon restarted before it was confirmed", h.revertWindow(f, st.Pending.ID))
+			continue
+		}
+		// A daemon stopped between recording a change and applying it left networkd on another: the
+		// record is applied again, once — the one revert timer is the pending change's, whose retries
+		// another NIC's must not disarm; the boot renders the record again.
+		want := ""
+		if st.Config != nil {
+			want = f.unit(*st.Config)
+		}
+		if got, _ := os.ReadFile(f.overrideUnit()); string(got) != want {
+			if err := h.netApply(h.ctx, f, st.Config, h.netIface(h.ctx, f)); err != nil {
+				h.O.logf("%s: applying the record again, as the networkd file differs from it: %v", f.what(), err)
+			} else {
+				h.O.logf("%s: applied again, as the networkd file differed from the record", f.what())
+			}
+		}
 	}
 }
 
@@ -1018,21 +1221,86 @@ func (h *Hostd) network(w http.ResponseWriter, r *http.Request) {
 	case fileExists(filepath.Join(f.networkd, staticUnit(f.name))):
 		n.Source = "install"
 	}
-	n.Pending = h.pending(st)
+	n.Pending = h.pending(f, st)
+	var links []ipLink
+	if len(f.roles) > 0 {
+		if links, err = h.links(r.Context()); err != nil {
+			replyErr(w, err)
+			return
+		}
+	}
+	for _, role := range f.roles {
+		g := f.forRole(role)
+		rst, err := g.read()
+		rn := RoleNetwork{Role: role, Addresses: []string{}, Override: rst.Config}
+		if err != nil {
+			// The rest of the network answers: it is what an operator recovers with.
+			rn.Override, rn.Error = nil, err.Error()
+		}
+		for _, l := range links {
+			if l.Name == role {
+				rn.MAC, rn.Addresses = l.MAC, append(rn.Addresses, l.global()...)
+			}
+		}
+		n.Roles = append(n.Roles, rn)
+		if p := h.pending(g, rst); err == nil && p != nil {
+			n.Pending = p
+		}
+	}
 	reply(w, http.StatusOK, n)
 }
 
-// netChange checks a change may start: no reboot scheduled, no change awaiting confirmation. It
-// returns the state. netMu is held.
-func (h *Hostd) netChange() (netState, error) {
-	if err := h.noReboot(); err != nil {
+// netChange checks a change of f's override may start (netIdle, and f's record reads and holds no
+// change awaiting confirmation). It returns f's state. netMu is held.
+func (h *Hostd) netChange(f netFiles) (netState, error) {
+	if err := h.netIdle(f); err != nil {
 		return netState{}, err
 	}
-	st, err := h.netFiles().read()
+	st, err := f.read()
 	if err != nil {
 		return st, err
 	}
-	return st, h.noPending(st)
+	return st, h.noPending(f, st)
+}
+
+// netIdle checks no other NIC holds the network: no reboot scheduled, every NIC's record
+// read (one that does not may hold a change awaiting confirmation: its error names the `network
+// reset` that drops it, which never waits), none awaiting confirmation, and no revert armed for
+// another NIC's change (a change here would disarm it). netMu is held.
+func (h *Hostd) netIdle(f netFiles) error {
+	if err := h.noReboot(); err != nil {
+		return err
+	}
+	// Every record read before any is judged: the one that does not read (f's own included) is the
+	// fix to name first.
+	var others []netState
+	for _, g := range f.all() {
+		st, err := g.read()
+		if err != nil {
+			return err
+		}
+		others = append(others, st)
+	}
+	for i, g := range f.all() {
+		if g.role == f.role {
+			continue
+		}
+		if err := h.noPending(g, others[i]); err != nil {
+			return err
+		}
+	}
+	if h.netTimer != nil && h.netOwner != f.role {
+		return fail(http.StatusConflict, "%s's network change has a revert armed (at its window's end, or tried again every %d s while it fails, %d times in all): change the network once it ran, or change or reset %s's first, which replaces it", nicName(h.netOwner), revertRetrySecs, revertAttempts, nicName(h.netOwner))
+	}
+	return nil
+}
+
+// nicName names a NIC by its role in a message: empty is the primary.
+func nicName(role string) string {
+	if role == "" {
+		return "the primary NIC"
+	}
+	return role
 }
 
 // noReboot refuses a change once a reboot is scheduled.
@@ -1045,22 +1313,21 @@ func (h *Hostd) noReboot() error {
 	return nil
 }
 
-// noPending refuses a change while another awaits confirmation.
-func (h *Hostd) noPending(st netState) error {
+// noPending refuses a change while f's NIC's awaits confirmation.
+func (h *Hostd) noPending(f netFiles, st netState) error {
 	if st.Pending != nil {
-		return fail(http.StatusConflict, "a network change awaits confirmation: `%s network confirm` keeps it, `%s network revert` undoes it", h.R.Ctl(), h.R.Ctl())
+		return fail(http.StatusConflict, "%s's network change awaits confirmation: `%s network confirm` keeps it, `%s network revert` undoes it", nicName(f.role), h.R.Ctl(), h.R.Ctl())
 	}
 	return nil
 }
 
-// netSet makes next (nil: the cloud-config's settings) the override. When it may move the VM and
+// netSet makes next (nil: the cloud-config's settings) f's override. When it may move the VM and
 // secs is not 0, it is recorded as awaiting confirmation, and its window armed, before networkd
 // sees it. A change that fails is undone at once. netMu is held.
-func (h *Hostd) netSet(cur, next *NetConfig, secs int, arm bool) (netState, error) {
-	f := h.netFiles()
+func (h *Hostd) netSet(f netFiles, cur, next *NetConfig, secs int, arm bool) (netState, error) {
 	// A revert still being tried belongs to the change this one replaces.
 	h.netDisarm()
-	live, _ := h.netLive(h.ctx)
+	iface := h.netIface(h.ctx, f)
 	st := netState{Config: next}
 	if arm && secs > 0 {
 		st.Pending = &netPending{ID: rand.Text(), Deadline: time.Now().Add(time.Duration(secs) * h.unit()), Previous: cur}
@@ -1069,13 +1336,13 @@ func (h *Hostd) netSet(cur, next *NetConfig, secs int, arm bool) (netState, erro
 		return st, err
 	}
 	if st.Pending != nil {
-		h.armRevert(st.Pending.Deadline, 1, "not confirmed in time", h.revertWindow(st.Pending.ID))
+		h.armRevert(f.role, st.Pending.Deadline, 1, "not confirmed in time", h.revertWindow(f, st.Pending.ID))
 	}
 	// The daemon's context, not the request's: a client that goes away (its SSH session cut by
 	// the change itself) does not make a change that worked fail.
-	if err := h.netApply(h.ctx, next, st, live.Interface); err != nil {
+	if err := h.netApply(h.ctx, f, next, iface); err != nil {
 		h.netDisarm()
-		if uerr := h.undo(1, "it could not be applied", h.restore(cur, live.Interface)); uerr != nil {
+		if uerr := h.undo(f.role, 1, "it could not be applied", h.restore(f, cur, iface)); uerr != nil {
 			return st, fmt.Errorf("%w; restoring the settings before it failed too, and is tried again every %d s: %v", err, revertRetrySecs, uerr)
 		}
 		return st, fmt.Errorf("%w: the settings before it are back", err)
@@ -1083,17 +1350,22 @@ func (h *Hostd) netSet(cur, next *NetConfig, secs int, arm bool) (netState, erro
 	return st, nil
 }
 
-// dropUnreadable removes the state file that did not read and applies the cloud-config's
+// dropUnreadable removes f's state file that did not read and applies the cloud-config's
 // settings. netMu is held.
-func (h *Hostd) dropUnreadable(why error) error {
-	h.netDisarm()
-	f := h.netFiles()
+func (h *Hostd) dropUnreadable(f netFiles, why error) error {
+	if h.netTimer != nil && h.netOwner == f.role {
+		h.netDisarm() // a revert of f's record, which goes
+	}
+	// Applied first, then removed: a drop that fails leaves the record that does not read, so a
+	// re-run drops it again.
+	if err := h.netApply(h.ctx, f, nil, h.netIface(h.ctx, f)); err != nil {
+		return err
+	}
 	if err := os.Remove(f.state); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	h.O.logf("the network override did not read (%v): dropped", why)
-	live, _ := h.netLive(h.ctx)
-	return h.netApply(h.ctx, nil, netState{}, live.Interface)
+	h.O.logf("%s did not read (%v): dropped", f.what(), why)
+	return nil
 }
 
 // NetAnswer is what the network changes answer.
@@ -1103,17 +1375,17 @@ type NetAnswer struct {
 	Pending  *NetPending `json:"pending,omitempty"`
 }
 
-func (h *Hostd) answer(st netState, msg string) NetAnswer {
-	return NetAnswer{Message: msg, Override: st.Config, Pending: h.pending(st)}
+func (h *Hostd) answer(f netFiles, st netState, msg string) NetAnswer {
+	return NetAnswer{Message: msg, Override: st.Config, Pending: h.pending(f, st)}
 }
 
-// pending is st's change awaiting confirmation, as the API tells it.
-func (h *Hostd) pending(st netState) *NetPending {
+// pending is f's state st's change awaiting confirmation, as the API tells it.
+func (h *Hostd) pending(f netFiles, st netState) *NetPending {
 	p := st.Pending
 	if p == nil {
 		return nil
 	}
-	return &NetPending{Previous: p.Previous, Deadline: p.Deadline, SecsLeft: max(int(time.Until(p.Deadline)/h.unit()), 0)}
+	return &NetPending{Role: f.role, Previous: p.Previous, Deadline: p.Deadline, SecsLeft: max(int(time.Until(p.Deadline)/h.unit()), 0)}
 }
 
 func (h *Hostd) setNetwork(w http.ResponseWriter, r *http.Request) {
@@ -1122,7 +1394,12 @@ func (h *Hostd) setNetwork(w http.ResponseWriter, r *http.Request) {
 		replyErr(w, err)
 		return
 	}
-	next, err := validNet(req.NetConfig)
+	f, err := h.roleFiles(req.Role)
+	if err != nil {
+		replyErr(w, err)
+		return
+	}
+	next, err := f.valid(req.NetConfig)
 	if err != nil {
 		replyErr(w, fail(http.StatusBadRequest, "%v", err))
 		return
@@ -1134,13 +1411,25 @@ func (h *Hostd) setNetwork(w http.ResponseWriter, r *http.Request) {
 	}
 	h.netMu.Lock()
 	defer h.netMu.Unlock()
-	cur, err := h.netChange()
+	cur, err := h.netChange(f)
 	if err != nil {
 		replyErr(w, err)
 		return
 	}
+	if f.role != "" {
+		// The override matches the NIC by the name its role gives it.
+		links, err := h.links(r.Context())
+		if err != nil {
+			replyErr(w, err)
+			return
+		}
+		if !slices.ContainsFunc(links, func(l ipLink) bool { return l.Name == f.role }) {
+			replyErr(w, fail(http.StatusConflict, "role %s: no NIC is named so on this VM: `vm attach` attaches one (`network attach` names it from the next boot)", f.role))
+			return
+		}
+	}
 	arm := addressing(cur.Config, next)
-	st, err := h.netSet(cur.Config, &next, secs, arm)
+	st, err := h.netSet(f, cur.Config, &next, secs, arm)
 	if err != nil {
 		replyErr(w, err)
 		return
@@ -1152,7 +1441,26 @@ func (h *Hostd) setNetwork(w http.ResponseWriter, r *http.Request) {
 	case arm:
 		msg = "applied, without a revert window"
 	}
-	reply(w, http.StatusOK, h.answer(st, msg))
+	reply(w, http.StatusOK, h.answer(f, st, msg))
+}
+
+// roleFiles are the files of the override a request names: a role is one of the release's
+// secondary NICs, empty the primary.
+func (h *Hostd) roleFiles(role string) (netFiles, error) {
+	f := h.netFiles()
+	if role == "" {
+		return f, nil
+	}
+	_, primary := secondaryNICs(h.R.Spec)
+	switch {
+	case role == primary:
+		return f, fail(http.StatusBadRequest, "role %s is the primary NIC: `%s network set` and `network reset` without --role address it", role, h.R.Ctl())
+	case len(f.roles) == 0:
+		return f, fail(http.StatusBadRequest, "role %s: %s declares no secondary NIC (host.interfaces)", role, h.R.Spec.Name)
+	case !slices.Contains(f.roles, role):
+		return f, fail(http.StatusBadRequest, "role %s: not one of %s's secondary NICs (%s)", role, h.R.Spec.Name, strings.Join(f.roles, ", "))
+	}
+	return f.forRole(role), nil
 }
 
 func (h *Hostd) confirmNetwork(w http.ResponseWriter, r *http.Request) {
@@ -1169,8 +1477,7 @@ func (h *Hostd) confirmNetwork(w http.ResponseWriter, r *http.Request) {
 // confirm keeps the change awaiting confirmation. One whose window ended — its timer fired, and
 // waits for netMu — is undone instead. netMu is held.
 func (h *Hostd) confirm() (NetAnswer, error) {
-	f := h.netFiles()
-	st, err := f.read()
+	f, st, err := h.pendingFiles()
 	if err != nil {
 		return NetAnswer{}, err
 	}
@@ -1179,7 +1486,7 @@ func (h *Hostd) confirm() (NetAnswer, error) {
 	}
 	if p := st.Pending; h.netGen != 0 && h.netFired.Load() == int64(h.netGen) {
 		h.netDisarm()
-		if err := h.undo(1, "not confirmed in time", h.revertWindow(p.ID)); err != nil {
+		if err := h.undo(f.role, 1, "not confirmed in time", h.revertWindow(f, p.ID)); err != nil {
 			return NetAnswer{}, fail(http.StatusConflict, "the change's window ended: undoing it failed, and is tried again every %d s: %v", revertRetrySecs, err)
 		}
 		return NetAnswer{}, fail(http.StatusConflict, "the change's window ended: the settings before it are back")
@@ -1190,17 +1497,36 @@ func (h *Hostd) confirm() (NetAnswer, error) {
 		return NetAnswer{}, err
 	}
 	h.netDisarm()
-	if err := f.writeBanner(st); err != nil {
+	if err := f.writeBanner(); err != nil {
 		h.O.logf("the console banner: %v", err)
 	}
 	h.reloadBanner(h.ctx)
-	return h.answer(st, "confirmed"), nil
+	return h.answer(f, st, "confirmed"), nil
+}
+
+// pendingFiles are the files of the override whose change awaits confirmation, and its state (no
+// pending change: the primary's). A record that does not read is an error, naming the `network
+// reset` that drops it (which never waits): it may hold that change. netMu is held.
+func (h *Hostd) pendingFiles() (netFiles, netState, error) {
+	all := h.netFiles().all()
+	var found netState
+	at := all[0]
+	for _, f := range all {
+		st, err := f.read()
+		if err != nil {
+			return f, st, err
+		}
+		if st.Pending != nil {
+			found, at = st, f
+		}
+	}
+	return at, found, nil
 }
 
 func (h *Hostd) revertNetwork(w http.ResponseWriter, r *http.Request) {
 	h.netMu.Lock()
 	defer h.netMu.Unlock()
-	st, err := h.netFiles().read()
+	f, st, err := h.pendingFiles()
 	if err != nil {
 		replyErr(w, err)
 		return
@@ -1210,17 +1536,22 @@ func (h *Hostd) revertNetwork(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.netDisarm()
-	if err := h.undo(1, "asked", h.revertWindow(st.Pending.ID)); err != nil {
+	if err := h.undo(f.role, 1, "asked", h.revertWindow(f, st.Pending.ID)); err != nil {
 		replyErr(w, fmt.Errorf("%w (tried again every %d s)", err, revertRetrySecs))
 		return
 	}
-	st, _ = h.netFiles().read()
-	reply(w, http.StatusOK, h.answer(st, "reverted"))
+	st, _ = f.read()
+	reply(w, http.StatusOK, h.answer(f, st, "reverted"))
 }
 
 func (h *Hostd) resetNetwork(w http.ResponseWriter, r *http.Request) {
 	var req NetResetRequest
 	if err := decodeBody(r, &req); err != nil {
+		replyErr(w, err)
+		return
+	}
+	f, err := h.roleFiles(req.Role)
+	if err != nil {
 		replyErr(w, err)
 		return
 	}
@@ -1235,33 +1566,35 @@ func (h *Hostd) resetNetwork(w http.ResponseWriter, r *http.Request) {
 		replyErr(w, err)
 		return
 	}
-	cur, err := h.netFiles().read()
+	_, err = f.read()
 	if bad := (unreadable{}); errors.As(err, &bad) {
 		// A record that does not read sets nothing at boot already: reset drops it, with no
-		// window, as there is nothing to go back to.
-		if err := h.dropUnreadable(bad.err); err != nil {
+		// window, as there is nothing to go back to — whatever another NIC does, as every other
+		// verb names this one to recover.
+		if err := h.dropUnreadable(f, bad.err); err != nil {
 			replyErr(w, err)
 			return
 		}
-		reply(w, http.StatusOK, h.answer(netState{}, fmt.Sprintf("the override did not read (%v): dropped, the cloud-config's settings apply", bad.err)))
+		reply(w, http.StatusOK, h.answer(f, netState{}, fmt.Sprintf("the override did not read (%v): dropped, %s apply", bad.err, f.base())))
 		return
 	}
-	if err := h.noPending(cur); err != nil {
-		replyErr(w, err)
-		return
-	}
-	if cur.Config == nil {
-		reply(w, http.StatusOK, h.answer(cur, "no override: the cloud-config's settings apply"))
-		return
-	}
-	st, err := h.netSet(cur.Config, nil, secs, true)
+	cur, err := h.netChange(f)
 	if err != nil {
 		replyErr(w, err)
 		return
 	}
-	msg := "back to the cloud-config's settings"
+	if cur.Config == nil {
+		reply(w, http.StatusOK, h.answer(f, cur, "no override: "+f.base()+" apply"))
+		return
+	}
+	st, err := h.netSet(f, cur.Config, nil, secs, true)
+	if err != nil {
+		replyErr(w, err)
+		return
+	}
+	msg := "back to " + f.base()
 	if st.Pending != nil {
 		msg += fmt.Sprintf(": `%s network confirm` keeps them within %d s, else the override comes back", h.R.Ctl(), secs)
 	}
-	reply(w, http.StatusOK, h.answer(st, msg))
+	reply(w, http.StatusOK, h.answer(f, st, msg))
 }

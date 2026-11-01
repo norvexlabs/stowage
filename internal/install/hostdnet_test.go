@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
@@ -40,7 +41,14 @@ type fakeLink struct {
 	// stuck: a reload applies nothing. reloadFails fails that many reloads.
 	stuck       bool
 	reloadFails int
+	// nics are the secondary links by name, with the address each has without an override ("":
+	// none); nicAddr what each runs, from its override in run, the secondaries' networkd directory.
+	nics, nicAddr map[string]string
+	run           string
 }
+
+// nicLease is the address a secondary link's DHCP gives.
+const nicLease = "198.51.100.7/24"
 
 const (
 	leaseAddr = "10.0.0.50/24"
@@ -96,16 +104,41 @@ func (f *fakeLink) Run(ctx context.Context, c Cmd) ([]byte, error) {
 			local6, prefix6, _ := strings.Cut(f.addr6, "/")
 			v6 += fmt.Sprintf(`,{"family":"inet6","local":%q,"prefixlen":%s,"scope":"global","tentative":%t,"dadfailed":%[3]t}`, local6, prefix6, f.addr6 == f.taken)
 		}
+		nics := ""
+		for _, n := range slices.Sorted(maps.Keys(f.nicAddr)) {
+			info := ""
+			if a := f.nicAddr[n]; a != "" {
+				l, p, _ := strings.Cut(a, "/")
+				info = fmt.Sprintf(`{"family":"inet","local":%q,"prefixlen":%s,"scope":"global"}`, l, p)
+			}
+			nics += fmt.Sprintf(`,{"ifname":%q,"address":"02:00:00:00:00:0%d","addr_info":[%s]}`, n, len(n), info)
+		}
 		return fmt.Appendf(nil, `[{"ifname":"lo","addr_info":[{"family":"inet","local":"127.0.0.1","prefixlen":8,"scope":"host"}]},
-			{"ifname":"ens3","address":"52:54:00:12:34:56","addr_info":[{"family":"inet","local":%q,"prefixlen":%s,"scope":"global"},%s]}]`, local, prefix, v6), nil
+			{"ifname":"ens3","address":"52:54:00:12:34:56","addr_info":[{"family":"inet","local":%q,"prefixlen":%s,"scope":"global"},%s]}%s]`, local, prefix, v6, nics), nil
 	case "resolvectl dns":
 		return []byte("Global:\nLink 2 (ens3): " + strings.Join(f.dns, " ") + "\n"), nil
 	}
 	return nil, nil
 }
 
-// apply runs the first .network file, as networkd does.
+// apply runs the first .network file, as networkd does, and each secondary link's override.
 func (f *fakeLink) apply() {
+	for n, base := range f.nics {
+		f.nicAddr[n] = base
+		raw, err := os.ReadFile(filepath.Join(f.run, "09-notes-"+n+"-override.network"))
+		if err != nil {
+			continue
+		}
+		f.nicAddr[n] = ""
+		for l := range strings.SplitSeq(string(raw), "\n") {
+			switch k, v, _ := strings.Cut(l, "="); {
+			case k == "Address":
+				f.nicAddr[n] = v
+			case l == "DHCP=ipv4":
+				f.nicAddr[n] = nicLease
+			}
+		}
+	}
 	files, _ := filepath.Glob(filepath.Join(f.dir, "*.network"))
 	sort.Strings(files)
 	f.addr, f.gw, f.dns = leaseAddr, leaseGW, []string{leaseGW}
@@ -162,7 +195,7 @@ func (f *fakeLink) live() (string, string, []string) {
 // netDaemon is a host daemon whose network is link's.
 func netDaemon(t *testing.T, link *fakeLink) *Hostd {
 	h := &Hostd{R: testRelease(t, "1.0.0"), O: Options{Dir: t.TempDir(), Log: io.Discard}, Host: link, Unit: time.Millisecond,
-		Networkd: link.dir, Issue: t.TempDir(), InstallNet: filepath.Join(t.TempDir(), "install-network.yaml"), ctx: context.Background()}
+		Networkd: link.dir, RunNetworkd: t.TempDir(), Issue: t.TempDir(), InstallNet: filepath.Join(t.TempDir(), "install-network.yaml"), ctx: context.Background()}
 	return h
 }
 
@@ -676,7 +709,7 @@ func TestTheDaemonStartingUndoesAChangeNotConfirmed(t *testing.T) {
 func TestTheBootUndoesAChangeNotConfirmed(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
-	f := netFiles{name: "notes", ctl: "notes-stow", state: NetworkFile(dir), networkd: t.TempDir(), issue: t.TempDir()}
+	f := newNetFiles("notes", "notes-stow", dir, t.TempDir(), t.TempDir(), t.TempDir(), nil)
 	prev := &NetConfig{Mode: "static", Address: "10.0.0.60/24", Gateway: "10.0.0.1"}
 	if err := f.write(netState{Config: &NetConfig{Mode: "dhcp"}, Pending: &netPending{ID: "w", Deadline: time.Now().Add(time.Hour), Previous: prev}}); err != nil {
 		t.Fatal(err)
@@ -715,7 +748,7 @@ func TestTheBootUndoesAChangeNotConfirmed(t *testing.T) {
 func TestAStateFileThatDoesNotReadSetsNothing(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
-	f := netFiles{name: "notes", ctl: "notes-stow", state: NetworkFile(dir), networkd: t.TempDir(), issue: t.TempDir()}
+	f := newNetFiles("notes", "notes-stow", dir, t.TempDir(), t.TempDir(), t.TempDir(), nil)
 	if err := os.WriteFile(f.overrideUnit(), []byte("[Network]\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -962,7 +995,7 @@ func TestNoRetryOnceTheDaemonStops(t *testing.T) {
 	h.ctx = ctx
 	h.netMu.Lock()
 	defer h.netMu.Unlock()
-	if err := h.undo(1, "a test", h.restore(nil, "ens3")); err == nil {
+	if err := h.undo("", 1, "a test", h.restore(h.netFiles(), nil, "ens3")); err == nil {
 		t.Fatal("undone on a stopped daemon")
 	}
 	if h.netTimer != nil {
@@ -1072,6 +1105,12 @@ func TestNetworkOverTheSocket(t *testing.T) {
 	}
 	if _, err = ctl(e, sock, "network", "set", "--address", "10.0.0.60/24"); err == nil || !strings.Contains(err.Error(), `"mode" not set`) {
 		t.Errorf("no --mode: %v", err)
+	}
+	// --role reaches the daemon, which knows no secondary NIC of this release.
+	for _, verb := range [][]string{{"set", "--role", "edge", "--mode", "none"}, {"reset", "--role", "edge"}} {
+		if _, err = ctl(e, sock, append([]string{"network"}, verb...)...); err == nil || !strings.Contains(err.Error(), "role edge: notes declares no secondary NIC") {
+			t.Errorf("%v: %v", verb, err)
+		}
 	}
 	if out, err = ctl(e, sock, "network", "--json"); err != nil {
 		t.Fatal(err)
