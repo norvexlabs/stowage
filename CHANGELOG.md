@@ -3,7 +3,7 @@
 Stowage's own releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
-## [0.21.1]
+## [0.21.1] - 2026-11-01
 
 ### Fixed
 - An upgrade on the VM to a release whose services no longer reach the host daemon (none in
