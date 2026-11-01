@@ -2,6 +2,7 @@ package lint
 
 import (
 	"fmt"
+	"maps"
 	"net/netip"
 	"os"
 	"path"
@@ -32,9 +33,11 @@ func (l *linter) serviceHost(at, name string, svc spec.Service) {
 	default:
 		l.errf(at+".irq", "%q: %s (the default: the NICs' interrupts off its cores) or %s", svc.IRQ, spec.IRQOff, spec.IRQOn)
 	}
+	var table string
 	if f := svc.Nftables; f != "" {
-		l.nftTable(at+".nftables", name, f)
+		table = l.nftTable(at+".nftables", name, f)
 	}
+	l.serviceSets(at, name, svc, table)
 	l.serviceNetwork(at, name, svc)
 	l.frontHosts(at, name, svc)
 	switch {
@@ -64,6 +67,69 @@ func (l *linter) serviceHost(at, name string, svc spec.Service) {
 			if s, ok := l.compose.Services[name]; ok && s.NetworkMode != "" {
 				l.errf(at+".interface", "%s runs with network_mode %s: its address of its own is a network beside the stack's", name, s.NetworkMode)
 			}
+		}
+	}
+}
+
+// serviceSets checks the sets a service fills from inputs (sets: each a set its table, text,
+// declares, from an input the firewall may show) and the tables it feeds (feeds: other services'
+// tables, fed through the VM's app socket, which shapes.kairos.host_api gives it).
+func (l *linter) serviceSets(at, name string, svc spec.Service, text string) {
+	if svc.Sets != nil {
+		w := at + ".sets"
+		switch {
+		case len(svc.Sets) == 0:
+			l.errf(w, "is empty: leave it out, or name a set of the table and the input filling it")
+		case svc.Nftables == "":
+			l.errf(w, "fills the sets of %s's own table: give it nftables", name)
+		}
+		for _, set := range slices.Sorted(maps.Keys(svc.Sets)) {
+			ws, key := w+"."+set, svc.Sets[set]
+			if text != "" && !slices.Contains(spec.NftSets(text), set) {
+				l.errf(ws, "the table inet %s declares no set %s", name, set)
+			}
+			in, ok := l.s.Input(key)
+			switch {
+			case !ok:
+				l.errf(ws, "%s is not an input", key)
+			case in.Secret:
+				l.errf(ws, "%s is secret: the firewall's rules show it", key)
+			case in.When != "":
+				l.errf(ws, "%s is asked only when %s: the set is filled in every mode", key, in.When)
+			case in.Profile != "":
+				l.errf(ws, "%s is asked only with the profile %s: the set is filled on every install", key, in.Profile)
+			case len(in.Shapes) > 0 && (l.s.Shapes.Docker != nil && !slices.Contains(in.Shapes, "docker") || l.s.Shapes.Kairos != nil && !slices.Contains(in.Shapes, "kairos")):
+				l.errf(ws, "%s must be asked on every shape the table loads on (docker and kairos the project has): an install not asked it fills the set with nothing", key)
+			case in.Default != "" && !strings.Contains(in.Default, "${"):
+				if _, err := spec.SetElements(in.Default); err != nil {
+					l.errf(ws, "%s's default: %v", key, err)
+				}
+			}
+		}
+	}
+	kairos := l.s.Shapes.Kairos
+	if svc.Feeds != nil {
+		w := at + ".feeds"
+		if len(svc.Feeds) == 0 {
+			l.errf(w, "is empty: leave it out, or name the services whose tables' sets %s feeds", name)
+		}
+		for i, f := range svc.Feeds {
+			wi := fmt.Sprintf("%s[%d]", w, i)
+			other, ok := l.s.Services[f]
+			switch {
+			case f == name:
+				l.errf(wi, "is %s itself: a load of its own table recreates it already", name)
+			case slices.Index(svc.Feeds, f) < i:
+				l.errf(wi, "%s is given twice", f)
+			case !ok || other.Nftables == "":
+				l.errf(wi, "%s has no nftables table (services.%s.nftables)", f, f)
+			}
+		}
+		switch {
+		case kairos == nil:
+			l.warnf(w, "only the VM's app socket feeds a table's sets (a kairos shape)")
+		case !slices.Contains(kairos.HostAPI, name):
+			l.warnf(w, "%s feeds the sets through the app socket, which shapes.kairos.host_api does not give it", name)
 		}
 	}
 }
@@ -502,35 +568,39 @@ func emptyList(v any) bool {
 
 // nftTable checks a service's nftables file: inside the project, holding one table, `table inet
 // <service>`, and nothing beside it (no include, no flush of the ruleset or of another table): the
-// host's firewall stays Stowage's. The OS bundle's build and the VM check its syntax with nft.
-func (l *linter) nftTable(at, service, rel string) {
+// host's firewall stays Stowage's. The OS bundle's build and the VM check its syntax with nft. It
+// returns the table's text when the file holds one, else nothing.
+func (l *linter) nftTable(at, service, rel string) string {
 	path, err := spec.ProjectPath(l.root, rel)
 	if err != nil {
 		l.errf(at, "%v", err)
-		return
+		return ""
 	}
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		l.errf(at, "%v", err)
-		return
+		return ""
 	}
 	if service == l.s.Name {
 		l.errf(at, "the service %s has the project's name: its table inet %s would be the VM's own firewall's", service, service)
-		return
+		return ""
 	}
 	if spec.NftKeyword(service) {
 		l.errf(at, "the service's name %q is a word of nft's own: its table needs another name", service)
-		return
+		return ""
 	}
 	if !spec.NftTableName.MatchString(service) {
 		l.errf(at, "the service's name %q is no nftables table's: a letter, then letters, digits and _ - . /", service)
-		return
+		return ""
 	}
 	if err := CheckNftTable(string(raw), service); err != nil {
 		l.errf(at, "%s: %v", rel, err)
-	} else if nftDropsInput(string(raw)) {
+		return ""
+	}
+	if nftDropsInput(string(raw)) {
 		l.warnf(at, "%s: a chain hooks the input with a drop policy: a base chain of any table judges every packet, so it drops what the VM's own firewall accepts (SSH, the stack's ports) unless it accepts them itself", rel)
 	}
+	return string(raw)
 }
 
 // nftTokens are an nftables file's tokens as nft lexes them where it matters here: a quoted

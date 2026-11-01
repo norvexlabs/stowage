@@ -179,6 +179,9 @@ type Installer struct {
 	removeDir bool
 	// tuned is the host's tune.System once its engine read: one `docker info` per run.
 	tuned *tune.System
+	// setsWarned is the release this run warned of the sets only the VM's app socket feeds
+	// (warnSocketFed).
+	setsWarned *Release
 	// networks is the digest of the stack's networks this start runs (NetworksFile), once read;
 	// prevNetworks the last start's that came up, as takeNetworks read it (prevNetworksErr when it
 	// could not); networksMoved is set once this start may have changed the engine's networks.
@@ -1338,7 +1341,7 @@ func (in *Installer) up(ctx context.Context, env *EnvFile) (err error) {
 		hn.domains = hostDomains(in.R.Spec.Front, mode, func(k string) string { v, _ := env.Get(k); return v })
 		// The services' tables first: a table a start loads gives its service the label that
 		// recreates it.
-		if err := in.loadTables(ctx); err != nil {
+		if err := in.loadTables(ctx, func(k string) string { v, _ := env.Get(k); return v }); err != nil {
 			return err
 		}
 		if err := in.gatewayStart(ctx, func(k string) string { v, _ := env.Get(k); return v }); err != nil {
@@ -1854,8 +1857,8 @@ func (in *Installer) openPorts(ctx context.Context, env *EnvFile, hn hostNet) er
 			}
 			daddr = family + " daddr " + a + " "
 		}
-		// A route on one interface is reached on it alone.
-		daddr = in.iif(r.Interface) + daddr
+		// A route on its interfaces is reached on them alone.
+		daddr = in.iif(r.Interfaces...) + daddr
 		if r.AllowInput == "" {
 			input = fmt.Appendf(input, "%s%s dport %d accept\n", daddr, r.Protocol, r.Port)
 			continue
@@ -2061,21 +2064,31 @@ func (in *Installer) forwardRoles(ctx context.Context, get func(string) string) 
 	return writeAtomic(record, bytes.NewReader(want), 0o644, nil)
 }
 
-// iif is the firewall's match of a rule on the host.interfaces role given, the interface's name;
-// none for every interface. It fails closed: a NIC role the VM's cloud-config names no NIC for (a
-// VM made by a release that named none) keeps its match, which no interface meets, warned — a port
-// meant for one interface is never opened on the others. A tun device is matched by its name
-// before its service opens it.
-func (in *Installer) iif(role string) string {
-	if role == "" {
-		return ""
-	}
-	if h := in.R.Spec.Host; h != nil {
-		if i, ok := h.Interfaces[role]; ok && i.Kind != spec.InterfaceTUN && !roleNamed(in.R.Spec.Name, role) {
-			in.O.logf("warning: no NIC of this VM is named %s (its cloud-config, from before its release named it, names none): its ports reach nothing, a VM made by this release (vm create --interface) names it", role)
+// iif is the firewall's match of a rule on the host.interfaces roles given, the interfaces' names
+// (iifname { … } for more than one); none (or only empty ones) for every interface. It fails
+// closed: a NIC role the VM's cloud-config names no NIC for (a VM made by a release that named
+// none) keeps its match, which no interface meets, warned — a port meant for some interfaces is
+// never opened on the others. A tun device is matched by its name before its service opens it.
+func (in *Installer) iif(roles ...string) string {
+	var names []string
+	for _, role := range roles {
+		if role == "" {
+			continue
 		}
+		if h := in.R.Spec.Host; h != nil {
+			if i, ok := h.Interfaces[role]; ok && i.Kind != spec.InterfaceTUN && !roleNamed(in.R.Spec.Name, role) {
+				in.O.logf("warning: no NIC of this VM is named %s (its cloud-config, from before its release named it, names none): its ports reach nothing, a VM made by this release (vm create --interface) names it", role)
+			}
+		}
+		names = append(names, strconv.Quote(role))
 	}
-	return fmt.Sprintf("iifname %q ", role)
+	switch len(names) {
+	case 0:
+		return ""
+	case 1:
+		return "iifname " + names[0] + " "
+	}
+	return "iifname { " + strings.Join(names, ", ") + " } "
 }
 
 // familySources splits an allowlist into its IPv4 and IPv6 prefixes, as the firewall's sets
@@ -2302,6 +2315,9 @@ func (in *Installer) inputList(mode string) []input {
 		domain := tls && slices.ContainsFunc(in.R.Spec.Front.Routes, func(r spec.Route) bool { return r.DomainInput == i.Key })
 		if domain {
 			check = in.domainCheck
+		}
+		if in.setInput(i.Key) {
+			check = chainChecks(check, checkSetElements)
 		}
 		out = append(out, input{i, check, domain})
 	}

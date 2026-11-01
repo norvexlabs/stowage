@@ -1607,7 +1607,20 @@ every shape, the VM end-to-end test upgrading through it), then the health gate.
   the VM replaces whole in one transaction (no doubled rule, no gap) when it is absent or changed,
   leaving the sets a service fed otherwise, a changed one recreating its service so it feeds them
   again, and deletes once the release drops it; the host's own table stays Stowage's, and the app socket feeds only
-  a declared set of a declared table, its elements checked before nft runs. The kernel keeps no
+  a declared set of a declared table, its elements checked before nft runs. The feeder is often
+  not the table's service: the socket's token upgrades, reboots and re-addresses the VM, so the
+  least-privilege stack gives it to a service its clients do not face, which `feeds` the proxy's
+  table. A feeder carries the fed table's load token in its label, so a load recreates it as it
+  does the table's own service: a recreate is the one signal every service already acts on, where
+  a journal event would ask each feeder to follow the events and a timer leaves the sets empty
+  until it fires. Operator settings held in a set (an allow-list) come from inputs (`sets`),
+  written at each start on every shape the table loads on: a Docker host serves no app socket (no
+  daemon runs there between starts), so an input is the one feed both shapes share. A set an input
+  fills is the input's alone (emptied first), so a re-run's change is the set's whole content. A
+  host-network service's ports are accepted from the stack's bridges as a whole, not per client
+  container: the containers' addresses are Docker's to give and change on a recreate, so a
+  per-source rule would need addresses Stowage does not own; lint warns instead where it matters,
+  a front route whose guard the service would then be reached past. The kernel keeps no
   table over a reboot while Docker's restart policy brings the containers back as soon as it
   starts, so a unit ordered before `docker.service` loads again the files the last start loaded
   (on the VM a unit of the OS bundle, as its tuning units are, its files on the persistent

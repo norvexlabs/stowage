@@ -188,6 +188,19 @@ func TestEachRuleFiresOnFull(t *testing.T) {
 		{"add_hosts twice", []edit{{sp, "[192.0.2.10, 192.0.2.11]", "[192.0.2.10, 192.0.2.10]"}}, nil, `images.api.add_hosts.packages.atlas.test[1]: 192.0.2.10 is given twice`},
 		{"transparent unknown role", []edit{{sp, "transparent: [vpn0]", "transparent: [vpn1]"}}, nil, `services.vpn.transparent[0]: "vpn1" is not one of host.interfaces`},
 		{"transparent twice", []edit{{sp, "transparent: [vpn0]", "transparent: [vpn0, vpn0]"}}, nil, "services.vpn.transparent[1]: vpn0 is given twice"},
+		{"set from a shape's input", []edit{{sp, `prompt: "Probe addresses ingest trusts, comma-separated (empty: none)", optional: true, shapes: [docker, kairos]`, `prompt: "Probe addresses ingest trusts, comma-separated (empty: none)", optional: true, shapes: [kairos]`}}, nil, "services.ingest.sets.trusted: TRUSTED_PROBES must be asked on every shape the table loads on"},
+		{"set from a profile's input", []edit{{sp, `prompt: "Probe addresses ingest trusts, comma-separated (empty: none)", optional: true`, `prompt: "Probe addresses ingest trusts, comma-separated (empty: none)", optional: true, profile: relay`}}, nil, "services.ingest.sets.trusted: TRUSTED_PROBES is asked only with the profile relay"},
+		{"sets empty", []edit{{sp, "sets: { trusted: TRUSTED_PROBES }", "sets: {}"}}, nil, "services.ingest.sets: is empty"},
+		{"set not in the table", []edit{{sp, "sets: { trusted: TRUSTED_PROBES }", "sets: { trusty: TRUSTED_PROBES }"}}, nil, "services.ingest.sets.trusty: the table inet ingest declares no set trusty"},
+		{"set from no input", []edit{{sp, "sets: { trusted: TRUSTED_PROBES }", "sets: { trusted: NO_SUCH }"}}, nil, "services.ingest.sets.trusted: NO_SUCH is not an input"},
+		{"set from a secret", []edit{{sp, `prompt: "Probe addresses ingest trusts, comma-separated (empty: none)", optional: true`, `prompt: "Probe addresses ingest trusts, comma-separated (empty: none)", optional: true, secret: true`}}, nil, "services.ingest.sets.trusted: TRUSTED_PROBES is secret"},
+		{"set from a mode's input", []edit{{sp, `prompt: "Probe addresses ingest trusts, comma-separated (empty: none)", optional: true`, `prompt: "Probe addresses ingest trusts, comma-separated (empty: none)", optional: true, when: tls`}}, nil, "services.ingest.sets.trusted: TRUSTED_PROBES is asked only when tls"},
+		{"set default", []edit{{sp, `prompt: "Probe addresses ingest trusts, comma-separated (empty: none)", optional: true`, `prompt: "Probe addresses ingest trusts, comma-separated (empty: none)", optional: true, default: "192.0.2.1; drop"`}}, nil, `services.ingest.sets.trusted: TRUSTED_PROBES's default: element "192.0.2.1; drop"`},
+		{"sets without a table", []edit{{sp, "api: { memory: 10, feeds", "api: { memory: 10, sets: { probes: TRUSTED_PROBES }, feeds"}}, nil, "services.api.sets: fills the sets of api's own table: give it nftables"},
+		{"feeds empty", []edit{{sp, "feeds: [ingest]", "feeds: []"}}, nil, "services.api.feeds: is empty"},
+		{"feeds twice", []edit{{sp, "feeds: [ingest]", "feeds: [ingest, ingest]"}}, nil, "services.api.feeds[1]: ingest is given twice"},
+		{"feeds no table", []edit{{sp, "feeds: [ingest]", "feeds: [echo]"}}, nil, "services.api.feeds[0]: echo has no nftables table (services.echo.nftables)"},
+		{"feeds itself", []edit{{sp, "sets: { trusted: TRUSTED_PROBES } }", "sets: { trusted: TRUSTED_PROBES }, feeds: [ingest] }"}}, nil, "services.ingest.feeds[0]: is ingest itself"},
 		{"transparent empty", []edit{{sp, "transparent: [vpn0]", "transparent: []"}}, nil, "services.vpn.transparent: is empty"},
 		{"transparent without a table", []edit{{sp, "nftables: deploy/vpn.nft, transparent", "transparent"}}, nil, "services.vpn.transparent: vpn's own table steers the traffic to its sockets: give it nftables"},
 		{"transparent off the host's network", []edit{{sp, "host_network: true, nftables: deploy/vpn.nft", "nftables: deploy/vpn.nft"}}, nil, "services.vpn.transparent: a transparent socket is on the host's network"},
@@ -444,7 +457,7 @@ func TestEachRuleFiresOnFull(t *testing.T) {
 		{"package name", []edit{{sp, "    tcpdump: {", "    -tcpdump: {"}}, nil, "host.packages.-tcpdump: not a package's name"},
 		{"package without a reason", []edit{{sp, "reason: \"capture on the VM's interfaces\"", "reason: \"\""}}, nil, "host.packages.tcpdump.reason: is required"},
 		{"firmware path", []edit{{sp, "    intel/ice/ddp/ice.pkg: {", "    intel/../ice.pkg: {"}}, nil, "host.firmware.intel/../ice.pkg: not a firmware file's path under /lib/firmware"},
-		{"interface name", []edit{{sp, "    edge:   ", "    Edge:   "}, {sp, "interface: edge }", "interface: Edge }"}, {sp, "{ interface: edge, address_input", "{ interface: Edge, address_input"}}, nil, "host.interfaces.Edge: not an interface's name"},
+		{"interface name", []edit{{sp, "    edge:   ", "    Edge:   "}, {sp, "interfaces: [edge] }", "interfaces: [Edge] }"}, {sp, "{ interface: edge, address_input", "{ interface: Edge, address_input"}}, nil, "host.interfaces.Edge: not an interface's name"},
 		{"interface named as the kernel names", []edit{{sp, "    vpn0: { kind: tun", "    eth1: { kind: tun"}}, nil, "host.interfaces.eth1: a name the kernel, udev or Docker gives"},
 		{"interface kind", []edit{{sp, "vpn0: { kind: tun,", "vpn0: { kind: wifi,"}}, nil, `host.interfaces.vpn0.kind: "wifi": nic (the default) or tun`},
 		{"no primary interface", []edit{{sp, "    uplink: { primary: true, ", "    uplink: { "}}, nil, "host.interfaces: 0 NICs are primary"},
@@ -456,7 +469,9 @@ func TestEachRuleFiresOnFull(t *testing.T) {
       routes`}}, nil, `host.interfaces.edge.routing_policy_rules[0].Table: "100; x": letters, digits`},
 		{"route of a policy rule's key", []edit{{sp, "routes: [{ Type: local,", "routes: [{ FirewallMark: local,"}}, nil, `host.interfaces.edge.routes[0]: "FirewallMark" is not one of networkd's settings here`},
 		{"front on an undeclared interface", []edit{{sp, "  interface: uplink ", "  interface: wan "}}, nil, `front.interface: "wan" is not one of host.interfaces`},
-		{"route on an undeclared interface", []edit{{sp, "interface: edge }", "interface: wan }"}}, nil, `l4.routes[1].interface: "wan" is not one of host.interfaces`},
+		{"route on an undeclared interface", []edit{{sp, "interfaces: [edge] }", "interfaces: [edge, wan] }"}}, nil, `l4.routes[1].interfaces[1]: "wan" is not one of host.interfaces`},
+		{"route on an interface twice", []edit{{sp, "interfaces: [edge] }", "interfaces: [edge, edge] }"}}, nil, "l4.routes[1].interfaces[1]: edge is given twice"},
+		{"route on no interface", []edit{{sp, "interfaces: [edge] }", "interfaces: [] }"}}, nil, "l4.routes[1].interfaces: is empty: leave it out to open the route on every interface"},
 		{"ethtool channels", []edit{{sp, "channels: { combined: max }", "channels: { combined: lots }"}}, nil, `host.interfaces.edge.ethtool.channels.combined: "lots": max, or a count`},
 		{"ethtool feature", []edit{{sp, `features: { rx-gro-list: "off" }`, `features: { rx-gro-list: "maybe" }`}}, nil, `host.interfaces.edge.ethtool.features.rx-gro-list: "maybe": on or off`},
 		{"ethtool on a tun", []edit{{sp, "vpn0: { kind: tun,", "vpn0: { kind: tun, ethtool: { eee: \"off\" },"}}, nil, "host.interfaces.vpn0.ethtool: a tun device has no NIC's settings"},
@@ -466,9 +481,9 @@ func TestEachRuleFiresOnFull(t *testing.T) {
 		{"service of no compose service", []edit{{sp, "echo: { cpus: 1, irq: on }", "echoes: { cpus: 1 }"}}, nil, `services.echoes: service "echoes" is not in deploy/compose.yaml`},
 		{"service nftables table of another name", []edit{{"deploy/ingest.nft", "table inet ingest {", "table inet other {"}}, nil, `services.ingest.nftables: deploy/ingest.nft: does not start with "table inet ingest {"`},
 		{"service nftables beyond its table", []edit{{"deploy/ingest.nft", "\t\tip saddr @probes counter\n", "\t\tip saddr @probes counter\n\t\tinclude \"/etc/x.nft\"\n"}}, nil, "services.ingest.nftables: deploy/ingest.nft: holds an include or names the ruleset"},
-		{"service nftables closing its table in a string", []edit{{"deploy/ingest.nft", "\t\tip saddr @probes counter\n\t}\n}\n", "\t\tip saddr @probes counter comment \"{\"\n\t}\n}\ndelete table inet atlas\ntable inet ingest { comment \"}\" }\n"}}, nil, "services.ingest.nftables: deploy/ingest.nft: holds something after its table"},
-		{"service nftables after its table", []edit{{"deploy/ingest.nft", "\t\tip saddr @probes counter\n\t}\n}\n", "\t\tip saddr @probes counter\n\t}\n}\ntable ip x {}\n"}}, nil, "services.ingest.nftables: deploy/ingest.nft: holds something after its table"},
-		{"service nftables unbalanced", []edit{{"deploy/ingest.nft", "\t\tip saddr @probes counter\n\t}\n}\n", "\t\tip saddr @probes counter\n\t}\n"}}, nil, "services.ingest.nftables: deploy/ingest.nft: its braces do not balance"},
+		{"service nftables closing its table in a string", []edit{{"deploy/ingest.nft", "\t\tip saddr @trusted counter\n\t}\n}\n", "\t\tip saddr @probes counter comment \"{\"\n\t}\n}\ndelete table inet atlas\ntable inet ingest { comment \"}\" }\n"}}, nil, "services.ingest.nftables: deploy/ingest.nft: holds something after its table"},
+		{"service nftables after its table", []edit{{"deploy/ingest.nft", "\t\tip saddr @trusted counter\n\t}\n}\n", "\t\tip saddr @trusted counter\n\t}\n}\ntable ip x {}\n"}}, nil, "services.ingest.nftables: deploy/ingest.nft: holds something after its table"},
+		{"service nftables unbalanced", []edit{{"deploy/ingest.nft", "\t\tip saddr @trusted counter\n\t}\n}\n", "\t\tip saddr @probes counter\n\t}\n"}}, nil, "services.ingest.nftables: deploy/ingest.nft: its braces do not balance"},
 		{"service nftables missing", []edit{{sp, "nftables: deploy/ingest.nft", "nftables: deploy/none.nft"}}, nil, "services.ingest.nftables: open "},
 		{"service interface without its input", []edit{{sp, "{ interface: edge, address_input: RELAY_ADDRESS }", "{ interface: edge }"}}, nil, "services.relay: interface and address_input go together"},
 		{"service interface not a NIC", []edit{{sp, "{ interface: edge, address_input: RELAY_ADDRESS }", "{ interface: vpn0, address_input: RELAY_ADDRESS }"}}, nil, `services.relay.interface: "vpn0" is not a NIC of host.interfaces`},
@@ -935,7 +950,7 @@ func TestStartFirstWarnings(t *testing.T) {
 		t.Fatalf("findings: %+v", res.Findings)
 	}
 	testutil.Edit(t, root, composeFile, "      test: [\"CMD\", \"atlas-server\", \"probe\", \"8080\"]\n", "")
-	testutil.Edit(t, root, specFile, "ingest: { nftables: deploy/ingest.nft }", "ingest: { nftables: deploy/ingest.nft, update: start-first }")
+	testutil.Edit(t, root, specFile, "ingest: { nftables: deploy/ingest.nft,", "ingest: { nftables: deploy/ingest.nft, update: start-first,")
 	if res := run(t, root); !warned(res, "ingest's healthcheck sets no test") {
 		t.Fatalf("findings: %+v", res.Findings)
 	}
@@ -956,12 +971,13 @@ func TestStartFirstWarnings(t *testing.T) {
 	root = testutil.CopyExample(t, "full")
 	testutil.Edit(t, root, specFile, ", update_socket: /run/atlas/handoff, update_ready: ready, update_decline_status: 75 }", " }")
 	testutil.Edit(t, root, composeFile, "  api:\n    image: ${STOWAGE_IMAGE_API}\n", "  api:\n    network_mode: host\n    image: ${STOWAGE_IMAGE_API}\n")
-	if res := run(t, root); !warned(res, "api runs on the host's network, where both containers of an overlap listen on its ports") {
+	if res := run(t, root); !warned(res, "api runs on the host's network, where both containers of an overlap listen on its ports") ||
+		!warned(res, "api runs on the host's network, where every container of the stack reaches its port 9090 directly") {
 		t.Fatalf("host network: %+v", res.Findings)
 	}
 	// With update_socket it is the app's handoff: no warning.
 	testutil.Edit(t, root, specFile, "update_signal: SIGUSR2 }", "update_signal: SIGUSR2, update_socket: /run/atlas/handoff }")
-	if res := run(t, root); warned(res, "api runs on the host's network") {
+	if res := run(t, root); warned(res, "api runs on the host's network, where both containers") {
 		t.Fatalf("host network with update_socket: %+v", res.Findings)
 	}
 	// An L4 upstream: on the VM, warned without update_socket alone; on Docker, warned unless on
@@ -1453,15 +1469,16 @@ func TestL4AllowlistWithoutKairosWarns(t *testing.T) {
 	for _, want := range []string{
 		"l4.routes[1].allow_input: only the VM's firewall enforces it, and the project has no kairos shape: the route is open to every source",
 		"front.interface: only the VM's firewall opens a port on one interface alone",
-		"l4.routes[1].interface: only the VM's firewall opens a port on one interface alone",
+		"l4.routes[1].interfaces: only the VM's firewall opens a port on some interfaces alone",
 		"services.vpn.transparent: only the VM's firewall is Stowage's (a kairos shape)",
 		"host.interfaces.vpn0.forward: only the VM's firewall is Stowage's (a kairos shape)",
+		"services.api.feeds: only the VM's app socket feeds a table's sets (a kairos shape)",
 	} {
 		if !slices.ContainsFunc(got, func(g string) bool { return strings.Contains(g, want) }) {
 			t.Errorf("no %q in %q", want, got)
 		}
 	}
-	if len(got) != 5 {
+	if len(got) != 6 {
 		t.Errorf("findings: %q", got)
 	}
 }
@@ -1764,13 +1781,13 @@ func FuzzCheckL4Bind(f *testing.F) {
 // memShares is examples/full's services block, which gives two services a memory share.
 const memShares = `services:                                                      # what a compose service asks of the host, beyond its compose file
   postgres: { memory: { percent: 25, max: 16G } }              # percent of the host's RAM, recomputed at each start, capped at 16 GiB
-  api: { memory: 10, update: start-first, update_signal: SIGUSR2, update_socket: /run/atlas/handoff, update_ready: ready, update_decline_status: 75 }  # its new container healthy beside the old before the old stops; the old one told to go once the new one wrote ready; exit 75 asks for stop-first
+  api: { memory: 10, feeds: [ingest], update: start-first, update_signal: SIGUSR2, update_socket: /run/atlas/handoff, update_ready: ready, update_decline_status: 75 }  # feeds ingest's sets (a load of its table recreates it too); its new container healthy beside the old before the old stops; the old one told to go once the new one wrote ready; exit 75 asks for stop-first
 `
 
 // servicesBlock is examples/full's whole services block: its memory shares, then the services' cores,
 // nftables table and address of their own.
 const servicesBlock = memShares + `  echo: { cpus: 1, irq: on }                                   # a whole core of its own, the NICs' interrupts on it too
-  ingest: { nftables: deploy/ingest.nft }                      # its own nftables table, loaded on the VM
+  ingest: { nftables: deploy/ingest.nft, sets: { trusted: TRUSTED_PROBES } }   # its own nftables table, loaded on the VM; its trusted set filled from an input at each start
   relay: { interface: edge, address_input: RELAY_ADDRESS }     # an address of its own on the edge NIC (an ipvlan network)
   vpn: { host_network: true, nftables: deploy/vpn.nft, transparent: [vpn0], front_hosts: host-gateway }   # on the host's network; its table steers vpn0's traffic to its own sockets; the front's domains at Docker's host-gateway address
 `
@@ -2019,6 +2036,44 @@ func TestTheServicesCoresFitTheVM(t *testing.T) {
 		gotWarn := slices.ContainsFunc(res.Findings, func(f Finding) bool { return f.Severity == Warning && strings.Contains(f.Message, kept) })
 		if gotErr != c.err || gotWarn != c.warn || len(errorsOf(res)) > 0 && !c.err {
 			t.Errorf("cpus %s, %s: %+v", c.cpus, c.size, res.Findings)
+		}
+	}
+}
+
+// A service feeding a table's sets without the app socket (shapes.kairos.host_api) is warned: it
+// has no way to feed them; one given the socket (the api, examples/full's clean control) is not.
+func TestAFeederWithoutTheAppSocketIsWarned(t *testing.T) {
+	t.Parallel()
+	root := testutil.CopyExample(t, "full")
+	testutil.Edit(t, root, specFile, "vpn: { host_network: true,", "vpn: { feeds: [ingest], host_network: true,")
+	want := "warning: services.vpn.feeds: vpn feeds the sets through the app socket, which shapes.kairos.host_api does not give it"
+	var got []string
+	for _, f := range run(t, root).Findings {
+		got = append(got, f.String())
+	}
+	if !slices.ContainsFunc(got, func(g string) bool { return strings.HasPrefix(g, want) }) || slices.ContainsFunc(got, func(g string) bool { return strings.Contains(g, "services.api.feeds") }) {
+		t.Errorf("findings: %q", got)
+	}
+}
+
+// A front route whose guard only the front holds is warned when its upstream runs on the host's
+// network (host_network, or on the VM an L4 route's upstream): every container reaches it there
+// directly. A guarded route to a service on the stack's network (examples/full's ops route, the
+// clean control) is not.
+func TestAGuardedRouteToTheHostsNetworkIsWarned(t *testing.T) {
+	t.Parallel()
+	for _, c := range []struct{ upstream, want string }{
+		{"vpn:9090", "front.routes[3].upstream: vpn runs on the host's network, where every container of the stack reaches its port 9090 directly, at the host's gateway, past the route's basic_auth, client_auth: vpn checks who calls it itself"},
+		{"echo:17007", "front.routes[3].upstream: echo runs on the VM's network (an L4 route's upstream), where"},
+	} {
+		root := testutil.CopyExample(t, "full")
+		testutil.Edit(t, root, specFile, "      domain_input: OPS_DOMAIN\n      upstream: api:9090\n", "      domain_input: OPS_DOMAIN\n      upstream: "+c.upstream+"\n")
+		var got []string
+		for _, f := range run(t, root).Findings {
+			got = append(got, f.String())
+		}
+		if !slices.ContainsFunc(got, func(g string) bool { return strings.Contains(g, "warning: "+c.want) }) {
+			t.Errorf("%s: findings %q", c.upstream, got)
 		}
 	}
 }

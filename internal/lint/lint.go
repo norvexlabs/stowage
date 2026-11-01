@@ -877,6 +877,7 @@ func (l *linter) front() {
 			l.errf(w+".upstream", "%q must be <service>:<port>", r.Upstream)
 		} else {
 			l.service(w+".upstream", m[1])
+			l.hostNetGuard(w+".upstream", r, m[1], m[2])
 		}
 		for _, h := range r.StripHeaders {
 			if strings.TrimSuffix(h, "*") == "" || strings.ContainsAny(h, " :") {
@@ -1094,6 +1095,40 @@ func (l *linter) basicAuth(where string, r spec.Route) {
 	case !in.Secret:
 		l.errf(where+".secret", "%s is not secret: a password is never printed", a.Secret)
 	}
+}
+
+// hostNetGuard warns of a front route whose guard (basic_auth, client_auth, forward_auth,
+// allow_input) holds only through the front while its upstream runs on the host's network
+// (host_network, a compose network_mode: host, or with a kairos shape an L4 route's upstream, on
+// the VM): every container of the stack
+// reaches that port directly, at the host's gateway, past the front.
+func (l *linter) hostNetGuard(at string, r spec.Route, service, port string) {
+	var guards []string
+	if r.BasicAuth != nil {
+		guards = append(guards, "basic_auth")
+	}
+	if r.ClientAuth {
+		guards = append(guards, "client_auth")
+	}
+	if r.ForwardAuth != nil {
+		guards = append(guards, "forward_auth")
+	}
+	if r.AllowInput != "" {
+		guards = append(guards, "allow_input")
+	}
+	if len(guards) == 0 {
+		return
+	}
+	always, onVM := l.hostNetworkServices()
+	where := "the host's network"
+	switch {
+	case slices.Contains(always, service):
+	case slices.Contains(onVM, service):
+		where = "the VM's network (an L4 route's upstream)"
+	default:
+		return
+	}
+	l.warnf(at, "%s runs on %s, where every container of the stack reaches its port %s directly, at the host's gateway, past the route's %s: %s checks who calls it itself", service, where, port, strings.Join(guards, ", "), service)
 }
 
 // basicUserRe is a basic_auth user's name.
@@ -1480,6 +1515,9 @@ func (l *linter) readInputs() func(spec.Input) bool {
 	}
 	for _, svc := range l.s.Services {
 		inCompose[svc.AddressInput] = true
+		for _, k := range svc.Sets {
+			inCompose[k] = true
+		}
 	}
 	return func(in spec.Input) bool {
 		if in.Profile != "" {
@@ -1927,7 +1965,14 @@ func (l *linter) interfaces(ifs map[string]spec.HostInterface) {
 	}
 	named("front.interface", l.s.Front.Interface)
 	for i, r := range l.s.L4.Routes {
-		named(fmt.Sprintf("l4.routes[%d].interface", i), r.Interface)
+		if r.Interfaces == nil {
+			continue
+		}
+		at := fmt.Sprintf("l4.routes[%d].interfaces", i)
+		l.roleList(at, r.Interfaces, "leave it out to open the route on every interface", nil)
+		if !kairos && len(r.Interfaces) > 0 {
+			l.warnf(at, "only the VM's firewall opens a port on some interfaces alone (a kairos shape): a Docker host's firewall is its operator's")
+		}
 	}
 	for _, role := range slices.Sorted(maps.Keys(ifs)) {
 		fw, at := ifs[role].Forward, "host.interfaces."+role+".forward"

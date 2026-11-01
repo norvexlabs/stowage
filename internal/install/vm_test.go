@@ -1278,7 +1278,7 @@ func TestThePortsOfAnInterfaceAreOpenedOnItAlone(t *testing.T) {
 		s.Front.Interface = "uplink"
 		s.L4.Routes = []spec.L4Route{
 			{Name: "db", Protocol: "tcp", Port: 5432, Upstream: "postgres:5432"},
-			{Name: "feed", Protocol: "udp", Port: 17007, Upstream: "api:17007", AllowInput: "FEED_SOURCES", Interface: "edge"},
+			{Name: "feed", Protocol: "udp", Port: 17007, Upstream: "api:17007", AllowInput: "FEED_SOURCES", Interfaces: []string{"edge"}},
 		}
 	})
 	in := &Installer{R: r, O: Options{Dir: t.TempDir(), Firewall: filepath.Join(t.TempDir(), "nftables.d"), Host: host}}
@@ -1315,8 +1315,9 @@ func TestARoleWithoutItsNICFailsClosed(t *testing.T) {
 		s.Host = &spec.Host{Interfaces: map[string]spec.HostInterface{"uplink": {Primary: true}, "edge": {}, "vpn0": {Kind: spec.InterfaceTUN}}}
 		s.Front.Interface = "uplink"
 		s.L4.Routes = []spec.L4Route{
-			{Name: "feed", Protocol: "udp", Port: 17007, Upstream: "api:17007", Interface: "edge"},
-			{Name: "peer", Protocol: "udp", Port: 17008, Upstream: "api:17008", Interface: "vpn0"},
+			{Name: "feed", Protocol: "udp", Port: 17007, Upstream: "api:17007", Interfaces: []string{"edge"}},
+			{Name: "peer", Protocol: "udp", Port: 17008, Upstream: "api:17008", Interfaces: []string{"vpn0"}},
+			{Name: "dns", Protocol: "udp", Port: 53, Upstream: "api:53", Interfaces: []string{"vpn0", "uplink"}},
 		}
 	})
 	var log bytes.Buffer
@@ -1329,7 +1330,7 @@ func TestARoleWithoutItsNICFailsClosed(t *testing.T) {
 		t.Fatal(err)
 	}
 	b, _ := os.ReadFile(filepath.Join(in.O.Firewall, "notes-ports.nft"))
-	for _, want := range []string{"\niifname \"uplink\" tcp dport { 80, 443 } accept\n", "\niifname \"edge\" udp dport 17007 accept\n", "\niifname \"vpn0\" udp dport 17008 accept\n"} {
+	for _, want := range []string{"\niifname \"uplink\" tcp dport { 80, 443 } accept\n", "\niifname \"edge\" udp dport 17007 accept\n", "\niifname \"vpn0\" udp dport 17008 accept\n", "\niifname { \"vpn0\", \"uplink\" } udp dport 53 accept\n"} {
 		if !strings.Contains(string(b), want) {
 			t.Errorf("no %q in:\n%s", want, b)
 		}

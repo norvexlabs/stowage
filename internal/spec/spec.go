@@ -6,12 +6,14 @@ import (
 	"cmp"
 	"errors"
 	"fmt"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"reflect"
 	"regexp"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 
 	"go.yaml.in/yaml/v3"
@@ -142,6 +144,12 @@ type Service struct {
 	IRQ string `yaml:"irq"`
 	// Nftables is its nftables table, a file of the project holding one `table inet <service>`.
 	Nftables string `yaml:"nftables"`
+	// Sets fill its table's named sets from inputs, by set: each start writes the input's
+	// elements into the set (emptied first), on every shape its table loads on.
+	Sets map[string]string `yaml:"sets"`
+	// Feeds are the services whose tables' sets it feeds (through the VM's app socket): a start
+	// that loads one of those tables, which empties its sets, recreates it too.
+	Feeds []string `yaml:"feeds"`
 	// Transparent are the host.interfaces roles its table steers traffic crossing the host to its
 	// own sockets on (TPROXY): the VM's input chain accepts there what the kernel hands a
 	// transparent socket.
@@ -272,9 +280,9 @@ type L4Route struct {
 	AddressInput string `yaml:"address_input"`
 	AllowInput   string `yaml:"allow_input"`
 	BindInput    string `yaml:"bind_input"`
-	// Interface is the host.interfaces role the route listens on, which the VM's firewall opens
-	// its port on alone; empty, every interface.
-	Interface string `yaml:"interface"`
+	// Interfaces are the host.interfaces roles the route listens on, which the VM's firewall opens
+	// its port on alone (one rule, iifname { … }); none, every interface.
+	Interfaces []string `yaml:"interfaces"`
 }
 
 // L4Var is the variable carrying an L4 route's endpoint, <address>:<port>.
@@ -592,6 +600,107 @@ type Ethtool struct {
 	} `yaml:"rings"`
 	Features map[string]string `yaml:"features"`
 	EEE      string            `yaml:"eee"`
+}
+
+// NftSet is a named set a table declares.
+var NftSet = regexp.MustCompile(`(?:^|[\s;{}])set\s+([A-Za-z_][A-Za-z0-9_./-]*)\s*\{`)
+
+// NftSets are the named sets the table text declares, in order: as nft lexes it, a comment (# to
+// the line's end, outside a string) and a quoted string's content are none of its words.
+func NftSets(text string) []string {
+	var b strings.Builder
+	for i := 0; i < len(text); i++ {
+		switch c := text[i]; c {
+		case '"':
+			j := strings.IndexByte(text[i+1:], '"')
+			if j < 0 {
+				i = len(text)
+				continue
+			}
+			b.WriteString(" ")
+			i += j + 1
+		case '#':
+			j := strings.IndexByte(text[i:], '\n')
+			if j < 0 {
+				i = len(text)
+				continue
+			}
+			i += j - 1
+		default:
+			b.WriteByte(c)
+		}
+	}
+	var out []string
+	for _, m := range NftSet.FindAllStringSubmatch(b.String(), -1) {
+		out = append(out, m[1])
+	}
+	return out
+}
+
+// MaxSetElements is the most elements one input fills a set with (services.<name>.sets), and one
+// request of the app socket adds or deletes.
+const MaxSetElements = 1024
+
+// LiteralElement reports whether e is an element nft takes without resolving a name: each part
+// (" . " apart) an IP address, a prefix, a port (0 to 65535) or a range a-b of two addresses of one
+// family or two ports, a no greater than b. A host or service name would be resolved as nft takes
+// it: at boot before the network, by the host daemon over DNS.
+func LiteralElement(e string) bool {
+	for _, part := range strings.Split(e, " . ") {
+		if a, err := netip.ParseAddr(part); err == nil && a.Zone() == "" {
+			continue
+		}
+		if _, err := netip.ParsePrefix(part); err == nil {
+			continue
+		}
+		if _, ok := elementPort(part); ok {
+			continue
+		}
+		lo, hi, ok := strings.Cut(part, "-")
+		if !ok {
+			return false
+		}
+		if a, err := netip.ParseAddr(lo); err == nil {
+			b, err := netip.ParseAddr(hi)
+			if err != nil || a.Zone() != "" || b.Zone() != "" || a.Is4() != b.Is4() || a.Compare(b) > 0 {
+				return false
+			}
+			continue
+		}
+		a, okA := elementPort(lo)
+		b, okB := elementPort(hi)
+		if !okA || !okB || a > b {
+			return false
+		}
+	}
+	return true
+}
+
+// elementPort reads a port of a set's element: 0 to 65535, written without a sign or a leading 0.
+func elementPort(v string) (int, bool) {
+	n, err := strconv.Atoi(v)
+	return n, err == nil && n >= 0 && n <= 65535 && strconv.Itoa(n) == v
+}
+
+// SetElements are the elements an input's value fills a set with: comma-separated, each trimmed,
+// none for a blank value. An element that is not a literal one (LiteralElement), and more than
+// MaxSetElements, are errors.
+func SetElements(v string) ([]string, error) {
+	var out []string
+	for _, e := range strings.Split(v, ",") {
+		e = strings.TrimSpace(e)
+		if e == "" {
+			continue
+		}
+		if !LiteralElement(e) {
+			return nil, fmt.Errorf("element %q: an address, a prefix, a port or a range, or their concatenation (a . b), written as such (no host or service name)", e)
+		}
+		out = append(out, e)
+	}
+	if len(out) > MaxSetElements {
+		return nil, fmt.Errorf("%d elements: at most %d", len(out), MaxSetElements)
+	}
+	return out, nil
 }
 
 // NftTableName is a service's nftables table's name, the service's: a letter, then letters, digits

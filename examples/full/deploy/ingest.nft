@@ -1,7 +1,13 @@
 # The ingest service's own table (services.ingest.nftables): the VM loads it before the service
-# starts, and the service feeds its set through the host daemon's app socket.
+# starts; the api feeds its probes set through the host daemon's app socket (services.api.feeds),
+# and each start fills its trusted set from an input (services.ingest.sets).
 table inet ingest {
 	set probes {
+		type ipv4_addr
+		flags interval
+	}
+
+	set trusted {
 		type ipv4_addr
 		flags interval
 	}
@@ -9,5 +15,6 @@ table inet ingest {
 	chain prerouting {
 		type filter hook prerouting priority -150; policy accept;
 		ip saddr @probes counter
+		ip saddr @trusted counter
 	}
 }

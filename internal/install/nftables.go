@@ -7,11 +7,11 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"maps"
 	"net/http"
 	"os"
 	"path/filepath"
-	"regexp"
 	"slices"
 	"strings"
 
@@ -35,23 +35,79 @@ const (
 // firewall, or a consented Docker host's (gatewayApplies), before the services start (syncTables): at a start that finds it absent (a boot) or its file
 // changed, replaced whole in one transaction (the table made if absent, deleted, then its file's,
 // so a rule never doubles nor goes missing in between; nft checks it before it commits). A table
-// that holds already leaves its sets as the service fed them. Each load empties its sets, so it
+// that holds already leaves its sets as the service fed them, but those its inputs fill (below).
+// Each load empties its sets, so it
 // writes a token of its own (<name>.load), which is its service's label (TableLabel): the start
 // that loaded it recreates the service, which feeds them again. A table is recorded (TablesFile)
 // as soon as it is in the firewall, and a table recorded whose service the release no longer
 // declares is deleted, so none outlives its release, a load that fails halfway included. The
 // host's own table stays Stowage's: a file holds its service's table alone, never of the
-// project's name (lint, the release's decoding).
-func (in *Installer) loadTables(ctx context.Context) error {
+// project's name (lint, the release's decoding). The sets inputs fill (services.<name>.sets, get
+// reading the install's values) are written in the table's own transaction (setScripts), so a set
+// of its rules is never empty a moment, at a load as at a start that finds the table held (when
+// they changed since the last start's script); a set no longer filled loads the table again,
+// which empties it of its last input's elements.
+func (in *Installer) loadTables(ctx context.Context, get func(string) string) error {
 	if !in.gatewayApplies() {
 		return nil // gatewayStart says why
 	}
-	return in.syncTables(ctx, in.R.Nftables)
+	in.warnSocketFed()
+	sets, err := in.setScripts(get)
+	if err != nil {
+		return err
+	}
+	return in.syncTables(ctx, in.R.Nftables, sets)
 }
 
-// syncTables makes the tables loaded those of want, by service: each loaded as loadTables says, a
-// table recorded and not wanted deleted.
-func (in *Installer) syncTables(ctx context.Context, want map[string][]byte) error {
+// SetsSuffix names, beside a table's file under TablesDir, the nft script that filled its sets
+// from their inputs at the last start, which the boot loads with the table.
+const SetsSuffix = ".sets"
+
+// setScripts are, by table, the nft script giving each set an input fills its elements: the set
+// emptied, then the input's elements (spec.SetElements), every set of the table in one script. An
+// input that holds no element nft reads is an error naming it and its key, before any table loads.
+func (in *Installer) setScripts(get func(string) string) (map[string]string, error) {
+	out := map[string]string{}
+	var errs []error
+	for _, name := range sortedKeys(in.R.Spec.Services) {
+		sets := in.R.Spec.Services[name].Sets
+		if _, ok := in.R.Nftables[name]; !ok || len(sets) == 0 {
+			continue
+		}
+		var b strings.Builder
+		for _, set := range sortedKeys(sets) {
+			elems, err := spec.SetElements(get(sets[set]))
+			if err != nil {
+				errs = append(errs, fmt.Errorf("%s (services.%s.sets.%s): %w", sets[set], name, set, err))
+				continue
+			}
+			fmt.Fprintf(&b, "flush set inet %s %s\n", name, set)
+			if len(elems) > 0 {
+				fmt.Fprintf(&b, "add element inet %s %s { %s }\n", name, set, strings.Join(elems, ", "))
+			}
+		}
+		out[name] = b.String()
+	}
+	return out, errors.Join(errs...)
+}
+
+// setsKeys names a table's input-filled sets for an error: services.<name>.sets (their inputs).
+func (in *Installer) setsKeys(name string) string {
+	sets := in.R.Spec.Services[name].Sets
+	var keys []string
+	for _, set := range sortedKeys(sets) {
+		keys = append(keys, sets[set])
+	}
+	if len(keys) == 0 {
+		return fmt.Sprintf("services.%s.sets", name)
+	}
+	return fmt.Sprintf("services.%s.sets (%s)", name, strings.Join(keys, ", "))
+}
+
+// syncTables makes the tables loaded those of want, by service, each with its sets' script (sets):
+// each loaded as loadTables says, the script in the load's transaction or, for a table that holds,
+// in one of its own; a table recorded and not wanted deleted.
+func (in *Installer) syncTables(ctx context.Context, want map[string][]byte, sets map[string]string) error {
 	host := in.O.host()
 	record := map[string]bool{}
 	if prev, err := os.ReadFile(in.path(TablesFile)); err == nil {
@@ -64,6 +120,7 @@ func (in *Installer) syncTables(ctx context.Context, want map[string][]byte) err
 	save := func() error {
 		return writeAtomic(in.path(TablesFile), strings.NewReader(strings.Join(slices.Sorted(maps.Keys(record)), "\n")+"\n"), 0o644, nil)
 	}
+	var errs []error // a held table's sets refused: the other tables are made all the same
 	for _, name := range sortedKeys(want) {
 		var b bytes.Buffer
 		fmt.Fprintf(&b, "# %s's nftables table, as services.%s.nftables gives it, loaded whole.\ntable inet %s\ndelete table inet %s\n", name, name, name, name)
@@ -71,41 +128,67 @@ func (in *Installer) syncTables(ctx context.Context, want map[string][]byte) err
 		if !bytes.HasSuffix(want[name], []byte("\n")) {
 			b.WriteByte('\n') // nft takes a comment on the last line only before a newline
 		}
-		f := filepath.Join(in.O.Dir, TablesDir, name+".nft")
+		f, setsFile := in.tableFile(name, ".nft"), in.tableFile(name, SetsSuffix)
 		if cur, err := os.ReadFile(f); err == nil && bytes.Equal(cur, b.Bytes()) {
 			if _, err := host.Run(ctx, Cmd{Args: []string{"nft", "list", "table", "inet", name}}); err == nil {
-				continue
+				kept, err := os.ReadFile(setsFile)
+				switch script := sets[name]; {
+				case err != nil && !errors.Is(err, os.ErrNotExist):
+					// What the sets hold is unknown: the table loads again, with them.
+				case script == "" && len(kept) > 0:
+					// A set no longer filled keeps its last input's elements: the table loads again.
+				case script == string(kept):
+					continue // as the last start wrote them
+				default:
+					if _, err := host.Run(ctx, Cmd{Args: []string{"nft", "-f", "-"}, Stdin: strings.NewReader(script)}); err != nil {
+						errs = append(errs, fmt.Errorf("%s: nft refuses their elements: %w", in.setsKeys(name), err))
+						continue
+					}
+					if err := in.keepSets(setsFile, script); err != nil {
+						return errors.Join(append(errs, err)...)
+					}
+					continue
+				}
 			}
 		}
 		if err := os.MkdirAll(filepath.Dir(f), 0o755); err != nil {
-			return err
+			return errors.Join(append(errs, err)...)
 		}
 		// Loaded from a file of its own, which becomes its file once loaded: a load that fails
 		// leaves it as it was, so the next start tries again.
 		next := f + ".next"
+		table := b.String()
+		b.WriteString(sets[name]) // the sets filled in the load's transaction
 		if err := writeAtomic(next, &b, 0o644, nil); err != nil {
-			return err
+			return errors.Join(append(errs, err)...)
 		}
 		// The token first: a start cut off after the load recreates the service all the same (a
 		// token without its file loaded again only makes the next start load it again).
 		token := make([]byte, 8)
 		if _, err := rand.Read(token); err != nil {
-			return err
+			return errors.Join(append(errs, err)...)
 		}
-		if err := writeAtomic(strings.TrimSuffix(f, ".nft")+".load", strings.NewReader(hex.EncodeToString(token)+"\n"), 0o644, nil); err != nil {
-			return err
+		if err := writeAtomic(in.tableFile(name, ".load"), strings.NewReader(hex.EncodeToString(token)+"\n"), 0o644, nil); err != nil {
+			return errors.Join(append(errs, err)...)
 		}
 		if _, err := host.Run(ctx, Cmd{Args: []string{"nft", "-f", next}}); err != nil {
 			_ = os.Remove(next)
-			return fmt.Errorf("services.%s.nftables: nft refuses its table: %w", name, err)
+			if sets[name] != "" {
+				return errors.Join(append(errs, fmt.Errorf("services.%s.nftables: nft refuses its table, or %s their elements: %w", name, in.setsKeys(name), err))...)
+			}
+			return errors.Join(append(errs, fmt.Errorf("services.%s.nftables: nft refuses its table: %w", name, err))...)
 		}
 		record[name] = true
 		if err := save(); err != nil {
-			return err
+			return errors.Join(append(errs, err)...)
 		}
-		if err := os.Rename(next, f); err != nil {
-			return err
+		if err := in.keepSets(setsFile, sets[name]); err != nil {
+			return errors.Join(append(errs, err)...)
 		}
+		if err := writeAtomic(f, strings.NewReader(table), 0o644, nil); err != nil {
+			return errors.Join(append(errs, err)...)
+		}
+		_ = os.Remove(next)
 	}
 	for _, name := range slices.Sorted(maps.Keys(record)) {
 		if _, ok := want[name]; ok {
@@ -119,17 +202,23 @@ func (in *Installer) syncTables(ctx context.Context, want map[string][]byte) err
 			}
 		}
 		delete(record, name)
-		for _, ext := range []string{".nft", ".load"} {
-			_ = os.Remove(filepath.Join(in.O.Dir, TablesDir, name+ext))
+		for _, ext := range []string{".nft", ".load", SetsSuffix} {
+			_ = os.Remove(in.tableFile(name, ext))
 		}
 	}
 	if len(record) == 0 {
 		if err := os.Remove(in.path(TablesFile)); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return err
+			return errors.Join(append(errs, err)...)
 		}
-		return nil
+		return errors.Join(errs...)
 	}
-	return save()
+	return errors.Join(append(errs, save())...)
+}
+
+// tableFile is the file, under the install's TablesDir, of the table name with the extension
+// ext: .nft the table as last loaded, .load its load token, SetsSuffix its sets' script.
+func (in *Installer) tableFile(name, ext string) string {
+	return filepath.Join(in.O.Dir, TablesDir, name+ext)
 }
 
 // tableLoads are the services' tables' load tokens where they are loaded (TableLabel): a service whose table
@@ -139,13 +228,110 @@ func (in *Installer) tableLoads() map[string]string {
 	if in.O.Firewall == "" && !in.gatewayConsented() {
 		return nil
 	}
-	out := map[string]string{}
+	loads := map[string]string{}
 	for name := range in.R.Nftables {
 		if raw, err := os.ReadFile(filepath.Join(in.O.Dir, TablesDir, name+".load")); err == nil {
-			out[name] = "load " + strings.TrimSpace(string(raw))
+			loads[name] = "load " + strings.TrimSpace(string(raw))
+		}
+	}
+	// A service carries its own table's token, and a feeder (feeds) its own and those of the
+	// tables it feeds, so a load of any of them recreates it as it does the table's own service.
+	out := maps.Clone(loads)
+	for _, name := range sortedKeys(in.R.Spec.Services) {
+		feeds := in.R.Spec.Services[name].Feeds
+		if len(feeds) == 0 {
+			continue
+		}
+		var tokens []string
+		for _, t := range append([]string{name}, feeds...) {
+			if d, ok := loads[t]; ok && !slices.Contains(tokens, t+" "+d) {
+				tokens = append(tokens, t+" "+d)
+			}
+		}
+		if len(tokens) > 0 {
+			slices.Sort(tokens)
+			out[name] = strings.Join(tokens, "; ")
 		}
 	}
 	return out
+}
+
+// socketFed reports whether the table of the service name is fed through the VM's app socket: the
+// service, or one feeding its table (feeds), is given the socket (shapes.kairos.host_api).
+func (in *Installer) socketFed(name string) bool {
+	k := in.R.Spec.Shapes.Kairos
+	if k == nil {
+		return false
+	}
+	for _, svc := range sortedKeys(in.R.Spec.Services) {
+		if (svc == name || slices.Contains(in.R.Spec.Services[svc].Feeds, name)) && slices.Contains(k.HostAPI, svc) {
+			return true
+		}
+	}
+	return false
+}
+
+// setInput reports whether the input key fills a service's set (services.<name>.sets).
+func (in *Installer) setInput(key string) bool {
+	for _, svc := range in.R.Spec.Services {
+		for _, k := range svc.Sets {
+			if k == key {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// chainChecks is a check passing what a and b both pass (a nil one passes everything).
+func chainChecks(a, b func(string) error) func(string) error {
+	if a == nil {
+		return b
+	}
+	return func(v string) error {
+		if err := a(v); err != nil {
+			return err
+		}
+		return b(v)
+	}
+}
+
+// checkSetElements accepts an input's value a set is filled with (spec.SetElements).
+func checkSetElements(v string) error {
+	_, err := spec.SetElements(v)
+	return err
+}
+
+// keepSets records script as the sets' script the boot loads with the table at f's side (file),
+// or removes it when the table has none.
+func (in *Installer) keepSets(file, script string) error {
+	if script == "" {
+		if err := os.Remove(file); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		return nil
+	}
+	return writeAtomic(file, strings.NewReader(script), 0o644, nil)
+}
+
+// warnSocketFed warns on a Docker host, once a release, of each set of a table fed through the
+// VM's app socket (socketFed) that no input fills: nothing but the table's own rules or elements
+// feeds it there.
+func (in *Installer) warnSocketFed() {
+	if in.O.Firewall != "" || in.setsWarned == in.R {
+		return
+	}
+	in.setsWarned = in.R // a start prepares again after a pull: warned once
+	for _, name := range sortedKeys(in.R.Nftables) {
+		if !in.socketFed(name) {
+			continue
+		}
+		for _, set := range spec.NftSets(string(in.R.Nftables[name])) {
+			if _, filled := in.R.Spec.Services[name].Sets[set]; !filled {
+				in.O.logf("warning: the set %s of the table inet %s is fed through the VM's app socket, which a Docker host does not serve: it stays as the table declares it here unless its own rules fill it (services.%s.sets fills a set from an input)", set, name, name)
+			}
+		}
+	}
 }
 
 // tablesBootCmd loads the services' tables at boot, before Docker restores their containers.
@@ -171,7 +357,7 @@ func (in *Installer) bootTables(ctx context.Context) error {
 	}
 	var errs []error
 	for _, name := range strings.Fields(string(raw)) {
-		f := filepath.Join(in.O.Dir, TablesDir, name+".nft")
+		f := in.tableFile(name, ".nft")
 		if !spec.NftTableName.MatchString(name) || name == in.R.Spec.Name || !fileExists(f) {
 			continue
 		}
@@ -179,12 +365,47 @@ func (in *Installer) bootTables(ctx context.Context) error {
 		if _, err := rand.Read(token); err != nil {
 			return err
 		}
-		if err := writeAtomic(strings.TrimSuffix(f, ".nft")+".load", strings.NewReader(hex.EncodeToString(token)+"\n"), 0o644, nil); err != nil {
+		if err := writeAtomic(in.tableFile(name, ".load"), strings.NewReader(hex.EncodeToString(token)+"\n"), 0o644, nil); err != nil {
 			return err
 		}
-		if _, err := in.O.host().Run(ctx, Cmd{Args: []string{"nft", "-f", f}}); err != nil {
+		failed := func(err error) {
 			errs = append(errs, fmt.Errorf("services.%s.nftables: its table does not load at boot (the install's start loads it again): %w", name, err))
+		}
+		// With the sets its last start filled from their inputs, in the load's transaction: a set
+		// of its rules is never empty a moment. Sets nft refuses now leave the table loaded alone,
+		// said, and their script removed, so the boot's start, which finds the table held, writes
+		// them again.
+		setsFile := in.tableFile(name, SetsSuffix)
+		script, readErr := os.ReadFile(setsFile)
+		unread := readErr != nil && !errors.Is(readErr, os.ErrNotExist)
+		if unread {
+			errs = append(errs, fmt.Errorf("%s: the script that fills them at boot: %w", in.setsKeys(name), readErr))
+		}
+		var setsErr error
+		if len(script) > 0 {
+			table, tableErr := os.ReadFile(f)
+			if tableErr != nil {
+				failed(tableErr)
+				continue
+			}
+			_, setsErr = in.O.host().Run(ctx, Cmd{Args: []string{"nft", "-f", "-"}, Stdin: io.MultiReader(bytes.NewReader(table), bytes.NewReader(script))})
+			if setsErr == nil {
+				in.O.logf("loaded the nftables table inet %s and the sets its inputs fill, before the containers start", name)
+				continue
+			}
+		}
+		// A script refused or unread goes, so the boot's start writes the sets again.
+		if setsErr != nil || unread {
+			if err := os.Remove(setsFile); err != nil && !errors.Is(err, os.ErrNotExist) {
+				errs = append(errs, fmt.Errorf("%s: the script nft refused stays, so the start may not fill them again (remove %s): %w", in.setsKeys(name), setsFile, err))
+			}
+		}
+		if _, err := in.O.host().Run(ctx, Cmd{Args: []string{"nft", "-f", f}}); err != nil {
+			failed(err)
 			continue
+		}
+		if setsErr != nil {
+			errs = append(errs, fmt.Errorf("%s: nft refuses their elements at boot, so the table loads without them (the install's start fills them again): %w", in.setsKeys(name), setsErr))
 		}
 		in.O.logf("loaded the nftables table inet %s, before the containers start", name)
 	}
@@ -209,16 +430,6 @@ func tablesBootCommand(prepare func(cmd *cobra.Command) (*Installer, error)) *co
 	}
 }
 
-// nftSet is a named set a table declares, and nftElement one element of a set as nft reads it: an
-// address, a prefix, a port or a range, or a concatenation of them (" . " apart).
-var (
-	nftSet     = regexp.MustCompile(`(?m)^\s*set\s+([A-Za-z][A-Za-z0-9_]*)\s*\{`)
-	nftElement = regexp.MustCompile(`^[0-9A-Za-z_:./-]{1,64}( \. [0-9A-Za-z_:./-]{1,64}){0,3}$`)
-)
-
-// maxElements is the most elements one request adds or deletes.
-const maxElements = 1024
-
 // SetElements is a request of the host daemon's sets route: the elements a set gains and loses.
 type SetElements struct {
 	Add    []string `json:"add,omitempty"`
@@ -226,9 +437,10 @@ type SetElements struct {
 }
 
 // setElements adds and deletes elements of a named set of a service's table: the set one its
-// release's table declares, each element an address, a prefix, a port or a range (or their
-// concatenation), so a service feeds its own table's sets and reaches no other rule. The app
-// socket serves it: the services the release gives the socket feed their sets.
+// release's table declares and no input fills (services.<name>.sets, whose input is its whole
+// content), each element an address, a prefix, a port or a range (or their concatenation), so a
+// caller feeds sets and reaches no other rule. The app socket serves it: any service the release
+// gives the socket feeds any table's sets (its own, or those it feeds).
 func (h *Hostd) setElements(w http.ResponseWriter, r *http.Request) {
 	table, set := r.PathValue("table"), r.PathValue("set")
 	body, ok := h.R.Nftables[table]
@@ -236,12 +448,12 @@ func (h *Hostd) setElements(w http.ResponseWriter, r *http.Request) {
 		replyErr(w, fail(http.StatusNotFound, "no service %q has an nftables table (services.<name>.nftables)", table))
 		return
 	}
-	declared := false
-	for _, m := range nftSet.FindAllStringSubmatch(string(body), -1) {
-		declared = declared || m[1] == set
-	}
-	if !declared {
+	if !slices.Contains(spec.NftSets(string(body)), set) {
 		replyErr(w, fail(http.StatusNotFound, "the table inet %s declares no set %q", table, set))
+		return
+	}
+	if k, filled := h.R.Spec.Services[table].Sets[set]; filled {
+		replyErr(w, fail(http.StatusConflict, "the set %s of the table inet %s is filled from the input %s at each start (services.%s.sets): the input is its whole content", set, table, k, table))
 		return
 	}
 	var req SetElements
@@ -249,12 +461,12 @@ func (h *Hostd) setElements(w http.ResponseWriter, r *http.Request) {
 		replyErr(w, err)
 		return
 	}
-	if len(req.Add)+len(req.Delete) == 0 || len(req.Add)+len(req.Delete) > maxElements {
-		replyErr(w, fail(http.StatusBadRequest, "add or delete 1 to %d elements", maxElements))
+	if len(req.Add)+len(req.Delete) == 0 || len(req.Add)+len(req.Delete) > spec.MaxSetElements {
+		replyErr(w, fail(http.StatusBadRequest, "add or delete 1 to %d elements", spec.MaxSetElements))
 		return
 	}
 	for _, e := range append(slices.Clone(req.Add), req.Delete...) {
-		if !nftElement.MatchString(e) {
+		if !spec.LiteralElement(e) {
 			replyErr(w, fail(http.StatusBadRequest, "element %q: an address, a prefix, a port or a range, or their concatenation (a . b)", e))
 			return
 		}

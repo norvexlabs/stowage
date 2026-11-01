@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"maps"
 	"net/http"
 	"net/http/httptest"
@@ -32,7 +33,7 @@ func TestEveryStartLoadsTheServicesTables(t *testing.T) {
 	r := testRelease(t, "1.0.0")
 	r.Nftables = map[string][]byte{"ingest": []byte(ingestTable)}
 	in := &Installer{R: r, O: Options{Dir: t.TempDir(), Firewall: t.TempDir(), Host: host}}
-	if err := in.loadTables(ctx); err != nil {
+	if err := in.loadTables(ctx, none); err != nil {
 		t.Fatal(err)
 	}
 	f := filepath.Join(in.O.Dir, TablesDir, "ingest.nft")
@@ -51,7 +52,7 @@ func TestEveryStartLoadsTheServicesTables(t *testing.T) {
 	}
 	// The same table, still loaded: left as it is, its sets as the service fed them, its token too.
 	host.ran = nil
-	if err := in.loadTables(ctx); err != nil {
+	if err := in.loadTables(ctx, none); err != nil {
 		t.Fatal(err)
 	}
 	if !slices.EqualFunc(host.ran, [][]string{{"nft", "list", "table", "inet", "ingest"}}, slices.Equal) || in.tableLoads()["ingest"] != first {
@@ -59,19 +60,19 @@ func TestEveryStartLoadsTheServicesTables(t *testing.T) {
 	}
 	// Absent (a boot, or a table deleted by hand): loaded again, a new token recreating its service.
 	host.ran, host.listErr = nil, errors.New("no such table")
-	if err := in.loadTables(ctx); err != nil || len(host.ran) != 2 || in.tableLoads()["ingest"] == first {
+	if err := in.loadTables(ctx, none); err != nil || len(host.ran) != 2 || in.tableLoads()["ingest"] == first {
 		t.Errorf("an absent table: %v, ran %v", err, host.ran)
 	}
 	host.listErr = nil
 	// A changed one is loaded again.
 	host.ran = nil
 	in.R.Nftables = map[string][]byte{"ingest": []byte(strings.Replace(ingestTable, "ipv4_addr", "ipv6_addr", 1))}
-	if err := in.loadTables(ctx); err != nil || len(host.ran) != 1 || host.ran[0][1] != "-f" {
+	if err := in.loadTables(ctx, none); err != nil || len(host.ran) != 1 || host.ran[0][1] != "-f" {
 		t.Errorf("a changed table: %v, ran %v", err, host.ran)
 	}
 	host.ran = nil
 	in.R.Nftables = nil
-	if err := in.loadTables(ctx); err != nil {
+	if err := in.loadTables(ctx, none); err != nil {
 		t.Fatal(err)
 	}
 	if !slices.EqualFunc(host.ran, [][]string{{"nft", "list", "table", "inet", "ingest"}, {"nft", "delete", "table", "inet", "ingest"}}, slices.Equal) {
@@ -85,7 +86,7 @@ func TestEveryStartLoadsTheServicesTables(t *testing.T) {
 	// Two tables, the second refused: the first is recorded, and deleted once a release drops it.
 	host.ran, host.failOn = nil, "b.nft.next"
 	in.R.Nftables = map[string][]byte{"a": []byte(ingestTable), "b": []byte(ingestTable)}
-	if err := in.loadTables(ctx); err == nil || !strings.Contains(err.Error(), "services.b.nftables: nft refuses its table") {
+	if err := in.loadTables(ctx, none); err == nil || !strings.Contains(err.Error(), "services.b.nftables: nft refuses its table") {
 		t.Errorf("a refused table: %v, ran %v", err, host.ran)
 	}
 	if b, _ := os.ReadFile(in.path(TablesFile)); string(b) != "a\n" {
@@ -98,7 +99,7 @@ func TestEveryStartLoadsTheServicesTables(t *testing.T) {
 	in.R.Nftables = nil
 	// After a boot the kernel holds no table a: it leaves the record without a delete.
 	host.listErr = errors.New("no such table")
-	if err := in.loadTables(ctx); err != nil || !slices.EqualFunc(host.ran, [][]string{{"nft", "list", "table", "inet", "a"}}, slices.Equal) {
+	if err := in.loadTables(ctx, none); err != nil || !slices.EqualFunc(host.ran, [][]string{{"nft", "list", "table", "inet", "a"}}, slices.Equal) {
 		t.Errorf("rolled back: %v, ran %v", err, host.ran)
 	}
 	if _, err := os.Stat(in.path(TablesFile)); !errors.Is(err, os.ErrNotExist) {
@@ -109,8 +110,135 @@ func TestEveryStartLoadsTheServicesTables(t *testing.T) {
 	var log bytes.Buffer
 	docker := &Installer{R: r, O: Options{Dir: t.TempDir(), Host: host, Log: &log}}
 	host.ran = nil
-	if err := docker.loadTables(ctx); err != nil || len(host.ran) != 0 || docker.gatewayStart(ctx, none) != nil || !strings.Contains(log.String(), "the services' nftables tables (ingest) are not in force on this host") || docker.tableLoads() != nil {
+	if err := docker.loadTables(ctx, none); err != nil || len(host.ran) != 0 || docker.gatewayStart(ctx, none) != nil || !strings.Contains(log.String(), "the services' nftables tables (ingest) are not in force on this host") || docker.tableLoads() != nil {
 		t.Errorf("Docker host: %v, ran %v, log %q", err, host.ran, log.String())
+	}
+}
+
+// stdinHost records each command with what it read on its stdin.
+// refuse and alsoRefuse fail a command whose stdin (or file loaded) holds them.
+type stdinHost struct {
+	ran                []string
+	refuse, alsoRefuse string
+}
+
+func (h *stdinHost) Run(_ context.Context, c Cmd) ([]byte, error) {
+	line := strings.Join(c.Args, " ")
+	if c.Stdin != nil {
+		b, _ := io.ReadAll(c.Stdin)
+		line += "\n" + string(b)
+	} else if len(c.Args) == 3 && c.Args[1] == "-f" {
+		b, _ := os.ReadFile(c.Args[2])
+		line += "\n" + string(b)
+	}
+	h.ran = append(h.ran, line)
+	if h.refuse != "" && strings.Contains(line, h.refuse) || h.alsoRefuse != "" && strings.Contains(line, h.alsoRefuse) {
+		return nil, errors.New("Error: interval overlaps with an existing one")
+	}
+	return nil, nil
+}
+
+// A service feeding another's table (feeds) carries that table's load token beside its own, so
+// the start that loads it, emptying its sets, recreates the feeder too; a service feeding none
+// carries its own token alone.
+func TestAFeederCarriesTheTokensOfTheTablesItFeeds(t *testing.T) {
+	t.Parallel()
+	r := testRelease(t, "1.0.0")
+	r.Nftables = map[string][]byte{"proxy": []byte(ingestTable), "vpn": []byte(ingestTable)}
+	r.Spec.Services = map[string]spec.Service{"proxy": {}, "vpn": {}, "ctl": {Feeds: []string{"proxy"}}, "both": {Feeds: []string{"vpn", "proxy"}}}
+	in := &Installer{R: r, O: Options{Dir: t.TempDir(), Firewall: t.TempDir(), Host: &nftHost{}}}
+	if err := in.loadTables(context.Background(), none); err != nil {
+		t.Fatal(err)
+	}
+	l := in.tableLoads()
+	if !strings.HasPrefix(l["proxy"], "load ") || l["ctl"] != "proxy "+l["proxy"] {
+		t.Errorf("proxy %q, ctl %q", l["proxy"], l["ctl"])
+	}
+	if l["both"] != "proxy "+l["proxy"]+"; vpn "+l["vpn"] {
+		t.Errorf("both %q", l["both"])
+	}
+	before := l["ctl"]
+	if err := os.WriteFile(filepath.Join(in.O.Dir, TablesDir, "proxy.load"), []byte("0123456789abcdef"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if after := in.tableLoads(); after["ctl"] == before || after["vpn"] != l["vpn"] {
+		t.Errorf("after a load of proxy: %v, before %v", after, l)
+	}
+}
+
+// Each start writes a set named in services.<name>.sets its input's elements, the set emptied
+// first: in the table's load's transaction when it loads, in one of its own when the table holds
+// (never an empty set between two commands), the script kept for the boot; a blank input leaves it
+// empty; an element nft does not read fails the start before any table loads, naming the input and
+// the key; a set nft refuses names the sets' key; a host whose firewall is its operator's is
+// given none.
+func TestEveryStartFillsTheSetsFromTheirInputs(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	host := &stdinHost{}
+	r := testRelease(t, "1.0.0")
+	r.Nftables = map[string][]byte{"ingest": []byte(ingestTable)}
+	r.Spec.Services = map[string]spec.Service{"ingest": {Sets: map[string]string{"probes": "PROBES", "peers": "PEERS"}}}
+	in := &Installer{R: r, O: Options{Dir: t.TempDir(), Firewall: t.TempDir(), Host: host}}
+	vals := map[string]string{"PROBES": "192.0.2.7, 198.51.100.0/24 ,", "PEERS": " "}
+	get := func(k string) string { return vals[k] }
+	script := "flush set inet ingest peers\nflush set inet ingest probes\nadd element inet ingest probes { 192.0.2.7, 198.51.100.0/24 }\n"
+	f := filepath.Join(in.O.Dir, TablesDir, "ingest.nft")
+	if err := in.loadTables(ctx, get); err != nil {
+		t.Fatal(err)
+	}
+	if len(host.ran) != 1 || !strings.HasPrefix(host.ran[0], "nft -f "+f+".next\n") || !strings.HasSuffix(host.ran[0], ingestTable+script) {
+		t.Errorf("load: ran %q", host.ran)
+	}
+	if b, _ := os.ReadFile(strings.TrimSuffix(f, ".nft") + SetsSuffix); string(b) != script {
+		t.Errorf("kept %q", b)
+	}
+	if b, _ := os.ReadFile(f); strings.Contains(string(b), "add element") {
+		t.Errorf("the table's file holds the sets:\n%s", b)
+	}
+	// The table holds: the sets alone, in one transaction.
+	host.ran, vals["PEERS"] = nil, "192.0.2.1"
+	if err := in.loadTables(ctx, get); err != nil {
+		t.Fatal(err)
+	}
+	held := "flush set inet ingest peers\nadd element inet ingest peers { 192.0.2.1 }\nflush set inet ingest probes\nadd element inet ingest probes { 192.0.2.7, 198.51.100.0/24 }\n"
+	if !slices.Equal(host.ran, []string{"nft list table inet ingest", "nft -f -\n" + held}) {
+		t.Errorf("held: ran %q", host.ran)
+	}
+	if b, _ := os.ReadFile(strings.TrimSuffix(f, ".nft") + SetsSuffix); string(b) != held {
+		t.Errorf("kept %q", b)
+	}
+	// Unchanged since the last start: nothing written.
+	host.ran = nil
+	if err := in.loadTables(ctx, get); err != nil || !slices.Equal(host.ran, []string{"nft list table inet ingest"}) {
+		t.Errorf("unchanged: %v, ran %q", err, host.ran)
+	}
+	host.ran, host.refuse, vals["PEERS"] = nil, "ingest peers", "10.0.0.0/8, 10.1.0.0/16"
+	if err := in.loadTables(ctx, get); err == nil || !strings.Contains(err.Error(), "services.ingest.sets (PEERS, PROBES): nft refuses their elements: Error: interval overlaps") {
+		t.Errorf("refused: %v", err)
+	}
+	if b, _ := os.ReadFile(strings.TrimSuffix(f, ".nft") + SetsSuffix); string(b) != held {
+		t.Errorf("a refused script kept: %q", b)
+	}
+	host.refuse = ""
+	host.ran, host.refuse, vals["PEERS"] = nil, "", "192.0.2.1; drop"
+	if err := in.loadTables(ctx, get); err == nil || !strings.Contains(err.Error(), "PEERS (services.ingest.sets.peers): element \"192.0.2.1; drop\"") || len(host.ran) != 0 {
+		t.Errorf("%v, ran %q", err, host.ran)
+	}
+	// A release that fills no set any more loads the table again, which empties the last input's
+	// elements, and keeps no script.
+	host.ran, vals["PEERS"] = nil, "192.0.2.1"
+	r.Spec.Services = map[string]spec.Service{"ingest": {}}
+	if err := in.loadTables(ctx, get); err != nil || len(host.ran) != 2 || !strings.HasPrefix(host.ran[1], "nft -f "+f+".next\n") || strings.Contains(host.ran[1], "add element") {
+		t.Errorf("no set filled: %v, ran %q", err, host.ran)
+	}
+	if fileExists(strings.TrimSuffix(f, ".nft") + SetsSuffix) {
+		t.Error("the script stays")
+	}
+	host.ran = nil
+	in.O.Firewall = ""
+	if err := in.loadTables(ctx, get); err != nil || len(host.ran) != 0 {
+		t.Errorf("an operator's firewall: %v %q", err, host.ran)
 	}
 }
 
@@ -185,17 +313,23 @@ func TestTheSetsRouteFeedsTheServicesOwnSets(t *testing.T) {
 		t.Errorf("ran %v", host.ran)
 	}
 	host.ran = nil
-	for path, body := range map[string]string{
-		"/v1/nftables/other/sets/probes":  `{"add": ["192.0.2.1"]}`,
-		"/v1/nftables/ingest/sets/nope":   `{"add": ["192.0.2.1"]}`,
-		"/v1/nftables/ingest/sets/probes": `{"add": ["192.0.2.1 }; flush ruleset; {"]}`,
+	for _, c := range [][2]string{
+		{"/v1/nftables/other/sets/probes", `{"add": ["192.0.2.1"]}`},
+		{"/v1/nftables/ingest/sets/nope", `{"add": ["192.0.2.1"]}`},
+		{"/v1/nftables/ingest/sets/probes", `{"add": ["192.0.2.1 }; flush ruleset; {"]}`},
+		{"/v1/nftables/ingest/sets/probes", `{"add": ["probe.example.net"]}`}, // nft would resolve it
 	} {
-		if w := post(path, body); w.Code < 400 {
-			t.Errorf("%s %s: %d", path, body, w.Code)
+		if w := post(c[0], c[1]); w.Code < 400 {
+			t.Errorf("%s %s: %d", c[0], c[1], w.Code)
 		}
 	}
 	if w := post("/v1/nftables/ingest/sets/probes", `{}`); w.Code != http.StatusBadRequest {
 		t.Errorf("no element: %d", w.Code)
+	}
+	// A set an input fills is the input's alone: the next start would empty what the socket added.
+	r.Spec.Services = map[string]spec.Service{"ingest": {Sets: map[string]string{"probes": "PROBES"}}}
+	if w := post("/v1/nftables/ingest/sets/probes", `{"add": ["192.0.2.1"]}`); w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), "is filled from the input PROBES at each start") {
+		t.Errorf("an input's set: %d %s", w.Code, w.Body)
 	}
 	if len(host.ran) != 0 {
 		t.Errorf("ran %v", host.ran)
@@ -300,5 +434,122 @@ func TestAServiceCarriesItsTablesLabel(t *testing.T) {
 	}
 	if !strings.Contains(string(raw), "io.stowage.nftables: sha256:ab boot 1") || strings.Count(string(raw), "io.stowage.nftables") != 1 {
 		t.Errorf("content:\n%s", raw)
+	}
+}
+
+// An input filling a set is checked as it is given (a prompt, a flag, --answers), not first at
+// the start, after the tables loaded.
+func TestASetsInputIsCheckedAsItIsGiven(t *testing.T) {
+	t.Parallel()
+	r := testRelease(t, "1.0.0")
+	r.Spec.Inputs = append(r.Spec.Inputs, spec.Input{Key: "PROBES", Optional: true})
+	r.Spec.Services = map[string]spec.Service{"ingest": {Nftables: "ingest.nft", Sets: map[string]string{"probes": "PROBES"}}}
+	r.Spec.L4.Routes = []spec.L4Route{{Name: "feed", Protocol: "udp", Port: 17007, Upstream: "ingest:17007", AllowInput: "PROBES"}}
+	in := &Installer{R: r}
+	for _, i := range in.inputList(Loopback) {
+		if i.Key != "PROBES" {
+			continue
+		}
+		// An L4 route's allowlist too: both checks hold (a concatenation is no source).
+		if i.check == nil || i.check("192.0.2.1, 198.51.100.0/24") != nil || i.check("192.0.2.1;10.0.0.0/8") == nil || i.check("10.0.0.1 . 443") == nil {
+			t.Errorf("PROBES is not checked as a set's elements")
+		}
+		return
+	}
+	t.Error("PROBES not listed")
+}
+
+// At boot, a table loaded again has the sets its inputs filled at the last start written in the
+// same transaction, before Docker restores the containers: never empty a moment.
+func TestTheBootFillsTheSetsItEmptied(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	host := &stdinHost{}
+	r := testRelease(t, "1.0.0")
+	r.Nftables = map[string][]byte{"ingest": []byte(ingestTable)}
+	r.Spec.Services = map[string]spec.Service{"ingest": {Sets: map[string]string{"probes": "PROBES"}}}
+	in := &Installer{R: r, O: Options{Dir: t.TempDir(), Firewall: t.TempDir(), Host: host, Log: io.Discard}}
+	if err := in.loadTables(ctx, func(string) string { return "192.0.2.7" }); err != nil {
+		t.Fatal(err)
+	}
+	host.ran = nil
+	if err := in.bootTables(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if len(host.ran) != 1 || !strings.HasPrefix(host.ran[0], "nft -f -\n# ingest's nftables table") ||
+		!strings.HasSuffix(host.ran[0], ingestTable+"flush set inet ingest probes\nadd element inet ingest probes { 192.0.2.7 }\n") {
+		t.Errorf("ran %q", host.ran)
+	}
+	// Sets nft refuses now: the table loads alone, said.
+	host.ran, host.refuse = nil, "add element"
+	err := in.bootTables(ctx)
+	if err == nil || !strings.Contains(err.Error(), "services.ingest.sets (PROBES): nft refuses their elements at boot, so the table loads without them") ||
+		len(host.ran) != 2 || !strings.HasPrefix(host.ran[1], "nft -f "+filepath.Join(in.O.Dir, TablesDir, "ingest.nft")) {
+		t.Errorf("%v, ran %q", err, host.ran)
+	}
+	// The boot's start finds the table held, its sets empty: it writes them again.
+	host.ran, host.refuse = nil, ""
+	if err := in.loadTables(ctx, func(string) string { return "192.0.2.7" }); err != nil ||
+		!slices.Equal(host.ran, []string{"nft list table inet ingest", "nft -f -\nflush set inet ingest probes\nadd element inet ingest probes { 192.0.2.7 }\n"}) {
+		t.Errorf("the boot's start: %v, ran %q", err, host.ran)
+	}
+	// The table itself refused: said as the table's, not the sets'.
+	host.ran, host.refuse = nil, "table inet ingest"
+	if err := in.bootTables(ctx); err == nil || strings.Contains(err.Error(), "sets") || !strings.Contains(err.Error(), "services.ingest.nftables: its table does not load at boot") {
+		t.Errorf("the table refused: %v", err)
+	}
+}
+
+// A held table whose sets nft refuses leaves the others made all the same: a changed one loads.
+func TestARefusedSetLeavesTheOtherTablesMade(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	host := &stdinHost{}
+	r := testRelease(t, "1.0.0")
+	r.Nftables = map[string][]byte{"a": []byte(strings.Replace(ingestTable, "ingest", "a", 1)), "b": []byte(strings.Replace(ingestTable, "ingest", "b", 1))}
+	r.Spec.Services = map[string]spec.Service{"a": {Sets: map[string]string{"probes": "A"}}, "b": {}}
+	in := &Installer{R: r, O: Options{Dir: t.TempDir(), Firewall: t.TempDir(), Host: host}}
+	vals := map[string]string{"A": "192.0.2.1"}
+	get := func(k string) string { return vals[k] }
+	if err := in.loadTables(ctx, get); err != nil {
+		t.Fatal(err)
+	}
+	host.ran, host.refuse, vals["A"] = nil, "inet a probes", "192.0.2.2"
+	r.Nftables["b"] = []byte(strings.Replace(string(r.Nftables["b"]), "ipv4_addr", "ipv6_addr", 1))
+	err := in.loadTables(ctx, get)
+	if err == nil || !strings.Contains(err.Error(), "services.a.sets (A): nft refuses their elements") ||
+		!slices.ContainsFunc(host.ran, func(l string) bool { return strings.HasPrefix(l, "nft -f "+in.tableFile("b", ".nft.next")) }) {
+		t.Errorf("%v, ran %q", err, host.ran)
+	}
+	// b refused too: a's refusal is said with b's.
+	host.ran, host.alsoRefuse, vals["A"] = nil, "ether_addr", "192.0.2.3"
+	r.Nftables["b"] = []byte(strings.Replace(string(r.Nftables["b"]), "ipv6_addr", "ether_addr", 1))
+	if err := in.loadTables(ctx, get); err == nil || !strings.Contains(err.Error(), "services.a.sets (A): nft refuses their elements") || !strings.Contains(err.Error(), "services.b.nftables: nft refuses its table") {
+		t.Errorf("both refused: %v", err)
+	}
+}
+
+// A held table whose sets' script does not read loads again with its sets: what they hold is
+// unknown.
+func TestAnUnreadSetsScriptLoadsTheTableAgain(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	host := &stdinHost{}
+	r := testRelease(t, "1.0.0")
+	r.Nftables = map[string][]byte{"ingest": []byte(ingestTable)}
+	r.Spec.Services = map[string]spec.Service{"ingest": {Sets: map[string]string{"probes": "PROBES"}}}
+	in := &Installer{R: r, O: Options{Dir: t.TempDir(), Firewall: t.TempDir(), Host: host}}
+	get := func(string) string { return "192.0.2.7" }
+	if err := in.loadTables(ctx, get); err != nil {
+		t.Fatal(err)
+	}
+	// A link to itself, which no one reads (root included).
+	f := in.tableFile("ingest", SetsSuffix)
+	if err := os.Remove(f); err != nil || os.Symlink(f, f) != nil {
+		t.Fatal(err)
+	}
+	host.ran = nil
+	if err := in.loadTables(ctx, get); err != nil || len(host.ran) != 2 || !strings.HasPrefix(host.ran[1], "nft -f "+in.tableFile("ingest", ".nft.next")) {
+		t.Errorf("%v, ran %q", err, host.ran)
 	}
 }

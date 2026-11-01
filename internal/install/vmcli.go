@@ -363,8 +363,8 @@ func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(
 				return err
 			}
 			printUpdate(stdout, u)
-			if !u.Available {
-				return nil
+			if err := refusedVersion(version, u); err != nil || !u.Available {
+				return err
 			}
 			if !yes {
 				p := terminal(accessible)
@@ -787,7 +787,7 @@ func printUpdate(w io.Writer, u Update) {
 		defer fmt.Fprintf(w, "the VM runs the passive system (a boot that failed went back to it): `upgrade --version %s` writes %s's latest revision (%s again when it is that one) to the active slot\n", u.Current.Version, u.Current.Version, u.Current)
 	}
 	if u.LeftByRollback {
-		fmt.Fprintf(w, "no upgrade on %s: the install went back from %s, and the boot does not upgrade to it again\n", u.Channel, u.Target)
+		fmt.Fprintf(w, "no upgrade on %s: the install went back from %s, and the boot does not upgrade to it again: a new revision of %s is the way forward\n", u.Channel, u.Target, u.Target.Version)
 		return
 	}
 	if !u.Available {
@@ -801,6 +801,20 @@ func printUpdate(w io.Writer, u Update) {
 	fmt.Fprintf(w, "%s on %s: this OS runs %s\n", u.Target, u.Channel, u.Current)
 	if u.Changelog != "" {
 		fmt.Fprintf(w, "\n%s\n", strings.TrimSpace(u.Changelog))
+	}
+}
+
+// refusedVersion is upgrade's error when the version it was asked for (--version) is one it does
+// not write, the release the OS already carries aside: a script that asked for a version then
+// tells "nothing to do" (exit 0) from "refused".
+func refusedVersion(version string, u Update) error {
+	switch {
+	case version == "" || u.Available || u.Target == u.Current:
+		return nil
+	case u.LeftByRollback:
+		return fmt.Errorf("upgrade --version %s: refused, the install went back from %s; publish a new revision of %s to upgrade to it", version, u.Target, u.Target.Version)
+	default:
+		return fmt.Errorf("upgrade --version %s: refused, %s is not one this VM, which runs %s, can be upgraded to: yanked, published without an OS bundle, or not after it", version, u.Target, u.Current)
 	}
 }
 

@@ -1824,7 +1824,7 @@ func TestUDPPortFree(t *testing.T) {
 // wildcard a local resolver's stub keeps a bind from; another route's UDP port is probed there.
 func TestAHostNetworkRouteIsProbedWhereItsServiceBinds(t *testing.T) {
 	t.Parallel()
-	dns := spec.L4Route{Name: "dns", Protocol: "udp", Port: 53, Upstream: "resolver:53", Interface: "vpn0"}
+	dns := spec.L4Route{Name: "dns", Protocol: "udp", Port: 53, Upstream: "resolver:53", Interfaces: []string{"vpn0"}}
 	run := func(r spec.L4Route, fw string) ([]string, error) {
 		var probed []string
 		in := &Installer{

@@ -120,7 +120,7 @@ func TestADockerHostAppliesNothingOfTheGatewayWithoutConsent(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	in, host, log := gateway(t, 0)
-	if err := in.loadTables(ctx); err != nil {
+	if err := in.loadTables(ctx, none); err != nil {
 		t.Fatal(err)
 	}
 	if err := in.gatewayStart(ctx, none); err != nil {
@@ -156,7 +156,7 @@ func TestAConsentedStartAppliesTheGatewayAsRootAlone(t *testing.T) {
 	if err := in.writeGateway(gatewayRecord{Digest: dirDigest(in.gatewayDir()), Dir: in.gatewayDir()}); err != nil {
 		t.Fatal(err)
 	}
-	if err := in.loadTables(ctx); err != nil {
+	if err := in.loadTables(ctx, none); err != nil {
 		t.Fatal(err)
 	}
 	if err := in.gatewayStart(ctx, none); err != nil {
@@ -166,7 +166,7 @@ func TestAConsentedStartAppliesTheGatewayAsRootAlone(t *testing.T) {
 		t.Errorf("not root: ran %v, log %q", host.ran, *log)
 	}
 	in.O.Euid = func() int { return 0 }
-	if err := in.loadTables(ctx); err != nil {
+	if err := in.loadTables(ctx, none); err != nil {
 		t.Fatal(err)
 	}
 	if err := in.gatewayStart(ctx, none); err != nil {
@@ -283,7 +283,7 @@ func TestTheGatewaysNetworkdFilesAreTheInstallsAlone(t *testing.T) {
 	}
 	// Nothing is applied from it: a start as root says so, and loads no table.
 	*log, host.ran = nil, nil
-	if err := in.loadTables(ctx); err != nil || in.gatewayStart(ctx, none) != nil || host.did("nft") || !strings.Contains(strings.Join(*log, ""), "nothing of the stack's network declarations is applied (fix it, or remove it and `notes-stow tune --apply` again)") {
+	if err := in.loadTables(ctx, none); err != nil || in.gatewayStart(ctx, none) != nil || host.did("nft") || !strings.Contains(strings.Join(*log, ""), "nothing of the stack's network declarations is applied (fix it, or remove it and `notes-stow tune --apply` again)") {
 		t.Errorf("start: %v %q %v", err, *log, host.ran)
 	}
 	if st := in.gatewayStatus(none); !strings.HasPrefix(st, "not applied: ") {
@@ -299,7 +299,7 @@ func TestTuneApplyConsentsAndRevertRemovesTheGateway(t *testing.T) {
 	in.O.Exec = func(_ context.Context, exe string, args []string) error {
 		started = append([]string{exe}, args...)
 		// The start applies them, as a start does.
-		if err := in.loadTables(ctx); err != nil {
+		if err := in.loadTables(ctx, none); err != nil {
 			return err
 		}
 		return in.gatewayStart(ctx, none)
@@ -341,7 +341,7 @@ func TestTuneApplyConsentsAndRevertRemovesTheGateway(t *testing.T) {
 	host.ran = nil
 	var log []string
 	in.O.Log = writerFunc(func(p []byte) { log = append(log, string(p)) })
-	if err := in.loadTables(ctx); err != nil || in.gatewayStart(ctx, none) != nil || host.did("nft") || host.did("iptables-restore") || !strings.Contains(strings.Join(log, ""), "the consent to the stack's network declarations is withdrawn, but not all it applied is removed") {
+	if err := in.loadTables(ctx, none); err != nil || in.gatewayStart(ctx, none) != nil || host.did("nft") || host.did("iptables-restore") || !strings.Contains(strings.Join(log, ""), "the consent to the stack's network declarations is withdrawn, but not all it applied is removed") {
 		t.Errorf("a revoked consent applied: %v %v %q", err, host.ran, log)
 	}
 	host.xErr = nil
@@ -352,7 +352,7 @@ func TestTuneApplyConsentsAndRevertRemovesTheGateway(t *testing.T) {
 	if err := in.writeGateway(gatewayRecord{Digest: dirDigest(in.gatewayDir()), Dir: in.gatewayDir()}); err != nil {
 		t.Fatal(err)
 	}
-	if err := in.loadTables(ctx); err != nil {
+	if err := in.loadTables(ctx, none); err != nil {
 		t.Fatal(err)
 	}
 	host.deleteErr = errors.New("busy")
@@ -508,7 +508,7 @@ func TestTheTablesLoadedAreTheKernelsAsRoot(t *testing.T) {
 	if err := in.writeGateway(gatewayRecord{Digest: dirDigest(in.gatewayDir()), Dir: in.gatewayDir()}); err != nil {
 		t.Fatal(err)
 	}
-	if err := in.loadTables(ctx); err != nil {
+	if err := in.loadTables(ctx, none); err != nil {
 		t.Fatal(err)
 	}
 	if got := in.loadedTables(ctx); !slices.Equal(got, []string{"vpn"}) {
@@ -591,7 +591,7 @@ func TestAMovedInstallRevertsWhereItIs(t *testing.T) {
 	ctx := context.Background()
 	in, host, _ := gateway(t, 0)
 	in.O.Exec = func(context.Context, string, []string) error {
-		if err := in.loadTables(ctx); err != nil {
+		if err := in.loadTables(ctx, none); err != nil {
 			return err
 		}
 		return in.gatewayStart(ctx, none)
@@ -624,7 +624,7 @@ func TestTheBootLoadsTheTablesBeforeDocker(t *testing.T) {
 	if err := in.writeGateway(gatewayRecord{Digest: dirDigest(in.gatewayDir()), Dir: in.gatewayDir()}); err != nil {
 		t.Fatal(err)
 	}
-	if err := in.loadTables(ctx); err != nil {
+	if err := in.loadTables(ctx, none); err != nil {
 		t.Fatal(err)
 	}
 	before := in.tableLoads()
@@ -656,7 +656,7 @@ func TestTheBootLoadsTheTablesBeforeDocker(t *testing.T) {
 	}
 	// The boot's start finds them loaded: it loads none again.
 	host.ran = nil
-	if err := in.loadTables(ctx); err != nil || host.did("nft -f") {
+	if err := in.loadTables(ctx, none); err != nil || host.did("nft -f") {
 		t.Errorf("the start loaded again: %v %v", err, host.ran)
 	}
 	// One whose file nft refuses: the other loads, the error names it.
@@ -737,5 +737,29 @@ func TestSystemdArg(t *testing.T) {
 		if got := systemdArg(in); got != want {
 			t.Errorf("%q: %s, want %s", in, got, want)
 		}
+	}
+}
+
+// On a consented Docker host, a set fed through the VM's app socket (its service, or a feeder of
+// its table, given the socket) and filled by no input is warned: nothing feeds it there; a set an
+// input fills, and a table no socket holder feeds, are not.
+func TestADockerHostWarnsOfASetOnlyTheAppSocketFeeds(t *testing.T) {
+	t.Parallel()
+	in, _, log := gateway(t, 0)
+	in.R.Nftables["vpn"] = []byte("table inet vpn {\n\tset peers {\n\t\ttype ipv4_addr\n\t}\n\tset allowed {\n\t\ttype ipv4_addr\n\t}\n}\n")
+	in.R.Nftables["probe"] = []byte("table inet probe {\n\tset seen {\n\t\ttype ipv4_addr\n\t}\n}\n")
+	in.R.Spec.Services = map[string]spec.Service{"vpn": {Sets: map[string]string{"allowed": "ALLOWED"}}, "api": {Feeds: []string{"vpn"}}, "probe": {}}
+	in.R.Spec.Shapes.Kairos = &spec.KairosShape{HostAPI: []string{"api"}}
+	if err := in.writeGateway(gatewayRecord{Digest: dirDigest(in.gatewayDir()), Dir: in.gatewayDir()}); err != nil {
+		t.Fatal(err)
+	}
+	// A start prepares twice after a pull: warned once.
+	for range 2 {
+		in.warnSocketFed()
+	}
+	got := strings.Join(*log, "")
+	if strings.Count(got, "set peers") != 1 || !strings.Contains(got, "warning: the set peers of the table inet vpn is fed through the VM's app socket, which a Docker host does not serve: it stays as the table declares it here unless its own rules fill it (services.vpn.sets fills a set from an input)") ||
+		strings.Contains(got, "set allowed") || strings.Contains(got, "inet probe") {
+		t.Errorf("log %q", got)
 	}
 }

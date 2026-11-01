@@ -3,6 +3,28 @@
 Stowage's own releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
+## [0.20.0]
+
+### Added
+- **`services.<name>.feeds`**: a service feeding another's nftables sets through the app socket
+  is recreated when that table loads, as the table's own service is, so it feeds them again; the
+  socket's token can stay off the service clients face.
+- **`services.<name>.sets`**: a table's named set filled from an input at each start, on Docker
+  and the VM alike (an allow-list as an operator setting).
+- **`l4.routes[].interfaces`**: a route opens on several roles at once (a resolver on a VPN and a
+  client LAN, never the uplink). It replaces `interface`.
+
+### Changed
+- **`upgrade --version V` exits non-zero when it refuses V** (the install went back from it, or
+  it is not an upgrade), and still 0 when V is installed already; the message says a new
+  revision is the way forward.
+- **A Docker host warns of a set only the VM's app socket feeds**, which stays empty there.
+- **The app socket's sets route takes literal elements only** (addresses, prefixes, ports and
+  ranges written as such): a host or service name, which nft would resolve, is refused, and so
+  is a write to a set an input fills.
+- **Lint warns of a guarded front route to a service on the host's network**: every container of
+  the stack reaches that port directly, past the guard.
+
 ## [0.19.1] - 2026-10-31
 
 ### Fixed

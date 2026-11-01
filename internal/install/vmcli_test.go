@@ -290,6 +290,35 @@ func TestUpdatesSaysWhenTheInstallWentBackFromTheTarget(t *testing.T) {
 	}
 }
 
+// upgrade --version exits non-zero when the version asked for is refused, and 0 when it is the
+// release the OS carries already, or when no version was asked for.
+func TestUpgradeVersionRefusedIsAnError(t *testing.T) {
+	t.Parallel()
+	for _, c := range []struct {
+		name string
+		args []string
+		u    Update
+		want string
+	}{
+		{"went back", []string{"--version", "2.0.0"}, Update{Channel: "stable", Current: Version{"1.0.0", 1}, Target: Version{"2.0.0", 1}, LeftByRollback: true}, "publish a new revision of 2.0.0"},
+		{"older", []string{"--version", "0.9.0"}, Update{Channel: "stable", Current: Version{"1.0.0", 1}, Target: Version{"0.9.0", 1}}, "is not one this VM, which runs 1.0.0 (revision 1), can be upgraded to"},
+		{"installed", []string{"--version", "1.0.0"}, Update{Channel: "stable", Current: Version{"1.0.0", 1}, Target: Version{"1.0.0", 1}}, ""},
+		{"channel went back", nil, Update{Channel: "stable", Current: Version{"1.0.0", 1}, Target: Version{"2.0.0", 1}, LeftByRollback: true}, ""},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			e := vmEnv(t, "1.0.0")
+			mux := http.NewServeMux()
+			mux.HandleFunc("GET /v1/updates", func(w http.ResponseWriter, _ *http.Request) { reply(w, 200, c.u) })
+			mux.HandleFunc("POST /v1/upgrade", func(w http.ResponseWriter, _ *http.Request) { t.Error("upgrade started") })
+			out, err := ctl(e, servedHandler(t, mux), append([]string{"upgrade", "--yes"}, c.args...)...)
+			if c.want == "" && err != nil || c.want != "" && (err == nil || !strings.Contains(err.Error(), c.want)) {
+				t.Errorf("%v\n%s", err, out)
+			}
+		})
+	}
+}
+
 func TestFollowReadsOnFromTheDaemonsTotal(t *testing.T) {
 	t.Parallel()
 	e := vmEnv(t, "1.0.0")

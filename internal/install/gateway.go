@@ -623,7 +623,7 @@ func (in *Installer) gatewayRevert(ctx context.Context) error {
 			errs = append(errs, err)
 		}
 	}
-	errs = append(errs, in.syncTables(ctx, nil), in.dropForward(ctx))
+	errs = append(errs, in.syncTables(ctx, nil, nil), in.dropForward(ctx))
 	if raw, err := os.ReadFile(in.path(TablesFile)); err == nil && len(strings.Fields(string(raw))) > 0 {
 		errs = append(errs, fmt.Errorf("the nftables tables %s are still loaded", strings.Join(strings.Fields(string(raw)), ", ")))
 	}

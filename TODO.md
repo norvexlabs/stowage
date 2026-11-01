@@ -47,7 +47,47 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
    Before writing a module, read the latest provider's official docs and its schema, and pin that
    release.
 
+### Next batch — found iterating a release on the VM
+
+1. **An installed VM cannot gain the NIC a new release names, nor re-address a secondary one**:
+   a NIC is attached, named (`10-<name>-<role>.link`) and addressed (`--interface
+   ROLE=static,address=…`) by `vm create` alone. A release adding a role (a gateway's client
+   LAN beside its uplink) upgrades an installed VM to "no NIC of this VM is named <role>: its
+   ports reach nothing", and `network set` addresses the primary only. The way forward is a new
+   VM, which loses what the old one holds (its data volumes, a VPN node's identity, a CA) unless
+   the operator moves it by hand. Give `vm` a verb that attaches a NIC for a role to an existing
+   VM (the platform's NIC on the module's state, the `.link` and `.network` written over SSH,
+   then a reboot), and `network set --role ROLE --mode static|dhcp|none` for a secondary NIC,
+   with the same revert window as the primary's.
+2. **A stack without a database cannot back up its volumes, so a disaster recovery loses
+   them**: `backup` (and its `volumes`) is refused without a `database` ("a backup dumps the
+   database, and the project declares none"), so `secrets export` → `vm create --secrets` brings
+   back the secrets alone. A stack whose state is files — a private CA's key, a VPN node's
+   identity, an operator-edited configuration — comes back empty: new CA (every client must
+   trust it again), a new VPN node (approved again), edits lost, unless the operator tars the
+   volumes over SSH by hand. Allow `backup: { provider: volumes-age-rclone, volumes: […] }` (or
+   `backup.volumes` with no database), restored by `restore` onto a machine made with
+   `--secrets`, which then awaits it as it awaits a dump.
+
 ## Should
+
+- **A set's input default holding a variable is checked at the start only**: lint skips a
+  `services.<name>.sets` input whose `default` holds `${…}`, and the expanded default is not
+  checked before the start, which then fails after the tables loaded.
+- **A host-network service's ports, per client container**: the VM accepts them from every
+  container of the stack (`iifname "br-*"`); lint warns of a guarded front route to one. Accepting
+  each port only from the containers that reach it (the front, a dependent) needs addresses
+  Stowage owns: a network of its own per target with a subnet Stowage picks and its gateway as
+  the target's name, or the containers' addresses kept in a set the host daemon refreshes on
+  Docker's events.
+
+- **How many NICs of a role is an install's choice, not the release's**: `host.interfaces`
+  fixes the roles, so a gateway serving one client LAN on one site and three on another needs
+  `lan1` … `lanN` declared in every release, their `forward`, `transparent` and L4 routes
+  repeated, and the unused ones warned on every VM ("its ports reach nothing"). Let a role be
+  declared once as a family (`lan: { count: { max: 4 } }`, named `lan0` … on the VM, the
+  service's table matching `iifname "lan*"`) and an install name as many NICs of it as it has,
+  `vm create --interface lan=…` repeated; a role an install names no NIC for then says nothing.
 
 - **A NIC role's device on a Docker host, beyond `--interface`**: the forwarding and `tune`'s
   rules name the NIC `--interface ROLE=NIC` recorded; the `primary` role could default to the
@@ -354,6 +394,12 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
   repositories.
 
 ## Could
+
+- **Parallel suites race on grype's database**: `test/lib.sh`'s `grype_db` deletes every archive
+  but the latest that is over an hour old, so when grype publishes a new database during a gate
+  run, the first suite to fetch it deletes the one another suite is scanning with (`--db: stat …:
+  no such file or directory`, e2e-docker's "audit through the mirror"). Keep the previous archive
+  too (the two newest), or delete under a lock no suite holds.
 
 - **An interrupt that fired once before the boot moved it**: `tune --check` judges a NIC
   interrupt that never fired (`per_cpu_count` all zeros) by the affinity asked, since the kernel
