@@ -3,7 +3,7 @@
 Stowage's own releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
-## [0.22.0]
+## [0.22.0] - 2026-11-01
 
 ### Added
 - `optional: true` on a `host.interfaces` NIC role: a NIC some machines alone have. Absent, `tune`
