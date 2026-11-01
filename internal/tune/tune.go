@@ -38,8 +38,9 @@ type Host struct {
 	// Reserved are the ports the stack listens on that the network profile's range of local
 	// ports holds: the kernel never gives them to an outgoing connection.
 	Reserved []int
-	// Settings are the project's own kernel settings (host.sysctls), written after the profile's:
-	// none is a key a profile sets.
+	// Settings are the project's own kernel settings (host.sysctls) and those its host.interfaces
+	// call for on a host Stowage owns (the ARP settings of several NIC roles), written after the
+	// profile's: none is a key a profile sets.
 	Settings []Sysctl
 	// Isolated are the CPUs of the services' whole cores that the NICs' interrupts and receive
 	// steering stay off (System.isolated).

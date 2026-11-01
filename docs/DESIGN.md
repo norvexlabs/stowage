@@ -1599,6 +1599,16 @@ every shape, the VM end-to-end test upgrading through it), then the health gate.
   keeps its NICs as its cloud-config named them: the override matches what the seed's own file
   matches, never a guess from the running release; a port on a role no NIC is named for fails
   closed (warned), as opening it on the other interfaces is what the role was declared against.
+  An optional role is a NIC some sites have and others do not: its absence is the machine's shape,
+  not drift, so it is neither reported nor warned, and `vm create` makes it only on demand — a
+  cloud's one-NIC VM then takes the release. Of more than one NIC role, the kernel's ARP defaults
+  (any NIC answers for any address of the host) let a client on an L2 two roles share reach a
+  role's address through another NIC, past its per-interface rules: `arp_ignore=1` and
+  `arp_announce=2` are set on `all` alone, as the kernel takes the larger of `all`'s and a NIC's,
+  so one attached later is covered without a per-NIC key that would need the NIC present; a
+  project's own `all` value is its decision, and a NIC's or `default`'s value below `all`'s is refused at lint
+  rather than overridden in silence (the kernel takes the larger), naming the `all` key to set. The VM alone: a Docker host's ARP is its operator's (an address on
+  `lo`, a VIP, answers on any NIC there by design).
   A NIC a later release names is attached (`vm attach`, `network attach`) rather than the VM made
   again, which would lose its data: the seed is pulled once, at the first boot, so the NIC is
   recorded on the VM and written as a cloud-config of its own on the OEM partition, which every boot

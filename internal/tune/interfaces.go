@@ -22,7 +22,9 @@ type Interface struct {
 	// intercepts traffic on it (a transparent socket).
 	Forward     []string
 	Transparent bool
-	Reason      string
+	// Optional: a NIC some machines alone have, its absence no difference.
+	Optional bool
+	Reason   string
 	// Applied: the install's starts apply its forwarding (a consented Docker host): reported so,
 	// not advised.
 	Applied bool
@@ -126,6 +128,8 @@ func (s System) inspectInterfaces(ctx context.Context) []Item {
 		switch {
 		case !ok && i.Kind == "tun":
 			items = append(items, Item{NA, "interface", i.Role, "absent: its service opens it", "present" + why})
+		case !ok && i.Optional:
+			items = append(items, Item{NA, "interface", i.Role, "absent: optional", "present where the machine has it" + why})
 		case !ok:
 			items = append(items, Item{Differs, "interface", i.Role, "absent", "present" + why})
 		case i.MTU != 0 && mtu != strconv.Itoa(i.MTU):

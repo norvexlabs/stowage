@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/norvexlabs/stowage/internal/spec"
@@ -41,11 +42,18 @@ func (in *Installer) tuneSystem(ctx context.Context) (tune.System, error) {
 		// record holds those rules), through roles that each have a device here, is reported so
 		// rather than advised.
 		cur, _ := os.ReadFile(in.forwardRecord())
-		want, _ := forwardRules(in.R.Spec.Host, in.forwardChain(), func(r string) string { return in.roleDevice(r, get) })
-		applied := in.gatewayConsented() && want != nil && bytes.Equal(cur, want)
+		want, unmapped := forwardRules(in.R.Spec.Host, in.forwardChain(), func(r string) string { return in.roleDevice(r, get) })
+		applied := in.gatewayConsented() && want != nil && bytes.Equal(cur, want) && len(unmapped) == 0
+		// An optional role without its NIC here is no difference: nothing forwards through it nor
+		// is intercepted on it, so no rule names it.
+		absent := func(r string) bool { return in.R.Spec.Host.Interfaces[r].Optional && in.roleDevice(r, get) == "" }
 		for i := range sys.Interfaces {
 			ti := &sys.Interfaces[i]
-			ti.Applied = applied && !slices.Contains(slices.Collect(maps.Values(ti.Devices)), "")
+			if absent(ti.Role) {
+				ti.Forward, ti.Transparent = nil, false
+			}
+			ti.Forward = slices.DeleteFunc(slices.Clone(ti.Forward), absent)
+			ti.Applied = applied
 		}
 	}
 	out, err := in.O.Docker.Run(ctx, Cmd{Args: []string{"info", "--format", "{{.ServerVersion}}|{{.OperatingSystem}}|{{json .SecurityOptions}}"}})
@@ -389,7 +397,7 @@ func releaseHost(sys *tune.System, s *spec.Spec) {
 	for _, r := range slices.Sorted(maps.Keys(s.Host.Interfaces)) {
 		i := s.Host.Interfaces[r]
 		ti := tune.Interface{Role: r, Kind: cmp.Or(i.Kind, spec.InterfaceNIC), MTU: i.MTU,
-			RoutingPolicyRules: i.RoutingPolicyRules, Routes: i.Routes, Forward: i.Forward, Reason: i.Reason}
+			RoutingPolicyRules: i.RoutingPolicyRules, Routes: i.Routes, Forward: i.Forward, Optional: i.Optional, Reason: i.Reason}
 		for _, svc := range s.Services {
 			ti.Transparent = ti.Transparent || slices.Contains(svc.Transparent, r)
 		}
@@ -415,7 +423,32 @@ func releaseHost(sys *tune.System, s *spec.Spec) {
 		c := s.Host.Sysctls[k]
 		sys.Settings = append(sys.Settings, tune.Sysctl{Key: k, Want: c.Value, Why: c.Reason, Rule: tune.Exact})
 	}
+	if sys.Owned {
+		sys.Settings = append(sys.Settings, arpSettings(s.Host)...)
+	}
 	sys.Power = s.Host.Power
+}
+
+// arpSettings are the kernel's ARP settings of a VM of more than one NIC role (an optional one
+// included: the release's, whatever NICs this machine has): each NIC answers ARP for its own
+// addresses alone (arp_ignore=1) and asks with the address of the NIC it sends from
+// (arp_announce=2), so a client on an L2 two roles share caches each address with its own NIC's
+// MAC. The kernel takes the larger of all's and a NIC's value, so all's covers every NIC, one
+// attached later included, and a NIC's own larger value holds; a setting host.sysctls gives all
+// is the project's (a NIC's or default's lower one is lint's error: all's would override it). None
+// for one NIC role or none.
+func arpSettings(h *spec.Host) []tune.Sysctl {
+	if h.NICRoles() < 2 {
+		return nil
+	}
+	why := "more than one NIC role (host.interfaces): each NIC answers ARP for its own addresses alone"
+	var out []tune.Sysctl
+	for _, name := range slices.Sorted(maps.Keys(spec.ARPSettings)) {
+		if _, own := h.Sysctls[spec.ARPKey(name)]; !own {
+			out = append(out, tune.Sysctl{Key: spec.ARPKey(name), Want: strconv.Itoa(spec.ARPSettings[name]), Why: why, Rule: tune.Exact})
+		}
+	}
+	return out
 }
 
 // runHost runs a host program, its error carrying what it wrote to stderr.

@@ -230,6 +230,11 @@ on_vm cat /proc/cmdline | grep -qw 'iommu=pt' || fail "the VM booted without its
 [[ $(on_vm cat /proc/sys/vm/swappiness) == 10 ]] || fail "vm.swappiness is not the project's 10 (host.sysctls)"
 grep -qE "^ok +kernel iommu=pt " "$WORK/tune.txt" && grep -qE "^ok +sysctl vm.swappiness " "$WORK/tune.txt" ||
 	{ cat "$WORK/tune.txt"; fail "tune does not report the kernel argument and the setting as asked"; }
+# Two NIC roles on one bridge: each NIC answers ARP for its own addresses alone.
+[[ $(on_vm cat /proc/sys/net/ipv4/conf/all/arp_ignore)/$(on_vm cat /proc/sys/net/ipv4/conf/all/arp_announce) == 1/2 ]] ||
+	fail "arp_ignore/arp_announce are not 1/2 on a VM of two NIC roles"
+grep -qE "^ok +sysctl net.ipv4.conf.all.arp_ignore " "$WORK/tune.txt" && grep -qE "^ok +sysctl net.ipv4.conf.all.arp_announce " "$WORK/tune.txt" ||
+	{ cat "$WORK/tune.txt"; fail "tune does not report the ARP settings of two NIC roles"; }
 # host.power performance: the VM has no cpufreq (the hypervisor drives the CPUs' frequency).
 grep -qE "^n/a +cpu governor " "$WORK/tune.txt" || { cat "$WORK/tune.txt"; fail "tune does not report the governor as the hypervisor's"; }
 # shellcheck disable=SC2016 # expanded on the VM

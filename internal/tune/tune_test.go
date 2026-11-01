@@ -1820,10 +1820,11 @@ func TestInspectJudgesTheProjectsInterfaces(t *testing.T) {
 			NIC: &NICSettings{Combined: "max", RX: "max", Features: map[string]string{"rx-gro-list": "on", "rx-udp-gro-forwarding": "off"}}},
 		{Role: "vpn0", Kind: "tun", Reason: "the peers"},
 		{Role: "lost", Kind: "nic", Reason: "r"},
+		{Role: "spare", Kind: "nic", Optional: true, Reason: "r"},
 	}
 	s.Owned = true
 	items := s.Inspect(ctx, host(4096, 2))
-	for name, st := range map[string]State{"uplink": OK, "edge": Differs, "vpn0": NA, "lost": Differs, "edge rx-gro-list": Differs, "edge rx-udp-gro-forwarding": OK, "edge rings": Differs} {
+	for name, st := range map[string]State{"spare": NA, "uplink": OK, "edge": Differs, "vpn0": NA, "lost": Differs, "edge rx-gro-list": Differs, "edge rx-udp-gro-forwarding": OK, "edge rings": Differs} {
 		if it := find(items, "interface", name); it == nil || it.State != st {
 			t.Errorf("owned, %s: %+v, want %s", name, it, st)
 		}

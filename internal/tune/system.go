@@ -45,8 +45,9 @@ type System struct {
 	// KernelArgs are the kernel arguments the project declares, which Inspect judges against the
 	// running kernel's command line.
 	KernelArgs []KernelArg
-	// Settings are the kernel settings the project declares (host.sysctls), which the host's
-	// settings (Host.Sysctls) take after the profile's.
+	// Settings are the kernel settings the project declares (host.sysctls) and those its
+	// host.interfaces call for on a host Stowage owns (the ARP settings of several NIC roles),
+	// which the host's settings (Host.Sysctls) take after the profile's.
 	Settings []Sysctl
 	// Power is the project's posture (host.power): Performance holds the CPUs at their full speed;
 	// "" or Platform leaves them as the host has them.

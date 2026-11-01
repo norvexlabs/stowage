@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -538,6 +539,16 @@ func TestTuneNamesARolesRecordedNIC(t *testing.T) {
 	t.Fatal("no vpn0")
 }
 
+// ti is sys's interface of role, its zero value when none.
+func ti(sys tune.System, role string) tune.Interface {
+	for _, i := range sys.Interfaces {
+		if i.Role == role {
+			return i
+		}
+	}
+	return tune.Interface{}
+}
+
 // tune with a gateway record: another directory's refuses an apply of the declarations before the
 // host is changed, and a revert there leaves it and reverts the tuning; one that does not read
 // refuses both first; the forwarding a start applied, through roles with devices, is reported so.
@@ -612,6 +623,35 @@ func TestTuneWithAGatewayRecord(t *testing.T) {
 	if !applied() {
 		t.Error("not applied though a start applied it")
 	}
+	// Forwarded to an optional role this host lacks too: nothing goes through it, still applied.
+	ifs := in.R.Spec.Host.Interfaces
+	ifs["lan"] = spec.HostInterface{Optional: true}
+	ifs["vpn0"] = spec.HostInterface{Kind: spec.InterfaceTUN, Forward: []string{"uplink", "lan"}}
+	if !applied() {
+		t.Error("not applied for an optional role without its NIC")
+	}
+	in.tuned = nil
+	if sys, err := in.tuneSystem(ctx); err != nil || !slices.Equal(ti(sys, "vpn0").Forward, []string{"uplink"}) {
+		t.Errorf("the forwarding to an optional role without its NIC is reported: %+v %v", ti(sys, "vpn0"), err)
+	}
+	// An optional role that forwards itself, without its NIC here: none of its forwarding to report.
+	ifs["lan"] = spec.HostInterface{Optional: true, Forward: []string{"uplink"}}
+	in.tuned = nil
+	sys, err := in.tuneSystem(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, i := range sys.Interfaces {
+		if i.Role == "lan" && len(i.Forward) != 0 {
+			t.Errorf("an optional role without its NIC forwards: %+v", i)
+		}
+	}
+	ifs["lan"] = spec.HostInterface{}
+	if applied() {
+		t.Error("applied though a role not optional has no NIC")
+	}
+	delete(ifs, "lan")
+	ifs["vpn0"] = spec.HostInterface{Kind: spec.InterfaceTUN, Forward: []string{"uplink"}}
 	// Another NIC named since: the chain holds the old one's rules.
 	in.O.Interfaces = map[string]string{"uplink": "enp2s0"}
 	if applied() {
@@ -623,5 +663,65 @@ func TestTuneWithAGatewayRecord(t *testing.T) {
 	}
 	if applied() {
 		t.Error("applied before a start applied it")
+	}
+}
+
+// More than one NIC role (an optional one counted): the VM answers ARP for each address on its own
+// NIC alone, on all (which covers each NIC); a setting the project sets itself, on any device, is
+// its own. One NIC role, a tun device beside it, none; a Docker host's ARP is its operator's.
+func TestARPFollowsEachNICOfSeveralRoles(t *testing.T) {
+	t.Parallel()
+	owned := true
+	arp := func(s *spec.Spec) map[string]string {
+		sys := tune.System{Owned: owned}
+		releaseHost(&sys, s)
+		got := map[string]string{}
+		for _, c := range sys.Settings {
+			if strings.Contains(c.Key, ".arp_") {
+				got[c.Key] = c.Want
+			}
+		}
+		return got
+	}
+	two := &spec.Spec{Host: &spec.Host{Interfaces: map[string]spec.HostInterface{"uplink": {Primary: true}, "edge": {Optional: true}, "vpn0": {Kind: spec.InterfaceTUN}}}}
+	if got := arp(two); len(got) != 2 || got["net.ipv4.conf.all.arp_ignore"] != "1" || got["net.ipv4.conf.all.arp_announce"] != "2" {
+		t.Errorf("two NIC roles: %v", got)
+	}
+	two.Host.Sysctls = map[string]spec.HostValue{"net.ipv4.conf.all.arp_ignore": {Value: "2", Reason: "r"}}
+	if got := arp(two); len(got) != 2 || got["net.ipv4.conf.all.arp_ignore"] != "2" || got["net.ipv4.conf.all.arp_announce"] != "2" {
+		t.Errorf("the project's own arp_ignore: %v", got)
+	}
+	two.Host.Sysctls = map[string]spec.HostValue{"net.ipv4.conf.edge.arp_announce": {Value: "2", Reason: "r"}, "net.ipv4.conf.default.arp_ignore": {Value: "0", Reason: "r"}}
+	if got := arp(two); len(got) != 4 || got["net.ipv4.conf.all.arp_ignore"] != "1" || got["net.ipv4.conf.all.arp_announce"] != "2" {
+		t.Errorf("a NIC's and default's settings leave all's: %v", got)
+	}
+	two.Host.Sysctls = nil
+	two.Host.Interfaces["edge"] = spec.HostInterface{Kind: spec.InterfaceNIC}
+	if got := arp(two); len(got) != 2 {
+		t.Errorf("two NIC roles of an explicit kind: %v", got)
+	}
+	owned = false
+	if got := arp(two); len(got) != 0 {
+		t.Errorf("a Docker host: %v", got)
+	}
+	owned = true
+	one := &spec.Spec{Host: &spec.Host{Interfaces: map[string]spec.HostInterface{"uplink": {Primary: true}, "vpn0": {Kind: spec.InterfaceTUN}}}}
+	if got := arp(one); len(got) != 0 {
+		t.Errorf("one NIC role: %v", got)
+	}
+}
+
+// A role no NIC of this host plays is said, but an optional one, which this host may well lack.
+func TestAnOptionalRoleWithoutItsNICIsNotSaid(t *testing.T) {
+	t.Parallel()
+	h := &spec.Host{Interfaces: map[string]spec.HostInterface{"uplink": {Primary: true}, "lan": {Optional: true, Forward: []string{"uplink"}}, "vpn0": {Kind: spec.InterfaceTUN, Forward: []string{"uplink"}}}}
+	dev := func(r string) string { return map[string]string{"uplink": "eth0", "vpn0": "vpn0"}[r] }
+	rules, unmapped := forwardRules(h, ForwardChain, dev)
+	if len(unmapped) != 0 || !strings.Contains(string(rules), "-i vpn0 -o eth0") || strings.Contains(string(rules), "lan") {
+		t.Errorf("%v\n%s", unmapped, rules)
+	}
+	h.Interfaces["lan"] = spec.HostInterface{Forward: []string{"uplink"}}
+	if _, unmapped := forwardRules(h, ForwardChain, dev); !slices.Equal(unmapped, []string{"lan"}) {
+		t.Errorf("a role not optional: %v", unmapped)
 	}
 }

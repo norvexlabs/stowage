@@ -575,7 +575,10 @@ type HostInterface struct {
 	Kind string `yaml:"kind"`
 	// Primary is the interface of the default route, which the install's own addressing (vm
 	// create's --network, network set) is.
-	Primary            bool                `yaml:"primary"`
+	Primary bool `yaml:"primary"`
+	// Optional: a NIC some machines of the project have alone. Absent, it is no difference
+	// (tune) and logs nothing (the start); vm create makes it only when --interface names it.
+	Optional           bool                `yaml:"optional"`
 	MTU                int                 `yaml:"mtu"`
 	RoutingPolicyRules []map[string]string `yaml:"routing_policy_rules"`
 	Routes             []map[string]string `yaml:"routes"`
@@ -586,6 +589,25 @@ type HostInterface struct {
 	Ethtool *Ethtool `yaml:"ethtool"`
 	Reason  string   `yaml:"reason"`
 }
+
+// NICRoles counts host.interfaces' NIC roles (kind nic), an optional one included.
+func (h *Host) NICRoles() int {
+	n := 0
+	for _, i := range h.Interfaces {
+		if i.Kind == "" || i.Kind == InterfaceNIC {
+			n++
+		}
+	}
+	return n
+}
+
+// ARPSettings are the kernel ARP settings a VM of more than one NIC role is given on all, by
+// name, at their values: each NIC answers ARP for its own addresses alone (arp_ignore), and asks
+// with its own (arp_announce).
+var ARPSettings = map[string]int{"arp_announce": 2, "arp_ignore": 1}
+
+// ARPKey is the ARP setting name's key on all.
+func ARPKey(name string) string { return "net.ipv4.conf.all." + name }
 
 // Ethtool is one of host.interfaces' NIC settings: its channels (combined queues: max or a
 // count), its rings (rx, tx: max or a count), its features by name (on or off, each set where the

@@ -799,7 +799,8 @@ func unicastMAC(mac string) bool {
 // MAC and the network it attaches to. A VM of one such NIC needs no MAC: it is named from the NIC
 // it has. Of more, each is named by its MAC: given, else generated on a hypervisor (which creates
 // the NICs with them). A server's are its own, given for each NIC (it may have more ports). A
-// cloud names its NICs' MACs itself: it takes one, and no MAC. Nil when the release declares none.
+// cloud names its NICs' MACs itself: it takes one, and no MAC. An optional NIC is made only when
+// --interface names it. Nil when the release declares none.
 func machineInterfaces(s *spec.Spec, given []string, p Platform) ([]MachineInterface, error) {
 	var roles []string
 	primary := ""
@@ -820,8 +821,9 @@ func machineInterfaces(s *spec.Spec, given []string, p Platform) ([]MachineInter
 		return nil, nil
 	}
 	cloud := !p.ISO
-	if cloud && len(roles) > 1 {
-		return nil, fmt.Errorf("%s names its VMs' NICs itself, one here: %s declares %d (host.interfaces: %s)", p.Label, s.Name, len(roles), strings.Join(roles, ", "))
+	required := slices.DeleteFunc(slices.Clone(roles), func(r string) bool { return s.Host.Interfaces[r].Optional })
+	if cloud && len(required) > 1 {
+		return nil, fmt.Errorf("%s names its VMs' NICs itself, one here: %s requires %d (host.interfaces: %s): a hypervisor's or a server's VM takes it", p.Label, s.Name, len(required), strings.Join(required, ", "))
 	}
 	byRole := map[string]MachineInterface{}
 	for _, r := range roles {
@@ -873,6 +875,11 @@ func machineInterfaces(s *spec.Spec, given []string, p Platform) ([]MachineInter
 			return nil, fmt.Errorf("--interface %s: address= is the static mode's, and the static mode's address is required", g)
 		}
 		byRole[role] = i
+	}
+	roles = slices.DeleteFunc(roles, func(r string) bool { return s.Host.Interfaces[r].Optional && !set[r] })
+	if cloud && len(roles) > 1 {
+		asked := slices.DeleteFunc(slices.Clone(roles), func(r string) bool { return slices.Contains(required, r) })
+		return nil, fmt.Errorf("--interface %s: %s names its VMs' NICs itself, one here: leave the optional %s out", asked[0], p.Label, strings.Join(asked, ", "))
 	}
 	out := make([]MachineInterface, 0, len(roles))
 	macs := map[string]string{}

@@ -1892,6 +1892,9 @@ func (l *linter) host() {
 			l.errf(at+".value", "%q: letters, digits and _ . , : / + -, fields of one space, at most 8", c.Value)
 		case namespaced(key):
 			kept = append(kept, key)
+			l.arpSetting(at, h, key, c.Value)
+		default:
+			l.arpSetting(at, h, key, c.Value)
 		}
 		l.reason(at+".reason", c.Reason)
 	}
@@ -1919,6 +1922,35 @@ func (l *linter) host() {
 	l.interfaces(h.Interfaces)
 }
 
+// arpSetting refuses, on a VM of more than one NIC role, a NIC's or default's ARP setting below
+// all's (the project's own, else spec.ARPSettings'): the kernel takes the larger, so it would not
+// hold.
+func (l *linter) arpSetting(at string, h *spec.Host, key, value string) {
+	if l.s.Shapes.Kairos == nil || h.NICRoles() < 2 {
+		return
+	}
+	rest, ok := strings.CutPrefix(key, "net.ipv4.conf.")
+	i := strings.LastIndexByte(rest, '.')
+	if !ok || i <= 0 {
+		return
+	}
+	dev, name := rest[:i], rest[i+1:]
+	all, arp := spec.ARPSettings[name]
+	if !arp || dev == "all" {
+		return
+	}
+	if c, own := h.Sysctls[spec.ARPKey(name)]; own {
+		v, err := strconv.Atoi(c.Value)
+		if err != nil {
+			return
+		}
+		all = v
+	}
+	if v, err := strconv.Atoi(value); err == nil && v < all {
+		l.errf(at+".value", "%d is below the %s %d all holds on a VM of several NIC roles, and the kernel takes the larger: set %s to %d to choose it for every NIC", v, name, all, spec.ARPKey(name), v)
+	}
+}
+
 // interfaces checks host.interfaces: each role is an interface's name, which networkd's files,
 // the firewall's rules and tune's report carry; its routing is networkd's own settings, each
 // written into a .network file; one NIC is the default route's when any NIC is declared (a tun
@@ -1939,8 +1971,14 @@ func (l *linter) interfaces(ifs map[string]spec.HostInterface) {
 			nics++
 			if i.Primary {
 				primaries++
+				if i.Optional {
+					l.errf(at+".optional", "the primary NIC, the default route's, is every machine's")
+				}
 			}
 		case spec.InterfaceTUN:
+			if i.Optional {
+				l.errf(at+".optional", "a NIC's: a tun device is its service's, absent until it opens it")
+			}
 			if i.Primary {
 				l.errf(at+".primary", "a tun device a service opens is not the default route's")
 			}

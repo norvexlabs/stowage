@@ -463,6 +463,8 @@ func TestEachRuleFiresOnFull(t *testing.T) {
 		{"interface kind", []edit{{sp, "vpn0: { kind: tun,", "vpn0: { kind: wifi,"}}, nil, `host.interfaces.vpn0.kind: "wifi": nic (the default) or tun`},
 		{"no primary interface", []edit{{sp, "    uplink: { primary: true, ", "    uplink: { "}}, nil, "host.interfaces: 0 NICs are primary"},
 		{"a primary tun", []edit{{sp, "vpn0: { kind: tun,", "vpn0: { kind: tun, primary: true,"}}, nil, "host.interfaces.vpn0.primary: a tun device a service opens is not the default route's"},
+		{"an optional primary", []edit{{sp, "    uplink: { primary: true, ", "    uplink: { primary: true, optional: true, "}}, nil, "host.interfaces.uplink.optional: the primary NIC, the default route's, is every machine's"},
+		{"an optional tun", []edit{{sp, "vpn0: { kind: tun,", "vpn0: { kind: tun, optional: true,"}}, nil, "host.interfaces.vpn0.optional: a NIC's: a tun device is its service's"},
 		{"interface MTU", []edit{{sp, "      mtu: 1500\n", "      mtu: 1279\n"}}, nil, "host.interfaces.edge.mtu: 1279: 1280 to 9216"},
 		{"routing setting", []edit{{sp, `FirewallMark: "0x1"`, `ExecStart: "0x1"`}}, nil, `host.interfaces.edge.routing_policy_rules[0]: "ExecStart" is not one of networkd's settings here`},
 		{"routing value", []edit{{sp, `Table: "100" }]
@@ -555,6 +557,13 @@ func TestEachRuleFiresOnFull(t *testing.T) {
 		{"sysctl of a profile", []edit{{sp, "    vm.swappiness: {", "    net.netfilter.nf_conntrack_max: {"}}, nil, "host.sysctls.net.netfilter.nf_conntrack_max: is a tune profile's"},
 		{"sysctl key", []edit{{sp, "    vm.swappiness: {", "    vm/swappiness: {"}}, nil, "host.sysctls.vm/swappiness: not a kernel setting's key"},
 		{"sysctl value", []edit{{sp, "vm.swappiness: { value: \"10\"", "vm.swappiness: { value: \"10;reboot\""}}, nil, `host.sysctls.vm.swappiness.value: "10;reboot"`},
+		{"a NIC's ARP setting below all's", []edit{{sp, `    vm.swappiness: { value: "10",`, `    net.ipv4.conf.edge.arp_announce: { value: "1", reason: "r" }
+    vm.swappiness: { value: "10",`}}, nil, "host.sysctls.net.ipv4.conf.edge.arp_announce.value: 1 is below the arp_announce 2 all holds on a VM of several NIC roles, and the kernel takes the larger: set net.ipv4.conf.all.arp_announce to 1"},
+		{"default's ARP setting below all's", []edit{{sp, `    vm.swappiness: { value: "10",`, `    net.ipv4.conf.default.arp_ignore: { value: "0", reason: "r" }
+    vm.swappiness: { value: "10",`}}, nil, "host.sysctls.net.ipv4.conf.default.arp_ignore.value: 0 is below the arp_ignore 1 all holds"},
+		{"a NIC's ARP setting below the project's all", []edit{{sp, `    vm.swappiness: { value: "10",`, `    net.ipv4.conf.all.arp_ignore: { value: "2", reason: "r" }
+    net.ipv4.conf.edge.arp_ignore: { value: "1", reason: "r" }
+    vm.swappiness: { value: "10",`}}, nil, "host.sysctls.net.ipv4.conf.edge.arp_ignore.value: 1 is below the arp_ignore 2 all holds"},
 		{"sysctl without a reason", []edit{{sp, "reason: \"postgres's pages stay in RAM\"", "reason: \"\""}}, nil, "host.sysctls.vm.swappiness.reason: is required"},
 		{"power", []edit{{sp, "  power: performance", "  power: turbo"}}, nil, `host.power: "turbo": performance or platform`},
 		{"module key unknown", []edit{{sp, "pcspkr: { block: true,", "pcspkr: { blocked: true,"}}, nil, "field blocked not found"},
@@ -585,6 +594,27 @@ func TestEachRuleFiresOnFull(t *testing.T) {
 			}
 			t.Fatalf("no error containing %q; got:\n%s", c.want, strings.Join(errs, "\n"))
 		})
+	}
+}
+
+// A NIC's ARP setting at or above all's holds (the kernel takes the larger), all's being the
+// project's own where it sets it: none is refused.
+func TestANICsARPSettingAtAllsHolds(t *testing.T) {
+	t.Parallel()
+	root := testutil.CopyExample(t, "full")
+	testutil.Edit(t, root, specFile, `    vm.swappiness: { value: "10",`, `    net.ipv4.conf.edge.arp_announce: { value: "2", reason: "r" }
+    net.ipv4.conf.edge.arp_ignore: { value: "2", reason: "r" }
+    net.ipv4.conf.all.arp_ignore: { value: "0", reason: "r" }
+    net.ipv4.conf.default.arp_ignore: { value: "0", reason: "r" }
+    vm.swappiness: { value: "10",`)
+	res, err := Run(root, filepath.Join(root, specFile), now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range errorsOf(res) {
+		if strings.Contains(e, "arp_") {
+			t.Errorf("%s", e)
+		}
 	}
 }
 

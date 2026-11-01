@@ -1967,7 +1967,7 @@ func forwardRules(h *spec.Host, chain string, dev func(role string) string) (rul
 			for _, out := range h.Interfaces[role].Forward {
 				in, o := dev(role), dev(out)
 				for r, d := range map[string]string{role: in, out: o} {
-					if d == "" && !slices.Contains(unmapped, r) {
+					if d == "" && !h.Interfaces[r].Optional && !slices.Contains(unmapped, r) {
 						unmapped = append(unmapped, r)
 					}
 				}
@@ -2076,7 +2076,7 @@ func (in *Installer) iif(roles ...string) string {
 			continue
 		}
 		if h := in.R.Spec.Host; h != nil {
-			if i, ok := h.Interfaces[role]; ok && i.Kind != spec.InterfaceTUN && !roleNamed(in.R.Spec.Name, role) {
+			if i, ok := h.Interfaces[role]; ok && i.Kind != spec.InterfaceTUN && !i.Optional && !roleNamed(in.R.Spec.Name, role) {
 				in.O.logf("warning: no NIC of this VM is named %s (its cloud-config, from before its release named it, names none): its ports reach nothing, a VM made by this release (vm create --interface) names it, and `vm attach` (TrueNAS) or the NIC attached on its platform and `network attach` adds one to this VM", role)
 			}
 		}

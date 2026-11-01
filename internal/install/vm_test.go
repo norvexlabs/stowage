@@ -1312,10 +1312,11 @@ func TestARoleWithoutItsNICFailsClosed(t *testing.T) {
 	ctx := context.Background()
 	host := &nftHost{}
 	r, _ := testInstallerWith(t, "1.0.0", func(s *spec.Spec) {
-		s.Host = &spec.Host{Interfaces: map[string]spec.HostInterface{"uplink": {Primary: true}, "edge": {}, "vpn0": {Kind: spec.InterfaceTUN}}}
+		s.Host = &spec.Host{Interfaces: map[string]spec.HostInterface{"uplink": {Primary: true}, "edge": {}, "lan": {Optional: true}, "vpn0": {Kind: spec.InterfaceTUN}}}
 		s.Front.Interface = "uplink"
 		s.L4.Routes = []spec.L4Route{
 			{Name: "feed", Protocol: "udp", Port: 17007, Upstream: "api:17007", Interfaces: []string{"edge"}},
+			{Name: "site", Protocol: "udp", Port: 17009, Upstream: "api:17009", Interfaces: []string{"lan"}},
 			{Name: "peer", Protocol: "udp", Port: 17008, Upstream: "api:17008", Interfaces: []string{"vpn0"}},
 			{Name: "dns", Protocol: "udp", Port: 53, Upstream: "api:53", Interfaces: []string{"vpn0", "uplink"}},
 		}
@@ -1335,7 +1336,7 @@ func TestARoleWithoutItsNICFailsClosed(t *testing.T) {
 			t.Errorf("no %q in:\n%s", want, b)
 		}
 	}
-	if !strings.Contains(log.String(), "warning: no NIC of this VM is named edge") || strings.Contains(log.String(), "named uplink") || strings.Contains(log.String(), "named vpn0") {
+	if !strings.Contains(log.String(), "warning: no NIC of this VM is named edge") || strings.Contains(log.String(), "named uplink") || strings.Contains(log.String(), "named vpn0") || strings.Contains(log.String(), "named lan") {
 		t.Errorf("log %q", log.String())
 	}
 	if got := seedMatch(dir, "notes"); got != "Name=uplink" {

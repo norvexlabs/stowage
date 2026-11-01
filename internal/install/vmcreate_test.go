@@ -1078,8 +1078,8 @@ func TestMachineInterfacesFromTheFlags(t *testing.T) {
 		{nil, "metal", "--interface edge=mac=…: a server names each NIC"},
 		{[]string{"edge=mac=0b:00:00:00:00:01"}, "truenas", "is not a unicast MAC address"},
 		{[]string{"uplink=mac=02:00:00:00:00:01", "edge=mac=02:00:00:00:00:01"}, "metal", "have the MAC 02:00:00:00:00:01"},
-		{nil, "gcp", "names its VMs' NICs itself, one here: atlas declares 2"},
-		{[]string{"edge=mac=02:00:00:00:00:0b"}, "gcp", "names its VMs' NICs itself"},
+		{nil, "gcp", "names its VMs' NICs itself, one here: atlas requires 2 (host.interfaces: edge, uplink): a hypervisor's"},
+		{[]string{"edge=mac=02:00:00:00:00:0b"}, "gcp", "names its VMs' NICs itself, one here: atlas requires 2 (host.interfaces: edge, uplink): a hypervisor's"},
 		{[]string{"vpn0=dhcp"}, "truenas", `"vpn0" is not one of atlas's NICs (edge, uplink)`},
 		{[]string{"uplink=dhcp"}, "truenas", "the primary NIC's addressing is --network's"},
 		{[]string{"edge=static"}, "truenas", "the static mode's address is required"},
@@ -1092,6 +1092,27 @@ func TestMachineInterfacesFromTheFlags(t *testing.T) {
 	} {
 		if _, err := machineInterfaces(s, c.given, plat(c.plat)); err == nil || !strings.Contains(err.Error(), c.want) {
 			t.Errorf("%v on %s: %v, want %q", c.given, c.plat, err, c.want)
+		}
+	}
+	// An optional NIC: made only when --interface names it, so a cloud takes the release without it.
+	opt := &spec.Spec{Name: "atlas", Host: &spec.Host{Interfaces: map[string]spec.HostInterface{"uplink": {Primary: true}, "lan": {Optional: true}}}}
+	if got, err := machineInterfaces(opt, nil, plat("truenas")); err != nil || len(got) != 1 || got[0].Role != "uplink" || got[0].MAC != "" {
+		t.Errorf("an optional NIC not asked: %+v %v", got, err)
+	}
+	if got, err := machineInterfaces(opt, nil, plat("gcp")); err != nil || len(got) != 1 {
+		t.Errorf("a cloud, an optional NIC not asked: %+v %v", got, err)
+	}
+	if got, err := machineInterfaces(opt, []string{"lan=dhcp"}, plat("truenas")); err != nil || len(got) != 2 || got[0].Role != "lan" || got[0].Mode != IfaceDHCP || got[0].MAC == "" {
+		t.Errorf("an optional NIC asked: %+v %v", got, err)
+	}
+	if _, err := machineInterfaces(opt, []string{"lan=dhcp"}, plat("gcp")); err == nil || !strings.Contains(err.Error(), "--interface lan: Google Cloud names its VMs' NICs itself, one here: leave the optional lan out") {
+		t.Errorf("a cloud, an optional NIC asked: %v", err)
+	}
+	// Two NICs beside the optional: the release is refused whatever --interface asks, before the flags.
+	opt.Host.Interfaces["edge"] = spec.HostInterface{}
+	for _, given := range [][]string{nil, {"lan=dhcp"}, {"edge=mac=02:00:00:00:00:0b"}} {
+		if _, err := machineInterfaces(opt, given, plat("gcp")); err == nil || !strings.Contains(err.Error(), "names its VMs' NICs itself, one here: atlas requires 2 (host.interfaces: edge, uplink)") {
+			t.Errorf("a cloud, two NICs and an optional, %v: %v", given, err)
 		}
 	}
 	one := &spec.Spec{Name: "atlas", Host: &spec.Host{Interfaces: map[string]spec.HostInterface{"uplink": {Primary: true}}}}

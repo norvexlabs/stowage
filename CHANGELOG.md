@@ -3,6 +3,20 @@
 Stowage's own releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
+## [0.22.0]
+
+### Added
+- `optional: true` on a `host.interfaces` NIC role: a NIC some machines alone have. Absent, `tune`
+  reports it `n/a` and the start no longer warns; `vm create` makes it only when `--interface`
+  names it, so a cloud VM takes such a release with its one NIC.
+
+### Fixed
+- A VM of more than one NIC role no longer lets each NIC answer ARP for every address of the VM
+  (a client on a shared L2 could reach a role's address on the wrong NIC, its per-interface rules
+  missed): `arp_ignore=1` and `arp_announce=2` are set and judged by `tune`, unless
+  `host.sysctls` sets them on `all` (a NIC's own lower value is a lint error, as the
+  kernel takes the larger).
+
 ## [0.21.1] - 2026-11-01
 
 ### Fixed
