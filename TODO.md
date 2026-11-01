@@ -74,6 +74,22 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
 
 ## Should
 
+- **A `local` rclone destination is accepted, then never works**: where rclone runs in a
+  throw-away container (`docker run --rm`, the Docker shape), a `type = local` remote writes
+  inside it and the file is gone — `backup config` saves it, then `backup verify` and `backup run`
+  fail with `was written but does not read back … directory not found`, naming neither the cause
+  nor the fix. Refuse a `local` (or `alias` of one) remote at `backup config` and `verify
+  --destination`, saying the destination must be reachable from outside the host's containers
+  (SFTP, S3, …), or mount the path into the rclone container. Gate: smoke-install, `backup config`
+  refusing a local remote and accepting an SFTP one.
+
+- **`rollback` reports a `--no-provision` nobody gave**: a rollback starts the previous release
+  without the provision hook, and ends with `not provisioned (--no-provision): … provision does
+  it` — the operator passed no such flag, and nothing says whether running it against the data the
+  newer release left is wanted. Word it for the rollback (the hook is not run on a rollback; run
+  `provision` only if …), and keep the `--no-provision` wording for the install that was given it.
+  Gate: the rollback lifecycle case, its last line.
+
 - **`vm create` takes no lock on its state directory**: `vm attach` and `vm destroy` hold
   `<state>.lock`, but a create still applying, waiting for the VM or installing it over SSH can
   meet one of them, or a second create of the same host passing its "state exists" check before
@@ -247,7 +263,9 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
 
 - **`exec` and `schema` on the VM and Kubernetes**: Docker's `exec SERVICE -- CMD` and `schema`
   have no VM verb (the host daemon would run them, as it runs `logs`) nor `k8s schema` (a query
-  pod, as the rollback check runs).
+  pod, as the rollback check runs). On the VM, today: `sudo docker exec $(sudo docker ps -q -f
+  label=com.docker.compose.service=<svc>) …`, e.g. to reach a service's own CLI for what its
+  container reads once (a node renamed live).
 
 - **Cloud images, account identity**: an image's working directory is keyed by the cloud's
   settings, not by the account the credentials reach; two accounts on the same settings (a
@@ -406,6 +424,21 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
   project's own keys; meanwhile README asks for an account that cannot write the project's
   repositories.
 
+- **An optional NIC role**: a `host.interfaces` NIC role is always required, so a project
+  serving a client LAN on a second NIC at some sites alone cannot say so: on a VM without it,
+  `tune --check` reports `interface <role>: absent` and each start logs `no NIC of this VM is named
+  <role>`; a cloud's `vm create` is refused (it names the NICs itself), and TrueNAS's adds an
+  unaddressed NIC on the primary's bridge. `optional: true` on a NIC role: absent is no
+  difference and logs nothing, and `vm create` makes its NIC only when `--interface <role>=…`
+  asks (a cloud's then refused as now). Today: the NIC given at creation; such a release does not
+  go to a single-NIC cloud VM.
+- **Setting a generated secret's value on an install**: `install --set` refuses a key that is not
+  an input, and `secrets rotate` takes `rotation: true` secrets alone, to a generated value; a
+  generated password people type (a login's, a local IdP's static users) cannot be set to a chosen
+  value, or reset after a leak, but through a disaster recovery (export, edit, `vm create
+  --secrets`, `restore`). `secrets set KEY`, the value on standard input (never an argument), the
+  services reading it recreated as for a changed input, on Docker and the VM (the operator's
+  socket alone, never the app socket).
 - **Retention on an immutable channel**: `prune` takes one version, or all but the pointer's, on a
   mutable channel alone; a project keeping its tags immutable cannot keep only the last N releases
   (`prune --channel <c> --keep N`: the older releases' tags, disks, installers and referrers
