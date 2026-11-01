@@ -3,7 +3,7 @@
 Stowage's own releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
-## [0.21.0]
+## [0.21.0] - 2026-11-01
 
 ### Added
 - **`backup: { provider: volumes-age-rclone, volumes: […] }`**: a project without a database backs
