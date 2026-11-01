@@ -421,6 +421,8 @@ type Secret struct {
 	// Rotation lets `secrets rotate` replace the value in three passes, through KEY_NEXT and
 	// KEY_PREVIOUS.
 	Rotation bool `yaml:"rotation"`
+	// Settable lets `secrets set` record a value the operator chooses in place of the generated one.
+	Settable bool `yaml:"settable"`
 }
 
 type Input struct {

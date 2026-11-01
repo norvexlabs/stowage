@@ -15,7 +15,20 @@ follow [SemVer](https://semver.org/).
   start, a re-run with another value loading the other table (a default-deny floor and an
   observe mode, one release).
 
+- `secrets set KEY`: a value the operator chooses for a generated secret marked `settable: true`
+  (a login's password, set or reset after a leak), read from standard input or asked unechoed,
+  the services reading it recreated; on Docker and the VM (the operator's socket alone).
+
+- `prune --channel C --keep N`: a channel's retention, its N latest releases and the pointer's
+  kept, on an immutable channel too.
+
+- `exec SERVICE -- COMMAND` on the VM, through the host daemon (the operator's socket alone): its
+  outputs and its exit status, without a terminal or input.
+
 ### Fixed
+- A machine made again with `--secrets` (`install`, `vm create`) no longer issues a new local CA
+  for `--tls internal`: `secrets export` carries the front's root and its key, and the new
+  install's front starts with them, so the clients trusting the old root still trust it.
 - A start-first service's new container that fails no longer takes its log with it: the start's
   error quotes its last lines, read before it is removed, in place of a pointer to compose's
   logs, which only showed the old container.

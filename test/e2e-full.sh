@@ -17,7 +17,8 @@
 # it → its record lost, `provision --set ADMIN_API_KEY=<key>` gives the key the hook never returned
 # (the spec declares it in hooks.provision.returns) and no other is minted → re-runs turn the api route's forward auth on and off, narrow the ingest route's allowlist,
 # set an advanced input and give it back to its default → `secrets rotate` takes the internal
-# secret through its three passes, each value accepted while it must be → ship .2 (a migration) → upgrade --version → the data kept → rollback is allowed (the
+# secret through its three passes, each value accepted while it must be → `secrets set` records a
+# chosen login password, its hash made again → ship .2 (a migration) → upgrade --version → the data kept → rollback is allowed (the
 # previous api reads the newer schema, by its label) → ship .3 (a migration that is a rollback
 # barrier) → upgrade → rollback is refused, naming the barrier and the snapshot.
 set -euo pipefail
@@ -275,6 +276,16 @@ rotate --finish
 [[ -z $(secret INTERNAL_SERVICE_SECRET_PREVIOUS) ]] || fail "--finish kept the previous value"
 expect_code 401 --max-time 10 -X POST -H "Authorization: Bearer $old" "http://127.0.0.1:$API_PORT/api/v1/events"
 event "http://127.0.0.1:$INGEST_PORT/events"
+atlas_running "$V1" 1
+
+step "secrets set OPS_PASSWORD: a chosen value from standard input, the login's hash made again"
+hash_before=$(cat "$D/.stowage-front-logins")
+printf 'a-chosen-password\n' | "${CTL[@]}" secrets set OPS_PASSWORD --dir "$D" >"$WORK/set.log" 2>&1 || { cat "$WORK/set.log"; fail "secrets set OPS_PASSWORD"; }
+[[ $(secret OPS_PASSWORD) == a-chosen-password ]] || fail "secrets set did not record the value"
+[[ $(cat "$D/.stowage-front-logins") != "$hash_before" ]] || fail "the login's hash was not made again for the new password"
+! grep -q a-chosen-password "$WORK/set.log" || fail "secrets set printed the value"
+printf 'x\n' | "${CTL[@]}" secrets set POSTGRES_PASSWORD --dir "$D" >"$WORK/set.log" 2>&1 && fail "a secret without settable was set"
+grep -q 'settable: OPS_PASSWORD' "$WORK/set.log" || { cat "$WORK/set.log"; fail "the refusal does not name the settable secrets"; }
 atlas_running "$V1" 1
 EV=$(status events) # the events so far, which the upgrades keep
 

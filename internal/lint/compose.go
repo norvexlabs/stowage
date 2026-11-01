@@ -78,7 +78,9 @@ type Service struct {
 	MemLimit       any `yaml:"mem_limit"`
 	MemReservation any `yaml:"mem_reservation"`
 	Scale          any `yaml:"scale"`
-	Deploy         struct {
+	// Environment is the service's own `environment:`, a map or a list of KEY=VALUE.
+	Environment any `yaml:"environment"`
+	Deploy      struct {
 		Replicas  any `yaml:"replicas"`
 		Resources struct {
 			Limits struct {

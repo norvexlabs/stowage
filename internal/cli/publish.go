@@ -558,13 +558,18 @@ func yankCmd(o *options) *cobra.Command {
 
 func pruneCmd(o *options) *cobra.Command {
 	var channel string
+	var keep int
 	c := &cobra.Command{
-		Use:   "prune --channel <mutable channel> [<version>]",
-		Short: "Delete a mutable channel's releases: one version, or all but the pointer's",
+		Use:   "prune --channel <channel> [<version> | --keep N]",
+		Short: "Delete a channel's releases: of a mutable one, one version or all but the pointer's; of any, with --keep, all but its N latest and the pointer's",
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if channel == "" {
 				return errors.New("--channel is required")
+			}
+			keeping := cmd.Flags().Changed("keep")
+			if keeping && len(args) == 1 {
+				return errors.New("--keep keeps the latest releases, a version prunes one: give one of them")
 			}
 			_, pub, err := o.openPublisher(&channel, writeAccess)
 			if err != nil {
@@ -574,14 +579,20 @@ func pruneCmd(o *options) *cobra.Command {
 			if len(args) == 1 {
 				v = args[0]
 			}
-			pruned, err := pub.Prune(cmd.Context(), channel, v)
+			var pruned []string
+			if keeping {
+				pruned, err = pub.PruneKeep(cmd.Context(), channel, keep)
+			} else {
+				pruned, err = pub.Prune(cmd.Context(), channel, v)
+			}
 			for _, t := range pruned {
 				fmt.Fprintln(o.out, t)
 			}
 			return err
 		},
 	}
-	c.Flags().StringVar(&channel, "channel", "", "mutable channel (required)")
+	c.Flags().StringVar(&channel, "channel", "", "the channel (required; mutable, unless --keep)")
+	c.Flags().IntVar(&keep, "keep", 0, "keep the channel's N latest releases (and the pointer's), delete the older ones; on an immutable channel too")
 	return c
 }
 

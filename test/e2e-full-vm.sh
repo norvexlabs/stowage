@@ -6,9 +6,9 @@
 # two USB sticks, left in) installs .1's OS on the disk, powers off and is started again; the
 # installed system's first boot writes .2's OS bundle and reboots into it, which installs it from the cloud-config's settings with the search
 # extension's input set (to the api itself, standing in for a search service); the provision hook registers the administrator through the api; the api reaches the host
-# daemon's app socket and reads the front's local CA; an event goes through ingest; the ops route
+# daemon's app socket and reads the front's local CA (`exec` through the host daemon, its exit status carried); an event goes through ingest; the ops route
 # refuses everyone until a re-run gives `--client-ca`, then takes a certificate that CA issued
-# alone, and its login (basic_auth, the generated OPS_PASSWORD); then `vm destroy`. Upgrade, rollback and the health gate's fallback are the VM machinery's: e2e-vm. Needs
+# alone, and its login (basic_auth, the generated OPS_PASSWORD, then one `secrets set` records); then `vm destroy`. Upgrade, rollback and the health gate's fallback are the VM machinery's: e2e-vm. Needs
 # what e2e-vm needs: Docker (privileged containers, loop devices), network access, about 15 GB
 # on disk under XDG_CACHE_HOME, OpenTofu's `tofu`, ssh, and a TrueNAS host.
 #
@@ -125,7 +125,9 @@ on_vm sudo docker inspect --format "'{{range .Mounts}}{{.Source}}:{{.Destination
 	grep -qx '/run/atlas/app:/run/stowage-host:false' || fail "the api service does not mount the app directory read-only"
 # The front's local CA reaches the api (front.publish_ca): a client trusting it alone reaches the
 # api route.
-on_vm sudo docker exec "$api" cat /etc/atlas/ca/ca.crt >"$WORK/vm-ca.crt" && grep -q 'BEGIN CERTIFICATE' "$WORK/vm-ca.crt" || fail "the api reads no CA"
+on_vm sudo at-stow exec api -- cat /etc/atlas/ca/ca.crt >"$WORK/vm-ca.crt" && grep -q 'BEGIN CERTIFICATE' "$WORK/vm-ca.crt" || fail "the api reads no CA (exec through the host daemon)"
+on_vm sudo at-stow exec api -- sh -c "'exit 3'" && fail "exec did not carry the command's exit status"
+[[ $? == 3 ]] || fail "exec's exit status is not the command's"
 curl -sf --max-time 10 --cacert "$WORK/vm-ca.crt" --resolve "api.atlas.test:443:$IP" https://api.atlas.test/health >/dev/null ||
 	fail "the api route's certificate does not chain to the CA the front published"
 code=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 10 --resolve "ingest.atlas.test:443:$IP" -X POST -H 'Content-Type: application/json' -d '{"kind": "probe"}' https://ingest.atlas.test/events)
@@ -150,6 +152,10 @@ ops_pw=$(sed -n "s/^OPS_PASSWORD='\{0,1\}\([^']*\).*/\1/p" "$WORK/vm.env")
 [[ $(ops --cert "$WORK/client.pem" --key "$WORK/client.key" -u "ops:wrong") == 401 ]] || fail "the ops route takes a wrong password"
 [[ $(ops --cert "$WORK/client.pem" --key "$WORK/client.key" -u "ops:$ops_pw") == 200 ]] || fail "the ops route refuses a certificate its client CA issued, with its login"
 on_vm sudo test -s /usr/local/atlas/.stowage-front-logins || fail "the login's hash is not kept"
+# secrets set through the operator's socket: the new password logs in, the old one no more.
+printf 'a-chosen-password\n' | on_vm sudo at-stow secrets set OPS_PASSWORD >"$WORK/set.txt" 2>&1 || { cat "$WORK/set.txt"; fail "secrets set OPS_PASSWORD on the VM"; }
+[[ $(ops --cert "$WORK/client.pem" --key "$WORK/client.key" -u "ops:a-chosen-password") == 200 ]] || fail "the ops route refuses the password secrets set recorded"
+[[ $(ops --cert "$WORK/client.pem" --key "$WORK/client.key" -u "ops:$ops_pw") == 401 ]] || fail "the ops route still takes the password secrets set replaced"
 [[ $(ops) == 000 && $(ops --cert "$WORK/rogue.pem" --key "$WORK/rogue.key") == 000 ]] || fail "the ops route takes a client without a certificate its client CA issued"
 [[ $(curl -sk -o /dev/null -w '%{http_code}' --max-time 10 --resolve "api.atlas.test:443:$IP" https://api.atlas.test/health) == 200 ]] || fail "the api route asks for a client certificate"
 

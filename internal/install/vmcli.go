@@ -258,6 +258,38 @@ func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(
 		},
 	}
 	logs.Flags().IntVar(&tail, "tail", 200, "how many lines (1 to 5000)")
+	exec := &cobra.Command{
+		Use:   "exec SERVICE -- COMMAND [ARG...]",
+		Short: "Run a command in a running service's container, without a terminal or input; its outputs are printed once it ends (each cut at 4 MiB), its exit status is the run's",
+		Args:  cobra.MinimumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if cmd.ArgsLenAtDash() != 1 || len(args) < 2 {
+				return errors.New("exec SERVICE -- COMMAND: the command goes after --")
+			}
+			var out ExecResult
+			if err := c.do(cmd.Context(), http.MethodPost, "/v1/services/"+url.PathEscape(args[0])+"/exec", ExecRequest{Args: args[1:]}, &out); err != nil {
+				return err
+			}
+			if _, err := stdout.Write(out.Stdout); err != nil {
+				return err
+			}
+			if _, err := stderr.Write(out.Stderr); err != nil {
+				return err
+			}
+			for _, cut := range []struct {
+				what string
+				cut  bool
+			}{{"standard output", out.StdoutCut}, {"standard error", out.StderrCut}} {
+				if cut.cut {
+					fmt.Fprintf(stderr, "%s: the command's %s was cut at %d bytes\n", c.ctl, cut.what, maxExecOutput)
+				}
+			}
+			if out.Exit != 0 {
+				return ExitCode(out.Exit)
+			}
+			return nil
+		},
+	}
 	health := &cobra.Command{
 		Use:   "health",
 		Short: "Whether the install is ready, as the health gate judges it: every service up (healthy where it has a healthcheck), and the health provider's answer",
@@ -297,7 +329,7 @@ func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(
 	events.Flags().Int64Var(&after, "after", 0, "the entries after this number (status --json's events is the last one)")
 	events.Flags().BoolVarP(&followEvents, "follow", "f", false, "then wait for new entries, until interrupted")
 	events.Flags().BoolVar(&asJSON, "json", false, "print each entry as the daemon's JSON, one per line")
-	root.AddCommand(status, health, ps, logs, events)
+	root.AddCommand(status, health, ps, logs, exec, events)
 	for _, a := range []string{"restart", "stop", "start"} {
 		root.AddCommand(&cobra.Command{
 			Use:   a + " SERVICE",
@@ -512,9 +544,20 @@ func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(
 			return c.follow(cmd.Context(), stderr, started)
 		}
 	}
-	secrets := secretsCommand(name, stdout, func(*cobra.Command) {}, rotate, func(cmd *cobra.Command, recipients []string) ([]byte, error) {
+	var set func(cmd *cobra.Command, key, value string) error
+	if slices.ContainsFunc(r.Spec.Secrets, func(s spec.Secret) bool { return s.Settable }) {
+		set = func(cmd *cobra.Command, key, value string) error {
+			var started JobStarted
+			if err := c.do(cmd.Context(), http.MethodPost, "/v1/secrets/set", SecretSetRequest{Key: key, Value: value}, &started); err != nil {
+				return err
+			}
+			return c.follow(cmd.Context(), stderr, started)
+		}
+	}
+	secrets := secretsCommand(name, stdout, func(*cobra.Command) {}, rotate, set, in.checkSetValue, terminal, func(cmd *cobra.Command, recipients []string) ([]byte, error) {
 		var out SecretsExport
 		err := c.do(cmd.Context(), http.MethodPost, "/v1/secrets/export", SecretsExportRequest{Recipients: recipients}, &out)
+		_, _ = io.WriteString(stderr, out.Log)
 		return []byte(out.File), err
 	})
 	netCmd := networkCommand(c, name, stdout)

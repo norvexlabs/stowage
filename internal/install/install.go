@@ -446,6 +446,10 @@ func (in *Installer) Install(ctx context.Context) error {
 		in.markInstall(err)
 		return err
 	}
+	if err := in.writeRestoredFrontCA(mode); err != nil {
+		in.markInstall(err)
+		return err
+	}
 	if err := in.writeStack(env); err != nil {
 		in.markInstall(err)
 		return err
@@ -1116,6 +1120,9 @@ func (in *Installer) keepSelf() {
 // start brings the stack up, then runs the provision hook — idempotent, so a re-run runs it
 // again — unless --no-provision. Its caller holds the lifecycle lock.
 func (in *Installer) start(ctx context.Context, env *EnvFile) error {
+	if err := in.loadFrontCA(ctx, env); err != nil {
+		return err
+	}
 	if err := in.up(ctx, env); err != nil {
 		return err
 	}

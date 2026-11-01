@@ -1526,7 +1526,6 @@ func (p *Publisher) Prune(ctx context.Context, channel, v string) (pruned []stri
 			return nil, fmt.Errorf("%s: %w", v, err)
 		}
 	}
-	pointerGone := false
 	// Which releases go, decided first: a pruned release's disk is kept whole while a release the
 	// prune keeps names it (its own, or the set it boots).
 	prunes := map[string]bool{}
@@ -1542,6 +1541,45 @@ func (p *Publisher) Prune(ctx context.Context, channel, v string) (pruned []stri
 		}
 		prunes[r.Manifest.Tag] = same
 	}
+	pruned, err = p.prune(ctx, channel, rs, ptr, prunes)
+	if err == nil && v != "" && len(pruned) == 0 {
+		return nil, fmt.Errorf("channel %s has no release of %s", channel, v)
+	}
+	return pruned, err
+}
+
+// PruneKeep deletes the tags of a channel's releases, mutable or immutable, but its keep latest
+// (by the project's scheme) and the one its pointer is on, as Prune does.
+func (p *Publisher) PruneKeep(ctx context.Context, channel string, keep int) ([]string, error) {
+	if _, ok := p.Project.Spec.Channels[channel]; !ok {
+		return nil, fmt.Errorf("channel %q is not declared", channel)
+	}
+	if keep < 1 {
+		return nil, fmt.Errorf("--keep %d: keep 1 release or more", keep)
+	}
+	rs, err := p.Releases(ctx, channel)
+	if err != nil {
+		return nil, err
+	}
+	ptr, err := p.pointer(ctx, channel)
+	if err != nil {
+		return nil, err
+	}
+	// rs is oldest first: all but its last keep go, the pointer's kept.
+	prunes := map[string]bool{}
+	for i, r := range rs {
+		prunes[r.Manifest.Tag] = i < len(rs)-keep && (ptr == nil || ptr.Manifest.Tag != r.Manifest.Tag)
+	}
+	pruned, err := p.prune(ctx, channel, rs, ptr, prunes)
+	if err == nil && len(pruned) == 0 {
+		p.logf("channel %s holds %d release(s), the pointer's among the last %d or apart: none pruned", channel, len(rs), keep)
+	}
+	return pruned, err
+}
+
+// prune deletes the tags of the releases of channel (rs, its pointer ptr) prunes names.
+func (p *Publisher) prune(ctx context.Context, channel string, rs []*Ref, ptr *Ref, prunes map[string]bool) (pruned []string, err error) {
+	pointerGone := false
 	// Every channel's releases count, and one the current scheme does not order: a promotion
 	// shares a disk across channels.
 	everyRelease, err := p.scan(ctx, "")
@@ -1660,9 +1698,6 @@ func (p *Publisher) Prune(ctx context.Context, channel, v string) (pruned []stri
 		}
 		p.logf("pruned %s", r.Manifest.Tag)
 		pruned = append(pruned, r.Manifest.Tag)
-	}
-	if v != "" && len(pruned) == 0 {
-		return nil, fmt.Errorf("channel %s has no release of %s", channel, v)
 	}
 	return pruned, nil
 }

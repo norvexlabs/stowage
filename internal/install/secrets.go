@@ -18,11 +18,13 @@ import (
 // age keys, and as `install --secrets` and `vm create --secrets` take them back, decrypted: a
 // machine lost makes its install again with them (a disaster recovery). Secrets holds what the
 // install generated (a rotated secret's next and previous values included) and the secret inputs
-// it was given; Provision what the provision hook returned.
+// it was given; Provision what the provision hook returned; FrontCA the front's local CA, for an
+// install in the internal mode whose front made one.
 type SecretsFile struct {
 	Project   string            `yaml:"project"`
 	Secrets   map[string]string `yaml:"secrets"`
 	Provision map[string]string `yaml:"provision,omitempty"`
+	FrontCA   *FrontCA          `yaml:"front_ca,omitempty"`
 }
 
 // maxSecretsFile bounds a secrets file read.
@@ -44,9 +46,9 @@ func (in *Installer) secretKey(k string) bool {
 	return k == CloudflareTokenVar
 }
 
-// exportSecrets is the install's SecretsFile: its recorded secrets that are not empty, and the
-// provision hook's record.
-func (in *Installer) exportSecrets(env *EnvFile) (*SecretsFile, error) {
+// exportSecrets is the install's SecretsFile: its recorded secrets that are not empty, the
+// provision hook's record and the front's local CA.
+func (in *Installer) exportSecrets(ctx context.Context, env *EnvFile) (*SecretsFile, error) {
 	f := &SecretsFile{Project: in.R.Spec.Name, Secrets: map[string]string{}}
 	for _, k := range env.Keys() {
 		if v, _ := env.Get(k); v != "" && in.secretKey(k) {
@@ -65,6 +67,10 @@ func (in *Installer) exportSecrets(env *EnvFile) (*SecretsFile, error) {
 			}
 			f.Provision[k], _ = p.Get(k)
 		}
+	}
+	// The secrets go out whatever the front's state: a recovery needs them most.
+	if f.FrontCA, err = in.frontCA(ctx, env); err != nil {
+		in.O.logf("warning: %v: the export carries no front CA, and a machine made again from it issues from a new root", err)
 	}
 	return f, nil
 }
@@ -137,7 +143,7 @@ func (in *Installer) ExportSecrets(recipients []string) ([]byte, error) {
 	if err := in.sameRelease(context.Background(), env); err != nil {
 		return nil, err
 	}
-	f, err := in.exportSecrets(env)
+	f, err := in.exportSecrets(context.Background(), env)
 	if err != nil {
 		return nil, err
 	}
@@ -162,6 +168,11 @@ func (in *Installer) readSecrets(raw []byte) (*SecretsFile, error) {
 	}
 	if f.Project != in.R.Spec.Name {
 		return nil, fmt.Errorf("--secrets: the file holds %q's secrets, not %s's", f.Project, in.R.Spec.Name)
+	}
+	if ca := f.FrontCA; ca != nil {
+		if _, err := parseFrontCA([]byte(ca.Cert), []byte(ca.Key)); err != nil {
+			return nil, fmt.Errorf("--secrets: front_ca: %w", err)
+		}
 	}
 	return &f, nil
 }

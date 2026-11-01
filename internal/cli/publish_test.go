@@ -135,6 +135,14 @@ func TestPublishCommands(t *testing.T) {
 	if _, _, err := run(t, b, env, "-C", root, "prune"); err == nil || !strings.Contains(err.Error(), "--channel") {
 		t.Fatalf("prune without a channel: %v", err)
 	}
+	for args, want := range map[string]string{"--keep 1 1.0.0": "give one of them", "--keep 0": "--keep 0: keep 1 release or more"} {
+		if _, _, err := run(t, b, env, append([]string{"-C", root, "prune", "--channel", "stable"}, strings.Fields(args)...)...); err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("prune %s: %v", args, err)
+		}
+	}
+	if out, _, err := run(t, b, env, "-C", root, "prune", "--channel", "stable", "--keep", "1"); err != nil || strings.TrimSpace(out) != "" {
+		t.Fatalf("prune --keep 1 of an immutable channel of one release: %v\n%s", err, out)
+	}
 	if out, _, err := run(t, b, env, "-C", root, "prune", "--channel", "beta", "1.0.0"); err != nil || strings.TrimSpace(out) != "beta-1.0.0" {
 		t.Fatalf("prune: %v\n%s", err, out)
 	}

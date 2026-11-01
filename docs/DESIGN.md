@@ -226,7 +226,7 @@ prefix such as `beta-{v}` does not).
 
 Repackaging the same project version with a new Stowage runtime (a `hostctl` fix, a base-OS CVE) is a
 new **revision**. Tag `{v}` for revision 1, `{v}-r{N}` afterwards (the channel's tag template decides
-the spelling). Order is `(scheme order of project version, revision)`. A stable tag stays immutable;
+the spelling). Order is `(scheme order of project version, revision)`. A stable tag stays immutable (it never names other content; `prune --keep N`, the channel's retention, deletes it whole once N later releases exist);
 a revision is how a stable release receives a runtime fix without lying about the app version.
 
 ### 3.5 What the operator sees
@@ -783,10 +783,11 @@ on this shape") instead of failing obscurely.
 | 22 | Manual rollback | barrier + reads-newer check, else points to the snapshot **C** | `helm rollback` after the barrier + reads-newer check in a pod (`shapes.kubernetes.schema`) **C** | `hostctl rollback`, rollback-check refuses only on proof **C** |
 | 23 | Reset data | `reset-db`: stack down, the `data.reset` volumes deleted (`keep_on_reset` kept), provisioned as first installed **C** | `k8s reset-db`: uninstall, the release's claims deleted, installed again with its values and Secrets **C** | `reset-db`, a host daemon job, the Docker shape's, no reboot **C** |
 | 24 | Rotate secrets | `secrets rotate KEY` for `rotation: true`, three passes (`--stage` → `KEY_NEXT` accepted; swap → `KEY_PREVIOUS` accepted; `--finish`), the stack up again at each **C** | `k8s secrets rotate`: the same passes on the Secret, each workload's rollout restarted and awaited **C** | the Docker shape's verb, a host daemon job **C** |
+| 24b | Set a secret | `secrets set KEY` for `settable: true` (opt-in: a database password or an encryption key changed in `.env` alone breaks the data made with it), the value on standard input, the stack up again **C** | not yet **X** | the Docker shape's verb, a host daemon job on the operator's socket alone **C** |
 | 25 | Registry credential rotation | `.env` / installer flag **C** | pull Secret **C** | sealed env + `reconfigure-userdata` **C** → the pull account the OS bundle carries; a mirror's is root's Docker login on the VM |
 | 26 | Power / maintenance | `stop` / `start` **C** | owner: cluster | `hostctl reboot/shutdown --drain-secs`, disk-pressure hook **C** |
 | 27 | Uninstall | `uninstall [--keep-data]` **X** | `k8s uninstall`: `helm uninstall`, the installer's Secrets, the hook's account and Job; the claims only with `--data`, kept data keeping the Secrets that answer for it, a chart's own claim (which helm deletes) needing `--data` **C** | `vm destroy` (a VM `vm create` made with OpenTofu) **C**; else owner: hypervisor |
-| 28 | Move host / disaster recovery | `secrets export` on old → `install --secrets` on new **C** (data: the snapshot by hand) | owner: managed PG; secrets **X** | `secrets export`, then `vm create --secrets` + `restore OBJECT` **C** |
+| 28 | Move host / disaster recovery | `secrets export` on old (the front's local CA with the secrets: a new root would break every client trusting the old) → `install --secrets` on new **C** (data: the snapshot by hand) | owner: managed PG; secrets **X** | `secrets export`, then `vm create --secrets` + `restore OBJECT` **C** |
 
 Rules:
 - A verb has the **same name** on every shape where it applies; elsewhere the owner is named.

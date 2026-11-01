@@ -354,7 +354,16 @@ func newCommand(r *Release, self string, stdout, stderr io.Writer, tools K8sOpti
 			return in.RotateSecret(cmd.Context(), key, pass)
 		}
 	}
-	root.AddCommand(secretsCommand(name, stdout, func(c *cobra.Command) { dirFlag(c) }, rotate, func(_ *cobra.Command, recipients []string) ([]byte, error) {
+	var set func(cmd *cobra.Command, key, value string) error
+	if slices.ContainsFunc(r.Spec.Secrets, func(s spec.Secret) bool { return s.Settable }) {
+		set = func(cmd *cobra.Command, key, value string) error {
+			if err := prepare(); err != nil {
+				return err
+			}
+			return in.SetSecret(cmd.Context(), key, value)
+		}
+	}
+	root.AddCommand(secretsCommand(name, stdout, func(c *cobra.Command) { dirFlag(c) }, rotate, set, in.checkSetValue, terminal, func(_ *cobra.Command, recipients []string) ([]byte, error) {
 		if err := prepare(); err != nil {
 			return nil, err
 		}
@@ -535,9 +544,32 @@ func k8sCommand(in *Installer, o *Options, prepare func() error, terminal func(b
 			c.Flags().DurationVar(&rotateTimeout, "timeout", 6*time.Minute, "how long kubectl waits for each restarted workload to be ready")
 		}, func(cmd *cobra.Command, key, pass string) error {
 			return run(cmd, rotateTimeout, false, func(ctx context.Context) error { return in.K8sRotateSecret(ctx, key, pass) })
-		}, nil))
+		}, nil, nil, nil, nil))
 	}
 	return k
+}
+
+// secretValue is the value `secrets set KEY` records: asked on terminal when standard input is
+// one (the answer checked by check), else read from it.
+func secretValue(cmd *cobra.Command, key string, check func(key, value string) error, terminal func(bool) Prompter, accessible bool) (string, error) {
+	stdin := cmd.InOrStdin()
+	if f, ok := stdin.(*os.File); !ok || !term.IsTerminal(int(f.Fd())) {
+		v, err := readSetSecret(stdin)
+		if err != nil {
+			return "", fmt.Errorf("%s: %w", key, err)
+		}
+		return v, nil
+	}
+	t := terminal(accessible)
+	if t == nil {
+		return "", fmt.Errorf("%s: no terminal to ask on: pipe the value into this same command (printf '%%s\\n' \"$VALUE\" | …)", key)
+	}
+	a, err := t.Ask(cmd.Context(), Form{Questions: []Question{{Title: "The new value of " + key, Key: key, Required: true, Secret: true,
+		Check: func(v string) error { return check(key, v) }}}})
+	if err != nil {
+		return "", err
+	}
+	return a[key], nil
 }
 
 // readSecretsArg reads --secrets' file, or standard input for "-".
@@ -555,10 +587,31 @@ func readSecretsArg(path string, stdin io.Reader) ([]byte, error) {
 }
 
 // secretsCommand is `secrets`: `rotate KEY [--stage | --finish]`, one pass of a rotated secret's
-// rotation run by rotate (none without it), and `export`, the secrets export returns written
-// where --output says (none without it); flags adds the shape's own flags to each.
-func secretsCommand(name string, stdout io.Writer, flags func(*cobra.Command), rotate func(cmd *cobra.Command, key, pass string) error, export func(cmd *cobra.Command, recipients []string) ([]byte, error)) *cobra.Command {
-	s := &cobra.Command{Use: "secrets", Short: "The install's secrets: rotate one, or export them all for a disaster recovery", Args: cobra.NoArgs}
+// rotation run by rotate (none without it), `set KEY`, the value read from standard input (asked
+// on terminal when it is one) recorded by set (none without it), and `export`, the secrets export
+// returns written where --output says (none without it); flags adds the shape's own flags to each.
+func secretsCommand(name string, stdout io.Writer, flags func(*cobra.Command), rotate func(cmd *cobra.Command, key, pass string) error,
+	set func(cmd *cobra.Command, key, value string) error, check func(key, value string) error, terminal func(accessible bool) Prompter,
+	export func(cmd *cobra.Command, recipients []string) ([]byte, error)) *cobra.Command {
+	s := &cobra.Command{Use: "secrets", Short: "The install's secrets: rotate one, set one, or export them all for a disaster recovery", Args: cobra.NoArgs}
+	if set != nil {
+		var accessible bool
+		c := &cobra.Command{
+			Use:   "set KEY",
+			Short: "Record a value you choose for a generated secret whose spec entry has settable: true, read from standard input (asked, unechoed, on a terminal); the services reading it are recreated",
+			Args:  cobra.ExactArgs(1),
+			RunE: func(cmd *cobra.Command, args []string) error {
+				v, err := secretValue(cmd, args[0], check, terminal, accessible)
+				if err != nil {
+					return err
+				}
+				return set(cmd, args[0], v)
+			},
+		}
+		c.Flags().BoolVar(&accessible, "accessible", false, "on a terminal, ask with a plain line prompt")
+		flags(c)
+		s.AddCommand(c)
+	}
 	if rotate != nil {
 		var stage, finish bool
 		r := &cobra.Command{

@@ -9,17 +9,6 @@ A finished item is deleted, not ticked. The plan behind it is
 
 Batched by the gate they share: a batch is one slice, one review, one gate run.
 
-### Next batch
-
-1. **A machine made again issues a new front CA (`--tls internal`)**: the front's local root
-   and its key live in the front's own data volume, which neither `secrets export` nor a
-   `pg-age-rclone` / `volumes-age-rclone` backup carries (`backup.volumes` takes the compose
-   file's volumes alone), so after `vm create --secrets` and `restore` every client trusting the
-   old root (sign-in, a portal, `publish_ca`) gets a certificate error until it trusts the new
-   one. Carry the internal root in the secrets export (it is a secret, and small), or in every
-   backup, and install it before the front first starts on a machine made again. Gate: e2e-vm's
-   disaster recovery, the front's certificate chained to the same root before and after.
-
 ### Blocked — upstream or accounts
 
 1. **Kairos 4.4.0 final**: the OS bundle is pinned to the release candidate
@@ -247,11 +236,10 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
 - **The Docker disk-pressure check end to end**: `disk-check` and its timer are unit-tested; no
   suite runs the check against a filled volume on a Docker host.
 
-- **`exec` and `schema` on the VM and Kubernetes**: Docker's `exec SERVICE -- CMD` and `schema`
-  have no VM verb (the host daemon would run them, as it runs `logs`) nor `k8s schema` (a query
-  pod, as the rollback check runs). On the VM, today: `sudo docker exec $(sudo docker ps -q -f
-  label=com.docker.compose.service=<svc>) …`, e.g. to reach a service's own CLI for what its
-  container reads once (a node renamed live).
+- **`schema` on the VM and Kubernetes, `secrets set` on Kubernetes**: Docker's `schema` has no
+  VM verb (the host daemon would run it, as it runs `exec`) nor `k8s schema` (a query pod, as the
+  rollback check runs); `secrets set` has no `k8s` verb (the release's Secret changed and its
+  readers restarted, as `k8s secrets rotate` does).
 
 - **Cloud images, account identity**: an image's working directory is keyed by the cloud's
   settings, not by the account the credentials reach; two accounts on the same settings (a
@@ -409,19 +397,6 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
   read the test prefix's release repository and refuse when a release there verifies with the
   project's own keys; meanwhile README asks for an account that cannot write the project's
   repositories.
-
-- **Setting a generated secret's value on an install**: `install --set` refuses a key that is not
-  an input, and `secrets rotate` takes `rotation: true` secrets alone, to a generated value; a
-  generated password people type (a login's, a local IdP's static users) cannot be set to a chosen
-  value, or reset after a leak, but through a disaster recovery (export, edit, `vm create
-  --secrets`, `restore`). `secrets set KEY`, the value on standard input (never an argument), the
-  services reading it recreated as for a changed input, on Docker and the VM (the operator's
-  socket alone, never the app socket).
-- **Retention on an immutable channel**: `prune` takes one version, or all but the pointer's, on a
-  mutable channel alone; a project keeping its tags immutable cannot keep only the last N releases
-  (`prune --channel <c> --keep N`: the older releases' tags, disks, installers and referrers
-  deleted, the index and `:latest` settled as `yank` and `prune` do). Today: a mutable channel,
-  pruned by version.
 
 ## Could
 

@@ -104,11 +104,16 @@ func (in *Installer) Exec(ctx context.Context, service string, args []string, st
 	if err != nil {
 		return err
 	}
+	return in.exec(ctx, env, service, args, stdin, terminal)
+}
+
+// exec is Exec on the install env records, service one of its stack's.
+func (in *Installer) exec(ctx context.Context, env *EnvFile, service string, args []string, stdin io.Reader, terminal bool) error {
 	c := []string{"exec"}
 	if !terminal {
 		c = append(c, "-T")
 	}
-	_, err = in.O.Docker.Run(ctx, Cmd{Args: append(in.composeBase(), append(append(c, service), args...)...), Env: env.Environ(in.O.environ()), Stdin: stdin, Stdout: in.O.Out, Stream: in.O.Log})
+	_, err := in.O.Docker.Run(ctx, Cmd{Args: append(in.composeBase(), append(append(c, service), args...)...), Env: env.Environ(in.O.environ()), Stdin: stdin, Stdout: in.O.Out, Stream: in.O.Log})
 	var ee interface{ ExitCode() int }
 	if errors.As(err, &ee) && ee.ExitCode() > 0 {
 		return ExitCode(ee.ExitCode())

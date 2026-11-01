@@ -1530,3 +1530,44 @@ func amd64Image(size, layers int64) (v1.Image, error) {
 	cf.OS, cf.Architecture = "linux", "amd64"
 	return mutate.ConfigFile(img, cf)
 }
+
+// --keep prunes any channel, an immutable one too, to its latest releases and the pointer's.
+func TestPruneKeepsTheLatestReleases(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	e.mustShip("stable", 1)
+	e.bump("1.1.0")
+	e.mustShip("stable", 1)
+	e.bump("1.2.0")
+	e.mustShip("stable", 1)
+	p, _ := e.publisher()
+	ctx := context.Background()
+	for keep, want := range map[int]string{0: "keep 1 release or more", -1: "keep 1 release or more"} {
+		if _, err := p.PruneKeep(ctx, "stable", keep); err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("--keep %d: %v", keep, err)
+		}
+	}
+	if _, err := p.PruneKeep(ctx, "nightly", 1); err == nil || !strings.Contains(err.Error(), "not declared") {
+		t.Errorf("an undeclared channel: %v", err)
+	}
+	if pruned, err := p.PruneKeep(ctx, "stable", 3); err != nil || len(pruned) != 0 {
+		t.Fatalf("keeping them all: %v %v", pruned, err)
+	}
+	pruned, err := p.PruneKeep(ctx, "stable", 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	eq(t, "pruned", strings.Join(pruned, ","), "1.0.0")
+	eq(t, "its release tag gone", e.digest("notes-release", "1.0.0"), "")
+	eq(t, "its image gone", e.digest("notes-api", "1.0.0"), "")
+	eq(t, "the next kept", e.digest("notes-release", "1.1.0") != "", true)
+	// The pointer back on 1.1.0 (1.2.0 yanked): --keep 1 keeps the latest and the pointer's.
+	if err := p.Yank(ctx, "stable", "1.2.0", 1, "bad"); err != nil {
+		t.Fatal(err)
+	}
+	if pruned, err := p.PruneKeep(ctx, "stable", 1); err != nil || len(pruned) != 0 {
+		t.Fatalf("the pointer's release: %v %v", pruned, err)
+	}
+	eq(t, "the pointer's release kept", e.digest("notes-release", "1.1.0") != "", true)
+	eq(t, "the latest kept", e.digest("notes-release", "1.2.0") != "", true)
+}

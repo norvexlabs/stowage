@@ -30,6 +30,8 @@ import (
 	"github.com/google/go-containerregistry/pkg/name"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
 
+	"go.yaml.in/yaml/v3"
+
 	"github.com/norvexlabs/stowage/internal/front"
 	"github.com/norvexlabs/stowage/internal/payload"
 	"github.com/norvexlabs/stowage/internal/project"
@@ -471,7 +473,35 @@ volumes:
 		if want, _ := os.ReadFile(ca); mode == "byo" && !bytes.Equal(pub, want) {
 			t.Errorf("byo published %q, not the --ca given", pub)
 		}
-		if mode != "byo" {
+		if mode == "internal" {
+			// A machine made again from the secrets export: its front issues from the same root.
+			env, err := ReadEnvFile(filepath.Join(dir, ".env"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			f, err := in.exportSecrets(context.Background(), env)
+			if err != nil || f.FrontCA == nil || !bytes.Equal([]byte(f.FrontCA.Cert), pub) {
+				t.Fatalf("the export does not carry the published root: %v\n%s", err, log.String())
+			}
+			plain, err := yaml.Marshal(f)
+			if err != nil {
+				t.Fatal(err)
+			}
+			again := filepath.Join(work, "stowage-smoke-notes-internal-again")
+			httpPort2, httpsPort2 := freePort(t), freePort(t)
+			in2 := &Installer{R: r, O: Options{Dir: again, Out: &out, Log: &log, Docker: ExecTool{Bin: "docker"}, TLS: "internal", Secrets: plain,
+				Domains: map[string]string{"app": "notes.smoke.test"}, HTTPPort: httpPort2, HTTPSPort: httpsPort2}}
+			t.Cleanup(func() {
+				if env, err := ReadEnvFile(filepath.Join(again, ".env")); err == nil {
+					_, _ = in2.Compose(context.Background(), env, io.Discard, "down", "--volumes")
+				}
+			})
+			if err := in2.Install(context.Background()); err != nil {
+				t.Fatalf("the install made again: %v\n%s", err, log.String())
+			}
+			if _, pub2 := served(in2, httpsPort2); !bytes.Equal(pub2, pub) {
+				t.Fatalf("the install made again publishes another root:\n%s\nnot\n%s", pub2, pub)
+			}
 			continue
 		}
 		// The byo install moves to the local CA: its certificate and key go, the local CA's root

@@ -153,7 +153,7 @@ secrets:
   - { key: INTERNAL_SERVICE_SECRET, gen: hex32, rotation: true }   # secrets rotate
   - { key: POSTGRES_PASSWORD,       gen: pass18 }
   - { key: APP_DB_PASSWORD,         gen: pass18 }
-  - { key: OPS_PASSWORD,            gen: pass18 }   # the ops route's login
+  - { key: OPS_PASSWORD,            gen: pass18, settable: true }   # the ops route's login; secrets set
 
 safe_defaults:
   COOKIE_SECURE: "true"

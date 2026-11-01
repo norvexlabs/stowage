@@ -442,7 +442,7 @@ func TestTheAppSocketRefusesTheOperatorsRoutes(t *testing.T) {
 		handler.ServeHTTP(w, req)
 		return w.Code
 	}
-	for _, pattern := range []string{"DELETE /v1/backup/config", "POST /v1/provision", "POST /v1/reset-db", "POST /v1/secrets/export", "POST /v1/secrets/rotate", "POST /v1/restore"} {
+	for _, pattern := range []string{"DELETE /v1/backup/config", "POST /v1/provision", "POST /v1/reset-db", "POST /v1/secrets/export", "POST /v1/secrets/rotate", "POST /v1/secrets/set", "POST /v1/services/api/exec", "POST /v1/restore"} {
 		if code := call(h.AppHandler(), pattern); code != http.StatusForbidden {
 			t.Errorf("the app socket answered %s with %d", pattern, code)
 		}

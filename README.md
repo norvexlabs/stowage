@@ -86,7 +86,7 @@ sh notes.sh
 | **Version** | developer | The version comes from your changelog, a file, a git tag or a command; a scheme (CalVer, SemVer, regex, command) validates and orders it. Stowage never compares versions as strings. `stowage.lock` pins the Stowage that publishes. |
 | **Publish** | developer, CI | `stowage ship` builds what changed, pushes it by digest, signs it, builds the installer and the release manifest, then moves the channel's pointer. `verify`, `promote` (beta → stable without rebuilding), `yank`, `prune`, `releases`. `stowage hook install` ships each version bump on commit. |
 | **Install** | operator | `docker run --rm <prefix>/<name>-installer:latest > <name>.sh` gets the bootstrap script, which carries the installer, `<short>-stow`; then `sh <name>.sh` on Docker; `sh <name>.sh k8s install` on Kubernetes; `sh <name>.sh vm create` for a VM (seed ISO or cloud user-data, or the VM created with OpenTofu: TrueNAS; libvirt, Proxmox VE, vSphere, AWS, Google Cloud and Azure as previews; or a module of your own). Inputs asked once, secrets generated once, provision hook run, portal URL printed. |
-| **Operate** | operator | `status`, a re-run to change inputs, ports or the TLS mode (the changes logged, the previous values kept), `provision`, `secrets rotate` (stage, swap, finish: the old value accepted meanwhile), `secrets export` (age-encrypted, to rebuild a machine), `reset-db`. |
+| **Operate** | operator | `status`, a re-run to change inputs, ports or the TLS mode (the changes logged, the previous values kept), `provision`, `secrets rotate` (stage, swap, finish: the old value accepted meanwhile), `secrets set` (a chosen value for a `settable` secret), `secrets export` (age-encrypted, to rebuild a machine), `reset-db`. |
 | **Upgrade** | operator | `upgrade --version V` fetches that release's installer, checks its signature against the keys the install trusts and brings the stack up on the new images — on Docker after a `pg_dump` snapshot, on Kubernetes through Helm. On the VM, `updates` lists what the channel offers and `upgrade` reboots into the new OS. |
 | **Roll back** | operator | `rollback` returns to the previous release — unless a migration since then is a rollback barrier your schema-compat provider reports, in which case it refuses and names it. On the VM the health gate does it alone: an upgraded boot that is not healthy in time falls back to the previous system. |
 | **Recover** | operator | On the VM: scheduled and pre-upgrade backups (`pg_dump` and the volumes the project lists, or those volumes alone for a project without a database, encrypted to age keys, uploaded with rclone to any rclone remote), `restore` into a side database swapped in once loaded whole, and a disaster recovery from exported secrets. |
@@ -101,6 +101,7 @@ sh notes.sh
 | Signed `upgrade` / `rollback` | ✓ | ✓ (Helm) | ✓ (A/B reboot) |
 | Rollback refused past a schema barrier | ✓ | ✓ (`shapes.kubernetes.schema`) | ✓ |
 | `reset-db`, `secrets rotate` | ✓ | ✓ | ✓ |
+| `secrets set` | ✓ | — | ✓ |
 | `secrets export` | ✓ | — | ✓ |
 | Install from a mirror | ✓ | ✓ | ✓ |
 | A failed upgrade undone on its own | — | ✓ (Helm `--wait`, rolled back when not ready) | ✓ (health gate) |
@@ -498,6 +499,7 @@ stowage -C <project> sbom export [<version>] DIR [--channel C] [--revision N]   
 stowage -C <project> promote <version> --from C --to C [--revision N] [--json]
 stowage -C <project> yank <version> --reason TEXT [--channel C] [--revision N]
 stowage -C <project> prune --channel C [<version>]    # mutable channels only
+stowage -C <project> prune --channel C --keep N      # any channel: all but its N latest and the pointer's
 stowage -C <project> releases [--channel C] [--json]
 stowage -C <project> hook install [--channel C] [--disks]       # write git's post-commit hook for this project
 stowage -C <project> hook post-commit [--channel C] [--disks]   # what that hook runs: ship a version bump in the background
@@ -544,7 +546,11 @@ stowage -C <project> --test-registry PREFIX [--test-push USER:ENV] [--test-pull 
   reads, as the installer's `sbom export` does (`DIR/<artifact>.spdx.json`, `DIR/index.json`).
 - `prune` without a version deletes every release of the channel except the pointer's. With a
   version, it deletes every revision of that version, and the pointer moves back when it held
-  one. An immutable channel is refused: yank instead.
+  one. An immutable channel is refused: yank instead. `--keep N` (1 or more; not with a version)
+  is the channel's retention, on an immutable channel too: every release but its N latest (by
+  the project's scheme; each revision is a release, a yanked one counted) and the pointer's is deleted as above (tags, disks,
+  installer, chart, referrers; the index and `:latest` settled); a release the current scheme
+  refuses is skipped, as `releases` does. Nothing to delete prints nothing and succeeds.
 - `releases` lists the published releases, oldest first in each channel. It checks no signature.
   A release whose version the current scheme refuses is skipped with a warning.
 - `ship`, `promote` and `verify` print, besides the release line and its digest (not with
@@ -1531,7 +1537,7 @@ backup. On Kubernetes
 | `health` | `http-json` (`service`, `port`, `path`, `liveness_path`, `expect`: the JSON fields a ready answer carries), `http-status` (the same, `expect` a 200–399 status, default 200), `command` (`image`, `cmd`, `timeout_s`). The VM's health gate and `<short>-stow health` run it; the Docker installer waits on the compose healthchecks (`up --wait`), then judges a stack `--wait` refused by each service's state (every one running, healthy when it has a healthcheck, or exited 0) |
 | `database` | optional (see "A project without a database" above); given, `engine` (`postgres` only), `service`, `name`, `roles.migrate`, `roles.app` (all required; one role twice is allowed), `schema_compat` (`sql`, `command`, `none`; `sql`'s `baseline`, an integer ≥ 0 where absent or 0 means 1 (every other provider is at 1), is the schema epoch the release's migrations start from: see the upgrade notes on schema baselines) |
 | `data` | optional: `volumes.<name>.{uid, keep_on_reset}`, `reset` (volumes not `keep_on_reset`; empty is a warning, and `reset-db` refuses it; without a `database`, an error when not empty): the volumes `reset-db` wipes on Docker and the VM (on Kubernetes it deletes every claim of the release). `uid` (0 to 4294967294; absent, the volume is left as Docker makes it — owned by the image's directory it mounts on, root when the image has none): on Docker and the VM, a volume a service mounts that the engine does not hold yet — the stack's first start, or after `reset-db` wiped it — is given to `uid` as that start makes it, before the services start: the containers are made first (`up --no-start`), so the volume already holds what the image put there, then, when its root belongs to another user, it is given to `uid` recursively (`chown -hR uid`: the group kept, a symbolic link changed itself, never what it points to), logging `volume <name> given to its uid`. The volumes a start makes are listed in `.stowage-volumes-pending` (0600) until they have their uid: a start cut off in between, or a release without the helper, leaves them listed, and the next start that mounts them gives it; one a service mounts while no `uid` is owed to it, or that is gone, is struck off. A volume that exists otherwise keeps its owner (its data's: an upgrade never re-owns it), and an `external` one is never touched. The chown runs as root, offline, in the volume helper (`<name>-chown`, busybox pinned by digest), which `ship` builds and publishes for a project with such a volume and the `docker` or `kairos` shape, a Docker install pulls with the stack's images (recorded as `STOWAGE_CHOWN_IMAGE`, by digest or, offline, by tag) and the OS bundle preloads. A release an earlier Stowage published carries none: started again by a rollback, its new volumes keep the owner Docker gives them until a release with the helper starts, and the start logs `<name> <version> carries no volume helper: <volumes> keep the owner Docker gave them until a release with one starts`. On Kubernetes the chart sets its own `securityContext` |
-| `secrets[]` | `key`, `gen`: `hex32`, `hex16` (random bytes, hex), `pass18`, `pass32` (alphanumeric), `b64-32` (base64url); `rotation: true` lets `secrets rotate` replace it (`KEY_NEXT`, `KEY_PREVIOUS` and `KEY_ACCEPTED` are then reserved names, recorded empty beside it, and the compose file must read both `KEY_NEXT` and `KEY_PREVIOUS`, or `KEY_ACCEPTED` alone). Generated once at the first install, or at the upgrade that adds it |
+| `secrets[]` | `key`, `gen`: `hex32`, `hex16` (random bytes, hex), `pass18`, `pass32` (alphanumeric), `b64-32` (base64url); `rotation: true` lets `secrets rotate` replace it (`KEY_NEXT`, `KEY_PREVIOUS` and `KEY_ACCEPTED` are then reserved names, recorded empty beside it, and the compose file must read both `KEY_NEXT` and `KEY_PREVIOUS`, or `KEY_ACCEPTED` alone); `settable: true` lets `secrets set` record a value the operator chooses (a password people type), refused beside `rotation` (`secrets[N].settable: KEY rotates: …`) and on a secret the database's service reads in its compose `environment` (the database keeps the value it was made with). Generated once at the first install, or at the upgrade that adds it |
 | `safe_defaults` | `KEY: value`, the value the compose file defaults to |
 | `inputs[]` | `key`, `prompt` (required), `default` (may name `${KEY}`), `required`, `optional` (exclusive with `required`; otherwise no effect), `secret` (no default), `when: tls\|loopback` (asked only in that mode), `shapes` (`docker`, `kubernetes`, `kairos`; asked only on those), `profile` (a compose profile name, `[a-zA-Z0-9][a-zA-Z0-9_.-]*`, that a service of the compose file carries: the input turns it on while it holds a value — see "Optional services" under the installer; not `required`, and asked on the `docker` or `kairos` shape; lint counts it as read), `advanced` (a tunable: never asked, recorded only when `--set`, `--answers` or the VM's settings give it — never from an exported variable — its default the compose file's — so no `required` or `default`, and the compose file must write it `${KEY:-default}`; a re-run giving it empty removes it). An input left empty is recorded empty. An input asked on the `docker` or `kairos` shape that no compose service, no route and no provision hook's `env` reads is a warning (one asked on `kubernetes` only is the chart's) |
 | `extensions[]` | the apps an install of this project can be pointed at (see "Extensions"): `name` (an app name, as `name` is; not this project's; none twice), `input` (required: an input holding the extension's endpoint, empty while it is off — `optional`, not `secret`, no `default`, and read by a compose service, a route or the provision hook's `env`, or asked on `kubernetes` only, where the chart reads it), `prompt` (required: what the install's tip calls it; the `input` is neither `advanced` nor asked in one mode only, `when`, so every install records it), `key_input` (an `optional` `secret` input holding its credential, asked on the same shapes as `input`, neither `advanced` nor `when`, and read as `input` is). No input is named by two extensions, or twice by one |
@@ -1578,6 +1584,7 @@ again, to copy an installer to another host.
 <short>-stow uninstall [--data] [--yes] [--no-input] [--accessible] [--dry-run] [--dir D]
 <short>-stow secrets export --recipient AGE_KEY… [-o FILE|-] [--dir D]   # the secrets, encrypted
 <short>-stow secrets rotate KEY [--stage | --finish] [--dir D]           # a secret with rotation: true
+<short>-stow secrets set KEY [--accessible] [--dir D] < value            # a secret with settable: true; asked, unechoed, on a terminal
 <short>-stow provision [--dir D] [--set KEY=VALUE]…                      # run the provision hook again; --set an input only it reads, or a value it returned or declares it returns
 <short>-stow upgrade [--dir D] [--set KEY=VALUE]… [--answers FILE] [--no-input] # the NEW release's installer
           [--ports route=port]… [--offline] [--dry-run] [--no-provision] [--accessible]
@@ -1873,7 +1880,7 @@ again, to copy an installer to another host.
     to the install's CA (`tls/ca.pem`, kept) when there is one; `--ca` alone gives a new CA for
     the install's certificate, and `--ca none` publishes none. The new files are written into a
     new directory that takes `tls/`'s place, the replaced one kept as `tls.prev/` until the stack next
-    comes up (a re-run, `secrets rotate`, `reset-db`, an upgrade) (one already there, from a run that failed, is the last that came up: it is
+    comes up (a re-run, `secrets rotate`, `secrets set`, `reset-db`, an upgrade) (one already there, from a run that failed, is the last that came up: it is
     kept, and the failed files go). A move away
     from `byo` removes `tls/` once a re-run's stack came up in the new mode (also when the run
     that recorded the move failed). A re-run without `--tls` keeps the
@@ -2057,8 +2064,13 @@ again, to copy an installer to another host.
   refusal names that command.
 - `secrets export --recipient age1…` (repeatable, 1 to 16 keys) writes the install's secrets for a
   disaster recovery: the generated ones (a rotated secret's `KEY_NEXT` and `KEY_PREVIOUS` with
-  them), the secret inputs (the Cloudflare token among them) and what the provision hook returned
-  (`provision.env`), as YAML (`project`, `secrets`, `provision`), encrypted to those age public
+  them), the secret inputs (the Cloudflare token among them), what the provision hook returned
+  (`provision.env`) and, for an install in the `internal` TLS mode, the front's local CA (its
+  root's certificate and key, PEM, read from the front's data volume by a container of the
+  front's image, running or not; a front that made none yet is exported without it, said, and one
+  that cannot be read — Docker down, the image gone — is a warning: the secrets are exported
+  without it, and a machine made again from them issues from a new root), as
+  YAML (`project`, `secrets`, `provision`, `front_ca: {cert, key}`), encrypted to those age public
   keys and ASCII-armored, into `-o` (default `<name>-secrets.age`, 0600, never over a file; `-`
   for standard output). No private key is needed on the machine; keep the file off it.
   `age --decrypt -i KEY <name>-secrets.age > secrets.yaml` gives what `--secrets` takes back.
@@ -2071,8 +2083,16 @@ again, to copy an installer to another host.
   re-run or a boot: the stack starts unprovisioned, `status` says a backup is awaited
   (`.stowage-restore-awaited`), and `sudo <short>-stow restore OBJECT` (the VM) loads it and runs
   the hook; on Docker, which has no `restore`, a backup loaded by hand, then `provision` runs it,
-  as it does an empty database. A file without provision values awaits nothing. Refused: a file still encrypted,
-  one of another project, an unknown field, over 1 MiB, and `--secrets` on an install that
+  as it does an empty database. A file without provision values awaits nothing. The front's
+  local CA the file holds is recorded (`.stowage-front-ca`, 0600) for an install in the
+  `internal` mode (in another, it is left out, said), and put in the front's data volume before
+  the front first starts: a front container already there is removed, the root and its key
+  written, the intermediate and the certificates an earlier root issued deleted (Caddy makes them
+  again from the root), then the record deleted; a start that fails before keeps it, and the
+  next start (a re-run) does it. So every client that trusted the old root (a browser, a
+  service `publish_ca` gives it to) still trusts the new machine. Refused: a file still encrypted,
+  one of another project, an unknown field, over 1 MiB, a `front_ca` whose certificate is not a
+  CA's or whose key is not its own, and `--secrets` on an install that
   exists (it keeps its own). A key that is no secret of the release is left out, and said.
   Docker and the Kairos VM; on Kubernetes, not yet.
 - `secrets rotate KEY` replaces a generated secret whose spec entry has `rotation: true` (any
@@ -2092,6 +2112,23 @@ again, to copy an installer to another host.
   while one is staged, else `KEY_PREVIOUS`; empty outside a rotation, as the two are never both
   set), each pass and each upgrade writing it again: a service that accepts one more value beside
   `KEY` reads `${KEY_ACCEPTED}` alone. It is a secret, as the two are.
+- `secrets set KEY` records a value the operator chooses for a generated secret whose spec entry
+  has `settable: true` (any other is refused, naming the ones that have it): a login's password,
+  a local identity provider's user, set to a known value or reset after a leak. The value is read
+  from standard input, one trailing line break dropped (`printf '%s\n' "$pw" | … secrets set
+  KEY`), or asked, unechoed, when standard input is a terminal (`--accessible`: a plain line
+  prompt; without a terminal to ask on, it is refused, naming that pipe); never an argument. Refused before anything changes: an empty value, one over 4096
+  bytes, one `.env` cannot hold (a single quote, a line break, a trailing backslash), and, for a
+  front route's login password (`basic_auth.secret`), one over the 72 bytes bcrypt takes. It is
+  recorded in `.env`, then the stack is brought up again as for a changed input (the services
+  reading it are recreated, a login's hash made again) and the provision hook run, under the
+  install's lock; the value is never printed. The same value again records nothing and brings
+  the stack up again. `secrets export` carries it from then on. A secret the database or the
+  data was made with (a database password, an encryption key) is never `settable`: the
+  database keeps the password it was created with (lint refuses `settable` on a secret the
+  database's service reads in its `environment` — by name or interpolated, an `env_file` not
+  read: `secrets[N].settable: KEY is read by the database's service …`). Docker and the Kairos VM; on Kubernetes,
+  not yet.
 - `reset-db` takes the install back to its first setup, run by the installer of the release it
   runs (another is refused, naming the one to use). It refuses, before anything changes, a
   `data.reset` volume the release's compose file does not declare at top level, declares
@@ -2358,7 +2395,8 @@ again, to copy an installer to another host.
   issuer; a chain ending at a self-signed certificate no host trusts, a private CA's, is said and
   kept — then copied into `<dir>/tls/` 0600; `status` shows its end, and warns from 30 days
   before it), `internal` (Caddy's local CA; its root is
-  `/data/caddy/pki/authorities/local/root.crt` in the front). `dns-cloudflare`
+  `/data/caddy/pki/authorities/local/root.crt` in the front; `secrets export` carries it and its
+  key, so a machine made again with `--secrets` keeps the root). `dns-cloudflare`
   (Let's Encrypt alone, DNS-01 through Cloudflare, so no port needs to reach the host for
   issuance; `STOWAGE_ACME_EMAIL` as with `acme`; `STOWAGE_CLOUDFLARE_API_TOKEN`, required and
   secret, a token with Zone DNS Edit on each domain's zone, in the form Cloudflare issues — 35 to
@@ -3895,6 +3933,7 @@ sudo <short>-stow install [--channel C] [--set KEY=VALUE]… [--answers FILE] [-
 <short>-stow events [--after N] [--follow|-f] [--json]   # the event journal: jobs, reboots, boots and the health gate's verdicts, the first install; --follow waits for more until interrupted, through daemon restarts
 <short>-stow ps [--json]              # the stack's services, state and health
 <short>-stow logs SERVICE [--tail N]  # 1 to 5000 lines, default 200
+<short>-stow exec SERVICE -- COMMAND [ARG…]   # in the running container, no terminal or input; its outputs once it ends, its exit status
 <short>-stow restart|stop|start SERVICE
 <short>-stow provision [--set KEY=VALUE]…   # the provision hook again; --set as on Docker (an input only it reads, or a value it returned or declares it returns; empty forgets it)
 <short>-stow updates [--channel C] [--version V] [--json]
@@ -3905,6 +3944,7 @@ sudo <short>-stow install [--channel C] [--set KEY=VALUE]… [--answers FILE] [-
 <short>-stow restore OBJECT [--identity FILE|-] [--yes] [--accessible]   # load a backup into the database and its volumes (the volumes alone without one)
 <short>-stow secrets export --recipient age1…… [-o FILE|-]   # the install's secrets, encrypted
 <short>-stow secrets rotate KEY [--stage | --finish]   # a secret with rotation: true
+<short>-stow secrets set KEY [--accessible] < value   # a secret with settable: true
 <short>-stow network [--json]          # the address, gateway and DNS servers, what sets them, a change awaiting confirmation
 <short>-stow tune [--check]           # how the VM's network settings differ from what its boot tuning wants (the stack's profile); --check exits non-zero
 <short>-stow network set --mode dhcp|static [--address A/P] [--gateway G] [--ipv6 [--address6 A/P] [--gateway6 G]] [--dns D,…] [--revert-secs N | --no-revert]
@@ -4095,7 +4135,7 @@ sudo <short>-stow network attach --role ROLE --mac MAC [--mode dhcp|static|none]
   every 4 KiB, a blank line is kept; the daemon keeps at least a job's last 2000 lines), and fails
   when the job fails or when the daemon's job is another (`status` then tells how it went). Every
   verb that starts a job (`upgrade`, `rollback`, `reset-db`, `backup run`, `backup verify`,
-  `restore`, `secrets rotate`) follows it this way, telling it from any other by the `started`
+  `restore`, `secrets rotate`, `secrets set`) follows it this way, telling it from any other by the `started`
   its 202 carries — another job of the same kind and target is another job. Between two reads of
   the log it waits on the event journal from the 202's `events`, so a job's end is seen at once,
   and read from the journal when reading the job again then fails in any way (the daemon gone,
@@ -4168,9 +4208,23 @@ sudo <short>-stow network attach --role ROLE --mac MAC [--mode dhcp|static|none]
   has no route into an internal network); a service on internal networks alone is not ready.
 - `secrets rotate` is the Docker shape's three passes, run by the daemon as a job (`rotate`)
   once the health gate judged the boot (its restarts could fail the gate's deadline); `<short>-stow`
-  follows it. `secrets export` is the Docker shape's, the daemon writing the encrypted file it
-  answers; both refuse (409) an install running another release than the OS's, whose spec
+  follows it. `secrets set` is the Docker shape's too: `<short>-stow` reads the value as Docker's
+  does and sends it to the daemon (`POST /v1/secrets/set`, the operator's socket alone), which
+  refuses (400) a key that is not settable and a value Docker's refuses, then records it in a job
+  (`secret`) once the health gate judged the boot, followed the same way. `secrets export` is
+  the Docker shape's, the daemon writing the encrypted file it answers (and what the export said,
+  a front CA it could not read, which `<short>-stow` prints on standard error). `secrets export` and
+  `secrets set` refuse (409) an install running another release than the OS's, whose spec
   names the secrets.
+- `exec SERVICE -- COMMAND [ARG…]` runs a command in the service's running container through
+  the daemon (`POST /v1/services/<service>/exec`, `{"args": […]}`, the operator's socket alone;
+  it answers `{"stdout", "stderr", "exit"}`, each output base64 as JSON carries bytes, and
+  `"stdout_cut"` / `"stderr_cut"` true when one was cut),
+  as `docker compose exec -T`: no terminal and no standard input; its standard output and error
+  are printed once it ends, each cut at 4 MiB (said on standard error), and its exit status is
+  `<short>-stow`'s. An unknown service is 404, no command 400. As on Docker it takes no lock: it
+  runs beside a job (an upgrade, a restore) as `docker exec` would. Interrupting `<short>-stow`
+  stops the `docker compose exec`, not always the command in the container.
 - `restore OBJECT` loads a backup into the install's database (the VM's destination and rclone
   config, so backups must be configured): `<short>-stow` reads the age identity that decrypts it
   from standard input (`--identity FILE` instead), asks to confirm on a terminal (without one,
@@ -4230,7 +4284,7 @@ sudo <short>-stow network attach --role ROLE --mac MAC [--mode dhcp|static|none]
   a restore. From the database's swap until every volume is in, `<dir>/.stowage-volumes-split`
   marks the install (a swap whose outcome cannot be read keeps it too, with the staging): while
   it is there nothing brings the stack up, writes the data or moves the release — the boot, a
-  re-run, `secrets rotate`, `start` and `restart` (409), `provision`, `reset-db`, `upgrade` and
+  re-run, `secrets rotate`, `secrets set`, `start` and `restart` (409), `provision`, `reset-db`, `upgrade` and
   `rollback` refuse before changing anything, saying so; the stopped services' containers are
   removed (`compose rm --stop --force`), so no restart policy starts them at a reboot —, no backup is taken (409, an upgrade's first one
   failing), and `status` says `not running` (on Docker `… (or a restore is running)`; the VM's
@@ -4627,7 +4681,7 @@ sudo <short>-stow network attach --role ROLE --mac MAC [--mode dhcp|static|none]
   address family), or their concatenation (`a . b`), written as such — a host
   or service name, which nft would resolve, and anything else 400 before nft runs; it answers `{"added": N, "deleted": M}`.
   The operator's routes answer 403 there, token or not: `provision`, `reset-db` (its plan
-  excepted), `secrets export`, `secrets rotate`, `restore` and `backup config --remove`
+  excepted), `secrets export`, `secrets rotate`, `secrets set`, `exec`, `restore` and `backup config --remove`
   (`DELETE backup/config`), run over SSH alone, and so does an `upgrade` with `skip_backup` (the
   backup a failed migration is restored from). `network` stays the app's, `revert_secs` 0
   included: a service holding the token can move the VM to an address nothing reaches, which
@@ -4732,7 +4786,8 @@ showed another plan: look again`), `GET updates?channel=&version=` (`left_by_rol
   start the boot cancels, `Job for <name>.service canceled.`, is tried once more once
   `systemctl is-system-running --wait` returns, 10 min at most, unless the unit failed; a failure
   then fails the create, the VM kept), then `backup config` with the same destination, `backup
-  list` and `restore OBJECT` load the data back.
+  list` and `restore OBJECT` load the data back. The front's local CA (`--tls internal`) goes
+  with the secrets: the new VM's front issues from the same root.
 - Not yet: `upgrade --reset-db`, secrets sealed in an encrypted answers file.
 - The firewall: the bundle's `/etc/nftables.conf` holds a table of the project's own (`inet
   <name>`, flushed by itself on each load, never the whole ruleset: Docker's rules stay) whose

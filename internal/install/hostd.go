@@ -45,6 +45,9 @@ import (
 //	GET  /v1/services                    the stack's services
 //	GET  /v1/services/{service}/logs     ?tail=N (1..5000, default 200): the service's last lines
 //	POST /v1/services/{service}/{action} restart, stop or start one service
+//	POST /v1/services/{service}/exec     {args}: a command run in the service's running container,
+//	                                     without a terminal or input: {stdout, stderr, exit}, each
+//	                                     output cut at maxExecOutput (operator only)
 //	POST /v1/provision                   {set}: the provision hook again, set recorded first
 //	GET  /v1/updates                     ?channel=C&version=V: the release an upgrade would install
 //	POST /v1/upgrade                     {channel, version, confirm, reboot, skip_backup}: an upgrade job
@@ -59,7 +62,7 @@ import (
 //	POST /v1/reboot, /v1/shutdown        {drain_secs}: after the drain (202)
 //	GET, POST /v1/network, POST /v1/network/{confirm,revert,reset}: the network override (hostdnet.go)
 //	/v1/backup, /v1/backup/{config,status,list,verify}: the backups (hostdbackup.go)
-//	/v1/secrets/{export,rotate}, /v1/restore: the install's secrets and a backup's restore (hostdsecrets.go)
+//	/v1/secrets/{export,rotate,set}, /v1/restore: the install's secrets and a backup's restore (hostdsecrets.go)
 //
 // An error is {"error": "..."} with a 4xx or 5xx status. One job runs at a time, and none starts
 // once a reboot is scheduled; every request that starts one answers 202 with JobStarted.
@@ -558,13 +561,14 @@ func (h *Hostd) routes(app bool) http.Handler {
 	}
 	// The app reaches what operates the install; the operator's alone are the routes that hand
 	// out or replace the secrets, erase or overwrite the data, re-run the hook (whose outputs
-	// include credentials), or stop the backups.
+	// include credentials), stop the backups, or run a command in a container.
 	both := func(pattern string, f http.HandlerFunc) { handle(pattern, f, true) }
 	operator := func(pattern string, f http.HandlerFunc) { handle(pattern, f, false) }
 	both("GET /v1/status", h.status)
 	both("GET /v1/services", h.services)
 	both("GET /v1/services/{service}/logs", h.logs)
 	both("POST /v1/services/{service}/{action}", h.serviceAction)
+	operator("POST /v1/services/{service}/exec", h.execService)
 	operator("POST /v1/provision", h.provision)
 	both("GET /v1/reset-db", h.resetDBPlan)
 	operator("POST /v1/reset-db", h.resetDB)
@@ -592,6 +596,7 @@ func (h *Hostd) routes(app bool) http.Handler {
 	both("POST /v1/backup/verify", h.verifyBackup)
 	operator("POST /v1/secrets/export", h.exportSecrets)
 	operator("POST /v1/secrets/rotate", h.rotateSecret)
+	operator("POST /v1/secrets/set", h.setSecret)
 	operator("POST /v1/restore", h.restoreBackup)
 	return mux
 }
@@ -884,6 +889,57 @@ func (h *Hostd) logs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	reply(w, http.StatusOK, map[string]string{"logs": string(out)})
+}
+
+// maxExecOutput bounds each output of an exec the daemon answers.
+const maxExecOutput = 4 << 20
+
+// ExecRequest is POST /v1/services/{service}/exec's body, and ExecResult its answer: the outputs
+// (cut, StdoutCut and StderrCut then set, past maxExecOutput) and the command's exit status.
+type ExecRequest struct {
+	Args []string `json:"args"`
+}
+
+type ExecResult struct {
+	Stdout    []byte `json:"stdout"`
+	Stderr    []byte `json:"stderr"`
+	StdoutCut bool   `json:"stdout_cut,omitempty"`
+	StderrCut bool   `json:"stderr_cut,omitempty"`
+	Exit      int    `json:"exit"`
+}
+
+func (h *Hostd) execService(w http.ResponseWriter, r *http.Request) {
+	var req ExecRequest
+	if err := decodeBody(r, &req); err != nil {
+		replyErr(w, err)
+		return
+	}
+	if len(req.Args) == 0 {
+		replyErr(w, fail(http.StatusBadRequest, "args: the command to run, as [\"psql\", \"-c\", \"…\"]"))
+		return
+	}
+	in, _ := h.run()
+	env, err := h.installed(in)
+	if err != nil {
+		replyErr(w, err)
+		return
+	}
+	svc := r.PathValue("service")
+	if err := h.knownService(r.Context(), in, env, svc); err != nil {
+		replyErr(w, err)
+		return
+	}
+	stdout, stderr := &capped{limit: maxExecOutput}, &capped{limit: maxExecOutput}
+	in.O.Out, in.O.Log = stdout, stderr
+	err = in.exec(r.Context(), env, svc, req.Args, nil, false)
+	var code ExitCode
+	switch {
+	case errors.As(err, &code):
+	case err != nil:
+		replyErr(w, err)
+		return
+	}
+	reply(w, http.StatusOK, ExecResult{Stdout: stdout.buf.Bytes(), Stderr: stderr.buf.Bytes(), StdoutCut: stdout.over, StderrCut: stderr.over, Exit: int(code)})
 }
 
 func (h *Hostd) serviceAction(w http.ResponseWriter, r *http.Request) {

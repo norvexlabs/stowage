@@ -1315,6 +1315,12 @@ func (l *linter) secretsAndInputs() {
 			claim(w+".rotation", s.Key+"_PREVIOUS", "a rotated secret's previous value")
 			claim(w+".rotation", s.Key+"_ACCEPTED", "a rotated secret's other accepted value")
 			l.rotated(w, s.Key)
+			if s.Settable {
+				l.errf(w+".settable", "%s rotates: `secrets rotate` changes it, in passes every service follows; keep one of rotation and settable", s.Key)
+			}
+		}
+		if s.Settable {
+			l.settable(w, s.Key)
 		}
 	}
 	for _, k := range sortedKeys(l.s.SafeDefaults) {
@@ -1386,6 +1392,42 @@ func (l *linter) rotated(where, key string) {
 			l.errf(where+".rotation", "%s reads no ${%s} (nor ${%s_ACCEPTED}, either of them): during a rotation its services accept both values", l.s.Stack.Compose, k, key)
 		}
 	}
+}
+
+// settable refuses a settable secret the database's service reads in its environment: the
+// database keeps the value it was first made with, so a new one in .env breaks its readers.
+func (l *linter) settable(where, key string) {
+	if l.compose == nil || !l.s.HasDatabase() {
+		return
+	}
+	db := l.s.DB().Service
+	if envReads(l.compose.Services[db].Environment, key) {
+		l.errf(where+".settable", "%s is read by the database's service %s, which keeps the value it was first made with: a secret the data is made with is never settable", key, db)
+	}
+}
+
+// envReads reports whether a compose environment (a map, or a list of KEY[=VALUE]) reads key:
+// passes it through by name (a list entry KEY, a map key KEY without a value), or interpolates it
+// in a value (${KEY}, ${KEY…} with a modifier, $KEY; compose's $$ is a literal dollar).
+func envReads(env any, key string) bool {
+	re := regexp.MustCompile(`\$(\{` + regexp.QuoteMeta(key) + `[}:?+-]|` + regexp.QuoteMeta(key) + `\b)`)
+	reads := func(v string) bool { return re.MatchString(strings.ReplaceAll(v, "$$", "")) }
+	switch e := env.(type) {
+	case map[string]any:
+		for k, v := range e {
+			if k == key && v == nil || v != nil && reads(fmt.Sprint(v)) {
+				return true
+			}
+		}
+	case []any:
+		for _, v := range e {
+			s := fmt.Sprint(v)
+			if name, val, _ := strings.Cut(s, "="); name == key && !strings.Contains(s, "=") || reads(val) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (l *linter) composeVars(keys map[string]string) {

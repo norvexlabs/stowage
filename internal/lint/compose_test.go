@@ -26,3 +26,28 @@ func TestMergeNetworks(t *testing.T) {
 		}
 	}
 }
+
+func TestEnvReadsASecret(t *testing.T) {
+	t.Parallel()
+	for _, c := range []struct {
+		env  any
+		want bool
+	}{
+		{map[string]any{"P": nil}, true},
+		{map[string]any{"P": "literal"}, false},
+		{map[string]any{"X": "${P}"}, true},
+		{map[string]any{"X": "${P:-x}"}, true},
+		{map[string]any{"X": "a$P"}, true},
+		{map[string]any{"X": "$${P}"}, false},
+		{map[string]any{"X": "${PX}"}, false},
+		{[]any{"P"}, true},
+		{[]any{"P=literal"}, false},
+		{[]any{"X=${P}"}, true},
+		{[]any{"PX"}, false},
+		{nil, false},
+	} {
+		if got := envReads(c.env, "P"); got != c.want {
+			t.Errorf("%v: %v", c.env, got)
+		}
+	}
+}

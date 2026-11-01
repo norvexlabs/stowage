@@ -33,8 +33,10 @@ import (
 // fakeDocker answers the docker CLI the installer runs and records every call.
 type fakeDocker struct {
 	// mu guards calls: a backup's dump and upload run at once.
-	mu     sync.Mutex
-	calls  []Cmd
+	mu    sync.Mutex
+	calls []Cmd
+	// exec, when set, runs a `compose exec`: it may write to the call's Stdout and Stream.
+	exec   func(c Cmd) error
 	loaded map[string]string // image reference → the ID `image inspect` reports
 	// loadedBytes is what `docker load` read; it loads loadAs, which `image inspect` then answers
 	// with loadInspect.
@@ -98,6 +100,9 @@ func (f *fakeDocker) Run(_ context.Context, c Cmd) ([]byte, error) {
 	a := strings.Join(c.Args, " ")
 	if f.runner != nil && strings.HasPrefix(a, "run --rm --pull never ") {
 		return f.runner(c)
+	}
+	if f.exec != nil && strings.HasPrefix(a, "compose") && strings.Contains(a, " exec ") {
+		return nil, f.exec(c)
 	}
 	if f.answer != nil {
 		if out, ok, err := f.answer(a); ok {

@@ -28,6 +28,9 @@ import (
 //	POST /v1/secrets/rotate  {key, pass}: one pass (stage, swap, finish) of a rotated secret's
 //	                         rotation, as a job (202, {job, target}): the install's .env changes,
 //	                         then the stack comes up again with it
+//	POST /v1/secrets/set     {key, value}: a settable secret's value recorded, as a job (202, {job,
+//	                         target}): the install's .env changes, then the stack comes up again
+//	                         with it
 //	POST /v1/restore         {object, identity, confirm}: a backup of the release the install runs
 //	                         loaded into its database, as a job (202, {job, target})
 
@@ -38,6 +41,8 @@ type SecretsExportRequest struct {
 
 type SecretsExport struct {
 	File string `json:"file"`
+	// Log is what the export said (a front CA it could not read), for the operator.
+	Log string `json:"log,omitempty"`
 }
 
 func (h *Hostd) exportSecrets(w http.ResponseWriter, r *http.Request) {
@@ -46,7 +51,7 @@ func (h *Hostd) exportSecrets(w http.ResponseWriter, r *http.Request) {
 		replyErr(w, err)
 		return
 	}
-	in, _ := h.run()
+	in, log := h.run()
 	env, err := h.installed(in)
 	if err != nil {
 		replyErr(w, err)
@@ -62,7 +67,7 @@ func (h *Hostd) exportSecrets(w http.ResponseWriter, r *http.Request) {
 		replyErr(w, err)
 		return
 	}
-	f, err := in.exportSecrets(env)
+	f, err := in.exportSecrets(r.Context(), env)
 	if err != nil {
 		replyErr(w, err)
 		return
@@ -72,7 +77,7 @@ func (h *Hostd) exportSecrets(w http.ResponseWriter, r *http.Request) {
 		replyErr(w, err)
 		return
 	}
-	reply(w, http.StatusOK, SecretsExport{File: string(raw)})
+	reply(w, http.StatusOK, SecretsExport{File: string(raw), Log: log.String()})
 }
 
 // osRelease refuses (409) an install running another release than the OS's, whose spec the
@@ -124,6 +129,57 @@ func (h *Hostd) rotateSecret(w http.ResponseWriter, r *http.Request) {
 		jw := &jobWriter{h: h, j: j}
 		in.O.Out, in.O.Log = jw, jw
 		err := in.RotateSecret(h.ctx, req.Key, req.Pass)
+		jw.flush()
+		h.finish(j, err)
+	}()
+	accepted(w, j)
+}
+
+// SecretSetRequest is POST /v1/secrets/set's body.
+type SecretSetRequest struct {
+	Key   string `json:"key"`
+	Value string `json:"value"`
+}
+
+func (h *Hostd) setSecret(w http.ResponseWriter, r *http.Request) {
+	var req SecretSetRequest
+	if err := decodeBody(r, &req); err != nil {
+		replyErr(w, err)
+		return
+	}
+	in, _ := h.run()
+	env, err := h.installed(in)
+	if err != nil {
+		replyErr(w, err)
+		return
+	}
+	// The settable secrets are the ones the install's release names, the OS's spec the daemon reads.
+	if err := h.osRelease(env, "secrets set"); err != nil {
+		replyErr(w, err)
+		return
+	}
+	if _, err := in.settable(req.Key); err != nil {
+		replyErr(w, fail(http.StatusBadRequest, "%v", err))
+		return
+	}
+	if err := in.checkSetValue(req.Key, req.Value); err != nil {
+		replyErr(w, fail(http.StatusBadRequest, "%v", err))
+		return
+	}
+	// Not while the health gate judges the boot: the restarts could fail its deadline.
+	if err := h.judged(r.Context()); err != nil {
+		replyErr(w, err)
+		return
+	}
+	j, err := h.startJob("secret", req.Key, nil)
+	if err != nil {
+		replyErr(w, err)
+		return
+	}
+	go func() {
+		jw := &jobWriter{h: h, j: j}
+		in.O.Out, in.O.Log = jw, jw
+		err := in.SetSecret(h.ctx, req.Key, req.Value)
 		jw.flush()
 		h.finish(j, err)
 	}()
