@@ -1407,6 +1407,10 @@ func (in *Installer) up(ctx context.Context, env *EnvFile) (err error) {
 		}
 	}
 	if err != nil {
+		// A failed start-first container's error quotes its log, which compose's no longer has.
+		if sf := (successorFailed{}); errors.As(err, &sf) {
+			return fmt.Errorf("the stack did not become ready: %w", err)
+		}
 		return fmt.Errorf("the stack did not become ready: %w (see: docker compose --project-directory %s logs)", err, in.O.Dir)
 	}
 	in.certDone()

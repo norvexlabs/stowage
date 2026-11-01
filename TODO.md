@@ -19,13 +19,6 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
    one. Carry the internal root in the secrets export (it is a secret, and small), or in every
    backup, and install it before the front first starts on a machine made again. Gate: e2e-vm's
    disaster recovery, the front's certificate chained to the same root before and after.
-2. **A start-first successor that fails is removed with its log**: when the new container of an
-   `update: start-first` service is unhealthy, exits, restarts or declines, the start removes it,
-   and the error points at `docker compose … logs`, which then shows only the old container (seen:
-   an entrypoint refusing an input's value, exit 1, its message lost). Before removing a failed
-   successor, read its last lines (`docker logs --tail 20`) and quote them in the error, as the
-   failed boot's diagnostics keep a service's log; drop the `see: docker compose … logs` pointer
-   there. Gate: e2e-vm's start-first refusal case, the successor's last line in the error.
 
 ### Blocked — upstream or accounts
 
@@ -951,6 +944,14 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
 - **One rule of a picked table's sets, two copies**: lint and the release decoding each compare
   the files' named sets; a shared helper beside `CheckNftTable` would keep them one. The decoding
   also folds a value nft's names refuse into `is no table a service declares`.
+
+- **A failed successor's quoted lines are not redacted**: what its entrypoint printed (an input's
+  value it refused, a secret among them) reaches the start's error, the terminal and the host
+  daemon's reply as written; `logs` shows the same today. Masking the install's secret values in
+  them would narrow it.
+- **No suite runs a failing start-first successor**: the quoting of its last lines is unit-tested
+  against the engine's calls; an e2e case (a release whose new container exits) would prove it
+  against Docker's own `logs`.
 
 ## Won't — not in the first version
 

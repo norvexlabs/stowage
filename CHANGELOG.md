@@ -16,6 +16,9 @@ follow [SemVer](https://semver.org/).
   observe mode, one release).
 
 ### Fixed
+- A start-first service's new container that fails no longer takes its log with it: the start's
+  error quotes its last lines, read before it is removed, in place of a pointer to compose's
+  logs, which only showed the old container.
 - A VM of more than one NIC role no longer lets each NIC answer ARP for every address of the VM
   (a client on a shared L2 could reach a role's address on the wrong NIC, its per-interface rules
   missed): `arp_ignore=1` and `arp_announce=2` are set and judged by `tune`, unless

@@ -18,6 +18,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/norvexlabs/stowage/internal/spec"
 )
@@ -485,20 +487,38 @@ func (in *Installer) overlap(ctx context.Context, environ []string, m *composeMo
 		if lerr != nil {
 			return fmt.Errorf("%w (removing the new one: %v)", failed, lerr)
 		}
-		for _, c := range now {
-			if c.ID != old {
-				if _, rerr := in.O.Docker.Run(ctx, Cmd{Args: []string{"rm", "--force", c.ID}}); rerr != nil {
-					if declined {
-						return fmt.Errorf("%w: removing the new container %s: %v", failed, c.ID, rerr)
+		var lines []string
+		removed := true
+		news := slices.DeleteFunc(slices.Clone(now), func(c container) bool { return c.ID == old })
+		for _, c := range news {
+			// Its log goes with it: what it said before it failed is the error's.
+			if !declined {
+				if l := in.lastLines(ctx, c.ID); l != "" {
+					if len(news) > 1 {
+						l = "  " + c.ID + ":\n" + l
 					}
-					in.O.logf("warning: services.%s: the failed new container %s stays: %v", service, c.ID, rerr)
+					lines = append(lines, l)
 				}
+			}
+			if _, rerr := in.O.Docker.Run(ctx, Cmd{Args: []string{"rm", "--force", c.ID}}); rerr != nil {
+				removed = false
+				if declined {
+					return fmt.Errorf("%w: removing the new container %s: %v", failed, c.ID, rerr)
+				}
+				in.O.logf("warning: services.%s: the failed new container %s stays: %v", service, c.ID, rerr)
 			}
 		}
 		if declined {
 			return stopFirst(fmt.Sprintf("its new container declined the overlap (exit status %d, update_decline_status)", *in.R.Spec.Services[service].UpdateDeclineStatus))
 		}
-		return failed
+		if len(lines) == 0 {
+			return failed // nothing quoted: compose's logs are still where to look
+		}
+		if !removed {
+			// One stays, its whole log in compose's: the start's pointer holds.
+			return fmt.Errorf("%w; its last lines (docker logs --tail %d), a new container left (see the warning):\n%s", failed, successorLines, strings.Join(lines, "\n"))
+		}
+		return successorFailed{fmt.Errorf("%w; its last lines (docker logs --tail %d), the container removed:\n%s", failed, successorLines, strings.Join(lines, "\n"))}
 	}
 	if _, err := in.O.Docker.Run(ctx, Cmd{Args: []string{"stop", old}}); err != nil {
 		return fmt.Errorf("services.%s: stopping its old container: %w", service, err)
@@ -627,6 +647,61 @@ func (in *Installer) startBeside(ctx context.Context, environ []string, project,
 // errDeclined is startBeside's when the new container exits with its service's
 // update_decline_status before the old one was signalled.
 var errDeclined = errors.New("the new container declined the overlap")
+
+// successorLines are the lines of a failed new container's log its error quotes, and
+// successorBytes their most, the last kept.
+const (
+	successorLines = 20
+	successorBytes = 4096
+)
+
+// successorFailed is a start-first service's failed new container, removed: its error quotes its
+// log, which `docker compose logs` no longer shows.
+type successorFailed struct{ err error }
+
+func (s successorFailed) Error() string { return s.err.Error() }
+func (s successorFailed) Unwrap() error { return s.err }
+
+// successorLogWait bounds the read of a failed new container's log.
+var successorLogWait = 10 * time.Second
+
+// lastLines are the last lines container id wrote (stdout and stderr, as docker logs merges them),
+// each indented, at most successorBytes (cut at a line where one fits), a control character but a
+// tab shown as ?; "" when there are none or the read fails (its stderr is docker's, not the
+// container's).
+func (in *Installer) lastLines(ctx context.Context, id string) string {
+	ctx, cancel := context.WithTimeout(ctx, successorLogWait)
+	defer cancel()
+	var b bytes.Buffer
+	ret, err := in.O.Docker.Run(ctx, Cmd{Args: []string{"logs", "--tail", strconv.Itoa(successorLines), id}, Stream: &b})
+	if err != nil {
+		return ""
+	}
+	out := bytes.TrimRight(append(ret, b.Bytes()...), "\r\n") // a Stream takes both streams; a tool may return them instead
+	if n := len(out); n > successorBytes {
+		atLine := out[n-successorBytes-1] == '\n'
+		out = out[n-successorBytes:]
+		if i := bytes.IndexByte(out, '\n'); !atLine && i >= 0 {
+			out = out[i+1:]
+		}
+		for len(out) > 0 && !utf8.RuneStart(out[0]) {
+			out = out[1:]
+		}
+	}
+	text := strings.Map(func(r rune) rune {
+		if r == '\r' {
+			return -1
+		}
+		if r != '\n' && r != '\t' && (unicode.IsControl(r) || unicode.Is(unicode.Cf, r) || unicode.In(r, unicode.Zl, unicode.Zp)) {
+			return '?'
+		}
+		return r
+	}, strings.ToValidUTF8(string(out), "?"))
+	if strings.TrimSpace(text) == "" {
+		return ""
+	}
+	return "  | " + strings.ReplaceAll(text, "\n", "\n  | ")
+}
 
 // declines tells whether c, a new container of an overlap of svc, ended declining it: exited
 // with update_decline_status, or restarting after it (its restart policy's; the engine keeps the

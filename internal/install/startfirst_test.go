@@ -201,6 +201,42 @@ func TestAStartFirstServiceOverlaps(t *testing.T) {
 		!slices.Equal(f.engine(), []string{up, "rm --force new1"}) {
 		t.Errorf("a new container that fails: %v, ran %q", err, f.engine())
 	}
+	// Its last lines, read before it goes, are the error's; none, nothing more.
+	logs := func(a string) ([]byte, bool, error) {
+		if a == "logs --tail 20 new1" {
+			return []byte("starting\nFEED_SOURCES: not an address\n"), true, nil
+		}
+		return nil, false, nil
+	}
+	f, _, err = run(&engineState{containers: deps(), hash: hashes, upErr: errors.New("unhealthy"), answer: logs}, cfg)
+	var sf successorFailed
+	if err == nil || !errors.As(err, &sf) || !strings.HasSuffix(err.Error(), "which serves on: unhealthy; its last lines (docker logs --tail 20), the container removed:\n  | starting\n  | FEED_SOURCES: not an address") {
+		t.Errorf("a failed new container's log: %v", err)
+	}
+	// Nothing quoted: compose's logs are still where to look, the plain error.
+	_, _, err = run(&engineState{containers: deps(), hash: hashes, upErr: errors.New("unhealthy")}, cfg)
+	if errors.As(err, &sf) {
+		t.Errorf("a failed new container without a log: %v", err)
+	}
+	// Its removal refused: the container stays, and the error says so.
+	logsRm := func(a string) ([]byte, bool, error) {
+		if a == "rm --force new1" {
+			return nil, true, errors.New("daemon timeout")
+		}
+		return logs(a)
+	}
+	if _, _, err := run(&engineState{containers: deps(), hash: hashes, upErr: errors.New("unhealthy"), answer: logsRm}, cfg); err == nil || !strings.Contains(err.Error(), "its last lines (docker logs --tail 20), a new container left (see the warning):") || errors.As(err, &sf) {
+		t.Errorf("a failed new container that stays: %v", err)
+	}
+	var order []string
+	for _, c := range f.calls {
+		if a := strings.Join(c.Args, " "); a == "logs --tail 20 new1" || a == "rm --force new1" {
+			order = append(order, a)
+		}
+	}
+	if !slices.Equal(order, []string{"logs --tail 20 new1", "rm --force new1"}) {
+		t.Errorf("read after its removal: %q", order)
+	}
 	with := func(service string, cs ...string) map[string][]string {
 		c := deps()
 		c[service] = cs
@@ -939,4 +975,53 @@ func TestAContainerJoiningTheOldOneIsTheEngines(t *testing.T) {
 	if _, err := in.joinedContainer(context.Background(), old); err == nil || !strings.Contains(err.Error(), "reading the engine's containers") {
 		t.Errorf("a container that does not read: %v", err)
 	}
+}
+
+// A failed new container's last lines: each indented, at most successorBytes, cut at a line where
+// one fits (else within the last), invalid bytes and control characters shown as ?, a carriage
+// return dropped; blank output, or a read that fails (its stderr is docker's), is nothing. The
+// engine's CLI gives them on its Stream.
+func TestTheLastLinesOfAFailedContainer(t *testing.T) {
+	t.Parallel()
+	read := func(out string, err error) string {
+		in := &Installer{O: Options{Docker: streamTool{out: out, err: err}}}
+		return in.lastLines(context.Background(), "c1")
+	}
+	if got := read("a\r\n\xffb\x1b[2J\tc\n", nil); got != "  | a\n  | ?b?[2J\tc" {
+		t.Errorf("%q", got)
+	}
+	if got := read(strings.Repeat("x", successorBytes)+"\nlast\n", nil); got != "  | last" {
+		t.Errorf("cut: %q", got)
+	}
+	if got := read("first\n"+strings.Repeat("y", successorBytes+10)+"\n", nil); got != "  | "+strings.Repeat("y", successorBytes) {
+		t.Errorf("a last line over the bound: %q", got)
+	}
+	if got := read(strings.Repeat("z", 9)+"\n"+strings.Repeat("w", successorBytes), nil); got != "  | "+strings.Repeat("w", successorBytes) {
+		t.Errorf("a window starting at a line: %q", got)
+	}
+	if got := read(strings.Repeat("é", successorBytes), nil); !strings.HasPrefix(got, "  | é") {
+		t.Errorf("a cut within a character: %q", got[:8])
+	}
+	if got := read("ok\u202eko\u2028x", nil); got != "  | ok?ko?x" {
+		t.Errorf("format characters: %q", got)
+	}
+	if got := read(" \n", nil); got != "" {
+		t.Errorf("blank: %q", got)
+	}
+	if got := read("Error response from daemon: No such container: c1\n", errors.New("exit status 1")); got != "" {
+		t.Errorf("a read that fails: %q", got)
+	}
+}
+
+// streamTool writes out on a command's Stream, as the engine's CLI does, and fails with err.
+type streamTool struct {
+	out string
+	err error
+}
+
+func (s streamTool) Run(_ context.Context, c Cmd) ([]byte, error) {
+	if c.Stream != nil {
+		_, _ = io.WriteString(c.Stream, s.out)
+	}
+	return nil, s.err
 }

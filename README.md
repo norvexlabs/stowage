@@ -2567,7 +2567,12 @@ default) as the drain, then removed (`services.<name>: start-first: the new cont
 beside the old one`, then `… the new container is healthy, the old one stopped`). The rest of the
 stack then starts as before. A new container that does not become healthy is removed and the old one
 serves on: the start fails (`services.<name>: its new container did not become healthy beside the
-old one, which serves on: …`). A service none runs yet, or one unchanged, is the stack's start's
+old one, which serves on: …`), quoting the last lines it wrote, read before it goes (`…; its last
+lines (docker logs --tail 20), the container removed:`, then each line after `  | `, at most 4 KiB, a control or format
+character but a tab shown as `?`; each container's ID before its lines when there are several), and
+then without the `see: docker compose … logs` pointer of a failed start, whose logs no longer hold
+it; one that wrote nothing, whose log does not read, or that stays (`a new container left (see the
+warning)` when its removal fails) keeps the pointer. A service none runs yet, or one unchanged, is the stack's start's
 as any other. For a moment two containers run: twice its memory share and the same cores.
 Sharing the work is the app's: through the front, both containers answer its upstream's name
 until the old one stops, so the old one drains on SIGTERM (no new request, those in flight
