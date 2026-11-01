@@ -517,8 +517,12 @@ func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(
 		err := c.do(cmd.Context(), http.MethodPost, "/v1/secrets/export", SecretsExportRequest{Recipients: recipients}, &out)
 		return []byte(out.File), err
 	})
+	netCmd := networkCommand(c, name, stdout)
+	netAttach := netAttachCommand(r, &o.Dir, stdout)
+	dirFlag(netAttach)
+	netCmd.AddCommand(netAttach)
 	restore := restoreCommand(c, name, "sudo "+c.ctl+" install", stderr, terminal)
-	root.AddCommand(prov, updates, upgrade, rollback, reset, secrets, restore, networkCommand(c, name, stdout), backupCommand(c, name, stdout, stderr),
+	root.AddCommand(prov, updates, upgrade, rollback, reset, secrets, restore, netCmd, backupCommand(c, name, stdout, stderr),
 		power("reboot", "Reboot the VM", "/v1/reboot"),
 		power("shutdown", "Power the VM off", "/v1/shutdown"))
 	return root

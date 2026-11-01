@@ -379,7 +379,7 @@ func seedMatch(networkd, name string) string {
 	if err != nil {
 		links, _ := filepath.Glob(filepath.Join(networkd, kairos.InterfaceLink(name, "*")))
 		if len(links) == 1 {
-			return "Name=" + strings.TrimSuffix(strings.TrimPrefix(filepath.Base(links[0]), "10-"+name+"-"), ".link")
+			return "Name=" + linkRole(name, links[0])
 		}
 		return everyNIC
 	}
@@ -398,9 +398,16 @@ func seedMatch(networkd, name string) string {
 // networkdDir holds the VM's networkd files, the seed's .link ones among them; tests move it.
 var networkdDir = "/etc/systemd/network"
 
-// roleNamed reports whether the VM's cloud-config names a NIC role (its .link file).
+// roleNamed reports whether the VM names a NIC role: its cloud-config's .link file, or the one of a
+// NIC `network attach` added once a NIC is named so (a NIC recorded, never attached, names none).
 func roleNamed(name, role string) bool {
-	_, err := os.Stat(filepath.Join(networkdDir, kairos.InterfaceLink(name, role)))
+	if seedNamed(name, role) {
+		return true
+	}
+	if _, err := os.Stat(filepath.Join(networkdDir, attachedLink(name, role))); err != nil {
+		return false
+	}
+	_, err := os.Stat(filepath.Join(sysNetDir, role))
 	return err == nil
 }
 

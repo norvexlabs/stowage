@@ -10,6 +10,9 @@ follow [SemVer](https://semver.org/).
   its volumes up, encrypted, on the same schedule, settings and destination as a database's
   backup, and `restore` brings them back (on a machine made again with `--secrets` too): a private
   CA's key, a VPN node's identity or an operator's edits survive a disaster recovery.
+- **`vm attach HOSTNAME --interface ROLE=SPEC`** and **`network attach`**: a VM made on TrueNAS
+  gains the NIC a newer release names (a gateway's client LAN beside its uplink), named by its MAC
+  and addressed from its next boot, without making the VM again.
 
 ## [0.20.0] - 2026-11-01
 

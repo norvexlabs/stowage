@@ -1585,7 +1585,15 @@ every shape, the VM end-to-end test upgrading through it), then the health gate.
   share one), a server's are always given (it may have more ports than the release names). A VM
   keeps its NICs as its cloud-config named them: the override matches what the seed's own file
   matches, never a guess from the running release; a port on a role no NIC is named for fails
-  closed (warned), as opening it on the other interfaces is what the role was declared against. The routing and MTU are
+  closed (warned), as opening it on the other interfaces is what the role was declared against.
+  A NIC a later release names is attached (`vm attach`, `network attach`) rather than the VM made
+  again, which would lose its data: the seed is pulled once, at the first boot, so the NIC is
+  recorded on the VM and written as a cloud-config of its own on the OEM partition, which every boot
+  runs after the seed's — its `.link` in the initramfs stage too, so udev names it from the start
+  and no rename races the seed's MAC-less primary link, which it names by its MAC (09-, ahead of
+  the seed's 10-). The platform's NIC goes through the module's state, index 0 untouched, and
+  TrueNAS's power step restarts the VM, as a device applies at a start; the other platforms' are
+  attached by hand until one is asked for. The routing and MTU are
   the image's drop-ins (the release's, so each system boots with its own), the addressing the
   seed's (the install's). A secondary NIC never takes the default route, the DNS servers or the
   host's name: the primary's addressing is the machine's network. A tun device is the service's:

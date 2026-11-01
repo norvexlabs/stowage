@@ -665,12 +665,11 @@ func (in *Installer) DestroyVM(ctx context.Context, d *VMDestroy) error {
 	if err != nil {
 		return err
 	}
-	if _, err := os.Stat(filepath.Join(dir, varsFile)); err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("no VM %s made by `%s vm create --create %s`: %s holds no state", d.Host, in.R.Ctl(), CreateTofu, dir)
-		}
+	unlock, _, err := openState(dir, d.Host, in.R.Ctl())
+	if err != nil {
 		return err
 	}
+	defer unlock()
 	key, builtin, err := readPlatform(dir)
 	if err != nil {
 		return err

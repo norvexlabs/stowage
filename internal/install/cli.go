@@ -868,7 +868,30 @@ func vmCreateCommand(in *Installer, o *Options, prepare func() error, terminal f
 	df.BoolVar(&d.Yes, "yes", false, "destroy without asking")
 	df.BoolVar(noInput, "no-input", false, "never ask: without --yes, refuse")
 	df.BoolVar(accessible, "accessible", false, "ask with plain line prompts (screen readers); also when ACCESSIBLE is set or TERM=dumb")
-	vm.AddCommand(create, destroy, truenasCommand(os.Getenv))
+	var at VMAttach
+	attach := &cobra.Command{
+		Use:   "attach HOSTNAME",
+		Short: "Attach a NIC for a role of the release to a VM `vm create --create " + CreateTofu + "` made on TrueNAS: recorded on the VM over SSH, added to its OpenTofu state, the VM powered off and on",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) (err error) {
+			if err := prepare(); err != nil {
+				return err
+			}
+			at.Host = args[0]
+			if at.Ctl, err = os.Executable(); err != nil {
+				return err
+			}
+			return in.AttachVM(cmd.Context(), &at)
+		},
+	}
+	af := attach.Flags()
+	af.StringVar(&at.Interface, "interface", "", "the NIC, ROLE=SPEC as vm create takes it: dhcp, static,address=A/P or none, then mac= (default: generated) and attach= (the bridge; default the primary's)")
+	af.StringVar(&at.User, "user", "", "the VM's administrator, who logs in over SSH (default: your user name, else sysadmin)")
+	af.StringVar(&at.SSHKey, "ssh-key", "", "the administrator's SSH public key file (default: ~/.ssh/id_ed25519.pub, id_ecdsa.pub or id_rsa.pub)")
+	af.StringVar(&at.Address, "host", "", "the name or address the VM answers at (default: HOSTNAME)")
+	af.DurationVar(&at.Wait, "wait", 0, "how long to wait for the VM to answer over SSH after its power cycle (default 10m)")
+	_ = attach.MarkFlagRequired("interface")
+	vm.AddCommand(create, destroy, attach, truenasCommand(os.Getenv))
 	return vm
 }
 

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -24,6 +25,30 @@ func netBootCommand(name, ctl string, dir *string, stderr io.Writer) *cobra.Comm
 			return NetBoot(name, ctl, *dir, stderr)
 		},
 	}
+	return cmd
+}
+
+// netAttachCommand is `network attach`, run as root: AttachNIC over the install in *dir.
+func netAttachCommand(r *Release, dir *string, stdout io.Writer) *cobra.Command {
+	var a NetAttach
+	cmd := &cobra.Command{
+		Use:   "attach",
+		Short: "Name and address a NIC the release names and the VM's cloud-config does not, by its MAC, from the next boot (as root; `vm attach` runs it and attaches the NIC)",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			if os.Geteuid() != 0 {
+				return fmt.Errorf("network attach writes the boot's files: run it as root (sudo %s network attach)", r.Ctl())
+			}
+			return AttachNIC(r, *dir, a, stdout)
+		},
+	}
+	f := cmd.Flags()
+	f.StringVar(&a.Role, "role", "", "the NIC's role (host.interfaces), a secondary one")
+	f.StringVar(&a.MAC, "mac", "", "the NIC's MAC address")
+	f.StringVar(&a.Mode, "mode", IfaceNone, "dhcp, static or none (the link up, no address)")
+	f.StringVar(&a.Address, "address", "", "static: the IPv4 address with its prefix (192.0.2.10/24)")
+	_ = cmd.MarkFlagRequired("role")
+	_ = cmd.MarkFlagRequired("mac")
 	return cmd
 }
 

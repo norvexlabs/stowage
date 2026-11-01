@@ -34,6 +34,8 @@ type fakeTofu struct {
 	missing bool   // `tofu` is not installed
 	fail    error  // apply fails
 	outputs string // `tofu output -json`; empty is an id alone
+	plan    int    // `tofu plan -detailed-exitcode`'s exit status: 2 when it has changes
+	show    string // `tofu show -json` of the plan
 }
 
 func (f *fakeTofu) Run(_ context.Context, c Cmd) ([]byte, error) {
@@ -55,6 +57,19 @@ func (f *fakeTofu) Run(_ context.Context, c Cmd) ([]byte, error) {
 		return nil, os.WriteFile(filepath.Join(dir, "terraform.tfstate"), []byte("{}"), 0o600)
 	case "destroy":
 		return nil, os.WriteFile(filepath.Join(dir, "terraform.tfstate"), []byte(`{"resources":[]}`), 0o600)
+	case "plan":
+		for _, a := range c.Args {
+			if out, ok := strings.CutPrefix(a, "-out="); ok {
+				if err := os.WriteFile(filepath.Join(dir, out), []byte("a plan"), 0o600); err != nil {
+					return nil, err
+				}
+			}
+		}
+		if f.plan != 0 {
+			return nil, exitCode(f.plan)
+		}
+	case "show":
+		return []byte(f.show), nil
 	case "output":
 		if f.outputs == "" {
 			return []byte(`{"id": {"value": "7", "type": "string"}}`), nil

@@ -2077,7 +2077,7 @@ func (in *Installer) iif(roles ...string) string {
 		}
 		if h := in.R.Spec.Host; h != nil {
 			if i, ok := h.Interfaces[role]; ok && i.Kind != spec.InterfaceTUN && !roleNamed(in.R.Spec.Name, role) {
-				in.O.logf("warning: no NIC of this VM is named %s (its cloud-config, from before its release named it, names none): its ports reach nothing, a VM made by this release (vm create --interface) names it", role)
+				in.O.logf("warning: no NIC of this VM is named %s (its cloud-config, from before its release named it, names none): its ports reach nothing, a VM made by this release (vm create --interface) names it, and `vm attach` (TrueNAS) or the NIC attached on its platform and `network attach` adds one to this VM", role)
 			}
 		}
 		names = append(names, strconv.Quote(role))

@@ -465,7 +465,7 @@ a real registry, the local Docker engine, a kind cluster and a VM on TrueNAS
 | inputs digests and the build graph | |
 | installer (Docker): loopback and every TLS front (`acme`, `dns-cloudflare`, `byo`, `internal`), terminal form, `install`, re-run (changes the inputs and the front's ports), `status`, `ps`, `logs`, `restart`/`stop`/`start`, `exec`, `schema`, `uninstall` (`--data`), `provision`, `script`, `upgrade` (`--version` fetches the release's installer), `rollback`, `reset-db`, `--dry-run`, `--offline`, a mirror and its CA (`--registry`, `--registry-ca`); `mirror export` / `mirror import` (a release carried as one file to a site without internet); `secrets rotate`, `secrets export` and `--secrets` (a machine made again) | scheduled backup, restore, chart library, `upgrade --reset-db` |
 | installer (Kubernetes): `<short>-stow k8s install`, `upgrade` (`--version`), `rollback`, `status`, `reset-db`, `uninstall` (`--data`), `provision` (the hook as a Job after the release, its outputs in a Secret and handed back, `--set`), `secrets rotate`, `tune`, `--dry-run`, `--no-provision`, `--image-registry`, `--registry-ca`, `--unsafe-sysctls` | barrier pre-flight before `rollback` |
-| installer (Kairos VM): `<short>-stow vm create` (the disk image by digest, the cloud-config on a seed ISO or as user-data, the platform's steps; or the VM created with OpenTofu — TrueNAS's module, the previews for libvirt, Proxmox VE, vSphere, AWS, Google Cloud and Azure, or the operator's own holding the module contract — waited for until it installed; from a mirror whose CA the VM then trusts) and `vm destroy`; `<short>-stow` in the OS bundle — the first install from the cloud-config's settings, `install` from the preloaded images, the boot (install up again, upgrade to the OS's release, back to the replaced one), the host daemon and its verbs (`status`, `health`, `events`, `ps`, `logs`, `restart`/`stop`/`start`, `provision`, `updates`, `upgrade`, `rollback` to the passive system, `reset-db`, `network` with its auto-revert, `backup` — scheduled, before an upgrade, or now, encrypted to age keys and uploaded with rclone; `verify` of proposed settings —, `restore`, `secrets export` and `rotate`, `reboot`, `shutdown`), its disk-pressure watch (`hooks.maintenance.disk_pressure`), its app socket for the services `host_api` names, the health gate judging each boot (Kairos boot assessment: an upgraded boot not healthy in time falls back to the passive system, unless going back is refused at a rollback barrier: it is then kept), a default-deny firewall (`vm create --ssh-allow`), the time zone (`--timezone`), a disaster recovery (`vm create --secrets`) | |
+| installer (Kairos VM): `<short>-stow vm create` (the disk image by digest, the cloud-config on a seed ISO or as user-data, the platform's steps; or the VM created with OpenTofu — TrueNAS's module, the previews for libvirt, Proxmox VE, vSphere, AWS, Google Cloud and Azure, or the operator's own holding the module contract — waited for until it installed; from a mirror whose CA the VM then trusts), `vm destroy` and `vm attach` (a NIC for a role a newer release names, on TrueNAS); `<short>-stow` in the OS bundle — the first install from the cloud-config's settings, `install` from the preloaded images, the boot (install up again, upgrade to the OS's release, back to the replaced one), the host daemon and its verbs (`status`, `health`, `events`, `ps`, `logs`, `restart`/`stop`/`start`, `provision`, `updates`, `upgrade`, `rollback` to the passive system, `reset-db`, `network` with its auto-revert, `backup` — scheduled, before an upgrade, or now, encrypted to age keys and uploaded with rclone; `verify` of proposed settings —, `restore`, `secrets export` and `rotate`, `reboot`, `shutdown`), its disk-pressure watch (`hooks.maintenance.disk_pressure`), its app socket for the services `host_api` names, the health gate judging each boot (Kairos boot assessment: an upgraded boot not healthy in time falls back to the passive system, unless going back is refused at a rollback barrier: it is then kept), a default-deny firewall (`vm create --ssh-allow`), the time zone (`--timezone`), a disaster recovery (`vm create --secrets`) | |
 
 ## Reference — for people and AI agents
 
@@ -3427,6 +3427,7 @@ in the same installer (bootstrap it as above, then `sh <name>.sh vm create …`,
           [--cpus N] [--memory MiB] [--disk GiB] [--host H] [--wait DURATION]
           [--registry PREFIX] [--registry-ca FILE]
 <short>-stow vm destroy HOSTNAME [--yes] [--no-input] [--accessible]
+<short>-stow vm attach HOSTNAME --interface ROLE=SPEC [--user U] [--ssh-key FILE] [--host H] [--wait DURATION]
 ```
 
 - A project whose front offers no mode a VM can take (only `none` and `byo`) is refused first.
@@ -3503,7 +3504,8 @@ in the same installer (bootstrap it as above, then `sh <name>.sh vm create …`,
   NIC so, else every NIC). After an upgrade of a VM made by a release that named no NIC, a port on a NIC
   role no NIC is named for (no `10-<name>-<role>.link`) keeps its interface's match, which nothing
   meets — never opened on the other interfaces — warned (`warning: no NIC of this VM is named
-  <role> …: its ports reach nothing`); a VM made by the release names it. By hand, the steps list each NIC with its MAC and network; OpenTofu's modules take
+  <role> …: its ports reach nothing`); a VM made by the release names it, and `vm attach` (below)
+  attaches one to this VM. By hand, the steps list each NIC with its MAC and network; OpenTofu's modules take
   them as `nics` (below). A role that is not one of the release's NICs, the primary's addressing
   (`--network`'s), a `static` without its address or an address without `static`, two NICs of one
   MAC, and `attach=` on metal are refused, naming the flag.
@@ -3796,7 +3798,8 @@ in the same installer (bootstrap it as above, then `sh <name>.sh vm create …`,
     failure there is a warning (the next boot retires the key). A VM not ready in time is kept; the error says so.
   - It prints `ssh <user>@<host> <short>-stow status` and where the state is.
 - **`vm destroy HOSTNAME`** destroys a VM `vm create --create opentofu` made: `tofu destroy` of its
-  module (the VM, its disk and data, its uploads), then its state directory. It needs the same
+  module (the VM, its disk and data, its uploads), then its state directory, holding
+  `.<host>.lock` beside it meanwhile, which stays (refused while a `vm attach` runs on the VM). It needs the same
   environment and `tofu` (the TrueNAS API's variables for TrueNAS's built-in module, as its
   `platform` file records; a VM made before that file is TrueNAS's), asks on a terminal ("Destroy
   the VM H: its disk, its data and its uploads on <platform>", default no), and without one refuses
@@ -3808,6 +3811,47 @@ in the same installer (bootstrap it as above, then `sh <name>.sh vm create …`,
   registry cannot be read (`Whether a VM of <name> <version> can be created again is not known:
   …`); neither stops the destroy. On TrueNAS, snapshots of the zvol and the staging dataset (a periodic task's) are
   deleted first, as TrueNAS refuses to delete a dataset that has any. The cached disk stays.
+- **`vm attach HOSTNAME --interface ROLE=SPEC`** attaches a NIC for a role of the release (a
+  secondary NIC its `host.interfaces` names, which the VM's cloud-config does not) to a VM `vm
+  create --create opentofu` made with TrueNAS's built-in module, keeping the VM and its data:
+  `SPEC` is `vm create --interface`'s (`dhcp`, `static,address=A/P` or `none`, the default; then
+  `mac=`, default generated, and `attach=`, the bridge, default the primary's). Over SSH, as `--user`
+  (default your user name, else `sysadmin`) with `--ssh-key`'s key (vm create's defaults), at
+  `--host` (default HOSTNAME: give the address `vm create` waited at, its `--host`), checked
+  strictly against the host key `vm create` recorded for that address in the state directory
+  (`known_hosts`; none, or none for that address, is refused: a VM whose install was finished by
+  hand has none, and its host key, checked on its console, goes there), it reads the VM's boot id (one that does not read is refused); runs `tofu init` and
+  `tofu plan -detailed-exitcode -out=attach.tfplan -var nics=…` (in the state directory; the NICs
+  with the new one appended, the primary's entry unchanged, or added as it was applied when the VM
+  had one NIC: the module's own MAC) and reads the plan (`tofu show -json`): it goes on with a plan
+  that creates the attached role's NIC device and replaces the power step, every other resource
+  unchanged, or with one that changes no resource when the state holds the NIC already (for a new
+  role it is refused: `the VM's OpenTofu plan does not add the NIC <role> …; nothing changed`); anything else
+  (drift on the disk, the VM, the datasets or another NIC; the power step alone; the NIC without
+  the power step: an earlier vm attach left half done) is refused before the VM or the state
+  changes: drift as `the VM's OpenTofu plan changes more than its NIC: <address> (<actions>), …;
+  nothing changed`, with the `STOWAGE_CTL=<ctl> tofu -chdir=<state> plan -var 'nics=…'` that shows
+  it (drift is the operator's to resolve: an apply would carry it out); a half-done attach as
+  `does not add the NIC with the VM's power cycle`, with the way to finish it by hand: power the VM
+  off on TrueNAS, then `STOWAGE_CTL=<ctl> tofu -chdir=<state> apply` with the TrueNAS API's
+  variables, and the same `vm attach` command, which the message repeats with its flags, checks it. Then it runs `sudo <short>-stow network attach` on the VM (below), which
+  records the NIC, writes the NICs into the module's `nics` in `terraform.tfvars.json`, and applies
+  the saved plan, which powers the VM off and on (TrueNAS applies a device at a start); an apply
+  that fails says the NIC is recorded on the VM and in the state's variables, and names the same
+  way to finish by hand once its cause is fixed. The plan file is removed whatever happens, and
+  `vm attach` and `vm destroy` hold `.<host>.lock`, beside the state directory (kept: a lock file removed while held would exclude no run that opened it), for their whole run: one on a VM at a time
+  (`another vm attach or vm destroy runs on it`). It waits up to `--wait` (default 10m) for the VM to answer from a new boot naming a NIC
+  by the role (`has
+  not booted again naming a NIC <role> after …`, with the journal to read, when it does not). Run
+  again for a role the state attaches, it goes on with the state's MAC and bridge (another `mac=`
+  or `attach=` is refused) and, when the plan has no changes, reboots the VM instead (`sudo
+  <short>-stow reboot`: its 30 s drain, its refusal the error) for the addressing given. Refused before the VM is changed: a role that is not one of the release's
+  NICs, the primary, a MAC another NIC of the state has (the module's own derived one included),
+  a VM with no state or no VM name in it, a VM made with another module, a `--user` that is not a
+  user name, a `--host` holding spaces, quotes, `%`, `@` or starting with `-`, a state whose module predates NICs by role
+  (no `nics` variable: `has one NIC`), and `tofu` or the TrueNAS API's variables missing, as `vm
+  destroy` needs them. On another platform, or with such a module: attach the NIC there, run `sudo
+  <short>-stow network attach --role ROLE --mac MAC` on the VM, then power it off and on.
 - `vm truenas import-image|seed|start|stop|drop-snapshots` (hidden) are the module's steps, run
   by OpenTofu: each reads `TRUENAS_URL`, `TRUENAS_API_KEY`, `TRUENAS_INSECURE_SKIP_VERIFY` and its
   own variables (`IMAGE`, `IMAGE_SHA256`, `STAGING_DIR`, `ZVOL`; `SEED`, `SEED_PATH`; `VM_ID`;
@@ -3850,6 +3894,7 @@ sudo <short>-stow install [--channel C] [--set KEY=VALUE]… [--answers FILE] [-
 <short>-stow network set --mode dhcp|static [--address A/P] [--gateway G] [--ipv6 [--address6 A/P] [--gateway6 G]] [--dns D,…] [--revert-secs N | --no-revert]
 <short>-stow network confirm|revert   # keep the change awaiting confirmation, or undo it now
 <short>-stow network reset [--revert-secs N | --no-revert]   # drop the override: back to the cloud-config's network
+sudo <short>-stow network attach --role ROLE --mac MAC [--mode dhcp|static|none] [--address A/P]   # a NIC the release names, from the next boot
 <short>-stow backup config [--json] [--destination REMOTE:PATH] [--rclone-config FILE|-] [--recipient age1…]…
           [--retention-days N] [--schedule CALENDAR] [--profile P] [--remove]   # show, change or drop the backup settings
           [--lock | --unlock]   # the app socket may (not) change the settings
@@ -4235,6 +4280,25 @@ sudo <short>-stow install [--channel C] [--set KEY=VALUE]… [--answers FILE] [-
   `vm create` gave (its cloud-config's file; with its settings, which the cloud-config also
   records in `/etc/<name>/install-network.yaml`, rewritten at every boot — a record that does not
   read is logged, once per error, and left out), or DHCP (a VM whose cloud-config wrote none).
+- `network attach` (as root; `vm attach` runs it) names and addresses a NIC the VM's
+  cloud-config does not name, for a secondary role of the release's `host.interfaces` (`kind:
+  nic`), from the next boot: by its `--mac` (a unicast MAC), with `--mode` `dhcp`, `static` with
+  `--address` (IPv4 with its prefix) or `none` (the default: the link up, no address), as `vm
+  create --interface` addresses a secondary. It records the NIC in `<dir>/interfaces.yaml` and
+  writes `/oem/96_<name>-interfaces.yaml`, a cloud-config every boot runs after the seed's: its
+  `/etc/systemd/network/09-<name>-<role>.link` (by MAC; 09- sorts before the seed's 10- files) in
+  the initramfs stage, before udev names the NICs, and its `10-<name>-<role>.network` at boot
+  (the release's MTU and routing drop-ins apply to it). A NIC the seed named by its original name
+  alone (a VM made by a release with one NIC) is named by its MAC too, the MAC of the NIC its role
+  names now (`<role>: its NIC (<MAC>) is named by its MAC from the next boot, as another NIC joins
+  it`), so the new NIC never takes its name. Given again for a role, it replaces the role's MAC
+  and addressing (applied at the next boot). Refused: a role that is not one of the release's
+  NICs, the primary (`network set` addresses it), a role the cloud-config names, a MAC another
+  recorded NIC has, that the cloud-config names another NIC by, or that a NIC named as another
+  role has, `--address` without `static` or `static` without an IPv4 one, a mode other
+  than the three, a seed's NIC to pin that no NIC is named for now, and a run not as root. The
+  install's warning about a role no NIC is named for counts these NICs once a boot named them (a
+  NIC recorded and never attached names none: the warning stays).
 - `network set` sets an override that outranks the cloud-config's network, as a whole (a setting
   left out is not kept from before): `--mode static` with
   `--address` (IPv4 with its prefix, 1 to 32) and an optional `--gateway`, or `--mode dhcp`

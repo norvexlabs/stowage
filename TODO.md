@@ -49,18 +49,19 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
 
 ### Next batch — found iterating a release on the VM
 
-1. **An installed VM cannot gain the NIC a new release names, nor re-address a secondary one**:
-   a NIC is attached, named (`10-<name>-<role>.link`) and addressed (`--interface
-   ROLE=static,address=…`) by `vm create` alone. A release adding a role (a gateway's client
-   LAN beside its uplink) upgrades an installed VM to "no NIC of this VM is named <role>: its
-   ports reach nothing", and `network set` addresses the primary only. The way forward is a new
-   VM, which loses what the old one holds (its data volumes, a VPN node's identity, a CA) unless
-   the operator moves it by hand. Give `vm` a verb that attaches a NIC for a role to an existing
-   VM (the platform's NIC on the module's state, the `.link` and `.network` written over SSH,
-   then a reboot), and `network set --role ROLE --mode static|dhcp|none` for a secondary NIC,
-   with the same revert window as the primary's.
+1. **`network set --role ROLE` for a secondary NIC, with the primary's revert window**: `network
+   attach` given again re-addresses a NIC it attached, at the next boot and with no window, and a
+   NIC the cloud-config named (`vm create --interface`) cannot be re-addressed at all. Extend the
+   override (hostdnet.go's netState, primary-only) to a secondary role: its own unit sorting
+   first (`09-<name>-<role>-override.network`) and the image's MTU and routing drop-ins for it too
+   (an `InterfaceUnits` helper beside `PrimaryUnits`), one pending change across all roles.
 
 ## Should
+
+- **`vm create` takes no lock on its state directory**: `vm attach` and `vm destroy` hold
+  `<state>.lock`, but a create still applying, waiting for the VM or installing it over SSH can
+  meet one of them, or a second create of the same host passing its "state exists" check before
+  the first wrote its variables. Take the lock for create's whole run, checking the state under it.
 
 - **A volumes-age-rclone backup reads its volumes live**: without a dump, the archive is the
   whole backup, and files a service writes together (a CA's index and serial) may be archived
@@ -390,6 +391,10 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
   repositories.
 
 ## Could
+
+- **`vm attach` with a wrong `attach=` bridge**: the plan passes, the variables record it, and the
+  apply fails; a re-run with the right bridge is refused against the recorded one, and the hint's
+  `tofu apply` fails the same way. Let a re-run correct a NIC whose device the state lacks.
 
 - **Parallel suites race on grype's database**: `test/lib.sh`'s `grype_db` deletes every archive
   but the latest that is over an hour old, so when grype publishes a new database during a gate
