@@ -13,10 +13,12 @@ import (
 	"maps"
 	"net/netip"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -1164,5 +1166,52 @@ func TestTheSeedNamesAndAddressesTheNICs(t *testing.T) {
 	raw, _ = UserData("atlas", "at-stow", none, Settings{}, nil)
 	if strings.Contains(string(raw), ".link") || !strings.Contains(string(raw), "Name=en* eth*") {
 		t.Errorf("no interfaces:\n%s", raw)
+	}
+}
+
+// The command `vm create --secrets` runs on the VM, run by a shell against stand-ins: a start of
+// the boot unit the boot cancels is tried once more after the boot's jobs, a unit that failed is
+// not run again, and the install runs only once a start succeeded.
+func TestTheSecretsInstallRetriesACanceledStartOnce(t *testing.T) {
+	t.Parallel()
+	const start, wait, failed, install = "start notes.service\n", "is-system-running --wait\n", "is-failed --quiet notes.service\n", "install --secrets - --no-input\n"
+	for _, c := range []struct {
+		fails  int
+		failed bool // the unit failed for real
+		want   string
+		ok     bool
+	}{
+		{0, false, start + install, true},
+		{1, false, start + wait + failed + start + install, true},
+		{2, false, start + wait + failed + start, false},
+		{1, true, start + wait + failed, false},
+	} {
+		dir := t.TempDir()
+		log := filepath.Join(dir, "log")
+		scripts := map[string]string{
+			"sudo": "#!/bin/sh\nexec \"$@\"\n",
+			// Each start fails while the count file holds a start to fail; is-failed answers the
+			// failed file's presence.
+			"systemctl": "#!/bin/sh\necho \"$*\" >>" + log + "\ncase $1 in\nis-failed) [ -e " + dir + "/failed ]; exit $? ;;\nstart) ;;\n*) echo running; exit 0 ;;\nesac\n" +
+				"n=$(cat " + dir + "/fails)\n[ \"$n\" -gt 0 ] || exit 0\necho $((n-1)) >" + dir + "/fails\necho 'Job for notes.service canceled.' >&2\nexit 1\n",
+			"notes-stow": "#!/bin/sh\necho \"$*\" >>" + log + "\n",
+		}
+		if c.failed {
+			scripts["failed"] = ""
+		}
+		for n, body := range scripts {
+			if err := os.WriteFile(filepath.Join(dir, n), []byte(body), 0o755); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := os.WriteFile(filepath.Join(dir, "fails"), []byte(strconv.Itoa(c.fails)), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		cmd := exec.Command("/bin/sh", "-c", strings.Join(secretsInstall("notes", "notes-stow"), " "))
+		cmd.Env = []string{"PATH=" + dir + ":/usr/bin:/bin"}
+		out, err := cmd.CombinedOutput()
+		if got, _ := os.ReadFile(log); string(got) != c.want || (err == nil) != c.ok {
+			t.Errorf("%d failed starts, failed unit %v: %v %s\nran:\n%s\nwant:\n%s", c.fails, c.failed, err, out, got, c.want)
+		}
 	}
 }

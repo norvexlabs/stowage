@@ -29,6 +29,7 @@ import (
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 
 	"github.com/norvexlabs/stowage/internal/lint"
+	"github.com/norvexlabs/stowage/internal/payload"
 	"github.com/norvexlabs/stowage/internal/registry"
 	"github.com/norvexlabs/stowage/internal/release"
 )
@@ -343,7 +344,8 @@ var serviceName = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}$`)
 
 // Serve serves the API on the unix socket path until ctx ends. The socket and its directory are
 // root's and Group's; without that group, root's alone. When the stack's services reach the daemon
-// (shapes.kairos.host_api), the API is served too on the app socket, in the directory app beside
+// (shapes.kairos.host_api, the OS's release's or the installed one's: appServed), the API is
+// served too on the app socket, in the directory app beside
 // path, which those services mount: any process may connect to it, and every request carries the
 // install's token (AppHandler).
 func (h *Hostd) Serve(ctx context.Context, path string) error {
@@ -371,7 +373,7 @@ func (h *Hostd) Serve(ctx context.Context, path string) error {
 	}
 	servers := []*http.Server{{Handler: h.Handler(), ReadHeaderTimeout: 10 * time.Second}}
 	listeners := []net.Listener{l}
-	if k := h.R.Spec.Shapes.Kairos; k != nil && len(k.HostAPI) > 0 {
+	if h.appServed() {
 		app := filepath.Join(dir, filepath.Base(AppDir(h.R.Spec.Name)))
 		if app != AppDir(h.R.Spec.Name) {
 			h.O.logf("the services %s names mount %s; this daemon serves %s", "shapes.kairos.host_api", AppDir(h.R.Spec.Name), app)
@@ -445,6 +447,25 @@ func (h *Hostd) Serve(ctx context.Context, path string) error {
 		h.O.logf("a backup did not finish its cleanup within %s", backupStopWait)
 	}
 	return first
+}
+
+// appServed reports whether the daemon serves the app socket: the OS's release names services
+// that reach it (shapes.kairos.host_api), or the release the install runs does, read from its
+// kept installer. An upgrade's boot brings the installed release up before upgrading, and its
+// services must reach the daemon then, whatever the OS's release names.
+func (h *Hostd) appServed() bool {
+	if k := h.R.Spec.Shapes.Kairos; k != nil && len(k.HostAPI) > 0 {
+		return true
+	}
+	in, _ := h.run()
+	files, err := payload.Read(in.ctl())
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			h.O.logf("no app socket: the installed release's host_api cannot be read from %s: %v", in.ctl(), err)
+		}
+		return false
+	}
+	return len(payloadHostAPI(files[payload.Spec])) > 0
 }
 
 // listen listens on the unix socket path with the owner and mode perm gives it. The socket is made

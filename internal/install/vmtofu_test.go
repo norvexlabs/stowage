@@ -501,7 +501,8 @@ func TestVMCreateWithOpenTofuGivesTheSecretsOverSSH(t *testing.T) {
 	// The VM answers, waiting: the secrets go over SSH, the API_KEY among them, never in the
 	// cloud-config, each call pinned to the host key the cloud-config carries.
 	dir := filepath.Join(r.state, "notes", "vms", "notes-1")
-	if len(r.ssh.calls) != 5 || r.ssh.stdin[3] != plain || !strings.HasSuffix(strings.Join(r.ssh.calls[3], " "), "ops@notes-1.lan -- sudo systemctl start notes.service && sudo notes-stow install --secrets - --no-input") ||
+	if len(r.ssh.calls) != 5 || r.ssh.stdin[3] != plain || !strings.HasSuffix(strings.Join(r.ssh.calls[3], " "), "ops@notes-1.lan -- sudo systemctl start notes.service || { sudo timeout 600 systemctl is-system-running --wait >/dev/null ; "+
+		"! systemctl is-failed --quiet notes.service && sudo systemctl start notes.service ; } && sudo notes-stow install --secrets - --no-input") ||
 		!strings.Contains(strings.Join(r.ssh.calls[4], " "), "-- cat /etc/ssh/ssh_host_ed25519_key.pub && sudo rm -f /etc/ssh/sshd_config.d/01-notes-seed-host-key.conf /run/notes-seed-host-key && sudo touch /oem/notes-seed-host-key.retired && ") {
 		t.Fatalf("ssh %v", r.ssh.calls)
 	}

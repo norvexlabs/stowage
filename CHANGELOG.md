@@ -3,6 +3,15 @@
 Stowage's own releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
+## [0.21.1]
+
+### Fixed
+- An upgrade on the VM to a release whose services no longer reach the host daemon (none in
+  `shapes.kairos.host_api`) no longer fails its boot and goes back: the installed release, brought
+  up first, keeps its app socket for that boot.
+- `vm create --secrets` no longer stops with `Job for <name>.service canceled.` when the VM's own
+  boot is still starting the install's unit: the start is tried once more after the boot.
+
 ## [0.21.0] - 2026-11-01
 
 ### Added

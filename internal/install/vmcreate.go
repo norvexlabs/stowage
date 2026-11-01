@@ -364,10 +364,7 @@ func (in *Installer) CreateVM(ctx context.Context, c *VMCreate) error {
 		}
 		if st.AwaitSecrets && len(waiting) == 0 {
 			o.logf("installing over SSH with the secrets given")
-			// After the boot unit: it runs after the release's images are loaded, which the install
-			// takes (`systemctl start` waits for it, or returns at once once it ran).
-			args := pinnedSSHArgs(pin, mach.User, addr, c.SSHKey,
-				"sudo", "systemctl", "start", name+".service", "&&", "sudo", ctl, "install", "--secrets", "-", "--no-input")
+			args := pinnedSSHArgs(pin, mach.User, addr, c.SSHKey, secretsInstall(name, ctl)...)
 			if _, err := o.SSH.Run(ctx, Cmd{Args: args, Stdin: bytes.NewReader(c.Secrets), Stream: o.Log}); err != nil {
 				return fmt.Errorf("the install over SSH with the secrets: %w; the VM is kept: `ssh %s@%s %s status` tells where it stopped — `sudo %s install` finishes an install begun, and %s; `%s vm destroy %s` removes it. %s",
 					err, mach.User, addr, ctl, ctl, secretsSteps(mach.User, addr, ctl), ctl, mach.Hostname, strings.TrimSpace(seedHostKeyNote(hostKey, addr)))
@@ -610,6 +607,18 @@ func (in *Installer) bootDisks(ctx context.Context, cl *registry.Client, prefix 
 type noBootDisk struct{ error }
 
 func (e noBootDisk) Unwrap() error { return e.error }
+
+// secretsInstall is the command `vm create --secrets` runs on the VM over SSH, the secrets on its
+// standard input. The install comes after the boot unit, which runs once the release's images are
+// loaded (`systemctl start` waits for it, or returns at once once it ran). A start whose job the
+// boot cancels (`Job for <name>.service canceled.`, the boot's own start of it still queued) is
+// tried once more, after the boot's jobs are done (waited for 10 min at most); a unit that failed
+// is not run again, and a second start that fails fails the install too.
+func secretsInstall(name, ctl string) []string {
+	unit := name + ".service"
+	return []string{"sudo", "systemctl", "start", unit, "||", "{", "sudo", "timeout", "600", "systemctl", "is-system-running", "--wait", ">/dev/null", ";",
+		"!", "systemctl", "is-failed", "--quiet", unit, "&&", "sudo", "systemctl", "start", unit, ";", "}", "&&", "sudo", ctl, "install", "--secrets", "-", "--no-input"}
+}
 
 // secretsSteps tells how to give a VM's install its secrets file: copied over, its mode kept
 // 0600, then an install on a terminal, which can ask what the file does not hold.

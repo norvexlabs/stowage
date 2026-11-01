@@ -488,6 +488,54 @@ func TestNoAppSocketWhenNoServiceReachesTheDaemon(t *testing.T) {
 	}
 }
 
+// An upgrade's boot brings the installed release up first: its services reach the app socket
+// though the OS's release names none, and only while the installed release names some.
+func TestTheAppSocketServesTheInstalledReleasesServices(t *testing.T) {
+	t.Parallel()
+	for _, installed := range []bool{true, false} {
+		e := vmEnv(t, "1.0.0")
+		if !installed {
+			e.r, e.self = bundledInstaller(t, "1.0.0", 1, func(s *spec.Spec) { s.Shapes.Kairos.HostAPI = nil })
+		}
+		if err := e.install(vm); err != nil {
+			t.Fatal(err)
+		}
+		e.r, e.self = bundledInstaller(t, "2.0.0", 1, func(s *spec.Spec) { s.Shapes.Kairos.HostAPI = nil })
+		sock := served(t, daemon(e, &fakeHost{}))
+		// Answered once the daemon serves, which is after it made the app socket or chose not to.
+		if _, err := ctl(e, sock, "status"); err != nil {
+			t.Fatal(err)
+		}
+		_, err := os.Stat(filepath.Join(filepath.Dir(sock), "app", "app.sock"))
+		if installed != (err == nil) {
+			t.Fatalf("installed release names host_api: %v; app socket: %v", installed, err)
+		}
+		if installed {
+			if code := appClient(t, sock, get(e.readEnv(), HostTokenVar), "/v1/status"); code != http.StatusOK {
+				t.Errorf("the installed release's token: %d", code)
+			}
+		}
+	}
+}
+
+// A kept installer that cannot be read serves no app socket, and the daemon says why.
+func TestAnUnreadableKeptInstallerIsLogged(t *testing.T) {
+	t.Parallel()
+	e := vmEnv(t, "1.0.0")
+	if err := e.install(vm); err != nil {
+		t.Fatal(err)
+	}
+	e.r, e.self = bundledInstaller(t, "2.0.0", 1, func(s *spec.Spec) { s.Shapes.Kairos.HostAPI = nil })
+	d := daemon(e, &fakeHost{})
+	in, _ := d.run()
+	if err := os.WriteFile(in.ctl(), []byte("not an installer"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if d.appServed() || !strings.Contains(e.log.String(), "no app socket: the installed release's host_api cannot be read from "+in.ctl()) {
+		t.Errorf("log:\n%s", e.log)
+	}
+}
+
 func TestRollbackOverTheSocketAsksThenFollowsTheJob(t *testing.T) {
 	t.Parallel()
 	e, d, host := upgradedVM(t)

@@ -4595,8 +4595,10 @@ sudo <short>-stow network attach --role ROLE --mac MAC [--mode dhcp|static|none]
     following) and 2 minutes to be answered, then counts as the daemon not reached, so a daemon
     that takes one and never answers is asked again. It runs on the VM, so a reboot ends it with
     the VM: run it again after the boot.
-- The app socket: when `shapes.kairos.host_api` names services, the daemon also serves its
-  API on `/run/<name>/app/app.sock` (0666, in a 0755 directory beside its socket), and every
+- The app socket: when `shapes.kairos.host_api` names services — in the OS's release or in the
+  release the install runs when the daemon starts (an upgrade's boot brings that one up first, so
+  its services reach the socket though the new release names none; it stays served for that boot;
+  an installed release its kept installer cannot tell is logged, `no app socket: …`) — the daemon also serves its API on `/run/<name>/app/app.sock` (0666, in a 0755 directory beside its socket), and every
   request there must carry `Authorization: Bearer <token>`, the install's `STOWAGE_HOST_TOKEN`
   (64 hex digits generated at the first install, or by the upgrade to a release that names
   services first); before an install records one, or with another token, the answer is 401.
@@ -4710,7 +4712,10 @@ showed another plan: look again`), `GET updates?channel=&version=` (`left_by_rol
   journaled: …"}` beside it (absent otherwise): a client then takes no cursor from it. An error is `{"error": "…"}` with a 4xx or 5xx status; a body with an unknown field is refused.
 - A disaster recovery: `secrets export --recipient age1…` while the VM lives (the file kept off
   it), backups to a destination off it; on a new VM, `vm create --secrets FILE` (the file
-  decrypted) installs with those secrets, then `backup config` with the same destination, `backup
+  decrypted) installs with those secrets over SSH, after `systemctl start <name>.service` (a
+  start the boot cancels, `Job for <name>.service canceled.`, is tried once more once
+  `systemctl is-system-running --wait` returns, 10 min at most, unless the unit failed; a failure
+  then fails the create, the VM kept), then `backup config` with the same destination, `backup
   list` and `restore OBJECT` load the data back.
 - Not yet: `upgrade --reset-db`, secrets sealed in an encrypted answers file.
 - The firewall: the bundle's `/etc/nftables.conf` holds a table of the project's own (`inet

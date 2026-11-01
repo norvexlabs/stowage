@@ -231,6 +231,20 @@ func payloadReset(raw []byte) (reset []string, volumes map[string]spec.Volume, o
 	return s.Data.Reset, volumes, outputs, nil
 }
 
+// payloadHostAPI is the shapes.kairos.host_api a release's spec.json records (Shapes.Kairos.HostAPI,
+// the spec's Go field names), read as payloadBaseline reads the baseline: nil when it is unread.
+func payloadHostAPI(raw []byte) []string {
+	var s struct {
+		Shapes struct {
+			Kairos *struct{ HostAPI []string }
+		}
+	}
+	if json.Unmarshal(raw, &s) != nil || s.Shapes.Kairos == nil {
+		return nil
+	}
+	return s.Shapes.Kairos.HostAPI
+}
+
 // baseline is the kept release's schema baseline, 0 when it has no database.
 func (k *keptRelease) baseline() (int, error) { return k.schema, k.schemaErr }
 
