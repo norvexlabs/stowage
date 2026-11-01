@@ -14,6 +14,7 @@
 # good; `rollback` takes the VM back to the passive system; a release that never becomes ready
 # fails its health gate, and Kairos falls back to the passive system, whose boot goes back; one that
 # fails it past a rollback barrier is kept, as going back would leave nothing serving;
+# `vm attach` gives the VM a NIC for the role 1.0.1 adds, which `network set --role` re-addresses;
 # `network set` keeps the lease as a static address, a unique local IPv6 address beside it, and a
 # change not confirmed comes undone at its window's end and at a reboot; then `vm destroy`. Needs Docker
 # (privileged containers, loop devices), network access, about 15 GB on disk under
@@ -65,7 +66,8 @@ grep -q '^    health_gate: ' "$P/stowage.yaml" || fail "no health_gate in the pr
 # An L4 route to the database, which the VM's firewall opens to the sources DB_SOURCES holds: on
 # the host's network, the database listens on the route's port itself. A kernel argument the
 # active system boots with and the recovery system without (a module's parameter, which nothing
-# reads), and a package of the project's.
+# reads), and a package of the project's. Its NIC named by a role, the primary (1.0.1 adds a
+# secondary, which `vm attach` attaches).
 python3 - "$P/stowage.yaml" <<'PY'
 import sys
 path = sys.argv[1]
@@ -77,7 +79,7 @@ for old, new in [
 ]:
     assert s.count(old) == 1, old
     s = s.replace(old, new)
-s += "\nhost:\n  kernel_args:\n    stowage.e2e: { value: \"1\", reason: \"the recovery system boots without it\" }\n  packages:\n    tcpdump: { reason: \"the bundle installs a package of the project's\" }\n"
+s += "\nhost:\n  interfaces:\n    uplink: { primary: true, reason: \"the default route's\" }\n  kernel_args:\n    stowage.e2e: { value: \"1\", reason: \"the recovery system boots without it\" }\n  packages:\n    tcpdump: { reason: \"the bundle installs a package of the project's\" }\n"
 open(path, "w").write(s)
 PY
 "${S[@]}" lint
@@ -328,7 +330,9 @@ step "a re-run on the VM changes the L4 route's allowlist: this host is refused"
 on_vm sudo notes-stow install --no-input --set DB_SOURCES=192.0.2.1/32 >"$WORK/allow.txt" 2>&1 || { cat "$WORK/allow.txt"; fail "the re-run changing DB_SOURCES"; }
 ! reach "$vm4" 5432 || fail "the L4 route's port still answers this host, which its allowlist no longer holds"
 
-step "ship beta 1.0.1, carry it through the mirror; the VM upgrades from it, and its health gate keeps it"
+step "ship beta 1.0.1, which names a second NIC, carry it through the mirror; the VM upgrades from it, and its health gate keeps it"
+sed -i 's/^    uplink: { primary: true, reason: "the default route'"'"'s" }$/&\n    edge: { mtu: 1400, reason: "a NIC vm attach attaches" }/' "$P/stowage.yaml"
+grep -q '^    edge: ' "$P/stowage.yaml" || fail "no edge NIC in the project"
 release 1.0.1
 on_vm notes-stow updates >"$WORK/updates.txt" 2>&1 || { cat "$WORK/updates.txt"; fail "updates"; }
 grep -q '1.0.1 (revision 1) on beta' "$WORK/updates.txt" || { cat "$WORK/updates.txt"; fail "updates does not offer 1.0.1 from the mirror"; }
@@ -341,9 +345,11 @@ back_on 1.0.1 active "after the upgrade" "$boot"
 healthy_postgres "after the upgrade"
 [[ $(on_vm systemctl is-active notes-health.service) == active ]] || fail "the health gate did not pass 1.0.1"
 # The boot keeps the operator's profile, and its Docker file, written before Docker starts, rotates
-# the logs.
-on_vm notes-stow tune --check >"$WORK/tune.txt" 2>&1 && grep -q '^this host: .* the network profile$' "$WORK/tune.txt" ||
-	{ cat "$WORK/tune.txt"; fail "the upgraded boot's tuning differs, or is not the network profile"; }
+# the logs. Until vm attach gives it a NIC, edge is the one setting that differs.
+on_vm notes-stow tune --check >"$WORK/tune.txt" 2>&1 || true
+grep -q '^this host: .* the network profile$' "$WORK/tune.txt" && grep -qE '^differs +interface edge +absent' "$WORK/tune.txt" &&
+	[[ $(grep '^differs ' "$WORK/tune.txt" | grep -cvE '^differs +interface edge ') == 0 ]] ||
+	{ cat "$WORK/tune.txt"; fail "the upgraded boot's tuning differs beyond edge's missing NIC, or is not the network profile"; }
 grep -qE "^ok +package tcpdump " "$WORK/tune.txt" && grep -qE "^ok +kernel stowage.e2e=1 " "$WORK/tune.txt" ||
 	{ cat "$WORK/tune.txt"; fail "tune does not report the project's package and kernel argument as asked"; }
 tuned=$(on_vm sudo docker ps -q --filter label=com.docker.compose.service=api)
@@ -358,6 +364,45 @@ grep -qx 'enable_boot_assessment=' "$WORK/assess.txt" && grep -qx 'boot_assessme
 on_vm notes-stow health >"$WORK/health.txt" 2>&1 && grep -qx ready "$WORK/health.txt" || { cat "$WORK/health.txt"; fail "health"; }
 [[ $(on_vm sudo stat -c "'%Y %s'" /oem/95_userdata) == "$userdata" ]] && on_vm test ! -e /run/.userdata_load ||
 	fail "the upgrade's boot pulled the user-data again: /oem/95_userdata is not the first boot's"
+
+step "vm attach: a NIC for the role 1.0.1 names, the VM power-cycled on TrueNAS; network set --role re-addresses it, confirmed; a reset not confirmed comes undone"
+# The operator's notes-stow of the release naming the role; an address of TEST-NET-1 on the
+# primary's bridge, which nothing else on the LAN holds.
+vm_ctl beta-1.0.1
+boot=$(boot_id)
+"$CTL" vm attach "$H" --interface edge=static,address=192.0.2.10/24 --user ops --ssh-key "$KEY.pub" --host "$ADDR" --wait 15m \
+	>"$WORK/attach.txt" 2>"$WORK/attach.log" || { tail -80 "$WORK/attach.log"; fail "vm attach"; }
+back_on 1.0.1 active "after vm attach" "$boot"
+healthy_postgres "after vm attach"
+on_vm ip -4 -o addr show dev edge | grep -q ' 192\.0\.2\.10/24 ' || { on_vm ip -o addr || true; fail "the attached NIC is not named edge with its address"; }
+on_vm test -e /sys/class/net/uplink || fail "the primary NIC lost its name as edge joined it"
+on_vm notes-stow tune --check >"$WORK/tune.txt" 2>&1 || { cat "$WORK/tune.txt"; fail "tune still finds a setting that differs once edge is attached"; }
+# role_line: the edge role's line of `notes-stow network`.
+role_line() { on_vm notes-stow network >"$WORK/net-role.txt" 2>&1 || { cat "$WORK/net-role.txt"; fail "network"; }; sed -n 's/^role       edge: //p' "$WORK/net-role.txt"; }
+[[ $(role_line) == *"192.0.2.10/24; set by the cloud-config or \`network attach\`" ]] || { cat "$WORK/net-role.txt"; fail "network does not show the attached NIC"; }
+on_vm notes-stow network set --role edge --mode static --address 192.0.2.11/24 --revert-secs 600 >"$WORK/net-set.txt" 2>&1 ||
+	{ cat "$WORK/net-set.txt"; fail "network set --role edge"; }
+grep -q 'network confirm` keeps it within 600 s' "$WORK/net-set.txt" || { cat "$WORK/net-set.txt"; fail "the secondary's change does not await confirmation"; }
+role_line >/dev/null
+grep -q '^pending    not confirmed' "$WORK/net-role.txt" || { cat "$WORK/net-role.txt"; fail "the secondary's change does not await confirmation"; }
+[[ $(on_vm notes-stow network confirm) == confirmed ]] || fail "network confirm of edge's change"
+[[ $(role_line) == *"192.0.2.11/24; set by \`notes-stow network set --role edge\`: 192.0.2.11/24" ]] && ! grep -q '^pending' "$WORK/net-role.txt" ||
+	{ cat "$WORK/net-role.txt"; fail "edge's override is not kept"; }
+on_vm ip -4 -o addr show dev edge | grep -q ' 192\.0\.2\.11/24 ' || fail "edge does not have its override's address"
+# The override's file under /run, and the release's MTU drop-in applied to it.
+on_vm test -e /run/systemd/network/09-notes-edge-override.network || fail "no override file for edge under /run"
+on_vm test -e /usr/lib/systemd/network/09-notes-edge-override.network.d/50-notes.conf || fail "the release ships no drop-in for edge's override"
+on_vm ip -o link show dev edge | grep -q ' mtu 1400 ' || { on_vm ip -o link show dev edge || true; fail "edge's override runs without the release's MTU"; }
+# Reset, not confirmed: the attach's address now, the override back at the window's end.
+on_vm notes-stow network reset --role edge --revert-secs 60 >"$WORK/net-reset.txt" 2>&1 || { cat "$WORK/net-reset.txt"; fail "network reset --role edge"; }
+[[ $(role_line) == *"set by the cloud-config or \`network attach\`" ]] && grep -q '^pending    not confirmed' "$WORK/net-role.txt" ||
+	{ cat "$WORK/net-role.txt"; fail "the reset of edge's override does not await confirmation"; }
+deadline=$((SECONDS + 240))
+until [[ $(role_line) == *"set by \`notes-stow network set --role edge\`: 192.0.2.11/24" ]] && ! grep -q '^pending' "$WORK/net-role.txt"; do
+	((SECONDS < deadline)) || { cat "$WORK/net-role.txt"; fail "edge's reset was not undone at its window's end"; }
+	sleep 10
+done
+on_vm ip -4 -o addr show dev edge | grep -q ' 192\.0\.2\.11/24 ' || fail "edge does not have its override's address back"
 
 step "rollback: the VM reboots into the passive system, whose boot goes back to 1.0.0"
 # The job reboots the VM itself: the reboot may close the session following it (ssh: 255).
@@ -406,6 +451,9 @@ step "network: the lease kept as a static address, a static IPv6 address beside 
 net() { on_vm notes-stow network >"$WORK/net.txt" 2>&1 || { cat "$WORK/net.txt"; fail "network $1"; }; }
 net_field() { sed -n "s/^$1 *//p" "$WORK/net.txt"; }
 net "on DHCP"
+# edge's override, kept through 1.0.0 (which names no edge), rendered again by 1.0.3's boot.
+grep -q "^role       edge: .*192\.0\.2\.11/24; set by \`notes-stow network set --role edge\`: 192\.0\.2\.11/24$" "$WORK/net.txt" ||
+	{ cat "$WORK/net.txt"; fail "edge's override did not come back with a release naming edge"; }
 # vm create's network, DHCP with IPv6 on: the cloud-config's file, which asks DHCPv6 without
 # waiting for a router's advertisement, as a cloud gives IPv6 addresses.
 [[ $(net_field 'set by') == "the VM's cloud-config, as \`vm create\` gave it: DHCP, automatic IPv6" ]] || { cat "$WORK/net.txt"; fail "the network is not the cloud-config's"; }
