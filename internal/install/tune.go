@@ -209,6 +209,28 @@ func (in *Installer) Tune(ctx context.Context, t TuneOptions) error {
 				for _, name := range sortedKeys(in.R.Nftables) {
 					fmt.Fprintf(in.O.Out, "# services.%s.nftables (not written: load it with nft -f <file>, the host's firewall is its operator's)\n%s\n", name, in.R.Nftables[name])
 				}
+				get := func(string) string { return "" }
+				if len(in.R.NftByInput) > 0 {
+					var envErr error
+					if get, envErr = in.installedEnv(); envErr != nil {
+						fmt.Fprintf(in.O.Out, "# note: the install's record does not read (%v): each table an input picks is printed, load one alone\n", envErr)
+					}
+				}
+				for _, name := range sortedKeys(in.R.NftByInput) {
+					t := in.R.Spec.Services[name].Nftables
+					values := sortedKeys(in.R.NftByInput[name])
+					v := get(t.Input)
+					_, picks := in.R.NftByInput[name][v]
+					switch {
+					case picks:
+						values = []string{v} // the install's: the one its starts load
+					case v != "":
+						fmt.Fprintf(in.O.Out, "# note: %s: %v: a start that loads the table refuses it; each table it picks is printed, load one alone\n", t.Input, pickError(name, t, v))
+					}
+					for _, v := range values {
+						fmt.Fprintf(in.O.Out, "# services.%s.nftables.files.%s, the table %s=%s picks (not written: load the one this install's %s picks alone, with nft -f <file>, the host's firewall is its operator's)\n%s\n", name, v, t.Input, v, t.Input, in.R.NftByInput[name][v])
+					}
+				}
 			}
 			return nil
 		}
@@ -250,7 +272,7 @@ func (in *Installer) Tune(ctx context.Context, t TuneOptions) error {
 		if consented || revoked {
 			loaded = in.loadedTables(ctx)
 		}
-		for _, name := range sortedKeys(in.R.Nftables) {
+		for _, name := range in.R.Tables() {
 			item := tune.Item{State: tune.Advice, Kind: "nftables", Name: "table inet " + name,
 				Have: "the service " + name + " asks for its nftables table:", Want: "`" + ctl + " tune --apply` loads it at each start, or nft -f <file> from `" + ctl + " tune --print` (the host's firewall is its operator's)"}
 			switch {

@@ -34,8 +34,11 @@ func (l *linter) serviceHost(at, name string, svc spec.Service) {
 		l.errf(at+".irq", "%q: %s (the default: the NICs' interrupts off its cores) or %s", svc.IRQ, spec.IRQOff, spec.IRQOn)
 	}
 	var table string
-	if f := svc.Nftables; f != "" {
-		table = l.nftTable(at+".nftables", name, f)
+	switch t := svc.Nftables; {
+	case t.File != "":
+		table = l.nftTable(at+".nftables", name, t.File)
+	case t.Input != "":
+		table = l.pickedTable(at+".nftables", name, t)
 	}
 	l.serviceSets(at, name, svc, table)
 	l.serviceNetwork(at, name, svc)
@@ -80,7 +83,7 @@ func (l *linter) serviceSets(at, name string, svc spec.Service, text string) {
 		switch {
 		case len(svc.Sets) == 0:
 			l.errf(w, "is empty: leave it out, or name a set of the table and the input filling it")
-		case svc.Nftables == "":
+		case !svc.Nftables.Set():
 			l.errf(w, "fills the sets of %s's own table: give it nftables", name)
 		}
 		for _, set := range slices.Sorted(maps.Keys(svc.Sets)) {
@@ -88,18 +91,9 @@ func (l *linter) serviceSets(at, name string, svc spec.Service, text string) {
 			if text != "" && !slices.Contains(spec.NftSets(text), set) {
 				l.errf(ws, "the table inet %s declares no set %s", name, set)
 			}
-			in, ok := l.s.Input(key)
+			in, ok := l.firewallInput(ws, key, "the firewall's rules show it", "the set is filled", "fills the set with nothing")
 			switch {
 			case !ok:
-				l.errf(ws, "%s is not an input", key)
-			case in.Secret:
-				l.errf(ws, "%s is secret: the firewall's rules show it", key)
-			case in.When != "":
-				l.errf(ws, "%s is asked only when %s: the set is filled in every mode", key, in.When)
-			case in.Profile != "":
-				l.errf(ws, "%s is asked only with the profile %s: the set is filled on every install", key, in.Profile)
-			case len(in.Shapes) > 0 && (l.s.Shapes.Docker != nil && !slices.Contains(in.Shapes, "docker") || l.s.Shapes.Kairos != nil && !slices.Contains(in.Shapes, "kairos")):
-				l.errf(ws, "%s must be asked on every shape the table loads on (docker and kairos the project has): an install not asked it fills the set with nothing", key)
 			case in.Default != "" && !strings.Contains(in.Default, "${"):
 				if _, err := spec.SetElements(in.Default); err != nil {
 					l.errf(ws, "%s's default: %v", key, err)
@@ -121,7 +115,7 @@ func (l *linter) serviceSets(at, name string, svc spec.Service, text string) {
 				l.errf(wi, "is %s itself: a load of its own table recreates it already", name)
 			case slices.Index(svc.Feeds, f) < i:
 				l.errf(wi, "%s is given twice", f)
-			case !ok || other.Nftables == "":
+			case !ok || !other.Nftables.Set():
 				l.errf(wi, "%s has no nftables table (services.%s.nftables)", f, f)
 			}
 		}
@@ -180,7 +174,7 @@ func (l *linter) serviceNetwork(at, name string, svc spec.Service) {
 	}
 	at += ".transparent"
 	l.roleList(at, svc.Transparent, "the host.interfaces roles its table intercepts traffic on, like [vpn0]", nil)
-	if svc.Nftables == "" {
+	if !svc.Nftables.Set() {
 		l.errf(at, "%s's own table steers the traffic to its sockets: give it nftables", name)
 	}
 	if !svc.HostNetwork {
@@ -601,6 +595,112 @@ func (l *linter) nftTable(at, service, rel string) string {
 		l.warnf(at, "%s: a chain hooks the input with a drop policy: a base chain of any table judges every packet, so it drops what the VM's own firewall accepts (SSH, the stack's ports) unless it accepts them itself", rel)
 	}
 	return string(raw)
+}
+
+// pickedTable checks a table an input picks (nftables: { input, files }): the input asked on every
+// install the table loads on, never secret, its default one of the values and, without one,
+// required (an empty value picks nothing); each value a name of its file (spec.NftChoice) and
+// each file a table file as nftTable judges it, all declaring the same sets (a feeder's, an
+// input's, the same whatever the value). The first file's text, for the sets' checks.
+func (l *linter) pickedTable(at, name string, t spec.NftTable) string {
+	in, ok := l.firewallInput(at+".input", t.Input, "the table it picks is shown (the logs, tune)", "the table loads", "picks no table")
+	if use := l.otherUse(t.Input); use != "" {
+		l.errf(at+".input", "%s is also %s: an input picking a table picks it alone", t.Input, use)
+	}
+	switch {
+	case !ok:
+	case in.Advanced:
+		l.errf(at+".input", "%s is advanced, never asked nor recorded: the table it picks needs a value on every install", t.Input)
+	case in.Default == "" && !in.Required:
+		l.errf(at+".input", "%s has no default and is not required: an empty value picks no table (one of %s)", t.Input, strings.Join(t.Values(), ", "))
+	case in.Default != "" && !strings.Contains(in.Default, "${") && t.Files[in.Default] == "":
+		l.errf(at+".input", "%s's default %q picks no table (one of %s)", t.Input, in.Default, strings.Join(t.Values(), ", "))
+	}
+	var first string
+	var sets []string
+	var each []string
+	same := true
+	for _, v := range t.Values() {
+		wv := at + ".files." + v
+		if !spec.NftChoice.MatchString(v) {
+			l.errf(wv, "not a value naming a table's file: a letter or digit, then letters, digits and _ . -, at most 64")
+			continue
+		}
+		text := l.nftTable(wv, name, t.Files[v])
+		if text == "" {
+			continue
+		}
+		got := spec.NftSets(text)
+		slices.Sort(got)
+		each = append(each, fmt.Sprintf("%s: [%s]", v, strings.Join(got, " ")))
+		if first == "" {
+			first, sets = text, got
+		} else if !slices.Equal(got, sets) {
+			same = false
+		}
+	}
+	if !same {
+		l.errf(at+".files", "its files declare different sets (%s): each declares the same, which its feeders and inputs fill whatever the value", strings.Join(each, ", "))
+	}
+	return first
+}
+
+// otherUse is what else the installer reads input key as, checked as such (a set's elements, an L4
+// route's or a front route's value, a service's address), "" for nothing.
+func (l *linter) otherUse(key string) string {
+	for _, name := range slices.Sorted(maps.Keys(l.s.Services)) {
+		svc := l.s.Services[name]
+		for _, set := range slices.Sorted(maps.Keys(svc.Sets)) {
+			if svc.Sets[set] == key {
+				return "services." + name + ".sets." + set + "'s"
+			}
+		}
+		if svc.AddressInput == key {
+			return "services." + name + ".address_input"
+		}
+	}
+	for i, r := range l.s.L4.Routes {
+		if r.AddressInput == key || r.AllowInput == key || r.BindInput == key {
+			return fmt.Sprintf("l4.routes[%d]'s", i)
+		}
+	}
+	for i, r := range l.s.Front.Routes {
+		if r.DomainInput == key || r.AllowInput == key {
+			return fmt.Sprintf("front.routes[%d]'s", i)
+		}
+		if a := r.ForwardAuth; a != nil && (a.AddressInput == key || a.URIInput == key) {
+			return fmt.Sprintf("front.routes[%d].forward_auth's", i)
+		}
+	}
+	for i, e := range l.s.Extensions {
+		if e.Input == key || e.KeyInput == key {
+			return fmt.Sprintf("extensions[%d]'s", i)
+		}
+	}
+	return ""
+}
+
+// firewallInput checks an input the firewall reads (a set's elements, the table it picks): an
+// input, not secret (why), asked in every mode, with no profile and on every shape among docker
+// and kairos the project has, as the table loads (what) on every install; not, what an install
+// not asked it does (unasked). ok when it passes.
+func (l *linter) firewallInput(at, key, why, what, unasked string) (spec.Input, bool) {
+	in, ok := l.s.Input(key)
+	switch {
+	case !ok:
+		l.errf(at, "%s is not an input", key)
+	case in.Secret:
+		l.errf(at, "%s is secret: %s", key, why)
+	case in.When != "":
+		l.errf(at, "%s is asked only when %s: %s in every mode", key, in.When, what)
+	case in.Profile != "":
+		l.errf(at, "%s is asked only with the profile %s: %s on every install", key, in.Profile, what)
+	case len(in.Shapes) > 0 && (l.s.Shapes.Docker != nil && !slices.Contains(in.Shapes, "docker") || l.s.Shapes.Kairos != nil && !slices.Contains(in.Shapes, "kairos")):
+		l.errf(at, "%s must be asked on every shape the table loads on (docker and kairos the project has): an install not asked it %s", key, unasked)
+	default:
+		return in, true
+	}
+	return in, false
 }
 
 // nftTokens are an nftables file's tokens as nft lexes them where it matters here: a quoted

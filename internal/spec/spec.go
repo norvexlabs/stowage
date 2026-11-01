@@ -142,8 +142,9 @@ type Service struct {
 	// IRQ is where the host's NICs' interrupts and receive steering go: off its cores (off, the
 	// default) or on them too (on).
 	IRQ string `yaml:"irq"`
-	// Nftables is its nftables table, a file of the project holding one `table inet <service>`.
-	Nftables string `yaml:"nftables"`
+	// Nftables is its nftables table, a file of the project holding one `table inet <service>`,
+	// or one such file by each value of the input picking it.
+	Nftables NftTable `yaml:"nftables"`
 	// Sets fill its table's named sets from inputs, by set: each start writes the input's
 	// elements into the set (emptied first), on every shape its table loads on.
 	Sets map[string]string `yaml:"sets"`

@@ -170,9 +170,7 @@ func Build(p *project.Project, r Release) (*Graph, error) {
 	installed := append([]string{s.Stack.Compose}, trusted...)
 	// The services' nftables tables, which the installer carries.
 	for _, name := range slices.Sorted(maps.Keys(s.Services)) {
-		if f := s.Services[name].Nftables; f != "" {
-			installed = append(installed, f)
-		}
+		installed = append(installed, s.Services[name].Nftables.Paths()...)
 	}
 
 	var imageIDs []string

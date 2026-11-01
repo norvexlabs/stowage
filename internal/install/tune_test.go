@@ -725,3 +725,51 @@ func TestAnOptionalRoleWithoutItsNICIsNotSaid(t *testing.T) {
 		t.Errorf("a role not optional: %v", unmapped)
 	}
 }
+
+// tune --print on a Docker host prints a table an input picks: each value's without an install,
+// the install's own alone once it records the value (two would merge into one table).
+func TestTunePrintsThePickedTable(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	dockerInfo(e.docker, `27.3.1|Ubuntu 24.04 LTS|[]`)
+	e.r.Spec.Services = map[string]spec.Service{"ingest": {Nftables: spec.NftTable{Input: "POSTURE", Files: map[string]string{"observe": "o.nft", "enforce": "e.nft"}}}}
+	e.r.NftByInput = map[string]map[string][]byte{"ingest": {"observe": []byte("# observe\n"), "enforce": []byte("# enforce\n")}}
+	in := e.installer(func(o *Options) { o.Tune = fakeTune(tuneRoot(t), 0) })
+	printed := func() string {
+		e.out.Reset()
+		if err := in.Tune(context.Background(), TuneOptions{Print: true}); err != nil {
+			t.Fatal(err)
+		}
+		return e.out.String()
+	}
+	if out := printed(); !strings.Contains(out, "# observe\n") || !strings.Contains(out, "# enforce\n") {
+		t.Errorf("no install:\n%s", out)
+	}
+	if err := os.MkdirAll(e.dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	env := NewEnvFile()
+	env.Set("POSTURE", "enforce")
+	if err := env.WriteFile(in.path(envName)); err != nil {
+		t.Fatal(err)
+	}
+	if out := printed(); strings.Contains(out, "# observe\n") || !strings.Contains(out, "services.ingest.nftables.files.enforce, the table POSTURE=enforce picks") {
+		t.Errorf("the install's value:\n%s", out)
+	}
+	env.Set("POSTURE", "strict")
+	if err := env.WriteFile(in.path(envName)); err != nil {
+		t.Fatal(err)
+	}
+	if out := printed(); !strings.Contains(out, `# note: POSTURE: "strict" picks no table of ingest (services.ingest.nftables.files: enforce, observe): a start that loads the table refuses it`) || !strings.Contains(out, "# observe\n") {
+		t.Errorf("a recorded value without a file:\n%s", out)
+	}
+	if err := os.Remove(in.path(envName)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(in.path(envName), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if out := printed(); strings.Count(out, "# note: the install's record does not read") != 1 || !strings.Contains(out, "# observe\n") || !strings.Contains(out, "# enforce\n") {
+		t.Errorf("a record that does not read:\n%s", out)
+	}
+}

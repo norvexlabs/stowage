@@ -130,9 +130,15 @@ func (p *Publisher) payloadFiles(file string, man []byte, view spec.Spec) (paylo
 	}
 	files := payload.Files{file: man, payload.Spec: viewJSON, payload.Compose: compose}
 	for _, name := range slices.Sorted(maps.Keys(s.Services)) {
-		if f := s.Services[name].Nftables; f != "" {
-			if files[payload.NftablesDir+name+".nft"], err = p.projectFile(f); err != nil {
+		t := s.Services[name].Nftables
+		if t.File != "" {
+			if files[payload.NftablesDir+name+".nft"], err = p.projectFile(t.File); err != nil {
 				return nil, fmt.Errorf("services.%s.nftables: %w", name, err)
+			}
+		}
+		for _, v := range t.Values() {
+			if files[payload.NftablesDir+name+"/"+v+".nft"], err = p.projectFile(t.Files[v]); err != nil {
+				return nil, fmt.Errorf("services.%s.nftables.files.%s: %w", name, v, err)
 			}
 		}
 	}

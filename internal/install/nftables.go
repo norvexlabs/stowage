@@ -52,11 +52,19 @@ func (in *Installer) loadTables(ctx context.Context, get func(string) string) er
 		return nil // gatewayStart says why
 	}
 	in.warnSocketFed()
+	want, err := in.R.TablesNow(get)
+	if err != nil {
+		rerun := fmt.Sprintf("%s --dir %s", in.ctl(), in.O.Dir)
+		if in.O.Preloaded {
+			rerun = "sudo " + in.R.Ctl() + " install"
+		}
+		return fmt.Errorf("%w: a re-run of the install, `%s --set <input>=<value>`, picks one", err, rerun)
+	}
 	sets, err := in.setScripts(get)
 	if err != nil {
 		return err
 	}
-	return in.syncTables(ctx, in.R.Nftables, sets)
+	return in.syncTables(ctx, want, sets)
 }
 
 // SetsSuffix names, beside a table's file under TablesDir, the nft script that filled its sets
@@ -71,7 +79,7 @@ func (in *Installer) setScripts(get func(string) string) (map[string]string, err
 	var errs []error
 	for _, name := range sortedKeys(in.R.Spec.Services) {
 		sets := in.R.Spec.Services[name].Sets
-		if _, ok := in.R.Nftables[name]; !ok || len(sets) == 0 {
+		if !in.R.hasTable(name) || len(sets) == 0 {
 			continue
 		}
 		var b strings.Builder
@@ -229,7 +237,7 @@ func (in *Installer) tableLoads() map[string]string {
 		return nil
 	}
 	loads := map[string]string{}
-	for name := range in.R.Nftables {
+	for _, name := range in.R.Tables() {
 		if raw, err := os.ReadFile(filepath.Join(in.O.Dir, TablesDir, name+".load")); err == nil {
 			loads[name] = "load " + strings.TrimSpace(string(raw))
 		}
@@ -283,6 +291,23 @@ func (in *Installer) setInput(key string) bool {
 	return false
 }
 
+// tablePick is the check of an input picking services' tables (services.<name>.nftables.input):
+// its value one each such table has a file for; nil for another input.
+func (in *Installer) tablePick(key string) func(string) error {
+	var check func(string) error
+	for _, name := range sortedKeys(in.R.Spec.Services) {
+		if t := in.R.Spec.Services[name].Nftables; t.Input == key {
+			check = chainChecks(check, func(v string) error {
+				if t.Files[v] == "" {
+					return pickError(name, t, v)
+				}
+				return nil
+			})
+		}
+	}
+	return check
+}
+
 // chainChecks is a check passing what a and b both pass (a nil one passes everything).
 func chainChecks(a, b func(string) error) func(string) error {
 	if a == nil {
@@ -322,11 +347,11 @@ func (in *Installer) warnSocketFed() {
 		return
 	}
 	in.setsWarned = in.R // a start prepares again after a pull: warned once
-	for _, name := range sortedKeys(in.R.Nftables) {
+	for _, name := range in.R.Tables() {
 		if !in.socketFed(name) {
 			continue
 		}
-		for _, set := range spec.NftSets(string(in.R.Nftables[name])) {
+		for _, set := range in.R.tableSets(name) {
 			if _, filled := in.R.Spec.Services[name].Sets[set]; !filled {
 				in.O.logf("warning: the set %s of the table inet %s is fed through the VM's app socket, which a Docker host does not serve: it stays as the table declares it here unless its own rules fill it (services.%s.sets fills a set from an input)", set, name, name)
 			}
@@ -443,12 +468,11 @@ type SetElements struct {
 // gives the socket feeds any table's sets (its own, or those it feeds).
 func (h *Hostd) setElements(w http.ResponseWriter, r *http.Request) {
 	table, set := r.PathValue("table"), r.PathValue("set")
-	body, ok := h.R.Nftables[table]
-	if !ok {
+	if !h.R.hasTable(table) {
 		replyErr(w, fail(http.StatusNotFound, "no service %q has an nftables table (services.<name>.nftables)", table))
 		return
 	}
-	if !slices.Contains(spec.NftSets(string(body)), set) {
+	if !slices.Contains(h.R.tableSets(table), set) {
 		replyErr(w, fail(http.StatusNotFound, "the table inet %s declares no set %q", table, set))
 		return
 	}

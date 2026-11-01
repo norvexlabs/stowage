@@ -259,7 +259,7 @@ func TestAReleaseWithAProjectNamedTableIsRefused(t *testing.T) {
 		return strings.Replace(ingestTable, "table inet ingest", "table inet "+name, 1)
 	}
 	for name, want := range map[string]string{"notes": "no table of the project's name", "queue": "nor of a name nft does not take", "ingest": ""} {
-		view["services"] = map[string]any{name: map[string]any{"nftables": name + ".nft"}}
+		view["services"] = map[string]any{name: map[string]any{"nftables": map[string]any{"File": name + ".nft"}}}
 		files[payload.Spec], _ = json.Marshal(view)
 		f := maps.Clone(files)
 		f[payload.NftablesDir+name+".nft"] = []byte(table(name))
@@ -273,7 +273,7 @@ func TestAReleaseWithAProjectNamedTableIsRefused(t *testing.T) {
 	}
 	// A table no service declares (the project's own name among them), one without its .nft, and a
 	// body that reaches past its table are refused: the VM loads each one as root.
-	view["services"] = map[string]any{"ingest": map[string]any{"nftables": "ingest.nft"}}
+	view["services"] = map[string]any{"ingest": map[string]any{"nftables": map[string]any{"File": "ingest.nft"}}}
 	files[payload.Spec], _ = json.Marshal(view)
 	for path, body := range map[string]string{
 		payload.NftablesDir + "notes.nft":  table("notes"),
@@ -443,7 +443,7 @@ func TestASetsInputIsCheckedAsItIsGiven(t *testing.T) {
 	t.Parallel()
 	r := testRelease(t, "1.0.0")
 	r.Spec.Inputs = append(r.Spec.Inputs, spec.Input{Key: "PROBES", Optional: true})
-	r.Spec.Services = map[string]spec.Service{"ingest": {Nftables: "ingest.nft", Sets: map[string]string{"probes": "PROBES"}}}
+	r.Spec.Services = map[string]spec.Service{"ingest": {Nftables: spec.NftTable{File: "ingest.nft"}, Sets: map[string]string{"probes": "PROBES"}}}
 	r.Spec.L4.Routes = []spec.L4Route{{Name: "feed", Protocol: "udp", Port: 17007, Upstream: "ingest:17007", AllowInput: "PROBES"}}
 	in := &Installer{R: r}
 	for _, i := range in.inputList(Loopback) {
@@ -551,5 +551,133 @@ func TestAnUnreadSetsScriptLoadsTheTableAgain(t *testing.T) {
 	host.ran = nil
 	if err := in.loadTables(ctx, get); err != nil || len(host.ran) != 2 || !strings.HasPrefix(host.ran[1], "nft -f "+in.tableFile("ingest", ".nft.next")) {
 		t.Errorf("%v, ran %q", err, host.ran)
+	}
+}
+
+// A table an input picks: the release carries a file by each value, each judged as a table file;
+// a start loads the one the input's value picks, again when the value changes, and a value without
+// a file is refused at the input and at the start, before any table loads.
+func TestAnInputPicksTheServicesTable(t *testing.T) {
+	t.Parallel()
+	_, exe := testInstaller(t, "1.0.0")
+	files, err := payload.Read(exe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var view map[string]any
+	if err := json.Unmarshal(files[payload.Spec], &view); err != nil {
+		t.Fatal(err)
+	}
+	view["services"] = map[string]any{"ingest": map[string]any{"nftables": map[string]any{"Input": "POSTURE", "Files": map[string]any{"observe": "a.nft", "enforce": "b.nft"}}}}
+	view["Inputs"] = []any{map[string]any{"Key": "POSTURE", "Default": "observe"}, map[string]any{"Key": "HIDDEN", "Secret": true, "Default": "observe"},
+		map[string]any{"Key": "MODE", "When": "tls", "Default": "observe"}, map[string]any{"Key": "PROF", "Profile": "p", "Default": "observe"},
+		map[string]any{"Key": "ADV", "Advanced": true}, map[string]any{"Key": "K8S", "Shapes": []any{"kubernetes"}, "Default": "observe"}, map[string]any{"Key": "BARE"}}
+	files[payload.Spec], _ = json.Marshal(view)
+	enforce := "# enforce\n" + ingestTable
+	picked := func(edit func(f map[string][]byte)) (*Release, error) {
+		f := maps.Clone(files)
+		f[payload.NftablesDir+"ingest/observe.nft"] = []byte(ingestTable)
+		f[payload.NftablesDir+"ingest/enforce.nft"] = []byte(enforce)
+		if edit != nil {
+			edit(f)
+		}
+		return Load(f)
+	}
+	r, err := picked(nil)
+	if err != nil || !slices.Equal(r.Tables(), []string{"ingest"}) || !slices.Equal(r.tableSets("ingest"), []string{"probes"}) {
+		t.Fatalf("%v %v", r, err)
+	}
+	for name, edit := range map[string]func(f map[string][]byte){
+		"has no nftables/ingest/enforce.nft": func(f map[string][]byte) { delete(f, payload.NftablesDir+"ingest/enforce.nft") },
+		"is no table a service declares":     func(f map[string][]byte) { f[payload.NftablesDir+"ingest/count.nft"] = []byte(ingestTable) },
+		"nftables/ingest.nft is no table":    func(f map[string][]byte) { f[payload.NftablesDir+"ingest.nft"] = []byte(ingestTable) },
+		"services.ingest.nftables.files.enforce": func(f map[string][]byte) {
+			f[payload.NftablesDir+"ingest/enforce.nft"] = []byte(ingestTable + "flush ruleset\n")
+		},
+		"its files declare different sets": func(f map[string][]byte) {
+			f[payload.NftablesDir+"ingest/enforce.nft"] = []byte(strings.Replace(ingestTable, "set probes", "set trusted", 1))
+		},
+	} {
+		if _, err := picked(edit); err == nil || !strings.Contains(err.Error(), name) {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+	host := &nftHost{}
+	in := &Installer{R: r, O: Options{Dir: t.TempDir(), Firewall: t.TempDir(), Host: host}}
+	posture := "observe"
+	get := func(k string) string {
+		if k == "POSTURE" {
+			return posture
+		}
+		return ""
+	}
+	loaded := func() string {
+		b, _ := os.ReadFile(filepath.Join(in.O.Dir, TablesDir, "ingest.nft"))
+		return string(b)
+	}
+	if err := in.loadTables(context.Background(), get); err != nil || !strings.HasSuffix(loaded(), "delete table inet ingest\n"+ingestTable) {
+		t.Errorf("observe: %v\n%s", err, loaded())
+	}
+	posture = "enforce"
+	if err := in.loadTables(context.Background(), get); err != nil || !strings.HasSuffix(loaded(), "delete table inet ingest\n"+enforce) {
+		t.Errorf("enforce: %v\n%s", err, loaded())
+	}
+	posture, host.ran = "count", nil
+	const refused = `"count" picks no table of ingest (services.ingest.nftables.files: enforce, observe)`
+	if err := in.loadTables(context.Background(), get); err == nil || !strings.HasPrefix(err.Error(), "POSTURE: "+refused+": a re-run of the install, `"+in.ctl()+" --dir "+in.O.Dir+" --set <input>=<value>`, picks one") || len(host.ran) != 0 {
+		t.Errorf("a value without a file: %v, ran %v", err, host.ran)
+	}
+	in.O.Preloaded = true
+	if err := in.loadTables(context.Background(), get); err == nil || !strings.HasSuffix(err.Error(), ": a re-run of the install, `sudo notes-stow install --set <input>=<value>`, picks one") {
+		t.Errorf("a value without a file on the VM: %v", err)
+	}
+	in.O.Preloaded = false
+	if err := in.tablePick("POSTURE")("count"); err == nil || err.Error() != refused {
+		t.Errorf("the input's check: %v", err)
+	}
+	// Another service's table the same input picks: its values are checked too.
+	in.R.Spec.Services["probe"] = spec.Service{Nftables: spec.NftTable{Input: "POSTURE", Files: map[string]string{"observe": "p.nft"}}}
+	if err := in.tablePick("POSTURE")("enforce"); err == nil || err.Error() != `"enforce" picks no table of probe (services.probe.nftables.files: observe)` {
+		t.Errorf("a value one of two tables has no file for: %v", err)
+	}
+	delete(in.R.Spec.Services, "probe")
+	if err := in.tablePick("POSTURE")("enforce"); err != nil {
+		t.Errorf("the input's check of a value with its file: %v", err)
+	}
+	if in.tablePick("OTHER") != nil {
+		t.Error("a check for an input picking no table")
+	}
+	// An upgrade to this release asks again, as an input it adds, one whose recorded value it has
+	// no file for; one whose value it has, it keeps.
+	in.R.Spec.Inputs = []spec.Input{{Key: "POSTURE", Default: "observe"}}
+	env := NewEnvFile()
+	env.Set("POSTURE", "strict")
+	if added := in.addedInputs(env, Loopback); len(added) != 1 || added[0].Key != "POSTURE" {
+		t.Errorf("a recorded value without a file: %v", added)
+	}
+	env.Set("POSTURE", "enforce")
+	if added := in.addedInputs(env, Loopback); len(added) != 0 {
+		t.Errorf("a recorded value with its file: %v", added)
+	}
+	in.R.Spec.Inputs = nil
+	// A picking input not asked on every install, in the clear, with a value, is refused.
+	for _, k := range []string{"NONE", "HIDDEN", "MODE", "PROF", "ADV", "K8S", "BARE"} {
+		v := maps.Clone(view)
+		v["services"] = map[string]any{"ingest": map[string]any{"nftables": map[string]any{"Input": k, "Files": map[string]any{"observe": "a.nft"}}}}
+		f := maps.Clone(files)
+		f[payload.Spec], _ = json.Marshal(v)
+		if _, err := Load(f); err == nil || !strings.Contains(err.Error(), k+" is no input asked on every install, in the clear") {
+			t.Errorf("%s: %v", k, err)
+		}
+	}
+	// A table neither a file nor an input with its files, or both, is refused.
+	for _, nft := range []map[string]any{{"Input": "POSTURE"}, {"File": "a.nft", "Input": "POSTURE", "Files": map[string]any{"observe": "a.nft"}}} {
+		v := maps.Clone(view)
+		v["services"] = map[string]any{"ingest": map[string]any{"nftables": nft}}
+		f := maps.Clone(files)
+		f[payload.Spec], _ = json.Marshal(v)
+		if _, err := Load(f); err == nil || !strings.Contains(err.Error(), "a file, or an input and its files, not both nor either alone") {
+			t.Errorf("%v: %v", nft, err)
+		}
 	}
 }

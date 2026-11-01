@@ -153,6 +153,13 @@ on_vm sudo test -s /usr/local/atlas/.stowage-front-logins || fail "the login's h
 [[ $(ops) == 000 && $(ops --cert "$WORK/rogue.pem" --key "$WORK/rogue.key") == 000 ]] || fail "the ops route takes a client without a certificate its client CA issued"
 [[ $(curl -sk -o /dev/null -w '%{http_code}' --max-time 10 --resolve "api.atlas.test:443:$IP" https://api.atlas.test/health) == 200 ]] || fail "the api route asks for a client certificate"
 
+step "on metal: the input picking ingest's table: observe first, enforce on a re-run, a value without a file refused"
+on_vm sudo nft list table inet ingest >"$WORK/ingest.txt" && ! grep -q 'tcp dport 9 ' "$WORK/ingest.txt" || { cat "$WORK/ingest.txt"; fail "ingest's table is not the observe posture's (INGEST_POSTURE's default)"; }
+on_vm sudo at-stow install --no-input --set INGEST_POSTURE=count >"$WORK/posture.txt" 2>&1 && fail "a value picking no table was taken"
+grep -q 'INGEST_POSTURE: "count" picks no table of ingest' "$WORK/posture.txt" || { cat "$WORK/posture.txt"; fail "the refusal of a value picking no table"; }
+on_vm sudo at-stow install --no-input --set INGEST_POSTURE=enforce >"$WORK/posture.txt" 2>&1 || { cat "$WORK/posture.txt"; fail "the re-run picking the enforce table"; }
+on_vm sudo nft list table inet ingest >"$WORK/ingest.txt" && grep -q 'tcp dport 9 ' "$WORK/ingest.txt" || { cat "$WORK/ingest.txt"; fail "ingest's table is not the enforce posture's after the re-run"; }
+
 step "on metal: each NIC named by its role from its MAC, the edge's lease neither the default route nor the host's name, its policy routing, the tun device's route once opened; the firewall opens the front on uplink alone and the UDP echo on edge alone"
 for r in uplink:$MAC_UPLINK edge:$MAC_EDGE; do
 	[[ $(on_vm cat "/sys/class/net/${r%%:*}/address") == "${r#*:}" ]] || { on_vm ip -o link; fail "no NIC ${r%%:*} of MAC ${r#*:}"; }

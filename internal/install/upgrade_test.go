@@ -1801,3 +1801,98 @@ func TestAnUpgradeRefusesCoresTheHostLacks(t *testing.T) {
 		t.Errorf("an engine answering garbled: %v", err)
 	}
 }
+
+// An upgrade asks again an input picking a table whose recorded value the release has no file
+// for (a non-interactive one takes its default), and the rollback takes the previous value back,
+// which the previous release has a file for.
+func TestARollbackTakesBackAPickTheUpgradeAskedAgain(t *testing.T) {
+	t.Parallel()
+	picks := func(values ...string) (func(*spec.Spec), payload.Files) {
+		nft := spec.NftTable{Input: "POSTURE", Files: map[string]string{}}
+		files := payload.Files{}
+		for _, v := range values {
+			nft.Files[v] = v + ".nft"
+			files[payload.NftablesDir+"web/"+v+".nft"] = []byte("table inet web {\n}\n")
+		}
+		return func(s *spec.Spec) {
+			s.Inputs = append(s.Inputs, spec.Input{Key: "POSTURE", Default: values[0]})
+			if s.Services == nil {
+				s.Services = map[string]spec.Service{}
+			}
+			svc := s.Services["web"]
+			svc.Nftables = nft
+			s.Services["web"] = svc
+		}, files
+	}
+	e := newEnv(t)
+	e.docker.dump = "DUMP"
+	e.schemaAt("5", nil, true)
+	mod, files := picks("strict", "observe")
+	e.r, e.self = testInstallerKeys(t, "1.0.0", 1, mod, nil, files)
+	if err := e.install(nil); err != nil {
+		t.Fatal(err)
+	}
+	posture := func() string {
+		env, err := ReadEnvFile(filepath.Join(e.dir, envName))
+		if err != nil {
+			t.Fatal(err)
+		}
+		v, _ := env.Get("POSTURE")
+		return v
+	}
+	if v := posture(); v != "strict" {
+		t.Fatalf("installed with %q", v)
+	}
+	mod, files = picks("enforce", "audit")
+	e.r, e.self = testInstallerKeys(t, "2.0.0", 1, mod, nil, files)
+	if err := e.upgrade(nil); err != nil {
+		t.Fatalf("%v\n%s", err, e.log)
+	}
+	if v := posture(); v != "enforce" || !strings.Contains(e.log.String(), `note: POSTURE: the recorded value picks no table of notes 2.0.0: it is given, asked or defaulted again`) ||
+		!strings.Contains(e.log.String(), `warning: POSTURE: the recorded value picks no table of notes 2.0.0, so it is now "enforce"`) {
+		t.Errorf("upgraded with %q, want the release's default, said:\n%s", v, e.log)
+	}
+	e.log.Reset()
+	if err := e.rollback(func(o *Options) { o.DryRun = true }); err != nil || strings.Contains(e.log.String(), "goes back") {
+		t.Errorf("a dry rollback says the posture goes back: %v\n%s", err, e.log)
+	}
+	if err := e.rollback(nil); err != nil {
+		t.Fatalf("%v\n%s", err, e.log)
+	}
+	if v := posture(); v != "strict" || !strings.Contains(e.log.String(), `POSTURE goes back to the value notes 1.0.0 ran with`) {
+		t.Errorf("rolled back with %q, want the previous release's value, said:\n%s", v, e.log)
+	}
+}
+
+// A rollback to a release picking a table by an input the newer release reads as any other takes
+// back the value it ran with, a re-run's change since included.
+func TestARollbackTakesBackAPickOfThePreviousReleaseAlone(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	e.docker.dump = "DUMP"
+	e.schemaAt("5", nil, true)
+	e.r, e.self = testInstallerKeys(t, "1.0.0", 1, func(s *spec.Spec) {
+		s.Inputs = append(s.Inputs, spec.Input{Key: "POSTURE", Default: "strict"})
+		s.Services = map[string]spec.Service{"web": {Nftables: spec.NftTable{Input: "POSTURE", Files: map[string]string{"strict": "s.nft"}}}}
+	}, nil, payload.Files{payload.NftablesDir + "web/strict.nft": []byte("table inet web {\n}\n")})
+	if err := e.install(nil); err != nil {
+		t.Fatal(err)
+	}
+	e.to("2.0.0", func(s *spec.Spec) { s.Inputs = append(s.Inputs, spec.Input{Key: "POSTURE", Default: "strict"}) })
+	if err := e.upgrade(nil); err != nil {
+		t.Fatalf("%v\n%s", err, e.log)
+	}
+	if err := e.install(func(o *Options) { o.Set = map[string]string{"POSTURE": "loose"} }); err != nil {
+		t.Fatalf("%v\n%s", err, e.log)
+	}
+	if err := e.rollback(nil); err != nil {
+		t.Fatalf("%v\n%s", err, e.log)
+	}
+	env, err := ReadEnvFile(filepath.Join(e.dir, envName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v, _ := env.Get("POSTURE"); v != "strict" {
+		t.Errorf("rolled back with %q", v)
+	}
+}

@@ -1,0 +1,21 @@
+# The ingest service's own table, its enforce posture (services.ingest.nftables, INGEST_POSTURE
+# enforce): the observe posture's sets and counters, and the probes' port dropped but from a trusted
+# address. The same sets as the observe posture's: the api feeds probes, each start fills trusted.
+table inet ingest {
+	set probes {
+		type ipv4_addr
+		flags interval
+	}
+
+	set trusted {
+		type ipv4_addr
+		flags interval
+	}
+
+	chain prerouting {
+		type filter hook prerouting priority -150; policy accept;
+		ip saddr @probes counter
+		ip saddr @trusted counter
+		tcp dport 9 ip saddr != @trusted counter drop
+	}
+}

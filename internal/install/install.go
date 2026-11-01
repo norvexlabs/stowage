@@ -2319,6 +2319,9 @@ func (in *Installer) inputList(mode string) []input {
 		if in.setInput(i.Key) {
 			check = chainChecks(check, checkSetElements)
 		}
+		if pick := in.tablePick(i.Key); pick != nil {
+			check = chainChecks(check, pick)
+		}
 		out = append(out, input{i, check, domain})
 	}
 	return out

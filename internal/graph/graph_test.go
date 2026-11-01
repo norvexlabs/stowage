@@ -703,3 +703,29 @@ func TestTheScannerReachesTheRelease(t *testing.T) {
 		t.Errorf("changed = %v", c)
 	}
 }
+
+// Each file of a service's table, an input-picked one's every file included, reaches the
+// installer, which carries them, and no image.
+func TestTheServicesTablesReachTheInstaller(t *testing.T) {
+	t.Parallel()
+	root := testutil.CopyExample(t, "full")
+	base := inputs(build(t, root))
+	for _, e := range []struct{ file, old, new string }{
+		{"deploy/vpn.nft", "table inet vpn {", "table inet vpn {\n\tcomment \"x\""},
+		{"deploy/ingest.nft", "ip saddr @probes counter", "ip saddr @probes counter comment \"x\""},
+		{"deploy/ingest-enforce.nft", "tcp dport 9", "tcp dport 7"},
+	} {
+		testutil.Edit(t, root, e.file, e.old, e.new)
+		now := inputs(build(t, root))
+		c := changed(base, now)
+		if !c["installer"] {
+			t.Errorf("%s: changed = %v", e.file, c)
+		}
+		for id := range c {
+			if strings.HasPrefix(id, "image/") {
+				t.Errorf("%s changed %s", e.file, id)
+			}
+		}
+		base = now
+	}
+}

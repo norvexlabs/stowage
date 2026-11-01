@@ -58,7 +58,7 @@ type networkdFile struct {
 // gatewayDeclared reports whether the release declares what a Docker host applies on consent: a
 // service's nftables table, forwarding between roles, or a tun device.
 func (in *Installer) gatewayDeclared() bool {
-	return len(in.R.Nftables) > 0 || len(in.gatewayRoles()) > 0 || forwards(in.R.Spec.Host)
+	return len(in.R.Tables()) > 0 || len(in.gatewayRoles()) > 0 || forwards(in.R.Spec.Host)
 }
 
 // gatewayRoles are the tun roles, whose whole networkd file a Docker host is given.
@@ -273,8 +273,8 @@ func (in *Installer) gatewayStart(ctx context.Context, get func(string) string) 
 // gatewayWhat names the release's network declarations, for a warning.
 func (in *Installer) gatewayWhat() string {
 	var what []string
-	if len(in.R.Nftables) > 0 {
-		what = append(what, "the services' nftables tables ("+strings.Join(sortedKeys(in.R.Nftables), ", ")+")")
+	if tables := in.R.Tables(); len(tables) > 0 {
+		what = append(what, "the services' nftables tables ("+strings.Join(tables, ", ")+")")
 	}
 	if forwards(in.R.Spec.Host) {
 		what = append(what, "the forwarding between host.interfaces")

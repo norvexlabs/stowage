@@ -1638,7 +1638,13 @@ every shape, the VM end-to-end test upgrading through it), then the health gate.
   the VM replaces whole in one transaction (no doubled rule, no gap) when it is absent or changed,
   leaving the sets a service fed otherwise, a changed one recreating its service so it feeds them
   again, and deletes once the release drops it; the host's own table stays Stowage's, and the app socket feeds only
-  a declared set of a declared table, its elements checked before nft runs. The feeder is often
+  a declared set of a declared table, its elements checked before nft runs. A table of two
+  postures (a default-deny floor, an observe mode that counts and accepts) is one release: an
+  input picks the file, each posture a whole table file judged as one, rather than a template
+  Stowage would render (the general form, a table its image generates, stays deferred). Every
+  file declares the same sets, so the sets route and the inputs that fill them are the table's,
+  whichever posture is loaded; the value is checked where the input is given and again at the
+  start, which loads nothing on a value without a file. The feeder is often
   not the table's service: the socket's token upgrades, reboots and re-addresses the VM, so the
   least-privilege stack gives it to a service its clients do not face, which `feeds` the proxy's
   table. A feeder carries the fed table's load token in its label, so a load recreates it as it

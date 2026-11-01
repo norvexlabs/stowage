@@ -186,6 +186,11 @@ func (in *Installer) Upgrade(ctx context.Context) error {
 	for _, k := range env.Keys() {
 		in.recorded[k], _ = env.Get(k)
 	}
+	for _, i := range added {
+		if _, rec := env.Get(i.Key); rec && in.tablePick(i.Key) != nil {
+			o.logf("note: %s: the recorded value picks no table of %s %s: it is given, asked or defaulted again", i.Key, m.Name, m.ProjectVersion)
+		}
+	}
 	values, err := in.inputs(ctx, added, false)
 	if err != nil {
 		return err
@@ -238,6 +243,14 @@ func (in *Installer) Upgrade(ctx context.Context) error {
 	}
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("stopped before anything changed: %w", err)
+	}
+	// A table's posture the release asked again (its recorded value picks no file of it) is said
+	// once nothing stops the upgrade before its changes: the firewall the start loads changes.
+	for _, i := range added {
+		was, rec := env.Get(i.Key)
+		if now, _ := next.Get(i.Key); rec && in.tablePick(i.Key) != nil && now != was {
+			o.logf("warning: %s: the recorded value picks no table of %s %s, so it is now %q: the table it picks is the one the start loads", i.Key, name, m.ProjectVersion, now)
+		}
 	}
 	if in.crossing != nil {
 		// No release is kept to go back to, nor one left by a rollback: across a baseline neither
@@ -412,11 +425,14 @@ func (in *Installer) coresUpgrade(ctx context.Context) error {
 	return nil
 }
 
-// addedInputs are the inputs of the release in this mode the install does not record.
+// addedInputs are the inputs of the release in this mode the install does not record, and those
+// picking a table whose recorded value the release has no file for: each is given (--set,
+// --answers), asked or defaulted as the release's own.
 func (in *Installer) addedInputs(env *EnvFile, mode string) []input {
 	var added []input
 	for _, i := range in.inputList(mode) {
-		if _, ok := env.Get(i.Key); !ok {
+		v, ok := env.Get(i.Key)
+		if pick := in.tablePick(i.Key); !ok || pick != nil && pick(v) != nil {
 			added = append(added, i)
 		}
 	}
@@ -924,10 +940,19 @@ func (in *Installer) Rollback(ctx context.Context) error {
 		o.logf("%s: what only its spec tells is not checked", pk.foreign())
 	}
 	rolled := NewEnvFile()
+	var postures []string
 	// A value the release sets is the previous release's, or none where it records none (an image
-	// only the newer release has).
+	// only the newer release has); so is an input picking a table the previous release has no file
+	// for (the upgrade asked it again).
 	for _, k := range env.Keys() {
 		v, _ := env.Get(k)
+		// An input picking a table, in either release, takes back its value from before the
+		// upgrade, which the previous release ran: the posture goes back with the release, a
+		// re-run's change since included; said once the rollback is past its checks.
+		if pv, ok := prevEnv.Get(k); ok && pv != v && (in.tablePick(k) != nil || back != nil && back.tablePick(k) != nil) {
+			postures = append(postures, fmt.Sprintf("%s goes back to the value %s %s ran with", k, name, pk.projectVersion()))
+			v = pv
+		}
 		if releaseKey(k) {
 			pv, ok := prevEnv.Get(k)
 			if !ok {
@@ -967,6 +992,9 @@ func (in *Installer) Rollback(ctx context.Context) error {
 	if o.DryRun {
 		o.logf("a run would go back to %s %s (revision %d)", pk.Manifest.Name, st.ProjectVersion, st.Revision)
 		return nil
+	}
+	for _, p := range postures {
+		o.logf("%s", p)
 	}
 	failed := in.path(FailedDir)
 	if err := os.RemoveAll(failed); err != nil {

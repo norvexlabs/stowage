@@ -1509,13 +1509,17 @@ func (l *linter) readInputs() func(spec.Input) bool {
 			inCompose[a.Secret] = true
 		}
 	}
-	// The installer reads the L4 routes' inputs, and the services' addresses of their own.
+	// The installer reads the L4 routes' inputs, the services' addresses of their own, the sets'
+	// inputs and those picking a table.
 	for _, r := range l.s.L4.Routes {
 		inCompose[r.AddressInput], inCompose[r.AllowInput], inCompose[r.BindInput] = true, true, true
 	}
 	for _, svc := range l.s.Services {
 		inCompose[svc.AddressInput] = true
 		for _, k := range svc.Sets {
+			inCompose[k] = true
+		}
+		if k := svc.Nftables.Input; k != "" {
 			inCompose[k] = true
 		}
 	}

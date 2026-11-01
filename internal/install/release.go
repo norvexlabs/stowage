@@ -10,8 +10,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"os/exec"
 	"path"
+	"slices"
 	"strings"
 	"time"
 
@@ -29,8 +31,10 @@ type Release struct {
 	Spec     *spec.Spec // the runtime view
 	Compose  []byte
 	Keys     map[string][]byte // trusted public keys by file name
-	// Nftables are the services' nftables tables (services.<name>.nftables), by service.
+	// Nftables are the services' nftables tables of one file (services.<name>.nftables), by service.
 	Nftables map[string][]byte
+	// NftByInput are the tables an input picks, by service, then by the input's value.
+	NftByInput map[string]map[string][]byte
 	// Pull is the project's pull account, baked in at ship time; nil when the project has none.
 	Pull *payload.Account
 }
@@ -61,32 +65,77 @@ func Load(files payload.Files) (*Release, error) {
 	if s.Short() != m.ShortName {
 		return nil, fmt.Errorf("payload: the spec's short name is %q, the release's %q", s.Short(), m.ShortName)
 	}
-	r := &Release{Manifest: m, Spec: &s, Compose: files[payload.Compose], Keys: payloadKeys(files), Nftables: map[string][]byte{}}
+	r := &Release{Manifest: m, Spec: &s, Compose: files[payload.Compose], Keys: payloadKeys(files),
+		Nftables: map[string][]byte{}, NftByInput: map[string]map[string][]byte{}}
 	for n, b := range files {
 		if t, ok := strings.CutPrefix(n, payload.NftablesDir); ok {
-			name, nft := strings.CutSuffix(t, ".nft")
-			if svc, declared := s.Services[name]; !nft || !declared || svc.Nftables == "" {
-				return nil, fmt.Errorf("payload: %s is no table a service declares (services.<name>.nftables)", n)
+			t, nft := strings.CutSuffix(t, ".nft")
+			name, value, picked := strings.Cut(t, "/")
+			svc, declared := s.Services[name]
+			switch {
+			case !nft || !declared:
+			case !picked && svc.Nftables.File != "":
+				r.Nftables[name] = b
+				continue
+			case picked && svc.Nftables.Files[value] != "" && spec.NftChoice.MatchString(value):
+				if r.NftByInput[name] == nil {
+					r.NftByInput[name] = map[string][]byte{}
+				}
+				r.NftByInput[name][value] = b
+				continue
 			}
-			r.Nftables[name] = b
+			return nil, fmt.Errorf("payload: %s is no table a service declares (services.<name>.nftables)", n)
 		}
 	}
 	// The VM loads each table as root: a table of the project's name would be its own firewall's,
 	// and a body beyond its table (another table, the ruleset flushed) would reach past it.
 	for _, name := range sortedKeys(s.Services) {
-		svc := s.Services[name]
-		if svc.Nftables == "" {
+		t := s.Services[name].Nftables
+		if !t.Set() {
 			continue
 		}
-		body, ok := r.Nftables[name]
-		switch {
-		case name == s.Name || !spec.NftTableName.MatchString(name) || spec.NftKeyword(name):
-			return nil, fmt.Errorf("payload: services.%s.nftables: no table of the project's name (the VM's own firewall's), nor of a name nft does not take", name)
-		case !ok:
-			return nil, fmt.Errorf("payload: services.%s.nftables has no %s%s.nft", name, payload.NftablesDir, name)
+		if (t.File != "") == (t.Input != "") || (t.Input != "") != (len(t.Files) > 0) {
+			return nil, fmt.Errorf("payload: services.%s.nftables: a file, or an input and its files, not both nor either alone", name)
 		}
-		if err := lint.CheckNftTable(string(body), name); err != nil {
-			return nil, fmt.Errorf("payload: services.%s.nftables: %w", name, err)
+		if in, ok := s.Input(t.Input); t.Input != "" && (!ok || in.Advanced || in.Secret || in.When != "" || in.Profile != "" ||
+			len(in.Shapes) > 0 && (s.Shapes.Docker != nil && !slices.Contains(in.Shapes, "docker") || s.Shapes.Kairos != nil && !slices.Contains(in.Shapes, "kairos")) ||
+			in.Default == "" && !in.Required) {
+			return nil, fmt.Errorf("payload: services.%s.nftables.input: %s is no input asked on every install, in the clear", name, t.Input)
+		}
+		if name == s.Name || !spec.NftTableName.MatchString(name) || spec.NftKeyword(name) {
+			return nil, fmt.Errorf("payload: services.%s.nftables: no table of the project's name (the VM's own firewall's), nor of a name nft does not take", name)
+		}
+		bodies := map[string][]byte{}
+		if t.File != "" {
+			body, ok := r.Nftables[name]
+			if !ok {
+				return nil, fmt.Errorf("payload: services.%s.nftables has no %s%s.nft", name, payload.NftablesDir, name)
+			}
+			bodies[""] = body
+		}
+		for _, v := range t.Values() {
+			body, ok := r.NftByInput[name][v]
+			if !ok {
+				return nil, fmt.Errorf("payload: services.%s.nftables.files.%s has no %s%s/%s.nft", name, v, payload.NftablesDir, name, v)
+			}
+			bodies[v] = body
+		}
+		var sets []string
+		for i, v := range sortedKeys(bodies) {
+			got := spec.NftSets(string(bodies[v]))
+			slices.Sort(got)
+			if i == 0 {
+				sets = got
+			} else if !slices.Equal(got, sets) {
+				return nil, fmt.Errorf("payload: services.%s.nftables: its files declare different sets", name)
+			}
+			if err := lint.CheckNftTable(string(bodies[v]), name); err != nil {
+				at := "services." + name + ".nftables"
+				if v != "" {
+					at += ".files." + v
+				}
+				return nil, fmt.Errorf("payload: %s: %w", at, err)
+			}
 		}
 	}
 	if raw, ok := files[payload.Pull]; ok {
@@ -350,3 +399,59 @@ func (r *Release) ImageRef(registryPrefix, key string) string {
 
 // ImageVar is the compose variable that names an image.
 func ImageVar(key string) string { return lint.ImageVar(key) }
+
+// Tables are the services' table names, sorted: of one file, or picked by an input (the release's
+// decoding holds them to the services' nftables).
+func (r *Release) Tables() []string {
+	out := sortedKeys(r.Nftables)
+	for name := range r.NftByInput {
+		if !slices.Contains(out, name) {
+			out = append(out, name)
+		}
+	}
+	slices.Sort(out)
+	return out
+}
+
+// hasTable reports whether the service name has a table.
+func (r *Release) hasTable(name string) bool {
+	_, one := r.Nftables[name]
+	return one || len(r.NftByInput[name]) > 0
+}
+
+// tableSets are the named sets the service's table declares: those of any of its files, as each
+// file of a table an input picks declares the same (lint).
+func (r *Release) tableSets(name string) []string {
+	if b, ok := r.Nftables[name]; ok {
+		return spec.NftSets(string(b))
+	}
+	for _, v := range sortedKeys(r.NftByInput[name]) {
+		return spec.NftSets(string(r.NftByInput[name][v]))
+	}
+	return nil
+}
+
+// TablesNow are the tables a start loads, by service: each of one file, and each an input picks
+// by the value get reads. A value that names none of its files is an error naming the input and
+// the values it takes.
+func (r *Release) TablesNow(get func(string) string) (map[string][]byte, error) {
+	out := maps.Clone(r.Nftables)
+	var errs []error
+	for _, name := range sortedKeys(r.NftByInput) {
+		t := r.Spec.Services[name].Nftables
+		v := get(t.Input)
+		body, ok := r.NftByInput[name][v]
+		if !ok {
+			errs = append(errs, fmt.Errorf("%s: %w", t.Input, pickError(name, t, v)))
+			continue
+		}
+		out[name] = body
+	}
+	return out, errors.Join(errs...)
+}
+
+// pickError is the refusal of value v of the input picking the service's table t; its callers
+// name the input.
+func pickError(name string, t spec.NftTable, v string) error {
+	return fmt.Errorf("%q picks no table of %s (services.%s.nftables.files: %s)", v, name, name, strings.Join(t.Values(), ", "))
+}

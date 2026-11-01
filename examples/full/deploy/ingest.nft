@@ -1,4 +1,5 @@
-# The ingest service's own table (services.ingest.nftables): the VM loads it before the service
+# The ingest service's own table, its observe posture (services.ingest.nftables, INGEST_POSTURE
+# observe): it counts and accepts. The VM loads it before the service
 # starts; the api feeds its probes set through the host daemon's app socket (services.api.feeds),
 # and each start fills its trusted set from an input (services.ingest.sets).
 table inet ingest {

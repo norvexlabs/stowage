@@ -482,12 +482,31 @@ func TestEachRuleFiresOnFull(t *testing.T) {
 		{"service irq", []edit{{sp, "echo: { cpus: 1, irq: on }", "echo: { cpus: 1, irq: maybe }"}}, nil, `services.echo.irq: "maybe": off`},
 		{"service irq without cpus", []edit{{sp, "echo: { cpus: 1, irq: on }", "echo: { irq: on }"}}, nil, "services.echo.irq: is about the service's cores: give it cpus"},
 		{"service of no compose service", []edit{{sp, "echo: { cpus: 1, irq: on }", "echoes: { cpus: 1 }"}}, nil, `services.echoes: service "echoes" is not in deploy/compose.yaml`},
-		{"service nftables table of another name", []edit{{"deploy/ingest.nft", "table inet ingest {", "table inet other {"}}, nil, `services.ingest.nftables: deploy/ingest.nft: does not start with "table inet ingest {"`},
-		{"service nftables beyond its table", []edit{{"deploy/ingest.nft", "\t\tip saddr @probes counter\n", "\t\tip saddr @probes counter\n\t\tinclude \"/etc/x.nft\"\n"}}, nil, "services.ingest.nftables: deploy/ingest.nft: holds an include or names the ruleset"},
-		{"service nftables closing its table in a string", []edit{{"deploy/ingest.nft", "\t\tip saddr @trusted counter\n\t}\n}\n", "\t\tip saddr @probes counter comment \"{\"\n\t}\n}\ndelete table inet atlas\ntable inet ingest { comment \"}\" }\n"}}, nil, "services.ingest.nftables: deploy/ingest.nft: holds something after its table"},
-		{"service nftables after its table", []edit{{"deploy/ingest.nft", "\t\tip saddr @trusted counter\n\t}\n}\n", "\t\tip saddr @trusted counter\n\t}\n}\ntable ip x {}\n"}}, nil, "services.ingest.nftables: deploy/ingest.nft: holds something after its table"},
-		{"service nftables unbalanced", []edit{{"deploy/ingest.nft", "\t\tip saddr @trusted counter\n\t}\n}\n", "\t\tip saddr @probes counter\n\t}\n"}}, nil, "services.ingest.nftables: deploy/ingest.nft: its braces do not balance"},
-		{"service nftables missing", []edit{{sp, "nftables: deploy/ingest.nft", "nftables: deploy/none.nft"}}, nil, "services.ingest.nftables: open "},
+		{"service nftables table of another name", []edit{{"deploy/ingest.nft", "table inet ingest {", "table inet other {"}}, nil, `services.ingest.nftables.files.observe: deploy/ingest.nft: does not start with "table inet ingest {"`},
+		{"service nftables beyond its table", []edit{{"deploy/ingest.nft", "\t\tip saddr @probes counter\n", "\t\tip saddr @probes counter\n\t\tinclude \"/etc/x.nft\"\n"}}, nil, "services.ingest.nftables.files.observe: deploy/ingest.nft: holds an include or names the ruleset"},
+		{"service nftables closing its table in a string", []edit{{"deploy/ingest.nft", "\t\tip saddr @trusted counter\n\t}\n}\n", "\t\tip saddr @probes counter comment \"{\"\n\t}\n}\ndelete table inet atlas\ntable inet ingest { comment \"}\" }\n"}}, nil, "services.ingest.nftables.files.observe: deploy/ingest.nft: holds something after its table"},
+		{"service nftables after its table", []edit{{"deploy/ingest.nft", "\t\tip saddr @trusted counter\n\t}\n}\n", "\t\tip saddr @trusted counter\n\t}\n}\ntable ip x {}\n"}}, nil, "services.ingest.nftables.files.observe: deploy/ingest.nft: holds something after its table"},
+		{"service nftables unbalanced", []edit{{"deploy/ingest.nft", "\t\tip saddr @trusted counter\n\t}\n}\n", "\t\tip saddr @probes counter\n\t}\n"}}, nil, "services.ingest.nftables.files.observe: deploy/ingest.nft: its braces do not balance"},
+		{"service nftables missing", []edit{{sp, "nftables: deploy/vpn.nft", "nftables: deploy/none.nft"}}, nil, "services.vpn.nftables: open "},
+		{"service nftables of one file beyond its table", []edit{{"deploy/vpn.nft", "table inet vpn {", "table inet other {"}}, nil, `services.vpn.nftables: deploy/vpn.nft: does not start with "table inet vpn {"`},
+		{"a picked table's file missing", []edit{{sp, "enforce: deploy/ingest-enforce.nft", "enforce: deploy/none.nft"}}, nil, "services.ingest.nftables.files.enforce: open "},
+		{"a picked table's value", []edit{{sp, "enforce: deploy/ingest-enforce.nft", "-enforce: deploy/ingest-enforce.nft"}}, nil, "services.ingest.nftables.files.-enforce: not a value naming a table's file"},
+		{"a picked table's sets", []edit{{"deploy/ingest-enforce.nft", "	set trusted {", "	set allowed {"}}, nil, "services.ingest.nftables.files: its files declare different sets (enforce: [allowed probes], observe: [probes trusted])"},
+		{"a picked table's input of a set", []edit{{sp, "input: INGEST_POSTURE,", "input: TRUSTED_PROBES,"}}, nil, "services.ingest.nftables.input: TRUSTED_PROBES is also services.ingest.sets.trusted's: an input picking a table picks it alone"},
+		{"a picked table's input of a forward_auth", []edit{{sp, "input: INGEST_POSTURE,", "input: AUTH_URI,"}}, nil, "services.ingest.nftables.input: AUTH_URI is also front.routes["},
+		{"a picked table's input of a service's address", []edit{{sp, "input: INGEST_POSTURE,", "input: RELAY_ADDRESS,"}}, nil, "services.ingest.nftables.input: RELAY_ADDRESS is also services.relay.address_input"},
+		{"a picked table's input of an L4 route", []edit{{sp, "input: INGEST_POSTURE,", "input: ECHO_SOURCES,"}}, nil, "services.ingest.nftables.input: ECHO_SOURCES is also l4.routes["},
+		{"a picked table's input of an extension", []edit{{sp, "input: INGEST_POSTURE,", "input: SEARCH_URL,"}}, nil, "services.ingest.nftables.input: SEARCH_URL is also extensions[0]'s"},
+		{"a picked table's advanced input", []edit{{sp, `default: observe, shapes: [docker, kairos] }`, `advanced: true, shapes: [docker, kairos] }`}}, nil, "services.ingest.nftables.input: INGEST_POSTURE is advanced, never asked nor recorded"},
+		{"a picked table's input with a profile", []edit{{sp, `default: observe, shapes: [docker, kairos] }`, `default: observe, profile: probes, shapes: [docker, kairos] }`}}, nil, "services.ingest.nftables.input: INGEST_POSTURE is asked only with the profile probes: the table loads on every install"},
+		{"a picked table's input", []edit{{sp, "input: INGEST_POSTURE,", "input: NO_SUCH,"}}, nil, "services.ingest.nftables.input: NO_SUCH is not an input"},
+		{"a picked table's secret input", []edit{{sp, `default: observe, shapes: [docker, kairos] }`, `default: observe, secret: true, shapes: [docker, kairos] }`}}, nil, "services.ingest.nftables.input: INGEST_POSTURE is secret"},
+		{"a picked table's input in one mode", []edit{{sp, `default: observe, shapes: [docker, kairos] }`, `default: observe, when: tls, shapes: [docker, kairos] }`}}, nil, "services.ingest.nftables.input: INGEST_POSTURE is asked only when tls"},
+		{"a picked table's input on one shape", []edit{{sp, `default: observe, shapes: [docker, kairos] }`, `default: observe, shapes: [docker] }`}}, nil, "services.ingest.nftables.input: INGEST_POSTURE must be asked on every shape"},
+		{"a picked table's default", []edit{{sp, `default: observe, shapes: [docker, kairos] }`, `default: count, shapes: [docker, kairos] }`}}, nil, `services.ingest.nftables.input: INGEST_POSTURE's default "count" picks no table (one of enforce, observe)`},
+		{"a picked table's input without a value", []edit{{sp, `default: observe, shapes: [docker, kairos] }`, `shapes: [docker, kairos] }`}}, nil, "services.ingest.nftables.input: INGEST_POSTURE has no default and is not required: an empty value picks no table (one of enforce, observe)"},
+		{"a picked table without files", []edit{{sp, "files: { observe: deploy/ingest.nft, enforce: deploy/ingest-enforce.nft } }", "files: {} }"}}, nil, "a table an input picks names its input and a file by each of its values"},
+		{"a picked table's unknown key", []edit{{sp, "{ input: INGEST_POSTURE,", "{ inputs: INGEST_POSTURE,"}}, nil, "field inputs not found in a table an input picks (input, files)"},
 		{"service interface without its input", []edit{{sp, "{ interface: edge, address_input: RELAY_ADDRESS }", "{ interface: edge }"}}, nil, "services.relay: interface and address_input go together"},
 		{"service interface not a NIC", []edit{{sp, "{ interface: edge, address_input: RELAY_ADDRESS }", "{ interface: vpn0, address_input: RELAY_ADDRESS }"}}, nil, `services.relay.interface: "vpn0" is not a NIC of host.interfaces`},
 		{"service address input unknown", []edit{{sp, "address_input: RELAY_ADDRESS }", "address_input: NOPE }"}}, nil, "services.relay.address_input: NOPE is not an input"},
@@ -985,7 +1004,7 @@ func TestStartFirstWarnings(t *testing.T) {
 		t.Fatalf("findings: %+v", res.Findings)
 	}
 	testutil.Edit(t, root, composeFile, "      test: [\"CMD\", \"atlas-server\", \"probe\", \"8080\"]\n", "")
-	testutil.Edit(t, root, specFile, "ingest: { nftables: deploy/ingest.nft,", "ingest: { nftables: deploy/ingest.nft, update: start-first,")
+	testutil.Edit(t, root, specFile, "ingest: { nftables: {", "ingest: { update: start-first, nftables: {")
 	if res := run(t, root); !warned(res, "ingest's healthcheck sets no test") {
 		t.Fatalf("findings: %+v", res.Findings)
 	}
@@ -1822,7 +1841,7 @@ const memShares = `services:                                                    
 // servicesBlock is examples/full's whole services block: its memory shares, then the services' cores,
 // nftables table and address of their own.
 const servicesBlock = memShares + `  echo: { cpus: 1, irq: on }                                   # a whole core of its own, the NICs' interrupts on it too
-  ingest: { nftables: deploy/ingest.nft, sets: { trusted: TRUSTED_PROBES } }   # its own nftables table, loaded on the VM; its trusted set filled from an input at each start
+  ingest: { nftables: { input: INGEST_POSTURE, files: { observe: deploy/ingest.nft, enforce: deploy/ingest-enforce.nft } }, sets: { trusted: TRUSTED_PROBES } }   # its own nftables table, loaded on the VM, the input picking which; its trusted set filled from an input at each start
   relay: { interface: edge, address_input: RELAY_ADDRESS }     # an address of its own on the edge NIC (an ipvlan network)
   vpn: { host_network: true, nftables: deploy/vpn.nft, transparent: [vpn0], front_hosts: host-gateway }   # on the host's network; its table steers vpn0's traffic to its own sockets; the front's domains at Docker's host-gateway address
 `

@@ -10,6 +10,11 @@ follow [SemVer](https://semver.org/).
   reports it `n/a` and the start no longer warns; `vm create` makes it only when `--interface`
   names it, so a cloud VM takes such a release with its one NIC.
 
+- A service's nftables table picked by an input: `nftables: { input: KEY, files: { <value>:
+  <file> } }`, each file a table of the same sets, the value checked as it is given and at each
+  start, a re-run with another value loading the other table (a default-deny floor and an
+  observe mode, one release).
+
 ### Fixed
 - A VM of more than one NIC role no longer lets each NIC answer ARP for every address of the VM
   (a client on a shared L2 could reach a role's address on the wrong NIC, its per-interface rules
