@@ -185,9 +185,11 @@ func TestEachRuleFiresOnFull(t *testing.T) {
 		{"audit unsigned", []edit{{sp, "provider: cosign-key\n  key: env://ATLAS_SIGNING_KEY", "provider: none\n  key: env://ATLAS_SIGNING_KEY"}}, nil, "audit: a project that signs no release"},
 		{"audit fail_on", []edit{{sp, "fail_on: critical", "fail_on: none"}}, nil, `audit.fail_on: "none": one of negligible`},
 		{"audit allow missing", []edit{{sp, "allow: audit-allow.yaml", "allow: no-such.yaml"}}, nil, "audit.allow: no-such.yaml:"},
-		{"audit allow reason", []edit{{"audit-allow.yaml", "  reason: the Go standard library in Ubuntu", "  reasons: the Go standard library in Ubuntu"}}, nil, "audit.allow: audit-allow.yaml: yaml: unmarshal errors"},
-		{"audit allow date", []edit{{"audit-allow.yaml", "no Ubuntu build with the fix yet\n  expires: 2027-01-31", "no Ubuntu build with the fix yet\n  expires: 2027-02-30"}}, nil, `expires "2027-02-30": a date`},
-		{"audit allow forever", []edit{{"audit-allow.yaml", "no Ubuntu build with the fix yet\n  expires: 2027-01-31", "no Ubuntu build with the fix yet\n  expires: 2099-01-01"}}, nil, "expires 2099-01-01: more than a year ahead"},
+		{"audit allow reason", []edit{{"audit-allow.yaml", "  reason: Kairos 4.4.0", "  reasons: Kairos 4.4.0"}}, nil, "audit.allow: audit-allow.yaml: yaml: unmarshal errors"},
+		{"audit allow date", []edit{{"audit-allow.yaml", "no Kairos release with the fix yet\n  expires: 2027-01-31", "no Kairos release with the fix yet\n  expires: 2027-02-30"}}, nil, `expires "2027-02-30": a date`},
+		{"audit allow artifact", []edit{{"audit-allow.yaml", "- id: GO-2026-6604\n  artifact: os", "- id: GO-2026-6604\n  artifact: osx"}}, nil, `audit.allow: audit-allow.yaml: allowance GO-2026-6604 in osx (package stdlib) (path /usr/bin/pebble): artifact "osx" is no artifact of the release: one of api, ingest, postgres, provision, ui, os, front, backup, chown, audit, installer, or "*"`},
+		{"audit allow path", []edit{{"audit-allow.yaml", "path: /system/installer/kairos-installer", "path: system/installer/kairos-installer"}}, nil, `path "system/installer/kairos-installer": an absolute, clean path`},
+		{"audit allow forever", []edit{{"audit-allow.yaml", "no Kairos release with the fix yet\n  expires: 2027-01-31", "no Kairos release with the fix yet\n  expires: 2099-01-01"}}, nil, "expires 2099-01-01: more than a year ahead"},
 		{"add_hosts name", []edit{{sp, "packages.atlas.test: [", "Packages.atlas.test: ["}}, nil, `images.api.add_hosts: "Packages.atlas.test" is not a host name`},
 		{"add_hosts address", []edit{{sp, "[192.0.2.10, 192.0.2.11]", "[192.0.2.10, 192.0.2]"}}, nil, `images.api.add_hosts.packages.atlas.test[1]: "192.0.2" is not an IP address without a zone`},
 		{"add_hosts zone", []edit{{sp, "[192.0.2.10, 192.0.2.11]", "[fe80::1%eth0]"}}, nil, `"fe80::1%eth0" is not an IP address without a zone`},
@@ -1516,6 +1518,7 @@ func TestL4AllowlistWithoutKairosWarns(t *testing.T) {
 	t.Parallel()
 	root := testutil.CopyExample(t, "full")
 	testutil.Edit(t, root, specFile, "  kairos:\n    base: ubuntu:26.04@sha256:c098726dd9b9733f3e885f8de0ef375206a311b0a317eadc40d347b1115fb944\n    kairos_init: quay.io/kairos/kairos-init:v4.4.0@sha256:eb131bd9b4ed5b9b25cf761af9afa7d462bef27c2d0e9453ce884cf7733a6556\n    disk_formats: [raw, qcow2, ova, vhd, gce, iso]\n    cloud_publish: [aws, azure, gcp]\n    disks: opt-in   # always: every ship publishes the disks; opt-in (the default): a ship asked to (--disks)\n    health_gate: { deadline_s: 600, deadline_after_reset_s: 1800, poll_s: 30 }\n    host_api: [api]\n    "+vmSizeLine+"   # vm create's least and default size\n", "")
+	testutil.Write(t, root, "audit-allow.yaml", "") // its entries are the OS bundle's, which the release no longer carries
 	res := run(t, root)
 	if errs := errorsOf(res); len(errs) > 0 {
 		t.Fatalf("errors:\n%s", strings.Join(errs, "\n"))
@@ -2160,6 +2163,53 @@ func TestAVMsDataVolumesWithoutABackupAreWarned(t *testing.T) {
 		warned := slices.ContainsFunc(res.Findings, func(f Finding) bool { return strings.Contains(f.Message, want) })
 		if warned == backup {
 			t.Errorf("backup %v: findings %+v", backup, res.Findings)
+		}
+	}
+}
+
+// TestAuditAllowNotice: lint warns of an allowance expired, and of one ending within the notice,
+// on both sides of each boundary; an artifact a disk names is refused (a disk's findings are its
+// bundle's), an image key and "*" are not.
+func TestAuditAllowNotice(t *testing.T) {
+	t.Parallel()
+	// now is 2026-10-08 12:00 UTC: an allowance holds through its last day; the notice is 30 days.
+	for _, c := range []struct{ expires, want string }{
+		{"2026-10-07", "expired on 2026-10-07"},
+		{"2026-10-08", "expires on 2026-10-08, within 30 days"},
+		{"2026-11-06", "expires on 2026-11-06, within 30 days"},
+		{"2026-11-07", ""},
+	} {
+		root := testutil.CopyExample(t, "full")
+		testutil.Edit(t, root, "audit-allow.yaml", "no Kairos release with the fix yet\n  expires: 2027-01-31", "no Kairos release with the fix yet\n  expires: "+c.expires)
+		res, err := Run(root, filepath.Join(root, specFile), now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var warns []string
+		for _, f := range res.Findings {
+			if f.Severity == Warning && f.Where == "audit.allow" {
+				warns = append(warns, f.String())
+			}
+		}
+		switch {
+		case c.want == "" && len(warns) > 0:
+			t.Errorf("%s: warned %q", c.expires, warns)
+		case c.want != "" && (len(warns) != 1 || !strings.Contains(warns[0], "allowance GHSA-cxf3-9h37-7rr8 in os (package github.com/labstack/echo/v5) (path /system/installer/kairos-installer) "+c.want)):
+			t.Errorf("%s: %q, want %q", c.expires, warns, c.want)
+		}
+		if errs := errorsOf(res); len(errs) > 0 {
+			t.Errorf("%s: %q", c.expires, errs)
+		}
+	}
+	for art, ok := range map[string]bool{"disk-raw": false, "disk": false, "release": false, "api": true, "\"*\"": true, "front": true} {
+		root := testutil.CopyExample(t, "full")
+		testutil.Edit(t, root, "audit-allow.yaml", "- id: GO-2026-6604\n  artifact: os", "- id: GO-2026-6604\n  artifact: "+art)
+		res, err := Run(root, filepath.Join(root, specFile), now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if errs := errorsOf(res); (len(errs) == 0) != ok {
+			t.Errorf("artifact %s: %q", art, errs)
 		}
 	}
 }

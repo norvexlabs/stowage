@@ -245,6 +245,12 @@ func (s Scanner) Import(ctx context.Context) error {
 
 // Scan matches doc against the database: its findings, and when the database was built.
 func (s Scanner) Scan(ctx context.Context, doc []byte) ([]Finding, string, error) {
+	// The files the document names are read first: one that does not decode is refused before
+	// grype runs.
+	ev, err := Evidence(doc)
+	if err != nil {
+		return nil, "", err
+	}
 	if err := os.MkdirAll(filepath.Join(s.Cache, "tmp"), 0o700); err != nil {
 		return nil, "", err
 	}
@@ -266,11 +272,15 @@ func (s Scanner) Scan(ctx context.Context, doc []byte) ([]Finding, string, error
 	if out.over {
 		return nil, "", fmt.Errorf("grype: an answer of more than %d bytes", MaxReport)
 	}
-	return ParseGrype(out.Bytes())
+	return ParseGrype(out.Bytes(), ev)
 }
 
-// ParseGrype reads grype's JSON answer: its findings, sorted, and when its database was built.
-func ParseGrype(raw []byte) ([]Finding, string, error) {
+// ParseGrype reads grype's JSON answer: its findings, sorted, and when its database was built. ev
+// (Evidence of the scanned document) gives each finding the file its package was found in: a
+// package found in several files (one module in two binaries, as one SPDX package or two) is a
+// finding per file, so an allowance naming one file never accepts another's. Identical matches
+// are one.
+func ParseGrype(raw []byte, ev map[string][]string) ([]Finding, string, error) {
 	var g struct {
 		Matches []struct {
 			Vulnerability struct {
@@ -281,6 +291,7 @@ func ParseGrype(raw []byte) ([]Finding, string, error) {
 				} `json:"fix"`
 			} `json:"vulnerability"`
 			Artifact struct {
+				ID      string `json:"id"`
 				Name    string `json:"name"`
 				Version string `json:"version"`
 				Type    string `json:"type"`
@@ -299,11 +310,40 @@ func ParseGrype(raw []byte) ([]Finding, string, error) {
 	}
 	out := make([]Finding, 0, len(g.Matches))
 	for _, m := range g.Matches {
-		out = append(out, Finding{ID: m.Vulnerability.ID, Severity: ParseSeverity(m.Vulnerability.Severity),
-			Package: m.Artifact.Name, Version: m.Artifact.Version, Type: m.Artifact.Type, Fixed: m.Vulnerability.Fix.Versions})
+		f := Finding{ID: m.Vulnerability.ID, Severity: ParseSeverity(m.Vulnerability.Severity),
+			Package: m.Artifact.Name, Version: m.Artifact.Version, Type: m.Artifact.Type, Fixed: m.Vulnerability.Fix.Versions}
+		paths := ev[m.Artifact.ID]
+		if len(paths) == 0 {
+			out = append(out, f)
+		}
+		for _, p := range paths {
+			f.Path = p
+			out = append(out, f)
+		}
 	}
 	sortFindings(out)
-	return slices.CompactFunc(out, func(a, b Finding) bool {
-		return a.ID == b.ID && a.Package == b.Package && a.Version == b.Version && a.Type == b.Type
-	}), g.Descriptor.DB.Status.Built, nil
+	// The same match more than once (from two of grype's namespaces) is one finding, at the
+	// highest severity any gives (the first, as sorted) and fixed by every version any names, each
+	// once, in the matches' sorted order (never compared as versions): a fix one of them knows is
+	// never dropped.
+	type key struct{ id, pkg, version, typ, path string }
+	at := map[key]int{}
+	merged := make([]Finding, 0, len(out))
+	for _, f := range out {
+		k := key{f.ID, f.Package, f.Version, f.Type, f.Path}
+		i, seen := at[k]
+		if !seen {
+			i = len(merged)
+			at[k] = i
+			first := f
+			first.Fixed = nil
+			merged = append(merged, first)
+		}
+		for _, v := range f.Fixed {
+			if !slices.Contains(merged[i].Fixed, v) {
+				merged[i].Fixed = append(merged[i].Fixed, v)
+			}
+		}
+	}
+	return merged, g.Descriptor.DB.Status.Built, nil
 }

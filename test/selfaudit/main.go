@@ -131,6 +131,9 @@ func run(ctx context.Context, bin, allowFile, db, cache string) error {
 	}
 	p := sbom.Policy{FailOn: sbom.High, On: true, FixableOnly: true, Allow: allow}
 	g := rep.Judge(p, now)
+	for _, n := range g.Accepted() {
+		fmt.Fprintln(os.Stderr, "accepted:", n)
+	}
 	for _, n := range g.Notes() {
 		fmt.Fprintln(os.Stderr, "note:", n)
 	}

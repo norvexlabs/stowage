@@ -145,7 +145,8 @@ a self-review against the code it describes is enough. Every other commit clears
    `pins.sh`, `sweep.sh`: e2e, e2e-docker, e2e-full, e2e-stateless, e2e-k8s, e2e-full-k8s); `go.mod`/`go.sum`
    run every suite but e2e-full-vm; `internal/sbom` (the SBOMs, the scanner, the audits) runs
    e2e, the lifecycle suites (e2e-docker, e2e-full, e2e-stateless, e2e-k8s, e2e-full-k8s),
-   e2e-kairos and e2e-vm; `internal/tune` the lifecycle suites and e2e-vm, its `modules.go`
+   e2e-kairos and e2e-vm, its `policy.go` (the release gate's allowances, `ship`'s alone) e2e,
+   the lifecycle suites and e2e-full-vm (the one shipping `examples/full`'s OS bundle); `internal/tune` the lifecycle suites and e2e-vm, its `modules.go`
    e2e-full-vm alone, its `host.go`, `packages.go` (the firmware), `interfaces.go`, `ethtool.go` and `cores.go` e2e-full-vm too; `internal/install`'s `nftables*.go`, `ipvlan*.go` and `cpus*.go` (a service's table, address and cores) smoke-install, the lifecycle suites and e2e-full-vm (e2e-vm's project declares a kernel argument and a package); `internal/install/audit.go` smoke-install, the lifecycle suites and the VM's
    (e2e-kairos, e2e-vm);
    `Dockerfile`/`Makefile` the suites but e2e-kairos, e2e-vm and e2e-full-vm; a `_test.go` file none (`make

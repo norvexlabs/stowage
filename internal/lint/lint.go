@@ -352,11 +352,30 @@ func (l *linter) audit() {
 		return
 	}
 	doc, err := os.ReadFile(spec.Path(l.root, a.Allow))
+	var allow []sbom.Allowance
 	if err == nil {
-		_, err = sbom.ParseAllowances(doc, l.now)
+		allow, err = sbom.ParseAllowances(doc, l.now)
 	}
 	if err != nil {
 		l.errf("audit.allow", "%s: %v", a.Allow, err)
+		return
+	}
+	// The artifacts a release can carry: the project's images, the OS bundle with the kairos
+	// shape, and what Stowage supplies. A disk's findings are its bundle's (os).
+	known := slices.Sorted(maps.Keys(l.s.Images))
+	if l.s.Shapes.Kairos != nil {
+		known = append(known, "os")
+	}
+	known = append(known, sbom.StowageSubjects...)
+	for _, e := range allow {
+		switch {
+		case e.Artifact != "*" && !slices.Contains(known, e.Artifact):
+			l.errf("audit.allow", "%s: allowance %s: artifact %q is no artifact of the release: one of %s, or \"*\"", a.Allow, e, e.Artifact, strings.Join(known, ", "))
+		case !e.Holds(l.now):
+			l.warnf("audit.allow", "%s: allowance %s expired on %s: the finding counts again; renew it, fix the finding, or remove it", a.Allow, e, e.Expires)
+		case !e.Holds(l.now.Add(sbom.ExpiryNotice)):
+			l.warnf("audit.allow", "%s: allowance %s expires on %s, within %d days: renew it or fix the finding before then", a.Allow, e, e.Expires, int(sbom.ExpiryNotice.Hours()/24))
+		}
 	}
 }
 

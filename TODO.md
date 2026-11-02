@@ -39,12 +39,13 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
 ## Should
 
 - **The OS bundle carries upstream binaries with fixable criticals no rebuild clears yet**: Docker's
-  latest `containerd`, `ctr` and `docker-compose` (golang.org/x/net 0.58), Ubuntu 26.04's `pebble`
-  (Go 1.27.1) and Kairos 4.4.0's `kairos-installer` (labstack/echo 5.3.1). `examples/full`'s
-  `audit-allow.yaml` accepts GO-2026-6612 and GO-2026-6604 in `os` until 2027-01-31; every
-  project with the kairos shape and `audit` needs the same until Docker, Ubuntu and Kairos ship
-  fixed builds. Before then: check for fixed releases, then remove the allowances (or rebuild
-  those binaries in the bundle's recipe if upstream stays behind).
+  latest `containerd`, `containerd-shim-runc-v2`, `ctr`, `runc` and `docker-compose`
+  (golang.org/x/net 0.55–0.58), Ubuntu 26.04's `pebble` (Go 1.27.1) and Kairos 4.4.0's
+  `kairos-installer` (labstack/echo 5.3.1). `examples/full`'s `audit-allow.yaml` accepts
+  GO-2026-6612, GO-2026-6604 and GHSA-cxf3-9h37-7rr8 in `os`, each narrowed to its package and
+  binary, until 2027-01-31; every project with the kairos shape and `audit` needs the same until
+  Docker, Ubuntu and Kairos ship fixed builds. Before then: check for fixed releases, then remove
+  the allowances (or rebuild those binaries in the bundle's recipe if upstream stays behind).
 
 - **`updates` on Docker and Kubernetes**: the VM's `updates` lists what the channel offers after
   the running release, with its changelog; on Docker and Kubernetes an operator learns that a newer
@@ -402,6 +403,21 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
 
 ## Could
 
+- **`lint` accepts an allowance for an image of Stowage's the release does not carry**: the
+  artifacts it accepts include `front`, `backup`, `chown` and `audit` whatever the project
+  declares, so an entry for `front` in a project without a front passes lint and shows only at a
+  ship (`matches no finding`). Deriving them from the spec as `ship` does would close it.
+
+- **grype's database archives kept for a whole gate run**: `test/lib.sh`'s `grype_db` keeps the
+  archive the listing names and the newest other one, which covers one publication of grype's
+  database during a gate run, not two (a long suite still scanning with the archive before both
+  then loses it). Keep each archive a suite of this run named, or delete under a lock.
+
+- **A pre-commit hook running `lint`**: `hook install` writes git's post-commit hook alone; a
+  project wanting `lint`'s allowance checks (an artifact the release cannot carry, an entry
+  expired or ending within 30 days) before a version bump is committed adds its own pre-commit
+  hook running `stowage lint`. `hook install --pre-commit` could write it.
+
 - **`flush_conntrack` marks, leftovers** (review): the sets record is compared as nft text the start wrote, where a digest of
   the elements would not depend on its form.
 
@@ -440,12 +456,6 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
 - **`vm attach` with a wrong `attach=` bridge**: the plan passes, the variables record it, and the
   apply fails; a re-run with the right bridge is refused against the recorded one, and the hint's
   `tofu apply` fails the same way. Let a re-run correct a NIC whose device the state lacks.
-
-- **Parallel suites race on grype's database**: `test/lib.sh`'s `grype_db` deletes every archive
-  but the latest that is over an hour old, so when grype publishes a new database during a gate
-  run, the first suite to fetch it deletes the one another suite is scanning with (`--db: stat …:
-  no such file or directory`, e2e-docker's "audit through the mirror"). Keep the previous archive
-  too (the two newest), or delete under a lock no suite holds.
 
 - **An interrupt that fired once before the boot moved it**: `tune --check` judges a NIC
   interrupt that never fired (`per_cpu_count` all zeros) by the affinity asked, since the kernel

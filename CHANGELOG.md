@@ -3,6 +3,23 @@
 Stowage's own releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
+## [0.26.0]
+
+### Added
+- An entry of the audit gate's `allow` file can be narrowed with `package` and `path`: it then
+  accepts its finding only in that package, found in that file, so an allowance written for one
+  upstream binary no longer accepts the same finding in every binary of the artifact. `ship` says
+  when a refused finding falls outside an entry's package or file, and refuses two entries that
+  can both accept one finding (a whole artifact beside a narrowed entry of the same finding).
+- When grype reports the same vulnerability twice for one package, once with a fix and once
+  without, the audit keeps the fix: the gate no longer passes it as unfixable.
+- `audit` names the file each vulnerable package was found in, where the SBOM says (`in
+  /usr/bin/containerd`; `path` in `--json`); a module found in two binaries is two findings.
+- `ship` lists each allowance it applied: what it accepts, until when, how many findings, and why.
+- `lint` refuses an allowance naming an artifact no release of the project can carry, and warns of one
+  expired or expiring within 30 days, so a commit hook or CI running `lint` catches them before a
+  release.
+
 ## [0.25.0] - 2026-11-02
 
 ### Added

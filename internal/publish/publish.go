@@ -260,6 +260,9 @@ func (p *Publisher) auditGate(ctx context.Context, m *release.Manifest, policy *
 	}
 	rep.Project, rep.Version, rep.Revision, rep.Channel, rep.Tag = m.Name, m.ProjectVersion, m.Revision, m.Channel, m.Tag
 	g := rep.Judge(*policy, p.Now())
+	for _, n := range g.Accepted() {
+		p.logf("audit: %s", n)
+	}
 	for _, n := range g.Notes() {
 		p.logf("audit: %s", n)
 	}

@@ -15,7 +15,7 @@ var policyNow = time.Date(2026, 11, 2, 12, 0, 0, 0, time.UTC)
 
 func TestParseAllowances(t *testing.T) {
 	t.Parallel()
-	ok := "- { id: CVE-1, artifact: front, reason: no fix, expires: 2027-01-31 }\n- { id: CVE-1, artifact: \"*\", reason: r, expires: 2026-12-01 }\n"
+	ok := "- { id: CVE-1, artifact: front, reason: no fix, expires: 2027-01-31 }\n- { id: CVE-2, artifact: \"*\", reason: r, expires: 2026-12-01 }\n"
 	a, err := ParseAllowances([]byte(ok), policyNow)
 	if err != nil || len(a) != 2 || a[0].Artifact != "front" || a[1].Artifact != "*" {
 		t.Fatalf("%+v %v", a, err)
@@ -31,6 +31,22 @@ func TestParseAllowances(t *testing.T) {
 		{"- { id: CVE-1, artifact: front, reason: r }", "a date"},
 		{"- { id: CVE-1, artifact: front, reason: r, expires: 2027-01-01, until: x }", "field until not found"},
 		{"- { id: CVE-1, artifact: front, reason: r, expires: 2027-01-01 }\n- { id: CVE-1, artifact: front, reason: s, expires: 2027-01-02 }", "listed twice"},
+		{"- { id: CVE-1, artifact: os, package: p, path: /a, reason: r, expires: 2027-01-01 }\n- { id: CVE-1, artifact: os, package: p, path: /a, reason: s, expires: 2027-01-02 }", "CVE-1 in os (package p) (path /a) is listed twice (entry 1)"},
+		// A wider entry beside a narrower one of the same id undoes its narrowing, either order.
+		{"- { id: CVE-1, artifact: os, package: p, path: /a, reason: r, expires: 2027-01-01 }\n- { id: CVE-1, artifact: os, reason: s, expires: 2027-01-02 }", "entry 2 (CVE-1 in os) and entry 1 (CVE-1 in os (package p) (path /a)) can both accept one finding"},
+		{"- { id: CVE-1, artifact: \"*\", reason: r, expires: 2027-01-01 }\n- { id: CVE-1, artifact: front, reason: s, expires: 2027-01-02 }", "can both accept one finding"},
+		{"- { id: CVE-1, artifact: os, package: p, reason: r, expires: 2027-01-01 }\n- { id: CVE-1, artifact: os, package: p, path: /a, reason: s, expires: 2027-01-02 }", "can both accept one finding"},
+		{"- { id: CVE-1, artifact: os, path: /a, reason: r, expires: 2027-01-01 }\n- { id: CVE-1, artifact: os, package: p, path: /a, reason: s, expires: 2027-01-02 }", "can both accept one finding"},
+		// Partly overlapping: one narrowed by file, the other by package, both match p in /a.
+		{"- { id: CVE-1, artifact: os, path: /a, reason: r, expires: 2027-01-01 }\n- { id: CVE-1, artifact: os, package: p, reason: s, expires: 2027-01-02 }", "can both accept one finding"},
+		{"- { id: CVE-1, artifact: \"*\", path: /a, reason: r, expires: 2027-01-01 }\n- { id: CVE-1, artifact: os, package: p, path: /b, reason: s, expires: 2027-01-02 }\n- { id: CVE-1, artifact: os, package: p, reason: s, expires: 2027-01-02 }", "entry 3"},
+		{"- { id: CVE-1, artifact: os, package: \" p\", reason: r, expires: 2027-01-01 }", "without spaces around it"},
+		{"- { id: \"CVE-1 \", artifact: os, reason: r, expires: 2027-01-01 }", "id and artifact are written without spaces around them"},
+		{"- { id: CVE-1, artifact: \" os\", reason: r, expires: 2027-01-01 }", "id and artifact are written without spaces around them"},
+		{"- { id: CVE-1, artifact: os, path: usr/bin/ctr, reason: r, expires: 2027-01-01 }", "an absolute, clean path"},
+		{"- { id: CVE-1, artifact: os, path: /usr/bin/../bin/ctr, reason: r, expires: 2027-01-01 }", "an absolute, clean path"},
+		{"- { id: CVE-1, artifact: os, path: /usr/bin/, reason: r, expires: 2027-01-01 }", "an absolute, clean path"},
+		{"- { id: CVE-1, artifact: os, path: \"/usr/bin/ctr \", reason: r, expires: 2027-01-01 }", "an absolute, clean path"},
 		// A year and a day ahead (2026-11-02 + 366 days ends on 2027-11-03): the last day allowed,
 		// then one more.
 		{"- { id: CVE-1, artifact: front, reason: r, expires: 2027-11-04 }", "more than a year ahead"},
@@ -41,6 +57,112 @@ func TestParseAllowances(t *testing.T) {
 	}
 	if _, err := ParseAllowances([]byte("- { id: CVE-1, artifact: front, reason: r, expires: 2027-11-02 }"), policyNow); err != nil {
 		t.Errorf("a year ahead: %v", err)
+	}
+	// One id in one artifact, narrowed to a package in two files, another package, and the same id
+	// in another artifact whole: none accepts what another does.
+	narrowed := "- { id: CVE-1, artifact: os, package: p, path: /usr/bin/ctr, reason: r, expires: 2027-01-01 }\n- { id: CVE-1, artifact: os, package: p, path: /usr/bin/runc, reason: r, expires: 2027-01-01 }\n" +
+		"- { id: CVE-1, artifact: os, package: q, reason: r, expires: 2027-01-01 }\n- { id: CVE-1, artifact: api, reason: r, expires: 2027-01-01 }\n"
+	if a, err := ParseAllowances([]byte(narrowed), policyNow); err != nil || len(a) != 4 || a[0].Package != "p" || a[0].Path != "/usr/bin/ctr" {
+		t.Errorf("narrowed entries: %+v %v", a, err)
+	}
+}
+
+func TestJudgeNarrowed(t *testing.T) {
+	t.Parallel()
+	net := func(path string) Finding {
+		return Finding{ID: "GO-1", Severity: Critical, Package: "golang.org/x/net", Version: "0.58", Type: "go-module", Fixed: []string{"0.59"}, Path: path}
+	}
+	r := Report{Subjects: []Subject{
+		{Name: "os", Findings: []Finding{net("/usr/bin/containerd"), net("/usr/bin/ctr"), {ID: "GO-1", Severity: Critical, Package: "stdlib", Version: "1.27.1", Type: "go-module", Fixed: []string{"1.27.2"}, Path: "/usr/bin/pebble"}}},
+		{Name: "api", Findings: []Finding{net("")}},
+	}}
+	p := func(a ...Allowance) Policy { return Policy{FailOn: High, On: true, FixableOnly: true, Allow: a} }
+	allow := func(art, pkg, path string) Allowance {
+		return Allowance{ID: "GO-1", Artifact: art, Package: pkg, Path: path, Reason: "upstream", Expires: "2027-01-31"}
+	}
+	for _, c := range []struct {
+		name, want string
+		a          Allowance
+	}{
+		{"the artifact whole", "api/GO-1", allow("os", "", "")},
+		{"its package", "os/GO-1 api/GO-1", allow("os", "golang.org/x/net", "")},
+		{"a file of it", "os/GO-1 os/GO-1 api/GO-1", allow("os", "", "/usr/bin/ctr")},
+		{"the package in that file", "os/GO-1 os/GO-1 api/GO-1", allow("os", "golang.org/x/net", "/usr/bin/ctr")},
+		{"the package, not in that file", "os/GO-1 os/GO-1 os/GO-1 api/GO-1", allow("os", "golang.org/x/net", "/usr/bin/pebble")},
+		{"another package", "os/GO-1 os/GO-1 os/GO-1 api/GO-1", allow("os", "golang.org/x/text", "")},
+		{"a file of no package", "os/GO-1 os/GO-1 os/GO-1 api/GO-1", allow("os", "", "/usr/bin/docker")},
+		{"every artifact's package, one with no file", "os/GO-1", allow("*", "golang.org/x/net", "")},
+		{"every artifact's file: a finding with none is outside", "os/GO-1 os/GO-1 api/GO-1", allow("*", "", "/usr/bin/containerd")},
+	} {
+		if got := ids(r.Judge(p(c.a), policyNow)); got != c.want {
+			t.Errorf("%s: blocked %q, want %q", c.name, got, c.want)
+		}
+	}
+	// Narrowed to one file: the id's findings in the other files count, and the note says why; the
+	// allowance applied is listed with the findings it accepted.
+	g := r.Judge(p(allow("os", "golang.org/x/net", "/usr/bin/ctr"), allow("os", "", "/usr/bin/docker")), policyNow)
+	if len(g.Applied) != 1 || g.Applied[0].Path != "/usr/bin/ctr" || g.Applied[0].Accepted != 1 || g.Allowed != 1 {
+		t.Errorf("applied %+v, allowed %d", g.Applied, g.Allowed)
+	}
+	if len(g.Unused) != 1 || g.Unused[0].Path != "/usr/bin/docker" || len(g.Outside) != 2 || g.Outside[0].Entries != 2 {
+		t.Errorf("unused %+v, outside %+v", g.Unused, g.Outside)
+	}
+	notes := strings.Join(g.Notes(), "\n")
+	for _, want := range []string{
+		"GO-1 in os (golang.org/x/net 0.58 in /usr/bin/containerd) counts: the 2 allowance(s) of it in force are narrowed to other packages or files",
+		"GO-1 in os (stdlib 1.27.1 in /usr/bin/pebble) counts: the 2 allowance(s) of it in force are narrowed to other packages or files",
+		"allowance GO-1 in os (path /usr/bin/docker) matches no finding: correct its package or path",
+	} {
+		if !strings.Contains(notes, want) {
+			t.Errorf("notes %q lack %q", notes, want)
+		}
+	}
+	if strings.Count(notes, "counts: the") != 2 || strings.Contains(notes, "in /usr/bin/ctr) counts") {
+		t.Errorf("the finding an allowance accepted is named as counting: %q", notes)
+	}
+	acc := g.Accepted()
+	if len(acc) != 1 || acc[0] != "allowance GO-1 in os (package golang.org/x/net) (path /usr/bin/ctr) until 2027-01-31 accepts 1 finding(s): upstream" {
+		t.Errorf("accepted %q", acc)
+	}
+	// A narrowed allowance of a finding the policy does not count today (no fix yet) that matches
+	// nothing is unused all the same: a typo'd path is reported whatever the policy counts.
+	nofix := Report{Subjects: []Subject{{Name: "os", Findings: []Finding{{ID: "GO-1", Severity: Critical, Package: "stdlib", Path: "/usr/bin/pebble"}}}}}
+	if g := nofix.Judge(p(allow("os", "stdlib", "/usr/bin/peble")), policyNow); len(g.Unused) != 1 || len(g.Applied) != 0 || len(g.Blocked) != 0 {
+		t.Errorf("a typo'd path of an uncounted finding: %+v", g)
+	}
+	if g := nofix.Judge(p(allow("os", "stdlib", "/usr/bin/pebble")), policyNow); len(g.Unused) != 0 || len(g.Applied) != 1 || g.Applied[0].Accepted != 0 {
+		t.Errorf("an allowance of an uncounted finding is applied, accepting none: %+v", g)
+	}
+	// One narrowed allowance: each finding of its id it does not cover is noted once, naming one.
+	if g := r.Judge(p(allow("os", "", "/usr/bin/ctr")), policyNow); len(g.Outside) != 2 || g.Outside[0].Entries != 1 || g.Outside[1].Entries != 1 {
+		t.Errorf("one narrowed allowance: outside %+v", g.Outside)
+	}
+	// An allowance of the id in another artifact is neither applied nor outside: matches nothing.
+	if g := r.Judge(p(Allowance{ID: "GO-1", Artifact: "web", Reason: "r", Expires: "2027-01-31"}), policyNow); len(g.Unused) != 1 || len(g.Outside) != 0 || len(g.Applied) != 0 {
+		t.Errorf("another artifact: %+v", g)
+	}
+	// An expired narrowed allowance is not named as outside: the expiry note covers it.
+	old := allow("os", "", "/usr/bin/docker")
+	old.Expires = "2026-11-01"
+	if g := r.Judge(p(old), policyNow); len(g.Expired) != 1 || len(g.Outside) != 0 {
+		t.Errorf("expired: %+v", g)
+	}
+	// A refused finding the SBOM names no file for: only an entry without path accepts it.
+	if notes := strings.Join(r.Judge(p(allow("*", "", "/usr/bin/ctr")), policyNow).Notes(), "\n"); !strings.Contains(notes, "GO-1 in api (golang.org/x/net 0.58) counts: the 1 allowance(s) of it in force are narrowed to other packages or files; the SBOM names no file for it, so only an entry without path accepts it") {
+		t.Errorf("notes %q", notes)
+	}
+	// A covering entry narrowed by file to another package: dropping its path would not accept the
+	// finding either, so no word of a file.
+	if notes := strings.Join(r.Judge(p(allow("*", "stdlib", "/usr/bin/ctr")), policyNow).Notes(), "\n"); !strings.Contains(notes, "GO-1 in api (golang.org/x/net 0.58) counts") || strings.Contains(notes, "names no file") {
+		t.Errorf("notes %q", notes)
+	}
+	// Covering entries narrowed by package alone: no word of a file.
+	if notes := strings.Join(r.Judge(p(allow("api", "golang.org/x/text", "")), policyNow).Notes(), "\n"); !strings.Contains(notes, "GO-1 in api (golang.org/x/net 0.58) counts") || strings.Contains(notes, "names no file") {
+		t.Errorf("notes %q", notes)
+	}
+	// The refusal names the files of the finding.
+	if err := r.Judge(p(), policyNow).Err(p()); err == nil || !strings.Contains(err.Error(), "critical GO-1 in os (golang.org/x/net 0.58 in /usr/bin/containerd, fixed in 0.59)") {
+		t.Errorf("%v", err)
 	}
 }
 

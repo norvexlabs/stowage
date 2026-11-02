@@ -117,6 +117,14 @@ for f in "${changed[@]}"; do
 		need e2e-full-k8s "$f"
 		;;
 	internal/kairos/files/* | internal/kairos/Dockerfile.tmpl | internal/kairos/kairos.go | internal/backup/*) vm_side "$f" ;;
+	# The release gate's policy and allowances: ship's alone, which e2e's and the lifecycle suites'
+	# ships pass; e2e-full-vm's is the one that keeps examples/full's kairos shape, so audits its OS
+	# bundle under the allowances narrowed to its upstream binaries. Before internal/sbom/*.
+	internal/sbom/policy.go)
+		need e2e "$f"
+		lifecycle "$f"
+		need e2e-full-vm "$f"
+		;;
 	# The SBOMs ship makes, the scanner a release carries, the audits that read them.
 	internal/sbom/*) # every signed ship of every example makes SBOMs; the audits read them
 		need e2e "$f"

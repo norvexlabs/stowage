@@ -20,35 +20,150 @@ import (
 
 const grypeOut = `{"matches":[
  {"vulnerability":{"id":"CVE-2026-2","severity":"Medium","fix":{"versions":[]}},"artifact":{"name":"zlib","version":"1.3","type":"apk"}},
- {"vulnerability":{"id":"CVE-2026-1","severity":"Critical","fix":{"versions":["3.1"]}},"artifact":{"name":"openssl","version":"3.0","type":"apk"}},
- {"vulnerability":{"id":"CVE-2026-1","severity":"Critical","fix":{"versions":["3.1"]}},"artifact":{"name":"openssl","version":"3.0","type":"apk"}},
+ {"vulnerability":{"id":"CVE-2026-1","severity":"Critical","fix":{"versions":["3.1"]}},"artifact":{"id":"Package-b","name":"openssl","version":"3.0","type":"apk"}},
+ {"vulnerability":{"id":"CVE-2026-1","severity":"Critical","fix":{"versions":["3.1"]}},"artifact":{"id":"Package-a","name":"openssl","version":"3.0","type":"apk"}},
  {"vulnerability":{"id":"GHSA-x","severity":"weird","fix":{}},"artifact":{"name":"lodash","version":"4","type":"npm"}}
 ],"descriptor":{"db":{"status":{"schemaVersion":"v6.1.10","built":"2026-10-25T06:27:34Z","valid":true}}}}`
 
 func TestParseGrype(t *testing.T) {
 	t.Parallel()
-	f, built, err := ParseGrype([]byte(grypeOut))
+	ev := map[string][]string{"Package-a": {"/usr/bin/a"}, "Package-b": {"/usr/bin/b", "/usr/bin/c"}}
+	f, built, err := ParseGrype([]byte(grypeOut), ev)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if built != "2026-10-25T06:27:34Z" || len(f) != 3 {
+	if built != "2026-10-25T06:27:34Z" || len(f) != 5 {
 		t.Fatalf("%s %+v", built, f)
 	}
-	if f[0].ID != "CVE-2026-1" || f[0].Severity != Critical || !slices.Equal(f[0].Fixed, []string{"3.1"}) || f[1].Severity != Medium || f[2].Severity != Unknown {
-		t.Errorf("sorted by severity, duplicates dropped: %+v", f)
+	if f[0].ID != "CVE-2026-1" || f[0].Severity != Critical || !slices.Equal(f[0].Fixed, []string{"3.1"}) || f[3].Severity != Medium || f[4].Severity != Unknown {
+		t.Errorf("sorted by severity: %+v", f)
 	}
-	if _, _, err := ParseGrype([]byte("not json")); err == nil {
+	if f[0].Path != "/usr/bin/a" || f[1].Path != "/usr/bin/b" || f[2].Path != "/usr/bin/c" || f[3].Path != "" {
+		t.Errorf("one finding per file the package was found in (one SPDX package in two files is two), sorted; none where the SBOM says none: %+v", f)
+	}
+	// Without evidence the two matches are the same finding: one.
+	if f, _, err := ParseGrype([]byte(grypeOut), nil); err != nil || len(f) != 3 {
+		t.Errorf("duplicates dropped: %+v %v", f, err)
+	}
+	// The same match three times, at two severities, without a fix then with them: one finding,
+	// at the highest severity, fixed by each version once, in the matches' sorted order.
+	two := `{"matches":[
+ {"vulnerability":{"id":"CVE-9","severity":"Critical","fix":{"versions":[]}},"artifact":{"name":"p","version":"1","type":"go-module"}},
+ {"vulnerability":{"id":"CVE-9","severity":"Medium","fix":{"versions":["1.10"]}},"artifact":{"name":"p","version":"1","type":"go-module"}},
+ {"vulnerability":{"id":"CVE-9","severity":"Critical","fix":{"versions":["1.9", "1.10"]}},"artifact":{"name":"p","version":"1","type":"go-module"}}]}`
+	if f, _, err := ParseGrype([]byte(two), nil); err != nil || len(f) != 1 || f[0].Severity != Critical || !slices.Equal(f[0].Fixed, []string{"1.9", "1.10"}) {
+		t.Errorf("a fix one match names is kept: %+v %v", f, err)
+	}
+	if _, _, err := ParseGrype([]byte("not json"), nil); err == nil {
 		t.Error("not JSON passed")
 	}
+}
+
+// spdxDoc is a syft-shaped SPDX document: a Go module found in two binaries, one in a third, a
+// package with no file, and relationships Evidence must pass over.
+const spdxDoc = `{"spdxVersion":"SPDX-2.3",
+ "files":[{"fileName":"usr/bin/containerd","SPDXID":"SPDXRef-File-c"},{"fileName":"/usr/bin/ctr","SPDXID":"SPDXRef-File-t"},{"fileName":"usr/local/../bin/pebble","SPDXID":"SPDXRef-File-p"}],
+ "relationships":[
+  {"spdxElementId":"SPDXRef-Package-net","relatedSpdxElement":"SPDXRef-File-t","relationshipType":"OTHER","comment":"evident-by: indicates the package's existence is evident by the given file"},
+  {"spdxElementId":"SPDXRef-Package-net","relatedSpdxElement":"SPDXRef-File-c","relationshipType":"OTHER","comment":"evident-by: indicates the package's existence is evident by the given file"},
+  {"spdxElementId":"SPDXRef-Package-net","relatedSpdxElement":"SPDXRef-File-c","relationshipType":"OTHER","comment":"evident-by: twice"},
+  {"spdxElementId":"SPDXRef-Package-std","relatedSpdxElement":"SPDXRef-File-p","relationshipType":"OTHER","comment":"evident-by: indicates the package's existence is evident by the given file"},
+  {"spdxElementId":"SPDXRef-Package-std","relatedSpdxElement":"SPDXRef-File-c","relationshipType":"CONTAINS"},
+  {"spdxElementId":"SPDXRef-Package-std","relatedSpdxElement":"SPDXRef-File-t","relationshipType":"OTHER","comment":"something else"},
+  {"spdxElementId":"SPDXRef-Package-none","relatedSpdxElement":"SPDXRef-File-missing","relationshipType":"OTHER","comment":"evident-by: x"},
+  {"spdxElementId":"SPDXRef-","relatedSpdxElement":"SPDXRef-File-c","relationshipType":"OTHER","comment":"evident-by: no package"}
+ ]}`
+
+func TestEvidence(t *testing.T) {
+	t.Parallel()
+	ev, err := Evidence([]byte(spdxDoc))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string][]string{"Package-net": {"/usr/bin/containerd", "/usr/bin/ctr"}, "Package-std": {"/usr/bin/pebble"}}
+	if len(ev) != len(want) {
+		t.Fatalf("%v", ev)
+	}
+	for k, w := range want {
+		if !slices.Equal(ev[k], w) {
+			t.Errorf("%s: %v, want %v", k, ev[k], w)
+		}
+	}
+	for _, bad := range []string{"not json", `{"files":[{"fileName":1}]}`, `{"relationships":{}}`} {
+		if ev, err := Evidence([]byte(bad)); err == nil || ev != nil {
+			t.Errorf("%s: %v %v", bad, ev, err)
+		}
+	}
+}
+
+func FuzzEvidence(f *testing.F) {
+	f.Add([]byte(spdxDoc))
+	f.Add([]byte(`{"files":null}`))
+	f.Fuzz(func(t *testing.T, doc []byte) {
+		ev, _ := Evidence(doc)
+		for id, ps := range ev {
+			if !slices.IsSorted(ps) || len(slices.Compact(slices.Clone(ps))) != len(ps) {
+				t.Errorf("%s: not sorted once each: %v", id, ps)
+			}
+			for _, p := range ps {
+				if !strings.HasPrefix(p, "/") || filepath.Clean(p) != p {
+					t.Errorf("%s: %q is not absolute and clean", id, p)
+				}
+			}
+		}
+	})
 }
 
 func FuzzParseGrype(f *testing.F) {
 	f.Add([]byte(grypeOut))
 	f.Add([]byte(`{"matches":null}`))
+	f.Add([]byte(`{"matches":[{"vulnerability":{"id":"X","fix":{"versions":["2","2"]}},"artifact":{"name":"p"}}]}`))
+	f.Add([]byte(`{"matches":[{"vulnerability":{"id":"X","severity":"High","fix":{"versions":["2"]}},"artifact":{"id":"a","name":"p","version":"1"}},{"vulnerability":{"id":"X","severity":"Low","fix":{"versions":["3"]}},"artifact":{"id":"b","name":"p","version":"1"}}]}`))
 	f.Fuzz(func(t *testing.T, raw []byte) {
-		got, _, err := ParseGrype(raw)
+		got, _, err := ParseGrype(raw, map[string][]string{"a": {"/x", "/y"}, "b": {"/y"}})
 		if err != nil {
 			return
+		}
+		type key struct{ id, pkg, version, typ, path string }
+		seen := map[key]bool{}
+		for _, f := range got {
+			k := key{f.ID, f.Package, f.Version, f.Type, f.Path}
+			if seen[k] {
+				t.Errorf("a match twice: %+v", f)
+			}
+			seen[k] = true
+			for i, v := range f.Fixed {
+				if slices.Index(f.Fixed, v) != i {
+					t.Errorf("a version twice: %v", f.Fixed)
+				}
+			}
+		}
+		// Every fix version of every match survives in its finding.
+		var in struct {
+			Matches []struct {
+				Vulnerability struct {
+					ID  string `json:"id"`
+					Fix struct {
+						Versions []string `json:"versions"`
+					} `json:"fix"`
+				} `json:"vulnerability"`
+				Artifact struct {
+					Name    string `json:"name"`
+					Version string `json:"version"`
+				} `json:"artifact"`
+			} `json:"matches"`
+		}
+		if json.Unmarshal(raw, &in) != nil {
+			return
+		}
+		for _, m := range in.Matches {
+			for _, v := range m.Vulnerability.Fix.Versions {
+				if !slices.ContainsFunc(got, func(f Finding) bool {
+					return f.ID == m.Vulnerability.ID && f.Package == m.Artifact.Name && f.Version == m.Artifact.Version && slices.Contains(f.Fixed, v)
+				}) {
+					t.Errorf("fix %s of %s in %s dropped: %+v", v, m.Vulnerability.ID, m.Artifact.Name, got)
+				}
+			}
 		}
 		if !slices.IsSortedFunc(got, func(a, b Finding) int { return int(b.Severity) - int(a.Severity) }) {
 			t.Errorf("not sorted by severity: %+v", got)

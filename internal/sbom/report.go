@@ -63,11 +63,15 @@ type Finding struct {
 	Version  string   `json:"version"`
 	Type     string   `json:"type"`
 	Fixed    []string `json:"fixed_in,omitempty"`
+	// Path is the file the SBOM says the package was found in (a Go module's binary), when it
+	// says: a package found in several files is a finding per file.
+	Path string `json:"path,omitempty"`
 }
 
 func sortFindings(f []Finding) {
 	slices.SortStableFunc(f, func(a, b Finding) int {
-		return cmp.Or(cmp.Compare(b.Severity, a.Severity), cmp.Compare(a.ID, b.ID), cmp.Compare(a.Package, b.Package), cmp.Compare(a.Version, b.Version))
+		return cmp.Or(cmp.Compare(b.Severity, a.Severity), cmp.Compare(a.ID, b.ID), cmp.Compare(a.Package, b.Package), cmp.Compare(a.Version, b.Version),
+			cmp.Compare(a.Type, b.Type), cmp.Compare(a.Path, b.Path))
 	})
 }
 
@@ -184,7 +188,7 @@ func (r Report) Print(w io.Writer) error {
 		if len(x.f.Fixed) > 0 {
 			fixed = "fixed in " + strings.Join(x.f.Fixed, ", ")
 		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s %s (%s)\t%s\n", x.f.Severity, x.subject, x.f.ID, x.f.Package, x.f.Version, x.f.Type, fixed)
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s %s (%s)%s\t%s\n", x.f.Severity, x.subject, x.f.ID, x.f.Package, x.f.Version, x.f.Type, inText(x.f), fixed)
 	}
 	if err := tw.Flush(); err != nil {
 		return err
@@ -239,4 +243,28 @@ func countText(n map[Severity]int) string {
 		return "none"
 	}
 	return strings.Join(parts, ", ")
+}
+
+// Stowage's artifacts in a release: the images Stowage builds from its own recipes (front, backup,
+// chown, audit) and the installer. Every other subject is the project's, the OS bundle and its
+// disks included: the project's pins (shapes.kairos's base and kairos_init) decide what they hold.
+var StowageSubjects = []string{"front", "backup", "chown", Key, "installer"}
+
+// Owner is who fixes a subject's findings: "stowage" for what Stowage supplies, else "project".
+func Owner(subject string) string {
+	if slices.Contains(StowageSubjects, subject) {
+		return "stowage"
+	}
+	return "project"
+}
+
+// Fixable: a fixed version of the package is published.
+func (f Finding) Fixable() bool { return len(f.Fixed) > 0 }
+
+// inText names the file a finding's package was found in, when the SBOM says.
+func inText(f Finding) string {
+	if f.Path == "" {
+		return ""
+	}
+	return " in " + f.Path
 }

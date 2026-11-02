@@ -130,8 +130,9 @@ scanner_fresh() {
 }
 untag_repo() { docker images --format '{{.Repository}}:{{.Tag}}' "$1" | xargs -r docker rmi >/dev/null 2>&1 || true; }
 # grype_db: GRYPE_DB, grype's latest vulnerability database archive, fetched once into the tools
-# cache (older ones removed) and checked against the listing's digest; the audits scan with it
-# (--db), as a site without access to grype's servers does, so no suite fetches its own.
+# cache and checked against the listing's digest; the audits scan with it (--db), as a site without
+# access to grype's servers does, so no suite fetches its own. The two newest archives are kept:
+# a suite in parallel may still scan with the one before a database grype published during the run.
 grype_db() {
 	local dir=$TOOLS/grype-db latest path sum tmp
 	mkdir -p "$dir"
@@ -146,7 +147,9 @@ grype_db() {
 		echo "${sum#sha256:}  $tmp" | sha256sum -c --quiet - || fail "$path: the digest is not $sum"
 		mv -f "$tmp" "$GRYPE_DB"
 	fi
-	find "$dir" -maxdepth 1 -name 'vulnerability-db_*.tar.zst' ! -name "$path" -mmin +60 -delete
+	local old
+	mapfile -t old < <(ls -1t "$dir"/vulnerability-db_*.tar.zst | grep -vxF "$GRYPE_DB" | tail -n +2)
+	((${#old[@]} == 0)) || rm -f -- "${old[@]}"
 }
 
 [[ -x $STOWAGE ]] || fail "$STOWAGE is missing: run make build"
@@ -349,6 +352,18 @@ if kairos != "1":
     while end < len(lines) and lines[end].startswith("    "):
         end += 1
     del lines[k:end]
+    # Without the kairos shape the release carries no OS bundle: its allowances (artifact os) go
+    # too, as lint refuses an artifact the release cannot carry; the others stay.
+    allow = path.rsplit("/", 1)[0] + "/audit-allow.yaml"
+    entries = open(allow).read().split("\n- ")
+    kept = [entries[0]] + [e for e in entries[1:] if "\n  artifact: os\n" not in e]
+    assert len(kept) < len(entries), "no allowance of the OS bundle in " + allow
+    text = "\n- ".join(kept)
+    import re
+    assert not re.search(r"""["']?artifact["']?\s*:\s*["']?os["']?\s*(#|[,}\n])""", text + "\n"), "an os allowance left in " + allow
+    if len(kept) == 1:
+        text = text.rstrip("\n") + "\n[]\n"
+    open(allow, "w").write(text)
 open(path, "w").write("\n".join(lines) + "\n")
 PY
 	S=("$STOWAGE" -C "$P")

@@ -543,7 +543,17 @@ Off until the project configures a key (`signing: { provider: cosign-key, key: â
   finding no version fixes cannot be acted on by a rebuild, and failing on it would make every
   release wait for upstream. A finding that must ship anyway is accepted by an allowlist entry
   that names the finding, the artifact and a reason, and **expires** (at most a year ahead): an
-  acceptance is a decision that is reviewed again, never a lowered threshold. The escape hatch,
+  acceptance is a decision that is reviewed again, never a lowered threshold. An entry may be
+  narrowed to a package and to the file the SBOM says the package was found in: an OS bundle
+  carries upstream binaries built with the same modules, and an id accepted in the whole bundle
+  for one late binary would also accept it in a binary whose fixed release is out, or in one added
+  later. The file comes from the SBOM, not from the scanner (grype reports no location for a
+  package it read from an SPDX document): its match names the package's SPDX id, which the
+  document links to the file it was evident by; a package found in two files is therefore two
+  findings, so an entry naming one file never accepts the other's. Two entries that can both accept one
+  finding are refused, as a wider entry left beside narrowed ones would silently undo them. `lint` refuses an entry naming
+  an artifact the release cannot carry and warns of one expired or ending within 30 days, so a
+  mistake shows at a commit rather than in a background ship's log. The escape hatch,
   `--audit-override REASON`, publishes past the gate and is recorded on the release manifest's
   artifact as an annotation, under the signature, rather than in the manifest: installs decode the
   manifest strictly, and the record is for the publisher's audit trail, not for an install. An

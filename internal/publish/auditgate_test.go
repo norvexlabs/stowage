@@ -157,6 +157,12 @@ func TestTheAuditGateAllowance(t *testing.T) {
 		if !c.pass && !strings.Contains(e.log.String(), "allowance CVE-W in web expired on 2026-10-07") {
 			t.Errorf("no note of the expired allowance:\n%s", e.log)
 		}
+		if c.pass && !strings.Contains(e.log.String(), "audit: allowance CVE-W in web until 2026-10-08 accepts 1 finding(s): no fix in the base yet") {
+			t.Errorf("the allowance applied is not listed:\n%s", e.log)
+		}
+		if !c.pass && strings.Contains(e.log.String(), "accepts") {
+			t.Errorf("an expired allowance is listed as applied:\n%s", e.log)
+		}
 		if c.pass && !strings.Contains(e.log.String(), "passes (") {
 			t.Errorf("no pass logged:\n%s", e.log)
 		}

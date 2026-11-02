@@ -531,11 +531,15 @@ stowage -C <project> --test-registry PREFIX [--test-push USER:ENV] [--test-pull 
   `signing.public_keys` (with the pull account alone), and scans each with grype
   (`docker.io/anchore/grype:v0.121.0`, its linux/amd64 image pinned by digest, on the local
   engine, as the publisher's user). It prints the vulnerabilities by severity, highest first (the artifact, the CVE, the
-  package and version, its type, the versions that fix it), then their count by severity; an
+  package and version, its type, `in <file>` — the file the SBOM says the package was found in,
+  where it says (a Go module's binary) — and the versions that fix it), then their count by
+  severity. A package found in several files is a finding per file: the same Go module in two
+  binaries is two findings, each `in` its binary; an SBOM whose files or relationships do not
+  decode leaves its artifact `not audited`; an
   artifact without an SBOM by a trusted key (or whose scan failed) is listed as `not audited:
   <why>`. `--json` prints the report: `{project, version, revision, channel, tag, db_built,
   subjects: [{name, owner, digest, error, findings: [{id, severity, package, version, type,
-  fixed_in}]}]}`, `owner` being who fixes the artifact's findings: `stowage` for what Stowage
+  fixed_in, path}]}]}`, `owner` being who fixes the artifact's findings: `stowage` for what Stowage
   supplies (the images `front`, `backup`, `chown` and `audit`, built from its recipes, and the
   installer), `project` for the rest: the project's own images, and the OS bundle and its disks,
   whose contents its `shapes.kairos` pins (`base`, `kairos_init`) decide. The printed summary splits the counts the same
@@ -563,16 +567,42 @@ stowage -C <project> --test-registry PREFIX [--test-push USER:ENV] [--test-pull 
   fix them and ship again, accept one for a while in audit.allow, or ship with --audit-override
   REASON (recorded in the release)`, after printing the findings and the summary by owner. Fixed
   (a rebuilt image, a bumped pin), the same command carries on; nothing is published until it
-  passes. `allow` is a file of the project's: a YAML list of `{id, artifact, reason, expires}` —
-  the finding's id, the artifact it is in (an image key, `installer`, `os` — a disk's findings are
-  its bundle's, under `os` — or `"*"` for any), why, and its last day (`YYYY-MM-DD`, UTC, at most a year ahead: an allowance is
-  renewed, never kept for good). `lint` checks the file (each field required, a valid date, no
-  entry twice, nothing more than a year ahead) and refuses `audit` on a project that does not
-  sign. `ship` logs `audit: allowance <id> in <artifact> expired on <date>: the finding counts
-  again whenever the policy counts it; renew the allowance, fix the finding, or remove the
-  allowance` for an expired one, and `audit: allowance <id> in <artifact> matches
-  no finding: remove it`; a release that passes logs `audit: <tag> passes (N artifacts, M
-  findings accepted by audit.allow)`. `--audit-override REASON` publishes past a refused finding:
+  passes. `allow` is a file of the project's: a YAML list of `{id, artifact, package, path,
+  reason, expires}` — the finding's id, the artifact it is in (an image key, `installer`, `front`,
+  `backup`, `chown`, `audit`, `os` with the kairos shape — a disk's findings are its bundle's,
+  under `os` — or `"*"` for any), optionally the package (its name as `audit` prints it:
+  `golang.org/x/net`, `stdlib`, `openssl`) and the file it is found in (absolute, as `audit`
+  prints it after `in`: `/usr/bin/containerd`) the entry is narrowed to, why, and its last day
+  (`YYYY-MM-DD`, UTC, at most a year ahead: an allowance is renewed, never kept for good). An
+  entry with `package` accepts its finding in that package alone, with `path` in the package
+  found in that file alone (a finding whose SBOM names no file is outside every `path`), so one
+  written for an upstream binary does not accept the same id in another binary, one added later
+  included. Two entries that can both accept one finding (the same id, and artifacts, packages
+  and paths each equal or one of them any: `"*"` beside `os`, a whole artifact beside a narrowed
+  entry, an entry narrowed by `package` beside one narrowed by `path`, or the same entry twice) are
+  refused, since one would undo the other's narrowing. `lint` checks the file: each field but
+  `package` and `path` required, an `id`, `artifact` and `package` without spaces around them, a valid date, a `path`
+  absolute and clean without spaces around it, no two entries that can accept one finding, nothing more than a year ahead, and an `artifact` a release
+  of the project can carry — one of its image keys, `os` with the kairos shape, or one Stowage
+  supplies (`front`, `backup`, `chown`, `audit`, `installer`), whether or not this project's
+  releases carry it — refused otherwise, naming those; it warns of an entry expired (`allowance <id> in <artifact> … expired on <date>: the
+  finding counts again; renew it, fix the finding, or remove it`) and of one whose last day is
+  within 30 days (`… expires on <date>, within 30 days: renew it or fix the finding before
+  then`), so a commit hook or a CI step running `lint` catches them before a release. It also
+  refuses `audit` on a project that does not sign. `ship` logs each allowance in force that
+  matched a finding, `audit: allowance <id> in <artifact> [(package P)] [(path F)] until <date>
+  accepts N finding(s): <reason>` (N is 0 when the policy counts none of them today), `audit:
+  allowance … expired on <date>: the finding counts again whenever the policy counts it; renew the
+  allowance, fix the finding, or remove the allowance` for an expired one, `audit: allowance …
+  matches no finding: remove it` for one that matched no finding (an entry with `package` or
+  `path`: `… matches no finding: correct its package or path (audit prints each finding's package
+  and files), or remove it`), whether or not the policy counts its finding today, and `audit:
+  <id> in <artifact> (<package> <version> in <file>) counts: the N allowance(s) of it in force
+  are narrowed to other packages or files` once per refused finding entries name outside their
+  package or file (with `; the SBOM names no file for it, so only an entry without path accepts
+  it` when the SBOM names none and an entry narrowed by `path` alone — or by `path` and the
+  finding's own package — names it); a release that passes
+  logs `audit: <tag> passes (N artifacts, M findings accepted by audit.allow)`. `--audit-override REASON` publishes past a refused finding:
   `ship` logs `audit: <tag> published past its gate (…): REASON` and records the reason (less the
   blanks around it) on the
   release manifest's artifact (the annotation `dev.stowage.audit-override`, which its signature
@@ -1589,7 +1619,7 @@ backup. On Kubernetes
 | `registry.delete` | how the publisher deletes a manifest by digest (an older disk set, a pruned release's): `oci` (the default, the distribution API) or `github` (GitHub's packages API: `api`, default `https://api.github.com`; `token_env`, default `registry.push`'s, a token with `delete:packages`) |
 | `registry.pull`, `registry.push` | `token` (`user`, `token_env`), `docker-config` (`config`, a Docker config directory; empty: the default Docker login), `none` (pull only). `registry.pull` is baked into every installer: it may not use `registry.push`'s `token_env` or Docker config. With `none`, `ship` refuses a repository the release writes that an anonymous read is refused (see `ship`) |
 | `signing` | `cosign-key` (`key`, `public_keys`), or absent / `none` |
-| `audit` | optional, a project that signs: the gate `ship` and `promote` pass before a channel points at a release (see "The audit gate" under `audit`): `fail_on` (`negligible`, `low`, `medium`, `high`, `critical`; required), `fixable_only` (default `true`), `allow` (a file of the project's: `{id, artifact, reason, expires}` entries, each expiring at most a year ahead). The publisher's alone: it changes no release's inputs |
+| `audit` | optional, a project that signs: the gate `ship` and `promote` pass before a channel points at a release (see "The audit gate" under `audit`): `fail_on` (`negligible`, `low`, `medium`, `high`, `critical`; required), `fixable_only` (default `true`), `allow` (a file of the project's: `{id, artifact, package, path, reason, expires}` entries, `package` and `path` optional, each expiring at most a year ahead). The publisher's alone: it changes no release's inputs |
 | `images.<key>` | built (`context`, `dockerfile`, `target`, `args`, `add_hosts`: `{<host name>: [<IP>, …]}`, the names the build's steps resolve to fixed addresses, each to every address of its list (a client's failover across them) — BuildKit's `/etc/hosts` is read-only to a step — each passed as `--add-host`; `network`: `default` (BuildKit's own), `host` or `none`, the steps' network, passed as `--network` (`host` with `--allow network.host`, its entitlement, which the builder must grant); `inputs`: the paths whose content enters the image's inputs digest, default the whole context less `.dockerignore`) or `ref` (exclusive with the build keys). `add_hosts` and a `network` other than `default` enter the image's inputs digest. Each address enters the digest in its order. A host name that is not lowercase, an empty list, an address that is not an IP (or carries a zone), the same address twice for one name and another network are errors. An image no service or hook uses is a warning; a `# syntax=` frontend or a `FROM $ARG` cannot be checked (warning) |
 | `stack.compose` | the compose file (its contract: "The contracts a project must honour"): `extends` within the file, `profiles:` only those an input's `profile` names, a `ports:` entry past this host an error with a `kairos` shape and a warning on `docker` |
 | `tune.profile` | optional: the tuning profile of the hosts the `docker` and `kairos` shapes run on (see "Network tuning" under the installer): `default` (the same as no `tune`: Docker's path as fast as the host's network) or `network` (a host serving a heavy network load); the operator may choose another (`--tune-profile`). Another name is an error, and so is `tune:` without a profile; a project with neither a `docker` nor a `kairos` shape is warned: a node is the cluster's |
