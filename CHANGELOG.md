@@ -3,7 +3,7 @@
 Stowage's own releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
-## [0.23.0]
+## [0.23.0] - 2026-11-02
 
 ### Added
 - `services.<name>.flush_conntrack: true`: a start that loads the service's nftables table anew
