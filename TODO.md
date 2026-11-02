@@ -9,25 +9,6 @@ A finished item is deleted, not ticked. The plan behind it is
 
 Batched by the gate they share: a batch is one slice, one review, one gate run.
 
-### Next
-
-1. **A service table's switch leaves the flows the previous table admitted**: with a table an
-   input picks (`nftables: { input, files }`), a start that loads another file (`--set
-   KEY=<value>`) replaces the table, but the host's conntrack keeps the entries of the flows the
-   old one judged. A table that accepts `ct state established,related` first (the usual fast path)
-   keeps forwarding them up to the established timeout (5 days by default), and a nat rule of the
-   new table (`redirect`, `dnat`) never applies to an existing entry: a permissive table switched to
-   an enforcing one enforces only on new flows. Expected: when a start loads a table other than
-   the one the previous start loaded (the record `.stowage-nftables` tells which), the entries that
-   table judged are deleted after the new one loads — the narrowest set nft and conntrack can name
-   (the service's addresses, its marks or zone; all entries only if no narrower one is reliable,
-   stated in README), on the VM and on a consented Docker host; a load of the same table deletes
-   nothing. README's "A service's nftables table" says what a switch does to open flows. Until then
-   the operator runs `conntrack -F` by hand (`conntrack` a `host.packages` entry on the VM). Gate:
-   smoke-install (the deletion run after the new table, not on a same-table start, its failure
-   failing the start with the fix named), e2e-full-vm (a long-lived TCP flow through a permissive
-   table cut once an enforcing one is picked).
-
 ### Blocked — upstream or accounts
 
 1. **Kairos 4.4.0 final**: the OS bundle is pinned to the release candidate
@@ -419,13 +400,12 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
 
 ## Could
 
-- **The VM's `exec` takes no standard input**: `<short>-stow exec SERVICE -- COMMAND` runs the
-  command without one, so an operator cannot stream a file into a container (a `tar -x` into a
-  volume) and falls back to `docker exec -i` on the VM. Add `exec --stdin` (`-i`), the caller's
-  standard input sent with the request and passed to the command, bounded as its outputs are
-  (4 MiB, refused above with the limit named), README's VM verbs and the app/operator socket table
-  updated. Gate: smoke-install (over the socket: the input reaches the command, the bound on both
-  sides), e2e-full-vm (a file piped through `exec --stdin`).
+- **`flush_conntrack`, leftovers** (review): a host whose kernel has no connection-tracking
+  netlink (the flush fails with nothing to flush) keeps the `.flush` mark and warns at every start;
+  a set's change (an input, the app socket) never flushes, so a source dropped from an allow-list
+  keeps its open connections; e2e-full-vm watches an SSH session across the flush, not a
+  connection through the front's published ports (Docker's DNAT made again on the next packet).
+
 - **The daemon's start applies a record its networkd file differs from once**: a failure (networkd
   not ready) is logged and the boot renders the record again, where it was retried every 15 s;
   retries would need the one revert timer, which a pending change on another NIC owns. A timer

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"slices"
 	"strings"
@@ -184,18 +185,28 @@ func TestExecOverTheSocket(t *testing.T) {
 		case strings.HasSuffix(a, " exec -T api big"):
 			_, _ = c.Stdout.Write(bytes.Repeat([]byte("x"), maxExecOutput+1))
 			return nil
+		case strings.HasSuffix(a, " exec -T api wc"):
+			if c.Stdin == nil {
+				_, _ = c.Stdout.Write([]byte("no input"))
+				return nil
+			}
+			in, _ := io.ReadAll(c.Stdin)
+			_, _ = fmt.Fprintf(c.Stdout, "%d %s", len(in), in[:min(len(in), 5)])
+			return nil
 		}
 		return errors.New("docker failed")
 	}
 	sock := served(t, daemon(e, &fakeHost{}))
 	// --socket goes before the command's own arguments.
-	ctl := func(_ *env, sock string, args ...string) (string, error) {
+	ctlIn := func(stdin string, args ...string) (string, error) {
 		var out bytes.Buffer
 		cmd := vmCommand(e.r, e.self, &out, &out, func(bool) Prompter { return nil }, clientTimes{unit: time.Millisecond})
+		cmd.SetIn(strings.NewReader(stdin))
 		cmd.SetArgs(append([]string{"--socket", sock}, args...))
 		err := cmd.ExecuteContext(context.Background())
 		return out.String(), err
 	}
+	ctl := func(_ *env, sock string, args ...string) (string, error) { return ctlIn("unread", args...) }
 	out, err := ctl(e, sock, "exec", "api", "--", "cli", "rename", "a", "b")
 	if err != nil || out != "renamed\na warning\n" {
 		t.Fatalf("%v\n%q", err, out)
@@ -215,9 +226,30 @@ func TestExecOverTheSocket(t *testing.T) {
 			t.Errorf("%s: %v", args, err)
 		}
 	}
+	if out, err := ctl(e, sock, "exec", "api", "--", "wc"); err != nil || out != "no input" {
+		t.Errorf("without --stdin the command reads none: %v %q", err, out)
+	}
+	for _, flag := range []string{"--stdin", "-i"} {
+		if out, err := ctlIn("hello", "exec", flag, "api", "--", "wc"); err != nil || out != "5 hello" {
+			t.Errorf("%s: %v %q", flag, err, out)
+		}
+	}
+	full := strings.Repeat("y", maxExecInput)
+	if out, err := ctlIn(full, "exec", "--stdin", "api", "--", "wc"); err != nil || out != fmt.Sprintf("%d yyyyy", maxExecInput) {
+		t.Errorf("an input at the bound: %v %.40q", err, out)
+	}
+	if _, err := ctlIn(full+"y", "exec", "--stdin", "api", "--", "wc"); err == nil || !strings.Contains(err.Error(), "over the 4194304 bytes") {
+		t.Errorf("an input over the bound: %v", err)
+	}
 	var e400 errOf
 	if code := call(t, daemon(e, &fakeHost{}).Handler(), "POST", "/v1/services/api/exec", ExecRequest{}, &e400); code != 400 {
 		t.Errorf("no args: %d %s", code, e400.Error)
+	}
+	if code := call(t, daemon(e, &fakeHost{}).Handler(), "POST", "/v1/services/api/exec", ExecRequest{Args: []string{"wc"}, Stdin: []byte(full + "y")}, &e400); code != 400 || !strings.Contains(e400.Error, "over the 4194304 an exec takes") {
+		t.Errorf("the daemon, an input over the bound: %d %s", code, e400.Error)
+	}
+	if code := call(t, daemon(e, &fakeHost{}).Handler(), "POST", "/v1/services/api/exec", ExecRequest{Args: []string{"wc"}, Stdin: []byte(full + full)}, &e400); code != 413 || !strings.Contains(e400.Error, "the request body is over the") {
+		t.Errorf("the daemon, a body over its bound: %d %s", code, e400.Error)
 	}
 }
 

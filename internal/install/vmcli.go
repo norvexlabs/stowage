@@ -258,16 +258,28 @@ func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(
 		},
 	}
 	logs.Flags().IntVar(&tail, "tail", 200, "how many lines (1 to 5000)")
+	var execStdin bool
 	exec := &cobra.Command{
 		Use:   "exec SERVICE -- COMMAND [ARG...]",
-		Short: "Run a command in a running service's container, without a terminal or input; its outputs are printed once it ends (each cut at 4 MiB), its exit status is the run's",
+		Short: "Run a command in a running service's container, without a terminal; with --stdin it reads this command's standard input (at most 4 MiB), else none; its outputs are printed once it ends (each cut at 4 MiB), its exit status is the run's",
 		Args:  cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if cmd.ArgsLenAtDash() != 1 || len(args) < 2 {
 				return errors.New("exec SERVICE -- COMMAND: the command goes after --")
 			}
+			req := ExecRequest{Args: args[1:]}
+			if execStdin {
+				in, err := io.ReadAll(io.LimitReader(cmd.InOrStdin(), maxExecInput+1))
+				if err != nil {
+					return fmt.Errorf("--stdin: %w", err)
+				}
+				if len(in) > maxExecInput {
+					return fmt.Errorf("--stdin: the input is over the %d bytes an exec takes: split it, and pipe each part into its own exec", maxExecInput)
+				}
+				req.Stdin = in
+			}
 			var out ExecResult
-			if err := c.do(cmd.Context(), http.MethodPost, "/v1/services/"+url.PathEscape(args[0])+"/exec", ExecRequest{Args: args[1:]}, &out); err != nil {
+			if err := c.do(cmd.Context(), http.MethodPost, "/v1/services/"+url.PathEscape(args[0])+"/exec", req, &out); err != nil {
 				return err
 			}
 			if _, err := stdout.Write(out.Stdout); err != nil {
@@ -290,6 +302,7 @@ func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(
 			return nil
 		},
 	}
+	exec.Flags().BoolVarP(&execStdin, "stdin", "i", false, "pass this command's standard input to the command (at most 4 MiB); without it the command reads none")
 	health := &cobra.Command{
 		Use:   "health",
 		Short: "Whether the install is ready, as the health gate judges it: every service up (healthy where it has a healthcheck), and the health provider's answer",

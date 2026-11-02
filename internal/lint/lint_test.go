@@ -201,7 +201,8 @@ func TestEachRuleFiresOnFull(t *testing.T) {
 		{"feeds empty", []edit{{sp, "feeds: [ingest]", "feeds: []"}}, nil, "services.api.feeds: is empty"},
 		{"feeds twice", []edit{{sp, "feeds: [ingest]", "feeds: [ingest, ingest]"}}, nil, "services.api.feeds[1]: ingest is given twice"},
 		{"feeds no table", []edit{{sp, "feeds: [ingest]", "feeds: [echo]"}}, nil, "services.api.feeds[0]: echo has no nftables table (services.echo.nftables)"},
-		{"feeds itself", []edit{{sp, "sets: { trusted: TRUSTED_PROBES } }", "sets: { trusted: TRUSTED_PROBES }, feeds: [ingest] }"}}, nil, "services.ingest.feeds[0]: is ingest itself"},
+		{"flush_conntrack without a table", []edit{{sp, "api: { memory: 10, feeds", "api: { memory: 10, flush_conntrack: true, feeds"}}, nil, "services.api.flush_conntrack: api has no nftables table (services.api.nftables)"},
+		{"feeds itself", []edit{{sp, "sets: { trusted: TRUSTED_PROBES }, flush", "sets: { trusted: TRUSTED_PROBES }, feeds: [ingest], flush"}}, nil, "services.ingest.feeds[0]: is ingest itself"},
 		{"transparent empty", []edit{{sp, "transparent: [vpn0]", "transparent: []"}}, nil, "services.vpn.transparent: is empty"},
 		{"transparent without a table", []edit{{sp, "nftables: deploy/vpn.nft, transparent", "transparent"}}, nil, "services.vpn.transparent: vpn's own table steers the traffic to its sockets: give it nftables"},
 		{"transparent off the host's network", []edit{{sp, "host_network: true, nftables: deploy/vpn.nft", "nftables: deploy/vpn.nft"}}, nil, "services.vpn.transparent: a transparent socket is on the host's network"},
@@ -1843,7 +1844,7 @@ const memShares = `services:                                                    
 // servicesBlock is examples/full's whole services block: its memory shares, then the services' cores,
 // nftables table and address of their own.
 const servicesBlock = memShares + `  echo: { cpus: 1, irq: on }                                   # a whole core of its own, the NICs' interrupts on it too
-  ingest: { nftables: { input: INGEST_POSTURE, files: { observe: deploy/ingest.nft, enforce: deploy/ingest-enforce.nft } }, sets: { trusted: TRUSTED_PROBES } }   # its own nftables table, loaded on the VM, the input picking which; its trusted set filled from an input at each start
+  ingest: { nftables: { input: INGEST_POSTURE, files: { observe: deploy/ingest.nft, enforce: deploy/ingest-enforce.nft } }, sets: { trusted: TRUSTED_PROBES }, flush_conntrack: true }   # its own nftables table, loaded on the VM, the input picking which; its trusted set filled from an input at each start; the host's connection tracking flushed when another table loads
   relay: { interface: edge, address_input: RELAY_ADDRESS }     # an address of its own on the edge NIC (an ipvlan network)
   vpn: { host_network: true, nftables: deploy/vpn.nft, transparent: [vpn0], front_hosts: host-gateway }   # on the host's network; its table steers vpn0's traffic to its own sockets; the front's domains at Docker's host-gateway address
 `

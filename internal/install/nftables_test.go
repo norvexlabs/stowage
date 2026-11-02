@@ -32,7 +32,7 @@ func TestEveryStartLoadsTheServicesTables(t *testing.T) {
 	host := &nftHost{}
 	r := testRelease(t, "1.0.0")
 	r.Nftables = map[string][]byte{"ingest": []byte(ingestTable)}
-	in := &Installer{R: r, O: Options{Dir: t.TempDir(), Firewall: t.TempDir(), Host: host}}
+	in := &Installer{R: r, O: Options{Dir: t.TempDir(), Firewall: t.TempDir(), Host: host, Log: io.Discard}}
 	if err := in.loadTables(ctx, none); err != nil {
 		t.Fatal(err)
 	}
@@ -179,7 +179,7 @@ func TestEveryStartFillsTheSetsFromTheirInputs(t *testing.T) {
 	r := testRelease(t, "1.0.0")
 	r.Nftables = map[string][]byte{"ingest": []byte(ingestTable)}
 	r.Spec.Services = map[string]spec.Service{"ingest": {Sets: map[string]string{"probes": "PROBES", "peers": "PEERS"}}}
-	in := &Installer{R: r, O: Options{Dir: t.TempDir(), Firewall: t.TempDir(), Host: host}}
+	in := &Installer{R: r, O: Options{Dir: t.TempDir(), Firewall: t.TempDir(), Host: host, Log: io.Discard}}
 	vals := map[string]string{"PROBES": "192.0.2.7, 198.51.100.0/24 ,", "PEERS": " "}
 	get := func(k string) string { return vals[k] }
 	script := "flush set inet ingest peers\nflush set inet ingest probes\nadd element inet ingest probes { 192.0.2.7, 198.51.100.0/24 }\n"
@@ -508,7 +508,7 @@ func TestARefusedSetLeavesTheOtherTablesMade(t *testing.T) {
 	r := testRelease(t, "1.0.0")
 	r.Nftables = map[string][]byte{"a": []byte(strings.Replace(ingestTable, "ingest", "a", 1)), "b": []byte(strings.Replace(ingestTable, "ingest", "b", 1))}
 	r.Spec.Services = map[string]spec.Service{"a": {Sets: map[string]string{"probes": "A"}}, "b": {}}
-	in := &Installer{R: r, O: Options{Dir: t.TempDir(), Firewall: t.TempDir(), Host: host}}
+	in := &Installer{R: r, O: Options{Dir: t.TempDir(), Firewall: t.TempDir(), Host: host, Log: io.Discard}}
 	vals := map[string]string{"A": "192.0.2.1"}
 	get := func(k string) string { return vals[k] }
 	if err := in.loadTables(ctx, get); err != nil {
@@ -538,7 +538,7 @@ func TestAnUnreadSetsScriptLoadsTheTableAgain(t *testing.T) {
 	r := testRelease(t, "1.0.0")
 	r.Nftables = map[string][]byte{"ingest": []byte(ingestTable)}
 	r.Spec.Services = map[string]spec.Service{"ingest": {Sets: map[string]string{"probes": "PROBES"}}}
-	in := &Installer{R: r, O: Options{Dir: t.TempDir(), Firewall: t.TempDir(), Host: host}}
+	in := &Installer{R: r, O: Options{Dir: t.TempDir(), Firewall: t.TempDir(), Host: host, Log: io.Discard}}
 	get := func(string) string { return "192.0.2.7" }
 	if err := in.loadTables(ctx, get); err != nil {
 		t.Fatal(err)
@@ -557,14 +557,16 @@ func TestAnUnreadSetsScriptLoadsTheTableAgain(t *testing.T) {
 // A table an input picks: the release carries a file by each value, each judged as a table file;
 // a start loads the one the input's value picks, again when the value changes, and a value without
 // a file is refused at the input and at the start, before any table loads.
-func TestAnInputPicksTheServicesTable(t *testing.T) {
-	t.Parallel()
+// postureTables is a release whose ingest table the input POSTURE picks (observe, enforce: the
+// enforce file's table is "# enforce\n" before observe's), the payload edited by edit first; view
+// and files are its spec and payload without the tables.
+func postureTables(t *testing.T) (picked func(edit func(f map[string][]byte)) (*Release, error), enforce string, view map[string]any, files map[string][]byte) {
+	t.Helper()
 	_, exe := testInstaller(t, "1.0.0")
 	files, err := payload.Read(exe)
 	if err != nil {
 		t.Fatal(err)
 	}
-	var view map[string]any
 	if err := json.Unmarshal(files[payload.Spec], &view); err != nil {
 		t.Fatal(err)
 	}
@@ -573,8 +575,8 @@ func TestAnInputPicksTheServicesTable(t *testing.T) {
 		map[string]any{"Key": "MODE", "When": "tls", "Default": "observe"}, map[string]any{"Key": "PROF", "Profile": "p", "Default": "observe"},
 		map[string]any{"Key": "ADV", "Advanced": true}, map[string]any{"Key": "K8S", "Shapes": []any{"kubernetes"}, "Default": "observe"}, map[string]any{"Key": "BARE"}}
 	files[payload.Spec], _ = json.Marshal(view)
-	enforce := "# enforce\n" + ingestTable
-	picked := func(edit func(f map[string][]byte)) (*Release, error) {
+	enforce = "# enforce\n" + ingestTable
+	picked = func(edit func(f map[string][]byte)) (*Release, error) {
 		f := maps.Clone(files)
 		f[payload.NftablesDir+"ingest/observe.nft"] = []byte(ingestTable)
 		f[payload.NftablesDir+"ingest/enforce.nft"] = []byte(enforce)
@@ -583,6 +585,12 @@ func TestAnInputPicksTheServicesTable(t *testing.T) {
 		}
 		return Load(f)
 	}
+	return picked, enforce, view, files
+}
+
+func TestAnInputPicksTheServicesTable(t *testing.T) {
+	t.Parallel()
+	picked, enforce, view, files := postureTables(t)
 	r, err := picked(nil)
 	if err != nil || !slices.Equal(r.Tables(), []string{"ingest"}) || !slices.Equal(r.tableSets("ingest"), []string{"probes"}) {
 		t.Fatalf("%v %v", r, err)
@@ -603,7 +611,7 @@ func TestAnInputPicksTheServicesTable(t *testing.T) {
 		}
 	}
 	host := &nftHost{}
-	in := &Installer{R: r, O: Options{Dir: t.TempDir(), Firewall: t.TempDir(), Host: host}}
+	in := &Installer{R: r, O: Options{Dir: t.TempDir(), Firewall: t.TempDir(), Host: host, Log: io.Discard}}
 	posture := "observe"
 	get := func(k string) string {
 		if k == "POSTURE" {
@@ -679,5 +687,98 @@ func TestAnInputPicksTheServicesTable(t *testing.T) {
 		if _, err := Load(f); err == nil || !strings.Contains(err.Error(), "a file, or an input and its files, not both nor either alone") {
 			t.Errorf("%v: %v", nft, err)
 		}
+	}
+}
+
+func TestATableLoadedAnewFlushesTheConnectionTracking(t *testing.T) {
+	t.Parallel()
+	picked, _, _, _ := postureTables(t)
+	r, err := picked(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc := r.Spec.Services["ingest"]
+	svc.FlushConntrack = true
+	r.Spec.Services["ingest"] = svc
+	var log bytes.Buffer
+	flushes, flushErr := 0, error(nil)
+	in := &Installer{R: r, O: Options{Dir: t.TempDir(), Firewall: t.TempDir(), Host: &nftHost{}, Log: &log,
+		FlushConntrack: func() error { flushes++; return flushErr }}}
+	posture := "observe"
+	get := func(k string) string {
+		if k == "POSTURE" {
+			return posture
+		}
+		return ""
+	}
+	start := func(want int, what string) {
+		t.Helper()
+		flushes = 0
+		if err := in.loadTables(context.Background(), get); err != nil || flushes != want {
+			t.Errorf("%s: %v, %d flushes, want %d\n%s", what, err, flushes, want, log.String())
+		}
+	}
+	start(1, "the first load")
+	start(0, "the same table held")
+	posture = "enforce"
+	start(1, "another table picked")
+	if !strings.Contains(log.String(), "flushed the host's connection-tracking table (services.ingest.flush_conntrack)") {
+		t.Errorf("the flush is not logged:\n%s", log.String())
+	}
+	// A flush that fails is warned, the start going on, and the next start, which finds the table
+	// held, flushes it then.
+	posture, flushErr = "observe", errors.New("operation not permitted")
+	log.Reset()
+	start(1, "a flush that fails")
+	if !strings.Contains(log.String(), "warning: services.ingest.flush_conntrack: the host's connection-tracking table does not flush: operation not permitted: the connections open before keep the previous table's verdict until they end, or until `sudo conntrack -F` (the next start tries again)") {
+		t.Errorf("a failed flush is not warned:\n%s", log.String())
+	}
+	flushErr = nil
+	start(1, "a flush failed before")
+	start(0, "flushed since")
+	// A table held, loaded again for its sets alone (their script unread), flushes nothing.
+	sets := filepath.Join(in.O.Dir, TablesDir, "ingest"+SetsSuffix)
+	if err := os.MkdirAll(sets, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	start(0, "a load for the sets alone")
+	if err := os.RemoveAll(sets); err != nil {
+		t.Fatal(err)
+	}
+	// A load's file left by a start cut off: what the firewall holds is unknown, so the table
+	// loads anew.
+	if err := os.WriteFile(filepath.Join(in.O.Dir, TablesDir, "ingest.nft.next"), []byte("table inet ingest {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	start(1, "a load cut off before")
+	start(0, "loaded since")
+	// A start whose sync fails after the load flushes all the same.
+	record := filepath.Join(in.O.Dir, TablesFile)
+	if err := os.Remove(record); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(record, "x"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	posture, flushes = "enforce", 0
+	if err := in.loadTables(context.Background(), get); err == nil || flushes != 1 {
+		t.Errorf("a sync failing after the load: %v, %d flushes", err, flushes)
+	}
+	if err := os.RemoveAll(record); err != nil {
+		t.Fatal(err)
+	}
+	// Without flush_conntrack a change of rules is noted, and nothing flushes.
+	svc.FlushConntrack = false
+	r.Spec.Services["ingest"] = svc
+	posture = "enforce"
+	log.Reset()
+	start(0, "without flush_conntrack")
+	if !strings.Contains(log.String(), "note: services.ingest.nftables: its table changed, and the connections open before keep their conntrack entries") {
+		t.Errorf("no note:\n%s", log.String())
+	}
+	log.Reset()
+	start(0, "the same table, without flush_conntrack")
+	if strings.Contains(log.String(), "note:") {
+		t.Errorf("a note for a table held:\n%s", log.String())
 	}
 }

@@ -3,6 +3,16 @@
 Stowage's own releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
+## [0.23.0]
+
+### Added
+- `services.<name>.flush_conntrack: true`: a start that loads the service's nftables table anew
+  (another posture picked, changed rules) flushes the host's connection-tracking table, so the
+  connections the previous table admitted meet the new one's rules instead of riding its
+  established fast path; without it such a load notes that open connections keep their state.
+
+- `exec --stdin` (`-i`) on the VM: the command reads the caller's standard input, at most 4 MiB.
+
 ## [0.22.0] - 2026-11-01
 
 ### Added

@@ -1645,7 +1645,15 @@ every shape, the VM end-to-end test upgrading through it), then the health gate.
   Stowage would render (the general form, a table its image generates, stays deferred). Every
   file declares the same sets, so the sets route and the inputs that fill them are the table's,
   whichever posture is loaded; the value is checked where the input is given and again at the
-  start, which loads nothing on a value without a file. The feeder is often
+  start, which loads nothing on a value without a file. A load leaves the conntrack entries of
+  the connections open before, which a table's established fast path and its nat rules never judge
+  again, so a posture's switch would enforce on new connections alone: `flush_conntrack` flushes
+  the host's whole connection-tracking table after a load anew, an opt-in because the flush also
+  cuts the host's and the containers' outward connections whose replies the VM's input chain then
+  drops, and a host firewall's reload (firewalld, ufw, nft) flushes nothing either. No narrower
+  set is generic: a table may judge any packet the host sees, and marking the entries it judged
+  would rewrite the project's rules. The flush goes through netlink (no `conntrack` tool in the
+  bundle), marked before the load so a start cut off before it flushes at the next. The feeder is often
   not the table's service: the socket's token upgrades, reboots and re-addresses the VM, so the
   least-privilege stack gives it to a service its clients do not face, which `feeds` the proxy's
   table. A feeder carries the fed table's load token in its label, so a load recreates it as it

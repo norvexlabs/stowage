@@ -886,7 +886,7 @@ func TestEveryStartOpensTheFrontsPortsInTheFirewall(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	host := &nftHost{}
-	in := &Installer{R: testRelease(t, "1.0.0"), O: Options{Dir: t.TempDir(), Firewall: filepath.Join(t.TempDir(), "nftables.d"), Host: host}}
+	in := &Installer{R: testRelease(t, "1.0.0"), O: Options{Dir: t.TempDir(), Firewall: filepath.Join(t.TempDir(), "nftables.d"), Host: host, Log: io.Discard}}
 	file := filepath.Join(in.O.Firewall, "notes-ports.nft")
 	env := NewEnvFile()
 	env.Set("STOWAGE_TLS_MODE", "internal")
@@ -967,7 +967,7 @@ func TestEveryStartOpensTheL4PortsFromTheirSources(t *testing.T) {
 			{Name: "feed", Protocol: "udp", Port: 17007, Upstream: "api:17007", AllowInput: "FEED_SOURCES"},
 		}
 	})
-	in := &Installer{R: r, O: Options{Dir: t.TempDir(), Firewall: filepath.Join(t.TempDir(), "nftables.d"), Host: host}}
+	in := &Installer{R: r, O: Options{Dir: t.TempDir(), Firewall: filepath.Join(t.TempDir(), "nftables.d"), Host: host, Log: io.Discard}}
 	ports, l4 := filepath.Join(in.O.Firewall, "notes-ports.nft"), filepath.Join(in.O.Dir, ForwardRules, "notes-l4.nft")
 	old := []byte("# notes's L4 routes' allowlists, which every start of the install writes.\nmeta nfproto ipv6 meta l4proto udp drop\n")
 	if err := os.MkdirAll(filepath.Dir(l4), 0o755); err != nil {
@@ -1096,7 +1096,7 @@ func TestEveryStartForwardsAndInterceptsOnTheRoles(t *testing.T) {
 		}}
 		s.Services = map[string]spec.Service{"proxy": {HostNetwork: true, Transparent: []string{"vpn0"}}, "api": {CPUs: 1}}
 	})
-	in := &Installer{R: r, O: Options{Dir: t.TempDir(), Firewall: filepath.Join(t.TempDir(), "nftables.d"), Host: host}}
+	in := &Installer{R: r, O: Options{Dir: t.TempDir(), Firewall: filepath.Join(t.TempDir(), "nftables.d"), Host: host, Log: io.Discard}}
 	env := NewEnvFile()
 	env.Set("STOWAGE_TLS_MODE", Loopback)
 	hn := hostNet{targets: map[string]bool{"proxy": true}}
@@ -1281,7 +1281,7 @@ func TestThePortsOfAnInterfaceAreOpenedOnItAlone(t *testing.T) {
 			{Name: "feed", Protocol: "udp", Port: 17007, Upstream: "api:17007", AllowInput: "FEED_SOURCES", Interfaces: []string{"edge"}},
 		}
 	})
-	in := &Installer{R: r, O: Options{Dir: t.TempDir(), Firewall: filepath.Join(t.TempDir(), "nftables.d"), Host: host}}
+	in := &Installer{R: r, O: Options{Dir: t.TempDir(), Firewall: filepath.Join(t.TempDir(), "nftables.d"), Host: host, Log: io.Discard}}
 	env := NewEnvFile()
 	env.Set("STOWAGE_TLS_MODE", "internal")
 	env.Set(HTTPPortVar, "80")

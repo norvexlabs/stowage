@@ -76,7 +76,8 @@ func (l *linter) serviceHost(at, name string, svc spec.Service) {
 
 // serviceSets checks the sets a service fills from inputs (sets: each a set its table, text,
 // declares, from an input the firewall may show) and the tables it feeds (feeds: other services'
-// tables, fed through the VM's app socket, which shapes.kairos.host_api gives it).
+// tables, fed through the VM's app socket, which shapes.kairos.host_api gives it), and whether a
+// load of its table flushes the connection-tracking table (flush_conntrack: it needs the table).
 func (l *linter) serviceSets(at, name string, svc spec.Service, text string) {
 	if svc.Sets != nil {
 		w := at + ".sets"
@@ -100,6 +101,9 @@ func (l *linter) serviceSets(at, name string, svc spec.Service, text string) {
 				}
 			}
 		}
+	}
+	if svc.FlushConntrack && !svc.Nftables.Set() {
+		l.errf(at+".flush_conntrack", "%s has no nftables table (services.%s.nftables), whose loads it flushes after", name, name)
 	}
 	kairos := l.s.Shapes.Kairos
 	if svc.Feeds != nil {

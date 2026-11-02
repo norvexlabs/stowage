@@ -128,6 +128,9 @@ on_vm sudo docker inspect --format "'{{range .Mounts}}{{.Source}}:{{.Destination
 on_vm sudo at-stow exec api -- cat /etc/atlas/ca/ca.crt >"$WORK/vm-ca.crt" && grep -q 'BEGIN CERTIFICATE' "$WORK/vm-ca.crt" || fail "the api reads no CA (exec through the host daemon)"
 on_vm sudo at-stow exec api -- sh -c "'exit 3'" && fail "exec did not carry the command's exit status"
 [[ $? == 3 ]] || fail "exec's exit status is not the command's"
+[[ $(printf 'piped-in' | on_vm sudo at-stow exec --stdin api -- cat) == piped-in ]] || fail "exec --stdin did not pass its input to the command"
+out=$(printf 'unread' | on_vm sudo at-stow exec api -- cat) || fail "exec api -- cat without --stdin"
+[[ -z $out ]] || fail "exec without --stdin passed its input to the command"
 curl -sf --max-time 10 --cacert "$WORK/vm-ca.crt" --resolve "api.atlas.test:443:$IP" https://api.atlas.test/health >/dev/null ||
 	fail "the api route's certificate does not chain to the CA the front published"
 code=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 10 --resolve "ingest.atlas.test:443:$IP" -X POST -H 'Content-Type: application/json' -d '{"kind": "probe"}' https://ingest.atlas.test/events)
@@ -159,11 +162,29 @@ printf 'a-chosen-password\n' | on_vm sudo at-stow secrets set OPS_PASSWORD >"$WO
 [[ $(ops) == 000 && $(ops --cert "$WORK/rogue.pem" --key "$WORK/rogue.key") == 000 ]] || fail "the ops route takes a client without a certificate its client CA issued"
 [[ $(curl -sk -o /dev/null -w '%{http_code}' --max-time 10 --resolve "api.atlas.test:443:$IP" https://api.atlas.test/health) == 200 ]] || fail "the api route asks for a client certificate"
 
-step "on metal: the input picking ingest's table: observe first, enforce on a re-run, a value without a file refused"
+step "on metal: the input picking ingest's table: observe first, enforce on a re-run (the connection tracking flushed, an SSH session open across it kept), a value without a file refused"
 on_vm sudo nft list table inet ingest >"$WORK/ingest.txt" && ! grep -q 'tcp dport 9 ' "$WORK/ingest.txt" || { cat "$WORK/ingest.txt"; fail "ingest's table is not the observe posture's (INGEST_POSTURE's default)"; }
 on_vm sudo at-stow install --no-input --set INGEST_POSTURE=count >"$WORK/posture.txt" 2>&1 && fail "a value picking no table was taken"
 grep -q 'INGEST_POSTURE: "count" picks no table of ingest' "$WORK/posture.txt" || { cat "$WORK/posture.txt"; fail "the refusal of a value picking no table"; }
-on_vm sudo at-stow install --no-input --set INGEST_POSTURE=enforce >"$WORK/posture.txt" 2>&1 || { cat "$WORK/posture.txt"; fail "the re-run picking the enforce table"; }
+# An SSH session open across the re-run: the flush of the connection tracking (ingest's
+# flush_conntrack) leaves its next packets to the firewall as new ones, which it accepts.
+on_vm rm -f /tmp/e2e-ticks-stop
+on_vm 'while [ ! -e /tmp/e2e-ticks-stop ]; do echo tick; sleep 1; done' >"$WORK/ticks.txt" 2>&1 &
+ticks=$!
+# stop_ticks ends the session's subshell and its ssh.
+stop_ticks() { pkill -P "$ticks" 2>/dev/null; kill "$ticks" 2>/dev/null; }
+for _ in $(seq 30); do grep -q tick "$WORK/ticks.txt" && break; sleep 1; done
+grep -q tick "$WORK/ticks.txt" || { stop_ticks; fail "the SSH session to keep open across the re-run did not start"; }
+on_vm sudo at-stow install --no-input --set INGEST_POSTURE=enforce >"$WORK/posture.txt" 2>&1 || { stop_ticks; cat "$WORK/posture.txt"; fail "the re-run picking the enforce table"; }
+grep -q "flushed the host's connection-tracking table (services.ingest.flush_conntrack)" "$WORK/posture.txt" || { stop_ticks; cat "$WORK/posture.txt"; fail "the re-run loading another table of ingest flushed no connection tracking"; }
+before=$(grep -c tick "$WORK/ticks.txt")
+sleep 5
+(( $(grep -c tick "$WORK/ticks.txt") > before )) || { stop_ticks; fail "the SSH session open across the connection tracking's flush went silent after it"; }
+on_vm touch /tmp/e2e-ticks-stop
+# A session cut hangs until TCP gives up: it gets 30 s to see the stop and end.
+for _ in $(seq 30); do kill -0 "$ticks" 2>/dev/null || break; sleep 1; done
+if kill -0 "$ticks" 2>/dev/null; then stop_ticks; fail "the SSH session open across the connection tracking's flush was cut"; fi
+wait "$ticks" || { cat "$WORK/ticks.txt"; fail "the SSH session open across the connection tracking's flush ended in error"; }
 on_vm sudo nft list table inet ingest >"$WORK/ingest.txt" && grep -q 'tcp dport 9 ' "$WORK/ingest.txt" || { cat "$WORK/ingest.txt"; fail "ingest's table is not the enforce posture's after the re-run"; }
 
 step "on metal: each NIC named by its role from its MAC, the edge's lease neither the default route nor the host's name, its policy routing, the tun device's route once opened; the firewall opens the front on uplink alone and the UDP echo on edge alone"

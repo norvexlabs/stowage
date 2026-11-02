@@ -8,6 +8,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -650,10 +651,17 @@ func replyErr(w http.ResponseWriter, err error) {
 }
 
 // decodeBody reads a JSON body strictly; an empty one leaves v as it is.
-func decodeBody(r *http.Request, v any) error {
-	dec := json.NewDecoder(io.LimitReader(r.Body, 64<<10))
+func decodeBody(r *http.Request, v any) error { return decodeBodyUpTo(nil, r, v, 64<<10) }
+
+// decodeBodyUpTo is decodeBody for a body of up to limit bytes; given w, a body over it closes
+// the connection rather than drain the rest.
+func decodeBodyUpTo(w http.ResponseWriter, r *http.Request, v any, limit int64) error {
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, limit))
 	dec.DisallowUnknownFields()
-	if err := dec.Decode(v); err != nil && !errors.Is(err, io.EOF) {
+	var over *http.MaxBytesError
+	if err := dec.Decode(v); errors.As(err, &over) {
+		return fail(http.StatusRequestEntityTooLarge, "the request body is over the %d bytes it may be", limit)
+	} else if err != nil && !errors.Is(err, io.EOF) {
 		return fail(http.StatusBadRequest, "the request body: %v", err)
 	}
 	return nil
@@ -897,8 +905,12 @@ const maxExecOutput = 4 << 20
 // ExecRequest is POST /v1/services/{service}/exec's body, and ExecResult its answer: the outputs
 // (cut, StdoutCut and StderrCut then set, past maxExecOutput) and the command's exit status.
 type ExecRequest struct {
-	Args []string `json:"args"`
+	Args  []string `json:"args"`
+	Stdin []byte   `json:"stdin,omitempty"` // the command's standard input (base64), at most maxExecInput bytes
 }
+
+// maxExecInput bounds an exec's standard input, as maxExecOutput bounds each output.
+const maxExecInput = 4 << 20
 
 type ExecResult struct {
 	Stdout    []byte `json:"stdout"`
@@ -910,12 +922,17 @@ type ExecResult struct {
 
 func (h *Hostd) execService(w http.ResponseWriter, r *http.Request) {
 	var req ExecRequest
-	if err := decodeBody(r, &req); err != nil {
+	// The input as base64, and the rest of the request.
+	if err := decodeBodyUpTo(w, r, &req, int64(base64.StdEncoding.EncodedLen(maxExecInput))+64<<10); err != nil {
 		replyErr(w, err)
 		return
 	}
 	if len(req.Args) == 0 {
 		replyErr(w, fail(http.StatusBadRequest, "args: the command to run, as [\"psql\", \"-c\", \"…\"]"))
+		return
+	}
+	if len(req.Stdin) > maxExecInput {
+		replyErr(w, fail(http.StatusBadRequest, "stdin: %d bytes, over the %d an exec takes", len(req.Stdin), maxExecInput))
 		return
 	}
 	in, _ := h.run()
@@ -931,7 +948,11 @@ func (h *Hostd) execService(w http.ResponseWriter, r *http.Request) {
 	}
 	stdout, stderr := &capped{limit: maxExecOutput}, &capped{limit: maxExecOutput}
 	in.O.Out, in.O.Log = stdout, stderr
-	err = in.exec(r.Context(), env, svc, req.Args, nil, false)
+	var stdin io.Reader
+	if req.Stdin != nil {
+		stdin = bytes.NewReader(req.Stdin)
+	}
+	err = in.exec(r.Context(), env, svc, req.Args, stdin, false)
 	var code ExitCode
 	switch {
 	case errors.As(err, &code):

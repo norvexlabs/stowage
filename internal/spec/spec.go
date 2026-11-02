@@ -151,6 +151,10 @@ type Service struct {
 	// Feeds are the services whose tables' sets it feeds (through the VM's app socket): a start
 	// that loads one of those tables, which empties its sets, recreates it too.
 	Feeds []string `yaml:"feeds"`
+	// FlushConntrack flushes the host's connection-tracking table after a start loads its table
+	// anew (its first load, another file, changed rules, a table absent; never for its sets
+	// alone), so the connections an earlier table admitted meet the new one's rules.
+	FlushConntrack bool `yaml:"flush_conntrack"`
 	// Transparent are the host.interfaces roles its table steers traffic crossing the host to its
 	// own sockets on (TPROXY): the VM's input chain accepts there what the kernel hands a
 	// transparent socket.

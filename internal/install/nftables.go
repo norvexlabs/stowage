@@ -129,7 +129,36 @@ func (in *Installer) syncTables(ctx context.Context, want map[string][]byte, set
 		return writeAtomic(in.path(TablesFile), strings.NewReader(strings.Join(slices.Sorted(maps.Keys(record)), "\n")+"\n"), 0o644, nil)
 	}
 	var errs []error // a held table's sets refused: the other tables are made all the same
+	// The tables loaded anew (absent, or of other rules) whose service flushes the
+	// connection-tracking table then: each marked before its load, so a start cut off before the
+	// flush, or whose flush failed, flushes at the next one. It runs however this sync ends, a
+	// later table's refusal included.
+	var flush []string
+	defer func() {
+		if len(flush) == 0 {
+			return
+		}
+		keys := make([]string, len(flush))
+		for i, name := range flush {
+			keys[i] = "services." + name + ".flush_conntrack"
+		}
+		if err := in.O.flushConntrack(); err != nil {
+			in.O.logf("warning: %s: the host's connection-tracking table does not flush: %v: the connections open before keep the previous table's verdict until they end, or until `sudo conntrack -F` (the next start tries again)", strings.Join(keys, ", "), err)
+			return
+		}
+		in.O.logf("flushed the host's connection-tracking table (%s): the connections open before meet the tables now loaded as new ones", strings.Join(keys, ", "))
+		for _, name := range flush {
+			_ = os.Remove(in.tableFile(name, ".flush"))
+		}
+	}()
 	for _, name := range sortedKeys(want) {
+		mark, flushes := in.tableFile(name, ".flush"), in.R.Spec.Services[name].FlushConntrack
+		switch {
+		case flushes && fileExists(mark):
+			flush = append(flush, name)
+		case !flushes:
+			_ = os.Remove(mark)
+		}
 		var b bytes.Buffer
 		fmt.Fprintf(&b, "# %s's nftables table, as services.%s.nftables gives it, loaded whole.\ntable inet %s\ndelete table inet %s\n", name, name, name, name)
 		b.Write(want[name])
@@ -137,8 +166,17 @@ func (in *Installer) syncTables(ctx context.Context, want map[string][]byte, set
 			b.WriteByte('\n') // nft takes a comment on the last line only before a newline
 		}
 		f, setsFile := in.tableFile(name, ".nft"), in.tableFile(name, SetsSuffix)
-		if cur, err := os.ReadFile(f); err == nil && bytes.Equal(cur, b.Bytes()) {
+		// Loaded from a file of its own, which becomes its file once loaded: a load that fails
+		// leaves it as it was, so the next start tries again.
+		next := f + ".next"
+		// held: its rules in the firewall as this start loads them, so a load is for its sets alone.
+		// A load's file left (.next) is a start cut off after nft may have loaded it, before f
+		// recorded it: what the firewall holds is unknown, and the table loads again.
+		held := false
+		earlier, earlierErr := os.ReadFile(f)
+		if earlierErr == nil && bytes.Equal(earlier, b.Bytes()) && !fileExists(next) {
 			if _, err := host.Run(ctx, Cmd{Args: []string{"nft", "list", "table", "inet", name}}); err == nil {
+				held = true
 				kept, err := os.ReadFile(setsFile)
 				switch script := sets[name]; {
 				case err != nil && !errors.Is(err, os.ErrNotExist):
@@ -162,9 +200,6 @@ func (in *Installer) syncTables(ctx context.Context, want map[string][]byte, set
 		if err := os.MkdirAll(filepath.Dir(f), 0o755); err != nil {
 			return errors.Join(append(errs, err)...)
 		}
-		// Loaded from a file of its own, which becomes its file once loaded: a load that fails
-		// leaves it as it was, so the next start tries again.
-		next := f + ".next"
 		table := b.String()
 		b.WriteString(sets[name]) // the sets filled in the load's transaction
 		if err := writeAtomic(next, &b, 0o644, nil); err != nil {
@@ -179,6 +214,11 @@ func (in *Installer) syncTables(ctx context.Context, want map[string][]byte, set
 		if err := writeAtomic(in.tableFile(name, ".load"), strings.NewReader(hex.EncodeToString(token)+"\n"), 0o644, nil); err != nil {
 			return errors.Join(append(errs, err)...)
 		}
+		if flushes && !held {
+			if err := writeAtomic(mark, strings.NewReader(""), 0o644, nil); err != nil {
+				return errors.Join(append(errs, err)...)
+			}
+		}
 		if _, err := host.Run(ctx, Cmd{Args: []string{"nft", "-f", next}}); err != nil {
 			_ = os.Remove(next)
 			if sets[name] != "" {
@@ -187,6 +227,12 @@ func (in *Installer) syncTables(ctx context.Context, want map[string][]byte, set
 			return errors.Join(append(errs, fmt.Errorf("services.%s.nftables: nft refuses its table: %w", name, err))...)
 		}
 		record[name] = true
+		switch {
+		case flushes && !held && !slices.Contains(flush, name):
+			flush = append(flush, name)
+		case !flushes && earlierErr == nil && !bytes.Equal(earlier, []byte(table)):
+			in.O.logf("note: services.%s.nftables: its table changed, and the connections open before keep their conntrack entries: a rule for new connections, or a nat rule, leaves them be until they end (services.%s.flush_conntrack: true flushes the host's connection-tracking table at each such load)", name, name)
+		}
 		if err := save(); err != nil {
 			return errors.Join(append(errs, err)...)
 		}
@@ -210,7 +256,7 @@ func (in *Installer) syncTables(ctx context.Context, want map[string][]byte, set
 			}
 		}
 		delete(record, name)
-		for _, ext := range []string{".nft", ".load", SetsSuffix} {
+		for _, ext := range []string{".nft", ".load", ".flush", SetsSuffix} {
 			_ = os.Remove(in.tableFile(name, ext))
 		}
 	}
@@ -224,7 +270,8 @@ func (in *Installer) syncTables(ctx context.Context, want map[string][]byte, set
 }
 
 // tableFile is the file, under the install's TablesDir, of the table name with the extension
-// ext: .nft the table as last loaded, .load its load token, SetsSuffix its sets' script.
+// ext: .nft the table as last loaded, .load its load token, SetsSuffix its sets' script, .flush the
+// mark of a load whose flush of the connection-tracking table is still due (flush_conntrack).
 func (in *Installer) tableFile(name, ext string) string {
 	return filepath.Join(in.O.Dir, TablesDir, name+ext)
 }

@@ -146,6 +146,8 @@ type Options struct {
 	Euid        func() int
 	NetworkdDir string
 	GatewayRun  string
+	// FlushConntrack replaces the flush of the host's connection-tracking table in tests.
+	FlushConntrack func() error
 	// Roots are the host's trusted CAs a byo chain is checked against; nil is the system's.
 	Roots func() (*x509.CertPool, error)
 	// Tune is the host tune reads and changes (`tune`, the containers' network settings, the
@@ -2972,6 +2974,14 @@ func (o *Options) host() Tool {
 		return o.Host
 	}
 	return HostTool{}
+}
+
+// flushConntrack flushes the host's connection-tracking table (FlushConntrack in tests).
+func (o *Options) flushConntrack() error {
+	if o.FlushConntrack != nil {
+		return o.FlushConntrack()
+	}
+	return flushConntrack()
 }
 
 // euid is the run's effective user (Euid in tests).
