@@ -3,7 +3,7 @@
 Stowage's own releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
-## [0.25.0]
+## [0.25.0] - 2026-11-02
 
 ### Added
 - The audit gate: a project that signs declares `audit: { fail_on, fixable_only, allow }`, and
