@@ -20,7 +20,7 @@
 set -euo pipefail
 
 # The amd64 image of the example's postgres, as e2e-docker.
-PG=postgres:17-alpine@sha256:aa90e97ee862e558111d34cfb8b2c4bec768c2b039fb791341686928560263b3
+PG=postgres:18-alpine@sha256:10a5c69a83035ab5239f5620d708520e8b28f5aa1f2b20143e6024532edadfb5
 FORMATS=(raw qcow2 ova vhd gce iso)
 . "$(dirname "$0")/lib.sh"
 command -v zstd >/dev/null || fail "zstd is needed (the disks are checked decompressed)"

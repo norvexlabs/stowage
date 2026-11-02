@@ -2,8 +2,9 @@
 # Every build, test and check runs here: the host needs Docker and nothing else.
 #   make check  → target checks   (gofmt, go vet, staticcheck, govulncheck, go test -race)
 #   make build  → target bin      (static binaries exported to ./bin: stowage, which embeds the
-#                                  linux/amd64 stowage-install it ships, stowage-install, and the
-#                                  installer's Docker smoke test)
+#                                  linux/amd64 stowage-install it ships, stowage-install, the
+#                                  installer's Docker smoke test, and self-audit, the release's
+#                                  vulnerability gate)
 #   make image  → target image    (distroless runtime image)
 ARG GO_VERSION=1.27.3
 
@@ -34,12 +35,13 @@ RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache
     GOOS=linux GOARCH=amd64 go build -ldflags "-s -w -buildid= -X main.version=${VERSION}" -o /out/stowage-install ./cmd/stowage-install; \
     cp /out/stowage-install internal/installerbin/stowage-install; \
     go build -tags stowage_installer -ldflags "-s -w -buildid= -X main.version=${VERSION}" -o /out/stowage ./cmd/stowage; \
-    go test -c -tags dockersmoke -o /out/install-smoke.test ./internal/install
+    go test -c -tags dockersmoke -o /out/install-smoke.test ./internal/install; \
+    go build -o /out/self-audit ./test/selfaudit
 # No binary leaves this file without green checks.
 COPY --from=checks /checks.ok /out/.checks.ok
 
 FROM scratch AS bin
-COPY --from=build /out/stowage /out/stowage-install /out/install-smoke.test /
+COPY --from=build /out/stowage /out/stowage-install /out/install-smoke.test /out/self-audit /
 
 FROM gcr.io/distroless/static-debian12:nonroot AS image
 COPY --from=build /out/stowage /usr/local/bin/stowage

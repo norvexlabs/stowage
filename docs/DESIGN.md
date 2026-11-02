@@ -520,13 +520,14 @@ Off until the project configures a key (`signing: { provider: cosign-key, key: �
   the same storage, so `mirror export` carries it with no new format, and an attestation is
   never taken for a signature (the predicate decides). The SBOM is a property of the digest, so
   it is made once per digest and never re-made by a newer syft: re-shipping stays idempotent and
-  needs no graph node; it is not an input of anything. The scanner (grype) is a pinned upstream
-  image published as the release image `audit`, so an operator — at a site without internet
-  included — audits with the release's own scanner from the registry it already reads, and only
-  grype's database comes from outside (fetched, or given as a file). It is published converted to
-  OCI media types (upstream's is a Docker v2 manifest), its own digest found again by its inputs
-  as a built image's, so a registry that takes OCI manifests alone takes every image Stowage
-  publishes for itself. No SBOM lists the kernel itself or its modules (syft's kernel cataloger
+  needs no graph node; it is not an input of anything. The scanner (grype) is built by `ship` from
+  a recipe Stowage embeds, like the front, and published as the release image `audit`, so an
+  operator — at a site without internet included — audits with the release's own scanner from the
+  registry it already reads, and only grype's database comes from outside (fetched, or given as a
+  file). It is built, not mirrored, for the same reason as every image Stowage supplies: what
+  Stowage puts in every release must pass the gate below, and upstream's image is rebuilt only on
+  upstream's schedule (its Go toolchain lagged the fixes); the recipe raises the toolchain and the
+  modules itself, and a registry that takes OCI manifests alone takes it. No SBOM lists the kernel itself or its modules (syft's kernel cataloger
   is left out): a scanner matched the kernel's upstream version against fixes a distribution
   backports, failing every OS bundle on false findings, while the distribution's kernel packages
   carry versions its own tracker reads. Audits and exports run on
@@ -534,6 +535,24 @@ Off until the project configures a key (`signing: { provider: cosign-key, key: �
   version the VM runs is all an audit needs; a VM holds no scanner (the bundle does not preload
   it) and none of its database (1 GB), and its persistent space stays the app's. The export
   hands the verified documents to the operator's own tools, which keep watching them.
+- **The audit gate**: a scan after publication tells an operator what already reached them; the
+  gate scans before a channel points at the release, so a fixable critical never reaches the
+  stable channel unchecked. It reuses the audit as it is (the attested SBOMs, the same scanner and
+  database), judged by a spec policy the publisher alone reads (`audit`: no artifact carries it,
+  so tightening it changes no release's inputs). Only **fixable** findings count by default: a
+  finding no version fixes cannot be acted on by a rebuild, and failing on it would make every
+  release wait for upstream. A finding that must ship anyway is accepted by an allowlist entry
+  that names the finding, the artifact and a reason, and **expires** (at most a year ahead): an
+  acceptance is a decision that is reviewed again, never a lowered threshold. The escape hatch,
+  `--audit-override REASON`, publishes past the gate and is recorded on the release manifest's
+  artifact as an annotation, under the signature, rather than in the manifest: installs decode the
+  manifest strictly, and the record is for the publisher's audit trail, not for an install. An
+  artifact that could not be scanned is never overridden: what is not judged is not published.
+  The report separates the project's artifacts from what Stowage supplies (the images built from
+  its recipes, the installer), so a publisher knows which side owns each finding — the OS bundle
+  is the project's, its pins deciding what it holds; Stowage's own release runs the
+  same policy on what it supplies (`make self-audit`, fixable high and above) before it publishes,
+  so a project inherits no fixable finding of Stowage's.
 - **An app's own SBOM documents**: one audit covers the whole stack only if each image's SBOM
   names what the app put in it. syft reads what is self-describing (package databases, lock files,
   Go binaries, Rust binaries built by `cargo auditable`); what it cannot see — scripts a front

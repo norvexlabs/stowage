@@ -206,7 +206,7 @@ func TestAChartThatWouldDifferIsRefusedOnAnImmutableChannel(t *testing.T) {
 		if m.Artifacts.Installer, err = p.publishInstaller(ctx, img, m.Tag); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := p.writeRelease(ctx, m.Tag, &m); err != nil {
+		if _, err := p.writeRelease(ctx, m.Tag, &m, ""); err != nil {
 			t.Fatal(err)
 		}
 		if m.Artifacts.Chart == nil {
@@ -382,7 +382,7 @@ func TestThePointersChartIsNeverSwept(t *testing.T) {
 	c.Version = "0.2.0"
 	m.ReleaseSeq, m.Artifacts.Chart = 2, &c
 	p, _ := e.publisher()
-	if _, err := p.writeRelease(ctx, m.Tag, &m); err != nil {
+	if _, err := p.writeRelease(ctx, m.Tag, &m, ""); err != nil {
 		t.Fatal(err)
 	}
 	p.sweepCharts(ctx, "beta")

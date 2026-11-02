@@ -11,7 +11,6 @@
 package graph
 
 import (
-	"cmp"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -67,7 +66,7 @@ const FrontID = KindImage + "/" + front.Key
 // backup.Key.
 const BackupID = KindImage + "/" + backup.Key
 
-// AuditID is the node of the vulnerability scanner a signing release carries (sbom.Grype),
+// AuditID is the node of the vulnerability scanner a signing release carries (sbom.Dockerfile),
 // published as the image sbom.Key.
 const AuditID = KindImage + "/" + sbom.Key
 
@@ -84,9 +83,6 @@ type Node struct {
 	Inputs string   `json:"inputs"`
 	// Pinned is set for an upstream image taken by reference: nothing is built.
 	Pinned string `json:"pinned,omitempty"`
-	// Converts is set for an upstream image, pinned by digest, published with OCI media types:
-	// its digest is the conversion's, found again by its inputs as a built image's is.
-	Converts string `json:"converts,omitempty"`
 	// ReadsVersion is set for an image whose Dockerfile declares VersionArg.
 	ReadsVersion bool `json:"reads_version,omitempty"`
 	// Recipe is the Dockerfile of an image Stowage supplies (the front): what its inputs digest
@@ -123,9 +119,6 @@ type Release struct {
 	Installer []byte
 	// Pull is the pull account baked into the installer ("" when the project has none).
 	Pull string
-	// Scanner is the vulnerability scanner a signing release carries, pinned by digest: sbom.Grype
-	// when empty.
-	Scanner string
 }
 
 // Build computes the graph of p for a release. The installer image is the installer executable
@@ -195,7 +188,7 @@ func Build(p *project.Project, r Release) (*Graph, error) {
 		stowageImages = append(stowageImages, chownNode())
 	}
 	if s.Signs() {
-		stowageImages = append(stowageImages, auditNode(cmp.Or(r.Scanner, sbom.Grype)))
+		stowageImages = append(stowageImages, auditNode())
 	}
 	for _, n := range stowageImages {
 		g.Nodes = append(g.Nodes, n)
@@ -344,15 +337,16 @@ func backupNode() Node {
 	return Node{ID: BackupID, Kind: KindImage, Inputs: b.Sum(), Recipe: recipe}
 }
 
-// auditNode is the scanner (grype), pinned at ref: a signing release publishes it converted to
-// OCI media types (a registry need not take Docker's), so an install audits the SBOMs it carries
-// with its own release's scanner, wherever it pulls from.
-func auditNode(ref string) Node {
+// auditNode is the scanner (grype) a signing release carries, so an install audits the SBOMs it
+// carries with its own release's scanner, wherever it pulls from: like the front, its inputs are
+// the recipe (sbom.Dockerfile) and the platform.
+func auditNode() Node {
+	recipe := sbom.Dockerfile
 	b := digest.New(KindImage)
 	b.Field("name", sbom.Key)
-	b.Field("ref", ref)
-	b.Field("media-types", "oci")
-	return Node{ID: AuditID, Kind: KindImage, Inputs: b.Sum(), Converts: ref}
+	b.Field("platform", platform)
+	b.Field("recipe", string(recipe))
+	return Node{ID: AuditID, Kind: KindImage, Inputs: b.Sum(), Recipe: recipe}
 }
 
 // chownNode is the helper that gives data volumes their uid: like the front, its inputs are the

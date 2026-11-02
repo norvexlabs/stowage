@@ -25,7 +25,6 @@
 set -euo pipefail
 
 # The amd64 image of the example's postgres: mirroring copies every platform of an index.
-PG=postgres:17-alpine@sha256:aa90e97ee862e558111d34cfb8b2c4bec768c2b039fb791341686928560263b3
 . "$(dirname "$0")/lib.sh"
 
 k8s_tools
@@ -101,7 +100,7 @@ start_zot
 start_kind
 
 step "project, ship this month's first release"
-new_full "$PG"
+new_full
 V1=$CALVER.1 V2=$CALVER.2
 "${S[@]}" ship --channel stable 2>"$WORK/ship-$V1.log" || { cat "$WORK/ship-$V1.log"; fail "ship $V1"; }
 

@@ -73,7 +73,8 @@ func sortFindings(f []Finding) {
 
 // Subject is one artifact of the release audited: its SBOM's findings, or why it has none.
 type Subject struct {
-	Name     string    `json:"name"` // the image key, installer or os
+	Name     string    `json:"name"`  // the image key, installer or os
+	Owner    string    `json:"owner"` // who fixes its findings: "project" or "stowage" (Owner)
 	Digest   string    `json:"digest"`
 	Error    string    `json:"error,omitempty"`
 	Findings []Finding `json:"findings"`
@@ -188,7 +189,46 @@ func (r Report) Print(w io.Writer) error {
 	if err := tw.Flush(); err != nil {
 		return err
 	}
-	n := r.Counts()
+	_, err := fmt.Fprintf(w, "%d artifacts, vulnerabilities: %s\n", len(r.Subjects), countText(r.Counts()))
+	if err != nil || len(rows) == 0 {
+		return err
+	}
+	// Who fixes what: the project's images, or what Stowage supplies; each side's counts split
+	// between the findings a published version fixes and those none does yet.
+	for _, side := range []struct{ owner, label string }{{"project", "the project's"}, {"stowage", "Stowage's"}} {
+		var sub Report
+		for _, s := range r.Subjects {
+			if s.Owner == side.owner {
+				sub.Subjects = append(sub.Subjects, s)
+			}
+		}
+		fix, nofix := sub.split()
+		if _, err := fmt.Fprintf(w, "  %s: fixable %s; no fix %s\n", side.label, countText(fix.Counts()), countText(nofix.Counts())); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// split is r's findings, as two reports: those with a fixed version, and those without.
+func (r Report) split() (fixable, nofix Report) {
+	for _, s := range r.Subjects {
+		a, b := s, s
+		a.Findings, b.Findings = nil, nil
+		for _, f := range s.Findings {
+			if f.Fixable() {
+				a.Findings = append(a.Findings, f)
+			} else {
+				b.Findings = append(b.Findings, f)
+			}
+		}
+		fixable.Subjects, nofix.Subjects = append(fixable.Subjects, a), append(nofix.Subjects, b)
+	}
+	return fixable, nofix
+}
+
+// countText is counts by severity, highest first, or "none".
+func countText(n map[Severity]int) string {
 	var parts []string
 	for s := Critical; s >= Unknown; s-- {
 		if n[s] > 0 {
@@ -196,8 +236,7 @@ func (r Report) Print(w io.Writer) error {
 		}
 	}
 	if len(parts) == 0 {
-		parts = []string{"none"}
+		return "none"
 	}
-	_, err := fmt.Fprintf(w, "%d artifacts, vulnerabilities: %s\n", len(r.Subjects), strings.Join(parts, ", "))
-	return err
+	return strings.Join(parts, ", ")
 }

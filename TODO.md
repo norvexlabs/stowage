@@ -38,6 +38,19 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
 
 ## Should
 
+- **The OS bundle carries upstream binaries with fixable criticals no rebuild clears yet**: Docker's
+  latest `containerd`, `ctr` and `docker-compose` (golang.org/x/net 0.58), Ubuntu 26.04's `pebble`
+  (Go 1.27.1) and Kairos 4.4.0's `kairos-installer` (labstack/echo 5.3.1). `examples/full`'s
+  `audit-allow.yaml` accepts GO-2026-6612 and GO-2026-6604 in `os` until 2027-01-31; every
+  project with the kairos shape and `audit` needs the same until Docker, Ubuntu and Kairos ship
+  fixed builds. Before then: check for fixed releases, then remove the allowances (or rebuild
+  those binaries in the bundle's recipe if upstream stays behind).
+
+- **`updates` on Docker and Kubernetes**: the VM's `updates` lists what the channel offers after
+  the running release, with its changelog; on Docker and Kubernetes an operator learns that a newer
+  release exists only by pulling the installer's `:latest`. Offer `<short>-stow updates` on every
+  shape (the channel pointer read with the install's registry and keys, its signature checked).
+
 - **A `local` rclone destination is accepted, then never works**: where rclone runs in a
   throw-away container (`docker run --rm`, the Docker shape), a `type = local` remote writes
   inside it and the file is gone — `backup config` saves it, then `backup verify` and `backup run`

@@ -264,7 +264,7 @@ func TestAnInstallerThatWouldDifferIsRefusedOnAnImmutableChannel(t *testing.T) {
 		m := *r.Manifest
 		m.Artifacts.Installer = r.Manifest.Artifacts.Images["web"]
 		p, _ := e.publisher()
-		if _, err := p.writeRelease(ctx, m.Tag, &m); err != nil {
+		if _, err := p.writeRelease(ctx, m.Tag, &m, ""); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -332,7 +332,7 @@ func TestAFallbackToAReleaseWithoutAnInstallerRemovesLatest(t *testing.T) {
 	m := *old.Manifest
 	m.Artifacts.Installer = ""
 	p, _ := e.publisher()
-	if _, err := p.writeRelease(ctx, m.Tag, &m); err != nil {
+	if _, err := p.writeRelease(ctx, m.Tag, &m, ""); err != nil {
 		t.Fatal(err)
 	}
 	e.bump("1.1.0")
@@ -429,7 +429,7 @@ func TestAnInstallerRefusalWritesNothing(t *testing.T) {
 	m := *r.Manifest
 	m.Artifacts.Installer = ""
 	p, _ := e.publisher()
-	if _, err := p.writeRelease(ctx, m.Tag, &m); err != nil {
+	if _, err := p.writeRelease(ctx, m.Tag, &m, ""); err != nil {
 		t.Fatal(err)
 	}
 	tag, _ := e.reg.Tag(e.host+"/acme/notes/notes-postgres", "1.0.0")
@@ -477,7 +477,7 @@ func TestAShipOfAYankedReleaseFinishesAnInterruptedYank(t *testing.T) {
 	m := *second.Manifest
 	m.Yanked = &release.Yank{Reason: "broken", Date: e.now}
 	p, _ := e.publisher()
-	if _, err := p.writeRelease(ctx, m.Tag, &m); err != nil {
+	if _, err := p.writeRelease(ctx, m.Tag, &m, ""); err != nil {
 		t.Fatal(err)
 	}
 	eq(t, "pointer still on the yanked release", e.digest("notes-release", "stable"), second.Digest.String())

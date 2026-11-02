@@ -194,7 +194,7 @@ stowage:
 images:
   api: { context: api, dockerfile: api/Dockerfile, inputs: [api/] }
   web: { context: web, dockerfile: web/Dockerfile, inputs: [web/] }
-  postgres: { ref: "postgres:17-alpine@sha256:…" }       # an upstream image, pinned by digest
+  postgres: { ref: "postgres:18-alpine@sha256:…" }       # an upstream image, pinned by digest
 ```
 
 - A built image's `inputs` are the paths whose content decides whether it is rebuilt (default:
@@ -492,11 +492,11 @@ stowage -C <project> project-version [--channel C] [--revision N] [--json]
 stowage -C <project> changelog [--from V] [--to V] [--json]
 stowage -C <project> plan [--revision N] [--channel C] [--json]   # build graph + inputs digests
 stowage -C <project> lock [--update]                  # pin this stowage in stowage.lock
-stowage -C <project> ship [--channel C] [--revision N] [--disks] [--json]   # build what changed, push, move the pointer
+stowage -C <project> ship [--channel C] [--revision N] [--disks] [--audit-db FILE] [--audit-override REASON] [--json]   # build what changed, push, audit, move the pointer
 stowage -C <project> verify [<version>] [--channel C] [--revision N] [--json]
 stowage -C <project> audit [<version>] [--channel C] [--revision N] [--db FILE] [--fail-on S] [--json]   # the release's SBOMs, scanned
 stowage -C <project> sbom export [<version>] DIR [--channel C] [--revision N]   # the release's SBOMs, verified, as files
-stowage -C <project> promote <version> --from C --to C [--revision N] [--json]
+stowage -C <project> promote <version> --from C --to C [--revision N] [--audit-db FILE] [--audit-override REASON] [--json]
 stowage -C <project> yank <version> --reason TEXT [--channel C] [--revision N]
 stowage -C <project> prune --channel C [<version>]    # mutable channels only
 stowage -C <project> prune --channel C --keep N      # any channel: all but its N latest and the pointer's
@@ -534,14 +534,68 @@ stowage -C <project> --test-registry PREFIX [--test-push USER:ENV] [--test-pull 
   package and version, its type, the versions that fix it), then their count by severity; an
   artifact without an SBOM by a trusted key (or whose scan failed) is listed as `not audited:
   <why>`. `--json` prints the report: `{project, version, revision, channel, tag, db_built,
-  subjects: [{name, digest, error, findings: [{id, severity, package, version, type,
-  fixed_in}]}]}`. It exits 1 when an artifact is not audited, and with `--fail-on
+  subjects: [{name, owner, digest, error, findings: [{id, severity, package, version, type,
+  fixed_in}]}]}`, `owner` being who fixes the artifact's findings: `stowage` for what Stowage
+  supplies (the images `front`, `backup`, `chown` and `audit`, built from its recipes, and the
+  installer), `project` for the rest: the project's own images, and the OS bundle and its disks,
+  whose contents its `shapes.kairos` pins (`base`, `kairos_init`) decide. The printed summary splits the counts the same
+  way, each side's into `fixable` (a published version fixes it) and `no fix`:
+  `  the project's: fixable 1 critical; no fix none` / `  Stowage's: fixable none; no fix 2 high`. It exits 1 when an artifact is not audited, and with `--fail-on
   negligible|low|medium|high|critical` (default `none`) when a vulnerability is at or above that
   severity. grype's database is fetched from grype's servers into `~/.cache/stowage/grype` (about
   1 GB, kept between audits; grype refreshes it when it is older than its servers'); `--db FILE`
   imports an archive from grype's listing (`https://grype.anchore.io/databases`) instead and
   fetches nothing, whatever the archive's age (grype's own limit, 5 days, is not applied to it).
   The database is made ready once, and only when an artifact has an SBOM to scan. A project that does not sign is refused (its releases carry no SBOM).
+- **The audit gate** (`audit: { fail_on, fixable_only, allow }` in the spec, a project that signs):
+  `ship` and `promote` check the gate first, before anything is built (an unsigned project, a
+  `fail_on` or `allow` file that does not parse, an `--audit-db` file that is not there stop it
+  there), then scan the release as `audit` does — every image's, the installer's and the OS
+  bundle's SBOM (a disk carries its bundle's, which that scan judges), with the same grype and
+  database — once its artifacts are pushed by digest, and before the release manifest is written,
+  any release tag moves (the images', the bundle's, the disks', the installer's) or a cloud image
+  of `cloud_publish` is registered, and before a channel points at it. A refused release leaves
+  every tag as it was; it consumes its release number (`release_seq`). A finding at or
+  above `fail_on` (`negligible`, `low`, `medium`, `high`, `critical`) that a published version
+  fixes (`fixable_only: true`, the default; `false` counts those with no fix too) and that no
+  allowance in force accepts stops the ship: `release <tag>: audit: N fixable vulnerabilities at
+  or above high: high CVE-… in web (libcurl 8.22.0, fixed in 8.23.0); …; no channel moves to it:
+  fix them and ship again, accept one for a while in audit.allow, or ship with --audit-override
+  REASON (recorded in the release)`, after printing the findings and the summary by owner. Fixed
+  (a rebuilt image, a bumped pin), the same command carries on; nothing is published until it
+  passes. `allow` is a file of the project's: a YAML list of `{id, artifact, reason, expires}` —
+  the finding's id, the artifact it is in (an image key, `installer`, `os` — a disk's findings are
+  its bundle's, under `os` — or `"*"` for any), why, and its last day (`YYYY-MM-DD`, UTC, at most a year ahead: an allowance is
+  renewed, never kept for good). `lint` checks the file (each field required, a valid date, no
+  entry twice, nothing more than a year ahead) and refuses `audit` on a project that does not
+  sign. `ship` logs `audit: allowance <id> in <artifact> expired on <date>: the finding counts
+  again whenever the policy counts it; renew the allowance, fix the finding, or remove the
+  allowance` for an expired one, and `audit: allowance <id> in <artifact> matches
+  no finding: remove it`; a release that passes logs `audit: <tag> passes (N artifacts, M
+  findings accepted by audit.allow)`. `--audit-override REASON` publishes past a refused finding:
+  `ship` logs `audit: <tag> published past its gate (…): REASON` and records the reason (less the
+  blanks around it) on the
+  release manifest's artifact (the annotation `dev.stowage.audit-override`, which its signature
+  covers and no install reads), which `verify` and `ship` print as `published past its audit gate:
+  REASON` (`audit_override` in `--json`) and a yank keeps. A release shipped again unchanged is
+  judged again before a tag or the channel moves (a finding published since stops it too; a
+  yanked one is refused as yanked instead). Its manifest is not written again, so it takes an
+  override only when one is recorded on it already, which stands (`--audit-override` given again
+  keeps it: `audit: <tag> past its gate (…) by the override recorded on it: …`, and a different
+  reason given then is logged as not recorded); a release
+  published without one is refused (`publish a new revision of the release (N+1) with
+  --audit-override, or fix them`); such a refusal says `this ship moves nothing (a channel already
+  pointing at the release stays there)`, as the channel may serve it already. `--audit-override` on a project without `audit`, or with a blank reason, is refused, and one
+  given to a release that passes logs `audit: --audit-override is not needed: nothing is
+  recorded`. An
+  artifact not audited (its SBOM unreadable, or its scan failed) is refused whatever the override.
+  An allowance matching a finding the policy does not count today (no fix yet) is in use, not
+  reported. The database is grype's, kept in `~/.cache/stowage/grype` and brought up to date
+  before the scan, one audit or gate at a time on the cache (a second logs `waiting for the
+  scanner's cache <dir> (another audit or ship holds it)` and waits, until interrupted);
+  `--audit-db FILE` (or `STOWAGE_AUDIT_DB` in the environment, as a hook ship has it) imports an
+  archive instead. `audit` is the publisher's alone: no artifact carries it, and changing it
+  changes no release's inputs. Without `audit`, nothing is scanned before publication.
 - `sbom export [<version>] DIR` checks the release as `verify` does and writes the SBOMs `audit`
   reads, as the installer's `sbom export` does (`DIR/<artifact>.spdx.json`, `DIR/index.json`).
 - `prune` without a version deletes every release of the channel except the pointer's. With a
@@ -651,6 +705,10 @@ release for a test run, never the project's, without editing the spec:
   `disk_formats` whose ship publishes none is told so on that line (`…, without disks (vm create of it refused unless the
   channel's disks boot it)`). The background run's log ends with the ship's summary, its shape
   lines included.
+- The ship passes the project's audit gate (`audit`) as `stowage ship` does, scanning with the
+  database `STOWAGE_AUDIT_DB` names in the commit's environment (else grype's, fetched); a refusal
+  ends the background run's log, and no override is given: the publisher fixes the finding,
+  allows it in `audit.allow`, or ships by hand with `--audit-override`.
 - The ship runs in the background, in a session of its own with no input, and `hook post-commit`
   returns at once, printing `follow: tail -f <log>`. The background run is `stowage -C <project>
   hook post-commit --channel C --ship <version> --commit <id> [--disks]` (`--ship` and `--commit`
@@ -716,7 +774,7 @@ The release manifest (artifact type `application/vnd.stowage.release.v1+json`) h
 | `<name>-front` | the front, built by Stowage, by the release tag |
 | `<name>-backup` | the backup runner, built by Stowage (a `docker` or `kairos` shape with a `pg-age-rclone` or `volumes-age-rclone` backup), by the release tag |
 | `<name>-chown` | the volume helper, built by Stowage (a `docker` or `kairos` shape with a `data.volumes` entry of a `uid`), by the release tag |
-| `<name>-audit` | the vulnerability scanner a signing release carries (grype, mirrored by digest), by the release tag |
+| `<name>-audit` | the vulnerability scanner a signing release carries (grype, built from its source by ship), by the release tag |
 | `<name>-installer` | the release tag, and `:latest` |
 | `<name>-os` | the Kairos OS bundle (an image), by the release tag |
 | `<name>-disk` | each disk image by `<tag>-<format>` (one disk set per channel), and `latest-<format>` |
@@ -944,14 +1002,15 @@ from the registry is made again), and one made is read back before the release i
 SBOM of a digest is made once: a later syft makes no new one, and a digest that already carries
 one (a pulled image's included) keeps it, so a document added to a built image is merged when the
 image is next built (a new digest). An attestation never counts as a
-signature. A signing release also carries the scanner `audit` runs, grype's linux/amd64 image, published
-as the image `audit` (`<prefix>/<name>-audit`) with OCI media types (`image audit: convert <ref>
-to OCI media types`: upstream's is a Docker v2 manifest; its layers and config are upstream's, its
-digest the conversion's, which the release pins, signs and attests; a later ship finds it by its
-inputs, as a built image), so a registry that takes OCI manifests alone (zot's default) takes
-every image Stowage publishes for itself — a project's own pinned image (`images.<key>.ref`) is
-mirrored as is, a Docker v2 one needing a registry that takes those (zot: `http.compat:
-["docker2s2"]`). No OS bundle preloads the scanner: `mirror
+signature. A signing release also carries the scanner `<short>-stow audit` runs: grype v0.121.0,
+built by `ship` (`image audit: build`) from grype's source with Go 1.27.3 and the modules raised
+past a published vulnerability (a recipe embedded in `stowage`, its base pinned by digest, the
+binary and the CA certificates on an empty image, laid out as grype's own image), published as the
+image `audit` (`<prefix>/<name>-audit`), signed and attested as every image, and found again by its
+inputs by a later ship. Every image Stowage builds for itself is an OCI image, which a registry
+taking OCI manifests alone (zot's default) takes — a project's own pinned image
+(`images.<key>.ref`) is mirrored as is, a Docker v2 one needing a registry that takes those (zot:
+`http.compat: ["docker2s2"]`). No OS bundle preloads the scanner: `mirror
 export` carries it and the SBOMs to a site without internet, where an operator's `<short>-stow
 audit` pulls it. `stowage sbom export` and `<short>-stow sbom export` write the verified SBOMs as
 files for other tools. **An image's own SBOM documents are merged**: syft runs with its SBOM cataloger
@@ -1530,6 +1589,7 @@ backup. On Kubernetes
 | `registry.delete` | how the publisher deletes a manifest by digest (an older disk set, a pruned release's): `oci` (the default, the distribution API) or `github` (GitHub's packages API: `api`, default `https://api.github.com`; `token_env`, default `registry.push`'s, a token with `delete:packages`) |
 | `registry.pull`, `registry.push` | `token` (`user`, `token_env`), `docker-config` (`config`, a Docker config directory; empty: the default Docker login), `none` (pull only). `registry.pull` is baked into every installer: it may not use `registry.push`'s `token_env` or Docker config. With `none`, `ship` refuses a repository the release writes that an anonymous read is refused (see `ship`) |
 | `signing` | `cosign-key` (`key`, `public_keys`), or absent / `none` |
+| `audit` | optional, a project that signs: the gate `ship` and `promote` pass before a channel points at a release (see "The audit gate" under `audit`): `fail_on` (`negligible`, `low`, `medium`, `high`, `critical`; required), `fixable_only` (default `true`), `allow` (a file of the project's: `{id, artifact, reason, expires}` entries, each expiring at most a year ahead). The publisher's alone: it changes no release's inputs |
 | `images.<key>` | built (`context`, `dockerfile`, `target`, `args`, `add_hosts`: `{<host name>: [<IP>, …]}`, the names the build's steps resolve to fixed addresses, each to every address of its list (a client's failover across them) — BuildKit's `/etc/hosts` is read-only to a step — each passed as `--add-host`; `network`: `default` (BuildKit's own), `host` or `none`, the steps' network, passed as `--network` (`host` with `--allow network.host`, its entitlement, which the builder must grant); `inputs`: the paths whose content enters the image's inputs digest, default the whole context less `.dockerignore`) or `ref` (exclusive with the build keys). `add_hosts` and a `network` other than `default` enter the image's inputs digest. Each address enters the digest in its order. A host name that is not lowercase, an empty list, an address that is not an IP (or carries a zone), the same address twice for one name and another network are errors. An image no service or hook uses is a warning; a `# syntax=` frontend or a `FROM $ARG` cannot be checked (warning) |
 | `stack.compose` | the compose file (its contract: "The contracts a project must honour"): `extends` within the file, `profiles:` only those an input's `profile` names, a `ports:` entry past this host an error with a `kairos` shape and a warning on `docker` |
 | `tune.profile` | optional: the tuning profile of the hosts the `docker` and `kairos` shapes run on (see "Network tuning" under the installer): `default` (the same as no `tune`: Docker's path as fast as the host's network) or `network` (a host serving a heavy network load); the operator may choose another (`--tune-profile`). Another name is an error, and so is `tune:` without a profile; a project with neither a `docker` nor a `kairos` shape is warned: a node is the cluster's |
@@ -4915,10 +4975,11 @@ internal/publish/     ship, verify, promote, yank, prune, releases; the Docker i
 internal/kairos/      the OS bundle's recipe (Dockerfile, files) and the disk image builder
 internal/command/     the `command` provider contract
 internal/sigverify/   signature checks of sigstore bundles, in-process (the publisher's verify, every install)
-internal/front/       the recipe of the Caddy TLS front image, built by ship
+internal/front/       the recipe of the Caddy TLS front image (Caddy built with patched modules, curl removed), built by ship
 internal/providers/   runtime-side provider configs (auth, signing, health, schema, provision, backup)
-internal/backup/      the recipe of the VM's backup runner (rclone, pinned by digest), built by ship
+internal/backup/      the recipe of the VM's backup runner (rclone built from its source, on Alpine), built by ship
 internal/chown/       the recipe of the volume helper (busybox, pinned by digest), built by ship
+internal/sbom/        SBOMs (syft) and scans (grype); the audit report, the gate's policy and allowlist; the recipe of the scanner a release carries, built by ship
 internal/lock/        stowage.lock
 internal/hook/        the post-commit hook: release detection, lock, detached ship
 internal/gitcmd/      git run without git's per-hook variables
@@ -4932,7 +4993,7 @@ internal/cloud/       the cloud images' registration: each cloud's settings and 
 internal/truenas/     TrueNAS's API: the disk and seed uploads, power, snapshots (the module's steps)
 internal/testutil/    test helpers
 examples/             minimal (the phase-1 smoke target), full (every spec key), stateless (no database, nothing built, no front)
-test/                 end-to-end scripts (make e2e, make e2e-docker, make e2e-full, make e2e-stateless, make e2e-k8s, make e2e-full-k8s, make e2e-kairos, make e2e-vm, make e2e-full-vm), the commit gate's suite selection (gate.sh), their shared helpers (lib.sh), the VM helpers (vm.sh), the bare-metal machine a TrueNAS VM plays for e2e-full-vm (metal-truenas, an OpenTofu module), their pinned images (pins.sh) and the sweep of earlier runs (sweep.sh)
+test/                 end-to-end scripts (make e2e, make e2e-docker, make e2e-full, make e2e-stateless, make e2e-k8s, make e2e-full-k8s, make e2e-kairos, make e2e-vm, make e2e-full-vm), the commit gate's suite selection (gate.sh), their shared helpers (lib.sh), the VM helpers (vm.sh), the bare-metal machine a TrueNAS VM plays for e2e-full-vm (metal-truenas, an OpenTofu module), Stowage's own release gate (selfaudit, with audit-allow.yaml at the root), their pinned images (pins.sh) and the sweep of earlier runs (sweep.sh)
 docs/                 DESIGN.md; img/ (the logo, icon, social preview, badge, diagram, installer recording); demo/ (how that recording is made)
 ```
 
@@ -4941,14 +5002,15 @@ docs/                 DESIGN.md; img/ (the logo, icon, social preview, badge, di
 ```bash
 make check    # gofmt, go vet, staticcheck, govulncheck, go test -race — all in a container
 make build    # ./bin/stowage, static; built only after the checks stage passed
+make self-audit  # Stowage's own release gate, which the release workflow runs before it publishes: builds the front, the backup runner, the volume helper and the scanner from this tree's recipes, scans them and the binaries (stowage, stowage-install) with the pinned grype, prints the report by severity and refuses (exit 1) a fixable high or critical that audit-allow.yaml (the same format as a project's audit.allow) does not accept
 make image    # stowage:<version> runtime image (distroless)
 make test     # fast loop: unit tests without the race detector
 make gate     # the commit gate: check, build, lint, then only the end-to-end suites the change (against GATE_BASE, default HEAD, untracked files included) can affect; e2e-kairos, e2e-vm and e2e-full-vm (given STOWAGE_VM_ENV) one at a time beside the others, which run in parallel; each step of a suite prints the time since it began
 make gate-plan  # the suites `make gate` would run, each with the first changed path that needs it; `bash test/gate.sh --plan --paths P…` for given paths
-make e2e      # build, then ship / verify / promote / yank / prune examples/minimal, signed, against zot, and run its installer image; each image's and the installer's SBOM attested (none made again by a re-ship), the scanner mirrored, `audit` reading them all with grype's database given (`--db`, fetched once into the tools cache), an SBOM checked by hand with `cosign verify-attestation`, and refused with a key the release was not signed with; with registry.pull none on a registry refusing anonymous reads, ship stops before it builds
+make e2e      # build, then ship / verify / promote / yank / prune examples/minimal, signed, against zot, and run its installer image; each image's and the installer's SBOM attested (none made again by a re-ship), the scanner built, `audit` reading them all with grype's database given (`--db`, fetched once into the tools cache), an SBOM checked by hand with `cosign verify-attestation`, and refused with a key the release was not signed with; with registry.pull none on a registry refusing anonymous reads, ship stops before it builds; the audit gate (every finding counted) refusing a ship before stable moves, then `--audit-override` publishing it with its reason recorded, which `verify` prints
 make smoke-install  # the installer on the local Docker engine: registry, stack, front, provision hook, re-run, status, upgrade, rollback; behind TLS the local CA, then byo with --ca, each one's CA published to the stack and what the front serves chaining to it; the byo install moved to internal and back by re-runs; a loopback install on `::1` with `--ipv6` (the stack's network and the front have IPv6); with a global IPv6 address on the host, a TLS install whose route has an allowlist, called from that address: `--ipv6` and the allowlist holding it serves, an allowlist without it refuses (403), and the same install moved off IPv6 refuses it too (the front sees Docker's IPv4 gateway)
 make e2e-docker     # build, then the real binaries against zot and the local Docker engine: ship examples/minimal 1.0.0, install it with the bootstrap one-liner, re-run, `notes-stow audit` with its release's scanner and `sbom export` of its SBOMs, the release's default tuning profile in status and the api container given the host's own settings and open files, ship 2.0.0 and 3.0.0 and reach each with notes-stow upgrade --version (each release's signature checked against the kept installer's key), roll back (allowed, then refused at a rollback barrier); then `mirror export` 3.0.0, `mirror import` into a TLS zot of its own test CA (refused without `--registry-ca`, the signatures carried), a second install from it with `--registry` and `--registry-ca`, `upgrade --version` reading it with the recorded CA, and `audit` reading the SBOMs and pulling the scanner from the mirror alone
-make e2e-full       # build, then examples/full as it stands on the Docker shape: ship this month's CalVer release with a token push, signed with the key its environment holds (env://), install it with the bootstrap one-liner (the installer image pulled with the project's own pull account) in loopback mode, every route serving, the api migrating a real Postgres and serving as its app role, the provision hook registering the administrator and its API key through the api and its credentials file 0600; the release's network tuning profile in status, `sbom export` of its SBOMs (the ui's taking a third-party script's package from the SBOM document its image ships), the api's namespace holding its settings, the host's open files and the host route's MTU on the stack's network; the install prints its endpoint (the api route's URL, also in `status`) and ends with the search extension's tip (`atlas-search`, not published on the channel); a re-run sets the search extension's input (`SEARCH_URL`, the api reaching it, no tip), another clears it (the tip again), the hook handed back the key it minted; the app's users revoke that key: `provision` fails naming `provision --set`, `provision --set ADMIN_API_KEY=` mints and registers another (in no log), the next run keeps it; its record lost, `provision --set ADMIN_API_KEY=<key>` gives the key the hook never returned (declared in `hooks.provision.returns`; an undeclared key refused) and no other is minted; re-runs turn forward auth on the api route on (no identity without the authentication service's answer, a forged header stripped) and off, narrow the ingest route's allowlist to another address and to none (403), set an advanced input and give it back to its default (status shows each); `secrets rotate` takes the internal secret through --stage, the swap and --finish, each value accepted while it must be and the old one refused after; ship .2 (a migration), upgrade --version (data kept, a pg_dump snapshot), roll back (allowed by the api image's reads-newer label); ship .3 (a migration that is a rollback barrier), upgrade, and rollback is refused naming the barrier and the snapshot
+make e2e-full       # build, then examples/full as it stands on the Docker shape: ship this month's CalVer release with a token push, signed with the key its environment holds (env://), each ship passing its audit gate (fail_on critical, grype's latest database given by STOWAGE_AUDIT_DB: a fixable critical published since in an example's image fails the suite until the example is fixed), install it with the bootstrap one-liner (the installer image pulled with the project's own pull account) in loopback mode, every route serving, the api migrating a real Postgres and serving as its app role, the provision hook registering the administrator and its API key through the api and its credentials file 0600; the release's network tuning profile in status, `sbom export` of its SBOMs (the ui's taking a third-party script's package from the SBOM document its image ships), the api's namespace holding its settings, the host's open files and the host route's MTU on the stack's network; the install prints its endpoint (the api route's URL, also in `status`) and ends with the search extension's tip (`atlas-search`, not published on the channel); a re-run sets the search extension's input (`SEARCH_URL`, the api reaching it, no tip), another clears it (the tip again), the hook handed back the key it minted; the app's users revoke that key: `provision` fails naming `provision --set`, `provision --set ADMIN_API_KEY=` mints and registers another (in no log), the next run keeps it; its record lost, `provision --set ADMIN_API_KEY=<key>` gives the key the hook never returned (declared in `hooks.provision.returns`; an undeclared key refused) and no other is minted; re-runs turn forward auth on the api route on (no identity without the authentication service's answer, a forged header stripped) and off, narrow the ingest route's allowlist to another address and to none (403), set an advanced input and give it back to its default (status shows each); `secrets rotate` takes the internal secret through --stage, the swap and --finish, each value accepted while it must be and the old one refused after; ship .2 (a migration), upgrade --version (data kept, a pg_dump snapshot), roll back (allowed by the api image's reads-newer label); ship .3 (a migration that is a rollback barrier), upgrade, and rollback is refused naming the barrier and the snapshot
 make e2e-k8s        # build, then the real binaries against zot and a kind cluster pulling from it with the pull Secret: k8s install with the bootstrap script (the provision hook's Job run, what it returned in its Secret and not the log), upgrade --values, upgrade alone (what the hook returned handed back), upgrade --version 2.0.0, a refused downgrade, a failed upgrade helm rolls back, rollback, status, `audit --version 1.0.0` and `sbom export` of the cluster's release from the operator's machine (no install directory: the installer's keys and registry), reset-db (what the hook returned forgotten), uninstall refused without --data (the chart's own claim, which helm deletes), then uninstall --data removing the release, its Secrets, the hook's account and the claim, the namespace kept; then across Stowage versions: the previous release's stowage (the latest `v*` tag but this tree's version, built from that tag with its own `make build` once and kept in `~/.cache/stowage-prev/<tag>`) ships 3.0.0 at schema baseline 1 and its installer installs it, this stowage ships 4.0.0 at baseline 2, whose `k8s upgrade` is refused naming 3.0.0's baseline, and `k8s reset-db --new-baseline` crosses
 make e2e-stateless  # build, then examples/stateless on the Docker shape: ship 1.0.0 (a pulled image, no database, no front) to zot, install it with the bootstrap one-liner (no TLS mode asked or recorded, no front running), the health path and the L4 route serving the input from an inline compose config, the state volume given the server's uid (the server, uid 1000, writes into it at start); a re-run changes the input, and the server is made again with it; `status` lists the L4 route; `--tls` refused, there being no front; a `volumes-age-rclone` backup to WebDAV (the state volume's archive and the manifest, no dump; `backup list` shows the manifest alone) and a `restore` that brings the volume back as it was; ship 1.0.1, `upgrade --version 1.0.1` (nothing dumped) and `rollback` (no schema check), the input kept; `reset-db` refused, the release having no database
 make e2e-full-k8s   # build, then examples/full's chart on a kind cluster pulling from zot: k8s install with the bootstrap script against a Postgres outside the release (its two URLs and the administrator's password secret inputs from the operator's environment), two api replicas migrating once, the provision hook's Job registering the administrator and its API key (recorded in the outputs Secret, in no log; the Job deleted; no helm hook), every service answering, the api reaching the search extension's URL given at the install (`--set SEARCH_URL=…`), the endpoint printed as the api's Service URL; `k8s upgrade` of the same release, the key handed back to the hook; the app's users revoke the key, ship .2 (a migration), upgrade --version: the release runs .2 and the hook fails naming `k8s provision --set`, which mints and registers another key, and `k8s provision` again keeps it; its record lost, `k8s provision --set ADMIN_API_KEY=<key>` gives the key the hook never returned (an undeclared key refused) and no other is minted (data kept); rollback (the previous api on the newer schema); a second release in another namespace with the embedded Postgres, and reset-db deleting its database's claim, forgetting what the hook returned and registering the administrator again; `k8s secrets rotate` through its three passes, the release restarted at each, each value accepted while it must be; `k8s uninstall --yes` of the embedded release keeps its database's claim and its Secrets, and `k8s install` takes them back, the events kept

@@ -5,7 +5,7 @@
 # After sourcing: REPO, STOWAGE, WORK (on disk, never under /tmp: image exports can be large),
 # step / fail / expect_code. start_zot sets REG and PULL_TOKEN (the account pull's) and exports
 # STOWAGE_PUSH_TOKEN, NOTES_PULL_TOKEN (pull's) and STOWAGE_PULL_TOKEN (atlas-pull's, a token of its
-# own); new_project <postgres ref> (notes) or new_full <postgres ref> (atlas) sets P (the project),
+# own); new_project <postgres ref> (notes) or new_full (atlas) sets P (the project),
 # S (stowage -C P), NAME, and the account login_pull and digest_of read with: PULL_USER and
 # PULL_TOKEN (new_full switches them to atlas-pull's).
 # k8s_tools and start_kind (after start_zot) set up the Kubernetes suites: pinned kind, helm and
@@ -321,11 +321,11 @@ SH
 	[[ -s $1.pub && -s $WORK/other/other.pub ]] || fail "cosign generate-key-pair"
 }
 
-# new_full <postgres ref>: examples/full (atlas) as it stands — token pushes and pulls (the pull
-# account atlas-pull), signed with the key its environment holds (env://ATLAS_SIGNING_KEY) —
-# publishing to zot, its postgres replaced by the ref given and its first release this month's
-# (CalVer with month_guard: utc), CALVER being the month (YYYY.M). The kairos shape is dropped
-# unless KAIROS=1.
+# new_full: examples/full (atlas) as it stands — token pushes and pulls (the pull account
+# atlas-pull), signed with the key its environment holds (env://ATLAS_SIGNING_KEY), its audit gate
+# scanning with grype's database (STOWAGE_AUDIT_DB) — publishing to zot, its first release this
+# month's (CalVer with month_guard: utc), CALVER being the month (YYYY.M). The kairos shape is
+# dropped unless KAIROS=1.
 new_full() {
 	P=$WORK/atlas NAME=atlas SHORT=at PULL_USER=atlas-pull PULL_TOKEN=$STOWAGE_PULL_TOKEN
 	cp -r "$REPO/examples/full" "$P"
@@ -335,17 +335,14 @@ new_full() {
 	cp "$WORK/atlas-key/release.pub" "$P/keys/release-2026.pub"
 	CALVER=$(date -u +%Y.%-m)
 	printf '# Changelog\n\n## [%s.1]\n\n### Added\n- The first release.\n' "$CALVER" >"$P/CHANGELOG.md"
-	python3 - "$P/stowage.yaml" "$REG" "$1" "${KAIROS:-0}" <<'PY'
+	python3 - "$P/stowage.yaml" "$REG" "${KAIROS:-0}" <<'PY'
 import sys
-path, reg, pinned, kairos = sys.argv[1:]
+path, reg, kairos = sys.argv[1:]
 s = open(path).read()
 old = "prefix: registry.example.com/atlas"
 assert s.count(old) == 1, old
 s = s.replace(old, f"prefix: {reg}/atlas")
 lines = s.splitlines()
-pg = [i for i, l in enumerate(lines) if l.startswith("  postgres:  { ref:")]
-assert len(pg) == 1, pg
-lines[pg[0]] = f'  postgres:  {{ ref: "{pinned}" }}'
 if kairos != "1":
     k = lines.index("  kairos:")
     end = k + 1
@@ -357,6 +354,9 @@ PY
 	S=("$STOWAGE" -C "$P")
 	"${S[@]}" lock --update >/dev/null
 	"${S[@]}" lint
+	# Its audit gate scans each ship with grype's database, fetched once into the tools cache.
+	grype_db
+	export STOWAGE_AUDIT_DB=$GRYPE_DB
 }
 
 # full_release <micro> <migration file> <sql>: this month's release <micro>, with a migration, shipped

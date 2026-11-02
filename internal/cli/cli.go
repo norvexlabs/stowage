@@ -43,13 +43,14 @@ type options struct {
 	registryOpts []registry.Option
 	builder      publish.Builder
 	disks        publish.DiskMaker
-	// sboms and scanner replace syft and the scanner image a signing release mirrors.
-	sboms   publish.SBOMMaker
-	scanner string
+	// sboms replaces syft.
+	sboms publish.SBOMMaker
 	// dockerRun and scannerImage replace the Docker CLI and grype's image an audit runs.
 	dockerRun    sbom.Docker
 	scannerImage string
-	cloud        publish.CloudUploader
+	// auditDB and auditOverride are ship's and promote's --audit-db and --audit-override.
+	auditDB, auditOverride string
+	cloud                  publish.CloudUploader
 	// installer is the installer executable releases are published with.
 	installer []byte
 	// executable is this stowage's path, and launch starts it detached; the post-commit hook
@@ -418,8 +419,6 @@ func planCmd(o *options) *cobra.Command {
 				switch {
 				case n.Pinned != "":
 					note = "pinned " + n.Pinned
-				case n.Converts != "":
-					note = "converts " + n.Converts
 				case n.ReadsVersion:
 					note = "reads " + graph.VersionArg
 				}

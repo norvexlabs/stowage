@@ -20,6 +20,8 @@ type Target struct {
 	// Optional is an artifact a mirror may leave out: the OS bundle and the disks, which an
 	// export carries only for the shapes and the disk formats it names.
 	Optional bool
+	// Disk is a disk of the OS bundle, which carries the bundle's SBOM.
+	Disk bool
 }
 
 // Targets are the artifacts of a release (a) that carry an SBOM, under the registry prefix the
@@ -32,7 +34,7 @@ func Targets(prefix, project string, a release.Artifacts) ([]Target, error) {
 		if err != nil {
 			return err
 		}
-		out = append(out, Target{Name: n, Digest: r.Digest(d), Optional: repo == "os" || repo == "disk"})
+		out = append(out, Target{Name: n, Digest: r.Digest(d), Optional: repo == "os" || repo == "disk", Disk: repo == "disk"})
 		return nil
 	}
 	keys := make([]string, 0, len(a.Images))
@@ -75,7 +77,7 @@ func Audit(ctx context.Context, read Attested, s Scanner, targets []Target, logf
 	docs := make([][]byte, len(targets))
 	ready := false
 	for i, t := range targets {
-		sub := Subject{Name: t.Name, Digest: t.Digest.DigestStr(), Findings: []Finding{}}
+		sub := Subject{Name: t.Name, Owner: Owner(t.Name), Digest: t.Digest.DigestStr(), Findings: []Finding{}}
 		doc, err := read(ctx, t.Digest)
 		if err == nil {
 			err = Check(doc)
@@ -90,6 +92,12 @@ func Audit(ctx context.Context, read Attested, s Scanner, targets []Target, logf
 	if !ready {
 		return r, nil
 	}
+	// The cache is the scanner's alone from the database's import to the last scan.
+	unlock, err := lockCache(ctx, s.Cache, logf)
+	if err != nil {
+		return r, err
+	}
+	defer unlock()
 	// A database that could not be made ready leaves each SBOM unscanned, named, beside the
 	// targets that have none.
 	if err := s.Import(ctx); err != nil {

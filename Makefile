@@ -9,7 +9,7 @@ DOCKER_GO  := docker run --rm -u $(shell id -u):$(shell id -g) -e HOME=/tmp -e G
               -e GOMODCACHE=/cache/mod -v $(GOCACHE_DIR):/cache -v $(CURDIR):/src -w /src
 GO         := $(DOCKER_GO) -e GOFLAGS=-trimpath golang:$(GO_VERSION)-bookworm
 
-.PHONY: all check build image test e2e e2e-docker e2e-full e2e-full-k8s e2e-stateless e2e-k8s e2e-kairos e2e-vm e2e-full-vm smoke-install gate gate-plan fmt tidy shell hooks clean
+.PHONY: all check build image test e2e e2e-docker e2e-full e2e-full-k8s e2e-stateless e2e-k8s e2e-kairos e2e-vm e2e-full-vm smoke-install self-audit gate gate-plan fmt tidy shell hooks clean
 
 all: check build
 
@@ -57,6 +57,9 @@ gate-plan:        ## print the suites `make gate` would run for the change, and 
 
 smoke-install: build  ## the installer on the local Docker engine: registry, stack, front, re-run
 	./bin/install-smoke.test -test.run Smoke -test.count 1 -test.v; rc=$$?; bash test/sweep.sh; exit $$rc
+
+self-audit: build ## Stowage's own release gate: build the images Stowage supplies, scan them and the binaries, refuse a fixable high or critical (audit-allow.yaml; needs Docker + network)
+	./bin/self-audit -bin bin -allow audit-allow.yaml
 
 image:            ## runtime image
 	$(BUILD) --target image -t $(IMAGE) --load .

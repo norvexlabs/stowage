@@ -24,6 +24,9 @@ signing:
   provider: cosign-key
   key: env://ATLAS_SIGNING_KEY
   public_keys: [keys/release-2026.pub]
+# Before a channel points at a release, its SBOMs are scanned: a fixable critical stops the ship,
+# unless an entry of audit-allow.yaml accepts it for a while.
+audit: { fail_on: critical, fixable_only: true, allow: audit-allow.yaml }
 
 images:
   api:
@@ -37,7 +40,7 @@ images:
   ingest:    { context: ., dockerfile: docker/ingest.Dockerfile, inputs: [server/] }
   ui:        { context: ui, dockerfile: ui/Dockerfile }
   provision: { context: provision, dockerfile: provision/Dockerfile }
-  postgres:  { ref: "postgres:17-alpine@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24" }
+  postgres:  { context: postgres, dockerfile: postgres/Dockerfile }
 
 stack:
   compose: deploy/compose.yaml

@@ -333,6 +333,9 @@ func TestShipRegistersEachCloudsImageOnce(t *testing.T) {
 		t.Fatalf("got %v", err)
 	}
 	eq(t, "no release", e.digest("notes-release", "beta"), "")
+	// A failed registration leaves every tag as it was.
+	eq(t, "no image tag", e.digest("notes-web", "beta-1.0.0"), "")
+	eq(t, "no bundle tag", e.digest("notes-os", "beta-1.0.0"), "")
 
 	e.cloud.fail = false
 	r := e.mustShip("beta", 1)

@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -104,6 +105,13 @@ func (o *options) publisher(p *project.Project, a access) (*publish.Publisher, e
 			return nil, err
 		}
 	}
+	// The audit gate's scanner, kept with stowage audit's database.
+	var scan *sbom.Scanner
+	if a == writeAccess && p.Spec.Audit != nil {
+		if scan, err = o.scanner(cmp.Or(o.auditDB, o.getenv(AuditDBEnv))); err != nil {
+			return nil, err
+		}
+	}
 	if a == writeAccess {
 		if pull, err = o.pullAccount(p); err != nil {
 			return nil, err
@@ -116,7 +124,6 @@ func (o *options) publisher(p *project.Project, a access) (*publish.Publisher, e
 		Project:        p,
 		Signer:         signer,
 		SBOM:           sboms,
-		Scanner:        o.scanner,
 		Registry:       reg,
 		Upstream:       registry.New(authn.DefaultKeychain, o.registryOpts...),
 		Anonymous:      registry.New(authn.NewMultiKeychain(), o.registryOpts...),
@@ -130,10 +137,22 @@ func (o *options) publisher(p *project.Project, a access) (*publish.Publisher, e
 		StowageVersion: o.buildVersion,
 		Installer:      o.installer,
 		Pull:           pull,
+		Scan:           scan,
+		AuditOverride:  o.auditOverride,
 		Now:            o.now,
 		Log:            o.err,
 	}, nil
 }
+
+// auditFlags are ship's and promote's: the gate's database and override.
+func (o *options) auditFlags(c *cobra.Command) {
+	c.Flags().StringVar(&o.auditDB, "audit-db", "", "a grype database archive the audit gate scans with, for a host that does not reach grype's servers (default: $"+AuditDBEnv+")")
+	c.Flags().StringVar(&o.auditOverride, "audit-override", "", "publish past the audit gate's refusal of a finding, for this reason (recorded in the release)")
+}
+
+// AuditDBEnv is the grype database archive the audit gate scans with when --audit-db is not given:
+// for a hook ship, from the commit's environment.
+const AuditDBEnv = "STOWAGE_AUDIT_DB"
 
 // DisksEnv set to 1 or true publishes the disks as --disks does: for a hook ship, from the
 // commit's environment.
@@ -276,10 +295,17 @@ func (o *options) openPublisher(channel *string, a access) (*project.Project, *p
 
 func (o *options) printRelease(p *project.Project, r *publish.Ref) error {
 	if o.json {
-		return o.emitJSON(map[string]any{"digest": r.Digest.String(), "manifest": r.Manifest})
+		out := map[string]any{"digest": r.Digest.String(), "manifest": r.Manifest}
+		if r.AuditOverride != "" {
+			out["audit_override"] = r.AuditOverride
+		}
+		return o.emitJSON(out)
 	}
 	m := r.Manifest
 	fmt.Fprintf(o.out, "%s %s revision %d · channel %s · tag %s · seq %d\n%s\n", m.Name, m.ProjectVersion, m.Revision, m.Channel, m.Tag, m.ReleaseSeq, r.Digest)
+	if r.AuditOverride != "" {
+		fmt.Fprintf(o.out, "published past its audit gate: %s\n", r.AuditOverride)
+	}
 	for _, l := range shapeLines(p.Spec, m) {
 		fmt.Fprintln(o.out, l)
 	}
@@ -445,6 +471,7 @@ func shipCmd(o *options) *cobra.Command {
 	c.Flags().StringVar(&channel, "channel", "", "channel (default: the one that moves latest, else the first)")
 	c.Flags().IntVar(&revision, "revision", 1, "package revision")
 	c.Flags().BoolVar(&o.json, "json", false, "machine-readable output")
+	o.auditFlags(c)
 	return c
 }
 
@@ -527,6 +554,7 @@ func promoteCmd(o *options) *cobra.Command {
 	c.Flags().StringVar(&to, "to", "", "target channel (required)")
 	c.Flags().IntVar(&revision, "revision", 1, "package revision")
 	c.Flags().BoolVar(&o.json, "json", false, "machine-readable output")
+	o.auditFlags(c)
 	_ = c.MarkFlagRequired("from")
 	_ = c.MarkFlagRequired("to")
 	return c

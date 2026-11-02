@@ -11,6 +11,7 @@ import (
 	"github.com/norvexlabs/stowage/internal/chown"
 	"github.com/norvexlabs/stowage/internal/front"
 	"github.com/norvexlabs/stowage/internal/project"
+	"github.com/norvexlabs/stowage/internal/sbom"
 	"github.com/norvexlabs/stowage/internal/testutil"
 )
 
@@ -148,6 +149,7 @@ func TestPublisherFieldsChangeNoDigest(t *testing.T) {
 	testutil.Edit(t, root, "stowage.yaml", `dev:    { tag: "v{v}-dev"`, `dev:    { tag: "v{v}-nightly"`)
 	testutil.Edit(t, root, "stowage.yaml", "key: env://ATLAS_SIGNING_KEY", "key: hashivault://atlas")
 	testutil.Edit(t, root, "stowage.yaml", "disks: opt-in", "disks: always")
+	testutil.Edit(t, root, "stowage.yaml", "audit: { fail_on: critical, fixable_only: true, allow: audit-allow.yaml }", "audit: { fail_on: high }")
 	if c := changed(before, inputs(build(t, root))); len(c) > 0 {
 		t.Errorf("publisher-only edits changed %v", c)
 	}
@@ -678,28 +680,20 @@ func carriers() map[string]bool {
 	return map[string]bool{"installer": true, "os-bundle": true, "disks": true, "release": true}
 }
 
-// Another scanner changes the release, its installer and its OS bundle (whose <short>-stow
-// names it, though the bundle does not preload it).
+// The scanner's recipe changes the scanner, the release, its installer and its OS bundle (whose
+// <short>-stow names it, though the bundle does not preload it), and no project image.
 func TestTheScannerReachesTheRelease(t *testing.T) {
-	t.Parallel()
 	root := testutil.CopyExample(t, "full")
-	p, err := project.Open(root, "")
-	if err != nil {
-		t.Fatal(err)
+	a := inputs(build(t, root))
+	saved := sbom.Dockerfile
+	sbom.Dockerfile = append([]byte("# another recipe\n"), saved...)
+	t.Cleanup(func() { sbom.Dockerfile = saved })
+	g := build(t, root)
+	if n, _ := g.Node(AuditID); string(n.Recipe) != string(sbom.Dockerfile) {
+		t.Error("the scanner's node does not carry the recipe it hashes")
 	}
-	v, err := p.Version()
-	if err != nil {
-		t.Fatal(err)
-	}
-	g := func(scanner string) map[string]string {
-		gr, err := Build(p, Release{Version: v, Revision: 1, Channel: firstChannel(p), Scanner: scanner})
-		if err != nil {
-			t.Fatal(err)
-		}
-		return inputs(gr)
-	}
-	c := changed(g(""), g("example.org/grype@sha256:"+strings.Repeat("a", 64)))
-	if !c[AuditID] || !c["release"] || !c["installer"] || !c["os-bundle"] {
+	c := changed(a, inputs(g))
+	if !c[AuditID] || !c["release"] || !c["installer"] || !c["os-bundle"] || c["image/api"] || c[FrontID] {
 		t.Errorf("changed = %v", c)
 	}
 }

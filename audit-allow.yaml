@@ -1,0 +1,5 @@
+# The findings Stowage's own release gate (make self-audit) accepts for a while, as a YAML list of
+#   - { id: <finding>, artifact: <front, backup, chown, audit, stowage, stowage-install or "*">,
+#       reason: <why>, expires: <YYYY-MM-DD, its last day, at most a year ahead> }
+# An expired entry counts its finding again. None is needed today.
+[]

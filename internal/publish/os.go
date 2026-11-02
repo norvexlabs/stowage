@@ -220,9 +220,6 @@ func (p *Publisher) planOS(ctx context.Context, o ShipOptions, disks bool, tag s
 			return nil, fmt.Errorf("%s: %w", a.what, err)
 		}
 	}
-	if err := p.publishClouds(ctx, pl.disks); err != nil {
-		return nil, err
-	}
 	return pl, nil
 }
 

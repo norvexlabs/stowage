@@ -1,13 +1,18 @@
 # The front every Docker install runs: Caddy with the Cloudflare DNS plugin, which the
 # dns-cloudflare TLS mode needs. `stowage ship` builds it for each project, for linux/amd64, and
 # publishes it next to the project's images; this file's bytes are its inputs. Every base is pinned
-# by digest and the plugin by version. Never Caddy 2.11.6: it cuts the response to any request
-# that carries a body at 60 s.
+# by digest, and Caddy, the plugin and the modules raised past a published vulnerability by
+# version. Never Caddy 2.11.6: it cuts the response to any request that carries a body at 60 s.
 # Caddy is cross-compiled on the publisher's own platform, never under emulation.
-FROM --platform=$BUILDPLATFORM caddy:2.11.7-builder@sha256:b25f47453fa02f7e66c0828b4b1343658808b9000950b6825c4a1cb0c988f5f8 AS builder
+FROM --platform=$BUILDPLATFORM caddy:2.11.7-builder@sha256:c4cd20eaa0b69112fd5d4f721ffc9671687e1d5d0b155c8620cf7546dbef94c0 AS builder
 ARG TARGETOS TARGETARCH
-RUN GOOS=$TARGETOS GOARCH=$TARGETARCH xcaddy build v2.11.7 --with github.com/caddy-dns/cloudflare@v0.2.4
+RUN GOOS=$TARGETOS GOARCH=$TARGETARCH xcaddy build v2.11.7 --with github.com/caddy-dns/cloudflare@v0.2.4 \
+      --replace golang.org/x/net=golang.org/x/net@v0.62.0 --replace github.com/go-jose/go-jose/v4=github.com/go-jose/go-jose/v4@v4.1.7 \
+      --replace github.com/go-chi/chi/v5=github.com/go-chi/chi/v5@v5.4.0
 
-FROM caddy:2.11.7-alpine@sha256:d8542f48d34a9cf4e4c11a478865229840e87e4c96ea3f439101f31a5d35f75f
+# Caddy's image less what the front never runs (curl and its libraries, the capability tools: the
+# front runs as root).
+FROM caddy:2.11.7-alpine@sha256:e70b164da81ef698b3ad19af799ea6086ce6d9e48ed4079eb9fe26f6fbf14ee5
+RUN apk del --no-cache curl libcap libcap-utils
 COPY --from=builder /usr/bin/caddy /usr/bin/caddy
-RUN caddy version | grep -q '^v2\.11\.7 ' && caddy list-modules | grep -qx 'dns.providers.cloudflare'
+RUN caddy version | grep -q '^v2\.11\.7 ' && caddy list-modules | grep -qx 'dns.providers.cloudflare' && ! command -v curl

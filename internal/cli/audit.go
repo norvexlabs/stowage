@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"cmp"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -31,13 +30,11 @@ func auditCmd(o *options) *cobra.Command {
 			if len(args) == 1 {
 				v = args[0]
 			}
-			cache, err := os.UserCacheDir()
+			s, err := o.scanner(db)
 			if err != nil {
 				return err
 			}
-			s := sbom.Scanner{Docker: o.docker(), Image: cmp.Or(o.scannerImage, sbom.Grype), Cache: filepath.Join(cache, "stowage", "grype"),
-				User: fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid()), DB: db}
-			rep, err := pub.Audit(cmd.Context(), channel, v, revision, s)
+			rep, err := pub.Audit(cmd.Context(), channel, v, revision, *s)
 			if err != nil {
 				return err
 			}
@@ -58,6 +55,17 @@ func auditCmd(o *options) *cobra.Command {
 	c.Flags().StringVar(&db, "db", "", "a grype database archive to scan with, for a host that does not reach grype's servers")
 	c.Flags().BoolVar(&o.json, "json", false, "machine-readable output")
 	return c
+}
+
+// scanner is the publisher's grype, which stowage audit and the audit gate run: its database kept
+// in the user's cache (~/.cache/stowage/grype), or imported from db.
+func (o *options) scanner(db string) (*sbom.Scanner, error) {
+	cache, err := os.UserCacheDir()
+	if err != nil {
+		return nil, err
+	}
+	return &sbom.Scanner{Docker: o.docker(), Image: o.scannerImage, Cache: filepath.Join(cache, "stowage", "grype"),
+		User: fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid()), DB: db}, nil
 }
 
 func (o *options) docker() sbom.Docker {

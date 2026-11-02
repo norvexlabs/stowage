@@ -16,7 +16,7 @@
 set -euo pipefail
 
 # A small multi-platform image stands in for the example's postgres: mirroring copies every platform.
-PINNED=busybox:1.37@sha256:bdf57e528e45e4433820e045b29b4597825a1c9e38353532d90a01445013f82e
+PINNED=busybox:1.37@sha256:a7dbc319b1438115a207e11930dc4bb3e643dcb3ec0bdd694bb36cd8fad289ec
 . "$(dirname "$0")/lib.sh"
 
 step "start zot, which takes OCI manifests alone (no docker2s2): every image Stowage publishes is one"
@@ -34,7 +34,7 @@ grep -q 'image front: build' "$WORK/ship1.log" || fail "the front was not built"
 grep -q 'installer: push' "$WORK/ship1.log" || fail "the installer was not pushed"
 grep -q 'chart: tag .* → charts/notes-beta:0.1.0' "$WORK/ship1.log" || fail "the chart was not pushed"
 [[ $(grep -c '^signed ' "$WORK/ship1.log") == 10 ]] || { cat "$WORK/ship1.log"; fail "want 10 signatures (3 images, the front, the backup runner, the volume helper, the scanner, the chart, the installer, the release manifest)"; }
-grep -q 'image audit: convert docker.io/anchore/grype' "$WORK/ship1.log" || fail "the scanner was not converted"
+grep -q 'image audit: build' "$WORK/ship1.log" || fail "the scanner was not built"
 [[ $(grep -c '^attested the SBOM of ' "$WORK/ship1.log") == 8 ]] || { cat "$WORK/ship1.log"; fail "want 8 SBOMs (the 7 images, the installer)"; }
 
 step "ship beta again (nothing changes)"
@@ -157,5 +157,21 @@ if [[ -n $key ]] && [[ $(curl -s -o /dev/null -w '%{http_code}' -u "publisher:$k
 else
 	fail "zot API keys: not usable with htpasswd alone ($resp)"
 fi
+
+step "the audit gate: a finding the policy refuses stops the ship before stable moves; an override publishes it, recorded"
+# Every finding counts (no fix included): the gate refuses whatever grype's database holds today.
+# The spec names a signing key of its own (lint reads the spec; the run is signed with --test-key,
+# which a test release refuses to be the project's).
+cp "$WORK/other/other.key" "$WORK/other/other.pub" "$P/keys/"
+printf 'signing: { provider: cosign-key, key: keys/other.key, public_keys: [keys/other.pub] }\naudit: { fail_on: negligible, fixable_only: false }\n' >>"$P/stowage.yaml"
+if "${S[@]}" ship --channel stable --revision 2 --audit-db "$GRYPE_DB" 2>"$WORK/gate.log"; then fail "ship published past the audit gate"; fi
+grep -q 'no channel moves to it: fix them and ship again' "$WORK/gate.log" || { tail -20 "$WORK/gate.log"; fail "the gate's refusal"; }
+grep -q "^  the project's: fixable " "$WORK/gate.log" && grep -q "^  Stowage's: fixable " "$WORK/gate.log" || { tail -20 "$WORK/gate.log"; fail "the refused findings are not printed by owner"; }
+if env -u STOWAGE_PUSH_TOKEN "${S[@]}" verify --channel stable 2>/dev/null; then fail "stable points at a release the gate refused"; fi
+STOWAGE_AUDIT_DB=$GRYPE_DB "${S[@]}" ship --channel stable --revision 2 --audit-override "e2e: accepted" 2>"$WORK/gate-override.log" >/dev/null ||
+	{ tail -20 "$WORK/gate-override.log"; fail "ship with --audit-override"; }
+grep -q 'published past its gate' "$WORK/gate-override.log" || { tail -20 "$WORK/gate-override.log"; fail "the override is not logged"; }
+env -u STOWAGE_PUSH_TOKEN "${S[@]}" verify --channel stable >"$WORK/gate-verify.txt" || { cat "$WORK/gate-verify.txt"; fail "verify after the override"; }
+grep -qx 'published past its audit gate: e2e: accepted' "$WORK/gate-verify.txt" || { cat "$WORK/gate-verify.txt"; fail "the override is not recorded on the release"; }
 
 printf '\nPASS\n'

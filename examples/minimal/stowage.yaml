@@ -24,7 +24,7 @@ registry:
 images:
   api: { context: api, dockerfile: api/Dockerfile, inputs: [api/] }
   web: { context: web, dockerfile: web/Dockerfile, inputs: [web/] }
-  postgres: { ref: "postgres:17-alpine@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24" }
+  postgres: { ref: "postgres:18-alpine@sha256:10a5c69a83035ab5239f5620d708520e8b28f5aa1f2b20143e6024532edadfb5" }
 
 stack:
   compose: deploy/compose.yaml

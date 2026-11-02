@@ -39,8 +39,11 @@ type Spec struct {
 	Channels  map[string]Channel `yaml:"channels"`
 	Registry  Registry           `yaml:"registry"`
 	Signing   *Provider          `yaml:"signing"`
-	Images    map[string]Image   `yaml:"images"`
-	Stack     Stack              `yaml:"stack"`
+	// Audit is the gate a signing release passes before a channel points at it: its SBOMs scanned,
+	// a finding the policy refuses stopping the ship. The publisher's alone (RuntimeView drops it).
+	Audit  *Audit           `yaml:"audit"`
+	Images map[string]Image `yaml:"images"`
+	Stack  Stack            `yaml:"stack"`
 	// Services are what the project asks for its compose services beyond their compose file, by
 	// service.
 	Services     map[string]Service `yaml:"services"`
@@ -80,6 +83,19 @@ type Extension struct {
 type StowageReq struct {
 	Requires string `yaml:"requires"`
 }
+
+// Audit is a release's vulnerability gate: FailOn is the lowest severity that stops a ship
+// (negligible, low, medium, high, critical); FixableOnly (true when left out) counts only the
+// findings a published version fixes; Allow is a file of the project's (sbom.ParseAllowances)
+// accepting findings for a while.
+type Audit struct {
+	FailOn      string `yaml:"fail_on" json:"fail_on"`
+	FixableOnly *bool  `yaml:"fixable_only" json:"fixable_only,omitempty"`
+	Allow       string `yaml:"allow" json:"allow,omitempty"`
+}
+
+// Fixable reports whether only fixable findings count (the default).
+func (a *Audit) Fixable() bool { return a.FixableOnly == nil || *a.FixableOnly }
 
 type VersionSpec struct {
 	Source Provider `yaml:"source"`
@@ -971,11 +987,12 @@ func (s *Spec) Signs() bool { return s.Signing != nil && s.Signing.Name != "none
 
 // RuntimeView is the part of the spec that reaches an install: the spec without the fields only
 // the publisher reads (version and changelog providers, channels, push credentials, the signing
-// key, the delete provider, the kairos shape's disks policy). Artifacts embed this view, so their inputs digests hash it and nothing else: fixing push
+// key, the audit gate, the delete provider, the kairos shape's disks policy). Artifacts embed this view, so their inputs digests hash it and nothing else: fixing push
 // credentials or a channel template must not change what a release contains.
 func (s *Spec) RuntimeView() Spec {
 	v := *s
 	v.Version = VersionSpec{}
+	v.Audit = nil
 	v.Changelog = Provider{}
 	v.Channels = nil
 	v.Registry.Push = Provider{}

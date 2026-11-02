@@ -18,7 +18,6 @@
 set -euo pipefail
 
 # The amd64 image of the example's postgres: the one e2e-docker mirrors.
-PG=postgres:17-alpine@sha256:aa90e97ee862e558111d34cfb8b2c4bec768c2b039fb791341686928560263b3
 . "$(dirname "$0")/vm.sh"
 vm_env
 . "$(dirname "$0")/lib.sh"
@@ -52,7 +51,7 @@ step "start zot"
 start_zot
 
 step "project: examples/full with its kairos shape, its installer ISO alone, a short health gate"
-KAIROS=1 new_full "$PG"
+KAIROS=1 new_full
 V1=$CALVER.1
 sed -i 's/^    disk_formats: \[raw, qcow2, ova, vhd, gce, iso\]$/    disk_formats: [iso]/; s/^    health_gate: { deadline_s: 600, /    health_gate: { deadline_s: 300, /' "$P/stowage.yaml"
 grep -qx '    disk_formats: \[iso\]' "$P/stowage.yaml" && grep -q '^    health_gate: { deadline_s: 300, ' "$P/stowage.yaml" || fail "the kairos shape was not edited"

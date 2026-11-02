@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"os"
 	"slices"
 	"sort"
 	"strings"
@@ -31,6 +32,8 @@ import (
 	"github.com/norvexlabs/stowage/internal/providers"
 	"github.com/norvexlabs/stowage/internal/registry"
 	"github.com/norvexlabs/stowage/internal/release"
+	"github.com/norvexlabs/stowage/internal/sbom"
+	"github.com/norvexlabs/stowage/internal/spec"
 	"github.com/norvexlabs/stowage/internal/version"
 )
 
@@ -68,8 +71,11 @@ type Publisher struct {
 	// SBOM makes an image's SBOM, which a signing project attests on every image, the installer and
 	// the OS bundle; it is required then.
 	SBOM SBOMMaker
-	// Scanner is the vulnerability scanner a signing release carries, pinned: sbom.Grype when empty.
-	Scanner        string
+	// Scan scans a release's SBOMs for the audit gate (spec audit) before a channel points at it;
+	// it is required then. AuditOverride, when set, is the publisher's reason to publish past a
+	// finding the gate refuses: recorded on the release manifest it writes (AuditOverrideAnnotation).
+	Scan           *sbom.Scanner
+	AuditOverride  string
 	StowageVersion string
 	// Installer is the installer executable every release's installer image is made of; Pull is
 	// the pull account baked into it (nil when registry.pull is not a token).
@@ -117,6 +123,8 @@ func (p *Publisher) releaseRepo() string {
 type Ref struct {
 	Manifest *release.Manifest
 	Digest   v1.Hash
+	// AuditOverride is the reason the release was published past its audit gate ("" for none).
+	AuditOverride string
 }
 
 func (p *Publisher) readRelease(ctx context.Context, tag string) (*Ref, error) {
@@ -135,12 +143,16 @@ func (p *Publisher) readRelease(ctx context.Context, tag string) (*Ref, error) {
 	if m.Name != p.Project.Spec.Name {
 		return nil, fmt.Errorf("%s: release of %q, not %q: %w", t, m.Name, p.Project.Spec.Name, registry.ErrNotArtifact)
 	}
-	return &Ref{m, d}, nil
+	return &Ref{Manifest: m, Digest: d, AuditOverride: a.Annotations[AuditOverrideAnnotation]}, nil
 }
+
+// AuditOverrideAnnotation records on a release manifest's artifact the reason it was published past
+// its audit gate: the signature covers it, and no install reads it.
+const AuditOverrideAnnotation = "dev.stowage.audit-override"
 
 // writeRelease pushes m by digest, signs it, and only then moves tag to it: a release tag never
 // holds an unsigned manifest of a signed project.
-func (p *Publisher) writeRelease(ctx context.Context, tag string, m *release.Manifest) (v1.Hash, error) {
+func (p *Publisher) writeRelease(ctx context.Context, tag string, m *release.Manifest, override string) (v1.Hash, error) {
 	data, err := m.Encode()
 	if err != nil {
 		return v1.Hash{}, err
@@ -149,9 +161,13 @@ func (p *Publisher) writeRelease(ctx context.Context, tag string, m *release.Man
 	if err != nil {
 		return v1.Hash{}, err
 	}
+	ann := map[string]string{registry.InputsAnnotation: m.Inputs}
+	if override != "" {
+		ann[AuditOverrideAnnotation] = override
+	}
 	d, err := p.Registry.PushArtifact(ctx, t.Repository, registry.Artifact{
 		Type: release.MediaType, Data: data,
-		Annotations: map[string]string{registry.InputsAnnotation: m.Inputs},
+		Annotations: ann,
 	})
 	if err != nil {
 		return v1.Hash{}, err
@@ -163,6 +179,126 @@ func (p *Publisher) writeRelease(ctx context.Context, tag string, m *release.Man
 		return v1.Hash{}, err
 	}
 	return v1.NewHash(d.DigestStr())
+}
+
+// auditPolicy is the spec's audit gate, checked before anything is built: nil when the project
+// declares none. A gate that cannot judge (an unsigned project, no scanner, a database file that
+// is not there, a policy or an allowlist that does not parse) stops the ship here.
+func (p *Publisher) auditPolicy() (*sbom.Policy, error) {
+	// The reason is recorded as written, less the blanks around it.
+	given := p.AuditOverride != ""
+	p.AuditOverride = strings.TrimSpace(p.AuditOverride)
+	if given && p.AuditOverride == "" {
+		return nil, errors.New("--audit-override: the reason is blank: say why the release is published past its gate")
+	}
+	pol := p.Project.Spec.Audit
+	if pol == nil {
+		if p.AuditOverride != "" {
+			return nil, errors.New("--audit-override: the project declares no audit gate (audit), so there is nothing to override and no reason would be recorded")
+		}
+		return nil, nil
+	}
+	if !p.signed() {
+		return nil, errors.New("audit: the project signs no release (signing): its releases carry no SBOM to audit")
+	}
+	if p.Scan == nil {
+		return nil, errors.New("audit: no scanner is set")
+	}
+	if p.Scan.DB != "" {
+		if _, err := os.Stat(p.Scan.DB); err != nil {
+			return nil, fmt.Errorf("audit: the database: %w", err)
+		}
+	}
+	min, on, err := sbom.FailOn(pol.FailOn)
+	if err != nil || !on {
+		return nil, fmt.Errorf("audit.fail_on %q: one of negligible, low, medium, high, critical", pol.FailOn)
+	}
+	policy := &sbom.Policy{FailOn: min, On: true, FixableOnly: pol.Fixable()}
+	if pol.Allow != "" {
+		path, err := spec.ProjectPath(p.Project.Root, pol.Allow)
+		if err != nil {
+			return nil, fmt.Errorf("audit.allow: %w", err)
+		}
+		doc, err := os.ReadFile(path)
+		if err != nil {
+			return nil, fmt.Errorf("audit.allow: %w", err)
+		}
+		if policy.Allow, err = sbom.ParseAllowances(doc, p.Now()); err != nil {
+			return nil, fmt.Errorf("audit.allow: %s: %w", pol.Allow, err)
+		}
+	}
+	return policy, nil
+}
+
+// auditGate scans the SBOMs of a release's artifacts (m's) under policy (auditPolicy; nil: no
+// gate), before the release manifest is written and before any release tag or channel moves to
+// it. A disk carries its bundle's SBOM, which the bundle's scan judges. It returns the
+// publisher's override reason when the gate refused a finding and AuditOverride accepted it, ""
+// when the release passes. An artifact left unaudited is refused whatever the override: what is
+// not scanned is not judged. unchanged is the published release m is, shipped again unchanged
+// (nil for a manifest about to be written): its manifest is not written again, so an override is
+// accepted only when one is recorded on it already, which stands; another reason is recorded on a
+// new revision.
+func (p *Publisher) auditGate(ctx context.Context, m *release.Manifest, policy *sbom.Policy, unchanged *Ref) (string, error) {
+	if policy == nil {
+		return "", nil
+	}
+	tag := m.Tag
+	all, err := sbom.Targets(p.Project.Spec.Registry.Prefix, p.Project.Spec.Name, m.Artifacts)
+	if err != nil {
+		return "", err
+	}
+	var targets []sbom.Target
+	for _, t := range all {
+		if !t.Disk {
+			targets = append(targets, t)
+		}
+	}
+	rep, err := sbom.Audit(ctx, p.Signer.Attestation, *p.Scan, targets, p.logf)
+	if err != nil {
+		return "", err
+	}
+	rep.Project, rep.Version, rep.Revision, rep.Channel, rep.Tag = m.Name, m.ProjectVersion, m.Revision, m.Channel, m.Tag
+	g := rep.Judge(*policy, p.Now())
+	for _, n := range g.Notes() {
+		p.logf("audit: %s", n)
+	}
+	gerr := g.Err(*policy)
+	if gerr == nil {
+		p.logf("audit: %s passes (%d artifacts, %d findings accepted by audit.allow)", tag, len(rep.Subjects), g.Allowed)
+		if p.AuditOverride != "" {
+			p.logf("audit: --audit-override is not needed: nothing is recorded")
+		}
+		return "", nil
+	}
+	if p.Log != nil {
+		_ = rep.Print(p.Log)
+	}
+	where := "no channel moves to it"
+	recorded := ""
+	if unchanged != nil {
+		recorded = unchanged.AuditOverride
+		where = "this ship moves nothing (a channel already pointing at the release stays there)"
+	}
+	switch {
+	case len(g.NotAudited) > 0:
+		return "", fmt.Errorf("release %s: %w; %s: each artifact's SBOM must be attested and scanned (--audit-db FILE scans without grype's servers); no override publishes past it", tag, gerr, where)
+	case p.AuditOverride == "" && recorded != "":
+		return "", fmt.Errorf("release %s: %w; %s: it was published past its gate (%s): ship or promote it again with --audit-override REASON to keep that override, which stands (another reason is recorded on a new revision of the release, %d), or fix them", tag, gerr, where, recorded, m.Revision+1)
+	case p.AuditOverride == "":
+		return "", fmt.Errorf("release %s: %w; %s: fix them and ship again, accept one for a while in audit.allow, or ship or promote with --audit-override REASON (recorded in the release)", tag, gerr, where)
+	case unchanged == nil:
+		p.logf("audit: %s published past its gate (%v): %s", tag, gerr, p.AuditOverride)
+		return p.AuditOverride, nil
+	case recorded == "":
+		return "", fmt.Errorf("release %s: %w; %s: it is published unchanged without an override, and its manifest is not written again to record one: publish a new revision of the release (%d) with --audit-override REASON (ship --revision %d; a promotion of it once the source channel holds it), or fix them", tag, gerr, where, m.Revision+1, m.Revision+1)
+	default:
+		p.logf("audit: %s past its gate (%v) by the override recorded on it: %s", tag, gerr, recorded)
+		if p.AuditOverride != recorded {
+			p.logf("audit: this ship's reason is not recorded (the release's manifest is not written again; a new revision records it): %s", p.AuditOverride)
+		}
+		return recorded, nil
+	}
 }
 
 // signed reports whether the project signs its releases.
@@ -342,6 +478,11 @@ func (p *Publisher) Ship(ctx context.Context, o ShipOptions) (*Ref, error) {
 		return nil, errors.New("signing is configured and no signer is set: refusing to publish an unsigned release")
 	}
 	if err := p.readyToPublish(); err != nil {
+		return nil, err
+	}
+	// The audit gate is checked before anything is built; it judges the release later.
+	policy, err := p.auditPolicy()
+	if err != nil {
 		return nil, err
 	}
 	ch, ok := s.Channels[o.Channel]
@@ -567,22 +708,38 @@ func (p *Publisher) Ship(ctx context.Context, o ShipOptions) (*Ref, error) {
 			return nil, err
 		}
 	}
-	for _, pl := range plans {
-		if err := p.tagImage(ctx, pl); err != nil {
-			return nil, err
+	// The images', the bundle's and the disks' release tags move, and the cloud images are
+	// registered, once the audit gate passed: a refused release leaves every tag as it was (it
+	// consumes its release number, claimed before the installer that carries it is made).
+	moveTags := func() error {
+		// The cloud images first: a failed registration leaves every tag as it was.
+		if osp != nil && len(osp.disks) > 0 {
+			if err := p.publishClouds(ctx, osp.disks); err != nil {
+				return err
+			}
 		}
+		for _, pl := range plans {
+			if err := p.tagImage(ctx, pl); err != nil {
+				return err
+			}
+		}
+		if osp != nil {
+			if err := p.tagArtifact(ctx, osp.os); err != nil {
+				return err
+			}
+			for _, a := range osp.disks {
+				if err := p.tagArtifact(ctx, a); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
 	}
 	var osDigest string
 	var disks map[string]string
 	if osp != nil {
-		if err := p.tagArtifact(ctx, osp.os); err != nil {
-			return nil, err
-		}
 		osDigest, disks = osp.os.digest, map[string]string{}
 		for _, a := range osp.disks {
-			if err := p.tagArtifact(ctx, a); err != nil {
-				return nil, err
-			}
 			disks[a.format] = a.digest
 		}
 		if len(disks) == 0 {
@@ -636,8 +793,30 @@ func (p *Publisher) Ship(ctx context.Context, o ShipOptions) (*Ref, error) {
 	var rel *Ref
 	if keptInstaller != nil && (!p.hasChart() || keptChart != nil) && sameRelease(existing.Manifest, m) {
 		p.logf("release %s unchanged", tag)
+		// Judged again before a tag moves or a channel points at it: a finding published since
+		// stops it too. The installer goes back first if it went missing: the gate reads its SBOM.
+		// A yanked release is refused below, as it was.
+		// A yanked one moves no tag and registers no cloud image: it is refused below, once its
+		// channel's pointer is settled.
+		pushed := ""
+		if existing.Manifest.Yanked == nil {
+			if pushed, err = p.pushInstaller(ctx, keptInstaller); err != nil {
+				return nil, err
+			}
+			if _, err := p.auditGate(ctx, existing.Manifest, policy, existing); err != nil {
+				return nil, err
+			}
+			if err := moveTags(); err != nil {
+				return nil, err
+			}
+		}
 		// The installer and the chart are put back if they went missing.
-		if _, err := p.publishInstaller(ctx, keptInstaller, tag); err != nil {
+		if pushed != "" {
+			err = p.tagInstaller(ctx, pushed, tag)
+		} else {
+			_, err = p.publishInstaller(ctx, keptInstaller, tag)
+		}
+		if err != nil {
 			return nil, err
 		}
 		if keptChart != nil {
@@ -687,10 +866,23 @@ func (p *Publisher) Ship(ctx context.Context, o ShipOptions) (*Ref, error) {
 		if err != nil {
 			return nil, fmt.Errorf("installer: %w", err)
 		}
-		if m.Artifacts.Installer, err = p.publishInstaller(ctx, img, tag); err != nil {
+		if m.Artifacts.Installer, err = p.pushInstaller(ctx, img); err != nil {
 			return nil, err
 		}
-		d, err := p.writeRelease(ctx, tag, m)
+		// The gate judges every artifact the manifest names before it is written, and before any
+		// release tag (the installer's, which a bootstrap runs, included) holds an artifact of it.
+		// A yanked build re-pushed is judged too: its artifacts are new.
+		override, err := p.auditGate(ctx, m, policy, nil)
+		if err != nil {
+			return nil, err
+		}
+		if err := moveTags(); err != nil {
+			return nil, err
+		}
+		if err := p.tagInstaller(ctx, m.Artifacts.Installer, tag); err != nil {
+			return nil, err
+		}
+		d, err := p.writeRelease(ctx, tag, m, override)
 		if err != nil {
 			return nil, err
 		}
@@ -699,7 +891,7 @@ func (p *Publisher) Ship(ctx context.Context, o ShipOptions) (*Ref, error) {
 				return nil, err
 			}
 		}
-		rel = &Ref{m, d}
+		rel = &Ref{Manifest: m, Digest: d, AuditOverride: override}
 		p.logf("release %s published (seq %d)", tag, m.ReleaseSeq)
 	}
 	if len(rel.Manifest.Artifacts.Disks) > 0 && recorded == nil {
@@ -876,7 +1068,7 @@ func (p *Publisher) planPinned(ctx context.Context, pl *imagePlan, repo string, 
 }
 
 // pinnedDigest parses an upstream reference pinned by digest, in Docker's usual forms
-// (`postgres:17-alpine@sha256:…`, a registry-less name meaning Docker Hub). The tag is ignored:
+// (`postgres:18-alpine@sha256:…`, a registry-less name meaning Docker Hub). The tag is ignored:
 // the digest is what is mirrored.
 func pinnedDigest(ref string) (name.Digest, error) {
 	r, err := name.ParseReference(ref)
@@ -917,28 +1109,19 @@ func (p *Publisher) prepareImage(ctx context.Context, v string, pl *imagePlan) e
 	default:
 		return nil
 	}
-	var img v1.Image
-	if pl.node.Converts != "" {
-		var err error
-		if img, err = p.convert(ctx, pl); err != nil {
-			return fmt.Errorf("image %s: %w", pl.image, err)
+	p.logf("image %s: build", pl.image)
+	req := BuildRequest{Image: pl.image, Inputs: pl.node.Inputs, Recipe: pl.node.Recipe}
+	if pl.node.ReadsVersion {
+		req.Version = v
+	}
+	img, cleanup, err := p.Builder.Build(ctx, p.Project, req)
+	defer func() {
+		if cleanup != nil {
+			cleanup()
 		}
-	} else {
-		p.logf("image %s: build", pl.image)
-		req := BuildRequest{Image: pl.image, Inputs: pl.node.Inputs, Recipe: pl.node.Recipe}
-		if pl.node.ReadsVersion {
-			req.Version = v
-		}
-		built, cleanup, err := p.Builder.Build(ctx, p.Project, req)
-		defer func() {
-			if cleanup != nil {
-				cleanup()
-			}
-		}()
-		if err != nil {
-			return fmt.Errorf("image %s: build: %w", pl.image, err)
-		}
-		img = built
+	}()
+	if err != nil {
+		return fmt.Errorf("image %s: build: %w", pl.image, err)
 	}
 	annotated, ok := mutate.Annotations(img, map[string]string{registry.InputsAnnotation: pl.node.Inputs}).(v1.Image)
 	if !ok {
@@ -957,25 +1140,6 @@ func (p *Publisher) prepareImage(ctx context.Context, v string, pl *imagePlan) e
 	}
 	pl.action, pl.from, pl.digest = actRetag, dst, d.String()
 	return nil
-}
-
-// convert reads the upstream image a node converts (by its pinned digest, which the read checks)
-// and gives it OCI media types: its layers' bytes and its config are the upstream's.
-func (p *Publisher) convert(ctx context.Context, pl *imagePlan) (v1.Image, error) {
-	ud, err := pinnedDigest(pl.node.Converts)
-	if err != nil {
-		return nil, err
-	}
-	p.logf("image %s: convert %s to OCI media types", pl.image, pl.node.Converts)
-	from := p.Upstream
-	if from == nil {
-		from = p.Registry
-	}
-	up, err := from.Image(ctx, ud)
-	if err != nil {
-		return nil, fmt.Errorf("read %s: %w", pl.node.Converts, err)
-	}
-	return toOCI(up)
 }
 
 // tagImage points the image's release tag at its digest.
@@ -1436,7 +1600,7 @@ func (p *Publisher) Yank(ctx context.Context, channel, v string, revision int, r
 	if r.Manifest.Yanked == nil {
 		m := *r.Manifest
 		m.Yanked = &release.Yank{Reason: reason, Date: p.Now().UTC()}
-		d, err := p.writeRelease(ctx, m.Tag, &m)
+		d, err := p.writeRelease(ctx, m.Tag, &m, r.AuditOverride)
 		if err != nil {
 			return err
 		}

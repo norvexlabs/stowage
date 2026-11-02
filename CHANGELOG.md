@@ -3,6 +3,36 @@
 Stowage's own releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
+## [0.25.0]
+
+### Added
+- The audit gate: a project that signs declares `audit: { fail_on, fixable_only, allow }`, and
+  `ship` and `promote` scan the release's SBOMs before the release manifest is written and before
+  a channel points at it. A fixable finding at or above `fail_on` stops the ship unless an entry of
+  the `allow` file accepts it (each entry names the finding, the artifact and a reason, and
+  expires at most a year ahead); `--audit-override REASON` publishes past it, recorded on the
+  release and printed by `verify`. `--audit-db FILE` (or `STOWAGE_AUDIT_DB`) scans offline.
+- `audit` reports split the findings between the project's artifacts and what Stowage supplies (the
+  images built from its recipes, the installer), each into fixable and no fix, and `--json` names
+  each artifact's `owner`.
+- Stowage's own release is gated the same way: `make self-audit` builds the images Stowage
+  supplies, scans them and Stowage's binaries, and refuses a fixable high or critical.
+
+### Changed
+- The scanner a signing release carries (`audit`) is grype built from its source with Go 1.27.3
+  and patched modules, no longer upstream's image (built with Go 1.26.8).
+- The front is rebuilt with patched Go modules and without curl and its libraries, which it never
+  ran; the backup runner is rclone built from its source with Go 1.27.3 and patched modules, on
+  Alpine 3.24 with only its CA certificates (no FUSE), every base pinned by digest. Together they
+  clear every fixable critical and high an audit found in them (curl, brotli, OpenSSL, zlib, the
+  Go standard library, golang.org/x/net, go-jose, grpc, chi).
+- Stowage's own Go dependencies raise golang.org/x/net to 0.62.0.
+- The examples run PostgreSQL 18 (its data volume mounted at `/var/lib/postgresql`, as the
+  PostgreSQL 18 image expects) and serve their static pages with busybox's httpd instead of nginx.
+  `examples/full` declares an audit gate (`fail_on: critical`) and passes it: its PostgreSQL image
+  upgrades its Alpine packages and switches user with su-exec in place of upstream's gosu (built
+  with an outdated Go), and the examples' Python images drop pip, which they never run.
+
 ## [0.24.0] - 2026-11-02
 
 ### Changed

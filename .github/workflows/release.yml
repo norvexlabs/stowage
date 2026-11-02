@@ -57,6 +57,11 @@ jobs:
           if-no-files-found: error
       - name: lint the examples with the asset
         run: for e in minimal full stateless; do ./dist/stowage-linux-amd64 -C "examples/$e" lint; done
+      # Stowage's own vulnerability gate: the images it supplies to every release (built from this
+      # tree's recipes) and its binaries, scanned; a fixable high or critical that audit-allow.yaml
+      # does not accept stops the run before anything is published.
+      - name: self-audit
+        run: ./bin/self-audit -bin bin -allow audit-allow.yaml
 
   # Signs and publishes what the build made; it checks out and runs nothing of the repository.
   publish:

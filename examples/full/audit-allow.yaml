@@ -1,0 +1,11 @@
+# Findings the release gate accepts for a while: the finding's id, the artifact it is in (an image
+# key, installer, os — a disk's findings are its bundle's — or "*"), why, and the last day it
+# holds (at most a year ahead).
+- id: GO-2026-6612
+  artifact: os
+  reason: golang.org/x/net and the Go standard library in containerd, ctr and docker-compose (Docker's latest packages) and Ubuntu's pebble; no release of them is built with the fix yet
+  expires: 2027-01-31
+- id: GO-2026-6604
+  artifact: os
+  reason: the Go standard library in Ubuntu's pebble (go1.27.1); no Ubuntu build with the fix yet
+  expires: 2027-01-31

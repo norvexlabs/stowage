@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"cmp"
 	"context"
+	_ "embed"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,14 +19,20 @@ import (
 	"strings"
 )
 
-// Syft and Grype are the pinned images that make and scan the documents. Grype is also a release's
-// image Key, so a mirror carries it to an install that audits without reaching the internet: its
-// linux/amd64 image alone (a release runs on that platform), a Docker v2 manifest.
+// Syft and Grype are the pinned images that make and scan the documents on the publisher's side
+// (ship, stowage audit).
 const (
 	Syft  = "docker.io/anchore/syft:v1.55.0@sha256:4cc92b64ca74ffca4c94d4c8fcc01f217731375300be14d0b6eeb2e82eaa110a"
 	Grype = "docker.io/anchore/grype:v0.121.0@sha256:d39f3ac8a9f55477aadacd051cc4199a9d2dda30600ef00fdf5c406c9f40f0b7"
-	Key   = "audit"
+	// Key is the image of the scanner a signing release carries (Dockerfile), so a mirror carries
+	// it to an install that audits without reaching the internet.
+	Key = "audit"
 )
+
+// Dockerfile builds the scanner a signing release carries. It needs no build context.
+//
+//go:embed Dockerfile
+var Dockerfile []byte
 
 // PredicateType is the in-toto predicate type of an SPDX document, and CosignType the name
 // `cosign attest --type` and `cosign verify-attestation --type` give it.

@@ -26,7 +26,6 @@ import (
 	"github.com/google/go-containerregistry/pkg/v1/mutate"
 	"github.com/google/go-containerregistry/pkg/v1/random"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
-	"github.com/google/go-containerregistry/pkg/v1/types"
 
 	"github.com/norvexlabs/stowage/internal/backup"
 	"github.com/norvexlabs/stowage/internal/chown"
@@ -174,7 +173,6 @@ type env struct {
 	root    string
 	host    string
 	reg     *registry.Client
-	scanner string // the scanner image a signing release mirrors
 	builder *fakeBuilder
 	log     *bytes.Buffer
 	now     time.Time
@@ -189,6 +187,9 @@ type env struct {
 	// privateAs404 answers a refused read as an unknown repository, as some registries do.
 	privateAs404 bool
 	signer       *fakeSigner // set by sign()
+	// scan is the audit gate's scanner, override its --audit-override.
+	scan     *sbom.Scanner
+	override string
 	// installer is the installer executable; pull the baked pull account.
 	installer []byte
 	pull      *payload.Account
@@ -367,17 +368,6 @@ func newEnv(t *testing.T) *env {
 	}
 	d, _ := up.Digest()
 	testutil.SetYAML(t, root, "stowage.yaml", []string{"images", "postgres"}, map[string]any{"ref": host + "/upstream/postgres@" + d.String()})
-	// The scanner a signing release mirrors, in place of grype's.
-	scan, err := amd64Image(64, 1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	scanTag, _ := name.NewTag(host + "/upstream/grype:1")
-	if err := remote.Write(scanTag, scan); err != nil {
-		t.Fatal(err)
-	}
-	sd, _ := scan.Digest()
-	e.scanner = host + "/upstream/grype@" + sd.String()
 	e.root, e.host, e.reg, e.builder, e.log = root, host, registry.New(authn.NewMultiKeychain()) /* no keychain: never the host's Docker login */, &fakeBuilder{}, &bytes.Buffer{}
 	e.disks = &fakeDisks{dir: t.TempDir()}
 	e.now = time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC)
@@ -394,7 +384,7 @@ func (e *env) publisher() (*Publisher, string) {
 	if err != nil {
 		e.t.Fatal(err)
 	}
-	pub := &Publisher{Project: p, Registry: e.reg, Upstream: e.reg, Builder: e.builder, StowageVersion: "0.1.0", Scanner: e.scanner,
+	pub := &Publisher{Project: p, Registry: e.reg, Upstream: e.reg, Builder: e.builder, StowageVersion: "0.1.0", Scan: e.scan, AuditOverride: e.override,
 		Installer: e.installer, Pull: e.pull, Disks: e.disks, WorkDir: e.t.TempDir(), Anonymous: e.anon, Now: func() time.Time { return e.now }, Log: e.log}
 	if e.signer != nil {
 		pub.Signer, pub.SBOM = e.signer, e.signer
@@ -1027,7 +1017,7 @@ func TestShipReplacesAPointerLeftOnAYankedRelease(t *testing.T) {
 	p, _ := e.publisher()
 	m := *stale.Manifest
 	m.Yanked = &release.Yank{Reason: "bad", Date: e.now}
-	if _, err := p.writeRelease(context.Background(), m.Tag, &m); err != nil { // yank, then "crash"
+	if _, err := p.writeRelease(context.Background(), m.Tag, &m, ""); err != nil { // yank, then "crash"
 		t.Fatal(err)
 	}
 	eq(t, "pointer still stale", e.digest("notes-release", "stable"), stale.Digest.String())
@@ -1043,7 +1033,7 @@ func TestReleasesSkipsAVersionTheSchemeNoLongerReads(t *testing.T) {
 	p, _ := e.publisher()
 	m := *first.Manifest
 	m.ProjectVersion, m.Tag = "not-a-version", "not-a-version"
-	if _, err := p.writeRelease(context.Background(), m.Tag, &m); err != nil {
+	if _, err := p.writeRelease(context.Background(), m.Tag, &m, ""); err != nil {
 		t.Fatal(err)
 	}
 	rs, err := p.Releases(context.Background(), "stable")
@@ -1061,11 +1051,11 @@ func TestPointerOnAVersionTheSchemeNoLongerReadsMoves(t *testing.T) {
 	p, _ := e.publisher()
 	m := *first.Manifest
 	m.ProjectVersion, m.Tag = "legacy", "legacy"
-	old, err := p.writeRelease(context.Background(), m.Tag, &m)
+	old, err := p.writeRelease(context.Background(), m.Tag, &m, "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := p.movePointer(context.Background(), "stable", &Ref{&m, old}); err != nil {
+	if err := p.movePointer(context.Background(), "stable", &Ref{Manifest: &m, Digest: old}); err != nil {
 		t.Fatal(err)
 	}
 	e.bump("1.1.0")
@@ -1209,48 +1199,36 @@ func TestASignedProjectSignsEveryArtifactBeforeItsTagMoves(t *testing.T) {
 	eq(t, "public keys", len(keys) == 1 && keys[0] == readFile(t, e.root+"/keys/release.pub"), true)
 }
 
-// The scanner, a Docker v2 image upstream, is published with OCI media types (a registry need take
-// no Docker manifest): converted once, its layers and its config the upstream's, kept by a
-// re-ship and by a promotion.
-func TestTheScannerIsPublishedAsOCI(t *testing.T) {
+// The scanner is built from its recipe, signed, and kept by a re-ship and by a promotion.
+func TestTheScannerIsBuiltFromItsRecipe(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
 	e.sign()
 	r := e.mustShip("stable", 1)
 	d := r.Manifest.Artifacts.Images[sbom.Key]
-	up, _ := pinnedDigest(e.scanner)
-	if d == "" || d == up.DigestStr() {
-		t.Fatalf("the scanner's digest %q, upstream %s", d, up.DigestStr())
+	built := func() (n int) {
+		for _, b := range e.builder.built {
+			if b.Image == sbom.Key {
+				if string(b.Recipe) != string(sbom.Dockerfile) || b.Context != "" {
+					t.Errorf("the scanner built from %q, context %q", b.Recipe, b.Context)
+				}
+				n++
+			}
+		}
+		return n
 	}
-	ref, _ := e.reg.Digest(e.host+"/acme/notes/notes-"+sbom.Key, d)
-	img, err := e.reg.Image(context.Background(), ref)
-	if err != nil {
-		t.Fatal(err)
-	}
-	m, _ := img.Manifest()
-	if m.MediaType != types.OCIManifestSchema1 || m.Config.MediaType != types.OCIConfigJSON || len(m.Layers) == 0 || slices.ContainsFunc(m.Layers, func(l v1.Descriptor) bool { return l.MediaType != types.OCILayer }) {
-		t.Errorf("media types %+v", m)
-	}
-	upImg, _ := e.reg.Image(context.Background(), up)
-	if um, _ := upImg.Manifest(); um.MediaType != types.DockerManifestSchema2 {
-		t.Fatalf("upstream %s: not the Docker image this test converts", um.MediaType)
-	}
-	cf, _ := img.ConfigFile()
-	ucf, _ := upImg.ConfigFile()
-	if !slices.Equal(cf.RootFS.DiffIDs, ucf.RootFS.DiffIDs) || !slices.Equal(cf.Config.Entrypoint, ucf.Config.Entrypoint) || cf.Architecture != "amd64" {
-		t.Errorf("config %+v, upstream %+v", cf, ucf)
-	}
-	eq(t, "the scanner signed", e.signedRef("notes-"+sbom.Key, d), true)
-	eq(t, "conversions", strings.Count(e.log.String(), "image audit: convert "), 1)
+	eq(t, "builds", built(), 1)
+	eq(t, "the scanner signed", d != "" && e.signedRef("notes-"+sbom.Key, d), true)
 	e.mustShip("stable", 1)
-	eq(t, "a re-ship converts nothing", strings.Count(e.log.String(), "image audit: convert "), 1)
+	eq(t, "a re-ship builds nothing", built(), 0)
+	e.builder.built = nil
 	p, v := e.publisher()
 	st, err := p.Promote(context.Background(), v, "stable", "beta", 1)
 	if err != nil {
 		t.Fatalf("%v\n%s", err, e.log)
 	}
 	eq(t, "the promoted scanner", st.Manifest.Artifacts.Images[sbom.Key], d)
-	eq(t, "a promotion converts nothing", strings.Count(e.log.String(), "image audit: convert "), 1)
+	eq(t, "a promotion builds nothing", built(), 0)
 }
 
 // A signing project attests the SBOM of every image, the installer and the OS bundle, once: a
@@ -1511,7 +1489,7 @@ func TestAManifestNamingNoReferenceIsIncomplete(t *testing.T) {
 	m := *r.Manifest
 	m.Artifacts.Images = map[string]string{"Not A Key": "sha256:x"}
 	p, _ := e.publisher()
-	if err := p.verifyRelease(context.Background(), &Ref{&m, r.Digest}, m.Tag); !incomplete(err) {
+	if err := p.verifyRelease(context.Background(), &Ref{Manifest: &m, Digest: r.Digest}, m.Tag); !incomplete(err) {
 		t.Fatalf("got %v", err)
 	}
 }

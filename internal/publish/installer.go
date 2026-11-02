@@ -38,7 +38,7 @@ func (p *Publisher) installerRepo() string {
 
 // Graph computes the release's build graph with what this publisher's installer carries.
 func (p *Publisher) Graph(v string, revision int, channel string) (*graph.Graph, error) {
-	r := graph.Release{Version: v, Revision: revision, Channel: channel, Installer: p.Installer, Scanner: p.Scanner}
+	r := graph.Release{Version: v, Revision: revision, Channel: channel, Installer: p.Installer}
 	if a := p.Pull; a != nil {
 		r.Pull = a.User + ":" + a.Password
 	}
@@ -239,6 +239,15 @@ func (p *Publisher) installerImage(m *release.Manifest) (v1.Image, error) {
 // publishInstaller puts img in the installer repository by digest, signs it, then moves the
 // release's tag to it, and returns its digest. What is already in place is left alone.
 func (p *Publisher) publishInstaller(ctx context.Context, img v1.Image, tag string) (string, error) {
+	h, err := p.pushInstaller(ctx, img)
+	if err != nil {
+		return "", err
+	}
+	return h, p.tagInstaller(ctx, h, tag)
+}
+
+// pushInstaller pushes the installer image by digest, signs it and attests its SBOM: no tag moves.
+func (p *Publisher) pushInstaller(ctx context.Context, img v1.Image) (string, error) {
 	h, err := img.Digest()
 	if err != nil {
 		return "", err
@@ -261,19 +270,28 @@ func (p *Publisher) publishInstaller(ctx context.Context, img v1.Image, tag stri
 	if err := p.ensureSBOM(ctx, d); err != nil {
 		return "", fmt.Errorf("installer: %w", err)
 	}
+	return h.String(), nil
+}
+
+// tagInstaller points the installer's release tag at the installer h, pushed by pushInstaller.
+func (p *Publisher) tagInstaller(ctx context.Context, h, tag string) error {
+	d, err := p.Registry.Digest(p.installerRepo(), h)
+	if err != nil {
+		return err
+	}
 	t, err := p.Registry.Tag(p.installerRepo(), tag)
 	if err != nil {
-		return "", err
+		return err
 	}
 	if have, err := p.Registry.Head(ctx, t); err != nil {
-		return "", err
-	} else if have == nil || have.Digest != h {
-		p.logf("installer: tag %s → %s", registry.Short(h.String()), tag)
+		return err
+	} else if have == nil || have.Digest.String() != h {
+		p.logf("installer: tag %s → %s", registry.Short(h), tag)
 		if err := p.Registry.Retag(ctx, d, t); err != nil {
-			return "", err
+			return err
 		}
 	}
-	return h.String(), nil
+	return nil
 }
 
 // LatestTag is the installer tag the bootstrap one-liner pulls.

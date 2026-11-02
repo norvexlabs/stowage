@@ -24,7 +24,6 @@
 set -euo pipefail
 
 # The amd64 image of the example's postgres: the one e2e-docker mirrors.
-PG=postgres:17-alpine@sha256:aa90e97ee862e558111d34cfb8b2c4bec768c2b039fb791341686928560263b3
 . "$(dirname "$0")/lib.sh"
 
 D=$WORK/stowage-e2e-install
@@ -57,7 +56,7 @@ step "start zot"
 start_zot
 
 step "project, ship this month's first release"
-new_full "$PG"
+new_full
 V1=$CALVER.1 V2=$CALVER.2 V3=$CALVER.3
 "${S[@]}" ship --channel stable 2>"$WORK/ship-$V1.log" || { cat "$WORK/ship-$V1.log"; fail "ship $V1"; }
 grep -q 'not in the current month' "$WORK/ship-$V1.log" && fail "this month's release is out of its month"

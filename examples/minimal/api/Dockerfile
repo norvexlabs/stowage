@@ -1,4 +1,6 @@
-FROM python:3.13-alpine@sha256:2d9aefe2fef018a7eb2c13064c89c71929800fd2e5dccdbf52ea5da5bb8d929a
+FROM python:3.13-alpine@sha256:7984cf56ceaddebe4fefeb75d64000b9f45d8b77b11a09b24524da6cdc3af0c8
+# The image runs Python's standard library alone: pip, and the packages it vendors, are removed.
+RUN python -m pip uninstall -y -q pip && rm -rf /usr/local/lib/python3.13/ensurepip
 ARG STOWAGE_PROJECT_VERSION=dev
 ENV NOTES_VERSION=${STOWAGE_PROJECT_VERSION}
 COPY notes-api /usr/local/bin/notes-api

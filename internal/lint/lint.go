@@ -29,6 +29,7 @@ import (
 	"github.com/norvexlabs/stowage/internal/kairos"
 	"github.com/norvexlabs/stowage/internal/lock"
 	"github.com/norvexlabs/stowage/internal/providers"
+	"github.com/norvexlabs/stowage/internal/sbom"
 	"github.com/norvexlabs/stowage/internal/spec"
 	"github.com/norvexlabs/stowage/internal/tune"
 	"github.com/norvexlabs/stowage/internal/version"
@@ -118,6 +119,7 @@ func Run(root, specPath string, now time.Time) (*Result, error) {
 	l.versioning()
 	l.channels()
 	l.registry()
+	l.audit()
 	l.images()
 	l.stack()
 	l.memory()
@@ -330,6 +332,31 @@ func (l *linter) registry() {
 		for i, k := range c.PublicKeys {
 			l.publicKey(fmt.Sprintf("signing.public_keys[%d]", i), k)
 		}
+	}
+}
+
+// audit checks the release gate: a signing project (only its releases carry SBOMs), a severity,
+// and an allowlist file that parses.
+func (l *linter) audit() {
+	a := l.s.Audit
+	if a == nil {
+		return
+	}
+	if !l.s.Signs() {
+		l.errf("audit", "a project that signs no release (signing) carries no SBOM to audit: sign its releases, or remove audit")
+	}
+	if min, on, err := sbom.FailOn(a.FailOn); err != nil || !on || min < sbom.Negligible {
+		l.errf("audit.fail_on", "%q: one of negligible, low, medium, high, critical", a.FailOn)
+	}
+	if a.Allow == "" || !l.exists("audit.allow", a.Allow, false) {
+		return
+	}
+	doc, err := os.ReadFile(spec.Path(l.root, a.Allow))
+	if err == nil {
+		_, err = sbom.ParseAllowances(doc, l.now)
+	}
+	if err != nil {
+		l.errf("audit.allow", "%s: %v", a.Allow, err)
 	}
 }
 
