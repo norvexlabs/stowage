@@ -3,7 +3,7 @@
 Stowage's own releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
-## [0.26.0]
+## [0.26.0] - 2026-11-03
 
 ### Added
 - An entry of the audit gate's `allow` file can be narrowed with `package` and `path`: it then
