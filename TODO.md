@@ -49,6 +49,16 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
 
 ## Should
 
+- **A set narrowed under `flush_conntrack` leaves the flows its removed elements admitted
+  open**: a service's `sets` rewritten with fewer elements (an input's `--set` with fewer
+  entries, the app socket) reloads the set with the table held, so no flush fires, and a flow the
+  removed element admitted keeps riding the table's `ct state established accept` until it ends
+  (TCP's established timeout is 5 days); the workaround is `sudo conntrack -F` by hand. A narrowing
+  of a set feeding a table that declares `flush_conntrack` should end those flows: flush as for a
+  table load, or, finer, delete over netlink only the entries matching the removed elements by the
+  set's key (address, port). Widening needs nothing. The start's output says which happened, as a
+  table load's does.
+
 - **A `local` rclone destination is accepted, then never works**: where rclone runs in a
   throw-away container (`docker run --rm`, the Docker shape), a `type = local` remote writes
   inside it and the file is gone — `backup config` saves it, then `backup verify` and `backup run`
@@ -402,8 +412,7 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
 
 - **`flush_conntrack`, leftovers** (review): a host whose kernel has no connection-tracking
   netlink (the flush fails with nothing to flush) keeps the `.flush` mark and warns at every start;
-  a set's change (an input, the app socket) never flushes, so a source dropped from an allow-list
-  keeps its open connections; e2e-full-vm watches an SSH session across the flush, not a
+  e2e-full-vm watches an SSH session across the flush, not a
   connection through the front's published ports (Docker's DNAT made again on the next packet).
 
 - **The daemon's start applies a record its networkd file differs from once**: a failure (networkd
