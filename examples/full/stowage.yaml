@@ -222,7 +222,7 @@ shapes:
     schema: { url_env: DATABASE_URL, image: postgres }            # k8s upgrade records the schema, k8s rollback checks it
   kairos:
     base: ubuntu:26.04@sha256:c098726dd9b9733f3e885f8de0ef375206a311b0a317eadc40d347b1115fb944
-    kairos_init: quay.io/kairos/kairos-init:v4.4.0-rc2@sha256:ac885c9f3002a3f0e7000947e3d1e2a5c95f5e2d0212d5f9bbd663347f1ebe0c
+    kairos_init: quay.io/kairos/kairos-init:v4.4.0@sha256:eb131bd9b4ed5b9b25cf761af9afa7d462bef27c2d0e9453ce884cf7733a6556
     disk_formats: [raw, qcow2, ova, vhd, gce, iso]
     cloud_publish: [aws, azure, gcp]
     disks: opt-in   # always: every ship publishes the disks; opt-in (the default): a ship asked to (--disks)

@@ -736,12 +736,13 @@ func TestATableLoadedAnewFlushesTheConnectionTracking(t *testing.T) {
 	flushErr = nil
 	start(1, "a flush failed before")
 	start(0, "flushed since")
-	// A table held, loaded again for its sets alone (their script unread), flushes nothing.
+	// A table held, loaded again for its sets alone as their script is unread: what they held is
+	// unknown, so it flushes.
 	sets := filepath.Join(in.O.Dir, TablesDir, "ingest"+SetsSuffix)
 	if err := os.MkdirAll(sets, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	start(0, "a load for the sets alone")
+	start(1, "a load for the sets alone, their script unread")
 	if err := os.RemoveAll(sets); err != nil {
 		t.Fatal(err)
 	}
@@ -780,5 +781,170 @@ func TestATableLoadedAnewFlushesTheConnectionTracking(t *testing.T) {
 	start(0, "the same table, without flush_conntrack")
 	if strings.Contains(log.String(), "note:") {
 		t.Errorf("a note for a table held:\n%s", log.String())
+	}
+}
+
+// Under flush_conntrack, a held table whose input-filled sets change flushes the
+// connection-tracking table, as a load does — an element added (a set the rules deny by) or
+// removed (one they admit by); the same sets flush nothing; a change nft refuses flushes nothing,
+// then or later; a set no longer filled loads the table again; a sets record not of setScripts'
+// form counts as unknown; the boot drops a flush still due, as a reboot empties the table.
+func TestAChangedSetFlushesTheConnectionTracking(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	host := &stdinHost{}
+	r := testRelease(t, "1.0.0")
+	r.Nftables = map[string][]byte{"ingest": []byte(ingestTable)}
+	r.Spec.Services = map[string]spec.Service{"ingest": {FlushConntrack: true, Sets: map[string]string{"probes": "PROBES"}}}
+	var log bytes.Buffer
+	flushes, flushErr := 0, error(nil)
+	in := &Installer{R: r, O: Options{Dir: t.TempDir(), Firewall: t.TempDir(), Host: host, Log: &log,
+		FlushConntrack: func() error { flushes++; return flushErr }}}
+	vals := map[string]string{"PROBES": "192.0.2.7"}
+	get := func(k string) string { return vals[k] }
+	start := func(want int, what string) {
+		t.Helper()
+		flushes = 0
+		if err := in.loadTables(ctx, get); err != nil || flushes != want {
+			t.Errorf("%s: %v, %d flushes, want %d\n%s", what, err, flushes, want, log.String())
+		}
+	}
+	mark := filepath.Join(in.O.Dir, TablesDir, "ingest.flush")
+	start(1, "the first load")
+	start(0, "the same sets")
+	vals["PROBES"] = "192.0.2.7, 198.51.100.0/24"
+	start(1, "an element added")
+	vals["PROBES"] = "198.51.100.0/24"
+	start(1, "an element removed")
+	if !strings.Contains(log.String(), "flushed the host's connection-tracking table (services.ingest.flush_conntrack): the connections open before meet the tables and sets now loaded as new ones") {
+		t.Errorf("the flush is not logged:\n%s", log.String())
+	}
+	vals["PROBES"] = " "
+	start(1, "a set emptied")
+	// Refused by nft: the mark written for it goes, and the next start flushes nothing.
+	vals["PROBES"], host.refuse = "192.0.2.2", "192.0.2.2"
+	flushes = 0
+	if err := in.loadTables(ctx, get); err == nil || flushes != 0 || fileExists(mark) {
+		t.Errorf("refused: %v, %d flushes, mark %v", err, flushes, fileExists(mark))
+	}
+	host.refuse, vals["PROBES"] = "", " "
+	start(0, "the sets as before the refusal")
+	// A flush that fails is due at the next start, which flushes for it.
+	vals["PROBES"], flushErr = "192.0.2.1", errors.New("operation not permitted")
+	start(1, "a flush that fails")
+	flushErr = nil
+	start(1, "the flush due from before")
+	start(0, "flushed since")
+	// A release that fills the set no more loads the table again, emptying it.
+	host.ran = nil
+	r.Spec.Services = map[string]spec.Service{"ingest": {FlushConntrack: true}}
+	start(1, "a set no longer filled")
+	if len(host.ran) != 2 || !strings.Contains(host.ran[1], "delete table inet ingest") {
+		t.Errorf("the table is not loaded again: %q", host.ran)
+	}
+	r.Spec.Services = map[string]spec.Service{"ingest": {FlushConntrack: true, Sets: map[string]string{"probes": "PROBES", "peers": "PEERS"}}}
+	vals["PEERS"] = " "
+	start(1, "sets filled anew")
+	// One set of two no longer filled, though it was empty: the table loads again, which also
+	// empties what the app socket fed.
+	host.ran = nil
+	r.Spec.Services = map[string]spec.Service{"ingest": {FlushConntrack: true, Sets: map[string]string{"probes": "PROBES"}}}
+	start(1, "one set of two no longer filled")
+	if len(host.ran) != 2 || !strings.Contains(host.ran[1], "delete table inet ingest") {
+		t.Errorf("the table is not loaded again: %q", host.ran)
+	}
+	// A record not of setScripts' form: what the sets hold is unknown, the table loads again.
+	setsFile := filepath.Join(in.O.Dir, TablesDir, "ingest"+SetsSuffix)
+	if err := os.WriteFile(setsFile, []byte("add element inet ingest probes { 192.0.2.1 }\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	host.ran = nil
+	r.Spec.Services = map[string]spec.Service{"ingest": {FlushConntrack: true}}
+	start(1, "a record of another form")
+	if len(host.ran) != 2 || !strings.Contains(host.ran[1], "delete table inet ingest") {
+		t.Errorf("the table is not loaded again: %q", host.ran)
+	}
+	// A load nft refuses changes nothing: the mark written for it goes, and a start back on the
+	// sets the firewall holds flushes nothing.
+	r.Spec.Services = map[string]spec.Service{"ingest": {FlushConntrack: true, Sets: map[string]string{"probes": "PROBES"}}}
+	start(1, "filled again")
+	host.refuse = "delete table inet ingest"
+	r.Spec.Services = map[string]spec.Service{"ingest": {FlushConntrack: true}}
+	flushes = 0
+	if err := in.loadTables(ctx, get); err == nil || flushes != 0 || fileExists(mark) {
+		t.Errorf("a refused load: %v, %d flushes, mark %v", err, flushes, fileExists(mark))
+	}
+	host.refuse = ""
+	r.Spec.Services = map[string]spec.Service{"ingest": {FlushConntrack: true, Sets: map[string]string{"probes": "PROBES"}}}
+	start(0, "back on the sets the firewall holds")
+	// The boot drops a flush still due from an earlier boot; one of this boot (the unit run again
+	// by hand) stays, as does one whose boot is not known. The mark holds the boot it was written in.
+	in.O.BootIDFile = filepath.Join(t.TempDir(), "boot_id")
+	if err := os.WriteFile(in.O.BootIDFile, []byte("b2\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct {
+		boot string
+		kept bool
+	}{{"b1", false}, {"", true}, {"b2", true}} {
+		if err := os.WriteFile(mark, []byte(c.boot), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := in.bootTables(ctx); err != nil || fileExists(mark) != c.kept {
+			t.Errorf("boot, a mark of boot %q: %v, kept %v", c.boot, err, fileExists(mark))
+		}
+	}
+	_ = os.Remove(mark)
+	vals["PROBES"], flushErr = "192.0.2.4", errors.New("operation not permitted")
+	r.Spec.Services = map[string]spec.Service{"ingest": {FlushConntrack: true, Sets: map[string]string{"probes": "PROBES"}}}
+	start(1, "a flush that fails, in boot b2")
+	flushErr = nil
+	if b, _ := os.ReadFile(mark); string(b) != "b2" {
+		t.Errorf("the mark holds %q", b)
+	}
+	// Without flush_conntrack a change flushes nothing.
+	r.Spec.Services = map[string]spec.Service{"ingest": {Sets: map[string]string{"probes": "PROBES"}}}
+	vals["PROBES"] = "192.0.2.3"
+	start(0, "without flush_conntrack")
+}
+
+func TestSetsDropped(t *testing.T) {
+	t.Parallel()
+	a := "flush set inet t s\nadd element inet t s { 192.0.2.1, 10.0.0.1 . 80 }\nflush set inet t u\n"
+	for _, c := range []struct {
+		prev, next string
+		want       bool
+	}{
+		{a, a, false},
+		{a, "flush set inet t s\nflush set inet t u\n", false},
+		{a, a + "flush set inet t v\n", false},
+		{a, "flush set inet t s\n", true},
+		{a, "", true},
+		{"", a, false},
+		{"", "", false},
+		{"add element inet t s { 192.0.2.1 }\n", a, true},
+	} {
+		if got := setsDropped(c.prev, c.next); got != c.want {
+			t.Errorf("%q → %q: %v, want %v", c.prev, c.next, got, c.want)
+		}
+	}
+}
+
+// The sets route never flushes the connection-tracking table, flush_conntrack or not: the app's
+// calls come often, and a flush ends every flow of the host's.
+func TestTheSetsRouteFlushesNothing(t *testing.T) {
+	t.Parallel()
+	r := testRelease(t, "1.0.0")
+	r.Nftables = map[string][]byte{"ingest": []byte(ingestTable)}
+	r.Spec.Services = map[string]spec.Service{"ingest": {FlushConntrack: true}}
+	flushes := 0
+	h := &Hostd{R: r, O: Options{Dir: t.TempDir(), Host: &nftHost{}, Log: io.Discard, FlushConntrack: func() error { flushes++; return nil }}}
+	api := h.routes(true)
+	for _, body := range []string{`{"add": ["192.0.2.1"]}`, `{"delete": ["192.0.2.1"]}`} {
+		w := httptest.NewRecorder()
+		api.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/v1/nftables/ingest/sets/probes", strings.NewReader(body)))
+		if w.Code != http.StatusOK || flushes != 0 {
+			t.Errorf("%s: %d %s, %d flushes", body, w.Code, w.Body, flushes)
+		}
 	}
 }

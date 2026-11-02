@@ -1,4 +1,4 @@
-# Kairos's /system/oem/08_grub.yaml (kairos-init v4.4.0-rc2) as {{.Name}}'s OS bundle installs it: the
+# Kairos's /system/oem/08_grub.yaml (kairos-init v4.4.0) as {{.Name}}'s OS bundle installs it: the
 # boot.before step that removed the boot assessment's sentinels on every boot of the active
 # system is left out. `{{.Ctl}} health-gate` removes them once the install the boot brought up
 # is healthy; before that, a reboot is a failed boot and GRUB boots the fallback (passive) entry.

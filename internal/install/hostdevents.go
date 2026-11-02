@@ -60,6 +60,7 @@ const (
 	evInstallFailed   = "install.failed"
 	evCertExpiring    = "cert.expiring"
 	evBackupConfig    = "backup.config"
+	evNoRoute6        = "network.no_ipv6_route"
 )
 
 // Why a job was lost, and a reboot cancelled at the daemon's start.

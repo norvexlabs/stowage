@@ -57,7 +57,7 @@ RUN chmod 0440 /etc/sudoers.d/10-{{.Name}} \
     && echo "{{.OSVersion}}" > /etc/{{.Name}}/os-version \
     && mkdir -p /etc/systemd/system/multi-user.target.wants /etc/systemd/system/getty.target.wants \
     && (getent group admin >/dev/null || groupadd --system admin) \
-    && for u in {{.Name}}-expand.service {{.Name}}-preload.service {{.Name}}.service {{.Name}}-health.service {{.Name}}-hostd.service {{.Name}}-network.service {{.Name}}-tune.service {{.Name}}-tune-online.service {{.Name}}-tables.service; do \
+    && for u in {{.Name}}-expand.service {{.Name}}-preload.service {{.Name}}.service {{.Name}}-health.service {{.Name}}-hostd.service {{.Name}}-network.service {{.Name}}-tune.service {{.Name}}-tune-online.service {{.Name}}-route6.service {{.Name}}-tables.service; do \
            ln -sf /etc/systemd/system/$u /etc/systemd/system/multi-user.target.wants/$u; done \
     && ln -sf /lib/systemd/system/docker.service /etc/systemd/system/multi-user.target.wants/docker.service \
     && ln -sf /lib/systemd/system/nftables.service /etc/systemd/system/multi-user.target.wants/nftables.service \
@@ -247,8 +247,8 @@ RUN set -e; if [ ! -e /etc/default/locale ]; then \
 # build fails when kairos-init's file is no longer the one that copy is derived from, naming the
 # release it is derived from.
 RUN set -e; f=/system/oem/08_grub.yaml; \
-    echo "25f60229d81892d0ddd437d8f880a4fc92668fd0e8ddcb8a88e26e4c5a04d7e2  $f" | sha256sum -c - || \
-        { echo "shapes.kairos.kairos_init: its $f is not the one this stowage's boot assessment is derived from: use kairos-init v4.4.0-rc2" >&2; exit 1; }; \
+    echo "a8d0b7ba11e554651ffaa7ec1cf132b217679be3bc387675ea1ad4ca40d104e5  $f" | sha256sum -c - || \
+        { echo "shapes.kairos.kairos_init: its $f is not the one this stowage's boot assessment is derived from: use kairos-init v4.4.0" >&2; exit 1; }; \
     mv /usr/share/{{.Name}}/08_grub.yaml "$f"; \
     rmdir /usr/share/{{.Name}}; \
     ! grep -q 'Remove GRUB sentinels' "$f"

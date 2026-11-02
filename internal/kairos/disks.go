@@ -27,7 +27,7 @@ import (
 
 // Auroraboot is the image that makes the raw disk from the bundle; the other formats are made
 // from that disk.
-const Auroraboot = "quay.io/kairos/auroraboot:v0.28.0@sha256:9a3ae40ca2f4e5856055502ad72ff3b6343758b78a97968387ee3af0233892c2"
+const Auroraboot = "quay.io/kairos/auroraboot:v0.29.0@sha256:8d88e63907a1c01e1bae431fe7d0edd846750ff8a09358e3fad493a329894dea"
 
 //go:embed disktools.Dockerfile
 var disktools string

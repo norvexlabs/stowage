@@ -3,6 +3,31 @@
 Stowage's own releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
+## [0.24.0]
+
+### Changed
+- The OS bundle is built on Kairos 4.4.0 (kairos-init `v4.4.0`, was the release candidate) and its
+  disks with AuroraBoot v0.29.0. A project's `shapes.kairos.kairos_init` pins
+  `quay.io/kairos/kairos-init:v4.4.0@sha256:eb131bd9b4ed5b9b25cf761af9afa7d462bef27c2d0e9453ce884cf7733a6556`:
+  the build refuses `v4.4.0-rc2` now, and lint warns of it.
+
+### Fixed
+- With IPv6 on, a VM whose link also carries a router that is not a default one (router lifetime
+  0) could run for minutes without an IPv6 default route, its services' IPv6 traffic going nowhere,
+  as networkd stops soliciting at the first router that answers. The boot now waits up to a minute
+  for the route before Docker starts, soliciting the routers again with backoff, and the host
+  daemon keeps soliciting while it is missing; a minute without one is a `status` warning and a
+  `network.no_ipv6_route` event.
+
+- `flush_conntrack` now also flushes when a start changes a set an input fills — the input's
+  value, a set the release no longer fills, a set an input starts filling — so open flows meet the
+  set as it is now (an element removed from an allow-list, or added to a deny-list) instead of
+  riding the table's established fast path. The same values flush nothing; a flush still due from
+  an earlier boot is dropped at boot. The app socket's set changes never flush.
+
+- A release that stops filling one of a table's sets while it still fills another left that set
+  holding the last input's elements until a reboot; the table now loads again, which empties it.
+
 ## [0.23.0] - 2026-11-02
 
 ### Added

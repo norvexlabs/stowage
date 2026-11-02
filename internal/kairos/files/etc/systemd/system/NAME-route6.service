@@ -1,0 +1,18 @@
+[Unit]
+Description={{.Name}}: with IPv6 on, wait (a minute at most) for the IPv6 default route, soliciting the routers, before Docker starts
+# The installer ISO boots this system live, to install it: no host of the stack.
+ConditionPathExists=!/run/cos/live_mode
+# After the cloud-config's boot stage, which writes the network `vm create` gave (whether IPv6 is on).
+After=network-online.target cos-setup-boot.service
+Wants=network-online.target
+Before=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/{{.Ctl}} route6-boot
+# The verb bounds itself at 60 s.
+TimeoutStartSec=120
+
+[Install]
+WantedBy=multi-user.target

@@ -108,6 +108,8 @@ type Hostd struct {
 	Systemd string
 	// Statfs reads the space of a directory's filesystem; nil is the system's.
 	Statfs func(dir string) *Disk
+	// Solicit sends a router solicitation on a link; nil is sendRouterSolicitation. Tests set it.
+	Solicit func(iface string) error
 	// Docker: the daemon of a Docker install, run in the installer's process (dockerhost.go): no
 	// boot, no health gate, no banner; its units the installer's own; DiskDir the Docker engine's
 	// data, whose filesystem the disk-pressure watch reads.
@@ -165,6 +167,10 @@ type Hostd struct {
 	onEvent func(evs []Event)
 	// bootRec holds this boot's boot.started once read (boot).
 	bootRec bootCache
+	// route6Mu guards route6Warn, the warning of a primary link without an IPv6 default route
+	// (route6Watch).
+	route6Mu   sync.Mutex
+	route6Warn string
 }
 
 // job is a long run the daemon does on its own: an upgrade.
@@ -285,6 +291,9 @@ type Status struct {
 	// EventsError then says why: a reader never takes a cursor the journal did not give.
 	Events      *int64 `json:"events"`
 	EventsError string `json:"events_error,omitempty"`
+	// NetworkWarning: IPv6 is on and the primary link has had no IPv6 default route for a minute
+	// or more; the daemon solicits the routers until one answers.
+	NetworkWarning string `json:"network_warning,omitempty"`
 }
 
 // Disk is the persistent partition's space.
@@ -426,6 +435,9 @@ func (h *Hostd) Serve(ctx context.Context, path string) error {
 		h.pressureWatch(wctx)
 	}()
 	go h.certWatch(wctx)
+	if !h.Docker {
+		go h.route6Watch(wctx)
+	}
 	// One server failing stops the others: the daemon is restarted whole.
 	var first error
 	for range servers {
@@ -755,6 +767,7 @@ func (h *Hostd) status(w http.ResponseWriter, r *http.Request) {
 	}
 	st.FailedBoot = lastFailedBoot(in.O.Dir)
 	st.BootID = h.bootID()
+	st.NetworkWarning = h.route6Warning()
 	if a, err := h.journal().since(-1, 0); err != nil {
 		st.EventsError = fmt.Sprintf("the event journal cannot be read: %v", err)
 	} else {

@@ -220,7 +220,7 @@ func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(
 	dirFlag(netBoot)
 	tablesBoot := tablesBootCommand(func(*cobra.Command) (*Installer, error) { return in, prepare() })
 	dirFlag(tablesBoot)
-	root.AddCommand(install, boot, back, hostd, gate, netBoot, tuneBootCommand(r, stderr), tablesBoot, tuneCommand(in, prepare, terminal, true))
+	root.AddCommand(install, boot, back, hostd, gate, netBoot, tuneBootCommand(r, stderr), route6BootCommand(r, stderr), tablesBoot, tuneCommand(in, prepare, terminal, true))
 
 	jsonFlag := func(cmd *cobra.Command) {
 		cmd.Flags().BoolVar(&asJSON, "json", false, "print the daemon's JSON answer")
@@ -786,6 +786,9 @@ func (c *hostClient) status(ctx context.Context, asJSON bool) error {
 		if ct.Warning != "" {
 			fmt.Fprintf(c.out, "           warning: %s\n", ct.Warning)
 		}
+	}
+	if st.NetworkWarning != "" {
+		fmt.Fprintf(c.out, "network    warning: %s\n", st.NetworkWarning)
 	}
 	if st.RebootPending {
 		fmt.Fprintln(c.out, "reboot     scheduled")

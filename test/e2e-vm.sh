@@ -476,6 +476,15 @@ if ((${#HOST6[@]})); then
 	code=$(curl -6 -sk --connect-timeout 10 --max-time 30 -o /dev/null -w '%{http_code}' --resolve "app.notes.test:443:[$vm6]" https://app.notes.test/)
 	[[ $code =~ ^[23] ]] || fail "https://app.notes.test/ over IPv6 ([$vm6]) answered $code"
 	! reach "$vm6" 5432 || fail "the L4 route's port answered over IPv6, which its allowlist leaves out"
+	# The boot waited for the IPv6 default route before Docker started. With the advertised route
+	# dropped, the wait run again at once sends a router solicitation, and the route comes back
+	# from the router's answer (networkd solicits no more once a router answered): its line counts
+	# the solicitations, so a route brought back by an unsolicited advertisement alone fails.
+	[[ $(on_vm systemctl is-active notes-route6.service) == active ]] || fail "the boot's wait for the IPv6 default route did not run"
+	on_vm 'for _ in 1 2 3 4 5 6 7 8; do sudo ip -6 route del default proto ra 2>/dev/null || break; done; sudo notes-stow route6-boot' >"$WORK/route6.txt" 2>&1 || { cat "$WORK/route6.txt"; fail "route6-boot"; }
+	grep -qE '^the IPv6 default route on [^ ]+ came after [1-9][0-9]* router solicitations$' "$WORK/route6.txt" ||
+		{ cat "$WORK/route6.txt"; fail "the router solicitation did not bring the IPv6 default route back"; }
+	[[ -n $(on_vm ip -6 route show default proto ra) ]] || fail "no advertised IPv6 default route after route6-boot"
 else
 	echo "this host has no global IPv6 address: the VM's IPv6 address, SSH and HTTPS over it are not checked"
 fi

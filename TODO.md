@@ -11,18 +11,7 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
 
 ### Blocked — upstream or accounts
 
-1. **Kairos 4.4.0 final**: the OS bundle is pinned to the release candidate
-   (`kairos_init` `v4.4.0-rc2`). When Kairos 4.4.0 ships: pin its kairos-init by digest in
-   `examples/minimal` and `examples/full`; re-derive the bundle's `08_grub.yaml` from it (Kairos's
-   master already changes the boot step the copy leaves out) and its sha256 in the Dockerfile
-   template; move the release named in the build's refusal, the copy's header, README and the
-   tests; take the AuroraBoot release that goes with it; keep the `selected_entry = cos` guard
-   unless Kairos takes it upstream (an issue was drafted for it); check that kairos-init's SSH
-   drop-in still lands where the build moves it from. Gate: the VM chain (e2e-kairos, e2e-vm,
-   e2e-full-vm), and an upgrade from the last 24.04 release with a rollback to it, as was run
-   by hand for 0.12.0 (the release's VM installed by the older stowage, the next shipped by this
-   one: the upgrade, the health gate, `rollback`, SSH on the older system).
-2. **Cloud images on AWS and Azure**: `ship` registers the `cloud_publish` images through
+1. **Cloud images on AWS and Azure**: `ship` registers the `cloud_publish` images through
    OpenTofu, run for real on Google Cloud only (`STOWAGE_CLOUD_ENV=<file> make e2e-kairos`). Run it
    with the AWS and Azure test accounts once they exist, and fix what they find. Azure, known:
    its probe takes an image of the name whatever its provisioning state (its resource list gives
@@ -35,29 +24,19 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
    `security_group_ids` is given (a VPC's default group admits nothing from outside) and an
    `encrypted` root volume; Azure's an NSG on the NIC; Secure Boot / vTPM where the image allows.
    Each checked against its provider's schema and applied for real.
-3. **Scaleway**: a platform of `vm create` (OpenTofu module: an instance from the release's
+2. **Scaleway**: a platform of `vm create` (OpenTofu module: an instance from the release's
    disk, the cloud-config as its user data) and a cloud of `cloud_publish` (the disk uploaded to
    Object Storage and imported as an instance image, with the publisher's credentials from the
    environment), as the other clouds. Before writing a module, read the latest
    `scaleway/scaleway` provider's official docs and its schema (`tofu providers schema -json`),
    and pin that release.
-4. **OVHcloud**: the same for OVHcloud Public Cloud (OpenStack): `vm create` and `cloud_publish`
+3. **OVHcloud**: the same for OVHcloud Public Cloud (OpenStack): `vm create` and `cloud_publish`
    (the disk uploaded as a Glance image of the project, `ovh/ovh` and/or
    `terraform-provider-openstack/openstack`, whichever the latest official docs make canonical).
    Before writing a module, read the latest provider's official docs and its schema, and pin that
    release.
 
 ## Should
-
-- **A set narrowed under `flush_conntrack` leaves the flows its removed elements admitted
-  open**: a service's `sets` rewritten with fewer elements (an input's `--set` with fewer
-  entries, the app socket) reloads the set with the table held, so no flush fires, and a flow the
-  removed element admitted keeps riding the table's `ct state established accept` until it ends
-  (TCP's established timeout is 5 days); the workaround is `sudo conntrack -F` by hand. A narrowing
-  of a set feeding a table that declares `flush_conntrack` should end those flows: flush as for a
-  table load, or, finer, delete over netlink only the entries matching the removed elements by the
-  set's key (address, port). Widening needs nothing. The start's output says which happened, as a
-  table load's does.
 
 - **A `local` rclone destination is accepted, then never works**: where rclone runs in a
   throw-away container (`docker run --rm`, the Docker shape), a `type = local` remote writes
@@ -409,6 +388,30 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
   repositories.
 
 ## Could
+
+- **`flush_conntrack` marks, leftovers** (review): the sets record is compared as nft text the start wrote, where a digest of
+  the elements would not depend on its form.
+
+- **IPv6 on with no IPv6 router**: a link given IPv6 for a static `address6` alone (no
+  `gateway6`, no router) holds every boot's Docker 60 s for the default route and warns in `status`
+  for good, soliciting hourly. A setting saying no router is expected, or skipping the wait when a
+  static IPv6 address has no gateway, would quiet it (review).
+
+- **The app socket's set changes leave the flows the set judged before**: under
+  `flush_conntrack`, an element deleted from an allow-list (or added to a deny-list) through
+  `POST /v1/nftables/<table>/sets/<set>` keeps its open flows until they end, as a whole-table
+  flush at each of the app's calls would cut every flow of the host's (review). Delete over
+  netlink only the entries matching the changed elements by the set's key (address, prefix, port,
+  concatenation), as `conntrack -D` would by tuple, counting only elements nft actually changed;
+  the start's set changes could use the same instead of the whole-table flush.
+
+- **networkd's router solicitations, upstream**: networkd (systemd v259, `sd-ndisc.c`,
+  `ndisc_handle_router`) stops soliciting on any router's advertisement, a lifetime-0 one
+  included, where RFC 4861 § 6.3.7 desists only on a non-zero lifetime; Stowage solicits itself
+  (`route6-boot`, the daemon's watch). Report it to systemd, and drop the workaround once a fixed
+  networkd ships in the bundle. e2e-vm proves the daemon brings back a dropped advertised route; a
+  test link with a lifetime-0 router answering first and the default router's solicited answer
+  dropped (the field case) is not built.
 
 - **`flush_conntrack`, leftovers** (review): a host whose kernel has no connection-tracking
   netlink (the flush fails with nothing to flush) keeps the `.flush` mark and warns at every start;

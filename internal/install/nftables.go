@@ -99,6 +99,34 @@ func (in *Installer) setScripts(get func(string) string) (map[string]string, err
 	return out, errors.Join(errs...)
 }
 
+// setsDropped reports whether the script next leaves as it is a set the script prev (setScripts'
+// form, as the last start kept it) filled: a set prev flushes and next does not, or a prev that
+// names no set though it holds text (not of setScripts' form: what it filled is unknown). Only a
+// load of the table empties such a set of prev's elements.
+func setsDropped(prev, next string) bool {
+	was, now := setsFlushed(prev), setsFlushed(next)
+	if strings.TrimSpace(prev) != "" && len(was) == 0 {
+		return true
+	}
+	for set := range was {
+		if !now[set] {
+			return true
+		}
+	}
+	return false
+}
+
+// setsFlushed is the sets ("table set") a script of setScripts' form flushes: every set it fills.
+func setsFlushed(script string) map[string]bool {
+	out := map[string]bool{}
+	for line := range strings.Lines(script) {
+		if f := strings.Fields(line); len(f) == 5 && f[0] == "flush" && f[1] == "set" && f[2] == "inet" {
+			out[f[3]+" "+f[4]] = true
+		}
+	}
+	return out
+}
+
 // setsKeys names a table's input-filled sets for an error: services.<name>.sets (their inputs).
 func (in *Installer) setsKeys(name string) string {
 	sets := in.R.Spec.Services[name].Sets
@@ -146,7 +174,7 @@ func (in *Installer) syncTables(ctx context.Context, want map[string][]byte, set
 			in.O.logf("warning: %s: the host's connection-tracking table does not flush: %v: the connections open before keep the previous table's verdict until they end, or until `sudo conntrack -F` (the next start tries again)", strings.Join(keys, ", "), err)
 			return
 		}
-		in.O.logf("flushed the host's connection-tracking table (%s): the connections open before meet the tables now loaded as new ones", strings.Join(keys, ", "))
+		in.O.logf("flushed the host's connection-tracking table (%s): the connections open before meet the tables and sets now loaded as new ones", strings.Join(keys, ", "))
 		for _, name := range flush {
 			_ = os.Remove(in.tableFile(name, ".flush"))
 		}
@@ -169,28 +197,49 @@ func (in *Installer) syncTables(ctx context.Context, want map[string][]byte, set
 		// Loaded from a file of its own, which becomes its file once loaded: a load that fails
 		// leaves it as it was, so the next start tries again.
 		next := f + ".next"
-		// held: its rules in the firewall as this start loads them, so a load is for its sets alone.
-		// A load's file left (.next) is a start cut off after nft may have loaded it, before f
-		// recorded it: what the firewall holds is unknown, and the table loads again.
-		held := false
+		// A table held — its rules in the firewall as this start loads them — writes its sets alone,
+		// or nothing; else it loads (again). A load's file left (.next) is a start cut off after nft
+		// may have loaded it, before f recorded it: what the firewall holds is unknown, and the table
+		// loads again. Under flush_conntrack every load flushes, and so does a held table's change
+		// of its sets: an element added to a set the rules deny by ends the flows it denies now, one
+		// removed from a set they admit by the flows it admitted.
 		earlier, earlierErr := os.ReadFile(f)
 		if earlierErr == nil && bytes.Equal(earlier, b.Bytes()) && !fileExists(next) {
 			if _, err := host.Run(ctx, Cmd{Args: []string{"nft", "list", "table", "inet", name}}); err == nil {
-				held = true
 				kept, err := os.ReadFile(setsFile)
 				switch script := sets[name]; {
 				case err != nil && !errors.Is(err, os.ErrNotExist):
 					// What the sets hold is unknown: the table loads again, with them.
-				case script == "" && len(kept) > 0:
-					// A set no longer filled keeps its last input's elements: the table loads again.
+				case setsDropped(string(kept), script):
+					// A set no longer filled keeps its last input's elements: the table loads again,
+					// which gives it back the table's own and empties the sets the app socket fed.
 				case script == string(kept):
 					continue // as the last start wrote them
 				default:
+					// Marked before the sets change, as a load is: a start cut off before the
+					// flush flushes at the next one. A mark this start wrote goes when nft refuses
+					// the elements, which then change nothing.
+					marked := false
+					if flushes && !fileExists(mark) {
+						if err := writeAtomic(mark, strings.NewReader(in.O.bootID()), 0o644, nil); err != nil {
+							return errors.Join(append(errs, err)...)
+						}
+						marked = true
+					}
 					if _, err := host.Run(ctx, Cmd{Args: []string{"nft", "-f", "-"}, Stdin: strings.NewReader(script)}); err != nil {
+						if marked {
+							_ = os.Remove(mark)
+						}
 						errs = append(errs, fmt.Errorf("%s: nft refuses their elements: %w", in.setsKeys(name), err))
 						continue
 					}
+					if flushes && !slices.Contains(flush, name) {
+						flush = append(flush, name)
+					}
 					if err := in.keepSets(setsFile, script); err != nil {
+						// A record of the sets before would match a later script that wants them
+						// back, which would then not be written: none is left.
+						_ = os.Remove(setsFile)
 						return errors.Join(append(errs, err)...)
 					}
 					continue
@@ -214,13 +263,20 @@ func (in *Installer) syncTables(ctx context.Context, want map[string][]byte, set
 		if err := writeAtomic(in.tableFile(name, ".load"), strings.NewReader(hex.EncodeToString(token)+"\n"), 0o644, nil); err != nil {
 			return errors.Join(append(errs, err)...)
 		}
-		if flushes && !held {
-			if err := writeAtomic(mark, strings.NewReader(""), 0o644, nil); err != nil {
+		// Marked before the load; a mark this start wrote goes when nft refuses the load, which
+		// then changes nothing.
+		marked := false
+		if flushes && !fileExists(mark) {
+			if err := writeAtomic(mark, strings.NewReader(in.O.bootID()), 0o644, nil); err != nil {
 				return errors.Join(append(errs, err)...)
 			}
+			marked = true
 		}
 		if _, err := host.Run(ctx, Cmd{Args: []string{"nft", "-f", next}}); err != nil {
 			_ = os.Remove(next)
+			if marked {
+				_ = os.Remove(mark)
+			}
 			if sets[name] != "" {
 				return errors.Join(append(errs, fmt.Errorf("services.%s.nftables: nft refuses its table, or %s their elements: %w", name, in.setsKeys(name), err))...)
 			}
@@ -228,7 +284,7 @@ func (in *Installer) syncTables(ctx context.Context, want map[string][]byte, set
 		}
 		record[name] = true
 		switch {
-		case flushes && !held && !slices.Contains(flush, name):
+		case flushes && !slices.Contains(flush, name):
 			flush = append(flush, name)
 		case !flushes && earlierErr == nil && !bytes.Equal(earlier, []byte(table)):
 			in.O.logf("note: services.%s.nftables: its table changed, and the connections open before keep their conntrack entries: a rule for new connections, or a nat rule, leaves them be until they end (services.%s.flush_conntrack: true flushes the host's connection-tracking table at each such load)", name, name)
@@ -271,7 +327,8 @@ func (in *Installer) syncTables(ctx context.Context, want map[string][]byte, set
 
 // tableFile is the file, under the install's TablesDir, of the table name with the extension
 // ext: .nft the table as last loaded, .load its load token, SetsSuffix its sets' script, .flush the
-// mark of a load whose flush of the connection-tracking table is still due (flush_conntrack).
+// mark of a load whose flush of the connection-tracking table is still due (flush_conntrack),
+// holding the boot id it was written in.
 func (in *Installer) tableFile(name, ext string) string {
 	return filepath.Join(in.O.Dir, TablesDir, name+ext)
 }
@@ -433,6 +490,14 @@ func (in *Installer) bootTables(ctx context.Context) error {
 		if !spec.NftTableName.MatchString(name) || name == in.R.Spec.Name || !fileExists(f) {
 			continue
 		}
+		// A reboot empties the connection-tracking table: a flush still due from an earlier boot (the
+		// mark holds the boot it was written in) is moot. One of this boot stays (the unit run again
+		// by hand empties nothing), and so does one whose boot is not known.
+		if mark := in.tableFile(name, ".flush"); fileExists(mark) {
+			if b, _ := os.ReadFile(mark); otherBoot(strings.TrimSpace(string(b)), in.O.bootID()) {
+				_ = os.Remove(mark)
+			}
+		}
 		token := make([]byte, 8)
 		if _, err := rand.Read(token); err != nil {
 			return err
@@ -555,5 +620,7 @@ func (h *Hostd) setElements(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// No flush of the connection-tracking table here, flush_conntrack or not: the app's calls
+	// come often, and a flush ends every flow of the host's.
 	reply(w, http.StatusOK, map[string]int{"added": len(req.Add), "deleted": len(req.Delete)})
 }

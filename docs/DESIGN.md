@@ -849,7 +849,17 @@ Rules:
   the cloud-config writes its network file even for DHCP, as Kairos's own file would take router
   advertisements. On, networkd takes the router advertisements and, with DHCP, starts its DHCPv6
   client at once (`WithoutRA=solicit`) rather than on a managed flag: the clouds hand out the
-  address by DHCPv6, and a LAN without a DHCPv6 server still gets SLAAC. One static IPv6 address
+  address by DHCPv6, and a LAN without a DHCPv6 server still gets SLAAC. networkd (v259) ends its
+  router solicitations at the first advertisement of any router, where RFC 4861 § 6.3.7 desists
+  only on one with a non-zero router lifetime: on a link with a non-default router (a Thread border
+  router, a home hub) one lost answer of the default router leaves the link without a default route
+  until that router's next unsolicited advertisement, up to 30 min. Stowage solicits itself while
+  the primary link has no IPv6 default route, rather than reconfigure networkd (`networkctl
+  reconfigure` restarts DHCP too): a raw ICMPv6 solicitation, which networkd's own listener takes
+  the answer of, so the route stays networkd's. The boot waits a bounded minute for it before
+  Docker starts the services (`<name>-route6.service`), so a healthy boot does not run services
+  whose IPv6 has nowhere to go; past it the boot goes on, the daemon keeps soliciting with backoff
+  to RFC 7559's hour (a link without an IPv6 router is not solicited every minute forever), and the gap is a `status` warning and an event, never silence. One static IPv6 address
   and gateway may sit beside the advertised ones, checked as the IPv4 pair is (a link-local
   gateway is on any link); an IPv6 DNS server needs IPv6 on. All of it is on the VM's one wired
   interface, and one networkd section renderer serves the override and the cloud-config's file.
@@ -1653,7 +1663,17 @@ every shape, the VM end-to-end test upgrading through it), then the health gate.
   drops, and a host firewall's reload (firewalld, ufw, nft) flushes nothing either. No narrower
   set is generic: a table may judge any packet the host sees, and marking the entries it judged
   would rewrite the project's rules. The flush goes through netlink (no `conntrack` tool in the
-  bundle), marked before the load so a start cut off before it flushes at the next. The feeder is often
+  bundle), marked before the load so a start cut off before it flushes at the next. A set's
+  change is a change of the rules' verdicts like a table's: an element removed from a set the
+  rules admit by, or added to one they deny by, leaves flows open that the set no longer admits,
+  and Stowage cannot tell which way a set is used. So any change of a held table's sets (an
+  input's value, a set no longer filled, a set filled anew) flushes
+  as a load does, and so does a sets record that does not read; the same values do not. The app
+  socket's changes do not flush: its calls come as often as the app likes, and a whole-table flush
+  at each would cut every flow of the host's, where a start is rare. A change
+  nft refuses removes the mark it wrote, and the boot drops a mark still due, as a reboot empties
+  the table. The flush is the whole table's: ending only a removed element's flows means matching the element
+  (an address, a prefix, a port, a concatenation) against each entry's tuple by the set's key. The feeder is often
   not the table's service: the socket's token upgrades, reboots and re-addresses the VM, so the
   least-privilege stack gives it to a service its clients do not face, which `feeds` the proxy's
   table. A feeder carries the fed table's load token in its label, so a load recreates it as it
