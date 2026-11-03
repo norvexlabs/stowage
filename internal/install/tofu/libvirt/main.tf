@@ -73,17 +73,20 @@ resource "libvirt_domain" "vm" {
   }
 
   devices = {
+    # Each disk by its volume's path (type='file'): the AppArmor driver's virt-aa-helper writes a
+    # file disk and its qcow2 backing chain into the domain's profile, never a pool volume
+    # (type='volume'), which confined QEMU may then not open.
     disks = [
       {
         source = {
-          volume = { pool = var.pool, volume = libvirt_volume.disk.name }
+          file = { file = libvirt_volume.disk.path }
         }
         target = { dev = "vda", bus = "virtio" }
         driver = { name = "qemu", type = "qcow2" }
       },
       {
         source = {
-          volume = { pool = var.pool, volume = libvirt_volume.seed.name }
+          file = { file = libvirt_volume.seed.path }
         }
         target    = { dev = "vdb", bus = "virtio" }
         driver    = { name = "qemu", type = "raw" }

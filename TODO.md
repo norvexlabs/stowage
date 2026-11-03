@@ -38,6 +38,10 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
 
 ## Should
 
+- **libvirt: a domain whose start failed stays defined, out of the state**: dmacvicar/libvirt
+  0.9.9 records no `libvirt_domain` when the start after its define fails, so `vm destroy` leaves
+  it (the failed `vm create` names `virsh undefine … --nvram`). Fixed upstream (the resource kept
+  in the state, tainted) or by a `vm destroy` that reaches the platform, it needs no hint.
 - **The OS bundle carries upstream binaries with fixable criticals no rebuild clears yet**: Docker's
   latest `containerd`, `containerd-shim-runc-v2`, `ctr`, `runc` and `docker-compose`
   (golang.org/x/net 0.55–0.58), Ubuntu 26.04's `pebble` (Go 1.27.1) and Kairos 4.4.0's

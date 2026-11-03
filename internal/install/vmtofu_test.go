@@ -408,6 +408,36 @@ func TestVMCreateWithOpenTofuKeepsTheStateOfAFailedApply(t *testing.T) {
 	}
 }
 
+// A libvirt domain defined before its start failed is out of the state: the error names the
+// command that removes it, on the module's uri.
+func TestVMCreateOnLibvirtNamesTheDomainAFailedStartLeaves(t *testing.T) {
+	t.Parallel()
+	for _, uri := range []string{"", "qemu+ssh://kvm1/system"} {
+		v := newVMCreate(t, "qcow2")
+		r := newTofuRun(t)
+		r.tofu.fail = errors.New("tofu apply: Failed to Start Domain")
+		c := VMCreate{Platform: "libvirt", Create: CreateTofu, Hostname: "notes-1", User: "ops", Ctl: "/opt/notes-stow", Wait: 5 * time.Second}
+		want := "virsh -c qemu:///system undefine "
+		if uri != "" {
+			c.Vars, want = map[string]string{"uri": uri}, "virsh -c "+uri+" undefine "
+		}
+		err := v.create(c, r.mod(nil))
+		if err == nil || !strings.Contains(err.Error(), "Failed to Start Domain") || !strings.Contains(err.Error(), want) || !strings.Contains(err.Error(), " --nvram") {
+			t.Fatalf("uri %q: err = %v", uri, err)
+		}
+		if !strings.Contains(err.Error(), want+"notes-1 --nvram") {
+			t.Errorf("uri %q: the domain is not named: %v", uri, err)
+		}
+	}
+	// Another platform's failed apply says nothing of libvirt.
+	v := newVMCreate(t, "qcow2")
+	r := newTofuRun(t)
+	r.tofu.fail = errors.New("tofu apply: the pool is full")
+	if err := v.create(tofuCreate(), r.mod(nil)); err == nil || strings.Contains(err.Error(), "virsh") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
 func TestVMCreateWithOpenTofuGivesUpWaiting(t *testing.T) {
 	t.Parallel()
 	v := newVMCreate(t, "qcow2")

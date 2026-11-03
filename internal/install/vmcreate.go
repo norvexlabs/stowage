@@ -340,7 +340,17 @@ func (in *Installer) CreateVM(ctx context.Context, c *VMCreate) error {
 	if tofu {
 		id, out, err := in.applyVM(ctx, state, c.Ctl, p, mach, st, &c.TofuVM, files, declared, disk, format, layer.Hex, seed)
 		if err != nil {
-			return fmt.Errorf("%w\n(the state is in %s: `%s vm create` again with the same --hostname is refused; `%s vm destroy %s` removes what was made)", err, state, ctl, ctl, mach.Hostname)
+			err = fmt.Errorf("%w\n(the state is in %s: `%s vm create` again with the same --hostname is refused; `%s vm destroy %s` removes what was made)", err, state, ctl, ctl, mach.Hostname)
+			if p.Key == "libvirt" && c.Module == "" {
+				// The provider defines the domain, then starts it: a failed start leaves the domain
+				// defined, out of the state, where no destroy reaches it.
+				uri := c.Vars["uri"]
+				if uri == "" {
+					uri = "qemu:///system"
+				}
+				err = fmt.Errorf("%w\n(a domain libvirt defined before its start failed is not in the state: `virsh -c %s undefine %s --nvram` removes it)", err, uri, c.Name)
+			}
+			return err
 		}
 		o.logf("OpenTofu created the VM %s (%s)", c.Name, id)
 		// The address the platform gave, when nothing named one: a cloud's is known only now.

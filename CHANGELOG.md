@@ -3,6 +3,16 @@
 Stowage's own releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
+## [0.26.2]
+
+### Fixed
+- `vm create --platform libvirt --create opentofu` starts its domain on a host whose libvirt
+  confines QEMU with AppArmor (Ubuntu, Debian): the built-in module gives the disk and the seed
+  by their paths, which libvirt writes into the domain's profile, where QEMU was refused them.
+- A failed `vm create` on the built-in libvirt module names `virsh -c <uri> undefine <vm-name>
+  --nvram`: a domain whose start failed is left defined, out of what `vm destroy` removes.
+- README names the AppArmor rule a libvirt host may need for `virt-aa-helper`.
+
 ## [0.26.1] - 2026-11-03
 
 ### Fixed

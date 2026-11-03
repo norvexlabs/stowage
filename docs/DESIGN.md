@@ -1308,7 +1308,14 @@ every shape, the VM end-to-end test upgrading through it), then the health gate.
   VM, and destroyed by `vm destroy`. A preview is a module not run on its platform yet: checked by
   `tofu validate` against its pinned provider only, marked in README and in `vm create`'s output,
   which names the manual steps as the fallback (by hand is its default on a terminal); it loses
-  the mark at its first passing run. Any other platform is the operator's own module
+  the mark at its first passing run. libvirt's module gives each disk by its volume's path, never
+  as a pool volume: the AppArmor driver's `virt-aa-helper` writes a file disk and its backing
+  chain into the domain's profile, and resolves no pool volume, so confined QEMU could open none
+  of them. The provider defines then starts a domain and records neither when the start fails;
+  rather than `vm destroy` reaching past the state (a `virsh` on the operator's machine, which
+  the pure-Go provider does not need), the failed apply names the `virsh undefine` that removes
+  it.
+  Any other platform is the operator's own module
   (`--module`), holding one contract: the variables `vm create` writes (name, size, the disk and
   the seed, their SHA-256; the administrator and key when declared), the outputs it reads (`id`,
   and `address` for a platform that only tells the address after the apply, as clouds do), and

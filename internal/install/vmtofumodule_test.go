@@ -75,6 +75,29 @@ func TestEveryBuiltInModuleHoldsTheContract(t *testing.T) {
 	}
 }
 
+// libvirt's module states ACPI (libvirt refuses a UEFI domain without it on x86_64) and gives
+// each disk by its volume's path: AppArmor's virt-aa-helper resolves a file disk and its backing
+// chain into the domain's profile, never a pool volume.
+func TestTheLibvirtModuleBootsUnderUEFIAndAppArmor(t *testing.T) {
+	t.Parallel()
+	files, err := moduleFiles("libvirt", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	main := string(files["main.tf"])
+	if !regexp.MustCompile(`(?s)features = \{\s*acpi = true\s*apic = \{\}\s*\}`).MatchString(main) || !strings.Contains(main, `firmware     = "efi"`) {
+		t.Error("the UEFI domain does not state ACPI and the APIC")
+	}
+	if strings.Contains(main, "volume = { pool") {
+		t.Error("a disk is a pool volume, which AppArmor's virt-aa-helper does not resolve")
+	}
+	for _, v := range []string{"disk", "seed"} {
+		if !strings.Contains(main, "file = { file = libvirt_volume."+v+".path }") {
+			t.Errorf("the %s is not given by its path", v)
+		}
+	}
+}
+
 func TestModuleVarsReadsTheDeclarations(t *testing.T) {
 	t.Parallel()
 	vars, err := moduleVars(map[string][]byte{
