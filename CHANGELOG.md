@@ -3,6 +3,13 @@
 Stowage's own releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
+## [0.26.1]
+
+### Fixed
+- `vm create --platform libvirt --create opentofu` defines its domain on current libvirt: the
+  built-in module turns ACPI and the APIC on, without which libvirt refused the UEFI domain
+  ("UEFI requires ACPI on this architecture").
+
 ## [0.26.0] - 2026-11-03
 
 ### Added

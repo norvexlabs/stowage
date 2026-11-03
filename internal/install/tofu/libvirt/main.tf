@@ -1,7 +1,7 @@
 # One libvirt / KVM domain of the release: its disk a copy-on-write qcow2 volume over the release's
 # image, grown to disk_gib, and its NoCloud seed a second, read-only volume (the OS reads the cidata
-# label from any disk). The firmware is libvirt's UEFI autoselection, Secure Boot off. A preview:
-# not run on a libvirt host yet.
+# label from any disk). The firmware is libvirt's UEFI autoselection, Secure Boot off, with ACPI
+# and the APIC on. A preview: not run end to end on a libvirt host yet.
 
 resource "libvirt_volume" "image" {
   name = "${var.name}-image-${substr(var.image_sha256, 0, 12)}.${var.image_format}"
@@ -47,6 +47,13 @@ resource "libvirt_domain" "vm" {
   memory_unit = "MiB"
   autostart   = true
   running     = true
+
+  # ACPI and the APIC stated: the provider adds no default feature, and libvirt refuses a UEFI
+  # domain without ACPI on x86_64.
+  features = {
+    acpi = true
+    apic = {}
+  }
 
   os = {
     type         = "hvm"
