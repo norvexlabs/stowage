@@ -38,6 +38,13 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
 
 ## Should
 
+- **A built-in module's apply leaves no drift**: a `tofu plan -detailed-exitcode` after the apply
+  returning 0 would catch any attribute the platform normalizes (libvirt sorted the firmware's
+  features); run it where a suite applies a module for real (e2e-vm). libvirt's module was
+  applied by hand against libvirtd in a privileged Ubuntu 24.04 container (QEMU without KVM: the
+  module's `type` set to `qemu`, its CPU mode to `maximum`), then planned with no change, two NICs
+  included; made a suite, it would keep the module from drifting (DHCP's lease wait aside, which
+  needs a guest that boots).
 - **libvirt: a domain whose start failed stays defined, out of the state**: dmacvicar/libvirt
   0.9.9 records no `libvirt_domain` when the start after its define fails, so `vm destroy` leaves
   it (the failed `vm create` names `virsh undefine … --nvram`). Fixed upstream (the resource kept

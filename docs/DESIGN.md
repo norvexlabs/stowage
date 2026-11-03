@@ -1314,7 +1314,8 @@ every shape, the VM end-to-end test upgrading through it), then the health gate.
   of them. The provider defines then starts a domain and records neither when the start fails;
   rather than `vm destroy` reaching past the state (a `virsh` on the operator's machine, which
   the pure-Go provider does not need), the failed apply names the `virsh undefine` that removes
-  it.
+  it. Its lists are written in the order libvirt returns them (the firmware's features by name):
+  the provider compares a read-back list by position, and fails an apply on another order.
   Any other platform is the operator's own module
   (`--module`), holding one contract: the variables `vm create` writes (name, size, the disk and
   the seed, their SHA-256; the administrator and key when declared), the outputs it reads (`id`,

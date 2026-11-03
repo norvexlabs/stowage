@@ -3,6 +3,13 @@
 Stowage's own releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
+## [0.26.3]
+
+### Fixed
+- `vm create --platform libvirt --create opentofu` no longer fails once the domain runs ("Provider
+  produced inconsistent result after apply"): the built-in module states the firmware's features
+  in the order libvirt returns them.
+
 ## [0.26.2] - 2026-11-03
 
 ### Fixed

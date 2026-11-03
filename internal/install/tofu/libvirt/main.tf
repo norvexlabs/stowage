@@ -59,10 +59,12 @@ resource "libvirt_domain" "vm" {
     type         = "hvm"
     type_machine = "q35"
     firmware     = "efi"
+    # In libvirt's order, by name: the provider compares its read-back list by position, and an
+    # apply whose features differ in order alone fails as an inconsistent result.
     firmware_info = {
       features = [
-        { name = "secure-boot", enabled = "no" },
         { name = "enrolled-keys", enabled = "no" },
+        { name = "secure-boot", enabled = "no" },
       ]
     }
     boot_devices = [{ dev = "hd" }]

@@ -96,6 +96,16 @@ func TestTheLibvirtModuleBootsUnderUEFIAndAppArmor(t *testing.T) {
 			t.Errorf("the %s is not given by its path", v)
 		}
 	}
+	// The firmware's features in libvirt's order, by name: the provider compares them by position
+	// with what libvirt returns, and fails the apply on another order.
+	names := regexp.MustCompile(`\{ name = "([^"]+)", enabled = "no" \}`).FindAllStringSubmatch(main, -1)
+	var got []string
+	for _, n := range names {
+		got = append(got, n[1])
+	}
+	if !slices.Equal(got, []string{"enrolled-keys", "secure-boot"}) {
+		t.Errorf("the firmware's features are %q, not in libvirt's order", got)
+	}
 }
 
 func TestModuleVarsReadsTheDeclarations(t *testing.T) {
