@@ -822,6 +822,7 @@ func (c *hostClient) services(ctx context.Context, asJSON bool) error {
 		}
 		fmt.Fprintf(c.out, "%-20s %-22s %s\n", s.Service, state, s.Image)
 	}
+	printDown(c.out, list)
 	return nil
 }
 

@@ -74,11 +74,42 @@ func (b Bytes) String() string {
 	return strconv.FormatInt(int64(b), 10)
 }
 
-// Share is a service's part of the host's RAM: Percent of it, capped at Max when Max is set.
-// Written as the percent alone, or as { percent: N, max: 16G }.
+// Share is a service's part of the host's RAM: Percent of it, capped at Max when Max is set, and
+// never under Min when Min is set (Min wins over Max: lint refuses a Min over the Max). Written as
+// the percent alone, or as { percent: N, min: 256M, max: 16G }.
 type Share struct {
 	Percent int
 	Max     Bytes
+	Min     Bytes
+}
+
+// Limit is one container's memory limit from the share on a host whose kernel shows ram bytes, the
+// service run as n containers: its part of the percent, capped at its part of Max, in whole MiB;
+// never under its part of Min (rounded up to the byte, so the parts together are never under
+// Min), MinMemLimit, or floor (what the compose file gives the container itself). The install and
+// lint both compute it here.
+func (s Share) Limit(ram uint64, n int, floor Bytes) Bytes {
+	n = max(n, 1)
+	pct := uint64(max(s.Percent, 0))
+	// Multiplied first, as hosts are: divided first only where the product would overflow.
+	var whole uint64
+	if ram > math.MaxUint64/100 {
+		whole = ram / 100 * pct
+	} else {
+		whole = ram * pct / 100
+	}
+	part := Bytes(min(whole/uint64(n), math.MaxInt64))
+	if s.Max > 0 {
+		part = min(part, s.Max/Bytes(n))
+	}
+	const mib = Bytes(1 << 20)
+	// The min's part rounded up to the byte, never to the MiB: the parts together are never
+	// under Min, and a Min equal to Max gives Max's part, within a byte.
+	least := s.Min / Bytes(n)
+	if s.Min%Bytes(n) != 0 {
+		least++
+	}
+	return max(part&^(mib-1), least, MinMemLimit, floor)
 }
 
 func (s *Share) UnmarshalYAML(n *yaml.Node) error {
@@ -87,46 +118,56 @@ func (s *Share) UnmarshalYAML(n *yaml.Node) error {
 		return n.Decode(&s.Percent)
 	}
 	if n.Kind != yaml.MappingNode {
-		return fmt.Errorf("line %d: a percent, or { percent: N, max: 16G }", n.Line)
+		return fmt.Errorf("line %d: a percent, or { percent: N, min: 256M, max: 16G }", n.Line)
 	}
-	if err := knownKeys(n, "a memory share", "percent", "max"); err != nil {
+	if err := knownKeys(n, "a memory share", "percent", "min", "max"); err != nil {
 		return err
 	}
 	var v struct {
 		Percent int   `yaml:"percent"`
+		Min     Bytes `yaml:"min"`
 		Max     Bytes `yaml:"max"`
 	}
 	if err := n.Decode(&v); err != nil {
 		return err
 	}
-	if k := key(n, "max"); k != nil && v.Max == 0 {
-		return fmt.Errorf("line %d: max: %s: a size of at least %s; leave max out for none", k.Line, shown(k), MinMemLimit)
+	for _, b := range []struct {
+		name string
+		v    Bytes
+	}{{"min", v.Min}, {"max", v.Max}} {
+		if k := key(n, b.name); k != nil && b.v == 0 {
+			return fmt.Errorf("line %d: %s: %s: a size of at least %s; leave %s out for none", k.Line, b.name, shown(k), MinMemLimit, b.name)
+		}
 	}
-	*s = Share{Percent: v.Percent, Max: v.Max}
+	*s = Share{Percent: v.Percent, Max: v.Max, Min: v.Min}
 	return nil
 }
 
-// MarshalJSON writes a share without a maximum as its percent alone: the spec's digest is then
-// the percent's alone.
+// MarshalJSON writes a share with neither a minimum nor a maximum as its percent alone, and one
+// without a minimum without the Min field: a share's digest depends on the keys it states alone.
 func (s Share) MarshalJSON() ([]byte, error) {
-	if s.Max == 0 {
+	if s.Max == 0 && s.Min == 0 {
 		return json.Marshal(s.Percent)
 	}
-	return json.Marshal(struct{ Percent, Max int64 }{int64(s.Percent), int64(s.Max)})
+	// Min omitted when unset: a share stating a maximum alone is written as one.
+	return json.Marshal(struct {
+		Percent, Max int64
+		Min          int64 `json:",omitempty"`
+	}{int64(s.Percent), int64(s.Max), int64(s.Min)})
 }
 
 func (s *Share) UnmarshalJSON(raw []byte) error {
 	if err := json.Unmarshal(raw, &s.Percent); err == nil {
-		s.Max = 0
+		s.Max, s.Min = 0, 0
 		return nil
 	}
-	var v struct{ Percent, Max int64 }
+	var v struct{ Percent, Max, Min int64 }
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&v); err != nil {
 		return fmt.Errorf("a memory share: %w", err)
 	}
-	*s = Share{Percent: int(v.Percent), Max: Bytes(v.Max)}
+	*s = Share{Percent: int(v.Percent), Max: Bytes(v.Max), Min: Bytes(v.Min)}
 	return nil
 }
 

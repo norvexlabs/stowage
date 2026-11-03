@@ -10,3 +10,6 @@ func flockWait(string, bool) (func(), error) { return func() {}, nil }
 
 // lockHeld is false where flock does not exist; the installer runs on Unix hosts.
 func lockHeld(string) bool { return false }
+
+// lockHeldPassive is false where flock does not exist; the installer runs on Unix hosts.
+func lockHeldPassive(string) bool { return false }

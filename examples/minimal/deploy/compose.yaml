@@ -28,12 +28,22 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    # Serving once its schema is migrated: the install waits for it (readiness, /healthz/ready, is
+    # the health gate's, through the spec's health provider).
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=2)"]
+      interval: 2s
+      retries: 30
     restart: unless-stopped
 
   web:
     image: ${STOWAGE_IMAGE_WEB}
     environment:
       API_URL: ${STOWAGE_URL_API}
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/"]
+      interval: 2s
+      retries: 30
     restart: unless-stopped
 
 volumes:

@@ -38,6 +38,15 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
 
 ## Should
 
+- **The libvirt module on a KVM host (blocked: a host with KVM)**: e2e-kairos proves the module
+  against libvirtd in a container without KVM (defined, running, no drift, nothing left after
+  `vm destroy`). The guest's boot, its SSH and its first install, and AppArmor's confinement
+  (Ubuntu's `virt-aa-helper`), need a stock Ubuntu LTS host with KVM and AppArmor enforcing; each
+  built-in module leaving preview gets the same run on its platform.
+- **A start does not say when the memory floors exceed the host's RAM**: a share's `min` (or the
+  compose file's own limit) on a host smaller than it gives a limit, and `STOWAGE_MEM_LIMIT_MB`,
+  over the RAM the host has (`STOWAGE_HOST_MEM_MB` beside it says so). Lint warns on the least VM;
+  a Docker host of any size gets no word: the start could log it.
 - **A built-in module's apply leaves no drift**: a `tofu plan -detailed-exitcode` after the apply
   returning 0 would catch any attribute the platform normalizes (libvirt sorted the firmware's
   features); run it where a suite applies a module for real (e2e-vm). libvirt's module was
@@ -414,6 +423,20 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
 
 ## Could
 
+- **The service watch's races**: a look judges the lock, the daemon's jobs and its reboots at
+  instants around the read; a lifecycle lock a CLI run takes and releases wholly inside one
+  `compose ps`, or the boot unit run wholly inside it, goes unseen, and the services it stopped
+  may be journaled down (an extra event, never a crash hidden).
+- **The service watch's blind spots**: a service with no container at all (a run that removed it
+  and failed before `up`) is never down to it, as it judges the containers `compose ps` lists,
+  not the services the stack declares; a one-off `compose run` container left exited non-zero
+  counts as its service down; when docker inspect fails on one container (removed between ps and
+  inspect) every container loses its facts that look, as the exec runner drops a failing
+  command's output; and inspect runs at every look, where only the services down need it.
+- **`lockHeld` takes the lifecycle lock for an instant**: the upgrade's and the boot's checks
+  that a run holds it (`lockHeld`) take and release the flock, so a run arriving at that instant
+  is refused as if one ran. `lockHeldPassive` reads the kernel's table instead; the two could be
+  one.
 - **`lint` accepts an allowance for an image of Stowage's the release does not carry**: the
   artifacts it accepts include `front`, `backup`, `chown` and `audit` whatever the project
   declares, so an entry for `front` in a project without a front passes lint and shows only at a

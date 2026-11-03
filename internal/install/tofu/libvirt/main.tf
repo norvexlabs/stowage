@@ -27,11 +27,12 @@ resource "libvirt_volume" "disk" {
   }
 }
 
+# The seed's format as libvirt probes an ISO 9660 image: iso (another would drift at every plan).
 resource "libvirt_volume" "seed" {
   name = "${var.name}-seed-${substr(var.seed_sha256, 0, 12)}.iso"
   pool = var.pool
   target = {
-    format = { type = "raw" }
+    format = { type = "iso" }
   }
   create = {
     content = { url = var.seed }
@@ -41,7 +42,7 @@ resource "libvirt_volume" "seed" {
 resource "libvirt_domain" "vm" {
   name        = var.name
   description = var.description
-  type        = "kvm"
+  type        = var.domain_type
   vcpu        = var.cpus
   memory      = var.memory_mib
   memory_unit = "MiB"
@@ -70,8 +71,9 @@ resource "libvirt_domain" "vm" {
     boot_devices = [{ dev = "hd" }]
   }
 
+  # The host's CPU as it is under KVM; QEMU's emulation offers its most.
   cpu = {
-    mode = "host-passthrough"
+    mode = var.domain_type == "kvm" ? "host-passthrough" : "maximum"
   }
 
   devices = {

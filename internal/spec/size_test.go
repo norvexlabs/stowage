@@ -2,6 +2,7 @@ package spec
 
 import (
 	"encoding/json"
+	"math"
 	"strings"
 	"testing"
 )
@@ -45,11 +46,11 @@ func FuzzParseBytes(f *testing.F) {
 
 func TestMemoryShareForms(t *testing.T) {
 	t.Parallel()
-	s, err := Parse([]byte(base + "services:\n  db: { memory: { percent: 25, max: 16G } }\n  api: { memory: 10 }\n"))
+	s, err := Parse([]byte(base + "services:\n  db: { memory: { percent: 25, max: 16G } }\n  api: { memory: 10 }\n  web: { memory: { percent: 5, min: 256M } }\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := s.MemoryShares(); got["db"] != (Share{25, 16 << 30}) || got["api"] != (Share{Percent: 10}) {
+	if got := s.MemoryShares(); got["db"] != (Share{Percent: 25, Max: 16 << 30}) || got["api"] != (Share{Percent: 10}) || got["web"] != (Share{Percent: 5, Min: 256 << 20}) {
 		t.Errorf("shares: %+v", got)
 	}
 	for in, want := range map[string]string{
@@ -58,6 +59,9 @@ func TestMemoryShareForms(t *testing.T) {
 		"[25]":                          "a percent, or",
 		"ten":                           "cannot unmarshal",
 		"{ percent: 25, max: 0 }":       "max: 0: a size of at least 64M",
+		"{ percent: 25, min: 0 }":       "min: 0: a size of at least 64M; leave min out for none",
+		"{ percent: 25, min: }":         "min: empty: a size",
+		"{ percent: 25, min: lots }":    `"lots": a size`,
 		"{ percent: 25, max: }":         "max: empty: a size",
 	} {
 		if _, err := Parse([]byte(base + "services:\n  db: { memory: " + in + " }\n")); err == nil || !strings.Contains(err.Error(), want) {
@@ -70,20 +74,38 @@ func TestMemoryShareForms(t *testing.T) {
 // the percent's, both forms read back, and an unknown field is refused.
 func TestMemoryShareJSON(t *testing.T) {
 	t.Parallel()
-	in := map[string]Share{"api": {Percent: 10}, "db": {Percent: 25, Max: 16 << 30}}
+	in := map[string]Share{"api": {Percent: 10}, "db": {Percent: 25, Max: 16 << 30}, "web": {Percent: 5, Min: 256 << 20}}
 	raw, err := json.Marshal(in)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := `{"api":10,"db":{"Percent":25,"Max":17179869184}}`; string(raw) != want {
+	if want := `{"api":10,"db":{"Percent":25,"Max":17179869184},"web":{"Percent":5,"Max":0,"Min":268435456}}`; string(raw) != want {
 		t.Errorf("%s, want %s", raw, want)
 	}
 	var back map[string]Share
-	if err := json.Unmarshal(raw, &back); err != nil || back["api"] != in["api"] || back["db"] != in["db"] {
+	if err := json.Unmarshal(raw, &back); err != nil || back["api"] != in["api"] || back["db"] != in["db"] || back["web"] != in["web"] {
 		t.Errorf("%+v, %v", back, err)
 	}
 	if err := json.Unmarshal([]byte(`{"db":{"Percent":25,"Maximum":1}}`), &back); err == nil || !strings.Contains(err.Error(), "Maximum") {
 		t.Errorf("an unknown field: %v", err)
+	}
+}
+
+// Limit's arithmetic at its edges: a RAM whose product with the percent overflows, and sizes of
+// petabytes, never wrap.
+func TestShareLimitNeverWraps(t *testing.T) {
+	t.Parallel()
+	huge := uint64(math.MaxUint64 / 50)
+	if got := (Share{Percent: 90}).Limit(huge, 1, 0); got <= 0 {
+		t.Errorf("90 %% of a RAM over MaxUint64/100: %d", got)
+	}
+	if got := (Share{Percent: 1, Min: 5000 << 50}).Limit(0, 2, 0); got < 2500<<50 {
+		t.Errorf("a min of 5000p over 2: %d", got)
+	}
+	for _, n := range []int{1, 2, 3} {
+		if got := (Share{Percent: 1, Min: math.MaxInt64}).Limit(1<<30, n, 0); got < math.MaxInt64/Bytes(n)-(1<<20) {
+			t.Errorf("the largest min over %d: %d, the min dropped", n, got)
+		}
 	}
 }
 

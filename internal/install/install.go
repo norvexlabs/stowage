@@ -2237,8 +2237,17 @@ func (in *Installer) Status(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	_, err = in.O.Out.Write(out)
-	return err
+	if _, err := in.O.Out.Write(out); err != nil {
+		return err
+	}
+	// Compose's table says exited; the services down are told apart from one-shots that finished.
+	list, err := in.stackServices(ctx, env)
+	if err != nil {
+		fmt.Fprintf(in.O.Out, "warning: which services are down could not be read: %v\n", err)
+		return nil
+	}
+	printDown(in.O.Out, list)
+	return nil
 }
 
 // ports returns each route's loopback port: base's, with given (--ports) over it.

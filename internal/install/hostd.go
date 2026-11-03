@@ -121,6 +121,9 @@ type Hostd struct {
 	mu        sync.Mutex
 	job       *job
 	rebooting bool
+	// rebootGen, under mu, moves at every reboot or power-off scheduled or cancelled: the service
+	// watch tells a look one cut.
+	rebootGen uint64
 	// jobEnd, under mu, is closed when the running job ends (startJobWhenFree waits on it).
 	jobEnd chan struct{}
 	// slotGen, under mu, moves at every claim of the job slot and every job's end: a run that
@@ -313,6 +316,13 @@ type Service struct {
 	Image   string `json:"image"`
 	// ExitCode is an exited service's exit status.
 	ExitCode int `json:"exit_code"`
+	// ID is its container's, as compose ps prints it.
+	ID string `json:"id,omitempty"`
+	// OOMKilled: its memory cgroup killed its container's last run; MemLimit is the memory limit
+	// its container runs with (0: none); Restarts, how many times its restart policy restarted it.
+	OOMKilled bool  `json:"oom_killed,omitempty"`
+	MemLimit  int64 `json:"mem_limit_bytes,omitempty"`
+	Restarts  int   `json:"restarts,omitempty"`
 }
 
 // Update is what GET /v1/updates answers: the release an upgrade would install.
@@ -429,12 +439,16 @@ func (h *Hostd) Serve(ctx context.Context, path string) error {
 	}()
 	go h.backupResume()
 	wctx, stopWatch := context.WithCancel(ctx)
-	watched := make(chan struct{})
+	watched, servicesWatched := make(chan struct{}), make(chan struct{})
 	go func() {
 		defer close(watched)
 		h.pressureWatch(wctx)
 	}()
 	go h.certWatch(wctx)
+	go func() {
+		defer close(servicesWatched)
+		h.serviceWatch(wctx)
+	}()
 	if !h.Docker {
 		go h.route6Watch(wctx)
 	}
@@ -450,6 +464,7 @@ func (h *Hostd) Serve(ctx context.Context, path string) error {
 	}
 	stopWatch() // a check under way ends with it: no banner or log after Serve returns
 	<-watched
+	<-servicesWatched
 	// A backup cut off by the stop removes its runner and the object it left (each within
 	// rcloneTimeout) and records its failure: the daemon waits for it, up to backupStopWait.
 	done := make(chan struct{})
@@ -818,12 +833,7 @@ func (h *Hostd) services(w http.ResponseWriter, r *http.Request) {
 		replyErr(w, err)
 		return
 	}
-	out, err := in.Compose(r.Context(), env, nil, "ps", "--all", "--format", "json")
-	if err != nil {
-		replyErr(w, err)
-		return
-	}
-	list, err := parseServices(out)
+	list, err := in.stackServices(r.Context(), env)
 	if err != nil {
 		replyErr(w, err)
 		return
@@ -835,8 +845,8 @@ func (h *Hostd) services(w http.ResponseWriter, r *http.Request) {
 // array.
 func parseServices(out []byte) ([]Service, error) {
 	type row struct {
-		Service, State, Health, Image string
-		ExitCode                      int
+		ID, Service, State, Health, Image string
+		ExitCode                          int
 	}
 	var rows []row
 	trimmed := bytes.TrimSpace(out)
@@ -863,7 +873,7 @@ func parseServices(out []byte) ([]Service, error) {
 	}
 	list := []Service{}
 	for _, r := range rows {
-		list = append(list, Service(r))
+		list = append(list, Service{Service: r.Service, State: r.State, Health: r.Health, Image: r.Image, ExitCode: r.ExitCode, ID: r.ID})
 	}
 	return list, nil
 }
@@ -1951,6 +1961,7 @@ func (h *Hostd) schedule(action string, drain int, idle bool, by *job, note stri
 			}
 			h.mu.Lock()
 			h.rebooting = false
+			h.rebootGen++
 			h.mu.Unlock()
 			h.rebootCancelled(action, reason, by)
 		}
@@ -1968,6 +1979,7 @@ func (h *Hostd) claimReboot(idle bool) error {
 		return fail(http.StatusConflict, "a job (%s) is running: wait for it to finish", h.job.Kind)
 	}
 	h.rebooting = true
+	h.rebootGen++
 	return nil
 }
 

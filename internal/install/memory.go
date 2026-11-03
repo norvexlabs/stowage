@@ -45,17 +45,11 @@ func (in *Installer) memoryPlan(sys tune.System, h tune.Host) hostPlan {
 	return hostPlan{Shares: shares, Host: h}
 }
 
-// limit is a container's part of share of the host's RAM, split among n containers, capped at
-// the share's maximum (the service's, split as well), in whole MiB, from MinMemLimit, and never
-// below floor: the limit the compose file sets itself, or the memory it reserves (Docker refuses a
-// limit under the reservation).
+// limit is a container's limit from the share, split among n containers (spec.Share.Limit), on
+// this host's RAM, never below floor: the limit the compose file sets itself, or the memory it
+// reserves (Docker refuses a limit under the reservation).
 func (p hostPlan) limit(share spec.Share, n int, floor int64) int64 {
-	n = max(n, 1)
-	part := int64(p.Host.MemBytes * uint64(share.Percent) / 100 / uint64(n))
-	if share.Max > 0 {
-		part = min(part, int64(share.Max)/int64(n))
-	}
-	return max(part&^(1<<20-1), MinMemLimit, floor)
+	return int64(share.Limit(p.Host.MemBytes, n, spec.Bytes(floor)))
 }
 
 // give adds to a service's content entry the memory limit share gives each of its containers, on

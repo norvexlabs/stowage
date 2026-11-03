@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # End-to-end test of the Kairos VM shape's publication: the OS bundle and its disk images, built for
 # real (kairos-init, auroraboot, qemu-img) and published to zot. Needs Docker (privileged
-# containers, loop devices), zstd, network access and about 30 GB on disk under XDG_CACHE_HOME.
+# containers, loop devices), zstd, tofu, network access and about 30 GB on disk under XDG_CACHE_HOME.
 #
 #   make e2e-kairos        (builds ./bin/stowage first)
 #   STOWAGE_CLOUD_ENV=<file> make e2e-kairos    (also registers the clouds' images: the file sets
@@ -15,7 +15,9 @@
 # and its app socket, a backup through the preloaded runner to a WebDAV server, decrypted with the
 # key), a second ship that builds nothing, promote to the immutable channel
 # (re-tagged, with latest-<format> following it), `vm create` from the published notes-stow (the
-# disk by digest, the seed ISO), verify, prune (a channel's disk set stays); then ship 2.0.0 (a migration): booting its notes-stow
+# disk by digest, the seed ISO), `vm create --platform libvirt --create opentofu` against libvirtd in
+# a container (QEMU without KVM: the module applied, a plan after it changing nothing, `vm destroy`
+# leaving no domain, volume or NVRAM), verify, prune (a channel's disk set stays); then ship 2.0.0 (a migration): booting its notes-stow
 # upgrades the install, and booting 1.0.0's again (the A/B fallback) goes back.
 set -euo pipefail
 
@@ -334,6 +336,44 @@ for want in [b"#cloud-config", b"ssh-ed25519 ", b"/etc/notes/install.yaml", b"ch
     assert want in iso, want
 PY
 rm -rf "$VMC"
+
+step "vm create on libvirt with OpenTofu: the built-in module against libvirtd (QEMU without KVM), no drift after the apply, vm destroy leaves nothing"
+command -v tofu >/dev/null || fail "tofu is needed (the libvirt module is applied)"
+LV=$WORK/libvirt
+mkdir -p "$LV/run" "$LV/state"
+docker build -q --build-arg "BASE=$LIBVIRTD_BASE" -t stowage-e2e-libvirtd "$(dirname "$0")/libvirtd" >/dev/null || fail "the libvirtd image"
+# --init: libvirtd daemonizes QEMU, whose parent is then PID 1, which must reap it (a zombie QEMU
+# fails the destroy).
+lvc=$(docker run -d --init --name "stowage-e2e-libvirtd-$$" --privileged --cgroupns=host --memory 6g -v "$LV/run:/run/libvirt" stowage-e2e-libvirtd)
+CLEANUP+=("docker rm -f $lvc >/dev/null 2>&1")
+# libvirtd's runtime files under the bind mount are root's: removed by a container, as root.
+CLEANUP+=("docker run --rm --network none -v '$LV:/lv' --entrypoint rm $LIBVIRTD_BASE -rf /lv/run >/dev/null 2>&1")
+for _ in $(seq 60); do [[ -e $LV/run/e2e-ready ]] && break; sleep 1; done
+[[ -e $LV/run/e2e-ready ]] || { docker logs "$lvc" | tail -20; fail "libvirtd did not start"; }
+# libvirtd names the peer of its socket: this user's uid must be a user inside.
+docker exec "$lvc" sh -c "getent passwd $(id -u) >/dev/null || useradd -u $(id -u) -M e2e"
+virsh() { docker exec "$lvc" virsh -c qemu:///system "$@"; }
+URI="qemu:///system?socket=$LV/run/libvirt-sock"
+# No KVM, so the guest boots too slowly to answer: the wait gives up, and the state is kept.
+! "${OPERATOR[@]}" XDG_STATE_HOME="$LV/state" "$WORK/notes-stow-stable" vm create --no-input --platform libvirt --create opentofu \
+	--hostname notes-lv --user ops --ssh-key "$WORK/key.pub" --tls internal --domains app=app.notes.test,api=api.notes.test --set ADMIN_EMAIL=admin@notes.test \
+	--network static --address 192.168.122.10/24 --gateway 192.168.122.1 --dns 192.168.122.1 --cpus 2 --memory 2048 --disk 4 \
+	--tofu-var "uri=$URI" --tofu-var domain_type=qemu --wait 30s >"$LV/create.txt" 2>"$LV/create.log" || { cat "$LV/create.log"; fail "vm create answered without KVM"; }
+grep -q 'OpenTofu created the VM notes-lv' "$LV/create.log" || { tail -40 "$LV/create.log"; fail "OpenTofu did not create the domain"; }
+[[ $(virsh domstate notes-lv) == running ]] || fail "the domain does not run"
+xml=$(virsh dumpxml notes-lv)
+grep -q '<acpi/>' <<<"$xml" && grep -q '<apic/>' <<<"$xml" || fail "the domain has no ACPI or APIC"
+grep -q "<disk type='file' device='disk'>" <<<"$xml" && ! grep -q "<disk type='volume'" <<<"$xml" || fail "a disk is not given by its path"
+grep -q "<loader .*type='pflash'" <<<"$xml" || fail "the domain does not boot UEFI"
+# The apply leaves no drift: a plan right after it changes nothing.
+STATE=$LV/state/notes/vms/notes-lv
+"${OPERATOR[@]}" tofu -chdir="$STATE" plan -detailed-exitcode -input=false -no-color >"$LV/plan.log" 2>&1 || { tail -40 "$LV/plan.log"; fail "the libvirt module drifts after its apply"; }
+"${OPERATOR[@]}" XDG_STATE_HOME="$LV/state" "$WORK/notes-stow-stable" vm destroy notes-lv --yes --no-input >"$LV/destroy.log" 2>&1 || { cat "$LV/destroy.log"; fail "vm destroy"; }
+[[ -z $(virsh list --all --name | tr -d '[:space:]') ]] || fail "vm destroy left a domain"
+[[ -z $(virsh vol-list default | tail -n +3 | tr -d '[:space:]') ]] || { virsh vol-list default; fail "vm destroy left a volume"; }
+[[ -z $(docker exec "$lvc" sh -c 'ls -A /var/lib/libvirt/qemu/nvram 2>/dev/null') ]] || fail "vm destroy left an NVRAM file"
+[[ ! -e $STATE ]] || fail "vm destroy left the state"
+docker rm -f "$lvc" >/dev/null
 
 step "prune beta: its bundle tag goes, its disks (beta's disk set) and stable's stay"
 [[ $("${S[@]}" prune --channel beta 1.0.0) == beta-1.0.0 ]] || fail "prune output"

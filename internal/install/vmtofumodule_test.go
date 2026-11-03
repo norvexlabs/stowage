@@ -106,6 +106,16 @@ func TestTheLibvirtModuleBootsUnderUEFIAndAppArmor(t *testing.T) {
 	if !slices.Equal(got, []string{"enrolled-keys", "secure-boot"}) {
 		t.Errorf("the firmware's features are %q, not in libvirt's order", got)
 	}
+	// The seed volume's format is the one libvirt probes on an ISO 9660 image, or a plan drifts.
+	if !regexp.MustCompile(`(?s)resource "libvirt_volume" "seed" \{.*?format = \{ type = "iso" \}`).MatchString(main) {
+		t.Error("the seed volume is not of format iso")
+	}
+	// KVM by default; QEMU's emulation, on a host without it, with the CPU it emulates.
+	vars := string(files["variables.tf"])
+	if !strings.Contains(main, "type        = var.domain_type") || !strings.Contains(main, `mode = var.domain_type == "kvm" ? "host-passthrough" : "maximum"`) ||
+		!regexp.MustCompile(`(?s)variable "domain_type" \{.*?default     = "kvm".*?contains\(\["kvm", "qemu"\], var.domain_type\)`).MatchString(vars) {
+		t.Error("the domain's type is not domain_type, kvm by default")
+	}
 }
 
 func TestModuleVarsReadsTheDeclarations(t *testing.T) {

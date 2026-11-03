@@ -60,6 +60,7 @@ const (
 	evInstallFailed   = "install.failed"
 	evCertExpiring    = "cert.expiring"
 	evBackupConfig    = "backup.config"
+	evServiceDown     = "service.down"
 	evNoRoute6        = "network.no_ipv6_route"
 )
 

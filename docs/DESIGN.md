@@ -1316,6 +1316,11 @@ every shape, the VM end-to-end test upgrading through it), then the health gate.
   the pure-Go provider does not need), the failed apply names the `virsh undefine` that removes
   it. Its lists are written in the order libvirt returns them (the firmware's features by name):
   the provider compares a read-back list by position, and fails an apply on another order.
+  e2e-kairos applies it through `vm create` against libvirtd in a container, as Ubuntu LTS
+  packages it, with `domain_type: qemu` (no KVM there): the domain must be defined and run, a plan
+  right after the apply must change nothing (which catches any attribute libvirt normalizes), and
+  `vm destroy` must leave no domain, volume or NVRAM file. The guest's boot, SSH and install wait
+  for a host with KVM, as does AppArmor's confinement (the container runs none).
   Any other platform is the operator's own module
   (`--module`), holding one contract: the variables `vm create` writes (name, size, the disk and
   the seed, their SHA-256; the administrator and key when declared), the outputs it reads (`id`,
@@ -1672,7 +1677,10 @@ every shape, the VM end-to-end test upgrading through it), then the health gate.
   NICs are the operator's: `tune` advises, `k8s tune` prints, nothing is written. Left out: bonds
   and VLANs (networkd has them; no project asks), several NICs on a cloud (TODO).
 - **What a service asks of the host is one entry** (`services.<name>`): its memory share (moved
-  from `stack.memory`), its whole cores, its nftables table, its address of its own. Cores are
+  from `stack.memory`; a percent of the host's RAM, with a `min` — the least the service needs,
+  which a small percent of the least VM would not give: lint computes each share on
+  `size.min` and warns one under 128 MiB stating none — and a `max`; the compose file's own limit
+  stays a floor too), its whole cores, its nftables table, its address of its own. Cores are
   allocated, not named: a release cannot know a host's CPU ids, so the install gives whole cores
   from the top, a core's threads together, never CPU 0's (the host's timers and default interrupts),
   the same on every start and boot, and `tune` computes the same sets for the NICs' steering, with
@@ -1778,12 +1786,42 @@ every shape, the VM end-to-end test upgrading through it), then the health gate.
   diverged network again, stopping what is on it until the stack's start brings it back or the
   start fails, never losing data, so the engine's networks are not compared with it. Kubernetes has it as a
   Deployment's strategy, which the chart sets.
+- **A service down is told, not recovered** — Stowage sets no restart policy of its own: the
+  compose file's `restart` is the project's choice, as a restart alone does not recover every
+  service (one whose state a crash corrupts), and lint warns a long-running service with none
+  (`restart: "no"` says it is meant). What Stowage adds is visibility: `status` and `ps` name a
+  service down with its exit code, whether its memory cgroup killed it and its limit (docker
+  inspect, as compose ps tells neither), and the VM's host daemon looks every minute after the
+  health gate and journals `service.down` when a service becomes down — a stretch is one event,
+  a crash loop's included, keyed by service: run identities (a container, the end of its run, a
+  restart count Docker resets on a start by hand) each missed a crash in some case. The look is
+  a read: it never takes the lifecycle lock, which a verb arriving at the same moment would find
+  held, but reads its holder from the kernel's lock table, and a look the lock or a job cuts is
+  dropped whole, what the last one saw kept. A policy's restart is no event (`ps --json` shows
+  the count). An operator's `stop` that exits non-zero is a service down too, its signal named
+  (`exited 143 (SIGTERM)`): Docker records no stop's author, and every way of telling it from a
+  crash Stowage could keep (a mark by container, by the end of its run, by its exit code) hides a
+  real crash in some case — a start that failed, a run that did not recreate it, an inspect that
+  did not answer —, which is worse than naming a stop the operator made. A service exited 0 is not
+  down: Compose does not tell a one-shot from a service that stopped of itself, so the exit code
+  is the line. Readiness is the compose healthcheck's: the install is done when every service
+  runs and every healthcheck passes, so lint warns the long-running services with none rather
+  than the install waiting on something it cannot see.
 - **Memory follows the host** (`stack.memory`): a service's limit is a share of the RAM, set in
   `stowage-content.yaml` at each start, so a resized VM or host is followed at its next start
   without a new release. A share only raises: the compose file's own limit and its reservation
   are floors, as the kernel's defaults are for the network tuning, and the shares together leave
   at least 10 % of the RAM to the OS, the engine and Stowage's own front and daemon — the floors
-  can take a small host past it, which the compose file's own limits asked for anyway. A share is
+  can take a small host past it, which the compose file's own limits asked for anyway. A share's
+  `min` is such a floor stated in the spec, the least the service needs: a percent sized for a
+  large host is an unusable limit on the least VM (5 % of 2 GiB is 92 MiB), and the compose limit
+  would then have to be written for the least host and hold on every other. It wins over `max`
+  (lint refuses a `min` over it), and its part of each container is rounded up to the byte, not
+  the MiB, so the containers never get less than it states and a `min` equal to the `max` gives
+  the max. Lint computes each share on `size.min` with the installer's own arithmetic
+  (`spec.Share.Limit`), so its warnings are the limits the VM gets; floors together past the
+  shares' 90 % are warned, not refused, as the compose file's own floors are: the limits are
+  ceilings, which the kernel enforces only under pressure. A share is
   the service's, split among its containers, so a scaled service takes no more of the RAM. Docker
   Desktop gets none: its containers' RAM is its VM's, which the host does not show. The limit goes on the key the
   compose file uses (Compose refuses `mem_limit` beside a distinct deploy limit), and the swap a

@@ -205,11 +205,11 @@ func TestEachRuleFiresOnFull(t *testing.T) {
 		{"set from a secret", []edit{{sp, `prompt: "Probe addresses ingest trusts, comma-separated (empty: none)", optional: true`, `prompt: "Probe addresses ingest trusts, comma-separated (empty: none)", optional: true, secret: true`}}, nil, "services.ingest.sets.trusted: TRUSTED_PROBES is secret"},
 		{"set from a mode's input", []edit{{sp, `prompt: "Probe addresses ingest trusts, comma-separated (empty: none)", optional: true`, `prompt: "Probe addresses ingest trusts, comma-separated (empty: none)", optional: true, when: tls`}}, nil, "services.ingest.sets.trusted: TRUSTED_PROBES is asked only when tls"},
 		{"set default", []edit{{sp, `prompt: "Probe addresses ingest trusts, comma-separated (empty: none)", optional: true`, `prompt: "Probe addresses ingest trusts, comma-separated (empty: none)", optional: true, default: "192.0.2.1; drop"`}}, nil, `services.ingest.sets.trusted: TRUSTED_PROBES's default: element "192.0.2.1; drop"`},
-		{"sets without a table", []edit{{sp, "api: { memory: 10, feeds", "api: { memory: 10, sets: { probes: TRUSTED_PROBES }, feeds"}}, nil, "services.api.sets: fills the sets of api's own table: give it nftables"},
+		{"sets without a table", []edit{{sp, "api: { memory: { percent: 10, min: 256M }, feeds", "api: { memory: { percent: 10, min: 256M }, sets: { probes: TRUSTED_PROBES }, feeds"}}, nil, "services.api.sets: fills the sets of api's own table: give it nftables"},
 		{"feeds empty", []edit{{sp, "feeds: [ingest]", "feeds: []"}}, nil, "services.api.feeds: is empty"},
 		{"feeds twice", []edit{{sp, "feeds: [ingest]", "feeds: [ingest, ingest]"}}, nil, "services.api.feeds[1]: ingest is given twice"},
 		{"feeds no table", []edit{{sp, "feeds: [ingest]", "feeds: [echo]"}}, nil, "services.api.feeds[0]: echo has no nftables table (services.echo.nftables)"},
-		{"flush_conntrack without a table", []edit{{sp, "api: { memory: 10, feeds", "api: { memory: 10, flush_conntrack: true, feeds"}}, nil, "services.api.flush_conntrack: api has no nftables table (services.api.nftables)"},
+		{"flush_conntrack without a table", []edit{{sp, "api: { memory: { percent: 10, min: 256M }, feeds", "api: { memory: { percent: 10, min: 256M }, flush_conntrack: true, feeds"}}, nil, "services.api.flush_conntrack: api has no nftables table (services.api.nftables)"},
 		{"feeds itself", []edit{{sp, "sets: { trusted: TRUSTED_PROBES }, flush", "sets: { trusted: TRUSTED_PROBES }, feeds: [ingest], flush"}}, nil, "services.ingest.feeds[0]: is ingest itself"},
 		{"transparent empty", []edit{{sp, "transparent: [vpn0]", "transparent: []"}}, nil, "services.vpn.transparent: is empty"},
 		{"transparent without a table", []edit{{sp, "nftables: deploy/vpn.nft, transparent", "transparent"}}, nil, "services.vpn.transparent: vpn's own table steers the traffic to its sockets: give it nftables"},
@@ -237,6 +237,10 @@ func TestEachRuleFiresOnFull(t *testing.T) {
 		{"memory share max under the replicas' limits", []edit{{sp, memShares, "services:\n  postgres: { memory: { percent: 25, max: 511M } }\n"}, {"deploy/compose.yaml", "    mem_limit: 256m ", "    scale: 2\n    mem_limit: 256m "}}, nil, "services.postgres.memory.max: 511M: 261632K for each of postgres's 2 containers, under the 256M limit or reservation"},
 		{"memory share max under the reservation", []edit{{sp, memShares, "services:\n  postgres: { memory: { percent: 25, max: 1G } }\n"}, {"deploy/compose.yaml", "    mem_limit: 256m ", "    mem_reservation: 1.5g\n    mem_limit: 256m "}}, nil, "services.postgres.memory.max: 1G: 1G for postgres, under the 1536M limit"},
 		{"memory share max under the base's limit", []edit{{sp, memShares, "services:\n  api: { memory: { percent: 25, max: 1G } }\n"}, {"deploy/compose.yaml", "  api:\n    image: ${STOWAGE_IMAGE_API}\n", "  api:\n    extends: postgres\n    image: ${STOWAGE_IMAGE_API}\n"}, {"deploy/compose.yaml", "    mem_limit: 256m ", "    mem_limit: 2g "}}, nil, "services.api.memory.max: 1G: 1G for api, under the 2G limit"},
+		{"memory share min under the least", []edit{{sp, memShares, "services:\n  api: { memory: { percent: 25, min: 67108863 } }\n"}}, nil, "services.api.memory.min: 67108863: 67108863 for api, under 64M, the least limit"},
+		{"memory share min under the least per container", []edit{{sp, memShares, "services:\n  api: { memory: { percent: 10, min: 255M } }\n"}, {"deploy/compose.yaml", "  api:\n    image: ${STOWAGE_IMAGE_API}\n", "  api:\n    deploy: { replicas: \"4\" }\n    image: ${STOWAGE_IMAGE_API}\n"}}, nil, "services.api.memory.min: 255M: 65280K for each of api's 4 containers, under 64M"},
+		{"memory share min over max", []edit{{sp, memShares, "services:\n  api: { memory: { percent: 10, min: 1025M, max: 1G } }\n"}}, nil, "services.api.memory.min: 1025M: over the share's max 1G"},
+		{"memory share min over max by a byte", []edit{{sp, memShares, "services:\n  api: { memory: { percent: 10, min: 1073741825, max: 1G } }\n"}}, nil, "services.api.memory.min: 1073741825: over the share's max 1G"},
 		{"memory share max without percent", []edit{{sp, memShares, "services:\n  postgres: { memory: { max: 16G } }\n"}}, nil, "services.postgres.memory: 0: a percent of the host's RAM"},
 		{"vm size empty", []edit{{sp, vmSizeLine, "size: {}"}}, nil, "shapes.kairos.size: states no size"},
 		{"vm size states nothing", []edit{{sp, vmSizeLine, "size: { min: {} }"}}, nil, "shapes.kairos.size.min: states nothing"},
@@ -538,7 +542,7 @@ func TestEachRuleFiresOnFull(t *testing.T) {
 		{"update decline status -1", []edit{{sp, "update_decline_status: 75", "update_decline_status: -1"}}, nil, "services.api.update_decline_status: -1: an exit status from 1 to 124"},
 		{"update decline status 0", []edit{{sp, "update_decline_status: 75", "update_decline_status: 0"}}, nil, "services.api.update_decline_status: 0: an exit status from 1 to 124"},
 		{"front hosts unknown", []edit{{sp, "front_hosts: host-gateway", "front_hosts: public"}}, nil, `services.vpn.front_hosts: "public": loopback (the default), host-gateway or none`},
-		{"front hosts off the host's network", []edit{{sp, "api: { memory: 10,", "api: { front_hosts: none, memory: 10,"}}, nil, "services.api.front_hosts: is where a service on the host's network reaches the front's domains: api is not on it"},
+		{"front hosts off the host's network", []edit{{sp, "api: { memory: { percent: 10, min: 256M },", "api: { front_hosts: none, memory: { percent: 10, min: 256M },"}}, nil, "services.api.front_hosts: is where a service on the host's network reaches the front's domains: api is not on it"},
 		{"update decline status 125", []edit{{sp, "update_decline_status: 75", "update_decline_status: 125"}}, nil, "services.api.update_decline_status: 125: an exit status from 1 to 124"},
 		{"start-first with an address", []edit{{sp, "address_input: RELAY_ADDRESS }", "address_input: RELAY_ADDRESS, update: start-first }"}}, nil, "services.relay.update: relay has an address of its own"},
 		{"start-first with a container name", []edit{{cp, "  api:\n    image: ${STOWAGE_IMAGE_API}\n", "  api:\n    container_name: atlas-api\n    image: ${STOWAGE_IMAGE_API}\n"}}, nil, "services.api.update: api sets container_name atlas-api"},
@@ -553,7 +557,7 @@ func TestEachRuleFiresOnFull(t *testing.T) {
 		{"start-first lending its volumes", []edit{{cp, "    profiles: [relay]\n", "    profiles: [relay]\n    volumes_from: [\"api:ro\"]\n"}}, nil, "services.api.update: relay mounts api's volumes (volumes_from: api:ro)"},
 		{"start-first in another's namespace", []edit{{cp, "  api:\n    image: ${STOWAGE_IMAGE_API}\n", "  api:\n    network_mode: service:ui\n    image: ${STOWAGE_IMAGE_API}\n"}}, nil, "services.api.update: api runs in another's network namespace (network_mode service:ui)"},
 		{"start-first lending its volumes through extends", []edit{{cp, "    profiles: [relay]\n", "    profiles: [relay]\n    extends: ui\n"}, {cp, "  ui:\n    image: ${STOWAGE_IMAGE_UI}\n", "  ui:\n    volumes_from: [api]\n    image: ${STOWAGE_IMAGE_UI}\n"}}, nil, "services.api.update: relay mounts api's volumes (volumes_from: api)"},
-		{"start-first with a disabled base healthcheck", []edit{{cp, "  api:\n    image: ${STOWAGE_IMAGE_API}\n", "  api:\n    extends: ui\n    image: ${STOWAGE_IMAGE_API}\n"}, {cp, "  ui:\n    image: ${STOWAGE_IMAGE_UI}\n", "  ui:\n    healthcheck: { disable: true }\n    image: ${STOWAGE_IMAGE_UI}\n"}}, nil, "services.api.update: api disables its healthcheck"},
+		{"start-first with a disabled base healthcheck", []edit{{cp, "  api:\n    image: ${STOWAGE_IMAGE_API}\n", "  api:\n    extends: ui\n    image: ${STOWAGE_IMAGE_API}\n"}, {cp, "      test: [\"CMD\", \"wget\", \"-q\", \"-O\", \"/dev/null\", \"http://127.0.0.1:8080/\"]\n", "      disable: true\n"}}, nil, "services.api.update: api disables its healthcheck"},
 		{"start-first with a test of no probe", []edit{{cp, "      test: [\"CMD\", \"atlas-server\", \"probe\", \"9090\"]\n", "      test: [\"curl\", \"-f\", \"http://localhost:9090\"]\n"}}, nil, "services.api.update: api's healthcheck test starts with curl, not CMD, CMD-SHELL or NONE"},
 		{"start-first with a test of no command", []edit{{cp, "      test: [\"CMD\", \"atlas-server\", \"probe\", \"9090\"]\n", "      test: [\"CMD-SHELL\", \"\"]\n"}}, nil, "services.api.update: api's healthcheck test runs no command"},
 		{"start-first with a blank string test", []edit{{cp, "      test: [\"CMD\", \"atlas-server\", \"probe\", \"9090\"]\n", "      test: \" \"\n"}}, nil, "api's healthcheck test runs no command"},
@@ -1602,7 +1606,7 @@ func TestHostPrivilegesWarn(t *testing.T) {
 	// What gives none: privileged false, another socket.
 	root = testutil.CopyExample(t, "stateless")
 	testutil.Edit(t, root, "deploy/compose.yaml", img, img+"    privileged: \"off\"\n")
-	testutil.Edit(t, root, "deploy/compose.yaml", "  server:\n", "  other:\n    image: ${STOWAGE_IMAGE_SERVER}\n    privileged: false\n  server:\n")
+	testutil.Edit(t, root, "deploy/compose.yaml", "  server:\n", "  other:\n    image: ${STOWAGE_IMAGE_SERVER}\n    privileged: false\n    restart: \"no\"\n  server:\n")
 	testutil.Edit(t, root, "deploy/compose.yaml", vol, vol+"      - /run/other.sock:/run/other.sock\n      - /var/lib/data:/data\n      - /var/run/docker.sock\n      - ${DATA:-/srv/data}:/data2\n")
 	if res := run(t, root); len(res.Findings) != 0 {
 		t.Errorf("findings %+v", res.Findings)
@@ -1847,7 +1851,7 @@ func FuzzCheckL4Bind(f *testing.F) {
 // memShares is examples/full's services block, which gives two services a memory share.
 const memShares = `services:                                                      # what a compose service asks of the host, beyond its compose file
   postgres: { memory: { percent: 25, max: 16G } }              # percent of the host's RAM, recomputed at each start, capped at 16 GiB
-  api: { memory: 10, feeds: [ingest], update: start-first, update_signal: SIGUSR2, update_socket: /run/atlas/handoff, update_ready: ready, update_decline_status: 75 }  # feeds ingest's sets (a load of its table recreates it too); its new container healthy beside the old before the old stops; the old one told to go once the new one wrote ready; exit 75 asks for stop-first
+  api: { memory: { percent: 10, min: 256M }, feeds: [ingest], update: start-first, update_signal: SIGUSR2, update_socket: /run/atlas/handoff, update_ready: ready, update_decline_status: 75 }  # 10 % of the host's RAM, never under 256 MiB; feeds ingest's sets (a load of its table recreates it too); its new container healthy beside the old before the old stops; the old one told to go once the new one wrote ready; exit 75 asks for stop-first
 `
 
 // servicesBlock is examples/full's whole services block: its memory shares, then the services' cores,
@@ -1923,6 +1927,179 @@ func TestMemoryShareMaxAlwaysReachedWarns(t *testing.T) {
 		if res := run(t, root); warned(res) != want {
 			t.Errorf("%s on the VM alone: warned %v, findings %+v", share, !want, res.Findings)
 		}
+	}
+}
+
+// On the least VM (2G, 1843.2M shown), a share under 128M with no min is warned; a min, or a
+// compose limit at least that, silences it. Shares' floors over the 90 % the shares get are warned.
+func TestMemoryShareOnTheLeastVM(t *testing.T) {
+	t.Parallel()
+	warned := func(res *Result, where string) bool {
+		for _, f := range res.Findings {
+			if f.Severity == Warning && f.Where == where {
+				return true
+			}
+		}
+		return false
+	}
+	for share, want := range map[string]bool{
+		"6":                         true,  // 6 % of 1843.2M is 110.6M
+		"7":                         false, // 7 % is 129M
+		"{ percent: 6, min: 128M }": false, // a floor stated
+		"{ percent: 6, min: 64M }":  false, // any floor stated: the project's call
+		"{ percent: 7, max: 127M }": false, // capped under it by the project's own max
+		"{ percent: 6, max: 128M }": true,  // a max at it: 110.6M still
+		"{ percent: 7, max: 128M }": false, // capped at it
+	} {
+		root := testutil.CopyExample(t, "full")
+		testutil.Edit(t, root, specFile, memShares, "services:\n  api: { memory: "+share+" }\n")
+		res := run(t, root)
+		if warned(res, "services.api.memory") != want {
+			t.Errorf("%s: warned %v, findings %+v", share, !want, res.Findings)
+		}
+		if errs := errorsOf(res); len(errs) > 0 {
+			t.Errorf("%s: %v", share, errs)
+		}
+	}
+	// postgres's compose limit (256m) is its floor: 1 % of it is no warning.
+	root := testutil.CopyExample(t, "full")
+	testutil.Edit(t, root, specFile, memShares, "services:\n  postgres: { memory: 1 }\n")
+	if res := run(t, root); warned(res, "services.postgres.memory") {
+		t.Errorf("a compose limit over 128M: warned, findings %+v", res.Findings)
+	}
+	// The floors: postgres's 256M and api's min, against 90 % of 1843.2M (1658.88M).
+	for min, want := range map[string]bool{"1402M": false, "1403M": true} {
+		root := testutil.CopyExample(t, "full")
+		testutil.Edit(t, root, specFile, memShares, "services:\n  postgres: { memory: 25 }\n  api: { memory: { percent: 10, min: "+min+" } }\n")
+		if res := run(t, root); warned(res, "services") != want {
+			t.Errorf("api's min %s: warned %v, findings %+v", min, !want, res.Findings)
+		}
+	}
+	// The other sides of the min's boundaries are clean: a min equal to the max, 64M for each of 4.
+	for _, c := range [][2]string{
+		{"services:\n  api: { memory: { percent: 10, min: 1G, max: 1G } }\n", ""},
+		{"services:\n  api: { memory: { percent: 10, min: 256M } }\n", "  api:\n    deploy: { replicas: \"4\" }\n    image: ${STOWAGE_IMAGE_API}\n"},
+	} {
+		root := testutil.CopyExample(t, "full")
+		testutil.Edit(t, root, specFile, memShares, c[0])
+		if c[1] != "" {
+			testutil.Edit(t, root, "deploy/compose.yaml", "  api:\n    image: ${STOWAGE_IMAGE_API}\n", c[1])
+		}
+		if errs := errorsOf(run(t, root)); len(errs) > 0 {
+			t.Errorf("%q: %v", c[0], errs)
+		}
+	}
+	// A min the compose limit always wins over is warned; one over it is not.
+	for min, want := range map[string]bool{"256M": true, "268435457": false, "257M": false} {
+		root := testutil.CopyExample(t, "full")
+		testutil.Edit(t, root, specFile, memShares, "services:\n  postgres: { memory: { percent: 25, min: "+min+" } }\n")
+		if res := run(t, root); warned(res, "services.postgres.memory.min") != want {
+			t.Errorf("postgres's min %s beside its 256m: warned %v, findings %+v", min, !want, res.Findings)
+		}
+	}
+	// The hint keeps a max the share states.
+	root = testutil.CopyExample(t, "full")
+	testutil.Edit(t, root, specFile, memShares, "services:\n  api: { memory: { percent: 6, max: 128M } }\n")
+	found := false
+	for _, f := range run(t, root).Findings {
+		found = found || f.Where == "services.api.memory" && strings.Contains(f.Message, "(memory: { percent: 6, min: <size>, max: 128M })")
+	}
+	if !found {
+		t.Error("the hint drops the share's max")
+	}
+	// Floors of petabytes saturate, never wrap: still over the least VM.
+	root = testutil.CopyExample(t, "full")
+	testutil.Edit(t, root, specFile, memShares, "services:\n  postgres: { memory: { percent: 1, min: 5000p } }\n  api: { memory: { percent: 1, min: 5000p } }\n")
+	if res := run(t, root); !warned(res, "services") {
+		t.Errorf("floors of 2 × 5000p: not warned, findings %+v", res.Findings)
+	}
+	// Without a least VM, nothing is computed.
+	root = testutil.CopyExample(t, "full")
+	testutil.Edit(t, root, specFile, memShares, "services:\n  api: { memory: 1 }\n")
+	testutil.SetYAML(t, root, specFile, []string{"shapes", "kairos"}, nil)
+	if res := run(t, root); warned(res, "services.api.memory") {
+		t.Errorf("without a kairos shape: warned, findings %+v", res.Findings)
+	}
+}
+
+// "Always the maximum" is the percent's (and the compose floor's) doing, never the min's.
+func TestMemoryShareMaxAlwaysReachedIsThePercents(t *testing.T) {
+	t.Parallel()
+	for share, want := range map[string]bool{
+		"api: { memory: { percent: 1, min: 1G, max: 1G } }": false, // the min reaches it, not 1 %
+		"postgres: { memory: { percent: 5, max: 256M } }":   true,  // its 256m compose limit is the max
+		"postgres: { memory: { percent: 5, max: 257M } }":   false,
+	} {
+		root := testutil.CopyExample(t, "full")
+		testutil.Edit(t, root, specFile, memShares, "services:\n  "+share+"\n")
+		testutil.SetYAML(t, root, specFile, []string{"shapes", "docker"}, nil)
+		got := false
+		for _, f := range run(t, root).Findings {
+			got = got || f.Severity == Warning && strings.HasSuffix(f.Where, ".memory.max")
+		}
+		if got != want {
+			t.Errorf("%s: warned %v", share, got)
+		}
+	}
+}
+
+// A long-running service with no restart policy is warned, and the ones with no healthcheck
+// together; a one-shot (waited for with service_completed_successfully, or restart: "no") is
+// none, a base's restart is inherited, and a project without a docker or kairos shape is not
+// checked.
+func TestLongRunningServices(t *testing.T) {
+	t.Parallel()
+	const web = "  web:\n    image: ${STOWAGE_IMAGE_WEB}\n    environment:\n      API_URL: ${STOWAGE_URL_API}\n    healthcheck:\n      test: [\"CMD\", \"wget\", \"-q\", \"-O\", \"/dev/null\", \"http://127.0.0.1:8080/\"]\n      interval: 2s\n      retries: 30\n    restart: unless-stopped\n"
+	const noRestart, noHealth = "services.web: no restart policy", "web set no healthcheck"
+	findings := func(res *Result) string {
+		var b strings.Builder
+		for _, f := range res.Findings {
+			b.WriteString(f.String() + "\n")
+		}
+		return b.String()
+	}
+	for _, c := range []struct {
+		name, with string
+		edits      [][3]string
+		want       []string // the warnings, each a substring; none when empty
+	}{
+		{"no restart", strings.Replace(web, "    restart: unless-stopped\n", "", 1), nil, []string{noRestart}},
+		{"no healthcheck", strings.Replace(web, "    healthcheck:\n      test: [\"CMD\", \"wget\", \"-q\", \"-O\", \"/dev/null\", \"http://127.0.0.1:8080/\"]\n      interval: 2s\n      retries: 30\n", "", 1), nil, []string{noHealth}},
+		{"a healthcheck tuning the image's", strings.Replace(web, "      test: [\"CMD\", \"wget\", \"-q\", \"-O\", \"/dev/null\", \"http://127.0.0.1:8080/\"]\n", "", 1), nil, nil},
+		{"a healthcheck disabled", strings.Replace(web, "      interval: 2s\n", "      disable: true\n", 1), nil, []string{noHealth}},
+		{"a NONE healthcheck", strings.Replace(web, "[\"CMD\", \"wget\", \"-q\", \"-O\", \"/dev/null\", \"http://127.0.0.1:8080/\"]", "[\"NONE\"]", 1), nil, []string{noHealth}},
+		{"neither", "  web:\n    image: ${STOWAGE_IMAGE_WEB}\n", nil, []string{noRestart, noHealth}},
+		{"deploy's restart policy", strings.Replace(web, "    restart: unless-stopped\n", "    deploy: { restart_policy: { condition: on-failure } }\n", 1), nil, nil},
+		{"a one-shot by deploy's condition none", "  web:\n    image: ${STOWAGE_IMAGE_WEB}\n    deploy: { restart_policy: { condition: none } }\n", nil, nil},
+		{"a one-shot by restart no", "  web:\n    image: ${STOWAGE_IMAGE_WEB}\n    restart: \"no\"\n", nil, nil},
+		{"a one-shot waited for", "  web:\n    image: ${STOWAGE_IMAGE_WEB}\n", [][3]string{{"deploy/compose.yaml", "      postgres:\n        condition: service_healthy\n", "      postgres:\n        condition: service_healthy\n      web:\n        condition: service_completed_successfully\n        restart: true\n"}}, nil},
+		{"a base's restart", "  web:\n    extends: api\n    image: ${STOWAGE_IMAGE_WEB}\n    healthcheck:\n      test: [\"CMD\", \"true\"]\n", nil, nil},
+	} {
+		root := testutil.CopyExample(t, "minimal")
+		testutil.Edit(t, root, "deploy/compose.yaml", web, c.with)
+		for _, e := range c.edits {
+			testutil.Edit(t, root, e[0], e[1], e[2])
+		}
+		got := findings(run(t, root))
+		for _, w := range c.want {
+			if !strings.Contains(got, w) {
+				t.Errorf("%s: no %q in\n%s", c.name, w, got)
+			}
+		}
+		if c.want == nil && strings.Contains(got, "services.web") || c.want == nil && strings.Contains(got, "web set no") {
+			t.Errorf("%s: warned\n%s", c.name, got)
+		}
+	}
+	// Kubernetes alone: the chart's pods restart and probe on their own.
+	root := testutil.CopyExample(t, "full")
+	testutil.Edit(t, root, "deploy/compose.yaml", "    depends_on: [echo, vpn]\n    restart: \"no\"\n", "    depends_on: [echo, vpn]\n")
+	if got := findings(run(t, root)); !strings.Contains(got, "services.echo-check: no restart policy") {
+		t.Fatalf("the positive control: %s", got)
+	}
+	testutil.SetYAML(t, root, specFile, []string{"shapes", "docker"}, nil)
+	testutil.SetYAML(t, root, specFile, []string{"shapes", "kairos"}, nil)
+	if got := findings(run(t, root)); strings.Contains(got, "no restart policy") || strings.Contains(got, "set no healthcheck") {
+		t.Errorf("Kubernetes alone: %s", got)
 	}
 }
 

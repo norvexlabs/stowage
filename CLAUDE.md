@@ -141,7 +141,8 @@ a self-review against the code it describes is enough. Every other commit clears
    (`vmcreate*.go`, `seed*.go`). Each must
    print PASS. `make gate`
    runs exactly these, and also: the VM's creation, verbs and health gate (`vmcreate*.go`,
-   `vmcli*.go`, `vmhealth*.go`) run e2e-vm; a test script runs its own suite (`test/lib.sh`,
+   `vmcli*.go`, `vmhealth*.go`) run e2e-vm; a test script runs its own suite (`test/libvirtd/`, the libvirt daemon e2e-kairos
+   applies the libvirt module against, runs e2e-kairos; `test/lib.sh`,
    `pins.sh`, `sweep.sh`: e2e, e2e-docker, e2e-full, e2e-stateless, e2e-k8s, e2e-full-k8s); `go.mod`/`go.sum`
    run every suite but e2e-full-vm; `internal/sbom` (the SBOMs, the scanner, the audits) runs
    e2e, the lifecycle suites (e2e-docker, e2e-full, e2e-stateless, e2e-k8s, e2e-full-k8s),

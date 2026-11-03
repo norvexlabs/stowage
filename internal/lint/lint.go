@@ -8,6 +8,7 @@ import (
 	"encoding/pem"
 	"fmt"
 	"maps"
+	"math"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -549,6 +550,7 @@ func (l *linter) stack() {
 	for _, name := range sortedKeys(inherited) {
 		l.errf(file+": services."+name+".extends", "%v", inherited[name])
 	}
+	l.longRunning(c, file)
 	imageVars := l.imageVars()
 	used := map[string]bool{}
 	for _, name := range sortedKeys(c.Services) {
@@ -631,7 +633,8 @@ func (l *linter) stack() {
 
 // memory checks services: each a service the compose file declares (when it reads), asking
 // something; its memory share from 1 %, the shares together at most spec.MaxMemoryShares, each
-// maximum one the service can be given; the rest serviceHost.
+// minimum and maximum one the service can be given, and on the least VM each share's limit and
+// the floors together (shareOnLeastVM); the rest serviceHost.
 func (l *linter) memory() {
 	if len(l.s.Services) == 0 {
 		if l.leftEmpty("services") {
@@ -639,7 +642,7 @@ func (l *linter) memory() {
 		}
 		return
 	}
-	total, shares := 0, false
+	total, shares, floors := 0, false, spec.Bytes(0)
 	for _, name := range sortedKeys(l.s.Services) {
 		svc, at := l.s.Services[name], "services."+name
 		l.service(at, name)
@@ -655,15 +658,27 @@ func (l *linter) memory() {
 		if share.Max != 0 {
 			l.shareMax(at+".memory", name, *share)
 		}
+		if share.Min != 0 {
+			l.shareMin(at+".memory", name, *share)
+		}
 		if pct := share.Percent; pct < 1 || pct > spec.MaxMemoryShares {
 			l.errf(at+".memory", "%d: a percent of the host's RAM, from 1 to %d", pct, spec.MaxMemoryShares)
 			continue
 		}
 		total += share.Percent
+		// Saturated, never wrapped: a size of petabytes stays over every VM.
+		if f := l.shareOnLeastVM(at+".memory", name, *share); f > math.MaxInt64-floors {
+			floors = math.MaxInt64
+		} else {
+			floors += f
+		}
 	}
 	l.containerJoins()
 	if total > spec.MaxMemoryShares {
 		l.errf("services", "the memory shares total %d %%: at most %d, the rest is the OS's, the engine's and Stowage's", total, spec.MaxMemoryShares)
+	}
+	if least := l.leastVMRAM(); least > 0 && floors > least/100*spec.MaxMemoryShares {
+		l.warnf("services", "the memory shares' floors (each the largest of its min, its compose limit or reservation and %s, for each container) total %s, over the %s the least VM (shapes.kairos.size.min.memory: %s, %s of it shown by its kernel) leaves the shares (%d %%): its services may be OOM-killed under load", spec.MinMemLimit, floors&^(1<<20-1), (least/100*spec.MaxMemoryShares)&^(1<<20-1), l.s.Shapes.Kairos.Size.Min.Memory, least&^(1<<20-1), spec.MaxMemoryShares)
 	}
 	if shares && l.s.Shapes.Docker == nil && l.s.Shapes.Kairos == nil {
 		l.warnf("services", "only the docker and kairos shapes size services from the host: the chart gives its pods their resources")
@@ -676,15 +691,9 @@ func (l *linter) memory() {
 // it: only the VM's least size bounds a host, of which its kernel shows at least vmRAMShown.
 func (l *linter) shareMax(at, name string, share spec.Share) {
 	at += ".max"
-	floor, n := spec.Bytes(0), 1
-	if l.compose != nil {
-		floor, n = l.compose.Services[name].MemFloor()
-	}
+	floor, n, each := l.shareContainers(name)
 	// A maximum is split among the service's containers: each part is checked.
-	part, each := share.Max/spec.Bytes(n), name
-	if n > 1 {
-		each = fmt.Sprintf("each of %s's %d containers", name, n)
-	}
+	part := share.Max / spec.Bytes(n)
 	switch {
 	case part < spec.MinMemLimit:
 		l.errf(at, "%s: %s for %s, under %s, the least limit a share gives", share.Max, part, each, spec.MinMemLimit)
@@ -697,11 +706,83 @@ func (l *linter) shareMax(at, name string, share spec.Share) {
 	if l.s.Shapes.Docker != nil || k == nil || k.Size == nil || k.Size.Min == nil || k.Size.Min.Memory == 0 || share.Percent < 1 || share.Percent > spec.MaxMemoryShares {
 		return
 	}
-	// Divided first: a size of petabytes times a percent would overflow.
-	shown := k.Size.Min.Memory / 100 * vmRAMShown
-	if least := shown / 100 * spec.Bytes(share.Percent); least >= share.Max {
-		l.warnf(at, "%s: %d %% of the least VM's %s (%s of it shown by its kernel) is already %s, so the limit is always the maximum: give %s a %s limit in %s instead", share.Max, share.Percent, k.Size.Min.Memory, shown&^(1<<20-1), least&^(1<<20-1), each, part&^(1<<20-1), l.s.Stack.Compose)
+	shown := l.leastVMRAM()
+	// The percent's limit there, its compose floor included, never its min: the min is not the percent.
+	if least := (spec.Share{Percent: share.Percent, Max: share.Max}).Limit(uint64(shown), n, floor); least >= part&^(1<<20-1) {
+		l.warnf(at, "%s: %d %% of the least VM's %s (%s of it shown by its kernel) is already %s, so the limit is always the maximum: give %s a %s limit in %s instead", share.Max, share.Percent, k.Size.Min.Memory, shown&^(1<<20-1), least, each, part&^(1<<20-1), l.s.Stack.Compose)
 	}
+}
+
+// shareMin checks a share's minimum: at least spec.MinMemLimit for each of the service's
+// containers, and not over the share's maximum, which it would always win over; one the compose
+// file's own limit or reservation always wins over is warned.
+func (l *linter) shareMin(at, name string, share spec.Share) {
+	at += ".min"
+	floor, n, each := l.shareContainers(name)
+	switch part := share.Min / spec.Bytes(n); {
+	case part < spec.MinMemLimit:
+		l.errf(at, "%s: %s for %s, under %s, the least limit a share gives", share.Min, part, each, spec.MinMemLimit)
+	case share.Max != 0 && share.Min > share.Max:
+		l.errf(at, "%s: over the share's max %s, which it would always win over: give a min up to the max", share.Min, share.Max)
+	case (spec.Share{Min: share.Min}).Limit(0, n, 0) <= floor:
+		l.warnf(at, "%s: %s for %s, at most the %s limit or reservation %s gives it itself, which always wins: the min never changes its limit", share.Min, part, each, floor, l.s.Stack.Compose)
+	}
+}
+
+// leastVMRAM is the RAM the least VM's kernel shows (shapes.kairos.size.min.memory, of which it
+// shows at least vmRAMShown), or 0 without one.
+func (l *linter) leastVMRAM() spec.Bytes {
+	k := l.s.Shapes.Kairos
+	if k == nil || k.Size == nil || k.Size.Min == nil {
+		return 0
+	}
+	// Divided first: a size of petabytes times a percent would overflow.
+	return k.Size.Min.Memory / 100 * vmRAMShown
+}
+
+// lowShare is the limit under which a share without a min is warned on the least VM: a server and
+// the command its healthcheck runs outgrow less.
+const lowShare spec.Bytes = 128 << 20
+
+// shareOnLeastVM computes the share's limit on the least VM, as the install does
+// (spec.Share.Limit), and warns when it comes out under lowShare for a share that states no min
+// (nor a max under lowShare, a limit the project chose); a least VM bounds every VM whatever other
+// shapes the project has, so it is checked beside a docker shape too;
+// it returns the service's floor (the largest of its min, its compose limit or reservation and
+// spec.MinMemLimit, for each container), which the floors' total is checked with. Without a least
+// VM, it checks nothing and returns 0.
+func (l *linter) shareOnLeastVM(at, name string, share spec.Share) spec.Bytes {
+	least := l.leastVMRAM()
+	if least == 0 {
+		return 0
+	}
+	floor, n, who := l.shareContainers(name)
+	keepMax := ""
+	if share.Max != 0 {
+		keepMax = ", max: " + share.Max.String()
+	}
+	// A share stating no min, unless its own max caps it under lowShare: that limit is the project's.
+	if limit := share.Limit(uint64(least), n, floor); share.Min == 0 && (share.Max == 0 || share.Max/spec.Bytes(n) >= lowShare) && limit < lowShare {
+		l.warnf(at, "%d %% of the least VM's %s (%s of it shown by its kernel) is a %s limit for %s, under %s: state the least it needs as the share's min (memory: { percent: %d, min: <size>%s })", share.Percent, l.s.Shapes.Kairos.Size.Min.Memory, least&^(1<<20-1), limit, who, lowShare, share.Percent, keepMax)
+	}
+	each := spec.Share{Min: share.Min}.Limit(0, n, floor)
+	if each > math.MaxInt64/spec.Bytes(n) {
+		return math.MaxInt64
+	}
+	return each * spec.Bytes(n)
+}
+
+// shareContainers is what a share is split with: the largest memory the compose file gives each
+// of the service's containers itself, their number, and the words naming them.
+func (l *linter) shareContainers(name string) (floor spec.Bytes, n int, who string) {
+	n, who = 1, name
+	if l.compose != nil {
+		floor, n = l.compose.Services[name].MemFloor()
+	}
+	if n > 1 {
+		who = fmt.Sprintf("each of %s's %d containers", name, n)
+	}
+	return floor, n, who
 }
 
 // vmRAMShown is the percent of a VM's memory its kernel shows, at least: the firmware and the
@@ -2319,3 +2400,48 @@ func ChannelName(name string) bool { return len(name) <= 128 && imageKeyRe.Match
 // RegistryPrefix reports whether p is written as registry.prefix must be: host[:port][/path], lower
 // case, no scheme, no trailing slash.
 func RegistryPrefix(p string) bool { return !strings.Contains(p, "://") && prefixRe.MatchString(p) }
+
+// longRunning checks what a long-running service tells the install, with a docker or kairos
+// shape (the chart's pods have their own restart and probes): one with no restart policy is warned
+// (a crash or an OOM kill leaves it down until the next start), and the services with no
+// healthcheck are warned together (the install is done once they run, not once they are ready). A
+// one-shot is none: a service another waits for with service_completed_successfully, or one that
+// says so with restart: "no" (which the restart warning offers for a one-shot alone).
+func (l *linter) longRunning(c *Compose, file string) {
+	if l.s.Shapes.Docker == nil && l.s.Shapes.Kairos == nil {
+		return
+	}
+	oneShot := map[string]bool{}
+	for _, svc := range c.Services {
+		deps, _ := svc.DependsOn.(map[string]any)
+		for d, v := range deps {
+			if on, _ := v.(map[string]any); on["condition"] == "service_completed_successfully" {
+				oneShot[d] = true
+			}
+		}
+	}
+	var unhealthy []string
+	for _, name := range sortedKeys(c.Services) {
+		svc := c.Services[name]
+		// deploy.restart_policy's condition none is restart: "no" written the other way.
+		policy, _ := svc.Deploy.RestartPolicy.(map[string]any)
+		if oneShot[name] || svc.Restart == "no" || policy != nil && policy["condition"] == "none" {
+			continue
+		}
+		if svc.Restart == nil && svc.Deploy.RestartPolicy == nil {
+			l.warnf(file+": services."+name, "no restart policy: a crash or an OOM kill leaves it down until the next start; give it restart: unless-stopped, or restart: \"no\" for a one-shot")
+		}
+		// None, or one disabled (disable: true, test: ["NONE"]); a block without a test tunes the
+		// image's own, which lint does not read.
+		if h := svc.Healthcheck; h == nil {
+			unhealthy = append(unhealthy, name)
+		} else if _, none := healthBroken(h.Test); none {
+			unhealthy = append(unhealthy, name)
+		} else if off, _ := composeBool(h.Disable); off {
+			unhealthy = append(unhealthy, name)
+		}
+	}
+	if len(unhealthy) > 0 {
+		l.warnf(file, "%s set no healthcheck: the install (and vm create) is done once they run, not once they are ready, so give one that passes once the service serves, or has done the work it does after it starts (an image's own HEALTHCHECK counts, which lint does not read)", strings.Join(unhealthy, ", "))
+	}
+}

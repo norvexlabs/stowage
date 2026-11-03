@@ -75,6 +75,16 @@ variable "network" {
   default     = "default"
 }
 
+variable "domain_type" {
+  description = "The domain's type: kvm (the default), or qemu for a host without KVM (emulated, much slower: its CPU mode is then maximum)."
+  type        = string
+  default     = "kvm"
+  validation {
+    condition     = contains(["kvm", "qemu"], var.domain_type)
+    error_message = "domain_type is kvm or qemu."
+  }
+}
+
 variable "dhcp" {
   description = "The VM takes its IPv4 address by DHCP: the apply waits for its lease, the address the module returns."
   type        = bool

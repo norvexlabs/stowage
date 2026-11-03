@@ -22,6 +22,10 @@ for n in $(docker ps -a --format '{{.Names}}' | grep -E '^stowage-(e2e|smoke)-zo
 	alive "${pid%-dav}" || docker rm -f "$n" >/dev/null 2>&1
 done
 
+# e2e-kairos's libvirt daemon of a dead run, stowage-e2e-libvirtd-<pid> (with its domains).
+for n in $(docker ps -a --format '{{.Names}}' | grep -E '^stowage-e2e-libvirtd-[0-9]+$'); do
+	alive "${n#stowage-e2e-libvirtd-}" || docker rm -f "$n" >/dev/null 2>&1
+done
 # kind clusters of dead runs, stowage-e2e-<pid>: their node containers (and anonymous volumes),
 # then their network.
 for c in $(docker ps -a --filter label=io.x-k8s.kind.cluster --format '{{.Label "io.x-k8s.kind.cluster"}}' | sort -u | grep -E '^stowage-e2e-[0-9]+$'); do

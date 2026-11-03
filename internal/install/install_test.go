@@ -354,7 +354,7 @@ type env struct {
 	dir    string
 	cos    string // where Kairos's marks are read (Options.Cos)
 	out    *bytes.Buffer
-	log    *bytes.Buffer
+	log    *syncBuffer
 	vars   map[string]string
 	busy   map[int]bool
 	// udpBusy are the UDP ports a socket of the host holds.
@@ -364,7 +364,7 @@ type env struct {
 func newEnv(t *testing.T) *env {
 	r, self := testInstaller(t, "1.0.0")
 	return &env{t: t, r: r, self: self, docker: &fakeDocker{loaded: map[string]string{}, compose: "2.29.1"},
-		dir: filepath.Join(t.TempDir(), "notes"), cos: t.TempDir(), out: &bytes.Buffer{}, log: &bytes.Buffer{},
+		dir: filepath.Join(t.TempDir(), "notes"), cos: t.TempDir(), out: &bytes.Buffer{}, log: &syncBuffer{},
 		vars: map[string]string{"ADMIN_EMAIL": "admin@example.org"}, busy: map[int]bool{}}
 }
 
@@ -1908,4 +1908,41 @@ func TestARefusalNamesTheHoldersItsProbeMet(t *testing.T) {
 			t.Errorf("on %v: %v", c.on, got)
 		}
 	}
+}
+
+// syncBuffer is a bytes.Buffer the daemon's goroutines (its watches) and its handlers may log to
+// at once.
+type syncBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (s *syncBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.Write(p)
+}
+
+func (s *syncBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.String()
+}
+
+func (s *syncBuffer) Reset() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.b.Reset()
+}
+
+func (s *syncBuffer) Len() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.Len()
+}
+
+func (s *syncBuffer) Bytes() []byte {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return bytes.Clone(s.b.Bytes())
 }

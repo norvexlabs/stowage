@@ -65,7 +65,9 @@ type Service struct {
 	ExtLinks    any `yaml:"external_links"`
 	// OwnVolumesFrom, OwnLinks and OwnExtLinks are its own lists, before extends joins its base's.
 	OwnVolumesFrom, OwnLinks, OwnExtLinks any `yaml:"-"`
-	Healthcheck                           *struct {
+	// Restart is its restart policy (no, always, on-failure[:N], unless-stopped), nil when unset.
+	Restart     any `yaml:"restart"`
+	Healthcheck *struct {
 		Disable any `yaml:"disable"`
 		Test    any `yaml:"test"`
 	} `yaml:"healthcheck"`
@@ -81,8 +83,10 @@ type Service struct {
 	// Environment is the service's own `environment:`, a map or a list of KEY=VALUE.
 	Environment any `yaml:"environment"`
 	Deploy      struct {
-		Replicas  any `yaml:"replicas"`
-		Resources struct {
+		Replicas any `yaml:"replicas"`
+		// RestartPolicy is Compose's other restart key, deploy.restart_policy.
+		RestartPolicy any `yaml:"restart_policy"`
+		Resources     struct {
 			Limits struct {
 				Memory any `yaml:"memory"`
 			} `yaml:"limits"`
@@ -220,6 +224,12 @@ func (c *Compose) inherit() map[string]error {
 		}
 		if svc.Ipc == "" {
 			svc.Ipc = b.Ipc
+		}
+		if svc.Restart == nil {
+			svc.Restart = b.Restart
+		}
+		if svc.Deploy.RestartPolicy == nil {
+			svc.Deploy.RestartPolicy = b.Deploy.RestartPolicy
 		}
 		if svc.MacAddress == "" {
 			svc.MacAddress = b.MacAddress

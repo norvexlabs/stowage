@@ -156,6 +156,52 @@ func TestMemoryShareBounds(t *testing.T) {
 			t.Errorf("25 %% of 8 GiB, max %s, %d containers, own %d: %d MiB, want %d MiB", c.max, c.n, c.own, got/mib, c.want/mib)
 		}
 	}
+	// The minimum, on both sides of the share it floors, split with the share, over the maximum.
+	for _, c := range []struct {
+		min, max  spec.Bytes
+		n         int
+		own, want int64
+	}{
+		{2049 * mib, 0, 1, 0, 2049 * mib},              // over the share: the minimum
+		{2048 * mib, 0, 1, 0, 2048 * mib},              // the share itself
+		{2047 * mib, 0, 1, 0, 2048 * mib},              // under it: the share
+		{4098 * mib, 0, 2, 0, 2049 * mib},              // split: half of each
+		{3 * 1024 * mib, 1024 * mib, 1, 0, 3072 * mib}, // over the maximum: the minimum wins
+		{256 * mib, 0, 1, 512 * mib, 2048 * mib},       // the compose file's own limit under the share
+	} {
+		if got := p.limit(spec.Share{Percent: 25, Min: c.min, Max: c.max}, c.n, c.own); got != c.want {
+			t.Errorf("25 %% of 8 GiB, min %s, max %s, %d containers, own %d: %d MiB, want %d MiB", c.min, c.max, c.n, c.own, got/mib, c.want/mib)
+		}
+	}
+	// A minimum split unevenly rounds up to the byte: the parts together are never under it, and a
+	// minimum equal to the maximum gives the maximum's part, within a byte.
+	tiny := hostPlan{Host: tune.Host{MemBytes: 1 << 30}}
+	for _, c := range []struct {
+		min  spec.Bytes
+		n    int
+		want int64
+	}{
+		{100000000, 1, 100000000},
+		{256 * mib, 3, 89478486},     // 268435456 / 3 = 89478485.33
+		{255 * mib, 3, 85 * mib},     // even
+		{192*mib + 1, 3, 64*mib + 1}, // a third of a byte over 64M
+		{192*mib + 3, 3, 64*mib + 1}, // even again
+	} {
+		if got := tiny.limit(spec.Share{Percent: 1, Min: c.min}, c.n, 0); got != c.want || got*int64(c.n) < int64(c.min) {
+			t.Errorf("min %d over %d: %d, want %d", c.min, c.n, got, c.want)
+		}
+	}
+	if got := tiny.limit(spec.Share{Percent: 90, Min: 1000 * mib, Max: 1000 * mib}, 3, 0); got != 349525334 {
+		t.Errorf("min = max = 1000M over 3: %d, want 349525334 (the max's part, rounded up to the byte)", got)
+	}
+	// The report's case: 5 % of a 2 GiB VM's shown RAM is 92 MiB; a minimum of 256M gives 256 MiB.
+	vm := hostPlan{Host: tune.Host{MemBytes: 1843 * mib}}
+	if got := vm.limit(spec.Share{Percent: 5}, 1, 0); got != 92*mib {
+		t.Errorf("5 %% of 1843 MiB: %d MiB", got/mib)
+	}
+	if got := vm.limit(spec.Share{Percent: 5, Min: 256 * mib}, 1, 0); got != 256*mib {
+		t.Errorf("5 %% of 1843 MiB, min 256M: %d MiB", got/mib)
+	}
 	over := hostPlan{Host: tune.Host{MemBytes: 6528 * mib}}
 	if got := over.limit(spec.Share{Percent: 1}, 1, 0); got != 65*mib {
 		t.Errorf("1 %% of 6528 MiB, above the floor: %d MiB", got/mib)

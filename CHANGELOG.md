@@ -3,6 +3,37 @@
 Stowage's own releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
+## [0.27.0]
+
+### Fixed
+- The built-in libvirt module no longer drifts after its apply: its seed volume is of format
+  `iso`, as libvirt reads it, where a plan after the apply wanted to change it back to `raw`.
+
+### Added
+- A memory share takes a floor: `memory: { percent: 5, min: 256M, max: 2G }` never gives the
+  service less than `min`, whatever the host's RAM; `min` wins over `max`, and the compose file's
+  own limit still wins when larger.
+- `lint` computes each memory share on the least VM (`shapes.kairos.size.min.memory`): a share
+  with no `min` whose limit comes out under 128 MiB there is warned, and so are the shares' floors
+  together when they exceed what that VM leaves the shares. A `min` under 64 MiB, or over the
+  share's `max`, is an error.
+- `status` and `ps` name each service down — exited with a code other than 0, restarting, dead
+  or never started — with its exit code and the signal it tells, whether its memory cgroup
+  killed it, and the memory limit its container ran with (`down: api exited 137 (SIGKILL),
+  OOM-killed (memory limit 96 MiB)`); their JSON carries `oom_killed`, `mem_limit_bytes` and
+  `restarts`.
+- The VM's host daemon looks at the services every minute once a boot is judged, and journals
+  `service.down` when one becomes down.
+- `lint` warns a long-running service with no restart policy (Stowage sets none), and the
+  long-running services with no healthcheck: the install is done once they run, not once they
+  are ready. README states the contract: the install is done when every service runs and every
+  healthcheck passes.
+- The built-in libvirt module takes `domain_type`: `kvm` (the default) or `qemu`, for a host
+  without KVM.
+- Stowage's own tests apply the built-in libvirt module through `vm create` against a real
+  libvirt daemon, check that a plan right after the apply changes nothing, and that `vm destroy`
+  leaves no domain, volume or NVRAM file.
+
 ## [0.26.3] - 2026-11-03
 
 ### Fixed

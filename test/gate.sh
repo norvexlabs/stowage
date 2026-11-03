@@ -194,7 +194,7 @@ for f in "${changed[@]}"; do
 	test/e2e-stateless.sh) need e2e-stateless "$f" ;;
 	test/e2e-k8s.sh) need e2e-k8s "$f" ;;
 	test/e2e-full-k8s.sh) need e2e-full-k8s "$f" ;;
-	test/e2e-kairos.sh) need e2e-kairos "$f" ;;
+	test/e2e-kairos.sh | test/libvirtd/*) need e2e-kairos "$f" ;;
 	test/e2e-vm.sh) need e2e-vm "$f" ;;
 	test/e2e-full-vm.sh | test/vm.sh | test/metal-truenas/*) need e2e-full-vm "$f" ;;
 	test/lib.sh | test/pins.sh | test/sweep.sh) # shared by every suite; the short ones exercise it

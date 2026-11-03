@@ -271,7 +271,7 @@ func TestServicesReadsEitherComposeFormat(t *testing.T) {
 		if code := call(t, daemon(e, &fakeHost{}).Handler(), "GET", "/v1/services", nil, &list); code != 200 {
 			t.Fatalf("%s: %d", name, code)
 		}
-		want := []Service{{"api", "running", "healthy", "a", 0}, {"web", "exited", "", "w", 3}}
+		want := []Service{{Service: "api", State: "running", Health: "healthy", Image: "a"}, {Service: "web", State: "exited", Image: "w", ExitCode: 3}}
 		if fmt.Sprint(list) != fmt.Sprint(want) {
 			t.Errorf("%s: %+v", name, list)
 		}
