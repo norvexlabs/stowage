@@ -3,7 +3,7 @@
 Stowage's own releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
-## [0.26.2]
+## [0.26.2] - 2026-11-03
 
 ### Fixed
 - `vm create --platform libvirt --create opentofu` starts its domain on a host whose libvirt
