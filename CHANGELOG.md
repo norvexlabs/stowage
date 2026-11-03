@@ -3,7 +3,7 @@
 Stowage's own releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
-## [0.27.0]
+## [0.27.0] - 2026-11-03
 
 ### Fixed
 - The built-in libvirt module no longer drifts after its apply: its seed volume is of format
