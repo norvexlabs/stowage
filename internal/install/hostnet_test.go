@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -169,13 +171,13 @@ func TestDockerRunsAHostNetworkServiceOnTheHostsNetwork(t *testing.T) {
 	if got := in.targetHosts(); !slices.Equal(got, []string{"echo:host-gateway"}) {
 		t.Errorf("target hosts %v", got)
 	}
-	fc, err := frontCompose(in.R.Spec.Front, in.R.Spec.L4.Routes, func(string) string { return "" }, "internal", hostAPI{}, "sha256:x", "", false, false, in.hostServices())
+	fc, err := frontCompose(in.R.Spec.Front, in.R.Spec.L4.Routes, func(string) string { return "" }, "internal", hostAPI{}, "sha256:x", "", false, false, in.hostServices(), nil)
 	if err != nil || strings.Contains(string(fc), "17007") {
 		t.Errorf("the front publishes the route of a service on the host's network: %v\n%s", err, fc)
 	}
 	// Without it, Docker publishes the route's port from the stack's network.
 	in.R.Spec.Services = nil
-	if fc, err := frontCompose(in.R.Spec.Front, in.R.Spec.L4.Routes, func(string) string { return "" }, "internal", hostAPI{}, "sha256:x", "", false, false, in.hostServices()); err != nil || !strings.Contains(string(fc), "published: \"17007\"") {
+	if fc, err := frontCompose(in.R.Spec.Front, in.R.Spec.L4.Routes, func(string) string { return "" }, "internal", hostAPI{}, "sha256:x", "", false, false, in.hostServices(), nil); err != nil || !strings.Contains(string(fc), "published: \"17007\"") {
 		t.Errorf("no route's port: %v\n%s", err, fc)
 	}
 }
@@ -239,7 +241,7 @@ func TestTheFrontAnswersToItsRoutesDomainsInside(t *testing.T) {
 	get := func(k string) string { return vals[k] }
 	aliases := func(mode string) []string {
 		t.Helper()
-		raw, err := frontCompose(f, nil, get, mode, hostAPI{}, "sha256:x", "", false, false, nil)
+		raw, err := frontCompose(f, nil, get, mode, hostAPI{}, "sha256:x", "", false, false, nil, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -535,5 +537,51 @@ func TestHeldPorts(t *testing.T) {
 	delete(want, peerPort{8443, "tcp"})
 	if got := in.heldPorts(env); !maps.Equal(got, want) {
 		t.Errorf("loopback: %v", got)
+	}
+}
+
+// The VM's host records reach every service of a network of its own or the host's, and the
+// services Stowage runs on demand; one in another's namespace takes none. A line that does not
+// read is left out, warned; no file, none.
+func TestTheVMsHostRecordsReachTheContainers(t *testing.T) {
+	t.Parallel()
+	file := filepath.Join(t.TempDir(), "hosts")
+	if err := os.WriteFile(file, []byte("192.0.2.10 peer.example.org\n2001:db8::10 admin.example.org\n192.0.2.11 bad name\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var log bytes.Buffer
+	in := &Installer{R: testRelease(t, "1.0.0"), O: Options{HostsFile: file, Log: &log}}
+	recs := in.vmHosts()
+	if want := []string{"peer.example.org:192.0.2.10", "admin.example.org:2001:db8::10"}; !slices.Equal(recs, want) || !strings.Contains(log.String(), `"192.0.2.11 bad name" is not a host record`) {
+		t.Fatalf("records %q, log %q", recs, log.String())
+	}
+	if in.vmHosts(); strings.Count(log.String(), "is not a host record") != 1 {
+		t.Errorf("warned again: %q", log.String())
+	}
+	hn := hostNet{targets: map[string]bool{"dns": true}, records: recs}
+	for mode, want := range map[string][]string{
+		"":             append(slices.Clone(recs), "dns:host-gateway"),
+		"host":         recs,
+		"service:dns":  nil,
+		"container:db": nil,
+		"none":         nil,
+	} {
+		extra := map[string]any{}
+		hn.give(extra, "web", mode)
+		if got, _ := extra["extra_hosts"].([]string); !slices.Equal(got, want) {
+			t.Errorf("mode %q: %v", mode, got)
+		}
+	}
+	extra := map[string]any{}
+	hn.give(extra, "dns", "")
+	if got, _ := extra["extra_hosts"].([]string); len(got) < 2 || !slices.Equal(got[:2], recs) {
+		t.Errorf("a target's %v", got)
+	}
+	if got := in.targetHosts(); !slices.Equal(got, recs) {
+		t.Errorf("on demand %v", got)
+	}
+	in = &Installer{R: in.R, O: Options{HostsFile: filepath.Join(t.TempDir(), "absent"), Log: &log}}
+	if got := in.vmHosts(); got != nil {
+		t.Errorf("no file: %v", got)
 	}
 }

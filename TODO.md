@@ -38,6 +38,12 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
 
 ## Should
 
+- **A real-iptables suite for the Docker host's L4 allowlist**: the rules are proven by unit tests
+  and by a one-off probe on Docker-in-Docker (a source off the list dropped, one on it let through),
+  but no suite runs a consented start on a real engine, as e2e-full stops at "not in force". A
+  privileged Docker-in-Docker step in e2e-full would prove the chain, the IPv4-only publication and
+  the boot's order.
+
 - **The libvirt module on a KVM host (blocked: a host with KVM)**: e2e-kairos proves the module
   against libvirtd in a container without KVM (defined, running, no drift, nothing left after
   `vm destroy`). The guest's boot, its SSH and its first install, and AppArmor's confinement
@@ -422,6 +428,16 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
   repositories.
 
 ## Could
+
+- **Docker L4 allowlist, leftovers of its review**: the allow chain's `.applied` mark is redundant
+  beside `.held`; `l4Exposure` and `status` recompute the rules and re-read the marks per route; a
+  retried `prepare` applies the chains twice; a boot with an unreadable record, or a refused IPv6
+  bind, closes the port on every IPv4 address, another install's route of that port included;
+  `status` not as root on a root-only `.env` reads the lists as not held; right after an upgrade
+  from 0.27 a forwarding chain reads as not applied until a start as root; `lint` reports only the
+  first of an allowlist input's errors.
+- **A cancelled disk build's race**: a `docker run` whose create reaches the daemon after the
+  cancel's `rm --force` leaves a container Created, never started.
 
 - The libvirt e2e creates its VM with one vCPU alone: no suite applies the module with several
   (`queues = var.cpus`) nor checks its no-drift plan then; a second, short apply with `--cpus 2`

@@ -3,10 +3,12 @@ package install
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"maps"
 	"net/netip"
+	"os"
 	"slices"
 	"strconv"
 	"strings"
@@ -45,6 +47,9 @@ type hostNet struct {
 	// network gives them is not on the host's.
 	domains    []string
 	frontHosts map[string]string
+	// records are the VM's host records (vmHosts), NAME:IP, which every service of a network of
+	// its own or the host's gets.
+	records []string
 }
 
 // bridged is the targets' ports the firewall accepts from the stack's bridges, sorted, each once.
@@ -79,10 +84,11 @@ type peerPort struct {
 // names it maps for a target (its peers, the other targets, the routes' domains), the ports at its address for a peer, and every target's name for a
 // service of a network of its own (another's namespace or none maps nothing).
 func (hn hostNet) give(extra map[string]any, name, mode string) {
-	if len(hn.targets) == 0 {
-		return
-	}
 	var hosts []string
+	// Another's namespace, or none, takes no host of its own.
+	if !strings.HasPrefix(mode, "service:") && !strings.HasPrefix(mode, "container:") && mode != "none" {
+		hosts = append(hosts, hn.records...)
+	}
 	if hn.targets[name] {
 		extra["network_mode"] = "host"
 		for _, p := range hn.reach[name] {
@@ -105,7 +111,7 @@ func (hn hostNet) give(extra map[string]any, name, mode string) {
 				hosts = append(hosts, d+":"+at)
 			}
 		}
-	} else if mode == "" || mode == "bridge" {
+	} else if len(hn.targets) > 0 && (mode == "" || mode == "bridge") {
 		for _, t := range sortedKeys(hn.targets) {
 			hosts = append(hosts, t+":host-gateway")
 		}
@@ -126,7 +132,7 @@ func (hn hostNet) give(extra map[string]any, name, mode string) {
 // provision hook, a command provider) reaches the services on the host's network by: each at the
 // host's gateway (one a profile turned off too: its name then reaches nothing).
 func (in *Installer) targetHosts() []string {
-	var hosts []string
+	hosts := in.vmHosts()
 	for _, name := range in.hostServices() {
 		hosts = append(hosts, name+":host-gateway")
 	}
@@ -152,6 +158,46 @@ func (in *Installer) hostServices() []string {
 	return slices.Compact(names)
 }
 
+// vmHosts are the VM's host records (Options.HostsFile) as extra hosts, NAME:IP: none without the
+// file. A line that does not read as parseHosts writes it is left out, warned: it reaches every
+// container's /etc/hosts.
+func (in *Installer) vmHosts() []string {
+	if in.O.HostsFile == "" {
+		return nil
+	}
+	// Read once a run: a start asks for them more than once, and warns of a bad line once.
+	if in.hostsRead {
+		return in.hosts
+	}
+	in.hostsRead = true
+	in.hosts = in.readVMHosts()
+	return in.hosts
+}
+
+// readVMHosts reads vmHosts' file.
+func (in *Installer) readVMHosts() []string {
+	raw, err := os.ReadFile(in.O.HostsFile)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			in.O.logf("warning: the VM's host records: %v: the containers get none", err)
+		}
+		return nil
+	}
+	var out []string
+	for _, l := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+		ip, name, _ := strings.Cut(l, " ")
+		if l == "" {
+			continue
+		}
+		if h, err := parseHosts([]string{name + "=" + ip}, true); err != nil || len(h) != 1 || h[0] != l {
+			in.O.logf("warning: %s: %q is not a host record (IP NAME): the containers do not get it", in.O.HostsFile, l)
+			continue
+		}
+		out = append(out, name+":"+ip)
+	}
+	return out
+}
+
 // hostNetwork is the hostNet for the stack m: the services on the host's network (hostServices)
 // that m runs (a profile that is off leaves one out), and each one's peers, the services
 // of m it depends on with a network namespace of their own, with the ports each exposes (its
@@ -160,7 +206,7 @@ func (in *Installer) hostServices() []string {
 // another's namespace, are logged (the target cannot reach it by name), but one sharing a volume
 // or a host path with the target and one without a network (none), which it reaches over a file.
 func (in *Installer) hostNetwork(ctx context.Context, m *composeModel, taken map[peerPort]bool) (hostNet, error) {
-	hn := hostNet{targets: map[string]bool{}, peers: map[string][]peerPort{}, addrs: map[string]string{}, reach: map[string][]string{}}
+	hn := hostNet{targets: map[string]bool{}, peers: map[string][]peerPort{}, addrs: map[string]string{}, reach: map[string][]string{}, records: in.vmHosts()}
 	for _, name := range in.hostServices() {
 		if _, ok := m.Services[name]; ok {
 			hn.targets[name] = true

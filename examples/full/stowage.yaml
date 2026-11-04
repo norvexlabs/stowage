@@ -118,7 +118,7 @@ front:
 l4:
   routes:
     - { name: echo,     protocol: tcp, port: 17007, upstream: echo:17007, address_input: ECHO_ADDRESS, bind_input: ECHO_BIND }
-    - { name: echo-udp, protocol: udp, port: 17007, upstream: echo:17007, allow_input: ECHO_SOURCES, interfaces: [edge] }   # the VM's firewall
+    - { name: echo-udp, protocol: udp, port: 17007, upstream: echo:17007, allow_input: ECHO_SOURCES, interfaces: [edge] }   # the VM's firewall; a Docker host's once consented
 
 health:
   provider: http-json
@@ -175,7 +175,7 @@ inputs:
   - { key: LOG_LEVEL,         prompt: "Log level (debug, info, warning)", advanced: true }
   - { key: ECHO_ADDRESS,      prompt: "Host name or address clients dial the echo service at", default: localhost, shapes: [docker, kairos] }
   - { key: ECHO_BIND,         prompt: "Host address the TCP echo is published on (every address when empty)", advanced: true, shapes: [docker, kairos] }
-  - { key: ECHO_SOURCES,      prompt: "Sources (addresses, CIDRs) the VM lets reach the UDP echo", default: "0.0.0.0/0 ::/0", shapes: [kairos] }
+  - { key: ECHO_SOURCES,      prompt: "Sources (addresses, CIDRs) the firewall lets reach the UDP echo", default: "0.0.0.0/0 ::/0", shapes: [docker, kairos] }
   - { key: RELAY_SOURCE,      prompt: "Event source the relay forwards (empty: no relay)", optional: true, profile: relay, shapes: [docker, kairos] }
   - { key: RELAY_ADDRESS,     prompt: "Address the relay has of its own on the edge network (empty: none)", optional: true, advanced: true, shapes: [docker, kairos] }
   # Kubernetes: the database is external or embedded by the chart's postgres.mode value

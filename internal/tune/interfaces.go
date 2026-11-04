@@ -12,7 +12,9 @@ import (
 // Interface is one of the project's host.interfaces: its role (the interface's name on a host
 // Stowage owns), its kind (nic or tun), its MTU and policy routing in networkd's terms, and why.
 type Interface struct {
-	Role, Kind         string
+	Role, Kind string
+	// Device is a tun role's device where its service names it otherwise than the role.
+	Device             string
 	MTU                int
 	RoutingPolicyRules []map[string]string
 	Routes             []map[string]string
@@ -33,16 +35,27 @@ type Interface struct {
 	Devices map[string]string
 }
 
-// dev is role's device in a rule: its own name where roles are names, else the device known, or
-// a placeholder naming the NIC to put there.
+// dev is role's device in a rule: its own name where roles are names (its own device for the
+// interface's role), else the device known, or a placeholder naming the NIC to put there.
 func (i Interface) dev(role string) string {
 	if i.Devices == nil {
+		if role == i.Role && i.Device != "" {
+			return i.Device
+		}
 		return role
 	}
 	if d := i.Devices[role]; d != "" {
 		return d
 	}
 	return "<the NIC playing " + role + ">"
+}
+
+// AsDevice is " as <device>" for a tun role whose device is not named after it, else "".
+func (i Interface) AsDevice() string {
+	if d := i.dev(i.Role); d != i.Role {
+		return " as " + d
+	}
+	return ""
 }
 
 // Firewall are the rules a host's firewall gives the interface's traffic for the project, where
@@ -108,7 +121,7 @@ func (s System) inspectInterfaces(ctx context.Context) []Item {
 				want += "; " + strings.Join(i.NIC.commands("<its NIC>"), "; ")
 			}
 			if i.Kind == "tun" {
-				want = "its service opens it (the host's network, /dev/net/tun)"
+				want = "its service opens it" + i.AsDevice() + " (the host's network, /dev/net/tun)"
 				if set != "" {
 					want += "; networkd's .network file matching it by name with " + set
 				}
@@ -124,7 +137,7 @@ func (s System) inspectInterfaces(ctx context.Context) []Item {
 			}
 			continue
 		}
-		mtu, ok := s.read("sys/class/net/" + i.Role + "/mtu")
+		mtu, ok := s.read("sys/class/net/" + i.dev(i.Role) + "/mtu")
 		switch {
 		case !ok && i.Kind == "tun":
 			items = append(items, Item{NA, "interface", i.Role, "absent: its service opens it", "present" + why})

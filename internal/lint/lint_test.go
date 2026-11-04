@@ -417,11 +417,12 @@ func TestEachRuleFiresOnFull(t *testing.T) {
 		{"l4 bind asked", []edit{{sp, `(every address when empty)", advanced: true,`, `(every address when empty)",`}}, nil, "l4.routes[0].bind_input: ECHO_BIND must be advanced"},
 		{"l4 bind secret", []edit{{sp, `(every address when empty)", advanced: true,`, `(every address when empty)", advanced: true, secret: true,`}}, nil, "ECHO_BIND is secret: the ports the stack publishes show it"},
 		{"l4 allow not an input", []edit{{sp, "allow_input: ECHO_SOURCES", "allow_input: NOPE"}}, nil, "l4.routes[1].allow_input: NOPE is not an input"},
-		{"l4 allow asked on docker", []edit{{sp, `default: "0.0.0.0/0 ::/0", shapes: [kairos] }`, `default: "0.0.0.0/0 ::/0", shapes: [docker, kairos] }`}}, nil, "ECHO_SOURCES must be asked on the kairos shape alone"},
-		{"l4 allow on every shape", []edit{{sp, `default: "0.0.0.0/0 ::/0", shapes: [kairos] }`, `default: "0.0.0.0/0 ::/0" }`}}, nil, "ECHO_SOURCES must be asked on the kairos shape alone"},
-		{"l4 allow secret", []edit{{sp, `default: "0.0.0.0/0 ::/0", shapes: [kairos] }`, `default: "0.0.0.0/0 ::/0", shapes: [kairos], secret: true }`}}, nil, "ECHO_SOURCES is secret: the firewall's rules show it"},
-		{"l4 allow advanced", []edit{{sp, `default: "0.0.0.0/0 ::/0", shapes: [kairos] }`, `default: "0.0.0.0/0 ::/0", shapes: [kairos], advanced: true }`}}, nil, "ECHO_SOURCES is advanced, never asked"},
-		{"l4 allow by mode", []edit{{sp, `default: "0.0.0.0/0 ::/0", shapes: [kairos] }`, `default: "0.0.0.0/0 ::/0", shapes: [kairos], when: tls }`}}, nil, "ECHO_SOURCES is asked only when tls: the firewall reads it in every mode"},
+		{"l4 allow not asked on docker", []edit{{sp, `default: "0.0.0.0/0 ::/0", shapes: [docker, kairos] }`, `default: "0.0.0.0/0 ::/0", shapes: [kairos] }`}}, nil, "ECHO_SOURCES must be asked on the docker and kairos shapes alone (shapes: [docker, kairos])"},
+		{"l4 allow not asked on kairos", []edit{{sp, `default: "0.0.0.0/0 ::/0", shapes: [docker, kairos] }`, `default: "0.0.0.0/0 ::/0", shapes: [docker] }`}}, nil, "ECHO_SOURCES must be asked on the docker and kairos shapes alone"},
+		{"l4 allow on every shape", []edit{{sp, `default: "0.0.0.0/0 ::/0", shapes: [docker, kairos] }`, `default: "0.0.0.0/0 ::/0" }`}}, nil, "ECHO_SOURCES must be asked on the docker and kairos shapes alone"},
+		{"l4 allow secret", []edit{{sp, `default: "0.0.0.0/0 ::/0", shapes: [docker, kairos] }`, `default: "0.0.0.0/0 ::/0", shapes: [docker, kairos], secret: true }`}}, nil, "ECHO_SOURCES is secret: the firewall's rules show it"},
+		{"l4 allow advanced", []edit{{sp, `default: "0.0.0.0/0 ::/0", shapes: [docker, kairos] }`, `default: "0.0.0.0/0 ::/0", shapes: [docker, kairos], advanced: true }`}}, nil, "ECHO_SOURCES is advanced, never asked"},
+		{"l4 allow by mode", []edit{{sp, `default: "0.0.0.0/0 ::/0", shapes: [docker, kairos] }`, `default: "0.0.0.0/0 ::/0", shapes: [docker, kairos], when: tls }`}}, nil, "ECHO_SOURCES is asked only when tls: the firewall reads it in every mode"},
 		{"host network on the VM", []edit{{cp, "    command: [atlas-server, echo, \"17007\"]\n", "    command: [atlas-server, echo, \"17007\"]\n    network_mode: host\n"}}, nil, "services.echo.network_mode: host: the VM's firewall opens only what Stowage publishes"},
 		{"host network inherited", []edit{{cp, "    command: [atlas-server, echo, \"17007\"]\n", "    command: [atlas-server, echo, \"17007\"]\n    network_mode: host\n"}, {cp, "  relay:\n", "  relay:\n    extends: echo\n"}}, nil, "services.relay.network_mode: host"},
 		{"backup volume not declared", []edit{{sp, "volumes: [spool] ", "volumes: [spools] "}}, nil, `backup.volumes[0]: "spools" is not a volume deploy/compose.yaml declares`},
@@ -479,6 +480,14 @@ func TestEachRuleFiresOnFull(t *testing.T) {
 		{"no primary interface", []edit{{sp, "    uplink: { primary: true, ", "    uplink: { "}}, nil, "host.interfaces: 0 NICs are primary"},
 		{"a primary tun", []edit{{sp, "vpn0: { kind: tun,", "vpn0: { kind: tun, primary: true,"}}, nil, "host.interfaces.vpn0.primary: a tun device a service opens is not the default route's"},
 		{"an optional primary", []edit{{sp, "    uplink: { primary: true, ", "    uplink: { primary: true, optional: true, "}}, nil, "host.interfaces.uplink.optional: the primary NIC, the default route's, is every machine's"},
+		{"a tun device's name", []edit{{sp, "vpn0: { kind: tun,", "vpn0: { kind: tun, device: \"a/b\","}}, nil, `host.interfaces.vpn0.device: "a/b": a device's name of 1 to 15`},
+		{"a tun device of dots", []edit{{sp, "vpn0: { kind: tun,", "vpn0: { kind: tun, device: \"..\","}}, nil, `host.interfaces.vpn0.device: "..": a device's name`},
+		{"a tun device of the host's", []edit{{sp, "vpn0: { kind: tun,", "vpn0: { kind: tun, device: eth0,"}}, nil, `host.interfaces.vpn0.device: "eth0" is a name the kernel, udev or Docker gives (eth…)`},
+		{"a tun device of an option", []edit{{sp, "vpn0: { kind: tun,", "vpn0: { kind: tun, device: \"-vpn\","}}, nil, `host.interfaces.vpn0.device: "-vpn": a device's name`},
+		{"a tun device too long", []edit{{sp, "vpn0: { kind: tun,", "vpn0: { kind: tun, device: ovl-0-0-0-0-0-0-0,"}}, nil, `host.interfaces.vpn0.device: "ovl-0-0-0-0-0-0-0": a device's name`},
+		{"a tun device of another role's name", []edit{{sp, "vpn0: { kind: tun,", "vpn0: { kind: tun, device: uplink,"}}, nil, `host.interfaces.vpn0.device: "uplink" is the role uplink's name`},
+		{"two tun roles of one device", []edit{{sp, "    vpn0: { kind: tun,", "    vpn1: { kind: tun, device: ovl, reason: r }\n    vpn0: { kind: tun, device: ovl,"}}, nil, `host.interfaces.vpn1.device: "ovl" is host.interfaces.vpn0.device too`},
+		{"a NIC's device", []edit{{sp, "    uplink: { primary: true, ", "    uplink: { primary: true, device: ovl-0, "}}, nil, "host.interfaces.uplink.device: a tun role's"},
 		{"an optional tun", []edit{{sp, "vpn0: { kind: tun,", "vpn0: { kind: tun, optional: true,"}}, nil, "host.interfaces.vpn0.optional: a NIC's: a tun device is its service's"},
 		{"interface MTU", []edit{{sp, "      mtu: 1500\n", "      mtu: 1279\n"}}, nil, "host.interfaces.edge.mtu: 1279: 1280 to 9216"},
 		{"routing setting", []edit{{sp, `FirewallMark: "0x1"`, `ExecStart: "0x1"`}}, nil, `host.interfaces.edge.routing_policy_rules[0]: "ExecStart" is not one of networkd's settings here`},
@@ -1488,8 +1497,6 @@ func TestPublishedPortOnDockerWarns(t *testing.T) {
 	}
 }
 
-// An L4 route's allowlist, and the front's or a route's interface, without a kairos shape are
-// warned: nothing enforces them.
 // A service on the host's network with neither a docker nor a kairos shape is warned: only those
 // run it there, the chart's pod sets hostNetwork itself.
 func TestHostNetworkWithoutDockerNorKairosWarns(t *testing.T) {
@@ -1513,12 +1520,36 @@ func TestHostNetworkWithoutDockerNorKairosWarns(t *testing.T) {
 		y = y[:start] + y[end:]
 	}
 	testutil.Write(t, root, specFile, y)
+	res := run(t, root)
+	if !slices.ContainsFunc(res.Findings, func(f Finding) bool { return f.Severity == Warning && strings.Contains(f.String(), msg) }) {
+		t.Fatalf("not warned: %+v", res.Findings)
+	}
+	// Nor is an L4 route's allowlist enforced: only the VM's firewall and a Docker host's are.
+	if !slices.ContainsFunc(res.Findings, func(f Finding) bool {
+		return f.Severity == Warning && strings.Contains(f.String(), "l4.routes[1].allow_input: only the VM's firewall and a Docker host's (tune --apply) enforce it")
+	}) {
+		t.Fatalf("the allowlist not warned: %+v", res.Findings)
+	}
+}
+
+// An L4 route's allowlist to a service on the host's network is warned on the docker shape:
+// Docker translates no port to it, and the host's input chain is its operator's.
+func TestL4AllowlistToTheHostsNetworkWarnsOnDocker(t *testing.T) {
+	t.Parallel()
+	const msg = "l4.routes[1].allow_input: on the docker shape vpn runs on the host's network, whose input chain is the Docker host's operator's"
+	root := testutil.CopyExample(t, "full")
+	if res := run(t, root); slices.ContainsFunc(res.Findings, func(f Finding) bool { return strings.Contains(f.String(), msg) }) {
+		t.Fatalf("warned of a bridged upstream: %+v", res.Findings)
+	}
+	testutil.Edit(t, root, specFile, "upstream: echo:17007, allow_input: ECHO_SOURCES", "upstream: vpn:17007, allow_input: ECHO_SOURCES")
 	if res := run(t, root); !slices.ContainsFunc(res.Findings, func(f Finding) bool { return f.Severity == Warning && strings.Contains(f.String(), msg) }) {
 		t.Fatalf("not warned: %+v", res.Findings)
 	}
 }
 
-func TestL4AllowlistWithoutKairosWarns(t *testing.T) {
+// The front's or a route's interface, a service's interception, a role's forwarding and a
+// table's feeds without a kairos shape are warned: only the VM applies them.
+func TestVMFirewallOnlyKeysWithoutKairosWarn(t *testing.T) {
 	t.Parallel()
 	root := testutil.CopyExample(t, "full")
 	testutil.Edit(t, root, specFile, "  kairos:\n    base: ubuntu:26.04@sha256:c098726dd9b9733f3e885f8de0ef375206a311b0a317eadc40d347b1115fb944\n    kairos_init: quay.io/kairos/kairos-init:v4.4.0@sha256:eb131bd9b4ed5b9b25cf761af9afa7d462bef27c2d0e9453ce884cf7733a6556\n    disk_formats: [raw, qcow2, ova, vhd, gce, iso]\n    cloud_publish: [aws, azure, gcp]\n    disks: opt-in   # always: every ship publishes the disks; opt-in (the default): a ship asked to (--disks)\n    health_gate: { deadline_s: 600, deadline_after_reset_s: 1800, poll_s: 30 }\n    host_api: [api]\n    "+vmSizeLine+"   # vm create's least and default size\n", "")
@@ -1537,7 +1568,6 @@ func TestL4AllowlistWithoutKairosWarns(t *testing.T) {
 		got = append(got, f.String())
 	}
 	for _, want := range []string{
-		"l4.routes[1].allow_input: only the VM's firewall enforces it, and the project has no kairos shape: the route is open to every source",
 		"front.interface: only the VM's firewall opens a port on one interface alone",
 		"l4.routes[1].interfaces: only the VM's firewall opens a port on some interfaces alone",
 		"services.vpn.transparent: only the VM's firewall is Stowage's (a kairos shape)",
@@ -1548,7 +1578,7 @@ func TestL4AllowlistWithoutKairosWarns(t *testing.T) {
 			t.Errorf("no %q in %q", want, got)
 		}
 	}
-	if len(got) != 6 {
+	if len(got) != 5 {
 		t.Errorf("findings: %q", got)
 	}
 }

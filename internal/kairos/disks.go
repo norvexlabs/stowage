@@ -2,9 +2,11 @@ package kairos
 
 import (
 	"archive/tar"
+	"bytes"
 	"cmp"
 	"compress/gzip"
 	"context"
+	"crypto/rand"
 	_ "embed"
 	"encoding/base64"
 	"encoding/binary"
@@ -19,6 +21,7 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/google/go-containerregistry/pkg/authn"
 
@@ -257,6 +260,13 @@ func allZero(b []byte) bool {
 	return true
 }
 
+// containerPrefix starts the name of each container a DiskBuilder runs, which a cancelled build
+// removes (docker rm --force) before its work directory.
+const containerPrefix = "stowage-disks"
+
+// removeTimeout bounds the removal of a cancelled build's container.
+const removeTimeout = 30 * time.Second
+
 // DiskBuilder makes disk images with Docker: auroraboot (privileged, on the host's network so a
 // loopback registry is reachable) for the raw, VHD and GCE disks, and qemu-img in a container for
 // qcow2 and the OVA's disk. Its WorkDir must be on disk: a disk is gigabytes, and auroraboot needs
@@ -273,10 +283,30 @@ func (b *DiskBuilder) docker(ctx context.Context, args ...string) error {
 	if d == "" {
 		d = "docker"
 	}
+	// A container is named, so that a cancelled run removes it: killing the docker CLI leaves the
+	// container it started running, holding the work directory and, for auroraboot, loop devices.
+	name, what := "", strings.Join(args[:min(2, len(args))], " ")
+	if len(args) > 0 && args[0] == "run" {
+		var r [8]byte
+		if _, err := rand.Read(r[:]); err != nil {
+			return err
+		}
+		name = fmt.Sprintf("%s-%x", containerPrefix, r)
+		args = append([]string{"run", "--name", name}, args[1:]...)
+	}
 	cmd := exec.CommandContext(ctx, d, args...)
 	cmd.Stdout, cmd.Stderr = b.Stdout, b.Stderr
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("docker %s: %w", strings.Join(args[:min(2, len(args))], " "), err)
+	err := cmd.Run()
+	if name != "" && ctx.Err() != nil {
+		rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), removeTimeout)
+		defer cancel()
+		rm := exec.CommandContext(rctx, d, "rm", "--force", name)
+		if out, rerr := rm.CombinedOutput(); rerr != nil && !strings.Contains(string(out), "No such container") {
+			err = errors.Join(err, fmt.Errorf("the cancelled container %s may still run: docker rm --force %s: %w: %s", name, name, rerr, bytes.TrimSpace(out)))
+		}
+	}
+	if err != nil {
+		return fmt.Errorf("docker %s: %w", what, err)
 	}
 	return nil
 }

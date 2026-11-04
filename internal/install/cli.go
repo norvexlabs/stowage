@@ -192,9 +192,10 @@ func newCommand(r *Release, self string, stdout, stderr io.Writer, tools K8sOpti
 		dirFlag(c)
 		root.AddCommand(c)
 	}
+	var execStdin bool
 	exec := &cobra.Command{
-		Use:   "exec SERVICE -- COMMAND [ARG...]",
-		Short: "Run a command in a running service's container (with a terminal when standard input is one); its exit status is the run's",
+		Use:   "exec [--stdin] SERVICE -- COMMAND [ARG...]",
+		Short: "Run a command in a running service's container (with a terminal when standard input is one); without one it reads this command's standard input only with --stdin; its exit status is the run's",
 		Args:  cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if err := prepare(); err != nil {
@@ -205,9 +206,14 @@ func newCommand(r *Release, self string, stdout, stderr io.Writer, tools K8sOpti
 			}
 			stdin := cmd.InOrStdin()
 			f, ok := stdin.(*os.File)
-			return in.Exec(cmd.Context(), args[0], args[1:], stdin, ok && term.IsTerminal(int(f.Fd())))
+			terminal := ok && term.IsTerminal(int(f.Fd()))
+			if ok && !terminal && !execStdin && pipedInput(f) {
+				in.O.logf("warning: this command's standard input is a pipe or a file, which exec passes only with --stdin (-i): the command reads none")
+			}
+			return in.Exec(cmd.Context(), args[0], args[1:], execInput(stdin, terminal, execStdin), terminal)
 		},
 	}
+	exec.Flags().BoolVarP(&execStdin, "stdin", "i", false, "without a terminal, pass this command's standard input to the command; without it the command reads none")
 	dirFlag(exec)
 	var after string
 	schemaCmd := &cobra.Command{
@@ -586,6 +592,26 @@ func readSecretsArg(path string, stdin io.Reader) ([]byte, error) {
 	return io.ReadAll(io.LimitReader(r, maxSecretsFile+1))
 }
 
+// execInput is what exec passes the command: this command's standard input on a terminal, which
+// the command's own terminal reads, or with --stdin (asked); else none, as the VM's exec, so a
+// script's own input is never read unless it says so.
+func execInput(stdin io.Reader, terminal, asked bool) io.Reader {
+	if terminal || asked {
+		return stdin
+	}
+	return nil
+}
+
+// pipedInput reports whether f is a pipe or a non-empty file: input a caller meant to pass (not
+// /dev/null, a character device, nor an empty file).
+func pipedInput(f *os.File) bool {
+	st, err := f.Stat()
+	if err != nil {
+		return false
+	}
+	return st.Mode()&os.ModeNamedPipe != 0 || st.Mode().IsRegular() && st.Size() > 0
+}
+
 // secretsCommand is `secrets`: `rotate KEY [--stage | --finish]`, one pass of a rotated secret's
 // rotation run by rotate (none without it), `set KEY`, the value read from standard input (asked
 // on terminal when it is one) recorded by set (none without it), and `export`, the secrets export
@@ -859,6 +885,7 @@ func vmCreateCommand(in *Installer, o *Options, prepare func() error, terminal f
 	f.StringVar(&c.Address6, "address6", "", "with --ipv6: a static IPv6 address with its prefix, e.g. 2001:db8::10/64, either network")
 	f.StringVar(&c.Gateway6, "gateway6", "", "with --address6: the IPv6 gateway, link-local or in its subnet (default: the router advertisements')")
 	f.StringSliceVar(&c.DNS, "dns", nil, "--network static: a DNS server (repeatable, or comma-separated)")
+	f.StringArrayVar(&c.Hosts, "add-host", nil, fmt.Sprintf("a host record, NAME=IP (repeatable, at most %d): the VM and its stack's containers resolve NAME to IP", maxHosts))
 	f.StringSliceVar(&c.SSHAllow, "ssh-allow", nil, "the sources SSH accepts, CIDR (repeatable, or comma-separated; default: every source)")
 	f.StringVar(&c.Timezone, "timezone", "", "the VM's time zone, an IANA name such as Europe/Paris (default UTC)")
 	f.StringArrayVar(&c.Interfaces, "interface", nil, "a NIC the release names (host.interfaces), ROLE=SPEC (repeatable): a secondary's dhcp, static,address=A/P or none (the default), then mac= (default: generated on a hypervisor; a server's own on metal) and attach= (the hypervisor's network or bridge; default the primary's)")

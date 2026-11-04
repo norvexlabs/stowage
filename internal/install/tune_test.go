@@ -566,7 +566,7 @@ func TestTuneWithAGatewayRecord(t *testing.T) {
 	dockerInfo(e.docker, `27.3.1|Ubuntu 24.04 LTS|[]`)
 	root := tuneRoot(t)
 	in := e.installer(func(o *Options) {
-		o.Tune, o.Yes, o.Host, o.Systemd, o.GatewayRun, o.Euid = fakeTune(root, 0), true, &gwHost{tables: map[string]bool{}}, t.TempDir(), t.TempDir(), func() int { return 0 }
+		o.Tune, o.Yes, o.Host, o.Systemd, o.GatewayRun, o.Euid = fakeTune(root, 0), true, &gwHost{tables: map[string]bool{}, jumps: map[string]int{}, chain: map[string]bool{}}, t.TempDir(), t.TempDir(), func() int { return 0 }
 	})
 	other := t.TempDir()
 	record := []byte(`{"digest":"00000000","dir":"` + other + `"}`)
@@ -617,7 +617,7 @@ func TestTuneWithAGatewayRecord(t *testing.T) {
 		t.Error("applied before a start applied it")
 	}
 	rules, _ := forwardRules(in.R.Spec.Host, in.forwardChain(), func(r string) string { return in.roleDevice(r, none) })
-	if err := os.WriteFile(in.forwardRecord(), rules, 0o644); err != nil {
+	if err := os.WriteFile(appliedMark(in.forwardRecord()), chainRecord(map[string][]byte{"iptables": rules, "ip6tables": rules}), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if !applied() {
@@ -658,7 +658,7 @@ func TestTuneWithAGatewayRecord(t *testing.T) {
 		t.Error("applied for a NIC the chain does not name")
 	}
 	in.O.Interfaces = map[string]string{"uplink": "enp1s0"}
-	if err := os.Remove(in.forwardRecord()); err != nil {
+	if err := os.Remove(appliedMark(in.forwardRecord())); err != nil {
 		t.Fatal(err)
 	}
 	if applied() {

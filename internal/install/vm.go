@@ -95,6 +95,11 @@ func SettingsFile(name string) string { return "/etc/" + name + "/install.yaml" 
 // gave it (a NetConfig), for the host daemon to answer. The override's state is NetworkFile.
 func InstallNetworkFile(name string) string { return "/etc/" + name + "/install-network.yaml" }
 
+// VMHostsFile is where a VM's cloud-config writes, at every boot, the host records `vm create
+// --add-host` gave, as /etc/hosts lines ("IP NAME"), for its installs to give the stack's containers
+// (vmHosts) and the host daemon to answer.
+func VMHostsFile(name string) string { return "/etc/" + name + "/hosts" }
+
 // Settings are a VM's first install as its cloud-config gives them: what `install` takes from its
 // flags, but no secret — a secret input is given over SSH, by `sudo <short>-stow install`.
 type Settings struct {

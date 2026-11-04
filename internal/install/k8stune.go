@@ -75,7 +75,7 @@ func (in *Installer) K8sTune() error {
 	for _, i := range sys.Interfaces {
 		what := "a NIC playing it"
 		if i.Kind == spec.InterfaceTUN {
-			what = "a tun device its service opens (the host's network)"
+			what = "a tun device its service opens" + i.AsDevice() + " (the host's network)"
 		}
 		if n := i.Networkd(); n != "" {
 			what += ", networkd's " + n

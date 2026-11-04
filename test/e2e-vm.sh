@@ -75,7 +75,7 @@ s = open(path).read()
 for old, new in [
     ("\nhealth:\n", "\nl4:\n  routes:\n    - { name: db, protocol: tcp, port: 5432, upstream: postgres:5432, allow_input: DB_SOURCES }\n\nhealth:\n"),
     ("  - { key: ADMIN_EMAIL, prompt: \"Administrator email\", required: true }\n",
-     "  - { key: ADMIN_EMAIL, prompt: \"Administrator email\", required: true }\n  - { key: DB_SOURCES, prompt: \"Sources the VM lets reach the database\", shapes: [kairos] }\n"),
+     "  - { key: ADMIN_EMAIL, prompt: \"Administrator email\", required: true }\n  - { key: DB_SOURCES, prompt: \"Sources the firewall lets reach the database\", shapes: [docker, kairos] }\n"),
 ]:
     assert s.count(old) == 1, old
     s = s.replace(old, new)

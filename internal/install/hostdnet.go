@@ -103,6 +103,8 @@ type Network struct {
 	// Roles are the release's secondary NICs, in role order.
 	Roles   []RoleNetwork `json:"roles,omitempty"`
 	Pending *NetPending   `json:"pending,omitempty"`
+	// Hosts are the VM's host records (`vm create --add-host`), NAME:IP.
+	Hosts []string `json:"hosts,omitempty"`
 }
 
 // RoleNetwork is a secondary NIC's network.
@@ -1212,7 +1214,7 @@ func (h *Hostd) network(w http.ResponseWriter, r *http.Request) {
 	if err != nil && h.installNetLogged.Swap(err.Error()) != any(err.Error()) {
 		h.O.logf("the install's network is not answered: %v", err)
 	}
-	n := Network{Live: live, Override: st.Config, Install: install, Source: "dhcp"}
+	n := Network{Live: live, Override: st.Config, Install: install, Source: "dhcp", Hosts: (&Installer{R: h.R, O: h.O}).vmHosts()}
 	switch {
 	case st.Config != nil:
 		n.Source = "override"

@@ -17,6 +17,7 @@ import (
 	"go.yaml.in/yaml/v3"
 
 	"github.com/norvexlabs/stowage/internal/kairos"
+	"github.com/norvexlabs/stowage/internal/lint"
 )
 
 // Machine is a VM's own settings, which its cloud-config gives: its name, its administrator and
@@ -35,6 +36,9 @@ type Machine struct {
 	publicSSH bool
 	// Timezone is an IANA zone name; empty keeps the OS's, UTC.
 	Timezone string
+	// Hosts are host records, "IP NAME" lines (parseHosts), which every boot writes into the VM's
+	// /etc/hosts and, as data (VMHostsFile), its installs give the stack's containers.
+	Hosts []string
 	// HostKey is a one-time SSH host key (an OpenSSH private key) the VM serves until its first
 	// install, which `vm create --secrets` pins to send the secrets; nil for none.
 	HostKey []byte
@@ -261,6 +265,18 @@ func UserData(name, ctl string, m Machine, st Settings, ca []byte) ([]byte, erro
 			Commands: []string{fmt.Sprintf("if [ -f /usr/share/zoneinfo/%[1]s ]; then ln -sf /usr/share/zoneinfo/%[1]s /etc/localtime && echo %[1]s > /etc/timezone; else echo 'no time zone %[1]s on this OS: it stays UTC' >&2; fi", m.Timezone)},
 		})
 	}
+	if len(m.Hosts) > 0 {
+		mark := " # " + name + ": vm create --add-host"
+		boot = append(boot, stage{
+			Name:  name + ": the host records",
+			Files: []cloudFile{{Path: VMHostsFile(name), Permissions: 0o644, Content: strings.Join(m.Hosts, "\n") + "\n"}},
+		}, stage{
+			// A step of its own, after the one that writes the file: the records replace those an
+			// earlier boot added, marked.
+			Name:     name + ": the host records in /etc/hosts",
+			Commands: []string{fmt.Sprintf("sed -i '/%s$/d' /etc/hosts && sed 's/$/%s/' %s >> /etc/hosts", mark, mark, VMHostsFile(name))},
+		})
+	}
 	netYAML, err := yaml.Marshal(m.Net)
 	if err != nil {
 		return nil, err
@@ -384,6 +400,42 @@ func checkTimezone(v string) error {
 		return fmt.Errorf("%q is not a time zone: %w", v, err)
 	}
 	return nil
+}
+
+// maxHosts bounds vm create's host records.
+const maxHosts = 64
+
+// parseHosts reads vm create's --add-host NAME=IP records into /etc/hosts lines ("IP NAME"), sorted:
+// NAME a lower-case host name whose last label is not all digits (no IP address), IP one without
+// a zone, IPv6 only with ipv6 (the VM has none else); the same record twice is refused.
+func parseHosts(flags []string, ipv6 bool) ([]string, error) {
+	if len(flags) > maxHosts {
+		return nil, fmt.Errorf("--add-host: %d records, at most %d", len(flags), maxHosts)
+	}
+	var out []string
+	for _, f := range flags {
+		name, ip, ok := strings.Cut(f, "=")
+		if !ok {
+			return nil, fmt.Errorf("--add-host %q: NAME=IP, as peer.example.org=192.0.2.10", f)
+		}
+		if _, err := netip.ParseAddr(name); err == nil || name == "" || lint.CheckL4Address(name) != nil {
+			return nil, fmt.Errorf("--add-host %q: %q is not a host name (lower-case labels of letters, digits and -, the last not all digits)", f, name)
+		}
+		a, err := netip.ParseAddr(ip)
+		switch {
+		case err != nil || a.Zone() != "":
+			return nil, fmt.Errorf("--add-host %q: %q is not an IP address (without a zone)", f, ip)
+		case a.Is6() && !a.Is4In6() && !ipv6:
+			return nil, fmt.Errorf("--add-host %q: an IPv6 address, and the VM has no IPv6 without --ipv6", f)
+		}
+		line := a.Unmap().String() + " " + name
+		if slices.Contains(out, line) {
+			return nil, fmt.Errorf("--add-host %q: given twice", f)
+		}
+		out = append(out, line)
+	}
+	slices.Sort(out)
+	return out, nil
 }
 
 // MetaData is the NoCloud meta-data of the VM: its instance, named after its host.

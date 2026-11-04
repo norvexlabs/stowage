@@ -367,7 +367,7 @@ func frontCommand(f spec.Front, ca string) []string {
 // recreates it. ca is the CA it publishes (frontCommand). clientCA mounts the install's client CA.
 // ipv6 turns IPv6 on for the default network. onHost are the services on the host's network
 // (hostServices), whose L4 routes' ports are their own.
-func frontCompose(f spec.Front, l4 []spec.L4Route, get func(string) string, mode string, host hostAPI, digest, ca string, clientCA, ipv6 bool, onHost []string) ([]byte, error) {
+func frontCompose(f spec.Front, l4 []spec.L4Route, get func(string) string, mode string, host hostAPI, digest, ca string, clientCA, ipv6 bool, onHost, v4Only []string) ([]byte, error) {
 	var ports []string
 	volumes := []string{"./" + Caddyfile + ":/etc/caddy/Caddyfile:ro", "stowage-front-data:/data"}
 	if mode == Loopback {
@@ -418,7 +418,9 @@ func frontCompose(f spec.Front, l4 []spec.L4Route, get func(string) string, mode
 		}
 	}
 	// Each L4 route's host port, on every address or its bind address, to its upstream as it is:
-	// compose appends these to the service's own ports. None for a service on the host's network
+	// compose appends these to the service's own ports. A route of v4Only is published on IPv4's
+	// every address alone: Docker's userland proxy would carry its IPv6 clients past DOCKER-USER,
+	// where its allowlist is (allowRules). None for a service on the host's network
 	// (hostNet), which listens on the port itself: on the VM, every route's.
 	for _, r := range l4 {
 		name, target, _ := strings.Cut(r.Upstream, ":")
@@ -434,6 +436,8 @@ func frontCompose(f spec.Front, l4 []spec.L4Route, get func(string) string, mode
 		port := map[string]any{"target": target, "published": strconv.Itoa(r.Port), "protocol": r.Protocol}
 		if a := bindAddr(r, get); a != "" {
 			port["host_ip"] = a
+		} else if slices.Contains(v4Only, r.Name) {
+			port["host_ip"] = "0.0.0.0"
 		}
 		svc["ports"] = append(ports, port)
 	}

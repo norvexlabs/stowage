@@ -139,6 +139,9 @@ type Options struct {
 	// is the program.
 	Firewall string
 	Host     Tool
+	// HostsFile is the VM's host records (VMHostsFile), which its starts give the stack's
+	// containers; empty gives none (a Docker host's are its operator's).
+	HostsFile string
 	// Systemd is where a Docker install's units are written; empty is /etc/systemd/system.
 	Systemd string
 	// Euid replaces the run's effective user, NetworkdDir the host's networkd directory and
@@ -176,6 +179,11 @@ func (o *Options) bootID() string { return readBootID(cmp.Or(o.BootIDFile, kerne
 type Installer struct {
 	R *Release
 	O Options
+	// hosts are the VM's host records once read (hostsRead): vmHosts.
+	hosts     []string
+	hostsRead bool
+	// allowApplied is the mark (heldMark) of the L4 allowlists this start applied: markAllowHeld.
+	allowApplied string
 	// removeDir: this run created the install directory before writing the install, so a failure
 	// before .env removes it again.
 	removeDir bool
@@ -1253,7 +1261,7 @@ func (in *Installer) renderStack(env *EnvFile, dir string) error {
 			}
 		}
 	}
-	fc, err := frontCompose(f, in.R.Spec.L4.Routes, get, mode, in.hostAPI(), "sha256:"+hex.EncodeToString(h.Sum(nil)), ca, clientCA != nil, get(IPv6Var) == "true", in.hostServices())
+	fc, err := frontCompose(f, in.R.Spec.L4.Routes, get, mode, in.hostAPI(), "sha256:"+hex.EncodeToString(h.Sum(nil)), ca, clientCA != nil, get(IPv6Var) == "true", in.hostServices(), in.allowV4Only())
 	if err != nil {
 		return err
 	}
@@ -1425,6 +1433,9 @@ func (in *Installer) up(ctx context.Context, env *EnvFile) (err error) {
 	in.certDone()
 	if err := in.recordNetworks(); err != nil {
 		in.O.logf("warning: recording the stack's networks: %v", err)
+	}
+	if err := in.markAllowHeld(); err != nil {
+		in.O.logf("warning: marking the L4 routes' source allowlists held: %v: status says they are not", err)
 	}
 	get := func(k string) string { v, _ := env.Get(k); return v }
 	for _, r := range in.R.Spec.L4.Routes {
@@ -1781,6 +1792,7 @@ func bindAddr(r spec.L4Route, get func(string) string) string {
 // whose firewall applies the route's allowlist.
 func (in *Installer) l4Exposure(r spec.L4Route, get func(string) string, off []string) string {
 	name, _, _ := strings.Cut(r.Upstream, ":")
+	where, open, hint := "on every address", ", open to whoever reaches this host", ""
 	switch a := bindAddr(r, get); {
 	case slices.Contains(off, name):
 		return "not served: " + name + "'s profiles are off"
@@ -1789,12 +1801,25 @@ func (in *Installer) l4Exposure(r spec.L4Route, get func(string) string, off []s
 	case slices.Contains(in.hostServices(), name):
 		return "on the addresses " + name + " binds on the host's network, behind this host's own firewall"
 	case a != "":
-		return "on " + a + " alone"
+		where, open = "on "+a+" alone", ""
 	case r.BindInput != "":
-		return "on every address, open to whoever reaches this host (" + r.BindInput + " gives it one address)"
-	default:
-		return "on every address, open to whoever reaches this host"
+		hint = " (" + r.BindInput + " gives it one address)"
 	}
+	switch {
+	case r.AllowInput != "" && in.gatewayConsented() && in.allowHolds(get):
+		if where == "on every address" {
+			where = "on IPv4's every address"
+		}
+		return where + ", from the IPv4 sources " + r.AllowInput + " holds (the install's chain in DOCKER-USER, applied by each start as root)" + hint
+	case r.AllowInput != "" && in.gatewayConsented():
+		if open != "" {
+			where = "open to whoever reaches this host"
+		}
+		return where + hint + ": " + r.AllowInput + "'s list is not held yet: a start as root applies it, on IPv4 alone (consented; `status` says what the last one did)"
+	case r.AllowInput != "":
+		return where + cmp.Or(open, ", open to whoever reaches it") + hint + ": " + r.AllowInput + "'s sources hold once `" + in.R.Ctl() + " tune --apply` consents"
+	}
+	return where + open + hint
 }
 
 // heldPorts are the ports the host holds on every address, which a peer of a service on the
@@ -2013,12 +2038,16 @@ func forwards(h *spec.Host) bool {
 	return false
 }
 
-// roleDevice is a host.interfaces role's device on this host: on the VM, and for a tun role, its
-// own name (the VM names its NICs by their roles, a service its tun device); on a Docker host a
-// NIC role's is the NIC --interface named, as given or recorded (get); "" when none is.
+// roleDevice is a host.interfaces role's device on this host: a tun role's, the one its service
+// opens (its device, else its own name); on the VM a NIC role's own name (the VM names its NICs by
+// their roles); on a Docker host a NIC role's is the NIC --interface named, as given or recorded
+// (get); "" when none is.
 func (in *Installer) roleDevice(role string, get func(string) string) string {
 	h := in.R.Spec.Host
-	if in.O.Firewall != "" || h == nil || h.Interfaces[role].Kind == spec.InterfaceTUN {
+	if h != nil && h.Interfaces[role].Kind == spec.InterfaceTUN {
+		return h.Interfaces[role].DeviceName(role)
+	}
+	if in.O.Firewall != "" || h == nil {
 		return role
 	}
 	// A recorded name is read back as a flag's is checked: it goes into the host's rules as root.
@@ -2029,71 +2058,140 @@ func (in *Installer) roleDevice(role string, get func(string) string) string {
 }
 
 // forwardRoles gives the install's forwarding chain (forwardChain) its rules (forwardRules), for
-// IPv4 and IPv6, in one transaction each that replaces the chain's rules alone, and makes sure
-// DOCKER-USER jumps to it. A record of them under /run (forwardRecord), which a boot empties as it
-// does iptables's rules, skips a start that changes nothing; with no role forwarding and no record,
-// iptables is left alone.
+// IPv4 and IPv6, through applyChain: replaced at each start, in one transaction each that
+// replaces the chain's rules alone, DOCKER-USER made to jump to it, recorded under /run
+// (forwardRecord, which a boot empties as it does iptables's rules) and marked applied once every
+// table took them; with no role forwarding, a recorded chain is removed, else iptables is left
+// alone.
 func (in *Installer) forwardRoles(ctx context.Context, get func(string) string) error {
-	chain, host := in.forwardChain(), in.O.host()
-	want, unmapped := forwardRules(in.R.Spec.Host, chain, func(r string) string { return in.roleDevice(r, get) })
+	chain := in.forwardChain()
+	rules, unmapped := in.forwardTables(get)
 	for _, r := range unmapped {
 		in.O.logf("warning: host.interfaces.%s: no NIC of this host plays it (`--interface %s=<NIC>` on a re-run names one): the forwarding through it is not applied", r, r)
 	}
-	record := in.forwardRecord()
-	cur, _ := os.ReadFile(record)
-	if bytes.Equal(cur, want) {
-		return nil
+	const what = "the forwarding between the host's interfaces"
+	if in.O.Firewall == "" && rules != nil {
+		// Its mark first: a mark from an earlier start says nothing of an engine that changed.
+		if err := os.Remove(appliedMark(in.forwardRecord())); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("%s: %w", what, err)
+		}
+		if err := in.dockerUserReached(ctx, what); err != nil {
+			return err
+		}
 	}
-	// The record goes first: a start that fails here finds a change, and applies again.
-	if err := os.Remove(record); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("the forwarding between the host's interfaces: %w", err)
-	}
-	rules := want
+	return in.applyChain(ctx, chain, in.forwardRecord(), rules, what, false)
+}
+
+// applyChain gives chain, which DOCKER-USER jumps to, its rules by table (iptables, ip6tables: a
+// table's iptables-restore input; a table left out is left alone), in one transaction each that
+// replaces the chain's rules alone, and makes sure DOCKER-USER jumps to it.
+// record, under /run (which a boot empties as it does iptables's rules), holds what it applied: a
+// start replaces them, so a chain flushed or edited meanwhile holds again (nothing checks its
+// content otherwise). With no rules, a recorded chain is removed (dropChain), else iptables is
+// left alone. what names the chain in an error.
+func (in *Installer) applyChain(ctx context.Context, chain, record string, rules map[string][]byte, what string, boot bool) error {
 	if rules == nil {
-		rules = fmt.Appendf(nil, "*filter\n:%s - [0:0]\nCOMMIT\n", chain)
+		if !fileExists(record) {
+			return nil // nothing applied: iptables is left alone
+		}
+		return in.dropChain(ctx, chain, record)
 	}
+	host := in.O.host()
 	tables := []string{"iptables", "ip6tables"}
 	if _, err := os.Stat(ipv6Proc); err != nil {
 		tables = tables[:1] // a kernel without IPv6: Docker keeps no ip6tables chain either
 	}
+	// The record goes first, as what the chain may hold: a start that fails here leaves it, so a
+	// later one with no rules still removes the chain; its applied mark (appliedMark) only once
+	// every table took the rules.
+	if err := os.Remove(appliedMark(record)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("%s: %w", what, err)
+	}
+	if err := os.MkdirAll(filepath.Dir(record), 0o755); err != nil {
+		return err
+	}
+	if err := writeAtomic(record, bytes.NewReader(chainRecord(rules)), 0o644, nil); err != nil {
+		return fmt.Errorf("%s: %w", what, err)
+	}
 	for _, t := range tables {
-		if _, err := host.Run(ctx, Cmd{Args: []string{t + "-restore", "-w", "--noflush"}, Stdin: bytes.NewReader(rules)}); err != nil {
-			return fmt.Errorf("the forwarding between the host's interfaces (%s): %w", t, err)
+		r := rules[t]
+		if r == nil {
+			continue // a table the rules leave alone
+		}
+		if _, err := host.Run(ctx, Cmd{Args: []string{t + "-restore", "-w", "--noflush"}, Stdin: bytes.NewReader(r)}); err != nil {
+			return fmt.Errorf("%s (%s): %w", what, t, err)
 		}
 		jump := []string{"DOCKER-USER", "-j", chain}
 		if _, err := host.Run(ctx, Cmd{Args: append([]string{t, "-w", "-C"}, jump...)}); err == nil {
 			continue
 		}
+		// A boot runs before Docker: DOCKER-USER is made here, which Docker keeps, and its rules, as
+		// it starts. After it, one missing is an engine that keeps none: an error.
+		if boot {
+			if _, err := host.Run(ctx, Cmd{Args: []string{t, "-w", "-n", "-L", "DOCKER-USER"}}); err != nil {
+				if _, err := host.Run(ctx, Cmd{Args: []string{t, "-w", "-N", "DOCKER-USER"}}); err != nil {
+					return fmt.Errorf("%s (%s's DOCKER-USER): %w", what, t, err)
+				}
+			}
+		}
 		if _, err := host.Run(ctx, Cmd{Args: append([]string{t, "-w", "-I"}, jump...)}); err != nil {
-			return fmt.Errorf("the forwarding between the host's interfaces (%s's DOCKER-USER): %w", t, err)
+			return fmt.Errorf("%s (%s's DOCKER-USER): %w", what, t, err)
 		}
 	}
+	return writeAtomic(appliedMark(record), bytes.NewReader(chainRecord(rules)), 0o644, nil)
+}
+
+// forwardTables are the forwarding chain's rules by table (forwardRules, the same for IPv4 and
+// IPv6), nil for none, and the roles no device plays.
+func (in *Installer) forwardTables(get func(string) string) (map[string][]byte, []string) {
+	want, unmapped := forwardRules(in.R.Spec.Host, in.forwardChain(), func(r string) string { return in.roleDevice(r, get) })
 	if want == nil {
-		return nil // the record went above: nothing is forwarded
+		return nil, unmapped
 	}
-	if err := os.MkdirAll(filepath.Dir(record), 0o755); err != nil {
-		return err
+	return map[string][]byte{"iptables": want, "ip6tables": want}, unmapped
+}
+
+// forwardApplied reports whether the forwarding the release and get give is the one a start
+// applied whole (its applied mark), the pairs through a role no device plays left out.
+func (in *Installer) forwardApplied(get func(string) string) bool {
+	rules, _ := in.forwardTables(get)
+	mark, err := os.ReadFile(appliedMark(in.forwardRecord()))
+	return err == nil && rules != nil && bytes.Equal(mark, chainRecord(rules))
+}
+
+// appliedMark is where applyChain marks record's rules applied, every table having taken them:
+// what status and tune read as in force.
+func appliedMark(record string) string { return record + ".applied" }
+
+// chainRecord is what applyChain records of rules: the iptables then the ip6tables ones, nil for
+// none.
+func chainRecord(rules map[string][]byte) []byte {
+	if len(rules) == 0 {
+		return nil
 	}
-	return writeAtomic(record, bytes.NewReader(want), 0o644, nil)
+	return append(slices.Clone(rules["iptables"]), rules["ip6tables"]...)
 }
 
 // iif is the firewall's match of a rule on the host.interfaces roles given, the interfaces' names
 // (iifname { … } for more than one); none (or only empty ones) for every interface. It fails
 // closed: a NIC role the VM's cloud-config names no NIC for (a VM made by a release that named
 // none) keeps its match, which no interface meets, warned — a port meant for some interfaces is
-// never opened on the others. A tun device is matched by its name before its service opens it.
+// never opened on the others. A tun device is matched by its name (its device's) before its
+// service opens it.
 func (in *Installer) iif(roles ...string) string {
 	var names []string
 	for _, role := range roles {
 		if role == "" {
 			continue
 		}
+		dev := role
 		if h := in.R.Spec.Host; h != nil {
+			dev = h.Interfaces[role].DeviceName(role)
 			if i, ok := h.Interfaces[role]; ok && i.Kind != spec.InterfaceTUN && !i.Optional && !roleNamed(in.R.Spec.Name, role) {
 				in.O.logf("warning: no NIC of this VM is named %s (its cloud-config, from before its release named it, names none): its ports reach nothing, a VM made by this release (vm create --interface) names it, and `vm attach` (TrueNAS) or the NIC attached on its platform and `network attach` adds one to this VM", role)
 			}
 		}
-		names = append(names, strconv.Quote(role))
+		names = append(names, strconv.Quote(dev))
 	}
 	switch len(names) {
 	case 0:
@@ -2327,6 +2425,15 @@ func (in *Installer) inputList(mode string) []input {
 		}
 		if slices.ContainsFunc(in.R.Spec.L4.Routes, func(r spec.L4Route) bool { return r.BindInput == i.Key }) {
 			check = lint.CheckL4Bind
+			// A consented Docker host holds an allowlisted route's list for IPv4 alone.
+			if in.O.Firewall == "" && in.gatewayConsented() && slices.ContainsFunc(in.allowed(), func(r spec.L4Route) bool { return r.BindInput == i.Key }) {
+				check = chainChecks(check, func(v string) error {
+					if v6Bound(v) {
+						return errors.New("an IPv6 address, and this Docker host holds the route's allowlist for IPv4 alone (tune --apply): an IPv4 address, or none")
+					}
+					return nil
+				})
+			}
 		}
 		if slices.ContainsFunc(in.R.Spec.L4.Routes, func(r spec.L4Route) bool { return r.AllowInput == i.Key }) {
 			check = checkSources

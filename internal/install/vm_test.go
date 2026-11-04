@@ -1123,19 +1123,18 @@ func TestEveryStartForwardsAndInterceptsOnTheRoles(t *testing.T) {
 	if b, _ := os.ReadFile(filepath.Join(in.O.Firewall, "notes-ports.nft")); !strings.HasSuffix(string(b), "\niifname \"vpn0\" meta l4proto { tcp, udp } socket transparent 1 accept\n") {
 		t.Errorf("ports %q", b)
 	}
-	// Nothing changed: no iptables, no reload.
-	host.ran, host.noJump = nil, false
-	if err := in.openPorts(ctx, env, hn); err != nil || host.ran != nil {
-		t.Errorf("ran %q %v", host.ran, err)
+	// Again: the chain replaced (a firewall reload or a flush meanwhile holds again), its jump kept.
+	host.ran, host.stdin, host.noJump = nil, nil, false
+	if err := in.openPorts(ctx, env, hn); err != nil || !slices.Equal(host.stdin, []string{rules, rules}) || slices.ContainsFunc(host.ran, func(r string) bool { return strings.Contains(r, " -I ") }) {
+		t.Errorf("again: ran %q %v", host.ran, err)
 	}
-	// No role forwards: the chain is emptied once, its jump kept.
+	// No role forwards: the chain is removed, its jump first; then iptables is left alone.
 	in.R.Spec.Host.Interfaces["vpn0"] = spec.HostInterface{Kind: spec.InterfaceTUN}
-	host.stdin = nil
+	host.ran, host.stdin, host.noJump = nil, nil, true
 	if err := in.openPorts(ctx, env, hn); err != nil {
 		t.Fatal(err)
 	}
-	empty := "*filter\n:STOWAGE-FORWARD - [0:0]\nCOMMIT\n"
-	if !slices.Equal(host.ran, []string{"iptables-restore -w --noflush", "iptables -w -C DOCKER-USER -j STOWAGE-FORWARD", "ip6tables-restore -w --noflush", "ip6tables -w -C DOCKER-USER -j STOWAGE-FORWARD"}) || !slices.Equal(host.stdin, []string{empty, empty}) {
+	if !slices.Contains(host.ran, "iptables -w -X STOWAGE-FORWARD") || len(host.stdin) != 0 || fileExists(in.forwardRecord()) {
 		t.Errorf("ran %q\nstdin %q", host.ran, host.stdin)
 	}
 	host.ran = nil
@@ -1148,6 +1147,41 @@ func TestEveryStartForwardsAndInterceptsOnTheRoles(t *testing.T) {
 	}
 	if b, _ := os.ReadFile(filepath.Join(in.O.Firewall, "notes-ports.nft")); strings.Contains(string(b), "socket transparent") {
 		t.Errorf("ports %q", b)
+	}
+}
+
+// A tun role naming its device (host.interfaces.<role>.device) is that device in every rule: its
+// port's and its interception's match, its forwarding, and on a Docker host tune's advice.
+func TestATunRolesDeviceIsItsRulesDevice(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	host := &iptHost{noJump: true}
+	r, _ := testInstallerWith(t, "1.0.0", func(s *spec.Spec) {
+		s.Host = &spec.Host{Interfaces: map[string]spec.HostInterface{
+			"uplink": {Primary: true},
+			"vpn0":   {Kind: spec.InterfaceTUN, Device: "ovl-0-0", Forward: []string{"uplink"}},
+		}}
+		s.L4.Routes = []spec.L4Route{{Name: "peer", Protocol: "udp", Port: 17008, Upstream: "api:17008", Interfaces: []string{"vpn0"}}}
+		s.Services = map[string]spec.Service{"proxy": {HostNetwork: true, Transparent: []string{"vpn0"}}, "api": {CPUs: 1}}
+	})
+	in := &Installer{R: r, O: Options{Dir: t.TempDir(), Firewall: filepath.Join(t.TempDir(), "nftables.d"), Host: host, Log: io.Discard}}
+	env := NewEnvFile()
+	env.Set("STOWAGE_TLS_MODE", Loopback)
+	if err := in.openPorts(ctx, env, hostNet{targets: map[string]bool{"proxy": true}}); err != nil {
+		t.Fatal(err)
+	}
+	b, _ := os.ReadFile(filepath.Join(in.O.Firewall, "notes-ports.nft"))
+	for _, want := range []string{"\niifname \"ovl-0-0\" udp dport 17008 accept\n", "\niifname \"ovl-0-0\" meta l4proto { tcp, udp } socket transparent 1 accept\n"} {
+		if !strings.Contains(string(b), want) || strings.Contains(string(b), `"vpn0"`) {
+			t.Errorf("no %q in:\n%s", want, b)
+		}
+	}
+	if len(host.stdin) == 0 || !strings.Contains(host.stdin[0], "-A STOWAGE-FORWARD -i ovl-0-0 -o uplink -j ACCEPT\n") {
+		t.Errorf("stdin %q", host.stdin)
+	}
+	docker := &Installer{R: r, O: Options{Dir: t.TempDir()}}
+	if d := docker.roleDevice("vpn0", none); d != "ovl-0-0" {
+		t.Errorf("a Docker host's device %q", d)
 	}
 }
 

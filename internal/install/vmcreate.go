@@ -105,6 +105,8 @@ type VMCreate struct {
 	Address6 string // with IPv6, either mode: a static IPv6 address with its prefix
 	Gateway6 string
 	DNS      []string
+	// Hosts are --add-host's NAME=IP: names the VM and its stack resolve to fixed addresses.
+	Hosts    []string
 	SSHAllow []string // CIDR: the sources SSH accepts; none is every source
 	Timezone string
 	// Interfaces are --interface's ROLE=SPEC: a host.interfaces NIC's addressing (dhcp, static with
@@ -1038,6 +1040,9 @@ func (in *Installer) machine(ctx context.Context, c *VMCreate, p Platform) (Mach
 		}
 		m.Timezone = c.Timezone
 	}
+	if m.Hosts, err = parseHosts(c.Hosts, c.IPv6); err != nil {
+		return Machine{}, err
+	}
 	if err := checkNet(a["--network"]); err != nil {
 		return Machine{}, err
 	}
@@ -1308,6 +1313,9 @@ func (in *Installer) confirmVM(ctx context.Context, p Platform, format string, m
 		ssh = fmt.Sprint(m.SSHAllow)
 	}
 	fmt.Fprintf(&b, "  SSH from %s; time zone %s\n", ssh, cmp.Or(m.Timezone, "UTC"))
+	if len(m.Hosts) > 0 {
+		fmt.Fprintf(&b, "  host records: %s\n", strings.Join(m.Hosts, ", "))
+	}
 	fmt.Fprintf(&b, "  served: %s; updates from the %s channel\n", cmp.Or(st.TLS, "no front, its L4 routes alone"), st.Channel)
 	if st.Registry != "" || st.RegistryCA != "" {
 		fmt.Fprintf(&b, "  registry: %s", cmp.Or(st.Registry, in.R.Spec.Registry.Prefix))

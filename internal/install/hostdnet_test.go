@@ -1167,3 +1167,17 @@ func TestABadInstallRecordIsLoggedOnce(t *testing.T) {
 		t.Errorf("logged %d times:\n%s", got, log.String())
 	}
 }
+
+// network shows the VM's host records, when it has any.
+func TestNetworkShowsTheHostRecords(t *testing.T) {
+	t.Parallel()
+	var b strings.Builder
+	printNetwork(&b, "notes-stow", Network{Hosts: []string{"peer.example.org:192.0.2.10"}})
+	if !strings.Contains(b.String(), "hosts      peer.example.org:192.0.2.10 (vm create --add-host)\n") {
+		t.Errorf("%s", b.String())
+	}
+	b.Reset()
+	if printNetwork(&b, "notes-stow", Network{}); strings.Contains(b.String(), "hosts") {
+		t.Errorf("%s", b.String())
+	}
+}

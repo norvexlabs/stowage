@@ -601,7 +601,9 @@ type HostInterface struct {
 	Primary bool `yaml:"primary"`
 	// Optional: a NIC some machines of the project have alone. Absent, it is no difference
 	// (tune) and logs nothing (the start); vm create makes it only when --interface names it.
-	Optional           bool                `yaml:"optional"`
+	Optional bool `yaml:"optional"`
+	// Device is a tun role's device as its service names it, where that is not the role's name.
+	Device             string              `yaml:"device"`
 	MTU                int                 `yaml:"mtu"`
 	RoutingPolicyRules []map[string]string `yaml:"routing_policy_rules"`
 	Routes             []map[string]string `yaml:"routes"`
@@ -611,6 +613,25 @@ type HostInterface struct {
 	// Ethtool is a NIC's settings in ethtool's own terms, over the tune profile's.
 	Ethtool *Ethtool `yaml:"ethtool"`
 	Reason  string   `yaml:"reason"`
+}
+
+// DeviceName is the device that plays role: a tun role's Device when it names one, else the role's
+// own name (the VM names its NICs by their roles).
+func (i HostInterface) DeviceName(role string) string {
+	if i.Kind == InterfaceTUN && i.Device != "" {
+		return i.Device
+	}
+	return role
+}
+
+// TunDevice is a tun device's name as a service gives it: the kernel's rule (1 to 15 bytes),
+// narrowed to letters, digits and _ . -, starting with a letter or digit, as it goes into
+// networkd's files, the firewall's rules and iptables's arguments (never an option there).
+var TunDevice = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,14}$`)
+
+// ValidTunDevice reports whether name is a tun device's name (TunDevice).
+func ValidTunDevice(name string) bool {
+	return TunDevice.MatchString(name)
 }
 
 // NICRoles counts host.interfaces' NIC roles (kind nic), an optional one included.

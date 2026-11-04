@@ -128,3 +128,44 @@ func TestK8sSubcommandsKeepTheirOwnDefaults(t *testing.T) {
 		t.Errorf("rollback %q", e.f.ran("helm rollback"))
 	}
 }
+
+// Docker's exec passes this command's input on a terminal or with --stdin alone, as the VM's.
+func TestExecReadsInputOnATerminalOrWithStdin(t *testing.T) {
+	t.Parallel()
+	in := strings.NewReader("x")
+	for _, c := range []struct {
+		terminal, asked, passed bool
+	}{{false, false, false}, {false, true, true}, {true, false, true}, {true, true, true}} {
+		if got := execInput(in, c.terminal, c.asked); (got != nil) != c.passed {
+			t.Errorf("terminal %v, --stdin %v: passed %v", c.terminal, c.asked, got != nil)
+		}
+	}
+}
+
+// A pipe or a non-empty file is input a caller meant to pass, which exec warns it drops; an empty
+// file or /dev/null is none.
+func TestPipedInputIsAPipeOrAFile(t *testing.T) {
+	t.Parallel()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	defer w.Close()
+	full, empty := filepath.Join(t.TempDir(), "full"), filepath.Join(t.TempDir(), "empty")
+	_ = os.WriteFile(full, []byte("x"), 0o644)
+	_ = os.WriteFile(empty, nil, 0o644)
+	open := func(p string) *os.File {
+		f, err := os.Open(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { f.Close() })
+		return f
+	}
+	for f, want := range map[*os.File]bool{r: true, open(full): true, open(empty): false, open(os.DevNull): false} {
+		if got := pipedInput(f); got != want {
+			t.Errorf("%s: %v", f.Name(), got)
+		}
+	}
+}

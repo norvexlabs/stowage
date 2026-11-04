@@ -1286,6 +1286,30 @@ every shape, the VM end-to-end test upgrading through it), then the health gate.
   leaves the judging to the stack's own table, which decides and masquerades what it forwards.
   Rejected: Docker's `ip-forward-no-drop`, which would forward between every interface of the
   VM.
+- **An L4 allowlist on a Docker host** — Docker publishes a port with a DNAT before any filter
+  chain the operator owns, so the host's input chain never sees the connection and the allowlist
+  goes in `DOCKER-USER`, the one place Docker leaves for it, applied only once the operator
+  consented, as the gateway's other declarations are. The match is the connection's original
+  destination port (`conntrack --ctstate DNAT --ctorigdstport`), not the packet's, which Docker
+  rewrote to the container's: a container's own outbound connection to that port is not
+  translated and never matches. A chain of its own beside the forwarding's is replaced whole at
+  every start, as nothing checks its content otherwise, and at boot before Docker, as Docker
+  restores the containers' ports before any start; a list that does not read drops every source
+  of its ports. The boot's unit is ordered before Docker but never required by it: a failure of
+  iptables itself there must not keep every other stack of the host down, so the routes wait for
+  the install's start then. IPv4
+  alone: Docker's userland proxy carries IPv6 clients past every chain whenever the container's
+  network has no IPv6 (and with the engine's ip6tables off), so the route is published on IPv4
+  alone rather than filtered on a path that may not exist; an engine sending nothing through
+  `DOCKER-USER` refuses the start. A service on the host's network is not translated, and its
+  allowlist stays the host input chain's, the operator's: lint warns.
+- **A tun role's device** — a role's name is a device's on the VM (its NICs are renamed to their
+  roles), so it takes no `-`; a daemon that names its own tun device cannot be renamed, so the
+  role names it (`device`) and keeps its own name in the spec's references and messages.
+- **Host records on the VM** — the VM's `/etc/hosts` serves the host and resolved; a container
+  resolves through Docker's DNS, which reads the upstream servers and never that file, so the
+  start gives the stack's containers the same records as `extra_hosts`, read from the file the
+  seed writes at every boot.
 - **Creating a VM** — one entry, `<short>-stow vm create`, in the order an administrator decides:
   the platform (it decides the disk format, the cloud-config's medium and whether OpenTofu can
   create the VM), then the machine (host name, administrator and SSH key, network), then the

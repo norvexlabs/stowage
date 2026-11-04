@@ -243,7 +243,7 @@ func TestUninstallOnDockerRevertsTheGateway(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(e.dir, GatewayFile), []byte(`{"digest":"00000000","dir":"`+e.dir+`"}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	units, host := t.TempDir(), &gwHost{tables: map[string]bool{}}
+	units, host := t.TempDir(), &gwHost{tables: map[string]bool{}, jumps: map[string]int{}, chain: map[string]bool{}}
 	opts := func(euid int) func(o *Options) {
 		return func(o *Options) {
 			o.Yes, o.Systemd, o.Host, o.GatewayRun, o.Euid = true, units, host, t.TempDir(), func() int { return euid }
@@ -280,7 +280,7 @@ func TestUninstallOnDockerReadsTheGatewaysRecordFirst(t *testing.T) {
 		t.Fatal(err)
 	}
 	var log bytes.Buffer
-	host := &gwHost{tables: map[string]bool{}}
+	host := &gwHost{tables: map[string]bool{}, jumps: map[string]int{}, chain: map[string]bool{}}
 	if err := e.installer(func(o *Options) {
 		o.Yes, o.Log, o.Host, o.Systemd, o.Euid = true, &log, host, t.TempDir(), func() int { return 1000 }
 	}).Uninstall(ctx, false); err != nil || !strings.Contains(log.String(), "(the directory moved or copied)") || host.did("iptables") {

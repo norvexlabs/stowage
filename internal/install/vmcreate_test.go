@@ -9,6 +9,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"maps"
 	"net/netip"
@@ -619,6 +620,14 @@ func TestVMCreateRefusals(t *testing.T) {
 		{"unknown tune profile", []string{"qcow2"}, nil, VMCreate{Platform: "truenas", TuneProfile: "shared"}, nil, `--tune-profile: profile "shared": default or network`},
 		{"ssh source without prefix", []string{"qcow2"}, nil, VMCreate{Platform: "truenas", SSHAllow: []string{"192.0.2.0/24", "192.0.2.7"}}, nil, `--ssh-allow: "192.0.2.7" is not a source with its prefix`},
 		{"time zone not a name", []string{"qcow2"}, nil, VMCreate{Platform: "truenas", Timezone: "../../etc/passwd"}, nil, "--timezone: \"../../etc/passwd\" is not a time zone name"},
+		{"host record without =", []string{"qcow2"}, nil, VMCreate{Platform: "truenas", Hosts: []string{"peer.example.org"}}, nil, `--add-host "peer.example.org": NAME=IP`},
+		{"host record of no name", []string{"qcow2"}, nil, VMCreate{Platform: "truenas", Hosts: []string{"=192.0.2.10"}}, nil, `--add-host "=192.0.2.10": "" is not a host name`},
+		{"host record of an address", []string{"qcow2"}, nil, VMCreate{Platform: "truenas", Hosts: []string{"192.0.2.9=192.0.2.10"}}, nil, `"192.0.2.9" is not a host name`},
+		{"host record of a name with a space", []string{"qcow2"}, nil, VMCreate{Platform: "truenas", Hosts: []string{"a b=192.0.2.10"}}, nil, `"a b" is not a host name`},
+		{"host record not an address", []string{"qcow2"}, nil, VMCreate{Platform: "truenas", Hosts: []string{"peer=192.0.2"}}, nil, `"192.0.2" is not an IP address`},
+		{"host record of a zone", []string{"qcow2"}, nil, VMCreate{Platform: "truenas", IPv6: true, Hosts: []string{"peer=fe80::1%eth0"}}, nil, `"fe80::1%eth0" is not an IP address (without a zone)`},
+		{"host record IPv6 without --ipv6", []string{"qcow2"}, nil, VMCreate{Platform: "truenas", Hosts: []string{"peer=2001:db8::10"}}, nil, "an IPv6 address, and the VM has no IPv6 without --ipv6"},
+		{"host record twice", []string{"qcow2"}, nil, VMCreate{Platform: "truenas", Hosts: []string{"peer=192.0.2.10", "peer=192.0.2.10"}}, nil, `--add-host "peer=192.0.2.10": given twice`},
 		{"unknown time zone", []string{"qcow2"}, nil, VMCreate{Platform: "truenas", Timezone: "Mars/Olympus"}, nil, "--timezone: \"Mars/Olympus\" is not a time zone:"},
 		{"Go's local zone", []string{"qcow2"}, nil, VMCreate{Platform: "truenas", Timezone: "Local"}, nil, "--timezone: \"Local\" is not a time zone name"},
 		{"the database's own file", []string{"qcow2"}, nil, VMCreate{Platform: "truenas", Timezone: "localtime"}, nil, "--timezone: \"localtime\" is not a time zone name"},
@@ -1234,5 +1243,41 @@ func TestTheSecretsInstallRetriesACanceledStartOnce(t *testing.T) {
 		if got, _ := os.ReadFile(log); string(got) != c.want || (err == nil) != c.ok {
 			t.Errorf("%d failed starts, failed unit %v: %v %s\nran:\n%s\nwant:\n%s", c.fails, c.failed, err, out, got, c.want)
 		}
+	}
+}
+
+// --add-host's records: written as data and into /etc/hosts at every boot, replacing an earlier
+// boot's, and named by the plan; at most maxHosts, an IPv6 one with --ipv6.
+func TestVMCreateWritesTheHostRecords(t *testing.T) {
+	t.Parallel()
+	v := newVMCreate(t, "qcow2")
+	c := VMCreate{Platform: "proxmox", SSHAllow: []string{"192.0.2.0/24"}, IPv6: true, Hosts: []string{"peer.example.org=192.0.2.10", "admin.example.org=2001:db8::10"}}
+	if err := v.create(c, nil); err != nil {
+		t.Fatalf("%v\n%s", err, v.log)
+	}
+	ud, _, _ := readSeed(t, filepath.Join(v.out, "notes-seed.iso"))
+	_, cc := cloudSettings(t, ud)
+	i := slices.IndexFunc(cc.Stages["boot"], func(s stage) bool { return s.Name == "notes: the host records" })
+	if i < 0 || len(cc.Stages["boot"]) < i+2 {
+		t.Fatalf("boot %+v", cc.Stages["boot"])
+	}
+	if f := cc.Stages["boot"][i].Files; len(f) != 1 || f[0].Path != VMHostsFile("notes") || f[0].Content != "192.0.2.10 peer.example.org\n2001:db8::10 admin.example.org\n" {
+		t.Errorf("records %+v", f)
+	}
+	if cmd := cc.Stages["boot"][i+1].Commands; !slices.Equal(cmd, []string{"sed -i '/ # notes: vm create --add-host$/d' /etc/hosts && sed 's/$/ # notes: vm create --add-host/' /etc/notes/hosts >> /etc/hosts"}) {
+		t.Errorf("/etc/hosts %q", cmd)
+	}
+	if !strings.Contains(v.log.String(), "host records: 192.0.2.10 peer.example.org, 2001:db8::10 admin.example.org") {
+		t.Errorf("summary:\n%s", v.log)
+	}
+	many := make([]string, maxHosts+1)
+	for i := range many {
+		many[i] = fmt.Sprintf("h%d=192.0.2.%d", i, i)
+	}
+	if _, err := parseHosts(many[:maxHosts], false); err != nil {
+		t.Errorf("%d records: %v", maxHosts, err)
+	}
+	if _, err := parseHosts(many, false); err == nil || !strings.Contains(err.Error(), "at most 64") {
+		t.Errorf("%d records: %v", maxHosts+1, err)
 	}
 }

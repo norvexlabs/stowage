@@ -42,7 +42,7 @@ const bootLockWait = 10 * time.Minute
 func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(accessible bool) Prompter, times clientTimes) *cobra.Command {
 	name := r.Spec.Name
 	o := Options{Out: stdout, Log: stderr, Docker: ExecTool{Bin: "docker"}, Self: self, Dir: VMDir(name), Offline: true, Preloaded: true,
-		Firewall: PortRules, Host: HostTool{}, Tune: vmTune(r.Ctl()), TunedAtBoot: true}
+		Firewall: PortRules, HostsFile: VMHostsFile(name), Host: HostTool{}, Tune: vmTune(r.Ctl()), TunedAtBoot: true}
 	if _, err := os.Stat("/proc/self/exe"); err == nil {
 		o.SelfExe = "/proc/self/exe"
 	}

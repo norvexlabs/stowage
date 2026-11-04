@@ -1,7 +1,6 @@
 package install
 
 import (
-	"bytes"
 	"cmp"
 	"context"
 	"errors"
@@ -41,9 +40,8 @@ func (in *Installer) tuneSystem(ctx context.Context) (tune.System, error) {
 		// The forwarding a start as root applied as the release and the devices now give it (its
 		// record holds those rules), through roles that each have a device here, is reported so
 		// rather than advised.
-		cur, _ := os.ReadFile(in.forwardRecord())
-		want, unmapped := forwardRules(in.R.Spec.Host, in.forwardChain(), func(r string) string { return in.roleDevice(r, get) })
-		applied := in.gatewayConsented() && want != nil && bytes.Equal(cur, want) && len(unmapped) == 0
+		_, unmapped := in.forwardTables(get)
+		applied := in.gatewayConsented() && in.forwardApplied(get) && len(unmapped) == 0
 		// An optional role without its NIC here is no difference: nothing forwards through it nor
 		// is intercepted on it, so no rule names it.
 		absent := func(r string) bool { return in.R.Spec.Host.Interfaces[r].Optional && in.roleDevice(r, get) == "" }
@@ -418,7 +416,7 @@ func releaseHost(sys *tune.System, s *spec.Spec) {
 	}
 	for _, r := range slices.Sorted(maps.Keys(s.Host.Interfaces)) {
 		i := s.Host.Interfaces[r]
-		ti := tune.Interface{Role: r, Kind: cmp.Or(i.Kind, spec.InterfaceNIC), MTU: i.MTU,
+		ti := tune.Interface{Role: r, Kind: cmp.Or(i.Kind, spec.InterfaceNIC), Device: i.Device, MTU: i.MTU,
 			RoutingPolicyRules: i.RoutingPolicyRules, Routes: i.Routes, Forward: i.Forward, Optional: i.Optional, Reason: i.Reason}
 		for _, svc := range s.Services {
 			ti.Transparent = ti.Transparent || slices.Contains(svc.Transparent, r)

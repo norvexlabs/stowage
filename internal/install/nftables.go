@@ -477,14 +477,17 @@ func (in *Installer) bootTables(ctx context.Context) error {
 	if in.O.Firewall == "" && !in.gatewayConsented() {
 		return nil
 	}
+	var errs []error
+	if in.O.Firewall == "" {
+		errs = append(errs, in.bootAllow(ctx))
+	}
 	raw, err := os.ReadFile(in.path(TablesFile))
 	if errors.Is(err, os.ErrNotExist) {
-		return nil
+		return errors.Join(errs...)
 	}
 	if err != nil {
-		return err
+		return errors.Join(append(errs, err)...)
 	}
-	var errs []error
 	for _, name := range strings.Fields(string(raw)) {
 		f := in.tableFile(name, ".nft")
 		if !spec.NftTableName.MatchString(name) || name == in.R.Spec.Name || !fileExists(f) {
@@ -547,6 +550,28 @@ func (in *Installer) bootTables(ctx context.Context) error {
 		in.O.logf("loaded the nftables table inet %s, before the containers start", name)
 	}
 	return errors.Join(errs...)
+}
+
+// bootAllow applies a consented Docker host's L4 allowlists (allowSources) at boot, before Docker
+// restores the stack's containers with their published ports, so no route is open a moment past
+// its list (the kernel keeps no chain over a reboot): from the install's recorded values, into a
+// DOCKER-USER made now when Docker has not made it yet (applyChain; Docker keeps it, and its
+// rules, as it starts). Values that do not read drop every source of those ports.
+func (in *Installer) bootAllow(ctx context.Context) error {
+	if len(in.allowRoutes()) == 0 {
+		return nil
+	}
+	// Unread, every list is empty: the routes' ports drop every source until the start applies them.
+	get, readErr := in.installedEnv()
+	if readErr == nil && !fileExists(in.path(envName)) {
+		readErr = errors.New("the install records no values (.env)")
+	}
+	// A boot never marks the lists held (allowHeld): the start after Docker does.
+	if err := errors.Join(readErr, in.allowSources(ctx, get, true)); err != nil {
+		return fmt.Errorf("the L4 routes' source allowlists at boot (the install's start applies them): %w", err)
+	}
+	in.O.logf("applied the L4 routes' source allowlists, before the containers start")
+	return nil
 }
 
 // tablesBootCommand is the hidden verb a boot unit runs as root before Docker starts: the

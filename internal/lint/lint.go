@@ -1190,7 +1190,8 @@ func (l *linter) l4() {
 			}
 		}
 		if k := r.AllowInput; k != "" {
-			l.l4Allow(w+".allow_input", k)
+			svc, _, _ := strings.Cut(r.Upstream, ":")
+			l.l4Allow(w+".allow_input", k, svc)
 		}
 		if k := r.BindInput; k != "" {
 			l.l4Bind(w+".bind_input", k)
@@ -1327,24 +1328,40 @@ func (l *linter) l4Bind(where, key string) {
 	}
 }
 
-// l4Allow checks an L4 route's allowlist input: only the VM's firewall enforces it (a Docker
-// host's is the operator's), so it is asked on the kairos shape alone, in every mode, and an
-// empty one refuses every source; without a kairos shape nothing enforces it (a warning).
-func (l *linter) l4Allow(where, key string) {
+// l4Allow checks an L4 route's allowlist input: the VM's firewall enforces it, and a Docker host's
+// once its operator consents (tune --apply), so it is asked on those of the docker and kairos
+// shapes the project has and on no other (a cluster's firewall is its own), in every mode, and an
+// empty one refuses every source; with neither shape nothing enforces it (a warning), nor on
+// Docker for an upstream on the host's network, which Docker translates no port to (a warning).
+func (l *linter) l4Allow(where, key, upstream string) {
 	in, ok := l.s.Input(key)
-	switch {
-	case !ok:
+	if !ok {
 		l.errf(where, "%s is not an input", key)
-	case l.s.Shapes.Kairos == nil:
-		l.warnf(where, "only the VM's firewall enforces it, and the project has no kairos shape: the route is open to every source (a Docker host's firewall is the operator's)")
-	case !slices.Equal(in.Shapes, []string{"kairos"}):
-		l.errf(where, "%s must be asked on the kairos shape alone (shapes: [kairos]): only the VM's firewall enforces it, a Docker host's is the operator's", key)
+		return
+	}
+	// The shapes whose firewall enforces it: the VM's, and a Docker host's once its operator
+	// consented (tune --apply).
+	var enforcing []string
+	for _, sh := range l.s.Shapes.Names() {
+		if sh == "docker" || sh == "kairos" {
+			enforcing = append(enforcing, sh)
+		}
+	}
+	asked := func(sh string) bool { return len(in.Shapes) == 0 || slices.Contains(in.Shapes, sh) }
+	switch {
+	case len(enforcing) == 0:
+		l.warnf(where, "only the VM's firewall and a Docker host's (tune --apply) enforce it, and the project has neither a docker nor a kairos shape: the route is open to every source")
+	case slices.ContainsFunc(enforcing, func(sh string) bool { return !asked(sh) }) || l.s.Shapes.Kubernetes != nil && asked("kubernetes"):
+		l.errf(where, "%s must be asked on the %s shapes alone (shapes: [%s]): their firewalls enforce it, a cluster's is its own", key, strings.Join(enforcing, " and "), strings.Join(enforcing, ", "))
 	case in.Secret:
 		l.errf(where, "%s is secret: the firewall's rules show it", key)
 	case in.Advanced:
 		l.errf(where, "%s is advanced, never asked: the route would refuse every source until it is set", key)
 	case in.When != "":
 		l.errf(where, "%s is asked only when %s: the firewall reads it in every mode", key, in.When)
+	}
+	if always, _ := l.hostNetworkServices(); l.s.Shapes.Docker != nil && slices.Contains(always, upstream) {
+		l.warnf(where, "on the docker shape %s runs on the host's network, whose input chain is the Docker host's operator's: the route is open to every source there", upstream)
 	}
 }
 
@@ -2155,8 +2172,12 @@ func (l *linter) interfaces(ifs map[string]spec.HostInterface) {
 			if i.Primary {
 				l.errf(at+".primary", "a tun device a service opens is not the default route's")
 			}
+			l.tunDevice(at+".device", role, i.Device, ifs)
 		default:
 			l.errf(at+".kind", "%q: %s (the default) or %s", i.Kind, spec.InterfaceNIC, spec.InterfaceTUN)
+		}
+		if i.Device != "" && i.Kind != spec.InterfaceTUN {
+			l.errf(at+".device", "a tun role's: a NIC role's device is the one the VM names after the role, or the one --interface names on a Docker host")
 		}
 		if i.MTU != 0 && (i.MTU < 1280 || i.MTU > 9216) {
 			l.errf(at+".mtu", "%d: 1280 to 9216 (IPv6's least, a jumbo frame's most), or none for the network's", i.MTU)
@@ -2204,6 +2225,33 @@ func (l *linter) interfaces(ifs map[string]spec.HostInterface) {
 		}
 		if len(fw) > 0 && !kairos {
 			l.warnf(at, "only the VM's firewall is Stowage's (a kairos shape): a Docker host applies it in DOCKER-USER once its operator consents (tune --apply)")
+		}
+	}
+}
+
+// tunDevice checks a tun role's device (spec.ValidTunDevice), the name its service gives the
+// device where the role's own cannot be it: one no other role is (the VM names its NICs by their
+// roles) and no other tun role's device is.
+func (l *linter) tunDevice(at, role, dev string, ifs map[string]spec.HostInterface) {
+	if dev == "" {
+		return
+	}
+	if !spec.ValidTunDevice(dev) {
+		l.errf(at, "%q: a device's name of 1 to 15 letters, digits, _, . or -, starting with a letter or digit (the name its service gives it)", dev)
+		return
+	}
+	// The host's own devices are never a service's tun: a tun or tap name is one (tun0, tap0).
+	if p := slices.IndexFunc(spec.ReservedInterfacePrefixes, func(p string) bool { return p != "tun" && p != "tap" && strings.HasPrefix(dev, p) }); p >= 0 {
+		l.errf(at, "%q is a name the kernel, udev or Docker gives (%s…): the name the service gives its tun device", dev, spec.ReservedInterfacePrefixes[p])
+		return
+	}
+	for _, r := range slices.Sorted(maps.Keys(ifs)) {
+		switch {
+		case r == role:
+		case r == dev:
+			l.errf(at, "%q is the role %s's name, another interface's", dev, r)
+		case ifs[r].Kind == spec.InterfaceTUN && ifs[r].Device == dev:
+			l.errf(at, "%q is host.interfaces.%s.device too: one device plays one role", dev, r)
 		}
 	}
 }

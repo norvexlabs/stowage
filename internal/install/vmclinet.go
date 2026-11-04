@@ -175,6 +175,9 @@ func printNetwork(w io.Writer, ctl string, n Network) {
 	}
 	fmt.Fprintf(w, "gateway    %s\n", strings.Join(gws, ", "))
 	fmt.Fprintf(w, "dns        %s\n", strings.Join(l.DNS, ", "))
+	if len(n.Hosts) > 0 {
+		fmt.Fprintf(w, "hosts      %s (vm create --add-host)\n", strings.Join(n.Hosts, ", "))
+	}
 	switch n.Source {
 	case "override":
 		fmt.Fprintf(w, "set by     `%s network set`: %s\n", ctl, describeNet(n.Override))

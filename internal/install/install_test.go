@@ -849,7 +849,7 @@ func TestL4Routes(t *testing.T) {
 		t.Errorf("err = %v", err)
 	}
 	var out bytes.Buffer
-	if err := e.installer(func(o *Options) { o.Out = &out }).Status(context.Background()); err != nil || !strings.Contains(out.String(), "\ndata      tcp/7443 · on every address, open to whoever reaches this host\ndata-udp  udp/7443 · on every address, open to whoever reaches this host\n") {
+	if err := e.installer(func(o *Options) { o.Out = &out }).Status(context.Background()); err != nil || !strings.Contains(out.String(), "\ndata      tcp/7443 · on every address, open to whoever reaches this host\ndata-udp  udp/7443 · on every address, open to whoever reaches this host: DATA_SOURCES's sources hold once `notes-stow tune --apply` consents\n") {
 		t.Errorf("%v\n%s", err, out.String())
 	}
 	// The first install: an option over the project's port, and the route's port free.
@@ -910,11 +910,30 @@ func TestAnL4RoutesExposureIsSaid(t *testing.T) {
 		{spec.L4Route{Name: "data", Protocol: "tcp", Port: 7443, Upstream: "proxy:7443"}, "", "", "on the addresses proxy binds on the host's network, behind this host's own firewall", nil},
 		{spec.L4Route{Name: "data", Protocol: "tcp", Port: 7443, Upstream: "proxy:7443"}, "", "", "not served: proxy's profiles are off", []string{"proxy"}},
 		{spec.L4Route{Name: "data", Protocol: "tcp", Port: 7443, Upstream: "proxy:7443"}, "", "/run/notes/firewall", "not served: proxy's profiles are off", []string{"proxy"}},
+		{spec.L4Route{Name: "data", Protocol: "tcp", Port: 7443, AllowInput: "SRC"}, "", "", "on every address, open to whoever reaches this host: SRC's sources hold once `notes-stow tune --apply` consents", nil},
+		{spec.L4Route{Name: "data", Protocol: "tcp", Port: 7443, AllowInput: "SRC", BindInput: "DATA_BIND"}, "192.0.2.7", "", "on 192.0.2.7 alone, open to whoever reaches it: SRC's sources hold once `notes-stow tune --apply` consents", nil},
 	} {
-		in := &Installer{R: &Release{Spec: &spec.Spec{Services: map[string]spec.Service{"proxy": {HostNetwork: true}}}}, O: Options{Firewall: c.fw}}
+		in := &Installer{R: &Release{Spec: &spec.Spec{Name: "notes", Services: map[string]spec.Service{"proxy": {HostNetwork: true}}}}, O: Options{Firewall: c.fw}}
 		if got := in.l4Exposure(c.r, func(k string) string { return map[string]string{"DATA_BIND": c.bind}[k] }, c.off); got != c.want {
 			t.Errorf("%+v: %q", c, got)
 		}
+	}
+	// Consented, the allowlist holds.
+	in, _, _ := gateway(t, 0)
+	if err := in.writeGateway(gatewayRecord{Digest: dirDigest(in.gatewayDir()), Dir: in.gatewayDir()}); err != nil {
+		t.Fatal(err)
+	}
+	route := spec.L4Route{Name: "data", Protocol: "tcp", Port: 7443, Upstream: "api:7443", AllowInput: "SRC"}
+	in.R.Spec.L4.Routes = []spec.L4Route{route}
+	if got := in.l4Exposure(route, none, nil); got != "open to whoever reaches this host: SRC's list is not held yet: a start as root applies it, on IPv4 alone (consented; `status` says what the last one did)" {
+		t.Errorf("consented, not applied: %q", got)
+	}
+	rules, _ := allowRules(in.allowed(), in.allowChain(), none)
+	if err := os.WriteFile(in.allowHeld(), []byte(heldMark(rules)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := in.l4Exposure(route, none, nil); got != "on IPv4's every address, from the IPv4 sources SRC holds (the install's chain in DOCKER-USER, applied by each start as root)" {
+		t.Errorf("applied: %q", got)
 	}
 }
 
@@ -1324,7 +1343,7 @@ func TestFrontStripsHeadersAndPublishesOnTheLoopback(t *testing.T) {
 			t.Errorf("Caddyfile lacks %q:\n%s", want, cf)
 		}
 	}
-	fc, err := frontCompose(e.r.Spec.Front, nil, nil, Loopback, hostAPI{}, "sha256:x", "", false, false, nil)
+	fc, err := frontCompose(e.r.Spec.Front, nil, nil, Loopback, hostAPI{}, "sha256:x", "", false, false, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

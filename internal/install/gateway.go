@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"cmp"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -58,7 +60,7 @@ type networkdFile struct {
 // gatewayDeclared reports whether the release declares what a Docker host applies on consent: a
 // service's nftables table, forwarding between roles, or a tun device.
 func (in *Installer) gatewayDeclared() bool {
-	return len(in.R.Tables()) > 0 || len(in.gatewayRoles()) > 0 || forwards(in.R.Spec.Host)
+	return len(in.R.Tables()) > 0 || len(in.gatewayRoles()) > 0 || forwards(in.R.Spec.Host) || len(in.allowRoutes()) > 0
 }
 
 // gatewayRoles are the tun roles, whose whole networkd file a Docker host is given.
@@ -220,8 +222,183 @@ func (in *Installer) forwardRecord() string {
 	return filepath.Join(in.O.gatewayRun(), in.R.Spec.Name+"-gateway-"+in.gatewayDigest()+"-forward.rules")
 }
 
+// allowChain is the iptables chain DOCKER-USER jumps to for a Docker host's L4 source allowlists
+// (allowRules), named after the install directory's digest as its forwarding chain is.
+func (in *Installer) allowChain() string { return "STOWAGE-ALW-" + in.gatewayDigest() }
+
+// allowRecord is where allowSources records the rules it gave allowChain, beside forwardRecord.
+func (in *Installer) allowRecord() string {
+	return filepath.Join(in.O.gatewayRun(), in.R.Spec.Name+"-gateway-"+in.gatewayDigest()+"-allow.rules")
+}
+
+// allowHeld marks the allowlists held: written by a start as root once it applied them, saw
+// Docker's FORWARD jump to DOCKER-USER and brought the stack up (never by a boot, before Docker),
+// removed as any apply begins, holding the digest of the rules it applied (heldMark). status and the L4 lines say a
+// list holds only while it is the one the release and the recorded values give (allowHolds).
+func (in *Installer) allowHeld() string {
+	return filepath.Join(in.O.gatewayRun(), in.R.Spec.Name+"-gateway-"+in.gatewayDigest()+"-allow.held")
+}
+
+// markAllowHeld writes the mark of the lists this start applied (allowHeld), once the stack is up:
+// its ports are then published as the lists need, on IPv4 alone.
+func (in *Installer) markAllowHeld() error {
+	if in.allowApplied == "" {
+		return nil
+	}
+	return writeAtomic(in.allowHeld(), strings.NewReader(in.allowApplied), 0o644, nil)
+}
+
+// heldMark is allowHeld's content for rules: their digest.
+func heldMark(rules map[string][]byte) string {
+	return fmt.Sprintf("sha256:%x\n", sha256.Sum256(chainRecord(rules)))
+}
+
+// allowHolds reports whether the allowlists the release and get give are those a start as root
+// applied and saw hold (allowHeld): a start not as root, which applies nothing, after an upgrade
+// or a change of values leaves another mark.
+func (in *Installer) allowHolds(get func(string) string) bool {
+	rules, err := allowRules(in.allowed(), in.allowChain(), get)
+	if err != nil || rules == nil {
+		return false
+	}
+	mark, err := os.ReadFile(in.allowHeld())
+	return err == nil && string(mark) == heldMark(rules)
+}
+
+// allowRoutes are the names of the L4 routes with a source allowlist (allow_input), which a
+// consented Docker host enforces (allowRules).
+func (in *Installer) allowRoutes() []string {
+	var names []string
+	for _, r := range in.allowed() {
+		names = append(names, r.Name)
+	}
+	return names
+}
+
+// allowed are the L4 routes a Docker host's allowlists hold: those with an allow_input whose
+// upstream Docker publishes (one on the host's network listens itself, untranslated: its list is
+// the host's input chain's, the operator's).
+func (in *Installer) allowed() []spec.L4Route {
+	var out []spec.L4Route
+	onHost := in.hostServices()
+	for _, r := range in.R.Spec.L4.Routes {
+		if name, _, _ := strings.Cut(r.Upstream, ":"); r.AllowInput != "" && !slices.Contains(onHost, name) {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// allowV4Only are the L4 routes a consented Docker host publishes on IPv4 alone: those with an
+// allowlist, whose IPv6 clients Docker's userland proxy may carry past DOCKER-USER, unfiltered (a
+// stack without IPv6, an upstream on a network without it, an engine with ip6tables off).
+func (in *Installer) allowV4Only() []string {
+	if in.O.Firewall != "" || !in.gatewayConsented() {
+		return nil
+	}
+	return in.allowRoutes()
+}
+
+// allowRules are chain's rules, iptables's alone, for the L4 routes' source allowlists on a Docker
+// host, which publishes those routes on IPv4 alone (allowV4Only): a connection to a route's
+// published port (its original destination, which Docker translates to the container's: the port,
+// and the route's bind address when it has one) from one of its input's IPv4 sources returns to
+// DOCKER-USER, which goes on to Docker's own rules, and any other is dropped; an empty list drops
+// every source. Nil when no route has an allowlist. A recorded value read back is checked again
+// (checkSources): it goes into the host's rules as root.
+func allowRules(routes []spec.L4Route, chain string, get func(string) string) (map[string][]byte, error) {
+	var rules []string
+	n := 0
+	for _, r := range routes {
+		if r.AllowInput == "" {
+			continue
+		}
+		n++
+		v := get(r.AllowInput)
+		if err := checkSources(v); err != nil {
+			return nil, fmt.Errorf("l4 route %s: %s: %w", r.Name, r.AllowInput, err)
+		}
+		s4, _ := familySources(v)
+		match := fmt.Sprintf("-A %s -p %s -m conntrack --ctstate DNAT --ctdir ORIGINAL --ctorigdstport %d", chain, r.Protocol, r.Port)
+		// Bound to one address: another install's port on another address is not this one's. An
+		// IPv6 one is applied by no start (allowBound refuses it).
+		if a := bindAddr(r, get); a != "" {
+			match += " --ctorigdst " + a
+		}
+		for _, s := range s4 {
+			rules = append(rules, match+" -s "+s+" -j RETURN")
+		}
+		rules = append(rules, match+" -j DROP")
+	}
+	if n == 0 {
+		return nil, nil
+	}
+	return map[string][]byte{"iptables": fmt.Appendf(nil, "*filter\n:%s - [0:0]\n%s\nCOMMIT\n", chain, strings.Join(rules, "\n"))}, nil
+}
+
+// allowSources gives allowChain the L4 routes' allowlists (allowRules), as applyChain does.
+func (in *Installer) allowSources(ctx context.Context, get func(string) string, boot bool) error {
+	chain, what := in.allowChain(), "the L4 routes' source allowlists"
+	if err := os.Remove(in.allowHeld()); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("%s: %w", what, err)
+	}
+	err := in.allowBound(get)
+	var rules map[string][]byte
+	if err == nil {
+		rules, err = allowRules(in.allowed(), chain, get)
+	}
+	if err != nil {
+		// Fail closed: the routes' ports, on their IPv4 bind addresses, drop every source until
+		// the start that fixes it.
+		// Every list empty and no bind address, which checkSources takes (it cannot fail): each
+		// route's port drops every source on every address, whatever it is published on now.
+		closed, _ := allowRules(in.allowed(), chain, func(string) string { return "" })
+		return errors.Join(err, in.applyChain(ctx, chain, in.allowRecord(), closed, what, boot))
+	}
+	// A boot runs before Docker, whose FORWARD jump is not there yet: the start after it says
+	// whether the lists hold.
+	if rules != nil && !boot {
+		if err := in.dockerUserReached(ctx, what); err != nil {
+			return err
+		}
+	}
+	if err := in.applyChain(ctx, chain, in.allowRecord(), rules, what, boot); err != nil || rules == nil || boot {
+		return err
+	}
+	in.allowApplied = heldMark(rules)
+	return nil
+}
+
+// dockerUserReached refuses an engine that sends nothing through DOCKER-USER (its iptables off, its
+// nftables backend): iptables' FORWARD does not jump to it, so no chain under it holds.
+func (in *Installer) dockerUserReached(ctx context.Context, what string) error {
+	if _, err := in.O.host().Run(ctx, Cmd{Args: []string{"iptables", "-w", "-C", "FORWARD", "-j", "DOCKER-USER"}}); err != nil {
+		return fmt.Errorf("%s cannot hold: iptables' FORWARD does not jump to DOCKER-USER (%v), so the Docker engine (its iptables off, or its nftables backend) passes nothing through it: turn its iptables on, or `%s tune --revert`", what, err, in.R.Ctl())
+	}
+	return nil
+}
+
+// v6Bound reports whether a bind address is one IPv6 address: not an IPv4 one, nor the
+// unspecified address, which is every address (bindAddr).
+func v6Bound(a string) bool {
+	ip, err := netip.ParseAddr(a)
+	return err == nil && !ip.Unmap().Is4() && !ip.IsUnspecified()
+}
+
+// allowBound refuses an allowlisted route bound to an IPv6 address: a Docker host holds the list
+// for IPv4 alone (allowV4Only).
+func (in *Installer) allowBound(get func(string) string) error {
+	for _, r := range in.allowed() {
+		if a := bindAddr(r, get); v6Bound(a) {
+			return fmt.Errorf("l4 route %s: %s=%s is an IPv6 address, and a Docker host holds %s for IPv4 alone: an IPv4 address in %s, or none", r.Name, r.BindInput, a, r.AllowInput, r.BindInput)
+		}
+	}
+	return nil
+}
+
 // gatewayStart applies, at a Docker host's start, what is not the VM's own firewall's: the
-// forwarding's chain and the tun roles' networkd files (the tables are loadTables', at every start
+// forwarding's chain, the L4 routes' allowlists' (each tried, their errors joined) and the tun
+// roles' networkd files (the tables are loadTables', at every start
 // that applies them). Not consented, the release's declarations are said not to be in force;
 // consented but not run as root, they are said not to be applied (or, the release declaring none,
 // not removed). A NIC role's MTU and policy routing are said to be the operator's.
@@ -254,7 +431,7 @@ func (in *Installer) gatewayStart(ctx context.Context, get func(string) string) 
 		in.O.logf("warning: %s are applied by a start as root alone (`%s tune --apply` consented): this start applies nothing of them", in.gatewayWhat(), ctl)
 		return nil
 	case in.O.euid() != 0:
-		if len(rec.Networkd) > 0 || fileExists(in.forwardRecord()) || fileExists(in.path(TablesFile)) {
+		if len(rec.Networkd) > 0 || fileExists(in.forwardRecord()) || fileExists(in.allowRecord()) || fileExists(in.path(TablesFile)) {
 			in.O.logf("warning: what an earlier release applied of the stack's network declarations is removed by a start as root alone: this start removes nothing")
 		}
 		return nil
@@ -264,10 +441,8 @@ func (in *Installer) gatewayStart(ctx context.Context, get func(string) string) 
 	if _, err := in.writeUnits(ctx, false); err != nil {
 		in.O.logf("warning: the boot units of %s are not written (%v): `%s tune --apply` writes them again", in.gatewayWhat(), err, ctl)
 	}
-	if err := in.forwardRoles(ctx, get); err != nil {
-		return err
-	}
-	return in.gatewayRouting(ctx)
+	// Each is tried: one that fails never leaves the others unapplied.
+	return errors.Join(in.forwardRoles(ctx, get), in.allowSources(ctx, get, false), in.gatewayRouting(ctx))
 }
 
 // gatewayWhat names the release's network declarations, for a warning.
@@ -281,6 +456,9 @@ func (in *Installer) gatewayWhat() string {
 	}
 	if roles := in.gatewayRoles(); len(roles) > 0 {
 		what = append(what, "the networkd files of "+strings.Join(roles, ", "))
+	}
+	if routes := in.allowRoutes(); len(routes) > 0 {
+		what = append(what, "the source allowlists of the L4 routes "+strings.Join(routes, ", "))
 	}
 	if len(what) == 0 {
 		return "the stack's network declarations"
@@ -431,7 +609,7 @@ func (in *Installer) gatewayTablesUnit() (name, content string) {
 	dir := in.gatewayDir()
 	name = in.gatewayTablesUnitName(in.gatewayDigest())
 	ctl := filepath.Join(dir, in.R.Ctl())
-	return name, fmt.Sprintf("[Unit]\nDescription=%s (%s): the services' nftables tables, before Docker restores their containers (tune --apply)\nAfter=network-online.target\nWants=network-online.target\nBefore=docker.service\n\n[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=%s %s --dir %s\n\n[Install]\nWantedBy=multi-user.target\n",
+	return name, fmt.Sprintf("[Unit]\nDescription=%s (%s): the services' nftables tables and the L4 routes' source allowlists, before Docker restores their containers (tune --apply)\nAfter=network-online.target\nWants=network-online.target\nBefore=docker.service\n\n[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=%s %s --dir %s\n\n[Install]\nWantedBy=multi-user.target\n",
 		in.R.Spec.Name, systemdText(dir), systemdArg(ctl), tablesBootCmd, systemdArg(dir))
 }
 
@@ -498,6 +676,14 @@ func (in *Installer) consent(ctx context.Context) error {
 	}
 	if in.gatewayRecorded() && !in.gatewayHere(prev) {
 		return errors.New(in.gatewayElsewhere(prev))
+	}
+	// A route bound to an IPv6 address holds no list here (allowBound): refused before consent.
+	get, err := in.installedEnv()
+	if err != nil {
+		return fmt.Errorf("the install's record: %w: fix it, then tune --apply again", err)
+	}
+	if err := in.allowBound(get); err != nil {
+		return fmt.Errorf("%w (a re-run sets it), then tune --apply again", err)
 	}
 	recorded := in.gatewayRecorded()
 	rec := prev
@@ -588,11 +774,19 @@ func (in *Installer) lockedRevert(ctx context.Context) error {
 		return err
 	}
 	defer unlock()
-	return in.gatewayRevert(ctx)
+	if err := in.gatewayRevert(ctx); err != nil {
+		return err
+	}
+	// The consent published them on IPv4 alone (allowV4Only); the next start publishes them on
+	// every address, which a revert never starts itself (the stack may be stopped).
+	if routes := in.allowRoutes(); len(routes) > 0 && fileExists(in.path(envName)) {
+		in.O.logf("note: the L4 routes %s are open to every source now, and stay published on IPv4 alone until the next start, which publishes them on every address: `%s --dir %s --no-input --no-provision`", strings.Join(routes, ", "), in.ctl(), in.gatewayDir())
+	}
+	return nil
 }
 
-// gatewayRevert removes what the declarations applied (the boot unit, the services' tables, the
-// forwarding's chain, the networkd files) and the consent (tune --revert, uninstall on a Docker
+// gatewayRevert removes what the declarations applied (the boot units, the services' tables, the
+// forwarding's and the allowlists' chains, the networkd files) and the consent (tune --revert, uninstall on a Docker
 // host; the caller holds the install's lock). The record is read first: one that does not read, or
 // names another file, refuses before anything goes. Each step is tried; when one failed, the record
 // stays, revoked (no start applies anything), and a revert again removes the rest. A service's
@@ -652,34 +846,60 @@ func (in *Installer) gatewayRevert(ctx context.Context) error {
 	return nil
 }
 
-// dropForward removes the install's forwarding chain on a Docker host: DOCKER-USER's jump to it,
-// its rules, the chain, and its record.
+// dropForward removes the install's chains on a Docker host, the forwarding's and the
+// allowlists' (dropChain: DOCKER-USER's jumps to each, its rules, the chain, its records), and the
+// allowlists' held mark, each step tried.
 func (in *Installer) dropForward(ctx context.Context) error {
-	chain, host := in.forwardChain(), in.O.host()
+	var errs []error
+	if err := os.Remove(in.allowHeld()); err != nil && !errors.Is(err, os.ErrNotExist) {
+		errs = append(errs, err)
+	}
+	for _, c := range []struct{ chain, record string }{{in.forwardChain(), in.forwardRecord()}, {in.allowChain(), in.allowRecord()}} {
+		errs = append(errs, in.dropChain(ctx, c.chain, c.record))
+	}
+	return errors.Join(errs...)
+}
+
+// dropChain removes chain's applied mark, then the chain, DOCKER-USER's jumps to it first, from
+// each table that holds it (each tried), then its record once every step went.
+func (in *Installer) dropChain(ctx context.Context, chain, record string) error {
+	var errs []error
+	// The applied mark first: a step failing below leaves no chain said to be applied.
+	if err := os.Remove(appliedMark(record)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		errs = append(errs, err)
+	}
+	host := in.O.host()
 	tables := []string{"iptables", "ip6tables"}
 	if _, err := os.Stat(ipv6Proc); err != nil {
 		tables = tables[:1]
 	}
 	for _, t := range tables {
-		jump := []string{"DOCKER-USER", "-j", chain}
-		for range 16 { // each jump inserted once a start; a bound on what deleting takes
-			if _, err := host.Run(ctx, Cmd{Args: append([]string{t, "-w", "-C"}, jump...)}); err != nil {
-				break
+		errs = append(errs, func() error {
+			jump := []string{"DOCKER-USER", "-j", chain}
+			for range 16 { // each jump inserted once a start; a bound on what deleting takes
+				if _, err := host.Run(ctx, Cmd{Args: append([]string{t, "-w", "-C"}, jump...)}); err != nil {
+					break
+				}
+				if _, err := host.Run(ctx, Cmd{Args: append([]string{t, "-w", "-D"}, jump...)}); err != nil {
+					return fmt.Errorf("%s: DOCKER-USER's jump to %s: %w", t, chain, err)
+				}
 			}
-			if _, err := host.Run(ctx, Cmd{Args: append([]string{t, "-w", "-D"}, jump...)}); err != nil {
-				return fmt.Errorf("%s: DOCKER-USER's jump to %s: %w", t, chain, err)
+			if _, err := host.Run(ctx, Cmd{Args: []string{t, "-w", "-n", "-L", chain}}); err != nil {
+				return nil // no such chain
 			}
-		}
-		if _, err := host.Run(ctx, Cmd{Args: []string{t, "-w", "-n", "-L", chain}}); err != nil {
-			continue // no such chain
-		}
-		for _, op := range []string{"-F", "-X"} {
-			if _, err := host.Run(ctx, Cmd{Args: []string{t, "-w", op, chain}}); err != nil {
-				return fmt.Errorf("%s %s %s: %w", t, op, chain, err)
+			for _, op := range []string{"-F", "-X"} {
+				if _, err := host.Run(ctx, Cmd{Args: []string{t, "-w", op, chain}}); err != nil {
+					return fmt.Errorf("%s %s %s: %w", t, op, chain, err)
+				}
 			}
-		}
+			return nil
+		}())
 	}
-	if err := os.Remove(in.forwardRecord()); err != nil && !errors.Is(err, os.ErrNotExist) {
+	// The record stays while a step failed: the next try finds the chain to remove.
+	if err := errors.Join(errs...); err != nil {
+		return err
+	}
+	if err := os.Remove(record); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
 	return nil
@@ -704,15 +924,28 @@ func (in *Installer) gatewayStatus(get func(string) string) string {
 	case rec.Revoked:
 		return fmt.Sprintf("revoked, but not all it applied is removed: `%s tune --revert` again removes the rest", ctl)
 	}
-	var applied []string
+	var applied, notYet []string
 	if loaded := in.loadedTables(context.Background()); len(loaded) > 0 {
 		applied = append(applied, "tables "+strings.Join(loaded, ", "))
 	}
-	if fileExists(in.forwardRecord()) {
+	switch rules, _ := in.forwardTables(get); {
+	case in.forwardApplied(get):
 		applied = append(applied, "forwarding")
+	case rules == nil && fileExists(in.forwardRecord()):
+		notYet = append(notYet, "forwarding left (the next start as root removes it)")
+	case rules != nil:
+		notYet = append(notYet, "forwarding not applied (no start as root applied it since this release or these devices, or its error says why)")
 	}
-	if _, unmapped := forwardRules(in.R.Spec.Host, ForwardChain, func(r string) string { return in.roleDevice(r, get) }); len(unmapped) > 0 {
-		applied = append(applied, "no forwarding through "+strings.Join(unmapped, ", ")+" (no NIC named: --interface)")
+	if _, unmapped := in.forwardTables(get); len(unmapped) > 0 {
+		notYet = append(notYet, "no forwarding through "+strings.Join(unmapped, ", ")+" (no NIC named: --interface)")
+	}
+	switch routes := strings.Join(in.allowRoutes(), ", "); {
+	case routes != "" && in.allowHolds(get):
+		applied = append(applied, "source allowlists of "+routes)
+	case routes != "":
+		notYet = append(notYet, "source allowlists of "+routes+" not held (no start as root applied them since this release or these values, or its error says why)")
+	case fileExists(in.allowRecord()):
+		notYet = append(notYet, "source allowlists left (the next start as root removes them)")
 	}
 	n, pending := 0, 0
 	for _, f := range rec.Networkd {
@@ -726,8 +959,12 @@ func (in *Installer) gatewayStatus(get func(string) string) string {
 		applied = append(applied, fmt.Sprintf("%d networkd file(s)", n))
 	}
 	if pending > 0 {
-		applied = append(applied, fmt.Sprintf("%d networkd file(s) pending (written, not yet seen loaded by networkd: the next start as root reloads it)", pending))
+		notYet = append(notYet, fmt.Sprintf("%d networkd file(s) pending (written, not yet seen loaded by networkd: the next start as root reloads it)", pending))
 	}
+	if len(applied) == 0 && len(notYet) > 0 {
+		return "consented (tune --apply), nothing in force: " + strings.Join(notYet, "; ")
+	}
+	applied = append(applied, notYet...)
 	switch {
 	case len(applied) == 0 && !in.gatewayDeclared():
 		return "consented (tune --apply): the release declares none (`" + ctl + " tune --revert` withdraws the consent)"

@@ -18,12 +18,19 @@ import (
 type gwHost struct {
 	ran    [][]string
 	tables map[string]bool
-	jumps  int
-	chain  bool
+	stdin  []string // what each iptables-restore read
+	// jumps are DOCKER-USER's jumps by chain, chain the chains made (a table's alone: one
+	// iptables -C finds the jump the other's -I made).
+	jumps map[string]int
+	chain map[string]bool
 	// noNetworkd: systemd-networkd does not run; reloadErr fails `networkctl reload`; xErr fails
 	// deleting a chain.
-	noNetworkd                            bool
+	noNetworkd bool
+	// noUser: iptables has no DOCKER-USER until one is made (-N), as before Docker starts;
+	// noForward: Docker's FORWARD does not jump to it (its iptables off).
+	noUser, noForward                     bool
 	reloadErr, xErr, deleteErr, enableErr error
+	restoreErr                            error // fails iptables-restore
 }
 
 func (h *gwHost) Run(_ context.Context, c Cmd) ([]byte, error) {
@@ -58,26 +65,54 @@ func (h *gwHost) Run(_ context.Context, c Cmd) ([]byte, error) {
 		}
 		delete(h.tables, a[len(a)-1])
 	case strings.HasSuffix(a[0], "-restore"):
-		h.chain = true
+		if h.restoreErr != nil {
+			return nil, h.restoreErr
+		}
+		if c.Stdin != nil {
+			b, _ := io.ReadAll(c.Stdin)
+			h.stdin = append(h.stdin, string(b))
+			for _, l := range strings.Split(string(b), "\n") {
+				if n, ok := strings.CutPrefix(l, ":"); ok {
+					h.chain[strings.Fields(n)[0]] = true
+				}
+			}
+		}
+	case a[0] == "iptables" && slices.Contains(a, "FORWARD"):
+		if h.noForward {
+			return nil, errors.New("Bad rule: no such jump")
+		}
+	case a[0] == "iptables" && h.noUser && slices.Contains(a, "-N"):
+		h.noUser = false
+	case a[0] == "iptables" && h.noUser && (slices.Contains(a, "-I") || slices.Contains(a, "-C") || slices.Contains(a, "-L") && a[len(a)-1] == "DOCKER-USER"):
+		return nil, errors.New("No chain/target/match by that name")
 	case strings.HasPrefix(a[0], "ip") && slices.Contains(a, "-C"):
-		if h.jumps == 0 {
+		if h.jumps[a[len(a)-1]] == 0 {
 			return nil, errors.New("Bad rule")
 		}
 	case strings.HasPrefix(a[0], "ip") && slices.Contains(a, "-I"):
-		h.jumps++
+		h.jumps[a[len(a)-1]]++
 	case strings.HasPrefix(a[0], "ip") && slices.Contains(a, "-D"):
-		h.jumps--
+		h.jumps[a[len(a)-1]]--
 	case strings.HasPrefix(a[0], "ip") && slices.Contains(a, "-L"):
-		if !h.chain {
+		if !h.chain[a[len(a)-1]] {
 			return nil, errors.New("No chain")
 		}
 	case strings.HasPrefix(a[0], "ip") && slices.Contains(a, "-X"):
 		if h.xErr != nil {
 			return nil, h.xErr
 		}
-		h.chain = false
+		delete(h.chain, a[len(a)-1])
 	}
 	return nil, nil
+}
+
+// njumps counts DOCKER-USER's jumps, to every chain.
+func (h *gwHost) njumps() int {
+	n := 0
+	for _, j := range h.jumps {
+		n += j
+	}
+	return n
 }
 
 func (h *gwHost) did(prefix string) bool {
@@ -95,7 +130,7 @@ func gateway(t *testing.T, euid int) (*Installer, *gwHost, *[]string) {
 		"edge":   {RoutingPolicyRules: []map[string]string{{"From": "10.8.0.0/24", "Table": "100"}}},
 		"vpn0":   {Kind: spec.InterfaceTUN, Forward: []string{"uplink"}, Routes: []map[string]string{{"Destination": "0.0.0.0/0", "Table": "100"}}},
 	}}
-	host := &gwHost{tables: map[string]bool{}}
+	host := &gwHost{tables: map[string]bool{}, jumps: map[string]int{}, chain: map[string]bool{}}
 	var log []string
 	in := &Installer{R: r, O: Options{
 		Dir: t.TempDir(), Host: host, Euid: func() int { return euid },
@@ -319,8 +354,8 @@ func TestTuneApplyConsentsAndRevertRemovesTheGateway(t *testing.T) {
 	if !host.did("systemctl enable "+name+" "+tname) || !slices.Equal(started, []string{filepath.Join(in.O.Dir, "notes-stow"), "--dir", in.O.Dir, "--no-input", "--no-provision"}) {
 		t.Errorf("ran %v, started %v", host.ran, started)
 	}
-	if !in.gatewayConsented() || !host.tables["vpn"] || host.jumps != 1 || !fileExists(in.tunFile("vpn0")) {
-		t.Fatalf("consented %v, tables %v, jumps %d", in.gatewayConsented(), host.tables, host.jumps)
+	if !in.gatewayConsented() || !host.tables["vpn"] || host.njumps() != 1 || !fileExists(in.tunFile("vpn0")) {
+		t.Fatalf("consented %v, tables %v, jumps %v, ran %v", in.gatewayConsented(), host.tables, host.jumps, host.ran)
 	}
 	// A revert with networkd stopped, and a chain that does not go: the rest goes, the consent is
 	// revoked, and a revert again removes the chain and the record.
@@ -328,8 +363,8 @@ func TestTuneApplyConsentsAndRevertRemovesTheGateway(t *testing.T) {
 	if err := in.gatewayRevert(ctx); err == nil || !strings.Contains(err.Error(), "the consent is withdrawn, but not all it applied is removed (`notes-stow tune --revert` again removes the rest)") || strings.Contains(err.Error(), "networkctl") {
 		t.Fatalf("revert: %v", err)
 	}
-	if in.gatewayConsented() || !in.gatewayRecorded() || host.tables["vpn"] || host.jumps != 0 || fileExists(filepath.Join(in.O.Systemd, name)) || fileExists(filepath.Join(in.O.Systemd, tname)) || fileExists(in.tunFile("vpn0")) {
-		t.Errorf("left: consented %v, tables %v, jumps %d", in.gatewayConsented(), host.tables, host.jumps)
+	if in.gatewayConsented() || !in.gatewayRecorded() || host.tables["vpn"] || host.njumps() != 0 || fileExists(filepath.Join(in.O.Systemd, name)) || fileExists(filepath.Join(in.O.Systemd, tname)) || fileExists(in.tunFile("vpn0")) {
+		t.Errorf("left: consented %v, tables %v, jumps %d", in.gatewayConsented(), host.tables, host.njumps())
 	}
 	if st := in.gatewayStatus(none); !strings.HasPrefix(st, "revoked, but not all it applied is removed") {
 		t.Errorf("status %q", st)
@@ -345,7 +380,7 @@ func TestTuneApplyConsentsAndRevertRemovesTheGateway(t *testing.T) {
 		t.Errorf("a revoked consent applied: %v %v %q", err, host.ran, log)
 	}
 	host.xErr = nil
-	if err := in.gatewayRevert(ctx); err != nil || host.chain || in.gatewayRecorded() {
+	if err := in.gatewayRevert(ctx); err != nil || len(host.chain) > 0 || in.gatewayRecorded() {
 		t.Errorf("again: %v, chain %v, recorded %v", err, host.chain, in.gatewayRecorded())
 	}
 	// A table nft does not delete fails the revert.
@@ -414,7 +449,7 @@ func TestAConsentedReleaseDeclaringNothingClearsTheGateway(t *testing.T) {
 	if err := in.gatewayStart(ctx, none); err != nil {
 		t.Fatal(err)
 	}
-	if fileExists(in.tunFile("vpn0")) || !host.did("networkctl reload") || !host.did("iptables-restore -w --noflush") || fileExists(in.forwardRecord()) {
+	if fileExists(in.tunFile("vpn0")) || !host.did("networkctl reload") || !host.did("iptables -w -X STOWAGE-FWD-"+dirDigest(in.O.Dir)) || fileExists(in.forwardRecord()) {
 		t.Errorf("left: ran %v", host.ran)
 	}
 	if st := in.gatewayStatus(none); !strings.HasPrefix(st, "consented (tune --apply): the release declares none") {
@@ -556,7 +591,7 @@ func TestTheForwardingNamesARolesNIC(t *testing.T) {
 	if err := in.forwardRoles(ctx, none); err != nil || strings.Contains(rules, "-A ") || !strings.Contains(strings.Join(*log, ""), "host.interfaces.uplink: no NIC of this host plays it (`--interface uplink=<NIC>` on a re-run names one): the forwarding through it is not applied") {
 		t.Errorf("unmapped: %v %q %q", err, rules, *log)
 	}
-	if st := in.gatewayStatus(none); !strings.Contains(st, "no forwarding through uplink (no NIC named: --interface)") {
+	if st := in.gatewayStatus(none); !strings.HasPrefix(st, "consented (tune --apply), nothing in force: ") || !strings.Contains(st, "no forwarding through uplink (no NIC named: --interface)") {
 		t.Errorf("status %q", st)
 	}
 	// The VM names its NICs by their roles.
@@ -761,5 +796,409 @@ func TestADockerHostWarnsOfASetOnlyTheAppSocketFeeds(t *testing.T) {
 	if strings.Count(got, "set peers") != 1 || !strings.Contains(got, "warning: the set peers of the table inet vpn is fed through the VM's app socket, which a Docker host does not serve: it stays as the table declares it here unless its own rules fill it (services.vpn.sets fills a set from an input)") ||
 		strings.Contains(got, "set allowed") || strings.Contains(got, "inet probe") {
 		t.Errorf("log %q", got)
+	}
+}
+
+// A consented Docker host enforces the L4 routes' allowlists, IPv4's alone, in a chain of the
+// install's that DOCKER-USER jumps to, replaced at each start: each route's published port from its
+// sources, the rest dropped; a list that does not read, or an engine that sends nothing through
+// DOCKER-USER, fails the start with every source dropped; a revert removes the chain.
+func TestAConsentedDockerHostEnforcesTheL4Allowlists(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	in, host, log := gateway(t, 0)
+	in.R.Nftables, in.R.Spec.Host = nil, nil
+	in.R.Spec.L4.Routes = []spec.L4Route{
+		{Name: "db", Protocol: "tcp", Port: 5432, Upstream: "postgres:5432", AllowInput: "DB_SOURCES"},
+		{Name: "feed", Protocol: "udp", Port: 17007, Upstream: "api:17007"},
+	}
+	values := map[string]string{"DB_SOURCES": "10.0.0.0/8, 192.0.2.1 fd00::/8"}
+	get := func(k string) string { return values[k] }
+	if err := in.gatewayStart(ctx, get); err != nil || len(host.ran) != 0 || !strings.Contains(strings.Join(*log, ""), "the source allowlists of the L4 routes db are not in force on this host") {
+		t.Fatalf("not consented: %v, ran %v, log %q", err, host.ran, *log)
+	}
+	if err := in.writeGateway(gatewayRecord{Digest: dirDigest(in.gatewayDir()), Dir: in.gatewayDir()}); err != nil {
+		t.Fatal(err)
+	}
+	if err := in.gatewayStart(ctx, get); err != nil {
+		t.Fatal(err)
+	}
+	if in.allowHolds(get) {
+		t.Error("held before the stack is up")
+	}
+	if err := in.markAllowHeld(); err != nil {
+		t.Fatal(err)
+	}
+	chain := "STOWAGE-ALW-" + dirDigest(in.O.Dir)
+	match := "-A " + chain + " -p tcp -m conntrack --ctstate DNAT --ctdir ORIGINAL --ctorigdstport 5432"
+	rules := func(lines ...string) string {
+		return "*filter\n:" + chain + " - [0:0]\n" + strings.Join(lines, "\n") + "\nCOMMIT\n"
+	}
+	v4 := rules(match+" -s 10.0.0.0/8 -j RETURN", match+" -s 192.0.2.1/32 -j RETURN", match+" -j DROP")
+	if !slices.Equal(host.stdin, []string{v4}) || !host.did("iptables -w -I DOCKER-USER -j "+chain) || host.did("ip6tables -w -I DOCKER-USER -j "+chain) || !host.did("iptables -w -C FORWARD -j DOCKER-USER") {
+		t.Errorf("rules %q, ran %v", host.stdin, host.ran)
+	}
+	if st := in.gatewayStatus(get); st != "applied at each start (tune --apply): source allowlists of db" {
+		t.Errorf("status %q", st)
+	}
+	// Values changed by no start as root (one not as root applies nothing): no longer held.
+	if changed := func(k string) string { return map[string]string{"DB_SOURCES": "192.0.2.0/24"}[k] }; in.allowHolds(changed) || !strings.Contains(in.gatewayStatus(changed), "source allowlists of db not held") {
+		t.Errorf("held for other values: %q", in.gatewayStatus(changed))
+	}
+	// Replaced at each start: a chain flushed meanwhile holds again.
+	host.stdin = nil
+	if err := in.gatewayStart(ctx, get); err != nil || !slices.Equal(host.stdin, []string{v4}) {
+		t.Errorf("again: %v, rules %q", err, host.stdin)
+	}
+	values["DB_SOURCES"], host.stdin = "", nil
+	if err := in.gatewayStart(ctx, get); err != nil || !slices.Equal(host.stdin, []string{rules(match + " -j DROP")}) {
+		t.Errorf("an empty list refuses every source: %v, rules %q", err, host.stdin)
+	}
+	// A recorded list that does not read: every source dropped, the start failed, no record.
+	values["DB_SOURCES"], host.stdin = "10.0.0.0/8 -j ACCEPT", nil
+	if err := in.gatewayStart(ctx, get); err == nil || !strings.Contains(err.Error(), "l4 route db: DB_SOURCES") || !slices.Equal(host.stdin, []string{rules(match + " -j DROP")}) || fileExists(in.allowHeld()) || !strings.Contains(in.gatewayStatus(get), "source allowlists of db not held") {
+		t.Errorf("a list that does not read: %v, rules %q", err, host.stdin)
+	}
+	// An engine that sends nothing through DOCKER-USER holds no list: refused.
+	values["DB_SOURCES"], host.noForward = "10.0.0.0/8", true
+	if err := in.gatewayStart(ctx, get); err == nil || !strings.Contains(err.Error(), "iptables' FORWARD does not jump to DOCKER-USER") || fileExists(in.allowHeld()) {
+		t.Errorf("no FORWARD jump: %v", err)
+	}
+	host.noForward = false
+	// A restore that fails keeps the record, not the applied mark: a release without lists then
+	// removes the chain.
+	host.restoreErr = errors.New("xtables lock")
+	if err := in.gatewayStart(ctx, get); err == nil || !fileExists(in.allowRecord()) || fileExists(appliedMark(in.allowRecord())) {
+		t.Errorf("a failed restore: %v", err)
+	}
+	host.restoreErr, host.ran = nil, nil
+	in.R.Spec.L4.Routes = in.R.Spec.L4.Routes[1:]
+	if err := in.gatewayStart(ctx, get); err != nil || !host.did("iptables -w -X "+chain) || fileExists(in.allowRecord()) {
+		t.Errorf("a release without lists: %v, ran %v", err, host.ran)
+	}
+	in.R.Spec.L4.Routes = []spec.L4Route{{Name: "db", Protocol: "tcp", Port: 5432, Upstream: "postgres:5432", AllowInput: "DB_SOURCES"}}
+	if err := in.gatewayStart(ctx, get); err != nil {
+		t.Fatal(err)
+	}
+	if err := in.dropForward(ctx); err != nil || !host.did("iptables -w -X "+chain) || fileExists(in.allowRecord()) {
+		t.Errorf("revert: %v, ran %v", err, host.ran)
+	}
+}
+
+// At boot, before Docker restores the containers, the tables' unit applies the allowlists from
+// the install's recorded values, into a DOCKER-USER it makes when Docker has not yet: no route is
+// open a moment past its list. Without the consent, nothing; a record that does not read drops
+// every source.
+func TestTheBootAppliesTheL4AllowlistsBeforeDocker(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	in, host, log := gateway(t, 0)
+	in.R.Nftables, in.R.Spec.Host = nil, nil
+	in.R.Spec.L4.Routes = []spec.L4Route{{Name: "db", Protocol: "tcp", Port: 5432, Upstream: "postgres:5432", AllowInput: "DB_SOURCES", BindInput: "DB_BIND"}}
+	env := NewEnvFile()
+	env.Set("DB_SOURCES", "10.0.0.0/8")
+	env.Set("DB_BIND", "192.0.2.7")
+	if err := env.WriteFile(in.path(envName)); err != nil {
+		t.Fatal(err)
+	}
+	if err := in.bootTables(ctx); err != nil || len(host.ran) != 0 {
+		t.Fatalf("not consented: %v, ran %v", err, host.ran)
+	}
+	if err := in.writeGateway(gatewayRecord{Digest: dirDigest(in.gatewayDir()), Dir: in.gatewayDir()}); err != nil {
+		t.Fatal(err)
+	}
+	host.noUser, host.noForward = true, true // before Docker: no DOCKER-USER, no FORWARD jump yet
+	if err := in.bootTables(ctx); err != nil {
+		t.Fatal(err)
+	}
+	chain := "STOWAGE-ALW-" + dirDigest(in.O.Dir)
+	if !host.did("iptables -w -N DOCKER-USER") || !host.did("iptables -w -I DOCKER-USER -j "+chain) || len(host.stdin) != 1 || !strings.Contains(host.stdin[0], "--ctorigdst 192.0.2.7 -s 10.0.0.0/8 -j RETURN") || !fileExists(in.allowRecord()) || fileExists(in.allowHeld()) || host.did("iptables -w -C FORWARD") {
+		t.Errorf("ran %v, rules %q", host.ran, host.stdin)
+	}
+	if !strings.Contains(strings.Join(*log, ""), "applied the L4 routes' source allowlists, before the containers start") {
+		t.Errorf("log %q", *log)
+	}
+	if _, content := in.gatewayTablesUnit(); !strings.Contains(content, "Before=docker.service") {
+		t.Errorf("unit %s", content)
+	}
+	// A record that does not read: every source of the port dropped, on its bind address too
+	// when the record gives none, said.
+	if err := os.Remove(in.path(envName)); err != nil {
+		t.Fatal(err)
+	}
+	host.stdin = nil
+	if err := in.bootTables(ctx); err == nil || !strings.Contains(err.Error(), "the L4 routes' source allowlists at boot") || len(host.stdin) != 1 || strings.Contains(host.stdin[0], "RETURN") || fileExists(in.allowHeld()) {
+		t.Errorf("unread: %v, rules %q", err, host.stdin)
+	}
+}
+
+// A route bound to one address matches that address alone (another install's port on another
+// address is not its own), and keeps it when its list does not read; one bound to an IPv6
+// address is refused: a Docker host holds the list for IPv4 alone.
+func TestABoundAllowlistMatchesItsAddress(t *testing.T) {
+	t.Parallel()
+	routes := []spec.L4Route{{Name: "db", Protocol: "udp", Port: 5353, Upstream: "dns:53", AllowInput: "SRC", BindInput: "BIND"}}
+	vals := map[string]string{"SRC": "10.0.0.0/8, fd00::/8", "BIND": "192.0.2.5"}
+	get := func(k string) string { return vals[k] }
+	rules, err := allowRules(routes, "C", get)
+	if err != nil || len(rules) != 1 || !strings.Contains(string(rules["iptables"]), "--ctorigdstport 5353 --ctorigdst 192.0.2.5 -s 10.0.0.0/8 -j RETURN\n") || strings.Contains(string(rules["iptables"]), "fd00") {
+		t.Errorf("%v %q", err, rules)
+	}
+	in, host, _ := gateway(t, 0)
+	in.R.Spec.L4.Routes = routes
+	vals["SRC"] = "x"
+	if err := in.allowSources(context.Background(), get, false); err == nil || len(host.stdin) != 1 || !strings.Contains(host.stdin[0], "--ctorigdstport 5353 -j DROP\n") {
+		t.Errorf("closed on every address: %v %q", err, host.stdin)
+	}
+	vals["SRC"], vals["BIND"] = "10.0.0.0/8", "2001:db8::5"
+	host.stdin = nil
+	if err := in.allowSources(context.Background(), get, false); err == nil || !strings.Contains(err.Error(), "l4 route db: BIND=2001:db8::5 is an IPv6 address, and a Docker host holds SRC for IPv4 alone") ||
+		len(host.stdin) != 1 || strings.Contains(host.stdin[0], "2001:db8") || !strings.Contains(host.stdin[0], "--ctorigdstport 5353 -j DROP\n") {
+		t.Errorf("IPv6 bind, closed on every address: %v %q", err, host.stdin)
+	}
+	// A route to a service on the host's network is no list's: Docker translates no port to it.
+	in.R.Spec.Services = map[string]spec.Service{"dns": {HostNetwork: true}}
+	if got := in.allowRoutes(); got != nil {
+		t.Errorf("a host-network upstream's: %v", got)
+	}
+}
+
+// A consented Docker host publishes an allowlisted route on IPv4 alone, whatever the stack's
+// IPv6: Docker's userland proxy may carry its IPv6 clients past DOCKER-USER. Not consented, or a
+// bind address given, as before.
+func TestAnAllowlistedRouteIsIPv4s(t *testing.T) {
+	t.Parallel()
+	in, _, _ := gateway(t, 0)
+	routes := []spec.L4Route{{Name: "db", Protocol: "tcp", Port: 5432, Upstream: "postgres:5432", AllowInput: "DB_SOURCES"}, {Name: "feed", Protocol: "udp", Port: 17007, Upstream: "api:17007"}}
+	in.R.Spec.L4.Routes = routes
+	if got := in.allowV4Only(); got != nil {
+		t.Errorf("not consented: %v", got)
+	}
+	if err := in.writeGateway(gatewayRecord{Digest: dirDigest(in.gatewayDir()), Dir: in.gatewayDir()}); err != nil {
+		t.Fatal(err)
+	}
+	if got := in.allowV4Only(); !slices.Equal(got, []string{"db"}) {
+		t.Errorf("consented: %v", got)
+	}
+	fc, err := frontCompose(in.R.Spec.Front, routes, func(string) string { return "" }, Loopback, hostAPI{}, "sha256:x", "", false, true, nil, []string{"db"})
+	if err != nil || !strings.Contains(string(fc), "host_ip: 0.0.0.0\n") || strings.Count(string(fc), "host_ip") != 1 {
+		t.Errorf("%v\n%s", err, fc)
+	}
+}
+
+// A revert of a consent whose allowlisted routes it published on IPv4 alone says the next start
+// publishes them on every address; it never starts the stack itself.
+func TestARevertNamesTheStartThatPublishesEverywhere(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	for _, allow := range []string{"DB_SOURCES", ""} {
+		in, _, log := gateway(t, 0)
+		in.R.Nftables, in.R.Spec.Host = nil, nil
+		in.R.Spec.L4.Routes = []spec.L4Route{{Name: "db", Protocol: "tcp", Port: 5432, Upstream: "postgres:5432", AllowInput: allow}}
+		if err := NewEnvFile().WriteFile(in.path(envName)); err != nil {
+			t.Fatal(err)
+		}
+		if err := in.writeGateway(gatewayRecord{Digest: dirDigest(in.gatewayDir()), Dir: in.gatewayDir()}); err != nil {
+			t.Fatal(err)
+		}
+		in.O.Exec = func(context.Context, string, []string) error { t.Error("a revert started the stack"); return nil }
+		err := in.lockedRevert(ctx)
+		noted := strings.Contains(strings.Join(*log, ""), "note: the L4 routes db are open to every source now, and stay published on IPv4 alone until the next start, which publishes them on every address: `"+in.ctl()+" --dir "+in.gatewayDir()+" --no-input --no-provision`")
+		if err != nil || in.gatewayRecorded() || (allow != "") != noted {
+			t.Errorf("allow %q: %v, log %q", allow, err, *log)
+		}
+	}
+}
+
+// status says the forwarding is applied only while its applied mark is the rules the release and
+// the devices give now, and not applied while a chain is recorded without it.
+func TestStatusSaysWhetherTheForwardingIsApplied(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	in, _, _ := gateway(t, 0)
+	in.R.Nftables = nil
+	if err := in.writeGateway(gatewayRecord{Digest: dirDigest(in.gatewayDir()), Dir: in.gatewayDir()}); err != nil {
+		t.Fatal(err)
+	}
+	if err := in.gatewayStart(ctx, none); err != nil {
+		t.Fatal(err)
+	}
+	if st := in.gatewayStatus(none); !strings.Contains(st, "forwarding;") || strings.Contains(st, "not applied") {
+		t.Errorf("applied: %q", st)
+	}
+	in.O.Interfaces = map[string]string{"uplink": "eth1"} // another NIC named, no start as root since
+	if st := in.gatewayStatus(none); !strings.Contains(st, "forwarding not applied (no start as root applied it since this release or these devices") {
+		t.Errorf("another NIC: %q", st)
+	}
+}
+
+// A consented Docker host refuses an IPv6 bind address for an allowlisted route as it is given,
+// and refuses to consent while one is recorded: the list holds for IPv4 alone.
+func TestAnIPv6BindOfAnAllowlistedRouteIsRefusedEarly(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	in, _, _ := gateway(t, 0)
+	in.R.Nftables, in.R.Spec.Host = nil, nil
+	in.R.Spec.Inputs = append(in.R.Spec.Inputs, spec.Input{Key: "SRC"}, spec.Input{Key: "BIND"})
+	in.R.Spec.L4.Routes = []spec.L4Route{{Name: "db", Protocol: "tcp", Port: 5432, Upstream: "postgres:5432", AllowInput: "SRC", BindInput: "BIND"}}
+	env := NewEnvFile()
+	env.Set("BIND", "2001:db8::5")
+	if err := env.WriteFile(in.path(envName)); err != nil {
+		t.Fatal(err)
+	}
+	if err := in.consent(ctx); err == nil || !strings.Contains(err.Error(), "BIND=2001:db8::5 is an IPv6 address") || in.gatewayRecorded() {
+		t.Errorf("consent: %v", err)
+	}
+	// A record that does not read could hide one: refused too.
+	raw, _ := os.ReadFile(in.path(envName))
+	if err := os.WriteFile(in.path(envName), []byte("not a record\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := in.consent(ctx); err == nil || !strings.Contains(err.Error(), "the install's record") || in.gatewayRecorded() {
+		t.Errorf("consent on a record that does not read: %v", err)
+	}
+	if err := os.WriteFile(in.path(envName), raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	check := func() func(string) error {
+		for _, i := range in.inputList(Loopback) {
+			if i.Key == "BIND" {
+				return i.check
+			}
+		}
+		return nil
+	}
+	if c := check(); c != nil && c("2001:db8::5") != nil {
+		t.Error("refused before the consent")
+	}
+	if err := in.writeGateway(gatewayRecord{Digest: dirDigest(in.gatewayDir()), Dir: in.gatewayDir()}); err != nil {
+		t.Fatal(err)
+	}
+	if err := check()("2001:db8::5"); err == nil || !strings.Contains(err.Error(), "holds the route's allowlist for IPv4 alone") {
+		t.Errorf("given after the consent: %v", err)
+	}
+	for _, v := range []string{"192.0.2.5", "::"} { // :: is every address
+		if err := check()(v); err != nil {
+			t.Errorf("%s: %v", v, err)
+		}
+	}
+}
+
+// DOCKER-USER is made at boot alone, before Docker: a start after it finding none is an engine
+// that keeps none, whose chain nothing would reach: an error, nothing said to be applied.
+func TestAStartWithoutDockerUserFails(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	in, host, _ := gateway(t, 0)
+	in.R.Nftables = nil
+	if err := in.writeGateway(gatewayRecord{Digest: dirDigest(in.gatewayDir()), Dir: in.gatewayDir()}); err != nil {
+		t.Fatal(err)
+	}
+	host.noUser = true
+	if err := in.gatewayStart(ctx, none); err == nil || !strings.Contains(err.Error(), "the forwarding between the host's interfaces (iptables's DOCKER-USER)") || host.did("iptables -w -N") || in.forwardApplied(none) {
+		t.Errorf("%v, ran %v", err, host.ran)
+	}
+}
+
+// An engine that sends nothing through DOCKER-USER (its FORWARD does not jump to it, as with a
+// DOCKER-USER a boot made) holds neither chain: each says so, naming the fix, and nothing is marked
+// applied; with nothing in force, status says so.
+func TestAnEngineWithoutDockerUserHoldsNoChain(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	in, host, _ := gateway(t, 0)
+	in.R.Nftables = nil
+	in.R.Spec.Host.Interfaces = map[string]spec.HostInterface{"uplink": {Primary: true}, "lan": {Forward: []string{"uplink"}}}
+	in.O.Interfaces = map[string]string{"uplink": "eth0", "lan": "eth1"}
+	in.R.Spec.L4.Routes = []spec.L4Route{{Name: "db", Protocol: "tcp", Port: 5432, Upstream: "postgres:5432", AllowInput: "SRC"}}
+	if err := in.writeGateway(gatewayRecord{Digest: dirDigest(in.gatewayDir()), Dir: in.gatewayDir()}); err != nil {
+		t.Fatal(err)
+	}
+	host.noForward = true
+	err := in.gatewayStart(ctx, none)
+	for _, want := range []string{"the forwarding between the host's interfaces cannot hold: iptables' FORWARD does not jump to DOCKER-USER (Bad rule: no such jump)", "the L4 routes' source allowlists cannot hold", "`notes-stow tune --revert`"} {
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("no %q in %v", want, err)
+		}
+	}
+	if in.forwardApplied(none) || in.allowHolds(none) || len(host.stdin) != 0 {
+		t.Errorf("applied: rules %q", host.stdin)
+	}
+	if st := in.gatewayStatus(none); !strings.HasPrefix(st, "consented (tune --apply), nothing in force: forwarding not applied") || !strings.Contains(st, "source allowlists of db not held") {
+		t.Errorf("status %q", st)
+	}
+}
+
+// A start's marks say what holds now: a forwarding marked applied by an earlier start is no longer
+// once the engine sends nothing through DOCKER-USER.
+func TestAnEarlierForwardingMarkGoesWithTheEngine(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	in, host, _ := gateway(t, 0)
+	in.R.Nftables = nil
+	if err := in.writeGateway(gatewayRecord{Digest: dirDigest(in.gatewayDir()), Dir: in.gatewayDir()}); err != nil {
+		t.Fatal(err)
+	}
+	if err := in.gatewayStart(ctx, none); err != nil || !in.forwardApplied(none) {
+		t.Fatalf("%v, applied %v", err, in.forwardApplied(none))
+	}
+	host.noForward = true
+	if err := in.gatewayStart(ctx, none); err == nil || in.forwardApplied(none) {
+		t.Errorf("%v, applied %v", err, in.forwardApplied(none))
+	}
+}
+
+// A consented start as root, whole: the route published on IPv4 alone in the front's file, its
+// list marked held once the stack is up, and said so at the end.
+func TestAConsentedStartPublishesAndHoldsTheList(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	e.r.Spec.Inputs = append(e.r.Spec.Inputs, spec.Input{Key: "SRC", Default: "10.0.0.0/8"})
+	e.r.Spec.L4.Routes = []spec.L4Route{{Name: "data", Protocol: "tcp", Port: 7443, Upstream: "web:7443", AllowInput: "SRC"}}
+	host := &gwHost{tables: map[string]bool{}, jumps: map[string]int{}, chain: map[string]bool{}}
+	run := t.TempDir()
+	opts := func(o *Options) {
+		o.Host, o.GatewayRun, o.Euid, o.Systemd = host, run, func() int { return 0 }, t.TempDir()
+	}
+	if err := e.install(opts); err != nil {
+		t.Fatal(err)
+	}
+	in := e.installer(opts)
+	if fc, _ := os.ReadFile(in.path(FrontCompose)); strings.Contains(string(fc), "host_ip") {
+		t.Errorf("not consented, on IPv4 alone:\n%s", fc)
+	}
+	if err := in.writeGateway(gatewayRecord{Digest: dirDigest(in.gatewayDir()), Dir: in.gatewayDir()}); err != nil {
+		t.Fatal(err)
+	}
+	// A stack that does not come up holds no list: its old publication may still run.
+	e.docker.upErr = errors.New("unhealthy")
+	if err := e.install(opts); err == nil || fileExists(in.allowHeld()) || !strings.Contains(in.gatewayStatus(func(k string) string { return map[string]string{"SRC": "10.0.0.0/8"}[k] }), "source allowlists of data not held") {
+		t.Errorf("up failed: %v, held %v", err, fileExists(in.allowHeld()))
+	}
+	e.docker.upErr = nil
+	e.log.Reset()
+	if err := e.install(opts); err != nil {
+		t.Fatal(err)
+	}
+	if fc, _ := os.ReadFile(in.path(FrontCompose)); !strings.Contains(string(fc), "host_ip: 0.0.0.0") {
+		t.Errorf("consented, not on IPv4 alone:\n%s", fc)
+	}
+	if !fileExists(in.allowHeld()) || !strings.Contains(e.log.String(), "L4 route data: tcp/7443 on IPv4's every address, from the IPv4 sources SRC holds") {
+		t.Errorf("held %v, log:\n%s", fileExists(in.allowHeld()), e.log.String())
+	}
+}
+
+// Networkd files not yet seen loaded are not in force: alone, status says nothing is.
+func TestPendingNetworkdFilesAreNotInForce(t *testing.T) {
+	t.Parallel()
+	in, _, _ := gateway(t, 0)
+	in.R.Nftables = nil
+	in.R.Spec.Host.Interfaces = map[string]spec.HostInterface{"vpn0": {Kind: spec.InterfaceTUN}}
+	file := in.tunFile("vpn0")
+	if err := in.writeGateway(gatewayRecord{Digest: dirDigest(in.gatewayDir()), Dir: in.gatewayDir(), Networkd: map[string]networkdFile{file: {Role: "vpn0", Pending: true}}}); err != nil {
+		t.Fatal(err)
+	}
+	if st := in.gatewayStatus(none); !strings.HasPrefix(st, "consented (tune --apply), nothing in force: 1 networkd file(s) pending") {
+		t.Errorf("status %q", st)
 	}
 }

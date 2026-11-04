@@ -3,6 +3,37 @@
 Stowage's own releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
+## [0.28.0]
+
+### Added
+- An L4 route's `allow_input` is enforced on a Docker host too, once its operator consents with
+  `tune --apply`: each start as root lets the input's sources reach the route's published port
+  and drops every other, from boot on, before Docker restores the containers; such a route is
+  then published on IPv4 alone, and an engine with its iptables off is refused, as nothing would
+  hold the list. Until then, the install's end and `status` say the route is open to whoever
+  reaches the host. Its input is now asked on the `docker` and `kairos`
+  shapes the project has (`shapes: [docker, kairos]`).
+- A `tun` interface role can name the device its service opens (`host.interfaces.<role>.device`),
+  such as one with a `-` in its name, which no role name may hold: networkd's file, the firewall's
+  rules, the forwarding and `tune` then use that device.
+- `vm create --add-host NAME=IP` (repeatable) gives the VM host records: written into its
+  `/etc/hosts` at every boot, given to the stack's containers, and shown by `network`.
+- `exec --stdin` (`-i`) on the Docker shape, as on the VM.
+- A consented Docker host whose firewall was reloaded or flushed gets its forwarding again at the
+  next start, which now replaces the chain each time; an engine that sends nothing through
+  `DOCKER-USER` fails the start, naming the fix.
+
+### Changed
+- On the Docker shape, `exec` without a terminal reads its standard input only with `--stdin`,
+  as on the VM: one command line drives either shape. Input it drops is warned.
+- `lint` refuses an L4 allowlist input asked on the `kairos` shape alone when the project has a
+  `docker` shape (ask it on both), and warns of an allowlisted route to a service on the host's
+  network on Docker, where nothing translates its port.
+
+### Fixed
+- An interrupted `ship --disks` no longer leaves its disk-building container running: it is
+  removed before the work directory.
+
 ## [0.27.1] - 2026-11-04
 
 ### Fixed

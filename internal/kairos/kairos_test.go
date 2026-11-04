@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/go-containerregistry/pkg/authn"
 
@@ -1166,5 +1167,67 @@ func TestInterfacesAreTheImagesNetworkdFiles(t *testing.T) {
 	p.Interfaces = map[string]spec.HostInterface{"Edge": {Reason: "r"}}
 	if _, err := Dockerfile(p); err == nil {
 		t.Error("rendered a role that is no interface's name")
+	}
+	// A tun role naming its device matches that device.
+	p.Interfaces = map[string]spec.HostInterface{"vpn0": {Kind: spec.InterfaceTUN, Device: "ovl-0-0", Reason: "r"}}
+	if f := string(interfaceFiles(p)["usr/lib/systemd/network/10-notes-vpn0.network"]); !strings.Contains(f, "[Match]\nName=ovl-0-0\n") {
+		t.Errorf("the tun's file:\n%s", f)
+	}
+	p.Interfaces = map[string]spec.HostInterface{"vpn0": {Kind: spec.InterfaceTUN, Device: "a\nb", Reason: "r"}}
+	if _, err := Dockerfile(p); err == nil {
+		t.Error("rendered a device that is no device's name")
+	}
+}
+
+// A cancelled build removes the container its docker run started, which the killed CLI leaves
+// running, before it returns; a container already gone is no error.
+func TestACancelledBuildRemovesItsContainer(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	log := filepath.Join(dir, "log")
+	fake := filepath.Join(dir, "docker")
+	body := "#!/bin/sh\necho \"$*\" >> " + log + "\ncase $1 in run) exec sleep 30 ;; rm) [ ! -e " + dir + "/gone ] || { echo 'Error: No such container' >&2; exit 1; } ;; esac\n"
+	if err := os.WriteFile(fake, []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	b := &DiskBuilder{Docker: fake}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- b.docker(ctx, "run", "--rm", "img") }()
+	for {
+		if raw, _ := os.ReadFile(log); len(raw) > 0 {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	cancel()
+	if err := <-done; err == nil {
+		t.Fatal("a cancelled run succeeded")
+	}
+	raw, _ := os.ReadFile(log)
+	lines := strings.Split(strings.TrimSpace(string(raw)), "\n")
+	name := strings.Fields(lines[0])[2]
+	if len(lines) != 2 || !strings.HasPrefix(lines[0], "run --name "+containerPrefix+"-") || lines[1] != "rm --force "+name {
+		t.Errorf("ran %q", lines)
+	}
+	// A container the daemon never made is no error of the removal's.
+	if err := os.WriteFile(filepath.Join(dir, "gone"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel = context.WithCancel(context.Background())
+	cancel()
+	if err := b.docker(ctx, "run", "img"); err == nil || strings.Contains(err.Error(), "may still run") {
+		t.Errorf("a container never made: %v", err)
+	}
+	// A run that ends on its own removes nothing.
+	ok := filepath.Join(dir, "ok")
+	if err := os.WriteFile(ok, []byte("#!/bin/sh\necho \"$*\" >> "+log+".ok\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := (&DiskBuilder{Docker: ok}).docker(context.Background(), "run", "--rm", "img"); err != nil {
+		t.Fatal(err)
+	}
+	if raw, _ := os.ReadFile(log + ".ok"); strings.Count(string(raw), "\n") != 1 {
+		t.Errorf("ran %q", raw)
 	}
 }

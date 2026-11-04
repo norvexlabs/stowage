@@ -283,7 +283,7 @@ func InterfaceNetwork(name, role string, i spec.HostInterface) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "# %s's interface %s (host.interfaces): %s\n", name, role, i.Reason)
 	if i.Kind == spec.InterfaceTUN {
-		fmt.Fprintf(&b, "[Match]\nName=%s\n\n[Network]\nLinkLocalAddressing=no\nIPv6AcceptRA=no\nKeepConfiguration=yes\nConfigureWithoutCarrier=yes\n\n[Link]\nRequiredForOnline=no\n", role)
+		fmt.Fprintf(&b, "[Match]\nName=%s\n\n[Network]\nLinkLocalAddressing=no\nIPv6AcceptRA=no\nKeepConfiguration=yes\nConfigureWithoutCarrier=yes\n\n[Link]\nRequiredForOnline=no\n", i.DeviceName(role))
 		if i.MTU != 0 {
 			fmt.Fprintf(&b, "MTUBytes=%d\n", i.MTU)
 		}
@@ -335,7 +335,7 @@ func (p Params) check() error {
 		}
 	}
 	for role, i := range p.Interfaces {
-		valid := spec.InterfaceName.MatchString(role) && !strings.ContainsFunc(i.Reason, unicode.IsControl)
+		valid := spec.InterfaceName.MatchString(role) && !strings.ContainsFunc(i.Reason, unicode.IsControl) && (i.Device == "" || spec.ValidTunDevice(i.Device))
 		for _, entries := range [][]map[string]string{i.RoutingPolicyRules, i.Routes} {
 			for _, e := range entries {
 				for key, v := range e {

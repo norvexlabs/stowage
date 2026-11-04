@@ -1968,6 +1968,17 @@ func TestAFirewallRuleNamesARolesDevice(t *testing.T) {
 	if strings.Contains(got, "uplink") {
 		t.Errorf("a role named:\n%s", got)
 	}
+	// A tun role naming its device: that device, on a host Stowage owns too, where it is read.
+	i = Interface{Role: "vpn0", Kind: "tun", Device: "ovl-0-0", Forward: []string{"uplink"}, Transparent: true}
+	if got := strings.Join(i.Firewall("FORWARD"), "\n"); !strings.Contains(got, "-i ovl-0-0 -o uplink") || strings.Contains(got, "vpn0") || i.AsDevice() != " as ovl-0-0" {
+		t.Errorf("the device's rules:\n%s", got)
+	}
+	s, _ := fakeHost(t, "1500")
+	s.Owned, s.Interfaces = true, []Interface{i}
+	write(t, s.Root, "sys/class/net/ovl-0-0/mtu", "1400\n")
+	if it := find(s.Inspect(context.Background(), host(4096, 2)), "interface", "vpn0"); it == nil || it.State != OK {
+		t.Errorf("the device present: %+v", it)
+	}
 }
 
 // Consented, the forwarding is the starts' to apply: reported so, never advised again; the
