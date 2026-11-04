@@ -3,6 +3,15 @@
 Stowage's own releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
+## [0.27.1]
+
+### Fixed
+- `vm create --platform libvirt --cpus 1` no longer fails its apply (`Provider produced
+  inconsistent result after apply … driver.queues`): with one vCPU the NIC sets no queue count.
+- The Kairos VM's `/etc/resolv.conf` was an empty file, so the host and a service on the host's
+  network resolved no name; it is now a link to systemd-resolved's list of the DNS servers,
+  made at every boot.
+
 ## [0.27.0] - 2026-11-03
 
 ### Fixed

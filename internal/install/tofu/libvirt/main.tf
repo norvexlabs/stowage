@@ -102,8 +102,10 @@ resource "libvirt_domain" "vm" {
     interfaces = [for i, n in(length(var.nics) > 0 ? var.nics : [{ role = "", mac = "", attach = "" }]) : {
       model = { type = "virtio" }
       # A queue per vCPU, each on its own CPU in the guest, and the largest receive ring virtio
-      # offers: the guest's tuning grows its ring to it.
-      driver = { queues = var.cpus, rx_queue_size = 1024 }
+      # offers: the guest's tuning grows its ring to it. One vCPU sets no queues: one is libvirt's
+      # default, which it leaves out of the domain, and the provider fails an apply that reads back
+      # a value it set as null.
+      driver = { queues = var.cpus > 1 ? var.cpus : null, rx_queue_size = 1024 }
       mac    = n.mac != "" ? { address = n.mac } : null
       source = {
         network = { network = n.attach != "" ? n.attach : var.network }

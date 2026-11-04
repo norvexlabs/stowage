@@ -1242,8 +1242,10 @@ These are what `lint` checks; each finding names the key path or `file:line` to 
   purged one a declared package depends on (the initrd lacks both). The build fails, after the
   purges, when a purged package is still installed (but those declared), and at its last step when a declared package, or one of the
   bundle's own (`containerd.io`, `docker-ce`, `docker-compose-plugin`, `dracut`,
-  `linux-image-generic`, `nftables`, `openssh-server`, `systemd`, `systemd-sysv`), is not
-  installed, or one of the masked timers below is not masked. On top of it:
+  `linux-image-generic`, `nftables`, `openssh-server`, `systemd`, `systemd-resolved`,
+  `systemd-sysv`), is not
+  installed, or one of the masked timers below is not masked, or when the tmpfiles rules of
+  `/etc/resolv.conf` are not the bundle's alone or systemd-resolved is not enabled. On top of it:
   - Docker CE and its compose plugin from Docker's apt repository (unpinned: the version of the
     day of the build), the containerd image store on, data under `/usr/local/docker` (the
     persistent partition), started after `nftables`;
@@ -3728,7 +3730,9 @@ in the same installer (bootstrap it as above, then `sh <name>.sh vm create …`,
   account of the OS such as `www-data` or `nobody`; the base's own user, `ubuntu`, may be taken), the administrator's SSH
   public key file (default `~/.ssh/id_ed25519.pub`, `id_ecdsa.pub` or `id_rsa.pub`; one key of
   a type OpenSSH takes), and its network: DHCP, or a static `--address` with its prefix, an
-  optional `--gateway` and `--dns` servers; IPv6, off unless `--ipv6` (off, the VM's link has no
+  optional `--gateway` and `--dns` servers (systemd-resolved's; the VM's `/etc/resolv.conf` is
+  a link, made at every boot, to resolved's list of them, not its stub, so the host and a container
+  on the host's network resolve through them — a container through those of its creation); IPv6, off unless `--ipv6` (off, the VM's link has no
   IPv6 at all); with it, in either mode, router advertisements and DHCPv6 address the VM, and an
   optional static IPv6 `--address6` with its prefix and its `--gateway6` (asked with the static
   mode's questions when `--ipv6` is given, empty by default) sit beside them; `--address6` or
@@ -3852,7 +3856,7 @@ in the same installer (bootstrap it as above, then `sh <name>.sh vm create …`,
   | `--platform` | provider | what the module makes | the module's own variables (`--tofu-var`, or asked) |
   |---|---|---|---|
   | `truenas` | `pjsalty/truenas` 3.1.0 | below | its flags: `--pool`, `--dataset`, `--bridge` |
-  | `libvirt` (preview) | `dmacvicar/libvirt` 0.9.9 | the image uploaded as a volume, a copy-on-write qcow2 volume over it grown to `disk_gib` (the app's `--disk` and Kairos's share); the seed as a second, read-only volume; both given to the domain by their paths (file disks, which the AppArmor security driver writes into the domain's profile with the image behind the disk); a KVM domain with libvirt's UEFI firmware (Secure Boot off, ACPI and the APIC on) on `network`, its virtio NIC with a queue per vCPU and a receive ring of 1024, its DHCP lease of an IPv4 address the address (waited for, up to 5 minutes, only with DHCP) | `uri` (default `qemu:///system`), `pool` (`default`), `network` (`default`), `domain_type` (`kvm`, or `qemu` for a host without KVM: emulated, much slower, its CPU mode then `maximum`; any other value refused by the module) |
+  | `libvirt` (preview) | `dmacvicar/libvirt` 0.9.9 | the image uploaded as a volume, a copy-on-write qcow2 volume over it grown to `disk_gib` (the app's `--disk` and Kairos's share); the seed as a second, read-only volume; both given to the domain by their paths (file disks, which the AppArmor security driver writes into the domain's profile with the image behind the disk); a KVM domain with libvirt's UEFI firmware (Secure Boot off, ACPI and the APIC on) on `network`, its virtio NIC with a queue per vCPU (none set with one vCPU: one is libvirt's default) and a receive ring of 1024, its DHCP lease of an IPv4 address the address (waited for, up to 5 minutes, only with DHCP) | `uri` (default `qemu:///system`), `pool` (`default`), `network` (`default`), `domain_type` (`kvm`, or `qemu` for a host without KVM: emulated, much slower, its CPU mode then `maximum`; any other value refused by the module) |
   | `proxmox` (preview) | `bpg/proxmox` 0.117.0 | the image uploaded to a datastore with *Import* content (not enabled by default: Datacenter > Storage), the seed to one with *ISO* content, both through the API (the token alone, no SSH to the node); an OVMF VM importing the image, grown to `disk_gib` (the app's `--disk` and Kairos's share), the seed on its CD-ROM, a virtio NIC with a queue per vCPU (at most 64); no address (no guest agent) | `node` (required), `datastore` (`local-lvm`), `import_datastore` (`local`), `iso_datastore` (`local`), `bridge` (`vmbr0`) |
   | `vmware` (preview) | `vmware/vsphere` 2.17.1 | the OVA deployed, its disk grown to `disk_gib` (the app's `--disk` and Kairos's share), the seed uploaded to the datastore on its CD-ROM; its address when VMware tools report one | `datacenter`, `cluster`, `datastore`, `host` (required), `network` (`VM Network`), `folder` |
   | `aws` (preview) | `hashicorp/aws` 6.69.1 | the raw image uploaded to S3, imported as a snapshot (the `vmimport` role), registered as a UEFI image, an instance launched from it with the cloud-config as its user data (IMDSv2); its public address, else its private one | `region`, `bucket`, `subnet_id` (required), `security_group_ids` (comma-separated), `instance_type` (`t3.medium`), `vmimport_role` (`vmimport`) |

@@ -189,6 +189,17 @@ tuned=$(on_vm sudo docker ps -q --filter label=com.docker.compose.service=api)
 on_vm sudo docker inspect --format "'{{range .HostConfig.Ulimits}}{{.Name}} {{.Soft}} {{.Hard}}{{println}}{{end}}'" "$tuned" | grep -qE '^nofile 65536 [0-9]{6,}$' || fail "the api container is not given the VM's open files"
 on_vm sudo docker inspect --format "'{{json .HostConfig.LogConfig}}'" "$tuned" | grep -q '"max-size":"20m"' || fail "the api container's logs do not rotate on the default profile"
 
+# The resolver file is the link to resolved's list of the lease's servers, at every boot, and a
+# container on the host's network reads them (Docker copies the host's file into it).
+resolv_ok() {
+	[[ $(on_vm readlink /etc/resolv.conf) == ../run/systemd/resolve/resolv.conf ]] || { on_vm ls -l /etc/resolv.conf; fail "/etc/resolv.conf is not the link to resolved's servers ($1)"; }
+	on_vm grep -q "'^nameserver '" /etc/resolv.conf || { on_vm resolvectl dns; fail "/etc/resolv.conf lists no server ($1)"; }
+	local img
+	img=$(on_vm sudo docker inspect --format "'{{.Config.Image}}'" "$(on_vm sudo docker ps -q --filter label=com.docker.compose.service=api)")
+	on_vm sudo docker run --rm --network host --entrypoint cat "$img" /etc/resolv.conf | grep -q '^nameserver ' || fail "a container on the host's network lists no DNS server ($1)"
+}
+resolv_ok "first boot"
+
 step "the operator raises the VM to the network profile: a re-run tunes it at once, and the containers with it"
 on_vm sudo notes-stow install --no-input --tune-profile network >"$WORK/retune.txt" 2>&1 || { cat "$WORK/retune.txt"; fail "the re-run with --tune-profile network"; }
 grep -q 'tuning: the network profile, the operator' "$WORK/retune.txt" && grep -q 'tuned by the network profile' "$WORK/retune.txt" || { cat "$WORK/retune.txt"; fail "the re-run did not tune the VM"; }
@@ -414,6 +425,8 @@ back_on 1.0.0 passive "after rollback" "$boot"
 healthy_postgres "after rollback"
 if on_vm sudo notes-stow rollback --yes >"$WORK/rollback2.txt" 2>&1; then fail "a rollback from the passive system ran"; fi
 grep -q 'runs the passive system already' "$WORK/rollback2.txt" || { cat "$WORK/rollback2.txt"; fail "the refusal does not say why"; }
+
+resolv_ok "after the rollback's reboot"
 
 step "ship 1.0.2, which never becomes ready: its health gate fails, and Kairos falls back to the passive system"
 release 1.0.2 false

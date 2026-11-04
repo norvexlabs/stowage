@@ -743,7 +743,7 @@ func TestThePurgeKeepsTheProjectsPackages(t *testing.T) {
 	for _, want := range []string{
 		"printf '%s\\n' fail2ban nfs-common tcpdump | grep -vxF -f \"$t/installed\"", "apt-get install -y --no-install-recommends --no-remove $want;",
 		"held=\"$(grep -E '" + heldPackages + "' \"$t/installed\" | grep -vxF -f \"$t/held\" || true)\"", "[ -z \"$new\" ] || { echo \"host.packages bring packages of the boot's own: $new\"",
-		"for p in containerd.io docker-ce docker-compose-plugin dracut linux-image-generic nftables openssh-server systemd systemd-sysv; do",
+		"for p in containerd.io docker-ce docker-compose-plugin dracut linux-image-generic nftables openssh-server systemd systemd-resolved systemd-sysv; do",
 		"dpkg-query -W -f='${db:Status-Abbrev}' tcpdump 2>/dev/null | grep -q '^ii' || { echo \"host.packages.tcpdump: not installed\"",
 		" nbd-client open-iscsi ", "for u in apt-daily.timer apt-daily-upgrade.timer motd-news.timer; do ln -sf /dev/null",
 	} {

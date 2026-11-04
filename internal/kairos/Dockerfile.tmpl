@@ -242,6 +242,14 @@ RUN set -e; if [ ! -e /etc/default/locale ]; then \
         printf 'LANG=C.UTF-8\n' > "$t"; fi; \
     grep -q '^LANG=' /etc/default/locale
 
+# The host's resolver file is resolved's list of servers, linked at every boot by the bundle's
+# tmpfiles rule (files/etc/tmpfiles.d), which replaces resolved's own. The build fails when
+# systemd-tmpfiles does not read it in place of resolved's, or resolved is not enabled to write that
+# list.
+RUN set -e; c="$(systemd-tmpfiles --cat-config | grep -E '^[^#]*[[:space:]]/etc/resolv\.conf([[:space:]]|$)' || true)"; \
+    [ "$c" = 'L+ /etc/resolv.conf - - - - ../run/systemd/resolve/resolv.conf' ] || { printf 'the tmpfiles rules of /etc/resolv.conf are not the bundle'"'"'s alone:\n%s\n' "$c" >&2; exit 1; }; \
+    [ "$(systemctl is-enabled systemd-resolved.service)" = enabled ] || { echo "systemd-resolved is not enabled: /etc/resolv.conf would link to nothing" >&2; exit 1; }
+
 # Kairos's boot assessment, with the health gate as its judge: the bundle's copy of 08_grub.yaml
 # leaves out the step that marks every boot of the active system good (files/usr/share/NAME). The
 # build fails when kairos-init's file is no longer the one that copy is derived from, naming the

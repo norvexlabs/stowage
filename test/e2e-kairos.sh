@@ -357,7 +357,7 @@ URI="qemu:///system?socket=$LV/run/libvirt-sock"
 # No KVM, so the guest boots too slowly to answer: the wait gives up, and the state is kept.
 ! "${OPERATOR[@]}" XDG_STATE_HOME="$LV/state" "$WORK/notes-stow-stable" vm create --no-input --platform libvirt --create opentofu \
 	--hostname notes-lv --user ops --ssh-key "$WORK/key.pub" --tls internal --domains app=app.notes.test,api=api.notes.test --set ADMIN_EMAIL=admin@notes.test \
-	--network static --address 192.168.122.10/24 --gateway 192.168.122.1 --dns 192.168.122.1 --cpus 2 --memory 2048 --disk 4 \
+	--network static --address 192.168.122.10/24 --gateway 192.168.122.1 --dns 192.168.122.1 --cpus 1 --memory 2048 --disk 4 \
 	--tofu-var "uri=$URI" --tofu-var domain_type=qemu --wait 30s >"$LV/create.txt" 2>"$LV/create.log" || { cat "$LV/create.log"; fail "vm create answered without KVM"; }
 grep -q 'OpenTofu created the VM notes-lv' "$LV/create.log" || { tail -40 "$LV/create.log"; fail "OpenTofu did not create the domain"; }
 [[ $(virsh domstate notes-lv) == running ]] || fail "the domain does not run"
@@ -365,6 +365,9 @@ xml=$(virsh dumpxml notes-lv)
 grep -q '<acpi/>' <<<"$xml" && grep -q '<apic/>' <<<"$xml" || fail "the domain has no ACPI or APIC"
 grep -q "<disk type='file' device='disk'>" <<<"$xml" && ! grep -q "<disk type='volume'" <<<"$xml" || fail "a disk is not given by its path"
 grep -q "<loader .*type='pflash'" <<<"$xml" || fail "the domain does not boot UEFI"
+# One vCPU: no queue count (libvirt's default, which the apply must not read back as a change),
+# the receive ring kept.
+grep -q "<driver rx_queue_size='1024'/>" <<<"$xml" || { grep -n '<driver' <<<"$xml"; fail "the NIC's driver is not a 1024 receive ring alone"; }
 # The apply leaves no drift: a plan right after it changes nothing.
 STATE=$LV/state/notes/vms/notes-lv
 "${OPERATOR[@]}" tofu -chdir="$STATE" plan -detailed-exitcode -input=false -no-color >"$LV/plan.log" 2>&1 || { tail -40 "$LV/plan.log"; fail "the libvirt module drifts after its apply"; }

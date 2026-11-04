@@ -139,7 +139,7 @@ func (Params) PurgeAfterInit() []string  { return PurgedAfterInit }
 
 // own are packages the bundle's boot and stack run on, which the build's last step finds
 // installed: no step after theirs removes them.
-var own = []string{"containerd.io", "docker-ce", "docker-compose-plugin", "dracut", "linux-image-generic", "nftables", "openssh-server", "systemd", "systemd-sysv"}
+var own = []string{"containerd.io", "docker-ce", "docker-compose-plugin", "dracut", "linux-image-generic", "nftables", "openssh-server", "systemd", "systemd-resolved", "systemd-sysv"}
 
 // Own are the packages the build's last step finds installed, sorted.
 func (Params) Own() []string { return own }

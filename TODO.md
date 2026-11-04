@@ -423,6 +423,12 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
 
 ## Could
 
+- The libvirt e2e creates its VM with one vCPU alone: no suite applies the module with several
+  (`queues = var.cpus`) nor checks its no-drift plan then; a second, short apply with `--cpus 2`
+  asserting `queues='2'` would.
+- The proxmox module sets `queues = min(var.cpus, 64)` with one vCPU too: whether the bpg provider
+  reads 1 back as set (libvirt's leaves it out, failing the apply) is unproven.
+
 - **The service watch's races**: a look judges the lock, the daemon's jobs and its reboots at
   instants around the read; a lifecycle lock a CLI run takes and releases wholly inside one
   `compose ps`, or the boot unit run wholly inside it, goes unseen, and the services it stopped
