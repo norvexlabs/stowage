@@ -3,7 +3,7 @@
 Stowage's own releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
-## [0.27.1]
+## [0.27.1] - 2026-11-04
 
 ### Fixed
 - `vm create --platform libvirt --cpus 1` no longer fails its apply (`Provider produced
