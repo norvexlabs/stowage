@@ -3,7 +3,7 @@
 Stowage's own releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
-## [0.28.0]
+## [0.28.0] - 2026-11-05
 
 ### Added
 - An L4 route's `allow_input` is enforced on a Docker host too, once its operator consents with
