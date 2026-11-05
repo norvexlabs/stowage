@@ -104,7 +104,10 @@ content. Each start writes the file from that value. The path holds the value's 
 service's container keeps the inode it was made with: a new path is what makes compose recreate the
 services mounting it, and the old file stays until the stack started on the new one, as a container
 restarting before that still needs it. The path is relative because compose resolves it against the
-project directory, so a moved install keeps working. The file is 0644 in a 0700 directory rather
+project directory, so a moved install keeps working. A provision hook naming a file input
+gets the same file at a fixed path, which its variable holds: its container is made anew each run,
+so the digest has no work to do there, and the install's relative path means nothing inside it. The
+run writes the file itself, as `provision` has no start to. The file is 0644 in a 0700 directory rather
 than 0600: the installer cannot know the uid a container runs as, and only that directory's
 owner and the container it is mounted in reach the file.
 Service names starting `stowage-` are Stowage's: the front is the `stowage-front` service, added
@@ -659,7 +662,7 @@ point.
    `helm upgrade --install --atomic`. VM: render cloud-config (+ NoCloud ISO, or point at the disk
    image) and boot; first boot needs no registry (images are preloaded). Then the `provision` hook,
    resumable. Docker: a service Stowage adds (`stowage-provision.yaml`, profile-gated, no
-   capability, no host file) run with `compose run --rm --no-deps -T`; its stdout `KEY=VALUE`
+   capability, no host file but the file inputs its `env` names) run with `compose run --rm --no-deps -T`; its stdout `KEY=VALUE`
    lines are recorded one by one in `provision.env` (0600) and fed back on the next run, so a
    value it minted survives a run that stops later; inputs come from `.env`, never a second
    questionnaire. It receives only the keys its `env` declares: a hook holds no secret it did not

@@ -3,6 +3,21 @@
 Stowage's own releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
+## [0.28.1]
+
+### Added
+- A provision hook's `env` may name a file input (`type: file` or `pem`): the hook gets the file
+  read-only at `${STOWAGE_INPUT_FILE_<KEY>}`, so a check against a private CA takes the operator's
+  PEM file, checked by Stowage, instead of a base64 text the hook decodes itself. On Docker and the
+  VM; `provision --set` refuses a file input, naming the re-run with `--set-file` that changes it.
+
+### Fixed
+- `provision --set` of an input only the hook reads is no longer refused on a project where a
+  service mounts a file input.
+- A `command` provider's container no longer receives a file input's encoded value.
+- `provision --set` of an input only the hook reads is refused when a compose `secrets` or
+  `configs` entry may read the install's `.env`, as for a mount of it.
+
 ## [0.28.0] - 2026-11-05
 
 ### Added

@@ -110,7 +110,7 @@ func TestTheHookServiceIsConfinedAndGetsTheRecordedValues(t *testing.T) {
 }
 
 func TestADollarInTheHooksCmdStaysLiteral(t *testing.T) {
-	out, err := provisionCompose(&providers.ProvisionHook{Image: "api", Cmd: []string{"sh", "-c", "echo $HOME ${X}"}}, nil, nil)
+	out, err := provisionCompose(&providers.ProvisionHook{Image: "api", Cmd: []string{"sh", "-c", "echo $HOME ${X}"}}, nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -134,7 +134,7 @@ func TestOnDemandServicesReachTheVMsL4ServicesByName(t *testing.T) {
 	if got := vm.targetHosts(); !slices.Equal(got, []string{"echo:host-gateway", "postgres:host-gateway"}) {
 		t.Errorf("hosts %v", got)
 	}
-	out, err := provisionCompose(&providers.ProvisionHook{Image: "api", Cmd: []string{"true"}}, nil, vm.targetHosts())
+	out, err := provisionCompose(&providers.ProvisionHook{Image: "api", Cmd: []string{"true"}}, nil, nil, vm.targetHosts())
 	if err != nil || !strings.Contains(string(out), "extra_hosts:\n            - echo:host-gateway\n            - postgres:host-gateway\n") {
 		t.Errorf("%s %v", out, err)
 	}
@@ -656,6 +656,187 @@ func TestProvisionSetRefusesAnInputTheHookDoesNotRead(t *testing.T) {
 	err := e.installer(func(o *Options) { o.Set = map[string]string{"NOTE": "y"} }).Provision(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "NOTE is neither an input only the provision hook reads (ADMIN_EMAIL)") {
 		t.Fatalf("--set NOTE: %v", err)
+	}
+}
+
+// A file input the hook's env names reaches it as its file, read-only, with its variable holding
+// the path inside the container: its recorded value stays out, of the container and the compose file.
+func TestTheHookGetsAFileInputAsItsFile(t *testing.T) {
+	e := newEnv(t)
+	e.r.Spec.Inputs = append(e.r.Spec.Inputs, spec.Input{Key: "CA", Prompt: "CA file", Optional: true, Type: spec.InputFile})
+	e.r.Spec.Hooks.Provision.Config["env"] = []any{"ADMIN_EMAIL", "CA"}
+	v := encodeFileInput([]byte("the content"))
+	if err := e.install(func(o *Options) { o.Set = map[string]string{"CA": v} }); err != nil {
+		t.Fatal(err)
+	}
+	pc, err := os.ReadFile(filepath.Join(e.dir, ProvisionCompose))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var f struct {
+		Services map[string]struct {
+			Environment, Volumes []string
+		}
+	}
+	if err := yaml.Unmarshal(pc, &f); err != nil {
+		t.Fatal(err)
+	}
+	svc := f.Services[ProvisionService]
+	if !slices.Contains(svc.Environment, "ADMIN_EMAIL") || !slices.Contains(svc.Environment, "STOWAGE_INPUT_FILE_CA=/run/stowage/inputs/CA") || slices.Contains(svc.Environment, "CA") {
+		t.Errorf("environment %v", svc.Environment)
+	}
+	if !slices.Equal(svc.Volumes, []string{"${STOWAGE_INPUT_FILE_CA}:/run/stowage/inputs/CA:ro"}) {
+		t.Errorf("volumes %v", svc.Volumes)
+	}
+	if strings.Contains(string(pc), v) {
+		t.Errorf("the value in the compose file:\n%s", pc)
+	}
+	path := get(e.readEnv(), spec.FileVar("CA"))
+	if calls := e.hookCalls(); len(calls) != 1 || !slices.Contains(calls[0].Env, spec.FileVar("CA")+"="+path) {
+		t.Errorf("compose was not given the file's path %s: %v", path, calls)
+	}
+
+	// `provision` alone writes a file gone, which a mount would make a directory, and mounts the
+	// file of the value recorded, whatever path .env holds.
+	if err := os.RemoveAll(filepath.Join(e.dir, InputFilesDir)); err != nil {
+		t.Fatal(err)
+	}
+	record := func(k, v string) {
+		t.Helper()
+		f, err := ReadEnvFile(filepath.Join(e.dir, envName))
+		if err != nil {
+			t.Fatal(err)
+		}
+		f.Set(k, v)
+		if err := f.WriteFile(filepath.Join(e.dir, envName)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	record(spec.FileVar("CA"), "./"+InputFilesDir+"/stale")
+	e.docker.calls = nil
+	if err := e.installer(nil).Provision(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.ReadFile(filepath.Join(e.dir, path)); err != nil || string(got) != "the content" {
+		t.Errorf("after provision: %q, %v", got, err)
+	}
+	if calls := e.hookCalls(); len(calls) != 1 || !slices.Contains(calls[0].Env, spec.FileVar("CA")+"="+path) {
+		t.Errorf("provision mounted another path than %s: %v", path, calls)
+	}
+
+	// --set refuses it, though the compose file names no CA, naming the flag that changes it.
+	err = e.installer(func(o *Options) { o.Set = map[string]string{"CA": v} }).Provision(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "CA is a file input: a re-run, `") || !strings.Contains(err.Error(), "--dir "+e.dir+" --set-file CA=PATH`, changes it") {
+		t.Errorf("--set CA: %v", err)
+	}
+
+	// An input left empty is an empty file, never a directory.
+	record("CA", "")
+	if err := os.RemoveAll(filepath.Join(e.dir, InputFilesDir)); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.installer(nil).Provision(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	empty := filepath.Join(e.dir, InputFilesDir, fileInputName("CA", ""))
+	if info, err := os.Stat(empty); err != nil || !info.Mode().IsRegular() || info.Size() != 0 {
+		t.Errorf("the empty file: %v, %v", info, err)
+	}
+
+	// A recorded value that is no file's content stops the run before the hook, naming the input.
+	record("CA", "plain text")
+	e.docker.calls = nil
+	err = e.installer(nil).Provision(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "input CA: its recorded value") {
+		t.Errorf("a bad recorded value: %v", err)
+	}
+	if n := len(e.hookCalls()); n != 0 {
+		t.Errorf("%d hook runs on a bad recorded value", n)
+	}
+}
+
+// A mount of exactly a file input's variable cannot pass .env on: the installer records that path.
+// Any other source holding a variable might.
+func TestAFileInputsMountPassesNoEnvOn(t *testing.T) {
+	e := newEnv(t)
+	e.r.Spec.Inputs = append(e.r.Spec.Inputs, spec.Input{Key: "CA", Prompt: "CA file", Optional: true, Type: spec.InputFile}, spec.Input{Key: "NOTE", Default: "x"})
+	for src, passes := range map[string]bool{
+		"${STOWAGE_INPUT_FILE_CA}":         true,
+		"./data":                           true,
+		"${STOWAGE_INPUT_FILE_NOTE}":       false,
+		"${STOWAGE_INPUT_FILE_NOPE}":       false,
+		"${STOWAGE_INPUT_FILE_CA}/../..":   false,
+		"${STOWAGE_INPUT_FILE_CA:-./.env}": false,
+		"${OTHER}":                         false,
+		"$STOWAGE_INPUT_FILE_CA":           false,
+	} {
+		e.r.Compose = []byte("services:\n  web:\n    image: x\n    volumes:\n      - \"" + src + ":/mounted:ro\"\n")
+		err := e.installer(nil).passesEnvOn()
+		if (err == nil) != passes {
+			t.Errorf("%s: %v", src, err)
+		}
+	}
+	for doc, passes := range map[string]bool{
+		"secrets:\n  s:\n    file: ./.env\n":       false,
+		"secrets:\n  s:\n    file: ./secret.txt\n": true,
+		"secrets:\n  s:\n    environment: X\n":     true,
+		"configs:\n  c:\n    file: ./.env\n":       false,
+		"configs:\n  c:\n    file: ./app.conf\n":   true,
+	} {
+		e.r.Compose = []byte("services:\n  web:\n    image: x\n" + doc)
+		if err := e.installer(nil).passesEnvOn(); (err == nil) != passes {
+			t.Errorf("%s: %v", doc, err)
+		}
+	}
+}
+
+// The refusal of a file input names the command that changes it where it runs.
+func TestProvisionSetOfAFileInputNamesTheRerun(t *testing.T) {
+	e := newEnv(t)
+	e.r.Spec.Inputs = append(e.r.Spec.Inputs, spec.Input{Key: "CA", Prompt: "CA file", Optional: true, Type: spec.InputFile})
+	h, err := e.installer(nil).hook()
+	if err != nil {
+		t.Fatal(err)
+	}
+	set := func(o *Options) { o.Set = map[string]string{"CA": ""} }
+	in := e.installer(set)
+	_, _, err = in.setHookValues(NewEnvFile(), h, NewEnvFile())
+	if err == nil || !strings.Contains(err.Error(), in.ctl()+" --dir "+e.dir+" --set-file CA=PATH`, changes it (`--set CA=` empties an optional one)") {
+		t.Errorf("Docker: %v", err)
+	}
+	in = e.installer(func(o *Options) { set(o); o.Preloaded = true })
+	_, _, err = in.setHookValues(NewEnvFile(), h, NewEnvFile())
+	if err == nil || !strings.Contains(err.Error(), "`sudo "+in.R.Ctl()+" install --set-file CA=PATH`") {
+		t.Errorf("the VM: %v", err)
+	}
+}
+
+// A command provider's container gets no file input's encoded value, and no text input loses out.
+func TestACommandProviderGetsNoFileInput(t *testing.T) {
+	e := newEnv(t)
+	e.r.Spec.Inputs = append(e.r.Spec.Inputs, spec.Input{Key: "CA", Prompt: "CA file", Optional: true, Type: spec.InputFile})
+	f := NewEnvFile()
+	f.Set("CA", encodeFileInput([]byte("x")))
+	f.Set("ADMIN_EMAIL", "a@b")
+	keys := e.installer(nil).recordedEnv(f)
+	if slices.Contains(keys, "CA") || !slices.Contains(keys, "ADMIN_EMAIL") {
+		t.Errorf("keys %v", keys)
+	}
+}
+
+// A hook whose env names no file input has no mount, nor any input's path.
+func TestAHookNamingNoFileInputGetsNone(t *testing.T) {
+	e := newEnv(t)
+	e.r.Spec.Inputs = append(e.r.Spec.Inputs, spec.Input{Key: "CA", Prompt: "CA file", Optional: true, Type: spec.InputFile})
+	if err := e.install(nil); err != nil {
+		t.Fatal(err)
+	}
+	pc, err := os.ReadFile(filepath.Join(e.dir, ProvisionCompose))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(pc), "volumes") || strings.Contains(string(pc), spec.FileVarPrefix) {
+		t.Errorf("%s", pc)
 	}
 }
 

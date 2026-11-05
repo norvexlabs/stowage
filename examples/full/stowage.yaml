@@ -192,7 +192,7 @@ hooks:
     provider: container
     image: provision
     cmd: [provision.py]
-    env: [ADMIN_EMAIL, ADMIN_PASSWORD, INTERNAL_SERVICE_SECRET]   # all it receives, with what it returned before
+    env: [ADMIN_EMAIL, ADMIN_PASSWORD, INTERNAL_SERVICE_SECRET, API_CA_BUNDLE]   # all it receives, with what it returned before
     returns: [ADMIN_API_KEY, ADMIN_LOGIN]                       # provision --set gives one it has not returned
     outputs: credentials.txt
   maintenance:

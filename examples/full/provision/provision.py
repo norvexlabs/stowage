@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Provision hook contract: environment in, KEY=VALUE lines out, idempotent and resumable.
 
-It receives what hooks.provision.env lists (ADMIN_EMAIL, ADMIN_PASSWORD, INTERNAL_SERVICE_SECRET)
+It receives what hooks.provision.env lists (ADMIN_EMAIL, ADMIN_PASSWORD, INTERNAL_SERVICE_SECRET,
+and API_CA_BUNDLE as a file mounted at STOWAGE_INPUT_FILE_API_CA_BUNDLE, on Docker and the VM)
 and what it returned before; API_URL (default http://api:9090) comes from the chart's ConfigMap
 on Kubernetes. The administrator's password is ADMIN_PASSWORD when given (an input on Kubernetes;
 on Docker the one this hook returned before), else minted here and printed before the step that
@@ -28,6 +29,10 @@ api = os.environ.get("API_URL") or "http://api:9090"
 password = os.environ.get("ADMIN_PASSWORD")
 key = os.environ.get("ADMIN_API_KEY")
 registered = os.environ.get("ADMIN_LOGIN") == email
+ca_path = os.environ.get("STOWAGE_INPUT_FILE_API_CA_BUNDLE")
+if ca_path and os.path.getsize(ca_path):  # empty while the input is
+    with open(ca_path, "rb") as ca_file:  # a bundle's comments may be in any encoding
+        print(f"certificates in {ca_path}: {ca_file.read().count(b'BEGIN CERTIFICATE')}", file=sys.stderr, flush=True)
 
 
 def call(req, what):

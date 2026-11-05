@@ -26,6 +26,10 @@ import (
 // directory keeps the host's other users out.
 const InputFilesDir = ".stowage-inputs"
 
+// HookInputsDir holds, inside the provision hook's container, the file of each file input its env
+// names, under the input's key.
+const HookInputsDir = "/run/stowage/inputs"
+
 // fileValuePrefix starts the value recorded for a file: base64 alone could not tell a file from a
 // text that happens to read as base64, whether mistyped or left by an earlier release.
 const fileValuePrefix = "stowage-file:"

@@ -229,13 +229,14 @@ grep -q "recorded ADMIN_API_KEY in $D/provision.env" "$WORK/prov-given.log" || {
 
 step "the front: forward auth on the api route, the ingest route's allowlist; an advanced input"
 rerun() { "${CTL[@]}" --dir "$D" --no-input "$@" >"$WORK/rerun.log" 2>&1 || { cat "$WORK/rerun.log"; fail "re-run $*"; }; }
-step "a file input: mounted empty, then the file given, recreating the service that mounts it; a bad one refused"
+step "a file input: mounted empty, then the file given, recreating the service that mounts it, read by the provision hook; a bad one refused"
 api_ca() { docker exec "$(docker ps -q --filter "label=com.docker.compose.project=$(project)" --filter label=com.docker.compose.service=api)" cat /etc/atlas/upstream-ca.pem; }
 ca=$(api_ca) && [[ -z $ca ]] || fail "the file input left empty was not an empty file"
 openssl req -x509 -newkey ed25519 -nodes -subj /CN=atlas-upstream -keyout /dev/null -days 1 -out "$WORK/upstream-ca.pem" 2>/dev/null || fail "making a CA"
 rerun --set-file API_CA_BUNDLE="$WORK/upstream-ca.pem"
 [[ $(api_ca) == "$(cat "$WORK/upstream-ca.pem")" ]] || fail "the api does not see the file given"
 grep -qF 'changing API_CA_BUNDLE: "" → sha256:' "$WORK/rerun.log" || { cat "$WORK/rerun.log"; fail "the change was not logged by its digest"; }
+grep -qF 'certificates in /run/stowage/inputs/API_CA_BUNDLE: 1' "$WORK/rerun.log" || { cat "$WORK/rerun.log"; fail "the provision hook did not read the file given"; }
 [[ $(find "$D/.stowage-inputs" -type f | wc -l) == 1 && $(stat -c %a "$D/.stowage-inputs") == 700 ]] || fail "the input files: one, in a directory only its owner reads"
 echo 'not PEM' >"$WORK/bad.pem"
 if "${CTL[@]}" --dir "$D" --no-input --set-file API_CA_BUNDLE="$WORK/bad.pem" >"$WORK/bad-pem.log" 2>&1; then cat "$WORK/bad-pem.log"; fail "a file that is not PEM passed"; fi

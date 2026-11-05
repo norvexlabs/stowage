@@ -1534,7 +1534,8 @@ func (l *linter) secretsAndInputs() {
 	l.fileInputsOnlyMounted()
 }
 
-// fileInputsOnlyMounted refuses a file input read as text: what is recorded for it is encoded.
+// fileInputsOnlyMounted refuses a file input read as text: what is recorded for it is encoded. A
+// provision hook's env may name one: the hook gets its file, not that value.
 func (l *linter) fileInputsOnlyMounted() {
 	use := func(where, key string) {
 		if i, ok := l.s.Input(key); ok && i.File() {
@@ -1572,11 +1573,6 @@ func (l *linter) fileInputsOnlyMounted() {
 		w := fmt.Sprintf("extensions[%d]", n)
 		use(w+".input", e.Input)
 		use(w+".key_input", e.KeyInput)
-	}
-	if h, err := providers.DecodeProvision(l.s.Short(), l.s.Hooks.Provision, l.s.Images); err == nil {
-		for n, k := range h.Keys() {
-			use(fmt.Sprintf("hooks.provision.env[%d]", n), k)
-		}
 	}
 	for n, in := range l.s.Inputs {
 		for _, other := range l.s.Inputs {

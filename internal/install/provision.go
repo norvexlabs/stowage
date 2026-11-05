@@ -55,15 +55,28 @@ func (in *Installer) hook() (*providers.ProvisionHook, error) {
 
 // hookEnv lists the recorded keys the provision hook receives: the values Stowage provides, each
 // route's URL, and the keys its env declares. Nothing else of .env reaches it: not a secret it
-// did not ask for, nor an image, a port or compose's own settings.
+// did not ask for, nor an image, a port or compose's own settings. A file input stays out: its
+// recorded value is encoded, and the hook gets its file (hookFiles).
 func (in *Installer) hookEnv(env *EnvFile, h *providers.ProvisionHook) []string {
 	keys := in.providedEnv(env)
+	files := in.hookFiles(h)
 	for _, k := range h.Keys() {
-		if _, ok := env.Get(k); ok && !slices.Contains(keys, k) {
+		if _, ok := env.Get(k); ok && !slices.Contains(keys, k) && !slices.Contains(files, k) {
 			keys = append(keys, k)
 		}
 	}
 	return keys
+}
+
+// hookFiles lists the file inputs the provision hook's env names.
+func (in *Installer) hookFiles(h *providers.ProvisionHook) []string {
+	var files []string
+	for _, k := range h.Keys() {
+		if i, ok := in.R.Spec.Input(k); ok && i.File() {
+			files = append(files, k)
+		}
+	}
+	return files
 }
 
 // providedEnv lists the recorded values Stowage provides, each route's URL and each L4 route's
@@ -88,7 +101,8 @@ func (in *Installer) providedEnv(env *EnvFile) []string {
 }
 
 // recordedEnv lists the recorded keys a `command` provider's container receives: the values
-// Stowage provides, each route's URL and domain, the inputs, the secrets and the safe defaults.
+// Stowage provides, each route's URL and domain, the inputs but file inputs, the secrets and the
+// safe defaults.
 // Images, ports and compose's own settings stay out.
 func (in *Installer) recordedEnv(env *EnvFile) []string {
 	s := in.R.Spec
@@ -99,7 +113,9 @@ func (in *Installer) recordedEnv(env *EnvFile) []string {
 		}
 	}
 	for _, i := range s.Inputs {
-		add(i.Key)
+		if !i.File() { // what is recorded is encoded, and such a container mounts no file
+			add(i.Key)
+		}
 	}
 	for _, r := range s.Front.Routes {
 		add(r.DomainInput)
@@ -114,8 +130,8 @@ func (in *Installer) recordedEnv(env *EnvFile) []string {
 }
 
 // confined is a service Stowage runs on demand in the stack (behind its own profile): cmd as the
-// container's whole command line, no capability, no privilege gain, no file of the host, and the
-// recorded values by name (compose takes them from the environment it runs with).
+// container's whole command line, no capability, no privilege gain, no file of the host (the caller
+// adds what it mounts), and the recorded values by name (compose takes them from the environment it runs with).
 func confined(service, image string, cmd, keys []string) map[string]any {
 	c := make([]string, len(cmd))
 	for i, a := range cmd {
@@ -142,10 +158,21 @@ func serviceFile(what, service string, svc map[string]any) ([]byte, error) {
 }
 
 // provisionCompose is the hook's service, confined, which also reads the hook's earlier outputs
-// from ProvisionEnv, with hosts (targetHosts) as its extra hosts.
-func provisionCompose(h *providers.ProvisionHook, keys, hosts []string) ([]byte, error) {
-	svc := confined(ProvisionService, "${"+ImageVar(h.Image)+"}", h.Cmd, keys)
+// from ProvisionEnv, with hosts (targetHosts) as its extra hosts. Each of files is a file input
+// mounted read-only, its only mounts, with its variable holding the path inside the container.
+func provisionCompose(h *providers.ProvisionHook, keys, files, hosts []string) ([]byte, error) {
+	environment := slices.Clone(keys)
+	var volumes []string
+	for _, k := range files {
+		target := HookInputsDir + "/" + k
+		environment = append(environment, spec.FileVar(k)+"="+target)
+		volumes = append(volumes, "${"+spec.FileVar(k)+"}:"+target+":ro")
+	}
+	svc := confined(ProvisionService, "${"+ImageVar(h.Image)+"}", h.Cmd, environment)
 	svc["env_file"] = []string{"./" + ProvisionEnv}
+	if len(volumes) > 0 {
+		svc["volumes"] = volumes
+	}
 	if len(hosts) > 0 {
 		svc["extra_hosts"] = hosts
 	}
@@ -197,10 +224,12 @@ func (in *Installer) leftovers(ctx context.Context, env *EnvFile) error {
 	return nil
 }
 
-// runHook runs the hook once, under the lock lockRun took.
+// runHook runs the hook once, under the lock lockRun took. The files of the file inputs it mounts
+// are on disk: up or provisionNow wrote them.
 func (in *Installer) runHook(ctx context.Context, env *EnvFile, h *providers.ProvisionHook) error {
 	name := containerName(env, ProvisionService)
 	keys := in.hookEnv(env, h)
+	files := in.hookFiles(h)
 	reserved := recordedKeys(env)
 	outs := NewEnvFile()
 	if _, err := os.Stat(in.path(ProvisionEnv)); err == nil {
@@ -227,7 +256,7 @@ func (in *Installer) runHook(ctx context.Context, env *EnvFile, h *providers.Pro
 	if err := outs.WriteFile(in.path(ProvisionEnv)); err != nil {
 		return err
 	}
-	pc, err := provisionCompose(h, keys, in.targetHosts())
+	pc, err := provisionCompose(h, keys, files, in.targetHosts())
 	if err != nil {
 		return err
 	}
@@ -583,6 +612,13 @@ func setReturned(returned *EnvFile, set map[string]string) {
 // (`provision`, or a restore): a first install whose stack came up and whose hook failed is
 // finished by it.
 func (in *Installer) provisionNow(ctx context.Context, env *EnvFile, h *providers.ProvisionHook) error {
+	if len(in.hookFiles(h)) > 0 {
+		// No start wrote them, and a mount of a file gone would make a directory.
+		in.fileVars(env)
+		if err := in.writeInputFiles(env); err != nil {
+			return err
+		}
+	}
 	if err := in.runHook(ctx, env, h); err != nil {
 		return err
 	}
@@ -596,7 +632,8 @@ var composeWord = regexp.MustCompile(`[A-Za-z_][A-Za-z0-9_]*`)
 
 // passesEnvOn refuses a compose file through which the stack may read the install's .env: an
 // env_file, a bind mount of the install directory, of a directory above it or of .env, a bind
-// source compose would expand ($, ~), or a volume with driver options (which may bind anything).
+// source compose would expand ($, ~) but a file input's own path, a secret's or a config's file
+// reaching one of those, or a volume with driver options (which may bind anything).
 func (in *Installer) passesEnvOn() error {
 	var doc struct {
 		Services map[string]struct {
@@ -606,6 +643,12 @@ func (in *Installer) passesEnvOn() error {
 		Volumes map[string]struct {
 			DriverOpts map[string]any `yaml:"driver_opts"`
 		} `yaml:"volumes"`
+		Secrets map[string]struct {
+			File string `yaml:"file"`
+		} `yaml:"secrets"`
+		Configs map[string]struct {
+			File string `yaml:"file"`
+		} `yaml:"configs"`
 	}
 	if err := yaml.Unmarshal(in.R.Compose, &doc); err != nil {
 		return fmt.Errorf("compose.yaml: %w", err)
@@ -616,6 +659,16 @@ func (in *Installer) passesEnvOn() error {
 	for _, name := range sortedKeys(doc.Volumes) {
 		if len(doc.Volumes[name].DriverOpts) > 0 {
 			return refuse("volume " + name + "'s driver_opts")
+		}
+	}
+	for _, name := range sortedKeys(doc.Secrets) {
+		if f := doc.Secrets[name].File; f != "" && bindsEnv(in.O.Dir, f) {
+			return refuse("secret " + name + "'s file")
+		}
+	}
+	for _, name := range sortedKeys(doc.Configs) {
+		if f := doc.Configs[name].File; f != "" && bindsEnv(in.O.Dir, f) {
+			return refuse("config " + name + "'s file")
 		}
 	}
 	for _, name := range sortedKeys(doc.Services) {
@@ -631,12 +684,20 @@ func (in *Installer) passesEnvOn() error {
 			case map[string]any:
 				src, _ = v["source"].(string)
 			}
-			if src != "" && bindsEnv(in.O.Dir, src) {
+			if src != "" && !in.fileInputMount(src) && bindsEnv(in.O.Dir, src) {
 				return refuse(fmt.Sprintf("service %s's mount of %s", name, src))
 			}
 		}
 	}
 	return nil
+}
+
+// fileInputMount reports whether a mount source is exactly a file input's variable: the installer
+// records that path, under InputFilesDir, so it never reaches .env.
+func (in *Installer) fileInputMount(src string) bool {
+	return slices.ContainsFunc(in.R.Spec.Inputs, func(i spec.Input) bool {
+		return i.File() && src == "${"+spec.FileVar(i.Key)+"}"
+	})
 }
 
 // bindsEnv reports whether a mount source may reach dir/.env: dir itself, a directory above it,
@@ -665,6 +726,14 @@ func (in *Installer) setHookValues(env *EnvFile, h *providers.ProvisionHook, ret
 	var bad []string
 	for _, k := range sortedKeys(in.O.Set) {
 		v := in.O.Set[k]
+		if f, ok := in.R.Spec.Input(k); ok && f.File() {
+			rerun := fmt.Sprintf("%s --dir %s", in.ctl(), in.O.Dir)
+			if in.O.Preloaded {
+				rerun = fmt.Sprintf("sudo %s install", in.R.Ctl())
+			}
+			bad = append(bad, fmt.Sprintf("%s is a file input: a re-run, `%s --set-file %s=PATH`, changes it (`--set %s=` empties an optional one)", k, rerun, k, k))
+			continue
+		}
 		i, isInput := settable[k]
 		isOutput := slices.Contains(outputs, k)
 		switch {
@@ -700,7 +769,7 @@ func (in *Installer) setHookValues(env *EnvFile, h *providers.ProvisionHook, ret
 
 // hookInputs are the inputs the install recorded that only the provision hook reads: its env
 // lists them, and the compose file names none of them anywhere — interpolated, passed by name, in
-// a comment (conservative) — nor does the front.
+// a comment (conservative) — nor does the front. A file input is none: a re-run checks its file.
 func (in *Installer) hookInputs(env *EnvFile, h *providers.ProvisionHook) map[string]spec.Input {
 	stack := map[string]bool{}
 	for _, w := range composeWord.FindAll(in.R.Compose, -1) {
@@ -711,7 +780,7 @@ func (in *Installer) hookInputs(env *EnvFile, h *providers.ProvisionHook) map[st
 	}
 	settable := map[string]spec.Input{}
 	for _, i := range in.R.Spec.Inputs {
-		if _, recorded := env.Get(i.Key); recorded && !stack[i.Key] && slices.Contains(h.Keys(), i.Key) {
+		if _, recorded := env.Get(i.Key); recorded && !i.File() && !stack[i.Key] && slices.Contains(h.Keys(), i.Key) {
 			settable[i.Key] = i
 		}
 	}
