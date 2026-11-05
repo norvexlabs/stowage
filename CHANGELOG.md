@@ -3,7 +3,7 @@
 Stowage's own releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
-## [0.28.1]
+## [0.28.1] - 2026-11-05
 
 ### Added
 - A provision hook's `env` may name a file input (`type: file` or `pem`): the hook gets the file
