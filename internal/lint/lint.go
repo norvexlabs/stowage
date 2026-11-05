@@ -1490,6 +1490,21 @@ func (l *linter) secretsAndInputs() {
 		if in.Profile != "" {
 			l.profileInput(w, in)
 		}
+		switch in.Type {
+		case "":
+		case spec.InputFile, spec.InputPEM:
+			if in.Default != "" {
+				l.errf(w+".type", "a file input is given as a file: no default")
+			}
+			if in.Advanced {
+				l.errf(w+".type", "a file input is mounted by a service, so asked: not advanced")
+			}
+			if l.s.Shapes.Kubernetes != nil && in.OnKubernetes() {
+				l.errf(w+".type", "a file input reaches a service on the docker and kairos shapes, as a mounted file; a chart has no way to it: shapes: [docker, kairos]")
+			}
+		default:
+			l.errf(w+".type", "%q: expected %s or %s", in.Type, spec.InputFile, spec.InputPEM)
+		}
 		if in.Advanced && (in.Required || in.Default != "") {
 			l.errf(w+".advanced", "an advanced input is never asked and takes the compose file's default: no required, no default")
 		}
@@ -1516,6 +1531,60 @@ func (l *linter) secretsAndInputs() {
 	l.composeVars(keys)
 	l.inputsConsumed()
 	l.extensions()
+	l.fileInputsOnlyMounted()
+}
+
+// fileInputsOnlyMounted refuses a file input read as text: what is recorded for it is encoded.
+func (l *linter) fileInputsOnlyMounted() {
+	use := func(where, key string) {
+		if i, ok := l.s.Input(key); ok && i.File() {
+			l.errf(where, "%s is a file input, which a service mounts (${%s}): it holds no text this can read", key, spec.FileVar(key))
+		}
+	}
+	for n, r := range l.s.Front.Routes {
+		w := fmt.Sprintf("front.routes[%d]", n)
+		use(w+".domain_input", r.DomainInput)
+		use(w+".allow_input", r.AllowInput)
+		if a := r.ForwardAuth; a != nil {
+			use(w+".forward_auth.address_input", a.AddressInput)
+			use(w+".forward_auth.uri_input", a.URIInput)
+		}
+		if a := r.BasicAuth; a != nil {
+			use(w+".basic_auth.secret", a.Secret)
+		}
+	}
+	for n, r := range l.s.L4.Routes {
+		w := fmt.Sprintf("l4.routes[%d]", n)
+		use(w+".address_input", r.AddressInput)
+		use(w+".allow_input", r.AllowInput)
+		use(w+".bind_input", r.BindInput)
+	}
+	for _, name := range sortedKeys(l.s.Services) {
+		svc := l.s.Services[name]
+		w := "services." + name
+		use(w+".address_input", svc.AddressInput)
+		for _, k := range svc.Sets {
+			use(w+".sets", k)
+		}
+		use(w+".nftables.input", svc.Nftables.Input)
+	}
+	for n, e := range l.s.Extensions {
+		w := fmt.Sprintf("extensions[%d]", n)
+		use(w+".input", e.Input)
+		use(w+".key_input", e.KeyInput)
+	}
+	if h, err := providers.DecodeProvision(l.s.Short(), l.s.Hooks.Provision, l.s.Images); err == nil {
+		for n, k := range h.Keys() {
+			use(fmt.Sprintf("hooks.provision.env[%d]", n), k)
+		}
+	}
+	for n, in := range l.s.Inputs {
+		for _, other := range l.s.Inputs {
+			if other.File() && strings.Contains(in.Default, "${"+other.Key+"}") {
+				use(fmt.Sprintf("inputs[%d].default", n), other.Key)
+			}
+		}
+	}
 }
 
 // rotated checks that the compose file reads a rotated secret's next and previous values, or the
@@ -1607,14 +1676,24 @@ func (l *linter) composeVars(keys map[string]string) {
 			}
 			continue
 		}
+		if key, ok := strings.CutPrefix(v.Name, spec.FileVarPrefix); ok {
+			if i, found := l.s.Input(key); !found || !i.File() {
+				l.errf(w, "%s names no file input (inputs[].type: file or pem)", v.Name)
+			}
+			continue
+		}
 		if v.Name == "STOWAGE_TLS_MODE" && !l.s.HasFront() {
 			l.errf(w, "%s: the project has no front, so no TLS mode is recorded", v.Name)
 			continue
 		}
 		if strings.HasPrefix(v.Name, "STOWAGE_") {
 			if _, ok := ProvidedVars[v.Name]; !ok {
-				l.errf(w, "%s is not a variable Stowage provides (%s, STOWAGE_IMAGE_<KEY>, STOWAGE_URL_<ROUTE>, STOWAGE_L4_<ROUTE>)", v.Name, strings.Join(sortedKeys(ProvidedVars), ", "))
+				l.errf(w, "%s is not a variable Stowage provides (%s, STOWAGE_IMAGE_<KEY>, STOWAGE_URL_<ROUTE>, STOWAGE_L4_<ROUTE>, STOWAGE_INPUT_FILE_<KEY>)", v.Name, strings.Join(sortedKeys(ProvidedVars), ", "))
 			}
+			continue
+		}
+		if i, ok := l.s.Input(v.Name); ok && i.File() {
+			l.errf(w, "${%s} is a file input: what is recorded for it is no text to read; mount ${%s}", v.Name, spec.FileVar(v.Name))
 			continue
 		}
 		if v.NeedsValue() && slices.ContainsFunc(l.s.Inputs, func(i spec.Input) bool { return i.Key == v.Name && i.Advanced }) {
@@ -1677,7 +1756,7 @@ var composeProfile = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]*$`)
 func (l *linter) readInputs() func(spec.Input) bool {
 	inCompose := map[string]bool{}
 	for _, v := range l.compose.Vars {
-		inCompose[v.Name] = true
+		inCompose[strings.TrimPrefix(v.Name, spec.FileVarPrefix)] = true
 	}
 	// The provision hook reads the keys its env lists.
 	if h, err := providers.DecodeProvision(l.s.Short(), l.s.Hooks.Provision, l.s.Images); err == nil {

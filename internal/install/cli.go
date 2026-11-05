@@ -15,7 +15,6 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
-	"go.yaml.in/yaml/v3"
 	"golang.org/x/term"
 
 	"github.com/norvexlabs/stowage/internal/payload"
@@ -40,7 +39,7 @@ func newCommand(r *Release, self string, stdout, stderr io.Writer, tools K8sOpti
 	if _, err := os.Stat("/proc/self/exe"); err == nil {
 		o.SelfExe = "/proc/self/exe" // the running file, even when its path was replaced since
 	}
-	var ports, sets, domains []string
+	var ports, sets, setFiles, domains []string
 	var answers, to, secretsFile string
 	var noInput, accessible bool
 	name := r.Spec.Name
@@ -51,6 +50,9 @@ func newCommand(r *Release, self string, stdout, stderr io.Writer, tools K8sOpti
 			return err
 		}
 		if o.Set, err = parseSets(sets); err != nil {
+			return err
+		}
+		if err = addSetFiles(o.Set, setFiles); err != nil {
 			return err
 		}
 		if o.Domains, err = parseDomains(domains); err != nil {
@@ -129,6 +131,7 @@ func newCommand(r *Release, self string, stdout, stderr io.Writer, tools K8sOpti
 	hideFrontFlags(rf, r.Spec, frontFlagNames)
 	rf.StringVar(&secretsFile, "secrets", "", "a first install's secrets: the file `secrets export` wrote, decrypted (- for standard input)")
 	rf.StringArrayVar(&sets, "set", nil, "an input, KEY=VALUE (repeatable; a re-run changes the recorded one)")
+	rf.StringArrayVar(&setFiles, "set-file", nil, "a file input's file, KEY=PATH (repeatable; a re-run changes the recorded one)")
 	rf.StringVar(&answers, "answers", "", "a YAML file of inputs, KEY: value (a re-run changes the recorded ones)")
 	rf.BoolVar(&noInput, "no-input", false, "never ask: an input nothing gave takes its default")
 	rf.BoolVar(&o.NoProvision, "no-provision", false, "start the stack without running the provision hook (`provision` runs it later)")
@@ -301,6 +304,7 @@ func newCommand(r *Release, self string, stdout, stderr io.Writer, tools K8sOpti
 	uf := up.Flags()
 	uf.StringVar(&to, "version", "", "fetch the installer of this version (its latest revision, on the install's channel) from the install's registry, and upgrade with it")
 	uf.StringArrayVar(&sets, "set", nil, "an input this release adds, KEY=VALUE (repeatable)")
+	uf.StringArrayVar(&setFiles, "set-file", nil, "a file input this release adds, KEY=PATH (repeatable)")
 	uf.StringVar(&answers, "answers", "", "a YAML file of the inputs this release adds, KEY: value")
 	uf.StringSliceVar(&ports, "ports", nil, "the port of a route this release adds, route=port (loopback mode; default the release's front.loopback_ports)")
 	uf.BoolVar(&noInput, "no-input", false, "never ask: an added input nothing gave takes its default")
@@ -379,7 +383,7 @@ func newCommand(r *Release, self string, stdout, stderr io.Writer, tools K8sOpti
 		root.AddCommand(k8sCommand(in, &o, prepare, terminal, &sets, &answers, &noInput, &accessible))
 	}
 	if r.Spec.Shapes.Kairos != nil {
-		root.AddCommand(vmCreateCommand(in, &o, prepare, terminal, &sets, &domains, &answers, &noInput, &accessible))
+		root.AddCommand(vmCreateCommand(in, &o, prepare, terminal, &sets, &setFiles, &domains, &answers, &noInput, &accessible))
 	}
 	root.AddCommand(mirrorCommand(in, &o, prepare))
 	root.AddCommand(auditCommand(in, &o, prepare, dirFlag, stdout), sbomCommand(in, &o, prepare, dirFlag, stdout))
@@ -818,7 +822,7 @@ func ipv6Flag(f *pflag.FlagSet, v **bool, usage string) {
 
 // vmCreateCommand is `vm create`: the files a new VM of the release needs, on a hypervisor or a
 // cloud (Installer.CreateVM).
-func vmCreateCommand(in *Installer, o *Options, prepare func() error, terminal func(bool) Prompter, sets, domains *[]string, answers *string, noInput, accessible *bool) *cobra.Command {
+func vmCreateCommand(in *Installer, o *Options, prepare func() error, terminal func(bool) Prompter, sets, setFiles, domains *[]string, answers *string, noInput, accessible *bool) *cobra.Command {
 	name, m := in.R.Spec.Name, in.R.Manifest
 	var c VMCreate
 	var secretsFile string
@@ -901,6 +905,7 @@ func vmCreateCommand(in *Installer, o *Options, prepare func() error, terminal f
 	f.IntVar(&o.HTTPSPort, "https-port", 0, "the VM's port a TLS front serves HTTPS on (default the project's front.https_port, else 443)")
 	hideFrontFlags(f, in.R.Spec, []string{"tls", "domains", "http-port", "https-port"}) // --address is the VM's own
 	f.StringArrayVar(sets, "set", nil, "an input, KEY=VALUE (repeatable; never a secret input)")
+	f.StringArrayVar(setFiles, "set-file", nil, "a file input's file, KEY=PATH (repeatable; never a secret input)")
 	f.StringVar(answers, "answers", "", "a YAML file of inputs, KEY: value (never a secret input)")
 	f.BoolVar(noInput, "no-input", false, "never ask: what nothing gave takes its default")
 	f.BoolVar(accessible, "accessible", false, "ask with plain line prompts (screen readers); also when ACCESSIBLE is set or TERM=dumb")
@@ -1106,16 +1111,4 @@ func parseSets(items []string) (map[string]string, error) {
 		out[k] = v
 	}
 	return out, nil
-}
-
-func readAnswers(path string) (map[string]string, error) {
-	raw, err := os.ReadFile(filepath.Clean(path))
-	if err != nil {
-		return nil, err
-	}
-	var m map[string]string
-	if err := yaml.Unmarshal(raw, &m); err != nil {
-		return nil, fmt.Errorf("--answers %s: a map of KEY: value is expected: %w", path, err)
-	}
-	return m, nil
 }

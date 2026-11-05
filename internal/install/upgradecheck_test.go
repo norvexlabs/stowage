@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -38,6 +39,10 @@ func TestUpgradeRefusesWhatTheBootWouldBeforeWritingTheOS(t *testing.T) {
 		want string
 	}{
 		"a route on another's port": {docsRoute(8080), "notes 2.0.0 adds the route docs on port 8080, which app has"},
+		"a recorded input it declares as a file": {func(s *spec.Spec) {
+			i := slices.IndexFunc(s.Inputs, func(i spec.Input) bool { return i.Key == "ADMIN_EMAIL" })
+			s.Inputs[i].Type = spec.InputFile
+		}, "ADMIN_EMAIL: notes 2.0.0 declares it as a file"},
 		"an input nothing gives": {func(s *spec.Spec) {
 			s.Inputs = append(s.Inputs, spec.Input{Key: "SMTP_HOST", Prompt: "Mail host", Required: true})
 		}, "missing required input(s), set by --set KEY=VALUE, the environment or --answers: SMTP_HOST (Mail host)"},

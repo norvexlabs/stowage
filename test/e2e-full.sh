@@ -185,7 +185,7 @@ echo_ports() { docker port "$(docker ps -q --filter "label=com.docker.compose.pr
 "${CTL[@]}" --dir "$D" --no-input --set ECHO_BIND= >"$WORK/unbind.log" 2>&1 || { cat "$WORK/unbind.log"; fail "re-run --set ECHO_BIND="; }
 [[ $(echo_ports) == *0.0.0.0:17007* ]] || fail "the TCP echo is published on $(echo_ports) once ECHO_BIND is empty"
 grep -qxF "echo      tcp/17007 localhost:17007 · on every address, open to whoever reaches this host (ECHO_BIND gives it one address)" "$WORK/status.txt" &&
-	grep -qxF "echo-udp  udp/17007 · on every address, open to whoever reaches this host" "$WORK/status.txt" ||
+	grep -qxF 'echo-udp  udp/17007 · on every address, open to whoever reaches this host: ECHO_SOURCES'"'"'s sources hold once `at-stow tune --apply` consents' "$WORK/status.txt" ||
 	{ cat "$WORK/status.txt"; fail "status does not list the L4 routes"; }
 relay() { docker ps -q --filter "label=com.docker.compose.project=$(project)" --filter label=com.docker.compose.service=relay; }
 [[ -z $(relay) ]] || fail "the relay runs while RELAY_SOURCE is empty"
@@ -229,6 +229,18 @@ grep -q "recorded ADMIN_API_KEY in $D/provision.env" "$WORK/prov-given.log" || {
 
 step "the front: forward auth on the api route, the ingest route's allowlist; an advanced input"
 rerun() { "${CTL[@]}" --dir "$D" --no-input "$@" >"$WORK/rerun.log" 2>&1 || { cat "$WORK/rerun.log"; fail "re-run $*"; }; }
+step "a file input: mounted empty, then the file given, recreating the service that mounts it; a bad one refused"
+api_ca() { docker exec "$(docker ps -q --filter "label=com.docker.compose.project=$(project)" --filter label=com.docker.compose.service=api)" cat /etc/atlas/upstream-ca.pem; }
+ca=$(api_ca) && [[ -z $ca ]] || fail "the file input left empty was not an empty file"
+openssl req -x509 -newkey ed25519 -nodes -subj /CN=atlas-upstream -keyout /dev/null -days 1 -out "$WORK/upstream-ca.pem" 2>/dev/null || fail "making a CA"
+rerun --set-file API_CA_BUNDLE="$WORK/upstream-ca.pem"
+[[ $(api_ca) == "$(cat "$WORK/upstream-ca.pem")" ]] || fail "the api does not see the file given"
+grep -qF 'changing API_CA_BUNDLE: "" → sha256:' "$WORK/rerun.log" || { cat "$WORK/rerun.log"; fail "the change was not logged by its digest"; }
+[[ $(find "$D/.stowage-inputs" -type f | wc -l) == 1 && $(stat -c %a "$D/.stowage-inputs") == 700 ]] || fail "the input files: one, in a directory only its owner reads"
+echo 'not PEM' >"$WORK/bad.pem"
+if "${CTL[@]}" --dir "$D" --no-input --set-file API_CA_BUNDLE="$WORK/bad.pem" >"$WORK/bad-pem.log" 2>&1; then cat "$WORK/bad-pem.log"; fail "a file that is not PEM passed"; fi
+grep -q 'API_CA_BUNDLE: no PEM block' "$WORK/bad-pem.log" || { cat "$WORK/bad-pem.log"; fail "the refusal does not name the input"; }
+
 whoami="http://127.0.0.1:$API_PORT/api/v1/whoami"
 [[ $(curl -sf --max-time 10 "$whoami") == '{"user": ""}' ]] || fail "the api route asks an authentication service while AUTH_ADDRESS is empty"
 rerun --set AUTH_ADDRESS=api:9090 --set AUTH_URI=/api/v1/auth

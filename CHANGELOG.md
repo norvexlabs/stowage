@@ -13,6 +13,10 @@ follow [SemVer](https://semver.org/).
   hold the list. Until then, the install's end and `status` say the route is open to whoever
   reaches the host. Its input is now asked on the `docker` and `kairos`
   shapes the project has (`shapes: [docker, kairos]`).
+- File inputs (`inputs[].type: file` or `pem`): a certificate, bundle or key given with `--set-file
+  KEY=PATH`, `KEY: {file: PATH}` in `--answers`, or its path on a terminal, at most 48000 bytes; a `pem`
+  one is checked and an encrypted key refused. Each start writes it under the install directory and
+  a service mounts `${STOWAGE_INPUT_FILE_<KEY>}`; a new value recreates the services mounting it.
 - A `tun` interface role can name the device its service opens (`host.interfaces.<role>.device`),
   such as one with a `-` in its name, which no role name may hold: networkd's file, the firewall's
   rules, the forwarding and `tune` then use that device.

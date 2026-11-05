@@ -33,6 +33,9 @@ func (in *Installer) upgradeCheck(ctx context.Context, env *EnvFile) error {
 	if err != nil {
 		return err
 	}
+	if err := in.recordedForms(env); err != nil {
+		return err
+	}
 	added := in.addedInputs(env, mode)
 	in.recorded = map[string]string{}
 	for _, k := range env.Keys() {

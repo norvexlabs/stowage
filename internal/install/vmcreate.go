@@ -46,6 +46,8 @@ type Platform struct {
 	// Steps are what the operator does with the files, in order; %[1]s is the disk file, %[2]s the
 	// seed (the ISO or the user-data file), %[3]d the disk's size in GiB (the OS's and the app's).
 	Steps []string
+	// UserDataMax is the most user data the cloud takes, in bytes (0: as much as a file input holds).
+	UserDataMax int
 }
 
 // Platforms are the platforms `vm create` knows, in the order it offers them.
@@ -77,7 +79,7 @@ var Platforms = []Platform{
 		"Plug both into the server and boot it from the first, in UEFI mode with Secure Boot off: the installer wipes the --device disk (at least %[3]d GiB), installs the OS on it and powers the server off.",
 		"Take both sticks out, then power the server on: its first boot installs the release.",
 	}},
-	{Key: "azure", Label: "Microsoft Azure", Formats: []string{"vhd"}, Tofu: true, Preview: true, Steps: []string{
+	{Key: "azure", Label: "Microsoft Azure", Formats: []string{"vhd"}, Tofu: true, Preview: true, UserDataMax: 64 << 10, Steps: []string{
 		"Upload %[1]s as a page blob, and create a managed image from it (az image create --source <blob URL> --os-type Linux --hyper-v-generation V2).",
 		"Create the VM from that image with %[2]s as its custom data and a %[3]d GiB disk (az vm create --custom-data %[2]s --os-disk-size-gb %[3]d).",
 	}},
@@ -85,7 +87,7 @@ var Platforms = []Platform{
 		"Upload %[1]s to a bucket, and create an image from it (gcloud compute images create --source-uri gs://<bucket>/<file> --guest-os-features UEFI_COMPATIBLE).",
 		"Create the instance from that image with %[2]s as its user-data and a %[3]d GiB disk (gcloud compute instances create --metadata-from-file user-data=%[2]s --boot-disk-size %[3]dGB).",
 	}},
-	{Key: "aws", Label: "Amazon EC2", Formats: []string{"raw"}, Tofu: true, Preview: true, Steps: []string{
+	{Key: "aws", Label: "Amazon EC2", Formats: []string{"raw"}, Tofu: true, Preview: true, UserDataMax: 16 << 10, Steps: []string{
 		"Upload %[1]s to S3, import it as a snapshot (aws ec2 import-snapshot), and register an image from it (aws ec2 register-image --boot-mode uefi).",
 		"Launch the instance from that image with %[2]s as its user data and a %[3]d GiB root volume (aws ec2 run-instances --user-data file://%[2]s, the image's root device mapped to a volume of that size with --block-device-mappings).",
 	}},
@@ -297,6 +299,9 @@ func (in *Installer) CreateVM(ctx context.Context, c *VMCreate) error {
 	}
 	userData, err := UserData(name, in.R.Ctl(), mach, *st, ca)
 	if err != nil {
+		return err
+	}
+	if err := fileInputsFit(p, in.R.Spec, st, len(userData)); err != nil {
 		return err
 	}
 	if err := os.MkdirAll(out, 0o755); err != nil {
@@ -1325,7 +1330,11 @@ func (in *Installer) confirmVM(ctx context.Context, p Platform, format string, m
 		b.WriteString("\n")
 	}
 	for _, k := range sortedKeys(st.Inputs) {
-		fmt.Fprintf(&b, "  %s=%s\n", k, st.Inputs[k])
+		v := st.Inputs[k]
+		if i, ok := in.R.Spec.Input(k); ok && i.File() {
+			v = fileInputDigest(v)
+		}
+		fmt.Fprintf(&b, "  %s=%s\n", k, v)
 	}
 	if st.AwaitSecrets {
 		b.WriteString("  secrets: --secrets', given over SSH once the VM answers, to a one-time host key its cloud-config carries (never the secrets)\n")

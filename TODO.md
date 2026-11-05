@@ -38,6 +38,9 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
 
 ## Should
 
+- **A file input on a chart**: lint refuses one asked on the `kubernetes` shape, as the Secret holds
+  its recorded form and a chart can only mount a key as it is. A second Secret of the decoded
+  contents, named in `.Values.stowage`, would give it the same reach as on Docker and the VM.
 - **A real-iptables suite for the Docker host's L4 allowlist**: the rules are proven by unit tests
   and by a one-off probe on Docker-in-Docker (a source off the list dropped, one on it let through),
   but no suite runs a consented start on a real engine, as e2e-full stops at "not in force". A
@@ -428,6 +431,12 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
   repositories.
 
 ## Could
+
+- **File inputs' leftovers**: the user-data limit is checked after `vm create`'s confirmation, not
+  before it; the re-run's hint for a required file input a new TLS mode asks has no test; a compose
+  command run before the first start of a service mounting a file input would make a directory at
+  its path, which the start then reports; a rollback to a release whose spec this installer cannot
+  read takes back a file value by its record alone, a branch with no test.
 
 - **Docker L4 allowlist, leftovers of its review**: the allow chain's `.applied` mark is redundant
   beside `.held`; `l4Exposure` and `status` recompute the rules and re-read the marks per route; a

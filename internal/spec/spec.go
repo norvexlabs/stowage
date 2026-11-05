@@ -460,7 +460,28 @@ type Input struct {
 	// Profile names the compose profile the input turns on while it holds a value: the services
 	// of that profile run only then.
 	Profile string `yaml:"profile"`
+	// Type is what the input holds: empty for text, InputFile for a file's content, InputPEM for
+	// PEM blocks. A file input records its content in one line, its prefix and base64.
+	Type string `yaml:"type"`
 }
+
+// The types of an input holding a file.
+const (
+	InputFile = "file"
+	InputPEM  = "pem"
+)
+
+// MaxInputFile bounds a file input's content: its recorded form fits MaxEnvValue.
+const MaxInputFile = 48000
+
+// FileVarPrefix starts the variable holding a file input's path.
+const FileVarPrefix = "STOWAGE_INPUT_FILE_"
+
+// File is whether the input holds a file.
+func (i Input) File() bool { return i.Type == InputFile || i.Type == InputPEM }
+
+// FileVar is the variable holding the path of the file input key.
+func FileVar(key string) string { return FileVarPrefix + key }
 
 // Profiles are the compose profiles the inputs turn on, sorted, each once.
 func (s *Spec) Profiles() []string {

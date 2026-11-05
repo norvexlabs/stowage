@@ -330,7 +330,7 @@ func (in *Installer) k8sInputs() []input {
 	var out []input
 	for _, i := range in.R.Spec.Inputs {
 		if i.OnKubernetes() {
-			out = append(out, input{Input: i})
+			out = append(out, input{Input: i, check: textInputCheck})
 		}
 	}
 	return out

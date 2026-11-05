@@ -47,7 +47,7 @@ func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(
 		o.SelfExe = "/proc/self/exe"
 	}
 	in := &Installer{R: r}
-	var ports, sets, domains []string
+	var ports, sets, setFiles, domains []string
 	var answers, secretsFile string
 	var noInput, accessible, asJSON bool
 	var group string
@@ -58,6 +58,9 @@ func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(
 			return err
 		}
 		if o.Set, err = parseSets(sets); err != nil {
+			return err
+		}
+		if err = addSetFiles(o.Set, setFiles); err != nil {
 			return err
 		}
 		if o.Domains, err = parseDomains(domains); err != nil {
@@ -149,6 +152,7 @@ func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(
 	hideFrontFlags(f, r.Spec, frontFlagNames)
 	f.BoolVar(&o.DryRun, "dry-run", false, "check, print what would be written (secrets redacted), write nothing")
 	f.StringArrayVar(&sets, "set", nil, "an input, KEY=VALUE (repeatable; on an installed VM, changes the recorded one)")
+	f.StringArrayVar(&setFiles, "set-file", nil, "a file input's file, KEY=PATH (repeatable; on an installed VM, changes the recorded one)")
 	f.StringVar(&answers, "answers", "", "a YAML file of inputs, KEY: value (on an installed VM, changes the recorded ones)")
 	f.BoolVar(&noInput, "no-input", false, "never ask: an input nothing gave takes its default")
 	f.BoolVar(&o.NoProvision, "no-provision", false, "start the stack without running the provision hook (`provision` runs it later)")

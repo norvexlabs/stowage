@@ -371,10 +371,7 @@ func (in *Installer) Install(ctx context.Context) error {
 	if o.DryRun {
 		for _, k := range env.Keys() {
 			v, _ := env.Get(k)
-			if secrets[k] && v != "" {
-				v = "<redacted>"
-			}
-			fmt.Fprintf(o.Out, "%s=%s\n", k, v)
+			fmt.Fprintf(o.Out, "%s=%s\n", k, in.shownValue(k, v, secrets))
 		}
 		return nil
 	}
@@ -803,6 +800,7 @@ func (in *Installer) decide(ctx context.Context, dir, mode string, pub publish, 
 	acceptedVars(in.secrets(), func(k string) string { v, _ := env.Get(k); return v }, func(k, v string) { env.Set(k, v); secrets[k] = true })
 	in.profilesVar(env)
 	in.l4Vars(env)
+	in.fileVars(env)
 	return env, secrets, env.Check()
 }
 
@@ -1318,6 +1316,10 @@ func (in *Installer) up(ctx context.Context, env *EnvFile) (err error) {
 	if err := in.volumesSplit(); err != nil {
 		return err
 	}
+	in.fileVars(env)
+	if err := in.writeInputFiles(env); err != nil {
+		return err
+	}
 	if err := in.takeNetworks(); err != nil {
 		return err
 	}
@@ -1436,6 +1438,9 @@ func (in *Installer) up(ctx context.Context, env *EnvFile) (err error) {
 	}
 	if err := in.markAllowHeld(); err != nil {
 		in.O.logf("warning: marking the L4 routes' source allowlists held: %v: status says they are not", err)
+	}
+	if err := in.sweepInputFiles(env); err != nil {
+		in.O.logf("warning: removing the files of the inputs' earlier values: %v", err)
 	}
 	get := func(k string) string { v, _ := env.Get(k); return v }
 	for _, r := range in.R.Spec.L4.Routes {
@@ -2451,6 +2456,11 @@ func (in *Installer) inputList(mode string) []input {
 		if pick := in.tablePick(i.Key); pick != nil {
 			check = chainChecks(check, pick)
 		}
+		if i.File() {
+			check = fileInputCheck(i)
+		} else {
+			check = chainChecks(check, textInputCheck)
+		}
 		out = append(out, input{i, check, domain})
 	}
 	return out
@@ -2501,6 +2511,19 @@ func (in *Installer) inputs(ctx context.Context, list []input, back bool) (map[s
 		}
 		if ok {
 			given[i.Key] = v
+		} else if i.File() {
+			// Asked as a path, which is no secret; recorded as the file's content below.
+			check := func(path string) error {
+				if path == "" {
+					return nil
+				}
+				v, err := loadFileInput(path)
+				if err != nil {
+					return err
+				}
+				return i.check(v)
+			}
+			qs = append(qs, Question{Title: cmp.Or(i.Prompt, i.Key), Key: i.Key, Required: i.Required, Check: check})
 		} else if !i.Advanced {
 			qs = append(qs, Question{Title: cmp.Or(i.Prompt, i.Key), Key: i.Key, Required: i.Required, Secret: i.Secret, Check: envAnd(i.check)})
 		}
@@ -2534,6 +2557,13 @@ func (in *Installer) inputs(ctx context.Context, list []input, back bool) (map[s
 		}
 		if err != nil {
 			return nil, err
+		}
+		for _, i := range list {
+			if path := answers[i.Key]; i.File() && path != "" {
+				if answers[i.Key], err = loadFileInput(path); err != nil {
+					return nil, fmt.Errorf("%s: %w", i.Key, err)
+				}
+			}
 		}
 	}
 	values, missing := in.resolve(list, given, answers)
@@ -2598,7 +2628,11 @@ func (in *Installer) resolve(list []input, given, answers map[string]string) (ma
 			})
 		}
 		if v == "" && i.Required {
-			missing = append(missing, fmt.Sprintf("%s (%s)", i.Key, i.Prompt))
+			what := i.Prompt
+			if i.File() {
+				what += fmt.Sprintf(": a file, --set-file %s=PATH", i.Key)
+			}
+			missing = append(missing, fmt.Sprintf("%s (%s)", i.Key, what))
 			continue
 		}
 		values[i.Key] = v
@@ -2983,6 +3017,10 @@ func (in *Installer) inputEnv(k string) string {
 		return v
 	}
 	if in.remote {
+		return ""
+	}
+	// A file input is a file given by name: never a variable that happens to be exported.
+	if i, ok := in.R.Spec.Input(k); ok && i.File() {
 		return ""
 	}
 	return in.O.getenv(k)

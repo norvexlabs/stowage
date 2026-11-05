@@ -1220,7 +1220,7 @@ func mustRead(t *testing.T, raw []byte) *EnvFile {
 func TestChangesLogASecretRedacted(t *testing.T) {
 	t.Parallel()
 	var log bytes.Buffer
-	in := &Installer{O: Options{Log: &log}}
+	in := &Installer{R: &Release{Spec: &spec.Spec{}}, O: Options{Log: &log}}
 	a, b := NewEnvFile(), NewEnvFile()
 	a.Set("TOKEN", "old-secret")
 	b.Set("TOKEN", "new-secret")

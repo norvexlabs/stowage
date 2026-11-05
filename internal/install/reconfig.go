@@ -100,7 +100,11 @@ func (in *Installer) changes(env *EnvFile) (next *EnvFile, secrets map[string]bo
 	for _, i := range in.inputList(mode) {
 		used[i.Key] = true
 		if v, _ := next.Get(i.Key); v == "" && i.Required {
-			bad = append(bad, fmt.Sprintf("%s is required (--set %s=…)", i.Key, i.Key))
+			how := "--set " + i.Key + "=…"
+			if i.File() {
+				how = "--set-file " + i.Key + "=PATH"
+			}
+			bad = append(bad, fmt.Sprintf("%s is required (%s)", i.Key, how))
 		}
 	}
 	if mode != was {
@@ -170,6 +174,7 @@ func (in *Installer) changes(env *EnvFile) (next *EnvFile, secrets map[string]bo
 	in.tuneVar(next)
 	in.profilesVar(next)
 	in.l4Vars(next)
+	in.fileVars(next)
 	if err := next.Check(); err != nil {
 		return nil, nil, publish{}, err
 	}
@@ -320,19 +325,23 @@ func (in *Installer) certDone() {
 
 // logChanges logs each value next changes from env, a secret's redacted, and each it removes.
 func (in *Installer) logChanges(env, next *EnvFile, secrets map[string]bool) {
+	// A file input's path follows its value, which is logged.
+	path := func(k string) bool { return strings.HasPrefix(k, spec.FileVarPrefix) }
 	for _, k := range env.Keys() {
-		if _, ok := next.Get(k); !ok {
+		if _, ok := next.Get(k); !ok && !path(k) {
 			in.O.logf("removing %s", k)
 		}
 	}
 	for _, k := range next.Keys() {
 		a, _ := env.Get(k)
 		b, _ := next.Get(k)
-		if a == b {
+		if a == b || path(k) {
 			continue
 		}
 		if secrets[k] {
 			a, b = redact(a), redact(b)
+		} else if i, ok := in.R.Spec.Input(k); ok && i.File() {
+			a, b = fileInputDigest(a), fileInputDigest(b)
 		}
 		in.O.logf("changing %s: %s → %s", k, cmp.Or(a, `""`), cmp.Or(b, `""`))
 	}

@@ -218,10 +218,7 @@ func (in *Installer) Upgrade(ctx context.Context) error {
 			if old, ok := env.Get(k); ok && old == v {
 				continue
 			}
-			if secrets[k] && v != "" {
-				v = "<redacted>"
-			}
-			fmt.Fprintf(o.Out, "%s=%s\n", k, v)
+			fmt.Fprintf(o.Out, "%s=%s\n", k, in.shownValue(k, v, secrets))
 		}
 		if in.R.Spec.HasDatabase() {
 			o.logf("a run would dump the database to %s, keep %s %s in %s, then start %s", in.path(SnapshotsDir), name, cur, in.path(PrevDir), m.ProjectVersion)
@@ -330,6 +327,9 @@ func (in *Installer) upgradeRefusals(ctx context.Context, env *EnvFile, name, cu
 	if o.Offline && pinnedImages(env) {
 		return "", publish{}, nil, nil, errors.New("--offline: this install pulls its images by digest; an install made with --offline upgrades from loaded images")
 	}
+	if err := in.recordedForms(env); err != nil {
+		return "", publish{}, nil, nil, err
+	}
 	added = in.addedInputs(env, mode)
 	if err := in.onlyAdded(env, added); err != nil {
 		return "", publish{}, nil, nil, err
@@ -432,7 +432,8 @@ func (in *Installer) addedInputs(env *EnvFile, mode string) []input {
 	var added []input
 	for _, i := range in.inputList(mode) {
 		v, ok := env.Get(i.Key)
-		if pick := in.tablePick(i.Key); !ok || pick != nil && pick(v) != nil {
+		// A required file input recorded empty would start on an empty file.
+		if pick := in.tablePick(i.Key); !ok || pick != nil && pick(v) != nil || i.File() && i.Required && v == "" {
 			added = append(added, i)
 		}
 	}
@@ -714,6 +715,7 @@ func (in *Installer) upgradeEnv(env *EnvFile, mode string, added []input, values
 	}
 	in.profilesVar(next)
 	in.l4Vars(next)
+	in.fileVars(next)
 	return next, secrets, next.Check()
 }
 
@@ -953,9 +955,22 @@ func (in *Installer) Rollback(ctx context.Context) error {
 			postures = append(postures, fmt.Sprintf("%s goes back to the value %s %s ran with", k, name, pk.projectVersion()))
 			v = pv
 		}
-		if releaseKey(k) {
-			pv, ok := prevEnv.Get(k)
-			if !ok {
+		// A value the previous release cannot read (a file given to the newer one for what it reads
+		// as text, or the other way) is the one it ran with, or none. A release whose spec this
+		// installer does not read is judged by its own record alone.
+		pv, prevOK := prevEnv.Get(k)
+		unreadable := false
+		if back == nil {
+			unreadable = isFileValue(v) && !isFileValue(pv)
+		} else if i, ok := back.R.Spec.Input(k); ok {
+			// A file input it requires, emptied since, would not start either.
+			unreadable = wrongForm(i, v) || i.File() && i.Required && v == ""
+		}
+		if unreadable {
+			postures = append(postures, fmt.Sprintf("%s goes back to the value %s %s ran with", k, name, pk.projectVersion()))
+		}
+		if releaseKey(k) || unreadable {
+			if !prevOK {
 				continue
 			}
 			v = pv
@@ -967,6 +982,9 @@ func (in *Installer) Rollback(ctx context.Context) error {
 			v, _ := prevEnv.Get(k)
 			rolled.Set(k, v)
 		}
+	}
+	if back != nil {
+		back.fileVars(rolled)
 	}
 	if err := in.baselineCheck(pk, st); err != nil {
 		return err

@@ -1162,13 +1162,13 @@ These are what `lint` checks; each finding names the key path or `file:line` to 
     (a loopback address in every mode and without a front, for a port only this host may reach: 127.x or `::1`,
     bare — Compose's port syntax takes `::1:5432:5432`), `STOWAGE_IPV6` (`true` with `--ipv6`, else `false`; Docker and the VM),
     `STOWAGE_L4_<ROUTE>` (an `l4` route's endpoint, `<address>:<port>`, for a route with an
-    `address_input`; Docker and the VM). The variables a service's `services` entry gives it
+    `address_input`; Docker and the VM), `STOWAGE_INPUT_FILE_<KEY>` (the path of a file input's file, to mount; Docker and the VM). The variables a service's `services` entry gives it
     (`STOWAGE_MEM_LIMIT_MB`, `STOWAGE_HOST_MEM_MB`, `STOWAGE_HOST_CPUS`; `STOWAGE_CPUS`) are in its container's
     environment, not the compose file's: a command reads them escaped, `$${STOWAGE_MEM_LIMIT_MB}`,
     and `${STOWAGE_MEM_LIMIT_MB}` is an unknown variable;
   - an unknown `STOWAGE_…` variable, a `STOWAGE_IMAGE_<KEY>` naming no image, a
-    `STOWAGE_URL_<ROUTE>` naming no route or a `STOWAGE_L4_<ROUTE>` naming no `l4` route with an
-    `address_input` is an error, and so is a compose file with no service;
+    `STOWAGE_URL_<ROUTE>` naming no route, a `STOWAGE_L4_<ROUTE>` naming no `l4` route with an
+    `address_input` or a `STOWAGE_INPUT_FILE_<KEY>` naming no file input is an error, and so is a compose file with no service;
   - service names starting `stowage-` are Stowage's (it adds the front as `stowage-front`), and so
     are top-level `volumes` and `networks` starting `stowage-` (the front's data volume is
     `stowage-front-data`).
@@ -1656,7 +1656,7 @@ backup. On Kubernetes
 | `data` | optional: `volumes.<name>.{uid, keep_on_reset}`, `reset` (volumes not `keep_on_reset`; empty is a warning, and `reset-db` refuses it; without a `database`, an error when not empty): the volumes `reset-db` wipes on Docker and the VM (on Kubernetes it deletes every claim of the release). `uid` (0 to 4294967294; absent, the volume is left as Docker makes it — owned by the image's directory it mounts on, root when the image has none): on Docker and the VM, a volume a service mounts that the engine does not hold yet — the stack's first start, or after `reset-db` wiped it — is given to `uid` as that start makes it, before the services start: the containers are made first (`up --no-start`), so the volume already holds what the image put there, then, when its root belongs to another user, it is given to `uid` recursively (`chown -hR uid`: the group kept, a symbolic link changed itself, never what it points to), logging `volume <name> given to its uid`. The volumes a start makes are listed in `.stowage-volumes-pending` (0600) until they have their uid: a start cut off in between, or a release without the helper, leaves them listed, and the next start that mounts them gives it; one a service mounts while no `uid` is owed to it, or that is gone, is struck off. A volume that exists otherwise keeps its owner (its data's: an upgrade never re-owns it), and an `external` one is never touched. The chown runs as root, offline, in the volume helper (`<name>-chown`, busybox pinned by digest), which `ship` builds and publishes for a project with such a volume and the `docker` or `kairos` shape, a Docker install pulls with the stack's images (recorded as `STOWAGE_CHOWN_IMAGE`, by digest or, offline, by tag) and the OS bundle preloads. A release an earlier Stowage published carries none: started again by a rollback, its new volumes keep the owner Docker gives them until a release with the helper starts, and the start logs `<name> <version> carries no volume helper: <volumes> keep the owner Docker gave them until a release with one starts`. On Kubernetes the chart sets its own `securityContext` |
 | `secrets[]` | `key`, `gen`: `hex32`, `hex16` (random bytes, hex), `pass18`, `pass32` (alphanumeric), `b64-32` (base64url); `rotation: true` lets `secrets rotate` replace it (`KEY_NEXT`, `KEY_PREVIOUS` and `KEY_ACCEPTED` are then reserved names, recorded empty beside it, and the compose file must read both `KEY_NEXT` and `KEY_PREVIOUS`, or `KEY_ACCEPTED` alone); `settable: true` lets `secrets set` record a value the operator chooses (a password people type), refused beside `rotation` (`secrets[N].settable: KEY rotates: …`) and on a secret the database's service reads in its compose `environment` (the database keeps the value it was made with). Generated once at the first install, or at the upgrade that adds it |
 | `safe_defaults` | `KEY: value`, the value the compose file defaults to |
-| `inputs[]` | `key`, `prompt` (required), `default` (may name `${KEY}`), `required`, `optional` (exclusive with `required`; otherwise no effect), `secret` (no default), `when: tls\|loopback` (asked only in that mode), `shapes` (`docker`, `kubernetes`, `kairos`; asked only on those), `profile` (a compose profile name, `[a-zA-Z0-9][a-zA-Z0-9_.-]*`, that a service of the compose file carries: the input turns it on while it holds a value — see "Optional services" under the installer; not `required`, and asked on the `docker` or `kairos` shape; lint counts it as read), `advanced` (a tunable: never asked, recorded only when `--set`, `--answers` or the VM's settings give it — never from an exported variable — its default the compose file's — so no `required` or `default`, and the compose file must write it `${KEY:-default}`; a re-run giving it empty removes it). An input left empty is recorded empty. An input asked on the `docker` or `kairos` shape that no compose service, no route and no provision hook's `env` reads is a warning (one asked on `kubernetes` only is the chart's) |
+| `inputs[]` | `key`, `prompt` (required), `default` (may name `${KEY}`), `required`, `optional` (exclusive with `required`; otherwise no effect), `secret` (no default), `when: tls\|loopback` (asked only in that mode), `shapes` (`docker`, `kubernetes`, `kairos`; asked only on those), `profile` (a compose profile name, `[a-zA-Z0-9][a-zA-Z0-9_.-]*`, that a service of the compose file carries: the input turns it on while it holds a value — see "Optional services" under the installer; not `required`, and asked on the `docker` or `kairos` shape; lint counts it as read), `advanced` (a tunable: never asked, recorded only when `--set`, `--answers` or the VM's settings give it — never from an exported variable — its default the compose file's — so no `required` or `default`, and the compose file must write it `${KEY:-default}`; a re-run giving it empty removes it), `type` (`file`, any content, or `pem`, PEM blocks: a file input, see "File inputs" under the installer; no `default`, not `advanced`). An input left empty is recorded empty. An input asked on the `docker` or `kairos` shape that no compose service, no route and no provision hook's `env` reads is a warning (one asked on `kubernetes` only is the chart's) |
 | `extensions[]` | the apps an install of this project can be pointed at (see "Extensions"): `name` (an app name, as `name` is; not this project's; none twice), `input` (required: an input holding the extension's endpoint, empty while it is off — `optional`, not `secret`, no `default`, and read by a compose service, a route or the provision hook's `env`, or asked on `kubernetes` only, where the chart reads it), `prompt` (required: what the install's tip calls it; the `input` is neither `advanced` nor asked in one mode only, `when`, so every install records it), `key_input` (an `optional` `secret` input holding its credential, asked on the same shapes as `input`, neither `advanced` nor `when`, and read as `input` is). No input is named by two extensions, or twice by one |
 | `endpoint` | a route of `front.routes`: this project's endpoint when another project uses it as an extension. Its installer prints the route's URL at the end of an install (see "Extensions") |
 | `hooks.provision` | `container` (`image`, `cmd`, `env`: the inputs, secrets and safe defaults it receives, required, `[]` for none; `returns`: keys it may return, which `provision --set` sets before it returned them; `outputs`) |
@@ -1683,7 +1683,7 @@ again, to copy an installer to another host.
 
 ```bash
 <short>-stow [--dir D] [--registry PREFIX] [--registry-ca FILE] [--offline] [--dry-run] # install / finish setup
-          [--set KEY=VALUE]… [--answers FILE] [--no-input] [--accessible] [--no-provision]
+          [--set KEY=VALUE]… [--set-file KEY=PATH]… [--answers FILE] [--no-input] [--accessible] [--no-provision]
           [--ports route=port,…] [--address 127.x.x.x|::1]                 # loopback mode
           [--tls acme|dns-cloudflare|byo|internal] [--domains route=host,…] # TLS mode
           [--cert FILE --key FILE [--ca FILE]] [--http-port N] [--https-port N]
@@ -1703,9 +1703,9 @@ again, to copy an installer to another host.
 <short>-stow secrets rotate KEY [--stage | --finish] [--dir D]           # a secret with rotation: true
 <short>-stow secrets set KEY [--accessible] [--dir D] < value            # a secret with settable: true; asked, unechoed, on a terminal
 <short>-stow provision [--dir D] [--set KEY=VALUE]…                      # run the provision hook again; --set an input only it reads, or a value it returned or declares it returns
-<short>-stow upgrade [--dir D] [--set KEY=VALUE]… [--answers FILE] [--no-input] # the NEW release's installer
+<short>-stow upgrade [--dir D] [--set KEY=VALUE]… [--set-file KEY=PATH]… [--answers FILE] [--no-input] # the NEW release's installer
           [--ports route=port]… [--offline] [--dry-run] [--no-provision] [--accessible]
-<short>-stow upgrade --version V [--dir D] [--set KEY=VALUE]… [--answers FILE] # fetches V's installer
+<short>-stow upgrade --version V [--dir D] [--set KEY=VALUE]… [--set-file KEY=PATH]… [--answers FILE] # fetches V's installer
           [--ports route=port]… [--no-input] [--accessible] [--dry-run] [--no-provision]
 <short>-stow rollback [--dir D] [--offline] [--dry-run]                  # the installer the install keeps
 <short>-stow reset-db [--dir D] [--yes] [--no-input] [--accessible] [--dry-run] [--no-provision]
@@ -1817,7 +1817,7 @@ again, to copy an installer to another host.
   or rootless Docker (`~/.config/docker/certs.d`) needs the file put there by hand.
   `--registry` and `--registry-ca` are recorded at the first install: a re-run given either is
   refused.
-- `--answers FILE` is a YAML map, `KEY: value`.
+- `--answers FILE` is a YAML map, `KEY: value`; a file input's also `KEY: {file: PATH}` (see "File inputs"), the path relative to the answers file.
 - `--dry-run` on a first install prints every `KEY=VALUE` `.env` would record (secrets
   `<redacted>`) and writes nothing. On a re-run, it logs the changes a run would record and says
   the stack would be brought up again.
@@ -2487,6 +2487,37 @@ again, to copy an installer to another host.
   served: <service>'s profiles are off`). A Docker
   host's own listeners are its operator's too: a dependency's port one of them holds on every
   address cannot be published at `127.0.4.<n>`, and the start fails, naming it.
+- File inputs (an input's `type`: `file` or `pem`): a certificate, a CA bundle or a key handed to
+  a service as a file. On each command taking `--set` on Docker and the VM, but `provision`:
+  `--set-file KEY=PATH` (repeatable; `--set` and `--set-file` of one input are refused, as is one
+  that is no file input); in `--answers`, `KEY: {file: PATH}`; on a terminal the form asks its path
+  (never masked, as a path is no secret, and checked as it is typed). The environment never gives
+  one; `--secrets` gives a secret one. The content is at most 48000 bytes and an empty file is refused (`--set KEY=` leaves an optional input empty). A file for an input this release takes as text is refused as it is given, as is any value in the recorded form below (`KEY: is no file input of this release`); a fetched release's installer judges them, as `upgrade --version` passes `--set-file` on. A `pem` input
+  takes PEM blocks with nothing after the last (text before or between them, a bundle's comments, is kept), every block must decode (`3 PEM blocks open, and 2 of them decode`): a `CERTIFICATE`, `PRIVATE KEY`, `RSA PRIVATE KEY` or
+  `EC PRIVATE KEY` block must be well-formed DER, any other type is taken as it is, and an encrypted key (an `OPENSSH PRIVATE KEY`'s too) is
+  refused (`CA: PEM block 2 (CERTIFICATE): does not parse`, `no PEM block`,
+  `text after PEM block 1`, `an encrypted key: give it without its passphrase`). `.env` records the
+  value as `stowage-file:<the content's base64>`, on its one line, so re-runs, upgrades, rollbacks,
+  `secrets export` (a secret one), `--secrets` and the VM's settings carry it as any input; `--set
+  KEY=stowage-file:<base64>`, an answer's plain string and the settings' `inputs` give that same form, and
+  anything else but empty is refused (`not a file's content: give the file with --set-file
+  KEY=PATH, or KEY: {file: PATH} in --answers`). A log, `--dry-run` and `vm create`'s summary show
+  a non-secret one as `sha256:<12 hex>`, a secret one `<redacted>`. `vm create` puts a non-secret
+  one in the seed, refused when it carries the cloud-config past what the cloud takes as user data (Amazon EC2: 16 KiB, Microsoft Azure: 64 KiB; `the cloud-config is N bytes, and … takes …: give smaller files for KEY; an optional one can be left out and given over SSH once the VM answers, with `install --set-file``); a secret one is refused there as any secret input, given over SSH with
+  `--secrets`. An upgrade to a release that cannot read a recorded input, a text it declares as a file, a file it declares as text or a file a `pem` input refuses, in any mode, is refused before it writes anything (`KEY: <project> <version> declares it as a file, which cannot read the value recorded: the project must declare a changed input under a new key`); one that requires a file input recorded empty asks it as an input it adds; and a `rollback` to a release that cannot read a value given since takes back the one it ran with, or none (`KEY goes back to the value <project> <version> ran with`). Each start writes each file input's file under `.stowage-inputs/` in the install
+  directory (the directory 0700, each file 0644: a bind mount lets a container of any uid read the
+  file, and the host's other users stay out), named `<KEY>-<12 hex of the value's digest>`, and
+  records its path as `STOWAGE_INPUT_FILE_<KEY>` in `.env`, relative to the install directory, for
+  every file input whatever its `when` or `shapes`; a value left empty writes an empty file, so a
+  mount never makes a directory. A service mounts it: `- ${STOWAGE_INPUT_FILE_CA}:/etc/app/ca.pem:ro`.
+  A new value is a new path, so compose recreates the services mounting it; the files of earlier
+  values and of inputs no longer declared are removed once the stack has started (a warning when
+  that fails). `uninstall` keeps them with `.env`, and `--data` removes them. Lint refuses `${KEY}`
+  of a file input in the compose file, `STOWAGE_INPUT_FILE_<KEY>` of what is no file input, and a
+  file input read as text: as a route's domain, allowlist, forward auth or basic auth, an L4 route's
+  or a service's address or bind, a set, a table's input, an extension's, a provision hook's `env`,
+  or in another input's `default`. Reading `STOWAGE_INPUT_FILE_<KEY>` counts as reading the input.
+  A file input has no way to a chart: with a `kubernetes` shape, lint refuses one asked on it (`shapes: [docker, kairos]`).
 - Optional services (an input's `profile`): the install records `COMPOSE_PROFILES` in `.env`, the
   profiles whose input holds a value, comma-separated and sorted (recorded empty while none is;
   not recorded for a project whose inputs name no profile). Every `docker compose` the installer
@@ -3701,7 +3732,7 @@ in the same installer (bootstrap it as above, then `sh <name>.sh vm create …`,
           [--ssh-allow CIDR,…] [--timezone ZONE] [--device DISK] [--interface ROLE=SPEC]…
           [--add-host NAME=IP]… [--secrets FILE|-]
           [--tls MODE] [--domains route=host,…] [--http-port N] [--https-port N]
-          [--set KEY=VALUE]… [--answers FILE] [--no-input] [--accessible]
+          [--set KEY=VALUE]… [--set-file KEY=PATH]… [--answers FILE] [--no-input] [--accessible]
           [--create opentofu|manual] [--module DIR] [--tofu-var NAME=VALUE]…
           [--vm-name N] [--pool P] [--dataset D] [--bridge B]
           [--cpus N] [--memory MiB] [--disk GiB] [--host H] [--wait DURATION]
@@ -4174,7 +4205,7 @@ and never pulls: it runs the images the bundle preloads, by their digest tag
 (`<prefix>/<name>-<key>:sha256-<hex>`), each checked against the IDs the release records.
 
 ```bash
-sudo <short>-stow install [--channel C] [--set KEY=VALUE]… [--answers FILE] [--no-input] [--accessible]
+sudo <short>-stow install [--channel C] [--set KEY=VALUE]… [--set-file KEY=PATH]… [--answers FILE] [--no-input] [--accessible]
           [--ports route=port,…] [--address 127.x.x.x] [--tls MODE] [--domains route=host,…]
           [--cert F --key F [--ca F]] [--http-port N] [--https-port N] [--no-provision] [--dry-run]
           [--tune-profile default|network|release]   # on an installed VM, a higher profile applies at once, a lower one at the next reboot

@@ -40,6 +40,7 @@ services:
       ORG_NAME: ${ORG_NAME}
     volumes:
       - ca:/etc/atlas/ca:ro      # the front's CA (front.publish_ca), as ca.crt
+      - ${STOWAGE_INPUT_FILE_API_CA_BUNDLE}:/etc/atlas/upstream-ca.pem:ro
     healthcheck:
       test: ["CMD", "atlas-server", "probe", "9090"]
       interval: 2s

@@ -95,7 +95,18 @@ Variables Stowage provides on every shape (the `STOWAGE_` prefix is reserved):
 `STOWAGE_URL_<ROUTE>` (the route's public URL: `https://<domain>` behind TLS,
 `http://<address>:<port>` in loopback mode — projects read it rather than assembling URLs),
 `STOWAGE_NAME`, `STOWAGE_PROJECT_VERSION`, `STOWAGE_REVISION`, `STOWAGE_LOOPBACK_ADDRESS`, and on
-Docker and the VM `STOWAGE_L4_<ROUTE>` (an L4 route's `<address>:<port>`, from its address input).
+Docker and the VM `STOWAGE_L4_<ROUTE>` (an L4 route's `<address>:<port>`, from its address input)
+and `STOWAGE_INPUT_FILE_<KEY>` (a file input's file).
+
+A file input records `stowage-file:` and the base64 of its content in `.env`, not a file beside it (the prefix, because base64 alone cannot tell a file from a text that reads as base64): one line goes
+unchanged through re-runs, upgrades, rollbacks, `secrets export` and the VM's seed, so no path needs its own carrying, and the 64 KiB a value may hold bounds it at 48000 bytes of
+content. Each start writes the file from that value. The path holds the value's digest because a
+service's container keeps the inode it was made with: a new path is what makes compose recreate the
+services mounting it, and the old file stays until the stack started on the new one, as a container
+restarting before that still needs it. The path is relative because compose resolves it against the
+project directory, so a moved install keeps working. The file is 0644 in a 0700 directory rather
+than 0600: the installer cannot know the uid a container runs as, and only that directory's
+owner and the container it is mounted in reach the file.
 Service names starting `stowage-` are Stowage's: the front is the `stowage-front` service, added
 beside the project's compose file.
 
