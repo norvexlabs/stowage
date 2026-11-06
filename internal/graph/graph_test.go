@@ -364,7 +364,7 @@ func TestBackupRunnerOnlyWithAnAgeRcloneBackup(t *testing.T) {
 	}{
 		{"no backup", "backup:\n  provider: pg-age-rclone\n  profiles: { full: all }\n  volumes: [uploads]", "#"},
 		{"command backup", "  provider: pg-age-rclone\n  profiles: { full: all }\n  volumes: [uploads]", "  provider: command\n  image: api\n  cmd: [notes-api, backup]\n"},
-		{"neither docker nor kairos", "  docker: {}\n  kubernetes: { chart: deploy/chart, postgres_modes: [external, cnpg] }\n  kairos:\n    base: ubuntu:26.04@sha256:c098726dd9b9733f3e885f8de0ef375206a311b0a317eadc40d347b1115fb944\n    kairos_init: quay.io/kairos/kairos-init:v4.4.0@sha256:eb131bd9b4ed5b9b25cf761af9afa7d462bef27c2d0e9453ce884cf7733a6556\n    disk_formats: [qcow2]\n    host_api: [api]\n", "  kubernetes: { chart: deploy/chart, postgres_modes: [external, cnpg] }\n"},
+		{"neither docker nor kairos", "  docker: {}\n  kubernetes: { chart: deploy/chart, postgres_modes: [external, cnpg] }\n  kairos:\n    base: ubuntu:26.04@sha256:6a06111c3b0a8600feadb270aec771dc239bf407b25625f93f44ab00e11f4d3c\n    kairos_init: quay.io/kairos/kairos-init:v4.4.0@sha256:eb131bd9b4ed5b9b25cf761af9afa7d462bef27c2d0e9453ce884cf7733a6556\n    disk_formats: [qcow2]\n    host_api: [api]\n", "  kubernetes: { chart: deploy/chart, postgres_modes: [external, cnpg] }\n"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			t.Parallel()
@@ -378,7 +378,7 @@ func TestBackupRunnerOnlyWithAnAgeRcloneBackup(t *testing.T) {
 	}
 	// Positive control: the Docker shape alone runs backups, with the runner.
 	root := testutil.CopyExample(t, "minimal")
-	testutil.Edit(t, root, "stowage.yaml", "  kairos:\n    base: ubuntu:26.04@sha256:c098726dd9b9733f3e885f8de0ef375206a311b0a317eadc40d347b1115fb944\n    kairos_init: quay.io/kairos/kairos-init:v4.4.0@sha256:eb131bd9b4ed5b9b25cf761af9afa7d462bef27c2d0e9453ce884cf7733a6556\n    disk_formats: [qcow2]\n    host_api: [api]\n", "")
+	testutil.Edit(t, root, "stowage.yaml", "  kairos:\n    base: ubuntu:26.04@sha256:6a06111c3b0a8600feadb270aec771dc239bf407b25625f93f44ab00e11f4d3c\n    kairos_init: quay.io/kairos/kairos-init:v4.4.0@sha256:eb131bd9b4ed5b9b25cf761af9afa7d462bef27c2d0e9453ce884cf7733a6556\n    disk_formats: [qcow2]\n    host_api: [api]\n", "")
 	if _, ok := build(t, root).Node(BackupID); !ok {
 		t.Error("a Docker release with a pg-age-rclone backup carries no runner")
 	}
@@ -419,7 +419,7 @@ func TestVolumeHelperOnlyWithAVolumeOfAUID(t *testing.T) {
 		name, old, new string
 	}{
 		{"no uid", "    postgres: { uid: 70 }\n    uploads:  { uid: 1000 }\n", "    postgres: {}\n    uploads:  {}\n"},
-		{"neither docker nor kairos", "  docker: {}\n  kubernetes: { chart: deploy/chart, postgres_modes: [external, cnpg] }\n  kairos:\n    base: ubuntu:26.04@sha256:c098726dd9b9733f3e885f8de0ef375206a311b0a317eadc40d347b1115fb944\n    kairos_init: quay.io/kairos/kairos-init:v4.4.0@sha256:eb131bd9b4ed5b9b25cf761af9afa7d462bef27c2d0e9453ce884cf7733a6556\n    disk_formats: [qcow2]\n    host_api: [api]\n", "  kubernetes: { chart: deploy/chart, postgres_modes: [external, cnpg] }\n"},
+		{"neither docker nor kairos", "  docker: {}\n  kubernetes: { chart: deploy/chart, postgres_modes: [external, cnpg] }\n  kairos:\n    base: ubuntu:26.04@sha256:6a06111c3b0a8600feadb270aec771dc239bf407b25625f93f44ab00e11f4d3c\n    kairos_init: quay.io/kairos/kairos-init:v4.4.0@sha256:eb131bd9b4ed5b9b25cf761af9afa7d462bef27c2d0e9453ce884cf7733a6556\n    disk_formats: [qcow2]\n    host_api: [api]\n", "  kubernetes: { chart: deploy/chart, postgres_modes: [external, cnpg] }\n"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			t.Parallel()
@@ -579,7 +579,7 @@ func TestKairosSettingsReachTheBundle(t *testing.T) {
 		old, new  string
 		os, disks bool
 	}{
-		{"base: ubuntu:26.04@sha256:c", "base: ubuntu:26.04@sha256:d", true, true},
+		{"base: ubuntu:26.04@sha256:6", "base: ubuntu:26.04@sha256:d", true, true},
 		{"kairos-init:v4.4.0@sha256:e", "kairos-init:v4.4.0@sha256:f", true, true},
 		{"pcspkr: { block: true, reason: a VM has no speaker }", "pcspkr: { block: true, reason: no speaker }", true, true},
 		{"redirect_always_follow: \"Y\"", "redirect_always_follow: \"N\"", true, true},

@@ -186,10 +186,10 @@ func TestEachRuleFiresOnFull(t *testing.T) {
 		{"audit fail_on", []edit{{sp, "fail_on: critical", "fail_on: none"}}, nil, `audit.fail_on: "none": one of negligible`},
 		{"audit allow missing", []edit{{sp, "allow: audit-allow.yaml", "allow: no-such.yaml"}}, nil, "audit.allow: no-such.yaml:"},
 		{"audit allow reason", []edit{{"audit-allow.yaml", "  reason: Docker's latest runc", "  reasons: Docker's latest runc"}}, nil, "audit.allow: audit-allow.yaml: yaml: unmarshal errors"},
-		{"audit allow date", []edit{{"audit-allow.yaml", "golang.org/x/net 0.55; no release with the fix yet\n  expires: 2027-01-31", "golang.org/x/net 0.55; no release with the fix yet\n  expires: 2027-02-30"}}, nil, `expires "2027-02-30": a date`},
-		{"audit allow artifact", []edit{{"audit-allow.yaml", "- id: GO-2026-6604\n  artifact: os", "- id: GO-2026-6604\n  artifact: osx"}}, nil, `audit.allow: audit-allow.yaml: allowance GO-2026-6604 in osx (package stdlib) (path /usr/bin/pebble): artifact "osx" is no artifact of the release: one of api, ingest, postgres, provision, ui, os, front, backup, chown, audit, installer, or "*"`},
+		{"audit allow date", []edit{{"audit-allow.yaml", "golang.org/x/net 0.55, no release has the fix; that build does not link x/net's HTTP/2 server, where the bug is\n  expires: 2027-01-31", "golang.org/x/net 0.55, no release has the fix; that build does not link x/net's HTTP/2 server, where the bug is\n  expires: 2027-02-30"}}, nil, `expires "2027-02-30": a date`},
+		{"audit allow artifact", []edit{{"audit-allow.yaml", "artifact: os\n  package: golang.org/x/net\n  path: /usr/bin/runc", "artifact: osx\n  package: golang.org/x/net\n  path: /usr/bin/runc"}}, nil, `audit.allow: audit-allow.yaml: allowance GO-2026-6612 in osx (package golang.org/x/net) (path /usr/bin/runc): artifact "osx" is no artifact of the release: one of api, ingest, postgres, provision, ui, os, front, backup, chown, audit, installer, or "*"`},
 		{"audit allow path", []edit{{"audit-allow.yaml", "path: /usr/bin/runc", "path: usr/bin/runc"}}, nil, `path "usr/bin/runc": an absolute, clean path`},
-		{"audit allow forever", []edit{{"audit-allow.yaml", "golang.org/x/net 0.55; no release with the fix yet\n  expires: 2027-01-31", "golang.org/x/net 0.55; no release with the fix yet\n  expires: 2099-01-01"}}, nil, "expires 2099-01-01: more than a year ahead"},
+		{"audit allow forever", []edit{{"audit-allow.yaml", "golang.org/x/net 0.55, no release has the fix; that build does not link x/net's HTTP/2 server, where the bug is\n  expires: 2027-01-31", "golang.org/x/net 0.55, no release has the fix; that build does not link x/net's HTTP/2 server, where the bug is\n  expires: 2099-01-01"}}, nil, "expires 2099-01-01: more than a year ahead"},
 		{"add_hosts name", []edit{{sp, "packages.atlas.test: [", "Packages.atlas.test: ["}}, nil, `images.api.add_hosts: "Packages.atlas.test" is not a host name`},
 		{"add_hosts address", []edit{{sp, "[192.0.2.10, 192.0.2.11]", "[192.0.2.10, 192.0.2]"}}, nil, `images.api.add_hosts.packages.atlas.test[1]: "192.0.2" is not an IP address without a zone`},
 		{"add_hosts zone", []edit{{sp, "[192.0.2.10, 192.0.2.11]", "[fe80::1%eth0]"}}, nil, `"fe80::1%eth0" is not an IP address without a zone`},
@@ -473,9 +473,9 @@ func TestEachRuleFiresOnFull(t *testing.T) {
 		{"backup exclude pattern", []edit{{sp, "lean: { exclude: [events", "lean: { exclude: [events-x"}}, nil, "is not a table pattern"},
 		{"backup profile name", []edit{{sp, "    config: [organisations", "    con-fig: [organisations"}}, nil, "lowercase letters and digits"},
 		{"postgres mode", []edit{{sp, "postgres_modes: [embedded, external]", "postgres_modes: [rds]"}}, nil, "unknown mode \"rds\""},
-		{"kairos base", []edit{{sp, "    base: ubuntu:26.04@sha256:c098726dd9b9733f3e885f8de0ef375206a311b0a317eadc40d347b1115fb944\n", ""}}, nil, "shapes.kairos.base: is required"},
+		{"kairos base", []edit{{sp, "    base: ubuntu:26.04@sha256:6a06111c3b0a8600feadb270aec771dc239bf407b25625f93f44ab00e11f4d3c\n", ""}}, nil, "shapes.kairos.base: is required"},
 		{"kairos init", []edit{{sp, "    kairos_init: quay.io/kairos/kairos-init:v4.4.0@sha256:eb131bd9b4ed5b9b25cf761af9afa7d462bef27c2d0e9453ce884cf7733a6556\n", ""}}, nil, "shapes.kairos.kairos_init: is required"},
-		{"kairos base unpinned", []edit{{sp, "base: ubuntu:26.04@sha256:c098726dd9b9733f3e885f8de0ef375206a311b0a317eadc40d347b1115fb944", "base: ubuntu:26.04"}}, nil, `shapes.kairos.base: "ubuntu:26.04" must be pinned by digest`},
+		{"kairos base unpinned", []edit{{sp, "base: ubuntu:26.04@sha256:6a06111c3b0a8600feadb270aec771dc239bf407b25625f93f44ab00e11f4d3c", "base: ubuntu:26.04"}}, nil, `shapes.kairos.base: "ubuntu:26.04" must be pinned by digest`},
 		{"kairos init unpinned", []edit{{sp, "kairos-init:v4.4.0@sha256:eb131bd9b4ed5b9b25cf761af9afa7d462bef27c2d0e9453ce884cf7733a6556", "kairos-init:v4.4.0"}}, nil, `"quay.io/kairos/kairos-init:v4.4.0" must be pinned by digest`},
 		{"pull shares the push token", []edit{{sp, "token_env: STOWAGE_PULL_TOKEN", "token_env: STOWAGE_PUSH_TOKEN"}}, nil, "registry.pull: token_env STOWAGE_PUSH_TOKEN is registry.push's"},
 		{"pull is the push docker config", []edit{{sp, "pull: { provider: token, user: atlas-pull, token_env: STOWAGE_PULL_TOKEN }", "pull: { provider: docker-config, config: ci }"}, {sp, "push: { provider: token, user: publisher, token_env: STOWAGE_PUSH_TOKEN }", "push: { provider: docker-config, config: ci/ }"}}, nil, "registry.pull: is registry.push's Docker config"},
@@ -1573,7 +1573,7 @@ func TestL4AllowlistToTheHostsNetworkWarnsOnDocker(t *testing.T) {
 func TestVMFirewallOnlyKeysWithoutKairosWarn(t *testing.T) {
 	t.Parallel()
 	root := testutil.CopyExample(t, "full")
-	testutil.Edit(t, root, specFile, "  kairos:\n    base: ubuntu:26.04@sha256:c098726dd9b9733f3e885f8de0ef375206a311b0a317eadc40d347b1115fb944\n    kairos_init: quay.io/kairos/kairos-init:v4.4.0@sha256:eb131bd9b4ed5b9b25cf761af9afa7d462bef27c2d0e9453ce884cf7733a6556\n    disk_formats: [raw, qcow2, ova, vhd, gce, iso]\n    cloud_publish: [aws, azure, gcp]\n    disks: opt-in   # always: every ship publishes the disks; opt-in (the default): a ship asked to (--disks)\n    health_gate: { deadline_s: 600, deadline_after_reset_s: 1800, poll_s: 30 }\n    host_api: [api]\n    "+vmSizeLine+"   # vm create's least and default size\n", "")
+	testutil.Edit(t, root, specFile, "  kairos:\n    base: ubuntu:26.04@sha256:6a06111c3b0a8600feadb270aec771dc239bf407b25625f93f44ab00e11f4d3c\n    kairos_init: quay.io/kairos/kairos-init:v4.4.0@sha256:eb131bd9b4ed5b9b25cf761af9afa7d462bef27c2d0e9453ce884cf7733a6556\n    disk_formats: [raw, qcow2, ova, vhd, gce, iso]\n    cloud_publish: [aws, azure, gcp]\n    disks: opt-in   # always: every ship publishes the disks; opt-in (the default): a ship asked to (--disks)\n    health_gate: { deadline_s: 600, deadline_after_reset_s: 1800, poll_s: 30 }\n    host_api: [api]\n    "+vmSizeLine+"   # vm create's least and default size\n", "")
 	testutil.Write(t, root, "audit-allow.yaml", "") // its entries are the OS bundle's, which the release no longer carries
 	res := run(t, root)
 	if errs := errorsOf(res); len(errs) > 0 {
@@ -2375,7 +2375,7 @@ func TestAGuardedRouteToTheHostsNetworkIsWarned(t *testing.T) {
 // A VM of a project without a database still keeps its data volumes: without a backup, warned.
 func TestAVMsDataVolumesWithoutABackupAreWarned(t *testing.T) {
 	t.Parallel()
-	kairos := "  docker: {}\n  kairos:\n    base: ubuntu:26.04@sha256:c098726dd9b9733f3e885f8de0ef375206a311b0a317eadc40d347b1115fb944\n    kairos_init: quay.io/kairos/kairos-init:v4.4.0@sha256:eb131bd9b4ed5b9b25cf761af9afa7d462bef27c2d0e9453ce884cf7733a6556\n    disk_formats: [qcow2]\n"
+	kairos := "  docker: {}\n  kairos:\n    base: ubuntu:26.04@sha256:6a06111c3b0a8600feadb270aec771dc239bf407b25625f93f44ab00e11f4d3c\n    kairos_init: quay.io/kairos/kairos-init:v4.4.0@sha256:eb131bd9b4ed5b9b25cf761af9afa7d462bef27c2d0e9453ce884cf7733a6556\n    disk_formats: [qcow2]\n"
 	const want = "the VM keeps its data volumes locally and no backup is declared (volumes-age-rclone archives them)"
 	for _, backup := range []bool{true, false} {
 		root := testutil.CopyExample(t, "stateless")
@@ -2408,7 +2408,7 @@ func TestAuditAllowNotice(t *testing.T) {
 		{"2026-11-07", ""},
 	} {
 		root := testutil.CopyExample(t, "full")
-		testutil.Edit(t, root, "audit-allow.yaml", "golang.org/x/net 0.55; no release with the fix yet\n  expires: 2027-01-31", "golang.org/x/net 0.55; no release with the fix yet\n  expires: "+c.expires)
+		testutil.Edit(t, root, "audit-allow.yaml", "golang.org/x/net 0.55, no release has the fix; that build does not link x/net's HTTP/2 server, where the bug is\n  expires: 2027-01-31", "golang.org/x/net 0.55, no release has the fix; that build does not link x/net's HTTP/2 server, where the bug is\n  expires: "+c.expires)
 		res, err := Run(root, filepath.Join(root, specFile), now)
 		if err != nil {
 			t.Fatal(err)
@@ -2431,7 +2431,7 @@ func TestAuditAllowNotice(t *testing.T) {
 	}
 	for art, ok := range map[string]bool{"disk-raw": false, "disk": false, "release": false, "api": true, "\"*\"": true, "front": true} {
 		root := testutil.CopyExample(t, "full")
-		testutil.Edit(t, root, "audit-allow.yaml", "- id: GO-2026-6604\n  artifact: os", "- id: GO-2026-6604\n  artifact: "+art)
+		testutil.Edit(t, root, "audit-allow.yaml", "artifact: os\n  package: golang.org/x/net\n  path: /usr/bin/runc", "artifact: "+art+"\n  package: golang.org/x/net\n  path: /usr/bin/runc")
 		res, err := Run(root, filepath.Join(root, specFile), now)
 		if err != nil {
 			t.Fatal(err)

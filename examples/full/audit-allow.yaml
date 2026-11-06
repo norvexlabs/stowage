@@ -6,35 +6,23 @@
   artifact: os
   package: golang.org/x/net
   path: /usr/bin/containerd
-  reason: Docker's latest containerd is built with golang.org/x/net 0.58; no release with the fix yet
+  reason: Docker's containerd.io 2.4.2 is built with golang.org/x/net 0.58, no release has the fix; that build does not link x/net's HTTP/2 server, where the bug is
   expires: 2027-01-31
 - id: GO-2026-6612
   artifact: os
   package: golang.org/x/net
   path: /usr/bin/containerd-shim-runc-v2
-  reason: Docker's latest containerd is built with golang.org/x/net 0.58; no release with the fix yet
+  reason: Docker's containerd.io 2.4.2 is built with golang.org/x/net 0.58, no release has the fix; that build does not link x/net's HTTP/2 server, where the bug is
   expires: 2027-01-31
 - id: GO-2026-6612
   artifact: os
   package: golang.org/x/net
   path: /usr/bin/ctr
-  reason: Docker's latest containerd is built with golang.org/x/net 0.58; no release with the fix yet
+  reason: Docker's containerd.io 2.4.2 is built with golang.org/x/net 0.58, no release has the fix; that build does not link x/net's HTTP/2 server, where the bug is
   expires: 2027-01-31
 - id: GO-2026-6612
   artifact: os
   package: golang.org/x/net
   path: /usr/bin/runc
-  reason: Docker's latest runc is built with golang.org/x/net 0.55; no release with the fix yet
-  expires: 2027-01-31
-- id: GO-2026-6612
-  artifact: os
-  package: stdlib
-  path: /usr/bin/pebble
-  reason: the Go standard library in the ubuntu:26.04 base image's pebble (go1.27.1); no base image with the fix yet
-  expires: 2027-01-31
-- id: GO-2026-6604
-  artifact: os
-  package: stdlib
-  path: /usr/bin/pebble
-  reason: the Go standard library in the ubuntu:26.04 base image's pebble (go1.27.1); no base image with the fix yet
+  reason: Docker's latest runc (containerd.io 2.4.2) is built with golang.org/x/net 0.55, no release has the fix; that build does not link x/net's HTTP/2 server, where the bug is
   expires: 2027-01-31

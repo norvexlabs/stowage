@@ -16,6 +16,13 @@ follow [SemVer](https://semver.org/).
   in Kairos's installer: today's Docker package and the Kairos 4.4.0 image carry the fixes. A project
   with the kairos shape can drop those two allowances once `ship` says, on a freshly built bundle,
   that they match no finding; its GO-2026-6612 entries for containerd and runc are still needed.
+- The examples' OS bundles build on `ubuntu:26.04@sha256:6a06111c…`, whose `pebble` is built with a
+  fixed Go (1.27.3), and the full example no longer accepts GO-2026-6612 or GO-2026-6604 in it. A
+  project with the kairos shape moves `shapes.kairos.base` to that image or a newer one, and drops
+  those two allowances once `ship` says, on a freshly built bundle, that they match no finding.
+- The full example's GO-2026-6612 entries left are for the containerd and runc of Docker's
+  containerd.io 2.4.2: the bug is in `golang.org/x/net`'s HTTP/2 server, which those builds do not
+  link, but the scanner goes by the library's version. Check this again for a later build.
 
 ## [0.28.1] - 2026-11-05
 
