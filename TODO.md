@@ -38,6 +38,12 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
 
 ## Should
 
+- **Keep a raised module's version in one place**: klauspost/compress is pinned in go.mod and in the
+  front, backup and scanner recipes, in three syntaxes, and only `make self-audit` notices one left
+  behind. A test comparing each recipe's pin with go.mod would catch it in `make check`.
+- **The front's `--replace` is a pin, not a floor**: a later Caddy needing a newer klauspost/compress
+  is silently held back to the replaced version. The recipe should fail when the replacement is below
+  what Caddy requires.
 - **A file input on a chart**: lint refuses one asked on the `kubernetes` shape, as the Secret holds
   its recorded form and a chart can only mount a key as it is. A second Secret of the decoded
   contents, named in `.Values.stowage`, would give it the same reach as on Docker and the VM.
