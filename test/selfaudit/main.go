@@ -3,7 +3,8 @@
 // from the recipes this tree embeds, makes the SBOM of each and of Stowage's binaries (stowage,
 // stowage-install, which the OS bundle carries), scans them with the pinned scanner and refuses,
 // exit 1, on a fixable finding at or above high that no allowance in force accepts. It runs where
-// Docker does: `make self-audit`, and the release workflow before anything is published.
+// Docker does: `make self-audit`, and the release workflow before anything is published. It also
+// reminds, on every run, of each module a recipe forces over its upstream's release (overrides.go).
 package main
 
 import (
@@ -19,9 +20,6 @@ import (
 
 	"github.com/google/go-containerregistry/pkg/name"
 
-	"github.com/norvexlabs/stowage/internal/backup"
-	"github.com/norvexlabs/stowage/internal/chown"
-	"github.com/norvexlabs/stowage/internal/front"
 	"github.com/norvexlabs/stowage/internal/sbom"
 )
 
@@ -38,6 +36,9 @@ func main() {
 }
 
 func run(ctx context.Context, bin, allowFile, db, cache string) error {
+	// Deferred: a run that fails, a recipe that no longer builds included, shows it too, and an
+	// override may be what to change.
+	defer remind(os.Stderr, recipes)
 	now := time.Now().UTC()
 	doc, err := os.ReadFile(allowFile)
 	if err != nil {
@@ -67,13 +68,10 @@ func run(ctx context.Context, bin, allowFile, db, cache string) error {
 	// Each subject: its name as a release names it, and what syft reads.
 	type subject struct{ name, file, source string }
 	var subjects []subject
-	for _, r := range []struct {
-		key    string
-		recipe []byte
-	}{{front.Key, front.Dockerfile}, {backup.Key, backup.Dockerfile}, {chown.Key, chown.Dockerfile}, {sbom.Key, sbom.Dockerfile}} {
+	for _, r := range recipes {
 		tag := "stowage-self-audit/" + r.key + ":latest"
 		fmt.Fprintf(os.Stderr, "building %s\n", r.key)
-		if err := docker(ctx, bytes.NewReader(r.recipe), nil, "buildx", "build", "--platform", sbom.Platform, "--load", "-t", tag, "-"); err != nil {
+		if err := docker(ctx, bytes.NewReader(r.file), nil, "buildx", "build", "--platform", sbom.Platform, "--load", "-t", tag, "-"); err != nil {
 			return fmt.Errorf("build %s: %w", r.key, err)
 		}
 		archive := r.key + ".tar"

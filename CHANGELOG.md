@@ -3,6 +3,13 @@
 Stowage's own releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
+## [0.29.1]
+
+### Changed
+
+- `make self-audit` names, on every run, each module the recipes force over what their upstream's
+  release ships, and reminds that each is a stopgap to drop once that upstream carries the fix.
+
 ## [0.29.0] - 2026-11-06
 
 ### Fixed

@@ -576,7 +576,9 @@ Off until the project configures a key (`signing: { provider: cosign-key, key: �
   its recipes, the installer), so a publisher knows which side owns each finding — the OS bundle
   is the project's, its pins deciding what it holds; Stowage's own release runs the
   same policy on what it supplies (`make self-audit`, fixable high and above) before it publishes,
-  so a project inherits no fixable finding of Stowage's.
+  so a project inherits no fixable finding of Stowage's. A module its recipes force over the
+  upstream's release leaves the scan clean, and so unmarked: that run lists each one, read from the
+  recipes, as a stopgap to drop once the upstream carries the fix.
 - **An app's own SBOM documents**: one audit covers the whole stack only if each image's SBOM
   names what the app put in it. syft reads what is self-describing (package databases, lock files,
   Go binaries, Rust binaries built by `cargo auditable`); what it cannot see — scripts a front

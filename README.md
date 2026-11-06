@@ -5217,7 +5217,7 @@ docs/                 DESIGN.md; img/ (the logo, icon, social preview, badge, di
 ```bash
 make check    # gofmt, go vet, staticcheck, govulncheck, go test -race — all in a container
 make build    # ./bin/stowage, static; built only after the checks stage passed
-make self-audit  # Stowage's own release gate, which the release workflow runs before it publishes: builds the front, the backup runner, the volume helper and the scanner from this tree's recipes, scans them and the binaries (stowage, stowage-install) with the pinned grype, prints the report by severity and refuses (exit 1) a fixable high or critical that audit-allow.yaml (the same format as a project's audit.allow) does not accept
+make self-audit  # Stowage's own release gate, which the release workflow runs before it publishes: builds the front, the backup runner, the volume helper and the scanner from this tree's recipes, scans them and the binaries (stowage, stowage-install) with the pinned grype, prints the report by severity, names every module the recipes force over their upstream's release, to be dropped once that upstream ships the fix, and refuses (exit 1) a fixable high or critical that audit-allow.yaml (the same format as a project's audit.allow) does not accept
 make image    # stowage:<version> runtime image (distroless)
 make test     # fast loop: unit tests without the race detector
 make gate     # the commit gate: check, build, lint, then only the end-to-end suites the change (against GATE_BASE, default HEAD, untracked files included) can affect; e2e-kairos, e2e-vm and e2e-full-vm (given STOWAGE_VM_ENV) one at a time beside the others, which run in parallel; each step of a suite prints the time since it began
