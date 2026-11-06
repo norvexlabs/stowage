@@ -493,7 +493,7 @@ func TestAProjectWithoutAFront(t *testing.T) {
 	}
 
 	// vm create refuses a front's mode before it says what a VM's front would need.
-	if _, _, err := e.installer(func(o *Options) { o.TLS = Loopback }).vmSettings(context.Background()); err == nil || !strings.Contains(err.Error(), "notes has no front: --tls") {
+	if _, _, _, err := e.installer(func(o *Options) { o.TLS = Loopback }).vmSettings(context.Background()); err == nil || !strings.Contains(err.Error(), "notes has no front: --tls") {
 		t.Errorf("vm create --tls none: %v", err)
 	}
 

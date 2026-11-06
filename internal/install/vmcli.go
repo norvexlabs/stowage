@@ -48,7 +48,7 @@ func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(
 	}
 	in := &Installer{R: r}
 	var ports, sets, setFiles, domains []string
-	var answers, secretsFile string
+	var answers, secretsFile, givenFile string
 	var noInput, accessible, asJSON bool
 	var group string
 	socket := Socket(name)
@@ -100,6 +100,18 @@ func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if err := prepare(); err != nil {
 				return err
+			}
+			if givenFile != "" {
+				if secretsFile != "" {
+					return errors.New("--secrets restores an install, --given gives a new one its secret inputs and TLS material: give one")
+				}
+				raw, err := readStdinFlag("--given", givenFile, cmd.InOrStdin())
+				if err == nil {
+					err = in.takeGiven(raw)
+				}
+				if err != nil {
+					return err
+				}
 			}
 			if ch := in.O.Channel; ch != "" && !lint.ChannelName(ch) {
 				return fmt.Errorf("--channel %q is not a channel name", ch)
@@ -157,7 +169,8 @@ func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(
 	f.BoolVar(&noInput, "no-input", false, "never ask: an input nothing gave takes its default")
 	f.BoolVar(&o.NoProvision, "no-provision", false, "start the stack without running the provision hook (`provision` runs it later)")
 	f.StringVar(&secretsFile, "secrets", "", "a first install's secrets: the file `secrets export` wrote, decrypted (- for standard input)")
-	f.BoolVar(&o.NewSecrets, "new-secrets", false, "generate the secrets though `vm create --secrets` made the install wait for exported ones")
+	f.StringVar(&givenFile, "given", "", "secret inputs and TLS material, as `vm create` gives them over SSH or leaves them in a .given file (- for standard input); on an installed VM, changes the recorded ones")
+	f.BoolVar(&o.NewSecrets, "new-secrets", false, "go on though `vm create` made the install wait: generate the secrets `vm create --secrets` would give, or take from the flags what its secret inputs and TLS material were")
 	f.BoolVar(&accessible, "accessible", false, "ask with plain line prompts (screen readers); also when ACCESSIBLE is set or TERM=dumb")
 	dirFlag(install)
 	settingsFlag(install)

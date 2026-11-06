@@ -91,9 +91,9 @@ func (in *Installer) mode(ctx context.Context, prev string) (mode string, asked 
 	}
 	o, offered := &in.O, in.R.Spec.Front.TLSModes
 	if in.remote {
-		offered = remoteModes(offered)
+		offered = in.createModes()
 		if len(offered) == 0 {
-			return "", false, fmt.Errorf("%s offers no TLS mode a VM can be created with: %s (loopback is not reached from outside the VM, and byo's key never goes in its cloud-config)", in.R.Spec.Name, strings.Join(in.R.Spec.Front.TLSModes, ", "))
+			return "", false, in.noCreateMode()
 		}
 	}
 	if len(offered) == 0 {
@@ -199,6 +199,25 @@ func remoteModes(offered []string) []string {
 	return slices.DeleteFunc(slices.Clone(offered), func(m string) bool { return m == Loopback || m == "byo" })
 }
 
+// createModes are the modes `vm create` can take: remoteModes, and byo once its certificate is
+// asked for by --tls or named, as its key then goes over the pinned SSH channel.
+func (in *Installer) createModes() []string {
+	o, offered := &in.O, in.R.Spec.Front.TLSModes
+	if slices.Contains(offered, "byo") && (o.TLS == "byo" || o.Cert != "" || o.Key != "") {
+		return slices.DeleteFunc(slices.Clone(offered), func(m string) bool { return m == Loopback })
+	}
+	return remoteModes(offered)
+}
+
+// noCreateMode is the refusal of a project whose front offers `vm create` no mode, naming the fix.
+func (in *Installer) noCreateMode() error {
+	fix := ""
+	if slices.Contains(in.R.Spec.Front.TLSModes, "byo") {
+		fix = ": give --cert and --key, whose key goes over SSH once the VM answers"
+	}
+	return fmt.Errorf("%s offers no TLS mode a VM can be created with: %s (loopback is not reached from outside the VM, and byo's key never goes in its cloud-config)%s", in.R.Spec.Name, strings.Join(in.R.Spec.Front.TLSModes, ", "), fix)
+}
+
 // domainMode is the mode a domain given without --tls picks: acme when offered, else the first
 // HTTPS mode offered; "" when there is none.
 func domainMode(offered []string) string {
@@ -233,7 +252,7 @@ func (in *Installer) loadCert(ctx context.Context) (*byoCert, error) {
 		return nil, errors.New("--tls byo needs --cert FILE and --key FILE: the certificate chain and its private key, PEM")
 	}
 	if o.Cert != "" {
-		c, err := readPair(o.Cert, o.Key)
+		c, err := o.readPair(o.Cert, o.Key)
 		if err != nil {
 			return nil, fmt.Errorf("--cert and --key: %w", err)
 		}
@@ -292,7 +311,7 @@ func (in *Installer) readCA(c *byoCert) error {
 	if in.O.CA == "" || in.O.CA == noCA {
 		return nil
 	}
-	raw, err := os.ReadFile(in.O.CA)
+	raw, err := in.O.readPEM(in.O.CA)
 	if err != nil {
 		return fmt.Errorf("--ca: %w", err)
 	}
@@ -323,6 +342,12 @@ func readLeaf(path string) ([]byte, *x509.Certificate, error) {
 	if err != nil {
 		return nil, nil, err
 	}
+	return leafFrom(path, raw)
+}
+
+// leafFrom returns the PEM certificate chain raw, read from name, and its first certificate,
+// refused when expired.
+func leafFrom(path string, raw []byte) ([]byte, *x509.Certificate, error) {
 	b, _ := pem.Decode(raw)
 	if b == nil || b.Type != "CERTIFICATE" {
 		return nil, nil, fmt.Errorf("%s holds no PEM certificate", path)
@@ -339,11 +364,20 @@ func readLeaf(path string) ([]byte, *x509.Certificate, error) {
 
 // readPair reads a certificate chain and its private key, checked as a pair.
 func readPair(certPath, keyPath string) (*byoCert, error) {
-	cert, leaf, err := readLeaf(certPath)
+	return (&Options{}).readPair(certPath, keyPath)
+}
+
+// readPair is readPair over what the options' TLS flags name: a Given's PEM, else the files.
+func (o *Options) readPair(certPath, keyPath string) (*byoCert, error) {
+	raw, err := o.readPEM(certPath)
 	if err != nil {
 		return nil, err
 	}
-	key, err := os.ReadFile(keyPath)
+	cert, leaf, err := leafFrom(certPath, raw)
+	if err != nil {
+		return nil, err
+	}
+	key, err := o.readPEM(keyPath)
 	if err != nil {
 		return nil, err
 	}
@@ -622,7 +656,7 @@ func (in *Installer) readClientCA() ([]byte, error) {
 	case v == noCA:
 		return nil, nil
 	}
-	raw, err := os.ReadFile(v)
+	raw, err := in.O.readPEM(v)
 	if err != nil {
 		return nil, fmt.Errorf("--client-ca: %w", err)
 	}

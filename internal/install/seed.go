@@ -312,6 +312,9 @@ func UserData(name, ctl string, m Machine, st Settings, ca []byte) ([]byte, erro
 		}, secondaries...),
 		Commands: []string{"networkctl reload"},
 	})
+	if st.AwaitGiven != "" {
+		boot[0].Files = append(boot[0].Files, cloudFile{Path: AwaitGivenFile(SettingsFile(name)), Permissions: 0o600, Content: st.AwaitGiven + "\n"})
+	}
 	if m.HostKey != nil {
 		key, dropIn, retired := seedHostKeyFiles(name)
 		before := "[ ! -e " + VMDir(name) + "/" + envName + " ] && [ ! -e " + retired + " ]"

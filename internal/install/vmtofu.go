@@ -94,15 +94,23 @@ func (o *Options) vmsDir(name string) (string, error) {
 	return filepath.Join(base, name, "vms"), nil
 }
 
+// sshPathOK refuses a directory ssh would misread in a known hosts file's path, with its escapes and
+// % tokens.
+func sshPathOK(dir string) error {
+	if strings.ContainsAny(dir, `%\"`) {
+		return fmt.Errorf("%s: a path ssh reads cannot hold %%, \\ or \"", dir)
+	}
+	return nil
+}
+
 // stateDir is where a VM OpenTofu created keeps its module, variables and state.
 func (o *Options) stateDir(name, host string) (string, error) {
 	vms, err := o.vmsDir(name)
 	if err != nil {
 		return "", err
 	}
-	// ssh reads its known hosts file's path with escapes and % tokens: none may be in it.
-	if strings.ContainsAny(vms, `%\"`) {
-		return "", fmt.Errorf("%s: a VM's state directory cannot hold %%, \\ or \" (set XDG_STATE_HOME elsewhere)", vms)
+	if err := sshPathOK(vms); err != nil {
+		return "", fmt.Errorf("%w (set XDG_STATE_HOME elsewhere)", err)
 	}
 	return filepath.Join(vms, host), nil
 }
@@ -585,8 +593,10 @@ func pinnedSSHArgs(pin, user, addr, pubKey string, command ...string) []string {
 // reports the install. A first boot runs the recovery system, then resets and reboots into the
 // active one, each with its own SSH host key: every attempt takes the key into a file of its own,
 // and the VM's known_hosts in dir is the one of the attempt that answered. With pin, a known_hosts
-// file of the host key the VM serves (pinnedSSHArgs), every attempt takes that key alone.
-func (in *Installer) awaitVM(ctx context.Context, dir, pin, user, addr, pubKey string, wait time.Duration, installs bool) error {
+// file of the host key the VM serves (pinnedSSHArgs), every attempt takes that key alone. With osRelease,
+// the release a first boot takes the OS of first, an answer from the OS it boots away from is not
+// ready: what is sent to it would die in its reboot.
+func (in *Installer) awaitVM(ctx context.Context, dir, pin, user, addr, pubKey string, wait time.Duration, installs bool, osRelease *OSRelease) error {
 	o, ctl := &in.O, in.R.Ctl()
 	if o.SSH == nil {
 		return errors.New("ssh is not available to this run")
@@ -608,9 +618,15 @@ func (in *Installer) awaitVM(ctx context.Context, dir, pin, user, addr, pubKey s
 		if err == nil {
 			var st Status
 			if err = json.Unmarshal(out, &st); err == nil {
+				otherOS := osRelease != nil && st.OS != (Version{osRelease.Version, osRelease.Revision})
 				switch {
 				case st.Boot == "recovery":
 					err = errors.New("the recovery system answers: the first boot is not done")
+				case otherOS:
+					err = fmt.Errorf("the OS of %s %d answers: the first boot has not taken %s's yet", st.OS.Version, st.OS.Revision, osRelease.Tag)
+					if st.InstallFailed != "" { // said, not fatal: a unit stopped by the switch's reboot reads so too
+						err = fmt.Errorf("%w (its boot says: %s; `journalctl -u %s` on the VM tells more)", err, st.InstallFailed, in.R.Spec.Name+".service")
+					}
 				case installs && st.InstallFailed != "":
 					if rerr := os.Rename(attempt, known); rerr != nil && !errors.Is(rerr, os.ErrNotExist) {
 						return rerr

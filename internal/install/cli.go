@@ -42,7 +42,7 @@ func newCommand(r *Release, self string, stdout, stderr io.Writer, tools K8sOpti
 	var ports, sets, setFiles, domains []string
 	var answers, to, secretsFile string
 	var noInput, accessible bool
-	var takesTLS bool // the running command is install, which alone takes an answers file's tls section
+	var takesTLS bool // the running command is install or vm create, which alone take an answers file's tls section
 	name := r.Spec.Name
 	in := &Installer{R: r}
 	prepare := func() error {
@@ -385,7 +385,7 @@ func newCommand(r *Release, self string, stdout, stderr io.Writer, tools K8sOpti
 		root.AddCommand(k8sCommand(in, &o, prepare, terminal, &sets, &answers, &noInput, &accessible))
 	}
 	if r.Spec.Shapes.Kairos != nil {
-		root.AddCommand(vmCreateCommand(in, &o, prepare, terminal, &sets, &setFiles, &domains, &answers, &noInput, &accessible))
+		root.AddCommand(vmCreateCommand(in, &o, prepare, terminal, &sets, &setFiles, &domains, &answers, &noInput, &accessible, &takesTLS))
 	}
 	root.AddCommand(mirrorCommand(in, &o, prepare))
 	root.AddCommand(auditCommand(in, &o, prepare, dirFlag, stdout), sbomCommand(in, &o, prepare, dirFlag, stdout))
@@ -586,11 +586,17 @@ func secretValue(cmd *cobra.Command, key string, check func(key, value string) e
 
 // readSecretsArg reads --secrets' file, or standard input for "-".
 func readSecretsArg(path string, stdin io.Reader) ([]byte, error) {
+	return readStdinFlag("--secrets", path, stdin)
+}
+
+// readStdinFlag reads the file flag names, standard input for -, up to one byte past
+// maxSecretsFile, so its reader refuses it.
+func readStdinFlag(flag, path string, stdin io.Reader) ([]byte, error) {
 	r := stdin
 	if path != "-" {
 		f, err := os.Open(expandHome(path))
 		if err != nil {
-			return nil, fmt.Errorf("--secrets: %w", err)
+			return nil, fmt.Errorf("%s: %w", flag, err)
 		}
 		defer f.Close()
 		r = f
@@ -824,7 +830,7 @@ func ipv6Flag(f *pflag.FlagSet, v **bool, usage string) {
 
 // vmCreateCommand is `vm create`: the files a new VM of the release needs, on a hypervisor or a
 // cloud (Installer.CreateVM).
-func vmCreateCommand(in *Installer, o *Options, prepare func() error, terminal func(bool) Prompter, sets, setFiles, domains *[]string, answers *string, noInput, accessible *bool) *cobra.Command {
+func vmCreateCommand(in *Installer, o *Options, prepare func() error, terminal func(bool) Prompter, sets, setFiles, domains *[]string, answers *string, noInput, accessible, takesTLS *bool) *cobra.Command {
 	name, m := in.R.Spec.Name, in.R.Manifest
 	var c VMCreate
 	var secretsFile string
@@ -839,12 +845,14 @@ func vmCreateCommand(in *Installer, o *Options, prepare func() error, terminal f
 		Short: fmt.Sprintf("Write a new VM's disk image of %s %s and its cloud-config, then print the platform's steps", name, m.ProjectVersion),
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) (err error) {
+			*takesTLS = true
 			if err := prepare(); err != nil {
 				return err
 			}
 			if !*noInput {
 				in.O.Prompt = terminal(*accessible)
 			}
+			in.O.Cert, in.O.Key, in.O.CA, in.O.ClientCA = expandHome(in.O.Cert), expandHome(in.O.Key), expandHome(in.O.CA), expandHome(in.O.ClientCA)
 			c.Progress = downloadProgress(in.O.Log)
 			for _, kv := range tofuVars {
 				k, v, ok := strings.Cut(kv, "=")
@@ -896,19 +904,30 @@ func vmCreateCommand(in *Installer, o *Options, prepare func() error, terminal f
 	f.StringVar(&c.Timezone, "timezone", "", "the VM's time zone, an IANA name such as Europe/Paris (default UTC)")
 	f.StringArrayVar(&c.Interfaces, "interface", nil, "a NIC the release names (host.interfaces), ROLE=SPEC (repeatable): a secondary's dhcp, static,address=A/P or none (the default), then mac= (default: generated on a hypervisor; a server's own on metal) and attach= (the hypervisor's network or bridge; default the primary's)")
 	f.StringVar(&c.Device, "device", "", "metal: the disk the OS installs on, wiped — a path under /dev/ (a /dev/disk/by-id/ one names it whatever the boot order), or auto (the largest disk); asked on a terminal")
-	f.StringVar(&secretsFile, "secrets", "", "the install's secrets, the file `secrets export` wrote, decrypted: the first install waits for them, given over SSH, never in the cloud-config")
+	f.StringVar(&secretsFile, "secrets", "", "the install's secrets, the file `secrets export` wrote, decrypted: the first install waits for them, given over SSH, never in the cloud-config (refused with a secret input or TLS material)")
 	tlsVM := "how the VM's front serves: none a VM can take (" + name + " offers " + strings.Join(in.R.Spec.Front.TLSModes, ", ") + ")"
 	if remote := remoteModes(in.R.Spec.Front.TLSModes); len(remote) > 0 {
 		tlsVM = "how the VM's front serves: " + strings.Join(remote, ", ") + "; default " + domainMode(remote) + " with --domains, else asked on a terminal"
+	}
+	if slices.Contains(in.R.Spec.Front.TLSModes, "byo") {
+		tlsVM += "; byo with --cert and --key, given over SSH"
+		f.StringVar(&o.Cert, "cert", "", "--tls byo: the certificate chain, PEM, given over SSH once the VM answers, never in the cloud-config")
+		f.StringVar(&o.Key, "key", "", "--tls byo: the certificate's private key, PEM, given over SSH once the VM answers, never in the cloud-config")
+		if in.R.Spec.Front.PublishCA != nil {
+			f.StringVar(&o.CA, "ca", "", "--tls byo: the CA the certificate chains to, PEM, given over SSH once the VM answers and published to the stack")
+		}
+	}
+	if len(clientAuthRoutes(in.R.Spec.Front)) > 0 {
+		f.StringVar(&o.ClientCA, "client-ca", "", "the CA, PEM, the client certificates of the routes with client_auth chain to, given over SSH once the VM answers")
 	}
 	f.StringVar(&o.TLS, "tls", "", tlsVM)
 	f.StringSliceVar(domains, "domains", nil, "a route's domain, route=host: HTTPS")
 	f.IntVar(&o.HTTPPort, "http-port", 0, "the VM's port a TLS front serves HTTP on (default the project's front.http_port, else 80)")
 	f.IntVar(&o.HTTPSPort, "https-port", 0, "the VM's port a TLS front serves HTTPS on (default the project's front.https_port, else 443)")
-	hideFrontFlags(f, in.R.Spec, []string{"tls", "domains", "http-port", "https-port"}) // --address is the VM's own
-	f.StringArrayVar(sets, "set", nil, "an input, KEY=VALUE (repeatable; never a secret input)")
-	f.StringArrayVar(setFiles, "set-file", nil, "a file input's file, KEY=PATH (repeatable; never a secret input)")
-	f.StringVar(answers, "answers", "", "a YAML file of inputs, KEY: value (never a secret input)")
+	hideFrontFlags(f, in.R.Spec, []string{"tls", "domains", "cert", "key", "ca", "client-ca", "http-port", "https-port"}) // --address is the VM's own
+	f.StringArrayVar(sets, "set", nil, "an input, KEY=VALUE (repeatable; never a secret input: --answers gives one)")
+	f.StringArrayVar(setFiles, "set-file", nil, "a file input's file, KEY=PATH (repeatable; never a secret input: --answers gives one)")
+	f.StringVar(answers, "answers", "", "a YAML file of inputs, KEY: value, and the front's tls section: secret inputs and TLS material are given over SSH once the VM answers, never in the cloud-config")
 	f.BoolVar(noInput, "no-input", false, "never ask: what nothing gave takes its default")
 	f.BoolVar(accessible, "accessible", false, "ask with plain line prompts (screen readers); also when ACCESSIBLE is set or TERM=dumb")
 	f.StringVar(&o.Registry, "registry", "", "a registry prefix to read the disk and the VM's updates from, a mirror")

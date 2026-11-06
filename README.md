@@ -1820,7 +1820,7 @@ again, to copy an installer to another host.
 - `--answers FILE` is a YAML map, `KEY: value`; a file input's also `KEY: {file: PATH}` (see "File inputs"), the path relative to the answers file.
   Its reserved `tls` section gives the front's TLS settings to an install or its re-run, on Docker and on the VM, as `--tls`, `--cert`, `--key`, `--ca` and `--client-ca` do, a flag winning over the file:
   `tls: { mode: byo, cert: front.crt, key: front.key, ca: root.pem, client_ca: root.pem }`, every field optional, a relative path relative to the answers file (no `~`, as `{file: PATH}`), and `none` for `ca` or `client_ca` the flags' word (`./none` is a file). A flag wins whole: `--cert` or `--key` replaces the section's `mode`, `cert`, `key` and `ca`; `--tls` with a mode other than `byo` replaces `mode` and leaves out `cert`, `key` and `ca`; `--domains` replaces a section's `mode: none` (loopback serves no domain); `--ca` and `--client-ca` replace only their own. The run logs which flags the section stands in for, as a later check names those flags (`the tls section of FILE gives --tls, --cert`), and which fields a flag left out; a file left out need not exist. The flags' checks apply unchanged, so a re-run given the section replaces the certificate as `--cert` and `--key` do; left out, a re-run keeps what the install recorded.
-  A field it does not know, one given twice or empty, a mode that is no TLS mode and a file it takes that does not exist are refused, naming the file and the field. Refused too: the section on any other command taking `--answers` (`upgrade`, `vm create`, `k8s install`, `k8s upgrade`; on Kubernetes the chart's ingress serves the routes, and a VM's cloud-config never carries a private key): remove it for that command.
+  A field it does not know, one given twice or empty, a mode that is no TLS mode and a file it takes that does not exist are refused, naming the file and the field. `vm create` takes it too, its material given over SSH ("Given over SSH"). Refused too: the section on any other command taking `--answers` (`upgrade`, `k8s install`, `k8s upgrade`; on Kubernetes the chart's ingress serves the routes): remove it for that command.
 - `--dry-run` on a first install prints every `KEY=VALUE` `.env` would record (secrets
   `<redacted>`) and writes nothing. On a re-run, it logs the changes a run would record and says
   the stack would be brought up again.
@@ -3741,7 +3741,8 @@ in the same installer (bootstrap it as above, then `sh <name>.sh vm create …`,
           [--ipv6 [--address6 A/P] [--gateway6 G]] [--tune-profile default|network]
           [--ssh-allow CIDR,…] [--timezone ZONE] [--device DISK] [--interface ROLE=SPEC]…
           [--add-host NAME=IP]… [--secrets FILE|-]
-          [--tls MODE] [--domains route=host,…] [--http-port N] [--https-port N]
+          [--tls MODE] [--cert FILE --key FILE] [--ca FILE] [--client-ca FILE]
+          [--domains route=host,…] [--http-port N] [--https-port N]
           [--set KEY=VALUE]… [--set-file KEY=PATH]… [--answers FILE] [--no-input] [--accessible]
           [--create opentofu|manual] [--module DIR] [--tofu-var NAME=VALUE]…
           [--vm-name N] [--pool P] [--dataset D] [--bridge B]
@@ -3751,7 +3752,7 @@ in the same installer (bootstrap it as above, then `sh <name>.sh vm create …`,
 <short>-stow vm attach HOSTNAME --interface ROLE=SPEC [--user U] [--ssh-key FILE] [--host H] [--wait DURATION]
 ```
 
-- A project whose front offers no mode a VM can take (only `none` and `byo`) is refused first.
+- A project whose front offers no mode a VM can take (only `none`, or `byo` and no certificate given) is refused first, saying to give `--cert` and `--key` when it offers `byo`.
 - The platform decides the disk format (the first of its formats the registry holds: a mirror
   carries the formats its `mirror export --disks` named) and how the cloud-config reaches the VM.
   Only the platforms the registry has a disk for are offered; a `--platform` whose formats the
@@ -3893,10 +3894,10 @@ in the same installer (bootstrap it as above, then `sh <name>.sh vm create …`,
   secrets`): after the install and a reboot the VM serves its own key, so `ssh-keygen -R <address>`
   then. Then the product, as the VM's `install` asks it: the
   TLS mode (an HTTPS one: never `none`, whose loopback address nothing outside the VM reaches,
-  nor `byo`, whose private key the cloud-config never carries), the domains and the inputs of the
+  nor `byo` unless its certificate is given, whose private key the cloud-config never carries), the domains and the inputs of the
   `kairos` shape — never from the environment, which says nothing about the VM — but no secret
-  input: one given is refused, and one the install
-  requires is named at the end, for the operator to give over SSH (`ssh <user>@<address> sudo
+  input is asked: one in `--answers` goes over SSH ("Given over SSH"), and one the install
+  requires that nothing gives is named at the end, for the operator to give over SSH (`ssh <user>@<address> sudo
   <short>-stow install`). The answers are reviewed ("Go on with these answers"), the whole is shown,
   and on a terminal confirmed; without one the flags and the defaults decide. The whole names the
   ports the VM opens to each `l4` route (`opens tcp/15432 (L4 route db) to every source`, or `to
@@ -3966,7 +3967,9 @@ in the same installer (bootstrap it as above, then `sh <name>.sh vm create …`,
   other, so every program of the VM that uses it trusts a certificate that CA issues for any
   name; give a CA that issues the mirror's certificate alone (a dedicated one, not a company's
   root). It carries no secret,
-  but with `--secrets` the one-time host key (its header says so).
+  but with `--secrets` or given material (see "Given over SSH") the one-time host key (its header says so).
+- **Given over SSH.** A secret input in `--answers` (`--set` and `--set-file` of one are still refused, as a command line is no place for it) and the front's `byo` certificate, key and CA and its client CA (`--cert`, `--key`, `--ca`, `--client-ca`, or the answers file's `tls` section, `--tls byo` asking the paths on a terminal) never enter the cloud-config. `vm create` checks each before a VM exists (the pair, its expiry, its chain, that it covers each route's domain, the input's own check, 1 MiB in all), the review names them and never a value, the seed says only `await_secrets: true`, carries no `tls` for `byo`, and writes `/etc/<name>/install.yaml.given` (`byo`, else `given`), and the first boot waits. A chain without `--ca` is checked against this machine's trusted CAs, and again by the install against the VM's, so give `--ca` for a private CA. A required secret input the file does not give is refused, as the install over SSH has no terminal to ask it, and so is `--secrets` with any of them: it restores an install, so create the VM with `--secrets` alone and give them by a re-run over SSH.
+  With OpenTofu the material goes over SSH, on standard input, to `sudo <short>-stow install --given - --no-input`, pinned to the one-time host key as `--secrets` is. `<state>/given.yaml` (0600, beside `<state>/given.yaml.known_hosts`) holds it from before the VM exists until the install took it, and `vm destroy` removes it: if the wait or the install fails the VM is kept, and the error prints the step below for that file. By hand, `vm create` writes `<out>/<hostname>.given` (0600) and `<out>/<hostname>.given.known_hosts` beside the seed, refuses a `.given` already there, and prints the step, for `<address>` the VM's: `ssh -o HostKeyAlias=vm-seed-host-key -o ConnectTimeout=10 -o StrictHostKeyChecking=yes -o 'UserKnownHostsFile="<file>.known_hosts"' [-i KEY -o IdentitiesOnly=yes] <user>@<address> -- sudo <short>-stow install --given - --no-input < <file> && rm <file> <file>.known_hosts`. Run again after a failure, it finishes the install, and only success removes the file; a VM that rebooted since the install began has retired the one-time key, so ssh refuses it: check the VM's own key on its console, run the command without its `HostKeyAlias`, `StrictHostKeyChecking` and `UserKnownHostsFile` options, and remove the file. An `--out` with a character ssh reads in a path (`%`, a backslash, `"`) is refused for this file. With a disk of another release the first boot also writes this release's OS and reboots: the step is for that OS, and `vm create` says so. An install finished by this step leaves the one-time key served until the VM's next reboot, and `known_hosts` empty. OpenTofu failing keeps `given.yaml` for a VM it may have left waiting, for `vm destroy` to remove, and removes it when it failed before it wrote its variables, as no VM exists then. `install --given` is refused on Kairos's recovery system, as the reset wipes what it installs: the step works once the first boot rebooted.
 - **With OpenTofu** (`--create opentofu`). `vm create` then creates the VM itself instead of
   printing steps, with a module: the platform's built-in one, or the operator's (`--module DIR`).
   The built-in modules, each pinning its provider's release exactly, with its lock file (the
@@ -4082,7 +4085,7 @@ in the same installer (bootstrap it as above, then `sh <name>.sh vm create …`,
     the seed's paths and SHA-256 — no credential), `platform` (`<platform> builtin` or
     `<platform> module`, which `vm destroy` reads), the seed (`seed.iso`, or `user-data.yaml` on a
     cloud), OpenTofu's `terraform.tfstate`, and `known_hosts` (the VM's SSH host key; with
-    `--secrets`, `known_hosts.seed` holds the one-time key while it is pinned). A host name
+    `--secrets`, `known_hosts.seed` holds the one-time key while it is pinned, and with given material `given.yaml.known_hosts`). A host name
     whose directory holds the variables (an apply ran, or was tried) is refused: `vm destroy` it
     first, or choose another `--hostname`. So is a `--vm-name` another VM there already has,
     whatever its case (on TrueNAS its zvol and staging dataset would be the same).
@@ -4126,7 +4129,7 @@ in the same installer (bootstrap it as above, then `sh <name>.sh vm create …`,
     the VM's install runs as root, \`sudo <short>-stow install\``; as root, `D is not writable, by root
     either (a read-only filesystem?)`), `--dry-run` checks the same and waits for nothing, saying
     what a run would wait for, and a host whose init is not systemd (`systemctl` there, but no
-    `/run/systemd/system`) waits for nothing). With `--secrets` it waits until the VM answers, then runs `sudo systemctl start
+    `/run/systemd/system`) waits for nothing). On a disk of another release it also waits until the VM answers from this release's OS (up to 40 min by default), saying what the old OS's boot reported if that wait ends. With `--secrets` it waits until the VM answers, then runs `sudo systemctl start
     <name>.service && sudo <short>-stow install --secrets - --no-input` there over the same SSH (the
     boot unit first: it runs once the release's images are loaded), the file on its standard input (a secret
     input still due: it prints how to give both instead — `chmod 600 FILE; scp -p FILE
@@ -4220,6 +4223,7 @@ sudo <short>-stow install [--channel C] [--set KEY=VALUE]… [--set-file KEY=PAT
           [--cert F --key F [--ca F]] [--http-port N] [--https-port N] [--no-provision] [--dry-run]
           [--tune-profile default|network|release]   # on an installed VM, a higher profile applies at once, a lower one at the next reboot
           [--secrets FILE|- | --new-secrets]   (both: refused)
+          [--given FILE|-]                     (with --secrets: refused)
 <short>-stow status [--json]          # this OS's release, the install's (and `not finished` while a first install's stack comes up or its provision hook runs, or after one failed — with why, and the `sudo <short>-stow install` that runs it again; `"installing": true` and `"install_failed": "<why>"` in JSON; `not provisioned` while an install given `--secrets` awaits the backup `restore` loads, `"restore_awaited": true`; `not running` while a restore left the volumes half restored, `"volumes_split": true`), the channel, the stack's tuning profile and whose it is (`tune       network (operator)`, `"tune"` in JSON), the system Kairos booted (active, passive or recovery; the fallback), the last failed boot, the disk, a byo install's certificate (`cert`: its names, end and days left, with a warning from 30 days before it; `"cert"` in JSON), a network warning (`network    warning: …`, `"network_warning"` in JSON: IPv6 on and no IPv6 default route for a minute or more), the services
 <short>-stow health [--json]          # ready, or fails saying why: the health gate's check, once
 <short>-stow events [--after N] [--follow|-f] [--json]   # the event journal: jobs, reboots, boots and the health gate's verdicts, the first install; --follow waits for more until interrupted, through daemon restarts
@@ -4262,10 +4266,11 @@ sudo <short>-stow network attach --role ROLE --mac MAC [--mode dhcp|static|none]
   is the Docker shape's too, moving between TLS modes and taking a new certificate (`--tls`,
   `--cert`, `--key`, `--ca` for a project with `front.publish_ca`, and `--client-ca` for one
   with a `client_auth` route), and `--secrets` makes a
-  first install with exported secrets (see `secrets export` under the Docker shape). A first
+  first install with exported secrets (see `secrets export` under the Docker shape). `--given FILE|-`
+  takes what `vm create` gives over SSH, at most 1 MiB, strict YAML (`project`, `inputs` of KEY: value with a file input as `stowage-file:<base64>`, `tls` of `cert`, `key`, `ca`, `client_ca` as PEM; a certificate picks `byo`): a first install or a re-run, refused with `--secrets`, on Kairos's recovery system, when encrypted, for another project, holding nothing, with a `cert` or `key` alone, or a `ca` without a `cert`. Flags and `--answers` win: `--cert`, `--key` or `--tls` with another mode leave out the file's `cert`, `key` and `ca`, `--ca` and `--client-ca` their own, and the run logs what it left out. A first
   install takes the settings file `/etc/<name>/install.yaml` (written by the cloud-config `vm
   create` makes; YAML: `channel`, `tls`, `http_port`, `https_port`, `inputs` of KEY: value,
-  `await_secrets`, `ipv6`, `release` (see `vm create`: the release whose OS a first boot takes first), and `registry` and `registry_ca` — a mirror and the file of its CA, taken as `--registry` and
+  `await_secrets` (the first install waits for what `vm create` gives over SSH), `ipv6`, `release` (see `vm create`: the release whose OS a first boot takes first), and `registry` and `registry_ca` — a mirror and the file of its CA, taken as `--registry` and
   `--registry-ca`, so the install records them and its updates and upgrades read the mirror,
   with root's Docker login on the VM, anonymously when it has none —; any other key refused) for what its flags and `--answers` do not give (its `tls` is not taken when
   `--cert` or `--key` is given, nor when its `tls` is `none` and a domain is given, by
@@ -4281,10 +4286,10 @@ sudo <short>-stow network attach --role ROLE --mac MAC [--mode dhcp|static|none]
   and the cloud-config's boot and network stages, `cos-setup-boot.service` and
   `cos-setup-network.service`). With no install, it makes the first one from the settings file,
   with nothing asked; without that file, while a secret input the install requires has no
-  value, or when the file says `await_secrets: true` (`vm create --secrets`), it does nothing,
-  saying that `sudo <short>-stow install` (`--secrets`) makes it — and an install without
-  `--secrets` is then refused, as it would generate secrets the backups do not match, unless
-  `--new-secrets` (the file lost) generates them (that run takes the
+  value, or when the file says `await_secrets: true` (`vm create --secrets`, or material given over SSH), it does nothing,
+  saying that `sudo <short>-stow install` (`--secrets`; `--given` when `install.yaml.given` marks that wait) makes it — and an install without
+  it is then refused (`--given` does not meet the wait for `--secrets`, nor `--secrets` the wait for `--given`), as it would generate secrets the backups do not match, unless
+  `--new-secrets` (the file lost) goes on, generating them, or with the flags that give the material again; a mark of `byo` keeps the mode `byo` unless `--tls` says otherwise, so that run asks for the certificate rather than moving to another mode (that run takes the
   settings file and asks the rest). An upgrade or a rollback a reboot stopped is finished first by
   the install's own `<short>-stow` (`.stowage-prev/` recording the release the install runs gives
   it away). Then an install of the OS's release comes up again; an install of

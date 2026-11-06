@@ -143,8 +143,8 @@ func (in *Installer) CreateVM(ctx context.Context, c *VMCreate) error {
 	if in.R.Spec.Shapes.Kairos == nil || m.Artifacts.OS == "" {
 		return fmt.Errorf("%s %s publishes no OS bundle (shapes.kairos)", name, m.ProjectVersion)
 	}
-	if in.R.Spec.HasFront() && len(remoteModes(in.R.Spec.Front.TLSModes)) == 0 {
-		return fmt.Errorf("%s offers no TLS mode a VM can be created with: %s (loopback is not reached from outside the VM, and byo's key never goes in its cloud-config)", name, strings.Join(in.R.Spec.Front.TLSModes, ", "))
+	if in.R.Spec.HasFront() && len(in.createModes()) == 0 {
+		return in.noCreateMode()
 	}
 	if c.Secrets != nil {
 		f, err := in.readSecrets(c.Secrets)
@@ -208,11 +208,14 @@ func (in *Installer) CreateVM(ctx context.Context, c *VMCreate) error {
 	if err != nil {
 		return err
 	}
-	st, waiting, err := in.vmSettings(ctx)
+	st, waiting, given, err := in.vmSettings(ctx)
 	if err != nil {
 		return err
 	}
-	st.AwaitSecrets = c.Secrets != nil
+	st.AwaitSecrets = c.Secrets != nil || given != nil
+	if given != nil {
+		st.AwaitGiven = given.awaits()
+	}
 	st.IPv6 = c.IPv6 // the install's network too: the front's IPv6 clients keep their address
 	st.TuneProfile = c.TuneProfile
 	// Another release's disk: the first boot takes this release's OS bundle before it installs.
@@ -280,15 +283,37 @@ func (in *Installer) CreateVM(ctx context.Context, c *VMCreate) error {
 	} else if _, err := os.Lstat(seed); err == nil { // a seed may already be attached to a VM: never replaced
 		return fmt.Errorf("%s exists: move it away, or give the VM another --hostname or --out", seed)
 	}
+	// Manual steps: the given material waits in a file of the operator's, beside the seed, and ssh
+	// reads its pin's path.
+	givenFile := filepath.Join(state, "given.yaml")
+	if !tofu {
+		// Absolute: the step is run later, from anywhere.
+		abs, err := filepath.Abs(out)
+		if err != nil {
+			return err
+		}
+		givenFile = filepath.Join(abs, mach.Hostname+".given")
+		if given != nil {
+			if err := sshPathOK(abs); err != nil {
+				return fmt.Errorf("--out: %w", err)
+			}
+		}
+		for _, f := range []string{givenFile, givenFile + ".known_hosts"} {
+			if _, err := os.Lstat(f); given != nil && err == nil {
+				return fmt.Errorf("%s exists: move it away, or give the VM another --hostname or --out", f)
+			}
+		}
+	}
+	givenPin := givenFile + ".known_hosts"
 	for _, a := range []string{mach.staticAddr(), mach.staticAddr6()} {
 		if !tofu && a != "" {
 			in.sshAllows(a, mach)
 		}
 	}
-	if err := in.confirmVM(ctx, p, format, mach, st, seed, c, addr); err != nil {
+	if err := in.confirmVM(ctx, p, format, mach, st, given, seed, c, addr); err != nil {
 		return err
 	}
-	// The secrets go over SSH to a host key known beforehand: one generated here, which the
+	// What is given goes over SSH to a host key known beforehand: one generated here, which the
 	// cloud-config carries and the VM serves until its install.
 	var hostKey *seedHostKey
 	if st.AwaitSecrets {
@@ -345,9 +370,31 @@ func (in *Installer) CreateVM(ctx context.Context, c *VMCreate) error {
 	}
 	ctl := in.R.Ctl()
 	if tofu {
+		// Written before a VM exists, so a VM never waits for what is lost; `vm destroy` removes it
+		// with the state, and a done install at once.
+		if given != nil {
+			if err := writeGiven(givenFile, givenPin, given, hostKey); err != nil {
+				return err
+			}
+		}
 		id, out, err := in.applyVM(ctx, state, c.Ctl, p, mach, st, &c.TofuVM, files, declared, disk, format, layer.Hex, seed)
 		if err != nil {
-			err = fmt.Errorf("%w\n(the state is in %s: `%s vm create` again with the same --hostname is refused; `%s vm destroy %s` removes what was made)", err, state, ctl, ctl, mach.Hostname)
+			// A failure past the variables may leave a VM waiting, and `vm destroy` removes the file
+			// with the state. Before them no VM exists, and no `vm destroy` finds this state.
+			if given != nil {
+				if _, serr := os.Lstat(filepath.Join(state, varsFile)); errors.Is(serr, os.ErrNotExist) {
+					if rerr := errors.Join(os.Remove(givenFile), os.Remove(givenPin)); rerr != nil {
+						o.logf("warning: %v: it holds what the VM was to be given", rerr)
+					}
+				} else {
+					o.logf("%s holds what a VM made by this run waits for: `%s vm destroy %s` removes it", givenFile, ctl, mach.Hostname)
+				}
+			}
+			if _, serr := os.Lstat(filepath.Join(state, varsFile)); errors.Is(serr, os.ErrNotExist) {
+				err = fmt.Errorf("%w\n(no VM was made: `%s vm create` runs again with the same --hostname)", err, ctl)
+			} else {
+				err = fmt.Errorf("%w\n(the state is in %s: `%s vm create` again with the same --hostname is refused; `%s vm destroy %s` removes what was made)", err, state, ctl, ctl, mach.Hostname)
+			}
 			if p.Key == "libvirt" && c.Module == "" {
 				// The provider defines the domain, then starts it: a failed start leaves the domain
 				// defined, out of the state, where no destroy reaches it.
@@ -370,18 +417,40 @@ func (in *Installer) CreateVM(ctx context.Context, c *VMCreate) error {
 			wait = 40 * time.Minute // the first boot writes the release's OS bundle and reboots first
 		}
 		pin := ""
-		if hostKey != nil {
+		if given != nil {
+			pin = givenPin // writeGiven wrote it
+		} else if hostKey != nil {
 			pin = filepath.Join(state, "known_hosts.seed")
 			if err := writeAtomic(pin, strings.NewReader(seedHostAlias+" "+hostKey.Public+"\n"), 0o600, nil); err != nil {
 				return err
 			}
 		}
-		if err := in.awaitVM(ctx, state, pin, mach.User, addr, c.SSHKey, cmp.Or(c.Wait, wait), len(waiting) == 0 && !st.AwaitSecrets); err != nil {
+		giveAgain := func() string {
+			return "this gives what `vm create` gave, then removes the file holding it: " + givenSteps(mach.User, addr, ctl, givenFile, givenPin, c.SSHKey) + "; " + givenRetired + " `" + ctl + " vm destroy " + mach.Hostname + "` removes the VM and that file. " + strings.TrimSpace(seedHostKeyNote(hostKey, addr))
+		}
+		if err := in.awaitVM(ctx, state, pin, mach.User, addr, c.SSHKey, cmp.Or(c.Wait, wait), len(waiting) == 0 && !st.AwaitSecrets, st.Release); err != nil {
+			if given != nil {
+				return fmt.Errorf("%w; once it answers, %s", err, giveAgain())
+			}
 			return err
 		}
-		if st.AwaitSecrets && len(waiting) == 0 {
+		if given != nil {
+			raw, err := marshalGiven(given)
+			if err != nil {
+				return err
+			}
+			o.logf("installing over SSH with %s", given.names())
+			args := pinnedSSHArgs(pin, mach.User, addr, c.SSHKey, firstInstallOverSSH(name, ctl, "--given")...)
+			if _, err := o.SSH.Run(ctx, Cmd{Args: args, Stdin: bytes.NewReader(raw), Stream: o.Log}); err != nil {
+				return fmt.Errorf("the install over SSH: %w; the VM is kept: `ssh %s@%s %s status` tells where it stopped — %s", err, mach.User, addr, ctl, giveAgain())
+			}
+			if err := os.Remove(givenFile); err != nil {
+				o.logf("warning: %v: it holds what the install took", err)
+			}
+			in.retireSeedHostKey(ctx, state, pin, mach, addr, c.SSHKey)
+		} else if st.AwaitSecrets && len(waiting) == 0 {
 			o.logf("installing over SSH with the secrets given")
-			args := pinnedSSHArgs(pin, mach.User, addr, c.SSHKey, secretsInstall(name, ctl)...)
+			args := pinnedSSHArgs(pin, mach.User, addr, c.SSHKey, firstInstallOverSSH(name, ctl, "--secrets")...)
 			if _, err := o.SSH.Run(ctx, Cmd{Args: args, Stdin: bytes.NewReader(c.Secrets), Stream: o.Log}); err != nil {
 				return fmt.Errorf("the install over SSH with the secrets: %w; the VM is kept: `ssh %s@%s %s status` tells where it stopped — `sudo %s install` finishes an install begun, and %s; `%s vm destroy %s` removes it. %s",
 					err, mach.User, addr, ctl, ctl, secretsSteps(mach.User, addr, ctl), ctl, mach.Hostname, strings.TrimSpace(seedHostKeyNote(hostKey, addr)))
@@ -421,6 +490,18 @@ func (in *Installer) CreateVM(ctx context.Context, c *VMCreate) error {
 			}
 			fmt.Fprintf(o.Out, "    %s  %s  on %s\n", i.Role, i.MAC, on)
 		}
+	}
+	if given != nil {
+		if err := writeGiven(givenFile, givenPin, given, hostKey); err != nil {
+			return err
+		}
+		fmt.Fprintf(o.Out, "\nIts first install waits for %s, which the cloud-config never carries. %s holds them, for you alone: once the first boot is done (a VM boots its recovery system, then reboots), run, with its address for <address>:\n  %s\n", given.names(), givenFile, givenSteps(mach.User, "<address>", ctl, givenFile, givenPin, c.SSHKey))
+		fmt.Fprintf(o.Out, "%s\n", givenRetired)
+		if st.Release != nil {
+			fmt.Fprintf(o.Out, "Its disk carries %s: its first boot also writes %s's OS and reboots into it, and the step is for that OS (`%s status` over SSH names it).\n", boot.release, m.Tag, ctl)
+		}
+		fmt.Fprint(o.Out, seedHostKeyNote(hostKey, "<address>"))
+		return nil
 	}
 	if st.AwaitSecrets {
 		fmt.Fprintf(o.Out, "\nIts first install waits for its secrets (the file `secrets export` wrote, decrypted), which the cloud-config never carries: %s\n", secretsSteps(mach.User, "<address>", ctl))
@@ -625,16 +706,16 @@ type noBootDisk struct{ error }
 
 func (e noBootDisk) Unwrap() error { return e.error }
 
-// secretsInstall is the command `vm create --secrets` runs on the VM over SSH, the secrets on its
-// standard input. The install comes after the boot unit, which runs once the release's images are
+// firstInstallOverSSH is the command `vm create` runs on the VM over SSH, what flag (--secrets or
+// --given) takes on its standard input. The install comes after the boot unit, which runs once the release's images are
 // loaded (`systemctl start` waits for it, or returns at once once it ran). A start whose job the
 // boot cancels (`Job for <name>.service canceled.`, the boot's own start of it still queued) is
 // tried once more, after the boot's jobs are done (waited for 10 min at most); a unit that failed
 // is not run again, and a second start that fails fails the install too.
-func secretsInstall(name, ctl string) []string {
+func firstInstallOverSSH(name, ctl, flag string) []string {
 	unit := name + ".service"
 	return []string{"sudo", "systemctl", "start", unit, "||", "{", "sudo", "timeout", "600", "systemctl", "is-system-running", "--wait", ">/dev/null", ";",
-		"!", "systemctl", "is-failed", "--quiet", unit, "&&", "sudo", "systemctl", "start", unit, ";", "}", "&&", "sudo", ctl, "install", "--secrets", "-", "--no-input"}
+		"!", "systemctl", "is-failed", "--quiet", unit, "&&", "sudo", "systemctl", "start", unit, ";", "}", "&&", "sudo", ctl, "install", flag, "-", "--no-input"}
 }
 
 // secretsSteps tells how to give a VM's install its secrets file: copied over, its mode kept
@@ -1165,32 +1246,31 @@ func (in *Installer) askGiven(ctx context.Context, qs []Question, given, default
 }
 
 // vmSettings asks the product's questions as the VM's install asks them — the TLS mode, then the
-// inputs of the Kairos shape in that mode — but no secret: a secret input given is refused, and
-// one the install needs is returned, for the operator to give over SSH. The VM is served over
-// HTTPS: loopback, which nothing outside the VM reaches, and byo, whose key the cloud-config never
-// carries, are not offered. No input and no domain is read from the operator's environment (the
-// pull token still is).
-func (in *Installer) vmSettings(ctx context.Context) (*Settings, []string, error) {
+// inputs of the Kairos shape in that mode — but no secret: a secret input in the answers file, and
+// a byo certificate, are checked here and returned as what goes over the pinned SSH channel, never
+// in Settings; a secret input --set is refused, as a command line is no place for one, and one the
+// install needs is returned, for the operator to give over SSH. The VM is served over HTTPS:
+// loopback, which nothing outside the VM reaches, is not offered, and byo only with its certificate
+// (createModes). No input and no domain is read from the operator's environment (the pull token
+// still is).
+func (in *Installer) vmSettings(ctx context.Context) (*Settings, []string, *Given, error) {
 	o := &in.O
 	o.Preloaded = true // the VM's install: the inputs of the Kairos shape
 	in.goOn, in.remote = "Go on with these answers", true
 	if !in.R.Spec.HasFront() {
 		if err := in.frontFlags(); err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 	}
-	switch o.TLS {
-	case "byo":
-		return nil, nil, fmt.Errorf("--tls byo copies a certificate's private key, which the cloud-config never carries: create the VM with another mode, or install it over SSH (`sudo %s install --tls byo`)", in.R.Ctl())
-	case Loopback:
-		return nil, nil, errors.New("--tls none serves on the VM's loopback address alone, which nothing outside it reaches: give the VM an HTTPS mode")
+	if o.TLS == Loopback {
+		return nil, nil, nil, errors.New("--tls none serves on the VM's loopback address alone, which nothing outside it reaches: give the VM an HTTPS mode")
 	}
 	if err := in.applyDomains(); err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	// The front's ports, as the VM's install takes them (a TLS mode's, whichever it is), before
 	// the form: its first boot would refuse them, and one the VM's SSH holds.
-	if in.R.Spec.HasFront() && len(remoteModes(in.R.Spec.Front.TLSModes)) > 0 {
+	if in.R.Spec.HasFront() && len(in.createModes()) > 0 {
 		pub, err := in.publish("")
 		if err == nil {
 			err = in.l4Clash(pub)
@@ -1201,7 +1281,7 @@ func (in *Installer) vmSettings(ctx context.Context) (*Settings, []string, error
 			}
 		}
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 	}
 	var mode string
@@ -1210,18 +1290,22 @@ func (in *Installer) vmSettings(ctx context.Context) (*Settings, []string, error
 	for {
 		m, asked, err := in.mode(ctx, mode)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		mode = m
+		in.byo = nil
+		if mode == "byo" {
+			if in.byo, err = in.loadCert(ctx); err != nil {
+				return nil, nil, nil, err
+			}
+		}
 		if err := in.knownInputs(mode); err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		list = nil
 		for _, i := range in.inputList(mode) {
-			_, set := o.Set[i.Key]
-			_, answered := o.Answers[i.Key]
-			if i.Secret && (set || answered) {
-				return nil, nil, fmt.Errorf("%s is a secret input, which the cloud-config never carries: give it over SSH (`sudo %s install`)", i.Key, in.R.Ctl())
+			if _, set := o.Set[i.Key]; i.Secret && set {
+				return nil, nil, nil, fmt.Errorf("%s is a secret input, which a command line never carries: give it in the --answers file, which goes over SSH once the VM answers, or later (`sudo %s install`)", i.Key, in.R.Ctl())
 			}
 			if !i.Secret {
 				list = append(list, i)
@@ -1232,17 +1316,26 @@ func (in *Installer) vmSettings(ctx context.Context) (*Settings, []string, error
 			continue
 		}
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		break
 	}
 	// The VM's install would refuse them at its first boot: refused here, before a VM exists.
 	if in.R.Spec.HasFront() {
 		if _, err := in.routeDomains(mode, func(k string) string { return cmp.Or(values[k], o.Set[k]) }); err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 	}
-	st := &Settings{Channel: in.R.Manifest.Channel, TLS: mode, HTTPPort: o.HTTPPort, HTTPSPort: o.HTTPSPort}
+	given, err := in.givenOverSSH(mode)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	// A certificate decides the mode the VM's install takes; the settings never name byo.
+	shown := mode
+	if mode == "byo" {
+		shown = ""
+	}
+	st := &Settings{Channel: in.R.Manifest.Channel, TLS: shown, HTTPPort: o.HTTPPort, HTTPSPort: o.HTTPSPort}
 	for _, i := range list {
 		if v := values[i.Key]; v != "" {
 			if st.Inputs == nil {
@@ -1253,11 +1346,63 @@ func (in *Installer) vmSettings(ctx context.Context) (*Settings, []string, error
 	}
 	var waiting []string
 	for _, i := range in.inputList(mode) {
-		if i.Secret && i.Required && i.Default == "" && in.restoredSecret(i.Key) == "" {
+		if i.Secret && i.Required && i.Default == "" && in.restoredSecret(i.Key) == "" && (given == nil || given.Inputs[i.Key] == "") {
 			waiting = append(waiting, i.Key)
 		}
 	}
-	return st, waiting, nil
+	// The install over SSH runs with no terminal to ask them.
+	if given != nil && len(waiting) > 0 {
+		return nil, nil, nil, fmt.Errorf("%s go over SSH, and the install also needs %s, which nothing gives: add it to the --answers file", given.names(), strings.Join(waiting, ", "))
+	}
+	return st, waiting, given, nil
+}
+
+// givenOverSSH collects what the VM's install in mode takes over the pinned SSH channel, each value
+// checked as the install would, before a VM exists: the answers file's secret inputs, the byo
+// certificate loadCert read and the client CA. nil when there is none, and refused beside --secrets,
+// as the install over SSH takes one or the other.
+func (in *Installer) givenOverSSH(mode string) (*Given, error) {
+	o := &in.O
+	g := &Given{Project: in.R.Spec.Name}
+	var t GivenTLS
+	if c := in.byo; c != nil {
+		t.Cert, t.Key, t.CA = string(c.cert), string(c.key), string(c.ca)
+	}
+	client, err := in.readClientCA()
+	if err != nil {
+		return nil, err
+	}
+	t.ClientCA = string(client)
+	if t != (GivenTLS{}) {
+		g.TLS = &t
+	}
+	for _, i := range in.inputList(mode) {
+		v := o.Answers[i.Key]
+		if !i.Secret || v == "" {
+			continue
+		}
+		if err := i.checkValue(v); err != nil {
+			return nil, fmt.Errorf("%s: %w", i.Key, err)
+		}
+		if g.Inputs == nil {
+			g.Inputs = map[string]string{}
+		}
+		g.Inputs[i.Key] = v
+	}
+	if g.TLS == nil && g.Inputs == nil {
+		return nil, nil
+	}
+	raw, err := marshalGiven(g)
+	if err != nil {
+		return nil, err
+	}
+	if len(raw) > maxSecretsFile {
+		return nil, fmt.Errorf("%s come to %d bytes, and the install over SSH takes %d at most: give the rest over SSH once the VM answers", g.names(), len(raw), maxSecretsFile)
+	}
+	if in.restored != nil {
+		return nil, fmt.Errorf("--secrets restores an install, and %s would go with it: create the VM with --secrets alone, then a re-run over SSH gives them (`sudo %s install --answers FILE`)", g.names(), in.R.Ctl())
+	}
+	return g, nil
 }
 
 // diskSplit says the disk a VM of format gets for app GiB of the app's: "a 43 GiB disk (the OS 23
@@ -1268,7 +1413,7 @@ func (in *Installer) diskSplit(format string, app int) string {
 }
 
 // confirmVM shows what will be written, and on a terminal asks to go on.
-func (in *Installer) confirmVM(ctx context.Context, p Platform, format string, m Machine, st *Settings, seed string, c *VMCreate, addr string) error {
+func (in *Installer) confirmVM(ctx context.Context, p Platform, format string, m Machine, st *Settings, given *Given, seed string, c *VMCreate, addr string) error {
 	o := &in.O
 	var b bytes.Buffer
 	fmt.Fprintf(&b, "%s %s (revision %d) on %s: its %s disk, and %s\n", in.R.Spec.Name, in.R.Manifest.ProjectVersion, in.R.Manifest.Revision, p.Label, format, seed)
@@ -1321,7 +1466,7 @@ func (in *Installer) confirmVM(ctx context.Context, p Platform, format string, m
 	if len(m.Hosts) > 0 {
 		fmt.Fprintf(&b, "  host records: %s\n", strings.Join(m.Hosts, ", "))
 	}
-	fmt.Fprintf(&b, "  served: %s; updates from the %s channel\n", cmp.Or(st.TLS, "no front, its L4 routes alone"), st.Channel)
+	fmt.Fprintf(&b, "  served: %s; updates from the %s channel\n", cmp.Or(given.givenMode(st.TLS), "no front, its L4 routes alone"), st.Channel)
 	if st.Registry != "" || st.RegistryCA != "" {
 		fmt.Fprintf(&b, "  registry: %s", cmp.Or(st.Registry, in.R.Spec.Registry.Prefix))
 		if st.RegistryCA != "" {
@@ -1336,7 +1481,9 @@ func (in *Installer) confirmVM(ctx context.Context, p Platform, format string, m
 		}
 		fmt.Fprintf(&b, "  %s=%s\n", k, v)
 	}
-	if st.AwaitSecrets {
+	if given != nil {
+		fmt.Fprintf(&b, "  given over SSH once the VM answers, to a one-time host key its cloud-config carries (never these): %s\n", given.names())
+	} else if st.AwaitSecrets {
 		b.WriteString("  secrets: --secrets', given over SSH once the VM answers, to a one-time host key its cloud-config carries (never the secrets)\n")
 	}
 	for _, r := range in.R.Spec.L4.Routes {

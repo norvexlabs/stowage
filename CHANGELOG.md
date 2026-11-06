@@ -10,6 +10,17 @@ follow [SemVer](https://semver.org/).
 - An answers file can carry the front's TLS settings in a `tls` section (`mode`, `cert`, `key`, `ca`,
   `client_ca`, with paths relative to the file), so one file describes a whole install on Docker or
   the VM. Flags still win over the file.
+- `vm create` can give a new VM its secret inputs and its `byo` certificate: from `--answers` or from
+  the new `--cert`, `--key`, `--ca` and `--client-ca` flags. They are checked before the VM exists,
+  never enter the cloud-config, and reach the first install over SSH, pinned to the VM's one-time host
+  key. A project offering only `byo` can now create a VM.
+- `install --given` on the VM takes that material from a file or standard input, and creating a VM
+  by hand writes it to a private `.given` file and prints the one command that delivers it.
+
+### Fixed
+
+- `vm create` with OpenTofu on a disk of another release now waits for that release's OS before it
+  sends anything, so `--secrets` no longer dies in the first boot's reboot.
 
 ### Changed
 

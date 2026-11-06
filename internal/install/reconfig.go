@@ -230,7 +230,7 @@ func (in *Installer) rerunMode(was string) (string, error) {
 		if o.Cert == "" || o.Key == "" {
 			return "", errors.New("--tls byo needs --cert FILE and --key FILE: the certificate chain and its private key, PEM")
 		}
-		c, err := readPair(o.Cert, o.Key)
+		c, err := o.readPair(o.Cert, o.Key)
 		if err != nil {
 			return "", fmt.Errorf("--cert and --key: %w", err)
 		}

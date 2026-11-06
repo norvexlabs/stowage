@@ -64,10 +64,10 @@ func TestOnlyInstallTakesTheAnswersFilesTLSSection(t *testing.T) {
 	if err := os.WriteFile(file, []byte("tls: {mode: dns-cloudflare}\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	for _, args := range [][]string{{"upgrade", "--dir", dir}, {"k8s", "install"}, {"k8s", "upgrade"}, {"vm", "create"}} {
+	for _, args := range [][]string{{"upgrade", "--dir", dir}, {"k8s", "install"}, {"k8s", "upgrade"}} {
 		cmd := Command(r, self, io.Discard, io.Discard)
 		cmd.SetArgs(append(args, "--answers", file, "--no-input"))
-		if err := cmd.Execute(); err == nil || !strings.Contains(err.Error(), "only a Docker install or a VM's `install` over SSH takes") || !strings.Contains(err.Error(), "remove the section") {
+		if err := cmd.Execute(); err == nil || !strings.Contains(err.Error(), "only a Docker install, a VM's `install` or `vm create` takes") || !strings.Contains(err.Error(), "remove the section") {
 			t.Errorf("%v: %v", args, err)
 		}
 	}
@@ -75,6 +75,11 @@ func TestOnlyInstallTakesTheAnswersFilesTLSSection(t *testing.T) {
 	cmd.SetArgs([]string{"--answers", file, "--dir", dir, "--no-input"})
 	if err := cmd.Execute(); err == nil || !strings.Contains(err.Error(), "--tls dns-cloudflare:") {
 		t.Errorf("install: %v, want the section's mode judged as --tls is", err)
+	}
+	cmd = Command(r, self, io.Discard, io.Discard)
+	cmd.SetArgs([]string{"vm", "create", "--answers", file, "--no-input"})
+	if err := cmd.Execute(); err == nil || strings.Contains(err.Error(), "remove the section") {
+		t.Errorf("vm create: %v, want the section taken", err)
 	}
 }
 

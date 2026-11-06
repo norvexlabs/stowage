@@ -112,9 +112,14 @@ type Settings struct {
 	// is the file on the VM holding the CA its certificate chains to (VMRegistryCA).
 	Registry   string `yaml:"registry,omitempty"`
 	RegistryCA string `yaml:"registry_ca,omitempty"`
-	// AwaitSecrets: the first install waits for its secrets (`vm create --secrets`), which
-	// `sudo <short>-stow install --secrets` gives over SSH.
+	// AwaitSecrets: the first install waits for what `vm create` gives over SSH: its secrets
+	// (`install --secrets`), or, with AwaitGiven, its secret inputs and TLS material (`install
+	// --given`).
 	AwaitSecrets bool `yaml:"await_secrets,omitempty"`
+	// AwaitGiven tells the second wait from the first, as `given` or `byo`, the mode the install then
+	// takes unless told otherwise. It is a file beside the settings (AwaitGivenFile), not a key: a disk
+	// of another release decodes the settings strictly before it takes this release's OS.
+	AwaitGiven string `yaml:"-"`
 	// IPv6 turns IPv6 on for the stack's network (`vm create --ipv6`, as `install --ipv6`).
 	IPv6 bool `yaml:"ipv6,omitempty"`
 	// TuneProfile is the operator's tuning profile (`vm create --tune-profile`, as `install
@@ -230,7 +235,11 @@ func (in *Installer) switchOS(ctx context.Context, st *Settings) error {
 	return err
 }
 
-// ReadSettings strictly decodes the settings file at path; nil when there is none.
+// AwaitGivenFile is the file beside the settings at path holding Settings.AwaitGiven.
+func AwaitGivenFile(path string) string { return path + ".given" }
+
+// ReadSettings strictly decodes the settings file at path, and the file AwaitGiven comes from; nil
+// when there is none.
 func ReadSettings(path string) (*Settings, error) {
 	raw, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -245,6 +254,11 @@ func ReadSettings(path string) (*Settings, error) {
 	if err := dec.Decode(&st); err != nil && !errors.Is(err, io.EOF) {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
+	mark, err := os.ReadFile(AwaitGivenFile(path))
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+	st.AwaitGiven = strings.TrimSpace(string(mark))
 	return &st, nil
 }
 
@@ -256,7 +270,11 @@ func (in *Installer) applySettings(path string, st *Settings) error {
 	if st.Channel != "" && !lint.ChannelName(st.Channel) {
 		return fmt.Errorf("%s: channel %q is not a channel name", path, st.Channel)
 	}
-	if st.AwaitSecrets && o.Secrets == nil && !o.NewSecrets {
+	switch {
+	case !st.AwaitSecrets || o.NewSecrets:
+	case st.AwaitGiven != "" && o.Given == nil:
+		return fmt.Errorf("%s: the first install waits for the secret inputs and TLS material `vm create` gives over SSH: `sudo %s install --given FILE` gives them; the file lost, `--new-secrets` goes on without it, with the flags that give them again (--cert, --key, --ca, --client-ca, --answers)", path, in.R.Ctl())
+	case st.AwaitGiven == "" && o.Secrets == nil:
 		return fmt.Errorf("%s: the first install waits for its secrets (`vm create --secrets`): `sudo %s install --secrets FILE` gives them; without them it would generate new ones the backups do not match (--new-secrets does, the file lost)", path, in.R.Ctl())
 	}
 	if st.TLS == "byo" {
@@ -284,6 +302,10 @@ func (in *Installer) applySettings(path string, st *Settings) error {
 	}
 	if o.Cert == "" && o.Key == "" && !(domain && st.TLS == Loopback) {
 		o.TLS = cmp.Or(o.TLS, st.TLS)
+	}
+	// A VM created to serve its own certificate never moves to another mode for lack of it.
+	if st.AwaitGiven == "byo" {
+		o.TLS = cmp.Or(o.TLS, "byo")
 	}
 	o.HTTPPort = cmp.Or(o.HTTPPort, st.HTTPPort)
 	o.HTTPSPort = cmp.Or(o.HTTPSPort, st.HTTPSPort)
@@ -472,6 +494,10 @@ func (in *Installer) firstBoot(ctx context.Context, path string) error {
 		o.logf("%s names %s; `upgrade` wrote this OS's %s since: the first install runs it", path, t.Tag, in.R.Manifest.Tag)
 	}
 	if st.AwaitSecrets {
+		if st.AwaitGiven != "" {
+			o.logf("the first install waits for the secret inputs and TLS material the cloud-config never carries: `sudo %s install --given FILE` gives them", ctl)
+			return nil
+		}
 		o.logf("the first install waits for its secrets, which the cloud-config never carries: `sudo %s install --secrets FILE` gives them", ctl)
 		return nil
 	}

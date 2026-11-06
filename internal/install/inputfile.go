@@ -477,7 +477,7 @@ func (o *Options) readAnswersFile(path string, takesTLS bool) error {
 		return nil
 	}
 	if !takesTLS {
-		return fmt.Errorf("--answers %s: its %s section gives the front's TLS settings, which only a Docker install or a VM's `install` over SSH takes, and its re-run (`upgrade` keeps what is recorded, on Kubernetes the chart's ingress serves the routes, and a VM's cloud-config never carries a private key): remove the section for this command", path, answersTLSKey)
+		return fmt.Errorf("--answers %s: its %s section gives the front's TLS settings, which only a Docker install, a VM's `install` or `vm create` takes, and their re-runs (`upgrade` keeps what is recorded, and on Kubernetes the chart's ingress serves the routes): remove the section for this command", path, answersTLSKey)
 	}
 	taken, left, err := o.takeAnswersTLS(path, *section)
 	if err != nil {

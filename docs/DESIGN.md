@@ -1463,7 +1463,18 @@ every shape, the VM end-to-end test upgrading through it), then the health gate.
   little worth: it is served only until the install (from `/run`, so not past a reboot), then
   marked retired on the OEM partition, which a reset keeps and the recovery system mounts too, so
   no later boot serves it, and the VM's own key, read through it, is what `vm create` keeps;
-  anyone reading the seed or the metadata service later finds a key no system of the VM offers. After the first version (TODO): sealed secrets opt-in per deployment (a SOPS file, the sops library, encrypted to the
+  anyone reading the seed or the metadata service later finds a key no system of the VM offers.
+  A new VM's secret inputs and `byo` material take that channel too (`Given`, `install --given`):
+  `await_secrets` keeps its name, and `install.yaml.given`, beside the settings, tells this wait
+  from the wait for `--secrets`: a disk of an older release decodes the seed strictly before it
+  switches OS, so a new settings key would stop that boot, and without the mark a Given would meet
+  the wait for restored secrets and generate new ones. The mark also keeps a VM made for `byo` in
+  that mode, as the settings still refuse `tls: byo`. The TLS checks read a Given's PEM by a name
+  of its own in place of a path, so one set of rules judges both. The material is written to a 0600
+  file before the VM exists rather than only on failure, so no wait or interrupt strands a VM
+  waiting for it; the operator's own files already hold it on that machine. `vm create` waits for
+  the release's OS when its disk carries another, as what is sent to the OS it leaves dies in the
+  reboot. After the first version (TODO): sealed secrets opt-in per deployment (a SOPS file, the sops library, encrypted to the
   operator's key plus a per-deployment key that alone reaches the target, decrypted at each start
   or boot); then the VM's key sealed by its TPM or released by a KMS, with the same boot flow.
 - **Installer** — one installer image for all three shapes. It carries a Go binary with a terminal

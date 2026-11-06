@@ -108,6 +108,10 @@ type Options struct {
 	// exported ones (--new-secrets).
 	Secrets    []byte
 	NewSecrets bool
+	// Given is what `install --given` gives (takeGiven): its inputs join Answers, and givenTLS is the
+	// PEM the TLS options read when they name it (readPEM).
+	Given    *Given
+	givenTLS *GivenTLS
 	// Prompt asks for an input nothing else gave; nil takes its default.
 	Prompt Prompter
 

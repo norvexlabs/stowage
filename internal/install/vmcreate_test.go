@@ -632,9 +632,9 @@ func TestVMCreateRefusals(t *testing.T) {
 		{"Go's local zone", []string{"qcow2"}, nil, VMCreate{Platform: "truenas", Timezone: "Local"}, nil, "--timezone: \"Local\" is not a time zone name"},
 		{"the database's own file", []string{"qcow2"}, nil, VMCreate{Platform: "truenas", Timezone: "localtime"}, nil, "--timezone: \"localtime\" is not a time zone name"},
 		{"a leap-second zone", []string{"qcow2"}, nil, VMCreate{Platform: "truenas", Timezone: "right/Europe/Paris"}, nil, "--timezone: \"right/Europe/Paris\" is not a time zone name"},
-		{"byo", []string{"qcow2"}, nil, VMCreate{Platform: "truenas"}, func(o *Options) { o.TLS = "byo" }, "never carries"},
+		{"byo", []string{"qcow2"}, nil, VMCreate{Platform: "truenas"}, func(o *Options) { o.TLS = "byo" }, "--tls byo needs --cert FILE and --key FILE"},
 		{"loopback", []string{"qcow2"}, nil, VMCreate{Platform: "truenas"}, func(o *Options) { o.TLS = "none" }, "nothing outside it reaches"},
-		{"no mode for a VM", []string{"qcow2"}, func(s *spec.Spec) { s.Front.TLSModes = []string{"none", "byo"} }, VMCreate{Platform: "virtualbox", Hostname: "Bad_Name"}, nil, "offers no TLS mode a VM can be created with: none, byo"},
+		{"no mode for a VM", []string{"qcow2"}, func(s *spec.Spec) { s.Front.TLSModes = []string{"none", "byo"} }, VMCreate{Platform: "virtualbox", Hostname: "Bad_Name"}, nil, "offers no TLS mode a VM can be created with: none, byo (loopback is not reached from outside the VM, and byo's key never goes in its cloud-config): give --cert and --key"},
 		{"secret input", []string{"qcow2"}, secret, VMCreate{Platform: "truenas"}, func(o *Options) { o.Set = map[string]string{"API_KEY": "k"} }, "API_KEY is a secret input"},
 		{"unknown input", []string{"qcow2"}, nil, VMCreate{Platform: "truenas"}, func(o *Options) { o.Set = map[string]string{"NOPE": "k"} }, "no input of this install is named NOPE"},
 	} {
@@ -1237,7 +1237,7 @@ func TestTheSecretsInstallRetriesACanceledStartOnce(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(dir, "fails"), []byte(strconv.Itoa(c.fails)), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		cmd := exec.Command("/bin/sh", "-c", strings.Join(secretsInstall("notes", "notes-stow"), " "))
+		cmd := exec.Command("/bin/sh", "-c", strings.Join(firstInstallOverSSH("notes", "notes-stow", "--secrets"), " "))
 		cmd.Env = []string{"PATH=" + dir + ":/usr/bin:/bin"}
 		out, err := cmd.CombinedOutput()
 		if got, _ := os.ReadFile(log); string(got) != c.want || (err == nil) != c.ok {
