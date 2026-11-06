@@ -10,7 +10,7 @@ FROM --platform=$BUILDPLATFORM golang:1.27.3-alpine@sha256:d200d2dd76b03a99b5265
 ARG TARGETOS TARGETARCH
 WORKDIR /build
 RUN go mod init build \
- && go get github.com/rclone/rclone@v1.75.1 golang.org/x/net@v0.62.0 google.golang.org/grpc@v1.85.0 github.com/go-chi/chi/v5@v5.4.0 \
+ && go get github.com/rclone/rclone@v1.75.1 golang.org/x/net@v0.62.0 google.golang.org/grpc@v1.85.0 github.com/go-chi/chi/v5@v5.4.0 github.com/klauspost/compress@v1.20.2 github.com/andybalholm/brotli@v1.2.7 \
  && CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath \
       -ldflags '-s -w -X github.com/rclone/rclone/fs.Version=v1.75.1' -o /rclone github.com/rclone/rclone
 

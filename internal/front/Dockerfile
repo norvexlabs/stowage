@@ -8,7 +8,7 @@ FROM --platform=$BUILDPLATFORM caddy:2.11.7-builder@sha256:c4cd20eaa0b69112fd5d4
 ARG TARGETOS TARGETARCH
 RUN GOOS=$TARGETOS GOARCH=$TARGETARCH xcaddy build v2.11.7 --with github.com/caddy-dns/cloudflare@v0.2.4 \
       --replace golang.org/x/net=golang.org/x/net@v0.62.0 --replace github.com/go-jose/go-jose/v4=github.com/go-jose/go-jose/v4@v4.1.7 \
-      --replace github.com/go-chi/chi/v5=github.com/go-chi/chi/v5@v5.4.0
+      --replace github.com/go-chi/chi/v5=github.com/go-chi/chi/v5@v5.4.0 --replace github.com/klauspost/compress=github.com/klauspost/compress@v1.20.2
 
 # Caddy's image less what the front never runs (curl and its libraries, the capability tools: the
 # front runs as root).

@@ -10,7 +10,7 @@ ARG TARGETOS TARGETARCH
 RUN apk add --no-cache ca-certificates
 WORKDIR /build
 RUN go mod init build \
- && go get github.com/anchore/grype/cmd/grype@v0.121.0 golang.org/x/net@v0.62.0 github.com/go-jose/go-jose/v4@v4.1.7 \
+ && go get github.com/anchore/grype/cmd/grype@v0.121.0 golang.org/x/net@v0.62.0 github.com/go-jose/go-jose/v4@v4.1.7 github.com/klauspost/compress@v1.20.2 github.com/andybalholm/brotli@v1.2.7 \
  && CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath \
       -ldflags '-s -w -X main.version=0.121.0' -o /grype github.com/anchore/grype/cmd/grype \
  && go version -m /grype | awk '$1 == "mod" && $2 == "github.com/anchore/grype" && $3 == "v0.121.0" {ok = 1} END {exit !ok}'

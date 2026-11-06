@@ -3,12 +3,17 @@
 Stowage's own releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
-## [0.28.2]
+## [0.29.0]
 
 ### Fixed
 
 - A crafted compressed frame could crash the zstd code Stowage's binaries carry (GO-2026-6865):
   they now use the fixed compression library.
+- The images Stowage supplies now run the fixed zstd library: the front, the VM's backup runner and
+  the scanner. The backup runner and the scanner also move past excessive memory use when
+  decompressing crafted brotli streams (GO-2026-6888, which the scanner rates critical). A project
+  gets these images on its next `ship` with this Stowage; an install keeps the ones it has until it
+  upgrades to that release.
 
 ### Changed
 
