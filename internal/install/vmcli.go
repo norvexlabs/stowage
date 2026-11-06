@@ -67,7 +67,7 @@ func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(
 			return err
 		}
 		if answers != "" {
-			if o.Answers, err = readAnswers(answers); err != nil {
+			if err = o.readAnswersFile(answers, true); err != nil {
 				return err
 			}
 		}
@@ -153,7 +153,7 @@ func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(
 	f.BoolVar(&o.DryRun, "dry-run", false, "check, print what would be written (secrets redacted), write nothing")
 	f.StringArrayVar(&sets, "set", nil, "an input, KEY=VALUE (repeatable; on an installed VM, changes the recorded one)")
 	f.StringArrayVar(&setFiles, "set-file", nil, "a file input's file, KEY=PATH (repeatable; on an installed VM, changes the recorded one)")
-	f.StringVar(&answers, "answers", "", "a YAML file of inputs, KEY: value (on an installed VM, changes the recorded ones)")
+	f.StringVar(&answers, "answers", "", "a YAML file of inputs, KEY: value, and the front's tls section (on an installed VM, changes the recorded ones)")
 	f.BoolVar(&noInput, "no-input", false, "never ask: an input nothing gave takes its default")
 	f.BoolVar(&o.NoProvision, "no-provision", false, "start the stack without running the provision hook (`provision` runs it later)")
 	f.StringVar(&secretsFile, "secrets", "", "a first install's secrets: the file `secrets export` wrote, decrypted (- for standard input)")

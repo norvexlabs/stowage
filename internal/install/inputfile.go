@@ -313,23 +313,30 @@ func addSetFiles(set map[string]string, items []string) error {
 }
 
 // readAnswers reads an --answers file: KEY: value, or KEY: {file: PATH} for a file input, the path
-// relative to the answers file.
-func readAnswers(path string) (map[string]string, error) {
+// absolute or beside the file; and its reserved tls section apart from the inputs, nil without one.
+func readAnswers(path string) (map[string]string, *answersTLS, error) {
 	raw, err := os.ReadFile(filepath.Clean(path))
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	var nodes map[string]yaml.Node
 	if err := yaml.Unmarshal(raw, &nodes); err != nil {
-		return nil, fmt.Errorf("--answers %s: a map of KEY: value is expected: %w", path, err)
+		return nil, nil, fmt.Errorf("--answers %s: a map of KEY: value is expected: %w", path, err)
 	}
 	m := make(map[string]string, len(nodes))
+	var section *answersTLS
 	for _, k := range sortedKeys(nodes) {
 		n := nodes[k]
+		if k == answersTLSKey {
+			if section, err = readAnswersTLS(path, &n); err != nil {
+				return nil, nil, err
+			}
+			continue
+		}
 		if n.Kind != yaml.MappingNode {
 			var v string
 			if err := n.Decode(&v); err != nil {
-				return nil, fmt.Errorf("--answers %s: %s: a value is expected: %w", path, k, err)
+				return nil, nil, fmt.Errorf("--answers %s: %s: a value is expected: %w", path, k, err)
 			}
 			m[k] = v
 			continue
@@ -338,17 +345,151 @@ func readAnswers(path string) (map[string]string, error) {
 			File string `yaml:"file"`
 		}
 		if err := n.Decode(&form); err != nil || form.File == "" || len(n.Content) != 2 {
-			return nil, fmt.Errorf("--answers %s: %s: a value or {file: PATH} is expected", path, k)
+			return nil, nil, fmt.Errorf("--answers %s: %s: a value or {file: PATH} is expected", path, k)
 		}
-		file := form.File
-		if !filepath.IsAbs(file) {
-			file = filepath.Join(filepath.Dir(path), file)
+		file, err := answersPath(path, form.File)
+		if err == nil {
+			m[k], err = loadFileInput(file)
 		}
-		if m[k], err = loadFileInput(file); err != nil {
-			return nil, fmt.Errorf("--answers %s: %s: %w", path, k, err)
+		if err != nil {
+			return nil, nil, fmt.Errorf("--answers %s: %s: %w", path, k, err)
 		}
 	}
-	return m, nil
+	return m, section, nil
+}
+
+// answersTLSKey is the reserved section of an answers file holding the front's TLS settings. An
+// input's key is upper case (providers.EnvName), so no input can take this name.
+const answersTLSKey = "tls"
+
+// answersTLS is an answers file's tls section: what --tls, --cert, --key, --ca and --client-ca
+// give, its paths absolute, so a resolved path can never read as the word `none`.
+type answersTLS struct {
+	Mode, Cert, Key, CA, ClientCA string
+}
+
+// answersPath resolves a path an answers file names: absolute as it is, else beside the file.
+func answersPath(answers, file string) (string, error) {
+	if filepath.IsAbs(file) {
+		return file, nil
+	}
+	abs, err := filepath.Abs(answers)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(filepath.Dir(abs), file), nil
+}
+
+// readAnswersTLS decodes the section strictly: a field it does not know, given twice or holding no
+// value is an error, as is a mode no project can offer, each named by the file and field to fix.
+// `none` for ca or client_ca stays the word those flags take.
+func readAnswersTLS(path string, n *yaml.Node) (*answersTLS, error) {
+	if n.Kind != yaml.MappingNode {
+		return nil, fmt.Errorf("--answers %s: %s: a map of mode, cert, key, ca and client_ca is expected", path, answersTLSKey)
+	}
+	var t answersTLS
+	fields := map[string]*string{"mode": &t.Mode, "cert": &t.Cert, "key": &t.Key, "ca": &t.CA, "client_ca": &t.ClientCA}
+	seen := map[string]bool{}
+	for i := 0; i+1 < len(n.Content); i += 2 {
+		name := n.Content[i].Value
+		field, known := fields[name]
+		if !known {
+			return nil, fmt.Errorf("--answers %s: %s: %s is no field of it (mode, cert, key, ca, client_ca)", path, answersTLSKey, name)
+		}
+		if seen[name] {
+			return nil, fmt.Errorf("--answers %s: %s: %s is given twice", path, answersTLSKey, name)
+		}
+		seen[name] = true
+		var v string
+		if err := n.Content[i+1].Decode(&v); err != nil || v == "" {
+			return nil, fmt.Errorf("--answers %s: %s: %s: a value is expected", path, answersTLSKey, name)
+		}
+		if name == "mode" {
+			if _, ok := modeLabels[v]; !ok {
+				return nil, fmt.Errorf("--answers %s: %s: mode: %s is no TLS mode (%s)", path, answersTLSKey, v, strings.Join(sortedKeys(modeLabels), ", "))
+			}
+			*field = v
+			continue
+		}
+		if (name == "ca" || name == "client_ca") && v == noCA {
+			*field = v
+			continue
+		}
+		file, err := answersPath(path, v)
+		if err != nil {
+			return nil, fmt.Errorf("--answers %s: %s: %s: %w", path, answersTLSKey, name, err)
+		}
+		*field = file
+	}
+	return &t, nil
+}
+
+// takeAnswersTLS gives the options the section's settings where no flag decides them, and returns
+// the flags it stood in for and the fields it left out. A flag wins whole, not field by field: a
+// certificate given replaces the section's mode, certificate, key and CA, and a mode other than byo
+// leaves out its certificate, key and CA, as they would be refused with it. The client CA stands
+// alone, and a domain given replaces the section's loopback mode, which serves none. Only a file the run will read must exist, so a flag replaces a stale path; one that cannot
+// be read for another reason is left to the checks a flag's file gets.
+func (o *Options) takeAnswersTLS(path string, t answersTLS) (taken, left []string, err error) {
+	byFlagCert := o.Cert != "" || o.Key != ""
+	byFlagMode := o.TLS != "" && o.TLS != "byo"
+	for _, f := range []struct {
+		name, flag, value string
+		into              *string
+		out               bool
+		file              bool
+	}{
+		{"mode", "--tls", t.Mode, &o.TLS, byFlagCert || (t.Mode == Loopback && len(o.Domains) > 0), false},
+		{"cert", "--cert", t.Cert, &o.Cert, byFlagCert || byFlagMode, true},
+		{"key", "--key", t.Key, &o.Key, byFlagCert || byFlagMode, true},
+		{"ca", "--ca", t.CA, &o.CA, byFlagCert || byFlagMode, true},
+		{"client_ca", "--client-ca", t.ClientCA, &o.ClientCA, false, true},
+	} {
+		switch {
+		case f.value == "":
+			continue
+		case f.out || *f.into != "":
+			left = append(left, f.name)
+			continue
+		}
+		if f.file && f.value != noCA {
+			if _, err := os.Stat(f.value); errors.Is(err, os.ErrNotExist) {
+				return nil, nil, fmt.Errorf("--answers %s: %s: %s: %w", path, answersTLSKey, f.name, err)
+			}
+		}
+		*f.into = f.value
+		taken = append(taken, f.flag)
+	}
+	return taken, left, nil
+}
+
+// readAnswersFile reads --answers into the options. A command that takes no TLS settings refuses
+// the file's tls section, naming the fix, before anything in it is judged by the files it names.
+// The run says which flags the section stands in for, as a later refusal names those flags, and
+// which of its fields a flag left out.
+func (o *Options) readAnswersFile(path string, takesTLS bool) error {
+	inputs, section, err := readAnswers(path)
+	if err != nil {
+		return err
+	}
+	o.Answers = inputs
+	if section == nil {
+		return nil
+	}
+	if !takesTLS {
+		return fmt.Errorf("--answers %s: its %s section gives the front's TLS settings, which only a Docker install or a VM's `install` over SSH takes, and its re-run (`upgrade` keeps what is recorded, on Kubernetes the chart's ingress serves the routes, and a VM's cloud-config never carries a private key): remove the section for this command", path, answersTLSKey)
+	}
+	taken, left, err := o.takeAnswersTLS(path, *section)
+	if err != nil {
+		return err
+	}
+	if len(taken) > 0 {
+		o.logf("the %s section of %s gives %s", answersTLSKey, path, strings.Join(taken, ", "))
+	}
+	if len(left) > 0 {
+		o.logf("the %s section of %s: %s left out, as the flags given decide", answersTLSKey, path, strings.Join(left, ", "))
+	}
+	return nil
 }
 
 // fileInputsFit refuses a cloud-config a file input carries past what the cloud takes as user data:

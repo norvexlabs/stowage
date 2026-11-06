@@ -770,7 +770,9 @@ for layout and colour. Raw `read` prompts are not used.
 - Every form field comes from the spec (`inputs:` prompt, default, `secret`, `required`, `when`,
   `shapes`), so a project gets a polished installer without writing UI code.
 - **Non-interactive is first-class**: every input is also an environment variable and a flag, and
-  `--answers <file>` takes a YAML answers file; with no TTY, or with `--no-input`, the installer
+  `--answers <file>` takes a YAML answers file, whose reserved `tls` section gives the front's TLS
+  settings to an install so that one file describes it whole (input keys are upper case, so none
+  can clash; every other command taking `--answers` refuses the section: on Kubernetes the chart's ingress owns TLS, and a VM's cloud-config never carries a private key); with no TTY, or with `--no-input`, the installer
   never prompts and fails listing every missing required input at once. The CI path and the TTY path
   write identical files.
 - **Accessible mode** (`--accessible`, `ACCESSIBLE` set, or `TERM=dumb`): Stowage's own

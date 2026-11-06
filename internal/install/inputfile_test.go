@@ -265,11 +265,11 @@ func TestReadAnswers(t *testing.T) {
 		}
 		return p
 	}
-	got, err := readAnswers(write("F: {file: beside}\nT: text\nN: 5\n"))
+	got, _, err := readAnswers(write("F: {file: beside}\nT: text\nN: 5\n"))
 	if err != nil || got["F"] != encodeFileInput([]byte("hi")) || got["T"] != "text" || got["N"] != "5" {
 		t.Errorf("%v, %v", err, got)
 	}
-	if got, err := readAnswers(write("F: {file: " + filepath.Join(dir, "beside") + "}\n")); err != nil || got["F"] == "" {
+	if got, _, err := readAnswers(write("F: {file: " + filepath.Join(dir, "beside") + "}\n")); err != nil || got["F"] == "" {
 		t.Errorf("an absolute path: %v, %v", err, got)
 	}
 	for body, want := range map[string]string{
@@ -279,9 +279,184 @@ func TestReadAnswers(t *testing.T) {
 		"T: [a, b]\n":                  "a value is expected",
 		"- a\n":                        "a map of KEY: value",
 	} {
-		if _, err := readAnswers(write(body)); err == nil || !strings.Contains(err.Error(), want) {
+		if _, _, err := readAnswers(write(body)); err == nil || !strings.Contains(err.Error(), want) {
 			t.Errorf("%q: %v, want %q", body, err, want)
 		}
+	}
+}
+
+// An answers file's tls section gives what the flags give, its paths beside the file, and is as
+// strict as the spec.
+func TestAnswersFileCarriesTheFrontsTLSSettings(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(dir, "sub"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	abs := filepath.Join(t.TempDir(), "elsewhere.pem")
+	for _, f := range []string{filepath.Join(dir, "front.crt"), filepath.Join(dir, "sub", "front.key"), filepath.Join(dir, "none"), abs} {
+		if err := os.WriteFile(f, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write := func(body string) string {
+		p := filepath.Join(dir, "answers.yaml")
+		if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	inputs, section, err := readAnswers(write("APP: x\ntls: {mode: byo, cert: front.crt, key: sub/front.key, ca: " + abs + "}\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := answersTLS{Mode: "byo", Cert: filepath.Join(dir, "front.crt"), Key: filepath.Join(dir, "sub", "front.key"), CA: abs}
+	if *section != want || len(inputs) != 1 || inputs["APP"] != "x" {
+		t.Errorf("%+v, %v; want %+v, the inputs apart", section, inputs, want)
+	}
+	if _, section, err := readAnswers(write("APP: x\n")); err != nil || section != nil {
+		t.Errorf("no section: %+v, %v", section, err)
+	}
+	if _, section, err := readAnswers(write("tls: {ca: none, client_ca: none}\n")); err != nil || section.CA != noCA || section.ClientCA != noCA {
+		t.Errorf("none stays the flags' word: %+v, %v", section, err)
+	}
+	if _, section, err := readAnswers(write("tls: {ca: ./none, client_ca: ./none}\n")); err != nil || section.CA != filepath.Join(dir, "none") || section.ClientCA != section.CA {
+		t.Errorf("./none is a file: %+v, %v", section, err)
+	}
+	for body, wanted := range map[string]string{
+		"tls: byo\n":                  "a map of mode, cert, key, ca and client_ca",
+		"tls: {certificate: c}\n":     "certificate is no field of it",
+		"tls: {ca: none, ca: none}\n": "ca is given twice",
+		"tls: {cert: \"\"}\n":         "cert: a value is expected",
+		"tls: {cert: [a]}\n":          "cert: a value is expected",
+		"tls: {mode: nonsense}\n":     "tls: mode: nonsense is no TLS mode",
+	} {
+		_, _, err := readAnswers(write(body))
+		if err == nil || !strings.Contains(err.Error(), wanted) || !strings.Contains(err.Error(), "--answers "+filepath.Join(dir, "answers.yaml")) {
+			t.Errorf("%q: %v, want %q naming the file", body, err, wanted)
+		}
+	}
+}
+
+// An answers file named from the working directory: its ./none is the file there, an absolute path,
+// which a join with the directory `.` would clean down to the word `none`.
+func TestAnswersFileBesideTheWorkingDirectoryKeepsAFileNamedNone(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	for name, body := range map[string]string{"answers.yaml": "tls: {ca: ./none}\n", "none": "x"} {
+		if err := os.WriteFile(name, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_, section, err := readAnswers("answers.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !filepath.IsAbs(section.CA) || filepath.Base(section.CA) != "none" {
+		t.Errorf("%q, want the file's absolute path", section.CA)
+	}
+}
+
+// A flag wins over the section whole, as the section's other fields would be refused beside it; a
+// CA given alone or the client CA changes only itself. A file left out need not exist; one taken
+// must, reached as written (no ~).
+func TestAFlagWinsOverTheAnswersFilesTLSSection(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	in := func(name string) string { return filepath.Join(dir, name) }
+	for _, f := range []string{"c", "k", "a", "cl"} {
+		if err := os.WriteFile(in(f), []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	section := answersTLS{Mode: "byo", Cert: in("c"), Key: in("k"), CA: in("a"), ClientCA: in("cl")}
+	for name, c := range map[string]struct {
+		flags, want Options
+		left        []string
+	}{
+		"no flag":       {Options{}, Options{TLS: "byo", Cert: in("c"), Key: in("k"), CA: in("a"), ClientCA: in("cl")}, nil},
+		"another mode":  {Options{TLS: "internal"}, Options{TLS: "internal", ClientCA: in("cl")}, []string{"mode", "cert", "key", "ca"}},
+		"byo itself":    {Options{TLS: "byo"}, Options{TLS: "byo", Cert: in("c"), Key: in("k"), CA: in("a"), ClientCA: in("cl")}, []string{"mode"}},
+		"a certificate": {Options{Cert: "f.crt", Key: "f.key"}, Options{Cert: "f.crt", Key: "f.key", ClientCA: in("cl")}, []string{"mode", "cert", "key", "ca"}},
+		"a key alone":   {Options{Key: "f.key"}, Options{Key: "f.key", ClientCA: in("cl")}, []string{"mode", "cert", "key", "ca"}},
+		"a CA":          {Options{CA: "f.ca"}, Options{TLS: "byo", Cert: in("c"), Key: in("k"), CA: "f.ca", ClientCA: in("cl")}, []string{"ca"}},
+		"a client CA":   {Options{ClientCA: "f.cl"}, Options{TLS: "byo", Cert: in("c"), Key: in("k"), CA: in("a"), ClientCA: "f.cl"}, []string{"client_ca"}},
+	} {
+		got := c.flags
+		_, left, err := got.takeAnswersTLS("a.yaml", section)
+		if err != nil || !slices.Equal(left, c.left) {
+			t.Errorf("%s: %v, left out %v, want %v", name, err, left, c.left)
+		}
+		if got.TLS != c.want.TLS || got.Cert != c.want.Cert || got.Key != c.want.Key || got.CA != c.want.CA || got.ClientCA != c.want.ClientCA {
+			t.Errorf("%s: %+v, want %+v", name, got, c.want)
+		}
+	}
+	stale := answersTLS{Mode: "byo", Cert: in("gone"), Key: in("gone")}
+	flagged := Options{Cert: "f.crt", Key: "f.key"}
+	if _, _, err := flagged.takeAnswersTLS("a.yaml", stale); err != nil {
+		t.Errorf("a flag replaces a stale path: %v", err)
+	}
+	var none Options
+	if _, _, err := none.takeAnswersTLS("a.yaml", stale); err == nil || !strings.Contains(err.Error(), "--answers a.yaml: tls: cert:") || !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("a stale path taken: %v", err)
+	}
+	// Only a file that does not exist refuses here: any other failure is the later check's, as a
+	// flag's file gets (a path under a file is ENOTDIR).
+	underFile := Options{}
+	if _, _, err := underFile.takeAnswersTLS("a.yaml", answersTLS{Cert: filepath.Join(in("c"), "x")}); err != nil || underFile.Cert == "" {
+		t.Errorf("a path the later check judges: %v", err)
+	}
+	// Each field stands in for its own flag.
+	var named Options
+	taken, _, err := named.takeAnswersTLS("a.yaml", section)
+	if want := []string{"--tls", "--cert", "--key", "--ca", "--client-ca"}; err != nil || !slices.Equal(taken, want) {
+		t.Errorf("%v: %v, want %v", err, taken, want)
+	}
+	// A domain given beats the section's loopback mode, which serves none; a mode that serves one stays.
+	loop := Options{Domains: map[string]string{"app": "a.example.org"}}
+	if _, _, err := loop.takeAnswersTLS("a.yaml", answersTLS{Mode: Loopback}); err != nil || loop.TLS != "" {
+		t.Errorf("a domain over loopback: %v %q", err, loop.TLS)
+	}
+	kept := Options{Domains: map[string]string{"app": "a.example.org"}}
+	if _, _, err := kept.takeAnswersTLS("a.yaml", answersTLS{Mode: "internal"}); err != nil || kept.TLS != "internal" {
+		t.Errorf("a domain over another mode: %v %q", err, kept.TLS)
+	}
+	var word Options
+	if _, _, err := word.takeAnswersTLS("a.yaml", answersTLS{CA: noCA, ClientCA: noCA}); err != nil || word.CA != noCA || word.ClientCA != noCA {
+		t.Errorf("none is no file: %v %+v", err, word)
+	}
+	// ~ is no home directory: a path as written, beside the file.
+	tilde := filepath.Join(dir, "tilde.yaml")
+	if err := os.WriteFile(tilde, []byte("tls: {cert: ~/front.crt}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, section, err := readAnswers(tilde); err != nil || section.Cert != filepath.Join(dir, "~", "front.crt") {
+		t.Errorf("~: %+v, %v", section, err)
+	}
+}
+
+// A refusing command says so before any file the section names is looked at.
+func TestAnswersFileRefusalComesBeforeItsFiles(t *testing.T) {
+	t.Parallel()
+	file := filepath.Join(t.TempDir(), "a.yaml")
+	if err := os.WriteFile(file, []byte("tls: {cert: gone.crt}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var o Options
+	if err := o.readAnswersFile(file, false); err == nil || !strings.Contains(err.Error(), "remove the section") {
+		t.Errorf("%v", err)
+	}
+	// What a flag left out is said.
+	if err := os.WriteFile(file, []byte("tls: {mode: internal, client_ca: none}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var log bytes.Buffer
+	flagged := Options{Log: &log, TLS: "acme"}
+	if err := flagged.readAnswersFile(file, true); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(log.String(), "gives --client-ca") || !strings.Contains(log.String(), ": mode left out, as the flags given decide") {
+		t.Errorf("the log: %q", log.String())
 	}
 }
 

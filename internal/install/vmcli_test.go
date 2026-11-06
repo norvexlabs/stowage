@@ -91,6 +91,27 @@ func TestTheSocketIsRootsAloneWithoutTheGroup(t *testing.T) {
 	}
 }
 
+// The VM's install takes an answers file's tls section. A bad --channel stops it right after, before
+// it acts on the host, and the run has said what the section gave.
+func TestTheVMInstallTakesTheAnswersFilesTLSSection(t *testing.T) {
+	t.Parallel()
+	e := vmEnv(t, "1.0.0")
+	dir := t.TempDir()
+	file := filepath.Join(dir, "answers.yaml")
+	if err := os.WriteFile(file, []byte("tls: {mode: internal}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var log bytes.Buffer
+	cmd := vmCommand(e.r, e.self, io.Discard, &log, func(bool) Prompter { return nil }, clientTimes{unit: time.Millisecond})
+	cmd.SetArgs([]string{"install", "--answers", file, "--channel", "Bad Channel", "--dir", filepath.Join(dir, "install"), "--no-input"})
+	if err := cmd.Execute(); err == nil || !strings.Contains(err.Error(), "is not a channel name") {
+		t.Errorf("%v", err)
+	}
+	if !strings.Contains(log.String(), "gives --tls") {
+		t.Errorf("the log: %q", log.String())
+	}
+}
+
 func TestStatusOverTheSocket(t *testing.T) {
 	t.Parallel()
 	e := installedVM(t)

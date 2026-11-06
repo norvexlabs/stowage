@@ -54,6 +54,30 @@ func TestUpgradeVersionRefusesOffline(t *testing.T) {
 	}
 }
 
+// install takes an answers file's tls section, the settings reaching the install as its flags do;
+// a command taking an answers file but no TLS settings refuses the section, naming the fix.
+func TestOnlyInstallTakesTheAnswersFilesTLSSection(t *testing.T) {
+	t.Parallel()
+	r, self := testInstallerWith(t, "1.0.0", func(s *spec.Spec) { s.Front.TLSModes = []string{"internal"} })
+	dir := t.TempDir()
+	file := filepath.Join(dir, "answers.yaml")
+	if err := os.WriteFile(file, []byte("tls: {mode: dns-cloudflare}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{{"upgrade", "--dir", dir}, {"k8s", "install"}, {"k8s", "upgrade"}, {"vm", "create"}} {
+		cmd := Command(r, self, io.Discard, io.Discard)
+		cmd.SetArgs(append(args, "--answers", file, "--no-input"))
+		if err := cmd.Execute(); err == nil || !strings.Contains(err.Error(), "only a Docker install or a VM's `install` over SSH takes") || !strings.Contains(err.Error(), "remove the section") {
+			t.Errorf("%v: %v", args, err)
+		}
+	}
+	cmd := Command(r, self, io.Discard, io.Discard)
+	cmd.SetArgs([]string{"--answers", file, "--dir", dir, "--no-input"})
+	if err := cmd.Execute(); err == nil || !strings.Contains(err.Error(), "--tls dns-cloudflare:") {
+		t.Errorf("install: %v, want the section's mode judged as --tls is", err)
+	}
+}
+
 func TestK8sCommandOnlyWithTheKubernetesShape(t *testing.T) {
 	t.Parallel()
 	r, self := testInstallerWith(t, "1.0.0", func(s *spec.Spec) { s.Shapes.Kubernetes = nil })

@@ -5,6 +5,12 @@ follow [SemVer](https://semver.org/).
 
 ## [0.29.1]
 
+### Added
+
+- An answers file can carry the front's TLS settings in a `tls` section (`mode`, `cert`, `key`, `ca`,
+  `client_ca`, with paths relative to the file), so one file describes a whole install on Docker or
+  the VM. Flags still win over the file.
+
 ### Changed
 
 - `make self-audit` names, on every run, each module the recipes force over what their upstream's

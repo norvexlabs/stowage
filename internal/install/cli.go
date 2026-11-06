@@ -42,6 +42,7 @@ func newCommand(r *Release, self string, stdout, stderr io.Writer, tools K8sOpti
 	var ports, sets, setFiles, domains []string
 	var answers, to, secretsFile string
 	var noInput, accessible bool
+	var takesTLS bool // the running command is install, which alone takes an answers file's tls section
 	name := r.Spec.Name
 	in := &Installer{R: r}
 	prepare := func() error {
@@ -59,7 +60,7 @@ func newCommand(r *Release, self string, stdout, stderr io.Writer, tools K8sOpti
 			return err
 		}
 		if answers != "" {
-			if o.Answers, err = readAnswers(answers); err != nil {
+			if err = o.readAnswersFile(answers, takesTLS); err != nil {
 				return err
 			}
 		}
@@ -73,6 +74,7 @@ func newCommand(r *Release, self string, stdout, stderr io.Writer, tools K8sOpti
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			takesTLS = true
 			if err := prepare(); err != nil {
 				return err
 			}
@@ -132,7 +134,7 @@ func newCommand(r *Release, self string, stdout, stderr io.Writer, tools K8sOpti
 	rf.StringVar(&secretsFile, "secrets", "", "a first install's secrets: the file `secrets export` wrote, decrypted (- for standard input)")
 	rf.StringArrayVar(&sets, "set", nil, "an input, KEY=VALUE (repeatable; a re-run changes the recorded one)")
 	rf.StringArrayVar(&setFiles, "set-file", nil, "a file input's file, KEY=PATH (repeatable; a re-run changes the recorded one)")
-	rf.StringVar(&answers, "answers", "", "a YAML file of inputs, KEY: value (a re-run changes the recorded ones)")
+	rf.StringVar(&answers, "answers", "", "a YAML file of inputs, KEY: value, and the front's tls section (a re-run changes the recorded ones)")
 	rf.BoolVar(&noInput, "no-input", false, "never ask: an input nothing gave takes its default")
 	rf.BoolVar(&o.NoProvision, "no-provision", false, "start the stack without running the provision hook (`provision` runs it later)")
 	rf.BoolVar(&accessible, "accessible", false, "ask with plain line prompts (screen readers); also when ACCESSIBLE is set or TERM=dumb")
