@@ -16,9 +16,18 @@ follow [SemVer](https://semver.org/).
   key. A project offering only `byo` can now create a VM.
 - `install --given` on the VM takes that material from a file or standard input, and creating a VM
   by hand writes it to a private `.given` file and prints the one command that delivers it.
+- File inputs now work on Kubernetes: `k8s install` and `k8s upgrade` take `--set-file`, the chart
+  mounts each file from a Secret named in `.Values.stowage.files`, and the provision hook's Job gets
+  the file as it does on Docker. Lint no longer refuses a file input on the `kubernetes` shape, and
+  warns when a chart does not read that value.
+- `k8s install` and `k8s upgrade` take `--given`. On an upgrade, the inputs it gives replace the
+  recorded values and restart the workloads reading them; a `tls` section is left out and said, as
+  the chart's ingress owns TLS on Kubernetes.
 
 ### Fixed
 
+- A dry run on Kubernetes shows a file input by its digest, and a Kubernetes upgrade or install over
+  a kept Secret refuses a recorded value the release cannot read.
 - `vm create` with OpenTofu on a disk of another release now waits for that release's OS before it
   sends anything, so `--secrets` no longer dies in the first boot's reboot.
 

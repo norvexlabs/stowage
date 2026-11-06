@@ -187,6 +187,53 @@ func TestK8sResetAcrossABaselineWritesWhatTheNewReleaseAdds(t *testing.T) {
 	}
 }
 
+// A refusal across a baseline names no --given, which reset-db does not take.
+func TestK8sResetAcrossABaselineRefusalsNameNoGiven(t *testing.T) {
+	t.Parallel()
+	declares := func(s *spec.Spec) {
+		atBaseline(2)(s)
+		s.Inputs = append(s.Inputs, spec.Input{Key: "CA", Prompt: "CA", Type: spec.InputFile, Optional: true})
+	}
+	for name, c := range map[string]struct {
+		stored map[string]string
+		set    map[string]string
+		want   string
+	}{
+		"a value it keeps": {map[string]string{"ADMIN_EMAIL": "a@example.org"}, map[string]string{"ADMIN_EMAIL": "b@example.org"}, "recorded at the install"},
+		"unreadable":       {map[string]string{"CA": "text"}, nil, "declares it as"},
+	} {
+		e := baselineKube(t, 1, 2)
+		e.release = e.at("2.0.0", 1, declares)
+		c.stored["SESSION_SECRET"], c.stored["POSTGRES_PASSWORD"] = "s", "p"
+		e.stored(c.stored, ours)
+		err := e.reset(func(o *Options) { o.Yes, o.NewBaseline, o.Set = true, true, c.set })
+		if err == nil || !strings.Contains(err.Error(), c.want) || strings.Contains(err.Error(), "--given") {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+}
+
+// A release across a baseline that adds a file input writes the files Secret, and the install after
+// the wipe names it: the values read back from the release do not.
+func TestK8sResetAcrossABaselineNamesTheFilesSecret(t *testing.T) {
+	t.Parallel()
+	e := baselineKube(t, 1, 2)
+	e.release = e.at("2.0.0", 1, func(s *spec.Spec) {
+		atBaseline(2)(s)
+		s.Inputs = append(s.Inputs, spec.Input{Key: "CA", Prompt: "CA", Type: spec.InputFile, Optional: true})
+	})
+	set := map[string]string{"CA": encodeFileInput([]byte("the file"))}
+	if err := e.reset(func(o *Options) { o.Yes, o.NewBaseline, o.Set = true, true, set }); err != nil {
+		t.Fatalf("%v\n%s", err, e.log)
+	}
+	if got := e.secretData("notes-stowage-files")["CA"]; got != "the file" {
+		t.Errorf("files %v", e.secretData("notes-stowage-files"))
+	}
+	if n := len(e.f.given); n == 0 || !strings.Contains(e.f.given[n-1], "files: notes-stowage-files\n") {
+		t.Errorf("values %q", e.f.given)
+	}
+}
+
 // An upgrade to a release that no longer declares an input drops its value from the release's
 // Secret, saying so; a key the old hook declared it returns, and the new one does not, leaves the
 // outputs Secret.

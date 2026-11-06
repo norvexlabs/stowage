@@ -223,12 +223,17 @@ func (in *Installer) K8sRotateSecret(ctx context.Context, key, pass string) erro
 		return err
 	}
 	in.O.logf("%s", what)
+	return in.restartWorkloads(ctx, workloads)
+}
+
+// restartWorkloads restarts each workload, one at a time, waiting for it to be ready.
+func (in *Installer) restartWorkloads(ctx context.Context, workloads []string) error {
 	for _, w := range workloads {
 		in.O.logf("kubectl: restarting %s", w)
 		if _, err := in.kubectl(ctx, Cmd{Args: []string{"rollout", "restart", w}}); err != nil {
 			return err
 		}
-		if _, err := in.kubectl(ctx, Cmd{Args: []string{"rollout", "status", w, "--timeout", k.Timeout.String()}}); err != nil {
+		if _, err := in.kubectl(ctx, Cmd{Args: []string{"rollout", "status", w, "--timeout", in.O.K8s.Timeout.String()}}); err != nil {
 			return fmt.Errorf("%s did not become ready: %w", w, err)
 		}
 	}

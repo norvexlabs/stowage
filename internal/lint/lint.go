@@ -1499,9 +1499,6 @@ func (l *linter) secretsAndInputs() {
 			if in.Advanced {
 				l.errf(w+".type", "a file input is mounted by a service, so asked: not advanced")
 			}
-			if l.s.Shapes.Kubernetes != nil && in.OnKubernetes() {
-				l.errf(w+".type", "a file input reaches a service on the docker and kairos shapes, as a mounted file; a chart has no way to it: shapes: [docker, kairos]")
-			}
 		default:
 			l.errf(w+".type", "%q: expected %s or %s", in.Type, spec.InputFile, spec.InputPEM)
 		}
@@ -1985,9 +1982,14 @@ func (l *linter) chart(rel string) {
 	if !reads("images") {
 		l.warnf("shapes.kubernetes.chart", "%s: no template reads .Values.%s.images: the chart does not run the release's images by digest", rel, helm.ValuesKey)
 	}
-	k8sInput := slices.ContainsFunc(l.s.Inputs, spec.Input.OnKubernetes)
+	// A file input's key there is its recorded form: a chart reads it from the files Secret.
+	k8sInput := slices.ContainsFunc(l.s.Inputs, func(i spec.Input) bool { return !i.File() && i.OnKubernetes() })
 	if (len(l.s.Secrets) > 0 || k8sInput) && !reads("secret") {
 		l.warnf("shapes.kubernetes.chart", "%s: no template reads .Values.%s.secret: the release's secrets and inputs do not reach the chart", rel, helm.ValuesKey)
+	}
+	k8sFile := slices.ContainsFunc(l.s.Inputs, func(i spec.Input) bool { return i.File() && i.OnKubernetes() })
+	if k8sFile && !reads("files") {
+		l.warnf("shapes.kubernetes.chart", "%s: no template reads .Values.%s.files: the file inputs on Kubernetes do not reach the chart", rel, helm.ValuesKey)
 	}
 	if l.s.Registry.Pull.Name == "token" && !reads("pullSecret") {
 		l.warnf("shapes.kubernetes.chart", "%s: no template reads .Values.%s.pullSecret: the cluster pulls the images without the pull account", rel, helm.ValuesKey)

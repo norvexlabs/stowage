@@ -89,10 +89,15 @@ func (in *Installer) recordedForms(env *EnvFile) error {
 			continue
 		}
 		if v, ok := env.Get(i.Key); ok && wrongForm(i, v) {
-			return fmt.Errorf("%s: %s %s declares it as %s, which cannot read the value recorded: the project must declare a changed input under a new key", i.Key, in.R.Spec.Name, in.R.Manifest.ProjectVersion, inputForm(i))
+			return in.unreadable(i)
 		}
 	}
 	return nil
+}
+
+// unreadable refuses a release that cannot read what is recorded for the input i.
+func (in *Installer) unreadable(i spec.Input) error {
+	return fmt.Errorf("%s: %s %s declares it as %s, which cannot read the value recorded: the project must declare a changed input under a new key", i.Key, in.R.Spec.Name, in.R.Manifest.ProjectVersion, inputForm(i))
 }
 
 // loadFileInput is the value recorded for the file at path, at most spec.MaxInputFile bytes.
@@ -516,7 +521,8 @@ func (in *Installer) shownValue(k, v string, secrets map[string]bool) string {
 	if secrets[k] && v != "" {
 		return "<redacted>"
 	}
-	if i, ok := in.R.Spec.Input(k); ok && i.File() {
+	// In the recorded form whatever this release declares: a value it replaces may be one.
+	if i, ok := in.R.Spec.Input(k); (ok && i.File()) || isFileValue(v) {
 		return fileInputDigest(v)
 	}
 	if key, ok := strings.CutPrefix(k, spec.FileVarPrefix); ok && secrets[key] {

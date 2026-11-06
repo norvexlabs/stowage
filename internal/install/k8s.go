@@ -219,6 +219,9 @@ func (k K8sOptions) envSecret() string { return k.Release + "-stowage" }
 // pullSecret names the Secret holding the pull account, as a Docker config.
 func (k K8sOptions) pullSecret() string { return k.Release + "-stowage-pull" }
 
+// filesSecret is the Secret holding each file input's content under its key, for a chart to mount.
+func (k K8sOptions) filesSecret() string { return k.Release + "-stowage-files" }
+
 // k8sCtl is the command line of a k8s verb on this release.
 func (in *Installer) k8sCtl(verb string) string {
 	return in.R.Ctl() + " k8s " + verb + k8sTarget(in.O.K8s)
@@ -330,7 +333,11 @@ func (in *Installer) k8sInputs() []input {
 	var out []input
 	for _, i := range in.R.Spec.Inputs {
 		if i.OnKubernetes() {
-			out = append(out, input{Input: i, check: textInputCheck})
+			check := textInputCheck
+			if i.File() {
+				check = fileInputCheck(i)
+			}
+			out = append(out, input{Input: i, check: check})
 		}
 	}
 	return out
@@ -359,7 +366,7 @@ func (in *Installer) readSecret(ctx context.Context, name string) (map[string]st
 	// Who wrote it first: another tool's Secret is named as such, not as another release's.
 	for _, key := range []string{"app.kubernetes.io/managed-by", "app.kubernetes.io/part-of", "app.kubernetes.io/instance"} {
 		if got, want := s.Metadata.Labels[key], want[key]; got != want {
-			return nil, fmt.Errorf("secret %s in %s was not written by %s for release %s (label %s is %q, not %q): it is not written over", name, in.O.K8s.Namespace, in.R.Ctl(), in.O.K8s.Release, key, got, want)
+			return nil, &foreignSecret{fmt.Sprintf("secret %s in %s was not written by %s for release %s (label %s is %q, not %q): it is not written over", name, in.O.K8s.Namespace, in.R.Ctl(), in.O.K8s.Release, key, got, want)}
 		}
 	}
 	data := map[string]string{}
@@ -409,10 +416,12 @@ func dockerAuths(host, user, token string) ([]byte, error) {
 type deploy struct {
 	namespace bool // the namespace is created
 	env       map[string]string
-	secret    map[string]bool // keys of env never printed
-	changed   []string        // keys of env this run adds or changes
-	pull      []byte          // the pull Secret's Docker config; nil writes none
-	values    []byte          // the values file the installer gives helm
+	secret    map[string]bool   // keys of env never printed
+	changed   []string          // keys of env this run adds or changes
+	pull      []byte            // the pull Secret's Docker config; nil writes none
+	files     map[string][]byte // the files Secret's data; nil writes none
+	restart   []string          // the keys whose readers an upgrade restarts (k8sRestartList)
+	values    []byte            // the values file the installer gives helm
 }
 
 // K8sInstall installs the release the installer carries as a new helm release: its namespace
@@ -506,6 +515,9 @@ func (in *Installer) k8sDeploy(ctx context.Context, upgrade bool) error {
 	if d.env, d.secret, d.changed, err = in.k8sEnv(ctx, upgrade); err != nil {
 		return err
 	}
+	if d.files, err = in.k8sFiles(ctx, d.env); err != nil {
+		return err
+	}
 	// A value the release no longer declares as an input leaves its Secret: the server-side apply
 	// removes a key the installer no longer gives.
 	for _, k := range in.dropped.inputs {
@@ -513,6 +525,9 @@ func (in *Installer) k8sDeploy(ctx context.Context, upgrade bool) error {
 			delete(d.env, k)
 			o.logf("input %s is not in %s %s: dropped", k, m.Name, m.ProjectVersion)
 		}
+	}
+	if upgrade {
+		d.restart = in.k8sRestartList(d.changed)
 	}
 	user, token, err := in.pullAccount(prefix)
 	if err != nil {
@@ -541,6 +556,11 @@ func (in *Installer) k8sDeploy(ctx context.Context, upgrade bool) error {
 	case !upgrade:
 		vals["pullSecret"] = ""
 		// An upgrade with no password keeps the pull Secret the release names (reused values).
+	}
+	// Given on every deploy, an upgrade's too: a value reused could name a Secret deleted since.
+	vals["files"] = ""
+	if d.files != nil {
+		vals["files"] = k.filesSecret()
 	}
 	if u := k.UnsafeSysctls; u != nil {
 		sysctls = *u
@@ -623,6 +643,16 @@ func (in *Installer) k8sDeploy(ctx context.Context, upgrade bool) error {
 		return fmt.Errorf("%w\nhelm removed the release; its Secret %s is kept, and a new `%s` reuses its values", err, k.envSecret(), in.k8sCtl("install"))
 	}
 	fmt.Fprintf(o.Out, "release %s in %s runs %s %s (revision %d)\n", k.Release, k.Namespace, m.Name, m.ProjectVersion, m.Revision)
+	if upgrade {
+		if err := in.k8sRestartReaders(ctx, d.restart); err != nil {
+			in.k8sFinished(ctx, d.env, prefix)
+			msg := fmt.Sprintf("%v\nthe release runs, and its Secrets hold the new values of %s", err, strings.Join(d.restart, ", "))
+			if plan != nil {
+				msg += fmt.Sprintf(", then `%s` runs the provision hook, which has not run", in.k8sCtl("provision"))
+			}
+			return errors.New(msg)
+		}
+	}
 	// The release runs: its endpoint and tips are printed whatever the hook does.
 	err = in.k8sProvisioned(ctx, plan)
 	in.k8sFinished(ctx, d.env, prefix)
@@ -706,12 +736,24 @@ func (in *Installer) k8sEnv(ctx context.Context, upgrade bool) (env map[string]s
 	for _, i := range all {
 		_, set := o.Set[i.Key]
 		_, ans := o.Answers[i.Key]
-		if _, ok := rec[i.Key]; !ok || (!upgrade && (set || ans)) {
+		rv, ok := rec[i.Key]
+		_, given := o.givenInputs()[i.Key]
+		switch {
+		// A value the run keeps must be readable. One an upgrade replaces may not change form, text
+		// to file or back, whatever is given: the release a rollback brings back reads it too.
+		case ok && wrongForm(i.Input, rv) && (!given && (upgrade || !set && !ans) || upgrade && isFileValue(rv) != i.File() && rv != ""):
+			if !upgrade {
+				return nil, nil, nil, fmt.Errorf("%w; or give it a new value with this install", in.unreadable(i.Input))
+			}
+			return nil, nil, nil, in.unreadable(i.Input)
+		case !ok, !upgrade && (set || ans), given, i.File() && i.Required && rv == "":
 			list = append(list, i)
 		}
 	}
 	if upgrade {
-		err = in.onlyAdded(recorded, list)
+		if err = in.onlyAdded(recorded, list); err != nil && !o.NewBaseline && replaceable(rec, all, list, o.Set, o.Answers) {
+			err = fmt.Errorf("%w; `--given FILE` replaces a recorded input (a file as `stowage-file:<base64>`)", err)
+		}
 	} else {
 		err = in.knownK8sInputs(all)
 	}
@@ -741,6 +783,9 @@ func (in *Installer) k8sEnv(ctx context.Context, upgrade bool) (env map[string]s
 	for _, key := range sortedKeys(values) {
 		if old, ok := rec[key]; !ok || old != values[key] {
 			changed = append(changed, key)
+			if ok {
+				o.logf("changing %s: %s → %s", key, cmp.Or(in.shownValue(key, old, secret), `""`), cmp.Or(in.shownValue(key, values[key], secret), `""`))
+			}
 		}
 	}
 	return values, secret, changed, nil
@@ -799,6 +844,9 @@ func (in *Installer) applySecrets(ctx context.Context, d deploy) error {
 		data[key] = []byte(v)
 	}
 	items = append(items, in.secretObject(k.envSecret(), "Opaque", data))
+	if d.files != nil {
+		items = append(items, in.secretObject(k.filesSecret(), "Opaque", d.files))
+	}
 	if d.pull != nil {
 		items = append(items, in.secretObject(k.pullSecret(), "kubernetes.io/dockerconfigjson", map[string][]byte{".dockerconfigjson": d.pull}))
 	}
@@ -813,6 +861,9 @@ func (in *Installer) applySecrets(ctx context.Context, d deploy) error {
 
 func secretNames(d deploy, k K8sOptions) []string {
 	names := []string{k.envSecret()}
+	if d.files != nil {
+		names = append(names, k.filesSecret())
+	}
 	if d.pull != nil {
 		names = append(names, k.pullSecret())
 	}
@@ -828,11 +879,10 @@ func (in *Installer) printDeploy(d deploy, args []string, shown map[string]strin
 	}
 	fmt.Fprintf(w, "secret %s:\n", k.envSecret())
 	for _, key := range d.changed {
-		v := d.env[key]
-		if d.secret[key] && v != "" {
-			v = "<redacted>"
-		}
-		fmt.Fprintf(w, "  %s=%s\n", key, v)
+		fmt.Fprintf(w, "  %s=%s\n", key, in.shownValue(key, d.env[key], d.secret))
+	}
+	if d.files != nil {
+		fmt.Fprintf(w, "secret %s: the file inputs %s\n", k.filesSecret(), cmp.Or(strings.Join(sortedKeys(d.files), ", "), "(none)"))
 	}
 	if d.pull != nil {
 		fmt.Fprintf(w, "secret %s: the pull account (redacted)\n", k.pullSecret())
@@ -847,6 +897,9 @@ func (in *Installer) printDeploy(d deploy, args []string, shown map[string]strin
 		a = append(a, "--kube-context", k.Context)
 	}
 	fmt.Fprintf(w, "%s\n", strings.Join(a, " "))
+	if len(d.restart) > 0 {
+		fmt.Fprintf(w, "then a restart of what reads %s\n", strings.Join(d.restart, ", "))
+	}
 	if plan != nil {
 		fmt.Fprintf(w, "then the provision hook, as the Job %s (the installer image %s)\n", k.hookJob(), plan.ctl)
 	}
@@ -1010,6 +1063,9 @@ func (in *Installer) K8sUpgradeTo(ctx context.Context, v string, args []string) 
 		return fmt.Errorf("release %s in %s runs %s %s (revision %d), after %s %s (revision %d): `%s` goes back one upgrade", k.Release, k.Namespace, name, r.Version, r.Revision, name, m.ProjectVersion, m.Revision, in.k8sCtl("rollback"))
 	case order == 0 && r.Revision == m.Revision:
 		fmt.Fprintf(in.O.Out, "release %s in %s already runs %s %s (revision %d)\n", k.Release, k.Namespace, name, r.Version, r.Revision)
+		if len(in.O.Set) > 0 || len(in.O.Answers) > 0 {
+			fmt.Fprintf(in.O.Out, "the inputs given are not applied: without --version, the installer of %s %s (revision %d) takes an input it adds (`%s`), and `--given FILE` replaces a recorded one\n", name, r.Version, r.Revision, in.k8sCtl("upgrade"))
+		}
 		if u := k.UnsafeSysctls; u != nil && *u != cur.givesSysctls() {
 			fmt.Fprintf(in.O.Out, "--unsafe-sysctls is not applied: `%s --unsafe-sysctls=%t`, without --version, by the installer of %s %s (revision %d), applies it\n", in.k8sCtl("upgrade"), *u, name, r.Version, r.Revision)
 		}

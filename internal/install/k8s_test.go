@@ -60,6 +60,7 @@ type fakeKube struct {
 	claims      []string         // the PersistentVolumeClaims `kubectl get` lists
 	deleteErr   error            // `kubectl delete` fails
 	uninstErr   error            // `helm uninstall` fails
+	rolloutErr  error            // `kubectl rollout` fails
 	// The provision hook's Job.
 	outputs string         // `kubectl get secret` of the outputs Secret
 	job     string         // `kubectl get job`: a Job an earlier run left; set to the created one
@@ -216,8 +217,10 @@ func (k kubeTool) Run(_ context.Context, c Cmd) ([]byte, error) {
 	case "helm status":
 		_, err := io.WriteString(c.Stdout, "STATUS: deployed\n")
 		return nil, err
-	case "kubectl version", "kubectl rollout":
+	case "kubectl version":
 		return nil, nil
+	case "kubectl rollout":
+		return nil, f.rolloutErr
 	case "kubectl config":
 		return []byte("kind-current\n"), nil
 	case "kubectl get":
@@ -265,6 +268,8 @@ func (k kubeTool) Run(_ context.Context, c Cmd) ([]byte, error) {
 			return []byte(f.pull), nil
 		case strings.HasSuffix(a[2], "-stowage-provision"):
 			return []byte(f.outputs), nil
+		case strings.HasSuffix(a[2], "-stowage-files"): // when objects names it, above
+			return nil, nil
 		}
 		return []byte(f.secret), nil
 	case "kubectl apply":
@@ -407,7 +412,8 @@ func (e *kubeEnv) secretData(name string) map[string]string {
 		md := o["metadata"].(map[string]any)
 		if o["kind"] == "Secret" && md["name"] == name {
 			out := map[string]string{}
-			for k, v := range o["data"].(map[string]any) {
+			data, _ := o["data"].(map[string]any) // absent when empty
+			for k, v := range data {
 				b, err := base64.StdEncoding.DecodeString(v.(string))
 				if err != nil {
 					e.t.Fatal(err)
@@ -456,7 +462,7 @@ func TestK8sInstallAppliesTheSecretsThenInstallsTheChartByDigest(t *testing.T) {
 	if strings.Contains(a, "--reset-then-reuse-values") || strings.Contains(a, "--kube-context") {
 		t.Errorf("%s", a)
 	}
-	want := fmt.Sprintf("stowage:\n    pullSecret: \"\"\n    registry: %s\n    secret: notes-stowage\n    sysctls: []\n", e.prefix)
+	want := fmt.Sprintf("stowage:\n    files: \"\"\n    pullSecret: \"\"\n    registry: %s\n    secret: notes-stowage\n    sysctls: []\n", e.prefix)
 	if len(e.f.given) != 1 || e.f.given[0] != want {
 		t.Errorf("values %q, want %q", e.f.given, want)
 	}

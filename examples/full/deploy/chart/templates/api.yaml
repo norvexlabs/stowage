@@ -37,6 +37,8 @@ spec:
             {{- else }}
             {{- fail (printf "postgres.mode %q: embedded or external" .Values.postgres.mode) }}
             {{- end }}
+          volumeMounts:
+            - { name: upstream-ca, mountPath: /etc/atlas/upstream-ca.pem, subPath: API_CA_BUNDLE, readOnly: true }
           ports:
             - containerPort: 9090
           startupProbe:          # the migrations run before the api listens
@@ -50,5 +52,9 @@ spec:
             httpGet: { path: /ready, port: 9090 }   # a psql round trip
             periodSeconds: 2
             timeoutSeconds: 5
+      volumes:
+        - name: upstream-ca   # the file input API_CA_BUNDLE, empty while it is
+          secret:
+            secretName: {{ required "stowage.files: install the chart with at-stow k8s, which records the Secret" .Values.stowage.files | quote }}
 ---
 {{ include "atlas.service" $c }}

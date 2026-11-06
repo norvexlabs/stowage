@@ -458,6 +458,9 @@ func (in *Installer) K8sReset(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	if len(o.Set) > 0 && !o.NewBaseline {
+		return errors.New("--set-file: a reset installs with the values it has; only --new-baseline asks what a release adds")
+	}
 	// A reset installs the release it wipes again, with its installer; only across a schema
 	// baseline, asked for by --new-baseline, does it install this installer's release instead.
 	other := cur.Release.Version != m.ProjectVersion || cur.Release.Revision != m.Revision
@@ -492,6 +495,9 @@ func (in *Installer) K8sReset(ctx context.Context) error {
 		if d.env, d.secret, d.changed, err = in.k8sEnv(ctx, true); err != nil {
 			return err
 		}
+		if d.files, err = in.k8sFiles(ctx, d.env); err != nil {
+			return err
+		}
 		user, token, err := in.pullAccount(cur.Registry)
 		if err != nil {
 			return err
@@ -509,6 +515,15 @@ func (in *Installer) K8sReset(ctx context.Context) error {
 	values, err := in.helm(ctx, Cmd{Args: []string{"get", "values", k.Release, "--output", "yaml"}})
 	if err != nil {
 		return err
+	}
+	if other {
+		name := ""
+		if d.files != nil {
+			name = k.filesSecret()
+		}
+		if values, err = withFilesValue(values, name); err != nil {
+			return err
+		}
 	}
 	manifest, err := in.helm(ctx, Cmd{Args: []string{"get", "manifest", k.Release}})
 	if err != nil {

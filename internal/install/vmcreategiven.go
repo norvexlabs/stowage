@@ -42,7 +42,7 @@ func parseGiven(raw []byte, project string) (*Given, error) {
 	}
 	t := bytes.TrimSpace(raw)
 	if bytes.HasPrefix(t, []byte(armor.Header)) || bytes.HasPrefix(t, []byte("age-encryption.org/")) {
-		return nil, errors.New("--given: the file is encrypted: this flag takes it in the clear, over the pinned SSH channel")
+		return nil, errors.New("--given: the file is encrypted: this flag takes it in the clear")
 	}
 	var g Given
 	dec := yaml.NewDecoder(bytes.NewReader(raw))

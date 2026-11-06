@@ -2,7 +2,7 @@
 """Provision hook contract: environment in, KEY=VALUE lines out, idempotent and resumable.
 
 It receives what hooks.provision.env lists (ADMIN_EMAIL, ADMIN_PASSWORD, INTERNAL_SERVICE_SECRET,
-and API_CA_BUNDLE as a file mounted at STOWAGE_INPUT_FILE_API_CA_BUNDLE, on Docker and the VM)
+and API_CA_BUNDLE as a file mounted at STOWAGE_INPUT_FILE_API_CA_BUNDLE)
 and what it returned before; API_URL (default http://api:9090) comes from the chart's ConfigMap
 on Kubernetes. The administrator's password is ADMIN_PASSWORD when given (an input on Kubernetes;
 on Docker the one this hook returned before), else minted here and printed before the step that

@@ -236,6 +236,11 @@ func (in *Installer) k8sRunHook(ctx context.Context, p *k8sHookPlan, set map[str
 	for key := range in.R.Spec.SafeDefaults {
 		reserved[key] = true
 	}
+	for _, i := range in.k8sInputs() {
+		if i.File() {
+			reserved[spec.FileVar(i.Key)] = true
+		}
+	}
 	cm, err := in.configMapKeys(ctx, k.hookName())
 	if err != nil {
 		return err
@@ -722,8 +727,19 @@ func (in *Installer) hookJobObject(p *k8sHookPlan, env, outs map[string]string, 
 	ref := func(secret, key string) map[string]any {
 		return map[string]any{"name": key, "valueFrom": map[string]any{"secretKeyRef": map[string]any{"name": secret, "key": key}}}
 	}
+	var inputFiles []any
 	for _, key := range p.hook.Keys() {
 		if _, ok := env[key]; ok {
+			if i, isInput := s.Input(key); isInput && i.File() {
+				// A value kept from a release that asked it here has no file: the input is not asked now.
+				if !i.OnKubernetes() {
+					continue
+				}
+				// The file, never its recorded form: mounted below, at the path this variable holds.
+				inputFiles = append(inputFiles, map[string]any{"key": key, "path": key})
+				vars = append(vars, map[string]any{"name": spec.FileVar(key), "value": HookInputsDir + "/" + key})
+				continue
+			}
 			vars = append(vars, ref(k.envSecret(), key))
 		} else if v, ok := s.SafeDefaults[key]; ok && !chart[key] {
 			// A safe default is no secret, and the release's Secret does not hold it; the chart's
@@ -778,6 +794,11 @@ func (in *Installer) hookJobObject(p *k8sHookPlan, env, outs map[string]string, 
 					map[string]any{"name": "token", "mountPath": tokenMount, "readOnly": true},
 				}},
 		},
+	}
+	if len(inputFiles) > 0 {
+		pod["volumes"] = append(pod["volumes"].([]any), map[string]any{"name": "inputs", "secret": map[string]any{"secretName": k.filesSecret(), "defaultMode": 0o444, "items": inputFiles}})
+		provision := pod["containers"].([]any)[0].(map[string]any)
+		provision["volumeMounts"] = append(provision["volumeMounts"].([]any), map[string]any{"name": "inputs", "mountPath": HookInputsDir, "readOnly": true})
 	}
 	if p.pull != "" {
 		pod["imagePullSecrets"] = []any{map[string]any{"name": p.pull}}

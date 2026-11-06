@@ -736,6 +736,21 @@ into a binary every shape carries, for what two CLIs every cluster operator has 
   restores the chart's objects only), not by an install retried after `--atomic` removed a
   failed one. The chart reads it by name (`stowage.secret`), as it reads the pull Secret
   (`stowage.pullSecret`). Inputs are recorded there too: Kubernetes has no `.env`.
+- **A file input reaches a chart as a Secret of its own** (`<release>-stowage-files`, named in
+  `stowage.files`), derived on each deploy from the recorded form: mounting that Secret gives a real
+  file, which the release's Secret, read key by key into the environment, cannot. A key per input,
+  empty while the input is, so a `subPath` mount holds a file either way, as on Docker. A key no input
+  declares stays with what it holds, as the release a rollback or a failed upgrade leaves running
+  mounts it (a later release declaring the input asks it, as any it adds);
+  the Secret is not kept with the data, as the release's Secret rebuilds it.
+- **`--given` replaces a recorded value on an upgrade, and `--set` does not**: an upgrade keeping
+  what was recorded protects an operator from a stray flag, whereas given material is issued to
+  replace. A pod keeps the environment and the `subPath` file it started with, and helm rolls only
+  what a template changes, so the installer restarts what reads a key given. It does so even when
+  the value is unchanged: helm rolling a failed upgrade back leaves the Secret ahead of the pods, and
+  giving the same file again is how that is repaired. Giving never changes a value's form on an
+  upgrade: the release a rollback brings back reads the same Secret. TLS is not carried here: the chart's ingress
+  and cert-manager own it.
 - **Full values on every upgrade, without the operator repeating them**: helm does not merge a
   release's earlier values into an upgrade, so a forgotten `--values` would reset the release to
   chart defaults. `upgrade` passes `--reset-then-reuse-values` (helm ≥ 3.14): the new chart's

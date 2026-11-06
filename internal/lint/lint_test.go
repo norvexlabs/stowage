@@ -277,7 +277,6 @@ func TestEachRuleFiresOnFull(t *testing.T) {
 		{"file input type named", []edit{{sp, "type: pem, optional: true", "type: text, optional: true"}}, nil, `"text": expected file or pem`},
 		{"file input default", []edit{{sp, "type: pem, optional: true", "type: pem, default: x, optional: true"}}, nil, "a file input is given as a file: no default"},
 		{"file input advanced", []edit{{sp, "type: pem, optional: true", "type: pem, advanced: true, optional: true"}}, nil, "a file input is mounted by a service, so asked: not advanced"},
-		{"file input on a chart", []edit{{sp, "type: pem, optional: true, shapes: [docker, kairos]", "type: pem, optional: true"}}, nil, "a chart has no way to it"},
 		{"file input as text", []edit{{cp, "ORG_NAME: ${ORG_NAME}", "ORG_NAME: ${API_CA_BUNDLE}"}}, nil, "${API_CA_BUNDLE} is a file input: what is recorded for it is no text to read; mount ${STOWAGE_INPUT_FILE_API_CA_BUNDLE}"},
 		{"file path of no file input", []edit{{cp, "${STOWAGE_INPUT_FILE_API_CA_BUNDLE}", "${STOWAGE_INPUT_FILE_ORG_NAME}"}}, nil, "STOWAGE_INPUT_FILE_ORG_NAME names no file input"},
 		{"file path of no input", []edit{{cp, "${STOWAGE_INPUT_FILE_API_CA_BUNDLE}", "${STOWAGE_INPUT_FILE_NOPE}"}}, nil, "STOWAGE_INPUT_FILE_NOPE names no file input"},
@@ -1664,6 +1663,22 @@ func TestHostPrivilegesWarn(t *testing.T) {
 	}
 }
 
+// A chart that never reads the files Secret is warned while a file input is asked on Kubernetes.
+func TestChartNotReadingTheFilesSecretWarns(t *testing.T) {
+	t.Parallel()
+	root := testutil.CopyExample(t, "full")
+	testutil.Edit(t, root, "deploy/chart/templates/api.yaml", ".Values.stowage.files", ".Values.api.files")
+	res := run(t, root)
+	if len(res.Findings) != 1 || !strings.Contains(res.Findings[0].String(), "no template reads .Values.stowage.files") {
+		t.Fatalf("findings: %+v", res.Findings)
+	}
+	// No such input on the shape, no warning.
+	testutil.Edit(t, root, "stowage.yaml", "type: pem, optional: true }", "type: pem, optional: true, shapes: [docker, kairos] }")
+	if res := run(t, root); len(res.Findings) != 0 {
+		t.Fatalf("findings: %+v", res.Findings)
+	}
+}
+
 // A chart that never reads the L4 routes is warned: they would not be published on Kubernetes.
 func TestChartNotReadingTheL4RoutesWarns(t *testing.T) {
 	t.Parallel()
@@ -1746,6 +1761,14 @@ func TestChartNotReadingTheSecretWarns(t *testing.T) {
 	for _, f := range run(t, root).Findings {
 		if strings.Contains(f.Message, ".Values.stowage.secret") {
 			t.Errorf("warned with nothing to read: %s", f.Message)
+		}
+	}
+	// A file input alone reads the files Secret, not this one.
+	testutil.Edit(t, root, specFile, `required: true, shapes: [docker] }`, `required: true, shapes: [docker] }
+  - { key: CA, prompt: "CA", type: file, optional: true }`)
+	for _, f := range run(t, root).Findings {
+		if strings.Contains(f.Message, ".Values.stowage.secret") {
+			t.Errorf("warned for a file input: %s", f.Message)
 		}
 	}
 }

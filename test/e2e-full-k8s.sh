@@ -12,12 +12,13 @@
 # month's .1 → `k8s install` against an external Postgres (its two URLs and the administrator's
 # password are secret inputs, given in the operator's environment; the search extension's URL
 # given at the install), the hook's API key recorded, the endpoint printed → `k8s upgrade` of the
-# same release, the key handed back to the hook → the app's users revoke
+# same release, the key handed back to the hook → `k8s upgrade --given`: a file input and a recorded
+# value replaced, the api restarted on them, the hook reading the file, its tls left out → the app's users revoke
 # the key, ship .2 (a migration) → `k8s upgrade --version`: the release runs .2, its hook fails
 # naming `k8s provision --set`, which mints another key; `k8s provision` again keeps it → its
 # record lost, `k8s provision --set ADMIN_API_KEY=<key>` gives the key the hook never returned (the
 # spec declares it in hooks.provision.returns) and no other is minted → the data kept → `k8s rollback` (the database read in a pod of the release: no barrier since the schema the upgrade recorded, and the previous api reads the newer schema) → a second release in another
-# namespace with the embedded Postgres → `k8s reset-db` deletes its database's claim, forgets what
+# namespace with the embedded Postgres and a file input by --set-file → `k8s reset-db` deletes its database's claim, forgets what
 # the hook returned, and the hook registers the administrator again → `k8s secrets rotate` takes
 # the internal secret through its three passes, the release restarted at each, each value
 # accepted while it must be → `k8s uninstall --yes` of the embedded release keeps its database's
@@ -202,6 +203,32 @@ atlas_runs "$V1" 1
 hook_ran "$WORK/search.log" "$key"
 [[ $(k8s_get atlas-stowage-provision ADMIN_API_KEY) == "$key" ]] || fail "the upgrade's hook minted another key: what it returned was not handed back"
 
+step "k8s upgrade --given: a file input and a recorded value replaced, the pods restarted; its tls left out"
+api_ca() { kubectl exec -n "$NS" deploy/atlas-api -c api -- cat /etc/atlas/upstream-ca.pem; }
+ca=$(api_ca) && [[ -z $ca ]] || fail "the file input left empty was not an empty file"
+openssl req -x509 -newkey ed25519 -nodes -subj /CN=atlas-upstream -keyout /dev/null -days 1 -out "$OP/upstream-ca.pem" 2>/dev/null || fail "making a CA"
+SEARCH2=http://atlas-api.$NS.svc:9090
+cat >"$OP/given.yaml" <<EOF
+project: atlas
+inputs:
+  API_CA_BUNDLE: "stowage-file:$(base64 -w0 "$OP/upstream-ca.pem")"
+  SEARCH_URL: "$SEARCH2"
+tls: { client_ca: "$(tr -d '\n' <"$OP/upstream-ca.pem")" }
+EOF
+ctl v1.sh k8s upgrade --given given.yaml --no-input --timeout 5m >"$WORK/given.log" 2>&1 || { cat "$WORK/given.log"; cluster_logs >&2; fail "k8s upgrade --given"; }
+atlas_runs "$V1" 1
+[[ $(api_ca) == "$(cat "$OP/upstream-ca.pem")" ]] || fail "the api does not see the file given"
+[[ $(k8s_get atlas-stowage-files API_CA_BUNDLE) == "$(cat "$OP/upstream-ca.pem")" ]] || fail "the files Secret does not hold the file given"
+[[ $(kubectl exec -n "$NS" deploy/atlas-api -c api -- printenv SEARCH_URL) == "$SEARCH2" ]] || fail "the api was not restarted with the value given"
+[[ $(status search admins) == True/1 ]] || fail "the api does not reach SEARCH_URL as given"
+grep -qF 'changing API_CA_BUNDLE: "" → sha256:' "$WORK/given.log" || { cat "$WORK/given.log"; fail "the file's change was not logged by its digest"; }
+grep -qF "changing SEARCH_URL: http://atlas-api:9090 → $SEARCH2" "$WORK/given.log" || { cat "$WORK/given.log"; fail "the value's change was not logged"; }
+grep -qF 'kubectl: restarting deployment/atlas-api' "$WORK/given.log" || { cat "$WORK/given.log"; fail "what reads the values given was not restarted"; }
+grep -qF -- '--given: tls left out' "$WORK/given.log" || { cat "$WORK/given.log"; fail "the tls section was not said to be left out"; }
+grep -qF 'certificates in /run/stowage/inputs/API_CA_BUNDLE: 1' "$WORK/given.log" || { cat "$WORK/given.log"; fail "the provision hook did not read the file given"; }
+hook_ran "$WORK/given.log" "$key"
+! grep -qF "$(base64 -w0 "$OP/upstream-ca.pem")" "$WORK/given.log" || fail "the file given reached a log"
+
 step "the app's users revoke the key; ship $V2 (a migration), k8s upgrade --version $V2: the hook fails, the release runs $V2"
 kubectl exec -n atlas-db deploy/db -- psql -U atlas -d atlas -qc 'DELETE FROM api_keys' || fail "revoking the key"
 full_release 2 002_event_source.sql "-- 002: where an event came from
@@ -249,9 +276,10 @@ atlas_runs "$V1" 2
 
 step "k8s install $V1 in atlas-eval, embedded database"
 NS=atlas-eval
-(cd "$OP" && "${OPERATOR[@]}" "ADMIN_PASSWORD=$ADMIN_PW" sh v1.sh k8s install --namespace "$NS" --no-input \
+(cd "$OP" && "${OPERATOR[@]}" "ADMIN_PASSWORD=$ADMIN_PW" sh v1.sh k8s install --namespace "$NS" --no-input --set-file API_CA_BUNDLE=upstream-ca.pem \
 	--set ADMIN_EMAIL=admin@atlas.test --set ORG_NAME=Eval --timeout 5m) >"$WORK/eval.log" 2>&1 ||
 	{ cat "$WORK/eval.log"; cluster_logs >&2; fail "k8s install (embedded)"; }
+[[ $(api_ca) == "$(cat "$OP/upstream-ca.pem")" ]] || fail "the api does not see the file --set-file gave"
 atlas_runs "$V1" 1
 [[ $(status organisation admins) == Eval/1 ]] || fail "the embedded release's api did not record its inputs"
 evalkey=$(k8s_get atlas-stowage-provision ADMIN_API_KEY)

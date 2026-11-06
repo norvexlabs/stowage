@@ -382,7 +382,7 @@ func newCommand(r *Release, self string, stdout, stderr io.Writer, tools K8sOpti
 		return in.ExportSecrets(recipients)
 	}))
 	if r.Spec.Shapes.Kubernetes != nil {
-		root.AddCommand(k8sCommand(in, &o, prepare, terminal, &sets, &answers, &noInput, &accessible))
+		root.AddCommand(k8sCommand(in, &o, prepare, terminal, &sets, &setFiles, &answers, &noInput, &accessible))
 	}
 	if r.Spec.Shapes.Kairos != nil {
 		root.AddCommand(vmCreateCommand(in, &o, prepare, terminal, &sets, &setFiles, &domains, &answers, &noInput, &accessible, &takesTLS))
@@ -412,9 +412,9 @@ func newCommand(r *Release, self string, stdout, stderr io.Writer, tools K8sOpti
 
 // k8sCommand is `k8s`: the release on a Kubernetes cluster, with helm and kubectl. Every
 // subcommand works in the current directory, where `upgrade --version` fetches an installer.
-func k8sCommand(in *Installer, o *Options, prepare func() error, terminal func(bool) Prompter, sets *[]string, answers *string, noInput, accessible *bool) *cobra.Command {
+func k8sCommand(in *Installer, o *Options, prepare func() error, terminal func(bool) Prompter, sets, setFiles *[]string, answers *string, noInput, accessible *bool) *cobra.Command {
 	name, v := in.R.Spec.Name, in.R.Manifest.ProjectVersion
-	var to string
+	var to, givenFile string
 	// One per subcommand: a flag writes its default into its variable when it is defined.
 	var installTimeout, upTimeout, backTimeout time.Duration
 	// run prepares the options, then asks on the terminal when the subcommand asks and the operator
@@ -429,6 +429,21 @@ func k8sCommand(in *Installer, o *Options, prepare func() error, terminal func(b
 		}
 		return f(cmd.Context())
 	}
+	// deployWith is run for what takes --given: what it gives joins the inputs before f reads them.
+	deployWith := func(cmd *cobra.Command, timeout time.Duration, f func(context.Context) error) error {
+		return run(cmd, timeout, true, func(ctx context.Context) error {
+			if givenFile != "" {
+				raw, err := readStdinFlag("--given", givenFile, cmd.InOrStdin())
+				if err == nil {
+					err = in.takeK8sGiven(raw)
+				}
+				if err != nil {
+					return err
+				}
+			}
+			return f(ctx)
+		})
+	}
 	k := &cobra.Command{
 		Use:   "k8s",
 		Short: fmt.Sprintf("Install and manage %s %s on Kubernetes, with helm and kubectl", name, v),
@@ -438,13 +453,15 @@ func k8sCommand(in *Installer, o *Options, prepare func() error, terminal func(b
 	pf.StringVar(&o.K8s.Namespace, "namespace", name, "the release's namespace")
 	pf.StringVar(&o.K8s.Release, "release", name, "the helm release's name")
 	pf.StringVar(&o.K8s.Context, "kube-context", "", "the kubeconfig context (default: the current one)")
-	deployFlags := func(c *cobra.Command, timeout *time.Duration, def time.Duration, what string) {
+	deployFlags := func(c *cobra.Command, timeout *time.Duration, def time.Duration, what, whatFile string) {
 		f := c.Flags()
 		f.StringArrayVar(&o.K8s.Values, "values", nil, "a chart values file, given to helm after the installer's (repeatable)")
 		f.StringVar(&o.K8s.Registry, "image-registry", "", "pull the chart and the images from this registry prefix, a mirror")
 		f.StringVar(&o.RegistryCA, "registry-ca", "", "a PEM file of the CA the registry's certificate chains to, a mirror's own: the installer's reads trust it (the cluster's nodes must trust it already)")
 		f.StringArrayVar(sets, "set", nil, what)
+		f.StringArrayVar(setFiles, "set-file", nil, whatFile)
 		f.StringVar(answers, "answers", "", "a YAML file of inputs, KEY: value")
+		f.StringVar(&givenFile, "given", "", "the file of what another install gives, or - for standard input: its inputs, which on an upgrade replace the recorded ones and restart what reads them")
 		f.BoolVar(noInput, "no-input", false, "never ask: an input nothing gave takes its default")
 		f.BoolVar(accessible, "accessible", false, "ask with plain line prompts (screen readers); also when ACCESSIBLE is set or TERM=dumb")
 		f.BoolVar(&o.DryRun, "dry-run", false, "check, print what would be applied (secrets redacted), change nothing")
@@ -457,22 +474,27 @@ func k8sCommand(in *Installer, o *Options, prepare func() error, terminal func(b
 		Short: fmt.Sprintf("Install %s %s as a new helm release: its Secrets, then the chart (rolled back when not ready)", name, v),
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			return run(cmd, installTimeout, true, in.K8sInstall)
+			return deployWith(cmd, installTimeout, in.K8sInstall)
 		},
 	}
-	deployFlags(install, &installTimeout, 10*time.Minute, "an input, KEY=VALUE (repeatable)")
+	deployFlags(install, &installTimeout, 10*time.Minute, "an input, KEY=VALUE (repeatable)", "a file input's file, KEY=PATH (repeatable)")
 	up := &cobra.Command{
 		Use:   "upgrade",
 		Short: fmt.Sprintf("Move the release to %s, or apply it again with new values; rolled back by helm when not ready", v),
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if to != "" {
-				return run(cmd, upTimeout, false, func(ctx context.Context) error { return in.K8sUpgradeTo(ctx, to, passed(cmd, "version")) })
+				return run(cmd, upTimeout, false, func(ctx context.Context) error {
+					if givenFile != "" {
+						return fmt.Errorf("--given with --version: `%s --version %s` first, then the installer of %s (`docker run --rm %s/%s-installer:<its tag> > %s.sh`) takes `k8s upgrade --given FILE` with the same target", in.k8sCtl("upgrade"), to, to, in.R.Spec.Registry.Prefix, in.R.Spec.Name, in.R.Spec.Name)
+					}
+					return in.K8sUpgradeTo(ctx, to, passed(cmd, "version"))
+				})
 			}
-			return run(cmd, upTimeout, true, in.K8sUpgrade)
+			return deployWith(cmd, upTimeout, in.K8sUpgrade)
 		},
 	}
-	deployFlags(up, &upTimeout, 6*time.Minute, "an input this release adds, KEY=VALUE (repeatable)")
+	deployFlags(up, &upTimeout, 6*time.Minute, "an input this release adds, KEY=VALUE (repeatable)", "a file input this release adds, KEY=PATH (repeatable)")
 	up.Flags().StringVar(&to, "version", "", "fetch the installer of this version (its latest revision, on the release's channel) from the release's registry, and upgrade with it")
 	back := &cobra.Command{
 		Use:   "rollback",
@@ -510,6 +532,7 @@ func k8sCommand(in *Installer, o *Options, prepare func() error, terminal func(b
 	rf.StringVar(&o.RegistryCA, "registry-ca", "", "a PEM file of the CA the release's registry's certificate chains to, a mirror's own")
 	rf.DurationVar(&resetTimeout, "timeout", 10*time.Minute, "how long helm and kubectl wait at each step")
 	rf.BoolVar(&o.NoProvision, "no-provision", false, "install again without running the provision hook")
+	rf.StringArrayVar(setFiles, "set-file", nil, "with --new-baseline, a file input the release adds, KEY=PATH (repeatable)")
 	rf.BoolVar(&o.NewBaseline, "new-baseline", false, "the release runs another schema baseline: wipe it and install this installer's release instead")
 	var uninstallTimeout time.Duration
 	uninstall := &cobra.Command{
