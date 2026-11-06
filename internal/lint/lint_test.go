@@ -185,11 +185,11 @@ func TestEachRuleFiresOnFull(t *testing.T) {
 		{"audit unsigned", []edit{{sp, "provider: cosign-key\n  key: env://ATLAS_SIGNING_KEY", "provider: none\n  key: env://ATLAS_SIGNING_KEY"}}, nil, "audit: a project that signs no release"},
 		{"audit fail_on", []edit{{sp, "fail_on: critical", "fail_on: none"}}, nil, `audit.fail_on: "none": one of negligible`},
 		{"audit allow missing", []edit{{sp, "allow: audit-allow.yaml", "allow: no-such.yaml"}}, nil, "audit.allow: no-such.yaml:"},
-		{"audit allow reason", []edit{{"audit-allow.yaml", "  reason: Kairos 4.4.0", "  reasons: Kairos 4.4.0"}}, nil, "audit.allow: audit-allow.yaml: yaml: unmarshal errors"},
-		{"audit allow date", []edit{{"audit-allow.yaml", "no Kairos release with the fix yet\n  expires: 2027-01-31", "no Kairos release with the fix yet\n  expires: 2027-02-30"}}, nil, `expires "2027-02-30": a date`},
+		{"audit allow reason", []edit{{"audit-allow.yaml", "  reason: Docker's latest runc", "  reasons: Docker's latest runc"}}, nil, "audit.allow: audit-allow.yaml: yaml: unmarshal errors"},
+		{"audit allow date", []edit{{"audit-allow.yaml", "golang.org/x/net 0.55; no release with the fix yet\n  expires: 2027-01-31", "golang.org/x/net 0.55; no release with the fix yet\n  expires: 2027-02-30"}}, nil, `expires "2027-02-30": a date`},
 		{"audit allow artifact", []edit{{"audit-allow.yaml", "- id: GO-2026-6604\n  artifact: os", "- id: GO-2026-6604\n  artifact: osx"}}, nil, `audit.allow: audit-allow.yaml: allowance GO-2026-6604 in osx (package stdlib) (path /usr/bin/pebble): artifact "osx" is no artifact of the release: one of api, ingest, postgres, provision, ui, os, front, backup, chown, audit, installer, or "*"`},
-		{"audit allow path", []edit{{"audit-allow.yaml", "path: /system/installer/kairos-installer", "path: system/installer/kairos-installer"}}, nil, `path "system/installer/kairos-installer": an absolute, clean path`},
-		{"audit allow forever", []edit{{"audit-allow.yaml", "no Kairos release with the fix yet\n  expires: 2027-01-31", "no Kairos release with the fix yet\n  expires: 2099-01-01"}}, nil, "expires 2099-01-01: more than a year ahead"},
+		{"audit allow path", []edit{{"audit-allow.yaml", "path: /usr/bin/runc", "path: usr/bin/runc"}}, nil, `path "usr/bin/runc": an absolute, clean path`},
+		{"audit allow forever", []edit{{"audit-allow.yaml", "golang.org/x/net 0.55; no release with the fix yet\n  expires: 2027-01-31", "golang.org/x/net 0.55; no release with the fix yet\n  expires: 2099-01-01"}}, nil, "expires 2099-01-01: more than a year ahead"},
 		{"add_hosts name", []edit{{sp, "packages.atlas.test: [", "Packages.atlas.test: ["}}, nil, `images.api.add_hosts: "Packages.atlas.test" is not a host name`},
 		{"add_hosts address", []edit{{sp, "[192.0.2.10, 192.0.2.11]", "[192.0.2.10, 192.0.2]"}}, nil, `images.api.add_hosts.packages.atlas.test[1]: "192.0.2" is not an IP address without a zone`},
 		{"add_hosts zone", []edit{{sp, "[192.0.2.10, 192.0.2.11]", "[fe80::1%eth0]"}}, nil, `"fe80::1%eth0" is not an IP address without a zone`},
@@ -2408,7 +2408,7 @@ func TestAuditAllowNotice(t *testing.T) {
 		{"2026-11-07", ""},
 	} {
 		root := testutil.CopyExample(t, "full")
-		testutil.Edit(t, root, "audit-allow.yaml", "no Kairos release with the fix yet\n  expires: 2027-01-31", "no Kairos release with the fix yet\n  expires: "+c.expires)
+		testutil.Edit(t, root, "audit-allow.yaml", "golang.org/x/net 0.55; no release with the fix yet\n  expires: 2027-01-31", "golang.org/x/net 0.55; no release with the fix yet\n  expires: "+c.expires)
 		res, err := Run(root, filepath.Join(root, specFile), now)
 		if err != nil {
 			t.Fatal(err)
@@ -2422,7 +2422,7 @@ func TestAuditAllowNotice(t *testing.T) {
 		switch {
 		case c.want == "" && len(warns) > 0:
 			t.Errorf("%s: warned %q", c.expires, warns)
-		case c.want != "" && (len(warns) != 1 || !strings.Contains(warns[0], "allowance GHSA-cxf3-9h37-7rr8 in os (package github.com/labstack/echo/v5) (path /system/installer/kairos-installer) "+c.want)):
+		case c.want != "" && (len(warns) != 1 || !strings.Contains(warns[0], "allowance GO-2026-6612 in os (package golang.org/x/net) (path /usr/bin/runc) "+c.want)):
 			t.Errorf("%s: %q, want %q", c.expires, warns, c.want)
 		}
 		if errs := errorsOf(res); len(errs) > 0 {

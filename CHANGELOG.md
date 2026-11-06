@@ -3,6 +3,20 @@
 Stowage's own releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
+## [0.28.2]
+
+### Fixed
+
+- A crafted compressed frame could crash the zstd code Stowage's binaries carry (GO-2026-6865):
+  they now use the fixed compression library.
+
+### Changed
+
+- The full example no longer accepts GO-2026-6612 in Docker's compose plugin or GHSA-cxf3-9h37-7rr8
+  in Kairos's installer: today's Docker package and the Kairos 4.4.0 image carry the fixes. A project
+  with the kairos shape can drop those two allowances once `ship` says, on a freshly built bundle,
+  that they match no finding; its GO-2026-6612 entries for containerd and runc are still needed.
+
 ## [0.28.1] - 2026-11-05
 
 ### Added

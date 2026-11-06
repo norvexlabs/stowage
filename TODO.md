@@ -68,13 +68,21 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
   it (the failed `vm create` names `virsh undefine … --nvram`). Fixed upstream (the resource kept
   in the state, tainted) or by a `vm destroy` that reaches the platform, it needs no hint.
 - **The OS bundle carries upstream binaries with fixable criticals no rebuild clears yet**: Docker's
-  latest `containerd`, `containerd-shim-runc-v2`, `ctr`, `runc` and `docker-compose`
-  (golang.org/x/net 0.55–0.58), Ubuntu 26.04's `pebble` (Go 1.27.1) and Kairos 4.4.0's
-  `kairos-installer` (labstack/echo 5.3.1). `examples/full`'s `audit-allow.yaml` accepts
-  GO-2026-6612, GO-2026-6604 and GHSA-cxf3-9h37-7rr8 in `os`, each narrowed to its package and
-  binary, until 2027-01-31; every project with the kairos shape and `audit` needs the same until
-  Docker, Ubuntu and Kairos ship fixed builds. Before then: check for fixed releases, then remove
-  the allowances (or rebuild those binaries in the bundle's recipe if upstream stays behind).
+  latest `containerd`, `containerd-shim-runc-v2`, `ctr` and `runc` (golang.org/x/net 0.55–0.58) and
+  the `ubuntu:26.04` base image's `pebble` (Go 1.27.1, no package owns it, nothing starts it).
+  `examples/full`'s `audit-allow.yaml` accepts GO-2026-6612 and GO-2026-6604 in `os`, each narrowed
+  to its package and binary, until 2027-01-31; every project with the kairos shape and `audit`
+  needs the same until Docker and Ubuntu ship fixed builds. Before then: check for fixed releases,
+  then remove the allowances. The fixes are taken from upstream's releases only.
+
+- **A change to `examples/full`'s `os` allowances is audited by no suite the gate picks**: e2e-full
+  and e2e-full-k8s drop the kairos shape and those entries, so an entry removed too early first
+  fails at e2e-full-vm or a real ship. Route those entries to e2e-full-vm in `test/gate.sh` and
+  gate 1.
+
+- **The lint tests edit a live allowance**: `TestEachRuleFiresOnFull` and `TestAuditAllowNotice`
+  anchor on the `runc` entry of `examples/full/audit-allow.yaml`, which goes when Docker ships a
+  fix. Have them add a fixture entry to the copied example instead.
 
 - **`updates` on Docker and Kubernetes**: the VM's `updates` lists what the channel offers after
   the running release, with its changelog; on Docker and Kubernetes an operator learns that a newer

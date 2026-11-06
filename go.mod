@@ -10,7 +10,7 @@ require (
 	github.com/docker/cli v29.8.2+incompatible
 	github.com/docker/go-units v0.5.0
 	github.com/google/go-containerregistry v0.22.1
-	github.com/klauspost/compress v1.20.1
+	github.com/klauspost/compress v1.20.2
 	github.com/moby/buildkit v0.34.0
 	github.com/moby/patternmatcher v0.6.1
 	github.com/sigstore/sigstore v1.10.8

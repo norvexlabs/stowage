@@ -28,25 +28,13 @@
   expires: 2027-01-31
 - id: GO-2026-6612
   artifact: os
-  package: golang.org/x/net
-  path: /usr/libexec/docker/cli-plugins/docker-compose
-  reason: Docker's latest docker-compose is built with golang.org/x/net 0.58; no release with the fix yet
-  expires: 2027-01-31
-- id: GO-2026-6612
-  artifact: os
   package: stdlib
   path: /usr/bin/pebble
-  reason: the Go standard library in Ubuntu's pebble (go1.27.1); no Ubuntu build with the fix yet
+  reason: the Go standard library in the ubuntu:26.04 base image's pebble (go1.27.1); no base image with the fix yet
   expires: 2027-01-31
 - id: GO-2026-6604
   artifact: os
   package: stdlib
   path: /usr/bin/pebble
-  reason: the Go standard library in Ubuntu's pebble (go1.27.1); no Ubuntu build with the fix yet
-  expires: 2027-01-31
-- id: GHSA-cxf3-9h37-7rr8
-  artifact: os
-  package: github.com/labstack/echo/v5
-  path: /system/installer/kairos-installer
-  reason: Kairos 4.4.0's kairos-installer is built with labstack/echo 5.3.1; no Kairos release with the fix yet
+  reason: the Go standard library in the ubuntu:26.04 base image's pebble (go1.27.1); no base image with the fix yet
   expires: 2027-01-31
