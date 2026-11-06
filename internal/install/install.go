@@ -108,7 +108,7 @@ type Options struct {
 	// exported ones (--new-secrets).
 	Secrets    []byte
 	NewSecrets bool
-	// Given is what `install --given` gives (takeGiven): its inputs join Answers, and givenTLS is the
+	// Given is what --given or --kit gives (useGiven): its inputs join Answers, and givenTLS is the
 	// PEM the TLS options read when they name it (readPEM).
 	Given    *Given
 	givenTLS *GivenTLS
@@ -2411,6 +2411,11 @@ func (in *Installer) knownInputs(mode string) error {
 			hint = "; a route's domain is one with --tls or --domains"
 			if in.again {
 				hint = "; this install is in loopback mode, which serves no domain"
+			}
+		}
+		for _, k := range unknown {
+			if i, ok := in.R.Spec.Input(k); ok && i.When != "" && !applies(i, in.shape(), mode != Loopback) {
+				hint += fmt.Sprintf("; %s is asked in a %s mode alone, and this is %s", k, i.When, mode)
 			}
 		}
 		return fmt.Errorf("no input of this install is named %s (inputs: %s%s)", strings.Join(unknown, ", "), strings.Join(sortedKeys(used), ", "), hint)

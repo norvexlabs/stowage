@@ -57,8 +57,9 @@ base64 -d > "$dir/%[2]s" <<'STOWAGE_INSTALLER_END'
 	_, err := fmt.Fprintf(w, `
 STOWAGE_INSTALLER_END
 chmod 700 "$dir/%[2]s"
-# Piped, stdin is this script: prompts read the terminal when there is one.
-if [ ! -t 0 ] && (exec < /dev/tty) 2>/dev/null; then
+# Arriving on stdin (no file $0), stdin is this script: prompts read the terminal when there is one.
+# Run from its file, stdin is the operator's, for the flags and commands that read it.
+if [ ! -f "$0" ] && [ ! -t 0 ] && (exec < /dev/tty) 2>/dev/null; then
 	"$dir/%[2]s" "$@" < /dev/tty
 else
 	"$dir/%[2]s" "$@"

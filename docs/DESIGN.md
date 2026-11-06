@@ -1479,6 +1479,13 @@ every shape, the VM end-to-end test upgrading through it), then the health gate.
   marked retired on the OEM partition, which a reset keeps and the recovery system mounts too, so
   no later boot serves it, and the VM's own key, read through it, is what `vm create` keeps;
   anyone reading the seed or the metadata service later finds a key no system of the VM offers.
+  A handoff kit (`internal/kit`) seals a `Given` with a code rather than to an age public key: age has
+  no sender authentication, so anyone could forge a kit to a public key, and a kit sets what an install
+  trusts (CAs, URLs); age refuses a scrypt file with any other recipient, so a file made without the
+  code does not open. The most scrypt work a kit may ask is what Stowage seals with, as it is paid
+  before the code is known. `vm create --kit` opens the kit where it runs and gives the result as any
+  Given: the material is already on that machine's disk until the install took it, so a step copying
+  the sealed kit and asking the code on the VM would protect nothing more for a second way to fail.
   A new VM's secret inputs and `byo` material take that channel too (`Given`, `install --given`):
   `await_secrets` keeps its name, and `install.yaml.given`, beside the settings, tells this wait
   from the wait for `--secrets`: a disk of an older release decodes the seed strictly before it

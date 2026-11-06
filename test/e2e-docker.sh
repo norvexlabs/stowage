@@ -5,7 +5,7 @@
 #   make e2e-docker        (builds ./bin/stowage first)
 #
 # Walks examples/minimal, with a real Postgres, through: ship 1.0.0 → the bootstrap one-liner
-# installs it → a re-run changes nothing → backups to a WebDAV server through the release's
+# installs it → a re-run changes nothing → `--given` replaces an input → backups to a WebDAV server through the release's
 # runner (the dump and the uploads volume's archive), and a restore that brings both back → ship 2.0.0 (a migration) → `notes-stow upgrade --version
 # 2.0.0` fetches its installer and upgrades → rollback is allowed (1.0.0 reads the newer schema) →
 # ship 3.0.0 (a migration that is a rollback barrier) → upgrade → going back to 1.0.0 by upgrade
@@ -60,6 +60,17 @@ step "re-run changes nothing"
 sum=$(sha256sum "$D/.env" "$D/compose.yaml")
 "${CTL[@]}" --dir "$D" --no-input >"$WORK/rerun.log" 2>&1 || { cat "$WORK/rerun.log"; fail "re-run"; }
 [[ $(sha256sum "$D/.env" "$D/compose.yaml") == "$sum" ]] || fail "a re-run changed .env or compose.yaml"
+running 1.0.0 1
+
+step "--given on a re-run: an input replaced and logged, then given back"
+given() {
+	printf 'project: notes\ninputs: {ADMIN_EMAIL: %s}\n' "$1" | "${CTL[@]}" --dir "$D" --no-input --given - >"$WORK/given.log" 2>&1 || { cat "$WORK/given.log"; fail "--given $1"; }
+}
+given other@notes.test
+grep -q '^ADMIN_EMAIL=other@notes.test$' "$D/.env" || fail "--given did not replace the recorded input"
+grep -qF 'changing ADMIN_EMAIL: admin@notes.test → other@notes.test' "$WORK/given.log" || { cat "$WORK/given.log"; fail "the change was not logged"; }
+given admin@notes.test
+grep -q '^ADMIN_EMAIL=admin@notes.test$' "$D/.env" || fail "--given did not give the input back"
 running 1.0.0 1
 
 step "audit on the Docker host: the release's SBOMs, scanned with its own scanner (the database given)"

@@ -7,6 +7,7 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"filippo.io/age/armor"
@@ -42,7 +43,7 @@ func parseGiven(raw []byte, project string) (*Given, error) {
 	}
 	t := bytes.TrimSpace(raw)
 	if bytes.HasPrefix(t, []byte(armor.Header)) || bytes.HasPrefix(t, []byte("age-encryption.org/")) {
-		return nil, errors.New("--given: the file is encrypted: this flag takes it in the clear")
+		return nil, errors.New("--given: the file is encrypted: this flag takes it in the clear, and --kit a kit")
 	}
 	var g Given
 	dec := yaml.NewDecoder(bytes.NewReader(raw))
@@ -53,18 +54,39 @@ func parseGiven(raw []byte, project string) (*Given, error) {
 	if g.Project != project {
 		return nil, fmt.Errorf("--given: the file holds %q's material, not %s's", g.Project, project)
 	}
-	if len(g.Inputs) == 0 && (g.TLS == nil || *g.TLS == GivenTLS{}) {
-		return nil, errors.New("--given: the file holds neither an input nor TLS material")
+	if err := g.check("--given"); err != nil {
+		return nil, err
+	}
+	return &g, nil
+}
+
+// empty reports whether g holds nothing.
+func (g *Given) empty() bool {
+	return len(g.Inputs) == 0 && (g.TLS == nil || *g.TLS == GivenTLS{})
+}
+
+// leftNothing refuses a g this shape's rules emptied, what they left out already said.
+func (g *Given) leftNothing(flag string) error {
+	if g.empty() {
+		return fmt.Errorf("%s: nothing in the file is for this install: get one holding this shape's inputs from its issuer", flag)
+	}
+	return nil
+}
+
+// check refuses a g holding nothing or half a certificate; flag is what gave it.
+func (g *Given) check(flag string) error {
+	if g.empty() {
+		return fmt.Errorf("%s: the file holds neither an input nor TLS material", flag)
 	}
 	if t := g.TLS; t != nil {
 		if (t.Cert == "") != (t.Key == "") {
-			return nil, errors.New("--given: tls: cert and key are given together")
+			return fmt.Errorf("%s: tls: cert and key are given together", flag)
 		}
 		if t.CA != "" && t.Cert == "" {
-			return nil, errors.New("--given: tls: ca is the CA of its cert, which the file does not hold")
+			return fmt.Errorf("%s: tls: ca is the CA of its cert, which the file does not hold", flag)
 		}
 	}
-	return &g, nil
+	return nil
 }
 
 // The names the TLS checks read a Given's PEM by, in place of the files --cert, --key, --ca and
@@ -93,19 +115,31 @@ func (o *Options) readPEM(path string) ([]byte, error) {
 	return os.ReadFile(path)
 }
 
-// takeGiven makes raw this install's given material. A flag and an answers file win, as over the
-// settings file: a certificate named by a flag leaves out the file's certificate, key and CA, as
-// does a mode other than byo, and --ca or --client-ca leaves out its own; each is said.
-func (in *Installer) takeGiven(raw []byte) error {
+// useGiven makes g, which flag gave, the given material of an install of shape. An input the project
+// declares for other shapes alone is left out and said, and a g left with nothing refused, as it
+// would meet a VM's wait for what `vm create` gives; an input it does not declare stays, for the
+// inputs' own check to refuse. A flag and an answers file win, as over the settings file: a
+// certificate named by a flag leaves out the file's certificate, key and CA, as does a mode other
+// than byo, and --ca or --client-ca leaves out its own; each is said.
+func (in *Installer) useGiven(g *Given, flag, shape string) error {
 	o := &in.O
-	g, err := parseGiven(raw, in.R.Spec.Name)
-	if err != nil {
-		return err
-	}
 	// The reset to come wipes an install made here, and the operator's step then removes the only
 	// copy of what it took.
 	if bootMode(o.cos()) == "recovery" {
-		return errors.New("--given: this is Kairos's recovery system, whose reset wipes an install: run it again once the first boot rebooted into the active system")
+		return fmt.Errorf("%s: this is Kairos's recovery system, whose reset wipes an install: run it again once the first boot rebooted into the active system", flag)
+	}
+	var elsewhere []string
+	for _, key := range sortedKeys(g.Inputs) {
+		if i, ok := in.R.Spec.Input(key); ok && len(i.Shapes) > 0 && !slices.Contains(i.Shapes, shape) {
+			elsewhere = append(elsewhere, key)
+			delete(g.Inputs, key)
+		}
+	}
+	if len(elsewhere) > 0 {
+		o.logf("%s: %s left out: not an input of the %s shape", flag, strings.Join(elsewhere, ", "), shape)
+	}
+	if err := g.leftNothing(flag); err != nil {
+		return err
 	}
 	o.Given = g
 	if len(g.Inputs) > 0 {
@@ -142,7 +176,7 @@ func (in *Installer) takeGiven(raw []byte) error {
 	}
 	o.givenTLS = t
 	if len(left) > 0 {
-		o.logf("--given: tls: %s left out, as the flags given decide", strings.Join(left, ", "))
+		o.logf("%s: tls: %s left out, as the flags given decide", flag, strings.Join(left, ", "))
 	}
 	return nil
 }

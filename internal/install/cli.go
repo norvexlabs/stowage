@@ -42,6 +42,7 @@ func newCommand(r *Release, self string, stdout, stderr io.Writer, tools K8sOpti
 	var ports, sets, setFiles, domains []string
 	var answers, to, secretsFile string
 	var noInput, accessible bool
+	var given givenFlags
 	var takesTLS bool // the running command is install or vm create, which alone take an answers file's tls section
 	name := r.Spec.Name
 	in := &Installer{R: r}
@@ -83,10 +84,18 @@ func newCommand(r *Release, self string, stdout, stderr io.Writer, tools K8sOpti
 			}
 			in.O.Cert, in.O.Key, in.O.CA, in.O.ClientCA = expandHome(in.O.Cert), expandHome(in.O.Key), expandHome(in.O.CA), expandHome(in.O.ClientCA)
 			if secretsFile != "" {
+				if given.any() {
+					return fmt.Errorf("--secrets restores an install, %s gives one its inputs and TLS material: give one", given.name())
+				}
 				var err error
 				if in.O.Secrets, err = readSecretsArg(secretsFile, cmd.InOrStdin()); err != nil {
 					return err
 				}
+			}
+			if err := given.take(cmd.Context(), in, cmd.InOrStdin(), in.O.Prompt, time.Now(), func(g *Given, flag string) error {
+				return in.useGiven(g, flag, in.shape())
+			}); err != nil {
+				return err
 			}
 			if in.O.Prompt != nil && !cmd.Flags().Changed("dir") {
 				def := in.O.Dir
@@ -132,6 +141,8 @@ func newCommand(r *Release, self string, stdout, stderr io.Writer, tools K8sOpti
 	rf.BoolVar(&o.DryRun, "dry-run", false, "check, print what would be written (secrets redacted), write nothing")
 	hideFrontFlags(rf, r.Spec, frontFlagNames)
 	rf.StringVar(&secretsFile, "secrets", "", "a first install's secrets: the file `secrets export` wrote, decrypted (- for standard input)")
+	given.defineGiven(rf, "inputs and TLS material another install gives, a file in the clear (- for standard input); a re-run changes the recorded ones")
+	given.defineKit(rf, "a handoff kit, or - for standard input: what it holds, taken as --given's")
 	rf.StringArrayVar(&sets, "set", nil, "an input, KEY=VALUE (repeatable; a re-run changes the recorded one)")
 	rf.StringArrayVar(&setFiles, "set-file", nil, "a file input's file, KEY=PATH (repeatable; a re-run changes the recorded one)")
 	rf.StringVar(&answers, "answers", "", "a YAML file of inputs, KEY: value, and the front's tls section (a re-run changes the recorded ones)")
@@ -303,6 +314,7 @@ func newCommand(r *Release, self string, stdout, stderr io.Writer, tools K8sOpti
 			return nil
 		},
 	}
+	refusesKit(up, fmt.Sprintf("a re-run, `%s --dir <the install> --kit FILE`, gives it to the install", r.Ctl()))
 	uf := up.Flags()
 	uf.StringVar(&to, "version", "", "fetch the installer of this version (its latest revision, on the install's channel) from the install's registry, and upgrade with it")
 	uf.StringArrayVar(&sets, "set", nil, "an input this release adds, KEY=VALUE (repeatable)")
@@ -414,7 +426,8 @@ func newCommand(r *Release, self string, stdout, stderr io.Writer, tools K8sOpti
 // subcommand works in the current directory, where `upgrade --version` fetches an installer.
 func k8sCommand(in *Installer, o *Options, prepare func() error, terminal func(bool) Prompter, sets, setFiles *[]string, answers *string, noInput, accessible *bool) *cobra.Command {
 	name, v := in.R.Spec.Name, in.R.Manifest.ProjectVersion
-	var to, givenFile string
+	var to string
+	var given givenFlags
 	// One per subcommand: a flag writes its default into its variable when it is defined.
 	var installTimeout, upTimeout, backTimeout time.Duration
 	// run prepares the options, then asks on the terminal when the subcommand asks and the operator
@@ -429,17 +442,11 @@ func k8sCommand(in *Installer, o *Options, prepare func() error, terminal func(b
 		}
 		return f(cmd.Context())
 	}
-	// deployWith is run for what takes --given: what it gives joins the inputs before f reads them.
+	// deployWith is run for what takes --given and --kit: what they give joins the inputs before f reads them.
 	deployWith := func(cmd *cobra.Command, timeout time.Duration, f func(context.Context) error) error {
 		return run(cmd, timeout, true, func(ctx context.Context) error {
-			if givenFile != "" {
-				raw, err := readStdinFlag("--given", givenFile, cmd.InOrStdin())
-				if err == nil {
-					err = in.takeK8sGiven(raw)
-				}
-				if err != nil {
-					return err
-				}
+			if err := given.take(ctx, in, cmd.InOrStdin(), in.O.Prompt, time.Now(), in.useK8sGiven); err != nil {
+				return err
 			}
 			return f(ctx)
 		})
@@ -461,7 +468,8 @@ func k8sCommand(in *Installer, o *Options, prepare func() error, terminal func(b
 		f.StringArrayVar(sets, "set", nil, what)
 		f.StringArrayVar(setFiles, "set-file", nil, whatFile)
 		f.StringVar(answers, "answers", "", "a YAML file of inputs, KEY: value")
-		f.StringVar(&givenFile, "given", "", "the file of what another install gives, or - for standard input: its inputs, which on an upgrade replace the recorded ones and restart what reads them")
+		given.defineGiven(f, "the file of what another install gives, or - for standard input: its inputs, which on an upgrade replace the recorded ones and restart what reads them")
+		given.defineKit(f, "a handoff kit, or - for standard input: its inputs, taken as --given's")
 		f.BoolVar(noInput, "no-input", false, "never ask: an input nothing gave takes its default")
 		f.BoolVar(accessible, "accessible", false, "ask with plain line prompts (screen readers); also when ACCESSIBLE is set or TERM=dumb")
 		f.BoolVar(&o.DryRun, "dry-run", false, "check, print what would be applied (secrets redacted), change nothing")
@@ -485,8 +493,9 @@ func k8sCommand(in *Installer, o *Options, prepare func() error, terminal func(b
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if to != "" {
 				return run(cmd, upTimeout, false, func(ctx context.Context) error {
-					if givenFile != "" {
-						return fmt.Errorf("--given with --version: `%s --version %s` first, then the installer of %s (`docker run --rm %s/%s-installer:<its tag> > %s.sh`) takes `k8s upgrade --given FILE` with the same target", in.k8sCtl("upgrade"), to, to, in.R.Spec.Registry.Prefix, in.R.Spec.Name, in.R.Spec.Name)
+					if given.any() {
+						flag := given.name()
+						return fmt.Errorf("%s with --version: `%s --version %s` first, then the installer of %s (`docker run --rm %s/%s-installer:<its tag> > %s.sh`) takes `k8s upgrade %s FILE` with the same target", flag, in.k8sCtl("upgrade"), to, to, in.R.Spec.Registry.Prefix, in.R.Spec.Name, in.R.Spec.Name, flag)
 					}
 					return in.K8sUpgradeTo(ctx, to, passed(cmd, "version"))
 				})
@@ -615,6 +624,11 @@ func readSecretsArg(path string, stdin io.Reader) ([]byte, error) {
 // readStdinFlag reads the file flag names, standard input for -, up to one byte past
 // maxSecretsFile, so its reader refuses it.
 func readStdinFlag(flag, path string, stdin io.Reader) ([]byte, error) {
+	return readFlagFile(flag, path, stdin, maxSecretsFile)
+}
+
+// readFlagFile reads the file flag names, standard input for -, up to one byte past limit.
+func readFlagFile(flag, path string, stdin io.Reader, limit int64) ([]byte, error) {
 	r := stdin
 	if path != "-" {
 		f, err := os.Open(expandHome(path))
@@ -624,7 +638,11 @@ func readStdinFlag(flag, path string, stdin io.Reader) ([]byte, error) {
 		defer f.Close()
 		r = f
 	}
-	return io.ReadAll(io.LimitReader(r, maxSecretsFile+1))
+	raw, err := io.ReadAll(io.LimitReader(r, limit+1))
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", flag, err)
+	}
+	return raw, nil
 }
 
 // execInput is what exec passes the command: this command's standard input on a terminal, which
@@ -858,6 +876,7 @@ func vmCreateCommand(in *Installer, o *Options, prepare func() error, terminal f
 	var c VMCreate
 	var secretsFile string
 	var tofuVars []string
+	var kitFlags givenFlags
 	vm := &cobra.Command{
 		Use:   "vm",
 		Short: fmt.Sprintf("Run %s on a VM of its own: its Kairos OS, from a disk image", name),
@@ -897,9 +916,17 @@ func vmCreateCommand(in *Installer, o *Options, prepare func() error, terminal f
 				return err
 			}
 			if secretsFile != "" {
+				if secretsFile == "-" && kitFlags.kit == "-" {
+					return errors.New("--secrets and --kit both name standard input, which is read once")
+				}
 				if c.Secrets, err = readSecretsArg(secretsFile, cmd.InOrStdin()); err != nil {
 					return err
 				}
+			}
+			if err := kitFlags.take(cmd.Context(), in, cmd.InOrStdin(), in.O.Prompt, time.Now(), func(g *Given, flag string) error {
+				return in.useGiven(g, flag, "kairos") // the shape the VM's install takes
+			}); err != nil {
+				return err
 			}
 			return in.CreateVM(cmd.Context(), &c)
 		},
@@ -951,6 +978,7 @@ func vmCreateCommand(in *Installer, o *Options, prepare func() error, terminal f
 	f.StringArrayVar(sets, "set", nil, "an input, KEY=VALUE (repeatable; never a secret input: --answers gives one)")
 	f.StringArrayVar(setFiles, "set-file", nil, "a file input's file, KEY=PATH (repeatable; never a secret input: --answers gives one)")
 	f.StringVar(answers, "answers", "", "a YAML file of inputs, KEY: value, and the front's tls section: secret inputs and TLS material are given over SSH once the VM answers, never in the cloud-config")
+	kitFlags.defineKit(f, "a handoff kit, or - for standard input: its inputs taken as --answers', its secret inputs and TLS material given over SSH once the VM answers, never in the cloud-config")
 	f.BoolVar(noInput, "no-input", false, "never ask: what nothing gave takes its default")
 	f.BoolVar(accessible, "accessible", false, "ask with plain line prompts (screen readers); also when ACCESSIBLE is set or TERM=dumb")
 	f.StringVar(&o.Registry, "registry", "", "a registry prefix to read the disk and the VM's updates from, a mirror")

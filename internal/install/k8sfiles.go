@@ -42,15 +42,12 @@ func (o *Options) givenInputs() map[string]string {
 	return o.Given.Inputs
 }
 
-// takeK8sGiven makes raw this run's given material on Kubernetes. Its inputs join the answers, a flag
+// useK8sGiven makes g, which flag gave, this run's given material on Kubernetes. Its inputs join the answers, a flag
 // and an answers file winning; an input of another shape is left out and said, one the project does
-// not declare refused. Its tls is left out and said: the chart's ingress owns TLS on this shape.
-func (in *Installer) takeK8sGiven(raw []byte) error {
+// not declare refused. Its tls is left out and said: the chart's ingress owns TLS on this shape. A g
+// left with nothing is refused.
+func (in *Installer) useK8sGiven(g *Given, flag string) error {
 	o := &in.O
-	g, err := parseGiven(raw, in.R.Spec.Name)
-	if err != nil {
-		return err
-	}
 	answers := map[string]string{}
 	var unknown, left []string
 	for _, key := range sortedKeys(g.Inputs) {
@@ -65,13 +62,17 @@ func (in *Installer) takeK8sGiven(raw []byte) error {
 		}
 	}
 	if len(unknown) > 0 {
-		return fmt.Errorf("--given: %s %s declares no input %s", in.R.Spec.Name, in.R.Manifest.ProjectVersion, strings.Join(unknown, ", "))
+		return fmt.Errorf("%s: %s %s declares no input %s", flag, in.R.Spec.Name, in.R.Manifest.ProjectVersion, strings.Join(unknown, ", "))
 	}
 	if len(left) > 0 {
-		o.logf("--given: %s left out: not an input on Kubernetes", strings.Join(left, ", "))
+		o.logf("%s: %s left out: not an input on Kubernetes", flag, strings.Join(left, ", "))
 	}
 	if g.TLS != nil {
-		o.logf("--given: tls left out: on Kubernetes the chart's ingress owns the certificate")
+		o.logf("%s: tls left out: on Kubernetes the chart's ingress owns the certificate", flag)
+		g.TLS = nil
+	}
+	if err := g.leftNothing(flag); err != nil {
+		return err
 	}
 	maps.Copy(answers, o.Answers)
 	o.Given, o.Answers = g, answers

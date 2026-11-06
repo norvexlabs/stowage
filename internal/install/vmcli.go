@@ -48,7 +48,8 @@ func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(
 	}
 	in := &Installer{R: r}
 	var ports, sets, setFiles, domains []string
-	var answers, secretsFile, givenFile string
+	var answers, secretsFile string
+	var given givenFlags
 	var noInput, accessible, asJSON bool
 	var group string
 	socket := Socket(name)
@@ -101,17 +102,17 @@ func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(
 			if err := prepare(); err != nil {
 				return err
 			}
-			if givenFile != "" {
-				if secretsFile != "" {
-					return errors.New("--secrets restores an install, --given gives a new one its secret inputs and TLS material: give one")
-				}
-				raw, err := readStdinFlag("--given", givenFile, cmd.InOrStdin())
-				if err == nil {
-					err = in.takeGiven(raw)
-				}
-				if err != nil {
-					return err
-				}
+			if given.any() && secretsFile != "" {
+				return fmt.Errorf("--secrets restores an install, %s gives a new one its secret inputs and TLS material: give one", given.name())
+			}
+			var prompt Prompter
+			if !noInput {
+				prompt = terminal(accessible)
+			}
+			if err := given.take(cmd.Context(), in, cmd.InOrStdin(), prompt, time.Now(), func(g *Given, flag string) error {
+				return in.useGiven(g, flag, in.shape())
+			}); err != nil {
+				return err
 			}
 			if ch := in.O.Channel; ch != "" && !lint.ChannelName(ch) {
 				return fmt.Errorf("--channel %q is not a channel name", ch)
@@ -131,9 +132,7 @@ func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(
 			if err := in.withSettings(); err != nil {
 				return err
 			}
-			if !noInput {
-				in.O.Prompt = terminal(accessible)
-			}
+			in.O.Prompt = prompt
 			in.O.Cert, in.O.Key, in.O.CA, in.O.ClientCA = expandHome(in.O.Cert), expandHome(in.O.Key), expandHome(in.O.CA), expandHome(in.O.ClientCA)
 			if err := in.Install(cmd.Context()); err != nil {
 				return err
@@ -169,7 +168,8 @@ func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(
 	f.BoolVar(&noInput, "no-input", false, "never ask: an input nothing gave takes its default")
 	f.BoolVar(&o.NoProvision, "no-provision", false, "start the stack without running the provision hook (`provision` runs it later)")
 	f.StringVar(&secretsFile, "secrets", "", "a first install's secrets: the file `secrets export` wrote, decrypted (- for standard input)")
-	f.StringVar(&givenFile, "given", "", "secret inputs and TLS material, as `vm create` gives them over SSH or leaves them in a .given file (- for standard input); on an installed VM, changes the recorded ones")
+	given.defineGiven(f, "secret inputs and TLS material, as `vm create` gives them over SSH or leaves them in a .given file (- for standard input); on an installed VM, changes the recorded ones")
+	given.defineKit(f, "a handoff kit, or - for standard input: what it holds, taken as --given's")
 	f.BoolVar(&o.NewSecrets, "new-secrets", false, "go on though `vm create` made the install wait: generate the secrets `vm create --secrets` would give, or take from the flags what its secret inputs and TLS material were")
 	f.BoolVar(&accessible, "accessible", false, "ask with plain line prompts (screen readers); also when ACCESSIBLE is set or TERM=dumb")
 	dirFlag(install)
@@ -453,6 +453,7 @@ func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(
 			return c.follow(ctx, stderr, started)
 		},
 	}
+	refusesKit(upgrade, fmt.Sprintf("a re-run, `sudo %s install --kit FILE`, gives it to the install", r.Ctl()))
 	uf := upgrade.Flags()
 	uf.StringVar(&channel, "channel", "", "the channel to upgrade on (default: the install's; before the first install, its settings')")
 	uf.StringVar(&version, "version", "", "this version's latest revision, not the channel's latest release")

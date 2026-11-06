@@ -79,3 +79,53 @@ func TestScriptFallsBackWhenTheDirectoryIsReadOnly(t *testing.T) {
 		t.Fatalf("left behind: %v", left)
 	}
 }
+
+// Run from its file, standard input stays the operator's, whatever the arguments; arriving on standard
+// input, the installer gets the terminal. Proven on a terminal, which `script` gives a test.
+func TestStandardInputIsTheOperatorsUnlessItIsTheScript(t *testing.T) {
+	t.Parallel()
+	pty, err := exec.LookPath("script")
+	if err != nil {
+		t.Skip("no script(1) to give a terminal")
+	}
+	dir := t.TempDir()
+	run := func(cmd string) (string, error) {
+		c := exec.Command(pty, "-qec", cmd, "/dev/null")
+		c.Dir = dir
+		out, err := c.CombinedOutput()
+		return strings.TrimSpace(string(out)), err
+	}
+	if got, err := run("[ -t 0 ] && echo terminal"); err != nil || got != "terminal" {
+		t.Skipf("script(1) gives no terminal here: %v %q", err, got)
+	}
+	bin := "#!/bin/sh\nif [ -t 0 ]; then echo terminal; else cat; fi\n"
+	var s bytes.Buffer
+	if err := Script(&s, "notes", "notes-stow", strings.NewReader(bin)); err != nil {
+		t.Fatal(err)
+	}
+	file, in := filepath.Join(dir, "s.sh"), filepath.Join(dir, "in")
+	if err := os.WriteFile(file, s.Bytes(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(in, []byte("the-pipe\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for cmd, want := range map[string]string{
+		"sh " + file + " --kit - < " + in:            "the-pipe",
+		"sh " + file + " secrets set KEY < " + in:    "the-pipe",
+		"cat " + in + " | sh " + file + " --given -": "the-pipe",
+		"sh " + file + " --no-input":                 "terminal",
+		"cat " + file + " | sh -s":                   "terminal",
+		"cat " + file + " | sh -s -- --kit -":        "terminal",
+		"sh -s -- --no-input < " + file:              "terminal",
+	} {
+		got, err := run(cmd)
+		if err != nil {
+			t.Errorf("%s: %v %q", cmd, err, got)
+			continue
+		}
+		if got != want {
+			t.Errorf("%s: %q, want %q", cmd, got, want)
+		}
+	}
+}

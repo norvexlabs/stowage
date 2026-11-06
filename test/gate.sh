@@ -101,7 +101,7 @@ for f in "${changed[@]}"; do
 		lifecycle "$f"
 		need e2e-full-vm "$f"
 		;;
-	internal/install/* | internal/payload/* | cmd/stowage-install/*)
+	internal/install/* | internal/kit/* | internal/payload/* | cmd/stowage-install/*)
 		need smoke-install "$f"
 		lifecycle "$f"
 		;;

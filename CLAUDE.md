@@ -109,7 +109,7 @@ a self-review against the code it describes is enough. Every other commit clears
    `make e2e` (real builds against zot) and it must print PASS. A change to the signature
    verifier (`internal/sigverify`), which the publisher and every install use, runs every suite
    below, e2e-vm included (not e2e-full-vm: its VM machinery is e2e-vm's). A change to the installer
-   (`internal/install`, `internal/payload`, `cmd/stowage-install`) runs `make smoke-install`. A
+   (`internal/install`, `internal/kit`, `internal/payload`, `cmd/stowage-install`) runs `make smoke-install`. A
    change to either, to `internal/installerbin`, `internal/version` or `examples/minimal` runs
    `make e2e-docker` too (the lifecycle with the real binaries), and all but `examples/minimal`
    run `make e2e-full` (`examples/full`'s lifecycle on Docker), as does a change to

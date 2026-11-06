@@ -23,9 +23,18 @@ follow [SemVer](https://semver.org/).
 - `k8s install` and `k8s upgrade` take `--given`. On an upgrade, the inputs it gives replace the
   recorded values and restart the workloads reading them; a `tls` section is left out and said, as
   the chart's ingress owns TLS on Kubernetes.
+- Handoff kits: `--kit FILE` on the Docker and VM installs, `vm create`, `k8s install` and `k8s upgrade`
+  takes inputs and TLS material sealed with a code, which comes from `--kit-code-file`,
+  `STOWAGE_KIT_CODE` or the terminal. A kit is refused with the wrong code, when changed, for another
+  project or once expired; an input meant for another shape is left out and said.
+- The Docker install takes `--given` too. On Docker and the VM, an input given for another shape is
+  left out and said, instead of refused.
 
 ### Fixed
 
+- The bootstrap script run from its file leaves standard input to the installer, so `sh <name>.sh
+  secrets set KEY < FILE` and `exec -i` read it; only a script arriving on standard input itself
+  hands the installer the terminal.
 - A dry run on Kubernetes shows a file input by its digest, and a Kubernetes upgrade or install over
   a kept Secret refuses a recorded value the release cannot read.
 - `vm create` with OpenTofu on a disk of another release now waits for that release's OS before it
