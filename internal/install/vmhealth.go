@@ -181,8 +181,7 @@ func (g *Gate) Run(ctx context.Context) error {
 	in := g.In
 	o, m := &in.O, in.R.Manifest
 	if !fileExists(in.path(envName)) {
-		o.logf("%s holds no install yet: there is nothing to judge", o.Dir)
-		return nil
+		return g.noInstall(ctx)
 	}
 	// The compose files of health commands a reboot or a kill interrupted: older than any call
 	// the daemon may be running.
@@ -193,12 +192,10 @@ func (g *Gate) Run(ctx context.Context) error {
 			}
 		}
 	}
-	a := assessment{cmp.Or(g.State, cosState), g.Host}
-	vars, err := a.read()
+	a, onTrial, err := g.trial()
 	if err != nil {
 		return err
 	}
-	onTrial := bootMode(g.In.O.cos()) == "active" && trial(vars)
 	cfg := in.R.Spec.Shapes.Kairos.Gate()
 	unit := cmp.Or(g.Unit, time.Second)
 	limit := time.Duration(cfg.DeadlineS) * unit
@@ -237,7 +234,11 @@ func (g *Gate) Run(ctx context.Context) error {
 	// the database moved past what it reads, and then nothing serves. The new system is kept.
 	var kept string
 	if onTrial {
-		kept = g.refusedRollback(ctx)
+		if in.switchedHere() && !fileExists(filepath.Join(in.path(PrevDir), prevState)) {
+			kept = "the passive system is the OS this install's first boot switched from, and no previous release is kept: it holds no release to go back to"
+		} else {
+			kept = g.refusedRollback(ctx)
+		}
 	}
 	dir, err := g.keep(ctx, why, kept)
 	if err != nil {
@@ -270,6 +271,66 @@ func (g *Gate) Run(ctx context.Context) error {
 		return fmt.Errorf("%w; the reboot failed: %v", failed, err)
 	}
 	return failed
+}
+
+// trial reads the boot assessment: whether GRUB booted the active system on trial.
+func (g *Gate) trial() (assessment, bool, error) {
+	a := assessment{cmp.Or(g.State, cosState), g.Host}
+	vars, err := a.read()
+	if err != nil {
+		return a, false, fmt.Errorf("the boot assessment: %w", err)
+	}
+	return a, bootMode(g.In.O.cos()) == "active" && trial(vars), nil
+}
+
+// noInstall is the gate of a boot with no install yet: there is nothing to judge. The OS a first
+// boot switched to (switchOS) runs on trial, and its first install may wait for what `vm create`
+// gives over SSH, after this gate, or have failed: its marks are cleared, whatever its boot unit
+// did. The passive system, the OS it switched from, holds no install, and its boot stops at the
+// same mark; left set, the next boot would fall back to it, whose installer refuses the newer
+// install made meanwhile. Here, a retried `install` runs this OS's release.
+func (g *Gate) noInstall(ctx context.Context) error {
+	in := g.In
+	o := &in.O
+	onTrial := false
+	var a assessment
+	if in.switchedHere() {
+		var err error
+		if a, onTrial, err = g.trial(); err != nil {
+			return err
+		}
+	}
+	if !onTrial {
+		o.logf("%s holds no install yet: there is nothing to judge", o.Dir)
+		return nil
+	}
+	if err := a.set(ctx, assessEnable+"=", assessTentative+"="); err != nil {
+		return fmt.Errorf("%s holds no install yet, but marking the OS its first boot switched to good failed (the next boot would fall back to the older OS): %w", o.Dir, err)
+	}
+	o.logf("%s holds no install yet: the OS its first boot switched to is marked good, as the passive system holds no install to go back to", o.Dir)
+	return nil
+}
+
+// switchedHere reports whether this OS is the one a first boot switched to: the settings file
+// names this OS's release (by version and revision, as firstBoot compares them: an OS bundle's
+// installer carries no tag), and switchOS's mark names that release's tag. The mark stays after
+// the install, and the health gate reads it: removed, an unhealthy first install on trial falls
+// back as any other.
+func (in *Installer) switchedHere() bool {
+	raw, err := os.ReadFile(osSwitchFile(in.O.Dir))
+	if err != nil {
+		return false
+	}
+	st, err := ReadSettings(cmp.Or(in.O.Settings, SettingsFile(in.R.Spec.Name)))
+	if err != nil {
+		in.O.logf("warning: %v: the OS a first boot switched to is not recognised", err)
+		return false
+	}
+	if st == nil || st.Release == nil {
+		return false
+	}
+	t, m := st.Release, in.R.Manifest
+	return t.Tag != "" && strings.TrimSpace(string(raw)) == t.Tag && t.Version == m.ProjectVersion && t.Revision == m.Revision
 }
 
 // refusedRollback runs the rollback the passive system's boot would run, dry: why the database

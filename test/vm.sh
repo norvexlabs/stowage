@@ -84,6 +84,13 @@ vm_cleanup() {
 
 # VM_IP, once set, is the address ssh reaches the VM at, its host key still known by its name.
 on_vm() { ssh -o BatchMode=yes -o ConnectTimeout=10 -o UserKnownHostsFile="$STATE/known_hosts" -o HostKeyAlias="$ADDR" -i "$KEY" -o IdentitiesOnly=yes "ops@${VM_IP:-$ADDR}" -- "$@"; }
+# not_on_vm <text> <path>: a search of that path on the VM ran and did not find that text (no single
+# quote in it). A search that could not run fails, as it found nothing out.
+not_on_vm() {
+	local rc=0
+	on_vm sudo grep -rqF -- "'$1'" "$2" || rc=$?
+	[[ $rc == 1 ]] || fail "the search of $2 on the VM exited $rc (0: what vm create gives over SSH is there)"
+}
 # boot_id: the VM's current boot; a reboot changes it.
 boot_id() { on_vm cat /proc/sys/kernel/random/boot_id; }
 # assessment: the boot assessment's environment on the VM.

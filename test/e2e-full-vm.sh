@@ -4,7 +4,8 @@
 # .2 crosses to a TLS mirror of its own CA; `vm create --platform metal` of .2 on a bare-metal
 # machine that a TrueNAS VM plays (test/metal-truenas: an empty disk, the installer and the seed as
 # two USB sticks, left in) installs .1's OS on the disk, powers off and is started again; the
-# installed system's first boot writes .2's OS bundle and reboots into it, which installs it from the cloud-config's settings with the search
+# installed system's first boot writes .2's OS bundle and reboots into it, which waits for a secret input (`--answers`) over the
+# pinned SSH, in no seed, and installs it from the cloud-config's settings with the search
 # extension's input set (to the api itself, standing in for a search service); the provision hook registers the administrator through the api; the api reaches the host
 # daemon's app socket and reads the front's local CA (`exec` through the host daemon, its exit status carried); an event goes through ingest; the ops route
 # refuses everyone until a re-run gives `--client-ca`, then takes a certificate that CA issued
@@ -82,7 +83,9 @@ CLEANUP=("touch $WORK/metal-up" "${CLEANUP[@]}")
 # The server's two NICs (host.interfaces' uplink and edge), both on the bridge, by MACs of this run.
 MAC_UPLINK=$(printf '02:5e:%02x:%02x:00:01' $(($$ >> 8 & 255)) $(($$ & 255)))
 MAC_EDGE=$(printf '02:5e:%02x:%02x:00:02' $(($$ >> 8 & 255)) $(($$ & 255)))
-"$CTL" vm create --no-input --platform metal --device /dev/vda --create opentofu --module "$(dirname "$0")/metal-truenas" --vm-name "${H//-/}" \
+SEARCH_KEY_GIVEN=$(token)
+(umask 077; printf 'SEARCH_KEY: %s\n' "$SEARCH_KEY_GIVEN" >"$WORK/vm-answers.yaml")
+"$CTL" vm create --no-input --platform metal --device /dev/vda --answers "$WORK/vm-answers.yaml" --create opentofu --module "$(dirname "$0")/metal-truenas" --vm-name "${H//-/}" \
 	--interface uplink=mac="$MAC_UPLINK" --interface edge=dhcp,mac="$MAC_EDGE" --hostname "$H" --user ops --ssh-key "$KEY.pub" \
 	--tls internal --domains console=console.atlas.test,api=api.atlas.test,ingest=ingest.atlas.test,ops=ops.atlas.test \
 	--set ADMIN_EMAIL=admin@atlas.test --set ORG_NAME=Atlas --set SUPPORT_EMAIL=support@atlas.test --set SEARCH_URL=http://api:9090 \
@@ -94,6 +97,11 @@ touch "$WORK/metal-up"
 grep -q "fetching atlas's iso disk of v$V1" "$WORK/vm-create.log" || { tail -30 "$WORK/vm-create.log"; fail "vm create did not take $V1's installer"; }
 grep -q "^The VM $H runs atlas $V2" "$WORK/vm-create.txt" || { cat "$WORK/vm-create.txt"; fail "vm create did not report the install"; }
 ! grep -rqF -- "$TRUENAS_API_KEY" "$STATE" || fail "the API key is in the VM's state"
+grep -q 'installing over SSH with ' "$WORK/vm-create.log" || { tail -30 "$WORK/vm-create.log"; fail "the secret input did not go over SSH"; }
+[[ ! -e $STATE/given.yaml ]] || fail "what the install took is left on this machine"
+! grep -rqaF -- "$SEARCH_KEY_GIVEN" "$STATE" "$WORK/vm-create.log" "$WORK/vm-create.txt" || fail "the secret input is in the VM's state or the log"
+on_vm sudo grep -rqF admin@atlas.test /oem || fail "/oem does not read in the clear: the search below would see nothing"
+not_on_vm "$SEARCH_KEY_GIVEN" /oem
 IP=$(getent hosts "$ADDR" | awk '{print $1; exit}')
 [[ -n $IP ]] || fail "$ADDR does not resolve"
 
@@ -107,6 +115,7 @@ atlas_on "$V2" 2
 on_vm sudo cat /usr/local/atlas/.env >"$WORK/vm.env"
 grep -qx "STOWAGE_REGISTRY='$SITE'" "$WORK/vm.env" || fail "the install does not record the mirror"
 grep -qx "SEARCH_URL='\{0,1\}http://api:9090'\{0,1\}" "$WORK/vm.env" || fail "the install does not record SEARCH_URL"
+grep -qx "SEARCH_KEY='\{0,1\}$SEARCH_KEY_GIVEN'\{0,1\}" "$WORK/vm.env" || fail "the install does not record the secret input given over SSH"
 on_vm sudo grep -qE "'^ADMIN_PASSWORD=[A-Za-z0-9]{20}$'" /usr/local/atlas/credentials.txt || fail "the hook's outputs file holds no credentials"
 [[ $(on_vm sudo stat -c %a /usr/local/atlas/credentials.txt) == 600 ]] || fail "the credentials file is not 0600"
 
@@ -234,6 +243,15 @@ vpn_id=$(on_vm sudo docker ps -q --filter label=com.docker.compose.service=vpn)
 	fail "the vpn service (host_network) is not on the host's network"
 
 step "on the VM: a reboot loads the services' tables before Docker brings their containers back"
+# The first boot switched to $V2's OS on trial, the install made over SSH after the health gate:
+# the gate marked it good, or this reboot would fall back to $V1's OS, which refuses the install.
+marks=$(on_vm sudo cat /run/initramfs/cos-state/boot_assessment 2>&1) || fail "the boot assessment does not read: $marks"
+if grep -q '^boot_assessment_tentative=yes' <<<"$marks"; then
+	echo "$marks"
+	on_vm sudo cat /usr/local/atlas.os-switch 2>&1 || true
+	on_vm sudo journalctl -u atlas-health.service --no-pager 2>&1 | tail -60
+	fail "the boot is still on trial before the reboot: the next boot would fall back to $V1's OS"
+fi
 boot=$(boot_id)
 on_vm sudo systemctl reboot >/dev/null 2>&1 || true
 deadline=$((SECONDS + 900))

@@ -13,7 +13,9 @@
 # Walks examples/minimal through: ship 1.0.0 → the bootstrap script's `k8s install` (pods ready,
 # the Secret's values in the pod's environment, the provision hook's Job run and what it returned
 # kept in its Secret, not in the log) → `k8s upgrade --values` (2 replicas) → `k8s upgrade` alone
-# keeps them, and hands the hook what it returned → ship 2.0.0 (a new web image) → `k8s upgrade --version 2.0.0` → the
+# keeps them, and hands the hook what it returned → `k8s kit create`, `k8s upgrade --kit`, `k8s kit
+# check` → a Docker install beside it: a kit Docker issued taken by `k8s upgrade --kit`, one Kubernetes
+# issued taken by the Docker install's `--kit` → ship 2.0.0 (a new web image) → `k8s upgrade --version 2.0.0` → the
 # same again is a note → 1.0.0's `k8s upgrade` is refused → an upgrade that never becomes ready is
 # rolled back by helm → `k8s rollback` goes back one upgrade, to 1.0.0 → `k8s status` → `k8s
 # reset-db` deletes the release's claim, forgets what the hook returned and installs it again with
@@ -21,14 +23,15 @@
 # chart's own claim), then `--data` removes the release, its Secrets, the hook's account and the
 # claim, and keeps the namespace → the previous Stowage (the latest release tag, built once from it)
 # ships 3.0.0 at schema baseline 1 and installs it; this one ships 4.0.0 at baseline 2, whose
-# `k8s upgrade` is refused naming the previous release's baseline, and `k8s reset-db
-# --new-baseline` crosses.
+# `k8s upgrade` is refused naming the previous release's baseline, `k8s reset-db --new-baseline`
+# crosses, and that release issues and takes a kit, which its own spec holds.
 set -euo pipefail
 
 # The amd64 image of the example's postgres: mirroring copies every platform of an index.
 PG=postgres:18-alpine@sha256:10a5c69a83035ab5239f5620d708520e8b28f5aa1f2b20143e6024532edadfb5
 . "$(dirname "$0")/lib.sh"
 
+DOCKER_OPERATOR=("${OPERATOR[@]}")
 k8s_tools
 NS=notes
 
@@ -121,6 +124,28 @@ printf 'project: notes\ninputs: {ADMIN_EMAIL: admin@notes.test}\n' >"$OP/back.ya
 ctl v1.sh k8s upgrade --given back.yaml --no-input --timeout 3m >"$WORK/kit-back.log" 2>&1 || { cat "$WORK/kit-back.log"; fail "k8s upgrade --given back"; }
 [[ $(kubectl get -n "$NS" secret notes-stowage -o jsonpath='{.data}') == "$secret" ]] || fail "the Secret is not back as it was"
 
+step "between shapes: a kit Docker issued taken by k8s upgrade --kit, one Kubernetes issued taken by a Docker install's --kit"
+docker_beside v1.sh
+running 1.0.0 1
+"${DOCKER_CTL[@]}" kit create second-site --dir "$D" --name site-k8s --set SITE_ADMIN=from-docker@notes.test -o "$OP/docker.kit" >"$WORK/kit-docker.log" 2>&1 || { cat "$WORK/kit-docker.log"; stack_logs >&2; fail "kit create on Docker"; }
+kit_code "$WORK/kit-docker.log" "$OP/docker.code"
+ctl v1.sh k8s upgrade --kit docker.kit --kit-code-file docker.code --no-input --timeout 3m >"$WORK/kit-docker-up.log" 2>&1 || { cat "$WORK/kit-docker-up.log"; cluster_logs >&2; fail "k8s upgrade --kit of Docker's kit"; }
+[[ $(kubectl get -n "$NS" secret notes-stowage -o jsonpath='{.data.ADMIN_EMAIL}' | base64 -d) == from-docker@notes.test ]] || fail "Docker's kit did not replace the recorded input"
+grep -qF 'kubectl: restarting deployment/notes-web' "$WORK/kit-docker-up.log" || { cat "$WORK/kit-docker-up.log"; fail "what reads Docker's kit's value was not restarted"; }
+# Of the pods not being deleted: an old one may still be ending.
+for p in $(kubectl get pods -n "$NS" -l app.kubernetes.io/name=web -o go-template='{{range .items}}{{if not .metadata.deletionTimestamp}}{{.metadata.name}} {{end}}{{end}}'); do
+	[[ $(kubectl exec -n "$NS" "$p" -- printenv ADMIN_EMAIL) == from-docker@notes.test ]] || fail "the pod $p does not read Docker's kit's value"
+done
+ctl v1.sh k8s kit create second-site --name site-docker --set SITE_ADMIN=from-k8s@notes.test -o k8s.kit >"$WORK/kit-k8s.log" 2>&1 || { cat "$WORK/kit-k8s.log"; cluster_logs >&2; fail "k8s kit create for Docker"; }
+kit_code "$WORK/kit-k8s.log" "$OP/k8s.code"
+"${DOCKER_CTL[@]}" --dir "$D" --no-input --kit "$OP/k8s.kit" --kit-code-file "$OP/k8s.code" >"$WORK/kit-k8s-take.log" 2>&1 || { cat "$WORK/kit-k8s-take.log"; stack_logs >&2; fail "--kit of Kubernetes's kit on Docker"; }
+grep -q "^ADMIN_EMAIL='from-k8s@notes.test'\$" "$D/.env" || fail "Kubernetes's kit did not replace the recorded input"
+grep -qF 'changing ADMIN_EMAIL: admin@notes.test → from-k8s@notes.test' "$WORK/kit-k8s-take.log" || { cat "$WORK/kit-k8s-take.log"; fail "the change was not logged"; }
+running 1.0.0 1
+ctl v1.sh k8s upgrade --given back.yaml --no-input --timeout 3m >"$WORK/kit-back.log" 2>&1 || { cat "$WORK/kit-back.log"; fail "k8s upgrade --given back"; }
+[[ $(kubectl get -n "$NS" secret notes-stowage -o jsonpath='{.data}') == "$secret" ]] || fail "the Secret is not back as it was"
+"${DOCKER_CTL[@]}" uninstall --dir "$D" --data --yes >"$WORK/docker-site-gone.log" 2>&1 || { cat "$WORK/docker-site-gone.log"; fail "uninstall of the Docker install beside"; }
+
 step "ship 2.0.0, k8s upgrade --version 2.0.0"
 release 2.0.0
 [[ $(digest_of notes/notes-web:2.0.0) != "$(digest_of notes/notes-web:1.0.0)" ]] || fail "2.0.0 has 1.0.0's web image"
@@ -204,15 +229,9 @@ step "across Stowage versions: the previous Stowage's release, at baseline 1, cr
 prev=$(prev_stowage)
 S_NOW=("${S[@]}")
 S=("$prev" "${S[@]:1}")
-# That Stowage reads its spec strictly, and one before 0.30.0 refuses handoffs.
-cp "$P/stowage.yaml" "$WORK/stowage-now.yaml"
-python3 - "$P/stowage.yaml" <<'PY2'
-import re, sys
-path = sys.argv[1]
-s, k = re.subn(r"^handoffs:.*\n(?:[ #].*\n|\n)*", "", open(path).read(), count=1, flags=re.M)
-assert k == 1, "handoffs"
-open(path, "w").write(s)
-PY2
+# That Stowage reads its spec strictly: it ships the example as its own tag has it, which holds no
+# key newer than it.
+example_at "$(basename "$(dirname "$prev")")"
 "${S[@]}" lock --update >/dev/null # a project publishes with the stowage its lock pins
 baseline 1
 release 3.0.0
@@ -221,7 +240,7 @@ ctl v3.sh k8s install --no-input --set ADMIN_EMAIL=admin@notes.test --timeout 3m
 	{ cat "$WORK/install3.log"; cluster_logs >&2; fail "k8s install of the previous Stowage's 3.0.0"; }
 runs 3.0.0 1
 S=("${S_NOW[@]}")
-cp "$WORK/stowage-now.yaml" "$P/stowage.yaml"
+example_at
 "${S[@]}" lock --update >/dev/null
 baseline 2
 release 4.0.0
@@ -231,6 +250,10 @@ grep -q 'notes 4.0.0 starts schema baseline 2, and release notes in notes runs n
 	{ cat "$WORK/up4.log"; fail "the upgrade's refusal does not tell the previous Stowage's baseline"; }
 ctl v4.sh k8s reset-db --new-baseline --yes --timeout 3m >"$WORK/cross.log" 2>&1 || { cat "$WORK/cross.log"; cluster_logs >&2; fail "k8s reset-db --new-baseline"; }
 runs 4.0.0 1
+ctl v4.sh k8s kit create second-site --name site-after --set SITE_ADMIN=after@notes.test -o after.kit >"$WORK/kit-after.log" 2>&1 || { cat "$WORK/kit-after.log"; cluster_logs >&2; fail "k8s kit create after the crossing"; }
+kit_code "$WORK/kit-after.log" "$OP/after.code"
+ctl v4.sh k8s upgrade --kit after.kit --kit-code-file after.code --no-input --timeout 3m >"$WORK/kit-after-up.log" 2>&1 || { cat "$WORK/kit-after-up.log"; cluster_logs >&2; fail "k8s upgrade --kit after the crossing"; }
+[[ $(kubectl get -n "$NS" secret notes-stowage -o jsonpath='{.data.ADMIN_EMAIL}' | base64 -d) == after@notes.test ]] || fail "the kit did not replace the recorded input after the crossing"
 ctl v4.sh k8s uninstall --data --yes --timeout 3m >"$WORK/uninstall4.log" 2>&1 || { cat "$WORK/uninstall4.log"; fail "k8s uninstall --data after the crossing"; }
 
 printf '\nPASS\n'

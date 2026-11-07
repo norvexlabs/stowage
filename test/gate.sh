@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # The commit gate (CLAUDE.md, gate 1), with the end-to-end suites chosen from what changed: a suite
-# runs only when a changed path can affect it, so the long ones (e2e-kairos ~25 min, e2e-vm ~85 min)
+# runs only when a changed path can affect it, so the long ones (e2e-kairos ~25 min, e2e-vm ~105 min)
 # run only for the code they exercise (e2e-full-vm only for its own scripts and examples/full's kairos
 # shape: the VM machinery is e2e-vm's).
 #

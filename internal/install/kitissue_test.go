@@ -1151,6 +1151,23 @@ func TestKitCheckUsageIsNoAnswer(t *testing.T) {
 	if left, err := two.installer(nil).k8sKitLeftovers(context.Background()); err != nil || len(left) != 2 {
 		t.Errorf("%v %v", left, err)
 	}
+	for fails, read := range map[string]string{"notes-stowage-kit-second": "notes-stowage-kit-client", "notes-stowage-kit-client": "notes-stowage-kit-second"} {
+		two.f.kitReadFails = fails
+		two.out.Reset()
+		two.log.Reset()
+		if err := two.installer(nil).K8sStatus(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(two.out.String(), "leftover  the Secret "+read+" holds") || strings.Contains(two.out.String(), "the Secret "+fails) || !strings.Contains(two.log.String(), "leftovers could not be read") {
+			t.Errorf("%s fails: %s\n%s", fails, two.out, two.log)
+		}
+	}
+	// A check's exit status is no leftover, as the next run clears it.
+	two.f.kitReadFails = ""
+	two.f.outputs = outputsJSON(map[string]string{kitExitKey: "0"})
+	if left, err := two.installer(nil).k8sKitLeftovers(context.Background()); err != nil || len(left) != 0 {
+		t.Errorf("an exit status: %v %v", left, err)
+	}
 	e := k8sIssuing(t)
 	e.f.created = map[string]any{}
 	e.f.kitReadErrs = 1

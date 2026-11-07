@@ -165,6 +165,122 @@ func TestTheGateMarksAHealthyBootOnTrialGood(t *testing.T) {
 	}
 }
 
+// A first boot that took a newer release's OS runs it on trial, its install waiting for what
+// `vm create` gives over SSH: the gate clears the marks, or the next boot falls back to the older OS.
+func TestAGateWithNoInstallClearsATrialOnly(t *testing.T) {
+	t.Parallel()
+	always := map[string]string{assessAlways: "yes", assessTentative: "yes"}
+	this := "release:\n  version: 1.0.0\n  revision: 1\n  tag: 1.0.0-1\n  os: sha256:0\n"
+	for name, c := range map[string]struct {
+		mode, mark, settings, boot string
+		vars                       map[string]string
+		editErr                    error
+		cleared                    bool
+		want                       string // in the error, or else in the log
+	}{
+		"switched, on trial":              {mode: "active", mark: "1.0.0-1", settings: this, vars: onTrial, cleared: true, want: "is marked good"},
+		"switched, always on trial":       {mode: "active", mark: "1.0.0-1", settings: this, vars: always, cleared: true, want: "is marked good"},
+		"not switched, on trial":          {mode: "active", settings: this, vars: onTrial, want: "nothing to judge"},
+		"switched to another, on trial":   {mode: "active", mark: "3.0.0-1", settings: this, vars: onTrial, want: "nothing to judge"},
+		"settings of another release":     {mode: "active", mark: "0.9.0-1", settings: "release:\n  version: 0.9.0\n  revision: 1\n  tag: 0.9.0-1\n  os: sha256:0\n", vars: onTrial, want: "nothing to judge"},
+		"settings of another revision":    {mode: "active", mark: "1.0.0-2", settings: "release:\n  version: 1.0.0\n  revision: 2\n  tag: 1.0.0-2\n  os: sha256:0\n", vars: onTrial, want: "nothing to judge"},
+		"settings naming no tag":          {mode: "active", mark: " ", settings: "release:\n  version: 1.0.0\n  revision: 1\n  os: sha256:0\n", vars: onTrial, want: "nothing to judge"},
+		"settings unreadable":             {mode: "active", mark: "1.0.0-1", settings: "release: [\n", vars: onTrial, want: "is not recognised"},
+		"no settings":                     {mode: "active", mark: "1.0.0-1", vars: onTrial, want: "nothing to judge"},
+		"switched, not on trial":          {mode: "active", mark: "1.0.0-1", settings: this, vars: map[string]string{assessEnable: "yes"}, want: "nothing to judge"},
+		"switched, passive":               {mode: "passive", mark: "1.0.0-1", settings: this, vars: onTrial, want: "nothing to judge"},
+		"switched, on trial, boot failed": {mode: "active", mark: "1.0.0-1", settings: this, vars: onTrial, boot: "failed", cleared: true, want: "is marked good"},
+		"switched, on trial, edit fails":  {mode: "active", mark: "1.0.0-1", settings: this, vars: onTrial, editErr: errors.New("read-only"), want: "switched to good failed"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			e := vmEnv(t, "1.0.0")
+			e.r.Manifest.Tag = "" // an OS bundle's installer carries no tag
+			if c.mark != "" {
+				if err := os.WriteFile(osSwitchFile(e.dir), []byte(c.mark+"\n"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			path := filepath.Join(t.TempDir(), "install.yaml")
+			if c.settings != "" {
+				if err := os.WriteFile(path, []byte(c.settings), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			cos, state := t.TempDir(), t.TempDir()
+			if err := os.WriteFile(filepath.Join(cos, c.mode+"_mode"), nil, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			var kv []string
+			for k, v := range c.vars {
+				kv = append(kv, k+"="+v)
+			}
+			if err := editEnv(filepath.Join(state, assessFile), kv); err != nil {
+				t.Fatal(err)
+			}
+			host := &fakeHost{boot: c.boot, editErr: c.editErr}
+			g := &Gate{In: e.installer(func(o *Options) { vm(o); o.Cos = cos; o.Settings = path }), Host: host, State: state, Unit: time.Microsecond}
+			err := g.Run(context.Background())
+			failing := c.editErr != nil
+			switch {
+			case failing && (err == nil || !strings.Contains(err.Error(), c.want)):
+				t.Errorf("err %v, want %q", err, c.want)
+			case !failing && err != nil:
+				t.Fatal(err)
+			case !failing && !strings.Contains(e.log.String(), c.want):
+				t.Errorf("log %s, want %q", e.log, c.want)
+			}
+			v, rerr := assessment{dir: state}.read()
+			if rerr != nil {
+				t.Fatal(rerr)
+			}
+			if cleared := v[assessEnable] == "" && v[assessTentative] == ""; cleared != c.cleared {
+				t.Errorf("cleared %v, want %v: %v", cleared, c.cleared, v)
+			}
+			if strings.Contains(fmt.Sprint(host.calls()), "reboot") {
+				t.Error("rebooted")
+			}
+		})
+	}
+}
+
+// The first install of the OS a first boot switched to, unhealthy on trial: the passive system,
+// the OS it switched from, holds no install, so the gate keeps this one.
+func TestAGateKeepsTheOSAFirstBootSwitchedTo(t *testing.T) {
+	t.Parallel()
+	for name, upgraded := range map[string]bool{"before an upgrade": false, "after an upgrade": true} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			g := newGate(t, "active", onTrial, true)
+			g.probe.status = 503
+			g.gate.In.R.Manifest.Tag = "" // an OS bundle's installer carries no tag
+			if err := os.WriteFile(osSwitchFile(g.dir), []byte("1.0.0-1\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			g.gate.In.O.Settings = filepath.Join(t.TempDir(), "install.yaml")
+			if err := os.WriteFile(g.gate.In.O.Settings, []byte("release:\n  version: 1.0.0\n  revision: 1\n  tag: 1.0.0-1\n  os: sha256:0\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if upgraded { // a previous release kept: the passive system holds it
+				if err := os.MkdirAll(filepath.Join(g.dir, PrevDir), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(g.dir, PrevDir, prevState), []byte("{}"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			err := g.gate.Run(context.Background())
+			kept := err != nil && strings.Contains(err.Error(), "holds no release to go back to")
+			if kept == upgraded || g.rebooted() != upgraded {
+				t.Fatalf("kept %v, rebooted %v, want kept %v: %v", kept, g.rebooted(), !upgraded, err)
+			}
+			if v := g.vars(); (v[assessTentative] == "") == upgraded {
+				t.Errorf("the marks: %v", v)
+			}
+		})
+	}
+}
+
 func TestAnUnhealthyBootOnTrialKeepsDiagnosticsAndFallsBack(t *testing.T) {
 	t.Parallel()
 	g := newGate(t, "active", onTrial, true)

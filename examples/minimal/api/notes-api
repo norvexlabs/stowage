@@ -5,7 +5,8 @@ serve          migrates the stored schema up to this release's, then readiness o
                liveness on /healthz, the stored schema on /schema
 schema-compat  the `command` provider contract (JSON on stdin/stdout; exit 2 = no answer)
 create-admin   the provision hook contract (env in, KEY=VALUE out, idempotent)
-kit-issue      a handoff's run: what `gives` lists, for the instance it is told, from what `ask` asked
+kit-issue      a handoff's run: what `gives` lists, for the instance it is told, from what `ask` asked:
+               SITE_ADMIN as ADMIN_EMAIL, and each GIVE_<KEY> as <KEY>
 kit-check      a handoff's check: exit 0 proven, 2 unknown, other not proven; this stand-in knows no
                site, so the instance's name says
 
@@ -94,6 +95,9 @@ def main(argv):
         return 0
     elif cmd == "kit-issue":
         print(f"ADMIN_EMAIL={os.environ['SITE_ADMIN']}")
+        for key, value in sorted(os.environ.items()):
+            if key.startswith("GIVE_"):
+                print(f"{key.removeprefix('GIVE_')}={value}")
         return 0
     elif cmd == "kit-check":
         return {"site-unknown": 2, "site-refused": 1}.get(os.environ["STOWAGE_KIT_INSTANCE"], 0)

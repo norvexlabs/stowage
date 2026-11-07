@@ -11,8 +11,8 @@ RUN GOOS=$TARGETOS GOARCH=$TARGETARCH xcaddy build v2.11.7 --with github.com/cad
       --replace github.com/go-chi/chi/v5=github.com/go-chi/chi/v5@v5.4.0 --replace github.com/klauspost/compress=github.com/klauspost/compress@v1.20.2
 
 # Caddy's image less what the front never runs (curl and its libraries, the capability tools: the
-# front runs as root).
+# front runs as root), zlib past CVE-2026-4738, which the pinned base does not carry.
 FROM caddy:2.11.7-alpine@sha256:e70b164da81ef698b3ad19af799ea6086ce6d9e48ed4079eb9fe26f6fbf14ee5
-RUN apk del --no-cache curl libcap libcap-utils
+RUN apk del --no-cache curl libcap libcap-utils && apk add --no-cache 'zlib>=1.4'
 COPY --from=builder /usr/bin/caddy /usr/bin/caddy
 RUN caddy version | grep -q '^v2\.11\.7 ' && caddy list-modules | grep -qx 'dns.providers.cloudflare' && ! command -v curl

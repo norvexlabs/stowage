@@ -7,7 +7,9 @@
 # route's port from the sources its allowlist holds (this host over IPv4: refused over IPv6, and
 # from every source once a re-run changes the allowlist, through the upgrade's reboot), its service
 # (the database) on the host's network and reached by name from the stack's, in the time
-# zone given (`--timezone`); `reset-db` wipes the data and provisions again without a reboot; a
+# zone given (`--timezone`); kits cross between it and a Docker install and a kind cluster beside
+# the suite, both ways, and a second VM's first install comes from `vm create --kit` of a kit Kubernetes
+# issued, with a `byo` certificate and a secret input over the pinned SSH, in no seed; `reset-db` wipes the data and provisions again without a reboot; a
 # backup goes, encrypted, to a WebDAV server on this host — the database and the uploads volume —
 # and `restore` loads both back over newer data; `secrets export` writes the install's secrets encrypted to the operator's key; a newer release crosses the same way and the VM upgrades from the
 # mirror (a backup first), its health gate marking the boot
@@ -75,11 +77,25 @@ s = open(path).read()
 for old, new in [
     ("\nhealth:\n", "\nl4:\n  routes:\n    - { name: db, protocol: tcp, port: 5432, upstream: postgres:5432, allow_input: DB_SOURCES }\n\nhealth:\n"),
     ("  - { key: ADMIN_EMAIL, prompt: \"Administrator email\", required: true }\n",
-     "  - { key: ADMIN_EMAIL, prompt: \"Administrator email\", required: true }\n  - { key: DB_SOURCES, prompt: \"Sources the firewall lets reach the database\", shapes: [docker, kairos] }\n"),
+     "  - { key: ADMIN_EMAIL, prompt: \"Administrator email\", required: true }\n  - { key: DEPLOY_TOKEN, prompt: \"Token of the second site\", secret: true, optional: true }\n  - { key: DB_SOURCES, prompt: \"Sources the firewall lets reach the database\", shapes: [docker, kairos] }\n"),
+    ("  loopback_ports: { app: 8080, api: 8000 }\n", "  loopback_ports: { app: 8080, api: 8000 }\n  publish_ca: { volume: ca }\n"),
+    ("    uploads:  { uid: 1000 }\n", "    uploads:  { uid: 1000 }\n    ca:       { uid: 1000 }\n"),
+    ("\n\nbackup:\n",
+     "\n  - name: vm-site\n    for: notes\n    ask:\n      - { key: SITE_ADMIN, prompt: a }\n      - { key: GIVE_DEPLOY_TOKEN, prompt: t, secret: true }\n      - { key: GIVE_KIT_TLS_CERT, prompt: c }\n      - { key: GIVE_KIT_TLS_KEY, prompt: k, secret: true }\n      - { key: GIVE_KIT_TLS_CA, prompt: i }\n    run: { image: api, cmd: [notes-api, kit-issue], env: [] }\n    gives: [ADMIN_EMAIL, DEPLOY_TOKEN, KIT_TLS_CERT, KIT_TLS_KEY, KIT_TLS_CA]\n\nbackup:\n"),
 ]:
     assert s.count(old) == 1, old
     s = s.replace(old, new)
 s += "\nhost:\n  interfaces:\n    uplink: { primary: true, reason: \"the default route's\" }\n  kernel_args:\n    stowage.e2e: { value: \"1\", reason: \"the recovery system boots without it\" }\n  packages:\n    tcpdump: { reason: \"the bundle installs a package of the project's\" }\n"
+open(path, "w").write(s)
+# The volume the front publishes its CA in, which the api reads.
+path = path.replace("stowage.yaml", "deploy/compose.yaml")
+s = open(path).read()
+for old, new in [
+    ("      - uploads:/data/uploads\n", "      - uploads:/data/uploads\n      - ca:/etc/notes/ca:ro\n"),
+    ("  uploads: {}\n", "  uploads: {}\n  ca: {}\n"),
+]:
+    assert s.count(old) == 1, old
+    s = s.replace(old, new)
 open(path, "w").write(s)
 PY
 "${S[@]}" lint
@@ -94,6 +110,92 @@ vm_ctl beta-1.0.0
 vm_mirror
 mirror "$WORK/r1.oci.tar" --disks qcow2
 grep -q '^Exported notes 1.0.0' "$WORK/r1.oci.tar.txt" || { cat "$WORK/r1.oci.tar.txt"; fail "export of 1.0.0"; }
+
+step "this release on Docker and on a kind cluster, beside the VMs: each issues a kit before any VM exists"
+DOCKER_OPERATOR=("${OPERATOR[@]}")
+k8s_tools
+NS=notes
+start_kind
+installer v1.sh beta-1.0.0
+ctl v1.sh k8s install --no-input --set ADMIN_EMAIL=admin@notes.test --timeout 5m >"$WORK/k8s-install.log" 2>&1 || { cat "$WORK/k8s-install.log"; cluster_logs >&2; fail "k8s install beside the VMs"; }
+docker_beside v1.sh
+# A CA and a certificate of the routes' domains, which the second VM's kit carries.
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout "$WORK/site-ca.key" -out "$WORK/site-ca.pem" -days 2 -subj "/CN=second site CA" \
+	-addext basicConstraints=critical,CA:TRUE -addext keyUsage=critical,keyCertSign 2>/dev/null &&
+	openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout "$WORK/site.key" -out "$WORK/site.csr" -subj /CN=app.notes.test 2>/dev/null &&
+	openssl x509 -req -in "$WORK/site.csr" -CA "$WORK/site-ca.pem" -CAkey "$WORK/site-ca.key" -CAcreateserial -out "$WORK/site.pem" -days 2 \
+		-extfile <(printf 'subjectAltName=DNS:app.notes.test,DNS:api.notes.test\nextendedKeyUsage=serverAuth\n') 2>/dev/null || fail "openssl: the second site's certificate"
+SITE_TOKEN=$(token)
+pem_given() { printf 'stowage-file:%s' "$(base64 -w0 "$1")"; }
+{
+	printf 'SITE_ADMIN: from-k8s@notes.test\nGIVE_DEPLOY_TOKEN: %s\n' "$SITE_TOKEN"
+	printf 'GIVE_KIT_TLS_CERT: %s\nGIVE_KIT_TLS_KEY: %s\nGIVE_KIT_TLS_CA: %s\n' "$(pem_given "$WORK/site.pem")" "$(pem_given "$WORK/site.key")" "$(pem_given "$WORK/site-ca.pem")"
+} >"$OP/vm-site.yaml"
+chmod 600 "$OP/vm-site.yaml"
+ctl v1.sh k8s kit create vm-site --name site-vm --answers vm-site.yaml -o vm-site.kit >"$WORK/kit-vm-site.log" 2>&1 || { cat "$WORK/kit-vm-site.log"; cluster_logs >&2; fail "k8s kit create of the second VM's kit"; }
+kit_code "$WORK/kit-vm-site.log" "$OP/vm-site.code"
+! grep -qF "$SITE_TOKEN" "$WORK/kit-vm-site.log" "$OP/vm-site.kit" || fail "the token in the clear"
+"${DOCKER_CTL[@]}" kit create second-site --dir "$D" --name site-vm --set SITE_ADMIN=from-docker@notes.test -o "$WORK/docker.kit" >"$WORK/kit-docker.log" 2>&1 || { cat "$WORK/kit-docker.log"; stack_logs >&2; fail "kit create on Docker"; }
+kit_code "$WORK/kit-docker.log" "$WORK/docker.code"
+
+step "vm create --kit, of Kubernetes's kit: the first install takes the byo certificate and the secret over the pinned SSH, and neither is in the seed"
+H_MAIN=$H ADDR_MAIN=$ADDR STATE_MAIN=$STATE
+H=$H-kit ADDR=$H.$DOMAIN STATE=$XDG_STATE_HOME/$NAME/vms/$H
+vm_cleanup
+"$CTL" vm create --no-input --platform truenas --create opentofu --hostname "$H" --user ops --ssh-key "$KEY.pub" \
+	--domains app=app.notes.test,api=api.notes.test --kit "$OP/vm-site.kit" --kit-code-file "$OP/vm-site.code" \
+	--pool "$POOL" --dataset "$DATASET" --bridge "$BRIDGE" --cpus 2 --memory 4096 --disk 16 --host "$ADDR" --wait "${E2E_VM_WAIT:-30m}" \
+	--registry "$SITE" --registry-ca "$MIRROR_CA" \
+	>"$WORK/vm-kit.txt" 2>"$WORK/vm-kit.log" || { tail -80 "$WORK/vm-kit.log"; fail "vm create --kit"; }
+grep -q "^The VM $H runs notes 1.0.0" "$WORK/vm-kit.txt" || { cat "$WORK/vm-kit.txt"; fail "vm create --kit did not report the install"; }
+grep -q 'installing over SSH with ' "$WORK/vm-kit.log" || { tail -30 "$WORK/vm-kit.log"; fail "the kit's material did not go over SSH"; }
+[[ ! -e $STATE/given.yaml ]] || fail "what the install took is left on this machine"
+# The kit's plain input is in the seed and in what the VM's first boot kept, so the search below reads
+# them; its secret, its certificate and its key are in neither, nor anywhere in the VM's state.
+# Each as a line of its PEM and whole in the form the kit's answers carried it.
+key_line=$(sed -n 2p "$WORK/site.key")
+cert_line=$(sed -n 2p "$WORK/site.pem")
+key_given=$(base64 -w0 "$WORK/site.key")
+cert_given=$(base64 -w0 "$WORK/site.pem")
+grep -aqF from-k8s@notes.test "$STATE/seed.iso" || fail "the seed does not read in the clear: the search below would see nothing"
+on_vm sudo grep -rqF from-k8s@notes.test /oem || fail "/oem does not read in the clear: the search below would see nothing"
+for v in "$SITE_TOKEN" "$key_line" "$cert_line" "$key_given" "$cert_given"; do
+	! grep -rqaF -- "$v" "$STATE" || fail "what vm create gives over SSH is in the VM's state"
+	! grep -qaF -- "$v" "$WORK/vm-kit.log" "$WORK/vm-kit.txt" || fail "what vm create gives over SSH reached its output"
+	not_on_vm "$v" /oem
+done
+on_vm sudo cat /usr/local/notes/.env >"$WORK/vm-kit.env"
+grep -qx "DEPLOY_TOKEN='\{0,1\}$SITE_TOKEN'\{0,1\}" "$WORK/vm-kit.env" || fail "the kit's secret input was not recorded"
+grep -qx "ADMIN_EMAIL='\{0,1\}from-k8s@notes.test'\{0,1\}" "$WORK/vm-kit.env" || fail "the kit's input was not recorded"
+# The kit's CA reaches the api, and the front serves its certificate: a client trusting that CA alone
+# reaches both routes.
+want=$(openssl x509 -in "$WORK/site-ca.pem" -noout -fingerprint -sha256)
+deadline=$((SECONDS + 120))
+until on_vm sudo docker exec "$(on_vm sudo docker ps -q --filter label=com.docker.compose.service=api)" cat /etc/notes/ca/ca.crt >"$WORK/vm-kit-ca.crt" 2>/dev/null &&
+	[[ $(openssl x509 -in "$WORK/vm-kit-ca.crt" -noout -fingerprint -sha256 2>/dev/null) == "$want" ]]; do
+	((SECONDS < deadline)) || { cat "$WORK/vm-kit-ca.crt"; fail "the CA the api reads is not the kit's"; }
+	sleep 5
+done
+# At the address SSH reaches the VM at: the name may give others.
+# shellcheck disable=SC2016 # expanded on the VM
+ip=$(on_vm 'set -- $SSH_CONNECTION; echo "$3"') && [[ -n $ip ]] || fail "the kit's VM's address"
+[[ $ip != *:* ]] || ip="[$ip]"
+deadline=$((SECONDS + 120))
+until curl -fsS -o /dev/null --max-time 10 --cacert "$WORK/site-ca.pem" --resolve "app.notes.test:443:$ip" https://app.notes.test/ 2>"$WORK/vm-kit-curl.log" &&
+	curl -fsS -o /dev/null --max-time 10 --cacert "$WORK/site-ca.pem" --resolve "api.notes.test:443:$ip" https://api.notes.test/healthz 2>"$WORK/vm-kit-curl.log"; do
+	((SECONDS < deadline)) || {
+		echo "--- at $ip; the name $ADDR gives:"
+		getent ahosts "$ADDR" || true
+		cat "$WORK/vm-kit-curl.log"
+		# shellcheck disable=SC2016 # expanded on the VM
+		on_vm 'sudo docker ps -a --format "{{.Names}} {{.Status}}"; sudo ss -tln; sudo nft list ruleset | grep -E "dport|policy"; sudo docker logs --tail 30 "$(sudo docker ps -aq --filter label=com.docker.compose.service=front)"' 2>&1 | cut -c1-300 || true
+		fail "the front does not serve the kit's certificate"
+	}
+	sleep 5
+done
+"$CTL" vm destroy "$H" --yes >"$WORK/vm-kit-destroy.txt" 2>"$WORK/vm-kit-destroy.log" || { tail -50 "$WORK/vm-kit-destroy.log"; fail "vm destroy of the kit's VM"; }
+[[ ! -e $STATE ]] || fail "the kit's VM's state is left"
+H=$H_MAIN ADDR=$ADDR_MAIN STATE=$STATE_MAIN
 
 step "vm create with OpenTofu on TrueNAS, from the mirror, IPv6 on: the disk, the seed, the VM; it boots and installs"
 vm_cleanup
@@ -273,7 +375,7 @@ ip=$(getent hosts "$ADDR" | awk '{print $1; exit}')
 code=$(curl -sk -o /dev/null -w '%{http_code}' --resolve "app.notes.test:443:$ip" https://app.notes.test/)
 [[ $code =~ ^[23] ]] || fail "https://app.notes.test/ on the VM answered $code"
 
-step "kit create on the VM, through the daemon; the kit taken by install --kit; kit check"
+step "kit create on the VM, through the daemon; the kit taken by install --kit, by a Docker install and by a release on Kubernetes; Docker's by the VM; kit check"
 on_vm sudo notes-stow kit create second-site --name site-2 --set SITE_ADMIN=second@notes.test -o /tmp/site.kit >"$WORK/kit.log" 2>&1 || { cat "$WORK/kit.log"; fail "kit create on the VM"; }
 code=$(sed -n 's/^code  //p' "$WORK/kit.log")
 [[ -n $code ]] || { cat "$WORK/kit.log"; fail "kit create printed no code"; }
@@ -283,7 +385,21 @@ grep -qF 'changing ADMIN_EMAIL: ' "$WORK/kit-take.log" || { cat "$WORK/kit-take.
 on_vm sudo notes-stow kit check second-site site-2 | grep -q 'proven$' || fail "kit check of a site"
 rc=0; on_vm sudo notes-stow kit check second-site site-unknown >/dev/null 2>&1 || rc=$?
 [[ $rc == 2 ]] || fail "kit check of an unknown site exited $rc, not 2"
-on_vm sudo rm -f /tmp/site.kit /tmp/site.code
+on_vm sudo cat /tmp/site.kit >"$OP/vm.kit" || fail "reading the VM's kit"
+(umask 077; printf '%s\n' "$code" >"$OP/vm.code")
+"${DOCKER_CTL[@]}" --dir "$D" --no-input --kit "$OP/vm.kit" --kit-code-file "$OP/vm.code" >"$WORK/kit-vm-docker.log" 2>&1 || { cat "$WORK/kit-vm-docker.log"; stack_logs >&2; fail "--kit of the VM's kit on Docker"; }
+grep -q "^ADMIN_EMAIL='second@notes.test'\$" "$D/.env" || fail "the VM's kit did not replace Docker's recorded input"
+ctl v1.sh k8s upgrade --kit vm.kit --kit-code-file vm.code --no-input --timeout 5m >"$WORK/kit-vm-k8s.log" 2>&1 || { cat "$WORK/kit-vm-k8s.log"; cluster_logs >&2; fail "k8s upgrade --kit of the VM's kit"; }
+[[ $(kubectl get -n "$NS" secret notes-stowage -o jsonpath='{.data.ADMIN_EMAIL}' | base64 -d) == second@notes.test ]] || fail "the VM's kit did not replace Kubernetes's recorded input"
+on_vm 'cat >/tmp/docker.kit' <"$WORK/docker.kit" || fail "copying Docker's kit"
+on_vm 'umask 077; cat >/tmp/docker.code' <"$WORK/docker.code" || fail "copying Docker's kit's code"
+on_vm sudo notes-stow install --kit /tmp/docker.kit --kit-code-file /tmp/docker.code --no-input >"$WORK/kit-docker-vm.log" 2>&1 || { cat "$WORK/kit-docker-vm.log"; fail "install --kit of Docker's kit on the VM"; }
+on_vm sudo cat /usr/local/notes/.env >"$WORK/vm-docker.env" || fail "reading the VM's .env"
+grep -qx "ADMIN_EMAIL='\{0,1\}from-docker@notes.test'\{0,1\}" "$WORK/vm-docker.env" || fail "Docker's kit did not replace the VM's recorded input"
+on_vm sudo rm -f /tmp/site.kit /tmp/site.code /tmp/docker.kit /tmp/docker.code
+# The cluster and the Docker install have done their part: the long steps left run without them.
+kind delete cluster --name "$CLUSTER" >/dev/null 2>&1 || true
+"${DOCKER_CTL[@]}" uninstall --dir "$D" --data --yes >"$WORK/docker-site-gone.log" 2>&1 || { cat "$WORK/docker-site-gone.log"; fail "uninstall of the Docker install beside"; }
 
 step "reset-db on the VM: the data wiped and provisioned again, without a reboot"
 on_vm sudo docker exec "$api" touch /data/uploads/marker || fail "no marker written in the uploads volume"
@@ -567,6 +683,30 @@ on_recovery() {
 	ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$WORK/known_hosts.recovery" \
 		-i "$KEY" -o IdentitiesOnly=yes "ops@$RECOVERY" -- "$@"
 }
+# recovery_lost <what>: a system that answered stopped answering, which fails the step; what this host
+# sees, and what the VM's journal says once it answers again within 5 minutes, tell why.
+recovery_lost() {
+	echo "--- $1: the recovery system stopped answering at $RECOVERY; the name $ADDR gives:"
+	getent ahosts "$ADDR" || true
+	ip neigh show | grep -F "$RECOVERY" || true
+	local until=$((SECONDS + 300)) r
+	while ((SECONDS < until)); do
+		for r in "$RECOVERY" "$VM_IP" "$ADDR"; do
+			# shellcheck disable=SC2016 # expanded on the VM
+			if RECOVERY=$r on_recovery 'echo "--- answers at '"$r"', up $(cut -d" " -f1 /proc/uptime) s:"; ip -br addr; sudo journalctl -b -u systemd-networkd --no-pager | tail -40'; then
+				fail "the recovery system stopped answering ($1), and answered again"
+			fi
+		done
+		sleep 15
+	done
+	fail "the recovery system stopped answering ($1)"
+}
+# recovery_failed <exit status> <what>: ssh's own 255 is a system that stopped answering; any other is
+# what ran failing on a system that answers.
+recovery_failed() {
+	[[ $1 != 255 ]] || recovery_lost "$2"
+	fail "$2 on the recovery system exited $1"
+}
 on_vm 'sudo grub2-editenv /oem/grubenv set next_entry=recovery && sudo systemctl reboot' >/dev/null 2>&1 || true
 deadline=$((SECONDS + 600))
 until for RECOVERY in "$VM_IP" "$ADDR"; do on_recovery test -e /run/cos/recovery_mode 2>>"$WORK/recovery.log" && break; RECOVERY=; done; [[ -n $RECOVERY ]]; do
@@ -579,13 +719,21 @@ until for RECOVERY in "$VM_IP" "$ADDR"; do on_recovery test -e /run/cos/recovery
 	sleep 15
 done
 echo "recovery: answers at $RECOVERY"
-on_recovery sudo nft list table inet notes >"$WORK/nft.recovery.txt" 2>&1 && grep -q 'hook input .*policy drop;' "$WORK/nft.recovery.txt" ||
+# The name may move between the two NICs' leases: the address that answered is kept from here on.
+recovery_name=$RECOVERY
+# shellcheck disable=SC2016 # expanded on the VM
+RECOVERY=$(on_recovery 'set -- $SSH_CONNECTION; echo "$3"') && [[ -n $RECOVERY ]] || { RECOVERY=$recovery_name; recovery_lost "its address"; }
+echo "recovery: its address is $RECOVERY"
+rc=0
+on_recovery sudo nft list table inet notes >"$WORK/nft.recovery.txt" 2>&1 || rc=$?
+[[ $rc != 255 ]] || { cat "$WORK/nft.recovery.txt"; recovery_lost nft; }
+[[ $rc == 0 ]] && grep -q 'hook input .*policy drop;' "$WORK/nft.recovery.txt" ||
 	{ cat "$WORK/nft.recovery.txt"; fail "the recovery system runs without the bundle's firewall"; }
-on_recovery sudo ss -tulpn >"$WORK/ss.recovery.txt" || fail "ss on the recovery system"
+on_recovery sudo ss -tulpn >"$WORK/ss.recovery.txt" || recovery_failed $? ss
 beyond_loopback "$WORK/ss.recovery.txt" tcp/22 udp/68 udp/546 ||
 	{ cat "$WORK/ss.recovery.txt"; fail "the recovery system listens beyond loopback on more than SSH and DHCP"; }
-on_recovery sudo passwd -S -a >"$WORK/passwd.recovery.txt" || fail "passwd -S on the recovery system"
-cmdline=$(on_recovery cat /proc/cmdline) || fail "the recovery system's command line does not read"
+on_recovery sudo passwd -S -a >"$WORK/passwd.recovery.txt" || recovery_failed $? "passwd -S"
+cmdline=$(on_recovery cat /proc/cmdline) || recovery_failed $? /proc/cmdline
 [[ $cmdline != *stowage.e2e* ]] || fail "the recovery system booted with the project's kernel argument: $cmdline"
 ! awk '$2 == "P" {print; found = 1} END {exit !found}' "$WORK/passwd.recovery.txt" || fail "an account of the recovery system has a password"
 

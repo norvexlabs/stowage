@@ -274,6 +274,29 @@ new_project() {
 	P=$WORK/notes NAME=notes SHORT=notes
 	cp -r "$REPO/examples/minimal" "$P"
 	cosign_keys "$P/keys/release"
+	project_spec "$1"
+	S=("$STOWAGE" -C "$P")
+	if [[ ${KAIROS:-0} != 1 ]]; then
+		S+=(--test-registry "$REG/notes" --test-push publisher:STOWAGE_PUSH_TOKEN --test-pull pull:NOTES_PULL_TOKEN
+			--test-key "$P/keys/release.key" --test-public-key keys/release.pub --shapes docker,kubernetes)
+	fi
+	"${S[@]}" lock --update >/dev/null # the example pins a stowage; publish with the one built
+	"${S[@]}" lint
+}
+
+# example_at <tag>: examples/minimal as that tag has it, over $P (its keys kept), its spec edited
+# for this run; no tag: as this tree has it. PG is the pinned postgres.
+example_at() {
+	if [[ -n ${1:-} ]]; then
+		git -C "$REPO" archive "$1" examples/minimal | tar -x --strip-components=2 -C "$P" || fail "the example at $1"
+	else
+		cp -r "$REPO/examples/minimal/." "$P/" || fail "the example of this tree"
+	fi
+	project_spec "$PG"
+}
+
+# project_spec <pinned postgres>: $P/stowage.yaml, examples/minimal's at any release, edited for this run.
+project_spec() {
 	python3 - "$P/stowage.yaml" "$REG" "$1" "${KAIROS:-0}" <<'PY'
 import sys
 path, reg, pinned, kairos = sys.argv[1:]
@@ -296,13 +319,6 @@ if kairos == "1":
     lines.insert(i, "signing: { provider: cosign-key, key: keys/release.key, public_keys: [keys/release.pub] }")
 open(path, "w").write("\n".join(lines) + "\n")
 PY
-	S=("$STOWAGE" -C "$P")
-	if [[ ${KAIROS:-0} != 1 ]]; then
-		S+=(--test-registry "$REG/notes" --test-push publisher:STOWAGE_PUSH_TOKEN --test-pull pull:NOTES_PULL_TOKEN
-			--test-key "$P/keys/release.key" --test-public-key keys/release.pub --shapes docker,kubernetes)
-	fi
-	"${S[@]}" lock --update >/dev/null # the example pins a stowage; publish with the one built
-	"${S[@]}" lint
 }
 
 # cosign_keys <prefix>: STOWAGE_COSIGN, a cosign run in its container on the host network (the
@@ -570,6 +586,25 @@ remove_cluster() {
 	[[ -n ${REG:-} ]] || return 0
 	docker images --format '{{.Repository}}:{{.Tag}}' --filter "reference=$REG/${NAME:-notes}/*" | xargs -r docker rmi >/dev/null 2>&1 || true
 }
+# docker_beside <installer script in $OP>: a Docker install of the project in $WORK/docker-site beside
+# a suite's cluster or VM, for handoffs between shapes: DOCKER_CTL its <short>-stow, run in
+# DOCKER_OPERATOR, the operator's environment the suite kept before k8s_tools.
+docker_beside() {
+	D=$WORK/docker-site
+	CLEANUP+=('remove_install')
+	DOCKER_CTL=("${DOCKER_OPERATOR[@]}" "$D/$SHORT-stow")
+	APP_PORT=$(free_port)
+	API_PORT=$(free_port)
+	while [[ $API_PORT == "$APP_PORT" ]]; do API_PORT=$(free_port); done
+	(cd "$OP" && "${DOCKER_OPERATOR[@]}" sh "$1" --no-input --dir "$D" --ports "app=$APP_PORT,api=$API_PORT" --set ADMIN_EMAIL=admin@notes.test) \
+		>"$WORK/docker-site.log" 2>&1 || { cat "$WORK/docker-site.log"; fail "the Docker install beside"; }
+}
+# kit_code <kit create's log> <file>: the code that log printed, in that file, 0600.
+kit_code() {
+	(umask 077; sed -n 's/^code  //p' "$1" >"$2")
+	[[ -s $2 ]] || { cat "$1"; fail "kit create printed no code"; }
+}
+
 # prev_stowage: the path of the previous release's stowage — the latest v* tag but this tree's
 # own version — built from that tag with its own `make build` (in Docker) once, then kept in
 # ~/.cache/stowage-prev/<tag>; its git worktree is removed once built.
@@ -602,9 +637,9 @@ ctl() {
 	shift
 	(cd "$OP" && "${OPERATOR[@]}" sh "$s" "$@")
 }
-# installer <file>: the latest installer of the registry, as the bootstrap one-liner fetches it.
+# installer <file> [tag]: the installer of the registry (the latest), as the bootstrap one-liner fetches it.
 installer() {
 	login_pull
-	docker run --rm --pull always "$REG/$NAME/$NAME-installer:latest" >"$OP/$1" || fail "docker run of the installer image"
+	docker run --rm --pull always "$REG/$NAME/$NAME-installer:${2:-latest}" >"$OP/$1" || fail "docker run of the installer image"
 	unset DOCKER_CONFIG # for the next ships; the installer's environment never has it (OPERATOR)
 }

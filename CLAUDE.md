@@ -82,7 +82,7 @@ The Serena MCP server is this repository's code tool; use it for every code task
 - **One gate run.** `make gate` (`STOWAGE_VM_ENV=<file> make gate` when it needs e2e-vm), once per
   settled tree: check, build and lint, then only the suites gate 1 lists for the changed paths —
   `test/gate.sh` encodes that list, and a change to the list changes both. The long suites
-  (e2e-kairos ~25 min, e2e-vm ~85 min) run only for the code they exercise. The end-to-end suites run **in parallel**: each has its own zot, ports, network
+  (e2e-kairos ~25 min, e2e-vm ~105 min) run only for the code they exercise. The end-to-end suites run **in parallel**: each has its own zot, ports, network
   and work directory. A suite that fails only in parallel is re-run alone, and the clash is fixed
   or noted in TODO.md.
 - **Commit as soon as the gates and the review settle.** Then, before starting the next slice:
@@ -128,7 +128,7 @@ a self-review against the code it describes is enough. Every other commit clears
    never in the tree). A change
    to `internal/truenas`, the OpenTofu module (`internal/install/tofu`), `vmtofu.go`, `seed*.go`,
    the boot (`vm.go`), the host daemon, the backup runner or the OS bundle's files (its recipe's lists, `internal/kairos/kairos.go`, included) runs `STOWAGE_VM_ENV=<file> make
-   e2e-vm` too (a real VM on TrueNAS, an upgrade of it through a TLS mirror, `reset-db`, `rollback`, a failed health gate's fallback, a backup, `vm attach` of a second NIC and the network overrides' revert, ~90 min; the file is the user's, its path given at run time,
+   e2e-vm` too (a real VM on TrueNAS, an upgrade of it through a TLS mirror, `reset-db`, `rollback`, a failed health gate's fallback, a backup, `vm attach` of a second NIC and the network overrides' revert, handoff kits with a Docker install and a kind cluster beside it, a second VM made by `vm create --kit`, ~105 min; the file is the user's, its path given at run time,
    never written in the tree); it runs beside the parallel suites in one chain with `e2e-kairos` and
    `e2e-full-vm`, one at a time, as they make disks with auroraboot, which races for loop devices. A change to `examples/full`'s kairos
    shape (its `stowage.yaml`'s `shapes.kairos` block and its top-level `host` block, each compared

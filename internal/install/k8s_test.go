@@ -61,6 +61,7 @@ type fakeKube struct {
 	deleteErr    error            // `kubectl delete` fails
 	deleteJobErr error            // `kubectl delete job` fails
 	kitReadErrs  int              // reads of a kit's Secret that fail, once a Job was created
+	kitReadFails string           // the kit's Secret whose reads always fail
 	createErr    error            // `kubectl create` fails
 	uninstErr    error            // `helm uninstall` fails
 	rolloutErr   error            // `kubectl rollout` fails
@@ -275,6 +276,8 @@ func (k kubeTool) Run(_ context.Context, c Cmd) ([]byte, error) {
 			return []byte(cmp.Or(f.pods, `{"items": []}`)), nil
 		case strings.HasSuffix(a[2], "-pull"):
 			return []byte(f.pull), nil
+		case f.kitReadFails != "" && a[2] == f.kitReadFails:
+			return nil, errors.New("the connection to the server was refused")
 		case strings.Contains(a[2], "-stowage-kit-") && f.created != nil && f.kitReadErrs > 0:
 			f.kitReadErrs--
 			return nil, errors.New("the connection to the server was refused")

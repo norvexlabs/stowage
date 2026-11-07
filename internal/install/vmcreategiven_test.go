@@ -391,6 +391,28 @@ func TestVMCreateWithOpenTofuFailingKeepsWhatAVMMayWaitFor(t *testing.T) {
 	}
 }
 
+// OpenTofu failing before the variables leaves no VM, and no `vm destroy` finds this state: nothing
+// of what was to be given stays on this machine.
+func TestVMCreateWithOpenTofuFailingBeforeAnyVMKeepsNothing(t *testing.T) {
+	t.Parallel()
+	v := newVMCreate(t, "qcow2")
+	_, _, mod := byoVM(t, v)
+	r := newTofuRun(t)
+	dir := filepath.Join(r.state, "notes", "vms", "notes-1")
+	if err := os.MkdirAll(filepath.Join(dir, platformFile, "in-the-way"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	err := v.create(tofuCreate(), r.mod(func(o *Options) { o.TLS = ""; mod(o) }))
+	if err == nil || !strings.Contains(err.Error(), "no VM was made") {
+		t.Fatalf("%v", err)
+	}
+	for _, f := range []string{"given.yaml", "given.yaml.known_hosts"} {
+		if _, err := os.Stat(filepath.Join(dir, f)); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("%s: %v", f, err)
+		}
+	}
+}
+
 // The default --out is the working directory, and the step runs from anywhere.
 func TestTheGivenStepNamesItsFileWhereverItRuns(t *testing.T) {
 	v := newVMCreate(t, "qcow2")

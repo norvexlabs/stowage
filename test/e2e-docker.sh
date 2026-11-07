@@ -91,11 +91,11 @@ grep -qF 'changing ADMIN_EMAIL: admin@notes.test → second@notes.test' "$WORK/k
 "${CTL[@]}" upgrade --dir "$D" --kit "$WORK/site.kit" >"$WORK/kit5.log" 2>&1 && fail "upgrade took --kit"
 grep -q -- '--kit: an upgrade takes none of it' "$WORK/kit5.log" || { cat "$WORK/kit5.log"; fail "the refusal does not name the re-run"; }
 given admin@notes.test
-"${CTL[@]}" kit check second-site site-2 --dir "$D" | grep -q 'proven$' || fail "kit check of a site"
-rc=0; "${CTL[@]}" kit check second-site site-unknown --dir "$D" >/dev/null 2>&1 || rc=$?
-[[ $rc == 2 ]] || fail "kit check of an unknown site exited $rc, not 2"
-rc=0; "${CTL[@]}" kit check second-site site-refused --dir "$D" >/dev/null 2>&1 || rc=$?
-[[ $rc == 1 ]] || fail "kit check of a refused site exited $rc, not 1"
+"${CTL[@]}" kit check second-site site-2 --dir "$D" >"$WORK/kit-check.log" 2>&1 && grep -q 'proven$' "$WORK/kit-check.log" || { cat "$WORK/kit-check.log"; fail "kit check of a site"; }
+rc=0; "${CTL[@]}" kit check second-site site-unknown --dir "$D" >"$WORK/kit-check.log" 2>&1 || rc=$?
+[[ $rc == 2 ]] || { cat "$WORK/kit-check.log"; fail "kit check of an unknown site exited $rc, not 2"; }
+rc=0; "${CTL[@]}" kit check second-site site-refused --dir "$D" >"$WORK/kit-check.log" 2>&1 || rc=$?
+[[ $rc == 1 ]] || { cat "$WORK/kit-check.log"; fail "kit check of a refused site exited $rc, not 1"; }
 running 1.0.0 1
 
 step "audit on the Docker host: the release's SBOMs, scanned with its own scanner (the database given)"

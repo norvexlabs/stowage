@@ -438,6 +438,7 @@ func TestK8sUpgradeGivenFailedRestartNamesTheRetry(t *testing.T) {
 	// With a hook to run, it says the hook has not run; the release's endpoint and tips are printed.
 	e = upgradeEnv(t)
 	e.f.rolloutErr = errors.New("timed out")
+	e.release.Spec.Handoffs = []spec.Handoff{testHandoff()}
 	e.published(e.release)
 	e.f.manifest += "---\nkind: Deployment\nmetadata: {name: notes-api}\n"
 	e.hookRuns("Succeeded", "", nil)
@@ -451,6 +452,9 @@ func TestK8sUpgradeGivenFailedRestartNamesTheRetry(t *testing.T) {
 	}
 	if e.f.created != nil {
 		t.Error("the hook ran")
+	}
+	if !strings.Contains(e.out.String(), "k8s kit create client") {
+		t.Errorf("no tip after a failed restart: %s", e.out)
 	}
 }
 

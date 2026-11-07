@@ -129,7 +129,7 @@ func (in *Installer) k8sKitRun(ctx context.Context, p *k8sHookPlan, answers map[
 	if err != nil {
 		return nil, err
 	}
-	if slices.ContainsFunc(sortedKeys(held), func(key string) bool { return key != kitExitKey }) {
+	if kitHolds(held) {
 		return nil, fmt.Errorf("the Secret %s holds what an earlier run gave, perhaps the only copy of what it issued: `kubectl get secret %s %s --output json` shows it, `kubectl delete secret %s %s` clears the way, then run again", k.hookName(), k.hookName(), k.kubectlWhere(), k.hookName(), k.kubectlWhere())
 	}
 	if err := in.deleteKitObjects(ctx); err != nil {
@@ -311,10 +311,18 @@ func (in *Installer) K8sCheckKit(ctx context.Context, handoff, instance string) 
 	return code, nil
 }
 
+// kitHolds tells a Secret holding what a run gave from one holding nothing, or a check's exit status,
+// which is worth nothing.
+func kitHolds(held map[string]string) bool {
+	return slices.ContainsFunc(sortedKeys(held), func(key string) bool { return key != kitExitKey })
+}
+
 // k8sKitLeftovers names the handoffs' Secrets a run killed before it could delete them. Each holds
-// what was issued, until the operator deletes it, or `k8s uninstall` does.
+// what was issued, until the operator deletes it, or `k8s uninstall` does. A Secret that does not
+// read does not hide those after it.
 func (in *Installer) k8sKitLeftovers(ctx context.Context) ([]string, error) {
 	var left []string
+	var errs []error
 	for _, h := range in.R.Spec.Handoffs {
 		k := in.O.K8s
 		k.kit = h.Name
@@ -324,11 +332,12 @@ func (in *Installer) k8sKitLeftovers(ctx context.Context) ([]string, error) {
 			continue
 		}
 		if err != nil {
-			return left, err
+			errs = append(errs, err)
+			continue
 		}
-		if got != nil {
+		if kitHolds(got) {
 			left = append(left, k.hookName())
 		}
 	}
-	return left, nil
+	return left, errors.Join(errs...)
 }

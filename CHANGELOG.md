@@ -3,6 +3,31 @@
 Stowage's own releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
+## [0.30.1]
+
+### Fixed
+
+- `k8s status` no longer stops listing a handoff's leftover Secrets at the first one it cannot read,
+  and no longer calls a Secret holding only a check's exit status a leftover of issued values.
+- The front and the backup runner are built with zlib 1.4, past the critical CVE-2026-4738, which
+  their Alpine base images do not carry yet: a project signing its releases with `fail_on: critical`
+  was refused at `ship`. The examples' Python images are raised the same way; a project's own Alpine
+  images need the same until their base carries it.
+- A VM whose first boot took a newer release's OS, and whose first install waited for what
+  `vm create` gives over SSH (secrets, secret inputs, a `byo` certificate, a kit), no longer falls
+  back to the older OS at its next reboot, where the older installer refused the install: the
+  health gate marks such a boot good, as the older OS holds no install to go back to. Its first
+  install unhealthy before any upgrade, that OS is kept instead of rebooting into the older one,
+  which served nothing.
+
+### Changed
+
+- Handoff kits are proven further on real installs. A VM's first
+  install is run from `vm create --kit`, with a `byo` certificate and a secret input over the pinned
+  SSH and in no seed; kits cross between Docker, Kubernetes and the VM in both directions; a release
+  shipped after a Stowage upgrade issues and takes one; and a secret input reaches a bare-metal
+  machine's first install past the switch to its release's OS.
+
 ## [0.30.0] - 2026-11-07
 
 ### Added
