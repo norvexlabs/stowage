@@ -204,6 +204,15 @@ step "across Stowage versions: the previous Stowage's release, at baseline 1, cr
 prev=$(prev_stowage)
 S_NOW=("${S[@]}")
 S=("$prev" "${S[@]:1}")
+# That Stowage reads its spec strictly, and one before 0.30.0 refuses handoffs.
+cp "$P/stowage.yaml" "$WORK/stowage-now.yaml"
+python3 - "$P/stowage.yaml" <<'PY2'
+import re, sys
+path = sys.argv[1]
+s, k = re.subn(r"^handoffs:.*\n(?:[ #].*\n|\n)*", "", open(path).read(), count=1, flags=re.M)
+assert k == 1, "handoffs"
+open(path, "w").write(s)
+PY2
 "${S[@]}" lock --update >/dev/null # a project publishes with the stowage its lock pins
 baseline 1
 release 3.0.0
@@ -212,6 +221,7 @@ ctl v3.sh k8s install --no-input --set ADMIN_EMAIL=admin@notes.test --timeout 3m
 	{ cat "$WORK/install3.log"; cluster_logs >&2; fail "k8s install of the previous Stowage's 3.0.0"; }
 runs 3.0.0 1
 S=("${S_NOW[@]}")
+cp "$WORK/stowage-now.yaml" "$P/stowage.yaml"
 "${S[@]}" lock --update >/dev/null
 baseline 2
 release 4.0.0
