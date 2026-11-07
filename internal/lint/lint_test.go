@@ -82,6 +82,27 @@ func TestEachRuleFires(t *testing.T) {
 		want  string
 	}{
 		{"bad name", []edit{{specFile, "\nname: notes\n", "\nname: Notes\n"}}, nil, "name:"},
+		{"handoff bad name", []edit{{specFile, "  - name: second-site\n", "  - name: Second\n"}}, nil, "handoffs[0].name"},
+		{"handoff long name", []edit{{specFile, "  - name: second-site\n", "  - name: aaaaaaaaaaaaaaaaaaaaaaaaa\n"}}, nil, "at most 24 characters"},
+		{"handoff twice", []edit{{specFile, "handoffs:", "handoffs:\n  - { name: second-site, for: notes, run: { image: api, cmd: [x], env: [] }, gives: [A] }"}}, nil, "the name of another handoff"},
+		{"handoff bad for", []edit{{specFile, "    for: notes\n", "    for: Not_A_Name\n"}}, nil, "handoffs[0].for"},
+		{"handoff ask key", []edit{{specFile, "key: SITE_ADMIN", "key: STOWAGE_ADMIN"}}, nil, "handoffs[0].ask[0].key"},
+		{"handoff ask an input", []edit{{specFile, "key: SITE_ADMIN", "key: ADMIN_EMAIL"}}, nil, "the run receives it through its env"},
+		{"handoff ask twice", []edit{{specFile, "ask: [{ key: SITE_ADMIN, prompt: \"The second site's administrator\" }]", "ask: [{ key: SITE_ADMIN, prompt: a }, { key: SITE_ADMIN, prompt: b }]"}}, nil, "is asked twice"},
+		{"handoff ask prompt", []edit{{specFile, "prompt: \"The second site's administrator\"", "prompt: \"\""}}, nil, "handoffs[0].ask[0].prompt"},
+		{"handoff run image", []edit{{specFile, "run: { image: api, cmd: [notes-api, kit-issue]", "run: { image: nope, cmd: [notes-api, kit-issue]"}}, nil, "handoffs[0].run.image"},
+		{"handoff run cmd", []edit{{specFile, "cmd: [notes-api, kit-issue]", "cmd: []"}}, nil, "handoffs[0].run.cmd"},
+		{"handoff run env", []edit{{specFile, "cmd: [notes-api, kit-issue], env: []", "cmd: [notes-api, kit-issue], env: [NOPE]"}}, nil, "handoffs[0].run.env[0]"},
+		{"handoff run env twice", []edit{{specFile, "cmd: [notes-api, kit-issue], env: []", "cmd: [notes-api, kit-issue], env: [ADMIN_EMAIL, ADMIN_EMAIL]"}}, nil, "is listed twice"},
+		{"handoff check image", []edit{{specFile, "check: { image: api,", "check: { image: nope,"}}, nil, "handoffs[0].check.image"},
+		{"handoff gives nothing", []edit{{specFile, "    gives: [ADMIN_EMAIL]\n", ""}}, nil, "handoffs[0].gives"},
+		{"handoff gives what it asks", []edit{{specFile, "gives: [ADMIN_EMAIL]", "gives: [SITE_ADMIN]"}}, nil, "is what the handoff asks"},
+		{"handoff gives the install's", []edit{{specFile, "gives: [ADMIN_EMAIL]", "gives: [STOWAGE_X]"}}, nil, "is not a key a step's stdout may give"},
+		{"handoff gives twice", []edit{{specFile, "gives: [ADMIN_EMAIL]", "gives: [A, A]"}}, nil, "is listed twice"},
+		{"handoff gives a TLS key", []edit{{specFile, "gives: [ADMIN_EMAIL]", "gives: [KIT_TLS_NOPE]"}}, nil, "KIT_TLS_ is for"},
+		{"handoff half a cert", []edit{{specFile, "gives: [ADMIN_EMAIL]", "gives: [KIT_TLS_CERT]"}}, nil, "given together"},
+		{"handoff a key alone", []edit{{specFile, "gives: [ADMIN_EMAIL]", "gives: [KIT_TLS_KEY]"}}, nil, "given together"},
+		{"handoff CA alone", []edit{{specFile, "gives: [ADMIN_EMAIL]", "gives: [KIT_TLS_CA]"}}, nil, "which it does not give"},
 		{"k8s schema without sql", []edit{{specFile, "kubernetes: { chart: deploy/chart, postgres_modes: [external, cnpg] }", "kubernetes: { chart: deploy/chart, postgres_modes: [external, cnpg], schema: { url_env: DATABASE_URL, image: postgres } }"}}, nil, "shapes.kubernetes.schema: needs a database whose schema_compat provider is sql"},
 		{"bad requires", []edit{{specFile, `requires: ">=0.1 <1"`, `requires: "~0.1"`}}, nil, "stowage.requires: \"~0.1\": a comparator starts with"},
 		{"lock outside requires", []edit{{specFile, `requires: ">=0.1 <1"`, `requires: ">0.1"`}}, nil, "pins stowage 0.1.0, which stowage.requires (>0.1) does not accept"},
@@ -181,6 +202,7 @@ func TestEachRuleFiresOnFull(t *testing.T) {
 		write map[string]string
 		want  string
 	}{
+		{"handoff file input", []edit{{sp, "cmd: [handoff.py, issue], env: []", "cmd: [handoff.py, issue], env: [API_CA_BUNDLE]"}}, nil, "is a file input"},
 		{"absolute path", []edit{{sp, "compose: deploy/compose.yaml", "compose: /etc/compose.yaml"}}, nil, "must be relative to the project root"},
 		{"audit unsigned", []edit{{sp, "provider: cosign-key\n  key: env://ATLAS_SIGNING_KEY", "provider: none\n  key: env://ATLAS_SIGNING_KEY"}}, nil, "audit: a project that signs no release"},
 		{"audit fail_on", []edit{{sp, "fail_on: critical", "fail_on: none"}}, nil, `audit.fail_on: "none": one of negligible`},

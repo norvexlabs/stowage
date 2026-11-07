@@ -162,6 +162,19 @@ grep -q 'tip: the extension atlas-search' "$WORK/search-off.log" || { cat "$WORK
 [[ $(sed -n 's/^ADMIN_API_KEY=//p' "$D/credentials.txt") == "$key" ]] || fail "a re-run minted a new API key: what the hook returned was not handed back"
 atlas_running "$V1" 1
 
+step "kit create: asked --name, given by flags; the kit taken by --kit reaches the api; kit check; the search input cleared again"
+printf 'SITE_SEARCH_TOKEN: the-token\n' >"$WORK/kit-answers.yaml"
+"${CTL[@]}" kit create search-client --dir "$D" --name site-2 --set SITE_SEARCH_URL=http://api:9090 --answers "$WORK/kit-answers.yaml" -o "$WORK/search.kit" >"$WORK/kit.log" 2>&1 || { cat "$WORK/kit.log"; fail "kit create"; }
+sed -n 's/^code  //p' "$WORK/kit.log" >"$WORK/search.code"
+"${CTL[@]}" --dir "$D" --no-input --kit "$WORK/search.kit" --kit-code-file "$WORK/search.code" >"$WORK/kit-on.log" 2>&1 || { cat "$WORK/kit-on.log"; fail "--kit"; }
+grep -q 'changing SEARCH_URL: "" → http://api:9090' "$WORK/kit-on.log" || { cat "$WORK/kit-on.log"; fail "the kit's change was not logged"; }
+[[ $(status search) == True ]] || { stack_logs >&2; fail "the api does not reach SEARCH_URL from the kit"; }
+"${CTL[@]}" kit check search-client site-2 --dir "$D" | grep -q 'proven$' || fail "kit check of a site"
+rc=0; "${CTL[@]}" kit check search-client site-unknown --dir "$D" >/dev/null 2>&1 || rc=$?
+[[ $rc == 2 ]] || fail "kit check of an unknown site exited $rc, not 2"
+"${CTL[@]}" --dir "$D" --no-input --set SEARCH_URL= >"$WORK/kit-off.log" 2>&1 || { cat "$WORK/kit-off.log"; fail "re-run --set SEARCH_URL="; }
+atlas_running "$V1" 1
+
 step "the L4 routes: the echo service over TCP and UDP on 17007, published beside the front, then on one address; an optional service its input turns on"
 # echo_l4 tcp|udp: what the echo service sends back for "ping" (TCP: prefixed by its endpoint).
 echo_l4() {

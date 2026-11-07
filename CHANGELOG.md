@@ -27,8 +27,16 @@ follow [SemVer](https://semver.org/).
   takes inputs and TLS material sealed with a code, which comes from `--kit-code-file`,
   `STOWAGE_KIT_CODE` or the terminal. A kit is refused with the wrong code, when changed, for another
   project or once expired; an input meant for another shape is left out and said.
+- Projects declare `handoffs`, and `kit create` issues a kit from a one-shot container on every shape,
+  writing it 0600 and printing its code once; `kit check` runs the handoff's check, exiting 0 proven,
+  2 unknown, 1 not proven. On Kubernetes the values reach no pod log, and their Secret is deleted.
 - The Docker install takes `--given` too. On Docker and the VM, an input given for another shape is
   left out and said, instead of refused.
+
+### Changed
+
+- On Kubernetes, an extension's tip names `k8s upgrade --kit` or `--given` to give its endpoint, in
+  place of uninstalling the release.
 
 ### Fixed
 

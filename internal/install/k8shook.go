@@ -44,12 +44,33 @@ var (
 const unschedulable = "its pod cannot be scheduled: "
 
 // hookJob names the provision Job: a Job's name is a pod label, at most 63 characters.
-func (k K8sOptions) hookJob() string { return k.Release + "-stowage" }
+func (k K8sOptions) hookJob() string {
+	if k.kit != "" {
+		return k.Release + "-stowage-kit-" + k.kit
+	}
+	return k.Release + "-stowage"
+}
 
 // hookName names what the provision hook keeps between runs: the Secret of what it returned, the
 // ServiceAccount (and its Role and RoleBinding) that may patch that Secret alone, and the
 // ConfigMap the chart may render to give the hook more environment.
-func (k K8sOptions) hookName() string { return k.Release + "-stowage-provision" }
+func (k K8sOptions) hookName() string {
+	if k.kit != "" {
+		return k.Release + "-stowage-kit-" + k.kit
+	}
+	return k.provisionName()
+}
+
+// provisionName names the provision hook's objects, and the chart's ConfigMap a hook and a handoff read.
+func (k K8sOptions) provisionName() string { return k.Release + "-stowage-provision" }
+
+// kubectlWhere is what a printed kubectl command needs to reach the release.
+func (k K8sOptions) kubectlWhere() string {
+	if k.Context != "" {
+		return "--namespace " + shellQuote(k.Namespace) + " --context " + shellQuote(k.Context)
+	}
+	return "--namespace " + shellQuote(k.Namespace)
+}
 
 // hookImageOf is the release's installer image, by the digest the release manifest in the registry
 // at prefix records under the release's tag: the installer runs from its own image in the Job. The
@@ -93,6 +114,10 @@ type k8sHookPlan struct {
 	prefix string // the registry the release pulls from
 	ctl    string // the installer image
 	pull   string // the release's pull Secret; empty: none
+	// A handoff's step: what it receives beside the keys it lists, and that its Job records its exit
+	// status in the Secret, in place of its stdout's values.
+	vars     map[string]string
+	exitOnly bool
 }
 
 // k8sHookPlanFor reads what a run of the hook needs on the release just deployed from prefix: nil
@@ -376,14 +401,19 @@ var hookGrants = [][2]string{
 // checkHookGrants refuses, before anything changes, a run whose account may not do what the hook's
 // run does in the namespace. The questions are asked at once.
 func (in *Installer) checkHookGrants(ctx context.Context) error {
+	return in.checkGrants(ctx, hookGrants, "the provision hook runs as a Job of its own", " (`--no-provision` deploys without it)")
+}
+
+// checkGrants asks whether this account holds grants, each a verb and a resource, naming what lacks.
+func (in *Installer) checkGrants(ctx context.Context, grants [][2]string, what, hint string) error {
 	k := in.O.K8s
-	no := make([]bool, len(hookGrants))
-	errs := make([]error, len(hookGrants))
+	no := make([]bool, len(grants))
+	errs := make([]error, len(grants))
 	ask := func(i int) {
 		// `kubectl auth can-i` prints yes (exit 0) or no (exit 1) on stdout; anything else, an
 		// exit 1 without that answer included, is that it could not ask.
 		var out bytes.Buffer
-		args := append([]string{"auth", "can-i"}, strings.Fields(hookGrants[i][0]+" "+hookGrants[i][1])...)
+		args := append([]string{"auth", "can-i"}, strings.Fields(grants[i][0]+" "+grants[i][1])...)
 		_, err := in.kubectl(ctx, Cmd{Args: args, Stdout: &out})
 		switch answer := strings.TrimSpace(out.String()); {
 		case err == nil && answer == "yes":
@@ -400,7 +430,7 @@ func (in *Installer) checkHookGrants(ctx context.Context) error {
 	ask(0)
 	if errs[0] == nil {
 		var wg sync.WaitGroup
-		for i := 1; i < len(hookGrants); i++ {
+		for i := 1; i < len(grants); i++ {
 			wg.Go(func() { ask(i) })
 		}
 		wg.Wait()
@@ -409,13 +439,13 @@ func (in *Installer) checkHookGrants(ctx context.Context) error {
 		return err
 	}
 	var missing []string
-	for i, g := range hookGrants {
+	for i, g := range grants {
 		if no[i] {
 			missing = append(missing, g[0]+" "+g[1])
 		}
 	}
 	if len(missing) > 0 {
-		return fmt.Errorf("the provision hook runs as a Job of its own, and this account may not, in %s: %s (`--no-provision` deploys without it)", k.Namespace, strings.Join(missing, ", "))
+		return fmt.Errorf("%s, and this account may not, in %s: %s%s", what, k.Namespace, strings.Join(missing, ", "), hint)
 	}
 	return nil
 }
@@ -724,6 +754,9 @@ func (in *Installer) hookJobObject(p *k8sHookPlan, env, outs map[string]string, 
 	for _, kv := range [][2]string{{"STOWAGE_NAME", s.Name}, {"STOWAGE_PROJECT_VERSION", m.ProjectVersion}, {"STOWAGE_REVISION", strconv.Itoa(m.Revision)}} {
 		vars = append(vars, map[string]any{"name": kv[0], "value": kv[1]})
 	}
+	for _, key := range sortedKeys(p.vars) {
+		vars = append(vars, map[string]any{"name": key, "value": p.vars[key]})
+	}
 	ref := func(secret, key string) map[string]any {
 		return map[string]any{"name": key, "valueFrom": map[string]any{"secretKeyRef": map[string]any{"name": secret, "key": key}}}
 	}
@@ -780,7 +813,7 @@ func (in *Installer) hookJobObject(p *k8sHookPlan, env, outs map[string]string, 
 		},
 		"containers": []any{
 			map[string]any{"name": "provision", "image": in.R.ImageRef(p.prefix, p.hook.Image), "command": run, "env": vars,
-				"envFrom": []any{map[string]any{"configMapRef": map[string]any{"name": name, "optional": true}}},
+				"envFrom": []any{map[string]any{"configMapRef": map[string]any{"name": k.provisionName(), "optional": true}}},
 				// Non-root, as the restricted Pod Security standard requires: the image's own user.
 				"securityContext": map[string]any{"runAsNonRoot": true, "allowPrivilegeEscalation": false, "capabilities": map[string]any{"drop": []string{"ALL"}}},
 				"volumeMounts":    []any{shared}},
@@ -794,6 +827,12 @@ func (in *Installer) hookJobObject(p *k8sHookPlan, env, outs map[string]string, 
 					map[string]any{"name": "token", "mountPath": tokenMount, "readOnly": true},
 				}},
 		},
+	}
+	if p.exitOnly {
+		containers := pod["containers"].([]any)
+		hook, record := containers[0].(map[string]any), containers[1].(map[string]any)
+		record["command"] = append(record["command"].([]string), "--exit-key", kitExitKey)
+		hook["command"] = slices.Insert(slices.Clone(run), 3, "--discard-stdout")
 	}
 	if len(inputFiles) > 0 {
 		pod["volumes"] = append(pod["volumes"].([]any), map[string]any{"name": "inputs", "secret": map[string]any{"secretName": k.filesSecret(), "defaultMode": 0o444, "items": inputFiles}})

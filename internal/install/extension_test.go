@@ -133,7 +133,7 @@ func TestFinishedSaysNothingOfTheRegistryUnlessItAnswers(t *testing.T) {
 	}
 	p.out.Reset()
 	p.installer(nil).Finished(context.Background(), onDocker)
-	if out := p.out.String(); strings.Contains(out, "not published") || strings.Count(out, "tip: ") != 2 || !strings.Contains(out, "notes-search-installer:latest") {
+	if out := p.out.String(); strings.Contains(out, "not published") || strings.Count(out, "tip: the extension ") != 2 || !strings.Contains(out, "notes-search-installer:latest") {
 		t.Errorf("refused:\n%s", out)
 	}
 }
@@ -151,7 +151,7 @@ func TestFinishedBoundsTheRegistryCheck(t *testing.T) {
 	}
 	start := time.Now()
 	p.installer(nil).Finished(context.Background(), onDocker)
-	if d := time.Since(start); d > 2*time.Second || strings.Count(p.out.String(), "tip: ") != 2 || strings.Contains(p.out.String(), "not published") {
+	if d := time.Since(start); d > 2*time.Second || strings.Count(p.out.String(), "tip: the extension ") != 2 || strings.Contains(p.out.String(), "not published") {
 		t.Errorf("after %s:\n%s", d, p.out)
 	}
 }
@@ -169,7 +169,7 @@ func TestK8sDeployPrintsTheServiceEndpointAndTips(t *testing.T) {
 	for _, want := range []string{
 		"endpoint  http://notes-api.notes.svc:8000 (the URL a project using notes as an extension is given)\n",
 		"  install it: docker run --rm " + e.prefix + "/notes-search-installer:latest > notes-search.sh && sh notes-search.sh k8s install\n" +
-			"  then give its endpoint: the release takes it at a new install: `helm uninstall notes --namespace notes` (its Secret is kept), then SEARCH_KEY=<its key> notes-stow k8s install --namespace notes --release notes --set SEARCH_URL=<its endpoint>\n",
+			"  then give its endpoint: notes-stow k8s upgrade --namespace notes --release notes --kit FILE, for a kit it issued, or --given FILE, for a file holding `project: notes` and `inputs: {SEARCH_URL: <its endpoint>, SEARCH_KEY: <its key>}`\n",
 		"tip: the extension notes-kube (Cluster only) is off: KUBE_URL is empty\n" +
 			"  " + e.prefix + "/notes-kube-installer is not published on the stable channel\n",
 	} {

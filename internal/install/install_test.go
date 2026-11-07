@@ -54,8 +54,12 @@ type fakeDocker struct {
 	// hookSaved is provision.env once the hook printed its output, before it exited.
 	hookSaved string
 	hookStop  func() // stops the run as the installer would (its context), after the output
-	leftover  string // the service whose container is there before the run
-	rmErr     error
+	// kitOut is what a handoff's step prints on stdout, then fails with kitErr; kitEnv its environment.
+	kitOut   string
+	kitErr   error
+	kitEnv   []string
+	leftover string // the service whose container is there before the run
+	rmErr    error
 	// dump is what pg_dump writes, then fails with dumpErr.
 	dump    string
 	dumpErr error
@@ -226,6 +230,12 @@ func (f *fakeDocker) Run(_ context.Context, c Cmd) ([]byte, error) {
 		}
 		f.loaded[c.Args[len(c.Args)-1]] = "sha256:pulled"
 		return nil, nil
+	case strings.Contains(a, " run --rm --no-deps -T --name ") && strings.HasSuffix(a, " "+KitService):
+		f.kitEnv = c.Env
+		if _, err := io.WriteString(c.Stdout, f.kitOut); err != nil {
+			return nil, err
+		}
+		return nil, f.kitErr
 	case strings.Contains(a, " run --rm --no-deps -T --name ") && strings.HasSuffix(a, " "+ProvisionService):
 		raw, err := os.ReadFile(filepath.Join(c.Args[2], ProvisionEnv))
 		if err != nil {

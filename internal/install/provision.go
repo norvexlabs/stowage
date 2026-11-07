@@ -215,7 +215,7 @@ func (in *Installer) lockRun(ctx context.Context, env *EnvFile) (func(), error) 
 // leftovers refuses a run while a provision or schema container an earlier run left is there:
 // its fixed name would fail the run's own.
 func (in *Installer) leftovers(ctx context.Context, env *EnvFile) error {
-	for _, svc := range []string{ProvisionService, SchemaService} {
+	for _, svc := range []string{ProvisionService, SchemaService, KitService} {
 		name := containerName(env, svc)
 		if _, err := in.O.Docker.Run(ctx, Cmd{Args: []string{"container", "inspect", "--format", "{{.State.Status}}", name}}); err == nil {
 			return fmt.Errorf("the container %s of an earlier run is still there: once it is not running anything you need, `docker rm --force %s`, then run again", name, name)

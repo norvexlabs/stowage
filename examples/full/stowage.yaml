@@ -202,6 +202,17 @@ hooks:
       post: http://api:9090/api/v1/maintenance/purge
       auth_secret: INTERNAL_SERVICE_SECRET
 
+handoffs:                                                      # kit create: what another install of atlas takes with --kit
+  - name: search-client
+    for: atlas
+    instance: "The site this kit is for"                       # asked when --name does not give it
+    ask:
+      - { key: SITE_SEARCH_URL, prompt: "The search service's URL at that site" }
+      - { key: SITE_SEARCH_TOKEN, prompt: "The token that site's search service gave", secret: true }  # never a --set
+    run: { image: provision, cmd: [handoff.py, issue], env: [] }
+    gives: [SEARCH_URL]
+    check: { image: provision, cmd: [handoff.py, check], env: [] }
+
 # Search is an app of its own, published beside atlas: an install takes its URL (and its key).
 extensions:
   - { name: atlas-search, input: SEARCH_URL, key_input: SEARCH_KEY, prompt: "Full-text search over the events" }

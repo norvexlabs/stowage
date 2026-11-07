@@ -112,6 +112,8 @@ type Options struct {
 	// PEM the TLS options read when they name it (readPEM).
 	Given    *Given
 	givenTLS *GivenTLS
+	// kitWork is the work factor a kit is sealed at; zero is kit.WorkFactor (a test's lower one).
+	kitWork int
 	// Prompt asks for an input nothing else gave; nil takes its default.
 	Prompt Prompter
 

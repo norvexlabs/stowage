@@ -26,6 +26,8 @@ import (
 
 // K8sOptions is one run of `<short>-stow k8s`.
 type K8sOptions struct {
+	// kit, set for one handoff's run, names the hook's objects after that handoff.
+	kit       string
 	Namespace string // the release's namespace
 	Release   string // the helm release's name
 	Context   string // the kubeconfig context; empty is the current one
@@ -672,6 +674,7 @@ func (in *Installer) k8sFinished(ctx context.Context, env map[string]string, pre
 		}
 		return env[key], true
 	})
+	in.kitTips(onK8s)
 }
 
 // helmDeploy is the helm command that installs or upgrades the release with chart, waiting for it
@@ -992,6 +995,13 @@ func (in *Installer) K8sStatus(ctx context.Context) error {
 	fmt.Fprintf(o.Out, "%s %s (revision %d, %s)\nregistry  %s\n", r.Name, r.Version, r.Revision, r.Channel, cur.Registry)
 	if url := in.k8sEndpoint(); url != "" {
 		fmt.Fprintf(o.Out, "endpoint  %s\n", url)
+	}
+	left, err := in.k8sKitLeftovers(ctx)
+	if err != nil {
+		o.logf("the handoffs' leftovers could not be read: %v", err)
+	}
+	for _, name := range left {
+		fmt.Fprintf(o.Out, "leftover  the Secret %s holds what a handoff's run gave, a run under way or one interrupted: once none runs, `kubectl delete job/%s secret/%s --ignore-not-found %s` deletes it\n", name, name, name, k.kubectlWhere())
 	}
 	_, err = in.helm(ctx, Cmd{Args: []string{"status", k.Release}, Stdout: o.Out})
 	return err

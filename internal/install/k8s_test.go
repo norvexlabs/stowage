@@ -50,17 +50,20 @@ type fakeKube struct {
 	namespace bool   // the namespace exists
 	nsErr     error  // reading the namespace fails
 	// podSecurity is the namespace's Pod Security enforce label.
-	podSecurity string
-	calls       [][]string
-	applied     []map[string]any // the objects kubectl applied
-	chart       []byte           // the chart helm was given
-	given       []string         // the values files helm was given, read when it ran
-	upErr       error            // `helm upgrade` and `helm rollback` fail
-	manifest    string           // `helm get manifest`
-	claims      []string         // the PersistentVolumeClaims `kubectl get` lists
-	deleteErr   error            // `kubectl delete` fails
-	uninstErr   error            // `helm uninstall` fails
-	rolloutErr  error            // `kubectl rollout` fails
+	podSecurity  string
+	calls        [][]string
+	applied      []map[string]any // the objects kubectl applied
+	chart        []byte           // the chart helm was given
+	given        []string         // the values files helm was given, read when it ran
+	upErr        error            // `helm upgrade` and `helm rollback` fail
+	manifest     string           // `helm get manifest`
+	claims       []string         // the PersistentVolumeClaims `kubectl get` lists
+	deleteErr    error            // `kubectl delete` fails
+	deleteJobErr error            // `kubectl delete job` fails
+	kitReadErrs  int              // reads of a kit's Secret that fail, once a Job was created
+	createErr    error            // `kubectl create` fails
+	uninstErr    error            // `helm uninstall` fails
+	rolloutErr   error            // `kubectl rollout` fails
 	// The provision hook's Job.
 	outputs string         // `kubectl get secret` of the outputs Secret
 	job     string         // `kubectl get job`: a Job an earlier run left; set to the created one
@@ -155,8 +158,14 @@ func (k kubeTool) Run(_ context.Context, c Cmd) ([]byte, error) {
 		if a[1] == "job" {
 			f.job = ""
 		}
+		if a[1] == "job" && f.deleteJobErr != nil {
+			return nil, f.deleteJobErr
+		}
 		return nil, f.deleteErr
 	case "kubectl create":
+		if f.createErr != nil {
+			return nil, f.createErr
+		}
 		if f.sql != nil {
 			raw, _ := io.ReadAll(c.Stdin)
 			var pod struct {
@@ -266,7 +275,10 @@ func (k kubeTool) Run(_ context.Context, c Cmd) ([]byte, error) {
 			return []byte(cmp.Or(f.pods, `{"items": []}`)), nil
 		case strings.HasSuffix(a[2], "-pull"):
 			return []byte(f.pull), nil
-		case strings.HasSuffix(a[2], "-stowage-provision"):
+		case strings.Contains(a[2], "-stowage-kit-") && f.created != nil && f.kitReadErrs > 0:
+			f.kitReadErrs--
+			return nil, errors.New("the connection to the server was refused")
+		case strings.HasSuffix(a[2], "-stowage-provision"), strings.Contains(a[2], "-stowage-kit-"):
 			return []byte(f.outputs), nil
 		case strings.HasSuffix(a[2], "-stowage-files"): // when objects names it, above
 			return nil, nil

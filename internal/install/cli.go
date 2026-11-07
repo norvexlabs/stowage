@@ -283,6 +283,9 @@ func newCommand(r *Release, self string, stdout, stderr io.Writer, tools K8sOpti
 	prov.Flags().StringArrayVar(&sets, "set", nil, "correct an input only the hook reads, or set a value it returned or declares it returns (empty forgets it), KEY=VALUE (repeatable)")
 	dirFlag(prov)
 	root.AddCommand(prov)
+	if c := kitCommand(r, stdout, stderr, terminal, dockerKitVerbs(in, prepare, dirFlag)); c != nil {
+		root.AddCommand(c)
+	}
 	up := &cobra.Command{
 		Use:   "upgrade",
 		Short: fmt.Sprintf("Move an install of an earlier %s release to %s (dumps the database first; `rollback` goes back)", name, r.Manifest.ProjectVersion),
@@ -403,7 +406,8 @@ func newCommand(r *Release, self string, stdout, stderr io.Writer, tools K8sOpti
 	root.AddCommand(auditCommand(in, &o, prepare, dirFlag, stdout), sbomCommand(in, &o, prepare, dirFlag, stdout))
 	root.AddCommand(tuneCommand(in, prepare, terminal, false))
 	root.AddCommand(dockerHostCommands(in, prepare, dirFlag, stdout, stderr, terminal)...)
-	if r.Spec.Shapes.Kubernetes != nil && r.Spec.Hooks.Provision != nil {
+	// What a hook's Job and a handoff's Job run.
+	if r.Spec.Shapes.Kubernetes != nil && (r.Spec.Hooks.Provision != nil || len(r.Spec.Handoffs) > 0) {
 		root.AddCommand(k8sHookPodCommand(stderr))
 	}
 	root.AddCommand(&cobra.Command{
@@ -504,6 +508,11 @@ func k8sCommand(in *Installer, o *Options, prepare func() error, terminal func(b
 		},
 	}
 	deployFlags(up, &upTimeout, 6*time.Minute, "an input this release adds, KEY=VALUE (repeatable)", "a file input this release adds, KEY=PATH (repeatable)")
+	if c := kitCommand(in.R, o.Out, o.Log, terminal, k8sKitVerbs(in, o, func(cmd *cobra.Command, f func(context.Context) error) error {
+		return run(cmd, 0, false, f)
+	})); c != nil {
+		k.AddCommand(c)
+	}
 	up.Flags().StringVar(&to, "version", "", "fetch the installer of this version (its latest revision, on the release's channel) from the release's registry, and upgrade with it")
 	back := &cobra.Command{
 		Use:   "rollback",

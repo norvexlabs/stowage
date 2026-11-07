@@ -18,6 +18,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -62,15 +63,17 @@ func k8sHookPodCommand(stderr io.Writer) *cobra.Command {
 	})
 	var dir string
 	var timeout time.Duration
+	var discardStdout bool
 	run := &cobra.Command{
 		Use:  "run -- CMD…",
 		Args: cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return hookRun(cmd.Context(), dir, timeout, args, stderr)
+			return hookRunTo(cmd.Context(), dir, timeout, args, stderr, discardStdout)
 		},
 	}
 	run.Flags().StringVar(&dir, "dir", "", "the shared volume")
 	run.Flags().DurationVar(&timeout, "timeout", provisionTimeout, "how long the hook may run")
+	run.Flags().BoolVar(&discardStdout, "discard-stdout", false, "its stdout says nothing: a check's, whose exit status alone is read")
 	c.AddCommand(run)
 	var r hookRecorder
 	var reserved string
@@ -108,15 +111,17 @@ func k8sHookPodCommand(stderr io.Writer) *cobra.Command {
 	f.StringVar(&r.namespace, "namespace", "", "the release's namespace")
 	f.StringVar(&r.secret, "secret", "", "the outputs Secret")
 	f.StringVar(&reserved, "reserved", "", "the keys the install records, comma-separated: never a hook's")
+	f.StringVar(&r.exitKey, "exit-key", "", "record the hook's exit status under this key, in place of what its stdout holds, and end well")
 	c.AddCommand(rec)
 	return c
 }
 
-// hookRun runs the hook argv with its stdout to dir's hookOutFile (at most maxProvisionOut bytes and
-// one more, which tells `record` it wrote too much; past that it is stopped), its stderr to the
-// pod's log, for at most timeout, then records how it ended in hookStatusFile. It fails only when
-// it cannot record that: `record` reports the hook's own failure, after keeping what it returned.
-func hookRun(ctx context.Context, dir string, timeout time.Duration, argv []string, stderr io.Writer) error {
+// hookRunTo runs the hook argv with its stdout to dir's hookOutFile (at most maxProvisionOut bytes and
+// one more, which tells `record` it wrote too much; past that it is stopped), or thrown away, unbounded,
+// when discard says; its stderr to the pod's log, for at most timeout, then records how it ended in
+// hookStatusFile. It fails only when it cannot record that: `record` reports the hook's own failure,
+// after keeping what it returned.
+func hookRunTo(ctx context.Context, dir string, timeout time.Duration, argv []string, stderr io.Writer, discard bool) error {
 	out, err := os.OpenFile(filepath.Join(dir, hookOutFile), os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
 	if err != nil {
 		return err
@@ -131,7 +136,10 @@ func hookRun(ctx context.Context, dir string, timeout time.Duration, argv []stri
 	} else {
 		c := exec.CommandContext(runCtx, path, argv[1:]...)
 		c.Args[0] = argv[0]
-		c.Stdout, c.Stderr, c.Env = capped, stderr, os.Environ()
+		c.Stderr, c.Env = stderr, os.Environ()
+		if !discard {
+			c.Stdout = capped // else /dev/null: no pipe a background child can hold open
+		}
 		c.Cancel = func() error { return c.Process.Signal(syscall.SIGTERM) }
 		c.WaitDelay = 10 * time.Second
 		err := c.Run()
@@ -207,7 +215,8 @@ func (c *capWriter) Write(p []byte) (int, error) {
 // outputs Secret.
 type hookRecorder struct {
 	dir, prev, token, namespace, secret string
-	check                               bool // only the empty patch
+	check                               bool   // only the empty patch
+	exitKey                             string // record the hook's exit status alone, under this key
 	reserved                            map[string]bool
 	log                                 io.Writer
 	client                              *http.Client // nil: one trusting the cluster's CA
@@ -231,6 +240,9 @@ var hookFinalFlush = 2 * time.Minute
 // refused, or when what it read could not be recorded. A last line without a line break counts only
 // from a hook that exited 0.
 func (r *hookRecorder) record(ctx context.Context) error {
+	if r.exitKey != "" {
+		return r.recordExit(ctx)
+	}
 	outs, err := readPrev(r.prev)
 	if err != nil {
 		return err
@@ -329,6 +341,41 @@ func (r *hookRecorder) record(ctx context.Context) error {
 		errs = append([]error{fmt.Errorf("the hook exited %d", st.Exit)}, errs...)
 	}
 	return errors.Join(errs...)
+}
+
+// recordExit waits for the hook to end and records its exit status alone. A hook that could not start
+// or was stopped records -1, which no check's exit says "proven" or "unknown".
+func (r *hookRecorder) recordExit(ctx context.Context) error {
+	for {
+		st, err := readStatus(r.dir)
+		if err != nil {
+			return err
+		}
+		if st != nil {
+			exit := st.Exit
+			if st.Stopped != "" {
+				exit = -1
+				fmt.Fprintf(r.log, "the check did not finish: %s\n", st.Stopped)
+			}
+			// Tried again for a while, as the last values of a run are: it is what the check said.
+			data := map[string]string{r.exitKey: strconv.Itoa(exit)}
+			err := r.patch(ctx, data)
+			var final refusedPatch
+			for end := time.Now().Add(hookFinalFlush); err != nil && !errors.As(err, &final) && ctx.Err() == nil && time.Now().Before(end); {
+				select {
+				case <-ctx.Done():
+				case <-time.After(hookFollow):
+					err = r.patch(ctx, data)
+				}
+			}
+			return wrapPatch(r.secret, err)
+		}
+		select {
+		case <-ctx.Done():
+			return errors.New("the check did not finish: the pod was stopped")
+		case <-time.After(hookFollow):
+		}
+	}
 }
 
 // refusedPatch is an answer of the API server that trying again cannot change (a 4xx).
@@ -438,7 +485,7 @@ func (r *hookRecorder) patch(ctx context.Context, data map[string]string) error 
 		}
 		_ = json.Unmarshal(msg, &s)
 		last = fmt.Errorf("the API server answered %s: %s", resp.Status, s.Message)
-		if resp.StatusCode < 500 {
+		if resp.StatusCode < 500 && resp.StatusCode != http.StatusRequestTimeout && resp.StatusCode != http.StatusTooManyRequests {
 			return refusedPatch{last} // the same patch again would be refused again
 		}
 	}

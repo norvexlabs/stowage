@@ -393,6 +393,9 @@ func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(
 		},
 	}
 	prov.Flags().StringArrayVar(&provSets, "set", nil, "correct an input only the hook reads, or set a value it returned or declares it returns (empty forgets it), KEY=VALUE (repeatable)")
+	if k := kitCommand(r, stdout, stderr, terminal, vmKitVerbs(c, stderr)); k != nil {
+		root.AddCommand(k)
+	}
 	var channel, version string
 	var yes, noReboot, skipBackup bool
 	updates := &cobra.Command{

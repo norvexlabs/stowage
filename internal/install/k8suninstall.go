@@ -103,7 +103,15 @@ func (in *Installer) K8sUninstall(ctx context.Context) error {
 	}
 	var owned []k8sOwned
 	var foreign []string
-	for _, ob := range k.k8sOwnedObjects() {
+	objects := k.k8sOwnedObjects()
+	// A handoff's objects are deleted with its run; one killed leaves them.
+	for _, h := range in.R.Spec.Handoffs {
+		kk := k
+		kk.kit = h.Name
+		name := kk.hookName()
+		objects = append(objects, k8sOwned{"job", name}, k8sOwned{"rolebinding", name}, k8sOwned{"role", name}, k8sOwned{"serviceaccount", name}, k8sOwned{"secret", name})
+	}
+	for _, ob := range objects {
 		exists, ours, err := in.ownedState(ctx, ob)
 		switch {
 		case err != nil:

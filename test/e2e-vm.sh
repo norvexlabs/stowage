@@ -273,6 +273,18 @@ ip=$(getent hosts "$ADDR" | awk '{print $1; exit}')
 code=$(curl -sk -o /dev/null -w '%{http_code}' --resolve "app.notes.test:443:$ip" https://app.notes.test/)
 [[ $code =~ ^[23] ]] || fail "https://app.notes.test/ on the VM answered $code"
 
+step "kit create on the VM, through the daemon; the kit taken by install --kit; kit check"
+on_vm sudo notes-stow kit create second-site --name site-2 --set SITE_ADMIN=second@notes.test -o /tmp/site.kit >"$WORK/kit.log" 2>&1 || { cat "$WORK/kit.log"; fail "kit create on the VM"; }
+code=$(sed -n 's/^code  //p' "$WORK/kit.log")
+[[ -n $code ]] || { cat "$WORK/kit.log"; fail "kit create printed no code"; }
+printf '%s\n' "$code" | on_vm sudo sh -c "'umask 077; cat >/tmp/site.code'" || fail "writing the code on the VM"
+on_vm sudo notes-stow install --kit /tmp/site.kit --kit-code-file /tmp/site.code --no-input >"$WORK/kit-take.log" 2>&1 || { cat "$WORK/kit-take.log"; fail "install --kit on the VM"; }
+grep -qF 'changing ADMIN_EMAIL: ' "$WORK/kit-take.log" || { cat "$WORK/kit-take.log"; fail "the change was not logged"; }
+on_vm sudo notes-stow kit check second-site site-2 | grep -q 'proven$' || fail "kit check of a site"
+rc=0; on_vm sudo notes-stow kit check second-site site-unknown >/dev/null 2>&1 || rc=$?
+[[ $rc == 2 ]] || fail "kit check of an unknown site exited $rc, not 2"
+on_vm sudo rm -f /tmp/site.kit /tmp/site.code
+
 step "reset-db on the VM: the data wiped and provisioned again, without a reboot"
 on_vm sudo docker exec "$api" touch /data/uploads/marker || fail "no marker written in the uploads volume"
 pw=$(on_vm sudo grep '^ADMIN_PASSWORD=' /usr/local/notes/provision.env) || fail "the VM's install recorded no ADMIN_PASSWORD"

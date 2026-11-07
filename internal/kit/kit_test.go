@@ -275,3 +275,26 @@ func FuzzParse(f *testing.F) {
 		}
 	})
 }
+
+func TestNewCode(t *testing.T) {
+	t.Parallel()
+	a, err := NewCode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := NewCode()
+	if a == b {
+		t.Error("two codes alike")
+	}
+	// 160 bits as base32: 32 characters of 5 bits each, grouped by four.
+	if n := len(strings.ReplaceAll(a, "-", "")); n != 32 || strings.Count(a, "-") != 7 {
+		t.Errorf("%q", a)
+	}
+	raw, err := Seal(sample(), a, fast)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(raw, a); err != nil {
+		t.Error(err)
+	}
+}

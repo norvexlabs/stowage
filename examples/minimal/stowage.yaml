@@ -78,6 +78,14 @@ hooks:
     cmd: [notes-api, create-admin]
     env: [ADMIN_EMAIL]
 
+handoffs:                                                    # kit create: what another install of notes takes with --kit
+  - name: second-site
+    for: notes
+    ask: [{ key: SITE_ADMIN, prompt: "The second site's administrator" }]
+    run: { image: api, cmd: [notes-api, kit-issue], env: [] }   # KEY=VALUE lines out, as the provision hook's
+    gives: [ADMIN_EMAIL]
+    check: { image: api, cmd: [notes-api, kit-check], env: [] } # exit 0 proven, 2 unknown, other not proven
+
 backup:
   provider: pg-age-rclone
   profiles: { full: all }

@@ -52,6 +52,7 @@ func (in *Installer) Finished(ctx context.Context, shape string) {
 	}
 	prefix, _ := env.Get("STOWAGE_REGISTRY")
 	in.extensionTips(ctx, shape, prefix, func(key string) (string, bool) { return env.Get(key) })
+	in.kitTips(shape)
 }
 
 // dockerEndpoint is the URL the install serves the endpoint route at, as it records it: the
@@ -109,20 +110,21 @@ func (in *Installer) extensionTips(ctx context.Context, shape, prefix string, va
 			fmt.Fprintf(w, "  %s/%s-installer is not published on the %s channel\n", prefix, e.Name, channel)
 		}
 		get := fmt.Sprintf("docker run --rm %s/%s-installer:%s > %s.sh", prefix, e.Name, tag, e.Name)
-		// The endpoint is a --set; the key, a secret input, never is: an --answers file on a re-run
-		// (which reads no environment), the environment on a Kubernetes install.
+		// The endpoint is a --set; the key, a secret input, never is: an --answers file on a re-run,
+		// which reads no environment.
 		set := "--set " + e.Input + "=<its endpoint>"
-		key := ""
 		if e.KeyInput != "" {
 			set += " --answers <a file: " + e.KeyInput + ": <its key>>"
-			key = e.KeyInput + "=<its key> "
 		}
 		switch shape {
 		case onK8s:
 			fmt.Fprintf(w, "  install it: %s && sh %s.sh k8s install\n", get, e.Name)
-			// An upgrade keeps a recorded input: the endpoint is taken at an install.
-			fmt.Fprintf(w, "  then give its endpoint: the release takes it at a new install: `helm uninstall %s --namespace %s` (its Secret is kept), then %s%s --set %s=<its endpoint>\n",
-				in.O.K8s.Release, in.O.K8s.Namespace, key, in.k8sCtl("install"), e.Input)
+			// An upgrade keeps a recorded input unless it is given: a kit, or a file of the same form.
+			inputs := e.Input + ": <its endpoint>"
+			if e.KeyInput != "" {
+				inputs += ", " + e.KeyInput + ": <its key>"
+			}
+			fmt.Fprintf(w, "  then give its endpoint: %s --kit FILE, for a kit it issued, or --given FILE, for a file holding `project: %s` and `inputs: {%s}`\n", in.k8sCtl("upgrade"), in.R.Spec.Name, inputs)
 		case onVM:
 			fmt.Fprintf(w, "  install it: %s && sh %s.sh (Docker) or sh %s.sh vm create (a VM)\n", get, e.Name, e.Name)
 			fmt.Fprintf(w, "  then give its endpoint: sudo %s install %s\n", in.R.Ctl(), set)

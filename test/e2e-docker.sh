@@ -5,7 +5,7 @@
 #   make e2e-docker        (builds ./bin/stowage first)
 #
 # Walks examples/minimal, with a real Postgres, through: ship 1.0.0 → the bootstrap one-liner
-# installs it → a re-run changes nothing → `--given` replaces an input → backups to a WebDAV server through the release's
+# installs it → a re-run changes nothing → `--given` replaces an input, a kit issued and taken by --kit too → backups to a WebDAV server through the release's
 # runner (the dump and the uploads volume's archive), and a restore that brings both back → ship 2.0.0 (a migration) → `notes-stow upgrade --version
 # 2.0.0` fetches its installer and upgrades → rollback is allowed (1.0.0 reads the newer schema) →
 # ship 3.0.0 (a migration that is a rollback barrier) → upgrade → going back to 1.0.0 by upgrade
@@ -71,6 +71,31 @@ grep -q '^ADMIN_EMAIL=other@notes.test$' "$D/.env" || fail "--given did not repl
 grep -qF 'changing ADMIN_EMAIL: admin@notes.test → other@notes.test' "$WORK/given.log" || { cat "$WORK/given.log"; fail "the change was not logged"; }
 given admin@notes.test
 grep -q '^ADMIN_EMAIL=admin@notes.test$' "$D/.env" || fail "--given did not give the input back"
+running 1.0.0 1
+
+step "kit create: a kit for another install, taken by this one with --kit; kit check"
+"${CTL[@]}" kit create second-site --dir "$D" --name site-2 --set SITE_ADMIN=second@notes.test -o "$WORK/site.kit" >"$WORK/kit.log" 2>&1 || { cat "$WORK/kit.log"; fail "kit create"; }
+sed -n 's/^code  //p' "$WORK/kit.log" >"$WORK/site.code"
+[[ -s $WORK/site.code ]] || { cat "$WORK/kit.log"; fail "kit create printed no code"; }
+[[ $(stat -c %a "$WORK/site.kit") == 600 ]] || fail "the kit is not 0600"
+head -1 "$WORK/site.kit" | grep -q 'BEGIN AGE ENCRYPTED FILE' || fail "the kit is not armored age"
+! grep -qF second@notes.test "$WORK/site.kit" "$WORK/kit.log" || fail "a value in the clear"
+"${CTL[@]}" kit create second-site --dir "$D" --name site-2 --set SITE_ADMIN=x -o "$WORK/site.kit" >"$WORK/kit2.log" 2>&1 && fail "kit create replaced a file"
+grep -q 'never replaces a file' "$WORK/kit2.log" || { cat "$WORK/kit2.log"; fail "the refusal does not say why"; }
+"${CTL[@]}" --dir "$D" --no-input --kit "$WORK/site.kit" >"$WORK/kit3.log" 2>&1 && fail "--kit with --no-input and no code"
+grep -q 'nothing gives its code' "$WORK/kit3.log" || { cat "$WORK/kit3.log"; fail "the refusal does not name the code's sources"; }
+"${CTL[@]}" --dir "$D" --no-input --kit "$WORK/site.kit" --kit-code-file "$WORK/site.code" >"$WORK/kit4.log" 2>&1 || { cat "$WORK/kit4.log"; fail "--kit on a re-run"; }
+grep -q '^ADMIN_EMAIL=second@notes.test$' "$D/.env" || fail "--kit did not replace the recorded input"
+grep -qF 'changing ADMIN_EMAIL: admin@notes.test → second@notes.test' "$WORK/kit4.log" || { cat "$WORK/kit4.log"; fail "the change was not logged"; }
+! grep -qF "$(cat "$WORK/site.code")" "$WORK/kit4.log" || fail "the code reached the log"
+"${CTL[@]}" upgrade --dir "$D" --kit "$WORK/site.kit" >"$WORK/kit5.log" 2>&1 && fail "upgrade took --kit"
+grep -q -- '--kit: an upgrade takes none of it' "$WORK/kit5.log" || { cat "$WORK/kit5.log"; fail "the refusal does not name the re-run"; }
+given admin@notes.test
+"${CTL[@]}" kit check second-site site-2 --dir "$D" | grep -q 'proven$' || fail "kit check of a site"
+rc=0; "${CTL[@]}" kit check second-site site-unknown --dir "$D" >/dev/null 2>&1 || rc=$?
+[[ $rc == 2 ]] || fail "kit check of an unknown site exited $rc, not 2"
+rc=0; "${CTL[@]}" kit check second-site site-refused --dir "$D" >/dev/null 2>&1 || rc=$?
+[[ $rc == 1 ]] || fail "kit check of a refused site exited $rc, not 1"
 running 1.0.0 1
 
 step "audit on the Docker host: the release's SBOMs, scanned with its own scanner (the database given)"

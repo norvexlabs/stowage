@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/norvexlabs/stowage/internal/providers"
 	"github.com/norvexlabs/stowage/internal/spec"
 )
 
@@ -814,4 +815,106 @@ func nftDropsInput(text string) bool {
 		}
 	}
 	return false
+}
+
+// maxHandoffName bounds a handoff's name, which reaches a Kubernetes Job's, with the release's.
+const maxHandoffName = 24
+
+// handoffs checks the issuer's side of each handoff: a name, its target, its questions, its steps and
+// what it gives. The target's own inputs are its installer's to check: lint cannot see its spec.
+func (l *linter) handoffs() {
+	known := map[string]string{}
+	for _, i := range l.s.Inputs {
+		known[i.Key] = "an input"
+	}
+	for _, sec := range l.s.Secrets {
+		known[sec.Key] = "a secret"
+	}
+	for k := range l.s.SafeDefaults {
+		known[k] = "a safe default"
+	}
+	reservedKey := func(k string) bool { return strings.HasPrefix(k, "STOWAGE_") || strings.HasPrefix(k, "COMPOSE_") }
+	step := func(w string, st *spec.HandoffStep) {
+		if _, ok := l.s.Images[st.Image]; !ok {
+			l.errf(w+".image", "%q is not an images key", st.Image)
+		}
+		if len(st.Cmd) == 0 {
+			l.errf(w+".cmd", "is required")
+		}
+		seen := map[string]bool{}
+		for i, k := range st.Env {
+			kw := fmt.Sprintf("%s.env[%d]", w, i)
+			switch input, isInput := l.s.Input(k); {
+			case seen[k]:
+				l.errf(kw, "%s is listed twice", k)
+			case known[k] == "":
+				l.errf(kw, "%s is no input, secret or safe default", k)
+			case isInput && input.File():
+				l.errf(kw, "%s is a file input, which a handoff's step does not get: its run makes what it gives", k)
+			}
+			seen[k] = true
+		}
+	}
+	names := map[string]bool{}
+	for n, h := range l.s.Handoffs {
+		w := fmt.Sprintf("handoffs[%d]", n)
+		switch {
+		case !imageNameRe.MatchString(h.Name) || len(h.Name) > maxHandoffName:
+			l.errf(w+".name", "%q: lower-case letters, digits and '-', at most %d characters", h.Name, maxHandoffName)
+		case names[h.Name]:
+			l.errf(w+".name", "%s is the name of another handoff", h.Name)
+		}
+		names[h.Name] = true
+		if !imageNameRe.MatchString(h.For) {
+			l.errf(w+".for", "%q is not a project's name", h.For)
+		}
+		asked := map[string]bool{}
+		for i, a := range h.Ask {
+			aw := fmt.Sprintf("%s.ask[%d]", w, i)
+			switch {
+			case !providers.EnvName.MatchString(a.Key) || reservedKey(a.Key):
+				l.errf(aw+".key", "%q is not a variable name of the project's (STOWAGE_* and COMPOSE_* are the install's)", a.Key)
+			case asked[a.Key]:
+				l.errf(aw+".key", "%s is asked twice", a.Key)
+			case known[a.Key] != "":
+				l.errf(aw+".key", "%s is %s: the run receives it through its env", a.Key, known[a.Key])
+			}
+			asked[a.Key] = true
+			if a.Prompt == "" {
+				l.errf(aw+".prompt", "is required")
+			}
+		}
+		for i, k := range h.Gives {
+			if asked[k] {
+				l.errf(fmt.Sprintf("%s.gives[%d]", w, i), "%s is what the handoff asks, which the run receives: a kit holds what it issues, under another name", k)
+			}
+		}
+		step(w+".run", &h.Run)
+		if h.Check != nil {
+			step(w+".check", h.Check)
+		}
+		if len(h.Gives) == 0 {
+			l.errf(w+".gives", "is required: a kit holds what its run gives")
+		}
+		given := map[string]bool{}
+		for i, k := range h.Gives {
+			gw := fmt.Sprintf("%s.gives[%d]", w, i)
+			isTLS := slices.Contains([]string{spec.KitTLSCert, spec.KitTLSKey, spec.KitTLSCA, spec.KitTLSClientCA}, k)
+			switch {
+			case !providers.EnvName.MatchString(k) || reservedKey(k):
+				l.errf(gw, "%q is not a key a step's stdout may give (STOWAGE_* and COMPOSE_* are the install's)", k)
+			case strings.HasPrefix(k, "KIT_TLS_") && !isTLS:
+				l.errf(gw, "%s: KIT_TLS_ is for %s, %s, %s and %s", k, spec.KitTLSCert, spec.KitTLSKey, spec.KitTLSCA, spec.KitTLSClientCA)
+			case given[k]:
+				l.errf(gw, "%s is listed twice", k)
+			}
+			given[k] = true
+		}
+		if given[spec.KitTLSCert] != given[spec.KitTLSKey] {
+			l.errf(w+".gives", "%s and %s are given together", spec.KitTLSCert, spec.KitTLSKey)
+		}
+		if given[spec.KitTLSCA] && !given[spec.KitTLSCert] {
+			l.errf(w+".gives", "%s is the CA of %s, which it does not give", spec.KitTLSCA, spec.KitTLSCert)
+		}
+	}
 }

@@ -102,6 +102,25 @@ runs 1.0.0 2
 [[ $(kubectl get -n "$NS" secret notes-stowage -o jsonpath='{.data}') == "$secret" ]] || fail "an upgrade changed the Secret"
 [[ $(returned) == "$pw" ]] || fail "the hook minted another password: what it returned was not handed back"
 
+step "k8s kit create: a Job whose values reach no log, its Secret deleted; k8s upgrade --kit; k8s kit check"
+ctl v1.sh k8s kit create second-site --name site-2 --set SITE_ADMIN=second@notes.test -o site.kit >"$WORK/kit.log" 2>&1 || { cat "$WORK/kit.log"; cluster_logs >&2; fail "k8s kit create"; }
+sed -n 's/^code  //p' "$WORK/kit.log" >"$OP/site.code"
+[[ -s $OP/site.code ]] || { cat "$WORK/kit.log"; fail "k8s kit create printed no code"; }
+! grep -qF second@notes.test "$WORK/kit.log" "$OP/site.kit" || fail "a value in the clear"
+! kubectl get -n "$NS" secret notes-stowage-kit-second-site >/dev/null 2>&1 || fail "the kit's Secret is still there"
+! kubectl get -n "$NS" job notes-stowage-kit-second-site >/dev/null 2>&1 || fail "the kit's Job is still there"
+ctl v1.sh k8s upgrade --kit site.kit --kit-code-file site.code --no-input --timeout 3m >"$WORK/kit-up.log" 2>&1 || { cat "$WORK/kit-up.log"; cluster_logs >&2; fail "k8s upgrade --kit"; }
+[[ $(kubectl get -n "$NS" secret notes-stowage -o jsonpath='{.data.ADMIN_EMAIL}' | base64 -d) == second@notes.test ]] || fail "--kit did not replace the recorded input"
+grep -qF 'changing ADMIN_EMAIL: ' "$WORK/kit-up.log" || { cat "$WORK/kit-up.log"; fail "the change was not logged"; }
+ctl v1.sh k8s kit check second-site site-2 >"$WORK/kit-check.log" 2>&1 && grep -q 'proven$' "$WORK/kit-check.log" || { cat "$WORK/kit-check.log"; fail "k8s kit check of a site"; }
+rc=0; ctl v1.sh k8s kit check second-site site-unknown >"$WORK/kit-check.log" 2>&1 || rc=$?
+[[ $rc == 2 ]] || { cat "$WORK/kit-check.log"; fail "k8s kit check of an unknown site exited $rc, not 2"; }
+rc=0; ctl v1.sh k8s kit check second-site site-refused >"$WORK/kit-check.log" 2>&1 || rc=$?
+[[ $rc == 1 ]] || { cat "$WORK/kit-check.log"; fail "k8s kit check of a refused site exited $rc, not 1"; }
+printf 'project: notes\ninputs: {ADMIN_EMAIL: admin@notes.test}\n' >"$OP/back.yaml"
+ctl v1.sh k8s upgrade --given back.yaml --no-input --timeout 3m >"$WORK/kit-back.log" 2>&1 || { cat "$WORK/kit-back.log"; fail "k8s upgrade --given back"; }
+[[ $(kubectl get -n "$NS" secret notes-stowage -o jsonpath='{.data}') == "$secret" ]] || fail "the Secret is not back as it was"
+
 step "ship 2.0.0, k8s upgrade --version 2.0.0"
 release 2.0.0
 [[ $(digest_of notes/notes-web:2.0.0) != "$(digest_of notes/notes-web:1.0.0)" ]] || fail "2.0.0 has 1.0.0's web image"

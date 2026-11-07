@@ -933,6 +933,11 @@ func (l *linter) hookUsesImage(key string) bool {
 			return true
 		}
 	}
+	for _, h := range l.s.Handoffs {
+		if h.Run.Image == key || (h.Check != nil && h.Check.Image == key) {
+			return true
+		}
+	}
 	return false
 }
 
@@ -1528,6 +1533,7 @@ func (l *linter) secretsAndInputs() {
 	l.composeVars(keys)
 	l.inputsConsumed()
 	l.extensions()
+	l.handoffs()
 	l.fileInputsOnlyMounted()
 }
 

@@ -8,6 +8,8 @@ package kit
 
 import (
 	"bytes"
+	"crypto/rand"
+	"encoding/base32"
 	"errors"
 	"fmt"
 	"io"
@@ -91,6 +93,23 @@ func Seal(k *Kit, code string, workFactor int) ([]byte, error) {
 		return nil, err
 	}
 	return out.Bytes(), nil
+}
+
+// NewCode makes a code of 160 random bits: a kit can be attacked offline, so its code is never one a
+// person chose. It reads as groups of four, for a person to give over a call.
+func NewCode() (string, error) {
+	raw := make([]byte, 20)
+	if _, err := rand.Read(raw); err != nil {
+		return "", err
+	}
+	enc := strings.ToLower(base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(raw))
+	var groups []string
+	for len(enc) > 0 {
+		n := min(4, len(enc))
+		groups = append(groups, enc[:n])
+		enc = enc[n:]
+	}
+	return strings.Join(groups, "-"), nil
 }
 
 // Sniff refuses what cannot be a kit, before anyone is asked its code.

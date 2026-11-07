@@ -229,6 +229,26 @@ grep -qF 'certificates in /run/stowage/inputs/API_CA_BUNDLE: 1' "$WORK/given.log
 hook_ran "$WORK/given.log" "$key"
 ! grep -qF "$(base64 -w0 "$OP/upstream-ca.pem")" "$WORK/given.log" || fail "the file given reached a log"
 
+step "k8s kit create and k8s upgrade --kit, replacing a recorded value; k8s kit check"
+SEARCH3=http://atlas-api.$NS.svc.cluster.local:9090
+printf 'SITE_SEARCH_TOKEN: the-token\n' >"$OP/kit-answers.yaml"
+ctl v1.sh k8s kit create search-client --name site-2 --set SITE_SEARCH_URL="$SEARCH3" --answers kit-answers.yaml -o search.kit >"$WORK/kit.log" 2>&1 || { cat "$WORK/kit.log"; cluster_logs >&2; fail "k8s kit create"; }
+code=$(sed -n 's/^code  //p' "$WORK/kit.log")
+[[ -n $code ]] || { cat "$WORK/kit.log"; fail "k8s kit create printed no code"; }
+! grep -qF "$SEARCH3" "$WORK/kit.log" "$OP/search.kit" || fail "a value in the clear"
+! kubectl get -n "$NS" secret atlas-stowage-kit-search-client >/dev/null 2>&1 || fail "the kit's Secret is still there"
+! kubectl get -n "$NS" job atlas-stowage-kit-search-client >/dev/null 2>&1 || fail "the kit's Job is still there"
+printf '%s\n' "$code" >"$OP/search.code"
+ctl v1.sh k8s upgrade --kit search.kit --kit-code-file search.code --no-input --timeout 5m >"$WORK/kit-up.log" 2>&1 || { cat "$WORK/kit-up.log"; cluster_logs >&2; fail "k8s upgrade --kit"; }
+grep -qF "changing SEARCH_URL: $SEARCH2 → $SEARCH3" "$WORK/kit-up.log" || { cat "$WORK/kit-up.log"; fail "the kit's change was not logged"; }
+grep -qF 'kubectl: restarting deployment/atlas-api' "$WORK/kit-up.log" || { cat "$WORK/kit-up.log"; fail "what reads the kit's value was not restarted"; }
+[[ $(kubectl exec -n "$NS" deploy/atlas-api -c api -- printenv SEARCH_URL) == "$SEARCH3" ]] || fail "the api was not restarted with the kit's value"
+[[ $(status search admins) == True/1 ]] || fail "the api does not reach SEARCH_URL as the kit gave it"
+hook_ran "$WORK/kit-up.log" "$key"
+ctl v1.sh k8s kit check search-client site-2 >"$WORK/kit-check.log" 2>&1 && grep -q 'proven$' "$WORK/kit-check.log" || { cat "$WORK/kit-check.log"; fail "k8s kit check of a site"; }
+rc=0; ctl v1.sh k8s kit check search-client site-unknown >"$WORK/kit-check.log" 2>&1 || rc=$?
+[[ $rc == 2 ]] || { cat "$WORK/kit-check.log"; fail "k8s kit check of an unknown site exited $rc, not 2"; }
+
 step "the app's users revoke the key; ship $V2 (a migration), k8s upgrade --version $V2: the hook fails, the release runs $V2"
 kubectl exec -n atlas-db deploy/db -- psql -U atlas -d atlas -qc 'DELETE FROM api_keys' || fail "revoking the key"
 full_release 2 002_event_source.sql "-- 002: where an event came from

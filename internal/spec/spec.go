@@ -68,6 +68,62 @@ type Spec struct {
 	// Endpoint names the route that is this project's endpoint when another project uses it as
 	// an extension: its installer prints the route's URL after an install.
 	Endpoint string `yaml:"endpoint"`
+	// Handoffs are what this project issues to another install, sealed in a kit (`kit create`).
+	Handoffs []Handoff `yaml:"handoffs"`
+}
+
+// Handoff is a kit this project issues. Run is a one-shot container whose stdout carries the hook's
+// KEY=VALUE lines: each key Gives lists, by the target's input names, or KIT_TLS_* for the target's
+// front. Lint checks this side alone: it cannot see the target's spec.
+type Handoff struct {
+	Name string `yaml:"name"`
+	// For is the project the kit is for; only its install takes it.
+	For string `yaml:"for"`
+	// Instance, when set, is the question naming the instance a kit is for; else --name, else the
+	// handoff's name.
+	Instance string       `yaml:"instance"`
+	Ask      []HandoffAsk `yaml:"ask"`
+	Run      HandoffStep  `yaml:"run"`
+	Gives    []string     `yaml:"gives"`
+	// Check proves a kit taken, by its exit status: 0 proven, 2 unknown, any other not proven.
+	Check *HandoffStep `yaml:"check"`
+}
+
+// HandoffAsk is a question `kit create` asks, whose answer the run receives under Key.
+type HandoffAsk struct {
+	Key    string `yaml:"key"`
+	Prompt string `yaml:"prompt"`
+	Secret bool   `yaml:"secret"`
+}
+
+// HandoffStep is a one-shot container: an images key, its command, and the recorded keys it receives.
+type HandoffStep struct {
+	Image string   `yaml:"image"`
+	Cmd   []string `yaml:"cmd"`
+	Env   []string `yaml:"env"`
+}
+
+// The keys of a handoff's gives that are the target's front's TLS material, PEM as stowage-file:<base64>.
+const (
+	KitTLSCert     = "KIT_TLS_CERT"
+	KitTLSKey      = "KIT_TLS_KEY"
+	KitTLSCA       = "KIT_TLS_CA"
+	KitTLSClientCA = "KIT_TLS_CLIENT_CA"
+)
+
+// Handoff finds a handoff by its name; nil when there is none.
+func (s *Spec) Handoff(name string) *Handoff {
+	for i := range s.Handoffs {
+		if s.Handoffs[i].Name == name {
+			return &s.Handoffs[i]
+		}
+	}
+	return nil
+}
+
+// Asks reports whether h asks key.
+func (h *Handoff) Asks(key string) bool {
+	return slices.ContainsFunc(h.Ask, func(a HandoffAsk) bool { return a.Key == key })
 }
 
 // Extension is an app another project's install can point this one at: its installer is

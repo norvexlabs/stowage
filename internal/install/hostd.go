@@ -589,7 +589,7 @@ func (h *Hostd) routes(app bool) http.Handler {
 	}
 	// The app reaches what operates the install; the operator's alone are the routes that hand
 	// out or replace the secrets, erase or overwrite the data, re-run the hook (whose outputs
-	// include credentials), stop the backups, or run a command in a container.
+	// include credentials), issue a kit, stop the backups, or run a command in a container.
 	both := func(pattern string, f http.HandlerFunc) { handle(pattern, f, true) }
 	operator := func(pattern string, f http.HandlerFunc) { handle(pattern, f, false) }
 	both("GET /v1/status", h.status)
@@ -623,6 +623,8 @@ func (h *Hostd) routes(app bool) http.Handler {
 	both("GET /v1/backup/list", h.listBackups)
 	both("POST /v1/backup/verify", h.verifyBackup)
 	operator("POST /v1/secrets/export", h.exportSecrets)
+	operator("POST /v1/kits", h.createKit)
+	operator("POST /v1/kits/check", h.checkKit)
 	operator("POST /v1/secrets/rotate", h.rotateSecret)
 	operator("POST /v1/secrets/set", h.setSecret)
 	operator("POST /v1/restore", h.restoreBackup)
