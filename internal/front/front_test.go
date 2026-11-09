@@ -35,6 +35,10 @@ func TestRecipe(t *testing.T) {
 		"github.com/caddy-dns/cloudflare@v",
 		"grep -q '^v" + regexp.QuoteMeta(CaddyVersion) + " '",
 		"dns.providers.cloudflare",
+		// The layer4 app, by a tagged release, which an L4 route's TLS termination needs.
+		"github.com/mholt/caddy-l4@v0.",
+		"grep -qx 'layer4.handlers.tls'",
+		"grep -qx 'layer4.matchers.remote_ip'",
 	} {
 		if !strings.Contains(src, want) {
 			t.Errorf("the recipe lacks %q", want)

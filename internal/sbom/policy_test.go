@@ -302,7 +302,13 @@ func TestScannerRecipe(t *testing.T) {
 	if len(froms) != 2 || !regexp.MustCompile(`^golang:[^@\s]+@sha256:[0-9a-f]{64}$`).MatchString(froms[0].Image) || froms[1].Image != "scratch" {
 		t.Fatalf("FROMs = %v", froms)
 	}
-	for _, want := range []string{"go get github.com/anchore/grype/cmd/grype@v0.121.0 ", `$2 == "github.com/anchore/grype" && $3 == "v0.121.0"`, `ENTRYPOINT ["/grype"]`} {
+	// The grype the recipe builds is the one Grype pins, which the publisher's own audit runs.
+	_, tag, _ := strings.Cut(Grype, ":v")
+	v, _, _ := strings.Cut(tag, "@")
+	if !regexp.MustCompile(`^\d+\.\d+\.\d+$`).MatchString(v) {
+		t.Fatalf("Grype %s: no vX.Y.Z tag (%q)", Grype, v)
+	}
+	for _, want := range []string{"go get github.com/anchore/grype/cmd/grype@v" + v + " ", "main.version=" + v + "'", `$2 == "github.com/anchore/grype" && $3 == "v` + v + `"`, `ENTRYPOINT ["/grype"]`} {
 		if !strings.Contains(string(Dockerfile), want) {
 			t.Errorf("the recipe lacks %q", want)
 		}

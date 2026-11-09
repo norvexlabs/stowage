@@ -606,7 +606,21 @@ func (in *Installer) upgradeRoutes(env, next *EnvFile, mode string, pub publish)
 	// In byo mode the install's certificate must cover the domain of a route the release adds, as
 	// a re-run's.
 	adds := slices.ContainsFunc(s.Front.Routes, func(r spec.Route) bool { _, ok := env.Get(spec.URLVar(r.Name)); return !ok })
-	if mode == "byo" && adds {
+	// An L4 route the front terminates TLS on: its domain given, and in byo covered, whether the
+	// release adds it or its tls (an upgrade records no mark of either).
+	var l4 []spec.L4Route
+	if mode != Loopback {
+		for _, r := range s.L4.Routes {
+			if !r.Terminated() {
+				continue
+			}
+			if get(r.TLS.DomainInput) == "" {
+				return fmt.Errorf("%s %s terminates TLS on the L4 route %s, whose domain %s nothing gives: --set %s=<domain>", m.Name, m.ProjectVersion, r.Name, r.TLS.DomainInput, r.TLS.DomainInput)
+			}
+			l4 = append(l4, r)
+		}
+	}
+	if mode == "byo" && (adds || len(l4) > 0) {
 		_, leaf, err := readLeaf(filepath.Join(in.O.Dir, TLSDir, "cert.pem"))
 		if err != nil {
 			return fmt.Errorf("the install's certificate: %w", err)
@@ -614,6 +628,11 @@ func (in *Installer) upgradeRoutes(env, next *EnvFile, mode string, pub publish)
 		for _, r := range s.Front.Routes {
 			if _, ok := env.Get(spec.URLVar(r.Name)); !ok && leaf.VerifyHostname(get(r.DomainInput)) != nil {
 				return fmt.Errorf("%s %s adds the route %s: the install's certificate does not cover %s (%s)", m.Name, m.ProjectVersion, r.Name, get(r.DomainInput), r.DomainInput)
+			}
+		}
+		for _, r := range l4 {
+			if leaf.VerifyHostname(get(r.TLS.DomainInput)) != nil {
+				return fmt.Errorf("%s %s: the install's certificate does not cover %s (%s), the domain of the L4 route %s", m.Name, m.ProjectVersion, get(r.TLS.DomainInput), r.TLS.DomainInput, r.Name)
 			}
 		}
 	}

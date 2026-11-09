@@ -120,6 +120,11 @@ l4:
   routes:
     - { name: echo,     protocol: tcp, port: 17007, upstream: echo:17007, address_input: ECHO_ADDRESS, bind_input: ECHO_BIND }
     - { name: echo-udp, protocol: udp, port: 17007, upstream: echo:17007, allow_input: ECHO_SOURCES, interfaces: [edge] }   # the VM's firewall; a Docker host's once consented
+    - name: echo-tls                                          # the front terminates TLS with its mode's certificate, the echo gets plaintext
+      protocol: tcp
+      port: 17443
+      upstream: echo:17009
+      tls: { domain_input: ECHO_DOMAIN }
 
 health:
   provider: http-json

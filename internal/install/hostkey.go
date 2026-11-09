@@ -60,7 +60,7 @@ func (in *Installer) retireSeedHostKey(ctx context.Context, dir, pin string, m M
 		if len(f) < 2 || f[0] != "ssh-ed25519" {
 			err = fmt.Errorf("no ed25519 host key in %q", out)
 		} else if own, err = fingerprint(f[1]); err == nil {
-			err = writeAtomic(filepath.Join(dir, "known_hosts"), strings.NewReader(addr+" "+f[0]+" "+f[1]+"\n"), 0o600, nil)
+			err = writeAtomic(filepath.Join(dir, "known_hosts"), strings.NewReader(hostAlias(addr)+" "+f[0]+" "+f[1]+"\n"), 0o600, nil)
 		}
 	}
 	if err != nil {

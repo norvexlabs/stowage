@@ -273,6 +273,11 @@ func TestVMCreateWithOpenTofu(t *testing.T) {
 		t.Errorf("an attempt's file is left: %v", err)
 	}
 	a := r.ssh.calls[0]
+	// The key recorded under the alias every later link looks it up by, from the state's file
+	// alone, in the clear.
+	if !slices.Contains(a, "HostKeyAlias=notes-1.lan") || !slices.Contains(a, "GlobalKnownHostsFile=/dev/null") || !slices.Contains(a, "HashKnownHosts=no") {
+		t.Errorf("ssh args %q", a)
+	}
 	if !slices.Contains(a, `UserKnownHostsFile="`+filepath.Join(dir, "known_hosts.attempt")+`"`) || !slices.Contains(a, "BatchMode=yes") ||
 		!slices.Equal(a[len(a)-5:], []string{"ops@notes-1.lan", "--", "notes-stow", "status", "--json"}) {
 		t.Errorf("ssh %q", a)

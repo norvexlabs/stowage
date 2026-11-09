@@ -272,6 +272,16 @@ type L4Route struct {
 	Port       int    `yaml:"port"`
 	Service    string `yaml:"service"`
 	TargetPort int    `yaml:"targetPort"`
+	// TLS is set on a route the chart terminates TLS on, as the front does on the other shapes.
+	TLS *L4TLS `yaml:"tls,omitempty"`
+}
+
+// L4TLS is an L4 route's TLS termination, the chart's to do on Kubernetes (cert-manager, a
+// Gateway's TLSRoute): DomainInput names the input holding the domain, ClientAuth asks for a
+// client certificate.
+type L4TLS struct {
+	DomainInput string `yaml:"domainInput"`
+	ClientAuth  bool   `yaml:"clientAuth"`
 }
 
 // Release identifies the release a chart belongs to.

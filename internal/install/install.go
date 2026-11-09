@@ -1209,15 +1209,10 @@ func (in *Installer) renderStack(env *EnvFile, dir string) error {
 	// One that holds no CA certificate any more is none: its routes refuse everyone, and the
 	// front still serves the others.
 	var clientCA []byte
-	if mode != Loopback && len(clientAuthRoutes(f)) > 0 {
-		raw, err := os.ReadFile(in.path(ClientCAFile))
-		if err != nil && !errors.Is(err, os.ErrNotExist) {
+	if mode != Loopback {
+		var err error
+		if clientCA, err = in.heldClientCA(true); err != nil {
 			return err
-		}
-		if err == nil {
-			if clientCA, err = clientCAs(raw); err != nil {
-				in.O.logf("%s %v: %s refuse(s) everyone", in.path(ClientCAFile), err, strings.Join(clientAuthRoutes(f), ", "))
-			}
 		}
 	}
 	logins, err := in.logins(f, get, dir)
@@ -1229,15 +1224,15 @@ func (in *Installer) renderStack(env *EnvFile, dir string) error {
 	case !f.Declared():
 		cf = "# Written by the installer: " + in.R.Spec.Name + " has no front, nothing is served over HTTP.\n"
 	case mode == Loopback:
-		cf = loopbackCaddyfile(f, get, logins)
+		cf = loopbackCaddyfile(f, in.R.Spec.L4.Routes, get, logins)
 	default:
 		domains := map[string]string{}
-		for _, r := range f.Routes {
-			domains[r.Name], _ = env.Get(r.DomainInput)
+		for _, d := range in.R.Spec.RouteDomains() {
+			domains[d.Route], _ = env.Get(d.Input)
 		}
 		email, _ := env.Get(ACMEEmailVar)
 		httpsPort, _ := env.Get(HTTPSPortVar)
-		cf = tlsCaddyfile(f, mode, domains, email, httpsPort, clientCA != nil, get, logins)
+		cf = tlsCaddyfile(f, in.R.Spec.L4.Routes, mode, domains, email, httpsPort, clientCA != nil, get, logins)
 	}
 	// The front's configuration: the Caddyfile, the client CA it reads, and in byo the files of
 	// tls/ it reads.
@@ -1449,8 +1444,9 @@ func (in *Installer) up(ctx context.Context, env *EnvFile) (err error) {
 		in.O.logf("warning: removing the files of the inputs' earlier values: %v", err)
 	}
 	get := func(k string) string { v, _ := env.Get(k); return v }
+	ca := in.readHeldCA()
 	for _, r := range in.R.Spec.L4.Routes {
-		if e := in.l4Exposure(r, get, off); e != "" {
+		if e := in.l4Exposure(r, get, off, ca); e != "" {
 			in.O.logf("L4 route %s: %s/%d %s", r.Name, r.Protocol, r.Port, e)
 		}
 	}
@@ -1801,12 +1797,18 @@ func bindAddr(r spec.L4Route, get func(string) string) string {
 // whoever reaches the host; a service on the host's network listens on it itself, behind them.
 // A route to a service off (its profiles all off) is served by no one. Otherwise empty on the VM,
 // whose firewall applies the route's allowlist.
-func (in *Installer) l4Exposure(r spec.L4Route, get func(string) string, off []string) string {
+// ca is the install's client CA as the front reads it (heldClientCA, read once by the caller for
+// all the routes' lines).
+func (in *Installer) l4Exposure(r spec.L4Route, get func(string) string, off []string, ca heldCA) string {
 	name, _, _ := strings.Cut(r.Upstream, ":")
 	where, open, hint := "on every address", ", open to whoever reaches this host", ""
-	switch a := bindAddr(r, get); {
-	case slices.Contains(off, name):
+	if slices.Contains(off, name) {
 		return "not served: " + name + "'s profiles are off"
+	}
+	if r.Terminated() {
+		return in.l4TLSExposure(r, get, ca)
+	}
+	switch a := bindAddr(r, get); {
 	case in.O.Firewall != "":
 		return ""
 	case slices.Contains(in.hostServices(), name):
@@ -1831,6 +1833,89 @@ func (in *Installer) l4Exposure(r spec.L4Route, get func(string) string, off []s
 		return where + cmp.Or(open, ", open to whoever reaches it") + hint + ": " + r.AllowInput + "'s sources hold once `" + in.R.Ctl() + " tune --apply` consents"
 	}
 	return where + open + hint
+}
+
+// heldCA is the install's client CA as heldClientCA reads it, or why it could not.
+type heldCA struct {
+	certs []byte
+	err   error
+}
+
+// readHeldCA is heldClientCA's answer, for the L4 routes' status lines.
+func (in *Installer) readHeldCA() heldCA {
+	c, err := in.heldClientCA(false)
+	return heldCA{c, err}
+}
+
+// heldClientCA is the install's client CA (--client-ca) as the front reads it: its CA
+// certificates, nil when no route asks for a client certificate or the install holds none. One
+// that holds no CA certificate any more is none (logged when logIt): its routes refuse everyone,
+// and the front still serves the others.
+func (in *Installer) heldClientCA(logIt bool) ([]byte, error) {
+	routes := clientAuthRoutes(in.R.Spec)
+	if len(routes) == 0 {
+		return nil, nil
+	}
+	raw, err := os.ReadFile(in.path(ClientCAFile))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	ca, err := clientCAs(raw)
+	if err != nil {
+		if logIt {
+			in.O.logf("%s %v: %s refuse(s) everyone", in.path(ClientCAFile), err, strings.Join(routes, ", "))
+		}
+		return nil, nil
+	}
+	return ca, nil
+}
+
+// l4TLSExposure says where the front serves an L4 route it terminates TLS on, for which domain,
+// and who decides its sources: the front, by the route's allowlist; on the VM the firewall opens
+// the port to every source, and on Docker nothing filters it before the front. In loopback mode,
+// plaintext on the loopback address alone.
+func (in *Installer) l4TLSExposure(r spec.L4Route, get func(string) string, ca heldCA) string {
+	tls := get("STOWAGE_TLS_MODE") != Loopback
+	domain := ""
+	if tls {
+		domain = get(r.TLS.DomainInput)
+	}
+	// A client CA that cannot be read is said so, as the front's next start fails on it.
+	if r.TLS.ClientAuth && ca.err != nil {
+		return "unknown: the client CA cannot be read: " + ca.err.Error()
+	}
+	// What the front closes to everyone is said so, never as served (l4Closed: the front's rule).
+	if why := l4Closed(r, get, domain, ca.certs != nil, tls); why != "" {
+		return "closed to every source: " + why
+	}
+	if !tls {
+		return "on the loopback address alone, in the clear: TLS and the sources are the proxy's in front of this install"
+	}
+	from := ""
+	if r.AllowInput != "" {
+		from = ", from the sources " + r.AllowInput + " holds (the front closes any other)"
+	}
+	a, ifaces := bindAddr(r, get), ""
+	if in.O.Firewall != "" && len(r.Interfaces) > 0 {
+		ifaces = "the interfaces " + strings.Join(r.Interfaces, ", ")
+	}
+	where := "on every address"
+	switch {
+	case a != "" && ifaces != "":
+		where = "on " + a + " alone, on " + ifaces
+	case a != "":
+		where = "on " + a + " alone"
+	case ifaces != "":
+		where = "on " + ifaces + " alone"
+	}
+	e := where + ", TLS by the front for " + domain
+	if r.TLS.ClientAuth {
+		e += " with a client certificate"
+	}
+	return e + from
 }
 
 // heldPorts are the ports the host holds on every address, which a peer of a service on the
@@ -1908,6 +1993,14 @@ func (in *Installer) openPorts(ctx context.Context, env *EnvFile, hn hostNet) er
 		}
 		// A route on its interfaces is reached on them alone.
 		daddr = in.iif(r.Interfaces...) + daddr
+		// A route the front terminates TLS on is the front's port, whose sources the front
+		// filters; in loopback mode it is published on the loopback address alone.
+		if r.Terminated() {
+			if mode, _ := env.Get("STOWAGE_TLS_MODE"); mode != Loopback {
+				input = fmt.Appendf(input, "%stcp dport %d accept\n", daddr, r.Port)
+			}
+			continue
+		}
 		if r.AllowInput == "" {
 			input = fmt.Appendf(input, "%s%s dport %d accept\n", daddr, r.Protocol, r.Port)
 			continue
@@ -2314,9 +2407,10 @@ func (in *Installer) Status(ctx context.Context) error {
 	if err != nil {
 		fmt.Fprintf(in.O.Out, "warning: the services whose profiles are off could not be read: %v\n", err)
 	}
+	ca := in.readHeldCA()
 	for _, r := range in.R.Spec.L4.Routes {
 		line := strings.TrimSpace(fmt.Sprintf("%s/%d %s", r.Protocol, r.Port, get(spec.L4Var(r.Name))))
-		if e := in.l4Exposure(r, get, off); e != "" {
+		if e := in.l4Exposure(r, get, off, ca); e != "" {
 			line += " · " + e
 		}
 		fmt.Fprintf(in.O.Out, "%-9s %s\n", r.Name, line)
@@ -2407,9 +2501,7 @@ func (in *Installer) knownInputs(mode string) error {
 	if len(unknown) > 0 {
 		sort.Strings(unknown)
 		hint := ""
-		if mode == Loopback && slices.ContainsFunc(unknown, func(k string) bool {
-			return slices.ContainsFunc(in.R.Spec.Front.Routes, func(r spec.Route) bool { return r.DomainInput == k })
-		}) {
+		if mode == Loopback && slices.ContainsFunc(unknown, in.R.Spec.IsDomainInput) {
 			hint = "; a route's domain is one with --tls or --domains"
 			if in.again {
 				hint = "; this install is in loopback mode, which serves no domain"
@@ -2457,7 +2549,7 @@ func (in *Installer) inputList(mode string) []input {
 		if slices.ContainsFunc(in.R.Spec.Front.Routes, func(r spec.Route) bool { return r.BasicAuth != nil && r.BasicAuth.Secret == i.Key }) {
 			check = checkLoginPassword
 		}
-		domain := tls && slices.ContainsFunc(in.R.Spec.Front.Routes, func(r spec.Route) bool { return r.DomainInput == i.Key })
+		domain := tls && in.R.Spec.IsDomainInput(i.Key)
 		if domain {
 			check = in.domainCheck
 		}

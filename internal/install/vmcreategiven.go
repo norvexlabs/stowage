@@ -214,7 +214,7 @@ func (g *Given) givenMode(mode string) string {
 
 // givenRetired says what the pinned step cannot do: a boot after an install began retires the one-time
 // host key, and ssh then refuses it, the file staying.
-const givenRetired = "If the install began and the VM rebooted since, the one-time key is retired and ssh refuses it: check the VM's own key on its console (`ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub`), run the same command without its HostKeyAlias, StrictHostKeyChecking and UserKnownHostsFile options, and remove the file."
+const givenRetired = "If the install began and the VM rebooted since, the one-time key is retired and ssh refuses it: check the VM's own key on its console (`ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub`), run the same command without its HostKeyAlias, StrictHostKeyChecking, UserKnownHostsFile, GlobalKnownHostsFile and HashKnownHosts options, and remove the file."
 
 // writeGiven writes g where its owner alone reads it, with the known_hosts file naming the one-time
 // host key beside it, for givenSteps.
@@ -237,14 +237,20 @@ func writeGiven(path, pin string, g *Given, hostKey *seedHostKey) error {
 // a failure stopped, and it removes the file only once the install took it. An operator runs it, so
 // a key's passphrase may be asked: BatchMode is left out of the arguments every other call shares.
 func givenSteps(user, addr, ctl, file, pin, pubKey string) string {
+	line := sshCommandLine(pinnedSSHArgs(pin, user, addr, pubKey, "sudo", ctl, "install", "--given", "-", "--no-input"))
+	return fmt.Sprintf("%s < %s && rm %s %s", line, shellQuote(file), shellQuote(file), shellQuote(pin))
+}
+
+// sshCommandLine is ssh run with args as an operator types it in a shell: each word quoted, less
+// BatchMode, which only a run that asks nothing needs.
+func sshCommandLine(args []string) string {
 	words := []string{"ssh"}
-	args := pinnedSSHArgs(pin, user, addr, pubKey, "sudo", ctl, "install", "--given", "-", "--no-input")
 	for n := 0; n < len(args); n++ {
-		if args[n] == "-o" && args[n+1] == "BatchMode=yes" {
+		if args[n] == "-o" && n+1 < len(args) && args[n+1] == "BatchMode=yes" {
 			n++
 			continue
 		}
 		words = append(words, shellQuote(args[n]))
 	}
-	return fmt.Sprintf("%s < %s && rm %s %s", strings.Join(words, " "), shellQuote(file), shellQuote(file), shellQuote(pin))
+	return strings.Join(words, " ")
 }

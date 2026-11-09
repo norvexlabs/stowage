@@ -1242,10 +1242,40 @@ func (l *linter) l4() {
 		}
 		if k := r.AllowInput; k != "" {
 			svc, _, _ := strings.Cut(r.Upstream, ":")
-			l.l4Allow(w+".allow_input", k, svc)
+			l.l4Allow(w+".allow_input", k, svc, r.TLS != nil)
 		}
 		if k := r.BindInput; k != "" {
 			l.l4Bind(w+".bind_input", k)
+		}
+		if r.TLS != nil {
+			l.l4TLS(w+".tls", r)
+		}
+	}
+}
+
+// l4TLS checks an L4 route the front terminates TLS on: a TCP route, a front with a TLS mode to
+// give it a certificate, and a domain input.
+func (l *linter) l4TLS(where string, r spec.L4Route) {
+	f := l.s.Front
+	if r.Protocol == "udp" {
+		l.errf(where, "the front terminates TLS over TCP alone: a UDP route passes through as it is (DTLS is the upstream's)")
+	}
+	if !f.Declared() || !slices.ContainsFunc(f.TLSModes, func(m string) bool { return m != "none" }) {
+		l.errf(where, "the front terminates TLS with the certificate of its TLS mode, and %s offers none: give front.tls_modes a TLS mode, or leave tls out (the upstream's own TLS passes through)", l.s.Name)
+	}
+	if !providers.EnvName.MatchString(r.TLS.DomainInput) {
+		l.errf(where+".domain_input", "%q is not an environment variable name", r.TLS.DomainInput)
+	} else if in, ok := l.s.Input(r.TLS.DomainInput); ok {
+		// Declared, it must be asked wherever the front serves the route, as an undeclared one
+		// is: never empty, never left unasked.
+		leftOut := slices.ContainsFunc([]string{"docker", "kairos"}, func(sh string) bool {
+			return slices.Contains(l.s.Shapes.Names(), sh) && len(in.Shapes) > 0 && !slices.Contains(in.Shapes, sh)
+		})
+		switch {
+		case in.Secret:
+			l.errf(where+".domain_input", "%s is secret: a domain is in the certificate, which every client reads", r.TLS.DomainInput)
+		case in.Optional || in.Advanced || in.When == "loopback" || leftOut:
+			l.errf(where+".domain_input", "%s must be asked on every install the front terminates the route's TLS on: neither optional nor advanced, nor asked in loopback mode alone, nor left out of a docker or kairos shape — or leave it undeclared, and the install asks it as a route's domain", r.TLS.DomainInput)
 		}
 	}
 }
@@ -1334,12 +1364,32 @@ func (l *linter) l4Host(where string, r spec.L4Route, name string, port int) {
 	if l.s.Shapes.Kairos == nil && !host || l.compose == nil {
 		return
 	}
-	if port != r.Port {
-		on := "on the VM the service runs"
-		if host {
-			on = "the service runs"
-		}
+	on := "on the VM the service runs"
+	if host {
+		on = "the service runs"
+	}
+	switch {
+	case r.TLS != nil && port == r.Port:
+		l.errf(where+".upstream", "%s: %s on the host's network, where the front holds the route's port %d to terminate TLS: the service listens on another, which the front forwards the plaintext to", r.Upstream, on, r.Port)
+	case r.TLS == nil && port != r.Port:
 		l.errf(where+".upstream", "%s: %s on the host's network, where nothing maps one port to another: it listens on the route's port, %d", r.Upstream, on, r.Port)
+	}
+	if r.TLS != nil && (r.AllowInput != "" || r.TLS.ClientAuth) {
+		var guards []string
+		if r.AllowInput != "" {
+			guards = append(guards, "allow_input")
+		}
+		if r.TLS.ClientAuth {
+			guards = append(guards, "tls.client_auth")
+		}
+		net := "the VM's network (an L4 route's upstream)"
+		if host {
+			net = "the host's network"
+		}
+		l.warnf(where+".upstream", "%s runs on %s, where every container of the stack reaches its port %d directly, at the host's gateway, past the route's %s: %s checks who calls it itself", name, net, port, strings.Join(guards, " and "), name)
+	}
+	if r.TLS != nil && host && l.s.Shapes.Docker != nil {
+		l.warnf(where+".upstream", "%s runs on the host's network (services.%s.host_network), where on Docker its plaintext port %d is open to whoever reaches the host, past the route's TLS (the host's firewall is its operator's): have it listen on the address the front reaches it at alone", name, name, port)
 	}
 	if !host {
 		l.hostNetService(name, "the VM runs "+name+" on the host's network (the L4 route "+r.Name+")")
@@ -1384,7 +1434,8 @@ func (l *linter) l4Bind(where, key string) {
 // shapes the project has and on no other (a cluster's firewall is its own), in every mode, and an
 // empty one refuses every source; with neither shape nothing enforces it (a warning), nor on
 // Docker for an upstream on the host's network, which Docker translates no port to (a warning).
-func (l *linter) l4Allow(where, key, upstream string) {
+// On a route the front terminates TLS on (terminated), the front enforces it on those shapes.
+func (l *linter) l4Allow(where, key, upstream string, terminated bool) {
 	in, ok := l.s.Input(key)
 	if !ok {
 		l.errf(where, "%s is not an input", key)
@@ -1411,7 +1462,8 @@ func (l *linter) l4Allow(where, key, upstream string) {
 	case in.When != "":
 		l.errf(where, "%s is asked only when %s: the firewall reads it in every mode", key, in.When)
 	}
-	if always, _ := l.hostNetworkServices(); l.s.Shapes.Docker != nil && slices.Contains(always, upstream) {
+	// The front filters a route it terminates TLS on itself, whatever network its upstream is on.
+	if always, _ := l.hostNetworkServices(); !terminated && l.s.Shapes.Docker != nil && slices.Contains(always, upstream) {
 		l.warnf(where, "on the docker shape %s runs on the host's network, whose input chain is the Docker host's operator's: the route is open to every source there", upstream)
 	}
 }
@@ -1571,9 +1623,9 @@ func (l *linter) secretsAndInputs() {
 			}
 		}
 	}
-	for _, r := range l.s.Front.Routes {
-		if _, ok := keys[r.DomainInput]; !ok {
-			keys[r.DomainInput] = "a route domain"
+	for _, d := range l.s.RouteDomains() {
+		if _, ok := keys[d.Input]; !ok {
+			keys[d.Input] = "a route domain"
 		}
 	}
 	l.composeVars(keys)
@@ -1608,6 +1660,9 @@ func (l *linter) fileInputsOnlyMounted() {
 		use(w+".address_input", r.AddressInput)
 		use(w+".allow_input", r.AllowInput)
 		use(w+".bind_input", r.BindInput)
+		if r.TLS != nil {
+			use(w+".tls.domain_input", r.TLS.DomainInput)
+		}
 	}
 	for _, name := range sortedKeys(l.s.Services) {
 		svc := l.s.Services[name]
@@ -1823,6 +1878,9 @@ func (l *linter) readInputs() func(spec.Input) bool {
 	// inputs and those picking a table.
 	for _, r := range l.s.L4.Routes {
 		inCompose[r.AddressInput], inCompose[r.AllowInput], inCompose[r.BindInput] = true, true, true
+		if r.TLS != nil {
+			inCompose[r.TLS.DomainInput] = true
+		}
 	}
 	for _, svc := range l.s.Services {
 		inCompose[svc.AddressInput] = true
@@ -2001,9 +2059,9 @@ func (l *linter) hookEnv(h *providers.ProvisionHook) {
 			l.errf(fmt.Sprintf("hooks.provision.env[%d]", i), "%s is no input, secret or safe default (the URLs and what the hook returned before it receives without asking)", k)
 		}
 	}
-	for _, r := range l.s.Front.Routes {
-		if known[r.DomainInput] == "" {
-			known[r.DomainInput] = "a route domain"
+	for _, d := range l.s.RouteDomains() {
+		if known[d.Input] == "" {
+			known[d.Input] = "a route domain"
 		}
 	}
 	for i, k := range h.Returns {

@@ -3,6 +3,33 @@
 Stowage's own releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
+## [0.32.0]
+
+### Added
+
+- An L4 route can have the front terminate its TLS (`l4.routes[].tls: { domain_input, client_auth }`):
+  the front serves the certificate its TLS mode gives the route's domain (`acme`,
+  `dns-cloudflare`, `byo`, `internal`, renewed with the HTTP routes'), optionally asks for a
+  client certificate, filters the route's allowlist itself, and passes the plaintext stream to the
+  upstream. In loopback mode the route passes in the clear on the loopback address alone; on
+  Kubernetes the chart gets the route's `tls` in its values and terminates it. `--domains` names
+  such a route.
+- `vm kit create`, `vm kit check` and `vm kit take`, run from the operator's machine on a VM
+  `vm create` made, over the SSH link it pinned: a kit is issued on the VM and written on the
+  operator's machine, a kit opened there is given to the VM's install, and neither the code nor a
+  secret answer touches the VM's disk. The VM's `kit create --json` is the request and answer
+  they exchange.
+
+### Changed
+
+- The front runs Caddy 2.11.9, the backup runner rclone 1.76.0 and the scanner grype 0.121.3: the
+  modules Stowage forced over their earlier releases are now their own (the backup runner's all
+  of them), but for golang.org/x/net, go-jose and klauspost/compress in the front and go-jose in
+  the scanner. Their bases, and the examples', are repinned to their latest builds.
+- The SSH links to a VM never read the operator's global known hosts, and `vm create` records the
+  VM's key in the clear, under the address the later links look it up by, whatever the operator's
+  ssh configuration makes of the name.
+
 ## [0.31.0] - 2026-11-09
 
 ### Added

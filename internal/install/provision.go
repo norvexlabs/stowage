@@ -117,8 +117,8 @@ func (in *Installer) recordedEnv(env *EnvFile) []string {
 			add(i.Key)
 		}
 	}
-	for _, r := range s.Front.Routes {
-		add(r.DomainInput)
+	for _, d := range s.RouteDomains() {
+		add(d.Input)
 	}
 	for _, sec := range s.Secrets {
 		add(sec.Key)
@@ -775,8 +775,8 @@ func (in *Installer) hookInputs(env *EnvFile, h *providers.ProvisionHook) map[st
 	for _, w := range composeWord.FindAll(in.R.Compose, -1) {
 		stack[string(w)] = true
 	}
-	for _, r := range in.R.Spec.Front.Routes {
-		stack[r.DomainInput] = true // the front's
+	for _, d := range in.R.Spec.RouteDomains() {
+		stack[d.Input] = true // the front's
 	}
 	settable := map[string]spec.Input{}
 	for _, i := range in.R.Spec.Inputs {

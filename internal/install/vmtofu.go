@@ -559,15 +559,27 @@ func moduleNICs(m Machine, t *TofuVM) []moduleNIC {
 // key of that public one alone (ssh's other keys would spend the VM's few authentication tries),
 // and the host key taken on first contact into the file known, apart from the operator's known
 // hosts.
+//
+// The key ssh records is the address's, under the alias every later link looks it up by
+// (HostKeyAlias), whatever the operator's ssh_config makes of the name (Port, HostName).
 func sshArgs(known, user, addr, pubKey string, command ...string) []string {
-	return sshArgsChecking("accept-new", known, user, addr, pubKey, command...)
+	return sshArgsChecking("accept-new", hostAlias(addr), known, user, addr, pubKey, command...)
 }
 
-// sshArgsChecking are sshArgs with ssh's StrictHostKeyChecking set to checking.
-func sshArgsChecking(checking, known, user, addr, pubKey string, command ...string) []string {
+// hostAlias names the VM's key in its known_hosts by its address, lower-cased as ssh writes and
+// matches a name: the same on the link that records it and on every one that looks it up.
+func hostAlias(addr string) string { return strings.ToLower(addr) }
+
+// sshArgsChecking are sshArgs with ssh's StrictHostKeyChecking set to checking. The VM's key is
+// the file known's alone: the operator's global known hosts are never read, and a key ssh records
+// is written in the clear (HashKnownHosts=no), which the operator can read and check.
+//
+// alias is the name the VM's key has in known (HostKeyAlias): every link names it, so ssh never
+// looks the key up under its own idea of the host (an ssh_config HostName or Port).
+func sshArgsChecking(checking, alias, known, user, addr, pubKey string, command ...string) []string {
 	// Quoted: ssh splits an option's value at white space, into several files.
-	args := []string{"-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=" + checking,
-		"-o", `UserKnownHostsFile="` + known + `"`}
+	args := []string{"-o", "HostKeyAlias=" + alias, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=" + checking,
+		"-o", `UserKnownHostsFile="` + known + `"`, "-o", "GlobalKnownHostsFile=/dev/null", "-o", "HashKnownHosts=no"}
 	pub := expandHome(pubKey)
 	if priv, ok := strings.CutSuffix(pub, ".pub"); ok {
 		if _, err := os.Stat(priv); err == nil {
@@ -585,7 +597,7 @@ const seedHostAlias = "vm-seed-host-key"
 // pinnedSSHArgs are sshArgs, the VM's host key checked against the file pin's alone (its line
 // names seedHostAlias): ssh refuses any other, never adding one.
 func pinnedSSHArgs(pin, user, addr, pubKey string, command ...string) []string {
-	return append([]string{"-o", "HostKeyAlias=" + seedHostAlias}, sshArgsChecking("yes", pin, user, addr, pubKey, command...)...)
+	return sshArgsChecking("yes", seedHostAlias, pin, user, addr, pubKey, command...)
 }
 
 // awaitVM waits, up to wait, until `<short>-stow status --json` on the VM at addr answers from a

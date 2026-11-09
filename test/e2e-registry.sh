@@ -100,9 +100,13 @@ head -1 "$WORK/notes.sh" | grep -q '^#!/bin/sh' || fail "the installer image did
 (cd "$WORK" && sh notes.sh --help) >"$WORK/help.txt" || { cat "$WORK/help.txt"; fail "the script did not run the installer"; }
 grep -q 'Install and manage notes 1.0.0 with Docker' "$WORK/help.txt" || { cat "$WORK/help.txt"; fail "installer help"; }
 compgen -G "$WORK/.notes-stow.*" >/dev/null && fail "the script left its extracted installer behind"
-# The front shipped is the pinned Caddy, with the Cloudflare DNS plugin.
+# The front shipped is the pinned Caddy, with the Cloudflare DNS plugin and the layer4 app (an L4
+# route's TLS).
 docker run --rm --pull always "$REG/notes/notes-front:1.0.0" sh -c 'caddy version; caddy list-modules' >"$WORK/front.txt" 2>&1 || { cat "$WORK/front.txt"; fail "docker run of the front"; }
-grep -q '^v2\.11\.7 ' "$WORK/front.txt" && grep -qx 'dns.providers.cloudflare' "$WORK/front.txt" || { cat "$WORK/front.txt"; fail "the front is not Caddy 2.11.7 with the Cloudflare plugin"; }
+grep -q '^v2\.11\.9 ' "$WORK/front.txt" && grep -qx 'dns.providers.cloudflare' "$WORK/front.txt" && grep -qx 'layer4.handlers.tls' "$WORK/front.txt" &&
+	grep -qx 'layer4.matchers.remote_ip' "$WORK/front.txt" && grep -qx 'layer4.handlers.proxy' "$WORK/front.txt" &&
+	grep -qx 'layer4.handlers.close' "$WORK/front.txt" ||
+	{ cat "$WORK/front.txt"; fail "the front is not Caddy 2.11.9 with the Cloudflare plugin and the layer4 app"; }
 
 step "the chart: pulled with the pull account, rendered by helm with the release's images by digest"
 mkdir -p "$WORK/chart"

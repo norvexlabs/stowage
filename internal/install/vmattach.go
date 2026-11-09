@@ -390,25 +390,13 @@ func (in *Installer) AttachVM(ctx context.Context, a *VMAttach) error {
 		nics = append(nics, moduleNIC{Role: role, MAC: i.MAC, Attach: attach})
 		j = len(nics) - 1
 	}
-	if o.SSH == nil {
-		return errors.New("ssh is not available to this run")
-	}
-	user, pub, addr := cmp.Or(a.User, defaultUser(o.getenv)), cmp.Or(a.SSHKey, defaultKey(o.getenv("HOME"))), cmp.Or(a.Address, a.Host)
-	if err := checkUser(user); err != nil {
-		return fmt.Errorf("--user %s: %w", user, err)
-	}
-	if strings.HasPrefix(addr, "-") || strings.ContainsAny(addr, " \t\r\n%@\"'\\") {
-		return fmt.Errorf("--host %q: a host name or an address", addr)
-	}
 	// The host key vm create recorded for the address it waited at: the VM answers with it, or
 	// ssh refuses, an address it recorded none for included.
-	known := filepath.Join(dir, "known_hosts")
-	if _, err := os.Stat(known); err != nil {
-		return fmt.Errorf("%s: the VM's host key is not known (vm create records it once the VM answers; a VM whose install was finished by hand: put its host key, checked on its console, in %s): %w", a.Host, known, err)
+	l, err := in.link(VMReach{Host: a.Host, User: a.User, SSHKey: a.SSHKey, Address: a.Address})
+	if err != nil {
+		return err
 	}
-	ssh := func(ctx context.Context, cmd ...string) ([]byte, error) {
-		return o.SSH.Run(ctx, Cmd{Args: append([]string{"-o", "HostKeyAlias=" + addr}, sshArgsChecking("yes", known, user, addr, pub, cmd...)...)})
-	}
+	user, addr, ssh := l.user, l.addr, l.run
 	// The boot the VM runs now, read before anything changes: the probe waits for another.
 	b, err := ssh(ctx, "cat", "/proc/sys/kernel/random/boot_id")
 	before := strings.TrimSpace(string(b))

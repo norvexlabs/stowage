@@ -218,9 +218,17 @@ func (in *Installer) hostNetwork(ctx context.Context, m *composeModel, taken map
 			}
 		}
 	}
+	// An L4 route's port, or on a route the front terminates TLS on its upstream's port, which the
+	// front forwards the plaintext to (the route's port is the front's).
 	for _, r := range in.R.Spec.L4.Routes {
-		if name, _, _ := strings.Cut(r.Upstream, ":"); hn.targets[name] {
+		name, port, _ := strings.Cut(r.Upstream, ":")
+		if !hn.targets[name] {
+			continue
+		}
+		if !r.Terminated() {
 			hn.open = append(hn.open, peerPort{r.Port, r.Protocol})
+		} else if n, err := strconv.Atoi(port); err == nil {
+			hn.open = append(hn.open, peerPort{n, "tcp"})
 		}
 	}
 	// The front's routes to a target, and the ports a target exposes, are reached from the stack.

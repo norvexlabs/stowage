@@ -14,4 +14,4 @@ var Dockerfile []byte
 const Key = "front"
 
 // CaddyVersion is the Caddy the front runs.
-const CaddyVersion = "2.11.7"
+const CaddyVersion = "2.11.9"

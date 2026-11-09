@@ -1,7 +1,10 @@
 package install
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -20,7 +23,18 @@ type kitVerbs struct {
 	create func(cmd *cobra.Command, req KitRequest) (*IssuedKit, error)
 	check  func(cmd *cobra.Command, handoff, instance string) (int, error)
 	flags  func(c *cobra.Command)
+	// host, when set, makes HOSTNAME each command's first argument, which it receives: the VM
+	// `vm kit` reaches over SSH.
+	host *string
+	// precheck, when set, runs before create asks anything or makes its file.
+	precheck func(cmd *cobra.Command) error
+	// json gives `create` --json: the request read from standard input, the issued kit written to
+	// standard output as JSON, no file — the VM's side of `vm kit create`.
+	json bool
 }
+
+// maxKitRequest bounds a --json request: its answers are a handoff's, each a recorded value's size.
+const maxKitRequest = 1 << 20
 
 // kitCommand is `kit`, for a project that declares a handoff; nil for one that does not.
 func kitCommand(r *Release, stdout, stderr io.Writer, terminal func(bool) Prompter, verbs kitVerbs) *cobra.Command {
@@ -35,19 +49,42 @@ func kitCommand(r *Release, stdout, stderr io.Writer, terminal func(bool) Prompt
 		fmt.Fprintln(stderr, "error:", err)
 		return ExitCode(KitUnknown)
 	}
+	lead, use := 0, ""
+	if verbs.host != nil {
+		lead, use = 1, "HOSTNAME "
+	}
+	// hosted takes HOSTNAME off args, for the verbs to reach.
+	hosted := func(args []string) []string {
+		if verbs.host != nil {
+			*verbs.host = args[0]
+		}
+		return args[lead:]
+	}
 	var instance, expires, out, answers string
 	var sets []string
-	var noInput, accessible bool
+	var noInput, accessible, asJSON bool
 	create := &cobra.Command{
-		Use:   "create HANDOFF",
+		Use:   "create " + use + "HANDOFF",
 		Short: "Run a handoff's step, and write what it gives to a kit another install takes with --kit",
-		Args:  cobra.ExactArgs(1),
+		Args:  cobra.ExactArgs(lead + 1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			args = hosted(args)
+			if asJSON {
+				for _, name := range []string{"name", "expires", "output", "set", "answers"} {
+					if cmd.Flags().Changed(name) {
+						return fmt.Errorf("--json reads the whole request on standard input: --%s with it is refused", name)
+					}
+				}
+				return kitJSON(cmd, args[0], verbs, stdout)
+			}
 			h := r.Spec.Handoff(args[0])
 			if h == nil {
 				return fmt.Errorf("%s declares no handoff %q", r.Spec.Name, args[0])
 			}
 			after, err := parseKitExpiry(expires)
+			if err == nil && verbs.precheck != nil {
+				err = verbs.precheck(cmd)
+			}
 			if err != nil {
 				return err
 			}
@@ -109,15 +146,19 @@ func kitCommand(r *Release, stdout, stderr io.Writer, terminal func(bool) Prompt
 	cf.StringVar(&answers, "answers", "", "a YAML file of what the handoff asks, KEY: value")
 	cf.BoolVar(&noInput, "no-input", false, "never ask")
 	cf.BoolVar(&accessible, "accessible", false, "ask with plain line prompts (screen readers); also when ACCESSIBLE is set or TERM=dumb")
+	if verbs.json {
+		cf.BoolVar(&asJSON, "json", false, "read the request (instance, answers, expires in nanoseconds) as JSON on standard input and write the kit, its code and the run's log as JSON on standard output, no file: what `vm kit create` runs over SSH")
+	}
 	verbs.flags(create)
 	check := &cobra.Command{
-		Use:   "check HANDOFF INSTANCE",
+		Use:   "check " + use + "HANDOFF INSTANCE",
 		Short: "Run a handoff's check for an instance: exit 0 proven, 2 unknown or no answer, 1 not proven",
 		// A check that never ran is no answer, as below: a script reads 1 as not proven.
 		Args: func(cmd *cobra.Command, args []string) error {
-			return noAnswer(cobra.ExactArgs(2)(cmd, args))
+			return noAnswer(cobra.ExactArgs(lead+2)(cmd, args))
 		},
 		RunE: func(cmd *cobra.Command, args []string) error {
+			args = hosted(args)
 			code, err := verbs.check(cmd, args[0], args[1])
 			// No answer is unknown, never negative: a script must not read it as not proven.
 			if err != nil {
@@ -146,6 +187,36 @@ func kitCommand(r *Release, stdout, stderr io.Writer, terminal func(bool) Prompt
 	verbs.flags(check)
 	root.AddCommand(create, check)
 	return root
+}
+
+// kitJSON is `kit create --json`: the request strictly read from standard input, for handoff, and
+// the issued kit written to stdout as one JSON object. The verb checks the request as any other's.
+func kitJSON(cmd *cobra.Command, handoff string, verbs kitVerbs, stdout io.Writer) error {
+	raw, err := readFlagFile("--json", "-", cmd.InOrStdin(), maxKitRequest)
+	if err != nil {
+		return err
+	}
+	var req KitRequest
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
+		return fmt.Errorf("--json: the request on standard input: %w", err)
+	}
+	if dec.More() {
+		return errors.New("--json: the request on standard input holds more than one object")
+	}
+	if req.Handoff != "" && req.Handoff != handoff {
+		return fmt.Errorf("--json: the request names the handoff %q, the command %q", req.Handoff, handoff)
+	}
+	req.Handoff = handoff
+	issued, err := verbs.create(cmd, req)
+	if err != nil {
+		return err
+	}
+	if err := json.NewEncoder(stdout).Encode(issued); err != nil {
+		return fmt.Errorf("the kit could not be written to standard output: %w; what the handoff issued is lost: the project's script decides whether it can be issued again", err)
+	}
+	return nil
 }
 
 // parseKitExpiry reads --expires: a number of days, as 7d, or what time.ParseDuration reads. Empty is
@@ -254,6 +325,7 @@ func kitAnswers(ctx context.Context, h *spec.Handoff, sets []string, answers str
 // vmKitVerbs run a handoff through the host daemon, on its operators' socket alone.
 func vmKitVerbs(c *hostClient, stderr io.Writer) kitVerbs {
 	return kitVerbs{
+		json:  true,
 		flags: func(*cobra.Command) {},
 		create: func(cmd *cobra.Command, req KitRequest) (*IssuedKit, error) {
 			var out IssuedKit

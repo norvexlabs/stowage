@@ -1,9 +1,9 @@
-FROM python:3.13-alpine@sha256:7984cf56ceaddebe4fefeb75d64000b9f45d8b77b11a09b24524da6cdc3af0c8 AS build
+FROM python:3.13-alpine@sha256:1e1f6334529d1fb26a2ef619d7cffb30a7c7d7cc1cc7338ebee283a58d1aeaca AS build
 ARG FEATURES=core
 COPY server/ /src/server/
 RUN echo "features: ${FEATURES}" > /src/build-info
 
-FROM python:3.13-alpine@sha256:7984cf56ceaddebe4fefeb75d64000b9f45d8b77b11a09b24524da6cdc3af0c8 AS runtime
+FROM python:3.13-alpine@sha256:1e1f6334529d1fb26a2ef619d7cffb30a7c7d7cc1cc7338ebee283a58d1aeaca AS runtime
 ARG STOWAGE_PROJECT_VERSION=dev
 ENV ATLAS_VERSION=${STOWAGE_PROJECT_VERSION}
 # "true": this release reads a schema newer than its own, so a rollback to it is allowed until a

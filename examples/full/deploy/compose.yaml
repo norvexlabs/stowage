@@ -67,7 +67,7 @@ services:
   # Echoes over TCP and UDP on 17007, which the spec's l4 routes publish as they are.
   echo:
     image: ${STOWAGE_IMAGE_INGEST}
-    command: [atlas-server, echo, "17007"]
+    command: [atlas-server, echo, "17007", "17009"]
     environment:
       ECHO_ENDPOINT: ${STOWAGE_L4_ECHO}
     healthcheck:

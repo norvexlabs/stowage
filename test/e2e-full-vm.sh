@@ -87,7 +87,7 @@ SEARCH_KEY_GIVEN=$(token)
 (umask 077; printf 'SEARCH_KEY: %s\n' "$SEARCH_KEY_GIVEN" >"$WORK/vm-answers.yaml")
 "$CTL" vm create --no-input --platform metal --device /dev/vda --answers "$WORK/vm-answers.yaml" --create opentofu --module "$(dirname "$0")/metal-truenas" --vm-name "${H//-/}" \
 	--interface uplink=mac="$MAC_UPLINK" --interface edge=dhcp,mac="$MAC_EDGE" --hostname "$H" --user ops --ssh-key "$KEY.pub" \
-	--tls internal --domains console=console.atlas.test,api=api.atlas.test,ingest=ingest.atlas.test,ops=ops.atlas.test \
+	--tls internal --domains console=console.atlas.test,api=api.atlas.test,ingest=ingest.atlas.test,ops=ops.atlas.test,echo-tls=echo.atlas.test \
 	--set ADMIN_EMAIL=admin@atlas.test --set ORG_NAME=Atlas --set SUPPORT_EMAIL=support@atlas.test --set SEARCH_URL=http://api:9090 \
 	--tofu-var pool="$POOL" --tofu-var parent_dataset="$DATASET" --tofu-var nic_attach="$BRIDGE" --tofu-var stop_file="$WORK/metal-up" \
 	--tofu-var insecure_skip_verify="${TRUENAS_INSECURE_SKIP_VERIFY:-false}" --cpus 2 --memory 4096 --disk 20 --host "$ADDR" --wait "${E2E_VM_WAIT:-60m}" \
@@ -241,6 +241,17 @@ echo_id=$(on_vm sudo docker ps -q --filter label=com.docker.compose.service=echo
 vpn_id=$(on_vm sudo docker ps -q --filter label=com.docker.compose.service=vpn)
 [[ -n $vpn_id && $(on_vm sudo docker inspect --format "'{{.HostConfig.NetworkMode}}'" "$vpn_id") == host ]] ||
 	fail "the vpn service (host_network) is not on the host's network"
+
+step "on the VM: the front terminates TLS on the echo-tls L4 route with its local CA's certificate for the route's domain, and the echo on the host's network gets the plaintext; its plaintext port is closed to this host"
+# -brief, not -quiet (which never ends on its input's end): the line sent, then the echo's answer.
+tls_echo=$( (echo tls-line; sleep 2) | timeout 20 openssl s_client -connect "$IP:17443" -servername echo.atlas.test -verify_hostname echo.atlas.test \
+	-CAfile "$WORK/vm-ca.crt" -verify_return_error -brief 2>&1) || true
+grep -q 'Verification: OK' <<<"$tls_echo" && grep -q ' tls-line$' <<<"$tls_echo" ||
+	{ echo "$tls_echo"; fail "the echo-tls route did not verify by echo.atlas.test, or the echo did not answer the plaintext line"; }
+tls_echo=$( (echo no-sni; sleep 2) | timeout 20 openssl s_client -connect "$IP:17443" -noservername -verify_hostname echo.atlas.test \
+	-CAfile "$WORK/vm-ca.crt" -verify_return_error -brief 2>&1) || true
+grep -q ' no-sni$' <<<"$tls_echo" || { echo "$tls_echo"; fail "a client sending no server name did not get the route's certificate"; }
+if timeout 5 bash -c "exec 3<>/dev/tcp/$IP/17009" 2>/dev/null; then fail "the echo's plaintext port 17009 answers this host"; fi
 
 step "on the VM: a reboot loads the services' tables before Docker brings their containers back"
 # The first boot switched to $V2's OS on trial, the install made over SSH after the health gate:

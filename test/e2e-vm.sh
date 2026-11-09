@@ -27,7 +27,7 @@
 # The file is read by test/vm.sh's vm_env, never copied or printed.
 set -euo pipefail
 
-PG=postgres:18-alpine@sha256:10a5c69a83035ab5239f5620d708520e8b28f5aa1f2b20143e6024532edadfb5
+PG=postgres:18-alpine@sha256:123b17998ccaf47e53b502e8c6a1e79afd8f579c6f3eec83c563da026f957395
 . "$(dirname "$0")/vm.sh"
 vm_env
 . "$(dirname "$0")/lib.sh"
@@ -375,28 +375,27 @@ ip=$(getent hosts "$ADDR" | awk '{print $1; exit}')
 code=$(curl -sk -o /dev/null -w '%{http_code}' --resolve "app.notes.test:443:$ip" https://app.notes.test/)
 [[ $code =~ ^[23] ]] || fail "https://app.notes.test/ on the VM answered $code"
 
-step "kit create on the VM, through the daemon; the kit taken by install --kit, by a Docker install and by a release on Kubernetes; Docker's by the VM; kit check"
-on_vm sudo notes-stow kit create second-site --name site-2 --set SITE_ADMIN=second@notes.test -o /tmp/site.kit >"$WORK/kit.log" 2>&1 || { cat "$WORK/kit.log"; fail "kit create on the VM"; }
+step "vm kit on the VM over the pinned SSH, through the daemon: the kit written here, taken by vm kit take, by a Docker install and by a release on Kubernetes; Docker's by the VM; vm kit check"
+VMKIT=(--user ops --ssh-key "$KEY.pub" --host "$ADDR")
+"$CTL" vm kit create "$H" second-site --name site-2 --set SITE_ADMIN=second@notes.test -o "$OP/vm.kit" --no-input "${VMKIT[@]}" >"$WORK/kit.log" 2>&1 || { cat "$WORK/kit.log"; fail "vm kit create"; }
 code=$(sed -n 's/^code  //p' "$WORK/kit.log")
-[[ -n $code ]] || { cat "$WORK/kit.log"; fail "kit create printed no code"; }
-printf '%s\n' "$code" | on_vm sudo sh -c "'umask 077; cat >/tmp/site.code'" || fail "writing the code on the VM"
-on_vm sudo notes-stow install --kit /tmp/site.kit --kit-code-file /tmp/site.code --no-input >"$WORK/kit-take.log" 2>&1 || { cat "$WORK/kit-take.log"; fail "install --kit on the VM"; }
-grep -qF 'changing ADMIN_EMAIL: ' "$WORK/kit-take.log" || { cat "$WORK/kit-take.log"; fail "the change was not logged"; }
-on_vm sudo notes-stow kit check second-site site-2 | grep -q 'proven$' || fail "kit check of a site"
-rc=0; on_vm sudo notes-stow kit check second-site site-unknown >/dev/null 2>&1 || rc=$?
-[[ $rc == 2 ]] || fail "kit check of an unknown site exited $rc, not 2"
-on_vm sudo cat /tmp/site.kit >"$OP/vm.kit" || fail "reading the VM's kit"
+[[ -n $code && -s $OP/vm.kit ]] || { cat "$WORK/kit.log"; fail "vm kit create wrote no kit or printed no code"; }
+[[ $(stat -c %a "$OP/vm.kit") == 600 ]] || fail "the kit is not 0600"
 (umask 077; printf '%s\n' "$code" >"$OP/vm.code")
+not_on_vm "$code" /tmp
+not_on_vm "$code" /home/ops
+"$CTL" vm kit take "$H" "$OP/vm.kit" --kit-code-file "$OP/vm.code" --no-input "${VMKIT[@]}" >"$WORK/kit-take.log" 2>&1 || { cat "$WORK/kit-take.log"; fail "vm kit take"; }
+grep -qF 'changing ADMIN_EMAIL: ' "$WORK/kit-take.log" || { cat "$WORK/kit-take.log"; fail "the change was not logged"; }
+"$CTL" vm kit check "$H" second-site site-2 "${VMKIT[@]}" | grep -q 'proven$' || fail "vm kit check of a site"
+rc=0; "$CTL" vm kit check "$H" second-site site-unknown "${VMKIT[@]}" >/dev/null 2>&1 || rc=$?
+[[ $rc == 2 ]] || fail "vm kit check of an unknown site exited $rc, not 2"
 "${DOCKER_CTL[@]}" --dir "$D" --no-input --kit "$OP/vm.kit" --kit-code-file "$OP/vm.code" >"$WORK/kit-vm-docker.log" 2>&1 || { cat "$WORK/kit-vm-docker.log"; stack_logs >&2; fail "--kit of the VM's kit on Docker"; }
 grep -q "^ADMIN_EMAIL='second@notes.test'\$" "$D/.env" || fail "the VM's kit did not replace Docker's recorded input"
 ctl v1.sh k8s upgrade --kit vm.kit --kit-code-file vm.code --no-input --timeout 5m >"$WORK/kit-vm-k8s.log" 2>&1 || { cat "$WORK/kit-vm-k8s.log"; cluster_logs >&2; fail "k8s upgrade --kit of the VM's kit"; }
 [[ $(kubectl get -n "$NS" secret notes-stowage -o jsonpath='{.data.ADMIN_EMAIL}' | base64 -d) == second@notes.test ]] || fail "the VM's kit did not replace Kubernetes's recorded input"
-on_vm 'cat >/tmp/docker.kit' <"$WORK/docker.kit" || fail "copying Docker's kit"
-on_vm 'umask 077; cat >/tmp/docker.code' <"$WORK/docker.code" || fail "copying Docker's kit's code"
-on_vm sudo notes-stow install --kit /tmp/docker.kit --kit-code-file /tmp/docker.code --no-input >"$WORK/kit-docker-vm.log" 2>&1 || { cat "$WORK/kit-docker-vm.log"; fail "install --kit of Docker's kit on the VM"; }
+"$CTL" vm kit take "$H" "$WORK/docker.kit" --kit-code-file "$WORK/docker.code" --no-input "${VMKIT[@]}" >"$WORK/kit-docker-vm.log" 2>&1 || { cat "$WORK/kit-docker-vm.log"; fail "vm kit take of Docker's kit"; }
 on_vm sudo cat /usr/local/notes/.env >"$WORK/vm-docker.env" || fail "reading the VM's .env"
 grep -qx "ADMIN_EMAIL='\{0,1\}from-docker@notes.test'\{0,1\}" "$WORK/vm-docker.env" || fail "Docker's kit did not replace the VM's recorded input"
-on_vm sudo rm -f /tmp/site.kit /tmp/site.code /tmp/docker.kit /tmp/docker.code
 # The cluster and the Docker install have done their part: the long steps left run without them.
 kind delete cluster --name "$CLUSTER" >/dev/null 2>&1 || true
 "${DOCKER_CTL[@]}" uninstall --dir "$D" --data --yes >"$WORK/docker-site-gone.log" 2>&1 || { cat "$WORK/docker-site-gone.log"; fail "uninstall of the Docker install beside"; }

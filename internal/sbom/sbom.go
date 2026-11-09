@@ -23,7 +23,7 @@ import (
 // (ship, stowage audit).
 const (
 	Syft  = "docker.io/anchore/syft:v1.55.0@sha256:4cc92b64ca74ffca4c94d4c8fcc01f217731375300be14d0b6eeb2e82eaa110a"
-	Grype = "docker.io/anchore/grype:v0.121.0@sha256:d39f3ac8a9f55477aadacd051cc4199a9d2dda30600ef00fdf5c406c9f40f0b7"
+	Grype = "docker.io/anchore/grype:v0.121.3@sha256:fc0e577410baa1ff4956f0927b05c9be6a0459c71517e23c14e44bcd9e19553f"
 	// Key is the image of the scanner a signing release carries (Dockerfile), so a mirror carries
 	// it to an install that audits without reaching the internet.
 	Key = "audit"

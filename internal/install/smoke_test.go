@@ -639,7 +639,7 @@ func smokeCloudflareCaddyfile(t *testing.T, work, frontRef string, f spec.Front)
 	if err != nil {
 		t.Fatal(err)
 	}
-	cf := tlsCaddyfile(f, "dns-cloudflare", map[string]string{"app": "notes.smoke.test", "api": "api.smoke.test"}, "ops@example.com", "443", true, func(k string) string { return vals[k] }, logins)
+	cf := tlsCaddyfile(f, nil, "dns-cloudflare", map[string]string{"app": "notes.smoke.test", "api": "api.smoke.test"}, "ops@example.com", "443", true, func(k string) string { return vals[k] }, logins)
 	if !strings.Contains(cf, "client_auth") || !strings.Contains(cf, "basic_auth {\n\t\t\tops $2a$") {
 		t.Fatalf("no client authentication or login in:\n%s", cf)
 	}

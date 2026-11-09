@@ -277,12 +277,13 @@ func (in *Installer) allowRoutes() []string {
 
 // allowed are the L4 routes a Docker host's allowlists hold: those with an allow_input whose
 // upstream Docker publishes (one on the host's network listens itself, untranslated: its list is
-// the host's input chain's, the operator's).
+// the host's input chain's, the operator's), but those the front terminates TLS on, whose sources
+// the front filters.
 func (in *Installer) allowed() []spec.L4Route {
 	var out []spec.L4Route
 	onHost := in.hostServices()
 	for _, r := range in.R.Spec.L4.Routes {
-		if name, _, _ := strings.Cut(r.Upstream, ":"); r.AllowInput != "" && !slices.Contains(onHost, name) {
+		if name, _, _ := strings.Cut(r.Upstream, ":"); r.AllowInput != "" && !r.Terminated() && !slices.Contains(onHost, name) {
 			out = append(out, r)
 		}
 	}

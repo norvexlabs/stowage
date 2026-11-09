@@ -1,5 +1,7 @@
 # The echo service, over TCP and UDP; and a NodePort Service for each of the release's L4 routes
-# (stowage.l4), to the component its upstream names.
+# (stowage.l4), to the component its upstream names. A route with tls is the chart's to terminate
+# (a Gateway's TLSRoute with cert-manager's certificate for its domain): this one publishes none,
+# never its plaintext port.
 {{- $c := dict "root" $ "component" "echo" }}
 apiVersion: apps/v1
 kind: Deployment
@@ -26,6 +28,7 @@ spec:
             - { containerPort: 17007, protocol: TCP }
             - { containerPort: 17007, protocol: UDP }
 {{- range .Values.stowage.l4 }}
+{{- if not .tls }}
 ---
 apiVersion: v1
 kind: Service
@@ -37,4 +40,5 @@ spec:
     {{- include "atlas.labels" (dict "root" $ "component" .service) | nindent 4 }}
   ports:
     - { name: {{ .name }}, protocol: {{ .protocol }}, port: {{ .port }}, targetPort: {{ .targetPort }} }
+{{- end }}
 {{- end }}

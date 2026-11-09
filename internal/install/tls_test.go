@@ -549,7 +549,7 @@ func TestRoutesOfOneDomainAreToldApartByTheirPaths(t *testing.T) {
 	if u := get(l.readEnv(), "STOWAGE_URL_IDP"); !strings.HasSuffix(u, ":18081/idp") {
 		t.Errorf("loopback URL %q", u)
 	}
-	lb := loopbackCaddyfile(e.r.Spec.Front, func(string) string { return "" }, nil)
+	lb := loopbackCaddyfile(e.r.Spec.Front, nil, func(string) string { return "" }, nil)
 	if !strings.Contains(lb, "\n# idp\nhttp://:10001 {\n\t@stowage_path_1 path /idp /idp/*\n\thandle @stowage_path_1 {\n\t\treverse_proxy idp:5556 {\n\t\t\tlb_try_duration 5s\n\t\t}\n\t}\n\thandle {\n\t\trespond 404\n\t}\n}\n") ||
 		!strings.Contains(lb, "\n# app\nhttp://:10000 {\n\treverse_proxy web:8080 {") {
 		t.Errorf("loopback Caddyfile:\n%s", lb)
@@ -592,7 +592,7 @@ func TestRoutesGivenOneDomainAreRefusedWhereTheyClash(t *testing.T) {
 	in.R.Spec.Front.Routes[2].Path = "/ops"
 	// Rendered all the same (an upgrade's checks aside), the route refuses everyone: its site
 	// asks no certificate.
-	cf := tlsCaddyfile(in.R.Spec.Front, "internal", map[string]string{"app": "a.example.com", "idp": "a.example.com", "ops": "a.example.com"}, "", "443", true, get, nil)
+	cf := tlsCaddyfile(in.R.Spec.Front, nil, "internal", map[string]string{"app": "a.example.com", "idp": "a.example.com", "ops": "a.example.com"}, "", "443", true, get, nil)
 	if !strings.Contains(cf, "\t@stowage_path_2 path /ops /ops/*\n\thandle @stowage_path_2 {\n\t\trespond 403\n\t}\n") || strings.Contains(cf, "client_auth") {
 		t.Errorf("a client_auth route on a shared site:\n%s", cf)
 	}
@@ -931,7 +931,7 @@ func TestAReRunChangesTheTLSModeAndTheCertificate(t *testing.T) {
 		mod  func(*Options)
 		want string
 	}{
-		"uncovered": {func(o *Options) { o.Cert, o.Key = narrow, narrowKey }, "the certificate does not cover api.example.com (api)"},
+		"uncovered": {func(o *Options) { o.Cert, o.Key = narrow, narrowKey }, "the certificate does not cover api.example.com (API_DOMAIN: api)"},
 		"half":      {func(o *Options) { o.Cert = cert }, "--tls byo needs --cert FILE and --key FILE"},
 		"loopback":  {func(o *Options) { o.TLS = Loopback }, "moving between loopback mode and a TLS mode is a new install"},
 		"cert":      {func(o *Options) { o.TLS, o.Cert, o.Key = "internal", cert, key }, "--cert and --key are for --tls byo, not internal"},

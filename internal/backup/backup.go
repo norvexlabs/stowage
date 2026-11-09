@@ -14,4 +14,4 @@ var Dockerfile []byte
 const Key = "backup"
 
 // RcloneVersion is the rclone the runner runs.
-const RcloneVersion = "1.75.1"
+const RcloneVersion = "1.76.0"

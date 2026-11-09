@@ -49,6 +49,11 @@ const (
 // mode. The host side comes from .env, so changing a port never changes these files.
 func frontPort(i int) int { return 10000 + i }
 
+// frontL4Port is the port the front's container listens on for the L4 route of index i among the
+// spec's, when it terminates its TLS: a range of its own, apart from 80, 443 and the loopback
+// routes' (frontPort), whatever host port publishes it.
+func frontL4Port(i int) int { return 20000 + i }
+
 // PortVar records a route's loopback port in .env.
 func PortVar(route string) string {
 	return "STOWAGE_PORT_" + strings.TrimPrefix(spec.URLVar(route), "STOWAGE_URL_")
@@ -57,10 +62,12 @@ func PortVar(route string) string {
 // loopbackCaddyfile serves each route on its own plain-HTTP port, as routeBody says; get reads a
 // recorded value. A route asking for a client certificate refuses everyone: plain HTTP carries
 // none.
-func loopbackCaddyfile(f spec.Front, get func(string) string, logins map[string]login) string {
+func loopbackCaddyfile(f spec.Front, l4 []spec.L4Route, get func(string) string, logins map[string]login) string {
 	var b strings.Builder
 	b.WriteString("# Written by the installer from the project's front routes; rewritten on every run.\n")
-	b.WriteString("{\n\tadmin off\n\tauto_https off\n\tpersist_config off\n}\n")
+	b.WriteString("{\n\tadmin off\n\tauto_https off\n\tpersist_config off\n")
+	layer4(&b, l4, get, func(spec.L4Route) string { return "" }, false, false)
+	b.WriteString("}\n")
 	for i, r := range f.Routes {
 		fmt.Fprintf(&b, "\n# %s\nhttp://:%d {\n", r.Name, frontPort(i))
 		serveRoutes(&b, []indexed{{i, r}}, func(b *strings.Builder, r spec.Route) {
@@ -221,11 +228,22 @@ func (in *Installer) warnIPv6Allowlists(get func(string) string, gw netip.Addr) 
 		holds = func(p netip.Prefix) bool { return p.Contains(gw) }
 		what = "the stack network's gateway " + gw.String() + ", as which"
 	}
+	type listed struct{ name, input string }
+	var lists []listed
 	for _, r := range in.R.Spec.Front.Routes {
-		if r.AllowInput == "" {
+		lists = append(lists, listed{r.Name, r.AllowInput})
+	}
+	// An L4 route the front terminates TLS on takes no allowlist in loopback mode.
+	for _, r := range in.R.Spec.L4.Routes {
+		if r.Terminated() && get("STOWAGE_TLS_MODE") != Loopback {
+			lists = append(lists, listed{r.Name, r.AllowInput})
+		}
+	}
+	for _, r := range lists {
+		if r.input == "" {
 			continue
 		}
-		for _, s := range splitSources(get(r.AllowInput)) {
+		for _, s := range splitSources(get(r.input)) {
 			p, err := netip.ParsePrefix(s)
 			if err != nil {
 				a, aerr := netip.ParseAddr(s)
@@ -238,7 +256,7 @@ func (in *Installer) warnIPv6Allowlists(get func(string) string, gw netip.Addr) 
 				p = netip.PrefixFrom(p.Addr().Unmap(), max(p.Bits()-96, 0))
 			}
 			if holds(p) {
-				in.O.logf("warning: route %s: %s=%s: %s holds %s every IPv6 client passes while the stack's IPv6 is off and this host has a global IPv6 address: install --ipv6, or list narrower sources", r.Name, r.AllowInput, get(r.AllowInput), s, what)
+				in.O.logf("warning: route %s: %s=%s: %s holds %s every IPv6 client passes while the stack's IPv6 is off and this host has a global IPv6 address: install --ipv6, or list narrower sources", r.name, r.input, get(r.input), s, what)
 				break
 			}
 		}
@@ -368,14 +386,14 @@ func frontCommand(f spec.Front, ca string) []string {
 // ipv6 turns IPv6 on for the default network. onHost are the services on the host's network
 // (hostServices), whose L4 routes' ports are their own.
 func frontCompose(f spec.Front, l4 []spec.L4Route, get func(string) string, mode string, host hostAPI, digest, ca string, clientCA, ipv6 bool, onHost, v4Only []string) ([]byte, error) {
-	var ports []string
+	var ports []any
 	volumes := []string{"./" + Caddyfile + ":/etc/caddy/Caddyfile:ro", "stowage-front-data:/data"}
 	if mode == Loopback {
 		for i, r := range f.Routes {
 			ports = append(ports, fmt.Sprintf("${STOWAGE_LOOPBACK_ADDRESS}:${%s}:%d", PortVar(r.Name), frontPort(i)))
 		}
 	} else {
-		ports = []string{"${" + HTTPPortVar + "}:80", "${" + HTTPSPortVar + "}:443"}
+		ports = []any{"${" + HTTPPortVar + "}:80", "${" + HTTPSPortVar + "}:443"}
 	}
 	if mode == "byo" {
 		volumes = append(volumes, "./"+TLSDir+":/etc/caddy/"+TLSDir+":ro")
@@ -422,8 +440,26 @@ func frontCompose(f spec.Front, l4 []spec.L4Route, get func(string) string, mode
 	// every address alone: Docker's userland proxy would carry its IPv6 clients past DOCKER-USER,
 	// where its allowlist is (allowRules). None for a service on the host's network
 	// (hostNet), which listens on the port itself: on the VM, every route's.
-	for _, r := range l4 {
+	for i, r := range l4 {
 		name, target, _ := strings.Cut(r.Upstream, ":")
+		if r.Terminated() {
+			// The front's own port: it terminates TLS there and forwards the plaintext stream,
+			// filtering the sources itself. In loopback mode, plaintext on the loopback address
+			// alone: TLS is what is in front of the install's.
+			port := map[string]any{"target": frontL4Port(i), "published": strconv.Itoa(r.Port), "protocol": "tcp"}
+			switch a := bindAddr(r, get); {
+			case mode == Loopback:
+				port["host_ip"] = "${STOWAGE_LOOPBACK_ADDRESS}"
+			case a != "":
+				port["host_ip"] = a
+			}
+			front, _ := services[FrontService].(map[string]any)
+			if front == nil {
+				return nil, fmt.Errorf("l4.routes %s: the front terminates its TLS, and there is no front", r.Name)
+			}
+			front["ports"] = append(front["ports"].([]any), port)
+			continue
+		}
 		if slices.Contains(onHost, name) {
 			continue
 		}

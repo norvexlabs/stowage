@@ -230,9 +230,10 @@ class EchoServer(socketserver.ThreadingTCPServer):
     daemon_threads = True
 
 
-def echo(port):
-    """Serves TCP on port in a thread, UDP on port in this one."""
-    threading.Thread(target=EchoServer(("", port), EchoTCP).serve_forever, daemon=True).start()
+def echo(port, *more):
+    """Serves TCP on port and each of more in a thread, UDP on port in this one."""
+    for p in (port, *more):
+        threading.Thread(target=EchoServer(("", p), EchoTCP).serve_forever, daemon=True).start()
     udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     udp.bind(("", port))
     log(f"atlas echo on :{port} (tcp, udp)")
@@ -244,7 +245,7 @@ def echo(port):
 def main():
     role = sys.argv[1] if len(sys.argv) > 1 else "api"
     if role == "echo":
-        echo(int(sys.argv[2]))
+        echo(*(int(p) for p in sys.argv[2:]))
     if role == "probe":
         try:
             with urllib.request.urlopen(f"http://127.0.0.1:{sys.argv[2]}/health", timeout=2) as r:

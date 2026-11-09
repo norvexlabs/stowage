@@ -199,7 +199,7 @@ func TestVMAttach(t *testing.T) {
 	}
 	// One system answering each call in turn, with the host key vm create recorded for its address.
 	vm := func(steps ...func() ([]byte, error)) {
-		if err := os.WriteFile(filepath.Join(dir, "known_hosts"), []byte("notes-1.lan key\n"), 0o600); err != nil {
+		if err := os.WriteFile(filepath.Join(dir, "known_hosts"), []byte("notes-1.lan ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEAIlrmYko7n75rw1in9PSsqvQQwoVBxv2WjCA2q6yuS\n"), 0o600); err != nil {
 			t.Fatal(err)
 		}
 		n := 0
@@ -446,7 +446,7 @@ func TestVMAttachToAVMOfOneUnnamedNIC(t *testing.T) {
 	dir := filepath.Join(r.state, "notes", "vms", "notes-1")
 	v.r.Spec.Host = &spec.Host{Interfaces: map[string]spec.HostInterface{"uplink": {Primary: true}, "edge": {}}}
 	in := v.installer(r.mod(nil))
-	if err := os.WriteFile(filepath.Join(dir, "known_hosts"), []byte("notes-1.lan key\n"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "known_hosts"), []byte("notes-1.lan ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEAIlrmYko7n75rw1in9PSsqvQQwoVBxv2WjCA2q6yuS\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	n := 0

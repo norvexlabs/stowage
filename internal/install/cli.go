@@ -127,7 +127,7 @@ func newCommand(r *Release, self string, stdout, stderr io.Writer, tools K8sOpti
 	if r.Spec.Front.PublishCA != nil {
 		rf.StringVar(&o.CA, "ca", "", "--tls byo: the CA the certificate chains to, PEM, published to the stack")
 	}
-	if len(clientAuthRoutes(r.Spec.Front)) > 0 {
+	if len(clientAuthRoutes(r.Spec)) > 0 {
 		rf.StringVar(&o.ClientCA, "client-ca", "", "the CA, PEM, the client certificates of the routes with client_auth chain to, copied into the install (a re-run replaces it; none removes it)")
 	}
 	rf.IntVar(&o.HTTPPort, "http-port", 0, "the host port a TLS front serves HTTP on (default the project's front.http_port, else 80; a re-run changes it)")
@@ -976,7 +976,7 @@ func vmCreateCommand(in *Installer, o *Options, prepare func() error, terminal f
 			f.StringVar(&o.CA, "ca", "", "--tls byo: the CA the certificate chains to, PEM, given over SSH once the VM answers and published to the stack")
 		}
 	}
-	if len(clientAuthRoutes(in.R.Spec.Front)) > 0 {
+	if len(clientAuthRoutes(in.R.Spec)) > 0 {
 		f.StringVar(&o.ClientCA, "client-ca", "", "the CA, PEM, the client certificates of the routes with client_auth chain to, given over SSH once the VM answers")
 	}
 	f.StringVar(&o.TLS, "tls", "", tlsVM)
@@ -1052,12 +1052,13 @@ func vmCreateCommand(in *Installer, o *Options, prepare func() error, terminal f
 	}
 	af := attach.Flags()
 	af.StringVar(&at.Interface, "interface", "", "the NIC, ROLE=SPEC as vm create takes it: dhcp, static,address=A/P or none, then mac= (default: generated) and attach= (the bridge; default the primary's)")
-	af.StringVar(&at.User, "user", "", "the VM's administrator, who logs in over SSH (default: your user name, else sysadmin)")
-	af.StringVar(&at.SSHKey, "ssh-key", "", "the administrator's SSH public key file (default: ~/.ssh/id_ed25519.pub, id_ecdsa.pub or id_rsa.pub)")
-	af.StringVar(&at.Address, "host", "", "the name or address the VM answers at (default: HOSTNAME)")
+	reachFlags(af, &at.User, &at.SSHKey, &at.Address)
 	af.DurationVar(&at.Wait, "wait", 0, "how long to wait for the VM to answer over SSH after its power cycle (default 10m)")
 	_ = attach.MarkFlagRequired("interface")
 	vm.AddCommand(create, destroy, attach, truenasCommand(os.Getenv))
+	if k := in.vmKitCommand(o, prepare, terminal); k != nil {
+		vm.AddCommand(k)
+	}
 	return vm
 }
 

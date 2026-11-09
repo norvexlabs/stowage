@@ -42,11 +42,12 @@ var modeLabels = map[string]string{
 	"internal":       "HTTPS on your domains, certificates from a local CA browsers do not trust",
 }
 
-// domainKeys maps each route to the input holding its domain.
+// domainKeys maps each route to the input holding its domain: the front's routes, and the L4
+// routes it terminates TLS on.
 func (in *Installer) domainKeys() map[string]string {
 	out := map[string]string{}
-	for _, r := range in.R.Spec.Front.Routes {
-		out[r.Name] = r.DomainInput
+	for _, d := range in.R.Spec.RouteDomains() {
+		out[d.Route] = d.Input
 	}
 	return out
 }
@@ -63,7 +64,7 @@ func (in *Installer) applyDomains() error {
 		host := o.Domains[route]
 		k, ok := keys[route]
 		if !ok {
-			return fmt.Errorf("--domains: %q is no route (%s)", route, strings.Join(in.R.Spec.Front.RouteNames(), ", "))
+			return fmt.Errorf("--domains: %q is no route (%s)", route, strings.Join(slices.Sorted(maps.Keys(keys)), ", "))
 		}
 		if other, given := by[k]; given && o.Domains[other] != host {
 			return fmt.Errorf("--domains %s=%s and %s=%s disagree: both routes take their domain from %s", other, o.Domains[other], route, host, k)
@@ -510,13 +511,10 @@ func (in *Installer) frontInputs(mode string) []input {
 	}
 	// One input per domain, which the routes sharing it name.
 	var out []input
-	routes := map[string][]string{}
-	for _, r := range in.R.Spec.Front.Routes {
-		if _, ok := in.R.Spec.Input(r.DomainInput); !ok {
-			if routes[r.DomainInput] == nil {
-				out = append(out, input{spec.Input{Key: r.DomainInput, Required: true}, in.domainCheck, true})
-			}
-			routes[r.DomainInput] = append(routes[r.DomainInput], r.Name)
+	keys, routes := in.R.Spec.DomainGroups()
+	for _, k := range keys {
+		if _, ok := in.R.Spec.Input(k); !ok {
+			out = append(out, input{spec.Input{Key: k, Required: true}, in.domainCheck, true})
 		}
 	}
 	for i := range out {
@@ -552,7 +550,7 @@ const hsts = `header Strict-Transport-Security "max-age=31536000; includeSubDoma
 // of one domain are one site, told apart by their paths. A route with client_auth requires a
 // client certificate chaining to the install's client CA (clientCA: one was given), and refuses
 // everyone while none was.
-func tlsCaddyfile(f spec.Front, mode string, domains map[string]string, email string, httpsPort string, clientCA bool, get func(string) string, logins map[string]login) string {
+func tlsCaddyfile(f spec.Front, l4 []spec.L4Route, mode string, domains map[string]string, email string, httpsPort string, clientCA bool, get func(string) string, logins map[string]login) string {
 	public := publicHTTPSPort(mode, httpsPort)
 	var b strings.Builder
 	b.WriteString("# Written by the installer from the project's front routes; rewritten on every run.\n")
@@ -571,6 +569,7 @@ func tlsCaddyfile(f spec.Front, mode string, domains map[string]string, email st
 	case "internal":
 		b.WriteString("\tlocal_certs\n")
 	}
+	layer4(&b, l4, get, func(r spec.L4Route) string { return domains[r.Name] }, clientCA, true)
 	b.WriteString("}\n")
 	// One site per domain, in the order of its first route.
 	var order []string
@@ -630,14 +629,107 @@ func tlsCaddyfile(f spec.Front, mode string, domains map[string]string, email st
 			fmt.Fprintf(&b, "http://%s {\n\tredir https://%s:%s{uri} 308\n}\n", d, d, public)
 		}
 	}
+	// A domain only L4 routes terminate TLS for is a site of its own, which serves nothing over
+	// HTTPS: it makes Caddy obtain, renew and hold its certificate as a route's (its ACME
+	// challenges on the front's ports, byo's files loaded), which the layer4 TLS handler serves.
+	var l4Order []string
+	l4Names := map[string][]string{}
+	for _, r := range l4 {
+		d := domains[r.Name]
+		if !r.Terminated() || d == "" || sites[d] != nil {
+			continue
+		}
+		if l4Names[d] == nil {
+			l4Order = append(l4Order, d)
+		}
+		l4Names[d] = append(l4Names[d], r.Name)
+	}
+	for _, d := range l4Order {
+		fmt.Fprintf(&b, "\n# the L4 routes %s' certificate\n%s {\n", strings.Join(l4Names[d], ", "), d)
+		if mode == "byo" {
+			fmt.Fprintf(&b, "\ttls /etc/caddy/%s/cert.pem /etc/caddy/%s/key.pem\n", TLSDir, TLSDir)
+		}
+		b.WriteString("\trespond 404\n}\n")
+	}
 	return b.String()
 }
 
-// clientAuthRoutes are the names of the front's routes asking for a client certificate.
-func clientAuthRoutes(f spec.Front) []string {
+// l4Closed is why the front closes an L4 route it terminates TLS on to every source, "" when it
+// serves it: its allowlist given and empty; a client certificate asked with no domain (loopback
+// mode's plain TCP carries none) or no client CA; in a TLS mode, no domain. layer4 and the route's
+// status line both read it, so what status says is what the front does.
+func l4Closed(r spec.L4Route, get func(string) string, domain string, clientCA, tls bool) string {
+	switch {
+	case tls && r.AllowInput != "" && len(splitSources(get(r.AllowInput))) == 0:
+		return r.AllowInput + " is empty"
+	case r.TLS.ClientAuth && !tls:
+		return "it asks for a client certificate, which loopback mode's plain TCP carries none of"
+	case tls && domain == "":
+		return "its domain " + r.TLS.DomainInput + " is empty"
+	case r.TLS.ClientAuth && !clientCA:
+		return "it asks for a client certificate, and the install holds no client CA (--client-ca)"
+	}
+	return ""
+}
+
+// layer4 writes the global layer4 block serving the L4 routes the front terminates TLS on, each
+// on its port in the front's container (frontL4Port, by its index among l4): a source its allowlist does not hold is closed before any
+// handshake (everyone while the list is empty); then, given a domain (a TLS mode), TLS with the
+// certificate Caddy holds for it — a client sending no server name given it too — and a client
+// certificate chaining to the install's client CA when the route asks one (everyone closed while
+// none was given); then the plaintext stream to the upstream. Without a domain (loopback mode) the
+// stream passes as it is, and a route asking for a client certificate closes everyone: plain TCP
+// carries none. Nothing is written without such a route.
+func layer4(b *strings.Builder, l4 []spec.L4Route, get func(string) string, domain func(spec.L4Route) string, clientCA, tls bool) {
+	if !slices.ContainsFunc(l4, spec.L4Route.Terminated) {
+		return
+	}
+	b.WriteString("\tlayer4 {\n")
+	for i, r := range l4 {
+		if !r.Terminated() {
+			continue
+		}
+		d := domain(r)
+		fmt.Fprintf(b, "\t\t# %s, host port %d\n\t\t:%d {\n", r.Name, r.Port, frontL4Port(i))
+		// In loopback mode the route takes no allowlist: it is published on the loopback address
+		// alone, and the front would see every client as the stack network's gateway.
+		var sources []string
+		if tls {
+			sources = splitSources(get(r.AllowInput))
+		}
+		// In a TLS mode a route without its domain is closed, never served in the clear.
+		switch {
+		case l4Closed(r, get, d, clientCA, tls) != "":
+			b.WriteString("\t\t\troute {\n\t\t\t\tclose\n\t\t\t}\n\t\t}\n")
+			continue
+		case len(sources) > 0:
+			fmt.Fprintf(b, "\t\t\t@stowage_allowed remote_ip %s\n\t\t\troute @stowage_allowed {\n", strings.Join(sources, " "))
+		default:
+			b.WriteString("\t\t\troute {\n")
+		}
+		if d != "" {
+			fmt.Fprintf(b, "\t\t\t\ttls {\n\t\t\t\t\tconnection_policy {\n\t\t\t\t\t\tdefault_sni %s\n", d)
+			if r.TLS.ClientAuth {
+				fmt.Fprintf(b, "\t\t\t\t\t\tclient_auth {\n\t\t\t\t\t\t\tmode require_and_verify\n\t\t\t\t\t\t\ttrust_pool file %s\n\t\t\t\t\t\t}\n", clientCAPath)
+			}
+			b.WriteString("\t\t\t\t\t}\n\t\t\t\t}\n")
+		}
+		fmt.Fprintf(b, "\t\t\t\tproxy %s\n\t\t\t}\n\t\t}\n", r.Upstream)
+	}
+	b.WriteString("\t}\n")
+}
+
+// clientAuthRoutes are the names of the routes asking for a client certificate the install's
+// client CA issued: the front's, then the L4 routes it terminates TLS on.
+func clientAuthRoutes(s *spec.Spec) []string {
 	var names []string
-	for _, r := range f.Routes {
+	for _, r := range s.Front.Routes {
 		if r.ClientAuth {
+			names = append(names, r.Name)
+		}
+	}
+	for _, r := range s.L4.Routes {
+		if r.Terminated() && r.TLS.ClientAuth {
 			names = append(names, r.Name)
 		}
 	}
@@ -651,7 +743,7 @@ func (in *Installer) readClientCA() ([]byte, error) {
 	switch {
 	case v == "":
 		return nil, nil
-	case len(clientAuthRoutes(in.R.Spec.Front)) == 0:
+	case len(clientAuthRoutes(in.R.Spec)) == 0:
 		return nil, fmt.Errorf("--client-ca: no route of %s asks for a client certificate (client_auth)", in.R.Spec.Name)
 	case v == noCA:
 		return nil, nil
@@ -718,11 +810,11 @@ func (in *Installer) writeClientCA(raw []byte, mode string) error {
 			return err
 		}
 	}
-	routes := clientAuthRoutes(in.R.Spec.Front)
+	routes := clientAuthRoutes(in.R.Spec)
 	switch {
 	case len(routes) == 0:
 	case mode == Loopback:
-		in.O.logf("%s refuse(s) everyone in loopback mode: plain HTTP carries no client certificate", strings.Join(routes, ", "))
+		in.O.logf("%s refuse(s) everyone in loopback mode: plain HTTP or TCP carries no client certificate", strings.Join(routes, ", "))
 	case !fileExists(in.path(ClientCAFile)):
 		in.O.logf("%s refuse(s) everyone until --client-ca FILE gives the CA their client certificates chain to", strings.Join(routes, ", "))
 	}

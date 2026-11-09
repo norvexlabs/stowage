@@ -175,17 +175,17 @@ rc=0; "${CTL[@]}" kit check search-client site-unknown --dir "$D" >/dev/null 2>&
 "${CTL[@]}" --dir "$D" --no-input --set SEARCH_URL= >"$WORK/kit-off.log" 2>&1 || { cat "$WORK/kit-off.log"; fail "re-run --set SEARCH_URL="; }
 atlas_running "$V1" 1
 
-step "the L4 routes: the echo service over TCP and UDP on 17007, published beside the front, then on one address; an optional service its input turns on"
-# echo_l4 tcp|udp: what the echo service sends back for "ping" (TCP: prefixed by its endpoint).
+step "the L4 routes: the echo service over TCP and UDP on 17007, published beside the front, then on one address; the echo-tls route through the front in the clear on the loopback address alone (loopback mode); an optional service its input turns on"
+# echo_l4 tcp|udp [port]: what the echo service sends back for "ping" (TCP: prefixed by its endpoint).
 echo_l4() {
 	python3 -c '
 import socket, sys
 proto = sys.argv[1]
 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM if proto == "tcp" else socket.SOCK_DGRAM)
 s.settimeout(10)
-s.connect(("127.0.0.1", 17007))
+s.connect(("127.0.0.1", int(sys.argv[2])))
 s.sendall(b"ping\n" if proto == "tcp" else b"ping")
-print(s.recv(256).decode().strip())' "$1"
+print(s.recv(256).decode().strip())' "$1" "${2:-17007}"
 }
 [[ $(echo_l4 tcp) == "localhost:17007 ping" ]] || { stack_logs >&2; fail "the echo service over TCP (STOWAGE_L4_ECHO handed to it)"; }
 [[ $(echo_l4 udp) == "ping" ]] || fail "the echo service over UDP"
@@ -200,6 +200,13 @@ echo_ports() { docker port "$(docker ps -q --filter "label=com.docker.compose.pr
 grep -qxF "echo      tcp/17007 localhost:17007 · on every address, open to whoever reaches this host (ECHO_BIND gives it one address)" "$WORK/status.txt" &&
 	grep -qxF 'echo-udp  udp/17007 · on every address, open to whoever reaches this host: ECHO_SOURCES'"'"'s sources hold once `at-stow tune --apply` consents' "$WORK/status.txt" ||
 	{ cat "$WORK/status.txt"; fail "status does not list the L4 routes"; }
+# In loopback mode the front passes the echo-tls route in the clear, on the loopback address alone:
+# TLS is the proxy's in front of the install.
+[[ $(echo_l4 tcp 17443) == "localhost:17007 ping" ]] || { stack_logs >&2; fail "the echo-tls route through the front in loopback mode"; }
+tls_ports=$(docker port "$(docker ps -q --filter "label=com.docker.compose.project=$(project)" --filter label=com.docker.compose.service=stowage-front)" | awk -F' -> ' '$2 ~ /:17443$/ {print $2}' | sort | tr '\n' ' ')
+[[ $tls_ports == "127.0.0.1:17443 " ]] || fail "the echo-tls route is published on $tls_ports, not 127.0.0.1 alone"
+grep -qxF "echo-tls  tcp/17443 · on the loopback address alone, in the clear: TLS and the sources are the proxy's in front of this install" "$WORK/status.txt" ||
+	{ cat "$WORK/status.txt"; fail "status does not say the echo-tls route is in the clear on the loopback address"; }
 relay() { docker ps -q --filter "label=com.docker.compose.project=$(project)" --filter label=com.docker.compose.service=relay; }
 [[ -z $(relay) ]] || fail "the relay runs while RELAY_SOURCE is empty"
 "${CTL[@]}" --dir "$D" --no-input --set RELAY_SOURCE=sensors >"$WORK/relay-on.log" 2>&1 || { cat "$WORK/relay-on.log"; fail "re-run --set RELAY_SOURCE=sensors"; }

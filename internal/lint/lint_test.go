@@ -128,7 +128,7 @@ func TestEachRuleFires(t *testing.T) {
 		{"backup image key", []edit{{specFile, "  web: { context: web", "  backup: { context: web"}, {composeFile, "${STOWAGE_IMAGE_WEB}", "${STOWAGE_IMAGE_BACKUP}"}}, nil, `"backup" is reserved`},
 		{"chown image key", []edit{{specFile, "  web: { context: web", "  chown: { context: web"}, {composeFile, "${STOWAGE_IMAGE_WEB}", "${STOWAGE_IMAGE_CHOWN}"}}, nil, `"chown" is reserved`},
 		{"front image key", []edit{{specFile, "  web: { context: web", "  front: { context: web"}, {composeFile, "${STOWAGE_IMAGE_WEB}", "${STOWAGE_IMAGE_FRONT}"}}, nil, `"front" is reserved`},
-		{"unpinned ref", []edit{{specFile, "postgres:18-alpine@sha256:10a5c69a83035ab5239f5620d708520e8b28f5aa1f2b20143e6024532edadfb5", "postgres:17-alpine"}}, nil, "pinned by digest"},
+		{"unpinned ref", []edit{{specFile, "postgres:18-alpine@sha256:123b17998ccaf47e53b502e8c6a1e79afd8f579c6f3eec83c563da026f957395", "postgres:17-alpine"}}, nil, "pinned by digest"},
 		{"missing dockerfile", []edit{{specFile, "dockerfile: web/Dockerfile", "dockerfile: web/Nope"}}, nil, "web/Nope"},
 		{"missing input", []edit{{specFile, "inputs: [web/]", "inputs: [nope/]"}}, nil, "nope/"},
 		{"route upstream not a service", []edit{{specFile, "upstream: web:8080", "upstream: www:8080"}}, nil, `service "www"`},
@@ -203,6 +203,12 @@ func TestEachRuleFiresOnFull(t *testing.T) {
 		want  string
 	}{
 		{"handoff file input", []edit{{sp, "cmd: [handoff.py, issue], env: []", "cmd: [handoff.py, issue], env: [API_CA_BUNDLE]"}}, nil, "is a file input"},
+		{"l4 tls udp", []edit{{sp, "      protocol: tcp\n      port: 17443", "      protocol: udp\n      port: 17443"}}, nil, "l4.routes[2].tls: the front terminates TLS over TCP alone"},
+		{"l4 tls no mode", []edit{{sp, "tls_modes: [acme, dns-cloudflare, byo, internal, none]", "tls_modes: [none]"}}, nil, "l4.routes[2].tls: the front terminates TLS with the certificate of its TLS mode, and atlas offers none"},
+		{"l4 tls domain name", []edit{{sp, "tls: { domain_input: ECHO_DOMAIN }", "tls: { domain_input: echo-domain }"}}, nil, `l4.routes[2].tls.domain_input: "echo-domain" is not an environment variable name`},
+		{"l4 tls domain secret", []edit{{sp, "tls: { domain_input: ECHO_DOMAIN }", "tls: { domain_input: SEARCH_KEY }"}}, nil, "l4.routes[2].tls.domain_input: SEARCH_KEY is secret"},
+		{"l4 tls same port on the VM", []edit{{sp, "      upstream: echo:17009", "      upstream: echo:17443"}}, nil, "where the front holds the route's port 17443 to terminate TLS"},
+		{"l4 tls key", []edit{{sp, "tls: { domain_input: ECHO_DOMAIN }", "tls: { domain: ECHO_DOMAIN }"}}, nil, "field domain not found"},
 		{"absolute path", []edit{{sp, "compose: deploy/compose.yaml", "compose: /etc/compose.yaml"}}, nil, "must be relative to the project root"},
 		{"audit unsigned", []edit{{sp, "provider: cosign-key\n  key: env://ATLAS_SIGNING_KEY", "provider: none\n  key: env://ATLAS_SIGNING_KEY"}}, nil, "audit: a project that signs no release"},
 		{"audit fail_on", []edit{{sp, "fail_on: critical", "fail_on: none"}}, nil, `audit.fail_on: "none": one of negligible`},
@@ -256,7 +262,7 @@ func TestEachRuleFiresOnFull(t *testing.T) {
 		{"forward twice", []edit{{sp, "forward: [uplink]", "forward: [uplink, uplink]"}}, nil, "host.interfaces.vpn0.forward[1]: uplink is given twice"},
 		{"forward empty", []edit{{sp, "forward: [uplink]", "forward: []"}}, nil, "host.interfaces.vpn0.forward: is empty"},
 		{"build network", []edit{{sp, "    network: default\n", "    network: bridge\n"}}, nil, `images.api.network: "bridge" is not a build network: default, host, none`},
-		{"build keys with ref", []edit{{sp, "postgres:  { context: postgres, dockerfile: postgres/Dockerfile }", `postgres:  { network: none, ref: "postgres:18-alpine@sha256:10a5c69a83035ab5239f5620d708520e8b28f5aa1f2b20143e6024532edadfb5" }`}}, nil, "images.postgres: ref and build fields are exclusive"},
+		{"build keys with ref", []edit{{sp, "postgres:  { context: postgres, dockerfile: postgres/Dockerfile }", `postgres:  { network: none, ref: "postgres:18-alpine@sha256:123b17998ccaf47e53b502e8c6a1e79afd8f579c6f3eec83c563da026f957395" }`}}, nil, "images.postgres: ref and build fields are exclusive"},
 		{"memory share of 0", []edit{{sp, memShares, "services:\n  postgres: { memory: 0 }\n"}}, nil, "services.postgres.memory: 0: a percent of the host's RAM, from 1 to 90"},
 		{"memory share over 90", []edit{{sp, memShares, "services:\n  postgres: { memory: 91 }\n"}}, nil, "services.postgres.memory: 91: a percent of the host's RAM, from 1 to 90"},
 		{"memory shares over 90", []edit{{sp, memShares, "services:\n  postgres: { memory: 60 }\n  api: { memory: 31 }\n"}}, nil, "services: the memory shares total 91 %: at most 90"},
@@ -371,9 +377,9 @@ func TestEachRuleFiresOnFull(t *testing.T) {
 		{"public key not PEM", nil, map[string]string{"keys/release-2026.pub": "ssh-ed25519 AAAA\n"}, "is not a PEM public key"},
 		{"public key unreadable DER", nil, map[string]string{"keys/release-2026.pub": "-----BEGIN PUBLIC KEY-----\nAAAA\n-----END PUBLIC KEY-----\n"}, "signing.public_keys[0]: keys/release-2026.pub: "},
 		{"image key with underscore", []edit{{sp, "  ui:        {", "  u_i:       {"}}, nil, "separated by single '-'"},
-		{"ref and build", []edit{{sp, "dockerfile: postgres/Dockerfile }", `dockerfile: postgres/Dockerfile, ref: "postgres:18-alpine@sha256:10a5c69a83035ab5239f5620d708520e8b28f5aa1f2b20143e6024532edadfb5" }`}}, nil, "exclusive"},
-		{"unpinned FROM", []edit{{"provision/Dockerfile", "FROM python:3.13-alpine@sha256:7984cf56ceaddebe4fefeb75d64000b9f45d8b77b11a09b24524da6cdc3af0c8", "FROM python:3.13-alpine"}}, nil, "FROM python:3.13-alpine must be pinned"},
-		{"invalid Dockerfile", []edit{{"provision/Dockerfile", "FROM python:3.13-alpine@sha256:7984cf56ceaddebe4fefeb75d64000b9f45d8b77b11a09b24524da6cdc3af0c8", "FROM python:3.13-alpine@sha256:7984cf56ceaddebe4fefeb75d64000b9f45d8b77b11a09b24524da6cdc3af0c8 AS a b"}}, nil, "provision/Dockerfile: dockerfile:"},
+		{"ref and build", []edit{{sp, "dockerfile: postgres/Dockerfile }", `dockerfile: postgres/Dockerfile, ref: "postgres:18-alpine@sha256:123b17998ccaf47e53b502e8c6a1e79afd8f579c6f3eec83c563da026f957395" }`}}, nil, "exclusive"},
+		{"unpinned FROM", []edit{{"provision/Dockerfile", "FROM python:3.13-alpine@sha256:1e1f6334529d1fb26a2ef619d7cffb30a7c7d7cc1cc7338ebee283a58d1aeaca", "FROM python:3.13-alpine"}}, nil, "FROM python:3.13-alpine must be pinned"},
+		{"invalid Dockerfile", []edit{{"provision/Dockerfile", "FROM python:3.13-alpine@sha256:1e1f6334529d1fb26a2ef619d7cffb30a7c7d7cc1cc7338ebee283a58d1aeaca", "FROM python:3.13-alpine@sha256:1e1f6334529d1fb26a2ef619d7cffb30a7c7d7cc1cc7338ebee283a58d1aeaca AS a b"}}, nil, "provision/Dockerfile: dockerfile:"},
 		{"unknown target", []edit{{sp, "target: runtime", "target: final"}}, nil, `"final" is not a stage`},
 		{"compose no service", nil, map[string]string{cp: "services: {}\n"}, "declares no service"},
 		{"compose unparsable", nil, map[string]string{cp: "services: [\n"}, "stack.compose"},
@@ -474,15 +480,15 @@ func TestEachRuleFiresOnFull(t *testing.T) {
 		{"l4 allow secret", []edit{{sp, `default: "0.0.0.0/0 ::/0", shapes: [docker, kairos] }`, `default: "0.0.0.0/0 ::/0", shapes: [docker, kairos], secret: true }`}}, nil, "ECHO_SOURCES is secret: the firewall's rules show it"},
 		{"l4 allow advanced", []edit{{sp, `default: "0.0.0.0/0 ::/0", shapes: [docker, kairos] }`, `default: "0.0.0.0/0 ::/0", shapes: [docker, kairos], advanced: true }`}}, nil, "ECHO_SOURCES is advanced, never asked"},
 		{"l4 allow by mode", []edit{{sp, `default: "0.0.0.0/0 ::/0", shapes: [docker, kairos] }`, `default: "0.0.0.0/0 ::/0", shapes: [docker, kairos], when: tls }`}}, nil, "ECHO_SOURCES is asked only when tls: the firewall reads it in every mode"},
-		{"host network on the VM", []edit{{cp, "    command: [atlas-server, echo, \"17007\"]\n", "    command: [atlas-server, echo, \"17007\"]\n    network_mode: host\n"}}, nil, "services.echo.network_mode: host: the VM's firewall opens only what Stowage publishes"},
-		{"host network inherited", []edit{{cp, "    command: [atlas-server, echo, \"17007\"]\n", "    command: [atlas-server, echo, \"17007\"]\n    network_mode: host\n"}, {cp, "  relay:\n", "  relay:\n    extends: echo\n"}}, nil, "services.relay.network_mode: host"},
+		{"host network on the VM", []edit{{cp, "    command: [atlas-server, echo, \"17007\", \"17009\"]\n", "    command: [atlas-server, echo, \"17007\", \"17009\"]\n    network_mode: host\n"}}, nil, "services.echo.network_mode: host: the VM's firewall opens only what Stowage publishes"},
+		{"host network inherited", []edit{{cp, "    command: [atlas-server, echo, \"17007\", \"17009\"]\n", "    command: [atlas-server, echo, \"17007\", \"17009\"]\n    network_mode: host\n"}, {cp, "  relay:\n", "  relay:\n    extends: echo\n"}}, nil, "services.relay.network_mode: host"},
 		{"backup volume not declared", []edit{{sp, "volumes: [spool] ", "volumes: [spools] "}}, nil, `backup.volumes[0]: "spools" is not a volume deploy/compose.yaml declares`},
 		{"backup volume external", []edit{{cp, "  spool: {}\n", "  spool: { external: true }\n"}}, nil, `backup.volumes[0]: "spool" is an external volume`},
 		{"backup volume interpolated", []edit{{cp, "  spool: {}\n", "  spool: { name: \"${SPOOL}\" }\n"}}, nil, `backup.volumes[0]: "spool" is named "${SPOOL}", which Compose interpolates`},
 		{"backup volume of the database", []edit{{sp, "volumes: [spool] ", "volumes: [spool, postgres] "}}, nil, `backup.volumes[1]: "postgres" is mounted by the database's service`},
 		{"backup volume key", []edit{{sp, "volumes: [spool] ", "volumes: [\"../spool\"] "}}, nil, `backup: pg-age-rclone: volumes[0] "../spool" is not a compose volume's key`},
 		{"backup volume twice", []edit{{sp, "volumes: [spool] ", "volumes: [spool, spool] "}}, nil, `backup: pg-age-rclone: volumes[1] "spool" is listed twice`},
-		{"published port on the VM", []edit{{cp, "    command: [atlas-server, echo, \"17007\"]\n", "    command: [atlas-server, echo, \"17007\"]\n    ports: [\"17008:17007\"]\n"}}, nil, "services.echo.ports: the VM's firewall opens only what Stowage publishes"},
+		{"published port on the VM", []edit{{cp, "    command: [atlas-server, echo, \"17007\", \"17009\"]\n", "    command: [atlas-server, echo, \"17007\", \"17009\"]\n    ports: [\"17008:17007\"]\n"}}, nil, "services.echo.ports: the VM's firewall opens only what Stowage publishes"},
 		{"profile on kubernetes only", []edit{{sp, "profile: relay, shapes: [docker, kairos]", "profile: relay, shapes: [kubernetes]"}}, nil, "this input is asked on neither"},
 		{"endpoint no route", []edit{{sp, "endpoint: api\n", "endpoint: admin\n"}}, nil, `endpoint: "admin" is not a route of front.routes (console, api, ingest, ops, status)`},
 		{"bad when", []edit{{sp, "when: tls,", "when: always,"}}, nil, "expected tls or loopback"},
@@ -1056,7 +1062,7 @@ func TestNamedBuildContextRules(t *testing.T) {
 	t.Run("a flagged, normalised FROM of a context", func(t *testing.T) {
 		root := testutil.CopyExample(t, "full")
 		testutil.Edit(t, root, specFile, "contexts: { schema: migrations }", "contexts: { schema: migrations, base: server }")
-		testutil.Edit(t, root, "docker/api.Dockerfile", "FROM python:3.13-alpine@sha256:7984cf56ceaddebe4fefeb75d64000b9f45d8b77b11a09b24524da6cdc3af0c8 AS build", "FROM --platform=linux/amd64 docker.io/base:latest AS build")
+		testutil.Edit(t, root, "docker/api.Dockerfile", "FROM python:3.13-alpine@sha256:1e1f6334529d1fb26a2ef619d7cffb30a7c7d7cc1cc7338ebee283a58d1aeaca AS build", "FROM --platform=linux/amd64 docker.io/base:latest AS build")
 		if errs := errorsOf(run(t, root)); len(errs) > 0 {
 			t.Errorf("FROM docker.io/base:latest of the context base is refused:\n%s", strings.Join(errs, "\n"))
 		}
@@ -1064,7 +1070,7 @@ func TestNamedBuildContextRules(t *testing.T) {
 	t.Run("a replaced stage's base is never pulled", func(t *testing.T) {
 		root := testutil.CopyExample(t, "full")
 		testutil.Edit(t, root, specFile, "contexts: { schema: migrations }", "contexts: { schema: migrations, build: server }")
-		testutil.Edit(t, root, "docker/api.Dockerfile", "FROM python:3.13-alpine@sha256:7984cf56ceaddebe4fefeb75d64000b9f45d8b77b11a09b24524da6cdc3af0c8 AS build", "FROM python:3.13-alpine AS build")
+		testutil.Edit(t, root, "docker/api.Dockerfile", "FROM python:3.13-alpine@sha256:1e1f6334529d1fb26a2ef619d7cffb30a7c7d7cc1cc7338ebee283a58d1aeaca AS build", "FROM python:3.13-alpine AS build")
 		if errs := strings.Join(errorsOf(run(t, root)), "\n"); strings.Contains(errs, "FROM python:3.13-alpine must be pinned") {
 			t.Errorf("the base of a stage a named context replaces is held to pinning:\n%s", errs)
 		}
@@ -1081,7 +1087,7 @@ func TestNamedBuildContextRules(t *testing.T) {
 	})
 	t.Run("from a context", func(t *testing.T) {
 		root := testutil.CopyExample(t, "full")
-		testutil.Edit(t, root, "docker/api.Dockerfile", "FROM python:3.13-alpine@sha256:7984cf56ceaddebe4fefeb75d64000b9f45d8b77b11a09b24524da6cdc3af0c8 AS build", "FROM schema AS build")
+		testutil.Edit(t, root, "docker/api.Dockerfile", "FROM python:3.13-alpine@sha256:1e1f6334529d1fb26a2ef619d7cffb30a7c7d7cc1cc7338ebee283a58d1aeaca AS build", "FROM schema AS build")
 		res := run(t, root)
 		if errs := errorsOf(res); len(errs) > 0 {
 			t.Errorf("FROM a named context is refused as an unpinned base:\n%s", strings.Join(errs, "\n"))
@@ -1215,7 +1221,7 @@ func TestStartFirstWarnings(t *testing.T) {
 	if res := run(t, root); warned(res, "echo is l4.routes[0]'s upstream: on the VM") || !warned(res, l4) {
 		t.Fatalf("an L4 upstream with update_socket: %+v", res.Findings)
 	}
-	testutil.Edit(t, root, composeFile, "    command: [atlas-server, echo, \"17007\"]\n", "    command: [atlas-server, echo, \"17007\"]\n    network_mode: host\n")
+	testutil.Edit(t, root, composeFile, "    command: [atlas-server, echo, \"17007\", \"17009\"]\n", "    command: [atlas-server, echo, \"17007\", \"17009\"]\n    network_mode: host\n")
 	if res := run(t, root); warned(res, l4) {
 		t.Fatalf("an L4 upstream on the host's network: %+v", res.Findings)
 	}
@@ -1320,7 +1326,7 @@ func TestStartFirstWarnings(t *testing.T) {
 	root = testutil.CopyExample(t, "full")
 	testutil.Edit(t, root, composeFile, "    profiles: [relay]\n", "    profiles: [relay]\n    external_links: [\"atlas-api-1:api\"]\n")
 	testutil.Edit(t, root, specFile, "echo: { cpus: 1, irq: on }", "echo: { cpus: 1, irq: on, update: start-first }")
-	testutil.Edit(t, root, composeFile, "    command: [atlas-server, echo, \"17007\"]\n", "    command: [atlas-server, echo, \"17007\"]\n    network_mode: $ECHO_NET\n")
+	testutil.Edit(t, root, composeFile, "    command: [atlas-server, echo, \"17007\", \"17009\"]\n", "    command: [atlas-server, echo, \"17007\", \"17009\"]\n    network_mode: $ECHO_NET\n")
 	res = run(t, root)
 	if !warned(res, "links to a container by its name (atlas-api-1:api)") || !warned(res, "$ECHO_NET, which only a run resolves: if it is service:… or container:…, or a network of its own while it publishes ports (its L4 route's on Docker included), the install replaces echo stop-first") || warned(res, l4) {
 		t.Fatalf("external_links, an unbraced variable: %+v", res.Findings)
@@ -2521,6 +2527,63 @@ func TestAGuardedRouteToTheHostsNetworkIsWarned(t *testing.T) {
 		}
 		if !slices.ContainsFunc(got, func(g string) bool { return strings.Contains(g, "warning: "+c.want) }) {
 			t.Errorf("%s: findings %q", c.upstream, got)
+		}
+	}
+}
+
+// An L4 route the front terminates TLS on is warned when its guards hold only through the front and
+// its upstream runs on the host's network: every container reaches the plaintext port directly;
+// and on Docker, a host_network upstream's plaintext port is open to whoever reaches the host.
+// examples/full's echo-tls route, unguarded, is the clean control.
+func TestAGuardedL4TLSRouteToTheHostsNetworkIsWarned(t *testing.T) {
+	t.Parallel()
+	for _, c := range []struct{ tls, upstream, want string }{
+		{"tls: { domain_input: ECHO_DOMAIN, client_auth: true }", "echo:17009", "l4.routes[2].upstream: echo runs on the VM's network (an L4 route's upstream), where every container of the stack reaches its port 17009 directly, at the host's gateway, past the route's tls.client_auth: echo checks who calls it itself"},
+		{"tls: { domain_input: ECHO_DOMAIN }\n      allow_input: ECHO_SOURCES", "echo:17009", "l4.routes[2].upstream: echo runs on the VM's network (an L4 route's upstream), where every container of the stack reaches its port 17009 directly, at the host's gateway, past the route's allow_input: echo checks"},
+		{"tls: { domain_input: ECHO_DOMAIN }", "vpn:17010", "l4.routes[2].upstream: vpn runs on the host's network (services.vpn.host_network), where on Docker its plaintext port 17010 is open to whoever reaches the host"},
+	} {
+		root := testutil.CopyExample(t, "full")
+		testutil.Edit(t, root, specFile, "      upstream: echo:17009\n      tls: { domain_input: ECHO_DOMAIN }", "      upstream: "+c.upstream+"\n      "+c.tls)
+		var got []string
+		for _, f := range run(t, root).Findings {
+			got = append(got, f.String())
+		}
+		if !slices.ContainsFunc(got, func(g string) bool { return strings.Contains(g, "warning: "+c.want) }) {
+			t.Errorf("%s: findings %q", c.tls, got)
+		}
+	}
+	// The front filters the allowlist of such a route to a host_network service: not the warning
+	// that the host's input chain leaves it open.
+	root := testutil.CopyExample(t, "full")
+	testutil.Edit(t, root, specFile, "      upstream: echo:17009\n      tls: { domain_input: ECHO_DOMAIN }", "      upstream: vpn:17010\n      tls: { domain_input: ECHO_DOMAIN }\n      allow_input: ECHO_SOURCES")
+	for _, f := range run(t, root).Findings {
+		if strings.Contains(f.String(), "the route is open to every source there") {
+			t.Errorf("finding %s", f)
+		}
+	}
+}
+
+// A domain input an L4 TLS route declares is asked on every install the front terminates its TLS
+// on: an optional, advanced, loopback-only or docker-less one is refused; a plain one is clean.
+func TestADeclaredL4TLSDomainIsAlwaysAsked(t *testing.T) {
+	t.Parallel()
+	for decl, bad := range map[string]bool{
+		`prompt: "Echo domain" }`:                           false,
+		`prompt: "Echo domain", optional: true }`:           true,
+		`prompt: "Echo domain", advanced: true }`:           true,
+		`prompt: "Echo domain", when: loopback }`:           true,
+		`prompt: "Echo domain", shapes: [kairos] }`:         true,
+		`prompt: "Echo domain", shapes: [docker] }`:         true,
+		`prompt: "Echo domain", shapes: [docker, kairos] }`: false,
+	} {
+		root := testutil.CopyExample(t, "full")
+		testutil.Edit(t, root, specFile, "  - { key: ECHO_SOURCES,", "  - { key: ECHO_DOMAIN, "+decl+"\n  - { key: ECHO_SOURCES,")
+		res := run(t, root)
+		got := slices.ContainsFunc(errorsOf(res), func(e string) bool {
+			return strings.Contains(e, "l4.routes[2].tls.domain_input: ECHO_DOMAIN must be asked on every install the front terminates the route's TLS on")
+		})
+		if got != bad {
+			t.Errorf("%s: errors %q", decl, errorsOf(res))
 		}
 	}
 }

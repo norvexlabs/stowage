@@ -85,7 +85,11 @@ func l4Values(routes []spec.L4Route) ([]helm.L4Route, error) {
 		if err != nil {
 			return nil, fmt.Errorf("l4.routes %s: upstream %q: %w", r.Name, r.Upstream, err)
 		}
-		out = append(out, helm.L4Route{Name: r.Name, Protocol: strings.ToUpper(r.Protocol), Port: r.Port, Service: svc, TargetPort: target})
+		v := helm.L4Route{Name: r.Name, Protocol: strings.ToUpper(r.Protocol), Port: r.Port, Service: svc, TargetPort: target}
+		if r.TLS != nil {
+			v.TLS = &helm.L4TLS{DomainInput: r.TLS.DomainInput, ClientAuth: r.TLS.ClientAuth}
+		}
+		out = append(out, v)
 	}
 	return out, nil
 }

@@ -9,6 +9,61 @@ A finished item is deleted, not ticked. The plan behind it is
 
 Batched by the gate they share: a batch is one slice, one review, one gate run.
 
+### Installer
+
+1. **`updates` on Docker and Kubernetes**: only the VM's installer has `updates` (each release the
+   channel offers after the running one, with its changelog). On Docker and Kubernetes the
+   installer is one release's binary and has no way to say a newer one exists: an operator learns
+   of it only by pulling the installer's `:latest` again, and a stale local copy of that image
+   silently answers with an old release. Offer `<short>-stow updates [--channel C] [--version V]`
+   on the Docker shape and `<short>-stow k8s updates` on Kubernetes, with the VM's output and code
+   path (one listing and rendering, not a second one): the channel pointer and the release
+   manifests read from the install's recorded registry (a mirror and its `--registry-ca`, the
+   operator's own registry sign-in where the mirror asks for one), their signatures checked against
+   the release keys as `upgrade --version` checks them; nothing newer is said so.
+
+### Supply chain — stopgaps back to canonical
+
+1. **Check every stopgap at each release, and drop each one the upstream has caught up with**:
+   images are kept past published vulnerabilities by forcing things over what their upstream
+   ships. Each is a stopgap that must give way to the upstream's own fix as soon as it is released.
+   - Go modules forced over a release's own `go.mod` (`make self-audit` prints each one as
+     `override:`): the front over Caddy 2.11.9 (golang.org/x/net 0.62.0 over its 0.60.0, go-jose/v4
+     4.1.7 over 4.1.6, klauspost/compress 1.20.2 over 1.20.1) and the scanner over grype 0.121.3
+     (go-jose 4.1.7 over 4.1.6); the backup runner, rclone 1.76.0, has none. The
+     canonical form is a later upstream release that carries the module at that version or later.
+     Move the recipe to that release and drop its `--replace` / `go get`. Checked 2026-11-09:
+     Caddy 2.11.9 carries chi 5.4.0, rclone 1.76.0 x/net, chi, compress, brotli and grpc 1.84.0
+     (past GO-2026-6443, which hit the 1.84.0-dev snapshot 1.75.1 shipped), grype 0.121.3 x/net,
+     compress and brotli — those raises are gone.
+   - Alpine packages raised over a pinned base: `zlib>=1.4` (CVE-2026-4738) in
+     `internal/front/Dockerfile`, `internal/backup/Dockerfile` and the examples' Python images
+     (`examples/minimal/api`, `examples/full/docker/api`, `ingest`, `provision`); `apk upgrade`
+     with su-exec in place of gosu in `examples/full/postgres`. These make the image depend on what
+     Alpine's mirror serves at build time, so the recipe's digest no longer decides the image. The
+     canonical form is a base image whose own build carries the fix: repin its digest and drop the
+     raise. `examples/minimal`'s `ref` postgres and the suites' pinned PG carry the same zlib, with
+     no raise. Checked 2026-11-09: Alpine 3.24's repository serves zlib 1.4-r0 (CVE-2026-4738 fixed,
+     per its security database), but the latest builds of alpine 3.24.4, caddy 2.11.9-alpine,
+     python 3.13-alpine and postgres 18-alpine still ship zlib 1.3.2-r1; postgres 18-alpine's gosu
+     is still 1.19 built with Go 1.24.6.
+   - Base images pinned by digest: repin each to its upstream's latest patch build whenever one
+     is published, not only when an audit refuses it.
+   - Findings with no upstream fix yet, to take once one is released (`make self-audit`
+     2026-11-09): the front's go-jose/v3 3.0.5, which Caddy 2.11.9 (and 2.11.7 before it) still
+     links beside v4, GHSA-mgcc-cww5-fp2q high (v3's last release is affected; v4 4.1.6 is
+     fixed); golang.org/x/crypto 0.58.0 in every Go artifact (Stowage's own binaries included),
+     GO-2026-5932, fixed only in a pseudo-version after 0.58.0 — take the first tagged release.
+   - The audit allowances in `examples/full/audit-allow.yaml` (the OS bundle's containerd/runc,
+     until 2027-01-31; see the Should entry): removed once Docker ships fixed builds. Checked
+     2026-11-09: Docker's containerd.io 2.4.2-3 is containerd v2.4.2 (x/net 0.58.0) with runc v1.5.2
+     (x/net 0.55.0), upstream's latest: no fix yet.
+
+   How: before every release, run `make self-audit` and the e2e suites' ships and read each
+   `override:` line and each raise against its upstream's latest release. Make it mechanical where
+   cheap: have `self-audit` also flag a raise its base already satisfies, so a stale stopgap fails
+   loudly rather than staying silently.
+
 ### Blocked — upstream or accounts
 
 1. **Cloud images on AWS and Azure**: `ship` registers the `cloud_publish` images through
@@ -38,6 +93,42 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
 
 ## Should
 
+- **An L4 route hands its upstream the client's address**: a TCP route's upstream sees the
+  connection's source as Docker's NAT or userland proxy leaves it, and a front terminating TLS
+  on the route (`l4.routes[].tls`) hides it entirely; an upstream that
+  logs, rate-limits or judges by the client's address then sees the front or a bridge gateway.
+  Offer
+  `l4.routes[].proxy_protocol: v2`, off by default (an upstream not reading it would take its
+  header for data): the front, or the forwarder the route uses, sends the PROXY protocol v2
+  header with the client's own address, IPv4 and IPv6, on every shape. Lint refuses it on a UDP
+  route. Prove it with an e2e: an upstream reads the header and sees the test client's address
+  over IPv4 and IPv6, on a pass-through route and on a TLS route.
+
+- **An HTTP route's client address is a stated, tested contract**: the front's `reverse_proxy`
+  sets `X-Forwarded-For`, `X-Forwarded-Proto` and `X-Forwarded-Host` by Caddy's default, but the
+  README says nothing of what an upstream may read, and no test holds it: a Caddy upgrade or a
+  front change could drop or loosen it silently, and an upstream would then log or judge by the
+  front's own address, or by a header the client wrote. State it under the front: the upstream
+  gets the client's address in `X-Forwarded-For`, a client-sent value replaced, never appended
+  to (no `trusted_proxies`); without `--ipv6` an IPv6 client is the bridge's IPv4 gateway. Prove
+  it with an e2e: a request with a forged `X-Forwarded-For` reaches an echo upstream with the
+  test client's own address alone, over IPv4 and, with `--ipv6`, over IPv6.
+
+- **The health gate's first install after a pre-install `upgrade`**: an `upgrade` run before a VM's
+  first install writes a newer OS on trial; that release's first install failing after `.env` is
+  written, or made by `install --given`/`--secrets` after the gate (the install awaiting them),
+  falls back at the next reboot to the older OS, whose installer refuses the newer install. The
+  switch's case is covered by its `<dir>.os-switch` mark; this one has no lasting mark (firstBoot
+  removes `<dir>.os-upgrade`). A field of the install's own state ("made on an OS written before
+  it") would cover both, and outlive an operator removing the mark. Check first that `upgradedTo`
+  can be true on a VM at all: it compares `<dir>.os-upgrade` with the installer's own tag, and an
+  OS bundle's installer carries none (the gate's switch check reads the settings' release instead).
+  `crossingAsked` (`reset-db --new-baseline`'s mark) compares the same way; e2e-vm's crossing
+  passes, so find which path it takes before trusting either, and match marks on version and
+  revision in one helper.
+- **`TestHookShip` is timing-bound**: it failed once in `make check` under `-race` (ship returned
+  nil but the output or build count differed) and passed 20 runs in a row on the host; its 50 ms
+  lock window and output prefix are worth making deterministic.
 - **Keep a raised module's version in one place**: klauspost/compress is pinned in go.mod and in the
   front, backup and scanner recipes, in three syntaxes, and only `make self-audit` notices one left
   behind. A test comparing each recipe's pin with go.mod would catch it in `make check`.
@@ -93,11 +184,6 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
   likewise repeated across `graph_test.go` and `lint_test.go`, and `TestKairosSettingsReachTheBundle`
   anchors on its first hex digit: a repin edits them all, and a digest starting with `d` turns that
   test's edit into a no-op. A shared constant keeps a repin to one line.
-
-- **`updates` on Docker and Kubernetes**: the VM's `updates` lists what the channel offers after
-  the running release, with its changelog; on Docker and Kubernetes an operator learns that a newer
-  release exists only by pulling the installer's `:latest`. Offer `<short>-stow updates` on every
-  shape (the channel pointer read with the install's registry and keys, its signature checked).
 
 - **A `local` rclone destination is accepted, then never works**: where rclone runs in a
   throw-away container (`docker run --rm`, the Docker shape), a `type = local` remote writes
@@ -449,6 +535,15 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
   repositories.
 
 ## Could
+
+- **A bound on an L4 TLS route's connections** (`max_connections`), for an upstream that does not
+  bound its own: caddy-l4 (v0.1.2) has no concurrency limit, only `throttle` (bandwidth); a
+  handler of its own, or an upstream release that adds one.
+
+- **An L4 TLS route's domain names the front on the stack's network too**: a front route's domain
+  is an alias of the front (`routeAliases`), so a service dialing it reaches the front; an
+  `l4.routes[].tls` domain is not, so a service of the stack dialing `<domain>:<port>` leaves
+  through the host's public address (hairpin NAT) rather than straight to the front.
 
 - **File inputs' leftovers**: the user-data limit is checked after `vm create`'s confirmation, not
   before it; the re-run's hint for a required file input a new TLS mode asks has no test; a compose
@@ -947,8 +1042,6 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
 - **A first install refused by the lock** leaves the directory it created (holding only the lock
   file): another run holds it, so it is not removed.
 
-- **`<short>-stow updates`**: list the channel's releases after the installed one, from the release
-  manifest (DESIGN's verb set).
 - **Upgrade order under a `command` scheme**: the project's scheme command does not run on an
   install, so an upgrade to an older release is not refused there.
 

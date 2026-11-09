@@ -1488,7 +1488,12 @@ func (in *Installer) confirmVM(ctx context.Context, p Platform, format string, m
 	}
 	for _, r := range in.R.Spec.L4.Routes {
 		from := "every source"
-		if r.AllowInput != "" {
+		switch {
+		case r.Terminated() && r.AllowInput != "":
+			from += ", TLS by the front, which admits the sources of " + r.AllowInput
+		case r.Terminated():
+			from += ", TLS by the front"
+		case r.AllowInput != "":
 			from = "the sources of " + r.AllowInput
 		}
 		fmt.Fprintf(&b, "  opens %s/%d (L4 route %s) to %s\n", r.Protocol, r.Port, r.Name, from)

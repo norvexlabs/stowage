@@ -366,6 +366,58 @@ type L4Route struct {
 	// Interfaces are the host.interfaces roles the route listens on, which the VM's firewall opens
 	// its port on alone (one rule, iifname { … }); none, every interface.
 	Interfaces []string `yaml:"interfaces"`
+	// TLS, when set, has the front terminate TLS on the route's port (a TCP route's alone), with
+	// the certificate its TLS mode gives the domain, and forward the plaintext stream to Upstream.
+	TLS *L4TLS `yaml:"tls"`
+}
+
+// L4TLS is an L4 route's TLS termination by the front: DomainInput names the input holding the
+// domain its certificate covers, which the install asks as a front route's; ClientAuth requires
+// a client certificate the install's client CA issued, as a front route's client_auth does.
+type L4TLS struct {
+	DomainInput string `yaml:"domain_input"`
+	ClientAuth  bool   `yaml:"client_auth"`
+}
+
+// Terminated reports whether the front terminates TLS on r: its port is the front's, its upstream
+// reached by the front.
+func (r L4Route) Terminated() bool { return r.TLS != nil }
+
+// RouteDomain is a route served on a domain and the input holding it.
+type RouteDomain struct{ Route, Input string }
+
+// RouteDomains are the routes the front serves on a domain, each with its domain input, in the
+// spec's order: the front's routes, then the L4 routes it terminates TLS on. Whatever reads,
+// asks, checks or hands on a route's domain reads this list.
+func (s *Spec) RouteDomains() []RouteDomain {
+	var out []RouteDomain
+	for _, r := range s.Front.Routes {
+		out = append(out, RouteDomain{r.Name, r.DomainInput})
+	}
+	for _, r := range s.L4.Routes {
+		if r.Terminated() {
+			out = append(out, RouteDomain{r.Name, r.TLS.DomainInput})
+		}
+	}
+	return out
+}
+
+// DomainGroups are the domain inputs, in the order of their first route, and the routes each one
+// serves (RouteDomains): what asks a domain and what refuses one name the same routes.
+func (s *Spec) DomainGroups() (keys []string, routes map[string][]string) {
+	routes = map[string][]string{}
+	for _, d := range s.RouteDomains() {
+		if routes[d.Input] == nil {
+			keys = append(keys, d.Input)
+		}
+		routes[d.Input] = append(routes[d.Input], d.Route)
+	}
+	return keys, routes
+}
+
+// IsDomainInput reports whether key holds a route's domain (RouteDomains).
+func (s *Spec) IsDomainInput(key string) bool {
+	return slices.ContainsFunc(s.RouteDomains(), func(d RouteDomain) bool { return d.Input == key })
 }
 
 // L4Var is the variable carrying an L4 route's endpoint, <address>:<port>.

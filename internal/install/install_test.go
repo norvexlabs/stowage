@@ -924,7 +924,7 @@ func TestAnL4RoutesExposureIsSaid(t *testing.T) {
 		{spec.L4Route{Name: "data", Protocol: "tcp", Port: 7443, AllowInput: "SRC", BindInput: "DATA_BIND"}, "192.0.2.7", "", "on 192.0.2.7 alone, open to whoever reaches it: SRC's sources hold once `notes-stow tune --apply` consents", nil},
 	} {
 		in := &Installer{R: &Release{Spec: &spec.Spec{Name: "notes", Services: map[string]spec.Service{"proxy": {HostNetwork: true}}}}, O: Options{Firewall: c.fw}}
-		if got := in.l4Exposure(c.r, func(k string) string { return map[string]string{"DATA_BIND": c.bind}[k] }, c.off); got != c.want {
+		if got := in.l4Exposure(c.r, func(k string) string { return map[string]string{"DATA_BIND": c.bind}[k] }, c.off, heldCA{}); got != c.want {
 			t.Errorf("%+v: %q", c, got)
 		}
 	}
@@ -935,14 +935,14 @@ func TestAnL4RoutesExposureIsSaid(t *testing.T) {
 	}
 	route := spec.L4Route{Name: "data", Protocol: "tcp", Port: 7443, Upstream: "api:7443", AllowInput: "SRC"}
 	in.R.Spec.L4.Routes = []spec.L4Route{route}
-	if got := in.l4Exposure(route, none, nil); got != "open to whoever reaches this host: SRC's list is not held yet: a start as root applies it, on IPv4 alone (consented; `status` says what the last one did)" {
+	if got := in.l4Exposure(route, none, nil, heldCA{}); got != "open to whoever reaches this host: SRC's list is not held yet: a start as root applies it, on IPv4 alone (consented; `status` says what the last one did)" {
 		t.Errorf("consented, not applied: %q", got)
 	}
 	rules, _ := allowRules(in.allowed(), in.allowChain(), none)
 	if err := os.WriteFile(in.allowHeld(), []byte(heldMark(rules)), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if got := in.l4Exposure(route, none, nil); got != "on IPv4's every address, from the IPv4 sources SRC holds (the install's chain in DOCKER-USER, applied by each start as root)" {
+	if got := in.l4Exposure(route, none, nil, heldCA{}); got != "on IPv4's every address, from the IPv4 sources SRC holds (the install's chain in DOCKER-USER, applied by each start as root)" {
 		t.Errorf("applied: %q", got)
 	}
 }
@@ -1347,7 +1347,7 @@ func TestProjectNamesFollowTheDirectory(t *testing.T) {
 func TestFrontStripsHeadersAndPublishesOnTheLoopback(t *testing.T) {
 	e := newEnv(t)
 	e.r.Spec.Front.Routes[1].StripHeaders = []string{"X-Auth-Request-*", "X-Tenant"}
-	cf := loopbackCaddyfile(e.r.Spec.Front, func(string) string { return "" }, nil)
+	cf := loopbackCaddyfile(e.r.Spec.Front, nil, func(string) string { return "" }, nil)
 	for _, want := range []string{"http://:10000 {\n\treverse_proxy web:8080", "http://:10001 {\n\trequest_header -X-Auth-Request-*\n\trequest_header -X-Tenant\n\treverse_proxy api:8000", "admin off"} {
 		if !strings.Contains(cf, want) {
 			t.Errorf("Caddyfile lacks %q:\n%s", want, cf)

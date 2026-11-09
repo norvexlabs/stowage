@@ -39,13 +39,13 @@ func (in *Installer) changes(env *EnvFile) (next *EnvFile, secrets map[string]bo
 	}
 	// A domain is checked only when it changes: a value as recorded is no change.
 	var domainGiven []string
-	for _, r := range s.Front.Routes {
-		v, ok := o.Set[r.DomainInput]
+	for _, d := range s.RouteDomains() {
+		v, ok := o.Set[d.Input]
 		if !ok {
-			v, ok = o.Answers[r.DomainInput]
+			v, ok = o.Answers[d.Input]
 		}
-		if was, _ := env.Get(r.DomainInput); ok && v != was && !slices.Contains(domainGiven, r.DomainInput) {
-			domainGiven = append(domainGiven, r.DomainInput)
+		if was, _ := env.Get(d.Input); ok && v != was && !slices.Contains(domainGiven, d.Input) {
+			domainGiven = append(domainGiven, d.Input)
 		}
 	}
 	switch {
@@ -116,9 +116,13 @@ func (in *Installer) changes(env *EnvFile) (next *EnvFile, secrets map[string]bo
 		}
 	}
 	if in.newCert != nil {
-		for _, r := range s.Front.Routes {
-			if d, _ := next.Get(r.DomainInput); in.newCert.leaf.VerifyHostname(d) != nil {
-				bad = append(bad, fmt.Sprintf("the certificate does not cover %s (%s)", d, r.Name))
+		// One refusal per domain input, naming the routes it serves.
+		keys, routes := s.DomainGroups()
+		// An empty one is no domain to cover: the input is required (lint, frontInputs), and the
+		// front closes a route without one.
+		for _, k := range keys {
+			if d, _ := next.Get(k); d != "" && in.newCert.leaf.VerifyHostname(d) != nil {
+				bad = append(bad, fmt.Sprintf("the certificate does not cover %s (%s: %s)", d, k, strings.Join(routes[k], ", ")))
 			}
 		}
 	}
