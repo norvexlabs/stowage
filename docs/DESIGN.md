@@ -826,7 +826,7 @@ on this shape") instead of failing obscurely.
 | 1 | Author | `stowage.yaml` + `stowage lint` **C** | same file, `shapes.kubernetes` | same file, `shapes.kairos` |
 | 2 | Version + changelog | providers; version from a changelog + CalVer month guard as configuration **C**; revisions, `stowage.lock`, Platform block **C** | chart version from the release sequence § 3.1 | `release.json` |
 | 2′ | Upgrade Stowage itself | `stowage lock --update` → diff → `ship --revision` or next version **C** | arrives with the next chart/images | runtime inside the OS bundle, via `upgrade` |
-| 3 | Build + ship | graph, mutable dev / immutable stable, `verify` **C**; inputs digest, skip/re-tag **C** | chart OCI push **C** | OS bundle + disk images (raw, qcow2, ova, vhd, gce) + cloud publish (aws, azure, gcp) **C** |
+| 3 | Build + ship | graph, mutable dev / immutable stable, `verify` **C**; inputs digest, skip/re-tag **C** | chart OCI push **C** | OS bundle + disk images (raw, qcow2, ova, vhd, gce) + cloud publish (aws, azure, gcp, scaleway) **C** |
 | 3′ | Sign / verify | detached sign + push by Stowage, verify before pull/upgrade **C** (§ 5.1) | manifest + chart verified by `<short>-stow k8s`; optional admission policy (owner: cluster) **C** | `hostd` verifies before staging **C** |
 | 4 | Promote / retire | `promote`, `prune --channel dev` **C**; `yank` **C** | same manifests | same manifests |
 | 5 | Discover | installer `:latest` + bundled docs **C**; `releases` from manifests **C** | same installer | same installer; disk image per format |
@@ -1044,7 +1044,7 @@ installer runs after the release, its outputs handed back, a failure leaving an 
 and `make e2e-full-vm` installs it on a TrueNAS VM from a mirror (its upgrade and rollback are the VM machinery's, which `make e2e-vm` proves). `ship` builds the Kairos
 shape's OS bundle (kairos-init on a pinned base, Docker, the release's images preloaded) and its
 disk images (raw, qcow2, ova, vhd, gce; `cloud_publish` adds the format each cloud imports — AWS
-raw, Azure a fixed VHD, Google Cloud a `disk.raw` tar.gz), keeps them across ships and re-tags them on a
+raw, Azure a fixed VHD, Google Cloud a `disk.raw` tar.gz, Scaleway a qcow2), keeps them across ships and re-tags them on a
 promotion; `make e2e-kairos` builds them for real against zot. Only the raw disk comes from
 auroraboot; every other format is converted from it by the clouds' documented recipes (qemu-img,
 tar), so one auroraboot run serves them all and each format's conformance is checked by `ship`,
@@ -1056,8 +1056,9 @@ in a private Docker config file — a loopback port is open to every local user,
 line is readable by them. So the disks build from the registry whoever else may read it, and the
 publisher's account never enters a container. `ship` registers each `cloud_publish` disk in the
 publisher's account of that cloud through built-in OpenTofu modules per cloud — an upload (bucket
-object, S3 object, page blob), the image made of it (Compute Engine image; import-snapshot → AMI;
-Azure image), then the upload destroyed, since a disk may carry the pull account and a bucket is
+object, S3 object, page blob, Object Storage object), the image made of it (Compute Engine image;
+import-snapshot → AMI; Azure image; Block Storage snapshot import → instance image), then the
+upload destroyed, since a disk may carry the pull account and a bucket is
 often read more widely than the images — with the publisher's credentials from the environment,
 which nothing in a release carries. The modules pin each provider's exact release with its lock
 file's checksums, and OpenTofu runs with an empty CLI configuration, so the provider binary that
@@ -1067,7 +1068,11 @@ import, and adding three SDK trees to `stowage` would only repeat them. The disk
 the registry by digest, so the image is exactly what an install fetches; the image is named by
 that digest and its OpenTofu state and id kept in the publisher's cache, keyed by the cloud's
 settings; without them, a probe module looks the image up by name in the account, so it is
-registered once whatever machine ships after, and a stopped run resumes. The release manifest does not record it: an
+registered once whatever machine ships after, and a stopped run resumes. Scaleway lists images
+by name alone, not by tag: its probe finds the disk's Block Storage snapshot by its tag (the
+description naming the digest), then the image of the name, which fails when a snapshot was made
+without its image. So a stopped run whose image state holds a resource still probes, takes an image
+found, and otherwise — none, or on Scaleway a lookup failed past init — resumes from its states. The release manifest does not record it: an
 image lives in one account, and an install takes the disk. The bundle carries `<short>-stow`:
 it installs the release on the VM from the preloaded images, brings it up, upgrades it or goes
 back at boot, and serves the host daemon (status, services, logs, provision, updates, upgrade
@@ -1078,7 +1083,7 @@ user-data), whose settings the first boot installs from; the services the spec n
 host daemon on its app socket with a token. With OpenTofu, `vm create` creates the VM on TrueNAS
 and waits until it has installed, and `vm destroy` removes it; `make e2e-vm` does both on a real
 TrueNAS host. The other canonical platforms (libvirt, Proxmox VE, vSphere, AWS, Google Cloud,
-Azure) have built-in modules as previews, and any platform takes the operator's module holding the
+Azure, Scaleway) have built-in modules as previews, and any platform takes the operator's module holding the
 same contract (`--module`). Next: the mirror for sites without internet (`mirror export` / `import`, a CA on
 every shape, the VM end-to-end test upgrading through it), then the health gate.
 
@@ -1375,7 +1380,9 @@ every shape, the VM end-to-end test upgrading through it), then the health gate.
   create the VM), then the machine (host name, administrator and SSH key, network), then the
   product (the install's own form, its TLS mode and inputs, without secrets), then a review. The
   medium follows the platform and is never asked: a NoCloud seed ISO for a hypervisor (Kairos's
-  cdrom datasource), the user-data field for a cloud. The cloud-config holds only Kairos stages
+  cdrom datasource), the user-data field for a cloud (each cloud's datasource in Kairos's list;
+  the bundle adds Scaleway's, which Kairos leaves out though its datasource library has it, so its
+  build fails when that list no longer reads as expected). The cloud-config holds only Kairos stages
   (applied at every boot, as `/etc` is not kept; the host name in `initramfs`, before networkd
   sends a DHCP request, the rest in `boot`) and a settings file the boot installs
   from, so the first install is the operator's `install` with no terminal; the VM's boot waits
@@ -1387,7 +1394,7 @@ every shape, the VM end-to-end test upgrading through it), then the health gate.
   key exchange) would reach an older release's sshd after a rollback, which then does not start.
 - **Creating a VM with OpenTofu** — `<short>-stow` embeds a module per canonical platform:
   TrueNAS (proven by `make e2e-vm`), and as previews libvirt/KVM, Proxmox VE and vSphere on
-  premises, AWS, Google Cloud and Azure in the clouds — each uploading the disk the platform takes
+  premises, AWS, Google Cloud, Azure and Scaleway in the clouds — each uploading the disk the platform takes
   and the cloud-config (seed ISO on a hypervisor, user data on a cloud), creating and starting the
   VM, and destroyed by `vm destroy`. A preview is a module not run on its platform yet: checked by
   `tofu validate` against its pinned provider only, marked in README and in `vm create`'s output,

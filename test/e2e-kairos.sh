@@ -7,8 +7,8 @@
 #   STOWAGE_CLOUD_ENV=<file> make e2e-kairos    (also registers the clouds' images: the file sets
 #                          a cloud's STOWAGE_<CLOUD>_* settings and credentials; needs tofu)
 #
-# Walks examples/minimal, with a real Postgres, two disk formats and the three clouds' (raw, vhd,
-# gce), through: ship a mutable
+# Walks examples/minimal, with a real Postgres, two disk formats and the four clouds' (raw, vhd,
+# gce, qcow2), through: ship a mutable
 # channel (the bundle preloads every image, named by digest, and `docker load` takes each archive;
 # each disk is compressed, decompressed with zstd -d and checked in its format, the clouds' as each cloud imports it), the bundle's own notes-stow run on this host's Docker as on
 # the VM (install from the preloaded images with the cloud-config's settings, boot, the host daemon
@@ -35,8 +35,8 @@ CLEANUP+=("docker run --rm --network none -v /run:/r --entrypoint rmdir $PG /r/n
 
 # The clouds the publisher has settings for (STOWAGE_CLOUD_ENV, the user's file, never in the
 # tree): ship registers their images, which are destroyed at exit; the others are left out.
-CLOUDS=(aws azure gcp)
-declare -A CLOUD_KEY=([aws]=STOWAGE_AWS_BUCKET [azure]=STOWAGE_AZURE_STORAGE_ACCOUNT [gcp]=STOWAGE_GCP_BUCKET)
+CLOUDS=(aws azure gcp scaleway)
+declare -A CLOUD_KEY=([aws]=STOWAGE_AWS_BUCKET [azure]=STOWAGE_AZURE_STORAGE_ACCOUNT [gcp]=STOWAGE_GCP_BUCKET [scaleway]=STOWAGE_SCALEWAY_BUCKET)
 if [[ -n ${STOWAGE_CLOUD_ENV:-} ]]; then
 	set -a
 	# shellcheck disable=SC1090
@@ -70,10 +70,10 @@ CLEANUP+=('destroy_images')
 step "start zot"
 start_zot
 
-step "project, with the kairos shape, two disk formats and three clouds"
+step "project, with the kairos shape, two disk formats and four clouds"
 KAIROS=1 new_project "$PG"
-sed -i 's/disk_formats: \[qcow2\]/disk_formats: [qcow2, ova, iso]\n    cloud_publish: [aws, azure, gcp]/' "$P/stowage.yaml"
-grep -q 'cloud_publish: \[aws, azure, gcp\]' "$P/stowage.yaml" || fail "disk formats not set"
+sed -i 's/disk_formats: \[qcow2\]/disk_formats: [qcow2, ova, iso]\n    cloud_publish: [aws, azure, gcp, scaleway]/' "$P/stowage.yaml"
+grep -q 'cloud_publish: \[aws, azure, gcp, scaleway\]' "$P/stowage.yaml" || fail "disk formats not set"
 # The disk-pressure hook at 1%: the host daemon posts as it starts (the api answers 501, and logs it).
 sed -i 's|^    env: \[ADMIN_EMAIL\]$|&\n  maintenance:\n    disk_pressure: { soft_pct: 1, hard_pct: 99, post: "http://api:8000/maintenance/disk-pressure", auth_secret: SESSION_SECRET }|' "$P/stowage.yaml"
 grep -q 'disk_pressure: { soft_pct: 1,' "$P/stowage.yaml" || fail "disk pressure not set"

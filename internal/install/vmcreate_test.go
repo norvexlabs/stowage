@@ -600,8 +600,8 @@ func TestVMCreateRefusals(t *testing.T) {
 		want    string
 	}{
 		{"no disk", nil, nil, VMCreate{Platform: "truenas"}, nil, "has no disk in"},
-		{"no platform", []string{"qcow2"}, nil, VMCreate{}, nil, "--platform is required (truenas, proxmox, libvirt)"},
-		{"platform without its format", []string{"qcow2"}, nil, VMCreate{Platform: "aws"}, nil, "--platform aws: notes 1.0.0 offers truenas, proxmox, libvirt"},
+		{"no platform", []string{"qcow2"}, nil, VMCreate{}, nil, "--platform is required (truenas, proxmox, libvirt, scaleway)"},
+		{"platform without its format", []string{"qcow2"}, nil, VMCreate{Platform: "aws"}, nil, "--platform aws: notes 1.0.0 offers truenas, proxmox, libvirt, scaleway"},
 		{"unknown platform", []string{"ova"}, nil, VMCreate{Platform: "virtualbox"}, nil, "offers vmware"},
 		{"bad host name", []string{"qcow2"}, nil, VMCreate{Platform: "truenas", Hostname: "Notes_1"}, nil, "--hostname: \"Notes_1\" is not a host name"},
 		{"root", []string{"qcow2"}, nil, VMCreate{Platform: "truenas", User: "root"}, nil, "root is the OS's own"},

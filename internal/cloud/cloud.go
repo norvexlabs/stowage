@@ -50,7 +50,17 @@ var Settings = map[string][]Setting{
 		{Var: "project", Env: "STOWAGE_GCP_PROJECT"},
 		{Var: "bucket", Env: "STOWAGE_GCP_BUCKET"},
 	},
+	"scaleway": {
+		{Var: "bucket", Env: "STOWAGE_SCALEWAY_BUCKET"},
+		{Var: "zone", Env: "SCW_DEFAULT_ZONE"},
+		{Var: "project", Env: "SCW_DEFAULT_PROJECT_ID"},
+	},
 }
+
+// snapshotGap maps a cloud whose probe fails on the image's snapshot left without its image to that
+// snapshot's kind, which its hints name. Scaleway lists snapshots by tag, not images: its probe
+// looks the image up by name once the disk's snapshot is found.
+var snapshotGap = map[string]string{"scaleway": "Block Storage snapshot"}
 
 // Vars are the module variables of cloud read through getenv: nil when none of its required
 // STOWAGE_ settings is set (nothing is uploaded to it), an error naming the required settings
@@ -178,9 +188,18 @@ func (u *Uploader) apply(ctx context.Context, dir string) error {
 	if _, err := u.run(ctx, dir, u.Log, "init", "-input=false", "-no-color"); err != nil {
 		return err
 	}
-	_, err := u.run(ctx, dir, u.Log, "apply", "-auto-approve", "-input=false", "-no-color")
-	return err
+	if _, err := u.run(ctx, dir, u.Log, "apply", "-auto-approve", "-input=false", "-no-color"); err != nil {
+		return applyError{err}
+	}
+	return nil
 }
+
+// applyError is apply's failure past init: the module's own, not its providers'. It reads as the
+// failure it wraps.
+type applyError struct{ err error }
+
+func (e applyError) Error() string { return e.err.Error() }
+func (e applyError) Unwrap() error { return e.err }
 
 // output is the module's output name in dir.
 func (u *Uploader) output(ctx context.Context, dir, name string) (string, error) {
@@ -252,40 +271,67 @@ func (u *Uploader) Registered(ctx context.Context, img Image) (string, error) {
 	case !errors.Is(err, os.ErrNotExist):
 		return "", err
 	}
+	// A run stopped part way: an id once its image was made; else whether its state holds a
+	// resource (a snapshot, an import), which the next upload goes on from.
+	held := false
 	if _, err := os.Stat(filepath.Join(dir, "terraform.tfstate")); err == nil {
-		// A run stopped part way: an id once its image was made, else the account is looked at,
-		// and the next upload goes on.
 		if id, err := u.output(ctx, dir, "id"); err == nil && id != "" {
 			return id, u.record(ctx, img, dir, id)
 		}
+		list, err := u.run(ctx, dir, nil, "state", "list")
+		if err != nil {
+			return "", fmt.Errorf("cloud %s: read the state of image %s in %s: %w", img.Cloud, img.Name, dir, err)
+		}
+		held = strings.TrimSpace(string(list)) != ""
 	}
-	probe := filepath.Join(dir, "probe")
-	if err := os.MkdirAll(probe, 0o700); err != nil {
-		return "", err
-	}
-	if err := writeModule(probe, path.Join("tofu", img.Cloud, "probe"), img, map[string]string{"description": img.Description}); err != nil {
-		return "", err
-	}
-	if err := u.apply(ctx, probe); err != nil {
-		return "", fmt.Errorf("cloud %s: look for image %s: %w", img.Cloud, img.Name, err)
-	}
-	id, err := u.output(ctx, probe, "id")
-	if err != nil {
-		return "", fmt.Errorf("cloud %s: look for image %s: %w", img.Cloud, img.Name, err)
-	}
-	if id != "" {
+	id, unready, err := u.probe(ctx, img, dir)
+	gap := snapshotGap[img.Cloud]
+	switch {
+	case err == nil && id != "":
 		return id, u.record(ctx, img, dir, id)
-	}
-	// An image of that name not ready (failed, or still being made), or another disk's, holds the
-	// name.
-	unready, err := u.output(ctx, probe, "unready")
-	if err != nil {
-		return "", fmt.Errorf("cloud %s: look for image %s: %w", img.Cloud, img.Name, err)
-	}
-	if unready != "" {
-		return "", fmt.Errorf("cloud %s: image %s exists and is not this disk's ready image (%s): wait for it, or delete it, then ship again", img.Cloud, img.Name, unready)
+	case err != nil && held && gap != "" && errors.As(err, new(applyError)):
+		// The lookup failed past init, as it does on the stopped run's own snapshot, made without
+		// its image: the next upload goes on from the states.
+		if u.Log != nil {
+			fmt.Fprintf(u.Log, "%v: going on from the stopped run's states in %s\n", err, dir)
+		}
+		return "", nil
+	case err != nil && gap != "" && errors.As(err, new(applyError)):
+		return "", fmt.Errorf("%w (when OpenTofu's error above is that no image has the name, the %s %s was left without its image: delete it, then ship again)", err, gap, img.Name)
+	case err != nil:
+		return "", err
+	case unready != "":
+		// An image of that name not ready (failed, or still being made), or another disk's, holds
+		// the name.
+		del := "delete it"
+		if gap != "" {
+			del = "delete it and the " + gap + " " + img.Name
+		}
+		return "", fmt.Errorf("cloud %s: image %s exists and is not this disk's ready image (%s): wait for it, or %s, then ship again", img.Cloud, img.Name, unready, del)
 	}
 	return "", nil
+}
+
+// probe looks img up in its account with the cloud's probe module, in dir/probe: the id of this
+// disk's ready image, else what holds its name ("" when nothing does).
+func (u *Uploader) probe(ctx context.Context, img Image, dir string) (id, unready string, err error) {
+	probe := filepath.Join(dir, "probe")
+	if err := os.MkdirAll(probe, 0o700); err != nil {
+		return "", "", err
+	}
+	if err := writeModule(probe, path.Join("tofu", img.Cloud, "probe"), img, map[string]string{"description": img.Description}); err != nil {
+		return "", "", err
+	}
+	if err := u.apply(ctx, probe); err != nil {
+		return "", "", fmt.Errorf("cloud %s: look for image %s: %w", img.Cloud, img.Name, err)
+	}
+	if id, err = u.output(ctx, probe, "id"); err == nil && id == "" {
+		unready, err = u.output(ctx, probe, "unready")
+	}
+	if err != nil {
+		return "", "", fmt.Errorf("cloud %s: look for image %s: %w", img.Cloud, img.Name, err)
+	}
+	return id, unready, nil
 }
 
 // Upload registers img on its cloud and returns its id: the disk fetched into the image's working

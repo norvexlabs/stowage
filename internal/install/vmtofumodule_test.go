@@ -70,8 +70,26 @@ func TestEveryBuiltInModuleHoldsTheContract(t *testing.T) {
 			}
 		}
 	}
-	if n != 7 {
+	if n != 8 {
 		t.Errorf("%d built-in modules", n)
+	}
+}
+
+// Scaleway's module gives the cloud-config as the cloud-init user data (the key the OS bundle's
+// datasource reads), makes a security group dropping what it does not accept unless one is given,
+// and never replaces the instance for a later image or cloud-config.
+func TestTheScalewayModule(t *testing.T) {
+	t.Parallel()
+	files, err := moduleFiles("scaleway", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	main := string(files["main.tf"])
+	for _, want := range []string{"cloud-init = file(var.seed)", `inbound_default_policy  = "drop"`, `count                   = var.security_group_id == "" ? 1 : 0`,
+		"ignore_changes = [image, user_data]", `volume_type = "sbs_volume"`, "size_in_gb  = ceil(var.disk_gib * 1.073741824)", `architecture   = "x86_64"`} {
+		if !strings.Contains(main, want) {
+			t.Errorf("main.tf lacks %q", want)
+		}
 	}
 }
 

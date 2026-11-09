@@ -92,7 +92,8 @@ RUN set -e; f=/usr/lib/dracut/modules.d/70crypt/crypt-generator.sh; \
 # which every boot fills from its image without deleting, so a file left there by a newer image
 # would reach an older one's sshd on a rollback, which refuses settings it does not know and
 # does not start. On a system without that directory the Include reads nothing. The build fails
-# when sshd's effective settings are not the drop-in's.
+# when sshd's effective settings are not the drop-in's, root's login refused among them: a cloud's
+# datasource writes its metadata's SSH keys (on Scaleway, every key of the project) for root.
 RUN set -e \
     && /kairos-init -s init --skip-step cisHardening -v "{{.OSVersion}}" \
     && rm /kairos-init \
@@ -103,6 +104,7 @@ RUN set -e \
     && k="$(mktemp -d)" && ssh-keygen -q -t ed25519 -N '' -f "$k/key" && mkdir -p /run/sshd \
     && sshd -T -h "$k/key" > "$k/effective" \
     && grep -qx 'allowtcpforwarding no' "$k/effective" && grep -qx 'maxauthtries 4' "$k/effective" \
+    && grep -qx 'permitrootlogin no' "$k/effective" \
     && rm -rf "$k" \
     && ! test -e /etc/modprobe.d/cis-blocklist.conf \
     && ! grep -rqsE '^[[:space:]]*umask[[:space:]]+0*27([^0-7]|$)' /etc/profile /etc/profile.d /etc/bash.bashrc \
@@ -233,6 +235,15 @@ RUN set -e; f=/system/oem/09_systemd_services.yaml; \
     u=; for d in /usr/lib /lib /etc; do [ ! -e "$d/systemd/system/iscsid.service" ] || u=1; done; \
     if [ -z "$u" ]; then \
         sed -i '/^          - iscsid$/d' "$f"; ! grep -q iscsid "$f"; fi
+
+# Kairos's datasource stage pulls a cloud's user data from the providers it lists, which leave out
+# Scaleway's metadata service (its datasource, yip's, reads the `cloud-init` user data): it is added
+# last, probed beside the other clouds'. The build fails when the list no longer reads as expected.
+RUN set -e; f=/system/oem/00_datasource.yaml; \
+    [ "$(grep -cE '^ +providers: \[.*\]$' "$f")" = 1 ]; \
+    ! grep -q scaleway "$f"; \
+    sed -i -E 's/^( +providers: \[.*)\]$/\1, "scaleway"]/' "$f"; \
+    grep -qE '^ +providers: \[.*"maas", "scaleway"\]$' "$f"
 
 # The locale every login's PAM reads: Ubuntu's /etc/default/locale is a link to /etc/locale.conf,
 # which the base image lacks, so each SSH session and sudo would log the missing file. The build

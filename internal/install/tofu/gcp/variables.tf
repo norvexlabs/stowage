@@ -36,7 +36,7 @@ variable "seed" {
 }
 
 variable "seed_sha256" {
-  description = "The seed's SHA-256: a change attaches it again."
+  description = "The seed's SHA-256 (the instance takes its user data once, at creation)."
   type        = string
 }
 

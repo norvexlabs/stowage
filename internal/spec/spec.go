@@ -674,8 +674,9 @@ type K8sSchema struct {
 var DiskFormats = []string{"raw", "qcow2", "ova", "vhd", "gce", "iso"}
 
 // CloudFormat is the disk format each cloud of cloud_publish imports: AWS a raw disk, Azure a
-// fixed VHD, Google Cloud a disk.raw in a tar.gz.
-var CloudFormat = map[string]string{"aws": "raw", "azure": "vhd", "gcp": "gce"}
+// fixed VHD, Google Cloud a disk.raw in a tar.gz, Scaleway a qcow2 (a Block Storage snapshot's
+// import).
+var CloudFormat = map[string]string{"aws": "raw", "azure": "vhd", "gcp": "gce", "scaleway": "qcow2"}
 
 type KairosShape struct {
 	Base         string      `yaml:"base"`

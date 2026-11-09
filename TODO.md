@@ -79,12 +79,14 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
    `security_group_ids` is given (a VPC's default group admits nothing from outside) and an
    `encrypted` root volume; Azure's an NSG on the NIC; Secure Boot / vTPM where the image allows.
    Each checked against its provider's schema and applied for real.
-2. **Scaleway**: a platform of `vm create` (OpenTofu module: an instance from the release's
-   disk, the cloud-config as its user data) and a cloud of `cloud_publish` (the disk uploaded to
-   Object Storage and imported as an instance image, with the publisher's credentials from the
-   environment), as the other clouds. Before writing a module, read the latest
-   `scaleway/scaleway` provider's official docs and its schema (`tofu providers schema -json`),
-   and pin that release.
+2. **Scaleway, run for real**: `cloud_publish: [scaleway]` and `vm create --platform scaleway` are
+   written against `scaleway/scaleway` 2.91.0 and checked against its schema, not yet run on
+   Scaleway (`STOWAGE_CLOUD_ENV=<file> make e2e-kairos`, then a `vm create --create opentofu`).
+   Check there: the import takes the compressed qcow2 (`qemu-img -c`), a tag holding the
+   description's spaces and colon is accepted and filtered on, the 5 GB single PUT holds the
+   disk, the bundle's `scaleway` datasource reads the `cloud-init` user data at first boot (its
+   source port below 1024), and a drop-by-default security group lets DHCP and the metadata
+   service through; then drop the module's preview mark.
 3. **OVHcloud**: the same for OVHcloud Public Cloud (OpenStack): `vm create` and `cloud_publish`
    (the disk uploaded as a Glance image of the project, `ovh/ovh` and/or
    `terraform-provider-openstack/openstack`, whichever the latest official docs make canonical).
@@ -535,6 +537,15 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
   repositories.
 
 ## Could
+
+- **Two ships on one cloud cache**: two `ship`/`promote` runs on the same `$XDG_CACHE_HOME`
+  share an image's working directory with no lock of Stowage's own: the second can take the
+  first's live state for a stopped run's, upload over its object and, failing on OpenTofu's state
+  lock, destroy the upload the first is importing. Take a lock on the image's directory.
+
+- **Cloud resume without a second transfer**: a run stopped once its snapshot was imported
+  (Scaleway, AWS) downloads and uploads the disk again to make the image, which never reads that
+  upload. Skip the upload module when the image module's state holds the imported snapshot.
 
 - **A bound on an L4 TLS route's connections** (`max_connections`), for an upstream that does not
   bound its own: caddy-l4 (v0.1.2) has no concurrency limit, only `throttle` (bandwidth); a

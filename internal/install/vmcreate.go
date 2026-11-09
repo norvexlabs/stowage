@@ -91,6 +91,10 @@ var Platforms = []Platform{
 		"Upload %[1]s to S3, import it as a snapshot (aws ec2 import-snapshot), and register an image from it (aws ec2 register-image --boot-mode uefi).",
 		"Launch the instance from that image with %[2]s as its user data and a %[3]d GiB root volume (aws ec2 run-instances --user-data file://%[2]s, the image's root device mapped to a volume of that size with --block-device-mappings).",
 	}},
+	{Key: "scaleway", Label: "Scaleway", Formats: []string{"qcow2"}, Tofu: true, Preview: true, Steps: []string{
+		"Upload %[1]s to an Object Storage bucket in the instance's region, import it as a snapshot, and make an image of it (scw block snapshot import-from-object-storage bucket=<bucket> key=<key> name=<name>; scw instance image create snapshot-id=<snapshot id> arch=x86_64 name=<name>).",
+		"Create the instance from that image with %[2]s as its cloud-init user data and an SBS root volume of %[3]d GiB, which Scaleway counts in GB: %[3]d × 1.073741824, rounded up (scw instance server create type=PLAY2-NANO image=<image id> root-volume=sbs:<GB>GB cloud-init=@%[2]s).",
+	}},
 }
 
 // VMCreate is a run of `vm create`: what its flags gave. An empty field is asked, or defaulted.

@@ -3,6 +3,18 @@
 Stowage's own releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
+## [0.33.0]
+
+### Added
+
+- Scaleway: `cloud_publish: [scaleway]` registers the release's qcow2 disk as an instance image in
+  the publisher's Scaleway project (uploaded to an Object Storage bucket, imported as a Block
+  Storage snapshot, made a UEFI x86_64 image; settings `STOWAGE_SCALEWAY_BUCKET`,
+  `SCW_DEFAULT_ZONE`, `SCW_DEFAULT_PROJECT_ID`), and `vm create --platform scaleway` creates an
+  instance from it, by hand or with OpenTofu (a preview: a security group from the SSH sources
+  and the opened ports, a routed public IPv4 address, the cloud-config as its cloud-init user
+  data). The OS bundle now reads its user data from Scaleway's metadata service.
+
 ## [0.32.1] - 2026-11-09
 
 ### Changed

@@ -41,7 +41,8 @@ func TestDockerfileRendersTheParams(t *testing.T) {
 		"mv /usr/share/notes/08_grub.yaml \"$f\"", "sha256sum -c -", "shapes.kairos.kairos_init: its", "grep -qx 'AllowTcpForwarding no' /etc/ssh/sshd_config.d/05-kairos-hardening.conf",
 		"mv /etc/ssh/sshd_config.d/05-kairos-hardening.conf /usr/lib/notes/sshd_config.d/",
 		"printf 'Include /usr/lib/notes/sshd_config.d/*.conf\\n' > /etc/ssh/sshd_config.d/00-notes-hardening.conf", "grep -qx 'allowtcpforwarding no' \"$k/effective\"",
-		"! test -e /etc/modprobe.d/cis-blocklist.conf", "umask[[:space:]]+0*27([^0-7]|$)' /etc/profile /etc/profile.d", "UMASK[[:space:]]+0*27", "sed -i '/^        net\\.core\\.rmem_max: 7500000$/d'"} {
+		"! test -e /etc/modprobe.d/cis-blocklist.conf", "umask[[:space:]]+0*27([^0-7]|$)' /etc/profile /etc/profile.d", "UMASK[[:space:]]+0*27", "sed -i '/^        net\\.core\\.rmem_max: 7500000$/d'",
+		`sed -i -E 's/^( +providers: \[.*)\]$/\1, "scaleway"]/' "$f"`, `grep -qx 'permitrootlogin no' "$k/effective"`} {
 		if !strings.Contains(s, want) {
 			t.Errorf("Dockerfile lacks %q", want)
 		}

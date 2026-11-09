@@ -35,6 +35,19 @@ func TestVars(t *testing.T) {
 	if v, err := Vars("gcp", env(nil)); v != nil || err != nil {
 		t.Errorf("gcp unset: %v, %v", v, err)
 	}
+	// Scaleway's zone and project, set for its CLI, upload nothing; its bucket asks for both.
+	scw := map[string]string{"SCW_DEFAULT_ZONE": "fr-par-1", "SCW_DEFAULT_PROJECT_ID": "p"}
+	if v, err := Vars("scaleway", env(scw)); v != nil || err != nil {
+		t.Errorf("scaleway zone and project alone: %v, %v", v, err)
+	}
+	scw["STOWAGE_SCALEWAY_BUCKET"] = "b"
+	if v, err := Vars("scaleway", env(scw)); err != nil || v["bucket"] != "b" || v["zone"] != "fr-par-1" || v["project"] != "p" {
+		t.Errorf("scaleway: %v, %v", v, err)
+	}
+	_, err = Vars("scaleway", env(map[string]string{"STOWAGE_SCALEWAY_BUCKET": "b"}))
+	if err == nil || err.Error() != "cloud scaleway: STOWAGE_SCALEWAY_BUCKET set, so its image is uploaded: set SCW_DEFAULT_ZONE, SCW_DEFAULT_PROJECT_ID too" {
+		t.Errorf("scaleway without zone and project: %v", err)
+	}
 	if _, err := Vars("ovh", env(nil)); err == nil {
 		t.Error("unknown cloud taken")
 	}
@@ -48,6 +61,10 @@ type fakeTofu struct {
 	id, existing, unready, upload string
 	fail                          string // the subcommand that fails
 	files                         map[string]map[string]bool
+	// held is what `state list` prints; noID makes an image's `output id` fail, as OpenTofu's
+	// does on a state without that output.
+	held string
+	noID bool
 }
 
 func (f *fakeTofu) run(_ context.Context, args, env []string, _ io.Writer) ([]byte, error) {
@@ -68,8 +85,12 @@ func (f *fakeTofu) run(_ context.Context, args, env []string, _ io.Writer) ([]by
 	switch args[1] {
 	case "apply":
 		return nil, os.WriteFile(filepath.Join(dir, "terraform.tfstate"), []byte("{}"), 0o600)
+	case "state":
+		return []byte(f.held), nil
 	case "output":
 		switch {
+		case f.noID && args[3] == "id" && base != "probe":
+			return nil, errors.New(`tofu output: Output "id" not found`)
 		case args[3] == "unready":
 			return []byte(f.unready), nil
 		case args[3] == "upload":
@@ -259,6 +280,10 @@ func TestRegisteredAfterAStoppedRun(t *testing.T) {
 			t.Fatal(err)
 		}
 		want := [][]string{{"notes-1", "output", "-raw", "id"}}
+		if c.id == "" {
+			// An empty state: the account is looked at.
+			want = append(want, []string{"notes-1", "state", "list"})
+		}
 		switch {
 		case c.existing == "":
 			want = append(want, probedNone()...)
@@ -290,6 +315,84 @@ func TestRegisteredAfterAStoppedRun(t *testing.T) {
 		if again, _ := u.Registered(ctx, img); c.want != "" && (again != c.want || tf.runs != nil) {
 			t.Errorf("kept: %q, runs %v", again, tf.runs)
 		}
+	}
+}
+
+// A run stopped once its image module's state holds a resource takes the image the account holds,
+// else goes on from its states, a failed lookup included (Scaleway's probe fails on the run's own
+// snapshot, made without its image); on Scaleway a failed lookup or an image not ready names the
+// snapshot to delete.
+func TestRegisteredResumesAHeldState(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	scw := Image{Cloud: "scaleway", Name: "notes-1", Vars: map[string]string{"bucket": "b", "zone": "fr-par-1", "project": "p"}}
+	aws := Image{Cloud: "aws", Name: "notes-1", Vars: map[string]string{"bucket": "b", "region": "eu-west-1", "vmimport_role": "vmimport"}}
+	stopped := func(tf *fakeTofu, img Image) (*Uploader, *strings.Builder) {
+		log := &strings.Builder{}
+		u := &Uploader{WorkDir: t.TempDir(), Tofu: tf.run, Log: log}
+		dir, _ := u.dir(img)
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "terraform.tfstate"), []byte("{}"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return u, log
+	}
+	head := [][]string{{"notes-1", "output", "-raw", "id"}, {"notes-1", "state", "list"}}
+	const snap = "scaleway_block_snapshot.image\n"
+	for _, c := range []struct {
+		name string
+		img  Image
+		tf   *fakeTofu
+		want string
+		runs [][]string
+		log  string
+	}{
+		// The image made by the stopped run (not recorded) or by another machine is taken.
+		{"aws, held, in the account", aws, &fakeTofu{held: "aws_ebs_snapshot_import.image\n", existing: "ami-1"}, "ami-1", append(slices.Clone(head), applied("probe", "id")...), ""},
+		{"aws, held, none", aws, &fakeTofu{held: "aws_ebs_snapshot_import.image\n"}, "", append(slices.Clone(head), probedNone()...), ""},
+		// `output id` as OpenTofu gives it on a state without it: empty, or failing.
+		{"scaleway, held, in the account", scw, &fakeTofu{noID: true, held: snap, existing: "fr-par-1/img"}, "fr-par-1/img", append(slices.Clone(head), applied("probe", "id")...), ""},
+		// The probe fails on the stopped run's own snapshot: logged, and the upload goes on.
+		{"scaleway, held, failed lookup", scw, &fakeTofu{held: snap, fail: "apply"}, "", append(slices.Clone(head), []string{"probe", "init", "-input=false", "-no-color"}, []string{"probe", "apply", "-auto-approve", "-input=false", "-no-color"}),
+			"cloud scaleway: look for image notes-1: tofu apply: exit status 1: going on from the stopped run's states in "},
+		{"scaleway, empty state", scw, &fakeTofu{noID: true}, "", append(slices.Clone(head), probedNone()...), ""},
+	} {
+		u, log := stopped(c.tf, c.img)
+		got, err := u.Registered(ctx, c.img)
+		if got != c.want || err != nil || !slices.EqualFunc(c.tf.runs, c.runs, slices.Equal) || !strings.HasPrefix(log.String(), c.log) || (c.log == "") != (log.String() == "") {
+			t.Errorf("%s: %q, %v, runs %v, log %q", c.name, got, err, c.tf.runs, log.String())
+		}
+	}
+	// Any other failed lookup stops, held state or not: another cloud's, or one at init.
+	for _, c := range []struct {
+		img  Image
+		fail string
+	}{{aws, "apply"}, {scw, "init"}} {
+		u, log := stopped(&fakeTofu{held: snap, fail: c.fail}, c.img)
+		if _, err := u.Registered(ctx, c.img); err == nil || err.Error() != "cloud "+c.img.Cloud+": look for image notes-1: tofu "+c.fail+": exit status 1" || log.String() != "" {
+			t.Errorf("%s, held, failed %s: %v, log %q", c.img.Cloud, c.fail, err, log.String())
+		}
+	}
+	// A state that cannot be read is told, not taken for none.
+	u, _ := stopped(&fakeTofu{noID: true, fail: "state"}, scw)
+	if _, err := u.Registered(ctx, scw); err == nil || !strings.HasPrefix(err.Error(), "cloud scaleway: read the state of image notes-1 in ") || !strings.HasSuffix(err.Error(), "/notes-1: tofu state: exit status 1") {
+		t.Errorf("unreadable state: %v", err)
+	}
+	// An image not ready stops, held state or not, naming the snapshot to delete with it.
+	u, _ = stopped(&fakeTofu{held: snap, unready: "state error"}, scw)
+	if _, err := u.Registered(ctx, scw); err == nil || err.Error() != "cloud scaleway: image notes-1 exists and is not this disk's ready image (state error): wait for it, or delete it and the Block Storage snapshot notes-1, then ship again" {
+		t.Errorf("unready: %v", err)
+	}
+	// Without a state, a failed lookup stops: past init, naming the snapshot that may fail it.
+	u = &Uploader{WorkDir: t.TempDir(), Tofu: (&fakeTofu{fail: "apply"}).run}
+	if _, err := u.Registered(ctx, scw); err == nil || err.Error() != "cloud scaleway: look for image notes-1: tofu apply: exit status 1 (when OpenTofu's error above is that no image has the name, the Block Storage snapshot notes-1 was left without its image: delete it, then ship again)" {
+		t.Errorf("failed lookup: %v", err)
+	}
+	u = &Uploader{WorkDir: t.TempDir(), Tofu: (&fakeTofu{fail: "init"}).run}
+	if _, err := u.Registered(ctx, scw); err == nil || err.Error() != "cloud scaleway: look for image notes-1: tofu init: exit status 1" {
+		t.Errorf("failed init: %v", err)
 	}
 }
 
