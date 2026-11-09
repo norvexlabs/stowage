@@ -59,7 +59,7 @@ Full examples: [full](../examples/full/stowage.yaml) (every key),
 | `stowage.requires` | accepted Stowage range (SemVer comparators, all holding), read before the rest of the spec and enforced by every command and on the lock; exact version in `stowage.lock` |
 | `version`, `changelog`, `channels` | § 3 |
 | `registry` | prefix, pull credentials (baked into the installer), push auth |
-| `images` | build table: `context`/`dockerfile`/`target`/`args`/`add_hosts`/`network`/`inputs`, or `ref` for a pinned upstream image |
+| `images` | build table: `context`/`dockerfile`/`target`/`args`/`add_hosts`/`network`/`contexts`/`inputs`, or `ref` for a pinned upstream image |
 | `stack.compose` | **the single service definition**, no `build:` (lint-enforced); `extends` within the file, `profiles:` only those an input turns on, no `ports:` of its own nor `network_mode: host` (`services.<name>.host_network` asks for the host's network) on the VM |
 | `front` | optional (absent or empty: no front, the `l4` routes alone); TLS modes offered, hostname (and path prefix) → upstream routes, header stripping, forward auth, a source allowlist, client certificates and a login per route, which route is the portal, the CA published to the stack, the project's default host ports |
 | `l4` | host ports published to a service as they are (TCP or UDP), beside the front; the input holding the address clients dial; the input holding the sources the VM lets reach it; the advanced input holding the host address the port is bound to |
@@ -265,7 +265,11 @@ uncommitted edit counts; for an image, its `.dockerignore` applied exactly as do
 `.git` is never read, so inside a build context it must be excluded by `.dockerignore`, which lint
 enforces) + dockerfile + target + build args + added hosts + a build network other than BuildKit's
 default (each entered only when set, so an image naming neither keeps the digest it has without
-them), and for the nodes that carry Stowage's runtime
+them) + each named build context (`contexts`: its name, its path and its tree less its OWN
+`.dockerignore`, which is what BuildKit applies to a named context — the main context's file
+never reaches it; whole whatever `inputs` narrows the main context to, since a named context is
+the source a stage reads by name, so all it sends is the build's), and for the nodes that carry
+Stowage's runtime
 (chart, OS bundle, disks, installer, release), the `stowage.lock` version. Base images enter through the Dockerfile's bytes: lint requires every
 `FROM` to be pinned by digest, so a base-image update is a Dockerfile change and reaches the
 digest (an unpinned base would change without one). The project version enters an image's digest

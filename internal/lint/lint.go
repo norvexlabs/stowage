@@ -415,7 +415,7 @@ func (l *linter) images() {
 			l.errf(where, "image key %q is reserved: %s-%s is where Stowage publishes its own artifacts", name, l.s.Name, name)
 		}
 		if !img.Built() {
-			if img.Context != "" || img.Dockerfile != "" || img.Target != "" || len(img.Args) > 0 || len(img.AddHosts) > 0 || img.Network != "" || len(img.Inputs) > 0 {
+			if img.Context != "" || img.Dockerfile != "" || img.Target != "" || len(img.Args) > 0 || len(img.AddHosts) > 0 || img.Network != "" || len(img.Contexts) > 0 || len(img.Inputs) > 0 {
 				l.errf(where, "ref and build fields are exclusive")
 			}
 			if !pinnedRe.MatchString(img.Ref) {
@@ -423,7 +423,16 @@ func (l *linter) images() {
 			}
 			continue
 		}
-		if l.exists(where+".context", img.Context, true) && l.exists(where+".dockerfile", img.Dockerfile, false) {
+		ctxOK := l.exists(where+".context", img.Context, true)
+		// The build context is resolved by BuildKit, a link at any of its components followed,
+		// while the inputs digest follows none: the same refusal as a named context's.
+		if ctxOK {
+			if _, _, err := spec.ContextDir(l.root, img.Context); err != nil {
+				l.errf(where+".context", "%v", err)
+				ctxOK = false
+			}
+		}
+		if ctxOK && l.exists(where+".dockerfile", img.Dockerfile, false) {
 			if ig, err := digest.DockerIgnore(spec.Path(l.root, img.Context), spec.Path(l.root, img.Dockerfile)); err != nil {
 				l.errf(where, "%v", err)
 			} else if g, err := digest.GitInContext(ig); err != nil {
@@ -434,7 +443,7 @@ func (l *linter) images() {
 			}
 		}
 		if l.exists(where+".dockerfile", img.Dockerfile, false) {
-			stages := l.baseImages(where+".dockerfile", img.Dockerfile)
+			stages := l.baseImages(where+".dockerfile", img.Dockerfile, img.Contexts)
 			if img.Target != "" && stages != nil && !stages[strings.ToLower(img.Target)] {
 				l.errf(where+".target", "%q is not a stage of %s", img.Target, img.Dockerfile)
 			}
@@ -464,14 +473,42 @@ func (l *linter) images() {
 		if img.Network != "" && !slices.Contains(spec.BuildNetworks, img.Network) {
 			l.errf(where+".network", "%q is not a build network: %s", img.Network, strings.Join(spec.BuildNetworks, ", "))
 		}
+		// A named context is a second build context: a directory of the project, sent less its
+		// own .dockerignore, which must keep its .git out as the main context's must.
+		for _, cn := range slices.Sorted(maps.Keys(img.Contexts)) {
+			cw := where + ".contexts." + cn
+			if !imageKeyRe.MatchString(cn) {
+				l.errf(where+".contexts", "%q is not a build context name (lowercase letters and digits, separated by single '.', '_' or '-')", cn)
+			}
+			// These two collide with BuildKit's own names: `scratch` is the empty base, `context`
+			// the main build context; which a step then reads depends on how it names it.
+			if cn == "scratch" || cn == "context" {
+				l.errf(where+".contexts", "%q collides with a name BuildKit gives its own (scratch: the empty base; context: the main build context): name the context otherwise", cn)
+			}
+			_, dir, err := spec.ContextDir(l.root, img.Contexts[cn])
+			if err != nil {
+				l.errf(cw, "%v", err)
+				continue
+			}
+			if ig, err := digest.ContextIgnore(dir); err != nil {
+				l.errf(cw, "%v", err)
+			} else if g, err := digest.GitInContext(ig); err != nil {
+				l.errf(cw, "%v", err)
+			} else if g != "" {
+				rel, _ := filepath.Rel(l.root, g)
+				l.errf(cw, "%s: %v", rel, digest.ErrGitInContext)
+			}
+		}
 	}
 }
 
 // baseImages requires every stage of a built image to start from an image pinned by digest (or
 // from an earlier stage, or scratch). The Dockerfile's bytes are part of the image's inputs
 // digest, so a pinned base is how a base-image update reaches the digest — and so the release.
+// A stage may also start from one of the image's named contexts (contexts), whose whole tree is an
+// input already; a context named like a stage replaces that stage, warned.
 // It returns the Dockerfile's stage names (nil when unreadable).
-func (l *linter) baseImages(where, rel string) map[string]bool {
+func (l *linter) baseImages(where, rel string, contexts map[string]string) map[string]bool {
 	src, err := os.ReadFile(spec.Path(l.root, rel))
 	if err != nil {
 		l.errf(where, "%v", err)
@@ -490,8 +527,12 @@ func (l *linter) baseImages(where, rel string) map[string]bool {
 	stages := map[string]bool{}
 	for _, f := range froms {
 		at := fmt.Sprintf("%s:%d", rel, f.Line)
+		name, isName := dockerfile.ContextName(f.Image)
+		_, named := contexts[name]
+		// A stage a named context replaces is never built, so its base is never pulled.
+		_, replaced := contexts[f.Stage]
 		switch {
-		case stages[strings.ToLower(f.Image)], f.Image == "scratch", pinnedRe.MatchString(f.Image):
+		case stages[strings.ToLower(f.Image)], f.Image == "scratch", pinnedRe.MatchString(f.Image), isName && named, replaced:
 		case strings.Contains(f.Image, "$"):
 			l.warnf(at, "FROM %s is set by a build argument: its pinning cannot be checked", f.Image)
 		default:
@@ -499,6 +540,11 @@ func (l *linter) baseImages(where, rel string) map[string]bool {
 		}
 		if f.Stage != "" {
 			stages[f.Stage] = true
+		}
+	}
+	for _, cn := range slices.Sorted(maps.Keys(contexts)) {
+		if stages[cn] {
+			l.warnf(where, "%s: the named context %s replaces the stage of that name: every read of the stage reads the directory %s instead", rel, cn, contexts[cn])
 		}
 	}
 	return stages

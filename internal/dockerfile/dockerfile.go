@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/distribution/reference"
 	"github.com/moby/buildkit/frontend/dockerfile/instructions"
 	"github.com/moby/buildkit/frontend/dockerfile/parser"
 	"github.com/moby/buildkit/frontend/dockerfile/shell"
@@ -111,4 +112,17 @@ func (f *File) Froms() []From {
 		out = append(out, fr)
 	}
 	return out
+}
+
+// ContextName is the name BuildKit looks a named build context up by for an image reference (a
+// FROM's base), as BuildKit computes it: the reference parsed as a normalised image name, then
+// spelled in its familiar form less the default tag — `schema`, `schema:latest`, `docker.io/schema`
+// and `docker.io/library/schema` all read the context `schema`. ok is false for a reference
+// BuildKit refuses as a name (an upper-case one, say): no context is looked up for it.
+func ContextName(ref string) (name string, ok bool) {
+	named, err := reference.ParseNormalizedNamed(ref)
+	if err != nil {
+		return "", false
+	}
+	return strings.TrimSuffix(reference.FamiliarString(named), ":latest"), true
 }

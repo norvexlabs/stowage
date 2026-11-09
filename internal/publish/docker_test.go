@@ -147,6 +147,44 @@ func TestDockerBuilderPassesTheSpecAndYieldsAnOCIImage(t *testing.T) {
 	}
 }
 
+// An image's named contexts reach the build as `--build-context <name>=<dir>`, each its
+// project path made absolute, in name order.
+func TestDockerBuilderPassesNamedContexts(t *testing.T) {
+	root := testutil.CopyExample(t, "full")
+	p, err := project.Open(root, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	img := p.Spec.Images["api"]
+	img.Contexts = map[string]string{"vendored": "ui", "assets": "server"}
+	p.Spec.Images["api"] = img
+	dir := t.TempDir()
+	src, _ := random.Image(64, 1)
+	tag, _ := name.NewTag("saved:1")
+	archive := filepath.Join(dir, "saved.tar")
+	if err := tarball.WriteToFile(archive, tag, src); err != nil {
+		t.Fatal(err)
+	}
+	docker := filepath.Join(dir, "docker")
+	if err := os.WriteFile(docker, []byte(fakeDocker), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	logf := filepath.Join(dir, "log")
+	t.Setenv("FAKE_DOCKER_LOG", logf)
+	t.Setenv("FAKE_DOCKER_ARCHIVE", archive)
+	b := &DockerBuilder{Docker: docker, WorkDir: filepath.Join(dir, "work")}
+	_, cleanup, err := b.Build(context.Background(), p, BuildRequest{Image: "api", Inputs: "sha256:0123456789abcdef0123"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cleanup()
+	raw, _ := os.ReadFile(logf)
+	want := "--build-context assets=" + filepath.Join(root, "server") + " --build-context vendored=" + filepath.Join(root, "ui")
+	if call := strings.SplitN(string(raw), "\n", 2)[0]; !strings.Contains(call, want) {
+		t.Errorf("build call lacks %q:\n%s", want, call)
+	}
+}
+
 // A recipe is built from its own bytes, with an empty context, whatever the spec holds.
 func TestDockerBuilderBuildsARecipe(t *testing.T) {
 	root := testutil.CopyExample(t, "minimal")

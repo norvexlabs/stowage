@@ -15,7 +15,8 @@ RUN apk add --no-cache postgresql18-client 'zlib>=1.4'
 RUN python -m pip uninstall -y -q pip && rm -rf /usr/local/lib/python3.13/ensurepip
 COPY --from=build /src/server/atlas-server /usr/local/bin/atlas-server
 COPY --from=build /src/build-info /srv/build-info
-COPY migrations/ /srv/migrations/
+# The schema from its named build context (images.api.contexts in stowage.yaml).
+COPY --from=schema / /srv/migrations/
 # The update_socket directory, the user's: a new volume takes it, owner included.
 RUN install -d -o 65532 -g 65532 /run/atlas/handoff
 USER 65532

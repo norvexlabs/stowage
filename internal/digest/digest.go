@@ -54,11 +54,24 @@ type Ignore struct {
 // present, else `<context>/.dockerignore`. The result always knows the context, with no pattern
 // when neither file exists.
 func DockerIgnore(contextDir, dockerfile string) (*Ignore, error) {
+	return ignoreOf(contextDir, dockerfile+".dockerignore", filepath.Join(contextDir, ".dockerignore"))
+}
+
+// ContextIgnore loads the ignore file BuildKit applies to a NAMED build context
+// (`--build-context name=<dir>`): `<dir>/.dockerignore` alone — the Dockerfile's own ignore file
+// is the main context's, never a named one's. The result always knows the directory, with no
+// pattern when it holds no such file.
+func ContextIgnore(contextDir string) (*Ignore, error) {
+	return ignoreOf(contextDir, filepath.Join(contextDir, ".dockerignore"))
+}
+
+// ignoreOf loads the first of candidates that exists, its patterns relative to contextDir.
+func ignoreOf(contextDir string, candidates ...string) (*Ignore, error) {
 	abs, err := filepath.Abs(contextDir)
 	if err != nil {
 		return nil, err
 	}
-	for _, p := range []string{dockerfile + ".dockerignore", filepath.Join(contextDir, ".dockerignore")} {
+	for _, p := range candidates {
 		f, err := os.Open(p)
 		if os.IsNotExist(err) {
 			continue

@@ -5,6 +5,29 @@ import (
 	"testing"
 )
 
+// ContextName is BuildKit's own normalisation: familiar form, less :latest; a name it refuses
+// looks nothing up.
+func TestContextName(t *testing.T) {
+	t.Parallel()
+	for in, want := range map[string]string{
+		"schema":                          "schema",
+		"schema:latest":                   "schema",
+		"docker.io/schema":                "schema",
+		"index.docker.io/schema":          "schema",
+		"docker.io/library/schema":        "schema",
+		"docker.io/library/schema:latest": "schema",
+		"library/schema":                  "schema",
+		"schema:1.2":                      "schema:1.2",
+		"registry.example/schema":         "registry.example/schema",
+		"Schema":                          "",
+	} {
+		got, ok := ContextName(in)
+		if got != want || ok != (want != "") {
+			t.Errorf("ContextName(%q) = %q, %v; want %q", in, got, ok, want)
+		}
+	}
+}
+
 func TestMayDeclareArg(t *testing.T) {
 	cases := []struct {
 		src  string

@@ -3,6 +3,30 @@
 Stowage's own releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
+## [0.31.0]
+
+### Added
+
+- `images.<key>.contexts`: named build contexts, `{<name>: <directory of the project>}`, each
+  passed to the build as `--build-context <name>=<dir>` — the source a stage reads with
+  `COPY --from=<name>` (or the stage of that name it replaces) that the main context does not
+  hold, such as a submodule the main context's `.dockerignore` keeps out. Each is sent less its
+  own `.dockerignore`, as BuildKit applies it, and enters the image's inputs digest so: its name,
+  its path and every file it sends. A stage may start `FROM` one. Lint refuses a name that is
+  not lowercase letters and digits separated by single `.`, `_` or `-`, a path that is no
+  directory of the project or goes through a symbolic link, a
+  `.git` its own `.dockerignore` does not exclude (a git submodule needs a `.dockerignore` of its
+  own excluding `.git`), `scratch` and `context` (BuildKit's own names for the empty base and the
+  main build context), and `contexts` beside `ref`; it warns of a named context named like a stage,
+  which it replaces.
+
+### Changed
+
+- An image's `context` reached through a symbolic link, at any component of its path, is refused
+  by lint and by every command that computes the release's inputs (`ship` among them): BuildKit
+  sends the directory the link points to while the inputs digest follows no link, so an edit there
+  would never rebuild the image. Name the directory itself.
+
 ## [0.30.1] - 2026-11-07
 
 ### Fixed

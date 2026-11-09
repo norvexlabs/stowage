@@ -373,7 +373,9 @@ func imageNode(p *project.Project, name, projectVersion string) (Node, error) {
 	if err != nil {
 		return Node{}, fmt.Errorf("image %s dockerfile: %w", name, err)
 	}
-	ctxPath, err := spec.ProjectPath(p.Root, img.Context)
+	// Through no link: the walk below follows none, BuildKit follows them all. Entered as written
+	// (the `context` field below), as it always has been.
+	_, ctxPath, err := spec.ContextDir(p.Root, img.Context)
 	if err != nil {
 		return Node{}, fmt.Errorf("image %s context: %w", name, err)
 	}
@@ -428,6 +430,24 @@ func imageNode(p *project.Project, name, projectVersion string) (Node, error) {
 	}
 	if err := b.Tree(p.Root, inputs, ig); err != nil {
 		return Node{}, fmt.Errorf("image %s: %w", name, err)
+	}
+	// Each named context as BuildKit sends it: its name and path, then its tree less its own
+	// `.dockerignore` — whatever `inputs` narrows the main context to, a named context is
+	// sent whole and so enters whole.
+	for _, cn := range slices.Sorted(maps.Keys(img.Contexts)) {
+		// Cleaned (one directory, one build), and through no link: the walk below follows none.
+		rel, dir, err := spec.ContextDir(p.Root, img.Contexts[cn])
+		if err != nil {
+			return Node{}, fmt.Errorf("image %s context %s: %w", name, cn, err)
+		}
+		cig, err := digest.ContextIgnore(dir)
+		if err != nil {
+			return Node{}, fmt.Errorf("image %s context %s: %w", name, cn, err)
+		}
+		b.Field("build-context", cn+"="+rel)
+		if err := b.Tree(p.Root, []string{rel}, cig); err != nil {
+			return Node{}, fmt.Errorf("image %s context %s: %w", name, cn, err)
+		}
 	}
 	n.Inputs = b.Sum()
 	return n, nil

@@ -212,6 +212,66 @@ func TestBuildInputsReachTheImage(t *testing.T) {
 	}
 }
 
+// A named build context enters the image's inputs as BuildKit sends it: named, whole whatever
+// `inputs` narrows the main context to, and less its OWN .dockerignore — never the main one's.
+func TestNamedBuildContextReachesTheImage(t *testing.T) {
+	root := testutil.CopyExample(t, "full")
+	testutil.Write(t, root, "vendored/src/a", "a\n")
+	testutil.Write(t, root, "vendored/.dockerignore", "target\n")
+	before := inputs(build(t, root))
+	testutil.Edit(t, root, "stowage.yaml", "contexts: { schema: migrations }", "contexts: { schema: migrations, vendored: vendored }")
+	if c := changed(before, inputs(build(t, root))); !c["image/api"] || c["image/ingest"] {
+		t.Errorf("declaring a named context: %v", c)
+	}
+	// Its content, though api's inputs name only server/.
+	before = inputs(build(t, root))
+	testutil.Write(t, root, "vendored/src/a", "b\n")
+	if c := changed(before, inputs(build(t, root))); !c["image/api"] {
+		t.Errorf("a change inside the named context: %v", c)
+	}
+	// What its own ignore file excludes is not sent, so it is not an input.
+	before = inputs(build(t, root))
+	testutil.Write(t, root, "vendored/target/out", "built\n")
+	if c := changed(before, inputs(build(t, root))); c["image/api"] {
+		t.Errorf("a file its own .dockerignore excludes changed the image: %v", c)
+	}
+	// The main context's ignore file does not reach it: excluded there, still an input here.
+	testutil.Write(t, root, ".dockerignore", "vendored/src\n")
+	before = inputs(build(t, root))
+	testutil.Write(t, root, "vendored/src/a", "c\n")
+	if c := changed(before, inputs(build(t, root))); !c["image/api"] {
+		t.Errorf("the main context's .dockerignore hid a named context's file: %v", c)
+	}
+	// Its name is an input too: another name is another build.
+	before = inputs(build(t, root))
+	testutil.Edit(t, root, "stowage.yaml", "contexts: { schema: migrations, vendored: vendored }", "contexts: { schema: migrations, other: vendored }")
+	if c := changed(before, inputs(build(t, root))); !c["image/api"] {
+		t.Errorf("renaming the named context: %v", c)
+	}
+	// Another spelling of the same directory is the same build.
+	before = inputs(build(t, root))
+	testutil.Edit(t, root, "stowage.yaml", "other: vendored }", "other: ./vendored/ }")
+	if c := changed(before, inputs(build(t, root))); c["image/api"] {
+		t.Errorf("respelling the named context's path: %v", c)
+	}
+	// A link: the walk would see its text while BuildKit sends the directory, so it is refused.
+	if err := os.Symlink("vendored", filepath.Join(root, "linked")); err != nil {
+		t.Fatal(err)
+	}
+	testutil.Edit(t, root, "stowage.yaml", "other: ./vendored/ }", "other: linked }")
+	p, err := project.Open(root, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	v, err := p.Version()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Build(p, Release{Version: v, Revision: 1, Channel: firstChannel(p)}); err == nil || !strings.Contains(err.Error(), "linked goes through a symbolic link") {
+		t.Errorf("a linked named context: %v", err)
+	}
+}
+
 // A revision repackages what embeds it and re-tags every image.
 func TestRevisionReachesWhatEmbedsIt(t *testing.T) {
 	root := testutil.CopyExample(t, "full")

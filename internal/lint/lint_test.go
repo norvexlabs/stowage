@@ -212,6 +212,15 @@ func TestEachRuleFiresOnFull(t *testing.T) {
 		{"audit allow artifact", []edit{{"audit-allow.yaml", "artifact: os\n  package: golang.org/x/net\n  path: /usr/bin/runc", "artifact: osx\n  package: golang.org/x/net\n  path: /usr/bin/runc"}}, nil, `audit.allow: audit-allow.yaml: allowance GO-2026-6612 in osx (package golang.org/x/net) (path /usr/bin/runc): artifact "osx" is no artifact of the release: one of api, ingest, postgres, provision, ui, os, front, backup, chown, audit, installer, or "*"`},
 		{"audit allow path", []edit{{"audit-allow.yaml", "path: /usr/bin/runc", "path: usr/bin/runc"}}, nil, `path "usr/bin/runc": an absolute, clean path`},
 		{"audit allow forever", []edit{{"audit-allow.yaml", "golang.org/x/net 0.55, no release has the fix; that build does not link x/net's HTTP/2 server, where the bug is\n  expires: 2027-01-31", "golang.org/x/net 0.55, no release has the fix; that build does not link x/net's HTTP/2 server, where the bug is\n  expires: 2099-01-01"}}, nil, "expires 2099-01-01: more than a year ahead"},
+		{"contexts name", []edit{{sp, "contexts: { schema: migrations }", "contexts: { Schema: migrations }"}}, nil, `images.api.contexts: "Schema" is not a build context name`},
+		{"contexts name end", []edit{{sp, "contexts: { schema: migrations }", "contexts: { schema-: migrations }"}}, nil, `images.api.contexts: "schema-" is not a build context name`},
+		{"contexts name twice", []edit{{sp, "contexts: { schema: migrations }", "contexts: { a..b: migrations }"}}, nil, `images.api.contexts: "a..b" is not a build context name`},
+		{"contexts missing", []edit{{sp, "contexts: { schema: migrations }", "contexts: { schema: no-such }"}}, nil, "images.api.contexts.schema: no-such does not exist"},
+		{"contexts scratch", []edit{{sp, "contexts: { schema: migrations }", "contexts: { schema: migrations, scratch: ui }"}}, nil, `images.api.contexts: "scratch" collides with a name BuildKit gives its own`},
+		{"contexts context", []edit{{sp, "contexts: { schema: migrations }", "contexts: { schema: migrations, context: ui }"}}, nil, `images.api.contexts: "context" collides with a name BuildKit gives its own`},
+		{"contexts file", []edit{{sp, "contexts: { schema: migrations }", "contexts: { schema: docker/api.Dockerfile }"}}, nil, "images.api.contexts.schema: docker/api.Dockerfile is not a directory"},
+		{"contexts git", []edit{{sp, "contexts: { schema: migrations }", "contexts: { schema: migrations, vendored: vendored }"}}, map[string]string{"vendored/.git": "gitdir: ../.git/modules/vendored\n", "vendored/a": "a\n"}, "images.api.contexts.vendored: vendored/.git: the build context holds .git"},
+		{"contexts ref", []edit{{sp, "ingest:    { context: ., dockerfile: docker/ingest.Dockerfile, inputs: [server/] }", "ingest:    { ref: \"registry.example.test/ingest@sha256:" + strings.Repeat("a", 64) + "\", contexts: { vendored: ui } }"}}, nil, "images.ingest: ref and build fields are exclusive"},
 		{"add_hosts name", []edit{{sp, "packages.atlas.test: [", "Packages.atlas.test: ["}}, nil, `images.api.add_hosts: "Packages.atlas.test" is not a host name`},
 		{"add_hosts address", []edit{{sp, "[192.0.2.10, 192.0.2.11]", "[192.0.2.10, 192.0.2]"}}, nil, `images.api.add_hosts.packages.atlas.test[1]: "192.0.2" is not an IP address without a zone`},
 		{"add_hosts zone", []edit{{sp, "[192.0.2.10, 192.0.2.11]", "[fe80::1%eth0]"}}, nil, `"fe80::1%eth0" is not an IP address without a zone`},
@@ -1011,6 +1020,105 @@ func TestGitInBuildContext(t *testing.T) {
 	testutil.Write(t, root, ".dockerignore", ".git\n")
 	if errs := errorsOf(run(t, root)); len(errs) > 0 {
 		t.Fatalf("excluded .git still reported:\n%s", strings.Join(errs, "\n"))
+	}
+}
+
+// A named context is read through no link (the digest would never see the files BuildKit sends);
+// a stage may start FROM one; one shadowing a stage, or read by no step, is warned.
+func TestNamedBuildContextRules(t *testing.T) {
+	warned := func(res *Result, msg string) bool {
+		return slices.ContainsFunc(res.Findings, func(f Finding) bool { return f.Severity == Warning && strings.Contains(f.String(), msg) })
+	}
+	t.Run("symlink", func(t *testing.T) {
+		root := testutil.CopyExample(t, "full")
+		if err := os.Symlink("migrations", filepath.Join(root, "linked")); err != nil {
+			t.Fatal(err)
+		}
+		testutil.Edit(t, root, specFile, "contexts: { schema: migrations }", "contexts: { schema: linked }")
+		if errs := strings.Join(errorsOf(run(t, root)), "\n"); !strings.Contains(errs, "images.api.contexts.schema: linked goes through a symbolic link") {
+			t.Errorf("a linked context is not refused:\n%s", errs)
+		}
+	})
+	t.Run("symlink above", func(t *testing.T) {
+		// A link at a parent component, out of the project: the path's last component is a
+		// real directory, and still the context is not a directory of the project.
+		root := testutil.CopyExample(t, "full")
+		outside := t.TempDir()
+		testutil.Write(t, outside, "lib/a", "a\n")
+		if err := os.Symlink(outside, filepath.Join(root, "third_party")); err != nil {
+			t.Fatal(err)
+		}
+		testutil.Edit(t, root, specFile, "contexts: { schema: migrations }", "contexts: { schema: migrations, ext: third_party/lib }")
+		if errs := strings.Join(errorsOf(run(t, root)), "\n"); !strings.Contains(errs, "images.api.contexts.ext: third_party/lib goes through a symbolic link") {
+			t.Errorf("a context under a linked parent is not refused:\n%s", errs)
+		}
+	})
+	t.Run("a flagged, normalised FROM of a context", func(t *testing.T) {
+		root := testutil.CopyExample(t, "full")
+		testutil.Edit(t, root, specFile, "contexts: { schema: migrations }", "contexts: { schema: migrations, base: server }")
+		testutil.Edit(t, root, "docker/api.Dockerfile", "FROM python:3.13-alpine@sha256:7984cf56ceaddebe4fefeb75d64000b9f45d8b77b11a09b24524da6cdc3af0c8 AS build", "FROM --platform=linux/amd64 docker.io/base:latest AS build")
+		if errs := errorsOf(run(t, root)); len(errs) > 0 {
+			t.Errorf("FROM docker.io/base:latest of the context base is refused:\n%s", strings.Join(errs, "\n"))
+		}
+	})
+	t.Run("a replaced stage's base is never pulled", func(t *testing.T) {
+		root := testutil.CopyExample(t, "full")
+		testutil.Edit(t, root, specFile, "contexts: { schema: migrations }", "contexts: { schema: migrations, build: server }")
+		testutil.Edit(t, root, "docker/api.Dockerfile", "FROM python:3.13-alpine@sha256:7984cf56ceaddebe4fefeb75d64000b9f45d8b77b11a09b24524da6cdc3af0c8 AS build", "FROM python:3.13-alpine AS build")
+		if errs := strings.Join(errorsOf(run(t, root)), "\n"); strings.Contains(errs, "FROM python:3.13-alpine must be pinned") {
+			t.Errorf("the base of a stage a named context replaces is held to pinning:\n%s", errs)
+		}
+	})
+	t.Run("a linked main context", func(t *testing.T) {
+		root := testutil.CopyExample(t, "full")
+		if err := os.Symlink("ui", filepath.Join(root, "ui-link")); err != nil {
+			t.Fatal(err)
+		}
+		testutil.Edit(t, root, specFile, "ui:        { context: ui, dockerfile: ui/Dockerfile }", "ui:        { context: ui-link, dockerfile: ui/Dockerfile }")
+		if errs := strings.Join(errorsOf(run(t, root)), "\n"); !strings.Contains(errs, "images.ui.context: ui-link goes through a symbolic link") {
+			t.Errorf("a linked main context is not refused:\n%s", errs)
+		}
+	})
+	t.Run("from a context", func(t *testing.T) {
+		root := testutil.CopyExample(t, "full")
+		testutil.Edit(t, root, "docker/api.Dockerfile", "FROM python:3.13-alpine@sha256:7984cf56ceaddebe4fefeb75d64000b9f45d8b77b11a09b24524da6cdc3af0c8 AS build", "FROM schema AS build")
+		res := run(t, root)
+		if errs := errorsOf(res); len(errs) > 0 {
+			t.Errorf("FROM a named context is refused as an unpinned base:\n%s", strings.Join(errs, "\n"))
+		}
+		// The control: the same FROM of a name that is no context is still an unpinned base.
+		testutil.Edit(t, root, "docker/api.Dockerfile", "FROM schema AS build", "FROM schemas AS build")
+		if errs := strings.Join(errorsOf(run(t, root)), "\n"); !strings.Contains(errs, "FROM schemas must be pinned by digest") {
+			t.Errorf("an unknown FROM is not refused:\n%s", errs)
+		}
+	})
+	t.Run("shadows a stage", func(t *testing.T) {
+		root := testutil.CopyExample(t, "full")
+		testutil.Edit(t, root, specFile, "contexts: { schema: migrations }", "contexts: { schema: migrations, build: server }")
+		if res := run(t, root); !warned(res, "the named context build replaces the stage of that name") {
+			t.Error("a context shadowing a stage is not warned")
+		}
+		if res := run(t, testutil.CopyExample(t, "full")); warned(res, "replaces the stage") {
+			t.Error("the example's own context is warned as shadowing a stage (control)")
+		}
+	})
+}
+
+// A named build context is held to its OWN .dockerignore, the one BuildKit applies to it: the
+// main context's ignore file does not reach it, and its own excluding .git makes it clean.
+func TestGitInNamedBuildContext(t *testing.T) {
+	root := testutil.CopyExample(t, "full")
+	testutil.Edit(t, root, specFile, "contexts: { schema: migrations }", "contexts: { schema: migrations, vendored: vendored }")
+	testutil.Write(t, root, "vendored/.git", "gitdir: ../.git/modules/vendored\n")
+	testutil.Write(t, root, "vendored/src/a", "a\n")
+	// The main context's ignore file excludes it, and still it is reported: not its rules.
+	testutil.Write(t, root, ".dockerignore", "vendored/.git\n")
+	if errs := strings.Join(errorsOf(run(t, root)), "\n"); !strings.Contains(errs, "images.api.contexts.vendored: vendored/.git: ") {
+		t.Errorf("no .git error for the named context:\n%s", errs)
+	}
+	testutil.Write(t, root, "vendored/.dockerignore", ".git\n")
+	if errs := errorsOf(run(t, root)); len(errs) > 0 {
+		t.Fatalf("a named context excluding its .git is still refused:\n%s", strings.Join(errs, "\n"))
 	}
 }
 

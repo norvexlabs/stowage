@@ -36,7 +36,8 @@ images:
     args: { FEATURES: "core,ingest" }
     add_hosts: { packages.atlas.test: [192.0.2.10, 192.0.2.11] }  # a name the build's steps resolve, to each address
     network: default
-    inputs: [server/, migrations/]
+    contexts: { schema: migrations }                           # a named build context: COPY --from=schema reads it, sent less its own .dockerignore
+    inputs: [server/]
   ingest:    { context: ., dockerfile: docker/ingest.Dockerfile, inputs: [server/] }
   ui:        { context: ui, dockerfile: ui/Dockerfile }
   provision: { context: provision, dockerfile: provision/Dockerfile }

@@ -59,8 +59,8 @@ func (b *DockerBuilder) Build(ctx context.Context, p *project.Project, r BuildRe
 			return nil, nil, fmt.Errorf("image %s is not built by stowage", r.Image)
 		}
 		var err error
-		if ctxDir, err = spec.ProjectPath(p.Root, img.Context); err != nil {
-			return nil, nil, err
+		if _, ctxDir, err = spec.ContextDir(p.Root, img.Context); err != nil {
+			return nil, nil, fmt.Errorf("image %s context: %w", r.Image, err)
 		}
 		if df, err = spec.ProjectPath(p.Root, img.Dockerfile); err != nil {
 			return nil, nil, err
@@ -122,6 +122,13 @@ func (b *DockerBuilder) Build(ctx context.Context, p *project.Project, r BuildRe
 		for _, a := range img.AddHosts[h] {
 			args = append(args, "--add-host", h+"="+a)
 		}
+	}
+	for _, name := range slices.Sorted(maps.Keys(img.Contexts)) {
+		_, named, err := spec.ContextDir(p.Root, img.Contexts[name])
+		if err != nil {
+			return nil, cleanup, fmt.Errorf("image %s context %s: %w", r.Image, name, err)
+		}
+		args = append(args, "--build-context", name+"="+named)
 	}
 	if img.Network == "host" {
 		args = append(args, "--allow", "network.host") // BuildKit's entitlement for it

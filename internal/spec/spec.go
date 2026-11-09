@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/netip"
 	"os"
+	"path"
 	"path/filepath"
 	"reflect"
 	"regexp"
@@ -183,9 +184,14 @@ type Image struct {
 	// address of its list in order (BuildKit's /etc/hosts is read-only to a step).
 	AddHosts map[string][]string `yaml:"add_hosts"`
 	// Network is the build steps' network: default (BuildKit's own), host or none.
-	Network string   `yaml:"network"`
-	Inputs  []string `yaml:"inputs"`
-	Ref     string   `yaml:"ref"`
+	Network string `yaml:"network"`
+	// Contexts are named build contexts, by name, each a directory relative to the project root
+	// (`--build-context <name>=<dir>`): a source a stage reads (`COPY --from=<name>`, or a stage of
+	// that name it replaces) that the main context does not hold. Each is sent less its own
+	// `.dockerignore`, and enters the inputs digest so.
+	Contexts map[string]string `yaml:"contexts"`
+	Inputs   []string          `yaml:"inputs"`
+	Ref      string            `yaml:"ref"`
 }
 
 // BuildNetworks are the networks an image's build steps may run on (images.<key>.network).
@@ -1048,6 +1054,54 @@ func ProjectPath(root, rel string) (string, error) {
 // read or hash what it names use ProjectPath, or a path InsideRoot already accepted.
 func Path(root, rel string) string {
 	return filepath.Join(root, filepath.FromSlash(rel))
+}
+
+// ContextDir resolves a named build context's path (images.<key>.contexts): the path cleaned —
+// `dir`, `dir/` and `./dir` are one directory — and the absolute directory it names. Refused: a
+// path leaving the project, one with a symbolic link at any of its components (the inputs digest
+// walks the path and follows no link, while BuildKit sends whatever a link points to, so a link
+// would be an input the digest never reads, or one outside the project), and one that is not a
+// directory. The one check lint, the inputs digest and the build all make.
+func ContextDir(root, rel string) (clean, dir string, err error) {
+	if err := InsideRoot(rel); err != nil {
+		return "", "", fmt.Errorf("%q %w", rel, err)
+	}
+	clean = path.Clean(filepath.ToSlash(rel))
+	dir = Path(root, clean)
+	// Each failure is said of the spec's path, never of the host's absolute one.
+	// A *PathError is unwrapped to its cause, which leaves its absolute path out; an error that
+	// wraps nothing (ENOTDIR at a middle component, a link loop) names no path, and is kept.
+	cause := func(err error) error {
+		if u := errors.Unwrap(err); u != nil {
+			return u
+		}
+		return err
+	}
+	unreadable := func(err error) error {
+		if errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("%s does not exist", clean)
+		}
+		return fmt.Errorf("%s cannot be read: %v", clean, cause(err))
+	}
+	realRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return "", "", fmt.Errorf("the project root cannot be read: %v", cause(err))
+	}
+	resolved, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		return "", "", unreadable(err)
+	}
+	if resolved != filepath.Join(realRoot, filepath.FromSlash(clean)) {
+		return "", "", fmt.Errorf("%s goes through a symbolic link: name the directory it points to, inside the project", clean)
+	}
+	fi, err := os.Stat(dir)
+	if err != nil {
+		return "", "", unreadable(err)
+	}
+	if !fi.IsDir() {
+		return "", "", fmt.Errorf("%s is not a directory", clean)
+	}
+	return clean, dir, nil
 }
 
 // ImageNames returns the image keys in a stable order.
