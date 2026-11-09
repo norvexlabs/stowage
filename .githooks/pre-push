@@ -1,0 +1,51 @@
+#!/bin/sh
+# Refuses a push unless it goes to a local path, or over https authenticated as a GitHub App (an
+# installation token, ghs_). This repository pushes nowhere else: GitHub shows the account behind
+# every push publicly, and a personal login (an OAuth or personal token, an SSH key) must never be
+# it. The hook asks git for the credential the push itself will use (the same config, `-c` and
+# GIT_CONFIG_* included) and checks only the token's kind; it never prints the token or the URL.
+# Whatever can authenticate past the credential helper is refused: an Authorization extraheader,
+# a cookie file, any netrc, a remote helper (remote.*.vcs). A helper that mints tokens mints one
+# more for this check, and one answering differently to the push (interactive, authtype) is not
+# seen; both accepted.
+# The primary guard is server-side: the repository's rulesets refuse any other account's ref change.
+set -eu
+url=$2
+refuse() {
+  echo "pre-push: refused: $1. Pushes go over https through the org app's credential helper in .git/config (CLAUDE.md, Commit identity)" >&2
+  exit 1
+}
+case $url in
+  [Ff][Ii][Ll][Ee]://*) exit 0 ;;
+  [Hh][Tt][Tt][Pp][Ss]://*) ;;
+  *://*) refuse "the remote is not https (SSH pushes as a personal key)" ;;
+  *)
+    case ${url%%/*} in
+      *:*) refuse "the remote is SSH (scp-like), which pushes as a personal key" ;;
+      *) exit 0 ;; # a path
+    esac ;;
+esac
+if git config --get-regexp '^remote\..*\.vcs$' >/dev/null 2>&1; then
+  refuse "a remote.*.vcs sends the push through its own remote helper, past the credential helper"
+fi
+if git config --get-regexp '^http\..*extraheader$' 2>/dev/null | grep -qi 'authorization'; then
+  refuse "an http.*.extraheader sends its own Authorization, past the credential helper"
+fi
+if git config --get-regexp '^http\..*cookiefile$' >/dev/null 2>&1; then
+  refuse "an http.*.cookieFile can authenticate past the credential helper"
+fi
+[ -n "${HOME:-}" ] || refuse "HOME is unset, so the netrc files cannot be checked"
+for f in "${NETRC:-}" "$HOME/.netrc" "$HOME/_netrc"; do
+  if [ -n "$f" ] && [ -e "$f" ]; then
+    refuse "a netrc file ($f) can authenticate past the credential helper"
+  fi
+done
+t=
+command -v timeout >/dev/null 2>&1 && t="timeout 60"
+pass=$(printf 'url=%s\n\n' "$url" | GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/bin/false SSH_ASKPASS=/bin/false \
+  $t git -c credential.interactive=false credential fill 2>/dev/null | sed -n 's/^password=//p') || pass=
+case $pass in
+  ghs_*) exit 0 ;;
+  '') refuse "git has no credential for this remote" ;;
+  *) refuse "git would push with a personal credential, not a GitHub App installation token" ;;
+esac

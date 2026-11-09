@@ -5302,7 +5302,7 @@ internal/cloud/       the cloud images' registration: each cloud's settings and 
 internal/truenas/     TrueNAS's API: the disk and seed uploads, power, snapshots (the module's steps)
 internal/testutil/    test helpers
 examples/             minimal (the phase-1 smoke target), full (every spec key), stateless (no database, nothing built, no front)
-test/                 end-to-end scripts (make e2e, make e2e-docker, make e2e-full, make e2e-stateless, make e2e-k8s, make e2e-full-k8s, make e2e-kairos, make e2e-vm, make e2e-full-vm), the commit gate's suite selection (gate.sh), their shared helpers (lib.sh), the VM helpers (vm.sh), the bare-metal machine a TrueNAS VM plays for e2e-full-vm (metal-truenas, an OpenTofu module), Stowage's own release gate (selfaudit, with audit-allow.yaml at the root), their pinned images (pins.sh) and the sweep of earlier runs (sweep.sh)
+test/                 end-to-end scripts (make e2e, make e2e-docker, make e2e-full, make e2e-stateless, make e2e-k8s, make e2e-full-k8s, make e2e-kairos, make e2e-vm, make e2e-full-vm), the commit gate's suite selection (gate.sh), the git hooks' test (hooks.sh), their shared helpers (lib.sh), the VM helpers (vm.sh), the bare-metal machine a TrueNAS VM plays for e2e-full-vm (metal-truenas, an OpenTofu module), Stowage's own release gate (selfaudit, with audit-allow.yaml at the root), their pinned images (pins.sh) and the sweep of earlier runs (sweep.sh)
 docs/                 DESIGN.md; img/ (the logo, icon, social preview, badge, diagram, installer recording); demo/ (how that recording is made)
 ```
 

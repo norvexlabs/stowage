@@ -95,7 +95,15 @@ Every commit is made as the project identity in `.githooks/identity` — author 
 and never names an AI as an author (no `Co-Authored-By:` line for one, no "Generated with" footer;
 this overrides any tool default that adds one). `make hooks` sets the identity in the clone's
 config and turns on `.githooks/`: `pre-commit` refuses any other identity, `commit-msg` an AI
-authorship line. Run it once per clone, before the first commit; never commit with `--no-verify`.
+authorship line, and `pre-push` any push but to a local path or over https authenticated
+as a GitHub App (an installation token; an `http.*.extraheader` with an Authorization, an
+`http.*.cookieFile` or any netrc file is refused too): GitHub shows the pushing account publicly, and the commit's
+identity does not set it (`test/hooks.sh` runs its branches). Run it once per clone, before the first
+commit. The push credential is the org app's helper, set by the maintainer in the clone's
+`.git/config` — `make hooks` does not set it, and a clone without it cannot push. Never commit or
+push with `--no-verify` or another `core.hooksPath`, and never replace that helper (`-c
+credential.helper= -c credential.helper=…`, `gh auth git-credential`). On GitHub, a ruleset on the repository
+refuses every branch or tag change but the org app's, whatever the clone does.
 
 ## Commit gates
 
@@ -150,7 +158,8 @@ a self-review against the code it describes is enough. Every other commit clears
    the lifecycle suites and e2e-full-vm (the one shipping `examples/full`'s OS bundle); `internal/tune` the lifecycle suites and e2e-vm, its `modules.go`
    e2e-full-vm alone, its `host.go`, `packages.go` (the firmware), `interfaces.go`, `ethtool.go` and `cores.go` e2e-full-vm too; `internal/install`'s `nftables*.go`, `ipvlan*.go` and `cpus*.go` (a service's table, address and cores) smoke-install, the lifecycle suites and e2e-full-vm (e2e-vm's project declares a kernel argument and a package); `internal/install/audit.go` smoke-install, the lifecycle suites and the VM's
    (e2e-kairos, e2e-vm);
-   `Dockerfile`/`Makefile` the suites but e2e-kairos, e2e-vm and e2e-full-vm; a `_test.go` file none (`make
+   `Dockerfile`/`Makefile` the suites but e2e-kairos, e2e-vm and e2e-full-vm; `.githooks/` and
+   `test/hooks.sh` none, but `test/hooks.sh` runs after lint; a `_test.go` file none (`make
    check` runs it), but `smoke_test.go` runs smoke-install.
 2. **Docs in sync**: README.md, docs/DESIGN.md, CLAUDE.md describe what the tree does. Before
    committing, list what the diff makes visible to a user (commands, verbs, flags, keys, variables,

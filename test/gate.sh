@@ -53,7 +53,7 @@ kairos_lines() {
 	[[ "$(git show "$base:$1" 2>/dev/null | kairos_block)" != "$(kairos_block <"$1")" ]]
 }
 
-code=false
+code=false hooks=false
 for f in "${changed[@]}"; do
 	case $f in
 	*.md | LICENSE) continue ;;
@@ -197,6 +197,7 @@ for f in "${changed[@]}"; do
 	test/e2e-kairos.sh | test/libvirtd/*) need e2e-kairos "$f" ;;
 	test/e2e-vm.sh) need e2e-vm "$f" ;;
 	test/e2e-full-vm.sh | test/vm.sh | test/metal-truenas/*) need e2e-full-vm "$f" ;;
+	.githooks/* | test/hooks.sh) hooks=true ;; # the git hooks' branches, test/hooks.sh
 	test/lib.sh | test/pins.sh | test/sweep.sh) # shared by every suite; the short ones exercise it
 		need e2e "$f"
 		lifecycle "$f"
@@ -210,7 +211,7 @@ if ! $code; then
 fi
 order=(smoke-install e2e e2e-docker e2e-full e2e-stateless e2e-k8s e2e-full-k8s e2e-kairos e2e-vm e2e-full-vm)
 parallel=() chain=()
-echo "gate: against $base, ${#changed[@]} paths changed; make check, make build, lint, then:"
+echo "gate: against $base, ${#changed[@]} paths changed; make check, make build, lint$($hooks && echo ", test/hooks.sh"), then:"
 for s in "${order[@]}"; do
 	if [[ -n ${why[$s]:-} ]]; then
 		echo "  $s  (${why[$s]})"
@@ -239,6 +240,7 @@ make build
 ./bin/stowage -C examples/minimal lint
 ./bin/stowage -C examples/full lint
 ./bin/stowage -C examples/stateless lint
+if $hooks; then test/hooks.sh; fi
 # The kairos chain runs one suite at a time, beside the parallel suites. Both run the binaries the
 # build above made (-o build): a suite's own build would rewrite ./bin while another one runs a
 # binary from it, which exec then refuses (text file busy).
