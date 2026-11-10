@@ -2109,7 +2109,7 @@ no `action` blocks, so every operation is a resource's create, update or delete)
 
 | | Docker | Kubernetes | Kairos VM |
 |---|---|---|---|
-| Reached by | the system `ssh`, the target's `known_hosts` line given (strict) | kubeconfig and context, helm ≥ 3.14 and kubectl locally, a linux/amd64 runner (the installer's platform) | the system `ssh`, the line from `stowage_vm_seed` |
+| Reached by | the system `ssh`, the target's `known_hosts` line given (strict) | a `kubernetes {}` block named as the helm provider's (`host`, `token`, `cluster_ca_certificate`, `client_certificate`/`client_key`, `exec {}`, or `config_path` + `config_context`), written to a 0600 kubeconfig for the run and removed after; helm ≥ 3.14 and kubectl locally, on a platform an installer is built for | the system `ssh`, the line from `stowage_vm_seed` |
 | Desired release | `installer`: the installer image by digest — an installer carries one release, so the digest is the release | the same | `version` and `channel` (the disk carried the first) |
 | Change of release | the new installer's `upgrade` | its `k8s upgrade` | `sudo <short>-stow upgrade --version V --yes`, then the reboot followed: a new `boot_id`, the trial over, `installed` the target; a fallback or a failed boot is an error saving the release that runs |
 | Change of a recorded input | the running installer's re-run with `--set` | `k8s upgrade --given -` | `sudo <short>-stow install --set` |
@@ -2138,6 +2138,12 @@ no `action` blocks, so every operation is a resource's create, update or delete)
   does, § 5.1); the installer verifies every later release with the keys the install trusts.
 - **Plan-time checks** (an upgrade's dry run over SSH) are opt-in, and skipped while the target does
   not exist yet (a VM created in the same root).
+- **Kubernetes is reached as the helm and kubernetes providers reach it**: the same `kubernetes {}`
+  block, so a root that creates a cluster (EKS, GKE, AKS) passes its outputs straight in and
+  installs on it in the same apply; a kubeconfig file alone could not, as the file does not exist
+  at plan time. The provider runs Stowage's `k8s` verbs, never `helm_release`: a chart installed by
+  helm alone skips the signature check, the schema barrier, the rollback check, the hook and the
+  recorded inputs, which the provider would then have to copy.
 
 **`stowage_vm_seed`** — `vm seed --json`, generated once (a managed resource: the one-time host key
 would change at every plan from a data source, and a function must be pure). The customer's own

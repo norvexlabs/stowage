@@ -562,6 +562,11 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
   project's own keys; meanwhile README asks for an account that cannot write the project's
   repositories.
 
+- **Installers for more platforms**: `<short>-stow` is linux/amd64, so a Kubernetes install (and
+  the OpenTofu provider's Kubernetes target) runs from a Linux amd64 machine only: no macOS
+  runner, a common place to run OpenTofu. Build darwin/arm64, darwin/amd64 and linux/arm64
+  installers, the payload appended to each; needed before the provider's Kubernetes target ships.
+
 ## Could
 
 - **A failed first install removes its lock under waiters**: a first install that fails after
@@ -583,10 +588,6 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
 - **`k8s rollback` reads helm twice**: a rollback with no `--revision` runs `helm history` and
   `helm get values` of the target twice (the previous revision's search, then the schema check).
   Hand the history the search read to the check.
-
-- **Installers for more platforms**: `<short>-stow` is linux/amd64, so a Kubernetes install (and
-  the OpenTofu provider's Kubernetes target) runs from a Linux amd64 machine only. Build
-  darwin/arm64, darwin/amd64 and linux/arm64 installers, the payload appended to each.
 
 - **Two ships on one cloud cache**: two `ship`/`promote` runs on the same `$XDG_CACHE_HOME`
   share an image's working directory with no lock of Stowage's own: the second can take the
