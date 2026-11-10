@@ -826,13 +826,14 @@ Stowage calls a project's programs: the two never share a reader.
 
 - **`describe --json`** — what the release this installer carries offers, read before anything is
   installed: `format` (this interface's version, an integer moved only on a breaking change; a
-  reader refuses one it does not know, naming the Stowage release it needs), `name`, the release
+  reader refuses one it does not know, naming the Stowage release it needs), `name`, `short_name` (the `<short>` of `<short>-stow`, the
+  name of the installer an install keeps), the release
   `{version, revision}`, the channel, the shapes, the inputs from the payload's spec (key, type,
   secret, required, optional, shapes, when, advanced, profile, prompt, a default — never a
   secret's) and the settings a re-run cannot change (`address`, `registry`, `registry_ca`,
   `channel`). It comes from the spec the payload carries, so there is no second schema.
 - **`status --json` on every shape** — the VM's fields (§ 8, the host daemon's status) are the core,
-  and Docker's and Kubernetes' carry the same names: `name`, `installed` as `{version, revision}`,
+  and Docker's and Kubernetes' carry the same names: `format`, `name`, `installed` as `{version, revision}`,
   `channel`, `installing`, `install_failed`; and on every shape `previous` (the release `rollback`
   returns to, null before an upgrade) and `inputs`, the recorded keys only — never a value, so the
   output can be logged. On Docker and Kubernetes `installed` and `previous` also carry `installer`:
@@ -2079,8 +2080,8 @@ no `action` blocks, so every operation is a resource's create, update or delete)
   setting one again). A failure between leaves the reconfigured release in state, and the next plan
   shows the upgrade alone. Inputs a new release adds go with its upgrade.
 - **Rollback** only when the desired release is `status.previous` and `allow_rollback` is set: a
-  rollback restores the previous values and, on the VM, reboots, so a variable edit never triggers
-  one. Any other older release goes to the installer, whose refusal (exit 3) is the diagnostic.
+  rollback is destructive (it takes the release's own values back, keeps every other, and on the VM
+  reboots), so a variable edit never triggers one. Any other older release goes to the installer, whose refusal (exit 3) is the diagnostic.
 - **First-install-only settings** (`channel`, `address`, `registry`) changed: a plan-time error
   naming the fix, never a replacement — replacing an install deletes its data.
 - **`deletion_protection`** (default true) refuses a destroy; `delete_data` (default false) chooses

@@ -149,6 +149,7 @@ func newCommand(r *Release, self string, stdout, stderr io.Writer, tools K8sOpti
 	rf.BoolVar(&noInput, "no-input", false, "never ask: an input nothing gave takes its default")
 	rf.BoolVar(&o.NoProvision, "no-provision", false, "start the stack without running the provision hook (`provision` runs it later)")
 	rf.BoolVar(&accessible, "accessible", false, "ask with plain line prompts (screen readers); also when ACCESSIBLE is set or TERM=dumb")
+	var statusJSON bool
 	status := &cobra.Command{
 		Use:   "status",
 		Short: "What the install runs, its URLs and its services",
@@ -157,10 +158,14 @@ func newCommand(r *Release, self string, stdout, stderr io.Writer, tools K8sOpti
 			if err := prepare(); err != nil {
 				return err
 			}
+			if statusJSON {
+				return in.StatusJSON(cmd.Context())
+			}
 			return in.Status(cmd.Context())
 		},
 	}
 	dirFlag(status)
+	status.Flags().BoolVar(&statusJSON, "json", false, "print the install's status as one JSON object, for a program (never an input's value)")
 	root.AddCommand(status)
 	var asJSON bool
 	ps := &cobra.Command{
@@ -402,7 +407,7 @@ func newCommand(r *Release, self string, stdout, stderr io.Writer, tools K8sOpti
 	if r.Spec.Shapes.Kairos != nil {
 		root.AddCommand(vmCreateCommand(in, &o, prepare, terminal, &sets, &setFiles, &domains, &answers, &noInput, &accessible, &takesTLS))
 	}
-	root.AddCommand(mirrorCommand(in, &o, prepare))
+	root.AddCommand(mirrorCommand(in, &o, prepare), describeCommand(r, stdout))
 	root.AddCommand(auditCommand(in, &o, prepare, dirFlag, stdout), sbomCommand(in, &o, prepare, dirFlag, stdout))
 	root.AddCommand(tuneCommand(in, prepare, terminal, false))
 	root.AddCommand(dockerHostCommands(in, prepare, dirFlag, stdout, stderr, terminal)...)
@@ -525,14 +530,19 @@ func k8sCommand(in *Installer, o *Options, prepare func() error, terminal func(b
 	back.Flags().IntVar(&o.K8s.Revision, "revision", 0, "the helm revision to go back to (helm history lists them)")
 	back.Flags().DurationVar(&backTimeout, "timeout", 6*time.Minute, "how long helm waits for the rolled-back release to be ready")
 	back.Flags().BoolVar(&o.DryRun, "dry-run", false, "check, change nothing")
+	var statusJSON bool
 	status := &cobra.Command{
 		Use:   "status",
 		Short: "What the helm release runs, then helm's status",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			if statusJSON {
+				return run(cmd, 0, false, in.K8sStatusJSON)
+			}
 			return run(cmd, 0, false, in.K8sStatus)
 		},
 	}
+	status.Flags().BoolVar(&statusJSON, "json", false, "print the release's status as one JSON object, for a program (never an input's value)")
 	var resetTimeout time.Duration
 	reset := &cobra.Command{
 		Use:   "reset-db",

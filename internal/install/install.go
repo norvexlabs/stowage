@@ -171,6 +171,9 @@ type Options struct {
 	// PublicAddr is this machine's public address, as a server on the internet sees it; nil asks
 	// publicAddrURL.
 	PublicAddr func(ctx context.Context) (netip.Addr, error)
+	// InstallerImage reads the installer image of this installer's release, by the digest the
+	// release manifest in the registry at prefix records; nil reads it there (releaseInstallerImage).
+	InstallerImage func(ctx context.Context, prefix string) (string, error)
 }
 
 func (o *Options) logf(format string, a ...any) { fmt.Fprintf(o.Log, format+"\n", a...) }
@@ -426,6 +429,7 @@ func (in *Installer) Install(ctx context.Context) error {
 	if err := in.fetchImages(ctx, env); err != nil {
 		return unwritten(err)
 	}
+	in.recordInstaller(ctx, env)
 	if err := in.writeCert(); err != nil { // it removes a tls/ it created; one it did not is not this run's
 		return unwritten(err)
 	}
@@ -816,8 +820,8 @@ func (in *Installer) decide(ctx context.Context, dir, mode string, pub publish, 
 // up again with them.
 func (in *Installer) rerun(ctx context.Context) (err error) {
 	o := &in.O
-	if o.Address != "" || o.Registry != "" || o.RegistryCA != "" || o.Channel != "" {
-		return errors.New("--address, --registry, --registry-ca and --channel are recorded at the first install: this directory already holds one (a re-run changes the inputs with --set, --answers and --domains, the front's ports, and its TLS mode and certificate)")
+	if given := slices.DeleteFunc(slices.Clone(firstInstallOnly), func(s firstInstallSetting) bool { return !s.given(o) }); len(given) > 0 {
+		return firstInstallOnlyRefusal(given)
 	}
 	clientCA, err := in.readClientCA()
 	if err != nil {

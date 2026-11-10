@@ -475,8 +475,8 @@ a real registry, the local Docker engine, a kind cluster and a VM on TrueNAS
 | `ship`, `verify`, `promote`, `yank`, `prune`, `releases` (images, the front, the Helm chart, the Kairos OS bundle and its disk images + `latest-<format>`, each cloud's importable image (`cloud_publish`) registered in the publisher's AWS, Azure, Google Cloud or Scaleway account, installer image + `:latest`, release manifest) | registering on AWS, Azure and Scaleway (written, run on Google Cloud only) |
 | every version / changelog provider, registry client, release manifest, cosign signing | |
 | inputs digests and the build graph | |
-| installer (Docker): loopback and every TLS front (`acme`, `dns-cloudflare`, `byo`, `internal`), terminal form, `install`, re-run (changes the inputs and the front's ports), `status`, `ps`, `logs`, `restart`/`stop`/`start`, `exec`, `schema`, `uninstall` (`--data`), `provision`, `script`, `upgrade` (`--version` fetches the release's installer), `rollback`, `reset-db`, `--dry-run`, `--offline`, a mirror and its CA (`--registry`, `--registry-ca`); `mirror export` / `mirror import` (a release carried as one file to a site without internet); `secrets rotate`, `secrets export` and `--secrets` (a machine made again) | scheduled backup, restore, chart library, `upgrade --reset-db` |
-| installer (Kubernetes): `<short>-stow k8s install`, `upgrade` (`--version`), `rollback`, `status`, `reset-db`, `uninstall` (`--data`), `provision` (the hook as a Job after the release, its outputs in a Secret and handed back, `--set`), `secrets rotate`, `tune`, `--dry-run`, `--no-provision`, `--image-registry`, `--registry-ca`, `--unsafe-sysctls` | barrier pre-flight before `rollback` |
+| installer (Docker): loopback and every TLS front (`acme`, `dns-cloudflare`, `byo`, `internal`), terminal form, `install`, re-run (changes the inputs and the front's ports), `status` (`--json`), `ps`, `logs`, `restart`/`stop`/`start`, `exec`, `schema`, `uninstall` (`--data`), `provision`, `script`, `upgrade` (`--version` fetches the release's installer), `rollback`, `reset-db`, `--dry-run`, `--offline`, a mirror and its CA (`--registry`, `--registry-ca`); `mirror export` / `mirror import` (a release carried as one file to a site without internet); `secrets rotate`, `secrets export` and `--secrets` (a machine made again) | scheduled backup, restore, chart library, `upgrade --reset-db` |
+| installer (Kubernetes): `<short>-stow k8s install`, `upgrade` (`--version`), `rollback`, `status` (`--json`), `reset-db`, `uninstall` (`--data`), `provision` (the hook as a Job after the release, its outputs in a Secret and handed back, `--set`), `secrets rotate`, `tune`, `--dry-run`, `--no-provision`, `--image-registry`, `--registry-ca`, `--unsafe-sysctls` | barrier pre-flight before `rollback` |
 | installer (Kairos VM): `<short>-stow vm create` (the disk image by digest, the cloud-config on a seed ISO or as user-data, the platform's steps; or the VM created with OpenTofu — TrueNAS's module, the previews for libvirt, Proxmox VE, vSphere, AWS, Google Cloud, Azure and Scaleway, or the operator's own holding the module contract — waited for until it installed; from a mirror whose CA the VM then trusts), `vm destroy` and `vm attach` (a NIC for a role a newer release names, on TrueNAS); `<short>-stow` in the OS bundle — the first install from the cloud-config's settings, `install` from the preloaded images, the boot (install up again, upgrade to the OS's release, back to the replaced one), the host daemon and its verbs (`status`, `health`, `events`, `ps`, `logs`, `restart`/`stop`/`start`, `provision`, `updates`, `upgrade`, `rollback` to the passive system, `reset-db`, `network` with its auto-revert, `backup` — scheduled, before an upgrade, or now, encrypted to age keys and uploaded with rclone; `verify` of proposed settings —, `restore`, `secrets export` and `rotate`, `reboot`, `shutdown`), its disk-pressure watch (`hooks.maintenance.disk_pressure`), its app socket for the services `host_api` names, the health gate judging each boot (Kairos boot assessment: an upgraded boot not healthy in time falls back to the passive system, unless going back is refused at a rollback barrier: it is then kept), a default-deny firewall (`vm create --ssh-allow`), the time zone (`--timezone`), a disaster recovery (`vm create --secrets`) | |
 
 ## Reference — for people and AI agents
@@ -1735,7 +1735,8 @@ again, to copy an installer to another host.
           [--tune-profile default|network|release]                         # over the release's tune.profile
           [--interface ROLE=NIC]…                                          # this host's NIC of a host.interfaces role
           [--secrets FILE|-]                                               # a machine made again
-<short>-stow status [--dir D]
+<short>-stow status [--json] [--dir D]                                    # --json: one object, for a program
+<short>-stow describe [--json]                                           # what the release offers, read with no install
 <short>-stow ps [--json] [--dir D]                                       # the stack's services, state and health
 <short>-stow logs SERVICE [--tail N] [--follow|-f] [--dir D]             # 1 to 5000 lines, default 200
 <short>-stow restart|stop|start SERVICE [--dir D]
@@ -1899,6 +1900,54 @@ again, to copy an installer to another host.
   143 (SIGTERM)`, `130 (SIGINT)` for a `stop_signal: SIGINT`, `137 (SIGKILL)` after the stop's
   timeout), and not down when it exits 0 on its stop signal: Docker records no stop's author. A crashed replica of a scaled service is down, and so is a
   start-first overlap's failed new container that could not be removed (the start warned of it).
+- `status --json` prints the install's status as one JSON object for a program, the VM's
+  `status --json` names (see "The installer on the Kairos VM") where they mean the same, and
+  never a recorded value, an input's or a secret's, so it can be logged; the text above is
+  unchanged without it, and nothing else goes to standard output (a warning goes to standard
+  error):
+  ```json
+  {
+    "format": 1,
+    "name": "notes",
+    "installed": { "version": "2.0.0", "revision": 1, "installer": "ghcr.io/acme/notes/notes-installer@sha256:…" },
+    "channel": "stable",
+    "previous": { "version": "1.0.0", "revision": 1, "installer": "ghcr.io/acme/notes/notes-installer@sha256:…" },
+    "inputs": ["ADMIN_EMAIL"],
+    "services": [{ "service": "api", "state": "running", "health": "healthy", "image": "…", "exit_code": 0, "id": "…" }]
+  }
+  ```
+  `format` is the machine interface's version, `1`, moved only on a breaking change (a reader
+  refuses one it does not know); `name` is the project; `installed` the release the install runs (`version`, `revision`) and
+  `installer`, its installer image by the digest its release manifest records; `channel` the
+  channel the install follows: the first install's `--channel`, else the channel the installed
+  release's manifest records, as the installer that carries it tells it (the one run, else the one
+  the install keeps; absent when neither carries the installed release);
+  `installing` (`true`, absent otherwise) while the first install has not finished, and
+  `install_failed` the first line of the error its last run failed with; `previous` the release
+  `rollback` goes back to, with its `installer`, `null` when the install keeps none (before an
+  upgrade, after a rollback) or keeps the release installed (an upgrade or a rollback that
+  stopped, which `rollback` finishes on it) — never the release `installed` names; `inputs` the keys of the installed release's inputs the install
+  records, sorted (`[]` when none), from the spec of the installer that carries that release —
+  absent (unknown) when neither does, or when the kept one's spec does not load in this Stowage
+  (logged once: `the installer the install keeps, <path>: …`, as any kept installer that does not
+  read; none kept is said by the field alone); `restore_awaited` (`true`, absent otherwise) while
+  an install given `--secrets` awaits its data, and `volumes_split` while a restore left the
+  volumes half restored — not while a restore runs (it holds the install's host lock), as on the
+  VM; `services` the stack's services as the VM's `ps --json` gives them
+  (`service`, `state`, `health`, `image`, `exit_code`, `id`, `oom_killed`, `mem_limit_bytes`,
+  `restarts`), `null` with `services_error` saying why when Compose cannot list them. The
+  installer image is recorded in `.env` as `STOWAGE_INSTALLER`, with `STOWAGE_INSTALLER_RELEASE`
+  the release it was recorded for (`<version>/<revision>`), by the install and each upgrade,
+  read from the release manifest of its release under its tag in the registry the install pulls
+  from (`<prefix>/<name>-release`, this installer's version and revision, signed by a key the
+  installer carries when it carries any); the upgrade keeps the replaced release's with it for
+  `rollback`, which takes it back. It is absent — never guessed — where it was not read: an
+  `--offline` install, a registry that holds no release manifest (logged: `the release's
+  installer image is not recorded (status --json leaves it out): …`), an install made before it
+  was recorded, or one recorded for another release than the one reported (`installed`: the
+  release `.env` records; `previous`: the one `.stowage-prev/state.json` records), as an
+  installer that does not record it leaves the replaced release's. Refused: a directory with no install, a recorded revision that is no number,
+  and a kept record (`.stowage-prev/state.json`) that does not read, naming the file.
 - `ps` prints `docker compose ps --all` of the stack (the front among its services), `--json`
   Compose's JSON, one service per line. `logs SERVICE` prints a service's last `--tail` lines
   (1 to 5000, default 200, no colour), and with `--follow` the lines it writes next until
@@ -1920,6 +1969,29 @@ again, to copy an installer to another host.
   \`rollback\` goes back to it` and `barriers   after M: <the barriers, or none>`. `--after N`
   reports the barriers after migration N instead. `--json` prints `{"migration", "kept":
   {"project_version", "revision", "schema"}, "after", "barriers"}`, the absent ones left out.
+- `describe` prints what the release this installer carries offers, read from the installer alone,
+  with no install and no `--dir`: the release, its channel, its shapes, each input and the settings
+  only a first install takes. It applies to every shape: the installer that runs `k8s` and `vm create`
+  is the same binary, so it describes the Kubernetes and VM releases too (the `<short>-stow` inside
+  a VM, which the OS bundle carries, has no `describe`). Without `--json` it prints a
+  short summary for people (`<name> <version> (revision N), channel C`, `shapes`, an `input` line
+  per input, `first install only: …`). `--json` prints the machine interface, one object, which
+  programs read instead of the text:
+  - `format`: the interface's version, an integer, 1; it moves only on a breaking change (a field
+    removed, renamed or given another meaning), never when a field is added, so a reader refuses a
+    format it does not know.
+  - `name`, `release` (`{version, revision}`), `channel`: the release's, from its manifest.
+  - `short_name`: the `<short>` of `<short>-stow`, the installer's name, so a program finds the
+    installer an install keeps, `<dir>/<short>-stow`.
+  - `shapes`: the shapes the spec declares, in the order `docker`, `kubernetes`, `kairos`.
+  - `inputs`: the spec's inputs in the spec's order (the form's), each `{key, type, secret,
+    required, optional, shapes, when, advanced, profile, prompt, default}` as `inputs` declares it,
+    every field present: `type` is `text`, `file` or `pem`; `shapes` is `[]` for an input of every
+    shape; `when`, `profile`, `prompt` and `default` are `""` when the spec gives none. A secret
+    input's `default` is never printed: the key is left out.
+  - `first_install_only`: the settings an install records at its first run and a re-run refuses,
+    `["address", "registry", "registry_ca", "channel"]` (`--address`, `--registry`,
+    `--registry-ca`, and the VM's `install --channel`).
 - `uninstall` removes the install's containers and networks (`docker compose down
   --remove-orphans`, the containers a hook or a schema check left among them). The data — the
   stack's volumes and the install directory (its `.env` and secrets, the dumps, the release kept
@@ -3401,7 +3473,7 @@ the current directory. A release with no chart (published without the shape) is 
 <short>-stow k8s upgrade  [the same flags; --timeout 6m]                 # the NEW release's installer
 <short>-stow k8s upgrade --version V [the same flags, but --given, --kit] # fetches V's installer
 <short>-stow k8s rollback [--namespace NS] [--release R] [--kube-context C] [--revision N] [--timeout 6m] [--dry-run]
-<short>-stow k8s status   [--namespace NS] [--release R] [--kube-context C]
+<short>-stow k8s status   [--namespace NS] [--release R] [--kube-context C] [--json]
 <short>-stow k8s reset-db [--namespace NS] [--release R] [--kube-context C] [--yes] [--no-input]
                        [--accessible] [--registry-ca FILE] [--timeout 10m] [--dry-run] [--no-provision]
                        [--new-baseline [--set-file KEY=PATH]…]        # the NEW release's installer, across a baseline
@@ -3480,8 +3552,15 @@ the current directory. A release with no chart (published without the shape) is 
   upgrade --install <release> <chart> --wait --timeout <T>` with `--atomic` (helm 3) or
   `--rollback-on-failure` (helm 4): a release that does not become ready is rolled back (removed
   on a first install; the Secrets are kept, and the next `install` reuses them). helm gets a
-  values file of the installer's, `stowage: {registry, secret, pullSecret, files}`, then each
-  `--values FILE` in order (they win).
+  values file of the installer's, `stowage: {registry, secret, pullSecret, files, release:
+  {installer, installerRelease}}`, then each `--values FILE` in order (they win).
+  `release.installerRelease` is the release it was recorded for (`<version>/<revision>`), and
+  `release.installer`, merged into
+  the chart's `stowage.release`, is the release's installer image by the digest its release
+  manifest records, read as the provision hook's below, on every install and upgrade (empty when
+  it cannot be read, which is logged: `the release's installer image is not recorded (status
+  --json leaves it out): …`, so a reused value never names another release's); `helm rollback`
+  takes it back with the revision's values.
 - Once helm has settled the release (`install`, `upgrade` — the same release applied again
   included — and `reset-db`), the installer runs the provision hook, unless `--no-provision`
   (`k8s provision` runs it later). A failed hook leaves the release as it runs (an upgrade is not
@@ -3602,7 +3681,36 @@ the current directory. A release with no chart (published without the shape) is 
   nothing is checked, and lint warns.
 - `status` prints what the release runs (name, version, revision, channel) and its registry,
   `endpoint  http://<release>-<service>.<namespace>.svc:<port>` when the spec names an `endpoint`
-  (see "Extensions"), then `helm status`.
+  (see "Extensions"), then `helm status`. `status --json` prints one JSON object for a program
+  instead, with the Docker shape's `status --json` names (`format`, `name`, `installed` with `installer`,
+  `channel`, `installing`, `previous`, `inputs`) and `helm` in place of `services`, never a
+  value of the release's Secret:
+  ```json
+  {
+    "format": 1,
+    "name": "notes",
+    "installed": { "version": "2.0.0", "revision": 1, "installer": "<prefix>/notes-installer@sha256:…" },
+    "channel": "stable",
+    "previous": { "version": "1.0.0", "revision": 1, "installer": "<prefix>/notes-installer@sha256:…" },
+    "inputs": ["ADMIN_EMAIL"],
+    "helm": { "revision": 2, "status": "deployed" }
+  }
+  ```
+  `installed` is what the release's values record (`stowage.release`, its `installer` absent
+  when empty or when `installerRelease` names another release than the one they record — a value
+  helm reused from another release's — as for `previous`); `installing` is `true` while helm's status is `pending-install`, and
+  `install_failed` is never set (helm's status tells a failed operation); `previous` is the
+  release the revision `k8s rollback` (no `--revision`) goes back to records in its values,
+  `null` when there is no such revision (before an upgrade) or its values record no release of the
+  project — never the revision `installed` is read from, though it may be the same version and
+  revision of the project run with other values (an upgrade that changed only values). After `helm uninstall --keep-history`
+  nothing runs: `installed` is `null` (and `channel`, `installing` and `inputs` are left out),
+  `previous` is the latest revision's release, which `k8s rollback` brings back, and `helm` says
+  `uninstalled`. A helm read that fails fails the command; `inputs` the keys of the release's inputs the Secret
+  `<release>-stowage` holds, sorted (`[]` when none), told only when something is installed and this
+  installer carries that release (its version and revision) — absent (unknown) otherwise; only
+  then is the Secret read, and one of its name another tool wrote refused, as every verb refuses
+  it; `helm` the release's latest revision (`helm history`) and its status (`helm list`).
 - `secrets rotate KEY` is the Docker shape's three passes on the release's Secret
   `<release>-stowage`, run by the installer of the release it runs (another is refused, as are a
   release with no such Secret and a `pending-…` one): each pass

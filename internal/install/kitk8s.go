@@ -67,7 +67,7 @@ func (in *Installer) k8sKitInstaller(ctx context.Context, h *spec.Handoff, step 
 		return nil, nil, fmt.Errorf("release %s in %s runs %s %s (revision %d), and this installer carries %s (revision %d): issue it with the installer of %s",
 			k.Release, k.Namespace, m.Name, r.Version, r.Revision, m.ProjectVersion, m.Revision, r.Version)
 	}
-	ref, err := in.hookImageOf(ctx, cur.Registry)
+	ref, err := in.hookImageOf(ctx, cur.Registry, kitUse)
 	if err != nil {
 		return nil, nil, err
 	}

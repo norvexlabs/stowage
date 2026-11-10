@@ -130,6 +130,9 @@ func (k kubeTool) Run(_ context.Context, c Cmd) ([]byte, error) {
 			}
 			n, _ := strconv.Atoi(a[i+1])
 			v, ok := f.revValues[n]
+			if !ok && f.values != nil && n == slices.MaxFunc(append([]helmRevision{{}}, f.history...), func(a, b helmRevision) int { return cmp.Compare(a.Revision, b.Revision) }).Revision {
+				return json.Marshal(f.values) // the latest revision's are the values the release runs with
+			}
 			if !ok {
 				return nil, fmt.Errorf("revision %d not found", n)
 			}
@@ -477,7 +480,7 @@ func TestK8sInstallAppliesTheSecretsThenInstallsTheChartByDigest(t *testing.T) {
 	if strings.Contains(a, "--reset-then-reuse-values") || strings.Contains(a, "--kube-context") {
 		t.Errorf("%s", a)
 	}
-	want := fmt.Sprintf("stowage:\n    files: \"\"\n    pullSecret: \"\"\n    registry: %s\n    secret: notes-stowage\n    sysctls: []\n", e.prefix)
+	want := fmt.Sprintf("stowage:\n    files: \"\"\n    pullSecret: \"\"\n    registry: %s\n    release:\n        installer: %s/notes-installer@%s\n        installerRelease: 1.0.0/1\n    secret: notes-stowage\n    sysctls: []\n", e.prefix, e.prefix, ctlDigest)
 	if len(e.f.given) != 1 || e.f.given[0] != want {
 		t.Errorf("values %q, want %q", e.f.given, want)
 	}

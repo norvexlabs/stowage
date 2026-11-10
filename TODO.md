@@ -107,7 +107,7 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
      `uninstall` (Docker, Kubernetes): one refusal error type raised by every refusal there is,
      `upgrade --version` passing its child's status on; text output unchanged. Review `high`
      (every refusal path).
-  4. The VM: `previous` and `inputs` in its `status --json`, the same `--json` and exit 3 on
+  4. The VM: `describe` on the VM's own `<short>-stow`, `format`, `previous` and `inputs` in its `status --json`, the same `--json` and exit 3 on
      `install`/`upgrade`/`rollback`, `vm seed --json`
      (the manual path's seed, no second builder) and `--known-hosts-line` on the `vm` verbs; one
      VM chain (e2e-kairos, e2e-vm, e2e-full-vm) for 3's VM part and 4.
@@ -571,6 +571,17 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
   repositories.
 
 ## Could
+
+- **Text `k8s status` after an uninstall that kept its history**: it prints the uninstalled
+  revision's release first, as if it ran (`k8s status --json` says nothing is installed). Say the
+  release is uninstalled, its history kept, and that `k8s rollback` brings it back.
+
+- **One release-identity check**: whether a release is a version at a revision is tested in four
+  places (the kept previous release, the VM's `prevIs`, `keptInstaller`, `isRelease`). Use one.
+
+- **`k8s rollback` reads helm twice**: a rollback with no `--revision` runs `helm history` and
+  `helm get values` of the target twice (the previous revision's search, then the schema check).
+  Hand the history the search read to the check.
 
 - **Installers for more platforms**: `<short>-stow` is linux/amd64, so a Kubernetes install (and
   the OpenTofu provider's Kubernetes target) runs from a Linux amd64 machine only. Build

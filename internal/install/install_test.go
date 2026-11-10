@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"cmp"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"maps"
 	"net"
@@ -389,7 +391,17 @@ func (e *env) installer(mod func(*Options)) *Installer {
 	if mod != nil {
 		mod(&o)
 	}
-	return &Installer{R: e.r, O: o}
+	in := &Installer{R: e.r, O: o}
+	if in.O.InstallerImage == nil {
+		// The registry holds each release's manifest, naming its installer image (testCtl).
+		in.O.InstallerImage = func(_ context.Context, prefix string) (string, error) { return testCtl(prefix, in.R.Manifest), nil }
+	}
+	return in
+}
+
+// testCtl is the installer image the registry at prefix records for release m in the tests.
+func testCtl(prefix string, m *release.Manifest) string {
+	return fmt.Sprintf("%s/%s-installer@sha256:%x", prefix, m.Name, sha256.Sum256([]byte(m.ProjectVersion+"-"+strconv.Itoa(m.Revision))))
 }
 
 // inProcess runs the installers a run starts as the host would, in this process: each loads its
@@ -1029,6 +1041,7 @@ func TestAReRunFinishesSetupAndNeverRedecides(t *testing.T) {
 	for _, mod := range []func(*Options){
 		func(o *Options) { o.Address = "127.0.0.9" },
 		func(o *Options) { o.Registry = "mirror.example.org/notes" },
+		func(o *Options) { o.RegistryCA = "ca.pem" },
 		func(o *Options) { o.Channel = "beta" },
 	} {
 		if err := e.install(mod); err == nil || !strings.Contains(err.Error(), "recorded at the first install") {

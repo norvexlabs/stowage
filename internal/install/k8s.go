@@ -69,6 +69,11 @@ type deployed struct {
 		Revision int    `json:"revision"`
 		Channel  string `json:"channel"`
 		Tag      string `json:"tag"`
+		// Installer is the release's installer image by digest (k8sInstallerKey); empty when the
+		// deploy did not read it.
+		Installer string `json:"installer"`
+		// InstallerRelease is the release Installer was recorded for (k8sInstallerOfKey).
+		InstallerRelease string `json:"installerRelease"`
 	} `json:"release"`
 	// PublicKeys are the keys the release was installed with: an installer carrying none does
 	// not upgrade it.
@@ -128,40 +133,122 @@ var rolledBackTo = regexp.MustCompile(`^Rollback to ([0-9]+)$`)
 // failed revision nor a copy of what runs (a rollback's, or an upgrade that changed nothing) is
 // chosen.
 func (in *Installer) previousRevision(ctx context.Context) (int, error) {
-	k := in.O.K8s
-	out, err := in.helm(ctx, Cmd{Args: []string{"history", k.Release, "--max", "1000", "--output", "json"}})
+	h, err := in.helmHistory(ctx)
 	if err != nil {
 		return 0, err
 	}
+	return h.previous(ctx)
+}
+
+// releaseHistory is a release's helm history, newest first, and the values of the revisions read
+// from it, each read once.
+type releaseHistory struct {
+	in   *Installer
+	revs []helmRevision
+	vals map[int]*revValues
+}
+
+// noPrevious: the release has no revision a rollback goes back to.
+type noPrevious struct{ msg string }
+
+func (e noPrevious) Error() string { return e.msg }
+
+// helmHistory reads the release's helm history.
+func (in *Installer) helmHistory(ctx context.Context) (*releaseHistory, error) {
+	out, err := in.helm(ctx, Cmd{Args: []string{"history", in.O.K8s.Release, "--max", "1000", "--output", "json"}})
+	if err != nil {
+		return nil, err
+	}
 	var hs []helmRevision
 	if err := json.Unmarshal(out, &hs); err != nil {
-		return 0, fmt.Errorf("helm history: %w", err)
-	}
-	if len(hs) == 0 {
-		return 0, fmt.Errorf("helm history lists no revision of %s in %s", k.Release, k.Namespace)
+		return nil, fmt.Errorf("helm history: %w", err)
 	}
 	slices.SortFunc(hs, func(a, b helmRevision) int { return cmp.Compare(b.Revision, a.Revision) }) // newest first
+	return &releaseHistory{in: in, revs: hs, vals: map[int]*revValues{}}, nil
+}
+
+// values is revision rev's values (revisionValues), read once.
+func (h *releaseHistory) values(ctx context.Context, rev int) ([]byte, error) {
+	v, err := h.read(ctx, rev)
+	if err != nil {
+		return nil, err
+	}
+	return v.full, nil
+}
+
+// ran is revision rev's values as what it ran is compared: without the values a deploy records
+// about itself (selfRecorded), made the first time a comparison asks.
+func (h *releaseHistory) ran(ctx context.Context, rev int) ([]byte, error) {
+	v, err := h.read(ctx, rev)
+	if err != nil {
+		return nil, err
+	}
+	if v.ran == nil {
+		for _, path := range selfRecorded {
+			deletePath(v.tree, append([]string{helm.ValuesKey}, path...))
+		}
+		if v.ran, err = json.Marshal(v.tree); err != nil {
+			return nil, fmt.Errorf("helm get values --revision %d: %w", rev, err)
+		}
+	}
+	return v.ran, nil
+}
+
+func (h *releaseHistory) read(ctx context.Context, rev int) (*revValues, error) {
+	if v, ok := h.vals[rev]; ok {
+		return v, nil
+	}
+	full, tree, err := h.in.revisionRead(ctx, rev)
+	if err != nil {
+		return nil, err
+	}
+	h.vals[rev] = &revValues{full: full, tree: tree}
+	return h.vals[rev], nil
+}
+
+// revValues is a revision's values read once: as canonical JSON, decoded, and as what it ran
+// (ran).
+type revValues struct {
+	full []byte
+	tree any
+	ran  []byte
+}
+
+// latest is the newest revision; 0 when helm lists none.
+func (h *releaseHistory) latest() int {
+	if len(h.revs) == 0 {
+		return 0
+	}
+	return h.revs[0].Revision
+}
+
+// previous is previousRevision on the history h holds; a noPrevious when there is none.
+func (h *releaseHistory) previous(ctx context.Context) (int, error) {
+	k, hs := h.in.O.K8s, h.revs
+	if len(hs) == 0 {
+		return 0, noPrevious{fmt.Sprintf("helm history lists no revision of %s in %s", k.Release, k.Namespace)}
+	}
 	latest := hs[0]
 	if latest.Status == "uninstalled" { // `helm uninstall --keep-history`: what ran until then
 		return latest.Revision, nil
 	}
 	if !deployedOnce(latest) {
-		for _, h := range hs[1:] {
-			if deployedOnce(h) {
-				return h.Revision, nil
+		for _, r := range hs[1:] {
+			if deployedOnce(r) {
+				return r.Revision, nil
 			}
 		}
-		return 0, fmt.Errorf("release %s in %s has no revision that deployed (`helm history %s --namespace %s` lists them)", k.Release, k.Namespace, k.Release, k.Namespace)
+		return 0, noPrevious{fmt.Sprintf("release %s in %s has no revision that deployed (`helm history %s --namespace %s` lists them)", k.Release, k.Namespace, k.Release, k.Namespace)}
 	}
 	byRev := map[int]helmRevision{}
-	for _, h := range hs {
-		byRev[h.Revision] = h
+	for _, r := range hs {
+		byRev[r.Revision] = r
 	}
 	// Each step goes to a lower revision, so the walk ends; a revision helm no longer keeps ends it.
 	from := latest.Revision
 	for {
-		h, ok := byRev[from]
-		m := rolledBackTo.FindStringSubmatch(h.Description)
+		r, ok := byRev[from]
+		m := rolledBackTo.FindStringSubmatch(r.Description)
 		if !ok || m == nil {
 			break
 		}
@@ -172,28 +259,29 @@ func (in *Installer) previousRevision(ctx context.Context) (int, error) {
 		from = n
 	}
 	var running []byte
-	for _, h := range hs {
-		if h.Revision >= from || !deployedOnce(h) {
+	var err error
+	for _, r := range hs {
+		if r.Revision >= from || !deployedOnce(r) {
 			continue
 		}
-		if h.Chart == latest.Chart {
+		if r.Chart == latest.Chart {
 			if running == nil {
-				if running, err = in.revisionValues(ctx, latest.Revision); err != nil {
+				if running, err = h.ran(ctx, latest.Revision); err != nil {
 					return 0, err
 				}
 			}
-			v, err := in.revisionValues(ctx, h.Revision)
+			ran, err := h.ran(ctx, r.Revision)
 			if err != nil {
 				return 0, err
 			}
-			if bytes.Equal(v, running) {
+			if bytes.Equal(ran, running) {
 				continue
 			}
 		}
-		return h.Revision, nil
+		return r.Revision, nil
 	}
-	return 0, fmt.Errorf("release %s in %s has no revision that ran something else before revision %d, the one it runs comes from (`helm history %s --namespace %s` lists them; --revision N picks one)",
-		k.Release, k.Namespace, from, k.Release, k.Namespace)
+	return 0, noPrevious{fmt.Sprintf("release %s in %s has no revision that ran something else before revision %d, the one it runs comes from (`helm history %s --namespace %s` lists them; --revision N picks one)",
+		k.Release, k.Namespace, from, k.Release, k.Namespace)}
 }
 
 // deployedOnce: the revision deployed (superseded: deployed, then replaced; deployed: still runs,
@@ -202,17 +290,38 @@ func deployedOnce(h helmRevision) bool { return h.Status == "superseded" || h.St
 
 // revisionValues is every value a revision ran with, as canonical JSON.
 func (in *Installer) revisionValues(ctx context.Context, rev int) ([]byte, error) {
+	full, _, err := in.revisionRead(ctx, rev)
+	return full, err
+}
+
+// revisionRead is revision rev's values as canonical JSON, and as decoded from it.
+func (in *Installer) revisionRead(ctx context.Context, rev int) ([]byte, any, error) {
 	out, err := in.helm(ctx, Cmd{Args: []string{"get", "values", in.O.K8s.Release, "--revision", strconv.Itoa(rev), "--all", "--output", "json"}})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	d := json.NewDecoder(bytes.NewReader(out))
 	d.UseNumber() // numbers compared as written, not as float64
 	var v any
 	if err := d.Decode(&v); err != nil {
-		return nil, fmt.Errorf("helm get values --revision %d: %w", rev, err)
+		return nil, nil, fmt.Errorf("helm get values --revision %d: %w", rev, err)
 	}
-	return json.Marshal(v) // map keys sorted, no spacing
+	full, err := json.Marshal(v) // map keys sorted, no spacing
+	if err != nil {
+		return nil, nil, fmt.Errorf("helm get values --revision %d: %w", rev, err)
+	}
+	return full, v, nil
+}
+
+// deletePath deletes the value at path in v, nested maps; nothing when one is missing.
+func deletePath(v any, path []string) {
+	for _, k := range path[:len(path)-1] {
+		m, _ := v.(map[string]any)
+		v = m[k]
+	}
+	if m, ok := v.(map[string]any); ok {
+		delete(m, path[len(path)-1])
+	}
 }
 
 // envSecret names the Secret holding the release's secrets and inputs, as KEY: value.
@@ -309,16 +418,22 @@ func (in *Installer) release(ctx context.Context) (*helmRelease, error) {
 // installedRelease reads what the release runs from its values; an error when it was not installed
 // from a chart of this project.
 func (in *Installer) installedRelease(ctx context.Context) (*deployed, error) {
-	k := in.O.K8s
-	out, err := in.helm(ctx, Cmd{Args: []string{"get", "values", k.Release, "--all", "--output", "json"}})
+	out, err := in.helm(ctx, Cmd{Args: []string{"get", "values", in.O.K8s.Release, "--all", "--output", "json"}})
 	if err != nil {
 		return nil, err
 	}
+	return in.deployedIn(out, "helm get values")
+}
+
+// deployedIn is what values, read by the helm call named, record the release runs; an error when
+// it was not installed from a chart of this project.
+func (in *Installer) deployedIn(values []byte, read string) (*deployed, error) {
+	k := in.O.K8s
 	var v struct {
 		Stowage *deployed `json:"stowage"`
 	}
-	if err := json.Unmarshal(out, &v); err != nil {
-		return nil, fmt.Errorf("helm get values: %w", err)
+	if err := json.Unmarshal(values, &v); err != nil {
+		return nil, fmt.Errorf("%s: %w", read, err)
 	}
 	if v.Stowage == nil || v.Stowage.Release.Name == "" {
 		return nil, fmt.Errorf("release %s in %s was not installed from a chart Stowage published", k.Release, k.Namespace)
@@ -440,6 +555,13 @@ func (in *Installer) K8sInstall(ctx context.Context) error {
 func (in *Installer) K8sUpgrade(ctx context.Context) error {
 	return in.k8sDeploy(ctx, true)
 }
+
+// selfRecorded are the values under helm.ValuesKey a deploy records about itself, not about what
+// the release runs, each by its path: the release's installer image (k8sInstallerKey, and
+// k8sInstallerOfKey, the release it names) and the schema an upgrade read (k8sSchemaFrom). What a
+// revision ran is compared without them (releaseHistory.ran): a re-apply of the same release whose reads
+// answered otherwise is a copy of it.
+var selfRecorded = [][]string{{"release", k8sInstallerKey}, {"release", k8sInstallerOfKey}, {k8sSchemaFrom}}
 
 func (in *Installer) k8sDeploy(ctx context.Context, upgrade bool) error {
 	in.givenCA = true
@@ -585,6 +707,11 @@ func (in *Installer) k8sDeploy(ctx context.Context, upgrade bool) error {
 			o.logf("warning: %v", err)
 		}
 	}
+	// Given on every deploy, so a reused value never names the installer of the release replaced;
+	// merged into the chart's stowage.release, and taken back by `helm rollback` (selfRecorded).
+	// Read once: the values record it, and the provision hook runs in it.
+	ctlRef, ctlErr := in.readInstallerImage(ctx, prefix)
+	vals["release"] = map[string]any{k8sInstallerKey: recordedImage(ctlRef, ctlErr), k8sInstallerOfKey: installerOf(m.ProjectVersion, m.Revision)}
 	if d.values, err = yaml.Marshal(map[string]any{helm.ValuesKey: vals}); err != nil {
 		return err
 	}
@@ -603,10 +730,11 @@ func (in *Installer) k8sDeploy(ctx context.Context, upgrade bool) error {
 	}
 	// The hook runs from the release's installer image: one the registry does not hold refuses
 	// the run before anything changes.
-	plan, err := in.k8sHookPlanFor(ctx, prefix)
+	plan, err := in.k8sHookPlanWith(ctx, prefix, func() (string, error) { return in.hookImage(ctlRef, ctlErr, hookUse) })
 	if err != nil {
 		return err
 	}
+	in.unrecorded(ctlErr) // the deploy goes on: a failed read is said
 	args := helmDeploy(major, k, chart, valuesFile)
 	if upgrade {
 		// helm keeps the values given before, over the new chart's own: the operator's and the
@@ -974,18 +1102,30 @@ func (in *Installer) K8sRollback(ctx context.Context) error {
 	return nil
 }
 
-// K8sStatus prints what the helm release runs, then helm's own status.
-func (in *Installer) K8sStatus(ctx context.Context) error {
-	o, k := &in.O, in.O.K8s
+// k8sStatusRelease is the release both forms of `k8s status` report on, as helm lists it; an error
+// when there is none.
+func (in *Installer) k8sStatusRelease(ctx context.Context) (*helmRelease, error) {
+	k := in.O.K8s
 	if err := in.checkTarget(); err != nil {
-		return err
+		return nil, err
 	}
 	rel, err := in.release(ctx)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if rel == nil {
-		return fmt.Errorf("no release %s in %s", k.Release, k.Namespace)
+		return nil, fmt.Errorf("no release %s in %s", k.Release, k.Namespace)
+	}
+	return rel, nil
+}
+
+// K8sStatus prints what the helm release runs (its name, version, revision and channel) and its
+// registry, the project's endpoint when its spec names one, a line per Secret a handoff's run left,
+// then helm's own status.
+func (in *Installer) K8sStatus(ctx context.Context) error {
+	o, k := &in.O, in.O.K8s
+	if _, err := in.k8sStatusRelease(ctx); err != nil {
+		return err
 	}
 	cur, err := in.installedRelease(ctx)
 	if err != nil {

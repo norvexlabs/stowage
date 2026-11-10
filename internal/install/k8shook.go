@@ -72,11 +72,41 @@ func (k K8sOptions) kubectlWhere() string {
 	return "--namespace " + shellQuote(k.Namespace)
 }
 
-// hookImageOf is the release's installer image, by the digest the release manifest in the registry
-// at prefix records under the release's tag: the installer runs from its own image in the Job. The
-// manifest must be this installer's release (its version and revision) and signed by a key it
-// carries.
-func (in *Installer) hookImageOf(ctx context.Context, prefix string) (string, error) {
+// hookImageOf is the release's installer image (readInstallerImage), which a Job runs for use
+// (hookImage).
+func (in *Installer) hookImageOf(ctx context.Context, prefix, use string) (string, error) {
+	ref, err := in.readInstallerImage(ctx, prefix)
+	return in.hookImage(ref, err, use)
+}
+
+// hookUse and kitUse are what a Job runs the release's installer image for, which a missing
+// release manifest's error names.
+const (
+	hookUse = "the provision hook"
+	kitUse  = "a handoff's Job"
+)
+
+// hookImage is the installer image a Job runs in for use (hookUse, kitUse), read as
+// readInstallerImage answered: a registry holding no release manifest is told what a mirror must
+// hold for it.
+func (in *Installer) hookImage(ref string, err error, use string) (string, error) {
+	var none noReleaseManifest
+	if errors.As(err, &none) {
+		name := in.R.Manifest.Name
+		return "", fmt.Errorf("%w: %s runs in the release's installer image (a mirror holds the %s-release and %s-installer repositories too)", err, use, name, name)
+	}
+	return ref, err
+}
+
+// noReleaseManifest: the registry holds no release manifest under the release's tag.
+type noReleaseManifest struct{ msg string }
+
+func (e noReleaseManifest) Error() string { return e.msg }
+
+// releaseInstallerImage is the release's installer image, by the digest the release manifest in
+// the registry at prefix records under the release's tag. The manifest must be this installer's
+// release (its version and revision) and signed by a key it carries.
+func (in *Installer) releaseInstallerImage(ctx context.Context, prefix string) (string, error) {
 	m := in.R.Manifest
 	c, err := in.registryClient(prefix)
 	if err != nil {
@@ -92,7 +122,7 @@ func (in *Installer) hookImageOf(ctx context.Context, prefix string) (string, er
 	}
 	switch {
 	case got == nil:
-		return "", fmt.Errorf("%s holds no release manifest %s: the provision hook runs in the release's installer image (a mirror holds the %s-release and %s-installer repositories too)", repo, m.Tag, m.Name, m.Name)
+		return "", noReleaseManifest{fmt.Sprintf("%s holds no release manifest %s", repo, m.Tag)}
 	case got.Name != m.Name || got.ProjectVersion != m.ProjectVersion || got.Revision != m.Revision:
 		return "", fmt.Errorf("%s:%s is %s %s (revision %d), not this installer's %s (revision %d): run the installer of the release it holds", repo, m.Tag, got.Name, got.ProjectVersion, got.Revision, m.ProjectVersion, m.Revision)
 	case got.Artifacts.Installer == "":
@@ -123,6 +153,12 @@ type k8sHookPlan struct {
 // k8sHookPlanFor reads what a run of the hook needs on the release just deployed from prefix: nil
 // when the release has no hook or --no-provision says not to run it.
 func (in *Installer) k8sHookPlanFor(ctx context.Context, prefix string) (*k8sHookPlan, error) {
+	return in.k8sHookPlanWith(ctx, prefix, func() (string, error) { return in.hookImageOf(ctx, prefix, hookUse) })
+}
+
+// k8sHookPlanWith is k8sHookPlanFor with the installer image image answers, asked only when the
+// hook runs.
+func (in *Installer) k8sHookPlanWith(ctx context.Context, prefix string, image func() (string, error)) (*k8sHookPlan, error) {
 	h, err := in.hook()
 	if err != nil || h == nil {
 		return nil, err
@@ -130,7 +166,7 @@ func (in *Installer) k8sHookPlanFor(ctx context.Context, prefix string) (*k8sHoo
 	if in.O.NoProvision {
 		return nil, nil
 	}
-	ref, err := in.hookImageOf(ctx, prefix)
+	ref, err := image()
 	if err != nil {
 		return nil, err
 	}

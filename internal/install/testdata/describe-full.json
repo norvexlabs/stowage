@@ -1,0 +1,330 @@
+{
+  "format": 1,
+  "name": "atlas",
+  "short_name": "at",
+  "release": {
+    "version": "2.4.0",
+    "revision": 3
+  },
+  "channel": "stable",
+  "shapes": [
+    "docker",
+    "kubernetes",
+    "kairos"
+  ],
+  "inputs": [
+    {
+      "key": "SUPPORT_EMAIL",
+      "type": "text",
+      "secret": false,
+      "required": false,
+      "optional": false,
+      "shapes": [
+        "docker",
+        "kairos"
+      ],
+      "when": "tls",
+      "advanced": false,
+      "profile": "",
+      "prompt": "Support address shown on the public site",
+      "default": ""
+    },
+    {
+      "key": "ADMIN_EMAIL",
+      "type": "text",
+      "secret": false,
+      "required": true,
+      "optional": false,
+      "shapes": [],
+      "when": "",
+      "advanced": false,
+      "profile": "",
+      "prompt": "Administrator email",
+      "default": ""
+    },
+    {
+      "key": "ORG_NAME",
+      "type": "text",
+      "secret": false,
+      "required": true,
+      "optional": false,
+      "shapes": [],
+      "when": "",
+      "advanced": false,
+      "profile": "",
+      "prompt": "Organisation name",
+      "default": ""
+    },
+    {
+      "key": "UPSTREAM_API_KEY",
+      "type": "text",
+      "secret": true,
+      "required": false,
+      "optional": true,
+      "shapes": [],
+      "when": "",
+      "advanced": false,
+      "profile": "",
+      "prompt": "Upstream API key"
+    },
+    {
+      "key": "SEARCH_URL",
+      "type": "text",
+      "secret": false,
+      "required": false,
+      "optional": true,
+      "shapes": [],
+      "when": "",
+      "advanced": false,
+      "profile": "",
+      "prompt": "Search service URL (empty: no search)",
+      "default": ""
+    },
+    {
+      "key": "SEARCH_KEY",
+      "type": "text",
+      "secret": true,
+      "required": false,
+      "optional": true,
+      "shapes": [],
+      "when": "",
+      "advanced": false,
+      "profile": "",
+      "prompt": "Search service key"
+    },
+    {
+      "key": "INGEST_SOURCES",
+      "type": "text",
+      "secret": false,
+      "required": false,
+      "optional": false,
+      "shapes": [
+        "docker",
+        "kairos"
+      ],
+      "when": "",
+      "advanced": false,
+      "profile": "",
+      "prompt": "Addresses allowed to send events (CIDRs; empty refuses everyone)",
+      "default": "0.0.0.0/0, ::/0"
+    },
+    {
+      "key": "AUTH_ADDRESS",
+      "type": "text",
+      "secret": false,
+      "required": false,
+      "optional": false,
+      "shapes": [
+        "docker",
+        "kairos"
+      ],
+      "when": "",
+      "advanced": true,
+      "profile": "",
+      "prompt": "Authentication service of the api route, host:port",
+      "default": ""
+    },
+    {
+      "key": "AUTH_URI",
+      "type": "text",
+      "secret": false,
+      "required": false,
+      "optional": false,
+      "shapes": [
+        "docker",
+        "kairos"
+      ],
+      "when": "",
+      "advanced": true,
+      "profile": "",
+      "prompt": "Path the authentication service is asked at",
+      "default": ""
+    },
+    {
+      "key": "LOG_LEVEL",
+      "type": "text",
+      "secret": false,
+      "required": false,
+      "optional": false,
+      "shapes": [],
+      "when": "",
+      "advanced": true,
+      "profile": "",
+      "prompt": "Log level (debug, info, warning)",
+      "default": ""
+    },
+    {
+      "key": "ECHO_ADDRESS",
+      "type": "text",
+      "secret": false,
+      "required": false,
+      "optional": false,
+      "shapes": [
+        "docker",
+        "kairos"
+      ],
+      "when": "",
+      "advanced": false,
+      "profile": "",
+      "prompt": "Host name or address clients dial the echo service at",
+      "default": "localhost"
+    },
+    {
+      "key": "ECHO_BIND",
+      "type": "text",
+      "secret": false,
+      "required": false,
+      "optional": false,
+      "shapes": [
+        "docker",
+        "kairos"
+      ],
+      "when": "",
+      "advanced": true,
+      "profile": "",
+      "prompt": "Host address the TCP echo is published on (every address when empty)",
+      "default": ""
+    },
+    {
+      "key": "ECHO_SOURCES",
+      "type": "text",
+      "secret": false,
+      "required": false,
+      "optional": false,
+      "shapes": [
+        "docker",
+        "kairos"
+      ],
+      "when": "",
+      "advanced": false,
+      "profile": "",
+      "prompt": "Sources (addresses, CIDRs) the firewall lets reach the UDP echo",
+      "default": "0.0.0.0/0 ::/0"
+    },
+    {
+      "key": "API_CA_BUNDLE",
+      "type": "pem",
+      "secret": false,
+      "required": false,
+      "optional": true,
+      "shapes": [],
+      "when": "",
+      "advanced": false,
+      "profile": "",
+      "prompt": "File of the CA certificates the API trusts for its upstream (PEM; empty: none)",
+      "default": ""
+    },
+    {
+      "key": "RELAY_SOURCE",
+      "type": "text",
+      "secret": false,
+      "required": false,
+      "optional": true,
+      "shapes": [
+        "docker",
+        "kairos"
+      ],
+      "when": "",
+      "advanced": false,
+      "profile": "relay",
+      "prompt": "Event source the relay forwards (empty: no relay)",
+      "default": ""
+    },
+    {
+      "key": "RELAY_ADDRESS",
+      "type": "text",
+      "secret": false,
+      "required": false,
+      "optional": true,
+      "shapes": [
+        "docker",
+        "kairos"
+      ],
+      "when": "",
+      "advanced": true,
+      "profile": "",
+      "prompt": "Address the relay has of its own on the edge network (empty: none)",
+      "default": ""
+    },
+    {
+      "key": "DATABASE_URL",
+      "type": "text",
+      "secret": true,
+      "required": false,
+      "optional": true,
+      "shapes": [
+        "kubernetes"
+      ],
+      "when": "",
+      "advanced": false,
+      "profile": "",
+      "prompt": "Migration database URL (external Postgres)"
+    },
+    {
+      "key": "APP_DATABASE_URL",
+      "type": "text",
+      "secret": true,
+      "required": false,
+      "optional": true,
+      "shapes": [
+        "kubernetes"
+      ],
+      "when": "",
+      "advanced": false,
+      "profile": "",
+      "prompt": "Application database URL (external Postgres)"
+    },
+    {
+      "key": "ADMIN_PASSWORD",
+      "type": "text",
+      "secret": true,
+      "required": true,
+      "optional": false,
+      "shapes": [
+        "kubernetes"
+      ],
+      "when": "",
+      "advanced": false,
+      "profile": "",
+      "prompt": "Administrator password"
+    },
+    {
+      "key": "TRUSTED_PROBES",
+      "type": "text",
+      "secret": false,
+      "required": false,
+      "optional": true,
+      "shapes": [
+        "docker",
+        "kairos"
+      ],
+      "when": "",
+      "advanced": false,
+      "profile": "",
+      "prompt": "Probe addresses ingest trusts, comma-separated (empty: none)",
+      "default": ""
+    },
+    {
+      "key": "INGEST_POSTURE",
+      "type": "text",
+      "secret": false,
+      "required": false,
+      "optional": false,
+      "shapes": [
+        "docker",
+        "kairos"
+      ],
+      "when": "",
+      "advanced": false,
+      "profile": "",
+      "prompt": "ingest's table: observe (counts) or enforce (drops what no trusted probe sends)",
+      "default": "observe"
+    }
+  ],
+  "first_install_only": [
+    "address",
+    "registry",
+    "registry_ca",
+    "channel"
+  ]
+}

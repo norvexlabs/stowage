@@ -3,6 +3,19 @@
 Stowage's own releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
+## [0.34.0]
+
+### Added
+
+- `status --json` on the Docker installer and `k8s status --json` on Kubernetes: one object for a
+  program — the installed and the previous release (with the installer image each came from, by
+  digest), the channel, a first install still running or failed, and the recorded input names
+  (never a value) — beside the services or the helm revision. Each install now records its
+  release's installer image.
+- `describe [--json]`: what the release an installer carries offers, read with no install — the
+  release, the shapes, every input (a secret's default never shown) and the settings a re-run
+  cannot change. The JSON carries `format`, the machine interface's version.
+
 ## [0.33.2] - 2026-11-10
 
 ### Fixed

@@ -230,6 +230,7 @@ func (in *Installer) Upgrade(ctx context.Context) error {
 	if err := in.fetchImages(ctx, next); err != nil {
 		return err
 	}
+	in.recordInstaller(ctx, next)
 	st := state{ProjectVersion: cur}
 	st.Revision, _ = strconv.Atoi(rev)
 	if in.schemaOn() && in.crossing == nil {
@@ -870,7 +871,7 @@ func restoreReturned(kept, cur string) error {
 // the release that uses it comes back.
 func releaseKey(k string) bool {
 	switch k {
-	case "STOWAGE_PROJECT_VERSION", "STOWAGE_REVISION", FrontImageVar, ChownImageVar:
+	case "STOWAGE_PROJECT_VERSION", "STOWAGE_REVISION", InstallerVar, InstallerOfVar, FrontImageVar, ChownImageVar:
 		return true
 	}
 	return strings.HasPrefix(k, "STOWAGE_IMAGE_")
