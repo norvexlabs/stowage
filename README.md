@@ -1971,7 +1971,8 @@ again, to copy an installer to another host.
   reports the barriers after migration N instead. `--json` prints `{"migration", "kept":
   {"project_version", "revision", "schema"}, "after", "barriers"}`, the absent ones left out.
 - `describe` prints what the release this installer carries offers, read from the installer alone,
-  with no install and no `--dir`: the release, its channel, its shapes, each input and the settings
+  with no install and no `--dir`: the release, its channel (`""` from the `<short>-stow` inside a
+  VM, whose OS bundle serves every channel it is tagged on: the VM's channel is `status`'s), its shapes, each input and the settings
   only a first install takes. It applies to every shape: the installer that runs `k8s` and `vm create`
   is the same binary, so it describes the Kubernetes and VM releases too (the `<short>-stow` inside
   a VM, which the OS bundle carries, has no `describe`). Without `--json` it prints a

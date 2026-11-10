@@ -247,9 +247,10 @@ on_vm notes-stow status >"$WORK/status.txt" || fail "status over SSH"
 grep -q '^installed  notes 1.0.0 (revision 1)' "$WORK/status.txt" && grep -q '^channel    beta' "$WORK/status.txt" ||
 	{ cat "$WORK/status.txt"; fail "status does not show the install"; }
 # The machine interface over SSH: describe reads the release the OS carries (a secret input's
-# default never printed); status --json the install, no release replaced yet.
+# default never printed; no channel, as the OS bundle serves every channel it is tagged on);
+# status --json the install, no release replaced yet.
 on_vm sudo notes-stow describe --json >"$WORK/vm-describe.json" 2>"$WORK/vm-describe.log" || { cat "$WORK/vm-describe.log"; fail "describe --json on the VM"; }
-jq -se 'length == 1 and (.[0] | .format == 1 and .name == "notes" and .short_name == "notes" and .release == {version: "1.0.0", revision: 1} and .channel == "beta" and
+jq -se 'length == 1 and (.[0] | .format == 1 and .name == "notes" and .short_name == "notes" and .release == {version: "1.0.0", revision: 1} and .channel == "" and
 	(.shapes | index("kairos") != null) and (.inputs | map(.key) | index("ADMIN_EMAIL") != null and index("DB_SOURCES") != null) and
 	(.inputs[] | select(.key == "DEPLOY_TOKEN") | .secret and (has("default") | not)) and
 	.first_install_only == ["address", "registry", "registry_ca", "channel"])' "$WORK/vm-describe.json" >/dev/null ||
