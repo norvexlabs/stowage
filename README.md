@@ -4092,8 +4092,9 @@ in the same installer (bootstrap it as above, then `sh <name>.sh vm create …`,
   the keys of the required secret inputs nothing gives (never a value; left out when there are
   none): the VM's first install waits for them, as `vm create` says, until they are given over
   SSH (`sudo <short>-stow install --given - --no-input`). `--platform` missing, not a platform
-  Stowage knows, or one the registry holds no disk for is refused once the registry is read (exit
-  3), its fix naming the platforms that registry offers.
+  Stowage knows, or one the registry holds no disk for is refused (exit 3) once the registry has
+  been read, its fix naming the platforms that registry offers; a registry that cannot be read,
+  or that offers no disk for any platform, is a failure (exit 1), whatever `--platform` says.
 - The platform decides the disk format (the first of its formats the registry holds: a mirror
   carries the formats its `mirror export --disks` named) and how the cloud-config reaches the VM.
   Only the platforms the registry has a disk for are offered; a `--platform` whose formats the
@@ -4698,9 +4699,13 @@ sudo <short>-stow network attach --role ROLE --mac MAC [--mode dhcp|static|none]
   `--http-port`/`--https-port` in the wrong TLS mode (the fix of an existing `tls/` is to move it
   away). Refused without a fix on the VM — no step of its verbs is sure to clear them, so the
   reason names what is wrong alone: a re-run by the installer of another release than the one
-  installed (`<dir> runs <name> <v> (revision <r>), and this OS's installer carries …`), another
-  project's install or one kept by another installer name, and a directory holding another
-  project's `compose.yaml`. On `upgrade`: `--given` or `--kit`;
+  installed (`<dir> runs <name> <v> (revision <r>), and this OS's installer carries …`), an
+  upgrade by an OS installer whose release comes before the one installed (`<dir> runs <name> <v>
+  (revision <r>), after this installer's …`), the boot's upgrade across a schema baseline when the
+  install runs another release than the one `reset-db --new-baseline` confirmed (`… which was
+  confirmed: nothing was wiped`), another project's install or one kept by another installer
+  name, and a directory holding another project's `compose.yaml`. A verb run before the first
+  install (`<dir> holds no install`) has the fix `sudo <short>-stow install`. On `upgrade`: `--given` or `--kit`;
   `--version V` refused here (`upgrade --version V: refused, the install went back from …`, or
   `… is not one this VM, which runs …, can be upgraded to …`); no terminal to confirm on without
   `--yes`; and what the host daemon refuses, below. On `rollback`: no terminal to confirm on

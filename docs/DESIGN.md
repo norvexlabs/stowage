@@ -875,7 +875,11 @@ Stowage calls a project's programs: the two never share a reader.
   installer that is not the release the install runs, a directory holding files and no install)
   are refusals without a fix: the reason names what is wrong, and no step of the VM's verbs is
   sure to clear it. So is one whose Docker fix is a flag of the upgrade (a port, or an input the
-  release adds): the VM's upgrade, checked by its daemon and run by its boot, takes none.
+  release adds): the VM's upgrade, checked by its daemon and run by its boot, takes none; an
+  upgrade by an installer earlier than the release the install runs (no verb is the fix); and the
+  boot's crossing of a baseline when the install runs another release than the one `reset-db
+  --new-baseline` confirmed (the boot runs on the target's OS already: a reset-db there does not
+  hold). A verb run before the first install is fixed by `sudo <short>-stow install`.
 - **`vm seed --json`** — a VM's first-boot material without creating the VM, for a tool that
   creates it with its own means: `{format, platform, user_data, known_hosts_line, fingerprint,
   host_key_private, disk: {<platform>: {format, image}}, waiting: [<key>]}` — the user-data for `--platform` (the
@@ -887,7 +891,9 @@ Stowage calls a project's programs: the two never share a reader.
   gives, which the first install waits for (never a value; omitted when none). It never asks: `vm create`'s machine flags, the front's, `--set`,
   `--answers` and `--channel` (the channel the first install follows) give it all. It is the seed
   `vm create --create manual` writes, built by the same steps (the registry and disk set, the
-  machine, the settings, the user-data). The `vm` verbs that reach a VM over SSH (`vm kit`, `vm
+  machine, the settings, the user-data). A missing, unknown or unoffered `--platform` is refused
+  (exit 3) once the registry has been read, naming the platforms it offers — the fix needs that
+  list; a registry that cannot be read, or that offers no disk, is a failure (exit 1). The `vm` verbs that reach a VM over SSH (`vm kit`, `vm
   attach`) take `--known-hosts-line LINE`: one host name and its key (no marker, pattern, list or
   hashed name), checked strictly under that name (`HostKeyAlias`), never `accept-new`, in place
   of the key `vm create` recorded; the line is written, its name lower-cased, to a file of its

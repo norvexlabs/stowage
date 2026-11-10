@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"strconv"
 
 	"github.com/spf13/cobra"
@@ -116,7 +115,7 @@ func (in *Installer) flagFix(fix string) string {
 }
 
 // vmCtl is the VM's installer as its operator runs it: the one its OS carries, as root.
-func (in *Installer) vmCtl() string { return "sudo " + filepath.Base(BundledCtl(in.R.Spec.Short())) }
+func (in *Installer) vmCtl() string { return "sudo " + in.R.Ctl() }
 
 // As makes a rollback check's refusal a Refused, so it exits 3 as every refusal does.
 func (e rollbackRefused) As(target any) bool {

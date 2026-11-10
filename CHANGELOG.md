@@ -30,9 +30,12 @@ follow [SemVer](https://semver.org/).
   installer, or a flag the VM's upgrade does not take carries no fix and still exits 3 — another
   release's or project's install, a kept installer that is not the release the install runs
   (whatever their order), a directory holding another project's files; an upgrade the boot
-  would refuse names the re-run of the install that clears it, where one does. `vm seed` and
-  `vm create` refuse a missing, unknown or unoffered `--platform` with exit 3, naming the
-  platforms the registry offers.
+  would refuse names the re-run of the install that clears it, where one does; an upgrade by an
+  earlier release's installer, or a baseline crossing confirmed for another release, carries no
+  fix there, and a verb run before the first install names `sudo <short>-stow install`. `vm seed`
+  and `vm create` refuse a missing, unknown or unoffered `--platform` with exit 3 once the
+  registry has been read, naming the platforms it offers; a registry that cannot be read, or that
+  offers no disk, is a failure (exit 1).
 - `vm seed --json`: a new VM's first-boot material for a tool that creates the VM itself — the
   cloud-config (no secret input), a one-time SSH host key with its `known_hosts` line and
   fingerprint, the disk image each platform boots, by digest, and the secret inputs the first

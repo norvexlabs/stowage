@@ -137,8 +137,8 @@ func (h *Hostd) plan(ctx context.Context, log io.Writer) (RollbackPlan, error) {
 		return RollbackPlan{}, fmt.Errorf("%s: %w", filepath.Join(in.path(PrevDir), prevState), err)
 	}
 	in.O.DryRun, in.O.Log = true, log
-	// Its refusals keep their fix (another run under way, half restored volumes, the data moved
-	// on…), but one that holds for a Docker install alone: failAs.
+	// Rollback runs as on the VM (O.Preloaded), so each refusal carries the fix it chose for the
+	// VM where it was raised, or none where no advice holds there; failAs keeps it, answered 409.
 	if err := in.Rollback(ctx); err != nil {
 		return RollbackPlan{}, failAs(http.StatusConflict, err)
 	}

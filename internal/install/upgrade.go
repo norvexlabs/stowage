@@ -77,7 +77,7 @@ func (in *Installer) open() (*EnvFile, error) {
 	in.O.Dir = dir
 	env, err := ReadEnvFile(in.path(envName))
 	if errors.Is(err, os.ErrNotExist) {
-		return nil, refuse(in.fixOn("install first, or give the --dir of the install", "install first"), "%s holds no install", dir)
+		return nil, refuse(in.fixOn("install first, or give the --dir of the install", in.vmCtl()+" install"), "%s holds no install", dir)
 	}
 	return env, err
 }
@@ -184,7 +184,9 @@ func (in *Installer) Upgrade(ctx context.Context) (err error) {
 		return nil
 	}
 	if c := in.crossing; c != nil && (c.version != cur || c.revision != rev) {
-		return refuse(in.fixOn(cmp.Or(o.Self, in.ctl())+" reset-db --new-baseline --dir "+o.Dir, in.vmCtl()+" reset-db --new-baseline"), "%s runs %s %s (revision %s) now, not %s (revision %s), which was confirmed: nothing was wiped; reset-db --new-baseline again", o.Dir, name, cur, rev, c.version, c.revision)
+		// On the VM this runs in the boot into the crossed release (Boot → Upgrade), whose OS is
+		// already the target's: a reset-db --new-baseline there does not hold, so no fix.
+		return refuse(in.fixOn(cmp.Or(o.Self, in.ctl())+" reset-db --new-baseline --dir "+o.Dir, ""), "%s runs %s %s (revision %s) now, not %s (revision %s), which was confirmed: nothing was wiped; reset-db --new-baseline again", o.Dir, name, cur, rev, c.version, c.revision)
 	}
 	if err := in.newer(cur, rev); err != nil {
 		return err
@@ -515,7 +517,7 @@ func (in *Installer) newer(cur, rev string) error {
 		return err
 	}
 	if cmp.Or(c, cmp.Compare(r, m.Revision)) > 0 {
-		return refuse(in.fixOn(laterFix(in.ctl()), "nothing to do: the install runs a later release"), "%s runs %s %s (revision %d), after this installer's %s (revision %d)%s",
+		return refuse(in.fixOn(laterFix(in.ctl()), ""), "%s runs %s %s (revision %d), after this installer's %s (revision %d)%s",
 			in.O.Dir, m.Name, cur, r, m.ProjectVersion, m.Revision, in.fixOn(fmt.Sprintf(": `%s rollback --dir %s` goes back one upgrade", in.ctl(), in.O.Dir), ""))
 	}
 	return nil

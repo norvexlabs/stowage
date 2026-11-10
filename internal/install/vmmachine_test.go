@@ -856,7 +856,7 @@ func TestVMRefusalsCarryAFixThatHoldsOnTheVM(t *testing.T) {
 			e := vmInstalled(t, "2.0.0")
 			e.r, e.self = bundledInstaller(t, "1.0.0", 1, nil)
 			return e.installer(mod).Upgrade(ctx)
-		}, "runs notes 2.0.0 (revision 1), after this installer's 1.0.0 (revision 1)", "nothing to do: the install runs a later release", "or a later release's installer"},
+		}, "runs notes 2.0.0 (revision 1), after this installer's 1.0.0 (revision 1)", "", "or a later release's installer"},
 		"a directory holding a compose file": {func(t *testing.T, mod func(*Options)) error {
 			e := vmEnv(t, "1.0.0")
 			if err := os.MkdirAll(e.dir, 0o755); err != nil {
@@ -877,7 +877,14 @@ func TestVMRefusalsCarryAFixThatHoldsOnTheVM(t *testing.T) {
 		}, "already holds a tls/", "move tls/ away", "--dir"},
 		"no install": {func(t *testing.T, mod func(*Options)) error {
 			return vmEnv(t, "1.0.0").installer(mod).Rollback(ctx)
-		}, "holds no install", "install first", "--dir"},
+		}, "holds no install", "sudo notes-stow install", "--dir"},
+		"an upgrade crossing from another release than the one confirmed": {func(t *testing.T, mod func(*Options)) error {
+			e := vmInstalled(t, "1.0.0")
+			e.r, e.self = bundledInstaller(t, "2.0.0", 1, nil)
+			in := e.installer(mod)
+			in.crossing = &crossing{version: "0.9.0", revision: "1"}
+			return in.Upgrade(ctx)
+		}, "not 0.9.0 (revision 1), which was confirmed: nothing was wiped", "", "reset-db --new-baseline --dir"},
 		"a TLS mode the release does not offer": {func(t *testing.T, mod func(*Options)) error {
 			e := vmInstalled(t, "1.0.0")
 			in := e.installer(mod)
