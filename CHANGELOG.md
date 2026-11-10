@@ -48,8 +48,7 @@ follow [SemVer](https://semver.org/).
 - `--known-hosts-line LINE` on `vm kit` and `vm attach`: the VM's host key given as one
   `known_hosts` line, checked strictly, for a VM `vm create` did not make.
 - `vm seed` given a secret input on its command line refuses it as a seed (exit 3), and `vm create`
-  refuses one there with exit 3 too, its fix to leave it off and give it once the VM answers.
-
+  refuses one there with exit 3 too, naming no fix.
 
 ## [0.33.2] - 2026-11-10
 

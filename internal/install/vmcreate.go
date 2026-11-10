@@ -1370,8 +1370,9 @@ func (in *Installer) vmSettings(ctx context.Context) (*Settings, []string, *Give
 				if in.seeding {
 					return nil, nil, nil, seedRefusal(i.Key)
 				}
-				return nil, nil, nil, refuse(fmt.Sprintf("run vm create again without --set %s, and give it once the VM answers (`%s install`)", i.Key, in.vmCtl()),
-					"%s is a secret input, which a command line never carries", i.Key)
+				// No fix: what clears it depends on the rest of the run (an --answers file, --secrets,
+				// the install's other secrets), so the reason states the rule alone.
+				return nil, nil, nil, refuse("", "%s is a secret input, which a command line (--set, --set-file) never carries", i.Key)
 			}
 			if !i.Secret {
 				list = append(list, i)

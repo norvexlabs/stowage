@@ -480,18 +480,18 @@ func TestVMSeed(t *testing.T) {
 	// refused as unknown, never as a secret the seed would give over SSH.
 	v.r.Spec.Inputs = append(v.r.Spec.Inputs, spec.Input{Key: "DOCKER_ONLY_TOKEN", Secret: true, Shapes: []string{"docker"}})
 	_, err = seed(func(o *Options) { o.Set["DOCKER_ONLY_TOKEN"] = "tok-not-to-be-printed" }, "")
-	if err == nil || strings.Contains(err.Error(), "a seed carries no secret") || strings.Contains(err.Error(), "tok-not") {
+	if err == nil || !strings.Contains(err.Error(), "no input of this install is named DOCKER_ONLY_TOKEN") || strings.Contains(err.Error(), "tok-not") {
 		t.Errorf("another shape's secret: %v", err)
 	}
 	v.r.Spec.Inputs = v.r.Spec.Inputs[:len(v.r.Spec.Inputs)-1]
 	// vm create given a secret input on a command line: a refusal too (exit 3), never the value,
-	// whose fix holds whatever else the run gives (--secrets, other secrets): leave it off.
+	// with no fix: what clears it depends on the rest of the run (--answers, --secrets, others).
 	create := v.installer(func(o *Options) {
 		o.TLS, o.Set = "internal", map[string]string{"ADMIN_EMAIL": "admin@example.org", "APP_DOMAIN": "app.example.org", "API_DOMAIN": "api.example.org", "ACCESS_TOKEN": "tok-not-to-be-printed"}
 		o.Prompt = asked
 	})
-	if _, _, _, err := create.vmSettings(context.Background()); !isRefused(err) || err.Error() != "ACCESS_TOKEN is a secret input, which a command line never carries" ||
-		refusedFix(err) != "run vm create again without --set ACCESS_TOKEN, and give it once the VM answers (`sudo notes-stow install`)" {
+	if _, _, _, err := create.vmSettings(context.Background()); !isRefused(err) || err.Error() != "ACCESS_TOKEN is a secret input, which a command line (--set, --set-file) never carries" ||
+		refusedFix(err) != "" {
 		t.Errorf("vm create --set of a secret: %v (fix %q)", err, refusedFix(err))
 	}
 	// A bad channel: refused before the registry is read (a --registry that does not parse would
