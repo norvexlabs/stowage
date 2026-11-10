@@ -4247,7 +4247,10 @@ in the same installer (bootstrap it as above, then `sh <name>.sh vm create …`,
   TLS mode (an HTTPS one: never `none`, whose loopback address nothing outside the VM reaches,
   nor `byo` unless its certificate is given, whose private key the cloud-config never carries), the domains and the inputs of the
   `kairos` shape — never from the environment, which says nothing about the VM — but no secret
-  input is asked: one in `--answers` goes over SSH ("Given over SSH"), and one the install
+  input is asked: one in `--answers` goes over SSH ("Given over SSH"), one given by `--set` or
+  `--set-file` is refused (exit 3: `KEY is a secret input, which a command line never carries`,
+  its fix `run vm create again without --set KEY, and give it once the VM answers (`sudo
+  <short>-stow install`)`; `vm seed` refuses it as a seed refuses any secret input), and one the install
   requires that nothing gives is named at the end, for the operator to give over SSH (`ssh <user>@<address> sudo
   <short>-stow install`). The answers are reviewed ("Go on with these answers"), the whole is shown,
   and on a terminal confirmed; without one the flags and the defaults decide. The whole names the

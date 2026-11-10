@@ -1367,8 +1367,11 @@ func (in *Installer) vmSettings(ctx context.Context) (*Settings, []string, *Give
 		list = nil
 		for _, i := range in.inputList(mode) {
 			if _, set := o.Set[i.Key]; i.Secret && set {
-				return nil, nil, nil, refuse(fmt.Sprintf("give %s in the --answers file, or later (`sudo %s install`)", i.Key, in.R.Ctl()),
-					"%s is a secret input, which a command line never carries: give it in the --answers file, which goes over SSH once the VM answers, or later (`sudo %s install`)", i.Key, in.R.Ctl())
+				if in.seeding {
+					return nil, nil, nil, seedRefusal(i.Key)
+				}
+				return nil, nil, nil, refuse(fmt.Sprintf("run vm create again without --set %s, and give it once the VM answers (`%s install`)", i.Key, in.vmCtl()),
+					"%s is a secret input, which a command line never carries", i.Key)
 			}
 			if !i.Secret {
 				list = append(list, i)

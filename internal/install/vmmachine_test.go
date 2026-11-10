@@ -456,19 +456,42 @@ func TestVMSeed(t *testing.T) {
 	if r, ok := Refusal(err); !ok || !strings.Contains(r.Reason, "ACCESS_TOKEN") || strings.Contains(r.Reason, "tok-not") || !strings.Contains(r.Fix, "install --given -") {
 		t.Errorf("%v", err)
 	}
-	// On a command line too: the seed's own refusal (exit 3, its fix), not vm create's advice to
-	// put the secret in the answers, which a seed refuses as well; before the registry is read.
-	_, err = seed(func(o *Options) { o.Set["ACCESS_TOKEN"] = "tok-not-to-be-printed"; o.Registry = "not a registry" }, "")
-	if r, ok := Refusal(err); !ok || !strings.Contains(r.Reason, "ACCESS_TOKEN: a seed carries no secret input") || strings.Contains(r.Reason, "tok-not") || !strings.Contains(r.Fix, "install --given -") {
-		t.Errorf("%v", err)
+	modes := v.r.Spec.Front.TLSModes
+	v.r.Spec.Front.TLSModes = append(append([]string{}, modes...), "dns-cloudflare")
+	// On a command line too (--set-file lands in Set as well): the seed's own refusal (exit 3,
+	// its fix), never vm create's, whose way a seed refuses; the front's token alike.
+	for name, mod := range map[string]func(*Options){
+		"a project secret": func(o *Options) { o.Set["ACCESS_TOKEN"] = "tok-not-to-be-printed" },
+		"the front's token": func(o *Options) {
+			o.TLS, o.Set[CloudflareTokenVar] = "dns-cloudflare", "tok-not-to-be-printed"
+		},
+	} {
+		_, err = seed(mod, "")
+		key := "ACCESS_TOKEN"
+		if name == "the front's token" {
+			key = CloudflareTokenVar
+		}
+		if r, ok := Refusal(err); !ok || !strings.Contains(r.Reason, key+": a seed carries no secret input") || strings.Contains(r.Reason, "tok-not") || !strings.Contains(r.Fix, "install --given -") {
+			t.Errorf("%s: %v", name, err)
+		}
 	}
-	// vm create given a secret input on a command line: a refusal too (exit 3), never the value.
+	v.r.Spec.Front.TLSModes = modes
+	// A secret input the VM's install never takes (another shape's): not one of its inputs, so
+	// refused as unknown, never as a secret the seed would give over SSH.
+	v.r.Spec.Inputs = append(v.r.Spec.Inputs, spec.Input{Key: "DOCKER_ONLY_TOKEN", Secret: true, Shapes: []string{"docker"}})
+	_, err = seed(func(o *Options) { o.Set["DOCKER_ONLY_TOKEN"] = "tok-not-to-be-printed" }, "")
+	if err == nil || strings.Contains(err.Error(), "a seed carries no secret") || strings.Contains(err.Error(), "tok-not") {
+		t.Errorf("another shape's secret: %v", err)
+	}
+	v.r.Spec.Inputs = v.r.Spec.Inputs[:len(v.r.Spec.Inputs)-1]
+	// vm create given a secret input on a command line: a refusal too (exit 3), never the value,
+	// whose fix holds whatever else the run gives (--secrets, other secrets): leave it off.
 	create := v.installer(func(o *Options) {
 		o.TLS, o.Set = "internal", map[string]string{"ADMIN_EMAIL": "admin@example.org", "APP_DOMAIN": "app.example.org", "API_DOMAIN": "api.example.org", "ACCESS_TOKEN": "tok-not-to-be-printed"}
 		o.Prompt = asked
 	})
-	if _, _, _, err := create.vmSettings(context.Background()); !isRefused(err) || !strings.Contains(err.Error(), "ACCESS_TOKEN is a secret input, which a command line never carries") ||
-		strings.Contains(err.Error(), "tok-not") || !strings.Contains(refusedFix(err), "--answers") {
+	if _, _, _, err := create.vmSettings(context.Background()); !isRefused(err) || err.Error() != "ACCESS_TOKEN is a secret input, which a command line never carries" ||
+		refusedFix(err) != "run vm create again without --set ACCESS_TOKEN, and give it once the VM answers (`sudo notes-stow install`)" {
 		t.Errorf("vm create --set of a secret: %v (fix %q)", err, refusedFix(err))
 	}
 	// A bad channel: refused before the registry is read (a --registry that does not parse would

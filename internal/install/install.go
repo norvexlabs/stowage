@@ -232,6 +232,9 @@ type Installer struct {
 	// givenNothing: the run takes no flag, input or answer — the VM's upgrade, which its daemon
 	// checks (upgradeCheck) and its boot runs (Upgrade) — so a refusal's fix names none (flagFix).
 	givenNothing bool
+	// seeding: the run is vm seed's, whose refusal of a secret input given to it says a seed
+	// carries none (seedRefusal), where vm create's names its own way.
+	seeding bool
 	// outputs is the provision hook's outputs file of a release another Stowage built, whose spec
 	// is read for its wipe alone (wipeOf).
 	outputs string
