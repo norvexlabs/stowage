@@ -1398,6 +1398,14 @@ every shape, the VM end-to-end test upgrading through it), then the health gate.
   from the image's `/usr`, not `/etc/ssh`: `/etc/ssh` is persistent state that each boot fills
   from its image without deleting, so a drop-in from a newer image (Kairos 4.4's post-quantum
   key exchange) would reach an older release's sshd after a rollback, which then does not start.
+  The image's own settings that differ from that drop-in sit beside it in `/usr`, named to be read
+  first (sshd keeps a keyword's first value): root's login is refused, where kairos-init allows it
+  by key, because a cloud's datasource writes its metadata's SSH keys for root (on Scaleway, every
+  key of the project). A rollback to an image built before 0.33.2 reads that image's `/usr` and
+  allows root by key again; Scaleway's images start at 0.33.2, the first whose bundle builds. The
+  build asserts sshd's effective settings (`sshd -T`), and a unit test reads the image's drop-ins
+  with kairos-init's (a copy of the pinned release's, in testdata) in sshd's order, so a setting
+  the drop-ins would not give fails `make check` before a build does.
 - **Creating a VM with OpenTofu** — `<short>-stow` embeds a module per canonical platform:
   TrueNAS (proven by `make e2e-vm`), and as previews libvirt/KVM, Proxmox VE and vSphere on
   premises, AWS, Google Cloud, Azure and Scaleway in the clouds — each uploading the disk the platform takes

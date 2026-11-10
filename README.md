@@ -1305,8 +1305,12 @@ These are what `lint` checks; each finding names the key path or `file:line` to 
     and MACs only; no TCP, agent or X11 forwarding and no tunnels; at most 4 authentication tries;
     a client that stops answering is dropped after 10 minutes: an agent holding more keys than 4 needs `ssh -i
     KEY -o IdentitiesOnly=yes`, which `vm create`'s own SSH passes: the private key next to
-    `--ssh-key`'s `.pub`, else that `.pub`, so the agent offers its key alone), the build failing when that drop-in no longer sets
-    `AllowTcpForwarding no`; kairos-init's CIS hardening step is not run (its shell umask,
+    `--ssh-key`'s `.pub`, else that `.pub`, so the agent offers its key alone), and root's login
+    refused (`/usr/lib/<name>/sshd_config.d/00-<name>.conf`, read before kairos-init's, which allows
+    it by key: a cloud's datasource writes its metadata's SSH keys for root); the build fails when
+    that drop-in no longer sets `AllowTcpForwarding no`, and when sshd's effective settings
+    (`sshd -T`) are not `PermitRootLogin no`, `AllowTcpForwarding no`, `MaxAuthTries 4` and
+    `PasswordAuthentication no`, naming the setting and the value it found; kairos-init's CIS hardening step is not run (its shell umask,
     password ageing and lockout would reach the install's files and the operator's account), the
     build failing when its module blocklist (`/etc/modprobe.d/cis-blocklist.conf`) or a umask of
     027 (`/etc/profile`, `/etc/profile.d`, `/etc/bash.bashrc`, `/etc/login.defs`) is there; an

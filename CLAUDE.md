@@ -199,6 +199,10 @@ asks for one:
 1. A docs-only commit dates the top entry: `## [x.y.z]` → `## [x.y.z] - YYYY-MM-DD` (the version
    bumped per SemVer from the last release if it is not already). The Makefile's `VERSION` is that
    entry's version.
+   Before it, every suite `GATE_BASE=v<last release> make gate-plan` lists has printed PASS on
+   the tree being released: a commit made "as is", with a suite deferred, is released only once
+   that suite has run (a template that builds an image is proven by building it), unless the user
+   waives it for a narrower proof, which the CHANGELOG entry's commit message names.
 2. `git tag vx.y.z` on that commit, then `git push origin main vx.y.z`.
 3. `gh run watch` the release run. It refuses a tag that is not on `main`, does not match the top
    entry's version or names an undated entry. A failed run is fixed on `main`, the tag moved to

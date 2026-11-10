@@ -14,6 +14,7 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -40,9 +41,9 @@ func TestDockerfileRendersTheParams(t *testing.T) {
 		"notes-preload.service", "chmod 0440 /etc/sudoers.d/10-notes", "notes-health.service", "notes-network.service", "notes-tune.service", "notes-tune-online.service", "notes-route6.service", "notes-tables.service", "ethtool",
 		"mv /usr/share/notes/08_grub.yaml \"$f\"", "sha256sum -c -", "shapes.kairos.kairos_init: its", "grep -qx 'AllowTcpForwarding no' /etc/ssh/sshd_config.d/05-kairos-hardening.conf",
 		"mv /etc/ssh/sshd_config.d/05-kairos-hardening.conf /usr/lib/notes/sshd_config.d/",
-		"printf 'Include /usr/lib/notes/sshd_config.d/*.conf\\n' > /etc/ssh/sshd_config.d/00-notes-hardening.conf", "grep -qx 'allowtcpforwarding no' \"$k/effective\"",
+		"printf 'Include /usr/lib/notes/sshd_config.d/*.conf\\n' > /etc/ssh/sshd_config.d/00-notes-hardening.conf",
 		"! test -e /etc/modprobe.d/cis-blocklist.conf", "umask[[:space:]]+0*27([^0-7]|$)' /etc/profile /etc/profile.d", "UMASK[[:space:]]+0*27", "sed -i '/^        net\\.core\\.rmem_max: 7500000$/d'",
-		`sed -i -E 's/^( +providers: \[.*)\]$/\1, "scaleway"]/' "$f"`, `grep -qx 'permitrootlogin no' "$k/effective"`} {
+		`sed -i -E 's/^( +providers: \[.*)\]$/\1, "scaleway"]/' "$f"`, `|| fail "sshd's effective setting is`} {
 		if !strings.Contains(s, want) {
 			t.Errorf("Dockerfile lacks %q", want)
 		}
@@ -54,6 +55,88 @@ func TestDockerfileRendersTheParams(t *testing.T) {
 	// Docker's packages stay cached from one release to the next.
 	if v, d := strings.Index(s, params.OSVersion), strings.Index(s, "docker-compose-plugin"); d < 0 || v < d {
 		t.Errorf("the OS version (at %d) comes before Docker's packages (at %d)", v, d)
+	}
+}
+
+// Every value the build asserts of sshd -T is the one sshd reads from the image's drop-ins and
+// kairos-init's: sshd keeps a keyword's first value, reading /etc/ssh/sshd_config.d by name, whose
+// first file includes the image's /usr directory (its files by name, kairos-init's moved there).
+func TestTheImagesSSHSettingsHoldOverKairosInits(t *testing.T) {
+	t.Parallel()
+	for _, ex := range []string{"minimal", "full"} {
+		raw, err := os.ReadFile(filepath.Join("..", "..", "examples", ex, "stowage.yaml"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(raw), "kairos_init: quay.io/kairos/kairos-init:"+KairosInitRelease+"@") {
+			t.Errorf("examples/%s pins another kairos-init than %s", ex, KairosInitRelease)
+		}
+	}
+	kairosInit, err := os.ReadFile("testdata/kairos-init-" + KairosInitRelease + "-sshd.conf")
+	if err != nil {
+		t.Fatalf("%v: put kairos-init %s's SSH drop-in there, as it writes it", err, KairosInitRelease)
+	}
+	ctx := t.TempDir()
+	if err := WriteContext(ctx, params); err != nil {
+		t.Fatal(err)
+	}
+	dir := func(d string, more map[string][]byte) map[string][]byte {
+		out := maps.Clone(more)
+		entries, err := os.ReadDir(filepath.Join(ctx, "files", d))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, e := range entries {
+			raw, err := os.ReadFile(filepath.Join(ctx, "files", d, e.Name()))
+			if err != nil {
+				t.Fatal(err)
+			}
+			out[e.Name()] = raw
+		}
+		return out
+	}
+	usr := dir("usr/lib/notes/sshd_config.d", map[string][]byte{"05-kairos-hardening.conf": kairosInit})
+	include := "Include /usr/lib/notes/sshd_config.d/*.conf"
+	etc := dir("etc/ssh/sshd_config.d", map[string][]byte{"00-notes-hardening.conf": []byte(include + "\n")})
+	df, err := Dockerfile(params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(df), "printf '"+include+"\\n' > /etc/ssh/sshd_config.d/00-notes-hardening.conf") {
+		t.Fatal("the image no longer includes its /usr drop-ins first: this test reads them in an order sshd does not")
+	}
+	effective := map[string]string{}
+	var read func(map[string][]byte)
+	read = func(d map[string][]byte) {
+		for _, name := range slices.Sorted(maps.Keys(d)) {
+			for line := range strings.Lines(string(d[name])) {
+				f := strings.Fields(line)
+				switch {
+				case len(f) == 0 || strings.HasPrefix(f[0], "#"):
+				case strings.EqualFold(f[0], "Include"):
+					read(usr)
+				default:
+					if kw := strings.ToLower(f[0]); effective[kw] == "" {
+						effective[kw] = strings.ToLower(strings.Join(f[1:], " "))
+					}
+				}
+			}
+		}
+	}
+	read(etc)
+	m := regexp.MustCompile(`for s in ((?:'[^']+'\s*)+);`).FindSubmatch(df)
+	if m == nil {
+		t.Fatal("the build's sshd -T loop (for s in '<keyword> <value>' …;) is not found")
+	}
+	asserted := regexp.MustCompile(`'([^']+)'`).FindAllSubmatch(m[1], -1)
+	if !slices.ContainsFunc(asserted, func(a [][]byte) bool { return string(a[1]) == "permitrootlogin no" }) {
+		t.Error("the build no longer asserts sshd refuses root's login")
+	}
+	for _, a := range asserted {
+		kw, want, _ := strings.Cut(string(a[1]), " ")
+		if got := effective[kw]; got != want {
+			t.Errorf("the build asserts sshd's %s is %q, the drop-ins give %q", kw, want, got)
+		}
 	}
 }
 

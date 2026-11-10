@@ -3,6 +3,16 @@
 Stowage's own releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
+## [0.33.2]
+
+### Fixed
+
+- The Kairos OS bundle builds again: since 0.33.0 its build demanded that SSH refuse root's login
+  while nothing in the image refused it (kairos-init allows root by key), so every `ship` of a
+  project with `shapes.kairos` failed. The image now refuses root's login over SSH, and each check
+  of the bundle's build that fails names itself (an SSH setting with the value it found, the CIS
+  settings left out, the kernel modules) instead of a bare `exit status 1`.
+
 ## [0.33.1] - 2026-11-10
 
 ### Fixed
