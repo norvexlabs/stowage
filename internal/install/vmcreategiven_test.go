@@ -557,7 +557,7 @@ func TestVMCreateRefusesWhatItCouldNotGive(t *testing.T) {
 		{"a certificate not covering the domains", nil, VMCreate{}, func(o *Options) { o.Cert, o.Key = otherCert, otherKey }, "the certificate does not cover"},
 		{"an expired certificate", nil, VMCreate{}, func(o *Options) { o.Cert, o.Key = expiredCert, expiredKey }, "the certificate expired"},
 		{"half a pair", nil, VMCreate{}, func(o *Options) { o.Cert = goodCert }, "--tls byo needs --cert FILE and --key FILE"},
-		{"--set of a secret", secret(true), VMCreate{}, func(o *Options) { o.TLS = "internal"; o.Set = map[string]string{"API_KEY": "v"} }, "a command line never carries"},
+		{"--set of a secret", secret(true), VMCreate{}, func(o *Options) { o.TLS = "internal"; o.Set = map[string]string{"API_KEY": "v"} }, "a command line (--set, --set-file) never carries"},
 		{"--secrets beside a certificate", nil, VMCreate{Secrets: []byte("project: notes\nsecrets: {}\n")}, func(o *Options) { o.Cert, o.Key = goodCert, goodKey }, "--secrets restores an install, and the certificate and its key would go with it"},
 		{"--secrets beside a secret input", secret(false), VMCreate{Secrets: []byte("project: notes\nsecrets: {}\n")}, func(o *Options) { o.TLS = "internal"; o.Answers = map[string]string{"API_KEY": "v"} }, "--secrets restores an install, and API_KEY would go with it"},
 		{"a required secret nothing gives", secret(true), VMCreate{}, func(o *Options) { o.Cert, o.Key = goodCert, goodKey }, "also needs API_KEY"},
