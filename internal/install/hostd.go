@@ -33,6 +33,7 @@ import (
 	"github.com/norvexlabs/stowage/internal/payload"
 	"github.com/norvexlabs/stowage/internal/registry"
 	"github.com/norvexlabs/stowage/internal/release"
+	"github.com/norvexlabs/stowage/internal/spec"
 )
 
 // The host daemon (`<short>-stow hostd`, a systemd service on the VM) runs the VM verbs as root:
@@ -170,6 +171,12 @@ type Hostd struct {
 	onEvent func(evs []Event)
 	// bootRec holds this boot's boot.started once read (boot).
 	bootRec bootCache
+	// carriedMu guards carriedKey and carriedSpec: the spec of the release installed as
+	// carriedRelease told it, for the release and the kept installer's file (its size and time)
+	// it was read from, so a status reads and logs it once per change.
+	carriedMu   sync.Mutex
+	carriedKey  string
+	carriedSpec *spec.Spec
 	// route6Mu guards route6Warn, the warning of a primary link without an IPv6 default route
 	// (route6Watch).
 	route6Mu   sync.Mutex
@@ -767,6 +774,25 @@ func (h *Hostd) source(in *Installer) (env *EnvFile, first bool, err error) {
 	return env, true, nil
 }
 
+// installedSpec is the spec carriedRelease tells for the release name version at revision, read
+// once per release and kept installer file (none, or its size and modification time): a status
+// does not read the kept installer, nor log it, at every request.
+func (h *Hostd) installedSpec(in *Installer, name, version string, revision int) *spec.Spec {
+	key := fmt.Sprintf("%s\x00%s\x00%d\x00", name, version, revision)
+	if fi, err := os.Stat(in.ctl()); err == nil {
+		key += fmt.Sprintf("%d\x00%d", fi.Size(), fi.ModTime().UnixNano())
+	}
+	h.carriedMu.Lock()
+	defer h.carriedMu.Unlock()
+	if h.carriedKey != key {
+		k := *in
+		k.O.Log = h.O.Log // what it logs is the daemon's, once
+		_, h.carriedSpec = k.carriedRelease(name, version, revision)
+		h.carriedKey = key
+	}
+	return h.carriedSpec
+}
+
 // notInstalled reports whether in has no install yet.
 func notInstalled(in *Installer) bool {
 	_, err := os.Stat(filepath.Join(in.O.Dir, envName))
@@ -786,7 +812,7 @@ func (h *Hostd) status(w http.ResponseWriter, r *http.Request) {
 		if st.Previous, err = in.keptPrevious(v, n); err != nil {
 			h.O.logf("status: the previous release is not known: %v", err)
 		}
-		if _, s := in.carriedRelease(name, v, n); s != nil {
+		if s := h.installedSpec(in, name, v, n); s != nil {
 			st.Inputs = recordedInputs(s, func(k string) bool { _, ok := env.Get(k); return ok })
 		}
 		st.Installing, st.InstallFailed, _ = in.firstInstall()

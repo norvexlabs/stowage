@@ -90,7 +90,9 @@ var knownHostName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,252}$`)
 // its own: $XDG_STATE_HOME/<name>/known-hosts/<its digest>, written whole, so a run giving the
 // same line meets the same file. alias is the line's host name, which ssh looks the key up by.
 func (o *Options) givenKnownHosts(name, line string) (file, alias string, err error) {
-	if strings.ContainsAny(strings.TrimRight(line, "\n"), "\r\n") {
+	// One line end is taken off, a Windows one (CRLF) too.
+	line = strings.TrimSuffix(strings.TrimSuffix(line, "\n"), "\r")
+	if strings.ContainsAny(line, "\r\n") {
 		return "", "", errors.New("--known-hosts-line: one line")
 	}
 	marker, hosts, key, _, _, err := ssh.ParseKnownHosts([]byte(line))
@@ -368,7 +370,7 @@ func (in *Installer) TakeKitVM(ctx context.Context, t *VMKitTake, stdin io.Reade
 	ctl := in.R.Ctl()
 	o.logf("installing on %s over SSH with %s", l.at(), g.names())
 	if _, err := l.ssh.Run(ctx, Cmd{Args: l.args("sudo", shellQuote(ctl), "install", "--given", "-", "--no-input"), Stdin: bytes.NewReader(raw), Stream: o.Log}); err != nil {
-		return fmt.Errorf("%s: the install over SSH: %w; `%s` tells where it stopped, and `%s vm kit take` again gives the kit again", l.at(), err, l.command("sudo", shellQuote(ctl), "status"), ctl)
+		return fmt.Errorf("%s: the install over SSH: %w; `%s` tells where it stopped, and the same `vm kit take` command, with the same flags, gives the kit again", l.at(), err, l.command("sudo", shellQuote(ctl), "status"))
 	}
 	return nil
 }

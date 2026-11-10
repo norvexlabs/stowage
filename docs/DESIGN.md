@@ -863,16 +863,22 @@ Stowage calls a project's programs: the two never share a reader.
   (`{error, fix}`), which its client takes as a refusal, so a verb over the socket exits 3 on it;
   an error without a fix is a failure. A verb whose job started is past its first change: what
   stops it then is a failure. The boot passes `boot-rollback`'s 3 on (its rollback check said no
-  before anything changed, after the OS fell back), claiming no change itself; any other status
-  of an installer it runs is its failure.
+  before anything changed, after the OS fell back), claiming no change itself, only when no step
+  of the boot before it changed anything (a mark it removed counts; a removal that found none
+  does not); else, and on any other status of an installer it runs, it fails. A refusal the
+  daemon answers carries a fix that is true on the VM: one whose fix names the Docker installer's
+  `--dir` or its kept installer (a dry-run rollback's, a kept installer that is not the release
+  the install runs) is answered as a failure, with no fix — the rollback check's refusal and the
+  shape-neutral ones (a registry's, a restore's) keep theirs.
 - **`vm seed --json`** — a VM's first-boot material without creating the VM, for a tool that
   creates it with its own means: `{format, platform, user_data, known_hosts_line, fingerprint,
-  host_key_private, disk: {<platform>: {format, image}}}` — the user-data for `--platform` (the
+  host_key_private, disk: {<platform>: {format, image}}, waiting: [<key>]}` — the user-data for `--platform` (the
   cloud-config; never a secret input — those go after the boot, `install --given -` over SSH: a
   secret input or TLS material given to the seed is refused), the one-time host key (its
   `known_hosts` line under the name `vm-seed-host-key`, its fingerprint and its private key, which
-  the caller keeps secret until it retires), and the disk image by digest of each platform the
-  registry holds a disk for. It never asks: `vm create`'s machine flags, the front's, `--set`,
+  the caller keeps secret until it retires), the disk image by digest of each platform the
+  registry holds a disk for, and `waiting`: the sorted keys of the required secret inputs nothing
+  gives, which the first install waits for (never a value; omitted when none). It never asks: `vm create`'s machine flags, the front's, `--set`,
   `--answers` and `--channel` (the channel the first install follows) give it all. It is the seed
   `vm create --create manual` writes, built by the same steps (the registry and disk set, the
   machine, the settings, the user-data). The `vm` verbs that reach a VM over SSH (`vm kit`, `vm

@@ -977,7 +977,7 @@ func vmCreateCommand(in *Installer, o *Options, prepare func() error, terminal f
 		},
 	}
 	f := create.Flags()
-	machineFlags(f, &c, in.R.Spec)
+	machineFlags(f, &c, in.R.Spec, false)
 	f.StringVar(&c.Out, "out", ".", "the directory the disk image and the cloud-config are written to")
 	f.StringVar(&secretsFile, "secrets", "", "the install's secrets, the file `secrets export` wrote, decrypted: the first install waits for them, given over SSH, never in the cloud-config (refused with a secret input or TLS material)")
 	tlsVM := "how the VM's front serves: none a VM can take (" + name + " offers " + strings.Join(in.R.Spec.Front.TLSModes, ", ") + ")"
@@ -1093,7 +1093,7 @@ func vmCreateCommand(in *Installer, o *Options, prepare func() error, terminal f
 		},
 	}
 	sf := seed.Flags()
-	machineFlags(sf, &sc, in.R.Spec)
+	machineFlags(sf, &sc, in.R.Spec, true)
 	sf.StringVar(&seedChannel, "channel", "", "the channel the VM's updates and upgrades follow (default: the release's, "+m.Channel+")")
 	sf.StringVar(&o.TLS, "tls", "", "how the VM's front serves: a mode the release offers a VM, never byo (its certificate goes over SSH, `install --given -`)")
 	sf.StringSliceVar(domains, "domains", nil, "a route's domain, route=host: HTTPS")
@@ -1116,13 +1116,18 @@ func vmCreateCommand(in *Installer, o *Options, prepare func() error, terminal f
 }
 
 // machineFlags are the flags giving a VM's platform and machine, which `vm create` and `vm seed`
-// take into c: s is the release's spec.
-func machineFlags(f *pflag.FlagSet, c *VMCreate, s *spec.Spec) {
+// take into c: s is the release's spec. seed: `vm seed`'s, which never asks, so --platform (and
+// metal's --device) is required there; `vm create` asks them on a terminal.
+func machineFlags(f *pflag.FlagSet, c *VMCreate, s *spec.Spec, seed bool) {
 	var keys []string
 	for _, p := range Platforms {
 		keys = append(keys, p.Key)
 	}
-	f.StringVar(&c.Platform, "platform", "", "where the VM runs: "+strings.Join(keys, ", ")+" (it decides the disk format and how the cloud-config reaches the VM)")
+	asked, device := "; asked on a terminal", "; asked on a terminal"
+	if seed {
+		asked, device = "; required", "; required with metal"
+	}
+	f.StringVar(&c.Platform, "platform", "", "where the VM runs: "+strings.Join(keys, ", ")+" (it decides the disk format and how the cloud-config reaches the VM)"+asked)
 	f.StringVar(&c.Hostname, "hostname", "", "the VM's host name (default: "+s.Name+")")
 	f.StringVar(&c.User, "user", "", "its administrator, in the admin group, who logs in over SSH (default: your user name, else sysadmin)")
 	f.StringVar(&c.SSHKey, "ssh-key", "", "the administrator's SSH public key file (default: ~/.ssh/id_ed25519.pub, id_ecdsa.pub or id_rsa.pub)")
@@ -1138,7 +1143,7 @@ func machineFlags(f *pflag.FlagSet, c *VMCreate, s *spec.Spec) {
 	f.StringSliceVar(&c.SSHAllow, "ssh-allow", nil, "the sources SSH accepts, CIDR (repeatable, or comma-separated; default: every source)")
 	f.StringVar(&c.Timezone, "timezone", "", "the VM's time zone, an IANA name such as Europe/Paris (default UTC)")
 	f.StringArrayVar(&c.Interfaces, "interface", nil, "a NIC the release names (host.interfaces), ROLE=SPEC (repeatable): a secondary's dhcp, static,address=A/P or none (the default), then mac= (default: generated on a hypervisor; a server's own on metal) and attach= (the hypervisor's network or bridge; default the primary's)")
-	f.StringVar(&c.Device, "device", "", "metal: the disk the OS installs on, wiped — a path under /dev/ (a /dev/disk/by-id/ one names it whatever the boot order), or auto (the largest disk); asked on a terminal")
+	f.StringVar(&c.Device, "device", "", "metal: the disk the OS installs on, wiped — a path under /dev/ (a /dev/disk/by-id/ one names it whatever the boot order), or auto (the largest disk)"+device)
 }
 
 // downloadProgress reports a download to w at every tenth of it.

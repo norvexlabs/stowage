@@ -291,7 +291,8 @@ func TestVMKitTakeFailureNamesTheLink(t *testing.T) {
 	err = runVMKit(t, in, bytes.NewReader(sealed), "take", "notes-1", "-", "--no-input", "--user", "ops")
 	if err == nil || !strings.Contains(err.Error(), "`ssh -o HostKeyAlias=notes-1 -o ConnectTimeout=10 -o StrictHostKeyChecking=yes -o ") ||
 		!strings.Contains(err.Error(), " -o GlobalKnownHostsFile=/dev/null -o HashKnownHosts=no ops@notes-1 -- sudo notes-stow status` tells where it stopped") ||
-		strings.Contains(err.Error(), "BatchMode") || strings.Contains(err.Error(), "-o -o") {
+		strings.Contains(err.Error(), "BatchMode") || strings.Contains(err.Error(), "-o -o") ||
+		!strings.HasSuffix(err.Error(), "and the same `vm kit take` command, with the same flags, gives the kit again") {
 		t.Errorf("err = %v", err)
 	}
 }

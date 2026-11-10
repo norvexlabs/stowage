@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"slices"
+	"strings"
 
 	"github.com/norvexlabs/stowage/internal/lint"
 )
@@ -25,6 +26,9 @@ type VMSeed struct {
 	HostKeyPrivate string `json:"host_key_private"`
 	// Disk is, per platform the registry holds a disk for, the disk image that platform boots.
 	Disk map[string]SeedDisk `json:"disk"`
+	// Waiting are the keys of the required secret inputs nothing gives, sorted (never a value):
+	// the VM's first install waits for them, given over SSH once the VM answers. Empty: omitted.
+	Waiting []string `json:"waiting,omitempty"`
 }
 
 // SeedDisk is a disk image: its format, and its reference by digest.
@@ -44,6 +48,18 @@ func (in *Installer) SeedVM(ctx context.Context, c *VMCreate, channel string) (*
 	if err := in.seedable(); err != nil {
 		return nil, err
 	}
+	// The flags' own refusals come before the registry is read; which platforms its disks serve
+	// is checked after (platform).
+	var keys []string
+	for _, pl := range Platforms {
+		keys = append(keys, pl.Key)
+	}
+	switch {
+	case c.Platform == "":
+		return nil, fmt.Errorf("--platform is required (%s)", strings.Join(keys, ", "))
+	case !slices.Contains(keys, c.Platform):
+		return nil, fmt.Errorf("--platform %s: one of %s", c.Platform, strings.Join(keys, ", "))
+	}
 	prefix, cl, err := in.seedRegistry(ctx)
 	if err != nil {
 		return nil, err
@@ -52,7 +68,7 @@ func (in *Installer) SeedVM(ctx context.Context, c *VMCreate, channel string) (*
 	if err != nil {
 		return nil, err
 	}
-	mach, st, _, given, ca, err := in.seedSettings(ctx, c, p, prefix)
+	mach, st, waiting, given, ca, err := in.seedSettings(ctx, c, p, prefix)
 	if err != nil {
 		return nil, err
 	}
@@ -68,7 +84,7 @@ func (in *Installer) SeedVM(ctx context.Context, c *VMCreate, channel string) (*
 		return nil, err
 	}
 	s := &VMSeed{Format: MachineFormat, Platform: p.Key, UserData: string(userData), KnownHostsLine: seedHostAlias + " " + key.Public,
-		Fingerprint: key.Fingerprint, HostKeyPrivate: string(key.Private), Disk: map[string]SeedDisk{}}
+		Fingerprint: key.Fingerprint, HostKeyPrivate: string(key.Private), Disk: map[string]SeedDisk{}, Waiting: slices.Sorted(slices.Values(waiting))}
 	for _, pl := range Platforms {
 		i := slices.IndexFunc(pl.Formats, func(f string) bool { _, ok := in.boot.osMiB[f]; return ok })
 		if i < 0 {

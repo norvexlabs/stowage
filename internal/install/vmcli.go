@@ -86,6 +86,23 @@ func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(
 		cmd.Flags().BoolVar(&resultJSON, "json", false, "print the run's result as one JSON object at its end, for a program; what the run prints otherwise goes to standard error")
 	}
 	c := &hostClient{http: socketClient(&socket), out: stdout, clientTimes: times, ctl: r.Ctl()}
+	// vmVerb makes cmd run its PreRunE, then run, and end on c.result: under --json every outcome,
+	// a PreRunE's refusal included, prints one Result. run tells whether there was nothing to do.
+	vmVerb := func(cmd *cobra.Command, run func(ctx context.Context) (nothing bool, err error)) {
+		pre := cmd.PreRunE
+		cmd.PreRunE = nil
+		cmd.RunE = func(cmd *cobra.Command, args []string) error {
+			var nothing bool
+			var err error
+			if pre != nil {
+				err = pre(cmd, args)
+			}
+			if err == nil {
+				nothing, err = run(cmd.Context())
+			}
+			return c.result(cmd.Context(), resultJSON, stderr, err, nothing)
+		}
+	}
 	root := &cobra.Command{
 		Use:           c.ctl,
 		Short:         fmt.Sprintf("Manage %s on this VM (its OS carries %s, revision %d)", name, r.Manifest.ProjectVersion, r.Manifest.Revision),
@@ -437,50 +454,49 @@ func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(
 		Use:   "upgrade",
 		Short: "Write a newer release's OS to the passive slot and reboot into it; the boot upgrades the install (database dumped first)",
 		Args:  cobra.NoArgs,
-		RunE: func(cmd *cobra.Command, _ []string) error {
-			ctx := cmd.Context()
-			out := c.textOut(resultJSON, stderr)
-			var nothing bool
-			err := func() error {
-				u, err := c.updates(ctx, channel, version)
-				if err != nil {
-					return err
-				}
-				printUpdate(out, u)
-				if err := refusedVersion(version, u); err != nil || !u.Available {
-					nothing = err == nil
-					return err
-				}
-				if !yes {
-					p := terminal(accessible)
-					if p == nil {
-						return refuse("give --yes, which upgrades without asking", "no terminal to confirm on: --yes upgrades without asking")
-					}
-					a, err := p.Ask(ctx, Form{Questions: []Question{{
-						Title: fmt.Sprintf("Upgrade to %s and reboot?", u.Target), Key: "--yes", Required: true,
-						Choices: []Choice{{"yes", "Upgrade"}, {"no", "Not now"}},
-					}}})
-					if err != nil {
-						return err
-					}
-					if a["--yes"] != "yes" {
-						return ErrAborted
-					}
-				}
-				reboot := !noReboot
-				req := UpgradeRequest{Channel: channel, Version: version, Confirm: &u.Target, Reboot: &reboot, SkipBackup: skipBackup}
-				var started JobStarted
-				if err := c.do(ctx, http.MethodPost, "/v1/upgrade", req, &started); err != nil {
-					return err
-				}
-				// The job started: the run changed the VM.
-				return changed(c.follow(ctx, stderr, started))
-			}()
-			return c.result(ctx, resultJSON, stderr, err, nothing)
-		},
 	}
 	resultFlag(upgrade)
 	refusesKit(upgrade, fmt.Sprintf("a re-run, `sudo %s install --kit FILE`, gives it to the install", r.Ctl()))
+	vmVerb(upgrade, func(ctx context.Context) (bool, error) {
+		out := c.textOut(resultJSON, stderr)
+		var nothing bool
+		err := func() error {
+			u, err := c.updates(ctx, channel, version)
+			if err != nil {
+				return err
+			}
+			printUpdate(out, u)
+			if err := refusedVersion(version, u); err != nil || !u.Available {
+				nothing = err == nil
+				return err
+			}
+			if !yes {
+				p := terminal(accessible)
+				if p == nil {
+					return refuse("give --yes, which upgrades without asking", "no terminal to confirm on: --yes upgrades without asking")
+				}
+				a, err := p.Ask(ctx, Form{Questions: []Question{{
+					Title: fmt.Sprintf("Upgrade to %s and reboot?", u.Target), Key: "--yes", Required: true,
+					Choices: []Choice{{"yes", "Upgrade"}, {"no", "Not now"}},
+				}}})
+				if err != nil {
+					return err
+				}
+				if a["--yes"] != "yes" {
+					return ErrAborted
+				}
+			}
+			reboot := !noReboot
+			req := UpgradeRequest{Channel: channel, Version: version, Confirm: &u.Target, Reboot: &reboot, SkipBackup: skipBackup}
+			var started JobStarted
+			if err := c.do(ctx, http.MethodPost, "/v1/upgrade", req, &started); err != nil {
+				return err
+			}
+			// The job started: the run changed the VM.
+			return changed(c.follow(ctx, stderr, started))
+		}()
+		return nothing, err
+	})
 	uf := upgrade.Flags()
 	uf.StringVar(&channel, "channel", "", "the channel to upgrade on (default: the install's; before the first install, its settings')")
 	uf.StringVar(&version, "version", "", "this version's latest revision, not the channel's latest release")
@@ -509,41 +525,40 @@ func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(
 		Use:   "rollback",
 		Short: "Go back to the release the last upgrade replaced: reboot into the passive system, which the VM keeps running (refused when the database moved past what that release reads)",
 		Args:  cobra.NoArgs,
-		RunE: func(cmd *cobra.Command, _ []string) error {
-			ctx := cmd.Context()
-			err := func() error {
-				var p RollbackPlan
-				if err := c.do(ctx, http.MethodGet, "/v1/rollback", nil, &p); err != nil {
-					return err
-				}
-				fmt.Fprintf(c.textOut(resultJSON, stderr), "the passive system carries %s %s; the install runs %s\n", name, p.To, p.From)
-				if !yes {
-					t := terminal(accessible)
-					if t == nil {
-						return refuse("give --yes, which goes back without asking", "no terminal to confirm on: --yes goes back without asking")
-					}
-					a, err := t.Ask(ctx, Form{Questions: []Question{{
-						Title: fmt.Sprintf("Go back to %s and reboot?", p.To), Key: "--yes", Required: true,
-						Choices: []Choice{{"yes", "Go back"}, {"no", "Not now"}},
-					}}})
-					if err != nil {
-						return err
-					}
-					if a["--yes"] != "yes" {
-						return ErrAborted
-					}
-				}
-				var started JobStarted
-				if err := c.do(ctx, http.MethodPost, "/v1/rollback", RollbackRequest{Confirm: &p.To}, &started); err != nil {
-					return err
-				}
-				// The job started: the run changed the VM.
-				return changed(c.follow(ctx, stderr, started))
-			}()
-			return c.result(ctx, resultJSON, stderr, err, false)
-		},
 	}
 	resultFlag(rollback)
+	vmVerb(rollback, func(ctx context.Context) (bool, error) {
+		err := func() error {
+			var p RollbackPlan
+			if err := c.do(ctx, http.MethodGet, "/v1/rollback", nil, &p); err != nil {
+				return err
+			}
+			fmt.Fprintf(c.textOut(resultJSON, stderr), "the passive system carries %s %s; the install runs %s\n", name, p.To, p.From)
+			if !yes {
+				t := terminal(accessible)
+				if t == nil {
+					return refuse("give --yes, which goes back without asking", "no terminal to confirm on: --yes goes back without asking")
+				}
+				a, err := t.Ask(ctx, Form{Questions: []Question{{
+					Title: fmt.Sprintf("Go back to %s and reboot?", p.To), Key: "--yes", Required: true,
+					Choices: []Choice{{"yes", "Go back"}, {"no", "Not now"}},
+				}}})
+				if err != nil {
+					return err
+				}
+				if a["--yes"] != "yes" {
+					return ErrAborted
+				}
+			}
+			var started JobStarted
+			if err := c.do(ctx, http.MethodPost, "/v1/rollback", RollbackRequest{Confirm: &p.To}, &started); err != nil {
+				return err
+			}
+			// The job started: the run changed the VM.
+			return changed(c.follow(ctx, stderr, started))
+		}()
+		return false, err
+	})
 	rollback.Flags().BoolVarP(&yes, "yes", "y", false, "go back without asking")
 	rollback.Flags().BoolVar(&accessible, "accessible", false, "confirm with a plain line prompt")
 	var noProvision, newBaseline bool

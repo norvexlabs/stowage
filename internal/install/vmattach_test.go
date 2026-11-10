@@ -304,6 +304,16 @@ func TestVMAttach(t *testing.T) {
 			t.Errorf("power alone %s: %v", acts, err)
 		}
 	}
+	// The command that checks it again carries the host key --known-hosts-line gave, without
+	// which it would not reach the VM.
+	vm(boot("1"), ok, ok)
+	r.tofu.calls, r.tofu.show = nil, `{"resource_changes": [{"address": "terraform_data.power", "change": {"actions": ["create"]}}]}`
+	const line = "vm-seed-host-key ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEAIlrmYko7n75rw1in9PSsqvQQwoVBxv2WjCA2q6yuS"
+	withLine := *a
+	withLine.KnownHostsLine = line
+	if err := in.AttachVM(ctx, &withLine); err == nil || !strings.Contains(err.Error(), "--ssh-key "+v.key+" --known-hosts-line '"+line+"' --wait 2s` again checks it") || !noApply() || !unchanged() {
+		t.Errorf("with --known-hosts-line: %v", err)
+	}
 	// A plan with changes and no resource changed (outputs): nothing applied, the VM rebooted.
 	vm(boot("1"), ok, ok, ok)
 	r.tofu.calls, r.tofu.show = nil, `{"resource_changes": [{"address": "truenas_zvol.disk", "change": {"actions": ["no-op"]}}]}`

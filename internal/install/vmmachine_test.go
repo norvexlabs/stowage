@@ -69,6 +69,21 @@ func TestTheBootPassesBootRollbacksRefusalOn(t *testing.T) {
 			t.Errorf("%d: %v", code, err)
 		}
 	}
+	// A step before it removed a mark (an upgrade's, a stale new-baseline's): the boot changed
+	// something, so the refusal is its failure; a removal that found nothing changed nothing.
+	for name, mark := range map[string]func(dir string) string{"os-upgrade": osUpgradeFile, "new-baseline": newBaselineFile} {
+		e, _, _ := upgradedVM(t)
+		e.r, e.self = bundledInstaller(t, "1.0.0", 1, nil)
+		in := e.installer(vm)
+		if err := os.WriteFile(mark(in.O.Dir), []byte("notes-9.9.9-1\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		in.O.Exec = func(context.Context, string, []string) error { return ExitCode(3) }
+		err := in.Boot(context.Background())
+		if err == nil || errors.As(err, new(ExitCode)) || isRefused(err) || !strings.Contains(err.Error(), "exited with status 3") || fileExists(mark(in.O.Dir)) {
+			t.Errorf("%s: %#v", name, err)
+		}
+	}
 }
 
 // The VM's `status --json` carries the machine interface's names: the format, the release
@@ -196,6 +211,10 @@ func TestVMVerbsJSONResults(t *testing.T) {
 		"upgrade without a terminal or --yes": {[]string{"upgrade"}, map[string]http.HandlerFunc{
 			"GET /v1/updates": func(w http.ResponseWriter, _ *http.Request) { reply(w, 200, avail) },
 		}, ResultNothing, "give --yes, which upgrades without asking", true, true},
+		"upgrade --kit refused before it runs": {[]string{"upgrade", "--yes", "--kit", "k.kit"}, nil,
+			ResultNothing, "a re-run, `sudo notes-stow install --kit FILE`, gives it to the install", true, true},
+		"upgrade --given refused before it runs": {[]string{"upgrade", "--yes", "--given", "g.yaml"}, nil,
+			ResultNothing, "a re-run, `sudo notes-stow install --kit FILE`, gives it to the install", true, true},
 		"upgrade refused by the daemon": {[]string{"upgrade", "--yes"}, map[string]http.HandlerFunc{
 			"GET /v1/updates": func(w http.ResponseWriter, _ *http.Request) { reply(w, 200, avail) }, "POST /v1/upgrade": refused,
 		}, ResultNothing, "choose another release", true, true},
@@ -408,13 +427,34 @@ func TestVMSeed(t *testing.T) {
 	if _, err := seed(func(o *Options) { o.Set["ACCESS_TOKEN"] = "tok-not-to-be-printed" }, ""); err == nil || strings.Contains(err.Error(), "tok-not") {
 		t.Errorf("%v", err)
 	}
-	// A bad channel, and no platform: refused before the registry is read.
-	if _, err := seed(nil, "Bad Channel"); err == nil || !strings.Contains(err.Error(), "is not a channel name") {
+	// A bad channel, no platform, or one no Stowage knows: refused before the registry is read
+	// (a --registry that does not parse would be refused first).
+	unread := func(o *Options) { o.Registry = "not a registry" }
+	if _, err := seed(unread, "Bad Channel"); err == nil || !strings.Contains(err.Error(), "is not a channel name") {
 		t.Errorf("%v", err)
 	}
-	in := v.installer(nil)
-	if _, err := in.SeedVM(context.Background(), &VMCreate{Hostname: "notes-1", SSHKey: v.key}, ""); err == nil || !strings.Contains(err.Error(), "--platform is required") {
-		t.Errorf("%v", err)
+	if _, err := seed(unread, ""); err != nil && !strings.Contains(err.Error(), "--registry") {
+		t.Fatalf("the positive control: %v", err)
+	}
+	for platform, want := range map[string]string{"": "--platform is required (truenas, ", "nowhere": "--platform nowhere: one of truenas, "} {
+		in := v.installer(unread)
+		if _, err := in.SeedVM(context.Background(), &VMCreate{Platform: platform, Hostname: "notes-1", SSHKey: v.key}, ""); err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("%q: %v", platform, err)
+		}
+	}
+
+	// No required secret input nothing gives: no waiting (the field left out).
+	if s.Waiting != nil || strings.Contains(string(raw), `"waiting"`) {
+		t.Errorf("waiting %v:\n%s", s.Waiting, raw)
+	}
+	// Required secret inputs nothing gives: their keys, sorted, never a value.
+	v.r.Spec.Inputs = append(v.r.Spec.Inputs, spec.Input{Key: "ZONE_KEY", Secret: true, Required: true}, spec.Input{Key: "API_KEY", Secret: true, Required: true})
+	s, err = seed(nil, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if raw, _ := json.Marshal(s); !slices.Equal(s.Waiting, []string{"API_KEY", "ZONE_KEY"}) || !strings.Contains(string(raw), `"waiting":["API_KEY","ZONE_KEY"]`) {
+		t.Errorf("waiting %v:\n%s", s.Waiting, raw)
 	}
 }
 
@@ -443,6 +483,16 @@ func TestVMSeedCommand(t *testing.T) {
 	c := vmCreateCommand(in, &o, prepare, func(bool) Prompter { return nil }, &sets, &setFiles, &domains, &answers, &noInput, &accessible, &takesTLS)
 	c.SetOut(io.Discard)
 	c.SetErr(io.Discard)
+	// The machine flags' help is true of each command: vm seed never asks.
+	for verb, want := range map[string]string{"seed": "; required", "create": "; asked on a terminal"} {
+		sub, _, err := c.Find([]string{verb})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if p, d := sub.Flags().Lookup("platform").Usage, sub.Flags().Lookup("device").Usage; !strings.HasSuffix(p, want) || !strings.HasSuffix(d, map[string]string{"seed": "; required with metal", "create": want}[verb]) {
+			t.Errorf("%s: %q, %q", verb, p, d)
+		}
+	}
 	c.SetArgs([]string{"seed", "--platform", "truenas", "--ssh-key", v.key})
 	if err := c.Execute(); err == nil || !strings.Contains(err.Error(), "json") {
 		t.Errorf("without --json: %v", err)
@@ -492,9 +542,14 @@ func TestKnownHostsLine(t *testing.T) {
 	if l2, err := in.link(VMReach{Host: "notes-1", KnownHostsLine: "vm-seed-host-key " + key}); err != nil || l2.known != l.known {
 		t.Errorf("%v %s", err, l2.known)
 	}
+	// A line ending CRLF (a file saved on Windows) is the same line.
+	if l3, err := in.link(VMReach{Host: "notes-1", KnownHostsLine: "vm-seed-host-key " + key + "\r\n"}); err != nil || l3.known != l.known {
+		t.Errorf("CRLF: %v", err)
+	}
 	for line, want := range map[string]string{
 		"": "the VM's host key is not known",
 		"vm-seed-host-key " + key + "\nother " + key: "one line",
+		"vm-seed-host-key " + key + "\r\r\n":         "one line",
 		"@cert-authority * " + key:                   "not a @cert-authority line",
 		"@revoked vm " + key:                         "not a @revoked line",
 		"* " + key:                                   "not one host name",
@@ -507,5 +562,95 @@ func TestKnownHostsLine(t *testing.T) {
 		if _, err := in.link(VMReach{Host: "notes-1", KnownHostsLine: line}); err == nil || !strings.Contains(err.Error(), want) {
 			t.Errorf("%q: %v, want %q", line, err, want)
 		}
+	}
+}
+
+// A refusal whose fix names the Docker installer's --dir or its kept installer reaches the VM's
+// client as a failure, with no fix: the VM has neither.
+func TestTheDaemonAnswersNoDockerFix(t *testing.T) {
+	t.Parallel()
+	// A rollback the dry run refuses as another project's install.
+	e, d, _ := upgradedVM(t)
+	env := e.readEnv()
+	env.Set("STOWAGE_NAME", "other")
+	if err := env.WriteFile(filepath.Join(e.dir, envName)); err != nil {
+		t.Fatal(err)
+	}
+	var got errOf
+	if code := call(t, d.Handler(), "GET", "/v1/rollback", nil, &got); code != 409 || !strings.Contains(got.Error, `holds an install of "other"`) || got.Fix != "" {
+		t.Errorf("rollback: %d %+v", code, got)
+	}
+	// An upgrade after a crossing whose boot fell back, whose kept installer is not the release
+	// the install runs.
+	p := vmPublished(t, spec.Provider{Name: "none"}, nil)
+	env = p.env.readEnv()
+	env.Set("STOWAGE_PROJECT_VERSION", "2.0.0")
+	if err := env.WriteFile(filepath.Join(p.env.dir, envName)); err != nil {
+		t.Fatal(err)
+	}
+	p.releaseOf("2.1.0", func(*spec.Spec) {})
+	host := &fakeHost{}
+	got = errOf{}
+	if code := call(t, daemon(p.env, host).Handler(), "POST", "/v1/upgrade", UpgradeRequest{Channel: "stable"}, &got); code != 409 || !strings.Contains(got.Error, "is not the installer of notes 2.0.0") || got.Fix != "" {
+		t.Errorf("upgrade: %d %+v", code, got)
+	}
+	if len(host.calls()) > 0 {
+		t.Errorf("ran %v", host.calls())
+	}
+}
+
+// status reads the installer the install keeps once per release and file: a request after it
+// reads nothing (a file changed in place but alike in size and time is not read again), and a
+// file changed is read again.
+func TestVMStatusReadsTheKeptInstallerOnce(t *testing.T) {
+	t.Parallel()
+	e := vmEnv(t, "1.0.0")
+	if err := e.install(vm); err != nil {
+		t.Fatalf("%v\n%s", err, e.log)
+	}
+	e.r, e.self = bundledInstaller(t, "2.0.0", 1, nil) // the OS carries another release
+	var log bytes.Buffer
+	d := daemon(e, &fakeHost{})
+	d.O.Log = &log
+	h := d.Handler()
+	inputs := func() []string {
+		t.Helper()
+		var st Status
+		if code := call(t, h, "GET", "/v1/status", nil, &st); code != 200 {
+			t.Fatalf("%d", code)
+		}
+		if st.Inputs == nil {
+			return nil
+		}
+		return *st.Inputs
+	}
+	if got := inputs(); !slices.Equal(got, []string{"ADMIN_EMAIL"}) {
+		t.Fatalf("%v", got)
+	}
+	kept := filepath.Join(e.dir, "notes-stow")
+	fi, err := os.Stat(kept)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(kept, bytes.Repeat([]byte("x"), int(fi.Size())), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(kept, fi.ModTime(), fi.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+	if got := inputs(); !slices.Equal(got, []string{"ADMIN_EMAIL"}) || log.Len() != 0 {
+		t.Errorf("read again: %v\n%s", got, log.String())
+	}
+	// Changed: read again, its error logged in the daemon's log once.
+	if err := os.Chtimes(kept, fi.ModTime().Add(time.Second), fi.ModTime().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		if got := inputs(); got != nil {
+			t.Errorf("%v", got)
+		}
+	}
+	if n := strings.Count(log.String(), "the installer the install keeps"); n != 1 {
+		t.Errorf("logged %d times:\n%s", n, log.String())
 	}
 }

@@ -158,23 +158,25 @@ func newBaselineFile(dir string) string { return filepath.Clean(dir) + ".new-bas
 // baseline. A mark naming another release is removed: its OS is not the one booted (the write
 // failed, or the health gate went back), so no later boot of that release acts on it unasked. One
 // naming this release stays until the crossing is made (crossed): a boot whose crossing failed
-// tries it again, as the operator cannot ask it again from this OS.
-func (in *Installer) crossingAsked() (bool, error) {
+// tries it again, as the operator cannot ask it again from this OS. removed tells whether a mark
+// was removed.
+func (in *Installer) crossingAsked() (asked, removed bool, err error) {
 	mark := newBaselineFile(in.O.Dir)
 	raw, err := os.ReadFile(mark)
 	if errors.Is(err, os.ErrNotExist) {
-		return false, nil
+		return false, false, nil
 	}
 	if err != nil {
-		return false, err
+		return false, false, err
 	}
 	if tag := strings.TrimSpace(string(raw)); tag != "" && tag == in.R.Manifest.Tag {
-		return true, nil
+		return true, false, nil
 	}
 	if err := os.Remove(mark); err != nil {
 		in.O.logf("warning: removing %s: %v", mark, err)
+		return false, false, nil
 	}
-	return false, nil
+	return false, true, nil
 }
 
 // fellBackFromCrossing reports whether the install's release, version at revision, is one a
@@ -537,22 +539,27 @@ func (in *Installer) firstBoot(ctx context.Context, path string) error {
 // never takes the same branch again.
 func (in *Installer) Boot(ctx context.Context) (err error) {
 	// A boot may change the install from its first step (a first boot's, an upgrade's, a
-	// rollback's): a refusal it raises is a failure.
-	mutated := true
+	// rollback's): a refusal it raises is a failure. touched: a step before boot-rollback removed
+	// a mark (a removal that found none changed nothing).
+	mutated, touched := true, false
 	defer afterChange(&mutated, &err)
 	o := &in.O
 	if _, err := os.Stat(filepath.Join(o.Dir, envName)); errors.Is(err, os.ErrNotExist) {
 		return in.firstBoot(ctx, cmp.Or(o.Settings, SettingsFile(in.R.Spec.Name)))
 	}
 	// An install exists: the mark of an upgrade before it says nothing of a later first install.
-	if err := os.Remove(osUpgradeFile(o.Dir)); err != nil && !errors.Is(err, os.ErrNotExist) {
+	switch err := os.Remove(osUpgradeFile(o.Dir)); {
+	case err == nil:
+		touched = true
+	case !errors.Is(err, os.ErrNotExist):
 		o.logf("warning: removing %s: %v", osUpgradeFile(o.Dir), err)
 	}
 	// A mark of another release goes whichever way the boot goes.
-	asked, err := in.crossingAsked()
+	asked, removed, err := in.crossingAsked()
 	if err != nil {
 		return err
 	}
+	touched = touched || removed
 	env, err := in.open()
 	if err != nil {
 		return err
@@ -592,9 +599,9 @@ func (in *Installer) Boot(ctx context.Context) (err error) {
 		o.logf("this OS carries %s %s (revision %d), which the install's last upgrade replaced: going back to it", name, m.ProjectVersion, m.Revision)
 		err := o.exec(ctx, in.ctl(), []string{bootRollbackCmd, "--dir", o.Dir})
 		// Its refusal (exit 3: its rollback check said no before it changed anything) is the
-		// boot's, which changed nothing either: a stopped run finished above leaves no previous
-		// release kept, so it never comes here.
-		if code, ok := errors.AsType[ExitCode](err); ok && code == ExitRefused {
+		// boot's when no step before it changed anything either (touched); else a failure. A
+		// stopped run finished above leaves no previous release kept, so it never comes here.
+		if code, ok := errors.AsType[ExitCode](err); ok && code == ExitRefused && !touched {
 			mutated = false
 			return err
 		}

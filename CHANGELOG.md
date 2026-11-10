@@ -24,10 +24,11 @@ follow [SemVer](https://semver.org/).
   `format`, `previous` (the release `rollback` goes back to) and `inputs` (the recorded input
   names, never a value); `install`, `upgrade` and `rollback` take `--json`, and every verb exits 3
   on a refusal, the host daemon's included (its error answer now carries the fix). A boot whose
-  rollback check refuses after the OS fell back exits 3, having changed nothing.
+  rollback check refuses after the OS fell back exits 3 when it changed nothing before it, else 1.
 - `vm seed --json`: a new VM's first-boot material for a tool that creates the VM itself — the
   cloud-config (no secret input), a one-time SSH host key with its `known_hosts` line and
-  fingerprint, and the disk image each platform boots, by digest; it never asks.
+  fingerprint, the disk image each platform boots, by digest, and the secret inputs the first
+  install waits for (`waiting`, names only); it never asks.
 - `--known-hosts-line LINE` on `vm kit` and `vm attach`: the VM's host key given as one
   `known_hosts` line, checked strictly, for a VM `vm create` did not make.
 

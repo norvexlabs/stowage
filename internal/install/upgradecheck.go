@@ -73,7 +73,9 @@ func (h *Hostd) checkUpgrade(ctx context.Context, in *Installer, env *EnvFile, m
 	if this := in.R.Manifest; v != this.ProjectVersion || rev != strconv.Itoa(this.Revision) {
 		kept, err := in.keptInstaller(ctx, name, v, rev)
 		if err != nil {
-			return failAs(http.StatusConflict, err)
+			// Its refusal's fix runs an installer with --dir, which the VM has neither of: a
+			// failure, with no fix.
+			return fail(http.StatusConflict, "%v", err)
 		}
 		running = kept
 	}
