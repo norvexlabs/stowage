@@ -15,7 +15,8 @@
 # 1.0.1` (nothing dumped) → rollback (no schema check) → reset-db is refused: the release has no
 # database → an install of 0.9.0, which the last release's stowage (built from its tag) shipped
 # before 1.0.0, upgrades to 1.0.1 with this one's, and a rollback goes back to it with its own
-# installer.
+# installer → 1.0.2 adds a front terminating the L4 route's TLS alone (no HTTP route, no portal),
+# installed with --tls internal, then re-run with --tls byo, its CA published into a volume.
 set -euo pipefail
 . "$(dirname "$0")/lib.sh"
 
@@ -178,5 +179,70 @@ cp "$D/lookup-stow" "$WORK/lookup-stow-0.9.0"
 grep -qF "starting lookup 0.9.0 (revision 1) with its own installer: $D/lookup-stow --dir $D --no-input --no-provision" "$WORK/rollback-0.9.0.log" ||
 	{ cat "$WORK/rollback-0.9.0.log"; fail "the rollback did not start 0.9.0 with its own installer"; }
 cmp -s "$D/lookup-stow" "$WORK/lookup-stow-0.9.0" || fail "the install does not keep 0.9.0's installer, which stowage $OLDV built"
+
+
+step "a front terminating TLS for the L4 route alone (no HTTP route, no portal): internal, then byo, its CA published"
+remove_install
+D=$WORK/stowage-e2e-install-tls # removed at exit in its turn
+CTL=("${OPERATOR[@]}" "$D/lookup-stow")
+python3 - "$P/stowage.yaml" "$P/deploy/compose.yaml" "$P/CHANGELOG.md" <<'PY2'
+import sys
+spec, compose, changelog = sys.argv[1:]
+for path, edits in [
+    (spec, [
+        ("upstream: server:8080 }", "upstream: server:8080, tls: { domain_input: LOOKUP_DOMAIN } }"),
+        ("\nhealth:\n", "\nfront:\n  tls_modes: [internal, byo, acme, dns-cloudflare]\n  publish_ca: { volume: ca }\n\nhealth:\n"),
+    ]),
+    (compose, [
+        ("      - state:/state\n", "      - state:/state\n      - ca:/ca:ro\n"),
+        ("  state: {}\n", "  state: {}\n  ca: {}\n"),
+    ]),
+    (changelog, [("## [1.0.1]", "## [1.0.2]\n\n### Changed\n- The front terminates the route's TLS.\n\n## [1.0.1]")]),
+]:
+    s = open(path).read()
+    for old, new in edits:
+        assert s.count(old) == 1, old
+        s = s.replace(old, new)
+    open(path, "w").write(s)
+PY2
+"${S[@]}" lint || fail "an L4 route's TLS as the front's only work is refused"
+"${S[@]}" ship --channel stable 2>"$WORK/ship-1.0.2.log" || { cat "$WORK/ship-1.0.2.log"; fail "ship 1.0.2"; }
+login_pull
+docker run --rm --pull always "$REG/notes/lookup-installer:latest" >"$WORK/lookup-tls.sh" || fail "docker run of the 1.0.2 installer image"
+unset DOCKER_CONFIG # the installer's environment never has it (OPERATOR)
+# Three distinct ports: free_port releases the one it found, and the L4 route's is free again.
+HTTP_PORT=$(free_port)
+while [[ $HTTP_PORT == "$PORT" ]]; do HTTP_PORT=$(free_port); done
+HTTPS_PORT=$(free_port)
+while [[ $HTTPS_PORT == "$PORT" || $HTTPS_PORT == "$HTTP_PORT" ]]; do HTTPS_PORT=$(free_port); done
+(cd "$WORK" && "${OPERATOR[@]}" sh lookup-tls.sh --no-input --dir "$D" --set GREETING=secure --tls internal \
+	--domains lookup=lookup.test --http-port "$HTTP_PORT" --https-port "$HTTPS_PORT") >"$WORK/install-tls.log" 2>&1 ||
+	{ cat "$WORK/install-tls.log"; fail "install 1.0.2 with --tls internal"; }
+# Hints (tuning, timers) may follow the line.
+grep -qx "lookup 1.0.2 is running" "$WORK/install-tls.log" || { cat "$WORK/install-tls.log"; fail "the install without a portal does not end as a project without a front does"; }
+grep -q "L4 route lookup: tcp/$PORT .*lookup.test" "$WORK/install-tls.log" || { cat "$WORK/install-tls.log"; fail "the install does not name the L4 route and its domain"; }
+# tls_get CA: the page through the front's TLS on the L4 port, trusting CA alone; HTTP/1.1, as
+# the front's TLS on an L4 route would take h2 for a stream the upstream reads as HTTP/1.
+tls_get() { curl -sf --http1.1 --max-time 10 --cacert "$1" --resolve "lookup.test:$PORT:127.0.0.1" "https://lookup.test:$PORT/"; }
+# tls_why CA: what curl saw, for a failure.
+tls_why() { curl -sv --http1.1 --max-time 10 --cacert "$1" --resolve "lookup.test:$PORT:127.0.0.1" "https://lookup.test:$PORT/" 2>&1 | tail -20 >&2 || true; }
+published_ca() { docker exec "$(server)" cat /ca/ca.crt; }
+for _ in $(seq 30); do published_ca >"$WORK/internal-ca.crt" 2>/dev/null && break; sleep 1; done
+[[ -s $WORK/internal-ca.crt ]] || { stack_logs >&2; fail "the front did not publish its local CA into the ca volume"; }
+[[ $(tls_get "$WORK/internal-ca.crt") == secure ]] || { stack_logs >&2; tls_why "$WORK/internal-ca.crt"; fail "the L4 route does not serve over the front's TLS, chained to the published local CA"; }
+! curl -sf --max-time 5 "http://127.0.0.1:$PORT/" >/dev/null || fail "the L4 route answers in the clear"
+# byo: a CA of the test's own and its certificate for the domain.
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 2 -subj /CN=lookup-e2e-ca \
+	-keyout "$WORK/byo-ca.key" -out "$WORK/byo-ca.crt" 2>/dev/null || fail "a byo CA"
+openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -subj /CN=lookup.test -keyout "$WORK/byo.key" -out "$WORK/byo.csr" 2>/dev/null &&
+	openssl x509 -req -in "$WORK/byo.csr" -CA "$WORK/byo-ca.crt" -CAkey "$WORK/byo-ca.key" -days 2 \
+		-extfile <(printf 'subjectAltName=DNS:lookup.test') -out "$WORK/byo.crt" 2>/dev/null || fail "a byo certificate"
+"${CTL[@]}" --dir "$D" --no-input --tls byo --cert "$WORK/byo.crt" --key "$WORK/byo.key" --ca "$WORK/byo-ca.crt" >"$WORK/rerun-byo.log" 2>&1 ||
+	{ cat "$WORK/rerun-byo.log"; fail "re-run with --tls byo"; }
+grep -qx "lookup 1.0.2 is running" "$WORK/rerun-byo.log" || { cat "$WORK/rerun-byo.log"; fail "the byo re-run does not end as a project without a front does"; }
+[[ $(tls_get "$WORK/byo-ca.crt") == secure ]] || { stack_logs >&2; tls_why "$WORK/byo-ca.crt"; fail "the L4 route does not serve the byo certificate"; }
+# The front copies its CA in the background once Caddy runs: the internal root may still be there.
+for _ in $(seq 30); do cmp -s <(published_ca 2>/dev/null) "$WORK/byo-ca.crt" && break; sleep 1; done
+cmp -s <(published_ca) "$WORK/byo-ca.crt" || fail "the front did not publish the byo CA"
 
 echo PASS

@@ -764,6 +764,40 @@ func TestVolumeUIDBounds(t *testing.T) {
 	}
 }
 
+// A front terminating TLS for L4 routes alone needs no HTTP route and no portal; without an L4
+// route with tls, an empty front.routes is refused, and a front with routes needs a portal naming one.
+func TestFrontOfL4TLSRoutesAlone(t *testing.T) {
+	t.Parallel()
+	const front = "\nfront:\n  tls_modes: [internal, byo, acme, dns-cloudflare]\n  publish_ca: { volume: state }\n\nhealth:\n"
+	const route = "{ name: lookup, protocol: tcp, port: 8090, upstream: server:8080 }"
+	const tlsRoute = "{ name: lookup, protocol: tcp, port: 8090, upstream: server:8080, tls: { domain_input: LOOKUP_DOMAIN } }"
+	for _, c := range []struct {
+		name, route, portal string
+		want                []string
+	}{
+		{"l4 tls alone", tlsRoute, "", nil},
+		{"portal naming no route", tlsRoute, "  portal: lookup\n", []string{`front.portal: "lookup" names no route`}},
+		{"no l4 tls", route, "", []string{"front.routes: at least one route is required", `front.portal: "" names no route`}},
+		// A front with HTTP routes keeps its portal, L4 routes with tls or not.
+		{"no portal beside routes", tlsRoute, "  routes: [{ name: web, domain_input: WEB_DOMAIN, upstream: server:8080 }]\n", []string{`front.portal: "" names no route`}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			root := testutil.CopyExample(t, "stateless")
+			testutil.Edit(t, root, specFile, route, c.route)
+			testutil.Edit(t, root, specFile, "\nhealth:\n", strings.Replace(front, "\n\nhealth:", "\n"+c.portal+"\nhealth:", 1))
+			errs := strings.Join(errorsOf(run(t, root)), "\n")
+			if c.want == nil && errs != "" {
+				t.Fatalf("want no error, got:\n%s", errs)
+			}
+			for _, w := range c.want {
+				if !strings.Contains(errs, w) {
+					t.Errorf("no %q in:\n%s", w, errs)
+				}
+			}
+		})
+	}
+}
+
 // Rules about an emptied section, set through the parsed spec so no other text is disturbed.
 func TestEmptySections(t *testing.T) {
 	cases := []struct {
@@ -772,7 +806,9 @@ func TestEmptySections(t *testing.T) {
 		want  string
 	}{
 		{[]string{"images"}, map[string]any{}, "at least one image"},
-		{[]string{"front", "routes"}, []any{}, "at least one route"},
+		// full has an L4 route with tls, so no route is refused for the portal it names alone
+		// (TestFrontOfL4TLSRoutesAlone has the refusal of no route).
+		{[]string{"front", "routes"}, []any{}, `front.portal: "console" names no route`},
 		{[]string{"shapes"}, map[string]any{}, "at least one deploy shape"},
 	}
 	for _, c := range cases {

@@ -81,6 +81,44 @@ func TestL4TLSCaddyfile(t *testing.T) {
 	}
 }
 
+// A front with L4 TLS routes alone: in every TLS mode, each domain is a site answering 404 that
+// makes Caddy obtain its certificate (acme's challenges on the front's ports, dns-cloudflare's
+// through DNS, byo's files loaded), and there is no other site.
+func TestL4TLSFrontWithoutRoutes(t *testing.T) {
+	t.Parallel()
+	f := spec.Front{TLSModes: []string{"acme", "dns-cloudflare", "byo", "internal"}}
+	routes := []spec.L4Route{{Name: "db", Protocol: "tcp", Port: 7443, Upstream: "db:5432", TLS: &spec.L4TLS{DomainInput: "DB_DOMAIN"}}}
+	domains := map[string]string{"db": "db.example.test"}
+	for mode, want := range map[string][]string{
+		"acme":           {"\tcert_issuer acme\n\temail ops@example.test\n", "\ndb.example.test {\n\trespond 404\n}\n"},
+		"dns-cloudflare": {"\tdns cloudflare {env.CLOUDFLARE_API_TOKEN}\n", "\ndb.example.test {\n\trespond 404\n}\n"},
+		"byo":            {"\ndb.example.test {\n\ttls /etc/caddy/" + TLSDir + "/cert.pem /etc/caddy/" + TLSDir + "/key.pem\n\trespond 404\n}\n"},
+		"internal":       {"\tlocal_certs\n", "\ndb.example.test {\n\trespond 404\n}\n"},
+	} {
+		cf := tlsCaddyfile(f, routes, mode, domains, "ops@example.test", "443", false, func(string) string { return "" }, nil)
+		for _, w := range append(want, "\t\t\t\t\t\tdefault_sni db.example.test\n") {
+			if !strings.Contains(cf, w) {
+				t.Errorf("%s: lacks %q:\n%s", mode, w, cf)
+			}
+		}
+		if _, sites, _ := strings.Cut(cf, "\n}\n"); strings.Count(sites, " {\n") != 1 {
+			t.Errorf("%s: want the L4 domain's site alone:\n%s", mode, sites)
+		}
+	}
+}
+
+// An install ends with its portal's URL, and with none for a front of L4 routes alone.
+func TestRunningLine(t *testing.T) {
+	t.Parallel()
+	get := func(k string) string { return "https://" + strings.ToLower(k) + ".test" }
+	if got := runningLine("notes", "1.0.0", portalURL(spec.Front{Portal: "app"}, get)); got != "notes 1.0.0 is running: https://stowage_url_app.test" {
+		t.Errorf("with a portal: %q", got)
+	}
+	if got := runningLine("lookup", "1.0.2", portalURL(spec.Front{TLSModes: []string{"internal"}}, get)); got != "lookup 1.0.2 is running" {
+		t.Errorf("without a portal: %q", got)
+	}
+}
+
 // In loopback mode the front passes such a route in the clear: TLS is what is in front of the
 // install's; one asking for a client certificate refuses everyone, as plain TCP carries none.
 func TestL4TLSLoopbackCaddyfile(t *testing.T) {

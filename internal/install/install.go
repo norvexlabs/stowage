@@ -1450,14 +1450,30 @@ func (in *Installer) up(ctx context.Context, env *EnvFile) (err error) {
 			in.O.logf("L4 route %s: %s/%d %s", r.Name, r.Protocol, r.Port, e)
 		}
 	}
-	if !in.R.Spec.HasFront() {
-		fmt.Fprintf(in.O.Out, "%s %s is running\n", in.R.Spec.Name, in.R.Manifest.ProjectVersion)
-		return nil
+	url := ""
+	if in.R.Spec.HasFront() {
+		in.warnIPv6Allowlists(get, in.frontGateway(ctx, environ))
+		url = portalURL(in.R.Spec.Front, get)
 	}
-	in.warnIPv6Allowlists(get, in.frontGateway(ctx, environ))
-	url, _ := env.Get(spec.URLVar(in.R.Spec.Front.Portal))
-	fmt.Fprintf(in.O.Out, "%s %s is running: %s\n", in.R.Spec.Name, in.R.Manifest.ProjectVersion, url)
+	fmt.Fprintln(in.O.Out, runningLine(in.R.Spec.Name, in.R.Manifest.ProjectVersion, url))
 	return nil
+}
+
+// portalURL is the URL of the front's portal, "" for a front without one (L4 routes alone: the
+// lines naming them are the way in).
+func portalURL(f spec.Front, get func(string) string) string {
+	if f.Portal == "" {
+		return ""
+	}
+	return get(spec.URLVar(f.Portal))
+}
+
+// runningLine is how an install ends: the release running, and its portal's URL when it has one.
+func runningLine(name, version, url string) string {
+	if url == "" {
+		return name + " " + version + " is running"
+	}
+	return name + " " + version + " is running: " + url
 }
 
 // settleUnit paces settle's polls of the stack; settlePolls bounds them. Tests shorten the unit.

@@ -15,6 +15,13 @@ follow [SemVer](https://semver.org/).
   and the opened ports, a routed public IPv4 address, the cloud-config as its cloud-init user
   data). The OS bundle now reads its user data from Scaleway's metadata service.
 
+### Changed
+
+- A front may serve L4 routes alone: with an `l4` route whose TLS the front terminates,
+  `front.routes` and `front.portal` may be left out (lint refused them before). The install then
+  ends naming the L4 routes, with no URL; the routes' certificates are obtained, renewed and
+  published as before, in every TLS mode.
+
 ## [0.32.1] - 2026-11-09
 
 ### Changed

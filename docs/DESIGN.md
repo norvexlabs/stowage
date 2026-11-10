@@ -61,7 +61,7 @@ Full examples: [full](../examples/full/stowage.yaml) (every key),
 | `registry` | prefix, pull credentials (baked into the installer), push auth |
 | `images` | build table: `context`/`dockerfile`/`target`/`args`/`add_hosts`/`network`/`contexts`/`inputs`, or `ref` for a pinned upstream image |
 | `stack.compose` | **the single service definition**, no `build:` (lint-enforced); `extends` within the file, `profiles:` only those an input turns on, no `ports:` of its own nor `network_mode: host` (`services.<name>.host_network` asks for the host's network) on the VM |
-| `front` | optional (absent or empty: no front, the `l4` routes alone); TLS modes offered, hostname (and path prefix) → upstream routes, header stripping, forward auth, a source allowlist, client certificates and a login per route, which route is the portal, the CA published to the stack, the project's default host ports |
+| `front` | optional (absent or empty: no front, the `l4` routes alone); TLS modes offered, hostname (and path prefix) → upstream routes, header stripping, forward auth, a source allowlist, client certificates and a login per route, which route is the portal, the CA published to the stack, the project's default host ports; with an `l4` route the front terminates TLS for, no route and no portal are needed: the front's sites then exist to hold the L4 domains' certificates |
 | `l4` | host ports published to a service as they are (TCP or UDP), beside the front; the input holding the address clients dial; the input holding the sources the VM lets reach it; the advanced input holding the host address the port is bound to; or, with `tls`, a TCP port the front terminates TLS on for a domain, the stream passed on in plaintext |
 | `health` | readiness probe (provider) used by every consumer: compose healthcheck, health gate, install wait |
 | `database` | optional: engine, service, db name, migration and app roles, schema-compat provider; without it, no backup, `data.reset`, `reset-db`, restore or schema check |
@@ -677,7 +677,7 @@ point.
    its log, and a step of the release's own installer image records it in a Secret the release
    owns, through a ServiceAccount that may patch that Secret alone; a failure leaves the release
    running and names `k8s provision`.
-5. **Done** — print the `front.portal` URL and the credentials file path.
+5. **Done** — print the `front.portal` URL and the credentials file path (a front for L4 routes alone has no portal: the L4 routes' lines are the way in).
 6. **Upgrade / rollback** — Docker: the new release's installer runs `upgrade` on the install;
    `<short>-stow upgrade --version V` fetches it first, and a plain `upgrade` by the installer of
    the release the install runs is `upgrade --version` of that version: the kept installer is

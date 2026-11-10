@@ -95,6 +95,21 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
 
 ## Should
 
+- **An L4 route the front terminates TLS on negotiates h2**: the layer4 TLS handler's connection
+  policy accepts the ALPN `h2` a client offers (curl does), though the stream goes to an upstream
+  that never saw that negotiation: an HTTP/1 upstream then breaks an h2 client ("unexpected data
+  while we expected SETTINGS frame"). A non-HTTP client offers no ALPN and is unaffected. Give the
+  route's connection policy an `alpn` of its own (`l4.routes[].tls.alpn`, empty by default: none
+  selected), and check it with `openssl s_client -alpn h2`.
+
+- **ACME proven end to end**: no suite runs an ACME server, so `acme` and `dns-cloudflare` are
+  proven by the Caddyfile they write alone — for the HTTP routes and for a domain the front holds
+  for L4 routes alone (a site answering 404 over HTTPS, its challenges on the front's ports 80
+  and 443, as a route's). Run Pebble (and a DNS stub for `dns-01`) beside a suite, with a
+  test-only way to point the front at its directory and trust its root, and check that a front
+  with L4 TLS routes alone obtains and renews its certificate. The VM runs the Docker install's
+  front, which e2e-stateless proves for such a front in `internal` and `byo`.
+
 - **An L4 route hands its upstream the client's address**: a TCP route's upstream sees the
   connection's source as Docker's NAT or userland proxy leaves it, and a front terminating TLS
   on the route (`l4.routes[].tls`) hides it entirely; an upstream that

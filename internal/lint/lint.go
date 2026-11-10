@@ -1009,8 +1009,10 @@ func (l *linter) front() {
 			l.errf("front.tls_modes", "unknown mode %q (%s)", m, strings.Join(providers.TLSModes, ", "))
 		}
 	}
-	if len(f.Routes) == 0 {
-		l.errf("front.routes", "at least one route is required")
+	// A front may serve L4 routes alone: their TLS is its, and their domains its sites.
+	l4TLS := slices.ContainsFunc(l.s.L4.Routes, spec.L4Route.Terminated)
+	if len(f.Routes) == 0 && !l4TLS {
+		l.errf("front.routes", "at least one route is required (or an l4 route with tls, the front terminating its TLS)")
 	}
 	names := map[string]bool{}
 	vars := map[string]string{}
@@ -1102,8 +1104,11 @@ func (l *linter) front() {
 			}
 		}
 	}
-	if !names[f.Portal] {
-		l.errf("front.portal", "%q names no route: the installer ends by printing the portal URL", f.Portal)
+	switch {
+	case f.Portal == "" && len(f.Routes) == 0 && l4TLS:
+		// The install ends naming the L4 routes, as a project without a front does.
+	case !names[f.Portal]:
+		l.errf("front.portal", "%q names no route: the installer ends by printing the portal URL (a front without routes, serving l4 routes with tls alone, leaves it out)", f.Portal)
 	}
 	ports := map[int]string{}
 	for _, name := range sortedKeys(f.LoopbackPorts) {
