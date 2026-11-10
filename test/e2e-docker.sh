@@ -14,7 +14,9 @@
 # number in its uploads volume (examples/minimal/api/notes-api). Then a site without internet:
 # `notes-stow mirror export` writes 3.0.0 to one file, `mirror import` pushes it into a TLS mirror of
 # its own CA, a second install pulls from the mirror (--registry, --registry-ca) and `upgrade
-# --version` reads it, trusting the CA the install recorded.
+# --version` reads it, trusting the CA the install recorded. Along the way, the machine interface:
+# `describe --json`; `status --json` before the install and after each change; `--json` on the
+# install, upgrade, rollback and the mirror install's uninstall; the refusals exiting 3.
 set -euo pipefail
 
 # The amd64 image of the example's postgres: mirroring copies every platform of an index.
@@ -34,12 +36,52 @@ release() {
 	"${S[@]}" ship --channel stable 2>"$WORK/ship-$1.log" || { cat "$WORK/ship-$1.log"; fail "ship $1"; }
 }
 no_next() { ! compgen -G "$D/.stowage-next-*" >/dev/null || fail "a fetched installer was left in $D"; }
+# result <file> <done|nothing> [version]: the file, a run's standard output under --json, is one
+# Result: format 1, that result, the release installed after it that version (none: absent).
+result() {
+	jq -se --arg r "$2" --arg v "${3:-}" 'length == 1 and (.[0] | .format == 1 and .result == $r and
+		(if $v == "" then has("release") | not else .release.version == $v and .release.revision == 1 end))' "$1" >/dev/null ||
+		{ cat "$1"; fail "$1 is not one Result: $2, release ${3:-none}"; }
+}
+# refused <file> <reason ERE>: the Result in the file is a refusal with that reason and a fix.
+refused() {
+	jq -e --arg re "$2" '.result == "nothing" and (.refused.reason | test($re)) and (.refused.fix | length > 0)' "$1" >/dev/null ||
+		{ cat "$1"; fail "$1 is not a refusal matching $2, with a fix"; }
+}
+# status_json <file> <installed> <previous|null>: status --json of the install in $D, into the
+# file: format 1, the releases installed and kept (each with its installer by digest), the inputs
+# as keys alone, and no value of a recorded input or secret anywhere in it.
+status_json() {
+	"${CTL[@]}" status --dir "$D" --json >"$1" 2>"$1.log" || { cat "$1.log" "$1"; fail "status --json"; }
+	local installer="^$REG/notes/notes-installer@sha256:[0-9a-f]{64}\$" k v
+	jq -se --arg v "$2" --arg p "$3" --arg i "$installer" 'length == 1 and (.[0] | .format == 1 and .name == "notes" and
+		.installed.version == $v and .installed.revision == 1 and (.installed.installer | test($i)) and
+		(if $p == "null" then .previous == null else .previous.version == $p and .previous.revision == 1 and (.previous.installer | test($i)) end) and
+		(.inputs | type == "array" and index("ADMIN_EMAIL") != null and index("E2E_TOKEN") != null and all(.[]; test("^[A-Z][A-Z0-9_]*$"))))' "$1" >/dev/null ||
+		{ cat "$1"; fail "status --json does not show $2 installed, $3 kept, the inputs by key"; }
+	for k in E2E_TOKEN SESSION_SECRET POSTGRES_PASSWORD ADMIN_EMAIL; do
+		v=$(sed -n "s/^$k='\{0,1\}\([^']*\)'\{0,1\}\$/\1/p" "$D/.env")
+		[[ -n $v ]] || fail "$D/.env records no $k: the search below would find nothing"
+		! grep -qF -- "$v" "$1" "$1.log" || fail "status --json prints the value of $k"
+	done
+}
 
 step "start zot"
 start_zot
 
 step "project, ship 1.0.0"
 new_project "$PG"
+# A secret input, given at the install: describe prints no default of it, status --json no value.
+python3 - "$P/stowage.yaml" <<'PY'
+import sys
+path = sys.argv[1]
+s = open(path).read()
+old = '  - { key: ADMIN_EMAIL, prompt: "Administrator email", required: true }\n'
+assert s.count(old) == 1, old
+s = s.replace(old, old + '  - { key: E2E_TOKEN, prompt: "A token", secret: true, optional: true }\n')
+open(path, "w").write(s)
+PY
+"${S[@]}" lint
 "${S[@]}" ship --channel stable 2>"$WORK/ship-1.0.0.log" || { cat "$WORK/ship-1.0.0.log"; fail "ship 1.0.0"; }
 
 step "install 1.0.0 with the bootstrap one-liner"
@@ -50,9 +92,27 @@ while [[ $API_PORT == "$APP_PORT" ]]; do API_PORT=$(free_port); done
 login_pull
 docker run --rm --pull always "$REG/notes/notes-installer:latest" >"$WORK/notes.sh" || fail "docker run of the installer image"
 unset DOCKER_CONFIG # for the next ships; the installer's environment never has it (OPERATOR)
-(cd "$WORK" && "${OPERATOR[@]}" sh notes.sh --no-input --dir "$D" --ports "app=$APP_PORT,api=$API_PORT" --set ADMIN_EMAIL=admin@notes.test) \
-	>"$WORK/install.log" 2>&1 || { cat "$WORK/install.log"; fail "install"; }
+# The machine interface before any install: describe reads the release the installer carries;
+# status refuses a directory that holds no install (exit 3), printing nothing on standard output.
+(cd "$WORK" && "${OPERATOR[@]}" sh notes.sh describe --json) >"$WORK/describe.json" 2>"$WORK/describe.log" || { cat "$WORK/describe.log"; fail "describe --json"; }
+jq -se 'length == 1 and (.[0] | .format == 1 and .name == "notes" and .short_name == "notes" and .release == {version: "1.0.0", revision: 1} and
+	.channel == "stable" and .first_install_only == ["address", "registry", "registry_ca", "channel"] and
+	(.inputs | map(.key) | index("ADMIN_EMAIL") != null and index("E2E_TOKEN") != null) and
+	(.inputs[] | select(.key == "ADMIN_EMAIL") | .required and (.secret | not) and .default == "") and
+	(.inputs[] | select(.key == "E2E_TOKEN") | .secret and .optional) and
+	all(.inputs[]; if .secret then has("default") | not else has("default") end))' "$WORK/describe.json" >/dev/null ||
+	{ cat "$WORK/describe.json"; fail "describe --json does not describe 1.0.0, its inputs (no secret's default) and the first-install-only settings"; }
+rc=0; (cd "$WORK" && "${OPERATOR[@]}" sh notes.sh status --dir "$D" --json) >"$WORK/status0.json" 2>"$WORK/status0.log" || rc=$?
+[[ $rc == 3 && ! -s $WORK/status0.json ]] && grep -q 'holds no install' "$WORK/status0.log" ||
+	{ cat "$WORK/status0.log" "$WORK/status0.json"; fail "status --json before the install exited $rc, not 3 with 'holds no install' and nothing on standard output"; }
+# The first install, under --json: its Result alone on standard output, its text on standard error.
+TOKEN=$(token)
+(cd "$WORK" && "${OPERATOR[@]}" sh notes.sh --no-input --dir "$D" --ports "app=$APP_PORT,api=$API_PORT" --set ADMIN_EMAIL=admin@notes.test --set "E2E_TOKEN=$TOKEN" --json) \
+	>"$WORK/install.json" 2>"$WORK/install.log" || { cat "$WORK/install.log" "$WORK/install.json"; fail "install --json"; }
+result "$WORK/install.json" "done" 1.0.0
+grep -q 'notes 1.0.0' "$WORK/install.log" || { cat "$WORK/install.log"; fail "the install's text did not go to standard error"; }
 running 1.0.0 1
+status_json "$WORK/status1.json" 1.0.0 null
 kept 1.0.0
 grep -q '^ADMIN_PASSWORD=' "$D/provision.env" || fail "the provision hook recorded no ADMIN_PASSWORD"
 
@@ -158,20 +218,25 @@ running 1.0.0 1
 
 step "ship 2.0.0, upgrade --version 2.0.0"
 release 2.0.0 '{"version": 2, "barriers": {}, "reads_newer": true}'
-"${CTL[@]}" upgrade --version 2.0.0 --dir "$D" --no-input >"$WORK/up2.log" 2>&1 || { cat "$WORK/up2.log"; fail "upgrade to 2.0.0"; }
+"${CTL[@]}" upgrade --version 2.0.0 --dir "$D" --no-input --json >"$WORK/up2.json" 2>"$WORK/up2.log" || { cat "$WORK/up2.log" "$WORK/up2.json"; fail "upgrade --json to 2.0.0"; }
+result "$WORK/up2.json" "done" 2.0.0
 running 2.0.0 2
 kept 2.0.0
 no_next
+status_json "$WORK/status2.json" 2.0.0 1.0.0
 ls "$D"/snapshots/*.sql.gz >/dev/null 2>&1 || fail "the upgrade took no snapshot"
 gzip -dc "$D"/snapshots/*.sql.gz >"$WORK/snapshot.sql" && grep -q 'PostgreSQL database dump' "$WORK/snapshot.sql" || fail "the snapshot is not a pg_dump"
-"${CTL[@]}" upgrade --version 2.0.0 --dir "$D" >"$WORK/again.log" 2>&1 || { cat "$WORK/again.log"; fail "upgrade to the running release"; }
+"${CTL[@]}" upgrade --version 2.0.0 --dir "$D" --json >"$WORK/again.json" 2>"$WORK/again.log" || { cat "$WORK/again.log"; fail "upgrade to the running release"; }
 grep -q 'already runs' "$WORK/again.log" || { cat "$WORK/again.log"; fail "no note that 2.0.0 already runs"; }
+result "$WORK/again.json" nothing 2.0.0
 
 step "rollback to 1.0.0 (allowed: 1.0.0 reads the newer schema)"
-"${CTL[@]}" rollback --dir "$D" >"$WORK/back1.log" 2>&1 || { cat "$WORK/back1.log"; fail "rollback"; }
+"${CTL[@]}" rollback --dir "$D" --json >"$WORK/back1.json" 2>"$WORK/back1.log" || { cat "$WORK/back1.log" "$WORK/back1.json"; fail "rollback --json"; }
+result "$WORK/back1.json" "done" 1.0.0
 grep -q 'the database is at 2; 1.0.0 reads past the newer migrations' "$WORK/back1.log" || { cat "$WORK/back1.log"; fail "the rollback did not check the schema"; }
 running 1.0.0 2
 kept 1.0.0
+status_json "$WORK/status3.json" 1.0.0 null
 
 step "ship 3.0.0 (a rollback barrier), upgrade --version 3.0.0"
 release 3.0.0 '{"version": 3, "barriers": {"3": "notes moved to a new table"}, "reads_newer": true}'
@@ -181,11 +246,18 @@ kept 3.0.0
 no_next
 
 step "going back is refused"
-if "${CTL[@]}" upgrade --version 1.0.0 --dir "$D" >"$WORK/down.log" 2>&1; then fail "upgrade --version 1.0.0 went back"; fi
+# Each a refusal: exit 3, and under --json a Result of nothing with its reason.
+rc=0; "${CTL[@]}" upgrade --version 1.0.0 --dir "$D" --json >"$WORK/down.json" 2>"$WORK/down.log" || rc=$?
+[[ $rc == 3 ]] || { cat "$WORK/down.log"; fail "upgrade --version 1.0.0 exited $rc, not 3 (refused)"; }
 grep -q 'runs notes 3.0.0 (revision 1), after notes 1.0.0 (revision 1): .*rollback' "$WORK/down.log" || { cat "$WORK/down.log"; fail "the refusal does not name rollback"; }
-if "${CTL[@]}" rollback --dir "$D" >"$WORK/back3.log" 2>&1; then fail "rollback crossed a barrier"; fi
+result "$WORK/down.json" nothing 3.0.0
+refused "$WORK/down.json" 'runs notes 3[.]0[.]0 [(]revision 1[)], after notes 1[.]0[.]0 [(]revision 1[)]'
+rc=0; "${CTL[@]}" rollback --dir "$D" --json >"$WORK/back3.json" 2>"$WORK/back3.log" || rc=$?
+[[ $rc == 3 ]] || { cat "$WORK/back3.log"; fail "rollback across a barrier exited $rc, not 3 (refused)"; }
 grep -q 'notes moved to a new table' "$WORK/back3.log" && grep -q 'snapshots/' "$WORK/back3.log" ||
 	{ cat "$WORK/back3.log"; fail "the refusal does not name the barrier and the snapshot"; }
+result "$WORK/back3.json" nothing 3.0.0
+jq -e '.refused.reason | test("notes moved to a new table")' "$WORK/back3.json" >/dev/null || { cat "$WORK/back3.json"; fail "the Result's reason does not name the barrier"; }
 running 3.0.0 3
 kept 3.0.0
 
@@ -238,6 +310,13 @@ scanner_fresh "$SITE"
 	{ cat "$WORK/audit-site.log" "$WORK/audit-site.json"; fail "audit through the mirror"; }
 [[ $(jq '[.subjects[] | select(.error)] | length' "$WORK/audit-site.json") == 0 ]] || { cat "$WORK/audit-site.json"; fail "an SBOM did not reach the mirror"; }
 grep -q "pulling $SITE/notes-audit@" "$WORK/audit-site.log" || { cat "$WORK/audit-site.log"; fail "the scanner was not pulled from the mirror"; }
+
+step "uninstall --json of the mirror's install: done, no release left"
+project=$(project)
+"${OPERATOR[@]}" "$D/notes-stow" uninstall --dir "$D" --data --yes --json >"$WORK/uninstall.json" 2>"$WORK/uninstall.log" ||
+	{ cat "$WORK/uninstall.log" "$WORK/uninstall.json"; fail "uninstall --json"; }
+result "$WORK/uninstall.json" "done"
+[[ -z $(docker ps -aq --filter "label=com.docker.compose.project=$project") ]] || fail "uninstall left the stack's containers"
 D=$D1 APP_PORT=$APP1 API_PORT=$API1
 
 printf '\nPASS\n'

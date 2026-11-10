@@ -24,7 +24,9 @@
 # claim, and keeps the namespace → the previous Stowage (the latest release tag, built once from it)
 # ships 3.0.0 at schema baseline 1 and installs it; this one ships 4.0.0 at baseline 2, whose
 # `k8s upgrade` is refused naming the previous release's baseline, `k8s reset-db --new-baseline`
-# crosses, and that release issues and takes a kit, which its own spec holds.
+# crosses, and that release issues and takes a kit, which its own spec holds. Along the way, the
+# machine interface: `describe --json`; `k8s status --json` before the install and after each
+# change; `--json` on install, upgrade, rollback and uninstall; the refusals exiting 3.
 set -euo pipefail
 
 # The amd64 image of the example's postgres: mirroring copies every platform of an index.
@@ -47,6 +49,43 @@ runs() {
 	got=$(helm list -n "$NS" --filter '^notes$' --output json | python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["app_version"])')
 	[[ $got == "$1" ]] || fail "helm lists $got, want $1"
 }
+# result <file> <done|nothing> [version]: the file, a run's standard output under --json, is one
+# Result: format 1, that result, the release installed after it that version (none: absent).
+result() {
+	jq -se --arg r "$2" --arg v "${3:-}" 'length == 1 and (.[0] | .format == 1 and .result == $r and
+		(if $v == "" then has("release") | not else .release.version == $v and .release.revision == 1 end))' "$1" >/dev/null ||
+		{ cat "$1"; fail "$1 is not one Result: $2, release ${3:-none}"; }
+}
+# refused <file> <code> <reason ERE>: the run that wrote the file exited <code> (3, refused), and
+# the Result in it is a refusal with that reason and a fix.
+refused() {
+	[[ $2 == 3 ]] || { cat "$1"; fail "$1: the run exited $2, not 3 (refused)"; }
+	jq -e --arg re "$3" '.result == "nothing" and (.refused.reason | test($re)) and (.refused.fix | length > 0)' "$1" >/dev/null ||
+		{ cat "$1"; fail "$1 is not a refusal matching $3, with a fix"; }
+}
+# status_json <script> <file> <installed> <previous|null>: k8s status --json of the release, run
+# by the bootstrap script of the release installed (another tells no inputs), into the file:
+# format 1, the releases installed and the one rollback goes back to (each with its installer by
+# digest), the inputs as keys alone, helm's latest revision deployed, and no value of the
+# release's Secret anywhere in it.
+status_json() {
+	local s=$1 installer="^$REG/notes/notes-installer@sha256:[0-9a-f]{64}\$" rev v n=0
+	shift
+	ctl "$s" k8s status --json >"$1" 2>"$1.log" || { cat "$1.log" "$1"; fail "k8s status --json"; }
+	rev=$(helm history notes -n "$NS" --output json | jq 'map(.revision) | max')
+	jq -se --arg v "$2" --arg p "$3" --arg i "$installer" --argjson rev "$rev" 'length == 1 and (.[0] | .format == 1 and .name == "notes" and
+		.installed.version == $v and .installed.revision == 1 and (.installed.installer | test($i)) and
+		(if $p == "null" then .previous == null else .previous.version == $p and .previous.revision == 1 and (.previous.installer | test($i)) end) and
+		(.inputs | type == "array" and index("ADMIN_EMAIL") != null and all(.[]; test("^[A-Z][A-Z0-9_]*$"))) and
+		.helm == {revision: $rev, status: "deployed"})' "$1" >/dev/null ||
+		{ cat "$1"; fail "k8s status --json does not show $2 installed, $3 to go back to, the inputs by key, helm revision $rev deployed"; }
+	while IFS= read -r v; do
+		((${#v} >= 8)) || continue
+		n=$((n + 1))
+		! grep -qF -- "$v" "$1" "$1.log" || fail "k8s status --json prints a value of the release's Secret"
+	done < <(kubectl get -n "$NS" secret notes-stowage -o json | jq -r '.data[] | @base64d')
+	((n >= 2)) || fail "the release's Secret holds fewer than 2 values to search for"
+}
 # release <version>: bump the example, with a web page of its own (a new image), ship it on stable.
 release() {
 	printf '%s\n' "$1" >"$P/VERSION"
@@ -65,9 +104,22 @@ new_project "$PG"
 
 step "k8s install 1.0.0 with the bootstrap script"
 installer v1.sh
-ctl v1.sh k8s install --no-input --set ADMIN_EMAIL=admin@notes.test --timeout 3m >"$WORK/install.log" 2>&1 ||
-	{ cat "$WORK/install.log"; cluster_logs >&2; fail "k8s install"; }
+# The machine interface before any install: describe reads the release the installer carries;
+# k8s status finds no release, and prints nothing on standard output.
+ctl v1.sh describe --json >"$WORK/describe.json" 2>"$WORK/describe.log" || { cat "$WORK/describe.log"; fail "describe --json"; }
+jq -se 'length == 1 and (.[0] | .format == 1 and .name == "notes" and .release == {version: "1.0.0", revision: 1} and (.shapes | index("kubernetes") != null) and
+	(.inputs | map(.key) | index("ADMIN_EMAIL") != null) and all(.inputs[]; if .secret then has("default") | not else has("default") end))' "$WORK/describe.json" >/dev/null ||
+	{ cat "$WORK/describe.json"; fail "describe --json does not describe 1.0.0 for Kubernetes"; }
+rc=0; ctl v1.sh k8s status --json >"$WORK/status0.json" 2>"$WORK/status0.log" || rc=$?
+[[ $rc != 0 && ! -s $WORK/status0.json ]] && grep -q 'no release notes in notes' "$WORK/status0.log" ||
+	{ cat "$WORK/status0.log" "$WORK/status0.json"; fail "k8s status --json before the install exited $rc, not failing with 'no release notes in notes' and nothing on standard output"; }
+# The install, under --json: its Result alone on standard output, its text on standard error.
+ctl v1.sh k8s install --no-input --set ADMIN_EMAIL=admin@notes.test --timeout 3m --json >"$WORK/install.json" 2>"$WORK/install.log" ||
+	{ cat "$WORK/install.log" "$WORK/install.json"; cluster_logs >&2; fail "k8s install --json"; }
+result "$WORK/install.json" "done" 1.0.0
+grep -q 'runs notes 1.0.0' "$WORK/install.log" || { cat "$WORK/install.log"; fail "the install's text did not go to standard error"; }
 runs 1.0.0 1
+status_json v1.sh "$WORK/status1.json" 1.0.0 null
 [[ $(kubectl get -n "$NS" deploy/notes-web -o jsonpath='{.spec.template.spec.imagePullSecrets[0].name}') == notes-stowage-pull ]] ||
 	fail "the pods do not pull with notes-stowage-pull"
 [[ $(kubectl get -n "$NS" secret notes-stowage -o jsonpath='{.metadata.labels.app\.kubernetes\.io/managed-by}') == stowage ]] ||
@@ -149,17 +201,23 @@ ctl v1.sh k8s upgrade --given back.yaml --no-input --timeout 3m >"$WORK/kit-back
 step "ship 2.0.0, k8s upgrade --version 2.0.0"
 release 2.0.0
 [[ $(digest_of notes/notes-web:2.0.0) != "$(digest_of notes/notes-web:1.0.0)" ]] || fail "2.0.0 has 1.0.0's web image"
-ctl v1.sh k8s upgrade --version 2.0.0 --no-input --timeout 3m >"$WORK/up2.log" 2>&1 || { cat "$WORK/up2.log"; fail "k8s upgrade --version 2.0.0"; }
+ctl v1.sh k8s upgrade --version 2.0.0 --no-input --timeout 3m --json >"$WORK/up2.json" 2>"$WORK/up2.log" || { cat "$WORK/up2.log" "$WORK/up2.json"; fail "k8s upgrade --version 2.0.0 --json"; }
+result "$WORK/up2.json" "done" 2.0.0
 runs 2.0.0 2
+installer v2.sh
+status_json v2.sh "$WORK/status2.json" 2.0.0 1.0.0
 [[ $(somaxconn) == 8192 ]] || { cluster_logs >&2; fail "2.0.0's pods lost the settings the release was given"; }
 ! compgen -G "$OP/.stowage-next-*" >/dev/null || fail "a fetched installer was left in $OP"
-ctl v1.sh k8s upgrade --version 2.0.0 >"$WORK/again.log" 2>&1 || { cat "$WORK/again.log"; fail "upgrade to the running release"; }
+ctl v1.sh k8s upgrade --version 2.0.0 --json >"$WORK/again.json" 2>"$WORK/again.log" || { cat "$WORK/again.log"; fail "upgrade to the running release"; }
 grep -q 'already runs notes 2.0.0' "$WORK/again.log" || { cat "$WORK/again.log"; fail "no note that 2.0.0 already runs"; }
+result "$WORK/again.json" nothing 2.0.0
 
-step "1.0.0's k8s upgrade is refused"
-if ctl v1.sh k8s upgrade --no-input >"$WORK/down.log" 2>&1; then fail "1.0.0's installer upgraded 2.0.0"; fi
+step "1.0.0's k8s upgrade is refused (exit 3)"
+rc=0; ctl v1.sh k8s upgrade --no-input --json >"$WORK/down.json" 2>"$WORK/down.log" || rc=$?
 grep -q "runs notes 2.0.0 (revision 1), after this installer's 1.0.0 (revision 1): .*rollback" "$WORK/down.log" ||
 	{ cat "$WORK/down.log"; fail "the refusal does not name rollback"; }
+refused "$WORK/down.json" "$rc" "runs notes 2[.]0[.]0 [(]revision 1[)], after this installer's 1[.]0[.]0 [(]revision 1[)]"
+result "$WORK/down.json" nothing 2.0.0
 runs 2.0.0 2
 
 step "an upgrade that never becomes ready is rolled back by helm"
@@ -170,9 +228,13 @@ grep -q 'helm rolled the release back' "$WORK/broken.log" || { cat "$WORK/broken
 runs 2.0.0 2
 
 step "k8s rollback goes back one upgrade, to 1.0.0"
-ctl v2.sh k8s rollback --timeout 3m >"$WORK/rollback.log" 2>&1 || { cat "$WORK/rollback.log"; fail "k8s rollback"; }
+ctl v2.sh k8s rollback --timeout 3m --json >"$WORK/rollback.json" 2>"$WORK/rollback.log" || { cat "$WORK/rollback.log" "$WORK/rollback.json"; fail "k8s rollback --json"; }
+result "$WORK/rollback.json" "done" 1.0.0
 grep -q 'release notes in notes runs notes 1.0.0 (revision 1)' "$WORK/rollback.log" || { cat "$WORK/rollback.log"; fail "the rollback does not say 1.0.0 runs"; }
 runs 1.0.0 2
+# Nothing to go back to: every revision helm keeps before the one rolled back to ran the same
+# values (the first install's, with one replica, is past helm's history limit).
+status_json v1.sh "$WORK/status3.json" 1.0.0 null
 
 step "k8s status"
 ctl v2.sh k8s status >"$WORK/status.log" 2>&1 || { cat "$WORK/status.log"; fail "k8s status"; }
@@ -203,10 +265,13 @@ if kubectl exec -n "$NS" deploy/notes-web -- test -e /data/marker; then fail "th
 [[ -n $(returned) && $(returned) != "$pw" ]] || fail "reset-db did not forget what the hook returned"
 
 step "k8s uninstall: refused without --data (helm deletes the chart's claim), then removes all but the namespace"
-if ctl v1.sh k8s uninstall --yes >"$WORK/uninstall0.log" 2>&1; then fail "k8s uninstall --yes deleted the chart's claim without --data"; fi
+rc=0; ctl v1.sh k8s uninstall --yes --json >"$WORK/uninstall0.json" 2>"$WORK/uninstall0.log" || rc=$?
 grep -q 'notes-uploads, which `helm uninstall` deletes with it' "$WORK/uninstall0.log" || { cat "$WORK/uninstall0.log"; fail "the refusal does not name the claim"; }
+refused "$WORK/uninstall0.json" "$rc" 'notes-uploads, which `helm uninstall` deletes with it'
+result "$WORK/uninstall0.json" nothing 1.0.0
 helm status -n "$NS" notes >/dev/null 2>&1 || fail "the refused uninstall removed the release"
-ctl v1.sh k8s uninstall --data --yes --timeout 3m >"$WORK/uninstall.log" 2>&1 || { cat "$WORK/uninstall.log"; cluster_logs >&2; fail "k8s uninstall --data"; }
+ctl v1.sh k8s uninstall --data --yes --timeout 3m --json >"$WORK/uninstall.json" 2>"$WORK/uninstall.log" || { cat "$WORK/uninstall.log" "$WORK/uninstall.json"; cluster_logs >&2; fail "k8s uninstall --data --json"; }
+result "$WORK/uninstall.json" "done"
 grep -q 'kept: the namespace notes' "$WORK/uninstall.log" || { cat "$WORK/uninstall.log"; fail "uninstall does not say what it kept"; }
 ! helm status -n "$NS" notes >/dev/null 2>&1 || fail "the release is still installed"
 for o in secret/notes-stowage secret/notes-stowage-provision serviceaccount/notes-stowage-provision role/notes-stowage-provision rolebinding/notes-stowage-provision pvc/notes-uploads; do

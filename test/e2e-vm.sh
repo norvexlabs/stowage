@@ -18,7 +18,10 @@
 # fails it past a rollback barrier is kept, as going back would leave nothing serving;
 # `vm attach` gives the VM a NIC for the role 1.0.1 adds, which `network set --role` re-addresses;
 # `network set` keeps the lease as a static address, a unique local IPv6 address beside it, and a
-# change not confirmed comes undone at its window's end and at a reboot; then `vm destroy`. Needs Docker
+# change not confirmed comes undone at its window's end and at a reboot; then `vm destroy`. Along
+# the way, the machine interface: the VM's `describe --json` and `status --json`, `--json` on its
+# upgrade and rollback, a refusal exiting 3; `vm seed --json` against the mirror, and
+# `--known-hosts-line` on `vm kit check`. Needs Docker
 # (privileged containers, loop devices), network access, about 15 GB on disk under
 # XDG_CACHE_HOME, OpenTofu's `tofu`, ssh, and a TrueNAS host the VM's DHCP lease is registered on.
 #
@@ -40,6 +43,31 @@ healthy_postgres() {
 		((SECONDS < deadline)) || { cat "$WORK/ps.txt"; fail "ps does not show a healthy postgres $1"; }
 		sleep 5
 	done
+}
+# vm_result <file> <done|nothing> <version>: the file, a verb's standard output on the VM under
+# --json, is one Result: format 1, that result, that release installed as the run ended (before
+# the reboot its job schedules).
+vm_result() {
+	jq -se --arg r "$2" --arg v "$3" 'length == 1 and (.[0] | .format == 1 and .result == $r and .release == {version: $v, revision: 1})' "$1" >/dev/null ||
+		{ cat "$1"; fail "$1 is not one Result: $2, release $3"; }
+}
+# vm_status_json <file> <installed> <previous|null|->: the VM's status --json over SSH, into the
+# file: format 1, the release installed, the one the last upgrade replaced (-: not checked), the
+# inputs as keys alone, and no value of a recorded input or secret anywhere in it.
+vm_status_json() {
+	on_vm sudo notes-stow status --json >"$1" 2>"$1.log" || { cat "$1.log" "$1"; fail "status --json on the VM"; }
+	jq -se --arg v "$2" --arg p "$3" 'length == 1 and (.[0] | .format == 1 and .name == "notes" and .installed == {version: $v, revision: 1} and
+		(if $p == "-" then true elif $p == "null" then .previous == null else .previous.version == $p and .previous.revision == 1 end) and
+		(.inputs | type == "array" and index("ADMIN_EMAIL") != null and index("DB_SOURCES") != null and all(.[]; test("^[A-Z][A-Z0-9_]*$"))))' "$1" >/dev/null ||
+		{ cat "$1"; fail "the VM's status --json does not show $2 installed, $3 replaced, the inputs by key"; }
+	local k v
+	on_vm sudo cat /usr/local/notes/.env >"$WORK/vm-status.env" || fail "reading the VM's .env"
+	for k in SESSION_SECRET POSTGRES_PASSWORD STOWAGE_HOST_TOKEN ADMIN_EMAIL DB_SOURCES; do
+		v=$(sed -n "s/^$k='\{0,1\}\([^']*\)'\{0,1\}\$/\1/p" "$WORK/vm-status.env")
+		[[ -n $v ]] || { rm -f "$WORK/vm-status.env"; fail "the VM's .env records no $k: the search below would find nothing"; }
+		! grep -qF -- "$v" "$1" "$1.log" || { rm -f "$WORK/vm-status.env"; fail "the VM's status --json prints the value of $k"; }
+	done
+	rm -f "$WORK/vm-status.env"
 }
 # release <version> [ready] [migration] [barriers]: ship it on beta (ready=false: its api never
 # becomes ready; migration 1 and no barrier by default, barriers a JSON object), carry it through
@@ -218,6 +246,15 @@ step "on the VM: the install, its status, its services"
 on_vm notes-stow status >"$WORK/status.txt" || fail "status over SSH"
 grep -q '^installed  notes 1.0.0 (revision 1)' "$WORK/status.txt" && grep -q '^channel    beta' "$WORK/status.txt" ||
 	{ cat "$WORK/status.txt"; fail "status does not show the install"; }
+# The machine interface over SSH: describe reads the release the OS carries (a secret input's
+# default never printed); status --json the install, no release replaced yet.
+on_vm sudo notes-stow describe --json >"$WORK/vm-describe.json" 2>"$WORK/vm-describe.log" || { cat "$WORK/vm-describe.log"; fail "describe --json on the VM"; }
+jq -se 'length == 1 and (.[0] | .format == 1 and .name == "notes" and .short_name == "notes" and .release == {version: "1.0.0", revision: 1} and .channel == "beta" and
+	(.shapes | index("kairos") != null) and (.inputs | map(.key) | index("ADMIN_EMAIL") != null and index("DB_SOURCES") != null) and
+	(.inputs[] | select(.key == "DEPLOY_TOKEN") | .secret and (has("default") | not)) and
+	.first_install_only == ["address", "registry", "registry_ca", "channel"])' "$WORK/vm-describe.json" >/dev/null ||
+	{ cat "$WORK/vm-describe.json"; fail "the VM's describe --json does not describe 1.0.0, its inputs (no secret's default) and the first-install-only settings"; }
+vm_status_json "$WORK/vm-status1.json" 1.0.0 null
 healthy_postgres "after the install"
 # A healthy boot logs no error: the journal at priority err holds nothing of this boot.
 # Its standard output alone: SSH's banner comes on its standard error.
@@ -350,6 +387,32 @@ step "the disk: the app's 16 GiB on the persistent partition, Kairos's partition
 size=$(on_vm "df -BG --output=size /usr/local | tail -1" | tr -dc 0-9)
 ((size >= 15)) || { on_vm "df -h; lsblk" || true; fail "/usr/local holds ${size}G, not the app's 16 GiB"; }
 
+step "vm seed --json from the mirror: a new VM's first-boot material, no VM made; a secret input given to it is refused"
+# shellcheck disable=SC2054 # --domains takes its routes comma-separated
+SEED=(--platform truenas --hostname "$H-seed" --user ops --ssh-key "$KEY.pub" --tls internal --domains app=app.notes.test,api=api.notes.test
+	--set ADMIN_EMAIL=seed@notes.test --set "DB_SOURCES=$MIRROR_IP/32" --registry "$SITE" --registry-ca "$MIRROR_CA")
+"$CTL" vm seed --json "${SEED[@]}" >"$WORK/seed.json" 2>"$WORK/seed.log" || { cat "$WORK/seed.log"; fail "vm seed --json"; }
+# The project's one secret input is optional: no required secret input waits, so waiting is left out.
+jq -se --arg site "$SITE" 'length == 1 and (.[0] | .format == 1 and .platform == "truenas" and
+	(.user_data | startswith("#cloud-config") and contains("seed@notes.test")) and
+	(.known_hosts_line | startswith("vm-seed-host-key ")) and (.fingerprint | startswith("SHA256:")) and
+	(.host_key_private | startswith("-----BEGIN OPENSSH PRIVATE KEY-----")) and
+	.disk.truenas.format == "qcow2" and (.disk.truenas.image | startswith($site + "/notes-disk@sha256:")) and (has("waiting") | not))' "$WORK/seed.json" >/dev/null ||
+	{ jq 'del(.host_key_private, .user_data)' "$WORK/seed.json"; fail "vm seed --json is not the first-boot material of a truenas VM from the mirror"; }
+[[ ! -e $XDG_STATE_HOME/$NAME/vms/$H-seed ]] || fail "vm seed wrote a VM's state"
+# Its known_hosts line, its fingerprint and its private key are the same key.
+jq -r .known_hosts_line "$WORK/seed.json" >"$WORK/seed.known_hosts"
+(umask 077; jq -r .host_key_private "$WORK/seed.json" >"$WORK/seed.key")
+[[ $(ssh-keygen -lf "$WORK/seed.known_hosts" | awk '{print $2}') == "$(jq -r .fingerprint "$WORK/seed.json")" ]] ||
+	{ ssh-keygen -lf "$WORK/seed.known_hosts"; fail "the seed's fingerprint is not its known_hosts line's"; }
+[[ $(ssh-keygen -y -f "$WORK/seed.key" | awk '{print $1, $2}') == "$(awk '{print $2, $3}' "$WORK/seed.known_hosts")" ]] || fail "the seed's private key is not its known_hosts line's"
+rm -f "$WORK/seed.key"
+seed_token=$(token)
+rc=0; "$CTL" vm seed --json "${SEED[@]}" --set "DEPLOY_TOKEN=$seed_token" >"$WORK/seed2.json" 2>"$WORK/seed2.log" || rc=$?
+[[ $rc == 3 && ! -s $WORK/seed2.json ]] && grep -q 'DEPLOY_TOKEN: a seed carries no secret input' "$WORK/seed2.log" ||
+	{ cat "$WORK/seed2.log"; fail "vm seed given a secret input exited $rc, not 3 naming it with nothing on standard output"; }
+! grep -qF -- "$seed_token" "$WORK/seed2.json" "$WORK/seed2.log" "$WORK/seed.json" || fail "the secret input given to vm seed reached its output"
+
 step "audit off the VM: the operator's notes-stow reads the VM's release's SBOMs from the mirror, by its version alone, and scans them"
 grype_db
 scanner_fresh "$SITE"
@@ -387,6 +450,16 @@ not_on_vm "$code" /home/ops
 "$CTL" vm kit take "$H" "$OP/vm.kit" --kit-code-file "$OP/vm.code" --no-input "${VMKIT[@]}" >"$WORK/kit-take.log" 2>&1 || { cat "$WORK/kit-take.log"; fail "vm kit take"; }
 grep -qF 'changing ADMIN_EMAIL: ' "$WORK/kit-take.log" || { cat "$WORK/kit-take.log"; fail "the change was not logged"; }
 "$CTL" vm kit check "$H" second-site site-2 "${VMKIT[@]}" | grep -q 'proven$' || fail "vm kit check of a site"
+# --known-hosts-line: the VM's own key (the one vm create recorded) given as one line, in place of
+# the record, reaches it; another key's line is refused by ssh before it logs in.
+real=$(awk 'NF >= 3 && $1 !~ /^#/ {print $2, $3; exit}' "$STATE/known_hosts")
+[[ -n $real ]] || { cat "$STATE/known_hosts"; fail "vm create recorded no host key"; }
+"$CTL" vm kit check "$H" second-site site-2 "${VMKIT[@]}" --known-hosts-line "$ADDR $real" >"$WORK/kit-line.txt" 2>"$WORK/kit-line.log" && grep -q 'proven$' "$WORK/kit-line.txt" ||
+	{ cat "$WORK/kit-line.txt" "$WORK/kit-line.log"; fail "vm kit check with --known-hosts-line of the VM's key"; }
+ssh-keygen -q -t ed25519 -N '' -C '' -f "$WORK/wrong-host-key" || fail "ssh-keygen"
+rc=0; "$CTL" vm kit check "$H" second-site site-2 "${VMKIT[@]}" --known-hosts-line "$ADDR $(awk '{print $1, $2}' "$WORK/wrong-host-key.pub")" >"$WORK/kit-wrong.txt" 2>"$WORK/kit-wrong.log" || rc=$?
+[[ $rc != 0 ]] && ! grep -q 'proven$' "$WORK/kit-wrong.txt" && grep -q 'Host key verification failed' "$WORK/kit-wrong.log" ||
+	{ cat "$WORK/kit-wrong.txt" "$WORK/kit-wrong.log"; fail "vm kit check with another key's --known-hosts-line exited $rc, not refused by ssh's host key check"; }
 rc=0; "$CTL" vm kit check "$H" second-site site-unknown "${VMKIT[@]}" >/dev/null 2>&1 || rc=$?
 [[ $rc == 2 ]] || fail "vm kit check of an unknown site exited $rc, not 2"
 "${DOCKER_CTL[@]}" --dir "$D" --no-input --kit "$OP/vm.kit" --kit-code-file "$OP/vm.code" >"$WORK/kit-vm-docker.log" 2>&1 || { cat "$WORK/kit-vm-docker.log"; stack_logs >&2; fail "--kit of the VM's kit on Docker"; }
@@ -475,12 +548,16 @@ release 1.0.1
 on_vm notes-stow updates >"$WORK/updates.txt" 2>&1 || { cat "$WORK/updates.txt"; fail "updates"; }
 grep -q '1.0.1 (revision 1) on beta' "$WORK/updates.txt" || { cat "$WORK/updates.txt"; fail "updates does not offer 1.0.1 from the mirror"; }
 boot=$(boot_id)
-on_vm sudo notes-stow upgrade --yes >"$WORK/upgrade.txt" 2>&1 || { cat "$WORK/upgrade.txt"; fail "upgrade"; }
+# Under --json: its Result alone on standard output, the release installed as its job schedules the
+# reboot (1.0.0); its text, the job's log among it, on standard error.
+on_vm sudo notes-stow upgrade --yes --json >"$WORK/upgrade.json" 2>"$WORK/upgrade.txt" || { cat "$WORK/upgrade.txt" "$WORK/upgrade.json"; fail "upgrade --json"; }
+vm_result "$WORK/upgrade.json" "done" 1.0.0
 grep -q 'a backup first: notes-full-' "$WORK/upgrade.txt" && grep -q 'backed up: dav:backups/notes-full-' "$WORK/upgrade.txt" ||
 	{ cat "$WORK/upgrade.txt"; fail "the upgrade took no backup first"; }
 # The VM reboots into 1.0.1, whose boot upgrades the install; the gate marks the boot good.
 back_on 1.0.1 active "after the upgrade" "$boot"
 healthy_postgres "after the upgrade"
+vm_status_json "$WORK/vm-status2.json" 1.0.1 1.0.0
 [[ $(on_vm systemctl is-active notes-health.service) == active ]] || fail "the health gate did not pass 1.0.1"
 # The boot keeps the operator's profile, and its Docker file, written before Docker starts, rotates
 # the logs. Until vm attach gives it a NIC, edge is the one setting that differs.
@@ -543,15 +620,25 @@ done
 on_vm ip -4 -o addr show dev edge | grep -q ' 192\.0\.2\.11/24 ' || fail "edge does not have its override's address back"
 
 step "rollback: the VM reboots into the passive system, whose boot goes back to 1.0.0"
-# The job reboots the VM itself: the reboot may close the session following it (ssh: 255).
+# The job reboots the VM itself: the reboot may close the session following it (ssh: 255), once
+# the run printed its Result. Under --json, the Result alone on standard output: the release
+# installed as the job schedules the reboot (1.0.1); the text on standard error.
 boot=$(boot_id)
-on_vm sudo notes-stow rollback --yes >"$WORK/rollback.txt" 2>&1 || { [[ $? == 255 ]] && grep -q 'rebooting into the passive system' "$WORK/rollback.txt"; } ||
-	{ cat "$WORK/rollback.txt"; fail "rollback"; }
+rc=0; on_vm sudo notes-stow rollback --yes --json >"$WORK/rollback.json" 2>"$WORK/rollback.txt" || rc=$?
+[[ $rc == 0 ]] || { [[ $rc == 255 ]] && grep -q 'rebooting into the passive system' "$WORK/rollback.txt"; } ||
+	{ cat "$WORK/rollback.txt" "$WORK/rollback.json"; fail "rollback --json exited $rc"; }
+vm_result "$WORK/rollback.json" "done" 1.0.1
 grep -q 'the passive system carries notes 1.0.0 (revision 1)' "$WORK/rollback.txt" || { cat "$WORK/rollback.txt"; fail "rollback did not name 1.0.0"; }
 back_on 1.0.0 passive "after rollback" "$boot"
 healthy_postgres "after rollback"
-if on_vm sudo notes-stow rollback --yes >"$WORK/rollback2.txt" 2>&1; then fail "a rollback from the passive system ran"; fi
+vm_status_json "$WORK/vm-status3.json" 1.0.0 -
+# A refusal: exit 3, and under --json a Result of nothing, its reason and its fix.
+rc=0; on_vm sudo notes-stow rollback --yes --json >"$WORK/rollback2.json" 2>"$WORK/rollback2.txt" || rc=$?
+[[ $rc == 3 ]] || { cat "$WORK/rollback2.txt"; fail "a rollback from the passive system exited $rc, not 3 (refused)"; }
 grep -q 'runs the passive system already' "$WORK/rollback2.txt" || { cat "$WORK/rollback2.txt"; fail "the refusal does not say why"; }
+vm_result "$WORK/rollback2.json" nothing 1.0.0
+jq -e '(.refused.reason | test("runs the passive system already")) and (.refused.fix | length > 0)' "$WORK/rollback2.json" >/dev/null ||
+	{ cat "$WORK/rollback2.json"; fail "the Result does not give the refusal's reason and fix"; }
 
 resolv_ok "after the rollback's reboot"
 
