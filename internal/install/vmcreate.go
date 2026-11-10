@@ -1367,7 +1367,8 @@ func (in *Installer) vmSettings(ctx context.Context) (*Settings, []string, *Give
 		list = nil
 		for _, i := range in.inputList(mode) {
 			if _, set := o.Set[i.Key]; i.Secret && set {
-				return nil, nil, nil, fmt.Errorf("%s is a secret input, which a command line never carries: give it in the --answers file, which goes over SSH once the VM answers, or later (`sudo %s install`)", i.Key, in.R.Ctl())
+				return nil, nil, nil, refuse(fmt.Sprintf("give %s in the --answers file, or later (`sudo %s install`)", i.Key, in.R.Ctl()),
+					"%s is a secret input, which a command line never carries: give it in the --answers file, which goes over SSH once the VM answers, or later (`sudo %s install`)", i.Key, in.R.Ctl())
 			}
 			if !i.Secret {
 				list = append(list, i)

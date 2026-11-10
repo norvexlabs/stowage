@@ -456,8 +456,20 @@ func TestVMSeed(t *testing.T) {
 	if r, ok := Refusal(err); !ok || !strings.Contains(r.Reason, "ACCESS_TOKEN") || strings.Contains(r.Reason, "tok-not") || !strings.Contains(r.Fix, "install --given -") {
 		t.Errorf("%v", err)
 	}
-	if _, err := seed(func(o *Options) { o.Set["ACCESS_TOKEN"] = "tok-not-to-be-printed" }, ""); err == nil || strings.Contains(err.Error(), "tok-not") {
+	// On a command line too: the seed's own refusal (exit 3, its fix), not vm create's advice to
+	// put the secret in the answers, which a seed refuses as well; before the registry is read.
+	_, err = seed(func(o *Options) { o.Set["ACCESS_TOKEN"] = "tok-not-to-be-printed"; o.Registry = "not a registry" }, "")
+	if r, ok := Refusal(err); !ok || !strings.Contains(r.Reason, "ACCESS_TOKEN: a seed carries no secret input") || strings.Contains(r.Reason, "tok-not") || !strings.Contains(r.Fix, "install --given -") {
 		t.Errorf("%v", err)
+	}
+	// vm create given a secret input on a command line: a refusal too (exit 3), never the value.
+	create := v.installer(func(o *Options) {
+		o.TLS, o.Set = "internal", map[string]string{"ADMIN_EMAIL": "admin@example.org", "APP_DOMAIN": "app.example.org", "API_DOMAIN": "api.example.org", "ACCESS_TOKEN": "tok-not-to-be-printed"}
+		o.Prompt = asked
+	})
+	if _, _, _, err := create.vmSettings(context.Background()); !isRefused(err) || !strings.Contains(err.Error(), "ACCESS_TOKEN is a secret input, which a command line never carries") ||
+		strings.Contains(err.Error(), "tok-not") || !strings.Contains(refusedFix(err), "--answers") {
+		t.Errorf("vm create --set of a secret: %v (fix %q)", err, refusedFix(err))
 	}
 	// A bad channel: refused before the registry is read (a --registry that does not parse would
 	// be refused first).

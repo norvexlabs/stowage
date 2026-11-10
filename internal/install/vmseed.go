@@ -36,6 +36,9 @@ type SeedDisk struct {
 	Image  string `json:"image"`
 }
 
+// seedSecretFix is the fix of a seed given a secret input or TLS material.
+const seedSecretFix = "leave the secret inputs and TLS material out of the seed, and give them once the VM answers, over SSH (install --given -)"
+
 // SeedVM is the first-boot material of a new VM of this release on c's platform, the
 // first install following channel (empty: the release's). It never asks (the run's prompter is
 // not read), and refuses a secret input or TLS material: a seed carries neither.
@@ -46,6 +49,13 @@ func (in *Installer) SeedVM(ctx context.Context, c *VMCreate, channel string) (*
 	}
 	if err := in.seedable(); err != nil {
 		return nil, err
+	}
+	// A secret input on the command line: the seed's own refusal, before the registry is read
+	// (vm create's, run by seedSettings, would advise the answers file, which a seed refuses too).
+	for _, i := range in.R.Spec.Inputs {
+		if _, set := in.O.Set[i.Key]; set && i.Secret {
+			return nil, refuse(seedSecretFix, "%s: a seed carries no secret input and no TLS material; they go after the boot, over SSH", i.Key)
+		}
 	}
 	// A --platform missing, unknown or whose disk the registry lacks is refused once the registry
 	// is read (platform), naming the platforms it offers: a fix that holds.
@@ -62,7 +72,7 @@ func (in *Installer) SeedVM(ctx context.Context, c *VMCreate, channel string) (*
 		return nil, err
 	}
 	if given != nil {
-		return nil, refuse("leave the secret inputs and TLS material out of the seed, and give them once the VM answers, over SSH (install --given -)",
+		return nil, refuse(seedSecretFix,
 			"%s: a seed carries no secret input and no TLS material; they go after the boot, over SSH", given.names())
 	}
 	if channel != "" {
