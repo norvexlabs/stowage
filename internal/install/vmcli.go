@@ -157,7 +157,7 @@ func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(
 			in.O.Prompt = prompt
 			in.O.Cert, in.O.Key, in.O.CA, in.O.ClientCA = expandHome(in.O.Cert), expandHome(in.O.Key), expandHome(in.O.CA), expandHome(in.O.ClientCA)
 			if err := in.Install(cmd.Context()); err != nil {
-				return vmRefusal(err)
+				return err
 			}
 			in.retune(cmd.Context(), vmTune(r.Ctl()), stderr)
 			in.Finished(cmd.Context(), onVM)
@@ -764,10 +764,13 @@ func (c *hostClient) do(ctx context.Context, method, path string, body, out any)
 		return unreachable{fmt.Errorf("the host daemon stopped before it answered: %w", err)}
 	}
 	if resp.StatusCode >= 400 {
-		var e struct{ Error, Fix string }
+		var e struct {
+			Error, Fix string
+			Refused    bool
+		}
 		switch {
 		case json.Unmarshal(raw, &e) != nil || e.Error == "":
-		case e.Fix != "": // the daemon's refusal: nothing changed
+		case e.Refused: // the daemon's refusal, with its fix or without: nothing changed
 			return Refused{Reason: e.Error, Fix: e.Fix}
 		default:
 			return errors.New(e.Error)

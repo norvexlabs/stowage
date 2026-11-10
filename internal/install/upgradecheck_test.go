@@ -37,15 +37,16 @@ func TestUpgradeRefusesWhatTheBootWouldBeforeWritingTheOS(t *testing.T) {
 	for name, c := range map[string]struct {
 		mod  func(*spec.Spec)
 		want string
+		fix  string // the VM's: none where the fix would be a flag of the upgrade, which takes none
 	}{
-		"a route on another's port": {docsRoute(8080), "notes 2.0.0 adds the route docs on port 8080, which app has"},
+		"a route on another's port": {docsRoute(8080), "notes 2.0.0 adds the route docs on port 8080, which app has", ""},
 		"a recorded input it declares as a file": {func(s *spec.Spec) {
 			i := slices.IndexFunc(s.Inputs, func(i spec.Input) bool { return i.Key == "ADMIN_EMAIL" })
 			s.Inputs[i].Type = spec.InputFile
-		}, "ADMIN_EMAIL: notes 2.0.0 declares it as a file"},
+		}, "ADMIN_EMAIL: notes 2.0.0 declares it as a file", "stay on the installed release: the project declares a changed input under a new key"},
 		"an input nothing gives": {func(s *spec.Spec) {
 			s.Inputs = append(s.Inputs, spec.Input{Key: "SMTP_HOST", Prompt: "Mail host", Required: true})
-		}, "missing required input(s), set by --set KEY=VALUE, the environment or --answers: SMTP_HOST (Mail host)"},
+		}, "missing required input(s), set by --set KEY=VALUE, the environment or --answers: SMTP_HOST (Mail host)", ""},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -54,10 +55,10 @@ func TestUpgradeRefusesWhatTheBootWouldBeforeWritingTheOS(t *testing.T) {
 			host := &fakeHost{}
 			hh := daemon(p.env, host).Handler()
 			var e errOf
-			// The boot's refusal is the upgrade's, with its fix.
+			// The boot's refusal is the upgrade's, with the fix it was raised with on the VM.
 			if code := call(t, hh, "POST", "/v1/upgrade", UpgradeRequest{Channel: "stable"}, &e); code != 409 || !strings.Contains(e.Error, c.want) ||
 				!strings.HasSuffix(e.Error, "the boot into 2.0.0-1 would refuse this upgrade (it is given no input), so its OS is not written") ||
-				e.Fix != "change what the install records with a re-run of its install (install --set, --answers), or choose another release" {
+				!e.Refused || e.Fix != c.fix {
 				t.Fatalf("%d %s (fix %q)", code, e.Error, e.Fix)
 			}
 			if calls := fmt.Sprint(host.calls()); strings.Contains(calls, "kairos-agent") {

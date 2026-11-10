@@ -688,27 +688,28 @@ func reply(w http.ResponseWriter, code int, v any) {
 }
 
 // replyErr answers err, with the code its httpError gives (500 without one); a refusal (Refused,
-// raised before the request changed anything) carries its fix too, which tells the client so —
-// but one whose fix holds for a Docker install alone (Refused.dockerOnly), a failure here.
+// raised before the request changed anything) is answered as one, refused true, with its fix when
+// it has one: the client exits 3 on it (hostClient.do).
 func replyErr(w http.ResponseWriter, err error) {
 	code := http.StatusInternalServerError
 	var he httpError
 	if errors.As(err, &he) {
 		code = he.code
 	}
-	body := map[string]string{"error": err.Error()}
-	if r, ok := Refusal(err); ok && r.Fix != "" && !r.dockerOnly {
-		body["fix"] = r.Fix
+	body := map[string]any{"error": err.Error()}
+	if r, ok := Refusal(err); ok {
+		body["refused"] = true
+		if r.Fix != "" {
+			body["fix"] = r.Fix
+		}
 	}
 	reply(w, code, body)
 }
 
-// failAs is err answered with code, a refusal kept one (its fix answered with it) unless its fix
-// holds for a Docker install alone (Refused.dockerOnly): the VM has no --dir, and keeps no
-// installer of its own to run.
+// failAs is err answered with code, a refusal kept one, with its fix or without.
 func failAs(code int, err error) error {
 	he := httpError{code, err.Error()}
-	if r, ok := Refusal(err); ok && !r.dockerOnly {
+	if r, ok := Refusal(err); ok {
 		return Refused{Reason: he.msg, Fix: r.Fix, cause: he}
 	}
 	return he
@@ -778,9 +779,10 @@ func (h *Hostd) source(in *Installer) (env *EnvFile, first bool, err error) {
 }
 
 // installedSpec is the spec carriedRelease tells for the release name version at revision, read
-// once per release and kept installer file (none, or its size and modification time): a status
-// does not read the kept installer, nor log it, at every request. A read that failed, or a file
-// that did not stat, is read again at the next.
+// once per release and kept installer file (none, or its size and modification time), whether the
+// read gave a spec or failed: a status does not read the kept installer, nor log it, at every
+// request. A file that stats with an error other than its absence gives no key: it is read, and
+// what is read not kept, at every request.
 func (h *Hostd) installedSpec(in *Installer, name, version string, revision int) *spec.Spec {
 	key := fmt.Sprintf("%s\x00%s\x00%d\x00", name, version, revision)
 	// A file that does not stat (absent aside) gives no key: what is read is not kept.
@@ -797,14 +799,13 @@ func (h *Hostd) installedSpec(in *Installer, name, version string, revision int)
 		return h.carriedSpec
 	}
 	h.carriedMu.Unlock()
-	// Read outside the lock: a status waits on no other's read. A read that failed is not kept,
-	// so the next status reads it again.
+	// Read outside the lock: a status waits on no other's read.
 	k := *in
 	k.O.Log = h.O.Log // what it logs is the daemon's, once
 	_, s, err := k.readCarried(name, version, revision)
 	if err != nil {
 		h.O.logf("%v", err)
-		return nil
+		s = nil // kept as no spec: read and logged again once the key changes
 	}
 	if keep {
 		h.carriedMu.Lock()
@@ -1112,7 +1113,7 @@ func (h *Hostd) serviceAction(w http.ResponseWriter, r *http.Request) {
 	}
 	// Under the lock, which a restore holds while it marks them.
 	if err := in.volumesSplit(); args[0] != "stop" && err != nil {
-		replyErr(w, fail(http.StatusConflict, "%v", err))
+		replyErr(w, failAs(http.StatusConflict, err))
 		return
 	}
 	svc := r.PathValue("service")
@@ -1301,7 +1302,7 @@ func (h *Hostd) resetPlan(ctx context.Context, in *Installer, newBaseline bool, 
 	}
 	if k.Release != nil {
 		if err := (&Installer{R: k.Release, O: in.O}).upgradeCheck(ctx, env); err != nil {
-			return ResetPlan{}, nil, "", fail(http.StatusConflict, "%v\nthe boot into %s would refuse it (it is given no input), so its OS is not written", err, m.Tag)
+			return ResetPlan{}, nil, "", failAs(http.StatusConflict, fmt.Errorf("%w\nthe boot into %s would refuse it (it is given no input), so its OS is not written", err, m.Tag))
 		}
 	}
 	key.plan = ResetPlan{Target: Version{m.ProjectVersion, m.Revision},
@@ -1389,7 +1390,7 @@ func (h *Hostd) resetDB(w http.ResponseWriter, r *http.Request) {
 			return fail(http.StatusConflict, "%v: reboot first, then reset-db", err)
 		}
 		if err := in.volumesSplit(); err != nil {
-			return fail(http.StatusConflict, "%v", err)
+			return failAs(http.StatusConflict, err)
 		}
 		return nil
 	})
@@ -1477,22 +1478,16 @@ func (h *Hostd) target(ctx context.Context, in *Installer, env *EnvFile, channel
 // after reports whether m comes after the release the OS carries, by the scheme m records; a
 // `command` scheme, which the daemon does not run, orders by revision within one version only.
 func (h *Hostd) after(m *release.Manifest) (bool, error) {
-	return releaseAfter(m, h.R.Manifest.ProjectVersion, h.R.Manifest.Revision)
-}
-
-// releaseAfter reports whether m comes after version at revision, by the scheme m records; a
-// `command` scheme, which an install does not run, orders by revision within one version only,
-// and puts m after any other version.
-func releaseAfter(m *release.Manifest, version string, revision int) (bool, error) {
-	c, err := compareTo(m, version)
+	cur := h.R.Manifest
+	c, err := compareTo(m, cur.ProjectVersion)
 	if err != nil {
 		return false, err
 	}
-	if m.Scheme.Provider == "command" && m.ProjectVersion != version {
+	if m.Scheme.Provider == "command" && m.ProjectVersion != cur.ProjectVersion {
 		return true, nil
 	}
 	if c == 0 {
-		return m.Revision > revision, nil
+		return m.Revision > cur.Revision, nil
 	}
 	return c < 0, nil
 }

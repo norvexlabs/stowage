@@ -21,11 +21,12 @@ import (
 func (in *Installer) upgradeCheck(ctx context.Context, env *EnvFile) error {
 	o := &in.O
 	o.Set, o.Answers, o.Ports, o.Prompt = nil, nil, nil, nil
+	in.givenNothing = o.Preloaded
 	o.Getenv = func(string) string { return "" } // the boot's environment gives no input either
 	if err := in.R.checkFront(); err != nil {
 		return err
 	}
-	if _, _, _, err := sameProject(o.Dir, env, in.R.Manifest); err != nil {
+	if _, _, _, err := in.sameProject(env, in.R.Manifest); err != nil {
 		return err
 	}
 	mode, _ := env.Get("STOWAGE_TLS_MODE")
@@ -71,7 +72,7 @@ func (h *Hostd) checkUpgrade(ctx context.Context, in *Installer, env *EnvFile, m
 	// crossing whose boot fell back — the later one its own installer carries.
 	var running baselined = in
 	if this := in.R.Manifest; v != this.ProjectVersion || rev != strconv.Itoa(this.Revision) {
-		kept, err := in.vmKeptInstaller(ctx, name, v, rev)
+		kept, err := in.keptInstaller(ctx, name, v, rev)
 		if err != nil {
 			return failAs(http.StatusConflict, err)
 		}
@@ -95,12 +96,8 @@ func (h *Hostd) checkUpgrade(ctx context.Context, in *Installer, env *EnvFile, m
 	}
 	t := &Installer{R: k.Release, O: in.O}
 	if err := t.upgradeCheck(ctx, env); err != nil {
-		// The refusal's own fix is the Docker installer's flags': the VM's is a re-run of its install.
-		msg := fmt.Sprintf("%v\nthe boot into %s would refuse this upgrade (it is given no input), so its OS is not written", err, m.Tag)
-		if _, ok := Refusal(err); ok {
-			return refuseAs(http.StatusConflict, "change what the install records with a re-run of its install (install --set, --answers), or choose another release", "%s", msg)
-		}
-		return fail(http.StatusConflict, "%s", msg)
+		// A refusal stays one, with the fix it was raised with on the VM (or none).
+		return failAs(http.StatusConflict, fmt.Errorf("%w\nthe boot into %s would refuse this upgrade (it is given no input), so its OS is not written", err, m.Tag))
 	}
 	return nil
 }

@@ -2016,7 +2016,9 @@ again, to copy an installer to another host.
   or pending); `refused` only on a refusal:
   `reason` the message the error line prints, naming the specifics; `fix` advice for the
   operator, what to run or change — a program shows it, never runs it (where another installer
-  answers, it names that installer, run in this one's place with the same arguments). A run that
+  answers, it names that installer, run in this one's place with the same arguments). `fix` is
+  chosen for the shape that refused, and is absent when no advice holds there (on the VM, see
+  "Exit status and `--json` on the VM"): the run is still refused, exit 3. A run that
   fails prints no object, only its error. `upgrade --version --json` passes `--json` to the
   installer it fetches, which prints the object; the run that fetched it prints none and exits
   with that installer's status (an installer from before 0.34.0 refuses the flag).
@@ -4089,9 +4091,9 @@ in the same installer (bootstrap it as above, then `sh <name>.sh vm create …`,
   table below, and its image by digest, in the mirror with `--registry`). `waiting` names, sorted,
   the keys of the required secret inputs nothing gives (never a value; left out when there are
   none): the VM's first install waits for them, as `vm create` says, until they are given over
-  SSH (`sudo <short>-stow install --given - --no-input`). `--platform` missing or not a platform
-  Stowage knows is refused before the registry is read; one the registry holds no disk for, after
-  (each exits 3, its fix naming the platforms to give).
+  SSH (`sudo <short>-stow install --given - --no-input`). `--platform` missing, not a platform
+  Stowage knows, or one the registry holds no disk for is refused once the registry is read (exit
+  3), its fix naming the platforms that registry offers.
 - The platform decides the disk format (the first of its formats the registry holds: a mirror
   carries the formats its `mirror export --disks` named) and how the cloud-config reaches the VM.
   Only the platforms the registry has a disk for are offered; a `--platform` whose formats the
@@ -4671,7 +4673,7 @@ sudo <short>-stow network attach --role ROLE --mac MAC [--mode dhcp|static|none]
 - **Exit status and `--json` on the VM.** `install`, `upgrade` and `rollback` take `--json`, as
   the Docker installer's verbs do (see "`--json` on the verbs that change an install"): one
   object on standard output at the run's end, `{"format", "result", "release", "refused":
-  {"reason", "fix"}}`, everything the run prints for people (`upgrade`'s release and changelog,
+  {"reason", "fix"}}` (`fix` absent when no advice holds on the VM), everything the run prints for people (`upgrade`'s release and changelog,
   `rollback`'s plan, the job's log) going to standard error, and a failure printing no object,
   only its error. `release` is the release the install runs as the run ends: `upgrade` and
   `rollback` end as their job schedules the reboot, so theirs is the release installed before
@@ -4679,8 +4681,11 @@ sudo <short>-stow network attach --role ROLE --mac MAC [--mode dhcp|static|none]
   daemon does not answer then, said on standard error); after the reboot, a new `boot_id` and
   `installed` in `status --json` tell how it went. `upgrade` with nothing to upgrade to is
   `nothing`. `refused.fix` is advice for a person — what to choose or change —, never a command
-  line to run. Each `<short>-stow` run exits `0` done or nothing to do, `3` refused (a rule
-  said no before anything changed, the error on standard error naming the fix), `1` failed.
+  line to run, and holds on the VM: a refusal whose Docker fix names `--dir`, the installer the
+  install keeps run by hand, or a flag of the upgrade (which on the VM takes none) carries no
+  fix here, and is still a refusal. Each `<short>-stow` run exits `0` done or nothing to do, `3`
+  refused (a rule said no before anything changed, the error on standard error naming what is
+  wrong), `1` failed.
   The refusals: on `install` (a first install or its re-run, which the VM runs itself as the
   Docker shape does): `--secrets` with `--given` or `--kit`; a directory holding another
   project's `compose.yaml`, or that became an install meanwhile; a re-run given `--secrets`, or
@@ -4690,38 +4695,44 @@ sudo <short>-stow network attach --role ROLE --mac MAC [--mode dhcp|static|none]
   check's container an earlier run left; volumes a restore left half restored; a required input
   missing or a value its input refuses; ports in use, a front port that is an L4 route's, an L4
   route bound to an address the VM does not have, an existing `tls/`, `--ports`/`--address` or
-  `--http-port`/`--https-port` in the wrong TLS mode. A re-run by the installer of another
-  release than the one installed, and another project's install or one kept by another installer
-  name, are failures (`1`, no `--json` result) on the VM: the Docker shape's fix runs another
-  installer with `--dir`, which the VM has none of. On `upgrade`: `--given` or `--kit`;
+  `--http-port`/`--https-port` in the wrong TLS mode (the fix of an existing `tls/` is to move it
+  away). Refused without a fix on the VM — no step of its verbs is sure to clear them, so the
+  reason names what is wrong alone: a re-run by the installer of another release than the one
+  installed (`<dir> runs <name> <v> (revision <r>), and this OS's installer carries …`), another
+  project's install or one kept by another installer name, and a directory holding another
+  project's `compose.yaml`. On `upgrade`: `--given` or `--kit`;
   `--version V` refused here (`upgrade --version V: refused, the install went back from …`, or
   `… is not one this VM, which runs …, can be upgraded to …`); no terminal to confirm on without
   `--yes`; and what the host daemon refuses, below. On `rollback`: no terminal to confirm on
   without `--yes`, and what the daemon refuses. An operator's "no" at a prompt (`aborted`:
   `install`'s form, `upgrade`, `rollback`, `restore`, and on the operator's machine `vm
   create`'s confirmation and `vm destroy`'s) is a refusal too. Every verb that asks the host
-  daemon exits `3` on an error answer carrying a `fix` (a refusal, the daemon having changed
-  nothing) and `1` on any other: the daemon refuses an upgrade to a yanked release (the
+  daemon exits `3` on an error answer marked `refused` (a refusal, the daemon having changed
+  nothing; its `fix` when it has one) and `1` on any other: the daemon refuses an upgrade to a yanked release (the
   channel's, or `--version`'s), to a version or revision not published on the channel, to one
   no key the OS's `<short>-stow` trusts signed, to one that does not come after the OS's
   release, to one published without an OS bundle, to one the install went back from, to one at
-  another schema baseline, to one the boot into it would refuse (its fix: change what the install records with a re-run of its install, `install --set` or `--answers`, or choose another release), and while
-  a restore left the volumes half restored; an upgrade of an install whose kept `<short>-stow`
-  is not the installer of the release it runs (another release's, or none it reads) when that
-  release comes after the OS's — a crossing whose boot fell back (`<dir>/<short>-stow is not the
-  installer of <name> <v> (revision <r>), which the install runs: …; `<short>-stow upgrade
-  --version <v>` writes its OS again`; its fix: write that OS again, whose boot keeps that
-  release's installer), and a failure otherwise; a rollback when the VM runs the passive system
-  already, when there is no passive system or no previous release kept, while another
+  another schema baseline, to one the boot into it would refuse (the boot's refusal, `…\nthe
+  boot into <tag> would refuse this upgrade (it is given no input), so its OS is not written`,
+  with the fix it has on the VM: a re-run of the install for what the install records —
+  `sudo <short>-stow install --tls MODE`, `--set <input>=<domain>`, or `--cert FILE --key FILE`
+  for a certificate that covers a route the release adds —, none where the Docker fix is a flag
+  of the upgrade, such as a port or an input the release adds), and while a restore left the
+  volumes half restored; an upgrade of an install whose kept `<short>-stow` is not the installer
+  of the release it runs (another release's or revision's, none it reads, or none at all),
+  whatever the order of that release and the OS's (`<dir>/<short>-stow is not the installer of
+  <name> <v> (revision <r>), which the install runs: …`, no fix: an `upgrade --version` finds a
+  version's latest revision, not the one the install runs); a rollback when the VM runs the
+  passive system already, when there is no passive system or no previous release kept, when the
+  install runs another release than the OS's (no fix), when the install is another project's or
+  is kept by another installer name (no fix), while another
   lifecycle run holds the install's lock or a hook's or check's container an earlier run left is
   there, while the volumes are half restored, when the kept previous release is not one release
   (its installer, its record and its `.env` name others: look into the kept directory) or its
   installer does not read its own release, and when the rollback check says no (a rollback
   barrier since the upgrade, or a newer schema the previous release does not read); and on any
   verb a refusal of the Docker shape's that its handler runs (another run holding the install's
-  lock). A refusal of the Docker shape's whose fix runs another installer with `--dir` or the
-  installer the install keeps (another project's install, one kept by another installer name) is
-  answered as a failure, with no fix. A job running, a reboot scheduled, a boot not judged yet, a
+  lock), with the fix it has on the VM or none. A job running, a reboot scheduled, a boot not judged yet, a
   daemon that does not answer: failures (`1`). Once
   `upgrade`'s or `rollback`'s job started, anything that stops the verb is a failure, a refusal
   answered while it follows the job included. `boot-rollback` starts the database first, its
@@ -4733,7 +4744,7 @@ sudo <short>-stow network attach --role ROLE --mac MAC [--mode dhcp|static|none]
   reboot stopped (it starts nothing first), the rollback's refusals exit 3 as `rollback`'s.
   `boot` exits 1 on any refusal it raises, a boot changing the install from its first step (an
   install whose kept `<short>-stow` is not the installer of the release it runs says so, naming
-  `<short>-stow upgrade --version <v>` when that release comes after the OS's), and
+  no way out), and
   on whatever an installer it runs exits with — but `boot-rollback`'s 3 when the OS fell back
   to the release the last upgrade replaced: the rollback check said no before anything changed,
   so the boot exits 3 too, claiming no change, unless the boot itself removed a mark before it
@@ -5556,7 +5567,7 @@ showed another plan: look again`), `GET updates?channel=&version=` (`left_by_rol
   identity, as `GET job` and the journal's `job` give it) and the journal's last `seq` once its
   `job.started` was written, which its `job.ended` (and its reboot's entries) come after — `null`
   when the start could not be journaled, with `{"events_error": "the job's start could not be
-  journaled: …"}` beside it (absent otherwise): a client then takes no cursor from it. An error is `{"error": "…"}` with a 4xx or 5xx status, and a refusal (a rule said no, nothing changed) `{"error": "…", "fix": "…"}`, the fix advice for a person, which the verbs exit 3 on; a body with an unknown field is refused.
+  journaled: …"}` beside it (absent otherwise): a client then takes no cursor from it. An error is `{"error": "…"}` with a 4xx or 5xx status, and a refusal (a rule said no, nothing changed) `{"error": "…", "refused": true, "fix": "…"}`, the fix advice for a person that holds on the VM, absent when none does, which the verbs exit 3 on (an answer without `refused` is a failure, fix or not); a body with an unknown field is refused.
 - A disaster recovery: `secrets export --recipient age1…` while the VM lives (the file kept off
   it), backups to a destination off it; on a new VM, `vm create --secrets FILE` (the file
   decrypted) installs with those secrets over SSH, after `systemctl start <name>.service` (a

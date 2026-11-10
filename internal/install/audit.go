@@ -63,7 +63,7 @@ func (in *Installer) auditRelease(ctx context.Context, o AuditOptions) (*auditSo
 	}
 	channel := in.R.Manifest.Channel
 	if envErr == nil {
-		pname, cur, rev, err := sameProject(in.O.Dir, env, in.R.Manifest)
+		pname, cur, rev, err := in.sameProject(env, in.R.Manifest)
 		if err != nil {
 			return nil, err
 		}

@@ -77,7 +77,7 @@ func (in *Installer) open() (*EnvFile, error) {
 	in.O.Dir = dir
 	env, err := ReadEnvFile(in.path(envName))
 	if errors.Is(err, os.ErrNotExist) {
-		return nil, refuse("install first, or give the --dir of the install", "%s holds no install", dir)
+		return nil, refuse(in.fixOn("install first, or give the --dir of the install", "install first"), "%s holds no install", dir)
 	}
 	return env, err
 }
@@ -89,18 +89,22 @@ func (in *Installer) ctl() string { return in.path(in.R.Ctl()) }
 // under another installer name. The install keeps its installer as <short_name>-stow, and finds
 // it again by the name of the release it runs, so short_name never changes over an install: a
 // release that renames the installer is installed afresh.
-// It returns which release the install runs (runs).
-func sameProject(dir string, env *EnvFile, m *release.Manifest) (name, version, revision string, err error) {
+// It returns which release the install runs (runs). The install is O.Dir's; on the VM, whose
+// directory and installer are its OS's, its refusals carry no fix.
+func (in *Installer) sameProject(env *EnvFile, m *release.Manifest) (name, version, revision string, err error) {
+	dir := in.O.Dir
 	name, version, revision = runs(env)
 	if name != m.Name {
-		return "", "", "", dockerRefusal("give the --dir of an install of "+m.Name, "%s holds an install of %q, not %q", dir, name, m.Name)
+		return "", "", "", refuse(in.fixOn("give the --dir of an install of "+m.Name, ""), "%s holds an install of %q, not %q", dir, name, m.Name)
 	}
 	if short, _ := env.Get("STOWAGE_SHORT_NAME"); short != m.ShortName {
 		kept := filepath.Join(dir, providers.Ctl(short))
 		if short == "" {
 			kept = "the installer the install keeps in " + dir
 		}
-		return "", "", "", dockerRefusal(sameArgs(kept, "it knows this install", "")+", for the release the install runs; or install this release afresh, "+providers.Ctl(m.ShortName)+" --dir <another directory>", "%s holds an install of %s kept by %s, not %s (short_name %q, this release's %q): run the installer it keeps, or install this release afresh", dir, name, providers.Ctl(short), providers.Ctl(m.ShortName), short, m.ShortName)
+		way := in.fixOn(": run the installer it keeps, or install this release afresh", "")
+		return "", "", "", refuse(in.fixOn(sameArgs(kept, "it knows this install", "")+", for the release the install runs; or install this release afresh, "+providers.Ctl(m.ShortName)+" --dir <another directory>", ""),
+			"%s holds an install of %s kept by %s, not %s (short_name %q, this release's %q)%s", dir, name, providers.Ctl(short), providers.Ctl(m.ShortName), short, m.ShortName, way)
 	}
 	return name, version, revision, nil
 }
@@ -157,6 +161,7 @@ func (in *Installer) Upgrade(ctx context.Context) (err error) {
 	var mutated bool
 	defer afterChange(&mutated, &err)
 	o := &in.O
+	in.givenNothing = o.Preloaded // the VM's is its boot's
 	if err := in.R.checkFront(); err != nil {
 		return err
 	}
@@ -166,7 +171,7 @@ func (in *Installer) Upgrade(ctx context.Context) (err error) {
 	}
 	defer unlock()
 	m := in.R.Manifest
-	name, cur, rev, err := sameProject(o.Dir, env, m)
+	name, cur, rev, err := in.sameProject(env, m)
 	if err != nil {
 		return err
 	}
@@ -179,7 +184,7 @@ func (in *Installer) Upgrade(ctx context.Context) (err error) {
 		return nil
 	}
 	if c := in.crossing; c != nil && (c.version != cur || c.revision != rev) {
-		return refuse(cmp.Or(o.Self, in.ctl())+" reset-db --new-baseline --dir "+o.Dir, "%s runs %s %s (revision %s) now, not %s (revision %s), which was confirmed: nothing was wiped; reset-db --new-baseline again", o.Dir, name, cur, rev, c.version, c.revision)
+		return refuse(in.fixOn(cmp.Or(o.Self, in.ctl())+" reset-db --new-baseline --dir "+o.Dir, in.vmCtl()+" reset-db --new-baseline"), "%s runs %s %s (revision %s) now, not %s (revision %s), which was confirmed: nothing was wiped; reset-db --new-baseline again", o.Dir, name, cur, rev, c.version, c.revision)
 	}
 	if err := in.newer(cur, rev); err != nil {
 		return err
@@ -334,7 +339,7 @@ func (in *Installer) upgradeRefusals(ctx context.Context, env *EnvFile, name, cu
 		return "", publish{}, nil, nil, err
 	}
 	if o.Offline && pinnedImages(env) {
-		return "", publish{}, nil, nil, refusal("leave out --offline", errors.New("--offline: this install pulls its images by digest; an install made with --offline upgrades from loaded images"))
+		return "", publish{}, nil, nil, refusal(in.flagFix("leave out --offline"), errors.New("--offline: this install pulls its images by digest; an install made with --offline upgrades from loaded images"))
 	}
 	if err := in.recordedForms(env); err != nil {
 		return "", publish{}, nil, nil, err
@@ -346,7 +351,7 @@ func (in *Installer) upgradeRefusals(ctx context.Context, env *EnvFile, name, cu
 	if raw, err := os.ReadFile(filepath.Join(in.path(PrevDir), prevState)); err == nil {
 		var st state
 		if json.Unmarshal(raw, &st) == nil && st.ProjectVersion == cur && strconv.Itoa(st.Revision) == rev {
-			return "", publish{}, nil, nil, refuse(in.ctl()+" rollback --dir "+o.Dir, "an upgrade from or a rollback to %s %s stopped before it finished: `%s rollback --dir %s` finishes it, back on %s %s", name, cur, in.ctl(), o.Dir, name, cur)
+			return "", publish{}, nil, nil, refuse(in.fixOn(in.ctl()+" rollback --dir "+o.Dir, ""), "an upgrade from or a rollback to %s %s stopped before it finished: `%s rollback --dir %s` finishes it, back on %s %s", name, cur, in.ctl(), o.Dir, name, cur)
 		}
 	}
 	kept, err = in.keptInstaller(ctx, name, cur, rev)
@@ -364,7 +369,7 @@ func (in *Installer) upgradeRefusals(ctx context.Context, env *EnvFile, name, cu
 			return "", publish{}, nil, nil, cmp.Or(err, refuse("install the release afresh", "neither %s %s nor %s %s names a volume in data.reset: --new-baseline has nothing to wipe, and the new release would start on the old baseline's data", name, cur, name, m.ProjectVersion))
 		}
 	} else if from, to, ok := baselines(o, kept, in); ok && from != to {
-		return "", publish{}, nil, nil, refuse(cmp.Or(o.Self, in.ctl())+" reset-db --new-baseline --dir "+o.Dir, "%s %s starts schema baseline %d, and the install runs %s %s, at baseline %d: its data cannot carry over, so it moves to %s only with its data wiped: `%s reset-db --new-baseline --dir %s` wipes it and installs %s",
+		return "", publish{}, nil, nil, refuse(in.fixOn(cmp.Or(o.Self, in.ctl())+" reset-db --new-baseline --dir "+o.Dir, ""), "%s %s starts schema baseline %d, and the install runs %s %s, at baseline %d: its data cannot carry over, so it moves to %s only with its data wiped: `%s reset-db --new-baseline --dir %s` wipes it and installs %s",
 			m.Name, m.ProjectVersion, to, name, cur, from, m.ProjectVersion, cmp.Or(o.Self, in.ctl()), o.Dir, m.ProjectVersion)
 	}
 	if o.Self == "" {
@@ -450,39 +455,27 @@ func (in *Installer) addedInputs(env *EnvFile, mode string) []input {
 }
 
 // keptInstaller returns the release the install's kept installer carries (readKept), and refuses
-// one that is not the release it runs: kept with it in PrevDir, that installer is what a rollback
-// goes back with.
+// one that is not the release it runs: kept with it in PrevDir, that installer is what a
+// rollback goes back with. On Docker the installer of that release, run again, keeps itself; the
+// VM's kept installer is its OS's, which no step of its verbs is sure to put back, so there the
+// refusal — an absent one's too — has no fix, whatever the order of the two releases.
 func (in *Installer) keptInstaller(ctx context.Context, name, version, revision string) (*keptRelease, error) {
 	k, refused, err := in.installerOf(ctx, name, version, revision)
 	if err == nil {
 		return k, nil
 	}
-	err = fmt.Errorf("%s is not the installer of %s %s (revision %s), so a rollback could not go back: re-run that release's installer in %s first (%w)",
-		in.ctl(), name, version, revision, in.O.Dir, err)
+	if in.O.Preloaded {
+		// An absent one too: the VM's comes from its OS's boot alone.
+		refused = refused || errors.Is(err, os.ErrNotExist)
+		err = fmt.Errorf("%s is not the installer of %s %s (revision %s), which the install runs: %w", in.ctl(), name, version, revision, err)
+	} else {
+		err = fmt.Errorf("%s is not the installer of %s %s (revision %s), so a rollback could not go back: re-run that release's installer in %s first (%w)",
+			in.ctl(), name, version, revision, in.O.Dir, err)
+	}
 	if refused {
-		return nil, refusal(fmt.Sprintf("run the installer of %s %s with --dir %s", name, version, in.O.Dir), err)
+		return nil, refusal(in.fixOn(fmt.Sprintf("run the installer of %s %s with --dir %s", name, version, in.O.Dir), ""), err)
 	}
 	return nil, err
-}
-
-// vmKeptInstaller is keptInstaller on the VM, whose way out is its own: the OS of the release the
-// install runs, written again by `upgrade --version`, whose boot re-runs the install, which keeps
-// its installer. The daemon upgrades only to a release after the OS's, so that way is a refusal's
-// fix for an install of a later release alone (a crossing whose boot fell back); else a failure,
-// naming no way.
-func (in *Installer) vmKeptInstaller(ctx context.Context, name, version, revision string) (*keptRelease, error) {
-	k, refused, err := in.installerOf(ctx, name, version, revision)
-	if err == nil {
-		return k, nil
-	}
-	err = fmt.Errorf("%s is not the installer of %s %s (revision %s), which the install runs: %w", in.ctl(), name, version, revision, err)
-	n, nerr := strconv.Atoi(revision)
-	osAfter, cerr := releaseAfter(in.R.Manifest, version, n)
-	if !refused || nerr != nil || cerr != nil || osAfter {
-		return nil, err
-	}
-	return nil, refusal("write the OS of the release the install runs again (upgrade --version "+version+"): its boot keeps that release's installer",
-		fmt.Errorf("%w; `%s upgrade --version %s` writes its OS again", err, in.R.Ctl(), version))
 }
 
 // installerOf returns the release the install's kept installer carries (readKept) when it is
@@ -522,8 +515,8 @@ func (in *Installer) newer(cur, rev string) error {
 		return err
 	}
 	if cmp.Or(c, cmp.Compare(r, m.Revision)) > 0 {
-		return refuse(laterFix(in.ctl()), "%s runs %s %s (revision %d), after this installer's %s (revision %d): `%s rollback --dir %s` goes back one upgrade",
-			in.O.Dir, m.Name, cur, r, m.ProjectVersion, m.Revision, in.ctl(), in.O.Dir)
+		return refuse(in.fixOn(laterFix(in.ctl()), "nothing to do: the install runs a later release"), "%s runs %s %s (revision %d), after this installer's %s (revision %d)%s",
+			in.O.Dir, m.Name, cur, r, m.ProjectVersion, m.Revision, in.fixOn(fmt.Sprintf(": `%s rollback --dir %s` goes back one upgrade", in.ctl(), in.O.Dir), ""))
 	}
 	return nil
 }
@@ -546,7 +539,7 @@ func (in *Installer) sameFront(env *EnvFile, mode string) error {
 		return refuse("install the release afresh", "%s %s serves through a front, and this install has none: a front needs a new install", m.Name, m.ProjectVersion)
 	}
 	if !slices.Contains(in.R.Spec.Front.TLSModes, mode) {
-		return refuse(in.ctl()+" --dir "+in.O.Dir+" --tls MODE moves the install to a mode it offers, then upgrade", "%s %s does not offer the TLS mode this install uses (%s)", m.Name, m.ProjectVersion, mode)
+		return refuse(in.fixOn(in.ctl()+" --dir "+in.O.Dir+" --tls MODE moves the install to a mode it offers, then upgrade", in.vmCtl()+" install --tls MODE moves the install to a mode it offers, then upgrade"), "%s %s does not offer the TLS mode this install uses (%s)", m.Name, m.ProjectVersion, mode)
 	}
 	if mode == Loopback {
 		return nil
@@ -559,8 +552,9 @@ func (in *Installer) sameFront(env *EnvFile, mode string) error {
 		case !recorded && !published:
 			unrecorded = true // an input the release adds: given with the others
 		case v == "":
-			return refuse(fmt.Sprintf("%s --dir %s --set %s=<domain>, then upgrade", in.ctl(), in.O.Dir, r.DomainInput), "%s %s takes the domain of %s from %s, which this install does not record (or records empty): give it to a re-run of the installer the install runs, `%s --dir %s --set %s=<domain>`, then upgrade",
-				m.Name, m.ProjectVersion, r.Name, r.DomainInput, in.ctl(), in.O.Dir, r.DomainInput)
+			rerun := in.fixOn(fmt.Sprintf("%s --dir %s --set %s=<domain>", in.ctl(), in.O.Dir, r.DomainInput), fmt.Sprintf("%s install --set %s=<domain>", in.vmCtl(), r.DomainInput))
+			return refuse(rerun+", then upgrade", "%s %s takes the domain of %s from %s, which this install does not record (or records empty): give it to a re-run of the installer the install runs, `%s`, then upgrade",
+				m.Name, m.ProjectVersion, r.Name, r.DomainInput, rerun)
 		}
 	}
 	if unrecorded {
@@ -568,9 +562,16 @@ func (in *Installer) sameFront(env *EnvFile, mode string) error {
 	}
 	_, err := in.routeDomains(mode, func(k string) string { v, _ := env.Get(k); return v })
 	if err != nil {
-		return refuse(in.ctl()+" --dir "+in.O.Dir+" gives the routes their domains, then upgrade", "%s %s: %w; give the routes their domains with a re-run of the installer the install runs, `%s --dir %s`, then upgrade", m.Name, m.ProjectVersion, err, in.ctl(), in.O.Dir)
+		rerun := in.fixOn(in.ctl()+" --dir "+in.O.Dir, in.vmCtl()+" install --set KEY=<domain>")
+		return refuse(rerun+" gives the routes their domains, then upgrade", "%s %s: %w; give the routes their domains with a re-run of the installer the install runs, `%s`, then upgrade", m.Name, m.ProjectVersion, err, rerun)
 	}
 	return nil
+}
+
+// certFix is the fix of an upgrade the install's byo certificate does not cover: a re-run of the
+// install giving it one that does.
+func (in *Installer) certFix() string {
+	return in.fixOn(in.ctl()+" --dir "+in.O.Dir, in.vmCtl()+" install") + " --cert FILE --key FILE gives the install a certificate that covers it, then upgrade"
 }
 
 // upgradePorts is where the upgraded install's front listens: in a TLS mode the recorded HTTP and
@@ -584,11 +585,11 @@ func (in *Installer) upgradePorts(env *EnvFile, mode string) (publish, error) {
 	port := func(k string) int { p, _ := strconv.Atoi(get(k)); return p }
 	switch {
 	case !s.HasFront() && len(o.Ports) > 0:
-		return publish{}, refuse("leave out --ports", "--ports: %s %s has no front", m.Name, m.ProjectVersion)
+		return publish{}, refuse(in.flagFix("leave out --ports"), "--ports: %s %s has no front", m.Name, m.ProjectVersion)
 	case !s.HasFront():
 		return publish{}, nil
 	case mode != Loopback && len(o.Ports) > 0:
-		return publish{}, refuse("leave out --ports", "--ports is for loopback mode: this install's front serves %s, on its recorded ports", mode)
+		return publish{}, refuse(in.flagFix("leave out --ports"), "--ports is for loopback mode: this install's front serves %s, on its recorded ports", mode)
 	case mode != Loopback:
 		return publish{addr: "127.0.0.1", all: true, ports: map[string]int{"http": port(HTTPPortVar), "https": port(HTTPSPortVar)}}, nil
 	}
@@ -597,7 +598,7 @@ func (in *Installer) upgradePorts(env *EnvFile, mode string) (publish, error) {
 	for _, r := range s.Front.Routes {
 		if _, ok := env.Get(spec.URLVar(r.Name)); ok {
 			if _, given := o.Ports[r.Name]; given {
-				return publish{}, refuse("leave out --ports "+r.Name, "--ports: the route %s is recorded at the install, and an upgrade keeps its port (only a route the release adds is given one)", r.Name)
+				return publish{}, refuse(in.flagFix("leave out --ports "+r.Name), "--ports: the route %s is recorded at the install, and an upgrade keeps its port (only a route the release adds is given one)", r.Name)
 			}
 			pub.ports[r.Name] = port(PortVar(r.Name))
 			continue
@@ -607,22 +608,22 @@ func (in *Installer) upgradePorts(env *EnvFile, mode string) (publish, error) {
 			p, ok = s.Front.LoopbackPorts[r.Name]
 		}
 		if !ok {
-			return publish{}, refuse("--ports "+r.Name+"=PORT", "%s %s adds the route %s, which has no loopback port: give it one with --ports %s=PORT", m.Name, m.ProjectVersion, r.Name, r.Name)
+			return publish{}, refuse(in.flagFix("--ports "+r.Name+"=PORT"), "%s %s adds the route %s, which has no loopback port: give it one with --ports %s=PORT", m.Name, m.ProjectVersion, r.Name, r.Name)
 		}
 		if p < 1 || p > 65535 {
-			return publish{}, refuse("--ports "+r.Name+"=PORT, a port from 1 to 65535", "--ports: %s=%d is not a TCP port", r.Name, p)
+			return publish{}, refuse(in.flagFix("--ports "+r.Name+"=PORT, a port from 1 to 65535"), "--ports: %s=%d is not a TCP port", r.Name, p)
 		}
 		pub.ports[r.Name], added.ports[r.Name] = p, p
 	}
 	for _, k := range sortedKeys(o.Ports) {
 		if _, ok := pub.ports[k]; !ok {
-			return publish{}, refuse("--ports names a route the release adds", "--ports: %q is no route (%s)", k, strings.Join(s.Front.RouteNames(), ", "))
+			return publish{}, refuse(in.flagFix("--ports names a route the release adds"), "--ports: %q is no route (%s)", k, strings.Join(s.Front.RouteNames(), ", "))
 		}
 	}
 	for _, k := range sortedKeys(added.ports) {
 		for _, other := range sortedKeys(pub.ports) {
 			if other != k && pub.ports[other] == added.ports[k] {
-				return publish{}, refuse("--ports "+k+"=PORT", "%s %s adds the route %s on port %d, which %s has: choose another with --ports %s=PORT", m.Name, m.ProjectVersion, k, added.ports[k], other, k)
+				return publish{}, refuse(in.flagFix("--ports "+k+"=PORT"), "%s %s adds the route %s on port %d, which %s has: choose another with --ports %s=PORT", m.Name, m.ProjectVersion, k, added.ports[k], other, k)
 			}
 		}
 	}
@@ -646,7 +647,7 @@ func (in *Installer) upgradeRoutes(env, next *EnvFile, mode string, pub publish)
 	if mode != Loopback {
 		for _, r := range s.Front.Routes {
 			if get(r.DomainInput) == "" {
-				return refuse("--set "+r.DomainInput+"=<domain>", "%s %s adds the route %s, whose domain %s nothing gives: --set %s=<domain>", m.Name, m.ProjectVersion, r.Name, r.DomainInput, r.DomainInput)
+				return refuse(in.flagFix("--set "+r.DomainInput+"=<domain>"), "%s %s adds the route %s, whose domain %s nothing gives: --set %s=<domain>", m.Name, m.ProjectVersion, r.Name, r.DomainInput, r.DomainInput)
 			}
 		}
 	}
@@ -662,7 +663,7 @@ func (in *Installer) upgradeRoutes(env, next *EnvFile, mode string, pub publish)
 				continue
 			}
 			if get(r.TLS.DomainInput) == "" {
-				return refuse("--set "+r.TLS.DomainInput+"=<domain>", "%s %s terminates TLS on the L4 route %s, whose domain %s nothing gives: --set %s=<domain>", m.Name, m.ProjectVersion, r.Name, r.TLS.DomainInput, r.TLS.DomainInput)
+				return refuse(in.flagFix("--set "+r.TLS.DomainInput+"=<domain>"), "%s %s terminates TLS on the L4 route %s, whose domain %s nothing gives: --set %s=<domain>", m.Name, m.ProjectVersion, r.Name, r.TLS.DomainInput, r.TLS.DomainInput)
 			}
 			l4 = append(l4, r)
 		}
@@ -674,12 +675,12 @@ func (in *Installer) upgradeRoutes(env, next *EnvFile, mode string, pub publish)
 		}
 		for _, r := range s.Front.Routes {
 			if _, ok := env.Get(spec.URLVar(r.Name)); !ok && leaf.VerifyHostname(get(r.DomainInput)) != nil {
-				return refuse(in.ctl()+" --dir "+in.O.Dir+" --cert FILE --key FILE gives the install a certificate that covers it, then upgrade", "%s %s adds the route %s: the install's certificate does not cover %s (%s)", m.Name, m.ProjectVersion, r.Name, get(r.DomainInput), r.DomainInput)
+				return refuse(in.certFix(), "%s %s adds the route %s: the install's certificate does not cover %s (%s)", m.Name, m.ProjectVersion, r.Name, get(r.DomainInput), r.DomainInput)
 			}
 		}
 		for _, r := range l4 {
 			if leaf.VerifyHostname(get(r.TLS.DomainInput)) != nil {
-				return refuse(in.ctl()+" --dir "+in.O.Dir+" --cert FILE --key FILE gives the install a certificate that covers it, then upgrade", "%s %s: the install's certificate does not cover %s (%s), the domain of the L4 route %s", m.Name, m.ProjectVersion, get(r.TLS.DomainInput), r.TLS.DomainInput, r.Name)
+				return refuse(in.certFix(), "%s %s: the install's certificate does not cover %s (%s), the domain of the L4 route %s", m.Name, m.ProjectVersion, get(r.TLS.DomainInput), r.TLS.DomainInput, r.Name)
 			}
 		}
 	}
@@ -939,7 +940,7 @@ func (in *Installer) Rollback(ctx context.Context) (err error) {
 	unlock := sync.OnceFunc(locked)
 	defer unlock()
 	m := in.R.Manifest
-	name, cur, rev, err := sameProject(o.Dir, env, m)
+	name, cur, rev, err := in.sameProject(env, m)
 	if err != nil {
 		return err
 	}
@@ -969,8 +970,11 @@ func (in *Installer) Rollback(ctx context.Context) (err error) {
 			// This is the kept one: an upgrade to the release installed stopped before it kept its own.
 			fix = fmt.Sprintf("run the installer of %s %s (revision %s) instead of this one, with the same arguments: the install runs that release, and the upgrade to it stopped before it kept its own installer", name, cur, rev)
 		}
-		return dockerRefusal(fix, "%s runs %s %s (revision %s), and this installer carries %s (revision %d): a rollback is run by the installer the install keeps, `%s rollback --dir %s`",
-			o.Dir, name, cur, rev, m.ProjectVersion, m.Revision, in.ctl(), o.Dir)
+		// The VM's rollback is its daemon's, whose plan reads this as its OS's: no installer is
+		// the operator's to run there.
+		way := in.fixOn(fmt.Sprintf(": a rollback is run by the installer the install keeps, `%s rollback --dir %s`", in.ctl(), o.Dir), "")
+		return refuse(in.fixOn(fix, ""), "%s runs %s %s (revision %s), and this installer carries %s (revision %d)%s",
+			o.Dir, name, cur, rev, m.ProjectVersion, m.Revision, way)
 	}
 	var mixed error // PrevDir holding more than one release, told before its installer is run
 	pk, err := in.readKept(ctx, filepath.Join(prev, in.R.Ctl()), func(pm *release.Manifest) error {

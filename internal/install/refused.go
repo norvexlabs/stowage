@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strconv"
 
 	"github.com/spf13/cobra"
@@ -13,15 +14,14 @@ import (
 
 // Refused is a refusal: a rule of the installer said no before the run changed anything. Its
 // message is Reason, the text a person reads; Fix is what to run or change, for a program (the
-// verbs' `--json` result). The installer exits 3 on one (cmd/stowage-install), wherever it is
-// raised: a new refusal is one of these, never a plain error.
+// verbs' `--json` result), chosen where the refusal is raised for the shape the installer runs
+// (fixOn) — empty when no advice holds there, and still a refusal. Nothing downstream changes it.
+// The installer exits 3 on one (cmd/stowage-install), wherever it is raised: a new refusal is one
+// of these, never a plain error.
 type Refused struct {
 	Reason, Fix string
 	// cause is the error the refusal was made of (refusal), which errors.Is and errors.As reach.
 	cause error
-	// dockerOnly: Fix holds for a Docker install alone, naming its installer's --dir or the
-	// installer it keeps (dockerRefusal); the VM's host daemon answers it as a failure, with no fix.
-	dockerOnly bool
 }
 
 func (e Refused) Error() string { return e.Reason }
@@ -97,20 +97,26 @@ func refuse(fix, format string, a ...any) error {
 	return refusal(fix, fmt.Errorf(format, a...))
 }
 
-// dockerRefusal is refuse's refusal whose fix holds for a Docker install alone (Refused.dockerOnly).
-func dockerRefusal(fix, format string, a ...any) error {
-	err := fmt.Errorf(format, a...)
-	return Refused{Reason: err.Error(), Fix: fix, cause: err, dockerOnly: true}
+// fixOn is a refusal's fix for the shape the installer runs: docker on Docker (and Kubernetes),
+// vm on the VM (O.Preloaded), where "" says no advice holds — the refusal stays one.
+func (in *Installer) fixOn(docker, vm string) string {
+	if in.O.Preloaded {
+		return vm
+	}
+	return docker
 }
 
-// vmRefusal is err as a verb run on the VM returns it: a refusal whose fix holds for a Docker
-// install alone (Refused.dockerOnly) is a failure there, its message kept.
-func vmRefusal(err error) error {
-	if r, ok := Refusal(err); ok && r.dockerOnly {
-		return errors.New(err.Error())
+// flagFix is fix, which gives the run a flag, input or answer — none when the run takes none
+// (Installer.givenNothing): no advice holds there.
+func (in *Installer) flagFix(fix string) string {
+	if in.givenNothing {
+		return ""
 	}
-	return err
+	return fix
 }
+
+// vmCtl is the VM's installer as its operator runs it: the one its OS carries, as root.
+func (in *Installer) vmCtl() string { return "sudo " + filepath.Base(BundledCtl(in.R.Spec.Short())) }
 
 // As makes a rollback check's refusal a Refused, so it exits 3 as every refusal does.
 func (e rollbackRefused) As(target any) bool {
@@ -141,10 +147,11 @@ type Result struct {
 	Refused *RefusedResult `json:"refused,omitempty"`
 }
 
-// RefusedResult is a refusal under --json: the message the run prints, and what to run instead.
+// RefusedResult is a refusal under --json: the message the run prints, and what to run instead
+// (absent when no advice holds on the shape that refused).
 type RefusedResult struct {
 	Reason string `json:"reason"`
-	Fix    string `json:"fix"`
+	Fix    string `json:"fix,omitempty"`
 }
 
 // Results of a verb under --json.

@@ -53,7 +53,7 @@ func (in *Installer) UpgradeRevision(ctx context.Context, args []string) (bool, 
 		return false, err
 	}
 	m := in.R.Manifest
-	name, cur, rev, err := sameProject(in.O.Dir, env, m)
+	name, cur, rev, err := in.sameProject(env, m)
 	if err != nil {
 		return false, err
 	}
@@ -120,7 +120,7 @@ func (in *Installer) UpgradeTo(ctx context.Context, v string, args []string) err
 	if err != nil {
 		return err
 	}
-	name, cur, rev, err := sameProject(in.O.Dir, env, in.R.Manifest)
+	name, cur, rev, err := in.sameProject(env, in.R.Manifest)
 	if err != nil {
 		return err
 	}

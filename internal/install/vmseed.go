@@ -47,11 +47,8 @@ func (in *Installer) SeedVM(ctx context.Context, c *VMCreate, channel string) (*
 	if err := in.seedable(); err != nil {
 		return nil, err
 	}
-	// A --platform missing or that Stowage does not know is refused before the registry is read;
-	// one whose disk the registry lacks, after (platform).
-	if err := checkPlatform(c.Platform, Platforms, "one of"); err != nil {
-		return nil, err
-	}
+	// A --platform missing, unknown or whose disk the registry lacks is refused once the registry
+	// is read (platform), naming the platforms it offers: a fix that holds.
 	prefix, cl, err := in.seedRegistry(ctx)
 	if err != nil {
 		return nil, err

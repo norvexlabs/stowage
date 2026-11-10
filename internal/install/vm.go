@@ -565,7 +565,7 @@ func (in *Installer) Boot(ctx context.Context) (err error) {
 		return err
 	}
 	m := in.R.Manifest
-	name, cur, rev, err := sameProject(o.Dir, env, m)
+	name, cur, rev, err := in.sameProject(env, m)
 	if err != nil {
 		return err
 	}
@@ -583,7 +583,7 @@ func (in *Installer) Boot(ctx context.Context) (err error) {
 		}
 		return in.Install(ctx)
 	}
-	if _, err := in.vmKeptInstaller(ctx, name, cur, rev); err != nil {
+	if _, err := in.keptInstaller(ctx, name, cur, rev); err != nil {
 		return err
 	}
 	switch {

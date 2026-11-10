@@ -880,7 +880,7 @@ func (h *Hostd) planBackup(ctx context.Context, req BackupRequest) (*backupPlan,
 	}
 	// A backup of volumes half restored would pass for a whole one.
 	if err := in.volumesSplit(); err != nil {
-		return nil, fail(http.StatusConflict, "%v", err)
+		return nil, failAs(http.StatusConflict, err)
 	}
 	h.backupMu.Lock()
 	c, err := h.readBackup(pg)

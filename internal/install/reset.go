@@ -365,7 +365,7 @@ func (in *Installer) resetBaseline(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	name, cur, rev, err := sameProject(o.Dir, env, m)
+	name, cur, rev, err := in.sameProject(env, m)
 	if err != nil {
 		return err
 	}

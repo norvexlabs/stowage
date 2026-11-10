@@ -229,6 +229,9 @@ type Installer struct {
 	nothing, delegated bool
 	// crossing makes Upgrade cross a schema baseline, wiping the data (reset-db --new-baseline).
 	crossing *crossing
+	// givenNothing: the run takes no flag, input or answer — the VM's upgrade, which its daemon
+	// checks (upgradeCheck) and its boot runs (Upgrade) — so a refusal's fix names none (flagFix).
+	givenNothing bool
 	// outputs is the provision hook's outputs file of a release another Stowage built, whose spec
 	// is read for its wipe alone (wipeOf).
 	outputs string
@@ -721,7 +724,8 @@ func (in *Installer) dirFree(dir string) error {
 		return refuse("run the installer again: the run finishes that install", "%s now holds an install: run again to finish it", dir)
 	}
 	if _, err := os.Stat(in.path("compose.yaml")); err == nil {
-		return refuse("choose another --dir", "%s already holds a compose.yaml and no install of %s: choose another --dir", dir, in.R.Spec.Name)
+		// The VM's install directory is its OS's: choosing another is no step of its verbs.
+		return refuse(in.fixOn("choose another --dir", ""), "%s already holds a compose.yaml and no install of %s%s", dir, in.R.Spec.Name, in.fixOn(": choose another --dir", ""))
 	}
 	return nil
 }
@@ -744,9 +748,9 @@ func (in *Installer) portsFree(p publish) error {
 		return nil
 	}
 	if p.all { // a TLS front
-		return refuse("choose free ports with --http-port and --https-port", "port(s) %s already in use on this host: choose others with --http-port and --https-port", strings.Join(busy, ", "))
+		return refuse(in.flagFix("choose free ports with --http-port and --https-port"), "port(s) %s already in use on this host: choose others with --http-port and --https-port", strings.Join(busy, ", "))
 	}
-	return refuse("choose free ports with --ports ROUTE=PORT", "port(s) %s already in use on %s: choose others with --ports", strings.Join(busy, ", "), p.addr)
+	return refuse(in.flagFix("choose free ports with --ports ROUTE=PORT"), "port(s) %s already in use on %s: choose others with --ports", strings.Join(busy, ", "), p.addr)
 }
 
 // decide computes every value a first install records, and checks each can be recorded. It returns
@@ -1194,24 +1198,28 @@ func (in *Installer) provisionUp(ctx context.Context, env *EnvFile, h *providers
 	return nil
 }
 
-// sameRelease refuses an install of another release: changing release is an upgrade. Its fixes run
-// a Docker install's installers (dockerRefusal).
+// sameRelease refuses an install of another release: changing release is an upgrade. On Docker its
+// fix runs the installer that moves or serves the install; on the VM, whose installer is its OS's,
+// it has none.
 func (in *Installer) sameRelease(ctx context.Context, env *EnvFile) error {
 	m := in.R.Manifest
-	name, v, rev, err := sameProject(in.O.Dir, env, m)
+	name, v, rev, err := in.sameProject(env, m)
 	if err != nil {
 		return err
 	}
-	if v != m.ProjectVersion || rev != strconv.Itoa(m.Revision) {
-		if in.newer(v, rev) != nil {
-			if _, err := in.keptInstaller(ctx, name, m.ProjectVersion, strconv.Itoa(m.Revision)); err == nil {
-				return dockerRefusal(fmt.Sprintf("run the installer of %s %s with --dir %s", name, v, in.O.Dir), "%s runs %s %s (revision %s), and keeps this installer, of %s (revision %d): the upgrade stopped before keeping its own; run the installer of %s with --dir %s", in.O.Dir, name, v, rev, m.ProjectVersion, m.Revision, v, in.O.Dir)
-			}
-			return dockerRefusal(in.ctl()+" --dir "+in.O.Dir, "%s runs %s %s (revision %s), after this installer's %s (revision %d): run the installer it keeps, %s", in.O.Dir, name, v, rev, m.ProjectVersion, m.Revision, in.ctl())
-		}
-		return dockerRefusal(cmp.Or(in.O.Self, in.R.Ctl())+" upgrade --dir "+in.O.Dir, "%s runs %s %s (revision %s); this installer carries %s (revision %d): `%s upgrade --dir %s` moves it to this release", in.O.Dir, name, v, rev, m.ProjectVersion, m.Revision, cmp.Or(in.O.Self, in.R.Ctl()), in.O.Dir)
+	if v == m.ProjectVersion && rev == strconv.Itoa(m.Revision) {
+		return nil
 	}
-	return nil
+	if in.O.Preloaded { // the VM's installer is its OS's: no other is the operator's to run
+		return refuse("", "%s runs %s %s (revision %s), and this OS's installer carries %s (revision %d)", in.O.Dir, name, v, rev, m.ProjectVersion, m.Revision)
+	}
+	if in.newer(v, rev) != nil {
+		if _, err := in.keptInstaller(ctx, name, m.ProjectVersion, strconv.Itoa(m.Revision)); err == nil {
+			return refuse(fmt.Sprintf("run the installer of %s %s with --dir %s", name, v, in.O.Dir), "%s runs %s %s (revision %s), and keeps this installer, of %s (revision %d): the upgrade stopped before keeping its own; run the installer of %s with --dir %s", in.O.Dir, name, v, rev, m.ProjectVersion, m.Revision, v, in.O.Dir)
+		}
+		return refuse(in.ctl()+" --dir "+in.O.Dir, "%s runs %s %s (revision %s), after this installer's %s (revision %d): run the installer it keeps, %s", in.O.Dir, name, v, rev, m.ProjectVersion, m.Revision, in.ctl())
+	}
+	return refuse(cmp.Or(in.O.Self, in.R.Ctl())+" upgrade --dir "+in.O.Dir, "%s runs %s %s (revision %s); this installer carries %s (revision %d): `%s upgrade --dir %s` moves it to this release", in.O.Dir, name, v, rev, m.ProjectVersion, m.Revision, cmp.Or(in.O.Self, in.R.Ctl()), in.O.Dir)
 }
 
 // writeStack writes the release's compose file and the front, which come from the payload and the
@@ -1699,7 +1707,7 @@ func (in *Installer) l4Clash(p publish) error {
 				if p.all {
 					flag = "--" + k + "-port"
 				}
-				return refuse("choose another port with "+flag, "the front's %s port %d is the L4 route %s's: choose another with %s", k, r.Port, r.Name, flag)
+				return refuse(in.flagFix("choose another port with "+flag), "the front's %s port %d is the L4 route %s's: choose another with %s", k, r.Port, r.Name, flag)
 			}
 		}
 	}
@@ -1724,7 +1732,7 @@ func (in *Installer) l4Upgrade(ctx context.Context, env *EnvFile, mode string) e
 	}
 	if err := in.l4Clash(pub); err != nil {
 		// The front's port is changed by a re-run alone: the fix names it, not the flag the clash's.
-		return refusal(in.ctl()+" --dir "+in.O.Dir+" with another port for the front, then upgrade", fmt.Errorf("%w: give it to a re-run of the installer the install runs, `%s --dir %s`, then upgrade", err, in.ctl(), in.O.Dir))
+		return refusal(in.fixOn(in.ctl()+" --dir "+in.O.Dir+" with another port for the front, then upgrade", ""), fmt.Errorf("%w: give it to a re-run of the installer the install runs, `%s --dir %s`, then upgrade", err, in.ctl(), in.O.Dir))
 	}
 	if len(in.R.Spec.L4.Routes) == 0 {
 		return nil
@@ -1755,8 +1763,9 @@ func (in *Installer) l4Upgrade(ctx context.Context, env *EnvFile, mode string) e
 		if err == nil {
 			return nil
 		}
-		return refusal("give the routes' bind inputs addresses of this host (a recorded one through a re-run of the installer the install runs, "+
-			in.ctl()+" --dir "+in.O.Dir+" --set KEY=<address>, then upgrade; one this release adds with --set KEY=<address> on this upgrade), or free the ports the reason names", err)
+		return refusal(in.fixOn("give the routes' bind inputs addresses of this host (a recorded one through a re-run of the installer the install runs, "+
+			in.ctl()+" --dir "+in.O.Dir+" --set KEY=<address>, then upgrade; one this release adds with --set KEY=<address> on this upgrade), or free the ports the reason names",
+			"free the ports the reason names"), err)
 	}
 	if err := bindFix(in.bindHere(in.R.Spec.L4.Routes, get)); err != nil {
 		return err
@@ -2421,7 +2430,7 @@ func (in *Installer) Status(ctx context.Context) error {
 	in.O.Dir = dir
 	env, err := ReadEnvFile(in.path(envName))
 	if errors.Is(err, os.ErrNotExist) {
-		return refuse("install first, or give the --dir of the install", "%s holds no install", dir)
+		return refuse(in.fixOn("install first, or give the --dir of the install", "install first"), "%s holds no install", dir)
 	}
 	if err != nil {
 		return err
@@ -2716,7 +2725,7 @@ func (in *Installer) inputs(ctx context.Context, list []input, back bool) (map[s
 	}
 	values, missing := in.resolve(list, given, answers)
 	if len(missing) > 0 {
-		return nil, refuse("give each with --set KEY=VALUE, --set-file KEY=PATH or --answers", "missing required input(s), set by --set KEY=VALUE, the environment or --answers: %s", strings.Join(missing, "; "))
+		return nil, refuse(in.flagFix("give each with --set KEY=VALUE, --set-file KEY=PATH or --answers"), "missing required input(s), set by --set KEY=VALUE, the environment or --answers: %s", strings.Join(missing, "; "))
 	}
 	for _, i := range list {
 		if i.check == nil {

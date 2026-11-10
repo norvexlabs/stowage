@@ -859,23 +859,23 @@ Stowage calls a project's programs: the two never share a reader.
   it (the reason names the specifics); 1 failed. A
   refusal is one error type in the installer, so a new refusal is a 3 wherever it is raised, and an
   installer run by another (`upgrade --version`) passes its child's status on. 2 stays `kit
-  check`'s "unknown". The VM's host daemon answers a refusal with its fix beside its error
-  (`{error, fix}`), which its client takes as a refusal, so a verb over the socket exits 3 on it;
-  an error without a fix is a failure. A verb whose job started is past its first change: what
+  check`'s "unknown". A refusal's `fix` is chosen where the refusal is raised, for the shape the
+  installer runs: a fix that holds only on Docker (a `--dir`, the installer the install keeps run
+  by hand) is not given on the VM, and when no advice holds there `fix` is absent — still a
+  refusal, exit 3. Nothing downstream rewrites, drops or adds a fix, and nothing turns a refusal
+  into a failure but the first-change rule. The VM's host daemon answers a refusal as one
+  (`{error, refused: true, fix?}`), which its client takes as a refusal, so a verb over the socket
+  exits 3 on it; any other error is a failure. A verb whose job started is past its first change: what
   stops it then is a failure. The boot passes `boot-rollback`'s 3 on (its rollback check said no
   before anything changed, after the OS fell back), claiming no change itself, only when no step
   of the boot before it changed anything (a mark it removed counts; a removal that found none
-  does not); else, and on any other status of an installer it runs, it fails. A refusal the
-  daemon answers carries a fix that is true on the VM: a refusal whose fix runs the Docker
-  installer with `--dir` or the installer the install keeps is marked so where it is raised
-  (another project's install, one kept by another installer name, a rollback run by an installer
-  the install does not keep, a re-run by another release's installer), and the daemon answers it
-  as a failure, with no fix, as the VM's `install` returns it; every other keeps its own (another
-  run under way, a container an earlier run left, half restored volumes, a kept previous release
-  that is not one, the rollback check's, a registry's). A kept installer that is not the release
-  the install runs has the VM's own way out when that release comes after the OS's (a crossing
-  whose boot fell back): `upgrade --version` writes its OS again, whose boot keeps its installer
-  — a refusal with that fix; otherwise a failure.
+  does not); else, and on any other status of an installer it runs, it fails. On the VM, the
+  refusals whose Docker fix names `--dir` or the kept installer (another project's install, one
+  kept by another installer name, a rollback or re-run by another release's installer, a kept
+  installer that is not the release the install runs, a directory holding files and no install)
+  are refusals without a fix: the reason names what is wrong, and no step of the VM's verbs is
+  sure to clear it. So is one whose Docker fix is a flag of the upgrade (a port, or an input the
+  release adds): the VM's upgrade, checked by its daemon and run by its boot, takes none.
 - **`vm seed --json`** — a VM's first-boot material without creating the VM, for a tool that
   creates it with its own means: `{format, platform, user_data, known_hosts_line, fingerprint,
   host_key_private, disk: {<platform>: {format, image}}, waiting: [<key>]}` — the user-data for `--platform` (the

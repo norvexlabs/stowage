@@ -202,7 +202,7 @@ func (in *Installer) Uninstall(ctx context.Context, data bool) (err error) {
 		return err
 	}
 	defer unlock()
-	name, version, _, err := sameProject(in.O.Dir, env, in.R.Manifest)
+	name, version, _, err := in.sameProject(env, in.R.Manifest)
 	if err != nil {
 		return err
 	}

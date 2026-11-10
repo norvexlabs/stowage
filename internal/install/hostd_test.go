@@ -176,7 +176,10 @@ func call(t *testing.T, h http.Handler, method, path string, body any, out any) 
 
 // errOf is an error answer's message.
 // errOf is the daemon's error answer: its message, and a refusal's fix.
-type errOf struct{ Error, Fix string }
+type errOf struct {
+	Error, Fix string
+	Refused    bool
+}
 
 func TestStatusBeforeAndAfterTheInstall(t *testing.T) {
 	t.Parallel()

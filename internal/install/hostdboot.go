@@ -116,7 +116,7 @@ func (h *Hostd) plan(ctx context.Context, log io.Writer) (RollbackPlan, error) {
 		return RollbackPlan{}, err
 	}
 	if _, v, rev := runs(env); v != m.ProjectVersion || rev != strconv.Itoa(m.Revision) {
-		return RollbackPlan{}, fail(http.StatusConflict, "the install runs %s (revision %s), not %s, which this OS carries: going back to the passive system is for an install of the active system's release", v, rev, from)
+		return RollbackPlan{}, refuseAs(http.StatusConflict, "", "the install runs %s (revision %s), not %s, which this OS carries: going back to the passive system is for an install of the active system's release", v, rev, from)
 	}
 	if !fileExists(filepath.Join(h.assessment().dir, passiveImage)) {
 		return RollbackPlan{}, refuseAs(http.StatusConflict, "nothing to go back to: an upgrade leaves the system it replaces", "there is no passive system to go back to")

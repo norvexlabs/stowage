@@ -23,13 +23,16 @@ follow [SemVer](https://semver.org/).
 - The VM's `<short>-stow` speaks the same interface: `describe [--json]`; `status --json` gains
   `format`, `previous` (the release `rollback` goes back to) and `inputs` (the recorded input
   names, never a value); `install`, `upgrade` and `rollback` take `--json`, and every verb exits 3
-  on a refusal, the host daemon's included (its error answer now carries the fix). A boot whose
-  rollback check refuses after the OS fell back exits 3 when it changed nothing before it, else 1.
-  A refusal whose fix only holds for a Docker install (another installer to run with `--dir`) is
-  a failure on the VM, with no fix; an upgrade after a crossing whose boot fell back, whose kept
-  installer is not the release the install runs, is refused naming the VM's way out
-  (`upgrade --version` of that release). `vm seed` and `vm create` refuse a missing or unknown
-  `--platform` with exit 3.
+  on a refusal, the host daemon's included (its error answer now says `refused`, with the fix
+  when it has one). A boot whose rollback check refuses after the OS fell back exits 3 when it
+  changed nothing before it, else 1. A refusal's fix is the one that holds on the shape that
+  refused: on the VM, a refusal whose Docker fix runs another installer with `--dir`, the kept
+  installer, or a flag the VM's upgrade does not take carries no fix and still exits 3 — another
+  release's or project's install, a kept installer that is not the release the install runs
+  (whatever their order), a directory holding another project's files; an upgrade the boot
+  would refuse names the re-run of the install that clears it, where one does. `vm seed` and
+  `vm create` refuse a missing, unknown or unoffered `--platform` with exit 3, naming the
+  platforms the registry offers.
 - `vm seed --json`: a new VM's first-boot material for a tool that creates the VM itself — the
   cloud-config (no secret input), a one-time SSH host key with its `known_hosts` line and
   fingerprint, the disk image each platform boots, by digest, and the secret inputs the first

@@ -438,7 +438,7 @@ func (in *Installer) tlsFree(mode string) error {
 		return nil
 	}
 	if _, err := os.Lstat(in.path(TLSDir)); err == nil {
-		return refuse("move "+TLSDir+"/ away, or choose another --dir", "%s already holds a %s/, where the install copies its certificate: move it (keep --cert and --key elsewhere) or choose another --dir", in.O.Dir, TLSDir)
+		return refuse(in.fixOn("move "+TLSDir+"/ away, or choose another --dir", "move "+TLSDir+"/ away"), "%s already holds a %s/, where the install copies its certificate: move it (keep --cert and --key elsewhere)%s", in.O.Dir, TLSDir, in.fixOn(" or choose another --dir", ""))
 	}
 	return nil
 }
