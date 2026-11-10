@@ -20,6 +20,16 @@ follow [SemVer](https://semver.org/).
   refusal and its fix), the run's other output on standard error. A refusal — a rule saying no
   before anything changed, an operator's "no" included — now exits 3 instead of 1; a rollback
   whose start fails after the files went back exits 1.
+- The VM's `<short>-stow` speaks the same interface: `describe [--json]`; `status --json` gains
+  `format`, `previous` (the release `rollback` goes back to) and `inputs` (the recorded input
+  names, never a value); `install`, `upgrade` and `rollback` take `--json`, and every verb exits 3
+  on a refusal, the host daemon's included (its error answer now carries the fix). A boot whose
+  rollback check refuses after the OS fell back exits 3, having changed nothing.
+- `vm seed --json`: a new VM's first-boot material for a tool that creates the VM itself — the
+  cloud-config (no secret input), a one-time SSH host key with its `known_hosts` line and
+  fingerprint, and the disk image each platform boots, by digest; it never asks.
+- `--known-hosts-line LINE` on `vm kit` and `vm attach`: the VM's host key given as one
+  `known_hosts` line, checked strictly, for a VM `vm create` did not make.
 
 ## [0.33.2] - 2026-11-10
 

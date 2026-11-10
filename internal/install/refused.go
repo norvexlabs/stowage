@@ -25,6 +25,9 @@ func (e Refused) Error() string { return e.Reason }
 
 func (e Refused) Unwrap() error { return e.cause }
 
+// ExitRefused is the installer's exit status on a refusal: nothing changed.
+const ExitRefused = 3
+
 // changedErr is an error raised once the run changed the install: a failure, whatever it wraps
 // (a refusal of a check run again after the change included).
 type changedErr struct{ error }
@@ -170,24 +173,36 @@ func (o *Options) toMachine() { o.Machine, o.Out = o.Out, o.Log }
 
 // printResult prints the Result of a verb's run that ended with err, and returns err.
 func (in *Installer) printResult(ctx context.Context, out io.Writer, kind verbKind, err error) error {
+	if in.delegated {
+		return err
+	}
+	return printMachineResult(out, err, in.nothing || in.O.DryRun, func(done bool) *Version {
+		switch {
+		case kind.uninstall && done:
+			return nil
+		case kind.k8s:
+			return in.k8sReleaseNow(ctx)
+		}
+		return in.releaseNow()
+	})
+}
+
+// printMachineResult prints the Result of a run that ended with err, nothing telling a run with
+// nothing to do, and returns err: a failure prints none. release is the release installed after
+// the run, done telling whether it changed the install.
+func printMachineResult(out io.Writer, err error, nothing bool, release func(done bool) *Version) error {
 	refused, ok := Refusal(err)
-	if in.delegated || err != nil && !ok {
+	if err != nil && !ok {
 		return err
 	}
 	res := Result{Format: MachineFormat, Result: ResultDone}
 	switch {
 	case err != nil:
 		res.Result, res.Refused = ResultNothing, &RefusedResult{Reason: err.Error(), Fix: refused.Fix}
-	case in.nothing || in.O.DryRun:
+	case nothing:
 		res.Result = ResultNothing
 	}
-	if !kind.uninstall || res.Result == ResultNothing {
-		if kind.k8s {
-			res.Release = in.k8sReleaseNow(ctx)
-		} else {
-			res.Release = in.releaseNow()
-		}
-	}
+	res.Release = release(res.Result == ResultDone)
 	if perr := printJSON(out, res); perr != nil && err == nil {
 		return perr
 	}

@@ -590,7 +590,15 @@ func (in *Installer) Boot(ctx context.Context) (err error) {
 		return in.crossed()
 	case in.prevIs(m.ProjectVersion, strconv.Itoa(m.Revision)):
 		o.logf("this OS carries %s %s (revision %d), which the install's last upgrade replaced: going back to it", name, m.ProjectVersion, m.Revision)
-		return childFailed(in.ctl(), o.exec(ctx, in.ctl(), []string{bootRollbackCmd, "--dir", o.Dir}))
+		err := o.exec(ctx, in.ctl(), []string{bootRollbackCmd, "--dir", o.Dir})
+		// Its refusal (exit 3: its rollback check said no before it changed anything) is the
+		// boot's, which changed nothing either: a stopped run finished above leaves no previous
+		// release kept, so it never comes here.
+		if code, ok := errors.AsType[ExitCode](err); ok && code == ExitRefused {
+			mutated = false
+			return err
+		}
+		return childFailed(in.ctl(), err)
 	case in.leftByRollback(m.ProjectVersion, m.Revision):
 		o.logf("the install went back from %s %s (revision %d), which this OS carries: it stays on %s (revision %s); upgrade to a later release, or remove %s to try this one again",
 			name, m.ProjectVersion, m.Revision, cur, rev, in.path(FailedDir))

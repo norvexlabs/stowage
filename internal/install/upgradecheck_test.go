@@ -54,9 +54,11 @@ func TestUpgradeRefusesWhatTheBootWouldBeforeWritingTheOS(t *testing.T) {
 			host := &fakeHost{}
 			hh := daemon(p.env, host).Handler()
 			var e errOf
+			// The boot's refusal is the upgrade's, with its fix.
 			if code := call(t, hh, "POST", "/v1/upgrade", UpgradeRequest{Channel: "stable"}, &e); code != 409 || !strings.Contains(e.Error, c.want) ||
-				!strings.HasSuffix(e.Error, "the boot into 2.0.0-1 would refuse this upgrade (it is given no input), so its OS is not written") {
-				t.Fatalf("%d %s", code, e.Error)
+				!strings.HasSuffix(e.Error, "the boot into 2.0.0-1 would refuse this upgrade (it is given no input), so its OS is not written") ||
+				e.Fix != "change what the install records with a re-run of its install (install --set, --answers), or choose another release" {
+				t.Fatalf("%d %s (fix %q)", code, e.Error, e.Fix)
 			}
 			if calls := fmt.Sprint(host.calls()); strings.Contains(calls, "kairos-agent") {
 				t.Errorf("the OS was written: %v", calls)
@@ -97,8 +99,9 @@ func TestUpgradeAcrossABaselineIsRefusedBeforeWritingTheOS(t *testing.T) {
 	hh := daemon(p.env, host).Handler()
 	var e errOf
 	if code := call(t, hh, "POST", "/v1/upgrade", UpgradeRequest{Channel: "stable"}, &e); code != 409 ||
-		!strings.Contains(e.Error, "notes 2.0.0 starts schema baseline 2, and the install runs notes 1.0.0, at baseline 1: its data cannot carry over, so its OS is not written; `notes-stow reset-db --new-baseline --version 2.0.0` wipes the data and installs it") {
-		t.Fatalf("%d %s", code, e.Error)
+		!strings.Contains(e.Error, "notes 2.0.0 starts schema baseline 2, and the install runs notes 1.0.0, at baseline 1: its data cannot carry over, so its OS is not written; `notes-stow reset-db --new-baseline --version 2.0.0` wipes the data and installs it") ||
+		e.Fix != "stay on this release, or cross to it with its data wiped (reset-db --new-baseline)" {
+		t.Fatalf("%d %s (fix %q)", code, e.Error, e.Fix)
 	}
 	if calls := fmt.Sprint(host.calls()); strings.Contains(calls, "kairos-agent") {
 		t.Errorf("the OS was written: %v", calls)

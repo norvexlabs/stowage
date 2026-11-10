@@ -248,12 +248,22 @@ type Version struct {
 
 func (v Version) String() string { return fmt.Sprintf("%s (revision %d)", v.Version, v.Revision) }
 
-// Status is what GET /v1/status answers.
+// Status is what GET /v1/status answers, and `status --json` prints: the core of InstallStatus's
+// names, and the VM's own.
 type Status struct {
-	Name string  `json:"name"`
-	OS   Version `json:"os"` // the release this OS carries
+	Format int     `json:"format"` // MachineFormat
+	Name   string  `json:"name"`
+	OS     Version `json:"os"` // the release this OS carries
 	// Installed is the release the install runs; nil before the first install.
 	Installed *Version `json:"installed"`
+	// Previous is the release the last upgrade replaced, which `rollback` goes back to (the
+	// passive system's); nil when the install keeps none. It names no installer: a VM's install
+	// records none, as its OS carries the release.
+	Previous *StatusRelease `json:"previous"`
+	// Inputs are the keys of the inputs the install records, sorted: never a value. Nil (left out)
+	// before the first install, or when the OS's installer carries another release than the one
+	// installed and the install keeps no installer of it this one reads.
+	Inputs *[]string `json:"inputs,omitempty"`
 	// Installing: the first install has not finished — its stack is coming up or the provision
 	// hook runs (or a reboot cut it: the boot runs it again). InstallFailed: why its last run
 	// failed; a re-run of the install finishes it.
@@ -670,13 +680,33 @@ func reply(w http.ResponseWriter, code int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
+// replyErr answers err, with the code its httpError gives (500 without one); a refusal (Refused,
+// raised before the request changed anything) carries its fix too, which tells the client so.
 func replyErr(w http.ResponseWriter, err error) {
 	code := http.StatusInternalServerError
 	var he httpError
 	if errors.As(err, &he) {
 		code = he.code
 	}
-	reply(w, code, map[string]string{"error": err.Error()})
+	body := map[string]string{"error": err.Error()}
+	if r, ok := Refusal(err); ok && r.Fix != "" {
+		body["fix"] = r.Fix
+	}
+	reply(w, code, body)
+}
+
+// failAs is err answered with code, a refusal kept one (its fix answered with it).
+func failAs(code int, err error) error {
+	he := httpError{code, err.Error()}
+	if r, ok := Refusal(err); ok {
+		return Refused{Reason: he.msg, Fix: r.Fix, cause: he}
+	}
+	return he
+}
+
+// refuseAs is a refusal answered with code, its fix fix and its message format's.
+func refuseAs(code int, fix, format string, a ...any) error {
+	return refusal(fix, fail(code, format, a...))
 }
 
 // decodeBody reads a JSON body strictly; an empty one leaves v as it is.
@@ -746,11 +776,19 @@ func notInstalled(in *Installer) bool {
 func (h *Hostd) status(w http.ResponseWriter, r *http.Request) {
 	in, _ := h.run()
 	m := h.R.Manifest
-	st := Status{Name: m.Name, OS: Version{m.ProjectVersion, m.Revision}, Job: "idle"}
+	st := Status{Format: MachineFormat, Name: m.Name, OS: Version{m.ProjectVersion, m.Revision}, Job: "idle"}
 	if env, err := in.open(); err == nil {
-		_, v, rev := runs(env)
+		name, v, rev := runs(env)
 		n, _ := strconv.Atoi(rev)
 		st.Installed = &Version{v, n}
+		// The release `rollback` goes back to, and the inputs as an installer of the release
+		// installed tells them: neither fails the answer (said in the daemon's log).
+		if st.Previous, err = in.keptPrevious(v, n); err != nil {
+			h.O.logf("status: the previous release is not known: %v", err)
+		}
+		if _, s := in.carriedRelease(name, v, n); s != nil {
+			st.Inputs = recordedInputs(s, func(k string) bool { _, ok := env.Get(k); return ok })
+		}
 		st.Installing, st.InstallFailed, _ = in.firstInstall()
 		st.RestoreAwaited = in.restoreAwaited()
 		st.Channel, _ = env.Get(ChannelVar)
@@ -1370,7 +1408,7 @@ func (h *Hostd) target(ctx context.Context, in *Installer, env *EnvFile, channel
 		// A pointer left on a publication its tag no longer holds (yanked or rebuilt since; the
 		// old one stays validly signed) is no pointer, as the publisher reads it.
 		if err == nil && m.Yanked != nil {
-			err = fmt.Errorf("the channel %s's release %s is yanked: %s", channel, m.Tag, m.Yanked.Reason)
+			err = refuse("choose another release with --version: the channel's is yanked", "the channel %s's release %s is yanked: %s", channel, m.Tag, m.Yanked.Reason)
 		}
 		if err == nil {
 			var td v1.Hash
@@ -1381,7 +1419,7 @@ func (h *Hostd) target(ctx context.Context, in *Installer, env *EnvFile, channel
 		}
 	}
 	if err != nil {
-		return nil, "", fail(http.StatusBadGateway, "%v", err)
+		return nil, "", failAs(http.StatusBadGateway, err)
 	}
 	if m.Name != h.R.Spec.Name || m.Channel != channel {
 		return nil, "", fail(http.StatusBadGateway, "the release found is %s's on %s, not %s's on %s", m.Name, m.Channel, h.R.Spec.Name, channel)
@@ -1706,7 +1744,7 @@ func (h *Hostd) upgrade(w http.ResponseWriter, r *http.Request) {
 	}
 	// A restore again finishes half restored volumes, onto this release only.
 	if err := in.volumesSplit(); err != nil {
-		replyErr(w, fail(http.StatusConflict, "%v", err))
+		replyErr(w, failAs(http.StatusConflict, err))
 		return
 	}
 	if err := h.judged(r.Context()); err != nil {
@@ -1740,16 +1778,16 @@ func (h *Hostd) upgrade(w http.ResponseWriter, r *http.Request) {
 		replyErr(w, fail(http.StatusConflict, "the release found is %s %s (revision %d), not %s, which was confirmed: look again with updates", m.Name, m.ProjectVersion, m.Revision, *req.Confirm))
 		return
 	case in.leftByRollback(m.ProjectVersion, m.Revision):
-		replyErr(w, fail(http.StatusConflict, "the install went back from %s %s (revision %d): the boot would not upgrade to it again (remove %s to try it again)", m.Name, m.ProjectVersion, m.Revision, in.path(FailedDir)))
+		replyErr(w, refuseAs(http.StatusConflict, "upgrade to a later release; or, to try this one again, remove the record of the release the install went back from", "the install went back from %s %s (revision %d): the boot would not upgrade to it again (remove %s to try it again)", m.Name, m.ProjectVersion, m.Revision, in.path(FailedDir)))
 		return
 	case m.Yanked != nil:
-		replyErr(w, fail(http.StatusConflict, "%s %s is yanked: %s", m.Name, m.Tag, m.Yanked.Reason))
+		replyErr(w, refuseAs(http.StatusConflict, "choose another release: this one is yanked", "%s %s is yanked: %s", m.Name, m.Tag, m.Yanked.Reason))
 		return
 	case !newer && !rewrite:
-		replyErr(w, fail(http.StatusConflict, "%s %s (revision %d) does not come after %s (revision %d), which this OS runs", m.Name, m.ProjectVersion, m.Revision, h.R.Manifest.ProjectVersion, h.R.Manifest.Revision))
+		replyErr(w, refuseAs(http.StatusConflict, "choose a release after the one this OS runs", "%s %s (revision %d) does not come after %s (revision %d), which this OS runs", m.Name, m.ProjectVersion, m.Revision, h.R.Manifest.ProjectVersion, h.R.Manifest.Revision))
 		return
 	case m.Artifacts.OS == "":
-		replyErr(w, fail(http.StatusConflict, "%s %s was published without an OS bundle", m.Name, m.Tag))
+		replyErr(w, refuseAs(http.StatusConflict, "choose a release published with an OS bundle (its kairos shape)", "%s %s was published without an OS bundle", m.Name, m.Tag))
 		return
 	}
 	// What the boot into it would refuse is refused now, before its OS is written. The release
@@ -1770,7 +1808,7 @@ func (h *Hostd) upgrade(w http.ResponseWriter, r *http.Request) {
 		}
 		// Again as the job claims the slot: a restore that just ended may have marked them.
 		if err := in.volumesSplit(); err != nil {
-			return fail(http.StatusConflict, "%v", err)
+			return failAs(http.StatusConflict, err)
 		}
 		return nil
 	})

@@ -847,7 +847,11 @@ Stowage calls a project's programs: the two never share a reader.
   release, refused: {reason, fix}}`. `nothing` is a run with nothing to do, a dry run or a
   refusal; `release` the release installed after the run, absent when none is; a failure prints
   no object, only its error. The run's text goes to standard error, so standard output is the
-  object alone; `upgrade --version` passes `--json` to its child, which prints it.
+  object alone; `upgrade --version` passes `--json` to its child, which prints it. On the VM,
+  `upgrade` and `rollback` end as their job schedules the reboot, so `release` is the one
+  installed before it, as the daemon's status answers then: the reboot's outcome is
+  `status --json`'s (a new `boot_id`), never waited for by the verb, which runs on the VM the
+  reboot stops.
 - **Exit status**: 0 done or nothing to do; **3 refused** — a rule said no before anything changed
   (a schema barrier or a newer schema, a recorded value set again, a first-install-only setting on
   a re-run, an older or yanked release or one no key the install trusts signed, `--given` with `--version` on Kubernetes,
@@ -855,14 +859,28 @@ Stowage calls a project's programs: the two never share a reader.
   it (the reason names the specifics); 1 failed. A
   refusal is one error type in the installer, so a new refusal is a 3 wherever it is raised, and an
   installer run by another (`upgrade --version`) passes its child's status on. 2 stays `kit
-  check`'s "unknown".
+  check`'s "unknown". The VM's host daemon answers a refusal with its fix beside its error
+  (`{error, fix}`), which its client takes as a refusal, so a verb over the socket exits 3 on it;
+  an error without a fix is a failure. A verb whose job started is past its first change: what
+  stops it then is a failure. The boot passes `boot-rollback`'s 3 on (its rollback check said no
+  before anything changed, after the OS fell back), claiming no change itself; any other status
+  of an installer it runs is its failure.
 - **`vm seed --json`** — a VM's first-boot material without creating the VM, for a tool that
-  creates it with its own means: the user-data (the cloud-config; never a secret input — those go
-  after the boot, `install --given -` over SSH), the one-time host key (its `known_hosts` line, its
-  fingerprint and its private key, which the caller keeps secret until it retires), and the disk
-  image per platform by digest. It is the seed `vm create --create manual` writes, built by the
-  same code. The `vm` verbs that reach a VM take `--known-hosts-line LINE`: that key alone is
-  accepted, never `accept-new`.
+  creates it with its own means: `{format, platform, user_data, known_hosts_line, fingerprint,
+  host_key_private, disk: {<platform>: {format, image}}}` — the user-data for `--platform` (the
+  cloud-config; never a secret input — those go after the boot, `install --given -` over SSH: a
+  secret input or TLS material given to the seed is refused), the one-time host key (its
+  `known_hosts` line under the name `vm-seed-host-key`, its fingerprint and its private key, which
+  the caller keeps secret until it retires), and the disk image by digest of each platform the
+  registry holds a disk for. It never asks: `vm create`'s machine flags, the front's, `--set`,
+  `--answers` and `--channel` (the channel the first install follows) give it all. It is the seed
+  `vm create --create manual` writes, built by the same steps (the registry and disk set, the
+  machine, the settings, the user-data). The `vm` verbs that reach a VM over SSH (`vm kit`, `vm
+  attach`) take `--known-hosts-line LINE`: one host name and its key (no marker, pattern, list or
+  hashed name), checked strictly under that name (`HostKeyAlias`), never `accept-new`, in place
+  of the key `vm create` recorded; the line is written, its name lower-cased, to a file of its
+  own under the state directory, named by its digest, so the `ssh` command a message gives runs
+  as the verb's did.
 
 ## 7. Full lifecycle matrix
 

@@ -107,7 +107,7 @@ func (h *Hostd) plan(ctx context.Context, log io.Writer) (RollbackPlan, error) {
 	switch mode := bootMode(h.O.cos()); mode {
 	case "active":
 	case "passive":
-		return RollbackPlan{}, fail(http.StatusConflict, "the VM runs the passive system already: there is no earlier one to go back to")
+		return RollbackPlan{}, refuseAs(http.StatusConflict, "nothing to go back to: the VM runs the earlier system already", "the VM runs the passive system already: there is no earlier one to go back to")
 	default:
 		return RollbackPlan{}, fail(http.StatusConflict, "the VM runs the %q system, not the active one: going back chooses the passive system from the active one", mode)
 	}
@@ -119,7 +119,7 @@ func (h *Hostd) plan(ctx context.Context, log io.Writer) (RollbackPlan, error) {
 		return RollbackPlan{}, fail(http.StatusConflict, "the install runs %s (revision %s), not %s, which this OS carries: going back to the passive system is for an install of the active system's release", v, rev, from)
 	}
 	if !fileExists(filepath.Join(h.assessment().dir, passiveImage)) {
-		return RollbackPlan{}, fail(http.StatusConflict, "there is no passive system to go back to")
+		return RollbackPlan{}, refuseAs(http.StatusConflict, "nothing to go back to: an upgrade leaves the system it replaces", "there is no passive system to go back to")
 	}
 	// An upgrade written but not booted yet (--no-reboot) made the running system the passive one.
 	if err := h.osWritten(); err != nil {
@@ -127,7 +127,7 @@ func (h *Hostd) plan(ctx context.Context, log io.Writer) (RollbackPlan, error) {
 	}
 	raw, err := os.ReadFile(filepath.Join(in.path(PrevDir), prevState))
 	if errors.Is(err, os.ErrNotExist) {
-		return RollbackPlan{}, fail(http.StatusConflict, "%s has no previous release to go back to (an upgrade keeps one)", in.O.Dir)
+		return RollbackPlan{}, refuseAs(http.StatusConflict, "nothing to go back to: an upgrade keeps the release it replaces", "%s has no previous release to go back to (an upgrade keeps one)", in.O.Dir)
 	}
 	if err != nil {
 		return RollbackPlan{}, err
@@ -138,7 +138,7 @@ func (h *Hostd) plan(ctx context.Context, log io.Writer) (RollbackPlan, error) {
 	}
 	in.O.DryRun, in.O.Log = true, log
 	if err := in.Rollback(ctx); err != nil {
-		return RollbackPlan{}, fail(http.StatusConflict, "%v", err)
+		return RollbackPlan{}, failAs(http.StatusConflict, err)
 	}
 	return RollbackPlan{From: from, To: Version{st.ProjectVersion, st.Revision}}, nil
 }
@@ -164,7 +164,7 @@ func (h *Hostd) rollback(w http.ResponseWriter, r *http.Request) {
 	// A restore again finishes half restored volumes, onto this release only.
 	in, _ := h.run()
 	if err := in.volumesSplit(); err != nil {
-		replyErr(w, fail(http.StatusConflict, "%v", err))
+		replyErr(w, failAs(http.StatusConflict, err))
 		return
 	}
 	if err := h.judged(r.Context()); err != nil {
@@ -184,7 +184,7 @@ func (h *Hostd) rollback(w http.ResponseWriter, r *http.Request) {
 	// Again as the job claims the slot: a restore that just ended may have marked them.
 	j, err := h.startJob("rollback", p.To.String(), func() error {
 		if err := in.volumesSplit(); err != nil {
-			return fail(http.StatusConflict, "%v", err)
+			return failAs(http.StatusConflict, err)
 		}
 		return nil
 	})

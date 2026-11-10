@@ -764,8 +764,8 @@ func TestTheTrustFixNamesTheVersion(t *testing.T) {
 	}
 }
 
-// A boot never passes the status of an installer it runs on: its refusal there, a 3, is the
-// boot's failure.
+// A boot never passes the status of the installer it brings the install up with before an
+// upgrade: its refusal there, a 3, is the boot's failure (boot-rollback's alone is passed on).
 func TestABootFailsWhateverItsChildExits(t *testing.T) {
 	t.Parallel()
 	e := vmEnv(t, "1.0.0")

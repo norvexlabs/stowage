@@ -4,12 +4,15 @@ import (
 	"bytes"
 	"cmp"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -17,23 +20,27 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
+	"golang.org/x/crypto/ssh"
 
 	"github.com/norvexlabs/stowage/internal/kit"
 )
 
-// vmLink reaches a VM `vm create` made over SSH: as user with the key next to pub, at addr,
-// checked strictly against the host key vm create recorded for that address in the VM's state
-// directory. ssh refuses another key, and an address it recorded none for.
+// vmLink reaches a VM over SSH: as user with the key next to pub, at addr, checked strictly
+// against the one host key the file known holds under alias — the one vm create recorded for that
+// address in the VM's state directory, or the line --known-hosts-line gave. ssh refuses another
+// key, and an address it holds none for.
 type vmLink struct {
 	ssh             Tool
 	user, pub, addr string
-	known           string
+	known, alias    string
 }
 
-// VMReach names a VM and how SSH reaches it: vm create's defaults, the host name.
+// VMReach names a VM and how SSH reaches it: vm create's defaults, the host name. KnownHostsLine,
+// when set, is the VM's host key as a known_hosts line, checked in place of vm create's record.
 type VMReach struct {
 	Host                  string
 	User, SSHKey, Address string
+	KnownHostsLine        string
 }
 
 // link is the SSH link to the VM r names, refused before any connection when its state holds no
@@ -51,26 +58,75 @@ func (in *Installer) link(r VMReach) (*vmLink, error) {
 		return nil, errors.New("ssh is not available to this run")
 	}
 	l := &vmLink{ssh: o.SSH, user: cmp.Or(r.User, defaultUser(o.getenv)), pub: cmp.Or(r.SSHKey, defaultKey(o.getenv("HOME"))), addr: cmp.Or(r.Address, r.Host), known: filepath.Join(dir, "known_hosts")}
+	l.alias = hostAlias(l.addr)
 	if err := checkUser(l.user); err != nil {
 		return nil, fmt.Errorf("--user %s: %w", l.user, err)
 	}
 	if strings.HasPrefix(l.addr, "-") || strings.ContainsAny(l.addr, " \t\r\n%@\"'\\") {
 		return nil, fmt.Errorf("--host %q: a host name or an address", l.addr)
 	}
+	if r.KnownHostsLine != "" {
+		if l.known, l.alias, err = o.givenKnownHosts(in.R.Spec.Name, r.KnownHostsLine); err != nil {
+			return nil, err
+		}
+		return l, nil
+	}
 	st, err := os.Stat(l.known)
 	if err == nil && st.Size() == 0 {
 		err = errors.New("it is empty")
 	}
 	if err != nil {
-		return nil, fmt.Errorf("%s: the VM's host key is not known (vm create records it once the VM answers, for the address it waited at: --host gives that one; a VM whose install was finished by hand: put its host key, checked on its console, in %s): %w", r.Host, l.known, err)
+		return nil, fmt.Errorf("%s: the VM's host key is not known (vm create records it once the VM answers, for the address it waited at: --host gives that one; a VM whose install was finished by hand: put its host key, checked on its console, in %s; or give it with --known-hosts-line): %w", r.Host, l.known, err)
 	}
 	return l, nil
+}
+
+// knownHostName is the host field --known-hosts-line takes: one plain name or address, never a
+// pattern, a hashed name, a list or a [host]:port.
+var knownHostName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,252}$`)
+
+// givenKnownHosts checks line, the one known_hosts line --known-hosts-line gives — a host name and
+// a public key, no marker — and writes it, the name lower-cased as ssh matches it, into a file of
+// its own: $XDG_STATE_HOME/<name>/known-hosts/<its digest>, written whole, so a run giving the
+// same line meets the same file. alias is the line's host name, which ssh looks the key up by.
+func (o *Options) givenKnownHosts(name, line string) (file, alias string, err error) {
+	if strings.ContainsAny(strings.TrimRight(line, "\n"), "\r\n") {
+		return "", "", errors.New("--known-hosts-line: one line")
+	}
+	marker, hosts, key, _, _, err := ssh.ParseKnownHosts([]byte(line))
+	switch {
+	case err != nil:
+		return "", "", fmt.Errorf("--known-hosts-line: not a known_hosts line (HOST KEYTYPE BASE64): %w", err)
+	case marker != "":
+		return "", "", fmt.Errorf("--known-hosts-line: a host key, not a @%s line", marker)
+	case len(hosts) != 1 || !knownHostName.MatchString(hosts[0]):
+		return "", "", fmt.Errorf("--known-hosts-line: its host field %q is not one host name or address (no pattern, list, hashed name or [host]:port)", strings.Join(hosts, ","))
+	}
+	alias = strings.ToLower(hosts[0])
+	text := alias + " " + strings.TrimSpace(string(ssh.MarshalAuthorizedKey(key))) + "\n"
+	base, err := o.xdgDir("XDG_STATE_HOME", filepath.Join(".local", "state"), "the VM's host key")
+	if err != nil {
+		return "", "", err
+	}
+	dir := filepath.Join(base, name, "known-hosts")
+	if err := sshPathOK(dir); err != nil {
+		return "", "", fmt.Errorf("%w (set XDG_STATE_HOME elsewhere)", err)
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", "", err
+	}
+	sum := sha256.Sum256([]byte(text))
+	file = filepath.Join(dir, hex.EncodeToString(sum[:16]))
+	if err := writeAtomic(file, strings.NewReader(text), 0o600, nil); err != nil {
+		return "", "", err
+	}
+	return file, alias, nil
 }
 
 // args are ssh's arguments running command on the VM; ssh joins command's words for the VM's
 // shell, so each word is a constant or quoted.
 func (l *vmLink) args(command ...string) []string {
-	return sshArgsChecking("yes", hostAlias(l.addr), l.known, l.user, l.addr, l.pub, command...)
+	return sshArgsChecking("yes", l.alias, l.known, l.user, l.addr, l.pub, command...)
 }
 
 // run runs command on the VM, its output returned.
@@ -95,12 +151,13 @@ func (l *vmLink) command(command ...string) string { return sshCommandLine(l.arg
 // at names the VM as an ssh destination, in messages.
 func (l *vmLink) at() string { return l.user + "@" + l.addr }
 
-// reachFlags are --user, --ssh-key and --host: how SSH reaches a VM vm create made, as every verb
-// that does takes them.
-func reachFlags(f *pflag.FlagSet, user, key, host *string) {
+// reachFlags are --user, --ssh-key, --host and --known-hosts-line: how SSH reaches a VM, as every
+// verb that does takes them.
+func reachFlags(f *pflag.FlagSet, user, key, host, known *string) {
 	f.StringVar(user, "user", "", "the VM's administrator, who logs in over SSH (default: your user name, else sysadmin)")
 	f.StringVar(key, "ssh-key", "", "the administrator's SSH public key file (default: ~/.ssh/id_ed25519.pub, id_ecdsa.pub or id_rsa.pub)")
 	f.StringVar(host, "host", "", "the name or address the VM answers at (default: HOSTNAME)")
+	f.StringVar(known, "known-hosts-line", "", "the VM's SSH host key as one known_hosts line, HOST KEYTYPE BASE64 (`vm seed --json`'s known_hosts_line): that key alone is accepted, in place of the one vm create recorded")
 }
 
 // exitCoder is an error carrying the exit status of the program that failed (exec's ExitError).
@@ -126,8 +183,10 @@ func (in *Installer) sshKitVerbs(reach *VMReach, stderr io.Writer, prepare func(
 		return l, err
 	}
 	return kitVerbs{
-		host:  &reach.Host,
-		flags: func(c *cobra.Command) { reachFlags(c.Flags(), &reach.User, &reach.SSHKey, &reach.Address) },
+		host: &reach.Host,
+		flags: func(c *cobra.Command) {
+			reachFlags(c.Flags(), &reach.User, &reach.SSHKey, &reach.Address, &reach.KnownHostsLine)
+		},
 		// The link, tried before anything is asked: ssh itself, as strict as the run's, so a VM it
 		// cannot reach, or whose recorded key it refuses, costs no answer.
 		precheck: func(cmd *cobra.Command) error {
@@ -272,7 +331,7 @@ func (in *Installer) vmKitCommand(o *Options, prepare func() error, terminal fun
 	}
 	f := c.Flags()
 	f.Var(pathFlag{&take.CodeFile}, "kit-code-file", "the file holding the kit's code (default: "+KitCodeVar+", else asked on a terminal)")
-	reachFlags(f, &take.User, &take.SSHKey, &take.Address)
+	reachFlags(f, &take.User, &take.SSHKey, &take.Address, &take.KnownHostsLine)
 	f.BoolVar(&noInput, "no-input", false, "never ask: the code comes from --kit-code-file or "+KitCodeVar)
 	f.BoolVar(&accessible, "accessible", false, "ask with plain line prompts (screen readers); also when ACCESSIBLE is set or TERM=dumb")
 	k.AddCommand(c)

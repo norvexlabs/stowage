@@ -175,7 +175,8 @@ func call(t *testing.T, h http.Handler, method, path string, body any, out any) 
 }
 
 // errOf is an error answer's message.
-type errOf struct{ Error string }
+// errOf is the daemon's error answer: its message, and a refusal's fix.
+type errOf struct{ Error, Fix string }
 
 func TestStatusBeforeAndAfterTheInstall(t *testing.T) {
 	t.Parallel()
@@ -546,29 +547,33 @@ func TestUpgradeWithoutRebootLeavesTheVMRunning(t *testing.T) {
 	}
 }
 
+// Each refusal of an upgrade is answered before anything runs, a rule's with its fix (the
+// client's exit 3); a bad request's with none.
 func TestUpgradeRefusals(t *testing.T) {
 	t.Parallel()
 	for name, c := range map[string]struct {
 		publish func(p *pubEnv)
 		body    UpgradeRequest
 		want    string
+		fix     string
 	}{
-		"not newer": {func(p *pubEnv) { p.release("0.9.0", 1, nil) }, UpgradeRequest{Channel: "stable"}, "does not come after"},
-		"same":      {func(p *pubEnv) { p.release("1.0.0", 1, nil) }, UpgradeRequest{Channel: "stable", Version: "1.0.0"}, "does not come after"},
-		"no os":     {func(p *pubEnv) { p.release("2.0.0", 1, func(m *release.Manifest) { m.Artifacts.OS = "" }) }, UpgradeRequest{Channel: "stable"}, "without an OS bundle"},
-		"bad body":  {func(p *pubEnv) { p.release("2.0.0", 1, nil) }, UpgradeRequest{}, "follows no channel"},
+		"not newer": {func(p *pubEnv) { p.release("0.9.0", 1, nil) }, UpgradeRequest{Channel: "stable"}, "does not come after", "choose a release after the one this OS runs"},
+		"same":      {func(p *pubEnv) { p.release("1.0.0", 1, nil) }, UpgradeRequest{Channel: "stable", Version: "1.0.0"}, "does not come after", "choose a release after the one this OS runs"},
+		"no os":     {func(p *pubEnv) { p.release("2.0.0", 1, func(m *release.Manifest) { m.Artifacts.OS = "" }) }, UpgradeRequest{Channel: "stable"}, "without an OS bundle", "choose a release published with an OS bundle (its kairos shape)"},
+		"bad body":  {func(p *pubEnv) { p.release("2.0.0", 1, nil) }, UpgradeRequest{}, "follows no channel", ""},
 		"yanked": {func(p *pubEnv) {
 			m := p.release("2.0.0", 1, nil)
 			m.Yanked = &release.Yank{Reason: "broken", Date: time.Now()}
 			p.putRelease("stable", m)
-		}, UpgradeRequest{Channel: "stable"}, "yanked: broken"},
-		"new revison": {func(p *pubEnv) { p.release("1.0.0", 2, nil) }, UpgradeRequest{Channel: "stable"}, ""},
+		}, UpgradeRequest{Channel: "stable"}, "yanked: broken", "choose another release with --version: the channel's is yanked"},
+		"version not published": {func(p *pubEnv) { p.release("2.0.0", 1, nil) }, UpgradeRequest{Channel: "stable", Version: "4.0.0"}, "is not published on stable", "choose a version published on stable"},
+		"new revison":           {func(p *pubEnv) { p.release("1.0.0", 2, nil) }, UpgradeRequest{Channel: "stable"}, "", ""},
 	} {
 		p := vmPublished(t, spec.Provider{Name: "none"}, nil)
 		c.publish(p)
 		host := &fakeHost{}
 		hh := daemon(p.env, host).Handler()
-		var e errOf
+		var e struct{ Error, Fix string }
 		code := call(t, hh, "POST", "/v1/upgrade", c.body, &e)
 		if c.want == "" {
 			if code != 202 {
@@ -577,8 +582,8 @@ func TestUpgradeRefusals(t *testing.T) {
 			waitJob(t, hh)
 			continue
 		}
-		if code < 400 || !strings.Contains(e.Error, c.want) {
-			t.Errorf("%s: %d %q, want %q", name, code, e.Error, c.want)
+		if code < 400 || !strings.Contains(e.Error, c.want) || e.Fix != c.fix {
+			t.Errorf("%s: %d %q (fix %q), want %q (fix %q)", name, code, e.Error, e.Fix, c.want, c.fix)
 		}
 		if len(host.calls()) > 0 {
 			t.Errorf("%s: ran %v", name, host.calls())
@@ -756,8 +761,9 @@ func TestTheReleaseARollbackLeftIsNotOffered(t *testing.T) {
 		t.Errorf("%+v", u)
 	}
 	var e errOf
-	if code := call(t, hh, "POST", "/v1/upgrade", UpgradeRequest{Channel: "stable"}, &e); code != 409 || !strings.Contains(e.Error, "went back from") {
-		t.Errorf("%d %s", code, e.Error)
+	if code := call(t, hh, "POST", "/v1/upgrade", UpgradeRequest{Channel: "stable"}, &e); code != 409 || !strings.Contains(e.Error, "went back from") ||
+		e.Fix != "upgrade to a later release; or, to try this one again, remove the record of the release the install went back from" {
+		t.Errorf("%d %s (fix %q)", code, e.Error, e.Fix)
 	}
 	if len(host.calls()) > 0 {
 		t.Errorf("ran %v", host.calls())

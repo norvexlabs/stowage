@@ -51,6 +51,9 @@ func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(
 	var answers, secretsFile string
 	var given givenFlags
 	var noInput, accessible, asJSON bool
+	// resultJSON: install, upgrade and rollback print their Result alone on standard output
+	// (--json); prepared: prepare gave in the run's options.
+	var resultJSON, prepared bool
 	var group string
 	socket := Socket(name)
 	prepare := func() error {
@@ -73,7 +76,14 @@ func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(
 			}
 		}
 		in.O = o
+		prepared = true
+		if resultJSON {
+			in.O.toMachine()
+		}
 		return nil
+	}
+	resultFlag := func(cmd *cobra.Command) {
+		cmd.Flags().BoolVar(&resultJSON, "json", false, "print the run's result as one JSON object at its end, for a program; what the run prints otherwise goes to standard error")
 	}
 	c := &hostClient{http: socketClient(&socket), out: stdout, clientTimes: times, ctl: r.Ctl()}
 	root := &cobra.Command{
@@ -103,7 +113,7 @@ func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(
 				return err
 			}
 			if given.any() && secretsFile != "" {
-				return fmt.Errorf("--secrets restores an install, %s gives a new one its secret inputs and TLS material: give one", given.name())
+				return refuse("give --secrets or "+given.name()+", not both", "--secrets restores an install, %s gives a new one its secret inputs and TLS material: give one", given.name())
 			}
 			var prompt Prompter
 			if !noInput {
@@ -174,6 +184,12 @@ func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(
 	f.BoolVar(&accessible, "accessible", false, "ask with plain line prompts (screen readers); also when ACCESSIBLE is set or TERM=dumb")
 	dirFlag(install)
 	settingsFlag(install)
+	resultFlag(install)
+	machineVerb(install, &resultJSON, stdout, in, verbKind{}, func() {
+		if !prepared {
+			in.O = o // a refusal before prepare took them, or in it
+		}
+	})
 
 	boot := &cobra.Command{
 		Use:    bootCmd,
@@ -359,7 +375,7 @@ func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(
 	events.Flags().Int64Var(&after, "after", 0, "the entries after this number (status --json's events is the last one)")
 	events.Flags().BoolVarP(&followEvents, "follow", "f", false, "then wait for new entries, until interrupted")
 	events.Flags().BoolVar(&asJSON, "json", false, "print each entry as the daemon's JSON, one per line")
-	root.AddCommand(status, health, ps, logs, exec, events)
+	root.AddCommand(status, health, ps, logs, exec, events, describeCommand(r, stdout))
 	for _, a := range []string{"restart", "stop", "start"} {
 		root.AddCommand(&cobra.Command{
 			Use:   a + " SERVICE",
@@ -423,39 +439,47 @@ func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			ctx := cmd.Context()
-			u, err := c.updates(ctx, channel, version)
-			if err != nil {
-				return err
-			}
-			printUpdate(stdout, u)
-			if err := refusedVersion(version, u); err != nil || !u.Available {
-				return err
-			}
-			if !yes {
-				p := terminal(accessible)
-				if p == nil {
-					return errors.New("no terminal to confirm on: --yes upgrades without asking")
-				}
-				a, err := p.Ask(ctx, Form{Questions: []Question{{
-					Title: fmt.Sprintf("Upgrade to %s and reboot?", u.Target), Key: "--yes", Required: true,
-					Choices: []Choice{{"yes", "Upgrade"}, {"no", "Not now"}},
-				}}})
+			out := c.textOut(resultJSON, stderr)
+			var nothing bool
+			err := func() error {
+				u, err := c.updates(ctx, channel, version)
 				if err != nil {
 					return err
 				}
-				if a["--yes"] != "yes" {
-					return ErrAborted
+				printUpdate(out, u)
+				if err := refusedVersion(version, u); err != nil || !u.Available {
+					nothing = err == nil
+					return err
 				}
-			}
-			reboot := !noReboot
-			req := UpgradeRequest{Channel: channel, Version: version, Confirm: &u.Target, Reboot: &reboot, SkipBackup: skipBackup}
-			var started JobStarted
-			if err := c.do(ctx, http.MethodPost, "/v1/upgrade", req, &started); err != nil {
-				return err
-			}
-			return c.follow(ctx, stderr, started)
+				if !yes {
+					p := terminal(accessible)
+					if p == nil {
+						return refuse("give --yes, which upgrades without asking", "no terminal to confirm on: --yes upgrades without asking")
+					}
+					a, err := p.Ask(ctx, Form{Questions: []Question{{
+						Title: fmt.Sprintf("Upgrade to %s and reboot?", u.Target), Key: "--yes", Required: true,
+						Choices: []Choice{{"yes", "Upgrade"}, {"no", "Not now"}},
+					}}})
+					if err != nil {
+						return err
+					}
+					if a["--yes"] != "yes" {
+						return ErrAborted
+					}
+				}
+				reboot := !noReboot
+				req := UpgradeRequest{Channel: channel, Version: version, Confirm: &u.Target, Reboot: &reboot, SkipBackup: skipBackup}
+				var started JobStarted
+				if err := c.do(ctx, http.MethodPost, "/v1/upgrade", req, &started); err != nil {
+					return err
+				}
+				// The job started: the run changed the VM.
+				return changed(c.follow(ctx, stderr, started))
+			}()
+			return c.result(ctx, resultJSON, stderr, err, nothing)
 		},
 	}
+	resultFlag(upgrade)
 	refusesKit(upgrade, fmt.Sprintf("a re-run, `sudo %s install --kit FILE`, gives it to the install", r.Ctl()))
 	uf := upgrade.Flags()
 	uf.StringVar(&channel, "channel", "", "the channel to upgrade on (default: the install's; before the first install, its settings')")
@@ -487,34 +511,39 @@ func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			ctx := cmd.Context()
-			var p RollbackPlan
-			if err := c.do(ctx, http.MethodGet, "/v1/rollback", nil, &p); err != nil {
-				return err
-			}
-			fmt.Fprintf(stdout, "the passive system carries %s %s; the install runs %s\n", name, p.To, p.From)
-			if !yes {
-				t := terminal(accessible)
-				if t == nil {
-					return errors.New("no terminal to confirm on: --yes goes back without asking")
-				}
-				a, err := t.Ask(ctx, Form{Questions: []Question{{
-					Title: fmt.Sprintf("Go back to %s and reboot?", p.To), Key: "--yes", Required: true,
-					Choices: []Choice{{"yes", "Go back"}, {"no", "Not now"}},
-				}}})
-				if err != nil {
+			err := func() error {
+				var p RollbackPlan
+				if err := c.do(ctx, http.MethodGet, "/v1/rollback", nil, &p); err != nil {
 					return err
 				}
-				if a["--yes"] != "yes" {
-					return ErrAborted
+				fmt.Fprintf(c.textOut(resultJSON, stderr), "the passive system carries %s %s; the install runs %s\n", name, p.To, p.From)
+				if !yes {
+					t := terminal(accessible)
+					if t == nil {
+						return refuse("give --yes, which goes back without asking", "no terminal to confirm on: --yes goes back without asking")
+					}
+					a, err := t.Ask(ctx, Form{Questions: []Question{{
+						Title: fmt.Sprintf("Go back to %s and reboot?", p.To), Key: "--yes", Required: true,
+						Choices: []Choice{{"yes", "Go back"}, {"no", "Not now"}},
+					}}})
+					if err != nil {
+						return err
+					}
+					if a["--yes"] != "yes" {
+						return ErrAborted
+					}
 				}
-			}
-			var started JobStarted
-			if err := c.do(ctx, http.MethodPost, "/v1/rollback", RollbackRequest{Confirm: &p.To}, &started); err != nil {
-				return err
-			}
-			return c.follow(ctx, stderr, started)
+				var started JobStarted
+				if err := c.do(ctx, http.MethodPost, "/v1/rollback", RollbackRequest{Confirm: &p.To}, &started); err != nil {
+					return err
+				}
+				// The job started: the run changed the VM.
+				return changed(c.follow(ctx, stderr, started))
+			}()
+			return c.result(ctx, resultJSON, stderr, err, false)
 		},
 	}
+	resultFlag(rollback)
 	rollback.Flags().BoolVarP(&yes, "yes", "y", false, "go back without asking")
 	rollback.Flags().BoolVar(&accessible, "accessible", false, "confirm with a plain line prompt")
 	var noProvision, newBaseline bool
@@ -725,8 +754,12 @@ func (c *hostClient) do(ctx context.Context, method, path string, body, out any)
 		return unreachable{fmt.Errorf("the host daemon stopped before it answered: %w", err)}
 	}
 	if resp.StatusCode >= 400 {
-		var e struct{ Error string }
-		if json.Unmarshal(raw, &e) == nil && e.Error != "" {
+		var e struct{ Error, Fix string }
+		switch {
+		case json.Unmarshal(raw, &e) != nil || e.Error == "":
+		case e.Fix != "": // the daemon's refusal: nothing changed
+			return Refused{Reason: e.Error, Fix: e.Fix}
+		default:
 			return errors.New(e.Error)
 		}
 		return fmt.Errorf("the host daemon answered %s", resp.Status)
@@ -738,6 +771,32 @@ func (c *hostClient) do(ctx context.Context, method, path string, body, out any)
 		return fmt.Errorf("the host daemon's answer: %w", err)
 	}
 	return nil
+}
+
+// textOut is where a verb prints its text for people: standard output, or log under --json
+// (asJSON), where standard output is its Result's alone.
+func (c *hostClient) textOut(asJSON bool, log io.Writer) io.Writer {
+	if asJSON {
+		return log
+	}
+	return c.out
+}
+
+// result ends a verb that changes the install: under --json (asJSON) it prints the verb's Result
+// on standard output, the release after it being the one the install runs as the daemon answers
+// (absent when none is, or the daemon does not answer: said on log). err is returned either way.
+func (c *hostClient) result(ctx context.Context, asJSON bool, log io.Writer, err error, nothing bool) error {
+	if !asJSON {
+		return err
+	}
+	return printMachineResult(c.out, err, nothing, func(bool) *Version {
+		var st Status
+		if serr := c.do(ctx, http.MethodGet, "/v1/status", nil, &st); serr != nil {
+			fmt.Fprintf(log, "%s: the release installed is not known: %v\n", c.ctl, serr)
+			return nil
+		}
+		return st.Installed
+	})
 }
 
 func printJSON(w io.Writer, v any) error {
@@ -897,9 +956,9 @@ func refusedVersion(version string, u Update) error {
 	case version == "" || u.Available || u.Target == u.Current:
 		return nil
 	case u.LeftByRollback:
-		return fmt.Errorf("upgrade --version %s: refused, the install went back from %s; publish a new revision of %s to upgrade to it", version, u.Target, u.Target.Version)
+		return refuse("upgrade to a later release: the boot does not upgrade to one the install went back from", "upgrade --version %s: refused, the install went back from %s; publish a new revision of %s to upgrade to it", version, u.Target, u.Target.Version)
 	default:
-		return fmt.Errorf("upgrade --version %s: refused, %s is not one this VM, which runs %s, can be upgraded to: yanked, published without an OS bundle, or not after it", version, u.Target, u.Current)
+		return refuse("choose a release published with an OS bundle after the one this VM runs", "upgrade --version %s: refused, %s is not one this VM, which runs %s, can be upgraded to: yanked, published without an OS bundle, or not after it", version, u.Target, u.Current)
 	}
 }
 

@@ -15,9 +15,6 @@ import (
 	"github.com/norvexlabs/stowage/internal/payload"
 )
 
-// exitRefused is the exit status of a refusal (install.Refused): nothing changed.
-const exitRefused = 3
-
 func main() {
 	os.Exit(exit(run(), os.Stderr))
 }
@@ -34,7 +31,7 @@ func exit(err error, stderr io.Writer) int {
 	}
 	fmt.Fprintln(stderr, "error:", err)
 	if _, ok := install.Refusal(err); ok {
-		return exitRefused
+		return install.ExitRefused
 	}
 	return 1
 }

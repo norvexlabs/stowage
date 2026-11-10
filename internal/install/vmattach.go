@@ -277,8 +277,10 @@ type VMAttach struct {
 	Host string
 	// Interface is ROLE=SPEC, as `vm create --interface` takes it.
 	Interface string
-	// User, SSHKey and Address reach the VM over SSH: vm create's defaults, the host name.
+	// User, SSHKey and Address reach the VM over SSH: vm create's defaults, the host name;
+	// KnownHostsLine, when set, is its host key, checked in place of vm create's record.
 	User, SSHKey, Address string
+	KnownHostsLine        string
 	Wait                  time.Duration
 	Ctl                   string
 }
@@ -392,7 +394,7 @@ func (in *Installer) AttachVM(ctx context.Context, a *VMAttach) error {
 	}
 	// The host key vm create recorded for the address it waited at: the VM answers with it, or
 	// ssh refuses, an address it recorded none for included.
-	l, err := in.link(VMReach{Host: a.Host, User: a.User, SSHKey: a.SSHKey, Address: a.Address})
+	l, err := in.link(VMReach{Host: a.Host, User: a.User, SSHKey: a.SSHKey, Address: a.Address, KnownHostsLine: a.KnownHostsLine})
 	if err != nil {
 		return err
 	}

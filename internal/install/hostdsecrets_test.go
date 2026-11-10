@@ -254,6 +254,12 @@ func TestAVolumeNotSwappedInFailsTheRestore(t *testing.T) {
 		if code := call(t, h, "POST", path, map[string]any{}, &e409); code != 409 || !strings.Contains(e409.Error, "half restored") {
 			t.Errorf("%s: %d %s", path, code, e409.Error)
 		}
+		// A refusal on the verbs that move the release, as the Docker install's.
+		if strings.HasPrefix(path, "/v1/upgrade") || strings.HasPrefix(path, "/v1/rollback") {
+			if e409.Fix != "finish the restore (run it again), then run again" {
+				t.Errorf("%s: fix %q", path, e409.Fix)
+			}
+		}
 	}
 	// The stopped services' containers went: no restart policy starts them at a reboot.
 	if !slices.ContainsFunc(e.docker.ran("compose")[n:], func(c Cmd) bool { return strings.HasSuffix(strings.Join(c.Args, " "), " rm --stop --force api web") }) {

@@ -976,29 +976,9 @@ func vmCreateCommand(in *Installer, o *Options, prepare func() error, terminal f
 			return in.CreateVM(cmd.Context(), &c)
 		},
 	}
-	var keys []string
-	for _, p := range Platforms {
-		keys = append(keys, p.Key)
-	}
 	f := create.Flags()
-	f.StringVar(&c.Platform, "platform", "", "where the VM runs: "+strings.Join(keys, ", ")+" (it decides the disk format and how the cloud-config reaches the VM)")
+	machineFlags(f, &c, in.R.Spec)
 	f.StringVar(&c.Out, "out", ".", "the directory the disk image and the cloud-config are written to")
-	f.StringVar(&c.Hostname, "hostname", "", "the VM's host name (default: "+name+")")
-	f.StringVar(&c.User, "user", "", "its administrator, in the admin group, who logs in over SSH (default: your user name, else sysadmin)")
-	f.StringVar(&c.SSHKey, "ssh-key", "", "the administrator's SSH public key file (default: ~/.ssh/id_ed25519.pub, id_ecdsa.pub or id_rsa.pub)")
-	f.StringVar(&c.Network, "network", "", "dhcp (default) or static")
-	f.StringVar(&c.Address, "address", "", "--network static: the address with its prefix, e.g. 192.0.2.10/24")
-	f.StringVar(&c.Gateway, "gateway", "", "--network static: the gateway")
-	f.BoolVar(&c.IPv6, "ipv6", false, "turn IPv6 on: the VM takes router advertisements (and DHCPv6 with dhcp), and its front IPv6 clients (default: no IPv6)")
-	f.Var(profileValue{&c.TuneProfile}, "tune-profile", "the VM's tuning profile over the release's tune.profile ("+in.R.Spec.TuneProfile()+"): default (Docker's path as fast as the VM's network) or network (a heavy network load)")
-	f.StringVar(&c.Address6, "address6", "", "with --ipv6: a static IPv6 address with its prefix, e.g. 2001:db8::10/64, either network")
-	f.StringVar(&c.Gateway6, "gateway6", "", "with --address6: the IPv6 gateway, link-local or in its subnet (default: the router advertisements')")
-	f.StringSliceVar(&c.DNS, "dns", nil, "--network static: a DNS server (repeatable, or comma-separated)")
-	f.StringArrayVar(&c.Hosts, "add-host", nil, fmt.Sprintf("a host record, NAME=IP (repeatable, at most %d): the VM and its stack's containers resolve NAME to IP", maxHosts))
-	f.StringSliceVar(&c.SSHAllow, "ssh-allow", nil, "the sources SSH accepts, CIDR (repeatable, or comma-separated; default: every source)")
-	f.StringVar(&c.Timezone, "timezone", "", "the VM's time zone, an IANA name such as Europe/Paris (default UTC)")
-	f.StringArrayVar(&c.Interfaces, "interface", nil, "a NIC the release names (host.interfaces), ROLE=SPEC (repeatable): a secondary's dhcp, static,address=A/P or none (the default), then mac= (default: generated on a hypervisor; a server's own on metal) and attach= (the hypervisor's network or bridge; default the primary's)")
-	f.StringVar(&c.Device, "device", "", "metal: the disk the OS installs on, wiped — a path under /dev/ (a /dev/disk/by-id/ one names it whatever the boot order), or auto (the largest disk); asked on a terminal")
 	f.StringVar(&secretsFile, "secrets", "", "the install's secrets, the file `secrets export` wrote, decrypted: the first install waits for them, given over SSH, never in the cloud-config (refused with a secret input or TLS material)")
 	tlsVM := "how the VM's front serves: none a VM can take (" + name + " offers " + strings.Join(in.R.Spec.Front.TLSModes, ", ") + ")"
 	if remote := remoteModes(in.R.Spec.Front.TLSModes); len(remote) > 0 {
@@ -1088,14 +1068,77 @@ func vmCreateCommand(in *Installer, o *Options, prepare func() error, terminal f
 	}
 	af := attach.Flags()
 	af.StringVar(&at.Interface, "interface", "", "the NIC, ROLE=SPEC as vm create takes it: dhcp, static,address=A/P or none, then mac= (default: generated) and attach= (the bridge; default the primary's)")
-	reachFlags(af, &at.User, &at.SSHKey, &at.Address)
+	reachFlags(af, &at.User, &at.SSHKey, &at.Address, &at.KnownHostsLine)
 	af.DurationVar(&at.Wait, "wait", 0, "how long to wait for the VM to answer over SSH after its power cycle (default 10m)")
 	_ = attach.MarkFlagRequired("interface")
-	vm.AddCommand(create, destroy, attach, truenasCommand(os.Getenv))
+	var sc VMCreate
+	var seedChannel string
+	stdout := o.Out // the command's standard output, which the seed alone goes to
+	seed := &cobra.Command{
+		Use:   "seed",
+		Short: fmt.Sprintf("Print a new VM's first-boot material for %s %s as JSON, without creating the VM: its cloud-config, a one-time SSH host key and its disk image per platform by digest; never asks", name, m.ProjectVersion),
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			*takesTLS = true
+			if err := prepare(); err != nil {
+				return err
+			}
+			// Standard output is the seed's alone; nothing is asked.
+			in.O.Out, in.O.Prompt = in.O.Log, nil
+			s, err := in.SeedVM(cmd.Context(), &sc, seedChannel)
+			if err != nil {
+				return err
+			}
+			return printJSON(stdout, s)
+		},
+	}
+	sf := seed.Flags()
+	machineFlags(sf, &sc, in.R.Spec)
+	sf.StringVar(&seedChannel, "channel", "", "the channel the VM's updates and upgrades follow (default: the release's, "+m.Channel+")")
+	sf.StringVar(&o.TLS, "tls", "", "how the VM's front serves: a mode the release offers a VM, never byo (its certificate goes over SSH, `install --given -`)")
+	sf.StringSliceVar(domains, "domains", nil, "a route's domain, route=host: HTTPS")
+	sf.IntVar(&o.HTTPPort, "http-port", 0, "the VM's port a TLS front serves HTTP on (default the project's front.http_port, else 80)")
+	sf.IntVar(&o.HTTPSPort, "https-port", 0, "the VM's port a TLS front serves HTTPS on (default the project's front.https_port, else 443)")
+	hideFrontFlags(sf, in.R.Spec, []string{"tls", "domains", "http-port", "https-port"})
+	sf.StringArrayVar(sets, "set", nil, "an input, KEY=VALUE (repeatable; never a secret input)")
+	sf.StringArrayVar(setFiles, "set-file", nil, "a file input's file, KEY=PATH (repeatable; never a secret input)")
+	sf.StringVar(answers, "answers", "", "a YAML file of the non-secret inputs, KEY: value, and the front's tls section (no secret input, no certificate: those go after the boot, over SSH)")
+	sf.StringVar(&o.Registry, "registry", "", "a registry prefix to read the disk and the VM's updates from, a mirror")
+	sf.StringVar(&o.RegistryCA, "registry-ca", "", "a PEM file of the CA the registry's certificate chains to, a mirror's own: trusted here and, through the cloud-config, by the VM")
+	var seedJSON bool
+	sf.BoolVar(&seedJSON, "json", false, "print the seed as one JSON object (required: the seed is for a program)")
+	_ = seed.MarkFlagRequired("json")
+	vm.AddCommand(create, seed, destroy, attach, truenasCommand(os.Getenv))
 	if k := in.vmKitCommand(o, prepare, terminal); k != nil {
 		vm.AddCommand(k)
 	}
 	return vm
+}
+
+// machineFlags are the flags giving a VM's platform and machine, which `vm create` and `vm seed`
+// take into c: s is the release's spec.
+func machineFlags(f *pflag.FlagSet, c *VMCreate, s *spec.Spec) {
+	var keys []string
+	for _, p := range Platforms {
+		keys = append(keys, p.Key)
+	}
+	f.StringVar(&c.Platform, "platform", "", "where the VM runs: "+strings.Join(keys, ", ")+" (it decides the disk format and how the cloud-config reaches the VM)")
+	f.StringVar(&c.Hostname, "hostname", "", "the VM's host name (default: "+s.Name+")")
+	f.StringVar(&c.User, "user", "", "its administrator, in the admin group, who logs in over SSH (default: your user name, else sysadmin)")
+	f.StringVar(&c.SSHKey, "ssh-key", "", "the administrator's SSH public key file (default: ~/.ssh/id_ed25519.pub, id_ecdsa.pub or id_rsa.pub)")
+	f.StringVar(&c.Network, "network", "", "dhcp (default) or static")
+	f.StringVar(&c.Address, "address", "", "--network static: the address with its prefix, e.g. 192.0.2.10/24")
+	f.StringVar(&c.Gateway, "gateway", "", "--network static: the gateway")
+	f.BoolVar(&c.IPv6, "ipv6", false, "turn IPv6 on: the VM takes router advertisements (and DHCPv6 with dhcp), and its front IPv6 clients (default: no IPv6)")
+	f.Var(profileValue{&c.TuneProfile}, "tune-profile", "the VM's tuning profile over the release's tune.profile ("+s.TuneProfile()+"): default (Docker's path as fast as the VM's network) or network (a heavy network load)")
+	f.StringVar(&c.Address6, "address6", "", "with --ipv6: a static IPv6 address with its prefix, e.g. 2001:db8::10/64, either network")
+	f.StringVar(&c.Gateway6, "gateway6", "", "with --address6: the IPv6 gateway, link-local or in its subnet (default: the router advertisements')")
+	f.StringSliceVar(&c.DNS, "dns", nil, "--network static: a DNS server (repeatable, or comma-separated)")
+	f.StringArrayVar(&c.Hosts, "add-host", nil, fmt.Sprintf("a host record, NAME=IP (repeatable, at most %d): the VM and its stack's containers resolve NAME to IP", maxHosts))
+	f.StringSliceVar(&c.SSHAllow, "ssh-allow", nil, "the sources SSH accepts, CIDR (repeatable, or comma-separated; default: every source)")
+	f.StringVar(&c.Timezone, "timezone", "", "the VM's time zone, an IANA name such as Europe/Paris (default UTC)")
+	f.StringArrayVar(&c.Interfaces, "interface", nil, "a NIC the release names (host.interfaces), ROLE=SPEC (repeatable): a secondary's dhcp, static,address=A/P or none (the default), then mac= (default: generated on a hypervisor; a server's own on metal) and attach= (the hypervisor's network or bridge; default the primary's)")
+	f.StringVar(&c.Device, "device", "", "metal: the disk the OS installs on, wiped — a path under /dev/ (a /dev/disk/by-id/ one names it whatever the boot order), or auto (the largest disk); asked on a terminal")
 }
 
 // downloadProgress reports a download to w at every tenth of it.

@@ -20,6 +20,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/go-containerregistry/pkg/name"
+
 	"github.com/norvexlabs/stowage/internal/kairos"
 	"github.com/norvexlabs/stowage/internal/lint"
 	"github.com/norvexlabs/stowage/internal/registry"
@@ -143,12 +145,8 @@ type VMCreate struct {
 // input is never asked, and is given over SSH.
 func (in *Installer) CreateVM(ctx context.Context, c *VMCreate) error {
 	o, m, name := &in.O, in.R.Manifest, in.R.Spec.Name
-	in.givenCA = true
-	if in.R.Spec.Shapes.Kairos == nil || m.Artifacts.OS == "" {
-		return fmt.Errorf("%s %s publishes no OS bundle (shapes.kairos)", name, m.ProjectVersion)
-	}
-	if in.R.Spec.HasFront() && len(in.createModes()) == 0 {
-		return in.noCreateMode()
+	if err := in.seedable(); err != nil {
+		return err
 	}
 	if c.Secrets != nil {
 		f, err := in.readSecrets(c.Secrets)
@@ -157,23 +155,11 @@ func (in *Installer) CreateVM(ctx context.Context, c *VMCreate) error {
 		}
 		in.useSecrets(f)
 	}
-	// The disk comes from the mirror when one is given, as the VM's updates do.
-	prefix := in.R.Spec.Registry.Prefix
-	if o.Registry != "" {
-		prefix = strings.TrimSuffix(o.Registry, "/")
-		if _, err := registry.Repository(prefix); err != nil {
-			return fmt.Errorf("--registry: %w", err)
-		}
-	}
-	cl, err := in.registryClient(prefix)
+	prefix, cl, err := in.seedRegistry(ctx)
 	if err != nil {
 		return err
 	}
-	boot, err := in.bootDisks(ctx, cl, prefix)
-	if err != nil {
-		return err
-	}
-	in.boot = boot
+	boot := in.boot
 	p, format, err := in.platform(ctx, c.Platform)
 	if err != nil {
 		return err
@@ -208,34 +194,9 @@ func (in *Installer) CreateVM(ctx context.Context, c *VMCreate) error {
 	} else if c.Host != "" || c.Wait != 0 || c.Name != "" || c.Pool != "" || c.Dataset != "" || c.Bridge != "" || c.CPUs != 0 || c.MemoryMiB != 0 || c.DiskGiB != 0 || len(c.Vars) > 0 {
 		return fmt.Errorf("--host, --wait, --vm-name, --pool, --dataset, --bridge, --cpus, --memory, --disk and --tofu-var are for --create %s", CreateTofu)
 	}
-	mach, err := in.machine(ctx, c, p)
+	mach, st, waiting, given, ca, err := in.seedSettings(ctx, c, p, prefix)
 	if err != nil {
 		return err
-	}
-	st, waiting, given, err := in.vmSettings(ctx)
-	if err != nil {
-		return err
-	}
-	st.AwaitSecrets = c.Secrets != nil || given != nil
-	if given != nil {
-		st.AwaitGiven = given.awaits()
-	}
-	st.IPv6 = c.IPv6 // the install's network too: the front's IPv6 clients keep their address
-	st.TuneProfile = c.TuneProfile
-	// Another release's disk: the first boot takes this release's OS bundle before it installs.
-	if boot.release != m.Tag {
-		st.Release = &OSRelease{Version: m.ProjectVersion, Revision: m.Revision, Tag: m.Tag, OS: m.Artifacts.OS}
-	}
-	// A mirror: the disk comes from it, and the VM's updates.
-	var ca []byte
-	if o.Registry != "" {
-		st.Registry = prefix
-	}
-	if o.RegistryCA != "" {
-		if ca, err = registry.ReadCA(o.RegistryCA); err != nil {
-			return fmt.Errorf("--registry-ca: %w", err)
-		}
-		st.RegistryCA = VMRegistryCA(name)
 	}
 	out := expandHome(cmp.Or(c.Out, "."))
 	seed := filepath.Join(out, mach.Hostname+"-user-data.yaml")
@@ -319,18 +280,8 @@ func (in *Installer) CreateVM(ctx context.Context, c *VMCreate) error {
 	}
 	// What is given goes over SSH to a host key known beforehand: one generated here, which the
 	// cloud-config carries and the VM serves until its install.
-	var hostKey *seedHostKey
-	if st.AwaitSecrets {
-		if hostKey, err = newSeedHostKey(mach.Hostname); err != nil {
-			return err
-		}
-		mach.HostKey = hostKey.Private
-	}
-	userData, err := UserData(name, in.R.Ctl(), mach, *st, ca)
+	userData, hostKey, err := in.seedUserData(p, &mach, st, ca, st.AwaitSecrets)
 	if err != nil {
-		return err
-	}
-	if err := fileInputsFit(p, in.R.Spec, st, len(userData)); err != nil {
 		return err
 	}
 	if err := os.MkdirAll(out, 0o755); err != nil {
@@ -341,7 +292,7 @@ func (in *Installer) CreateVM(ctx context.Context, c *VMCreate) error {
 			return err
 		}
 	}
-	ref, err := cl.Digest(prefix+"/"+name+"-disk", boot.disks[format])
+	ref, err := in.seedDisk(cl, prefix, format)
 	if err != nil {
 		return err
 	}
@@ -520,6 +471,101 @@ func (in *Installer) CreateVM(ctx context.Context, c *VMCreate) error {
 		fmt.Fprintf(o.Out, "The install waits for %s, which the cloud-config never carries: ssh %s@<address> sudo %s install\n", strings.Join(waiting, ", "), mach.User, ctl)
 	}
 	return nil
+}
+
+// seedable refuses a release a VM's seed cannot be written for: one that publishes no OS bundle,
+// or whose front offers no TLS mode a VM takes.
+func (in *Installer) seedable() error {
+	m := in.R.Manifest
+	in.givenCA = true
+	if in.R.Spec.Shapes.Kairos == nil || m.Artifacts.OS == "" {
+		return fmt.Errorf("%s %s publishes no OS bundle (shapes.kairos)", in.R.Spec.Name, m.ProjectVersion)
+	}
+	if in.R.Spec.HasFront() && len(in.createModes()) == 0 {
+		return in.noCreateMode()
+	}
+	return nil
+}
+
+// seedRegistry is the registry a VM's disk comes from, its prefix and its client: the mirror when
+// one is given (--registry), as the VM's updates do. The disk set the VM boots is read from it
+// into in.boot (bootDisks).
+func (in *Installer) seedRegistry(ctx context.Context) (string, *registry.Client, error) {
+	prefix := in.R.Spec.Registry.Prefix
+	if r := in.O.Registry; r != "" {
+		prefix = strings.TrimSuffix(r, "/")
+		if _, err := registry.Repository(prefix); err != nil {
+			return "", nil, fmt.Errorf("--registry: %w", err)
+		}
+	}
+	cl, err := in.registryClient(prefix)
+	if err != nil {
+		return "", nil, err
+	}
+	if in.boot, err = in.bootDisks(ctx, cl, prefix); err != nil {
+		return "", nil, err
+	}
+	return prefix, cl, nil
+}
+
+// seedSettings are what a VM's cloud-config gives on platform p, its disk from the registry at
+// prefix: the machine (machine), the first install's settings (vmSettings; the install awaits
+// what goes over SSH when c gives secrets or vmSettings returns given material), and the mirror's
+// CA, which ca holds when --registry-ca names one. waiting are the secret inputs the install
+// needs that nothing gives.
+func (in *Installer) seedSettings(ctx context.Context, c *VMCreate, p Platform, prefix string) (mach Machine, st *Settings, waiting []string, given *Given, ca []byte, err error) {
+	o, m := &in.O, in.R.Manifest
+	if mach, err = in.machine(ctx, c, p); err != nil {
+		return
+	}
+	if st, waiting, given, err = in.vmSettings(ctx); err != nil {
+		return
+	}
+	st.AwaitSecrets = c.Secrets != nil || given != nil
+	if given != nil {
+		st.AwaitGiven = given.awaits()
+	}
+	st.IPv6 = c.IPv6 // the install's network too: the front's IPv6 clients keep their address
+	st.TuneProfile = c.TuneProfile
+	// Another release's disk: the first boot takes this release's OS bundle before it installs.
+	if in.boot.release != m.Tag {
+		st.Release = &OSRelease{Version: m.ProjectVersion, Revision: m.Revision, Tag: m.Tag, OS: m.Artifacts.OS}
+	}
+	// A mirror: the disk comes from it, and the VM's updates.
+	if o.Registry != "" {
+		st.Registry = prefix
+	}
+	if o.RegistryCA != "" {
+		if ca, err = registry.ReadCA(o.RegistryCA); err != nil {
+			err = fmt.Errorf("--registry-ca: %w", err)
+			return
+		}
+		st.RegistryCA = VMRegistryCA(in.R.Spec.Name)
+	}
+	return
+}
+
+// seedUserData is the VM's cloud-config (UserData) for platform p, checked to fit what p takes;
+// withKey, it carries a one-time SSH host key generated here (mach.HostKey), which key is.
+func (in *Installer) seedUserData(p Platform, mach *Machine, st *Settings, ca []byte, withKey bool) (userData []byte, key *seedHostKey, err error) {
+	if withKey {
+		if key, err = newSeedHostKey(mach.Hostname); err != nil {
+			return nil, nil, err
+		}
+		mach.HostKey = key.Private
+	}
+	if userData, err = UserData(in.R.Spec.Name, in.R.Ctl(), *mach, *st, ca); err != nil {
+		return nil, nil, err
+	}
+	if err := fileInputsFit(p, in.R.Spec, st, len(userData)); err != nil {
+		return nil, nil, err
+	}
+	return userData, key, nil
+}
+
+// seedDisk is the disk of format the VM boots (in.boot), in the registry at prefix, by digest.
+func (in *Installer) seedDisk(cl *registry.Client, prefix, format string) (name.Digest, error) {
+	return cl.Digest(prefix+"/"+in.R.Spec.Name+"-disk", in.boot.disks[format])
 }
 
 // bootDisk is the disk set a VM boots: the release tag the disks are under, and each disk's digest

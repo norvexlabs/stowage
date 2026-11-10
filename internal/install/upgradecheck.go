@@ -73,7 +73,7 @@ func (h *Hostd) checkUpgrade(ctx context.Context, in *Installer, env *EnvFile, m
 	if this := in.R.Manifest; v != this.ProjectVersion || rev != strconv.Itoa(this.Revision) {
 		kept, err := in.keptInstaller(ctx, name, v, rev)
 		if err != nil {
-			return fail(http.StatusConflict, "%v", err)
+			return failAs(http.StatusConflict, err)
 		}
 		running = kept
 	}
@@ -86,7 +86,7 @@ func (h *Hostd) checkUpgrade(ctx context.Context, in *Installer, env *EnvFile, m
 		if running != baselined(in) { // reset-db resets the OS's release: the install's comes back first
 			way = fmt.Sprintf("`%s upgrade --version %s` writes the OS of the release the install runs, then `%s reset-db --new-baseline --version %s` wipes the data and installs it", in.R.Ctl(), v, in.R.Ctl(), m.ProjectVersion)
 		}
-		return fail(http.StatusConflict, "%s %s starts schema baseline %d, and the install runs %s %s, at baseline %d: its data cannot carry over, so its OS is not written; %s",
+		return refuseAs(http.StatusConflict, "stay on this release, or cross to it with its data wiped (reset-db --new-baseline)", "%s %s starts schema baseline %d, and the install runs %s %s, at baseline %d: its data cannot carry over, so its OS is not written; %s",
 			m.Name, m.ProjectVersion, to, m.Name, v, from, way)
 	}
 	if k.Release == nil {
@@ -95,7 +95,12 @@ func (h *Hostd) checkUpgrade(ctx context.Context, in *Installer, env *EnvFile, m
 	}
 	t := &Installer{R: k.Release, O: in.O}
 	if err := t.upgradeCheck(ctx, env); err != nil {
-		return fail(http.StatusConflict, "%v\nthe boot into %s would refuse this upgrade (it is given no input), so its OS is not written", err, m.Tag)
+		// The refusal's own fix is the Docker installer's flags': the VM's is a re-run of its install.
+		msg := fmt.Sprintf("%v\nthe boot into %s would refuse this upgrade (it is given no input), so its OS is not written", err, m.Tag)
+		if _, ok := Refusal(err); ok {
+			return refuseAs(http.StatusConflict, "change what the install records with a re-run of its install (install --set, --answers), or choose another release", "%s", msg)
+		}
+		return fail(http.StatusConflict, "%s", msg)
 	}
 	return nil
 }

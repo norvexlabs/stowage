@@ -103,12 +103,6 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
      Kubernetes: the release's values). The VM's daemon untouched, so the VM suites stay out.
   2. `describe --json`: the release, the inputs (never a secret's default), the first-install-only
      settings, `format`; read with no install.
-  4. The VM: the boot's `boot-rollback` child exit 3 (a rollback-check refusal after the OS fell
-     back) passed through as the boot's status, which then claims nothing changed (vm.go ~589);
-     `describe` on the VM's own `<short>-stow`, `format`, `previous` and `inputs` in its `status --json`, the same `--json` and exit 3 on
-     `install`/`upgrade`/`rollback`, `vm seed --json`
-     (the manual path's seed, no second builder) and `--known-hosts-line` on the `vm` verbs; one
-     VM chain (e2e-kairos, e2e-vm, e2e-full-vm) for 3's VM part and 4.
   5. Release, all suites once.
 
 - **OpenTofu provider** ([DESIGN § 13](docs/DESIGN.md#13-opentofu-provider-planned)), after the
