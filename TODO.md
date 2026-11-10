@@ -95,6 +95,32 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
 
 ## Should
 
+- **Machine interface** ([DESIGN § 6](docs/DESIGN.md#machine-interface--the-installer-read-by-programs)),
+  one slice each, in this order; each useful to CI scripts alone, and the base of the OpenTofu
+  provider below:
+  1. `status --json` on Docker and Kubernetes, the VM's field names; each install records its
+     release's installer digest (Docker: the install directory and the kept previous release;
+     Kubernetes: the release's values). The VM's daemon untouched, so the VM suites stay out.
+  2. `describe --json`: the release, the inputs (never a secret's default), the first-install-only
+     settings, `format`; read with no install.
+  3. `--json` results and exit 3 on a refusal on install/re-run, `upgrade`, `rollback`,
+     `uninstall` (Docker, Kubernetes): one refusal error type raised by every refusal there is,
+     `upgrade --version` passing its child's status on; text output unchanged. Review `high`
+     (every refusal path).
+  4. The VM: `previous` and `inputs` in its `status --json`, the same `--json` and exit 3 on
+     `install`/`upgrade`/`rollback`, `vm seed --json`
+     (the manual path's seed, no second builder) and `--known-hosts-line` on the `vm` verbs; one
+     VM chain (e2e-kairos, e2e-vm, e2e-full-vm) for 3's VM part and 4.
+  5. Release, all suites once.
+
+- **OpenTofu provider** ([DESIGN § 13](docs/DESIGN.md#13-opentofu-provider-planned)), after the
+  machine interface is released, in its own public repository `terraform-provider-stowage`
+  (created by the maintainer with the org app and its ruleset; a GPG key for its releases;
+  registry submission by hand). Slices: Docker target (create, read, delete); update (inputs
+  then release), rollback, write-only secrets, import; Kubernetes target; `stowage_vm_seed` and the
+  VM target; docs, acceptance scripts against `tofu` (sshd + Docker-in-Docker, kind, one TrueNAS
+  VM), first release.
+
 - **ACME proven end to end**: no suite runs an ACME server, so `acme` and `dns-cloudflare` are
   proven by the Caddyfile they write alone — for the HTTP routes and for a domain the front holds
   for L4 routes alone (a site answering 404 over HTTPS, its challenges on the front's ports 80
@@ -545,6 +571,10 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
   repositories.
 
 ## Could
+
+- **Installers for more platforms**: `<short>-stow` is linux/amd64, so a Kubernetes install (and
+  the OpenTofu provider's Kubernetes target) runs from a Linux amd64 machine only. Build
+  darwin/arm64, darwin/amd64 and linux/arm64 installers, the payload appended to each.
 
 - **Two ships on one cloud cache**: two `ship`/`promote` runs on the same `$XDG_CACHE_HOME`
   share an image's working directory with no lock of Stowage's own: the second can take the

@@ -3,7 +3,7 @@
 ## 0. Scope
 
 Stowage gives a small container stack a complete packaging and lifecycle: a release pipeline,
-three deploy shapes from one set of images, a host daemon + `hostctl`, a Caddy TLS front, a health
+three deploy shapes from one set of images, a host daemon and its `<short>-stow` verbs, a Caddy TLS front, a health
 gate with A/B rollback, backups, a network override with auto-revert and cloud-config rendering.
 Everything project-specific is declared in `stowage.yaml`; nothing in Stowage knows a particular
 project. The lifecycle is split into **core** (**C**, built in phases 1–2 — the publisher side,
@@ -17,7 +17,7 @@ knows it from its URL).
 
 Non-goals: generating Helm charts, orchestrating more than one host per Docker/VM install, what a
 rotated secret protects (re-encrypting data under a new key is the application's: Stowage rotates
-the value and keeps the old one accepted meanwhile), destroying VMs (the hypervisor's job), supporting databases other
+the value and keeps the old one accepted meanwhile), destroying VMs `vm create` did not make (the hypervisor's job), supporting databases other
 than Postgres in v1 (the `command` providers leave the door open).
 
 ## 1. Roles and artifacts
@@ -227,7 +227,7 @@ says which `stowage` to run.
 
 `apiVersion: stowage/v1` (spec) and `schemaVersion: 2` (release manifest) move only on a breaking
 change. A consumer that meets an unknown major refuses with an actionable error ("this release needs
-installer ≥ 2 — re-run the bootstrap one-liner" / "upgrade hostctl first").
+installer ≥ 2 — re-run the bootstrap one-liner" / "upgrade `<short>-stow` first").
 
 ### 3.4 Release identity = project version + package revision
 
@@ -238,7 +238,7 @@ publishes (`v{v}` / `v{v}-dev`
 is safe under CalVer; under SemVer a suffix such as `{v}-beta` collides with pre-releases, a
 prefix such as `beta-{v}` does not).
 
-Repackaging the same project version with a new Stowage runtime (a `hostctl` fix, a base-OS CVE) is a
+Repackaging the same project version with a new Stowage runtime (a `<short>-stow` fix, a base-OS CVE) is a
 new **revision**. Tag `{v}` for revision 1, `{v}-r{N}` afterwards (the channel's tag template decides
 the spelling). Order is `(scheme order of project version, revision)`. A stable tag stays immutable (it never names other content; `prune --keep N`, the channel's retention, deletes it whole once N later releases exist);
 a revision is how a stable release receives a runtime fix without lying about the app version.
@@ -476,8 +476,8 @@ which names the installer itself, and `yanked`, which a consumer reads from the 
 rewrites the manifest and never the installer. The installer is built after the release's number
 is claimed and before the manifest is written.
 
-Every consumer reads this one document — `hostctl updates` / `changelog`, `<short>-stow updates` /
-`upgrade`, the Kubernetes lifecycle, the application's own "update available" banner. Consumers order
+Every consumer reads this one document — `<short>-stow updates` /
+`upgrade` on every shape, the Kubernetes lifecycle, the application's own "update available" banner. Consumers order
 releases with the scheme recorded in the manifest; **they never parse tags** (no `tags/list`
 sorting, no raw changelog sidecar).
 
@@ -810,12 +810,54 @@ backup{run,list,status,verify} restore reset-db logs ps restart stop start unins
 
 | Shape | Command | Backend |
 |---|---|---|
-| VM | `hostctl` (unprivileged, no sudo) → host daemon socket | kairos-agent A/B, health gate, rollback-check, network override, cloud-config replace |
+| VM | `<short>-stow` (root or the `admin` group, no sudo) → host daemon socket | kairos-agent A/B, health gate, rollback-check, network override, cloud-config replace |
 | Docker | `<short>-stow` (the installer binary, installed next to `compose.yaml`) | compose, pre-change `pg_dump` snapshot, `.prev` compose, barrier-aware rollback |
 | Kubernetes | `<short>-stow k8s …` | helm OCI `--atomic`, `helm rollback`; data on managed PG / CNPG |
 
 Where a verb does not apply, the command says who owns it ("backups are your managed database's job
 on this shape") instead of failing obscurely.
+
+### Machine interface — the installer read by programs
+
+CI scripts, handoff tools and the OpenTofu provider (§ 13) drive `<short>-stow` without a terminal.
+They read its JSON and its exit status, never its text, which stays written for people. The
+interface is an **output** of the installer, not the `command` contract (§ 2.1), which is how
+Stowage calls a project's programs: the two never share a reader.
+
+- **`describe --json`** — what the release this installer carries offers, read before anything is
+  installed: `format` (this interface's version, an integer moved only on a breaking change; a
+  reader refuses one it does not know, naming the Stowage release it needs), `name`, the release
+  `{version, revision}`, the channel, the shapes, the inputs from the payload's spec (key, type,
+  secret, required, optional, shapes, when, advanced, profile, prompt, a default — never a
+  secret's) and the settings a re-run cannot change (`address`, `registry`, `registry_ca`,
+  `channel`). It comes from the spec the payload carries, so there is no second schema.
+- **`status --json` on every shape** — the VM's fields (§ 8, the host daemon's status) are the core,
+  and Docker's and Kubernetes' carry the same names: `name`, `installed` as `{version, revision}`,
+  `channel`, `installing`, `install_failed`; and on every shape `previous` (the release `rollback`
+  returns to, null before an upgrade) and `inputs`, the recorded keys only — never a value, so the
+  output can be logged. On Docker and Kubernetes `installed` and `previous` also carry `installer`:
+  the installer image by the digest the release manifest records, which each install records —
+  Docker in the install directory, carried into the kept previous release; Kubernetes in the
+  release's values, so `helm rollback` restores it. On the VM the release is the OS's, so the
+  disk, not an installer, carries it. Each shape adds its own (the services; the helm revision;
+  the VM's boot fields).
+- **`--json` on the verbs that change an install** (install and re-run, `upgrade`, `rollback`,
+  `uninstall`, on every shape) — one object at the end: `{format, result: "done" | "nothing",
+  release, refused: {reason, fix}}`.
+- **Exit status**: 0 done or nothing to do; **3 refused** — a rule said no before anything changed
+  (a schema barrier or a newer schema, a recorded value set again, a first-install-only setting on
+  a re-run, an older or yanked release or one no key the install trusts signed, `--given` with `--version` on Kubernetes,
+  `upgrade --version` on an `--offline` install), `refused.fix` naming what to run; 1 failed. A
+  refusal is one error type in the installer, so a new refusal is a 3 wherever it is raised, and an
+  installer run by another (`upgrade --version`) passes its child's status on. 2 stays `kit
+  check`'s "unknown".
+- **`vm seed --json`** — a VM's first-boot material without creating the VM, for a tool that
+  creates it with its own means: the user-data (the cloud-config; never a secret input — those go
+  after the boot, `install --given -` over SSH), the one-time host key (its `known_hosts` line, its
+  fingerprint and its private key, which the caller keeps secret until it retires), and the disk
+  image per platform by digest. It is the seed `vm create --create manual` writes, built by the
+  same code. The `vm` verbs that reach a VM take `--known-hosts-line LINE`: that key alone is
+  accepted, never `accept-new`.
 
 ## 7. Full lifecycle matrix
 
@@ -832,27 +874,27 @@ on this shape") instead of failing obscurely.
 | 5 | Discover | installer `:latest` + bundled docs **C**; `releases` from manifests **C** | same installer | same installer; disk image per format |
 | 6 | Pre-flight | compose ≥ 2.20, ports, registry login, image presence, offline image check **C** | kubectl/helm present, namespace, DB grant SQL printed **C** | values rendered + validated, disk ≥ minimum **C** |
 | 7 | Install | inputs → secrets → `.env` → `up --wait`, loopback vs TLS mode **C** | Secret (idempotent) + `helm upgrade --install --atomic` **C**; DB `external` / `embedded` / `cnpg` **C** (the chart's modes; `examples/full` runs the first two) | cloud-config render → NoCloud ISO / disk → boot → preload → secrets generated **C** |
-| 8 | First-run provision | `provision` hook, resumable state, credentials file; `provision --set` replaces a value it returned or sets one its `returns` declares **C** | the same hook as a Job after the release is settled, its outputs in `<release>-stowage-provision` (never a log) and handed back; a failure leaves the release running, `k8s provision [--set]` **C** | provision unit + `hostctl provision [--set]` **C** |
+| 8 | First-run provision | `provision` hook, resumable state, credentials file; `provision --set` replaces a value it returned or sets one its `returns` declares **C** | the same hook as a Job after the release is settled, its outputs in `<release>-stowage-provision` (never a log) and handed back; a failure leaves the release running, `k8s provision [--set]` **C** | provision unit + `<short>-stow provision [--set]` **C** |
 | 9 | Reach the portal | prints `front.portal` URL **C** | prints ingress URL **X** | console banner + login issue text **C** |
 | 10 | Air-gapped | `--offline` with preloaded images **C**; `--registry` mirror with its CA, filled by `mirror export` / `import` (§ 12) | `--image-registry` mirror **C**, with its CA | first boot is registry-free **C**; mirror and CA from cloud-config for updates and upgrades |
-| 11 | Observe | `status`, `health`, `logs`, `ps`; liveness ≠ readiness **C** | `status` **C** | `hostctl status/health/ps/logs/version`, console-info timer **C** |
+| 11 | Observe | `status`, `health`, `logs`, `ps`; liveness ≠ readiness **C** | `status` **C** | `<short>-stow status/health/ps/logs/events`, console-info timer **C** |
 | 12 | Reconfigure | installer re-run is an idempotent reconcile **C**; it changes what it is given — `--set`, `--answers`, `--domains`, the front's ports, its TLS mode (between HTTPS modes) and `byo` certificate — and brings the stack up again; advanced inputs (`advanced: true`) are tunables only `--set` records | `upgrade` with full values **C** | `reconfigure-userdata` (+ `.prev`) then reboot **C** → `sudo <short>-stow install --set …` over SSH, the Docker re-run; the settings file is the first install's |
 | 13 | Network / SSH | owner: host | owner: cluster | `<short>-stow network` set / confirm / revert / reset, an addressing change undone unless confirmed in its window (also at a daemon restart or a reboot inside it) **C**; SSH key-only, the admin group **C** |
 | 14 | TLS | Caddy acme / dns / byo / internal / none, auto-renew, certs survive reset-db **C** | owner: ingress + cert-manager **C** | same front as Docker **C** |
 | 15 | Backup | pre-upgrade snapshot **C**; scheduled backup (systemd timer), `backup config/run/list/status/verify` **C** | owner: managed PG / CNPG **C** | timer, pg_dump → age → rclone, retention, `backup config/run/list/status/verify` **C** |
 | 16 | Restore | `restore OBJECT`, as the VM's **C** | owner: managed PG PITR | `restore OBJECT`: a host daemon job, the backup streamed from the destination, decrypted with the key given on stdin, `pg_restore` in one transaction, the services but the database stopped **C** |
-| 17 | Check for update | `updates` from manifests **C** | same **C** | `hostctl updates` from manifests **C** |
-| 18 | Read changelog | project + Platform sections current → target **C** | same | `hostctl changelog new` **C**, source becomes the manifest |
+| 17 | Check for update | `updates` from manifests **C** | same **C** | `<short>-stow updates` from manifests **C** |
+| 18 | Read changelog | project + Platform sections current → target **C** | same | same, from the manifest |
 | 19 | Upgrade pre-flight | mandatory snapshot **C**; yanked / `min_upgrade_from` / barrier warning **C** | same checks **C** | pre-upgrade backup **C**; same checks **C** |
 | 20 | Upgrade | compose file moves with images, new `.env` keys merged, `up --wait` **C** | `--atomic`, gated by readiness **C** | kairos-agent stages passive slot while serving; reboot now or later **C** |
 | 21 | Health gate / auto-rollback | failure → prints the rollback command **C** | helm `--atomic` reverts **C** | health gate: deadline, all-healthy, diagnostics, grub fallback, loop guard; kept at a rollback barrier **C** |
-| 22 | Manual rollback | barrier + reads-newer check, else points to the snapshot **C** | `helm rollback` after the barrier + reads-newer check in a pod (`shapes.kubernetes.schema`) **C** | `hostctl rollback`, rollback-check refuses only on proof **C** |
+| 22 | Manual rollback | barrier + reads-newer check, else points to the snapshot **C** | `helm rollback` after the barrier + reads-newer check in a pod (`shapes.kubernetes.schema`) **C** | `<short>-stow rollback`, rollback-check refuses only on proof **C** |
 | 23 | Reset data | `reset-db`: stack down, the `data.reset` volumes deleted (`keep_on_reset` kept), provisioned as first installed **C** | `k8s reset-db`: uninstall, the release's claims deleted, installed again with its values and Secrets **C** | `reset-db`, a host daemon job, the Docker shape's, no reboot **C** |
 | 24 | Rotate secrets | `secrets rotate KEY` for `rotation: true`, three passes (`--stage` → `KEY_NEXT` accepted; swap → `KEY_PREVIOUS` accepted; `--finish`), the stack up again at each **C** | `k8s secrets rotate`: the same passes on the Secret, each workload's rollout restarted and awaited **C** | the Docker shape's verb, a host daemon job **C** |
 | 24b | Set a secret | `secrets set KEY` for `settable: true` (opt-in: a database password or an encryption key changed in `.env` alone breaks the data made with it), the value on standard input, the stack up again **C** | not yet **X** | the Docker shape's verb, a host daemon job on the operator's socket alone **C** |
 | 25 | Registry credential rotation | `.env` / installer flag **C** | pull Secret **C** | sealed env + `reconfigure-userdata` **C** → the pull account the OS bundle carries; a mirror's is root's Docker login on the VM |
-| 26 | Power / maintenance | `stop` / `start` **C** | owner: cluster | `hostctl reboot/shutdown --drain-secs`, disk-pressure hook **C** |
-| 27 | Uninstall | `uninstall [--keep-data]` **X** | `k8s uninstall`: `helm uninstall`, the installer's Secrets, the hook's account and Job; the claims only with `--data`, kept data keeping the Secrets that answer for it, a chart's own claim (which helm deletes) needing `--data` **C** | `vm destroy` (a VM `vm create` made with OpenTofu) **C**; else owner: hypervisor |
+| 26 | Power / maintenance | `stop` / `start` **C** | owner: cluster | `<short>-stow reboot/shutdown --drain-secs`, disk-pressure hook **C** |
+| 27 | Uninstall | `uninstall`: `compose down`, the install's timers and applied network declarations removed; the volumes and the install directory kept unless `--data` **C** | `k8s uninstall`: `helm uninstall`, the installer's Secrets, the hook's account and Job; the claims only with `--data`, kept data keeping the Secrets that answer for it, a chart's own claim (which helm deletes) needing `--data` **C** | `vm destroy` (a VM `vm create` made with OpenTofu) **C**; else owner: hypervisor |
 | 28 | Move host / disaster recovery | `secrets export` on old (the front's local CA with the secrets: a new root would break every client trusting the old) → `install --secrets` on new **C** (data: the snapshot by hand) | owner: managed PG; secrets **X** | `secrets export`, then `vm create --secrets` + `restore OBJECT` **C** |
 
 Rules:
@@ -971,7 +1013,7 @@ Rules:
 | Volume helper | busybox 1.37.0, from a Dockerfile embedded in `stowage` (base pinned by digest), built by `ship` into the project registry for a `docker` or `kairos` shape with a data volume of a `uid`, pulled with the stack's images on Docker, preloaded by the bundle | run once per start that makes such a volume, after `up --no-start` and before the services start: as root, no network, the new volumes mounted, `chown -hR <uid>` of each whose root belongs to another user |
 | Backup | the host daemon (pg_dump inside the database service, age in Go) and a runner image (rclone, from a Dockerfile embedded in `stowage`, base pinned by digest, built by `ship` into the project registry for a `kairos` or `docker` shape with a `pg-age-rclone` or `volumes-age-rclone` backup, preloaded by the bundle) | the dump streamed through age to rclone `rcat`, never on the VM's disk, after each listed volume's tar (the runner's own, the volume read-only, no network) streamed the same way beside it; the size reached checked; the dump last, so a backup holds a dump only once whole; retention by `rclone delete --min-age` on the profile's own dumps, then the volume archives whose dump is gone (an archive is older than its dump); a project without a database (`volumes-age-rclone`) uploads an encrypted manifest (project, release, volumes) in the dump's place, so a backup's last object still marks it whole and names it, and every listing, pruning and restore keys on that last object, whichever it is; its restore decrypts the manifest before stopping anything, which proves the identity and the backup's release, then swaps the volumes alone in; settings (destination, rclone config, recipients, retention, schedule, profile) the operator's, on the persistent partition, set over SSH; the timer's schedule a runtime drop-in; a backup before each upgrade, warn-only |
 | Host daemon (`hostd`) | Go, in `stowage`: `<short>-stow hostd`, a systemd service on the VM (not a privileged container) | JSON over HTTP on a unix socket (`root:admin` 0660): status, services, logs, service actions, provision, updates, upgrade (kairos-agent writes the release's bundle, by digest, to the passive slot; then a reboot), reboot / shutdown after a drain; one job at a time; the same API on an app socket, behind the install's token, mounted only into the services `shapes.kairos.host_api` names (served while the OS's release or the installed one names some: an upgrade's boot brings the installed release up first, its services still reaching the daemon). health, rollback to the passive system (a job: the boot assessment marked, then a reboot), reset-db (a job, no reboot), the network override (set / confirm / revert / reset, its revert timer), backups (settings, a job, status, list, verify — a job too), an event journal in the install (jobs started, ended or lost, reboots scheduled and cancelled, boots and the health gate's verdicts, the first install's end; appended by the daemon and the gate under one lock, numbered for the journal's life, read with a long poll), the disk-pressure watch (the persistent partition read at start and every 10 min; at `soft_pct` a POST to the hook's service at its container address, bearer `auth_secret`; past `hard_pct` a console banner) |
-| `hostctl` | the VM verbs of `<short>-stow` | client of `hostd` for root and the `admin` group, names derived from `name` |
+| VM verbs | `<short>-stow` on the VM | client of `hostd` for root and the `admin` group, names derived from `name` |
 | VM install | `<short>-stow` in the OS bundle, the release it carries without its publication | the Docker shape's install from the preloaded images (by digest tag) into the persistent partition; at every boot the same release comes up again, the release the last upgrade replaced goes back (with the install's own, newer `<short>-stow`), any other is upgraded to the OS's release |
 | Health gate | Go + systemd | deadline / all-healthy / diagnostics / Kairos boot assessment for the fallback / loop guard; probe from the `health` provider |
 | rollback-check | shell | record / check / exit 3 on proof; queries from the `schema compat` provider |
@@ -985,32 +1027,8 @@ migration barrier naming convention (exposed through the `schema compat` provide
 
 ## 9. Repository layout (Stowage itself)
 
-```
-cmd/stowage/            CLI entry point
-internal/cli/           commands and output
-internal/spec/          stowage.yaml types, strict decoding, the Provider shape
-internal/lint/          lint rules, compose parsing
-internal/version/       version sources, schemes, channel tags
-internal/changelog/     changelog providers
-internal/command/       the `command` provider contract
-internal/providers/     runtime-side provider configs (auth, signing, health, schema, provision, backup)
-internal/digest/        inputs digests
-internal/graph/         build graph, skip/re-tag
-internal/registry/      OCI client (go-containerregistry / oras-go), manifest, channel pointers
-internal/helm/          chart load (.helmignore), checks, packaging with the release's values
-runtime/installer/      installer + <short>-stow binary (Go; terminal UI on Charm huh/bubbles/lipgloss)
-runtime/ctl/            <short>-stow templates
-internal/front/         the front's Dockerfile (embedded)
-internal/backup/        the VM's backup runner's Dockerfile (embedded)
-internal/chown/         the volume helper's Dockerfile (embedded)
-internal/kairos/        the OS bundle's recipe (Dockerfile, files) and the disk image builder
-runtime/hostd/          host daemon (Go) + tests
-runtime/vm/             systemd units, health gate, rollback-check
-runtime/cloud-config/   template, render, seal, cidata
-charts/stowage-lib/     Helm library chart
-examples/               minimal, full
-tests/                  lifecycle smoke per shape
-```
+README's [Repository map](../README.md#repository-map) is the layout, one line per package; it
+changes with the tree in the same commit.
 
 ## 10. Extensions
 
@@ -1018,7 +1036,6 @@ tests/                  lifecycle smoke per shape
 |---|---|---|---|
 | K8s portal URL | 9 | S | parity with Docker |
 | Kubernetes secrets export/import | 28 | M | the VM and Docker have it |
-| `uninstall` (Docker) | 27 | S | `down` and removing the volumes by hand |
 
 ## 11. Phases
 
@@ -1090,7 +1107,7 @@ every shape, the VM end-to-end test upgrading through it), then the health gate.
 | Phase | Scope | Proof |
 |---|---|---|
 | 1 | CLI: spec, lint, providers, graph, ship / verify / promote / yank, release manifest. Docker shape: installer + `<short>-stow` with every **C** verb | `examples/minimal` walks every Docker row of § 7 on a clean host (lifecycle smoke) |
-| 2 | Kubernetes lifecycle + installer; Kairos bundle, hostd, hostctl, health gate, cloud-config | the same walk on kind and on a Kairos VM, including a forced health-gate rollback and a refused barrier rollback |
+| 2 | Kubernetes lifecycle + installer; Kairos bundle, hostd and its verbs, health gate, cloud-config | the same walk on kind and on a Kairos VM, including a forced health-gate rollback and a refused barrier rollback |
 | 2b | accepted **X** items | each added to the lifecycle smoke walk |
 | 3 | Adoption proof: `examples/full`, a working stack shaped like a production project (stand-in services migrating a real Postgres through two roles, a provision hook, an extension it takes the URL of, signed CalVer releases with token pushes, external database URLs on Kubernetes) | its Docker, Kubernetes and VM install, upgrade and rollback end to end (`make e2e-full` for Docker, `make e2e-full-k8s` for Kubernetes, `make e2e-full-vm` for the VM) |
 
@@ -2037,3 +2054,57 @@ every shape, the VM end-to-end test upgrading through it), then the health gate.
 - **No Stowage registry** — every runtime piece is in the `stowage` binary (an executable or a
   recipe `ship` builds into the project registry), so `stowage.lock` pins a version, not digests;
   operators only ever pull from the project registry.
+
+## 13. OpenTofu provider (planned)
+
+An operator who keeps infrastructure in OpenTofu declares a Stowage product's install beside the VM,
+cloud or cluster it runs on, in one root. The provider is a separate project
+(`terraform-provider-stowage`: the OpenTofu registry takes a public repository of that name) that
+reads only the machine interface (§ 6): it decides nothing the installer does not decide, orders no
+version, and keeps no copy of a rule. It needs OpenTofu ≥ 1.11 (write-only attributes; OpenTofu has
+no `action` blocks, so every operation is a resource's create, update or delete).
+
+**`stowage_install`**, one target per resource:
+
+| | Docker | Kubernetes | Kairos VM |
+|---|---|---|---|
+| Reached by | the system `ssh`, the target's `known_hosts` line given (strict) | kubeconfig and context, helm ≥ 3.14 and kubectl locally, a linux/amd64 runner (the installer's platform) | the system `ssh`, the line from `stowage_vm_seed` |
+| Desired release | `installer`: the installer image by digest — an installer carries one release, so the digest is the release | the same | `version` and `channel` (the disk carried the first) |
+| Change of release | the new installer's `upgrade` | its `k8s upgrade` | `sudo <short>-stow upgrade --version V --yes`, then the reboot followed: a new `boot_id`, the trial over, `installed` the target; a fallback or a failed boot is an error saving the release that runs |
+| Change of a recorded input | the running installer's re-run with `--set` | `k8s upgrade --given -` | `sudo <short>-stow install --set` |
+| Delete | `uninstall`, `--data` only with `delete_data` | `k8s uninstall`, the same | forgets the resource: removing a VM is its hypervisor resource's job |
+
+- **Update order**: the inputs first, with the running release's installer, state saved; then the
+  release, with the new release's installer (an upgrade keeps every recorded value and refuses
+  setting one again). A failure between leaves the reconfigured release in state, and the next plan
+  shows the upgrade alone. Inputs a new release adds go with its upgrade.
+- **Rollback** only when the desired release is `status.previous` and `allow_rollback` is set: a
+  rollback restores the previous values and, on the VM, reboots, so a variable edit never triggers
+  one. Any other older release goes to the installer, whose refusal (exit 3) is the diagnostic.
+- **First-install-only settings** (`channel`, `address`, `registry`) changed: a plan-time error
+  naming the fix, never a replacement — replacing an install deletes its data.
+- **`deletion_protection`** (default true) refuses a destroy; `delete_data` (default false) chooses
+  `uninstall --data`.
+- **What lands in state**: the connection (host, user, key file or agent, the `known_hosts` line),
+  the release, the non-secret inputs. Not in state: secret inputs (write-only, with a
+  `secret_inputs_wo_version` that triggers their update), a handoff kit or given values
+  (`given_wo`, at create), a decrypted `secrets export` (`secrets_wo`, at create, Docker and the VM:
+  Kubernetes has no `secrets export`). Read and delete see state alone, so nothing they need is
+  write-only. Generated secrets never leave the target.
+- **Read** is `status --json`: a VM whose health gate fell back shows its real release, and the next
+  plan proposes the upgrade again.
+- **Trust**: the first install trusts the digest the operator pinned (as the bootstrap one-liner
+  does, § 5.1); the installer verifies every later release with the keys the install trusts.
+- **Plan-time checks** (an upgrade's dry run over SSH) are opt-in, and skipped while the target does
+  not exist yet (a VM created in the same root).
+
+**`stowage_vm_seed`** — `vm seed --json`, generated once (a managed resource: the one-time host key
+would change at every plan from a data source, and a function must be pure). The customer's own
+provider (TrueNAS, a cloud) creates the VM from its user-data and disk. The private host key sits
+in state until the VM is installed; state encryption is advised. This replaces nesting
+`vm create --create opentofu`, a second OpenTofu root with its own state, inside the first;
+`vm create` keeps its built-in modules for operators who do not write OpenTofu.
+
+The provider is released from its repository (GoReleaser, the registry's signed checksums), pushed
+only by the org's GitHub App like Stowage, and can be mirrored into the project registry through
+OpenTofu's `oci_mirror`. It refuses an installer whose `describe` `format` it does not know.
