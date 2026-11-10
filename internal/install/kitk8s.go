@@ -54,7 +54,7 @@ func (in *Installer) k8sKitInstaller(ctx context.Context, h *spec.Handoff, step 
 		return nil, nil, err
 	}
 	if rel == nil {
-		return nil, nil, fmt.Errorf("no release %s in %s", k.Release, k.Namespace)
+		return nil, nil, in.noRelease()
 	}
 	if err := in.pending(rel); err != nil {
 		return nil, nil, err

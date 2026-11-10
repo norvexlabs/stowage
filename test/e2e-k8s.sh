@@ -111,8 +111,8 @@ jq -se 'length == 1 and (.[0] | .format == 1 and .name == "notes" and .release =
 	(.inputs | map(.key) | index("ADMIN_EMAIL") != null) and all(.inputs[]; if .secret then has("default") | not else has("default") end))' "$WORK/describe.json" >/dev/null ||
 	{ cat "$WORK/describe.json"; fail "describe --json does not describe 1.0.0 for Kubernetes"; }
 rc=0; ctl v1.sh k8s status --json >"$WORK/status0.json" 2>"$WORK/status0.log" || rc=$?
-[[ $rc != 0 && ! -s $WORK/status0.json ]] && grep -q 'no release notes in notes' "$WORK/status0.log" ||
-	{ cat "$WORK/status0.log" "$WORK/status0.json"; fail "k8s status --json before the install exited $rc, not failing with 'no release notes in notes' and nothing on standard output"; }
+[[ $rc == 3 && ! -s $WORK/status0.json ]] && grep -qF 'no release notes in notes: `notes-stow k8s install --namespace notes --release notes' "$WORK/status0.log" ||
+	{ cat "$WORK/status0.log" "$WORK/status0.json"; fail "k8s status --json before the install exited $rc, not 3 with 'no release notes in notes' naming the k8s install, and nothing on standard output"; }
 # The install, under --json: its Result alone on standard output, its text on standard error.
 ctl v1.sh k8s install --no-input --set ADMIN_EMAIL=admin@notes.test --timeout 3m --json >"$WORK/install.json" 2>"$WORK/install.log" ||
 	{ cat "$WORK/install.log" "$WORK/install.json"; cluster_logs >&2; fail "k8s install --json"; }

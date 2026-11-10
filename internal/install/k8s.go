@@ -1108,10 +1108,17 @@ func (in *Installer) K8sRollback(ctx context.Context) (err error) {
 	return nil
 }
 
-// k8sStatusRelease is the release both forms of `k8s status` report on, as helm lists it; an error
-// when there is none.
-func (in *Installer) k8sStatusRelease(ctx context.Context) (*helmRelease, error) {
+// noRelease is the refusal of a verb that needs the release when the namespace holds none, as
+// Docker's refuses a directory that holds no install: nothing changed, and the install is what
+// to run, named in the message too, as a verb without --json prints no fix.
+func (in *Installer) noRelease() error {
 	k := in.O.K8s
+	return refuse("install first: `"+in.k8sCtl("install")+"`", "no release %s in %s: `%s` installs %s", k.Release, k.Namespace, in.k8sCtl("install"), in.R.Manifest.ProjectVersion)
+}
+
+// k8sStatusRelease is the release both forms of `k8s status` report on, as helm lists it; a
+// refusal when there is none (noRelease).
+func (in *Installer) k8sStatusRelease(ctx context.Context) (*helmRelease, error) {
 	if err := in.checkTarget(); err != nil {
 		return nil, err
 	}
@@ -1120,7 +1127,7 @@ func (in *Installer) k8sStatusRelease(ctx context.Context) (*helmRelease, error)
 		return nil, err
 	}
 	if rel == nil {
-		return nil, fmt.Errorf("no release %s in %s", k.Release, k.Namespace)
+		return nil, in.noRelease()
 	}
 	return rel, nil
 }

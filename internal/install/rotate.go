@@ -187,7 +187,7 @@ func (in *Installer) K8sRotateSecret(ctx context.Context, key, pass string) erro
 		return err
 	}
 	if rel == nil {
-		return fmt.Errorf("no release %s in %s", k.Release, k.Namespace)
+		return in.noRelease()
 	}
 	if err := in.pending(rel); err != nil {
 		return err

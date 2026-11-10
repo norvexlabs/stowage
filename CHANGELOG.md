@@ -36,6 +36,11 @@ follow [SemVer](https://semver.org/).
   and `vm create` refuse a missing, unknown or unoffered `--platform` with exit 3 once the
   registry has been read, naming the platforms it offers; a registry that cannot be read, or that
   offers no disk, is a failure (exit 1).
+- `k8s status`, with or without `--json`, is refused (exit 3, nothing on standard output) when the
+  namespace holds no release of that name, as Docker's `status` of a directory without an
+  install, its message and its fix naming the `k8s install` to run; `k8s provision`, `k8s
+  reset-db`, `k8s secrets rotate` and `k8s kit create` / `kit check` refuse it the same way. They
+  exited 1 before.
 - `vm seed --json`: a new VM's first-boot material for a tool that creates the VM itself — the
   cloud-config (no secret input), a one-time SSH host key with its `known_hosts` line and
   fingerprint, the disk image each platform boots, by digest, and the secret inputs the first

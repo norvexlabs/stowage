@@ -373,7 +373,7 @@ func TestK8sHookPodThatCannotStart(t *testing.T) {
 func TestK8sProvisionRefusals(t *testing.T) {
 	t.Parallel()
 	e := newKubeEnv(t, spec.Provider{Name: "none"})
-	if err := e.installer(nil).K8sProvision(context.Background()); err == nil || !strings.Contains(err.Error(), "no release notes in notes") {
+	if err := e.installer(nil).K8sProvision(context.Background()); !isRefused(err) || !strings.Contains(err.Error(), "no release notes in notes: `notes-stow k8s install") {
 		t.Errorf("no release: %v", err)
 	}
 	e.runs("0.9.0", 1)

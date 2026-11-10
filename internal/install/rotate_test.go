@@ -10,6 +10,27 @@ import (
 	"github.com/norvexlabs/stowage/internal/spec"
 )
 
+// The verbs that need the release refuse a namespace without it, as `k8s status` does
+// (noRelease): exit 3, the install to run named.
+func TestK8sVerbsRefuseNoRelease(t *testing.T) {
+	t.Parallel()
+	const want = "no release notes in notes: `notes-stow k8s install --namespace notes --release notes` installs 1.0.0"
+	e := newKubeEnv(t, spec.Provider{Name: "none"})
+	e.release = e.at("1.0.0", 1, rotating)
+	e.f.listed = nil
+	if err := e.installer(nil).K8sRotateSecret(context.Background(), "SESSION_SECRET", RotateStage); !isRefused(err) || err.Error() != want {
+		t.Errorf("secrets rotate: %v", err)
+	}
+	e = k8sIssuing(t)
+	e.f.listed = nil
+	if _, err := e.installer(kitFast).K8sIssueKit(context.Background(), kitReq, kitNow); !isRefused(err) || err.Error() != want {
+		t.Errorf("kit create: %v", err)
+	}
+	if _, err := e.installer(nil).K8sCheckKit(context.Background(), "client", "site-1"); !isRefused(err) || err.Error() != want {
+		t.Errorf("kit check: %v", err)
+	}
+}
+
 // rotating makes SESSION_SECRET a rotated secret.
 func rotating(s *spec.Spec) {
 	for i := range s.Secrets {

@@ -492,7 +492,7 @@ func TestK8sResetRefusals(t *testing.T) {
 	t.Parallel()
 	e := newKubeEnv(t, spec.Provider{Name: "none"})
 	yes := func(o *Options) { o.Yes = true }
-	if err := e.reset(yes); err == nil || !strings.Contains(err.Error(), "no release notes in notes") {
+	if err := e.reset(yes); !isRefused(err) || !strings.Contains(err.Error(), "no release notes in notes: `notes-stow k8s install") {
 		t.Errorf("no release: %v", err)
 	}
 	e.runs("1.0.1", 1)

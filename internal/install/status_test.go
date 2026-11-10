@@ -346,6 +346,45 @@ func TestK8sStatusJSON(t *testing.T) {
 	}
 }
 
+// Both forms of `k8s status` refuse a namespace without the release (exit 3, as Docker's status
+// refuses a directory that holds no install), printing nothing on standard output, the install to
+// run in the message and the fix, its --kube-context included; with the release they succeed.
+func TestK8sStatusRefusesNoRelease(t *testing.T) {
+	t.Parallel()
+	for _, kctx := range []string{"", "the cluster"} {
+		e := newKubeEnv(t, spec.Provider{Name: "none"})
+		e.runs("1.0.0", 1)
+		e.f.history = []helmRevision{{Revision: 1, Status: "deployed", Chart: "notes-0.1.0"}}
+		e.stored(map[string]string{"ADMIN_EMAIL": "admin@example.org"}, ours)
+		in := e.installer(func(o *Options) { o.K8s.Context = kctx })
+		forms := []struct {
+			name string
+			f    func(context.Context) error
+		}{{"json", in.K8sStatusJSON}, {"text", in.K8sStatus}}
+		for _, form := range forms {
+			if err := form.f(context.Background()); err != nil {
+				t.Errorf("%s with the release: %v", form.name, err)
+			}
+		}
+		install := in.R.Ctl() + " k8s install --namespace notes --release notes"
+		if kctx != "" {
+			install += " --kube-context 'the cluster'"
+		}
+		e.f.listed = nil
+		for _, form := range forms {
+			e.out.Reset()
+			err := form.f(context.Background())
+			r, ok := Refusal(err)
+			if !ok || r.Reason != "no release notes in notes: `"+install+"` installs 1.0.0" || r.Fix != "install first: `"+install+"`" {
+				t.Errorf("%s: %v (refusal %v, fix %q)", form.name, err, ok, r.Fix)
+			}
+			if e.out.Len() != 0 {
+				t.Errorf("%s printed %q", form.name, e.out)
+			}
+		}
+	}
+}
+
 // A Secret of the release's name another tool wrote is refused, as every verb refuses it.
 func TestK8sStatusJSONRefusesAForeignSecret(t *testing.T) {
 	t.Parallel()
