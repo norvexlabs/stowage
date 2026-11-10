@@ -844,11 +844,15 @@ Stowage calls a project's programs: the two never share a reader.
   the VM's boot fields).
 - **`--json` on the verbs that change an install** (install and re-run, `upgrade`, `rollback`,
   `uninstall`, on every shape) — one object at the end: `{format, result: "done" | "nothing",
-  release, refused: {reason, fix}}`.
+  release, refused: {reason, fix}}`. `nothing` is a run with nothing to do, a dry run or a
+  refusal; `release` the release installed after the run, absent when none is; a failure prints
+  no object, only its error. The run's text goes to standard error, so standard output is the
+  object alone; `upgrade --version` passes `--json` to its child, which prints it.
 - **Exit status**: 0 done or nothing to do; **3 refused** — a rule said no before anything changed
   (a schema barrier or a newer schema, a recorded value set again, a first-install-only setting on
   a re-run, an older or yanked release or one no key the install trusts signed, `--given` with `--version` on Kubernetes,
-  `upgrade --version` on an `--offline` install), `refused.fix` naming what to run; 1 failed. A
+  `upgrade --version` on an `--offline` install), `refused.fix` advice for the operator — what to run or change; a program shows it, never runs
+  it (the reason names the specifics); 1 failed. A
   refusal is one error type in the installer, so a new refusal is a 3 wherever it is raised, and an
   installer run by another (`upgrade --version`) passes its child's status on. 2 stays `kit
   check`'s "unknown".

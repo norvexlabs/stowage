@@ -97,7 +97,7 @@ func (in *Installer) recordedForms(env *EnvFile) error {
 
 // unreadable refuses a release that cannot read what is recorded for the input i.
 func (in *Installer) unreadable(i spec.Input) error {
-	return fmt.Errorf("%s: %s %s declares it as %s, which cannot read the value recorded: the project must declare a changed input under a new key", i.Key, in.R.Spec.Name, in.R.Manifest.ProjectVersion, inputForm(i))
+	return refuse("stay on the installed release: the project declares a changed input under a new key", "%s: %s %s declares it as %s, which cannot read the value recorded: the project must declare a changed input under a new key", i.Key, in.R.Spec.Name, in.R.Manifest.ProjectVersion, inputForm(i))
 }
 
 // loadFileInput is the value recorded for the file at path, at most spec.MaxInputFile bytes.
@@ -482,7 +482,7 @@ func (o *Options) readAnswersFile(path string, takesTLS bool) error {
 		return nil
 	}
 	if !takesTLS {
-		return fmt.Errorf("--answers %s: its %s section gives the front's TLS settings, which only a Docker install, a VM's `install` or `vm create` takes, and their re-runs (`upgrade` keeps what is recorded, and on Kubernetes the chart's ingress serves the routes): remove the section for this command", path, answersTLSKey)
+		return refuse("remove the "+answersTLSKey+" section from "+path, "--answers %s: its %s section gives the front's TLS settings, which only a Docker install, a VM's `install` or `vm create` takes, and their re-runs (`upgrade` keeps what is recorded, and on Kubernetes the chart's ingress serves the routes): remove the section for this command", path, answersTLSKey)
 	}
 	taken, left, err := o.takeAnswersTLS(path, *section)
 	if err != nil {

@@ -52,7 +52,9 @@ func (in *Installer) ownedState(ctx context.Context, o k8sOwned) (exists, ours b
 // answer for it, and a claim `helm uninstall` deletes itself is never taken without --data. It reads the release as helm and
 // the labels have it, never the release this installer carries, so it removes one an older
 // installer made. It prints what it kept; the namespace is always kept.
-func (in *Installer) K8sUninstall(ctx context.Context) error {
+func (in *Installer) K8sUninstall(ctx context.Context) (err error) {
+	var mutated bool
+	defer afterChange(&mutated, &err)
 	o, k, name := &in.O, in.O.K8s, in.R.Spec.Name
 	if err := in.checkTarget(); err != nil {
 		return err
@@ -86,7 +88,7 @@ func (in *Installer) K8sUninstall(ctx context.Context) error {
 		// Any project's release Stowage published: a release of another name is how a project
 		// renamed leaves its old one, and the confirmation names it.
 		if v.Stowage == nil || v.Stowage.Release.Name == "" {
-			return fmt.Errorf("release %s in %s was not installed from a chart Stowage published: `helm uninstall` removes it", k.Release, k.Namespace)
+			return refuse("helm uninstall "+k.Release+" --namespace "+k.Namespace, "release %s in %s was not installed from a chart Stowage published: `helm uninstall` removes it", k.Release, k.Namespace)
 		}
 		cur = v.Stowage
 		manifest, err := in.helm(ctx, Cmd{Args: []string{"get", "manifest", k.Release}})
@@ -123,7 +125,7 @@ func (in *Installer) K8sUninstall(ctx context.Context) error {
 		}
 	}
 	if rel == nil && len(owned) == 0 {
-		return fmt.Errorf("no release %s in %s, and nothing %s made for it there", k.Release, k.Namespace, in.R.Ctl())
+		return refuse("nothing to uninstall", "no release %s in %s, and nothing %s made for it there", k.Release, k.Namespace, in.R.Ctl())
 	}
 	var what []string
 	if rel != nil {
@@ -158,7 +160,7 @@ func (in *Installer) K8sUninstall(ctx context.Context) error {
 	// helm deletes the claims the chart makes with the release: their data goes only when the
 	// operator says so, never as the side effect of an uninstall that keeps the rest.
 	if !data && len(byHelm) > 0 {
-		return fmt.Errorf("the chart of release %s makes the PersistentVolumeClaims %s, which `helm uninstall` deletes with it: `%s --data` uninstalls it with its data (back it up first)",
+		return refuse(in.k8sCtl("uninstall")+" --data", "the chart of release %s makes the PersistentVolumeClaims %s, which `helm uninstall` deletes with it: `%s --data` uninstalls it with its data (back it up first)",
 			k.Release, strings.Join(byHelm, ", "), in.k8sCtl("uninstall"))
 	}
 	// Kept data keeps the Secrets that answer for it: the values it was made with (a database's
@@ -176,7 +178,7 @@ func (in *Installer) K8sUninstall(ctx context.Context) error {
 		})
 	}
 	if rel == nil && len(owned) == 0 {
-		return fmt.Errorf("no release %s in %s, and nothing %s made for it there but the Secrets %s, which answer for its data: once the data's claims are deleted, `kubectl delete secret %s --namespace %s` deletes them",
+		return refuse(fmt.Sprintf("kubectl delete secret %s --namespace %s, once the data's claims are deleted", strings.Join(keptSecrets, " "), k.Namespace), "no release %s in %s, and nothing %s made for it there but the Secrets %s, which answer for its data: once the data's claims are deleted, `kubectl delete secret %s --namespace %s` deletes them",
 			k.Release, k.Namespace, in.R.Ctl(), strings.Join(keptSecrets, ", "), strings.Join(keptSecrets, " "), k.Namespace)
 	}
 	if len(owned) > 0 {
@@ -202,7 +204,7 @@ func (in *Installer) K8sUninstall(ctx context.Context) error {
 	}
 	if !o.Yes && !asked {
 		if o.Prompt == nil {
-			return errors.New("uninstall asks before it removes the release, and there is no terminal to answer: give --yes")
+			return refusal("--yes", errors.New("uninstall asks before it removes the release, and there is no terminal to answer: give --yes"))
 		}
 		a, err := o.Prompt.Ask(ctx, Form{
 			Questions: []Question{{Title: "Uninstall " + name + ": " + summary, Key: "confirm",
@@ -216,6 +218,7 @@ func (in *Installer) K8sUninstall(ctx context.Context) error {
 			return ErrAborted
 		}
 	}
+	mutated = true // helm uninstall, then the deletes
 	timeout := k.Timeout.String()
 	if rel != nil {
 		o.logf("helm: uninstalling %s in %s", k.Release, k.Namespace)

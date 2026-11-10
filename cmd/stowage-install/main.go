@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"syscall"
@@ -14,15 +15,28 @@ import (
 	"github.com/norvexlabs/stowage/internal/payload"
 )
 
+// exitRefused is the exit status of a refusal (install.Refused): nothing changed.
+const exitRefused = 3
+
 func main() {
-	if err := run(); err != nil {
-		var code install.ExitCode
-		if errors.As(err, &code) {
-			os.Exit(int(code)) // the installer it ran printed its error
-		}
-		fmt.Fprintln(os.Stderr, "error:", err)
-		os.Exit(1)
+	os.Exit(exit(run(), os.Stderr))
+}
+
+// exit is the exit status of a run that ended with err, whose error it prints on stderr: an
+// installer's it ran passed on (that installer printed its own), 3 on a refusal, 1 on a failure.
+func exit(err error, stderr io.Writer) int {
+	if err == nil {
+		return 0
 	}
+	var code install.ExitCode
+	if errors.As(err, &code) {
+		return int(code) // the installer it ran printed its error
+	}
+	fmt.Fprintln(stderr, "error:", err)
+	if _, ok := install.Refusal(err); ok {
+		return exitRefused
+	}
+	return 1
 }
 
 func run() error {

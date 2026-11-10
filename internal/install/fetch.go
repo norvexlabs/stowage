@@ -76,7 +76,7 @@ func (in *Installer) UpgradeRevision(ctx context.Context, args []string) (bool, 
 // release (it runs name cur, revision rev), signed by a key the install trusts, read from the
 // registry the install pulls from, with that registry's client and prefix.
 func (in *Installer) channelRelease(ctx context.Context, env *EnvFile, name, cur, rev, v string) (*release.Manifest, *registry.Client, string, *sigverify.Verifier, error) {
-	trust, kept, err := in.installTrust(ctx, name, cur, rev)
+	trust, kept, err := in.installTrust(ctx, name, cur, rev, v)
 	if err != nil {
 		return nil, nil, "", nil, err
 	}
@@ -92,8 +92,9 @@ func (in *Installer) channelRelease(ctx context.Context, env *EnvFile, name, cur
 // installTrust is the keys an install trusts (it runs name cur, revision rev), and its kept
 // release: the keys of the install's release decide; the installer run's only when it carries
 // none (an install of a release from before its project signed): an older installer must not
-// bring back a key a later release dropped.
-func (in *Installer) installTrust(ctx context.Context, name, cur, rev string) (*sigverify.Verifier, *keptRelease, error) {
+// bring back a key a later release dropped. v is the version asked, which its refusal's fix names
+// (empty: none).
+func (in *Installer) installTrust(ctx context.Context, name, cur, rev, v string) (*sigverify.Verifier, *keptRelease, error) {
 	kept, err := in.keptInstaller(ctx, name, cur, rev)
 	if err != nil {
 		return nil, nil, err
@@ -102,7 +103,7 @@ func (in *Installer) installTrust(ctx context.Context, name, cur, rev string) (*
 	switch {
 	case len(keys) == 0 && kept.Release == nil:
 		// Another Stowage's payload may keep its keys elsewhere: none found is not none carried.
-		return nil, nil, fmt.Errorf("%s carries no key this installer finds, and %s: the keys the install trusts cannot be told; run its own installer", in.ctl(), kept.foreign())
+		return nil, nil, refuse(sameArgs(in.ctl(), "it knows the keys the install trusts", v), "%s carries no key this installer finds, and %s: the keys the install trusts cannot be told; run its own installer", in.ctl(), kept.foreign())
 	case len(keys) == 0:
 		src, keys = "this installer", in.R.Keys
 	}
@@ -124,7 +125,7 @@ func (in *Installer) UpgradeTo(ctx context.Context, v string, args []string) err
 		return err
 	}
 	if !pinnedImages(env) {
-		return errors.New("--version: this install was made with --offline and never pulls: run the new release's installer, `upgrade --dir " + in.O.Dir + "`")
+		return refusal("run the new release's installer, upgrade --dir "+in.O.Dir, errors.New("--version: this install was made with --offline and never pulls: run the new release's installer, `upgrade --dir "+in.O.Dir+"`"))
 	}
 	m, c, prefix, _, err := in.channelRelease(ctx, env, name, cur, rev, v)
 	if err != nil {
@@ -142,8 +143,9 @@ func (in *Installer) UpgradeTo(ctx context.Context, v string, args []string) err
 	}
 	switch {
 	case order > 0 || (order == 0 && r > m.Revision):
-		return fmt.Errorf("%s runs %s %s (revision %s), after %s %s (revision %d): `%s rollback --dir %s` goes back one upgrade", in.O.Dir, name, cur, rev, name, m.ProjectVersion, m.Revision, in.ctl(), in.O.Dir)
+		return refuse(laterFix(in.ctl()), "%s runs %s %s (revision %s), after %s %s (revision %d): `%s rollback --dir %s` goes back one upgrade", in.O.Dir, name, cur, rev, name, m.ProjectVersion, m.Revision, in.ctl(), in.O.Dir)
 	case order == 0 && r == m.Revision:
+		in.nothing = true
 		fmt.Fprintf(in.O.Out, "%s already runs %s %s (revision %s)\n", in.O.Dir, name, cur, rev)
 		return nil
 	}
@@ -158,7 +160,7 @@ func (in *Installer) runFetched(ctx context.Context, c *registry.Client, prefix,
 	if err != nil {
 		return err
 	}
-	if err := in.O.exec(ctx, exe, append([]string{"upgrade", "--dir", in.O.Dir}, args...)); err != nil {
+	if err := in.runChild(ctx, exe, append([]string{"upgrade", "--dir", in.O.Dir}, args...)); err != nil {
 		in.O.logf("the fetched installer is kept: %s", exe)
 		return err
 	}
@@ -305,7 +307,7 @@ func findRevision(ctx context.Context, c *registry.Client, prefix, name, channel
 			continue
 		}
 		if x.m.Yanked != nil {
-			return nil, fmt.Errorf("%s %s is yanked on %s: %s", name, v, channel, x.m.Yanked.Reason)
+			return nil, refuse("choose another version", "%s %s is yanked on %s: %s", name, v, channel, x.m.Yanked.Reason)
 		}
 		return x.m, nil
 	}
@@ -313,9 +315,9 @@ func findRevision(ctx context.Context, c *registry.Client, prefix, name, channel
 		return nil, refused
 	}
 	if rev > 0 {
-		return nil, fmt.Errorf("%s %s (revision %d) is not published on %s in %s", name, v, rev, channel, repo)
+		return nil, refuse("choose a revision published on "+channel, "%s %s (revision %d) is not published on %s in %s", name, v, rev, channel, repo)
 	}
-	return nil, fmt.Errorf("%s %s is not published on %s in %s (a mirror holds the %s-release and %s-installer repositories too)", name, v, channel, repo, name, name)
+	return nil, refuse("choose a version published on "+channel, "%s %s is not published on %s in %s (a mirror holds the %s-release and %s-installer repositories too)", name, v, channel, repo, name, name)
 }
 
 // foreignManifest is readRelease's answer that the registry holds a release manifest this Stowage
@@ -383,7 +385,7 @@ func checkSigned(ctx context.Context, c *registry.Client, repo name.Repository, 
 	}
 	err := trust.Verify(ctx, c, repo.Digest(h.String()))
 	if errors.Is(err, sigverify.ErrUnsigned) {
-		return fmt.Errorf("%s %s (revision %d, %s) is not signed by a key this install trusts: refused (%w)", m.Name, m.ProjectVersion, m.Revision, m.Tag, err)
+		return refuse("choose a release signed by a key the install trusts", "%s %s (revision %d, %s) is not signed by a key this install trusts: refused (%w)", m.Name, m.ProjectVersion, m.Revision, m.Tag, err)
 	}
 	if err != nil {
 		return fmt.Errorf("%s %s (revision %d, %s): its signature could not be checked: %w", m.Name, m.ProjectVersion, m.Revision, m.Tag, err)
@@ -512,13 +514,31 @@ func carries(exe string, m *release.Manifest) error {
 }
 
 // exec runs an installer as a child on this run's terminal. An interrupt reaches it (a terminal
-// sends it to both); a stop of this run alone is passed on, and the child is waited for.
+// sends it to both); a stop of this run alone is passed on, and the child is waited for. The
+// child's exit status is an ExitCode, which this run exits with: a caller whose status is not the
+// child's makes it a failure (childFailed).
 func (o *Options) exec(ctx context.Context, exe string, args []string) error {
+	return o.execTo(ctx, exe, args, o.Out)
+}
+
+// runChild runs the installer exe that does this run's verb for it (upgrade --version, a later
+// revision's upgrade), whose exit status this run passes on (ExitCode). Under --json the child is
+// given it too (passed), and its standard output is this run's Result's: it prints the one Result.
+func (in *Installer) runChild(ctx context.Context, exe string, args []string) error {
+	out := in.O.Out
+	if in.O.Machine != nil {
+		out, in.delegated = in.O.Machine, true
+	}
+	return in.O.execTo(ctx, exe, args, out)
+}
+
+// execTo is exec with the child's standard output on out.
+func (o *Options) execTo(ctx context.Context, exe string, args []string, out io.Writer) error {
 	if o.Exec != nil {
 		return o.Exec(ctx, exe, args)
 	}
 	cmd := exec.CommandContext(ctx, exe, args...)
-	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, o.Out, o.Log
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, out, o.Log
 	cmd.Cancel = func() error { return cmd.Process.Signal(os.Interrupt) }
 	err := cmd.Run()
 	var ee *exec.ExitError

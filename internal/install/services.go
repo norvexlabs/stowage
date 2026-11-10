@@ -187,14 +187,16 @@ func (in *Installer) Schema(ctx context.Context, after string, asJSON bool) erro
 // and with data its volumes and the install directory (its secrets, the dumps, the release kept for rollback).
 // Without data, both are kept, and a re-run of the installer with --dir brings the install back
 // on them. It asks on a terminal (default no), and refuses without one unless O.Yes.
-func (in *Installer) Uninstall(ctx context.Context, data bool) error {
+func (in *Installer) Uninstall(ctx context.Context, data bool) (err error) {
+	var mutated bool
+	defer afterChange(&mutated, &err)
 	env, err := in.open()
 	if err != nil {
 		return err
 	}
 	unlock, err := lockFile(in.path(lifecycleLock))
 	if errors.Is(err, errLocked) {
-		return errors.New("a provision, upgrade, rollback or reset-db is running for this install: wait for it to finish")
+		return lockedRefusal
 	}
 	if err != nil {
 		return err
@@ -210,7 +212,7 @@ func (in *Installer) Uninstall(ctx context.Context, data bool) error {
 	// The gateway's record, read before anything goes: one that does not read refuses.
 	gwRec, gwErr := in.readGateway()
 	if in.gatewayRecorded() && gwErr != nil {
-		return fmt.Errorf("%w: fix or remove it, then uninstall again", gwErr)
+		return refuse("fix or remove the gateway record, then uninstall again", "%w: fix or remove it, then uninstall again", gwErr)
 	}
 	gateway := in.gatewayRecorded() && in.gatewayRevertsHere(gwRec)
 	if in.O.DryRun {
@@ -229,7 +231,7 @@ func (in *Installer) Uninstall(ctx context.Context, data bool) error {
 	switch {
 	case in.O.Yes:
 	case in.O.Prompt == nil:
-		return fmt.Errorf("uninstall asks first, and there is no terminal to answer: give --yes (with --data to delete the data)")
+		return refuse("--yes (with --data to delete the data)", "uninstall asks first, and there is no terminal to answer: give --yes (with --data to delete the data)")
 	default:
 		choices := []Choice{{"no", "No"}, {"keep", "Yes, and keep the data"}, {"delete", "Yes, and delete the data"}}
 		if data {
@@ -260,14 +262,15 @@ func (in *Installer) Uninstall(ctx context.Context, data bool) error {
 	if !h.systemdHost() {
 		for _, kind := range []string{"backup", "disk"} {
 			if timer := filepath.Join(h.Systemd, installUnit(in.R.Spec.Name, kind, dir)+".timer"); fileExists(timer) {
-				return fmt.Errorf("%s is the install's, and removing it takes root: run `sudo %s uninstall --dir %s`", timer, in.ctl(), dir)
+				return refuse("sudo "+in.ctl()+" uninstall --dir "+dir, "%s is the install's, and removing it takes root: run `sudo %s uninstall --dir %s`", timer, in.ctl(), dir)
 			}
 		}
 	}
 	// So would the gateway's boot unit, and its tables and forwarding stay in the host's.
 	if gateway && in.O.euid() != 0 {
-		return fmt.Errorf("the stack's network declarations are applied on this host (tune --apply), and removing them takes root: run `sudo %s uninstall --dir %s`", in.ctl(), dir)
+		return refuse("sudo "+in.ctl()+" uninstall --dir "+dir, "the stack's network declarations are applied on this host (tune --apply), and removing them takes root: run `sudo %s uninstall --dir %s`", in.ctl(), dir)
 	}
+	mutated = true // compose down, then the timers, the directory
 	args := []string{"down", "--remove-orphans"}
 	if data {
 		args = append(args, "--volumes")

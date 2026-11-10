@@ -200,7 +200,7 @@ func (in *Installer) lockRun(ctx context.Context, env *EnvFile) (func(), error) 
 		unlock, err = lockFile(in.path(lifecycleLock))
 	}
 	if errors.Is(err, errLocked) {
-		return nil, errors.New("a provision, upgrade, rollback or reset-db is already running for this install: wait for it to finish")
+		return nil, lockedRefusal
 	}
 	if err != nil {
 		return nil, err
@@ -212,13 +212,17 @@ func (in *Installer) lockRun(ctx context.Context, env *EnvFile) (func(), error) 
 	return unlock, nil
 }
 
+// lockedRefusal is the refusal of a run while another holds the install's lifecycle lock; its
+// cause is errLocked, so a caller tells another run's lock from a lock this run could not take.
+var lockedRefusal error = Refused{Reason: "a provision, upgrade, rollback or reset-db is already running for this install: wait for it to finish", Fix: "wait for the run under way to finish, then run again", cause: errLocked}
+
 // leftovers refuses a run while a provision or schema container an earlier run left is there:
 // its fixed name would fail the run's own.
 func (in *Installer) leftovers(ctx context.Context, env *EnvFile) error {
 	for _, svc := range []string{ProvisionService, SchemaService, KitService} {
 		name := containerName(env, svc)
 		if _, err := in.O.Docker.Run(ctx, Cmd{Args: []string{"container", "inspect", "--format", "{{.State.Status}}", name}}); err == nil {
-			return fmt.Errorf("the container %s of an earlier run is still there: once it is not running anything you need, `docker rm --force %s`, then run again", name, name)
+			return refuse("docker rm --force "+name+", then run again", "the container %s of an earlier run is still there: once it is not running anything you need, `docker rm --force %s`, then run again", name, name)
 		}
 	}
 	return nil

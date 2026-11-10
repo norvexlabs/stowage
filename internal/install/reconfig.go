@@ -127,7 +127,7 @@ func (in *Installer) changes(env *EnvFile) (next *EnvFile, secrets map[string]bo
 		}
 	}
 	if len(bad) > 0 {
-		return nil, nil, publish{}, errors.New(strings.Join(bad, "; "))
+		return nil, nil, publish{}, refusal("give each a value its input accepts", errors.New(strings.Join(bad, "; ")))
 	}
 	for _, sec := range in.secrets() {
 		secrets[sec.Key] = true

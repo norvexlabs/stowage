@@ -535,7 +535,11 @@ func (in *Installer) firstBoot(ctx context.Context, path string) error {
 // release, after its own installer brought its stack up so the upgrade can dump the database.
 // The install's own installer is run only when it carries the release the install runs, so a run
 // never takes the same branch again.
-func (in *Installer) Boot(ctx context.Context) error {
+func (in *Installer) Boot(ctx context.Context) (err error) {
+	// A boot may change the install from its first step (a first boot's, an upgrade's, a
+	// rollback's): a refusal it raises is a failure.
+	mutated := true
+	defer afterChange(&mutated, &err)
 	o := &in.O
 	if _, err := os.Stat(filepath.Join(o.Dir, envName)); errors.Is(err, os.ErrNotExist) {
 		return in.firstBoot(ctx, cmp.Or(o.Settings, SettingsFile(in.R.Spec.Name)))
@@ -586,11 +590,11 @@ func (in *Installer) Boot(ctx context.Context) error {
 		return in.crossed()
 	case in.prevIs(m.ProjectVersion, strconv.Itoa(m.Revision)):
 		o.logf("this OS carries %s %s (revision %d), which the install's last upgrade replaced: going back to it", name, m.ProjectVersion, m.Revision)
-		return o.exec(ctx, in.ctl(), []string{bootRollbackCmd, "--dir", o.Dir})
+		return childFailed(in.ctl(), o.exec(ctx, in.ctl(), []string{bootRollbackCmd, "--dir", o.Dir}))
 	case in.leftByRollback(m.ProjectVersion, m.Revision):
 		o.logf("the install went back from %s %s (revision %d), which this OS carries: it stays on %s (revision %s); upgrade to a later release, or remove %s to try this one again",
 			name, m.ProjectVersion, m.Revision, cur, rev, in.path(FailedDir))
-		return o.exec(ctx, in.ctl(), []string{bootCmd, "--dir", o.Dir})
+		return childFailed(in.ctl(), o.exec(ctx, in.ctl(), []string{bootCmd, "--dir", o.Dir}))
 	}
 	// An install of a later release with none kept to go back to: a crossing's (reset-db
 	// --new-baseline), whose boot fell back to this OS. Only that release's OS runs it.
@@ -599,7 +603,7 @@ func (in *Installer) Boot(ctx context.Context) error {
 			name, cur, rev, m.ProjectVersion, m.Revision, in.R.Ctl(), cur)
 	}
 	o.logf("the install runs %s %s (revision %s); this OS carries %s (revision %d): upgrading", name, cur, rev, m.ProjectVersion, m.Revision)
-	if err := o.exec(ctx, in.ctl(), []string{bootCmd, "--dir", o.Dir}); err != nil {
+	if err := childFailed(in.ctl(), o.exec(ctx, in.ctl(), []string{bootCmd, "--dir", o.Dir})); err != nil {
 		return fmt.Errorf("bringing %s %s up before the upgrade: %w", name, cur, err)
 	}
 	return in.Upgrade(ctx)
@@ -613,7 +617,7 @@ func (in *Installer) Boot(ctx context.Context) error {
 func (in *Installer) finishStopped(ctx context.Context) (*EnvFile, error) {
 	o := &in.O
 	o.logf("finishing the upgrade or rollback a reboot stopped")
-	if err := o.exec(ctx, in.ctl(), []string{bootRollbackCmd, "--dir", o.Dir}); err != nil {
+	if err := childFailed(in.ctl(), o.exec(ctx, in.ctl(), []string{bootRollbackCmd, "--dir", o.Dir})); err != nil {
 		return nil, fmt.Errorf("finishing the upgrade or rollback a reboot stopped: %w", err)
 	}
 	env, err := in.open()
@@ -628,10 +632,14 @@ func (in *Installer) finishStopped(ctx context.Context) (*EnvFile, error) {
 }
 
 // BootRollback is the install's own installer going back at boot (boot-rollback): the database
-// is brought up first, so the rollback check reads the schema the newer release left. A database
-// that does not come up refuses: going back unchecked could leave a release on a schema it cannot
-// read. Finishing a stopped run checks nothing, and brings nothing up first.
-func (in *Installer) BootRollback(ctx context.Context) error {
+// is brought up first, its first change, so the rollback check reads the schema the newer release
+// left; a refusal after it is a failure. A database that does not come up fails the run: going
+// back unchecked could leave a release on a schema it cannot read. Finishing a stopped run brings
+// nothing up first, and its refusals stay refusals.
+func (in *Installer) BootRollback(ctx context.Context) (err error) {
+	// Starting the database is its first change: a refusal after it is a failure.
+	var mutated bool
+	defer afterChange(&mutated, &err)
 	env, err := in.open()
 	if err != nil {
 		return err
@@ -643,6 +651,7 @@ func (in *Installer) BootRollback(ctx context.Context) error {
 		return in.Rollback(ctx)
 	}
 	if svc := in.R.Spec.DB().Service; svc != "" {
+		mutated = true
 		if _, err := in.Compose(ctx, env, in.O.Log, "up", "--detach", "--wait", svc); err != nil {
 			return fmt.Errorf("the database did not come up, so going back cannot be checked: %w", err)
 		}

@@ -76,7 +76,7 @@ func (in *Installer) auditRelease(ctx context.Context, o AuditOptions) (*auditSo
 		// The install's keys decide, as for its upgrades: an older installer never brings back a
 		// key a later release dropped; and the release audited is the one it runs.
 		var kept *keptRelease
-		if src.trust, kept, err = in.installTrust(ctx, pname, cur, rev); err != nil {
+		if src.trust, kept, err = in.installTrust(ctx, pname, cur, rev, ""); err != nil {
 			return nil, err
 		}
 		src.m, channel = kept.Manifest, kept.Manifest.Channel

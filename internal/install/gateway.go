@@ -664,7 +664,8 @@ func (in *Installer) gatewayApply(ctx context.Context) error {
 		return err
 	}
 	in.O.logf("applying %s: the install's start", in.gatewayWhat())
-	return in.O.exec(ctx, in.ctl(), []string{"--dir", in.gatewayDir(), "--no-input", "--no-provision"})
+	// The consent changed the host already: whatever the start exits with, this run failed.
+	return childFailed(in.ctl(), in.O.exec(ctx, in.ctl(), []string{"--dir", in.gatewayDir(), "--no-input", "--no-provision"}))
 }
 
 // consent enables the boot unit, then records the consent. A unit that fails leaves the record

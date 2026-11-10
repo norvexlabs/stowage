@@ -103,11 +103,9 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
      Kubernetes: the release's values). The VM's daemon untouched, so the VM suites stay out.
   2. `describe --json`: the release, the inputs (never a secret's default), the first-install-only
      settings, `format`; read with no install.
-  3. `--json` results and exit 3 on a refusal on install/re-run, `upgrade`, `rollback`,
-     `uninstall` (Docker, Kubernetes): one refusal error type raised by every refusal there is,
-     `upgrade --version` passing its child's status on; text output unchanged. Review `high`
-     (every refusal path).
-  4. The VM: `describe` on the VM's own `<short>-stow`, `format`, `previous` and `inputs` in its `status --json`, the same `--json` and exit 3 on
+  4. The VM: the boot's `boot-rollback` child exit 3 (a rollback-check refusal after the OS fell
+     back) passed through as the boot's status, which then claims nothing changed (vm.go ~589);
+     `describe` on the VM's own `<short>-stow`, `format`, `previous` and `inputs` in its `status --json`, the same `--json` and exit 3 on
      `install`/`upgrade`/`rollback`, `vm seed --json`
      (the manual path's seed, no second builder) and `--known-hosts-line` on the `vm` verbs; one
      VM chain (e2e-kairos, e2e-vm, e2e-full-vm) for 3's VM part and 4.
@@ -571,6 +569,15 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
   repositories.
 
 ## Could
+
+- **A failed first install removes its lock under waiters**: a first install that fails after
+  taking the lock removes its directory (`RemoveAll`), lock file included, while a second run
+  into the same `--dir` may wait on that lock; the waiter then fails (`no such file`) instead of
+  installing. Keep the lock file outside what a failed install removes.
+
+- **Flaky chunked-upload case**: `TestAFileBlobGoesUpInChunksAndResumes/a last chunk under the
+  smallest refused for its size is retried` failed once in `make check` under load (no refusal
+  seen, one session) and passes 20 of 20 alone. Find what it races on.
 
 - **Text `k8s status` after an uninstall that kept its history**: it prints the uninstalled
   revision's release first, as if it ran (`k8s status --json` says nothing is installed). Say the

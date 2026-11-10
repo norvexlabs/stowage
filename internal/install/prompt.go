@@ -58,8 +58,9 @@ type Question struct {
 type Choice struct{ Value, Label string }
 
 // ErrAborted is returned when the operator leaves the form (Ctrl-C, or end of input in
-// accessible mode) or quits at the review.
-var ErrAborted = errors.New("aborted")
+// accessible mode) or quits at the review, or says no where a run asks to go on: a refusal, as
+// nothing changed.
+var ErrAborted error = Refused{Reason: "aborted", Fix: "run it again and answer, or give what it asks with flags (--yes where it confirms)"}
 
 // ErrBack is returned, with the answers so far, when the operator chooses at the review to change
 // the step Form.Back names.

@@ -46,6 +46,18 @@ func newCommand(r *Release, self string, stdout, stderr io.Writer, tools K8sOpti
 	var takesTLS bool // the running command is install or vm create, which alone take an answers file's tls section
 	name := r.Spec.Name
 	in := &Installer{R: r}
+	// prepared: prepare gave in the run's options (in.O).
+	var prepared bool
+	// resultJSON: the verb prints its Result alone on standard output (--json, machineVerb).
+	var resultJSON bool
+	jsonFlag := func(c *cobra.Command, kind verbKind) {
+		c.Flags().BoolVar(&resultJSON, "json", false, "print the run's result as one JSON object at its end, for a program; what the run prints otherwise goes to standard error")
+		machineVerb(c, &resultJSON, stdout, in, kind, func() {
+			if !prepared {
+				in.O = o // a refusal before prepare took them, or in it
+			}
+		})
+	}
 	prepare := func() error {
 		var err error
 		if o.Ports, err = parsePorts(ports); err != nil {
@@ -66,6 +78,10 @@ func newCommand(r *Release, self string, stdout, stderr io.Writer, tools K8sOpti
 			}
 		}
 		in.O = o
+		prepared = true
+		if resultJSON {
+			in.O.toMachine()
+		}
 		return nil
 	}
 	root := &cobra.Command{
@@ -85,7 +101,7 @@ func newCommand(r *Release, self string, stdout, stderr io.Writer, tools K8sOpti
 			in.O.Cert, in.O.Key, in.O.CA, in.O.ClientCA = expandHome(in.O.Cert), expandHome(in.O.Key), expandHome(in.O.CA), expandHome(in.O.ClientCA)
 			if secretsFile != "" {
 				if given.any() {
-					return fmt.Errorf("--secrets restores an install, %s gives one its inputs and TLS material: give one", given.name())
+					return refuse("give --secrets or "+given.name()+", not both", "--secrets restores an install, %s gives one its inputs and TLS material: give one", given.name())
 				}
 				var err error
 				if in.O.Secrets, err = readSecretsArg(secretsFile, cmd.InOrStdin()); err != nil {
@@ -149,6 +165,7 @@ func newCommand(r *Release, self string, stdout, stderr io.Writer, tools K8sOpti
 	rf.BoolVar(&noInput, "no-input", false, "never ask: an input nothing gave takes its default")
 	rf.BoolVar(&o.NoProvision, "no-provision", false, "start the stack without running the provision hook (`provision` runs it later)")
 	rf.BoolVar(&accessible, "accessible", false, "ask with plain line prompts (screen readers); also when ACCESSIBLE is set or TERM=dumb")
+	jsonFlag(root, verbKind{})
 	var statusJSON bool
 	status := &cobra.Command{
 		Use:   "status",
@@ -272,6 +289,7 @@ func newCommand(r *Release, self string, stdout, stderr io.Writer, tools K8sOpti
 	unf.BoolVar(&noInput, "no-input", false, "never ask: without --yes, refuse")
 	unf.BoolVar(&accessible, "accessible", false, "confirm with a plain line prompt")
 	unf.BoolVar(&o.DryRun, "dry-run", false, "print what would be removed and kept, change nothing")
+	jsonFlag(uninstall, verbKind{uninstall: true})
 	dirFlag(uninstall)
 	root.AddCommand(exec, schemaCmd, uninstall)
 	prov := &cobra.Command{
@@ -301,7 +319,7 @@ func newCommand(r *Release, self string, stdout, stderr io.Writer, tools K8sOpti
 			}
 			if to != "" {
 				if in.O.Offline {
-					return errors.New("--version fetches the release from the registry: --offline upgrades with the new release's own installer")
+					return refusal("leave out --offline, or upgrade with the new release's own installer", errors.New("--version fetches the release from the registry: --offline upgrades with the new release's own installer"))
 				}
 				return in.UpgradeTo(cmd.Context(), to, passed(cmd, "version"))
 			}
@@ -334,6 +352,7 @@ func newCommand(r *Release, self string, stdout, stderr io.Writer, tools K8sOpti
 	uf.BoolVar(&o.Offline, "offline", false, "the images are already loaded: never log in or pull")
 	uf.BoolVar(&o.DryRun, "dry-run", false, "check, print the values that would change (secrets redacted), change nothing")
 	uf.BoolVar(&o.NoProvision, "no-provision", false, "start the release without running the provision hook")
+	jsonFlag(up, verbKind{})
 	dirFlag(up)
 	root.AddCommand(up)
 	back := &cobra.Command{
@@ -349,6 +368,7 @@ func newCommand(r *Release, self string, stdout, stderr io.Writer, tools K8sOpti
 	}
 	back.Flags().BoolVar(&o.Offline, "offline", false, "the images are already loaded: never log in or pull")
 	back.Flags().BoolVar(&o.DryRun, "dry-run", false, "check (pulling the previous images the check reads), change nothing")
+	jsonFlag(back, verbKind{})
 	dirFlag(back)
 	root.AddCommand(back)
 	tablesBoot := tablesBootCommand(func(*cobra.Command) (*Installer, error) { return in, prepare() })
@@ -402,7 +422,9 @@ func newCommand(r *Release, self string, stdout, stderr io.Writer, tools K8sOpti
 		return in.ExportSecrets(recipients)
 	}))
 	if r.Spec.Shapes.Kubernetes != nil {
-		root.AddCommand(k8sCommand(in, &o, prepare, terminal, &sets, &setFiles, &answers, &noInput, &accessible))
+		root.AddCommand(k8sCommand(in, &o, prepare, terminal, &sets, &setFiles, &answers, &noInput, &accessible, func(c *cobra.Command, uninstall bool) {
+			jsonFlag(c, verbKind{k8s: true, uninstall: uninstall})
+		}))
 	}
 	if r.Spec.Shapes.Kairos != nil {
 		root.AddCommand(vmCreateCommand(in, &o, prepare, terminal, &sets, &setFiles, &domains, &answers, &noInput, &accessible, &takesTLS))
@@ -433,7 +455,7 @@ func newCommand(r *Release, self string, stdout, stderr io.Writer, tools K8sOpti
 
 // k8sCommand is `k8s`: the release on a Kubernetes cluster, with helm and kubectl. Every
 // subcommand works in the current directory, where `upgrade --version` fetches an installer.
-func k8sCommand(in *Installer, o *Options, prepare func() error, terminal func(bool) Prompter, sets, setFiles *[]string, answers *string, noInput, accessible *bool) *cobra.Command {
+func k8sCommand(in *Installer, o *Options, prepare func() error, terminal func(bool) Prompter, sets, setFiles *[]string, answers *string, noInput, accessible *bool, jsonFlag func(c *cobra.Command, uninstall bool)) *cobra.Command {
 	name, v := in.R.Spec.Name, in.R.Manifest.ProjectVersion
 	var to string
 	var given givenFlags
@@ -504,7 +526,7 @@ func k8sCommand(in *Installer, o *Options, prepare func() error, terminal func(b
 				return run(cmd, upTimeout, false, func(ctx context.Context) error {
 					if given.any() {
 						flag := given.name()
-						return fmt.Errorf("%s with --version: `%s --version %s` first, then the installer of %s (`docker run --rm %s/%s-installer:<its tag> > %s.sh`) takes `k8s upgrade %s FILE` with the same target", flag, in.k8sCtl("upgrade"), to, to, in.R.Spec.Registry.Prefix, in.R.Spec.Name, in.R.Spec.Name, flag)
+						return refuse("run "+in.k8sCtl("upgrade")+" --version "+to+" first, then the new release's installer with "+given.name(), "%s with --version: `%s --version %s` first, then the installer of %s (`docker run --rm %s/%s-installer:<its tag> > %s.sh`) takes `k8s upgrade %s FILE` with the same target", flag, in.k8sCtl("upgrade"), to, to, in.R.Spec.Registry.Prefix, in.R.Spec.Name, in.R.Spec.Name, flag)
 					}
 					return in.K8sUpgradeTo(ctx, to, passed(cmd, "version"))
 				})
@@ -586,6 +608,10 @@ func k8sCommand(in *Installer, o *Options, prepare func() error, terminal func(b
 			return run(cmd, 0, false, func(context.Context) error { return in.K8sTune() })
 		},
 	}
+	jsonFlag(install, false)
+	jsonFlag(up, false)
+	jsonFlag(back, false)
+	jsonFlag(uninstall, true)
 	k.AddCommand(install, up, back, status, reset, uninstall, tuneCmd)
 	if in.R.Spec.Hooks.Provision != nil {
 		prov := &cobra.Command{

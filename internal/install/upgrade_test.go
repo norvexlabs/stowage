@@ -264,8 +264,14 @@ func TestUpgradeRefusesBeforeChangingAnything(t *testing.T) {
 				c.fake(e.docker)
 			}
 			before := read(t, filepath.Join(e.dir, ".env"))
-			if err := e.upgrade(func(o *Options) { o.Offline = name == "offline" }); err == nil || !strings.Contains(err.Error(), c.want) {
+			err := e.upgrade(func(o *Options) { o.Offline = name == "offline" })
+			if err == nil || !strings.Contains(err.Error(), c.want) {
 				t.Fatalf("%v, want %q", err, c.want)
+			}
+			// A rule's no is a refusal (exit 3); a step that could not run, a failure.
+			failed := name == "pull fails" || name == "dump fails" || name == "bad hook"
+			if errors.As(err, new(Refused)) == failed {
+				t.Errorf("refused: %t, want %t", !failed, failed)
 			}
 			if read(t, filepath.Join(e.dir, ".env")) != before {
 				t.Error(".env changed")
@@ -310,8 +316,8 @@ func TestUpgradeAddsALoopbackRoute(t *testing.T) {
 	} {
 		e.busy[9000] = name == "busy"
 		e.to("2.0.0", docsRoute(c.port))
-		if err := e.upgrade(func(o *Options) { o.Ports = c.ports }); err == nil || !strings.Contains(err.Error(), c.want) {
-			t.Errorf("%s: %v, want %q", name, err, c.want)
+		if err := e.upgrade(func(o *Options) { o.Ports = c.ports }); err == nil || !strings.Contains(err.Error(), c.want) || !errors.As(err, new(Refused)) {
+			t.Errorf("%s: %v, want the refusal %q", name, err, c.want)
 		}
 	}
 	e.busy[9000] = false
@@ -319,7 +325,7 @@ func TestUpgradeAddsALoopbackRoute(t *testing.T) {
 		docsRoute(9000)(s)
 		s.L4.Routes = []spec.L4Route{{Name: "data", Protocol: "tcp", Port: 9000, Upstream: "api:7000"}}
 	})
-	if err := e.upgrade(nil); err == nil || !strings.Contains(err.Error(), "the front's docs port 9000 is the L4 route data's: choose another with --ports") {
+	if err := e.upgrade(nil); err == nil || !strings.Contains(err.Error(), "the front's docs port 9000 is the L4 route data's: choose another with --ports") || !errors.As(err, new(Refused)) {
 		t.Errorf("an L4 route's port: %v", err)
 	}
 	if get(e.readEnv(), "STOWAGE_PROJECT_VERSION") != "1.0.0" {
@@ -758,8 +764,8 @@ func TestRollbackRefusedOnlyOnProof(t *testing.T) {
 				}
 				return
 			}
-			if err == nil || !strings.Contains(err.Error(), c.want) || !strings.Contains(err.Error(), filepath.Join(e.dir, SnapshotsDir)) {
-				t.Fatalf("%v, want %q and the snapshot", err, c.want)
+			if err == nil || !strings.Contains(err.Error(), c.want) || !strings.Contains(err.Error(), filepath.Join(e.dir, SnapshotsDir)) || !errors.As(err, new(Refused)) {
+				t.Fatalf("%v, want the refusal %q and the snapshot", err, c.want)
 			}
 			if get(e.readEnv(), "STOWAGE_PROJECT_VERSION") != "2.0.0" {
 				t.Error("a refused rollback changed .env")
@@ -1592,8 +1598,8 @@ func TestARollbackRefusesAPreviousInstallerItCannotTrust(t *testing.T) {
 		itself error  // what the kept installer says, reading its own payload
 		refuse string // "" = goes back
 	}{
-		"another project":   {other, errors.New("exit status 1"), `payload: the spec is "other"'s, the release "notes"'s, nor does that installer read it (exit status 1)`},
-		"cut short":         {func(b []byte) []byte { return b[:len(b)/2] }, errors.New("exit status 1"), "payload spec.json: unexpected EOF"},
+		"another project":   {other, ExitCode(1), `payload: the spec is "other"'s, the release "notes"'s, nor does that installer read it (exit status 1)`},
+		"cut short":         {func(b []byte) []byte { return b[:len(b)/2] }, ExitCode(1), "payload spec.json: unexpected EOF"},
 		"another stowage's": {other, nil, ""},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -1637,7 +1643,7 @@ func TestARollbackRefusesAPreviousInstallerItCannotTrust(t *testing.T) {
 				}
 				return
 			}
-			if err == nil || !strings.Contains(err.Error(), c.refuse) {
+			if err == nil || !strings.Contains(err.Error(), c.refuse) || !errors.As(err, new(Refused)) {
 				t.Fatalf("%v\n%s", err, e.log)
 			}
 			if get(e.readEnv(), "STOWAGE_PROJECT_VERSION") != "2.0.0" {
@@ -1655,11 +1661,11 @@ func TestARollbackRefusesAPreviousInstallerItCannotTrust(t *testing.T) {
 func TestTheTrustOfAnotherStowagesReleaseIsNotGuessed(t *testing.T) {
 	t.Parallel()
 	e := installed(t)
-	if _, _, err := e.installer(nil).installTrust(context.Background(), "notes", "1.0.0", "1"); err != nil {
+	if _, _, err := e.installer(nil).installTrust(context.Background(), "notes", "1.0.0", "1", "upgrade"); err != nil {
 		t.Fatalf("this Stowage's release without keys: %v", err)
 	}
 	anotherStowages(t, e)
-	if _, _, err := e.installer(nil).installTrust(context.Background(), "notes", "1.0.0", "1"); err == nil || !strings.Contains(err.Error(), "the keys the install trusts cannot be told") {
+	if _, _, err := e.installer(nil).installTrust(context.Background(), "notes", "1.0.0", "1", "upgrade"); err == nil || !strings.Contains(err.Error(), "the keys the install trusts cannot be told") {
 		t.Fatalf("another Stowage's release without keys: %v", err)
 	}
 }

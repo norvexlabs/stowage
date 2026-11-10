@@ -305,6 +305,9 @@ func (k *keptRelease) projectVersion() string { return k.Manifest.ProjectVersion
 // otherwise: not as its Stowage wrote it, or not told.
 func (in *Installer) readKept(ctx context.Context, exe string, expect func(*release.Manifest) error) (*keptRelease, error) {
 	files, err := payload.Read(exe)
+	if errors.Is(err, payload.ErrNone) {
+		return nil, notCarried{err}
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -330,11 +333,30 @@ func (in *Installer) readKept(ctx context.Context, exe string, expect func(*rele
 		return nil, ctx.Err()
 	case errors.Is(ierr, errProbeTimeout):
 		return nil, fmt.Errorf("%w, and whether that installer reads it is not known (%v)", err, ierr)
+	case ierr != nil && answered(ierr):
+		return nil, notCarried{fmt.Errorf("%w, nor does that installer read it (%v)", err, ierr)}
 	case ierr != nil:
-		return nil, fmt.Errorf("%w, nor does that installer read it (%v)", err, ierr)
+		// The probe did not run (exec refused, no interpreter, no memory): no answer of it.
+		return nil, fmt.Errorf("%w, and whether that installer reads it is not known (%v)", err, ierr)
 	}
 	return k, nil
 }
+
+// answered reports whether a probe's error is the installer's own answer: it ran, and exited 1,
+// the status an installer exits with on its own error (cmd/stowage-install). Any other — a start
+// that failed, a Go runtime's fatal 2, a loader's 127, a signal — tells nothing of its payload.
+func answered(err error) bool {
+	var ee *exec.ExitError
+	var code ExitCode
+	return errors.As(err, &ee) && ee.ExitCode() == 1 || errors.As(err, &code) && code == 1
+}
+
+// notCarried is readKept's answer that the installer carries no release: a file with no payload,
+// or an installer whose probe answered that it does not read its own (answered). A manifest this
+// Stowage cannot decode is no answer: a failure.
+type notCarried struct{ error }
+
+func (e notCarried) Unwrap() error { return e.error }
 
 // errProbeTimeout is readsItself's installer that did not answer within readsItselfWithin.
 var errProbeTimeout = errors.New("it did not answer")

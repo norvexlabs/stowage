@@ -1735,6 +1735,7 @@ again, to copy an installer to another host.
           [--tune-profile default|network|release]                         # over the release's tune.profile
           [--interface ROLE=NIC]…                                          # this host's NIC of a host.interfaces role
           [--secrets FILE|-]                                               # a machine made again
+          [--json]                                                         # the result as one object, for a program
 <short>-stow status [--json] [--dir D]                                    # --json: one object, for a program
 <short>-stow describe [--json]                                           # what the release offers, read with no install
 <short>-stow ps [--json] [--dir D]                                       # the stack's services, state and health
@@ -1742,16 +1743,16 @@ again, to copy an installer to another host.
 <short>-stow restart|stop|start SERVICE [--dir D]
 <short>-stow exec [--stdin] SERVICE [--dir D] -- COMMAND [ARG…]          # in the running container; its exit status
 <short>-stow schema [--after N] [--json] [--dir D]                        # the database's migration, the kept release's, the barriers after it
-<short>-stow uninstall [--data] [--yes] [--no-input] [--accessible] [--dry-run] [--dir D]
+<short>-stow uninstall [--data] [--yes] [--no-input] [--accessible] [--dry-run] [--json] [--dir D]
 <short>-stow secrets export --recipient AGE_KEY… [-o FILE|-] [--dir D]   # the secrets, encrypted
 <short>-stow secrets rotate KEY [--stage | --finish] [--dir D]           # a secret with rotation: true
 <short>-stow secrets set KEY [--accessible] [--dir D] < value            # a secret with settable: true; asked, unechoed, on a terminal
 <short>-stow provision [--dir D] [--set KEY=VALUE]…                      # run the provision hook again; --set an input only it reads, or a value it returned or declares it returns
 <short>-stow upgrade [--dir D] [--set KEY=VALUE]… [--set-file KEY=PATH]… [--answers FILE] [--no-input] # the NEW release's installer
-          [--ports route=port]… [--offline] [--dry-run] [--no-provision] [--accessible]
+          [--ports route=port]… [--offline] [--dry-run] [--no-provision] [--accessible] [--json]
 <short>-stow upgrade --version V [--dir D] [--set KEY=VALUE]… [--set-file KEY=PATH]… [--answers FILE] # fetches V's installer
-          [--ports route=port]… [--no-input] [--accessible] [--dry-run] [--no-provision]
-<short>-stow rollback [--dir D] [--offline] [--dry-run]                  # the installer the install keeps
+          [--ports route=port]… [--no-input] [--accessible] [--dry-run] [--no-provision] [--json]
+<short>-stow rollback [--dir D] [--offline] [--dry-run] [--json]         # the installer the install keeps
 <short>-stow reset-db [--dir D] [--yes] [--no-input] [--accessible] [--dry-run] [--no-provision]
           [--new-baseline]                                               # the NEW release's installer, across a baseline
 <short>-stow backup config|run|status|list|verify [--dir D] [the VM's flags]   # a pg-age-rclone or volumes-age-rclone backup
@@ -1992,6 +1993,74 @@ again, to copy an installer to another host.
   - `first_install_only`: the settings an install records at its first run and a re-run refuses,
     `["address", "registry", "registry_ca", "channel"]` (`--address`, `--registry`,
     `--registry-ca`, and the VM's `install --channel`).
+- **`--json` on the verbs that change an install**, for a program: the install and its re-run,
+  `upgrade` (`--version` too), `rollback` and `uninstall`, and on Kubernetes `k8s install`,
+  `k8s upgrade` (`--version` too), `k8s rollback` and `k8s uninstall`. The run prints one object
+  on standard output at its end, and nothing else there: what it prints for people otherwise (the
+  running line, the endpoint and the tips, `--dry-run`'s values and helm command, "already runs",
+  `release R in NS runs …`, `kept: …`) goes to standard error with its log. Asking still works on a
+  terminal; give `--no-input` (and `--yes` where it confirms) for none.
+  ```json
+  {
+    "format": 1,
+    "result": "done",
+    "release": { "version": "2.0.0", "revision": 1 },
+    "refused": { "reason": "…", "fix": "…" }
+  }
+  ```
+  `result` is `done` when the run changed the install, `nothing` when it had nothing to do (the
+  install already runs that release), was a `--dry-run`, or was refused; `release` the release
+  installed once the run ended (`.env`'s in the directory `--dir` names on Docker; on Kubernetes
+  the one the helm release's values record while helm lists it deployed), absent when none is (a
+  refused first install, an install of another project, after an uninstall, a release failed
+  or pending); `refused` only on a refusal:
+  `reason` the message the error line prints, naming the specifics; `fix` advice for the
+  operator, what to run or change — a program shows it, never runs it (where another installer
+  answers, it names that installer, run in this one's place with the same arguments). A run that
+  fails prints no object, only its error. `upgrade --version --json` passes `--json` to the
+  installer it fetches, which prints the object; the run that fetched it prints none and exits
+  with that installer's status (an installer from before 0.34.0 refuses the flag).
+- **Exit status** of every `<short>-stow` run: `0` done, or nothing to do; `3` refused — a rule
+  said no before anything changed, the error on standard error naming what to do; `1` failed;
+  `2` stays `kit check`'s "unknown"; an installer this one runs for it (`upgrade --version`, a
+  later revision's `upgrade`) passes its own status on. A check that says no once the run
+  changed the install (a restore splitting the volumes as an upgrade starts the new release) is
+  a failure (`1`), as is a rollback whose start fails after the files went back, and `tune
+  --apply`'s start of the stack after its consent: the install changed. A kept installer that cannot be read, whose manifest this installer cannot decode, or whose
+  probe gives no answer (it timed out, did not start, or exited otherwise than 1) fails (`1`);
+  one that carries another release, or carries none, or exits 1 on reading its own, is refused. The refusals (each exits 3): the
+  directory holds no install (`upgrade`, `rollback`, `uninstall`, `status`, `secrets export`), or another project's install, or one kept by another installer name; another
+  lifecycle run holds the install's lock, or a hook's or a check's container an earlier run left
+  is there (a refused first install may leave the directory it made, empty but for its lock
+  file, `.stowage.lock`, which the next install takes); a restore left the volumes
+  half restored; a directory with another project's `compose.yaml`, or that became an install
+  meanwhile; a re-run given `--secrets`, or a first-install-only setting (`--address`,
+  `--registry`, `--registry-ca`); `--secrets` with `--given` or `--kit`; a re-run by the
+  installer of another release than the one installed; a required input missing, or a value its
+  input refuses; ports in use, a front port that is an L4 route's, an L4 route bound to an
+  address the host does not have, an existing `tls/`, and `--ports`/`--address` or
+  `--http-port`/`--https-port` in the wrong TLS mode; an operator's "no" at a prompt (`aborted`);
+  on `upgrade`: an older release, another front, TLS mode or a route the install cannot keep or
+  serve, `--ports` or a `--set`/`--answers` key it does not take, a recorded value set again, a
+  recorded value the release cannot read, `--offline` on an install that pulls, `--given`/`--kit`,
+  a stopped upgrade or rollback, a kept installer that is not the release installed, a schema
+  baseline crossed (or `reset-db --new-baseline` confirmed for another release, or with nothing
+  to wipe), a host without the cores the services ask, and an `--answers` file's `tls` section;
+  on `upgrade --version`: `--offline`, an install made `--offline`, keys the install trusts that
+  cannot be told, a yanked release, one no key the install trusts signed, a version or revision
+  not published on the install's channel, and an older release; on `rollback`: no previous
+  release, a kept release that is not one release, a run by another installer than the one kept,
+  another schema baseline, a rollback barrier since or a newer schema the previous release does
+  not read; on `uninstall`: a gateway record that does not read, no `--yes` without a terminal,
+  and a timer or the network declarations that take root to remove. On Kubernetes: a release
+  that exists (install) or does not (upgrade, rollback, `--version`), one helm is working on
+  (`pending-*`), one not installed from this project's chart, an older release, another schema
+  baseline, an unknown or recorded input, the pull account's password missing, Pod Security
+  refusing `--unsafe-sysctls`, `--given` with `--version`, keys the release trusts this
+  installer does not carry, a release without a chart, `--revision` under 1, no revision to roll
+  back to, the schema refusing a rollback, and on `uninstall` a release not from this project's
+  chart, nothing to uninstall (or only the Secrets kept for the data), claims `--data` must
+  name, and no `--yes` without a terminal.
 - `uninstall` removes the install's containers and networks (`docker compose down
   --remove-orphans`, the containers a hook or a schema check left among them). The data — the
   stack's volumes and the install directory (its `.env` and secrets, the dumps, the release kept
@@ -3469,16 +3538,16 @@ the current directory. A release with no chart (published without the shape) is 
                        [--image-registry PREFIX] [--registry-ca FILE] [--set KEY=VALUE]… [--set-file KEY=PATH]…
                        [--answers FILE] [--given FILE|- | --kit FILE|- [--kit-code-file FILE]]
                        [--no-input] [--accessible] [--timeout 10m] [--dry-run] [--no-provision]
-                       [--unsafe-sysctls[=false]]
+                       [--unsafe-sysctls[=false]] [--json]
 <short>-stow k8s upgrade  [the same flags; --timeout 6m]                 # the NEW release's installer
 <short>-stow k8s upgrade --version V [the same flags, but --given, --kit] # fetches V's installer
-<short>-stow k8s rollback [--namespace NS] [--release R] [--kube-context C] [--revision N] [--timeout 6m] [--dry-run]
+<short>-stow k8s rollback [--namespace NS] [--release R] [--kube-context C] [--revision N] [--timeout 6m] [--dry-run] [--json]
 <short>-stow k8s status   [--namespace NS] [--release R] [--kube-context C] [--json]
 <short>-stow k8s reset-db [--namespace NS] [--release R] [--kube-context C] [--yes] [--no-input]
                        [--accessible] [--registry-ca FILE] [--timeout 10m] [--dry-run] [--no-provision]
                        [--new-baseline [--set-file KEY=PATH]…]        # the NEW release's installer, across a baseline
 <short>-stow k8s uninstall [--namespace NS] [--release R] [--kube-context C] [--data] [--yes]
-                       [--no-input] [--accessible] [--timeout 10m] [--dry-run]
+                       [--no-input] [--accessible] [--timeout 10m] [--dry-run] [--json]
 <short>-stow k8s provision [--namespace NS] [--release R] [--kube-context C] [--set KEY=VALUE]…
                        [--registry-ca FILE]                           # a project with a provision hook
 <short>-stow k8s secrets rotate KEY [--stage | --finish] [--namespace NS] [--release R]
@@ -4536,6 +4605,34 @@ sudo <short>-stow network attach --role ROLE --mac MAC [--mode dhcp|static|none]
   `--settings` (default `/etc/<name>/install.yaml`) on `install` and `boot`;
   `--socket` (default `/run/<name>/host.sock`) on every verb — the socket a verb asks, and the one
   `hostd` serves on.
+- Exit status on the VM: the VM's `<short>-stow` has no `--json` yet, but what it runs itself
+  shares the Docker installer's refusals, which exit 3 instead of 1, nothing having changed
+  (see "Exit status" under the installer). On the VM these are: `install` (a first install or
+  its re-run): a directory holding another project's `compose.yaml`, or that became an install
+  meanwhile; a re-run given `--secrets`, or a first-install-only setting (`--address`,
+  `--registry`, `--registry-ca`, `--channel`); a re-run by the installer of another release than
+  the one installed (an earlier one, or a later one the install does not keep); a re-run's value
+  its input refuses, a required input left empty, or a new certificate that does not cover a
+  route's domain; another project's install or one kept by another installer name; another
+  lifecycle run holding the lock, or a hook's or check's container an earlier run left; volumes a
+  restore left half restored; a required input missing or a value its input refuses; ports in
+  use, a front port that is an L4 route's, an L4 route bound to an address the VM does not have,
+  an existing `tls/`, `--ports`/`--address` or `--http-port`/`--https-port` in the wrong TLS
+  mode; `upgrade` given `--given` or `--kit`; an operator's "no" at a prompt (`aborted`:
+  `install`'s form, `upgrade`, `rollback`, `restore`, and on the operator's machine `vm
+  create`'s confirmation and `vm destroy`'s). `boot-rollback` starts the database first, its first
+  change, so the rollback's own check can read it: a directory holding no install exits 3, and
+  every refusal after the start (no previous release, a kept release that is not one release, a
+  kept installer that carries another release or none, another schema baseline, volumes half
+  restored, a rollback barrier since or a newer schema the previous release does not read)
+  exits 1; with no database service, or when it finishes an upgrade or a rollback a reboot
+  stopped (it starts nothing first), the rollback's refusals exit 3 as `rollback`'s. `boot`
+  exits 1 on any refusal, and whatever an installer it runs exits with: a boot may change the
+  install from its first step. A verb the host daemon answers (`status`, `provision`, the
+  socket's verbs) exits 1 on its refusals: they come back over the socket as its error. A refusal
+  raised after a run's first change is a failure (1). A rollback (`boot-rollback`) whose start
+  fails after the files went back exits 1, whatever the kept installer's boot exited with, and
+  names the directory the release left is kept in.
 - The health gate: after the boot, `<name>-health.service` runs `<short>-stow health-gate` (as
   root, hidden from the help), which judges the boot by Kairos's boot assessment (GRUB images).
   An upgrade enables the assessment; GRUB, booting the active system with it enabled, marks the

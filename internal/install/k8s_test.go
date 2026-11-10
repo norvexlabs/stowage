@@ -649,6 +649,10 @@ func TestK8sInstallRefusals(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), c.want) {
 			t.Errorf("%s: %v, want %q", c.name, err, c.want)
 		}
+		// A file or a registry read that fails is a failure; a rule's no, a refusal.
+		if failed := c.name == "no values file" || c.name == "chart not in the mirror"; errors.As(err, new(Refused)) == failed {
+			t.Errorf("%s: refused %t, want %t", c.name, !failed, failed)
+		}
 		if len(e.f.applied) != 0 || len(e.f.ran("helm upgrade")) != 0 {
 			t.Errorf("%s: changed the cluster", c.name)
 		}
@@ -951,8 +955,8 @@ func TestK8sUpgradeRefusals(t *testing.T) {
 		e.runs("0.9.0", 1)
 		e.stored(map[string]string{"ADMIN_EMAIL": "a@example.org", "SESSION_SECRET": "s", "POSTGRES_PASSWORD": "p"}, ours)
 		err := e.installer(func(o *Options) { c.mod(e, o) }).K8sUpgrade(context.Background())
-		if err == nil || !strings.Contains(err.Error(), c.want) {
-			t.Errorf("%s: %v, want %q", c.name, err, c.want)
+		if err == nil || !strings.Contains(err.Error(), c.want) || !errors.As(err, new(Refused)) {
+			t.Errorf("%s: %v, want the refusal %q", c.name, err, c.want)
 		}
 		if len(e.f.applied) != 0 || len(e.f.ran("helm upgrade")) != 0 {
 			t.Errorf("%s: changed the cluster", c.name)

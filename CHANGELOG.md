@@ -15,6 +15,11 @@ follow [SemVer](https://semver.org/).
 - `describe [--json]`: what the release an installer carries offers, read with no install — the
   release, the shapes, every input (a secret's default never shown) and the settings a re-run
   cannot change. The JSON carries `format`, the machine interface's version.
+- `--json` on install and its re-run, `upgrade`, `rollback` and `uninstall`, Docker and
+  Kubernetes: one result object at the end (`done` or `nothing`, the release installed, the
+  refusal and its fix), the run's other output on standard error. A refusal — a rule saying no
+  before anything changed, an operator's "no" included — now exits 3 instead of 1; a rollback
+  whose start fails after the files went back exits 1.
 
 ## [0.33.2] - 2026-11-10
 

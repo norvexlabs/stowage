@@ -184,7 +184,7 @@ func refusesKit(c *cobra.Command, fix string) {
 	c.PreRunE = func(cmd *cobra.Command, _ []string) error {
 		for _, name := range names {
 			if cmd.Flags().Changed(name) {
-				return fmt.Errorf("--%s: an upgrade takes none of it: %s", name, fix)
+				return refuse(fix, "--%s: an upgrade takes none of it: %s", name, fix)
 			}
 		}
 		return nil

@@ -48,7 +48,7 @@ func firstInstallOnlyRefusal(settings []firstInstallSetting) error {
 	default:
 		named, verb = strings.Join(flags[:n-1], ", ")+" and "+flags[n-1], "are"
 	}
-	return fmt.Errorf("%s %s recorded at the first install: this directory already holds one (a re-run changes the inputs with --set, --answers and --domains, the front's ports, and its TLS mode and certificate)", named, verb)
+	return refuse("leave out "+named, "%s %s recorded at the first install: this directory already holds one (a re-run changes the inputs with --set, --answers and --domains, the front's ports, and its TLS mode and certificate)", named, verb)
 }
 
 // Description is `describe --json`: what the release this installer carries offers, read with no

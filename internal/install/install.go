@@ -120,6 +120,10 @@ type Options struct {
 	Getenv  func(string) string
 	Environ []string
 	Out     io.Writer // results: URLs, the dry-run file
+	// Machine is the verb's standard output under --json, where its Result alone goes (Out is the
+	// log then); nil without --json. An installer run for this one (upgrade --version) prints its
+	// own Result there.
+	Machine io.Writer
 	Log     io.Writer // progress, docker output
 	Docker  Tool
 	// Tofu and SSH are OpenTofu and ssh, run by `vm create --create opentofu` and `vm destroy`.
@@ -220,6 +224,9 @@ type Installer struct {
 	dropped removed
 	// upgraded: Upgrade moved the install to this release (not a no-op, not a dry run).
 	upgraded bool
+	// nothing: the verb found nothing to do (the install already runs the release), its --json
+	// result; delegated: an installer it ran did the verb, and printed the result (runChild).
+	nothing, delegated bool
 	// crossing makes Upgrade cross a schema baseline, wiping the data (reset-db --new-baseline).
 	crossing *crossing
 	// outputs is the provision hook's outputs file of a release another Stowage built, whose spec
@@ -274,7 +281,9 @@ func (in *Installer) path(name string) string { return filepath.Join(in.O.Dir, n
 // Install installs the release in O.Dir, or — when the directory already holds an install of the
 // same release — finishes its setup (brings the stack up again). Nothing is written before every
 // check passed.
-func (in *Installer) Install(ctx context.Context) error {
+func (in *Installer) Install(ctx context.Context) (err error) {
+	var mutated bool
+	defer afterChange(&mutated, &err)
 	o := &in.O
 	if o.Dir == "" {
 		return errors.New("an install directory is required")
@@ -289,7 +298,7 @@ func (in *Installer) Install(ctx context.Context) error {
 	o.Dir = dir
 	if _, err := os.Stat(in.path(envName)); err == nil {
 		if o.Secrets != nil {
-			return fmt.Errorf("%s holds an install, which keeps its secrets: --secrets is for a first install (a machine made again)", dir)
+			return refuse("leave out --secrets: a re-run keeps the install's secrets", "%s holds an install, which keeps its secrets: --secrets is for a first install (a machine made again)", dir)
 		}
 		return in.rerun(ctx)
 	} else if !errors.Is(err, os.ErrNotExist) {
@@ -391,7 +400,8 @@ func (in *Installer) Install(ctx context.Context) error {
 		return err
 	}
 	// Everything from here runs under the lock: another run may have installed here meanwhile,
-	// and its files are its own.
+	// and its files are its own. A refusal under it leaves the directory, empty but for the
+	// lock's file, which the next install takes (dirFree).
 	unlock, err := in.lockRun(ctx, env)
 	if err != nil {
 		return err
@@ -400,6 +410,7 @@ func (in *Installer) Install(ctx context.Context) error {
 	if err := in.dirFree(dir); err != nil {
 		return err
 	}
+	mutated = true // the run writes the install from here
 	// Until .env is written no install owns what this run wrote: a failure removes it.
 	certWritten, caWritten, clientCAWritten := false, false, false
 	unwritten := func(err error) error {
@@ -496,10 +507,10 @@ func (in *Installer) preflight(ctx context.Context, mode string) (publish, error
 	}
 	if mode == Loopback {
 		if o.HTTPPort != 0 || o.HTTPSPort != 0 {
-			return publish{}, errors.New("--http-port and --https-port are for TLS modes: loopback mode takes --ports")
+			return publish{}, refusal("leave out --http-port and --https-port (loopback mode takes --ports)", errors.New("--http-port and --https-port are for TLS modes: loopback mode takes --ports"))
 		}
 	} else if len(o.Ports) > 0 || o.Address != "" {
-		return publish{}, errors.New("--ports and --address are for loopback mode: a TLS front listens on --http-port and --https-port")
+		return publish{}, refusal("leave out --ports and --address (a TLS front takes --http-port and --https-port)", errors.New("--ports and --address are for loopback mode: a TLS front listens on --http-port and --https-port"))
 	}
 	in.byo = nil
 	if err := in.tlsFree(mode); err != nil {
@@ -581,7 +592,7 @@ func (in *Installer) l4Free(routes []spec.L4Route, value func(string) string, ow
 		}
 	}
 	if len(busy) > 0 {
-		return fmt.Errorf("port(s) %s already in use on this host: the project's L4 routes publish them", strings.Join(busy, ", "))
+		return refuse("free the ports, or bind the routes to another address (their bind input)", "port(s) %s already in use on this host: the project's L4 routes publish them", strings.Join(busy, ", "))
 	}
 	return nil
 }
@@ -665,7 +676,7 @@ func (in *Installer) bindHere(routes []spec.L4Route, value func(string) string) 
 		if a == "" || slices.ContainsFunc(addrs, func(h string) bool { b, err := netip.ParseAddr(h); return err == nil && b.Unmap().String() == a }) {
 			continue
 		}
-		return fmt.Errorf("%s (%s, the L4 route %s's address) is not an address of this host", value(r.BindInput), r.BindInput, r.Name)
+		return refuse("give "+r.BindInput+" an address of this host", "%s (%s, the L4 route %s's address) is not an address of this host", value(r.BindInput), r.BindInput, r.Name)
 	}
 	return nil
 }
@@ -703,13 +714,14 @@ func tlsPublish(http, https int) (publish, error) {
 }
 
 // dirFree refuses a directory another run or project has taken: an install's .env, or a
-// compose.yaml with none.
+// compose.yaml with none. Anything else is free: the lifecycle lock's file a refused first
+// install left, in the directory it made, included.
 func (in *Installer) dirFree(dir string) error {
 	if _, err := os.Stat(in.path(envName)); err == nil {
-		return fmt.Errorf("%s now holds an install: run again to finish it", dir)
+		return refuse("run the installer again: the run finishes that install", "%s now holds an install: run again to finish it", dir)
 	}
 	if _, err := os.Stat(in.path("compose.yaml")); err == nil {
-		return fmt.Errorf("%s already holds a compose.yaml and no install of %s: choose another --dir", dir, in.R.Spec.Name)
+		return refuse("choose another --dir", "%s already holds a compose.yaml and no install of %s: choose another --dir", dir, in.R.Spec.Name)
 	}
 	return nil
 }
@@ -732,9 +744,9 @@ func (in *Installer) portsFree(p publish) error {
 		return nil
 	}
 	if p.all { // a TLS front
-		return fmt.Errorf("port(s) %s already in use on this host: choose others with --http-port and --https-port", strings.Join(busy, ", "))
+		return refuse("choose free ports with --http-port and --https-port", "port(s) %s already in use on this host: choose others with --http-port and --https-port", strings.Join(busy, ", "))
 	}
-	return fmt.Errorf("port(s) %s already in use on %s: choose others with --ports", strings.Join(busy, ", "), p.addr)
+	return refuse("choose free ports with --ports ROUTE=PORT", "port(s) %s already in use on %s: choose others with --ports", strings.Join(busy, ", "), p.addr)
 }
 
 // decide computes every value a first install records, and checks each can be recorded. It returns
@@ -819,6 +831,8 @@ func (in *Installer) decide(ctx context.Context, dir, mode string, pub publish, 
 // the changes are logged, the ports the install does not hold probed, then the stack is brought
 // up again with them.
 func (in *Installer) rerun(ctx context.Context) (err error) {
+	var mutated bool
+	defer afterChange(&mutated, &err)
 	o := &in.O
 	if given := slices.DeleteFunc(slices.Clone(firstInstallOnly), func(s firstInstallSetting) bool { return !s.given(o) }); len(given) > 0 {
 		return firstInstallOnlyRefusal(given)
@@ -881,6 +895,7 @@ func (in *Installer) rerun(ctx context.Context) (err error) {
 		}
 		return nil
 	}
+	mutated = true // its marker, the images, the files: changes from here
 	if unfinished, _, _ := in.firstInstall(); unfinished {
 		// From here this run brings the stack up: it finishes the first install, or records why
 		// not (a refusal or a dry run above leaves the marker as it was).
@@ -1061,7 +1076,7 @@ func (in *Installer) volumesSplit() error {
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
-	return fmt.Errorf("a restore left %s's volumes half restored (%s): its services stay stopped until a restore again finishes", in.R.Spec.Name, in.path(volumesSplitFile))
+	return refuse("finish the restore (run it again), then run again", "a restore left %s's volumes half restored (%s): its services stay stopped until a restore again finishes", in.R.Spec.Name, in.path(volumesSplitFile))
 }
 
 // restoreDone removes the restore-awaited marker: the hook ran on the data its values belong to,
@@ -1189,11 +1204,11 @@ func (in *Installer) sameRelease(ctx context.Context, env *EnvFile) error {
 	if v != m.ProjectVersion || rev != strconv.Itoa(m.Revision) {
 		if in.newer(v, rev) != nil {
 			if _, err := in.keptInstaller(ctx, name, m.ProjectVersion, strconv.Itoa(m.Revision)); err == nil {
-				return fmt.Errorf("%s runs %s %s (revision %s), and keeps this installer, of %s (revision %d): the upgrade stopped before keeping its own; run the installer of %s with --dir %s", in.O.Dir, name, v, rev, m.ProjectVersion, m.Revision, v, in.O.Dir)
+				return refuse(fmt.Sprintf("run the installer of %s %s with --dir %s", name, v, in.O.Dir), "%s runs %s %s (revision %s), and keeps this installer, of %s (revision %d): the upgrade stopped before keeping its own; run the installer of %s with --dir %s", in.O.Dir, name, v, rev, m.ProjectVersion, m.Revision, v, in.O.Dir)
 			}
-			return fmt.Errorf("%s runs %s %s (revision %s), after this installer's %s (revision %d): run the installer it keeps, %s", in.O.Dir, name, v, rev, m.ProjectVersion, m.Revision, in.ctl())
+			return refuse(in.ctl()+" --dir "+in.O.Dir, "%s runs %s %s (revision %s), after this installer's %s (revision %d): run the installer it keeps, %s", in.O.Dir, name, v, rev, m.ProjectVersion, m.Revision, in.ctl())
 		}
-		return fmt.Errorf("%s runs %s %s (revision %s); this installer carries %s (revision %d): `%s upgrade --dir %s` moves it to this release", in.O.Dir, name, v, rev, m.ProjectVersion, m.Revision, cmp.Or(in.O.Self, in.R.Ctl()), in.O.Dir)
+		return refuse(cmp.Or(in.O.Self, in.R.Ctl())+" upgrade --dir "+in.O.Dir, "%s runs %s %s (revision %s); this installer carries %s (revision %d): `%s upgrade --dir %s` moves it to this release", in.O.Dir, name, v, rev, m.ProjectVersion, m.Revision, cmp.Or(in.O.Self, in.R.Ctl()), in.O.Dir)
 	}
 	return nil
 }
@@ -1683,7 +1698,7 @@ func (in *Installer) l4Clash(p publish) error {
 				if p.all {
 					flag = "--" + k + "-port"
 				}
-				return fmt.Errorf("the front's %s port %d is the L4 route %s's: choose another with %s", k, r.Port, r.Name, flag)
+				return refuse("choose another port with "+flag, "the front's %s port %d is the L4 route %s's: choose another with %s", k, r.Port, r.Name, flag)
 			}
 		}
 	}
@@ -1707,7 +1722,8 @@ func (in *Installer) l4Upgrade(ctx context.Context, env *EnvFile, mode string) e
 		pub.ports[k], _ = strconv.Atoi(s)
 	}
 	if err := in.l4Clash(pub); err != nil {
-		return fmt.Errorf("%w: give it to a re-run of the installer the install runs, `%s --dir %s`, then upgrade", err, in.ctl(), in.O.Dir)
+		// The front's port is changed by a re-run alone: the fix names it, not the flag the clash's.
+		return refusal(in.ctl()+" --dir "+in.O.Dir+" with another port for the front, then upgrade", fmt.Errorf("%w: give it to a re-run of the installer the install runs, `%s --dir %s`, then upgrade", err, in.ctl(), in.O.Dir))
 	}
 	if len(in.R.Spec.L4.Routes) == 0 {
 		return nil
@@ -1733,7 +1749,15 @@ func (in *Installer) l4Upgrade(ctx context.Context, env *EnvFile, mode string) e
 		v, _ := env.Get(k)
 		return v
 	}
-	if err := in.bindHere(in.R.Spec.L4.Routes, get); err != nil {
+	// One advice for every route: what moves a route's port, or frees it.
+	bindFix := func(err error) error {
+		if err == nil {
+			return nil
+		}
+		return refusal("give the routes' bind inputs addresses of this host (a recorded one through a re-run of the installer the install runs, "+
+			in.ctl()+" --dir "+in.O.Dir+" --set KEY=<address>, then upgrade; one this release adds with --set KEY=<address> on this upgrade), or free the ports the reason names", err)
+	}
+	if err := bindFix(in.bindHere(in.R.Spec.L4.Routes, get)); err != nil {
 		return err
 	}
 	var added []spec.L4Route
@@ -1746,7 +1770,7 @@ func (in *Installer) l4Upgrade(ctx context.Context, env *EnvFile, mode string) e
 			added = append(added, r)
 		}
 	}
-	return in.l4Free(added, get, own)
+	return bindFix(in.l4Free(added, get, own))
 }
 
 // publishedPorts are the host ports, as protocol/port, the containers `compose ps --format json`
@@ -2396,7 +2420,7 @@ func (in *Installer) Status(ctx context.Context) error {
 	in.O.Dir = dir
 	env, err := ReadEnvFile(in.path(envName))
 	if errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("%s holds no install", dir)
+		return refuse("install first, or give the --dir of the install", "%s holds no install", dir)
 	}
 	if err != nil {
 		return err
@@ -2661,7 +2685,7 @@ func (in *Installer) inputs(ctx context.Context, list []input, back bool) (map[s
 		}
 	}
 	if len(bad) > 0 {
-		return nil, errors.New(strings.Join(bad, "; "))
+		return nil, refusal("give each a value its input accepts", errors.New(strings.Join(bad, "; ")))
 	}
 	defaults := func(answers map[string]string) map[string]string {
 		values, _ := in.resolve(list, given, answers)
@@ -2691,7 +2715,7 @@ func (in *Installer) inputs(ctx context.Context, list []input, back bool) (map[s
 	}
 	values, missing := in.resolve(list, given, answers)
 	if len(missing) > 0 {
-		return nil, fmt.Errorf("missing required input(s), set by --set KEY=VALUE, the environment or --answers: %s", strings.Join(missing, "; "))
+		return nil, refuse("give each with --set KEY=VALUE, --set-file KEY=PATH or --answers", "missing required input(s), set by --set KEY=VALUE, the environment or --answers: %s", strings.Join(missing, "; "))
 	}
 	for _, i := range list {
 		if i.check == nil {
@@ -2702,7 +2726,7 @@ func (in *Installer) inputs(ctx context.Context, list []input, back bool) (map[s
 		}
 	}
 	if len(bad) > 0 {
-		return nil, errors.New(strings.Join(bad, "; "))
+		return nil, refusal("give each a value its input accepts", errors.New(strings.Join(bad, "; ")))
 	}
 	return values, nil
 }

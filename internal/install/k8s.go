@@ -436,10 +436,10 @@ func (in *Installer) deployedIn(values []byte, read string) (*deployed, error) {
 		return nil, fmt.Errorf("%s: %w", read, err)
 	}
 	if v.Stowage == nil || v.Stowage.Release.Name == "" {
-		return nil, fmt.Errorf("release %s in %s was not installed from a chart Stowage published", k.Release, k.Namespace)
+		return nil, refuse("give the --release and --namespace of a release installed from this project's chart", "release %s in %s was not installed from a chart Stowage published", k.Release, k.Namespace)
 	}
 	if v.Stowage.Release.Name != in.R.Manifest.Name {
-		return nil, fmt.Errorf("release %s in %s runs %q, not %q", k.Release, k.Namespace, v.Stowage.Release.Name, in.R.Manifest.Name)
+		return nil, refuse("give the --release and --namespace of a release of "+in.R.Manifest.Name, "release %s in %s runs %q, not %q", k.Release, k.Namespace, v.Stowage.Release.Name, in.R.Manifest.Name)
 	}
 	return v.Stowage, nil
 }
@@ -563,14 +563,16 @@ func (in *Installer) K8sUpgrade(ctx context.Context) error {
 // answered otherwise is a copy of it.
 var selfRecorded = [][]string{{"release", k8sInstallerKey}, {"release", k8sInstallerOfKey}, {k8sSchemaFrom}}
 
-func (in *Installer) k8sDeploy(ctx context.Context, upgrade bool) error {
+func (in *Installer) k8sDeploy(ctx context.Context, upgrade bool) (err error) {
+	var mutated bool
+	defer afterChange(&mutated, &err)
 	in.givenCA = true
 	o, k, m := &in.O, in.O.K8s, in.R.Manifest
 	if err := in.checkTarget(); err != nil {
 		return err
 	}
 	if m.Artifacts.Chart == nil {
-		return fmt.Errorf("%s %s has no chart (published without the kubernetes shape): it is not installed on Kubernetes", m.Name, m.ProjectVersion)
+		return refuse("install the release with Docker, or a release published with the kubernetes shape", "%s %s has no chart (published without the kubernetes shape): it is not installed on Kubernetes", m.Name, m.ProjectVersion)
 	}
 	for _, f := range k.Values {
 		if _, err := os.Stat(f); err != nil {
@@ -593,9 +595,9 @@ func (in *Installer) k8sDeploy(ctx context.Context, upgrade bool) error {
 	var sysctls bool
 	switch {
 	case !upgrade && rel != nil:
-		return fmt.Errorf("release %s in %s exists (%s, %s): `%s` moves it to %s", k.Release, k.Namespace, rel.Status, rel.AppVersion, in.k8sCtl("upgrade"), m.ProjectVersion)
+		return refuse(in.k8sCtl("upgrade"), "release %s in %s exists (%s, %s): `%s` moves it to %s", k.Release, k.Namespace, rel.Status, rel.AppVersion, in.k8sCtl("upgrade"), m.ProjectVersion)
 	case upgrade && rel == nil:
-		return fmt.Errorf("no release %s in %s: `%s` installs %s", k.Release, k.Namespace, in.k8sCtl("install"), m.ProjectVersion)
+		return refuse(in.k8sCtl("install"), "no release %s in %s: `%s` installs %s", k.Release, k.Namespace, in.k8sCtl("install"), m.ProjectVersion)
 	case upgrade:
 		if err := in.pending(rel); err != nil {
 			return err
@@ -621,7 +623,7 @@ func (in *Installer) k8sDeploy(ctx context.Context, upgrade bool) error {
 				in.dropped = removedBy(running.Release, in.R)
 			}
 			if from, to, ok := in.k8sBaselines(running, runErr, cur); ok && from != to {
-				return fmt.Errorf("%s %s starts schema baseline %d, and release %s in %s runs %s %s, at baseline %d: its data cannot carry over, so it moves to %s only by a fresh install: `%s --new-baseline` wipes it and installs %s",
+				return refuse(in.k8sCtl("reset-db")+" --new-baseline", "%s %s starts schema baseline %d, and release %s in %s runs %s %s, at baseline %d: its data cannot carry over, so it moves to %s only by a fresh install: `%s --new-baseline` wipes it and installs %s",
 					m.Name, m.ProjectVersion, to, k.Release, k.Namespace, cur.Release.Name, cur.Release.Version, from, m.ProjectVersion, in.k8sCtl("reset-db"), m.ProjectVersion)
 			}
 		}
@@ -662,7 +664,7 @@ func (in *Installer) k8sDeploy(ctx context.Context, upgrade bool) error {
 		if err != nil {
 			return err
 		}
-		return fmt.Errorf("the cluster pulls the images with the pull account %s, whose password this installer does not carry: set %s", c.User, c.TokenEnv)
+		return refuse("set "+c.TokenEnv, "the cluster pulls the images with the pull account %s, whose password this installer does not carry: set %s", c.User, c.TokenEnv)
 	}
 	if token != "" {
 		host, _, _ := strings.Cut(prefix, "/")
@@ -748,6 +750,7 @@ func (in *Installer) k8sDeploy(ctx context.Context, upgrade bool) error {
 		c := m.Artifacts.Chart
 		return in.printDeploy(d, args, map[string]string{chart: "oci://" + prefix + "/" + c.Repository + "@" + c.Digest, valuesFile: "<the values above>"}, plan)
 	}
+	mutated = true // the Secrets, then helm
 	if err := in.applySecrets(ctx, d); err != nil {
 		return err
 	}
@@ -825,7 +828,7 @@ func (in *Installer) pending(rel *helmRelease) error {
 	if rel.Status == "pending-install" {
 		end = "helm uninstall" // no earlier revision to go back to; the Secrets are kept
 	}
-	return fmt.Errorf("release %s in %s is %s: another helm operation runs on it, or one stopped before it finished (`%s %s --namespace %s` ends it)", k.Release, k.Namespace, rel.Status, end, k.Release, k.Namespace)
+	return refuse(end+" "+k.Release+" --namespace "+k.Namespace, "release %s in %s is %s: another helm operation runs on it, or one stopped before it finished (`%s %s --namespace %s` ends it)", k.Release, k.Namespace, rel.Status, end, k.Release, k.Namespace)
 }
 
 // k8sNewer refuses a release that comes before the one the helm release runs, by the scheme the
@@ -843,7 +846,7 @@ func (in *Installer) k8sNewer(cur *deployed) error {
 		return err
 	}
 	if cmp.Or(c, cmp.Compare(cur.Release.Revision, m.Revision)) > 0 {
-		return fmt.Errorf("release %s in %s runs %s %s (revision %d), after this installer's %s (revision %d): `%s` goes back one upgrade",
+		return refuse(laterFix("the installer of the release it runs"), "release %s in %s runs %s %s (revision %d), after this installer's %s (revision %d): `%s` goes back one upgrade",
 			in.O.K8s.Release, in.O.K8s.Namespace, m.Name, cur.Release.Version, cur.Release.Revision, m.ProjectVersion, m.Revision, in.k8sCtl("rollback"))
 	}
 	return nil
@@ -936,7 +939,7 @@ func (in *Installer) knownK8sInputs(list []input) error {
 		}
 	}
 	if len(unknown) > 0 {
-		return fmt.Errorf("no input of this release on Kubernetes is named %s (inputs: %s)", strings.Join(unknown, ", "), cmp.Or(strings.Join(keys, ", "), "none"))
+		return refuse("leave out "+strings.Join(unknown, ", "), "no input of this release on Kubernetes is named %s (inputs: %s)", strings.Join(unknown, ", "), cmp.Or(strings.Join(keys, ", "), "none"))
 	}
 	return nil
 }
@@ -1049,13 +1052,15 @@ func indent(s string) string {
 
 // K8sRollback rolls the helm release back to a revision: by default the one before the last
 // upgrade (previousRevision).
-func (in *Installer) K8sRollback(ctx context.Context) error {
+func (in *Installer) K8sRollback(ctx context.Context) (err error) {
+	var mutated bool
+	defer afterChange(&mutated, &err)
 	o, k := &in.O, in.O.K8s
 	if err := in.checkTarget(); err != nil {
 		return err
 	}
 	if k.Revision < 0 {
-		return fmt.Errorf("--revision %d: a helm revision is 1 or more (`helm history %s --namespace %s` lists them)", k.Revision, k.Release, k.Namespace)
+		return refuse("--revision N, N from 1 (`helm history` lists them)", "--revision %d: a helm revision is 1 or more (`helm history %s --namespace %s` lists them)", k.Revision, k.Release, k.Namespace)
 	}
 	if _, err := in.checkHelm(ctx); err != nil {
 		return err
@@ -1065,7 +1070,7 @@ func (in *Installer) K8sRollback(ctx context.Context) error {
 		return err
 	}
 	if rel == nil {
-		return fmt.Errorf("no release %s in %s", k.Release, k.Namespace)
+		return refuse("nothing to roll back: "+in.k8sCtl("install")+" installs the release", "no release %s in %s", k.Release, k.Namespace)
 	}
 	if err := in.pending(rel); err != nil {
 		return err
@@ -1088,6 +1093,7 @@ func (in *Installer) K8sRollback(ctx context.Context) error {
 	if o.DryRun {
 		args = append(args, "--dry-run")
 	}
+	mutated = !o.DryRun // helm rolls the release back
 	o.logf("helm: rolling %s in %s back to revision %d", k.Release, k.Namespace, to)
 	if _, err := in.helm(ctx, Cmd{Args: args, Stream: o.Log}); err != nil {
 		return err
@@ -1165,7 +1171,7 @@ func (in *Installer) K8sUpgradeTo(ctx context.Context, v string, args []string) 
 		return err
 	}
 	if rel == nil {
-		return fmt.Errorf("no release %s in %s: `%s` installs %s", k.Release, k.Namespace, in.k8sCtl("install"), in.R.Manifest.ProjectVersion)
+		return refuse(in.k8sCtl("install"), "no release %s in %s: `%s` installs %s", k.Release, k.Namespace, in.k8sCtl("install"), in.R.Manifest.ProjectVersion)
 	}
 	if err := in.pending(rel); err != nil {
 		return err
@@ -1193,7 +1199,7 @@ func (in *Installer) K8sUpgradeTo(ctx context.Context, v string, args []string) 
 			}
 		}
 		if len(keys) == 0 {
-			return fmt.Errorf("release %s in %s trusts signing keys this %s does not carry: run the installer of the release it runs, or a later one", k.Release, k.Namespace, in.R.Ctl())
+			return refuse("run the installer of the release it runs, or a later one", "release %s in %s trusts signing keys this %s does not carry: run the installer of the release it runs, or a later one", k.Release, k.Namespace, in.R.Ctl())
 		}
 	}
 	trust, err := trusted("this installer", keys)
@@ -1210,8 +1216,9 @@ func (in *Installer) K8sUpgradeTo(ctx context.Context, v string, args []string) 
 	}
 	switch {
 	case order > 0 || (order == 0 && r.Revision > m.Revision):
-		return fmt.Errorf("release %s in %s runs %s %s (revision %d), after %s %s (revision %d): `%s` goes back one upgrade", k.Release, k.Namespace, name, r.Version, r.Revision, name, m.ProjectVersion, m.Revision, in.k8sCtl("rollback"))
+		return refuse(laterFix("the installer of the release it runs"), "release %s in %s runs %s %s (revision %d), after %s %s (revision %d): `%s` goes back one upgrade", k.Release, k.Namespace, name, r.Version, r.Revision, name, m.ProjectVersion, m.Revision, in.k8sCtl("rollback"))
 	case order == 0 && r.Revision == m.Revision:
+		in.nothing = true
 		fmt.Fprintf(in.O.Out, "release %s in %s already runs %s %s (revision %d)\n", k.Release, k.Namespace, name, r.Version, r.Revision)
 		if len(in.O.Set) > 0 || len(in.O.Answers) > 0 {
 			fmt.Fprintf(in.O.Out, "the inputs given are not applied: without --version, the installer of %s %s (revision %d) takes an input it adds (`%s`), and `--given FILE` replaces a recorded one\n", name, r.Version, r.Revision, in.k8sCtl("upgrade"))
@@ -1226,7 +1233,7 @@ func (in *Installer) K8sUpgradeTo(ctx context.Context, v string, args []string) 
 	if err != nil {
 		return err
 	}
-	if err := in.O.exec(ctx, exe, append([]string{"k8s", "upgrade"}, args...)); err != nil {
+	if err := in.runChild(ctx, exe, append([]string{"k8s", "upgrade"}, args...)); err != nil {
 		in.O.logf("the fetched installer is kept: %s", exe)
 		if k.UnsafeSysctls != nil {
 			in.O.logf("note: if it refused --unsafe-sysctls as an unknown flag, it was made before it: run `%s --version %s` without it; its release gives the pods no such settings", in.k8sCtl("upgrade"), m.ProjectVersion)
@@ -1325,6 +1332,6 @@ func (in *Installer) podSecurityAdmitsSysctls(ctx context.Context) error {
 	case "", "privileged":
 		return nil
 	default:
-		return fmt.Errorf("--unsafe-sysctls: namespace %s enforces the Pod Security level %s, which refuses pods given those settings: label it privileged (`kubectl label namespace %s %s=privileged --overwrite`), or give the pods none (--unsafe-sysctls=false)", k.Namespace, level, k.Namespace, PodSecurityEnforce)
+		return refuse(fmt.Sprintf("kubectl label namespace %s %s=privileged --overwrite, or --unsafe-sysctls=false", k.Namespace, PodSecurityEnforce), "--unsafe-sysctls: namespace %s enforces the Pod Security level %s, which refuses pods given those settings: label it privileged (`kubectl label namespace %s %s=privileged --overwrite`), or give the pods none (--unsafe-sysctls=false)", k.Namespace, level, k.Namespace, PodSecurityEnforce)
 	}
 }
