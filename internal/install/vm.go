@@ -583,7 +583,7 @@ func (in *Installer) Boot(ctx context.Context) (err error) {
 		}
 		return in.Install(ctx)
 	}
-	if _, err := in.keptInstaller(ctx, name, cur, rev); err != nil {
+	if _, err := in.vmKeptInstaller(ctx, name, cur, rev); err != nil {
 		return err
 	}
 	switch {

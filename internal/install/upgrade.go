@@ -93,14 +93,14 @@ func (in *Installer) ctl() string { return in.path(in.R.Ctl()) }
 func sameProject(dir string, env *EnvFile, m *release.Manifest) (name, version, revision string, err error) {
 	name, version, revision = runs(env)
 	if name != m.Name {
-		return "", "", "", refuse("give the --dir of an install of "+m.Name, "%s holds an install of %q, not %q", dir, name, m.Name)
+		return "", "", "", dockerRefusal("give the --dir of an install of "+m.Name, "%s holds an install of %q, not %q", dir, name, m.Name)
 	}
 	if short, _ := env.Get("STOWAGE_SHORT_NAME"); short != m.ShortName {
 		kept := filepath.Join(dir, providers.Ctl(short))
 		if short == "" {
 			kept = "the installer the install keeps in " + dir
 		}
-		return "", "", "", refuse(sameArgs(kept, "it knows this install", "")+", for the release the install runs; or install this release afresh, "+providers.Ctl(m.ShortName)+" --dir <another directory>", "%s holds an install of %s kept by %s, not %s (short_name %q, this release's %q): run the installer it keeps, or install this release afresh", dir, name, providers.Ctl(short), providers.Ctl(m.ShortName), short, m.ShortName)
+		return "", "", "", dockerRefusal(sameArgs(kept, "it knows this install", "")+", for the release the install runs; or install this release afresh, "+providers.Ctl(m.ShortName)+" --dir <another directory>", "%s holds an install of %s kept by %s, not %s (short_name %q, this release's %q): run the installer it keeps, or install this release afresh", dir, name, providers.Ctl(short), providers.Ctl(m.ShortName), short, m.ShortName)
 	}
 	return name, version, revision, nil
 }
@@ -453,25 +453,55 @@ func (in *Installer) addedInputs(env *EnvFile, mode string) []input {
 // one that is not the release it runs: kept with it in PrevDir, that installer is what a rollback
 // goes back with.
 func (in *Installer) keptInstaller(ctx context.Context, name, version, revision string) (*keptRelease, error) {
+	k, refused, err := in.installerOf(ctx, name, version, revision)
+	if err == nil {
+		return k, nil
+	}
+	err = fmt.Errorf("%s is not the installer of %s %s (revision %s), so a rollback could not go back: re-run that release's installer in %s first (%w)",
+		in.ctl(), name, version, revision, in.O.Dir, err)
+	if refused {
+		return nil, refusal(fmt.Sprintf("run the installer of %s %s with --dir %s", name, version, in.O.Dir), err)
+	}
+	return nil, err
+}
+
+// vmKeptInstaller is keptInstaller on the VM, whose way out is its own: the OS of the release the
+// install runs, written again by `upgrade --version`, whose boot re-runs the install, which keeps
+// its installer. The daemon upgrades only to a release after the OS's, so that way is a refusal's
+// fix for an install of a later release alone (a crossing whose boot fell back); else a failure,
+// naming no way.
+func (in *Installer) vmKeptInstaller(ctx context.Context, name, version, revision string) (*keptRelease, error) {
+	k, refused, err := in.installerOf(ctx, name, version, revision)
+	if err == nil {
+		return k, nil
+	}
+	err = fmt.Errorf("%s is not the installer of %s %s (revision %s), which the install runs: %w", in.ctl(), name, version, revision, err)
+	n, nerr := strconv.Atoi(revision)
+	osAfter, cerr := releaseAfter(in.R.Manifest, version, n)
+	if !refused || nerr != nil || cerr != nil || osAfter {
+		return nil, err
+	}
+	return nil, refusal("write the OS of the release the install runs again (upgrade --version "+version+"): its boot keeps that release's installer",
+		fmt.Errorf("%w; `%s upgrade --version %s` writes its OS again", err, in.R.Ctl(), version))
+}
+
+// installerOf returns the release the install's kept installer carries (readKept) when it is
+// name's version at revision. refused tells it carries another release, or none it reads: a
+// refusal's case; another error (a file that does not read, a probe that timed out, a stopped
+// run) is a failure.
+func (in *Installer) installerOf(ctx context.Context, name, version, revision string) (k *keptRelease, refused bool, err error) {
 	other := false
-	k, err := in.readKept(ctx, in.ctl(), func(m *release.Manifest) error {
+	k, err = in.readKept(ctx, in.ctl(), func(m *release.Manifest) error {
 		if m.Name == name && m.ProjectVersion == version && strconv.Itoa(m.Revision) == revision {
 			return nil
 		}
 		other = true
 		return fmt.Errorf("it carries %s %s (revision %d)", m.Name, m.ProjectVersion, m.Revision)
 	})
-	if err == nil {
-		return k, nil
+	if err != nil {
+		return nil, other || errors.As(err, new(notCarried)), err
 	}
-	err = fmt.Errorf("%s is not the installer of %s %s (revision %s), so a rollback could not go back: re-run that release's installer in %s first (%w)",
-		in.ctl(), name, version, revision, in.O.Dir, err)
-	// A refusal when it carries another release, or none it reads; a file that does not read, a
-	// probe that timed out or a stopped run is a failure.
-	if other || errors.As(err, new(notCarried)) {
-		return nil, refusal(fmt.Sprintf("run the installer of %s %s with --dir %s", name, version, in.O.Dir), err)
-	}
-	return nil, err
+	return k, false, nil
 }
 
 // newer refuses to upgrade to a release that is not after the one the install runs, ordered by
@@ -939,7 +969,7 @@ func (in *Installer) Rollback(ctx context.Context) (err error) {
 			// This is the kept one: an upgrade to the release installed stopped before it kept its own.
 			fix = fmt.Sprintf("run the installer of %s %s (revision %s) instead of this one, with the same arguments: the install runs that release, and the upgrade to it stopped before it kept its own installer", name, cur, rev)
 		}
-		return refuse(fix, "%s runs %s %s (revision %s), and this installer carries %s (revision %d): a rollback is run by the installer the install keeps, `%s rollback --dir %s`",
+		return dockerRefusal(fix, "%s runs %s %s (revision %s), and this installer carries %s (revision %d): a rollback is run by the installer the install keeps, `%s rollback --dir %s`",
 			o.Dir, name, cur, rev, m.ProjectVersion, m.Revision, in.ctl(), o.Dir)
 	}
 	var mixed error // PrevDir holding more than one release, told before its installer is run

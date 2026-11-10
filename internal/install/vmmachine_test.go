@@ -31,6 +31,9 @@ func ctlSplit(e *env, sock string, args ...string) (stdout, stderr string, err e
 	return out.String(), errb.String(), err
 }
 
+// refusedFix is err's refusal's fix; empty when err is no refusal.
+func refusedFix(err error) string { r, _ := Refusal(err); return r.Fix }
+
 // strictJSON decodes raw into v, refusing a field v does not name and anything after it.
 func strictJSON(t *testing.T, raw string, v any) {
 	t.Helper()
@@ -428,7 +431,8 @@ func TestVMSeed(t *testing.T) {
 		t.Errorf("%v", err)
 	}
 	// A bad channel, no platform, or one no Stowage knows: refused before the registry is read
-	// (a --registry that does not parse would be refused first).
+	// (a --registry that does not parse would be refused first); the platform's, a refusal (exit
+	// 3) naming the platforms to give.
 	unread := func(o *Options) { o.Registry = "not a registry" }
 	if _, err := seed(unread, "Bad Channel"); err == nil || !strings.Contains(err.Error(), "is not a channel name") {
 		t.Errorf("%v", err)
@@ -438,7 +442,8 @@ func TestVMSeed(t *testing.T) {
 	}
 	for platform, want := range map[string]string{"": "--platform is required (truenas, ", "nowhere": "--platform nowhere: one of truenas, "} {
 		in := v.installer(unread)
-		if _, err := in.SeedVM(context.Background(), &VMCreate{Platform: platform, Hostname: "notes-1", SSHKey: v.key}, ""); err == nil || !strings.Contains(err.Error(), want) {
+		if _, err := in.SeedVM(context.Background(), &VMCreate{Platform: platform, Hostname: "notes-1", SSHKey: v.key}, ""); err == nil || !strings.Contains(err.Error(), want) ||
+			!strings.HasPrefix(refusedFix(err), "give --platform one of truenas, ") {
 			t.Errorf("%q: %v", platform, err)
 		}
 	}
@@ -569,39 +574,106 @@ func TestKnownHostsLine(t *testing.T) {
 // client as a failure, with no fix: the VM has neither.
 func TestTheDaemonAnswersNoDockerFix(t *testing.T) {
 	t.Parallel()
-	// A rollback the dry run refuses as another project's install.
-	e, d, _ := upgradedVM(t)
-	env := e.readEnv()
-	env.Set("STOWAGE_NAME", "other")
-	if err := env.WriteFile(filepath.Join(e.dir, envName)); err != nil {
-		t.Fatal(err)
+	// A rollback the dry run refuses as another project's install, or one another installer keeps.
+	for key, want := range map[string]string{"STOWAGE_NAME": `holds an install of "other"`, "STOWAGE_SHORT_NAME": "kept by other-stow"} {
+		e, d, _ := upgradedVM(t)
+		env := e.readEnv()
+		env.Set(key, "other")
+		if err := env.WriteFile(filepath.Join(e.dir, envName)); err != nil {
+			t.Fatal(err)
+		}
+		var got errOf
+		if code := call(t, d.Handler(), "GET", "/v1/rollback", nil, &got); code != 409 || !strings.Contains(got.Error, want) || got.Fix != "" {
+			t.Errorf("%s: %d %+v", key, code, got)
+		}
+		stdout, _, err := ctlSplit(e, servedHandler(t, d.Handler()), "rollback", "--yes", "--json")
+		if err == nil || isRefused(err) || stdout != "" {
+			t.Errorf("%s client: %v\n%s", key, err, stdout)
+		}
 	}
-	var got errOf
-	if code := call(t, d.Handler(), "GET", "/v1/rollback", nil, &got); code != 409 || !strings.Contains(got.Error, `holds an install of "other"`) || got.Fix != "" {
-		t.Errorf("rollback: %d %+v", code, got)
+	// Answered as it is, or as failAs makes it.
+	for _, err := range []error{dockerRefusal("give the --dir of an install of notes", "no"), failAs(409, dockerRefusal("give the --dir of an install of notes", "no"))} {
+		w := httptest.NewRecorder()
+		replyErr(w, err)
+		if strings.Contains(w.Body.String(), "fix") {
+			t.Errorf("%v: %s", err, w.Body)
+		}
 	}
-	// An upgrade after a crossing whose boot fell back, whose kept installer is not the release
-	// the install runs.
-	p := vmPublished(t, spec.Provider{Name: "none"}, nil)
-	env = p.env.readEnv()
-	env.Set("STOWAGE_PROJECT_VERSION", "2.0.0")
-	if err := env.WriteFile(filepath.Join(p.env.dir, envName)); err != nil {
-		t.Fatal(err)
+}
+
+// The rollback's dry run's refusals whose fix holds on the VM keep it: another run under way, the
+// volumes half restored. The client exits 3 on them, its Result naming the fix.
+func TestTheDaemonKeepsTheRollbacksVMFix(t *testing.T) {
+	t.Parallel()
+	for name, c := range map[string]struct {
+		set func(t *testing.T, e *env) func()
+		fix string
+	}{
+		"locked": {func(t *testing.T, e *env) func() {
+			unlock, err := lockFile(filepath.Join(e.dir, lifecycleLock))
+			if err != nil {
+				t.Fatal(err)
+			}
+			return unlock
+		}, "wait for the run under way to finish, then run again"},
+		"half restored": {func(t *testing.T, e *env) func() {
+			if err := os.WriteFile(filepath.Join(e.dir, volumesSplitFile), []byte("x\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			return func() {}
+		}, "finish the restore (run it again), then run again"},
+	} {
+		e, d, _ := upgradedVM(t)
+		defer c.set(t, e)()
+		var got errOf
+		if code := call(t, d.Handler(), "GET", "/v1/rollback", nil, &got); code != 409 || got.Fix != c.fix {
+			t.Errorf("%s: %d %+v", name, code, got)
+		}
+		stdout, _, err := ctlSplit(e, servedHandler(t, d.Handler()), "rollback", "--yes", "--json")
+		var res Result
+		strictJSON(t, stdout, &res)
+		if !isRefused(err) || res.Result != ResultNothing || res.Refused == nil || res.Refused.Fix != c.fix {
+			t.Errorf("%s client: %v %+v", name, err, res)
+		}
 	}
-	p.releaseOf("2.1.0", func(*spec.Spec) {})
-	host := &fakeHost{}
-	got = errOf{}
-	if code := call(t, daemon(p.env, host).Handler(), "POST", "/v1/upgrade", UpgradeRequest{Channel: "stable"}, &got); code != 409 || !strings.Contains(got.Error, "is not the installer of notes 2.0.0") || got.Fix != "" {
-		t.Errorf("upgrade: %d %+v", code, got)
-	}
-	if len(host.calls()) > 0 {
-		t.Errorf("ran %v", host.calls())
+}
+
+// An upgrade whose install runs a release its kept installer does not carry is refused with the
+// VM's way out when that release comes after the OS's (a crossing whose boot fell back): its OS
+// written again, whose boot keeps its installer. An earlier one has no such way: a failure. Neither
+// names the Docker installer's --dir.
+func TestTheDaemonRefusesAKeptInstallerOfAnotherRelease(t *testing.T) {
+	t.Parallel()
+	for version, fix := range map[string]string{
+		"2.0.0": "write the OS of the release the install runs again (upgrade --version 2.0.0): its boot keeps that release's installer",
+		"0.9.0": "",
+	} {
+		p := vmPublished(t, spec.Provider{Name: "none"}, nil)
+		env := p.env.readEnv()
+		env.Set("STOWAGE_PROJECT_VERSION", version)
+		if err := env.WriteFile(filepath.Join(p.env.dir, envName)); err != nil {
+			t.Fatal(err)
+		}
+		p.releaseOf("2.1.0", func(*spec.Spec) {})
+		host := &fakeHost{}
+		var got errOf
+		code := call(t, daemon(p.env, host).Handler(), "POST", "/v1/upgrade", UpgradeRequest{Channel: "stable"}, &got)
+		if code != 409 || !strings.Contains(got.Error, "is not the installer of notes "+version) || got.Fix != fix ||
+			strings.Contains(got.Error, "--dir") || strings.Contains(got.Error, "re-run") {
+			t.Errorf("%s: %d %+v", version, code, got)
+		}
+		if fix != "" && !strings.HasSuffix(got.Error, "`notes-stow upgrade --version 2.0.0` writes its OS again") {
+			t.Errorf("%s: %s", version, got.Error)
+		}
+		if len(host.calls()) > 0 {
+			t.Errorf("%s: ran %v", version, host.calls())
+		}
 	}
 }
 
 // status reads the installer the install keeps once per release and file: a request after it
-// reads nothing (a file changed in place but alike in size and time is not read again), and a
-// file changed is read again.
+// reads nothing (a file changed in place but alike in size and time is not read again), a file
+// changed is read again, and a read that failed again at each request.
 func TestVMStatusReadsTheKeptInstallerOnce(t *testing.T) {
 	t.Parallel()
 	e := vmEnv(t, "1.0.0")
@@ -632,6 +704,10 @@ func TestVMStatusReadsTheKeptInstallerOnce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	orig, err := os.ReadFile(kept)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(kept, bytes.Repeat([]byte("x"), int(fi.Size())), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -641,8 +717,10 @@ func TestVMStatusReadsTheKeptInstallerOnce(t *testing.T) {
 	if got := inputs(); !slices.Equal(got, []string{"ADMIN_EMAIL"}) || log.Len() != 0 {
 		t.Errorf("read again: %v\n%s", got, log.String())
 	}
-	// Changed: read again, its error logged in the daemon's log once.
-	if err := os.Chtimes(kept, fi.ModTime().Add(time.Second), fi.ModTime().Add(time.Second)); err != nil {
+	// Changed: read again, its error logged in the daemon's log; a read that failed is not kept,
+	// so each request reads it again, and the installer put back (alike in size and time) reads.
+	later := fi.ModTime().Add(time.Second)
+	if err := os.Chtimes(kept, later, later); err != nil {
 		t.Fatal(err)
 	}
 	for range 2 {
@@ -650,7 +728,55 @@ func TestVMStatusReadsTheKeptInstallerOnce(t *testing.T) {
 			t.Errorf("%v", got)
 		}
 	}
-	if n := strings.Count(log.String(), "the installer the install keeps"); n != 1 {
+	if n := strings.Count(log.String(), "the installer the install keeps"); n != 2 {
 		t.Errorf("logged %d times:\n%s", n, log.String())
+	}
+	if err := os.WriteFile(kept, orig, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(kept, later, later); err != nil {
+		t.Fatal(err)
+	}
+	if got := inputs(); !slices.Equal(got, []string{"ADMIN_EMAIL"}) {
+		t.Errorf("put back: %v", got)
+	}
+}
+
+// A re-run of the install by the installer of another release is refused with a fix that runs a
+// Docker install's installers: on the VM, a failure (no Result, not exit 3), its message kept.
+func TestTheVMsInstallOfAnotherReleaseIsAFailure(t *testing.T) {
+	t.Parallel()
+	for name, run := range map[string]func(t *testing.T) error{
+		"an earlier installer": func(t *testing.T) error {
+			e := upgraded(t)
+			e.r, e.self = testInstaller(t, "1.0.0")
+			return e.install(nil)
+		},
+		"a later installer": func(t *testing.T) error {
+			e := installed(t)
+			e.to("2.0.0", nil)
+			return e.install(nil)
+		},
+		"the kept installer of a stopped upgrade": func(t *testing.T) error {
+			e := installed(t)
+			e.to("2.0.0", nil)
+			e.self = filepath.Join(t.TempDir(), "gone")
+			if err := e.upgrade(nil); err == nil {
+				t.Fatal("upgraded")
+			}
+			e.r, e.self = testInstaller(t, "1.0.0")
+			return e.install(nil)
+		},
+	} {
+		err := run(t)
+		if r, ok := Refusal(err); !ok || !r.dockerOnly {
+			t.Errorf("%s: %#v", name, err)
+		}
+		if got := vmRefusal(err); got == nil || isRefused(got) || got.Error() != err.Error() {
+			t.Errorf("%s on the VM: %#v", name, got)
+		}
+	}
+	if err := vmRefusal(refuse("do this", "no")); !isRefused(err) {
+		t.Errorf("another refusal: %v", err)
 	}
 }

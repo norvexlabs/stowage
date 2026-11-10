@@ -866,10 +866,16 @@ Stowage calls a project's programs: the two never share a reader.
   before anything changed, after the OS fell back), claiming no change itself, only when no step
   of the boot before it changed anything (a mark it removed counts; a removal that found none
   does not); else, and on any other status of an installer it runs, it fails. A refusal the
-  daemon answers carries a fix that is true on the VM: one whose fix names the Docker installer's
-  `--dir` or its kept installer (a dry-run rollback's, a kept installer that is not the release
-  the install runs) is answered as a failure, with no fix — the rollback check's refusal and the
-  shape-neutral ones (a registry's, a restore's) keep theirs.
+  daemon answers carries a fix that is true on the VM: a refusal whose fix runs the Docker
+  installer with `--dir` or the installer the install keeps is marked so where it is raised
+  (another project's install, one kept by another installer name, a rollback run by an installer
+  the install does not keep, a re-run by another release's installer), and the daemon answers it
+  as a failure, with no fix, as the VM's `install` returns it; every other keeps its own (another
+  run under way, a container an earlier run left, half restored volumes, a kept previous release
+  that is not one, the rollback check's, a registry's). A kept installer that is not the release
+  the install runs has the VM's own way out when that release comes after the OS's (a crossing
+  whose boot fell back): `upgrade --version` writes its OS again, whose boot keeps its installer
+  — a refusal with that fix; otherwise a failure.
 - **`vm seed --json`** — a VM's first-boot material without creating the VM, for a tool that
   creates it with its own means: `{format, platform, user_data, known_hosts_line, fingerprint,
   host_key_private, disk: {<platform>: {format, image}}, waiting: [<key>]}` — the user-data for `--platform` (the

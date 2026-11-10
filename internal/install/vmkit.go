@@ -33,6 +33,9 @@ type vmLink struct {
 	ssh             Tool
 	user, pub, addr string
 	known, alias    string
+	// line is the known_hosts line --known-hosts-line gave, as givenKnownHosts wrote it; empty
+	// without one.
+	line string
 }
 
 // VMReach names a VM and how SSH reaches it: vm create's defaults, the host name. KnownHostsLine,
@@ -66,7 +69,7 @@ func (in *Installer) link(r VMReach) (*vmLink, error) {
 		return nil, fmt.Errorf("--host %q: a host name or an address", l.addr)
 	}
 	if r.KnownHostsLine != "" {
-		if l.known, l.alias, err = o.givenKnownHosts(in.R.Spec.Name, r.KnownHostsLine); err != nil {
+		if l.known, l.alias, l.line, err = o.givenKnownHosts(in.R.Spec.Name, r.KnownHostsLine); err != nil {
 			return nil, err
 		}
 		return l, nil
@@ -88,41 +91,42 @@ var knownHostName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,252}$`)
 // givenKnownHosts checks line, the one known_hosts line --known-hosts-line gives — a host name and
 // a public key, no marker — and writes it, the name lower-cased as ssh matches it, into a file of
 // its own: $XDG_STATE_HOME/<name>/known-hosts/<its digest>, written whole, so a run giving the
-// same line meets the same file. alias is the line's host name, which ssh looks the key up by.
-func (o *Options) givenKnownHosts(name, line string) (file, alias string, err error) {
+// same line meets the same file. alias is the line's host name, which ssh looks the key up by;
+// written the line written, without its line end.
+func (o *Options) givenKnownHosts(name, line string) (file, alias, written string, err error) {
 	// One line end is taken off, a Windows one (CRLF) too.
 	line = strings.TrimSuffix(strings.TrimSuffix(line, "\n"), "\r")
 	if strings.ContainsAny(line, "\r\n") {
-		return "", "", errors.New("--known-hosts-line: one line")
+		return "", "", "", errors.New("--known-hosts-line: one line")
 	}
 	marker, hosts, key, _, _, err := ssh.ParseKnownHosts([]byte(line))
 	switch {
 	case err != nil:
-		return "", "", fmt.Errorf("--known-hosts-line: not a known_hosts line (HOST KEYTYPE BASE64): %w", err)
+		return "", "", "", fmt.Errorf("--known-hosts-line: not a known_hosts line (HOST KEYTYPE BASE64): %w", err)
 	case marker != "":
-		return "", "", fmt.Errorf("--known-hosts-line: a host key, not a @%s line", marker)
+		return "", "", "", fmt.Errorf("--known-hosts-line: a host key, not a @%s line", marker)
 	case len(hosts) != 1 || !knownHostName.MatchString(hosts[0]):
-		return "", "", fmt.Errorf("--known-hosts-line: its host field %q is not one host name or address (no pattern, list, hashed name or [host]:port)", strings.Join(hosts, ","))
+		return "", "", "", fmt.Errorf("--known-hosts-line: its host field %q is not one host name or address (no pattern, list, hashed name or [host]:port)", strings.Join(hosts, ","))
 	}
 	alias = strings.ToLower(hosts[0])
 	text := alias + " " + strings.TrimSpace(string(ssh.MarshalAuthorizedKey(key))) + "\n"
 	base, err := o.xdgDir("XDG_STATE_HOME", filepath.Join(".local", "state"), "the VM's host key")
 	if err != nil {
-		return "", "", err
+		return "", "", "", err
 	}
 	dir := filepath.Join(base, name, "known-hosts")
 	if err := sshPathOK(dir); err != nil {
-		return "", "", fmt.Errorf("%w (set XDG_STATE_HOME elsewhere)", err)
+		return "", "", "", fmt.Errorf("%w (set XDG_STATE_HOME elsewhere)", err)
 	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return "", "", err
+		return "", "", "", err
 	}
 	sum := sha256.Sum256([]byte(text))
 	file = filepath.Join(dir, hex.EncodeToString(sum[:16]))
 	if err := writeAtomic(file, strings.NewReader(text), 0o600, nil); err != nil {
-		return "", "", err
+		return "", "", "", err
 	}
-	return file, alias, nil
+	return file, alias, strings.TrimSuffix(text, "\n"), nil
 }
 
 // args are ssh's arguments running command on the VM; ssh joins command's words for the VM's

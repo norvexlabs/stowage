@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"slices"
-	"strings"
 
 	"github.com/norvexlabs/stowage/internal/lint"
 )
@@ -48,17 +47,10 @@ func (in *Installer) SeedVM(ctx context.Context, c *VMCreate, channel string) (*
 	if err := in.seedable(); err != nil {
 		return nil, err
 	}
-	// The flags' own refusals come before the registry is read; which platforms its disks serve
-	// is checked after (platform).
-	var keys []string
-	for _, pl := range Platforms {
-		keys = append(keys, pl.Key)
-	}
-	switch {
-	case c.Platform == "":
-		return nil, fmt.Errorf("--platform is required (%s)", strings.Join(keys, ", "))
-	case !slices.Contains(keys, c.Platform):
-		return nil, fmt.Errorf("--platform %s: one of %s", c.Platform, strings.Join(keys, ", "))
+	// A --platform missing or that Stowage does not know is refused before the registry is read;
+	// one whose disk the registry lacks, after (platform).
+	if err := checkPlatform(c.Platform, Platforms, "one of"); err != nil {
+		return nil, err
 	}
 	prefix, cl, err := in.seedRegistry(ctx)
 	if err != nil {

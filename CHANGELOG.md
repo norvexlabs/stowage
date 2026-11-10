@@ -25,6 +25,11 @@ follow [SemVer](https://semver.org/).
   names, never a value); `install`, `upgrade` and `rollback` take `--json`, and every verb exits 3
   on a refusal, the host daemon's included (its error answer now carries the fix). A boot whose
   rollback check refuses after the OS fell back exits 3 when it changed nothing before it, else 1.
+  A refusal whose fix only holds for a Docker install (another installer to run with `--dir`) is
+  a failure on the VM, with no fix; an upgrade after a crossing whose boot fell back, whose kept
+  installer is not the release the install runs, is refused naming the VM's way out
+  (`upgrade --version` of that release). `vm seed` and `vm create` refuse a missing or unknown
+  `--platform` with exit 3.
 - `vm seed --json`: a new VM's first-boot material for a tool that creates the VM itself — the
   cloud-config (no secret input), a one-time SSH host key with its `known_hosts` line and
   fingerprint, the disk image each platform boots, by digest, and the secret inputs the first

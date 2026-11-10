@@ -71,11 +71,9 @@ func (h *Hostd) checkUpgrade(ctx context.Context, in *Installer, env *EnvFile, m
 	// crossing whose boot fell back — the later one its own installer carries.
 	var running baselined = in
 	if this := in.R.Manifest; v != this.ProjectVersion || rev != strconv.Itoa(this.Revision) {
-		kept, err := in.keptInstaller(ctx, name, v, rev)
+		kept, err := in.vmKeptInstaller(ctx, name, v, rev)
 		if err != nil {
-			// Its refusal's fix runs an installer with --dir, which the VM has neither of: a
-			// failure, with no fix.
-			return fail(http.StatusConflict, "%v", err)
+			return failAs(http.StatusConflict, err)
 		}
 		running = kept
 	}

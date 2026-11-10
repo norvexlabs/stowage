@@ -162,29 +162,39 @@ func isRelease(m *release.Manifest, name, version string, revision int) bool {
 // kept one's); nil when neither carries it. No kept installer is said by the fields left out; one
 // that does not read is logged.
 func (in *Installer) carriedRelease(name, version string, revision int) (*release.Manifest, *spec.Spec) {
+	m, s, err := in.readCarried(name, version, revision)
+	if err != nil {
+		in.O.logf("%v", err)
+	}
+	return m, s
+}
+
+// readCarried is carriedRelease, its error the kept installer's that did not read (a later read
+// may not fail): none when it is absent, or carries another release. One that carries the release
+// in a spec this Stowage does not read is logged, its manifest returned alone.
+func (in *Installer) readCarried(name, version string, revision int) (*release.Manifest, *spec.Spec, error) {
 	if isRelease(in.R.Manifest, name, version, revision) {
-		return in.R.Manifest, in.R.Spec
+		return in.R.Manifest, in.R.Spec, nil
 	}
 	files, err := payload.Read(in.ctl())
 	if errors.Is(err, os.ErrNotExist) {
-		return nil, nil
+		return nil, nil, nil
 	}
 	var k *keptRelease
 	if err == nil {
 		k, err = keptOf(files)
 	}
 	if err != nil {
-		in.O.logf("the installer the install keeps, %s: %v", in.ctl(), err)
-		return nil, nil
+		return nil, nil, fmt.Errorf("the installer the install keeps, %s: %w", in.ctl(), err)
 	}
 	if !isRelease(k.Manifest, name, version, revision) {
-		return nil, nil
+		return nil, nil, nil
 	}
 	if k.Release == nil {
 		in.O.logf("the installer the install keeps, %s: %v", in.ctl(), k.unread)
-		return k.Manifest, nil
+		return k.Manifest, nil, nil
 	}
-	return k.Manifest, k.Release.Spec
+	return k.Manifest, k.Release.Spec, nil
 }
 
 // StatusJSON prints the Docker install's status as one JSON object (DockerStatus).

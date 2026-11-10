@@ -433,7 +433,7 @@ func (in *Installer) AttachVM(ctx context.Context, a *VMAttach) error {
 		waitFlag = a.Wait.String()
 	}
 	again := shellQuote(a.Ctl) + " vm attach " + a.Host + " --interface " + shellQuote(a.Interface)
-	for _, f := range []struct{ flag, v string }{{"--host", a.Address}, {"--user", a.User}, {"--ssh-key", keyFlag}, {"--known-hosts-line", a.KnownHostsLine}, {"--wait", waitFlag}} {
+	for _, f := range []struct{ flag, v string }{{"--host", a.Address}, {"--user", a.User}, {"--ssh-key", keyFlag}, {"--known-hosts-line", l.line}, {"--wait", waitFlag}} {
 		if f.v != "" {
 			again += " " + f.flag + " " + shellQuote(f.v)
 		}

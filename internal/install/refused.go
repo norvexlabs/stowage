@@ -19,6 +19,9 @@ type Refused struct {
 	Reason, Fix string
 	// cause is the error the refusal was made of (refusal), which errors.Is and errors.As reach.
 	cause error
+	// dockerOnly: Fix holds for a Docker install alone, naming its installer's --dir or the
+	// installer it keeps (dockerRefusal); the VM's host daemon answers it as a failure, with no fix.
+	dockerOnly bool
 }
 
 func (e Refused) Error() string { return e.Reason }
@@ -94,6 +97,21 @@ func refuse(fix, format string, a ...any) error {
 	return refusal(fix, fmt.Errorf(format, a...))
 }
 
+// dockerRefusal is refuse's refusal whose fix holds for a Docker install alone (Refused.dockerOnly).
+func dockerRefusal(fix, format string, a ...any) error {
+	err := fmt.Errorf(format, a...)
+	return Refused{Reason: err.Error(), Fix: fix, cause: err, dockerOnly: true}
+}
+
+// vmRefusal is err as a verb run on the VM returns it: a refusal whose fix holds for a Docker
+// install alone (Refused.dockerOnly) is a failure there, its message kept.
+func vmRefusal(err error) error {
+	if r, ok := Refusal(err); ok && r.dockerOnly {
+		return errors.New(err.Error())
+	}
+	return err
+}
+
 // As makes a rollback check's refusal a Refused, so it exits 3 as every refusal does.
 func (e rollbackRefused) As(target any) bool {
 	r, ok := target.(*Refused)
@@ -146,6 +164,21 @@ type verbKind struct{ k8s, uninstall bool }
 // the Result is made: it gives in the options as parsed when the run refused before it took them
 // (a flag's refusal, prepare's), so the Result reads the install they name.
 func machineVerb(c *cobra.Command, asJSON *bool, out io.Writer, in *Installer, kind verbKind, ready func()) {
+	endsOn(c, func(cmd *cobra.Command, err error) error {
+		if !*asJSON {
+			return err
+		}
+		if ready != nil {
+			ready()
+		}
+		return in.printResult(cmd.Context(), out, kind, err)
+	})
+}
+
+// endsOn makes c run its PreRunE, then its RunE when that passed, and return what finish makes of
+// the first one's error (nil when both passed): a verb's every outcome, a PreRunE's refusal
+// included, reaches finish.
+func endsOn(c *cobra.Command, finish func(cmd *cobra.Command, err error) error) {
 	pre, run := c.PreRunE, c.RunE
 	c.PreRunE = nil
 	c.RunE = func(cmd *cobra.Command, args []string) error {
@@ -157,13 +190,7 @@ func machineVerb(c *cobra.Command, asJSON *bool, out io.Writer, in *Installer, k
 			}
 			return run(cmd, args)
 		}()
-		if !*asJSON {
-			return err
-		}
-		if ready != nil {
-			ready()
-		}
-		return in.printResult(cmd.Context(), out, kind, err)
+		return finish(cmd, err)
 	}
 }
 

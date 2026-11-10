@@ -1194,7 +1194,8 @@ func (in *Installer) provisionUp(ctx context.Context, env *EnvFile, h *providers
 	return nil
 }
 
-// sameRelease refuses an install of another release: changing release is an upgrade.
+// sameRelease refuses an install of another release: changing release is an upgrade. Its fixes run
+// a Docker install's installers (dockerRefusal).
 func (in *Installer) sameRelease(ctx context.Context, env *EnvFile) error {
 	m := in.R.Manifest
 	name, v, rev, err := sameProject(in.O.Dir, env, m)
@@ -1204,11 +1205,11 @@ func (in *Installer) sameRelease(ctx context.Context, env *EnvFile) error {
 	if v != m.ProjectVersion || rev != strconv.Itoa(m.Revision) {
 		if in.newer(v, rev) != nil {
 			if _, err := in.keptInstaller(ctx, name, m.ProjectVersion, strconv.Itoa(m.Revision)); err == nil {
-				return refuse(fmt.Sprintf("run the installer of %s %s with --dir %s", name, v, in.O.Dir), "%s runs %s %s (revision %s), and keeps this installer, of %s (revision %d): the upgrade stopped before keeping its own; run the installer of %s with --dir %s", in.O.Dir, name, v, rev, m.ProjectVersion, m.Revision, v, in.O.Dir)
+				return dockerRefusal(fmt.Sprintf("run the installer of %s %s with --dir %s", name, v, in.O.Dir), "%s runs %s %s (revision %s), and keeps this installer, of %s (revision %d): the upgrade stopped before keeping its own; run the installer of %s with --dir %s", in.O.Dir, name, v, rev, m.ProjectVersion, m.Revision, v, in.O.Dir)
 			}
-			return refuse(in.ctl()+" --dir "+in.O.Dir, "%s runs %s %s (revision %s), after this installer's %s (revision %d): run the installer it keeps, %s", in.O.Dir, name, v, rev, m.ProjectVersion, m.Revision, in.ctl())
+			return dockerRefusal(in.ctl()+" --dir "+in.O.Dir, "%s runs %s %s (revision %s), after this installer's %s (revision %d): run the installer it keeps, %s", in.O.Dir, name, v, rev, m.ProjectVersion, m.Revision, in.ctl())
 		}
-		return refuse(cmp.Or(in.O.Self, in.R.Ctl())+" upgrade --dir "+in.O.Dir, "%s runs %s %s (revision %s); this installer carries %s (revision %d): `%s upgrade --dir %s` moves it to this release", in.O.Dir, name, v, rev, m.ProjectVersion, m.Revision, cmp.Or(in.O.Self, in.R.Ctl()), in.O.Dir)
+		return dockerRefusal(cmp.Or(in.O.Self, in.R.Ctl())+" upgrade --dir "+in.O.Dir, "%s runs %s %s (revision %s); this installer carries %s (revision %d): `%s upgrade --dir %s` moves it to this release", in.O.Dir, name, v, rev, m.ProjectVersion, m.Revision, cmp.Or(in.O.Self, in.R.Ctl()), in.O.Dir)
 	}
 	return nil
 }

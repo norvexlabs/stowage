@@ -89,19 +89,14 @@ func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(
 	// vmVerb makes cmd run its PreRunE, then run, and end on c.result: under --json every outcome,
 	// a PreRunE's refusal included, prints one Result. run tells whether there was nothing to do.
 	vmVerb := func(cmd *cobra.Command, run func(ctx context.Context) (nothing bool, err error)) {
-		pre := cmd.PreRunE
-		cmd.PreRunE = nil
-		cmd.RunE = func(cmd *cobra.Command, args []string) error {
-			var nothing bool
-			var err error
-			if pre != nil {
-				err = pre(cmd, args)
-			}
-			if err == nil {
-				nothing, err = run(cmd.Context())
-			}
-			return c.result(cmd.Context(), resultJSON, stderr, err, nothing)
+		var nothing bool
+		cmd.RunE = func(cmd *cobra.Command, _ []string) (err error) {
+			nothing, err = run(cmd.Context())
+			return err
 		}
+		endsOn(cmd, func(cmd *cobra.Command, err error) error {
+			return c.result(cmd.Context(), resultJSON, stderr, err, nothing)
+		})
 	}
 	root := &cobra.Command{
 		Use:           c.ctl,
@@ -162,7 +157,7 @@ func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(
 			in.O.Prompt = prompt
 			in.O.Cert, in.O.Key, in.O.CA, in.O.ClientCA = expandHome(in.O.Cert), expandHome(in.O.Key), expandHome(in.O.CA), expandHome(in.O.ClientCA)
 			if err := in.Install(cmd.Context()); err != nil {
-				return err
+				return vmRefusal(err)
 			}
 			in.retune(cmd.Context(), vmTune(r.Ctl()), stderr)
 			in.Finished(cmd.Context(), onVM)

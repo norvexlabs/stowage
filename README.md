@@ -3900,7 +3900,7 @@ A kit carries what one install issues to another (inputs, the front's TLS materi
 - A kit is taken by `--kit` on an install: its format, its code's sources and its refusals are under the Docker shape's `--kit`. Each `gives` key is checked by the target's installer: an input of another shape left out and said, one it does not declare refused.
 - `kit check` runs the handoff's `check` likewise, with the `STOWAGE_KIT_*` variables and its `env`, not what `ask` asked, its stdout thrown away unread and unbounded: `HANDOFF INSTANCE: proven` (exit 0), `unknown` (its exit 2, exit 2), `not proven (its check, or starting it, exited N)` (exit 1). A check stopped by its timeout, a check on Kubernetes that could not start or died by a signal (its Job records -1, its log saying why), a Job that fails altogether, an API server or Docker daemon that does not answer, a command's wrong arguments or flags and a handoff without `check` give no answer: `unknown` where it ran that far, exit 2, the reason on stderr (`error: …`), never read as not proven. On Docker and the VM, `docker compose` failing to start the check reads as its own exit status, so as not proven, the reason on stderr.
 - On the VM these go through the host daemon, on the operators' socket alone: `POST /v1/kits` (a `KitRequest`: `handoff`, `instance`, `answers`, `expires` in nanoseconds; answers `kit`, `code`, `log`, its only copy, the log cut at 1 MiB) and `POST /v1/kits/check` (`handoff`, `instance`; answers `exit`, `log`). The app's socket answers 403. The file is written where `kit create` runs. The VM's `kit create HANDOFF --json` writes no file: it reads that request (`instance`, `answers`, `expires`; strict, at most 1 MiB, one JSON object; a `handoff` other than the command's refused) on standard input and writes the daemon's answer (`kit`, `code`, `log`) as one JSON object on standard output; `--name`, `--expires`, `-o`, `--set` and `--answers` with it are refused. It is what `vm kit create` runs over SSH.
-- **`--known-hosts-line LINE`** (`vm kit create`, `check` and `take`, `vm attach`) gives the VM's SSH host key as one `known_hosts` line, `HOST KEYTYPE BASE64` (`vm seed --json`'s `known_hosts_line`, or the VM's own key checked on its console), in place of the key `vm create` recorded: a VM `vm create` did not make, or made elsewhere. That key alone is accepted, under the line's host name (`HostKeyAlias`, lower-cased), `StrictHostKeyChecking=yes`, never `accept-new`. The line is refused before any connection unless it holds one host name or address (`--known-hosts-line: its host field "…" is not one host name or address (no pattern, list, hashed name or [host]:port)`) and a key (`not a known_hosts line (HOST KEYTYPE BASE64)`), with no marker (`a host key, not a @cert-authority line`) and no second line (`one line`; one line end, LF or CRLF, is taken off). A `vm attach` message naming the command to run again carries the same `--known-hosts-line`. It is written to `$XDG_STATE_HOME/<name>/known-hosts/<its digest>` (`~/.local/state` by default; 0600, its directory 0700), the file ssh reads, which the `ssh` command a message gives names too. The one-time key of a seed retires once the VM's install is done and it rebooted: from then on, give the VM's own key.
+- **`--known-hosts-line LINE`** (`vm kit create`, `check` and `take`, `vm attach`) gives the VM's SSH host key as one `known_hosts` line, `HOST KEYTYPE BASE64` (`vm seed --json`'s `known_hosts_line`, or the VM's own key checked on its console), in place of the key `vm create` recorded: a VM `vm create` did not make, or made elsewhere. That key alone is accepted, under the line's host name (`HostKeyAlias`, lower-cased), `StrictHostKeyChecking=yes`, never `accept-new`. The line is refused before any connection unless it holds one host name or address (`--known-hosts-line: its host field "…" is not one host name or address (no pattern, list, hashed name or [host]:port)`) and a key (`not a known_hosts line (HOST KEYTYPE BASE64)`), with no marker (`a host key, not a @cert-authority line`) and no second line (`one line`; one line end, LF or CRLF, is taken off). A `vm attach` message naming the command to run again carries the same `--known-hosts-line`, as it is written (below: its name lower-cased, its line end and any comment off). It is written to `$XDG_STATE_HOME/<name>/known-hosts/<its digest>` (`~/.local/state` by default; 0600, its directory 0700), the file ssh reads, which the `ssh` command a message gives names too. The one-time key of a seed retires once the VM's install is done and it rebooted: from then on, give the VM's own key.
 - **`vm kit`**, on the operator's machine, reaches a VM `vm create` made over SSH as `vm attach` does (`--user`, `--ssh-key`, `--host`; strictly checked against the key `--known-hosts-line` gives, else the host key `vm create` recorded for that address in the VM's state directory, `known_hosts`, the address its alias (`HostKeyAlias`): ssh refuses another key, and an address it holds none for; a state with no such file is refused before any connection, naming the file a key checked on the VM's console goes in. `vm kit create` tries the link with ssh itself, running the sudo every run takes (`sudo -n <short>-stow --help`), before it asks anything or makes its file, so a VM ssh cannot reach, or whose key it refuses, costs no answer (`U@H does not answer over SSH, or does not run sudo without a password: … (--host, --user and --ssh-key reach it as vm create did; its key is the one in <file>; or its sudoers does not let the user run `<short>-stow` without a password)`); an empty `known_hosts` (an install finished by hand) is refused as none. The operator's global known hosts are never read on these links, nor on `vm create`'s, and `vm create` records the VM's key under that same alias (whatever the operator's ssh configuration makes of the name: `Port`, `HostName`), in the clear). `vm kit create HOSTNAME HANDOFF` takes `kit create`'s flags and checks, refuses a VM it cannot reach that way before it asks anything, asks what the handoff asks here, creates the kit's file here (0600, never over a file) before the run, then runs `sudo <short>-stow kit create HANDOFF --json` on the VM, the request on standard input (an answer, a secret one included, never on a command line, which the VM's process list and journal would show); the kit is written here and its code printed here, and neither touches the VM's disk. ssh failing, or an answer that does not read as a kit and a code (a field it does not know is no failure: the VM may run a newer release), writes no file and says what the run may have issued is lost. `vm kit check HOSTNAME HANDOFF INSTANCE` runs the VM's `kit check` and says its verdict as `kit check` does: its exit 0 and 1 are proven and not proven only with the verdict line it prints (`H I: proven`, `H I: not proven (its check, or starting it, exited N)`, whose N is said here as there), as `sudo` and ssh failing exit 1 or 255 too; its 2, ssh failing itself, a status without its verdict and any other status are unknown (exit 2), never not proven. `vm kit take HOSTNAME FILE|-` tries the link as `vm kit create` does, before it asks the code, then opens a kit here, its code from `--kit-code-file`, `STOWAGE_KIT_CODE` or the terminal (as `--kit`'s), refused here as `--kit` refuses one, and gives what it holds to `sudo <short>-stow install --given - --no-input` on the VM over SSH, the VM's install checking each input as `--given`'s (`installing on U@H over SSH with …`, the install's log following); the code never leaves this machine, and a failure names the `ssh` command over the same link (its options as the run's) running `sudo <short>-stow status`.
 - `k8s status` names a Secret an interrupted run left, not one holding a check's exit status alone (the next run clears that one) (`leftover  the Secret … holds what a handoff's run gave, a run under way or one interrupted: once none runs, kubectl delete job/… secret/… --ignore-not-found deletes it`), never its values; `k8s uninstall` deletes it and what stood beside it, for the handoffs the installer's release declares. A failure to read them is logged, and the status goes on.
 - After an install, each handoff is a tip: `` tip: `<short>-stow kit create NAME …` issues a kit for FOR: its install takes it with --kit FILE ``.
@@ -4090,11 +4090,12 @@ in the same installer (bootstrap it as above, then `sh <name>.sh vm create …`,
   the keys of the required secret inputs nothing gives (never a value; left out when there are
   none): the VM's first install waits for them, as `vm create` says, until they are given over
   SSH (`sudo <short>-stow install --given - --no-input`). `--platform` missing or not a platform
-  Stowage knows is refused before the registry is read; one the registry holds no disk for, after.
+  Stowage knows is refused before the registry is read; one the registry holds no disk for, after
+  (each exits 3, its fix naming the platforms to give).
 - The platform decides the disk format (the first of its formats the registry holds: a mirror
   carries the formats its `mirror export --disks` named) and how the cloud-config reaches the VM.
   Only the platforms the registry has a disk for are offered; a `--platform` whose formats the
-  release publishes but the registry lacks is refused with `--platform P: the <format> disk
+  release publishes but the registry lacks is refused (exit 3) with `--platform P: the <format> disk
   <digest> is not in <prefix> (…)` and the platforms it does offer:
 
   | `--platform` | disk | cloud-config |
@@ -4684,14 +4685,15 @@ sudo <short>-stow network attach --role ROLE --mac MAC [--mode dhcp|static|none]
   Docker shape does): `--secrets` with `--given` or `--kit`; a directory holding another
   project's `compose.yaml`, or that became an install meanwhile; a re-run given `--secrets`, or
   a first-install-only setting (`--address`, `--registry`, `--registry-ca`, `--channel`); a
-  re-run by the installer of another release than the one installed (an earlier one, or a later
-  one the install does not keep); a re-run's value its input refuses, a required input left
-  empty, or a new certificate that does not cover a route's domain; another project's install or
-  one kept by another installer name; another lifecycle run holding the lock, or a hook's or
+  re-run's value its input refuses, a required input left
+  empty, or a new certificate that does not cover a route's domain; another lifecycle run holding the lock, or a hook's or
   check's container an earlier run left; volumes a restore left half restored; a required input
   missing or a value its input refuses; ports in use, a front port that is an L4 route's, an L4
   route bound to an address the VM does not have, an existing `tls/`, `--ports`/`--address` or
-  `--http-port`/`--https-port` in the wrong TLS mode. On `upgrade`: `--given` or `--kit`;
+  `--http-port`/`--https-port` in the wrong TLS mode. A re-run by the installer of another
+  release than the one installed, and another project's install or one kept by another installer
+  name, are failures (`1`, no `--json` result) on the VM: the Docker shape's fix runs another
+  installer with `--dir`, which the VM has none of. On `upgrade`: `--given` or `--kit`;
   `--version V` refused here (`upgrade --version V: refused, the install went back from …`, or
   `… is not one this VM, which runs …, can be upgraded to …`); no terminal to confirm on without
   `--yes`; and what the host daemon refuses, below. On `rollback`: no terminal to confirm on
@@ -4704,12 +4706,23 @@ sudo <short>-stow network attach --role ROLE --mac MAC [--mode dhcp|static|none]
   no key the OS's `<short>-stow` trusts signed, to one that does not come after the OS's
   release, to one published without an OS bundle, to one the install went back from, to one at
   another schema baseline, to one the boot into it would refuse (its fix: change what the install records with a re-run of its install, `install --set` or `--answers`, or choose another release), and while
-  a restore left the volumes half restored; a rollback when the VM runs the passive system
-  already, when there is no passive system or no previous release kept, while the volumes are
-  half restored, and when the rollback check says no (a rollback barrier since the upgrade, or a
-  newer schema the previous release does not read); and on any verb a refusal of the Docker
-  shape's that its handler runs (another run holding the install's lock). A job running, a
-  reboot scheduled, a boot not judged yet, a daemon that does not answer: failures (`1`). Once
+  a restore left the volumes half restored; an upgrade of an install whose kept `<short>-stow`
+  is not the installer of the release it runs (another release's, or none it reads) when that
+  release comes after the OS's — a crossing whose boot fell back (`<dir>/<short>-stow is not the
+  installer of <name> <v> (revision <r>), which the install runs: …; `<short>-stow upgrade
+  --version <v>` writes its OS again`; its fix: write that OS again, whose boot keeps that
+  release's installer), and a failure otherwise; a rollback when the VM runs the passive system
+  already, when there is no passive system or no previous release kept, while another
+  lifecycle run holds the install's lock or a hook's or check's container an earlier run left is
+  there, while the volumes are half restored, when the kept previous release is not one release
+  (its installer, its record and its `.env` name others: look into the kept directory) or its
+  installer does not read its own release, and when the rollback check says no (a rollback
+  barrier since the upgrade, or a newer schema the previous release does not read); and on any
+  verb a refusal of the Docker shape's that its handler runs (another run holding the install's
+  lock). A refusal of the Docker shape's whose fix runs another installer with `--dir` or the
+  installer the install keeps (another project's install, one kept by another installer name) is
+  answered as a failure, with no fix. A job running, a reboot scheduled, a boot not judged yet, a
+  daemon that does not answer: failures (`1`). Once
   `upgrade`'s or `rollback`'s job started, anything that stops the verb is a failure, a refusal
   answered while it follows the job included. `boot-rollback` starts the database first, its
   first change, so the rollback's own check can read it: a directory holding no install exits
@@ -4718,7 +4731,9 @@ sudo <short>-stow network attach --role ROLE --mac MAC [--mode dhcp|static|none]
   volumes half restored, a rollback barrier since or a newer schema the previous release does
   not read) exits 1; with no database service, or when it finishes an upgrade or a rollback a
   reboot stopped (it starts nothing first), the rollback's refusals exit 3 as `rollback`'s.
-  `boot` exits 1 on any refusal it raises, a boot changing the install from its first step, and
+  `boot` exits 1 on any refusal it raises, a boot changing the install from its first step (an
+  install whose kept `<short>-stow` is not the installer of the release it runs says so, naming
+  `<short>-stow upgrade --version <v>` when that release comes after the OS's), and
   on whatever an installer it runs exits with — but `boot-rollback`'s 3 when the OS fell back
   to the release the last upgrade replaced: the rollback check said no before anything changed,
   so the boot exits 3 too, claiming no change, unless the boot itself removed a mark before it

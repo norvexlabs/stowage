@@ -1015,7 +1015,7 @@ func TestVMCreateBootsTheFormatsAMirrorCarries(t *testing.T) {
 	t.Parallel()
 	v := newVMCreate(t, "qcow2")
 	v.r.Manifest.Artifacts.Disks["raw"] = "sha256:" + strings.Repeat("e", 64)
-	if err := v.create(VMCreate{Platform: "aws", Out: t.TempDir()}, nil); err == nil || !strings.Contains(err.Error(), "--platform aws: the raw disk sha256:eeeeeeeeeeee is not in "+v.prefix) {
+	if err := v.create(VMCreate{Platform: "aws", Out: t.TempDir()}, nil); err == nil || !strings.Contains(err.Error(), "--platform aws: the raw disk sha256:eeeeeeeeeeee is not in "+v.prefix) || !isRefused(err) {
 		t.Errorf("a platform whose format is not there: %v", err)
 	}
 	if err := v.create(VMCreate{Platform: "truenas", Hostname: "notes-1", User: "ops"}, func(o *Options) { o.TLS = "internal" }); err != nil {

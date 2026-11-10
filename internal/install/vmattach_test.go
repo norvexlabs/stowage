@@ -305,12 +305,12 @@ func TestVMAttach(t *testing.T) {
 		}
 	}
 	// The command that checks it again carries the host key --known-hosts-line gave, without
-	// which it would not reach the VM.
+	// which it would not reach the VM: the line as written, its line end taken off.
 	vm(boot("1"), ok, ok)
 	r.tofu.calls, r.tofu.show = nil, `{"resource_changes": [{"address": "terraform_data.power", "change": {"actions": ["create"]}}]}`
 	const line = "vm-seed-host-key ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEAIlrmYko7n75rw1in9PSsqvQQwoVBxv2WjCA2q6yuS"
 	withLine := *a
-	withLine.KnownHostsLine = line
+	withLine.KnownHostsLine = line + "\r\n"
 	if err := in.AttachVM(ctx, &withLine); err == nil || !strings.Contains(err.Error(), "--ssh-key "+v.key+" --known-hosts-line '"+line+"' --wait 2s` again checks it") || !noApply() || !unchanged() {
 		t.Errorf("with --known-hosts-line: %v", err)
 	}

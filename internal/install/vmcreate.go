@@ -830,13 +830,6 @@ func (in *Installer) platform(ctx context.Context, key string) (Platform, string
 			offered = append(offered, p)
 		}
 	}
-	keys := func() string {
-		var ks []string
-		for _, p := range offered {
-			ks = append(ks, p.Key)
-		}
-		return strings.Join(ks, ", ")
-	}
 	if len(offered) == 0 {
 		return Platform{}, "", fmt.Errorf("no platform `vm create` knows boots the disk formats %s %s publishes", in.R.Spec.Name, in.R.Manifest.ProjectVersion)
 	}
@@ -854,24 +847,43 @@ func (in *Installer) platform(ctx context.Context, key string) (Platform, string
 		}
 		key = cmp.Or(a["--platform"], offered[0].Key)
 	}
-	if key == "" {
-		return Platform{}, "", fmt.Errorf("--platform is required (%s)", keys())
-	}
-	i := slices.IndexFunc(offered, func(p Platform) bool { return p.Key == key })
-	if i < 0 {
-		if j := slices.IndexFunc(Platforms, func(p Platform) bool { return p.Key == key }); j >= 0 {
-			for _, f := range Platforms[j].Formats {
-				if why := in.boot.missing[f]; why != nil {
-					return Platform{}, "", fmt.Errorf("--platform %s: %w; this registry offers %s", key, why, keys())
-				}
+	// A platform whose disk the release publishes but the registry lacks says which.
+	if j := slices.IndexFunc(Platforms, func(p Platform) bool { return p.Key == key }); j >= 0 && !slices.ContainsFunc(offered, func(p Platform) bool { return p.Key == key }) {
+		for _, f := range Platforms[j].Formats {
+			if why := in.boot.missing[f]; why != nil {
+				return Platform{}, "", refuse(platformFix(offered), "--platform %s: %w; this registry offers %s", key, why, platformKeys(offered))
 			}
 		}
-		return Platform{}, "", fmt.Errorf("--platform %s: %s %s offers %s", key, in.R.Spec.Name, in.R.Manifest.ProjectVersion, keys())
 	}
-	p := offered[i]
+	if err := checkPlatform(key, offered, fmt.Sprintf("%s %s offers", in.R.Spec.Name, in.R.Manifest.ProjectVersion)); err != nil {
+		return Platform{}, "", err
+	}
+	p := offered[slices.IndexFunc(offered, func(p Platform) bool { return p.Key == key })]
 	f := p.Formats[slices.IndexFunc(p.Formats, func(f string) bool { _, ok := held[f]; return ok })]
 	return p, f, nil
 }
+
+// checkPlatform refuses a --platform key that is empty, or none of among's (the platforms a run
+// can make a VM for); offers names among in its message.
+func checkPlatform(key string, among []Platform, offers string) error {
+	switch {
+	case key == "":
+		return refuse(platformFix(among), "--platform is required (%s)", platformKeys(among))
+	case !slices.ContainsFunc(among, func(p Platform) bool { return p.Key == key }):
+		return refuse(platformFix(among), "--platform %s: %s %s", key, offers, platformKeys(among))
+	}
+	return nil
+}
+
+func platformKeys(ps []Platform) string {
+	var ks []string
+	for _, p := range ps {
+		ks = append(ks, p.Key)
+	}
+	return strings.Join(ks, ", ")
+}
+
+func platformFix(ps []Platform) string { return "give --platform one of " + platformKeys(ps) }
 
 var userName = regexp.MustCompile(`^[a-z_][a-z0-9_-]{0,31}$`)
 

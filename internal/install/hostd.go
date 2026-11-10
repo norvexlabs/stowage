@@ -173,7 +173,7 @@ type Hostd struct {
 	bootRec bootCache
 	// carriedMu guards carriedKey and carriedSpec: the spec of the release installed as
 	// carriedRelease told it, for the release and the kept installer's file (its size and time)
-	// it was read from, so a status reads and logs it once per change.
+	// it was read from, so a status reads and logs it once per change (installedSpec).
 	carriedMu   sync.Mutex
 	carriedKey  string
 	carriedSpec *spec.Spec
@@ -688,7 +688,8 @@ func reply(w http.ResponseWriter, code int, v any) {
 }
 
 // replyErr answers err, with the code its httpError gives (500 without one); a refusal (Refused,
-// raised before the request changed anything) carries its fix too, which tells the client so.
+// raised before the request changed anything) carries its fix too, which tells the client so —
+// but one whose fix holds for a Docker install alone (Refused.dockerOnly), a failure here.
 func replyErr(w http.ResponseWriter, err error) {
 	code := http.StatusInternalServerError
 	var he httpError
@@ -696,16 +697,18 @@ func replyErr(w http.ResponseWriter, err error) {
 		code = he.code
 	}
 	body := map[string]string{"error": err.Error()}
-	if r, ok := Refusal(err); ok && r.Fix != "" {
+	if r, ok := Refusal(err); ok && r.Fix != "" && !r.dockerOnly {
 		body["fix"] = r.Fix
 	}
 	reply(w, code, body)
 }
 
-// failAs is err answered with code, a refusal kept one (its fix answered with it).
+// failAs is err answered with code, a refusal kept one (its fix answered with it) unless its fix
+// holds for a Docker install alone (Refused.dockerOnly): the VM has no --dir, and keeps no
+// installer of its own to run.
 func failAs(code int, err error) error {
 	he := httpError{code, err.Error()}
-	if r, ok := Refusal(err); ok {
+	if r, ok := Refusal(err); ok && !r.dockerOnly {
 		return Refused{Reason: he.msg, Fix: r.Fix, cause: he}
 	}
 	return he
@@ -776,21 +779,39 @@ func (h *Hostd) source(in *Installer) (env *EnvFile, first bool, err error) {
 
 // installedSpec is the spec carriedRelease tells for the release name version at revision, read
 // once per release and kept installer file (none, or its size and modification time): a status
-// does not read the kept installer, nor log it, at every request.
+// does not read the kept installer, nor log it, at every request. A read that failed, or a file
+// that did not stat, is read again at the next.
 func (h *Hostd) installedSpec(in *Installer, name, version string, revision int) *spec.Spec {
 	key := fmt.Sprintf("%s\x00%s\x00%d\x00", name, version, revision)
-	if fi, err := os.Stat(in.ctl()); err == nil {
+	// A file that does not stat (absent aside) gives no key: what is read is not kept.
+	keep := true
+	switch fi, err := os.Stat(in.ctl()); {
+	case err == nil:
 		key += fmt.Sprintf("%d\x00%d", fi.Size(), fi.ModTime().UnixNano())
+	case !errors.Is(err, os.ErrNotExist):
+		keep = false
 	}
 	h.carriedMu.Lock()
-	defer h.carriedMu.Unlock()
-	if h.carriedKey != key {
-		k := *in
-		k.O.Log = h.O.Log // what it logs is the daemon's, once
-		_, h.carriedSpec = k.carriedRelease(name, version, revision)
-		h.carriedKey = key
+	if keep && h.carriedKey == key {
+		defer h.carriedMu.Unlock()
+		return h.carriedSpec
 	}
-	return h.carriedSpec
+	h.carriedMu.Unlock()
+	// Read outside the lock: a status waits on no other's read. A read that failed is not kept,
+	// so the next status reads it again.
+	k := *in
+	k.O.Log = h.O.Log // what it logs is the daemon's, once
+	_, s, err := k.readCarried(name, version, revision)
+	if err != nil {
+		h.O.logf("%v", err)
+		return nil
+	}
+	if keep {
+		h.carriedMu.Lock()
+		h.carriedKey, h.carriedSpec = key, s
+		h.carriedMu.Unlock()
+	}
+	return s
 }
 
 // notInstalled reports whether in has no install yet.
@@ -1456,16 +1477,22 @@ func (h *Hostd) target(ctx context.Context, in *Installer, env *EnvFile, channel
 // after reports whether m comes after the release the OS carries, by the scheme m records; a
 // `command` scheme, which the daemon does not run, orders by revision within one version only.
 func (h *Hostd) after(m *release.Manifest) (bool, error) {
-	cur := h.R.Manifest
-	c, err := compareTo(m, cur.ProjectVersion)
+	return releaseAfter(m, h.R.Manifest.ProjectVersion, h.R.Manifest.Revision)
+}
+
+// releaseAfter reports whether m comes after version at revision, by the scheme m records; a
+// `command` scheme, which an install does not run, orders by revision within one version only,
+// and puts m after any other version.
+func releaseAfter(m *release.Manifest, version string, revision int) (bool, error) {
+	c, err := compareTo(m, version)
 	if err != nil {
 		return false, err
 	}
-	if m.Scheme.Provider == "command" && m.ProjectVersion != cur.ProjectVersion {
+	if m.Scheme.Provider == "command" && m.ProjectVersion != version {
 		return true, nil
 	}
 	if c == 0 {
-		return m.Revision > cur.Revision, nil
+		return m.Revision > revision, nil
 	}
 	return c < 0, nil
 }
