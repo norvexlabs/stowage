@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -428,9 +429,10 @@ func TestL4Values(t *testing.T) {
 	if err != nil || len(got) != 1 || got[0] != (helm.L4Route{Name: "data", Protocol: "UDP", Port: 443, Service: "relay", TargetPort: 4430}) {
 		t.Fatalf("%+v %v", got, err)
 	}
-	// A route with tls is the chart's to terminate: its domain input and client certificate given.
-	got, err = l4Values([]spec.L4Route{{Name: "db", Protocol: "tcp", Port: 7443, Upstream: "db:5432", TLS: &spec.L4TLS{DomainInput: "DB_DOMAIN", ClientAuth: true}}})
-	if err != nil || len(got) != 1 || got[0].TLS == nil || *got[0].TLS != (helm.L4TLS{DomainInput: "DB_DOMAIN", ClientAuth: true}) {
+	// A route with tls is the chart's to terminate: its domain input, client certificate and the
+	// upstream's ALPN protocols given.
+	got, err = l4Values([]spec.L4Route{{Name: "db", Protocol: "tcp", Port: 7443, Upstream: "db:5432", TLS: &spec.L4TLS{DomainInput: "DB_DOMAIN", ClientAuth: true, ALPN: []string{"postgresql"}}}})
+	if err != nil || len(got) != 1 || got[0].TLS == nil || !reflect.DeepEqual(*got[0].TLS, helm.L4TLS{DomainInput: "DB_DOMAIN", ClientAuth: true, ALPN: []string{"postgresql"}}) {
 		t.Fatalf("%+v %v", got, err)
 	}
 }

@@ -171,13 +171,13 @@ func TestDockerRunsAHostNetworkServiceOnTheHostsNetwork(t *testing.T) {
 	if got := in.targetHosts(); !slices.Equal(got, []string{"echo:host-gateway"}) {
 		t.Errorf("target hosts %v", got)
 	}
-	fc, err := frontCompose(in.R.Spec.Front, in.R.Spec.L4.Routes, func(string) string { return "" }, "internal", hostAPI{}, "sha256:x", "", false, false, in.hostServices(), nil)
+	fc, err := frontCompose(in.R.Spec.Front, in.R.Spec.L4.Routes, func(string) string { return "" }, "internal", hostAPI{}, "sha256:x", "", false, false, false, in.hostServices(), nil)
 	if err != nil || strings.Contains(string(fc), "17007") {
 		t.Errorf("the front publishes the route of a service on the host's network: %v\n%s", err, fc)
 	}
 	// Without it, Docker publishes the route's port from the stack's network.
 	in.R.Spec.Services = nil
-	if fc, err := frontCompose(in.R.Spec.Front, in.R.Spec.L4.Routes, func(string) string { return "" }, "internal", hostAPI{}, "sha256:x", "", false, false, in.hostServices(), nil); err != nil || !strings.Contains(string(fc), "published: \"17007\"") {
+	if fc, err := frontCompose(in.R.Spec.Front, in.R.Spec.L4.Routes, func(string) string { return "" }, "internal", hostAPI{}, "sha256:x", "", false, false, false, in.hostServices(), nil); err != nil || !strings.Contains(string(fc), "published: \"17007\"") {
 		t.Errorf("no route's port: %v\n%s", err, fc)
 	}
 }
@@ -241,7 +241,7 @@ func TestTheFrontAnswersToItsRoutesDomainsInside(t *testing.T) {
 	get := func(k string) string { return vals[k] }
 	aliases := func(mode string) []string {
 		t.Helper()
-		raw, err := frontCompose(f, nil, get, mode, hostAPI{}, "sha256:x", "", false, false, nil, nil)
+		raw, err := frontCompose(f, nil, get, mode, hostAPI{}, "sha256:x", "", false, false, false, nil, nil)
 		if err != nil {
 			t.Fatal(err)
 		}

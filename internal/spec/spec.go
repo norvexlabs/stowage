@@ -377,7 +377,15 @@ type L4Route struct {
 type L4TLS struct {
 	DomainInput string `yaml:"domain_input"`
 	ClientAuth  bool   `yaml:"client_auth"`
+	// ALPN are the protocols the upstream speaks, which the front selects when a client offers
+	// one (refusing a client offering only others, but one offering http/1.1 to a list holding
+	// h2, which Go lets through with none); none, the front selects no protocol.
+	ALPN []string `yaml:"alpn"`
 }
+
+// NoALPNMark is the protocol the front's configuration names for "no ALPN protocol", which no
+// route may declare.
+const NoALPNMark = "stowage-no-alpn"
 
 // Terminated reports whether the front terminates TLS on r: its port is the front's, its upstream
 // reached by the front.

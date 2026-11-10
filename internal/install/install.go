@@ -1260,7 +1260,7 @@ func (in *Installer) renderStack(env *EnvFile, dir string) error {
 			}
 		}
 	}
-	fc, err := frontCompose(f, in.R.Spec.L4.Routes, get, mode, in.hostAPI(), "sha256:"+hex.EncodeToString(h.Sum(nil)), ca, clientCA != nil, get(IPv6Var) == "true", in.hostServices(), in.allowV4Only())
+	fc, err := frontCompose(f, in.R.Spec.L4.Routes, get, mode, in.hostAPI(), "sha256:"+hex.EncodeToString(h.Sum(nil)), ca, strings.Contains(cf, noALPNMark), clientCA != nil, get(IPv6Var) == "true", in.hostServices(), in.allowV4Only())
 	if err != nil {
 		return err
 	}

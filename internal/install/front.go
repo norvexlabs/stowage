@@ -360,14 +360,24 @@ const (
 
 // frontCommand runs Caddy; with publish_ca, after copying ca (a path in the container, as soon as
 // it exists: the local CA's root is made as Caddy starts) into the published volume as ca.crt, or
-// removing a ca.crt there when ca is empty.
-func frontCommand(f spec.Front, ca string) []string {
+// removing a ca.crt there when ca is empty. noALPN (a TLS front terminating an L4 route) runs it
+// from the Caddyfile adapted to JSON, where the L4 routes' noALPNMark is the empty ALPN list.
+func frontCommand(f spec.Front, ca string, noALPN bool) []string {
 	caddy := []string{"caddy", "run", "--config", "/etc/caddy/Caddyfile", "--adapter", "caddyfile"}
-	if f.PublishCA == nil {
+	if f.PublishCA == nil && !noALPN {
 		return caddy
 	}
 	run := "exec " + strings.Join(caddy, " ")
-	if ca == "" {
+	if noALPN {
+		// A Caddyfile cannot write an empty ALPN list (an absent one is h2 and http/1.1): the
+		// configuration is adapted to JSON, where noALPNMark becomes the empty list. A mark left
+		// (adapt's output changed) stops the start: served, it would refuse every client's ALPN.
+		run = fmt.Sprintf(`caddy adapt --config /etc/caddy/Caddyfile --adapter caddyfile >%[1]s && sed -i 's/"alpn":\["%[2]s"\]/"alpn":[]/g' %[1]s && if grep -q %[2]s %[1]s; then echo "%[2]s left in %[1]s: the front's ALPN cannot be cleared" >&2; exit 1; fi && exec caddy run --config %[1]s`, frontJSON, noALPNMark)
+	}
+	switch {
+	case f.PublishCA == nil:
+		return []string{"sh", "-c", run}
+	case ca == "":
 		return []string{"sh", "-c", "rm -f " + caMount + "/ca.crt; " + run}
 	}
 	// cp keeps the source's mode (Caddy writes its root 0600): the copy is made readable to every
@@ -376,16 +386,24 @@ func frontCommand(f spec.Front, ca string) []string {
 	return []string{"sh", "-c", cp + run}
 }
 
+// noALPNMark is the ALPN protocol the Caddyfile names for "none", which the front's start
+// (frontCommand) replaces with the empty list; lint refuses it as a declared protocol.
+const noALPNMark = spec.NoALPNMark
+
+// frontJSON is where the front's start writes the configuration adapted from the Caddyfile.
+const frontJSON = "/tmp/stowage-caddy.json"
+
 // frontCompose adds the front service to the project's stack, unless it has none: in loopback mode each route on its
 // port of the loopback address, behind TLS only the HTTP and HTTPS ports (80 and 443 unless
 // moved), on every address. The host ports come from .env. The L4 routes' ports are published
 // in every mode, to their services: each on every address, or on the one its bind input holds (get
 // reads a recorded value).
 // digest labels the front with its configuration (the Caddyfile, a byo certificate), so a change
-// recreates it. ca is the CA it publishes (frontCommand). clientCA mounts the install's client CA.
+// recreates it. ca is the CA it publishes (frontCommand); noALPN, the Caddyfile names noALPNMark.
+// clientCA mounts the install's client CA.
 // ipv6 turns IPv6 on for the default network. onHost are the services on the host's network
 // (hostServices), whose L4 routes' ports are their own.
-func frontCompose(f spec.Front, l4 []spec.L4Route, get func(string) string, mode string, host hostAPI, digest, ca string, clientCA, ipv6 bool, onHost, v4Only []string) ([]byte, error) {
+func frontCompose(f spec.Front, l4 []spec.L4Route, get func(string) string, mode string, host hostAPI, digest, ca string, noALPN, clientCA, ipv6 bool, onHost, v4Only []string) ([]byte, error) {
 	var ports []any
 	volumes := []string{"./" + Caddyfile + ":/etc/caddy/Caddyfile:ro", "stowage-front-data:/data"}
 	if mode == Loopback {
@@ -406,7 +424,7 @@ func frontCompose(f spec.Front, l4 []spec.L4Route, get func(string) string, mode
 	}
 	service := map[string]any{
 		"image":   "${" + FrontImageVar + "}",
-		"command": frontCommand(f, ca),
+		"command": frontCommand(f, ca, noALPN),
 		"volumes": volumes,
 		"ports":   ports,
 		"restart": "unless-stopped",

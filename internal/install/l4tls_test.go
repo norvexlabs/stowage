@@ -48,9 +48,9 @@ func TestL4TLSCaddyfile(t *testing.T) {
 	global, sites, _ := strings.Cut(cf, "\n}\n")
 	for _, want := range []string{
 		"\tlocal_certs\n\tlayer4 {\n",
-		"\t\t# db, host port 7443\n\t\t:20001 {\n\t\t\troute {\n\t\t\t\ttls {\n\t\t\t\t\tconnection_policy {\n\t\t\t\t\t\tdefault_sni db.example.test\n\t\t\t\t\t}\n\t\t\t\t}\n\t\t\t\tproxy db:5432\n\t\t\t}\n\t\t}\n",
+		"\t\t# db, host port 7443\n\t\t:20001 {\n\t\t\troute {\n\t\t\t\ttls {\n\t\t\t\t\tconnection_policy {\n\t\t\t\t\t\tdefault_sni db.example.test\n\t\t\t\t\t\talpn stowage-no-alpn\n\t\t\t\t\t}\n\t\t\t\t}\n\t\t\t\tproxy db:5432\n\t\t\t}\n\t\t}\n",
 		"\t\t:20002 {\n\t\t\t@stowage_allowed remote_ip 10.0.0.0/8 192.0.2.7\n\t\t\troute @stowage_allowed {\n\t\t\t\ttls {\n\t\t\t\t\tconnection_policy {\n\t\t\t\t\t\tdefault_sni app.example.test\n",
-		"\t\t\t\t\t\tdefault_sni admin.example.test\n\t\t\t\t\t\tclient_auth {\n\t\t\t\t\t\t\tmode require_and_verify\n\t\t\t\t\t\t\ttrust_pool file " + clientCAPath + "\n",
+		"\t\t\t\t\t\tdefault_sni admin.example.test\n\t\t\t\t\t\talpn stowage-no-alpn\n\t\t\t\t\t\tclient_auth {\n\t\t\t\t\t\t\tmode require_and_verify\n\t\t\t\t\t\t\ttrust_pool file " + clientCAPath + "\n",
 		"\t\t:20004 {\n\t\t\troute {\n\t\t\t\tclose\n\t\t\t}\n\t\t}\n",
 	} {
 		if !strings.Contains(global, want) {
@@ -119,6 +119,64 @@ func TestRunningLine(t *testing.T) {
 	}
 }
 
+// The front selects no ALPN protocol on an L4 route it terminates TLS on, unless the route
+// declares its upstream's: the Caddyfile names noALPNMark, which the front's start, adapting it to
+// JSON, makes the empty list (a Caddyfile cannot write one); loopback mode writes no TLS.
+func TestL4TLSALPN(t *testing.T) {
+	t.Parallel()
+	routes := []spec.L4Route{
+		{Name: "db", Protocol: "tcp", Port: 7443, Upstream: "db:5432", TLS: &spec.L4TLS{DomainInput: "DB_DOMAIN", ALPN: []string{"postgresql"}}},
+		{Name: "mq", Protocol: "tcp", Port: 8883, Upstream: "mq:1883", TLS: &spec.L4TLS{DomainInput: "MQ_DOMAIN"}},
+	}
+	domains := map[string]string{"db": "db.example.test", "mq": "mq.example.test"}
+	cf := tlsCaddyfile(spec.Front{TLSModes: []string{"internal"}}, routes, "internal", domains, "", "443", false, func(string) string { return "" }, nil)
+	for _, want := range []string{"default_sni db.example.test\n\t\t\t\t\t\talpn postgresql\n", "default_sni mq.example.test\n\t\t\t\t\t\talpn " + noALPNMark + "\n"} {
+		if !strings.Contains(cf, want) {
+			t.Errorf("lacks %q:\n%s", want, cf)
+		}
+	}
+	adapt := `caddy adapt --config /etc/caddy/Caddyfile --adapter caddyfile >/tmp/stowage-caddy.json && sed -i 's/"alpn":\["stowage-no-alpn"\]/"alpn":[]/g' /tmp/stowage-caddy.json && if grep -q stowage-no-alpn /tmp/stowage-caddy.json; then echo "stowage-no-alpn left in /tmp/stowage-caddy.json: the front's ALPN cannot be cleared" >&2; exit 1; fi && exec caddy run --config /tmp/stowage-caddy.json`
+	f := spec.Front{TLSModes: []string{"internal"}}
+	if got := frontCommand(f, "", true); !slices.Equal(got, []string{"sh", "-c", adapt}) {
+		t.Errorf("noALPN: %q", got)
+	}
+	if got := frontCommand(f, "", false); !slices.Equal(got, []string{"caddy", "run", "--config", "/etc/caddy/Caddyfile", "--adapter", "caddyfile"}) {
+		t.Errorf("without: %q", got)
+	}
+	f.PublishCA = &spec.PublishCA{Volume: "ca"}
+	if got := frontCommand(f, localRoot, true); len(got) != 3 || !strings.HasPrefix(got[2], "(until [ -s "+localRoot+" ]") || !strings.HasSuffix(got[2], ") & "+adapt) {
+		t.Errorf("publish_ca and noALPN: %q", got)
+	}
+	// byo without a CA removes the published one, then starts adapted.
+	if got := frontCommand(f, "", true); len(got) != 3 || got[2] != "rm -f "+caMount+"/ca.crt; "+adapt {
+		t.Errorf("publish_ca without a CA and noALPN: %q", got)
+	}
+	// The compose file runs the adapted start when the Caddyfile names the mark: in a TLS mode,
+	// not in loopback mode, nor when every route declares its protocols.
+	get := func(string) string { return "" }
+	declared := []spec.L4Route{routes[0]}
+	for name, c := range map[string]struct {
+		mode   string
+		routes []spec.L4Route
+		want   bool
+	}{"tls": {"internal", routes, true}, "loopback": {Loopback, routes, false}, "declared": {"internal", declared, false}} {
+		front := spec.Front{TLSModes: []string{"internal", "none"}}
+		var cf string
+		if c.mode == Loopback {
+			cf = loopbackCaddyfile(front, c.routes, get, nil)
+		} else {
+			cf = tlsCaddyfile(front, c.routes, c.mode, domains, "", "443", false, get, nil)
+		}
+		fc, err := frontCompose(front, c.routes, get, c.mode, hostAPI{}, "d", "", strings.Contains(cf, noALPNMark), false, false, nil, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(fc), "caddy adapt") != c.want {
+			t.Errorf("%s: adapted start %v, want %v:\n%s", name, !c.want, c.want, fc)
+		}
+	}
+}
+
 // In loopback mode the front passes such a route in the clear: TLS is what is in front of the
 // install's; one asking for a client certificate refuses everyone, as plain TCP carries none.
 func TestL4TLSLoopbackCaddyfile(t *testing.T) {
@@ -148,7 +206,7 @@ func TestL4TLSFrontCompose(t *testing.T) {
 	routes[1].BindInput = "DB_BIND"
 	for mode, hostIP := range map[string]string{"internal": "192.0.2.9", Loopback: "${STOWAGE_LOOPBACK_ADDRESS}"} {
 		get := func(k string) string { return map[string]string{"DB_BIND": "192.0.2.9"}[k] }
-		raw, err := frontCompose(l4TLSFront(), routes, get, mode, hostAPI{}, "sha256:x", "", false, false, []string{"db"}, nil)
+		raw, err := frontCompose(l4TLSFront(), routes, get, mode, hostAPI{}, "sha256:x", "", false, false, false, []string{"db"}, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -521,7 +579,7 @@ func TestL4TLSClientAuthTakesTheClientCA(t *testing.T) {
 		t.Fatalf("%v\n%s", err, e.log)
 	}
 	cf, fc := e.file(Caddyfile), e.file(FrontCompose)
-	if !strings.Contains(cf, "default_sni db.example.com\n\t\t\t\t\t\tclient_auth {") || strings.Contains(cf, "\t\t\t\tclose\n") {
+	if !strings.Contains(cf, "default_sni db.example.com\n\t\t\t\t\t\talpn stowage-no-alpn\n\t\t\t\t\t\tclient_auth {") || strings.Contains(cf, "\t\t\t\tclose\n") {
 		t.Errorf("Caddyfile:\n%s", cf)
 	}
 	if !strings.Contains(fc, "./"+ClientCADir+":"+clientCADir+":ro") {

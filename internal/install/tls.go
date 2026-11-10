@@ -709,6 +709,13 @@ func layer4(b *strings.Builder, l4 []spec.L4Route, get func(string) string, doma
 		}
 		if d != "" {
 			fmt.Fprintf(b, "\t\t\t\ttls {\n\t\t\t\t\tconnection_policy {\n\t\t\t\t\t\tdefault_sni %s\n", d)
+			// The stream is the upstream's: the front selects its declared protocols alone, and none
+			// without (Caddy's default, h2 and http/1.1, would answer for an upstream it never asked).
+			alpn := r.TLS.ALPN
+			if len(alpn) == 0 {
+				alpn = []string{noALPNMark}
+			}
+			fmt.Fprintf(b, "\t\t\t\t\t\talpn %s\n", strings.Join(alpn, " "))
 			if r.TLS.ClientAuth {
 				fmt.Fprintf(b, "\t\t\t\t\t\tclient_auth {\n\t\t\t\t\t\t\tmode require_and_verify\n\t\t\t\t\t\t\ttrust_pool file %s\n\t\t\t\t\t\t}\n", clientCAPath)
 			}

@@ -1149,6 +1149,11 @@ func (l *linter) front() {
 
 var headerRe = regexp.MustCompile(`^[A-Za-z0-9!#$%&'*+.^_|~-]+$`)
 
+// alpnRe is an ALPN protocol ID as l4.routes[].tls.alpn takes it: letters, digits and . _ / + -, a
+// word the Caddyfile reads as it is (RFC 7301 allows any bytes; braces, quotes, # and $ mean
+// something there).
+var alpnRe = regexp.MustCompile(`^[A-Za-z0-9._/+-]{1,255}$`)
+
 // frontInput checks that key, which the front reads, is an input recorded on the Docker shape: a
 // route's value is written into the front's configuration.
 func (l *linter) frontInput(where, key string) {
@@ -1264,6 +1269,19 @@ func (l *linter) l4TLS(where string, r spec.L4Route) {
 	f := l.s.Front
 	if r.Protocol == "udp" {
 		l.errf(where, "the front terminates TLS over TCP alone: a UDP route passes through as it is (DTLS is the upstream's)")
+	}
+	seen := map[string]bool{}
+	for i, p := range r.TLS.ALPN {
+		w := fmt.Sprintf("%s.alpn[%d]", where, i)
+		switch {
+		case !alpnRe.MatchString(p):
+			l.errf(w, "%q is not an ALPN protocol: 1 to 255 letters, digits, '.', '_', '/', '+' or '-' (like http/1.1 or postgresql)", p)
+		case p == spec.NoALPNMark:
+			l.errf(w, "%q is Stowage's own: leave alpn out for no protocol", p)
+		case seen[p]:
+			l.errf(w, "%q is listed twice", p)
+		}
+		seen[p] = true
 	}
 	if !f.Declared() || !slices.ContainsFunc(f.TLSModes, func(m string) bool { return m != "none" }) {
 		l.errf(where, "the front terminates TLS with the certificate of its TLS mode, and %s offers none: give front.tls_modes a TLS mode, or leave tls out (the upstream's own TLS passes through)", l.s.Name)

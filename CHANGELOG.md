@@ -3,6 +3,16 @@
 Stowage's own releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
+## [0.33.1]
+
+### Fixed
+
+- An L4 route the front terminates TLS on no longer negotiates HTTP/2 (or HTTP/1.1) on its
+  upstream's behalf: the front selects no ALPN protocol, so an HTTP/2-capable client reaching an
+  HTTP/1 upstream through the route works. A route whose upstream needs one declares it
+  (`l4.routes[].tls.alpn`, e.g. `[postgresql]` for PostgreSQL's direct TLS); the chart is given
+  it too (`stowage.l4[].tls.alpn`).
+
 ## [0.33.0] - 2026-11-10
 
 ### Added

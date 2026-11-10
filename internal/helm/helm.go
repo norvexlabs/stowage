@@ -278,10 +278,11 @@ type L4Route struct {
 
 // L4TLS is an L4 route's TLS termination, the chart's to do on Kubernetes (cert-manager, a
 // Gateway's TLSRoute): DomainInput names the input holding the domain, ClientAuth asks for a
-// client certificate.
+// client certificate, ALPN are the protocols the upstream speaks (none: select none).
 type L4TLS struct {
-	DomainInput string `yaml:"domainInput"`
-	ClientAuth  bool   `yaml:"clientAuth"`
+	DomainInput string   `yaml:"domainInput"`
+	ClientAuth  bool     `yaml:"clientAuth"`
+	ALPN        []string `yaml:"alpn,omitempty"`
 }
 
 // Release identifies the release a chart belongs to.

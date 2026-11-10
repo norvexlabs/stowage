@@ -209,6 +209,11 @@ func TestEachRuleFiresOnFull(t *testing.T) {
 		{"l4 tls domain secret", []edit{{sp, "tls: { domain_input: ECHO_DOMAIN }", "tls: { domain_input: SEARCH_KEY }"}}, nil, "l4.routes[2].tls.domain_input: SEARCH_KEY is secret"},
 		{"l4 tls same port on the VM", []edit{{sp, "      upstream: echo:17009", "      upstream: echo:17443"}}, nil, "where the front holds the route's port 17443 to terminate TLS"},
 		{"l4 tls key", []edit{{sp, "tls: { domain_input: ECHO_DOMAIN }", "tls: { domain: ECHO_DOMAIN }"}}, nil, "field domain not found"},
+		{"l4 tls alpn word", []edit{{sp, "tls: { domain_input: ECHO_DOMAIN }", `tls: { domain_input: ECHO_DOMAIN, alpn: ["my proto"] }`}}, nil, `l4.routes[2].tls.alpn[0]: "my proto" is not an ALPN protocol`},
+		{"l4 tls alpn caddyfile", []edit{{sp, "tls: { domain_input: ECHO_DOMAIN }", `tls: { domain_input: ECHO_DOMAIN, alpn: ["#x"] }`}}, nil, `l4.routes[2].tls.alpn[0]: "#x" is not an ALPN protocol`},
+		{"l4 tls alpn empty", []edit{{sp, "tls: { domain_input: ECHO_DOMAIN }", `tls: { domain_input: ECHO_DOMAIN, alpn: [""] }`}}, nil, `l4.routes[2].tls.alpn[0]: "" is not an ALPN protocol`},
+		{"l4 tls alpn mark", []edit{{sp, "tls: { domain_input: ECHO_DOMAIN }", "tls: { domain_input: ECHO_DOMAIN, alpn: [stowage-no-alpn] }"}}, nil, `l4.routes[2].tls.alpn[0]: "stowage-no-alpn" is Stowage's own`},
+		{"l4 tls alpn twice", []edit{{sp, "tls: { domain_input: ECHO_DOMAIN }", "tls: { domain_input: ECHO_DOMAIN, alpn: [echo, echo] }"}}, nil, `l4.routes[2].tls.alpn[1]: "echo" is listed twice`},
 		{"absolute path", []edit{{sp, "compose: deploy/compose.yaml", "compose: /etc/compose.yaml"}}, nil, "must be relative to the project root"},
 		{"audit unsigned", []edit{{sp, "provider: cosign-key\n  key: env://ATLAS_SIGNING_KEY", "provider: none\n  key: env://ATLAS_SIGNING_KEY"}}, nil, "audit: a project that signs no release"},
 		{"audit fail_on", []edit{{sp, "fail_on: critical", "fail_on: none"}}, nil, `audit.fail_on: "none": one of negligible`},
@@ -795,6 +800,20 @@ func TestFrontOfL4TLSRoutesAlone(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// Declared ALPN protocols an upstream speaks are accepted: the longest ID and a mix of words.
+func TestL4TLSALPNAccepted(t *testing.T) {
+	t.Parallel()
+	root := testutil.CopyExample(t, "full")
+	testutil.Edit(t, root, specFile, "tls: { domain_input: ECHO_DOMAIN }", "tls: { domain_input: ECHO_DOMAIN, alpn: [echo/1, x-"+strings.Repeat("a", 253)+"] }")
+	if errs := errorsOf(run(t, root)); len(errs) > 0 {
+		t.Fatalf("%v", errs)
+	}
+	testutil.Edit(t, root, specFile, "x-"+strings.Repeat("a", 253), "x-"+strings.Repeat("a", 254))
+	if errs := strings.Join(errorsOf(run(t, root)), "\n"); !strings.Contains(errs, "is not an ALPN protocol") {
+		t.Fatalf("256 characters accepted: %s", errs)
 	}
 }
 

@@ -16,7 +16,8 @@
 # database → an install of 0.9.0, which the last release's stowage (built from its tag) shipped
 # before 1.0.0, upgrades to 1.0.1 with this one's, and a rollback goes back to it with its own
 # installer → 1.0.2 adds a front terminating the L4 route's TLS alone (no HTTP route, no portal),
-# installed with --tls internal, then re-run with --tls byo, its CA published into a volume.
+# installed with --tls internal (no ALPN protocol selected), then re-run with --tls byo, its CA
+# published into a volume.
 set -euo pipefail
 . "$(dirname "$0")/lib.sh"
 
@@ -221,16 +222,20 @@ while [[ $HTTPS_PORT == "$PORT" || $HTTPS_PORT == "$HTTP_PORT" ]]; do HTTPS_PORT
 # Hints (tuning, timers) may follow the line.
 grep -qx "lookup 1.0.2 is running" "$WORK/install-tls.log" || { cat "$WORK/install-tls.log"; fail "the install without a portal does not end as a project without a front does"; }
 grep -q "L4 route lookup: tcp/$PORT .*lookup.test" "$WORK/install-tls.log" || { cat "$WORK/install-tls.log"; fail "the install does not name the L4 route and its domain"; }
-# tls_get CA: the page through the front's TLS on the L4 port, trusting CA alone; HTTP/1.1, as
-# the front's TLS on an L4 route would take h2 for a stream the upstream reads as HTTP/1.
-tls_get() { curl -sf --http1.1 --max-time 10 --cacert "$1" --resolve "lookup.test:$PORT:127.0.0.1" "https://lookup.test:$PORT/"; }
+# tls_get CA: the page through the front's TLS on the L4 port, trusting CA alone. curl offers h2:
+# the front selects no ALPN protocol, so it speaks HTTP/1.1, as the upstream does.
+tls_get() { curl -sf --max-time 10 --cacert "$1" --resolve "lookup.test:$PORT:127.0.0.1" "https://lookup.test:$PORT/"; }
 # tls_why CA: what curl saw, for a failure.
-tls_why() { curl -sv --http1.1 --max-time 10 --cacert "$1" --resolve "lookup.test:$PORT:127.0.0.1" "https://lookup.test:$PORT/" 2>&1 | tail -20 >&2 || true; }
+tls_why() { curl -sv --max-time 10 --cacert "$1" --resolve "lookup.test:$PORT:127.0.0.1" "https://lookup.test:$PORT/" 2>&1 | tail -20 >&2 || true; }
 published_ca() { docker exec "$(server)" cat /ca/ca.crt; }
 for _ in $(seq 30); do published_ca >"$WORK/internal-ca.crt" 2>/dev/null && break; sleep 1; done
 [[ -s $WORK/internal-ca.crt ]] || { stack_logs >&2; fail "the front did not publish its local CA into the ca volume"; }
 [[ $(tls_get "$WORK/internal-ca.crt") == secure ]] || { stack_logs >&2; tls_why "$WORK/internal-ca.crt"; fail "the L4 route does not serve over the front's TLS, chained to the published local CA"; }
 ! curl -sf --max-time 5 "http://127.0.0.1:$PORT/" >/dev/null || fail "the L4 route answers in the clear"
+# A handshake completed and verified, with no protocol selected (a refused one prints no verify code).
+alpn=$(timeout 10 openssl s_client -connect "127.0.0.1:$PORT" -servername lookup.test -CAfile "$WORK/internal-ca.crt" -alpn h2,http/1.1 </dev/null 2>&1) || true
+grep -q '^No ALPN negotiated' <<<"$alpn" && grep -q 'Verify return code: 0 (ok)' <<<"$alpn" ||
+	{ echo "$alpn" >&2; fail "the front's handshake on the L4 route failed, or selected an ALPN protocol for a route declaring none"; }
 # byo: a CA of the test's own and its certificate for the domain.
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 2 -subj /CN=lookup-e2e-ca \
 	-keyout "$WORK/byo-ca.key" -out "$WORK/byo-ca.crt" 2>/dev/null || fail "a byo CA"

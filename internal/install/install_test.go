@@ -1353,7 +1353,7 @@ func TestFrontStripsHeadersAndPublishesOnTheLoopback(t *testing.T) {
 			t.Errorf("Caddyfile lacks %q:\n%s", want, cf)
 		}
 	}
-	fc, err := frontCompose(e.r.Spec.Front, nil, nil, Loopback, hostAPI{}, "sha256:x", "", false, false, nil, nil)
+	fc, err := frontCompose(e.r.Spec.Front, nil, nil, Loopback, hostAPI{}, "sha256:x", "", false, false, false, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

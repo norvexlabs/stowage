@@ -22,6 +22,23 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
    operator's own registry sign-in where the mirror asks for one), their signatures checked against
    the release keys as `upgrade --version` checks them; nothing newer is said so.
 
+### Kairos OS bundle
+
+1. **Every Kairos ship fails on 0.33.0: the OS bundle demands `permitrootlogin no`, which nothing
+   sets** (`internal/kairos/Dockerfile.tmpl`, the RUN after `kairos-init -s init`, added in
+   f704890). `kairos-init` v4.4.0's SSH hardening drop-in (`05-kairos-hardening.conf`) sets
+   `PermitRootLogin prohibit-password`, and the template writes no `PermitRootLogin` of its own,
+   so `sshd -T` reports `permitrootlogin prohibit-password`, `grep -qx 'permitrootlogin no'`
+   fails, and `ship --disks` (any spec with `shapes.kairos`, on `ubuntu:26.04` and
+   `kairos-init:v4.4.0`, the examples' own) stops at `os bundle: build: docker buildx build: exit
+   status 1` with no message naming the check. Reproduced 2026-11-10 by running the template's
+   checks one by one in the built layer: the drop-in, `allowtcpforwarding no` and
+   `maxauthtries 4` pass, `permitrootlogin no` fails. `kairos_test.go` greps the template for the
+   line and never builds it. Fix: write `PermitRootLogin no` in the image's own drop-in, read
+   before kairos-init's (sshd keeps a keyword's first value), so the check holds what the image
+   sets; and give every check in that RUN a message naming it, as the module count's has.
+   Prove it with a real `ship --disks` of an example before the release.
+
 ### Supply chain — stopgaps back to canonical
 
 1. **Check every stopgap at each release, and drop each one the upstream has caught up with**:
@@ -94,13 +111,6 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
    release.
 
 ## Should
-
-- **An L4 route the front terminates TLS on negotiates h2**: the layer4 TLS handler's connection
-  policy accepts the ALPN `h2` a client offers (curl does), though the stream goes to an upstream
-  that never saw that negotiation: an HTTP/1 upstream then breaks an h2 client ("unexpected data
-  while we expected SETTINGS frame"). A non-HTTP client offers no ALPN and is unaffected. Give the
-  route's connection policy an `alpn` of its own (`l4.routes[].tls.alpn`, empty by default: none
-  selected), and check it with `openssl s_client -alpn h2`.
 
 - **ACME proven end to end**: no suite runs an ACME server, so `acme` and `dns-cloudflare` are
   proven by the Caddyfile they write alone — for the HTTP routes and for a domain the front holds
