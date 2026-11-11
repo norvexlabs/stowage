@@ -370,6 +370,7 @@ func TestK8sStatusRefusesNoRelease(t *testing.T) {
 		if kctx != "" {
 			install += " --kube-context 'the cluster'"
 		}
+		install += " --no-provision" // the fixture's, which the install named takes
 		e.f.listed = nil
 		for _, form := range forms {
 			e.out.Reset()

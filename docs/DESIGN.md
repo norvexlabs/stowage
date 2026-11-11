@@ -859,12 +859,17 @@ Stowage calls a project's programs: the two never share a reader.
   `absent` (true) says no install is there — no `.env` in the directory, no helm release in the
   namespace — told apart from every other refusal (a release not from Stowage's chart), so a
   program's create tells "nothing here" from "something else here". The VM always answers its
-  status (`installed` null before the first install).
+  status (`installed` null before the first install), with the first install's `registry`,
+  `short_name`, `address` and `registry_ca` as Docker's.
 - **`--json` on the verbs that change an install** (install and re-run, `upgrade`, `rollback`,
   `uninstall`, on every shape) — one object at the end: `{format, result: "done" | "nothing",
   release, refused: {reason, fix, absent}}` (`absent` as `status --json`'s, left out when false;
-  Docker's and Kubernetes': the VM's daemon answers its verbs, and its status answers before any
-  install). `nothing` is a run with nothing to do, a dry run or a
+  on the VM, a verb before the first install: the host daemon answers the refusal with `absent`,
+  `{error, refused: true, fix?, absent?}`, and its client carries it, so every shape tells "no
+  install" the same way). The k8s refusals of a missing release are one: their reason names the
+  install to run, with the mirror and its CA the run was given (`--image-registry`,
+  `--registry-ca`), and their fix is `install first: <that install>`, as Docker's `holds no
+  install` names its own. `nothing` is a run with nothing to do, a dry run or a
   refusal; `release` the release installed after the run, absent when none is; a failure prints
   no object, only its error. The run's text goes to standard error, so standard output is the
   object alone; `upgrade --version` passes `--json` to its child, which prints it. On the VM,

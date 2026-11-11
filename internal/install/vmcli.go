@@ -639,16 +639,16 @@ func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(
 	netAttach := netAttachCommand(r, &o.Dir, stdout)
 	dirFlag(netAttach)
 	netCmd.AddCommand(netAttach)
-	restore := restoreCommand(c, name, "sudo "+c.ctl+" install", stderr, terminal)
+	restore := restoreCommand(c, name, func() error { return (&Installer{R: r, O: o}).noInstall(o.Dir) }, stderr, terminal)
 	root.AddCommand(prov, updates, upgrade, rollback, reset, secrets, restore, netCmd, backupCommand(c, name, stdout, stderr),
 		power("reboot", "Reboot the VM", "/v1/reboot"),
 		power("shutdown", "Power the VM off", "/v1/shutdown"))
 	return root
 }
 
-// restoreCommand is `restore OBJECT`, asking the host daemon c reaches; install names the command
-// that installs.
-func restoreCommand(c *hostClient, name, install string, stderr io.Writer, terminal func(accessible bool) Prompter) *cobra.Command {
+// restoreCommand is `restore OBJECT`, asking the host daemon c reaches; noInstall is the shape's
+// refusal of a restore before the first install (Installer.noInstall's).
+func restoreCommand(c *hostClient, name string, noInstall func() error, stderr io.Writer, terminal func(accessible bool) Prompter) *cobra.Command {
 	var yes, accessible bool
 	var identity string
 	restore := &cobra.Command{
@@ -662,7 +662,7 @@ func restoreCommand(c *hostClient, name, install string, stderr io.Writer, termi
 				return err
 			}
 			if st.Installed == nil {
-				return fmt.Errorf("%s is not installed yet: `%s` installs it", name, install)
+				return noInstall()
 			}
 			key, err := readFileOrStdin(identity, cmd.InOrStdin())
 			if err != nil {
@@ -753,6 +753,9 @@ func (c *hostClient) do(ctx context.Context, method, path string, body, out any)
 		req.Header.Set("Content-Type", "application/json")
 	}
 	resp, err := c.http.Do(req)
+	if me := (madeErr{}); errors.As(err, &me) {
+		return me.error // the daemon of this process failed to be made: its error as it is
+	}
 	if err != nil {
 		var op *net.OpError
 		if errors.As(err, &op) && errors.Is(err, os.ErrPermission) {
@@ -767,13 +770,13 @@ func (c *hostClient) do(ctx context.Context, method, path string, body, out any)
 	}
 	if resp.StatusCode >= 400 {
 		var e struct {
-			Error, Fix string
-			Refused    bool
+			Error, Fix      string
+			Refused, Absent bool
 		}
 		switch {
 		case json.Unmarshal(raw, &e) != nil || e.Error == "":
 		case e.Refused: // the daemon's refusal, with its fix or without: nothing changed
-			return Refused{Reason: e.Error, Fix: e.Fix}
+			return Refused{Reason: e.Error, Fix: e.Fix, Absent: e.Absent}
 		default:
 			return errors.New(e.Error)
 		}

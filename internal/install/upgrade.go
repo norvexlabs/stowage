@@ -82,11 +82,12 @@ func (in *Installer) open() (*EnvFile, error) {
 	return env, err
 }
 
-// noInstall is the refusal of a run whose directory, dir, holds no install: absent on Docker
-// alone, as the VM's host daemon answers its verbs (and its status answers before any install).
+// noInstall is the refusal of a run whose directory, dir, holds no install: absent, on Docker and
+// on the VM, whose host daemon carries it to its client; each shape's words and fix (the VM's
+// directory is its OS's own).
 func (in *Installer) noInstall(dir string) error {
 	if in.O.Preloaded {
-		return refuse(in.vmCtl()+" install", "%s holds no install", dir)
+		return absent(in.vmCtl()+" install", "%s is not installed yet: `%s install` installs it", in.R.Spec.Name, in.vmCtl())
 	}
 	return absent("install first, or give the --dir of the install", "%s holds no install", dir)
 }

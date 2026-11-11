@@ -664,7 +664,7 @@ func TestK8sFailedInstallKeepsTheSecret(t *testing.T) {
 	e := newKubeEnv(t, spec.Provider{Name: "none"})
 	e.f.upErr = errors.New("timed out waiting for the condition")
 	err := e.installer(nil).K8sInstall(context.Background())
-	if err == nil || !strings.Contains(err.Error(), "helm removed the release; its Secret notes-stowage is kept, and a new `notes-stow k8s install --namespace notes --release notes` reuses its values") {
+	if err == nil || !strings.Contains(err.Error(), "helm removed the release; its Secret notes-stowage is kept, and a new `notes-stow k8s install --namespace notes --release notes --no-provision` reuses its values") { // the fixture gives --no-provision
 		t.Fatalf("%v", err)
 	}
 }
@@ -940,7 +940,7 @@ func TestK8sUpgradeRefusals(t *testing.T) {
 		mod  func(*kubeEnv, *Options)
 		want string
 	}{
-		{"absent", func(e *kubeEnv, _ *Options) { e.f.listed = nil }, "no release notes in notes: `notes-stow k8s install --namespace notes --release notes` installs 1.0.0"},
+		{"absent", func(e *kubeEnv, _ *Options) { e.f.listed = nil }, "no release notes in notes: `notes-stow k8s install --namespace notes --release notes --no-provision` installs 1.0.0"},
 		{"pending", func(e *kubeEnv, _ *Options) { e.f.listed[0].Status = "pending-upgrade" }, "is pending-upgrade: another helm operation runs on it, or one stopped before it finished (`helm rollback notes --namespace notes` ends it)"},
 		{"pending install", func(e *kubeEnv, _ *Options) { e.f.listed[0].Status = "pending-install" }, "(`helm uninstall notes --namespace notes` ends it)"},
 		{"pending on helm 4", func(e *kubeEnv, _ *Options) { e.f.helm, e.f.listed[0].Status = "v4.0.4", "pending-upgrade" }, "is pending-upgrade"},

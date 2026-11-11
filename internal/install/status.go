@@ -84,13 +84,7 @@ type InstallStatus struct {
 // they could not be read.
 type DockerStatus struct {
 	InstallStatus
-	// ShortName is the <short> of the installer the install keeps, <dir>/<short>-stow.
-	ShortName string `json:"short_name,omitempty"`
-	// Address is the loopback address the first install recorded (--address, else 127.0.0.1).
-	Address string `json:"address,omitempty"`
-	// RegistryCA is sha256:<hex> of the registry CA the install keeps (--registry-ca at the first
-	// install, as given); left out when it keeps none.
-	RegistryCA string `json:"registry_ca,omitempty"`
+	FirstInstall
 	// RestoreAwaited and VolumesSplit are the VM's: the provision hook waits for a backup of the
 	// install --secrets came from; a restore left the volumes half restored (or one runs).
 	RestoreAwaited bool      `json:"restore_awaited,omitempty"`
@@ -294,10 +288,7 @@ func (in *Installer) StatusJSON(ctx context.Context) error {
 	// The channel the install follows (--channel at the first install, as the VM's), else the
 	// installed release's; its inputs from an installer that carries that release.
 	st.Channel, _ = env.Get(ChannelVar)
-	st.ShortName, _ = env.Get("STOWAGE_SHORT_NAME")
-	st.Address, _ = env.Get("STOWAGE_LOOPBACK_ADDRESS")
-	st.Registry, _ = env.Get("STOWAGE_REGISTRY")
-	if st.RegistryCA, err = fileDigest(in.path(RegistryCAFile)); err != nil {
+	if st.Registry, st.FirstInstall, err = readFirstInstall(env, in.O.Dir); err != nil {
 		return err
 	}
 	m, s := in.carriedRelease(name, v, n)
@@ -431,4 +422,24 @@ func fileDigest(path string) (string, error) {
 	}
 	sum := sha256.Sum256(data)
 	return "sha256:" + hex.EncodeToString(sum[:]), nil
+}
+
+// FirstInstall is what an install's first run recorded beside its registry, as status --json gives
+// it on Docker and the VM: the <short> of the installer it keeps (<dir>/<short>-stow), the loopback
+// address (--address, else 127.0.0.1), and sha256:<hex> of the registry CA it keeps (--registry-ca,
+// as given; left out when it keeps none).
+type FirstInstall struct {
+	ShortName  string `json:"short_name,omitempty"`
+	Address    string `json:"address,omitempty"`
+	RegistryCA string `json:"registry_ca,omitempty"`
+}
+
+// readFirstInstall is the registry and the FirstInstall env records, the CA in dir hashed at each
+// read (a small file: never a digest of one replaced since); err when that CA cannot be read.
+func readFirstInstall(env *EnvFile, dir string) (registry string, f FirstInstall, err error) {
+	registry, _ = env.Get("STOWAGE_REGISTRY")
+	f.ShortName, _ = env.Get("STOWAGE_SHORT_NAME")
+	f.Address, _ = env.Get("STOWAGE_LOOPBACK_ADDRESS")
+	f.RegistryCA, err = fileDigest(filepath.Join(dir, RegistryCAFile))
+	return registry, f, err
 }

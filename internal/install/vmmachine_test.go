@@ -913,7 +913,7 @@ func TestVMRefusalsCarryAFixThatHoldsOnTheVM(t *testing.T) {
 		}, "already holds a tls/", "move tls/ away", "--dir"},
 		"no install": {func(t *testing.T, mod func(*Options)) error {
 			return vmEnv(t, "1.0.0").installer(mod).Rollback(ctx)
-		}, "holds no install", "sudo notes-stow install", "--dir"},
+		}, "notes is not installed yet: `sudo notes-stow install` installs it", "sudo notes-stow install", "--dir"},
 		"an upgrade crossing from another release than the one confirmed": {func(t *testing.T, mod func(*Options)) error {
 			e := vmInstalled(t, "1.0.0")
 			e.r, e.self = bundledInstaller(t, "2.0.0", 1, nil)

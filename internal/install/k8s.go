@@ -601,7 +601,7 @@ func (in *Installer) k8sDeploy(ctx context.Context, upgrade bool) (err error) {
 	case !upgrade && rel != nil:
 		return refuse(in.k8sCtl("upgrade"), "release %s in %s exists (%s, %s): `%s` moves it to %s", k.Release, k.Namespace, rel.Status, rel.AppVersion, in.k8sCtl("upgrade"), m.ProjectVersion)
 	case upgrade && rel == nil:
-		return absent(in.k8sCtl("install"), "no release %s in %s: `%s` installs %s", k.Release, k.Namespace, in.k8sCtl("install"), m.ProjectVersion)
+		return in.noRelease()
 	case upgrade:
 		if err := in.pending(rel); err != nil {
 			return err
@@ -791,7 +791,7 @@ func (in *Installer) k8sDeploy(ctx context.Context, upgrade bool) (err error) {
 		if upgrade {
 			return fmt.Errorf("%w\nhelm rolled the release back to what it ran: `%s` shows it", err, in.k8sCtl("status"))
 		}
-		return fmt.Errorf("%w\nhelm removed the release; its Secret %s is kept, and a new `%s` reuses its values", err, k.envSecret(), in.k8sCtl("install"))
+		return fmt.Errorf("%w\nhelm removed the release; its Secret %s is kept, and a new `%s` reuses its values", err, k.envSecret(), in.k8sInstallCmd())
 	}
 	fmt.Fprintf(o.Out, "release %s in %s runs %s %s (revision %d)\n", k.Release, k.Namespace, m.Name, m.ProjectVersion, m.Revision)
 	if upgrade {
@@ -1088,7 +1088,7 @@ func (in *Installer) K8sRollback(ctx context.Context) (err error) {
 		return err
 	}
 	if rel == nil {
-		return absent("nothing to roll back: "+in.k8sCtl("install")+" installs the release", "no release %s in %s", k.Release, k.Namespace)
+		return in.noRelease()
 	}
 	if err := in.pending(rel); err != nil {
 		return err
@@ -1129,9 +1129,55 @@ func (in *Installer) K8sRollback(ctx context.Context) (err error) {
 // noRelease is the refusal of a verb that needs the release when the namespace holds none, as
 // Docker's refuses a directory that holds no install: nothing changed, and the install is what
 // to run, named in the message too, as a verb without --json prints no fix.
-func (in *Installer) noRelease() error {
+func (in *Installer) noRelease() error { return in.noReleaseTo("") }
+
+// noReleaseTo is noRelease for an upgrade asked for version to (empty: none): it says what this
+// installer installs, which may be another release than the one asked.
+func (in *Installer) noReleaseTo(to string) error {
+	k, cmd := in.O.K8s, in.k8sInstallCmd()
+	asked := ""
+	if to != "" {
+		asked = " to upgrade to " + to
+	}
+	return absent("install first: `"+cmd+"`"+in.k8sInputsNote(), "no release %s in %s%s: `%s` installs %s", k.Release, k.Namespace, asked, cmd, in.R.Manifest.ProjectVersion)
+}
+
+// k8sInstallCmd is the k8s install an operator runs instead of this run: the release's flags and
+// what this run was given that the install takes — the mirror (--image-registry), its CA
+// (--registry-ca), --image-pull-login, the values files (--values), --unsafe-sysctls and
+// --no-provision. Never --dry-run (the install named is the one to run) nor --timeout (each
+// verb's own default).
+func (in *Installer) k8sInstallCmd() string {
 	k := in.O.K8s
-	return absent("install first: `"+in.k8sCtl("install")+"`", "no release %s in %s: `%s` installs %s", k.Release, k.Namespace, in.k8sCtl("install"), in.R.Manifest.ProjectVersion)
+	cmd := in.k8sCtl("install")
+	if k.Registry != "" {
+		cmd += " --image-registry " + shellQuote(k.Registry)
+	}
+	if ca := in.O.RegistryCA; ca != "" {
+		cmd += " --registry-ca " + shellQuote(ca)
+	}
+	if k.PullLogin {
+		cmd += " --image-pull-login"
+	}
+	for _, v := range k.Values {
+		cmd += " --values " + shellQuote(v)
+	}
+	if u := k.UnsafeSysctls; u != nil {
+		cmd += " --unsafe-sysctls=" + strconv.FormatBool(*u)
+	}
+	if in.O.NoProvision {
+		cmd += " --no-provision"
+	}
+	return cmd
+}
+
+// k8sInputsNote names, for an install hint, the inputs this run was given, which the install
+// takes the same way (never their values, a secret's included); empty when none was given.
+func (in *Installer) k8sInputsNote() string {
+	if len(in.O.Set) == 0 && len(in.O.Answers) == 0 && in.O.Given == nil {
+		return ""
+	}
+	return ", given the inputs this run was given (its --set, --set-file, --answers, --given or --kit)"
 }
 
 // k8sStatusRelease is the release both forms of `k8s status` report on, as helm lists it; a
@@ -1196,7 +1242,7 @@ func (in *Installer) K8sUpgradeTo(ctx context.Context, v string, args []string) 
 		return err
 	}
 	if rel == nil {
-		return absent(in.k8sCtl("install"), "no release %s in %s: `%s` installs %s", k.Release, k.Namespace, in.k8sCtl("install"), in.R.Manifest.ProjectVersion)
+		return in.noReleaseTo(v)
 	}
 	if err := in.pending(rel); err != nil {
 		return err

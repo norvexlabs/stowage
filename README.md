@@ -2061,8 +2061,26 @@ again, to copy an installer to another host.
   Docker, no helm release in the namespace on Kubernetes (`k8s upgrade`, `--version` too, and `k8s
   rollback`; never `k8s uninstall`, whose "nothing to uninstall" does not tell what helm keeps of a
   release — read `k8s status --json`) — never an install of another project or a release not from
-  Stowage's chart, and never on the VM, whose host daemon answers its verbs
-  (its `status --json` answers before the first install, `installed` `null`). A run that
+  Stowage's chart. On the VM, a verb that needs the install, run before the first install (`ps`,
+  `logs`, `restart`, `backup run`, `restore`, `rollback`, …), is refused, `absent` true (`<name>
+  is not installed yet: \`sudo <short>-stow install\` installs it`, its fix `sudo <short>-stow
+  install`, exit 3): the host daemon answers it 409 with `absent` and the verb's client carries
+  it; `upgrade` and `updates` still serve a VM whose first install did not run or was refused
+  (below), and `status --json` answers before the first install, `installed` `null`. A Docker
+  host's `backup`, `backup config` and `restore` verbs answer the same refusal with Docker's
+  words and fix (`<dir> holds no install`, the directory absolute, `install first, or give the
+  --dir of the install`) for a `--dir` that does not exist, is no directory or lies under a file,
+  before the daemon of their process is made (nothing is made there); whatever fails as that
+  daemon is made is reported as itself (an interruption, an exit status kept), never as an
+  unreachable daemon. A `--dir` that is a directory is the verb's to judge (its daemon's lock
+  files are made there first): the backup timer's `backup run` still skips one whose install is
+  not made. The k8s refusal of a missing release is one on every verb: its reason and its fix
+  name the install to run, with what this run was given that the install takes
+  (`--image-registry`, `--registry-ca`, `--image-pull-login`, `--values`, `--unsafe-sysctls`,
+  `--no-provision`; never `--dry-run`, as the install named is the one to run, nor `--timeout`,
+  each verb's own), the fix adding `, given the inputs this run was given (…)` when it was given any
+  (never a value); `k8s upgrade --version V` says `… to upgrade to V`.
+  A run that
   fails prints no object, only its error. `upgrade --version --json` passes `--json` to the
   installer it fetches, which prints the object; the run that fetched it prints none and exits
   with that installer's status (an installer from before 0.34.0 refuses the flag).
@@ -4810,7 +4828,10 @@ sudo <short>-stow network attach --role ROLE --mac MAC [--mode dhcp|static|none]
   `STOWAGE_INPUTS`, as on Docker; absent before the first install, and when the install records
   no such list and the OS's `<short>-stow` carries another release than the one installed, a
   crossing whose boot fell back, and the install keeps no installer of it this one reads); then `channel`, `installing`,
-  `install_failed` and the VM's own fields.
+  `install_failed`, what the first install recorded as Docker's `status --json` gives it —
+  `registry`, `short_name`, `address`, `registry_ca` (`sha256:` of the registry CA the install
+  keeps; left out when it keeps none, or when it cannot be read: the status always answers, and
+  a poll logs nothing) — and the VM's own fields.
 - `describe [--json]` prints what the release this OS carries offers, with no install: the
   Docker installer's `describe` (see "The installer (Docker shape)"), the same object.
 - **Exit status and `--json` on the VM.** `install`, `upgrade` and `rollback` take `--json`, as

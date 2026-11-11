@@ -330,6 +330,14 @@ type lazyTransport struct {
 	settings string
 }
 
+// madeErr is what failed as the daemon of this process was made (its --dir check, its making, a
+// lock wait the command's context ends) or as the settings lock was taken: hostClient.do returns
+// it as itself — a refusal still one, an exit status or a cancellation kept —, never as an
+// unreachable daemon.
+type madeErr struct{ error }
+
+func (e madeErr) Unwrap() error { return e.error }
+
 // startsJob reports a request that starts a job: a backup, a verify, a restore.
 func startsJob(r *http.Request) bool {
 	if r.Method != http.MethodPost {
@@ -352,7 +360,7 @@ func (t *lazyTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	if *h == nil {
 		made, err := make()
 		if err != nil {
-			return nil, err
+			return nil, madeErr{err}
 		}
 		*h = made
 	}
@@ -360,7 +368,7 @@ func (t *lazyTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	if t.settings != "" && r.URL.Path == "/v1/backup/config" && r.Method != http.MethodGet {
 		unlock, err := flockWait(t.settings, true)
 		if err != nil {
-			return nil, err
+			return nil, madeErr{err}
 		}
 		defer unlock()
 	}
@@ -380,6 +388,9 @@ func dockerHostCommands(in *Installer, prepare func() error, dirFlag func(*cobra
 		if err := prepare(); err != nil {
 			return nil, err
 		}
+		if err := in.dockerDirCheck(); err != nil {
+			return nil, err
+		}
 		c.ctl = in.ctl()
 		h, err := in.dockerWatchd(jobs)
 		if err != nil {
@@ -390,6 +401,9 @@ func dockerHostCommands(in *Installer, prepare func() error, dirFlag func(*cobra
 	}
 	lt.jobs = func() (http.Handler, error) {
 		if err := prepare(); err != nil {
+			return nil, err
+		}
+		if err := in.dockerDirCheck(); err != nil {
 			return nil, err
 		}
 		c.ctl = in.ctl()
@@ -421,7 +435,7 @@ func dockerHostCommands(in *Installer, prepare func() error, dirFlag func(*cobra
 	var out []*cobra.Command
 	if providers.RunsBackups(in.R.Spec) {
 		b := backupCommand(c, name, stdout, stderr)
-		restore := restoreCommand(c, name, in.R.Ctl()+" --dir DIR", stderr, terminal)
+		restore := restoreCommand(c, name, func() error { return in.noInstall(in.O.Dir) }, stderr, terminal)
 		for _, cmd := range append([]*cobra.Command{restore}, b.Commands()...) {
 			dirFlag(cmd)
 			ended(cmd)
@@ -437,9 +451,28 @@ func dockerHostCommands(in *Installer, prepare func() error, dirFlag func(*cobra
 			if err := prepare(); err != nil {
 				return err
 			}
+			if err := in.dockerDirCheck(); err != nil {
+				return err
+			}
 			return in.DiskCheck(cmd.Context())
 		},
 	}
 	dirFlag(check)
 	return append(out, check)
+}
+
+// dockerDirCheck refuses, as every verb refuses a directory with no install, a --dir that does not
+// exist or is no directory: nothing is made there (the daemon's locks, its journal). One that is
+// a directory is the handlers' to judge (the backup timer's run skips an install not made yet).
+func (in *Installer) dockerDirCheck() error {
+	dir, err := filepath.Abs(in.O.Dir) // "" is the current directory, as every verb reads it
+	if err != nil {
+		return err
+	}
+	// Missing, a file, or under a file (ENOTDIR): no directory, so no install. Another error (a
+	// permission) is the verb's to meet.
+	if st, err := os.Stat(dir); err == nil && !st.IsDir() || err != nil && !errors.Is(err, os.ErrPermission) {
+		return in.noInstall(dir)
+	}
+	return nil
 }

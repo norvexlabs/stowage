@@ -567,11 +567,6 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
   runner, a common place to run OpenTofu. Build darwin/arm64, darwin/amd64 and linux/arm64
   installers, the payload appended to each; needed before the provider's Kubernetes target ships.
 
-- **The k8s refusals' wording, one way**: `k8s rollback`'s no-release refusal names no command in
-  its reason, the upgrade refusals use a bare-command fix naming the running installer's version
-  rather than the asked one, and the install hint these refusals build leaves out the
-  `--registry` / `--image-registry` the operator gave.
-
 ## Could
 
 - **A bind input refuses a loopback address the loopback answers on but does not carry**: an L4

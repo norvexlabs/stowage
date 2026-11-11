@@ -14,7 +14,7 @@ import (
 // (noRelease): exit 3, the install to run named.
 func TestK8sVerbsRefuseNoRelease(t *testing.T) {
 	t.Parallel()
-	const want = "no release notes in notes: `notes-stow k8s install --namespace notes --release notes` installs 1.0.0"
+	const want = "no release notes in notes: `notes-stow k8s install --namespace notes --release notes --no-provision` installs 1.0.0" // the fixture gives --no-provision
 	e := newKubeEnv(t, spec.Provider{Name: "none"})
 	e.release = e.at("1.0.0", 1, rotating)
 	e.f.listed = nil

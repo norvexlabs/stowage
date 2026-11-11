@@ -416,7 +416,7 @@ func TestTheVerbsTakeJSON(t *testing.T) {
 	if err := cmd.ExecuteContext(context.Background()); !isRefused(err) {
 		t.Fatalf("%v\n%s", err, &log)
 	}
-	if r := oneResult(t, out.String()); r.Refused == nil || r.Refused.Reason != "no release notes in notes" || r.Release != nil {
+	if r := oneResult(t, out.String()); r.Refused == nil || r.Refused.Reason != "no release notes in notes: `notes-stow k8s install --namespace notes --release notes` installs 1.0.0" || !r.Refused.Absent || r.Release != nil {
 		t.Errorf("%+v", r)
 	}
 	// Done: what the run prints for a person goes to standard error.

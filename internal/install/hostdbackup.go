@@ -871,10 +871,10 @@ func (h *Hostd) planBackup(ctx context.Context, req BackupRequest) (*backupPlan,
 		return nil, skippable(err, "")
 	}
 	in, _ := h.run()
-	if notInstalled(in) {
-		return nil, skippable(fail(http.StatusConflict, "%s is not installed yet", h.R.Spec.Name), "")
-	}
 	env, err := h.installed(in)
+	if r, ok := Refusal(err); ok && r.Absent {
+		return nil, skippable(err, "") // the timer's run skips a VM not installed yet
+	}
 	if err != nil {
 		return nil, err
 	}
