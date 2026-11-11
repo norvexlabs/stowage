@@ -478,7 +478,7 @@ a real registry, the local Docker engine, a kind cluster and a VM on TrueNAS
 | inputs digests and the build graph | |
 | installer (Docker): loopback and every TLS front (`acme`, `dns-cloudflare`, `byo`, `internal`), terminal form, `install`, re-run (changes the inputs and the front's ports), `status` (`--json`), `ps`, `logs`, `restart`/`stop`/`start`, `exec`, `schema`, `uninstall` (`--data`), `provision`, `script`, `upgrade` (`--version` fetches the release's installer), `rollback`, `reset-db`, `--dry-run`, `--offline`, a mirror and its CA (`--registry`, `--registry-ca`); `mirror export` / `mirror import` (a release carried as one file to a site without internet); `secrets rotate`, `secrets export` and `--secrets` (a machine made again) | scheduled backup, restore, chart library, `upgrade --reset-db` |
 | installer (Kubernetes): `<short>-stow k8s install`, `upgrade` (`--version`), `rollback`, `status` (`--json`), `reset-db`, `uninstall` (`--data`), `provision` (the hook as a Job after the release, its outputs in a Secret and handed back, `--set`), `secrets rotate`, `tune`, `--dry-run`, `--no-provision`, `--image-registry`, `--image-pull-login`, `--registry-ca`, `--unsafe-sysctls` | barrier pre-flight before `rollback` |
-| installer (Kairos VM): `<short>-stow vm create` (the disk image by digest, the cloud-config on a seed ISO or as user-data, the platform's steps; or the VM created with OpenTofu — TrueNAS's module, the previews for libvirt, Proxmox VE, vSphere, AWS, Google Cloud, Azure and Scaleway, or the operator's own holding the module contract — waited for until it installed; from a mirror whose CA the VM then trusts), `vm seed --json` (the first-boot material for a VM made by other means), `vm host-key` (its own host key, the seed's retired), `vm destroy` and `vm attach` (a NIC for a role a newer release names, on TrueNAS); `<short>-stow` in the OS bundle — the first install from the cloud-config's settings, `install` from the preloaded images, the boot (install up again, upgrade to the OS's release, back to the replaced one), `describe`, `--json` on `install`, `upgrade` and `rollback`, the host daemon and its verbs (`status` (`--json`), `health`, `events`, `ps`, `logs`, `restart`/`stop`/`start`, `provision`, `updates`, `upgrade`, `rollback` to the passive system, `reset-db`, `network` with its auto-revert, `backup` — scheduled, before an upgrade, or now, encrypted to age keys and uploaded with rclone; `verify` of proposed settings —, `restore`, `secrets export` and `rotate`, `reboot`, `shutdown`), its disk-pressure watch (`hooks.maintenance.disk_pressure`), its app socket for the services `host_api` names, the health gate judging each boot (Kairos boot assessment: an upgraded boot not healthy in time falls back to the passive system, unless going back is refused at a rollback barrier: it is then kept), a default-deny firewall (`vm create --ssh-allow`), the time zone (`--timezone`), a disaster recovery (`vm create --secrets`) | |
+| installer (Kairos VM): `<short>-stow vm create` (the disk image by digest, the cloud-config on a seed ISO or as user-data, the platform's steps; or the VM created with OpenTofu — TrueNAS's module, the previews for libvirt, Proxmox VE, vSphere, AWS, Google Cloud, Azure and Scaleway, or the operator's own holding the module contract — waited for until it installed; from a mirror whose CA the VM then trusts), `vm seed --json` (the first-boot material for a VM made by other means), `vm host-key` (its own host key, the seed's retired; `<short>-stow host-key` on the VM itself), `vm destroy` and `vm attach` (a NIC for a role a newer release names, on TrueNAS); `<short>-stow` in the OS bundle — the first install from the cloud-config's settings, `install` from the preloaded images, the boot (install up again, upgrade to the OS's release, back to the replaced one), `describe`, `--json` on `install`, `upgrade` and `rollback`, the host daemon and its verbs (`status` (`--json`), `health`, `events`, `ps`, `logs`, `restart`/`stop`/`start`, `provision`, `updates`, `upgrade`, `rollback` to the passive system, `reset-db`, `network` with its auto-revert, `backup` — scheduled, before an upgrade, or now, encrypted to age keys and uploaded with rclone; `verify` of proposed settings —, `restore`, `secrets export` and `rotate`, `reboot`, `shutdown`), its disk-pressure watch (`hooks.maintenance.disk_pressure`), its app socket for the services `host_api` names, the health gate judging each boot (Kairos boot assessment: an upgraded boot not healthy in time falls back to the passive system, unless going back is refused at a rollback barrier: it is then kept), a default-deny firewall (`vm create --ssh-allow`), the time zone (`--timezone`), a disaster recovery (`vm create --secrets`) | |
 
 ## Reference — for people and AI agents
 
@@ -4347,6 +4347,23 @@ in the same installer (bootstrap it as above, then `sh <name>.sh vm create …`,
   rebooted since its install serving its own key alone — the fix names the console's check,
   `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub`), and the reach's own errors (no key known,
   a bad `--known-hosts-line`, `--user` or `--host`). A refusal prints its object as `vm seed`'s.
+- **`sudo <short>-stow host-key [--json]`**, on the VM itself, runs the same steps locally (no
+  SSH, so no SSH config of the operator's): it prints the VM's own ed25519 host key as a
+  `known_hosts` line under the VM's host name (`<hostname> ssh-ed25519 AAAA…`), or with `--json`
+  `{"format": 1, "known_hosts_line": …, "fingerprint": "SHA256:…"}`, and retires the seed's
+  one-time key at once (as root, its steps run without sudo); run again it changes nothing more.
+  Refused (exit 3, nothing changed; with `--json` the refusal as one object, as `status
+  --json`'s): on Kairos's recovery or a live boot, told first (`this is Kairos's recovery system
+  or a live boot, whose host keys are not the active system's: the one-time key is kept`; run it
+  again once the VM rebooted into its active system), not as root (`host-key retires the seed's one-time host key,
+  which root alone can`, the fix `run the same command with sudo`), before the first install
+  (`absent`), and while it is not done, still running or failed (it may still wait for secrets or
+  a certificate given over SSH, pinned to the one-time key; the install retires it itself). A step that fails (the mark on `/oem` not
+  written, say) fails the verb (exit 1) naming it; the steps run again whole. The host name is
+  taken as ssh matches it (lower-cased, without a root dot); one the line cannot hold (none,
+  `localhost`, one `vm create --hostname` refuses, which a known_hosts line would read as a
+  pattern) is refused too, naming `hostnamectl set-hostname NAME`. The steps
+  are the ones the first boot after the install runs, and `vm host-key` over SSH (with sudo).
 - The platform decides the disk format (the first of its formats the registry holds: a mirror
   carries the formats its `mirror export --disks` named) and how the cloud-config reaches the VM.
   Only the platforms the registry has a disk for are offered; a `--platform` whose formats the
@@ -4846,6 +4863,7 @@ sudo <short>-stow install [--channel C] [--set KEY=VALUE]… [--set-file KEY=PAT
 <short>-stow secrets rotate KEY [--stage | --finish]   # a secret with rotation: true
 <short>-stow secrets set KEY [--accessible] < value   # a secret with settable: true
 <short>-stow secrets show KEY   # a settable secret's value, on a terminal only (the operator's socket)
+<short>-stow host-key [--json]   # as root: this VM's own SSH host key, the seed's one-time key retired
 <short>-stow network [--json]          # the address, gateway and DNS servers, what sets them, a change awaiting confirmation
 <short>-stow tune [--check]           # how the VM's network settings differ from what its boot tuning wants (the stack's profile); --check exits non-zero
 <short>-stow network set --mode dhcp|static [--address A/P] [--gateway G] [--ipv6 [--address6 A/P] [--gateway6 G]] [--dns D,…] [--revert-secs N | --no-revert]

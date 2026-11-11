@@ -52,7 +52,7 @@ func newSeedHostKey(comment string) (*seedHostKey, error) {
 // retires the key (an install that rebooted the VM already has, and the pinned key no longer answers).
 func (in *Installer) retireSeedHostKey(ctx context.Context, dir, pin string, m Machine, addr, pubKey string) {
 	o := &in.O
-	out, err := o.SSH.Run(ctx, Cmd{Args: pinnedSSHArgs(pin, m.User, addr, pubKey, in.retireSeedKeyCommand()...)})
+	out, err := o.SSH.Run(ctx, Cmd{Args: pinnedSSHArgs(pin, m.User, addr, pubKey, in.retireSeedKeyCommand(true, kairosCos)...)})
 	var own, blob string
 	if err == nil {
 		if blob, own, err = ownHostKey(out); err == nil {
@@ -74,11 +74,11 @@ func (in *Installer) retireSeedHostKey(ctx context.Context, dir, pin string, m M
 // the OEM partition, sshd reloaded. Run again, it prints the key and changes nothing more.
 // On Kairos's recovery system, or a live (installer) boot, it prints recoveryMark alone and
 // changes nothing: their keys are not the active system's, and the mark would keep the active
-// system from serving the one-time key.
-func (in *Installer) retireSeedKeyCommand() []string {
-	key, dropIn, retired := seedHostKeyFiles(in.R.Spec.Name)
-	return []string{"if", "[", "-e", "/run/cos/recovery_mode", "]", "||", "[", "-e", "/run/cos/live_mode", "];", "then", "echo", recoveryMark + ";", "else",
-		"cat", "/etc/ssh/ssh_host_ed25519_key.pub", "&&", "sudo", "rm", "-f", dropIn, key, "&&", "sudo", "touch", retired, "&&", "sudo", "sh", "-c", "'" + sshdReload + "';", "fi"}
+// system from serving the one-time key. Its steps are retireSteps', under sudo or not; cos is
+// the directory Kairos marks its boot's mode in (/run/cos).
+func (in *Installer) retireSeedKeyCommand(sudo bool, cos string) []string {
+	return []string{"if", "[", "-e", shellQuote(cos + "/recovery_mode"), "]", "||", "[", "-e", shellQuote(cos + "/live_mode"), "];", "then", "echo", recoveryMark + ";", "else",
+		"cat", "/etc/ssh/ssh_host_ed25519_key.pub", "&&", retireSteps(in.R.Spec.Name, sudo) + ";", "fi"}
 }
 
 // recoveryMark is what retireSeedKeyCommand prints on a recovery or live boot.

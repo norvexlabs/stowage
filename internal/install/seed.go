@@ -333,7 +333,7 @@ func UserData(name, ctl string, m Machine, st Settings, ca []byte) ([]byte, erro
 		}, stage{
 			Name:     name + ": the one-time SSH host key retired after the install",
 			If:       "[ -e " + VMDir(name) + "/" + envName + " ] && [ ! -e " + retired + " ]",
-			Commands: []string{"rm -f " + dropIn + " " + key + " && touch " + retired + " && " + sshdReload},
+			Commands: []string{retireSteps(name, false)},
 		})
 	}
 	// The host name is set in the initramfs stage, before networkd starts: its DHCP request then
@@ -380,9 +380,22 @@ func seedHostKeyFiles(name string) (key, dropIn, retired string) {
 	return "/run/" + name + "-seed-host-key", "/etc/ssh/sshd_config.d/01-" + name + "-seed-host-key.conf", "/oem/" + name + "-seed-host-key.retired"
 }
 
+// retireSteps are the shell steps retiring the seed's one-time host key of the project name: its
+// file and sshd drop-in removed, its retirement marked on the OEM partition, sshd reloaded; each
+// under sudo (over SSH, as the VM's user), or as it is (run as root: the boot's stage, host-key on
+// the VM). The one sequence every retirement runs.
+func retireSteps(name string, sudo bool) string {
+	key, dropIn, retired := seedHostKeyFiles(name)
+	if sudo {
+		return "sudo rm -f " + dropIn + " " + key + " && sudo touch " + retired + " && sudo sh -c '" + sshdReload + "'"
+	}
+	return "rm -f " + dropIn + " " + key + " && touch " + retired + " && " + sshdReload
+}
+
 // sshdReload makes a running sshd read its configuration again (Debian's unit is ssh.service,
-// others' sshd.service); one not running reads it when it starts.
-const sshdReload = "for u in ssh.service sshd.service; do systemctl try-reload-or-restart $u 2>/dev/null; done; true"
+// others' sshd.service); one not running reads it when it starts. Grouped: in `a && b &&
+// sshdReload` the list's status stays a's or b's failure, and the reload's own is always 0.
+const sshdReload = "{ for u in ssh.service sshd.service; do systemctl try-reload-or-restart $u 2>/dev/null; done; true; }"
 
 // SSHRules is the firewall's SSH rule file on the VM: the bundle's opens SSH to every source, and
 // a cloud-config with Machine.SSHAllow replaces it.

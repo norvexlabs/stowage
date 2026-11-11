@@ -644,6 +644,19 @@ func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(
 	dirFlag(netAttach)
 	netCmd.AddCommand(netAttach)
 	restore := restoreCommand(c, name, func() error { return (&Installer{R: r, O: o}).noInstall(o.Dir) }, stderr, terminal)
+	var hkJSON bool
+	hostKey := &cobra.Command{
+		Use:   "host-key",
+		Short: "Print this VM's own SSH host key as a known_hosts line and retire its seed's one-time key, on this VM as root (refused on the recovery or a live boot)",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			in.O = o
+			k, err := in.LocalHostKey(cmd.Context())
+			return printHostKey(stdout, k, err, hkJSON)
+		},
+	}
+	hostKey.Flags().BoolVar(&hkJSON, "json", false, "print the key as one JSON object (format, known_hosts_line, fingerprint), a refusal as one too")
+	root.AddCommand(hostKey)
 	root.AddCommand(prov, updates, upgrade, rollback, reset, secrets, restore, netCmd, backupCommand(c, name, stdout, stderr),
 		power("reboot", "Reboot the VM", "/v1/reboot"),
 		power("shutdown", "Power the VM off", "/v1/shutdown"))

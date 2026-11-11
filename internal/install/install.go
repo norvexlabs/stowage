@@ -163,6 +163,8 @@ type Options struct {
 	Euid        func() int
 	NetworkdDir string
 	GatewayRun  string
+	// Hostname replaces os.Hostname in tests (host-key's known_hosts line).
+	Hostname func() (string, error)
 	// FlushConntrack replaces the flush of the host's connection-tracking table in tests.
 	FlushConntrack func() error
 	// Roots are the host's trusted CAs a byo chain is checked against; nil is the system's.
@@ -187,7 +189,11 @@ type Options struct {
 func (o *Options) logf(format string, a ...any) { fmt.Fprintf(o.Log, format+"\n", a...) }
 
 // cos is where Kairos marks the system it booted.
-func (o *Options) cos() string { return cmp.Or(o.Cos, "/run/cos") }
+func (o *Options) cos() string { return cmp.Or(o.Cos, kairosCos) }
+
+// kairosCos is the directory Kairos marks its boot's mode in (active_mode, recovery_mode,
+// live_mode…).
+const kairosCos = "/run/cos"
 
 // bootID is this boot's id, as the kernel publishes it; empty when it cannot be read.
 func (o *Options) bootID() string { return readBootID(cmp.Or(o.BootIDFile, kernelBootID)) }

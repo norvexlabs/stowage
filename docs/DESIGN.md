@@ -932,8 +932,10 @@ Stowage calls a project's programs: the two never share a reader.
   as the verb's did. `vm host-key --json` reads the VM's own host key through that pinned key and
   retires the seed's one-time key at once — the step `vm create` runs after its install over
   SSH —, printing the VM's key as a `known_hosts` line: a consumer pins the VM's own key from
-  then on, with no file steps of its own. A refusal of `vm seed` or `vm host-key` prints its object
-  as `status --json`'s.
+  then on, with no file steps of its own. `<short>-stow host-key --json`, as root on the VM, runs
+  that same command locally rather than over SSH (one implementation), for a consumer on the VM
+  or one holding no SSH config of the operator's. A refusal of `vm seed`, `vm host-key` or
+  `host-key` prints its object as `status --json`'s.
 
 ## 7. Full lifecycle matrix
 

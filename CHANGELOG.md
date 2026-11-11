@@ -46,7 +46,8 @@ follow [SemVer](https://semver.org/).
   install can wait for a secrets export (`--await-secrets`) or a `byo` certificate (`--tls byo`)
   given over SSH. A refusal prints its object on standard output.
 - `vm host-key HOSTNAME --json` reads a VM's own SSH host key through the key it is checked by
-  and retires its seed's one-time key at once.
+  and retires its seed's one-time key at once; `sudo <short>-stow host-key [--json]` does the same
+  on the VM itself, with no SSH.
 
 ### Changed
 
