@@ -950,7 +950,7 @@ func TestAnL4RoutesExposureIsSaid(t *testing.T) {
 	if got := in.l4Exposure(route, none, nil, heldCA{}); got != "open to whoever reaches this host: SRC's list is not held yet: a start as root applies it, on IPv4 alone (consented; `status` says what the last one did)" {
 		t.Errorf("consented, not applied: %q", got)
 	}
-	rules, _ := allowRules(in.allowed(), in.allowChain(), none)
+	rules, _ := in.heldRules(in.allowChain(), none)
 	if err := os.WriteFile(in.allowHeld(), []byte(heldMark(rules)), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -1366,7 +1366,7 @@ func TestFrontStripsHeadersAndPublishesOnTheLoopback(t *testing.T) {
 			t.Errorf("Caddyfile lacks %q:\n%s", want, cf)
 		}
 	}
-	fc, err := frontCompose(e.r.Spec.Front, nil, nil, Loopback, hostAPI{}, "sha256:x", "", false, false, false, nil, nil)
+	fc, err := frontCompose(e.r.Spec.Front, nil, nil, Loopback, hostAPI{}, "sha256:x", "", false, false, false, nil, nil, false)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -114,6 +114,11 @@ docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$pg" | grep
 # The release's network profile: each container gets the profile's settings and the host's open
 # files, the stack's network the host route's MTU.
 api=$(docker ps -q --filter "label=com.docker.compose.project=$(project)" --filter label=com.docker.compose.service=api)
+# ENCRYPTION_KEY is delivered as a file (as_file): the api reads the file and has no such variable.
+docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$api" | grep -q '^ENCRYPTION_KEY=' &&
+	fail "the api's environment holds ENCRYPTION_KEY: it is delivered as a file"
+[[ $(docker exec "$api" cat /run/secrets/encryption_key) == "$(grep '^ENCRYPTION_KEY=' "$D/.env" | cut -d= -f2- | tr -d "'")" ]] ||
+	fail "the api's /run/secrets/encryption_key is not the recorded ENCRYPTION_KEY"
 read -r reuse somax < <(docker exec "$api" python3 -c 'print(*(open("/proc/sys/net/" + k).read().strip() for k in ("ipv4/tcp_tw_reuse", "core/somaxconn")))') ||
 	fail "the api's namespace does not read"
 [[ $reuse == 1 ]] && ((somax >= 8192)) || fail "the api's namespace holds tcp_tw_reuse $reuse, somaxconn $somax: not the network profile's"

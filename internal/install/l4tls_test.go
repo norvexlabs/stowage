@@ -167,7 +167,7 @@ func TestL4TLSALPN(t *testing.T) {
 		} else {
 			cf = tlsCaddyfile(front, c.routes, c.mode, domains, "", "443", false, get, nil)
 		}
-		fc, err := frontCompose(front, c.routes, get, c.mode, hostAPI{}, "d", "", strings.Contains(cf, noALPNMark), false, false, nil, nil)
+		fc, err := frontCompose(front, c.routes, get, c.mode, hostAPI{}, "d", "", strings.Contains(cf, noALPNMark), false, false, nil, nil, false)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -206,7 +206,7 @@ func TestL4TLSFrontCompose(t *testing.T) {
 	routes[1].BindInput = "DB_BIND"
 	for mode, hostIP := range map[string]string{"internal": "192.0.2.9", Loopback: "${STOWAGE_LOOPBACK_ADDRESS}"} {
 		get := func(k string) string { return map[string]string{"DB_BIND": "192.0.2.9"}[k] }
-		raw, err := frontCompose(l4TLSFront(), routes, get, mode, hostAPI{}, "sha256:x", "", false, false, false, []string{"db"}, nil)
+		raw, err := frontCompose(l4TLSFront(), routes, get, mode, hostAPI{}, "sha256:x", "", false, false, false, []string{"db"}, nil, false)
 		if err != nil {
 			t.Fatal(err)
 		}

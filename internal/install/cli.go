@@ -426,7 +426,12 @@ func newCommand(r *Release, self string, stdout, stderr io.Writer, tools K8sOpti
 			return nil, err
 		}
 		return in.ExportSecrets(recipients)
-	}))
+	}, settableShow(r.Spec, func(cmd *cobra.Command, key string) (string, error) {
+		if err := prepare(); err != nil {
+			return "", err
+		}
+		return in.ShowSecret(cmd.Context(), key)
+	})))
 	if r.Spec.Shapes.Kubernetes != nil {
 		root.AddCommand(k8sCommand(in, &o, prepare, terminal, &sets, &setFiles, &answers, &noInput, &accessible, func(c *cobra.Command, uninstall bool) {
 			jsonFlag(c, verbKind{k8s: true, uninstall: uninstall})
@@ -635,15 +640,40 @@ func k8sCommand(in *Installer, o *Options, prepare func() error, terminal func(b
 		pf.StringVar(&o.RegistryCA, "registry-ca", "", "a PEM file of the CA the release's registry's certificate chains to, a mirror's own")
 		k.AddCommand(prov)
 	}
+	var rotateTimeout time.Duration
+	var rotate func(cmd *cobra.Command, key, pass string) error
 	if slices.ContainsFunc(in.R.Spec.Secrets, func(s spec.Secret) bool { return s.Rotation }) {
-		var rotateTimeout time.Duration
-		k.AddCommand(secretsCommand(in.R.Spec.Name, o.Out, func(c *cobra.Command) {
-			c.Flags().DurationVar(&rotateTimeout, "timeout", 6*time.Minute, "how long kubectl waits for each restarted workload to be ready")
-		}, func(cmd *cobra.Command, key, pass string) error {
+		rotate = func(cmd *cobra.Command, key, pass string) error {
 			return run(cmd, rotateTimeout, false, func(ctx context.Context) error { return in.K8sRotateSecret(ctx, key, pass) })
-		}, nil, nil, nil, nil))
+		}
+	}
+	show := settableShow(in.R.Spec, func(cmd *cobra.Command, key string) (v string, err error) {
+		err = run(cmd, 0, false, func(ctx context.Context) error { v, err = in.K8sShowSecret(ctx, key); return err })
+		return v, err
+	})
+	if rotate != nil || show != nil {
+		k.AddCommand(secretsCommand(in.R.Spec.Name, o.Out, func(c *cobra.Command) {
+			if c.Name() == "rotate" {
+				c.Flags().DurationVar(&rotateTimeout, "timeout", 6*time.Minute, "how long kubectl waits for each restarted workload to be ready")
+			}
+		}, rotate, nil, nil, nil, nil, show))
 	}
 	return k
+}
+
+// settableShow is show when the spec has a settable secret, else nil: `secrets show` is offered
+// only where there is one to show.
+func settableShow(sp *spec.Spec, show func(cmd *cobra.Command, key string) (string, error)) func(cmd *cobra.Command, key string) (string, error) {
+	if slices.ContainsFunc(sp.Secrets, func(s spec.Secret) bool { return s.Settable }) {
+		return show
+	}
+	return nil
+}
+
+// isTerminal reports whether w is a terminal: `secrets show` prints nowhere else.
+var isTerminal = func(w io.Writer) bool {
+	f, ok := w.(*os.File)
+	return ok && term.IsTerminal(int(f.Fd()))
 }
 
 // secretValue is the value `secrets set KEY` records: asked on terminal when standard input is
@@ -724,8 +754,28 @@ func pipedInput(f *os.File) bool {
 // returns written where --output says (none without it); flags adds the shape's own flags to each.
 func secretsCommand(name string, stdout io.Writer, flags func(*cobra.Command), rotate func(cmd *cobra.Command, key, pass string) error,
 	set func(cmd *cobra.Command, key, value string) error, check func(key, value string) error, terminal func(accessible bool) Prompter,
-	export func(cmd *cobra.Command, recipients []string) ([]byte, error)) *cobra.Command {
-	s := &cobra.Command{Use: "secrets", Short: "The install's secrets: rotate one, set one, or export them all for a disaster recovery", Args: cobra.NoArgs}
+	export func(cmd *cobra.Command, recipients []string) ([]byte, error), show func(cmd *cobra.Command, key string) (string, error)) *cobra.Command {
+	s := &cobra.Command{Use: "secrets", Short: "The install's secrets: rotate one, set one, show a settable one, or export them all for a disaster recovery", Args: cobra.NoArgs}
+	if show != nil {
+		c := &cobra.Command{
+			Use:   "show KEY",
+			Short: "Print the value the install records for a secret whose spec entry has settable: true (a login), on a terminal only: refused when standard output is a pipe or a file",
+			Args:  cobra.ExactArgs(1),
+			RunE: func(cmd *cobra.Command, args []string) error {
+				if !isTerminal(stdout) {
+					return fmt.Errorf("%s: standard output is no terminal: `secrets show` prints a value on a terminal only, never into a pipe, a file or a log; `secrets export` carries the secrets encrypted", args[0])
+				}
+				v, err := show(cmd, args[0])
+				if err != nil {
+					return err
+				}
+				_, err = fmt.Fprintln(stdout, v)
+				return err
+			},
+		}
+		flags(c)
+		s.AddCommand(c)
+	}
 	if set != nil {
 		var accessible bool
 		c := &cobra.Command{

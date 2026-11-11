@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"unicode/utf8"
 
@@ -60,7 +61,7 @@ type networkdFile struct {
 // gatewayDeclared reports whether the release declares what a Docker host applies on consent: a
 // service's nftables table, forwarding between roles, or a tun device.
 func (in *Installer) gatewayDeclared() bool {
-	return len(in.R.Tables()) > 0 || len(in.gatewayRoles()) > 0 || forwards(in.R.Spec.Host) || len(in.allowRoutes()) > 0
+	return len(in.R.Tables()) > 0 || len(in.gatewayRoles()) > 0 || forwards(in.R.Spec.Host) || len(in.allowRoutes()) > 0 || len(in.heldNames()) > 0
 }
 
 // gatewayRoles are the tun roles, whose whole networkd file a Docker host is given.
@@ -257,7 +258,7 @@ func heldMark(rules map[string][]byte) string {
 // applied and saw hold (allowHeld): a start not as root, which applies nothing, after an upgrade
 // or a change of values leaves another mark.
 func (in *Installer) allowHolds(get func(string) string) bool {
-	rules, err := allowRules(in.allowed(), in.allowChain(), get)
+	rules, err := in.heldRules(in.allowChain(), get)
 	if err != nil || rules == nil {
 		return false
 	}
@@ -290,51 +291,348 @@ func (in *Installer) allowed() []spec.L4Route {
 	return out
 }
 
+// frontPorts are the front's two host ports, as recorded (get), and an error naming a value that is
+// no TCP port; such a value is the spec's port (a boot before the start: values that do not read),
+// which is the front's unless the install moved it (--http-port, --https-port).
+func (in *Installer) frontPorts(get func(string) string) ([]int, error) {
+	f := in.R.Spec.Front
+	var ports []int
+	var errs []error
+	for _, p := range []struct {
+		key  string
+		spec int
+	}{{HTTPPortVar, cmp.Or(f.HTTPPort, 80)}, {HTTPSPortVar, cmp.Or(f.HTTPSPort, 443)}} {
+		v := get(p.key)
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 || n > 65535 {
+			errs = append(errs, fmt.Errorf("%s %q is not a TCP port", p.key, v))
+			n = p.spec
+		}
+		ports = append(ports, n)
+	}
+	return ports, errors.Join(errs...)
+}
+
+// interfaced are the L4 routes a Docker host holds to their interfaces (l4.routes[].interfaces):
+// those Docker publishes, by the route's upstream or, for one the front terminates TLS on, by the
+// front.
+func (in *Installer) interfaced() []spec.L4Route {
+	var out []spec.L4Route
+	onHost := in.hostServices()
+	for _, r := range in.R.Spec.L4.Routes {
+		if name, _, _ := strings.Cut(r.Upstream, ":"); len(r.Interfaces) > 0 && (r.Terminated() || !slices.Contains(onHost, name)) {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// frontHeld reports whether a Docker host holds the front's ports to its interfaces
+// (front.interfaces).
+func (in *Installer) frontHeld() bool {
+	return in.R.Spec.Front.Declared() && len(in.R.Spec.Front.Interfaces) > 0
+}
+
+// heldNames are what a consented Docker host holds to interfaces: "front", then the L4 routes'
+// names (interfaced).
+func (in *Installer) heldNames() []string {
+	var names []string
+	if in.frontHeld() {
+		names = append(names, "front")
+	}
+	for _, r := range in.interfaced() {
+		names = append(names, r.Name)
+	}
+	return names
+}
+
+// heldNamesIn are heldNames as the recorded values (get) hold them (held): the front, and an L4
+// route the front terminates TLS on, are on the loopback address alone in loopback mode, held
+// nowhere.
+func (in *Installer) heldNamesIn(get func(string) string) []string {
+	var names []string
+	for _, h := range in.held(get) {
+		if !slices.Contains(names, h.name) {
+			names = append(names, h.name)
+		}
+	}
+	return names
+}
+
+// portHold is a published port a consented Docker host holds in its allow chain: to the sources
+// an input holds (allow, an L4 route's allowlist) and to the devices of host.interfaces roles
+// (roles), each when given.
+type portHold struct {
+	name, protocol string
+	service        string // the service whose published port it is
+	port           int
+	bind           string // the address it is published on alone; "" every address
+	allow          string
+	roles          []string
+	v6             bool // held for IPv6 too: the front with the stack's IPv6 on
+}
+
+// holds are the ports allowRules holds on a Docker host: each route's of allowed and interfaced,
+// and the front's two, while it is held (frontHeld) and not on the loopback address.
+func (in *Installer) holds(get func(string) string) []portHold {
+	var out []portHold
+	if in.frontHeld() && get("STOWAGE_TLS_MODE") != Loopback {
+		ports, _ := in.frontPorts(get)
+		for _, n := range ports {
+			out = append(out, portHold{name: "front", service: FrontService, protocol: "tcp", port: n, roles: in.R.Spec.Front.Interfaces, v6: get(IPv6Var) == "true"})
+		}
+	}
+	allow, ifaced := in.allowed(), in.interfaced()
+	for _, r := range in.R.Spec.L4.Routes {
+		upstream, _, _ := strings.Cut(r.Upstream, ":")
+		if r.Terminated() {
+			upstream = FrontService // the front's port
+		}
+		h := portHold{name: r.Name, service: upstream, protocol: r.Protocol, port: r.Port, bind: bindAddr(r, get)}
+		if slices.ContainsFunc(allow, func(a spec.L4Route) bool { return a.Name == r.Name }) {
+			h.allow = r.AllowInput
+		}
+		if slices.ContainsFunc(ifaced, func(a spec.L4Route) bool { return a.Name == r.Name }) {
+			if r.Terminated() && get("STOWAGE_TLS_MODE") == Loopback {
+				continue // on the loopback address alone
+			}
+			h.roles = r.Interfaces
+		}
+		if h.allow != "" || len(h.roles) > 0 {
+			out = append(out, h)
+		}
+	}
+	return out
+}
+
 // allowV4Only are the L4 routes a consented Docker host publishes on IPv4 alone: those with an
-// allowlist, whose IPv6 clients Docker's userland proxy may carry past DOCKER-USER, unfiltered (a
-// stack without IPv6, an upstream on a network without it, an engine with ip6tables off).
+// allowlist or interfaces, whose IPv6 clients Docker's userland proxy may carry past DOCKER-USER,
+// unfiltered (a stack without IPv6, an upstream on a network without it, an engine with ip6tables
+// off).
 func (in *Installer) allowV4Only() []string {
 	if in.O.Firewall != "" || !in.gatewayConsented() {
 		return nil
 	}
-	return in.allowRoutes()
+	names := in.allowRoutes()
+	for _, r := range in.interfaced() {
+		if !slices.Contains(names, r.Name) {
+			names = append(names, r.Name)
+		}
+	}
+	return names
 }
 
-// allowRules are chain's rules, iptables's alone, for the L4 routes' source allowlists on a Docker
-// host, which publishes those routes on IPv4 alone (allowV4Only): a connection to a route's
-// published port (its original destination, which Docker translates to the container's: the port,
-// and the route's bind address when it has one) from one of its input's IPv4 sources returns to
-// DOCKER-USER, which goes on to Docker's own rules, and any other is dropped; an empty list drops
-// every source. Nil when no route has an allowlist. A recorded value read back is checked again
-// (checkSources): it goes into the host's rules as root.
-func allowRules(routes []spec.L4Route, chain string, get func(string) string) (map[string][]byte, error) {
-	var rules []string
-	n := 0
-	for _, r := range routes {
-		if r.AllowInput == "" {
-			continue
+// frontV4Only reports whether a consented Docker host publishes the front's ports on IPv4 alone:
+// held to its interfaces while the stack's IPv6 is off, whose IPv6 clients Docker's userland proxy
+// would carry past DOCKER-USER (with it on, Docker translates them, and the hold is IPv6's too).
+func (in *Installer) frontV4Only(get func(string) string) bool {
+	return in.O.Firewall == "" && in.gatewayConsented() && in.frontHeld() && get(IPv6Var) != "true"
+}
+
+// holdRules are chain's rules for the ports holds names (a Docker host's L4 allowlists and interface
+// holds; the original destination is the published port Docker translates), each held to its
+// sources (an empty list drops every one) and to its roles' devices (dev): a connection to its
+// published port from one of those sources (any, without an allowlist) arriving on one of those
+// devices (any interface, without roles) returns to DOCKER-USER, and any other is dropped — for a
+// hold with roles, of the connections Docker forwards to a container bridge (br-*, docker0). A role
+// no device plays (dev "") adds none: fail closed. The rules are iptables's, and ip6tables's too
+// where a hold is IPv6's (portHold.v6) — that one without sources. Nil when nothing is held.
+func holdRules(holds []portHold, chain string, get func(string) string, dev func(string) string) (map[string][]byte, error) {
+	var v4, v6 []string
+	for _, h := range holds {
+		sources := []string{""}
+		if h.allow != "" {
+			v := get(h.allow)
+			if err := checkSources(v); err != nil {
+				return nil, fmt.Errorf("l4 route %s: %s: %w", h.name, h.allow, err)
+			}
+			sources, _ = familySources(v)
 		}
-		n++
-		v := get(r.AllowInput)
-		if err := checkSources(v); err != nil {
-			return nil, fmt.Errorf("l4 route %s: %s: %w", r.Name, r.AllowInput, err)
+		ifaces := []string{""}
+		if len(h.roles) > 0 {
+			ifaces = nil // none named: every connection dropped (closed)
+			for _, role := range h.roles {
+				if d := dev(role); d != "" {
+					ifaces = append(ifaces, d)
+				}
+			}
 		}
-		s4, _ := familySources(v)
-		match := fmt.Sprintf("-A %s -p %s -m conntrack --ctstate DNAT --ctdir ORIGINAL --ctorigdstport %d", chain, r.Protocol, r.Port)
+		base := fmt.Sprintf("-A %s -p %s -m conntrack --ctstate DNAT --ctdir ORIGINAL --ctorigdstport %d", chain, h.protocol, h.port)
 		// Bound to one address: another install's port on another address is not this one's. An
 		// IPv6 one is applied by no start (allowBound refuses it).
-		if a := bindAddr(r, get); a != "" {
-			match += " --ctorigdst " + a
+		if h.bind != "" {
+			base += " --ctorigdst " + h.bind
 		}
-		for _, s := range s4 {
-			rules = append(rules, match+" -s "+s+" -j RETURN")
+		// Held to roles: what Docker forwards to a container bridge alone (a compose network's,
+		// whose bridge lint keeps named br-*, or the default one), so another translation to the
+		// port (a cluster's service address) is not judged here.
+		outs := []string{""}
+		if len(h.roles) > 0 {
+			outs = []string{"br-+", "docker0"}
 		}
-		rules = append(rules, match+" -j DROP")
+		var rules []string
+		for _, o := range outs {
+			match := base
+			if o != "" {
+				match += " -o " + o
+			}
+			for _, i := range ifaces {
+				for _, s := range sources {
+					r := match
+					if i != "" {
+						r += " -i " + i
+					}
+					if s != "" {
+						r += " -s " + s
+					}
+					rules = append(rules, r+" -j RETURN")
+				}
+			}
+			rules = append(rules, match+" -j DROP")
+		}
+		v4 = append(v4, rules...)
+		if h.v6 {
+			v6 = append(v6, rules...)
+		}
 	}
-	if n == 0 {
+	if len(v4) == 0 {
 		return nil, nil
 	}
-	return map[string][]byte{"iptables": fmt.Appendf(nil, "*filter\n:%s - [0:0]\n%s\nCOMMIT\n", chain, strings.Join(rules, "\n"))}, nil
+	table := func(rules []string) []byte {
+		return fmt.Appendf(nil, "*filter\n:%s - [0:0]\n%s\nCOMMIT\n", chain, strings.Join(rules, "\n"))
+	}
+	out := map[string][]byte{"iptables": table(v4)}
+	if len(v6) > 0 {
+		out["ip6tables"] = table(v6)
+	}
+	return out, nil
+}
+
+// emptiedV6 gives rules an empty ip6tables chain when they hold nothing for IPv6 and the record of
+// the last apply gave ip6tables rules (an earlier start held the front for IPv6): applyChain leaves
+// a table it is not given alone, which would keep that hold. Every apply of the allow chain goes
+// through it, so the record says what ip6tables holds.
+func (in *Installer) emptiedV6(rules map[string][]byte) map[string][]byte {
+	if rules == nil || rules["ip6tables"] != nil {
+		return rules
+	}
+	rec, err := os.ReadFile(in.allowRecord())
+	if err != nil || bytes.Count(rec, []byte("*filter\n")) < 2 {
+		return rules
+	}
+	out := maps.Clone(rules)
+	out["ip6tables"] = fmt.Appendf(nil, "*filter\n:%s - [0:0]\nCOMMIT\n", in.allowChain())
+	return out
+}
+
+// held are the holds (holds, as the recorded values get give them) to interfaces.
+func (in *Installer) held(get func(string) string) []portHold {
+	var out []portHold
+	for _, h := range in.holds(get) {
+		if len(h.roles) > 0 {
+			out = append(out, h)
+		}
+	}
+	return out
+}
+
+// heldServices are the services whose published ports a start holds to interfaces (held): the
+// front's, and each interfaced route's upstream's, once each.
+func (in *Installer) heldServices(get func(string) string) []string {
+	var svcs []string
+	for _, h := range in.held(get) {
+		if !slices.Contains(svcs, h.service) {
+			svcs = append(svcs, h.service)
+		}
+	}
+	return svcs
+}
+
+// heldNetworks refuses, before the stack stops or starts anything, a held service (heldServices)
+// the holds would not judge, as the stack's compose model m and the host give it: one with an
+// address of its own on a NIC (services.<name>.interface), sharing another namespace
+// (network_mode, the default bridge's included), or on a network spec.UnheldNetwork refuses (a
+// compose network's driver and driver_opts, an external network's as Docker inspects it): the
+// holds judge what Docker translates and forwards to a bridge it makes and names itself, so its
+// ports would answer past them. Lint refuses what the release itself fixes; this sees the external
+// networks. A host daemon's defaults for the networks a stack makes (default-network-opts) are its
+// operator's. Nothing to judge where no hold applies (a Docker host not consented, or not as root).
+func (in *Installer) heldNetworks(ctx context.Context, m *composeModel, env *EnvFile) error {
+	get := func(k string) string { v, _ := env.Get(k); return v }
+	svcs := in.heldServices(get)
+	if len(svcs) == 0 || !in.gatewayApplies() {
+		return nil
+	}
+	compose := in.R.Spec.Stack.Compose
+	refuse := func(svc, what, fix string) error {
+		where := "service " + svc
+		if svc == FrontService {
+			where = "the front (" + svc + ")"
+		}
+		return fmt.Errorf("%s %s: its ports held to interfaces are judged on what Docker translates and forwards to a bridge it makes itself, so they would answer past the hold; %s", where, what, fix)
+	}
+	external := map[string]string{} // by name: `docker network inspect` of it
+	for _, svc := range svcs {
+		if in.R.Spec.Services[svc].Interface != "" {
+			return refuse(svc, "has an address of its own on "+in.R.Spec.Services[svc].Interface, "leave out its services."+svc+".interface, or the route's interfaces")
+		}
+		s, ok := m.Services[svc]
+		if !ok {
+			continue // a profile turned off
+		}
+		if s.NetworkMode != "" {
+			return refuse(svc, "has network_mode "+s.NetworkMode, "in "+compose+", leave its network_mode out: it joins the project's networks")
+		}
+		for _, key := range slices.Sorted(maps.Keys(s.Networks)) {
+			n := m.Networks[key]
+			driver, opts := n.Driver, n.DriverOpts
+			fix := "in " + compose + ", leave networks." + key + "'s driver and driver_opts to Docker (the neutral ones aside)"
+			if n.External {
+				name := cmp.Or(n.Name, key)
+				out, seen := external[name]
+				if !seen {
+					raw, err := in.O.Docker.Run(ctx, Cmd{Args: []string{"network", "inspect", "--format", "{{.Driver}}|{{json .Options}}", name}})
+					if err != nil {
+						return fmt.Errorf("service %s's external network %s (%s): %w", svc, key, compose, err)
+					}
+					out = strings.TrimSpace(string(raw))
+					external[name] = out
+				}
+				d, o, _ := strings.Cut(out, "|")
+				opts = nil
+				if err := json.Unmarshal([]byte(o), &opts); err != nil {
+					return fmt.Errorf("service %s's external network %s: `docker network inspect` gave %q, no driver and options: %w", svc, name, out, err)
+				}
+				driver = d
+				fix = "make the external network " + name + " again with Docker's own bridge (`docker network create " + name + "`, no -d and no -o but the neutral ones)"
+			}
+			if why := spec.UnheldNetwork(driver, opts); why != "" {
+				return refuse(svc, "is on network "+key+", which "+why, fix)
+			}
+		}
+	}
+	return nil
+}
+
+// unheldRoles are the roles of the ports held to interfaces (holds) that no NIC of this Docker host
+// plays (no --interface ROLE=NIC), sorted: those ports answer no client through them (closed).
+func (in *Installer) unheldRoles(get func(string) string) []string {
+	var roles []string
+	for _, h := range in.holds(get) {
+		for _, r := range h.roles {
+			if in.roleDevice(r, get) == "" && !slices.Contains(roles, r) {
+				roles = append(roles, r)
+			}
+		}
+	}
+	slices.Sort(roles)
+	return roles
+}
+
+// heldRules are the allow chain's rules on this Docker host (holdRules of holds), each role by its
+// device here.
+func (in *Installer) heldRules(chain string, get func(string) string) (map[string][]byte, error) {
+	return holdRules(in.holds(get), chain, get, func(role string) string { return in.roleDevice(role, get) })
 }
 
 // allowSources gives allowChain the L4 routes' allowlists (allowRules), as applyChain does.
@@ -346,27 +644,58 @@ func (in *Installer) allowSources(ctx context.Context, get func(string) string, 
 	err := in.allowBound(get)
 	var rules map[string][]byte
 	if err == nil {
-		rules, err = allowRules(in.allowed(), chain, get)
+		rules, err = in.heldRules(chain, get)
 	}
 	if err != nil {
 		// Fail closed: the routes' ports, on their IPv4 bind addresses, drop every source until
 		// the start that fixes it.
 		// Every list empty and no bind address, which checkSources takes (it cannot fail): each
-		// route's port drops every source on every address, whatever it is published on now.
-		closed, _ := allowRules(in.allowed(), chain, func(string) string { return "" })
-		return errors.Join(err, in.applyChain(ctx, chain, in.allowRecord(), closed, what, boot))
+		// route's port drops every source on every address, whatever it is published on now; the
+		// ports held to interfaces keep their holds.
+		lists := map[string]bool{}
+		for _, r := range in.allowed() {
+			lists[r.AllowInput], lists[r.BindInput] = true, true
+		}
+		// An interfaced route keeps its bind address but an IPv6 one, which IPv4's rules cannot hold.
+		for _, r := range in.interfaced() {
+			if v6Bound(bindAddr(r, get)) {
+				lists[r.BindInput] = true
+			}
+		}
+		closed, _ := in.heldRules(chain, func(k string) string {
+			if lists[k] {
+				return ""
+			}
+			return get(k)
+		})
+		return errors.Join(err, in.applyChain(ctx, chain, in.allowRecord(), in.emptiedV6(closed), what, boot))
 	}
+	for _, r := range in.unheldRoles(get) {
+		in.O.logf("warning: host.interfaces.%s: no NIC of this host plays it (`--interface %s=<NIC>` on a re-run names one): the ports held to it answer no client through it", r, r)
+	}
+	held6 := rules["ip6tables"] != nil
+	mark := heldMark(rules) // of what the release holds, which allowHolds recomputes
+	rules = in.emptiedV6(rules)
 	// A boot runs before Docker, whose FORWARD jump is not there yet: the start after it says
 	// whether the lists hold.
 	if rules != nil && !boot {
 		if err := in.dockerUserReached(ctx, what); err != nil {
 			return err
 		}
+		if _, v6 := os.Stat(ipv6Proc); held6 && v6 == nil {
+			if _, err := in.O.host().Run(ctx, Cmd{Args: []string{"ip6tables", "-w", "-C", "FORWARD", "-j", "DOCKER-USER"}}); err != nil {
+				// IPv4's holds are applied all the same: the start fails, nothing left open that
+				// IPv4 holds.
+				v4 := in.emptiedV6(map[string][]byte{"iptables": rules["iptables"]})
+				return errors.Join(fmt.Errorf("%s cannot hold for IPv6: ip6tables' FORWARD does not jump to DOCKER-USER (%v), so the Docker engine (its ip6tables off) passes the front's IPv6 clients through its userland proxy: turn its ip6tables on, or `%s tune --revert`", what, err, in.R.Ctl()),
+					in.applyChain(ctx, chain, in.allowRecord(), v4, what, boot))
+			}
+		}
 	}
 	if err := in.applyChain(ctx, chain, in.allowRecord(), rules, what, boot); err != nil || rules == nil || boot {
 		return err
 	}
-	in.allowApplied = heldMark(rules)
+	in.allowApplied = mark
 	return nil
 }
 
@@ -386,12 +715,17 @@ func v6Bound(a string) bool {
 	return err == nil && !ip.Unmap().Is4() && !ip.IsUnspecified()
 }
 
-// allowBound refuses an allowlisted route bound to an IPv6 address: a Docker host holds the list
-// for IPv4 alone (allowV4Only).
+// allowBound refuses an allowlisted route, or one held to its interfaces, bound to an IPv6
+// address: a Docker host holds the list and the interfaces for IPv4 alone (allowV4Only).
 func (in *Installer) allowBound(get func(string) string) error {
 	for _, r := range in.allowed() {
 		if a := bindAddr(r, get); v6Bound(a) {
 			return fmt.Errorf("l4 route %s: %s=%s is an IPv6 address, and a Docker host holds %s for IPv4 alone: an IPv4 address in %s, or none", r.Name, r.BindInput, a, r.AllowInput, r.BindInput)
+		}
+	}
+	for _, r := range in.interfaced() {
+		if a := bindAddr(r, get); v6Bound(a) {
+			return fmt.Errorf("l4 route %s: %s=%s is an IPv6 address, and a Docker host holds its interfaces for IPv4 alone: an IPv4 address in %s, or none", r.Name, r.BindInput, a, r.BindInput)
 		}
 	}
 	return nil
@@ -460,6 +794,9 @@ func (in *Installer) gatewayWhat() string {
 	}
 	if routes := in.allowRoutes(); len(routes) > 0 {
 		what = append(what, "the source allowlists of the L4 routes "+strings.Join(routes, ", "))
+	}
+	if held := in.heldNames(); len(held) > 0 {
+		what = append(what, "the interfaces of "+strings.Join(held, ", "))
 	}
 	if len(what) == 0 {
 		return "the stack's network declarations"
@@ -784,6 +1121,11 @@ func (in *Installer) lockedRevert(ctx context.Context) error {
 	if routes := in.allowRoutes(); len(routes) > 0 && fileExists(in.path(envName)) {
 		in.O.logf("note: the L4 routes %s are open to every source now, and stay published on IPv4 alone until the next start, which publishes them on every address: `%s --dir %s --no-input --no-provision`", strings.Join(routes, ", "), in.ctl(), in.gatewayDir())
 	}
+	if get, err := in.installedEnv(); err == nil && fileExists(in.path(envName)) {
+		if held := in.heldNamesIn(get); len(held) > 0 {
+			in.O.logf("note: %s answer on every interface now, published as the consent published them (on IPv4 alone, but the front with the stack's IPv6 on) until the next start, which publishes them on every address: `%s --dir %s --no-input --no-provision`", strings.Join(held, ", "), in.ctl(), in.gatewayDir())
+		}
+	}
 	return nil
 }
 
@@ -941,13 +1283,26 @@ func (in *Installer) gatewayStatus(get func(string) string) string {
 	if _, unmapped := in.forwardTables(get); len(unmapped) > 0 {
 		notYet = append(notYet, "no forwarding through "+strings.Join(unmapped, ", ")+" (no NIC named: --interface)")
 	}
-	switch routes := strings.Join(in.allowRoutes(), ", "); {
-	case routes != "" && in.allowHolds(get):
-		applied = append(applied, "source allowlists of "+routes)
-	case routes != "":
-		notYet = append(notYet, "source allowlists of "+routes+" not held (no start as root applied them since this release or these values, or its error says why)")
+	if unheld := in.unheldRoles(get); len(unheld) > 0 {
+		notYet = append(notYet, "no client through "+strings.Join(unheld, ", ")+" to the ports held to it (no NIC named: --interface)")
+	}
+	switch routes, held := strings.Join(in.allowRoutes(), ", "), strings.Join(in.heldNamesIn(get), ", "); {
+	case (routes != "" || held != "") && in.allowHolds(get):
+		if routes != "" {
+			applied = append(applied, "source allowlists of "+routes)
+		}
+		if held != "" {
+			applied = append(applied, "interfaces of "+held)
+		}
+	case routes != "" || held != "":
+		if routes != "" {
+			notYet = append(notYet, "source allowlists of "+routes+" not held (no start as root applied them since this release or these values, or its error says why)")
+		}
+		if held != "" {
+			notYet = append(notYet, "interfaces of "+held+" not held (no start as root applied them since this release or these values, or its error says why)")
+		}
 	case fileExists(in.allowRecord()):
-		notYet = append(notYet, "source allowlists left (the next start as root removes them)")
+		notYet = append(notYet, "published ports' holds left (the next start as root removes them)")
 	}
 	n, pending := 0, 0
 	for _, f := range rec.Networkd {

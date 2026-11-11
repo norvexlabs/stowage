@@ -110,7 +110,7 @@ func TestTheHookServiceIsConfinedAndGetsTheRecordedValues(t *testing.T) {
 }
 
 func TestADollarInTheHooksCmdStaysLiteral(t *testing.T) {
-	out, err := provisionCompose(&providers.ProvisionHook{Image: "api", Cmd: []string{"sh", "-c", "echo $HOME ${X}"}}, nil, nil, nil)
+	out, err := provisionCompose(&providers.ProvisionHook{Image: "api", Cmd: []string{"sh", "-c", "echo $HOME ${X}"}}, nil, nil, nil, spec.FileVar)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -134,7 +134,7 @@ func TestOnDemandServicesReachTheVMsL4ServicesByName(t *testing.T) {
 	if got := vm.targetHosts(); !slices.Equal(got, []string{"echo:host-gateway", "postgres:host-gateway"}) {
 		t.Errorf("hosts %v", got)
 	}
-	out, err := provisionCompose(&providers.ProvisionHook{Image: "api", Cmd: []string{"true"}}, nil, nil, vm.targetHosts())
+	out, err := provisionCompose(&providers.ProvisionHook{Image: "api", Cmd: []string{"true"}}, nil, nil, vm.targetHosts(), spec.FileVar)
 	if err != nil || !strings.Contains(string(out), "extra_hosts:\n            - echo:host-gateway\n            - postgres:host-gateway\n") {
 		t.Errorf("%s %v", out, err)
 	}

@@ -273,7 +273,7 @@ func (in *Installer) hookFailed(err error, keys []string) error {
 // returns (empty: forgets one), first.
 func (in *Installer) k8sRunHook(ctx context.Context, p *k8sHookPlan, set map[string]string) error {
 	o, k := &in.O, in.O.K8s
-	env, err := in.readSecret(ctx, k.envSecret())
+	env, err := in.k8sRecorded(ctx)
 	if err != nil {
 		return err
 	}
@@ -301,6 +301,9 @@ func (in *Installer) k8sRunHook(ctx context.Context, p *k8sHookPlan, set map[str
 		if i.File() {
 			reserved[spec.FileVar(i.Key)] = true
 		}
+	}
+	for _, key := range in.R.Spec.AsFileKeys() {
+		reserved[spec.SecretFileVar(key)] = true
 	}
 	cm, err := in.configMapKeys(ctx, k.hookName())
 	if err != nil {
@@ -796,7 +799,7 @@ func (in *Installer) hookJobObject(p *k8sHookPlan, env, outs map[string]string, 
 	ref := func(secret, key string) map[string]any {
 		return map[string]any{"name": key, "valueFrom": map[string]any{"secretKeyRef": map[string]any{"name": secret, "key": key}}}
 	}
-	var inputFiles []any
+	var inputFiles, secretFiles []any
 	for _, key := range p.hook.Keys() {
 		if _, ok := env[key]; ok {
 			if i, isInput := s.Input(key); isInput && i.File() {
@@ -807,6 +810,12 @@ func (in *Installer) hookJobObject(p *k8sHookPlan, env, outs map[string]string, 
 				// The file, never its recorded form: mounted below, at the path this variable holds.
 				inputFiles = append(inputFiles, map[string]any{"key": key, "path": key})
 				vars = append(vars, map[string]any{"name": spec.FileVar(key), "value": HookInputsDir + "/" + key})
+				continue
+			}
+			if s.AsFile(key) {
+				// Its value as a file, from the Secret of the secrets delivered so: never a variable.
+				secretFiles = append(secretFiles, map[string]any{"key": key, "path": key})
+				vars = append(vars, map[string]any{"name": spec.SecretFileVar(key), "value": HookInputsDir + "/" + key})
 				continue
 			}
 			vars = append(vars, ref(k.envSecret(), key))
@@ -870,8 +879,22 @@ func (in *Installer) hookJobObject(p *k8sHookPlan, env, outs map[string]string, 
 		record["command"] = append(record["command"].([]string), "--exit-key", kitExitKey)
 		hook["command"] = slices.Insert(slices.Clone(run), 3, "--discard-stdout")
 	}
-	if len(inputFiles) > 0 {
-		pod["volumes"] = append(pod["volumes"].([]any), map[string]any{"name": "inputs", "secret": map[string]any{"secretName": k.filesSecret(), "defaultMode": 0o444, "items": inputFiles}})
+	if len(inputFiles) > 0 || len(secretFiles) > 0 {
+		// One directory: the file inputs' Secret, the secrets delivered as files', or both projected.
+		var vol map[string]any
+		switch {
+		case len(secretFiles) == 0:
+			vol = map[string]any{"secret": map[string]any{"secretName": k.filesSecret(), "defaultMode": 0o444, "items": inputFiles}}
+		case len(inputFiles) == 0:
+			vol = map[string]any{"secret": map[string]any{"secretName": k.secretFilesSecret(), "defaultMode": 0o444, "items": secretFiles}}
+		default:
+			vol = map[string]any{"projected": map[string]any{"defaultMode": 0o444, "sources": []any{
+				map[string]any{"secret": map[string]any{"name": k.filesSecret(), "items": inputFiles}},
+				map[string]any{"secret": map[string]any{"name": k.secretFilesSecret(), "items": secretFiles}},
+			}}}
+		}
+		vol["name"] = "inputs"
+		pod["volumes"] = append(pod["volumes"].([]any), vol)
 		provision := pod["containers"].([]any)[0].(map[string]any)
 		provision["volumeMounts"] = append(provision["volumeMounts"].([]any), map[string]any{"name": "inputs", "mountPath": HookInputsDir, "readOnly": true})
 	}

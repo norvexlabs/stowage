@@ -1592,6 +1592,9 @@ func (l *linter) secretsAndInputs() {
 		if s.Settable {
 			l.settable(w, s.Key)
 		}
+		if s.AsFile && s.Rotation {
+			l.errf(w+".as_file", "%s rotates: its passes give the services %s_NEXT and %s_PREVIOUS to read beside it, as variables; keep one of rotation and as_file", s.Key, s.Key, s.Key)
+		}
 	}
 	for _, k := range sortedKeys(l.s.SafeDefaults) {
 		claim("safe_defaults."+k, k, "a safe default")
@@ -1615,6 +1618,13 @@ func (l *linter) secretsAndInputs() {
 		}
 		if in.Profile != "" {
 			l.profileInput(w, in)
+		}
+		switch {
+		case !in.AsFile:
+		case !in.Secret:
+			l.errf(w+".as_file", "%s is no secret input: as_file keeps a secret out of the services' environment (a file the operator gives is type: file)", in.Key)
+		case in.File():
+			l.errf(w+".as_file", "%s is a file input already: a service mounts ${%s}", in.Key, spec.FileVar(in.Key))
 		}
 		switch in.Type {
 		case "":
@@ -1805,18 +1815,28 @@ func (l *linter) composeVars(keys map[string]string) {
 			}
 			continue
 		}
+		if key, ok := strings.CutPrefix(v.Name, spec.SecretFileVarPrefix); ok {
+			if !l.s.AsFile(key) {
+				l.errf(w, "%s names no secret delivered as a file (secrets[].as_file, or a secret input's as_file)", v.Name)
+			}
+			continue
+		}
 		if v.Name == "STOWAGE_TLS_MODE" && !l.s.HasFront() {
 			l.errf(w, "%s: the project has no front, so no TLS mode is recorded", v.Name)
 			continue
 		}
 		if strings.HasPrefix(v.Name, "STOWAGE_") {
 			if _, ok := ProvidedVars[v.Name]; !ok {
-				l.errf(w, "%s is not a variable Stowage provides (%s, STOWAGE_IMAGE_<KEY>, STOWAGE_URL_<ROUTE>, STOWAGE_L4_<ROUTE>, STOWAGE_INPUT_FILE_<KEY>)", v.Name, strings.Join(sortedKeys(ProvidedVars), ", "))
+				l.errf(w, "%s is not a variable Stowage provides (%s, STOWAGE_IMAGE_<KEY>, STOWAGE_URL_<ROUTE>, STOWAGE_L4_<ROUTE>, STOWAGE_INPUT_FILE_<KEY>, STOWAGE_SECRET_FILE_<KEY>)", v.Name, strings.Join(sortedKeys(ProvidedVars), ", "))
 			}
 			continue
 		}
 		if i, ok := l.s.Input(v.Name); ok && i.File() {
 			l.errf(w, "${%s} is a file input: what is recorded for it is no text to read; mount ${%s}", v.Name, spec.FileVar(v.Name))
+			continue
+		}
+		if l.s.AsFile(v.Name) {
+			l.errf(w, "${%s} is delivered as a file (as_file: true), never as a variable: mount ${%s} and read the file", v.Name, spec.SecretFileVar(v.Name))
 			continue
 		}
 		if v.NeedsValue() && slices.ContainsFunc(l.s.Inputs, func(i spec.Input) bool { return i.Key == v.Name && i.Advanced }) {
@@ -1879,7 +1899,8 @@ var composeProfile = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]*$`)
 func (l *linter) readInputs() func(spec.Input) bool {
 	inCompose := map[string]bool{}
 	for _, v := range l.compose.Vars {
-		inCompose[strings.TrimPrefix(v.Name, spec.FileVarPrefix)] = true
+		name := strings.TrimPrefix(v.Name, spec.FileVarPrefix)
+		inCompose[strings.TrimPrefix(name, spec.SecretFileVarPrefix)] = true
 	}
 	// The provision hook reads the keys its env lists.
 	if h, err := providers.DecodeProvision(l.s.Short(), l.s.Hooks.Provision, l.s.Images); err == nil {
@@ -2123,6 +2144,11 @@ func (l *linter) chart(rel string) {
 	k8sFile := slices.ContainsFunc(l.s.Inputs, func(i spec.Input) bool { return i.File() && i.OnKubernetes() })
 	if k8sFile && !reads("files") {
 		l.warnf("shapes.kubernetes.chart", "%s: no template reads .Values.%s.files: the file inputs on Kubernetes do not reach the chart", rel, helm.ValuesKey)
+	}
+	k8sAsFile := slices.ContainsFunc(l.s.Secrets, func(s spec.Secret) bool { return s.AsFile }) ||
+		slices.ContainsFunc(l.s.Inputs, func(i spec.Input) bool { return i.Secret && i.AsFile && i.OnKubernetes() })
+	if k8sAsFile && !reads("secretFiles") {
+		l.warnf("shapes.kubernetes.chart", "%s: no template reads .Values.%s.secretFiles: the secrets delivered as files (as_file) do not reach the chart", rel, helm.ValuesKey)
 	}
 	if l.s.Registry.Pull.Name == "token" && !reads("pullSecret") {
 		l.warnf("shapes.kubernetes.chart", "%s: no template reads .Values.%s.pullSecret: the cluster pulls the images without the pull account", rel, helm.ValuesKey)
@@ -2403,25 +2429,27 @@ func (l *linter) interfaces(ifs map[string]spec.HostInterface) {
 		l.errf("host.interfaces", "%d NICs are primary: one is the default route's (primary: true)", primaries)
 	}
 	kairos := l.s.Shapes.Kairos != nil
-	named := func(at, role string) {
-		switch _, ok := ifs[role]; {
-		case role == "":
-		case !ok:
-			l.errf(at, "%q is not one of host.interfaces", role)
-		case !kairos:
-			l.warnf(at, "only the VM's firewall opens a port on one interface alone (a kairos shape): a Docker host's firewall is its operator's")
+	const consent = "only the VM's firewall is Stowage's (a kairos shape): a Docker host holds it in DOCKER-USER once its operator consents (tune --apply)"
+	if f := l.s.Front.Interfaces; f != nil {
+		l.roleList("front.interfaces", f, "leave it out to open the front on every interface", nil)
+		if !kairos && len(f) > 0 {
+			l.warnf("front.interfaces", consent)
 		}
 	}
-	named("front.interface", l.s.Front.Interface)
+	held := len(l.s.Front.Interfaces) > 0
 	for i, r := range l.s.L4.Routes {
 		if r.Interfaces == nil {
 			continue
 		}
+		held = held || len(r.Interfaces) > 0
 		at := fmt.Sprintf("l4.routes[%d].interfaces", i)
 		l.roleList(at, r.Interfaces, "leave it out to open the route on every interface", nil)
 		if !kairos && len(r.Interfaces) > 0 {
-			l.warnf(at, "only the VM's firewall opens a port on some interfaces alone (a kairos shape): a Docker host's firewall is its operator's")
+			l.warnf(at, consent)
 		}
+	}
+	if held && l.compose != nil {
+		l.heldServices()
 	}
 	for _, role := range slices.Sorted(maps.Keys(ifs)) {
 		fw, at := ifs[role].Forward, "host.interfaces."+role+".forward"
@@ -2435,6 +2463,94 @@ func (l *linter) interfaces(ifs map[string]spec.HostInterface) {
 		}
 		if len(fw) > 0 && !kairos {
 			l.warnf(at, "only the VM's firewall is Stowage's (a kairos shape): a Docker host applies it in DOCKER-USER once its operator consents (tune --apply)")
+		}
+	}
+}
+
+// heldServices refuses, for each service whose published ports are held to interfaces, what the
+// holds would not judge (spec.UnheldNetwork, as the start refuses it): the front, with
+// front.interfaces or an L4 route it terminates TLS on with interfaces, on the project's default
+// network; an interfaced route's upstream Docker publishes (not on the host's network: on the VM
+// every route's upstream is), with an address of its own on a NIC (services.<name>.interface), a
+// network_mode, or on a compose network the predicate refuses. An external network is the start's
+// to judge.
+func (l *linter) heldServices() {
+	held := map[string]string{} // service ("" the front): what holds it
+	if len(l.s.Front.Interfaces) > 0 {
+		held[""] = "front.interfaces"
+	}
+	docker := l.s.Shapes.Docker != nil
+	for i, r := range l.s.L4.Routes {
+		if len(r.Interfaces) == 0 {
+			continue
+		}
+		at := fmt.Sprintf("l4.routes[%d].interfaces", i)
+		name, _, _ := strings.Cut(r.Upstream, ":")
+		switch {
+		case r.Terminated():
+			if _, ok := held[""]; !ok {
+				held[""] = at
+			}
+		case docker && !l.s.Services[name].HostNetwork:
+			held[name] = at
+		}
+	}
+	nets, _ := l.compose.TopLevel["networks"].(map[string]any)
+	told := map[string]bool{}
+	network := func(at, who, key string) {
+		n, _ := nets[key].(map[string]any)
+		if ext, _ := n["external"].(bool); ext || told[key] {
+			return
+		}
+		driver := ""
+		if v, ok := n["driver"]; ok {
+			driver = fmt.Sprint(v)
+		}
+		opts := map[string]string{}
+		if o, ok := n["driver_opts"].(map[string]any); ok {
+			for k, v := range o {
+				opts[k] = fmt.Sprint(v)
+			}
+		}
+		// A value from a variable is the start's to judge, as compose resolves it.
+		if strings.Contains(driver, "$") || slices.ContainsFunc(slices.Collect(maps.Keys(opts)), func(k string) bool { return strings.Contains(k+opts[k], "$") }) {
+			return
+		}
+		if why := spec.UnheldNetwork(driver, opts); why != "" {
+			told[key] = true
+			l.errf(l.s.Stack.Compose, "networks.%s %s, and %s is on it while %s holds its ports to interfaces: the holds judge what Docker translates and forwards to a bridge it makes itself, so they would answer past them; leave its driver and driver_opts to Docker (the neutral ones aside)", key, why, who, at)
+		}
+	}
+	for _, svc := range slices.Sorted(maps.Keys(held)) {
+		at := held[svc]
+		if svc == "" {
+			network(at, "the front", "default")
+			continue
+		}
+		if i := l.s.Services[svc].Interface; i != "" {
+			l.errf("services."+svc+".interface", "%s has an address of its own on %s, past what %s holds: leave one of them out", svc, i, at)
+		}
+		c, ok := l.compose.Services[svc]
+		if !ok {
+			continue
+		}
+		if c.NetworkMode != "" {
+			l.errf(l.s.Stack.Compose, "services.%s.network_mode %s: %s holds its ports to interfaces, judged on what Docker translates to the project's networks: leave network_mode out", svc, c.NetworkMode, at)
+			continue // on no network of the project's
+		}
+		var keys []string
+		switch n := c.Networks.(type) {
+		case []any:
+			for _, k := range n {
+				keys = append(keys, fmt.Sprint(k))
+			}
+		case map[string]any:
+			keys = slices.Sorted(maps.Keys(n))
+		case nil:
+			keys = []string{"default"}
+		}
+		for _, k := range keys {
+			network(at, svc, k)
 		}
 	}
 }

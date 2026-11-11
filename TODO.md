@@ -56,35 +56,9 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
    alike (recommended); (b) the front's ports computed apart, mirroring the L4 rule. Docker's
    publishes follow the same decision, not only the firewall.
 
-### Features — the firewall's roles, secrets, pull credentials, logins
+### Features — pull credentials
 
-1. **`front.interfaces`, as `l4.routes[].interfaces`**: the front's ports scoped to roles exactly as
-   a route's are — the same key shape, the same lint (an undeclared role, one given twice, an empty
-   list are errors), the same firewall rule form (`iifname { … }`) — so one notion of "the roles a
-   port is open on" covers both; it replaces `front.interface`'s single role (no compat before 1.0).
-   The rule must hold the front itself: today the role's match is written into the input chain
-   alone, while the front is a bridged container published on every address and its 80/443 are
-   DNAT'd through forward, so it answers on every NIC. Hold the DNAT'd ports to the roles in
-   Stowage's table (or publish on the roles' addresses), and say what `acme`'s HTTP-01 needs then;
-   e2e-full-vm connects from a role left out. Options for holding the DNAT'd ports: (a) rules in
-   Stowage's table matching the original destination port of DNAT'd traffic (`ct status dnat`,
-   `ct original proto-dst`) by `iifname` (recommended: addresses may change, devices do not);
-   (b) publishing the front on each role's address (`host_ip`), which a DHCP address change
-   breaks; (c) the front on the host's network on the VM, as the L4 upstreams are, so the input
-   chain's rule holds it — a second model of the front across shapes. On the Docker shape the
-   host's chains are its operator's: the rule goes through `tune --apply`'s consent, as the
-   gateway's do.
-2. **Secrets as files**: the file-input mechanism (`STOWAGE_INPUT_FILE_<KEY>`, 0600, mounted
-   read-only) extended to `secrets:` and `secret: true` inputs, opted in per key in the spec, on
-   Docker and the VM, and as a Secret volume on Kubernetes — not a new delivery path: an
-   environment variable is in `docker inspect`, in every child's environment and in whatever
-   process parses untrusted input. Options: (a) the file-input path as it is — a 0600 file per key
-   under the install's directory, bind-mounted read-only, its path in a `STOWAGE_SECRET_FILE_<KEY>`
-   the compose file reads (recommended: one mechanism); (b) compose's own `secrets:` with a `file:`
-   source, mounted at `/run/secrets/<name>` — canonical compose, but outside Swarm it is a bind
-   mount whose `uid`/`gid`/`mode` are ignored, so the file's mode is set on the host anyway. The
-   value is then never in the service's environment, and the opt-in is per key in the spec.
-3. **A pull credential per install**: issued at install time by what the `registry.pull` provider
+1. **A pull credential per install**: issued at install time by what the `registry.pull` provider
    can mint, the account baked into installers and OS images staying the fallback of a provider
    that cannot; one leaked installer then reads no other install's images. Options: (a) the
    provider mints a per-install account (a registry robot account) when an operator holding an
@@ -94,14 +68,6 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
    registry's; (c) one pull account per channel or per customer, chosen at `ship` — coarser, but
    no issuing step. Revoking one install's credential leaves every other install pulling; an
    install without one keeps the baked account.
-4. **One verb shows a `settable` secret**: `secrets` sets, rotates and exports, but shows none, so
-   an operator reads `<dir>/.env` as root for a generated login. One verb for every `settable`
-   secret (root, a terminal only, never logged), and the install's closing report naming the
-   logins that exist and that verb. Options: (a) `secrets show KEY`, refused off a terminal and for
-   a key that is not `settable` (recommended); (b) `secrets export KEY` narrowed to one key on a
-   terminal, unencrypted — one verb fewer, but `export` means an encrypted file today. The same
-   verb on every shape (Docker, the VM's `<short>-stow`, Kubernetes reading its Secret).
-
 ### Supply chain — stopgaps back to canonical
 
 1. **Check every stopgap at each release, and drop each one the upstream has caught up with**:

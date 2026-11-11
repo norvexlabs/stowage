@@ -64,7 +64,7 @@ import (
 //	POST /v1/reboot, /v1/shutdown        {drain_secs}: after the drain (202)
 //	GET, POST /v1/network, POST /v1/network/{confirm,revert,reset}: the network override (hostdnet.go)
 //	/v1/backup, /v1/backup/{config,status,list,verify}: the backups (hostdbackup.go)
-//	/v1/secrets/{export,rotate,set}, /v1/restore: the install's secrets and a backup's restore (hostdsecrets.go)
+//	/v1/secrets/{export,rotate,set,show}, /v1/restore: the install's secrets and a backup's restore (hostdsecrets.go)
 //
 // An error is {"error": "..."} with a 4xx or 5xx status. One job runs at a time, and none starts
 // once a reboot is scheduled; every request that starts one answers 202 with JobStarted.
@@ -644,6 +644,7 @@ func (h *Hostd) routes(app bool) http.Handler {
 	operator("POST /v1/kits/check", h.checkKit)
 	operator("POST /v1/secrets/rotate", h.rotateSecret)
 	operator("POST /v1/secrets/set", h.setSecret)
+	operator("POST /v1/secrets/show", h.showSecret)
 	operator("POST /v1/restore", h.restoreBackup)
 	return mux
 }

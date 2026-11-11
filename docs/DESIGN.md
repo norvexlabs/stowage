@@ -953,6 +953,7 @@ Stowage calls a project's programs: the two never share a reader.
 | 23 | Reset data | `reset-db`: stack down, the `data.reset` volumes deleted (`keep_on_reset` kept), provisioned as first installed **C** | `k8s reset-db`: uninstall, the release's claims deleted, installed again with its values and Secrets **C** | `reset-db`, a host daemon job, the Docker shape's, no reboot **C** |
 | 24 | Rotate secrets | `secrets rotate KEY` for `rotation: true`, three passes (`--stage` → `KEY_NEXT` accepted; swap → `KEY_PREVIOUS` accepted; `--finish`), the stack up again at each **C** | `k8s secrets rotate`: the same passes on the Secret, each workload's rollout restarted and awaited **C** | the Docker shape's verb, a host daemon job **C** |
 | 24b | Set a secret | `secrets set KEY` for `settable: true` (opt-in: a database password or an encryption key changed in `.env` alone breaks the data made with it), the value on standard input, the stack up again **C** | not yet **X** | the Docker shape's verb, a host daemon job on the operator's socket alone **C** |
+| 24c | Show a login | `secrets show KEY` for `settable: true`, standard output a terminal or refused; the closing report names the logins and the verb **C** | `k8s secrets show`, from the release's Secret (or its secret files' one) **C** | the Docker shape's verb, the host daemon's answer on the operator's socket alone, never logged **C** |
 | 25 | Registry credential rotation | `.env` / installer flag **C** | pull Secret **C** | sealed env + `reconfigure-userdata` **C** → the pull account the OS bundle carries; a mirror's is root's Docker login on the VM |
 | 26 | Power / maintenance | `stop` / `start` **C** | owner: cluster | `<short>-stow reboot/shutdown --drain-secs`, disk-pressure hook **C** |
 | 27 | Uninstall | `uninstall`: `compose down`, the install's timers and applied network declarations removed; the volumes and the install directory kept unless `--data` **C** | `k8s uninstall`: `helm uninstall`, the installer's Secrets, the hook's account and Job; the claims only with `--data`, kept data keeping the Secrets that answer for it, a chart's own claim (which helm deletes) needing `--data` **C** | `vm destroy` (a VM `vm create` made with OpenTofu) **C**; else owner: hypervisor |
@@ -2115,6 +2116,32 @@ every shape, the VM end-to-end test upgrading through it), then the health gate.
 - **No Stowage registry** — every runtime piece is in the `stowage` binary (an executable or a
   recipe `ship` builds into the project registry), so `stowage.lock` pins a version, not digests;
   operators only ever pull from the project registry.
+- **A login is shown by one verb, on a terminal** — `secrets show KEY`, not `secrets export KEY`
+  narrowed to one key: `export` means a file encrypted to keys kept off the machine, and an
+  unencrypted mode of it would make "export" mean two things. It shows only `settable` secrets
+  (the ones a person types, which the operator may set anyway), never a database password or a
+  key the data was made with; and only when standard output is a terminal, checked before the
+  value is read, so a script or a CI log never captures one — a program that needs a value
+  reads the install's own record with the rights that record needs. On the VM it is an
+  operator-socket route: the group that may use that socket can already run a command in any
+  container, so a root-only check there would protect nothing.
+- **The front's interfaces are held where Docker's DNAT is judged** — by the original destination
+  port of a translated connection (`ct original proto-dst`, `--ctorigdstport`) and the interface it
+  came in on, not by publishing the front on each role's address: an address a DHCP lease changes
+  would drop the front, a device's name does not change. Nor by running the front on the host's
+  network on the VM alone, which would be a second model of the front across shapes. The stack's
+  bridges stay allowed (a container dialling a route's address). On a Docker host the rule is the
+  consented allow chain's, as the allowlists are, and IPv4's alone where Docker's userland proxy
+  could carry IPv6 clients past it.
+- **A secret delivered as a file is the file-input mechanism, opted in per key** (`as_file`), not
+  compose's own `secrets:` with a `file:` source: outside Swarm that is a bind mount whose `uid`,
+  `gid` and `mode` are ignored, so the file's mode is set on the host anyway, and a second path
+  would have its own writes, sweeps and checks. The value stays recorded where every value is (so
+  `secrets set`, `export` and an upgrade carry it); only its delivery changes. On Kubernetes it
+  goes to a Secret of its own rather than the release's, so a chart's `envFrom` of that one cannot
+  leak it whatever the chart does. Rotation is refused with it: its passes hand the services two
+  more values as variables. A `command` provider still receives it as a variable — one calling
+  convention for those (§ 12, the `command` contract), run by Stowage, not a service.
 
 ## 13. OpenTofu provider (planned)
 

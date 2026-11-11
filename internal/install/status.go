@@ -348,7 +348,6 @@ func (in *Installer) keptPrevious(version string, revision int) (*StatusRelease,
 
 // K8sStatusJSON prints the helm release's status as one JSON object (K8sReleaseStatus).
 func (in *Installer) K8sStatusJSON(ctx context.Context) error {
-	k := in.O.K8s
 	rel, err := in.k8sStatusRelease(ctx)
 	if err != nil {
 		return err
@@ -391,7 +390,11 @@ func (in *Installer) K8sStatusJSON(ctx context.Context) error {
 	// The inputs, as the spec of the release installed tells them: this installer's only when it
 	// carries that release.
 	if st.Installed != nil && isRelease(in.R.Manifest, r.Name, r.Version, r.Revision) {
-		data, err := in.readSecret(ctx, k.envSecret())
+		data, err := in.k8sRecorded(ctx)
+		// Another tool's Secret of the secret files' name says nothing of what is recorded.
+		if foreign := (*foreignSecret)(nil); errors.As(err, &foreign) {
+			data, err = in.readSecret(ctx, in.O.K8s.envSecret())
+		}
 		if err != nil {
 			return err
 		}

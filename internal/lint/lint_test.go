@@ -203,6 +203,12 @@ func TestEachRuleFiresOnFull(t *testing.T) {
 		want  string
 	}{
 		{"handoff file input", []edit{{sp, "cmd: [handoff.py, issue], env: []", "cmd: [handoff.py, issue], env: [API_CA_BUNDLE]"}}, nil, "is a file input"},
+		{"handoff as_file", []edit{{sp, "cmd: [handoff.py, issue], env: []", "cmd: [handoff.py, issue], env: [ENCRYPTION_KEY]"}}, nil, "handoffs[0].run.env[0]: ENCRYPTION_KEY is delivered as a file (as_file: true), which a handoff's step does not get"},
+		{"as_file rotation", []edit{{sp, "gen: hex32, rotation: true }", "gen: hex32, rotation: true, as_file: true }"}}, nil, "secrets[2].as_file: INTERNAL_SERVICE_SECRET rotates"},
+		{"as_file no secret", []edit{{sp, `prompt: "Organisation name",        required: true }`, `prompt: "Organisation name",        required: true, as_file: true }`}}, nil, "as_file: ORG_NAME is no secret input"},
+		{"as_file file input", []edit{{sp, "type: pem, optional: true }", "type: pem, optional: true, secret: true, as_file: true }"}}, nil, "as_file: API_CA_BUNDLE is a file input already: a service mounts ${STOWAGE_INPUT_FILE_API_CA_BUNDLE}"},
+		{"as_file read as a variable", []edit{{cp, "      ENCRYPTION_KEY_FILE: /run/secrets/encryption_key", "      ENCRYPTION_KEY_FILE: /run/secrets/encryption_key\n      KEY: ${ENCRYPTION_KEY}"}}, nil, "${ENCRYPTION_KEY} is delivered as a file (as_file: true), never as a variable: mount ${STOWAGE_SECRET_FILE_ENCRYPTION_KEY}"},
+		{"as_file var of no secret", []edit{{cp, "${STOWAGE_SECRET_FILE_ENCRYPTION_KEY}:/run", "${STOWAGE_SECRET_FILE_SESSION_SECRET}:/run"}}, nil, "STOWAGE_SECRET_FILE_SESSION_SECRET names no secret delivered as a file"},
 		{"l4 tls udp", []edit{{sp, "      protocol: tcp\n      port: 17443", "      protocol: udp\n      port: 17443"}}, nil, "l4.routes[2].tls: the front terminates TLS over TCP alone"},
 		{"l4 tls no mode", []edit{{sp, "tls_modes: [acme, dns-cloudflare, byo, internal, none]", "tls_modes: [none]"}}, nil, "l4.routes[2].tls: the front terminates TLS with the certificate of its TLS mode, and atlas offers none"},
 		{"l4 tls domain name", []edit{{sp, "tls: { domain_input: ECHO_DOMAIN }", "tls: { domain_input: echo-domain }"}}, nil, `l4.routes[2].tls.domain_input: "echo-domain" is not an environment variable name`},
@@ -499,7 +505,7 @@ func TestEachRuleFiresOnFull(t *testing.T) {
 		{"bad when", []edit{{sp, "when: tls,", "when: always,"}}, nil, "expected tls or loopback"},
 		{"bad shape", []edit{{sp, "shapes: [docker, kairos] }\n  - { key: ADMIN_EMAIL", "shapes: [docker, nomad] }\n  - { key: ADMIN_EMAIL"}}, nil, "unknown shape"},
 		{"unknown image var", []edit{{cp, "ATLAS_VERSION: ${STOWAGE_PROJECT_VERSION}", "ATLAS_VERSION: ${STOWAGE_IMAGE_TYPO}"}}, nil, "STOWAGE_IMAGE_TYPO names no image"},
-		{"required var undeclared", []edit{{cp, "${UPSTREAM_API_KEY:-}", "${UPSTREAM_KEY:?set the upstream key}"}}, nil, "${UPSTREAM_KEY} has no default"},
+		{"required var undeclared", []edit{{cp, "${SEARCH_KEY:-}", "${UPSTREAM_KEY:?set the upstream key}"}}, nil, "${UPSTREAM_KEY} has no default"},
 		{"nested var undeclared", []edit{{cp, "${LOG_LEVEL:-info}", "${LOG_LEVEL:-${LOG_FALLBACK}}"}}, nil, "${LOG_FALLBACK} has no default"},
 		{"block scalar var", []edit{{cp, "      SUPPORT_EMAIL: ${SUPPORT_EMAIL:-}\n", "      SUPPORT_EMAIL: ${SUPPORT_EMAIL:-}\n    command: |\n      # ${SEARCH_TOKEN}\n      run\n"}}, nil, "${SEARCH_TOKEN} has no default"},
 		{"provision cmd", []edit{{sp, "    cmd: [provision.py]\n", ""}}, nil, "cmd is required"},
@@ -557,7 +563,16 @@ func TestEachRuleFiresOnFull(t *testing.T) {
       routes`, `Table: "100; x" }]
       routes`}}, nil, `host.interfaces.edge.routing_policy_rules[0].Table: "100; x": letters, digits`},
 		{"route of a policy rule's key", []edit{{sp, "routes: [{ Type: local,", "routes: [{ FirewallMark: local,"}}, nil, `host.interfaces.edge.routes[0]: "FirewallMark" is not one of networkd's settings here`},
-		{"front on an undeclared interface", []edit{{sp, "  interface: uplink ", "  interface: wan "}}, nil, `front.interface: "wan" is not one of host.interfaces`},
+		{"front on an undeclared interface", []edit{{sp, "  interfaces: [uplink] ", "  interfaces: [wan] "}}, nil, `front.interfaces[0]: "wan" is not one of host.interfaces`},
+		{"front on an interface twice", []edit{{sp, "  interfaces: [uplink] ", "  interfaces: [uplink, uplink] "}}, nil, `front.interfaces[1]: uplink is given twice`},
+		{"held port on a renamed bridge", []edit{{cp, "volumes:\n  postgres: {}\n", "networks:\n  default: { driver_opts: { com.docker.network.bridge.name: atlas0 } }\nvolumes:\n  postgres: {}\n"}}, nil, `networks.default sets com.docker.network.bridge.name atlas0, and the front is on it while front.interfaces holds its ports to interfaces`},
+		{"held port on another driver", []edit{{cp, "volumes:\n  postgres: {}\n", "networks:\n  default: { driver: macvlan }\nvolumes:\n  postgres: {}\n"}}, nil, `networks.default is of the macvlan driver, and the front is on it`},
+		{"held port on a routed gateway", []edit{{cp, "volumes:\n  postgres: {}\n", "networks:\n  default: { driver_opts: { com.docker.network.bridge.gateway_mode_ipv4: routed } }\nvolumes:\n  postgres: {}\n"}}, nil, `networks.default sets com.docker.network.bridge.gateway_mode_ipv4 routed, and the front is on it`},
+		{"held upstream with its own address", []edit{{sp, "port: 17007, upstream: echo:17007, allow_input: ECHO_SOURCES", "port: 17007, upstream: relay:17007, allow_input: ECHO_SOURCES"}}, nil, `services.relay.interface: relay has an address of its own on edge, past what l4.routes[1].interfaces holds`},
+		{"held port on a known option", []edit{{cp, "volumes:\n  postgres: {}\n", "networks:\n  default: { driver_opts: { com.docker.network.driver.mtu: \"1400\" } }\nvolumes:\n  postgres: {}\n"}, {sp, "  interfaces: [uplink] ", "  interfaces: [wan] "}}, nil, `front.interfaces[0]: "wan" is not one of host.interfaces`},
+		{"held front of a TLS route", []edit{{sp, "  interfaces: [uplink]                                         # the front answers there alone: the VM's firewall, a Docker host's once consented\n", ""}, {sp, "      tls: { domain_input: ECHO_DOMAIN }", "      tls: { domain_input: ECHO_DOMAIN }\n      interfaces: [uplink]"}, {cp, "volumes:\n  postgres: {}\n", "networks:\n  default: { driver: macvlan }\nvolumes:\n  postgres: {}\n"}}, nil, `networks.default is of the macvlan driver, and the front is on it while l4.routes[2].interfaces holds`},
+		{"held upstream's network_mode", []edit{{cp, "      ECHO_ENDPOINT: ${STOWAGE_L4_ECHO}\n", "      ECHO_ENDPOINT: ${STOWAGE_L4_ECHO}\n    network_mode: bridge\n"}}, nil, `services.echo.network_mode bridge: l4.routes[1].interfaces holds its ports to interfaces`},
+		{"front on no interface", []edit{{sp, "  interfaces: [uplink] ", "  interfaces: [] "}}, nil, `front.interfaces: is empty: leave it out to open the front on every interface`},
 		{"route on an undeclared interface", []edit{{sp, "interfaces: [edge] }", "interfaces: [edge, wan] }"}}, nil, `l4.routes[1].interfaces[1]: "wan" is not one of host.interfaces`},
 		{"route on an interface twice", []edit{{sp, "interfaces: [edge] }", "interfaces: [edge, edge] }"}}, nil, "l4.routes[1].interfaces[1]: edge is given twice"},
 		{"route on no interface", []edit{{sp, "interfaces: [edge] }", "interfaces: [] }"}}, nil, "l4.routes[1].interfaces: is empty: leave it out to open the route on every interface"},
@@ -839,6 +854,25 @@ func TestEmptySections(t *testing.T) {
 				t.Fatalf("no %q in:\n%s", c.want, errs)
 			}
 		})
+	}
+}
+
+// An interfaced route's upstream on the host's network is published by no Docker translation: its
+// networks are not the holds' to judge.
+func TestAHeldUpstreamOnTheHostsNetworkIsNotJudged(t *testing.T) {
+	t.Parallel()
+	root := testutil.CopyExample(t, "full")
+	testutil.Edit(t, root, specFile, "  echo: { cpus: 1, irq: on } ", "  echo: { cpus: 1, irq: on, host_network: true } ")
+	testutil.Edit(t, root, composeFile, "      ECHO_ENDPOINT: ${STOWAGE_L4_ECHO}\n", "      ECHO_ENDPOINT: ${STOWAGE_L4_ECHO}\n    networks: [lan]\n")
+	testutil.Edit(t, root, composeFile, "volumes:\n  postgres: {}\n", "networks:\n  lan: { driver: macvlan }\nvolumes:\n  postgres: {}\n")
+	errs := strings.Join(errorsOf(run(t, root)), "\n")
+	if strings.Contains(errs, "networks.lan is of the macvlan driver") {
+		t.Fatalf("judged:\n%s", errs)
+	}
+	// The control: off the host's network, it is judged.
+	testutil.Edit(t, root, specFile, "  echo: { cpus: 1, irq: on, host_network: true } ", "  echo: { cpus: 1, irq: on } ")
+	if errs := strings.Join(errorsOf(run(t, root)), "\n"); !strings.Contains(errs, "networks.lan is of the macvlan driver, and echo is on it") {
+		t.Fatalf("not judged:\n%s", errs)
 	}
 }
 
@@ -1779,8 +1813,8 @@ func TestVMFirewallOnlyKeysWithoutKairosWarn(t *testing.T) {
 		got = append(got, f.String())
 	}
 	for _, want := range []string{
-		"front.interface: only the VM's firewall opens a port on one interface alone",
-		"l4.routes[1].interfaces: only the VM's firewall opens a port on some interfaces alone",
+		"front.interfaces: only the VM's firewall is Stowage's (a kairos shape): a Docker host holds it in DOCKER-USER once its operator consents",
+		"l4.routes[1].interfaces: only the VM's firewall is Stowage's (a kairos shape): a Docker host holds it in DOCKER-USER once its operator consents",
 		"services.vpn.transparent: only the VM's firewall is Stowage's (a kairos shape)",
 		"host.interfaces.vpn0.forward: only the VM's firewall is Stowage's (a kairos shape)",
 		"services.api.feeds: only the VM's app socket feeds a table's sets (a kairos shape)",
@@ -1865,6 +1899,24 @@ func TestChartNotReadingTheFilesSecretWarns(t *testing.T) {
 	}
 	// No such input on the shape, no warning.
 	testutil.Edit(t, root, "stowage.yaml", "type: pem, optional: true }", "type: pem, optional: true, shapes: [docker, kairos] }")
+	if res := run(t, root); len(res.Findings) != 0 {
+		t.Fatalf("findings: %+v", res.Findings)
+	}
+}
+
+// A chart that never reads the Secret of the secrets delivered as files is warned while one is.
+func TestChartNotReadingTheSecretFilesWarns(t *testing.T) {
+	t.Parallel()
+	root := testutil.CopyExample(t, "full")
+	testutil.Edit(t, root, "deploy/chart/templates/api.yaml", ".Values.stowage.secretFiles", ".Values.api.secretFiles")
+	res := run(t, root)
+	if len(res.Findings) != 1 || !strings.Contains(res.Findings[0].String(), "no template reads .Values.stowage.secretFiles") {
+		t.Fatalf("findings: %+v", res.Findings)
+	}
+	// None delivered so on the shape, no warning.
+	testutil.Edit(t, root, "stowage.yaml", "gen: hex32, as_file: true }", "gen: hex32 }")
+	testutil.Edit(t, root, "deploy/compose.yaml", "      - ${STOWAGE_SECRET_FILE_ENCRYPTION_KEY}:/run/secrets/encryption_key:ro\n", "")
+	testutil.Edit(t, root, "stowage.yaml", "optional: true, as_file: true }", "optional: true, as_file: true, shapes: [docker, kairos] }")
 	if res := run(t, root); len(res.Findings) != 0 {
 		t.Fatalf("findings: %+v", res.Findings)
 	}

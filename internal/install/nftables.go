@@ -558,7 +558,7 @@ func (in *Installer) bootTables(ctx context.Context) error {
 // DOCKER-USER made now when Docker has not made it yet (applyChain; Docker keeps it, and its
 // rules, as it starts). Values that do not read drop every source of those ports.
 func (in *Installer) bootAllow(ctx context.Context) error {
-	if len(in.allowRoutes()) == 0 {
+	if len(in.allowRoutes()) == 0 && len(in.heldNames()) == 0 {
 		return nil
 	}
 	// Unread, every list is empty: the routes' ports drop every source until the start applies them.
@@ -570,7 +570,7 @@ func (in *Installer) bootAllow(ctx context.Context) error {
 	if err := errors.Join(readErr, in.allowSources(ctx, get, true)); err != nil {
 		return fmt.Errorf("the L4 routes' source allowlists at boot (the install's start applies them): %w", err)
 	}
-	in.O.logf("applied the L4 routes' source allowlists, before the containers start")
+	in.O.logf("applied the published ports' holds (source allowlists, interfaces), before the containers start")
 	return nil
 }
 

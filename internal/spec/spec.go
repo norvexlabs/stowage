@@ -6,6 +6,7 @@ import (
 	"cmp"
 	"errors"
 	"fmt"
+	"maps"
 	"net/netip"
 	"os"
 	"path"
@@ -339,9 +340,10 @@ type Front struct {
 	// others; 0 is 80 and 443.
 	HTTPPort  int `yaml:"http_port"`
 	HTTPSPort int `yaml:"https_port"`
-	// Interface is the host.interfaces role the front serves on, which the VM's firewall opens
-	// its ports on alone; empty, every interface.
-	Interface string `yaml:"interface"`
+	// Interfaces are the host.interfaces roles the front serves on, as an L4 route's are: the VM's
+	// firewall, and a Docker host's once consented, hold its ports to them alone; none, every
+	// interface.
+	Interfaces []string `yaml:"interfaces"`
 }
 
 // L4 is the stack's layer-4 routes: host ports published to a service as they are, TCP or UDP,
@@ -565,6 +567,9 @@ type Secret struct {
 	Rotation bool `yaml:"rotation"`
 	// Settable lets `secrets set` record a value the operator chooses in place of the generated one.
 	Settable bool `yaml:"settable"`
+	// AsFile delivers the value as a file a service mounts (${STOWAGE_SECRET_FILE_<KEY>}), never
+	// as a variable a service's environment can read.
+	AsFile bool `yaml:"as_file"`
 }
 
 type Input struct {
@@ -585,6 +590,8 @@ type Input struct {
 	// Type is what the input holds: empty for text, InputFile for a file's content, InputPEM for
 	// PEM blocks. A file input records its content in one line, its prefix and base64.
 	Type string `yaml:"type"`
+	// AsFile delivers a secret input's value as a file a service mounts, as Secret.AsFile.
+	AsFile bool `yaml:"as_file"`
 }
 
 // The types of an input holding a file.
@@ -604,6 +611,77 @@ func (i Input) File() bool { return i.Type == InputFile || i.Type == InputPEM }
 
 // FileVar is the variable holding the path of the file input key.
 func FileVar(key string) string { return FileVarPrefix + key }
+
+// SecretFileVarPrefix starts the variable holding the path of a secret delivered as a file.
+const SecretFileVarPrefix = "STOWAGE_SECRET_FILE_"
+
+// SecretFileVar is the variable holding the path of the file the secret key is delivered as.
+func SecretFileVar(key string) string { return SecretFileVarPrefix + key }
+
+// MTUOpt is the bridge driver's option holding a network's MTU.
+const MTUOpt = "com.docker.network.driver.mtu"
+
+// neutralNetworkOpts are the bridge driver's options that leave how clients reach a container as
+// it is: Docker translates its published ports to it whatever they say.
+var neutralNetworkOpts = map[string]bool{
+	MTUOpt:                                 true,
+	"com.docker.network.bridge.enable_icc": true,
+	"com.docker.network.bridge.enable_ip_masquerade": true,
+	"com.docker.network.bridge.host_binding_ipv4":    true,
+	"com.docker.network.container_iface_prefix":      true,
+	"com.docker.network.enable_ipv4":                 true,
+	"com.docker.network.enable_ipv6":                 true,
+}
+
+// UnheldNetwork is why a network of driver and driver options opts cannot carry a port held to
+// interfaces, "" when it can: the holds judge what Docker translates (DNAT) and forwards to a bridge
+// it makes and names itself, so the network is a bridge with no option but the neutral ones (its
+// MTU, inter-container traffic, masquerading, the default binding address, the families):
+// another driver, a bridge it is told to use, a routed gateway, trusted host interfaces each let
+// clients reach the container past them. Fail closed: an option this does not know refuses.
+func UnheldNetwork(driver string, opts map[string]string) string {
+	if driver != "" && driver != "bridge" {
+		return "is of the " + driver + " driver"
+	}
+	for _, k := range slices.Sorted(maps.Keys(opts)) {
+		if !neutralNetworkOpts[k] {
+			return "sets " + k + " " + opts[k]
+		}
+	}
+	return ""
+}
+
+// Declares reports whether key is one of the spec's secrets or inputs.
+func (s *Spec) Declares(key string) bool {
+	if _, ok := s.Input(key); ok {
+		return true
+	}
+	return slices.ContainsFunc(s.Secrets, func(sec Secret) bool { return sec.Key == key })
+}
+
+// AsFile reports whether key is a secret or a secret input delivered as a file (as_file: true).
+func (s *Spec) AsFile(key string) bool {
+	if i, ok := s.Input(key); ok {
+		return i.Secret && i.AsFile
+	}
+	return slices.ContainsFunc(s.Secrets, func(sec Secret) bool { return sec.Key == key && sec.AsFile })
+}
+
+// AsFileKeys are the keys delivered as files, in the spec's order: its secrets', then its inputs'.
+func (s *Spec) AsFileKeys() []string {
+	var keys []string
+	for _, sec := range s.Secrets {
+		if sec.AsFile {
+			keys = append(keys, sec.Key)
+		}
+	}
+	for _, i := range s.Inputs {
+		if i.Secret && i.AsFile {
+			keys = append(keys, i.Key)
+		}
+	}
+	return keys
+}
 
 // Profiles are the compose profiles the inputs turn on, sorted, each once.
 func (s *Spec) Profiles() []string {

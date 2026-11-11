@@ -101,9 +101,11 @@ type DescribedInput struct {
 	Shapes   []string `json:"shapes"`
 	When     string   `json:"when"`
 	Advanced bool     `json:"advanced"`
-	Profile  string   `json:"profile"`
-	Prompt   string   `json:"prompt"`
-	Default  *string  `json:"default,omitempty"`
+	// AsFile: a secret input a service reads from the file ${STOWAGE_SECRET_FILE_<KEY>} mounts.
+	AsFile  bool    `json:"as_file"`
+	Profile string  `json:"profile"`
+	Prompt  string  `json:"prompt"`
+	Default *string `json:"default,omitempty"`
 }
 
 // Describe is what r offers.
@@ -142,7 +144,7 @@ func describeInput(i spec.Input) DescribedInput {
 		t = "text"
 	}
 	di := DescribedInput{Key: i.Key, Type: t, Secret: i.Secret, Required: i.Required, Optional: i.Optional,
-		Shapes: append([]string{}, i.Shapes...), When: i.When, Advanced: i.Advanced, Profile: i.Profile, Prompt: i.Prompt}
+		Shapes: append([]string{}, i.Shapes...), When: i.When, Advanced: i.Advanced, AsFile: i.Secret && i.AsFile, Profile: i.Profile, Prompt: i.Prompt}
 	if !i.Secret {
 		def := i.Default
 		di.Default = &def
@@ -181,7 +183,7 @@ func (d Description) print(w io.Writer) error {
 		for _, t := range []struct {
 			on   bool
 			name string
-		}{{i.Secret, "secret"}, {i.Required, "required"}, {i.Optional, "optional"}, {i.Advanced, "advanced"}} {
+		}{{i.Secret, "secret"}, {i.Required, "required"}, {i.Optional, "optional"}, {i.Advanced, "advanced"}, {i.AsFile, "as file"}} {
 			if t.on {
 				tags = append(tags, t.name)
 			}

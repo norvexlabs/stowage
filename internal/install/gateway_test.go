@@ -2,6 +2,7 @@ package install
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"maps"
@@ -22,13 +23,14 @@ type gwHost struct {
 	// jumps are DOCKER-USER's jumps by chain, chain the chains made (a table's alone: one
 	// iptables -C finds the jump the other's -I made).
 	jumps map[string]int
-	chain map[string]bool
+	chain map[string]bool // by "<table>:<chain>"
 	// noNetworkd: systemd-networkd does not run; reloadErr fails `networkctl reload`; xErr fails
 	// deleting a chain.
 	noNetworkd bool
 	// noUser: iptables has no DOCKER-USER until one is made (-N), as before Docker starts;
 	// noForward: Docker's FORWARD does not jump to it (its iptables off).
 	noUser, noForward                     bool
+	noForward6                            bool // ip6tables' FORWARD does not jump to DOCKER-USER (its ip6tables off)
 	reloadErr, xErr, deleteErr, enableErr error
 	restoreErr                            error // fails iptables-restore
 }
@@ -73,10 +75,15 @@ func (h *gwHost) Run(_ context.Context, c Cmd) ([]byte, error) {
 			h.stdin = append(h.stdin, string(b))
 			for _, l := range strings.Split(string(b), "\n") {
 				if n, ok := strings.CutPrefix(l, ":"); ok {
-					h.chain[strings.Fields(n)[0]] = true
+					h.chain[strings.TrimSuffix(a[0], "-restore")+":"+strings.Fields(n)[0]] = true
 				}
 			}
 		}
+	case a[0] == "ip6tables" && slices.Contains(a, "FORWARD"):
+		if h.noForward6 {
+			return nil, errors.New("Bad rule (does a matching rule exist in that chain?)")
+		}
+		return nil, nil
 	case a[0] == "iptables" && slices.Contains(a, "FORWARD"):
 		if h.noForward {
 			return nil, errors.New("Bad rule: no such jump")
@@ -94,14 +101,14 @@ func (h *gwHost) Run(_ context.Context, c Cmd) ([]byte, error) {
 	case strings.HasPrefix(a[0], "ip") && slices.Contains(a, "-D"):
 		h.jumps[a[len(a)-1]]--
 	case strings.HasPrefix(a[0], "ip") && slices.Contains(a, "-L"):
-		if !h.chain[a[len(a)-1]] {
+		if !h.chain[a[0]+":"+a[len(a)-1]] {
 			return nil, errors.New("No chain")
 		}
 	case strings.HasPrefix(a[0], "ip") && slices.Contains(a, "-X"):
 		if h.xErr != nil {
 			return nil, h.xErr
 		}
-		delete(h.chain, a[len(a)-1])
+		delete(h.chain, a[0]+":"+a[len(a)-1])
 	}
 	return nil, nil
 }
@@ -915,7 +922,7 @@ func TestTheBootAppliesTheL4AllowlistsBeforeDocker(t *testing.T) {
 	if !host.did("iptables -w -N DOCKER-USER") || !host.did("iptables -w -I DOCKER-USER -j "+chain) || len(host.stdin) != 1 || !strings.Contains(host.stdin[0], "--ctorigdst 192.0.2.7 -s 10.0.0.0/8 -j RETURN") || !fileExists(in.allowRecord()) || fileExists(in.allowHeld()) || host.did("iptables -w -C FORWARD") {
 		t.Errorf("ran %v, rules %q", host.ran, host.stdin)
 	}
-	if !strings.Contains(strings.Join(*log, ""), "applied the L4 routes' source allowlists, before the containers start") {
+	if !strings.Contains(strings.Join(*log, ""), "applied the published ports' holds (source allowlists, interfaces), before the containers start") {
 		t.Errorf("log %q", *log)
 	}
 	if _, content := in.gatewayTablesUnit(); !strings.Contains(content, "Before=docker.service") {
@@ -940,7 +947,7 @@ func TestABoundAllowlistMatchesItsAddress(t *testing.T) {
 	routes := []spec.L4Route{{Name: "db", Protocol: "udp", Port: 5353, Upstream: "dns:53", AllowInput: "SRC", BindInput: "BIND"}}
 	vals := map[string]string{"SRC": "10.0.0.0/8, fd00::/8", "BIND": "192.0.2.5"}
 	get := func(k string) string { return vals[k] }
-	rules, err := allowRules(routes, "C", get)
+	rules, err := holdRules([]portHold{{name: "db", protocol: "udp", port: 5353, bind: bindAddr(routes[0], get), allow: "SRC"}}, "C", get, nil)
 	if err != nil || len(rules) != 1 || !strings.Contains(string(rules["iptables"]), "--ctorigdstport 5353 --ctorigdst 192.0.2.5 -s 10.0.0.0/8 -j RETURN\n") || strings.Contains(string(rules["iptables"]), "fd00") {
 		t.Errorf("%v %q", err, rules)
 	}
@@ -980,7 +987,7 @@ func TestAnAllowlistedRouteIsIPv4s(t *testing.T) {
 	if got := in.allowV4Only(); !slices.Equal(got, []string{"db"}) {
 		t.Errorf("consented: %v", got)
 	}
-	fc, err := frontCompose(in.R.Spec.Front, routes, func(string) string { return "" }, Loopback, hostAPI{}, "sha256:x", "", false, false, true, nil, []string{"db"})
+	fc, err := frontCompose(in.R.Spec.Front, routes, func(string) string { return "" }, Loopback, hostAPI{}, "sha256:x", "", false, false, true, nil, []string{"db"}, false)
 	if err != nil || !strings.Contains(string(fc), "host_ip: 0.0.0.0\n") || strings.Count(string(fc), "host_ip") != 1 {
 		t.Errorf("%v\n%s", err, fc)
 	}
@@ -1200,5 +1207,259 @@ func TestPendingNetworkdFilesAreNotInForce(t *testing.T) {
 	}
 	if st := in.gatewayStatus(none); !strings.HasPrefix(st, "consented (tune --apply), nothing in force: 1 networkd file(s) pending") {
 		t.Errorf("status %q", st)
+	}
+}
+
+// A Docker host holds a port to its roles' devices, each crossed with its allowlist's sources, for
+// what Docker forwards to a container bridge; a role no device plays drops every connection (fail
+// closed); the front's ports with the stack's IPv6 on are held for IPv6 too.
+func TestHoldRulesCrossInterfacesAndSources(t *testing.T) {
+	t.Parallel()
+	get := func(k string) string { return map[string]string{"SRC": "10.0.0.0/8"}[k] }
+	dev := func(role string) string { return map[string]string{"edge": "eth1"}[role] }
+	rules, err := holdRules([]portHold{
+		{name: "feed", protocol: "udp", port: 17007, allow: "SRC", roles: []string{"edge"}},
+		{name: "front", protocol: "tcp", port: 443, roles: []string{"uplink"}, v6: true},
+	}, "C", get, dev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	held := func(m string) []string {
+		var r []string
+		for _, o := range []string{" -o br-+", " -o docker0"} {
+			if strings.Contains(m, "udp") {
+				r = append(r, m+o+" -i eth1 -s 10.0.0.0/8 -j RETURN", m+o+" -j DROP")
+			} else {
+				r = append(r, m+o+" -j DROP") // uplink: no NIC named, closed
+			}
+		}
+		return r
+	}
+	m := "-A C -p udp -m conntrack --ctstate DNAT --ctdir ORIGINAL --ctorigdstport 17007"
+	f := "-A C -p tcp -m conntrack --ctstate DNAT --ctdir ORIGINAL --ctorigdstport 443"
+	want4 := strings.Join(slices.Concat([]string{"*filter", ":C - [0:0]"}, held(m), held(f), []string{"COMMIT", ""}), "\n")
+	if got := string(rules["iptables"]); got != want4 {
+		t.Errorf("iptables:\n%s\nwant\n%s", got, want4)
+	}
+	want6 := strings.Join(slices.Concat([]string{"*filter", ":C - [0:0]"}, held(f), []string{"COMMIT", ""}), "\n")
+	if got := string(rules["ip6tables"]); got != want6 {
+		t.Errorf("ip6tables:\n%s\nwant\n%s", got, want6)
+	}
+	if rules, err := holdRules(nil, "C", get, dev); err != nil || rules != nil {
+		t.Errorf("nothing held: %v %v", rules, err)
+	}
+}
+
+// A consented Docker host holds the front to front.interfaces: its two ports from the recorded
+// values, none in loopback mode; without the stack's IPv6 it publishes them on IPv4 alone.
+func TestADockerHostHoldsTheFrontToItsInterfaces(t *testing.T) {
+	t.Parallel()
+	in, _, _ := gateway(t, 0)
+	in.R.Spec.Front.Interfaces = []string{"uplink"}
+	vals := map[string]string{"STOWAGE_TLS_MODE": "internal", HTTPPortVar: "8080", HTTPSPortVar: "8443", InterfaceVar("uplink"): "eth0"}
+	get := func(k string) string { return vals[k] }
+	if got := in.heldNames(); !slices.Equal(got, []string{"front"}) {
+		t.Errorf("held %v", got)
+	}
+	if got := in.unheldRoles(get); got != nil {
+		t.Errorf("unheld %v", got)
+	}
+	in.R.Spec.Front.Interfaces = []string{"uplink", "edge"}
+	if got := in.unheldRoles(get); !slices.Equal(got, []string{"edge"}) {
+		t.Errorf("unheld %v", got)
+	}
+	in.R.Spec.Front.Interfaces = []string{"uplink"}
+	rules, err := in.heldRules("C", get)
+	if err != nil || !strings.Contains(string(rules["iptables"]), "--ctorigdstport 8443 -o br-+ -i eth0 -j RETURN\n") || rules["ip6tables"] != nil {
+		t.Errorf("%v %q", err, rules)
+	}
+	// Values that do not read (a boot before the start): the spec's ports, held.
+	if rules, _ := in.heldRules("C", none); !strings.Contains(string(rules["iptables"]), "--ctorigdstport 443 -o br-+ -j DROP\n") {
+		t.Errorf("unread: %q", rules)
+	}
+	vals["STOWAGE_TLS_MODE"] = Loopback
+	if rules, _ := in.heldRules("C", get); rules != nil {
+		t.Errorf("loopback: %q", rules)
+	}
+	if in.frontV4Only(get) {
+		t.Error("not consented, yet on IPv4 alone")
+	}
+	if err := in.writeGateway(gatewayRecord{Digest: dirDigest(in.gatewayDir()), Dir: in.gatewayDir()}); err != nil {
+		t.Fatal(err)
+	}
+	if !in.frontV4Only(get) {
+		t.Error("consented without IPv6, yet not on IPv4 alone")
+	}
+	vals[IPv6Var] = "true"
+	if in.frontV4Only(get) {
+		t.Error("with IPv6, on IPv4 alone")
+	}
+	fc, err := frontCompose(in.R.Spec.Front, nil, get, "internal", hostAPI{}, "sha256:x", "", false, false, false, nil, nil, true)
+	if err != nil || !strings.Contains(string(fc), "0.0.0.0:${"+HTTPSPortVar+"}:443") {
+		t.Errorf("%v\n%s", err, fc)
+	}
+}
+
+// Holds that were IPv6's and are no more get an empty ip6tables chain while the record of the last
+// apply gave ip6tables rules: applyChain leaves a table it is not given alone.
+func TestAnIPv6HoldGoneEmptiesItsChain(t *testing.T) {
+	t.Parallel()
+	in, _, _ := gateway(t, 0)
+	rules := map[string][]byte{"iptables": []byte("*filter\n:X - [0:0]\nCOMMIT\n")}
+	if got := in.emptiedV6(rules); got["ip6tables"] != nil {
+		t.Errorf("no record: %q", got)
+	}
+	if err := os.MkdirAll(filepath.Dir(in.allowRecord()), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(in.allowRecord(), []byte("*filter\nA\nCOMMIT\n*filter\nB\nCOMMIT\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := in.emptiedV6(rules); string(got["ip6tables"]) != "*filter\n:"+in.allowChain()+" - [0:0]\nCOMMIT\n" || rules["ip6tables"] != nil {
+		t.Errorf("after an IPv6 hold: %q", got)
+	}
+}
+
+// A route held to its interfaces and bound to an IPv6 address is refused, as an allowlisted one is:
+// a Docker host holds it for IPv4 alone.
+func TestAnInterfacedRouteBoundToIPv6IsRefused(t *testing.T) {
+	t.Parallel()
+	in, _, _ := gateway(t, 0)
+	in.R.Spec.L4.Routes = []spec.L4Route{{Name: "db", Protocol: "tcp", Port: 5432, Upstream: "postgres:5432", BindInput: "BIND", Interfaces: []string{"uplink"}}}
+	vals := map[string]string{"BIND": "2001:db8::5"}
+	if err := in.allowBound(func(k string) string { return vals[k] }); err == nil || !strings.Contains(err.Error(), "l4 route db: BIND=2001:db8::5 is an IPv6 address, and a Docker host holds its interfaces for IPv4 alone") {
+		t.Errorf("%v", err)
+	}
+	vals["BIND"] = "192.0.2.5"
+	if err := in.allowBound(func(k string) string { return vals[k] }); err != nil {
+		t.Errorf("IPv4: %v", err)
+	}
+}
+
+// With the stack's IPv6 on and the engine's ip6tables off, the front's IPv6 hold cannot hold: the
+// start fails, its IPv4 holds applied all the same.
+func TestAnIPv6HoldThatCannotHoldStillAppliesIPv4s(t *testing.T) {
+	t.Parallel()
+	in, host, _ := gateway(t, 0)
+	host.noForward6 = true
+	in.R.Spec.Front.Interfaces = []string{"uplink"}
+	vals := map[string]string{"STOWAGE_TLS_MODE": "internal", HTTPPortVar: "80", HTTPSPortVar: "443", IPv6Var: "true"}
+	err := in.allowSources(context.Background(), func(k string) string { return vals[k] }, false)
+	if err == nil || !strings.Contains(err.Error(), "cannot hold for IPv6: ip6tables' FORWARD does not jump to DOCKER-USER") {
+		t.Fatalf("%v", err)
+	}
+	if len(host.stdin) != 1 || !strings.Contains(host.stdin[0], "--ctorigdstport 443 -o br-+ -i eth0 -j RETURN") {
+		t.Errorf("IPv4's holds: %q", host.stdin)
+	}
+}
+
+// netDocker answers heldNetworks' inspection of external networks: each one's driver and options.
+type netDocker map[string]string
+
+func (d netDocker) Run(_ context.Context, c Cmd) ([]byte, error) {
+	if a := c.Args; a[0] == "network" && a[1] == "inspect" {
+		return []byte(d[a[len(a)-1]] + "\n"), nil
+	}
+	return nil, errors.New("unexpected " + strings.Join(c.Args, " "))
+}
+
+// Before the stack starts, a held service the holds would not judge is refused (spec.UnheldNetwork,
+// a network_mode, an address of its own on a NIC), an external network's as Docker inspects it; a
+// network Docker makes passes, and nothing is judged where no hold applies (not consented) or in
+// loopback mode.
+func TestAHeldServiceTheHoldsWouldNotJudgeIsRefused(t *testing.T) {
+	t.Parallel()
+	in, _, _ := gateway(t, 0)
+	in.R.Spec.Front.Interfaces = []string{"uplink"}
+	env := NewEnvFile()
+	env.Set("STOWAGE_TLS_MODE", "internal")
+	model := func(mode, nets string) *composeModel {
+		var m composeModel
+		raw := `{"services": {"stowage-front": {"network_mode": "` + mode + `", "networks": {"default": {}, "shared": {}}}, "api": {"networks": {"lan": {}}}}, "networks": {` + nets + `}}`
+		if err := json.Unmarshal([]byte(raw), &m); err != nil {
+			t.Fatal(err)
+		}
+		return &m
+	}
+	okNets := `"default": {"driver_opts": {"com.docker.network.driver.mtu": "1400"}}, "shared": {"name": "shared", "external": true}, "lan": {"driver": "ipvlan"}`
+	in.O.Docker = netDocker{"shared": "bridge|{}"}
+	bad := model("", `"default": {"driver_opts": {"com.docker.network.bridge.name": "br-lan"}}, "shared": {}`)
+	if err := in.heldNetworks(context.Background(), bad, env); err != nil {
+		t.Errorf("not consented: %v", err)
+	}
+	if err := in.writeGateway(gatewayRecord{Digest: dirDigest(in.gatewayDir()), Dir: in.gatewayDir()}); err != nil {
+		t.Fatal(err)
+	}
+	if err := in.heldNetworks(context.Background(), model("", okNets), env); err != nil {
+		t.Errorf("Docker's own (an unheld service on ipvlan): %v", err)
+	}
+	for _, c := range []struct {
+		m    *composeModel
+		d    netDocker
+		want string
+	}{
+		{bad, nil, "the front (stowage-front) is on network default, which sets com.docker.network.bridge.name br-lan: its ports held to interfaces"},
+		{model("", okNets), netDocker{"shared": `bridge|{"com.docker.network.bridge.trusted_host_interfaces":"eth1"}`}, "make the external network shared again with Docker's own bridge"},
+		{model("", okNets), netDocker{"shared": "macvlan|{}"}, "is on network shared, which is of the macvlan driver"},
+		{model("", okNets), netDocker{"shared": "bridge|map[]"}, "`docker network inspect` gave \"bridge|map[]\""},
+		{model("bridge", okNets), nil, "has network_mode bridge"},
+	} {
+		in.O.Docker = c.d
+		if c.d == nil {
+			in.O.Docker = netDocker{"shared": "bridge|{}"}
+		}
+		if err := in.heldNetworks(context.Background(), c.m, env); err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("%q: %v", c.want, err)
+		}
+	}
+	// An interfaced route's upstream with an address of its own on a NIC.
+	in.R.Spec.L4.Routes = []spec.L4Route{{Name: "db", Protocol: "tcp", Port: 5432, Upstream: "api:5432", Interfaces: []string{"uplink"}}}
+	in.R.Spec.Services = map[string]spec.Service{"api": {Interface: "edge", AddressInput: "API_ADDRESS"}}
+	in.O.Docker = netDocker{"shared": "bridge|{}"}
+	if err := in.heldNetworks(context.Background(), model("", okNets), env); err == nil || !strings.Contains(err.Error(), "service api has an address of its own on edge") {
+		t.Errorf("an ipvlan address: %v", err)
+	}
+	in.R.Spec.L4.Routes, in.R.Spec.Services = nil, nil
+	env.Set("STOWAGE_TLS_MODE", Loopback)
+	if err := in.heldNetworks(context.Background(), bad, env); err != nil {
+		t.Errorf("loopback: %v", err)
+	}
+	if got := in.heldNamesIn(func(k string) string { v, _ := env.Get(k); return v }); got != nil {
+		t.Errorf("held in loopback mode: %v", got)
+	}
+}
+
+// A recorded port out of range holds the spec's, as one that does not read; a front of roles that
+// name no interface drops every connection to its ports, without failing.
+func TestFrontPortsAndAnEmptyRole(t *testing.T) {
+	t.Parallel()
+	in, _, _ := gateway(t, 0)
+	vals := map[string]string{HTTPPortVar: "0", HTTPSPortVar: "70000"}
+	if got, err := in.frontPorts(func(k string) string { return vals[k] }); !slices.Equal(got, []int{80, 443}) || err == nil || !strings.Contains(err.Error(), HTTPSPortVar+` "70000" is not a TCP port`) {
+		t.Errorf("ports %v %v", got, err)
+	}
+	in.R.Spec.Front.Interfaces = []string{""}
+	env := NewEnvFile()
+	env.Set("STOWAGE_TLS_MODE", "internal")
+	if got := string(in.frontHolds(env)); !strings.Contains(got, `oifname "br-*" drop`) {
+		t.Errorf("holds %q", got)
+	}
+}
+
+// k8s status --json reads the release's Secret alone when another tool wrote a Secret of the secret
+// files' name: what it lists is the record's keys.
+func TestK8sStatusBesideAForeignSecretFilesSecret(t *testing.T) {
+	t.Parallel()
+	e := newKubeEnv(t, spec.Provider{Name: "none"})
+	e.release = e.at("1.0.0", 1, asFileSession)
+	e.runs("1.0.0", 1)
+	e.stored(map[string]string{"ADMIN_EMAIL": "a@example.org"}, ours)
+	raw, _ := json.Marshal(map[string]any{"metadata": map[string]any{"labels": map[string]string{"app.kubernetes.io/managed-by": "other"}}, "data": map[string]string{}})
+	e.f.objects = map[string]string{"secret/notes-stowage-secret-files": string(raw)}
+	if _, err := e.installer(nil).k8sRecorded(context.Background()); err == nil {
+		t.Fatal("k8sRecorded took another tool's Secret")
+	}
+	if err := e.installer(nil).K8sStatusJSON(context.Background()); err != nil || !strings.Contains(e.out.String(), `"ADMIN_EMAIL"`) {
+		t.Errorf("%v\n%s", err, e.out)
 	}
 }

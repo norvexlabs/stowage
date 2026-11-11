@@ -634,7 +634,11 @@ func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(
 		err := c.do(cmd.Context(), http.MethodPost, "/v1/secrets/export", SecretsExportRequest{Recipients: recipients}, &out)
 		_, _ = io.WriteString(stderr, out.Log)
 		return []byte(out.File), err
-	})
+	}, settableShow(r.Spec, func(cmd *cobra.Command, key string) (string, error) {
+		var out SecretShown
+		err := c.do(cmd.Context(), http.MethodPost, "/v1/secrets/show", SecretShowRequest{Key: key}, &out)
+		return out.Value, err
+	}))
 	netCmd := networkCommand(c, name, stdout)
 	netAttach := netAttachCommand(r, &o.Dir, stdout)
 	dirFlag(netAttach)

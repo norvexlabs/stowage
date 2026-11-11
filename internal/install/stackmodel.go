@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/norvexlabs/stowage/internal/spec"
 	"os"
 	"slices"
 	"strconv"
@@ -76,13 +77,14 @@ type composeModel struct {
 
 // composeNetwork is a network of the compose file, as `docker compose config` renders it.
 type composeNetwork struct {
+	Name       string            `json:"name"`
 	External   bool              `json:"external"`
 	Driver     string            `json:"driver"`
 	DriverOpts map[string]string `json:"driver_opts"`
 }
 
 // mtuOpt is the bridge driver's option holding a network's MTU.
-const mtuOpt = "com.docker.network.driver.mtu"
+const mtuOpt = spec.MTUOpt
 
 // takesMTU reports whether the installer gives n the host's MTU: a bridge network the stack makes
 // itself, whose compose file sets no MTU of its own.

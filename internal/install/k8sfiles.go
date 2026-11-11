@@ -153,14 +153,22 @@ func (in *Installer) k8sRestartReaders(ctx context.Context, keys []string) error
 	if err != nil {
 		return err
 	}
-	if slices.ContainsFunc(keys, func(key string) bool { i, ok := in.R.Spec.Input(key); return ok && i.File() }) {
-		mounting, err := releaseWorkloads(manifest, k.Namespace, k.filesSecret(), keys)
-		if err != nil {
-			return err
+	for _, f := range []struct {
+		secret string
+		of     func(string) bool
+	}{
+		{k.filesSecret(), func(key string) bool { i, ok := in.R.Spec.Input(key); return ok && i.File() }},
+		{k.secretFilesSecret(), in.R.Spec.AsFile},
+	} {
+		if slices.ContainsFunc(keys, f.of) {
+			mounting, err := releaseWorkloads(manifest, k.Namespace, f.secret, keys)
+			if err != nil {
+				return err
+			}
+			workloads = append(workloads, mounting...)
+			slices.Sort(workloads)
+			workloads = slices.Compact(workloads)
 		}
-		workloads = append(workloads, mounting...)
-		slices.Sort(workloads)
-		workloads = slices.Compact(workloads)
 	}
 	// The context named in the hint a failure prints, read first: the current one may change meanwhile.
 	kctx := k.Context
@@ -178,8 +186,9 @@ func (in *Installer) k8sRestartReaders(ctx context.Context, keys []string) error
 	return nil
 }
 
-// withFilesValue sets the files Secret's name in the values a release ran with.
-func withFilesValue(values []byte, name string) ([]byte, error) {
+// withFilesValue sets the files Secret's name, the secret files' one's and the keys delivered as
+// files (asFile) in the values a release ran with.
+func withFilesValue(values []byte, name, secretFiles string, asFile []string) ([]byte, error) {
 	var v map[string]any
 	if err := yaml.Unmarshal(values, &v); err != nil {
 		return nil, fmt.Errorf("the release's values: %w", err)
@@ -192,6 +201,8 @@ func withFilesValue(values []byte, name string) ([]byte, error) {
 		block = map[string]any{}
 	}
 	block["files"] = name
+	block["secretFiles"] = secretFiles
+	block["asFile"] = append([]string{}, asFile...)
 	v[helm.ValuesKey] = block
 	return yaml.Marshal(v)
 }

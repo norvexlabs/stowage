@@ -26,8 +26,24 @@ follow [SemVer](https://semver.org/).
   install is there — no install in the directory, no helm release in the namespace (never `k8s
   uninstall`'s, which does not tell what helm keeps) — so a program tells "nothing installed here"
   from any other refusal.
+- `secrets show KEY` prints a `settable` secret's value (a login an operator signs in with) on a
+  terminal, refused into a pipe or a file, on every shape (`k8s secrets show` on Kubernetes, the
+  VM's host daemon on its operator's socket alone); an install's closing report names the logins
+  and that command, so a generated login is no longer read out of the install's files.
+- The front's ports are held to `front.interfaces` (roles, as an L4 route's `interfaces`) for
+  real on the VM: Docker translates them to the front's container past the input chain, and the
+  firewall's forward chain now drops a connection to them from any other interface. A consented
+  Docker host holds the front's and the L4 routes' interfaces in `DOCKER-USER` too.
+- `as_file: true` on a secret, or on a secret input, delivers its value as a file a service
+  mounts (`${STOWAGE_SECRET_FILE_<KEY>}`), never as a variable `docker inspect` or a child process
+  could read; lint refuses the variable read anywhere in the compose file. On Kubernetes the value
+  is in its own Secret (`stowage.secretFiles`), never in the release's, so `envFrom` cannot reach
+  it; the provision hook gets it as a file on every shape. `describe --json` gives `as_file`.
 
 ### Changed
+
+- `front.interface` (one role) is `front.interfaces` (a list, as an L4 route's): `interfaces:
+  [uplink]`.
 
 - `k8s uninstall` with no release refuses naming another tool's objects of the release's names it
   finds there.

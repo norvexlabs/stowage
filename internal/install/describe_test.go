@@ -33,6 +33,7 @@ var describeInputFields = map[string]string{
 	"When":     "when",
 	"Shapes":   "shapes",
 	"Advanced": "advanced",
+	"AsFile":   "as_file",
 	"Profile":  "profile",
 	"Type":     "type",
 }

@@ -492,10 +492,7 @@ func (in *Installer) K8sReset(ctx context.Context) error {
 	// inputs it adds (asked as an upgrade asks), and the pull account it carries.
 	var d deploy
 	if other {
-		if d.env, d.secret, d.changed, err = in.k8sEnv(ctx, true); err != nil {
-			return err
-		}
-		if d.files, err = in.k8sFiles(ctx, d.env); err != nil {
+		if err := in.k8sSecrets(ctx, &d, true); err != nil {
 			return err
 		}
 		user, token, err := in.pullAccount(cur.Registry)
@@ -520,7 +517,11 @@ func (in *Installer) K8sReset(ctx context.Context) error {
 		if d.files != nil {
 			name = k.filesSecret()
 		}
-		if values, err = withFilesValue(values, name); err != nil {
+		secretFiles := ""
+		if d.secretFiles() != nil {
+			secretFiles = k.secretFilesSecret()
+		}
+		if values, err = withFilesValue(values, name, secretFiles, d.asFile); err != nil {
 			return err
 		}
 	}

@@ -25,6 +25,7 @@
       ],
       "when": "tls",
       "advanced": false,
+      "as_file": false,
       "profile": "",
       "prompt": "Support address shown on the public site",
       "default": ""
@@ -38,6 +39,7 @@
       "shapes": [],
       "when": "",
       "advanced": false,
+      "as_file": false,
       "profile": "",
       "prompt": "Administrator email",
       "default": ""
@@ -51,6 +53,7 @@
       "shapes": [],
       "when": "",
       "advanced": false,
+      "as_file": false,
       "profile": "",
       "prompt": "Organisation name",
       "default": ""
@@ -64,6 +67,7 @@
       "shapes": [],
       "when": "",
       "advanced": false,
+      "as_file": true,
       "profile": "",
       "prompt": "Upstream API key"
     },
@@ -76,6 +80,7 @@
       "shapes": [],
       "when": "",
       "advanced": false,
+      "as_file": false,
       "profile": "",
       "prompt": "Search service URL (empty: no search)",
       "default": ""
@@ -89,6 +94,7 @@
       "shapes": [],
       "when": "",
       "advanced": false,
+      "as_file": false,
       "profile": "",
       "prompt": "Search service key"
     },
@@ -104,6 +110,7 @@
       ],
       "when": "",
       "advanced": false,
+      "as_file": false,
       "profile": "",
       "prompt": "Addresses allowed to send events (CIDRs; empty refuses everyone)",
       "default": "0.0.0.0/0, ::/0"
@@ -120,6 +127,7 @@
       ],
       "when": "",
       "advanced": true,
+      "as_file": false,
       "profile": "",
       "prompt": "Authentication service of the api route, host:port",
       "default": ""
@@ -136,6 +144,7 @@
       ],
       "when": "",
       "advanced": true,
+      "as_file": false,
       "profile": "",
       "prompt": "Path the authentication service is asked at",
       "default": ""
@@ -149,6 +158,7 @@
       "shapes": [],
       "when": "",
       "advanced": true,
+      "as_file": false,
       "profile": "",
       "prompt": "Log level (debug, info, warning)",
       "default": ""
@@ -165,6 +175,7 @@
       ],
       "when": "",
       "advanced": false,
+      "as_file": false,
       "profile": "",
       "prompt": "Host name or address clients dial the echo service at",
       "default": "localhost"
@@ -181,6 +192,7 @@
       ],
       "when": "",
       "advanced": true,
+      "as_file": false,
       "profile": "",
       "prompt": "Host address the TCP echo is published on (every address when empty)",
       "default": ""
@@ -197,6 +209,7 @@
       ],
       "when": "",
       "advanced": false,
+      "as_file": false,
       "profile": "",
       "prompt": "Sources (addresses, CIDRs) the firewall lets reach the UDP echo",
       "default": "0.0.0.0/0 ::/0"
@@ -210,6 +223,7 @@
       "shapes": [],
       "when": "",
       "advanced": false,
+      "as_file": false,
       "profile": "",
       "prompt": "File of the CA certificates the API trusts for its upstream (PEM; empty: none)",
       "default": ""
@@ -226,6 +240,7 @@
       ],
       "when": "",
       "advanced": false,
+      "as_file": false,
       "profile": "relay",
       "prompt": "Event source the relay forwards (empty: no relay)",
       "default": ""
@@ -242,6 +257,7 @@
       ],
       "when": "",
       "advanced": true,
+      "as_file": false,
       "profile": "",
       "prompt": "Address the relay has of its own on the edge network (empty: none)",
       "default": ""
@@ -257,6 +273,7 @@
       ],
       "when": "",
       "advanced": false,
+      "as_file": false,
       "profile": "",
       "prompt": "Migration database URL (external Postgres)"
     },
@@ -271,6 +288,7 @@
       ],
       "when": "",
       "advanced": false,
+      "as_file": false,
       "profile": "",
       "prompt": "Application database URL (external Postgres)"
     },
@@ -285,6 +303,7 @@
       ],
       "when": "",
       "advanced": false,
+      "as_file": false,
       "profile": "",
       "prompt": "Administrator password"
     },
@@ -300,6 +319,7 @@
       ],
       "when": "",
       "advanced": false,
+      "as_file": false,
       "profile": "",
       "prompt": "Probe addresses ingest trusts, comma-separated (empty: none)",
       "default": ""
@@ -316,6 +336,7 @@
       ],
       "when": "",
       "advanced": false,
+      "as_file": false,
       "profile": "",
       "prompt": "ingest's table: observe (counts) or enforce (drops what no trusted probe sends)",
       "default": "observe"

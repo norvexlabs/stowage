@@ -329,8 +329,10 @@ func (in *Installer) certDone() {
 
 // logChanges logs each value next changes from env, a secret's redacted, and each it removes.
 func (in *Installer) logChanges(env, next *EnvFile, secrets map[string]bool) {
-	// A file input's path follows its value, which is logged.
-	path := func(k string) bool { return strings.HasPrefix(k, spec.FileVarPrefix) }
+	// A mounted file's path follows its value, which is logged (a secret's redacted).
+	path := func(k string) bool {
+		return strings.HasPrefix(k, spec.FileVarPrefix) || strings.HasPrefix(k, spec.SecretFileVarPrefix) || k == FileSaltVar
+	}
 	for _, k := range env.Keys() {
 		if _, ok := next.Get(k); !ok && !path(k) {
 			in.O.logf("removing %s", k)

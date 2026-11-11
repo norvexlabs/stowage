@@ -403,13 +403,17 @@ const frontJSON = "/tmp/stowage-caddy.json"
 // clientCA mounts the install's client CA.
 // ipv6 turns IPv6 on for the default network. onHost are the services on the host's network
 // (hostServices), whose L4 routes' ports are their own.
-func frontCompose(f spec.Front, l4 []spec.L4Route, get func(string) string, mode string, host hostAPI, digest, ca string, noALPN, clientCA, ipv6 bool, onHost, v4Only []string) ([]byte, error) {
+func frontCompose(f spec.Front, l4 []spec.L4Route, get func(string) string, mode string, host hostAPI, digest, ca string, noALPN, clientCA, ipv6 bool, onHost, v4Only []string, frontV4 bool) ([]byte, error) {
 	var ports []any
 	volumes := []string{"./" + Caddyfile + ":/etc/caddy/Caddyfile:ro", "stowage-front-data:/data"}
 	if mode == Loopback {
 		for i, r := range f.Routes {
 			ports = append(ports, fmt.Sprintf("${STOWAGE_LOOPBACK_ADDRESS}:${%s}:%d", PortVar(r.Name), frontPort(i)))
 		}
+	} else if frontV4 {
+		// Held to its interfaces on a Docker host without the stack's IPv6: published on IPv4's
+		// every address alone, as an allowlisted route is (frontV4Only).
+		ports = []any{"0.0.0.0:${" + HTTPPortVar + "}:80", "0.0.0.0:${" + HTTPSPortVar + "}:443"}
 	} else {
 		ports = []any{"${" + HTTPPortVar + "}:80", "${" + HTTPSPortVar + "}:443"}
 	}
@@ -470,6 +474,8 @@ func frontCompose(f spec.Front, l4 []spec.L4Route, get func(string) string, mode
 				port["host_ip"] = "${STOWAGE_LOOPBACK_ADDRESS}"
 			case a != "":
 				port["host_ip"] = a
+			case slices.Contains(v4Only, r.Name):
+				port["host_ip"] = "0.0.0.0"
 			}
 			front, _ := services[FrontService].(map[string]any)
 			if front == nil {

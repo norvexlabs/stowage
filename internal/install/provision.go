@@ -68,15 +68,25 @@ func (in *Installer) hookEnv(env *EnvFile, h *providers.ProvisionHook) []string 
 	return keys
 }
 
-// hookFiles lists the file inputs the provision hook's env names.
+// hookFiles lists the keys of the provision hook's env it gets as files: the file inputs, and the
+// secrets delivered as files.
 func (in *Installer) hookFiles(h *providers.ProvisionHook) []string {
 	var files []string
+	mounted := in.mountedFiles()
 	for _, k := range h.Keys() {
-		if i, ok := in.R.Spec.Input(k); ok && i.File() {
+		if slices.ContainsFunc(mounted, func(f mountedFile) bool { return f.Key == k }) {
 			files = append(files, k)
 		}
 	}
 	return files
+}
+
+// fileVarOf is the variable holding the path of the file key is mounted from.
+func (in *Installer) fileVarOf(key string) string {
+	if in.R.Spec.AsFile(key) {
+		return spec.SecretFileVar(key)
+	}
+	return spec.FileVar(key)
 }
 
 // providedEnv lists the recorded values Stowage provides, each route's URL and each L4 route's
@@ -158,15 +168,16 @@ func serviceFile(what, service string, svc map[string]any) ([]byte, error) {
 }
 
 // provisionCompose is the hook's service, confined, which also reads the hook's earlier outputs
-// from ProvisionEnv, with hosts (targetHosts) as its extra hosts. Each of files is a file input
-// mounted read-only, its only mounts, with its variable holding the path inside the container.
-func provisionCompose(h *providers.ProvisionHook, keys, files, hosts []string) ([]byte, error) {
+// from ProvisionEnv, with hosts (targetHosts) as its extra hosts. Each of files is a file it gets
+// (a file input, or a secret delivered as a file) mounted read-only, its only mounts, with the
+// variable varOf names holding the path inside the container.
+func provisionCompose(h *providers.ProvisionHook, keys, files, hosts []string, varOf func(string) string) ([]byte, error) {
 	environment := slices.Clone(keys)
 	var volumes []string
 	for _, k := range files {
 		target := HookInputsDir + "/" + k
-		environment = append(environment, spec.FileVar(k)+"="+target)
-		volumes = append(volumes, "${"+spec.FileVar(k)+"}:"+target+":ro")
+		environment = append(environment, varOf(k)+"="+target)
+		volumes = append(volumes, "${"+varOf(k)+"}:"+target+":ro")
 	}
 	svc := confined(ProvisionService, "${"+ImageVar(h.Image)+"}", h.Cmd, environment)
 	svc["env_file"] = []string{"./" + ProvisionEnv}
@@ -260,7 +271,7 @@ func (in *Installer) runHook(ctx context.Context, env *EnvFile, h *providers.Pro
 	if err := outs.WriteFile(in.path(ProvisionEnv)); err != nil {
 		return err
 	}
-	pc, err := provisionCompose(h, keys, files, in.targetHosts())
+	pc, err := provisionCompose(h, keys, files, in.targetHosts(), in.fileVarOf)
 	if err != nil {
 		return err
 	}
@@ -697,12 +708,11 @@ func (in *Installer) passesEnvOn() error {
 	return nil
 }
 
-// fileInputMount reports whether a mount source is exactly a file input's variable: the installer
-// records that path, under InputFilesDir, so it never reaches .env.
+// fileInputMount reports whether a mount source is exactly a mounted file's variable (a file
+// input's, a secret's delivered as a file): the installer records that path, under InputFilesDir,
+// so it never reaches .env.
 func (in *Installer) fileInputMount(src string) bool {
-	return slices.ContainsFunc(in.R.Spec.Inputs, func(i spec.Input) bool {
-		return i.File() && src == "${"+spec.FileVar(i.Key)+"}"
-	})
+	return slices.ContainsFunc(in.mountedFiles(), func(f mountedFile) bool { return src == "${"+f.Var+"}" })
 }
 
 // bindsEnv reports whether a mount source may reach dir/.env: dir itself, a directory above it,

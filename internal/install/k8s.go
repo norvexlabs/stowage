@@ -337,6 +337,55 @@ func (k K8sOptions) pullSecret() string { return k.Release + "-stowage-pull" }
 // filesSecret is the Secret holding each file input's content under its key, for a chart to mount.
 func (k K8sOptions) filesSecret() string { return k.Release + "-stowage-files" }
 
+// secretFilesSecret is the Secret holding each secret delivered as a file (as_file) under its key,
+// for a chart to mount: never in envSecret, which a chart may read whole into an environment.
+func (k K8sOptions) secretFilesSecret() string { return k.Release + "-stowage-secret-files" }
+
+// k8sRecorded is what the release records: envSecret's data, with each key secretFilesSecret holds
+// that this release delivers as a file, or that envSecret does not hold (a key a later release
+// delivered as a file, carried back). Nil when envSecret is absent.
+func (in *Installer) k8sRecorded(ctx context.Context) (map[string]string, error) {
+	k := in.O.K8s
+	in.k8sHeld.env, in.k8sHeld.files = nil, nil
+	rec, err := in.readSecret(ctx, k.envSecret())
+	if err != nil {
+		return nil, err
+	}
+	if rec == nil {
+		// None recorded yet: a Secret of the secret files' name is another tool's, or one left
+		// behind; another tool's is refused before a run writes over it.
+		if len(in.R.Spec.AsFileKeys()) > 0 {
+			if _, err := in.readSecret(ctx, k.secretFilesSecret()); err != nil {
+				return nil, err
+			}
+		}
+		return nil, nil
+	}
+	in.k8sHeld.env = map[string]bool{}
+	for key := range rec {
+		in.k8sHeld.env[key] = true
+	}
+	files, err := in.readSecret(ctx, k.secretFilesSecret())
+	var foreign *foreignSecret
+	if errors.As(err, &foreign) && len(in.R.Spec.AsFileKeys()) == 0 {
+		return rec, nil // never written nor read: the name is free for another tool's
+	}
+	if err != nil {
+		return nil, err
+	}
+	in.k8sHeld.files = files
+	for key, v := range files {
+		// A key this release declares: delivered as a file, or carried back from one (a later
+		// release delivered it so); a key it does not declare stays in that Secret alone, for the
+		// release a rollback brings back, never in envSecret.
+		_, held := rec[key]
+		if in.R.Spec.AsFile(key) || !held && in.R.Spec.Declares(key) {
+			rec[key] = v
+		}
+	}
+	return rec, nil
+}
+
 // k8sCtl is the command line of a k8s verb on this release.
 func (in *Installer) k8sCtl(verb string) string {
 	return in.R.Ctl() + " k8s " + verb + k8sTarget(in.O.K8s)
@@ -535,14 +584,119 @@ func dockerAuths(host, user, token string) ([]byte, error) {
 
 // deploy is a plan the installer applies: the Secrets, then the chart.
 type deploy struct {
-	namespace bool // the namespace is created
-	env       map[string]string
-	secret    map[string]bool   // keys of env never printed
-	changed   []string          // keys of env this run adds or changes
-	pull      []byte            // the pull Secret's Docker config; nil writes none
-	files     map[string][]byte // the files Secret's data; nil writes none
-	restart   []string          // the keys whose readers an upgrade restarts (k8sRestartList)
-	values    []byte            // the values file the installer gives helm
+	namespace     bool // the namespace is created
+	env           map[string]string
+	secret        map[string]bool   // keys of env never printed
+	changed       []string          // keys of env this run adds or changes
+	pull          []byte            // the pull Secret's Docker config; nil writes none
+	files         map[string][]byte // the files Secret's data; nil writes none
+	asFile        []string          // the keys of env delivered as files: in secretFilesSecret, never envSecret
+	heldEnv       map[string]bool   // the keys envSecret held (k8sRecorded)
+	heldFiles     map[string]string // what secretFilesSecret held (k8sRecorded)
+	historyAsFile map[string]bool   // the keys every revision of the helm history delivers as files
+	restart       []string          // the keys whose readers an upgrade restarts (k8sRestartList)
+	values        []byte            // the values file the installer gives helm
+}
+
+// secretFiles is secretFilesSecret's data: each key the release delivers as a file, empty while env
+// holds none (an optional input left empty), so a chart's mount of it holds a file either way; and
+// each key the Secret held already, with env's value (its own while env holds none), so a release a
+// rollback brings back that delivers it as a file never mounts an older value. Nil, writing none,
+// when the release delivers none and the Secret held none.
+func (d deploy) secretFiles() map[string][]byte {
+	if len(d.asFile) == 0 && len(d.heldFiles) == 0 {
+		return nil
+	}
+	data := map[string][]byte{}
+	for key, v := range d.heldFiles {
+		data[key] = []byte(v)
+		if cur, ok := d.env[key]; ok {
+			data[key] = []byte(cur)
+		}
+	}
+	for _, key := range d.asFile {
+		data[key] = []byte(d.env[key])
+	}
+	return data
+}
+
+// inEnvSecret reports whether key of env is written to envSecret: every key but one delivered as a
+// file, which stays where envSecret held it while a revision of the release's helm history reads
+// it there (historyAsFile leaves it out), as a rollback may bring that one back; once every one
+// delivers it as a file, a run drops it.
+func (d deploy) inEnvSecret(key string) bool {
+	return !slices.Contains(d.asFile, key) || d.heldEnv[key] && !d.historyAsFile[key]
+}
+
+// historyAsFile is which of keys every revision of the release's helm history that deployed lists
+// in its values' stowage.asFile: none for a release in no history yet. It stops reading once none
+// of keys is left.
+func (in *Installer) historyAsFile(ctx context.Context, keys []string) (map[string]bool, error) {
+	h, err := in.helmHistory(ctx)
+	if err != nil {
+		return nil, err
+	}
+	all := map[string]bool{}
+	for _, k := range keys {
+		all[k] = true
+	}
+	seen := false
+	for _, r := range h.revs {
+		if !deployedOnce(r) {
+			continue
+		}
+		if len(all) == 0 {
+			return all, nil
+		}
+		seen = true
+		raw, err := h.values(ctx, r.Revision)
+		if err != nil {
+			return nil, err
+		}
+		var v struct {
+			Stowage struct {
+				AsFile []string `json:"asFile"`
+			} `json:"stowage"`
+		}
+		if err := json.Unmarshal(raw, &v); err != nil {
+			return nil, fmt.Errorf("helm get values --revision %d: %w", r.Revision, err)
+		}
+		listed := map[string]bool{}
+		for _, k := range v.Stowage.AsFile {
+			if all[k] {
+				listed[k] = true
+			}
+		}
+		all = listed
+	}
+	if !seen {
+		return nil, nil
+	}
+	return all, nil
+}
+
+// k8sSecrets fills d's Secrets' data for a run: the values (k8sEnv), the file inputs' (k8sFiles),
+// the keys delivered as files and what the Secrets held, read once (k8sRecorded).
+func (in *Installer) k8sSecrets(ctx context.Context, d *deploy, upgrade bool) (err error) {
+	d.asFile = in.R.Spec.AsFileKeys()
+	if d.env, d.secret, d.changed, err = in.k8sEnv(ctx, upgrade); err != nil {
+		return err
+	}
+	d.heldEnv, d.heldFiles = in.k8sHeld.env, in.k8sHeld.files
+	// Read only when a key delivered as a file is held in envSecret, which it may still have to keep.
+	var heldAsFile []string
+	for _, k := range d.asFile {
+		if d.heldEnv[k] {
+			heldAsFile = append(heldAsFile, k)
+		}
+	}
+	if upgrade && len(heldAsFile) > 0 {
+		if d.historyAsFile, err = in.historyAsFile(ctx, heldAsFile); err != nil {
+			return err
+		}
+	}
+	d.files, err = in.k8sFiles(ctx, d.env)
+	return err
 }
 
 // K8sInstall installs the release the installer carries as a new helm release: its namespace
@@ -676,10 +830,7 @@ func (in *Installer) k8sDeploy(ctx context.Context, upgrade bool) (err error) {
 		}
 		d.namespace = err == nil && len(bytes.TrimSpace(ns)) == 0
 	}
-	if d.env, d.secret, d.changed, err = in.k8sEnv(ctx, upgrade); err != nil {
-		return err
-	}
-	if d.files, err = in.k8sFiles(ctx, d.env); err != nil {
+	if err := in.k8sSecrets(ctx, &d, upgrade); err != nil {
 		return err
 	}
 	// A value the release no longer declares as an input leaves its Secret: the server-side apply
@@ -706,6 +857,11 @@ func (in *Installer) k8sDeploy(ctx context.Context, upgrade bool) (err error) {
 	if d.files != nil {
 		vals["files"] = k.filesSecret()
 	}
+	vals["secretFiles"] = ""
+	if d.secretFiles() != nil {
+		vals["secretFiles"] = k.secretFilesSecret()
+	}
+	vals["asFile"] = append([]string{}, d.asFile...)
 	if u := k.UnsafeSysctls; u != nil {
 		sysctls = *u
 	}
@@ -824,6 +980,7 @@ func (in *Installer) k8sFinished(ctx context.Context, env map[string]string, pre
 		return env[key], true
 	})
 	in.kitTips(onK8s)
+	in.loginTips(onK8s)
 }
 
 // helmDeploy is the helm command that installs or upgrades the release with chart, waiting for it
@@ -874,8 +1031,8 @@ func (in *Installer) k8sNewer(cur *deployed) error {
 // not hold resolved and every secret it does not hold generated. A first install takes --set over
 // a value an earlier run recorded; an upgrade sets only an input the release adds.
 func (in *Installer) k8sEnv(ctx context.Context, upgrade bool) (env map[string]string, secret map[string]bool, changed []string, err error) {
-	o, k := &in.O, in.O.K8s
-	rec, err := in.readSecret(ctx, k.envSecret())
+	o := &in.O
+	rec, err := in.k8sRecorded(ctx)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -993,11 +1150,16 @@ func (in *Installer) applySecrets(ctx context.Context, d deploy) error {
 	}
 	data := map[string][]byte{}
 	for key, v := range d.env {
-		data[key] = []byte(v)
+		if d.inEnvSecret(key) {
+			data[key] = []byte(v)
+		}
 	}
 	items = append(items, in.secretObject(k.envSecret(), "Opaque", data))
 	if d.files != nil {
 		items = append(items, in.secretObject(k.filesSecret(), "Opaque", d.files))
+	}
+	if f := d.secretFiles(); f != nil {
+		items = append(items, in.secretObject(k.secretFilesSecret(), "Opaque", f))
 	}
 	if d.pull != nil {
 		items = append(items, in.secretObject(k.pullSecret(), "kubernetes.io/dockerconfigjson", map[string][]byte{".dockerconfigjson": d.pull}))
@@ -1016,6 +1178,9 @@ func secretNames(d deploy, k K8sOptions) []string {
 	if d.files != nil {
 		names = append(names, k.filesSecret())
 	}
+	if d.secretFiles() != nil {
+		names = append(names, k.secretFilesSecret())
+	}
 	if d.pull != nil {
 		names = append(names, k.pullSecret())
 	}
@@ -1031,10 +1196,15 @@ func (in *Installer) printDeploy(d deploy, args []string, shown map[string]strin
 	}
 	fmt.Fprintf(w, "secret %s:\n", k.envSecret())
 	for _, key := range d.changed {
-		fmt.Fprintf(w, "  %s=%s\n", key, in.shownValue(key, d.env[key], d.secret))
+		if d.inEnvSecret(key) {
+			fmt.Fprintf(w, "  %s=%s\n", key, in.shownValue(key, d.env[key], d.secret))
+		}
 	}
 	if d.files != nil {
 		fmt.Fprintf(w, "secret %s: the file inputs %s\n", k.filesSecret(), cmp.Or(strings.Join(sortedKeys(d.files), ", "), "(none)"))
+	}
+	if f := d.secretFiles(); f != nil {
+		fmt.Fprintf(w, "secret %s: the secrets delivered as files %s (redacted)\n", k.secretFilesSecret(), strings.Join(sortedKeys(f), ", "))
 	}
 	if d.pull != nil {
 		fmt.Fprintf(w, "secret %s: the pull account (redacted)\n", k.pullSecret())

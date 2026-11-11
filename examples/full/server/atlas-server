@@ -256,6 +256,15 @@ def main():
         for k in ("DATABASE_URL", "APP_DATABASE_URL"):
             if not os.environ.get(k):
                 sys.exit(f"{k} is empty: give it (on Kubernetes, postgres.mode external takes it as an input)")
+        # The encryption key is delivered as a file (as_file): its variable must not exist.
+        if "ENCRYPTION_KEY" in os.environ:
+            sys.exit("ENCRYPTION_KEY is in the environment: it is delivered as the file ENCRYPTION_KEY_FILE names")
+        try:
+            with open(os.environ["ENCRYPTION_KEY_FILE"]) as f:
+                if not re.fullmatch(r"[0-9a-f]{64}", f.read()):
+                    sys.exit("ENCRYPTION_KEY_FILE holds no 32-byte hex key")
+        except (KeyError, OSError) as e:
+            sys.exit(f"ENCRYPTION_KEY_FILE: {e}")
         # The database may still be starting (a pod starts beside it): a connection that fails is
         # tried again for 280 s; any other error ends the api at once. With the session's own bound
         # (300 s), that fits the chart's startup probe (600 s).

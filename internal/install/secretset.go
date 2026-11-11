@@ -98,6 +98,7 @@ func (in *Installer) SetSecret(ctx context.Context, key, value string) error {
 		in.O.logf("%s holds that value already: bringing the stack up again", key)
 	} else {
 		env.Set(key, value)
+		in.fileVars(env) // a secret delivered as a file: the new value's path, recorded with it
 		if err := env.WriteFile(in.path(envName)); err != nil {
 			return err
 		}
@@ -110,4 +111,71 @@ func (in *Installer) SetSecret(ctx context.Context, key, value string) error {
 		return err
 	}
 	return in.start(ctx, env)
+}
+
+// ShowSecret returns the value the Docker install in O.Dir records for the settable secret key:
+// only when it runs this installer's release, whose spec says which secrets are settable.
+func (in *Installer) ShowSecret(ctx context.Context, key string) (string, error) {
+	if _, err := in.settable(key); err != nil {
+		return "", err
+	}
+	env, err := in.open()
+	if err != nil {
+		return "", err
+	}
+	if err := in.sameRelease(ctx, env); err != nil {
+		return "", err
+	}
+	return recordedSecret(env.Get, key, in.path(envName))
+}
+
+// K8sShowSecret returns the value the release's Secret records for the settable secret key.
+func (in *Installer) K8sShowSecret(ctx context.Context, key string) (string, error) {
+	if _, err := in.settable(key); err != nil {
+		return "", err
+	}
+	if err := in.checkTarget(); err != nil {
+		return "", err
+	}
+	k := in.O.K8s
+	if _, err := in.checkHelm(ctx); err != nil {
+		return "", err
+	}
+	rel, err := in.release(ctx)
+	if err != nil {
+		return "", err
+	}
+	if rel == nil {
+		return "", in.noRelease()
+	}
+	// The release's spec says which secrets are settable: this installer's only when it carries it.
+	cur, err := in.installedRelease(ctx)
+	if err != nil {
+		return "", err
+	}
+	if r, m := cur.Release, in.R.Manifest; r.Version != m.ProjectVersion || r.Revision != m.Revision {
+		return "", refuse(fmt.Sprintf("the installer of %s", r.Version), "release %s in %s runs %s %s (revision %d), and this installer carries %s (revision %d): show with the installer of %s",
+			k.Release, k.Namespace, m.Name, r.Version, r.Revision, m.ProjectVersion, m.Revision, r.Version)
+	}
+	rec, err := in.k8sRecorded(ctx)
+	if err != nil {
+		return "", err
+	}
+	if rec == nil {
+		return "", in.noRelease()
+	}
+	where := k.envSecret()
+	if in.R.Spec.AsFile(key) {
+		where = k.secretFilesSecret()
+	}
+	return recordedSecret(func(k string) (string, bool) { v, ok := rec[k]; return v, ok }, key, "the Secret "+where+" in "+k.Namespace)
+}
+
+// recordedSecret is key's value as get reads it from where (named in the error when it holds none).
+func recordedSecret(get func(string) (string, bool), key, where string) (string, error) {
+	v, ok := get(key)
+	if !ok || v == "" {
+		return "", fmt.Errorf("%s holds no %s", where, key)
+	}
+	return v, nil
 }
