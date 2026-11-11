@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"github.com/norvexlabs/stowage/internal/testutil"
 	"os"
 	"path/filepath"
 	"slices"
@@ -274,7 +275,7 @@ func TestResetNewBaselineRefusalsOnDocker(t *testing.T) {
 	if err := payload.Write(&buf, strings.NewReader("exe"), files); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(ctl, buf.Bytes(), 0o755); err != nil {
+	if err := testutil.WriteExecutable(ctl, buf.Bytes()); err != nil {
 		t.Fatal(err)
 	}
 	if err := e.reset(func(o *Options) {

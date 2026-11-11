@@ -57,7 +57,7 @@ func bundledInstaller(t *testing.T, version string, revision int, mod func(*spec
 		t.Fatal(err)
 	}
 	exe := filepath.Join(t.TempDir(), "notes-stow")
-	_ = os.WriteFile(exe, buf.Bytes(), 0o755)
+	_ = testutil.WriteExecutable(exe, buf.Bytes())
 	files, err := payload.Read(exe)
 	if err != nil {
 		t.Fatal(err)
@@ -523,7 +523,7 @@ func TestBootNeverRunsAnInstallerThatIsNotTheInstalls(t *testing.T) {
 	}
 	e.r, e.self = bundledInstaller(t, "2.0.0", 1, nil)
 	// The install's installer is 2.0.0's, though it runs 1.0.0: running it would boot again.
-	if err := os.WriteFile(filepath.Join(e.dir, "notes-stow"), []byte(read(t, e.self)), 0o755); err != nil {
+	if err := testutil.WriteExecutable(filepath.Join(e.dir, "notes-stow"), []byte(read(t, e.self))); err != nil {
 		t.Fatal(err)
 	}
 	in := e.installer(vm)

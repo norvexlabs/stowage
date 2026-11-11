@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"github.com/norvexlabs/stowage/internal/testutil"
 	"io"
 	"os"
 	"path/filepath"
@@ -651,7 +652,7 @@ func TestDockerStatusJSONKeptSpecUnread(t *testing.T) {
 	if err := payload.Write(&buf, strings.NewReader("exe"), files); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(kept, buf.Bytes(), 0o755); err != nil {
+	if err := testutil.WriteExecutable(kept, buf.Bytes()); err != nil {
 		t.Fatal(err)
 	}
 	dropInputsRecord(t, e) // the kept installer's spec alone could tell the inputs
@@ -680,7 +681,7 @@ func TestDockerStatusJSONChannelAndInputsFromTheInstalledRelease(t *testing.T) {
 	if st, out := statusOf(t, e, nil); st.Channel != "stable" || st.Inputs == nil || !slices.Equal(*st.Inputs, []string{"ADMIN_EMAIL"}) {
 		t.Errorf("%s", out)
 	}
-	if err := os.WriteFile(filepath.Join(e.dir, "notes-stow"), []byte("not an installer"), 0o755); err != nil {
+	if err := testutil.WriteExecutable(filepath.Join(e.dir, "notes-stow"), []byte("not an installer")); err != nil {
 		t.Fatal(err)
 	}
 	// The install's own record of its inputs tells them whatever installer runs.

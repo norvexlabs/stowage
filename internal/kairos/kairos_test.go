@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/norvexlabs/stowage/internal/testutil"
 	"hash/crc32"
 	"io"
 	"io/fs"
@@ -451,7 +452,7 @@ func vhdFooter(size int64) []byte {
 func fakeBuilder(t *testing.T) (*DiskBuilder, string) {
 	bin := t.TempDir()
 	for name, body := range map[string]string{"docker": fakeDocker, "qemu-img": fakeQemu, "sgdisk": "#!/bin/sh\n"} {
-		if err := os.WriteFile(filepath.Join(bin, name), []byte(body), 0o755); err != nil {
+		if err := testutil.WriteExecutable(filepath.Join(bin, name), []byte(body)); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -1271,7 +1272,7 @@ func TestACancelledBuildRemovesItsContainer(t *testing.T) {
 	log := filepath.Join(dir, "log")
 	fake := filepath.Join(dir, "docker")
 	body := "#!/bin/sh\necho \"$*\" >> " + log + "\ncase $1 in run) exec sleep 30 ;; rm) [ ! -e " + dir + "/gone ] || { echo 'Error: No such container' >&2; exit 1; } ;; esac\n"
-	if err := os.WriteFile(fake, []byte(body), 0o755); err != nil {
+	if err := testutil.WriteExecutable(fake, []byte(body)); err != nil {
 		t.Fatal(err)
 	}
 	b := &DiskBuilder{Docker: fake}
@@ -1305,7 +1306,7 @@ func TestACancelledBuildRemovesItsContainer(t *testing.T) {
 	}
 	// A run that ends on its own removes nothing.
 	ok := filepath.Join(dir, "ok")
-	if err := os.WriteFile(ok, []byte("#!/bin/sh\necho \"$*\" >> "+log+".ok\n"), 0o755); err != nil {
+	if err := testutil.WriteExecutable(ok, []byte("#!/bin/sh\necho \"$*\" >> "+log+".ok\n")); err != nil {
 		t.Fatal(err)
 	}
 	if err := (&DiskBuilder{Docker: ok}).docker(context.Background(), "run", "--rm", "img"); err != nil {

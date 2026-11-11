@@ -14,6 +14,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"github.com/norvexlabs/stowage/internal/testutil"
 	"io"
 	"net"
 	"net/http"
@@ -170,7 +171,7 @@ volumes:
 			t.Fatal(err)
 		}
 		exe := filepath.Join(work, "notes-stow-"+version)
-		if err := os.WriteFile(exe, buf.Bytes(), 0o755); err != nil {
+		if err := testutil.WriteExecutable(exe, buf.Bytes()); err != nil {
 			t.Fatal(err)
 		}
 		return r, exe

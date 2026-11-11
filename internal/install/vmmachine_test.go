@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"github.com/norvexlabs/stowage/internal/testutil"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -790,7 +791,7 @@ func TestVMStatusReadsTheKeptInstallerOnce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(kept, bytes.Repeat([]byte("x"), int(fi.Size())), 0o755); err != nil {
+	if err := testutil.WriteExecutable(kept, bytes.Repeat([]byte("x"), int(fi.Size()))); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.Chtimes(kept, fi.ModTime(), fi.ModTime()); err != nil {
@@ -813,7 +814,7 @@ func TestVMStatusReadsTheKeptInstallerOnce(t *testing.T) {
 	if n := strings.Count(log.String(), "the installer the install keeps"); n != 1 {
 		t.Errorf("logged %d times:\n%s", n, log.String())
 	}
-	if err := os.WriteFile(kept, orig, 0o755); err != nil {
+	if err := testutil.WriteExecutable(kept, orig); err != nil {
 		t.Fatal(err)
 	}
 	later = later.Add(time.Second)

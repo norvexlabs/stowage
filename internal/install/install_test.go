@@ -346,7 +346,7 @@ func testInstallerKeys(t *testing.T, version string, revision int, mod func(*spe
 		t.Fatal(err)
 	}
 	exe := filepath.Join(t.TempDir(), "notes-stow")
-	_ = os.WriteFile(exe, buf.Bytes(), 0o755)
+	_ = testutil.WriteExecutable(exe, buf.Bytes())
 	files, err = payload.Read(exe)
 	if err != nil {
 		t.Fatal(err)
