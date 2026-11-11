@@ -149,6 +149,9 @@ type Hostd struct {
 	netGen   int
 	// afterFunc arms a revert's timer: time.AfterFunc, or a test's, which fires it itself.
 	afterFunc func(d time.Duration, f func()) stopper
+	// onWait, a test's, is told what a request waits on ("slot": a running job's end; "events":
+	// the journal's next event) as it starts waiting: the test acts then, never before.
+	onWait func(what string)
 	// netOwner is the role of the NIC whose change netTimer undoes (empty: the primary): another
 	// NIC's change waits for it, as it would disarm it.
 	netOwner string
@@ -1684,6 +1687,9 @@ func (h *Hostd) startJobWhenFree(ctx context.Context, wait time.Duration, kind s
 		h.mu.Unlock()
 		if end == nil {
 			continue
+		}
+		if h.onWait != nil {
+			h.onWait("slot")
 		}
 		select {
 		case <-end:

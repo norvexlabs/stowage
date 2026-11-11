@@ -255,10 +255,16 @@ func TestTheEventsLongPoll(t *testing.T) {
 	// The daemon stopping ends it.
 	ctx, cancel := context.WithCancel(context.Background())
 	d.Unit, d.ctx = time.Hour, ctx
-	time.AfterFunc(20*time.Millisecond, cancel)
-	if code := call(t, d.Handler(), "GET", "/v1/events?after=2&wait=60", nil, &a); code != 200 || len(a.Events) != 0 {
-		t.Errorf("the stop: %d %+v", code, a)
+	d.onWait = func(what string) {
+		if what == "events" {
+			go cancel() // once the request waits: a stop before it would prove nothing
+		}
 	}
+	returnsWithin(t, "the stop ending the wait", func() {
+		if code := call(t, d.Handler(), "GET", "/v1/events?after=2&wait=60", nil, &a); code != 200 || len(a.Events) != 0 {
+			t.Errorf("the stop: %d %+v", code, a)
+		}
+	})
 }
 
 func TestAJobAndItsRebootAreJournaled(t *testing.T) {
@@ -1052,5 +1058,18 @@ func TestABootReadThatFailedIsRetriedAfterItsWait(t *testing.T) {
 	}
 	if b.get(at.Add(time.Hour), time.Minute, read) != rec || reads != 2 {
 		t.Errorf("a read that succeeded is read again: %d", reads)
+	}
+}
+
+// returnsWithin runs f, failing the test when it has not returned in 5 s: a wait the code should end, and
+// does not, fails rather than hang the suite.
+func returnsWithin(t *testing.T, what string, f func()) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() { defer close(done); f() }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("never: %s", what)
 	}
 }

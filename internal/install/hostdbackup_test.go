@@ -17,6 +17,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -926,11 +927,21 @@ func TestTheTimersRunWaitsForARunningJob(t *testing.T) {
 	}
 	// The job's end wakes the run at once: no poll of the slot (a Unit of an hour would show it).
 	d.Unit = time.Hour
-	time.AfterFunc(20*time.Millisecond, func() { d.finish(running, nil) })
-	var started JobStarted
-	if code := call(t, h, "POST", "/v1/backup", BackupRequest{IfConfigured: true}, &started); code != 202 || started.Job != "backup" || !started.Started.After(running.Started) {
-		t.Fatalf("the timer's run: %d %+v", code, started)
+	// Once the run waits for the slot: a job ended before it would prove nothing.
+	var act atomic.Pointer[func()]
+	d.onWait = func(what string) {
+		if f := act.Swap(nil); what == "slot" && f != nil {
+			go (*f)()
+		}
 	}
+	finish := func() { d.finish(running, nil) }
+	act.Store(&finish)
+	var started JobStarted
+	returnsWithin(t, "the job's end waking the run", func() {
+		if code := call(t, h, "POST", "/v1/backup", BackupRequest{IfConfigured: true}, &started); code != 202 || started.Job != "backup" || !started.Started.After(running.Started) {
+			t.Errorf("the timer's run: %d %+v", code, started)
+		}
+	})
 	if j := waitJob(t, h); j.State != "done" || j.Kind != "backup" || j.Target != started.Target {
 		t.Errorf("%+v", j)
 	}
@@ -940,16 +951,19 @@ func TestTheTimersRunWaitsForARunningJob(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	time.AfterFunc(20*time.Millisecond, func() {
+	remove := func() {
 		if code := call(t, h, "DELETE", "/v1/backup/config", nil, nil); code != 200 {
 			t.Errorf("removing the settings: %d", code)
 		}
 		d.finish(running, nil)
-	})
-	var skipped struct{ Skipped string }
-	if code := call(t, h, "POST", "/v1/backup", BackupRequest{IfConfigured: true}, &skipped); code != 200 || skipped.Skipped != "no backup is configured" {
-		t.Fatalf("settings removed during the wait: %d %+v", code, skipped)
 	}
+	act.Store(&remove)
+	var skipped struct{ Skipped string }
+	returnsWithin(t, "the job's end waking the run", func() {
+		if code := call(t, h, "POST", "/v1/backup", BackupRequest{IfConfigured: true}, &skipped); code != 200 || skipped.Skipped != "no backup is configured" {
+			t.Errorf("settings removed during the wait: %d %+v", code, skipped)
+		}
+	})
 	configure(t, d, validConfig(key))
 	d.Unit = time.Millisecond
 	// A job that does not end within the wait: the timer's run fails, saying why.
