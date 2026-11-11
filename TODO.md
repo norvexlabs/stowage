@@ -51,6 +51,35 @@ Known and accepted risks, no entry: SSH open to every source without `--ssh-allo
 NOPASSWD sudo for the admin group, the shared baked pull credential, secrets as environment
 variables.
 
+### Features — from the same consumer's audit
+
+1. **`front.interfaces`: the front held to several roles, on every path**: `front.interface` takes
+   one `host.interfaces` role or every interface. A gateway VM serves its front to clients on two
+   inside roles (a VPN tun and a client LAN) and must not answer on the uplink; with one role it
+   falls back to a route's `allow_input`, which the front checks after the TCP handshake and which
+   every IPv6 client passes as the stack network's gateway while the stack's IPv6 is off. Take
+   `front.interfaces: [roleA, roleB]` (one `iifname { … } tcp dport { http, https } accept`), linted
+   as `l4.routes[].interfaces` (an undeclared role, one given twice, an empty list are errors), and
+   say what `acme`'s HTTP-01 then needs. The rule must hold the front itself: today `openPorts`
+   writes the role's match into the input chain alone, while the front is a bridged container
+   published on every address, its 80/443 DNAT'd through forward (`policy accept`), so it answers
+   on every NIC (security audit 2026-10-26, Medium). Drop DNAT'd http/https arriving on another
+   interface in forward (or `DOCKER-USER`), or publish the front on the roles' addresses; e2e-full-vm
+   connects from a role left out rather than grepping the rule text.
+2. **Secrets as files, and a pull account per install**: (a) a generated secret (`secrets:`) or a
+   `secret: true` input reaches a service only as an environment variable, so it is in `docker
+   inspect`, in every child's environment and in the process parsing untrusted content; file
+   inputs serve operator-given files alone. Let the compose file take a secret as a mounted file
+   (0400, tmpfs) — `STOWAGE_SECRET_FILE_<KEY>`, as `STOWAGE_INPUT_FILE_<KEY>` is; a mounted Secret
+   on Kubernetes. (b) Every installer and OS image carries the project's one pull account: give
+   each install its own pull credential, or a short-lived one, so one leaked installer does not
+   read every image of the project.
+3. **A generated login shown at first use**: `secrets` has `set`, `rotate` and `export`, none
+   showing a value, so an operator whose first sign-in needs a `settable` generated password (a
+   route's `basic_auth`, a service's login) reads `<dir>/.env` as root. End the first install with
+   where each settable login is read (never the value in a log), and offer `secrets show KEY` for a
+   `settable` secret, on a terminal only, as root.
+
 ### Supply chain — stopgaps back to canonical
 
 1. **Check every stopgap at each release, and drop each one the upstream has caught up with**:
@@ -317,14 +346,6 @@ variables.
   networkd files and boot unit are unit-tested; no suite applies them to a real Docker host (the
   gate's host is not one to change). A disposable Docker host (a VM of the Docker shape) running
   e2e-full's `tune --apply --dir`, a reboot, `status`, then `tune --revert`, would prove them.
-- **`front.interface` does not hold the front on the VM** (security audit 2026-10-26, Medium):
-  `openPorts` writes the role's `iifname` match into the input chain alone
-  (`internal/install/install.go`), but the front is a bridged container published on every
-  address (`frontCompose`, no `host_ip`) and Docker's DNAT sends its 80/443 through forward,
-  whose chain is `policy accept` with its one include removed. So the front answers on every NIC,
-  against README's "opens the front's ports on alone". Drop DNAT'd http/https arriving on another
-  interface in forward (or `DOCKER-USER`), or publish the front on the role NIC's address; make
-  e2e-full-vm connect from `edge` rather than grep the rule text.
 - **A restore loads a backup it cannot authenticate** (security audit 2026-10-26, Medium): age
   gives confidentiality only, the recipients are public, and `ownBackup` checks the object's name
   (`internal/install/hostdsecrets.go`), so whoever can write the destination can plant (or
@@ -545,9 +566,6 @@ variables.
 - **Kairos at-rest encryption**: the persistent partition encrypted with a TPM-sealed key
   (Kairos kcrypt), or the sealed secrets' deployment key sealed by the TPM; later a key server or
   a cloud KMS releasing it at boot after attestation. The boot flow stays the same.
-- **Secrets as files (opt-in)**: deliver secrets as `/run/secrets/<KEY>` (compose `secrets:`, a
-  mounted Secret on Kubernetes) instead of environment variables, which leak into `docker
-  inspect`, crash dumps and child processes.
 - **Hook ship with submodules**: refused today (a checkout has no submodule content). Fetch them
   into the checkout from the repository's own `.git/modules` (no network, no change to the
   repository's configuration).
