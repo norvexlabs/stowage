@@ -31,6 +31,25 @@ follow [SemVer](https://semver.org/).
 
 - `k8s uninstall` with no release refuses naming another tool's objects of the release's names it
   finds there.
+- The front Stowage adds runs as a user of its own (65532, or the uid the project gives the
+  volume it publishes its CA in), with no capability, no privilege gain and a read-only root;
+  each start gives it its volumes, an older front's included, and copies a `byo` certificate into
+  its own volume. Lint refuses uid 0 on the volume `front.publish_ca` names. A start refuses a
+  published-CA volume whose directory another uid holds (a service's image made it so, or the
+  front ran as another uid there), naming the `chown` that gives it to the front.
+- The provision hook, the schema check and a handoff's step run with a read-only root, `/tmp`
+  their only writable path, on Docker and Kubernetes alike.
+- A front serving L4 routes alone no longer publishes or opens ports 80 and 443, which nothing
+  served on: in `acme` mode it opens 80 alone, for the certificates' challenge. An install checks
+  free only the ports the front serves on, and an upgrade whose release serves them first checks
+  them then. On the VM, a plaintext L4 route to a service whose profiles are off is no longer
+  opened.
+
+### Security
+
+- The VM's firewall drops what it would forward between its own interfaces, IPv6 as IPv4, unless
+  a role's `host.interfaces.<role>.forward` declares the pair, whatever Docker's forward policy
+  is: a neighbour could route new IPv6 flows through a VM that forwards IPv6.
 
 ## [0.34.0] - 2026-11-11
 

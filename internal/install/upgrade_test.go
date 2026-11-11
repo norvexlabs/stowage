@@ -703,6 +703,10 @@ func TestRollbackGoesBackAndKeepsWhatTheUpgradeAdded(t *testing.T) {
 	if read(t, filepath.Join(failed, "notes-stow")) != ctl2 || !strings.Contains(read(t, filepath.Join(failed, ".env")), "STOWAGE_PROJECT_VERSION='2.0.0'") {
 		t.Error("the release left is not kept")
 	}
+	// Its Caddyfile, the logins' hashes, stays the installer's alone there too.
+	if st, err := os.Stat(filepath.Join(failed, Caddyfile)); err != nil || st.Mode().Perm() != 0o600 {
+		t.Errorf("the release left's Caddyfile: %v %v", st, err)
+	}
 	if !strings.Contains(e.out.String(), "notes 1.0.0 is running") || len(e.docker.ran("compose")) == 0 {
 		t.Fatalf("not started: %s", e.out)
 	}
@@ -1732,8 +1736,10 @@ func TestUpgradeAddsAByoRouteTheCertificateCovers(t *testing.T) {
 	if err := e.upgrade(func(o *Options) { o.Set = map[string]string{"DOCS_DOMAIN": "docs.example.com"} }); err != nil {
 		t.Fatalf("a covered domain: %v\n%s", err, e.log)
 	}
-	// A release adding no route never reads the certificate (expired, or gone).
-	if err := os.Remove(filepath.Join(e.dir, TLSDir, "cert.pem")); err != nil {
+	// A release adding no route never reads the certificate (expired since; a copy gone is
+	// refused by the start: the front would serve without it).
+	expired, _ := writeCert(t, time.Now().Add(-time.Hour), "*.example.com")
+	if err := os.WriteFile(filepath.Join(e.dir, TLSDir, "cert.pem"), []byte(read(t, expired)), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	e.to("3.0.0", docsRoute(9000))

@@ -171,7 +171,7 @@ func TestResetAsksAndRefusesWithoutConsent(t *testing.T) {
 			if c.dryRun && !strings.Contains(e.out.String(), "a run would stop it, delete its volumes postgres, uploads") {
 				t.Errorf("output: %s", e.out)
 			}
-			if n := len(e.docker.ran("compose")) + len(e.docker.ran("volume")); n != 0 {
+			if n := len(e.docker.ran("compose")) + resetVolumeCalls(e); n != 0 {
 				t.Errorf("%d calls: %q", n, e.verbs())
 			}
 			if _, err := os.Stat(filepath.Join(e.dir, ProvisionEnv)); err != nil {
@@ -210,7 +210,7 @@ func TestResetRefusesNothingToWipeAndAnotherRelease(t *testing.T) {
 	if err := e.reset(func(o *Options) { o.Yes = true }); err == nil || !strings.Contains(err.Error(), "upgrade --dir") {
 		t.Fatalf("another release: %v", err)
 	}
-	if n := len(e.docker.ran("compose")) + len(e.docker.ran("volume")); n != 0 {
+	if n := len(e.docker.ran("compose")) + resetVolumeCalls(e); n != 0 {
 		t.Errorf("%d calls: %q", n, e.verbs())
 	}
 }
@@ -259,7 +259,7 @@ func TestTheDaemonResetsAsAJobOnceConfirmedAndJudged(t *testing.T) {
 	if code := call(t, h, "POST", "/v1/reset-db", ResetRequest{Confirm: &Version{"1.0.0", 1}}, &refused); code != 409 || !strings.Contains(refused.Error, "has not judged this boot") {
 		t.Fatalf("before the gate: %d %s", code, refused.Error)
 	}
-	if n := len(e.docker.ran("volume")); n != 0 {
+	if n := resetVolumeCalls(e); n != 0 {
 		t.Fatalf("%d volume calls before a reset ran", n)
 	}
 	host.judge = "active"
@@ -336,7 +336,7 @@ func TestResetOverTheSocketAsksThenFollowsTheJob(t *testing.T) {
 	if out, err := ctl(e, sock, "reset-db"); err == nil || !strings.Contains(err.Error(), "--yes") {
 		t.Fatalf("%v\n%s", err, out)
 	}
-	if n := len(e.docker.ran("volume")); n != 0 {
+	if n := resetVolumeCalls(e); n != 0 {
 		t.Fatalf("%d volume calls without consent", n)
 	}
 	out, err := ctl(e, sock, "reset-db", "--yes")
@@ -621,7 +621,7 @@ func TestResetRefusesBeforeTheStackStops(t *testing.T) {
 			if err := e.reset(func(o *Options) { o.Yes = true }); err == nil || !strings.Contains(err.Error(), c.want) {
 				t.Fatalf("err %v, want %q", err, c.want)
 			}
-			if n := len(e.docker.ran("compose")) + len(e.docker.ran("volume")); n != 0 {
+			if n := len(e.docker.ran("compose")) + resetVolumeCalls(e); n != 0 {
 				t.Errorf("%d calls: %q", n, e.verbs())
 			}
 		})
@@ -729,7 +729,7 @@ func TestTheDaemonRefusesAResetOfAnotherReleaseAtOnce(t *testing.T) {
 			t.Fatalf("%s: %d %s", method, code, refused.Error)
 		}
 	}
-	if n := len(e.docker.ran("compose")) + len(e.docker.ran("volume")); n != 0 {
+	if n := len(e.docker.ran("compose")) + resetVolumeCalls(e); n != 0 {
 		t.Errorf("%d docker calls", n)
 	}
 }
@@ -825,7 +825,19 @@ func TestTheVMAsksNamingTheReleaseItResets(t *testing.T) {
 	if len(p.forms) != 1 || !strings.HasPrefix(p.forms[0].Questions[0].Title, "Reset notes 1.0.0 (revision 1): stop it, delete its volumes postgres, uploads") {
 		t.Errorf("asked %+v", p.forms)
 	}
-	if n := len(e.docker.ran("volume")); n != 0 {
+	if n := resetVolumeCalls(e); n != 0 {
 		t.Errorf("%d volume calls", n)
 	}
+}
+
+// resetVolumeCalls counts the Docker calls on volumes but a start's listing of them (the front's
+// volumes looked for: frontVolumesMissing).
+func resetVolumeCalls(e *env) int {
+	n := 0
+	for _, c := range e.docker.ran("volume") {
+		if a := strings.Join(c.Args, " "); a != "volume ls --format {{.Name}}" && !strings.HasPrefix(a, "volume inspect --format {{.Name}} ") {
+			n++
+		}
+	}
+	return n
 }

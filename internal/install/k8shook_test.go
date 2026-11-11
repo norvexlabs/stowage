@@ -125,8 +125,11 @@ func TestK8sInstallRunsTheHookAsAJobAfterTheRelease(t *testing.T) {
 	if env["ADMIN_EMAIL"] != "notes-stowage/ADMIN_EMAIL" || env["STOWAGE_NAME"] != "notes" || env["STOWAGE_PROJECT_VERSION"] != "1.0.0" || len(env) != 4 {
 		t.Errorf("the hook's environment: %v", env)
 	}
-	if sc := hook["securityContext"].(map[string]any); sc["runAsNonRoot"] != true || sc["allowPrivilegeEscalation"] != false {
+	if sc := hook["securityContext"].(map[string]any); sc["runAsNonRoot"] != true || sc["allowPrivilegeEscalation"] != false || sc["readOnlyRootFilesystem"] != true {
 		t.Errorf("the hook's securityContext: %v", sc)
+	}
+	if !slices.Contains(mounts(hook), "/tmp") {
+		t.Errorf("the hook has no writable /tmp: %v", mounts(hook))
 	}
 	// The check step proves the way to the Secret before the hook runs; it holds the token too.
 	if chk := e.container("check"); !strings.Contains(strings.Join(toStrings(chk["command"]), " "), "record --check --token /var/run/stowage --namespace notes --secret notes-stowage-provision") || !slices.Contains(mounts(chk), tokenMount) {

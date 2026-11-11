@@ -425,8 +425,17 @@ type modulePort struct {
 // route's, whose allowlist the VM's firewall alone applies.
 func (in *Installer) openedPorts(st *Settings) []modulePort {
 	ports := []modulePort{}
-	if in.R.Spec.HasFront() {
-		ports = append(ports, modulePort{"tcp", cmp.Or(st.HTTPPort, in.R.Spec.Front.HTTPPort, 80)}, modulePort{"tcp", cmp.Or(st.HTTPSPort, in.R.Spec.Front.HTTPSPort, 443)})
+	// The front's that something serves on in the mode given (frontPorts); with none given, the
+	// mode the VM's install takes is not known here: both.
+	http, https := in.R.Spec.HasFront(), in.R.Spec.HasFront()
+	if st.TLS != "" {
+		http, https = frontPorts(in.R.Spec.Front, in.R.Spec.L4.Routes, st.TLS)
+	}
+	if http {
+		ports = append(ports, modulePort{"tcp", cmp.Or(st.HTTPPort, in.R.Spec.Front.HTTPPort, 80)})
+	}
+	if https {
+		ports = append(ports, modulePort{"tcp", cmp.Or(st.HTTPSPort, in.R.Spec.Front.HTTPSPort, 443)})
 	}
 	for _, r := range in.R.Spec.L4.Routes {
 		ports = append(ports, modulePort{r.Protocol, r.Port})

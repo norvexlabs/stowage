@@ -166,6 +166,16 @@ func (in *Installer) changes(env *EnvFile) (next *EnvFile, secrets map[string]bo
 		if pub, err = tlsPublish(cmp.Or(o.HTTPPort, recordedPort(HTTPPortVar)), cmp.Or(o.HTTPSPort, recordedPort(HTTPSPortVar))); err != nil {
 			return nil, nil, publish{}, err
 		}
+		pub.unserved = in.unservedPorts(mode)
+		// A recorded port the last mode left unpublished is no port the install holds.
+		if was != Loopback {
+			for k := range in.unservedPorts(was) {
+				v, _ := env.Get(map[string]string{"http": HTTPPortVar, "https": HTTPSPortVar}[k])
+				if p, err := strconv.Atoi(v); err == nil {
+					delete(held, p)
+				}
+			}
+		}
 	}
 	if err := in.l4Clash(pub); err != nil {
 		return nil, nil, publish{}, err
@@ -193,7 +203,7 @@ func (in *Installer) changes(env *EnvFile) (next *EnvFile, secrets map[string]bo
 	if same {
 		return nil, nil, publish{}, nil
 	}
-	probe = publish{addr: pub.addr, all: pub.all, ports: map[string]int{}}
+	probe = publish{addr: pub.addr, all: pub.all, ports: map[string]int{}, unserved: pub.unserved}
 	for k, p := range pub.ports {
 		if !held[p] {
 			probe.ports[k] = p
@@ -463,6 +473,13 @@ func (in *Installer) acmeForward(was, env *EnvFile) {
 		return
 	}
 	if was != nil && get(was, HTTPPortVar) == http && get(was, HTTPSPortVar) == https {
+		return
+	}
+	// The front serving L4 routes alone publishes its HTTP port alone: the HTTP-01 challenge's.
+	if _, served := frontPorts(in.R.Spec.Front, in.R.Spec.L4.Routes, "acme"); !served {
+		if http != "80" {
+			in.O.logf("Let's Encrypt reaches each domain on port 80: forward it to %s here; IPv6 forwards no port, so a domain whose AAAA record names this host is reached on 80 itself", http)
+		}
 		return
 	}
 	in.O.logf("Let's Encrypt reaches each domain on ports 80 and 443: forward them to %s and %s here; IPv6 forwards no port, so a domain whose AAAA record names this host is reached on 80 and 443 themselves", http, https)

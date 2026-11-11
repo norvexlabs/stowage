@@ -13,9 +13,13 @@ RUN GOOS=$TARGETOS GOARCH=$TARGETARCH xcaddy build v2.11.9 --with github.com/cad
       --replace github.com/klauspost/compress=github.com/klauspost/compress@v1.20.2
 
 # Caddy's image less what the front never runs (curl and its libraries, the capability tools: the
-# front runs as root), zlib past CVE-2026-4738, which the pinned base does not carry.
+# front runs as its own user with no capability, and binds 80 and 443 as its network namespace lets
+# any user), zlib past CVE-2026-4738, which the pinned base does not carry. Its data and
+# configuration directories are that user's (65532, the installer's FrontUID), so a volume made
+# on them is too; the binary carries no file capability.
 FROM caddy:2.11.9-alpine@sha256:0bbb055bda6793c999bde78b1b5ce3e89f829fb031af2cf50056ea1246559fee
 RUN apk del --no-cache curl libcap libcap-utils && apk add --no-cache 'zlib>=1.4'
 COPY --from=builder /usr/bin/caddy /usr/bin/caddy
+RUN mkdir -p /data /config && chown -R 65532:65532 /data /config
 RUN caddy version | grep -q '^v2\.11\.9 ' && caddy list-modules | grep -qx 'dns.providers.cloudflare' && \
     caddy list-modules | grep -qx 'layer4.handlers.tls' && caddy list-modules | grep -qx 'layer4.matchers.remote_ip' && ! command -v curl

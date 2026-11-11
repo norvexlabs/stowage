@@ -980,7 +980,7 @@ func TestAnAllowlistedRouteIsIPv4s(t *testing.T) {
 	if got := in.allowV4Only(); !slices.Equal(got, []string{"db"}) {
 		t.Errorf("consented: %v", got)
 	}
-	fc, err := frontCompose(in.R.Spec.Front, routes, func(string) string { return "" }, Loopback, hostAPI{}, "sha256:x", "", false, false, true, nil, []string{"db"})
+	fc, err := frontCompose(in.R.Spec.Front, routes, func(string) string { return "" }, Loopback, hostAPI{}, "sha256:x", "", false, false, true, nil, []string{"db"}, FrontUID)
 	if err != nil || !strings.Contains(string(fc), "host_ip: 0.0.0.0\n") || strings.Count(string(fc), "host_ip") != 1 {
 		t.Errorf("%v\n%s", err, fc)
 	}

@@ -22,40 +22,6 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
    operator's own registry sign-in where the mirror asks for one), their signatures checked against
    the release keys as `upgrade --version` checks them; nothing newer is said so.
 
-### Security — the VM's firewall and the services Stowage adds
-
-1. **`host.interfaces.<role>.forward` is enforced on IPv4 alone**: the role's traffic out and its
-   replies back are accepted, and what is not declared relies on the Docker engine's FORWARD
-   policy, which drops on IPv4 only (`ip6 filter FORWARD` is `policy accept`, as is the stack's own
-   forward chain): on a VM forwarding IPv6, a neighbour routes new flows through it, into a role or
-   back out. What a role does not forward is dropped on both address families by Stowage's own
-   table, whatever the engine's FORWARD policy is (README's "DROP for IPv4 and IPv6" holds then);
-   e2e-vm proves it over IPv6. Options: (a) the stack's `inet` table's forward chain drops what
-   is forwarded between non-bridge interfaces and is neither a declared `forward` pair nor a reply
-   (`ct state established,related`) — one rule set, both families (recommended); (b) a table of its
-   own at the forward hook with `policy drop` for the roles' devices alone; (c) Docker's own
-   `ip6tables` setting, which makes the engine drop on IPv6 too — rejected unless (a) cannot work:
-   it leaves the rule to the engine again.
-2. **One confinement for every service Stowage adds**: `stowage-provision` runs with `cap_drop:
-   [ALL]` and `no-new-privileges`; the front runs as root with Docker's default capabilities. Every
-   service Stowage adds to a stack (the front, the provision service, any later one) gets the same
-   rule: no capability beyond what it needs (`NET_BIND_SERVICE` while it binds a port under 1024),
-   `no-new-privileges`, a non-root user where its volumes allow, a read-only root filesystem.
-   Options for a non-root service binding a low port: (a) it listens on high ports inside its
-   container and the publish maps the low host port to them — no capability at all, where nothing
-   binds a host port directly (recommended where it holds); (b) the namespaced sysctl
-   `net.ipv4.ip_unprivileged_port_start=0` on the service; (c) `cap_add: [NET_BIND_SERVICE]` with a
-   non-root user (needs a file capability on the binary, or ambient capabilities). A service on the
-   host's network (the VM's L4 upstreams) has no publish to map: say which option holds there.
-   Writable paths become volumes or `tmpfs` mounts, each named.
-3. **The firewall opens a port only when the spec declares something serving on it**: a front
-   serving L4 routes alone opens 80 and 443 in every TLS mode, and the front answers 404 there.
-   Open the front's ports as an L4 route's are: only when a front route serves on them in the
-   install's TLS mode, or the mode itself needs them (`acme`'s HTTP-01 challenge). Options: (a) one
-   function deciding a port's opening from what serves on it, used by the front and the L4 routes
-   alike (recommended); (b) the front's ports computed apart, mirroring the L4 rule. Docker's
-   publishes follow the same decision, not only the firewall.
-
 ### Features — the firewall's roles, secrets, pull credentials, logins
 
 1. **`front.interfaces`, as `l4.routes[].interfaces`**: the front's ports scoped to roles exactly as

@@ -1,9 +1,15 @@
 package install
 
 import (
+	"archive/tar"
+	"bytes"
+	"cmp"
 	"context"
+	"errors"
 	"fmt"
 	"net/netip"
+	"os"
+	"path/filepath"
 	"regexp"
 	"slices"
 	"strconv"
@@ -354,16 +360,51 @@ func frontCheck(f spec.Front, key string) func(string) error {
 // the project volume publish_ca names.
 const (
 	localRoot = "/data/caddy/pki/authorities/local/root.crt"
-	byoCA     = "/etc/caddy/" + TLSDir + "/ca.pem"
+	byoCA     = frontTLS + "/ca.pem"
 	caMount   = "/stowage-ca"
 )
+
+// FrontUID is the user and group the front runs as (frontUser) unless the volume it publishes its
+// CA in is given another: never root, with no capability (it binds 80 and 443 as its network
+// namespace lets any user: frontSysctls). prepareFront gives it its volume and the published CA's.
+const FrontUID = 65532
+
+// frontUser is the uid (and gid) the front runs as: the one the release gives the volume it
+// publishes its CA in (data.volumes.<volume>.uid, never 0: lint), whose services own it and which
+// the front writes in; else FrontUID.
+func (in *Installer) frontUser() int {
+	if p := in.R.Spec.Front.PublishCA; p != nil {
+		if uid := in.R.Spec.Data.Volumes[p.Volume].UID; uid != nil && *uid > 0 {
+			return *uid
+		}
+	}
+	return FrontUID
+}
+
+// frontCaddyfile is where the front reads its configuration: in its own volume, where prepareFront
+// copies the install's Caddyfile (readable by the installer's user alone: it holds the logins'
+// hashes) at each start.
+const frontCaddyfile = "/data/stowage-Caddyfile"
+
+// frontTLS is where the front reads a byo certificate (cert.pem, key.pem, ca.pem): in its own
+// volume, where prepareFront copies them from the install's TLSDir, readable by the installer's
+// user alone, at each start.
+const frontTLS = "/data/stowage-tls"
+
+// frontSysctls let the front's user bind the ports under 1024 in its own network namespace (the
+// stack's network, never the host's), as Docker's engines do by default: no capability needed.
+var frontSysctls = map[string]string{"net.ipv4.ip_unprivileged_port_start": "0"}
+
+// FrontDataVolume is the front's own volume (Caddy's data directory: its certificates, its local
+// CA), in the compose project.
+const FrontDataVolume = "stowage-front-data"
 
 // frontCommand runs Caddy; with publish_ca, after copying ca (a path in the container, as soon as
 // it exists: the local CA's root is made as Caddy starts) into the published volume as ca.crt, or
 // removing a ca.crt there when ca is empty. noALPN (a TLS front terminating an L4 route) runs it
 // from the Caddyfile adapted to JSON, where the L4 routes' noALPNMark is the empty ALPN list.
 func frontCommand(f spec.Front, ca string, noALPN bool) []string {
-	caddy := []string{"caddy", "run", "--config", "/etc/caddy/Caddyfile", "--adapter", "caddyfile"}
+	caddy := []string{"caddy", "run", "--config", frontCaddyfile, "--adapter", "caddyfile"}
 	if f.PublishCA == nil && !noALPN {
 		return caddy
 	}
@@ -372,7 +413,7 @@ func frontCommand(f spec.Front, ca string, noALPN bool) []string {
 		// A Caddyfile cannot write an empty ALPN list (an absent one is h2 and http/1.1): the
 		// configuration is adapted to JSON, where noALPNMark becomes the empty list. A mark left
 		// (adapt's output changed) stops the start: served, it would refuse every client's ALPN.
-		run = fmt.Sprintf(`caddy adapt --config /etc/caddy/Caddyfile --adapter caddyfile >%[1]s && sed -i 's/"alpn":\["%[2]s"\]/"alpn":[]/g' %[1]s && if grep -q %[2]s %[1]s; then echo "%[2]s left in %[1]s: the front's ALPN cannot be cleared" >&2; exit 1; fi && exec caddy run --config %[1]s`, frontJSON, noALPNMark)
+		run = fmt.Sprintf(`caddy adapt --config `+frontCaddyfile+` --adapter caddyfile >%[1]s && sed -i 's/"alpn":\["%[2]s"\]/"alpn":[]/g' %[1]s && if grep -q %[2]s %[1]s; then echo "%[2]s left in %[1]s: the front's ALPN cannot be cleared" >&2; exit 1; fi && exec caddy run --config %[1]s`, frontJSON, noALPNMark)
 	}
 	switch {
 	case f.PublishCA == nil:
@@ -394,27 +435,33 @@ const noALPNMark = spec.NoALPNMark
 const frontJSON = "/tmp/stowage-caddy.json"
 
 // frontCompose adds the front service to the project's stack, unless it has none: in loopback mode each route on its
-// port of the loopback address, behind TLS only the HTTP and HTTPS ports (80 and 443 unless
-// moved), on every address. The host ports come from .env. The L4 routes' ports are published
+// port of the loopback address, behind TLS the HTTP and HTTPS ports something serves on alone
+// (frontPorts; 80 and 443 unless moved), on every address. The host ports come from .env. The L4 routes' ports are published
 // in every mode, to their services: each on every address, or on the one its bind input holds (get
 // reads a recorded value).
 // digest labels the front with its configuration (the Caddyfile, a byo certificate), so a change
 // recreates it. ca is the CA it publishes (frontCommand); noALPN, the Caddyfile names noALPNMark.
 // clientCA mounts the install's client CA.
 // ipv6 turns IPv6 on for the default network. onHost are the services on the host's network
-// (hostServices), whose L4 routes' ports are their own.
-func frontCompose(f spec.Front, l4 []spec.L4Route, get func(string) string, mode string, host hostAPI, digest, ca string, noALPN, clientCA, ipv6 bool, onHost, v4Only []string) ([]byte, error) {
+// (hostServices), whose L4 routes' ports are their own. uid is the front's user and group
+// (frontUser).
+func frontCompose(f spec.Front, l4 []spec.L4Route, get func(string) string, mode string, host hostAPI, digest, ca string, noALPN, clientCA, ipv6 bool, onHost, v4Only []string, uid int) ([]byte, error) {
 	var ports []any
-	volumes := []string{"./" + Caddyfile + ":/etc/caddy/Caddyfile:ro", "stowage-front-data:/data"}
+	volumes := []string{FrontDataVolume + ":/data"}
 	if mode == Loopback {
 		for i, r := range f.Routes {
 			ports = append(ports, fmt.Sprintf("${STOWAGE_LOOPBACK_ADDRESS}:${%s}:%d", PortVar(r.Name), frontPort(i)))
 		}
 	} else {
-		ports = []any{"${" + HTTPPortVar + "}:80", "${" + HTTPSPortVar + "}:443"}
-	}
-	if mode == "byo" {
-		volumes = append(volumes, "./"+TLSDir+":/etc/caddy/"+TLSDir+":ro")
+		// The ports something serves on alone (frontPorts), as the VM's firewall opens them.
+		ports = []any{}
+		http, https := frontPorts(f, l4, mode)
+		if http {
+			ports = append(ports, "${"+HTTPPortVar+"}:80")
+		}
+		if https {
+			ports = append(ports, "${"+HTTPSPortVar+"}:443")
+		}
 	}
 	if clientCA {
 		volumes = append(volumes, "./"+ClientCADir+":"+clientCADir+":ro")
@@ -422,13 +469,23 @@ func frontCompose(f spec.Front, l4 []spec.L4Route, get func(string) string, mode
 	if f.PublishCA != nil {
 		volumes = append(volumes, f.PublishCA.Volume+":"+caMount)
 	}
+	// Confined as every service Stowage adds: its own user, no capability, no privilege gain, a
+	// read-only root (its writes go to its volume, the published CA's, /tmp, where its start
+	// adapts the configuration, and /config, Caddy's configuration directory, which it never
+	// persists to: persist_config off).
 	service := map[string]any{
-		"image":   "${" + FrontImageVar + "}",
-		"command": frontCommand(f, ca, noALPN),
-		"volumes": volumes,
-		"ports":   ports,
-		"restart": "unless-stopped",
-		"labels":  map[string]string{FrontConfigLabel: digest},
+		"image":        "${" + FrontImageVar + "}",
+		"command":      frontCommand(f, ca, noALPN),
+		"volumes":      volumes,
+		"ports":        ports,
+		"restart":      "unless-stopped",
+		"labels":       map[string]string{FrontConfigLabel: digest},
+		"user":         fmt.Sprintf("%d:%d", uid, uid),
+		"cap_drop":     []string{"ALL"},
+		"security_opt": []string{"no-new-privileges:true"},
+		"read_only":    true,
+		"tmpfs":        []string{"/tmp", "/config"},
+		"sysctls":      frontSysctls,
 	}
 	if mode == "dns-cloudflare" {
 		service["environment"] = map[string]string{"CLOUDFLARE_API_TOKEN": "${" + CloudflareTokenVar + "}"}
@@ -440,7 +497,7 @@ func frontCompose(f spec.Front, l4 []spec.L4Route, get func(string) string, mode
 		service["networks"] = map[string]any{"default": map[string]any{"aliases": aliases}}
 	}
 	services := map[string]any{FrontService: service}
-	volumesDoc := map[string]any{"stowage-front-data": map[string]any{}}
+	volumesDoc := map[string]any{FrontDataVolume: map[string]any{}}
 	if !f.Declared() {
 		services, volumesDoc = map[string]any{}, nil // no front: the L4 ports and the host API alone
 	}
@@ -538,4 +595,293 @@ func routeAliases(f spec.Front, mode string, get func(string) string) []string {
 	}
 	slices.Sort(aliases)
 	return aliases
+}
+
+// The lines frontUserShell prints for what the front's user cannot fix itself, which
+// frontRootShell then fixes: frontPrepForeign, a file of another user's in the front's volume;
+// frontPrepCA and the uid, the published CA's directory another uid holds.
+const (
+	frontPrepForeign = "stowage-front-foreign"
+	frontPrepCA      = "stowage-front-ca"
+)
+
+// frontUserShell runs as the front's user (uid) with no capability: in its own volume (/data),
+// whatever a link there leads to, it writes nothing the user could not. It says what it cannot do
+// itself, before anything is written (a refusal then leaves the volume as it was): a file of
+// another user's in /data (frontPrepForeign), the published CA's directory (/stowage-ca) of another
+// uid (frontPrepCA and that uid). Otherwise it removes the front's temporary copy of the CA
+// another user holds there (an interrupted earlier front's, run as root: one the front's own user
+// holds, it overwrites, so a copy a running front is making is left alone), and takes the files the installer gives on its standard
+// input (a tar: Caddyfile, and tls/ for a byo certificate) into a directory of its own, renames the
+// Caddyfile to frontCaddyfile and tls/ to frontTLS (a copy no longer given removed), and removes
+// what an interrupted run left.
+func frontUserShell(uid int) string {
+	return fmt.Sprintf(`ca=
+if [ -d %[3]s ] && [ "$(stat -c %%u %[3]s)" != %[1]d ]; then ca=1; echo "%[5]s $(stat -c %%u %[3]s)"; fi
+if [ -n "$(find /data ! -user %[1]d -print | head -n 1)" ]; then echo %[4]s; exit 0; fi
+if [ -n "$ca" ]; then exit 0; fi
+if [ -d %[3]s ]; then find %[3]s -maxdepth 1 -name .ca.crt -type f ! -user %[1]d -exec rm -f {} +; fi
+cd /data
+rm -rf .stowage-in
+mkdir -m 0700 .stowage-in
+tar -x -f - -C .stowage-in
+mv -T -f .stowage-in/Caddyfile %[6]s
+rm -rf %[2]s
+if [ -d .stowage-in/tls ]; then mv -T .stowage-in/tls %[2]s; fi
+rm -rf .stowage-in
+`, uid, frontTLS, caMount, frontPrepForeign, frontPrepCA, frontCaddyfile)
+}
+
+// frontRootShell runs as root, the front stopped, for what frontUserShell could not do, as
+// prepareFront decided it: with data, it gives the front's user (uid) its volume (chown -hR: no
+// link followed); with ca, the published CA's directory alone (the project's files in it left as
+// they are), first removing the front's temporary copy an interrupted earlier one left (rm
+// removes a link, never follows it).
+func frontRootShell(uid int, data, ca bool) string {
+	return fmt.Sprintf(`if %[2]t; then chown -hR %[1]d:%[1]d /data; fi
+if %[3]t; then rm -f %[4]s/.ca.crt; chown %[1]d:%[1]d %[4]s; fi
+`, uid, data, ca, caMount)
+}
+
+// frontVolumes are the front's volume and the published CA's (empty without publish_ca) as the
+// engine holds them (m names them, else compose's <project>_<key>).
+func (in *Installer) frontVolumes(env *EnvFile, m *composeModel) (data, ca string, err error) {
+	project, _ := env.Get("COMPOSE_PROJECT_NAME")
+	volume := func(key string) string {
+		if n := m.Volumes[key].Name; n != "" {
+			return n
+		}
+		if p := cmp.Or(m.Name, project); p != "" {
+			return p + "_" + key
+		}
+		return ""
+	}
+	if data = volume(FrontDataVolume); data == "" {
+		return "", "", fmt.Errorf("the front's volume: the stack names no %s", FrontDataVolume)
+	}
+	if p := in.R.Spec.Front.PublishCA; p != nil {
+		if ca = volume(p.Volume); ca == "" {
+			return "", "", fmt.Errorf("front.publish_ca.volume: the stack names no volume %s", p.Volume)
+		}
+	}
+	return data, ca, nil
+}
+
+// noSuchVolume reports whether err is the engine's saying a volume is not there.
+func noSuchVolume(err error) bool {
+	return err != nil && strings.Contains(strings.ToLower(err.Error()), "no such volume")
+}
+
+// frontVolumesMissing reports which of the front's volumes (frontVolumes) the engine lacks: its
+// own (data) and the published CA's (ca), as `docker volume inspect` of each tells; another failure
+// of the engine is an error. The start then makes them, with the stack's containers, before
+// prepareFront.
+func (in *Installer) frontVolumesMissing(ctx context.Context, env *EnvFile, m *composeModel) (data, ca bool, err error) {
+	if !in.R.Spec.HasFront() {
+		return false, false, nil
+	}
+	dv, cv, err := in.frontVolumes(env, m)
+	if err != nil {
+		return false, false, err
+	}
+	gone := func(v string) (bool, error) {
+		if v == "" {
+			return false, nil
+		}
+		_, err := in.O.Docker.Run(ctx, Cmd{Args: []string{"volume", "inspect", "--format", "{{.Name}}", v}})
+		if noSuchVolume(err) {
+			return true, nil
+		}
+		if err != nil {
+			return false, fmt.Errorf("the front's volume %s: %w", v, err)
+		}
+		return false, nil
+	}
+	if data, err = gone(dv); err != nil {
+		return false, false, err
+	}
+	ca, err = gone(cv)
+	return data, ca, err
+}
+
+// prepareFront readies the front's volumes for its user before the stack's start runs it, the
+// volumes made: frontUserShell, in the front's image as the front's user with no capability, off
+// any network, its root read-only, given the Caddyfile and a byo certificate on its standard input;
+// then, only for what it says it cannot do, frontRootShell as root with the capabilities to change
+// owners and remove a file alone, the front stopped first (stop), and frontUserShell again. The
+// published CA's directory is given to the front's user when root holds it; one another uid holds
+// is refused by a user's run before it writes anything (the first, before the front is stopped, or
+// the one judging again after a front of another user was stopped), naming the operator's fix and
+// the project's. A front running as another user is stopped after that first run and the volume
+// judged again (what it wrote meanwhile given back too); a front the step stopped stays stopped when
+// the start fails.
+// A byo install whose certificate's copy is gone is refused, naming the re-run that gives one.
+// Nothing for a project without a front.
+func (in *Installer) prepareFront(ctx context.Context, env *EnvFile, m *composeModel, stop func() error) error {
+	if !in.R.Spec.HasFront() {
+		return nil
+	}
+	image, _ := env.Get(FrontImageVar)
+	if image == "" {
+		return fmt.Errorf("the front's volume: no front image recorded (%s)", FrontImageVar)
+	}
+	data, ca, err := in.frontVolumes(env, m)
+	if err != nil {
+		return err
+	}
+	mode, _ := env.Get("STOWAGE_TLS_MODE")
+	files, err := in.frontFiles(mode == "byo")
+	if err != nil {
+		return err
+	}
+	uid := in.frontUser()
+	mounts := []string{"--volume", data + ":/data"}
+	key := ""
+	if p := in.R.Spec.Front.PublishCA; p != nil {
+		key = p.Volume
+		mounts = append(mounts, "--volume", ca+":"+caMount)
+	}
+	user := func(judge bool) (foreign bool, caUID int, err error) {
+		args := append([]string{"run", "--rm", "-i", "--pull", "never", "--network", "none", "--read-only", "--user", fmt.Sprintf("%d:%d", uid, uid),
+			"--cap-drop", "ALL", "--security-opt", "no-new-privileges:true", "--entrypoint", "sh"}, mounts...)
+		out, err := in.O.Docker.Run(ctx, Cmd{Args: append(args, image, "-euc", frontUserShell(uid)), Stdin: bytes.NewReader(files), Env: env.Environ(in.O.environ())})
+		if err != nil {
+			return false, -1, fmt.Errorf("giving the front its files: %w", err)
+		}
+		caUID = -1
+		for line := range strings.Lines(string(out)) {
+			f := strings.Fields(line)
+			switch {
+			case len(f) == 1 && f[0] == frontPrepForeign:
+				foreign = true
+			case len(f) == 2 && f[0] == frontPrepCA:
+				if n, err := strconv.Atoi(f[1]); err == nil && n != uid {
+					caUID = n
+				}
+			}
+		}
+		// The CA's directory another user's: refused, nothing changed. Root's, as Docker makes a
+		// volume, is given to the front.
+		if judge && caUID > 0 {
+			fix := fmt.Sprintf("give that directory to the front's user, if the volume's services write nothing there: `docker run --rm --user 0 --entrypoint chown -v %s:/v %s %d:%d /v`", ca, image, uid, uid)
+			// The project's way, where it declares no uid for the volume (the front then runs as
+			// FrontUID, which never holds it here): declare the holder's, and the front runs as it.
+			if in.R.Spec.Data.Volumes[key].UID == nil {
+				fix += fmt.Sprintf("; or the project declares data.volumes.%s.uid: %d, the uid holding it, which the front then runs as", key, caUID)
+			}
+			return false, -1, refuse(fix,
+				"front.publish_ca.volume: the volume %s's directory belongs to uid %d, not the front's (%d), which writes its CA there as its own user", key, caUID, uid)
+		}
+		return foreign, caUID, nil
+	}
+	foreign, caUID, err := user(true)
+	if err != nil {
+		return err
+	}
+	// A front running as another user (an older release's ran as root) writes files the front's
+	// user may not: stopped, and the volume judged again.
+	other, err := in.frontRunsAsAnother(ctx, env, m, uid)
+	if err != nil {
+		return err
+	}
+	if !foreign && caUID < 0 && !other {
+		return nil
+	}
+	if err := stop(); err != nil {
+		return err
+	}
+	if other { // what it wrote until it stopped is judged too
+		if foreign, caUID, err = user(true); err != nil {
+			return err
+		}
+		if !foreign && caUID < 0 {
+			return nil
+		}
+	}
+	args := append([]string{"run", "--rm", "--pull", "never", "--network", "none", "--read-only", "--user", "0", "--cap-drop", "ALL",
+		"--cap-add", "CHOWN", "--cap-add", "FOWNER", "--cap-add", "DAC_OVERRIDE", "--cap-add", "DAC_READ_SEARCH", "--security-opt", "no-new-privileges:true", "--entrypoint", "sh"}, mounts...)
+	if _, err := in.O.Docker.Run(ctx, Cmd{Args: append(args, image, "-euc", frontRootShell(uid, foreign, caUID >= 0)), Env: env.Environ(in.O.environ())}); err != nil {
+		return fmt.Errorf("giving the front its volumes: %w", err)
+	}
+	// Root's run judged: what is still there fails the start as it is, never as the project's.
+	if foreign, caUID, err = user(false); err != nil {
+		return err
+	}
+	switch {
+	case foreign:
+		return fmt.Errorf("giving the front its volumes: a file of another user's is still in %s", data)
+	case caUID >= 0:
+		return fmt.Errorf("giving the front its volumes: the published CA's volume %s is still uid %d's", ca, caUID)
+	}
+	return nil
+}
+
+// frontRunsAsAnother reports whether the stack's running front runs as another user than uid (an
+// older release's ran as root): it writes files the front's user may not, so it is stopped first.
+func (in *Installer) frontRunsAsAnother(ctx context.Context, env *EnvFile, m *composeModel, uid int) (bool, error) {
+	project, _ := env.Get("COMPOSE_PROJECT_NAME")
+	project = cmp.Or(m.Name, project)
+	out, err := in.O.Docker.Run(ctx, Cmd{Args: []string{"ps", "-q", "--filter", "label=com.docker.compose.project=" + project, "--filter", "label=com.docker.compose.service=" + FrontService}})
+	if err != nil {
+		return false, fmt.Errorf("the front's container: %w", err)
+	}
+	ids := strings.Fields(string(out))
+	if len(ids) == 0 {
+		return false, nil
+	}
+	users, err := in.O.Docker.Run(ctx, Cmd{Args: append([]string{"container", "inspect", "--format", "{{.Config.User}}"}, ids...)})
+	if err != nil {
+		return true, nil // one gone since, or unread: stopped all the same, the safe side
+	}
+	want := fmt.Sprintf("%d:%d", uid, uid)
+	lines := strings.Split(strings.TrimRight(string(users), "\n"), "\n")
+	return len(lines) != len(ids) || slices.ContainsFunc(lines, func(u string) bool { return strings.TrimSpace(u) != want }), nil
+}
+
+// frontFiles is the tar frontUserShell takes on its standard input: the install's Caddyfile, and
+// with byo its certificate's files (tls/), readable by the front's user alone. A byo install
+// whose copy is gone is refused, naming the re-run that gives one.
+func (in *Installer) frontFiles(byo bool) ([]byte, error) {
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	add := func(name string, raw []byte) error {
+		if err := tw.WriteHeader(&tar.Header{Name: name, Mode: 0o600, Size: int64(len(raw)), Typeflag: tar.TypeReg}); err != nil {
+			return err
+		}
+		_, err := tw.Write(raw)
+		return err
+	}
+	cf, err := os.ReadFile(in.path(Caddyfile))
+	if err != nil {
+		return nil, fmt.Errorf("the front's configuration: %w", err)
+	}
+	if err := add("Caddyfile", cf); err != nil {
+		return nil, err
+	}
+	if byo {
+		for _, f := range []string{"cert.pem", "key.pem"} {
+			if _, err := os.Stat(filepath.Join(in.path(TLSDir), f)); err != nil {
+				return nil, refuse(in.flagFix("--cert FILE --key FILE"), "the byo certificate's copy is gone (%v): a re-run with --cert FILE --key FILE gives the front one", err)
+			}
+		}
+		if err := tw.WriteHeader(&tar.Header{Name: "tls/", Mode: 0o700, Typeflag: tar.TypeDir}); err != nil {
+			return nil, err
+		}
+		for _, f := range []string{"cert.pem", "key.pem", "ca.pem"} {
+			raw, err := os.ReadFile(filepath.Join(in.path(TLSDir), f))
+			if errors.Is(err, os.ErrNotExist) && f == "ca.pem" {
+				continue
+			}
+			if err != nil {
+				return nil, fmt.Errorf("the byo certificate: %w", err)
+			}
+			if err := add("tls/"+f, raw); err != nil {
+				return nil, err
+			}
+		}
+	}
+	if err := tw.Close(); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
 }

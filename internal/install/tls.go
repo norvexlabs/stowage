@@ -389,7 +389,8 @@ func (o *Options) readPair(certPath, keyPath string) (*byoCert, error) {
 }
 
 // writeCert copies a byo certificate and key into a tls/ directory this run creates, readable by
-// the owner only (the front runs as root); a failure removes it again.
+// the owner only (each start copies them into the front's volume: prepareFront); a failure
+// removes it again.
 func (in *Installer) writeCert() (err error) {
 	if in.byo == nil {
 		return nil
@@ -558,7 +559,11 @@ func tlsCaddyfile(f spec.Front, l4 []spec.L4Route, mode string, domains map[stri
 	fmt.Fprintf(&b, "{\n\tadmin off\n\tpersist_config off\n\thttp_port 80\n\thttps_port 443\n\tservers {\n\t\tprotocols h1 h2\n\t}\n")
 	switch mode {
 	case "acme", "dns-cloudflare":
-		if mode == "acme" {
+		if _, https := frontPorts(f, l4, mode); mode == "acme" && !https {
+			// The front publishes HTTP alone (frontPorts): the TLS-ALPN challenge, on HTTPS,
+			// would fail before HTTP-01 is tried.
+			b.WriteString("\tcert_issuer acme {\n\t\tdisable_tlsalpn_challenge\n\t}\n")
+		} else if mode == "acme" {
 			b.WriteString("\tcert_issuer acme\n")
 		} else {
 			b.WriteString("\tcert_issuer acme {\n\t\tdns cloudflare {env.CLOUDFLARE_API_TOKEN}\n\t}\n")
@@ -567,7 +572,9 @@ func tlsCaddyfile(f spec.Front, l4 []spec.L4Route, mode string, domains map[stri
 			fmt.Fprintf(&b, "\temail %s\n", email)
 		}
 	case "internal":
-		b.WriteString("\tlocal_certs\n")
+		// The local CA's root is published (publish_ca), never put in the front's own trust
+		// store: its root is read-only and its user no root.
+		b.WriteString("\tlocal_certs\n\tskip_install_trust\n")
 	}
 	layer4(&b, l4, get, func(r spec.L4Route) string { return domains[r.Name] }, clientCA, true)
 	b.WriteString("}\n")
@@ -596,7 +603,7 @@ func tlsCaddyfile(f spec.Front, l4 []spec.L4Route, mode string, domains map[stri
 		fmt.Fprintf(&b, "\n# %s\n%s {\n", strings.Join(names, ", "), addrs)
 		tls := ""
 		if mode == "byo" {
-			tls = fmt.Sprintf("/etc/caddy/%s/cert.pem /etc/caddy/%s/key.pem", TLSDir, TLSDir)
+			tls = frontTLS + "/cert.pem " + frontTLS + "/key.pem"
 		}
 		// A client certificate is asked for a whole site: a route asking for one has its domain
 		// alone (routeDomains).
@@ -647,7 +654,7 @@ func tlsCaddyfile(f spec.Front, l4 []spec.L4Route, mode string, domains map[stri
 	for _, d := range l4Order {
 		fmt.Fprintf(&b, "\n# the L4 routes %s' certificate\n%s {\n", strings.Join(l4Names[d], ", "), d)
 		if mode == "byo" {
-			fmt.Fprintf(&b, "\ttls /etc/caddy/%s/cert.pem /etc/caddy/%s/key.pem\n", TLSDir, TLSDir)
+			fmt.Fprintf(&b, "\ttls %[1]s/cert.pem %[1]s/key.pem\n", frontTLS)
 		}
 		b.WriteString("\trespond 404\n}\n")
 	}
@@ -805,7 +812,11 @@ func clientCAs(raw []byte) ([]byte, error) {
 func (in *Installer) writeClientCA(raw []byte, mode string) error {
 	switch {
 	case raw != nil:
+		// 0755 whatever the umask: the front reads it as a user of its own.
 		if err := os.MkdirAll(in.path(ClientCADir), 0o755); err != nil {
+			return err
+		}
+		if err := os.Chmod(in.path(ClientCADir), 0o755); err != nil {
 			return err
 		}
 		if err := writeAtomic(in.path(ClientCAFile), bytes.NewReader(raw), 0o644, nil); err != nil {

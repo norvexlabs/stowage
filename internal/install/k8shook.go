@@ -831,6 +831,7 @@ func (in *Installer) hookJobObject(p *k8sHookPlan, env, outs map[string]string, 
 		"securityContext":              map[string]any{"seccompProfile": map[string]any{"type": "RuntimeDefault"}},
 		"volumes": []any{
 			map[string]any{"name": "stowage", "emptyDir": map[string]any{}},
+			map[string]any{"name": "tmp", "emptyDir": map[string]any{}},
 			map[string]any{"name": "prev", "secret": map[string]any{"secretName": name, "optional": true}},
 			map[string]any{"name": "token", "projected": map[string]any{"defaultMode": 0o444, "sources": []any{
 				map[string]any{"serviceAccountToken": map[string]any{"path": "token", "expirationSeconds": 3600}},
@@ -850,9 +851,10 @@ func (in *Installer) hookJobObject(p *k8sHookPlan, env, outs map[string]string, 
 		"containers": []any{
 			map[string]any{"name": "provision", "image": in.R.ImageRef(p.prefix, p.hook.Image), "command": run, "env": vars,
 				"envFrom": []any{map[string]any{"configMapRef": map[string]any{"name": k.provisionName(), "optional": true}}},
-				// Non-root, as the restricted Pod Security standard requires: the image's own user.
-				"securityContext": map[string]any{"runAsNonRoot": true, "allowPrivilegeEscalation": false, "capabilities": map[string]any{"drop": []string{"ALL"}}},
-				"volumeMounts":    []any{shared}},
+				// Non-root, as the restricted Pod Security standard requires: the image's own user;
+				// its root read-only, /tmp its only writable path, as on Docker.
+				"securityContext": map[string]any{"runAsNonRoot": true, "allowPrivilegeEscalation": false, "readOnlyRootFilesystem": true, "capabilities": map[string]any{"drop": []string{"ALL"}}},
+				"volumeMounts":    []any{shared, map[string]any{"name": "tmp", "mountPath": "/tmp"}}},
 			map[string]any{"name": "record", "image": p.ctl,
 				"command": []string{ctl, k8sHookCommand, "record", "--dir", hookMount, "--prev", prevMount, "--token", tokenMount,
 					"--namespace", k.Namespace, "--secret", name, "--reserved", strings.Join(reserved, ",")},

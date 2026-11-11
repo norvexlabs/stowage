@@ -47,7 +47,7 @@ func TestL4TLSCaddyfile(t *testing.T) {
 	cf := tlsCaddyfile(l4TLSFront(), l4TLSRoutes(), "internal", domains, "", "443", true, get, nil)
 	global, sites, _ := strings.Cut(cf, "\n}\n")
 	for _, want := range []string{
-		"\tlocal_certs\n\tlayer4 {\n",
+		"\tlocal_certs\n\tskip_install_trust\n\tlayer4 {\n",
 		"\t\t# db, host port 7443\n\t\t:20001 {\n\t\t\troute {\n\t\t\t\ttls {\n\t\t\t\t\tconnection_policy {\n\t\t\t\t\t\tdefault_sni db.example.test\n\t\t\t\t\t\talpn stowage-no-alpn\n\t\t\t\t\t}\n\t\t\t\t}\n\t\t\t\tproxy db:5432\n\t\t\t}\n\t\t}\n",
 		"\t\t:20002 {\n\t\t\t@stowage_allowed remote_ip 10.0.0.0/8 192.0.2.7\n\t\t\troute @stowage_allowed {\n\t\t\t\ttls {\n\t\t\t\t\tconnection_policy {\n\t\t\t\t\t\tdefault_sni app.example.test\n",
 		"\t\t\t\t\t\tdefault_sni admin.example.test\n\t\t\t\t\t\talpn stowage-no-alpn\n\t\t\t\t\t\tclient_auth {\n\t\t\t\t\t\t\tmode require_and_verify\n\t\t\t\t\t\t\ttrust_pool file " + clientCAPath + "\n",
@@ -72,7 +72,7 @@ func TestL4TLSCaddyfile(t *testing.T) {
 	if !strings.Contains(cf, "\t\t# admin, host port 9443\n\t\t:20003 {\n\t\t\troute {\n\t\t\t\tclose\n") || strings.Contains(cf, "trust_pool") {
 		t.Errorf("admin without a client CA:\n%s", cf)
 	}
-	if !strings.Contains(cf, "\ndb.example.test {\n\ttls /etc/caddy/"+TLSDir+"/cert.pem /etc/caddy/"+TLSDir+"/key.pem\n\trespond 404\n}\n") {
+	if !strings.Contains(cf, "\ndb.example.test {\n\ttls "+frontTLS+"/cert.pem "+frontTLS+"/key.pem\n\trespond 404\n}\n") {
 		t.Errorf("byo's site:\n%s", cf)
 	}
 	// No route the front terminates TLS on: no layer4 app.
@@ -90,9 +90,9 @@ func TestL4TLSFrontWithoutRoutes(t *testing.T) {
 	routes := []spec.L4Route{{Name: "db", Protocol: "tcp", Port: 7443, Upstream: "db:5432", TLS: &spec.L4TLS{DomainInput: "DB_DOMAIN"}}}
 	domains := map[string]string{"db": "db.example.test"}
 	for mode, want := range map[string][]string{
-		"acme":           {"\tcert_issuer acme\n\temail ops@example.test\n", "\ndb.example.test {\n\trespond 404\n}\n"},
+		"acme":           {"\tcert_issuer acme {\n\t\tdisable_tlsalpn_challenge\n\t}\n\temail ops@example.test\n", "\ndb.example.test {\n\trespond 404\n}\n"},
 		"dns-cloudflare": {"\tdns cloudflare {env.CLOUDFLARE_API_TOKEN}\n", "\ndb.example.test {\n\trespond 404\n}\n"},
-		"byo":            {"\ndb.example.test {\n\ttls /etc/caddy/" + TLSDir + "/cert.pem /etc/caddy/" + TLSDir + "/key.pem\n\trespond 404\n}\n"},
+		"byo":            {"\ndb.example.test {\n\ttls " + frontTLS + "/cert.pem " + frontTLS + "/key.pem\n\trespond 404\n}\n"},
 		"internal":       {"\tlocal_certs\n", "\ndb.example.test {\n\trespond 404\n}\n"},
 	} {
 		cf := tlsCaddyfile(f, routes, mode, domains, "ops@example.test", "443", false, func(string) string { return "" }, nil)
@@ -135,12 +135,12 @@ func TestL4TLSALPN(t *testing.T) {
 			t.Errorf("lacks %q:\n%s", want, cf)
 		}
 	}
-	adapt := `caddy adapt --config /etc/caddy/Caddyfile --adapter caddyfile >/tmp/stowage-caddy.json && sed -i 's/"alpn":\["stowage-no-alpn"\]/"alpn":[]/g' /tmp/stowage-caddy.json && if grep -q stowage-no-alpn /tmp/stowage-caddy.json; then echo "stowage-no-alpn left in /tmp/stowage-caddy.json: the front's ALPN cannot be cleared" >&2; exit 1; fi && exec caddy run --config /tmp/stowage-caddy.json`
+	adapt := `caddy adapt --config /data/stowage-Caddyfile --adapter caddyfile >/tmp/stowage-caddy.json && sed -i 's/"alpn":\["stowage-no-alpn"\]/"alpn":[]/g' /tmp/stowage-caddy.json && if grep -q stowage-no-alpn /tmp/stowage-caddy.json; then echo "stowage-no-alpn left in /tmp/stowage-caddy.json: the front's ALPN cannot be cleared" >&2; exit 1; fi && exec caddy run --config /tmp/stowage-caddy.json`
 	f := spec.Front{TLSModes: []string{"internal"}}
 	if got := frontCommand(f, "", true); !slices.Equal(got, []string{"sh", "-c", adapt}) {
 		t.Errorf("noALPN: %q", got)
 	}
-	if got := frontCommand(f, "", false); !slices.Equal(got, []string{"caddy", "run", "--config", "/etc/caddy/Caddyfile", "--adapter", "caddyfile"}) {
+	if got := frontCommand(f, "", false); !slices.Equal(got, []string{"caddy", "run", "--config", "/data/stowage-Caddyfile", "--adapter", "caddyfile"}) {
 		t.Errorf("without: %q", got)
 	}
 	f.PublishCA = &spec.PublishCA{Volume: "ca"}
@@ -167,7 +167,7 @@ func TestL4TLSALPN(t *testing.T) {
 		} else {
 			cf = tlsCaddyfile(front, c.routes, c.mode, domains, "", "443", false, get, nil)
 		}
-		fc, err := frontCompose(front, c.routes, get, c.mode, hostAPI{}, "d", "", strings.Contains(cf, noALPNMark), false, false, nil, nil)
+		fc, err := frontCompose(front, c.routes, get, c.mode, hostAPI{}, "d", "", strings.Contains(cf, noALPNMark), false, false, nil, nil, FrontUID)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -206,7 +206,7 @@ func TestL4TLSFrontCompose(t *testing.T) {
 	routes[1].BindInput = "DB_BIND"
 	for mode, hostIP := range map[string]string{"internal": "192.0.2.9", Loopback: "${STOWAGE_LOOPBACK_ADDRESS}"} {
 		get := func(k string) string { return map[string]string{"DB_BIND": "192.0.2.9"}[k] }
-		raw, err := frontCompose(l4TLSFront(), routes, get, mode, hostAPI{}, "sha256:x", "", false, false, false, []string{"db"}, nil)
+		raw, err := frontCompose(l4TLSFront(), routes, get, mode, hostAPI{}, "sha256:x", "", false, false, false, []string{"db"}, nil, FrontUID)
 		if err != nil {
 			t.Fatal(err)
 		}

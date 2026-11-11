@@ -75,6 +75,8 @@ func TestTheHookServiceIsConfinedAndGetsTheRecordedValues(t *testing.T) {
 			Profiles    []string `yaml:"profiles"`
 			CapDrop     []string `yaml:"cap_drop"`
 			SecurityOpt []string `yaml:"security_opt"`
+			ReadOnly    bool     `yaml:"read_only"`
+			Tmpfs       []string `yaml:"tmpfs"`
 			Environment []string `yaml:"environment"`
 			EnvFile     []string `yaml:"env_file"`
 			Volumes     []string `yaml:"volumes"`
@@ -85,7 +87,7 @@ func TestTheHookServiceIsConfinedAndGetsTheRecordedValues(t *testing.T) {
 	}
 	s := doc.Services[ProvisionService]
 	if s.Image != "${STOWAGE_IMAGE_API}" || strings.Join(s.Entrypoint, " ") != "notes-api create-admin" ||
-		strings.Join(s.CapDrop, ",") != "ALL" || strings.Join(s.SecurityOpt, ",") != "no-new-privileges:true" ||
+		strings.Join(s.CapDrop, ",") != "ALL" || strings.Join(s.SecurityOpt, ",") != "no-new-privileges:true" || !s.ReadOnly || strings.Join(s.Tmpfs, ",") != "/tmp" ||
 		strings.Join(s.Profiles, ",") != ProvisionService || len(s.Volumes) != 0 || strings.Join(s.EnvFile, ",") != "./"+ProvisionEnv {
 		t.Fatalf("service: %+v", s)
 	}

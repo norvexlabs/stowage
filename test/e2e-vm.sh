@@ -718,6 +718,35 @@ if ((${#HOST6[@]})); then
 else
 	echo "this host has no global IPv6 address: the VM's IPv6 address, SSH and HTTPS over it are not checked"
 fi
+# The VM routes nothing for others between its own interfaces, IPv4 and (with a global IPv6
+# address here) IPv6 alike, whatever Docker's FORWARD policies (the project forwards no role): a
+# namespace behind a veth of the VM's, no bridge of the stack's, connects to this host through it,
+# and the firewall's forward chain drops it: its drop's counter moves by each family's SYNs (the
+# probe's sources have no way back from this host, so the counter alone is the evidence).
+fwd_dsts=("$MIRROR_IP")
+if ((${#HOST6[@]})); then
+	[[ $(on_vm cat /proc/sys/net/ipv6/conf/all/forwarding) == 1 ]] || fail "the VM does not forward IPv6: the probe below would prove nothing"
+	fwd_dsts+=("${HOST6[0]}")
+fi
+fwd_drops() { on_vm sudo nft list chain inet notes forward | awk '/counter packets .* drop/ {print $3}'; }
+before=$(fwd_drops)
+[[ $before =~ ^[0-9]+$ ]] || { on_vm sudo nft list chain inet notes forward; fail "the forward chain has no counted drop"; }
+on_vm "sudo ip netns add e2efwd && sudo ip link add e2efwd0 type veth peer name e2efwd1 netns e2efwd &&
+	sudo ip addr add 10.254.254.1/30 dev e2efwd0 && sudo ip addr add fd5f:6677::1/64 dev e2efwd0 nodad && sudo ip link set e2efwd0 up &&
+	sudo ip -n e2efwd addr add 10.254.254.2/30 dev e2efwd1 && sudo ip -n e2efwd addr add fd5f:6677::2/64 dev e2efwd1 nodad && sudo ip -n e2efwd link set e2efwd1 up &&
+	sudo ip -n e2efwd route add default via 10.254.254.1 && sudo ip -n e2efwd -6 route add default via fd5f:6677::1" >"$WORK/fwd.txt" 2>&1 ||
+	{ cat "$WORK/fwd.txt"; on_vm "sudo ip netns del e2efwd; sudo ip link del e2efwd0" 2>/dev/null; fail "the forwarding probe's namespace"; }
+for dst in "${fwd_dsts[@]}"; do
+	on_vm "sudo ip netns exec e2efwd timeout 3 bash -c 'exec 3<>/dev/tcp/$dst/22'" >/dev/null 2>&1 || true
+	after=$(fwd_drops)
+	((after > before)) || {
+		on_vm sudo nft list chain inet notes forward
+		on_vm "sudo ip netns del e2efwd; sudo ip link del e2efwd0" 2>/dev/null
+		fail "the forward chain did not drop the probe's connection to $dst (drops $before → $after)"
+	}
+	before=$after
+done
+on_vm "sudo ip netns del e2efwd; sudo ip link del e2efwd0 2>/dev/null; true"
 lease=$(net_field address) gw=$(net_field gateway) dns=$(net_field dns)
 # The first address and gateway are IPv4's, the IPv6 ones follow.
 lease=${lease%%,*} gw=${gw%%,*} dns=${dns// /}

@@ -144,7 +144,8 @@ func frontCAEnv(t *testing.T, root []byte) *env {
 	answer := e.docker.answer
 	e.docker.answer = func(a string) ([]byte, bool, error) {
 		switch {
-		case strings.Contains(a, " run --rm --no-deps -T --entrypoint sh "+FrontService+" -c "+frontCAReadShell):
+		// The read as root with the read-search capability alone, the write as the front's user.
+		case strings.Contains(a, " run --rm --no-deps -T --user 0 --cap-add DAC_READ_SEARCH --entrypoint sh "+FrontService+" -c "+frontCAReadShell):
 			return root, true, nil
 		case strings.Contains(a, " run --rm --no-deps -T --entrypoint sh "+FrontService+" -c "+frontCAWriteShell):
 			return nil, true, nil
@@ -189,7 +190,7 @@ func TestTheFrontCAGoesThroughADisasterRecovery(t *testing.T) {
 			if raw, _ := readAllOf(c); string(raw) != string(cert)+string(key) {
 				t.Errorf("the restore wrote:\n%s", raw)
 			}
-		case slices.Contains(c.Args, "up") && up < 0:
+		case slices.Contains(c.Args, "--detach") && up < 0: // the front's first start
 			up = i
 		}
 	}

@@ -1103,6 +1103,10 @@ func (l *linter) front() {
 				l.errf("front.publish_ca.volume", "%q is not a volume %s declares", p.Volume, l.s.Stack.Compose)
 			}
 		}
+		// The front writes its CA there as the volume's uid when it has one: never root.
+		if uid := l.s.Data.Volumes[p.Volume].UID; uid != nil && *uid == 0 {
+			l.errf("front.publish_ca.volume", "%s's uid is 0 (data.volumes.%s.uid): the front writes its CA there as that volume's user, and never runs as root; give it its services' non-root uid, or none", p.Volume, p.Volume)
+		}
 	}
 	switch {
 	case f.Portal == "" && len(f.Routes) == 0 && l4TLS:

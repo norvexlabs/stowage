@@ -106,7 +106,7 @@ func (in *Installer) composeVolumes(names []string) (map[string]string, error) {
 func (in *Installer) adopted(ctx context.Context, vol, project string, mounted bool) (bool, error) {
 	out, err := in.O.Docker.Run(ctx, Cmd{Args: []string{"volume", "inspect", "--format", `{{index .Labels "com.docker.compose.project"}}`, vol}})
 	if err != nil {
-		if strings.Contains(strings.ToLower(err.Error()), "no such volume") {
+		if noSuchVolume(err) {
 			return false, nil
 		}
 		return false, err

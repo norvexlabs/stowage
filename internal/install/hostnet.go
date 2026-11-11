@@ -1,6 +1,7 @@
 package install
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -50,6 +51,98 @@ type hostNet struct {
 	// records are the VM's host records (vmHosts), NAME:IP, which every service of a network of
 	// its own or the host's gets.
 	records []string
+	// off are the services whose profiles are all off this start (profilesOff): an L4 route to one
+	// is served by no one (l4Served).
+	off []string
+	// bridges are the names the stack's own bridge networks give their bridges
+	// (com.docker.network.bridge.name), which the VM's forward chain leaves to Docker's chains as
+	// it does docker0 and br-* (stackBridges).
+	bridges []string
+}
+
+// bridgeNameOpt is the bridge driver's option naming a network's bridge.
+const bridgeNameOpt = "com.docker.network.bridge.name"
+
+// stackBridges are the bridge names m's own bridge networks give (bridgeNameOpt), sorted, each
+// once, but those the forward chain matches already (docker0, br-*) and one no device could be
+// named (ifName: Docker refuses it too); an external network's are externalBridges'.
+func stackBridges(m *composeModel) []string {
+	var out []string
+	for _, name := range sortedKeys(m.Networks) {
+		n := m.Networks[name]
+		if n.External || (n.Driver != "" && n.Driver != "bridge") {
+			continue
+		}
+		if b := n.DriverOpts[bridgeNameOpt]; namedBridge(b) {
+			out = append(out, b)
+		}
+	}
+	slices.Sort(out)
+	return slices.Compact(out)
+}
+
+// namedBridge reports whether b is a bridge's name the forward chain does not match already
+// (docker0, br-*) and a device could have (ifName).
+func namedBridge(b string) bool {
+	return b != "" && b != "docker0" && !strings.HasPrefix(b, "br-") && ifName.MatchString(b)
+}
+
+// forwardBridges are the named bridges the VM's forward chain leaves to Docker's chains: the
+// stack's own networks' (stackBridges) and its external ones' (externalBridges), sorted, each
+// once; none off the VM, whose forward chain alone reads them. A name that is one of the host's
+// own devices (a host.interfaces role's, the loopback) is refused: its accept would forward
+// through that interface whatever the roles declare.
+func (in *Installer) forwardBridges(ctx context.Context, m *composeModel) ([]string, error) {
+	if in.O.Firewall == "" {
+		return nil, nil
+	}
+	ext, err := in.externalBridges(ctx, m)
+	if err != nil {
+		return nil, err
+	}
+	out := append(stackBridges(m), ext...)
+	slices.Sort(out)
+	out = slices.Compact(out)
+	own := map[string]string{"lo": "the loopback"}
+	if h := in.R.Spec.Host; h != nil {
+		for role, i := range h.Interfaces {
+			own[role] = "host.interfaces." + role
+			own[i.DeviceName(role)] = "host.interfaces." + role
+		}
+	}
+	for _, b := range out {
+		if what, ok := own[b]; ok {
+			return nil, fmt.Errorf("a network of the stack names its bridge %s (%s), which is %s's device on this host: name it otherwise", b, bridgeNameOpt, what)
+		}
+	}
+	return out, nil
+}
+
+// externalBridges are the bridge names of the external networks m joins, as the engine holds
+// them (a bridge network's bridgeNameOpt; namedBridge), sorted, each once: one inspection of them
+// all.
+func (in *Installer) externalBridges(ctx context.Context, m *composeModel) ([]string, error) {
+	var names []string
+	for _, key := range sortedKeys(m.Networks) {
+		if n := m.Networks[key]; n.External {
+			names = append(names, cmp.Or(n.Name, key))
+		}
+	}
+	if len(names) == 0 {
+		return nil, nil
+	}
+	raw, err := in.O.Docker.Run(ctx, Cmd{Args: append([]string{"network", "inspect", "--format", "{{.Driver}} {{index .Options \"" + bridgeNameOpt + "\"}}"}, names...)})
+	if err != nil {
+		return nil, fmt.Errorf("the external networks %s: %w", strings.Join(names, ", "), err)
+	}
+	var out []string
+	for line := range strings.Lines(string(raw)) {
+		if f := strings.Fields(line); len(f) == 2 && f[0] == "bridge" && namedBridge(f[1]) {
+			out = append(out, f[1])
+		}
+	}
+	slices.Sort(out)
+	return slices.Compact(out), nil
 }
 
 // bridged is the targets' ports the firewall accepts from the stack's bridges, sorted, each once.

@@ -39,12 +39,21 @@ const (
 // the front, and the content labels of that compose file's services.
 var stackFiles = []string{"compose.yaml", FrontCompose, Caddyfile, ContentCompose}
 
+// stackFileMode is a stack file's mode wherever it is written: the Caddyfile 0600 (it holds the
+// logins' hashes; each start copies it into the front's volume: prepareFront), the others 0644.
+func stackFileMode(name string) os.FileMode {
+	if name == Caddyfile {
+		return 0o600
+	}
+	return 0o644
+}
+
 // restoreStack copies the stack files dir keeps over the install's; missingOK skips one dir lacks.
 // The content labels go with the compose file they were written for: where dir keeps none, the
 // install's are removed, never left naming services the restored compose file may not have.
 func (in *Installer) restoreStack(dir string, missingOK bool) error {
 	for _, f := range stackFiles {
-		err := copyFile(filepath.Join(dir, f), in.path(f), 0o644)
+		err := copyFile(filepath.Join(dir, f), in.path(f), stackFileMode(f))
 		switch {
 		case err == nil:
 		case errors.Is(err, os.ErrNotExist) && f == ContentCompose:
@@ -603,7 +612,7 @@ func (in *Installer) upgradePorts(env *EnvFile, mode string) (publish, error) {
 	case mode != Loopback && len(o.Ports) > 0:
 		return publish{}, refuse(in.flagFix("leave out --ports"), "--ports is for loopback mode: this install's front serves %s, on its recorded ports", mode)
 	case mode != Loopback:
-		return publish{addr: "127.0.0.1", all: true, ports: map[string]int{"http": port(HTTPPortVar), "https": port(HTTPSPortVar)}}, nil
+		return publish{addr: "127.0.0.1", all: true, ports: map[string]int{"http": port(HTTPPortVar), "https": port(HTTPSPortVar)}, unserved: in.unservedPorts(mode)}, nil
 	}
 	pub := publish{addr: get("STOWAGE_LOOPBACK_ADDRESS"), ports: map[string]int{}}
 	added := publish{addr: pub.addr, ports: map[string]int{}}
@@ -856,7 +865,7 @@ func (in *Installer) keepPrev(env *EnvFile, st state, kept *keptRelease) error {
 	} else {
 		// Another Stowage's stack files are its own to render: those its last start wrote.
 		for _, f := range stackFiles {
-			if err := copyFile(in.path(f), filepath.Join(tmp, f), 0o644); err != nil && !errors.Is(err, os.ErrNotExist) {
+			if err := copyFile(in.path(f), filepath.Join(tmp, f), stackFileMode(f)); err != nil && !errors.Is(err, os.ErrNotExist) {
 				return err
 			}
 		}
@@ -1119,7 +1128,7 @@ func (in *Installer) Rollback(ctx context.Context) (err error) {
 		return err
 	}
 	for _, f := range append(slices.Clone(stackFiles), envName, in.R.Ctl()) {
-		mode := os.FileMode(0o644)
+		mode := stackFileMode(f)
 		switch f {
 		case envName:
 			mode = 0o600

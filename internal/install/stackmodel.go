@@ -76,6 +76,8 @@ type composeModel struct {
 
 // composeNetwork is a network of the compose file, as `docker compose config` renders it.
 type composeNetwork struct {
+	// Name is the network's name as the engine holds it.
+	Name       string            `json:"name"`
 	External   bool              `json:"external"`
 	Driver     string            `json:"driver"`
 	DriverOpts map[string]string `json:"driver_opts"`

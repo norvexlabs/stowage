@@ -111,13 +111,15 @@ func TestDataVolumesAreGivenTheirUID(t *testing.T) {
 		switch {
 		case strings.HasSuffix(a, " up --no-start --remove-orphans"):
 			order = append(order, "create")
+		case strings.HasPrefix(a, frontUserPrefix):
+			order = append(order, "front")
 		case strings.HasPrefix(a, "run --rm --pull never --network none --user 0 "):
 			order = append(order, "own")
 		case strings.Contains(a, " up --detach --wait "):
 			order = append(order, "start")
 		}
 	}
-	if strings.Join(order, " ") != "create own start" {
+	if strings.Join(order, " ") != "create own front start" {
 		t.Fatalf("order: %v", order)
 	}
 	for _, want := range []string{`if [ "$(stat -c %u /v/0)" != 70 ]; then chown -hR 70 /v/0; echo p_postgres; fi`, `!= 1000 ]; then chown -hR 1000 /v/1;`} {
@@ -158,14 +160,26 @@ func TestDataVolumesAreGivenTheirUID(t *testing.T) {
 		t.Errorf("%d chowns of volumes that exist or are external", n)
 	}
 
-	// Without a uid, nothing is made first nor given.
+	// Without a uid, nothing is given; and without a front either, nothing is made first.
 	e = newEnv(t)
 	e.docker.model = `{"services": {"web": {"volumes": [{"type": "volume", "source": "cache", "target": "/c"}]}}, "volumes": {"cache": {"name": "p_cache"}}}`
 	if err := e.install(nil); err != nil {
 		t.Fatal(err)
 	}
-	if n := len(e.docker.ran("run --rm --pull never --network none --user 0 ")); n != 0 || len(e.docker.ran("compose --project-directory "+e.dir+" -f "+filepath.Join(e.dir, "compose.yaml")+" -f "+filepath.Join(e.dir, FrontCompose)+" -f "+filepath.Join(e.dir, ContentCompose)+" up --no-start")) != 0 {
+	created := func() int {
+		return len(e.docker.ran("compose --project-directory " + e.dir + " -f " + filepath.Join(e.dir, "compose.yaml") + " -f " + filepath.Join(e.dir, FrontCompose) + " -f " + filepath.Join(e.dir, ContentCompose) + " up --no-start"))
+	}
+	if n := len(e.docker.ran("run --rm --pull never --network none --user 0 ")); n != 0 || created() != 1 {
 		t.Errorf("a stack without a volume of a uid: %d chowns, calls %v", n, e.docker.calls)
+	}
+	e = newEnv(t)
+	e.to("1.0.0", func(s *spec.Spec) { s.Front = spec.Front{} })
+	e.docker.model = `{"services": {"web": {"volumes": [{"type": "volume", "source": "cache", "target": "/c"}]}}, "volumes": {"cache": {"name": "p_cache"}}}`
+	if err := e.install(nil); err != nil {
+		t.Fatal(err)
+	}
+	if created() != 0 || len(e.docker.ran(frontUserPrefix)) != 0 {
+		t.Errorf("a stack without a volume of a uid nor a front: calls %v", e.docker.calls)
 	}
 }
 

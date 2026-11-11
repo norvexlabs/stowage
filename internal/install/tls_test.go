@@ -11,6 +11,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"io"
 	"math/big"
 	"net/netip"
 	"os"
@@ -259,7 +260,7 @@ func TestTheLocalCASendsNoHSTSAndOtherPortsReachTheURLs(t *testing.T) {
 	}
 	cf := e.file(Caddyfile)
 	// The front listens on 443 in its container, and on the URL's port for the stack's services.
-	if strings.Contains(cf, "Strict-Transport-Security") || !strings.Contains(cf, "\thttps_port 443\n") || !strings.Contains(cf, "\tlocal_certs\n") || strings.Contains(cf, "acme") ||
+	if strings.Contains(cf, "Strict-Transport-Security") || !strings.Contains(cf, "\thttps_port 443\n") || !strings.Contains(cf, "\tlocal_certs\n\tskip_install_trust\n") || strings.Contains(cf, "acme") ||
 		!strings.Contains(cf, "\nnotes.example.com, notes.example.com:8443 {\n") {
 		t.Errorf("Caddyfile:\n%s", cf)
 	}
@@ -314,11 +315,17 @@ func TestOwnCertificateIsCheckedAndCopiedIntoTheInstall(t *testing.T) {
 			t.Fatalf("%s: %v %v", name, st, err)
 		}
 	}
-	if cf := e.file(Caddyfile); !strings.Contains(cf, "notes.example.com {\n\ttls /etc/caddy/tls/cert.pem /etc/caddy/tls/key.pem\n\t"+hsts) {
+	if cf := e.file(Caddyfile); !strings.Contains(cf, "notes.example.com {\n\ttls /data/stowage-tls/cert.pem /data/stowage-tls/key.pem\n\t"+hsts) {
 		t.Errorf("Caddyfile:\n%s", cf)
 	}
-	if fc := e.file(FrontCompose); !strings.Contains(fc, "./tls:/etc/caddy/tls:ro") {
-		t.Errorf("front compose:\n%s", fc)
+	// The front reads its copy in its own volume, which each start makes from the install's.
+	if fc := e.file(FrontCompose); strings.Contains(fc, "./tls:") {
+		t.Errorf("front compose mounts the install's copy:\n%s", fc)
+	}
+	if prep := e.docker.ran(frontUserPrefix); len(prep) == 0 {
+		t.Error("no front preparation")
+	} else if stdin, _ := io.ReadAll(prep[len(prep)-1].Stdin); tarNames(t, stdin)["tls/cert.pem"] != 0o600 {
+		t.Errorf("the start gives the front no certificate: %v", tarNames(t, stdin))
 	}
 	// A re-run needs the copy, and changes nothing about TLS.
 	if err := e.install(nil); err != nil {
@@ -957,7 +964,7 @@ func TestAReRunChangesTheTLSModeAndTheCertificate(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(e.dir, TLSDir)); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("tls/ stayed after the move from byo: %v", err)
 	}
-	if cf := e.file(Caddyfile); !strings.Contains(cf, "dns cloudflare") || strings.Contains(cf, "tls /etc/caddy") {
+	if cf := e.file(Caddyfile); !strings.Contains(cf, "dns cloudflare") || strings.Contains(cf, "tls "+frontTLS) {
 		t.Fatalf("Caddyfile:\n%s", cf)
 	}
 	token2 := "cfut_" + strings.Repeat("b", 40)
@@ -989,7 +996,7 @@ func TestAReRunChangesTheTLSModeAndTheCertificate(t *testing.T) {
 	if got, _ := os.ReadFile(filepath.Join(e.dir, TLSDir, "ca.pem")); !bytes.Equal(got, wantCA) {
 		t.Fatal("the CA was not copied")
 	}
-	if fc := e.file(FrontCompose); !strings.Contains(fc, "cp /etc/caddy/tls/ca.pem /stowage-ca/.ca.crt") || !strings.Contains(fc, "- ca:/stowage-ca") {
+	if fc := e.file(FrontCompose); !strings.Contains(fc, "cp /data/stowage-tls/ca.pem /stowage-ca/.ca.crt") || !strings.Contains(fc, "- ca:/stowage-ca") {
 		t.Fatalf("front compose does not publish the CA:\n%s", fc)
 	}
 }
@@ -1285,10 +1292,10 @@ func TestARouteAskingForAClientCertificate(t *testing.T) {
 	if err := e.install(func(o *Options) { o.TLS, o.Cert, o.Key = "byo", leaf, key }); err != nil {
 		t.Fatal(err)
 	}
-	if b := block(e, "api.example.com"); !strings.HasPrefix(b, "\ttls /etc/caddy/tls/cert.pem /etc/caddy/tls/key.pem {\n\t\tclient_auth {") || !mounted(e) {
+	if b := block(e, "api.example.com"); !strings.HasPrefix(b, "\ttls /data/stowage-tls/cert.pem /data/stowage-tls/key.pem {\n\t\tclient_auth {") || !mounted(e) {
 		t.Errorf("byo:\n%s", b)
 	}
-	if b := block(e, "notes.example.com"); !strings.HasPrefix(b, "\ttls /etc/caddy/tls/cert.pem /etc/caddy/tls/key.pem\n") {
+	if b := block(e, "notes.example.com"); !strings.HasPrefix(b, "\ttls /data/stowage-tls/cert.pem /data/stowage-tls/key.pem\n") {
 		t.Errorf("byo app:\n%s", b)
 	}
 	// A client CA emptied since is none: the route refuses everyone, the front serves the others.
@@ -1383,7 +1390,7 @@ func TestCAIsForByoAndAProjectThatPublishesOne(t *testing.T) {
 	if err := e.install(func(o *Options) { tlsDomains(o); o.TLS, o.Cert, o.Key, o.CA = "byo", cert, key, ca }); err != nil {
 		t.Fatal(err)
 	}
-	if fc := e.file(FrontCompose); !strings.Contains(fc, "cp /etc/caddy/tls/ca.pem /stowage-ca/.ca.crt && chmod 0644 /stowage-ca/.ca.crt && mv") {
+	if fc := e.file(FrontCompose); !strings.Contains(fc, "cp /data/stowage-tls/ca.pem /stowage-ca/.ca.crt && chmod 0644 /stowage-ca/.ca.crt && mv") {
 		t.Fatalf("front compose:\n%s", fc)
 	}
 }

@@ -87,6 +87,9 @@ type fakeDocker struct {
 	runner func(c Cmd) ([]byte, error)
 	// model is what `compose config --format json` prints; empty, an empty stack.
 	model string
+	// frontUser and frontPrep answer the start's runs of the front's image readying its volumes
+	// (prepareFront): as the front's user, then as root for what that one cannot do.
+	frontUser, frontPrep func(Cmd) ([]byte, error)
 	// owner answers the run that gives the data volumes their uid.
 	owner func(c Cmd) ([]byte, error)
 	// volumes are the names `volume ls` prints, one per line.
@@ -99,11 +102,30 @@ type exitCode int
 func (e exitCode) Error() string { return "exit status " + strconv.Itoa(int(e)) }
 func (e exitCode) ExitCode() int { return int(e) }
 
+// frontUserPrefix and frontPrepPrefix start prepareFront's command lines: as the front's user,
+// and as root.
+const (
+	frontUserPrefix = "run --rm -i --pull never --network none --read-only --user "
+	frontPrepPrefix = "run --rm --pull never --network none --read-only --user 0 --cap-drop ALL --cap-add CHOWN "
+)
+
 func (f *fakeDocker) Run(_ context.Context, c Cmd) ([]byte, error) {
 	f.mu.Lock()
 	f.calls = append(f.calls, c)
 	f.mu.Unlock()
 	a := strings.Join(c.Args, " ")
+	if strings.HasPrefix(a, frontUserPrefix) {
+		if f.frontUser != nil {
+			return f.frontUser(c)
+		}
+		return nil, nil
+	}
+	if strings.HasPrefix(a, frontPrepPrefix) {
+		if f.frontPrep != nil {
+			return f.frontPrep(c)
+		}
+		return nil, nil
+	}
 	if f.runner != nil && strings.HasPrefix(a, "run --rm --pull never ") {
 		return f.runner(c)
 	}
@@ -120,6 +142,13 @@ func (f *fakeDocker) Run(_ context.Context, c Cmd) ([]byte, error) {
 		return []byte("27.3.1\n"), nil
 	case a == "volume ls --format {{.Name}}":
 		return []byte(f.volumes), nil
+	case strings.HasPrefix(a, "volume inspect --format {{.Name}} "):
+		for _, v := range c.Args[4:] {
+			if !slices.Contains(strings.Fields(f.volumes), v) {
+				return nil, errors.New("no such volume: " + v)
+			}
+		}
+		return []byte(strings.Join(c.Args[4:], "\n") + "\n"), nil
 	case strings.HasPrefix(a, "compose") && strings.HasSuffix(a, " config --format json"):
 		return []byte(cmp.Or(f.model, "{}")), nil
 	case strings.HasPrefix(a, "run --rm --pull never --network none --user 0 --entrypoint sh "):
@@ -520,12 +549,35 @@ func TestInstallWritesTheStackAndStartsIt(t *testing.T) {
 	if n := len(e.docker.ran("pull")); n != 5 {
 		t.Errorf("%d pulls, want 5 (3 images, the front and the volume helper)", n)
 	}
+	// The stack's containers made, the front's volumes readied for its user, then the stack started.
 	up := e.docker.ran("compose")
-	if len(up) != 4 || !strings.HasSuffix(strings.Join(up[1].Args, " "), "config --format json") || !strings.Contains(strings.Join(up[2].Args, " "), "up --detach --wait") || !strings.HasSuffix(strings.Join(up[3].Args, " "), "run --rm --no-deps -T --name "+get(e.readEnv(), "COMPOSE_PROJECT_NAME")+"-"+ProvisionService+" "+ProvisionService) {
+	if len(up) != 5 || !strings.HasSuffix(strings.Join(up[1].Args, " "), "config --format json") || !strings.HasSuffix(strings.Join(up[2].Args, " "), "up --no-start --remove-orphans") ||
+		!strings.Contains(strings.Join(up[3].Args, " "), "up --detach --wait") || !strings.HasSuffix(strings.Join(up[4].Args, " "), "run --rm --no-deps -T --name "+get(e.readEnv(), "COMPOSE_PROJECT_NAME")+"-"+ProvisionService+" "+ProvisionService) {
 		t.Fatalf("compose calls: %v", up)
 	}
+	var order []string
+	for _, c := range e.docker.calls {
+		switch a := strings.Join(c.Args, " "); {
+		case strings.HasSuffix(a, " up --no-start --remove-orphans"):
+			order = append(order, "create")
+		case strings.HasPrefix(a, frontPrepPrefix):
+			order = append(order, "root")
+		case strings.HasPrefix(a, frontUserPrefix):
+			order = append(order, "front")
+			if want := " --volume " + get(e.readEnv(), "COMPOSE_PROJECT_NAME") + "_" + FrontDataVolume + ":/data " + get(e.readEnv(), FrontImageVar) + " -euc "; !strings.Contains(a, want) {
+				t.Errorf("the front's volume: %s, want %q", a, want)
+			}
+		case strings.Contains(a, " up --detach --wait "):
+			order = append(order, "start")
+		}
+	}
+	// A first install's volumes are made first, then given their files as the front's user; nothing
+	// asked root.
+	if strings.Join(order, " ") != "create front start" {
+		t.Errorf("order: %v", order)
+	}
 	// The recorded values win over the shell's.
-	envs := strings.Join(up[2].Env, "\n")
+	envs := strings.Join(up[3].Env, "\n")
 	if strings.Contains(envs, "from-the-shell") || strings.Contains(envs, "COMPOSE_PROJECT_NAME=other") || !strings.Contains(envs, "PATH=/bin") {
 		t.Fatalf("compose environment:\n%s", envs)
 	}
@@ -1060,7 +1112,7 @@ func TestAReRunFinishesSetupAndNeverRedecides(t *testing.T) {
 	if !bytes.Equal(before, after) {
 		t.Fatal("a re-run rewrote .env")
 	}
-	if len(e.docker.ran("pull")) != 0 || len(e.docker.ran("compose")) != 4 {
+	if len(e.docker.ran("pull")) != 0 || len(e.docker.ran("compose")) != 5 {
 		t.Fatalf("re-run calls: %v", e.docker.calls)
 	}
 
@@ -1163,7 +1215,7 @@ func TestAReRunChangesWhatItIsGiven(t *testing.T) {
 			t.Errorf("log lacks %q:\n%s", want, e.log)
 		}
 	}
-	if len(e.docker.ran("compose")) != 4 || !strings.Contains(e.out.String(), "http://localhost:18080") {
+	if len(e.docker.ran("compose")) != 5 || !strings.Contains(e.out.String(), "http://localhost:18080") {
 		t.Fatalf("the stack was not brought up again: %v\n%s", e.docker.calls, e.out)
 	}
 
@@ -1327,7 +1379,7 @@ func TestThePullAccountGoesInAPrivateConfigNeverTheOperatorsLogin(t *testing.T) 
 	// `up` pulls an image gone since with the account too.
 	ups := 0
 	for _, c := range e.docker.calls {
-		if slices.Contains(c.Args, "up") {
+		if slices.Contains(c.Args, "--detach") {
 			ups++
 			if up := dockerConfig(c.Env); !strings.HasPrefix(up, e.dir+string(filepath.Separator)) {
 				t.Fatalf("up ran with DOCKER_CONFIG %q, not the account's", up)
@@ -1366,7 +1418,7 @@ func TestFrontStripsHeadersAndPublishesOnTheLoopback(t *testing.T) {
 			t.Errorf("Caddyfile lacks %q:\n%s", want, cf)
 		}
 	}
-	fc, err := frontCompose(e.r.Spec.Front, nil, nil, Loopback, hostAPI{}, "sha256:x", "", false, false, false, nil, nil)
+	fc, err := frontCompose(e.r.Spec.Front, nil, nil, Loopback, hostAPI{}, "sha256:x", "", false, false, false, nil, nil, FrontUID)
 	if err != nil {
 		t.Fatal(err)
 	}

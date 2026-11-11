@@ -1179,6 +1179,18 @@ func TestATunRolesDeviceIsItsRulesDevice(t *testing.T) {
 	if len(host.stdin) == 0 || !strings.Contains(host.stdin[0], "-A STOWAGE-FORWARD -i ovl-0-0 -o uplink -j ACCEPT\n") {
 		t.Errorf("stdin %q", host.stdin)
 	}
+	fwd := filepath.Join(in.O.Firewall, ForwardDir, "notes-forward.nft")
+	if b, _ := os.ReadFile(fwd); !strings.HasSuffix(string(b), "\niifname \"ovl-0-0\" oifname \"uplink\" accept\n") || strings.Count(string(b), "accept") != 1 {
+		t.Errorf("the forward chain's rules:\n%s", b)
+	}
+	// A release forwarding nothing leaves the forward chain no rule of the install's: its drop holds.
+	r.Spec.Host.Interfaces["vpn0"] = spec.HostInterface{Kind: spec.InterfaceTUN, Device: "ovl-0-0"}
+	if err := in.openPorts(ctx, env, hostNet{targets: map[string]bool{"proxy": true}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(fwd); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("the forwarding's file is left: %v", err)
+	}
 	docker := &Installer{R: r, O: Options{Dir: t.TempDir()}}
 	if d := docker.roleDevice("vpn0", none); d != "ovl-0-0" {
 		t.Errorf("a Docker host's device %q", d)
@@ -1202,6 +1214,23 @@ func TestTheBundlesFirewallIncludesTheInstallsRules(t *testing.T) {
 	if !ok || !strings.Contains(input, `include "`+PortRules+`/*.nft"`) ||
 		!strings.Contains(forward, `include "`+VMDir("notes")+"/"+ForwardRules+`/*.nft"`) || !strings.Contains(forward, "hook forward") {
 		t.Errorf("ruleset:\n%s", conf)
+	}
+	// What is forwarded between the host's own interfaces is dropped, both families (inet), but a
+	// reply, the stack's bridges' traffic and the roles' pairs, which come before the drop.
+	body, _, _ := strings.Cut(forward, "}")
+	pairs := strings.Index(body, `include "`+PortRules+"/"+ForwardDir+`/*.nft"`)
+	drop := strings.Index(body, "\t\tcounter drop\n")
+	for _, want := range []string{"ct state established,related accept", `iifname "br-*" accept`, `oifname "br-*" accept`, `iifname "docker0" accept`, `oifname "docker0" accept`} {
+		if i := strings.Index(body, want); i < 0 || i > drop {
+			t.Errorf("no %q ahead of the drop:\n%s", want, body)
+		}
+	}
+	if pairs < 0 || drop < pairs || !strings.Contains(conf, "table inet notes {") {
+		t.Errorf("the roles' pairs are not included ahead of the forward chain's drop:\n%s", body)
+	}
+	tmp, _ := os.ReadFile(filepath.Join(dir, "files", "etc", "tmpfiles.d", "notes-nftables.conf"))
+	if !strings.Contains(string(tmp), "d "+PortRules+"/"+ForwardDir+" ") {
+		t.Errorf("tmpfiles:\n%s", tmp)
 	}
 }
 

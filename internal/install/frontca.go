@@ -87,7 +87,10 @@ func (in *Installer) frontCA(ctx context.Context, env *EnvFile) (*FrontCA, error
 	if mode, _ := env.Get("STOWAGE_TLS_MODE"); mode != "internal" || !in.R.Spec.Front.Declared() {
 		return nil, nil
 	}
-	out, err := in.O.Docker.Run(ctx, Cmd{Args: append(in.composeBase(), "run", "--rm", "--no-deps", "-T", "--entrypoint", "sh", FrontService, "-c", frontCAReadShell),
+	// As root reading alone, whoever holds the volume's files yet (a start not yet past
+	// prepareFront): a file it cannot read is never taken for no CA.
+	out, err := in.O.Docker.Run(ctx, Cmd{Args: append(in.composeBase(), "run", "--rm", "--no-deps", "-T", "--user", "0", "--cap-add", "DAC_READ_SEARCH",
+		"--entrypoint", "sh", FrontService, "-c", frontCAReadShell),
 		Env: env.Environ(in.O.environ())})
 	if err != nil {
 		return nil, fmt.Errorf("the front's local CA: %w", err)
@@ -141,6 +144,8 @@ func (in *Installer) loadFrontCA(ctx context.Context, env *EnvFile) error {
 	if _, err := in.Compose(ctx, env, in.O.Log, "rm", "--stop", "--force", FrontService); err != nil {
 		return fmt.Errorf("the front's local CA: %w", err)
 	}
+	// As the front's user, in its volume once the start's prepareFront gave it to that user: no
+	// link there leads the write elsewhere.
 	if _, err := in.O.Docker.Run(ctx, Cmd{Args: append(in.composeBase(), "run", "--rm", "--no-deps", "-T", "--entrypoint", "sh", FrontService, "-c", frontCAWriteShell),
 		Env: env.Environ(in.O.environ()), Stdin: bytes.NewReader(raw)}); err != nil {
 		return fmt.Errorf("the front's local CA, into its volume: %w", err)

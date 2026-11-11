@@ -70,7 +70,7 @@ func TestASecretRotatesInThreePassesOnDocker(t *testing.T) {
 	ups := func() int {
 		n := 0
 		for _, c := range e.docker.calls {
-			if slices.Contains(c.Args, "up") {
+			if slices.Contains(c.Args, "--detach") {
 				n++
 			}
 		}

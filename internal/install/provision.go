@@ -130,8 +130,9 @@ func (in *Installer) recordedEnv(env *EnvFile) []string {
 }
 
 // confined is a service Stowage runs on demand in the stack (behind its own profile): cmd as the
-// container's whole command line, no capability, no privilege gain, no file of the host (the caller
-// adds what it mounts), and the recorded values by name (compose takes them from the environment it runs with).
+// container's whole command line, no capability, no privilege gain, a read-only root with /tmp
+// its only writable path, the image's own user, no file of the host (the caller adds what it
+// mounts), and the recorded values by name (compose takes them from the environment it runs with).
 func confined(service, image string, cmd, keys []string) map[string]any {
 	c := make([]string, len(cmd))
 	for i, a := range cmd {
@@ -143,6 +144,8 @@ func confined(service, image string, cmd, keys []string) map[string]any {
 		"profiles":     []string{service},
 		"cap_drop":     []string{"ALL"},
 		"security_opt": []string{"no-new-privileges:true"},
+		"read_only":    true,
+		"tmpfs":        []string{"/tmp"},
 		"environment":  keys,
 		"restart":      "no",
 	}

@@ -93,7 +93,13 @@ func (in *Installer) tuneProfile(get func(string) string) (tune.Profile, string)
 func (in *Installer) stackPorts(get func(string) string) []int {
 	var keys []string
 	if in.R.Spec.HasFront() {
-		keys = append(keys, HTTPPortVar, HTTPSPortVar)
+		http, https := frontPorts(in.R.Spec.Front, in.R.Spec.L4.Routes, get("STOWAGE_TLS_MODE"))
+		if http {
+			keys = append(keys, HTTPPortVar)
+		}
+		if https {
+			keys = append(keys, HTTPSPortVar)
+		}
 		for _, r := range in.R.Spec.Front.Routes {
 			keys = append(keys, PortVar(r.Name))
 		}

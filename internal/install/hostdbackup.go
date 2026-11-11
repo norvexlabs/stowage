@@ -756,7 +756,7 @@ func (in *Installer) stackVolume(ctx context.Context, env *EnvFile, key string, 
 			return "", fmt.Errorf("volume %s belongs to the Compose project %s, not %s", vol, o, project)
 		}
 		return vol, nil
-	case !strings.Contains(strings.ToLower(err.Error()), "no such volume"):
+	case !noSuchVolume(err):
 		return "", fmt.Errorf("volume %s: %w", vol, err)
 	case !create:
 		return "", nil

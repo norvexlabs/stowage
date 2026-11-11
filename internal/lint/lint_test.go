@@ -402,6 +402,7 @@ func TestEachRuleFiresOnFull(t *testing.T) {
 		{"allow input advanced", []edit{{sp, `default: "0.0.0.0/0, ::/0", shapes`, `advanced: true, shapes`}}, nil, "INGEST_SOURCES is advanced, never asked"},
 		{"allow input required", []edit{{sp, `default: "0.0.0.0/0, ::/0", shapes`, `required: true, shapes`}}, nil, "INGEST_SOURCES is required: empty is how the front"},
 		{"publish ca volume undeclared", []edit{{sp, "publish_ca: { volume: ca }", "publish_ca: { volume: cacerts }"}}, nil, `front.publish_ca.volume: "cacerts" is not a volume`},
+		{"publish ca volume of root", []edit{{sp, "    certs:    { uid: 0, keep_on_reset: true }\n", "    certs:    { uid: 0, keep_on_reset: true }\n    ca:       { uid: 0 }\n"}}, nil, "front.publish_ca.volume: ca's uid is 0 (data.volumes.ca.uid): the front"},
 		{"publish ca without a CA mode", []edit{{sp, "tls_modes: [acme, dns-cloudflare, byo, internal, none]", "tls_modes: [acme, dns-cloudflare, none]"}}, nil, "front.publish_ca: no mode offered has a CA to publish"},
 		{"advanced with default", []edit{{sp, `prompt: "Log level (debug, info, warning)", advanced: true`, `prompt: "Log level (debug, info, warning)", default: info, advanced: true`}}, nil, "inputs[9].advanced: an advanced input is never asked"},
 		{"advanced without compose default", []edit{{cp, "${LOG_LEVEL:-info}", "${LOG_LEVEL}"}}, nil, "${LOG_LEVEL} is an advanced input, recorded only when given"},

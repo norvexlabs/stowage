@@ -164,7 +164,7 @@ func TestK8sHookOfAFileInputNoLongerAskedHere(t *testing.T) {
 	if _, ok := env[spec.FileVar("CA")]; ok {
 		t.Errorf("a path to no file: %v", env)
 	}
-	if n := len(e.container("provision")["volumeMounts"].([]any)); n != 1 {
+	if n := len(e.container("provision")["volumeMounts"].([]any)); n != 2 { // its scratch and /tmp
 		t.Errorf("mounts %v", e.container("provision")["volumeMounts"])
 	}
 }
@@ -701,7 +701,7 @@ func TestK8sHookWithoutAFileInputMountsNone(t *testing.T) {
 	if err := e.installer(func(o *Options) { o.NoProvision = false }).K8sInstall(context.Background()); err != nil {
 		t.Fatalf("%v\n%s", err, e.log)
 	}
-	if strings.Contains(strings.Join(toStrings(e.container("provision")["command"]), " "), "inputs") || len(e.container("provision")["volumeMounts"].([]any)) != 1 {
+	if strings.Contains(strings.Join(toStrings(e.container("provision")["command"]), " "), "inputs") || len(e.container("provision")["volumeMounts"].([]any)) != 2 {
 		t.Errorf("mounts %v", e.container("provision")["volumeMounts"])
 	}
 }
