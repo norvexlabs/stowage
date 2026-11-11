@@ -1044,7 +1044,7 @@ SBOM of a digest is made once: a later syft makes no new one, and a digest that 
 one (a pulled image's included) keeps it, so a document added to a built image is merged when the
 image is next built (a new digest). An attestation never counts as a
 signature. A signing release also carries the scanner `<short>-stow audit` runs: grype v0.121.3,
-built by `ship` (`image audit: build`) from grype's source with Go 1.27.3 and the modules raised
+built by `ship` (`image audit: build`) from grype's source with Go 1.27.4 and the modules raised
 past a published vulnerability (a recipe embedded in `stowage`, its base pinned by digest, the
 binary and the CA certificates on an empty image, laid out as grype's own image), published as the
 image `audit` (`<prefix>/<name>-audit`), signed and attested as every image, and found again by its

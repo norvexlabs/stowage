@@ -6,7 +6,7 @@
 # Caddy, the plugins and the modules raised past a published vulnerability by version.
 # Never Caddy 2.11.6: it cuts the response to any request that carries a body at 60 s.
 # Caddy is cross-compiled on the publisher's own platform, never under emulation.
-FROM --platform=$BUILDPLATFORM caddy:2.11.9-builder@sha256:3fddbec729442a56b942d4c9eaef1df80893dbf2cf5b86701bfae6aad1408eeb AS builder
+FROM --platform=$BUILDPLATFORM caddy:2.11.9-builder@sha256:1b828679ae08622c534d8e83ed80c6c25d343202f0586fe3b52d8e0ce33413b9 AS builder
 ARG TARGETOS TARGETARCH
 RUN GOOS=$TARGETOS GOARCH=$TARGETARCH xcaddy build v2.11.9 --with github.com/caddy-dns/cloudflare@v0.2.4 --with github.com/mholt/caddy-l4@v0.1.2 \
       --replace golang.org/x/net=golang.org/x/net@v0.62.0 --replace github.com/go-jose/go-jose/v4=github.com/go-jose/go-jose/v4@v4.1.7 \

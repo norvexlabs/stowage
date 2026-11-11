@@ -32,7 +32,7 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
      4.1.7 over 4.1.6, klauspost/compress 1.20.2 over 1.20.1) and the scanner over grype 0.121.3
      (go-jose 4.1.7 over 4.1.6); the backup runner, rclone 1.76.0, has none. The
      canonical form is a later upstream release that carries the module at that version or later.
-     Move the recipe to that release and drop its `--replace` / `go get`. Checked 2026-11-09:
+     Move the recipe to that release and drop its `--replace` / `go get`. Checked 2026-11-11:
      Caddy 2.11.9 carries chi 5.4.0, rclone 1.76.0 x/net, chi, compress, brotli and grpc 1.84.0
      (past GO-2026-6443, which hit the 1.84.0-dev snapshot 1.75.1 shipped), grype 0.121.3 x/net,
      compress and brotli — those raises are gone.
@@ -43,7 +43,7 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
      Alpine's mirror serves at build time, so the recipe's digest no longer decides the image. The
      canonical form is a base image whose own build carries the fix: repin its digest and drop the
      raise. `examples/minimal`'s `ref` postgres and the suites' pinned PG carry the same zlib, with
-     no raise. Checked 2026-11-09: Alpine 3.24's repository serves zlib 1.4-r0 (CVE-2026-4738 fixed,
+     no raise. Checked 2026-11-11: Alpine 3.24's repository serves zlib 1.4-r0 (CVE-2026-4738 fixed,
      per its security database), but the latest builds of alpine 3.24.4, caddy 2.11.9-alpine,
      python 3.13-alpine and postgres 18-alpine still ship zlib 1.3.2-r1; postgres 18-alpine's gosu
      is still 1.19 built with Go 1.24.6.
@@ -56,7 +56,7 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
      GO-2026-5932, fixed only in a pseudo-version after 0.58.0 — take the first tagged release.
    - The audit allowances in `examples/full/audit-allow.yaml` (the OS bundle's containerd/runc,
      until 2027-01-31; see the Should entry): removed once Docker ships fixed builds. Checked
-     2026-11-09: Docker's containerd.io 2.4.2-3 is containerd v2.4.2 (x/net 0.58.0) with runc v1.5.2
+     2026-11-11: Docker's containerd.io 2.4.2-3 is containerd v2.4.2 (x/net 0.58.0) with runc v1.5.2
      (x/net 0.55.0), upstream's latest: no fix yet.
 
    How: before every release, run `make self-audit` and the e2e suites' ships and read each
@@ -579,6 +579,11 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
   `--registry` / `--image-registry` the operator gave.
 
 ## Could
+
+- **A bind input refuses a loopback address the loopback answers on but does not carry**: an L4
+  route's bind input must be an address an interface carries, so `127.0.0.2` is refused although
+  Linux's loopback answers on all of `127.0.0.0/8` and Docker publishes on it. Accept an address
+  inside a loopback interface's prefix.
 
 - **A failed first install removes its lock under waiters**: a first install that fails after
   taking the lock removes its directory (`RemoveAll`), lock file included, while a second run

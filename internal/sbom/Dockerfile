@@ -5,7 +5,7 @@
 # `stowage ship` builds it for each signing project and publishes it next to the project's images;
 # this file's bytes are its inputs. The base is pinned by digest. grype is cross-compiled on the
 # publisher's own platform, and its version read from its build information, never run there.
-FROM --platform=$BUILDPLATFORM golang:1.27.3-alpine@sha256:fa3d596898d9f126af7c01d14ee7597bab3f39cccf392ef36b69fe77cd681f18 AS builder
+FROM --platform=$BUILDPLATFORM golang:1.27.4-alpine@sha256:0a5f7fe796599ff487605987432e7619ae45beeb2fba4c2ce0b907879932aebf AS builder
 ARG TARGETOS TARGETARCH
 RUN apk add --no-cache ca-certificates
 WORKDIR /build

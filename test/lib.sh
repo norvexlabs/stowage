@@ -586,9 +586,9 @@ remove_cluster() {
 	[[ -n ${REG:-} ]] || return 0
 	docker images --format '{{.Repository}}:{{.Tag}}' --filter "reference=$REG/${NAME:-notes}/*" | xargs -r docker rmi >/dev/null 2>&1 || true
 }
-# docker_beside <installer script in $OP>: a Docker install of the project in $WORK/docker-site beside
-# a suite's cluster or VM, for handoffs between shapes: DOCKER_CTL its <short>-stow, run in
-# DOCKER_OPERATOR, the operator's environment the suite kept before k8s_tools.
+# docker_beside <installer script in $OP> [install argument]…: a Docker install of the project in
+# $WORK/docker-site beside a suite's cluster or VM, for handoffs between shapes: DOCKER_CTL its
+# <short>-stow, run in DOCKER_OPERATOR, the operator's environment the suite kept before k8s_tools.
 docker_beside() {
 	D=$WORK/docker-site
 	CLEANUP+=('remove_install')
@@ -596,7 +596,7 @@ docker_beside() {
 	APP_PORT=$(free_port)
 	API_PORT=$(free_port)
 	while [[ $API_PORT == "$APP_PORT" ]]; do API_PORT=$(free_port); done
-	(cd "$OP" && "${DOCKER_OPERATOR[@]}" sh "$1" --no-input --dir "$D" --ports "app=$APP_PORT,api=$API_PORT" --set ADMIN_EMAIL=admin@notes.test) \
+	(cd "$OP" && "${DOCKER_OPERATOR[@]}" sh "$1" --no-input --dir "$D" --ports "app=$APP_PORT,api=$API_PORT" --set ADMIN_EMAIL=admin@notes.test "${@:2}") \
 		>"$WORK/docker-site.log" 2>&1 || { cat "$WORK/docker-site.log"; fail "the Docker install beside"; }
 }
 # kit_code <kit create's log> <file>: the code that log printed, in that file, 0600.

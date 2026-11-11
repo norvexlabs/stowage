@@ -103,9 +103,9 @@ import sys
 path = sys.argv[1]
 s = open(path).read()
 for old, new in [
-    ("\nhealth:\n", "\nl4:\n  routes:\n    - { name: db, protocol: tcp, port: 5432, upstream: postgres:5432, allow_input: DB_SOURCES }\n\nhealth:\n"),
+    ("\nhealth:\n", "\nl4:\n  routes:\n    - { name: db, protocol: tcp, port: 5432, upstream: postgres:5432, allow_input: DB_SOURCES, bind_input: DB_BIND }\n\nhealth:\n"),
     ("  - { key: ADMIN_EMAIL, prompt: \"Administrator email\", required: true }\n",
-     "  - { key: ADMIN_EMAIL, prompt: \"Administrator email\", required: true }\n  - { key: DEPLOY_TOKEN, prompt: \"Token of the second site\", secret: true, optional: true }\n  - { key: DB_SOURCES, prompt: \"Sources the firewall lets reach the database\", shapes: [docker, kairos] }\n"),
+     "  - { key: ADMIN_EMAIL, prompt: \"Administrator email\", required: true }\n  - { key: DEPLOY_TOKEN, prompt: \"Token of the second site\", secret: true, optional: true }\n  - { key: DB_SOURCES, prompt: \"Sources the firewall lets reach the database\", shapes: [docker, kairos] }\n  - { key: DB_BIND, prompt: \"Host address the database is published on\", advanced: true, shapes: [docker, kairos] }\n"),
     ("  loopback_ports: { app: 8080, api: 8000 }\n", "  loopback_ports: { app: 8080, api: 8000 }\n  publish_ca: { volume: ca }\n"),
     ("    uploads:  { uid: 1000 }\n", "    uploads:  { uid: 1000 }\n    ca:       { uid: 1000 }\n"),
     ("\n\nbackup:\n",
@@ -146,7 +146,9 @@ NS=notes
 start_kind
 installer v1.sh beta-1.0.0
 ctl v1.sh k8s install --no-input --set ADMIN_EMAIL=admin@notes.test --timeout 5m >"$WORK/k8s-install.log" 2>&1 || { cat "$WORK/k8s-install.log"; cluster_logs >&2; fail "k8s install beside the VMs"; }
-docker_beside v1.sh
+# Its L4 route on the address the VM reaches this host at alone (an address of this host, as a bind
+# input's must be): this host's 127.0.0.1:5432 may be another stack's.
+docker_beside v1.sh --set "DB_BIND=$MIRROR_IP"
 # A CA and a certificate of the routes' domains, which the second VM's kit carries.
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout "$WORK/site-ca.key" -out "$WORK/site-ca.pem" -days 2 -subj "/CN=second site CA" \
 	-addext basicConstraints=critical,CA:TRUE -addext keyUsage=critical,keyCertSign 2>/dev/null &&

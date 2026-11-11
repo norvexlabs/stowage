@@ -50,6 +50,11 @@ follow [SemVer](https://semver.org/).
 - `vm seed` given a secret input on its command line refuses it as a seed (exit 3), and `vm create`
   refuses one there with exit 3 too, naming no fix.
 
+### Security
+
+- Built with Go 1.27.4 (net/http HTTP/1 server fix GO-2026-6859): Stowage's own binaries, the
+  front (Caddy built from source), the backup runner and the scanner.
+
 ## [0.33.2] - 2026-11-10
 
 ### Fixed
