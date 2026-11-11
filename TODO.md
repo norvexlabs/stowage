@@ -22,63 +22,48 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
    operator's own registry sign-in where the mirror asks for one), their signatures checked against
    the release keys as `upgrade --version` checks them; nothing newer is said so.
 
-### Security — from a consumer's audit of the VM (0.33.2, seen on two installed VMs)
+### Security — the VM's firewall and the services Stowage adds
 
-1. **IPv6 forwarding between `host.interfaces` roles is unfiltered**: the forward rules (each
-   role's traffic out, the replies back, nothing new into the role) rely on Docker's FORWARD
-   policy, DROP for IPv4 only. On the VMs `ip6 filter FORWARD` is `policy accept`, and so is the
-   project table's own forward chain (`inet <name>`, priority filter - 1): under IPv6 the
-   STOWAGE-FORWARD accepts change nothing and nothing drops the rest. On a VM whose roles forward
-   with IPv6 forwarding on (a gateway), a neighbour on the uplink routes new IPv6 flows through it,
-   into the inside roles or back out. Enforce "nothing new into the role" on both families in
-   Stowage's own table — its forward chain drops what is forwarded between non-bridge interfaces
-   and is neither a declared role pair nor a reply — instead of leaving it to Docker's policy; an
-   e2e-vm check over IPv6 proves it.
-2. **The front runs as root with Docker's default capabilities**: Caddy has uid 0, CapEff/CapBnd
-   `a80425fb`, NoNewPrivs 0; the generated front service sets no `user`, `cap_drop` or
-   `security_opt` (the provision service does). It is every install's one Internet-facing process,
-   holds the TLS keys, the DNS-01 token (environment) and the internal CA, and reaches from the
-   stack network every host-network port the firewall opens to `br-*`. Give it `cap_drop: [ALL]`
-   (plus `NET_BIND_SERVICE` only while it binds ports under 1024), `no-new-privileges`, a non-root
-   user where its volumes allow, and a read-only root filesystem.
-3. **A front serving L4 routes alone opens 80 and 443 in TLS modes that need neither**: on a VM
-   installed with `--tls internal` whose only route is an `l4` route with `tls`, the input chain
-   accepts `tcp dport { 80, 443 }` and Docker publishes both; the front answers 404 there. Open
-   80/443 only when a front route is served or the TLS mode needs them (`acme`'s challenge): none
-   for `internal`, `byo` and `dns-cloudflare` with no HTTP route.
+1. **`host.interfaces.<role>.forward` is enforced on IPv4 alone**: the role's traffic out and its
+   replies back are accepted, and what is not declared relies on the Docker engine's FORWARD
+   policy, which drops on IPv4 only (`ip6 filter FORWARD` is `policy accept`, as is the stack's own
+   forward chain): on a VM forwarding IPv6, a neighbour routes new flows through it, into a role or
+   back out. What a role does not forward is dropped on both address families by Stowage's own
+   table, whatever the engine's FORWARD policy is (README's "DROP for IPv4 and IPv6" holds then);
+   e2e-vm proves it over IPv6.
+2. **One confinement for every service Stowage adds**: `stowage-provision` runs with `cap_drop:
+   [ALL]` and `no-new-privileges`; the front runs as root with Docker's default capabilities. Every
+   service Stowage adds to a stack (the front, the provision service, any later one) gets the same
+   rule: no capability beyond what it needs (`NET_BIND_SERVICE` while it binds a port under 1024),
+   `no-new-privileges`, a non-root user where its volumes allow, a read-only root filesystem.
+3. **The firewall opens a port only when the spec declares something serving on it**: a front
+   serving L4 routes alone opens 80 and 443 in every TLS mode, and the front answers 404 there.
+   Open the front's ports as an L4 route's are: only when a front route serves on them in the
+   install's TLS mode, or the mode itself needs them (`acme`'s HTTP-01 challenge).
 
-Known and accepted risks, no entry: SSH open to every source without `--ssh-allow` and
-NOPASSWD sudo for the admin group, the shared baked pull credential, secrets as environment
-variables.
+### Features — the firewall's roles, secrets, pull credentials, logins
 
-### Features — from the same consumer's audit
-
-1. **`front.interfaces`: the front held to several roles, on every path**: `front.interface` takes
-   one `host.interfaces` role or every interface. A gateway VM serves its front to clients on two
-   inside roles (a VPN tun and a client LAN) and must not answer on the uplink; with one role it
-   falls back to a route's `allow_input`, which the front checks after the TCP handshake and which
-   every IPv6 client passes as the stack network's gateway while the stack's IPv6 is off. Take
-   `front.interfaces: [roleA, roleB]` (one `iifname { … } tcp dport { http, https } accept`), linted
-   as `l4.routes[].interfaces` (an undeclared role, one given twice, an empty list are errors), and
-   say what `acme`'s HTTP-01 then needs. The rule must hold the front itself: today `openPorts`
-   writes the role's match into the input chain alone, while the front is a bridged container
-   published on every address, its 80/443 DNAT'd through forward (`policy accept`), so it answers
-   on every NIC (security audit 2026-10-26, Medium). Drop DNAT'd http/https arriving on another
-   interface in forward (or `DOCKER-USER`), or publish the front on the roles' addresses; e2e-full-vm
-   connects from a role left out rather than grepping the rule text.
-2. **Secrets as files, and a pull account per install**: (a) a generated secret (`secrets:`) or a
-   `secret: true` input reaches a service only as an environment variable, so it is in `docker
-   inspect`, in every child's environment and in the process parsing untrusted content; file
-   inputs serve operator-given files alone. Let the compose file take a secret as a mounted file
-   (0400, tmpfs) — `STOWAGE_SECRET_FILE_<KEY>`, as `STOWAGE_INPUT_FILE_<KEY>` is; a mounted Secret
-   on Kubernetes. (b) Every installer and OS image carries the project's one pull account: give
-   each install its own pull credential, or a short-lived one, so one leaked installer does not
-   read every image of the project.
-3. **A generated login shown at first use**: `secrets` has `set`, `rotate` and `export`, none
-   showing a value, so an operator whose first sign-in needs a `settable` generated password (a
-   route's `basic_auth`, a service's login) reads `<dir>/.env` as root. End the first install with
-   where each settable login is read (never the value in a log), and offer `secrets show KEY` for a
-   `settable` secret, on a terminal only, as root.
+1. **`front.interfaces`, as `l4.routes[].interfaces`**: the front's ports scoped to roles exactly as
+   a route's are — the same key shape, the same lint (an undeclared role, one given twice, an empty
+   list are errors), the same firewall rule form (`iifname { … }`) — so one notion of "the roles a
+   port is open on" covers both; it replaces `front.interface`'s single role (no compat before 1.0).
+   The rule must hold the front itself: today the role's match is written into the input chain
+   alone, while the front is a bridged container published on every address and its 80/443 are
+   DNAT'd through forward, so it answers on every NIC. Hold the DNAT'd ports to the roles in
+   Stowage's table (or publish on the roles' addresses), and say what `acme`'s HTTP-01 needs then;
+   e2e-full-vm connects from a role left out.
+2. **Secrets as files**: the file-input mechanism (`STOWAGE_INPUT_FILE_<KEY>`, 0600, mounted
+   read-only) extended to `secrets:` and `secret: true` inputs, opted in per key in the spec, on
+   Docker and the VM, and as a Secret volume on Kubernetes — not a new delivery path: an
+   environment variable is in `docker inspect`, in every child's environment and in whatever
+   process parses untrusted input.
+3. **A pull credential per install**: issued at install time by what the `registry.pull` provider
+   can mint, the account baked into installers and OS images staying the fallback of a provider
+   that cannot; one leaked installer then reads no other install's images.
+4. **One verb shows a `settable` secret**: `secrets` sets, rotates and exports, but shows none, so
+   an operator reads `<dir>/.env` as root for a generated login. One verb for every `settable`
+   secret (root, a terminal only, never logged), and the install's closing report naming the
+   logins that exist and that verb.
 
 ### Supply chain — stopgaps back to canonical
 
