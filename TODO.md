@@ -66,8 +66,12 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
    revocation (recommended where the registry has such accounts); (b) the registry's token auth:
    a per-install long-lived secret exchanged for short-lived pull tokens, the token service the
    registry's; (c) one pull account per channel or per customer, chosen at `ship` — coarser, but
-   no issuing step. Revoking one install's credential leaves every other install pulling; an
-   install without one keeps the baked account.
+   no issuing step; (d) the operator mints the per-install token in the registry and Stowage only
+   takes it per install (a `kit`/install flag, recorded like a secret, replaced by a re-run) — the
+   same containment with no registry API in Stowage. Revoking one install's credential leaves
+   every other install pulling; an install without one keeps the baked account. Not in 0.35.0
+   (user, 2026-11-11): (a) needs a `registry.pull` mint operation per registry, an issuing
+   credential, revocation and a fallback.
 ### Supply chain — stopgaps back to canonical
 
 1. **Check every stopgap at each release, and drop each one the upstream has caught up with**:
