@@ -27,8 +27,18 @@ follow [SemVer](https://semver.org/).
   uninstall`'s, which does not tell what helm keeps) — so a program tells "nothing installed here"
   from any other refusal.
 
+- `vm seed --json` gives what a tool creating the VM itself would otherwise rebuild: the NoCloud
+  `meta_data`, each disk's sizes (`os_gib`, `disk_gib`, with `app_gib`), the cloud image name a
+  `ship --disks` registered from it, and with `--disk-dir` the disk itself as a file. Its first
+  install can wait for a secrets export (`--await-secrets`) or a `byo` certificate (`--tls byo`)
+  given over SSH. A refusal prints its object on standard output.
+- `vm host-key HOSTNAME --json` reads a VM's own SSH host key through the key it is checked by
+  and retires its seed's one-time key at once.
+
 ### Changed
 
+- `vm create` and `vm seed` of a release whose front offers no TLS mode a VM is made with refuse
+  it (exit 3) instead of failing, `vm seed` naming `--tls byo` where the release offers it.
 - `k8s uninstall` with no release refuses naming another tool's objects of the release's names it
   finds there.
 

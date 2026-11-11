@@ -197,3 +197,14 @@ func TestPreloadTagNamesTheDigest(t *testing.T) {
 		t.Errorf("got %s", got)
 	}
 }
+
+// A cloud image's name is the project's and the sha256 digest's first 12 hex digits; another
+// algorithm, or a digest too short, names none.
+func TestCloudImageName(t *testing.T) {
+	t.Parallel()
+	for digest, want := range map[string]string{"sha256:0123456789abcdef": "notes-0123456789ab", "sha256:0123456789ab": "notes-0123456789ab", "sha256:0123456789a": "", "sha512:0123456789abcdef": "", "sha256:0123": "", "0123456789abcdef0123": ""} {
+		if got := CloudImageName("notes", digest); got != want {
+			t.Errorf("%s: %q, want %q", digest, got, want)
+		}
+	}
+}

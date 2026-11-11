@@ -410,7 +410,7 @@ func TestVMSeed(t *testing.T) {
 				mod(o)
 			}
 		})
-		return in.SeedVM(context.Background(), &VMCreate{Platform: platform, Hostname: "notes-1", User: "ops", SSHKey: v.key}, channel)
+		return in.SeedVM(context.Background(), &VMCreate{Platform: platform, Hostname: "notes-1", User: "ops", SSHKey: v.key}, SeedOptions{Channel: channel})
 	}
 	s, err := seed(nil, "beta")
 	if err != nil || asked.n != 0 {
