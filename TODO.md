@@ -47,7 +47,7 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
    80/443 only when a front route is served or the TLS mode needs them (`acme`'s challenge): none
    for `internal`, `byo` and `dns-cloudflare` with no HTTP route.
 
-Known and kept in THREAT_MODEL.md, no entry: SSH open to every source without `--ssh-allow` and
+Known and accepted risks, no entry: SSH open to every source without `--ssh-allow` and
 NOPASSWD sudo for the admin group, the shared baked pull credential, secrets as environment
 variables.
 
