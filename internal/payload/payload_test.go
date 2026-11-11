@@ -3,6 +3,7 @@ package payload
 import (
 	"bytes"
 	"errors"
+	"github.com/norvexlabs/stowage/internal/testutil"
 	"os"
 	"path/filepath"
 	"testing"
@@ -15,7 +16,7 @@ func write(t *testing.T, exe []byte, files Files) string {
 		t.Fatal(err)
 	}
 	p := filepath.Join(t.TempDir(), "installer")
-	if err := os.WriteFile(p, buf.Bytes(), 0o755); err != nil {
+	if err := testutil.WriteExecutable(p, buf.Bytes()); err != nil {
 		t.Fatal(err)
 	}
 	return p
@@ -45,11 +46,11 @@ func TestRoundTrip(t *testing.T) {
 
 func TestNoPayload(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "plain")
-	_ = os.WriteFile(p, []byte("just a binary, long enough to hold a trailer"), 0o755)
+	_ = testutil.WriteExecutable(p, []byte("just a binary, long enough to hold a trailer"))
 	if _, err := Read(p); !errors.Is(err, ErrNone) {
 		t.Fatalf("got %v", err)
 	}
-	_ = os.WriteFile(p, []byte("x"), 0o755)
+	_ = testutil.WriteExecutable(p, []byte("x"))
 	if _, err := Read(p); !errors.Is(err, ErrNone) {
 		t.Fatalf("short file: %v", err)
 	}
@@ -67,7 +68,7 @@ func TestRefusesACorruptLength(t *testing.T) {
 	p := write(t, []byte("exe"), Files{Release: []byte("{}")})
 	raw, _ := os.ReadFile(p)
 	raw[int64(len(raw))-trailer] = 0xff // a length far beyond the file
-	_ = os.WriteFile(p, raw, 0o755)
+	_ = testutil.WriteExecutable(p, raw)
 	if _, err := Read(p); err == nil || errors.Is(err, ErrNone) {
 		t.Fatalf("got %v", err)
 	}

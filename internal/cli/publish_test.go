@@ -344,7 +344,7 @@ func TestCloudSettings(t *testing.T) {
 	if _, _, err := o.clouds(p, t.TempDir()); err == nil || !strings.Contains(err.Error(), "tofu is not on PATH") {
 		t.Errorf("no tofu: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(os.Getenv("PATH"), "tofu"), []byte("#!/bin/sh\n"), 0o755); err != nil {
+	if err := testutil.WriteExecutable(filepath.Join(os.Getenv("PATH"), "tofu"), []byte("#!/bin/sh\n")); err != nil {
 		t.Fatal(err)
 	}
 	up, vars, err := o.clouds(p, t.TempDir())

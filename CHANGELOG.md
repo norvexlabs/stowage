@@ -40,11 +40,29 @@ follow [SemVer](https://semver.org/).
   is in its own Secret (`stowage.secretFiles`), never in the release's, so `envFrom` cannot reach
   it; the provision hook gets it as a file on every shape. `describe --json` gives `as_file`.
 
+- `vm seed --json` gives what a tool creating the VM itself would otherwise rebuild: the NoCloud
+  `meta_data`, each disk's sizes (`os_gib`, `disk_gib`, with `app_gib`), the cloud image name a
+  `ship --disks` registered from it, and with `--disk-dir` the disk itself as a file. Its first
+  install can wait for a secrets export (`--await-secrets`) or a `byo` certificate (`--tls byo`)
+  given over SSH. A refusal prints its object on standard output.
+- `vm host-key HOSTNAME --json` reads a VM's own SSH host key through the key it is checked by
+  and retires its seed's one-time key at once.
+
 ### Changed
 
 - `front.interface` (one role) is `front.interfaces` (a list, as an L4 route's): `interfaces:
   [uplink]`.
-
+- On the VM, a verb run before the first install is a refusal (exit 3) whose `--json` result says
+  `absent`, as on Docker and Kubernetes; its `status --json` reports the first install's registry,
+  installer short name, loopback address and registry CA digest, as Docker's.
+- The Kubernetes refusals of a missing release read one way on every verb: the install to run,
+  with what the run was given that it takes (the mirror, its CA, `--image-pull-login`, the values
+  files, `--unsafe-sysctls`, `--no-provision`), as reason and fix; `k8s upgrade --version V` names the version
+  asked. A Docker host's `backup`, `backup config` or `restore` with a `--dir` that does not
+  exist is refused the same way, instead of failing on the daemon's lock, and whatever fails as
+  that daemon starts is reported as itself, never as an unreachable daemon.
+- `vm create` and `vm seed` of a release whose front offers no TLS mode a VM is made with refuse
+  it (exit 3) instead of failing, `vm seed` naming `--tls byo` where the release offers it.
 - `k8s uninstall` with no release refuses naming another tool's objects of the release's names it
   finds there.
 

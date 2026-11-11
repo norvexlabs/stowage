@@ -283,6 +283,10 @@ type Status struct {
 	// restore again finishes.
 	VolumesSplit bool   `json:"volumes_split,omitempty"`
 	Channel      string `json:"channel,omitempty"`
+	// Registry and FirstInstall are what the install's first run recorded, as Docker's status
+	// --json gives them; left out before the first install.
+	Registry string `json:"registry,omitempty"`
+	FirstInstall
 	// Tune is the stack's tuning profile, and whose it is: "network (operator)".
 	Tune string `json:"tune,omitempty"`
 	Disk *Disk  `json:"disk,omitempty"`
@@ -703,6 +707,9 @@ func replyErr(w http.ResponseWriter, err error) {
 		if r.Fix != "" {
 			body["fix"] = r.Fix
 		}
+		if r.Absent {
+			body["absent"] = true
+		}
 	}
 	reply(w, code, body)
 }
@@ -711,7 +718,7 @@ func replyErr(w http.ResponseWriter, err error) {
 func failAs(code int, err error) error {
 	he := httpError{code, err.Error()}
 	if r, ok := Refusal(err); ok {
-		return Refused{Reason: he.msg, Fix: r.Fix, cause: he}
+		return Refused{Reason: he.msg, Fix: r.Fix, Absent: r.Absent, cause: he}
 	}
 	return he
 }
@@ -746,12 +753,14 @@ func (h *Hostd) run() (*Installer, *bytes.Buffer) {
 	return &Installer{R: h.R, O: o}, &out
 }
 
-// installed opens the install; a 409 before the first install.
+// installed opens the install; before the first install, open()'s absent refusal (its fix the
+// shape's: the daemon's options say which), answered 409.
 func (h *Hostd) installed(in *Installer) (*EnvFile, error) {
-	if notInstalled(in) {
-		return nil, fail(http.StatusConflict, "%s is not installed yet: `sudo %s install` installs it", h.R.Spec.Name, filepath.Base(BundledCtl(h.R.Spec.Short())))
+	env, err := in.open()
+	if r, ok := Refusal(err); ok && r.Absent {
+		return nil, failAs(http.StatusConflict, err)
 	}
-	return in.open()
+	return env, err
 }
 
 // source opens what a release is looked up for: the install, or on the VM before its first install
@@ -839,6 +848,9 @@ func (h *Hostd) status(w http.ResponseWriter, r *http.Request) {
 		st.Installing, st.InstallFailed, _ = in.firstInstall()
 		st.RestoreAwaited = in.restoreAwaited()
 		st.Channel, _ = env.Get(ChannelVar)
+		// A registry CA that cannot be read is left out: the status always answers, and a poll
+		// logs nothing at each request.
+		st.Registry, st.FirstInstall, _ = readFirstInstall(env, in.O.Dir)
 		p, by := in.tuneProfile(func(k string) string { v, _ := env.Get(k); return v })
 		st.Tune = fmt.Sprintf("%s (%s)", p, by)
 		if mode, _ := env.Get("STOWAGE_TLS_MODE"); mode == "byo" {

@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"github.com/norvexlabs/stowage/internal/testutil"
 	"io"
 	"maps"
 	"net/http"
@@ -786,7 +787,7 @@ func TestK8sHookDropsAReturnTheReleaseRemoved(t *testing.T) {
 func hookScript(t *testing.T, body string) string {
 	t.Helper()
 	p := filepath.Join(t.TempDir(), "hook")
-	if err := os.WriteFile(p, []byte(body), 0o755); err != nil {
+	if err := testutil.WriteExecutable(p, []byte(body)); err != nil {
 		t.Fatal(err)
 	}
 	return p

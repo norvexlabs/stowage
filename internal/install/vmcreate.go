@@ -1356,7 +1356,9 @@ func (in *Installer) vmSettings(ctx context.Context) (*Settings, []string, *Give
 		}
 		mode = m
 		in.byo = nil
-		if mode == "byo" {
+		// A seed's byo install waits for its certificate over SSH: none is read here (SeedVM refuses
+		// one given, as the seed carries none).
+		if mode == "byo" && !in.seeding {
 			if in.byo, err = in.loadCert(ctx); err != nil {
 				return nil, nil, nil, err
 			}

@@ -17,7 +17,11 @@ func write(t *testing.T, dir, name, content string, mode os.FileMode) {
 	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(p, []byte(content), mode); err != nil {
+	write := func() error { return os.WriteFile(p, []byte(content), mode) }
+	if mode&0o111 != 0 { // a program the test runs: never held open for writing here
+		write = func() error { return testutil.WriteExecutable(p, []byte(content)) }
+	}
+	if err := write(); err != nil {
 		t.Fatal(err)
 	}
 }

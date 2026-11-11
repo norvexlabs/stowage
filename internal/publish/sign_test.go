@@ -53,7 +53,7 @@ func newFakeCosign(t *testing.T, reg string, auth authn.Authenticator) (*CosignS
 	t.Helper()
 	dir := t.TempDir()
 	bin := filepath.Join(dir, "cosign")
-	if err := os.WriteFile(bin, []byte(fakeCosign), 0o755); err != nil {
+	if err := testutil.WriteExecutable(bin, []byte(fakeCosign)); err != nil {
 		t.Fatal(err)
 	}
 	logf := filepath.Join(dir, "log")

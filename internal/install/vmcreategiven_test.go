@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/norvexlabs/stowage/internal/testutil"
 	"io"
 	"maps"
 	"os"
@@ -279,7 +280,7 @@ func TestVMCreateByHandGivesAByoCertificateAndASecretThroughAFile(t *testing.T) 
 	step = strings.ReplaceAll(step, "<address>", "192.0.2.9")
 	bin, seen := t.TempDir(), filepath.Join(t.TempDir(), "seen")
 	stub := "#!/bin/sh\nprintf '%s\\n' \"$*\" > " + seen + ".args\ncat > " + seen + ".stdin\nexit ${SSH_EXIT:-0}\n"
-	if err := os.WriteFile(filepath.Join(bin, "ssh"), []byte(stub), 0o700); err != nil {
+	if err := testutil.WriteExecutable(filepath.Join(bin, "ssh"), []byte(stub)); err != nil {
 		t.Fatal(err)
 	}
 	run := func(exit string) error {

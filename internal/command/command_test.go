@@ -3,6 +3,7 @@ package command
 import (
 	"context"
 	"errors"
+	"github.com/norvexlabs/stowage/internal/testutil"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,7 +14,7 @@ import (
 func script(t *testing.T, body string) Runner {
 	t.Helper()
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "c.sh"), []byte("#!/bin/sh\n"+body), 0o755); err != nil {
+	if err := testutil.WriteExecutable(filepath.Join(dir, "c.sh"), []byte("#!/bin/sh\n"+body)); err != nil {
 		t.Fatal(err)
 	}
 	return Runner{Root: dir, Config: Config{Cmd: []string{"./c.sh"}, TimeoutS: 5}}

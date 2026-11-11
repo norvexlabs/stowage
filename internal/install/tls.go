@@ -213,10 +213,13 @@ func (in *Installer) createModes() []string {
 // noCreateMode is the refusal of a project whose front offers `vm create` no mode, naming the fix.
 func (in *Installer) noCreateMode() error {
 	fix := ""
-	if slices.Contains(in.R.Spec.Front.TLSModes, "byo") {
+	switch {
+	case slices.Contains(in.R.Spec.Front.TLSModes, "byo") && in.seeding:
+		fix = ": give --tls byo, whose first install waits for the certificate, given over SSH once the VM answers"
+	case slices.Contains(in.R.Spec.Front.TLSModes, "byo"):
 		fix = ": give --cert and --key, whose key goes over SSH once the VM answers"
 	}
-	return fmt.Errorf("%s offers no TLS mode a VM can be created with: %s (loopback is not reached from outside the VM, and byo's key never goes in its cloud-config)%s", in.R.Spec.Name, strings.Join(in.R.Spec.Front.TLSModes, ", "), fix)
+	return refuse(strings.TrimPrefix(fix, ": "), "%s offers no TLS mode a VM can be created with: %s (loopback is not reached from outside the VM, and byo's key never goes in its cloud-config)%s", in.R.Spec.Name, strings.Join(in.R.Spec.Front.TLSModes, ", "), fix)
 }
 
 // domainMode is the mode a domain given without --tls picks: acme when offered, else the first

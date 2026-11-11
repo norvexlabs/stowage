@@ -1130,7 +1130,7 @@ func vmCreateCommand(in *Installer, o *Options, prepare func() error, terminal f
 	af.DurationVar(&at.Wait, "wait", 0, "how long to wait for the VM to answer over SSH after its power cycle (default 10m)")
 	_ = attach.MarkFlagRequired("interface")
 	var sc VMCreate
-	var seedChannel string
+	var so SeedOptions
 	stdout := o.Out // the command's standard output, which the seed alone goes to
 	seed := &cobra.Command{
 		Use:   "seed",
@@ -1138,22 +1138,26 @@ func vmCreateCommand(in *Installer, o *Options, prepare func() error, terminal f
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			*takesTLS = true
-			if err := prepare(); err != nil {
-				return err
-			}
-			// Standard output is the seed's alone; nothing is asked.
-			in.O.Out, in.O.Prompt = in.O.Log, nil
-			s, err := in.SeedVM(cmd.Context(), &sc, seedChannel)
+			s, err := func() (*VMSeed, error) {
+				if err := prepare(); err != nil {
+					return nil, err
+				}
+				// Standard output is the seed's alone; nothing is asked.
+				in.O.Out, in.O.Prompt = in.O.Log, nil
+				return in.SeedVM(cmd.Context(), &sc, so)
+			}()
 			if err != nil {
-				return err
+				return printStatusRefused(stdout, err) // a refusal's object, as status --json's
 			}
 			return printJSON(stdout, s)
 		},
 	}
 	sf := seed.Flags()
 	machineFlags(sf, &sc, in.R.Spec, true)
-	sf.StringVar(&seedChannel, "channel", "", "the channel the VM's updates and upgrades follow (default: the release's, "+m.Channel+")")
-	sf.StringVar(&o.TLS, "tls", "", "how the VM's front serves: a mode the release offers a VM, never byo (its certificate goes over SSH, `install --given -`)")
+	sf.StringVar(&so.Channel, "channel", "", "the channel the VM's updates and upgrades follow (default: the release's, "+m.Channel+")")
+	sf.StringVar(&o.TLS, "tls", "", "how the VM's front serves: a mode the release offers a VM; byo makes the first install wait for the certificate, given over SSH (`install --given -`)")
+	sf.BoolVar(&so.AwaitSecrets, "await-secrets", false, "the first install waits for a decrypted secrets export, given over SSH once the VM answers (`install --secrets -`)")
+	sf.StringVar(&so.DiskDir, "disk-dir", "", "write --platform's disk into this directory, decompressed, and name it in the seed (disk_file)")
 	sf.StringSliceVar(domains, "domains", nil, "a route's domain, route=host: HTTPS")
 	sf.IntVar(&o.HTTPPort, "http-port", 0, "the VM's port a TLS front serves HTTP on (default the project's front.http_port, else 80)")
 	sf.IntVar(&o.HTTPSPort, "https-port", 0, "the VM's port a TLS front serves HTTPS on (default the project's front.https_port, else 443)")
@@ -1166,7 +1170,31 @@ func vmCreateCommand(in *Installer, o *Options, prepare func() error, terminal f
 	var seedJSON bool
 	sf.BoolVar(&seedJSON, "json", false, "print the seed as one JSON object (required: the seed is for a program)")
 	_ = seed.MarkFlagRequired("json")
-	vm.AddCommand(create, seed, destroy, attach, truenasCommand(os.Getenv))
+	var hk VMReach
+	hostKey := &cobra.Command{
+		Use:   "host-key HOSTNAME",
+		Short: "Read the VM's own SSH host key through the key it is checked by, retire its seed's one-time key, and print the VM's key as JSON",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			k, err := func() (*VMHostKey, error) {
+				if err := prepare(); err != nil {
+					return nil, err
+				}
+				in.O.Out = in.O.Log
+				hk.Host = args[0]
+				return in.HostKey(cmd.Context(), hk)
+			}()
+			if err != nil {
+				return printStatusRefused(stdout, err)
+			}
+			return printJSON(stdout, k)
+		},
+	}
+	reachFlags(hostKey.Flags(), &hk.User, &hk.SSHKey, &hk.Address, &hk.KnownHostsLine)
+	var hkJSON bool
+	hostKey.Flags().BoolVar(&hkJSON, "json", false, "print the key as one JSON object (required: it is for a program)")
+	_ = hostKey.MarkFlagRequired("json")
+	vm.AddCommand(create, seed, destroy, attach, hostKey, truenasCommand(os.Getenv))
 	if k := in.vmKitCommand(o, prepare, terminal); k != nil {
 		vm.AddCommand(k)
 	}

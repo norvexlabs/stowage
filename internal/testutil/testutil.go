@@ -2,6 +2,8 @@
 package testutil
 
 import (
+	"bytes"
+	"fmt"
 	"io/fs"
 	"os"
 	"os/exec"
@@ -176,4 +178,18 @@ func IsolateGit() func() {
 		os.Unsetenv(k)
 	}
 	return func() { os.RemoveAll(dir) }
+}
+
+// WriteExecutable writes data to path, mode 0755, through a child process, so this process never
+// holds the file open for writing: a child another goroutine forks inherits every descriptor the
+// process holds until it execs, and an executable some process holds open for writing cannot be
+// executed (ETXTBSY) — a shell then runs the next one PATH names, a real one. Every test writing a
+// program it runs writes it with this, never os.WriteFile.
+func WriteExecutable(path string, data []byte) error {
+	cmd := exec.Command("/bin/sh", "-c", `/bin/cat >"$1" && /bin/chmod 755 "$1"`, "sh", path) // absolute: a test may set its own PATH
+	cmd.Stdin = bytes.NewReader(data)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("write %s: %w: %s", path, err, out)
+	}
+	return nil
 }

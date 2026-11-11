@@ -478,7 +478,7 @@ a real registry, the local Docker engine, a kind cluster and a VM on TrueNAS
 | inputs digests and the build graph | |
 | installer (Docker): loopback and every TLS front (`acme`, `dns-cloudflare`, `byo`, `internal`), terminal form, `install`, re-run (changes the inputs and the front's ports), `status` (`--json`), `ps`, `logs`, `restart`/`stop`/`start`, `exec`, `schema`, `uninstall` (`--data`), `provision`, `script`, `upgrade` (`--version` fetches the release's installer), `rollback`, `reset-db`, `--dry-run`, `--offline`, a mirror and its CA (`--registry`, `--registry-ca`); `mirror export` / `mirror import` (a release carried as one file to a site without internet); `secrets rotate`, `secrets export` and `--secrets` (a machine made again) | scheduled backup, restore, chart library, `upgrade --reset-db` |
 | installer (Kubernetes): `<short>-stow k8s install`, `upgrade` (`--version`), `rollback`, `status` (`--json`), `reset-db`, `uninstall` (`--data`), `provision` (the hook as a Job after the release, its outputs in a Secret and handed back, `--set`), `secrets rotate`, `tune`, `--dry-run`, `--no-provision`, `--image-registry`, `--image-pull-login`, `--registry-ca`, `--unsafe-sysctls` | barrier pre-flight before `rollback` |
-| installer (Kairos VM): `<short>-stow vm create` (the disk image by digest, the cloud-config on a seed ISO or as user-data, the platform's steps; or the VM created with OpenTofu — TrueNAS's module, the previews for libvirt, Proxmox VE, vSphere, AWS, Google Cloud, Azure and Scaleway, or the operator's own holding the module contract — waited for until it installed; from a mirror whose CA the VM then trusts), `vm seed --json` (the first-boot material for a VM made by other means), `vm destroy` and `vm attach` (a NIC for a role a newer release names, on TrueNAS); `<short>-stow` in the OS bundle — the first install from the cloud-config's settings, `install` from the preloaded images, the boot (install up again, upgrade to the OS's release, back to the replaced one), `describe`, `--json` on `install`, `upgrade` and `rollback`, the host daemon and its verbs (`status` (`--json`), `health`, `events`, `ps`, `logs`, `restart`/`stop`/`start`, `provision`, `updates`, `upgrade`, `rollback` to the passive system, `reset-db`, `network` with its auto-revert, `backup` — scheduled, before an upgrade, or now, encrypted to age keys and uploaded with rclone; `verify` of proposed settings —, `restore`, `secrets export` and `rotate`, `reboot`, `shutdown`), its disk-pressure watch (`hooks.maintenance.disk_pressure`), its app socket for the services `host_api` names, the health gate judging each boot (Kairos boot assessment: an upgraded boot not healthy in time falls back to the passive system, unless going back is refused at a rollback barrier: it is then kept), a default-deny firewall (`vm create --ssh-allow`), the time zone (`--timezone`), a disaster recovery (`vm create --secrets`) | |
+| installer (Kairos VM): `<short>-stow vm create` (the disk image by digest, the cloud-config on a seed ISO or as user-data, the platform's steps; or the VM created with OpenTofu — TrueNAS's module, the previews for libvirt, Proxmox VE, vSphere, AWS, Google Cloud, Azure and Scaleway, or the operator's own holding the module contract — waited for until it installed; from a mirror whose CA the VM then trusts), `vm seed --json` (the first-boot material for a VM made by other means), `vm host-key` (its own host key, the seed's retired), `vm destroy` and `vm attach` (a NIC for a role a newer release names, on TrueNAS); `<short>-stow` in the OS bundle — the first install from the cloud-config's settings, `install` from the preloaded images, the boot (install up again, upgrade to the OS's release, back to the replaced one), `describe`, `--json` on `install`, `upgrade` and `rollback`, the host daemon and its verbs (`status` (`--json`), `health`, `events`, `ps`, `logs`, `restart`/`stop`/`start`, `provision`, `updates`, `upgrade`, `rollback` to the passive system, `reset-db`, `network` with its auto-revert, `backup` — scheduled, before an upgrade, or now, encrypted to age keys and uploaded with rclone; `verify` of proposed settings —, `restore`, `secrets export` and `rotate`, `reboot`, `shutdown`), its disk-pressure watch (`hooks.maintenance.disk_pressure`), its app socket for the services `host_api` names, the health gate judging each boot (Kairos boot assessment: an upgraded boot not healthy in time falls back to the passive system, unless going back is refused at a rollback barrier: it is then kept), a default-deny firewall (`vm create --ssh-allow`), the time zone (`--timezone`), a disaster recovery (`vm create --secrets`) | |
 
 ## Reference — for people and AI agents
 
@@ -2065,8 +2065,26 @@ again, to copy an installer to another host.
   Docker, no helm release in the namespace on Kubernetes (`k8s upgrade`, `--version` too, and `k8s
   rollback`; never `k8s uninstall`, whose "nothing to uninstall" does not tell what helm keeps of a
   release — read `k8s status --json`) — never an install of another project or a release not from
-  Stowage's chart, and never on the VM, whose host daemon answers its verbs
-  (its `status --json` answers before the first install, `installed` `null`). A run that
+  Stowage's chart. On the VM, a verb that needs the install, run before the first install (`ps`,
+  `logs`, `restart`, `backup run`, `restore`, `rollback`, …), is refused, `absent` true (`<name>
+  is not installed yet: \`sudo <short>-stow install\` installs it`, its fix `sudo <short>-stow
+  install`, exit 3): the host daemon answers it 409 with `absent` and the verb's client carries
+  it; `upgrade` and `updates` still serve a VM whose first install did not run or was refused
+  (below), and `status --json` answers before the first install, `installed` `null`. A Docker
+  host's `backup`, `backup config` and `restore` verbs answer the same refusal with Docker's
+  words and fix (`<dir> holds no install`, the directory absolute, `install first, or give the
+  --dir of the install`) for a `--dir` that does not exist, is no directory or lies under a file,
+  before the daemon of their process is made (nothing is made there); whatever fails as that
+  daemon is made is reported as itself (an interruption, an exit status kept), never as an
+  unreachable daemon. A `--dir` that is a directory is the verb's to judge (its daemon's lock
+  files are made there first): the backup timer's `backup run` still skips one whose install is
+  not made. The k8s refusal of a missing release is one on every verb: its reason and its fix
+  name the install to run, with what this run was given that the install takes
+  (`--image-registry`, `--registry-ca`, `--image-pull-login`, `--values`, `--unsafe-sysctls`,
+  `--no-provision`; never `--dry-run`, as the install named is the one to run, nor `--timeout`,
+  each verb's own), the fix adding `, given the inputs this run was given (…)` when it was given any
+  (never a value); `k8s upgrade --version V` says `… to upgrade to V`.
+  A run that
   fails prints no object, only its error. `upgrade --version --json` passes `--json` to the
   installer it fetches, which prints the object; the run that fetched it prints none and exits
   with that installer's status (an installer from before 0.34.0 refuses the flag).
@@ -4078,7 +4096,7 @@ A kit carries what one install issues to another (inputs, the front's TLS materi
 - A kit is taken by `--kit` on an install: its format, its code's sources and its refusals are under the Docker shape's `--kit`. Each `gives` key is checked by the target's installer: an input of another shape left out and said, one it does not declare refused.
 - `kit check` runs the handoff's `check` likewise, with the `STOWAGE_KIT_*` variables and its `env`, not what `ask` asked, its stdout thrown away unread and unbounded: `HANDOFF INSTANCE: proven` (exit 0), `unknown` (its exit 2, exit 2), `not proven (its check, or starting it, exited N)` (exit 1). A check stopped by its timeout, a check on Kubernetes that could not start or died by a signal (its Job records -1, its log saying why), a Job that fails altogether, an API server or Docker daemon that does not answer, a command's wrong arguments or flags and a handoff without `check` give no answer: `unknown` where it ran that far, exit 2, the reason on stderr (`error: …`), never read as not proven. On Docker and the VM, `docker compose` failing to start the check reads as its own exit status, so as not proven, the reason on stderr.
 - On the VM these go through the host daemon, on the operators' socket alone: `POST /v1/kits` (a `KitRequest`: `handoff`, `instance`, `answers`, `expires` in nanoseconds; answers `kit`, `code`, `log`, its only copy, the log cut at 1 MiB) and `POST /v1/kits/check` (`handoff`, `instance`; answers `exit`, `log`). The app's socket answers 403. The file is written where `kit create` runs. The VM's `kit create HANDOFF --json` writes no file: it reads that request (`instance`, `answers`, `expires`; strict, at most 1 MiB, one JSON object; a `handoff` other than the command's refused) on standard input and writes the daemon's answer (`kit`, `code`, `log`) as one JSON object on standard output; `--name`, `--expires`, `-o`, `--set` and `--answers` with it are refused. It is what `vm kit create` runs over SSH.
-- **`--known-hosts-line LINE`** (`vm kit create`, `check` and `take`, `vm attach`) gives the VM's SSH host key as one `known_hosts` line, `HOST KEYTYPE BASE64` (`vm seed --json`'s `known_hosts_line`, or the VM's own key checked on its console), in place of the key `vm create` recorded: a VM `vm create` did not make, or made elsewhere. That key alone is accepted, under the line's host name (`HostKeyAlias`, lower-cased), `StrictHostKeyChecking=yes`, never `accept-new`. The line is refused before any connection unless it holds one host name or address (`--known-hosts-line: its host field "…" is not one host name or address (no pattern, list, hashed name or [host]:port)`) and a key (`not a known_hosts line (HOST KEYTYPE BASE64)`), with no marker (`a host key, not a @cert-authority line`) and no second line (`one line`; one line end, LF or CRLF, is taken off). A `vm attach` message naming the command to run again carries the same `--known-hosts-line`, as it is written (below: its name lower-cased, its line end and any comment off). It is written to `$XDG_STATE_HOME/<name>/known-hosts/<its digest>` (`~/.local/state` by default; 0600, its directory 0700), the file ssh reads, which the `ssh` command a message gives names too. The one-time key of a seed retires once the VM's install is done and it rebooted: from then on, give the VM's own key.
+- **`--known-hosts-line LINE`** (`vm kit create`, `check` and `take`, `vm attach`, `vm host-key`) gives the VM's SSH host key as one `known_hosts` line, `HOST KEYTYPE BASE64` (`vm seed --json`'s `known_hosts_line`, or the VM's own key checked on its console), in place of the key `vm create` recorded: a VM `vm create` did not make, or made elsewhere. That key alone is accepted, under the line's host name (`HostKeyAlias`, lower-cased), `StrictHostKeyChecking=yes`, never `accept-new`. The line is refused before any connection unless it holds one host name or address (`--known-hosts-line: its host field "…" is not one host name or address (no pattern, list, hashed name or [host]:port)`) and a key (`not a known_hosts line (HOST KEYTYPE BASE64)`), with no marker (`a host key, not a @cert-authority line`) and no second line (`one line`; one line end, LF or CRLF, is taken off). A `vm attach` message naming the command to run again carries the same `--known-hosts-line`, as it is written (below: its name lower-cased, its line end and any comment off). It is written to `$XDG_STATE_HOME/<name>/known-hosts/<its digest>` (`~/.local/state` by default; 0600, its directory 0700), the file ssh reads, which the `ssh` command a message gives names too. The one-time key of a seed retires once the VM's install is done and it rebooted, or at once by `vm host-key`: from then on, give the VM's own key.
 - **`vm kit`**, on the operator's machine, reaches a VM `vm create` made over SSH as `vm attach` does (`--user`, `--ssh-key`, `--host`; strictly checked against the key `--known-hosts-line` gives, else the host key `vm create` recorded for that address in the VM's state directory, `known_hosts`, the address its alias (`HostKeyAlias`): ssh refuses another key, and an address it holds none for; a state with no such file is refused before any connection, naming the file a key checked on the VM's console goes in. `vm kit create` tries the link with ssh itself, running the sudo every run takes (`sudo -n <short>-stow --help`), before it asks anything or makes its file, so a VM ssh cannot reach, or whose key it refuses, costs no answer (`U@H does not answer over SSH, or does not run sudo without a password: … (--host, --user and --ssh-key reach it as vm create did; its key is the one in <file>; or its sudoers does not let the user run `<short>-stow` without a password)`); an empty `known_hosts` (an install finished by hand) is refused as none. The operator's global known hosts are never read on these links, nor on `vm create`'s, and `vm create` records the VM's key under that same alias (whatever the operator's ssh configuration makes of the name: `Port`, `HostName`), in the clear). `vm kit create HOSTNAME HANDOFF` takes `kit create`'s flags and checks, refuses a VM it cannot reach that way before it asks anything, asks what the handoff asks here, creates the kit's file here (0600, never over a file) before the run, then runs `sudo <short>-stow kit create HANDOFF --json` on the VM, the request on standard input (an answer, a secret one included, never on a command line, which the VM's process list and journal would show); the kit is written here and its code printed here, and neither touches the VM's disk. ssh failing, or an answer that does not read as a kit and a code (a field it does not know is no failure: the VM may run a newer release), writes no file and says what the run may have issued is lost. `vm kit check HOSTNAME HANDOFF INSTANCE` runs the VM's `kit check` and says its verdict as `kit check` does: its exit 0 and 1 are proven and not proven only with the verdict line it prints (`H I: proven`, `H I: not proven (its check, or starting it, exited N)`, whose N is said here as there), as `sudo` and ssh failing exit 1 or 255 too; its 2, ssh failing itself, a status without its verdict and any other status are unknown (exit 2), never not proven. `vm kit take HOSTNAME FILE|-` tries the link as `vm kit create` does, before it asks the code, then opens a kit here, its code from `--kit-code-file`, `STOWAGE_KIT_CODE` or the terminal (as `--kit`'s), refused here as `--kit` refuses one, and gives what it holds to `sudo <short>-stow install --given - --no-input` on the VM over SSH, the VM's install checking each input as `--given`'s (`installing on U@H over SSH with …`, the install's log following); the code never leaves this machine, and a failure names the `ssh` command over the same link (its options as the run's) running `sudo <short>-stow status`.
 - `k8s status` names a Secret an interrupted run left, not one holding a check's exit status alone (the next run clears that one) (`leftover  the Secret … holds what a handoff's run gave, a run under way or one interrupted: once none runs, kubectl delete job/… secret/… --ignore-not-found deletes it`), never its values; `k8s uninstall` deletes it and what stood beside it, for the handoffs the installer's release declares. A failure to read them is logged, and the status goes on.
 - After an install, each handoff is a tip: `` tip: `<short>-stow kit create NAME …` issues a kit for FOR: its install takes it with --kit FILE ``.
@@ -4218,26 +4236,41 @@ in the same installer (bootstrap it as above, then `sh <name>.sh vm create …`,
           [--vm-name N] [--pool P] [--dataset D] [--bridge B]
           [--cpus N] [--memory MiB] [--disk GiB] [--host H] [--wait DURATION]
           [--registry PREFIX] [--registry-ca FILE]
-<short>-stow vm seed --json [--platform P] [--hostname H] [--user U] [--ssh-key FILE] [--channel C]
+<short>-stow vm seed --json [--platform P] [--hostname H] [--user U] [--ssh-key FILE] [--channel C] [--await-secrets] [--disk-dir DIR]
           [the machine's flags, as vm create's: --network … --device DISK, --interface ROLE=SPEC…, --add-host NAME=IP…]
           [--tls MODE] [--domains route=host,…] [--http-port N] [--https-port N]
           [--set KEY=VALUE]… [--set-file KEY=PATH]… [--answers FILE] [--registry PREFIX] [--registry-ca FILE]
                                                    # a VM's first-boot material as JSON, the VM made by your own means
 <short>-stow vm destroy HOSTNAME [--yes] [--no-input] [--accessible]
 <short>-stow vm attach HOSTNAME --interface ROLE=SPEC [--user U] [--ssh-key FILE] [--host H] [--known-hosts-line LINE] [--wait DURATION]
+<short>-stow vm host-key HOSTNAME --json [--user U] [--ssh-key FILE] [--host H] [--known-hosts-line LINE]   # the VM's own SSH host key; the seed's one-time key retired
 <short>-stow vm kit create|check|take HOSTNAME … [--known-hosts-line LINE]   # a handoff kit issued on the VM or taken by it, over SSH (see "Handoff kits")
 ```
 
 - A project whose front offers no mode a VM can take (only `none`, or `byo` and no certificate given) is refused first, saying to give `--cert` and `--key` when it offers `byo`.
 - **`vm seed --json`** prints, as one JSON object, what a new VM needs at its first boot, for a
   tool that creates the VM with its own means (a hypervisor's or a cloud's own provider): it
-  writes no file, creates nothing and never asks. It takes `vm create`'s machine flags
+  creates nothing, never asks, and writes no file but the disk `--disk-dir` asks for. It takes `vm create`'s machine flags
   (`--platform`, required, `--hostname`, `--user`, `--ssh-key`, `--network` and its addressing,
   `--ipv6`, `--tune-profile`, `--ssh-allow`, `--timezone`, `--device`, `--interface`,
-  `--add-host`), the front's (`--tls`, never `byo`, `--domains`, `--http-port`, `--https-port`),
-  `--set`, `--set-file` and `--answers` (inputs that are not secret, and an answers file's `tls`
-  section), `--registry` and `--registry-ca`, and `--channel` (the channel the first install
-  follows; default the release's); `--json` is required. It is the seed `vm create --create
+  `--add-host`), the front's (`--tls`, `--domains`, `--http-port`, `--https-port`), `--set`,
+  `--set-file` and `--answers` (inputs that are not secret, and an answers file's `tls` section),
+  `--registry` and `--registry-ca`, `--channel` (the channel the first install follows; default
+  the release's), and its own: `--await-secrets` (the first install waits for a decrypted
+  `secrets export`, given over SSH once the VM answers, `sudo <short>-stow install --secrets -
+  --no-input`, as `vm create --secrets` makes it; a machine made again), `--tls byo` (it waits
+  for the certificate, its key and CA, and the secret inputs, given over SSH, `sudo <short>-stow
+  install --given - --no-input`, its front serving that certificate; the release must offer
+  `byo`), and `--disk-dir DIR` (an existing directory `--platform`'s disk is written into,
+  decompressed, as `vm create` fetches it; a file of that name already holding it is kept).
+  `--tls byo` with `--await-secrets` is refused (the first install waits for one of them), as is a
+  `--disk-dir` that is no directory, and a certificate, key, CA or client CA an answers file's
+  `tls` section gives (`none` aside; the seed takes none of `--cert`, `--key`, `--ca`,
+  `--client-ca`): the seed carries none (a path the file names that does not exist fails first,
+  as the answers file is read). A release whose
+  front offers no mode a VM is made with, but `byo`, is refused naming `--tls byo` as the fix (`vm
+  create`'s names `--cert` and `--key`; both exit 3). `disk_file`'s path is absolute, whatever
+  `--disk-dir` was given as; `--json` is required. It is the seed `vm create --create
   manual` writes, made by the same steps and refused as `vm create` refuses (a release with no
   OS bundle or no disk, a front with no mode a VM takes, `--platform` missing or not offered, an
   input missing or refused), and a secret input or TLS material given to it is refused, naming
@@ -4253,7 +4286,14 @@ in the same installer (bootstrap it as above, then `sh <name>.sh vm create …`,
     "known_hosts_line": "vm-seed-host-key ssh-ed25519 AAAA…",
     "fingerprint": "SHA256:…",
     "host_key_private": "-----BEGIN OPENSSH PRIVATE KEY-----\n…",
-    "disk": { "truenas": { "format": "qcow2", "image": "<prefix>/<name>-disk@sha256:…" }, "aws": { "format": "raw", "image": "…" } },
+    "meta_data": "instance-id: notes-1\nlocal-hostname: notes-1\n",
+    "disk": {
+      "truenas": { "format": "qcow2", "image": "<prefix>/<name>-disk@sha256:…", "os_gib": 23, "disk_gib": 43 },
+      "aws": { "format": "raw", "image": "…", "os_gib": 23, "disk_gib": 43, "cloud_image": "<name>-0123456789ab" }
+    },
+    "app_gib": 20,
+    "disk_file": { "path": "/abs/DIR/<the disk's file name>.qcow2", "format": "qcow2", "sha256": "…", "disk_gib": 43 },
+    "await_secrets": true,
     "waiting": ["API_KEY"]
   }
   ```
@@ -4262,15 +4302,51 @@ in the same installer (bootstrap it as above, then `sh <name>.sh vm create …`,
   until its install and the reboot after it, as `vm create`'s does for what it gives over SSH.
   `known_hosts_line` is that key under the name `vm-seed-host-key`, which `--known-hosts-line`
   takes (below); `fingerprint` its SHA256 as ssh prints it; `host_key_private` the key itself,
-  an OpenSSH private key, which the caller keeps secret until the key retires. `disk` names, for
-  each platform the registry holds a disk for, the disk that platform boots (its format, as the
-  table below, and its image by digest, in the mirror with `--registry`). `waiting` names, sorted,
+  an OpenSSH private key, which the caller keeps secret until the key retires (`vm host-key`
+  retires it). `meta_data` is the NoCloud `meta-data` for a hypervisor that builds its own seed
+  ISO beside `user_data` (`instance-id` and `local-hostname`, the host name, as the seed ISO's).
+  `disk` names, for each platform the registry holds a disk for, the disk that platform boots: its
+  format, as the table below, its image by digest (in the mirror with `--registry`), `os_gib`
+  what Kairos takes of a VM's disk of it, and `disk_gib` the VM's disk size to create, `os_gib`
+  plus `app_gib`, the app's space the release recommends (else 20, at least its minimum and 4),
+  as `vm create` sizes it; on a cloud the release publishes to (`cloud_publish`) in that cloud's
+  format, `cloud_image` is the name `ship --disks` registers that disk's image under there,
+  `<name>-` and the first 12 hex digits of the disk's digest, which that cloud's own provider
+  looks the image up by: the ship that published the disk registered it only when it had that
+  cloud's settings, so a consumer checks the image exists. Left out for a release booting another
+  release's disks (the channel's set), whose ship's `cloud_publish` this release does not tell. `disk_file`,
+  with `--disk-dir`, is `--platform`'s disk as a file — named as `ship` named the disk (its
+  artifact's title, the name `vm create` writes it under) —: its absolute path, format, the SHA-256 of its
+  bytes (decompressed: what a hypervisor imports) and `disk_gib`; left out otherwise.
+  `await_secrets` (`--await-secrets`) and `await_tls` (`--tls byo`) say what the first install
+  waits for over SSH, left out when false. `waiting` names, sorted,
   the keys of the required secret inputs nothing gives (never a value; left out when there are
   none): the VM's first install waits for them, as `vm create` says, until they are given over
   SSH (`sudo <short>-stow install --given - --no-input`). `--platform` missing, not a platform
   Stowage knows, or one the registry holds no disk for is refused (exit 3) once the registry has
   been read, its fix naming the platforms that registry offers; a registry that cannot be read,
-  or that offers no disk for any platform, is a failure (exit 1), whatever `--platform` says.
+  or that offers no disk for any platform, is a failure (exit 1), whatever `--platform` says. A
+  refusal prints one object on standard output, as `status --json`'s (`{"format": 1,
+  "refused": {"reason": "…", "fix": "…"}}`), and exits 3; a failure prints none.
+- **`vm host-key HOSTNAME --json`** reads the VM's own ed25519 SSH host key over SSH, checked by
+  the key `--known-hosts-line` gives (the seed's `known_hosts_line`, or the VM's own) or `vm
+  create` recorded, and retires the seed's one-time key at once — its file and sshd drop-in
+  removed, its retirement marked on the OEM partition, sshd reloaded — so the VM serves its own
+  key alone from then on (as its first boot after the install would). It takes `--user`,
+  `--ssh-key`, `--host` (the address, default HOSTNAME) and `--known-hosts-line`, and prints
+  `{"format": 1, "known_hosts_line": "<host name> ssh-ed25519 AAAA…", "fingerprint":
+  "SHA256:…"}`: the VM's key under the host name the run checked it by (the line's, else the
+  address). With `vm create`'s record (no `--known-hosts-line`), the record is replaced by that
+  line; without it and without that record it is refused (a pin `vm create` keeps while it waits
+  is never read: a create may still be using it). With `--known-hosts-line` no record of `vm
+  create`'s is written (the line given is written to its own file, as for every verb taking it):
+  keep the printed line, the VM's key from then on. Run again it changes nothing more, through the VM's own key. Refused (exit 3,
+  nothing changed): the VM answering from its recovery or live system (its first boot not done:
+  the one-time key is kept, as the active system serves it; run it again once it rebooted), ssh
+  not reaching the VM through the key (exit 255: the VM down, the key not authorized, or a VM that
+  rebooted since its install serving its own key alone — the fix names the console's check,
+  `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub`), and the reach's own errors (no key known,
+  a bad `--known-hosts-line`, `--user` or `--host`). A refusal prints its object as `vm seed`'s.
 - The platform decides the disk format (the first of its formats the registry holds: a mirror
   carries the formats its `mirror export --disks` named) and how the cloud-config reaches the VM.
   Only the platforms the registry has a disk for are offered; a `--platform` whose formats the
@@ -4850,7 +4926,10 @@ sudo <short>-stow network attach --role ROLE --mac MAC [--mode dhcp|static|none]
   `STOWAGE_INPUTS`, as on Docker; absent before the first install, and when the install records
   no such list and the OS's `<short>-stow` carries another release than the one installed, a
   crossing whose boot fell back, and the install keeps no installer of it this one reads); then `channel`, `installing`,
-  `install_failed` and the VM's own fields.
+  `install_failed`, what the first install recorded as Docker's `status --json` gives it —
+  `registry`, `short_name`, `address`, `registry_ca` (`sha256:` of the registry CA the install
+  keeps; left out when it keeps none, or when it cannot be read: the status always answers, and
+  a poll logs nothing) — and the VM's own fields.
 - `describe [--json]` prints what the release this OS carries offers, with no install: the
   Docker installer's `describe` (see "The installer (Docker shape)"), the same object.
 - **Exit status and `--json` on the VM.** `install`, `upgrade` and `rollback` take `--json`, as

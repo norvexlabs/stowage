@@ -315,7 +315,7 @@ func droppedField(t *testing.T, exe string) {
 	if err := payload.Write(&buf, strings.NewReader("exe"), files); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(exe, buf.Bytes(), 0o755); err != nil {
+	if err := testutil.WriteExecutable(exe, buf.Bytes()); err != nil {
 		t.Fatal(err)
 	}
 }

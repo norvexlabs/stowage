@@ -5,6 +5,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -50,17 +51,12 @@ func newSeedHostKey(comment string) (*seedHostKey, error) {
 // fingerprint. A failure is said, not returned: the install is done, and the first boot after it
 // retires the key (an install that rebooted the VM already has, and the pinned key no longer answers).
 func (in *Installer) retireSeedHostKey(ctx context.Context, dir, pin string, m Machine, addr, pubKey string) {
-	o, name := &in.O, in.R.Spec.Name
-	key, dropIn, retired := seedHostKeyFiles(name)
-	out, err := o.SSH.Run(ctx, Cmd{Args: pinnedSSHArgs(pin, m.User, addr, pubKey,
-		"cat", "/etc/ssh/ssh_host_ed25519_key.pub", "&&", "sudo", "rm", "-f", dropIn, key, "&&", "sudo", "touch", retired, "&&", "sudo", "sh", "-c", "'"+sshdReload+"'")})
-	var own string
+	o := &in.O
+	out, err := o.SSH.Run(ctx, Cmd{Args: pinnedSSHArgs(pin, m.User, addr, pubKey, in.retireSeedKeyCommand()...)})
+	var own, blob string
 	if err == nil {
-		f := strings.Fields(string(out))
-		if len(f) < 2 || f[0] != "ssh-ed25519" {
-			err = fmt.Errorf("no ed25519 host key in %q", out)
-		} else if own, err = fingerprint(f[1]); err == nil {
-			err = writeAtomic(filepath.Join(dir, "known_hosts"), strings.NewReader(hostAlias(addr)+" "+f[0]+" "+f[1]+"\n"), 0o600, nil)
+		if blob, own, err = ownHostKey(out); err == nil {
+			err = writeAtomic(filepath.Join(dir, "known_hosts"), strings.NewReader(hostAlias(addr)+" ssh-ed25519 "+blob+"\n"), 0o600, nil)
 		}
 	}
 	if err != nil {
@@ -71,6 +67,38 @@ func (in *Installer) retireSeedHostKey(ctx context.Context, dir, pin string, m M
 		o.logf("warning: %v", err)
 	}
 	fmt.Fprintf(o.Out, "The VM's own SSH host key, read through the one-time key and now served alone: %s (ED25519); known_hosts: %s\n", own, filepath.Join(dir, "known_hosts"))
+}
+
+// retireSeedKeyCommand is the command, run on the VM over SSH, that prints the VM's own ed25519
+// host key, then retires the one-time key: its file and drop-in removed, its retirement marked on
+// the OEM partition, sshd reloaded. Run again, it prints the key and changes nothing more.
+// On Kairos's recovery system, or a live (installer) boot, it prints recoveryMark alone and
+// changes nothing: their keys are not the active system's, and the mark would keep the active
+// system from serving the one-time key.
+func (in *Installer) retireSeedKeyCommand() []string {
+	key, dropIn, retired := seedHostKeyFiles(in.R.Spec.Name)
+	return []string{"if", "[", "-e", "/run/cos/recovery_mode", "]", "||", "[", "-e", "/run/cos/live_mode", "];", "then", "echo", recoveryMark + ";", "else",
+		"cat", "/etc/ssh/ssh_host_ed25519_key.pub", "&&", "sudo", "rm", "-f", dropIn, key, "&&", "sudo", "touch", retired, "&&", "sudo", "sh", "-c", "'" + sshdReload + "';", "fi"}
+}
+
+// recoveryMark is what retireSeedKeyCommand prints on a recovery or live boot.
+const recoveryMark = "stowage-not-the-active-system"
+
+// errNotActive is ownHostKey's error for a VM answering from its recovery or live system.
+var errNotActive = errors.New("the VM answers from its recovery or live system: its first boot is not done, and the one-time key is kept")
+
+// ownHostKey reads the VM's own ed25519 host key from what retireSeedKeyCommand printed: its
+// base64 blob and its SHA256 fingerprint.
+func ownHostKey(out []byte) (blob, fp string, err error) {
+	if strings.TrimSpace(string(out)) == recoveryMark {
+		return "", "", errNotActive
+	}
+	f := strings.Fields(string(out))
+	if len(f) < 2 || f[0] != "ssh-ed25519" {
+		return "", "", fmt.Errorf("no ed25519 host key in %q", out)
+	}
+	fp, err = fingerprint(f[1])
+	return f[1], fp, err
 }
 
 // fingerprint is the SHA256 fingerprint, as ssh prints it, of an ed25519 public key's base64 blob.

@@ -859,12 +859,17 @@ Stowage calls a project's programs: the two never share a reader.
   `absent` (true) says no install is there — no `.env` in the directory, no helm release in the
   namespace — told apart from every other refusal (a release not from Stowage's chart), so a
   program's create tells "nothing here" from "something else here". The VM always answers its
-  status (`installed` null before the first install).
+  status (`installed` null before the first install), with the first install's `registry`,
+  `short_name`, `address` and `registry_ca` as Docker's.
 - **`--json` on the verbs that change an install** (install and re-run, `upgrade`, `rollback`,
   `uninstall`, on every shape) — one object at the end: `{format, result: "done" | "nothing",
   release, refused: {reason, fix, absent}}` (`absent` as `status --json`'s, left out when false;
-  Docker's and Kubernetes': the VM's daemon answers its verbs, and its status answers before any
-  install). `nothing` is a run with nothing to do, a dry run or a
+  on the VM, a verb before the first install: the host daemon answers the refusal with `absent`,
+  `{error, refused: true, fix?, absent?}`, and its client carries it, so every shape tells "no
+  install" the same way). The k8s refusals of a missing release are one: their reason names the
+  install to run, with the mirror and its CA the run was given (`--image-registry`,
+  `--registry-ca`), and their fix is `install first: <that install>`, as Docker's `holds no
+  install` names its own. `nothing` is a run with nothing to do, a dry run or a
   refusal; `release` the release installed after the run, absent when none is; a failure prints
   no object, only its error. The run's text goes to standard error, so standard output is the
   object alone; `upgrade --version` passes `--json` to its child, which prints it. On the VM,
@@ -901,8 +906,14 @@ Stowage calls a project's programs: the two never share a reader.
   --new-baseline` confirmed (the boot runs on the target's OS already: a reset-db there does not
   hold). A verb run before the first install is fixed by `sudo <short>-stow install`.
 - **`vm seed --json`** — a VM's first-boot material without creating the VM, for a tool that
-  creates it with its own means: `{format, platform, user_data, known_hosts_line, fingerprint,
-  host_key_private, disk: {<platform>: {format, image}}, waiting: [<key>]}` — the user-data for `--platform` (the
+  creates it with its own means: `{format, platform, user_data, meta_data, known_hosts_line,
+  fingerprint, host_key_private, disk: {<platform>: {format, image, os_gib, disk_gib,
+  cloud_image}}, app_gib, disk_file, await_secrets, await_tls, waiting: [<key>]}` — everything a
+  consumer would otherwise read from the registry or rebuild (the NoCloud meta-data, the sizes a
+  disk's annotation records, the disk unpacked from its zstd artifact with `--disk-dir`, the name
+  `ship --disks` registers a cloud image under, which is derived from the disk's digest, so no
+  record of it is needed), and what the first install waits for over SSH (`--await-secrets`: a
+  secrets export, so a machine made again keeps its secrets; `--tls byo`: the certificate) — the user-data for `--platform` (the
   cloud-config; never a secret input — those go after the boot, `install --given -` over SSH: a
   secret input or TLS material given to the seed is refused), the one-time host key (its
   `known_hosts` line under the name `vm-seed-host-key`, its fingerprint and its private key, which
@@ -918,7 +929,11 @@ Stowage calls a project's programs: the two never share a reader.
   hashed name), checked strictly under that name (`HostKeyAlias`), never `accept-new`, in place
   of the key `vm create` recorded; the line is written, its name lower-cased, to a file of its
   own under the state directory, named by its digest, so the `ssh` command a message gives runs
-  as the verb's did.
+  as the verb's did. `vm host-key --json` reads the VM's own host key through that pinned key and
+  retires the seed's one-time key at once — the step `vm create` runs after its install over
+  SSH —, printing the VM's key as a `known_hosts` line: a consumer pins the VM's own key from
+  then on, with no file steps of its own. A refusal of `vm seed` or `vm host-key` prints its object
+  as `status --json`'s.
 
 ## 7. Full lifecycle matrix
 
@@ -2197,8 +2212,11 @@ no `action` blocks, so every operation is a resource's create, update or delete)
 
 **`stowage_vm_seed`** — `vm seed --json`, generated once (a managed resource: the one-time host key
 would change at every plan from a data source, and a function must be pure). The customer's own
-provider (TrueNAS, a cloud) creates the VM from its user-data and disk. The private host key sits
-in state until the VM is installed; state encryption is advised. This replaces nesting
+provider (TrueNAS, a cloud) creates the VM from its user-data, meta-data and disk (the file
+`--disk-dir` writes, sized by `disk_gib`, or a cloud's `cloud_image`). The private host key sits
+in state until the VM is installed, then `vm host-key` retires it and gives the VM's own key;
+state encryption is advised. `secrets_wo` on the VM is a seed made with `--await-secrets`, its
+export given over SSH at create; a `byo` certificate, `--tls byo`, given the same way. This replaces nesting
 `vm create --create opentofu`, a second OpenTofu root with its own state, inside the first;
 `vm create` keeps its built-in modules for operators who do not write OpenTofu.
 

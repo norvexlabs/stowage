@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/norvexlabs/stowage/internal/testutil"
 	"io"
 	"maps"
 	"net/netip"
@@ -1230,7 +1231,7 @@ func TestTheSecretsInstallRetriesACanceledStartOnce(t *testing.T) {
 			scripts["failed"] = ""
 		}
 		for n, body := range scripts {
-			if err := os.WriteFile(filepath.Join(dir, n), []byte(body), 0o755); err != nil {
+			if err := testutil.WriteExecutable(filepath.Join(dir, n), []byte(body)); err != nil {
 				t.Fatal(err)
 			}
 		}

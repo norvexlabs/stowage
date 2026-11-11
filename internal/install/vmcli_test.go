@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/norvexlabs/stowage/internal/testutil"
 	"io"
 	"net"
 	"net/http"
@@ -549,7 +550,7 @@ func TestAnUnreadableKeptInstallerIsLogged(t *testing.T) {
 	e.r, e.self = bundledInstaller(t, "2.0.0", 1, func(s *spec.Spec) { s.Shapes.Kairos.HostAPI = nil })
 	d := daemon(e, &fakeHost{})
 	in, _ := d.run()
-	if err := os.WriteFile(in.ctl(), []byte("not an installer"), 0o755); err != nil {
+	if err := testutil.WriteExecutable(in.ctl(), []byte("not an installer")); err != nil {
 		t.Fatal(err)
 	}
 	if d.appServed() || !strings.Contains(e.log.String(), "no app socket: the installed release's host_api cannot be read from "+in.ctl()) {

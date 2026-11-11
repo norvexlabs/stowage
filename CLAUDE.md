@@ -271,6 +271,10 @@ asks for one:
 - A parser of untrusted text (versions, tags, compose variables) gets a property or fuzz test, not
   only examples.
 - Tests never touch the network or the host's Docker; filesystem state lives in `t.TempDir()`.
+- A test writing a program it runs writes it with `testutil.WriteExecutable`, never `os.WriteFile`: a
+  child another parallel test forks holds every descriptor of the process until it execs, and a
+  program held open for writing cannot run (ETXTBSY), so a shell runs the next one `PATH` names —
+  a real one. `TestNoTestWritesAProgramWithWriteFile` refuses the other way.
 - **Fast**: `go test ./...` stays around 4 s. A test never waits out real seconds — a timeout is
   scaled by an unexported unit or delay the test shortens — and a test that sets no environment
   and no package variable runs with `t.Parallel()`.
