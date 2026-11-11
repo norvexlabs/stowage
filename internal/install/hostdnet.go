@@ -1061,6 +1061,17 @@ func (h *Hostd) reloadBanner(ctx context.Context) {
 	}
 }
 
+// stopper is an armed timer: Stop disarms it.
+type stopper interface{ Stop() bool }
+
+// armTimer runs f after d: afterFunc's, else time.AfterFunc.
+func (h *Hostd) armTimer(d time.Duration, f func()) stopper {
+	if h.afterFunc != nil {
+		return h.afterFunc(d, f)
+	}
+	return time.AfterFunc(d, f)
+}
+
 func (h *Hostd) unit() time.Duration {
 	if h.Unit == 0 {
 		return time.Second
@@ -1075,7 +1086,7 @@ func (h *Hostd) armRevert(owner string, deadline time.Time, attempt int, why str
 	h.netDisarm()
 	h.netOwner = owner
 	gen := h.netGen
-	h.netTimer = time.AfterFunc(time.Until(deadline), func() {
+	h.netTimer = h.armTimer(time.Until(deadline), func() {
 		h.netFired.Store(int64(gen)) // a confirmation from now on comes too late
 		h.netMu.Lock()
 		defer h.netMu.Unlock()

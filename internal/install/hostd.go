@@ -145,8 +145,10 @@ type Hostd struct {
 	// netMu orders the network changes and their revert; netTimer is the armed revert, netGen
 	// counts disarms (a revert that fired after one does nothing).
 	netMu    sync.Mutex
-	netTimer *time.Timer
+	netTimer stopper
 	netGen   int
+	// afterFunc arms a revert's timer: time.AfterFunc, or a test's, which fires it itself.
+	afterFunc func(d time.Duration, f func()) stopper
 	// netOwner is the role of the NIC whose change netTimer undoes (empty: the primary): another
 	// NIC's change waits for it, as it would disarm it.
 	netOwner string
