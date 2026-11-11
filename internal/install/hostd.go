@@ -64,7 +64,7 @@ import (
 //	POST /v1/reboot, /v1/shutdown        {drain_secs}: after the drain (202)
 //	GET, POST /v1/network, POST /v1/network/{confirm,revert,reset}: the network override (hostdnet.go)
 //	/v1/backup, /v1/backup/{config,status,list,verify}: the backups (hostdbackup.go)
-//	/v1/secrets/{export,rotate,set}, /v1/restore: the install's secrets and a backup's restore (hostdsecrets.go)
+//	/v1/secrets/{export,rotate,set,show}, /v1/restore: the install's secrets and a backup's restore (hostdsecrets.go)
 //
 // An error is {"error": "..."} with a 4xx or 5xx status. One job runs at a time, and none starts
 // once a reboot is scheduled; every request that starts one answers 202 with JobStarted.
@@ -145,8 +145,13 @@ type Hostd struct {
 	// netMu orders the network changes and their revert; netTimer is the armed revert, netGen
 	// counts disarms (a revert that fired after one does nothing).
 	netMu    sync.Mutex
-	netTimer *time.Timer
+	netTimer stopper
 	netGen   int
+	// afterFunc arms a revert's timer: time.AfterFunc, or a test's, which fires it itself.
+	afterFunc func(d time.Duration, f func()) stopper
+	// onWait, a test's, is told what a request waits on ("slot": a running job's end; "events":
+	// the journal's next event) as it starts waiting: the test acts then, never before.
+	onWait func(what string)
 	// netOwner is the role of the NIC whose change netTimer undoes (empty: the primary): another
 	// NIC's change waits for it, as it would disarm it.
 	netOwner string
@@ -283,6 +288,10 @@ type Status struct {
 	// restore again finishes.
 	VolumesSplit bool   `json:"volumes_split,omitempty"`
 	Channel      string `json:"channel,omitempty"`
+	// Registry and FirstInstall are what the install's first run recorded, as Docker's status
+	// --json gives them; left out before the first install.
+	Registry string `json:"registry,omitempty"`
+	FirstInstall
 	// Tune is the stack's tuning profile, and whose it is: "network (operator)".
 	Tune string `json:"tune,omitempty"`
 	Disk *Disk  `json:"disk,omitempty"`
@@ -644,6 +653,7 @@ func (h *Hostd) routes(app bool) http.Handler {
 	operator("POST /v1/kits/check", h.checkKit)
 	operator("POST /v1/secrets/rotate", h.rotateSecret)
 	operator("POST /v1/secrets/set", h.setSecret)
+	operator("POST /v1/secrets/show", h.showSecret)
 	operator("POST /v1/restore", h.restoreBackup)
 	return mux
 }
@@ -702,6 +712,9 @@ func replyErr(w http.ResponseWriter, err error) {
 		if r.Fix != "" {
 			body["fix"] = r.Fix
 		}
+		if r.Absent {
+			body["absent"] = true
+		}
 	}
 	reply(w, code, body)
 }
@@ -710,7 +723,7 @@ func replyErr(w http.ResponseWriter, err error) {
 func failAs(code int, err error) error {
 	he := httpError{code, err.Error()}
 	if r, ok := Refusal(err); ok {
-		return Refused{Reason: he.msg, Fix: r.Fix, cause: he}
+		return Refused{Reason: he.msg, Fix: r.Fix, Absent: r.Absent, cause: he}
 	}
 	return he
 }
@@ -745,12 +758,14 @@ func (h *Hostd) run() (*Installer, *bytes.Buffer) {
 	return &Installer{R: h.R, O: o}, &out
 }
 
-// installed opens the install; a 409 before the first install.
+// installed opens the install; before the first install, open()'s absent refusal (its fix the
+// shape's: the daemon's options say which), answered 409.
 func (h *Hostd) installed(in *Installer) (*EnvFile, error) {
-	if notInstalled(in) {
-		return nil, fail(http.StatusConflict, "%s is not installed yet: `sudo %s install` installs it", h.R.Spec.Name, filepath.Base(BundledCtl(h.R.Spec.Short())))
+	env, err := in.open()
+	if r, ok := Refusal(err); ok && r.Absent {
+		return nil, failAs(http.StatusConflict, err)
 	}
-	return in.open()
+	return env, err
 }
 
 // source opens what a release is looked up for: the install, or on the VM before its first install
@@ -838,6 +853,9 @@ func (h *Hostd) status(w http.ResponseWriter, r *http.Request) {
 		st.Installing, st.InstallFailed, _ = in.firstInstall()
 		st.RestoreAwaited = in.restoreAwaited()
 		st.Channel, _ = env.Get(ChannelVar)
+		// A registry CA that cannot be read is left out: the status always answers, and a poll
+		// logs nothing at each request.
+		st.Registry, st.FirstInstall, _ = readFirstInstall(env, in.O.Dir)
 		p, by := in.tuneProfile(func(k string) string { v, _ := env.Get(k); return v })
 		st.Tune = fmt.Sprintf("%s (%s)", p, by)
 		if mode, _ := env.Get("STOWAGE_TLS_MODE"); mode == "byo" {
@@ -1669,6 +1687,9 @@ func (h *Hostd) startJobWhenFree(ctx context.Context, wait time.Duration, kind s
 		h.mu.Unlock()
 		if end == nil {
 			continue
+		}
+		if h.onWait != nil {
+			h.onWait("slot")
 		}
 		select {
 		case <-end:

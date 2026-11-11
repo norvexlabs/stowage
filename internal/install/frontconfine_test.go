@@ -18,6 +18,7 @@ import (
 	"github.com/norvexlabs/stowage/internal/front"
 	"github.com/norvexlabs/stowage/internal/kairos"
 	"github.com/norvexlabs/stowage/internal/spec"
+	"github.com/norvexlabs/stowage/internal/testutil"
 )
 
 // The front is confined as every service Stowage adds: its own user, no capability, no privilege
@@ -27,7 +28,7 @@ func TestTheFrontIsConfined(t *testing.T) {
 	t.Parallel()
 	f := l4TLSFront()
 	f.PublishCA = &spec.PublishCA{Volume: "ca"}
-	raw, err := frontCompose(f, nil, func(string) string { return "" }, "byo", hostAPI{}, "sha256:x", byoCA, false, false, false, nil, nil, FrontUID)
+	raw, err := frontCompose(f, nil, func(string) string { return "" }, "byo", hostAPI{}, "sha256:x", byoCA, false, false, false, nil, nil, false, FrontUID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -403,7 +404,7 @@ func TestTheFrontPrepScriptsJudgeWhatTheyFind(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		if err := os.WriteFile(filepath.Join(bin, "chown"), []byte("#!/bin/sh\necho chown \"$@\" >>"+filepath.Join(dir, "log")+"\n"), 0o755); err != nil {
+		if err := testutil.WriteExecutable(filepath.Join(bin, "chown"), []byte("#!/bin/sh\necho chown \"$@\" >>"+filepath.Join(dir, "log")+"\n")); err != nil {
 			t.Fatal(err)
 		}
 		if err := os.WriteFile(filepath.Join(dir, "ca", ".ca.crt"), nil, 0o644); err != nil {
@@ -691,7 +692,7 @@ func TestTheFrontUserRunWritesNothingBeforeTheCAIsJudged(t *testing.T) {
 		}
 	}
 	// stat says the CA's directory is uid 2000's; find, as the test's own files are the user's.
-	if err := os.WriteFile(filepath.Join(dir, "bin", "stat"), []byte("#!/bin/sh\necho 2000\n"), 0o755); err != nil {
+	if err := testutil.WriteExecutable(filepath.Join(dir, "bin", "stat"), []byte("#!/bin/sh\necho 2000\n")); err != nil {
 		t.Fatal(err)
 	}
 	script := frontUserShell(os.Getuid())

@@ -871,10 +871,10 @@ func (h *Hostd) planBackup(ctx context.Context, req BackupRequest) (*backupPlan,
 		return nil, skippable(err, "")
 	}
 	in, _ := h.run()
-	if notInstalled(in) {
-		return nil, skippable(fail(http.StatusConflict, "%s is not installed yet", h.R.Spec.Name), "")
-	}
 	env, err := h.installed(in)
+	if r, ok := Refusal(err); ok && r.Absent {
+		return nil, skippable(err, "") // the timer's run skips a VM not installed yet
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -1293,7 +1293,10 @@ func (h *Hostd) rcloneNamed(ctx context.Context, in *Installer, dir, name string
 func (h *Hostd) rcloneTo(ctx context.Context, in *Installer, dir, name string, stdin io.Reader, stdout io.Writer, args ...string) ([]byte, error) {
 	// On the host's network: the destination is reached, and named, as the host reaches it, over
 	// IPv6 too.
-	a := []string{"run", "--rm", "--pull", "never", "--network", "host", "--name", name, "-v", dir + ":/config/rclone"}
+	// Root with what reading and writing its configuration needs alone, whoever owns it (root on the
+	// VM, the operator running the Docker install's backup): DAC_READ_SEARCH and DAC_OVERRIDE.
+	a := []string{"run", "--rm", "--pull", "never", "--network", "host", "--cap-drop", "ALL", "--cap-add", "DAC_OVERRIDE", "--cap-add", "DAC_READ_SEARCH",
+		"--security-opt", "no-new-privileges:true", "--name", name, "-v", dir + ":/config/rclone"}
 	if stdin != nil {
 		a = append(a, "-i")
 	}
@@ -1344,7 +1347,12 @@ func (h *Hostd) runnerShell(ctx context.Context, in *Installer, image, vol strin
 		mount += ":ro"
 	}
 	name := h.runnerName()
-	a := []string{"run", "--rm", "--pull", "never", "--network", "none", "--name", name, "-v", mount}
+	// Root with what archiving and restoring files of every owner needs alone: reading any
+	// (DAC_READ_SEARCH), writing into any directory (DAC_OVERRIDE), giving back their owners
+	// (CHOWN), modes and times (FOWNER) and set-id bits (FSETID), and device nodes (MKNOD).
+	a := []string{"run", "--rm", "--pull", "never", "--network", "none", "--cap-drop", "ALL",
+		"--cap-add", "CHOWN", "--cap-add", "DAC_OVERRIDE", "--cap-add", "DAC_READ_SEARCH", "--cap-add", "FOWNER", "--cap-add", "FSETID", "--cap-add", "MKNOD",
+		"--security-opt", "no-new-privileges:true", "--name", name, "-v", mount}
 	if stdin != nil {
 		a = append(a, "-i")
 	}

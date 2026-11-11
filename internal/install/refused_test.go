@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"github.com/norvexlabs/stowage/internal/testutil"
 	"io"
 	"os"
 	"os/exec"
@@ -416,7 +417,7 @@ func TestTheVerbsTakeJSON(t *testing.T) {
 	if err := cmd.ExecuteContext(context.Background()); !isRefused(err) {
 		t.Fatalf("%v\n%s", err, &log)
 	}
-	if r := oneResult(t, out.String()); r.Refused == nil || r.Refused.Reason != "no release notes in notes" || r.Release != nil {
+	if r := oneResult(t, out.String()); r.Refused == nil || r.Refused.Reason != "no release notes in notes: `notes-stow k8s install --namespace notes --release notes` installs 1.0.0" || !r.Refused.Absent || r.Release != nil {
 		t.Errorf("%+v", r)
 	}
 	// Done: what the run prints for a person goes to standard error.
@@ -594,7 +595,7 @@ func TestAKeptInstallerThatDoesNotReadFails(t *testing.T) {
 	e := installed(t)
 	e.to("2.0.0", nil)
 	ctl := filepath.Join(e.dir, "notes-stow")
-	_ = os.WriteFile(ctl, []byte("no payload"), 0o755)
+	_ = testutil.WriteExecutable(ctl, []byte("no payload"))
 	if err := e.upgrade(nil); !isRefused(err) || !strings.Contains(err.Error(), "is not the installer of notes 1.0.0") {
 		t.Fatalf("carries none: %v", err)
 	}
@@ -786,7 +787,7 @@ func TestABootFailsWhateverItsChildExits(t *testing.T) {
 func TestARollbackChecksItsInstallerFirst(t *testing.T) {
 	t.Parallel()
 	e := upgraded(t)
-	_ = os.WriteFile(filepath.Join(e.dir, PrevDir, "notes-stow"), []byte("no payload"), 0o755)
+	_ = testutil.WriteExecutable(filepath.Join(e.dir, PrevDir, "notes-stow"), []byte("no payload"))
 	e.to("3.0.0", nil)
 	if err := e.rollback(nil); !isRefused(err) || !strings.Contains(err.Error(), "a rollback is run by the installer the install keeps") {
 		t.Fatalf("%v", err)
@@ -802,7 +803,7 @@ func TestARollbackChecksItsInstallerFirst(t *testing.T) {
 	if err := payload.Write(&buf, strings.NewReader("exe"), files); err != nil {
 		t.Fatal(err)
 	}
-	_ = os.WriteFile(ctl, buf.Bytes(), 0o755)
+	_ = testutil.WriteExecutable(ctl, buf.Bytes())
 	if err := e.rollback(nil); err == nil || isRefused(err) || !strings.Contains(err.Error(), "the previous release's installer") {
 		t.Fatalf("%v", err)
 	}
@@ -859,7 +860,7 @@ func TestTheKeptInstallerNeverAdvisesItself(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_ = os.WriteFile(ctl, raw, 0o755)
+	_ = testutil.WriteExecutable(ctl, raw)
 	r, ok := Refusal(e.rollback(func(o *Options) { o.Self = ctl }))
 	if !ok || strings.Contains(r.Fix, ctl) || !strings.HasPrefix(r.Fix, "run the installer of notes 2.0.0 (revision 1) instead of this one") {
 		t.Fatalf("%+v", r)

@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/norvexlabs/stowage/internal/testutil"
 	"io"
 	"math/big"
 	"os"
@@ -1026,7 +1027,7 @@ func TestAnUpgradeNeedsTheInstallerKept(t *testing.T) {
 		t.Fatalf("none kept: %v", err)
 	}
 	// The new installer saved over the kept one.
-	if err := os.WriteFile(filepath.Join(e.dir, "notes-stow"), []byte(read(t, e.self)), 0o755); err != nil {
+	if err := testutil.WriteExecutable(filepath.Join(e.dir, "notes-stow"), []byte(read(t, e.self))); err != nil {
 		t.Fatal(err)
 	}
 	if err := e.upgrade(nil); err == nil || !strings.Contains(err.Error(), "it carries notes 2.0.0 (revision 1)") {
@@ -1275,7 +1276,7 @@ func TestAStoppedRollbackCanRunAgain(t *testing.T) {
 		t.Fatal(".env switched")
 	}
 	_ = os.Remove(ctl)
-	_ = os.WriteFile(ctl, []byte(saved), 0o755)
+	_ = testutil.WriteExecutable(ctl, []byte(saved))
 	if err := e.rollback(nil); err != nil {
 		t.Fatalf("again: %v", err)
 	}
@@ -1527,7 +1528,7 @@ func anotherStowagesAt(t *testing.T, ctl string) []byte {
 	if err := payload.Write(&buf, strings.NewReader("exe"), files); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(ctl, buf.Bytes(), 0o755); err != nil {
+	if err := testutil.WriteExecutable(ctl, buf.Bytes()); err != nil {
 		t.Fatal(err)
 	}
 	return buf.Bytes()
@@ -1627,7 +1628,7 @@ func TestARollbackRefusesAPreviousInstallerItCannotTrust(t *testing.T) {
 			if err := payload.Write(&buf, strings.NewReader("exe"), files); err != nil {
 				t.Fatal(err)
 			}
-			if err := os.WriteFile(ctl, buf.Bytes(), 0o755); err != nil {
+			if err := testutil.WriteExecutable(ctl, buf.Bytes()); err != nil {
 				t.Fatal(err)
 			}
 			err = e.rollback(func(o *Options) {
@@ -1683,7 +1684,7 @@ func TestAKeptInstallerReadsItself(t *testing.T) {
 	dir := t.TempDir()
 	script := func(name, body string) string {
 		p := filepath.Join(dir, name)
-		if err := os.WriteFile(p, []byte("#!/bin/sh\n"+body+"\n"), 0o755); err != nil {
+		if err := testutil.WriteExecutable(p, []byte("#!/bin/sh\n"+body+"\n")); err != nil {
 			t.Fatal(err)
 		}
 		return p

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"github.com/norvexlabs/stowage/internal/testutil"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -410,7 +411,7 @@ func TestVMSeed(t *testing.T) {
 				mod(o)
 			}
 		})
-		return in.SeedVM(context.Background(), &VMCreate{Platform: platform, Hostname: "notes-1", User: "ops", SSHKey: v.key}, channel)
+		return in.SeedVM(context.Background(), &VMCreate{Platform: platform, Hostname: "notes-1", User: "ops", SSHKey: v.key}, SeedOptions{Channel: channel})
 	}
 	s, err := seed(nil, "beta")
 	if err != nil || asked.n != 0 {
@@ -790,7 +791,7 @@ func TestVMStatusReadsTheKeptInstallerOnce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(kept, bytes.Repeat([]byte("x"), int(fi.Size())), 0o755); err != nil {
+	if err := testutil.WriteExecutable(kept, bytes.Repeat([]byte("x"), int(fi.Size()))); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.Chtimes(kept, fi.ModTime(), fi.ModTime()); err != nil {
@@ -813,7 +814,7 @@ func TestVMStatusReadsTheKeptInstallerOnce(t *testing.T) {
 	if n := strings.Count(log.String(), "the installer the install keeps"); n != 1 {
 		t.Errorf("logged %d times:\n%s", n, log.String())
 	}
-	if err := os.WriteFile(kept, orig, 0o755); err != nil {
+	if err := testutil.WriteExecutable(kept, orig); err != nil {
 		t.Fatal(err)
 	}
 	later = later.Add(time.Second)
@@ -913,7 +914,7 @@ func TestVMRefusalsCarryAFixThatHoldsOnTheVM(t *testing.T) {
 		}, "already holds a tls/", "move tls/ away", "--dir"},
 		"no install": {func(t *testing.T, mod func(*Options)) error {
 			return vmEnv(t, "1.0.0").installer(mod).Rollback(ctx)
-		}, "holds no install", "sudo notes-stow install", "--dir"},
+		}, "notes is not installed yet: `sudo notes-stow install` installs it", "sudo notes-stow install", "--dir"},
 		"an upgrade crossing from another release than the one confirmed": {func(t *testing.T, mod func(*Options)) error {
 			e := vmInstalled(t, "1.0.0")
 			e.r, e.self = bundledInstaller(t, "2.0.0", 1, nil)

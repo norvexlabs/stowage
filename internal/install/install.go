@@ -163,6 +163,8 @@ type Options struct {
 	Euid        func() int
 	NetworkdDir string
 	GatewayRun  string
+	// Hostname replaces os.Hostname in tests (host-key's known_hosts line).
+	Hostname func() (string, error)
 	// FlushConntrack replaces the flush of the host's connection-tracking table in tests.
 	FlushConntrack func() error
 	// Roots are the host's trusted CAs a byo chain is checked against; nil is the system's.
@@ -187,7 +189,11 @@ type Options struct {
 func (o *Options) logf(format string, a ...any) { fmt.Fprintf(o.Log, format+"\n", a...) }
 
 // cos is where Kairos marks the system it booted.
-func (o *Options) cos() string { return cmp.Or(o.Cos, "/run/cos") }
+func (o *Options) cos() string { return cmp.Or(o.Cos, kairosCos) }
+
+// kairosCos is the directory Kairos marks its boot's mode in (active_mode, recovery_mode,
+// live_mode…).
+const kairosCos = "/run/cos"
 
 // bootID is this boot's id, as the kernel publishes it; empty when it cannot be read.
 func (o *Options) bootID() string { return readBootID(cmp.Or(o.BootIDFile, kernelBootID)) }
@@ -196,6 +202,11 @@ func (o *Options) bootID() string { return readBootID(cmp.Or(o.BootIDFile, kerne
 type Installer struct {
 	R *Release
 	O Options
+	// k8sHeld is what the release's Secret and its secret files' one held when k8sRecorded read them.
+	k8sHeld struct {
+		env   map[string]bool
+		files map[string]string
+	}
 	// hosts are the VM's host records once read (hostsRead): vmHosts.
 	hosts     []string
 	hostsRead bool
@@ -204,6 +215,8 @@ type Installer struct {
 	// removeDir: this run created the install directory before writing the install, so a failure
 	// before .env removes it again.
 	removeDir bool
+	// hookUsers are the users the hooks' images run as, by reference, once read (hookUser).
+	hookUsers map[string]string
 	// tuned is the host's tune.System once its engine read: one `docker info` per run.
 	tuned *tune.System
 	// setsWarned is the release this run warned of the sets only the VM's app socket feeds
@@ -508,17 +521,17 @@ type publish struct {
 	ports map[string]int
 	all   bool // probed on every address of the host, not only addr
 	// unserved are the TLS front's ports (http, https) it records but nothing serves on in the
-	// install's mode (frontPorts): neither published nor checked.
+	// install's mode (frontServed): neither published nor checked.
 	unserved map[string]bool
 }
 
-// frontPorts reports which of the front's host ports, HTTP's and HTTPS's, something serves on in
+// frontServed reports which of the front's host ports, HTTP's and HTTPS's, something serves on in
 // mode: both where the front serves a route behind TLS (its sites, and HTTP's redirect to them);
 // HTTP alone in acme mode where it terminates TLS on L4 routes alone (Let's Encrypt's HTTP-01
 // challenge for their certificates); neither in loopback mode or with no front route otherwise. It
 // is the one rule of what the front opens: the VM's firewall opens, Docker publishes and an install
 // checks free these alone, as an L4 route's port is opened while its service runs (l4Served).
-func frontPorts(f spec.Front, l4 []spec.L4Route, mode string) (http, https bool) {
+func frontServed(f spec.Front, l4 []spec.L4Route, mode string) (http, https bool) {
 	switch {
 	case !f.Declared() || mode == Loopback:
 		return false, false
@@ -536,10 +549,38 @@ func l4Served(r spec.L4Route, off []string) bool {
 	return r.Terminated() || !slices.Contains(off, name)
 }
 
-// unservedPorts are the TLS front's ports nothing serves on in mode (frontPorts), for a publish's
+// frontServedPorts are the front's recorded host ports (get) something serves on in mode
+// (frontServed), HTTP's then HTTPS's; none with no front or in loopback mode. A served one's value
+// that is no TCP port is an error, the spec's port (frontPorts' rule) standing in for it; an
+// unserved one's is never read.
+func (in *Installer) frontServedPorts(mode string, get func(string) string) ([]int, error) {
+	http, https := frontServed(in.R.Spec.Front, in.R.Spec.L4.Routes, mode)
+	f := in.R.Spec.Front
+	var out []int
+	var errs []error
+	for _, p := range []struct {
+		served bool
+		key    string
+		spec   int
+	}{{http, HTTPPortVar, cmp.Or(f.HTTPPort, 80)}, {https, HTTPSPortVar, cmp.Or(f.HTTPSPort, 443)}} {
+		if !p.served {
+			continue
+		}
+		v := get(p.key)
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 || n > 65535 {
+			errs = append(errs, fmt.Errorf("%s %q is not a TCP port", p.key, v))
+			n = p.spec
+		}
+		out = append(out, n)
+	}
+	return out, errors.Join(errs...)
+}
+
+// unservedPorts are the TLS front's ports nothing serves on in mode (frontServed), for a publish's
 // unserved.
 func (in *Installer) unservedPorts(mode string) map[string]bool {
-	http, https := frontPorts(in.R.Spec.Front, in.R.Spec.L4.Routes, mode)
+	http, https := frontServed(in.R.Spec.Front, in.R.Spec.L4.Routes, mode)
 	out := map[string]bool{}
 	if !http {
 		out["http"] = true
@@ -1342,7 +1383,7 @@ func (in *Installer) renderStack(env *EnvFile, dir string) error {
 			}
 		}
 	}
-	fc, err := frontCompose(f, in.R.Spec.L4.Routes, get, mode, in.hostAPI(), "sha256:"+hex.EncodeToString(h.Sum(nil)), ca, strings.Contains(cf, noALPNMark), clientCA != nil, get(IPv6Var) == "true", in.hostServices(), in.allowV4Only(), in.frontUser())
+	fc, err := frontCompose(f, in.R.Spec.L4.Routes, get, mode, in.hostAPI(), "sha256:"+hex.EncodeToString(h.Sum(nil)), ca, strings.Contains(cf, noALPNMark), clientCA != nil, get(IPv6Var) == "true", in.hostServices(), in.allowV4Only(), in.frontV4Only(get), in.frontUser())
 	if err != nil {
 		return err
 	}
@@ -1422,15 +1463,19 @@ func (in *Installer) up(ctx context.Context, env *EnvFile) (err error) {
 		return err
 	}
 	defer cleanup()
+	environ := env.Environ(base)
+	m, err := in.model(ctx, environ)
+	if err != nil {
+		return err
+	}
+	// Before anything stops or starts: a held service the holds would not judge is refused.
+	if err := in.heldNetworks(ctx, m, env); err != nil {
+		return err
+	}
 	if err := in.ipv6Network(ctx, env); err != nil {
 		return err
 	}
 	off, err := in.profilesOff(ctx, env)
-	if err != nil {
-		return err
-	}
-	environ := env.Environ(base)
-	m, err := in.model(ctx, environ)
 	if err != nil {
 		return err
 	}
@@ -2105,12 +2150,9 @@ func (in *Installer) l4TLSExposure(r spec.L4Route, get func(string) string, ca h
 func (in *Installer) heldPorts(env *EnvFile) map[peerPort]bool {
 	held := map[peerPort]bool{{22, "tcp"}: true}
 	mode, _ := env.Get("STOWAGE_TLS_MODE")
-	http, https := frontPorts(in.R.Spec.Front, in.R.Spec.L4.Routes, mode)
-	for k, served := range map[string]bool{HTTPPortVar: http, HTTPSPortVar: https} {
-		v, _ := env.Get(k)
-		if n, err := strconv.Atoi(v); err == nil && served {
-			held[peerPort{n, "tcp"}] = true
-		}
+	ports, _ := in.frontServedPorts(mode, func(k string) string { v, _ := env.Get(k); return v })
+	for _, n := range ports {
+		held[peerPort{n, "tcp"}] = true
 	}
 	for _, r := range in.R.Spec.L4.Routes {
 		held[peerPort{r.Port, r.Protocol}] = true
@@ -2124,14 +2166,19 @@ const FirewallConf = "/etc/nftables.conf"
 // openPorts opens the install's host ports in the VM's firewall (O.Firewall): a TLS front's, the
 // ports the stack's bridges reach the L4 routes' services on (hn), and every L4 route's in every
 // mode, from the sources its allowlist holds, on its bind address alone when it has one; the
-// front's and a route's on their host.interfaces role's interface alone when they name one. The
+// front's and a route's on their host.interfaces roles' interfaces alone when they name some. The
 // routes' services run on the host's network, so their traffic meets the input chain alone: one
 // rule file of the install's own, O.Firewall/<name>-ports.nft, under /run, so a boot drops the
 // routes' ports (input drops by default) until the install's start writes it. The roles'
 // forwarding (forwardNft) goes to O.Firewall/forward/<name>-forward.nft, which the forward chain
 // includes ahead of its drop, so a boot forwards nothing between the host's interfaces until the
-// start writes it. The forward chain's <dir>/nftables.d/<name>-l4.nft, which no release of this
-// Stowage writes, is removed. The ruleset is loaded again when any file changed.
+// start writes it. The front's ports, which Docker translates to its container past the input
+// chain, are held to its roles in the forward chain's <dir>/nftables.d/<name>-l4.nft
+// (frontHolds), removed while none is held: the name earlier releases kept their L4 allowlists
+// under, which each of them removes or rewrites at its start, so a rollback to one never keeps
+// this release's rule. The stack's named bridges go to <dir>/nftables.d/<name>-bridges.nft
+// (bridgeNft). The front's ports are those something serves on (frontServed). The ruleset is
+// loaded again when any file changed.
 func (in *Installer) openPorts(ctx context.Context, env *EnvFile, hn hostNet) error {
 	if in.O.Firewall == "" {
 		return nil
@@ -2139,24 +2186,16 @@ func (in *Installer) openPorts(ctx context.Context, env *EnvFile, hn hostNet) er
 	name := in.R.Spec.Name
 	var input []byte
 	mode, _ := env.Get("STOWAGE_TLS_MODE")
-	http, https := frontPorts(in.R.Spec.Front, in.R.Spec.L4.Routes, mode)
-	var ports []string
-	for _, k := range []struct {
-		key    string
-		served bool
-	}{{HTTPPortVar, http}, {HTTPSPortVar, https}} {
-		if !k.served {
-			continue
-		}
-		v, _ := env.Get(k.key)
-		n, err := strconv.Atoi(v)
-		if err != nil || n < 1 || n > 65535 {
-			return fmt.Errorf("%s %q is not a TCP port", k.key, v)
-		}
-		ports = append(ports, strconv.Itoa(n))
+	served, err := in.frontServedPorts(mode, func(k string) string { v, _ := env.Get(k); return v })
+	if err != nil {
+		return err
 	}
-	if len(ports) > 0 {
-		input = fmt.Appendf(input, "%stcp dport { %s } accept\n", in.iif(in.R.Spec.Front.Interface), strings.Join(ports, ", "))
+	if len(served) > 0 {
+		var ports []string
+		for _, n := range served {
+			ports = append(ports, strconv.Itoa(n))
+		}
+		input = fmt.Appendf(input, "%stcp dport { %s } accept\n", in.iif(in.R.Spec.Front.Interfaces...), strings.Join(ports, ", "))
 	}
 	// The ports the stack's own services reach a target on, from its bridges.
 	for _, proto := range []string{"tcp", "udp"} {
@@ -2220,7 +2259,8 @@ func (in *Installer) openPorts(ctx context.Context, env *EnvFile, hn hostNet) er
 	if err := in.forwardRoles(ctx, get); err != nil {
 		return err
 	}
-	// The forward chain's allowlists' file goes: nothing of this install is judged there.
+	// The forward chain's files: the roles' forwarding, the front's ports held to its roles, the
+	// stack's named bridges.
 	files := []struct {
 		path, what string
 		rule, cur  []byte
@@ -2229,7 +2269,7 @@ func (in *Installer) openPorts(ctx context.Context, env *EnvFile, hn hostNet) er
 		{path: filepath.Join(in.O.Firewall, name+"-ports.nft"), what: "ports", rule: input},
 		{path: filepath.Join(in.O.Firewall, ForwardDir, name+"-forward.nft"), what: "forwarding between the host's interfaces",
 			rule: forwardNft(in.R.Spec.Host, func(r string) string { return in.roleDevice(r, get) })},
-		{path: filepath.Join(in.O.Dir, ForwardRules, name+"-l4.nft"), what: "L4 routes' allowlists"},
+		{path: filepath.Join(in.O.Dir, ForwardRules, name+"-l4.nft"), what: "front's interfaces", rule: in.frontHolds(env)},
 		// On the persistent partition, which the forward chain includes from a boot on, before
 		// the install's start: the containers Docker restarts on those bridges are reached then.
 		{path: filepath.Join(in.O.Dir, ForwardRules, name+"-bridges.nft"), what: "stack's named bridges", rule: bridgeNft(hn.bridges)},
@@ -2274,6 +2314,53 @@ func (in *Installer) openPorts(ctx context.Context, env *EnvFile, hn hostNet) er
 		return fmt.Errorf("loading the firewall with the install's ports: %w", err)
 	}
 	return nil
+}
+
+// frontHolds are the VM's forward chain's rules holding the ports Docker publishes the front on to
+// the front's roles (front.interfaces; an L4 route the front terminates TLS on, to its own): a new
+// connection to one of them (its original destination port, which Docker's DNAT translates to the
+// front container's, so the input chain never sees it) forwarded to a container bridge (the
+// stack's network: another translation to the port, a cluster's service address, is not judged)
+// is dropped from any interface but those roles' (the stack's own containers reach the front by
+// its routes' names, on their network); nil when none is held,
+// or in loopback mode, where the front is on the loopback address alone.
+func (in *Installer) frontHolds(env *EnvFile) []byte {
+	if mode, _ := env.Get("STOWAGE_TLS_MODE"); !in.R.Spec.HasFront() || mode == Loopback {
+		return nil
+	}
+	var rules []byte
+	hold := func(ports []string, roles []string) {
+		if len(roles) == 0 || len(ports) == 0 {
+			return
+		}
+		// The input chain's rule (iif) warned of a role without its NIC already.
+		names := in.roleNames(false, roles...)
+		var from string
+		switch len(names) {
+		case 0: // no role named: closed
+		case 1:
+			from = "iifname != " + names[0] + " "
+		default:
+			from = "iifname != { " + strings.Join(names, ", ") + " } "
+		}
+		for _, out := range []string{"br-*", "docker0"} {
+			rules = fmt.Appendf(rules, "meta l4proto tcp ct direction original ct status dnat ct original proto-dst { %s } oifname %q %sdrop\n",
+				strings.Join(ports, ", "), out, from)
+		}
+	}
+	var front []string
+	mode, _ := env.Get("STOWAGE_TLS_MODE")
+	ports, _ := in.frontServedPorts(mode, func(k string) string { v, _ := env.Get(k); return v })
+	for _, n := range ports {
+		front = append(front, strconv.Itoa(n))
+	}
+	hold(front, in.R.Spec.Front.Interfaces)
+	for _, r := range in.R.Spec.L4.Routes {
+		if r.Terminated() {
+			hold([]string{strconv.Itoa(r.Port)}, r.Interfaces)
+		}
+	}
+	return rules
 }
 
 // transparentRoles are the roles the services this start runs on the host's network (hn) intercept
@@ -2518,6 +2605,20 @@ func chainRecord(rules map[string][]byte) []byte {
 // never opened on the others. A tun device is matched by its name (its device's) before its
 // service opens it.
 func (in *Installer) iif(roles ...string) string {
+	names := in.roleNames(true, roles...)
+	switch len(names) {
+	case 0:
+		return ""
+	case 1:
+		return "iifname " + names[0] + " "
+	}
+	return "iifname { " + strings.Join(names, ", ") + " } "
+}
+
+// roleNames are the interfaces' names of the host.interfaces roles given, quoted for nft, as iif
+// matches them, warning (warn) of a NIC role the VM names no NIC for; none for no role or only
+// empty ones.
+func (in *Installer) roleNames(warn bool, roles ...string) []string {
 	var names []string
 	for _, role := range roles {
 		if role == "" {
@@ -2526,19 +2627,13 @@ func (in *Installer) iif(roles ...string) string {
 		dev := role
 		if h := in.R.Spec.Host; h != nil {
 			dev = h.Interfaces[role].DeviceName(role)
-			if i, ok := h.Interfaces[role]; ok && i.Kind != spec.InterfaceTUN && !i.Optional && !roleNamed(in.R.Spec.Name, role) {
+			if i, ok := h.Interfaces[role]; warn && ok && i.Kind != spec.InterfaceTUN && !i.Optional && !roleNamed(in.R.Spec.Name, role) {
 				in.O.logf("warning: no NIC of this VM is named %s (its cloud-config, from before its release named it, names none): its ports reach nothing, a VM made by this release (vm create --interface) names it, and `vm attach` (TrueNAS) or the NIC attached on its platform and `network attach` adds one to this VM", role)
 			}
 		}
 		names = append(names, strconv.Quote(dev))
 	}
-	switch len(names) {
-	case 0:
-		return ""
-	case 1:
-		return "iifname " + names[0] + " "
-	}
-	return "iifname { " + strings.Join(names, ", ") + " } "
+	return names
 }
 
 // familySources splits an allowlist into its IPv4 and IPv6 prefixes, as the firewall's sets

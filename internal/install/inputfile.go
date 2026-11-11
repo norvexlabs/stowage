@@ -2,6 +2,7 @@ package install
 
 import (
 	"bytes"
+	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/asn1"
 	"encoding/base64"
@@ -21,9 +22,9 @@ import (
 	"github.com/norvexlabs/stowage/internal/spec"
 )
 
-// InputFilesDir holds, under the install directory, the file of each file input. It is 0700, and
-// each file 0644: a bind mount gives a container the file alone, whatever uid it runs as, and the
-// directory keeps the host's other users out.
+// InputFilesDir holds, under the install directory, the file of each file input and of each secret
+// delivered as a file. It is 0700, and each file 0644: a bind mount gives a container the file
+// alone, whatever uid it runs as, and the directory keeps the host's other users out.
 const InputFilesDir = ".stowage-inputs"
 
 // HookInputsDir holds, inside the provision hook's container, the file of each file input its env
@@ -218,30 +219,85 @@ func fileInputName(key, v string) string {
 	return key + "-" + hex.EncodeToString(sum[:6])
 }
 
-// fileVars records each file input's path, relative to the install directory compose resolves it
-// against, so a moved directory keeps working; and forgets the path of an input this release no
-// longer declares. Every file input has one, in any mode: a service mounts it whatever was asked.
+// mountedFile is a file the installer writes under InputFilesDir for a service to mount: a file
+// input's content, or the value of a secret delivered as a file (as_file).
+type mountedFile struct {
+	Key string
+	Var string // the variable holding its path
+	// secret: the value is written as it is recorded; else it is a file input's recorded form.
+	secret bool
+}
+
+// mountedFiles are the files this release's services mount: each file input's, then each secret
+// delivered as a file.
+func (in *Installer) mountedFiles() []mountedFile {
+	var files []mountedFile
+	for _, i := range in.R.Spec.Inputs {
+		if i.File() {
+			files = append(files, mountedFile{Key: i.Key, Var: spec.FileVar(i.Key)})
+		}
+	}
+	for _, k := range in.R.Spec.AsFileKeys() {
+		files = append(files, mountedFile{Key: k, Var: spec.SecretFileVar(k), secret: true})
+	}
+	return files
+}
+
+// FileSaltVar is the install's random key the name of a secret's file is made with (secretFileName):
+// recorded in .env, never logged or shown.
+const FileSaltVar = "STOWAGE_FILE_SALT"
+
+// name is f's file for the recorded value v: a new value a new name, so compose recreates what
+// mounts it. A file input's is named by the value's digest (fileInputName); a secret's by an HMAC
+// keyed with the install's salt (env's FileSaltVar), so its name, which docker inspect and the
+// container's mounts show, tells nothing of the value.
+func (f mountedFile) name(env *EnvFile, v string) string {
+	if !f.secret {
+		return fileInputName(f.Key, v)
+	}
+	salt, _ := env.Get(FileSaltVar)
+	m := hmac.New(sha256.New, []byte(salt))
+	m.Write([]byte(v))
+	return f.Key + "-" + hex.EncodeToString(m.Sum(nil)[:6])
+}
+
+// content is what f's file holds for the recorded value v.
+func (f mountedFile) content(v string) ([]byte, error) {
+	if f.secret {
+		return []byte(v), nil
+	}
+	return decodeFileInput(v)
+}
+
+// fileVars records each mounted file's path, relative to the install directory compose resolves it
+// against, so a moved directory keeps working; and forgets the path of a file this release no
+// longer declares. Every one has one, in any mode: a service mounts it whatever was asked.
 func (in *Installer) fileVars(env *EnvFile) {
+	files := in.mountedFiles()
+	if _, ok := env.Get(FileSaltVar); !ok && slices.ContainsFunc(files, func(f mountedFile) bool { return f.secret }) {
+		b := make([]byte, 16)
+		_, _ = io.ReadFull(in.O.rand(), b) // crypto/rand never fails on Linux
+		env.Set(FileSaltVar, hex.EncodeToString(b))
+	}
 	for _, k := range env.Keys() {
-		if key, ok := strings.CutPrefix(k, spec.FileVarPrefix); ok {
-			if i, found := in.R.Spec.Input(key); !found || !i.File() {
+		if strings.HasPrefix(k, spec.FileVarPrefix) || strings.HasPrefix(k, spec.SecretFileVarPrefix) {
+			if !slices.ContainsFunc(files, func(f mountedFile) bool { return f.Var == k }) {
 				env.Delete(k)
 			}
 		}
 	}
-	for _, i := range in.R.Spec.Inputs {
-		if i.File() {
-			v, _ := env.Get(i.Key)
-			env.Set(spec.FileVar(i.Key), "./"+InputFilesDir+"/"+fileInputName(i.Key, v))
-		}
+	for _, f := range files {
+		v, _ := env.Get(f.Key)
+		env.Set(f.Var, "./"+InputFilesDir+"/"+f.name(env, v))
 	}
 }
 
-// writeInputFiles writes each file input's file for the start to mount; an empty value writes an
+// writeInputFiles writes each mounted file for the start to mount; an empty value writes an
 // empty file, as the engine would make a directory of a path it does not find.
 func (in *Installer) writeInputFiles(env *EnvFile) error {
 	dir := in.path(InputFilesDir)
-	if !slices.ContainsFunc(in.R.Spec.Inputs, spec.Input.File) {
+	files := in.mountedFiles()
+	if len(files) == 0 {
 		return nil
 	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -250,17 +306,14 @@ func (in *Installer) writeInputFiles(env *EnvFile) error {
 	if err := os.Chmod(dir, 0o700); err != nil {
 		return err
 	}
-	for _, i := range in.R.Spec.Inputs {
-		if !i.File() {
-			continue
-		}
-		v, _ := env.Get(i.Key)
-		content, err := decodeFileInput(v)
+	for _, f := range files {
+		v, _ := env.Get(f.Key)
+		content, err := f.content(v)
 		if err != nil {
-			return fmt.Errorf("input %s: its recorded value: %w", i.Key, err)
+			return fmt.Errorf("input %s: its recorded value: %w", f.Key, err)
 		}
-		if err := writeAtomic(filepath.Join(dir, fileInputName(i.Key, v)), bytes.NewReader(content), 0o644, nil); err != nil {
-			return fmt.Errorf("input %s: %w", i.Key, err)
+		if err := writeAtomic(filepath.Join(dir, f.name(env, v)), bytes.NewReader(content), 0o644, nil); err != nil {
+			return fmt.Errorf("%s: %w", f.Key, err)
 		}
 	}
 	return nil
@@ -278,11 +331,9 @@ func (in *Installer) sweepInputFiles(env *EnvFile) error {
 		return err
 	}
 	var keep []string
-	for _, i := range in.R.Spec.Inputs {
-		if i.File() {
-			v, _ := env.Get(i.Key)
-			keep = append(keep, fileInputName(i.Key, v))
-		}
+	for _, f := range in.mountedFiles() {
+		v, _ := env.Get(f.Key)
+		keep = append(keep, f.name(env, v))
 	}
 	var errs []error
 	for _, e := range entries {
@@ -526,6 +577,9 @@ func (in *Installer) shownValue(k, v string, secrets map[string]bool) string {
 		return fileInputDigest(v)
 	}
 	if key, ok := strings.CutPrefix(k, spec.FileVarPrefix); ok && secrets[key] {
+		return "<redacted>"
+	}
+	if strings.HasPrefix(k, spec.SecretFileVarPrefix) || k == FileSaltVar {
 		return "<redacted>"
 	}
 	return v

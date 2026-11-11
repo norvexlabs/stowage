@@ -426,7 +426,12 @@ func newCommand(r *Release, self string, stdout, stderr io.Writer, tools K8sOpti
 			return nil, err
 		}
 		return in.ExportSecrets(recipients)
-	}))
+	}, settableShow(r.Spec, func(cmd *cobra.Command, key string) (string, error) {
+		if err := prepare(); err != nil {
+			return "", err
+		}
+		return in.ShowSecret(cmd.Context(), key)
+	})))
 	if r.Spec.Shapes.Kubernetes != nil {
 		root.AddCommand(k8sCommand(in, &o, prepare, terminal, &sets, &setFiles, &answers, &noInput, &accessible, func(c *cobra.Command, uninstall bool) {
 			jsonFlag(c, verbKind{k8s: true, uninstall: uninstall})
@@ -635,15 +640,40 @@ func k8sCommand(in *Installer, o *Options, prepare func() error, terminal func(b
 		pf.StringVar(&o.RegistryCA, "registry-ca", "", "a PEM file of the CA the release's registry's certificate chains to, a mirror's own")
 		k.AddCommand(prov)
 	}
+	var rotateTimeout time.Duration
+	var rotate func(cmd *cobra.Command, key, pass string) error
 	if slices.ContainsFunc(in.R.Spec.Secrets, func(s spec.Secret) bool { return s.Rotation }) {
-		var rotateTimeout time.Duration
-		k.AddCommand(secretsCommand(in.R.Spec.Name, o.Out, func(c *cobra.Command) {
-			c.Flags().DurationVar(&rotateTimeout, "timeout", 6*time.Minute, "how long kubectl waits for each restarted workload to be ready")
-		}, func(cmd *cobra.Command, key, pass string) error {
+		rotate = func(cmd *cobra.Command, key, pass string) error {
 			return run(cmd, rotateTimeout, false, func(ctx context.Context) error { return in.K8sRotateSecret(ctx, key, pass) })
-		}, nil, nil, nil, nil))
+		}
+	}
+	show := settableShow(in.R.Spec, func(cmd *cobra.Command, key string) (v string, err error) {
+		err = run(cmd, 0, false, func(ctx context.Context) error { v, err = in.K8sShowSecret(ctx, key); return err })
+		return v, err
+	})
+	if rotate != nil || show != nil {
+		k.AddCommand(secretsCommand(in.R.Spec.Name, o.Out, func(c *cobra.Command) {
+			if c.Name() == "rotate" {
+				c.Flags().DurationVar(&rotateTimeout, "timeout", 6*time.Minute, "how long kubectl waits for each restarted workload to be ready")
+			}
+		}, rotate, nil, nil, nil, nil, show))
 	}
 	return k
+}
+
+// settableShow is show when the spec has a settable secret, else nil: `secrets show` is offered
+// only where there is one to show.
+func settableShow(sp *spec.Spec, show func(cmd *cobra.Command, key string) (string, error)) func(cmd *cobra.Command, key string) (string, error) {
+	if slices.ContainsFunc(sp.Secrets, func(s spec.Secret) bool { return s.Settable }) {
+		return show
+	}
+	return nil
+}
+
+// isTerminal reports whether w is a terminal: `secrets show` prints nowhere else.
+var isTerminal = func(w io.Writer) bool {
+	f, ok := w.(*os.File)
+	return ok && term.IsTerminal(int(f.Fd()))
 }
 
 // secretValue is the value `secrets set KEY` records: asked on terminal when standard input is
@@ -724,8 +754,28 @@ func pipedInput(f *os.File) bool {
 // returns written where --output says (none without it); flags adds the shape's own flags to each.
 func secretsCommand(name string, stdout io.Writer, flags func(*cobra.Command), rotate func(cmd *cobra.Command, key, pass string) error,
 	set func(cmd *cobra.Command, key, value string) error, check func(key, value string) error, terminal func(accessible bool) Prompter,
-	export func(cmd *cobra.Command, recipients []string) ([]byte, error)) *cobra.Command {
-	s := &cobra.Command{Use: "secrets", Short: "The install's secrets: rotate one, set one, or export them all for a disaster recovery", Args: cobra.NoArgs}
+	export func(cmd *cobra.Command, recipients []string) ([]byte, error), show func(cmd *cobra.Command, key string) (string, error)) *cobra.Command {
+	s := &cobra.Command{Use: "secrets", Short: "The install's secrets: rotate one, set one, show a settable one, or export them all for a disaster recovery", Args: cobra.NoArgs}
+	if show != nil {
+		c := &cobra.Command{
+			Use:   "show KEY",
+			Short: "Print the value the install records for a secret whose spec entry has settable: true (a login), on a terminal only: refused when standard output is a pipe or a file",
+			Args:  cobra.ExactArgs(1),
+			RunE: func(cmd *cobra.Command, args []string) error {
+				if !isTerminal(stdout) {
+					return fmt.Errorf("%s: standard output is no terminal: `secrets show` prints a value on a terminal only, never into a pipe, a file or a log; `secrets export` carries the secrets encrypted", args[0])
+				}
+				v, err := show(cmd, args[0])
+				if err != nil {
+					return err
+				}
+				_, err = fmt.Fprintln(stdout, v)
+				return err
+			},
+		}
+		flags(c)
+		s.AddCommand(c)
+	}
 	if set != nil {
 		var accessible bool
 		c := &cobra.Command{
@@ -1080,7 +1130,7 @@ func vmCreateCommand(in *Installer, o *Options, prepare func() error, terminal f
 	af.DurationVar(&at.Wait, "wait", 0, "how long to wait for the VM to answer over SSH after its power cycle (default 10m)")
 	_ = attach.MarkFlagRequired("interface")
 	var sc VMCreate
-	var seedChannel string
+	var so SeedOptions
 	stdout := o.Out // the command's standard output, which the seed alone goes to
 	seed := &cobra.Command{
 		Use:   "seed",
@@ -1088,22 +1138,26 @@ func vmCreateCommand(in *Installer, o *Options, prepare func() error, terminal f
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			*takesTLS = true
-			if err := prepare(); err != nil {
-				return err
-			}
-			// Standard output is the seed's alone; nothing is asked.
-			in.O.Out, in.O.Prompt = in.O.Log, nil
-			s, err := in.SeedVM(cmd.Context(), &sc, seedChannel)
+			s, err := func() (*VMSeed, error) {
+				if err := prepare(); err != nil {
+					return nil, err
+				}
+				// Standard output is the seed's alone; nothing is asked.
+				in.O.Out, in.O.Prompt = in.O.Log, nil
+				return in.SeedVM(cmd.Context(), &sc, so)
+			}()
 			if err != nil {
-				return err
+				return printStatusRefused(stdout, err) // a refusal's object, as status --json's
 			}
 			return printJSON(stdout, s)
 		},
 	}
 	sf := seed.Flags()
 	machineFlags(sf, &sc, in.R.Spec, true)
-	sf.StringVar(&seedChannel, "channel", "", "the channel the VM's updates and upgrades follow (default: the release's, "+m.Channel+")")
-	sf.StringVar(&o.TLS, "tls", "", "how the VM's front serves: a mode the release offers a VM, never byo (its certificate goes over SSH, `install --given -`)")
+	sf.StringVar(&so.Channel, "channel", "", "the channel the VM's updates and upgrades follow (default: the release's, "+m.Channel+")")
+	sf.StringVar(&o.TLS, "tls", "", "how the VM's front serves: a mode the release offers a VM; byo makes the first install wait for the certificate, given over SSH (`install --given -`)")
+	sf.BoolVar(&so.AwaitSecrets, "await-secrets", false, "the first install waits for a decrypted secrets export, given over SSH once the VM answers (`install --secrets -`)")
+	sf.StringVar(&so.DiskDir, "disk-dir", "", "write --platform's disk into this directory, decompressed, and name it in the seed (disk_file)")
 	sf.StringSliceVar(domains, "domains", nil, "a route's domain, route=host: HTTPS")
 	sf.IntVar(&o.HTTPPort, "http-port", 0, "the VM's port a TLS front serves HTTP on (default the project's front.http_port, else 80)")
 	sf.IntVar(&o.HTTPSPort, "https-port", 0, "the VM's port a TLS front serves HTTPS on (default the project's front.https_port, else 443)")
@@ -1116,7 +1170,28 @@ func vmCreateCommand(in *Installer, o *Options, prepare func() error, terminal f
 	var seedJSON bool
 	sf.BoolVar(&seedJSON, "json", false, "print the seed as one JSON object (required: the seed is for a program)")
 	_ = seed.MarkFlagRequired("json")
-	vm.AddCommand(create, seed, destroy, attach, truenasCommand(os.Getenv))
+	var hk VMReach
+	hostKey := &cobra.Command{
+		Use:   "host-key HOSTNAME",
+		Short: "Read the VM's own SSH host key through the key it is checked by, retire its seed's one-time key, and print the VM's key as JSON",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			k, err := func() (*VMHostKey, error) {
+				if err := prepare(); err != nil {
+					return nil, err
+				}
+				in.O.Out = in.O.Log
+				hk.Host = args[0]
+				return in.HostKey(cmd.Context(), hk)
+			}()
+			return printHostKey(stdout, in.O.Log, k, err, true)
+		},
+	}
+	reachFlags(hostKey.Flags(), &hk.User, &hk.SSHKey, &hk.Address, &hk.KnownHostsLine)
+	var hkJSON bool
+	hostKey.Flags().BoolVar(&hkJSON, "json", false, "print the key as one JSON object (required: it is for a program)")
+	_ = hostKey.MarkFlagRequired("json")
+	vm.AddCommand(create, seed, destroy, attach, hostKey, truenasCommand(os.Getenv))
 	if k := in.vmKitCommand(o, prepare, terminal); k != nil {
 		vm.AddCommand(k)
 	}

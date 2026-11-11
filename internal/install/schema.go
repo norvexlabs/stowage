@@ -212,7 +212,18 @@ func (in *Installer) runCommand(ctx context.Context, r commandRun, c providers.R
 	if !ok {
 		return fmt.Errorf("no image %s is recorded", c.Image)
 	}
-	svc := confined(r.service, strings.ReplaceAll(ref, "$", "$$"), c.Cmd, in.recordedEnv(stack))
+	base, cleanup, err := in.pullEnviron(stack)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+	userCtx, userCancel := context.WithTimeout(ctx, 30*schemaUnit+time.Duration(c.TimeoutS)*schemaUnit)
+	user, err := in.hookUser(userCtx, ref, stack.Environ(base))
+	userCancel()
+	if err != nil {
+		return err
+	}
+	svc := confined(r.service, strings.ReplaceAll(ref, "$", "$$"), user, c.Cmd, in.recordedEnv(stack))
 	if hosts := in.targetHosts(); len(hosts) > 0 {
 		svc["extra_hosts"] = hosts
 	}
@@ -256,7 +267,7 @@ func (in *Installer) runCommand(ctx context.Context, r commandRun, c providers.R
 		return command.ErrNoAnswer
 	}
 	if err != nil {
-		return fmt.Errorf("%s: %w", op, err)
+		return fmt.Errorf("%s: %w", op, hookRanAs(err, user))
 	}
 	if out.over {
 		return fmt.Errorf("%s: the answer is longer than %d bytes", op, maxSchemaAnswer)

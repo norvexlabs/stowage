@@ -41,7 +41,7 @@ func (p *Publisher) publishClouds(ctx context.Context, disks []*artifact) error 
 		if err != nil {
 			return err
 		}
-		name := p.Project.Spec.Name + "-" + d.DigestStr()[len("sha256:"):][:12]
+		name := release.CloudImageName(p.Project.Spec.Name, d.DigestStr())
 		img := cloud.Image{
 			Cloud: c, Name: name, Vars: vars,
 			Description: fmt.Sprintf("%s %s disk %s, published by Stowage", p.Project.Spec.Name, f, d.DigestStr()),

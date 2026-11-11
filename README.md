@@ -86,7 +86,7 @@ sh notes.sh
 | **Version** | developer | The version comes from your changelog, a file, a git tag or a command; a scheme (CalVer, SemVer, regex, command) validates and orders it. Stowage never compares versions as strings. `stowage.lock` pins the Stowage that publishes. |
 | **Publish** | developer, CI | `stowage ship` builds what changed, pushes it by digest, signs it, builds the installer and the release manifest, then moves the channel's pointer. `verify`, `promote` (beta → stable without rebuilding), `yank`, `prune`, `releases`. `stowage hook install` ships each version bump on commit. |
 | **Install** | operator | `docker run --rm <prefix>/<name>-installer:latest > <name>.sh` gets the bootstrap script, which carries the installer, `<short>-stow`; then `sh <name>.sh` on Docker; `sh <name>.sh k8s install` on Kubernetes; `sh <name>.sh vm create` for a VM (seed ISO or cloud user-data, or the VM created with OpenTofu: TrueNAS; libvirt, Proxmox VE, vSphere, AWS, Google Cloud and Azure as previews; or a module of your own). Inputs asked once, secrets generated once, provision hook run, portal URL printed. |
-| **Operate** | operator | `status`, a re-run to change inputs, ports or the TLS mode (the changes logged, the previous values kept), `provision`, `secrets rotate` (stage, swap, finish: the old value accepted meanwhile), `secrets set` (a chosen value for a `settable` secret), `secrets export` (age-encrypted, to rebuild a machine), `reset-db`. |
+| **Operate** | operator | `status`, a re-run to change inputs, ports or the TLS mode (the changes logged, the previous values kept), `provision`, `secrets rotate` (stage, swap, finish: the old value accepted meanwhile), `secrets set` (a chosen value for a `settable` secret), `secrets show` (a `settable` secret's value, on a terminal), `secrets export` (age-encrypted, to rebuild a machine), `reset-db`. |
 | **Upgrade** | operator | `upgrade --version V` fetches that release's installer, checks its signature against the keys the install trusts and brings the stack up on the new images — on Docker after a `pg_dump` snapshot, on Kubernetes through Helm. On the VM, `updates` lists what the channel offers and `upgrade` reboots into the new OS. |
 | **Roll back** | operator | `rollback` returns to the previous release — unless a migration since then is a rollback barrier your schema-compat provider reports, in which case it refuses and names it. On the VM the health gate does it alone: an upgraded boot that is not healthy in time falls back to the previous system. |
 | **Recover** | operator | On the VM: scheduled and pre-upgrade backups (`pg_dump` and the volumes the project lists, or those volumes alone for a project without a database, encrypted to age keys, uploaded with rclone to any rclone remote), `restore` into a side database swapped in once loaded whole, and a disaster recovery from exported secrets. |
@@ -102,6 +102,7 @@ sh notes.sh
 | Rollback refused past a schema barrier | ✓ | ✓ (`shapes.kubernetes.schema`) | ✓ |
 | `reset-db`, `secrets rotate` | ✓ | ✓ | ✓ |
 | `secrets set` | ✓ | — | ✓ |
+| `secrets show` | ✓ | ✓ | ✓ |
 | `secrets export` | ✓ | — | ✓ |
 | Install from a mirror | ✓ | ✓ | ✓ |
 | A failed upgrade undone on its own | — | ✓ (Helm `--wait`, rolled back when not ready) | ✓ (health gate) |
@@ -477,7 +478,7 @@ a real registry, the local Docker engine, a kind cluster and a VM on TrueNAS
 | inputs digests and the build graph | |
 | installer (Docker): loopback and every TLS front (`acme`, `dns-cloudflare`, `byo`, `internal`), terminal form, `install`, re-run (changes the inputs and the front's ports), `status` (`--json`), `ps`, `logs`, `restart`/`stop`/`start`, `exec`, `schema`, `uninstall` (`--data`), `provision`, `script`, `upgrade` (`--version` fetches the release's installer), `rollback`, `reset-db`, `--dry-run`, `--offline`, a mirror and its CA (`--registry`, `--registry-ca`); `mirror export` / `mirror import` (a release carried as one file to a site without internet); `secrets rotate`, `secrets export` and `--secrets` (a machine made again) | scheduled backup, restore, chart library, `upgrade --reset-db` |
 | installer (Kubernetes): `<short>-stow k8s install`, `upgrade` (`--version`), `rollback`, `status` (`--json`), `reset-db`, `uninstall` (`--data`), `provision` (the hook as a Job after the release, its outputs in a Secret and handed back, `--set`), `secrets rotate`, `tune`, `--dry-run`, `--no-provision`, `--image-registry`, `--image-pull-login`, `--registry-ca`, `--unsafe-sysctls` | barrier pre-flight before `rollback` |
-| installer (Kairos VM): `<short>-stow vm create` (the disk image by digest, the cloud-config on a seed ISO or as user-data, the platform's steps; or the VM created with OpenTofu — TrueNAS's module, the previews for libvirt, Proxmox VE, vSphere, AWS, Google Cloud, Azure and Scaleway, or the operator's own holding the module contract — waited for until it installed; from a mirror whose CA the VM then trusts), `vm seed --json` (the first-boot material for a VM made by other means), `vm destroy` and `vm attach` (a NIC for a role a newer release names, on TrueNAS); `<short>-stow` in the OS bundle — the first install from the cloud-config's settings, `install` from the preloaded images, the boot (install up again, upgrade to the OS's release, back to the replaced one), `describe`, `--json` on `install`, `upgrade` and `rollback`, the host daemon and its verbs (`status` (`--json`), `health`, `events`, `ps`, `logs`, `restart`/`stop`/`start`, `provision`, `updates`, `upgrade`, `rollback` to the passive system, `reset-db`, `network` with its auto-revert, `backup` — scheduled, before an upgrade, or now, encrypted to age keys and uploaded with rclone; `verify` of proposed settings —, `restore`, `secrets export` and `rotate`, `reboot`, `shutdown`), its disk-pressure watch (`hooks.maintenance.disk_pressure`), its app socket for the services `host_api` names, the health gate judging each boot (Kairos boot assessment: an upgraded boot not healthy in time falls back to the passive system, unless going back is refused at a rollback barrier: it is then kept), a default-deny firewall (`vm create --ssh-allow`), the time zone (`--timezone`), a disaster recovery (`vm create --secrets`) | |
+| installer (Kairos VM): `<short>-stow vm create` (the disk image by digest, the cloud-config on a seed ISO or as user-data, the platform's steps; or the VM created with OpenTofu — TrueNAS's module, the previews for libvirt, Proxmox VE, vSphere, AWS, Google Cloud, Azure and Scaleway, or the operator's own holding the module contract — waited for until it installed; from a mirror whose CA the VM then trusts), `vm seed --json` (the first-boot material for a VM made by other means), `vm host-key` (its own host key, the seed's retired; `<short>-stow host-key` on the VM itself), `vm destroy` and `vm attach` (a NIC for a role a newer release names, on TrueNAS); `<short>-stow` in the OS bundle — the first install from the cloud-config's settings, `install` from the preloaded images, the boot (install up again, upgrade to the OS's release, back to the replaced one), `describe`, `--json` on `install`, `upgrade` and `rollback`, the host daemon and its verbs (`status` (`--json`), `health`, `events`, `ps`, `logs`, `restart`/`stop`/`start`, `provision`, `updates`, `upgrade`, `rollback` to the passive system, `reset-db`, `network` with its auto-revert, `backup` — scheduled, before an upgrade, or now, encrypted to age keys and uploaded with rclone; `verify` of proposed settings —, `restore`, `secrets export` and `rotate`, `reboot`, `shutdown`), its disk-pressure watch (`hooks.maintenance.disk_pressure`), its app socket for the services `host_api` names, the health gate judging each boot (Kairos boot assessment: an upgraded boot not healthy in time falls back to the passive system, unless going back is refused at a rollback barrier: it is then kept), a default-deny firewall (`vm create --ssh-allow`), the time zone (`--timezone`), a disaster recovery (`vm create --secrets`) | |
 
 ## Reference — for people and AI agents
 
@@ -1165,13 +1166,13 @@ These are what `lint` checks; each finding names the key path or `file:line` to 
     (a loopback address in every mode and without a front, for a port only this host may reach: 127.x or `::1`,
     bare — Compose's port syntax takes `::1:5432:5432`), `STOWAGE_IPV6` (`true` with `--ipv6`, else `false`; Docker and the VM),
     `STOWAGE_L4_<ROUTE>` (an `l4` route's endpoint, `<address>:<port>`, for a route with an
-    `address_input`; Docker and the VM), `STOWAGE_INPUT_FILE_<KEY>` (the path of a file input's file, to mount; Docker and the VM). The variables a service's `services` entry gives it
+    `address_input`; Docker and the VM), `STOWAGE_INPUT_FILE_<KEY>` (the path of a file input's file, to mount; Docker and the VM), `STOWAGE_SECRET_FILE_<KEY>` (the path of the file a secret with `as_file: true` is delivered as, to mount; Docker and the VM). The variables a service's `services` entry gives it
     (`STOWAGE_MEM_LIMIT_MB`, `STOWAGE_HOST_MEM_MB`, `STOWAGE_HOST_CPUS`; `STOWAGE_CPUS`) are in its container's
     environment, not the compose file's: a command reads them escaped, `$${STOWAGE_MEM_LIMIT_MB}`,
     and `${STOWAGE_MEM_LIMIT_MB}` is an unknown variable;
   - an unknown `STOWAGE_…` variable, a `STOWAGE_IMAGE_<KEY>` naming no image, a
     `STOWAGE_URL_<ROUTE>` naming no route, a `STOWAGE_L4_<ROUTE>` naming no `l4` route with an
-    `address_input` or a `STOWAGE_INPUT_FILE_<KEY>` naming no file input is an error, and so is a compose file with no service;
+    `address_input`, a `STOWAGE_INPUT_FILE_<KEY>` naming no file input or a `STOWAGE_SECRET_FILE_<KEY>` naming no secret delivered as a file is an error, and so is a compose file with no service;
   - service names starting `stowage-` are Stowage's (it adds the front as `stowage-front`), and so
     are top-level `volumes` and `networks` starting `stowage-` (the front's data volume is
     `stowage-front-data`).
@@ -1214,7 +1215,7 @@ These are what `lint` checks; each finding names the key path or `file:line` to 
     `$img := index .Values.stowage.images "<key>"`. `lint` warns when no template reads
     `.Values.stowage.images`;
   - `<short>-stow k8s` adds these values at install time (absent from the published chart, so guard
-    them with `{{ with }}`, or `stowage.secret` with `{{ required }}`, and `stowage.files` too in a chart whose project always asks a file input on Kubernetes): `stowage.files`, the name of the Secret `<release>-stowage-files` holding each file input's content under its key, empty when the release has no file input (mount it, one `subPath: KEY` per file, as [examples/full](examples/full/deploy/chart/templates/api.yaml) does; a file input's key in `stowage.secret` is its recorded form, no file to read); `stowage.secret`, the name of the Secret holding
+    them with `{{ with }}`, or `stowage.secret` with `{{ required }}`, and `stowage.files` too in a chart whose project always asks a file input on Kubernetes): `stowage.files`, the name of the Secret `<release>-stowage-files` holding each file input's content under its key, empty when the release has no file input (mount it, one `subPath: KEY` per file, as [examples/full](examples/full/deploy/chart/templates/api.yaml) does; a file input's key in `stowage.secret` is its recorded form, no file to read); `stowage.secretFiles`, the name of the Secret `<release>-stowage-secret-files` holding each secret delivered as a file (`as_file: true`) under its key, empty when the release delivers none (mount it as a volume with one `items` entry per key; a key there is in `stowage.secret` too only while a revision of the helm history reads it there, for a rollback); `stowage.asFile`, the keys the release delivers as files; `stowage.secret`, the name of the Secret holding
     the release's secrets and Kubernetes inputs as `KEY: value` (give each container only the
     keys it reads, with `env: [{name: K, valueFrom: {secretKeyRef: {name: …, key: K}}}]`;
     `envFrom` would give every container every secret), and `stowage.pullSecret`, the name of the `kubernetes.io/dockerconfigjson` Secret
@@ -1226,7 +1227,8 @@ These are what `lint` checks; each finding names the key path or `file:line` to 
     template reads `.Values.stowage.secret` while the project has a secret or a text input on
     Kubernetes, when no template reads `.Values.stowage.pullSecret` while its pull account is
     a `token`, when no template reads `.Values.stowage.files` while a file input is asked on
-    Kubernetes, and when no template reads `.Values.stowage.sysctls`;
+    Kubernetes, when no template reads `.Values.stowage.secretFiles` while a secret is delivered
+    as a file there, and when no template reads `.Values.stowage.sysctls`;
   - with an `endpoint` (see "Extensions"), the chart exposes that route's `upstream:
     <service>:<port>` as the Service `<release>-<service>` on that port: `<short>-stow k8s` prints
     `http://<release>-<service>.<namespace>.svc:<port>` as the project's endpoint.
@@ -1505,7 +1507,7 @@ These are what `lint` checks; each finding names the key path or `file:line` to 
 - **Provision hook** (`hooks.provision`, provider `container`: `image` an `images` key, `cmd`,
   `env` required, optional `returns` and `outputs` a file name): Stowage runs `cmd` as the container's whole
   command line (the image's entrypoint is not used). On Docker and the VM it runs in a service it
-  adds (`stowage-provision`), on the project's `default` network, as the image's own user, with no capability,
+  adds (`stowage-provision`), on the project's `default` network, as the image's own user when it declares one other than root, else as uid and gid 65534 (no hook is given root; a hook so run that fails says it ran so and that the fix is the image's: `give the image a USER of its own, non-root, that its program runs as`; the image's user read from the engine, `docker image inspect`, the image pulled first when the engine no longer holds it, another failure to read it failing the run: `the hook's image <ref>, whose user it runs as: …`), with no capability,
   `no-new-privileges`, a read-only root filesystem (`/tmp` a `tmpfs`, its only writable path) and no host file but the file inputs its `env` names (see "File inputs" under the installer); on Kubernetes as a Job (see the installer on Kubernetes).
   `env` lists the keys it receives as environment — each an input, a secret or a safe default
   (lint: anything else is an error; `[]` for none; a key listed twice or not a variable name is an
@@ -1690,14 +1692,14 @@ backup. On Kubernetes
 | `stack.compose` | the compose file (its contract: "The contracts a project must honour"): `extends` within the file, `profiles:` only those an input's `profile` names, a `ports:` entry past this host an error with a `kairos` shape and a warning on `docker` |
 | `tune.profile` | optional: the tuning profile of the hosts the `docker` and `kairos` shapes run on (see "Network tuning" under the installer): `default` (the same as no `tune`: Docker's path as fast as the host's network) or `network` (a host serving a heavy network load); the operator may choose another (`--tune-profile`). Another name is an error, and so is `tune:` without a profile; a project with neither a `docker` nor a `kairos` shape is warned: a node is the cluster's |
 | `services` | optional: what a compose service asks of the host beyond its compose file, by service (one the compose file does not declare is an error, as are `services:` left empty and a service asking nothing): `memory`: the percent of the host's RAM its memory limit is (`memory: 25`), or that percent with a minimum and a maximum (`memory: { percent: 25, min: 256M, max: 16G }`, either left out), on Docker and the VM, recomputed at each start (see "What a service asks of the host" under the installer). Each share is a whole percent from 1 to 90, together at most 90 (the rest is the OS's, the engine's and Stowage's). A share's map takes `percent`, `min` and `max` alone. `min` and `max` are sizes (`512M`, `1.5G`, `16GiB`: binary units, `k` to `p`; a bare number is bytes, a fraction of a byte dropped). Split among the service's containers (`scale`, `deploy.replicas`; one written as a variable counts as 1), each part of either under 64 MiB is an error (`min: 0`, `max: 0`, or either left empty, too: leave it out for none), and so is a `min` over the `max` (`min: 1025M: over the share's max 1G, which it would always win over`); a `min` whose part is at most what the compose file gives each container itself is warned (`… which always wins: the min never changes its limit`); for `max`, so is a part under what the compose file gives each container itself — the largest of `mem_limit`, `mem_reservation`, `deploy.resources.limits.memory` and `deploy.resources.reservations.memory` written as a number of bytes or a size Compose reads (not a variable), its `extends` base's included. With a `kairos` shape stating `size.min.memory` and no `docker` shape, a maximum the percent already reaches on that least VM is warned, counting 90 % of its memory as the RAM its kernel shows: the limit is then always the maximum, and a compose limit of the maximum's part for each container says it plainly. With a `kairos` shape stating `size.min.memory`, each share is computed on that least VM as the install computes it (90 % of its memory as the RAM its kernel shows, the percent, the maximum, then the floors): a share stating no `min` (nor a `max` under 128 MiB for each container, a limit the project chose) whose limit comes out under 128 MiB there is warned (`services.<name>.memory: 5 % of the least VM's 2G (1843M of it shown by its kernel) is a 92M limit for <name>, under 128M: state the least it needs as the share's min (memory: { percent: 5, min: <size> })`), and so are the shares' floors together (each the largest of its `min`, its compose limit or reservation and 64 MiB, for each container) over the 90 % of that RAM the shares get (`services: the memory shares' floors … total …, over the … the least VM … leaves the shares (90 %): its services may be OOM-killed under load`). A project with neither a `docker` nor a `kairos` shape is warned: the chart gives its pods their resources; `cpus`: whole cores of its own, 1 to 64, which the install gives it from the host's (Docker and the VM: its `cpuset`, from the last core down, a core's SMT threads together, never the core of CPU 0; a host of too few cores fails the start, and an upgrade to such a release is refused before it changes anything); with a `kairos` shape, services' `cpus` together over `size.min.cpus` less one (CPU 0's core) is an error, and over `size.recommended.cpus` less one a warning (`shapes.kairos.size.<min|recommended>.cpus: N: services.*.cpus (<services>) ask M whole cores, and a VM of N CPUs has N-1 beside the one of CPU 0, which stays the host's: its start fails`; a vCPU counts as a core); `irq`: `off` (the default) or `on`, whether the host's NICs' interrupts and receive steering go on those cores too (it needs `cpus`); `nftables`: a file of the project holding its nftables table, one `table inet <service> { … }` alone, as nft lexes it (a quoted string's braces and `#` are the string's, a comment is nothing, a backslash before a newline continues the line; no carriage return, form feed or vertical tab, which nft refuses: no `include`, no word `ruleset`, nothing before or after the table, its braces balanced; the service's name a table's: a letter, then letters, digits and `_ - .`, never the project's, whose table is the VM's own firewall's, nor a word of nft's own (each nft 1.1.6 refuses as a table's name, such as `queue`, `log`, `meta`, `mark` or `tunnel`), compared exactly: nft's are lower-case); a chain hooking the input, prerouting or ingress with a drop policy is warned (a base chain of any table judges every packet, so it drops what the VM's own firewall accepts — SSH, the stack's ports — unless it accepts them itself), which the VM loads before the service starts (see "A service's nftables table" under the installer). Or the table an input picks: `nftables: { input: KEY, files: { <value>: <file>, … } }` (both keys, no other: an error otherwise), each value a letter or digit, then letters, digits and `_ . -` (at most 64), each file judged as a table file above, and all declaring the same named sets (their feeders and inputs fill them whatever the value: `its files declare different sets (<value>: [a b], <value>: [a c])`); the input not `secret` nor `advanced`, nor another's (a set's, an L4 route's, a front route's or its `forward_auth`'s, an extension's, a service's address: `KEY is also <key>'s: an input picking a table picks it alone`), asked in every mode and with no profile, on every shape among `docker` and `kairos` the project has, with a `default` naming one of the values, or `required` (an empty value picks nothing) — each an error; lint counts it as read. Each start loads the table its value picks, so a re-run changing the value (`--set KEY=<value>`) loads the other at the next start; a value without a file is refused as the input is given (`KEY: "<v>" picks no table of <service> (services.<service>.nftables.files: <values>)`, for each service whose table the input picks) and by the start, before any table loads; the start's refusal names the fix (`…: a re-run of the install, `<short>-stow --dir DIR --set <input>=<value>`, picks one`; on the VM `sudo <short>-stow install --set …`); an upgrade to a release with no file for the install's recorded value takes the input as one the release adds (`upgrade --set KEY=<value>`, `--answers`, asked on a terminal, else its default; on the VM its default, or the boot refuses a required one), noted first (`note: KEY: "<old>" picks no table of <project> <version>: it is given, asked or defaulted again`) and warned when the value changes (`warning: KEY: "<old>" picks no table of <project> <version>, so it is now "<new>": …`), and a `rollback` takes back the value each input picking a table had before the upgrade, which the previous release ran with (`<KEY> goes back to "<value>", the value <project> <version> ran with`), a change since included; a payload whose files declare different sets is refused when it is read. The installer carries each file; `tune --print` on a Docker host prints each, labelled `services.<service>.nftables.files.<value>, the table KEY=<value> picks`: the install's value's alone once it records one, else each (load one alone: two would merge into one table), with a note when the install's record does not read or its value picks no table (`# note: KEY: "<v>" picks no table of <service> (…): a start that loads the table refuses it; …`); `sets`: the named sets of its table each start fills from an input, by set (`sets: { trusted: TRUSTED_PROBES }`): a set the table does not declare, an input not declared, `secret` (the firewall's rules show it), asked in one mode only (`when`) or with a profile only (`profile`), or not on every shape among `docker` and `kairos` the project has (its `shapes`), a `default` holding an element nft does not read, an empty map and a service without `nftables` are errors; lint counts the input as read; `feeds`: the services whose tables' sets this one feeds through the VM's app socket, so a load of one of those tables recreates it too: a service without `nftables`, the service itself, one given twice and an empty list are errors; a feeder not in `shapes.kairos.host_api`, and one without a `kairos` shape, are warned; `flush_conntrack`: `true` flushes the host's connection-tracking table after a start loads the service's table anew (its first load, another file picked, changed rules, a table absent), or after a start changes the elements of one of its sets an input fills, so the connections open before meet the tables and sets now loaded as new ones (see "A service's nftables table" under the installer); on a service without `nftables` it is an error; `transparent`: the `host.interfaces` roles (a `tun` one included) the service's table intercepts traffic on, steering it to the service's own transparent sockets (TPROXY: `tproxy … to :<port>`, with a policy route to the `local` table in the role's `routing_policy_rules` and `routes`), which keeps its original destination: the VM's input chain accepts on each role what the kernel hands a transparent socket (see "The firewall" under the installer on the Kairos VM), never on another (the listeners bind every address). A role not declared, one given twice, an empty list, a service without `nftables` or not on the host's network (`host_network`) are errors; without a `kairos` shape, a warning (a Docker host's input chain is its operator's: `tune` advises the rule); `host_network`: `true` runs the service on the host's network on Docker and the VM, as the VM runs an `l4` route's (see "Services on the host's network" under the installer): the stack reaches it by name, and an `l4` route to it keeps its port as the service's own. Its compose `network_mode`, `ports:`, `networks:`, more than one container, and an `interface` are errors; with neither a `docker` nor a `kairos` shape, a warning (the chart's pod sets `hostNetwork` itself, as it must beside them); `front_hosts`: what a service on the host's network (`host_network`, or an L4 route's upstream with a `kairos` shape; another is an error) maps the front's routes' domains to in its `/etc/hosts`: `loopback` (the default: `127.0.0.1`), `host-gateway` (Docker's host-gateway address, the default bridge's gateway: an address of the host's own that is not the loopback, where the front answers too, for a server that refuses the loopback as a destination) or `none` (no mapping: DNS answers them); `interface` and `address_input`, together: a `host.interfaces` NIC and an input (not `secret`; a `default` must be an IP address) holding the address the service has of its own on it, an ipvlan network beside the stack's (the service not on the host's network: `network_mode` is an error); lint counts that input as read; `update`: how a start replaces its container, `stop-first` (the default: Compose's own) or `start-first` (the new container healthy beside the old before the old one stops — see "An upgrade that overlaps" under the installer), which is an error for a service with an `interface`, a `container_name` (its `extends` base's included), a fixed address (`mac_address`, or a network's `ipv4_address`, `ipv6_address` or `mac_address`; its `extends` base's included), more than one container (`scale`, `deploy.replicas`, or either written as a variable), another service in its namespaces (`network_mode`, `pid` or `ipc: service:<name>`) or mounting its volumes (`volumes_from: [<name>]` or `[service:<name>]`, with `:ro` or `:rw`; its `extends` base's included), another service linking to it (`links: [<name>[:alias]]`: reach it by its name), a network namespace of another (`network_mode: service:…` or `container:…`), `ports:` while it is not on the host's network (two containers cannot publish one port: run it with `network_mode: host`, the port shared by `SO_REUSEPORT` or `update_socket`, or reach it through the front), or a healthcheck with `disable: true` or `test: ["NONE"]`, or whose test never tells when the new container serves (a list not of `CMD`, `CMD-SHELL` or `NONE`, for which Docker runs no probe; a blank command — a blank string or `CMD-SHELL ""` passes at once, a `CMD` without one never passes; a command that is not a string; the string `NONE`, a shell command that never passes), or whose `disable` is true as Compose casts it (`true`, `yes`, `y`, `on`, any case, as a boolean or a string); a `disable` from a variable or a string Compose does not read as a boolean, and a test from a variable (a `$$` escape is none; its head included, which is then not refused), are warned (lint cannot tell); one whose compose file sets no healthcheck, or one without a `test` (or an empty one), is warned (the overlap then waits for the image's own, and without one only for the new container to run), and so is one an L4 route targets with a `docker` shape while it is not on the host's network (`network_mode: host` or `host_network`; its port is published from its network there, so its starts on Docker are stop-first), and, without `update_socket`, one on the host's network (`network_mode: host`, `host_network`, or an L4 route's upstream with a `kairos` shape: both containers then listen on its ports, so the app sets `SO_REUSEPORT`); `update_socket`: a directory of the container (absolute and clean, not `/`; with `update: start-first` alone) both containers of an overlap mount, for the old one to hand its listening sockets to the new; `update_signal`: the signal the overlap sends the old container once the new one runs, before it waits for the new one's health (`SIGHUP`, `SIGINT`, `SIGQUIT`, `SIGTERM`, `SIGUSR1`, `SIGUSR2` or `SIGWINCH`; with `update: start-first` alone), for a server whose old process hands its listeners over only when told to go (Docker and the VM; a chart's rolling update has no equivalent); `update_ready`: a file name (no `/`, not `.` or `..`; with `update_socket` and `update_signal`, else an error) the new container writes in its `update_socket` directory once it is ready to take the old one's sockets: the overlap sends `update_signal` only then; `update_decline_status`: an exit status from 1 to 124 (0 is an error) (125 and up are the engine's, the shell's and the signals') by which the new container declines the overlap, the start then replacing the service stop-first; with `update_signal` and no `update_ready` it is warned (the signal goes as soon as the new container runs, and a decline after it fails the start); each of the two with `update: start-first` alone; with a start-first service, each key of a service joining a container by name or ID (`network_mode`, `pid`, `ipc` or `volumes_from: container:…`, `external_links`), or holding a variable (`links` included), is warned once (the install replaces that start-first service stop-first if it is its), but a start-first service's own `network_mode: container:…`, refused above; its own `network_mode` from a variable is warned (stop-first if it resolves to `service:…` or `container:…`, or to a network of its own while it publishes ports, an L4 route's on Docker included; without `update_socket`, the app's to share its ports if `host`), and spares it the `ports:` refusal and the Docker L4 warning. Whatever the spec, a compose service's `volumes_from`, `links` or `external_links` that is not a list of strings is an error, as Compose refuses it (`… is not a list: Compose takes a list of strings`, `<entry> is not a string, which Compose refuses`) |
-| `front` | optional: absent or empty, the project has no front (see "A project without a front"). `tls_modes` (`acme`, `dns-cloudflare`, `byo`, `internal`, `none`), `routes[]` (`name`, `domain_input`, `path` (optional: the prefix the route serves on its domain — `/idp` serves `/idp` and what is under it, kept in the request the upstream gets; `/`, then segments of letters, digits, `.`, `_`, `~` or `-`, no `.` or `..` segment, no trailing `/`, no wildcard, matched whatever its case; without one, every path another route of the domain does not serve), `upstream: <service>:<port>`, `strip_headers`, where a trailing `*` matches a prefix; `forward_auth`: `address_input` (required), `uri_input`, `copy_headers` (header names); `allow_input`; `client_auth` (`true`: the route requires a client certificate the install's `--client-ca` issued; refused when the project offers no TLS mode, `none` alone, as the route would refuse everyone — see the installer's front); `basic_auth`: `user` and `secret`, a login the front asks for (the key of a spec secret without `rotation` or of a `secret: true` input; not beside `forward_auth`) — see the installer's front), `portal` (both `routes` and `portal` are left out by a front serving `l4` routes with `tls` alone: see "A front for L4 routes alone"), `loopback_ports` and `loopback_env` (only when `tls_modes` offers `none`), `publish_ca` (`volume`: a volume the compose file declares; refused when the project offers neither `internal` nor `byo`), `http_port` and `https_port` (the host ports a TLS front publishes unless an install's `--http-port` / `--https-port` move them; absent or 0 is 80 and 443; they must differ, and, where a TLS mode is offered, `https_port` is not 80, the front's plain HTTP port in its container). `interface`: a `host.interfaces` role the VM's firewall opens the front's ports on alone (none: every interface; an undeclared one is an error; without a `kairos` shape, a warning: a Docker host's firewall is its operator's). A route with a guard (`basic_auth`, `client_auth`, `forward_auth`, `allow_input`) to a service on the host's network (`host_network`, a compose `network_mode: host`, or an L4 route's upstream with a `kairos` shape, "the VM's network (an L4 route's upstream)" in the message) is warned (`front.routes[N].upstream: <service> runs on the host's network, where every container of the stack reaches its port <port> directly, at the host's gateway, past the route's <guards>: <service> checks who calls it itself`): the firewall accepts the port from the stack's bridges, and the guard is the front's alone. Route names must give distinct `STOWAGE_URL_` variables; routes sharing a `domain_input` differ by their `path` (two without one, or with the same one, are an error), and a route with `client_auth` has its `domain_input` alone (a client certificate is asked for a whole domain). An input `forward_auth` or `allow_input` names must be an input of the `docker` shape and, with a `kairos` shape, of that one too, and neither `required` (empty is how the front leaves it off) nor asked in one mode only (`when`); an `allow_input` input is not `advanced` (never asked, it would refuse everyone). Lint counts these inputs, and a `basic_auth` input, as read |
+| `front` | optional: absent or empty, the project has no front (see "A project without a front"). `tls_modes` (`acme`, `dns-cloudflare`, `byo`, `internal`, `none`), `routes[]` (`name`, `domain_input`, `path` (optional: the prefix the route serves on its domain — `/idp` serves `/idp` and what is under it, kept in the request the upstream gets; `/`, then segments of letters, digits, `.`, `_`, `~` or `-`, no `.` or `..` segment, no trailing `/`, no wildcard, matched whatever its case; without one, every path another route of the domain does not serve), `upstream: <service>:<port>`, `strip_headers`, where a trailing `*` matches a prefix; `forward_auth`: `address_input` (required), `uri_input`, `copy_headers` (header names); `allow_input`; `client_auth` (`true`: the route requires a client certificate the install's `--client-ca` issued; refused when the project offers no TLS mode, `none` alone, as the route would refuse everyone — see the installer's front); `basic_auth`: `user` and `secret`, a login the front asks for (the key of a spec secret without `rotation` or of a `secret: true` input; not beside `forward_auth`) — see the installer's front), `portal` (both `routes` and `portal` are left out by a front serving `l4` routes with `tls` alone: see "A front for L4 routes alone"), `loopback_ports` and `loopback_env` (only when `tls_modes` offers `none`), `publish_ca` (`volume`: a volume the compose file declares; refused when the project offers neither `internal` nor `byo`), `http_port` and `https_port` (the host ports a TLS front publishes unless an install's `--http-port` / `--https-port` move them; absent or 0 is 80 and 443; they must differ, and, where a TLS mode is offered, `https_port` is not 80, the front's plain HTTP port in its container). `interfaces`: the `host.interfaces` roles the front answers on alone, as an L4 route's `interfaces` (an undeclared role, one given twice and an empty list are errors; leave it out for every interface): the VM's firewall holds them, and a Docker host's once its operator consents (`tune --apply`; without a `kairos` shape, a warning saying so) — see "The firewall" under the installer on the Kairos VM and the consent's chains on a Docker host. With `acme`, port 80 must answer on the role the CA's validation servers reach (HTTP-01), else no certificate is issued; the `dns-*` modes need no inbound port. A route with a guard (`basic_auth`, `client_auth`, `forward_auth`, `allow_input`) to a service on the host's network (`host_network`, a compose `network_mode: host`, or an L4 route's upstream with a `kairos` shape, "the VM's network (an L4 route's upstream)" in the message) is warned (`front.routes[N].upstream: <service> runs on the host's network, where every container of the stack reaches its port <port> directly, at the host's gateway, past the route's <guards>: <service> checks who calls it itself`): the firewall accepts the port from the stack's bridges, and the guard is the front's alone. Route names must give distinct `STOWAGE_URL_` variables; routes sharing a `domain_input` differ by their `path` (two without one, or with the same one, are an error), and a route with `client_auth` has its `domain_input` alone (a client certificate is asked for a whole domain). An input `forward_auth` or `allow_input` names must be an input of the `docker` shape and, with a `kairos` shape, of that one too, and neither `required` (empty is how the front leaves it off) nor asked in one mode only (`when`); an `allow_input` input is not `advanced` (never asked, it would refuse everyone). Lint counts these inputs, and a `basic_auth` input, as read |
 | `l4` | `routes[]`: host ports published to a service as they are, beside the front and never through it — `name` (1 to 15 lowercase letters, digits or `-`, starting with a letter, no `-` at its end or beside another, as a chart names a Service port after it; neither another L4 route's nor a front route's name), `protocol` (`tcp` or `udp`), `port` (the host port, 1–65535; one route per protocol and port), `upstream: <service>:<port>` (a compose service; with a `kairos` shape, or a service on the host's network on every shape (`services.<name>.host_network`), its port is the route's, as the service runs on the host's network, where nothing maps one port to another — on a route with `tls` it is another port, as the front holds the route's — and the service declares no `networks:` (its `extends` base's included) and runs one container — see "L4 routes" under the installer), `address_input` (optional: an input, not `secret`, holding the host name or address clients dial — a lowercase host name whose last label is not all digits, or an IP address; no port, scheme or zone. It is checked when given, and lint checks its `default`; the install records the route's endpoint `STOWAGE_L4_<ROUTE>` from it, and lint counts it as read), `allow_input` (optional: an input holding the source addresses and CIDRs, separated by commas or spaces, the firewall lets reach the port — empty refuses every source (a route with `tls` takes none in loopback mode, where it is published on the loopback address alone); checked when given. The VM's firewall enforces it, and a Docker host's once its operator consents (`tune --apply`, see "A Docker host's gateway" under `tune`), so with neither a `docker` nor a `kairos` shape it is a warning (the route is open to every source); its input is asked on those of the two shapes the project has, on no other (`shapes: [docker, kairos]`: a cluster's firewall is its own), is neither `secret` (the firewall's rules show it) nor `advanced` (never asked, it would refuse every source) nor asked in one mode only (`when`); lint counts it as read; on the `docker` shape a route to a service on the host's network (`host_network`) is warned: Docker translates no port to it, and the host's input chain is its operator's, so the route is open to every source there), `bind_input` (optional: an input holding the host address the route's port is published on, every address while it is empty; on the VM, the address the firewall accepts the port on — `advanced`, as only a host serving several installs sets it, and not `secret` (the published ports show it); checked as an IP address without a zone when given; lint counts it as read; an error, with a `docker` shape, for a route to a `host_network` service, which listens on the addresses it binds itself where nothing on Docker holds it to one), `interfaces` (optional: the `host.interfaces` roles the VM's firewall opens the route's port on alone, one rule `iifname { … }` — a resolver offered on a VPN tun and a client LAN, never on the uplink; an undeclared role, one given twice and an empty list are errors; without a `kairos` shape, a warning). `tls` (optional, a TCP route's alone: the front terminates TLS on the route's port with the certificate its TLS mode gives the route's domain — `acme`, `dns-cloudflare`, `byo` and `internal` as for an HTTP route, the same certificate store, renewal and `status` certificate line — and forwards the plaintext stream to `upstream`; see "L4 routes the front terminates TLS on" under the installer): `domain_input` (required: the input holding the domain, asked and checked as a front route's `domain_input`, `--domains <route>=<host>` giving it; may be a front route's own domain; not `secret`, not a file input; one the project declares must be asked on every install the front terminates the route on — neither `optional` nor `advanced`, nor `when: loopback`, nor `shapes` leaving out the project's `docker` or `kairos` shape —, else leave it undeclared) `client_auth` (`true`: a client certificate the install's `--client-ca` issued is required, as a front route's `client_auth`) and `alpn` (optional: the ALPN protocols the upstream speaks, e.g. `[postgresql]` or `[http/1.1]`, which the front selects when a client offers one and refuses a client offering only others (but one offering `http/1.1` to a list holding `h2`, which Go's TLS lets through with none); absent, the front selects no protocol, whatever the client offers: the stream is the upstream's. Each is 1 to 255 letters, digits, `.`, `_`, `/`, `+` or `-`, none twice, never `stowage-no-alpn`, the front's own). Lint refuses `tls` on a UDP route, and in a project with no front or whose `tls_modes` offer `none` alone; it warns of a route with `allow_input` or `client_auth` whose upstream runs on the host's network (on the VM every L4 route's), which every container of the stack reaches directly, past them; and on the `docker` shape of an upstream with `host_network`, whose plaintext port is open to whoever reaches the host. With a `kubernetes` shape, a chart whose templates never read `.Values.stowage.l4` is warned. Over TCP a route's port may not be one the front publishes by default: `front.http_port` / `https_port` (80 and 443) in a TLS mode, a route's `loopback_ports` in loopback mode, and 80 and 443 while `acme` is offered (its challenges need them). The same port over UDP is free. See "L4 routes" under the installer |
 | `health` | `http-json` (`service`, `port`, `path`, `liveness_path`, `expect`: the JSON fields a ready answer carries), `http-status` (the same, `expect` a 200–399 status, default 200), `command` (`image`, `cmd`, `timeout_s`). The VM's health gate and `<short>-stow health` run it; the Docker installer waits on the compose healthchecks (`up --wait`), then judges a stack `--wait` refused by each service's state (every one running, healthy when it has a healthcheck, or exited 0) |
 | `database` | optional (see "A project without a database" above); given, `engine` (`postgres` only), `service`, `name`, `roles.migrate`, `roles.app` (all required; one role twice is allowed), `schema_compat` (`sql`, `command`, `none`; `sql`'s `baseline`, an integer ≥ 0 where absent or 0 means 1 (every other provider is at 1), is the schema epoch the release's migrations start from: see the upgrade notes on schema baselines) |
-| `data` | optional: `volumes.<name>.{uid, keep_on_reset}`, `reset` (volumes not `keep_on_reset`; empty is a warning, and `reset-db` refuses it; without a `database`, an error when not empty): the volumes `reset-db` wipes on Docker and the VM (on Kubernetes it deletes every claim of the release). `uid` (0 to 4294967294; absent, the volume is left as Docker makes it — owned by the image's directory it mounts on, root when the image has none): on Docker and the VM, a volume a service mounts that the engine does not hold yet — the stack's first start, or after `reset-db` wiped it — is given to `uid` as that start makes it, before the services start: the containers are made first (`up --no-start`), so the volume already holds what the image put there, then, when its root belongs to another user, it is given to `uid` recursively (`chown -hR uid`: the group kept, a symbolic link changed itself, never what it points to), logging `volume <name> given to its uid`. The volumes a start makes are listed in `.stowage-volumes-pending` (0600) until they have their uid: a start cut off in between, or a release without the helper, leaves them listed, and the next start that mounts them gives it; one a service mounts while no `uid` is owed to it, or that is gone, is struck off. A volume that exists otherwise keeps its owner (its data's: an upgrade never re-owns it), and an `external` one is never touched. The chown runs as root, offline, in the volume helper (`<name>-chown`, busybox pinned by digest), which `ship` builds and publishes for a project with such a volume and the `docker` or `kairos` shape, a Docker install pulls with the stack's images (recorded as `STOWAGE_CHOWN_IMAGE`, by digest or, offline, by tag) and the OS bundle preloads. A release an earlier Stowage published carries none: started again by a rollback, its new volumes keep the owner Docker gives them until a release with the helper starts, and the start logs `<name> <version> carries no volume helper: <volumes> keep the owner Docker gave them until a release with one starts`. On Kubernetes the chart sets its own `securityContext` |
-| `secrets[]` | `key`, `gen`: `hex32`, `hex16` (random bytes, hex), `pass18`, `pass32` (alphanumeric), `b64-32` (base64url); `rotation: true` lets `secrets rotate` replace it (`KEY_NEXT`, `KEY_PREVIOUS` and `KEY_ACCEPTED` are then reserved names, recorded empty beside it, and the compose file must read both `KEY_NEXT` and `KEY_PREVIOUS`, or `KEY_ACCEPTED` alone); `settable: true` lets `secrets set` record a value the operator chooses (a password people type), refused beside `rotation` (`secrets[N].settable: KEY rotates: …`) and on a secret the database's service reads in its compose `environment` (the database keeps the value it was made with). Generated once at the first install, or at the upgrade that adds it |
+| `data` | optional: `volumes.<name>.{uid, keep_on_reset}`, `reset` (volumes not `keep_on_reset`; empty is a warning, and `reset-db` refuses it; without a `database`, an error when not empty): the volumes `reset-db` wipes on Docker and the VM (on Kubernetes it deletes every claim of the release). `uid` (0 to 4294967294; absent, the volume is left as Docker makes it — owned by the image's directory it mounts on, root when the image has none): on Docker and the VM, a volume a service mounts that the engine does not hold yet — the stack's first start, or after `reset-db` wiped it — is given to `uid` as that start makes it, before the services start: the containers are made first (`up --no-start`), so the volume already holds what the image put there, then, when its root belongs to another user, it is given to `uid` recursively (`chown -hR uid`: the group kept, a symbolic link changed itself, never what it points to), logging `volume <name> given to its uid`. The volumes a start makes are listed in `.stowage-volumes-pending` (0600) until they have their uid: a start cut off in between, or a release without the helper, leaves them listed, and the next start that mounts them gives it; one a service mounts while no `uid` is owed to it, or that is gone, is struck off. A volume that exists otherwise keeps its owner (its data's: an upgrade never re-owns it), and an `external` one is never touched. The chown runs as root, offline, with `CHOWN` and `DAC_READ_SEARCH` alone (`--cap-drop ALL`, `no-new-privileges`), in the volume helper (`<name>-chown`, busybox pinned by digest), which `ship` builds and publishes for a project with such a volume and the `docker` or `kairos` shape, a Docker install pulls with the stack's images (recorded as `STOWAGE_CHOWN_IMAGE`, by digest or, offline, by tag) and the OS bundle preloads. A release an earlier Stowage published carries none: started again by a rollback, its new volumes keep the owner Docker gives them until a release with the helper starts, and the start logs `<name> <version> carries no volume helper: <volumes> keep the owner Docker gave them until a release with one starts`. On Kubernetes the chart sets its own `securityContext` |
+| `secrets[]` | `key`, `gen`: `hex32`, `hex16` (random bytes, hex), `pass18`, `pass32` (alphanumeric), `b64-32` (base64url); `rotation: true` lets `secrets rotate` replace it (`KEY_NEXT`, `KEY_PREVIOUS` and `KEY_ACCEPTED` are then reserved names, recorded empty beside it, and the compose file must read both `KEY_NEXT` and `KEY_PREVIOUS`, or `KEY_ACCEPTED` alone); `as_file: true` delivers it as a file a service mounts, never a variable (see "Secrets delivered as files" under the installer; refused beside `rotation`); `settable: true` lets `secrets set` record a value the operator chooses (a password people type) and `secrets show` print it on a terminal, refused beside `rotation` (`secrets[N].settable: KEY rotates: …`) and on a secret the database's service reads in its compose `environment` (the database keeps the value it was made with). Generated once at the first install, or at the upgrade that adds it |
 | `safe_defaults` | `KEY: value`, the value the compose file defaults to |
-| `inputs[]` | `key`, `prompt` (required), `default` (may name `${KEY}`), `required`, `optional` (exclusive with `required`; otherwise no effect), `secret` (no default), `when: tls\|loopback` (asked only in that mode), `shapes` (`docker`, `kubernetes`, `kairos`; asked only on those), `profile` (a compose profile name, `[a-zA-Z0-9][a-zA-Z0-9_.-]*`, that a service of the compose file carries: the input turns it on while it holds a value — see "Optional services" under the installer; not `required`, and asked on the `docker` or `kairos` shape; lint counts it as read), `advanced` (a tunable: never asked, recorded only when `--set`, `--answers` or the VM's settings give it — never from an exported variable — its default the compose file's — so no `required` or `default`, and the compose file must write it `${KEY:-default}`; a re-run giving it empty removes it), `type` (`file`, any content, or `pem`, PEM blocks: a file input, see "File inputs" under the installer; no `default`, not `advanced`). An input left empty is recorded empty. An input asked on the `docker` or `kairos` shape that no compose service, no route and no provision hook's `env` reads is a warning (one asked on `kubernetes` only is the chart's) |
+| `inputs[]` | `key`, `prompt` (required), `default` (may name `${KEY}`), `required`, `optional` (exclusive with `required`; otherwise no effect), `secret` (no default), `when: tls\|loopback` (asked only in that mode), `shapes` (`docker`, `kubernetes`, `kairos`; asked only on those), `profile` (a compose profile name, `[a-zA-Z0-9][a-zA-Z0-9_.-]*`, that a service of the compose file carries: the input turns it on while it holds a value — see "Optional services" under the installer; not `required`, and asked on the `docker` or `kairos` shape; lint counts it as read), `advanced` (a tunable: never asked, recorded only when `--set`, `--answers` or the VM's settings give it — never from an exported variable — its default the compose file's — so no `required` or `default`, and the compose file must write it `${KEY:-default}`; a re-run giving it empty removes it), `type` (`file`, any content, or `pem`, PEM blocks: a file input, see "File inputs" under the installer; no `default`, not `advanced`), `as_file` (with `secret: true`, not on a file input: the value is delivered as a file, see "Secrets delivered as files" under the installer; `describe --json` gives it as `as_file`). An input left empty is recorded empty. An input asked on the `docker` or `kairos` shape that no compose service, no route and no provision hook's `env` reads is a warning (one asked on `kubernetes` only is the chart's) |
 | `extensions[]` | the apps an install of this project can be pointed at (see "Extensions"): `name` (an app name, as `name` is; not this project's; none twice), `input` (required: an input holding the extension's endpoint, empty while it is off — `optional`, not `secret`, no `default`, and read by a compose service, a route or the provision hook's `env`, or asked on `kubernetes` only, where the chart reads it), `prompt` (required: what the install's tip calls it; the `input` is neither `advanced` nor asked in one mode only, `when`, so every install records it), `key_input` (an `optional` `secret` input holding its credential, asked on the same shapes as `input`, neither `advanced` nor `when`, and read as `input` is). No input is named by two extensions, or twice by one |
 | `handoffs[]` | what this project issues to another install, sealed in a kit (see "Handoff kits"): `name` (lower-case letters, digits, `-`, at most 24, unique), `for` (the target project's name), `instance` (optional: the question naming the instance a kit is for), `ask[]` (optional: `key`, `prompt` (required), `secret`; a variable name, neither `STOWAGE_*` nor `COMPOSE_*`, no recorded key), `run` (`image`, an images key; `cmd`; `env`, the recorded keys it receives, no file input), `gives` (what the run must print: target input names, or `KIT_TLS_CERT` and `KIT_TLS_KEY` together, `KIT_TLS_CA` with them, `KIT_TLS_CLIENT_CA`), `check` (optional: as `run`). Lint checks this side alone, as it cannot see the target's spec; the target's installer checks each key. An image used by a handoff alone is used. |
 | `endpoint` | a route of `front.routes`: this project's endpoint when another project uses it as an extension. Its installer prints the route's URL at the end of an install (see "Extensions") |
@@ -1748,6 +1750,7 @@ again, to copy an installer to another host.
 <short>-stow secrets export --recipient AGE_KEY… [-o FILE|-] [--dir D]   # the secrets, encrypted
 <short>-stow secrets rotate KEY [--stage | --finish] [--dir D]           # a secret with rotation: true
 <short>-stow secrets set KEY [--accessible] [--dir D] < value            # a secret with settable: true; asked, unechoed, on a terminal
+<short>-stow secrets show KEY [--dir D]                                   # a settable secret's value, printed on a terminal only
 <short>-stow provision [--dir D] [--set KEY=VALUE]…                      # run the provision hook again; --set an input only it reads, or a value it returned or declares it returns
 <short>-stow upgrade [--dir D] [--set KEY=VALUE]… [--set-file KEY=PATH]… [--answers FILE] [--no-input] # the NEW release's installer
           [--ports route=port]… [--offline] [--dry-run] [--no-provision] [--accessible] [--json]
@@ -2012,8 +2015,9 @@ again, to copy an installer to another host.
     installer an install keeps, `<dir>/<short>-stow`.
   - `shapes`: the shapes the spec declares, in the order `docker`, `kubernetes`, `kairos`.
   - `inputs`: the spec's inputs in the spec's order (the form's), each `{key, type, secret,
-    required, optional, shapes, when, advanced, profile, prompt, default}` as `inputs` declares it,
-    every field present: `type` is `text`, `file` or `pem`; `shapes` is `[]` for an input of every
+    required, optional, shapes, when, advanced, as_file, profile, prompt, default}` as `inputs`
+    declares it, every field present: `type` is `text`, `file` or `pem`; `as_file` is true for a
+    secret input delivered as a file; `shapes` is `[]` for an input of every
     shape; `when`, `profile`, `prompt` and `default` are `""` when the spec gives none. A secret
     input's `default` is never printed: the key is left out.
   - `first_install_only`: the settings an install records at its first run and a re-run refuses,
@@ -2061,8 +2065,26 @@ again, to copy an installer to another host.
   Docker, no helm release in the namespace on Kubernetes (`k8s upgrade`, `--version` too, and `k8s
   rollback`; never `k8s uninstall`, whose "nothing to uninstall" does not tell what helm keeps of a
   release — read `k8s status --json`) — never an install of another project or a release not from
-  Stowage's chart, and never on the VM, whose host daemon answers its verbs
-  (its `status --json` answers before the first install, `installed` `null`). A run that
+  Stowage's chart. On the VM, a verb that needs the install, run before the first install (`ps`,
+  `logs`, `restart`, `backup run`, `restore`, `rollback`, …), is refused, `absent` true (`<name>
+  is not installed yet: \`sudo <short>-stow install\` installs it`, its fix `sudo <short>-stow
+  install`, exit 3): the host daemon answers it 409 with `absent` and the verb's client carries
+  it; `upgrade` and `updates` still serve a VM whose first install did not run or was refused
+  (below), and `status --json` answers before the first install, `installed` `null`. A Docker
+  host's `backup`, `backup config` and `restore` verbs answer the same refusal with Docker's
+  words and fix (`<dir> holds no install`, the directory absolute, `install first, or give the
+  --dir of the install`) for a `--dir` that does not exist, is no directory or lies under a file,
+  before the daemon of their process is made (nothing is made there); whatever fails as that
+  daemon is made is reported as itself (an interruption, an exit status kept), never as an
+  unreachable daemon. A `--dir` that is a directory is the verb's to judge (its daemon's lock
+  files are made there first): the backup timer's `backup run` still skips one whose install is
+  not made. The k8s refusal of a missing release is one on every verb: its reason and its fix
+  name the install to run, with what this run was given that the install takes
+  (`--image-registry`, `--registry-ca`, `--image-pull-login`, `--values`, `--unsafe-sysctls`,
+  `--no-provision`; never `--dry-run`, as the install named is the one to run, nor `--timeout`,
+  each verb's own), the fix adding `, given the inputs this run was given (…)` when it was given any
+  (never a value); `k8s upgrade --version V` says `… to upgrade to V`.
+  A run that
   fails prints no object, only its error. `upgrade --version --json` passes `--json` to the
   installer it fetches, which prints the object; the run that fetched it prints none and exits
   with that installer's status (an installer from before 0.34.0 refuses the flag).
@@ -2420,7 +2442,7 @@ again, to copy an installer to another host.
   one's container is still there; a run the installer stops (timeout, interrupt, output past its
   bounds) has its container removed. `provision --set` corrects an input only the hook reads —
   one its `env` lists and the compose file never names, no route's domain, and none at all when the stack may read `.env` itself (an `env_file`; a mount of
-  `.env`, of the install directory or a directory above it, or of a source with `$` or `~`, but one that is exactly a file input's `${STOWAGE_INPUT_FILE_<KEY>}`; a top-level `secrets` or `configs` entry whose `file` is such a path; a
+  `.env`, of the install directory or a directory above it, or of a source with `$` or `~`, but one that is exactly a file input's `${STOWAGE_INPUT_FILE_<KEY>}` or a secret's delivered as a file `${STOWAGE_SECRET_FILE_<KEY>}`; a top-level `secrets` or `configs` entry whose `file` is such a path; a
   volume with `driver_opts`) — recorded in `.env`; or it sets a value the hook returned before or
   declares it returns (a key `provision.env` holds, or one `hooks.provision.returns` lists, that
   the install does not record), recorded in `provision.env` and handed to the next run, where an
@@ -2496,6 +2518,21 @@ again, to copy an installer to another host.
   database's service reads in its `environment` — by name or interpolated, an `env_file` not
   read: `secrets[N].settable: KEY is read by the database's service …`). Docker and the Kairos VM; on Kubernetes,
   not yet.
+- `secrets show KEY` prints the value the install records for a secret with `settable: true` (a
+  login an operator signs in with; any other is refused, naming the ones that have it), one line
+  on standard output, which must be a terminal: into a pipe or a file it is refused before the
+  value is read, so it never lands in a log or a script's output (`secrets export` carries the
+  secrets off the machine, encrypted). On Docker it reads `.env`, so it needs the user that can
+  (root, for an install under `/opt`); on the VM the host daemon answers it on the operator's
+  socket alone (`POST /v1/secrets/show {"key"}` → `{"value"}`, never logged; 400 for a key that is
+  not settable, 404 for one the install does not record, 409 for an install running another
+  release than the OS's); on Kubernetes (`k8s secrets show KEY`) it reads the release's Secret
+  `<release>-stowage` (`<release>-stowage-secret-files` for a secret delivered as a file). Each
+  shape shows only with the installer of the release the install runs (another is refused,
+  naming the one to use), whose spec says which secrets are settable. The verb is there only when the spec has a settable secret, and an
+  install's, a re-run's and an upgrade's closing report then names them on a `logins` line with
+  the command that shows one (`<short>-stow secrets show KEY --dir D`, `sudo <short>-stow secrets
+  show KEY` on the VM, `<short>-stow k8s secrets show KEY …` on Kubernetes).
 - `reset-db` takes the install back to its first setup, run by the installer of the release it
   runs (another is refused, naming the one to use). It refuses, before anything changes, a
   `data.reset` volume the release's compose file does not declare at top level, declares
@@ -2871,6 +2908,43 @@ again, to copy an installer to another host.
   `--set-file KEY=PATH` or, for an optional one, `--set KEY=` (on the VM, `sudo <short>-stow install`). On Kubernetes the hook's Job gets the same: the file read-only at `/run/stowage/inputs/<KEY>`, from the Secret below, and the variable holding that path; a hook cannot return that variable. A `command`
   provider's container gets neither on any shape.
   On Kubernetes a file input is asked as on Docker, with `--set-file` on `k8s install` and, for an input the release adds, `k8s upgrade` (`--set-file` passes on with `upgrade --version`, and an installer made before it refuses it as unknown). The release's Secret records its value as above, and the Secret `<release>-stowage-files` (labelled, applied server-side beside it, one of that name another tool wrote never written over) holds its content under its key, an empty file while the input is empty, for the chart to mount from `.Values.stowage.files`. A release with no file input writes no such Secret, gives `files: ""` on every deploy and leaves one of that name another tool wrote alone. A key no input declares any more stays with what it holds until `k8s uninstall` deletes the Secret (in every case, as the release's Secret brings it back): the release a rollback or a failed upgrade leaves running mounts it. So the content of a dropped file input, a secret one's too, stays in that Secret until then; `kubectl delete secret` before the next deploy clears it. A release declaring that input again asks it, as any input it adds; left empty, its file is emptied, logged (`input KEY: nothing recorded, so its file in the Secret <release>-stowage-files is emptied`). An `upgrade`, or `install` over a kept Secret, is refused when a value it keeps is one the release cannot read (the message above; an install given the key replaces it). `--given` replaces a value of the right form this release's checks refuse, and on an upgrade never changes its form, text to file or back, as the release a rollback brings back reads it too. An upgrade asks a required file input recorded empty, and restarts what reads it. `k8s reset-db --new-baseline` takes `--set-file` for a file input the release adds; without `--new-baseline` it refuses the flag. A hook whose `env` names a file input no longer asked on Kubernetes gets neither its file nor its value.
+- Secrets delivered as files (`as_file: true` on a `secrets[]` entry, or on an input with `secret:
+  true`): the value is recorded as any other, but a service reads it from a file, never from a
+  variable — a variable is in `docker inspect`, in every child process's environment and in
+  whatever in the container parses untrusted input. On Docker and the VM each start writes it
+  beside the file inputs, `.stowage-inputs/<KEY>-<12 hex>` (the same modes: the directory 0700,
+  the file 0644), the hex an HMAC-SHA256 of the value keyed with the install's random
+  `STOWAGE_FILE_SALT` (recorded in `.env` at the first start that writes one, never logged or
+  shown), so the name `docker inspect` and the container's mounts show tells nothing of the value;
+  and records its path as `STOWAGE_SECRET_FILE_<KEY>` in `.env`; a service mounts it (`- ${STOWAGE_SECRET_FILE_DB_KEY}:/run/secrets/db_key:ro`) and is
+  told its path in a variable of its own (`DB_KEY_FILE: /run/secrets/db_key`, the `_FILE`
+  convention many images read). An optional input left empty writes an empty file. A new value
+  (`secrets set`, a re-run giving the input) is a new path, so compose recreates what mounts it,
+  and the file of the old value goes once the stack has started; the path's change is not
+  logged, and `--dry-run` shows the path and the salt `<redacted>`. Lint
+  refuses `${KEY}` of such a secret anywhere in the compose file (`${KEY} is delivered as a file
+  (as_file: true), never as a variable: mount ${STOWAGE_SECRET_FILE_KEY}`), `as_file` on an input
+  that is no secret or is a file input already, on a secret that rotates (its passes hand the
+  services `KEY_NEXT` and `KEY_PREVIOUS` as variables beside it), and a handoff step's `env`
+  naming one. A provision hook's `env` may name one: its container gets the file read-only at
+  `/run/stowage/inputs/<KEY>` and `STOWAGE_SECRET_FILE_<KEY>` holding that path, never the
+  variable, on every shape. A `command` provider's container receives it as a variable, as it
+  receives every recorded value: that is the `command` contract, and its image is the project's
+  own tool, not a service. On Kubernetes the value is written to the Secret
+  `<release>-stowage-secret-files` (labelled, applied server-side, one of that name another tool
+  wrote never written over), never to `<release>-stowage` (one that Secret already holds, from a
+  release that read it as a variable, stays there with its value, as that release reads it after
+  a rollback or a failed upgrade, while a revision of the release's helm history reads it there: a
+  run drops it once every deployed revision lists it in its values' `stowage.asFile`, the keys a
+  release delivers as files), so an `envFrom` of the release's Secret cannot
+  reach it; a key that Secret holds stays there too, given the current value, while a later
+  release no longer delivers it as a file, so a rollback never mounts an older value, and one no
+  release declares any more stays there alone until `k8s uninstall`; the chart mounts it from `.Values.stowage.secretFiles` as a Secret
+  volume, as [examples/full](examples/full/deploy/chart/templates/api.yaml) does. Every key the
+  release delivers so is there, empty while it holds none. An upgrade reads it back from there,
+  and `k8s upgrade --given` restarts what mounts it; `k8s uninstall` deletes it, and keeps it
+  with `<release>-stowage` when the data is kept. `secrets show` reads it, and `status --json`
+  lists a secret input recorded there.
 - Optional services (an input's `profile`): the install records `COMPOSE_PROFILES` in `.env`, the
   profiles whose input holds a value, comma-separated and sorted (recorded empty while none is;
   not recorded for a project whose inputs name no profile). Every `docker compose` the installer
@@ -3410,7 +3484,7 @@ with `tune` and neither a `docker` nor a `kairos` shape.
   host; a pair through a NIC role with no NIC named is not applied (`warning: host.interfaces.<role>:
   no NIC of this host plays it (`--interface <role>=<NIC>` on a re-run names one): the forwarding
   through it is not applied`, and `status` adds `no forwarding through <roles> (no NIC named:
-  --interface)`); the L4 routes' source allowlists, IPv4's alone, the chain `STOWAGE-ALW-<8 hex>`,
+  --interface)`); the L4 routes' source allowlists and the published ports' interfaces, the chain `STOWAGE-ALW-<8 hex>`,
   which `DOCKER-USER` jumps to (`iptables`), replaced whole at each start (`iptables-restore`, one
   transaction: a chain flushed or edited meanwhile holds again) and recorded under
   `/run/<name>-gateway-<8 hex>-allow.rules`: for each route with an `allow_input`, a connection
@@ -3438,14 +3512,53 @@ with `tune` and neither a `docker` nor a `kairos` shape.
   backend, publishes the ports past it) fails (`the L4 routes' source allowlists cannot hold:
   iptables' FORWARD does not jump to DOCKER-USER, …: turn its iptables on, or `<short>-stow tune
   --revert``, and `the forwarding between the host's interfaces cannot hold: …` for a release
-  that forwards). At boot the tables' unit (below) applies
+  that forwards). The same chain holds a published port to its `host.interfaces` roles (the
+  front's two, `front.interfaces`, outside loopback mode; an L4 route's `interfaces`, the front's
+  port for one it terminates TLS on): a connection to it returns to `DOCKER-USER` arriving on a
+  role's NIC (`--interface ROLE=NIC`, as the forwarding names it), crossed with the route's
+  allowlist when it has one, and is dropped from any other (another network's container dialling
+  the host's address included) — of the connections Docker
+  forwards to a container bridge (`-o br-+`, `-o docker0`), so another translation to the port is
+  not judged. A port held so needs its service on a bridge Docker makes and names itself, which
+  it translates the port to: a network of the `bridge` driver with no `driver_opts` but the neutral ones
+  (`com.docker.network.driver.mtu`, `com.docker.network.bridge.enable_icc`,
+  `….enable_ip_masquerade`, `….host_binding_ipv4`, `com.docker.network.container_iface_prefix`,
+  `com.docker.network.enable_ipv4`, `….enable_ipv6`); another driver, and any other option — a bridge it is told to
+  use, a routed gateway, trusted host interfaces, one Stowage does not know — let clients reach the
+  container past the holds. Lint refuses, for the front (`front.interfaces`, or an L4 route it
+  terminates TLS on with `interfaces`: the project's default network) and each interfaced route's
+  upstream Docker publishes (not on the host's network, as every L4 upstream is on the VM), such a
+  compose network (`networks.<key> is of the <driver> driver` or `sets <option> <value>, and
+  <service> is on it while <key> holds its ports to interfaces: …; leave its driver and driver_opts
+  to Docker (the neutral ones aside)`), a `network_mode` (`services.<name>.network_mode <mode>: …: leave
+  network_mode out`) and an address of its own on a NIC (`services.<name>.interface: <name> has an
+  address of its own on <role>, past what <key> holds: leave one of them out`); and a start, on the
+  VM and on a Docker host where the holds apply, refuses the same before it stops or starts
+  anything, an external network as `docker network inspect` gives its driver and options (`… make
+  the external network <name> again with Docker's own bridge (`docker network create <name>`, no
+  -d and no -o but an MTU)`; output that does not read is refused, naming the network). In an
+  upgrade that refusal comes with the new release's files in place, as a missing external network
+  does, and the upgrade's failure says how to go on. A host daemon's own defaults
+  (`default-network-opts`) are its operator's. Values that do not read (a boot before the start)
+  hold the front's ports the spec gives, its own unless the install moved them; and
+  a role no NIC is named for adds none (closed), warned (`warning:
+  host.interfaces.<role>: no NIC of this host plays it (…): the ports held to it answer no client
+  through it`), and `status` adds `no client through <roles> to the ports held to it (no NIC
+  named: --interface)`. Such a route is published on IPv4 alone while the consent
+  stands, as an allowlisted one is; the front's ports too while the stack's IPv6 is off, and with
+  `--ipv6` the hold is ip6tables's too (Docker translates the front's IPv6 clients then), a start
+  failing when ip6tables' `FORWARD` does not jump to `DOCKER-USER` (`… cannot hold for IPv6: …:
+  turn its ip6tables on, or `<short>-stow tune --revert``); a hold that was IPv6's and is no more
+  leaves that chain empty. `status` says `interfaces of <front, routes> held`, or `… not held (…)`,
+  and `tune --revert` notes that they answer on every interface, published as the consent
+  published them, until the next start. At boot the tables' unit (below) applies
   them from the install's recorded values before Docker restores the containers — a record that
   does not read drops every source of those ports — so no route is open a moment past its list;
   a route to a service on the host's network is not translated, so its allowlist holds nothing
   there; `status` adds `source allowlists of <routes>` once a start as root applied the lists the
   release and the recorded values give, saw Docker's `FORWARD` jump to `DOCKER-USER` and brought
   the stack up (a boot alone never says so), else `source allowlists of <routes> not held (no start as root applied
-  them since this release or these values, or its error says why)`, and `source allowlists left (the next start as root removes them)` once the release
+  them since this release or these values, or its error says why)`, and `published ports' holds left (the next start as root removes them)` once the release
   declares none while a chain is recorded; `forwarding` once every table took the rules the
   release and the devices give now, else `forwarding not applied (no start as root applied it since this
   release or these devices, or its error says why)`, or `forwarding left (the next start as root removes it)` once the
@@ -3665,6 +3778,7 @@ the current directory. A release with no chart (published without the shape) is 
 <short>-stow k8s provision [--namespace NS] [--release R] [--kube-context C] [--set KEY=VALUE]…
                        [--registry-ca FILE]                           # a project with a provision hook
 <short>-stow k8s secrets rotate KEY [--stage | --finish] [--namespace NS] [--release R]
+<short>-stow k8s secrets show KEY [--namespace NS] [--release R]   # a settable secret's value from the release's Secret, on a terminal only
                        [--kube-context C] [--timeout 6m]
 <short>-stow k8s tune                                                 # what tunes the network (prints)
 ```
@@ -3981,7 +4095,7 @@ the current directory. A release with no chart (published without the shape) is 
   <release> --wait`, then the provision Job `<release>-stowage` (`kubectl delete
   --cascade=foreground --wait`), the provision hook's RoleBinding, Role and ServiceAccount
   `<release>-stowage-provision`, and the Secrets `<release>-stowage-pull`, `<release>-stowage-provision`,
-  `<release>-stowage-files` and `<release>-stowage`. It deletes only an object whose labels say this installer made it for this
+  `<release>-stowage-files`, `<release>-stowage-secret-files` and `<release>-stowage`. It deletes only an object whose labels say this installer made it for this
   release (`app.kubernetes.io/managed-by: stowage`, `app.kubernetes.io/instance: <release>`); one of
   those names another tool made is kept and named. It takes any release a chart Stowage published
   (one whose values hold `stowage.release`), whatever its project name or version, so it removes a
@@ -3994,8 +4108,9 @@ the current directory. A release with no chart (published without the shape) is 
     marked `helm.sh/resource-policy: keep`): when the chart makes one, `uninstall` without `--data`
     is refused (`the chart of release R makes the PersistentVolumeClaims …, which helm uninstall
     deletes with it`), and a terminal offers only deleting the data.
-  - Data kept keeps the Secrets that answer for it: `<release>-stowage` (the values it was made
-    with, a database's password among them) and `<release>-stowage-provision` (what the provision
+  - Data kept keeps the Secrets that answer for it: `<release>-stowage` and
+    `<release>-stowage-secret-files` (the values it was made with, a database's password among
+    them) and `<release>-stowage-provision` (what the provision
     hook returned). `k8s install` of the release then takes the data back with them, as it takes
     a Secret an install left. Data is kept when its claims are not deleted, when the chart keeps
     one (`helm.sh/resource-policy: keep`, `--data` or not), and when helm no longer knows the
@@ -4050,7 +4165,7 @@ A kit carries what one install issues to another (inputs, the front's TLS materi
 - A kit is taken by `--kit` on an install: its format, its code's sources and its refusals are under the Docker shape's `--kit`. Each `gives` key is checked by the target's installer: an input of another shape left out and said, one it does not declare refused.
 - `kit check` runs the handoff's `check` likewise, with the `STOWAGE_KIT_*` variables and its `env`, not what `ask` asked, its stdout thrown away unread and unbounded: `HANDOFF INSTANCE: proven` (exit 0), `unknown` (its exit 2, exit 2), `not proven (its check, or starting it, exited N)` (exit 1). A check stopped by its timeout, a check on Kubernetes that could not start or died by a signal (its Job records -1, its log saying why), a Job that fails altogether, an API server or Docker daemon that does not answer, a command's wrong arguments or flags and a handoff without `check` give no answer: `unknown` where it ran that far, exit 2, the reason on stderr (`error: …`), never read as not proven. On Docker and the VM, `docker compose` failing to start the check reads as its own exit status, so as not proven, the reason on stderr.
 - On the VM these go through the host daemon, on the operators' socket alone: `POST /v1/kits` (a `KitRequest`: `handoff`, `instance`, `answers`, `expires` in nanoseconds; answers `kit`, `code`, `log`, its only copy, the log cut at 1 MiB) and `POST /v1/kits/check` (`handoff`, `instance`; answers `exit`, `log`). The app's socket answers 403. The file is written where `kit create` runs. The VM's `kit create HANDOFF --json` writes no file: it reads that request (`instance`, `answers`, `expires`; strict, at most 1 MiB, one JSON object; a `handoff` other than the command's refused) on standard input and writes the daemon's answer (`kit`, `code`, `log`) as one JSON object on standard output; `--name`, `--expires`, `-o`, `--set` and `--answers` with it are refused. It is what `vm kit create` runs over SSH.
-- **`--known-hosts-line LINE`** (`vm kit create`, `check` and `take`, `vm attach`) gives the VM's SSH host key as one `known_hosts` line, `HOST KEYTYPE BASE64` (`vm seed --json`'s `known_hosts_line`, or the VM's own key checked on its console), in place of the key `vm create` recorded: a VM `vm create` did not make, or made elsewhere. That key alone is accepted, under the line's host name (`HostKeyAlias`, lower-cased), `StrictHostKeyChecking=yes`, never `accept-new`. The line is refused before any connection unless it holds one host name or address (`--known-hosts-line: its host field "…" is not one host name or address (no pattern, list, hashed name or [host]:port)`) and a key (`not a known_hosts line (HOST KEYTYPE BASE64)`), with no marker (`a host key, not a @cert-authority line`) and no second line (`one line`; one line end, LF or CRLF, is taken off). A `vm attach` message naming the command to run again carries the same `--known-hosts-line`, as it is written (below: its name lower-cased, its line end and any comment off). It is written to `$XDG_STATE_HOME/<name>/known-hosts/<its digest>` (`~/.local/state` by default; 0600, its directory 0700), the file ssh reads, which the `ssh` command a message gives names too. The one-time key of a seed retires once the VM's install is done and it rebooted: from then on, give the VM's own key.
+- **`--known-hosts-line LINE`** (`vm kit create`, `check` and `take`, `vm attach`, `vm host-key`) gives the VM's SSH host key as one `known_hosts` line, `HOST KEYTYPE BASE64` (`vm seed --json`'s `known_hosts_line`, or the VM's own key checked on its console), in place of the key `vm create` recorded: a VM `vm create` did not make, or made elsewhere. That key alone is accepted, under the line's host name (`HostKeyAlias`, lower-cased), `StrictHostKeyChecking=yes`, never `accept-new`. The line is refused before any connection unless it holds one host name or address (`--known-hosts-line: its host field "…" is not one host name or address (no pattern, list, hashed name or [host]:port)`) and a key (`not a known_hosts line (HOST KEYTYPE BASE64)`), with no marker (`a host key, not a @cert-authority line`) and no second line (`one line`; one line end, LF or CRLF, is taken off). A `vm attach` message naming the command to run again carries the same `--known-hosts-line`, as it is written (below: its name lower-cased, its line end and any comment off). It is written to `$XDG_STATE_HOME/<name>/known-hosts/<its digest>` (`~/.local/state` by default; 0600, its directory 0700), the file ssh reads, which the `ssh` command a message gives names too. The one-time key of a seed retires once the VM's install is done and it rebooted, or at once by `vm host-key`: from then on, give the VM's own key.
 - **`vm kit`**, on the operator's machine, reaches a VM `vm create` made over SSH as `vm attach` does (`--user`, `--ssh-key`, `--host`; strictly checked against the key `--known-hosts-line` gives, else the host key `vm create` recorded for that address in the VM's state directory, `known_hosts`, the address its alias (`HostKeyAlias`): ssh refuses another key, and an address it holds none for; a state with no such file is refused before any connection, naming the file a key checked on the VM's console goes in. `vm kit create` tries the link with ssh itself, running the sudo every run takes (`sudo -n <short>-stow --help`), before it asks anything or makes its file, so a VM ssh cannot reach, or whose key it refuses, costs no answer (`U@H does not answer over SSH, or does not run sudo without a password: … (--host, --user and --ssh-key reach it as vm create did; its key is the one in <file>; or its sudoers does not let the user run `<short>-stow` without a password)`); an empty `known_hosts` (an install finished by hand) is refused as none. The operator's global known hosts are never read on these links, nor on `vm create`'s, and `vm create` records the VM's key under that same alias (whatever the operator's ssh configuration makes of the name: `Port`, `HostName`), in the clear). `vm kit create HOSTNAME HANDOFF` takes `kit create`'s flags and checks, refuses a VM it cannot reach that way before it asks anything, asks what the handoff asks here, creates the kit's file here (0600, never over a file) before the run, then runs `sudo <short>-stow kit create HANDOFF --json` on the VM, the request on standard input (an answer, a secret one included, never on a command line, which the VM's process list and journal would show); the kit is written here and its code printed here, and neither touches the VM's disk. ssh failing, or an answer that does not read as a kit and a code (a field it does not know is no failure: the VM may run a newer release), writes no file and says what the run may have issued is lost. `vm kit check HOSTNAME HANDOFF INSTANCE` runs the VM's `kit check` and says its verdict as `kit check` does: its exit 0 and 1 are proven and not proven only with the verdict line it prints (`H I: proven`, `H I: not proven (its check, or starting it, exited N)`, whose N is said here as there), as `sudo` and ssh failing exit 1 or 255 too; its 2, ssh failing itself, a status without its verdict and any other status are unknown (exit 2), never not proven. `vm kit take HOSTNAME FILE|-` tries the link as `vm kit create` does, before it asks the code, then opens a kit here, its code from `--kit-code-file`, `STOWAGE_KIT_CODE` or the terminal (as `--kit`'s), refused here as `--kit` refuses one, and gives what it holds to `sudo <short>-stow install --given - --no-input` on the VM over SSH, the VM's install checking each input as `--given`'s (`installing on U@H over SSH with …`, the install's log following); the code never leaves this machine, and a failure names the `ssh` command over the same link (its options as the run's) running `sudo <short>-stow status`.
 - `k8s status` names a Secret an interrupted run left, not one holding a check's exit status alone (the next run clears that one) (`leftover  the Secret … holds what a handoff's run gave, a run under way or one interrupted: once none runs, kubectl delete job/… secret/… --ignore-not-found deletes it`), never its values; `k8s uninstall` deletes it and what stood beside it, for the handoffs the installer's release declares. A failure to read them is logged, and the status goes on.
 - After an install, each handoff is a tip: `` tip: `<short>-stow kit create NAME …` issues a kit for FOR: its install takes it with --kit FILE ``.
@@ -4190,26 +4305,41 @@ in the same installer (bootstrap it as above, then `sh <name>.sh vm create …`,
           [--vm-name N] [--pool P] [--dataset D] [--bridge B]
           [--cpus N] [--memory MiB] [--disk GiB] [--host H] [--wait DURATION]
           [--registry PREFIX] [--registry-ca FILE]
-<short>-stow vm seed --json [--platform P] [--hostname H] [--user U] [--ssh-key FILE] [--channel C]
+<short>-stow vm seed --json [--platform P] [--hostname H] [--user U] [--ssh-key FILE] [--channel C] [--await-secrets] [--disk-dir DIR]
           [the machine's flags, as vm create's: --network … --device DISK, --interface ROLE=SPEC…, --add-host NAME=IP…]
           [--tls MODE] [--domains route=host,…] [--http-port N] [--https-port N]
           [--set KEY=VALUE]… [--set-file KEY=PATH]… [--answers FILE] [--registry PREFIX] [--registry-ca FILE]
                                                    # a VM's first-boot material as JSON, the VM made by your own means
 <short>-stow vm destroy HOSTNAME [--yes] [--no-input] [--accessible]
 <short>-stow vm attach HOSTNAME --interface ROLE=SPEC [--user U] [--ssh-key FILE] [--host H] [--known-hosts-line LINE] [--wait DURATION]
+<short>-stow vm host-key HOSTNAME --json [--user U] [--ssh-key FILE] [--host H] [--known-hosts-line LINE]   # the VM's own SSH host key; the seed's one-time key retired
 <short>-stow vm kit create|check|take HOSTNAME … [--known-hosts-line LINE]   # a handoff kit issued on the VM or taken by it, over SSH (see "Handoff kits")
 ```
 
 - A project whose front offers no mode a VM can take (only `none`, or `byo` and no certificate given) is refused first, saying to give `--cert` and `--key` when it offers `byo`.
 - **`vm seed --json`** prints, as one JSON object, what a new VM needs at its first boot, for a
   tool that creates the VM with its own means (a hypervisor's or a cloud's own provider): it
-  writes no file, creates nothing and never asks. It takes `vm create`'s machine flags
+  creates nothing, never asks, and writes no file but the disk `--disk-dir` asks for. It takes `vm create`'s machine flags
   (`--platform`, required, `--hostname`, `--user`, `--ssh-key`, `--network` and its addressing,
   `--ipv6`, `--tune-profile`, `--ssh-allow`, `--timezone`, `--device`, `--interface`,
-  `--add-host`), the front's (`--tls`, never `byo`, `--domains`, `--http-port`, `--https-port`),
-  `--set`, `--set-file` and `--answers` (inputs that are not secret, and an answers file's `tls`
-  section), `--registry` and `--registry-ca`, and `--channel` (the channel the first install
-  follows; default the release's); `--json` is required. It is the seed `vm create --create
+  `--add-host`), the front's (`--tls`, `--domains`, `--http-port`, `--https-port`), `--set`,
+  `--set-file` and `--answers` (inputs that are not secret, and an answers file's `tls` section),
+  `--registry` and `--registry-ca`, `--channel` (the channel the first install follows; default
+  the release's), and its own: `--await-secrets` (the first install waits for a decrypted
+  `secrets export`, given over SSH once the VM answers, `sudo <short>-stow install --secrets -
+  --no-input`, as `vm create --secrets` makes it; a machine made again), `--tls byo` (it waits
+  for the certificate, its key and CA, and the secret inputs, given over SSH, `sudo <short>-stow
+  install --given - --no-input`, its front serving that certificate; the release must offer
+  `byo`), and `--disk-dir DIR` (an existing directory `--platform`'s disk is written into,
+  decompressed, as `vm create` fetches it; a file of that name already holding it is kept).
+  `--tls byo` with `--await-secrets` is refused (the first install waits for one of them), as is a
+  `--disk-dir` that is no directory, and a certificate, key, CA or client CA an answers file's
+  `tls` section gives (`none` aside; the seed takes none of `--cert`, `--key`, `--ca`,
+  `--client-ca`): the seed carries none (a path the file names that does not exist fails first,
+  as the answers file is read). A release whose
+  front offers no mode a VM is made with, but `byo`, is refused naming `--tls byo` as the fix (`vm
+  create`'s names `--cert` and `--key`; both exit 3). `disk_file`'s path is absolute, whatever
+  `--disk-dir` was given as; `--json` is required. It is the seed `vm create --create
   manual` writes, made by the same steps and refused as `vm create` refuses (a release with no
   OS bundle or no disk, a front with no mode a VM takes, `--platform` missing or not offered, an
   input missing or refused), and a secret input or TLS material given to it is refused, naming
@@ -4225,7 +4355,14 @@ in the same installer (bootstrap it as above, then `sh <name>.sh vm create …`,
     "known_hosts_line": "vm-seed-host-key ssh-ed25519 AAAA…",
     "fingerprint": "SHA256:…",
     "host_key_private": "-----BEGIN OPENSSH PRIVATE KEY-----\n…",
-    "disk": { "truenas": { "format": "qcow2", "image": "<prefix>/<name>-disk@sha256:…" }, "aws": { "format": "raw", "image": "…" } },
+    "meta_data": "instance-id: notes-1\nlocal-hostname: notes-1\n",
+    "disk": {
+      "truenas": { "format": "qcow2", "image": "<prefix>/<name>-disk@sha256:…", "os_gib": 23, "disk_gib": 43 },
+      "aws": { "format": "raw", "image": "…", "os_gib": 23, "disk_gib": 43, "cloud_image": "<name>-0123456789ab" }
+    },
+    "app_gib": 20,
+    "disk_file": { "path": "/abs/DIR/<the disk's file name>.qcow2", "format": "qcow2", "sha256": "…", "disk_gib": 43 },
+    "await_secrets": true,
     "waiting": ["API_KEY"]
   }
   ```
@@ -4234,15 +4371,81 @@ in the same installer (bootstrap it as above, then `sh <name>.sh vm create …`,
   until its install and the reboot after it, as `vm create`'s does for what it gives over SSH.
   `known_hosts_line` is that key under the name `vm-seed-host-key`, which `--known-hosts-line`
   takes (below); `fingerprint` its SHA256 as ssh prints it; `host_key_private` the key itself,
-  an OpenSSH private key, which the caller keeps secret until the key retires. `disk` names, for
-  each platform the registry holds a disk for, the disk that platform boots (its format, as the
-  table below, and its image by digest, in the mirror with `--registry`). `waiting` names, sorted,
+  an OpenSSH private key, which the caller keeps secret until the key retires (`vm host-key`
+  retires it). `meta_data` is the NoCloud `meta-data` for a hypervisor that builds its own seed
+  ISO beside `user_data` (`instance-id` and `local-hostname`, the host name, as the seed ISO's).
+  `disk` names, for each platform the registry holds a disk for, the disk that platform boots: its
+  format, as the table below, its image by digest (in the mirror with `--registry`), `os_gib`
+  what Kairos takes of a VM's disk of it, and `disk_gib` the VM's disk size to create, `os_gib`
+  plus `app_gib`, the app's space the release recommends (else 20, at least its minimum and 4),
+  as `vm create` sizes it; on a cloud the release publishes to (`cloud_publish`) in that cloud's
+  format, `cloud_image` is the name `ship --disks` registers that disk's image under there,
+  `<name>-` and the first 12 hex digits of the disk's digest, which that cloud's own provider
+  looks the image up by: the ship that published the disk registered it only when it had that
+  cloud's settings, so a consumer checks the image exists. Left out for a release booting another
+  release's disks (the channel's set), whose ship's `cloud_publish` this release does not tell. `disk_file`,
+  with `--disk-dir`, is `--platform`'s disk as a file — named as `ship` named the disk (its
+  artifact's title, the name `vm create` writes it under) —: its absolute path, format, the SHA-256 of its
+  bytes (decompressed: what a hypervisor imports) and `disk_gib`; left out otherwise.
+  `await_secrets` (`--await-secrets`) and `await_tls` (`--tls byo`) say what the first install
+  waits for over SSH, left out when false. `waiting` names, sorted,
   the keys of the required secret inputs nothing gives (never a value; left out when there are
   none): the VM's first install waits for them, as `vm create` says, until they are given over
   SSH (`sudo <short>-stow install --given - --no-input`). `--platform` missing, not a platform
   Stowage knows, or one the registry holds no disk for is refused (exit 3) once the registry has
   been read, its fix naming the platforms that registry offers; a registry that cannot be read,
-  or that offers no disk for any platform, is a failure (exit 1), whatever `--platform` says.
+  or that offers no disk for any platform, is a failure (exit 1), whatever `--platform` says. A
+  refusal prints one object on standard output, as `status --json`'s (`{"format": 1,
+  "refused": {"reason": "…", "fix": "…"}}`), and exits 3; a failure prints none.
+- **`vm host-key HOSTNAME --json`** reads the VM's own ed25519 SSH host key over SSH, checked by
+  the key `--known-hosts-line` gives (the seed's `known_hosts_line`, or the VM's own) or `vm
+  create` recorded, and retires the seed's one-time key at once — its file and sshd drop-in
+  removed, its retirement marked on the OEM partition, sshd reloaded — so the VM serves its own
+  key alone from then on (as its first boot after the install would). It takes `--user`,
+  `--ssh-key`, `--host` (the address, default HOSTNAME) and `--known-hosts-line`, and prints
+  `{"format": 1, "public_key": "ssh-ed25519 AAAA…", "known_hosts_line": "<host name> ssh-ed25519
+  AAAA…", "fingerprint": "SHA256:…", "retired": true}`: the VM's key, and under the host name the
+  run checked it by (the line's, else the address) its known_hosts line. The retirement's sshd
+  reload is checked: a running `ssh.service` or `sshd.service` reloaded, or none running and
+  `ssh.socket` there to start one (which reads its configuration per connection); one that did
+  not take prints the key all the same with `"retired": false` and a `reason`, and fails the
+  verb (exit 1: `the seed's one-time host key's files are gone, but sshd did not reload: it may
+  serve that key until it does; `sudo systemctl reload ssh` (or reboot the VM), then run
+  host-key again`). With `vm create`'s record (no `--known-hosts-line`), the record is replaced by that
+  line; without it and without that record it is refused (a pin `vm create` keeps while it waits
+  is never read: a create may still be using it). With `--known-hosts-line` no record of `vm
+  create`'s is written (the line given is written to its own file, as for every verb taking it):
+  keep the printed line, the VM's key from then on. Run again it changes nothing more, through the VM's own key. Refused (exit 3,
+  nothing changed): the VM answering from its recovery or live system (its first boot not done:
+  the one-time key is kept, as the active system serves it; run it again once it rebooted), ssh
+  not reaching the VM through the key (exit 255: the VM down, the key not authorized, or a VM that
+  rebooted since its install serving its own key alone — the fix names the console's check,
+  `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub`), and the reach's own errors (no key known,
+  a bad `--known-hosts-line`, `--user` or `--host`). A refusal prints its object as `vm seed`'s.
+- **`sudo <short>-stow host-key [--json]`**, on the VM itself, runs the same steps locally (no
+  SSH, so no SSH config of the operator's): it prints the VM's own ed25519 host key as a
+  `known_hosts` line under the VM's host name (`<hostname> ssh-ed25519 AAAA…`), or with `--json`
+  `{"format": 1, "public_key": …, "known_hosts_line": …, "fingerprint": "SHA256:…", "retired":
+  true}`, and retires the seed's one-time key at once (as root, its steps run without sudo), its
+  sshd reload checked as `vm host-key`'s (not taken: `"retired": false` with a `reason`, exit 1,
+  the fix `sudo systemctl reload ssh` or a reboot); run again it changes nothing more.
+  Refused (exit 3, nothing changed; with `--json` the refusal as one object, as `status
+  --json`'s): on Kairos's recovery or a live boot, told first (`this is Kairos's recovery system
+  or a live boot, whose host keys are not the active system's: the one-time key is kept`; run it
+  again once the VM rebooted into its active system), not as root (`host-key retires the seed's one-time host key,
+  which root alone can`, the fix `run the same command with sudo`), before the first install
+  (`absent`), and while it is not done, still running or failed (it may still wait for secrets or
+  a certificate given over SSH, pinned to the one-time key; the install retires it itself). A step that fails (the mark on `/oem` not
+  written, say) fails the verb (exit 1) naming it; the steps run again whole. The host name is
+  taken as ssh matches it (lower-cased, without a root dot); one the line cannot hold (none,
+  `localhost`, one `vm create --hostname` refuses, which a known_hosts line would read as a
+  pattern) leaves the line out — the key and its retirement are no name's: the public key is
+  printed (as the line, without `--json`), and a `note` (on standard error without `--json`)
+  says why and names `hostnamectl set-hostname NAME`. The steps
+  are `vm host-key`'s over SSH (with sudo) and `vm create`'s after its install (which, when sshd
+  did not reload, keeps its pin of the one-time key and warns, naming the fix); the first boot
+  after the install runs the same file steps, its reload unchecked (an sshd not started yet reads
+  its configuration as it starts).
 - The platform decides the disk format (the first of its formats the registry holds: a mirror
   carries the formats its `mirror export --disks` named) and how the cloud-config reaches the VM.
   Only the platforms the registry has a disk for are offered; a `--platform` whose formats the
@@ -4742,6 +4945,8 @@ sudo <short>-stow install [--channel C] [--set KEY=VALUE]… [--set-file KEY=PAT
 <short>-stow secrets export --recipient age1…… [-o FILE|-]   # the install's secrets, encrypted
 <short>-stow secrets rotate KEY [--stage | --finish]   # a secret with rotation: true
 <short>-stow secrets set KEY [--accessible] < value   # a secret with settable: true
+<short>-stow secrets show KEY   # a settable secret's value, on a terminal only (the operator's socket)
+<short>-stow host-key [--json]   # as root: this VM's own SSH host key, the seed's one-time key retired
 <short>-stow network [--json]          # the address, gateway and DNS servers, what sets them, a change awaiting confirmation
 <short>-stow tune [--check]           # how the VM's network settings differ from what its boot tuning wants (the stack's profile); --check exits non-zero
 <short>-stow network set --mode dhcp|static [--address A/P] [--gateway G] [--ipv6 [--address6 A/P] [--gateway6 G]] [--dns D,…] [--revert-secs N | --no-revert]
@@ -4822,7 +5027,10 @@ sudo <short>-stow network attach --role ROLE --mac MAC [--mode dhcp|static|none]
   `STOWAGE_INPUTS`, as on Docker; absent before the first install, and when the install records
   no such list and the OS's `<short>-stow` carries another release than the one installed, a
   crossing whose boot fell back, and the install keeps no installer of it this one reads); then `channel`, `installing`,
-  `install_failed` and the VM's own fields.
+  `install_failed`, what the first install recorded as Docker's `status --json` gives it —
+  `registry`, `short_name`, `address`, `registry_ca` (`sha256:` of the registry CA the install
+  keeps; left out when it keeps none, or when it cannot be read: the status always answers, and
+  a poll logs nothing) — and the VM's own fields.
 - `describe [--json]` prints what the release this OS carries offers, with no install: the
   Docker installer's `describe` (see "The installer (Docker shape)"), the same object.
 - **Exit status and `--json` on the VM.** `install`, `upgrade` and `rollback` take `--json`, as
@@ -5440,7 +5648,12 @@ sudo <short>-stow network attach --role ROLE --mac MAC [--mode dhcp|static|none]
   (owners and privileges kept: the stack's roles exist on every install) as `database.roles.migrate` inside the database service (`docker
   compose exec`: the server's own version), encrypts the dump with age as it streams, to every
   recipient of the settings (any one's private key decrypts it; the VM holds none), and pipes it to
-  the backup runner — rclone 1.76.0, preloaded, run with `docker run --rm --pull never --network host`
+  the backup runner — rclone 1.76.0, preloaded, run with `docker run --rm --pull never --network host
+  --cap-drop ALL --cap-add DAC_OVERRIDE --cap-add DAC_READ_SEARCH --security-opt
+  no-new-privileges:true` (those alone: it reads and writes its configuration, whoever owns it —
+  root on the VM, the operator running a Docker install's backup; the runner's shell, which archives and restores volumes, keeps
+  `CHOWN`, `DAC_OVERRIDE`, `DAC_READ_SEARCH`, `FOWNER`, `FSETID` and `MKNOD` alone, for files of
+  every owner, their modes, set-id bits and device nodes)
   (it reaches the destination, and names it, as the VM does — over IPv6 too), the settings' rclone config mounted from a directory under `/run/<name>/`
   (root's, removed afterwards) — which uploads it with `rclone rcat` to
   `<destination>/<name>-<profile>-<UTC time, 20261010T030000Z>-<version>-r<revision>.pgdump.age`;
@@ -5627,7 +5840,7 @@ sudo <short>-stow network attach --role ROLE --mac MAC [--mode dhcp|static|none]
   come often, and a flush ends every flow of the host's): a flow an element removed admitted stays
   open until it ends.
   The operator's routes answer 403 there, token or not: `provision`, `reset-db` (its plan
-  excepted), `secrets export`, `secrets rotate`, `secrets set`, `exec`, `restore` and `backup config --remove`
+  excepted), `secrets export`, `secrets rotate`, `secrets set`, `secrets show`, `exec`, `restore` and `backup config --remove`
   (`DELETE backup/config`), run over SSH alone, and so does an `upgrade` with `skip_backup` (the
   backup a failed migration is restored from). `network` stays the app's, `revert_secs` 0
   included: a service holding the token can move the VM to an address nothing reaches, which
@@ -5756,7 +5969,7 @@ route's whose service runs (none for a service whose profiles are all off) (`<pr
   a family the list holds no source of, nothing while the list is empty; a value that is not an
   allowlist fails the start). A route with a bind address is accepted on it alone (`ip daddr
   <address> …`, or `ip6 daddr`, its family's rules alone); the front, and a route, on a
-  `host.interfaces` role (`interface`) on that interface alone (`iifname "<role>" …`); and on each
+  `host.interfaces` role (`front.interfaces`, a route's `interfaces`) on those interfaces alone (`iifname "<role>" …`, `iifname { … }` for more than one); and on each
   role a service intercepts on (`services.<name>.transparent`), what the kernel hands a
   transparent socket (`iifname "<role>" meta l4proto { tcp, udp } socket transparent 1 accept`):
   a packet the service's table steered to its own socket (TPROXY), its destination a remote
@@ -5769,23 +5982,34 @@ route's whose service runs (none for a service whose profiles are all off) (`<pr
   (`com.docker.network.bridge.name` of its own bridge networks, and of the external ones it joins
   as the engine reports them, `docker network inspect`: `iifname "<bridge>" accept`, `oifname
   "<bridge>" accept`), so a boot reaches the containers Docker restarts on them before the
-  install's start (no file when none is named), and removes `<name>-l4.nft`, where earlier
-  releases kept the routes' allowlists for Docker's DNAT; accepts replies (`ct state
-  established,related`) and what enters or leaves Docker's bridges by their names (`iifname`/`oifname`
-  `"docker0"` and `"br-*"`), which Docker's own chains judge after it; includes
-  `/run/nftables.d/forward/<name>-forward.nft`, which each start of the install writes, one rule
-  per role and the role it forwards to (`iifname "<role>" oifname "<out>" accept`, a `tun` role
-  by its `device`); and drops every other packet forwarded between the host's own interfaces
-  (`counter drop`), so a boot forwards nothing between them until the install's start writes
-  the file, and a release that forwards nothing leaves no file. The ruleset is loaded again (`nft
-  -f /etc/nftables.conf`) when any file changed; a load that fails fails the start, leaves no
-  ports nor forwarding file (the next start loads it again) and puts the persistent partition's
-  files back as they were. Outbound traffic is Docker's and the OS's to judge; the input rules serve what reaches
-  the host itself: the L4 routes' services, the front's ports Docker's userland proxy takes (an
-  IPv6 client of a bridge without IPv6). Docker's FORWARD policy is DROP for IPv4 (and for IPv6
-  where its `ip6tables` is on), so a stack routing for others (a VPN exit node, a gateway between
-  two NICs) declares the roles it forwards between (`host.interfaces.<role>.forward`): besides
-  the forward chain's rules, each start of the install gives the chain `STOWAGE-FORWARD`, which Docker's `DOCKER-USER` jumps to (inserted
+  install's start (no file when none is named); and `<name>-l4.nft` (that name, which each
+  earlier release removes or rewrites at its start, so a rollback never keeps this one's rule)
+  while the front answers on some roles alone (`front.interfaces`, an L4 route it terminates TLS
+  on with `interfaces`) outside loopback mode: Docker translates the front's published ports (those
+  something serves on, as above) to its container, so the input chain never sees them, and this
+  rule drops a new connection to one of them (`ct direction original ct status dnat ct original
+  proto-dst { <ports> }`) forwarded to a container bridge (`oifname "br-*"`, and a rule alike for
+  `oifname "docker0"`: another translation to such a port, a cluster's service address, is not
+  judged) and arriving on any interface but those roles' (`iifname != "<role>" drop`, or `!= {
+  "<role>", … }`; the stack's own containers reach the front by its routes' names, on their
+  network), removed while none is held (values that do not read hold the spec's ports,
+  `http_port` and `https_port`, the front's unless the install moved them). After them it accepts
+  replies (`ct state established,related`) and what enters or leaves Docker's bridges by their
+  names (`iifname`/`oifname` `"docker0"` and `"br-*"`), which Docker's own chains judge after it;
+  includes `/run/nftables.d/forward/<name>-forward.nft`, which each start of the install writes,
+  one rule per role and the role it forwards to (`iifname "<role>" oifname "<out>" accept`, a
+  `tun` role by its `device`); and drops every other packet forwarded between the host's own
+  interfaces (`counter drop`), so a boot forwards nothing between them until the install's start
+  writes the file, and a release that forwards nothing leaves no file. The ruleset is loaded again
+  (`nft -f /etc/nftables.conf`) when any file changed; a load that fails fails the start, leaves
+  no ports nor forwarding file (the next start loads it again) and puts the persistent partition's
+  files back as they were. Outbound traffic is Docker's and the OS's to judge; the input rules
+  serve what reaches the host itself: the L4 routes' services, the front's ports Docker's userland
+  proxy takes (an IPv6 client of a bridge without IPv6). Docker's FORWARD policy is DROP for IPv4
+  (and for IPv6 where its `ip6tables` is on), so a stack routing for others (a VPN exit node, a
+  gateway between two NICs) declares the roles it forwards between
+  (`host.interfaces.<role>.forward`): besides the forward chain's rules, each start of the install
+  gives the chain `STOWAGE-FORWARD`, which Docker's `DOCKER-USER` jumps to (inserted
   when missing), for `iptables` and `ip6tables` (Docker's iptables backend, the VM's; IPv4's
   alone on a kernel running without IPv6, `ipv6.disable=1`), one rule
   per role and the role it forwards to (`-i <role> -o <out> -j ACCEPT`) and one for the replies

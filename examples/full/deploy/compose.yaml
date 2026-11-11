@@ -23,7 +23,7 @@ services:
     environment:
       DATABASE_URL: postgres://atlas:${POSTGRES_PASSWORD}@postgres:5432/atlas
       APP_DATABASE_URL: postgres://atlas_app:${APP_DB_PASSWORD}@postgres:5432/atlas
-      ENCRYPTION_KEY: ${ENCRYPTION_KEY}
+      ENCRYPTION_KEY_FILE: /run/secrets/encryption_key   # as_file: the value is in no variable
       SESSION_SECRET: ${SESSION_SECRET}
       INTERNAL_SERVICE_SECRET: ${INTERNAL_SERVICE_SECRET}
       INTERNAL_SERVICE_SECRET_NEXT: ${INTERNAL_SERVICE_SECRET_NEXT}
@@ -32,7 +32,7 @@ services:
       TRUSTED_PROXY_HOPS: ${TRUSTED_PROXY_HOPS:-1}
       PUBLIC_URL: ${STOWAGE_URL_API}
       CONSOLE_URL: ${STOWAGE_URL_CONSOLE}
-      UPSTREAM_API_KEY: ${UPSTREAM_API_KEY:-}
+      UPSTREAM_API_KEY_FILE: /run/secrets/upstream_api_key
       SEARCH_URL: ${SEARCH_URL:-}
       SEARCH_KEY: ${SEARCH_KEY:-}
       LOG_LEVEL: ${LOG_LEVEL:-info}
@@ -41,6 +41,8 @@ services:
     volumes:
       - ca:/etc/atlas/ca:ro      # the front's CA (front.publish_ca), as ca.crt
       - ${STOWAGE_INPUT_FILE_API_CA_BUNDLE}:/etc/atlas/upstream-ca.pem:ro
+      - ${STOWAGE_SECRET_FILE_ENCRYPTION_KEY}:/run/secrets/encryption_key:ro
+      - ${STOWAGE_SECRET_FILE_UPSTREAM_API_KEY}:/run/secrets/upstream_api_key:ro
     healthcheck:
       test: ["CMD", "atlas-server", "probe", "9090"]
       interval: 2s

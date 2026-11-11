@@ -214,6 +214,21 @@ on_vm sudo ip tuntap del vpn0 mode tun
 on_vm sudo nft list ruleset >"$WORK/ruleset.txt"
 grep -q 'iifname "uplink" tcp dport { 80, 443 } accept' "$WORK/ruleset.txt" && grep -q 'iifname "edge" udp dport 17007 ' "$WORK/ruleset.txt" ||
 	{ grep -n 'dport' "$WORK/ruleset.txt"; fail "the front's or the UDP echo's ports are not on their interfaces alone"; }
+# Docker DNATs the front's ports past the input chain: the forward chain holds them to the uplink,
+# so the edge NIC's address, which this host reaches on the same bridge, gets no answer.
+grep -q 'ct original proto-dst { 80, 443 } oifname "br-\*" iifname != "uplink" drop' "$WORK/ruleset.txt" ||
+	{ grep -n 'proto-dst' "$WORK/ruleset.txt"; fail "the forward chain does not hold the front's ports to the uplink"; }
+edge_ip=$(on_vm ip -4 -o addr show dev edge | awk '{print $4}' | cut -d/ -f1 | head -1)
+[[ -n $edge_ip ]] || fail "edge has no IPv4 address"
+# The controls: the edge address is reachable (ICMP, which the input chain accepts) through the
+# edge NIC itself — both NICs are on one bridge, so the VM answers ARP for an address on the NIC
+# that holds it alone — and the front answers on the uplink's.
+on_vm sudo sysctl -qw net.ipv4.conf.all.arp_ignore=1 net.ipv4.conf.all.arp_announce=2 || fail "the VM's ARP settings could not be set"
+ip neigh flush to "$edge_ip" 2>/dev/null || sudo -n ip neigh flush to "$edge_ip" 2>/dev/null || true # an entry from before the settings
+ping -c 1 -W 5 "$edge_ip" >/dev/null || fail "this host does not reach the edge NIC ($edge_ip): the check below would prove nothing"
+ip neigh show "$edge_ip" | grep -qi "lladdr $MAC_EDGE" || { ip neigh show "$edge_ip"; fail "this host reaches $edge_ip at another MAC than the edge NIC's ($MAC_EDGE): the check below would prove nothing"; }
+curl -sk --max-time 10 -o /dev/null "https://$IP/" || fail "the front does not answer on the uplink ($IP)"
+curl -sk --max-time 5 -o /dev/null "https://$edge_ip/" && fail "the front answers on the edge NIC ($edge_ip), a role front.interfaces leaves out"
 # The vpn service's table steers vpn0's traffic to its sockets, which the input chain accepts on
 # vpn0 alone (services.vpn.transparent); vpn0's traffic out of the uplink and its replies pass
 # Docker's FORWARD policy (host.interfaces.vpn0.forward), for IPv4 and IPv6.

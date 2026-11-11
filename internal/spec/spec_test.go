@@ -138,3 +138,22 @@ func TestTheHealthGateDefaultsWhenUnset(t *testing.T) {
 		t.Errorf("set: %+v", g)
 	}
 }
+
+func TestUnheldNetwork(t *testing.T) {
+	t.Parallel()
+	for _, c := range []struct {
+		driver string
+		opts   map[string]string
+		want   string
+	}{
+		{"", nil, ""},
+		{"bridge", map[string]string{"com.docker.network.driver.mtu": "1400"}, ""},
+		{"macvlan", nil, "is of the macvlan driver"},
+		{"bridge", map[string]string{"com.docker.network.bridge.name": "br-lan"}, "sets com.docker.network.bridge.name br-lan"},
+		{"", map[string]string{"com.docker.network.bridge.trusted_host_interfaces": "eth1"}, "sets com.docker.network.bridge.trusted_host_interfaces eth1"},
+	} {
+		if got := UnheldNetwork(c.driver, c.opts); got != c.want {
+			t.Errorf("%s %v: %q, want %q", c.driver, c.opts, got, c.want)
+		}
+	}
+}

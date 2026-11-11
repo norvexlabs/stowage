@@ -56,7 +56,7 @@ func TestDockerBuilderPassesTheSpecAndYieldsAnOCIImage(t *testing.T) {
 		t.Fatal(err)
 	}
 	docker := filepath.Join(dir, "docker")
-	if err := os.WriteFile(docker, []byte(fakeDocker), 0o755); err != nil {
+	if err := testutil.WriteExecutable(docker, []byte(fakeDocker)); err != nil {
 		t.Fatal(err)
 	}
 	logf := filepath.Join(dir, "log")
@@ -166,7 +166,7 @@ func TestDockerBuilderPassesNamedContexts(t *testing.T) {
 		t.Fatal(err)
 	}
 	docker := filepath.Join(dir, "docker")
-	if err := os.WriteFile(docker, []byte(fakeDocker), 0o755); err != nil {
+	if err := testutil.WriteExecutable(docker, []byte(fakeDocker)); err != nil {
 		t.Fatal(err)
 	}
 	logf := filepath.Join(dir, "log")
@@ -200,7 +200,7 @@ func TestDockerBuilderBuildsARecipe(t *testing.T) {
 		t.Fatal(err)
 	}
 	docker := filepath.Join(dir, "docker")
-	if err := os.WriteFile(docker, []byte(fakeDocker), 0o755); err != nil {
+	if err := testutil.WriteExecutable(docker, []byte(fakeDocker)); err != nil {
 		t.Fatal(err)
 	}
 	logf := filepath.Join(dir, "log")
@@ -233,7 +233,7 @@ func TestDockerBuilderRefusesTheBundleInMemory(t *testing.T) {
 	t.Cleanup(func() { kairos.OnDisk = saved })
 	dir := t.TempDir()
 	docker := filepath.Join(dir, "docker")
-	if err := os.WriteFile(docker, []byte(fakeDocker), 0o755); err != nil {
+	if err := testutil.WriteExecutable(docker, []byte(fakeDocker)); err != nil {
 		t.Fatal(err)
 	}
 	logf := filepath.Join(dir, "log")

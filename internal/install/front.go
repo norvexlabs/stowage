@@ -436,16 +436,16 @@ const frontJSON = "/tmp/stowage-caddy.json"
 
 // frontCompose adds the front service to the project's stack, unless it has none: in loopback mode each route on its
 // port of the loopback address, behind TLS the HTTP and HTTPS ports something serves on alone
-// (frontPorts; 80 and 443 unless moved), on every address. The host ports come from .env. The L4 routes' ports are published
+// (frontServed; 80 and 443 unless moved), on every address. The host ports come from .env. The L4 routes' ports are published
 // in every mode, to their services: each on every address, or on the one its bind input holds (get
 // reads a recorded value).
 // digest labels the front with its configuration (the Caddyfile, a byo certificate), so a change
 // recreates it. ca is the CA it publishes (frontCommand); noALPN, the Caddyfile names noALPNMark.
 // clientCA mounts the install's client CA.
 // ipv6 turns IPv6 on for the default network. onHost are the services on the host's network
-// (hostServices), whose L4 routes' ports are their own. uid is the front's user and group
-// (frontUser).
-func frontCompose(f spec.Front, l4 []spec.L4Route, get func(string) string, mode string, host hostAPI, digest, ca string, noALPN, clientCA, ipv6 bool, onHost, v4Only []string, uid int) ([]byte, error) {
+// (hostServices), whose L4 routes' ports are their own. frontV4 publishes the front's ports on
+// IPv4 alone (frontV4Only). uid is the front's user and group (frontUser).
+func frontCompose(f spec.Front, l4 []spec.L4Route, get func(string) string, mode string, host hostAPI, digest, ca string, noALPN, clientCA, ipv6 bool, onHost, v4Only []string, frontV4 bool, uid int) ([]byte, error) {
 	var ports []any
 	volumes := []string{FrontDataVolume + ":/data"}
 	if mode == Loopback {
@@ -453,14 +453,20 @@ func frontCompose(f spec.Front, l4 []spec.L4Route, get func(string) string, mode
 			ports = append(ports, fmt.Sprintf("${STOWAGE_LOOPBACK_ADDRESS}:${%s}:%d", PortVar(r.Name), frontPort(i)))
 		}
 	} else {
-		// The ports something serves on alone (frontPorts), as the VM's firewall opens them.
+		// The ports something serves on alone (frontServed), as the VM's firewall opens them; held
+		// to its interfaces on a Docker host without the stack's IPv6, on IPv4's every address
+		// alone, as an allowlisted route is (frontV4Only).
 		ports = []any{}
-		http, https := frontPorts(f, l4, mode)
+		on := ""
+		if frontV4 {
+			on = "0.0.0.0:"
+		}
+		http, https := frontServed(f, l4, mode)
 		if http {
-			ports = append(ports, "${"+HTTPPortVar+"}:80")
+			ports = append(ports, on+"${"+HTTPPortVar+"}:80")
 		}
 		if https {
-			ports = append(ports, "${"+HTTPSPortVar+"}:443")
+			ports = append(ports, on+"${"+HTTPSPortVar+"}:443")
 		}
 	}
 	if clientCA {
@@ -527,6 +533,8 @@ func frontCompose(f spec.Front, l4 []spec.L4Route, get func(string) string, mode
 				port["host_ip"] = "${STOWAGE_LOOPBACK_ADDRESS}"
 			case a != "":
 				port["host_ip"] = a
+			case slices.Contains(v4Only, r.Name):
+				port["host_ip"] = "0.0.0.0"
 			}
 			front, _ := services[FrontService].(map[string]any)
 			if front == nil {

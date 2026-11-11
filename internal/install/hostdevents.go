@@ -608,6 +608,9 @@ func (h *Hostd) events(w http.ResponseWriter, r *http.Request) {
 			reply(w, http.StatusOK, a)
 			return
 		}
+		if h.onWait != nil {
+			h.onWait("events")
+		}
 		select {
 		case <-appended:
 		case <-tick.C:

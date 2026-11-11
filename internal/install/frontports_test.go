@@ -40,7 +40,7 @@ func TestTheFrontsPortsAreWhatServesOnThem(t *testing.T) {
 		{"L4 alone, loopback", l4f, l4, Loopback, false, false},
 		{"plaintext L4 alone, acme", l4f, pass, "acme", false, false},
 	} {
-		if http, https := frontPorts(c.f, c.l4, c.mode); http != c.http || https != c.https {
+		if http, https := frontServed(c.f, c.l4, c.mode); http != c.http || https != c.https {
 			t.Errorf("%s: http %v https %v, want %v %v", c.name, http, https, c.http, c.https)
 		}
 	}
@@ -60,7 +60,7 @@ func TestTheFrontPublishesWhatServesOnIt(t *testing.T) {
 		{f, "acme", []string{"${" + HTTPPortVar + "}:80\n"}, []string{":443\n"}},
 		{l4TLSFront(), "internal", []string{"${" + HTTPPortVar + "}:80\n", "${" + HTTPSPortVar + "}:443\n"}, nil},
 	} {
-		raw, err := frontCompose(c.f, l4, get, c.mode, hostAPI{}, "sha256:x", "", false, false, false, nil, nil, FrontUID)
+		raw, err := frontCompose(c.f, l4, get, c.mode, hostAPI{}, "sha256:x", "", false, false, false, nil, nil, false, FrontUID)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -210,5 +210,23 @@ func TestTheModulesPortsAreWhatServesOnThem(t *testing.T) {
 	}
 	if got := ports(""); len(got) != 3 || got[0].Port != 80 || got[1].Port != 443 {
 		t.Errorf("no mode given: %v", got)
+	}
+}
+
+// A served port's recorded value that is no TCP port fails, naming it; an unserved one's is never
+// read, whatever it holds.
+func TestOnlyServedFrontPortsAreRead(t *testing.T) {
+	t.Parallel()
+	in := &Installer{R: testRelease(t, "1.0.0")}
+	f, l4 := l4OnlyFront()
+	in.R.Spec.Front, in.R.Spec.L4.Routes = f, l4
+	vals := map[string]string{HTTPPortVar: "80", HTTPSPortVar: "STOWAGE_HTTP_PORT nonsense"}
+	get := func(k string) string { return vals[k] }
+	if ports, err := in.frontServedPorts("acme", get); err != nil || len(ports) != 1 || ports[0] != 80 {
+		t.Errorf("acme, HTTP alone: %v %v", ports, err)
+	}
+	vals[HTTPPortVar] = "x"
+	if _, err := in.frontServedPorts("acme", get); err == nil || !strings.Contains(err.Error(), HTTPPortVar+` "x" is not a TCP port`) {
+		t.Errorf("a served one bad: %v", err)
 	}
 }

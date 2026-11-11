@@ -53,6 +53,7 @@ func (in *Installer) Finished(ctx context.Context, shape string) {
 	prefix, _ := env.Get("STOWAGE_REGISTRY")
 	in.extensionTips(ctx, shape, prefix, func(key string) (string, bool) { return env.Get(key) })
 	in.kitTips(shape)
+	in.loginTips(shape)
 }
 
 // dockerEndpoint is the URL the install serves the endpoint route at, as it records it: the

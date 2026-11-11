@@ -125,7 +125,17 @@ func (in *Installer) kitContainer(ctx, runCtx context.Context, env *EnvFile, ste
 			keys = append(keys, k)
 		}
 	}
-	svc := confined(KitService, "${"+ImageVar(step.Image)+"}", step.Cmd, keys)
+	base, cleanup, err := in.pullEnviron(env)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+	ref, _ := env.Get(ImageVar(step.Image))
+	user, err := in.hookUser(runCtx, ref, env.Environ(base)) // within the step's run, its stop included
+	if err != nil {
+		return err
+	}
+	svc := confined(KitService, "${"+ImageVar(step.Image)+"}", user, step.Cmd, keys)
 	if hosts := in.targetHosts(); len(hosts) > 0 {
 		svc["extra_hosts"] = hosts
 	}
@@ -137,11 +147,6 @@ func (in *Installer) kitContainer(ctx, runCtx context.Context, env *EnvFile, ste
 		return err
 	}
 	defer func() { _ = os.Remove(in.path(KitCompose)) }()
-	base, cleanup, err := in.pullEnviron(env)
-	if err != nil {
-		return err
-	}
-	defer cleanup()
 	environ := env.Environ(base)
 	for _, k := range sortedKeys(vars) {
 		environ = append(environ, k+"="+vars[k])
@@ -152,6 +157,7 @@ func (in *Installer) kitContainer(ctx, runCtx context.Context, env *EnvFile, ste
 		Stream: in.O.Log,
 		Stdout: stdout,
 	})
+	runErr = hookRanAs(runErr, user)
 	if runCtx.Err() != nil || stopped() {
 		rmCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 		defer cancel()
@@ -312,4 +318,28 @@ func (in *Installer) kitTips(shape string) {
 		}
 		fmt.Fprintf(in.O.Out, "tip: `%s` issues a kit for %s: its install takes it with --kit FILE\n", cmd, h.For)
 	}
+}
+
+// loginTips names, at the end of an install or an upgrade, the settable secrets the install holds
+// (the logins an operator signs in with) and the verb that shows one on a terminal.
+func (in *Installer) loginTips(shape string) {
+	var keys []string
+	for _, s := range in.R.Spec.Secrets {
+		if s.Settable {
+			keys = append(keys, s.Key)
+		}
+	}
+	if len(keys) == 0 {
+		return
+	}
+	var cmd string
+	switch shape {
+	case onK8s:
+		cmd = in.k8sCtl("secrets show KEY")
+	case onVM:
+		cmd = "sudo " + in.R.Ctl() + " secrets show KEY"
+	default:
+		cmd = fmt.Sprintf("%s secrets show KEY --dir %s", in.ctl(), in.O.Dir)
+	}
+	fmt.Fprintf(in.O.Out, "logins    %s: `%s` shows one, on a terminal\n", strings.Join(keys, ", "), cmd)
 }

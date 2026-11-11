@@ -115,7 +115,7 @@ func TestShipPublishesTheOSBundleAndItsDisks(t *testing.T) {
 		t.Fatal("ctl/notes-stow is not the installer executable")
 	}
 	exe := filepath.Join(t.TempDir(), "notes-stow")
-	if err := os.WriteFile(exe, ctl, 0o755); err != nil {
+	if err := testutil.WriteExecutable(exe, ctl); err != nil {
 		t.Fatal(err)
 	}
 	files, err := payload.Read(exe)

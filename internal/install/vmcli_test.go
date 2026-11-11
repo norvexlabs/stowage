@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/norvexlabs/stowage/internal/testutil"
 	"io"
 	"net"
 	"net/http"
@@ -463,7 +464,7 @@ func TestTheAppSocketRefusesTheOperatorsRoutes(t *testing.T) {
 		handler.ServeHTTP(w, req)
 		return w.Code
 	}
-	for _, pattern := range []string{"DELETE /v1/backup/config", "POST /v1/kits", "POST /v1/kits/check", "POST /v1/provision", "POST /v1/reset-db", "POST /v1/secrets/export", "POST /v1/secrets/rotate", "POST /v1/secrets/set", "POST /v1/services/api/exec", "POST /v1/restore"} {
+	for _, pattern := range []string{"DELETE /v1/backup/config", "POST /v1/kits", "POST /v1/kits/check", "POST /v1/provision", "POST /v1/reset-db", "POST /v1/secrets/export", "POST /v1/secrets/rotate", "POST /v1/secrets/set", "POST /v1/secrets/show", "POST /v1/services/api/exec", "POST /v1/restore"} {
 		if code := call(h.AppHandler(), pattern); code != http.StatusForbidden {
 			t.Errorf("the app socket answered %s with %d", pattern, code)
 		}
@@ -549,7 +550,7 @@ func TestAnUnreadableKeptInstallerIsLogged(t *testing.T) {
 	e.r, e.self = bundledInstaller(t, "2.0.0", 1, func(s *spec.Spec) { s.Shapes.Kairos.HostAPI = nil })
 	d := daemon(e, &fakeHost{})
 	in, _ := d.run()
-	if err := os.WriteFile(in.ctl(), []byte("not an installer"), 0o755); err != nil {
+	if err := testutil.WriteExecutable(in.ctl(), []byte("not an installer")); err != nil {
 		t.Fatal(err)
 	}
 	if d.appServed() || !strings.Contains(e.log.String(), "no app socket: the installed release's host_api cannot be read from "+in.ctl()) {

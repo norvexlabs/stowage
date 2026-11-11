@@ -859,12 +859,17 @@ Stowage calls a project's programs: the two never share a reader.
   `absent` (true) says no install is there — no `.env` in the directory, no helm release in the
   namespace — told apart from every other refusal (a release not from Stowage's chart), so a
   program's create tells "nothing here" from "something else here". The VM always answers its
-  status (`installed` null before the first install).
+  status (`installed` null before the first install), with the first install's `registry`,
+  `short_name`, `address` and `registry_ca` as Docker's.
 - **`--json` on the verbs that change an install** (install and re-run, `upgrade`, `rollback`,
   `uninstall`, on every shape) — one object at the end: `{format, result: "done" | "nothing",
   release, refused: {reason, fix, absent}}` (`absent` as `status --json`'s, left out when false;
-  Docker's and Kubernetes': the VM's daemon answers its verbs, and its status answers before any
-  install). `nothing` is a run with nothing to do, a dry run or a
+  on the VM, a verb before the first install: the host daemon answers the refusal with `absent`,
+  `{error, refused: true, fix?, absent?}`, and its client carries it, so every shape tells "no
+  install" the same way). The k8s refusals of a missing release are one: their reason names the
+  install to run, with the mirror and its CA the run was given (`--image-registry`,
+  `--registry-ca`), and their fix is `install first: <that install>`, as Docker's `holds no
+  install` names its own. `nothing` is a run with nothing to do, a dry run or a
   refusal; `release` the release installed after the run, absent when none is; a failure prints
   no object, only its error. The run's text goes to standard error, so standard output is the
   object alone; `upgrade --version` passes `--json` to its child, which prints it. On the VM,
@@ -901,8 +906,14 @@ Stowage calls a project's programs: the two never share a reader.
   --new-baseline` confirmed (the boot runs on the target's OS already: a reset-db there does not
   hold). A verb run before the first install is fixed by `sudo <short>-stow install`.
 - **`vm seed --json`** — a VM's first-boot material without creating the VM, for a tool that
-  creates it with its own means: `{format, platform, user_data, known_hosts_line, fingerprint,
-  host_key_private, disk: {<platform>: {format, image}}, waiting: [<key>]}` — the user-data for `--platform` (the
+  creates it with its own means: `{format, platform, user_data, meta_data, known_hosts_line,
+  fingerprint, host_key_private, disk: {<platform>: {format, image, os_gib, disk_gib,
+  cloud_image}}, app_gib, disk_file, await_secrets, await_tls, waiting: [<key>]}` — everything a
+  consumer would otherwise read from the registry or rebuild (the NoCloud meta-data, the sizes a
+  disk's annotation records, the disk unpacked from its zstd artifact with `--disk-dir`, the name
+  `ship --disks` registers a cloud image under, which is derived from the disk's digest, so no
+  record of it is needed), and what the first install waits for over SSH (`--await-secrets`: a
+  secrets export, so a machine made again keeps its secrets; `--tls byo`: the certificate) — the user-data for `--platform` (the
   cloud-config; never a secret input — those go after the boot, `install --given -` over SSH: a
   secret input or TLS material given to the seed is refused), the one-time host key (its
   `known_hosts` line under the name `vm-seed-host-key`, its fingerprint and its private key, which
@@ -918,7 +929,17 @@ Stowage calls a project's programs: the two never share a reader.
   hashed name), checked strictly under that name (`HostKeyAlias`), never `accept-new`, in place
   of the key `vm create` recorded; the line is written, its name lower-cased, to a file of its
   own under the state directory, named by its digest, so the `ssh` command a message gives runs
-  as the verb's did.
+  as the verb's did. `vm host-key --json` reads the VM's own host key through that pinned key and
+  retires the seed's one-time key at once — the step `vm create` runs after its install over
+  SSH —, printing the VM's key as a `known_hosts` line: a consumer pins the VM's own key from
+  then on, with no file steps of its own. `<short>-stow host-key --json`, as root on the VM, runs
+  that same command locally rather than over SSH (one implementation), for a consumer on the VM
+  or one holding no SSH config of the operator's. A refusal of `vm seed`, `vm host-key` or
+  `host-key` prints its object as `status --json`'s. Both report the truth of the retirement:
+  sshd's reload is checked (the boot's own stage, before sshd may run, keeps the unchecked one),
+  and one that did not take is a failure carrying the key and `"retired": false`, as a consumer
+  must not take the one-time key for gone. The key and its retirement are no host name's: a name
+  no known_hosts line can hold leaves the line out with a note, never refusing the retirement.
 
 ## 7. Full lifecycle matrix
 
@@ -953,6 +974,7 @@ Stowage calls a project's programs: the two never share a reader.
 | 23 | Reset data | `reset-db`: stack down, the `data.reset` volumes deleted (`keep_on_reset` kept), provisioned as first installed **C** | `k8s reset-db`: uninstall, the release's claims deleted, installed again with its values and Secrets **C** | `reset-db`, a host daemon job, the Docker shape's, no reboot **C** |
 | 24 | Rotate secrets | `secrets rotate KEY` for `rotation: true`, three passes (`--stage` → `KEY_NEXT` accepted; swap → `KEY_PREVIOUS` accepted; `--finish`), the stack up again at each **C** | `k8s secrets rotate`: the same passes on the Secret, each workload's rollout restarted and awaited **C** | the Docker shape's verb, a host daemon job **C** |
 | 24b | Set a secret | `secrets set KEY` for `settable: true` (opt-in: a database password or an encryption key changed in `.env` alone breaks the data made with it), the value on standard input, the stack up again **C** | not yet **X** | the Docker shape's verb, a host daemon job on the operator's socket alone **C** |
+| 24c | Show a login | `secrets show KEY` for `settable: true`, standard output a terminal or refused; the closing report names the logins and the verb **C** | `k8s secrets show`, from the release's Secret (or its secret files' one) **C** | the Docker shape's verb, the host daemon's answer on the operator's socket alone, never logged **C** |
 | 25 | Registry credential rotation | `.env` / installer flag **C** | pull Secret **C** | sealed env + `reconfigure-userdata` **C** → the pull account the OS bundle carries; a mirror's is root's Docker login on the VM |
 | 26 | Power / maintenance | `stop` / `start` **C** | owner: cluster | `<short>-stow reboot/shutdown --drain-secs`, disk-pressure hook **C** |
 | 27 | Uninstall | `uninstall`: `compose down`, the install's timers and applied network declarations removed; the volumes and the install directory kept unless `--data` **C** | `k8s uninstall`: `helm uninstall`, the installer's Secrets, the hook's account and Job; the claims only with `--data`, kept data keeping the Secrets that answer for it, a chart's own claim (which helm deletes) needing `--data` **C** | `vm destroy` (a VM `vm create` made with OpenTofu) **C**; else owner: hypervisor |
@@ -1462,9 +1484,11 @@ every shape, the VM end-to-end test upgrading through it), then the health gate.
   moved one) and Caddy's redirect names its own HTTPS port: both would break; a capability with
   a non-root user (a file capability on the binary, which `no-new-privileges` ignores, or ambient
   ones). Stowage adds no service on the host's network: a project's service there (an L4 route's
-  upstream on the VM) keeps its own settings, as on any other network. The hooks keep their
-  image's user (a project's program, as its services): no capability makes root in them
-  powerless over the host.
+  upstream on the VM) keeps its own settings, as on any other network. A hook runs as its
+  image's user when the image declares one other than root, else as uid 65534: root is never
+  given, and an image that needs it fails the hook, the failure naming the fix (the image's own
+  `USER`) — the image is the project's, and what its program needs it states there. Refusing a
+  root image outright was rejected: most images declare no user and run fine as one.
 - **The front's files go in as its user; root only changes owners** — the front's user is 65532,
   or the uid the project gives the volume it publishes its CA in (one user for both rather than a
   second owner of a project's volume; uid 0 refused: the front never runs as root). The
@@ -1491,8 +1515,12 @@ every shape, the VM end-to-end test upgrading through it), then the health gate.
   containers are made when the front's volumes exist and no volume awaits its uid (else after,
   so it judges what the volume helper left), so a start whose volumes exist recreates no
   container early. The volume helper and the backup runner are one-shot containers acting on
-  volumes of any owner, no service of the stack: the volume helper off the network, the backup
-  runner (whose restore writes files of every owner back) with Docker's default capabilities.
+  volumes of any owner, no service of the stack, each with the capabilities it needs alone: the
+  volume helper `CHOWN` and `DAC_READ_SEARCH` (a recursive chown through any owner's
+  directories), rclone `DAC_OVERRIDE` and `DAC_READ_SEARCH` (its configuration, the operator's on a
+  Docker host where a non-root operator runs the backup), the runner's shell `CHOWN`,
+  `DAC_OVERRIDE`, `DAC_READ_SEARCH`, `FOWNER`, `FSETID` and `MKNOD` (archives read, and restores
+  written back, with every owner, mode, set-id bit and device node).
 - **A port opens where something serves on it** — the firewall and Docker's publishes followed
   the front's existence, not what it serves, so a front terminating L4 routes alone opened 80
   and 443 in every TLS mode and answered 404 there. One rule decides the front's ports from what
@@ -2185,6 +2213,32 @@ every shape, the VM end-to-end test upgrading through it), then the health gate.
 - **No Stowage registry** — every runtime piece is in the `stowage` binary (an executable or a
   recipe `ship` builds into the project registry), so `stowage.lock` pins a version, not digests;
   operators only ever pull from the project registry.
+- **A login is shown by one verb, on a terminal** — `secrets show KEY`, not `secrets export KEY`
+  narrowed to one key: `export` means a file encrypted to keys kept off the machine, and an
+  unencrypted mode of it would make "export" mean two things. It shows only `settable` secrets
+  (the ones a person types, which the operator may set anyway), never a database password or a
+  key the data was made with; and only when standard output is a terminal, checked before the
+  value is read, so a script or a CI log never captures one — a program that needs a value
+  reads the install's own record with the rights that record needs. On the VM it is an
+  operator-socket route: the group that may use that socket can already run a command in any
+  container, so a root-only check there would protect nothing.
+- **The front's interfaces are held where Docker's DNAT is judged** — by the original destination
+  port of a translated connection (`ct original proto-dst`, `--ctorigdstport`) and the interface it
+  came in on, not by publishing the front on each role's address: an address a DHCP lease changes
+  would drop the front, a device's name does not change. Nor by running the front on the host's
+  network on the VM alone, which would be a second model of the front across shapes. The stack's
+  bridges stay allowed (a container dialling a route's address). On a Docker host the rule is the
+  consented allow chain's, as the allowlists are, and IPv4's alone where Docker's userland proxy
+  could carry IPv6 clients past it.
+- **A secret delivered as a file is the file-input mechanism, opted in per key** (`as_file`), not
+  compose's own `secrets:` with a `file:` source: outside Swarm that is a bind mount whose `uid`,
+  `gid` and `mode` are ignored, so the file's mode is set on the host anyway, and a second path
+  would have its own writes, sweeps and checks. The value stays recorded where every value is (so
+  `secrets set`, `export` and an upgrade carry it); only its delivery changes. On Kubernetes it
+  goes to a Secret of its own rather than the release's, so a chart's `envFrom` of that one cannot
+  leak it whatever the chart does. Rotation is refused with it: its passes hand the services two
+  more values as variables. A `command` provider still receives it as a variable — one calling
+  convention for those (§ 12, the `command` contract), run by Stowage, not a service.
 
 ## 13. OpenTofu provider (planned)
 
@@ -2240,8 +2294,11 @@ no `action` blocks, so every operation is a resource's create, update or delete)
 
 **`stowage_vm_seed`** — `vm seed --json`, generated once (a managed resource: the one-time host key
 would change at every plan from a data source, and a function must be pure). The customer's own
-provider (TrueNAS, a cloud) creates the VM from its user-data and disk. The private host key sits
-in state until the VM is installed; state encryption is advised. This replaces nesting
+provider (TrueNAS, a cloud) creates the VM from its user-data, meta-data and disk (the file
+`--disk-dir` writes, sized by `disk_gib`, or a cloud's `cloud_image`). The private host key sits
+in state until the VM is installed, then `vm host-key` retires it and gives the VM's own key;
+state encryption is advised. `secrets_wo` on the VM is a seed made with `--await-secrets`, its
+export given over SSH at create; a `byo` certificate, `--tls byo`, given the same way. This replaces nesting
 `vm create --create opentofu`, a second OpenTofu root with its own state, inside the first;
 `vm create` keeps its built-in modules for operators who do not write OpenTofu.
 

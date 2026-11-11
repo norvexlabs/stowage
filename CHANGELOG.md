@@ -26,9 +26,44 @@ follow [SemVer](https://semver.org/).
   install is there — no install in the directory, no helm release in the namespace (never `k8s
   uninstall`'s, which does not tell what helm keeps) — so a program tells "nothing installed here"
   from any other refusal.
+- `secrets show KEY` prints a `settable` secret's value (a login an operator signs in with) on a
+  terminal, refused into a pipe or a file, on every shape (`k8s secrets show` on Kubernetes, the
+  VM's host daemon on its operator's socket alone); an install's closing report names the logins
+  and that command, so a generated login is no longer read out of the install's files.
+- The front's ports are held to `front.interfaces` (roles, as an L4 route's `interfaces`) for
+  real on the VM: Docker translates them to the front's container past the input chain, and the
+  firewall's forward chain now drops a connection to them from any other interface. A consented
+  Docker host holds the front's and the L4 routes' interfaces in `DOCKER-USER` too.
+- `as_file: true` on a secret, or on a secret input, delivers its value as a file a service
+  mounts (`${STOWAGE_SECRET_FILE_<KEY>}`), never as a variable `docker inspect` or a child process
+  could read; lint refuses the variable read anywhere in the compose file. On Kubernetes the value
+  is in its own Secret (`stowage.secretFiles`), never in the release's, so `envFrom` cannot reach
+  it; the provision hook gets it as a file on every shape. `describe --json` gives `as_file`.
+
+- `vm seed --json` gives what a tool creating the VM itself would otherwise rebuild: the NoCloud
+  `meta_data`, each disk's sizes (`os_gib`, `disk_gib`, with `app_gib`), the cloud image name a
+  `ship --disks` registered from it, and with `--disk-dir` the disk itself as a file. Its first
+  install can wait for a secrets export (`--await-secrets`) or a `byo` certificate (`--tls byo`)
+  given over SSH. A refusal prints its object on standard output.
+- `vm host-key HOSTNAME --json` reads a VM's own SSH host key through the key it is checked by
+  and retires its seed's one-time key at once; `sudo <short>-stow host-key [--json]` does the same
+  on the VM itself, with no SSH.
 
 ### Changed
 
+- `front.interface` (one role) is `front.interfaces` (a list, as an L4 route's): `interfaces:
+  [uplink]`.
+- On the VM, a verb run before the first install is a refusal (exit 3) whose `--json` result says
+  `absent`, as on Docker and Kubernetes; its `status --json` reports the first install's registry,
+  installer short name, loopback address and registry CA digest, as Docker's.
+- The Kubernetes refusals of a missing release read one way on every verb: the install to run,
+  with what the run was given that it takes (the mirror, its CA, `--image-pull-login`, the values
+  files, `--unsafe-sysctls`, `--no-provision`), as reason and fix; `k8s upgrade --version V` names the version
+  asked. A Docker host's `backup`, `backup config` or `restore` with a `--dir` that does not
+  exist is refused the same way, instead of failing on the daemon's lock, and whatever fails as
+  that daemon starts is reported as itself, never as an unreachable daemon.
+- `vm create` and `vm seed` of a release whose front offers no TLS mode a VM is made with refuse
+  it (exit 3) instead of failing, `vm seed` naming `--tls byo` where the release offers it.
 - `k8s uninstall` with no release refuses naming another tool's objects of the release's names it
   finds there.
 - The front Stowage adds runs as a user of its own (65532, or the uid the project gives the
@@ -38,7 +73,18 @@ follow [SemVer](https://semver.org/).
   published-CA volume whose directory another uid holds (a service's image made it so, or the
   front ran as another uid there), naming the `chown` that gives it to the front.
 - The provision hook, the schema check and a handoff's step run with a read-only root, `/tmp`
-  their only writable path, on Docker and Kubernetes alike.
+  their only writable path, on Docker and Kubernetes alike, and on Docker never as root: as their
+  image's own user when it declares one other than root, else as uid 65534 (a failure then says
+  so, the fix the image's own `USER`).
+- The volume helper and the backup runner drop every capability but those they need: `CHOWN`
+  and `DAC_READ_SEARCH` for the volume helper; `DAC_OVERRIDE` and `DAC_READ_SEARCH` for rclone
+  (its configuration, whoever owns it); `CHOWN`, `DAC_OVERRIDE`, `DAC_READ_SEARCH`, `FOWNER`,
+  `FSETID` and `MKNOD` for the runner's archives and restores.
+- `host-key` and `vm host-key` check sshd's reload as they retire the seed's one-time key: one
+  that did not take prints the key with `"retired": false` and a reason, and exits 1 naming
+  `sudo systemctl reload ssh`; `vm create` then keeps its pin of the one-time key and warns. A VM host name no known_hosts line can hold no longer refuses
+  `host-key`: the key and its retirement as ever, the line left out with a note; `--json` adds
+  `public_key`.
 - A front serving L4 routes alone no longer publishes or opens ports 80 and 443, which nothing
   served on: in `acme` mode it opens 80 alone, for the certificates' challenge. An install checks
   free only the ports the front serves on, and an upgrade whose release serves them first checks

@@ -339,8 +339,10 @@ func (in *Installer) certDone() {
 
 // logChanges logs each value next changes from env, a secret's redacted, and each it removes.
 func (in *Installer) logChanges(env, next *EnvFile, secrets map[string]bool) {
-	// A file input's path follows its value, which is logged.
-	path := func(k string) bool { return strings.HasPrefix(k, spec.FileVarPrefix) }
+	// A mounted file's path follows its value, which is logged (a secret's redacted).
+	path := func(k string) bool {
+		return strings.HasPrefix(k, spec.FileVarPrefix) || strings.HasPrefix(k, spec.SecretFileVarPrefix) || k == FileSaltVar
+	}
 	for _, k := range env.Keys() {
 		if _, ok := next.Get(k); !ok && !path(k) {
 			in.O.logf("removing %s", k)
@@ -476,7 +478,7 @@ func (in *Installer) acmeForward(was, env *EnvFile) {
 		return
 	}
 	// The front serving L4 routes alone publishes its HTTP port alone: the HTTP-01 challenge's.
-	if _, served := frontPorts(in.R.Spec.Front, in.R.Spec.L4.Routes, "acme"); !served {
+	if _, served := frontServed(in.R.Spec.Front, in.R.Spec.L4.Routes, "acme"); !served {
 		if http != "80" {
 			in.O.logf("Let's Encrypt reaches each domain on port 80: forward it to %s here; IPv6 forwards no port, so a domain whose AAAA record names this host is reached on 80 itself", http)
 		}

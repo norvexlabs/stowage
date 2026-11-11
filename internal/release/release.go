@@ -324,3 +324,14 @@ func (m *Manifest) check() error {
 	}
 	return nil
 }
+
+// CloudImageName is the name `ship --disks` registers a disk of digest (sha256:…) under as a
+// cloud's image, and that a VM's seed names it by: the project's name and the digest's first 12
+// hex digits. Empty for a digest of another algorithm, or one too short.
+func CloudImageName(project, digest string) string {
+	hex, ok := strings.CutPrefix(digest, "sha256:")
+	if !ok || len(hex) < 12 {
+		return ""
+	}
+	return project + "-" + hex[:12]
+}

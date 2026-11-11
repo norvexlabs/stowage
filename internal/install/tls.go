@@ -213,10 +213,13 @@ func (in *Installer) createModes() []string {
 // noCreateMode is the refusal of a project whose front offers `vm create` no mode, naming the fix.
 func (in *Installer) noCreateMode() error {
 	fix := ""
-	if slices.Contains(in.R.Spec.Front.TLSModes, "byo") {
+	switch {
+	case slices.Contains(in.R.Spec.Front.TLSModes, "byo") && in.seeding:
+		fix = ": give --tls byo, whose first install waits for the certificate, given over SSH once the VM answers"
+	case slices.Contains(in.R.Spec.Front.TLSModes, "byo"):
 		fix = ": give --cert and --key, whose key goes over SSH once the VM answers"
 	}
-	return fmt.Errorf("%s offers no TLS mode a VM can be created with: %s (loopback is not reached from outside the VM, and byo's key never goes in its cloud-config)%s", in.R.Spec.Name, strings.Join(in.R.Spec.Front.TLSModes, ", "), fix)
+	return refuse(strings.TrimPrefix(fix, ": "), "%s offers no TLS mode a VM can be created with: %s (loopback is not reached from outside the VM, and byo's key never goes in its cloud-config)%s", in.R.Spec.Name, strings.Join(in.R.Spec.Front.TLSModes, ", "), fix)
 }
 
 // domainMode is the mode a domain given without --tls picks: acme when offered, else the first
@@ -559,8 +562,8 @@ func tlsCaddyfile(f spec.Front, l4 []spec.L4Route, mode string, domains map[stri
 	fmt.Fprintf(&b, "{\n\tadmin off\n\tpersist_config off\n\thttp_port 80\n\thttps_port 443\n\tservers {\n\t\tprotocols h1 h2\n\t}\n")
 	switch mode {
 	case "acme", "dns-cloudflare":
-		if _, https := frontPorts(f, l4, mode); mode == "acme" && !https {
-			// The front publishes HTTP alone (frontPorts): the TLS-ALPN challenge, on HTTPS,
+		if _, https := frontServed(f, l4, mode); mode == "acme" && !https {
+			// The front publishes HTTP alone (frontServed): the TLS-ALPN challenge, on HTTPS,
 			// would fail before HTTP-01 is tried.
 			b.WriteString("\tcert_issuer acme {\n\t\tdisable_tlsalpn_challenge\n\t}\n")
 		} else if mode == "acme" {

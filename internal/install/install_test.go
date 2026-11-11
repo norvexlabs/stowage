@@ -90,6 +90,8 @@ type fakeDocker struct {
 	// frontUser and frontPrep answer the start's runs of the front's image readying its volumes
 	// (prepareFront): as the front's user, then as root for what that one cannot do.
 	frontUser, frontPrep func(Cmd) ([]byte, error)
+	// imageUsers are the users the images declare (Config.User), by reference; none is root.
+	imageUsers map[string]string
 	// owner answers the run that gives the data volumes their uid.
 	owner func(c Cmd) ([]byte, error)
 	// volumes are the names `volume ls` prints, one per line.
@@ -151,7 +153,7 @@ func (f *fakeDocker) Run(_ context.Context, c Cmd) ([]byte, error) {
 		return []byte(strings.Join(c.Args[4:], "\n") + "\n"), nil
 	case strings.HasPrefix(a, "compose") && strings.HasSuffix(a, " config --format json"):
 		return []byte(cmp.Or(f.model, "{}")), nil
-	case strings.HasPrefix(a, "run --rm --pull never --network none --user 0 --entrypoint sh "):
+	case strings.HasPrefix(a, "run --rm --pull never --network none --user 0 --cap-drop ALL --cap-add CHOWN --cap-add DAC_READ_SEARCH --security-opt no-new-privileges:true --entrypoint sh "):
 		if f.owner == nil {
 			return nil, nil
 		}
@@ -245,6 +247,8 @@ func (f *fakeDocker) Run(_ context.Context, c Cmd) ([]byte, error) {
 			f.loaded[f.loadAs] = f.loadInspect
 		}
 		return nil, err
+	case strings.HasPrefix(a, "image inspect --format {{.Config.User}} "):
+		return []byte(f.imageUsers[c.Args[len(c.Args)-1]] + "\n"), nil
 	case strings.HasPrefix(a, "image inspect"):
 		if id, ok := f.loaded[c.Args[len(c.Args)-1]]; ok {
 			return []byte(id + "\n"), nil
@@ -375,7 +379,7 @@ func testInstallerKeys(t *testing.T, version string, revision int, mod func(*spe
 		t.Fatal(err)
 	}
 	exe := filepath.Join(t.TempDir(), "notes-stow")
-	_ = os.WriteFile(exe, buf.Bytes(), 0o755)
+	_ = testutil.WriteExecutable(exe, buf.Bytes())
 	files, err = payload.Read(exe)
 	if err != nil {
 		t.Fatal(err)
@@ -1002,7 +1006,7 @@ func TestAnL4RoutesExposureIsSaid(t *testing.T) {
 	if got := in.l4Exposure(route, none, nil, heldCA{}); got != "open to whoever reaches this host: SRC's list is not held yet: a start as root applies it, on IPv4 alone (consented; `status` says what the last one did)" {
 		t.Errorf("consented, not applied: %q", got)
 	}
-	rules, _ := allowRules(in.allowed(), in.allowChain(), none)
+	rules, _ := in.heldRules(in.allowChain(), none)
 	if err := os.WriteFile(in.allowHeld(), []byte(heldMark(rules)), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -1418,7 +1422,7 @@ func TestFrontStripsHeadersAndPublishesOnTheLoopback(t *testing.T) {
 			t.Errorf("Caddyfile lacks %q:\n%s", want, cf)
 		}
 	}
-	fc, err := frontCompose(e.r.Spec.Front, nil, nil, Loopback, hostAPI{}, "sha256:x", "", false, false, false, nil, nil, FrontUID)
+	fc, err := frontCompose(e.r.Spec.Front, nil, nil, Loopback, hostAPI{}, "sha256:x", "", false, false, false, nil, nil, false, FrontUID)
 	if err != nil {
 		t.Fatal(err)
 	}

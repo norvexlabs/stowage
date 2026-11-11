@@ -83,7 +83,7 @@ host:                                                          # written into th
 
 front:
   tls_modes: [acme, dns-cloudflare, byo, internal, none]
-  interface: uplink                                            # the VM's firewall opens the front's ports there alone
+  interfaces: [uplink]                                         # the front answers there alone: the VM's firewall, a Docker host's once consented
   routes:
     - name: console
       domain_input: CONSOLE_DOMAIN
@@ -157,7 +157,7 @@ data:
   reset: [postgres, spool]
 
 secrets:
-  - { key: ENCRYPTION_KEY,          gen: hex32 }
+  - { key: ENCRYPTION_KEY,          gen: hex32, as_file: true }   # a file the api mounts, never a variable
   - { key: SESSION_SECRET,          gen: hex32 }
   - { key: INTERNAL_SERVICE_SECRET, gen: hex32, rotation: true }   # secrets rotate
   - { key: POSTGRES_PASSWORD,       gen: pass18 }
@@ -172,7 +172,7 @@ inputs:
   - { key: SUPPORT_EMAIL,     prompt: "Support address shown on the public site", when: tls, shapes: [docker, kairos] }
   - { key: ADMIN_EMAIL,       prompt: "Administrator email",      required: true }
   - { key: ORG_NAME,          prompt: "Organisation name",        required: true }
-  - { key: UPSTREAM_API_KEY,  prompt: "Upstream API key",         secret: true, optional: true }
+  - { key: UPSTREAM_API_KEY,  prompt: "Upstream API key",         secret: true, optional: true, as_file: true }
   - { key: SEARCH_URL,        prompt: "Search service URL (empty: no search)", optional: true }
   - { key: SEARCH_KEY,        prompt: "Search service key",       secret: true, optional: true }
   - { key: INGEST_SOURCES,    prompt: "Addresses allowed to send events (CIDRs; empty refuses everyone)", default: "0.0.0.0/0, ::/0", shapes: [docker, kairos] }

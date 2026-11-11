@@ -22,7 +22,7 @@ func (k K8sOptions) k8sOwnedObjects() []k8sOwned {
 	return []k8sOwned{
 		{"job", k.hookJob()},
 		{"rolebinding", hook}, {"role", hook}, {"serviceaccount", hook},
-		{"secret", hook}, {"secret", k.pullSecret()}, {"secret", k.filesSecret()}, {"secret", k.envSecret()},
+		{"secret", hook}, {"secret", k.pullSecret()}, {"secret", k.filesSecret()}, {"secret", k.secretFilesSecret()}, {"secret", k.envSecret()},
 	}
 }
 
@@ -175,7 +175,7 @@ func (in *Installer) K8sUninstall(ctx context.Context) (err error) {
 	var keptSecrets []string
 	if (len(claims) > 0 && !data) || len(keptClaims) > 0 || rel == nil {
 		owned = slices.DeleteFunc(owned, func(ob k8sOwned) bool {
-			keep := ob.kind == "secret" && (ob.name == k.envSecret() || ob.name == k.hookName())
+			keep := ob.kind == "secret" && (ob.name == k.envSecret() || ob.name == k.secretFilesSecret() || ob.name == k.hookName())
 			if keep {
 				keptSecrets = append(keptSecrets, ob.name)
 			}

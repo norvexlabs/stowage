@@ -4,6 +4,7 @@ package command
 
 import (
 	"context"
+	"github.com/norvexlabs/stowage/internal/testutil"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -26,7 +27,7 @@ func TestInterruptKillsTheCommandGroup(t *testing.T) {
 	dir := t.TempDir()
 	pidFile := filepath.Join(dir, "sleep.pid")
 	body := "#!/bin/sh\nsleep 60 & echo $! > " + pidFile + "\nwait\n"
-	if err := os.WriteFile(filepath.Join(dir, "c.sh"), []byte(body), 0o755); err != nil {
+	if err := testutil.WriteExecutable(filepath.Join(dir, "c.sh"), []byte(body)); err != nil {
 		t.Fatal(err)
 	}
 	helper := exec.Command(os.Args[0], "-test.run=^TestInterruptKillsTheCommandGroup$")
@@ -83,7 +84,7 @@ func TestIgnoredHangupStaysIgnored(t *testing.T) {
 	release := filepath.Join(dir, "release")
 	// The command answers only once the hangup was sent: it always lands during the run.
 	body := "#!/bin/sh\ntouch " + marker + "\nwhile [ ! -e " + release + " ]; do sleep 0.02; done\necho '{\"ok\":true}'\n"
-	if err := os.WriteFile(filepath.Join(dir, "c.sh"), []byte(body), 0o755); err != nil {
+	if err := testutil.WriteExecutable(filepath.Join(dir, "c.sh"), []byte(body)); err != nil {
 		t.Fatal(err)
 	}
 	helper := exec.Command("nohup", os.Args[0], "-test.run=^TestIgnoredHangupStaysIgnored$")
@@ -156,7 +157,7 @@ func TestJobControlReachesTheCommandGroup(t *testing.T) {
 	pidFile := filepath.Join(dir, "sleep.pid")
 	release := filepath.Join(dir, "release")
 	body := "#!/bin/sh\nsleep 60 & echo $! > " + pidFile + "\nwhile [ ! -e " + release + " ]; do sleep 0.05; done\nkill $!\necho '{\"ok\":true}'\n"
-	if err := os.WriteFile(filepath.Join(dir, "c.sh"), []byte(body), 0o755); err != nil {
+	if err := testutil.WriteExecutable(filepath.Join(dir, "c.sh"), []byte(body)); err != nil {
 		t.Fatal(err)
 	}
 	helper := exec.Command(os.Args[0], "-test.run=^TestJobControlReachesTheCommandGroup$")
@@ -198,7 +199,7 @@ func TestSuspendDoesNotConsumeTheTimeout(t *testing.T) {
 	pidFile := filepath.Join(dir, "sleep.pid")
 	release := filepath.Join(dir, "release")
 	body := "#!/bin/sh\nsleep 60 & echo $! > " + pidFile + "\nwhile [ ! -e " + release + " ]; do sleep 0.05; done\nkill $!\necho '{\"ok\":true}'\n"
-	if err := os.WriteFile(filepath.Join(dir, "c.sh"), []byte(body), 0o755); err != nil {
+	if err := testutil.WriteExecutable(filepath.Join(dir, "c.sh"), []byte(body)); err != nil {
 		t.Fatal(err)
 	}
 	helper := exec.Command(os.Args[0], "-test.run=^TestJobControlReachesTheCommandGroup$")
@@ -240,7 +241,7 @@ func TestStopOffTheForegroundIsDropped(t *testing.T) {
 	marker := filepath.Join(dir, "started")
 	release := filepath.Join(dir, "release")
 	body := "#!/bin/sh\ntouch " + marker + "\nwhile [ ! -e " + release + " ]; do sleep 0.05; done\necho '{\"ok\":true}'\n"
-	if err := os.WriteFile(filepath.Join(dir, "c.sh"), []byte(body), 0o755); err != nil {
+	if err := testutil.WriteExecutable(filepath.Join(dir, "c.sh"), []byte(body)); err != nil {
 		t.Fatal(err)
 	}
 	helper := exec.Command(os.Args[0], "-test.run=^TestJobControlReachesTheCommandGroup$")

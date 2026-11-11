@@ -851,6 +851,8 @@ func (l *linter) handoffs() {
 				l.errf(kw, "%s is no input, secret or safe default", k)
 			case isInput && input.File():
 				l.errf(kw, "%s is a file input, which a handoff's step does not get: its run makes what it gives", k)
+			case l.s.AsFile(k):
+				l.errf(kw, "%s is delivered as a file (as_file: true), which a handoff's step does not get: its run makes what it gives", k)
 			}
 			seen[k] = true
 		}

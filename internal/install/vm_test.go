@@ -57,7 +57,7 @@ func bundledInstaller(t *testing.T, version string, revision int, mod func(*spec
 		t.Fatal(err)
 	}
 	exe := filepath.Join(t.TempDir(), "notes-stow")
-	_ = os.WriteFile(exe, buf.Bytes(), 0o755)
+	_ = testutil.WriteExecutable(exe, buf.Bytes())
 	files, err := payload.Read(exe)
 	if err != nil {
 		t.Fatal(err)
@@ -523,7 +523,7 @@ func TestBootNeverRunsAnInstallerThatIsNotTheInstalls(t *testing.T) {
 	}
 	e.r, e.self = bundledInstaller(t, "2.0.0", 1, nil)
 	// The install's installer is 2.0.0's, though it runs 1.0.0: running it would boot again.
-	if err := os.WriteFile(filepath.Join(e.dir, "notes-stow"), []byte(read(t, e.self)), 0o755); err != nil {
+	if err := testutil.WriteExecutable(filepath.Join(e.dir, "notes-stow"), []byte(read(t, e.self))); err != nil {
 		t.Fatal(err)
 	}
 	in := e.installer(vm)
@@ -1338,7 +1338,7 @@ func TestThePortsOfAnInterfaceAreOpenedOnItAlone(t *testing.T) {
 	ctx := context.Background()
 	host := &nftHost{}
 	r, _ := testInstallerWith(t, "1.0.0", func(s *spec.Spec) {
-		s.Front.Interface = "uplink"
+		s.Front.Interfaces = []string{"uplink"}
 		s.L4.Routes = []spec.L4Route{
 			{Name: "db", Protocol: "tcp", Port: 5432, Upstream: "postgres:5432"},
 			{Name: "feed", Protocol: "udp", Port: 17007, Upstream: "api:17007", AllowInput: "FEED_SOURCES", Interfaces: []string{"edge"}},
@@ -1359,6 +1359,22 @@ func TestThePortsOfAnInterfaceAreOpenedOnItAlone(t *testing.T) {
 			t.Errorf("no %q in:\n%s", want, b)
 		}
 	}
+	// Docker DNATs the front's ports to its container, past the input chain: the forward chain
+	// holds them to the front's interfaces and the stack's bridges.
+	fwd, err := os.ReadFile(filepath.Join(in.O.Dir, ForwardRules, "notes-l4.nft"))
+	want := "meta l4proto tcp ct direction original ct status dnat ct original proto-dst { 80, 443 } oifname \"br-*\" iifname != \"uplink\" drop\n" +
+		"meta l4proto tcp ct direction original ct status dnat ct original proto-dst { 80, 443 } oifname \"docker0\" iifname != \"uplink\" drop\n"
+	if err != nil || !strings.HasSuffix(string(fwd), want) {
+		t.Errorf("the forward chain's front rules: %v\n%s", err, fwd)
+	}
+	// In loopback mode, none: the front is on the loopback address alone.
+	env.Set("STOWAGE_TLS_MODE", Loopback)
+	if err := in.openPorts(ctx, env, hostNet{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(in.O.Dir, ForwardRules, "notes-l4.nft")); !os.IsNotExist(err) {
+		t.Errorf("loopback mode keeps the front's forward rules: %v", err)
+	}
 }
 
 // A VM made by a release that named no NIC has none named by its role: after an upgrade to one
@@ -1376,7 +1392,7 @@ func TestARoleWithoutItsNICFailsClosed(t *testing.T) {
 	host := &nftHost{}
 	r, _ := testInstallerWith(t, "1.0.0", func(s *spec.Spec) {
 		s.Host = &spec.Host{Interfaces: map[string]spec.HostInterface{"uplink": {Primary: true}, "edge": {}, "lan": {Optional: true}, "vpn0": {Kind: spec.InterfaceTUN}}}
-		s.Front.Interface = "uplink"
+		s.Front.Interfaces = []string{"uplink"}
 		s.L4.Routes = []spec.L4Route{
 			{Name: "feed", Protocol: "udp", Port: 17007, Upstream: "api:17007", Interfaces: []string{"edge"}},
 			{Name: "site", Protocol: "udp", Port: 17009, Upstream: "api:17009", Interfaces: []string{"lan"}},

@@ -9,6 +9,8 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"slices"
@@ -166,9 +168,9 @@ func TestNoInstallNamesTheAbsoluteDir(t *testing.T) {
 	}
 }
 
-// On the VM, whose host daemon answers its verbs, a directory with no install is an ordinary
-// refusal: absent is Docker's and Kubernetes'.
-func TestTheVMsNoInstallIsNotAbsent(t *testing.T) {
+// A directory with no install is refused one way by every verb, the text status and the secrets
+// export, absent on Docker and on the VM, each with its shape's fix.
+func TestNoInstallIsAbsentOnEveryShape(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
 	for _, preloaded := range []bool{false, true} {
@@ -181,7 +183,7 @@ func TestTheVMsNoInstallIsNotAbsent(t *testing.T) {
 			if preloaded {
 				want = "sudo notes-stow install"
 			}
-			if r, ok := Refusal(err); !ok || r.Absent == preloaded || r.Fix != want {
+			if r, ok := Refusal(err); !ok || !r.Absent || r.Fix != want {
 				t.Errorf("preloaded %v: %v %+v", preloaded, err, r)
 			}
 		}
@@ -582,5 +584,258 @@ func TestK8sImagePullLoginDryRun(t *testing.T) {
 	}
 	if !strings.Contains(e.log.String(), "note: a run writes the pull Secret notes-stowage-pull from the Docker login for") || len(e.f.applied) != 0 {
 		t.Errorf("%s %v", e.log, e.f.applied)
+	}
+}
+
+// The host daemon carries absent across its socket: a request before the VM's first install is
+// an absent refusal, answered 409 with absent true, which the client takes back as Refused.Absent;
+// failAs keeps it, and a refusal of another kind carries none.
+func TestHostdCarriesAbsent(t *testing.T) {
+	t.Parallel()
+	e := vmEnv(t, "1.0.0")
+	h := daemon(e, &fakeHost{}).Handler()
+	var body map[string]any
+	if code := call(t, h, "GET", "/v1/services", nil, &body); code != 409 || body["absent"] != true || body["refused"] != true || body["fix"] != "sudo notes-stow install" {
+		t.Errorf("%d %v", code, body)
+	}
+	for _, c := range []struct {
+		err    error
+		absent bool
+	}{{failAs(409, absent("x", "none here")), true}, {failAs(409, refuse("x", "not that")), false}} {
+		w := httptest.NewRecorder()
+		replyErr(w, c.err)
+		if strings.Contains(w.Body.String(), `"absent":true`) != c.absent {
+			t.Errorf("%v: %s", c.err, w.Body)
+		}
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /absent", func(w http.ResponseWriter, _ *http.Request) {
+		replyErr(w, failAs(409, absent("install first", "none here")))
+	})
+	mux.HandleFunc("GET /other", func(w http.ResponseWriter, _ *http.Request) { replyErr(w, refuseAs(409, "do this", "no")) })
+	sock := servedHandler(t, mux)
+	c := &hostClient{http: socketClient(&sock)}
+	if r, ok := Refusal(c.do(context.Background(), "GET", "/absent", nil, nil)); !ok || !r.Absent || r.Fix != "install first" {
+		t.Errorf("absent: %+v %t", r, ok)
+	}
+	if r, ok := Refusal(c.do(context.Background(), "GET", "/other", nil, nil)); !ok || r.Absent {
+		t.Errorf("other: %+v %t", r, ok)
+	}
+}
+
+// The VM's status reports what its first install recorded, as Docker's: the registry, the
+// installer's short name, the loopback address, and the registry CA's digest when it keeps one.
+func TestVMStatusFirstInstallSettings(t *testing.T) {
+	t.Parallel()
+	e := vmEnv(t, "1.0.0")
+	if err := e.install(vm); err != nil {
+		t.Fatalf("%v\n%s", err, e.log)
+	}
+	h := daemon(e, &fakeHost{}).Handler()
+	var st Status
+	if code := call(t, h, "GET", "/v1/status", nil, &st); code != 200 || st.Registry != "ghcr.io/acme/notes" || st.ShortName != "notes" || st.Address != "127.0.0.1" || st.RegistryCA != "" {
+		t.Fatalf("%d %+v", code, st)
+	}
+	ca := []byte("a CA\n")
+	if err := os.WriteFile(filepath.Join(e.dir, RegistryCAFile), ca, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(ca)
+	if call(t, h, "GET", "/v1/status", nil, &st); st.RegistryCA != "sha256:"+hex.EncodeToString(sum[:]) {
+		t.Errorf("registry_ca %q", st.RegistryCA)
+	}
+	// The CA rewritten in place, of the same size and modification time: read again, at each status.
+	st0, _ := os.Stat(filepath.Join(e.dir, RegistryCAFile))
+	ca = []byte("b CA\n")
+	if err := os.WriteFile(filepath.Join(e.dir, RegistryCAFile), ca, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.Chtimes(filepath.Join(e.dir, RegistryCAFile), st0.ModTime(), st0.ModTime())
+	sum = sha256.Sum256(ca)
+	if call(t, h, "GET", "/v1/status", nil, &st); st.RegistryCA != "sha256:"+hex.EncodeToString(sum[:]) {
+		t.Errorf("in place: registry_ca %q", st.RegistryCA)
+	}
+	ca = []byte("another CA, longer\n")
+	if err := os.WriteFile(filepath.Join(e.dir, RegistryCAFile), ca, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sum = sha256.Sum256(ca)
+	if call(t, h, "GET", "/v1/status", nil, &st); st.RegistryCA != "sha256:"+hex.EncodeToString(sum[:]) {
+		t.Errorf("replaced: registry_ca %q", st.RegistryCA)
+	}
+	// Before the first install: none of them.
+	e2 := vmEnv(t, "1.0.0")
+	var none Status
+	if call(t, daemon(e2, &fakeHost{}).Handler(), "GET", "/v1/status", nil, &none); none.Registry != "" || none.ShortName != "" || none.Address != "" || none.RegistryCA != "" {
+		t.Errorf("%+v", none)
+	}
+}
+
+// The k8s refusals of a missing release name one install, with the mirror and the CA the run was
+// given, and an upgrade --version says what it was asked.
+func TestK8sNoReleaseNamesTheInstallGiven(t *testing.T) {
+	t.Parallel()
+	e := newKubeEnv(t, spec.Provider{Name: "none"})
+	on := true
+	err := e.installer(func(o *Options) {
+		o.K8s.Registry, o.RegistryCA, o.K8s.PullLogin, o.K8s.Values, o.K8s.UnsafeSysctls = "mirror.example/notes", "/etc/ca.pem", true, []string{"my values.yaml"}, &on
+	}).K8sUpgradeTo(context.Background(), "2.0.0", nil)
+	want := "`notes-stow k8s install --namespace notes --release notes --image-registry mirror.example/notes --registry-ca /etc/ca.pem --image-pull-login --values 'my values.yaml' --unsafe-sysctls=true --no-provision`"
+	if r, ok := Refusal(err); !ok || !r.Absent || r.Fix != "install first: "+want || r.Reason != "no release notes in notes to upgrade to 2.0.0: "+want+" installs 1.0.0" {
+		t.Errorf("%v (fix %q)", err, r.Fix)
+	}
+}
+
+// The Docker shape's daemon answers a request before its first install with Docker's own fix,
+// absent too: never the VM's installer.
+func TestDockerDaemonNoInstallFix(t *testing.T) {
+	t.Parallel()
+	e := vmEnv(t, "1.0.0")
+	d := daemon(e, &fakeHost{})
+	d.Docker, d.O.Preloaded = true, false
+	var body map[string]any
+	if code := call(t, d.Handler(), "GET", "/v1/services", nil, &body); code != 409 || body["absent"] != true || body["fix"] != "install first, or give the --dir of the install" {
+		t.Errorf("%d %v", code, body)
+	}
+}
+
+// The VM's status answers with no registry_ca before the install, and when the install's CA file
+// cannot be read: the status always answers, and a poll logs nothing.
+func TestVMStatusRegistryCAUnread(t *testing.T) {
+	t.Parallel()
+	e := vmEnv(t, "1.0.0")
+	if err := e.install(vm); err != nil {
+		t.Fatalf("%v\n%s", err, e.log)
+	}
+	if err := os.Mkdir(filepath.Join(e.dir, RegistryCAFile), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	var log bytes.Buffer
+	d := daemon(e, &fakeHost{})
+	d.O.Log = &log
+	var st Status
+	if code := call(t, d.Handler(), "GET", "/v1/status", nil, &st); code != 200 || st.RegistryCA != "" || st.Registry == "" || log.Len() != 0 {
+		t.Errorf("%d %+v\n%s", code, st, &log)
+	}
+}
+
+// restore before the VM's first install is an absent refusal, as every verb's.
+func TestVMRestoreBeforeTheInstall(t *testing.T) {
+	t.Parallel()
+	e := vmEnv(t, "1.0.0")
+	sock := served(t, daemon(e, &fakeHost{}))
+	_, err := ctl(e, sock, "restore", "notes-full-x.pgdump.age")
+	if r, ok := Refusal(err); !ok || !r.Absent || !strings.Contains(r.Reason, "is not installed yet") {
+		t.Errorf("%v", err)
+	}
+}
+
+// A Docker host's backup verb whose --dir does not exist answers the absent refusal through the
+// daemon of its process, as the daemon answers it — never as an unreachable daemon —, and makes
+// nothing there.
+func TestDockerHostVerbsBeforeTheInstall(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	missing := filepath.Join(t.TempDir(), "none")
+	var out, errb bytes.Buffer
+	cmd := Command(e.r, e.self, &out, &errb)
+	cmd.SetArgs([]string{"backup", "run", "--dir", missing})
+	err := cmd.Execute()
+	if r, ok := Refusal(err); !ok || !r.Absent || !strings.HasSuffix(r.Reason, "holds no install") || strings.Contains(err.Error(), "not reachable") {
+		t.Errorf("%v\n%s", err, &errb)
+	}
+	if fileExists(missing) {
+		t.Error("the directory was made")
+	}
+}
+
+// The install hint of a k8s refusal never names --dry-run (the install named is the one to run),
+// and says that the inputs given go with it, never their values.
+func TestK8sInstallHintDryRunAndInputs(t *testing.T) {
+	t.Parallel()
+	e := newKubeEnv(t, spec.Provider{Name: "none"})
+	err := e.installer(func(o *Options) {
+		o.DryRun, o.Set = true, map[string]string{"ADMIN_EMAIL": "secret-not-shown@example.org"}
+	}).K8sUpgrade(context.Background())
+	r, _ := Refusal(err)
+	if !r.Absent || strings.Contains(r.Fix, "--dry-run") || !strings.Contains(r.Fix, "`, given the inputs this run was given") || strings.Contains(r.Fix+r.Reason, "secret-not-shown") {
+		t.Errorf("%v (fix %q)", err, r.Fix)
+	}
+}
+
+// A relative --dir that does not exist is named absolute; a settings change there (backup config)
+// is the same refusal, before any lock is made, never an unreachable daemon.
+func TestDockerHostRelativeAndSettingsBeforeTheInstall(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	run := func(args ...string) error {
+		var out, errb bytes.Buffer
+		cmd := Command(e.r, e.self, &out, &errb)
+		cmd.SetArgs(args)
+		cmd.SetIn(strings.NewReader(""))
+		return cmd.Execute()
+	}
+	err := run("backup", "run", "--dir", "no-such-install-dir")
+	if r, ok := Refusal(err); !ok || !r.Absent || !strings.HasPrefix(r.Reason, "/") || !strings.HasSuffix(r.Reason, "/no-such-install-dir holds no install") {
+		t.Errorf("relative: %v", err)
+	}
+	missing := filepath.Join(t.TempDir(), "none")
+	err = run("backup", "config", "--dir", missing, "--destination", "dav:backups", "--recipient", "age1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq")
+	if r, ok := Refusal(err); !ok || !r.Absent || strings.Contains(err.Error(), "not reachable") || fileExists(missing) {
+		t.Errorf("settings: %v", err)
+	}
+}
+
+// What fails while the daemon of this process is made, and is no refusal, is the daemon's answer
+// too: the client's error is it, never an unreachable daemon.
+func TestLazyTransportAnswersAFailure(t *testing.T) {
+	t.Parallel()
+	failed := errors.New("no permission to read it")
+	lt := &lazyTransport{read: func() (http.Handler, error) { return nil, failed }}
+	c := &hostClient{http: &http.Client{Transport: lt}}
+	err := c.do(context.Background(), "GET", "/v1/backup", nil, nil)
+	if !errors.Is(err, failed) || isRefused(err) || err.Error() != "no permission to read it" {
+		t.Errorf("%v", err)
+	}
+	// A cancellation and an exit status keep their types.
+	lt = &lazyTransport{jobs: func() (http.Handler, error) { return nil, context.Canceled }}
+	c = &hostClient{http: &http.Client{Transport: lt}}
+	if err := c.do(context.Background(), "POST", "/v1/backup", nil, nil); !errors.Is(err, context.Canceled) {
+		t.Errorf("canceled: %v", err)
+	}
+	lt = &lazyTransport{read: func() (http.Handler, error) { return nil, ExitCode(4) }}
+	c = &hostClient{http: &http.Client{Transport: lt}}
+	var code ExitCode
+	if err := c.do(context.Background(), "GET", "/v1/backup", nil, nil); !errors.As(err, &code) || code != 4 {
+		t.Errorf("exit code: %v", err)
+	}
+	var u unreachable
+	if errors.As(err, &u) {
+		t.Error("taken as an unreachable daemon")
+	}
+}
+
+// One --dir check for every request, read or job: a missing one, a file, refused; "" is the
+// current directory.
+func TestDockerDirCheck(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	file := filepath.Join(t.TempDir(), "a-file")
+	_ = os.WriteFile(file, nil, 0o644)
+	for dir, refused := range map[string]bool{filepath.Join(t.TempDir(), "none"): true, file: true, filepath.Join(file, "under"): true, t.TempDir(): false, "": false} {
+		err := e.installer(func(o *Options) { o.Dir = dir }).dockerDirCheck()
+		if refusedAbsent(err) != refused {
+			t.Errorf("%q: %v", dir, err)
+		}
+	}
+	// The read path (backup config, no flags), a settings change and disk-check refuse a missing
+	// --dir too.
+	var out, errb bytes.Buffer
+	for _, args := range [][]string{{"backup", "config"}, {"backup", "config", "--destination", "dav:backups"}, {"disk-check"}} {
+		cmd := Command(e.r, e.self, &out, &errb)
+		cmd.SetArgs(append(args, "--dir", filepath.Join(t.TempDir(), "none")))
+		if err := cmd.Execute(); !refusedAbsent(err) {
+			t.Errorf("%v: %v\n%s", args, err, &errb)
+		}
 	}
 }

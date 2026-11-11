@@ -706,20 +706,20 @@ func TestK8sHookWithoutAFileInputMountsNone(t *testing.T) {
 	}
 }
 
-// The values a reset across a baseline installs with name the files Secret.
+// The values a reset across a baseline installs with name the files Secret and the secret files' one.
 func TestWithFilesValue(t *testing.T) {
 	t.Parallel()
 	for _, c := range []struct{ in, want string }{
-		{"", "stowage:\n    files: x\n"},
-		{"stowage: {secret: s}\npostgres: {mode: external}\n", "postgres:\n    mode: external\nstowage:\n    files: x\n    secret: s\n"},
-		{"stowage: {files: old}\n", "stowage:\n    files: x\n"},
+		{"", "stowage:\n    asFile:\n        - K\n    files: x\n    secretFiles: z\n"},
+		{"stowage: {secret: s}\npostgres: {mode: external}\n", "postgres:\n    mode: external\nstowage:\n    asFile:\n        - K\n    files: x\n    secret: s\n    secretFiles: z\n"},
+		{"stowage: {files: old, secretFiles: old}\n", "stowage:\n    asFile:\n        - K\n    files: x\n    secretFiles: z\n"},
 	} {
-		got, err := withFilesValue([]byte(c.in), "x")
+		got, err := withFilesValue([]byte(c.in), "x", "z", []string{"K"})
 		if err != nil || string(got) != c.want {
 			t.Errorf("%q: %q, %v", c.in, got, err)
 		}
 	}
-	if _, err := withFilesValue([]byte("a: [\n"), "x"); err == nil {
+	if _, err := withFilesValue([]byte("a: [\n"), "x", "z", []string{"K"}); err == nil {
 		t.Error("broken values passed")
 	}
 }

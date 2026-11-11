@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/norvexlabs/stowage/internal/spec"
 	"os"
 	"slices"
 	"strconv"
@@ -84,7 +85,7 @@ type composeNetwork struct {
 }
 
 // mtuOpt is the bridge driver's option holding a network's MTU.
-const mtuOpt = "com.docker.network.driver.mtu"
+const mtuOpt = spec.MTUOpt
 
 // takesMTU reports whether the installer gives n the host's MTU: a bridge network the stack makes
 // itself, whose compose file sets no MTU of its own.
@@ -496,7 +497,10 @@ func (in *Installer) ownVolumes(ctx context.Context, env *EnvFile, names []strin
 		in.O.logf("%s %s carries no volume helper: %s keep the owner Docker gave them until a release with one starts", in.R.Spec.Name, in.R.Manifest.ProjectVersion, strings.Join(names, ", "))
 		return false, nil
 	}
-	args := []string{"run", "--rm", "--pull", "never", "--network", "none", "--user", "0", "--entrypoint", "sh"}
+	// Root with the capabilities a recursive chown of any owner's files needs alone: changing owners
+	// (CHOWN) and reaching directories another user's mode closes (DAC_READ_SEARCH).
+	args := []string{"run", "--rm", "--pull", "never", "--network", "none", "--user", "0", "--cap-drop", "ALL", "--cap-add", "CHOWN",
+		"--cap-add", "DAC_READ_SEARCH", "--security-opt", "no-new-privileges:true", "--entrypoint", "sh"}
 	var script strings.Builder
 	script.WriteString("set -e\n")
 	for i, name := range names {

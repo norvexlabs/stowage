@@ -68,15 +68,25 @@ func (in *Installer) hookEnv(env *EnvFile, h *providers.ProvisionHook) []string 
 	return keys
 }
 
-// hookFiles lists the file inputs the provision hook's env names.
+// hookFiles lists the keys of the provision hook's env it gets as files: the file inputs, and the
+// secrets delivered as files.
 func (in *Installer) hookFiles(h *providers.ProvisionHook) []string {
 	var files []string
+	mounted := in.mountedFiles()
 	for _, k := range h.Keys() {
-		if i, ok := in.R.Spec.Input(k); ok && i.File() {
+		if slices.ContainsFunc(mounted, func(f mountedFile) bool { return f.Key == k }) {
 			files = append(files, k)
 		}
 	}
 	return files
+}
+
+// fileVarOf is the variable holding the path of the file key is mounted from.
+func (in *Installer) fileVarOf(key string) string {
+	if in.R.Spec.AsFile(key) {
+		return spec.SecretFileVar(key)
+	}
+	return spec.FileVar(key)
 }
 
 // providedEnv lists the recorded values Stowage provides, each route's URL and each L4 route's
@@ -129,16 +139,64 @@ func (in *Installer) recordedEnv(env *EnvFile) []string {
 	return keys
 }
 
+// HookUID is the user and group a hook (a service Stowage runs on demand: the provision hook, a
+// command provider's, a handoff's step) runs as on Docker when its image declares root, or no user:
+// no hook is given root.
+const HookUID = 65534
+
+// hookUser is the user a hook of the image ref runs as (compose's user: key): "" (the image's own)
+// when the image declares a user other than root, else HookUID's. An image the engine cannot read
+// (pruned since, whatever the engine's words) is pulled once, with environ (the pull's
+// credentials), as compose's run would, and read again; a failure then is an error, never a guess
+// at its user. Read once per image and run.
+func (in *Installer) hookUser(ctx context.Context, ref string, environ []string) (string, error) {
+	if u, ok := in.hookUsers[ref]; ok {
+		return u, nil
+	}
+	inspect := func() ([]byte, error) {
+		return in.O.Docker.Run(ctx, Cmd{Args: []string{"image", "inspect", "--format", "{{.Config.User}}", ref}})
+	}
+	out, err := inspect()
+	if err != nil { // not held (whatever the engine's words), or not read: pulled once, read again
+		if _, perr := in.O.Docker.Run(ctx, Cmd{Args: []string{"pull", ref}, Env: environ}); perr != nil {
+			return "", fmt.Errorf("the hook's image %s, whose user it runs as: %v; pulling it: %w", ref, err, perr)
+		}
+		out, err = inspect()
+	}
+	if err != nil {
+		return "", fmt.Errorf("the hook's image %s, whose user it runs as: %w", ref, err)
+	}
+	u := fmt.Sprintf("%d:%d", HookUID, HookUID)
+	if name, _, _ := strings.Cut(strings.TrimSpace(string(out)), ":"); name != "" && name != "0" && name != "root" {
+		u = ""
+	}
+	if in.hookUsers == nil {
+		in.hookUsers = map[string]string{}
+	}
+	in.hookUsers[ref] = u
+	return u, nil
+}
+
+// hookRanAs adds to a hook's failure the user it ran as when Stowage chose it (user, hookUser): its
+// image declares root, which no hook is given, so the fix is the image's.
+func hookRanAs(err error, user string) error {
+	if err == nil || user == "" {
+		return err
+	}
+	return fmt.Errorf("%w (it ran as %s: its image declares root, or no user, and no hook is given root; give the image a USER of its own, non-root, that its program runs as)", err, user)
+}
+
 // confined is a service Stowage runs on demand in the stack (behind its own profile): cmd as the
 // container's whole command line, no capability, no privilege gain, a read-only root with /tmp
-// its only writable path, the image's own user, no file of the host (the caller adds what it
-// mounts), and the recorded values by name (compose takes them from the environment it runs with).
-func confined(service, image string, cmd, keys []string) map[string]any {
+// its only writable path, user (hookUser: "" for the image's own, never root), no file of the host
+// (the caller adds what it mounts), and the recorded values by name (compose takes them from the
+// environment it runs with).
+func confined(service, image, user string, cmd, keys []string) map[string]any {
 	c := make([]string, len(cmd))
 	for i, a := range cmd {
 		c[i] = strings.ReplaceAll(a, "$", "$$") // compose interpolates $; the spec's cmd is literal
 	}
-	return map[string]any{
+	svc := map[string]any{
 		"image":        image,
 		"entrypoint":   c,
 		"profiles":     []string{service},
@@ -149,6 +207,10 @@ func confined(service, image string, cmd, keys []string) map[string]any {
 		"environment":  keys,
 		"restart":      "no",
 	}
+	if user != "" {
+		svc["user"] = user
+	}
+	return svc
 }
 
 // serviceFile is a compose file holding one service.
@@ -161,17 +223,18 @@ func serviceFile(what, service string, svc map[string]any) ([]byte, error) {
 }
 
 // provisionCompose is the hook's service, confined, which also reads the hook's earlier outputs
-// from ProvisionEnv, with hosts (targetHosts) as its extra hosts. Each of files is a file input
-// mounted read-only, its only mounts, with its variable holding the path inside the container.
-func provisionCompose(h *providers.ProvisionHook, keys, files, hosts []string) ([]byte, error) {
+// from ProvisionEnv, with hosts (targetHosts) as its extra hosts. Each of files is a file it gets
+// (a file input, or a secret delivered as a file) mounted read-only, its only mounts, with the
+// variable varOf names holding the path inside the container.
+func provisionCompose(h *providers.ProvisionHook, user string, keys, files, hosts []string, varOf func(string) string) ([]byte, error) {
 	environment := slices.Clone(keys)
 	var volumes []string
 	for _, k := range files {
 		target := HookInputsDir + "/" + k
-		environment = append(environment, spec.FileVar(k)+"="+target)
-		volumes = append(volumes, "${"+spec.FileVar(k)+"}:"+target+":ro")
+		environment = append(environment, varOf(k)+"="+target)
+		volumes = append(volumes, "${"+varOf(k)+"}:"+target+":ro")
 	}
-	svc := confined(ProvisionService, "${"+ImageVar(h.Image)+"}", h.Cmd, environment)
+	svc := confined(ProvisionService, "${"+ImageVar(h.Image)+"}", user, h.Cmd, environment)
 	svc["env_file"] = []string{"./" + ProvisionEnv}
 	if len(volumes) > 0 {
 		svc["volumes"] = volumes
@@ -263,7 +326,20 @@ func (in *Installer) runHook(ctx context.Context, env *EnvFile, h *providers.Pro
 	if err := outs.WriteFile(in.path(ProvisionEnv)); err != nil {
 		return err
 	}
-	pc, err := provisionCompose(h, keys, files, in.targetHosts())
+	base, cleanup, err := in.pullEnviron(env)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+	ref, _ := env.Get(ImageVar(h.Image))
+	// Its image's pull, if it is gone, within the hook's own time, as compose's run's would be.
+	userCtx, userCancel := context.WithTimeout(ctx, provisionTimeout)
+	user, err := in.hookUser(userCtx, ref, env.Environ(base))
+	userCancel()
+	if err != nil {
+		return err
+	}
+	pc, err := provisionCompose(h, user, keys, files, in.targetHosts(), in.fileVarOf)
 	if err != nil {
 		return err
 	}
@@ -274,11 +350,6 @@ func (in *Installer) runHook(ctx context.Context, env *EnvFile, h *providers.Pro
 	runCtx, cancel := context.WithTimeout(ctx, provisionTimeout)
 	defer cancel()
 	w := &outputWriter{outs: outs, reserved: reserved, save: func() error { return outs.WriteFile(in.path(ProvisionEnv)) }, stop: cancel}
-	base, cleanup, err := in.pullEnviron(env)
-	if err != nil {
-		return err
-	}
-	defer cleanup()
 	_, runErr := in.O.Docker.Run(runCtx, Cmd{
 		Args:   append(in.composeBase(ProvisionCompose), "run", "--rm", "--no-deps", "-T", "--name", name, ProvisionService),
 		Env:    env.Environ(base),
@@ -293,7 +364,7 @@ func (in *Installer) runHook(ctx context.Context, env *EnvFile, h *providers.Pro
 		}
 		rmCancel()
 	}
-	err = errors.Join(runErr, w.close(runErr == nil))
+	err = errors.Join(hookRanAs(runErr, user), w.close(runErr == nil))
 	if h.Outputs != "" {
 		err = errors.Join(err, writeOutputs(in.path(h.Outputs), outs))
 	}
@@ -700,12 +771,11 @@ func (in *Installer) passesEnvOn() error {
 	return nil
 }
 
-// fileInputMount reports whether a mount source is exactly a file input's variable: the installer
-// records that path, under InputFilesDir, so it never reaches .env.
+// fileInputMount reports whether a mount source is exactly a mounted file's variable (a file
+// input's, a secret's delivered as a file): the installer records that path, under InputFilesDir,
+// so it never reaches .env.
 func (in *Installer) fileInputMount(src string) bool {
-	return slices.ContainsFunc(in.R.Spec.Inputs, func(i spec.Input) bool {
-		return i.File() && src == "${"+spec.FileVar(i.Key)+"}"
-	})
+	return slices.ContainsFunc(in.mountedFiles(), func(f mountedFile) bool { return src == "${"+f.Var+"}" })
 }
 
 // bindsEnv reports whether a mount source may reach dir/.env: dir itself, a directory above it,

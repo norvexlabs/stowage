@@ -203,6 +203,7 @@ func TestASecondaryNICsOverrideIsRefused(t *testing.T) {
 func TestARecordThatDoesNotReadStopsChangesUntilItsReset(t *testing.T) {
 	t.Parallel()
 	link, h := roleDaemon(t)
+	timers := manualTimers(h)
 	api := h.Handler()
 	var a NetAnswer
 	if code := call(t, api, http.MethodPost, "/v1/network", NetRequest{NetConfig: NetConfig{Mode: "static", Address: "10.0.0.60/24", Gateway: "10.0.0.1"}, RevertSecs: intp(maxRevertSecs)}, fresh(&a)); code != http.StatusOK || a.Pending == nil {
@@ -252,6 +253,7 @@ func TestARecordThatDoesNotReadStopsChangesUntilItsReset(t *testing.T) {
 	if code := call(t, api, http.MethodPost, "/v1/network/reset", NetResetRequest{}, fresh(&a)); code != http.StatusOK || !strings.Contains(a.Message, "dropped") {
 		t.Fatalf("%d %+v", code, a)
 	}
+	<-timers.fire(t) // edge's window ends
 	eventually(t, "edge's change undone at its window's end", func() bool { return nicAddr(link, "edge") == "192.0.2.5/24" })
 }
 

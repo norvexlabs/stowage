@@ -31,6 +31,8 @@ import (
 //	POST /v1/secrets/set     {key, value}: a settable secret's value recorded, as a job (202, {job,
 //	                         target}): the install's .env changes, then the stack comes up again
 //	                         with it
+//	POST /v1/secrets/show    {key}: {value}, a settable secret's value as the install's .env records
+//	                         it; never logged
 //	POST /v1/restore         {object, identity, confirm}: a backup of the release the install runs
 //	                         loaded into its database, as a job (202, {job, target})
 
@@ -184,6 +186,44 @@ func (h *Hostd) setSecret(w http.ResponseWriter, r *http.Request) {
 		h.finish(j, err)
 	}()
 	accepted(w, j)
+}
+
+// SecretShowRequest is POST /v1/secrets/show's body, and SecretShown its answer.
+type SecretShowRequest struct {
+	Key string `json:"key"`
+}
+
+type SecretShown struct {
+	Value string `json:"value"`
+}
+
+func (h *Hostd) showSecret(w http.ResponseWriter, r *http.Request) {
+	var req SecretShowRequest
+	if err := decodeBody(r, &req); err != nil {
+		replyErr(w, err)
+		return
+	}
+	in, _ := h.run()
+	env, err := h.installed(in)
+	if err != nil {
+		replyErr(w, err)
+		return
+	}
+	// The settable secrets are the ones the install's release names, the OS's spec the daemon reads.
+	if err := h.osRelease(env, "secrets show"); err != nil {
+		replyErr(w, err)
+		return
+	}
+	if _, err := in.settable(req.Key); err != nil {
+		replyErr(w, fail(http.StatusBadRequest, "%v", err))
+		return
+	}
+	v, err := recordedSecret(env.Get, req.Key, "the install")
+	if err != nil {
+		replyErr(w, fail(http.StatusNotFound, "%v", err))
+		return
+	}
+	reply(w, http.StatusOK, SecretShown{Value: v})
 }
 
 // RestoreRequest is POST /v1/restore's body.

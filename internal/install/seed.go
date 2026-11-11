@@ -333,7 +333,7 @@ func UserData(name, ctl string, m Machine, st Settings, ca []byte) ([]byte, erro
 		}, stage{
 			Name:     name + ": the one-time SSH host key retired after the install",
 			If:       "[ -e " + VMDir(name) + "/" + envName + " ] && [ ! -e " + retired + " ]",
-			Commands: []string{"rm -f " + dropIn + " " + key + " && touch " + retired + " && " + sshdReload},
+			Commands: []string{retireSteps(name)},
 		})
 	}
 	// The host name is set in the initramfs stage, before networkd starts: its DHCP request then
@@ -380,9 +380,49 @@ func seedHostKeyFiles(name string) (key, dropIn, retired string) {
 	return "/run/" + name + "-seed-host-key", "/etc/ssh/sshd_config.d/01-" + name + "-seed-host-key.conf", "/oem/" + name + "-seed-host-key.retired"
 }
 
+// retireSteps are the boot's shell steps retiring the seed's one-time host key of the project
+// name, as root: its file and sshd drop-in removed, its retirement marked on the OEM partition,
+// sshd reloaded if it runs (one not started yet reads its configuration as it starts: the reload's
+// status is not judged).
+func retireSteps(name string) string {
+	return retireFiles(name, false) + " && " + sshdReload
+}
+
+// retireFiles are the retirement's file steps (retireSteps', retireStepsChecked's), each under sudo
+// (over SSH, as the VM's user) or as it is (as root).
+func retireFiles(name string, sudo bool) string {
+	key, dropIn, retired := seedHostKeyFiles(name)
+	s := ""
+	if sudo {
+		s = "sudo "
+	}
+	return s + "rm -f " + dropIn + " " + key + " && " + s + "touch " + retired
+}
+
+// retireStepsChecked are host-key's (on the VM, and vm host-key and vm create over SSH, under sudo):
+// retireSteps' file steps, failing the list when they fail, and sshd's reload checked
+// (sshdReloadChecked), printing sshdNotReloaded when it did not take, the list then exiting 0, as
+// the key is retired on disk and the reload alone is left.
+func retireStepsChecked(name string, sudo bool) string {
+	reload := sshdReloadChecked
+	if sudo {
+		reload = "sudo sh -c '" + sshdReloadChecked + "'"
+	}
+	return retireFiles(name, sudo) + " && { " + reload + " || echo " + sshdNotReloaded + "; }"
+}
+
+// sshdReloadChecked reloads the running sshd (ssh.service or sshd.service) and fails when none
+// took it: a running unit's reload failing, or none running and no ssh.socket to start one (a
+// socket-started sshd reads its configuration at the next connection).
+const sshdReloadChecked = `s=; for u in ssh.service sshd.service; do if systemctl is-active -q $u; then if systemctl reload-or-restart $u; then s=ok; else s=failed; break; fi; fi; done; [ "$s" = ok ] || { [ -z "$s" ] && systemctl is-active -q ssh.socket; }`
+
+// sshdNotReloaded is the line retireStepsChecked prints when sshd's reload did not take.
+const sshdNotReloaded = "stowage-sshd-not-reloaded"
+
 // sshdReload makes a running sshd read its configuration again (Debian's unit is ssh.service,
-// others' sshd.service); one not running reads it when it starts.
-const sshdReload = "for u in ssh.service sshd.service; do systemctl try-reload-or-restart $u 2>/dev/null; done; true"
+// others' sshd.service); one not running reads it when it starts. Grouped: in `a && b &&
+// sshdReload` the list's status stays a's or b's failure, and the reload's own is always 0.
+const sshdReload = "{ for u in ssh.service sshd.service; do systemctl try-reload-or-restart $u 2>/dev/null; done; true; }"
 
 // SSHRules is the firewall's SSH rule file on the VM: the bundle's opens SSH to every source, and
 // a cloud-config with Machine.SSHAllow replaces it.

@@ -18,6 +18,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -662,6 +663,7 @@ func TestResetGoesBackToTheCloudConfigOnTheSameTimer(t *testing.T) {
 	t.Parallel()
 	link := newLink(t)
 	h := netDaemon(t, link)
+	timers := manualTimers(h)
 	api := h.Handler()
 	var a NetAnswer
 	if code := call(t, api, http.MethodPost, "/v1/network/reset", nil, fresh(&a)); code != http.StatusOK || a.Message != "no override: the cloud-config's settings apply" {
@@ -675,6 +677,7 @@ func TestResetGoesBackToTheCloudConfigOnTheSameTimer(t *testing.T) {
 	if addr, _, _ := link.live(); addr != leaseAddr {
 		t.Fatalf("the reset left %s", addr)
 	}
+	<-timers.fire(t) // the reset's window ends
 	eventually(t, "the override back", func() bool { addr, _, _ := link.live(); return addr == "10.0.0.60/24" })
 	// Confirmed, the reset leaves no state.
 	if code := call(t, api, http.MethodPost, "/v1/network/reset", NetResetRequest{RevertSecs: intp(maxRevertSecs)}, fresh(&a)); code != http.StatusOK {
@@ -940,6 +943,7 @@ func TestAConfirmationAfterTheWindowUndoesTheChange(t *testing.T) {
 	t.Parallel()
 	link := newLink(t)
 	h := netDaemon(t, link)
+	timers := manualTimers(h)
 	api := h.Handler()
 	if code := call(t, api, http.MethodPost, "/v1/network", NetRequest{NetConfig: NetConfig{Mode: "static", Address: "10.0.0.60/24", Gateway: "10.0.0.1"}, RevertSecs: intp(minRevertSecs)}, nil); code != http.StatusOK {
 		t.Fatal(code)
@@ -947,6 +951,7 @@ func TestAConfirmationAfterTheWindowUndoesTheChange(t *testing.T) {
 	// The window ends while a request holds the lock: its timer fires and waits; a confirmation
 	// that has the lock first comes too late.
 	h.netMu.Lock()
+	done := timers.fire(t)
 	eventually(t, "the timer fired", func() bool { return h.netFired.Load() == int64(h.netGen) })
 	_, err := h.confirm()
 	h.netMu.Unlock()
@@ -960,10 +965,61 @@ func TestAConfirmationAfterTheWindowUndoesTheChange(t *testing.T) {
 		t.Error("the change is left recorded")
 	}
 	// The timer that waited does nothing more.
-	time.Sleep(10 * time.Millisecond)
+	<-done
 	if addr, _, _ := link.live(); addr != leaseAddr {
 		t.Errorf("the link runs %s", addr)
 	}
+}
+
+// manualTimers makes h's revert timers fire only when the test says: a window then ends where the
+// test needs it, whatever the machine's load.
+func manualTimers(h *Hostd) *manualTimer {
+	m := &manualTimer{}
+	h.afterFunc = func(_ time.Duration, f func()) stopper {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		a := &armedTimer{f: f}
+		m.armed = append(m.armed, a)
+		return a
+	}
+	return m
+}
+
+type manualTimer struct {
+	mu    sync.Mutex
+	armed []*armedTimer
+}
+
+type armedTimer struct {
+	f       func()
+	stopped atomic.Bool
+}
+
+func (a *armedTimer) Stop() bool { return !a.stopped.Swap(true) }
+
+// fire runs each armed timer not stopped, once, each in its own goroutine as time.AfterFunc does;
+// done closes when they all returned.
+func (m *manualTimer) fire(t *testing.T) (done chan struct{}) {
+	t.Helper()
+	m.mu.Lock()
+	var due []*armedTimer
+	for _, a := range m.armed {
+		if !a.stopped.Swap(true) {
+			due = append(due, a)
+		}
+	}
+	m.mu.Unlock()
+	if len(due) == 0 {
+		t.Fatal("no timer armed")
+	}
+	done = make(chan struct{})
+	var wg sync.WaitGroup
+	for _, a := range due {
+		wg.Add(1)
+		go func() { defer wg.Done(); a.f() }()
+	}
+	go func() { wg.Wait(); close(done) }()
+	return done
 }
 
 func TestTheDaemonStartingAppliesTheRecord(t *testing.T) {

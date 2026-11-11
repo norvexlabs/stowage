@@ -77,6 +77,7 @@ func TestTheHookServiceIsConfinedAndGetsTheRecordedValues(t *testing.T) {
 			SecurityOpt []string `yaml:"security_opt"`
 			ReadOnly    bool     `yaml:"read_only"`
 			Tmpfs       []string `yaml:"tmpfs"`
+			User        string   `yaml:"user"`
 			Environment []string `yaml:"environment"`
 			EnvFile     []string `yaml:"env_file"`
 			Volumes     []string `yaml:"volumes"`
@@ -88,6 +89,7 @@ func TestTheHookServiceIsConfinedAndGetsTheRecordedValues(t *testing.T) {
 	s := doc.Services[ProvisionService]
 	if s.Image != "${STOWAGE_IMAGE_API}" || strings.Join(s.Entrypoint, " ") != "notes-api create-admin" ||
 		strings.Join(s.CapDrop, ",") != "ALL" || strings.Join(s.SecurityOpt, ",") != "no-new-privileges:true" || !s.ReadOnly || strings.Join(s.Tmpfs, ",") != "/tmp" ||
+		s.User != fmt.Sprintf("%d:%d", HookUID, HookUID) || // its image declares no user: never root
 		strings.Join(s.Profiles, ",") != ProvisionService || len(s.Volumes) != 0 || strings.Join(s.EnvFile, ",") != "./"+ProvisionEnv {
 		t.Fatalf("service: %+v", s)
 	}
@@ -112,7 +114,7 @@ func TestTheHookServiceIsConfinedAndGetsTheRecordedValues(t *testing.T) {
 }
 
 func TestADollarInTheHooksCmdStaysLiteral(t *testing.T) {
-	out, err := provisionCompose(&providers.ProvisionHook{Image: "api", Cmd: []string{"sh", "-c", "echo $HOME ${X}"}}, nil, nil, nil)
+	out, err := provisionCompose(&providers.ProvisionHook{Image: "api", Cmd: []string{"sh", "-c", "echo $HOME ${X}"}}, "", nil, nil, nil, spec.FileVar)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -136,7 +138,7 @@ func TestOnDemandServicesReachTheVMsL4ServicesByName(t *testing.T) {
 	if got := vm.targetHosts(); !slices.Equal(got, []string{"echo:host-gateway", "postgres:host-gateway"}) {
 		t.Errorf("hosts %v", got)
 	}
-	out, err := provisionCompose(&providers.ProvisionHook{Image: "api", Cmd: []string{"true"}}, nil, nil, vm.targetHosts())
+	out, err := provisionCompose(&providers.ProvisionHook{Image: "api", Cmd: []string{"true"}}, "", nil, nil, vm.targetHosts(), spec.FileVar)
 	if err != nil || !strings.Contains(string(out), "extra_hosts:\n            - echo:host-gateway\n            - postgres:host-gateway\n") {
 		t.Errorf("%s %v", out, err)
 	}
@@ -958,5 +960,61 @@ func TestProvisionSetGivesADeclaredValueTheHookNeverReturned(t *testing.T) {
 	err = e.installer(nil).Provision(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "sets a value it returned or declares it returns (ADMIN_KEY) first") {
 		t.Errorf("the failure: %v", err)
+	}
+}
+
+// A hook runs as its image's own user when the image declares one other than root, else as
+// HookUID, never root; a hook run so that fails says why it ran so and the fix, the image's.
+func TestAHookIsNeverRoot(t *testing.T) {
+	t.Parallel()
+	for _, c := range []struct{ declared, want string }{{"", "65534:65534"}, {"root", "65534:65534"}, {"0:0", "65534:65534"}, {"app", ""}, {"1000:1000", ""}} {
+		docker := &fakeDocker{imageUsers: map[string]string{"reg/api@sha256:1": c.declared}}
+		in := &Installer{O: Options{Docker: docker}}
+		if got, err := in.hookUser(context.Background(), "reg/api@sha256:1", nil); err != nil || got != c.want {
+			t.Errorf("declared %q: %q %v, want %q", c.declared, got, err, c.want)
+		}
+	}
+	// An image the engine does not hold is pulled first, then read; another failure is an error,
+	// never a guess at its user; once read, the image is not asked again.
+	var calls []string
+	pulled := false
+	docker := &fakeDocker{}
+	docker.answer = func(a string) ([]byte, bool, error) {
+		calls = append(calls, a)
+		switch {
+		case a == "pull reg/app@sha256:2":
+			pulled = true
+			return nil, true, nil
+		case a == "image inspect --format {{.Config.User}} reg/app@sha256:2" && !pulled:
+			return nil, true, errors.New("failed to find image reg/app@sha256:2") // another engine's words
+		case a == "image inspect --format {{.Config.User}} reg/app@sha256:2":
+			return []byte("app\n"), true, nil
+		case a == "image inspect --format {{.Config.User}} reg/gone@sha256:3":
+			return nil, true, errors.New("Cannot connect to the Docker daemon")
+		case a == "pull reg/gone@sha256:3":
+			return nil, true, errors.New("Cannot connect to the Docker daemon")
+		}
+		return nil, false, nil
+	}
+	in := &Installer{O: Options{Docker: docker}}
+	if got, err := in.hookUser(context.Background(), "reg/app@sha256:2", []string{"DOCKER_CONFIG=/x"}); err != nil || got != "" || !pulled {
+		t.Errorf("pruned: %q %v (pulled %v)", got, err, pulled)
+	}
+	n := len(calls)
+	if got, err := in.hookUser(context.Background(), "reg/app@sha256:2", nil); err != nil || got != "" || len(calls) != n {
+		t.Errorf("asked again: %q %v %v", got, err, calls[n:])
+	}
+	if _, err := in.hookUser(context.Background(), "reg/gone@sha256:3", nil); err == nil || !strings.Contains(err.Error(), "the hook's image reg/gone@sha256:3, whose user it runs as") {
+		t.Errorf("the engine failing: %v", err)
+	}
+	if err := hookRanAs(errors.New("exit status 1"), "65534:65534"); err == nil || !strings.Contains(err.Error(), "exit status 1 (it ran as 65534:65534: its image declares root, or no user, and no hook is given root; give the image a USER of its own") {
+		t.Errorf("%v", err)
+	}
+	if err := hookRanAs(errors.New("exit status 1"), ""); err.Error() != "exit status 1" {
+		t.Errorf("the image's own user: %v", err)
+	}
+	out, err := provisionCompose(&providers.ProvisionHook{Image: "api", Cmd: []string{"true"}}, "", nil, nil, nil, spec.FileVar)
+	if err != nil || strings.Contains(string(out), "user:") {
+		t.Errorf("the image's own user is no key: %v\n%s", err, out)
 	}
 }

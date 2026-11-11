@@ -219,6 +219,9 @@ ctl v1.sh k8s upgrade --given given.yaml --no-input --timeout 5m >"$WORK/given.l
 atlas_runs "$V1" 1
 [[ $(api_ca) == "$(cat "$OP/upstream-ca.pem")" ]] || fail "the api does not see the file given"
 [[ $(k8s_get atlas-stowage-files API_CA_BUNDLE) == "$(cat "$OP/upstream-ca.pem")" ]] || fail "the files Secret does not hold the file given"
+# ENCRYPTION_KEY is delivered as a file (as_file): in its own Secret, never the release's.
+[[ $(k8s_get atlas-stowage-secret-files ENCRYPTION_KEY) =~ ^[0-9a-f]{64}$ ]] || fail "the secret files' Secret holds no ENCRYPTION_KEY"
+[[ -z $(kubectl get secret -n "$NS" atlas-stowage -o 'jsonpath={.data.ENCRYPTION_KEY}') ]] || fail "the release's Secret holds ENCRYPTION_KEY"
 [[ $(kubectl exec -n "$NS" deploy/atlas-api -c api -- printenv SEARCH_URL) == "$SEARCH2" ]] || fail "the api was not restarted with the value given"
 [[ $(status search admins) == True/1 ]] || fail "the api does not reach SEARCH_URL as given"
 grep -qF 'changing API_CA_BUNDLE: "" → sha256:' "$WORK/given.log" || { cat "$WORK/given.log"; fail "the file's change was not logged by its digest"; }
