@@ -87,6 +87,7 @@ func newCommand(r *Release, self string, stdout, stderr io.Writer, tools K8sOpti
 	root := &cobra.Command{
 		Use:           r.Ctl(),
 		Short:         fmt.Sprintf("Install and manage %s %s with Docker", name, r.Manifest.ProjectVersion),
+		Version:       r.versionLine(),
 		Args:          cobra.NoArgs,
 		SilenceUsage:  true,
 		SilenceErrors: true,
@@ -131,6 +132,7 @@ func newCommand(r *Release, self string, stdout, stderr io.Writer, tools K8sOpti
 			return nil
 		},
 	}
+	root.SetOut(stdout) // --version, as every verb's output
 	dirFlag := func(c *cobra.Command) { c.Flags().StringVar(&o.Dir, "dir", "./"+name, "install directory") }
 	dirFlag(root)
 	rf := root.Flags()
@@ -499,6 +501,7 @@ func k8sCommand(in *Installer, o *Options, prepare func() error, terminal func(b
 		f := c.Flags()
 		f.StringArrayVar(&o.K8s.Values, "values", nil, "a chart values file, given to helm after the installer's (repeatable)")
 		f.StringVar(&o.K8s.Registry, "image-registry", "", "pull the chart and the images from this registry prefix, a mirror")
+		f.BoolVar(&o.K8s.PullLogin, "image-pull-login", false, "write the cluster's pull Secret for the mirror's host from the Docker client's login (its user and password), which the installer reads the mirror with")
 		f.StringVar(&o.RegistryCA, "registry-ca", "", "a PEM file of the CA the registry's certificate chains to, a mirror's own: the installer's reads trust it (the cluster's nodes must trust it already)")
 		f.StringArrayVar(sets, "set", nil, what)
 		f.StringArrayVar(setFiles, "set-file", nil, whatFile)

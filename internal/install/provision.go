@@ -571,6 +571,7 @@ func (in *Installer) Provision(ctx context.Context) error {
 		for _, k := range sortedKeys(inputs) {
 			env.Set(k, inputs[k])
 		}
+		in.recordInputKeys(env, env)
 		if err := env.WriteFile(in.path(envName)); err != nil {
 			return err
 		}

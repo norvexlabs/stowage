@@ -328,6 +328,7 @@
     "channel"
   ],
   "registry": "registry.example.com/atlas",
+  "stowage_version": "",
   "routes": [
     {
       "name": "console",

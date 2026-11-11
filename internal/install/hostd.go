@@ -834,9 +834,7 @@ func (h *Hostd) status(w http.ResponseWriter, r *http.Request) {
 		if st.Previous, err = in.keptPrevious(v, n); err != nil {
 			h.O.logf("status: the previous release is not known: %v", err)
 		}
-		if s := h.installedSpec(in, name, v, n); s != nil {
-			st.Inputs = recordedInputs(s, func(k string) bool { _, ok := env.Get(k); return ok })
-		}
+		st.Inputs = installInputs(env, h.installedSpec(in, name, v, n))
 		st.Installing, st.InstallFailed, _ = in.firstInstall()
 		st.RestoreAwaited = in.restoreAwaited()
 		st.Channel, _ = env.Get(ChannelVar)

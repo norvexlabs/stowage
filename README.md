@@ -476,7 +476,7 @@ a real registry, the local Docker engine, a kind cluster and a VM on TrueNAS
 | every version / changelog provider, registry client, release manifest, cosign signing | |
 | inputs digests and the build graph | |
 | installer (Docker): loopback and every TLS front (`acme`, `dns-cloudflare`, `byo`, `internal`), terminal form, `install`, re-run (changes the inputs and the front's ports), `status` (`--json`), `ps`, `logs`, `restart`/`stop`/`start`, `exec`, `schema`, `uninstall` (`--data`), `provision`, `script`, `upgrade` (`--version` fetches the release's installer), `rollback`, `reset-db`, `--dry-run`, `--offline`, a mirror and its CA (`--registry`, `--registry-ca`); `mirror export` / `mirror import` (a release carried as one file to a site without internet); `secrets rotate`, `secrets export` and `--secrets` (a machine made again) | scheduled backup, restore, chart library, `upgrade --reset-db` |
-| installer (Kubernetes): `<short>-stow k8s install`, `upgrade` (`--version`), `rollback`, `status` (`--json`), `reset-db`, `uninstall` (`--data`), `provision` (the hook as a Job after the release, its outputs in a Secret and handed back, `--set`), `secrets rotate`, `tune`, `--dry-run`, `--no-provision`, `--image-registry`, `--registry-ca`, `--unsafe-sysctls` | barrier pre-flight before `rollback` |
+| installer (Kubernetes): `<short>-stow k8s install`, `upgrade` (`--version`), `rollback`, `status` (`--json`), `reset-db`, `uninstall` (`--data`), `provision` (the hook as a Job after the release, its outputs in a Secret and handed back, `--set`), `secrets rotate`, `tune`, `--dry-run`, `--no-provision`, `--image-registry`, `--image-pull-login`, `--registry-ca`, `--unsafe-sysctls` | barrier pre-flight before `rollback` |
 | installer (Kairos VM): `<short>-stow vm create` (the disk image by digest, the cloud-config on a seed ISO or as user-data, the platform's steps; or the VM created with OpenTofu — TrueNAS's module, the previews for libvirt, Proxmox VE, vSphere, AWS, Google Cloud, Azure and Scaleway, or the operator's own holding the module contract — waited for until it installed; from a mirror whose CA the VM then trusts), `vm seed --json` (the first-boot material for a VM made by other means), `vm destroy` and `vm attach` (a NIC for a role a newer release names, on TrueNAS); `<short>-stow` in the OS bundle — the first install from the cloud-config's settings, `install` from the preloaded images, the boot (install up again, upgrade to the OS's release, back to the replaced one), `describe`, `--json` on `install`, `upgrade` and `rollback`, the host daemon and its verbs (`status` (`--json`), `health`, `events`, `ps`, `logs`, `restart`/`stop`/`start`, `provision`, `updates`, `upgrade`, `rollback` to the passive system, `reset-db`, `network` with its auto-revert, `backup` — scheduled, before an upgrade, or now, encrypted to age keys and uploaded with rclone; `verify` of proposed settings —, `restore`, `secrets export` and `rotate`, `reboot`, `shutdown`), its disk-pressure watch (`hooks.maintenance.disk_pressure`), its app socket for the services `host_api` names, the health gate judging each boot (Kairos boot assessment: an upgraded boot not healthy in time falls back to the passive system, unless going back is refused at a rollback barrier: it is then kept), a default-deny firewall (`vm create --ssh-allow`), the time zone (`--timezone`), a disaster recovery (`vm create --secrets`) | |
 
 ## Reference — for people and AI agents
@@ -1724,6 +1724,7 @@ private directory where a program may run: the current directory, then the user'
 again, to copy an installer to another host.
 
 ```bash
+<short>-stow --version   # (-v) `<short>-stow version <version> (revision N), stowage <Stowage version>`: the release it carries and the Stowage that built it (`, stowage …` left out when its manifest records none)
 <short>-stow [--dir D] [--registry PREFIX] [--registry-ca FILE] [--offline] [--dry-run] # install / finish setup
           [--set KEY=VALUE]… [--set-file KEY=PATH]… [--answers FILE] [--no-input] [--accessible] [--no-provision]
           [--given FILE|- | --kit FILE|- [--kit-code-file FILE]]           # what another install gives
@@ -1931,11 +1932,16 @@ again, to copy an installer to another host.
   `install_failed` the first line of the error its last run failed with; `previous` the release
   `rollback` goes back to, with its `installer`, `null` when the install keeps none (before an
   upgrade, after a rollback) or keeps the release installed (an upgrade or a rollback that
-  stopped, which `rollback` finishes on it) — never the release `installed` names; `inputs` the keys of the installed release's inputs the install
-  records, sorted (`[]` when none), from the spec of the installer that carries that release —
-  absent (unknown) when neither does, or when the kept one's spec does not load in this Stowage
-  (logged once: `the installer the install keeps, <path>: …`, as any kept installer that does not
-  read; none kept is said by the field alone); `registry` the image prefix the install pulls from,
+  stopped, which `rollback` finishes on it) — never the release `installed` names; `inputs` the keys of the inputs the install
+  records, sorted (`[]` when none), whichever release declared them: the install lists them in
+  `.env` as `STOWAGE_INPUTS` (comma-separated, not a value compose or a hook reads) at the first
+  install, each re-run, upgrade, rollback and provision, keeping the keys its record already
+  listed — so after a rollback an input only the newer release declares, whose value the install
+  keeps, is still listed —, together with those the installed release's spec declares when the
+  installer that carries that release reads it. Absent (unknown) when neither tells: an install
+  made before the list was recorded, whose release no installer read carries — none kept, or the
+  kept one's spec does not load in this Stowage (logged once: `the installer the install keeps,
+  <path>: …`, as any kept installer that does not read; none kept is said by the field alone); `registry` the image prefix the install pulls from,
   as its first install recorded it (`--registry`, else the release's: `STOWAGE_REGISTRY` in
   `.env`); `short_name` the `<short>` of the installer the install keeps, `<dir>/<short>-stow`
   (`STOWAGE_SHORT_NAME`); `address` the loopback address the first install recorded (`--address`,
@@ -1999,6 +2005,9 @@ again, to copy an installer to another host.
     removed, renamed or given another meaning), never when a field is added, so a reader refuses a
     format it does not know.
   - `name`, `release` (`{version, revision}`), `channel`: the release's, from its manifest.
+  - `stowage_version`: the Stowage release that built the installer, as its release manifest
+    records it (`""` when it records none), as `--version` prints it: a program tells what an
+    installer offers by it without running another verb.
   - `short_name`: the `<short>` of `<short>-stow`, the installer's name, so a program finds the
     installer an install keeps, `<dir>/<short>-stow`.
   - `shapes`: the shapes the spec declares, in the order `docker`, `kubernetes`, `kairos`.
@@ -2019,7 +2028,8 @@ again, to copy an installer to another host.
     when none. A program compares a release's routes with the installed one's to tell a route an
     upgrade adds from one the install holds.
   Without `--json`, a `route` line per route (`route     NAME (loopback port N)`), an `l4 route`
-  line per L4 route (`l4 route  NAME (PROTOCOL/PORT)`) and `registry  PREFIX` come before
+  line per L4 route (`l4 route  NAME (PROTOCOL/PORT)`), `registry  PREFIX` and `stowage   VERSION`
+  (the Stowage that built the installer; left out when its manifest records none) come before
   `first install only: …`.
 - **`--json` on the verbs that change an install**, for a program: the install and its re-run,
   `upgrade` (`--version` too), `rollback` and `uninstall`, and on Kubernetes `k8s install`,
@@ -3571,7 +3581,7 @@ the current directory. A release with no chart (published without the shape) is 
 
 ```bash
 <short>-stow k8s install  [--namespace NS] [--release R] [--kube-context C] [--values FILE]…
-                       [--image-registry PREFIX] [--registry-ca FILE] [--set KEY=VALUE]… [--set-file KEY=PATH]…
+                       [--image-registry PREFIX] [--image-pull-login] [--registry-ca FILE] [--set KEY=VALUE]… [--set-file KEY=PATH]…
                        [--answers FILE] [--given FILE|- | --kit FILE|- [--kit-code-file FILE]]
                        [--no-input] [--accessible] [--timeout 10m] [--dry-run] [--no-provision]
                        [--unsafe-sysctls[=false]] [--json]
@@ -3873,8 +3883,31 @@ the current directory. A release with no chart (published without the shape) is 
   from another registry than the project's, and the `--registry-ca` given). `--timeout` bounds each helm and kubectl step.
 - `--image-registry PREFIX` pulls the chart and the images from a mirror holding the same
   repositories (`charts/<name>-<channel>`, `<name>-<key>`, and `<name>-release` and
-  `<name>-installer` for `upgrade --version` and the provision hook's Job); no pull Secret is written for it, so give the
-  chart your own pull Secret through `--values`.
+  `<name>-installer` for `upgrade --version` and the provision hook's Job). No pull Secret is
+  written for it unless asked, so give the chart your own pull Secret through `--values`, or
+  `--image-pull-login`: on `k8s install` or `k8s upgrade` (passed on by `--version`), it writes
+  the pull Secret `<release>-stowage-pull` for the mirror's host (`stowage.pullSecret`) from the
+  Docker client's login the installer reads the mirror with (its config, `DOCKER_CONFIG`, its
+  credential helpers): its user and password (or `auth`). It is noted (`note: the pull Secret …
+  holds the Docker login for <host> (user U), which anyone reading Secrets in the namespace
+  reads: …`) — give it a long-lived, read-only pull account, as a password a credential helper
+  renews (ECR, gcloud) expires in the Secret. Refused (exit 3) before any input is asked and
+  before the cluster changes: no login for the host (`--image-pull-login: no Docker login for
+  <host>`), one with no user and password a node pulls with (a token, a user or a password
+  alone), and the flag on the host of the release's own registry when its pull account is
+  `token` (a mirror's path on that host included, the host's letter case aside: the operator's own
+  login there is never copied; with the token's variable set, the run writes the pull account's
+  Secret); an `auth` that is not base64 fails. On the release's own registry
+  read with the Docker login (`docker-config`, `none`) it writes the Secret as for a mirror. An
+  upgrade from the mirror the release records takes it too, `--image-registry` left out;
+  `--dry-run` reads the login and notes the Secret a run writes (`note: a run writes the pull
+  Secret …`), writing nothing. `k8s upgrade --version` of the release that runs applies nothing,
+  and says `--image-pull-login is not applied: an upgrade to the release that runs changes
+  nothing`; one fetching an installer made before the flag fails on it as unknown, and the run
+  notes that installer writes no pull Secret from a login (run that version without the flag, and
+  give the chart your own pull Secret through `--values`). `reset-db` keeps the pull Secret and the
+  values naming it. A program with a pull account for the mirror gives it as a Docker config:
+  `DOCKER_CONFIG` pointing at a directory whose `config.json` holds it.
 - `uninstall` removes the release and what the installer made beside it: `helm uninstall
   <release> --wait`, then the provision Job `<release>-stowage` (`kubectl delete
   --cascade=foreground --wait`), the provision hook's RoleBinding, Role and ServiceAccount
@@ -4620,6 +4653,7 @@ sudo <short>-stow install [--channel C] [--set KEY=VALUE]… [--set-file KEY=PAT
           [--secrets FILE|- | --new-secrets]   (both: refused)
           [--given FILE|- | --kit FILE|- [--kit-code-file FILE]]   (with --secrets: refused)
           [--json]   # the run's result as one object, for a program (see "Exit status and --json on the VM")
+<short>-stow --version               # (-v) the release this OS carries and the Stowage that built it, as the Docker installer's
 <short>-stow describe [--json]        # what the release this OS carries offers, read with no install: the Docker installer's describe
 <short>-stow status [--json]          # this OS's release, the install's (and `not finished` while a first install's stack comes up or its provision hook runs, or after one failed — with why, and the `sudo <short>-stow install` that runs it again; `"installing": true` and `"install_failed": "<why>"` in JSON; `not provisioned` while an install given `--secrets` awaits the backup `restore` loads, `"restore_awaited": true`; `not running` while a restore left the volumes half restored, `"volumes_split": true`), the channel, the stack's tuning profile and whose it is (`tune       network (operator)`, `"tune"` in JSON), the system Kairos booted (active, passive or recovery; the fallback), the last failed boot, the disk, a byo install's certificate (`cert`: its names, end and days left, with a warning from 30 days before it; `"cert"` in JSON), a network warning (`network    warning: …`, `"network_warning"` in JSON: IPv6 on and no IPv6 default route for a minute or more), the services
 <short>-stow health [--json]          # ready, or fails saying why: the health gate's check, once
@@ -4714,9 +4748,10 @@ sudo <short>-stow network attach --role ROLE --mac MAC [--mode dhcp|static|none]
   `rollback` goes back to (`{"version", "revision"}`; no `installer`, as the OS, not an
   installer, carries a VM's release), `null` when the install keeps none (before an upgrade, and
   after a rollback) — and `inputs`, the keys of the inputs the install records, sorted, never a
-  value, so the output can be logged (absent before the first install, and when the OS's
-  `<short>-stow` carries another release than the one installed, a crossing whose boot fell
-  back, and the install keeps no installer of it this one reads); then `channel`, `installing`,
+  value, so the output can be logged, whichever release declared them (the install's
+  `STOWAGE_INPUTS`, as on Docker; absent before the first install, and when the install records
+  no such list and the OS's `<short>-stow` carries another release than the one installed, a
+  crossing whose boot fell back, and the install keeps no installer of it this one reads); then `channel`, `installing`,
   `install_failed` and the VM's own fields.
 - `describe [--json]` prints what the release this OS carries offers, with no install: the
   Docker installer's `describe` (see "The installer (Docker shape)"), the same object.

@@ -13,6 +13,14 @@ follow [SemVer](https://semver.org/).
 - `describe --json` lists the release's default registry, its front routes (the names `--ports`
   takes, with their loopback ports) and its L4 routes, so a program tells a route an upgrade adds
   from one the install holds. `describe` prints them too.
+- `status --json` `inputs` lists every input the install records, whichever release declared it:
+  after a rollback, an input only the newer release declares is still listed. Each install, re-run,
+  upgrade, rollback and provision records the keys.
+- `<short>-stow --version` (`-v`) prints the release the installer carries and the Stowage release that
+  built it, which `describe --json` gives as `stowage_version`.
+- `--image-pull-login` on `k8s install` and `k8s upgrade` writes the cluster's pull Secret for
+  a mirror's host from the Docker client's login the installer reads it with, so an authenticated
+  mirror serves the cluster; a login the cluster's nodes cannot pull with is refused.
 - A refusal of `status --json` prints one object on standard output (`refused`, with its reason
   and fix), and both it and the verbs' `--json` result say `absent` when the refusal is that no
   install is there — no install in the directory, no helm release in the namespace (never `k8s

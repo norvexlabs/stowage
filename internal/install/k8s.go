@@ -37,8 +37,12 @@ type K8sOptions struct {
 	// Registry is the prefix the chart and the images are pulled from (a mirror); empty is the
 	// project's registry on an install, the one the release was installed from on an upgrade.
 	Registry string
-	Timeout  time.Duration
-	Revision int // rollback: the helm revision to go back to; 0 is the one before the last upgrade
+	// PullLogin (--image-pull-login) writes the cluster's pull Secret for a mirror's host from the
+	// Docker client's login the installer reads the mirror with: copying that login into the
+	// cluster is the operator's choice, never made for them.
+	PullLogin bool
+	Timeout   time.Duration
+	Revision  int // rollback: the helm revision to go back to; 0 is the one before the last upgrade
 	// Data lets uninstall delete the release's PersistentVolumeClaims without asking.
 	Data bool
 	// UnsafeSysctls gives the pods the network settings the kubelet must allow (tune.Pod): true
@@ -628,7 +632,41 @@ func (in *Installer) k8sDeploy(ctx context.Context, upgrade bool) (err error) {
 			}
 		}
 	}
+	// The pull account first, before any input is asked: a refusal here wastes no answer.
 	var d deploy
+	user, token, err := in.pullAccount(prefix)
+	if err != nil {
+		return err
+	}
+	if k.PullLogin && in.R.Spec.Registry.Pull.Name == "token" && strings.EqualFold(registryHost(prefix), registryHost(in.R.Spec.Registry.Prefix)) {
+		c, err := providers.Token(in.R.Spec.Registry.Pull)
+		if err != nil {
+			return err
+		}
+		return refuse("leave out --image-pull-login: with "+c.TokenEnv+" set, the run writes the pull account's Secret", "--image-pull-login: the images come from %s, the host of the release's own registry, whose images the cluster pulls with the pull account %s (%s): the Docker login there is never copied into the cluster", registryHost(prefix), c.User, c.TokenEnv)
+	}
+	if token == "" && !upgrade && in.R.Spec.Registry.Pull.Name == "token" && prefix == in.R.Spec.Registry.Prefix {
+		c, err := providers.Token(in.R.Spec.Registry.Pull)
+		if err != nil {
+			return err
+		}
+		return refuse("set "+c.TokenEnv, "the cluster pulls the images with the pull account %s, whose password this installer does not carry: set %s", c.User, c.TokenEnv)
+	}
+	if token != "" {
+		if d.pull, err = dockerAuths(registryHost(prefix), user, token); err != nil {
+			return err
+		}
+	} else if k.PullLogin {
+		// Asked: the cluster pulls from the registry with the login the installer reads it with.
+		if d.pull, err = in.mirrorPull(prefix, k.pullSecret()); err != nil {
+			return err
+		}
+	}
+	if d.pull != nil {
+		if _, err := in.readSecret(ctx, k.pullSecret()); err != nil {
+			return err
+		}
+	}
 	if !upgrade {
 		// Reading a namespace takes a cluster-wide grant an operator limited to it may not have:
 		// one that cannot be read is taken to exist, and the Secrets' apply says when it does not.
@@ -654,26 +692,6 @@ func (in *Installer) k8sDeploy(ctx context.Context, upgrade bool) (err error) {
 	}
 	if upgrade {
 		d.restart = in.k8sRestartList(d.changed)
-	}
-	user, token, err := in.pullAccount(prefix)
-	if err != nil {
-		return err
-	}
-	if token == "" && !upgrade && in.R.Spec.Registry.Pull.Name == "token" && prefix == in.R.Spec.Registry.Prefix {
-		c, err := providers.Token(in.R.Spec.Registry.Pull)
-		if err != nil {
-			return err
-		}
-		return refuse("set "+c.TokenEnv, "the cluster pulls the images with the pull account %s, whose password this installer does not carry: set %s", c.User, c.TokenEnv)
-	}
-	if token != "" {
-		host, _, _ := strings.Cut(prefix, "/")
-		if d.pull, err = dockerAuths(host, user, token); err != nil {
-			return err
-		}
-		if _, err := in.readSecret(ctx, k.pullSecret()); err != nil {
-			return err
-		}
 	}
 	vals := map[string]any{"registry": prefix, "secret": k.envSecret()}
 	switch {
@@ -1233,6 +1251,9 @@ func (in *Installer) K8sUpgradeTo(ctx context.Context, v string, args []string) 
 		if u := k.UnsafeSysctls; u != nil && *u != cur.givesSysctls() {
 			fmt.Fprintf(in.O.Out, "--unsafe-sysctls is not applied: `%s --unsafe-sysctls=%t`, without --version, by the installer of %s %s (revision %d), applies it\n", in.k8sCtl("upgrade"), *u, name, r.Version, r.Revision)
 		}
+		if k.PullLogin {
+			fmt.Fprintf(in.O.Out, "--image-pull-login is not applied: an upgrade to the release that runs changes nothing\n")
+		}
 		return nil
 	}
 	in.O.logf("fetching the installer of %s %s (revision %d, %s)", name, m.ProjectVersion, m.Revision, m.Tag)
@@ -1244,6 +1265,9 @@ func (in *Installer) K8sUpgradeTo(ctx context.Context, v string, args []string) 
 		in.O.logf("the fetched installer is kept: %s", exe)
 		if k.UnsafeSysctls != nil {
 			in.O.logf("note: if it refused --unsafe-sysctls as an unknown flag, it was made before it: run `%s --version %s` without it; its release gives the pods no such settings", in.k8sCtl("upgrade"), m.ProjectVersion)
+		}
+		if k.PullLogin {
+			in.O.logf("note: if it refused --image-pull-login as an unknown flag, it was made before it, and writes no pull Secret from a login: run `%s --version %s` without it, and give the chart your own pull Secret through --values", in.k8sCtl("upgrade"), m.ProjectVersion)
 		}
 		return err
 	}
@@ -1341,4 +1365,11 @@ func (in *Installer) podSecurityAdmitsSysctls(ctx context.Context) error {
 	default:
 		return refuse(fmt.Sprintf("kubectl label namespace %s %s=privileged --overwrite, or --unsafe-sysctls=false", k.Namespace, PodSecurityEnforce), "--unsafe-sysctls: namespace %s enforces the Pod Security level %s, which refuses pods given those settings: label it privileged (`kubectl label namespace %s %s=privileged --overwrite`), or give the pods none (--unsafe-sysctls=false)", k.Namespace, level, k.Namespace, PodSecurityEnforce)
 	}
+}
+
+// registryHost is the host of a registry prefix (host[:port]/path), as written: the key a pull
+// Secret's auths names it by, which the kubelet matches against the images' references.
+func registryHost(prefix string) string {
+	host, _, _ := strings.Cut(prefix, "/")
+	return host
 }

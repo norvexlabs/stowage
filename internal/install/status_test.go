@@ -653,6 +653,7 @@ func TestDockerStatusJSONKeptSpecUnread(t *testing.T) {
 	if err := os.WriteFile(kept, buf.Bytes(), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	dropInputsRecord(t, e) // the kept installer's spec alone could tell the inputs
 	e.r, e.self = testInstallerWith(t, "2.0.0", nil)
 	e.log.Reset()
 	st, out := statusOf(t, e, nil)
@@ -681,6 +682,11 @@ func TestDockerStatusJSONChannelAndInputsFromTheInstalledRelease(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(e.dir, "notes-stow"), []byte("not an installer"), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	// The install's own record of its inputs tells them whatever installer runs.
+	if st, out := statusOf(t, e, nil); st.Inputs == nil || !slices.Equal(*st.Inputs, []string{"ADMIN_EMAIL"}) {
+		t.Errorf("from the record: %s", out)
+	}
+	dropInputsRecord(t, e) // an install made before it was recorded
 	e.log.Reset()
 	if st, out := statusOf(t, e, nil); st.Inputs != nil || strings.Contains(out, `"inputs"`) || strings.Count(e.log.String(), "the installer the install keeps, ") != 1 {
 		t.Errorf("%s\nlog %q", out, e.log)

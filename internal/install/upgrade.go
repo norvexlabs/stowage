@@ -235,6 +235,7 @@ func (in *Installer) Upgrade(ctx context.Context) (err error) {
 	if err := in.upgradeRoutes(env, next, mode, pub); err != nil {
 		return err
 	}
+	in.recordInputKeys(next, env) // before a dry run prints the changes: what the run writes
 	if o.DryRun {
 		for _, k := range next.Keys() {
 			v, _ := next.Get(k)
@@ -1133,6 +1134,11 @@ func (in *Installer) Rollback(ctx context.Context) (err error) {
 	// until the end, so an interrupted rollback can run again.
 	if err := in.restoreStack(prev, back == nil); err != nil {
 		return err
+	}
+	// The newer release's list and the one rolled back to's: a value either recorded comes back.
+	in.recordInputKeys(rolled, env, prevEnv)
+	if back != nil { // the rolled-back release's own inputs, when its spec is read
+		back.recordInputKeys(rolled, rolled)
 	}
 	if err := rolled.WriteFile(in.path(envName)); err != nil {
 		return err

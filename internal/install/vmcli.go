@@ -101,10 +101,12 @@ func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(
 	root := &cobra.Command{
 		Use:           c.ctl,
 		Short:         fmt.Sprintf("Manage %s on this VM (its OS carries %s, revision %d)", name, r.Manifest.ProjectVersion, r.Manifest.Revision),
+		Version:       r.versionLine(),
 		Args:          cobra.NoArgs,
 		SilenceUsage:  true,
 		SilenceErrors: true,
 	}
+	root.SetOut(stdout) // --version, as every verb's output
 	root.PersistentFlags().StringVar(&socket, "socket", socket, "the host daemon's socket")
 	_ = root.PersistentFlags().MarkHidden("socket")
 	dirFlag := func(cmd *cobra.Command) {

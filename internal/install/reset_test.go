@@ -558,6 +558,9 @@ func TestK8sResetThatFailsFromTheUninstallOnKeepsTheValues(t *testing.T) {
 			if raw := read(t, m[1]); !strings.Contains(raw, `"registry":"`+e.prefix+`"`) {
 				t.Errorf("kept %q", raw)
 			}
+			if strings.Contains(err.Error(), "--image-pull-login") {
+				t.Errorf("a pull Secret from the login named for the project's own registry: %v", err)
+			}
 			if fi, _ := os.Stat(m[1]); fi.Mode().Perm() != 0o600 {
 				t.Errorf("mode %v", fi.Mode().Perm())
 			}

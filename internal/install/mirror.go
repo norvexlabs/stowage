@@ -373,7 +373,7 @@ func (in *Installer) MirrorImport(ctx context.Context, file, prefix string, olde
 		}
 		ours[ch.Repository] = true
 	}
-	c, err := in.clientWith(authn.DefaultKeychain)
+	c, err := in.clientWith(in.O.login())
 	if err != nil {
 		return err
 	}

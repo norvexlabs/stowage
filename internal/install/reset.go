@@ -503,8 +503,7 @@ func (in *Installer) K8sReset(ctx context.Context) error {
 			return err
 		}
 		if token != "" {
-			host, _, _ := strings.Cut(cur.Registry, "/")
-			if d.pull, err = dockerAuths(host, user, token); err != nil {
+			if d.pull, err = dockerAuths(registryHost(cur.Registry), user, token); err != nil {
 				return err
 			}
 			if _, err := in.readSecret(ctx, k.pullSecret()); err != nil {

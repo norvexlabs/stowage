@@ -70,6 +70,10 @@ type Options struct {
 	// HTTPPort and HTTPSPort are the host ports a TLS front publishes; 0 is 80 and 443.
 	HTTPPort, HTTPSPort int
 	Registry            string // --registry: the prefix images are pulled from (a mirror); first install only
+	// Login is the Docker client's login the installer reads a mirror with, and on Kubernetes
+	// gives the cluster a mirror's pull Secret from; nil is the Docker client's own (its config,
+	// DOCKER_CONFIG, its credential helpers).
+	Login authn.Keychain
 	// RegistryCA is a PEM file of the CA the registry's certificate chains to (--registry-ca), a
 	// mirror's own: the installer's reads trust it, and an install records it (RegistryCAFile).
 	RegistryCA string
@@ -392,6 +396,7 @@ func (in *Installer) Install(ctx context.Context) (err error) {
 	if err := in.l4Free(in.R.Spec.L4.Routes, func(k string) string { v, _ := env.Get(k); return v }, nil); err != nil {
 		return err
 	}
+	in.recordInputKeys(env) // before a dry run prints it: what the run writes
 	if o.DryRun {
 		for _, k := range env.Keys() {
 			v, _ := env.Get(k)
@@ -945,6 +950,7 @@ func (in *Installer) rerun(ctx context.Context) (err error) {
 	if err := os.WriteFile(in.path(changingFile), nil, 0o600); err != nil {
 		return err
 	}
+	in.recordInputKeys(next, env)
 	if err := next.WriteFile(in.path(envName)); err != nil {
 		return err
 	}

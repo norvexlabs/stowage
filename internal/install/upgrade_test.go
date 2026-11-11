@@ -91,7 +91,7 @@ func TestUpgradeKeepsTheRecordedValuesAndAddsTheNew(t *testing.T) {
 	}
 	after := e.readEnv()
 	for _, k := range before.Keys() {
-		if k == "STOWAGE_PROJECT_VERSION" || k == InstallerVar || k == InstallerOfVar {
+		if k == "STOWAGE_PROJECT_VERSION" || k == InstallerVar || k == InstallerOfVar || k == InputsVar {
 			continue
 		}
 		if get(after, k) != get(before, k) {

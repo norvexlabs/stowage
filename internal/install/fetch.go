@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"cmp"
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -213,6 +214,55 @@ func isVersion(m *release.Manifest, v string) bool {
 	return err == nil && c == 0
 }
 
+// login is the Docker client's login (Options.Login).
+func (o *Options) login() authn.Keychain {
+	if o.Login != nil {
+		return o.Login
+	}
+	return authn.DefaultKeychain
+}
+
+// mirrorPull is the Docker config of the pull Secret (secret) a cluster pulls from the mirror at
+// prefix with (--image-pull-login): the user and password the Docker client's login holds for its
+// host, said. A login it cannot write one from — none, a token alone, a user or a password alone —
+// is refused: the run was asked for that Secret.
+func (in *Installer) mirrorPull(prefix, secret string) ([]byte, error) {
+	host := registryHost(prefix)
+	reg, err := name.NewRegistry(host)
+	if err != nil {
+		return nil, fmt.Errorf("--image-registry %s: %w", prefix, err)
+	}
+	a, err := in.O.login().Resolve(reg)
+	if err != nil {
+		return nil, fmt.Errorf("the Docker client's login for %s: %w", host, err)
+	}
+	cfg, err := a.Authorization()
+	if err != nil {
+		return nil, fmt.Errorf("the Docker client's login for %s: %w", host, err)
+	}
+	user, pass := cfg.Username, cfg.Password
+	if (user == "" || pass == "") && cfg.Auth != "" {
+		raw, err := base64.StdEncoding.DecodeString(cfg.Auth)
+		if err != nil {
+			return nil, fmt.Errorf("the Docker client's login for %s: its auth is not base64", host)
+		}
+		user, pass, _ = strings.Cut(string(raw), ":")
+	}
+	fix := "docker login " + host + " with a read-only pull account, or point DOCKER_CONFIG at a config holding one"
+	switch {
+	case user != "" && pass != "":
+		if in.O.DryRun {
+			in.O.logf("note: a run writes the pull Secret %s from the Docker login for %s (user %s)", secret, host, user)
+		} else {
+			in.O.logf("note: the pull Secret %s holds the Docker login for %s (user %s), which anyone reading Secrets in the namespace reads: a long-lived, read-only pull account (DOCKER_CONFIG), as a password a credential helper renews expires there", secret, host, user)
+		}
+		return dockerAuths(host, user, pass)
+	case cfg.IdentityToken != "" || cfg.RegistryToken != "" || user != "" || pass != "":
+		return nil, refuse(fix, "--image-pull-login: the Docker login for %s holds no user and password a cluster's nodes pull with (a token, or a user or password alone)", host)
+	}
+	return nil, refuse(fix, "--image-pull-login: no Docker login for %s", host)
+}
+
 // keychain is the login the installer's registry reads use: the project's pull account on its
 // own registry, as the image pulls use it (pullAccount); anonymous on the registry of a project
 // whose images are public; else (a mirror included) the Docker client's own login.
@@ -222,7 +272,7 @@ func (in *Installer) keychain(prefix string) (authn.Keychain, error) {
 	}
 	user, token, err := in.pullAccount(prefix)
 	if err != nil || token == "" {
-		return authn.DefaultKeychain, err
+		return in.O.login(), err
 	}
 	return registry.Fixed(authn.FromConfig(authn.AuthConfig{Username: user, Password: token})), nil
 }

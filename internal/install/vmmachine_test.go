@@ -761,6 +761,7 @@ func TestVMStatusReadsTheKeptInstallerOnce(t *testing.T) {
 	if err := e.install(vm); err != nil {
 		t.Fatalf("%v\n%s", err, e.log)
 	}
+	dropInputsRecord(t, e)                             // the kept installer's spec alone tells the inputs
 	e.r, e.self = bundledInstaller(t, "2.0.0", 1, nil) // the OS carries another release
 	var log bytes.Buffer
 	d := daemon(e, &fakeHost{})

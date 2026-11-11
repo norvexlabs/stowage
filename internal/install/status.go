@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strconv"
+	"strings"
 
 	"github.com/norvexlabs/stowage/internal/payload"
 	"github.com/norvexlabs/stowage/internal/release"
@@ -153,6 +154,66 @@ func (in *Installer) recordInstaller(ctx context.Context, env *EnvFile) {
 	}
 }
 
+// InputsVar records, in a Docker install's .env (and the VM's), the keys of the inputs it records,
+// comma-separated and sorted: the inputs of each release that wrote it, so a key only a newer
+// release declares stays listed after a rollback, which keeps .env's keys. Not a value compose or
+// a hook reads.
+const InputsVar = "STOWAGE_INPUTS"
+
+// recordInputKeys sets InputsVar in env, called by each run that writes .env with inputs added or
+// dropped (install, re-run, upgrade, rollback, provision; a secret's rotation or set changes no
+// key): the keys env records that are inputs of this release or
+// that a prior record (the ones env was made from; none for a first install) lists.
+func (in *Installer) recordInputKeys(env *EnvFile, priors ...*EnvFile) {
+	keys := map[string]bool{}
+	for _, prior := range priors {
+		for _, k := range listedInputs(prior) {
+			keys[k] = true
+		}
+	}
+	for _, i := range in.R.Spec.Inputs {
+		keys[i.Key] = true
+	}
+	var out []string
+	for _, k := range sortedKeys(keys) {
+		if _, ok := env.Get(k); ok {
+			out = append(out, k)
+		}
+	}
+	env.Set(InputsVar, strings.Join(out, ","))
+}
+
+// listedInputs are the keys InputsVar lists in env; none when it is absent (an install made
+// before it was recorded) or empty.
+func listedInputs(env *EnvFile) []string {
+	v, _ := env.Get(InputsVar)
+	if v == "" {
+		return nil
+	}
+	return strings.Split(v, ",")
+}
+
+// installInputs are the keys of the inputs env records: those s (the installed release's spec;
+// nil when no installer of it is read) declares, and those InputsVar lists — every release's that
+// wrote it —, sorted. Nil (unknown) when neither tells: no spec, and no list recorded.
+func installInputs(env *EnvFile, s *spec.Spec) *[]string {
+	_, listed := env.Get(InputsVar)
+	if s == nil && !listed {
+		return nil
+	}
+	out := []string{}
+	if s != nil {
+		out = *recordedInputs(s, func(k string) bool { _, ok := env.Get(k); return ok })
+	}
+	for _, k := range listedInputs(env) {
+		if _, ok := env.Get(k); ok && !slices.Contains(out, k) {
+			out = append(out, k)
+		}
+	}
+	slices.Sort(out)
+	return &out
+}
+
 // recordedInputs is the keys of s's inputs recorded holds, sorted; [] when none (never null).
 func recordedInputs(s *spec.Spec, recorded func(string) bool) *[]string {
 	out := []string{}
@@ -239,14 +300,11 @@ func (in *Installer) StatusJSON(ctx context.Context) error {
 	if st.RegistryCA, err = fileDigest(in.path(RegistryCAFile)); err != nil {
 		return err
 	}
-	if m, s := in.carriedRelease(name, v, n); m != nil {
-		if st.Channel == "" {
-			st.Channel = m.Channel
-		}
-		if s != nil {
-			st.Inputs = recordedInputs(s, func(k string) bool { _, ok := env.Get(k); return ok })
-		}
+	m, s := in.carriedRelease(name, v, n)
+	if m != nil && st.Channel == "" {
+		st.Channel = m.Channel
 	}
+	st.Inputs = installInputs(env, s)
 	if st.Previous, err = in.keptPrevious(v, n); err != nil {
 		return err
 	}

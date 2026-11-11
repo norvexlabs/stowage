@@ -828,7 +828,8 @@ Stowage calls a project's programs: the two never share a reader.
   installed: `format` (this interface's version, an integer moved only on a breaking change; a
   reader refuses one it does not know, naming the Stowage release it needs), `name`, `short_name` (the `<short>` of `<short>-stow`, the
   name of the installer an install keeps), the release
-  `{version, revision}`, the channel (empty from the installer an OS bundle carries: one bundle
+  `{version, revision}`, `stowage_version` (the Stowage that built the installer, which
+  `--version` prints too), the channel (empty from the installer an OS bundle carries: one bundle
   serves every channel it is tagged on, so its manifest names none, and the install's channel is
   `status`'s), the shapes, the inputs from the payload's spec (key, type,
   secret, required, optional, shapes, when, advanced, profile, prompt, a default — never a
@@ -842,7 +843,10 @@ Stowage calls a project's programs: the two never share a reader.
   and Docker's and Kubernetes' carry the same names: `format`, `name`, `installed` as `{version, revision}`,
   `channel`, `installing`, `install_failed`; and on every shape `previous` (the release `rollback`
   returns to, null before an upgrade) and `inputs`, the recorded keys only — never a value, so the
-  output can be logged. On Docker and Kubernetes `installed` and `previous` also carry `installer`:
+  output can be logged. On Docker and the VM the install records which of its `.env` keys are
+  inputs (`STOWAGE_INPUTS`), kept across releases, so `inputs` lists an input whichever release
+  declared it: after a rollback, the newer release's input whose value the install keeps — no spec
+  the running installer reads names it, and a program would otherwise see it dropped. On Docker and Kubernetes `installed` and `previous` also carry `installer`:
   the installer image by the digest the release manifest records, which each install records —
   Docker in the install directory, carried into the kept previous release; Kubernetes in the
   release's values, so `helm rollback` restores it. On the VM the release is the OS's, so the
@@ -2125,7 +2129,7 @@ no `action` blocks, so every operation is a resource's create, update or delete)
 
 | | Docker | Kubernetes | Kairos VM |
 |---|---|---|---|
-| Reached by | the system `ssh`, the target's `known_hosts` line given (strict) | a `kubernetes {}` block named as the helm provider's (`host`, `token`, `cluster_ca_certificate`, `client_certificate`/`client_key`, `exec {}`, or `config_path` + `config_context`), written to a 0600 kubeconfig for the run and removed after; helm ≥ 3.14 and kubectl locally, on a platform an installer is built for | the system `ssh`, the line from `stowage_vm_seed` |
+| Reached by | the system `ssh`, the target's `known_hosts` line given (strict) | the **provider's** `kubernetes {}` block, never the resource's, named as the helm provider's (`host`, `token`, `cluster_ca_certificate`, `client_certificate`/`client_key`, `exec {}`, or `config_path` + `config_context`): a provider configuration is never saved in state, so the cluster's credentials stay out of it; one provider alias per cluster. It is written to a 0600 kubeconfig for the run and removed after; helm ≥ 3.14 and kubectl locally, on a platform an installer is built for | the system `ssh`, the line from `stowage_vm_seed` |
 | Desired release | `installer`: the installer image by digest — an installer carries one release, so the digest is the release | the same | `version` and `channel` (the disk carried the first) |
 | Change of release | the new installer's `upgrade` | its `k8s upgrade` | `sudo <short>-stow upgrade --version V --yes`, then the reboot followed: a new `boot_id`, the trial over, `installed` the target; a fallback or a failed boot is an error saving the release that runs |
 | Change of a recorded input | the running installer's re-run with `--set` | `k8s upgrade --given -` | `sudo <short>-stow install --set` |
@@ -2142,8 +2146,9 @@ no `action` blocks, so every operation is a resource's create, update or delete)
   naming the fix, never a replacement — replacing an install deletes its data.
 - **`deletion_protection`** (default true) refuses a destroy; `delete_data` (default false) chooses
   `uninstall --data`.
-- **What lands in state**: the connection (host, user, key file or agent, the `known_hosts` line),
-  the release, the non-secret inputs. Not in state: secret inputs (write-only, with a
+- **What lands in state**: the SSH connection (host, user, key file or agent, the `known_hosts`
+  line), the release, the non-secret inputs; on Kubernetes the namespace and release name alone,
+  as the cluster's connection is the provider's configuration. Not in state: secret inputs (write-only, with a
   `secret_inputs_wo_version` that triggers their update), a handoff kit or given values
   (`given_wo`, at create), a decrypted `secrets export` (`secrets_wo`, at create, Docker and the VM:
   Kubernetes has no `secrets export`). Read and delete see state alone, so nothing they need is
@@ -2155,7 +2160,9 @@ no `action` blocks, so every operation is a resource's create, update or delete)
 - **Plan-time checks** (an upgrade's dry run over SSH) are opt-in, and skipped while the target does
   not exist yet (a VM created in the same root).
 - **Kubernetes is reached as the helm and kubernetes providers reach it**: the same `kubernetes {}`
-  block, so a root that creates a cluster (EKS, GKE, AKS) passes its outputs straight in and
+  block, in the provider's configuration as theirs is — a resource's attributes are saved in state,
+  a provider's are not, and a cluster token in state would outlive its rotation —, so a root that
+  creates a cluster (EKS, GKE, AKS) passes its outputs straight in and
   installs on it in the same apply; a kubeconfig file alone could not, as the file does not exist
   at plan time. The provider runs Stowage's `k8s` verbs, never `helm_release`: a chart installed by
   helm alone skips the signature check, the schema barrier, the rollback check, the hook and the

@@ -66,6 +66,9 @@ type Description struct {
 	// Registry is the prefix the release's images are pulled from when no --registry or
 	// --image-registry gives a mirror.
 	Registry string `json:"registry"`
+	// StowageVersion is the Stowage release that built this installer, as its manifest records it
+	// (empty when it records none).
+	StowageVersion string `json:"stowage_version"`
 	// Routes are the front's routes, in the spec's order ([] without a front): the names --ports
 	// takes. L4Routes are the host ports published beside the front ([] when none).
 	Routes   []DescribedRoute   `json:"routes"`
@@ -106,16 +109,17 @@ type DescribedInput struct {
 // Describe is what r offers.
 func Describe(r *Release) Description {
 	d := Description{
-		Format:    MachineFormat,
-		Name:      r.Manifest.Name,
-		ShortName: r.Spec.Short(),
-		Release:   Version{Version: r.Manifest.ProjectVersion, Revision: r.Manifest.Revision},
-		Channel:   r.Manifest.Channel,
-		Shapes:    append([]string{}, r.Spec.Shapes.Names()...),
-		Inputs:    []DescribedInput{},
-		Registry:  r.Spec.Registry.Prefix,
-		Routes:    []DescribedRoute{},
-		L4Routes:  []DescribedL4Route{},
+		Format:         MachineFormat,
+		Name:           r.Manifest.Name,
+		ShortName:      r.Spec.Short(),
+		Release:        Version{Version: r.Manifest.ProjectVersion, Revision: r.Manifest.Revision},
+		Channel:        r.Manifest.Channel,
+		Shapes:         append([]string{}, r.Spec.Shapes.Names()...),
+		Inputs:         []DescribedInput{},
+		Registry:       r.Spec.Registry.Prefix,
+		StowageVersion: r.Manifest.StowageVersion,
+		Routes:         []DescribedRoute{},
+		L4Routes:       []DescribedL4Route{},
 	}
 	for _, rt := range r.Spec.Front.Routes {
 		d.Routes = append(d.Routes, DescribedRoute{Name: rt.Name, LoopbackPort: r.Spec.Front.LoopbackPorts[rt.Name]})
@@ -211,7 +215,20 @@ func (d Description) print(w io.Writer) error {
 		fmt.Fprintf(&b, "l4 route  %s (%s/%d)\n", rt.Name, rt.Protocol, rt.Port)
 	}
 	fmt.Fprintf(&b, "registry  %s\n", d.Registry)
+	if d.StowageVersion != "" {
+		fmt.Fprintf(&b, "stowage   %s\n", d.StowageVersion)
+	}
 	fmt.Fprintf(&b, "first install only: %s\n", strings.Join(d.FirstInstallOnly, ", "))
 	_, err := io.WriteString(w, b.String())
 	return err
+}
+
+// versionLine is what `<short>-stow --version` prints after "<short>-stow version ": the release
+// it carries and the Stowage release that built it.
+func (r *Release) versionLine() string {
+	v := fmt.Sprintf("%s (revision %d)", r.Manifest.ProjectVersion, r.Manifest.Revision)
+	if r.Manifest.StowageVersion != "" {
+		v += ", stowage " + r.Manifest.StowageVersion
+	}
+	return v
 }
