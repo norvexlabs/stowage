@@ -22,6 +22,35 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
    operator's own registry sign-in where the mirror asks for one), their signatures checked against
    the release keys as `upgrade --version` checks them; nothing newer is said so.
 
+### Security — from a consumer's audit of the VM (0.33.2, seen on two installed VMs)
+
+1. **IPv6 forwarding between `host.interfaces` roles is unfiltered**: the forward rules (each
+   role's traffic out, the replies back, nothing new into the role) rely on Docker's FORWARD
+   policy, DROP for IPv4 only. On the VMs `ip6 filter FORWARD` is `policy accept`, and so is the
+   project table's own forward chain (`inet <name>`, priority filter - 1): under IPv6 the
+   STOWAGE-FORWARD accepts change nothing and nothing drops the rest. On a VM whose roles forward
+   with IPv6 forwarding on (a gateway), a neighbour on the uplink routes new IPv6 flows through it,
+   into the inside roles or back out. Enforce "nothing new into the role" on both families in
+   Stowage's own table — its forward chain drops what is forwarded between non-bridge interfaces
+   and is neither a declared role pair nor a reply — instead of leaving it to Docker's policy; an
+   e2e-vm check over IPv6 proves it.
+2. **The front runs as root with Docker's default capabilities**: Caddy has uid 0, CapEff/CapBnd
+   `a80425fb`, NoNewPrivs 0; the generated front service sets no `user`, `cap_drop` or
+   `security_opt` (the provision service does). It is every install's one Internet-facing process,
+   holds the TLS keys, the DNS-01 token (environment) and the internal CA, and reaches from the
+   stack network every host-network port the firewall opens to `br-*`. Give it `cap_drop: [ALL]`
+   (plus `NET_BIND_SERVICE` only while it binds ports under 1024), `no-new-privileges`, a non-root
+   user where its volumes allow, and a read-only root filesystem.
+3. **A front serving L4 routes alone opens 80 and 443 in TLS modes that need neither**: on a VM
+   installed with `--tls internal` whose only route is an `l4` route with `tls`, the input chain
+   accepts `tcp dport { 80, 443 }` and Docker publishes both; the front answers 404 there. Open
+   80/443 only when a front route is served or the TLS mode needs them (`acme`'s challenge): none
+   for `internal`, `byo` and `dns-cloudflare` with no HTTP route.
+
+Known and kept in THREAT_MODEL.md, no entry: SSH open to every source without `--ssh-allow` and
+NOPASSWD sudo for the admin group, the shared baked pull credential, secrets as environment
+variables.
+
 ### Supply chain — stopgaps back to canonical
 
 1. **Check every stopgap at each release, and drop each one the upstream has caught up with**:
