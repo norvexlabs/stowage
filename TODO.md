@@ -580,6 +580,12 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
 
 ## Could
 
+- **e2e-vm's SSH over IPv6 times out now and then**: the VM has its global address and its IPv6
+  default route, yet this host's SSH to it times out (`no SSH over IPv6 to …`); 2 runs of 4 on
+  2026-11-11 with no code change between them, the address the firewall admits unchanged. Keep
+  the VM (`E2E_KEEP_VM=1`) on the next one and read its neighbour table, the firewall's ip6
+  counters and a capture on both sides.
+
 - **A bind input refuses a loopback address the loopback answers on but does not carry**: an L4
   route's bind input must be an address an interface carries, so `127.0.0.2` is refused although
   Linux's loopback answers on all of `127.0.0.0/8` and Docker publishes on it. Accept an address
