@@ -105,6 +105,21 @@ push with `--no-verify` or another `core.hooksPath`, and never replace that help
 credential.helper= -c credential.helper=…`, `gh auth git-credential`). On GitHub, a ruleset on the repository
 refuses every branch or tag change but the org app's, whatever the clone does.
 
+**Private words.** The tree never names a private project. The words are never written in the
+tree — writing them there would publish them: they are the private-words list in
+`~/.config/norvexlabs/private-words` (`$XDG_CONFIG_HOME/norvexlabs/private-words`; one extended
+regex per line, case-insensitive), outside every clone. `.githooks/private-words`, which the hooks
+share, refuses a match: `pre-commit` in the staged tree (every staged file, so every added line)
+and its paths, `commit-msg` in the message, `pre-push` in every pushed commit the remote's refs do
+not hold (its changed files and their paths, its whole object: message, author, committer, a
+merged tag), every tag object a pushed ref leads to, and every pushed ref name. It names a file by its
+number in git's listing and a line by its number, never the word, the line or the path. A list that
+cannot be read, or with a line that is not a valid regex, refuses; a clone without the list (or
+with an empty one) is warned and passes: the maintainer's machine holds it. A CRLF list works;
+paths are matched unquoted, case folds in C.UTF-8; a blob missing locally (a partial clone)
+refuses. `test/hooks.sh` (run by
+`test/gate.sh` after lint) proves its refusals and passes with a fake word.
+
 ## Commit gates
 
 Commit straight to `main`. A docs-only commit (Markdown, no code, example or gate) runs no gate:

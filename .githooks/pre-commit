@@ -9,3 +9,5 @@ for who in AUTHOR COMMITTER; do
     exit 1
   fi
 done
+# The staged tree holds no private word (.githooks/private-words).
+sh "$(dirname "$0")/private-words" pre-commit index

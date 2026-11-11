@@ -1,0 +1,153 @@
+#!/bin/sh
+# The private-words check the hooks share: it refuses a commit, a message or a push holding a word
+# of the private-words list, ${XDG_CONFIG_HOME:-$HOME/.config}/norvexlabs/private-words (one
+# extended regex per line, case-insensitive; blank lines ignored). The list lives outside the tree,
+# so the words are never in it; this script never prints a word, a matched line or a path: it names
+# a file by its number in git's listing, and a line by its number.
+#   private-words <hook> index            the staged tree: every entry's content and path
+#   private-words <hook> message <file>   a commit message
+#   private-words <hook> push <remote>    pre-push's standard input: every commit of each pushed
+#                                         range (its changed files' content and paths, the whole
+#                                         commit object: message, author, committer, a merged
+#                                         tag), every tag object a pushed ref leads to, and every
+#                                         pushed ref name.
+#                                         A range is <remote sha>..<local sha>; for a new ref (or a
+#                                         remote sha not here), every commit no ref of <remote>
+#                                         (refs/remotes/<remote>/*) has: what another remote has is
+#                                         checked again.
+# No list: a warning, and the check passes (a clone elsewhere has none). A list that cannot be
+# read, or holding a line that is not a valid regex, refuses. Carriage returns in the list are
+# dropped (a list saved with CRLF line ends). Paths are matched unquoted (core.quotePath=false), and
+# a file whose content cannot be read (a blob missing from a partial clone) refuses. Matching runs
+# in the C.UTF-8 locale, so case folds beyond ASCII where the system has it.
+set -eu
+export LC_ALL=C.UTF-8
+me=$1 mode=$2
+shift 2
+say() { echo "$me: $*" >&2; }
+list=${XDG_CONFIG_HOME:-${HOME:?HOME is unset}/.config}/norvexlabs/private-words
+if [ ! -e "$list" ] && [ ! -L "$list" ]; then
+  say "warning: no private-words list at $list; nothing is checked for private words"
+  exit 0
+fi
+if [ ! -f "$list" ] || ! cat "$list" >/dev/null 2>&1; then
+  say "refused: the private-words list $list cannot be read (it must be a readable file); fix it, or remove it to skip the check"
+  exit 1
+fi
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+pats=$tmp/pats
+tr -d '\r' < "$list" > "$tmp/list"
+grep -v '^[[:space:]]*$' "$tmp/list" > "$pats" 2>/dev/null || true
+if [ ! -s "$pats" ]; then
+  say "warning: the private-words list $list holds no pattern; nothing is checked for private words"
+  exit 0
+fi
+n=0 bad=
+while IFS= read -r p || [ -n "$p" ]; do
+  n=$((n + 1))
+  case $p in *[![:space:]]*) ;; *) continue ;; esac
+  rc=0
+  printf '' | grep -i -E -e "$p" >/dev/null 2>&1 || rc=$?
+  [ "$rc" -le 1 ] || bad="$bad $n"
+done < "$tmp/list"
+if [ -n "$bad" ]; then
+  say "refused: the private-words list $list has a line that is not a valid regex: line$bad"
+  exit 1
+fi
+
+# hits: the numbers of the lines of standard input that match, space-separated. A grep failure
+# exits non-zero (the caller stops); the matched text stays in the private temporary directory.
+hits() {
+  rc=0
+  grep -a -n -i -E -f "$pats" > "$tmp/hits" 2>/dev/null || rc=$?
+  if [ "$rc" -gt 1 ]; then
+    say "refused: the private-words check failed (grep exit $rc)"
+    return 1
+  fi
+  cut -d: -f1 "$tmp/hits" | tr '\n' ' ' | sed 's/ $//'
+}
+found=0
+report() {
+  say "refused: a private word (the list $list) is in $*"
+  found=1
+}
+tab=$(printf '\t')
+
+# entries <label> <numbering> <entries> [<shas>]: <entries> is git's listing, one
+# "mode sha<TAB>path" per line (a path with a control character quoted by git, so one line each),
+# numbered as git lists it. The entries checked are every one, or those whose sha <shas> lists
+# (what a commit changed): their paths, and their content but a submodule's (mode 160000) or a
+# sparse index's directory (040000).
+entries() {
+  label=$1 numbering=$2 file=$3 only=${4:-}
+  if [ -n "$only" ]; then
+    awk -v t="$tab" 'FILENAME == ARGV[1] {c[$0]; next} {split($0, f, t); split(f[1], m, " "); if (m[2] in c) print FNR " " $0}' "$only" "$file" > "$tmp/sel"
+  else
+    awk '{print FNR " " $0}' "$file" > "$tmp/sel"
+  fi
+  : > "$tmp/selpaths"
+  while IFS= read -r e; do
+    i=${e%% *} rest=${e#* }
+    head=${rest%%"$tab"*}
+    emode=${head%% *} sha=${head#* }
+    printf '%s\n' "${rest#*"$tab"}" > "$tmp/path"
+    l=$(hits < "$tmp/path") || exit 1
+    [ -z "$l" ] || report "$label: the path of file $i ($numbering numbering)"
+    case $emode in 160000 | 040000) continue ;; esac
+    if ! git cat-file blob "$sha" > "$tmp/blob" 2>/dev/null; then
+      say "refused: $label: file $i ($numbering numbering) cannot be read to check it for private words (a partial clone: fetch its blobs)"
+      exit 1
+    fi
+    l=$(hits < "$tmp/blob") || exit 1
+    [ -z "$l" ] || report "$label: file $i ($numbering numbering), line $l"
+  done < "$tmp/sel"
+}
+git() { command git -c core.quotePath=false "$@"; }
+
+case $mode in
+index)
+  git ls-files --cached -s | sed "s/^\([0-7]*\) \([0-9a-f]*\) [0-9]*$tab/\1 \2$tab/" > "$tmp/entries"
+  entries "the staged tree" "git ls-files --cached" "$tmp/entries"
+  ;;
+message)
+  l=$(hits < "$1") || exit 1
+  [ -z "$l" ] || report "the commit message, line $l"
+  ;;
+push)
+  remote=${1:?private-words: push needs the remote name}
+  : > "$tmp/commits"
+  while read -r lref lsha rref rsha; do
+    case $lsha in *[!0]*) ;; *) continue ;; esac # a deletion pushes nothing
+    l=$(printf '%s\n%s\n' "$lref" "$rref" | hits) || exit 1
+    [ -z "$l" ] || report "a pushed ref's name"
+    o=$lsha
+    while [ "$(git cat-file -t "$o" 2>/dev/null)" = tag ]; do
+      git cat-file tag "$o" > "$tmp/tag"
+      l=$(hits < "$tmp/tag") || exit 1
+      [ -z "$l" ] || report "the pushed tag object $(git rev-parse --short "$o"), line $l"
+      o=$(sed -n 's/^object //p' "$tmp/tag" | head -n 1)
+    done
+    case $rsha in
+    *[!0]*) if git cat-file -e "$rsha^{commit}" 2>/dev/null; then set -- "$rsha..$lsha"; else set -- "$lsha" --not --remotes="$remote"; fi ;;
+    *) set -- "$lsha" --not --remotes="$remote" ;;
+    esac
+    git rev-list "$@" >> "$tmp/commits" || { say "refused: cannot list the pushed commits of $lref"; exit 1; }
+  done
+  sort -u "$tmp/commits" > "$tmp/c"
+  while IFS= read -r c; do
+    s=$(git rev-parse --short "$c")
+    git cat-file commit "$c" > "$tmp/msg"
+    l=$(hits < "$tmp/msg") || exit 1
+    [ -z "$l" ] || report "commit $s: its object (git cat-file commit $s: author, committer, merged tag or message), line $l"
+    git ls-tree -r "$c" | sed "s/^\([0-7]*\) [a-z]* \([0-9a-f]*\)$tab/\1 \2$tab/" > "$tmp/entries"
+    git diff-tree -r -m --root --no-commit-id --no-renames "$c" | awk '{print $4}' > "$tmp/changed"
+    entries "commit $s" "git ls-tree -r $s" "$tmp/entries" "$tmp/changed"
+  done < "$tmp/c"
+  ;;
+*)
+  say "private-words: unknown mode $mode"
+  exit 1
+  ;;
+esac
+[ "$found" = 0 ] || exit 1

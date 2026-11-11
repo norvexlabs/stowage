@@ -11,6 +11,10 @@
 # The primary guard is server-side: the repository's rulesets refuse any other account's ref change.
 set -eu
 url=$2
+# Every pushed commit, tag and ref name holds no private word (.githooks/private-words); it reads
+# the refs git gives on standard input, before any push is allowed, a local one included; what
+# the remote (its remote-tracking refs) has already is not checked again.
+sh "$(dirname "$0")/private-words" pre-push push "$1"
 refuse() {
   echo "pre-push: refused: $1. Pushes go over https through the org app's credential helper in .git/config (CLAUDE.md, Commit identity)" >&2
   exit 1
