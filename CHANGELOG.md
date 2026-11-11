@@ -3,6 +3,27 @@
 Stowage's own releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
+## [0.35.0]
+
+### Added
+
+- `status --json` reports what an install holds that a program would otherwise have to remember:
+  the image registry it pulls from (Docker and Kubernetes), and on Docker the installer's short
+  name, the loopback address and the digest of the registry CA its first install recorded.
+- `describe --json` lists the release's default registry, its front routes (the names `--ports`
+  takes, with their loopback ports) and its L4 routes, so a program tells a route an upgrade adds
+  from one the install holds. `describe` prints them too.
+- A refusal of `status --json` prints one object on standard output (`refused`, with its reason
+  and fix), and both it and the verbs' `--json` result say `absent` when the refusal is that no
+  install is there — no install in the directory, no helm release in the namespace (never `k8s
+  uninstall`'s, which does not tell what helm keeps) — so a program tells "nothing installed here"
+  from any other refusal.
+
+### Changed
+
+- `k8s uninstall` with no release refuses naming another tool's objects of the release's names it
+  finds there.
+
 ## [0.34.0] - 2026-11-11
 
 ### Added

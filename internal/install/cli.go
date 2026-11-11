@@ -172,11 +172,15 @@ func newCommand(r *Release, self string, stdout, stderr io.Writer, tools K8sOpti
 		Short: "What the install runs, its URLs and its services",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			if err := prepare(); err != nil {
-				return err
-			}
+			err := prepare()
 			if statusJSON {
-				return in.StatusJSON(cmd.Context())
+				if err == nil {
+					err = in.StatusJSON(cmd.Context())
+				}
+				return printStatusRefused(stdout, err)
+			}
+			if err != nil {
+				return err
 			}
 			return in.Status(cmd.Context())
 		},
@@ -559,7 +563,8 @@ func k8sCommand(in *Installer, o *Options, prepare func() error, terminal func(b
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if statusJSON {
-				return run(cmd, 0, false, in.K8sStatusJSON)
+				err := run(cmd, 0, false, in.K8sStatusJSON)
+				return printStatusRefused(o.Out, err)
 			}
 			return run(cmd, 0, false, in.K8sStatus)
 		},

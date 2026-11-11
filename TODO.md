@@ -567,12 +567,6 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
   runner, a common place to run OpenTofu. Build darwin/arm64, darwin/amd64 and linux/arm64
   installers, the payload appended to each; needed before the provider's Kubernetes target ships.
 
-- **`status --json` tells no install from another's**: on Docker and Kubernetes, a directory or
-  namespace holding no install and one holding another project's both refuse with exit 3 and
-  nothing on standard output, so a program (the OpenTofu provider's create) cannot tell "absent"
-  from "not mine". Print a Result-like `{format, refused: {reason, fix}, absent: true|false}` under
-  `--json`, or a distinct reason code, before the provider's Kubernetes target relies on it.
-
 - **The k8s refusals' wording, one way**: `k8s rollback`'s no-release refusal names no command in
   its reason, the upgrade refusals use a bare-command fix naming the running installer's version
   rather than the asked one, and the install hint these refusals build leaves out the

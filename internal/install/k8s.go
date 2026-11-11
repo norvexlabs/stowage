@@ -597,7 +597,7 @@ func (in *Installer) k8sDeploy(ctx context.Context, upgrade bool) (err error) {
 	case !upgrade && rel != nil:
 		return refuse(in.k8sCtl("upgrade"), "release %s in %s exists (%s, %s): `%s` moves it to %s", k.Release, k.Namespace, rel.Status, rel.AppVersion, in.k8sCtl("upgrade"), m.ProjectVersion)
 	case upgrade && rel == nil:
-		return refuse(in.k8sCtl("install"), "no release %s in %s: `%s` installs %s", k.Release, k.Namespace, in.k8sCtl("install"), m.ProjectVersion)
+		return absent(in.k8sCtl("install"), "no release %s in %s: `%s` installs %s", k.Release, k.Namespace, in.k8sCtl("install"), m.ProjectVersion)
 	case upgrade:
 		if err := in.pending(rel); err != nil {
 			return err
@@ -1070,7 +1070,7 @@ func (in *Installer) K8sRollback(ctx context.Context) (err error) {
 		return err
 	}
 	if rel == nil {
-		return refuse("nothing to roll back: "+in.k8sCtl("install")+" installs the release", "no release %s in %s", k.Release, k.Namespace)
+		return absent("nothing to roll back: "+in.k8sCtl("install")+" installs the release", "no release %s in %s", k.Release, k.Namespace)
 	}
 	if err := in.pending(rel); err != nil {
 		return err
@@ -1113,7 +1113,7 @@ func (in *Installer) K8sRollback(ctx context.Context) (err error) {
 // to run, named in the message too, as a verb without --json prints no fix.
 func (in *Installer) noRelease() error {
 	k := in.O.K8s
-	return refuse("install first: `"+in.k8sCtl("install")+"`", "no release %s in %s: `%s` installs %s", k.Release, k.Namespace, in.k8sCtl("install"), in.R.Manifest.ProjectVersion)
+	return absent("install first: `"+in.k8sCtl("install")+"`", "no release %s in %s: `%s` installs %s", k.Release, k.Namespace, in.k8sCtl("install"), in.R.Manifest.ProjectVersion)
 }
 
 // k8sStatusRelease is the release both forms of `k8s status` report on, as helm lists it; a
@@ -1178,7 +1178,7 @@ func (in *Installer) K8sUpgradeTo(ctx context.Context, v string, args []string) 
 		return err
 	}
 	if rel == nil {
-		return refuse(in.k8sCtl("install"), "no release %s in %s: `%s` installs %s", k.Release, k.Namespace, in.k8sCtl("install"), in.R.Manifest.ProjectVersion)
+		return absent(in.k8sCtl("install"), "no release %s in %s: `%s` installs %s", k.Release, k.Namespace, in.k8sCtl("install"), in.R.Manifest.ProjectVersion)
 	}
 	if err := in.pending(rel); err != nil {
 		return err

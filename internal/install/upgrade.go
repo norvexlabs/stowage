@@ -77,9 +77,18 @@ func (in *Installer) open() (*EnvFile, error) {
 	in.O.Dir = dir
 	env, err := ReadEnvFile(in.path(envName))
 	if errors.Is(err, os.ErrNotExist) {
-		return nil, refuse(in.fixOn("install first, or give the --dir of the install", in.vmCtl()+" install"), "%s holds no install", dir)
+		return nil, in.noInstall(dir)
 	}
 	return env, err
+}
+
+// noInstall is the refusal of a run whose directory, dir, holds no install: absent on Docker
+// alone, as the VM's host daemon answers its verbs (and its status answers before any install).
+func (in *Installer) noInstall(dir string) error {
+	if in.O.Preloaded {
+		return refuse(in.vmCtl()+" install", "%s holds no install", dir)
+	}
+	return absent("install first, or give the --dir of the install", "%s holds no install", dir)
 }
 
 // ctl is the installer the install keeps.

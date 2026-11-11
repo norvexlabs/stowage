@@ -501,10 +501,10 @@ func TestK8sStatusJSONAfterAnUninstallThatKeptItsHistory(t *testing.T) {
 	e.stored(nil, ours)
 	e.f.listed[0].Status = "uninstalled"
 	e.f.history = []helmRevision{{Revision: 1, Status: "superseded", Chart: "notes-0.1.0"}, {Revision: 2, Status: "uninstalled", Chart: "notes-0.1.0"}}
-	e.f.revValues = map[int]string{2: `{"stowage":{"release":{"name":"notes","version":"1.0.0","revision":1}}}`}
+	e.f.revValues = map[int]string{2: `{"stowage":{"registry":"ghcr.io/acme/notes","release":{"name":"notes","version":"1.0.0","revision":1}}}`}
 	st, out := k8sStatusOf(t, e)
 	if st.Installed != nil || !strings.Contains(out, `"installed": null`) || st.Previous == nil || *st.Previous != (StatusRelease{"1.0.0", 1, ""}) ||
-		st.Helm != (HelmStatus{2, "uninstalled"}) || st.Inputs != nil || st.Channel != "" {
+		st.Helm != (HelmStatus{2, "uninstalled"}) || st.Inputs != nil || st.Channel != "" || st.Registry != "" {
 		t.Errorf("%s", out)
 	}
 	if n, err := e.installer(nil).previousRevision(context.Background()); err != nil || n != 2 {

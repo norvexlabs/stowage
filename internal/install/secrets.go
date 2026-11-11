@@ -133,9 +133,6 @@ func encryptSecrets(f *SecretsFile, ctl string, recipients []string) ([]byte, er
 
 // ExportSecrets is the Docker install's SecretsFile in O.Dir, encrypted to recipients.
 func (in *Installer) ExportSecrets(recipients []string) ([]byte, error) {
-	if notInstalled(in) {
-		return nil, refuse(in.fixOn("install first, or give the --dir of the install", "install first"), "%s holds no install", in.O.Dir)
-	}
 	env, err := in.open()
 	if err != nil {
 		return nil, err

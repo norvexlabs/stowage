@@ -63,6 +63,28 @@ type Description struct {
 	Shapes           []string         `json:"shapes"`
 	Inputs           []DescribedInput `json:"inputs"`
 	FirstInstallOnly []string         `json:"first_install_only"`
+	// Registry is the prefix the release's images are pulled from when no --registry or
+	// --image-registry gives a mirror.
+	Registry string `json:"registry"`
+	// Routes are the front's routes, in the spec's order ([] without a front): the names --ports
+	// takes. L4Routes are the host ports published beside the front ([] when none).
+	Routes   []DescribedRoute   `json:"routes"`
+	L4Routes []DescribedL4Route `json:"l4_routes"`
+}
+
+// DescribedRoute is a front route: its name, and the host port it binds in loopback mode when
+// --ports gives none (front.loopback_ports; 0, left out, when the spec gives none).
+type DescribedRoute struct {
+	Name         string `json:"name"`
+	LoopbackPort int    `json:"loopback_port,omitempty"`
+}
+
+// DescribedL4Route is an L4 route: its name, protocol (tcp, udp) and host port, which no flag
+// moves.
+type DescribedL4Route struct {
+	Name     string `json:"name"`
+	Protocol string `json:"protocol"`
+	Port     int    `json:"port"`
 }
 
 // DescribedInput is one of the spec's inputs, in the spec's order. Default is left out for a
@@ -91,6 +113,15 @@ func Describe(r *Release) Description {
 		Channel:   r.Manifest.Channel,
 		Shapes:    append([]string{}, r.Spec.Shapes.Names()...),
 		Inputs:    []DescribedInput{},
+		Registry:  r.Spec.Registry.Prefix,
+		Routes:    []DescribedRoute{},
+		L4Routes:  []DescribedL4Route{},
+	}
+	for _, rt := range r.Spec.Front.Routes {
+		d.Routes = append(d.Routes, DescribedRoute{Name: rt.Name, LoopbackPort: r.Spec.Front.LoopbackPorts[rt.Name]})
+	}
+	for _, rt := range r.Spec.L4.Routes {
+		d.L4Routes = append(d.L4Routes, DescribedL4Route{Name: rt.Name, Protocol: rt.Protocol, Port: rt.Port})
 	}
 	for _, i := range r.Spec.Inputs {
 		d.Inputs = append(d.Inputs, describeInput(i))
@@ -169,6 +200,17 @@ func (d Description) print(w io.Writer) error {
 		}
 		b.WriteString("\n")
 	}
+	for _, rt := range d.Routes {
+		fmt.Fprintf(&b, "route     %s", rt.Name)
+		if rt.LoopbackPort != 0 {
+			fmt.Fprintf(&b, " (loopback port %d)", rt.LoopbackPort)
+		}
+		b.WriteString("\n")
+	}
+	for _, rt := range d.L4Routes {
+		fmt.Fprintf(&b, "l4 route  %s (%s/%d)\n", rt.Name, rt.Protocol, rt.Port)
+	}
+	fmt.Fprintf(&b, "registry  %s\n", d.Registry)
 	fmt.Fprintf(&b, "first install only: %s\n", strings.Join(d.FirstInstallOnly, ", "))
 	_, err := io.WriteString(w, b.String())
 	return err

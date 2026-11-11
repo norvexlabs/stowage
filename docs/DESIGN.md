@@ -832,8 +832,12 @@ Stowage calls a project's programs: the two never share a reader.
   serves every channel it is tagged on, so its manifest names none, and the install's channel is
   `status`'s), the shapes, the inputs from the payload's spec (key, type,
   secret, required, optional, shapes, when, advanced, profile, prompt, a default — never a
-  secret's) and the settings a re-run cannot change (`address`, `registry`, `registry_ca`,
-  `channel`). It comes from the spec the payload carries, so there is no second schema.
+  secret's), the settings a re-run cannot change (`address`, `registry`, `registry_ca`,
+  `channel`), the `registry` prefix its images come from when no mirror is given, the front's
+  `routes` (`name`, the `loopback_port` it binds without `--ports`: the names `--ports` takes) and
+  the `l4_routes` (`name`, `protocol`, `port`, which no flag moves), so a program tells a route an
+  upgrade adds from one the install holds. It comes from the spec the payload carries, so there
+  is no second schema.
 - **`status --json` on every shape** — the VM's fields (§ 8, the host daemon's status) are the core,
   and Docker's and Kubernetes' carry the same names: `format`, `name`, `installed` as `{version, revision}`,
   `channel`, `installing`, `install_failed`; and on every shape `previous` (the release `rollback`
@@ -842,11 +846,21 @@ Stowage calls a project's programs: the two never share a reader.
   the installer image by the digest the release manifest records, which each install records —
   Docker in the install directory, carried into the kept previous release; Kubernetes in the
   release's values, so `helm rollback` restores it. On the VM the release is the OS's, so the
-  disk, not an installer, carries it. Each shape adds its own (the services; the helm revision;
-  the VM's boot fields).
+  disk, not an installer, carries it. Docker and Kubernetes report the `registry` prefix the
+  install pulls from, and Docker what its first install recorded beside it — `short_name` (the
+  installer it keeps), `address` and `registry_ca` (`sha256:` of the CA file it keeps) —, so a
+  program compares its configuration with what the install holds instead of remembering what it
+  gave. Each shape adds its own (the services; the helm revision; the VM's boot fields). A
+  refusal of `status --json` prints `{format, refused: {reason, fix, absent}}` and exits 3:
+  `absent` (true) says no install is there — no `.env` in the directory, no helm release in the
+  namespace — told apart from every other refusal (a release not from Stowage's chart), so a
+  program's create tells "nothing here" from "something else here". The VM always answers its
+  status (`installed` null before the first install).
 - **`--json` on the verbs that change an install** (install and re-run, `upgrade`, `rollback`,
   `uninstall`, on every shape) — one object at the end: `{format, result: "done" | "nothing",
-  release, refused: {reason, fix}}`. `nothing` is a run with nothing to do, a dry run or a
+  release, refused: {reason, fix, absent}}` (`absent` as `status --json`'s, left out when false;
+  Docker's and Kubernetes': the VM's daemon answers its verbs, and its status answers before any
+  install). `nothing` is a run with nothing to do, a dry run or a
   refusal; `release` the release installed after the run, absent when none is; a failure prints
   no object, only its error. The run's text goes to standard error, so standard output is the
   object alone; `upgrade --version` passes `--json` to its child, which prints it. On the VM,

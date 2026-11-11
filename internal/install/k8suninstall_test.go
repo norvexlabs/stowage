@@ -197,11 +197,24 @@ func TestK8sUninstallOfAnotherReleaseOrWhatIsLeft(t *testing.T) {
 		t.Errorf("%v %q", err, e.f.changes())
 	}
 
-	// Nothing at all: refused.
+	// Nothing at all: refused, never absent (helm's history and claims are not told here).
 	e = newKubeEnv(t, spec.Provider{Name: "none"})
-	if err := e.uninstall(yes); err == nil || !strings.Contains(err.Error(), "no release notes in notes, and nothing notes-stow made for it there") {
+	if err := e.uninstall(yes); err == nil || err.Error() != "no release notes in notes, and nothing notes-stow made for it there" || refusedAbsent(err) {
 		t.Errorf("%v", err)
 	}
+	// Another tool's object of the release's names: refused naming it, and not absent.
+	e = newKubeEnv(t, spec.Provider{Name: "none"})
+	e.f.objects = map[string]string{"secret/notes-stowage": labelled(map[string]string{"app.kubernetes.io/managed-by": "other"})}
+	if err := e.uninstall(yes); !isRefused(err) || refusedAbsent(err) || !strings.HasSuffix(err.Error(), "; another tool made secret notes-stowage") || len(e.f.changes()) != 0 {
+		t.Errorf("%v %q", err, e.f.changes())
+	}
+	// Beside the Secrets kept for the data, another tool's objects are named too.
+	e = newKubeEnv(t, spec.Provider{Name: "none"})
+	e.f.objects = map[string]string{"secret/notes-stowage": labelled(ours), "secret/notes-stowage-provision": labelled(map[string]string{"app.kubernetes.io/managed-by": "other"})}
+	if err := e.uninstall(yes); !isRefused(err) || !strings.Contains(err.Error(), "but the Secrets notes-stowage,") && !strings.Contains(err.Error(), "but the Secrets notes-stowage ") || !strings.HasSuffix(err.Error(), "; another tool made secret notes-stowage-provision") {
+		t.Errorf("%v", err)
+	}
+
 }
 
 func TestK8sUninstallDeletesTheChartsOwnClaimsOnlyWithTheData(t *testing.T) {

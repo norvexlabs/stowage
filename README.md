@@ -1914,6 +1914,10 @@ again, to copy an installer to another host.
     "channel": "stable",
     "previous": { "version": "1.0.0", "revision": 1, "installer": "ghcr.io/acme/notes/notes-installer@sha256:…" },
     "inputs": ["ADMIN_EMAIL"],
+    "registry": "ghcr.io/acme/notes",
+    "short_name": "notes",
+    "address": "127.0.0.1",
+    "registry_ca": "sha256:…",
     "services": [{ "service": "api", "state": "running", "health": "healthy", "image": "…", "exit_code": 0, "id": "…" }]
   }
   ```
@@ -1931,7 +1935,13 @@ again, to copy an installer to another host.
   records, sorted (`[]` when none), from the spec of the installer that carries that release —
   absent (unknown) when neither does, or when the kept one's spec does not load in this Stowage
   (logged once: `the installer the install keeps, <path>: …`, as any kept installer that does not
-  read; none kept is said by the field alone); `restore_awaited` (`true`, absent otherwise) while
+  read; none kept is said by the field alone); `registry` the image prefix the install pulls from,
+  as its first install recorded it (`--registry`, else the release's: `STOWAGE_REGISTRY` in
+  `.env`); `short_name` the `<short>` of the installer the install keeps, `<dir>/<short>-stow`
+  (`STOWAGE_SHORT_NAME`); `address` the loopback address the first install recorded (`--address`,
+  else `127.0.0.1`; `STOWAGE_LOOPBACK_ADDRESS`); `registry_ca` `sha256:<hex>` of the registry CA
+  the install keeps (`registry-ca.pem`, the `--registry-ca` file as given), absent when it keeps
+  none — so a program compares what it would give with what the install holds; `restore_awaited` (`true`, absent otherwise) while
   an install given `--secrets` awaits its data, and `volumes_split` while a restore left the
   volumes half restored — not while a restore runs (it holds the install's host lock), as on the
   VM; `services` the stack's services as the VM's `ps --json` gives them
@@ -1947,8 +1957,13 @@ again, to copy an installer to another host.
   installer image is not recorded (status --json leaves it out): …`), an install made before it
   was recorded, or one recorded for another release than the one reported (`installed`: the
   release `.env` records; `previous`: the one `.stowage-prev/state.json` records), as an
-  installer that does not record it leaves the replaced release's. Refused: a directory with no install, a recorded revision that is no number,
-  and a kept record (`.stowage-prev/state.json`) that does not read, naming the file.
+  installer that does not record it leaves the replaced release's. Refused (exit 3): a directory
+  with no install, which prints one object on standard output: `{"format": 1, "refused":
+  {"reason": "… holds no install", "fix": "…", "absent": true}}` — `absent` tells "nothing
+  installed here" from any other refusal. Failed (exit 1, nothing on standard output): a recorded
+  revision that is no number, a kept record (`.stowage-prev/state.json`) that does not read,
+  naming the file, and an `.env` or a `registry-ca.pem` that cannot be read (a permission). An install of another project is
+  not refused: `name` says whose it is.
 - `ps` prints `docker compose ps --all` of the stack (the front among its services), `--json`
   Compose's JSON, one service per line. `logs SERVICE` prints a service's last `--tail` lines
   (1 to 5000, default 200, no colour), and with `--follow` the lines it writes next until
@@ -1995,6 +2010,17 @@ again, to copy an installer to another host.
   - `first_install_only`: the settings an install records at its first run and a re-run refuses,
     `["address", "registry", "registry_ca", "channel"]` (`--address`, `--registry`,
     `--registry-ca`, and the VM's `install --channel`).
+  - `registry`: the prefix the release's images are pulled from when no `--registry` (or
+    `--image-registry`) gives a mirror: the spec's `registry.prefix`.
+  - `routes`: the front's routes in the spec's order, each `{name, loopback_port}` — the names
+    `--ports route=port` takes, and the port each binds in loopback mode when `--ports` gives
+    none (`front.loopback_ports`; left out when it gives none); `[]` without a front.
+    `l4_routes`: the `l4` routes, each `{name, protocol, port}` — host ports no flag moves; `[]`
+    when none. A program compares a release's routes with the installed one's to tell a route an
+    upgrade adds from one the install holds.
+  Without `--json`, a `route` line per route (`route     NAME (loopback port N)`), an `l4 route`
+  line per L4 route (`l4 route  NAME (PROTOCOL/PORT)`) and `registry  PREFIX` come before
+  `first install only: …`.
 - **`--json` on the verbs that change an install**, for a program: the install and its re-run,
   `upgrade` (`--version` too), `rollback` and `uninstall`, and on Kubernetes `k8s install`,
   `k8s upgrade` (`--version` too), `k8s rollback` and `k8s uninstall`. The run prints one object
@@ -2007,7 +2033,7 @@ again, to copy an installer to another host.
     "format": 1,
     "result": "done",
     "release": { "version": "2.0.0", "revision": 1 },
-    "refused": { "reason": "…", "fix": "…" }
+    "refused": { "reason": "…", "fix": "…", "absent": true }
   }
   ```
   `result` is `done` when the run changed the install, `nothing` when it had nothing to do (the
@@ -2020,7 +2046,13 @@ again, to copy an installer to another host.
   operator, what to run or change — a program shows it, never runs it (where another installer
   answers, it names that installer, run in this one's place with the same arguments). `fix` is
   chosen for the shape that refused, and is absent when no advice holds there (on the VM, see
-  "Exit status and `--json` on the VM"): the run is still refused, exit 3. A run that
+  "Exit status and `--json` on the VM"): the run is still refused, exit 3. `absent` (`true`, left
+  out otherwise) says the refusal is that no install is there: no `.env` in the `--dir` on
+  Docker, no helm release in the namespace on Kubernetes (`k8s upgrade`, `--version` too, and `k8s
+  rollback`; never `k8s uninstall`, whose "nothing to uninstall" does not tell what helm keeps of a
+  release — read `k8s status --json`) — never an install of another project or a release not from
+  Stowage's chart, and never on the VM, whose host daemon answers its verbs
+  (its `status --json` answers before the first install, `installed` `null`). A run that
   fails prints no object, only its error. `upgrade --version --json` passes `--json` to the
   installer it fetches, which prints the object; the run that fetched it prints none and exits
   with that installer's status (an installer from before 0.34.0 refuses the flag).
@@ -3766,6 +3798,7 @@ the current directory. A release with no chart (published without the shape) is 
     "channel": "stable",
     "previous": { "version": "1.0.0", "revision": 1, "installer": "<prefix>/notes-installer@sha256:…" },
     "inputs": ["ADMIN_EMAIL"],
+    "registry": "<prefix>",
     "helm": { "revision": 2, "status": "deployed" }
   }
   ```
@@ -3783,10 +3816,14 @@ the current directory. A release with no chart (published without the shape) is 
   `<release>-stowage` holds, sorted (`[]` when none), told only when something is installed and this
   installer carries that release (its version and revision) — absent (unknown) otherwise; only
   then is the Secret read, and one of its name another tool wrote refused, as every verb refuses
-  it; `helm` the release's latest revision (`helm history`) and its status (`helm list`).
+  it; `registry` the image prefix the release's values record (`stowage.registry`: the last
+  deploy's `--image-registry`, else the release's); `helm` the release's latest revision (`helm history`) and its status (`helm list`).
   With no release of that name in the namespace, `status` (with or without `--json`) is refused
-  (exit 3, as Docker's `status` of a directory that holds no install) and prints nothing on
-  standard output; standard error says ``error: no release <release> in <namespace>: `<short>-stow
+  (exit 3, as Docker's `status` of a directory that holds no install); without `--json` it prints
+  nothing on standard output, with it the refusal's object, `absent` `true` (as Docker's: `{"format":
+  1, "refused": {"reason": "…", "fix": "…", "absent": true}}`), which every other refusal of
+  `status --json` prints too, without `absent` (a release not installed from Stowage's chart);
+  standard error says ``error: no release <release> in <namespace>: `<short>-stow
   k8s install --namespace NS --release R` installs <version>`` (`--kube-context C` added when
   given), and the refusal's fix is ``install first: `<that install>` ``. `provision`, `reset-db`,
   `secrets rotate` and `kit create` / `kit check` refuse it the same way.
@@ -3866,7 +3903,8 @@ the current directory. A release with no chart (published without the shape) is 
   - A release helm no longer knows (gone, or `uninstalled` with its history kept) has its other
     objects deleted all the same, its claims untold (none deleted, `--data` or not); nothing of it
     at all is refused (`no release R in NS, and nothing <short>-stow made for it
-    there`).
+    there`), and so is one whose names hold only another tool's objects, naming them (`…; another
+    tool made secret R-stowage`).
 
   It prints `release R in NS is uninstalled` (`… was uninstalled already: what the installer left of
   it is deleted` when helm no longer knew it), then `kept:` and what it kept, each with the

@@ -2426,18 +2426,11 @@ func (in *Installer) tunables(env *EnvFile, tls bool) {
 
 // Status prints what the install runs and its services.
 func (in *Installer) Status(ctx context.Context) error {
-	dir, err := filepath.Abs(in.O.Dir)
+	env, err := in.open()
 	if err != nil {
 		return err
 	}
-	in.O.Dir = dir
-	env, err := ReadEnvFile(in.path(envName))
-	if errors.Is(err, os.ErrNotExist) {
-		return refuse(in.fixOn("install first, or give the --dir of the install", "install first"), "%s holds no install", dir)
-	}
-	if err != nil {
-		return err
-	}
+	dir := in.O.Dir
 	get := func(k string) string { v, _ := env.Get(k); return v }
 	fmt.Fprintf(in.O.Out, "%s %s (revision %s)\nregistry  %s\n", get("STOWAGE_NAME"), get("STOWAGE_PROJECT_VERSION"), get("STOWAGE_REVISION"), get("STOWAGE_REGISTRY"))
 	p, by := in.tuneProfile(get)

@@ -326,5 +326,45 @@
     "registry",
     "registry_ca",
     "channel"
+  ],
+  "registry": "registry.example.com/atlas",
+  "routes": [
+    {
+      "name": "console",
+      "loopback_port": 3000
+    },
+    {
+      "name": "api",
+      "loopback_port": 9090
+    },
+    {
+      "name": "ingest",
+      "loopback_port": 8080
+    },
+    {
+      "name": "ops",
+      "loopback_port": 9091
+    },
+    {
+      "name": "status",
+      "loopback_port": 9092
+    }
+  ],
+  "l4_routes": [
+    {
+      "name": "echo",
+      "protocol": "tcp",
+      "port": 17007
+    },
+    {
+      "name": "echo-udp",
+      "protocol": "udp",
+      "port": 17007
+    },
+    {
+      "name": "echo-tls",
+      "protocol": "tcp",
+      "port": 17443
+    }
   ]
 }

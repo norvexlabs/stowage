@@ -124,6 +124,11 @@ func (in *Installer) K8sUninstall(ctx context.Context) (err error) {
 			foreign = append(foreign, ob.kind+" "+ob.name)
 		}
 	}
+	// No refusal of this verb is absent: what helm keeps of a release (its history, its claims) is
+	// not told here, and a program reads `k8s status --json` for that.
+	if rel == nil && len(owned) == 0 && len(foreign) > 0 {
+		return refuse("nothing to uninstall: they are another tool's", "no release %s in %s, and nothing %s made for it there; another tool made %s", k.Release, k.Namespace, in.R.Ctl(), strings.Join(foreign, ", "))
+	}
 	if rel == nil && len(owned) == 0 {
 		return refuse("nothing to uninstall", "no release %s in %s, and nothing %s made for it there", k.Release, k.Namespace, in.R.Ctl())
 	}
@@ -178,8 +183,12 @@ func (in *Installer) K8sUninstall(ctx context.Context) (err error) {
 		})
 	}
 	if rel == nil && len(owned) == 0 {
-		return refuse(fmt.Sprintf("kubectl delete secret %s --namespace %s, once the data's claims are deleted", strings.Join(keptSecrets, " "), k.Namespace), "no release %s in %s, and nothing %s made for it there but the Secrets %s, which answer for its data: once the data's claims are deleted, `kubectl delete secret %s --namespace %s` deletes them",
-			k.Release, k.Namespace, in.R.Ctl(), strings.Join(keptSecrets, ", "), strings.Join(keptSecrets, " "), k.Namespace)
+		others := ""
+		if len(foreign) > 0 {
+			others = "; another tool made " + strings.Join(foreign, ", ")
+		}
+		return refuse(fmt.Sprintf("kubectl delete secret %s --namespace %s, once the data's claims are deleted", strings.Join(keptSecrets, " "), k.Namespace), "no release %s in %s, and nothing %s made for it there but the Secrets %s, which answer for its data: once the data's claims are deleted, `kubectl delete secret %s --namespace %s` deletes them%s",
+			k.Release, k.Namespace, in.R.Ctl(), strings.Join(keptSecrets, ", "), strings.Join(keptSecrets, " "), k.Namespace, others)
 	}
 	if len(owned) > 0 {
 		var names []string

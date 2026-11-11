@@ -2,6 +2,8 @@ package install
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -71,12 +73,23 @@ type InstallStatus struct {
 	// so the output can be logged. Nil (left out) when this installer cannot tell them: it carries
 	// another release than the one installed, whose spec it does not have.
 	Inputs *[]string `json:"inputs,omitempty"`
+	// Registry is the prefix the install pulls its images from, as recorded: on Docker the one its
+	// first install chose (--registry, else the release's), on Kubernetes the release's values'.
+	// Empty (left out) when none is recorded.
+	Registry string `json:"registry,omitempty"`
 }
 
 // DockerStatus is `status --json` on Docker: the stack's services too, as `ps` reads them, or why
 // they could not be read.
 type DockerStatus struct {
 	InstallStatus
+	// ShortName is the <short> of the installer the install keeps, <dir>/<short>-stow.
+	ShortName string `json:"short_name,omitempty"`
+	// Address is the loopback address the first install recorded (--address, else 127.0.0.1).
+	Address string `json:"address,omitempty"`
+	// RegistryCA is sha256:<hex> of the registry CA the install keeps (--registry-ca at the first
+	// install, as given); left out when it keeps none.
+	RegistryCA string `json:"registry_ca,omitempty"`
 	// RestoreAwaited and VolumesSplit are the VM's: the provision hook waits for a backup of the
 	// install --secrets came from; a restore left the volumes half restored (or one runs).
 	RestoreAwaited bool      `json:"restore_awaited,omitempty"`
@@ -220,6 +233,12 @@ func (in *Installer) StatusJSON(ctx context.Context) error {
 	// The channel the install follows (--channel at the first install, as the VM's), else the
 	// installed release's; its inputs from an installer that carries that release.
 	st.Channel, _ = env.Get(ChannelVar)
+	st.ShortName, _ = env.Get("STOWAGE_SHORT_NAME")
+	st.Address, _ = env.Get("STOWAGE_LOOPBACK_ADDRESS")
+	st.Registry, _ = env.Get("STOWAGE_REGISTRY")
+	if st.RegistryCA, err = fileDigest(in.path(RegistryCAFile)); err != nil {
+		return err
+	}
 	if m, s := in.carriedRelease(name, v, n); m != nil {
 		if st.Channel == "" {
 			st.Channel = m.Channel
@@ -297,7 +316,7 @@ func (in *Installer) K8sStatusJSON(ctx context.Context) error {
 	// After `helm uninstall --keep-history` nothing runs: the latest revision is what `rollback`
 	// brings back (previous), and nothing is installed.
 	if len(h.revs) == 0 || h.revs[0].Status != "uninstalled" {
-		st.Channel, st.Installing = r.Channel, rel.Status == "pending-install"
+		st.Channel, st.Installing, st.Registry = r.Channel, rel.Status == "pending-install", cur.Registry
 		st.Installed = &StatusRelease{Version: r.Version, Revision: r.Revision, Installer: installerFor(r.Installer, r.InstallerRelease, r.Version, r.Revision)}
 	}
 	// The revision `rollback` goes back to: never the latest, but after an uninstall (when nothing
@@ -341,4 +360,17 @@ func (h *releaseHistory) release(ctx context.Context, n int) (*StatusRelease, er
 	}
 	r := v.Stowage.Release
 	return &StatusRelease{Version: r.Version, Revision: r.Revision, Installer: installerFor(r.Installer, r.InstallerRelease, r.Version, r.Revision)}, nil
+}
+
+// fileDigest is sha256:<hex> of the file at path; empty when there is none.
+func fileDigest(path string) (string, error) {
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(data)
+	return "sha256:" + hex.EncodeToString(sum[:]), nil
 }

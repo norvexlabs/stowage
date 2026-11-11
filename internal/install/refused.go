@@ -19,6 +19,9 @@ import (
 // of these, never a plain error.
 type Refused struct {
 	Reason, Fix string
+	// Absent: what refused is that no install is there (absent) — none in the directory, no helm
+	// release in the namespace — told apart from an install there that is not this project's.
+	Absent bool
 	// cause is the error the refusal was made of (refusal), which errors.Is and errors.As reach.
 	cause error
 }
@@ -96,6 +99,13 @@ func refuse(fix, format string, a ...any) error {
 	return refusal(fix, fmt.Errorf(format, a...))
 }
 
+// absent is the refusal of a run finding no install where it was pointed (Refused.Absent).
+func absent(fix, format string, a ...any) error {
+	r := refuse(fix, format, a...).(Refused)
+	r.Absent = true
+	return r
+}
+
 // fixOn is a refusal's fix for the shape the installer runs: docker on Docker (and Kubernetes),
 // vm on the VM (O.Preloaded), where "" says no advice holds — the refusal stays one.
 func (in *Installer) fixOn(docker, vm string) string {
@@ -147,10 +157,30 @@ type Result struct {
 }
 
 // RefusedResult is a refusal under --json: the message the run prints, and what to run instead
-// (absent when no advice holds on the shape that refused).
+// (left out when no advice holds on the shape that refused). Absent: no install is where the run
+// was pointed (Refused.Absent); left out otherwise.
 type RefusedResult struct {
 	Reason string `json:"reason"`
 	Fix    string `json:"fix,omitempty"`
+	Absent bool   `json:"absent,omitempty"`
+}
+
+// StatusRefused is what `status --json` prints on a refusal, then exits 3: the refusal, whose
+// absent tells "no install here" from another refusal (an install of another project).
+type StatusRefused struct {
+	Format  int           `json:"format"` // MachineFormat
+	Refused RefusedResult `json:"refused"`
+}
+
+// printStatusRefused prints the StatusRefused of err when it is a refusal, and returns err: a
+// failure prints nothing.
+func printStatusRefused(out io.Writer, err error) error {
+	r, ok := Refusal(err)
+	if !ok {
+		return err
+	}
+	_ = printJSON(out, StatusRefused{Format: MachineFormat, Refused: RefusedResult{Reason: err.Error(), Fix: r.Fix, Absent: r.Absent}}) // still a refusal, exit 3
+	return err
 }
 
 // Results of a verb under --json.
@@ -231,7 +261,7 @@ func printMachineResult(out io.Writer, err error, nothing bool, release func(don
 	res := Result{Format: MachineFormat, Result: ResultDone}
 	switch {
 	case err != nil:
-		res.Result, res.Refused = ResultNothing, &RefusedResult{Reason: err.Error(), Fix: refused.Fix}
+		res.Result, res.Refused = ResultNothing, &RefusedResult{Reason: err.Error(), Fix: refused.Fix, Absent: refused.Absent}
 	case nothing:
 		res.Result = ResultNothing
 	}
