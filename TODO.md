@@ -50,6 +50,22 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
    `vm create`, the VM's `install`, and `vm seed --await-secrets` waiting for it (recommended: one
    format the provider already writes); (b) `--registry-user` plus the password on standard input.
 
+### Kits — what a handoff's step reads
+
+1. **A handoff's step gets its `as_file` secrets and file inputs as files**: lint refuses a
+   handoff step's `env` naming a secret delivered as a file (`as_file: true`) or a file input
+   (`type: file`/`pem`), as the step gets its values as variables alone; a handoff that must read
+   such a secret (to issue a credential from it, to check what it opens) cannot be written. Give
+   the step what the provision hook gets: on Docker and the VM the `stowage-kit` service mounts
+   the keys its `env` lists from the install's files, read-only, and reads
+   `STOWAGE_SECRET_FILE_<KEY>` / the file input's variable; on Kubernetes the
+   `<release>-stowage-kit-<name>` Job mounts those keys alone from `<release>-stowage-secret-files`
+   and `<release>-stowage-files` (never `envFrom`), as the hook's; the value never in the step's
+   environment, its Secret's spec, a log or the kit. Lift both lint refusals; a test per shape
+   that the step reads the file and not the variable. Also prove the other way: a kit's `gives`
+   key that the receiving install declares `as_file` is recorded and delivered as a file by
+   `--kit`, `kit take` and `vm kit take` (a test, and the refusal it needs if it is not).
+
 ### VM creation — the OpenTofu path moves out of Stowage
 
 1. **`vm create --create opentofu` gives way to the OpenTofu provider and standalone modules**:
