@@ -96,6 +96,22 @@ func TestUpdatesOnDockerOfferTheChannelsRelease(t *testing.T) {
 	if out, err := p.updates(); err != nil || !strings.HasPrefix(out, "2.0.0 (revision 2) on stable: ") {
 		t.Fatalf("a later revision than the pointer's: %v %q", err, out)
 	}
+	// A later release published without an installer is not offered, and the reason said.
+	c := registry.New(authn.NewMultiKeychain())
+	bare, _, err := readRelease(context.Background(), c, p.prefix+"/notes-release", "2.0.0-2")
+	if err != nil || bare == nil {
+		t.Fatal(err)
+	}
+	bare.ProjectVersion, bare.Tag, bare.Artifacts.Installer = "3.0.0", "3.0.0-1", ""
+	p.putRelease(bare.Tag, bare)
+	point(t, p.prefix, "stable", "3.0.0-1")
+	if out, err := p.updates(); err != nil || out != "no upgrade on stable: "+p.dir+" runs 1.0.0 (revision 1); 3.0.0 (revision 2), after it, was published without an installer, which `upgrade --version` fetches\n" {
+		t.Fatalf("no installer: %v %q", err, out)
+	}
+	out, _ = p.updates("--json")
+	if u = (Update{}); json.Unmarshal([]byte(out), &u) != nil || u.Available || !u.NoInstaller {
+		t.Fatalf("no installer --json: %s", out)
+	}
 	// The channel names an earlier release (moved back by a yank): nothing newer, said so.
 	point(t, p.prefix, "stable", "0.9.0-1")
 	if out, err := p.updates(); err != nil || out != "no upgrade on stable: "+p.dir+" runs 1.0.0 (revision 1), the release found is 0.9.0 (revision 1)\n" {
@@ -245,7 +261,40 @@ func TestUpdatesFixNeverUpgrades(t *testing.T) {
 	anotherStowages(t, e)
 	_, err := e.installer(nil).Updates(context.Background(), "", "2.0.0")
 	r, ok := Refusal(err)
-	if !ok || !strings.Contains(err.Error(), "the keys the install trusts cannot be told") || !strings.HasPrefix(r.Fix, "run "+filepath.Join(e.dir, "notes-stow")+" updates with the same arguments") || !strings.Contains(r.Fix, "--version <version> --dry-run --dir "+e.dir) {
+	kept := filepath.Join(e.dir, "notes-stow")
+	if !ok || !strings.Contains(err.Error(), "the keys the install trusts cannot be told") || !strings.HasPrefix(r.Fix, "run `"+kept+" updates --dir "+e.dir+" --version 2.0.0`") || !strings.Contains(r.Fix, "`"+kept+" upgrade --version 2.0.0 --dry-run --dir "+e.dir+"`") {
 		t.Fatalf("%v (fix %q)", err, r.Fix)
+	}
+}
+
+// An install kept by an installer of another short name is handed to it: its `updates`, or a
+// dry run for one from before `updates`, each command exact.
+func TestUpdatesHandAnotherShortNameToItsInstaller(t *testing.T) {
+	t.Parallel()
+	e := installed(t)
+	env := e.readEnv()
+	env.Set("STOWAGE_SHORT_NAME", "old")
+	if err := env.WriteFile(filepath.Join(e.dir, envName)); err != nil {
+		t.Fatal(err)
+	}
+	_, err := e.installer(nil).Updates(context.Background(), "beta", "")
+	kept := filepath.Join(e.dir, "old-stow")
+	r, ok := Refusal(err)
+	if !ok || !strings.Contains(err.Error(), "kept by old-stow, not notes-stow") || r.Fix != "run `"+kept+" updates --dir "+e.dir+" --channel beta` (it knows this install); an installer from before `updates` has none: `"+kept+" upgrade --version <version> --dry-run --dir "+e.dir+"` checks that version" {
+		t.Fatalf("%v (fix %q)", err, r.Fix)
+	}
+}
+
+// A kept installer that does not read is reported for what `updates` needs of it, never as a
+// rollback's.
+func TestUpdatesSayWhyTheyNeedTheKeptInstaller(t *testing.T) {
+	t.Parallel()
+	e := installed(t)
+	if err := testutil.WriteExecutable(filepath.Join(e.dir, "notes-stow"), []byte("not an installer")); err != nil {
+		t.Fatal(err)
+	}
+	_, err := e.installer(nil).Updates(context.Background(), "", "")
+	if err == nil || !strings.Contains(err.Error(), "`updates` reads the keys the install trusts from it") || strings.Contains(err.Error(), "rollback") {
+		t.Fatalf("%v", err)
 	}
 }

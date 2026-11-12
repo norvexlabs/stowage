@@ -370,8 +370,11 @@ type Update struct {
 	// Follows is the channel the install follows, set on Docker and Kubernetes when --channel
 	// named another and the target there comes after the current release: `upgrade --version`
 	// reads the install's channel alone, so the target is not available.
-	Follows   string `json:"follows,omitempty"`
-	Changelog string `json:"changelog,omitempty"`
+	Follows string `json:"follows,omitempty"`
+	// NoInstaller: on Docker and Kubernetes, the target comes after the current release on the
+	// install's channel but was published without the installer `upgrade --version` fetches.
+	NoInstaller bool   `json:"no_installer,omitempty"`
+	Changelog   string `json:"changelog,omitempty"`
 }
 
 // UpgradeRequest is POST /v1/upgrade's body.

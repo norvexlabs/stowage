@@ -109,16 +109,21 @@ func (in *Installer) installTrust(ctx context.Context, name, cur, rev, v string)
 	if err != nil {
 		return nil, nil, err
 	}
+	trust, err := in.trustOf(kept, v)
+	return trust, kept, err
+}
+
+// trustOf is installTrust's keys of the kept release kept.
+func (in *Installer) trustOf(kept *keptRelease, v string) (*sigverify.Verifier, error) {
 	src, keys := in.ctl(), kept.Keys
 	switch {
 	case len(keys) == 0 && kept.Release == nil:
 		// Another Stowage's payload may keep its keys elsewhere: none found is not none carried.
-		return nil, nil, refusal(sameArgs(in.ctl(), keysWhy, v), keysUnknown{fmt.Errorf("%s carries no key this installer finds, and %s: the keys the install trusts cannot be told; run its own installer", in.ctl(), kept.foreign())})
+		return nil, refusal(sameArgs(in.ctl(), keysWhy, v), keysUnknown{fmt.Errorf("%s carries no key this installer finds, and %s: the keys the install trusts cannot be told; run its own installer", in.ctl(), kept.foreign())})
 	case len(keys) == 0:
 		src, keys = "this installer", in.R.Keys
 	}
-	trust, err := trusted(src, keys)
-	return trust, kept, err
+	return trusted(src, keys)
 }
 
 // UpgradeTo moves the install to version v of the project, on the channel the install's release

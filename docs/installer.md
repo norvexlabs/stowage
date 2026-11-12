@@ -438,9 +438,12 @@ again, to copy an installer to another host.
   is signed by a key the install trusts, as `upgrade --version` reads it (below). It prints
   `<release> on <channel>: <dir> runs <release>` and the release's changelog when it comes after
   the release the install runs (by the scheme the release records; revisions order one version;
-  a `command` scheme calls any other version later, as `upgrade --version` does) and has an
+  a `command` scheme calls any other version later, as `upgrade --version` does: its order is the
+  project's command, which runs where the project publishes, never in an installer) and has an
   installer; else `no upgrade on <channel>: <dir> runs <release>, the release found is
-  <release>`. A later release on another channel than the install's (`--channel`) is shown,
+  <release>`, or for a later release published without an installer `no upgrade on <channel>:
+  <dir> runs <release>; <release>, after it, was published without an installer, which
+  \`upgrade --version\` fetches`. A later release on another channel than the install's (`--channel`) is shown,
   never offered, as `upgrade --version` reads the install's channel alone: `<dir> follows
   <channel>: \`upgrade --version\` moves it on <channel> alone` follows it. A channel with no pointer, a
   yanked pointer (`choose another release with --version: the channel's is yanked`), a pointer
@@ -448,10 +451,16 @@ again, to copy an installer to another host.
   refused or fail as the VM's `updates` does ([vm](vm.md)); an install made with `--offline` is
   refused (`updates: this install was made with --offline and never pulls: the new release's
   installer, its images loaded, upgrades it (\`upgrade --dir <dir>\`)`), as `upgrade --version`
-  refuses it. A kept installer whose keys this one cannot tell is refused as `upgrade --version`
-  refuses it, its fix running that installer's `updates` with the same arguments, or for an
-  installer without `updates`, `<dir>/<short>-stow upgrade --version <version> --dry-run --dir
-  <dir>`. `--json` prints the answer as one object ([machine interface](machine-interface.md#updates---json)).
+  refuses it. An install another installer answers is refused, its fix naming the exact commands
+  to run: kept by an installer of another short name (`<dir> holds an install of <name> kept by
+  <other>-stow, not <short>-stow`), or by one whose keys this installer cannot tell (`… the keys
+  the install trusts cannot be told …`), the fix is `run \`<kept> updates --dir <dir> [--channel
+  C] [--version V]\` (<why>); an installer from before \`updates\` has none: \`<kept> upgrade
+  --version <V, else <version>> --dry-run --dir <dir>\` checks that version`. A kept installer
+  that does not read, or carries another release, fails or is refused with `<dir>/<short>-stow is
+  not the installer of <name> <version> (revision <r>), which the install runs: \`updates\` reads
+  the keys the install trusts from it (…)`, the refusal's fix running that release's installer
+  with `--dir`, then `updates` again. `--json` prints the answer as one object ([machine interface](machine-interface.md#updates---json)).
   It changes nothing and runs with whichever installer of the project is at hand, as `upgrade
   --version`.
 - `upgrade --version V`, run by any installer of the project (the one the install keeps,

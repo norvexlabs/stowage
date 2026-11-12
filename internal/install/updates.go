@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -15,6 +16,7 @@ import (
 	"github.com/spf13/pflag"
 
 	"github.com/norvexlabs/stowage/internal/lint"
+	"github.com/norvexlabs/stowage/internal/providers"
 	"github.com/norvexlabs/stowage/internal/registry"
 	"github.com/norvexlabs/stowage/internal/release"
 	"github.com/norvexlabs/stowage/internal/sigverify"
@@ -70,7 +72,8 @@ func channelTarget(ctx context.Context, c *registry.Client, prefix, project, cha
 
 // upgradeTarget is the release `upgrade --version` installs from channel on Docker and
 // Kubernetes: version v's latest revision, v empty the version of the channel's pointer
-// (channelTarget), whose latest revision may be a later one than the pointer's.
+// (channelTarget), whose latest revision may be a later one than the pointer's. Its scan of every
+// release tag is `upgrade --version`'s own (findRelease): the same answer needs the same read.
 func upgradeTarget(ctx context.Context, c *registry.Client, prefix, project, channel, v string, trust *sigverify.Verifier, logf func(string, ...any)) (*release.Manifest, error) {
 	m, err := channelTarget(ctx, c, prefix, project, channel, v, trust, logf)
 	if err != nil || v != "" {
@@ -110,6 +113,7 @@ func installUpdate(m *release.Manifest, channel, follows, cur string, rev int) (
 	if channel != follows && newer {
 		u.Follows = follows
 	}
+	u.NoInstaller = newer && channel == follows && m.Artifacts.Installer == ""
 	return u, nil
 }
 
@@ -122,6 +126,12 @@ func (in *Installer) Updates(ctx context.Context, channel, v string) (Update, er
 	if err != nil {
 		return Update{}, err
 	}
+	if name, _, _ := runs(env); name == in.R.Manifest.Name {
+		if short, _ := env.Get("STOWAGE_SHORT_NAME"); short != "" && short != in.R.Manifest.ShortName {
+			ctl := filepath.Join(in.O.Dir, providers.Ctl(short))
+			return Update{}, refusal(in.updatesHandoff(ctl, "it knows this install", channel, v), fmt.Errorf("%s holds an install of %s kept by %s, not %s", in.O.Dir, name, providers.Ctl(short), in.R.Ctl()))
+		}
+	}
 	project, cur, rev, err := in.sameProject(env, in.R.Manifest)
 	if err != nil {
 		return Update{}, err
@@ -133,12 +143,17 @@ func (in *Installer) Updates(ctx context.Context, channel, v string) (Update, er
 	if !pinnedImages(env) {
 		return Update{}, refusal("run the new release's installer, upgrade --dir "+in.O.Dir, errors.New("updates: this install was made with --offline and never pulls: the new release's installer, its images loaded, upgrades it (`upgrade --dir "+in.O.Dir+"`)"))
 	}
-	trust, kept, err := in.installTrust(ctx, project, cur, rev, "")
+	kept, refused, err := in.installerOf(ctx, project, cur, rev)
+	if err != nil {
+		err = fmt.Errorf("%s is not the installer of %s %s (revision %s), which the install runs: `updates` reads the keys the install trusts from it (%w)", in.ctl(), project, cur, rev, err)
+		if refused {
+			return Update{}, refusal(fmt.Sprintf("run the installer of %s %s (revision %s) with --dir %s, which keeps itself there, then `updates` again", project, cur, rev, in.O.Dir), err)
+		}
+		return Update{}, err
+	}
+	trust, err := in.trustOf(kept, "")
 	if r, ok := Refusal(err); ok && errors.As(err, new(keysUnknown)) {
-		// The kept installer knows its keys: its own `updates` is what to run, never its
-		// `upgrade --version`, which would upgrade; one from before `updates` checks a version
-		// with a dry run.
-		return Update{}, refusal(fmt.Sprintf("run %s updates with the same arguments (%s); an installer without `updates` checks a version with `%s upgrade --version <version> --dry-run --dir %s`", in.ctl(), keysWhy, in.ctl(), in.O.Dir), r)
+		return Update{}, refusal(in.updatesHandoff(in.ctl(), keysWhy, channel, v), r)
 	}
 	if err != nil {
 		return Update{}, err
@@ -155,6 +170,21 @@ func (in *Installer) Updates(ctx context.Context, channel, v string) (Update, er
 		return Update{}, err
 	}
 	return installUpdate(m, channel, follows, cur, r)
+}
+
+// updatesHandoff is the fix of a Docker `updates` that another installer, ctl, answers (it knows
+// why): its `updates` with this run's arguments, or, for an installer from before `updates`, a
+// dry run of `upgrade --version`, which fetches that version's installer and changes nothing.
+func (in *Installer) updatesHandoff(ctl, why, channel, v string) string {
+	cmd := ctl + " updates --dir " + in.O.Dir
+	if channel != "" {
+		cmd += " --channel " + channel
+	}
+	if v != "" {
+		cmd += " --version " + v
+	}
+	dry := ctl + " upgrade --version " + cmp.Or(v, "<version>") + " --dry-run --dir " + in.O.Dir
+	return fmt.Sprintf("run `%s` (%s); an installer from before `updates` has none: `%s` checks that version", cmd, why, dry)
 }
 
 // K8sUpdates is Updates of the helm release O.K8s names: read from the registry its values record

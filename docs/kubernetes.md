@@ -211,7 +211,8 @@ the current directory. A release with no chart (published without the shape) is 
   `<release> on <channel>: release R in NS runs <release>` with the changelog, or `no upgrade on
   <channel>: release R in NS runs <release>, the release found is <release>`, another channel's
   release shown, never offered (`release R in NS follows <channel>: \`k8s upgrade --version\`
-  moves it on <channel> alone`); `--json` the same object
+  moves it on <channel> alone`), and a later release published without an installer said so
+  as on Docker; `--json` the same object
   as Docker's. No helm release there is refused with the missing release's refusal of every verb
   (exit 3, no object printed), and a `pending-…` release as `upgrade` refuses it. It changes
   nothing.

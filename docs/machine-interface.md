@@ -154,7 +154,9 @@ share; each shape's own fields and verbs are on its page:
   with an installer, on the channel the install follows); `follows` (Docker and Kubernetes
   only: the VM's `upgrade` takes `--channel`), present only when `--channel` named another
   channel and the release found there comes after `current`, is the one the install follows, which `upgrade --version`
-  reads alone (`available` is then `false`); `changelog` is left out when the release has none. A run that
+  reads alone (`available` is then `false`); `no_installer` (`true`, Docker and
+  Kubernetes only, left out otherwise): `target` comes after `current` on the install's channel
+  but was published without the installer `upgrade --version` fetches (`available` `false`); `changelog` is left out when the release has none. A run that
   fails or is refused prints no object, only its error, and exits as any run does (below).
   The object has no `format` number, as the VM's, which its host daemon answers and the VM prints
   as is.

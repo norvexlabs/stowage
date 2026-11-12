@@ -617,13 +617,6 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
 
 ## Could
 
-- **Docker and Kubernetes `updates`, its edges**: (a) a release on the install's channel published
-  without an installer is said `no upgrade on …` with no reason; (b) a refusal handing the run to
-  the kept installer of another short name (`sameProject`) names `the same arguments`, which an
-  installer from before `updates` does not take, and keptInstaller's failure names a rollback;
-  (c) without `--version` it scans every release tag (findRelease) after reading the pointer, as
-  `upgrade --version` does — read only the pointer's version's revisions.
-
 - **e2e-vm's SSH over IPv6 times out now and then**: the VM has its global address and its IPv6
   default route, yet this host's SSH to it times out (`no SSH over IPv6 to …`); 2 runs of 4 on
   2026-11-11 with no code change between them, the address the firewall admits unchanged. Keep

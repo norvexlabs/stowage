@@ -978,6 +978,10 @@ func printUpdateOf(w io.Writer, u Update, runs, upgrade string) {
 	if u.Follows != "" {
 		defer fmt.Fprintf(w, "%s follows %s: `%s --version` moves it on %s alone\n", runs, u.Follows, upgrade, u.Follows)
 	}
+	if u.NoInstaller {
+		fmt.Fprintf(w, "no upgrade on %s: %s runs %s; %s, after it, was published without an installer, which `%s --version` fetches\n", u.Channel, runs, u.Current, u.Target, upgrade)
+		return
+	}
 	if !u.Available {
 		fmt.Fprintf(w, "no upgrade on %s: %s runs %s, the release found is %s\n", u.Channel, runs, u.Current, u.Target)
 		return
