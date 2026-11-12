@@ -3,7 +3,9 @@ package install
 import (
 	"cmp"
 	"context"
+	"crypto/sha256"
 	"embed"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,13 +20,14 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/norvexlabs/stowage/internal/spec"
 	"github.com/norvexlabs/stowage/internal/truenas"
 )
 
 // tofuModules are the OpenTofu modules `vm create` applies, one directory per platform that has
-// one.
+// one, and a cloud's image module in its image/ (imageRoot).
 //
-//go:embed tofu/*/*.tf tofu/*/.terraform.lock.hcl
+//go:embed tofu/*/*.tf tofu/*/.terraform.lock.hcl tofu/*/image/*.tf tofu/*/image/.terraform.lock.hcl
 var tofuModules embed.FS
 
 // The ways `vm create` makes a VM.
@@ -419,7 +422,14 @@ func (in *Installer) tofu(ctx context.Context, dir, ctl string, args ...string) 
 type modulePort struct {
 	Protocol string `json:"protocol"` // tcp or udp
 	Port     int    `json:"port"`
+	// Sources are the CIDRs the VM's own firewall lets reach the port, as vm create knows them:
+	// every source for the front's ports and for an L4 route whose allowlist it is not given, the
+	// list given for one (none when it is empty: the VM's firewall refuses every source then).
+	Sources []string `json:"sources"`
 }
+
+// everySource is every IPv4 and IPv6 source.
+var everySource = []string{"0.0.0.0/0", "::/0"}
 
 // openedPorts are the ports the VM's firewall opens besides SSH: the front's, and each L4
 // route's, whose allowlist the VM's firewall alone applies.
@@ -432,15 +442,34 @@ func (in *Installer) openedPorts(st *Settings) []modulePort {
 		http, https = frontServed(in.R.Spec.Front, in.R.Spec.L4.Routes, st.TLS)
 	}
 	if http {
-		ports = append(ports, modulePort{"tcp", cmp.Or(st.HTTPPort, in.R.Spec.Front.HTTPPort, 80)})
+		ports = append(ports, modulePort{"tcp", cmp.Or(st.HTTPPort, in.R.Spec.Front.HTTPPort, 80), everySource})
 	}
 	if https {
-		ports = append(ports, modulePort{"tcp", cmp.Or(st.HTTPSPort, in.R.Spec.Front.HTTPSPort, 443)})
+		ports = append(ports, modulePort{"tcp", cmp.Or(st.HTTPSPort, in.R.Spec.Front.HTTPSPort, 443), everySource})
 	}
 	for _, r := range in.R.Spec.L4.Routes {
-		ports = append(ports, modulePort{r.Protocol, r.Port})
+		ports = append(ports, modulePort{r.Protocol, r.Port, in.routeSources(st, r)})
 	}
 	return ports
+}
+
+// routeSources are the sources an L4 route's allowlist holds as vm create gives it: its input's
+// value in the settings, else its default; every source when neither is known here (a secret
+// input, given over SSH), and none when the list is empty, which the VM's firewall refuses too.
+// A platform's rules made from them are fixed at create: a later change of the list on the VM
+// does not reach them.
+func (in *Installer) routeSources(st *Settings, r spec.L4Route) []string {
+	i := slices.IndexFunc(in.R.Spec.Inputs, func(i spec.Input) bool { return i.Key == r.AllowInput })
+	v, given := st.Inputs[r.AllowInput]
+	switch {
+	case r.AllowInput == "" || i < 0:
+		return []string{}
+	case !given && in.R.Spec.Inputs[i].Secret:
+		return everySource
+	case !given:
+		v = in.R.Spec.Inputs[i].Default
+	}
+	return append([]string{}, splitSources(v)...)
 }
 
 // moduleFirewall warns when a built-in module's network firewall leaves out what the VM's opens:
@@ -505,6 +534,11 @@ func (in *Installer) applyVM(ctx context.Context, dir, ctl string, p Platform, m
 			vars[v.Name] = src
 		case "open_ports":
 			vars[v.Name] = in.openedPorts(st)
+			for _, r := range in.R.Spec.L4.Routes {
+				if r.AllowInput != "" {
+					in.O.logf("l4 route %s: the module's rule for %s/%d takes the sources %s holds now; a later change of %s on the VM does not reach it", r.Name, r.Protocol, r.Port, r.AllowInput, r.AllowInput)
+				}
+			}
 		case "nics":
 			vars[v.Name] = moduleNICs(mach, t)
 		}
@@ -513,6 +547,11 @@ func (in *Installer) applyVM(ctx context.Context, dir, ctl string, p Platform, m
 		vars[k] = v
 	}
 	in.moduleFirewall(p, t, mach, st, declared)
+	if t.Module == "" {
+		if err := in.applyImage(ctx, ctl, p, vars, image, imageSHA); err != nil {
+			return "", "", err
+		}
+	}
 	// The platform first: a state with variables is one `vm destroy` must know the platform of.
 	how := "module"
 	if t.Module == "" {
@@ -607,6 +646,83 @@ const seedHostAlias = "vm-seed-host-key"
 // names seedHostAlias): ssh refuses any other, never adding one.
 func pinnedSSHArgs(pin, user, addr, pubKey string, command ...string) []string {
 	return sshArgsChecking("yes", seedHostAlias, pin, user, addr, pubKey, command...)
+}
+
+// applyImage applies platform p's built-in image module, when it has one, in the state the VMs of
+// this disk in this place share (imageState), and gives its image_id to the VM module's vars. A
+// state that holds the image already changes nothing: the disk is uploaded once.
+func (in *Installer) applyImage(ctx context.Context, ctl string, p Platform, vars map[string]any, image, imageSHA string) error {
+	files, err := imageFiles(p.Key)
+	if err != nil || files == nil {
+		return err
+	}
+	declared, err := moduleVars(files)
+	if err != nil {
+		return err
+	}
+	m := in.R.Manifest
+	ivars := map[string]any{"name": in.R.Spec.Name, "image": image, "image_sha256": imageSHA,
+		"description": fmt.Sprintf("%s %s (revision %d)'s disk, shared by the VMs %s vm create makes of it", in.R.Spec.Name, m.ProjectVersion, m.Revision, in.R.Ctl())}
+	for _, v := range declared {
+		if _, set := ivars[v.Name]; !set && vars[v.Name] != nil {
+			ivars[v.Name] = vars[v.Name]
+		}
+	}
+	dir, err := in.imageState(p, ivars)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	// One vm create at a time applies it; another waits, then finds the image there.
+	unlock, err := flockWait(filepath.Join(dir, imageLock), true)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	in.O.logf("the disk's image on %s: %s (shared by the VMs of this disk, kept by vm destroy)", p.Label, dir)
+	if err := writeModule(dir, files, ivars); err != nil {
+		return err
+	}
+	if err := in.tofu(ctx, dir, ctl, "init", "-input=false", "-no-color"); err != nil {
+		return err
+	}
+	if err := in.tofu(ctx, dir, ctl, "apply", "-input=false", "-auto-approve", "-no-color"); err != nil {
+		return fmt.Errorf("the disk's image: %w", err)
+	}
+	id, err := in.tofuOutput(ctx, dir, ctl, "image_id")
+	if err != nil {
+		return fmt.Errorf("the disk's image: %w", err)
+	}
+	vars["image_id"] = id
+	return nil
+}
+
+// imageLock is the lock file in an image module's state directory.
+const imageLock = ".stowage.lock"
+
+// imageState is the directory of the state of platform p's image module given ivars:
+// $XDG_STATE_HOME/<name>/images/<platform>-<key>, the key a digest of every variable but the
+// image's path on this machine and its description — the disk's SHA-256 and the place (the zone,
+// the bucket, the project…) — so every VM of one disk in one place shares it.
+func (in *Installer) imageState(p Platform, ivars map[string]any) (string, error) {
+	vms, err := in.O.vmsDir(in.R.Spec.Name)
+	if err != nil {
+		return "", err
+	}
+	key := map[string]any{"platform": p.Key}
+	for k, v := range ivars {
+		if k != "image" && k != "description" {
+			key[k] = v
+		}
+	}
+	raw, err := json.Marshal(key) // its keys sorted
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(raw)
+	return filepath.Join(filepath.Dir(vms), "images", p.Key+"-"+hex.EncodeToString(sum[:8])), nil
 }
 
 // awaitVM waits, up to wait, until `<short>-stow status --json` on the VM at addr answers from a
@@ -748,12 +864,19 @@ func (in *Installer) DestroyVM(ctx context.Context, d *VMDestroy) error {
 			fmt.Fprintf(o.Out, "Whether a VM of %s %s can be created again is not known: its disks in %s could not be read (%v).\n", in.R.Spec.Name, m.ProjectVersion, prefix, err)
 		}
 	}
+	// A cloud's image module holds the uploads in a state of its own, which the next VM takes.
+	what, shared := "its disk, its data and its uploads", false
+	if builtin {
+		if img, err := imageFiles(key); err == nil && img != nil {
+			what, shared = "its disk and its data (the disk's image stays for the next VM of it)", true
+		}
+	}
 	if !d.Yes {
 		if o.Prompt == nil {
 			return fmt.Errorf("destroying %s deletes its disk: give --yes", d.Host)
 		}
 		a, err := o.Prompt.Ask(ctx, Form{
-			Questions: []Question{{Title: fmt.Sprintf("Destroy the VM %s: its disk, its data and its uploads on %s", d.Host, label), Key: "confirm",
+			Questions: []Question{{Title: fmt.Sprintf("Destroy the VM %s: %s on %s", d.Host, what, label), Key: "confirm",
 				Choices: []Choice{{"no", "No, keep it"}, {"yes", "Yes, destroy it"}}}},
 			Defaults: func(map[string]string) map[string]string { return map[string]string{"confirm": "no"} },
 		})
@@ -774,6 +897,11 @@ func (in *Installer) DestroyVM(ctx context.Context, d *VMDestroy) error {
 		return err
 	}
 	fmt.Fprintf(o.Out, "Destroyed %s.\n", d.Host)
+	if shared {
+		if images, err := o.vmsDir(name); err == nil {
+			fmt.Fprintf(o.Out, "The disk's image stays, for the next VM of it: each state in %s holds one, which `tofu -chdir=<state> destroy` removes (its uploads included) once no VM boots from it.\n", filepath.Join(filepath.Dir(images), "images"))
+		}
+	}
 	return nil
 }
 

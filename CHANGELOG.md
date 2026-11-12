@@ -5,6 +5,22 @@ follow [SemVer](https://semver.org/).
 
 ## [0.37.0]
 
+### Added
+
+- The cloud modules of `vm create --create opentofu` take an address reserved beforehand, which
+  `vm destroy` keeps: `ip_id` on Scaleway, `eip_allocation_id` on AWS, `public_ip_name` on Azure,
+  `nat_ip` on Google Cloud, so a stack's first install can know its own address, or another VM's,
+  before the VM exists.
+
+### Changed
+
+- On a cloud, `vm create` uploads a disk once and makes its image once for every VM of it in one
+  place (zone, bucket, project…), in a state of its own that `vm destroy` keeps; the next VM of
+  that disk uploads nothing.
+- The security group Scaleway's module makes, and the firewall rules Google Cloud's makes, open an
+  L4 route's port only to the sources its allowlist holds when the VM is created, not to every
+  source.
+
 ### Fixed
 
 - `vm create` stops waiting as soon as the VM's first boot gives up in Kairos's recovery system,

@@ -72,3 +72,14 @@ variable "vmimport_role" {
   type        = string
   default     = "vmimport"
 }
+
+variable "eip_allocation_id" {
+  description = "An Elastic IP (its allocation ID, eipalloc-…) the instance takes as its public address, reserved beforehand and kept by `vm destroy`; empty for none."
+  type        = string
+  default     = ""
+}
+
+variable "image_id" {
+  description = "The image the VM boots from: the image module's, which `<short>-stow vm create` applies first."
+  type        = string
+}

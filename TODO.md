@@ -15,25 +15,7 @@ Found on three VMs made by `vm create --platform scaleway --create opentofu` fro
 (0.35.0, `fr-par-1`). The modules here are the ones the OpenTofu path's move publishes standalone,
 so each fix lands in them.
 
-1. **The Scaleway module allocates its own public address: none can be reserved**: the module
-   always creates its `scaleway_instance_ip` (`internal/install/tofu/scaleway/main.tf`), so a
-   stack whose first install needs its own public address, or another VM's (`--add-host`, fixed
-   at create), cannot be installed in one pass at an address. Give it an `ip_id` variable (an
-   existing flexible IP: the module then creates none and reads its address), so the addresses
-   are reserved first, as `--network static` does on the hypervisors; the other clouds' modules
-   checked for the same.
-2. **The disk is uploaded per VM and deleted by `vm destroy`, unlike the docs**: the object is a
-   resource of the VM's own state, keyed on the VM's name (`stowage/<name>-<hash>.qcow2`), its
-   snapshot and image following it, so two VMs of one release upload 2.5 GB twice and `vm
-   destroy` deletes it, while `docs/vm-create.md` says it is kept. Key it on the disk alone (its
-   digest), keep it across `vm destroy`, skip the upload when it is there with the same SHA-256,
-   and share the snapshot and image the same way; the docs say what the module does.
-3. **The security group opens the routes' ports to every source**: every `open_ports` rule takes
-   `0.0.0.0/0`, and only a whole `security_group_id` narrows it, so an admin route is held by the
-   stack's own allowlist alone. Carry the routes' `allow_input` values into the group's rules, as
-   the VM's own firewall applies them (recommended), or a variable for the sources (every source
-   by default).
-4. **"Already published … with other inputs" does not say what differs**: the refusal
+1. **"Already published … with other inputs" does not say what differs**: the refusal
    (`internal/publish/publish.go`) compares the release's inputs digest alone, while the per-node
    digests are computed (`internal/graph`), so finding that a version's changelog section was
    edited after the release took the registry's annotations, node by node. Name the nodes whose

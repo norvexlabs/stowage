@@ -1,47 +1,11 @@
-# One Scaleway instance of the release: its qcow2 image uploaded to Object Storage, imported as a
-# Block Storage snapshot, made an x86_64 image (UEFI), and an instance booted from it with the
-# cloud-config as its cloud-init user data, a routed public IPv4 address and, unless one is given,
-# a security group dropping what SSH from its sources and the opened ports leave. A preview: not
-# run on Scaleway yet.
+# One Scaleway instance of the release, booted from the image module's image (image/), with the
+# cloud-config as its cloud-init user data, a routed public IPv4 address (ip_id's, else its own)
+# and, unless one is given, a security group dropping what SSH from its sources and the opened
+# ports leave. A preview: not run on Scaleway yet.
 
-locals {
-  id = substr(var.image_sha256, 0, 12)
-}
-
-resource "scaleway_object" "image" {
-  bucket     = var.bucket
-  key        = "stowage/${var.name}-${local.id}.qcow2"
-  file       = var.image
-  hash       = var.image_sha256
-  visibility = "private"
-
-  timeouts {
-    create = "60m"
-  }
-}
-
-resource "scaleway_block_snapshot" "image" {
-  name = "${var.name}-${local.id}"
-
-  import {
-    bucket = scaleway_object.image.bucket
-    key    = scaleway_object.image.key
-  }
-
-  timeouts = {
-    create = "60m"
-  }
-}
-
-resource "scaleway_instance_image" "image" {
-  name           = "${var.name}-${local.id}"
-  root_volume_id = scaleway_block_snapshot.image.id
-  architecture   = "x86_64"
-}
-
-# The VM's own firewall narrows these again: SSH from its sources, the front's and the L4 routes'
-# ports from every source (a route's allowlist is the VM's own firewall's); replies and outbound
-# traffic pass.
+# The VM's own firewall narrows these again: SSH from its sources, the front's ports from every
+# source, an L4 route's from the sources its allowlist held at create (none when it was empty: no
+# rule then); replies and outbound traffic pass.
 resource "scaleway_instance_security_group" "vm" {
   count                   = var.security_group_id == "" ? 1 : 0
   name                    = var.name
@@ -61,25 +25,44 @@ resource "scaleway_instance_security_group" "vm" {
   }
 
   dynamic "inbound_rule" {
-    for_each = var.open_ports
+    for_each = flatten([for p in var.open_ports : [for s in p.sources : { protocol = p.protocol, port = p.port, source = s }]])
     content {
       action   = "accept"
       protocol = upper(inbound_rule.value.protocol)
       port     = inbound_rule.value.port
-      ip_range = "0.0.0.0/0"
+      ip_range = inbound_rule.value.source
     }
   }
 }
 
+# The instance's public address: the one ip_id names (reserved beforehand, kept by `vm destroy`),
+# else one made for it.
 resource "scaleway_instance_ip" "vm" {
-  type = "routed_ipv4"
+  count = var.ip_id == "" ? 1 : 0
+  type  = "routed_ipv4"
+}
+
+# A state holding the address made without its index keeps it.
+moved {
+  from = scaleway_instance_ip.vm
+  to   = scaleway_instance_ip.vm[0]
+}
+
+data "scaleway_instance_ip" "given" {
+  count = var.ip_id == "" ? 0 : 1
+  id    = var.ip_id
+}
+
+locals {
+  ip_id   = var.ip_id == "" ? scaleway_instance_ip.vm[0].id : data.scaleway_instance_ip.given[0].id
+  address = var.ip_id == "" ? scaleway_instance_ip.vm[0].address : data.scaleway_instance_ip.given[0].address
 }
 
 resource "scaleway_instance_server" "vm" {
   name              = var.name
   type              = var.instance_type
-  image             = scaleway_instance_image.image.id
-  ip_id             = scaleway_instance_ip.vm.id
+  image             = var.image_id
+  ip_id             = local.ip_id
   security_group_id = var.security_group_id == "" ? scaleway_instance_security_group.vm[0].id : var.security_group_id
 
   # Scaleway sizes volumes in GB (10^9 bytes), disk_gib is GiB: rounded up.

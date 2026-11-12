@@ -83,6 +83,19 @@ variable "open_ports" {
   type = list(object({
     protocol = string
     port     = number
+    # The sources the VM's own firewall lets reach it, as `vm create` knows them; every one by default.
+    sources = optional(list(string), ["0.0.0.0/0", "::/0"])
   }))
   default = []
+}
+
+variable "ip_id" {
+  description = "A flexible IP of the zone (routed IPv4, its ID) the instance takes, reserved beforehand and kept by `vm destroy`; empty for one made with the VM."
+  type        = string
+  default     = ""
+}
+
+variable "image_id" {
+  description = "The image the VM boots from: the image module's, which `<short>-stow vm create` applies first."
+  type        = string
 }

@@ -71,6 +71,9 @@ func (f *fakeTofu) Run(_ context.Context, c Cmd) ([]byte, error) {
 	case "show":
 		return []byte(f.show), nil
 	case "output":
+		if c.Args[len(c.Args)-1] == "image_id" { // an image module's one output
+			return []byte(`"image-` + filepath.Base(dir) + `"` + "\n"), nil
+		}
 		if f.outputs == "" {
 			return []byte(`{"id": {"value": "7", "type": "string"}}`), nil
 		}

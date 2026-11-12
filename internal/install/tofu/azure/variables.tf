@@ -87,3 +87,14 @@ variable "ssh_public_key" {
   description = "The administrator's SSH public key: the same as vm create's --ssh-key."
   type        = string
 }
+
+variable "public_ip_name" {
+  description = "A public IP address of the resource group (Standard, static, by its name) the VM takes, reserved beforehand and kept by `vm destroy`; empty for one made with the VM."
+  type        = string
+  default     = ""
+}
+
+variable "image_id" {
+  description = "The image the VM boots from: the image module's, which `<short>-stow vm create` applies first."
+  type        = string
+}

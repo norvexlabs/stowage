@@ -1482,8 +1482,14 @@ every shape, the VM end-to-end test upgrading through it), then the health gate.
   `firewall` variable, off by default: creating firewall rules takes a role that may change every
   rule of the project, which a deployment account is often refused; while it is off, `vm create`
   warns, naming the ports the network must open; while it is on, the SSH rule takes IPv4 sources
-  alone, as the instance has no IPv6 address, and sources all IPv6 are warned: no rule is made); the VM's
-  own stays the one that applies each L4 route's allowlist. The route's service is on the host's
+  alone, as the instance has no IPv6 address, and sources all IPv6 are warned: no rule is made).
+  `open_ports` carries each L4 route's allowlist as `vm create` is given it, so the platform's
+  rule is narrowed too (defence in depth: an admin route is not held by the VM's firewall alone);
+  the rule is fixed at create, as no later run of Stowage applies the module, so the VM's own
+  firewall stays the one that follows a re-run's allowlist, and a narrower platform rule then
+  fails closed. A cloud's disk image is a state of its own (the module's `image/`), keyed on the
+  disk's digest and its place, so VMs of one disk share one upload and `vm destroy` of one leaves
+  it for the next: an image is the release's, not a VM's. The route's service is on the host's
   network, so its traffic meets the input chain, which drops by default: the allowlist is an
   input rule under /run, and a boot drops the port until the install's start writes it again
   (fail closed), though Docker restarts the service before that start. A bind address is a

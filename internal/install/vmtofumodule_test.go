@@ -60,6 +60,37 @@ func TestEveryBuiltInModuleHoldsTheContract(t *testing.T) {
 				t.Errorf("%s: its lock file is not of %s %s", p.Key, pin[1], pin[2])
 			}
 		}
+		// An image module declares the image's variables and others of the VM module alone (given
+		// its values), outputs image_id, which the VM module takes, and pins the same providers.
+		img, err := imageFiles(p.Key)
+		if err != nil {
+			t.Fatalf("%s: %v", p.Key, err)
+		}
+		if clouds := []string{"aws", "azure", "gcp", "scaleway"}; (img != nil) != slices.Contains(clouds, p.Key) {
+			t.Errorf("%s: an image module %v", p.Key, img != nil)
+		}
+		if img != nil {
+			ivars, err := moduleVars(img)
+			if err != nil {
+				t.Fatalf("%s image: %v", p.Key, err)
+			}
+			for _, n := range imageVars {
+				if !declares(ivars, n) {
+					t.Errorf("%s image: no variable %s", p.Key, n)
+				}
+			}
+			for _, v := range ivars {
+				if !slices.Contains(imageVars, v.Name) && !declares(platformVars(vars, false), v.Name) {
+					t.Errorf("%s image: variable %s is none of the VM module's own", p.Key, v.Name)
+				}
+			}
+			if !strings.Contains(string(img["outputs.tf"]), `output "image_id" {`) || !declares(vars, "image_id") {
+				t.Errorf("%s: the image module's image_id is not the VM module's", p.Key)
+			}
+			if string(img[".terraform.lock.hcl"]) != lock || string(img["versions.tf"]) != string(files["versions.tf"]) {
+				t.Errorf("%s image: its versions or lock are not the VM module's", p.Key)
+			}
+		}
 		if p.Preview != (p.Key != "truenas") {
 			t.Errorf("%s: preview %v", p.Key, p.Preview)
 		}
@@ -86,10 +117,97 @@ func TestTheScalewayModule(t *testing.T) {
 	}
 	main := string(files["main.tf"])
 	for _, want := range []string{"cloud-init = file(var.seed)", `inbound_default_policy  = "drop"`, `count                   = var.security_group_id == "" ? 1 : 0`,
-		"ignore_changes = [image, user_data]", `volume_type = "sbs_volume"`, "size_in_gb  = ceil(var.disk_gib * 1.073741824)", `architecture   = "x86_64"`} {
+		"ignore_changes = [image, user_data]", `volume_type = "sbs_volume"`, "size_in_gb  = ceil(var.disk_gib * 1.073741824)", "image             = var.image_id"} {
 		if !strings.Contains(main, want) {
 			t.Errorf("main.tf lacks %q", want)
 		}
+	}
+}
+
+// Each cloud's module takes an address reserved beforehand, making none of its own then, and
+// gives it as its address.
+func TestTheCloudModulesTakeAReservedAddress(t *testing.T) {
+	t.Parallel()
+	for key, want := range map[string][]string{
+		"scaleway": {`count = var.ip_id == "" ? 1 : 0`, `ip_id             = local.ip_id`, "data.scaleway_instance_ip.given[0].address", "value       = local.address", `variable "ip_id"`},
+		"aws":      {`count         = var.eip_allocation_id == "" ? 0 : 1`, "allocation_id = var.eip_allocation_id", "data.aws_eip.given[0].public_ip", `variable "eip_allocation_id"`},
+		"azure":    {`count               = var.public_ip_name == "" ? 1 : 0`, "public_ip_address_id          = local.public_ip_id", "data.azurerm_public_ip.given[0].ip_address", "value       = local.address", `variable "public_ip_name"`},
+		"gcp":      {`nat_ip = var.nat_ip == "" ? null : var.nat_ip`, `variable "nat_ip"`},
+	} {
+		files, err := moduleFiles(key, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		all := string(files["main.tf"]) + string(files["outputs.tf"]) + string(files["variables.tf"])
+		for _, w := range want {
+			if !strings.Contains(all, w) {
+				t.Errorf("%s lacks %q", key, w)
+			}
+		}
+	}
+}
+
+// A cloud's disk is made an image by its image module, applied first in a state the VMs of that
+// disk in one place share: a second VM finds it there, another bucket gets its own, the VM's
+// module boots the image_id it gave, and `vm destroy` leaves it.
+func TestTheCloudImageIsSharedAndKeptByDestroy(t *testing.T) {
+	t.Parallel()
+	v := newVMCreate(t, "qcow2")
+	r := newTofuRun(t)
+	delete(r.vars, "TRUENAS_URL")
+	r.tofu.outputs = `{"id": {"value": "1"}, "address": {"value": "192.0.2.7"}}`
+	images := filepath.Join(r.state, "notes", "images")
+	create := func(host, bucket string) string {
+		t.Helper()
+		r.tofu.calls = nil
+		c := VMCreate{Platform: "scaleway", Create: CreateTofu, Hostname: host, User: "ops", Ctl: "/opt/notes-stow", Wait: 5 * time.Second,
+			Vars: map[string]string{"zone": "fr-par-1", "bucket": bucket}}
+		if err := v.create(c, r.mod(nil)); err != nil {
+			t.Fatalf("%v\n%s", err, v.log)
+		}
+		var dirs []string
+		for _, c := range r.tofu.calls {
+			if dir, ok := strings.CutPrefix(c[0], "-chdir="); ok && len(c) > 1 && c[1] == "apply" {
+				dirs = append(dirs, dir)
+			}
+		}
+		if len(dirs) != 2 || filepath.Dir(dirs[0]) != images || dirs[1] != filepath.Join(r.state, "notes", "vms", host) {
+			t.Fatalf("applied %q: want the image's state, then the VM's", dirs)
+		}
+		ivars := readVars(t, dirs[0])
+		if ivars["name"] != "notes" || ivars["zone"] != "fr-par-1" || ivars["bucket"] != bucket || ivars["image_sha256"] == nil || ivars["ssh_sources"] != nil {
+			t.Errorf("the image module's variables: %v", ivars)
+		}
+		if got := readVars(t, dirs[1])["image_id"]; got != "image-"+filepath.Base(dirs[0]) {
+			t.Errorf("the VM's image_id %v", got)
+		}
+		return dirs[0]
+	}
+	first := create("notes-1", "b")
+	if !strings.HasPrefix(filepath.Base(first), "scaleway-") {
+		t.Errorf("the image's state %s", first)
+	}
+	if again := create("notes-2", "b"); again != first {
+		t.Errorf("a second VM of the disk applied %s, not the shared %s", again, first)
+	}
+	if other := create("notes-3", "c"); other == first {
+		t.Errorf("another bucket shares %s", first)
+	}
+	r.tofu.calls = nil
+	in := v.installer(r.mod(nil))
+	if err := in.DestroyVM(context.Background(), &VMDestroy{Host: "notes-1", Yes: true, Ctl: "/opt/notes-stow"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range r.tofu.calls {
+		if strings.HasPrefix(c[0], "-chdir="+images) {
+			t.Errorf("vm destroy ran %q on the image", c)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(first, varsFile)); err != nil {
+		t.Errorf("the image's state after vm destroy: %v", err)
+	}
+	if !strings.Contains(v.out2(), "The disk's image stays, for the next VM of it: each state in "+images+" holds one") {
+		t.Errorf("out:\n%s", v.out2())
 	}
 }
 
@@ -284,7 +402,8 @@ func TestVMCreateWithABuiltInPreviewModule(t *testing.T) {
 func TestTheGCPModuleIsGivenSSHsSourcesAndTheOpenedPorts(t *testing.T) {
 	t.Parallel()
 	v := newVMCreate(t, "gce")
-	v.r.Spec.L4.Routes = append(v.r.Spec.L4.Routes, spec.L4Route{Name: "dns", Protocol: "udp", Port: 5353})
+	v.r.Spec.L4.Routes = append(v.r.Spec.L4.Routes, spec.L4Route{Name: "dns", Protocol: "udp", Port: 5353, AllowInput: "DNS_SOURCES"})
+	v.r.Spec.Inputs = append(v.r.Spec.Inputs, spec.Input{Key: "DNS_SOURCES", Default: "192.0.2.0/24"})
 	r := newTofuRun(t)
 	delete(r.vars, "TRUENAS_URL")
 	r.tofu.outputs = `{"id": {"value": "1"}, "address": {"value": "192.0.2.7"}}`
@@ -297,11 +416,14 @@ func TestTheGCPModuleIsGivenSSHsSourcesAndTheOpenedPorts(t *testing.T) {
 	if got := fmt.Sprint(vars["ssh_sources"]); got != "[198.51.100.40/32]" {
 		t.Errorf("ssh_sources %s", got)
 	}
+	if !strings.Contains(v.log.String(), "l4 route dns: the module's rule for udp/5353 takes the sources DNS_SOURCES holds now; a later change of DNS_SOURCES on the VM does not reach it") {
+		t.Errorf("not told the rule is fixed:\n%s", v.log)
+	}
 	// The public address is no route's source behind a NAT: not compared with it.
 	if strings.Contains(v.log.String(), "--ssh-allow leaves out") {
 		t.Errorf("warned:\n%s", v.log)
 	}
-	if got := fmt.Sprint(vars["open_ports"]); got != "[map[port:80 protocol:tcp] map[port:443 protocol:tcp] map[port:5353 protocol:udp]]" {
+	if got := fmt.Sprint(vars["open_ports"]); got != "[map[port:80 protocol:tcp sources:[0.0.0.0/0 ::/0]] map[port:443 protocol:tcp sources:[0.0.0.0/0 ::/0]] map[port:5353 protocol:udp sources:[192.0.2.0/24]]]" {
 		t.Errorf("open_ports %s", got)
 	}
 	// No firewall rule unless asked: the network's own rules are the operator's to open.
@@ -319,7 +441,7 @@ func TestTheGCPModuleIsGivenSSHsSourcesAndTheOpenedPorts(t *testing.T) {
 		t.Fatalf("%v\n%s", err, v.log)
 	}
 	vars = readVars(t, filepath.Join(r.state, "notes", "vms", "notes-1"))
-	if got := fmt.Sprint(vars["ssh_sources"], vars["open_ports"]); got != "[0.0.0.0/0 ::/0] [map[port:8080 protocol:tcp] map[port:8443 protocol:tcp]]" {
+	if got := fmt.Sprint(vars["ssh_sources"], vars["open_ports"]); got != "[0.0.0.0/0 ::/0] [map[port:8080 protocol:tcp sources:[0.0.0.0/0 ::/0]] map[port:8443 protocol:tcp sources:[0.0.0.0/0 ::/0]]]" {
 		t.Errorf("variables %s", got)
 	}
 	if vars["firewall"] != "true" || strings.Contains(v.log.String(), "no firewall rule") {

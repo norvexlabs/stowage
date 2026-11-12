@@ -2,6 +2,7 @@ package install
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -210,6 +211,23 @@ func TestTheModulesPortsAreWhatServesOnThem(t *testing.T) {
 	}
 	if got := ports(""); len(got) != 3 || got[0].Port != 80 || got[1].Port != 443 {
 		t.Errorf("no mode given: %v", got)
+	}
+}
+
+// An L4 route's port is opened to what its allowlist holds as vm create gives it: the value given,
+// else the input's default; none for an empty list or no list (the VM's firewall refuses every
+// source then), every source for a secret one, which vm create is not given.
+func TestTheModulesPortsTakeTheRoutesAllowlists(t *testing.T) {
+	t.Parallel()
+	in := &Installer{R: testRelease(t, "1.0.0")}
+	in.R.Spec.Front = spec.Front{}
+	in.R.Spec.Inputs = append(in.R.Spec.Inputs, spec.Input{Key: "GIVEN"}, spec.Input{Key: "DEFAULTED", Default: "192.0.2.0/24"},
+		spec.Input{Key: "EMPTY"}, spec.Input{Key: "SECRET", Secret: true})
+	in.R.Spec.L4.Routes = []spec.L4Route{{Name: "given", Protocol: "tcp", Port: 1, AllowInput: "GIVEN"}, {Name: "defaulted", Protocol: "udp", Port: 2, AllowInput: "DEFAULTED"},
+		{Name: "empty", Protocol: "tcp", Port: 3, AllowInput: "EMPTY"}, {Name: "none", Protocol: "tcp", Port: 4}, {Name: "secret", Protocol: "tcp", Port: 5, AllowInput: "SECRET"}}
+	got := fmt.Sprint(in.openedPorts(&Settings{TLS: "none", Inputs: map[string]string{"GIVEN": "198.51.100.0/24, 2001:db8::/32", "EMPTY": ""}}))
+	if want := "[{tcp 1 [198.51.100.0/24 2001:db8::/32]} {udp 2 [192.0.2.0/24]} {tcp 3 []} {tcp 4 []} {tcp 5 [0.0.0.0/0 ::/0]}]"; got != want {
+		t.Errorf("ports %s\nwant  %s", got, want)
 	}
 }
 

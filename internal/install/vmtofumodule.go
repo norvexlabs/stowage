@@ -25,7 +25,11 @@ import (
 // answers, when the platform tells; empty otherwise).
 var (
 	contractVars = []string{"name", "description", "disk_gib", "image", "image_sha256", "seed", "seed_sha256"}
-	optionalVars = []string{"cpus", "memory_mib", "image_format", "dhcp", "admin_user", "ssh_public_key", "nics"}
+	optionalVars = []string{"cpus", "memory_mib", "image_format", "dhcp", "admin_user", "ssh_public_key", "nics", "image_id"}
+	// imageVars are the variables `vm create` writes for a built-in image module (imageRoot): the
+	// project's name and a description, the image and its SHA-256. It declares these, and any
+	// other is a variable of the VM's module, given the VM module's value.
+	imageVars = []string{"name", "description", "image", "image_sha256"}
 	// truenasVars are the TrueNAS module's own variables, which its flags give.
 	truenasVars = []string{"insecure_skip_verify", "pool", "parent_dataset", "nic_attach"}
 )
@@ -138,17 +142,9 @@ func hclCode(line string) string {
 func moduleFiles(platform, dir string) (map[string][]byte, error) {
 	files := map[string][]byte{}
 	if dir == "" {
-		root := path.Join("tofu", platform)
-		entries, err := fs.ReadDir(tofuModules, root)
+		files, err := embeddedModule(path.Join("tofu", platform))
 		if err != nil {
 			return nil, fmt.Errorf("no built-in OpenTofu module for %s", platform)
-		}
-		for _, e := range entries {
-			b, err := fs.ReadFile(tofuModules, path.Join(root, e.Name()))
-			if err != nil {
-				return nil, err
-			}
-			files[e.Name()] = b
 		}
 		return files, nil
 	}
@@ -169,6 +165,38 @@ func moduleFiles(platform, dir string) (map[string][]byte, error) {
 		return nil, fmt.Errorf("--module %s: no *.tf or *.tf.json file", dir)
 	}
 	return files, nil
+}
+
+// embeddedModule reads the files of the built-in module in root, not its subdirectories.
+func embeddedModule(root string) (map[string][]byte, error) {
+	entries, err := fs.ReadDir(tofuModules, root)
+	if err != nil {
+		return nil, err
+	}
+	files := map[string][]byte{}
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		if files[e.Name()], err = fs.ReadFile(tofuModules, path.Join(root, e.Name())); err != nil {
+			return nil, err
+		}
+	}
+	return files, nil
+}
+
+// imageRoot is the subdirectory of a cloud's built-in module holding its image module: the disk
+// uploaded and made an image, in a state of its own that every VM of that disk in one place shares
+// and `vm destroy` keeps (imageState). Its output image_id is the VM module's variable image_id.
+const imageRoot = "image"
+
+// imageFiles are the files of platform's built-in image module; nil when it has none.
+func imageFiles(platform string) (map[string][]byte, error) {
+	files, err := embeddedModule(path.Join("tofu", platform, imageRoot))
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, nil
+	}
+	return files, err
 }
 
 // checkContract refuses a module that does not declare a variable of the contract, and a variable
@@ -264,6 +292,20 @@ func (in *Installer) tofuOutputs(ctx context.Context, dir, ctl string) (id, addr
 		addr = strings.TrimSpace(a)
 	}
 	return id, addr, nil
+}
+
+// tofuOutput is the applied module's output name, a string that is not empty.
+func (in *Installer) tofuOutput(ctx context.Context, dir, ctl, name string) (string, error) {
+	env := append(in.O.environ(), CtlVar+"="+ctl, "TF_IN_AUTOMATION=1", "TF_INPUT=0")
+	out, err := in.O.Tofu.Run(ctx, Cmd{Args: []string{"-chdir=" + dir, "output", "-json", "-no-color", name}, Env: env})
+	if err != nil {
+		return "", fmt.Errorf("tofu output %s: %w", name, err)
+	}
+	var v string
+	if err := json.Unmarshal(out, &v); err != nil || strings.TrimSpace(v) == "" {
+		return "", fmt.Errorf("tofu output %s: %q is not a string that is not empty", name, bytes.TrimSpace(out))
+	}
+	return strings.TrimSpace(v), nil
 }
 
 // readPlatform reads what a VM's state directory records of its platform; a state from before it

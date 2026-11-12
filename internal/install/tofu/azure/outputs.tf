@@ -4,5 +4,5 @@ output "id" {
 
 output "address" {
   description = "Its public address."
-  value       = azurerm_public_ip.vm.ip_address
+  value       = local.address
 }

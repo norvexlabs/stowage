@@ -4,5 +4,5 @@ output "id" {
 
 output "address" {
   description = "Its public IPv4 address."
-  value       = scaleway_instance_ip.vm.address
+  value       = local.address
 }
