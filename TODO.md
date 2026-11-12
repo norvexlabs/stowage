@@ -9,19 +9,6 @@ A finished item is deleted, not ticked. The plan behind it is
 
 Batched by the gate they share: a batch is one slice, one review, one gate run.
 
-### Installer
-
-1. **`updates` on Docker and Kubernetes**: only the VM's installer has `updates` (each release the
-   channel offers after the running one, with its changelog). On Docker and Kubernetes the
-   installer is one release's binary and has no way to say a newer one exists: an operator learns
-   of it only by pulling the installer's `:latest` again, and a stale local copy of that image
-   silently answers with an old release. Offer `<short>-stow updates [--channel C] [--version V]`
-   on the Docker shape and `<short>-stow k8s updates` on Kubernetes, with the VM's output and code
-   path (one listing and rendering, not a second one): the channel pointer and the release
-   manifests read from the install's recorded registry (a mirror and its `--registry-ca`, the
-   operator's own registry sign-in where the mirror asks for one), their signatures checked against
-   the release keys as `upgrade --version` checks them; nothing newer is said so.
-
 ### Features — pull credentials
 
 1. **A pull credential per install**: issued at install time by what the `registry.pull` provider
@@ -629,6 +616,13 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
   installers, the payload appended to each; needed before the provider's Kubernetes target ships.
 
 ## Could
+
+- **Docker and Kubernetes `updates`, its edges**: (a) a release on the install's channel published
+  without an installer is said `no upgrade on …` with no reason; (b) a refusal handing the run to
+  the kept installer of another short name (`sameProject`) names `the same arguments`, which an
+  installer from before `updates` does not take, and keptInstaller's failure names a rollback;
+  (c) without `--version` it scans every release tag (findRelease) after reading the pointer, as
+  `upgrade --version` does — read only the pointer's version's revisions.
 
 - **e2e-vm's SSH over IPv6 times out now and then**: the VM has its global address and its IPv6
   default route, yet this host's SSH to it times out (`no SSH over IPv6 to …`); 2 runs of 4 on

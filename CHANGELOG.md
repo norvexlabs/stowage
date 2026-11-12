@@ -3,6 +3,17 @@
 Stowage's own releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
+## [0.36.0]
+
+### Added
+
+- `<short>-stow updates` on Docker and `k8s updates` on Kubernetes say which release the channel
+  offers after the one the install runs (or `--version V`'s latest revision), with its changelog,
+  or that there is none: read from the install's registry (a mirror with its CA, the operator's
+  Docker login where the mirror asks for one), signed by a key the install trusts, as on the VM.
+  They name what `upgrade --version` installs: the latest revision of the channel's version, and
+  another channel's release only shown. `--json` prints the VM's `updates` object.
+
 ## [0.35.0] - 2026-11-12
 
 ### Added

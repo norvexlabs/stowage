@@ -1427,23 +1427,7 @@ func (in *Installer) K8sUpgradeTo(ctx context.Context, v string, args []string) 
 		return err
 	}
 	name, r := cur.Release.Name, cur.Release
-	// The keys of the installer run, narrowed to those the release's values list when they list
-	// any: an installer of an earlier release does not bring back a key a later one dropped, and
-	// values (which an operator's --values can set) never add a key. An installer with none does
-	// not upgrade a release whose values list some.
-	keys := in.R.Keys
-	if listed := listedKeys(cur.PublicKeys); len(listed) > 0 {
-		keys = map[string][]byte{}
-		for n, k := range in.R.Keys {
-			if listed[strings.TrimSpace(string(k))] {
-				keys[n] = k
-			}
-		}
-		if len(keys) == 0 {
-			return refuse("run the installer of the release it runs, or a later one", "release %s in %s trusts signing keys this %s does not carry: run the installer of the release it runs, or a later one", k.Release, k.Namespace, in.R.Ctl())
-		}
-	}
-	trust, err := trusted("this installer", keys)
+	trust, err := in.k8sTrust(cur)
 	if err != nil {
 		return err
 	}

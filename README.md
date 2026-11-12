@@ -87,7 +87,7 @@ sh notes.sh
 | **Publish** | developer, CI | `stowage ship` builds what changed, pushes it by digest, signs it, builds the installer and the release manifest, then moves the channel's pointer. `verify`, `promote` (beta → stable without rebuilding), `yank`, `prune`, `releases`. `stowage hook install` ships each version bump on commit. |
 | **Install** | operator | `docker run --rm <prefix>/<name>-installer:latest > <name>.sh` gets the bootstrap script, which carries the installer, `<short>-stow`; then `sh <name>.sh` on Docker; `sh <name>.sh k8s install` on Kubernetes; `sh <name>.sh vm create` for a VM (seed ISO or cloud user-data, or the VM created with OpenTofu: TrueNAS; libvirt, Proxmox VE, vSphere, AWS, Google Cloud, Azure and Scaleway as previews; or a module of your own). Inputs asked once, secrets generated once, provision hook run, portal URL printed. |
 | **Operate** | operator | `status`, a re-run to change inputs, ports or the TLS mode (the changes logged, the previous values kept), `provision`, `secrets rotate` (stage, swap, finish: the old value accepted meanwhile), `secrets set` (a chosen value for a `settable` secret), `secrets show` (a `settable` secret's value, on a terminal), `secrets export` (age-encrypted, to rebuild a machine), `reset-db`. |
-| **Upgrade** | operator | `upgrade --version V` fetches that release's installer, checks its signature against the keys the install trusts and brings the stack up on the new images — on Docker after a `pg_dump` snapshot, on Kubernetes through Helm. On the VM, `updates` lists what the channel offers and `upgrade` reboots into the new OS. |
+| **Upgrade** | operator | `upgrade --version V` fetches that release's installer, checks its signature against the keys the install trusts and brings the stack up on the new images — on Docker after a `pg_dump` snapshot, on Kubernetes through Helm. `updates` says which release the channel offers after the one the install runs, signed by a key it trusts, with its changelog (or that there is none) — on Docker, on Kubernetes (`k8s updates`) and on the VM, where `upgrade` reboots into the new OS. |
 | **Roll back** | operator | `rollback` returns to the previous release — unless a migration since then is a rollback barrier your schema-compat provider reports, in which case it refuses and names it. On the VM the health gate does it alone: an upgraded boot that is not healthy in time falls back to the previous system. |
 | **Recover** | operator | On the VM: scheduled and pre-upgrade backups (`pg_dump` and the volumes the project lists, or those volumes alone for a project without a database, encrypted to age keys, uploaded with rclone to any rclone remote), `restore` into a side database swapped in once loaded whole, and a disaster recovery from exported secrets. |
 | **Disconnected sites** | operator | `mirror export` carries a release, signatures included, as one file; `mirror import` loads it into a local registry; installs and upgrades then read the mirror (`--registry`, `--registry-ca`). |
@@ -149,6 +149,7 @@ sh notes.sh                                   # the form: TLS mode, domains, inp
 sh notes.sh --no-input --tls internal \
    --domains app=notes.lan,api=api.notes.lan --set ADMIN_EMAIL=ops@example.com   # the same, unattended
 ./notes/notes-stow status
+./notes/notes-stow updates          # the release the channel offers after this one
 ./notes/notes-stow upgrade --version 1.1.0
 ./notes/notes-stow rollback
 ```
@@ -212,8 +213,8 @@ Every command, verb and flag is described in the reference page each line links.
 
 | Shape | Verbs | Reference |
 |---|---|---|
-| Docker | install and re-run, `status`, `describe`, `ps`, `logs`, `restart`/`stop`/`start`, `exec`, `schema`, `provision`, `upgrade` (`--version`), `rollback`, `reset-db`, `uninstall`, `secrets export`/`rotate`/`set`/`show`, `backup`, `restore`, `disk-check`, `tune`, `script`, `audit`, `sbom export` | [docs/installer.md](docs/installer.md), [docs/host.md](docs/host.md), [docs/tuning.md](docs/tuning.md) |
-| Kubernetes | `k8s install`, `status`, `upgrade` (`--version`), `rollback`, `reset-db`, `uninstall`, `provision`, `secrets rotate`/`show`, `tune` | [docs/kubernetes.md](docs/kubernetes.md) |
+| Docker | install and re-run, `status`, `describe`, `ps`, `logs`, `restart`/`stop`/`start`, `exec`, `schema`, `provision`, `updates`, `upgrade` (`--version`), `rollback`, `reset-db`, `uninstall`, `secrets export`/`rotate`/`set`/`show`, `backup`, `restore`, `disk-check`, `tune`, `script`, `audit`, `sbom export` | [docs/installer.md](docs/installer.md), [docs/host.md](docs/host.md), [docs/tuning.md](docs/tuning.md) |
+| Kubernetes | `k8s install`, `status`, `updates`, `upgrade` (`--version`), `rollback`, `reset-db`, `uninstall`, `provision`, `secrets rotate`/`show`, `tune` | [docs/kubernetes.md](docs/kubernetes.md) |
 | Creating a VM | `vm create`, `vm seed`, `vm host-key`, `vm attach`, `vm destroy` | [docs/vm-create.md](docs/vm-create.md) |
 | On the Kairos VM | `install`, `status`, `describe`, `health`, `events`, `ps`, `logs`, `restart`/`stop`/`start`, `exec`, `provision`, `updates`, `upgrade`, `rollback`, `reset-db`, `network`, `backup`, `restore`, `secrets export`/`rotate`/`set`/`show`, `host-key`, `tune`, `reboot`, `shutdown` | [docs/vm.md](docs/vm.md) |
 | Every shape | `kit create`/`check` (`k8s kit`, `vm kit`), `mirror export`/`import` | [docs/kits.md](docs/kits.md), [docs/mirror.md](docs/mirror.md) |

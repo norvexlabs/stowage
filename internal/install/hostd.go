@@ -27,7 +27,6 @@ import (
 
 	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/name"
-	v1 "github.com/google/go-containerregistry/pkg/v1"
 
 	"github.com/norvexlabs/stowage/internal/lint"
 	"github.com/norvexlabs/stowage/internal/payload"
@@ -367,7 +366,11 @@ type Update struct {
 	// whose boot fell back, a later one than the OS's.
 	Installed *Version `json:"installed,omitempty"`
 	// Passive: the VM runs the passive system, whose release `upgrade --version` finds to rewrite.
-	Passive   bool   `json:"passive,omitempty"`
+	Passive bool `json:"passive,omitempty"`
+	// Follows is the channel the install follows, set on Docker and Kubernetes when --channel
+	// named another and the target there comes after the current release: `upgrade --version`
+	// reads the install's channel alone, so the target is not available.
+	Follows   string `json:"follows,omitempty"`
 	Changelog string `json:"changelog,omitempty"`
 }
 
@@ -1453,40 +1456,9 @@ func (h *Hostd) target(ctx context.Context, in *Installer, env *EnvFile, channel
 	if err != nil {
 		return nil, "", err
 	}
-	var m *release.Manifest
-	if v != "" {
-		m, err = findRelease(ctx, c, prefix, h.R.Spec.Name, channel, v, trust, in.O.logf)
-	} else {
-		repo := prefix + "/" + h.R.Spec.Name + "-release"
-		var d v1.Hash
-		m, d, err = readRelease(ctx, c, repo, channel)
-		if err == nil && m == nil {
-			err = fmt.Errorf("the channel %s has no release in %s", channel, prefix)
-		}
-		if err == nil {
-			var r name.Repository
-			if r, err = c.Repo(repo); err == nil {
-				err = checkSigned(ctx, c, r, d, m, trust)
-			}
-		}
-		// A pointer left on a publication its tag no longer holds (yanked or rebuilt since; the
-		// old one stays validly signed) is no pointer, as the publisher reads it.
-		if err == nil && m.Yanked != nil {
-			err = refuse("choose another release with --version: the channel's is yanked", "the channel %s's release %s is yanked: %s", channel, m.Tag, m.Yanked.Reason)
-		}
-		if err == nil {
-			var td v1.Hash
-			var tm *release.Manifest
-			if tm, td, err = readRelease(ctx, c, repo, m.Tag); err == nil && (tm == nil || td != d) {
-				err = fmt.Errorf("the channel %s's pointer names %s, which its tag no longer holds: the channel is being changed, try again later", channel, m.Tag)
-			}
-		}
-	}
+	m, err := channelTarget(ctx, c, prefix, h.R.Spec.Name, channel, v, trust, in.O.logf)
 	if err != nil {
 		return nil, "", failAs(http.StatusBadGateway, err)
-	}
-	if m.Name != h.R.Spec.Name || m.Channel != channel {
-		return nil, "", fail(http.StatusBadGateway, "the release found is %s's on %s, not %s's on %s", m.Name, m.Channel, h.R.Spec.Name, channel)
 	}
 	return m, channel, nil
 }
@@ -1494,18 +1466,7 @@ func (h *Hostd) target(ctx context.Context, in *Installer, env *EnvFile, channel
 // after reports whether m comes after the release the OS carries, by the scheme m records; a
 // `command` scheme, which the daemon does not run, orders by revision within one version only.
 func (h *Hostd) after(m *release.Manifest) (bool, error) {
-	cur := h.R.Manifest
-	c, err := compareTo(m, cur.ProjectVersion)
-	if err != nil {
-		return false, err
-	}
-	if m.Scheme.Provider == "command" && m.ProjectVersion != cur.ProjectVersion {
-		return true, nil
-	}
-	if c == 0 {
-		return m.Revision > cur.Revision, nil
-	}
-	return c < 0, nil
+	return laterRelease(m, h.R.Manifest.ProjectVersion, h.R.Manifest.Revision)
 }
 
 func (h *Hostd) updates(w http.ResponseWriter, r *http.Request) {

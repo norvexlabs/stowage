@@ -13,6 +13,8 @@ the current directory. A release with no chart (published without the shape) is 
                        [--answers FILE] [--given FILE|- | --kit FILE|- [--kit-code-file FILE]]
                        [--no-input] [--accessible] [--timeout 10m] [--dry-run] [--no-provision]
                        [--unsafe-sysctls[=false]] [--json]
+<short>-stow k8s updates  [--namespace NS] [--release R] [--kube-context C] [--channel C] [--version V]
+          [--image-registry PREFIX] [--registry-ca FILE] [--json]      # the release upgrade --version would move to
 <short>-stow k8s upgrade  [the same flags; --timeout 6m]                 # the NEW release's installer
 <short>-stow k8s upgrade --version V [the same flags, but --given, --kit] # fetches V's installer
 <short>-stow k8s rollback [--namespace NS] [--release R] [--kube-context C] [--revision N] [--timeout 6m] [--dry-run] [--json]
@@ -199,6 +201,20 @@ the current directory. A release with no chart (published without the shape) is 
   against it (already on it: a note; later: refused, naming `rollback`; a `pending-…` release is
   refused first, as `upgrade` refuses it), then fetches V's
   installer into `./.stowage-next-<random>/` and runs its `k8s upgrade` with the other flags given.
+- `updates` says which release `upgrade --version` would move the release to, as the Docker
+  shape's `updates` does ([installer](installer.md)): the latest revision of the version the
+  channel's pointer names (the channel the release's values record, or `--channel C`), or with
+  `--version V` V's latest revision on it,
+  read from the registry the release records (or `--image-registry`; `--registry-ca` its CA, the
+  Docker client's login for its host where it asks for one) and refused unless it is signed by a
+  key `upgrade --version` trusts (the installer's, narrowed to those the values list). It prints
+  `<release> on <channel>: release R in NS runs <release>` with the changelog, or `no upgrade on
+  <channel>: release R in NS runs <release>, the release found is <release>`, another channel's
+  release shown, never offered (`release R in NS follows <channel>: \`k8s upgrade --version\`
+  moves it on <channel> alone`); `--json` the same object
+  as Docker's. No helm release there is refused with the missing release's refusal of every verb
+  (exit 3, no object printed), and a `pending-…` release as `upgrade` refuses it. It changes
+  nothing.
 - `rollback` refuses a `pending-…` release, as `upgrade` does, then runs `helm rollback <release>
   <N> --wait --timeout <T>` and prints what the release runs then. Without `--revision N` (a
   negative one is refused) it reads `helm history`: a release uninstalled with its history kept

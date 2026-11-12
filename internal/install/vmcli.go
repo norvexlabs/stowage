@@ -958,7 +958,13 @@ func (c *hostClient) updates(ctx context.Context, channel, version string) (Upda
 	return u, err
 }
 
-func printUpdate(w io.Writer, u Update) {
+// printUpdate is the VM's `updates`: printUpdateOf for the release this OS carries.
+func printUpdate(w io.Writer, u Update) { printUpdateOf(w, u, "this OS", "upgrade") }
+
+// printUpdateOf prints u, the release an upgrade of what runs (the VM's OS, a Docker install, a
+// helm release) would install, or that there is none to, every shape's `updates` alike; upgrade
+// is the shape's upgrade verb.
+func printUpdateOf(w io.Writer, u Update, runs, upgrade string) {
 	switch {
 	case u.Passive && u.Installed != nil && *u.Installed != u.Current && !u.Available:
 		defer fmt.Fprintf(w, "the install runs %s, which this OS (%s) does not carry: `upgrade --version %s` writes its OS\n", *u.Installed, u.Current, u.Installed.Version)
@@ -969,15 +975,18 @@ func printUpdate(w io.Writer, u Update) {
 		fmt.Fprintf(w, "no upgrade on %s: the install went back from %s, and the boot does not upgrade to it again: a new revision of %s is the way forward\n", u.Channel, u.Target, u.Target.Version)
 		return
 	}
+	if u.Follows != "" {
+		defer fmt.Fprintf(w, "%s follows %s: `%s --version` moves it on %s alone\n", runs, u.Follows, upgrade, u.Follows)
+	}
 	if !u.Available {
-		fmt.Fprintf(w, "no upgrade on %s: this OS runs %s, the release found is %s\n", u.Channel, u.Current, u.Target)
+		fmt.Fprintf(w, "no upgrade on %s: %s runs %s, the release found is %s\n", u.Channel, runs, u.Current, u.Target)
 		return
 	}
 	if u.Rewrite {
 		fmt.Fprintf(w, "%s on %s: the VM runs it from the passive system (a boot that failed went back to it); an upgrade writes it to the active slot again\n", u.Target, u.Channel)
 		return
 	}
-	fmt.Fprintf(w, "%s on %s: this OS runs %s\n", u.Target, u.Channel, u.Current)
+	fmt.Fprintf(w, "%s on %s: %s runs %s\n", u.Target, u.Channel, runs, u.Current)
 	if u.Changelog != "" {
 		fmt.Fprintf(w, "\n%s\n", strings.TrimSpace(u.Changelog))
 	}
