@@ -38,6 +38,35 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
    every other install pulling; an install without one keeps the baked account. Not in 0.35.0
    (user, 2026-11-11): (a) needs a `registry.pull` mint operation per registry, an issuing
    credential, revocation and a fallback.
+2. **A VM reads a mirror that asks for a sign-in**: Docker and Kubernetes installs read an
+   authenticated mirror with the operator's Docker login (`--image-pull-login` writing the cluster's
+   pull Secret), but a VM pulls from its mirror by itself and its settings carry only `registry`
+   and `registry_ca` (`vm create`, `vm seed` and the install's re-runs alike), so a mirror that
+   refuses anonymous reads cannot serve a VM. Carry a mirror login to the VM the way its secrets
+   go: after the boot, over SSH (never in the seed's cloud-config), recorded on the VM like a
+   secret, used for that mirror's host alone (the release's pull account never sent there), kept
+   through upgrades and rollbacks, replaced by a re-run; `status --json` says a login is held,
+   never its value. Options: (a) a `--registry-login-file` (Docker config `auths` entry) on
+   `vm create`, the VM's `install`, and `vm seed --await-secrets` waiting for it (recommended: one
+   format the provider already writes); (b) `--registry-user` plus the password on standard input.
+
+### VM creation — the OpenTofu path moves out of Stowage
+
+1. **`vm create --create opentofu` gives way to the OpenTofu provider and standalone modules**:
+   Stowage runs `tofu` itself there (its own state of the VM, beside any root the operator keeps),
+   while the provider (`terraform-provider-stowage`) creates the same VM from an operator's root
+   with `stowage_vm_seed` and these modules. Stowage stays the core and never depends on the
+   provider: (1) publish the VM modules (`internal/install/tofu/*`) as standalone, versioned
+   OpenTofu modules the provider's examples and quickstarts call; (2) the VM suites make their
+   VMs from `vm seed --json` and a test root of their own (as the provider's `acc-vm` does), never
+   through the provider; (3) remove `--create opentofu`, `--module`, `--tofu-var`, `vm destroy` and
+   the hypervisor side of `vm attach` (a NIC becomes the root's change), `vm create --kit` becoming
+   the provider's flow; `vm seed`, `vm create --create manual` and every verb on the VM stay. The
+   cloud images `ship` registers (`internal/cloud`) stay: they are the publisher's side. Options:
+   (a) the steps above (recommended); (b) also a `vm root` verb printing a ready root (provider +
+   module) for an operator with no IaC of their own, Stowage never running `tofu`; (c) keep
+   `vm create` as is beside the provider (two owners of a VM's state). No compatibility until 1.0.
+
 ### Supply chain — stopgaps back to canonical
 
 1. **Check every stopgap at each release, and drop each one the upstream has caught up with**:
