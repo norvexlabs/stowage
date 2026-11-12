@@ -128,8 +128,12 @@ type VMCreate struct {
 	TuneProfile string
 	// Secrets is a decrypted SecretsFile the first install takes (a machine made again): given over
 	// SSH, never in the cloud-config.
-	Secrets  []byte
-	Progress func(done, total int64) // the disk's download; nil reports nothing
+	Secrets []byte
+	// RegistryLogin is a login file for the mirror (--registry-login-file), a Docker config
+	// holding one auths entry for its host: given over SSH once the VM answers (`registry-login
+	// -`), never in the cloud-config.
+	RegistryLogin []byte
+	Progress      func(done, total int64) // the disk's download; nil reports nothing
 
 	Create string // CreateTofu or CreateManual; empty is asked where OpenTofu can create the VM
 	TofuVM
@@ -160,6 +164,10 @@ func (in *Installer) CreateVM(ctx context.Context, c *VMCreate) error {
 		return err
 	}
 	boot := in.boot
+	login, err := in.createLogin(c.RegistryLogin, prefix)
+	if err != nil {
+		return err
+	}
 	p, format, err := in.platform(ctx, c.Platform)
 	if err != nil {
 		return err
@@ -280,7 +288,9 @@ func (in *Installer) CreateVM(ctx context.Context, c *VMCreate) error {
 	}
 	// What is given goes over SSH to a host key known beforehand: one generated here, which the
 	// cloud-config carries and the VM serves until its install.
-	userData, hostKey, err := in.seedUserData(p, &mach, st, ca, st.AwaitSecrets)
+	// What goes over SSH goes to the host key the cloud-config carries, never to a key taken on
+	// first sight.
+	userData, hostKey, err := in.seedUserData(p, &mach, st, ca, st.AwaitSecrets || login != nil)
 	if err != nil {
 		return err
 	}
@@ -389,6 +399,37 @@ func (in *Installer) CreateVM(ctx context.Context, c *VMCreate) error {
 			}
 			return err
 		}
+		if login != nil {
+			o.logf("giving the VM its login to %s over SSH", login.Host)
+			raw, err := login.marshal()
+			if err != nil {
+				return err
+			}
+			args := pinnedSSHArgs(pin, mach.User, addr, c.SSHKey, "sudo", ctl, "registry-login", "-")
+			if _, err := o.SSH.Run(ctx, Cmd{Args: args, Stdin: bytes.NewReader(raw), Stream: o.Log}); err != nil {
+				then := ""
+				switch {
+				case given != nil:
+					then = "; then its install waits for what `vm create` gives: " + giveAgain() // it ends on the seed key's note
+				case st.AwaitSecrets && len(waiting) > 0:
+					then = fmt.Sprintf("; then its install waits for its secrets and %s: %s", strings.Join(waiting, ", "), secretsSteps(mach.User, addr, ctl))
+				case st.AwaitSecrets:
+					then = "; then its install waits for its secrets: " + secretsSteps(mach.User, addr, ctl)
+				case len(waiting) > 0:
+					then = fmt.Sprintf("; then its install waits for %s: ssh -t %s@%s sudo %s install", strings.Join(waiting, ", "), mach.User, addr, ctl)
+				}
+				note := ""
+				if n := strings.TrimSpace(seedHostKeyNote(hostKey, addr)); given == nil && n != "" {
+					note = ". " + n
+				}
+				return fmt.Errorf("giving the VM its login to %s over SSH: %w; the VM is kept: %s, then `ssh %s@%s %s status` says whether it holds it%s%s", login.Host, err, loginSteps(mach.User, addr, ctl), mach.User, addr, ctl, then, note)
+			}
+			// The last step over SSH retires the seed's one-time host key: the install's, when one
+			// follows.
+			if given == nil && !st.AwaitSecrets {
+				in.retireSeedHostKey(ctx, state, pin, mach, addr, c.SSHKey)
+			}
+		}
 		if given != nil {
 			raw, err := marshalGiven(given)
 			if err != nil {
@@ -446,6 +487,12 @@ func (in *Installer) CreateVM(ctx context.Context, c *VMCreate) error {
 			fmt.Fprintf(o.Out, "    %s  %s  on %s\n", i.Role, i.MAC, on)
 		}
 	}
+	if login != nil {
+		fmt.Fprintf(o.Out, "\nIts reads of the mirror %s take the login --registry-login-file gave, which the cloud-config never carries: once it answers, %s\n", login.Host, loginSteps(mach.User, "<address>", ctl))
+		if given == nil && !st.AwaitSecrets {
+			fmt.Fprint(o.Out, seedHostKeyNote(hostKey, "<address>"))
+		}
+	}
 	if given != nil {
 		if err := writeGiven(givenFile, givenPin, given, hostKey); err != nil {
 			return err
@@ -471,6 +518,38 @@ func (in *Installer) CreateVM(ctx context.Context, c *VMCreate) error {
 		fmt.Fprintf(o.Out, "The install waits for %s, which the cloud-config never carries: ssh %s@<address> sudo %s install\n", strings.Join(waiting, ", "), mach.User, ctl)
 	}
 	return nil
+}
+
+// createLogin checks vm create's --registry-login-file, raw (nil: none), against the mirror at
+// prefix the VM reads: its one entry must be for that host, and the VM must boot this release's
+// own disk — a first boot of another release's disk reads that release's OS from the mirror before
+// the login reaches it over SSH.
+func (in *Installer) createLogin(raw []byte, prefix string) (*registryLogin, error) {
+	if raw == nil {
+		return nil, nil
+	}
+	if len(raw) > maxRegistryLogin {
+		return nil, fmt.Errorf("--registry-login-file is over %d KiB: one entry is a few hundred bytes", maxRegistryLogin>>10)
+	}
+	l, err := parseRegistryLogin(raw)
+	if err != nil {
+		return nil, fmt.Errorf("--registry-login-file: %w", err)
+	}
+	if in.O.Registry == "" || prefix == in.R.Spec.Registry.Prefix {
+		return nil, refuse("give --registry, the mirror the login is for, or leave out --registry-login-file", "--registry-login-file is a mirror's login: the VM reads %s, the release's own registry, with its pull account", in.R.Spec.Registry.Prefix)
+	}
+	if h := registryHost(prefix); !strings.EqualFold(l.Host, h) {
+		return nil, fmt.Errorf("--registry-login-file: the login is for %s, but the VM reads its mirror %s at %s: give an auths entry for %s", l.Host, prefix, h, h)
+	}
+	if m := in.R.Manifest; in.boot.release != m.Tag {
+		return nil, fmt.Errorf("--registry-login-file: the VM would boot %s's disk set, and its first boot reads %s's OS bundle from the mirror before the login reaches it over SSH: give the mirror %s's own disk set (`mirror export --disks`, then `mirror import`), or use a mirror that reads without a sign-in", in.boot.release, m.Tag, m.Tag)
+	}
+	return &l, nil
+}
+
+// loginSteps tells how to give a VM its login to the mirror by hand, from the login file FILE.
+func loginSteps(user, addr, ctl string) string {
+	return fmt.Sprintf("ssh %s@%s sudo %s registry-login - < FILE", user, addr, ctl)
 }
 
 // seedable refuses a release a VM's seed cannot be written for: one that publishes no OS bundle,

@@ -75,6 +75,8 @@ func (f *fakeHost) Run(_ context.Context, c Cmd) ([]byte, error) {
 			return []byte("LoadState=loaded\nActiveState=active\n"), nil
 		case noBootUnit:
 			return []byte("LoadState=not-found\nActiveState=inactive\n"), nil
+		case "queued": // inactive, its start queued
+			return []byte("LoadState=loaded\nActiveState=inactive\nJob=42\n"), nil
 		}
 		return []byte("LoadState=loaded\nActiveState=" + st + "\n"), nil
 	}

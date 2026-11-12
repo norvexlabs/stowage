@@ -77,6 +77,9 @@ const (
 	verdictHealthy       = "healthy"
 	verdictWentBack      = "went_back"
 	verdictKeptUnhealthy = "kept_unhealthy"
+	// verdictNotInstalled: the boot held no install when the gate ran (a first install given
+	// over SSH after it): nothing was judged.
+	verdictNotInstalled = "not_installed"
 )
 
 // Event is one entry of the journal. Seq, At and Kind are always set; the other fields are the
@@ -108,6 +111,11 @@ type Event struct {
 	Verdict  string `json:"verdict,omitempty"`
 	// Kept is why a boot found unhealthy keeps running: going back is refused, or impossible.
 	Kept string `json:"kept,omitempty"`
+	// Reboots, on a boot.judged, is whether the gate reboots now: true only when it goes back by
+	// rebooting into the passive system; false when nothing reboots (a verdict that keeps the
+	// boot, or a went_back left to the next boot). A reboot that fails is a second boot.judged of
+	// the same boot, its reboots false and its error why.
+	Reboots *bool `json:"reboots,omitempty"`
 	// Reboot, on a job's end, is the reboot or power-off the job scheduled as its last step.
 	Reboot *EventReboot `json:"reboot,omitempty"`
 }
@@ -162,6 +170,11 @@ type journalState struct {
 	Dropped int64 `json:"dropped"` // every entry up to it is gone
 	// Boot is the boot id the last boot.started carried: kept through a rotation that drops it.
 	Boot string `json:"boot,omitempty"`
+	// Judged is the last boot.judged, kept through a rotation that drops it: the status reads a
+	// boot's verdict here. Judges marks a state its writer keeps Judged in: without it (a writer
+	// that does not keep one), the verdict is read off the journal.
+	Judged *Event `json:"judged,omitempty"`
+	Judges bool   `json:"judges,omitempty"`
 }
 
 func (j *journal) path() string      { return filepath.Join(j.dir, EventsFile) }
@@ -222,12 +235,29 @@ func (j *journal) update(read bool, f func(held []Event) []Event) (int64, error)
 		if e.Kind == evBootStarted && e.BootID != "" {
 			st.Boot = e.BootID
 		}
+		if e.Kind == evBootJudged {
+			judged := e
+			st.Judged = &judged
+		}
 		line, err := json.Marshal(e)
 		if err != nil {
 			return 0, err
 		}
 		buf.Write(line)
 		buf.WriteByte('\n')
+	}
+	if !st.Judges {
+		// The verdict this state holds from now on: the journal's last, which a writer that did
+		// not keep it may have written.
+		if held == nil {
+			if held, err = j.read(); err != nil {
+				return 0, err
+			}
+		}
+		if st.Judged == nil {
+			st.Judged = stateOf(held).Judged
+		}
+		st.Judges = true
 	}
 	if err := j.writeState(st); err != nil {
 		return 0, err
@@ -320,6 +350,10 @@ func stateOf(held []Event) journalState {
 		st.Last = max(st.Last, e.Seq)
 		if e.Kind == evBootStarted && e.BootID != "" {
 			st.Boot = e.BootID
+		}
+		if e.Kind == evBootJudged {
+			judged := e
+			st.Judged = &judged
 		}
 	}
 	if len(held) > 0 {
@@ -452,6 +486,42 @@ func recoverEvents(held []Event, boot *Event) []Event {
 		out = append(out, Event{Kind: evRebootCancelled, Action: sched.Action, By: sched.By, Reason: cancelledByRestart})
 	}
 	return out
+}
+
+// lastJudged is the last boot.judged, when it is of the boot id (lastOf's).
+func (j *journal) lastJudged(id string) (*Event, error) {
+	_, e, err := j.lastOf(id)
+	return e, err
+}
+
+// lastOf is, in one read under the shared lock, the journal's last entry number and its last
+// boot.judged when it is of the boot id: the state's alone when its writer keeps the verdict
+// (Judges), the journal read only for a state that does not, or none.
+func (j *journal) lastOf(id string) (int64, *Event, error) {
+	if !fileExists(j.statePath()) && !fileExists(j.path()) {
+		return 0, nil, nil
+	}
+	unlock, err := flockWait(j.statePath(), false)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer unlock()
+	st, ok := j.readState()
+	if !ok || !st.Judges {
+		held, err := j.read()
+		if err != nil {
+			return 0, nil, err
+		}
+		of := stateOf(held)
+		if !ok {
+			st = of
+		}
+		st.Judged = cmp.Or(st.Judged, of.Judged)
+	}
+	if e := st.Judged; e != nil && sameBoot(e.BootID, id) {
+		return st.Last, e, nil
+	}
+	return st.Last, nil, nil
 }
 
 // sameBoot and otherBoot tell two boot ids name one boot, or two: only ids both read decide
@@ -730,6 +800,9 @@ func printEvent(w io.Writer, e Event) {
 		field("on_trial", strconv.FormatBool(*e.OnTrial))
 	}
 	field("verdict", e.Verdict)
+	if e.Reboots != nil {
+		field("reboots", strconv.FormatBool(*e.Reboots))
+	}
 	field("boot_id", e.BootID)
 	field("reason", e.Reason)
 	field("kept", e.Kept)

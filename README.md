@@ -216,7 +216,7 @@ Every command, verb and flag is described in the reference page each line links.
 | Docker | install and re-run, `status`, `describe`, `ps`, `logs`, `restart`/`stop`/`start`, `exec`, `schema`, `provision`, `updates`, `upgrade` (`--version`), `rollback`, `reset-db`, `uninstall`, `secrets export`/`rotate`/`set`/`show`, `backup`, `restore`, `disk-check`, `tune`, `script`, `audit`, `sbom export` | [docs/installer.md](docs/installer.md), [docs/host.md](docs/host.md), [docs/tuning.md](docs/tuning.md) |
 | Kubernetes | `k8s install`, `status`, `updates`, `upgrade` (`--version`), `rollback`, `reset-db`, `uninstall`, `provision`, `secrets rotate`/`show`, `tune` | [docs/kubernetes.md](docs/kubernetes.md) |
 | Creating a VM | `vm create`, `vm seed`, `vm host-key`, `vm attach`, `vm destroy` | [docs/vm-create.md](docs/vm-create.md) |
-| On the Kairos VM | `install`, `status`, `describe`, `health`, `events`, `ps`, `logs`, `restart`/`stop`/`start`, `exec`, `provision`, `updates`, `upgrade`, `rollback`, `reset-db`, `network`, `backup`, `restore`, `secrets export`/`rotate`/`set`/`show`, `host-key`, `tune`, `reboot`, `shutdown` | [docs/vm.md](docs/vm.md) |
+| On the Kairos VM | `install`, `status`, `describe`, `health`, `events`, `ps`, `logs`, `restart`/`stop`/`start`, `exec`, `provision`, `updates`, `upgrade`, `rollback`, `reset-db`, `network`, `backup`, `restore`, `secrets export`/`rotate`/`set`/`show`, `host-key`, `registry-login`, `tune`, `reboot`, `shutdown` | [docs/vm.md](docs/vm.md) |
 | Every shape | `kit create`/`check` (`k8s kit`, `vm kit`), `mirror export`/`import` | [docs/kits.md](docs/kits.md), [docs/mirror.md](docs/mirror.md) |
 
 **For programs**: `describe --json`, `status --json` and `--json` on every verb that changes an

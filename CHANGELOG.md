@@ -14,6 +14,19 @@ follow [SemVer](https://semver.org/).
   They name what `upgrade --version` installs: the latest revision of the channel's version, and
   another channel's release only shown. `--json` prints the VM's `updates` object.
 
+- The VM's `status --json` tells when a boot has settled (`boot_settled`: the boot and its health
+  gate ran to an end) and gives the health gate's verdict on that boot (`boot_judged`), which
+  records whether the gate reboots: a program following an upgrade or a rollback reads the status
+  alone, and a gate that ended without a verdict, or a fallback whose reboot never comes, is told
+  at once. The `boot.judged` event carries `reboots` too, and a reboot that fails is a second
+  verdict saying so.
+- A VM reads a mirror that asks for a sign-in: `vm create --registry-login-file FILE` (a Docker
+  config holding one `auths` entry for the mirror's host) gives the login over SSH once the VM
+  answers, never in the cloud-config, and `sudo <short>-stow registry-login FILE|-` on the VM
+  records or replaces it (`--remove` removes it). It is kept through upgrades and rollbacks, used
+  for the mirror's host alone, and `status --json` says a login is held (`registry_login`, the
+  host), never its value. `vm seed --registry-login-file` checks it and names its host in the seed.
+
 ### Changed
 
 - A handoff's `run` and `check` may list a file input or a secret delivered as a file

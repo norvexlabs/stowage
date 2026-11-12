@@ -3338,11 +3338,16 @@ func (in *Installer) pullConfig(prefix string) ([]string, func(), error) {
 }
 
 // pullAccount is the project's pull account on its own registry: the password from the
-// environment, else the one baked into the installer. The token is empty for public images, a
-// mirror (the operator logs in to it) or a password nothing gives.
+// environment, else the one baked into the installer. On a mirror it is the login the VM holds
+// for the mirror's host (mirrorLogin), never the pull account. The token is empty for public
+// images, a mirror the operator logs in to (off the VM, or a VM holding no login for it) or a
+// password nothing gives.
 func (in *Installer) pullAccount(prefix string) (user, token string, err error) {
+	if prefix != in.R.Spec.Registry.Prefix {
+		return in.mirrorLogin(prefix)
+	}
 	p := in.R.Spec.Registry.Pull
-	if p.Name != "token" || prefix != in.R.Spec.Registry.Prefix {
+	if p.Name != "token" {
 		return "", "", nil
 	}
 	c, err := providers.Token(p)

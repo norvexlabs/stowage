@@ -240,6 +240,14 @@ func TestAGateWithNoInstallClearsATrialOnly(t *testing.T) {
 			if strings.Contains(fmt.Sprint(host.calls()), "reboot") {
 				t.Error("rebooted")
 			}
+			// The verdict says nothing was judged, or that marking the switched OS good failed.
+			verdict, trial := verdictNotInstalled, c.cleared
+			if failing {
+				verdict, trial = verdictWentBack, true
+			}
+			if j := ofKind(held(t, e.dir), evBootJudged); len(j) != 1 || j[0].Verdict != verdict || j[0].OnTrial == nil || *j[0].OnTrial != trial || j[0].Reboots == nil || *j[0].Reboots {
+				t.Errorf("verdict %+v, want %s on trial %v", j, verdict, trial)
+			}
 		})
 	}
 }
@@ -685,12 +693,12 @@ func TestTheGateReadsItsBootOnceItCan(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	g.judged(false, verdictHealthy, "", "") // no id yet
+	g.judged(false, verdictHealthy, "", "", false) // no id yet
 	write("boot-1")
 	g.boot.next = time.Time{} // the retry's wait passed
-	g.judged(false, verdictHealthy, "", "")
+	g.judged(false, verdictHealthy, "", "", false)
 	write("boot-2")
-	g.judged(false, verdictHealthy, "", "")
+	g.judged(false, verdictHealthy, "", "", false)
 	var ids []string
 	for _, ev := range ofKind(held(t, g.In.O.Dir), evBootJudged) {
 		ids = append(ids, ev.BootID)
