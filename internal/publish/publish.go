@@ -642,9 +642,12 @@ func (p *Publisher) Ship(ctx context.Context, o ShipOptions) (*Ref, error) {
 		return nil, err
 	}
 	relNode, _ := g.Node(graph.KindRelease)
-	// A promotion builds nothing: what its release was built with is recorded already.
+	// A promotion builds nothing: it carries what its release was built with.
 	untracked := ""
-	if !o.NoBuild {
+	switch {
+	case o.Promoted != nil:
+		untracked = o.Promoted.Untracked
+	case !o.NoBuild:
 		if untracked, err = p.untracked(); err != nil {
 			return nil, err
 		}

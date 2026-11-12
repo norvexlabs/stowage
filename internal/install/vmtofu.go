@@ -660,9 +660,10 @@ func (in *Installer) applyImage(ctx context.Context, ctl string, p Platform, var
 	if err != nil {
 		return err
 	}
-	m := in.R.Manifest
+	// The disk's own words alone: a release sharing the disk with another describes it the same,
+	// so the image is never made again for it.
 	ivars := map[string]any{"name": in.R.Spec.Name, "image": image, "image_sha256": imageSHA,
-		"description": fmt.Sprintf("%s %s (revision %d)'s disk, shared by the VMs %s vm create makes of it", in.R.Spec.Name, m.ProjectVersion, m.Revision, in.R.Ctl())}
+		"description": fmt.Sprintf("%s's disk %s, shared by the VMs vm create makes of it", in.R.Spec.Name, imageSHA[:min(12, len(imageSHA))])}
 	for _, v := range declared {
 		if _, set := ivars[v.Name]; !set && vars[v.Name] != nil {
 			ivars[v.Name] = vars[v.Name]

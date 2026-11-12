@@ -222,7 +222,7 @@ func Detect(p *project.Project, r Repo) (Decision, error) {
 func (r Repo) StagedDir(id string) string { return filepath.Join(r.Dir(), "untracked", id) }
 
 // Stage copies each of files (paths relative to the working tree's top level, each a regular file
-// or absent: an absent one is skipped) into StagedDir(id), byte for byte, its executable bit kept.
+// or absent: an absent one is skipped) into StagedDir(id), byte for byte, its permission bits kept.
 // What an earlier run staged for id is replaced.
 func (r Repo) Stage(id string, files []string) error {
 	if !objectID.MatchString(id) {
@@ -237,7 +237,7 @@ func (r Repo) Stage(id string, files []string) error {
 		if _, err := os.Lstat(src); errors.Is(err, os.ErrNotExist) {
 			continue
 		}
-		if err := copyFile(src, filepath.Join(dir, filepath.FromSlash(f))); err != nil {
+		if err := copyFile(src, filepath.Join(dir, filepath.FromSlash(f)), 0o700); err != nil {
 			return fmt.Errorf("stage %s: %w", f, err)
 		}
 	}
@@ -265,7 +265,7 @@ func (r Repo) Unstage(id, top string) ([]string, error) {
 		if _, err := os.Lstat(dst); err == nil {
 			return fmt.Errorf("untracked %s: the commit records it, so the working tree's copy is not taken", filepath.ToSlash(rel))
 		}
-		if err := copyFile(p, dst); err != nil {
+		if err := copyFile(p, dst, 0o755); err != nil {
 			return err
 		}
 		copied = append(copied, filepath.ToSlash(rel))
@@ -274,9 +274,9 @@ func (r Repo) Unstage(id, top string) ([]string, error) {
 	return copied, err
 }
 
-// copyFile copies the regular file src to dst (its directories made), its executable bit kept,
-// never through a symbolic link at either end.
-func copyFile(src, dst string) error {
+// copyFile copies the regular file src to dst, its permission bits kept (the inputs digest reads
+// them), its missing directories made with dirMode, never through a symbolic link at either end.
+func copyFile(src, dst string, dirMode os.FileMode) error {
 	in, err := os.Open(src)
 	if err != nil {
 		return err
@@ -289,14 +289,10 @@ func copyFile(src, dst string) error {
 	if l, err := os.Lstat(src); err != nil || !l.Mode().IsRegular() || !fi.Mode().IsRegular() {
 		return fmt.Errorf("%s is not a regular file", src)
 	}
-	if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
+	if err := os.MkdirAll(filepath.Dir(dst), dirMode); err != nil {
 		return err
 	}
-	mode := os.FileMode(0o644)
-	if fi.Mode()&0o111 != 0 {
-		mode = 0o755
-	}
-	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode)
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, fi.Mode().Perm())
 	if err != nil {
 		return err
 	}
@@ -304,5 +300,8 @@ func copyFile(src, dst string) error {
 		out.Close()
 		return err
 	}
-	return out.Close()
+	if err := out.Close(); err != nil {
+		return err
+	}
+	return os.Chmod(dst, fi.Mode().Perm()) // the umask left out
 }

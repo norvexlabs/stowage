@@ -1599,10 +1599,19 @@ func TestShipTakesTheUntrackedFiles(t *testing.T) {
 	if !strings.Contains(e.log.String(), "image api: untracked api/blob.bin "+sum) {
 		t.Errorf("not logged:\n%s", e.log)
 	}
-	p, _ := e.publisher()
-	got, err := p.readRelease(context.Background(), r.Manifest.Tag)
+	pub, _ := e.publisher()
+	got, err := pub.readRelease(context.Background(), r.Manifest.Tag)
 	if err != nil || got.Untracked != `{"api/api/blob.bin":"`+sum+`"}` {
 		t.Fatalf("recorded %q: %v", got.Untracked, err)
+	}
+	// A promotion builds nothing, and carries the record of what its release was built with.
+	p, v := e.publisher()
+	promoted, err := p.Promote(context.Background(), v, "stable", "beta", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := p.readRelease(context.Background(), promoted.Manifest.Tag); err != nil || got.Untracked != `{"api/api/blob.bin":"`+sum+`"}` {
+		t.Fatalf("promoted record %q: %v", got.Untracked, err)
 	}
 	testutil.Write(t, e.root, "api/blob.bin", "made again")
 	if _, err := e.ship("stable", 1); err == nil || !strings.Contains(err.Error(), "with other inputs (image/api: file, untracked;") {

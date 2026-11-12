@@ -408,17 +408,27 @@ func TestStageAndUnstage(t *testing.T) {
 	if err := testutil.WriteExecutable(filepath.Join(top, "bin", "tool"), []byte("#!/bin/sh\n")); err != nil {
 		t.Fatal(err)
 	}
-	if err := r.Stage(id, []string{"bin/tool", "gone.bin"}); err != nil {
+	testutil.Write(t, top, "etc/private.key", "k")
+	if err := os.Chmod(filepath.Join(top, "etc", "private.key"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Stage(id, []string{"bin/tool", "etc/private.key", "gone.bin"}); err != nil {
 		t.Fatal(err)
 	}
 	co := t.TempDir()
 	copied, err := r.Unstage(id, co)
-	if err != nil || strings.Join(copied, ",") != "bin/tool" {
+	if err != nil || strings.Join(copied, ",") != "bin/tool,etc/private.key" {
 		t.Fatalf("unstage: %v %q", err, copied)
 	}
 	fi, err := os.Stat(filepath.Join(co, "bin", "tool"))
 	if b, _ := os.ReadFile(filepath.Join(co, "bin", "tool")); err != nil || string(b) != "#!/bin/sh\n" || fi.Mode().Perm() != 0o755 {
 		t.Fatalf("copy: %v %q", err, b)
+	}
+	if fi, err := os.Stat(filepath.Join(co, "etc", "private.key")); err != nil || fi.Mode().Perm() != 0o600 {
+		t.Fatalf("its mode: %v %v", err, fi)
+	}
+	if fi, err := os.Stat(filepath.Join(co, "etc")); err != nil || fi.Mode().Perm() != 0o755 {
+		t.Fatalf("a directory made in the checkout: %v %v", err, fi)
 	}
 	if _, err := r.Unstage(id, co); err == nil || !strings.Contains(err.Error(), "untracked bin/tool: the commit records it") {
 		t.Fatalf("a path the checkout holds: %v", err)
