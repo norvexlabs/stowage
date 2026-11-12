@@ -347,6 +347,9 @@ func (r Repo) Sweep(id string, now time.Time) error {
 		gone := other == id
 		if !gone {
 			fi, err := e.Info()
+			if errors.Is(err, os.ErrNotExist) {
+				continue // removed meanwhile
+			}
 			if err != nil {
 				errs = append(errs, err)
 				continue

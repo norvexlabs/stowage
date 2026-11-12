@@ -461,9 +461,10 @@ func (in *Installer) openedPorts(st *Settings) []modulePort {
 // knows them, and whether they are its allowlist's: every source for a route without an
 // allowlist or one the front terminates TLS on (the front filters its own port), and for an
 // allowlist whose value is not known here (a secret input, given over SSH; one the spec does not
-// declare); else its input's value in the settings, or its default, as the VM's firewall reads it
-// (familySources: each a network's prefix, an IPv4-mapped address as IPv4, one another holds left
-// out) — none when the list is empty, which the VM's firewall refuses too. A platform's rules made
+// declare; one the install refuses); else its input's value in the settings, or its default, as
+// the VM's firewall reads it (familySources: each a network's prefix, an IPv4-mapped address as
+// IPv4, one another holds left out), sorted by family — none when the list is empty, which the
+// VM's firewall refuses too. A platform's rules made
 // from them are fixed at create: a later change of the list on the VM does not reach them.
 func (in *Installer) routeSources(st *Settings, r spec.L4Route) (sources []string, listed bool) {
 	i := slices.IndexFunc(in.R.Spec.Inputs, func(i spec.Input) bool { return i.Key == r.AllowInput })
@@ -476,7 +477,13 @@ func (in *Installer) routeSources(st *Settings, r spec.L4Route) (sources []strin
 	case !given:
 		v = in.R.Spec.Inputs[i].Default
 	}
+	// A list the install refuses is no list a platform takes: every source, left to it.
+	if checkSources(v) != nil {
+		return everySource, false
+	}
 	v4, v6 := familySources(v)
+	slices.Sort(v4)
+	slices.Sort(v6)
 	return append(append([]string{}, v4...), v6...), true
 }
 

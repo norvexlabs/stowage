@@ -182,3 +182,20 @@ func TestSourcesAtARevision(t *testing.T) {
 		}
 	}
 }
+
+// A version file the commit records as a link is read through it, as a checkout reads it, from a
+// project in a subdirectory.
+func TestSourceAtReadsThroughALink(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	write(t, dir, "shared/VERSION", "3.1.0\n", 0o644)
+	write(t, dir, "sub/README", "x\n", 0o644)
+	if err := os.Symlink("../shared/VERSION", filepath.Join(dir, "sub", "VERSION")); err != nil {
+		t.Fatal(err)
+	}
+	testutil.GitRepo(t, dir)
+	file, _ := NewSource(filepath.Join(dir, "sub"), spec.Provider{Name: "file"})
+	if v, err := file.(RevisionSource).At("HEAD"); err != nil || v != "3.1.0" {
+		t.Errorf("through the link: %q %v", v, err)
+	}
+}

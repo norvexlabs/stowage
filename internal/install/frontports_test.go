@@ -233,6 +233,18 @@ func TestTheModulesPortsTakeTheRoutesAllowlists(t *testing.T) {
 	if want := "[{tcp 1 [198.51.100.0/24 203.0.113.5/32 203.0.113.9/32 2001:db8::/32]} {udp 2 [192.0.2.0/24]} {tcp 3 []} {tcp 4 [0.0.0.0/0 ::/0]} {tcp 5 [0.0.0.0/0 ::/0]}]"; got != want {
 		t.Errorf("ports %s\nwant  %s", got, want)
 	}
+	// A list the install refuses is left to it: every source; one set in another order, the same.
+	in.R.Spec.Inputs = append(in.R.Spec.Inputs, spec.Input{Key: "BAD", Default: "not-an-address"})
+	in.R.Spec.L4.Routes[1].AllowInput = "BAD"
+	if got := fmt.Sprint(in.openedPorts(&Settings{TLS: "none"})[1]); got != "{udp 2 [0.0.0.0/0 ::/0]}" {
+		t.Errorf("a refused list: %s", got)
+	}
+	in.R.Spec.L4.Routes[1].AllowInput = "DEFAULTED"
+	a := fmt.Sprint(in.openedPorts(&Settings{TLS: "none", Inputs: map[string]string{"GIVEN": "203.0.113.0/24, 198.51.100.0/24"}})[0])
+	b := fmt.Sprint(in.openedPorts(&Settings{TLS: "none", Inputs: map[string]string{"GIVEN": "198.51.100.0/24, 203.0.113.0/24"}})[0])
+	if a != b {
+		t.Errorf("the order of a list: %s, %s", a, b)
+	}
 	// Another mode than loopback: the front serves the route it terminates TLS on, its sources its own.
 	got = fmt.Sprint(in.openedPorts(&Settings{TLS: "internal", Inputs: map[string]string{"GIVEN": "", "EMPTY": ""}})[5])
 	if want := "{tcp 6 [0.0.0.0/0 ::/0]}"; got != want {

@@ -484,4 +484,27 @@ func TestSweep(t *testing.T) {
 			t.Errorf("%s staged %v, want %v", id, err == nil, want)
 		}
 	}
+	// Every entry is tried: one that cannot be removed is told, and the others go.
+	if os.Geteuid() == 0 {
+		return // root removes what any mode keeps
+	}
+	stuck, other := strings.Repeat("c", 40), strings.Repeat("d", 40)
+	for _, id := range []string{stuck, other} {
+		if err := r.Stage(id, []string{"a.txt"}); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(r.StagedDir(id), now.Add(-8*24*time.Hour), now.Add(-8*24*time.Hour)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Chmod(r.StagedDir(stuck), 0o500); err != nil { // a directory
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(r.StagedDir(stuck), 0o700) })
+	if err := r.Sweep(shipped, now); err == nil {
+		t.Error("an entry left, and no error")
+	}
+	if _, err := os.Stat(r.StagedDir(other)); err == nil {
+		t.Error("the entry after one that failed was not tried")
+	}
 }

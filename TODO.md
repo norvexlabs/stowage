@@ -116,6 +116,12 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
 
 ## Should
 
+- **`-f`'s spec path is resolved through the working tree's links, not the commit's**: a hook
+  ship (`specInRepo`) resolves the spec's path with the working tree's current symbolic links,
+  then reads it at the commit; a link the next commit changed before a queued ship runs makes it
+  read another path at the commit than the checkout follows (refused as not committed, or another
+  spec). Keep the path as written and let the commit's links resolve it (`gitcmd.FileAt`).
+
 - **Machine interface** ([DESIGN § 6](docs/DESIGN.md#machine-interface--the-installer-read-by-programs)),
   one slice each, in this order; each useful to CI scripts alone, and the base of the OpenTofu
   provider below:

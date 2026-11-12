@@ -448,4 +448,29 @@ func TestHookShipTakesTheUntrackedFilesOfTheCommit(t *testing.T) {
 	if _, err := os.Stat(r.StagedDir(head)); !os.IsNotExist(err) {
 		t.Errorf("the staged files are left: %v", err)
 	}
+	// A stale entry that cannot be removed is warned after the release, which stands.
+	if os.Geteuid() == 0 {
+		return // root removes what any mode keeps
+	}
+	stuck := strings.Repeat("e", 40)
+	if err := r.Stage(stuck, nil); err != nil {
+		t.Fatal(err)
+	}
+	testutil.Write(t, r.StagedDir(stuck), "f", "x")
+	old := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+	if err := os.Chtimes(r.StagedDir(stuck), old, old); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(r.StagedDir(stuck), 0o500); err != nil { // a directory
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(r.StagedDir(stuck), 0o700) })
+	testutil.Write(t, root, "api/blob.bin", "made elsewhere")
+	if _, _, l, err := runHook(t, b, env, "-C", root, "hook", "post-commit"); err != nil || len(l) != 1 {
+		t.Fatalf("staged again: %v", err)
+	}
+	out, logs, _, err = runHook(t, b, env, "-C", root, "hook", "post-commit", "--ship", "1.0.0", "--commit", head)
+	if err != nil || !strings.Contains(out, "stowage hook: warning: staged untracked files left in ") {
+		t.Fatalf("a stale entry left: %v\n%s%s", err, out, logs)
+	}
 }

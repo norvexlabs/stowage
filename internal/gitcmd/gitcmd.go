@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"regexp"
 	"strconv"
 	"strings"
 )
@@ -75,19 +76,22 @@ func FileAt(dir, rev, path string) (content []byte, ok bool, err error) {
 	head, body, _ := bytes.Cut(out, []byte("\n"))
 	f := strings.Fields(string(head))
 	switch {
-	case len(f) == 3 && f[1] == "blob":
+	case strings.HasSuffix(string(head), " missing"), len(f) == 2 && (f[0] == "dangling" || f[0] == "notdir"):
+		return nil, false, nil // nothing there, a link to nothing, or a file where a directory was
+	case len(f) == 2 && (f[0] == "symlink" || f[0] == "loop"):
+		return nil, false, fmt.Errorf("%s at %s is a symbolic link that leaves the repository or loops", path, rev)
+	case len(f) == 3 && objectHex.MatchString(f[0]) && f[1] == "blob":
 		size, err := strconv.Atoi(f[2])
 		if err != nil || size > len(body) {
 			return nil, false, fmt.Errorf("git cat-file %s:%s: %q", rev, path, head)
 		}
 		return body[:size], true, nil
-	case strings.HasSuffix(string(head), " missing"), len(f) == 2 && f[0] == "dangling":
-		return nil, false, nil
-	case len(f) == 2 && (f[0] == "symlink" || f[0] == "loop"):
-		return nil, false, fmt.Errorf("%s at %s is a symbolic link that leaves the repository or loops", path, rev)
 	}
 	return nil, false, fmt.Errorf("git cat-file %s:%s: %s is no file", rev, path, strings.TrimSpace(string(head)))
 }
+
+// objectHex is an object id as cat-file prints it.
+var objectHex = regexp.MustCompile(`^[0-9a-f]{40}([0-9a-f]{24})?$`)
 
 func run(dir string, args ...string) (out string, exit1 bool, err error) {
 	var stderr bytes.Buffer

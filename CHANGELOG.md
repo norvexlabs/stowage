@@ -28,6 +28,8 @@ follow [SemVer](https://semver.org/).
 
 ### Fixed
 
+- `hook post-commit` reads a version file the commit records as a symbolic link through the
+  link, as a checkout does, not as the link's own target path.
 - `ship`'s refusal of a release already published on an immutable channel with other inputs
   names what differs: each part of the build (`installer`, `os-bundle`, an image…) and the inputs
   of it that changed (`changelog`, `spec`, `pull`…), read from what each ship now records on the

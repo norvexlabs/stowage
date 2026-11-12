@@ -1617,4 +1617,11 @@ func TestShipTakesTheUntrackedFiles(t *testing.T) {
 	if _, err := e.ship("stable", 1); err == nil || !strings.Contains(err.Error(), "with other inputs (image/api: file, untracked;") {
 		t.Fatalf("another content: %v", err)
 	}
+	// An executable one is recorded so.
+	if err := testutil.WriteExecutable(filepath.Join(e.root, "api", "blob.bin"), []byte("made again")); err != nil {
+		t.Fatal(err)
+	}
+	if rec, err := pub.untracked(); err != nil || rec != fmt.Sprintf(`{"api/api/blob.bin":"sha256:%x executable"}`, sha256.Sum256([]byte("made again"))) {
+		t.Fatalf("executable: %q %v", rec, err)
+	}
 }

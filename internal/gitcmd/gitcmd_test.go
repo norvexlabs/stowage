@@ -63,37 +63,27 @@ func TestRunVerifyResolve(t *testing.T) {
 // A committed file is read as a checkout reads it: through a link at any component, inside the
 // repository; a link out of it is refused, and a path or a revision that is not there is none.
 func TestFileAt(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
-	write := func(rel, v string) {
-		t.Helper()
-		if err := os.MkdirAll(filepath.Dir(filepath.Join(dir, rel)), 0o755); err != nil { // a directory
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(filepath.Join(dir, rel), []byte(v), 0o644); err != nil {
-			t.Fatal(err)
-		}
-	}
-	write("ops/stowage.yaml", "name: notes\n")
-	for link, target := range map[string]string{"deploy": "ops", "stowage.yaml": "deploy/stowage.yaml", "out.yaml": "../outside.yaml"} {
+	testutil.Write(t, dir, "ops/stowage.yaml", "name: notes\n")
+	for link, target := range map[string]string{"deploy": "ops", "stowage.yaml": "deploy/stowage.yaml", "out.yaml": "../outside.yaml", "loop.yaml": "loop.yaml"} {
 		if err := os.Symlink(target, filepath.Join(dir, link)); err != nil {
 			t.Fatal(err)
 		}
 	}
-	for _, args := range [][]string{{"init", "-q"}, {"add", "."}, {"-c", "user.name=t", "-c", "user.email=t@example.org", "commit", "-qm", "one"}} {
-		if _, err := gitcmd.Run(dir, args...); err != nil {
-			t.Fatal(err)
-		}
-	}
+	testutil.GitRepo(t, dir)
 	if b, ok, err := gitcmd.FileAt(dir, "HEAD", "stowage.yaml"); err != nil || !ok || string(b) != "name: notes\n" {
 		t.Errorf("through two links: %q %v %v", b, ok, err)
 	}
-	if _, _, err := gitcmd.FileAt(dir, "HEAD", "out.yaml"); err == nil || !strings.Contains(err.Error(), "leaves the repository") {
-		t.Errorf("a link out: %v", err)
+	for _, p := range []string{"out.yaml", "loop.yaml"} {
+		if _, _, err := gitcmd.FileAt(dir, "HEAD", p); err == nil || !strings.Contains(err.Error(), "leaves the repository or loops") {
+			t.Errorf("%s: %v", p, err)
+		}
 	}
-	if _, ok, err := gitcmd.FileAt(dir, "HEAD", "none.yaml"); err != nil || ok {
-		t.Errorf("no such file: %v %v", ok, err)
-	}
-	if _, ok, err := gitcmd.FileAt(dir, "HEAD~1", "stowage.yaml"); err != nil || ok {
-		t.Errorf("no such revision: %v %v", ok, err)
+	// Nothing there: no file, a path through a file, a name with a space, no such revision.
+	for _, c := range [][2]string{{"HEAD", "none.yaml"}, {"HEAD", "ops/stowage.yaml/x"}, {"HEAD", "my blob"}, {"HEAD~1", "stowage.yaml"}} {
+		if _, ok, err := gitcmd.FileAt(dir, c[0], c[1]); err != nil || ok {
+			t.Errorf("%s:%s: %v %v", c[0], c[1], ok, err)
+		}
 	}
 }
