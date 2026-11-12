@@ -3,6 +3,15 @@
 Stowage's own releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
+## [0.37.0]
+
+### Fixed
+
+- Lint's `cap_add` warning names only the capabilities a service holds beyond Docker's defaults:
+  a service that drops every capability and adds back some of the defaults (`cap_drop: [ALL]`,
+  `cap_add: [CHOWN, SETUID]`) is no longer warned, and `CAP_`-prefixed or lowercase names are read
+  as Docker reads them.
+
 ## [0.36.0] - 2026-11-12
 
 ### Added

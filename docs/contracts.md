@@ -31,7 +31,7 @@ These are what `lint` checks; each finding names the key path or `file:line` to 
     runs one container (`scale`, `deploy.replicas`), and the route's port is its upstream's;
   - a service given the host's powers is warned, on every shape, never refused (a stack may need
     one, as a VPN's `NET_ADMIN`): `privileged: true` (or a string Compose casts to true — `true`, `yes`, `y`, `on`, any case — or any other value but `false`, `no`, `n`, `off` — an interpolation lint cannot read, or one Compose refuses, a number included — warned as only a run knowing: `the
-    container holds every power of the host's root`), `cap_add` (`powers of the host's root beyond Docker's defaults`, naming them),
+    container holds every power of the host's root`), `cap_add` (`powers of the host's root beyond Docker's defaults`, naming only the entries outside Docker's default set — `CHOWN`, `DAC_OVERRIDE`, `FSETID`, `FOWNER`, `MKNOD`, `NET_RAW`, `SETGID`, `SETUID`, `SETFCAP`, `SETPCAP`, `NET_BIND_SERVICE`, `SYS_CHROOT`, `KILL`, `AUDIT_WRITE`, in any case, with `CAP_` or without, each named once; `cap_drop` only takes away, so a service confining itself with `cap_drop: [ALL]` and adding back some of those is not warned; `ALL`, an interpolated entry and a value that is no list are warned as written),
     `pid: host` (`sees and signals every process of the host`), and a `volumes:` entry
     bind-mounting the Docker socket, `/var/run/docker.sock` or `/run/docker.sock`, or a directory
     holding it (`/var/run`, `/run`, `/`; a long-syntax entry without a `type` counts as a bind, a

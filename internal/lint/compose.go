@@ -343,8 +343,21 @@ func shortSource(v string) string {
 	return src
 }
 
-// joinCaps is a cap_add list joined with ", ", or its value as written when it is no list.
-func joinCaps(v any) string {
+// dockerDefaultCaps is the capability set Docker gives a container that names none (moby's
+// oci/caps DefaultCapabilities), without the CAP_ prefix.
+var dockerDefaultCaps = map[string]bool{
+	"CHOWN": true, "DAC_OVERRIDE": true, "FSETID": true, "FOWNER": true, "MKNOD": true,
+	"NET_RAW": true, "SETGID": true, "SETUID": true, "SETFCAP": true, "SETPCAP": true,
+	"NET_BIND_SERVICE": true, "SYS_CHROOT": true, "KILL": true, "AUDIT_WRITE": true,
+}
+
+// capsBeyondDefaults is what of a cap_add list the container holds beyond Docker's defaults,
+// joined with ", ": cap_drop only takes away, so the powers past the defaults are the cap_add
+// entries Docker does not give anyway (named as Docker reads them: any case, CAP_ prefix or none),
+// each once, in the spelling it first has.
+// ALL, an entry a run fills in (${VAR}) and a value that is no list are kept as written: only a
+// run knows what they hold.
+func capsBeyondDefaults(v any) string {
 	list, ok := v.([]any)
 	if !ok {
 		if v == nil {
@@ -353,8 +366,21 @@ func joinCaps(v any) string {
 		return fmt.Sprint(v)
 	}
 	var caps []string
+	seen := map[string]bool{}
 	for _, c := range list {
-		caps = append(caps, fmt.Sprint(c))
+		name := fmt.Sprint(c)
+		switch c {
+		case nil:
+			name = "null"
+		case "":
+			name = `""`
+		}
+		key := strings.TrimPrefix(strings.ToUpper(name), "CAP_")
+		if dockerDefaultCaps[key] || seen[key] {
+			continue
+		}
+		seen[key] = true
+		caps = append(caps, name)
 	}
 	return strings.Join(caps, ", ")
 }

@@ -629,7 +629,7 @@ func (l *linter) stack() {
 		case !known:
 			l.warnf(w+".privileged", "%v, which only a run knows or Compose does not read as a boolean: if true, the container holds every power of the host's root, its devices included; a compromise of the service is the host's", svc.Privileged)
 		}
-		if caps := joinCaps(svc.CapAdd); caps != "" {
+		if caps := capsBeyondDefaults(svc.CapAdd); caps != "" {
 			l.warnf(w+".cap_add", "%s: powers of the host's root beyond Docker's defaults; give the fewest the service needs", caps)
 		}
 		if svc.Pid == "host" {

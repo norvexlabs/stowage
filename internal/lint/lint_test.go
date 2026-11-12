@@ -1859,6 +1859,13 @@ func TestHostPrivilegesWarn(t *testing.T) {
 	for _, c := range []struct{ old, add, want string }{
 		{img, "    privileged: true\n", "services.server.privileged: true: the container holds every power of the host's root"},
 		{img, "    cap_add: [NET_ADMIN, SYS_TIME]\n", "services.server.cap_add: NET_ADMIN, SYS_TIME: powers of the host's root beyond Docker's defaults"},
+		{img, "    cap_add: [CHOWN, net_admin, CAP_SETUID]\n", "services.server.cap_add: net_admin: powers of the host's root beyond Docker's defaults"},
+		{img, "    cap_add: [ALL]\n", "services.server.cap_add: ALL: powers of the host's root beyond Docker's defaults"},
+		{img, "    cap_add: [\"${EXTRA_CAP:-CHOWN}\"]\n", "services.server.cap_add: ${EXTRA_CAP:-CHOWN}: powers of the host's root beyond Docker's defaults"},
+		{img, "    cap_drop: [ALL]\n    cap_add: [CHOWN, NET_ADMIN]\n", "services.server.cap_add: NET_ADMIN: powers of the host's root beyond Docker's defaults"},
+		{img, "    cap_add: [NET_ADMIN, cap_net_admin, SYS_TIME]\n", "services.server.cap_add: NET_ADMIN, SYS_TIME: powers"},
+		{img, "    cap_add: [NET_ADMIN, \"\", ~]\n", "services.server.cap_add: NET_ADMIN, \"\", null: powers"},
+		{img, "    cap_add: [\"\"]\n", "services.server.cap_add: \"\": powers"},
 		{img, "    pid: host\n", "services.server.pid: host: the service sees and signals every process of the host"},
 		{vol, "      - /var/run/docker.sock:/var/run/docker.sock:ro\n", "services.server.volumes: the Docker socket is mounted"},
 		{vol, "      - { type: bind, source: /run/docker.sock, target: /d.sock }\n", "services.server.volumes: the Docker socket is mounted"},
@@ -1876,6 +1883,17 @@ func TestHostPrivilegesWarn(t *testing.T) {
 		res := run(t, root)
 		if len(res.Findings) != 1 || res.Findings[0].Severity != Warning || !strings.Contains(res.Findings[0].String(), c.want) {
 			t.Errorf("%q: findings %+v", c.add, res.Findings)
+		}
+	}
+	// A service confining itself to some of Docker's defaults holds nothing beyond them.
+	for _, caps := range []string{"    cap_drop: [ALL]\n    cap_add: [CHOWN, SETUID, cap_setgid]\n",
+		"    cap_add: [CHOWN, DAC_OVERRIDE, FSETID, FOWNER, MKNOD, NET_RAW, SETGID, SETUID, SETFCAP, SETPCAP, NET_BIND_SERVICE, SYS_CHROOT, KILL, AUDIT_WRITE]\n", "    cap_add: [SETPCAP]\n", "    cap_add: []\n"} {
+		root := testutil.CopyExample(t, "stateless")
+		testutil.Edit(t, root, "deploy/compose.yaml", img, img+caps)
+		for _, f := range run(t, root).Findings {
+			if strings.Contains(f.String(), "cap_add") {
+				t.Errorf("%q: %s", caps, f)
+			}
 		}
 	}
 	// What a service extends is its own: the base and the service are both warned.
