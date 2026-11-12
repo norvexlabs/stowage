@@ -8,18 +8,22 @@ same change.
 
 | Doc | Audience | Contains |
 |---|---|---|
-| [README.md](README.md) | users and AI agents using Stowage on a project | what works, how to build, the CLI, the contracts `lint` enforces, repo map |
+| [README.md](README.md) | users and AI agents using Stowage on a project | what works, a quick start, status, every command and verb at a glance with a link to its reference, the docs index, repo map, how to build |
+| docs/*.md but DESIGN.md (the reference, indexed in README's Documentation) | users and AI agents | the full reference: the guide, the publisher, the contracts `lint` enforces, the spec keys, each shape's installer, kits, extensions, the mirror, the machine interface, the test suites |
 | [docs/DESIGN.md](docs/DESIGN.md) | contributors | format, versioning, build graph, registry, lifecycle matrix, phases, decisions |
 | [CHANGELOG.md](CHANGELOG.md) | users | Stowage's own releases; the version source of the build |
 | this file | contributors | rules and commit gates |
 | [TODO.md](TODO.md) | contributors | pending work, MoSCoW for the first version (Must = parity), deferred review findings; a done item is deleted |
 
-**README.md documents every feature — nothing is discovered in the code.** A user or an AI agent
-reading README.md alone knows everything Stowage does that they can see or rely on: every command,
-verb, flag, spec key, lint rule, provider, contract, environment variable read or written, file or
-tag written, default, refusal, and change of behaviour. A change that adds or alters one updates
-README.md in the same commit; a feature missing from README.md is a blocking defect for the
-review, like a bug. README states what and how to use it; the why goes in DESIGN.
+**README.md and the reference pages it links document every feature — nothing is discovered in
+the code.** A user or an AI agent reading README.md and the docs/*.md pages it links (DESIGN.md
+aside) knows everything Stowage does that they can see or rely on: every command, verb, flag, spec
+key, lint rule, provider, contract, environment variable read or written, file or tag written,
+default, refusal, and change of behaviour. README names every command and verb and links the page
+that describes it; that page holds the full text. A change that adds or alters one updates that
+page (and README when a command or verb is added) in the same commit; a feature missing from them
+is a blocking defect for the review, like a bug. They state what and how to use it; the why goes
+in DESIGN.
 
 ## Scope — the first version is parity
 
@@ -176,12 +180,12 @@ a self-review against the code it describes is enough. Every other commit clears
    `Dockerfile`/`Makefile` the suites but e2e-kairos, e2e-vm and e2e-full-vm; `.githooks/` and
    `test/hooks.sh` none, but `test/hooks.sh` runs after lint; a `_test.go` file none (`make
    check` runs it), but `smoke_test.go` runs smoke-install.
-2. **Docs in sync**: README.md, docs/DESIGN.md, CLAUDE.md describe what the tree does. Before
+2. **Docs in sync**: README.md, the reference pages (docs/*.md), docs/DESIGN.md, CLAUDE.md describe what the tree does. Before
    committing, list what the diff makes visible to a user (commands, verbs, flags, keys, variables,
-   files, tags, refusals) and check that README.md names each one.
+   files, tags, refusals) and check that README.md or the reference page it links names each one.
 3. **CHANGELOG.md**: a user-facing line under the top `## [x.y.z]` (unreleased work accumulates in
    the top entry, undated; a dated top entry is released, and work after it opens a new top entry
-   — see [Release](#release)). No file or function names.
+   — see [Release](#release--only-a-pushed-tag-publishes)). No file or function names.
 4. **Code review via the `code-review` skill** — the gate is that skill only, run with the change's
    paths as an explicit target (untracked files included): `/code-review <level> <path> …`.
    - Always a structured self-review first, before every round: for each hunk, the concrete failure
