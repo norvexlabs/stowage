@@ -425,14 +425,21 @@ in the same installer (bootstrap it as above, then `sh <name>.sh vm create …`,
   The cloud modules (`aws`, `azure`, `gcp`, `scaleway`) make the disk's image with an **image
   module** of their own (their `image/`), applied first in a state of its own:
   `$XDG_STATE_HOME/<name>/images/<platform>-<key>`, the key a digest of the disk's SHA-256 and of
-  the module's other variables (the zone, region, bucket, project, resource group, storage
-  account: the VM module's values of the same names). Every VM of one disk in one place shares
-  it: the second finds the image there and uploads nothing, `vm create` logging `the disk's image
-  on <platform>: <directory> (shared by the VMs of this disk, kept by vm destroy)`; two `vm
-  create` runs on it at once take turns (`.stowage.lock` there). Its variables are `name` (the
-  project's name: the uploads and the image are `<name>-<the SHA-256's first 12 digits>`),
-  `description`, `image` and `image_sha256`; its output `image_id` is the VM module's variable
-  of that name. `vm destroy` keeps it, with the uploads: `tofu -chdir=<that directory> destroy`
+  the module's other variables the operator gives (the zone on Scaleway, the region, bucket,
+  project, resource group, location, storage account: the VM module's values of the same names;
+  Google Cloud's image module takes no zone, as an image is the project's). Every VM of one disk
+  in one place shares it: the second finds the image there and uploads nothing, `vm create`
+  logging `the disk's image on <platform>: <directory> (shared by the VMs of this disk, kept by
+  vm destroy)`; two `vm create` runs on it at once take turns (`.stowage.lock` there; the second
+  logs `waiting for another vm create making the disk's image in <directory>`). Its variables
+  are `name` (the project's name), `description` (`<name>'s disk <the SHA-256's first 12
+  digits>, …`), `image`, `image_sha256` and `state_key` (the key above), and every name it gives
+  holds the disk's digest and the key (`<name>-<12 digits>-<the key's first 8>` on AWS, Azure and
+  Scaleway; on Google Cloud the image `<name, cut to 30>-<a hash of the name and the
+  key>-<12 digits>`), so two states never make the same object or image: a value given in one
+  run and left to the default in another makes a second state, and a second upload. Its output
+  `image_id` is the VM module's variable of that name; `--tofu-var image_id` is refused (`the
+  image module makes the image the VM boots from`). `vm destroy` keeps it, with the uploads: `tofu -chdir=<that directory> destroy`
   removes them, with the platform's credentials, once no VM boots from the image. A reserved
   address (`ip_id`, `eip_allocation_id`, `public_ip_name`, `nat_ip`) lets a stack's first install
   know its address, or another VM's (`--add-host`), before the VM exists: give it as `--host`.
@@ -485,10 +492,12 @@ in the same installer (bootstrap it as above, then `sh <name>.sh vm create …`,
     port, sources}`: the ports the VM's firewall opens besides SSH, the front's HTTP and HTTPS ports that
     something serves on in the `--tls` mode given (both when none is given; see the front under
     the installer on Docker), from every source (`["0.0.0.0/0", "::/0"]`), and each `l4` route's,
-    from the sources its `allow_input` holds as `vm create` is given it — the value given (an
-    answers file, `--set`), else the input's default; none (`[]`) when the list is empty or the
-    route has none, as the VM's firewall then refuses every source; every source for a secret
-    input, which `vm create` is not given — for a firewall of the platform's, fixed at create:
+    from the sources the VM's firewall lets reach it as `vm create` knows them — every source for
+    a route without an `allow_input`, one the front terminates TLS on (the front filters its
+    port) and a secret list, which `vm create` is not given; else the list's value given (an
+    answers file, `--set`) or the input's default, each address a prefix of its own (`/32`,
+    `/128`); none (`[]`) when that list is empty, as the VM's firewall then refuses every
+    source — for a firewall of the platform's, fixed at create:
     `vm create` logs, for each route with an `allow_input`, `l4 route <name>: the module's rule
     for <protocol>/<port> takes the sources <input> holds now; a later change of <input> on the VM
     does not reach it`; a module whose `open_ports` type is `{protocol, port}` drops `sources`), `image_id` (the built-in cloud modules': the image their image module made, below), and `nics` (a list of `{role, mac, attach}`: the NICs the release names, the

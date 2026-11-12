@@ -87,8 +87,9 @@ func TestEveryBuiltInModuleHoldsTheContract(t *testing.T) {
 			if !strings.Contains(string(img["outputs.tf"]), `output "image_id" {`) || !declares(vars, "image_id") {
 				t.Errorf("%s: the image module's image_id is not the VM module's", p.Key)
 			}
-			if string(img[".terraform.lock.hcl"]) != lock || string(img["versions.tf"]) != string(files["versions.tf"]) {
-				t.Errorf("%s image: its versions or lock are not the VM module's", p.Key)
+			ipins := regexp.MustCompile(`(?m)^\s+source\s+=\s+"([^"]+)"\n\s+version\s+=\s+"([^"]+)"`).FindAllStringSubmatch(string(img["versions.tf"]), -1)
+			if string(img[".terraform.lock.hcl"]) != lock || fmt.Sprint(ipins) != fmt.Sprint(pins) {
+				t.Errorf("%s image: its providers or lock are not the VM module's", p.Key)
 			}
 		}
 		if p.Preview != (p.Key != "truenas") {
@@ -175,7 +176,8 @@ func TestTheCloudImageIsSharedAndKeptByDestroy(t *testing.T) {
 			t.Fatalf("applied %q: want the image's state, then the VM's", dirs)
 		}
 		ivars := readVars(t, dirs[0])
-		if ivars["name"] != "notes" || ivars["zone"] != "fr-par-1" || ivars["bucket"] != bucket || ivars["image_sha256"] == nil || ivars["ssh_sources"] != nil {
+		if ivars["name"] != "notes" || ivars["zone"] != "fr-par-1" || ivars["bucket"] != bucket || ivars["image_sha256"] == nil || ivars["ssh_sources"] != nil ||
+			"scaleway-"+fmt.Sprint(ivars["state_key"]) != filepath.Base(dirs[0]) {
 			t.Errorf("the image module's variables: %v", ivars)
 		}
 		if got := readVars(t, dirs[1])["image_id"]; got != "image-"+filepath.Base(dirs[0]) {
@@ -192,6 +194,12 @@ func TestTheCloudImageIsSharedAndKeptByDestroy(t *testing.T) {
 	}
 	if other := create("notes-3", "c"); other == first {
 		t.Errorf("another bucket shares %s", first)
+	}
+	// The image the VM boots from is the image module's: none given instead.
+	c := VMCreate{Platform: "scaleway", Create: CreateTofu, Hostname: "notes-4", User: "ops", Ctl: "/opt/notes-stow", Wait: 5 * time.Second,
+		Vars: map[string]string{"zone": "fr-par-1", "bucket": "b", "image_id": "fr-par-1/x"}}
+	if err := v.create(c, r.mod(nil)); err == nil || !strings.Contains(err.Error(), "--tofu-var image_id: the image module makes the image the VM boots from") {
+		t.Errorf("image_id given: %v", err)
 	}
 	r.tofu.calls = nil
 	in := v.installer(r.mod(nil))

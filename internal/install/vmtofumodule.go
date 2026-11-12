@@ -27,9 +27,10 @@ var (
 	contractVars = []string{"name", "description", "disk_gib", "image", "image_sha256", "seed", "seed_sha256"}
 	optionalVars = []string{"cpus", "memory_mib", "image_format", "dhcp", "admin_user", "ssh_public_key", "nics", "image_id"}
 	// imageVars are the variables `vm create` writes for a built-in image module (imageRoot): the
-	// project's name and a description, the image and its SHA-256. It declares these, and any
+	// project's name and a description, the image and its SHA-256, and its state's key, in every
+	// name it gives. It declares these, and any
 	// other is a variable of the VM's module, given the VM module's value.
-	imageVars = []string{"name", "description", "image", "image_sha256"}
+	imageVars = []string{"name", "description", "image", "image_sha256", "state_key"}
 	// truenasVars are the TrueNAS module's own variables, which its flags give.
 	truenasVars = []string{"insecure_skip_verify", "pool", "parent_dataset", "nic_attach"}
 )

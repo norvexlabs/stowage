@@ -265,6 +265,20 @@ func (r Repo) Unstage(id, top string) ([]string, error) {
 		if _, err := os.Lstat(dst); err == nil {
 			return fmt.Errorf("untracked %s: the commit records it, so the working tree's copy is not taken", filepath.ToSlash(rel))
 		}
+		// Every directory on its way the commit records is a directory: a link there would take the
+		// copy elsewhere than the build reads.
+		cur := top
+		for _, c := range strings.Split(filepath.Dir(rel), string(filepath.Separator)) {
+			if c == "." {
+				break
+			}
+			cur = filepath.Join(cur, c)
+			if fi, err := os.Lstat(cur); err == nil && !fi.IsDir() {
+				return fmt.Errorf("untracked %s: the commit records %s as no directory", filepath.ToSlash(rel), filepath.ToSlash(strings.TrimPrefix(cur, top+string(filepath.Separator))))
+			} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+				return err
+			}
+		}
 		if err := copyFile(p, dst, 0o755); err != nil {
 			return err
 		}

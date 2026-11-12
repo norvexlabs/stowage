@@ -198,7 +198,9 @@ func inputsDiff(was string, g *graph.Graph) string {
 	}
 	fields := func(a, b map[string]string) string {
 		var out []string
-		for _, k := range sortedKeys(union(a, b)) {
+		keys := append(slices.Collect(maps.Keys(a)), slices.Collect(maps.Keys(b))...)
+		slices.Sort(keys)
+		for _, k := range slices.Compact(keys) {
 			if a[k] != b[k] {
 				out = append(out, k)
 			}
@@ -266,18 +268,6 @@ func (p *Publisher) untracked() (string, error) {
 	}
 	b, err := json.Marshal(sums) // its keys sorted
 	return string(b), err
-}
-
-// union is the keys of a and b, with a's values.
-func union(a, b map[string]string) map[string]string {
-	out := map[string]string{}
-	for k := range b {
-		out[k] = ""
-	}
-	for k, v := range a {
-		out[k] = v
-	}
-	return out
 }
 
 // writeRelease pushes m by digest, signs it, and only then moves tag to it: a release tag never

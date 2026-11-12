@@ -408,9 +408,18 @@ func TestHookShipTakesTheUntrackedFilesOfTheCommit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The commit's spec decides, whatever the working tree's holds.
+	raw, err := os.ReadFile(filepath.Join(root, "stowage.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	testutil.SetYAML(t, root, "stowage.yaml", []string{"images", "api"}, map[string]any{"context": "api", "dockerfile": "api/Dockerfile", "inputs": []string{"api/"}})
 	out, logs, l, err := runHook(t, b, env, "-C", root, "hook", "post-commit")
 	if err != nil || len(l) != 0 || !strings.Contains(logs, "images.api.untracked: api/blob.bin is required and absent from the working tree; 1.0.0 not shipped") {
 		t.Fatalf("absent: %v %+v\n%s%s", err, l, out, logs)
+	}
+	if err := os.WriteFile(filepath.Join(root, "stowage.yaml"), raw, 0o644); err != nil {
+		t.Fatal(err)
 	}
 	testutil.Write(t, root, "api/blob.bin", "made elsewhere")
 	out, logs, l, err = runHook(t, b, env, "-C", root, "hook", "post-commit")
@@ -423,6 +432,13 @@ func TestHookShipTakesTheUntrackedFilesOfTheCommit(t *testing.T) {
 		if got, err := os.ReadFile(filepath.Join(p.Root, "api", "blob.bin")); err != nil || string(got) != "made elsewhere" {
 			t.Errorf("the build read %q (%v), not the file of the commit", got, err)
 		}
+	}
+	// A ship that fails keeps them, for its run by hand.
+	if _, _, _, err := runHook(t, b, nil, "-C", root, "hook", "post-commit", "--ship", "1.0.0", "--commit", head); err == nil {
+		t.Fatal("shipped without the push token")
+	}
+	if _, err := os.Stat(filepath.Join(r.StagedDir(head), "api", "blob.bin")); err != nil {
+		t.Fatalf("a failed ship left no staged file: %v", err)
 	}
 	out, logs, _, err = runHook(t, b, env, "-C", root, "hook", "post-commit", "--ship", "1.0.0", "--commit", head)
 	if err != nil || b.n == 0 || !strings.Contains(out, "stowage hook: untracked api/blob.bin copied into the checkout\n") ||

@@ -52,3 +52,12 @@ variable "container" {
   type        = string
   default     = "vhds"
 }
+
+variable "state_key" {
+  description = "The key of this image's state, which `<short>-stow vm create` derives from the disk and the place: in every name, so two states never make the same object or image."
+  type        = string
+  validation {
+    condition     = can(regex("^[0-9a-f]{16}$", var.state_key))
+    error_message = "state_key must be 16 lowercase hex digits."
+  }
+}

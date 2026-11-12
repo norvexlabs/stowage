@@ -117,7 +117,7 @@ func (o *options) postCommit(channel string, disks bool) error {
 	}
 	// The untracked files are taken now, at the commit: a file staged for a later release never
 	// reaches this one, however long its ship waits for the lock.
-	staged, err := stageUntracked(p, r, d.Commit)
+	staged, err := o.stageUntracked(p, r, d.Commit)
 	if err != nil {
 		return fmt.Errorf("%w; %s not shipped", err, d.Version)
 	}
@@ -189,8 +189,11 @@ func (o *options) hookShip(ctx context.Context, channel, v, commit string, disks
 		if rerr := remove(); rerr != nil && err == nil {
 			err = fmt.Errorf("remove the checkout of %s: %w", id, rerr)
 		}
-		if rerr := os.RemoveAll(r.StagedDir(id)); rerr != nil && err == nil {
-			err = fmt.Errorf("remove the untracked files staged for %s: %w", id, rerr)
+		// Kept when the ship fails, for its run by hand; gone once it is published.
+		if err == nil {
+			if rerr := os.RemoveAll(r.StagedDir(id)); rerr != nil {
+				err = fmt.Errorf("remove the untracked files staged for %s: %w", id, rerr)
+			}
 		}
 	}()
 	// The untracked files the working tree held at the commit, into the checkout.
@@ -204,17 +207,33 @@ func (o *options) hookShip(ctx context.Context, channel, v, commit string, disks
 	return o.inCheckout(top, rel, spec, root).ship(ctx, channel, 1, v, disks)
 }
 
-// stageUntracked stages, for the ship of commit id, every untracked file the project's images
-// declare (images.<key>.untracked), from the working tree as it is at the commit, and returns
-// their paths (relative to the working tree's top level). A required one absent is refused.
-func stageUntracked(p *project.Project, r hook.Repo, id string) ([]string, error) {
+// stageUntracked stages, for the ship of commit id, every untracked file the commit's spec
+// declares (images.<key>.untracked: the spec the ship builds with, whatever the working tree's
+// holds), from the working tree as it is at the commit, and returns their paths (relative to the
+// working tree's top level). A required one absent is refused.
+func (o *options) stageUntracked(p *project.Project, r hook.Repo, id string) ([]string, error) {
 	rel, err := relTo(r.Top, p.Root)
 	if err != nil {
 		return nil, err
 	}
+	specRel, err := o.specInRepo(r, id)
+	if err != nil {
+		return nil, err
+	}
+	if specRel == "" {
+		specRel = filepath.Join(rel, project.SpecFile)
+	}
+	raw, err := gitcmd.Run(r.Top, "show", id+":"+filepath.ToSlash(specRel))
+	if err != nil {
+		return nil, fmt.Errorf("the spec at %s: %w", id, err)
+	}
+	s, err := spec.Parse([]byte(raw))
+	if err != nil {
+		return nil, fmt.Errorf("the spec at %s: %w", id, err)
+	}
 	var files []string
-	for _, key := range p.Spec.ImageNames() {
-		for _, u := range p.Spec.Images[key].Untracked {
+	for _, key := range s.ImageNames() {
+		for _, u := range s.Images[key].Untracked {
 			clean, _, ok, err := spec.UntrackedFile(p.Root, u.Path)
 			if err != nil {
 				return nil, fmt.Errorf("images.%s.untracked: %w", key, err)

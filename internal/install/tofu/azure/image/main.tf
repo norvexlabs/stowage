@@ -4,6 +4,8 @@
 
 locals {
   id = substr(var.image_sha256, 0, 12)
+  # The disk's digest and this state's key: what every name holds.
+  tag = "${local.id}-${substr(var.state_key, 0, 8)}"
 }
 
 data "azurerm_storage_account" "images" {
@@ -17,14 +19,14 @@ data "azurerm_storage_container" "images" {
 }
 
 resource "azurerm_storage_blob" "image" {
-  name                 = "stowage-${var.name}-${local.id}.vhd"
+  name                 = "stowage-${var.name}-${local.tag}.vhd"
   storage_container_id = data.azurerm_storage_container.images.id
   type                 = "Page"
   source               = var.image
 }
 
 resource "azurerm_image" "image" {
-  name                = "${var.name}-${local.id}"
+  name                = "${var.name}-${local.tag}"
   location            = var.location
   resource_group_name = var.resource_group
   hyper_v_generation  = "V2"

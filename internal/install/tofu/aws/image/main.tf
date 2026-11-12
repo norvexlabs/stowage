@@ -4,11 +4,13 @@
 
 locals {
   id = substr(var.image_sha256, 0, 12)
+  # The disk's digest and this state's key: what every name holds.
+  tag = "${local.id}-${substr(var.state_key, 0, 8)}"
 }
 
 resource "aws_s3_object" "image" {
   bucket      = var.bucket
-  key         = "stowage/${var.name}-${local.id}.raw"
+  key         = "stowage/${var.name}-${local.tag}.raw"
   source      = var.image
   source_hash = var.image_sha256
 }
@@ -26,12 +28,12 @@ resource "aws_ebs_snapshot_import" "image" {
   }
 
   tags = {
-    Name = "${var.name}-${local.id}"
+    Name = "${var.name}-${local.tag}"
   }
 }
 
 resource "aws_ami" "image" {
-  name                = "${var.name}-${local.id}"
+  name                = "${var.name}-${local.tag}"
   description         = var.description
   virtualization_type = "hvm"
   architecture        = "x86_64"

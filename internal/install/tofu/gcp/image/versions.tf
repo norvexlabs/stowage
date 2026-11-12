@@ -11,7 +11,7 @@ terraform {
 
 # The account comes from the environment (GOOGLE_APPLICATION_CREDENTIALS, or the gcloud
 # application-default login): never from a file here.
+# An image and a bucket are the project's, in no zone.
 provider "google" {
   project = var.project
-  zone    = var.zone
 }

@@ -166,18 +166,13 @@ func GitInContext(ig *Ignore) (string, error) {
 // a path outside the context never is.
 func (ig *Ignore) Excluded(abs string) (bool, error) { return ig.excluded(abs) }
 
-// FileSum is "sha256:<hex>" of the file at abs.
+// FileSum is "sha256:<hex>" of the file at abs, as a tree's walk hashes it.
 func FileSum(abs string) (string, error) {
-	f, err := os.Open(abs)
+	sum, _, err := fileSum(abs)
 	if err != nil {
 		return "", err
 	}
-	defer f.Close()
-	h := sha256.New()
-	if _, err := io.Copy(h, f); err != nil {
-		return "", err
-	}
-	return "sha256:" + hex.EncodeToString(h.Sum(nil)), nil
+	return "sha256:" + sum, nil
 }
 
 // excluded reports whether abs (an absolute path) is ignored. Paths outside the base are never

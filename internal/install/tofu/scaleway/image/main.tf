@@ -4,11 +4,13 @@
 
 locals {
   id = substr(var.image_sha256, 0, 12)
+  # The disk's digest and this state's key: what every name holds.
+  tag = "${local.id}-${substr(var.state_key, 0, 8)}"
 }
 
 resource "scaleway_object" "image" {
   bucket     = var.bucket
-  key        = "stowage/${var.name}-${local.id}.qcow2"
+  key        = "stowage/${var.name}-${local.tag}.qcow2"
   file       = var.image
   hash       = var.image_sha256
   visibility = "private"
@@ -19,7 +21,7 @@ resource "scaleway_object" "image" {
 }
 
 resource "scaleway_block_snapshot" "image" {
-  name = "${var.name}-${local.id}"
+  name = "${var.name}-${local.tag}"
 
   import {
     bucket = scaleway_object.image.bucket
@@ -32,7 +34,7 @@ resource "scaleway_block_snapshot" "image" {
 }
 
 resource "scaleway_instance_image" "image" {
-  name           = "${var.name}-${local.id}"
+  name           = "${var.name}-${local.tag}"
   root_volume_id = scaleway_block_snapshot.image.id
   architecture   = "x86_64"
 }

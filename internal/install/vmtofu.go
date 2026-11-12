@@ -453,23 +453,32 @@ func (in *Installer) openedPorts(st *Settings) []modulePort {
 	return ports
 }
 
-// routeSources are the sources an L4 route's allowlist holds as vm create gives it: its input's
-// value in the settings, else its default; every source when neither is known here (a secret
-// input, given over SSH), and none when the list is empty, which the VM's firewall refuses too.
-// A platform's rules made from them are fixed at create: a later change of the list on the VM
-// does not reach them.
+// routeSources are the sources the VM's firewall lets reach an L4 route's port, as vm create
+// knows them: every source for a route without an allowlist or one the front terminates TLS on
+// (the front filters its own port), and for an allowlist whose value is not known here (a secret
+// input, given over SSH); else its input's value in the settings, or its default, each address a
+// prefix of its own (/32, /128) — none when the list is empty, which the VM's firewall refuses
+// too. A platform's rules made from them are fixed at create: a later change of the list on the
+// VM does not reach them.
 func (in *Installer) routeSources(st *Settings, r spec.L4Route) []string {
 	i := slices.IndexFunc(in.R.Spec.Inputs, func(i spec.Input) bool { return i.Key == r.AllowInput })
 	v, given := st.Inputs[r.AllowInput]
 	switch {
-	case r.AllowInput == "" || i < 0:
-		return []string{}
+	case r.AllowInput == "" || r.Terminated() || i < 0:
+		return everySource
 	case !given && in.R.Spec.Inputs[i].Secret:
 		return everySource
 	case !given:
 		v = in.R.Spec.Inputs[i].Default
 	}
-	return append([]string{}, splitSources(v)...)
+	out := []string{}
+	for _, s := range splitSources(v) {
+		if a, err := netip.ParseAddr(s); err == nil {
+			s = netip.PrefixFrom(a, a.BitLen()).String()
+		}
+		out = append(out, s)
+	}
+	return out
 }
 
 // moduleFirewall warns when a built-in module's network firewall leaves out what the VM's opens:
@@ -535,7 +544,7 @@ func (in *Installer) applyVM(ctx context.Context, dir, ctl string, p Platform, m
 		case "open_ports":
 			vars[v.Name] = in.openedPorts(st)
 			for _, r := range in.R.Spec.L4.Routes {
-				if r.AllowInput != "" {
+				if r.AllowInput != "" && !r.Terminated() {
 					in.O.logf("l4 route %s: the module's rule for %s/%d takes the sources %s holds now; a later change of %s on the VM does not reach it", r.Name, r.Protocol, r.Port, r.AllowInput, r.AllowInput)
 				}
 			}
@@ -548,6 +557,9 @@ func (in *Installer) applyVM(ctx context.Context, dir, ctl string, p Platform, m
 	}
 	in.moduleFirewall(p, t, mach, st, declared)
 	if t.Module == "" {
+		if _, given := t.Vars["image_id"]; given {
+			return "", "", errors.New("--tofu-var image_id: the image module makes the image the VM boots from: give the module's other variables")
+		}
 		if err := in.applyImage(ctx, ctl, p, vars, image, imageSHA); err != nil {
 			return "", "", err
 		}
@@ -669,15 +681,21 @@ func (in *Installer) applyImage(ctx context.Context, ctl string, p Platform, var
 			ivars[v.Name] = vars[v.Name]
 		}
 	}
-	dir, err := in.imageState(p, ivars)
+	dir, key, err := in.imageState(p, ivars)
 	if err != nil {
 		return err
 	}
+	ivars["state_key"] = key
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
 	// One vm create at a time applies it; another waits, then finds the image there.
-	unlock, err := flockWait(filepath.Join(dir, imageLock), true)
+	lock := filepath.Join(dir, imageLock)
+	unlock, err := lockFile(lock)
+	if errors.Is(err, errLocked) {
+		in.O.logf("waiting for another vm create making the disk's image in %s", dir)
+		unlock, err = flockWait(lock, true)
+	}
 	if err != nil {
 		return err
 	}
@@ -703,27 +721,29 @@ func (in *Installer) applyImage(ctx context.Context, ctl string, p Platform, var
 // imageLock is the lock file in an image module's state directory.
 const imageLock = ".stowage.lock"
 
-// imageState is the directory of the state of platform p's image module given ivars:
+// imageState is the directory of the state of platform p's image module given ivars, and its key:
 // $XDG_STATE_HOME/<name>/images/<platform>-<key>, the key a digest of every variable but the
-// image's path on this machine and its description — the disk's SHA-256 and the place (the zone,
-// the bucket, the project…) — so every VM of one disk in one place shares it.
-func (in *Installer) imageState(p Platform, ivars map[string]any) (string, error) {
+// image's path on this machine and its description — the disk's SHA-256 and the place (the region,
+// the bucket, the project…) — so every VM of one disk in one place shares it. The module names
+// what it makes with the key too (state_key): two states never make the same object or image.
+func (in *Installer) imageState(p Platform, ivars map[string]any) (string, string, error) {
 	vms, err := in.O.vmsDir(in.R.Spec.Name)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	key := map[string]any{"platform": p.Key}
 	for k, v := range ivars {
-		if k != "image" && k != "description" {
+		if k != "image" && k != "description" && k != "state_key" {
 			key[k] = v
 		}
 	}
 	raw, err := json.Marshal(key) // its keys sorted
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	sum := sha256.Sum256(raw)
-	return filepath.Join(filepath.Dir(vms), "images", p.Key+"-"+hex.EncodeToString(sum[:8])), nil
+	k := hex.EncodeToString(sum[:8])
+	return filepath.Join(filepath.Dir(vms), "images", p.Key+"-"+k), k, nil
 }
 
 // awaitVM waits, up to wait, until `<short>-stow status --json` on the VM at addr answers from a

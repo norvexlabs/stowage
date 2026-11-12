@@ -783,3 +783,38 @@ func TestTheServicesTablesReachTheInstaller(t *testing.T) {
 		base = now
 	}
 }
+
+// An image's untracked file enters its digest by its content, absent included, whatever order
+// the files are declared in; its field names it, as each field of a node does.
+func TestUntrackedFilesReachTheImage(t *testing.T) {
+	root := testutil.CopyExample(t, "full")
+	node := func(g *Graph, id string) Node {
+		t.Helper()
+		n, ok := g.Node(id)
+		if !ok {
+			t.Fatalf("no node %s", id)
+		}
+		return n
+	}
+	absent := node(build(t, root), "image/api")
+	if absent.Fields["untracked"] == "" {
+		t.Fatalf("no untracked field: %v", absent.Fields)
+	}
+	testutil.Write(t, root, "server/vendor/codec.bin", "made elsewhere")
+	there := node(build(t, root), "image/api")
+	testutil.Write(t, root, "server/vendor/codec.bin", "made again")
+	again := node(build(t, root), "image/api")
+	if there.Inputs == absent.Inputs || again.Inputs == there.Inputs || there.Fields["untracked"] == absent.Fields["untracked"] || again.Fields["untracked"] == there.Fields["untracked"] {
+		t.Errorf("the untracked file's content is no input: %s %s %s", absent.Inputs, there.Inputs, again.Inputs)
+	}
+	testutil.Write(t, root, "server/other.bin", "x")
+	testutil.Edit(t, root, "stowage.yaml", "untracked: [{ path: server/vendor/codec.bin }]", "untracked: [{ path: server/vendor/codec.bin }, { path: server/other.bin }]")
+	ab := node(build(t, root), "image/api").Inputs
+	testutil.Edit(t, root, "stowage.yaml", "untracked: [{ path: server/vendor/codec.bin }, { path: server/other.bin }]", "untracked: [{ path: server/other.bin }, { path: server/vendor/codec.bin }]")
+	if ba := node(build(t, root), "image/api").Inputs; ab != ba {
+		t.Errorf("the order of the untracked files changed the digest: %s %s", ab, ba)
+	}
+	if inst := node(build(t, root), KindInstaller); inst.Fields["changelog"] == "" || inst.Fields["spec"] == "" {
+		t.Errorf("the installer's fields: %v", inst.Fields)
+	}
+}

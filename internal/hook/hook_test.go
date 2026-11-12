@@ -433,6 +433,14 @@ func TestStageAndUnstage(t *testing.T) {
 	if _, err := r.Unstage(id, co); err == nil || !strings.Contains(err.Error(), "untracked bin/tool: the commit records it") {
 		t.Fatalf("a path the checkout holds: %v", err)
 	}
+	// A directory the commit records as a link is never gone through.
+	co2 := t.TempDir()
+	if err := os.Symlink(t.TempDir(), filepath.Join(co2, "bin")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Unstage(id, co2); err == nil || !strings.Contains(err.Error(), "untracked bin/tool: the commit records bin as no directory") {
+		t.Fatalf("a link on the way: %v", err)
+	}
 	if copied, err := r.Unstage(strings.Repeat("b", 40), co); err != nil || len(copied) != 0 {
 		t.Fatalf("nothing staged: %v %q", err, copied)
 	}
