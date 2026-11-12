@@ -1472,7 +1472,14 @@ every shape, the VM end-to-end test upgrading through it), then the health gate.
   which is why the IPv4 accept stays in `DOCKER-USER`. Rejected: a table of its own hooking
   forward with `policy drop` for the roles' devices alone (a second table to keep in step, and
   any other interface left to the engine's policy again); Docker's `ip6tables` setting (the rule
-  left to the engine again).
+  left to the engine again). The front's holds (`front.interfaces`) live in a base chain of
+  their own, `hold`, at a priority ahead of the forward chain: an accept in a base chain ends that
+  chain alone while a drop is final, so the forward chain's accepts (a named bridge's, a reply)
+  can never let through what a hold drops, whatever order its includes load in; the holds name
+  every bridge of the stack's (`docker0`, `br-…`, the named ones) as destinations. Their file is
+  on the persistent partition, so a boot holds the front before the install's start; after a
+  rollback and a re-upgrade a boot may load an older start's holds until the start rewrites them,
+  which only ever drop.
 - **One confinement for every service Stowage adds** — the stack's operator trusts Stowage's
   services as little as the project's: the front, the provision hook, the schema check and a
   handoff's step run with no capability, no privilege gain and a read-only root, a writable path

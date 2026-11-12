@@ -32,7 +32,8 @@ follow [SemVer](https://semver.org/).
   and that command, so a generated login is no longer read out of the install's files.
 - The front's ports are held to `front.interfaces` (roles, as an L4 route's `interfaces`) for
   real on the VM: Docker translates them to the front's container past the input chain, and the
-  firewall's forward chain now drops a connection to them from any other interface. A consented
+  firewall's `hold` chain, ahead of its forward chain, drops every packet of a connection to them
+  from any other interface (a container on any of the stack's bridges included). A consented
   Docker host holds the front's and the L4 routes' interfaces in `DOCKER-USER` too.
 - `as_file: true` on a secret, or on a secret input, delivers its value as a file a service
   mounts (`${STOWAGE_SECRET_FILE_<KEY>}`), never as a variable `docker inspect` or a child process

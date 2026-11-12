@@ -1069,23 +1069,29 @@ route's whose service runs (none for a service whose profiles are all off) (`<pr
   so a boot drops the routes' ports until the install's start writes the file. Its forward chain
   (`priority filter - 1`, ahead of Docker's; policy accept) judges what the VM routes for others,
   IPv4 and IPv6 alike (one `inet` table), whatever Docker's own FORWARD policies are: it includes
-  `/usr/local/<name>/nftables.d/*.nft`, on the persistent partition: there each start writes
+  `/usr/local/<name>/nftables.d/*.nft`, on the persistent partition, where each start writes
   `<name>-bridges.nft`, the bridges the stack's networks name otherwise than `docker0` or `br-…`
   (`com.docker.network.bridge.name` of its own bridge networks, and of the external ones it joins
   as the engine reports them, `docker network inspect`: `iifname "<bridge>" accept`, `oifname
   "<bridge>" accept`), so a boot reaches the containers Docker restarts on them before the
-  install's start (no file when none is named); and `<name>-l4.nft` (that name, which each
-  earlier release removes or rewrites at its start, so a rollback never keeps this one's rule)
-  while the front answers on some roles alone (`front.interfaces`, an L4 route it terminates TLS
-  on with `interfaces`) outside loopback mode: Docker translates the front's published ports (those
-  something serves on, as above) to its container, so the input chain never sees them, and this
-  rule drops a new connection to one of them (`ct direction original ct status dnat ct original
-  proto-dst { <ports> }`) forwarded to a container bridge (`oifname "br-*"`, and a rule alike for
-  `oifname "docker0"`: another translation to such a port, a cluster's service address, is not
-  judged) and arriving on any interface but those roles' (`iifname != "<role>" drop`, or `!= {
-  "<role>", … }`; the stack's own containers reach the front by its routes' names, on their
-  network), removed while none is held (values that do not read hold the spec's ports,
-  `http_port` and `https_port`, the front's unless the install moved them). After them it accepts
+  install's start (no file when none is named), and removes `<name>-l4.nft`, where earlier
+  releases kept their L4 allowlists. Ahead of it (`priority filter - 2`), a chain of its own,
+  `hold`, includes `/usr/local/<name>/nftables.d/*.hold`, where each start writes
+  `<name>-front.hold` while the front answers on some roles alone (`front.interfaces`, an L4
+  route it terminates TLS on with `interfaces`) outside loopback mode: Docker translates the
+  front's published ports (those something serves on, as above) to its container, so the input
+  chain never sees them, and these rules drop every packet, in its original direction, of a
+  connection to one of them (`ct direction original ct status dnat ct original proto-dst {
+  <ports> }`, an established one's too once the holds change) forwarded to a container bridge
+  (`oifname "br-*"`, a rule alike for `oifname "docker0"` and for each named bridge: another
+  translation to such a port, a cluster's service address, is not judged) and arriving on any
+  interface but those roles' (`iifname != "<role>" drop`, or `!= { "<role>", … }`) — a
+  container on a bridge included, the stack's own reaching the front by its routes' names on
+  their network, an external network's container through the VM's address refused; a drop in
+  that chain is final whatever the forward chain accepts after (an earlier release's bundle
+  includes no `*.hold`: a rollback never loads it). The file goes while nothing is held
+  (values that do not read hold the spec's ports, `http_port` and `https_port`, the front's
+  unless the install moved them). After its includes, the forward chain accepts
   replies (`ct state established,related`) and what enters or leaves Docker's bridges by their
   names (`iifname`/`oifname` `"docker0"` and `"br-*"`), which Docker's own chains judge after it;
   includes `/run/nftables.d/forward/<name>-forward.nft`, which each start of the install writes,

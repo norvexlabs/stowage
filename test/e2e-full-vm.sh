@@ -227,8 +227,13 @@ on_vm sudo sysctl -qw net.ipv4.conf.all.arp_ignore=1 net.ipv4.conf.all.arp_annou
 ip neigh flush to "$edge_ip" 2>/dev/null || sudo -n ip neigh flush to "$edge_ip" 2>/dev/null || true # an entry from before the settings
 ping -c 1 -W 5 "$edge_ip" >/dev/null || fail "this host does not reach the edge NIC ($edge_ip): the check below would prove nothing"
 ip neigh show "$edge_ip" | grep -qi "lladdr $MAC_EDGE" || { ip neigh show "$edge_ip"; fail "this host reaches $edge_ip at another MAC than the edge NIC's ($MAC_EDGE): the check below would prove nothing"; }
-curl -sk --max-time 10 -o /dev/null "https://$IP/" || fail "the front does not answer on the uplink ($IP)"
-curl -sk --max-time 5 -o /dev/null "https://$edge_ip/" && fail "the front answers on the edge NIC ($edge_ip), a role front.interfaces leaves out"
+# Each by a route's domain (the front's certificate is a site's: a handshake with no server name
+# fails whatever the firewall does); the edge's connection is dropped, not answered (curl's
+# connect timeout, 28: a TLS or HTTP answer would be another exit).
+[[ $(curl -sk --max-time 10 -o /dev/null -w '%{http_code}' --resolve "console.atlas.test:443:$IP" https://console.atlas.test/) == 200 ]] ||
+	fail "the front does not answer on the uplink ($IP)"
+rc=0; curl -sk --connect-timeout 5 --max-time 10 -o /dev/null --resolve "console.atlas.test:443:$edge_ip" https://console.atlas.test/ || rc=$?
+[[ $rc == 28 ]] || fail "the front answers on the edge NIC ($edge_ip), a role front.interfaces leaves out (curl exited $rc, not dropped)"
 # The vpn service's table steers vpn0's traffic to its sockets, which the input chain accepts on
 # vpn0 alone (services.vpn.transparent); vpn0's traffic out of the uplink and its replies pass
 # Docker's FORWARD policy (host.interfaces.vpn0.forward), for IPv4 and IPv6.

@@ -1441,7 +1441,7 @@ func TestFrontPortsAndAnEmptyRole(t *testing.T) {
 	in.R.Spec.Front.Interfaces = []string{""}
 	env := NewEnvFile()
 	env.Set("STOWAGE_TLS_MODE", "internal")
-	if got := string(in.frontHolds(env)); !strings.Contains(got, `oifname "br-*" drop`) {
+	if got := string(in.frontHolds(env, nil)); !strings.Contains(got, `oifname "br-*" drop`) {
 		t.Errorf("holds %q", got)
 	}
 }

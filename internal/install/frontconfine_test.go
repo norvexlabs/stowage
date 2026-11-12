@@ -511,12 +511,17 @@ func TestTheBundlesFirewallLoadsInNft(t *testing.T) {
 		t.Fatal(err)
 	}
 	root := t.TempDir()
+	// The files the install's start writes (openPorts), for a project forwarding a tun role out of
+	// the uplink, its front held to the uplink (a route behind TLS), a network naming its bridge.
 	h := &spec.Host{Interfaces: map[string]spec.HostInterface{"uplink": {Primary: true}, "vpn0": {Kind: spec.InterfaceTUN, Device: "ovl-0-0", Forward: []string{"uplink"}}}}
-	fwd := append(bridgeNft([]string{"appnet0"}), forwardNft(h, func(r string) string { return h.Interfaces[r].DeviceName(r) })...)
-	if err := os.MkdirAll(filepath.Join(root, "run", "forward"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(root, "run", "forward", "notes-forward.nft"), fwd, 0o644); err != nil {
+	in := &Installer{R: testRelease(t, "1.0.0"), O: Options{Dir: filepath.Join(root, "usr"), Firewall: filepath.Join(root, "run"), Host: &nftHost{}, Log: io.Discard}}
+	in.R.Spec.Host = h
+	in.R.Spec.Front.Interfaces = []string{"uplink"}
+	env := NewEnvFile()
+	env.Set("STOWAGE_TLS_MODE", "internal")
+	env.Set(HTTPPortVar, "80")
+	env.Set(HTTPSPortVar, "443")
+	if err := in.openPorts(context.Background(), env, hostNet{bridges: []string{"appnet0"}}); err != nil {
 		t.Fatal(err)
 	}
 	conf := strings.NewReplacer(PortRules, filepath.Join(root, "run"), "/etc/nftables.d", filepath.Join(root, "etc"), VMDir("notes"), filepath.Join(root, "usr")).Replace(string(raw))
@@ -524,14 +529,41 @@ func TestTheBundlesFirewallLoadsInNft(t *testing.T) {
 	if err := os.WriteFile(file, []byte(conf), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	out, err := exec.Command(unshare, "-rn", "sh", "-c", nft+" -f "+file+" && "+nft+" list chain inet notes forward").CombinedOutput()
+	out, err := exec.Command(unshare, "-rn", "sh", "-c", nft+" -f "+file+" && "+nft+" list table inet notes").CombinedOutput()
 	if err != nil {
 		t.Fatalf("%v\n%s\n%s", err, out, conf)
 	}
-	for _, want := range []string{`iifname "ovl-0-0" oifname "uplink" accept`, `iifname "br-*" accept`, `oifname "appnet0" accept`, "drop"} {
-		if !strings.Contains(string(out), want) {
-			t.Errorf("the loaded chain lacks %q:\n%s", want, out)
+	// The holds in a chain of their own ahead of the forward chain (a drop there is final, whatever
+	// the forward chain accepts after), every bridge of the stack's among their destinations; then
+	// the forward chain: the named bridge's accepts, replies, Docker's bridges, the pair, the drop.
+	hold, forward, ok := strings.Cut(string(out), "chain forward {")
+	if !ok || !strings.Contains(hold, "chain hold {") || !strings.Contains(hold, "type filter hook forward priority filter - 2; policy accept;") {
+		t.Fatalf("no hold chain ahead of the forward chain:\n%s", out)
+	}
+	for _, want := range []string{`ct original proto-dst { 80, 443 } oifname "br-*" iifname != "uplink" drop`, `ct original proto-dst { 80, 443 } oifname "appnet0" iifname != "uplink" drop`} {
+		if !strings.Contains(hold, want) {
+			t.Errorf("the hold chain lacks %q:\n%s", want, hold)
 		}
+	}
+	// The hold chain's own rules: drops alone (an accept there would end that chain alone, the
+	// holds after it unread).
+	_, body, _ := strings.Cut(hold, "chain hold {")
+	for line := range strings.Lines(body) {
+		if l := strings.TrimSpace(line); strings.HasSuffix(l, " accept") || l == "accept" {
+			t.Errorf("an accept in the hold chain: %q\n%s", l, out)
+		}
+	}
+	if strings.Contains(forward, "proto-dst") {
+		t.Errorf("a hold in the forward chain:\n%s", out)
+	}
+	at := -1
+	for _, want := range []string{`iifname "appnet0" accept`, "ct state established,related accept", `iifname "br-*" accept`, `oifname "br-*" accept`,
+		`iifname "ovl-0-0" oifname "uplink" accept`, "counter packets 0 bytes 0 drop"} {
+		i := strings.Index(forward, want)
+		if i < 0 || i < at {
+			t.Errorf("the forward chain lacks %q after the rules before it:\n%s", want, forward)
+		}
+		at = i
 	}
 }
 
@@ -559,10 +591,37 @@ func TestTheStacksNamedBridgesAreLeftToDocker(t *testing.T) {
 	if err := in.openPorts(ctx, env, hostNet{bridges: got}); err != nil {
 		t.Fatal(err)
 	}
-	// On the persistent partition: the boot's ruleset has them before the install's start.
+	// On the persistent partition: the boot's ruleset has them before the install's start. An
+	// earlier build's file of holds and accepts goes.
+	if err := os.MkdirAll(filepath.Join(in.O.Dir, ForwardRules), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(in.O.Dir, ForwardRules, "notes-l4.nft"), []byte("iifname \"appnet0\" accept\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := in.openPorts(ctx, env, hostNet{bridges: got}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(in.O.Dir, ForwardRules, "notes-l4.nft")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("an earlier build's file is left: %v", err)
+	}
 	b, _ := os.ReadFile(filepath.Join(in.O.Dir, ForwardRules, "notes-bridges.nft"))
 	if !strings.Contains(string(b), "\niifname \"appnet0\" accept\noifname \"appnet0\" accept\n") {
 		t.Errorf("the forward chain's rules:\n%s", b)
+	}
+	// With the front held to a role: its holds in the hold chain's file, the named bridge among
+	// their destinations, no accept there.
+	in.R.Spec.Front.Interfaces = []string{"uplink"}
+	env.Set("STOWAGE_TLS_MODE", "internal")
+	env.Set(HTTPPortVar, "80")
+	env.Set(HTTPSPortVar, "443")
+	if err := in.openPorts(ctx, env, hostNet{bridges: got}); err != nil {
+		t.Fatal(err)
+	}
+	// The holds go to the hold chain's file, the named bridge among their destinations.
+	b, _ = os.ReadFile(filepath.Join(in.O.Dir, ForwardRules, "notes-front.hold"))
+	if !strings.Contains(string(b), `oifname "appnet0" iifname != "uplink" drop`) || strings.Contains(string(b), " accept") {
+		t.Errorf("the holds:\n%s", b)
 	}
 }
 

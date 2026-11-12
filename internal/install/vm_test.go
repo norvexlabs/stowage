@@ -1359,9 +1359,9 @@ func TestThePortsOfAnInterfaceAreOpenedOnItAlone(t *testing.T) {
 			t.Errorf("no %q in:\n%s", want, b)
 		}
 	}
-	// Docker DNATs the front's ports to its container, past the input chain: the forward chain
+	// Docker DNATs the front's ports to its container, past the input chain: the hold chain
 	// holds them to the front's interfaces and the stack's bridges.
-	fwd, err := os.ReadFile(filepath.Join(in.O.Dir, ForwardRules, "notes-l4.nft"))
+	fwd, err := os.ReadFile(filepath.Join(in.O.Dir, ForwardRules, "notes-front.hold"))
 	want := "meta l4proto tcp ct direction original ct status dnat ct original proto-dst { 80, 443 } oifname \"br-*\" iifname != \"uplink\" drop\n" +
 		"meta l4proto tcp ct direction original ct status dnat ct original proto-dst { 80, 443 } oifname \"docker0\" iifname != \"uplink\" drop\n"
 	if err != nil || !strings.HasSuffix(string(fwd), want) {
@@ -1372,7 +1372,7 @@ func TestThePortsOfAnInterfaceAreOpenedOnItAlone(t *testing.T) {
 	if err := in.openPorts(ctx, env, hostNet{}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(filepath.Join(in.O.Dir, ForwardRules, "notes-l4.nft")); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(in.O.Dir, ForwardRules, "notes-front.hold")); !os.IsNotExist(err) {
 		t.Errorf("loopback mode keeps the front's forward rules: %v", err)
 	}
 }

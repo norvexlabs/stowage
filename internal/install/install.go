@@ -2173,12 +2173,13 @@ const FirewallConf = "/etc/nftables.conf"
 // forwarding (forwardNft) goes to O.Firewall/forward/<name>-forward.nft, which the forward chain
 // includes ahead of its drop, so a boot forwards nothing between the host's interfaces until the
 // start writes it. The front's ports, which Docker translates to its container past the input
-// chain, are held to its roles in the forward chain's <dir>/nftables.d/<name>-l4.nft
-// (frontHolds), removed while none is held: the name earlier releases kept their L4 allowlists
-// under, which each of them removes or rewrites at its start, so a rollback to one never keeps
-// this release's rule. The stack's named bridges go to <dir>/nftables.d/<name>-bridges.nft
-// (bridgeNft). The front's ports are those something serves on (frontServed). The ruleset is
-// loaded again when any file changed.
+// chain, are held to its roles by <dir>/nftables.d/<name>-front.hold (frontHolds), which the
+// hold chain ahead of the forward chain includes (a drop there is final), removed while none is
+// held (an earlier release's bundle includes no *.hold: a rollback never loads it); the stack's
+// named bridges' accepts (bridgeNft) go to the forward chain's <name>-bridges.nft; and
+// <name>-l4.nft, where earlier releases kept their L4 allowlists, is removed.
+// The front's ports are those something serves on (frontServed). The ruleset is loaded again when
+// any file changed.
 func (in *Installer) openPorts(ctx context.Context, env *EnvFile, hn hostNet) error {
 	if in.O.Firewall == "" {
 		return nil
@@ -2259,8 +2260,8 @@ func (in *Installer) openPorts(ctx context.Context, env *EnvFile, hn hostNet) er
 	if err := in.forwardRoles(ctx, get); err != nil {
 		return err
 	}
-	// The forward chain's files: the roles' forwarding, the front's ports held to its roles, the
-	// stack's named bridges.
+	// The forward chains' files: the roles' forwarding, the front's ports held to its roles (the
+	// hold chain's), the stack's named bridges.
 	files := []struct {
 		path, what string
 		rule, cur  []byte
@@ -2269,10 +2270,14 @@ func (in *Installer) openPorts(ctx context.Context, env *EnvFile, hn hostNet) er
 		{path: filepath.Join(in.O.Firewall, name+"-ports.nft"), what: "ports", rule: input},
 		{path: filepath.Join(in.O.Firewall, ForwardDir, name+"-forward.nft"), what: "forwarding between the host's interfaces",
 			rule: forwardNft(in.R.Spec.Host, func(r string) string { return in.roleDevice(r, get) })},
-		{path: filepath.Join(in.O.Dir, ForwardRules, name+"-l4.nft"), what: "front's interfaces", rule: in.frontHolds(env)},
-		// On the persistent partition, which the forward chain includes from a boot on, before
-		// the install's start: the containers Docker restarts on those bridges are reached then.
+		// On the persistent partition, loaded from a boot on, before the install's start: the
+		// front's holds, in the hold chain ahead of the forward chain (a drop there is final,
+		// whatever the forward chain accepts), and the stack's named bridges' accepts in the
+		// forward chain, so the containers Docker restarts on them are reached from the boot on.
+		{path: filepath.Join(in.O.Dir, ForwardRules, name+"-front.hold"), what: "front's interfaces", rule: in.frontHolds(env, hn.bridges)},
 		{path: filepath.Join(in.O.Dir, ForwardRules, name+"-bridges.nft"), what: "stack's named bridges", rule: bridgeNft(hn.bridges)},
+		// Where earlier releases kept their L4 allowlists, and an earlier build the holds: removed.
+		{path: filepath.Join(in.O.Dir, ForwardRules, name+"-l4.nft"), what: "L4 routes' allowlists"},
 	}
 	changed := false
 	for i := range files {
@@ -2316,15 +2321,17 @@ func (in *Installer) openPorts(ctx context.Context, env *EnvFile, hn hostNet) er
 	return nil
 }
 
-// frontHolds are the VM's forward chain's rules holding the ports Docker publishes the front on to
-// the front's roles (front.interfaces; an L4 route the front terminates TLS on, to its own): a new
-// connection to one of them (its original destination port, which Docker's DNAT translates to the
-// front container's, so the input chain never sees it) forwarded to a container bridge (the
-// stack's network: another translation to the port, a cluster's service address, is not judged)
+// frontHolds are the VM's hold chain's rules (a base chain ahead of the forward chain, whose drop is
+// final) holding the ports Docker publishes the front on to the front's roles (front.interfaces;
+// an L4 route the front terminates TLS on, to its own): every packet, in its original direction,
+// of a connection to one of them (its original destination port, which Docker's DNAT translates to the
+// front container's, so the input chain never sees it) forwarded to a container bridge (docker0,
+// br-*, or one of the stack's named bridges: the stack's network; another translation to the port,
+// a cluster's service address, is not judged)
 // is dropped from any interface but those roles' (the stack's own containers reach the front by
 // its routes' names, on their network); nil when none is held,
 // or in loopback mode, where the front is on the loopback address alone.
-func (in *Installer) frontHolds(env *EnvFile) []byte {
+func (in *Installer) frontHolds(env *EnvFile, bridges []string) []byte {
 	if mode, _ := env.Get("STOWAGE_TLS_MODE"); !in.R.Spec.HasFront() || mode == Loopback {
 		return nil
 	}
@@ -2343,7 +2350,7 @@ func (in *Installer) frontHolds(env *EnvFile) []byte {
 		default:
 			from = "iifname != { " + strings.Join(names, ", ") + " } "
 		}
-		for _, out := range []string{"br-*", "docker0"} {
+		for _, out := range append([]string{"br-*", "docker0"}, bridges...) { // every bridge of the stack's
 			rules = fmt.Appendf(rules, "meta l4proto tcp ct direction original ct status dnat ct original proto-dst { %s } oifname %q %sdrop\n",
 				strings.Join(ports, ", "), out, from)
 		}
