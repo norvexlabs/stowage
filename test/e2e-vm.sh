@@ -719,7 +719,18 @@ if ((${#HOST6[@]})); then
 		net "IPv6"
 	done
 	vm6=${vm6%/*}
-	VM_IP=$vm6 on_vm true || fail "no SSH over IPv6 to $vm6"
+	# A new address answers once neighbour discovery settles on both sides: tried for 90 s, each
+	# try said, and on failure both sides' neighbour tables, the VM's addresses and its ip6 rules.
+	tries=0
+	until VM_IP=$vm6 on_vm true; do
+		((++tries < 9)) || {
+			echo "== this host: route and neighbour of $vm6"; ip -6 route get "$vm6"; ip -6 neigh show | grep -F "$vm6"
+			echo "== the VM (over IPv4): addresses, neighbours, ip6 rules"
+			on_vm 'ip -6 addr show scope global; ip -6 neigh show; sudo nft list ruleset | grep -n -E "ip6|dport 22"'
+			fail "no SSH over IPv6 to $vm6"
+		}
+		echo "SSH over IPv6 to $vm6: no answer yet (try $tries)"
+	done
 	code=$(curl -6 -sk --connect-timeout 10 --max-time 30 -o /dev/null -w '%{http_code}' --resolve "app.notes.test:443:[$vm6]" https://app.notes.test/)
 	[[ $code =~ ^[23] ]] || fail "https://app.notes.test/ over IPv6 ([$vm6]) answered $code"
 	! reach "$vm6" 5432 || fail "the L4 route's port answered over IPv6, which its allowlist leaves out"
