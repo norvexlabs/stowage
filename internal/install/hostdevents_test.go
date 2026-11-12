@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -584,6 +585,95 @@ func TestTheGateJournalsItsVerdict(t *testing.T) {
 		if g.rebooted() != c.rebooted {
 			t.Errorf("%s: rebooted %v", name, g.rebooted())
 		}
+		// The verdict says whether the gate reboots: a reader waits for a new boot only then.
+		if e.Reboots == nil || *e.Reboots != c.rebooted {
+			t.Errorf("%s: reboots %v, want %v", name, e.Reboots, c.rebooted)
+		}
+	}
+}
+
+// A reboot that fails is a second verdict of the same boot: no reboot comes, and why.
+func TestAGateWhoseRebootFailsSaysNoRebootComes(t *testing.T) {
+	t.Parallel()
+	g := newGate(t, "active", onTrial, true)
+	g.probe.status = 503
+	g.host.rebootErr = errors.New("systemd is gone")
+	g.gate.In.O.BootIDFile = filepath.Join(t.TempDir(), "boot_id")
+	if err := os.WriteFile(g.gate.In.O.BootIDFile, []byte("boot-9\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.gate.Run(context.Background()); err == nil || !strings.Contains(err.Error(), "the reboot failed") {
+		t.Fatalf("%v", err)
+	}
+	j := ofKind(held(t, g.dir), evBootJudged)
+	if len(j) != 2 || j[0].Reboots == nil || !*j[0].Reboots || j[1].Reboots == nil || *j[1].Reboots || j[1].Verdict != verdictWentBack || j[1].BootID != "boot-9" || !strings.Contains(j[1].Error, "systemd is gone") {
+		t.Fatalf("%+v", j)
+	}
+	// The status gives the last one.
+	d := daemon(g.env, &fakeHost{})
+	d.O.BootIDFile = g.gate.In.O.BootIDFile
+	var st Status
+	call(t, d.Handler(), "GET", "/v1/status", nil, &st)
+	if b := st.BootJudged; b == nil || b.Reboots || b.Verdict != verdictWentBack || !strings.Contains(b.Error, "systemd is gone") || b.Seq != j[1].Seq {
+		t.Errorf("%+v", b)
+	}
+	if out, err := ctl(g.env, served(t, d), "status"); err != nil || !strings.Contains(out, "judged     went_back: the reboot failed: systemd is gone") {
+		t.Errorf("%v\n%s", err, out)
+	}
+}
+
+// The status tells a boot settled once its boot unit and its health gate ran to an end, and
+// gives this boot's verdict alone: one of another boot is not this boot's.
+func TestStatusTellsABootSettledAndItsVerdict(t *testing.T) {
+	t.Parallel()
+	e := installedVM(t)
+	for name, c := range map[string]struct {
+		boot, judge string
+		settled     bool
+	}{
+		"both done":          {"active", "active", true},
+		"gate failed":        {"active", "failed", true},
+		"no gate unit":       {"failed", noBootUnit, true},
+		"boot runs":          {"activating", "inactive", false},
+		"gate queued":        {"active", "inactive", false},
+		"gate runs":          {"active", "activating", false},
+		"boot reloading":     {"reloading", "active", false},
+		"boot never started": {"inactive", "failed", true},
+	} {
+		var st Status
+		call(t, daemon(e, &fakeHost{boot: c.boot, judge: c.judge}).Handler(), "GET", "/v1/status", nil, &st)
+		if st.BootSettled != c.settled {
+			t.Errorf("%s: settled %v", name, st.BootSettled)
+		}
+	}
+	d := daemon(e, &fakeHost{})
+	d.O.BootIDFile = filepath.Join(t.TempDir(), "boot_id")
+	if err := os.WriteFile(d.O.BootIDFile, []byte("boot-2\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var st Status
+	if call(t, daemon(e, &fakeHost{}).Handler(), "GET", "/v1/status", nil, &st); st.BootJudged != nil || !strings.Contains(st.BootJudgedError, "this boot's id cannot be read") {
+		t.Errorf("no boot id: %+v %q", st.BootJudged, st.BootJudgedError)
+	}
+	st = Status{}
+	if call(t, d.Handler(), "GET", "/v1/status", nil, &st); st.BootJudged != nil || !st.BootSettled || st.BootJudgedError != "" {
+		t.Errorf("settled with no verdict: %+v %v", st.BootJudged, st.BootSettled)
+	}
+	f, tr := false, true
+	j := &journal{dir: e.dir}
+	if _, err := j.append(Event{Kind: evBootJudged, BootID: "boot-1", Verdict: verdictWentBack, OnTrial: &tr, Reboots: &tr}); err != nil {
+		t.Fatal(err)
+	}
+	if call(t, d.Handler(), "GET", "/v1/status", nil, &st); st.BootJudged != nil {
+		t.Errorf("another boot's verdict: %+v", st.BootJudged)
+	}
+	seq, err := j.append(Event{Kind: evBootJudged, BootID: "boot-2", Verdict: verdictKeptUnhealthy, OnTrial: &tr, Reboots: &f, Reason: "api answered 503", Kept: "no passive"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	st = Status{}
+	if call(t, d.Handler(), "GET", "/v1/status", nil, &st); st.BootJudged == nil || *st.BootJudged != (BootJudged{Seq: seq, Verdict: verdictKeptUnhealthy, OnTrial: true, Reason: "api answered 503", Kept: "no passive"}) {
+		t.Errorf("%+v", st.BootJudged)
 	}
 }
 
@@ -1071,5 +1161,108 @@ func returnsWithin(t *testing.T, what string, f func()) {
 	case <-done:
 	case <-time.After(5 * time.Second):
 		t.Fatalf("never: %s", what)
+	}
+}
+
+// A boot's verdict outlives a rotation that drops its entry: the state keeps the last one.
+func TestTheVerdictIsKeptThroughARotation(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	j := &journal{dir: dir, keep: 2, max: 3}
+	f := false
+	if _, err := j.append(Event{Kind: evBootJudged, BootID: "boot-1", Verdict: verdictHealthy, Reboots: &f}); err != nil {
+		t.Fatal(err)
+	}
+	for range 6 {
+		if _, err := j.append(Event{Kind: evCertExpiring}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(ofKind(held(t, dir), evBootJudged)) != 0 {
+		t.Fatal("the rotation kept the verdict's entry: the test proves nothing")
+	}
+	if e, err := j.lastJudged("boot-1"); err != nil || e == nil || e.Verdict != verdictHealthy || e.Seq != 1 {
+		t.Errorf("%+v %v", e, err)
+	}
+	if e, err := j.lastJudged("boot-2"); err != nil || e != nil {
+		t.Errorf("another boot's: %+v %v", e, err)
+	}
+}
+
+// A gate that finds no install says so in this boot's verdict: a first install given after it
+// is not a gate that ended without one.
+func TestAGateWithNoInstallJournalsNotInstalled(t *testing.T) {
+	t.Parallel()
+	e := vmEnv(t, "1.0.0")
+	g := &Gate{In: e.installer(func(o *Options) { vm(o); o.BootIDFile = filepath.Join(e.t.TempDir(), "boot_id") }), Host: &fakeHost{}, State: t.TempDir(), Unit: time.Microsecond}
+	if err := os.WriteFile(g.In.O.BootIDFile, []byte("boot-1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if j := ofKind(held(t, e.dir), evBootJudged); len(j) != 1 || j[0].Verdict != verdictNotInstalled || j[0].BootID != "boot-1" || j[0].Reboots == nil || *j[0].Reboots {
+		t.Errorf("%+v", j)
+	}
+}
+
+// cancelOnReboot is a host whose `systemctl reboot` is stopped by the shutdown it starts.
+type cancelOnReboot struct {
+	*fakeHost
+	cancel context.CancelFunc
+}
+
+func (c cancelOnReboot) Run(ctx context.Context, cmd Cmd) ([]byte, error) {
+	if len(cmd.Args) > 1 && cmd.Args[0] == "systemctl" && cmd.Args[1] == "reboot" {
+		c.cancel()
+		return nil, ctx.Err()
+	}
+	return c.fakeHost.Run(ctx, cmd)
+}
+
+// A reboot the shutdown stops is the reboot coming: no second verdict says it failed.
+func TestARebootTheShutdownStopsIsNoFailedReboot(t *testing.T) {
+	t.Parallel()
+	g := newGate(t, "active", onTrial, true)
+	g.probe.status = 503
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	g.gate.Host = cancelOnReboot{g.host, cancel}
+	_ = g.gate.Run(ctx)
+	if j := ofKind(held(t, g.dir), evBootJudged); len(j) != 1 || j[0].Reboots == nil || !*j[0].Reboots {
+		t.Errorf("%+v", j)
+	}
+}
+
+// A reboot whose systemctl a signal ended (the shutdown's) writes no second verdict, even before
+// the gate's context is cancelled; one that exited does.
+func TestKilledBySignal(t *testing.T) {
+	t.Parallel()
+	killed := exec.Command("sh", "-c", "kill -TERM $$").Run()
+	crashed := exec.Command("sh", "-c", "kill -ABRT $$").Run()
+	if killedBySignal(fmt.Errorf("systemctl reboot: %w", crashed)) {
+		t.Errorf("a crash taken for the shutdown: %v", crashed)
+	}
+	exited := exec.Command("sh", "-c", "exit 1").Run()
+	if !killedBySignal(fmt.Errorf("systemctl reboot: %w", killed)) || killedBySignal(fmt.Errorf("systemctl reboot: %w", exited)) || killedBySignal(errors.New("other")) {
+		t.Errorf("killed %v, exited %v", killed, exited)
+	}
+}
+
+// A state written by a writer that keeps no verdict leaves the journal's to tell.
+func TestAVerdictTheStateLacksIsReadOffTheJournal(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	j := &journal{dir: dir}
+	if _, err := j.append(Event{Kind: evBootJudged, BootID: "boot-1", Verdict: verdictHealthy}); err != nil {
+		t.Fatal(err)
+	}
+	st, _ := j.readState()
+	st.Judged = nil
+	if err := j.writeState(st); err != nil {
+		t.Fatal(err)
+	}
+	if e, err := j.lastJudged("boot-1"); err != nil || e == nil || e.Verdict != verdictHealthy {
+		t.Errorf("%+v %v", e, err)
 	}
 }

@@ -18,11 +18,11 @@ in the same installer (bootstrap it as above, then `sh <name>.sh vm create …`,
           [--create opentofu|manual] [--module DIR] [--tofu-var NAME=VALUE]…
           [--vm-name N] [--pool P] [--dataset D] [--bridge B]
           [--cpus N] [--memory MiB] [--disk GiB] [--host H] [--wait DURATION]
-          [--registry PREFIX] [--registry-ca FILE]
+          [--registry PREFIX] [--registry-ca FILE] [--registry-login-file FILE]
 <short>-stow vm seed --json [--platform P] [--hostname H] [--user U] [--ssh-key FILE] [--channel C] [--await-secrets] [--disk-dir DIR]
           [the machine's flags, as vm create's: --network … --device DISK, --interface ROLE=SPEC…, --add-host NAME=IP…]
           [--tls MODE] [--domains route=host,…] [--http-port N] [--https-port N]
-          [--set KEY=VALUE]… [--set-file KEY=PATH]… [--answers FILE] [--registry PREFIX] [--registry-ca FILE]
+          [--set KEY=VALUE]… [--set-file KEY=PATH]… [--answers FILE] [--registry PREFIX] [--registry-ca FILE] [--registry-login-file FILE]
                                                    # a VM's first-boot material as JSON, the VM made by your own means
 <short>-stow vm destroy HOSTNAME [--yes] [--no-input] [--accessible]
 <short>-stow vm attach HOSTNAME --interface ROLE=SPEC [--user U] [--ssh-key FILE] [--host H] [--known-hosts-line LINE] [--wait DURATION]
@@ -38,7 +38,9 @@ in the same installer (bootstrap it as above, then `sh <name>.sh vm create …`,
   `--ipv6`, `--tune-profile`, `--ssh-allow`, `--timezone`, `--device`, `--interface`,
   `--add-host`), the front's (`--tls`, `--domains`, `--http-port`, `--https-port`), `--set`,
   `--set-file` and `--answers` (inputs that are not secret, and an answers file's `tls` section),
-  `--registry` and `--registry-ca`, `--channel` (the channel the first install follows; default
+  `--registry`, `--registry-ca` and `--registry-login-file` (checked as `vm create` checks it;
+  the seed names its host alone, `registry_login`, and the program gives the file over SSH once
+  the VM answers, `sudo <short>-stow registry-login -`), `--channel` (the channel the first install follows; default
   the release's), and its own: `--await-secrets` (the first install waits for a decrypted
   `secrets export`, given over SSH once the VM answers, `sudo <short>-stow install --secrets -
   --no-input`, as `vm create --secrets` makes it; a machine made again), `--tls byo` (it waits
@@ -102,7 +104,8 @@ in the same installer (bootstrap it as above, then `sh <name>.sh vm create …`,
   artifact's title, the name `vm create` writes it under) —: its absolute path, format, the SHA-256 of its
   bytes (decompressed: what a hypervisor imports) and `disk_gib`; left out otherwise.
   `await_secrets` (`--await-secrets`) and `await_tls` (`--tls byo`) say what the first install
-  waits for over SSH, left out when false. `waiting` names, sorted,
+  waits for over SSH, left out when false. `registry_login` (`--registry-login-file`) is the
+  mirror's host the login is for, never the login; left out without it. `waiting` names, sorted,
   the keys of the required secret inputs nothing gives (never a value; left out when there are
   none): the VM's first install waits for them, as `vm create` says, until they are given over
   SSH (`sudo <short>-stow install --given - --no-input`). `--platform` missing, not a platform
@@ -352,6 +355,21 @@ in the same installer (bootstrap it as above, then `sh <name>.sh vm create …`,
   PREFIX` (a mirror, checked as a repository name) the disk is read there instead, with the
   Docker client's login, and `--registry-ca FILE` (certificates only) is trusted for that read;
   the review shows the registry and the CA file.
+- **A mirror that asks for a sign-in.** `--registry-login-file FILE|-` (an empty value is refused) is the login the VM reads its
+  mirror with: a Docker config holding one `auths` entry for the mirror's host (as
+  `registry-login` takes it, see [vm](vm.md)), checked before anything is made. It is refused
+  without `--registry` (the release's own registry is read with its pull account), for another
+  host than `--registry`'s, for a file that is not one such entry, and when the VM would boot
+  another release's disk set (its first boot reads this release's OS bundle from the mirror
+  before the login reaches it: give the mirror this release's own disks). It never enters the
+  cloud-config, a log or the review: the cloud-config carries the one-time host key, and with
+  OpenTofu, once the VM answers, `vm create` runs `sudo <short>-stow registry-login -` over SSH
+  pinned to that key, the login on its standard input, before any install over SSH (a failure
+  keeps the VM, naming the step to run by hand and what the install still waits for); the seed's key is retired after it when no
+  install over SSH follows. With `--create manual` the steps say to run `ssh <user>@<address>
+  sudo <short>-stow registry-login - < FILE` once it answers. The VM's first install reads
+  nothing from the mirror (its images are preloaded), so it does not wait for the login; its
+  updates and upgrades take it.
 - The cloud-config (`#cloud-config`, Kairos's stages, applied at every boot) sets the host name
   in the `initramfs` stage, before the network starts (a DHCP request carries it, so a DHCP
   server that registers names registers it); then, in `boot`, creates the administrator with the SSH key and no password, then, in a step of its own,

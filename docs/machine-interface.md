@@ -17,6 +17,7 @@ share; each shape's own fields and verbs are on its page:
 | `k8s status --json` and the `k8s` verbs' `--json` | [kubernetes.md](kubernetes.md) |
 | `vm seed --json`, `vm host-key --json`, `<short>-stow host-key --json` | [vm-create.md](vm-create.md) |
 | The VM's `status --json`, its verbs' `--json`, exit status on the VM, the host daemon's API | [vm.md](vm.md) |
+| Following a VM's upgrade or rollback from `status --json` alone | [below](#following-a-vms-boot) |
 | The `command` provider contract (programs Stowage calls, not this interface) | [contracts.md](contracts.md) |
 
 ## status --json
@@ -187,6 +188,30 @@ share; each shape's own fields and verbs are on its page:
   fails prints no object, only its error. `upgrade --version --json` passes `--json` to the
   installer it fetches, which prints the object; the run that fetched it prints none and exits
   with that installer's status (an installer from before 0.34.0 refuses the flag).
+## Following a VM's boot
+
+- A program following a VM's `upgrade` or `rollback` (or any reboot) reads the VM's `status
+  --json` alone ([vm](vm.md)), never the event journal: the boot it reads is a new one when
+  `boot_id` differs from the one before the reboot, and it is over when `boot_settled` is
+  `true` (the boot unit and the health gate both ran to an end). Then:
+  - `boot_judged` absent, on an install, and no `boot_judged_error`: the health gate ended
+    without a verdict — a failure to report now, not to wait out (`journalctl -u <name>-health`
+    on the VM tells why). With `boot_judged_error`, the verdict cannot be told (this boot's id or
+    the journal cannot be read).
+  - `not_installed`: the gate ran before the first install (one given over SSH after it):
+    nothing was judged in this boot; the install's `installed` and `installing` tell the rest.
+  - `boot_judged.verdict` `healthy`: the boot is kept; `installed` is the release it runs.
+  - `went_back` with `reboots` `true`: the gate reboots into the passive system — wait for the
+    next `boot_id`, whose boot goes back to the release the upgrade replaced.
+  - `went_back` with `reboots` `false`: no reboot comes from the gate (marking the boot failed,
+    or the reboot failed: `error` says which); the next boot, whenever it comes, falls back.
+  - `kept_unhealthy`: the boot keeps running unhealthy, `kept` saying why (going back refused,
+    no passive system, a boot not on trial); `failed_boot` names its diagnostics.
+  `installed`, `on_trial`, `fallback` and `failed_boot` are then final for that boot. A rollback's
+  boot of the passive system is not on trial: the gate still judges it, `on_trial` `false`.
+- The VM's `registry_login` says it holds a login to its mirror (the host, never the login;
+  [vm](vm.md), `registry-login`): a program that gave one over SSH reads it back there.
+
 ## Exit status
 
 - **Exit status** of every `<short>-stow` run: `0` done, or nothing to do; `3` refused — a rule

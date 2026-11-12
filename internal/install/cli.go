@@ -977,7 +977,7 @@ func ipv6Flag(f *pflag.FlagSet, v **bool, usage string) {
 func vmCreateCommand(in *Installer, o *Options, prepare func() error, terminal func(bool) Prompter, sets, setFiles, domains *[]string, answers *string, noInput, accessible, takesTLS *bool) *cobra.Command {
 	name, m := in.R.Spec.Name, in.R.Manifest
 	var c VMCreate
-	var secretsFile string
+	var secretsFile, loginFile string
 	var tofuVars []string
 	var kitFlags givenFlags
 	vm := &cobra.Command{
@@ -1017,6 +1017,14 @@ func vmCreateCommand(in *Installer, o *Options, prepare func() error, terminal f
 			}
 			if c.Ctl, err = os.Executable(); err != nil {
 				return err
+			}
+			if loginFile != "" {
+				if loginFile == "-" && (secretsFile == "-" || kitFlags.kit == "-") {
+					return errors.New("--registry-login-file and another flag both name standard input, which is read once")
+				}
+				if c.RegistryLogin, err = readFlagFile("--registry-login-file", loginFile, cmd.InOrStdin(), maxRegistryLogin); err != nil {
+					return err
+				}
 			}
 			if secretsFile != "" {
 				if secretsFile == "-" && kitFlags.kit == "-" {
@@ -1066,6 +1074,7 @@ func vmCreateCommand(in *Installer, o *Options, prepare func() error, terminal f
 	f.BoolVar(accessible, "accessible", false, "ask with plain line prompts (screen readers); also when ACCESSIBLE is set or TERM=dumb")
 	f.StringVar(&o.Registry, "registry", "", "a registry prefix to read the disk and the VM's updates from, a mirror")
 	f.StringVar(&o.RegistryCA, "registry-ca", "", "a PEM file of the CA the registry's certificate chains to, a mirror's own: trusted here and, through the cloud-config, by the VM")
+	f.Var(pathFlag{&loginFile}, "registry-login-file", "a Docker config holding one auths entry, the mirror's login for its host, which the VM's reads of the mirror take: given over SSH once the VM answers, never in the cloud-config")
 	var tofuKeys []string
 	for _, p := range Platforms {
 		if p.Tofu {
@@ -1131,6 +1140,7 @@ func vmCreateCommand(in *Installer, o *Options, prepare func() error, terminal f
 	_ = attach.MarkFlagRequired("interface")
 	var sc VMCreate
 	var so SeedOptions
+	var seedLogin string
 	stdout := o.Out // the command's standard output, which the seed alone goes to
 	seed := &cobra.Command{
 		Use:   "seed",
@@ -1141,6 +1151,12 @@ func vmCreateCommand(in *Installer, o *Options, prepare func() error, terminal f
 			s, err := func() (*VMSeed, error) {
 				if err := prepare(); err != nil {
 					return nil, err
+				}
+				if seedLogin != "" {
+					var err error
+					if so.RegistryLogin, err = readFlagFile("--registry-login-file", seedLogin, cmd.InOrStdin(), maxRegistryLogin); err != nil {
+						return nil, err
+					}
 				}
 				// Standard output is the seed's alone; nothing is asked.
 				in.O.Out, in.O.Prompt = in.O.Log, nil
@@ -1167,6 +1183,7 @@ func vmCreateCommand(in *Installer, o *Options, prepare func() error, terminal f
 	sf.StringVar(answers, "answers", "", "a YAML file of the non-secret inputs, KEY: value, and the front's tls section (no secret input, no certificate: those go after the boot, over SSH)")
 	sf.StringVar(&o.Registry, "registry", "", "a registry prefix to read the disk and the VM's updates from, a mirror")
 	sf.StringVar(&o.RegistryCA, "registry-ca", "", "a PEM file of the CA the registry's certificate chains to, a mirror's own: trusted here and, through the cloud-config, by the VM")
+	sf.Var(pathFlag{&seedLogin}, "registry-login-file", "a Docker config holding one auths entry, the mirror's login for its host: checked, and named in the seed (registry_login) by its host alone; the program gives it over SSH once the VM answers (`registry-login -`)")
 	var seedJSON bool
 	sf.BoolVar(&seedJSON, "json", false, "print the seed as one JSON object (required: the seed is for a program)")
 	_ = seed.MarkFlagRequired("json")

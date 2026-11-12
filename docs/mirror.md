@@ -60,6 +60,10 @@ carries it:
   `<short>-stow k8s install --image-registry PREFIX --registry-ca FILE` (Kubernetes) and `<short>-stow
   vm create --registry PREFIX --registry-ca FILE` (the Kairos VM). A newer release crosses the
   same way; `upgrade --version`, `updates` and the VM's `upgrade` find it in the mirror.
+- A mirror that refuses anonymous reads: Docker reads it with the Docker client's login,
+  Kubernetes with the pull Secret `--image-pull-login` writes from that login, and the VM with the
+  login `vm create --registry-login-file FILE` gives it over SSH (or `sudo <short>-stow
+  registry-login -` on the VM), for the mirror's host alone ([vm](vm.md)).
 - `vm create --create opentofu` also needs its module's OpenTofu provider, which `tofu init`
   fetches from the OpenTofu registry: on a site without internet, give `tofu` a provider mirror
   (a `provider_installation { filesystem_mirror { … } }` block in a CLI configuration file named

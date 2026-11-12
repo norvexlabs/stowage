@@ -657,6 +657,10 @@ func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(
 	}
 	hostKey.Flags().BoolVar(&hkJSON, "json", false, "print the key as one JSON object (format, public_key, known_hosts_line when the host name can hold one, fingerprint, retired, reason when not, note), a refusal as one too")
 	root.AddCommand(hostKey)
+	regLogin := registryLoginCommand(in, &o, stdout, os.Geteuid)
+	dirFlag(regLogin)
+	settingsFlag(regLogin)
+	root.AddCommand(regLogin)
 	root.AddCommand(prov, updates, upgrade, rollback, reset, secrets, restore, netCmd, backupCommand(c, name, stdout, stderr),
 		power("reboot", "Reboot the VM", "/v1/reboot"),
 		power("shutdown", "Power the VM off", "/v1/shutdown"))
@@ -877,6 +881,27 @@ func (c *hostClient) status(ctx context.Context, asJSON bool) error {
 		}
 		fmt.Fprintf(c.out, "boot       %s\n", boot)
 	}
+	if j := st.BootJudged; j != nil {
+		judged := j.Verdict
+		switch {
+		case j.Reboots:
+			judged += ", rebooting into the passive system"
+		case j.Error != "":
+			judged += ": " + j.Error
+		case j.Verdict == verdictWentBack:
+			judged += ": the next boot goes back"
+		case j.Verdict == verdictNotInstalled:
+			judged += ": the gate ran before the first install; nothing was judged in this boot"
+		}
+		fmt.Fprintf(c.out, "judged     %s\n", judged)
+	} else if st.BootJudgedError != "" {
+		fmt.Fprintf(c.out, "judged     unknown: %s\n", st.BootJudgedError)
+	} else if st.BootSettled && st.Installed != nil && st.Boot != "" {
+		fmt.Fprintln(c.out, "judged     no verdict: the health gate ended without one in this boot (`journalctl -u "+st.Name+"-health` tells why)")
+	}
+	if !st.BootSettled && st.Boot != "" {
+		fmt.Fprintln(c.out, "settling   the boot or its health gate still runs, or their state cannot be read (`systemctl status "+st.Name+" "+st.Name+"-health`)")
+	}
 	if fb := st.FailedBoot; fb != nil {
 		fmt.Fprintf(c.out, "failed     %s %s at %s: %s\n           diagnostics: %s\n", st.Name, fb.Release, fb.At.Format(time.RFC3339), fb.Reason, fb.Dir)
 		if fb.Kept != "" {
@@ -901,6 +926,12 @@ func (c *hostClient) status(ctx context.Context, asJSON bool) error {
 		if ct.Warning != "" {
 			fmt.Fprintf(c.out, "           warning: %s\n", ct.Warning)
 		}
+	}
+	if st.RegistryLogin != "" {
+		fmt.Fprintf(c.out, "login      held for the mirror %s\n", st.RegistryLogin)
+	}
+	if st.RegistryLoginError != "" {
+		fmt.Fprintf(c.out, "login      unreadable: %s\n", st.RegistryLoginError)
 	}
 	if st.NetworkWarning != "" {
 		fmt.Fprintf(c.out, "network    warning: %s\n", st.NetworkWarning)

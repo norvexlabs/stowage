@@ -38,28 +38,6 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
    every other install pulling; an install without one keeps the baked account. Not in 0.35.0
    (user, 2026-11-11): (a) needs a `registry.pull` mint operation per registry, an issuing
    credential, revocation and a fallback.
-2. **A VM reads a mirror that asks for a sign-in**: Docker and Kubernetes installs read an
-   authenticated mirror with the operator's Docker login (`--image-pull-login` writing the cluster's
-   pull Secret), but a VM pulls from its mirror by itself and its settings carry only `registry`
-   and `registry_ca` (`vm create`, `vm seed` and the install's re-runs alike), so a mirror that
-   refuses anonymous reads cannot serve a VM. Carry a mirror login to the VM the way its secrets
-   go: after the boot, over SSH (never in the seed's cloud-config), recorded on the VM like a
-   secret, used for that mirror's host alone (the release's pull account never sent there), kept
-   through upgrades and rollbacks, replaced by a re-run; `status --json` says a login is held,
-   never its value. Options: (a) a `--registry-login-file` (Docker config `auths` entry) on
-   `vm create`, the VM's `install`, and `vm seed --await-secrets` waiting for it (recommended: one
-   format the provider already writes); (b) `--registry-user` plus the password on standard input.
-
-### VM — the machine interface
-
-1. **The VM's `status --json` says when a boot has settled**: a program following an upgrade or
-   a rollback cannot tell from `status --json` alone that the boot it reads has moved the install
-   to that boot's OS release (a rollback's passive boot is never on trial, and answers before its
-   boot unit is done), so it reads the event journal for the health gate's verdict instead. Give
-   `status --json` the boot unit's state (`boot: {id, settled}`, from what the host daemon's
-   status handler already works out) and record in the gate's verdict whether it rebooted, so a
-   gate that exits without a verdict, or a "not kept" whose reboot never comes, is told at once
-   rather than by a timeout. The provider's VM target then reads `status --json` alone.
 
 ### Kits — what a handoff's step reads
 
@@ -629,6 +607,15 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
   installers, the payload appended to each; needed before the provider's Kubernetes target ships.
 
 ## Could
+
+- **The VM's `boot_settled` never settles when the health gate's unit is skipped or stopped**: it
+  waits for `<name>-health.service` to be active or failed, so a gate unit its condition skipped
+  or an operator stopped (`inactive`, no job queued) keeps `settling` for the boot. Read the
+  unit's queued job (`Job`) and take inactive with none as ended, the boot unit's rule.
+
+- **The VM's status reads the event journal twice before a boot's first verdict**: `lastJudged`
+  falls back to the journal while the state holds no verdict, and `since(-1, 0)` locks it again
+  for the cursor; one read could serve both.
 
 - **e2e-vm's SSH over IPv6 times out now and then**: the VM has its global address and its IPv6
   default route, yet this host's SSH to it times out (`no SSH over IPv6 to …`); 2 runs of 4 on

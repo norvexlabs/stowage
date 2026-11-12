@@ -48,6 +48,10 @@ type VMSeed struct {
 	// Waiting are the keys of the required secret inputs nothing gives, sorted (never a value):
 	// the VM's first install waits for them, given over SSH once the VM answers. Empty: omitted.
 	Waiting []string `json:"waiting,omitempty"`
+	// RegistryLogin is the host of the mirror whose login --registry-login-file checked: the VM's
+	// reads of the mirror take it, given over SSH once the VM answers (`sudo <short>-stow
+	// registry-login -`); never the login itself. Empty: omitted.
+	RegistryLogin string `json:"registry_login,omitempty"`
 }
 
 // SeedDisk is a disk image: its format, its reference by digest, what Kairos takes of a VM's disk
@@ -79,6 +83,9 @@ type SeedOptions struct {
 	Channel      string
 	AwaitSecrets bool
 	DiskDir      string
+	// RegistryLogin is --registry-login-file's login file, checked for the mirror (createLogin);
+	// nil: none. The seed names its host alone.
+	RegistryLogin []byte
 }
 
 // seedRefusal refuses a seed given the secret inputs or TLS material names: it carries neither.
@@ -123,6 +130,10 @@ func (in *Installer) SeedVM(ctx context.Context, c *VMCreate, so SeedOptions) (*
 	if err != nil {
 		return nil, err
 	}
+	login, err := in.createLogin(so.RegistryLogin, prefix)
+	if err != nil {
+		return nil, err
+	}
 	p, _, err := in.platform(ctx, c.Platform)
 	if err != nil {
 		return nil, err
@@ -152,6 +163,9 @@ func (in *Installer) SeedVM(ctx context.Context, c *VMCreate, so SeedOptions) (*
 	s := &VMSeed{Format: MachineFormat, Platform: p.Key, UserData: string(userData), MetaData: string(MetaData(mach)), KnownHostsLine: seedHostAlias + " " + key.Public,
 		Fingerprint: key.Fingerprint, HostKeyPrivate: string(key.Private), Disk: map[string]SeedDisk{}, AppGiB: app, Waiting: slices.Sorted(slices.Values(waiting)),
 		AwaitSecrets: so.AwaitSecrets, AwaitTLS: byo}
+	if login != nil {
+		s.RegistryLogin = login.Host
+	}
 	var platformRef name.Digest // --platform's disk, which --disk-dir writes
 	for _, pl := range Platforms {
 		i := slices.IndexFunc(pl.Formats, func(f string) bool { _, ok := in.boot.osMiB[f]; return ok })

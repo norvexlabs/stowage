@@ -12,12 +12,14 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"regexp"
 	"slices"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/norvexlabs/stowage/internal/command"
@@ -160,13 +162,19 @@ type Gate struct {
 }
 
 // judged journals the gate's verdict on this boot: healthy, went_back (the next boot runs the
-// passive system) or kept_unhealthy (why in kept); reason is why the install was not healthy.
-// The boot's record is read until a read succeeds, then kept for the gate's run.
-func (g *Gate) judged(onTrial bool, verdict, reason, kept string) {
+// passive system) or kept_unhealthy (why in kept); reason is why the install was not healthy,
+// reboots whether the gate reboots now (Event.Reboots). The boot's record is read until a read
+// succeeds, then kept for the gate's run.
+func (g *Gate) judged(onTrial bool, verdict, reason, kept string, reboots bool) {
+	g.journalJudged(Event{OnTrial: &onTrial, Verdict: verdict, Reason: reason, Kept: kept, Reboots: &reboots})
+}
+
+// journalJudged journals e as this boot's boot.judged, its boot and release filled in.
+func (g *Gate) journalJudged(e Event) {
 	m := g.In.R.Manifest
 	rel := Version{m.ProjectVersion, m.Revision}
 	boot := g.boot.get(time.Now(), bootRetry*cmp.Or(g.Unit, time.Second), func() *Event { return bootRecord(&g.In.O, rel) })
-	e := Event{Kind: evBootJudged, BootID: bootIDOf(boot), Release: &rel, OnTrial: &onTrial, Verdict: verdict, Reason: reason, Kept: kept}
+	e.Kind, e.BootID, e.Release = evBootJudged, bootIDOf(boot), &rel
 	if _, err := (&journal{dir: g.In.O.Dir, boot: boot}).append(e); err != nil {
 		g.In.O.logf("the event journal: %v", err)
 	}
@@ -218,15 +226,15 @@ func (g *Gate) Run(ctx context.Context) error {
 	}
 	if why == nil {
 		if !onTrial {
-			g.judged(false, verdictHealthy, "", "")
+			g.judged(false, verdictHealthy, "", "", false)
 			o.logf("%s is healthy", this)
 			return nil
 		}
 		if err := a.set(ctx, assessEnable+"=", assessTentative+"="); err != nil {
-			g.judged(true, verdictWentBack, "marking the boot good failed: "+reason(err), "")
+			g.judged(true, verdictWentBack, "marking the boot good failed: "+reason(err), "", false)
 			return fmt.Errorf("%s is healthy, but marking the boot good failed (the next boot would fall back): %w", this, err)
 		}
-		g.judged(true, verdictHealthy, "", "")
+		g.judged(true, verdictHealthy, "", "", false)
 		o.logf("%s is healthy: the upgrade is kept", this)
 		return nil
 	}
@@ -247,30 +255,49 @@ func (g *Gate) Run(ctx context.Context) error {
 	failed := fmt.Errorf("%s is not healthy: %w (diagnostics: %s)", this, why, cmp.Or(dir, "none"))
 	unhealthy := reason(why)
 	if !onTrial {
-		g.judged(false, verdictKeptUnhealthy, unhealthy, "the boot is not on trial: there is nothing to go back to")
+		g.judged(false, verdictKeptUnhealthy, unhealthy, "the boot is not on trial: there is nothing to go back to", false)
 		return failed
 	}
 	if kept != "" {
 		if err := a.set(ctx, assessEnable+"=", assessTentative+"="); err != nil {
-			g.judged(true, verdictWentBack, unhealthy, "")
+			g.judged(true, verdictWentBack, unhealthy, "", false)
 			return fmt.Errorf("%w; going back is refused (%s), but marking the boot kept failed (the next boot would fall back): %v", failed, kept, err)
 		}
-		g.judged(true, verdictKeptUnhealthy, unhealthy, kept)
+		g.judged(true, verdictKeptUnhealthy, unhealthy, kept, false)
 		return fmt.Errorf("%w; this system is kept, as going back is refused: %s", failed, kept)
 	}
 	if !fileExists(filepath.Join(a.dir, passiveImage)) {
-		g.judged(true, verdictKeptUnhealthy, unhealthy, "there is no passive system to go back to")
+		g.judged(true, verdictKeptUnhealthy, unhealthy, "there is no passive system to go back to", false)
 		return fmt.Errorf("%w; there is no passive system to go back to", failed)
 	}
 	// Journaled before the reboot, which may end this process: a reboot that fails leaves the
 	// marks set, so the next boot goes back all the same.
-	g.judged(true, verdictWentBack, unhealthy, "")
+	g.judged(true, verdictWentBack, unhealthy, "", true)
 	o.logf("%v", failed)
 	o.logf("rebooting: Kairos boots the passive system, and its boot goes back to the release the upgrade replaced")
 	if _, err := g.Host.Run(ctx, Cmd{Args: []string{"systemctl", "reboot"}}); err != nil {
+		// A run the shutdown stopped is the reboot coming: no second verdict. Its signal may reach
+		// systemctl before the gate's context is cancelled.
+		if ctx.Err() != nil || killedBySignal(err) {
+			return fmt.Errorf("%w; stopped as the system goes down: %v", failed, cmp.Or[error](ctx.Err(), err))
+		}
+		// The marks stay set: the next boot, whenever it comes, goes back all the same.
+		f, onTrial := false, true
+		g.journalJudged(Event{OnTrial: &onTrial, Verdict: verdictWentBack, Reason: unhealthy, Reboots: &f, Error: "the reboot failed: " + reason(err)})
 		return fmt.Errorf("%w; the reboot failed: %v", failed, err)
 	}
 	return failed
+}
+
+// killedBySignal reports whether err is a program's that the shutdown's signal ended (SIGTERM or
+// SIGKILL), not one that exited or crashed.
+func killedBySignal(err error) bool {
+	var ee *exec.ExitError
+	if !errors.As(err, &ee) || ee.ProcessState == nil {
+		return false
+	}
+	ws, ok := ee.ProcessState.Sys().(syscall.WaitStatus)
+	return ok && ws.Signaled() && (ws.Signal() == syscall.SIGTERM || ws.Signal() == syscall.SIGKILL)
 }
 
 // trial reads the boot assessment: whether GRUB booted the active system on trial.
@@ -301,12 +328,15 @@ func (g *Gate) noInstall(ctx context.Context) error {
 		}
 	}
 	if !onTrial {
+		g.judged(false, verdictNotInstalled, "", "", false)
 		o.logf("%s holds no install yet: there is nothing to judge", o.Dir)
 		return nil
 	}
 	if err := a.set(ctx, assessEnable+"=", assessTentative+"="); err != nil {
+		g.judged(true, verdictWentBack, "the boot held no install, and marking the OS its first boot switched to good failed: "+reason(err), "", false)
 		return fmt.Errorf("%s holds no install yet, but marking the OS its first boot switched to good failed (the next boot would fall back to the older OS): %w", o.Dir, err)
 	}
+	g.judged(true, verdictNotInstalled, "", "", false)
 	o.logf("%s holds no install yet: the OS its first boot switched to is marked good, as the passive system holds no install to go back to", o.Dir)
 	return nil
 }

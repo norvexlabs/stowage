@@ -314,7 +314,23 @@ type Status struct {
 	// BootID is the kernel's id of this boot: a client that saw a reboot scheduled knows the
 	// appliance rebooted when it changes. Empty when it cannot be read.
 	BootID string `json:"boot_id,omitempty"`
-	Job    string `json:"job"` // the last job's state, idle when none ran
+	// BootSettled: this boot's units ran to an end — <name>.service (the boot's install, upgrade
+	// or going back) and <name>-health.service (the health gate) are active or failed, or the
+	// host has none (a Docker install): what the status says of this boot changes no more but by
+	// a job. False while either runs or is queued, or when their state cannot be read.
+	BootSettled bool `json:"boot_settled"`
+	// BootJudged is the health gate's last verdict in this boot (its boot.judged entry); nil
+	// before it, or when it cannot be told, BootJudgedError then saying why. Settled with none and
+	// no error, the gate ended without a verdict.
+	BootJudged      *BootJudged `json:"boot_judged,omitempty"`
+	BootJudgedError string      `json:"boot_judged_error,omitempty"`
+	// RegistryLogin is the host of the mirror the VM holds a login for (`registry-login`): never
+	// the login itself. Empty when it holds none.
+	RegistryLogin string `json:"registry_login,omitempty"`
+	// RegistryLoginError: the login file held cannot be read (the reads of the mirror fail on it),
+	// naming the file and the fix; never a value.
+	RegistryLoginError string `json:"registry_login_error,omitempty"`
+	Job                string `json:"job"` // the last job's state, idle when none ran
 	// Events is the event journal's last entry number (0 before the first): GET
 	// /v1/events?after= it follows from there. Null when the journal cannot be read, and
 	// EventsError then says why: a reader never takes a cursor the journal did not give.
@@ -323,6 +339,26 @@ type Status struct {
 	// NetworkWarning: IPv6 is on and the primary link has had no IPv6 default route for a minute
 	// or more; the daemon solicits the routers until one answers.
 	NetworkWarning string `json:"network_warning,omitempty"`
+}
+
+// BootJudged is the health gate's verdict on a boot, as its boot.judged entry records it.
+type BootJudged struct {
+	Seq     int64  `json:"seq"` // the entry's number in the event journal
+	Verdict string `json:"verdict"`
+	OnTrial bool   `json:"on_trial"`
+	// Reboots: the gate reboots now, into the passive system; false, no reboot comes from it.
+	Reboots bool   `json:"reboots"`
+	Reason  string `json:"reason,omitempty"`
+	Kept    string `json:"kept,omitempty"`
+	Error   string `json:"error,omitempty"`
+}
+
+// judgedOf is e's verdict; nil for none.
+func judgedOf(e *Event) *BootJudged {
+	if e == nil {
+		return nil
+	}
+	return &BootJudged{Seq: e.Seq, Verdict: e.Verdict, OnTrial: e.OnTrial != nil && *e.OnTrial, Reboots: e.Reboots != nil && *e.Reboots, Reason: e.Reason, Kept: e.Kept, Error: e.Error}
 }
 
 // Disk is the persistent partition's space.
@@ -867,9 +903,13 @@ func (h *Hostd) status(w http.ResponseWriter, r *http.Request) {
 	}
 	// The boot unit runs the first install: while it runs, a failure recorded before is being
 	// retried; failed with no install written, it failed before writing one.
-	if boot, err := h.bootState(r.Context()); err == nil {
+	boot, bootErr := h.bootState(r.Context())
+	// The gate runs after the boot unit: ended, and the boot unit not running (one a failed
+	// dependency never started stays inactive), the boot is over.
+	st.BootSettled = h.Docker || (bootErr == nil && !unitRunning(boot) && h.gateDone(r.Context()))
+	if err := bootErr; err == nil {
 		switch {
-		case boot != "active" && boot != "failed" && boot != noBootUnit:
+		case !unitDone(boot):
 			st.InstallFailed = ""
 		case boot == "failed" && st.Installed == nil:
 			st.InstallFailed = fmt.Sprintf("the boot's install failed before it wrote the install (`journalctl -u %s` tells why)", m.Name)
@@ -886,6 +926,16 @@ func (h *Hostd) status(w http.ResponseWriter, r *http.Request) {
 	}
 	st.FailedBoot = lastFailedBoot(in.O.Dir)
 	st.BootID = h.bootID()
+	if !h.Docker && st.BootID == "" {
+		st.BootJudgedError = "this boot's id cannot be read: its verdict is not told"
+	} else if !h.Docker {
+		if e, err := h.journal().lastJudged(st.BootID); err != nil {
+			st.BootJudgedError = fmt.Sprintf("the event journal cannot be read: %v", err)
+		} else {
+			st.BootJudged = judgedOf(e)
+		}
+	}
+	st.RegistryLogin, st.RegistryLoginError = in.heldLoginHost()
 	st.NetworkWarning = h.route6Warning()
 	if a, err := h.journal().since(-1, 0); err != nil {
 		st.EventsError = fmt.Sprintf("the event journal cannot be read: %v", err)
@@ -1561,7 +1611,7 @@ func (h *Hostd) booting(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if st != "active" && st != "failed" && st != noBootUnit {
+	if !unitDone(st) {
 		return fail(http.StatusConflict, "the boot is still bringing the install up (%s.service is %s): wait for it", h.R.Spec.Name, st)
 	}
 	return nil
@@ -1582,10 +1632,25 @@ func (h *Hostd) judged(ctx context.Context) error {
 		return err
 	}
 	// RemainAfterExit: a judged boot leaves the gate active, or failed.
-	if st != "active" && st != "failed" && st != noBootUnit {
+	if !unitDone(st) {
 		return fail(http.StatusConflict, "the health gate has not judged this boot yet (%s is %s): wait for it, or `systemctl start %s` if it does not run", unit, st, unit)
 	}
 	return nil
+}
+
+// unitDone reports whether a unit's state (unitState's) is an end: active or failed (a oneshot
+// unit with RemainAfterExit), or no such unit.
+func unitDone(st string) bool { return st == "active" || st == "failed" || st == noBootUnit }
+
+// unitRunning reports whether a unit's state is a change under way.
+func unitRunning(st string) bool {
+	return st == "activating" || st == "deactivating" || st == "reloading" || st == "refreshing"
+}
+
+// gateDone reports whether the health gate's unit ran to an end in this boot.
+func (h *Hostd) gateDone(ctx context.Context) bool {
+	st, err := unitState(ctx, h.Host, h.R.Spec.Name+"-health.service")
+	return err == nil && unitDone(st)
 }
 
 // noBootUnit is bootState's answer on a host without <name>.service.
