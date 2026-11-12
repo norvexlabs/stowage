@@ -23,6 +23,10 @@ follow [SemVer](https://semver.org/).
 
 ### Fixed
 
+- `ship`'s refusal of a release already published on an immutable channel with other inputs
+  names what differs: each part of the build (`installer`, `os-bundle`, an image…) and the inputs
+  of it that changed (`changelog`, `spec`, `pull`…), read from what each ship now records on the
+  release.
 - `vm create` stops waiting as soon as the VM's first boot gives up in Kairos's recovery system,
   naming the automatic reset's last journal lines, instead of waiting out `--wait`; `status
   --json` on the VM says so in `reset_failed`, and `status` after the boot.

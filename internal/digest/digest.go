@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"io/fs"
 	"os"
@@ -26,12 +27,15 @@ import (
 type Builder struct {
 	h io.Writer
 	s interface{ Sum([]byte) []byte }
+	// fields hashes each label's values apart, in the order given: what Fields tells. It never
+	// enters Sum.
+	fields map[string]hash.Hash
 }
 
 // New starts a digest under a domain label, so two node kinds hashing the same bytes differ.
 func New(domain string) *Builder {
 	h := sha256.New()
-	b := &Builder{h: h, s: h}
+	b := &Builder{h: h, s: h, fields: map[string]hash.Hash{}}
 	b.Field("domain", domain)
 	return b
 }
@@ -39,6 +43,23 @@ func New(domain string) *Builder {
 // Field adds a labelled value.
 func (b *Builder) Field(label, value string) {
 	fmt.Fprintf(b.h, "%d:%s=%d:%s\n", len(label), label, len(value), value)
+	f, ok := b.fields[label]
+	if !ok {
+		f = sha256.New()
+		b.fields[label] = f
+	}
+	fmt.Fprintf(f, "%d:%s\n", len(value), value)
+}
+
+// Fields are the digests of each label's values ("sha256:<hex>" by label, a tree's files under
+// "file"): two builders whose Sum differs differ in one of them at least, which names what
+// changed.
+func (b *Builder) Fields() map[string]string {
+	out := make(map[string]string, len(b.fields))
+	for label, f := range b.fields {
+		out[label] = "sha256:" + hex.EncodeToString(f.Sum(nil))
+	}
+	return out
 }
 
 // Sum returns "sha256:<hex>".

@@ -185,9 +185,10 @@ func TestThePullAccountIsBakedIntoTheInstaller(t *testing.T) {
 	if err := json.Unmarshal(files[payload.Pull], &a); err != nil || a != *e.pull {
 		t.Fatalf("baked account %+v %v", a, err)
 	}
-	// A rotated password is another installer: a new revision on an immutable channel.
+	// A rotated password is another installer: a new revision on an immutable channel, the
+	// refusal naming the node and the field that differ.
 	e.pull = &payload.Account{User: "notes-pull", Password: "rotated"}
-	if _, err := e.ship("stable", 1); err == nil || !strings.Contains(err.Error(), "--revision 2") {
+	if _, err := e.ship("stable", 1); err == nil || !strings.Contains(err.Error(), "with other inputs (os-bundle: pull; disks: os; installer: os, pull); publish a new revision (--revision 2)") {
 		t.Fatalf("a rotated pull password under a published stable tag: %v", err)
 	}
 }
@@ -264,7 +265,7 @@ func TestAnInstallerThatWouldDifferIsRefusedOnAnImmutableChannel(t *testing.T) {
 		m := *r.Manifest
 		m.Artifacts.Installer = r.Manifest.Artifacts.Images["web"]
 		p, _ := e.publisher()
-		if _, err := p.writeRelease(ctx, m.Tag, &m, ""); err != nil {
+		if _, err := p.writeRelease(ctx, m.Tag, &m, "", ""); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -332,7 +333,7 @@ func TestAFallbackToAReleaseWithoutAnInstallerRemovesLatest(t *testing.T) {
 	m := *old.Manifest
 	m.Artifacts.Installer = ""
 	p, _ := e.publisher()
-	if _, err := p.writeRelease(ctx, m.Tag, &m, ""); err != nil {
+	if _, err := p.writeRelease(ctx, m.Tag, &m, "", ""); err != nil {
 		t.Fatal(err)
 	}
 	e.bump("1.1.0")
@@ -429,7 +430,7 @@ func TestAnInstallerRefusalWritesNothing(t *testing.T) {
 	m := *r.Manifest
 	m.Artifacts.Installer = ""
 	p, _ := e.publisher()
-	if _, err := p.writeRelease(ctx, m.Tag, &m, ""); err != nil {
+	if _, err := p.writeRelease(ctx, m.Tag, &m, "", ""); err != nil {
 		t.Fatal(err)
 	}
 	tag, _ := e.reg.Tag(e.host+"/acme/notes/notes-postgres", "1.0.0")
@@ -477,7 +478,7 @@ func TestAShipOfAYankedReleaseFinishesAnInterruptedYank(t *testing.T) {
 	m := *second.Manifest
 	m.Yanked = &release.Yank{Reason: "broken", Date: e.now}
 	p, _ := e.publisher()
-	if _, err := p.writeRelease(ctx, m.Tag, &m, ""); err != nil {
+	if _, err := p.writeRelease(ctx, m.Tag, &m, "", ""); err != nil {
 		t.Fatal(err)
 	}
 	eq(t, "pointer still on the yanked release", e.digest("notes-release", "stable"), second.Digest.String())

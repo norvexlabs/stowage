@@ -31,6 +31,7 @@ import (
 	"github.com/norvexlabs/stowage/internal/chown"
 	"github.com/norvexlabs/stowage/internal/cloud"
 	"github.com/norvexlabs/stowage/internal/front"
+	"github.com/norvexlabs/stowage/internal/graph"
 	"github.com/norvexlabs/stowage/internal/kairos"
 	"github.com/norvexlabs/stowage/internal/payload"
 	"github.com/norvexlabs/stowage/internal/project"
@@ -1017,7 +1018,7 @@ func TestShipReplacesAPointerLeftOnAYankedRelease(t *testing.T) {
 	p, _ := e.publisher()
 	m := *stale.Manifest
 	m.Yanked = &release.Yank{Reason: "bad", Date: e.now}
-	if _, err := p.writeRelease(context.Background(), m.Tag, &m, ""); err != nil { // yank, then "crash"
+	if _, err := p.writeRelease(context.Background(), m.Tag, &m, "", ""); err != nil { // yank, then "crash"
 		t.Fatal(err)
 	}
 	eq(t, "pointer still stale", e.digest("notes-release", "stable"), stale.Digest.String())
@@ -1033,7 +1034,7 @@ func TestReleasesSkipsAVersionTheSchemeNoLongerReads(t *testing.T) {
 	p, _ := e.publisher()
 	m := *first.Manifest
 	m.ProjectVersion, m.Tag = "not-a-version", "not-a-version"
-	if _, err := p.writeRelease(context.Background(), m.Tag, &m, ""); err != nil {
+	if _, err := p.writeRelease(context.Background(), m.Tag, &m, "", ""); err != nil {
 		t.Fatal(err)
 	}
 	rs, err := p.Releases(context.Background(), "stable")
@@ -1051,7 +1052,7 @@ func TestPointerOnAVersionTheSchemeNoLongerReadsMoves(t *testing.T) {
 	p, _ := e.publisher()
 	m := *first.Manifest
 	m.ProjectVersion, m.Tag = "legacy", "legacy"
-	old, err := p.writeRelease(context.Background(), m.Tag, &m, "")
+	old, err := p.writeRelease(context.Background(), m.Tag, &m, "", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1548,4 +1549,35 @@ func TestPruneKeepsTheLatestReleases(t *testing.T) {
 	}
 	eq(t, "the pointer's release kept", e.digest("notes-release", "1.1.0") != "", true)
 	eq(t, "the latest kept", e.digest("notes-release", "1.2.0") != "", true)
+}
+
+// What differs is named node by node, field by field: a node new or gone, the release's own fields
+// when no node differs; nothing for a release published without the annotation, or with one that
+// cannot be read.
+func TestInputsDiffNamesTheNodesAndFields(t *testing.T) {
+	t.Parallel()
+	node := func(id, kind, inputs string, fields map[string]string) graph.Node {
+		return graph.Node{ID: id, Kind: kind, Inputs: inputs, Fields: fields}
+	}
+	was := &graph.Graph{Nodes: []graph.Node{
+		node("image/web", graph.KindImage, "a", map[string]string{"file": "1"}),
+		node("installer", graph.KindInstaller, "b", map[string]string{"changelog": "1", "spec": "1"}),
+		node("chart", graph.KindChart, "c", nil),
+		node("release", graph.KindRelease, "r", map[string]string{"changelog": "1"}),
+	}}
+	ann, err := nodeInputs(was)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := &graph.Graph{Nodes: []graph.Node{
+		node("image/web", graph.KindImage, "a", map[string]string{"file": "1"}),
+		node("installer", graph.KindInstaller, "b2", map[string]string{"changelog": "2", "spec": "1", "pull": "1"}),
+		node("os-bundle", graph.KindOSBundle, "o", nil),
+		node("release", graph.KindRelease, "r2", map[string]string{"changelog": "2"}),
+	}}
+	eq(t, "nodes", inputsDiff(ann, now), "installer: changelog, pull; os-bundle: new; chart: gone")
+	same := &graph.Graph{Nodes: append(slices.Clone(was.Nodes[:3]), node("release", graph.KindRelease, "r2", map[string]string{"changelog": "2"}))}
+	eq(t, "the release alone", inputsDiff(ann, same), "release: changelog")
+	eq(t, "no annotation", inputsDiff("", now), "")
+	eq(t, "unreadable", inputsDiff("{", now), "")
 }

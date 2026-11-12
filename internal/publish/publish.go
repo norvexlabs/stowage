@@ -125,6 +125,8 @@ type Ref struct {
 	Digest   v1.Hash
 	// AuditOverride is the reason the release was published past its audit gate ("" for none).
 	AuditOverride string
+	// NodeInputs is its NodeInputsAnnotation ("" for a release published without one).
+	NodeInputs string
 }
 
 func (p *Publisher) readRelease(ctx context.Context, tag string) (*Ref, error) {
@@ -143,16 +145,96 @@ func (p *Publisher) readRelease(ctx context.Context, tag string) (*Ref, error) {
 	if m.Name != p.Project.Spec.Name {
 		return nil, fmt.Errorf("%s: release of %q, not %q: %w", t, m.Name, p.Project.Spec.Name, registry.ErrNotArtifact)
 	}
-	return &Ref{Manifest: m, Digest: d, AuditOverride: a.Annotations[AuditOverrideAnnotation]}, nil
+	return &Ref{Manifest: m, Digest: d, AuditOverride: a.Annotations[AuditOverrideAnnotation], NodeInputs: a.Annotations[NodeInputsAnnotation]}, nil
 }
 
 // AuditOverrideAnnotation records on a release manifest's artifact the reason it was published past
 // its audit gate: the signature covers it, and no install reads it.
 const AuditOverrideAnnotation = "dev.stowage.audit-override"
 
+// NodeInputsAnnotation records on a release manifest's artifact the inputs digest of each node of
+// its build and of each field the digest hashes (nodeInputs, JSON): what names the nodes and
+// fields that differ when the release is built again with other inputs. The signature covers it,
+// and no install reads it.
+const NodeInputsAnnotation = "dev.stowage.node-inputs"
+
+// nodeInput is a node's entry in NodeInputsAnnotation.
+type nodeInput struct {
+	Inputs string            `json:"inputs"`
+	Fields map[string]string `json:"fields"`
+}
+
+// nodeInputs is NodeInputsAnnotation's value for the graph g.
+func nodeInputs(g *graph.Graph) (string, error) {
+	m := map[string]nodeInput{}
+	for _, n := range g.Nodes {
+		m[n.ID] = nodeInput{n.Inputs, n.Fields}
+	}
+	b, err := json.Marshal(m) // its keys sorted
+	return string(b), err
+}
+
+// inputsDiff names what differs between the release published (its NodeInputsAnnotation, was) and
+// the graph g: each node whose inputs differ, with the fields that do ("installer: changelog");
+// the release's own fields when no node of it differs. Empty when was is empty or unreadable (a
+// release published without it): the refusal then names nothing more.
+func inputsDiff(was string, g *graph.Graph) string {
+	var old map[string]nodeInput
+	if was == "" || json.Unmarshal([]byte(was), &old) != nil {
+		return ""
+	}
+	fields := func(a, b map[string]string) string {
+		var out []string
+		for _, k := range sortedKeys(union(a, b)) {
+			if a[k] != b[k] {
+				out = append(out, k)
+			}
+		}
+		return strings.Join(out, ", ")
+	}
+	var out []string
+	seen := map[string]bool{}
+	var rel graph.Node
+	for _, n := range g.Nodes {
+		seen[n.ID] = true
+		o, ok := old[n.ID]
+		switch {
+		case n.Kind == graph.KindRelease:
+			rel = n
+		case !ok:
+			out = append(out, n.ID+": new")
+		case o.Inputs != n.Inputs:
+			out = append(out, strings.TrimSuffix(n.ID+": "+fields(o.Fields, n.Fields), ": "))
+		}
+	}
+	for _, id := range slices.Sorted(maps.Keys(old)) {
+		if !seen[id] {
+			out = append(out, id+": gone")
+		}
+	}
+	if len(out) == 0 && old[rel.ID].Inputs != rel.Inputs {
+		if f := fields(old[rel.ID].Fields, rel.Fields); f != "" {
+			out = append(out, rel.ID+": "+f)
+		}
+	}
+	return strings.Join(out, "; ")
+}
+
+// union is the keys of a and b, with a's values.
+func union(a, b map[string]string) map[string]string {
+	out := map[string]string{}
+	for k := range b {
+		out[k] = ""
+	}
+	for k, v := range a {
+		out[k] = v
+	}
+	return out
+}
+
 // writeRelease pushes m by digest, signs it, and only then moves tag to it: a release tag never
-// holds an unsigned manifest of a signed project.
-func (p *Publisher) writeRelease(ctx context.Context, tag string, m *release.Manifest, override string) (v1.Hash, error) {
+// holds an unsigned manifest of a signed project. nodes is its NodeInputsAnnotation, "" for none.
+func (p *Publisher) writeRelease(ctx context.Context, tag string, m *release.Manifest, override, nodes string) (v1.Hash, error) {
 	data, err := m.Encode()
 	if err != nil {
 		return v1.Hash{}, err
@@ -164,6 +246,9 @@ func (p *Publisher) writeRelease(ctx context.Context, tag string, m *release.Man
 	ann := map[string]string{registry.InputsAnnotation: m.Inputs}
 	if override != "" {
 		ann[AuditOverrideAnnotation] = override
+	}
+	if nodes != "" {
+		ann[NodeInputsAnnotation] = nodes
 	}
 	d, err := p.Registry.PushArtifact(ctx, t.Repository, registry.Artifact{
 		Type: release.MediaType, Data: data,
@@ -516,8 +601,12 @@ func (p *Publisher) Ship(ctx context.Context, o ShipOptions) (*Ref, error) {
 		return nil, err
 	}
 	if existing != nil && existing.Manifest.Inputs != relNode.Inputs && !ch.Mutable {
-		return nil, fmt.Errorf("%s %s is already published on the immutable channel %s with other inputs; publish a new revision (--revision %d)",
-			s.Name, tag, o.Channel, o.Revision+1)
+		what := ""
+		if d := inputsDiff(existing.NodeInputs, g); d != "" {
+			what = " (" + d + ")"
+		}
+		return nil, fmt.Errorf("%s %s is already published on the immutable channel %s with other inputs%s; publish a new revision (--revision %d)",
+			s.Name, tag, o.Channel, what, o.Revision+1)
 	}
 
 	// A mutable tag rebuilt with other inputs and no --disks would keep disks of the build it
@@ -885,7 +974,11 @@ func (p *Publisher) Ship(ctx context.Context, o ShipOptions) (*Ref, error) {
 		if err := p.tagInstaller(ctx, m.Artifacts.Installer, tag); err != nil {
 			return nil, err
 		}
-		d, err := p.writeRelease(ctx, tag, m, override)
+		nodes, err := nodeInputs(g)
+		if err != nil {
+			return nil, err
+		}
+		d, err := p.writeRelease(ctx, tag, m, override, nodes)
 		if err != nil {
 			return nil, err
 		}
@@ -1603,7 +1696,7 @@ func (p *Publisher) Yank(ctx context.Context, channel, v string, revision int, r
 	if r.Manifest.Yanked == nil {
 		m := *r.Manifest
 		m.Yanked = &release.Yank{Reason: reason, Date: p.Now().UTC()}
-		d, err := p.writeRelease(ctx, m.Tag, &m, r.AuditOverride)
+		d, err := p.writeRelease(ctx, m.Tag, &m, r.AuditOverride, r.NodeInputs)
 		if err != nil {
 			return err
 		}

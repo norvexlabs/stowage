@@ -400,7 +400,15 @@ platform is part of an image's inputs). What `ship` does, in order:
    and re-tagged by every later release until a `stowage` with another recipe publishes. It is
    signed, verified, promoted, yanked and pruned with the images;
 2. on an immutable channel, a tag holding other inputs is refused before any write — publish a
-   new `--revision`;
+   new `--revision`. A release built again with other inputs is refused naming what differs:
+   `<name> <tag> is already published on the immutable channel <channel> with other inputs
+   (<node>: <field>, …; …); publish a new revision (--revision N)`, each node of the build whose
+   inputs differ (`installer`, `os-bundle`, `image/<key>`, `chart`, `disks`) with the fields of
+   its digest that do (`changelog`, `spec`, `lock`, `pull`, `file` for its files, a dependency's
+   node id, …), a node `new` or `gone`, and the release's own fields when no node differs. It
+   reads the annotation `dev.stowage.node-inputs` every ship records on the release manifest's
+   artifact (each node's inputs digest and the digest of each field, JSON; the signature covers
+   it, and no install reads it); a release published without it is refused naming nothing more;
 3. with the `kubernetes` shape, the chart is packaged (see the chart contract below) at version
    `0.<release_seq>.0` with `appVersion` the project version, and pushed to
    `<prefix>/charts/<name>-<channel>` by digest and signed; its version tag moves once the

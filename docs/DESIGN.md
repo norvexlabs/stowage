@@ -587,7 +587,10 @@ Off until the project configures a key (`signing: { provider: cosign-key, key: â
   mistake shows at a commit rather than in a background ship's log. The escape hatch,
   `--audit-override REASON`, publishes past the gate and is recorded on the release manifest's
   artifact as an annotation, under the signature, rather than in the manifest: installs decode the
-  manifest strictly, and the record is for the publisher's audit trail, not for an install. An
+  manifest strictly, and the record is for the publisher's audit trail, not for an install. The
+  build's per-node and per-field inputs digests (`dev.stowage.node-inputs`) are kept the same way
+  and for the same reason: they let a refused rebuild name what changed, which only the publisher
+  reads. An
   artifact that could not be scanned is never overridden: what is not judged is not published.
   The report separates the project's artifacts from what Stowage supplies (the images built from
   its recipes, the installer), so a publisher knows which side owns each finding â€” the OS bundle

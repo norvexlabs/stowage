@@ -81,6 +81,9 @@ type Node struct {
 	Kind   string   `json:"kind"`
 	Deps   []string `json:"deps,omitempty"`
 	Inputs string   `json:"inputs"`
+	// Fields are the digests of what Inputs hashes, by field (digest.Builder.Fields): they name
+	// what changed when Inputs did.
+	Fields map[string]string `json:"-"`
 	// Pinned is set for an upstream image taken by reference: nothing is built.
 	Pinned string `json:"pinned,omitempty"`
 	// ReadsVersion is set for an image whose Dockerfile declares VersionArg.
@@ -228,7 +231,7 @@ func Build(p *project.Project, r Release) (*Graph, error) {
 		if err := b.Tree(p.Root, trusted, nil); err != nil {
 			return nil, fmt.Errorf("chart: %w", err)
 		}
-		n := Node{ID: KindChart, Kind: KindChart, Deps: imageIDs, Inputs: b.Sum()}
+		n := Node{ID: KindChart, Kind: KindChart, Deps: imageIDs, Inputs: b.Sum(), Fields: b.Fields()}
 		g.Nodes = append(g.Nodes, n)
 		all.Field(n.ID, n.Inputs)
 	}
@@ -273,14 +276,14 @@ func Build(p *project.Project, r Release) (*Graph, error) {
 		if err := b.Tree(p.Root, installed, nil); err != nil {
 			return nil, fmt.Errorf("os bundle: %w", err)
 		}
-		osNode := Node{ID: KindOSBundle, Kind: KindOSBundle, Deps: imageIDs, Inputs: b.Sum()}
+		osNode := Node{ID: KindOSBundle, Kind: KindOSBundle, Deps: imageIDs, Inputs: b.Sum(), Fields: b.Fields()}
 		d := digest.New(KindDisks)
 		d.Field("os", osNode.Inputs)
 		// In the order they are made, not the spec's: reordering the list changes no disk.
 		d.Field("formats", strings.Join(k.Formats(), ","))
 		d.Field("recipe", diskRecipe())
 		d.Field("layer", diskLayer)
-		disks := Node{ID: KindDisks, Kind: KindDisks, Deps: []string{osNode.ID}, Inputs: d.Sum()}
+		disks := Node{ID: KindDisks, Kind: KindDisks, Deps: []string{osNode.ID}, Inputs: d.Sum(), Fields: d.Fields()}
 		g.Nodes = append(g.Nodes, osNode, disks)
 		all.Field(osNode.ID, osNode.Inputs)
 		all.Field(disks.ID, disks.Inputs)
@@ -301,7 +304,7 @@ func Build(p *project.Project, r Release) (*Graph, error) {
 	if err := installer.Tree(p.Root, installed, nil); err != nil {
 		return nil, fmt.Errorf("installer: %w", err)
 	}
-	inst := Node{ID: KindInstaller, Kind: KindInstaller, Deps: installerDeps, Inputs: installer.Sum()}
+	inst := Node{ID: KindInstaller, Kind: KindInstaller, Deps: installerDeps, Inputs: installer.Sum(), Fields: installer.Fields()}
 	g.Nodes = append(g.Nodes, inst)
 	all.Field(inst.ID, inst.Inputs)
 
@@ -312,7 +315,7 @@ func Build(p *project.Project, r Release) (*Graph, error) {
 		deps = append(deps, n.ID)
 	}
 	sort.Strings(deps)
-	g.Nodes = append(g.Nodes, Node{ID: KindRelease, Kind: KindRelease, Deps: deps, Inputs: all.Sum()})
+	g.Nodes = append(g.Nodes, Node{ID: KindRelease, Kind: KindRelease, Deps: deps, Inputs: all.Sum(), Fields: all.Fields()})
 	return g, nil
 }
 
@@ -323,7 +326,7 @@ func frontNode() Node {
 	b.Field("name", front.Key)
 	b.Field("platform", platform)
 	b.Field("recipe", string(recipe))
-	return Node{ID: FrontID, Kind: KindImage, Inputs: b.Sum(), Recipe: recipe}
+	return Node{ID: FrontID, Kind: KindImage, Inputs: b.Sum(), Fields: b.Fields(), Recipe: recipe}
 }
 
 // backupNode is the VM's backup runner: like the front, its inputs are the recipe and the
@@ -334,7 +337,7 @@ func backupNode() Node {
 	b.Field("name", backup.Key)
 	b.Field("platform", platform)
 	b.Field("recipe", string(recipe))
-	return Node{ID: BackupID, Kind: KindImage, Inputs: b.Sum(), Recipe: recipe}
+	return Node{ID: BackupID, Kind: KindImage, Inputs: b.Sum(), Fields: b.Fields(), Recipe: recipe}
 }
 
 // auditNode is the scanner (grype) a signing release carries, so an install audits the SBOMs it
@@ -346,7 +349,7 @@ func auditNode() Node {
 	b.Field("name", sbom.Key)
 	b.Field("platform", platform)
 	b.Field("recipe", string(recipe))
-	return Node{ID: AuditID, Kind: KindImage, Inputs: b.Sum(), Recipe: recipe}
+	return Node{ID: AuditID, Kind: KindImage, Inputs: b.Sum(), Fields: b.Fields(), Recipe: recipe}
 }
 
 // chownNode is the helper that gives data volumes their uid: like the front, its inputs are the
@@ -357,7 +360,7 @@ func chownNode() Node {
 	b.Field("name", chown.Key)
 	b.Field("platform", platform)
 	b.Field("recipe", string(recipe))
-	return Node{ID: ChownID, Kind: KindImage, Inputs: b.Sum(), Recipe: recipe}
+	return Node{ID: ChownID, Kind: KindImage, Inputs: b.Sum(), Fields: b.Fields(), Recipe: recipe}
 }
 
 func imageNode(p *project.Project, name, projectVersion string) (Node, error) {
@@ -367,7 +370,7 @@ func imageNode(p *project.Project, name, projectVersion string) (Node, error) {
 	b.Field("name", name)
 	if !img.Built() {
 		b.Field("ref", img.Ref)
-		return Node{ID: id, Kind: KindImage, Inputs: b.Sum(), Pinned: img.Ref}, nil
+		return Node{ID: id, Kind: KindImage, Inputs: b.Sum(), Fields: b.Fields(), Pinned: img.Ref}, nil
 	}
 	dfPath, err := spec.ProjectPath(p.Root, img.Dockerfile)
 	if err != nil {
@@ -449,7 +452,7 @@ func imageNode(p *project.Project, name, projectVersion string) (Node, error) {
 			return Node{}, fmt.Errorf("image %s context %s: %w", name, cn, err)
 		}
 	}
-	n.Inputs = b.Sum()
+	n.Inputs, n.Fields = b.Sum(), b.Fields()
 	return n, nil
 }
 

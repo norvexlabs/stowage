@@ -9,19 +9,6 @@ A finished item is deleted, not ticked. The plan behind it is
 
 Batched by the gate they share: a batch is one slice, one review, one gate run.
 
-### VM creation — the first real runs on Scaleway (a preview)
-
-Found on three VMs made by `vm create --platform scaleway --create opentofu` from one release
-(0.35.0, `fr-par-1`). The modules here are the ones the OpenTofu path's move publishes standalone,
-so each fix lands in them.
-
-1. **"Already published … with other inputs" does not say what differs**: the refusal
-   (`internal/publish/publish.go`) compares the release's inputs digest alone, while the per-node
-   digests are computed (`internal/graph`), so finding that a version's changelog section was
-   edited after the release took the registry's annotations, node by node. Name the nodes whose
-   inputs differ (`os-bundle`, `installer`) and, where it can, the field (`changelog`), keeping
-   the per-field digests in the release manifest.
-
 ### Publishing — inputs the commit cannot record
 
 1. **A ship carries declared out-of-band build inputs into its checkout**: some build inputs
