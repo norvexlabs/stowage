@@ -101,6 +101,9 @@ func (in *Installer) k8sKitRun(ctx context.Context, p *k8sHookPlan, answers map[
 	if env == nil {
 		return nil, fmt.Errorf("release %s in %s has no Secret %s: `%s` writes it", k.Release, k.Namespace, k.envSecret(), in.k8sCtl("install"))
 	}
+	if err := in.k8sFilesHeld(p.hook, env); err != nil {
+		return nil, err
+	}
 	cm, err := in.configMapKeys(ctx, k.provisionName())
 	if err != nil {
 		return nil, err

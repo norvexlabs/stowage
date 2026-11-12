@@ -88,6 +88,10 @@ func (in *Installer) writeHookFiles(env *EnvFile, h *providers.ProvisionHook) ([
 	if len(files) == 0 {
 		return nil, nil
 	}
+	// The salt names the secrets' files the stack mounts: a new one here, never saved, would name others.
+	if _, ok := env.Get(FileSaltVar); !ok && slices.ContainsFunc(files, in.R.Spec.AsFile) {
+		return nil, refuse(in.ctl()+" install --dir "+in.O.Dir, "%s records no %s, which names the files of the secrets delivered as files: `%s install --dir %s` records it, then run again", in.path(envName), FileSaltVar, in.ctl(), in.O.Dir)
+	}
 	in.fileVars(env)
 	return files, in.writeInputFiles(env)
 }

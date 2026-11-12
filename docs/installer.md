@@ -1012,7 +1012,9 @@ again, to copy an installer to another host.
   services `KEY_NEXT` and `KEY_PREVIOUS` as variables beside it). A provision hook's `env`, and a
   handoff step's (see [kits](kits.md)), may name one: its container gets the file read-only at
   `/run/stowage/inputs/<KEY>` and `STOWAGE_SECRET_FILE_<KEY>` holding that path, never the
-  variable, on every shape. A `command` provider's container receives it as a variable, as it
+  variable, on every shape. `provision` (and a handoff's step) refuses an install whose `.env` no
+  longer holds `STOWAGE_FILE_SALT`, naming the `install` re-run that records it, and on
+  Kubernetes a listed key the release's Secrets do not hold, naming it and `k8s install`. A `command` provider's container receives it as a variable, as it
   receives every recorded value: that is the `command` contract, and its image is the project's
   own tool, not a service. On Kubernetes the value is written to the Secret
   `<release>-stowage-secret-files` (labelled, applied server-side, one of that name another tool

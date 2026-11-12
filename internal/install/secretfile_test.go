@@ -299,3 +299,66 @@ func TestK8sSecretFilesSecretOfAnotherToolAndADroppedKey(t *testing.T) {
 		}
 	}
 }
+
+// A run outside a start that mounts a secret's file refuses an install directory whose .env lost its
+// salt, naming the install that records it: a salt made here, never saved, would name other files.
+// The provision hook and a handoff's step alike, and neither runs.
+func TestARunWithoutTheSaltIsRefused(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	asFileSession(e.r.Spec)
+	e.r.Spec.Hooks.Provision.Config["env"] = []any{"ADMIN_EMAIL", "SESSION_SECRET"}
+	h := testHandoff()
+	h.Run.Env = []string{"SESSION_SECRET"}
+	e.r.Spec.Handoffs = []spec.Handoff{h}
+	if err := e.install(nil); err != nil {
+		t.Fatal(err)
+	}
+	env := e.readEnv()
+	env.Delete(FileSaltVar)
+	if err := env.WriteFile(filepath.Join(e.dir, envName)); err != nil {
+		t.Fatal(err)
+	}
+	files := inputFiles(t, e.dir)
+	hooks := len(e.hookCalls())
+	want := "records no " + FileSaltVar + ", which names the files of the secrets delivered as files: `"
+	if err := e.installer(nil).Provision(context.Background()); err == nil || !strings.Contains(err.Error(), want) || !strings.Contains(err.Error(), " install --dir "+e.dir+"` records it") {
+		t.Errorf("provision: %v", err)
+	}
+	e.docker.kitOut = "TOKEN=t\n"
+	if _, err := e.installer(kitFast).IssueKit(context.Background(), kitReq, kitNow); err == nil || !strings.Contains(err.Error(), want) {
+		t.Errorf("kit create: %v", err)
+	}
+	if len(e.hookCalls()) != hooks || e.docker.kitEnv != nil || !slices.Equal(inputFiles(t, e.dir), files) {
+		t.Errorf("a step ran, or a file was written: %v", inputFiles(t, e.dir))
+	}
+}
+
+// On Kubernetes a step listing a file its release's Secrets do not hold is refused, naming the key and
+// the install that writes it: the provision hook and a handoff's step alike, and no Job is made.
+func TestK8sAStepsFileMissingIsRefused(t *testing.T) {
+	t.Parallel()
+	e := newKubeEnv(t, spec.Provider{Name: "none"})
+	e.release = e.at("1.0.0", 1, func(s *spec.Spec) {
+		withFiles(s)
+		asFileSession(s)
+		s.Hooks.Provision.Config["env"] = []any{"ADMIN_EMAIL", "SESSION_SECRET"}
+		h := testHandoff()
+		h.Run.Env = []string{"CA"}
+		s.Handoffs = []spec.Handoff{h}
+	})
+	e.published(e.release)
+	e.runs("1.0.0", 1)
+	e.stored(map[string]string{"ADMIN_EMAIL": "a@example.org", "EXTRA": ""}, ours) // no CA
+	e.f.objects = map[string]string{"secret/notes-stowage-secret-files": outputsJSON(map[string]string{"OTHER": "x"})}
+	e.hookRuns("Succeeded", "", map[string]string{"TOKEN": "t"})
+	if _, err := e.installer(kitFast).K8sIssueKit(context.Background(), kitReq, kitNow); err == nil || !strings.Contains(err.Error(), "records no CA, a file the step lists in its env") {
+		t.Errorf("kit create: %v", err)
+	}
+	if err := e.installer(func(o *Options) { o.NoProvision = false }).K8sProvision(context.Background()); err == nil || !strings.Contains(err.Error(), "records no SESSION_SECRET, a file the step lists in its env") || !strings.Contains(err.Error(), "k8s install") {
+		t.Errorf("provision: %v", err)
+	}
+	if e.f.created != nil {
+		t.Errorf("a Job was made: %v", e.f.created["metadata"])
+	}
+}

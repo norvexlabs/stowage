@@ -11,6 +11,9 @@ follow [SemVer](https://semver.org/).
   (`as_file: true`) in their `env`, which lint refused: the step gets each as its file, mounted
   read-only as the provision hook's, its path in `STOWAGE_INPUT_FILE_<KEY>` or
   `STOWAGE_SECRET_FILE_<KEY>`, the value in neither its environment, its Job, a log nor the kit.
+- `provision` and a handoff's step refuse to run without the file they list: on Docker and the VM
+  an install whose `.env` lost `STOWAGE_FILE_SALT`, on Kubernetes a key the release's Secrets do
+  not hold; each names the install that writes it.
 - Lint counts an input a handoff's `run` or `check` lists in its `env` as read: it no longer warns
   that nothing reads it.
 

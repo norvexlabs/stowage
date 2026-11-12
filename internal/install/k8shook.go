@@ -280,6 +280,9 @@ func (in *Installer) k8sRunHook(ctx context.Context, p *k8sHookPlan, set map[str
 	if env == nil {
 		return fmt.Errorf("release %s in %s has no Secret %s: `%s` writes it", k.Release, k.Namespace, k.envSecret(), in.k8sCtl("install"))
 	}
+	if err := in.k8sFilesHeld(p.hook, env); err != nil {
+		return err
+	}
 	outs, err := in.readSecret(ctx, k.hookName())
 	if err != nil {
 		return err
@@ -778,6 +781,31 @@ func podFailure(pod *k8sJob) error {
 		}
 	}
 	return errors.New("its pod failed")
+}
+
+// k8sFilesHeld refuses a Job whose step lists a file input asked on Kubernetes, or a secret delivered
+// as a file, that env (k8sRecorded) does not hold: its pod would start without the file or its
+// variable. Each is written on every deploy, empty or not, so one missing is the release's Secrets
+// changed by hand.
+func (in *Installer) k8sFilesHeld(h *providers.ProvisionHook, env map[string]string) error {
+	var missing []string
+	for _, key := range h.Keys() {
+		i, isInput := in.R.Spec.Input(key)
+		if (isInput && i.File() && i.OnKubernetes() || in.R.Spec.AsFile(key)) && !hasKey(env, key) {
+			missing = append(missing, key)
+		}
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+	k := in.O.K8s
+	return refuse(in.k8sCtl("install")+" again, which writes them", "release %s in %s records no %s, a file the step lists in its env: its Secrets (%s, %s, %s) lack it; `%s` again writes them",
+		k.Release, k.Namespace, strings.Join(missing, ", "), k.envSecret(), k.filesSecret(), k.secretFilesSecret(), in.k8sCtl("install"))
+}
+
+func hasKey(m map[string]string, key string) bool {
+	_, ok := m[key]
+	return ok
 }
 
 // hookJobObject is the provision Job: the hook's container gets the keys its env declares that the
