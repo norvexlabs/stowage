@@ -500,7 +500,7 @@ func TestSweep(t *testing.T) {
 	if err := os.Chmod(r.StagedDir(stuck), 0o500); err != nil { // a directory
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = os.Chmod(r.StagedDir(stuck), 0o700) })
+	t.Cleanup(func() { _ = os.Chmod(r.StagedDir(stuck), 0o700) }) // a directory
 	if err := r.Sweep(shipped, now); err == nil {
 		t.Error("an entry left, and no error")
 	}

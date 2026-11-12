@@ -464,7 +464,7 @@ func TestHookShipTakesTheUntrackedFilesOfTheCommit(t *testing.T) {
 	if err := os.Chmod(r.StagedDir(stuck), 0o500); err != nil { // a directory
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = os.Chmod(r.StagedDir(stuck), 0o700) })
+	t.Cleanup(func() { _ = os.Chmod(r.StagedDir(stuck), 0o700) }) // a directory
 	testutil.Write(t, root, "api/blob.bin", "made elsewhere")
 	if _, _, l, err := runHook(t, b, env, "-C", root, "hook", "post-commit"); err != nil || len(l) != 1 {
 		t.Fatalf("staged again: %v", err)
