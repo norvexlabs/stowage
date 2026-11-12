@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"io"
 	"os"
 	"path/filepath"
 	"slices"
@@ -28,10 +29,19 @@ type launched struct {
 // runHook runs stowage with a stand-in executable path and launcher, recording what it launches.
 func runHook(t *testing.T, b *randomBuilder, env map[string]string, args ...string) (string, string, []launched, error) {
 	t.Helper()
-	var out, errOut bytes.Buffer
+	var out bytes.Buffer
+	logs, l, err := runHookTo(t, &out, b, env, args...)
+	return out.String(), logs, l, err
+}
+
+// runHookTo runs the command with its standard output written to out, and returns its error
+// output.
+func runHookTo(t *testing.T, out io.Writer, b *randomBuilder, env map[string]string, args ...string) (string, []launched, error) {
+	t.Helper()
+	var errOut bytes.Buffer
 	var l []launched
 	o := &options{buildVersion: "0.1.0", getenv: func(k string) string { return env[k] }, builder: b, installer: []byte("exe"),
-		now: func() time.Time { return time.Date(2026, 10, 8, 0, 0, 0, 0, time.UTC) }, out: &out, err: &errOut,
+		now: func() time.Time { return time.Date(2026, 10, 8, 0, 0, 0, 0, time.UTC) }, out: out, err: &errOut,
 		executable: func() (string, error) { return "/usr/local/bin/stowage", nil },
 		launch: func(exe string, args []string, logPath string) error {
 			l = append(l, launched{exe, args, logPath})
@@ -40,7 +50,21 @@ func runHook(t *testing.T, b *randomBuilder, env map[string]string, args ...stri
 	cmd := newRoot(o)
 	cmd.SetArgs(args)
 	err := cmd.ExecuteContext(context.Background())
-	return out.String(), errOut.String(), l, err
+	return errOut.String(), l, err
+}
+
+// waitWriter is a buffer that closes waiting once a write holds the hook ship's waiting line.
+type waitWriter struct {
+	bytes.Buffer
+	waiting chan struct{}
+}
+
+func (w *waitWriter) Write(p []byte) (int, error) {
+	if w.waiting != nil && strings.Contains(string(p), "waiting for the hook ship running") {
+		close(w.waiting)
+		w.waiting = nil
+	}
+	return w.Buffer.Write(p)
 }
 
 func TestHookPostCommit(t *testing.T) {
@@ -190,14 +214,18 @@ func TestHookShip(t *testing.T) {
 		err error
 	}
 	done := make(chan result)
+	waiting := make(chan struct{})
 	go func() {
-		out, err := ship("--ship", "1.0.0", "--commit", head, "--channel", "beta")
-		done <- result{out, err}
+		w := &waitWriter{waiting: waiting}
+		logs, _, err := runHookTo(t, w, b, env, "-C", root, "hook", "post-commit", "--ship", "1.0.0", "--commit", head, "--channel", "beta")
+		done <- result{w.String() + logs, err}
 	}()
+	// The lock is released only once the second ship waits on it, however long it takes to get
+	// there.
 	select {
 	case res := <-done:
 		t.Fatalf("shipped while another held the lock: %v\n%s", res.err, res.out)
-	case <-time.After(50 * time.Millisecond):
+	case <-waiting:
 	}
 	unlock()
 	res := <-done
