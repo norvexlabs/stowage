@@ -50,6 +50,17 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
    `vm create`, the VM's `install`, and `vm seed --await-secrets` waiting for it (recommended: one
    format the provider already writes); (b) `--registry-user` plus the password on standard input.
 
+### VM — the machine interface
+
+1. **The VM's `status --json` says when a boot has settled**: a program following an upgrade or
+   a rollback cannot tell from `status --json` alone that the boot it reads has moved the install
+   to that boot's OS release (a rollback's passive boot is never on trial, and answers before its
+   boot unit is done), so it reads the event journal for the health gate's verdict instead. Give
+   `status --json` the boot unit's state (`boot: {id, settled}`, from what the host daemon's
+   status handler already works out) and record in the gate's verdict whether it rebooted, so a
+   gate that exits without a verdict, or a "not kept" whose reboot never comes, is told at once
+   rather than by a timeout. The provider's VM target then reads `status --json` alone.
+
 ### Kits — what a handoff's step reads
 
 1. **A handoff's step gets its `as_file` secrets and file inputs as files**: lint refuses a
