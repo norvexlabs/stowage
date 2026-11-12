@@ -9,6 +9,55 @@ A finished item is deleted, not ticked. The plan behind it is
 
 Batched by the gate they share: a batch is one slice, one review, one gate run.
 
+### VM creation — the first real runs on Scaleway (a preview)
+
+Found on three VMs made by `vm create --platform scaleway --create opentofu` from one release
+(0.35.0, `fr-par-1`). The modules here are the ones the OpenTofu path's move publishes standalone,
+so each fix lands in them.
+
+1. **The first boot races udev, and the VM stays in its recovery system**: one VM in three never
+   installed. Kairos's auto reset (its own step, run by the `network` stage) runs `udevadm
+   trigger` without waiting, read the disk's partitions before udev had recorded them (`failed to
+   read udev info … /run/udev/data/b8:1`, then `EFI partition not found`), and nothing retries
+   it. The disk holds the recovery system alone, so every VM's first boot depends on that reset;
+   the seed's cloud-config (`internal/install/seed.go`, its `Stages`) adds nothing ahead of it.
+   Options: (a) a seed step before the reset, `udevadm settle` (bounded), on every platform
+   (recommended: the canonical wait for udev's queue); (b) the reset retried while the EFI
+   partition is not found. An upstream Kairos report too.
+2. **`vm create` waits out its whole `--wait` and cannot say why**: the OpenTofu path's wait
+   (`internal/install/vmtofu.go`) takes a `status --json` answering `boot: recovery` as "not done
+   yet" at every poll, so a first boot that gave up in its first minute is told after 45 minutes
+   as `the first boot is not done`. Once the recovery system answers past its first boot, read the
+   agent's last error over the SSH already held (the one-time host key pinned), print it, and stop
+   waiting when the agent gave up; the manual path's wait the same.
+3. **The wait's failure names TrueNAS on every platform**: `look at its console on TrueNAS` is a
+   literal in that deadline message. Name the `--platform`'s console (Scaleway: the instance's
+   Console tab; the clouds' serial console; libvirt's `virsh console`).
+4. **The Scaleway module allocates its own public address: none can be reserved**: the module
+   always creates its `scaleway_instance_ip` (`internal/install/tofu/scaleway/main.tf`), so a
+   stack whose first install needs its own public address, or another VM's (`--add-host`, fixed
+   at create), cannot be installed in one pass at an address. Give it an `ip_id` variable (an
+   existing flexible IP: the module then creates none and reads its address), so the addresses
+   are reserved first, as `--network static` does on the hypervisors; the other clouds' modules
+   checked for the same.
+5. **The disk is uploaded per VM and deleted by `vm destroy`, unlike the docs**: the object is a
+   resource of the VM's own state, keyed on the VM's name (`stowage/<name>-<hash>.qcow2`), its
+   snapshot and image following it, so two VMs of one release upload 2.5 GB twice and `vm
+   destroy` deletes it, while `docs/vm-create.md` says it is kept. Key it on the disk alone (its
+   digest), keep it across `vm destroy`, skip the upload when it is there with the same SHA-256,
+   and share the snapshot and image the same way; the docs say what the module does.
+6. **The security group opens the routes' ports to every source**: every `open_ports` rule takes
+   `0.0.0.0/0`, and only a whole `security_group_id` narrows it, so an admin route is held by the
+   stack's own allowlist alone. Carry the routes' `allow_input` values into the group's rules, as
+   the VM's own firewall applies them (recommended), or a variable for the sources (every source
+   by default).
+7. **"Already published … with other inputs" does not say what differs**: the refusal
+   (`internal/publish/publish.go`) compares the release's inputs digest alone, while the per-node
+   digests are computed (`internal/graph`), so finding that a version's changelog section was
+   edited after the release took the registry's annotations, node by node. Name the nodes whose
+   inputs differ (`os-bundle`, `installer`) and, where it can, the field (`changelog`), keeping
+   the per-field digests in the release manifest.
+
 ### Features — pull credentials
 
 1. **A pull credential per install**: issued at install time by what the `registry.pull` provider
