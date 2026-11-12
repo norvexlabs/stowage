@@ -412,8 +412,9 @@ jq -r .known_hosts_line "$WORK/seed.json" >"$WORK/seed.known_hosts"
 rm -f "$WORK/seed.key"
 seed_token=$(token)
 rc=0; "$CTL" vm seed --json "${SEED[@]}" --set "DEPLOY_TOKEN=$seed_token" >"$WORK/seed2.json" 2>"$WORK/seed2.log" || rc=$?
-[[ $rc == 3 && ! -s $WORK/seed2.json ]] && grep -q 'DEPLOY_TOKEN: a seed carries no secret input' "$WORK/seed2.log" ||
-	{ cat "$WORK/seed2.log"; fail "vm seed given a secret input exited $rc, not 3 naming it with nothing on standard output"; }
+[[ $rc == 3 ]] && grep -q 'DEPLOY_TOKEN: a seed carries no secret input' "$WORK/seed2.log" &&
+	jq -e '.refused.reason | startswith("DEPLOY_TOKEN: a seed carries no secret input")' "$WORK/seed2.json" >/dev/null ||
+	{ cat "$WORK/seed2.log" "$WORK/seed2.json"; fail "vm seed given a secret input exited $rc, not 3 naming it, its refusal one JSON object on standard output"; }
 ! grep -qF -- "$seed_token" "$WORK/seed2.json" "$WORK/seed2.log" "$WORK/seed.json" || fail "the secret input given to vm seed reached its output"
 
 step "audit off the VM: the operator's notes-stow reads the VM's release's SBOMs from the mirror, by its version alone, and scans them"
