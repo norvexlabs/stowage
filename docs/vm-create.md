@@ -372,7 +372,11 @@ in the same installer (bootstrap it as above, then `sh <name>.sh vm create …`,
   updates and upgrades take it.
 - The cloud-config (`#cloud-config`, Kairos's stages, applied at every boot) sets the host name
   in the `initramfs` stage, before the network starts (a DHCP request carries it, so a DHCP
-  server that registers names registers it); then, in `boot`, creates the administrator with the SSH key and no password, then, in a step of its own,
+  server that registers names registers it), and there too makes Kairos's automatic reset
+  (`kairos-reset.service`, the first boot's, which lays the system out from the recovery
+  system the disk holds) wait for udev's queue before it reads the partitions:
+  `/etc/systemd/system/kairos-reset.service.d/10-<name>-udev-settle.conf`, `udevadm settle
+  --timeout=120`, the reset tried after the bound all the same; then, in `boot`, creates the administrator with the SSH key and no password, then, in a step of its own,
   puts them in the `admin` group (`usermod`, which also covers a user the base already has:
   passwordless `sudo`, the host daemon's socket), and writes the console's connect line,
   `/etc/issue.d/07-<name>-connect.issue` (`connect: ssh <user>@<address>, then `<short>-stow

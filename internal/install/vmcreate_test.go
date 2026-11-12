@@ -209,7 +209,7 @@ func TestVMCreateWritesTheDiskTheSeedAndTheSteps(t *testing.T) {
 	}
 	boot := cc.Stages["boot"]
 	u := boot[0].Users["ops"]
-	if ini := cc.Stages["initramfs"]; len(ini) != 1 || ini[0].Hostname != "notes-1" || boot[0].Hostname != "" {
+	if ini := cc.Stages["initramfs"]; len(ini) != 2 || ini[0].Hostname != "notes-1" || ini[1].Hostname != "" || boot[0].Hostname != "" {
 		t.Errorf("the host name is not set in the initramfs stage alone: %+v", cc.Stages)
 	}
 	if !slices.Equal(u.Groups, []string{"admin"}) || u.Passwd != "!" || !slices.Equal(u.SSHAuthorizedKeys, []string{v.keyLine}) {
@@ -1174,8 +1174,10 @@ func TestTheSeedNamesAndAddressesTheNICs(t *testing.T) {
 	for path, want := range map[string]string{
 		"initramfs:/etc/systemd/network/10-atlas-uplink.link": "[Match]\nMACAddress=02:00:00:00:00:0a\n\n[Link]\nName=uplink\n",
 		"initramfs:/etc/systemd/network/10-atlas-edge.link":   "[Match]\nMACAddress=02:00:00:00:00:0b\n\n[Link]\nName=edge\n",
-		"boot:/etc/systemd/network/05-atlas-static.network":   "[Match]\nName=uplink\n\n[Network]\nDHCP=ipv4\n",
-		"boot:/etc/systemd/network/10-atlas-edge.network":     "[Match]\nName=edge\n\n[Network]\nDHCP=ipv4\nLinkLocalAddressing=no\nIPv6AcceptRA=no\n\n[DHCPv4]\nUseGateway=no\nUseRoutes=no\nUseDNS=no\nSendHostname=no\n\n[Link]\nRequiredForOnline=no\n",
+		// The first boot's automatic reset waits for udev's queue before it reads the partitions.
+		"initramfs:/etc/systemd/system/kairos-reset.service.d/10-atlas-udev-settle.conf": "[Service]\nExecStartPre=-/usr/bin/udevadm settle --timeout=120\n",
+		"boot:/etc/systemd/network/05-atlas-static.network":                              "[Match]\nName=uplink\n\n[Network]\nDHCP=ipv4\n",
+		"boot:/etc/systemd/network/10-atlas-edge.network":                                "[Match]\nName=edge\n\n[Network]\nDHCP=ipv4\nLinkLocalAddressing=no\nIPv6AcceptRA=no\n\n[DHCPv4]\nUseGateway=no\nUseRoutes=no\nUseDNS=no\nSendHostname=no\n\n[Link]\nRequiredForOnline=no\n",
 	} {
 		if !strings.Contains(files[path], want) {
 			t.Errorf("%s:\n%s\nwant it to hold\n%s", path, files[path], want)

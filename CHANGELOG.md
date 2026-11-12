@@ -7,6 +7,9 @@ follow [SemVer](https://semver.org/).
 
 ### Fixed
 
+- A VM's first boot no longer stays in its recovery system when Kairos's automatic reset reads
+  the disk before udev has recorded its partitions: the reset waits for udev's queue (two
+  minutes at most).
 - `vm create`'s message when the VM is not ready by `--wait` names the platform's own console
   (Scaleway's Console tab, a cloud's serial console, `virsh console`, …), not TrueNAS's on every
   platform.
