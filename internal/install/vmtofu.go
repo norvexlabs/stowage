@@ -641,6 +641,13 @@ func (in *Installer) awaitVM(ctx context.Context, dir, pin, user, addr, pubKey s
 			if err = json.Unmarshal(out, &st); err == nil {
 				otherOS := osRelease != nil && st.OS != (Version{osRelease.Version, osRelease.Revision})
 				switch {
+				case st.Boot == "recovery" && st.ResetFailed != "":
+					// The reset is not tried again: no later poll would answer otherwise.
+					if rerr := os.Rename(attempt, known); rerr != nil && !errors.Is(rerr, os.ErrNotExist) {
+						return rerr
+					}
+					return fmt.Errorf("%s@%s: the first boot gave up in Kairos's recovery system, which stays: %s; the VM is kept: look at %s, or `%s vm destroy %s` removes it",
+						user, addr, st.ResetFailed, cmp.Or(console, "its console"), ctl, filepath.Base(dir))
 				case st.Boot == "recovery":
 					err = errors.New("the recovery system answers: the first boot is not done")
 				case otherOS:

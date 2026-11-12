@@ -148,6 +148,11 @@ func statusIn(boot string, installed bool) func() ([]byte, error) {
 	}
 }
 
+// statusResetFailed is the recovery system's status once its automatic reset failed.
+func statusResetFailed() ([]byte, error) {
+	return json.Marshal(Status{Name: "notes", OS: Version{"1.0.0", 1}, Job: "idle", Boot: "recovery", ResetFailed: kairosReset + " failed: EFI partition not found"})
+}
+
 // statusInstalling is the status of a first install not finished, still running.
 func statusInstalling() ([]byte, error) {
 	return json.Marshal(Status{Name: "notes", OS: Version{"1.0.0", 1}, Job: "idle", Boot: "active", Installed: &Version{"1.0.0", 1}, Installing: true})
@@ -497,6 +502,21 @@ func TestVMCreateWithOpenTofuWaitsForTheFirstInstallToFinish(t *testing.T) {
 		return json.Marshal(Status{Name: "notes", OS: Version{"1.0.0", 1}, Job: "idle", Boot: "active", InstallFailed: "the boot's install failed"})
 	}}
 	if err := v.create(tofuCreate(), r.mod(nil)); err == nil || !strings.Contains(err.Error(), "the first install failed: the boot's install failed") || len(r.ssh.calls) != 1 {
+		t.Fatalf("err = %v after %d calls", err, len(r.ssh.calls))
+	}
+}
+
+// A first boot whose automatic reset failed stays in the recovery system: the wait stops at its
+// first answer, telling the reset's journal, not at --wait; a recovery system still resetting is
+// waited for.
+func TestVMCreateWithOpenTofuStopsWhenTheResetFailed(t *testing.T) {
+	t.Parallel()
+	v := newVMCreate(t, "qcow2")
+	r := newTofuRun(t)
+	r.ssh.answers = []func() ([]byte, error){refused, statusResetFailed, statusJSON(true)}
+	err := v.create(tofuCreate(), r.mod(nil))
+	if err == nil || !strings.Contains(err.Error(), "gave up in Kairos's recovery system, which stays: kairos-reset.service failed: EFI partition not found") ||
+		!strings.Contains(err.Error(), "look at its display on TrueNAS") || !strings.Contains(err.Error(), "vm destroy notes-1") || len(r.ssh.calls) != 2 {
 		t.Fatalf("err = %v after %d calls", err, len(r.ssh.calls))
 	}
 }

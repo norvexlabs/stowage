@@ -554,7 +554,11 @@ in the same installer (bootstrap it as above, then `sh <name>.sh vm create …`,
     `--host` gives that address when this machine reaches the VM over it; a DHCP server must
     register it) until `<short>-stow status
     --json` there answers from a system that is not Kairos's recovery (a first boot runs the
-    recovery system, then resets and reboots into the active one) and reports the install
+    recovery system, then resets and reboots into the active one; a recovery system whose
+    automatic reset failed, `"reset_failed"` in its status, fails the wait at once: `the first
+    boot gave up in Kairos's recovery system, which stays: kairos-reset.service failed: <its last
+    journal lines>; the VM is kept: look at <the platform's console>, or `<short>-stow vm destroy
+    <name>` removes it`) and reports the install
     finished (its stack up and the provision hook done; `"installing": true` until then; a
     first install that failed, `"install_failed": "<why>"` — also when the boot's install failed
     before writing the install, and not while the boot runs it again — fails the wait at once

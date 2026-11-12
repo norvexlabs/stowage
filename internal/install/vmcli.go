@@ -879,6 +879,9 @@ func (c *hostClient) status(ctx context.Context, asJSON bool) error {
 		if st.Fallback {
 			boot += " (the fallback: the last upgrade failed its health gate, or `rollback` chose it)"
 		}
+		if st.ResetFailed != "" {
+			boot += " (the first boot gave up: " + st.ResetFailed + ")"
+		}
 		fmt.Fprintf(c.out, "boot       %s\n", boot)
 	}
 	if j := st.BootJudged; j != nil {

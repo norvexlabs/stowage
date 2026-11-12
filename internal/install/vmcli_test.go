@@ -789,6 +789,17 @@ func TestHealthOverTheSocketFailsWhenNotReady(t *testing.T) {
 	}
 }
 
+func TestStatusOverTheSocketTellsAFailedReset(t *testing.T) {
+	t.Parallel()
+	e := vmEnv(t, "1.0.0")
+	d := daemon(e, &fakeHost{reset: "failed"})
+	boots(t, d, "recovery", nil)
+	out, err := ctl(e, served(t, d), "status")
+	if want := "boot       recovery (the first boot gave up: " + kairosReset + " failed: the boot's journal)"; err != nil || !strings.Contains(out, want) {
+		t.Errorf("%v: no %q in\n%s", err, want, out)
+	}
+}
+
 func TestStatusOverTheSocketTellsTheFallback(t *testing.T) {
 	t.Parallel()
 	g := newGate(t, "", nil, false)

@@ -7,6 +7,9 @@ follow [SemVer](https://semver.org/).
 
 ### Fixed
 
+- `vm create` stops waiting as soon as the VM's first boot gives up in Kairos's recovery system,
+  naming the automatic reset's last journal lines, instead of waiting out `--wait`; `status
+  --json` on the VM says so in `reset_failed`, and `status` after the boot.
 - A VM's first boot no longer stays in its recovery system when Kairos's automatic reset reads
   the disk before udev has recorded its partitions: the reset waits for udev's queue (two
   minutes at most).

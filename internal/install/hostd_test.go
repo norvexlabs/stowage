@@ -38,6 +38,8 @@ type fakeHost struct {
 	// boot is the ActiveState of <name>.service, and judge of <name>-health.service; empty is
 	// active.
 	boot, judge string
+	// reset is the ActiveState of kairos-reset.service; empty is active.
+	reset string
 	// editErr fails grub2-editenv; remountErr fails a remount, roErr a remount read-only;
 	// rebootErr fails `systemctl reboot`; editAfterReboot, once it failed, fails grub2-editenv.
 	editErr, remountErr, roErr, rebootErr, editAfterReboot error
@@ -84,6 +86,8 @@ func (f *fakeHost) Run(_ context.Context, c Cmd) ([]byte, error) {
 			st = f.boot
 		case "notes-health.service":
 			st = f.judge
+		case kairosReset:
+			st = f.reset
 		default:
 			return nil, fmt.Errorf("asked about %v", c.Args)
 		}
@@ -254,6 +258,32 @@ func TestStatusTellsABootThatFailedBeforeWritingTheInstall(t *testing.T) {
 		var st Status
 		if code := call(t, daemon(e, &fakeHost{boot: boot}).Handler(), "GET", "/v1/status", nil, &st); code != 200 || st.Installed != nil || (st.InstallFailed != "") != failed {
 			t.Errorf("%s: %d %+v", boot, code, st)
+		}
+	}
+}
+
+// On the recovery system, a failed automatic reset is told with its journal; a reset not failed,
+// or a failed one on another system, is not.
+func TestStatusTellsAFailedAutomaticReset(t *testing.T) {
+	t.Parallel()
+	for _, c := range []struct {
+		mode, reset string
+		want        string
+	}{
+		{"recovery", "failed", kairosReset + " failed: the boot's journal"},
+		{"recovery", "activating", ""},
+		{"recovery", "", ""},
+		{"active", "failed", ""},
+	} {
+		e := vmEnv(t, "1.0.0")
+		d := daemon(e, &fakeHost{reset: c.reset})
+		d.O.Cos = t.TempDir()
+		if err := os.WriteFile(filepath.Join(d.O.Cos, c.mode+"_mode"), nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		var st Status
+		if call(t, d.Handler(), "GET", "/v1/status", nil, &st); st.ResetFailed != c.want {
+			t.Errorf("%s, reset %q: reset_failed %q, want %q", c.mode, c.reset, st.ResetFailed, c.want)
 		}
 	}
 }

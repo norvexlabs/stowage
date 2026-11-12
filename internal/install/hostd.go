@@ -307,6 +307,10 @@ type Status struct {
 	// Boot is the system Kairos booted: active, passive (the fallback) or recovery; empty off
 	// Kairos.
 	Boot string `json:"boot,omitempty"`
+	// ResetFailed: on the recovery system, Kairos's automatic reset (kairos-reset.service, which
+	// lays the system out at a first boot) failed, so the VM stays there; it holds the unit's last
+	// journal lines. Empty otherwise.
+	ResetFailed string `json:"reset_failed,omitempty"`
 	// Fallback: Kairos booted the passive system because the last upgrade's boot failed its health
 	// gate, or `rollback` chose it.
 	Fallback bool `json:"fallback,omitempty"`
@@ -941,6 +945,9 @@ func (h *Hostd) status(w http.ResponseWriter, r *http.Request) {
 	st.Disk = h.disk()
 	st.Pressure = h.pressureStatus(st.Disk)
 	st.Boot = bootMode(h.O.cos())
+	if st.Boot == "recovery" {
+		st.ResetFailed = resetFailed(r.Context(), h.Host)
+	}
 	st.Fallback = fileExists(filepath.Join(h.O.cos(), upgradeFailure))
 	if st.Boot == "active" {
 		if vars, err := h.assessment().read(); err == nil {
@@ -978,6 +985,25 @@ func (h *Hostd) status(w http.ResponseWriter, r *http.Request) {
 	}
 	h.mu.Unlock()
 	reply(w, http.StatusOK, st)
+}
+
+// kairosReset is Kairos's automatic reset unit.
+const kairosReset = "kairos-reset.service"
+
+// resetLines bounds the journal lines resetFailed tells.
+const resetLines = 15
+
+// resetFailed says, when kairosReset failed in this boot, so with its last journal lines; empty
+// when it did not fail, or its state cannot be read (the next status asks again).
+func resetFailed(ctx context.Context, host Tool) string {
+	if st, _, err := unitStatus(ctx, host, kairosReset); err != nil || st != "failed" {
+		return ""
+	}
+	out, err := host.Run(ctx, Cmd{Args: []string{"journalctl", "--unit", kairosReset, "--boot", "--no-pager", "--output", "cat", "--lines", strconv.Itoa(resetLines)}})
+	if err != nil || strings.TrimSpace(string(out)) == "" {
+		return kairosReset + " failed (`journalctl -u " + kairosReset + " -b` on the VM tells why)"
+	}
+	return kairosReset + " failed: " + strings.Join(strings.Fields(strings.ReplaceAll(strings.TrimSpace(string(out)), "\n", " | ")), " ")
 }
 
 // readBootID is the boot id the kernel publishes in file; empty when it cannot be read.
