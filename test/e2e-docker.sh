@@ -88,7 +88,6 @@ step "install 1.0.0 with the bootstrap one-liner"
 # Two free ports for the stack, picked just before they are bound.
 APP_PORT=$(free_port)
 API_PORT=$(free_port)
-while [[ $API_PORT == "$APP_PORT" ]]; do API_PORT=$(free_port); done
 login_pull
 docker run --rm --pull always "$REG/notes/notes-installer:latest" >"$WORK/notes.sh" || fail "docker run of the installer image"
 unset DOCKER_CONFIG # for the next ships; the installer's environment never has it (OPERATOR)
@@ -295,7 +294,6 @@ step "an install from the mirror; upgrade --version reads it with the recorded C
 D1=$D D=$WORK/stowage-e2e-site APP1=$APP_PORT API1=$API_PORT
 APP_PORT=$(free_port)
 API_PORT=$(free_port)
-while [[ $API_PORT == "$APP_PORT" ]]; do API_PORT=$(free_port); done
 CLEANUP+=('D=$WORK/stowage-e2e-site remove_install' "docker images --format '{{.Repository}}@{{.Digest}}' | grep -F '$SITE/' | xargs -r docker rmi >/dev/null 2>&1")
 "${OPERATOR[@]}" "$D1/notes-stow" --no-input --dir "$D" --ports "app=$APP_PORT,api=$API_PORT" --set ADMIN_EMAIL=admin@notes.test \
 	--registry "$SITE" --registry-ca "$MIRROR_CA" >"$WORK/install-site.log" 2>&1 || { cat "$WORK/install-site.log"; fail "install from the mirror"; }

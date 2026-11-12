@@ -1056,7 +1056,12 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
   provision hook creates); `keep_on_reset` on Kubernetes (today every claim of the release goes);
   a database outside the Kubernetes release (`external`) is not reset.
 
-- **What `test/sweep.sh` does not sweep**: a TrueNAS VM `stowage-e2e-<pid>` whose run died
+- **The smoke test's registry is judged by a bare PID**: `stowage-smoke-zot-<pid>` (the Go test's
+  process) has no PID namespace recorded, so an end-to-end suite in a container on the same Docker
+  sweeps a live `make smoke-install`'s registry. A random id and a recorded namespace, as the
+  suites' runs have, would close it.
+
+- **What `test/sweep.sh` does not sweep**: a TrueNAS VM `stowage-e2e-<run>` whose run died
   without its cleanup (a host crash; `vm destroy` needs the run's state, gone with it), and the
   build cache, which lives in the host's shared buildx builder.
 
@@ -1194,10 +1199,6 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
   changed during the ship would sign unchecked. The check beside each sign call would close it.
 - **An empty `services:` is caught by lint alone**, from the file: decoding takes it as no
   key. A presence check in spec decoding would give every reader of the spec the refusal.
-- **A suite's free port can be taken before it binds**: `free_port` hands out a port from the
-  kernel's ephemeral range, which the parallel suites' connections and docker-proxy draw from
-  too; e2e-docker once lost its mirror install's front port that way and passed alone. A port
-  range of its own per suite, outside the ephemeral one, would close it.
 
 - **A project's own ARP value on `all` is not range-checked**: lint takes `host.sysctls`'
   `net.ipv4.conf.all.arp_ignore` / `arp_announce` as the floor a NIC's value is judged against,

@@ -146,7 +146,6 @@ docker image rm -f "$REG/notes/notes-os:beta-1.0.0" >/dev/null
 step "the bundle's notes-stow installs from the preloaded images, as on the VM; boot brings it up again"
 APP_PORT=$(free_port)
 API_PORT=$(free_port)
-while [[ $API_PORT == "$APP_PORT" ]]; do API_PORT=$(free_port); done
 VM1=("${OPERATOR[@]}" "$WORK/os-1.0.0-ctl")
 # The settings a VM's cloud-config writes give the channel and the input; the flags the rest.
 printf 'channel: beta\ninputs:\n  ADMIN_EMAIL: admin@notes.test\n' >"$WORK/install.yaml"
@@ -344,7 +343,7 @@ mkdir -p "$LV/run" "$LV/state"
 docker build -q --build-arg "BASE=$LIBVIRTD_BASE" -t stowage-e2e-libvirtd "$(dirname "$0")/libvirtd" >/dev/null || fail "the libvirtd image"
 # --init: libvirtd daemonizes QEMU, whose parent is then PID 1, which must reap it (a zombie QEMU
 # fails the destroy).
-lvc=$(docker run -d --init --name "stowage-e2e-libvirtd-$$" --privileged --cgroupns=host --memory 6g -v "$LV/run:/run/libvirt" stowage-e2e-libvirtd)
+lvc=$(docker run -d --init --name "stowage-e2e-libvirtd-$RUN" --privileged --cgroupns=host --memory 6g -v "$LV/run:/run/libvirt" stowage-e2e-libvirtd)
 CLEANUP+=("docker rm -f $lvc >/dev/null 2>&1")
 # libvirtd's runtime files under the bind mount are root's: removed by a container, as root.
 CLEANUP+=("docker run --rm --network none -v '$LV:/lv' --entrypoint rm $LIBVIRTD_BASE -rf /lv/run >/dev/null 2>&1")

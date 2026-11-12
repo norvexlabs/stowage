@@ -62,12 +62,12 @@ V1=$CALVER.1 V2=$CALVER.2 V3=$CALVER.3
 grep -q 'not in the current month' "$WORK/ship-$V1.log" && fail "this month's release is out of its month"
 
 step "install $V1 with the bootstrap one-liner (loopback)"
-# Three distinct free ports for the stack, picked just before they are bound.
-CONSOLE_PORT=$(free_port) API_PORT=$(free_port) INGEST_PORT=$(free_port) OPS_PORT=$(free_port) STATUS_PORT=$(free_port)
-while [[ $API_PORT == "$CONSOLE_PORT" ]]; do API_PORT=$(free_port); done
-while [[ $INGEST_PORT == "$CONSOLE_PORT" || $INGEST_PORT == "$API_PORT" ]]; do INGEST_PORT=$(free_port); done
-while [[ $OPS_PORT == "$CONSOLE_PORT" || $OPS_PORT == "$API_PORT" || $OPS_PORT == "$INGEST_PORT" ]]; do OPS_PORT=$(free_port); done
-while [[ " $CONSOLE_PORT $API_PORT $INGEST_PORT $OPS_PORT " == *" $STATUS_PORT "* ]]; do STATUS_PORT=$(free_port); done
+# Five distinct free ports for the stack, each assigned alone: set -e sees a failed draw.
+CONSOLE_PORT=$(free_port)
+API_PORT=$(free_port)
+INGEST_PORT=$(free_port)
+OPS_PORT=$(free_port)
+STATUS_PORT=$(free_port)
 login_pull
 docker run --rm --pull always "$REG/atlas/atlas-installer:latest" >"$WORK/atlas.sh" || fail "docker run of the installer image"
 unset DOCKER_CONFIG # for the next ships; the installer's environment never has it (OPERATOR)

@@ -24,14 +24,14 @@ vm_env() {
 	command -v tofu >/dev/null || { echo "FAIL: no tofu on PATH" >&2; exit 1; }
 }
 
-# vm_names: H, the VM's host name (stowage-e2e-<pid>), ADDR its name under DOMAIN, the state
+# vm_names (after lib.sh): H, the VM's host name (stowage-e2e-<run>, lib.sh's RUN), ADDR its name under DOMAIN, the state
 # directory under $WORK (E2E_KEEP_VM=1: beside the work directory, past the run) and STATE, the
 # VM's state in it.
 vm_names() {
-	H=stowage-e2e-$$
+	H=stowage-e2e-$RUN
 	ADDR=$H.$DOMAIN
 	export XDG_STATE_HOME=$WORK/state
-	if [[ -n ${E2E_KEEP_VM:-} ]]; then XDG_STATE_HOME=$(dirname "$WORK")/stowage-e2e-vm-state-$$; fi
+	if [[ -n ${E2E_KEEP_VM:-} ]]; then XDG_STATE_HOME=$(dirname "$WORK")/stowage-e2e-vm-state-$RUN; fi
 	STATE=$XDG_STATE_HOME/$NAME/vms/$H
 }
 

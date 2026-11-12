@@ -81,8 +81,8 @@ vm_cleanup
 # The machine's power button loops until it answers, and stops before any destroy.
 CLEANUP=("touch $WORK/metal-up" "${CLEANUP[@]}")
 # The server's two NICs (host.interfaces' uplink and edge), both on the bridge, by MACs of this run.
-MAC_UPLINK=$(printf '02:5e:%02x:%02x:00:01' $(($$ >> 8 & 255)) $(($$ & 255)))
-MAC_EDGE=$(printf '02:5e:%02x:%02x:00:02' $(($$ >> 8 & 255)) $(($$ & 255)))
+MAC_UPLINK=02:5e:${RUN:1:2}:${RUN:3:2}:00:01
+MAC_EDGE=02:5e:${RUN:1:2}:${RUN:3:2}:00:02
 SEARCH_KEY_GIVEN=$(token)
 (umask 077; printf 'SEARCH_KEY: %s\n' "$SEARCH_KEY_GIVEN" >"$WORK/vm-answers.yaml")
 "$CTL" vm create --no-input --platform metal --device /dev/vda --answers "$WORK/vm-answers.yaml" --create opentofu --module "$(dirname "$0")/metal-truenas" --vm-name "${H//-/}" \

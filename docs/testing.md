@@ -40,7 +40,7 @@ and also use `sha256sum` and `tar`: they download pinned kind, helm 4 and kubect
 `$XDG_CACHE_HOME/stowage-tools` (default `~/.cache/stowage-tools`; each checked against its SHA-256) and run them from there, never the
 host's; each removes its cluster and its Docker network when it ends. `make e2e-kairos` and
 `make e2e-vm` download the pinned age 1.3.2 there too, and run a WebDAV server from the pinned
-rclone image (`stowage-e2e-zot-<pid>-dav`, removed when the run ends). `make e2e-kairos` needs
+rclone image (`stowage-e2e-zot-<run>-dav`, removed when the run ends). `make e2e-kairos` needs
 privileged containers and loop devices (auroraboot), about 30 GB free under `XDG_CACHE_HOME`, and
 takes about 25 minutes; it removes the stack it ran as `make e2e-docker` does; the other end-to-end targets but `make e2e-vm` and `make e2e-full-vm` drop the example's `kairos` shape.
 `make e2e-vm` needs what `make e2e-kairos` needs (about 15 GB), `tofu` (on `PATH`, else
@@ -50,9 +50,9 @@ registers the VM's host name, and a VM there that reaches this host's address to
 `TRUENAS_URL`, `TRUENAS_API_KEY`, `TRUENAS_INSECURE_SKIP_VERIFY`, `TF_VAR_pool`,
 `TF_VAR_parent_dataset`, `TF_VAR_nic_attach`, `TF_VAR_domain` (the DHCP server's domain) and
 `DEV_VM_SSH_KEY` (a private key without a passphrase, its public key at `<key>.pub`); the
-`TF_VAR_*` are unset before OpenTofu runs. The VM is `stowage-e2e-<pid>`, its state under the
+`TF_VAR_*` are unset before OpenTofu runs. The VM is `stowage-e2e-<run>`, its state under the
 run's work directory; it is destroyed when the run ends, pass or fail — unless `E2E_KEEP_VM=1`,
-which keeps it (its state in `stowage-e2e-vm-state-<pid>` beside the run's work directory, in
+which keeps it (its state in `stowage-e2e-vm-state-<run>` beside the run's work directory, in
 `$XDG_CACHE_HOME` or `~/.cache`, with a copy of the run's `notes-stow` beside it; the run prints
 the `vm destroy` command). `E2E_VM_WAIT` sets `vm
 create --wait` (default `30m`). About 85 minutes (two more releases are shipped and the VM
@@ -61,11 +61,27 @@ reboots six times). The project's `health_gate` is shortened (`deadline_s: 120`)
 (its copy is `at-stow`) and `E2E_VM_WAIT`; it shortens the example's `health_gate` to
 `deadline_s: 300` and its `disk_formats` to `[qcow2]`; about 25 minutes.
 
+The test registries (zot, the mirror, the WebDAV server) publish on a port Docker picks as it
+starts them. The ports a suite hands an install (its front's, its routes') come from lib.sh's
+`free_port`: below the kernel's ephemeral range (`net.ipv4.ip_local_port_range`, which outgoing
+connections and Docker's picks draw from; it must start above 11000) and reserved for the run under
+`$XDG_CACHE_HOME/stowage-e2e-ports/<port>` until it ends, so parallel suites sharing that cache
+never take each other's (runs in containers of their own, each with its own cache, do not see each
+other's reservations). A port is handed out only if nothing binds it on any address and no
+container publishes it.
+
 Every end-to-end suite (and `make smoke-install`) ends with `test/sweep.sh`, which removes what
-earlier runs left on the host and never what a live run holds (a run is live while its process
-is: each work directory records its PID in `.pid`): the test registries
-(`stowage-e2e-zot-<pid>`, `-mirror`, `-dav`, `stowage-smoke-zot-<pid>`) and kind clusters
-(`stowage-e2e-<pid>`) of dead runs; every image reference
+earlier runs left on the host and never what a live run holds. Each run draws a random id,
+`<run>` (`r` and 8 hex digits), which names its work directory `stowage-e2e.<run>` and everything it starts
+on Docker, so two runs never share a name, even two each PID 1 in a container of its own; a run is
+live while its process is (its work directory records its PID in `.pid`, trusted only in the PID
+namespace it records in `.pidns`), and a run it cannot judge so (another container's on the same
+Docker) for six hours after its object was made; a test install's
+stack in another container's work directory follows its run. A run's exit removes every container
+and network named with its id. It removes the test registries (`stowage-e2e-zot-<run>`, `-mirror`, `-dav`,
+`stowage-smoke-zot-<pid>`, the smoke test's process), libvirt daemons
+(`stowage-e2e-libvirtd-<run>`), kind clusters and their networks (`stowage-e2e-<run>`) of dead
+runs; the ports dead runs reserved; every image reference
 `<ipv4>:<port>/{notes,atlas,smoke,site,t}/…` whose port no running container publishes; work
 directories `stowage-e2e.*` of dead runs; the test installs' stacks — compose projects
 `<name>-stowage-{e2e,smoke}-…-<crc>`, as the suites and the smoke test name their install

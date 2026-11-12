@@ -19,9 +19,20 @@ REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 STOWAGE=${STOWAGE:-$REPO/bin/stowage}
 CACHE=${XDG_CACHE_HOME:-$HOME/.cache}
 mkdir -p "$CACHE" # a fresh machine (a CI runner) has none
-WORK=$(mktemp -d "$CACHE/stowage-e2e.XXXXXX")
-echo $$ >"$WORK/.pid" # this run's: test/sweep.sh leaves a live run's work directory alone
-ZOT_NAME=stowage-e2e-zot-$$
+# RUN, random, names this run's work directory and everything it starts on Docker (its
+# registries, cluster, network, VM): never another run's, whatever the PIDs (two runs, each PID 1 in
+# a container of its own, share one Docker). r and lowercase hex: a kind cluster's name takes no
+# capital, and a sweep that names a run by its PID never reads this one as one.
+while :; do
+	RUN=r$(head -c 4 /dev/urandom | od -An -tx1 | tr -d ' \n')
+	mkdir -m 700 "$CACHE/stowage-e2e.$RUN" 2>/dev/null && break
+done
+WORK=$CACHE/stowage-e2e.$RUN
+# This run's PID and the PID namespace it is one in: test/sweep.sh leaves a live run's things alone,
+# and trusts a PID only from its own namespace.
+readlink /proc/self/ns/pid >"$WORK/.pidns" || fail "/proc/self/ns/pid does not read"
+echo $$ >"$WORK/.pid"
+ZOT_NAME=stowage-e2e-zot-$RUN
 export XDG_CACHE_HOME=$WORK/cache
 CLEANUP=()
 
@@ -29,7 +40,11 @@ cleanup() {
 	local c
 	for c in "${CLEANUP[@]}"; do eval "$c" || true; done
 	if [[ -n ${E2E_LOGS:-} ]]; then mkdir -p "$E2E_LOGS" && cp "$WORK"/*.log "$E2E_LOGS"/ 2>/dev/null || true; fi
-	docker rm -f "$ZOT_NAME" >/dev/null 2>&1 || true
+	# Whatever else this run started on Docker under its name (a registry, a daemon, a network a
+	# failed step left): RUN is this run's alone.
+	docker ps -aq --filter "name=-$RUN" | xargs -r docker rm -f -v >/dev/null 2>&1 || true
+	docker network ls -q --filter "name=-$RUN" | xargs -r docker network rm >/dev/null 2>&1 || true
+	release_ports
 	rm -rf "$WORK"
 	# What earlier runs left: nothing accumulates from run to run.
 	bash "$REPO/test/sweep.sh" "$CACHE"
@@ -45,7 +60,49 @@ expect_code() { # <want> <curl args…>
 	[[ $got == "$want" ]] || fail "curl $* → $got, want $want"
 }
 token() { head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n'; }
-free_port() { python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])'; }
+# free_port: a port no other run sharing this cache holds, for what binds it later (an install's
+# front, a route). It is drawn below the kernel's ephemeral range, which outgoing connections and
+# the ports Docker picks come from, so neither takes it before it binds; it is bound by nothing on
+# any address and published by no container; each run reserves its ports under $PORTS (an atomic
+# mkdir naming the run; the run lists them in $WORK/ports), released at its exit, a dead run's by
+# test/sweep.sh. Runs in containers of their own, each with its own cache, do not see each other's
+# reservations. A container the run starts publishes on a port Docker picks instead
+# (published_port). A failure exits the $(…) it runs in: callers assign it alone, under set -e.
+PORTS=$CACHE/stowage-e2e-ports
+free_port() {
+	local lo port published
+	lo=$(cut -f1 /proc/sys/net/ipv4/ip_local_port_range)
+	((lo > 11000)) || fail "the ephemeral port range starts at $lo: no room below it for the suites' ports"
+	mkdir -p "$PORTS"
+	for _ in $(seq 200); do
+		port=$((10000 + (RANDOM << 15 | RANDOM) % (lo - 10000)))
+		mkdir "$PORTS/$port" 2>/dev/null || continue
+		echo "$RUN" >"$PORTS/$port/run"
+		echo "$port" >>"$WORK/ports"
+		published=$(docker ps --format '{{.Ports}}') || fail "docker ps"
+		if python3 -c 'import socket,sys; s=socket.socket(); s.bind(("0.0.0.0",int(sys.argv[1])))' "$port" 2>/dev/null &&
+			! grep -qF ":$port->" <<<"$published"; then
+			echo "$port"
+			return
+		fi
+	done
+	fail "no free port below $lo"
+}
+release_ports() {
+	local port
+	[[ -f $WORK/ports ]] || return 0
+	while read -r port; do
+		[[ $(cat "$PORTS/$port/run" 2>/dev/null) == "$RUN" ]] && rm -rf "${PORTS:?}/$port"
+	done <"$WORK/ports"
+	return 0
+}
+# published_port <container> <container port>: the host port Docker published it on (-p ip::port).
+published_port() {
+	local p
+	p=$(docker port "$1" "$2/tcp" | head -n1)
+	[[ $p =~ :([0-9]+)$ ]] || fail "$1 publishes no port for $2 ($p)"
+	echo "${BASH_REMATCH[1]}"
+}
 
 # tool <name> <url> <sha256> [tar member]: links $BIN/<name> to $TOOLS/<sha256>/<name>, downloaded
 # once and moved into place by a rename (another member of the same archive may be there).
@@ -79,16 +136,16 @@ tool() {
 start_dav() {
 	local url
 	mkdir -p "$WORK/dav"
+	CLEANUP+=("docker rm -f $ZOT_NAME-dav >/dev/null 2>&1")
 	if [[ -n ${1:-} ]]; then
 		local port
-		port=$(free_port)
-		docker run -d --name "$ZOT_NAME-dav" --user "$(id -u):$(id -g)" -p "$1:$port:8080" -v "$WORK/dav:/data" "$RCLONE" serve webdav /data --addr :8080 >/dev/null
+		docker run -d --name "$ZOT_NAME-dav" --user "$(id -u):$(id -g)" -p "$1::8080" -v "$WORK/dav:/data" "$RCLONE" serve webdav /data --addr :8080 >/dev/null
+		port=$(published_port "$ZOT_NAME-dav" 8080) || exit 1
 		url=http://$1:$port
 	else
 		docker run -d --name "$ZOT_NAME-dav" --user "$(id -u):$(id -g)" -v "$WORK/dav:/data" "$RCLONE" serve webdav /data --addr :8080 >/dev/null
 		url=http://$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$ZOT_NAME-dav"):8080
 	fi
-	CLEANUP+=("docker rm -f $ZOT_NAME-dav >/dev/null 2>&1")
 	DAV_CONF=$WORK/dav.conf
 	printf '[dav]\ntype = webdav\nurl = %s\nvendor = other\n' "$url" >"$DAV_CONF"
 	for _ in $(seq 1 50); do docker logs "$ZOT_NAME-dav" 2>&1 | grep -q 'WebDav Server started' && return; sleep 0.2; done
@@ -158,8 +215,6 @@ grype_db() {
 # be one) unless ZOT_COMPAT says otherwise: ZOT_COMPAT='' takes OCI manifests alone.
 start_zot() {
 	local port code
-	port=$(free_port)
-	REG=127.0.0.1:$port
 	PULL_TOKEN=$(token)
 	export STOWAGE_PUSH_TOKEN NOTES_PULL_TOKEN=$PULL_TOKEN STOWAGE_PULL_TOKEN
 	STOWAGE_PUSH_TOKEN=$(token) STOWAGE_PULL_TOKEN=$(token)
@@ -198,7 +253,10 @@ start_zot() {
   "log": { "level": "warn" }
 }
 JSON
-	docker run -d --name "$ZOT_NAME" --user "$(id -u):$(id -g)" -p "$REG:5000" -v "$WORK/zot:/etc/zot" "$ZOT" serve /etc/zot/config.json >/dev/null
+	# Published on a port Docker picks and binds at once: no other run can take it in between.
+	docker run -d --name "$ZOT_NAME" --user "$(id -u):$(id -g)" -p 127.0.0.1::5000 -v "$WORK/zot:/etc/zot" "$ZOT" serve /etc/zot/config.json >/dev/null
+	port=$(published_port "$ZOT_NAME" 5000) || exit 1
+	REG=127.0.0.1:$port
 	for _ in $(seq 1 50); do
 		code=$(curl -s -o /dev/null -w '%{http_code}' "http://$REG/v2/" || true)
 		[[ $code == 401 ]] && break
@@ -213,8 +271,7 @@ JSON
 # MIRROR_CONFIG (a Docker config directory holding the site's login, as `docker login` writes).
 start_mirror() {
 	local ip=${1:-127.0.0.1} port code m=$WORK/mirror token
-	port=$(free_port)
-	MIRROR=$ip:$port MIRROR_CA=$m/ca.pem MIRROR_CONFIG=$WORK/mirror-docker
+	MIRROR_CA=$m/ca.pem MIRROR_CONFIG=$WORK/mirror-docker
 	token=$(token)
 	mkdir -p "$m/data" "$MIRROR_CONFIG"
 	openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 2 -subj /CN=stowage-e2e-mirror-ca \
@@ -244,8 +301,10 @@ start_mirror() {
   "log": { "level": "warn" }
 }
 JSON
-	docker run -d --name "$ZOT_NAME-mirror" --user "$(id -u):$(id -g)" -p "$MIRROR:5000" -v "$m:/etc/zot" "$ZOT" serve /etc/zot/config.json >/dev/null
+	docker run -d --name "$ZOT_NAME-mirror" --user "$(id -u):$(id -g)" -p "$ip::5000" -v "$m:/etc/zot" "$ZOT" serve /etc/zot/config.json >/dev/null
 	CLEANUP+=("docker rm -f $ZOT_NAME-mirror >/dev/null 2>&1")
+	port=$(published_port "$ZOT_NAME-mirror" 5000) || exit 1
+	MIRROR=$ip:$port
 	for _ in $(seq 1 50); do
 		code=$(curl -s -o /dev/null -w '%{http_code}' --cacert "$MIRROR_CA" "https://$MIRROR/v2/" || true)
 		[[ $code == 200 || $code == 401 ]] && break
@@ -530,7 +589,7 @@ POD_SYSCTLS=(net.core.somaxconn net.ipv4.tcp_mtu_probing net.ipv4.tcp_notsent_lo
 # kubelet allows POD_SYSCTLS.
 start_kind() {
 	local pid
-	CLUSTER=stowage-e2e-$$ NET=stowage-e2e-$$
+	CLUSTER=stowage-e2e-$RUN NET=stowage-e2e-$RUN
 	CLEANUP+=('remove_cluster')
 	docker network create "$NET" >/dev/null
 	docker network connect "$NET" "$ZOT_NAME"
@@ -605,7 +664,6 @@ docker_beside() {
 	DOCKER_CTL=("${DOCKER_OPERATOR[@]}" "$D/$SHORT-stow")
 	APP_PORT=$(free_port)
 	API_PORT=$(free_port)
-	while [[ $API_PORT == "$APP_PORT" ]]; do API_PORT=$(free_port); done
 	(cd "$OP" && "${DOCKER_OPERATOR[@]}" sh "$1" --no-input --dir "$D" --ports "app=$APP_PORT,api=$API_PORT" --set ADMIN_EMAIL=admin@notes.test "${@:2}") \
 		>"$WORK/docker-site.log" 2>&1 || { cat "$WORK/docker-site.log"; fail "the Docker install beside"; }
 }

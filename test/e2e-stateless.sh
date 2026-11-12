@@ -211,11 +211,9 @@ PY2
 login_pull
 docker run --rm --pull always "$REG/notes/lookup-installer:latest" >"$WORK/lookup-tls.sh" || fail "docker run of the 1.0.2 installer image"
 unset DOCKER_CONFIG # the installer's environment never has it (OPERATOR)
-# Three distinct ports: free_port releases the one it found, and the L4 route's is free again.
+# Three distinct ports: free_port never hands out one this run holds.
 HTTP_PORT=$(free_port)
-while [[ $HTTP_PORT == "$PORT" ]]; do HTTP_PORT=$(free_port); done
 HTTPS_PORT=$(free_port)
-while [[ $HTTPS_PORT == "$PORT" || $HTTPS_PORT == "$HTTP_PORT" ]]; do HTTPS_PORT=$(free_port); done
 (cd "$WORK" && "${OPERATOR[@]}" sh lookup-tls.sh --no-input --dir "$D" --set GREETING=secure --tls internal \
 	--domains lookup=lookup.test --http-port "$HTTP_PORT" --https-port "$HTTPS_PORT") >"$WORK/install-tls.log" 2>&1 ||
 	{ cat "$WORK/install-tls.log"; fail "install 1.0.2 with --tls internal"; }
