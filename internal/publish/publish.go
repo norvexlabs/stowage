@@ -254,7 +254,7 @@ func (p *Publisher) untracked() (string, error) {
 				sums[key+"/"+clean] = "absent"
 				p.logf("image %s: untracked %s is absent: built without it", key, clean)
 			default:
-				sum, err := digest.FileSum(abs)
+				sum, _, err := digest.FileSum(abs)
 				if err != nil {
 					return "", fmt.Errorf("images.%s.untracked: %s: %w", key, clean, err)
 				}

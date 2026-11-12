@@ -69,3 +69,13 @@ func run(dir string, args ...string) (out string, exit1 bool, err error) {
 	}
 	return strings.TrimRight(string(b), "\n"), false, nil
 }
+
+// IsAncestor reports whether commit a is an ancestor of commit b (or b itself) in the repository
+// at dir: `merge-base --is-ancestor`, whose exit 1 means it is not.
+func IsAncestor(dir, a, b string) (bool, error) {
+	_, exit1, err := run(dir, "merge-base", "--is-ancestor", "--end-of-options", a, b)
+	if exit1 {
+		return false, nil
+	}
+	return err == nil, err
+}

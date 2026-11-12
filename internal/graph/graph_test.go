@@ -804,6 +804,12 @@ func TestUntrackedFilesReachTheImage(t *testing.T) {
 	there := node(build(t, root), "image/api")
 	testutil.Write(t, root, "server/vendor/codec.bin", "made again")
 	again := node(build(t, root), "image/api")
+	if err := testutil.WriteExecutable(filepath.Join(root, "server", "vendor", "codec.bin"), []byte("made again")); err != nil {
+		t.Fatal(err)
+	}
+	if x := node(build(t, root), "image/api"); x.Fields["untracked"] == again.Fields["untracked"] {
+		t.Error("the untracked file's mode is no input")
+	}
 	if there.Inputs == absent.Inputs || again.Inputs == there.Inputs || there.Fields["untracked"] == absent.Fields["untracked"] || again.Fields["untracked"] == there.Fields["untracked"] {
 		t.Errorf("the untracked file's content is no input: %s %s %s", absent.Inputs, there.Inputs, again.Inputs)
 	}

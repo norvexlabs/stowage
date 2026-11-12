@@ -79,7 +79,8 @@ func (o *options) postCommit(channel string, disks bool) error {
 	if err != nil {
 		return err
 	}
-	if _, err := o.specInRepo(r, "HEAD"); err != nil {
+	specRel, err := o.specInRepo(r, "HEAD")
+	if err != nil {
 		return err
 	}
 	d, err := hook.Detect(p, r)
@@ -117,7 +118,7 @@ func (o *options) postCommit(channel string, disks bool) error {
 	}
 	// The untracked files are taken now, at the commit: a file staged for a later release never
 	// reaches this one, however long its ship waits for the lock.
-	staged, err := o.stageUntracked(p, r, d.Commit)
+	staged, err := stageUntracked(p, r, d.Commit, specRel)
 	if err != nil {
 		return fmt.Errorf("%w; %s not shipped", err, d.Version)
 	}
@@ -189,12 +190,6 @@ func (o *options) hookShip(ctx context.Context, channel, v, commit string, disks
 		if rerr := remove(); rerr != nil && err == nil {
 			err = fmt.Errorf("remove the checkout of %s: %w", id, rerr)
 		}
-		// Kept when the ship fails, for its run by hand; gone once it is published.
-		if err == nil {
-			if rerr := os.RemoveAll(r.StagedDir(id)); rerr != nil {
-				err = fmt.Errorf("remove the untracked files staged for %s: %w", id, rerr)
-			}
-		}
 	}()
 	// The untracked files the working tree held at the commit, into the checkout.
 	copied, err := r.Unstage(id, top)
@@ -204,26 +199,30 @@ func (o *options) hookShip(ctx context.Context, channel, v, commit string, disks
 	for _, c := range copied {
 		fmt.Fprintf(o.out, "stowage hook: untracked %s copied into the checkout\n", c)
 	}
-	return o.inCheckout(top, rel, spec, root).ship(ctx, channel, 1, v, disks)
+	if err := o.inCheckout(top, rel, spec, root).ship(ctx, channel, 1, v, disks); err != nil {
+		return err // the staged files kept, for its run by hand
+	}
+	// Published: its staged files go, and those of every commit before it.
+	if err := r.Sweep(id); err != nil {
+		return fmt.Errorf("remove the untracked files staged for %s and before: %w", id, err)
+	}
+	return nil
 }
 
 // stageUntracked stages, for the ship of commit id, every untracked file the commit's spec
 // declares (images.<key>.untracked: the spec the ship builds with, whatever the working tree's
 // holds), from the working tree as it is at the commit, and returns their paths (relative to the
-// working tree's top level). A required one absent is refused.
-func (o *options) stageUntracked(p *project.Project, r hook.Repo, id string) ([]string, error) {
+// working tree's top level). A required one absent is refused. specRel is the spec's path in the
+// repository (specInRepo), "" for the project's own.
+func stageUntracked(p *project.Project, r hook.Repo, id, specRel string) ([]string, error) {
 	rel, err := relTo(r.Top, p.Root)
-	if err != nil {
-		return nil, err
-	}
-	specRel, err := o.specInRepo(r, id)
 	if err != nil {
 		return nil, err
 	}
 	if specRel == "" {
 		specRel = filepath.Join(rel, project.SpecFile)
 	}
-	raw, err := gitcmd.Run(r.Top, "show", id+":"+filepath.ToSlash(specRel))
+	raw, err := committedFile(r.Top, id, filepath.ToSlash(specRel))
 	if err != nil {
 		return nil, fmt.Errorf("the spec at %s: %w", id, err)
 	}
@@ -247,6 +246,28 @@ func (o *options) stageUntracked(p *project.Project, r hook.Repo, id string) ([]
 		}
 	}
 	return files, r.Stage(id, files)
+}
+
+// committedFile is the content commit id records at rel, a symbolic link followed as a checkout
+// follows it (inside the repository, a few at most).
+func committedFile(top, id, rel string) (string, error) {
+	for range 8 {
+		out, err := gitcmd.Run(top, "ls-tree", "--full-tree", id, "--", rel)
+		if err != nil {
+			return "", err
+		}
+		mode, _, _ := strings.Cut(out, " ")
+		raw, err := gitcmd.Run(top, "show", id+":"+rel)
+		if err != nil || mode != "120000" {
+			return raw, err
+		}
+		next := path.Join(path.Dir(rel), raw)
+		if !filepath.IsLocal(next) {
+			return "", fmt.Errorf("%s links out of the repository (%s)", rel, raw)
+		}
+		rel = next
+	}
+	return "", fmt.Errorf("%s: too many symbolic links", rel)
 }
 
 // inCheckout is o run on the project at rel (and the spec at spec, when set) in the checkout at

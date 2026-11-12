@@ -216,8 +216,9 @@ func TestTheModulesPortsAreWhatServesOnThem(t *testing.T) {
 
 // An L4 route's port is opened to what its allowlist holds as vm create gives it: the value given,
 // each address a prefix of its own, else the input's default; none for an empty list (the VM's
-// firewall refuses every source then); every source for a route without a list, one the front
-// terminates TLS on (the front filters its port), and a secret list, which vm create is not given.
+// firewall refuses every source then), each a network's prefix, sorted and once; every source for
+// a route without a list, one the front terminates TLS on (the front filters its port; in
+// loopback mode it is not opened), and a secret list, which vm create is not given.
 func TestTheModulesPortsTakeTheRoutesAllowlists(t *testing.T) {
 	t.Parallel()
 	in := &Installer{R: testRelease(t, "1.0.0")}
@@ -227,9 +228,14 @@ func TestTheModulesPortsTakeTheRoutesAllowlists(t *testing.T) {
 	in.R.Spec.L4.Routes = []spec.L4Route{{Name: "given", Protocol: "tcp", Port: 1, AllowInput: "GIVEN"}, {Name: "defaulted", Protocol: "udp", Port: 2, AllowInput: "DEFAULTED"},
 		{Name: "empty", Protocol: "tcp", Port: 3, AllowInput: "EMPTY"}, {Name: "none", Protocol: "tcp", Port: 4}, {Name: "secret", Protocol: "tcp", Port: 5, AllowInput: "SECRET"},
 		{Name: "tls", Protocol: "tcp", Port: 6, AllowInput: "GIVEN", TLS: &spec.L4TLS{DomainInput: "DB_DOMAIN"}}}
-	got := fmt.Sprint(in.openedPorts(&Settings{TLS: "none", Inputs: map[string]string{"GIVEN": "198.51.100.0/24, 2001:db8::/32 203.0.113.5,2001:db8::1", "EMPTY": ""}}))
-	if want := "[{tcp 1 [198.51.100.0/24 2001:db8::/32 203.0.113.5/32 2001:db8::1/128]} {udp 2 [192.0.2.0/24]} {tcp 3 []} {tcp 4 [0.0.0.0/0 ::/0]} {tcp 5 [0.0.0.0/0 ::/0]} {tcp 6 [0.0.0.0/0 ::/0]}]"; got != want {
+	got := fmt.Sprint(in.openedPorts(&Settings{TLS: "none", Inputs: map[string]string{"GIVEN": "198.51.100.0/24, 2001:db8::/32 203.0.113.5,2001:db8::1 203.0.113.5/32 198.51.100.7/24", "EMPTY": ""}}))
+	if want := "[{tcp 1 [198.51.100.0/24 2001:db8::/32 2001:db8::1/128 203.0.113.5/32]} {udp 2 [192.0.2.0/24]} {tcp 3 []} {tcp 4 [0.0.0.0/0 ::/0]} {tcp 5 [0.0.0.0/0 ::/0]}]"; got != want {
 		t.Errorf("ports %s\nwant  %s", got, want)
+	}
+	// Another mode than loopback: the front serves the route it terminates TLS on, its sources its own.
+	got = fmt.Sprint(in.openedPorts(&Settings{TLS: "internal", Inputs: map[string]string{"GIVEN": "", "EMPTY": ""}})[5])
+	if want := "{tcp 6 [0.0.0.0/0 ::/0]}"; got != want {
+		t.Errorf("a terminated route: %s, want %s", got, want)
 	}
 }
 

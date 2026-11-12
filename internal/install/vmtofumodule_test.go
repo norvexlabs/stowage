@@ -195,12 +195,6 @@ func TestTheCloudImageIsSharedAndKeptByDestroy(t *testing.T) {
 	if other := create("notes-3", "c"); other == first {
 		t.Errorf("another bucket shares %s", first)
 	}
-	// The image the VM boots from is the image module's: none given instead.
-	c := VMCreate{Platform: "scaleway", Create: CreateTofu, Hostname: "notes-4", User: "ops", Ctl: "/opt/notes-stow", Wait: 5 * time.Second,
-		Vars: map[string]string{"zone": "fr-par-1", "bucket": "b", "image_id": "fr-par-1/x"}}
-	if err := v.create(c, r.mod(nil)); err == nil || !strings.Contains(err.Error(), "--tofu-var image_id: the image module makes the image the VM boots from") {
-		t.Errorf("image_id given: %v", err)
-	}
 	r.tofu.calls = nil
 	in := v.installer(r.mod(nil))
 	if err := in.DestroyVM(context.Background(), &VMDestroy{Host: "notes-1", Yes: true, Ctl: "/opt/notes-stow"}); err != nil {
@@ -412,6 +406,9 @@ func TestTheGCPModuleIsGivenSSHsSourcesAndTheOpenedPorts(t *testing.T) {
 	v := newVMCreate(t, "gce")
 	v.r.Spec.L4.Routes = append(v.r.Spec.L4.Routes, spec.L4Route{Name: "dns", Protocol: "udp", Port: 5353, AllowInput: "DNS_SOURCES"})
 	v.r.Spec.Inputs = append(v.r.Spec.Inputs, spec.Input{Key: "DNS_SOURCES", Default: "192.0.2.0/24"})
+	// A secret list is not given to vm create: its port opens to every source, and no fixed rule is told.
+	v.r.Spec.L4.Routes = append(v.r.Spec.L4.Routes, spec.L4Route{Name: "hidden", Protocol: "tcp", Port: 5454, AllowInput: "HIDDEN_SOURCES"})
+	v.r.Spec.Inputs = append(v.r.Spec.Inputs, spec.Input{Key: "HIDDEN_SOURCES", Secret: true})
 	r := newTofuRun(t)
 	delete(r.vars, "TRUENAS_URL")
 	r.tofu.outputs = `{"id": {"value": "1"}, "address": {"value": "192.0.2.7"}}`
@@ -427,15 +424,18 @@ func TestTheGCPModuleIsGivenSSHsSourcesAndTheOpenedPorts(t *testing.T) {
 	if !strings.Contains(v.log.String(), "l4 route dns: the module's rule for udp/5353 takes the sources DNS_SOURCES holds now; a later change of DNS_SOURCES on the VM does not reach it") {
 		t.Errorf("not told the rule is fixed:\n%s", v.log)
 	}
+	if strings.Contains(v.log.String(), "l4 route hidden:") {
+		t.Errorf("a secret list told as the rule's:\n%s", v.log)
+	}
 	// The public address is no route's source behind a NAT: not compared with it.
 	if strings.Contains(v.log.String(), "--ssh-allow leaves out") {
 		t.Errorf("warned:\n%s", v.log)
 	}
-	if got := fmt.Sprint(vars["open_ports"]); got != "[map[port:80 protocol:tcp sources:[0.0.0.0/0 ::/0]] map[port:443 protocol:tcp sources:[0.0.0.0/0 ::/0]] map[port:5353 protocol:udp sources:[192.0.2.0/24]]]" {
+	if got := fmt.Sprint(vars["open_ports"]); got != "[map[port:80 protocol:tcp sources:[0.0.0.0/0 ::/0]] map[port:443 protocol:tcp sources:[0.0.0.0/0 ::/0]] map[port:5353 protocol:udp sources:[192.0.2.0/24]] map[port:5454 protocol:tcp sources:[0.0.0.0/0 ::/0]]]" {
 		t.Errorf("open_ports %s", got)
 	}
 	// No firewall rule unless asked: the network's own rules are the operator's to open.
-	if !strings.Contains(v.log.String(), "warning: no firewall rule is made on Google Cloud: the network's own rules must let tcp/22, tcp/80, tcp/443, udp/5353 reach the VM") {
+	if !strings.Contains(v.log.String(), "warning: no firewall rule is made on Google Cloud: the network's own rules must let tcp/22, tcp/80, tcp/443, udp/5353, tcp/5454 reach the VM") {
 		t.Errorf("no warning:\n%s", v.log)
 	}
 	// Every source when told so, the front's ports as the install publishes them, the rules asked.

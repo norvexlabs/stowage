@@ -438,8 +438,8 @@ in the same installer (bootstrap it as above, then `sh <name>.sh vm create …`,
   Scaleway; on Google Cloud the image `<name, cut to 30>-<a hash of the name and the
   key>-<12 digits>`), so two states never make the same object or image: a value given in one
   run and left to the default in another makes a second state, and a second upload. Its output
-  `image_id` is the VM module's variable of that name; `--tofu-var image_id` is refused (`the
-  image module makes the image the VM boots from`). `vm destroy` keeps it, with the uploads: `tofu -chdir=<that directory> destroy`
+  `image_id` is the VM module's variable of that name, which `vm create` writes (`--tofu-var
+  image_id` is refused, as every variable of the contract is). `vm destroy` keeps it, with the uploads: `tofu -chdir=<that directory> destroy`
   removes them, with the platform's credentials, once no VM boots from the image. A reserved
   address (`ip_id`, `eip_allocation_id`, `public_ip_name`, `nat_ip`) lets a stack's first install
   know its address, or another VM's (`--add-host`), before the VM exists: give it as `--host`.
@@ -491,14 +491,15 @@ in the same installer (bootstrap it as above, then `sh <name>.sh vm create …`,
     above, `["0.0.0.0/0", "::/0"]` for every source) and `open_ports` (a list of `{protocol,
     port, sources}`: the ports the VM's firewall opens besides SSH, the front's HTTP and HTTPS ports that
     something serves on in the `--tls` mode given (both when none is given; see the front under
-    the installer on Docker), from every source (`["0.0.0.0/0", "::/0"]`), and each `l4` route's,
-    from the sources the VM's firewall lets reach it as `vm create` knows them — every source for
-    a route without an `allow_input`, one the front terminates TLS on (the front filters its
-    port) and a secret list, which `vm create` is not given; else the list's value given (an
-    answers file, `--set`) or the input's default, each address a prefix of its own (`/32`,
-    `/128`); none (`[]`) when that list is empty, as the VM's firewall then refuses every
-    source — for a firewall of the platform's, fixed at create:
-    `vm create` logs, for each route with an `allow_input`, `l4 route <name>: the module's rule
+    the installer on Docker), from every source (`["0.0.0.0/0", "::/0"]`), and each `l4` route's
+    (but one the front terminates TLS on with `--tls none`, which the VM holds to its loopback
+    address), from the sources the VM's firewall lets reach it as `vm create` knows them — every
+    source for a route without an `allow_input`, one the front terminates TLS on (the front
+    filters its port) and a secret list, which `vm create` is not given; else the list's value
+    given (an answers file, `--set`) or the input's default, each a network's prefix (a bare
+    address `/32` or `/128`, host bits masked), sorted, once; none (`[]`) when that list is
+    empty, as the VM's firewall then refuses every source — for a firewall of the platform's,
+    fixed at create: `vm create` logs, for each route whose list it takes so, `l4 route <name>: the module's rule
     for <protocol>/<port> takes the sources <input> holds now; a later change of <input> on the VM
     does not reach it`; a module whose `open_ports` type is `{protocol, port}` drops `sources`), `image_id` (the built-in cloud modules': the image their image module made, below), and `nics` (a list of `{role, mac, attach}`: the NICs the release names, the
     primary first, each MAC the one the cloud-config names it by — empty for a machine's only NIC,

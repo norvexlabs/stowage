@@ -445,3 +445,38 @@ func TestStageAndUnstage(t *testing.T) {
 		t.Fatalf("nothing staged: %v %q", err, copied)
 	}
 }
+
+// A shipped commit's staged files go, with those of every commit before it and of one the
+// repository no longer has; a later commit's stay, as its ship may be queued.
+func TestSweep(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	testutil.Write(t, dir, "a.txt", "a")
+	testutil.GitRepo(t, dir)
+	first := strings.TrimSpace(testutil.Git(t, dir, "rev-parse", "HEAD"))
+	for _, n := range []string{"b", "c"} {
+		testutil.Write(t, dir, n+".txt", n)
+		testutil.Git(t, dir, "add", ".")
+		testutil.Git(t, dir, "commit", "-qm", n)
+	}
+	third := strings.TrimSpace(testutil.Git(t, dir, "rev-parse", "HEAD"))
+	second := strings.TrimSpace(testutil.Git(t, dir, "rev-parse", "HEAD~1"))
+	r, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gone := strings.Repeat("e", 40)
+	for _, id := range []string{first, second, third, gone} {
+		if err := r.Stage(id, []string{"a.txt"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := r.Sweep(second); err != nil {
+		t.Fatal(err)
+	}
+	for id, want := range map[string]bool{first: false, second: false, gone: false, third: true} {
+		if _, err := os.Stat(r.StagedDir(id)); (err == nil) != want {
+			t.Errorf("%s staged %v, want %v", id, err == nil, want)
+		}
+	}
+}

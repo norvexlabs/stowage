@@ -166,13 +166,14 @@ func GitInContext(ig *Ignore) (string, error) {
 // a path outside the context never is.
 func (ig *Ignore) Excluded(abs string) (bool, error) { return ig.excluded(abs) }
 
-// FileSum is "sha256:<hex>" of the file at abs, as a tree's walk hashes it.
-func FileSum(abs string) (string, error) {
-	sum, _, err := fileSum(abs)
+// FileSum is "sha256:<hex>" of the file at abs and its mode ("-", or "x" when executable), as a
+// tree's walk hashes them.
+func FileSum(abs string) (sum, mode string, err error) {
+	sum, mode, err = fileSum(abs)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
-	return "sha256:" + sum, nil
+	return "sha256:" + sum, mode, nil
 }
 
 // excluded reports whether abs (an absolute path) is ignored. Paths outside the base are never

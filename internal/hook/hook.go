@@ -319,3 +319,39 @@ func copyFile(src, dst string, dirMode os.FileMode) error {
 	}
 	return os.Chmod(dst, fi.Mode().Perm()) // the umask left out
 }
+
+// Sweep removes what StagedDir holds for commit id and for each commit before it (an ancestor):
+// their releases are behind the one shipped. A commit's files that are not its ancestor's stay, as
+// its ship may still be queued.
+func (r Repo) Sweep(id string) error {
+	entries, err := os.ReadDir(filepath.Join(r.Dir(), "untracked"))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	for _, e := range entries {
+		other := e.Name()
+		if !objectID.MatchString(other) {
+			continue
+		}
+		before := other == id
+		if !before {
+			// A commit the repository no longer has (a rewritten history) is swept too.
+			if known, err := gitcmd.Verify(r.Top, other+"^{commit}"); err != nil {
+				return err
+			} else if !known {
+				before = true
+			} else if before, err = gitcmd.IsAncestor(r.Top, other, id); err != nil {
+				return err
+			}
+		}
+		if before {
+			if err := os.RemoveAll(r.StagedDir(other)); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}

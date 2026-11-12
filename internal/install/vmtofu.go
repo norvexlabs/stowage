@@ -422,17 +422,16 @@ func (in *Installer) tofu(ctx context.Context, dir, ctl string, args ...string) 
 type modulePort struct {
 	Protocol string `json:"protocol"` // tcp or udp
 	Port     int    `json:"port"`
-	// Sources are the CIDRs the VM's own firewall lets reach the port, as vm create knows them:
-	// every source for the front's ports and for an L4 route whose allowlist it is not given, the
-	// list given for one (none when it is empty: the VM's firewall refuses every source then).
+	// Sources are the CIDRs the VM's own firewall lets reach the port, as vm create knows them
+	// (routeSources): every source for the front's ports, and an L4 route's allowlist.
 	Sources []string `json:"sources"`
 }
 
 // everySource is every IPv4 and IPv6 source.
 var everySource = []string{"0.0.0.0/0", "::/0"}
 
-// openedPorts are the ports the VM's firewall opens besides SSH: the front's, and each L4
-// route's, whose allowlist the VM's firewall alone applies.
+// openedPorts are the ports the VM's firewall opens besides SSH, each with its sources: the
+// front's, and each L4 route's but one the front holds to the loopback address (loopback mode).
 func (in *Installer) openedPorts(st *Settings) []modulePort {
 	ports := []modulePort{}
 	// The front's that something serves on in the mode given (frontServed); with none given, the
@@ -448,9 +447,18 @@ func (in *Installer) openedPorts(st *Settings) []modulePort {
 		ports = append(ports, modulePort{"tcp", cmp.Or(st.HTTPSPort, in.R.Spec.Front.HTTPSPort, 443), everySource})
 	}
 	for _, r := range in.R.Spec.L4.Routes {
+		// In loopback mode the front holds a route it terminates TLS on to the loopback address.
+		if r.Terminated() && st.TLS == Loopback {
+			continue
+		}
 		ports = append(ports, modulePort{r.Protocol, r.Port, in.routeSources(st, r)})
 	}
 	return ports
+}
+
+// secretInput reports whether the spec declares key a secret input.
+func (in *Installer) secretInput(key string) bool {
+	return slices.ContainsFunc(in.R.Spec.Inputs, func(i spec.Input) bool { return i.Key == key && i.Secret })
 }
 
 // routeSources are the sources the VM's firewall lets reach an L4 route's port, as vm create
@@ -471,14 +479,19 @@ func (in *Installer) routeSources(st *Settings, r spec.L4Route) []string {
 	case !given:
 		v = in.R.Spec.Inputs[i].Default
 	}
+	// Each a network's prefix (a bare address its own, host bits masked), sorted, once: what a
+	// platform's rule takes. One that is neither is left to the install's own check to refuse.
 	out := []string{}
 	for _, s := range splitSources(v) {
 		if a, err := netip.ParseAddr(s); err == nil {
 			s = netip.PrefixFrom(a, a.BitLen()).String()
+		} else if p, err := netip.ParsePrefix(s); err == nil {
+			s = p.Masked().String()
 		}
 		out = append(out, s)
 	}
-	return out
+	slices.Sort(out)
+	return slices.Compact(out)
 }
 
 // moduleFirewall warns when a built-in module's network firewall leaves out what the VM's opens:
@@ -544,7 +557,7 @@ func (in *Installer) applyVM(ctx context.Context, dir, ctl string, p Platform, m
 		case "open_ports":
 			vars[v.Name] = in.openedPorts(st)
 			for _, r := range in.R.Spec.L4.Routes {
-				if r.AllowInput != "" && !r.Terminated() {
+				if _, given := st.Inputs[r.AllowInput]; r.AllowInput != "" && !r.Terminated() && (given || !in.secretInput(r.AllowInput)) {
 					in.O.logf("l4 route %s: the module's rule for %s/%d takes the sources %s holds now; a later change of %s on the VM does not reach it", r.Name, r.Protocol, r.Port, r.AllowInput, r.AllowInput)
 				}
 			}
@@ -557,9 +570,6 @@ func (in *Installer) applyVM(ctx context.Context, dir, ctl string, p Platform, m
 	}
 	in.moduleFirewall(p, t, mach, st, declared)
 	if t.Module == "" {
-		if _, given := t.Vars["image_id"]; given {
-			return "", "", errors.New("--tofu-var image_id: the image module makes the image the VM boots from: give the module's other variables")
-		}
 		if err := in.applyImage(ctx, ctl, p, vars, image, imageSHA); err != nil {
 			return "", "", err
 		}
