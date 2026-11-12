@@ -262,7 +262,11 @@ rerun --set-file API_CA_BUNDLE="$WORK/upstream-ca.pem"
 [[ $(api_ca) == "$(cat "$WORK/upstream-ca.pem")" ]] || fail "the api does not see the file given"
 grep -qF 'changing API_CA_BUNDLE: "" → sha256:' "$WORK/rerun.log" || { cat "$WORK/rerun.log"; fail "the change was not logged by its digest"; }
 grep -qF 'certificates in /run/stowage/inputs/API_CA_BUNDLE: 1' "$WORK/rerun.log" || { cat "$WORK/rerun.log"; fail "the provision hook did not read the file given"; }
-[[ $(find "$D/.stowage-inputs" -type f | wc -l) == 1 && $(stat -c %a "$D/.stowage-inputs") == 700 ]] || fail "the input files: one, in a directory only its owner reads"
+# The file input's file, and the two secrets delivered as files (as_file), in a directory only its
+# owner reads.
+[[ $(find "$D/.stowage-inputs" -type f -name 'API_CA_BUNDLE*' | wc -l) == 1 && $(find "$D/.stowage-inputs" -type f | wc -l) == 3 &&
+	$(find "$D/.stowage-inputs" -type f -name 'ENCRYPTION_KEY-*' | wc -l) == 1 && $(find "$D/.stowage-inputs" -type f -name 'UPSTREAM_API_KEY-*' | wc -l) == 1 &&
+	$(stat -c %a "$D/.stowage-inputs") == 700 ]] || { ls -la "$D/.stowage-inputs"; fail "the input files: the file input's one and the two secrets' files, in a directory only its owner reads"; }
 echo 'not PEM' >"$WORK/bad.pem"
 if "${CTL[@]}" --dir "$D" --no-input --set-file API_CA_BUNDLE="$WORK/bad.pem" >"$WORK/bad-pem.log" 2>&1; then cat "$WORK/bad-pem.log"; fail "a file that is not PEM passed"; fi
 grep -q 'API_CA_BUNDLE: no PEM block' "$WORK/bad-pem.log" || { cat "$WORK/bad-pem.log"; fail "the refusal does not name the input"; }

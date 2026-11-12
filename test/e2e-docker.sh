@@ -93,7 +93,8 @@ login_pull
 docker run --rm --pull always "$REG/notes/notes-installer:latest" >"$WORK/notes.sh" || fail "docker run of the installer image"
 unset DOCKER_CONFIG # for the next ships; the installer's environment never has it (OPERATOR)
 # The machine interface before any install: describe reads the release the installer carries;
-# status refuses a directory that holds no install (exit 3), printing nothing on standard output.
+# status refuses a directory that holds no install (exit 3), its refusal one object on standard
+# output, absent (no install there).
 (cd "$WORK" && "${OPERATOR[@]}" sh notes.sh describe --json) >"$WORK/describe.json" 2>"$WORK/describe.log" || { cat "$WORK/describe.log"; fail "describe --json"; }
 jq -se 'length == 1 and (.[0] | .format == 1 and .name == "notes" and .short_name == "notes" and .release == {version: "1.0.0", revision: 1} and
 	.channel == "stable" and .first_install_only == ["address", "registry", "registry_ca", "channel"] and
@@ -103,8 +104,8 @@ jq -se 'length == 1 and (.[0] | .format == 1 and .name == "notes" and .short_nam
 	all(.inputs[]; if .secret then has("default") | not else has("default") end))' "$WORK/describe.json" >/dev/null ||
 	{ cat "$WORK/describe.json"; fail "describe --json does not describe 1.0.0, its inputs (no secret's default) and the first-install-only settings"; }
 rc=0; (cd "$WORK" && "${OPERATOR[@]}" sh notes.sh status --dir "$D" --json) >"$WORK/status0.json" 2>"$WORK/status0.log" || rc=$?
-[[ $rc == 3 && ! -s $WORK/status0.json ]] && grep -q 'holds no install' "$WORK/status0.log" ||
-	{ cat "$WORK/status0.log" "$WORK/status0.json"; fail "status --json before the install exited $rc, not 3 with 'holds no install' and nothing on standard output"; }
+[[ $rc == 3 ]] && grep -q 'holds no install' "$WORK/status0.log" && jq -se 'length == 1 and .[0].format == 1 and .[0].refused.absent == true and ((.[0].refused.reason + " " + (.[0].refused.fix // "")) | contains("holds no install"))' "$WORK/status0.json" >/dev/null ||
+	{ cat "$WORK/status0.log" "$WORK/status0.json"; fail "status --json before the install exited $rc, not 3 with its refusal ('holds no install', absent) one object on standard output"; }
 # The first install, under --json: its Result alone on standard output, its text on standard error.
 TOKEN=$(token)
 (cd "$WORK" && "${OPERATOR[@]}" sh notes.sh --no-input --dir "$D" --ports "app=$APP_PORT,api=$API_PORT" --set ADMIN_EMAIL=admin@notes.test --set "E2E_TOKEN=$TOKEN" --json) \

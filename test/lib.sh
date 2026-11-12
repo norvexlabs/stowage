@@ -572,6 +572,16 @@ YAML
 # before a project is made).
 cluster_logs() {
 	kubectl get all,secrets -n "$NS" -o wide 2>&1 || true
+	# Each pod with a container (an init one included) not ready: its containers' state, what they
+	# printed before they last ended and since, a container that never started included.
+	local p
+	for p in $(kubectl get pods -n "$NS" -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.status.initContainerStatuses[*].ready}{" "}{.status.containerStatuses[*].ready}{"\n"}{end}' 2>/dev/null | awk '/false/ {print $1}'); do
+		echo "--- $p, its containers and its last run:"
+		kubectl describe pod -n "$NS" "$p" 2>&1 | sed -n '/^Init Containers:/,/^Conditions:/p; /^Containers:/,/^Conditions:/p' || true
+		kubectl logs -n "$NS" "$p" --all-containers --previous --tail=40 2>&1 || true
+		kubectl logs -n "$NS" "$p" --all-containers --tail=40 2>&1 || true
+	done
+	kubectl get events -n "$NS" --sort-by=.lastTimestamp 2>&1 | tail -30 || true
 	kubectl describe pods -n "$NS" 2>&1 | tail -60 || true
 	helm history "${NAME:-notes}" -n "$NS" 2>&1 || true
 }

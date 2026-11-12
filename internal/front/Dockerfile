@@ -18,8 +18,12 @@ RUN GOOS=$TARGETOS GOARCH=$TARGETARCH xcaddy build v2.11.9 --with github.com/cad
 # configuration directories are that user's (65532, the installer's FrontUID), so a volume made
 # on them is too; the binary carries no file capability.
 FROM caddy:2.11.9-alpine@sha256:0bbb055bda6793c999bde78b1b5ce3e89f829fb031af2cf50056ea1246559fee
-RUN apk del --no-cache curl libcap libcap-utils && apk add --no-cache 'zlib>=1.4'
 COPY --from=builder /usr/bin/caddy /usr/bin/caddy
+# No file capability on the binary (the base sets cap_net_bind_service, which the bounding set of a
+# front with every capability dropped cannot grant, so the kernel would refuse its exec): taken off
+# and checked with the base's own tools, before they go.
+RUN setcap -r /usr/bin/caddy 2>/dev/null || true; caps="$(getcap /usr/bin/caddy)" && [ -z "$caps" ] && \
+    apk del --no-cache curl libcap libcap-utils && apk add --no-cache 'zlib>=1.4'
 RUN mkdir -p /data /config && chown -R 65532:65532 /data /config
 RUN caddy version | grep -q '^v2\.11\.9 ' && caddy list-modules | grep -qx 'dns.providers.cloudflare' && \
     caddy list-modules | grep -qx 'layer4.handlers.tls' && caddy list-modules | grep -qx 'layer4.matchers.remote_ip' && ! command -v curl

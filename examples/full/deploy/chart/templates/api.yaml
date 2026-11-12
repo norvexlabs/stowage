@@ -21,6 +21,9 @@ spec:
         {{- include "atlas.labels" $c | nindent 8 }}
     spec:
       {{- include "atlas.pod" . | trim | nindent 6 }}
+      # The api calls no Kubernetes API: no ServiceAccount token, whose mount would go below its
+      # read-only /run/secrets (/var/run is /run), where the kubelet could not make it.
+      automountServiceAccountToken: false
       containers:
         - name: api
           image: {{ include "atlas.image" (dict "root" $ "key" "api") }}

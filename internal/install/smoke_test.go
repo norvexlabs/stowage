@@ -201,6 +201,20 @@ volumes:
 	if resp.StatusCode != 200 || strings.TrimSpace(string(body)) != want {
 		t.Fatalf("GET through the front: %d %q, want %q\n%s", resp.StatusCode, body, want, log.String())
 	}
+	// The front runs confined: its own user, every capability dropped, no privilege gain, a read-only
+	// root — and running, so its binary carries no file capability the kernel would refuse it.
+	fenv, err := ReadEnvFile(filepath.Join(dir, ".env"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	project, ok := fenv.Get("COMPOSE_PROJECT_NAME")
+	if !ok || project == "" {
+		t.Fatal("no compose project recorded")
+	}
+	conf, err := exec.Command("docker", "inspect", "--format", "{{.Config.User}} {{.HostConfig.CapDrop}} {{.HostConfig.SecurityOpt}} {{.HostConfig.ReadonlyRootfs}} {{.State.Running}}", project+"-"+FrontService+"-1").Output()
+	if err != nil || strings.TrimSpace(string(conf)) != fmt.Sprintf("%d:%d [ALL] [no-new-privileges:true] true true", FrontUID, FrontUID) {
+		t.Fatalf("the front's confinement: %q %v", conf, err)
+	}
 
 	outs, err := ReadEnvFile(filepath.Join(dir, ProvisionEnv))
 	if err != nil {

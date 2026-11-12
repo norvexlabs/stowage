@@ -1482,8 +1482,10 @@ every shape, the VM end-to-end test upgrading through it), then the health gate.
   ports in the container and publishing the low host ports onto them, because the stack's
   services reach the front on the stack's network at the port a route's URL names (443, or the
   moved one) and Caddy's redirect names its own HTTPS port: both would break; a capability with
-  a non-root user (a file capability on the binary, which `no-new-privileges` ignores, or ambient
-  ones). Stowage adds no service on the host's network: a project's service there (an L4 route's
+  a non-root user (a file capability on the binary, or ambient ones). The front's binary carries
+  no file capability (its base's is taken off at build, and checked): with every capability out
+  of its bounding set, the kernel refuses to exec a binary whose file capabilities it cannot
+  grant. Stowage adds no service on the host's network: a project's service there (an L4 route's
   upstream on the VM) keeps its own settings, as on any other network. A hook runs as its
   image's user when the image declares one other than root, else as uid 65534: root is never
   given, and an image that needs it fails the hook, the failure naming the fix (the image's own

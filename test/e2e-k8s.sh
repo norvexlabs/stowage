@@ -105,14 +105,14 @@ new_project "$PG"
 step "k8s install 1.0.0 with the bootstrap script"
 installer v1.sh
 # The machine interface before any install: describe reads the release the installer carries;
-# k8s status finds no release, and prints nothing on standard output.
+# k8s status finds no release: its refusal one object on standard output, absent.
 ctl v1.sh describe --json >"$WORK/describe.json" 2>"$WORK/describe.log" || { cat "$WORK/describe.log"; fail "describe --json"; }
 jq -se 'length == 1 and (.[0] | .format == 1 and .name == "notes" and .release == {version: "1.0.0", revision: 1} and (.shapes | index("kubernetes") != null) and
 	(.inputs | map(.key) | index("ADMIN_EMAIL") != null) and all(.inputs[]; if .secret then has("default") | not else has("default") end))' "$WORK/describe.json" >/dev/null ||
 	{ cat "$WORK/describe.json"; fail "describe --json does not describe 1.0.0 for Kubernetes"; }
 rc=0; ctl v1.sh k8s status --json >"$WORK/status0.json" 2>"$WORK/status0.log" || rc=$?
-[[ $rc == 3 && ! -s $WORK/status0.json ]] && grep -qF 'no release notes in notes: `notes-stow k8s install --namespace notes --release notes' "$WORK/status0.log" ||
-	{ cat "$WORK/status0.log" "$WORK/status0.json"; fail "k8s status --json before the install exited $rc, not 3 with 'no release notes in notes' naming the k8s install, and nothing on standard output"; }
+[[ $rc == 3 ]] && grep -qF 'no release notes in notes' "$WORK/status0.log" && jq -se 'length == 1 and .[0].format == 1 and .[0].refused.absent == true and ((.[0].refused.reason + " " + (.[0].refused.fix // "")) | contains("no release notes in notes") and contains("notes-stow k8s install --namespace notes --release notes"))' "$WORK/status0.json" >/dev/null ||
+	{ cat "$WORK/status0.log" "$WORK/status0.json"; fail "k8s status --json before the install exited $rc, not 3 with its refusal ('no release notes in notes', absent, the k8s install as its fix) one object on standard output"; }
 # The install, under --json: its Result alone on standard output, its text on standard error.
 ctl v1.sh k8s install --no-input --set ADMIN_EMAIL=admin@notes.test --timeout 3m --json >"$WORK/install.json" 2>"$WORK/install.log" ||
 	{ cat "$WORK/install.log" "$WORK/install.json"; cluster_logs >&2; fail "k8s install --json"; }
