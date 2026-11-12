@@ -617,7 +617,7 @@ func pinnedSSHArgs(pin, user, addr, pubKey string, command ...string) []string {
 // file of the host key the VM serves (pinnedSSHArgs), every attempt takes that key alone. With osRelease,
 // the release a first boot takes the OS of first, an answer from the OS it boots away from is not
 // ready: what is sent to it would die in its reboot.
-func (in *Installer) awaitVM(ctx context.Context, dir, pin, user, addr, pubKey string, wait time.Duration, installs bool, osRelease *OSRelease) error {
+func (in *Installer) awaitVM(ctx context.Context, dir, pin, user, addr, pubKey string, wait time.Duration, installs bool, osRelease *OSRelease, console string) error {
 	o, ctl := &in.O, in.R.Ctl()
 	if o.SSH == nil {
 		return errors.New("ssh is not available to this run")
@@ -672,7 +672,7 @@ func (in *Installer) awaitVM(ctx context.Context, dir, pin, user, addr, pubKey s
 		select {
 		case <-ctx.Done():
 			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-				return fmt.Errorf("%s@%s: not ready after %s (last: %v); the VM is kept: look at its console on TrueNAS, or `%s vm destroy %s`", user, addr, wait, last, ctl, filepath.Base(dir))
+				return fmt.Errorf("%s@%s: not ready after %s (last: %v); the VM is kept: look at %s, or `%s vm destroy %s`", user, addr, wait, last, cmp.Or(console, "its console"), ctl, filepath.Base(dir))
 			}
 			return fmt.Errorf("%w; the VM is kept: `%s vm destroy %s` removes it", ctx.Err(), ctl, filepath.Base(dir))
 		case <-time.After(sshPoll):

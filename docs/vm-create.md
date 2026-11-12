@@ -536,7 +536,12 @@ in the same installer (bootstrap it as above, then `sh <name>.sh vm create …`,
     the release names (`nics`), each with its MAC on its bridge — and the seed as its
     CD-ROM, and starts it. A changed disk or seed rebuilds what depends on it, powering the VM off
     and on. A failed apply keeps the state, and the error names `vm destroy`.
-  - It then waits, up to `--wait` (default 20m), polling every 10 s over `ssh` (batch mode, the
+  - It then waits, up to `--wait` (default 20m; past it, `not ready after <wait> (last: <what the
+    VM last answered>); the VM is kept: look at <the platform's console>, or `<short>-stow vm
+    destroy <name>``, the console named per `--platform` — TrueNAS's display, Proxmox VE's console,
+    `virsh console`, vSphere's, Hyper-V Manager's, the machine's screen, Azure's serial console,
+    Google Cloud's serial port output, EC2's serial console or system log, Scaleway's Console
+    tab), polling every 10 s over `ssh` (batch mode, the
     private key next to `--ssh-key`'s `.pub` alone when it exists, else ssh's own keys and agent:
     the VM's sshd drops a client after 4 failed keys, so an agent holding more needs that private
     key next to the `.pub`) at `--host` (an address or a

@@ -50,50 +50,52 @@ type Platform struct {
 	Steps []string
 	// UserDataMax is the most user data the cloud takes, in bytes (0: as much as a file input holds).
 	UserDataMax int
+	// Console is where the operator watches the VM's boot, as a deadline's message names it.
+	Console string
 }
 
 // Platforms are the platforms `vm create` knows, in the order it offers them.
 var Platforms = []Platform{
-	{Key: "truenas", Label: "TrueNAS", Formats: []string{"qcow2", "raw"}, ISO: true, Tofu: true, Steps: []string{
+	{Key: "truenas", Console: "its display on TrueNAS", Label: "TrueNAS", Formats: []string{"qcow2", "raw"}, ISO: true, Tofu: true, Steps: []string{
 		"Copy %[1]s and %[2]s to the TrueNAS host.",
 		"Create a zvol of %[3]d GiB, and write the disk into it: qemu-img convert -O raw %[1]s /dev/zvol/<pool>/<zvol>.",
 		"Create a VM with UEFI boot, that zvol as its disk (VirtIO) and %[2]s as its CD-ROM, then start it.",
 	}},
-	{Key: "proxmox", Label: "Proxmox VE", Formats: []string{"qcow2", "raw"}, ISO: true, Tofu: true, Preview: true, Steps: []string{
+	{Key: "proxmox", Console: "its console in Proxmox VE", Label: "Proxmox VE", Formats: []string{"qcow2", "raw"}, ISO: true, Tofu: true, Preview: true, Steps: []string{
 		"Copy %[1]s to the Proxmox host, and %[2]s to an ISO storage (e.g. /var/lib/vz/template/iso/).",
 		"Create a VM with OVMF (UEFI) firmware and no disk, then import the disk: qm disk import <vmid> %[1]s <storage>; attach it and grow it to %[3]d GiB.",
 		"Attach %[2]s as the VM's CD-ROM, make the disk the first boot device, then start it.",
 	}},
-	{Key: "libvirt", Label: "libvirt / KVM (virt-install, virt-manager)", Formats: []string{"qcow2", "raw"}, ISO: true, Tofu: true, Preview: true, Steps: []string{
+	{Key: "libvirt", Console: "`virsh console` on the libvirt host", Label: "libvirt / KVM (virt-install, virt-manager)", Formats: []string{"qcow2", "raw"}, ISO: true, Tofu: true, Preview: true, Steps: []string{
 		"Grow the disk: qemu-img resize %[1]s %[3]dG.",
 		"virt-install --name <name> --memory 4096 --vcpus 2 --boot uefi --osinfo linux2022 --import --disk %[1]s --disk %[2]s,device=cdrom --network default --noautoconsole",
 	}},
-	{Key: "vmware", Label: "VMware vSphere, ESXi or Workstation", Formats: []string{"ova"}, ISO: true, Tofu: true, Preview: true, Steps: []string{
+	{Key: "vmware", Console: "its console in vSphere or Workstation", Label: "VMware vSphere, ESXi or Workstation", Formats: []string{"ova"}, ISO: true, Tofu: true, Preview: true, Steps: []string{
 		"Deploy %[1]s (Deploy OVF Template, or File > Open), and grow its disk to %[3]d GiB.",
 		"Upload %[2]s to a datastore and attach it as the VM's CD-ROM (connected at power on), then power the VM on.",
 	}},
-	{Key: "hyperv", Label: "Hyper-V", Formats: []string{"vhd"}, ISO: true, Steps: []string{
+	{Key: "hyperv", Console: "its console in Hyper-V Manager", Label: "Hyper-V", Formats: []string{"vhd"}, ISO: true, Steps: []string{
 		"Convert the disk for a generation 2 VM and grow it: Convert-VHD %[1]s <name>.vhdx; Resize-VHD <name>.vhdx -SizeBytes %[3]dGB.",
 		"Create a generation 2 VM on <name>.vhdx, with Secure Boot's template \"Microsoft UEFI Certificate Authority\", and %[2]s in its DVD drive, then start it.",
 	}},
-	{Key: "metal", Label: "Bare metal (amd64)", Formats: []string{"iso"}, ISO: true, Install: true, Steps: []string{
+	{Key: "metal", Console: "the machine's own screen", Label: "Bare metal (amd64)", Formats: []string{"iso"}, ISO: true, Install: true, Steps: []string{
 		"Write %[1]s to a USB stick, and %[2]s to another: dd if=<file> of=/dev/<stick> bs=4M conv=fsync (or any image writer).",
 		"Plug both into the server and boot it from the first, in UEFI mode with Secure Boot off: the installer wipes the --device disk (at least %[3]d GiB), installs the OS on it and powers the server off.",
 		"Take both sticks out, then power the server on: its first boot installs the release.",
 	}},
-	{Key: "azure", Label: "Microsoft Azure", Formats: []string{"vhd"}, Tofu: true, Preview: true, UserDataMax: 64 << 10, Steps: []string{
+	{Key: "azure", Console: "its serial console in the Azure portal", Label: "Microsoft Azure", Formats: []string{"vhd"}, Tofu: true, Preview: true, UserDataMax: 64 << 10, Steps: []string{
 		"Upload %[1]s as a page blob, and create a managed image from it (az image create --source <blob URL> --os-type Linux --hyper-v-generation V2).",
 		"Create the VM from that image with %[2]s as its custom data and a %[3]d GiB disk (az vm create --custom-data %[2]s --os-disk-size-gb %[3]d).",
 	}},
-	{Key: "gcp", Label: "Google Cloud", Formats: []string{"gce"}, Tofu: true, Preview: true, Steps: []string{
+	{Key: "gcp", Console: "its serial port output in the Google Cloud console", Label: "Google Cloud", Formats: []string{"gce"}, Tofu: true, Preview: true, Steps: []string{
 		"Upload %[1]s to a bucket, and create an image from it (gcloud compute images create --source-uri gs://<bucket>/<file> --guest-os-features UEFI_COMPATIBLE).",
 		"Create the instance from that image with %[2]s as its user-data and a %[3]d GiB disk (gcloud compute instances create --metadata-from-file user-data=%[2]s --boot-disk-size %[3]dGB).",
 	}},
-	{Key: "aws", Label: "Amazon EC2", Formats: []string{"raw"}, Tofu: true, Preview: true, UserDataMax: 16 << 10, Steps: []string{
+	{Key: "aws", Console: "its serial console or system log in the EC2 console", Label: "Amazon EC2", Formats: []string{"raw"}, Tofu: true, Preview: true, UserDataMax: 16 << 10, Steps: []string{
 		"Upload %[1]s to S3, import it as a snapshot (aws ec2 import-snapshot), and register an image from it (aws ec2 register-image --boot-mode uefi).",
 		"Launch the instance from that image with %[2]s as its user data and a %[3]d GiB root volume (aws ec2 run-instances --user-data file://%[2]s, the image's root device mapped to a volume of that size with --block-device-mappings).",
 	}},
-	{Key: "scaleway", Label: "Scaleway", Formats: []string{"qcow2"}, Tofu: true, Preview: true, Steps: []string{
+	{Key: "scaleway", Console: "the instance's Console tab in the Scaleway console", Label: "Scaleway", Formats: []string{"qcow2"}, Tofu: true, Preview: true, Steps: []string{
 		"Upload %[1]s to an Object Storage bucket in the instance's region, import it as a snapshot, and make an image of it (scw block snapshot import-from-object-storage bucket=<bucket> key=<key> name=<name>; scw instance image create snapshot-id=<snapshot id> arch=x86_64 name=<name>).",
 		"Create the instance from that image with %[2]s as its cloud-init user data and an SBS root volume of %[3]d GiB, which Scaleway counts in GB: %[3]d × 1.073741824, rounded up (scw instance server create type=PLAY2-NANO image=<image id> root-volume=sbs:<GB>GB cloud-init=@%[2]s).",
 	}},
@@ -393,7 +395,7 @@ func (in *Installer) CreateVM(ctx context.Context, c *VMCreate) error {
 		giveAgain := func() string {
 			return "this gives what `vm create` gave, then removes the file holding it: " + givenSteps(mach.User, addr, ctl, givenFile, givenPin, c.SSHKey) + "; " + givenRetired + " `" + ctl + " vm destroy " + mach.Hostname + "` removes the VM and that file. " + strings.TrimSpace(seedHostKeyNote(hostKey, addr))
 		}
-		if err := in.awaitVM(ctx, state, pin, mach.User, addr, c.SSHKey, cmp.Or(c.Wait, wait), len(waiting) == 0 && !st.AwaitSecrets, st.Release); err != nil {
+		if err := in.awaitVM(ctx, state, pin, mach.User, addr, c.SSHKey, cmp.Or(c.Wait, wait), len(waiting) == 0 && !st.AwaitSecrets, st.Release, p.Console); err != nil {
 			if given != nil {
 				return fmt.Errorf("%w; once it answers, %s", err, giveAgain())
 			}

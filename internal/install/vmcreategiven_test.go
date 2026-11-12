@@ -474,7 +474,7 @@ func TestVMCreateOnAnotherReleasesDiskGivesToTheReleasesOS(t *testing.T) {
 		return json.Marshal(want)
 	})
 	release := &OSRelease{Version: "1.0.0", Revision: 1, Tag: "1.0.0-r1"}
-	if err := in.awaitVM(context.Background(), t.TempDir(), "", "ops", "192.0.2.9", "", 5*time.Second, false, release); err != nil || calls != 2 {
+	if err := in.awaitVM(context.Background(), t.TempDir(), "", "ops", "192.0.2.9", "", 5*time.Second, false, release, ""); err != nil || calls != 2 {
 		t.Errorf("%v after %d calls", err, calls)
 	}
 }
@@ -528,13 +528,23 @@ func TestAwaitVMSaysAFailureOfTheOSItBootsAwayFrom(t *testing.T) {
 		return json.Marshal(Status{Name: "notes", OS: Version{"0.9.0", 1}, Boot: "active", InstallFailed: "the bundle would not write"})
 	})
 	release := &OSRelease{Version: "1.0.0", Revision: 1, Tag: "1.0.0-r1"}
-	if err := in.awaitVM(context.Background(), t.TempDir(), "", "ops", "192.0.2.9", "", 5*time.Second, false, release); err != nil || calls != 2 {
+	if err := in.awaitVM(context.Background(), t.TempDir(), "", "ops", "192.0.2.9", "", 5*time.Second, false, release, ""); err != nil || calls != 2 {
 		t.Errorf("%v after %d calls", err, calls)
 	}
 	calls = -1000
-	err := in.awaitVM(context.Background(), t.TempDir(), "", "ops", "192.0.2.9", "", 50*time.Millisecond, false, release)
-	if err == nil || !strings.Contains(err.Error(), "the bundle would not write") || !strings.Contains(err.Error(), "not ready after") {
+	err := in.awaitVM(context.Background(), t.TempDir(), "", "ops", "192.0.2.9", "", 50*time.Millisecond, false, release, "its display on TrueNAS")
+	if err == nil || !strings.Contains(err.Error(), "the bundle would not write") || !strings.Contains(err.Error(), "not ready after") || !strings.Contains(err.Error(), "look at its display on TrueNAS, or") {
 		t.Errorf("%v", err)
+	}
+}
+
+// Every platform names where its VM's boot is watched: a deadline's message points there.
+func TestEveryPlatformNamesItsConsole(t *testing.T) {
+	t.Parallel()
+	for _, p := range Platforms {
+		if p.Console == "" {
+			t.Errorf("%s names no console", p.Key)
+		}
 	}
 }
 

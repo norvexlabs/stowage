@@ -7,6 +7,9 @@ follow [SemVer](https://semver.org/).
 
 ### Fixed
 
+- `vm create`'s message when the VM is not ready by `--wait` names the platform's own console
+  (Scaleway's Console tab, a cloud's serial console, `virsh console`, …), not TrueNAS's on every
+  platform.
 - Lint's `cap_add` warning names only the capabilities a service holds beyond Docker's defaults:
   a service that drops every capability and adds back some of the defaults (`cap_drop: [ALL]`,
   `cap_add: [CHOWN, SETUID]`) is no longer warned, and `CAP_`-prefixed or lowercase names are read
