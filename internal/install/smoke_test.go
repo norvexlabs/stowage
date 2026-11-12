@@ -8,8 +8,10 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
@@ -64,15 +66,67 @@ func freePort(t *testing.T) int {
 	return l.Addr().(*net.TCPAddr).Port
 }
 
+// smokeRun records a run as test/lib.sh does, for test/sweep.sh to judge what it names: a random id
+// (r and 8 hex digits) and the directory stowage-e2e.<run> in the user's cache, holding the PID
+// namespace and the PID of this process; removed when the test ends.
+func smokeRun(t *testing.T) string {
+	t.Helper()
+	cache, err := os.UserCacheDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ns, err := os.Readlink("/proc/self/ns/pid")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(cache, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for {
+		b := make([]byte, 4)
+		_, _ = rand.Read(b)
+		run := "r" + hex.EncodeToString(b)
+		d := filepath.Join(cache, "stowage-e2e."+run)
+		if err := os.Mkdir(d, 0o700); os.IsExist(err) {
+			continue
+		} else if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.RemoveAll(d) })
+		// The namespace before the PID: a directory without a PID is one being made, live.
+		if err := os.WriteFile(filepath.Join(d, ".pidns"), []byte(ns+"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(d, ".pid"), []byte(strconv.Itoa(os.Getpid())+"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return run
+	}
+}
+
+// publishedPort is the host port Docker published a container's port on.
+func publishedPort(t *testing.T, container string, port int) int {
+	t.Helper()
+	out := sh(t, "docker", "port", container, fmt.Sprintf("%d/tcp", port))
+	_, p, err := net.SplitHostPort(strings.SplitN(out, "\n", 2)[0])
+	n, perr := strconv.Atoi(p)
+	if err != nil || perr != nil {
+		t.Fatalf("%s publishes no port for %d: %q", container, port, out)
+	}
+	return n
+}
+
 func TestSmokeInstallServesThroughTheFront(t *testing.T) {
 	work := t.TempDir()
-	regPort := freePort(t)
+	run := smokeRun(t)
 	_ = os.MkdirAll(filepath.Join(work, "zot"), 0o755)
 	_ = os.WriteFile(filepath.Join(work, "zot/config.json"), []byte(`{"storage":{"rootDirectory":"/etc/zot/data"},"http":{"address":"0.0.0.0","port":"5000"},"log":{"level":"warn"}}`), 0o644)
-	cname := fmt.Sprintf("stowage-smoke-zot-%d", os.Getpid())
-	sh(t, "docker", "run", "-d", "--name", cname, "--user", fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid()), "-p", fmt.Sprintf("127.0.0.1:%d:5000", regPort), "-v", filepath.Join(work, "zot")+":/etc/zot", smokeRegistry, "serve", "/etc/zot/config.json")
+	// Named by the run, as test/lib.sh names its registries; published on a port Docker picks and
+	// binds at once.
+	cname := "stowage-e2e-zot-" + run
 	t.Cleanup(func() { _ = exec.Command("docker", "rm", "-f", cname).Run() })
-	reg := fmt.Sprintf("127.0.0.1:%d", regPort)
+	sh(t, "docker", "run", "-d", "--name", cname, "--user", fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid()), "-p", "127.0.0.1::5000", "-v", filepath.Join(work, "zot")+":/etc/zot", smokeRegistry, "serve", "/etc/zot/config.json")
+	reg := fmt.Sprintf("127.0.0.1:%d", publishedPort(t, cname, 5000))
 	for i := 0; i < 50; i++ {
 		if r, err := http.Get("http://" + reg + "/v2/"); err == nil {
 			r.Body.Close()
@@ -93,7 +147,7 @@ func TestSmokeInstallServesThroughTheFront(t *testing.T) {
 	frontRepo := reg + "/smoke/notes-" + front.Key
 	b := &publisher.DockerBuilder{WorkDir: filepath.Join(work, "build"), Stderr: os.Stderr}
 	fimg, cleanup, err := b.Build(context.Background(), &project.Project{Spec: &spec.Spec{Name: "notes"}},
-		publisher.BuildRequest{Image: front.Key, Inputs: fmt.Sprintf("sha256:smoke%d", os.Getpid()), Recipe: front.Dockerfile})
+		publisher.BuildRequest{Image: front.Key, Inputs: "sha256:smoke" + run, Recipe: front.Dockerfile})
 	if cleanup != nil {
 		defer cleanup()
 	}

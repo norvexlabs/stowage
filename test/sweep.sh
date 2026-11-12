@@ -53,15 +53,12 @@ run_live() {
 }
 created() { docker inspect -f '{{.Created}}' "$@" 2>/dev/null | head -n1; }
 
-# Registries of dead runs, and their backups' WebDAV server: stowage-e2e-zot-<run>[-mirror|-dav].
+# Registries of dead runs, and their backups' WebDAV server: stowage-e2e-zot-<run>[-mirror|-dav]
+# (the smoke test's too: it records its run as lib.sh does).
 for n in $(docker ps -a --format '{{.Names}}' | grep -E '^stowage-e2e-zot-r[0-9a-f]+(-mirror|-dav)?$'); do
 	r=${n#stowage-e2e-zot-}
 	r=${r%-mirror}
 	run_live "${r%-dav}" "$(created "$n")" || docker rm -f "$n" >/dev/null 2>&1
-done
-# The smoke test's registry, stowage-smoke-zot-<pid> (the Go test's process, on this host).
-for n in $(docker ps -a --format '{{.Names}}' | grep -E '^stowage-smoke-zot-[0-9]+$'); do
-	alive "${n#stowage-smoke-zot-}" || docker rm -f "$n" >/dev/null 2>&1
 done
 
 # e2e-kairos's libvirt daemon of a dead run, stowage-e2e-libvirtd-<run> (with its domains).
@@ -154,7 +151,7 @@ live_run() {
 	for d in "$CACHE"/stowage-e2e.*/.pid; do
 		[[ -f $d ]] && not_dead "${d%/.pid}" && return 0
 	done
-	docker ps --format '{{.Names}}' | grep -qE '^stowage-smoke-zot-[0-9]+$'
+	return 1
 }
 docker ps -a --format '{{.ID}} {{.Label "com.docker.compose.project"}} {{.Label "com.docker.compose.project.working_dir"}}' |
 	while read -r id project dir; do

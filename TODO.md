@@ -1056,11 +1056,6 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
   provision hook creates); `keep_on_reset` on Kubernetes (today every claim of the release goes);
   a database outside the Kubernetes release (`external`) is not reset.
 
-- **The smoke test's registry is judged by a bare PID**: `stowage-smoke-zot-<pid>` (the Go test's
-  process) has no PID namespace recorded, so an end-to-end suite in a container on the same Docker
-  sweeps a live `make smoke-install`'s registry. A random id and a recorded namespace, as the
-  suites' runs have, would close it.
-
 - **What `test/sweep.sh` does not sweep**: a TrueNAS VM `stowage-e2e-<run>` whose run died
   without its cleanup (a host crash; `vm destroy` needs the run's state, gone with it), and the
   build cache, which lives in the host's shared buildx builder.
