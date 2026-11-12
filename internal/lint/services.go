@@ -844,15 +844,12 @@ func (l *linter) handoffs() {
 		seen := map[string]bool{}
 		for i, k := range st.Env {
 			kw := fmt.Sprintf("%s.env[%d]", w, i)
-			switch input, isInput := l.s.Input(k); {
+			// A file input and a secret delivered as a file reach the step as their files, as the hook's.
+			switch {
 			case seen[k]:
 				l.errf(kw, "%s is listed twice", k)
 			case known[k] == "":
 				l.errf(kw, "%s is no input, secret or safe default", k)
-			case isInput && input.File():
-				l.errf(kw, "%s is a file input, which a handoff's step does not get: its run makes what it gives", k)
-			case l.s.AsFile(k):
-				l.errf(kw, "%s is delivered as a file (as_file: true), which a handoff's step does not get: its run makes what it gives", k)
 			}
 			seen[k] = true
 		}

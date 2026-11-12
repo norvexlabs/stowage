@@ -3,6 +3,17 @@
 Stowage's own releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
+## [0.36.0]
+
+### Changed
+
+- A handoff's `run` and `check` may list a file input or a secret delivered as a file
+  (`as_file: true`) in their `env`, which lint refused: the step gets each as its file, mounted
+  read-only as the provision hook's, its path in `STOWAGE_INPUT_FILE_<KEY>` or
+  `STOWAGE_SECRET_FILE_<KEY>`, the value in neither its environment, its Job, a log nor the kit.
+- Lint counts an input a handoff's `run` or `check` lists in its `env` as read: it no longer warns
+  that nothing reads it.
+
 ## [0.35.0] - 2026-11-12
 
 ### Added

@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -18,6 +19,7 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"go.yaml.in/yaml/v3"
 
 	"github.com/norvexlabs/stowage/internal/kit"
 	"github.com/norvexlabs/stowage/internal/spec"
@@ -87,6 +89,74 @@ func TestIssueKitOnDocker(t *testing.T) {
 	e.docker.kitOut = "ADMIN_EMAIL=site@example.org\n"
 	if _, err := e.installer(kitFast).IssueKit(context.Background(), kitReq, kitNow); err != nil {
 		t.Errorf("a key this install records: %v", err)
+	}
+}
+
+// A step whose env lists a secret delivered as a file and a file input gets each as its file, mounted
+// read-only as the hook's, its path in the file's variable: never the value in its environment, nor
+// in its compose file or the log.
+func TestTheKitStepGetsItsFilesOnDocker(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	withFiles(e.r.Spec)
+	asFileSession(e.r.Spec)
+	h := testHandoff()
+	h.Run.Env = []string{"ADMIN_EMAIL", "CA", "SESSION_SECRET"}
+	e.r.Spec.Handoffs = []spec.Handoff{h}
+	if err := e.install(func(o *Options) { o.Set = map[string]string{"CA": encodeFileInput([]byte(pemCA))} }); err != nil {
+		t.Fatal(err)
+	}
+	recorded := e.readEnv()
+	secret := get(recorded, "SESSION_SECRET")
+	// A file gone since the start is written again, as a mount of a missing file makes a directory.
+	if err := os.RemoveAll(filepath.Join(e.dir, InputFilesDir)); err != nil {
+		t.Fatal(err)
+	}
+	e.docker.kitOut = "TOKEN=the-token\n"
+	if _, err := e.installer(kitFast).IssueKit(context.Background(), kitReq, kitNow); err != nil {
+		t.Fatalf("%v\n%s", err, e.log)
+	}
+	var f struct {
+		Services map[string]struct{ Environment, Volumes []string }
+	}
+	if err := yaml.Unmarshal([]byte(e.docker.kitFile), &f); err != nil {
+		t.Fatalf("%v\n%s", err, e.docker.kitFile)
+	}
+	svc := f.Services[KitService]
+	for _, want := range []string{"ADMIN_EMAIL", "STOWAGE_SECRET_FILE_SESSION_SECRET=/run/stowage/inputs/SESSION_SECRET", "STOWAGE_INPUT_FILE_CA=/run/stowage/inputs/CA"} {
+		if !slices.Contains(svc.Environment, want) {
+			t.Errorf("no %s in %v", want, svc.Environment)
+		}
+	}
+	if slices.Contains(svc.Environment, "SESSION_SECRET") || slices.Contains(svc.Environment, "CA") {
+		t.Errorf("a file's variable: %v", svc.Environment)
+	}
+	if want := []string{"${STOWAGE_INPUT_FILE_CA}:/run/stowage/inputs/CA:ro", "${STOWAGE_SECRET_FILE_SESSION_SECRET}:/run/stowage/inputs/SESSION_SECRET:ro"}; !slices.Equal(svc.Volumes, want) {
+		t.Errorf("volumes %v", svc.Volumes)
+	}
+	for _, k := range []string{"CA", "SESSION_SECRET"} {
+		path := get(recorded, (&Installer{R: e.r}).fileVarOf(k))
+		if !slices.Contains(e.docker.kitEnv, (&Installer{R: e.r}).fileVarOf(k)+"="+path) {
+			t.Errorf("compose was not given %s's path %s", k, path)
+		}
+		if _, err := os.Stat(filepath.Join(e.dir, path)); err != nil {
+			t.Errorf("%s's file: %v", k, err)
+		}
+	}
+	if got, _ := os.ReadFile(filepath.Join(e.dir, get(recorded, spec.SecretFileVar("SESSION_SECRET")))); string(got) != secret {
+		t.Errorf("the secret's file holds %q", got)
+	}
+	if strings.Contains(e.docker.kitFile, secret) || strings.Contains(e.log.String(), secret) || strings.Contains(e.docker.kitFile, pemCA) {
+		t.Errorf("a value in the step's file or the log:\n%s\n%s", e.docker.kitFile, e.log)
+	}
+	// Its check gets the files its env lists likewise.
+	e.r.Spec.Handoffs[0].Check.Env = []string{"SESSION_SECRET"}
+	e.docker.kitFile = ""
+	if code, err := e.installer(kitFast).CheckKit(context.Background(), "client", "site-1"); err != nil || code != KitProven {
+		t.Fatalf("%d %v\n%s", code, err, e.log)
+	}
+	if !strings.Contains(e.docker.kitFile, "${STOWAGE_SECRET_FILE_SESSION_SECRET}:/run/stowage/inputs/SESSION_SECRET:ro") || strings.Contains(e.docker.kitFile, "/CA") {
+		t.Errorf("the check's file:\n%s", e.docker.kitFile)
 	}
 }
 
@@ -424,6 +494,85 @@ func TestIssueKitOnKubernetes(t *testing.T) {
 	}
 	if strings.Contains(e.log.String(), "the-token") || strings.Contains(e.log.String(), "the-site") {
 		t.Errorf("a value in the log:\n%s", e.log)
+	}
+}
+
+// On Kubernetes a step whose env lists a secret delivered as a file and a file input gets each as its
+// file, those keys alone mounted from their Secrets, its path in the file's variable: never a variable
+// holding the value, an envFrom of a Secret, nor the value in the Job's spec.
+func TestTheKitStepGetsItsFilesOnKubernetes(t *testing.T) {
+	t.Parallel()
+	e := newKubeEnv(t, spec.Provider{Name: "none"})
+	e.release = e.at("1.0.0", 1, func(s *spec.Spec) {
+		withFiles(s)
+		asFileSession(s)
+		h := testHandoff()
+		h.Run.Env = []string{"ADMIN_EMAIL", "CA", "SESSION_SECRET"}
+		s.Handoffs = []spec.Handoff{h}
+	})
+	e.published(e.release)
+	e.runs("1.0.0", 1)
+	e.stored(map[string]string{"ADMIN_EMAIL": "a@example.org", "CA": encodeFileInput([]byte(pemCA)), "EXTRA": ""}, ours)
+	files, _ := json.Marshal(map[string]any{"metadata": map[string]any{"labels": ours},
+		"data": map[string]string{"SESSION_SECRET": base64.StdEncoding.EncodeToString([]byte("the-session-secret"))}})
+	e.f.objects = map[string]string{"secret/notes-stowage-secret-files": string(files)}
+	e.hookRuns("Succeeded", "", map[string]string{"TOKEN": "the-token"})
+	if _, err := e.installer(kitFast).K8sIssueKit(context.Background(), kitReq, kitNow); err != nil {
+		t.Fatalf("%v\n%s", err, e.log)
+	}
+	c := e.container("provision")
+	env := envOf(c)
+	if env["STOWAGE_SECRET_FILE_SESSION_SECRET"] != HookInputsDir+"/SESSION_SECRET" || env["STOWAGE_INPUT_FILE_CA"] != HookInputsDir+"/CA" || env["ADMIN_EMAIL"] != "notes-stowage/ADMIN_EMAIL" {
+		t.Errorf("env %v", env)
+	}
+	if _, ok := env["SESSION_SECRET"]; ok {
+		t.Errorf("the secret as a variable: %v", env)
+	}
+	if _, ok := env["CA"]; ok {
+		t.Errorf("the file input as a variable: %v", env)
+	}
+	for _, from := range c["envFrom"].([]any) {
+		if _, ok := from.(map[string]any)["secretRef"]; ok {
+			t.Errorf("envFrom a Secret: %v", c["envFrom"])
+		}
+	}
+	mounted := false
+	for _, m := range c["volumeMounts"].([]any) {
+		if m := m.(map[string]any); m["name"] == "inputs" && m["mountPath"] == HookInputsDir && m["readOnly"] == true {
+			mounted = true
+		}
+	}
+	if !mounted {
+		t.Errorf("mounts %v", c["volumeMounts"])
+	}
+	pod := e.f.created["spec"].(map[string]any)["template"].(map[string]any)["spec"].(map[string]any)
+	got := map[string][]string{}
+	for _, v := range pod["volumes"].([]any) {
+		if v := v.(map[string]any); v["name"] == "inputs" {
+			for _, src := range v["projected"].(map[string]any)["sources"].([]any) {
+				sec := src.(map[string]any)["secret"].(map[string]any)
+				for _, it := range sec["items"].([]any) {
+					got[sec["name"].(string)] = append(got[sec["name"].(string)], it.(map[string]any)["key"].(string))
+				}
+			}
+		}
+	}
+	if want := map[string][]string{"notes-stowage-files": {"CA"}, "notes-stowage-secret-files": {"SESSION_SECRET"}}; fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Errorf("mounted %v", got)
+	}
+	job, _ := json.Marshal(e.f.created)
+	if strings.Contains(string(job), "the-session-secret") || strings.Contains(string(job), "ca input") || strings.Contains(e.log.String(), "the-session-secret") {
+		t.Errorf("a value in the Job or the log:\n%s\n%s", job, e.log)
+	}
+	// Its check's Job gets the files its env lists likewise.
+	e.release.Spec.Handoffs[0].Check.Env = []string{"SESSION_SECRET"}
+	e.f.outputs, e.f.job = "", "" // the run's Secret and Job, gone once it sealed the kit
+	e.hookRuns("Succeeded", "", map[string]string{kitExitKey: "0"})
+	if code, err := e.installer(nil).K8sCheckKit(context.Background(), "client", "site-1"); err != nil || code != KitProven {
+		t.Fatalf("%d %v\n%s", code, err, e.log)
+	}
+	if env := envOf(e.container("provision")); env["STOWAGE_SECRET_FILE_SESSION_SECRET"] != HookInputsDir+"/SESSION_SECRET" || env["SESSION_SECRET"] != "" {
+		t.Errorf("the check's env %v", env)
 	}
 }
 

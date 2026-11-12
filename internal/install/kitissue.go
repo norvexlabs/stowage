@@ -111,8 +111,9 @@ func kitVars(h *spec.Handoff, instance string, answers map[string]string) map[st
 	return vars
 }
 
-// kitContainer runs step once in a confined container, as the provision hook runs, with vars set, its
-// stdout to stdout; its failure, the container gone. runCtx is the run's; stopped says a Write stopped it.
+// kitContainer runs step once in a confined container, as the provision hook runs, with vars set and
+// each file input or secret delivered as a file its env lists mounted as the hook's, its stdout to
+// stdout; its failure, the container gone. runCtx is the run's; stopped says a Write stopped it.
 func (in *Installer) kitContainer(ctx, runCtx context.Context, env *EnvFile, step *spec.HandoffStep, vars map[string]string, stdout io.Writer, stopped func() bool) error {
 	if err := in.leftovers(ctx, env); err != nil {
 		return err
@@ -120,6 +121,10 @@ func (in *Installer) kitContainer(ctx, runCtx context.Context, env *EnvFile, ste
 	name := containerName(env, KitService)
 	h := &providers.ProvisionHook{Image: step.Image, Cmd: step.Cmd, Env: &step.Env}
 	keys := in.hookEnv(env, h)
+	files, err := in.writeHookFiles(env, h)
+	if err != nil {
+		return err
+	}
 	for _, k := range sortedKeys(vars) {
 		if !slices.Contains(keys, k) {
 			keys = append(keys, k)
@@ -136,6 +141,7 @@ func (in *Installer) kitContainer(ctx, runCtx context.Context, env *EnvFile, ste
 		return err
 	}
 	svc := confined(KitService, "${"+ImageVar(step.Image)+"}", user, step.Cmd, keys)
+	mountFiles(svc, files, in.fileVarOf)
 	if hosts := in.targetHosts(); len(hosts) > 0 {
 		svc["extra_hosts"] = hosts
 	}

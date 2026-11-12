@@ -1898,8 +1898,9 @@ func (l *linter) profileInput(w string, in spec.Input) {
 // composeProfile is a compose profile's name.
 var composeProfile = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]*$`)
 
-// readInputs reports whether something reads an input: a compose service, a route of the front
-// or the provision hook's env; one asked on Kubernetes only is the chart's, taken as read.
+// readInputs reports whether something reads an input: a compose service, a route of the front,
+// the provision hook's env or a handoff step's; one asked on Kubernetes only is the chart's, taken
+// as read.
 func (l *linter) readInputs() func(spec.Input) bool {
 	inCompose := map[string]bool{}
 	for _, v := range l.compose.Vars {
@@ -1910,6 +1911,16 @@ func (l *linter) readInputs() func(spec.Input) bool {
 	if h, err := providers.DecodeProvision(l.s.Short(), l.s.Hooks.Provision, l.s.Images); err == nil {
 		for _, k := range h.Keys() {
 			inCompose[k] = true
+		}
+	}
+	// A handoff's steps read the keys their env lists.
+	for _, h := range l.s.Handoffs {
+		for _, st := range []*spec.HandoffStep{&h.Run, h.Check} {
+			if st != nil {
+				for _, k := range st.Env {
+					inCompose[k] = true
+				}
+			}
 		}
 	}
 	// The front reads its routes' inputs.

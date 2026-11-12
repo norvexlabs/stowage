@@ -81,6 +81,17 @@ func (in *Installer) hookFiles(h *providers.ProvisionHook) []string {
 	return files
 }
 
+// writeHookFiles writes the files the stack mounts when h gets one (hookFiles, returned), before a
+// run outside a start: none may have written them, and a mount of a file gone would make a directory.
+func (in *Installer) writeHookFiles(env *EnvFile, h *providers.ProvisionHook) ([]string, error) {
+	files := in.hookFiles(h)
+	if len(files) == 0 {
+		return nil, nil
+	}
+	in.fileVars(env)
+	return files, in.writeInputFiles(env)
+}
+
 // fileVarOf is the variable holding the path of the file key is mounted from.
 func (in *Installer) fileVarOf(key string) string {
 	if in.R.Spec.AsFile(key) {
@@ -227,22 +238,31 @@ func serviceFile(what, service string, svc map[string]any) ([]byte, error) {
 // (a file input, or a secret delivered as a file) mounted read-only, its only mounts, with the
 // variable varOf names holding the path inside the container.
 func provisionCompose(h *providers.ProvisionHook, user string, keys, files, hosts []string, varOf func(string) string) ([]byte, error) {
-	environment := slices.Clone(keys)
+	svc := confined(ProvisionService, "${"+ImageVar(h.Image)+"}", user, h.Cmd, keys)
+	mountFiles(svc, files, varOf)
+	svc["env_file"] = []string{"./" + ProvisionEnv}
+	if len(hosts) > 0 {
+		svc["extra_hosts"] = hosts
+	}
+	return serviceFile("the provision hook", ProvisionService, svc)
+}
+
+// mountFiles gives the confined service svc each of files (a file input, or a secret delivered as a
+// file) mounted read-only at HookInputsDir/<key>, its only mounts, with the variable varOf names
+// holding that path inside the container; the mount's source is that variable compose expands, the
+// file's path the install records. The value itself never reaches svc's environment.
+func mountFiles(svc map[string]any, files []string, varOf func(string) string) {
+	if len(files) == 0 {
+		return
+	}
+	environment := slices.Clone(svc["environment"].([]string))
 	var volumes []string
 	for _, k := range files {
 		target := HookInputsDir + "/" + k
 		environment = append(environment, varOf(k)+"="+target)
 		volumes = append(volumes, "${"+varOf(k)+"}:"+target+":ro")
 	}
-	svc := confined(ProvisionService, "${"+ImageVar(h.Image)+"}", user, h.Cmd, environment)
-	svc["env_file"] = []string{"./" + ProvisionEnv}
-	if len(volumes) > 0 {
-		svc["volumes"] = volumes
-	}
-	if len(hosts) > 0 {
-		svc["extra_hosts"] = hosts
-	}
-	return serviceFile("the provision hook", ProvisionService, svc)
+	svc["environment"], svc["volumes"] = environment, volumes
 }
 
 // containerName is the container of a service Stowage runs on demand: one name per install, so a
@@ -691,12 +711,8 @@ func setReturned(returned *EnvFile, set map[string]string) {
 // (`provision`, or a restore): a first install whose stack came up and whose hook failed is
 // finished by it.
 func (in *Installer) provisionNow(ctx context.Context, env *EnvFile, h *providers.ProvisionHook) error {
-	if len(in.hookFiles(h)) > 0 {
-		// No start wrote them, and a mount of a file gone would make a directory.
-		in.fileVars(env)
-		if err := in.writeInputFiles(env); err != nil {
-			return err
-		}
+	if _, err := in.writeHookFiles(env, h); err != nil {
+		return err
 	}
 	if err := in.runHook(ctx, env, h); err != nil {
 		return err

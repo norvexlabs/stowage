@@ -984,7 +984,7 @@ again, to copy an installer to another host.
   file input read as text: as a route's domain, allowlist, forward auth or basic auth, an L4 route's
   or a service's address or bind, a set, a table's input, an extension's,
   or in another input's `default`. Reading `STOWAGE_INPUT_FILE_<KEY>` counts as reading the input.
-  A provision hook's `env` may name a file input: its container gets the file read-only at
+  A provision hook's `env`, and a handoff step's (see [kits](kits.md)), may name a file input: its container gets the file read-only at
   `/run/stowage/inputs/<KEY>` and `STOWAGE_INPUT_FILE_<KEY>` holding that path, never the recorded
   value (these are the hook's only mounts). The file is empty while the input is, so a hook tests
   its size; `provision` writes it first, as no start did. `provision --set` refuses a file input,
@@ -1009,8 +1009,8 @@ again, to copy an installer to another host.
   refuses `${KEY}` of such a secret anywhere in the compose file (`${KEY} is delivered as a file
   (as_file: true), never as a variable: mount ${STOWAGE_SECRET_FILE_KEY}`), `as_file` on an input
   that is no secret or is a file input already, on a secret that rotates (its passes hand the
-  services `KEY_NEXT` and `KEY_PREVIOUS` as variables beside it), and a handoff step's `env`
-  naming one. A provision hook's `env` may name one: its container gets the file read-only at
+  services `KEY_NEXT` and `KEY_PREVIOUS` as variables beside it). A provision hook's `env`, and a
+  handoff step's (see [kits](kits.md)), may name one: its container gets the file read-only at
   `/run/stowage/inputs/<KEY>` and `STOWAGE_SECRET_FILE_<KEY>` holding that path, never the
   variable, on every shape. A `command` provider's container receives it as a variable, as it
   receives every recorded value: that is the `command` contract, and its image is the project's

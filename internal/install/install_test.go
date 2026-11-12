@@ -60,6 +60,7 @@ type fakeDocker struct {
 	kitOut   string
 	kitErr   error
 	kitEnv   []string
+	kitFile  string // the step's compose file, read when it ran
 	leftover string // the service whose container is there before the run
 	rmErr    error
 	// dump is what pg_dump writes, then fails with dumpErr.
@@ -267,6 +268,8 @@ func (f *fakeDocker) Run(_ context.Context, c Cmd) ([]byte, error) {
 		return nil, nil
 	case strings.Contains(a, " run --rm --no-deps -T --name ") && strings.HasSuffix(a, " "+KitService):
 		f.kitEnv = c.Env
+		raw, _ := os.ReadFile(filepath.Join(c.Args[2], KitCompose))
+		f.kitFile = string(raw)
 		if _, err := io.WriteString(c.Stdout, f.kitOut); err != nil {
 			return nil, err
 		}

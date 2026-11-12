@@ -1729,7 +1729,9 @@ every shape, the VM end-to-end test upgrading through it), then the health gate.
   A handoff's `run` and `check` are one-shot containers shaped as the provision hook, not a service
   plus `exec`: Kubernetes has no `exec` verb and no service-pod contract, and the hook already runs on
   every shape. Their output is the hook's `KEY=VALUE` grammar, so on Kubernetes values stay out of pod
-  logs through the same record step, in a Secret of their own read then deleted; a check's Job records
+  logs through the same record step, in a Secret of their own read then deleted; a file input or an
+  `as_file` secret their `env` lists is mounted as the hook's, by key, so the step that must read one
+  (to issue a credential from it) never holds it in its environment; a check's Job records
   its exit status there, since `podFailure` could not tell "not proven" from a failed Job. Stowage keeps
   no ledger: single use is the project's script's. `gives` keys are the target's input names with no
   renaming, and lint checks the issuer's side alone, as it cannot see the target's spec.

@@ -61,6 +61,16 @@ func TestExamplesAreClean(t *testing.T) {
 	}
 }
 
+// A handoff's step may list a file input and a secret delivered as a file: it gets each as its file.
+func TestAHandoffStepListsItsFiles(t *testing.T) {
+	t.Parallel()
+	root := testutil.CopyExample(t, "full")
+	testutil.Edit(t, root, specFile, "cmd: [handoff.py, issue], env: []", "cmd: [handoff.py, issue], env: [API_CA_BUNDLE, ENCRYPTION_KEY]")
+	if errs := errorsOf(run(t, root)); len(errs) > 0 {
+		t.Fatalf("errors:\n%s", strings.Join(errs, "\n"))
+	}
+}
+
 func TestRegistryPrefixes(t *testing.T) {
 	t.Parallel()
 	for p, ok := range map[string]bool{
@@ -202,8 +212,6 @@ func TestEachRuleFiresOnFull(t *testing.T) {
 		write map[string]string
 		want  string
 	}{
-		{"handoff file input", []edit{{sp, "cmd: [handoff.py, issue], env: []", "cmd: [handoff.py, issue], env: [API_CA_BUNDLE]"}}, nil, "is a file input"},
-		{"handoff as_file", []edit{{sp, "cmd: [handoff.py, issue], env: []", "cmd: [handoff.py, issue], env: [ENCRYPTION_KEY]"}}, nil, "handoffs[0].run.env[0]: ENCRYPTION_KEY is delivered as a file (as_file: true), which a handoff's step does not get"},
 		{"as_file rotation", []edit{{sp, "gen: hex32, rotation: true }", "gen: hex32, rotation: true, as_file: true }"}}, nil, "secrets[2].as_file: INTERNAL_SERVICE_SECRET rotates"},
 		{"as_file no secret", []edit{{sp, `prompt: "Organisation name",        required: true }`, `prompt: "Organisation name",        required: true, as_file: true }`}}, nil, "as_file: ORG_NAME is no secret input"},
 		{"as_file file input", []edit{{sp, "type: pem, optional: true }", "type: pem, optional: true, secret: true, as_file: true }"}}, nil, "as_file: API_CA_BUNDLE is a file input already: a service mounts ${STOWAGE_INPUT_FILE_API_CA_BUNDLE}"},
@@ -1486,8 +1494,8 @@ func TestFrontHostsOfAnL4Upstream(t *testing.T) {
 	}
 }
 
-// An input counts as read when the provision hook's env lists it, and only then: a hook no longer
-// receives every input.
+// An input counts as read when the provision hook's env or a handoff step's lists it, and only
+// then: a hook no longer receives every input.
 func TestInputOnlyTheHookReads(t *testing.T) {
 	t.Parallel()
 	warned := func(res *Result) bool {
@@ -1512,6 +1520,11 @@ func TestInputOnlyTheHookReads(t *testing.T) {
 	testutil.Edit(t, root, specFile, "env: [ADMIN_EMAIL, ADMIN_PASSWORD,", "env: [ADMIN_PASSWORD,")
 	if res := run(t, root); !warned(res) {
 		t.Fatalf("findings: %+v", res.Findings)
+	}
+	// A handoff's step reads what its env lists, its check's too.
+	testutil.Edit(t, root, specFile, "cmd: [handoff.py, check], env: []", "cmd: [handoff.py, check], env: [ADMIN_EMAIL]")
+	if res := run(t, root); warned(res) {
+		t.Fatal("warned while the handoff's check lists it")
 	}
 }
 

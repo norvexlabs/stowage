@@ -88,7 +88,13 @@ func (in *Installer) k8sKitInstaller(ctx context.Context, h *spec.Handoff, step 
 // Job exists it stands for a run under way: Kubernetes has no lock here.
 func (in *Installer) k8sKitRun(ctx context.Context, p *k8sHookPlan, answers map[string]string) (map[string]string, error) {
 	k := in.O.K8s
-	env, err := in.readSecret(ctx, k.envSecret())
+	// What the release records; with the secrets delivered as files, read from their own Secret, when
+	// the step lists one: the Job mounts each from that Secret by key, its value never in the Job.
+	read := func(context.Context) (map[string]string, error) { return in.readSecret(ctx, k.envSecret()) }
+	if slices.ContainsFunc(p.hook.Keys(), in.R.Spec.AsFile) {
+		read = in.k8sRecorded
+	}
+	env, err := read(ctx)
 	if err != nil {
 		return nil, err
 	}

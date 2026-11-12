@@ -647,3 +647,84 @@ func TestTheCodesVariableLeavesTheEnvironment(t *testing.T) {
 		t.Error("still in the environment, the file giving the code")
 	}
 }
+
+// A kit's key the install declares a secret input delivered as a file (as_file) is recorded as the
+// install's and delivered as its file, never as a variable: by --kit on Docker, by what `vm kit take`
+// sends the VM's install (`install --given -`), and by --kit on Kubernetes, in the secret files' own
+// Secret, never the release's.
+func TestAKitsKeyDeliveredAsAFile(t *testing.T) {
+	t.Parallel()
+	asFile := spec.Input{Key: "API_KEY", Prompt: "API key", Secret: true, AsFile: true, Required: true}
+	code := func(o *Options) {
+		environment := o.Getenv
+		o.Getenv = func(n string) string {
+			if n == KitCodeVar {
+				return testKitCode
+			}
+			return environment(n)
+		}
+	}
+	docker := func(t *testing.T, take func(in *Installer) error) {
+		t.Helper()
+		e := newEnv(t)
+		e.r.Spec.Inputs = append(e.r.Spec.Inputs, asFile)
+		in := e.installer(code)
+		if err := take(in); err != nil {
+			t.Fatal(err)
+		}
+		if err := in.Install(context.Background()); err != nil {
+			t.Fatalf("%v\n%s", err, e.log)
+		}
+		env := e.readEnv()
+		path := get(env, spec.SecretFileVar("API_KEY"))
+		if get(env, "API_KEY") != "from-the-kit" || path == "" {
+			t.Fatalf("recorded %q at %q", get(env, "API_KEY"), path)
+		}
+		if got, err := os.ReadFile(filepath.Join(e.dir, path)); err != nil || string(got) != "from-the-kit" {
+			t.Errorf("the file holds %q: %v", got, err)
+		}
+		if strings.Contains(e.log.String(), "from-the-kit") {
+			t.Errorf("the value in the log:\n%s", e.log)
+		}
+	}
+	t.Run("--kit", func(t *testing.T) {
+		docker(t, func(in *Installer) error {
+			f := givenFlags{kit: "-"}
+			return f.take(context.Background(), in, bytes.NewReader(sealKit(t, nil)), nil, kitNow, func(g *Given, flag string) error { return in.useGiven(g, flag, in.shape()) })
+		})
+	})
+	t.Run("vm kit take", func(t *testing.T) {
+		docker(t, func(in *Installer) error {
+			g, err := in.openKit(context.Background(), "-", "", bytes.NewReader(sealKit(t, nil)), nil, kitNow)
+			if err != nil {
+				return err
+			}
+			raw, err := marshalGiven(g) // what TakeKitVM sends the VM's `install --given -`
+			if err != nil {
+				return err
+			}
+			return in.takeGiven(raw)
+		})
+	})
+	t.Run("kubernetes --kit", func(t *testing.T) {
+		e := newKubeEnv(t, spec.Provider{Name: "none"})
+		e.release = e.at("1.0.0", 1, func(s *spec.Spec) { s.Inputs = append(s.Inputs, asFile) })
+		in := e.installer(code)
+		f := givenFlags{kit: "-"}
+		if err := f.take(context.Background(), in, bytes.NewReader(sealKit(t, nil)), nil, kitNow, in.useK8sGiven); err != nil {
+			t.Fatal(err)
+		}
+		if err := in.K8sInstall(context.Background()); err != nil {
+			t.Fatalf("%v\n%s", err, e.log)
+		}
+		if _, ok := e.secretData("notes-stowage")["API_KEY"]; ok {
+			t.Errorf("the release's Secret holds it: %v", e.secretData("notes-stowage"))
+		}
+		if got := e.secretData("notes-stowage-secret-files")["API_KEY"]; got != "from-the-kit" {
+			t.Errorf("the secret files' Secret holds %q", got)
+		}
+		if strings.Contains(e.log.String(), "from-the-kit") {
+			t.Errorf("the value in the log:\n%s", e.log)
+		}
+	})
+}
