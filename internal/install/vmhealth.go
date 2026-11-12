@@ -124,9 +124,16 @@ func (a assessment) set(ctx context.Context, vars ...string) error {
 
 // unitState is a systemd unit's ActiveState, or noBootUnit when systemd has no such unit.
 func unitState(ctx context.Context, host Tool, unit string) (string, error) {
-	out, err := host.Run(ctx, Cmd{Args: []string{"systemctl", "show", "--property", "LoadState", "--property", "ActiveState", unit}})
+	st, _, err := unitStatus(ctx, host, unit)
+	return st, err
+}
+
+// unitStatus is unitState's, and whether a job is queued for the unit (its Job property, which
+// systemctl leaves out, or empty, when none is).
+func unitStatus(ctx context.Context, host Tool, unit string) (string, bool, error) {
+	out, err := host.Run(ctx, Cmd{Args: []string{"systemctl", "show", "--property", "LoadState", "--property", "ActiveState", "--property", "Job", unit}})
 	if err != nil {
-		return "", fmt.Errorf("the state of %s: %w", unit, err)
+		return "", false, fmt.Errorf("the state of %s: %w", unit, err)
 	}
 	props := map[string]string{}
 	for _, l := range strings.Split(string(out), "\n") {
@@ -135,12 +142,12 @@ func unitState(ctx context.Context, host Tool, unit string) (string, error) {
 		}
 	}
 	if props["LoadState"] == "not-found" {
-		return noBootUnit, nil
+		return noBootUnit, false, nil
 	}
 	if props["ActiveState"] == "" {
-		return "", fmt.Errorf("the state of %s: systemctl answered %q", unit, strings.TrimSpace(string(out)))
+		return "", false, fmt.Errorf("the state of %s: systemctl answered %q", unit, strings.TrimSpace(string(out)))
 	}
-	return props["ActiveState"], nil
+	return props["ActiveState"], props["Job"] != "", nil
 }
 
 // Gate is the VM's health gate over the install of In, which carries the release this OS carries.

@@ -631,14 +631,18 @@ func TestStatusTellsABootSettledAndItsVerdict(t *testing.T) {
 		boot, judge string
 		settled     bool
 	}{
-		"both done":          {"active", "active", true},
-		"gate failed":        {"active", "failed", true},
-		"no gate unit":       {"failed", noBootUnit, true},
-		"boot runs":          {"activating", "inactive", false},
-		"gate queued":        {"active", "inactive", false},
-		"gate runs":          {"active", "activating", false},
-		"boot reloading":     {"reloading", "active", false},
-		"boot never started": {"inactive", "failed", true},
+		"both done":             {"active", "active", true},
+		"gate failed":           {"active", "failed", true},
+		"no gate unit":          {"failed", noBootUnit, true},
+		"boot runs":             {"activating", "queued", false},
+		"boot queued":           {"queued", "queued", false},
+		"gate queued":           {"active", "queued", false},
+		"gate runs":             {"active", "activating", false},
+		"gate deactivating":     {"active", "deactivating", false},
+		"boot reloading":        {"reloading", "active", false},
+		"boot never started":    {"inactive", "failed", true},
+		"gate skipped, stopped": {"active", "inactive", true},
+		"both inactive":         {"inactive", "inactive", true},
 	} {
 		var st Status
 		call(t, daemon(e, &fakeHost{boot: c.boot, judge: c.judge}).Handler(), "GET", "/v1/status", nil, &st)
@@ -1258,11 +1262,31 @@ func TestAVerdictTheStateLacksIsReadOffTheJournal(t *testing.T) {
 		t.Fatal(err)
 	}
 	st, _ := j.readState()
-	st.Judged = nil
+	if !st.Judges || st.Judged == nil {
+		t.Fatalf("the state keeps no verdict: %+v", st)
+	}
+	st.Judged, st.Judges = nil, false // as a writer that keeps none rewrites it
 	if err := j.writeState(st); err != nil {
 		t.Fatal(err)
 	}
 	if e, err := j.lastJudged("boot-1"); err != nil || e == nil || e.Verdict != verdictHealthy {
 		t.Errorf("%+v %v", e, err)
+	}
+	// The next append takes the journal's verdict back into the state.
+	if _, err := j.append(Event{Kind: evCertExpiring}); err != nil {
+		t.Fatal(err)
+	}
+	if st, _ := j.readState(); !st.Judges || st.Judged == nil || st.Judged.Verdict != verdictHealthy {
+		t.Errorf("not taken back: %+v", st)
+	}
+	// A state that keeps the verdict is read alone: the journal is not read (here, it cannot be).
+	if err := os.Rename(j.path(), j.path()+".away"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(j.path(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if last, e, err := j.lastOf("boot-1"); err != nil || e == nil || last != 2 {
+		t.Errorf("read the journal: %d %+v %v", last, e, err)
 	}
 }

@@ -269,8 +269,10 @@ JSON
 # its own test CA ($MIRROR_CA) signs for 127.0.0.1 and the address, published on the address
 # (default the loopback); anonymous reads, writes by the account site. Sets MIRROR (host:port) and
 # MIRROR_CONFIG (a Docker config directory holding the site's login, as `docker login` writes).
+# With MIRROR_SIGN_IN=1 it reads nothing anonymously: a read-only account vm, its password made
+# for this run (MIRROR_VM_TOKEN), is the login file MIRROR_VM_LOGIN (one auths entry, 0600).
 start_mirror() {
-	local ip=${1:-127.0.0.1} port code m=$WORK/mirror token
+	local ip=${1:-127.0.0.1} port code m=$WORK/mirror token anonymous='["read"]' users='{ "users": ["site"], "actions": ["read", "create", "update", "delete"] }'
 	MIRROR_CA=$m/ca.pem MIRROR_CONFIG=$WORK/mirror-docker
 	token=$(token)
 	mkdir -p "$m/data" "$MIRROR_CONFIG"
@@ -281,6 +283,11 @@ start_mirror() {
 	openssl x509 -req -in "$m/tls.csr" -CA "$m/ca.pem" -CAkey "$m/ca.key" -CAcreateserial -days 2 -extfile "$m/ext" -out "$m/tls.crt" 2>/dev/null
 	rm -f "$m/ca.key"
 	docker run --rm "$HTPASSWD" htpasswd -nbB site "$token" | grep . >"$m/htpasswd"
+	if [[ -n ${MIRROR_SIGN_IN:-} ]]; then
+		MIRROR_VM_TOKEN=$(token) anonymous='[]' users+=', { "users": ["vm"], "actions": ["read"] }'
+		# The password reaches htpasswd on its standard input, never on a command line.
+		printf '%s\n' "$MIRROR_VM_TOKEN" | docker run --rm -i --entrypoint sh "$HTPASSWD" -ec 'read -r a; printf "%s\n" "$a" | htpasswd -niB vm' | grep . >>"$m/htpasswd"
+	fi
 	cat >"$m/config.json" <<JSON
 {
   "storage": { "rootDirectory": "/etc/zot/data" },
@@ -291,8 +298,8 @@ start_mirror() {
     "accessControl": {
       "repositories": {
         "**": {
-          "anonymousPolicy": ["read"],
-          "policies": [{ "users": ["site"], "actions": ["read", "create", "update", "delete"] }],
+          "anonymousPolicy": $anonymous,
+          "policies": [$users],
           "defaultPolicy": []
         }
       }
@@ -312,6 +319,10 @@ JSON
 	done
 	[[ $code == 200 || $code == 401 ]] || { docker logs "$ZOT_NAME-mirror" >&2; fail "the mirror did not come up (last status $code)"; }
 	printf '{"auths":{"%s":{"auth":"%s"}}}' "$MIRROR" "$(printf 'site:%s' "$token" | base64 -w0)" >"$MIRROR_CONFIG/config.json"
+	if [[ -n ${MIRROR_SIGN_IN:-} ]]; then
+		MIRROR_VM_LOGIN=$WORK/mirror-vm-login.json
+		(umask 077 && printf '{"auths":{"%s":{"auth":"%s"}}}' "$MIRROR" "$(printf 'vm:%s' "$MIRROR_VM_TOKEN" | base64 -w0)" >"$MIRROR_VM_LOGIN")
+	fi
 }
 
 # mirror_referrers <repo> <tag>: how many referrers (signatures) the mirror holds for the manifest a tag

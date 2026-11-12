@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # End-to-end test of a real Kairos VM on a site without internet: the release goes to a TLS mirror
-# of its own CA (`mirror export`, `mirror import`), `vm create --create opentofu` on a TrueNAS host
+# of its own CA that asks for a sign-in (`mirror export`, `mirror import`; the VM's login given by
+# `--registry-login-file` over SSH), `vm create --create opentofu` on a TrueNAS host
 # boots the disk it reads from the mirror, whose first boot installs from the cloud-config, IPv6 on
 # (`--ipv6`: the LAN's IPv6 address, SSH and the front reached over it);
 # its firewall lets SSH in from this host alone (`--ssh-allow`) and the front's ports, and an L4
@@ -135,6 +136,7 @@ grep -q 'disk qcow2: tag .* → beta-1.0.0-qcow2' "$WORK/ship.log" && grep -q 'd
 
 step "the published notes-stow; the site's mirror, TLS of its own CA, on the address the VM reaches this host at"
 vm_ctl beta-1.0.0
+MIRROR_SIGN_IN=1 # the mirror asks every reader for a sign-in: the operator's, the VM's
 vm_mirror
 mirror "$WORK/r1.oci.tar" --disks qcow2
 grep -q '^Exported notes 1.0.0' "$WORK/r1.oci.tar.txt" || { cat "$WORK/r1.oci.tar.txt"; fail "export of 1.0.0"; }
@@ -172,10 +174,10 @@ step "vm create --kit, of Kubernetes's kit: the first install takes the byo cert
 H_MAIN=$H ADDR_MAIN=$ADDR STATE_MAIN=$STATE
 H=$H-kit ADDR=$H.$DOMAIN STATE=$XDG_STATE_HOME/$NAME/vms/$H
 vm_cleanup
-"$CTL" vm create --no-input --platform truenas --create opentofu --hostname "$H" --user ops --ssh-key "$KEY.pub" \
+DOCKER_CONFIG=$MIRROR_CONFIG "$CTL" vm create --no-input --platform truenas --create opentofu --hostname "$H" --user ops --ssh-key "$KEY.pub" \
 	--domains app=app.notes.test,api=api.notes.test --kit "$OP/vm-site.kit" --kit-code-file "$OP/vm-site.code" \
 	--pool "$POOL" --dataset "$DATASET" --bridge "$BRIDGE" --cpus 2 --memory 4096 --disk 16 --host "$ADDR" --wait "${E2E_VM_WAIT:-30m}" \
-	--registry "$SITE" --registry-ca "$MIRROR_CA" \
+	--registry "$SITE" --registry-ca "$MIRROR_CA" --registry-login-file "$MIRROR_VM_LOGIN" \
 	>"$WORK/vm-kit.txt" 2>"$WORK/vm-kit.log" || { tail -80 "$WORK/vm-kit.log"; fail "vm create --kit"; }
 grep -q "^The VM $H runs notes 1.0.0" "$WORK/vm-kit.txt" || { cat "$WORK/vm-kit.txt"; fail "vm create --kit did not report the install"; }
 grep -q 'installing over SSH with ' "$WORK/vm-kit.log" || { tail -30 "$WORK/vm-kit.log"; fail "the kit's material did not go over SSH"; }
@@ -233,10 +235,10 @@ vm_cleanup
 mapfile -t HOST6 < <(ip -6 -o addr show scope global | awk '$2 !~ /^(docker|br-|veth)/ && $0 !~ / (tentative|dadfailed|deprecated) / {sub(/\/.*/, "", $4); print $4}')
 allow=$MIRROR_IP/32
 for a in "${HOST6[@]}"; do allow+=",$a/128"; done
-"$CTL" vm create --no-input --platform truenas --create opentofu --hostname "$H" --user ops --ssh-key "$KEY.pub" \
+DOCKER_CONFIG=$MIRROR_CONFIG "$CTL" vm create --no-input --platform truenas --create opentofu --hostname "$H" --user ops --ssh-key "$KEY.pub" \
 	--tls internal --domains app=app.notes.test,api=api.notes.test --set ADMIN_EMAIL=admin@notes.test --set "DB_SOURCES=$MIRROR_IP/32" \
 	--pool "$POOL" --dataset "$DATASET" --bridge "$BRIDGE" --cpus 2 --memory 4096 --disk 16 --host "$ADDR" --wait "${E2E_VM_WAIT:-30m}" \
-	--registry "$SITE" --registry-ca "$MIRROR_CA" --ssh-allow "$allow" --ipv6 --timezone Europe/Paris \
+	--registry "$SITE" --registry-ca "$MIRROR_CA" --registry-login-file "$MIRROR_VM_LOGIN" --ssh-allow "$allow" --ipv6 --timezone Europe/Paris \
 	>"$WORK/vm-create.txt" 2>"$WORK/vm-create.log" || { tail -80 "$WORK/vm-create.log"; fail "vm create"; }
 grep -q "^The VM $H runs notes 1.0.0" "$WORK/vm-create.txt" || { cat "$WORK/vm-create.txt"; fail "vm create did not report the install"; }
 for f in main.tf variables.tf outputs.tf versions.tf terraform.tfvars.json terraform.tfstate seed.iso; do
@@ -382,9 +384,23 @@ api=$(on_vm sudo docker ps -q --filter label=com.docker.compose.service=api)
 on_vm sudo docker inspect --format "'{{range .Mounts}}{{.Source}}:{{.Destination}}:{{.RW}}{{println}}{{end}}'" "$api" |
 	grep -qx '/run/notes/app:/run/stowage-host:false' || fail "the api service does not mount the app directory read-only"
 
-step "on the VM: the install reads the mirror, whose CA the VM trusts"
+step "on the VM: the install reads the mirror, whose CA the VM trusts, with the login vm create gave over SSH"
 grep -qx "STOWAGE_REGISTRY='$SITE'" "$WORK/vm.env" || fail "the install does not record the mirror"
-on_vm curl -sf -o /dev/null "https://$MIRROR/v2/" || fail "the VM does not trust the mirror's CA"
+# TLS holds (000 would be a certificate refused), and the mirror asks for a sign-in.
+code=$(on_vm curl -s -o /dev/null -w '%{http_code}' "https://$MIRROR/v2/") || true
+[[ $code == 401 ]] || fail "the VM's anonymous read of the mirror answered $code, not 401 (000: the VM does not trust the mirror's CA)"
+code=$(curl -s -o /dev/null -w '%{http_code}' --cacert "$MIRROR_CA" "https://$MIRROR/v2/site/$NAME/$NAME-release/tags/list") || true
+[[ $code == 401 ]] || fail "an anonymous read of the mirror's release repository answered $code, not 401"
+grep -q "giving the VM its login to $MIRROR over SSH" "$WORK/vm-create.log" || { tail -30 "$WORK/vm-create.log"; fail "vm create did not give the login over SSH"; }
+on_vm "${SHORT}-stow" status --json >"$WORK/login-status.json" || fail "status --json"
+jq -e --arg h "$MIRROR" '.registry_login == $h and (has("registry_login_error") | not)' "$WORK/login-status.json" >/dev/null ||
+	{ cat "$WORK/login-status.json"; fail "status --json does not say the VM holds a login for $MIRROR"; }
+[[ $(on_vm sudo stat -c %a "/usr/local/$NAME.registry-login.json") == 600 ]] || fail "the login file on the VM is not root's alone"
+auth=$(printf 'vm:%s' "$MIRROR_VM_TOKEN" | base64 -w0)
+for v in "$MIRROR_VM_TOKEN" "$auth"; do
+	! grep -rqF -- "$v" "$STATE" "$WORK/vm-create.log" "$WORK/vm-create.txt" "$WORK/login-status.json" || fail "the mirror's login is in the VM's state, vm create's output or the status"
+done
+not_on_vm "$MIRROR_VM_TOKEN" /oem
 
 step "the disk: the app's 16 GiB on the persistent partition, Kairos's partitions beside it"
 size=$(on_vm "df -BG --output=size /usr/local | tail -1" | tr -dc 0-9)
@@ -394,7 +410,7 @@ step "vm seed --json from the mirror: a new VM's first-boot material, no VM made
 # shellcheck disable=SC2054 # --domains takes its routes comma-separated
 SEED=(--platform truenas --hostname "$H-seed" --user ops --ssh-key "$KEY.pub" --tls internal --domains app=app.notes.test,api=api.notes.test
 	--set ADMIN_EMAIL=seed@notes.test --set "DB_SOURCES=$MIRROR_IP/32" --registry "$SITE" --registry-ca "$MIRROR_CA")
-"$CTL" vm seed --json "${SEED[@]}" >"$WORK/seed.json" 2>"$WORK/seed.log" || { cat "$WORK/seed.log"; fail "vm seed --json"; }
+DOCKER_CONFIG=$MIRROR_CONFIG "$CTL" vm seed --json "${SEED[@]}" >"$WORK/seed.json" 2>"$WORK/seed.log" || { cat "$WORK/seed.log"; fail "vm seed --json"; }
 # The project's one secret input is optional: no required secret input waits, so waiting is left out.
 jq -se --arg site "$SITE" 'length == 1 and (.[0] | .format == 1 and .platform == "truenas" and
 	(.user_data | startswith("#cloud-config") and contains("seed@notes.test")) and
@@ -411,7 +427,7 @@ jq -r .known_hosts_line "$WORK/seed.json" >"$WORK/seed.known_hosts"
 [[ $(ssh-keygen -y -f "$WORK/seed.key" | awk '{print $1, $2}') == "$(awk '{print $2, $3}' "$WORK/seed.known_hosts")" ]] || fail "the seed's private key is not its known_hosts line's"
 rm -f "$WORK/seed.key"
 seed_token=$(token)
-rc=0; "$CTL" vm seed --json "${SEED[@]}" --set "DEPLOY_TOKEN=$seed_token" >"$WORK/seed2.json" 2>"$WORK/seed2.log" || rc=$?
+rc=0; DOCKER_CONFIG=$MIRROR_CONFIG "$CTL" vm seed --json "${SEED[@]}" --set "DEPLOY_TOKEN=$seed_token" >"$WORK/seed2.json" 2>"$WORK/seed2.log" || rc=$?
 [[ $rc == 3 ]] && grep -q 'DEPLOY_TOKEN: a seed carries no secret input' "$WORK/seed2.log" &&
 	jq -e '.refused.reason | startswith("DEPLOY_TOKEN: a seed carries no secret input")' "$WORK/seed2.json" >/dev/null ||
 	{ cat "$WORK/seed2.log" "$WORK/seed2.json"; fail "vm seed given a secret input exited $rc, not 3 naming it, its refusal one JSON object on standard output"; }
@@ -420,7 +436,7 @@ rc=0; "$CTL" vm seed --json "${SEED[@]}" --set "DEPLOY_TOKEN=$seed_token" >"$WOR
 step "audit off the VM: the operator's notes-stow reads the VM's release's SBOMs from the mirror, by its version alone, and scans them"
 grype_db
 scanner_fresh "$SITE"
-"$CTL" audit --version 1.0.0 --channel beta --registry "$SITE" --registry-ca "$MIRROR_CA" --db "$GRYPE_DB" --json >"$WORK/audit.json" 2>"$WORK/audit.log" ||
+DOCKER_CONFIG=$MIRROR_CONFIG "$CTL" audit --version 1.0.0 --channel beta --registry "$SITE" --registry-ca "$MIRROR_CA" --db "$GRYPE_DB" --json >"$WORK/audit.json" 2>"$WORK/audit.log" ||
 	{ cat "$WORK/audit.log" "$WORK/audit.json"; fail "audit of the VM's release"; }
 [[ $(jq '[.subjects[] | select(.error)] | length' "$WORK/audit.json") == 0 && $(jq '[.subjects[] | select(.name == "os" or .name == "disk-qcow2")] | length' "$WORK/audit.json") == 2 ]] ||
 	{ cat "$WORK/audit.json"; fail "not every artifact of the VM's release was audited"; }
@@ -428,7 +444,7 @@ grep -q "pulling $SITE/notes-audit@" "$WORK/audit.log" || { cat "$WORK/audit.log
 # The mirror carries the qcow2 disk alone: the raw one is left out, not failed.
 grep -q "^disk-raw sha256:[0-9a-f]* is not in $SITE (a mirror carries the shapes and the disk formats its export named): not read$" "$WORK/audit.log" ||
 	{ cat "$WORK/audit.log"; fail "the raw disk the mirror lacks was not left out"; }
-"$CTL" sbom export --version 1.0.0 --channel beta --registry "$SITE" --registry-ca "$MIRROR_CA" "$WORK/sbom" >"$WORK/sbom.txt" 2>&1 || { cat "$WORK/sbom.txt"; fail "sbom export"; }
+DOCKER_CONFIG=$MIRROR_CONFIG "$CTL" sbom export --version 1.0.0 --channel beta --registry "$SITE" --registry-ca "$MIRROR_CA" "$WORK/sbom" >"$WORK/sbom.txt" 2>&1 || { cat "$WORK/sbom.txt"; fail "sbom export"; }
 jq -e '[.artifacts[] | select(.file)] | length > 0 and all(.[]; .error == null)' "$WORK/sbom/index.json" >/dev/null &&
 	jq -e '.spdxVersion' "$WORK/sbom/os.spdx.json" >/dev/null || { cat "$WORK/sbom/index.json"; fail "the exported SBOMs"; }
 # The kernel is its distribution's packages: no SBOM lists it by upstream's version, nor its

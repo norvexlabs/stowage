@@ -903,10 +903,9 @@ func (h *Hostd) status(w http.ResponseWriter, r *http.Request) {
 	}
 	// The boot unit runs the first install: while it runs, a failure recorded before is being
 	// retried; failed with no install written, it failed before writing one.
-	boot, bootErr := h.bootState(r.Context())
-	// The gate runs after the boot unit: ended, and the boot unit not running (one a failed
-	// dependency never started stays inactive), the boot is over.
-	st.BootSettled = h.Docker || (bootErr == nil && !unitRunning(boot) && h.gateDone(r.Context()))
+	boot, bootQueued, bootErr := unitStatus(r.Context(), h.Host, h.R.Spec.Name+".service")
+	// Both the boot unit and the gate, which runs after it, ended: the boot is over.
+	st.BootSettled = h.Docker || (bootErr == nil && unitEnded(boot, bootQueued) && h.gateDone(r.Context()))
 	if err := bootErr; err == nil {
 		switch {
 		case !unitDone(boot):
@@ -926,22 +925,24 @@ func (h *Hostd) status(w http.ResponseWriter, r *http.Request) {
 	}
 	st.FailedBoot = lastFailedBoot(in.O.Dir)
 	st.BootID = h.bootID()
-	if !h.Docker && st.BootID == "" {
+	// One read of the journal: its cursor and this boot's verdict.
+	last, judged, jerr := h.journal().lastOf(st.BootID)
+	if jerr != nil {
+		st.EventsError = fmt.Sprintf("the event journal cannot be read: %v", jerr)
+	} else {
+		st.Events = &last
+	}
+	switch {
+	case h.Docker:
+	case st.BootID == "":
 		st.BootJudgedError = "this boot's id cannot be read: its verdict is not told"
-	} else if !h.Docker {
-		if e, err := h.journal().lastJudged(st.BootID); err != nil {
-			st.BootJudgedError = fmt.Sprintf("the event journal cannot be read: %v", err)
-		} else {
-			st.BootJudged = judgedOf(e)
-		}
+	case jerr != nil:
+		st.BootJudgedError = st.EventsError
+	default:
+		st.BootJudged = judgedOf(judged)
 	}
 	st.RegistryLogin, st.RegistryLoginError = in.heldLoginHost()
 	st.NetworkWarning = h.route6Warning()
-	if a, err := h.journal().since(-1, 0); err != nil {
-		st.EventsError = fmt.Sprintf("the event journal cannot be read: %v", err)
-	} else {
-		st.Events = &a.Last
-	}
 	h.mu.Lock()
 	st.RebootPending = h.rebooting
 	// Read with the job: a restore running holds the mark from its database's swap to its last
@@ -1642,15 +1643,15 @@ func (h *Hostd) judged(ctx context.Context) error {
 // unit with RemainAfterExit), or no such unit.
 func unitDone(st string) bool { return st == "active" || st == "failed" || st == noBootUnit }
 
-// unitRunning reports whether a unit's state is a change under way.
-func unitRunning(st string) bool {
-	return st == "activating" || st == "deactivating" || st == "reloading" || st == "refreshing"
-}
+// unitEnded reports whether a unit of state st, a job queued for it or not, is done with this
+// boot: done (unitDone), or inactive with no job queued — skipped by its condition, stopped,
+// or never started as a dependency of it failed.
+func unitEnded(st string, queued bool) bool { return unitDone(st) || (st == "inactive" && !queued) }
 
 // gateDone reports whether the health gate's unit ran to an end in this boot.
 func (h *Hostd) gateDone(ctx context.Context) bool {
-	st, err := unitState(ctx, h.Host, h.R.Spec.Name+"-health.service")
-	return err == nil && unitDone(st)
+	st, queued, err := unitStatus(ctx, h.Host, h.R.Spec.Name+"-health.service")
+	return err == nil && unitEnded(st, queued)
 }
 
 // noBootUnit is bootState's answer on a host without <name>.service.

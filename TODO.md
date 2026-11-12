@@ -608,15 +608,6 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
 
 ## Could
 
-- **The VM's `boot_settled` never settles when the health gate's unit is skipped or stopped**: it
-  waits for `<name>-health.service` to be active or failed, so a gate unit its condition skipped
-  or an operator stopped (`inactive`, no job queued) keeps `settling` for the boot. Read the
-  unit's queued job (`Job`) and take inactive with none as ended, the boot unit's rule.
-
-- **The VM's status reads the event journal twice before a boot's first verdict**: `lastJudged`
-  falls back to the journal while the state holds no verdict, and `since(-1, 0)` locks it again
-  for the cursor; one read could serve both.
-
 - **e2e-vm's SSH over IPv6 times out now and then**: the VM has its global address and its IPv6
   default route, yet this host's SSH to it times out (`no SSH over IPv6 to …`); 2 runs of 4 on
   2026-11-11 with no code change between them, the address the firewall admits unchanged. Keep

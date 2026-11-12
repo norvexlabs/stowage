@@ -882,9 +882,11 @@ Stowage calls a project's programs: the two never share a reader.
   the install (a rollback's passive boot is never on trial, and answers before its boot unit is
   done), and reading the event journal for the verdict makes it a second reader of a second
   format. So the status carries the boot's state: `boot_settled`, the boot unit and the health
-  gate both ended (the states the daemon already reads to refuse a job during the boot), and
+  gate both ended (active, failed, or inactive with no job queued: a unit skipped, stopped or
+  left by a failed dependency ends too), and
   `boot_judged`, the gate's last `boot.judged` of this boot id, which the journal's state keeps
-  through rotations (a long-lived boot's verdict is never rotated away), a gate that finds no
+  through rotations (a long-lived boot's verdict is never rotated away) and the status reads
+  there alone, never the journal (but once, for a state an older writer left), a gate that finds no
   install journaling `not_installed` so a first install given after it is not a gate that ended
   without a verdict. The verdict records whether the
   gate reboots (`reboots`), and a reboot that fails journals a second verdict saying no reboot
