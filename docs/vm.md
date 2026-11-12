@@ -360,7 +360,8 @@ sudo <short>-stow network attach --role ROLE --mac MAC [--mode dhcp|static|none]
   every 4 KiB, a blank line is kept; the daemon keeps at least a job's last 2000 lines), and fails
   when the job fails or when the daemon's job is another (`status` then tells how it went). Every
   verb that starts a job (`upgrade`, `rollback`, `reset-db`, `backup run`, `backup verify`,
-  `restore`, `secrets rotate`, `secrets set`) follows it this way, telling it from any other by the `started`
+  `restore`, `secrets rotate`, `secrets set`) follows it this way (a daemon that is stopping starts
+  none: 503, `the host daemon is stopping`), telling it from any other by the `started`
   its 202 carries — another job of the same kind and target is another job. Between two reads of
   the log it waits on the event journal from the 202's `events`, so a job's end is seen at once,
   and read from the journal when reading the job again then fails in any way (the daemon gone,
@@ -376,7 +377,7 @@ sudo <short>-stow network attach --role ROLE --mac MAC [--mode dhcp|static|none]
   stops, so it never follows the reboot. It prints `<kind> done: the VM reboots in <drain> s to
   run it — after it, <short>-stow status and <short>-stow events tell how it went`, exits 0 and asks the
   daemon nothing more. The drain is counted down only when `GET job` told the end and the drain
-  is not 0 (a rollback's is): otherwise the line says `the VM reboots to run it`, whatever the
+  is not 0 (a rollback's 5 s included): otherwise the line says `the VM reboots to run it`, whatever the
   next request met (the daemon's absence never tells a reboot under way). A power-off says
   `the VM powers off in <drain> s, and its next start runs it — after that start, …` (`powers
   off` likewise). The reboot's outcome is the event journal's: another boot's
@@ -411,20 +412,31 @@ sudo <short>-stow network attach --role ROLE --mac MAC [--mode dhcp|static|none]
   rollback barrier since the upgrade, or moved past a release that does not read a newer schema,
   naming the snapshot to restore instead). `<short>-stow` shows the release the passive system
   carries, asks to confirm on a terminal (without one, `--yes` is required) and follows the job:
-  after 30 s it marks the boot assessment as after a failed attempt (both variables `yes`), so
-  GRUB boots the fallback entry from then on, and runs `systemctl reboot`; the boot of the
-  passive system takes the install back. When the marks cannot be written, they are put back as
-  they were and the job fails. Once they are written the job ends, `done`, before `systemctl
-  reboot` runs; when the reboot then fails, the job stays `done` and the marks are put back as
-  they were. The journal's `reboot.cancelled` names the job, and its `reason`, like the job's log,
-  says whether putting them back worked: `systemctl reboot failed: <error>: the boot assessment is
-  put back as it was, nothing changed`, or `systemctl reboot failed: <error>; putting the boot
-  assessment back failed too, so the next boot may choose the passive system (<grubenv>):
-  <error>`. `rollback` itself answers from the job's end (exit 0 once it read it), so this is read
-  with `<short>-stow events`. After the 30 s, the checks run again
-  and the install's lock is taken and held to the reboot: a check that no longer passes, or an
-  install, upgrade, rollback, provision, reset-db or service action holding the lock, fails the job
-  before anything is written. It is refused for a release other than the one confirmed.
+  in order:
+  1. after 30 s the checks run again and the install's lock is taken, held to the reboot: a check
+     that no longer passes, an install, upgrade, rollback, provision, reset-db or service action
+     holding the lock, or a boot assessment that cannot be read fails the job (`nothing changed:
+     …`) before anything is written;
+  2. the job ends, `done`, with its reboot 5 s out: `rollback` answers from that end (exit 0 once
+     it read it), so run over SSH it prints its result before the reboot stops its session;
+  3. 5 s later it marks the boot assessment as after a failed attempt (both variables `yes`), so
+     GRUB boots the fallback entry from then on, and runs `systemctl reboot`; the boot of the
+     passive system takes the install back.
+
+  Nothing is marked before step 3: a daemon stopping in the drain fails the job (`nothing changed:
+  the host daemon stopped: …`); one stopping in the 5 s, or as the marks are written, runs no
+  reboot, leaves the next boot as it was and journals `reboot.cancelled` (`the daemon stopped
+  before the reboot`, with whether the marks were put back); one killed before it could is told by
+  its next start in the same boot (`the daemon restarted before it`). Marks written whose partition
+  then stays read-write are written: the reboot runs, the job's log saying `the boot assessment is
+  marked, its partition left read-write (<error>)`.
+  When the marks cannot be written, or the reboot fails, they are put back as they were and the
+  job stays `done`: the journal's `reboot.cancelled` names the job, and its `reason`, like the
+  job's log, says whether putting them back worked — `marking the boot assessment failed: <error>`
+  or `systemctl reboot failed: <error>`, then `: the boot assessment is put back as it was,
+  nothing changed`, `: the boot assessment is put back as it was, its partition left read-write
+  (<error>)`, or `; putting the boot assessment back failed too, so the next boot may choose the
+  passive system (<grubenv>): <error>` — read with `<short>-stow events`. It is refused for a release other than the one confirmed.
 - `health` answers whether the install is ready, as the health gate judges it (every service up,
   the health provider's answer); not ready, it fails with the reason. A probe of a service (the
   `http-json` and `http-status` health providers, the disk-pressure POST) reaches it at its
@@ -860,7 +872,7 @@ sudo <short>-stow network attach --role ROLE --mac MAC [--mode dhcp|static|none]
     `result` (done: what the job found, `GET job`'s `result` — `backup-verify`'s message),
     `reboot` (`{"action", "drain_secs"}`: the reboot the job scheduled as its last step — an
     upgrade's, `{"action": "reboot", "drain_secs": 30}`, a rollback's, `{"action": "reboot",
-    "drain_secs": 0}`; absent when it scheduled none). A job that reboots at its end journals its
+    "drain_secs": 5}`; absent when it scheduled none). A job that reboots at its end journals its
     `reboot.scheduled` and its `job.ended` (done) in one append, in that order, so a long poll
     answers both or neither; both are written before the job's `state` reads `done` in `GET job`,
     and before the reboot runs, so a shutdown that stops the daemon never leaves that job without

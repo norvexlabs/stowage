@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -160,13 +161,15 @@ func TestRollbackChoosesThePassiveSystemThenReboots(t *testing.T) {
 	if !strings.Contains(log, "the database is at 6; 1.0.0 reads past the newer migrations") || !strings.Contains(log, "a run would go back") {
 		t.Errorf("the checks are not in the log: %s", log)
 	}
-	if v := assessOf(t, d); v[assessEnable] != "yes" || v[assessTentative] != "yes" {
-		t.Errorf("the next boot does not choose the passive system: %v", v)
-	}
 	var st Status
 	call(t, hh, "GET", "/v1/status", nil, &st)
 	if !st.RebootPending {
 		t.Error("no reboot pending")
+	}
+	// The job ends the grace before its marks and its reboot.
+	waitCall(t, host, "systemctl reboot")
+	if v := assessOf(t, d); v[assessEnable] != "yes" || v[assessTentative] != "yes" {
+		t.Errorf("the next boot does not choose the passive system: %v", v)
 	}
 	calls := fmt.Sprint(host.calls())
 	if !strings.Contains(calls, "systemctl reboot") || strings.Index(calls, "grub2-editenv") > strings.Index(calls, "systemctl reboot") {
@@ -181,6 +184,134 @@ func TestRollbackChoosesThePassiveSystemThenReboots(t *testing.T) {
 	// The boot of the passive system goes back; the daemon changes nothing of the install.
 	if read(t, filepath.Join(e.dir, ".env")) != before {
 		t.Error("the daemon changed the install")
+	}
+}
+
+// A daemon stopping in a rollback's grace, the job ended, writes no mark and runs no reboot, and
+// journals that the reboot does not come before Serve returns (a shutdown has no later start to
+// tell it): the next boot is as it was, and the install's lock is released.
+func TestARollbackWhoseDaemonStopsInItsGraceArmsNothing(t *testing.T) {
+	t.Parallel()
+	e, d, host := upgradedVM(t)
+	reached, release := make(chan struct{}), make(chan struct{})
+	d.onWait = func(what string) {
+		if what == "reboot grace" {
+			close(reached)
+			<-release
+		}
+	}
+	boots(t, d, "active", map[string]string{assessEnable: "no", assessTentative: "no"})
+	dir, err := os.MkdirTemp("", "hostd") // a unix socket's path is bounded
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	sock := filepath.Join(dir, "run", "host.sock")
+	ctx, stop := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- d.Serve(ctx, sock) }()
+	waitSocket(t, sock)
+	if out, err := ctl(e, sock, "rollback", "--yes"); err != nil {
+		t.Fatalf("%v\n%s", err, out)
+	}
+	<-reached
+	stop()
+	select {
+	case err := <-done:
+		t.Fatalf("Serve returned before the rollback in its grace ended: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if e := ofKind(held(t, d.O.Dir), evRebootCancelled); len(e) != 1 || e[0].Reason != "the daemon stopped before the reboot: nothing changed" {
+		t.Errorf("the reboot.cancelled %+v", e)
+	}
+	if calls := fmt.Sprint(host.calls()); strings.Contains(calls, "grub2-editenv") || strings.Contains(calls, "systemctl reboot") {
+		t.Errorf("a stopped daemon armed its reboot: %s", calls)
+	}
+	if v := assessOf(t, d); v[assessEnable] != "no" || v[assessTentative] != "no" {
+		t.Errorf("the marks changed: %v", v)
+	}
+	unlock, err := lockFile(filepath.Join(d.O.Dir, lifecycleLock))
+	if err != nil {
+		t.Fatalf("the lock is held after the stop: %v", err)
+	}
+	unlock()
+}
+
+// Marks written whose partition stays read-write are written: the reboot runs, the job's log
+// telling the partition's state.
+func TestARollbackWhosePartitionStaysWritableReboots(t *testing.T) {
+	t.Parallel()
+	_, d, host := upgradedVM(t)
+	host.roErr = fmt.Errorf("busy")
+	boots(t, d, "active", map[string]string{assessEnable: "no", assessTentative: "no"})
+	hh := d.Handler()
+	if code := call(t, hh, "POST", "/v1/rollback", RollbackRequest{}, nil); code != 202 {
+		t.Fatalf("%d", code)
+	}
+	waitCall(t, host, "systemctl reboot")
+	if v := assessOf(t, d); v[assessEnable] != "yes" || v[assessTentative] != "yes" {
+		t.Errorf("the marks are not kept for the reboot: %v", v)
+	}
+	if j := waitJob(t, hh); !strings.Contains(strings.Join(j.Log, "\n"), "the boot assessment is marked, its partition left read-write") {
+		t.Errorf("%v", j.Log)
+	}
+	if e := ofKind(held(t, d.O.Dir), evRebootCancelled); len(e) != 0 {
+		t.Errorf("cancelled: %+v", e)
+	}
+}
+
+// A stop that comes as the marks are written runs no reboot: the marks are put back.
+func TestARollbackStoppedAsItMarksPutsThemBack(t *testing.T) {
+	t.Parallel()
+	_, d, host := upgradedVM(t)
+	ctx, stop := context.WithCancel(context.Background())
+	d.ctx = ctx
+	host.onEdit = func(vars []string) {
+		if slices.Contains(vars, assessEnable+"=yes") {
+			stop()
+		}
+	}
+	boots(t, d, "active", map[string]string{assessEnable: "no", assessTentative: "no"})
+	hh := d.Handler()
+	if code := call(t, hh, "POST", "/v1/rollback", RollbackRequest{}, nil); code != 202 {
+		t.Fatalf("%d", code)
+	}
+	if e := waitEvent(t, d.O.Dir, evRebootCancelled); e.Reason != "the daemon stopped before the reboot: the boot assessment is put back as it was, nothing changed" {
+		t.Errorf("the reboot.cancelled's reason %q", e.Reason)
+	}
+	if strings.Contains(fmt.Sprint(host.calls()), "systemctl reboot") {
+		t.Errorf("a stopped daemon rebooted: %v", host.calls())
+	}
+	if v := assessOf(t, d); v[assessEnable] != "no" || v[assessTentative] != "no" {
+		t.Errorf("the marks are not put back: %v", v)
+	}
+}
+
+// A stopping daemon starts no job: a rollback asked then is refused, never counted after Serve's
+// wait began.
+func TestAStoppingDaemonStartsNoJob(t *testing.T) {
+	t.Parallel()
+	_, d, host := upgradedVM(t)
+	d.mu.Lock()
+	d.stopping = true
+	d.mu.Unlock()
+	var body map[string]any
+	if code := call(t, d.Handler(), "POST", "/v1/rollback", RollbackRequest{}, &body); code != http.StatusServiceUnavailable || !strings.Contains(fmt.Sprint(body), "the host daemon is stopping") {
+		t.Fatalf("%d %v", code, body)
+	}
+	if strings.Contains(fmt.Sprint(host.calls()), "grub2-editenv") {
+		t.Errorf("a refused rollback wrote: %v", host.calls())
+	}
+	waited := make(chan struct{})
+	go func() { d.rollbacks.Wait(); close(waited) }()
+	select { // nothing counted
+	case <-waited:
+	case <-time.After(time.Second):
+		t.Fatal("a refused rollback was counted")
 	}
 }
 
@@ -313,7 +444,9 @@ func TestAFailedRollbackPutsTheMarksBack(t *testing.T) {
 			"systemctl reboot failed: inhibited: the boot assessment is put back as it was", true},
 		"reboot, the marks kept": {func(h *fakeHost) { h.rebootErr, h.editAfterReboot = fmt.Errorf("inhibited"), fmt.Errorf("read-only") }, "done",
 			"systemctl reboot failed: inhibited; putting the boot assessment back failed too, so the next boot may choose the passive system", false},
-		"read-only again": {func(h *fakeHost) { h.roErr = fmt.Errorf("busy") }, "failed", "", true},
+		// The marks put back, the partition alone left read-write: said so, not as a failure.
+		"reboot, read-only again": {func(h *fakeHost) { h.rebootErr, h.roErr = fmt.Errorf("inhibited"), fmt.Errorf("busy") }, "done",
+			"systemctl reboot failed: inhibited: the boot assessment is put back as it was, its partition left read-write (remounting", true},
 	} {
 		_, d, host := upgradedVM(t)
 		c.set(host)

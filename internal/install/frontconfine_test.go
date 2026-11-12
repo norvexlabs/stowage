@@ -469,7 +469,7 @@ func TestTheFrontsFilesAreReadableByItsUser(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(e.dir, ClientCADir), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Chmod(filepath.Join(e.dir, ClientCADir), 0o700); err != nil {
+	if err := os.Chmod(filepath.Join(e.dir, ClientCADir), 0o700); err != nil { // a directory
 		t.Fatal(err)
 	}
 	in := e.installer(nil)

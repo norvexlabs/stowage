@@ -197,8 +197,7 @@ func TestTestReleaseKeyIsItsPublicKeysPair(t *testing.T) {
 	testutil.Write(t, root, "keys/test.pub", string(theRun.PEM))
 	testutil.Edit(t, root, "stowage.yaml", "images:", "signing: { provider: cosign-key, key: env://PROJECT_KEY, public_keys: [keys/release.pub] }\nimages:")
 	cosign := filepath.Join(t.TempDir(), "cosign")
-	testutil.Write(t, filepath.Dir(cosign), "cosign", "#!/bin/sh\n[ \"$1\" = public-key ] && cat \"$FAKE_PUB\"\nexit 0\n")
-	if err := os.Chmod(cosign, 0o755); err != nil {
+	if err := testutil.WriteExecutable(cosign, []byte("#!/bin/sh\n[ \"$1\" = public-key ] && cat \"$FAKE_PUB\"\nexit 0\n")); err != nil {
 		t.Fatal(err)
 	}
 	b := &randomBuilder{}

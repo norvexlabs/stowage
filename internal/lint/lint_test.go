@@ -1229,8 +1229,7 @@ func TestGitInNamedBuildContext(t *testing.T) {
 // A scheme that cannot answer is reported once, against the scheme.
 func TestFailingSchemeReportedOnce(t *testing.T) {
 	root := testutil.CopyExample(t, "minimal")
-	testutil.Write(t, root, "scheme.sh", "#!/bin/sh\nexit 1\n")
-	if err := os.Chmod(filepath.Join(root, "scheme.sh"), 0o755); err != nil {
+	if err := testutil.WriteExecutable(filepath.Join(root, "scheme.sh"), []byte("#!/bin/sh\nexit 1\n")); err != nil {
 		t.Fatal(err)
 	}
 	testutil.Edit(t, root, specFile, "scheme: { provider: semver }", "scheme: { provider: command, cmd: [./scheme.sh] }")

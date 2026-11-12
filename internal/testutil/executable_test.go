@@ -10,9 +10,28 @@ import (
 	"testing"
 )
 
-// executableWrite is a test writing a file executable with os.WriteFile: a program it runs, which a
-// child another goroutine forks may hold open for writing as it is run (ETXTBSY).
-var executableWrite = regexp.MustCompile(`os\.WriteFile\([^\n]*, 0o7[0-7][0-7]\)`)
+// executableWrite is a test writing a file with os.WriteFile, and executableChmod one changing a
+// mode with os.Chmod: either with an execute bit makes a program the test runs, which a child
+// another goroutine forks may hold open for writing as it is run (ETXTBSY). A directory's chmod
+// says so in a `// a directory` comment.
+var (
+	executableWrite = regexp.MustCompile(`os\.WriteFile\([^\n]*, (0o?[0-7]+)\)`)
+	executableChmod = regexp.MustCompile(`os\.Chmod\([^\n]*, (0o?[0-7]+)\)`)
+)
+
+// makesExecutable reports whether line writes or chmods a file with an execute bit.
+func makesExecutable(line string) bool {
+	if m := executableWrite.FindStringSubmatch(line); m != nil && execBits(m[1]) {
+		return true
+	}
+	m := executableChmod.FindStringSubmatch(line)
+	return m != nil && execBits(m[1]) && !strings.Contains(line, "// a directory")
+}
+
+func execBits(lit string) bool {
+	mode, err := strconv.ParseUint(strings.TrimPrefix(lit, "0o"), 8, 32)
+	return err == nil && mode&0o111 != 0
+}
 
 // No test writes a program it runs with os.WriteFile: WriteExecutable writes it.
 func TestNoTestWritesAProgramWithWriteFile(t *testing.T) {
@@ -34,7 +53,7 @@ func TestNoTestWritesAProgramWithWriteFile(t *testing.T) {
 			return err
 		}
 		for i, line := range strings.Split(string(b), "\n") {
-			if executableWrite.MatchString(line) {
+			if makesExecutable(line) {
 				found = append(found, p+":"+strconv.Itoa(i+1))
 			}
 		}

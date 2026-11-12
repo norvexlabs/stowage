@@ -1312,7 +1312,7 @@ func TestTheVolumeScripts(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := os.Chmod(v, 0o750); err != nil {
+	if err := os.Chmod(v, 0o750); err != nil { // a directory
 		t.Fatal(err)
 	}
 	archive := run(archiveScript, nil)
@@ -1332,7 +1332,7 @@ func TestTheVolumeScripts(t *testing.T) {
 	// Since the backup: a file gone, one new, the root's mode changed.
 	_ = os.Remove(filepath.Join(v, "keep.txt"))
 	_ = os.WriteFile(filepath.Join(v, "later.txt"), nil, 0o600)
-	_ = os.Chmod(v, 0o755)
+	_ = os.Chmod(v, 0o755) // a directory
 	// A leftover of an earlier restore's former data goes as the archive is staged; an archive
 	// holding the restore's own names never extracts them.
 	_ = os.MkdirAll(filepath.Join(v, restoreReplaced), 0o755)
@@ -1381,7 +1381,7 @@ func TestTheVolumeScripts(t *testing.T) {
 		t.Errorf("root mode %v", fi.Mode().Perm())
 	}
 	// An empty archive (a volume never created at the backup) empties it, its root's mode kept.
-	_ = os.Chmod(v, 0o700)
+	_ = os.Chmod(v, 0o700) // a directory
 	var empty bytes.Buffer
 	_ = tar.NewWriter(&empty).Close()
 	run(stageScript, &empty)

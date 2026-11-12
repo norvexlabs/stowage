@@ -116,7 +116,8 @@ type Hostd struct {
 	Docker  bool
 	DiskDir string
 
-	// held is the install's lock a rollback keeps to its reboot.
+	// held is the install's lock a rollback keeps to its reboot: the daemon holds it so the
+	// collector never closes its file, which would release it, before the reboot.
 	held      func()
 	mu        sync.Mutex
 	job       *job
@@ -165,6 +166,11 @@ type Hostd struct {
 	backingUp atomic.Bool
 	// backups counts the backups running: Serve waits for them to clean up as it stops.
 	backups sync.WaitGroup
+	// rollbacks counts the rollbacks running, each counted under mu as its job is claimed: Serve
+	// waits for one stopped in its grace to journal that its reboot does not come. stopping, under
+	// mu, refuses every job once Serve stops, so no rollback is counted once it waits.
+	rollbacks sync.WaitGroup
+	stopping  bool
 	// pressMu guards lastPost, the disk-pressure watch's last POST.
 	pressMu  sync.Mutex
 	lastPost *PressurePost
@@ -440,7 +446,13 @@ var serviceName = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}$`)
 // path, which those services mount: any process may connect to it, and every request carries the
 // install's token (AppHandler).
 func (h *Hostd) Serve(ctx context.Context, path string) error {
+	// The daemon's own: whatever ends Serve (the stop, a server failing) stops what runs on.
+	ctx, stopAll := context.WithCancel(ctx)
+	defer stopAll()
 	h.ctx = ctx
+	h.mu.Lock()
+	h.stopping = false
+	h.mu.Unlock()
 	h.startJournal()
 	gid := -1
 	if h.Group != "" {
@@ -530,20 +542,26 @@ func (h *Hostd) Serve(ctx context.Context, path string) error {
 			}
 		}
 	}
+	h.mu.Lock()
+	h.stopping = true
+	h.mu.Unlock()
+	stopAll()   // a rollback in its grace ends with it, its cancel journaled
 	stopWatch() // a check under way ends with it: no banner or log after Serve returns
 	<-watched
 	<-servicesWatched
 	// A backup cut off by the stop removes its runner and the object it left (each within
-	// rcloneTimeout) and records its failure: the daemon waits for it, up to backupStopWait.
+	// rcloneTimeout) and records its failure, and a rollback stopped in its grace journals its
+	// reboot's cancel: the daemon waits for them, up to backupStopWait.
 	done := make(chan struct{})
 	go func() {
 		h.backups.Wait()
+		h.rollbacks.Wait()
 		close(done)
 	}()
 	select {
 	case <-done:
 	case <-time.After(backupStopWait):
-		h.O.logf("a backup did not finish its cleanup within %s", backupStopWait)
+		h.O.logf("a backup or a rollback did not finish within %s", backupStopWait)
 	}
 	return first
 }
@@ -1654,6 +1672,8 @@ func (h *Hostd) claimJob(kind, target string, guard func() error) (*job, error) 
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	switch {
+	case h.stopping:
+		return nil, fail(http.StatusServiceUnavailable, "the host daemon is stopping")
 	case h.rebooting:
 		return nil, fail(http.StatusConflict, "a reboot is scheduled")
 	case h.job != nil && h.job.State == "running":
@@ -2078,7 +2098,7 @@ func (h *Hostd) power(w http.ResponseWriter, r *http.Request, action string) {
 // before the job ends. Both the scheduling and a systemctl that fails are journaled; the job's
 // end stands when its reboot then fails.
 func (h *Hostd) schedule(action string, drain int, idle bool, by *job, note string) error {
-	if err := h.claimReboot(idle); err != nil {
+	if err := h.claimReboot(idle, nil); err != nil {
 		return err
 	}
 	if by != nil {
@@ -2089,24 +2109,32 @@ func (h *Hostd) schedule(action string, drain int, idle bool, by *job, note stri
 	} else {
 		h.event(h.scheduledEvent(action, drain, nil))
 	}
-	time.AfterFunc(time.Duration(drain)*cmp.Or(h.Unit, time.Second), func() {
+	time.AfterFunc(time.Duration(drain)*h.unit(), func() {
 		if _, err := h.Host.Run(h.ctx, Cmd{Args: []string{"systemctl", action}}); err != nil {
 			reason := fmt.Sprintf("systemctl %s failed: %v", action, err)
 			h.O.logf("%s", reason)
 			if by != nil {
 				h.logf(by, "%s: the system keeps running", reason)
 			}
-			h.mu.Lock()
-			h.rebooting = false
-			h.rebootGen++
-			h.mu.Unlock()
+			h.unclaimReboot()
 			h.rebootCancelled(action, reason, by)
 		}
 	})
 	return nil
 }
 
-func (h *Hostd) claimReboot(idle bool) error {
+// unclaimReboot gives back a reboot claimed that does not come: jobs start again, and the daemon
+// drops its hold on the install's lock (released by its holder before).
+func (h *Hostd) unclaimReboot() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.rebooting, h.held = false, nil
+	h.rebootGen++
+}
+
+// claimReboot claims the one reboot (idle: refused while a job runs), the daemon holding hold (a
+// rollback's lock on the install; nil for none) with it until unclaimReboot.
+func (h *Hostd) claimReboot(idle bool, hold func()) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.rebooting {
@@ -2115,7 +2143,7 @@ func (h *Hostd) claimReboot(idle bool) error {
 	if idle && h.job != nil && h.job.State == "running" {
 		return fail(http.StatusConflict, "a job (%s) is running: wait for it to finish", h.job.Kind)
 	}
-	h.rebooting = true
+	h.rebooting, h.held = true, hold
 	h.rebootGen++
 	return nil
 }

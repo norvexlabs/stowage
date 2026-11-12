@@ -281,8 +281,7 @@ func TestCheckout(t *testing.T) {
 		t.Fatal(err)
 	}
 	// A failing post-checkout hook fails the checkout, and leaves nothing.
-	testutil.Write(t, filepath.Join(dir, ".git", "hooks"), "post-checkout", "#!/bin/sh\nexit 1\n")
-	if err := os.Chmod(filepath.Join(dir, ".git", "hooks", "post-checkout"), 0o755); err != nil {
+	if err := testutil.WriteExecutable(filepath.Join(dir, ".git", "hooks", "post-checkout"), []byte("#!/bin/sh\nexit 1\n")); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, err := r.Checkout(full); err == nil {

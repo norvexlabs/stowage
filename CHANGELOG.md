@@ -39,6 +39,15 @@ follow [SemVer](https://semver.org/).
 - Lint counts an input a handoff's `run` or `check` lists in its `env` as read: it no longer warns
   that nothing reads it.
 
+### Fixed
+
+- A VM's `rollback` ends its job 5 s before it marks the boot assessment and runs `systemctl
+  reboot`, so the verb run on the VM over SSH prints its result (`--json`'s Result included)
+  before the reboot stops the session; nothing is marked while it waits, so a host daemon stopping
+  then leaves the next boot as it was. A mark that cannot be written is now a `reboot.cancelled`
+  after the job's end, as a failed reboot is; the journal's `reboot.scheduled` and `job.ended`
+  name the 5 s.
+
 ## [0.35.0] - 2026-11-12
 
 ### Added

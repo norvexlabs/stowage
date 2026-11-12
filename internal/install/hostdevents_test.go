@@ -300,10 +300,10 @@ func TestAJobAndItsRebootAreJournaled(t *testing.T) {
 	if !start.Job.Equal(*j.Started) || start.JobKind != "rollback" || start.Target != j.Target || start.BootID != "boot-1" {
 		t.Errorf("job.started %+v, job %+v", start, j)
 	}
-	if sched.Action != "reboot" || sched.By == nil || !sched.By.Equal(*j.Started) || sched.DrainSecs == nil || *sched.DrainSecs != 0 || sched.BootID != "boot-1" {
+	if sched.Action != "reboot" || sched.By == nil || !sched.By.Equal(*j.Started) || sched.DrainSecs == nil || *sched.DrainSecs != rebootGrace || sched.BootID != "boot-1" {
 		t.Errorf("reboot.scheduled %+v", sched)
 	}
-	if !end.Job.Equal(*j.Started) || end.State != "done" || end.Error != "" || end.JobKind != "rollback" || end.Reboot == nil || *end.Reboot != (EventReboot{"reboot", 0}) {
+	if !end.Job.Equal(*j.Started) || end.State != "done" || end.Error != "" || end.JobKind != "rollback" || end.Reboot == nil || *end.Reboot != (EventReboot{"reboot", rebootGrace}) {
 		t.Errorf("job.ended %+v", end)
 	}
 	if cancelled.Action != "reboot" || cancelled.Reason != "systemctl reboot failed: inhibited: the boot assessment is put back as it was, nothing changed" || cancelled.By == nil || !cancelled.By.Equal(*j.Started) {
@@ -422,20 +422,19 @@ func TestARollbackStoppedByItsRebootIsNotLost(t *testing.T) {
 	if code := call(t, hh, "POST", "/v1/rollback", RollbackRequest{}, nil); code != 202 {
 		t.Fatalf("%d", code)
 	}
-	for range 2000 {
-		if strings.Contains(fmt.Sprint(host.calls()), "systemctl reboot") {
-			break
-		}
-		time.Sleep(time.Millisecond)
-	}
-	if !strings.Contains(fmt.Sprint(host.calls()), "systemctl reboot") {
-		t.Fatalf("no reboot: %v", host.calls())
-	}
+	waitCall(t, host, "systemctl reboot")
 	// systemctl reboot has not returned: the shutdown stops the daemon here. The job's end is
 	// journaled already.
 	end := ofKind(held(t, d.O.Dir), evJobEnded)
-	if len(end) != 1 || end[0].State != "done" || end[0].JobKind != "rollback" || end[0].Reboot == nil || *end[0].Reboot != (EventReboot{"reboot", 0}) {
+	if len(end) != 1 || end[0].State != "done" || end[0].JobKind != "rollback" || end[0].Reboot == nil || *end[0].Reboot != (EventReboot{"reboot", rebootGrace}) {
 		t.Fatalf("job.ended before the reboot: %+v", end)
+	}
+	// The reboot runs the grace after the end: a client following the job prints it first.
+	host.mu.Lock()
+	gap := host.rebootAt.Sub(end[0].At)
+	host.mu.Unlock()
+	if gap < time.Duration(rebootGrace)*d.Unit {
+		t.Errorf("the reboot ran %v after the job's end, before its grace", gap)
 	}
 	// The next boot's daemon finds nothing lost.
 	next := daemon(e, &fakeHost{})

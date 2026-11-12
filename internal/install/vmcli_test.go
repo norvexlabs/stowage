@@ -46,16 +46,22 @@ func served(t *testing.T, h *Hostd) string {
 			t.Error(err)
 		}
 	})
-	// Ready once a connection is taken, not once something is at the socket's path.
+	waitSocket(t, sock)
+	return sock
+}
+
+// waitSocket waits for a daemon serving on sock: ready once a connection is taken, not once
+// something is at the socket's path.
+func waitSocket(t *testing.T, sock string) {
+	t.Helper()
 	for range 2000 {
 		if c, err := net.Dial("unix", sock); err == nil {
 			c.Close()
-			return sock
+			return
 		}
 		time.Sleep(time.Millisecond)
 	}
 	t.Fatal("the daemon did not start")
-	return ""
 }
 
 // ctl runs the VM's <short>-stow of e with args against the daemon on sock.
@@ -573,12 +579,13 @@ func TestRollbackOverTheSocketAsksThenFollowsTheJob(t *testing.T) {
 		t.Fatalf("%v\n%s", err, out)
 	}
 	for _, want := range []string{"the passive system carries notes 1.0.0 (revision 1); the install runs 2.0.0 (revision 1)",
-		"rebooting into the passive system in 30 s",
-		"rollback done: the VM reboots to run it — after it, `notes-stow status` and `notes-stow events` tell how it went"} {
+		"rebooting into the passive system in 35 s",
+		"rollback done: the VM reboots in 5 s to run it — after it, `notes-stow status` and `notes-stow events` tell how it went"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("no %q in\n%s", want, out)
 		}
 	}
+	waitCall(t, host, "systemctl reboot")
 	if v := assessOf(t, d); v[assessTentative] != "yes" {
 		t.Errorf("%v", v)
 	}
@@ -605,9 +612,10 @@ func TestAVerbEndsAtItsJobsReboot(t *testing.T) {
 		err  string // in the error; empty: success
 	}{
 		"upgrade":                     {verb: "upgrade", action: "reboot", drain: 30, want: "upgrade done: the VM reboots in 30 s to run it" + after},
-		"rollback":                    {verb: "rollback", action: "reboot", want: "rollback done: the VM reboots to run it" + after},
+		"rollback":                    {verb: "rollback", action: "reboot", drain: rebootGrace, want: "rollback done: the VM reboots in 5 s to run it" + after},
+		"no drain":                    {verb: "upgrade", action: "reboot", want: "upgrade done: the VM reboots to run it" + after},
 		"upgrade, from its entry":     {verb: "upgrade", action: "reboot", drain: 30, then: "gone", want: "upgrade done: the VM reboots to run it" + after},
-		"rollback, from its entry":    {verb: "rollback", action: "reboot", then: "gone", want: "rollback done: the VM reboots to run it" + after},
+		"rollback, from its entry":    {verb: "rollback", action: "reboot", drain: rebootGrace, then: "gone", want: "rollback done: the VM reboots to run it" + after},
 		"from its entry, then a 5xx":  {verb: "upgrade", action: "reboot", drain: 30, then: "5xx", want: "upgrade done: the VM reboots to run it" + after},
 		"from its entry, then garble": {verb: "upgrade", action: "reboot", drain: 30, then: "garbled", want: "upgrade done: the VM reboots to run it" + after},
 		"a power-off":                 {verb: "upgrade", action: "poweroff", drain: 30, want: "upgrade done: the VM powers off in 30 s, and its next start runs it — after that start"},
@@ -749,10 +757,10 @@ func TestARollbackEndsAtItsRebootEvenOneThatFails(t *testing.T) {
 	host.rebootErr = errors.New("inhibited")
 	sock := served(t, d)
 	out, err := ctl(e, sock, "rollback", "--yes")
-	if err != nil || !strings.Contains(out, "rollback done: the VM reboots to run it") {
+	if err != nil || !strings.Contains(out, "rollback done: the VM reboots in 5 s to run it") {
 		t.Fatalf("%v\n%s", err, out)
 	}
-	if j := waitJob(t, d.Handler()); j.State != "done" || j.Reboot == nil || *j.Reboot != (EventReboot{"reboot", 0}) {
+	if j := waitJob(t, d.Handler()); j.State != "done" || j.Reboot == nil || *j.Reboot != (EventReboot{"reboot", rebootGrace}) {
 		t.Errorf("%+v", j)
 	}
 	// The failed reboot is journaled after the job's end; the test ends once it is.

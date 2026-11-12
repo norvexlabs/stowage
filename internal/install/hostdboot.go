@@ -188,6 +188,9 @@ func (h *Hostd) rollback(w http.ResponseWriter, r *http.Request) {
 		if err := in.volumesSplit(); err != nil {
 			return failAs(http.StatusConflict, err)
 		}
+		// Counted as the job is claimed (under mu, after claimJob's stopping check; nothing
+		// after this guard fails the claim): Serve's wait never misses it.
+		h.rollbacks.Add(1)
 		return nil
 	})
 	if err != nil {
@@ -195,6 +198,7 @@ func (h *Hostd) rollback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	go func() {
+		defer h.rollbacks.Done()
 		for _, l := range strings.Split(strings.TrimSpace(checks.String()), "\n") {
 			if l != "" {
 				h.logf(j, "%s", l)
@@ -207,22 +211,28 @@ func (h *Hostd) rollback(w http.ResponseWriter, r *http.Request) {
 	accepted(w, j)
 }
 
+// rebootGrace is the wait, in Unit, between a rollback's end and its marks and `systemctl reboot`.
+const rebootGrace = 5
+
 // rollbackDrain is the wait, in Unit, before a rollback reboots.
 const rollbackDrain = 30
 
-// toPassive reboots into the passive system after the drain: the boot assessment is marked as
-// after a failed attempt right before `systemctl reboot`, so nothing is armed while the job waits.
-// When the marks cannot be written whole, they are put back as they were — a later reboot must
-// not go back unasked — and the error fails the job. Once they are written, the job ends, done
-// with its reboot (endRebooting), before `systemctl reboot` runs, and toPassive answers nil: when
-// the reboot then fails, the marks are put back, and the job's log and a reboot.cancelled by the
-// job tell it, saying whether putting them back worked; the job's end stands.
+// toPassive reboots into the passive system after the drain. Once the checks pass again and the
+// install's lock is taken, the job ends, done with its reboot rebootGrace out (endRebooting), so a
+// client following the job (`rollback` run on the VM over SSH) reads its end and prints its Result
+// before the shutdown stops its session. Only then are the boot assessment's marks written (as
+// after a failed attempt), right before `systemctl reboot`: nothing is armed while the job or the
+// grace waits, so a daemon stopping or dying meanwhile leaves the next boot as it was (a start in
+// this boot journals the reboot as not come, recoverEvents). When the marks cannot be written
+// whole, or the reboot fails, they are put back as they were — a later reboot must not go back
+// unasked — and the job's log and a reboot.cancelled by the job tell it, saying whether putting
+// them back worked; the job's end stands.
 func (h *Hostd) toPassive(j *job, p RollbackPlan) error {
-	h.logf(j, "rebooting into the passive system in %d s: the boot goes back to %s", rollbackDrain, p.To)
+	h.logf(j, "rebooting into the passive system in %d s: the boot goes back to %s", rollbackDrain+rebootGrace, p.To)
 	select {
 	case <-h.ctx.Done():
-		return h.ctx.Err()
-	case <-time.After(time.Duration(rollbackDrain) * cmp.Or(h.Unit, time.Second)):
+		return fmt.Errorf("nothing changed: the host daemon stopped: %w", h.ctx.Err())
+	case <-time.After(time.Duration(rollbackDrain) * h.unit()):
 	}
 	// The plan again, as a run during the drain may have changed what it found.
 	if again, err := h.plan(h.ctx, io.Discard); err != nil {
@@ -240,45 +250,65 @@ func (h *Hostd) toPassive(j *job, p RollbackPlan) error {
 	if err != nil {
 		return err
 	}
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(h.ctx), time.Minute)
-	defer cancel()
+	// The marks as they are, read before the job ends: one that cannot be read fails the job.
 	a := h.assessment()
 	was, err := a.read()
 	if err != nil {
 		unlock()
-		return err
+		return fmt.Errorf("nothing changed: the boot assessment: %w", err)
 	}
-	back := func(err error) error {
-		defer unlock()
+	if err := h.claimReboot(false, unlock); err != nil {
+		unlock()
+		return fmt.Errorf("nothing changed: %w", err)
+	}
+	h.endRebooting(j, "reboot", rebootGrace)
+	// cancelled ends the reboot that does not come: the lock released, the reboot unclaimed, the
+	// job's log and the journal told why.
+	cancelled := func(reason string) error {
+		unlock()
+		h.unclaimReboot()
+		h.O.logf("the rollback's reboot: %s", reason)
+		h.logf(j, "%s", reason)
+		h.rebootCancelled("reboot", reason, j)
+		return nil
+	}
+	if h.onWait != nil {
+		h.onWait("reboot grace")
+	}
+	select {
+	case <-h.ctx.Done():
+	case <-time.After(time.Duration(rebootGrace) * h.unit()):
+	}
+	if h.ctx.Err() != nil { // a stop, even one as the grace ends, arms nothing
+		return cancelled("the daemon stopped before the reboot: nothing changed")
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(h.ctx), time.Minute)
+	defer cancel()
+	// back answers reason with the marks put back as they were, and whether that worked.
+	back := func(reason string) string {
 		// A context of its own: the one that ran out may be why it failed.
 		rctx, rcancel := context.WithTimeout(context.WithoutCancel(h.ctx), time.Minute)
 		defer rcancel()
-		if rerr := a.set(rctx, assessEnable+"="+was[assessEnable], assessTentative+"="+was[assessTentative]); rerr != nil {
-			return fmt.Errorf("%w; putting the boot assessment back failed too, so the next boot may choose the passive system (%s): %v", err, a.file(), rerr)
+		switch rerr := a.set(rctx, assessEnable+"="+was[assessEnable], assessTentative+"="+was[assessTentative]); {
+		case errors.As(rerr, new(leftWritable)):
+			return fmt.Sprintf("%s: the boot assessment is put back as it was, its partition left read-write (%v)", reason, rerr)
+		case rerr != nil:
+			return fmt.Sprintf("%s; putting the boot assessment back failed too, so the next boot may choose the passive system (%s): %v", reason, a.file(), rerr)
 		}
-		return err
+		return reason + ": the boot assessment is put back as it was, nothing changed"
 	}
-	if err := a.set(ctx, assessEnable+"=yes", assessTentative+"=yes"); err != nil {
-		return back(err)
+	switch err := a.set(ctx, assessEnable+"=yes", assessTentative+"=yes"); {
+	case errors.As(err, new(leftWritable)): // the marks are written: the reboot needs no more
+		h.logf(j, "the boot assessment is marked, its partition left read-write (%v)", err)
+	case err != nil:
+		return cancelled(back(fmt.Sprintf("marking the boot assessment failed: %v", err)))
 	}
-	h.mu.Lock()
-	h.rebooting, h.held = true, unlock
-	h.mu.Unlock()
-	h.endRebooting(j, "reboot", 0)
+	// A stop that came while the marks were written: the reboot it would override is not run.
+	if h.ctx.Err() != nil {
+		return cancelled(back("the daemon stopped before the reboot"))
+	}
 	if _, err := h.Host.Run(ctx, Cmd{Args: []string{"systemctl", "reboot"}}); err != nil {
-		reason := fmt.Sprintf("systemctl reboot failed: %v", err)
-		h.mu.Lock()
-		h.rebooting, h.held = false, nil
-		h.mu.Unlock()
-		failed := errors.New(reason)
-		if err := back(failed); err != failed { // putting the marks back failed too
-			h.O.logf("the rollback's reboot: %v", err)
-			reason = err.Error()
-		} else {
-			reason += ": the boot assessment is put back as it was, nothing changed"
-		}
-		h.logf(j, "%s", reason)
-		h.rebootCancelled("reboot", reason, j)
+		return cancelled(back(fmt.Sprintf("systemctl reboot failed: %v", err)))
 	}
 	return nil
 }

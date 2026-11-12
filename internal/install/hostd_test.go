@@ -44,9 +44,26 @@ type fakeHost struct {
 	// rebootHold, when set, holds `systemctl reboot` (recorded) until it is closed: a reboot
 	// whose shutdown stops the daemon before the command returns.
 	rebootHold chan struct{}
+	// rebootAt is when `systemctl reboot` last ran.
+	rebootAt time.Time
+	// onEdit, when set, runs as grub2-editenv writes, with its variables.
+	onEdit func(vars []string)
 	// calendarErr fails systemd-analyze calendar; noTimer: systemd has no backup timer.
 	calendarErr error
 	noTimer     bool
+}
+
+// waitCall waits for h to run a command whose arguments read call, failing the test when it never
+// does.
+func waitCall(t *testing.T, h *fakeHost, call string) {
+	t.Helper()
+	for range 2000 {
+		if strings.Contains(fmt.Sprint(h.calls()), call) {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("no %s: %v", call, h.calls())
 }
 
 func (f *fakeHost) Run(_ context.Context, c Cmd) ([]byte, error) {
@@ -86,6 +103,7 @@ func (f *fakeHost) Run(_ context.Context, c Cmd) ([]byte, error) {
 	if f.rebootHold != nil && len(c.Args) > 1 && c.Args[0] == "systemctl" && c.Args[1] == "reboot" {
 		f.mu.Lock()
 		f.ran = append(f.ran, c.Args)
+		f.rebootAt = time.Now()
 		f.mu.Unlock()
 		<-f.rebootHold
 		return nil, nil
@@ -100,12 +118,16 @@ func (f *fakeHost) Run(_ context.Context, c Cmd) ([]byte, error) {
 		}
 		return nil, f.remountErr
 	case "grub2-editenv":
+		if f.onEdit != nil {
+			f.onEdit(c.Args[3:])
+		}
 		if f.editErr != nil {
 			return nil, f.editErr
 		}
 		return nil, editEnv(c.Args[1], c.Args[3:])
 	case "systemctl":
 		if len(c.Args) > 1 && c.Args[1] == "reboot" {
+			f.rebootAt = time.Now()
 			if f.rebootErr != nil && f.editAfterReboot != nil {
 				f.editErr = f.editAfterReboot
 			}
@@ -896,7 +918,7 @@ func TestAnUpgradeAnnouncesItsRebootOnlyOnceScheduled(t *testing.T) {
 		t.Fatalf("%d", code)
 	}
 	// A reboot claimed while the OS is written: the upgrade cannot schedule its own.
-	if err := d.claimReboot(false); err != nil {
+	if err := d.claimReboot(false, nil); err != nil {
 		t.Fatal(err)
 	}
 	close(host.gate)

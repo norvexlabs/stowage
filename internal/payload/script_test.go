@@ -63,10 +63,10 @@ func TestScriptFallsBackWhenTheDirectoryIsReadOnly(t *testing.T) {
 	if err := Script(&script, "notes", "notes-stow", strings.NewReader(bin)); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Chmod(ro, 0o555); err != nil {
+	if err := os.Chmod(ro, 0o555); err != nil { // a directory
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = os.Chmod(ro, 0o755) })
+	t.Cleanup(func() { _ = os.Chmod(ro, 0o755) }) // a directory
 	cmd := exec.Command("sh", "-c", "umask 022; exec sh -s")
 	cmd.Dir, cmd.Stdin = ro, bytes.NewReader(script.Bytes())
 	cmd.Env = append(os.Environ(), "TMPDIR="+tmp, "XDG_CACHE_HOME="+ro)

@@ -117,10 +117,15 @@ func (a assessment) set(ctx context.Context, vars ...string) error {
 		err = fmt.Errorf("grub2-editenv %s: %w", a.file(), err)
 	}
 	if _, rerr := a.host.Run(context.WithoutCancel(ctx), Cmd{Args: []string{"mount", "-o", "remount,ro", a.dir}}); rerr != nil && err == nil {
-		err = fmt.Errorf("remounting %s read-only: %w", a.dir, rerr)
+		err = fmt.Errorf("remounting %s read-only: %w", a.dir, leftWritable{rerr})
 	}
 	return err
 }
+
+// leftWritable is set's error when the variables are written but the partition stays read-write.
+type leftWritable struct{ error }
+
+func (e leftWritable) Unwrap() error { return e.error }
 
 // unitState is a systemd unit's ActiveState, or noBootUnit when systemd has no such unit.
 func unitState(ctx context.Context, host Tool, unit string) (string, error) {

@@ -23,6 +23,7 @@ import (
 
 	"github.com/norvexlabs/stowage/internal/kit"
 	"github.com/norvexlabs/stowage/internal/spec"
+	"github.com/norvexlabs/stowage/internal/testutil"
 )
 
 // testHandoff asks SITE, gives TOKEN, and has a check.
@@ -1054,8 +1055,8 @@ func TestACheckStdoutIsThrownAway(t *testing.T) {
 		t.Errorf("%s", cmd)
 	}
 	dir := t.TempDir()
-	script := writeTestFile(t, "big", []byte("#!/bin/sh\nhead -c 3000000 /dev/zero\n"))
-	if err := os.Chmod(script, 0o755); err != nil {
+	script := filepath.Join(t.TempDir(), "big")
+	if err := testutil.WriteExecutable(script, []byte("#!/bin/sh\nhead -c 3000000 /dev/zero\n")); err != nil {
 		t.Fatal(err)
 	}
 	if err := hookRunTo(context.Background(), dir, time.Minute, []string{script}, io.Discard, true); err != nil {
@@ -1070,8 +1071,8 @@ func TestACheckStdoutIsThrownAway(t *testing.T) {
 		t.Errorf("%d bytes kept", len(raw))
 	}
 	// A background child holding its stdout open is no reason to wait, nor to fail.
-	lingers := writeTestFile(t, "lingers", []byte("#!/bin/sh\nsleep 4 &\nexit 0\n"))
-	if err := os.Chmod(lingers, 0o755); err != nil {
+	lingers := filepath.Join(t.TempDir(), "lingers")
+	if err := testutil.WriteExecutable(lingers, []byte("#!/bin/sh\nsleep 4 &\nexit 0\n")); err != nil {
 		t.Fatal(err)
 	}
 	dir = t.TempDir()

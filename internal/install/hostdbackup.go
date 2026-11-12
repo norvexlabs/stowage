@@ -64,7 +64,8 @@ const (
 	// with the backup's own hour, within the unit's 75 minutes.
 	scheduledBackupWait = 10 * 60
 	// backupStopWait is how long the daemon's stop waits for a backup's cleanup (two runner
-	// calls), within its unit's TimeoutStopSec.
+	// calls) and, after it, a rollback stopped in its grace (its cancel journaled at once), both
+	// within this one bound and the unit's TimeoutStopSec.
 	backupStopWait = 2*rcloneTimeout + 15*time.Second
 )
 

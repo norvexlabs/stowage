@@ -1910,19 +1910,23 @@ func TestAReRunMovingAnL4RouteProbesItsNewAddress(t *testing.T) {
 	}
 }
 
-// The UDP probe: a port a socket holds is busy, and free again once it closes.
-// The port is one the kernel never hands out (below its ephemeral range) on a loopback address of
-// this run's own: once released, no other socket's ephemeral bind can take it before the probe.
+// The UDP probe: a port a socket holds is busy, and free again once it closes. The port is one
+// the kernel never hands out (below its ephemeral range) on a loopback address of this run's own;
+// the host's network is still shared with every other process, so a released port the probe calls
+// busy is drawn again, and the probe fails only when it never calls one free.
 func TestUDPPortFree(t *testing.T) {
 	t.Parallel()
-	host, port, c := heldUDPPort(t)
-	if udpPortFree(host, port) {
-		t.Error("a held port is free")
+	for range 16 {
+		host, port, c := heldUDPPort(t)
+		if udpPortFree(host, port) {
+			t.Fatal("a held port is free")
+		}
+		c.Close()
+		if udpPortFree(host, port) {
+			return
+		}
 	}
-	c.Close()
-	if !udpPortFree(host, port) {
-		t.Error("a released port is busy")
-	}
+	t.Fatal("a released port is busy, 16 ports in a row")
 }
 
 // heldUDPPort binds a UDP port below the kernel's ephemeral range on a random address of
