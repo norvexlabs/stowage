@@ -481,6 +481,19 @@ Every consumer reads this one document — `<short>-stow updates` /
 releases with the scheme recorded in the manifest; **they never parse tags** (no `tags/list`
 sorting, no raw changelog sidecar).
 
+`updates` is one code path on every shape: the channel's pointer (or a version's latest revision)
+read from the registry the install records — a mirror with its CA, the operator's registry login
+where the mirror asks for one —, its signature checked against the keys the shape's upgrade
+trusts, ordered against the running release by its scheme and rendered alike. What differs is
+what runs (the VM's OS through the host daemon, a Docker install's `.env`, a helm release's
+values) and what the shape's upgrade installs, which `updates` names: the VM's `upgrade` takes
+the pointer itself, on any `--channel`; Docker's and Kubernetes' `upgrade --version` take a
+version's latest revision on the install's channel, so their `updates` names the latest revision
+of the pointer's version, and shows another channel's release without offering it (`follows`).
+On Docker and Kubernetes the installer is one release's binary: without `updates` an operator
+learns of a newer release only by pulling the installer's `:latest` again, which a stale local
+copy of that image answers with an old one.
+
 `yank` sets `yanked: {reason, date}` on the manifest and moves the channel pointer back; nothing is
 deleted (installed systems may run it, and rollback may need it). Consumers refuse to upgrade *to* a
 yanked release and warn when *running* one.

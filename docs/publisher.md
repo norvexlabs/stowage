@@ -523,7 +523,7 @@ DNS. A manifest read (a release manifest, a signature, an artifact) whose conten
 the digest the registry gives is refused.
 
 **Installs verify** the release manifest of every release they read from a registry — `upgrade
---version` on Docker and on Kubernetes, the VM's `updates` and `upgrade` — before anything of it
+--version` and `updates` on Docker and on Kubernetes, the VM's `updates` and `upgrade` — before anything of it
 is fetched: it must carry a signature by a key the install's own release trusts (Docker: the
 kept `<dir>/<short>-stow`'s, or the `<short>-stow` run's only when the kept one carries none; the VM:
 its OS's `<short>-stow`'s; Kubernetes: the `<short>-stow` run's — not the release's
@@ -545,7 +545,7 @@ docker run --rm <prefix>/<name>-installer@sha256:… > <name>.sh`.
 Among a version's revisions, `upgrade --version` takes the latest one signed by a trusted key: one
 pushed without the key is passed over, its yank not believed; one whose signatures cannot be read
 stops it (an older revision never stands in for it). Each revision passed over is logged
-(`passed over: …`). The VM's `updates` / `upgrade` without a version refuse a channel pointer on a
+(`passed over: …`). `updates` (every shape) and the VM's `upgrade` without a version refuse a channel pointer on a
 yanked release, or on a publication its tag no longer holds (`the channel C's pointer names T,
 which its tag no longer holds`). A signature only counts as one made
 by `cosign sign` (an attestation the key made over the same digest does not), checked with the

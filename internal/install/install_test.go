@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"math/rand/v2"
 	"net"
 	"os"
 	"path/filepath"
@@ -1910,20 +1911,44 @@ func TestAReRunMovingAnL4RouteProbesItsNewAddress(t *testing.T) {
 }
 
 // The UDP probe: a port a socket holds is busy, and free again once it closes.
+// The port is one the kernel never hands out (below its ephemeral range) on a loopback address of
+// this run's own: once released, no other socket's ephemeral bind can take it before the probe.
 func TestUDPPortFree(t *testing.T) {
 	t.Parallel()
-	c, err := net.ListenPacket("udp", "127.0.0.1:0")
-	if err != nil {
-		t.Skip(err)
-	}
-	port := c.LocalAddr().(*net.UDPAddr).Port
-	if udpPortFree("127.0.0.1", port) {
+	host, port, c := heldUDPPort(t)
+	if udpPortFree(host, port) {
 		t.Error("a held port is free")
 	}
 	c.Close()
-	if !udpPortFree("127.0.0.1", port) {
+	if !udpPortFree(host, port) {
 		t.Error("a released port is busy")
 	}
+}
+
+// heldUDPPort binds a UDP port below the kernel's ephemeral range on a random address of
+// 127.0.0.0/8 (Linux's loopback answers on all of it), drawing again while one is taken.
+func heldUDPPort(t *testing.T) (string, int, net.PacketConn) {
+	t.Helper()
+	low := 32768 // the kernel's default ephemeral start
+	if b, err := os.ReadFile("/proc/sys/net/ipv4/ip_local_port_range"); err == nil {
+		if f := strings.Fields(string(b)); len(f) == 2 {
+			if n, err := strconv.Atoi(f[0]); err == nil {
+				low = n
+			}
+		}
+	}
+	if low <= 1024 {
+		t.Skipf("the ephemeral range starts at %d: no port below it to draw", low)
+	}
+	for range 64 {
+		host := fmt.Sprintf("127.%d.%d.%d", 1+rand.IntN(254), rand.IntN(256), 1+rand.IntN(254))
+		port := 1024 + rand.IntN(low-1024)
+		if c, err := net.ListenPacket("udp", net.JoinHostPort(host, strconv.Itoa(port))); err == nil {
+			return host, port, c
+		}
+	}
+	t.Skip("no UDP port below the ephemeral range could be bound on loopback")
+	return "", 0, nil
 }
 
 // A route to a service on the host's network is probed where the service binds, never on the

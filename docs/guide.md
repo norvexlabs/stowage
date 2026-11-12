@@ -190,7 +190,7 @@ channels:
 
 The defaults are a Keep a Changelog `CHANGELOG.md` as the version source and CalVer
 (`YYYY.M.MICRO`). The current version must have a changelog section: it ships inside the release,
-and the VM's `updates` shows it.
+and `updates` shows it (Docker, Kubernetes and the VM).
 
 ## 7. Point at the registry, and sign
 

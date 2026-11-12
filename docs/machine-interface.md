@@ -13,6 +13,7 @@ share; each shape's own fields and verbs are on its page:
 | `describe --json` — what a release offers, read from the installer alone | [below](#describe) |
 | `status --json` on Docker | [below](#status---json) |
 | `--json` on the verbs that change an install; the Result object; `absent` | [below](#--json-on-the-verbs-that-change-an-install) |
+| `updates --json` on Docker and Kubernetes (the VM's object, `follows` theirs alone) | [below](#updates---json) |
 | Exit status: `0` done, `1` failed, `2` unknown (`kit check`), `3` refused | [below](#exit-status) |
 | `k8s status --json` and the `k8s` verbs' `--json` | [kubernetes.md](kubernetes.md) |
 | `vm seed --json`, `vm host-key --json`, `<short>-stow host-key --json` | [vm-create.md](vm-create.md) |
@@ -132,6 +133,34 @@ share; each shape's own fields and verbs are on its page:
   line per L4 route (`l4 route  NAME (PROTOCOL/PORT)`), `registry  PREFIX` and `stowage   VERSION`
   (the Stowage that built the installer; left out when its manifest records none) come before
   `first install only: …`.
+
+## updates --json
+
+- `updates --json` (Docker) and `k8s updates --json` print the release an upgrade would move to
+  as one object, the VM's `updates --json` object ([vm](vm.md)) without its VM-only fields and
+  with `follows`, and
+  nothing else on standard output:
+  ```json
+  {
+    "channel": "stable",
+    "current": { "version": "1.0.0", "revision": 1 },
+    "target": { "version": "1.1.0", "revision": 1 },
+    "available": true,
+    "changelog": "…"
+  }
+  ```
+  `current` is the release the install runs, `target` the one found (the latest revision of the
+  channel's pointer's version, or of `--version`'s), `available` whether an upgrade moves to it (after `current`,
+  with an installer, on the channel the install follows); `follows` (Docker and Kubernetes
+  only: the VM's `upgrade` takes `--channel`), present only when `--channel` named another
+  channel and the release found there comes after `current`, is the one the install follows, which `upgrade --version`
+  reads alone (`available` is then `false`); `no_installer` (`true`, Docker and
+  Kubernetes only, left out otherwise): `target` comes after `current` on the install's channel
+  but was published without the installer `upgrade --version` fetches (`available` `false`); `changelog` is left out when the release has none. A run that
+  fails or is refused prints no object, only its error, and exits as any run does (below).
+  The object has no `format` number, as the VM's, which its host daemon answers and the VM prints
+  as is.
+
 ## `--json` on the verbs that change an install
 
 - **`--json` on the verbs that change an install**, for a program: the install and its re-run,

@@ -361,6 +361,13 @@ func newCommand(r *Release, self string, stdout, stderr io.Writer, tools K8sOpti
 	jsonFlag(up, verbKind{})
 	dirFlag(up)
 	root.AddCommand(up)
+	root.AddCommand(updatesCommand("upgrade", dirFlag, nil, func(cmd *cobra.Command, channel, version string) (Update, string, error) {
+		if err := prepare(); err != nil {
+			return Update{}, "", err
+		}
+		u, err := in.Updates(cmd.Context(), channel, version)
+		return u, in.O.Dir, err
+	}, stdout))
 	back := &cobra.Command{
 		Use:   "rollback",
 		Short: "Go back to the release the last upgrade replaced; refused when the database moved past what it reads",
@@ -621,6 +628,17 @@ func k8sCommand(in *Installer, o *Options, prepare func() error, terminal func(b
 			return run(cmd, 0, false, func(context.Context) error { return in.K8sTune() })
 		},
 	}
+	updates := updatesCommand("k8s upgrade", nil, func(f *pflag.FlagSet) {
+		f.StringVar(&o.K8s.Registry, "image-registry", "", "read the release's registry at this prefix, a mirror, in place of the one its values record")
+		f.StringVar(&o.RegistryCA, "registry-ca", "", "a PEM file of the CA the registry's certificate chains to, a mirror's own")
+	}, func(cmd *cobra.Command, channel, version string) (u Update, runs string, err error) {
+		err = run(cmd, 0, false, func(ctx context.Context) error {
+			u, err = in.K8sUpdates(ctx, channel, version)
+			return err
+		})
+		return u, fmt.Sprintf("release %s in %s", in.O.K8s.Release, in.O.K8s.Namespace), err
+	}, o.Out)
+	k.AddCommand(updates)
 	jsonFlag(install, false)
 	jsonFlag(up, false)
 	jsonFlag(back, false)

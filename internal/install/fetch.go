@@ -90,6 +90,15 @@ func (in *Installer) channelRelease(ctx context.Context, env *EnvFile, name, cur
 	return m, c, prefix, trust, err
 }
 
+// keysWhy is why installTrust's refusal runs the kept installer.
+const keysWhy = "it knows the keys the install trusts"
+
+// keysUnknown is the cause of installTrust's refusal of a kept installer whose keys this one
+// cannot tell, which a caller gives its own fix.
+type keysUnknown struct{ error }
+
+func (e keysUnknown) Unwrap() error { return e.error }
+
 // installTrust is the keys an install trusts (it runs name cur, revision rev), and its kept
 // release: the keys of the install's release decide; the installer run's only when it carries
 // none (an install of a release from before its project signed): an older installer must not
@@ -100,16 +109,21 @@ func (in *Installer) installTrust(ctx context.Context, name, cur, rev, v string)
 	if err != nil {
 		return nil, nil, err
 	}
+	trust, err := in.trustOf(kept, v)
+	return trust, kept, err
+}
+
+// trustOf is installTrust's keys of the kept release kept.
+func (in *Installer) trustOf(kept *keptRelease, v string) (*sigverify.Verifier, error) {
 	src, keys := in.ctl(), kept.Keys
 	switch {
 	case len(keys) == 0 && kept.Release == nil:
 		// Another Stowage's payload may keep its keys elsewhere: none found is not none carried.
-		return nil, nil, refuse(sameArgs(in.ctl(), "it knows the keys the install trusts", v), "%s carries no key this installer finds, and %s: the keys the install trusts cannot be told; run its own installer", in.ctl(), kept.foreign())
+		return nil, refusal(sameArgs(in.ctl(), keysWhy, v), keysUnknown{fmt.Errorf("%s carries no key this installer finds, and %s: the keys the install trusts cannot be told; run its own installer", in.ctl(), kept.foreign())})
 	case len(keys) == 0:
 		src, keys = "this installer", in.R.Keys
 	}
-	trust, err := trusted(src, keys)
-	return trust, kept, err
+	return trusted(src, keys)
 }
 
 // UpgradeTo moves the install to version v of the project, on the channel the install's release
