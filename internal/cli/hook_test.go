@@ -449,25 +449,3 @@ func TestHookShipTakesTheUntrackedFilesOfTheCommit(t *testing.T) {
 		t.Errorf("the staged files are left: %v", err)
 	}
 }
-
-// A spec the commit records as a symbolic link is read as the checkout reads it: through it, inside
-// the repository alone.
-func TestCommittedFileFollowsALink(t *testing.T) {
-	t.Parallel()
-	dir := t.TempDir()
-	testutil.Write(t, dir, "deploy/stowage.yaml", "name: notes\n")
-	if err := os.Symlink("deploy/stowage.yaml", filepath.Join(dir, "stowage.yaml")); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink("../../outside.yaml", filepath.Join(dir, "out.yaml")); err != nil {
-		t.Fatal(err)
-	}
-	testutil.GitRepo(t, dir)
-	head := strings.TrimSpace(testutil.Git(t, dir, "rev-parse", "HEAD"))
-	if got, err := committedFile(dir, head, "stowage.yaml"); err != nil || got != "name: notes" {
-		t.Errorf("through the link: %q %v", got, err)
-	}
-	if _, err := committedFile(dir, head, "out.yaml"); err == nil || !strings.Contains(err.Error(), "links out of the repository") {
-		t.Errorf("a link out: %v", err)
-	}
-}

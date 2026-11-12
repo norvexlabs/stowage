@@ -410,7 +410,7 @@ pushed artifact.
   another OS) are the one exception to the checkout: taken from the working tree by the
   synchronous step, at the commit, and staged in the git common directory, then copied into the
   checkout — never read when a queued ship starts, as the working tree may hold the next
-  release's by then. Each enters the image's inputs digest by its SHA-256, so the release says
+  release's by then. Each enters the image's inputs digest by its SHA-256 and mode, so the release says
   what it was built with; whether the file matches the release stays the project's build's to
   check. Git runs without the hook's `GIT_*`
   variables, which describe the commit in progress, not the repository layout `-C` finds.

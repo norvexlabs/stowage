@@ -244,7 +244,8 @@ release for a test run, never the project's, without editing the spec:
   not committed, is refused, here and by `hook post-commit`: the ship runs in a checkout of the
   commit.
 - `hook post-commit` reads the version recorded by `HEAD` and by `HEAD~1` (from the commits, not
-  the working tree). It starts a ship only when `HEAD`'s version is later than `HEAD~1`'s by the
+  the working tree; a version file the commit records as a link read through it, as a checkout
+  reads it). It starts a ship only when `HEAD`'s version is later than `HEAD~1`'s by the
   version scheme, or `HEAD~1` records none (the first commit, a file added, a version the scheme
   refuses). It prints why it does not otherwise:
   - a rebase, merge, cherry-pick or revert in progress (`rebase-merge`, `rebase-apply`,
@@ -292,9 +293,14 @@ release for a test run, never the project's, without editing the spec:
     copied into the checkout`), refusing one the commit records (`untracked <path>: the commit
     records it, so the working tree's copy is not taken`) or a path through a directory the
     commit records as a link (`untracked <path>: the commit records <dir> as no directory`); they
-    are removed once the ship succeeds, with those of every commit before it and of a commit
-    the repository no longer has (a later commit's stay, as its ship may be queued), and kept
-    when it fails, for its run by hand; a file put
+    are removed once the ship succeeds, and kept when it fails, for its run by hand; a
+    successful ship also removes those of a commit before it, or that the repository no longer
+    has, staged more than 7 days before (a recent one's ship may still wait for the lock, and a
+    later commit's stay), a failure there only warned (`stowage hook: warning: staged untracked
+    files left in <dir>: …`), as the release stands. The spec those files are read from is the
+    commit's, read through a link it records as a checkout reads it (a link leaving the
+    repository is refused: `the spec at <id>: <path> at <id> is a symbolic link that leaves the
+    repository or loops`; a spec the commit lacks, `the spec at <id>: <path> is not committed`); a file put
     there for the next release while this one's ship waits never reaches it;
     the repository's `post-checkout` hook runs for the checkout as for any, and its failure
     fails the ship; it refuses an `<id>` that is not a commit, a commit not at `<version>`, and

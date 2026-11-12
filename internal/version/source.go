@@ -144,15 +144,12 @@ func fileAt(root, path, rev string, parse func([]byte, string) (string, error)) 
 		return "", err
 	}
 	obj := rev + ":./" + filepath.ToSlash(rel)
-	// rev-parse -q exits 1 both when rev does not exist and when it lacks the file.
-	if found, err := gitcmd.Verify(root, obj); err != nil || !found {
+	// A link the commit records is read through, as a checkout reads it.
+	b, found, err := gitcmd.FileAt(root, rev, "./"+filepath.ToSlash(rel))
+	if err != nil || !found {
 		return "", err
 	}
-	b, err := gitcmd.Run(root, "cat-file", "blob", obj)
-	if err != nil {
-		return "", err
-	}
-	return parse([]byte(b), obj)
+	return parse(b, obj)
 }
 
 // gitTagSource takes the nearest tag reachable from HEAD.

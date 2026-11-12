@@ -202,9 +202,9 @@ func (o *options) hookShip(ctx context.Context, channel, v, commit string, disks
 	if err := o.inCheckout(top, rel, spec, root).ship(ctx, channel, 1, v, disks); err != nil {
 		return err // the staged files kept, for its run by hand
 	}
-	// Published: its staged files go, and those of every commit before it.
-	if err := r.Sweep(id); err != nil {
-		return fmt.Errorf("remove the untracked files staged for %s and before: %w", id, err)
+	// Published: its staged files go, and stale ones before it; the release stands either way.
+	if err := r.Sweep(id, o.now()); err != nil {
+		fmt.Fprintf(o.out, "stowage hook: warning: staged untracked files left in %s: %v\n", filepath.Dir(r.StagedDir(id)), err)
 	}
 	return nil
 }
@@ -222,11 +222,14 @@ func stageUntracked(p *project.Project, r hook.Repo, id, specRel string) ([]stri
 	if specRel == "" {
 		specRel = filepath.Join(rel, project.SpecFile)
 	}
-	raw, err := committedFile(r.Top, id, filepath.ToSlash(specRel))
+	raw, ok, err := gitcmd.FileAt(r.Top, id, filepath.ToSlash(specRel))
+	if err == nil && !ok {
+		err = fmt.Errorf("%s is not committed", specRel)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("the spec at %s: %w", id, err)
 	}
-	s, err := spec.Parse([]byte(raw))
+	s, err := spec.Parse(raw)
 	if err != nil {
 		return nil, fmt.Errorf("the spec at %s: %w", id, err)
 	}
@@ -246,28 +249,6 @@ func stageUntracked(p *project.Project, r hook.Repo, id, specRel string) ([]stri
 		}
 	}
 	return files, r.Stage(id, files)
-}
-
-// committedFile is the content commit id records at rel, a symbolic link followed as a checkout
-// follows it (inside the repository, a few at most).
-func committedFile(top, id, rel string) (string, error) {
-	for range 8 {
-		out, err := gitcmd.Run(top, "ls-tree", "--full-tree", id, "--", rel)
-		if err != nil {
-			return "", err
-		}
-		mode, _, _ := strings.Cut(out, " ")
-		raw, err := gitcmd.Run(top, "show", id+":"+rel)
-		if err != nil || mode != "120000" {
-			return raw, err
-		}
-		next := path.Join(path.Dir(rel), raw)
-		if !filepath.IsLocal(next) {
-			return "", fmt.Errorf("%s links out of the repository (%s)", rel, raw)
-		}
-		rel = next
-	}
-	return "", fmt.Errorf("%s: too many symbolic links", rel)
 }
 
 // inCheckout is o run on the project at rel (and the spec at spec, when set) in the checkout at

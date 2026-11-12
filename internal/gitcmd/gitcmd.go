@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 )
 
@@ -54,6 +55,38 @@ func Resolve(dir, rev string) (id string, ok bool, err error) {
 		return "", false, err
 	}
 	return out, true, nil
+}
+
+// FileAt is the content commit rev records at path (relative to the top level of the repository
+// at dir), a symbolic link followed as a checkout follows it — at any component, inside the
+// repository — by `cat-file --batch --follow-symlinks`; a path starting ./ is relative to dir.
+// ok is false when rev (or the path) does not exist there, or a link there leads to nothing; a
+// link that leaves the repository, or loops, is an error.
+func FileAt(dir, rev, path string) (content []byte, ok bool, err error) {
+	var stderr bytes.Buffer
+	cmd := exec.Command("git", "-C", dir, "cat-file", "--batch", "--follow-symlinks")
+	cmd.Env = Env(os.Environ())
+	cmd.Stdin = strings.NewReader(rev + ":" + path + "\n")
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, false, fmt.Errorf("git cat-file %s:%s: %v: %s", rev, path, err, strings.TrimSpace(stderr.String()))
+	}
+	head, body, _ := bytes.Cut(out, []byte("\n"))
+	f := strings.Fields(string(head))
+	switch {
+	case len(f) == 3 && f[1] == "blob":
+		size, err := strconv.Atoi(f[2])
+		if err != nil || size > len(body) {
+			return nil, false, fmt.Errorf("git cat-file %s:%s: %q", rev, path, head)
+		}
+		return body[:size], true, nil
+	case strings.HasSuffix(string(head), " missing"), len(f) == 2 && f[0] == "dangling":
+		return nil, false, nil
+	case len(f) == 2 && (f[0] == "symlink" || f[0] == "loop"):
+		return nil, false, fmt.Errorf("%s at %s is a symbolic link that leaves the repository or loops", path, rev)
+	}
+	return nil, false, fmt.Errorf("git cat-file %s:%s: %s is no file", rev, path, strings.TrimSpace(string(head)))
 }
 
 func run(dir string, args ...string) (out string, exit1 bool, err error) {

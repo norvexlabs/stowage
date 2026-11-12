@@ -446,35 +446,40 @@ func TestStageAndUnstage(t *testing.T) {
 	}
 }
 
-// A shipped commit's staged files go, with those of every commit before it and of one the
-// repository no longer has; a later commit's stay, as its ship may be queued.
+// A shipped commit's staged files go; a commit's before it, or one the repository no longer has,
+// once stale; a later commit's stay, as does a recent one before it, whose ship may be queued.
 func TestSweep(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
 	testutil.Write(t, dir, "a.txt", "a")
 	testutil.GitRepo(t, dir)
-	first := strings.TrimSpace(testutil.Git(t, dir, "rev-parse", "HEAD"))
-	for _, n := range []string{"b", "c"} {
+	var ids []string
+	for _, n := range []string{"b", "c", "d"} {
+		ids = append(ids, strings.TrimSpace(testutil.Git(t, dir, "rev-parse", "HEAD")))
 		testutil.Write(t, dir, n+".txt", n)
 		testutil.Git(t, dir, "add", ".")
 		testutil.Git(t, dir, "commit", "-qm", n)
 	}
-	third := strings.TrimSpace(testutil.Git(t, dir, "rev-parse", "HEAD"))
-	second := strings.TrimSpace(testutil.Git(t, dir, "rev-parse", "HEAD~1"))
+	ids = append(ids, strings.TrimSpace(testutil.Git(t, dir, "rev-parse", "HEAD")))
+	old, recent, shipped, later := ids[0], ids[1], ids[2], ids[3]
 	r, err := Open(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	gone := strings.Repeat("e", 40)
-	for _, id := range []string{first, second, third, gone} {
+	lost := strings.Repeat("e", 40)
+	now := time.Now()
+	for id, age := range map[string]time.Duration{old: 8 * 24 * time.Hour, recent: time.Hour, shipped: 0, later: 8 * 24 * time.Hour, lost: 8 * 24 * time.Hour} {
 		if err := r.Stage(id, []string{"a.txt"}); err != nil {
 			t.Fatal(err)
 		}
+		if err := os.Chtimes(r.StagedDir(id), now.Add(-age), now.Add(-age)); err != nil {
+			t.Fatal(err)
+		}
 	}
-	if err := r.Sweep(second); err != nil {
+	if err := r.Sweep(shipped, now); err != nil {
 		t.Fatal(err)
 	}
-	for id, want := range map[string]bool{first: false, second: false, gone: false, third: true} {
+	for id, want := range map[string]bool{old: false, recent: true, shipped: false, later: true, lost: false} {
 		if _, err := os.Stat(r.StagedDir(id)); (err == nil) != want {
 			t.Errorf("%s staged %v, want %v", id, err == nil, want)
 		}

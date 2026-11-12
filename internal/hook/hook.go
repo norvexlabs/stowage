@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/norvexlabs/stowage/internal/gitcmd"
 	"github.com/norvexlabs/stowage/internal/project"
@@ -320,10 +321,16 @@ func copyFile(src, dst string, dirMode os.FileMode) error {
 	return os.Chmod(dst, fi.Mode().Perm()) // the umask left out
 }
 
-// Sweep removes what StagedDir holds for commit id and for each commit before it (an ancestor):
-// their releases are behind the one shipped. A commit's files that are not its ancestor's stay, as
-// its ship may still be queued.
-func (r Repo) Sweep(id string) error {
+// StaleAfter is how long the untracked files staged for a commit before the one shipped (or one
+// the repository no longer has) are kept: its ship, queued behind the lock, may run after a later
+// commit's, and a failed one is run again by hand.
+const StaleAfter = 7 * 24 * time.Hour
+
+// Sweep removes what StagedDir holds for commit id, just shipped, and for each commit before it
+// (an ancestor) or that the repository no longer has (a rewritten history) staged more than
+// StaleAfter before now. A later commit's files stay. Every entry is tried; the errors are
+// joined.
+func (r Repo) Sweep(id string, now time.Time) error {
 	entries, err := os.ReadDir(filepath.Join(r.Dir(), "untracked"))
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
@@ -331,27 +338,37 @@ func (r Repo) Sweep(id string) error {
 	if err != nil {
 		return err
 	}
+	var errs []error
 	for _, e := range entries {
 		other := e.Name()
 		if !objectID.MatchString(other) {
 			continue
 		}
-		before := other == id
-		if !before {
-			// A commit the repository no longer has (a rewritten history) is swept too.
+		gone := other == id
+		if !gone {
+			fi, err := e.Info()
+			if err != nil {
+				errs = append(errs, err)
+				continue
+			}
+			if now.Sub(fi.ModTime()) < StaleAfter {
+				continue
+			}
 			if known, err := gitcmd.Verify(r.Top, other+"^{commit}"); err != nil {
-				return err
+				errs = append(errs, err)
+				continue
 			} else if !known {
-				before = true
-			} else if before, err = gitcmd.IsAncestor(r.Top, other, id); err != nil {
-				return err
+				gone = true
+			} else if gone, err = gitcmd.IsAncestor(r.Top, other, id); err != nil {
+				errs = append(errs, err)
+				continue
 			}
 		}
-		if before {
+		if gone {
 			if err := os.RemoveAll(r.StagedDir(other)); err != nil {
-				return err
+				errs = append(errs, err)
 			}
 		}
 	}
-	return nil
+	return errors.Join(errs...)
 }

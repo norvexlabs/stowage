@@ -451,47 +451,33 @@ func (in *Installer) openedPorts(st *Settings) []modulePort {
 		if r.Terminated() && st.TLS == Loopback {
 			continue
 		}
-		ports = append(ports, modulePort{r.Protocol, r.Port, in.routeSources(st, r)})
+		src, _ := in.routeSources(st, r)
+		ports = append(ports, modulePort{r.Protocol, r.Port, src})
 	}
 	return ports
 }
 
-// secretInput reports whether the spec declares key a secret input.
-func (in *Installer) secretInput(key string) bool {
-	return slices.ContainsFunc(in.R.Spec.Inputs, func(i spec.Input) bool { return i.Key == key && i.Secret })
-}
-
 // routeSources are the sources the VM's firewall lets reach an L4 route's port, as vm create
-// knows them: every source for a route without an allowlist or one the front terminates TLS on
-// (the front filters its own port), and for an allowlist whose value is not known here (a secret
-// input, given over SSH); else its input's value in the settings, or its default, each address a
-// prefix of its own (/32, /128) — none when the list is empty, which the VM's firewall refuses
-// too. A platform's rules made from them are fixed at create: a later change of the list on the
-// VM does not reach them.
-func (in *Installer) routeSources(st *Settings, r spec.L4Route) []string {
+// knows them, and whether they are its allowlist's: every source for a route without an
+// allowlist or one the front terminates TLS on (the front filters its own port), and for an
+// allowlist whose value is not known here (a secret input, given over SSH; one the spec does not
+// declare); else its input's value in the settings, or its default, as the VM's firewall reads it
+// (familySources: each a network's prefix, an IPv4-mapped address as IPv4, one another holds left
+// out) — none when the list is empty, which the VM's firewall refuses too. A platform's rules made
+// from them are fixed at create: a later change of the list on the VM does not reach them.
+func (in *Installer) routeSources(st *Settings, r spec.L4Route) (sources []string, listed bool) {
 	i := slices.IndexFunc(in.R.Spec.Inputs, func(i spec.Input) bool { return i.Key == r.AllowInput })
 	v, given := st.Inputs[r.AllowInput]
 	switch {
 	case r.AllowInput == "" || r.Terminated() || i < 0:
-		return everySource
+		return everySource, false
 	case !given && in.R.Spec.Inputs[i].Secret:
-		return everySource
+		return everySource, false
 	case !given:
 		v = in.R.Spec.Inputs[i].Default
 	}
-	// Each a network's prefix (a bare address its own, host bits masked), sorted, once: what a
-	// platform's rule takes. One that is neither is left to the install's own check to refuse.
-	out := []string{}
-	for _, s := range splitSources(v) {
-		if a, err := netip.ParseAddr(s); err == nil {
-			s = netip.PrefixFrom(a, a.BitLen()).String()
-		} else if p, err := netip.ParsePrefix(s); err == nil {
-			s = p.Masked().String()
-		}
-		out = append(out, s)
-	}
-	slices.Sort(out)
-	return slices.Compact(out)
+	v4, v6 := familySources(v)
+	return append(append([]string{}, v4...), v6...), true
 }
 
 // moduleFirewall warns when a built-in module's network firewall leaves out what the VM's opens:
@@ -557,7 +543,7 @@ func (in *Installer) applyVM(ctx context.Context, dir, ctl string, p Platform, m
 		case "open_ports":
 			vars[v.Name] = in.openedPorts(st)
 			for _, r := range in.R.Spec.L4.Routes {
-				if _, given := st.Inputs[r.AllowInput]; r.AllowInput != "" && !r.Terminated() && (given || !in.secretInput(r.AllowInput)) {
+				if _, listed := in.routeSources(st, r); listed {
 					in.O.logf("l4 route %s: the module's rule for %s/%d takes the sources %s holds now; a later change of %s on the VM does not reach it", r.Name, r.Protocol, r.Port, r.AllowInput, r.AllowInput)
 				}
 			}

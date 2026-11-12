@@ -136,9 +136,10 @@ type Ref struct {
 // UntrackedAnnotation.
 type releaseRecords struct{ override, nodes, untracked string }
 
-// UntrackedAnnotation records on a release manifest's artifact the SHA-256 of each untracked file
-// its images were built with (images.<key>.untracked), by "<key>/<path>", "absent" for one that
-// was not there (JSON). The signature covers it, and no install reads it.
+// UntrackedAnnotation records on a release manifest's artifact each untracked file its images were
+// built with (images.<key>.untracked), by "<key>/<path>": its SHA-256, " executable" after it for
+// an executable one, or "absent" for one that was not there (JSON). The signature covers it, and
+// no install reads it.
 const UntrackedAnnotation = "dev.stowage.untracked"
 
 func (p *Publisher) readRelease(ctx context.Context, tag string) (*Ref, error) {
@@ -254,9 +255,12 @@ func (p *Publisher) untracked() (string, error) {
 				sums[key+"/"+clean] = "absent"
 				p.logf("image %s: untracked %s is absent: built without it", key, clean)
 			default:
-				sum, _, err := digest.FileSum(abs)
+				sum, mode, err := digest.FileSum(abs)
 				if err != nil {
 					return "", fmt.Errorf("images.%s.untracked: %s: %w", key, clean, err)
+				}
+				if mode == "x" {
+					sum += " executable"
 				}
 				sums[key+"/"+clean] = sum
 				p.logf("image %s: untracked %s %s", key, clean, sum)
