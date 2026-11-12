@@ -38,6 +38,7 @@ images:
     network: default
     contexts: { schema: migrations }                           # a named build context: COPY --from=schema reads it, sent less its own .dockerignore
     inputs: [server/]
+    untracked: [{ path: server/vendor/codec.bin }]           # made elsewhere, ignored by git: its SHA-256 enters the digest; a hook ship copies it into its checkout
   ingest:    { context: ., dockerfile: docker/ingest.Dockerfile, inputs: [server/] }
   ui:        { context: ui, dockerfile: ui/Dockerfile }
   provision: { context: provision, dockerfile: provision/Dockerfile }

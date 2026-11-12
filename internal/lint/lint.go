@@ -26,6 +26,7 @@ import (
 	"github.com/norvexlabs/stowage/internal/changelog"
 	"github.com/norvexlabs/stowage/internal/digest"
 	"github.com/norvexlabs/stowage/internal/dockerfile"
+	"github.com/norvexlabs/stowage/internal/gitcmd"
 	"github.com/norvexlabs/stowage/internal/helm"
 	"github.com/norvexlabs/stowage/internal/kairos"
 	"github.com/norvexlabs/stowage/internal/lock"
@@ -415,7 +416,7 @@ func (l *linter) images() {
 			l.errf(where, "image key %q is reserved: %s-%s is where Stowage publishes its own artifacts", name, l.s.Name, name)
 		}
 		if !img.Built() {
-			if img.Context != "" || img.Dockerfile != "" || img.Target != "" || len(img.Args) > 0 || len(img.AddHosts) > 0 || img.Network != "" || len(img.Contexts) > 0 || len(img.Inputs) > 0 {
+			if img.Context != "" || img.Dockerfile != "" || img.Target != "" || len(img.Args) > 0 || len(img.AddHosts) > 0 || img.Network != "" || len(img.Contexts) > 0 || len(img.Inputs) > 0 || len(img.Untracked) > 0 {
 				l.errf(where, "ref and build fields are exclusive")
 			}
 			if !pinnedRe.MatchString(img.Ref) {
@@ -473,6 +474,9 @@ func (l *linter) images() {
 		if img.Network != "" && !slices.Contains(spec.BuildNetworks, img.Network) {
 			l.errf(where+".network", "%q is not a build network: %s", img.Network, strings.Join(spec.BuildNetworks, ", "))
 		}
+		if ctxOK {
+			l.untracked(where, img)
+		}
 		// A named context is a second build context: a directory of the project, sent less its
 		// own .dockerignore, which must keep its .git out as the main context's must.
 		for _, cn := range slices.Sorted(maps.Keys(img.Contexts)) {
@@ -500,6 +504,75 @@ func (l *linter) images() {
 			}
 		}
 	}
+}
+
+// untracked checks an image's untracked files (images.<key>.untracked): each a file of the
+// project, through no symbolic link, that the build is sent — in its context or a named one, and
+// not kept out by that one's ignore file — named once, and one git does not record (git's
+// own file the commit carries; checked when the project is in a git working tree).
+func (l *linter) untracked(where string, img spec.Image) {
+	seen := map[string]bool{}
+	for i, u := range img.Untracked {
+		w := fmt.Sprintf("%s.untracked[%d].path", where, i)
+		clean, abs, _, err := spec.UntrackedFile(l.root, u.Path)
+		if err != nil {
+			l.errf(w, "%v", err)
+			continue
+		}
+		if seen[clean] {
+			l.errf(w, "%s is named twice", clean)
+			continue
+		}
+		seen[clean] = true
+		// The context that sends it: the main one, else a named one holding it.
+		var ig *digest.Ignore
+		in := func(dir string) bool {
+			rel, err := filepath.Rel(spec.Path(l.root, dir), abs)
+			return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+		}
+		switch {
+		case in(img.Context):
+			ig, err = digest.DockerIgnore(spec.Path(l.root, img.Context), spec.Path(l.root, img.Dockerfile))
+		default:
+			found, bad := false, false
+			for _, cn := range slices.Sorted(maps.Keys(img.Contexts)) {
+				if !in(img.Contexts[cn]) {
+					continue
+				}
+				found = true
+				_, dir, cerr := spec.ContextDir(l.root, img.Contexts[cn])
+				if bad = cerr != nil; !bad { // a context that is not one is said of it
+					ig, err = digest.ContextIgnore(dir)
+				}
+				break
+			}
+			if !found {
+				l.errf(w, "%s is in neither the build's context (%s) nor a named one: the build is not sent it", clean, img.Context)
+			}
+			if !found || bad {
+				continue
+			}
+		}
+		if err != nil {
+			l.errf(w, "%v", err)
+			continue
+		}
+		if out, err := ig.Excluded(abs); err != nil {
+			l.errf(w, "%v", err)
+		} else if out {
+			l.errf(w, "%s is kept out of the build by its context's .dockerignore: the build is not sent it", clean)
+		}
+		if tracked, err := gitTracks(l.root, clean); err == nil && tracked {
+			l.errf(w, "git records %s: an untracked file is one the commit does not carry (git rm --cached it and ignore it), or drop it from untracked", clean)
+		}
+	}
+}
+
+// gitTracks reports whether git records the path rel of the working tree root is in; an error
+// when root is not in a git working tree.
+func gitTracks(root, rel string) (bool, error) {
+	out, err := gitcmd.Run(root, "ls-files", "--", rel)
+	return strings.TrimSpace(out) != "", err
 }
 
 // baseImages requires every stage of a built image to start from an image pinned by digest (or

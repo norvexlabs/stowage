@@ -7,6 +7,11 @@ follow [SemVer](https://semver.org/).
 
 ### Added
 
+- `images.<key>.untracked`: files an image's build reads that git does not record (a binary made
+  elsewhere). Each one's SHA-256 enters the image's inputs digest, every ship logs it and records
+  it on the release, a required one absent is refused, and a hook ship takes them from the
+  working tree when the commit is made, so its release is built with the files the commit was
+  made beside. Lint refuses one git records or the build is not sent.
 - The cloud modules of `vm create --create opentofu` take an address reserved beforehand, which
   `vm destroy` keeps: `ip_id` on Scaleway, `eip_allocation_id` on AWS, `public_ip_name` on Azure,
   `nat_ip` on Google Cloud, so a stack's first install can know its own address, or another VM's,

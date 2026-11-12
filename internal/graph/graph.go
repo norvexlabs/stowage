@@ -452,6 +452,21 @@ func imageNode(p *project.Project, name, projectVersion string) (Node, error) {
 			return Node{}, fmt.Errorf("image %s context %s: %w", name, cn, err)
 		}
 	}
+	// Each untracked file by its path and SHA-256, "absent" when it is not there: entered only when
+	// declared, so an image without them digests as before.
+	for _, u := range slices.SortedFunc(slices.Values(img.Untracked), func(a, b spec.Untracked) int { return strings.Compare(a.Path, b.Path) }) {
+		clean, abs, ok, err := spec.UntrackedFile(p.Root, u.Path)
+		if err != nil {
+			return Node{}, fmt.Errorf("image %s untracked: %w", name, err)
+		}
+		sum := "absent"
+		if ok {
+			if sum, err = digest.FileSum(abs); err != nil {
+				return Node{}, fmt.Errorf("image %s untracked %s: %w", name, clean, err)
+			}
+		}
+		b.Field("untracked", clean+"\x00"+sum)
+	}
 	n.Inputs, n.Fields = b.Sum(), b.Fields()
 	return n, nil
 }

@@ -394,3 +394,36 @@ func TestInstall(t *testing.T) {
 		t.Fatalf("foreign hook changed:\n%s", b)
 	}
 }
+
+// Staged files reach the checkout byte for byte, the executable bit kept; one the checkout holds
+// already (the commit records it) is refused, and an absent one is not staged.
+func TestStageAndUnstage(t *testing.T) {
+	t.Parallel()
+	top, common := t.TempDir(), t.TempDir()
+	r := Repo{Top: top, CommonDir: common}
+	id := strings.Repeat("a", 40)
+	if err := os.MkdirAll(filepath.Join(top, "bin"), 0o755); err != nil { // a directory
+		t.Fatal(err)
+	}
+	if err := testutil.WriteExecutable(filepath.Join(top, "bin", "tool"), []byte("#!/bin/sh\n")); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Stage(id, []string{"bin/tool", "gone.bin"}); err != nil {
+		t.Fatal(err)
+	}
+	co := t.TempDir()
+	copied, err := r.Unstage(id, co)
+	if err != nil || strings.Join(copied, ",") != "bin/tool" {
+		t.Fatalf("unstage: %v %q", err, copied)
+	}
+	fi, err := os.Stat(filepath.Join(co, "bin", "tool"))
+	if b, _ := os.ReadFile(filepath.Join(co, "bin", "tool")); err != nil || string(b) != "#!/bin/sh\n" || fi.Mode().Perm() != 0o755 {
+		t.Fatalf("copy: %v %q", err, b)
+	}
+	if _, err := r.Unstage(id, co); err == nil || !strings.Contains(err.Error(), "untracked bin/tool: the commit records it") {
+		t.Fatalf("a path the checkout holds: %v", err)
+	}
+	if copied, err := r.Unstage(strings.Repeat("b", 40), co); err != nil || len(copied) != 0 {
+		t.Fatalf("nothing staged: %v %q", err, copied)
+	}
+}

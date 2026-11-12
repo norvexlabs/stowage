@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"time"
@@ -12,6 +14,8 @@ import (
 
 	"github.com/norvexlabs/stowage/internal/gitcmd"
 	"github.com/norvexlabs/stowage/internal/hook"
+	"github.com/norvexlabs/stowage/internal/project"
+	"github.com/norvexlabs/stowage/internal/spec"
 )
 
 func hookCmd(o *options) *cobra.Command {
@@ -111,8 +115,18 @@ func (o *options) postCommit(channel string, disks bool) error {
 	if disks {
 		args = append(args, "--disks")
 	}
+	// The untracked files are taken now, at the commit: a file staged for a later release never
+	// reaches this one, however long its ship waits for the lock.
+	staged, err := stageUntracked(p, r, d.Commit)
+	if err != nil {
+		return fmt.Errorf("%w; %s not shipped", err, d.Version)
+	}
+	for _, s := range staged {
+		fmt.Fprintf(o.out, "stowage hook: untracked %s taken for the ship\n", s)
+	}
 	logPath := r.LogPath(p.Spec.Name, tag)
 	if err := o.launch(exe, args, logPath); err != nil {
+		_ = os.RemoveAll(r.StagedDir(d.Commit))
 		return fmt.Errorf("start the ship of %s: %w", d.Version, err)
 	}
 	// The disks are said where they are decided: a release without them is one vm create refuses
@@ -175,8 +189,45 @@ func (o *options) hookShip(ctx context.Context, channel, v, commit string, disks
 		if rerr := remove(); rerr != nil && err == nil {
 			err = fmt.Errorf("remove the checkout of %s: %w", id, rerr)
 		}
+		if rerr := os.RemoveAll(r.StagedDir(id)); rerr != nil && err == nil {
+			err = fmt.Errorf("remove the untracked files staged for %s: %w", id, rerr)
+		}
 	}()
+	// The untracked files the working tree held at the commit, into the checkout.
+	copied, err := r.Unstage(id, top)
+	if err != nil {
+		return err
+	}
+	for _, c := range copied {
+		fmt.Fprintf(o.out, "stowage hook: untracked %s copied into the checkout\n", c)
+	}
 	return o.inCheckout(top, rel, spec, root).ship(ctx, channel, 1, v, disks)
+}
+
+// stageUntracked stages, for the ship of commit id, every untracked file the project's images
+// declare (images.<key>.untracked), from the working tree as it is at the commit, and returns
+// their paths (relative to the working tree's top level). A required one absent is refused.
+func stageUntracked(p *project.Project, r hook.Repo, id string) ([]string, error) {
+	rel, err := relTo(r.Top, p.Root)
+	if err != nil {
+		return nil, err
+	}
+	var files []string
+	for _, key := range p.Spec.ImageNames() {
+		for _, u := range p.Spec.Images[key].Untracked {
+			clean, _, ok, err := spec.UntrackedFile(p.Root, u.Path)
+			if err != nil {
+				return nil, fmt.Errorf("images.%s.untracked: %w", key, err)
+			}
+			if !ok && u.Required {
+				return nil, fmt.Errorf("images.%s.untracked: %s is required and absent from the working tree", key, clean)
+			}
+			if ok {
+				files = append(files, path.Join(filepath.ToSlash(rel), clean))
+			}
+		}
+	}
+	return files, r.Stage(id, files)
 }
 
 // inCheckout is o run on the project at rel (and the spec at spec, when set) in the checkout at

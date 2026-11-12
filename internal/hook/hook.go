@@ -6,6 +6,7 @@ package hook
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -214,4 +215,94 @@ func Detect(p *project.Project, r Repo) (Decision, error) {
 		return Decision{}, err
 	}
 	return Decision{Version: cur, Commit: head}, nil
+}
+
+// StagedDir is where the hook keeps the untracked files of commit id (a full id) from the commit
+// to its ship: what the working tree held when the commit was made, whatever it holds later.
+func (r Repo) StagedDir(id string) string { return filepath.Join(r.Dir(), "untracked", id) }
+
+// Stage copies each of files (paths relative to the working tree's top level, each a regular file
+// or absent: an absent one is skipped) into StagedDir(id), byte for byte, its executable bit kept.
+// What an earlier run staged for id is replaced.
+func (r Repo) Stage(id string, files []string) error {
+	if !objectID.MatchString(id) {
+		return fmt.Errorf("%q is not a full commit id", id)
+	}
+	dir := r.StagedDir(id)
+	if err := os.RemoveAll(dir); err != nil {
+		return err
+	}
+	for _, f := range files {
+		src := filepath.Join(r.Top, filepath.FromSlash(f))
+		if _, err := os.Lstat(src); errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err := copyFile(src, filepath.Join(dir, filepath.FromSlash(f))); err != nil {
+			return fmt.Errorf("stage %s: %w", f, err)
+		}
+	}
+	return nil
+}
+
+// Unstage copies what StagedDir(id) holds into the checkout at top, each file at its path there,
+// and returns the paths copied. A path the checkout holds already (the commit records it) is
+// refused: the release would not be the commit's.
+func (r Repo) Unstage(id, top string) ([]string, error) {
+	dir := r.StagedDir(id)
+	var copied []string
+	err := filepath.WalkDir(dir, func(p string, d os.DirEntry, err error) error {
+		if errors.Is(err, os.ErrNotExist) && p == dir {
+			return filepath.SkipDir
+		}
+		if err != nil || d.IsDir() {
+			return err
+		}
+		rel, err := filepath.Rel(dir, p)
+		if err != nil {
+			return err
+		}
+		dst := filepath.Join(top, rel)
+		if _, err := os.Lstat(dst); err == nil {
+			return fmt.Errorf("untracked %s: the commit records it, so the working tree's copy is not taken", filepath.ToSlash(rel))
+		}
+		if err := copyFile(p, dst); err != nil {
+			return err
+		}
+		copied = append(copied, filepath.ToSlash(rel))
+		return nil
+	})
+	return copied, err
+}
+
+// copyFile copies the regular file src to dst (its directories made), its executable bit kept,
+// never through a symbolic link at either end.
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	fi, err := in.Stat()
+	if err != nil {
+		return err
+	}
+	if l, err := os.Lstat(src); err != nil || !l.Mode().IsRegular() || !fi.Mode().IsRegular() {
+		return fmt.Errorf("%s is not a regular file", src)
+	}
+	if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
+		return err
+	}
+	mode := os.FileMode(0o644)
+	if fi.Mode()&0o111 != 0 {
+		mode = 0o755
+	}
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		out.Close()
+		return err
+	}
+	return out.Close()
 }

@@ -192,7 +192,48 @@ type Image struct {
 	// `.dockerignore`, and enters the inputs digest so.
 	Contexts map[string]string `yaml:"contexts"`
 	Inputs   []string          `yaml:"inputs"`
-	Ref      string            `yaml:"ref"`
+	// Untracked are files the build reads that git does not record (a binary made elsewhere),
+	// each a path of the project inside the build's context or a named one: each enters the
+	// inputs digest by its SHA-256, a ship says each, and a hook ship copies each from the
+	// working tree at commit time into its checkout.
+	Untracked []Untracked `yaml:"untracked"`
+	Ref       string      `yaml:"ref"`
+}
+
+// Untracked is a file of images.<key>.untracked: Path, relative to the project; Required refuses
+// a ship while it is absent (an absent one is built without, said).
+type Untracked struct {
+	Path     string `yaml:"path"`
+	Required bool   `yaml:"required"`
+}
+
+// UntrackedFile resolves an images.<key>.untracked path: cleaned, and its absolute path. Refused:
+// a path leaving the project, one with a symbolic link at any component (a copy or a digest would
+// read another file than the build), and one naming anything but a regular file. ok is false when
+// it does not exist.
+func UntrackedFile(root, rel string) (clean, abs string, ok bool, err error) {
+	if err := InsideRoot(rel); err != nil {
+		return "", "", false, fmt.Errorf("%q %w", rel, err)
+	}
+	clean = path.Clean(filepath.ToSlash(rel))
+	abs = Path(root, clean)
+	cur := root
+	parts := strings.Split(clean, "/")
+	for i, c := range parts {
+		cur = filepath.Join(cur, c)
+		fi, err := os.Lstat(cur)
+		switch {
+		case errors.Is(err, os.ErrNotExist):
+			return clean, abs, false, nil
+		case err != nil:
+			return "", "", false, fmt.Errorf("%s cannot be read: %v", clean, errors.Unwrap(err))
+		case fi.Mode()&os.ModeSymlink != 0:
+			return "", "", false, fmt.Errorf("%s: %s is a symbolic link: name the file itself", clean, strings.Join(parts[:i+1], "/"))
+		case i == len(parts)-1 && !fi.Mode().IsRegular():
+			return "", "", false, fmt.Errorf("%s is not a file", clean)
+		}
+	}
+	return clean, abs, true, nil
 }
 
 // BuildNetworks are the networks an image's build steps may run on (images.<key>.network).

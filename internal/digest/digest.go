@@ -162,6 +162,24 @@ func GitInContext(ig *Ignore) (string, error) {
 	return found, err
 }
 
+// Excluded reports whether abs (an absolute path) is kept out of the build by the ignore file;
+// a path outside the context never is.
+func (ig *Ignore) Excluded(abs string) (bool, error) { return ig.excluded(abs) }
+
+// FileSum is "sha256:<hex>" of the file at abs.
+func FileSum(abs string) (string, error) {
+	f, err := os.Open(abs)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return "sha256:" + hex.EncodeToString(h.Sum(nil)), nil
+}
+
 // excluded reports whether abs (an absolute path) is ignored. Paths outside the base are never
 // ignored: docker cannot see them, so an explicit input outside the context counts as declared.
 func (ig *Ignore) excluded(abs string) (bool, error) {

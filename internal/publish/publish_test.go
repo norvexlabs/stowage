@@ -1018,7 +1018,7 @@ func TestShipReplacesAPointerLeftOnAYankedRelease(t *testing.T) {
 	p, _ := e.publisher()
 	m := *stale.Manifest
 	m.Yanked = &release.Yank{Reason: "bad", Date: e.now}
-	if _, err := p.writeRelease(context.Background(), m.Tag, &m, "", ""); err != nil { // yank, then "crash"
+	if _, err := p.writeRelease(context.Background(), m.Tag, &m, releaseRecords{}); err != nil { // yank, then "crash"
 		t.Fatal(err)
 	}
 	eq(t, "pointer still stale", e.digest("notes-release", "stable"), stale.Digest.String())
@@ -1034,7 +1034,7 @@ func TestReleasesSkipsAVersionTheSchemeNoLongerReads(t *testing.T) {
 	p, _ := e.publisher()
 	m := *first.Manifest
 	m.ProjectVersion, m.Tag = "not-a-version", "not-a-version"
-	if _, err := p.writeRelease(context.Background(), m.Tag, &m, "", ""); err != nil {
+	if _, err := p.writeRelease(context.Background(), m.Tag, &m, releaseRecords{}); err != nil {
 		t.Fatal(err)
 	}
 	rs, err := p.Releases(context.Background(), "stable")
@@ -1052,7 +1052,7 @@ func TestPointerOnAVersionTheSchemeNoLongerReadsMoves(t *testing.T) {
 	p, _ := e.publisher()
 	m := *first.Manifest
 	m.ProjectVersion, m.Tag = "legacy", "legacy"
-	old, err := p.writeRelease(context.Background(), m.Tag, &m, "", "")
+	old, err := p.writeRelease(context.Background(), m.Tag, &m, releaseRecords{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1580,4 +1580,32 @@ func TestInputsDiffNamesTheNodesAndFields(t *testing.T) {
 	eq(t, "the release alone", inputsDiff(ann, same), "release: changelog")
 	eq(t, "no annotation", inputsDiff("", now), "")
 	eq(t, "unreadable", inputsDiff("{", now), "")
+}
+
+// An image's untracked file enters the release: a required one absent ships nothing, one there is
+// logged by its SHA-256 and recorded on the release manifest's artifact, and another content of
+// it is other inputs, named so.
+func TestShipTakesTheUntrackedFiles(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	testutil.SetYAML(t, e.root, "stowage.yaml", []string{"images", "api"}, map[string]any{"context": "api", "dockerfile": "api/Dockerfile", "inputs": []string{"api/"},
+		"untracked": []map[string]any{{"path": "api/blob.bin", "required": true}}})
+	if _, err := e.ship("stable", 1); err == nil || !strings.Contains(err.Error(), "images.api.untracked: api/blob.bin is required and absent") || len(e.builder.built) != 0 {
+		t.Fatalf("absent: %v (%d built)", err, len(e.builder.built))
+	}
+	testutil.Write(t, e.root, "api/blob.bin", "made elsewhere")
+	sum := fmt.Sprintf("sha256:%x", sha256.Sum256([]byte("made elsewhere")))
+	r := e.mustShip("stable", 1)
+	if !strings.Contains(e.log.String(), "image api: untracked api/blob.bin "+sum) {
+		t.Errorf("not logged:\n%s", e.log)
+	}
+	p, _ := e.publisher()
+	got, err := p.readRelease(context.Background(), r.Manifest.Tag)
+	if err != nil || got.Untracked != `{"api/api/blob.bin":"`+sum+`"}` {
+		t.Fatalf("recorded %q: %v", got.Untracked, err)
+	}
+	testutil.Write(t, e.root, "api/blob.bin", "made again")
+	if _, err := e.ship("stable", 1); err == nil || !strings.Contains(err.Error(), "with other inputs (image/api: file, untracked;") {
+		t.Fatalf("another content: %v", err)
+	}
 }

@@ -282,7 +282,16 @@ release for a test run, never the project's, without editing the spec:
     run left it, even locked; no other worktree is touched), and runs `stowage ship` there
     for the channel (`--channel`, by default the one with `latest: true`, else the first) at
     revision 1: the release is that commit, whatever the working tree holds or wherever `HEAD`
-    moved meanwhile, and a file the commit does not record (untracked or ignored) is not in it;
+    moved meanwhile, and a file the commit does not record (untracked or ignored) is not in it —
+    but an image's declared untracked files (`images.<key>.untracked`, the one exception): `hook
+    post-commit` copies each from the working tree at the commit, byte for byte with its
+    executable bit, into `<git common dir>/stowage/untracked/<full id>/` (`stowage hook: untracked
+    <path> taken for the ship`; a required one absent starts no ship: `images.<key>.untracked:
+    <path> is required and absent from the working tree; <version> not shipped`), and the
+    background run copies them into the checkout before the ship (`stowage hook: untracked <path>
+    copied into the checkout`), refusing one the commit records (`untracked <path>: the commit
+    records it, so the working tree's copy is not taken`), then removes them; a file put there
+    for the next release while this one's ship waits never reaches it;
     the repository's `post-checkout` hook runs for the checkout as for any, and its failure
     fails the ship; it refuses an `<id>` that is not a commit, a commit not at `<version>`, and
     a project holding submodules (their content would not be in the checkout; publish such a

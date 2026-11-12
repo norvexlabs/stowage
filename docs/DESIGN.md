@@ -405,7 +405,14 @@ pushed artifact.
   `git-tag` or `command` version source does not move with a commit, so its project ships with
   `stowage ship`. The ship runs in a detached checkout of the commit, so the release is that
   commit whatever happens to the working tree meanwhile; a relative signing key is read from the
-  project directory, since a key file is never committed. Git runs without the hook's `GIT_*`
+  project directory, since a key file is never committed. An image's declared untracked files
+  (`images.<key>.untracked`: a build input the commit cannot record, such as a binary made on
+  another OS) are the one exception to the checkout: taken from the working tree by the
+  synchronous step, at the commit, and staged in the git common directory, then copied into the
+  checkout — never read when a queued ship starts, as the working tree may hold the next
+  release's by then. Each enters the image's inputs digest by its SHA-256, so the release says
+  what it was built with; whether the file matches the release stays the project's build's to
+  check. Git runs without the hook's `GIT_*`
   variables, which describe the commit in progress, not the repository layout `-C` finds.
 
 ## 5. Registry layout and release manifest

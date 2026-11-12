@@ -25,6 +25,7 @@ import (
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/mutate"
 
+	"github.com/norvexlabs/stowage/internal/digest"
 	"github.com/norvexlabs/stowage/internal/graph"
 	"github.com/norvexlabs/stowage/internal/lock"
 	"github.com/norvexlabs/stowage/internal/payload"
@@ -125,9 +126,20 @@ type Ref struct {
 	Digest   v1.Hash
 	// AuditOverride is the reason the release was published past its audit gate ("" for none).
 	AuditOverride string
-	// NodeInputs is its NodeInputsAnnotation ("" for a release published without one).
-	NodeInputs string
+	// NodeInputs is its NodeInputsAnnotation, Untracked its UntrackedAnnotation ("" for a release
+	// published without one).
+	NodeInputs, Untracked string
 }
+
+// releaseRecords are the publisher's records on a release manifest's artifact beside its inputs
+// digest, each an annotation when set: the audit override's reason, NodeInputsAnnotation and
+// UntrackedAnnotation.
+type releaseRecords struct{ override, nodes, untracked string }
+
+// UntrackedAnnotation records on a release manifest's artifact the SHA-256 of each untracked file
+// its images were built with (images.<key>.untracked), by "<key>/<path>", "absent" for one that
+// was not there (JSON). The signature covers it, and no install reads it.
+const UntrackedAnnotation = "dev.stowage.untracked"
 
 func (p *Publisher) readRelease(ctx context.Context, tag string) (*Ref, error) {
 	t, err := p.Registry.Tag(p.releaseRepo(), tag)
@@ -145,7 +157,8 @@ func (p *Publisher) readRelease(ctx context.Context, tag string) (*Ref, error) {
 	if m.Name != p.Project.Spec.Name {
 		return nil, fmt.Errorf("%s: release of %q, not %q: %w", t, m.Name, p.Project.Spec.Name, registry.ErrNotArtifact)
 	}
-	return &Ref{Manifest: m, Digest: d, AuditOverride: a.Annotations[AuditOverrideAnnotation], NodeInputs: a.Annotations[NodeInputsAnnotation]}, nil
+	return &Ref{Manifest: m, Digest: d, AuditOverride: a.Annotations[AuditOverrideAnnotation], NodeInputs: a.Annotations[NodeInputsAnnotation],
+		Untracked: a.Annotations[UntrackedAnnotation]}, nil
 }
 
 // AuditOverrideAnnotation records on a release manifest's artifact the reason it was published past
@@ -220,6 +233,41 @@ func inputsDiff(was string, g *graph.Graph) string {
 	return strings.Join(out, "; ")
 }
 
+// untracked says each image's untracked files (images.<key>.untracked), their SHA-256 or that one
+// is absent, and refuses a required one absent, before anything is built. It returns
+// UntrackedAnnotation's value, "" when no image declares one.
+func (p *Publisher) untracked() (string, error) {
+	sums := map[string]string{}
+	for _, key := range p.Project.Spec.ImageNames() {
+		img := p.Project.Spec.Images[key]
+		for _, u := range img.Untracked {
+			clean, abs, ok, err := spec.UntrackedFile(p.Project.Root, u.Path)
+			if err != nil {
+				return "", fmt.Errorf("images.%s.untracked: %w", key, err)
+			}
+			switch {
+			case !ok && u.Required:
+				return "", fmt.Errorf("images.%s.untracked: %s is required and absent: put it in the working tree (a hook ship takes it from there at the commit), or ship without requiring it", key, clean)
+			case !ok:
+				sums[key+"/"+clean] = "absent"
+				p.logf("image %s: untracked %s is absent: built without it", key, clean)
+			default:
+				sum, err := digest.FileSum(abs)
+				if err != nil {
+					return "", fmt.Errorf("images.%s.untracked: %s: %w", key, clean, err)
+				}
+				sums[key+"/"+clean] = sum
+				p.logf("image %s: untracked %s %s", key, clean, sum)
+			}
+		}
+	}
+	if len(sums) == 0 {
+		return "", nil
+	}
+	b, err := json.Marshal(sums) // its keys sorted
+	return string(b), err
+}
+
 // union is the keys of a and b, with a's values.
 func union(a, b map[string]string) map[string]string {
 	out := map[string]string{}
@@ -233,8 +281,8 @@ func union(a, b map[string]string) map[string]string {
 }
 
 // writeRelease pushes m by digest, signs it, and only then moves tag to it: a release tag never
-// holds an unsigned manifest of a signed project. nodes is its NodeInputsAnnotation, "" for none.
-func (p *Publisher) writeRelease(ctx context.Context, tag string, m *release.Manifest, override, nodes string) (v1.Hash, error) {
+// holds an unsigned manifest of a signed project.
+func (p *Publisher) writeRelease(ctx context.Context, tag string, m *release.Manifest, rec releaseRecords) (v1.Hash, error) {
 	data, err := m.Encode()
 	if err != nil {
 		return v1.Hash{}, err
@@ -244,11 +292,10 @@ func (p *Publisher) writeRelease(ctx context.Context, tag string, m *release.Man
 		return v1.Hash{}, err
 	}
 	ann := map[string]string{registry.InputsAnnotation: m.Inputs}
-	if override != "" {
-		ann[AuditOverrideAnnotation] = override
-	}
-	if nodes != "" {
-		ann[NodeInputsAnnotation] = nodes
+	for k, v := range map[string]string{AuditOverrideAnnotation: rec.override, NodeInputsAnnotation: rec.nodes, UntrackedAnnotation: rec.untracked} {
+		if v != "" {
+			ann[k] = v
+		}
 	}
 	d, err := p.Registry.PushArtifact(ctx, t.Repository, registry.Artifact{
 		Type: release.MediaType, Data: data,
@@ -595,6 +642,13 @@ func (p *Publisher) Ship(ctx context.Context, o ShipOptions) (*Ref, error) {
 		return nil, err
 	}
 	relNode, _ := g.Node(graph.KindRelease)
+	// A promotion builds nothing: what its release was built with is recorded already.
+	untracked := ""
+	if !o.NoBuild {
+		if untracked, err = p.untracked(); err != nil {
+			return nil, err
+		}
+	}
 
 	existing, err := p.readRelease(ctx, tag)
 	if err != nil {
@@ -978,7 +1032,7 @@ func (p *Publisher) Ship(ctx context.Context, o ShipOptions) (*Ref, error) {
 		if err != nil {
 			return nil, err
 		}
-		d, err := p.writeRelease(ctx, tag, m, override, nodes)
+		d, err := p.writeRelease(ctx, tag, m, releaseRecords{override, nodes, untracked})
 		if err != nil {
 			return nil, err
 		}
@@ -1696,7 +1750,7 @@ func (p *Publisher) Yank(ctx context.Context, channel, v string, revision int, r
 	if r.Manifest.Yanked == nil {
 		m := *r.Manifest
 		m.Yanked = &release.Yank{Reason: reason, Date: p.Now().UTC()}
-		d, err := p.writeRelease(ctx, m.Tag, &m, r.AuditOverride, r.NodeInputs)
+		d, err := p.writeRelease(ctx, m.Tag, &m, releaseRecords{r.AuditOverride, r.NodeInputs, r.Untracked})
 		if err != nil {
 			return err
 		}

@@ -390,3 +390,46 @@ func TestHookPostCommitRefusesAVersionOutOfItsMonth(t *testing.T) {
 		t.Fatalf("this month's: %v %+v %q", err, l, logs)
 	}
 }
+
+// An untracked file an image declares is taken from the working tree at the commit, not when the
+// ship starts: the release is built with the file the commit was made beside, copied into the
+// checkout, its SHA-256 logged; one declared required and absent ships nothing.
+func TestHookShipTakesTheUntrackedFilesOfTheCommit(t *testing.T) {
+	t.Parallel()
+	root := registryProject(t)
+	testutil.SetYAML(t, root, "stowage.yaml", []string{"images", "api"}, map[string]any{"context": "api", "dockerfile": "api/Dockerfile", "inputs": []string{"api/"},
+		"untracked": []map[string]any{{"path": "api/blob.bin", "required": true}}})
+	testutil.Write(t, root, ".gitignore", "api/blob.bin\n")
+	testutil.GitRepo(t, root)
+	head := strings.TrimSpace(testutil.Git(t, root, "rev-parse", "HEAD"))
+	b := &randomBuilder{}
+	env := map[string]string{"NOTES_PUSH_TOKEN": "t0ken"}
+	r, err := hook.Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, logs, l, err := runHook(t, b, env, "-C", root, "hook", "post-commit")
+	if err != nil || len(l) != 0 || !strings.Contains(logs, "images.api.untracked: api/blob.bin is required and absent from the working tree; 1.0.0 not shipped") {
+		t.Fatalf("absent: %v %+v\n%s%s", err, l, out, logs)
+	}
+	testutil.Write(t, root, "api/blob.bin", "made elsewhere")
+	out, logs, l, err = runHook(t, b, env, "-C", root, "hook", "post-commit")
+	if err != nil || len(l) != 1 || !strings.Contains(out, "stowage hook: untracked api/blob.bin taken for the ship\n") {
+		t.Fatalf("staged: %v %+v\n%s%s", err, l, out, logs)
+	}
+	// The next release's file, put there before this one's ship starts, does not reach it.
+	testutil.Write(t, root, "api/blob.bin", "the next release's")
+	b.seen = func(p *project.Project) {
+		if got, err := os.ReadFile(filepath.Join(p.Root, "api", "blob.bin")); err != nil || string(got) != "made elsewhere" {
+			t.Errorf("the build read %q (%v), not the file of the commit", got, err)
+		}
+	}
+	out, logs, _, err = runHook(t, b, env, "-C", root, "hook", "post-commit", "--ship", "1.0.0", "--commit", head)
+	if err != nil || b.n == 0 || !strings.Contains(out, "stowage hook: untracked api/blob.bin copied into the checkout\n") ||
+		!strings.Contains(out+logs, "image api: untracked api/blob.bin sha256:") {
+		t.Fatalf("ship: %v (%d builds)\n%s%s", err, b.n, out, logs)
+	}
+	if _, err := os.Stat(r.StagedDir(head)); !os.IsNotExist(err) {
+		t.Errorf("the staged files are left: %v", err)
+	}
+}

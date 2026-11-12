@@ -92,6 +92,7 @@ func TestEachRuleFires(t *testing.T) {
 		want  string
 	}{
 		{"bad name", []edit{{specFile, "\nname: notes\n", "\nname: Notes\n"}}, nil, "name:"},
+		{"untracked of a ref", []edit{{specFile, "postgres: { ref: ", "postgres: { untracked: [{ path: api/x.bin }], ref: "}}, nil, "images.postgres: ref and build fields are exclusive"},
 		{"handoff bad name", []edit{{specFile, "  - name: second-site\n", "  - name: Second\n"}}, nil, "handoffs[0].name"},
 		{"handoff long name", []edit{{specFile, "  - name: second-site\n", "  - name: aaaaaaaaaaaaaaaaaaaaaaaaa\n"}}, nil, "at most 24 characters"},
 		{"handoff twice", []edit{{specFile, "handoffs:", "handoffs:\n  - { name: second-site, for: notes, run: { image: api, cmd: [x], env: [] }, gives: [A] }"}}, nil, "the name of another handoff"},
@@ -244,6 +245,12 @@ func TestEachRuleFiresOnFull(t *testing.T) {
 		{"contexts scratch", []edit{{sp, "contexts: { schema: migrations }", "contexts: { schema: migrations, scratch: ui }"}}, nil, `images.api.contexts: "scratch" collides with a name BuildKit gives its own`},
 		{"contexts context", []edit{{sp, "contexts: { schema: migrations }", "contexts: { schema: migrations, context: ui }"}}, nil, `images.api.contexts: "context" collides with a name BuildKit gives its own`},
 		{"contexts file", []edit{{sp, "contexts: { schema: migrations }", "contexts: { schema: docker/api.Dockerfile }"}}, nil, "images.api.contexts.schema: docker/api.Dockerfile is not a directory"},
+		{"untracked outside", []edit{{sp, "untracked: [{ path: server/vendor/codec.bin }]", "untracked: [{ path: ../codec.bin }]"}}, nil, `images.api.untracked[0].path: "../codec.bin" leaves the project root`},
+		{"untracked twice", []edit{{sp, "untracked: [{ path: server/vendor/codec.bin }]", "untracked: [{ path: server/vendor/codec.bin }, { path: ./server/vendor/codec.bin, required: true }]"}}, nil, "images.api.untracked[1].path: server/vendor/codec.bin is named twice"},
+		{"untracked directory", []edit{{sp, "untracked: [{ path: server/vendor/codec.bin }]", "untracked: [{ path: server }]"}}, nil, "images.api.untracked[0].path: server is not a file"},
+		{"untracked not sent", []edit{{sp, "ui:        { context: ui, dockerfile: ui/Dockerfile }", "ui:        { context: ui, dockerfile: ui/Dockerfile, untracked: [{ path: server/vendor/codec.bin }] }"}}, nil, "images.ui.untracked[0].path: server/vendor/codec.bin is in neither the build's context (ui) nor a named one: the build is not sent it"},
+		{"untracked ignored", nil, map[string]string{"docker/api.Dockerfile.dockerignore": "server/vendor/\n"}, "images.api.untracked[0].path: server/vendor/codec.bin is kept out of the build by its context's .dockerignore"},
+		{"untracked key", []edit{{sp, "untracked: [{ path: server/vendor/codec.bin }]", "untracked: [{ file: server/vendor/codec.bin }]"}}, nil, "field file not found"},
 		{"contexts git", []edit{{sp, "contexts: { schema: migrations }", "contexts: { schema: migrations, vendored: vendored }"}}, map[string]string{"vendored/.git": "gitdir: ../.git/modules/vendored\n", "vendored/a": "a\n"}, "images.api.contexts.vendored: vendored/.git: the build context holds .git"},
 		{"contexts ref", []edit{{sp, "ingest:    { context: ., dockerfile: docker/ingest.Dockerfile, inputs: [server/] }", "ingest:    { ref: \"registry.example.test/ingest@sha256:" + strings.Repeat("a", 64) + "\", contexts: { vendored: ui } }"}}, nil, "images.ingest: ref and build fields are exclusive"},
 		{"add_hosts name", []edit{{sp, "packages.atlas.test: [", "Packages.atlas.test: ["}}, nil, `images.api.add_hosts: "Packages.atlas.test" is not a host name`},
@@ -2793,5 +2800,34 @@ func TestAuditAllowNotice(t *testing.T) {
 		if errs := errorsOf(res); (len(errs) == 0) != ok {
 			t.Errorf("artifact %s: %q", art, errs)
 		}
+	}
+}
+
+// An untracked file through a symbolic link is refused (a copy or a digest would read another
+// file than the build), and so is one git records; the same file ignored by git is clean.
+func TestUntrackedIsAFileGitDoesNotRecord(t *testing.T) {
+	t.Parallel()
+	root := testutil.CopyExample(t, "full")
+	testutil.Write(t, root, "server/real.bin", "x")
+	if err := os.Symlink("real.bin", filepath.Join(root, "server", "vendor")); err != nil {
+		t.Fatal(err)
+	}
+	if errs := strings.Join(errorsOf(run(t, root)), "\n"); !strings.Contains(errs, "images.api.untracked[0].path: server/vendor/codec.bin: server/vendor is a symbolic link: name the file itself") {
+		t.Fatalf("a link:\n%s", errs)
+	}
+	// The repository above the project, so the build's context holds no .git.
+	repo := t.TempDir()
+	root = filepath.Join(repo, "atlas")
+	if err := os.Rename(testutil.CopyExample(t, "full"), root); err != nil {
+		t.Fatal(err)
+	}
+	testutil.Write(t, root, "server/vendor/codec.bin", "made elsewhere")
+	testutil.GitRepo(t, repo)
+	if errs := errorsOf(run(t, root)); len(errs) != 0 {
+		t.Fatalf("ignored by git: %q", errs)
+	}
+	testutil.Git(t, root, "add", "-f", "server/vendor/codec.bin")
+	if errs := strings.Join(errorsOf(run(t, root)), "\n"); !strings.Contains(errs, "images.api.untracked[0].path: git records server/vendor/codec.bin") {
+		t.Fatalf("recorded by git:\n%s", errs)
 	}
 }

@@ -9,24 +9,6 @@ A finished item is deleted, not ticked. The plan behind it is
 
 Batched by the gate they share: a batch is one slice, one review, one gate run.
 
-### Publishing — inputs the commit cannot record
-
-1. **A ship carries declared out-of-band build inputs into its checkout**: some build inputs
-   cannot be made from the commit (a binary compiled on another OS, under an SDK licensed for
-   other hardware); the publisher drops it in the working tree, ignored by git, and a local
-   `docker build` reads it, but `ship` builds from a fresh worktree of the commit (a file the
-   commit does not record is not in it), so the hook's releases ship silently without it — a
-   release unlike the one built and tested. Declare such inputs by path, relative to the project
-   (an image's `build:` key, named as fits the spec); `ship` and the hook copy each declared path
-   from the invoking working tree into the checkout before building, byte for byte, the hook at
-   commit time (never when a queued ship starts later: a file re-staged for the next release must
-   not reach an earlier one), and record each one's SHA-256 in the ship's log and the release
-   record, entering the image's inputs digest. An undeclared untracked or ignored file stays out.
-   A declared path absent: the ship goes on with a line saying so (optional by default; declarable
-   as required, then refused). Lint: a declared path inside the project and not tracked by git.
-   Docs: the publisher's hook section (the one exception to the checkout rule), the spec keys.
-   Checking that the input matches the release stays the project's own build's.
-
 ### Features — pull credentials
 
 1. **A pull credential per install**: issued at install time by what the `registry.pull` provider
