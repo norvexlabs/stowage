@@ -1194,7 +1194,11 @@ its repository's blobs), the proxy holding the publisher's account (pull-scoped 
 registry issues tokens) and asking auroraboot for an account of its own, a one-run random password
 in a private Docker config file — a loopback port is open to every local user, and a command
 line is readable by them. So the disks build from the registry whoever else may read it, and the
-publisher's account never enters a container. `ship` registers each `cloud_publish` disk in the
+publisher's account never enters a container. auroraboot's loop devices are the host's, which two runs at once
+race for: its container takes one fixed name, which the Docker daemon grants one container at a
+time — a lock the host's daemon holds, whichever process, user or mount namespace builds, where a
+lock file would be one namespace's — and a build finding it taken waits. The test suites, each with
+a cache of its own, then run side by side, their auroraboot runs taking turns. `ship` registers each `cloud_publish` disk in the
 publisher's account of that cloud through built-in OpenTofu modules per cloud — an upload (bucket
 object, S3 object, page blob, Object Storage object), the image made of it (Compute Engine image;
 import-snapshot → AMI; Azure image; Block Storage snapshot import → instance image), then the

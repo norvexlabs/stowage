@@ -196,7 +196,7 @@ func (j *journal) update(read bool, f func(held []Event) []Event) (int64, error)
 	if err := os.MkdirAll(j.dir, 0o755); err != nil {
 		return 0, err
 	}
-	unlock, err := flockWait(j.statePath(), true)
+	unlock, err := flockWait(context.Background(), j.statePath(), true)
 	if err != nil {
 		return 0, err
 	}
@@ -390,7 +390,7 @@ func (j *journal) since(after int64, limit int) (EventsAnswer, error) {
 		a.Truncated = after > 0
 		return a, nil
 	}
-	unlock, err := flockWait(j.statePath(), false)
+	unlock, err := flockWait(context.Background(), j.statePath(), false)
 	if err != nil {
 		return a, err
 	}
@@ -501,7 +501,7 @@ func (j *journal) lastOf(id string) (int64, *Event, error) {
 	if !fileExists(j.statePath()) && !fileExists(j.path()) {
 		return 0, nil, nil
 	}
-	unlock, err := flockWait(j.statePath(), false)
+	unlock, err := flockWait(context.Background(), j.statePath(), false)
 	if err != nil {
 		return 0, nil, err
 	}

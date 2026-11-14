@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -16,6 +17,7 @@ import (
 
 	"go.yaml.in/yaml/v3"
 
+	"github.com/norvexlabs/stowage/internal/flock"
 	"github.com/norvexlabs/stowage/internal/lint"
 	"github.com/norvexlabs/stowage/internal/providers"
 	"github.com/norvexlabs/stowage/internal/spec"
@@ -277,22 +279,30 @@ func containerName(env *EnvFile, service string) string {
 }
 
 // lockRun takes the install's lifecycle lock, held until the returned func: one provision,
-// upgrade or rollback at a time, and nothing it reads or writes changes under it. A hook or
-// schema container an earlier run left behind is refused too: it holds the fixed name a run needs.
+// upgrade or rollback at a time, and nothing it reads or writes changes under it. It waits up to
+// LockWait for another run; the lock is on the file at its path when taken (flock.Take), made
+// again when absent. A directory removed meanwhile (an uninstall, a first install that failed) is
+// refused, `run again`. A hook or schema container an earlier run left behind is refused too: it
+// holds the fixed name a run needs.
 func (in *Installer) lockRun(ctx context.Context, env *EnvFile) (func(), error) {
-	unlock, err := lockFile(in.path(lifecycleLock))
-	for deadline := time.Now().Add(in.O.LockWait); errors.Is(err, errLocked) && time.Now().Before(deadline); {
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-time.After(100 * time.Millisecond):
-		}
-		unlock, err = lockFile(in.path(lifecycleLock))
+	wait, poll := ctx, 100*time.Millisecond
+	if in.O.LockWait <= 0 {
+		poll = 0 // no wait: a lock held is flock.ErrHeld
+	} else {
+		var cancel context.CancelFunc
+		wait, cancel = context.WithTimeout(ctx, in.O.LockWait)
+		defer cancel()
 	}
-	if errors.Is(err, errLocked) {
+	unlock, err := flock.Take(wait, in.path(lifecycleLock), flock.Create, true, poll, nil)
+	switch {
+	case err == nil:
+	case ctx.Err() != nil: // the caller's own end, its deadline included
+		return nil, ctx.Err()
+	case errors.Is(err, fs.ErrNotExist): // before the wait's end: the install is gone, whenever
+		return nil, goneRefusal(in.O.Dir, err)
+	case errors.Is(err, flock.ErrHeld), errors.Is(err, context.DeadlineExceeded):
 		return nil, lockedRefusal
-	}
-	if err != nil {
+	default:
 		return nil, err
 	}
 	if err := in.leftovers(ctx, env); err != nil {
@@ -300,6 +310,25 @@ func (in *Installer) lockRun(ctx context.Context, env *EnvFile) (func(), error) 
 		return nil, err
 	}
 	return unlock, nil
+}
+
+// lockNow takes the install's lifecycle lock without waiting: another run holding it is errLocked;
+// a directory that does not exist (none made, or an uninstall removed it) is refused as no install.
+func (in *Installer) lockNow() (func(), error) {
+	unlock, err := lockFile(in.path(lifecycleLock))
+	if errors.Is(err, fs.ErrNotExist) {
+		fix := "give the --dir of an install, or install again"
+		if in.O.Preloaded { // the VM's: one install, at its one place
+			fix = "install again"
+		}
+		return nil, Refused{Reason: fmt.Sprintf("no install in %s: the directory does not exist (none made there, or an uninstall removed it)", in.O.Dir), Fix: fix, Absent: true, cause: err}
+	}
+	return unlock, err
+}
+
+// goneRefusal refuses a run whose install was removed while it waited for the lock.
+func goneRefusal(dir string, err error) error {
+	return Refused{Reason: fmt.Sprintf("the install in %s was removed before this run held its lock (an uninstall, or a first install that failed)", dir), Fix: "run again", cause: err}
 }
 
 // lockedRefusal is the refusal of a run while another holds the install's lifecycle lock; its

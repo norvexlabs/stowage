@@ -326,10 +326,10 @@ func TestVMAttach(t *testing.T) {
 		t.Fatal(err)
 	}
 	vm(boot("1"))
-	if err := in.AttachVM(ctx, a); err == nil || !strings.Contains(err.Error(), "another vm attach or vm destroy runs on it") || len(r.ssh.calls) != 0 {
+	if err := in.AttachVM(ctx, a); err == nil || !strings.Contains(err.Error(), "another vm create, vm attach or vm destroy runs on it") || len(r.ssh.calls) != 0 {
 		t.Errorf("locked: %v", err)
 	}
-	if err := in.DestroyVM(ctx, &VMDestroy{Host: "notes-1", Yes: true, Ctl: "/opt/notes-stow"}); err == nil || !strings.Contains(err.Error(), "another vm attach or vm destroy runs on it") {
+	if err := in.DestroyVM(ctx, &VMDestroy{Host: "notes-1", Yes: true, Ctl: "/opt/notes-stow"}); err == nil || !strings.Contains(err.Error(), "another vm create, vm attach or vm destroy runs on it") {
 		t.Errorf("vm destroy, locked: %v", err)
 	}
 	unlock()

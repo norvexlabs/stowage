@@ -133,7 +133,7 @@ for img in api web postgres front backup chown; do
 	digest=$(art "a['images']['$img']")
 	ref="$REG/notes/notes-$img:${digest/:/-}"
 	docker load --input "$tar" >"$WORK/load-$img.log" || { cat "$WORK/load-$img.log"; fail "docker load of $img"; }
-	CLEANUP+=("docker image rm -f $ref >/dev/null")
+	CLEANUP+=("docker image rm $ref >/dev/null")
 	id=$(docker image inspect --format '{{.Id}}' "$ref") || fail "$ref is not loaded"
 	want_m=$(art "a['manifests']['$img']")
 	want_c=$(art "a['configs']['$img']")
@@ -141,7 +141,7 @@ for img in api web postgres front backup chown; do
 done
 docker cp "$ctr:/usr/sbin/notes-stow" "$WORK/os-1.0.0-ctl"
 docker rm -f "$ctr" >/dev/null
-docker image rm -f "$REG/notes/notes-os:beta-1.0.0" >/dev/null
+docker image rm "$REG/notes/notes-os:beta-1.0.0" >/dev/null
 
 step "the bundle's notes-stow installs from the preloaded images, as on the VM; boot brings it up again"
 APP_PORT=$(free_port)
@@ -311,7 +311,7 @@ ctr=$(docker create "$REG/notes/notes-installer:latest")
 CLEANUP+=("docker rm -f $ctr >/dev/null 2>&1")
 docker cp "$ctr:/notes-stow" "$WORK/notes-stow-stable"
 docker rm -f "$ctr" >/dev/null
-docker image rm -f "$REG/notes/notes-installer:latest" >/dev/null
+docker image rm "$REG/notes/notes-installer:latest" >/dev/null
 python3 -c 'import base64,os,struct,sys
 s=lambda b: struct.pack(">I", len(b)) + b
 print("ssh-ed25519 " + base64.b64encode(s(b"ssh-ed25519") + s(os.urandom(32))).decode() + " e2e")' >"$WORK/key.pub"
@@ -402,7 +402,7 @@ CLEANUP+=("docker rm -f $ctr >/dev/null 2>&1")
 docker cp "$ctr:/usr/sbin/notes-stow" "$WORK/os-2.0.0-ctl"
 rm -rf "$WORK/preload2" && docker cp "$ctr:/usr/share/notes-preload" "$WORK/preload2"
 docker rm -f "$ctr" >/dev/null
-docker image rm -f "$REG/notes/notes-os:beta-2.0.0" >/dev/null
+docker image rm "$REG/notes/notes-os:beta-2.0.0" >/dev/null
 for tar in "$WORK"/preload2/*.tar; do docker load --input "$tar" >/dev/null || fail "docker load of $tar"; done
 "${OPERATOR[@]}" "$WORK/os-2.0.0-ctl" boot --dir "$D" >"$WORK/vm-boot2.log" 2>&1 || { cat "$WORK/vm-boot2.log"; fail "boot on 2.0.0"; }
 running 2.0.0 2

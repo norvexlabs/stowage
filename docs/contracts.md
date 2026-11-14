@@ -290,12 +290,24 @@ These are what `lint` checks; each finding names the key path or `file:line` to 
   repository's blobs (and the `/v2/` ping), so the publisher's account never leaves `ship`, and a
   disk builds whoever else may read the registry. auroraboot runs on the host's network, so the
   Docker engine must share this machine's loopback (a rootful engine; not rootless Docker nor
-  Docker Desktop's VM). Each container the disks' build runs (auroraboot, qemu-img, the files'
-  `chown`) is named `stowage-disks-<16 hex>`; a `ship` interrupted (Ctrl-C, SIGTERM) removes the
-  one running (`docker rm --force`) before it removes its work directory, as the killed `docker`
-  CLI would leave it running, holding that directory and its loop devices (one it cannot remove
+  Docker Desktop's VM). Each container the disks' build runs (qemu-img, the files' `chown`) is named
+  `stowage-disks-<16 hex>`, auroraboot's `stowage-disks-loop` (below), and labelled with its run's
+  own id (`io.stowage.disks.run`); a `ship` interrupted (Ctrl-C, SIGTERM) removes the containers of
+  its run's label (`docker rm --force`), for 2 s after the cancel (the daemon may make one a moment
+  after the killed `docker` CLI asked for it), before it removes its work directory: the killed
+  CLI would leave one running, holding that directory and its loop devices (one it cannot remove
   is named in the error: `the cancelled container <name> may still run: docker rm --force <name>:
-  …`). The formats: `raw` (EFI) by
+  …`). auroraboot's loop devices are the host's, so two of its runs at once fail: its container
+  is always named `stowage-disks-loop`, a name the Docker daemon gives one container at a time,
+  whichever process, user, container or mount namespace runs the build. A second `ship` building
+  disks meanwhile waits for the name, saying ``waiting for another disk build on this host: its
+  container stowage-disks-loop holds the name (<state>; `docker rm --force stowage-disks-loop` if
+  its build is gone)`` once (the daemon's own refusal of the name is not shown), until Ctrl-C, and
+  never removes that container. A holder seen not running (exited, dead, created, paused, being
+  removed…) that stays the same container for a minute is refused, naming its removal: ``the container stowage-disks-loop of an earlier disk build is
+  <state> and holds the name every disk build takes: `docker rm --force stowage-disks-loop`, then
+  run again``. A `ship` killed while its auroraboot runs leaves the container to end on its own
+  (`--rm`), keeping the name meanwhile. The formats: `raw` (EFI) by
   auroraboot; then, with qemu-img and tar from the raw disk, `vhd` (a fixed VHD, its virtual size
   the raw disk's grown to a whole number of MiB, as Azure imports it), `gce` (the raw disk grown
   to a whole number of GiB, as `disk.raw` alone in a sparse, oldgnu `.tar.gz`, as Google Cloud

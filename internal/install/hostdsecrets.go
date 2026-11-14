@@ -460,7 +460,7 @@ func (h *Hostd) provisionRestored(ctx context.Context, in *Installer, env *EnvFi
 func (h *Hostd) runRestore(in *Installer, object string, ids []age.Identity, logf func(string, ...any)) (err error) {
 	ctx, cancel := context.WithTimeout(h.ctx, backupTimeout)
 	defer cancel()
-	unlock, err := lockFile(in.path(lifecycleLock))
+	unlock, err := in.lockNow()
 	if errors.Is(err, errLocked) {
 		return errors.New("an install, upgrade, rollback, provision or reset-db is running: restore again once it is done")
 	}

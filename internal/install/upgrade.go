@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"slices"
@@ -147,11 +148,31 @@ func (in *Installer) openLocked(ctx context.Context) (*EnvFile, func(), error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	if env, err = in.open(); err != nil {
+	if env, err = in.reopen(env); err != nil {
 		unlock()
 		return nil, nil, err
 	}
 	return env, unlock, nil
+}
+
+// reopen reads the install again under its lock, read as before before it: one gone meanwhile
+// (an uninstall ran before this run held the lock), or another project's made since (an
+// uninstall, then an install: the lock checked the leftovers of the earlier project's container
+// names), is refused, `run again`. The same project made again there is the install the run then
+// reads: its containers' names, which the lock's check saw, are the same.
+func (in *Installer) reopen(before *EnvFile) (*EnvFile, error) {
+	env, err := in.open()
+	if r := (Refused{}); errors.As(err, &r) && r.Absent || errors.Is(err, fs.ErrNotExist) {
+		return nil, goneRefusal(in.O.Dir, err)
+	}
+	if err != nil {
+		return nil, err
+	}
+	was, _ := before.Get("COMPOSE_PROJECT_NAME")
+	if now, _ := env.Get("COMPOSE_PROJECT_NAME"); now != was {
+		return nil, Refused{Reason: fmt.Sprintf("the install in %s was replaced by another before this run held its lock", in.O.Dir), Fix: "run again"}
+	}
+	return env, nil
 }
 
 // pinnedImages reports whether the install pulls its images by digest; one made with --offline
@@ -1036,7 +1057,7 @@ func (in *Installer) Rollback(ctx context.Context) (err error) {
 			return err
 		}
 		unlock()
-		return in.startKept(ctx, pk.Manifest, o.Offline || !pinnedImages(env))
+		return in.startKept(ctx, pk.Manifest, pk.Release, o.Offline || !pinnedImages(env), true)
 	}
 	o.Offline = o.Offline || !pinnedImages(prevEnv)
 	// back is the previous release as this Stowage reads it: nil when another built it, whose
@@ -1164,7 +1185,7 @@ func (in *Installer) Rollback(ctx context.Context) (err error) {
 		return err
 	}
 	unlock()
-	if err := in.startKept(ctx, pk.Manifest, o.Offline); err != nil {
+	if err := in.startKept(ctx, pk.Manifest, pk.Release, o.Offline, false); err != nil {
 		return fmt.Errorf("%w\nthe install records %s %s; the release left is kept in %s", err, pk.Manifest.Name, st.ProjectVersion, failed)
 	}
 	return nil
@@ -1174,8 +1195,10 @@ func (in *Installer) Rollback(ctx context.Context) (err error) {
 // is started by its own Stowage's code, whichever Stowage built the one this installer carries.
 // On Docker that is a re-run of it (without the provision hook); a VM's installer (an OS
 // bundle's) runs its boot, which brings up the release the install records. The install is
-// unlocked: the child locks it, and says how to start it again if it cannot.
-func (in *Installer) startKept(ctx context.Context, m *release.Manifest, offline bool) error {
+// unlocked: the child locks it, and says how to start it again if it cannot. rel is that release
+// as this Stowage reads it, nil when another Stowage built it. stopped is a run finishing one that
+// stopped, which may have stopped before the newer release ever ran on the data.
+func (in *Installer) startKept(ctx context.Context, m *release.Manifest, rel *Release, offline, stopped bool) error {
 	args := []string{"--dir", in.O.Dir, "--no-input", "--no-provision"}
 	if m.Bundled() {
 		args = []string{bootCmd, "--dir", in.O.Dir}
@@ -1184,7 +1207,29 @@ func (in *Installer) startKept(ctx context.Context, m *release.Manifest, offline
 	}
 	in.O.logf("starting %s %s (revision %d) with its own installer: %s %s", m.Name, m.ProjectVersion, m.Revision, in.ctl(), strings.Join(args, " "))
 	// The rollback changed the install already: whatever the child says, this run failed.
-	return childFailed(in.ctl(), in.O.exec(ctx, in.ctl(), args))
+	if err := childFailed(in.ctl(), in.O.exec(ctx, in.ctl(), args)); err != nil {
+		return err
+	}
+	// The child, whichever Stowage built it, words its skipped hook as an operator's
+	// --no-provision: the rollback says why it skipped it, for a release with a hook (one this
+	// Stowage cannot read may have one).
+	if m.Bundled() {
+		return nil
+	}
+	has := ""
+	if rel == nil {
+		has = ", if it has one,"
+	} else if h, err := (&Installer{R: rel, O: in.O}).hook(); err != nil {
+		has = ", if it has one,"
+	} else if h == nil {
+		return nil
+	}
+	data := "on the data as the newer release left it"
+	if stopped {
+		data = "on the data as the run that stopped left it (as it was, if it stopped before the newer release started)"
+	}
+	in.O.logf("the provision hook is not run on a rollback (the --no-provision above is the rollback's): `%s provision --dir %s` runs %s %s's hook%s %s, only if that release needs it", in.ctl(), in.O.Dir, m.Name, m.ProjectVersion, has, data)
+	return nil
 }
 
 // rollbackRefused is the rollback check's refusal: the database moved past what the previous

@@ -697,7 +697,9 @@ func (in *Installer) applyImage(ctx context.Context, ctl string, p Platform, var
 	unlock, err := lockFile(lock)
 	if errors.Is(err, errLocked) {
 		in.O.logf("waiting for another vm create making the disk's image in %s", dir)
-		unlock, err = flockWait(lock, true)
+		if unlock, err = flockWait(ctx, lock, true); err != nil && ctx.Err() != nil {
+			err = fmt.Errorf("waiting for another vm create making the disk's image in %s: %w", dir, err)
+		}
 	}
 	if err != nil {
 		return err

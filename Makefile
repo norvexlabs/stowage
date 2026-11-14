@@ -19,8 +19,13 @@ $(GOCACHE_DIR):
 check:            ## gofmt + vet + staticcheck + govulncheck + race tests
 	$(BUILD) --target checks .
 
+# The binaries are exported beside ./bin and renamed into it one by one: a run executing one keeps
+# its file, where a write in place would make its next exec fail (text file busy).
 build:            ## static binary → ./bin/stowage (only after green checks)
-	$(BUILD) --target bin --output type=local,dest=bin .
+	mkdir -p bin
+	set -e; tmp=$$(mktemp -d bin/.new.XXXXXX); trap 'rm -rf "$$tmp"' EXIT; \
+	$(BUILD) --target bin --output type=local,dest=$$tmp .; \
+	for f in "$$tmp"/*; do mv -f "$$f" bin/; done
 
 e2e: build       ## publisher end to end against zot, with real image builds (needs Docker + network)
 	bash test/e2e-registry.sh

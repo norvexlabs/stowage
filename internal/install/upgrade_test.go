@@ -20,6 +20,7 @@ import (
 
 	"github.com/norvexlabs/stowage/internal/command"
 	"github.com/norvexlabs/stowage/internal/payload"
+	"github.com/norvexlabs/stowage/internal/release"
 	"github.com/norvexlabs/stowage/internal/spec"
 )
 
@@ -710,6 +711,9 @@ func TestRollbackGoesBackAndKeepsWhatTheUpgradeAdded(t *testing.T) {
 	}
 	if !strings.Contains(e.out.String(), "notes 1.0.0 is running") || len(e.docker.ran("compose")) == 0 {
 		t.Fatalf("not started: %s", e.out)
+	}
+	if want := " provision --dir " + e.dir + "` runs notes 1.0.0's hook on the data as the newer release left it"; !strings.Contains(e.log.String(), want) {
+		t.Errorf("the rollback does not say its hook was not run: %s", e.log)
 	}
 	for _, c := range e.docker.calls {
 		if strings.Contains(strings.Join(c.Args, " "), "reads_newer") {
@@ -1585,7 +1589,8 @@ func TestAReleaseOfAnotherStowageUpgradesAndGoesBack(t *testing.T) {
 	}
 	for _, want := range []string{foreign + ": what only its spec tells is not checked",
 		"starting notes 1.0.0 (revision 1) with its own installer: " + exe + " --dir " + e.dir + " --no-input --no-provision",
-		"going back unchecked: whether 1.0.0 reads the newer schema 6 is not known: another Stowage built it"} {
+		"going back unchecked: whether 1.0.0 reads the newer schema 6 is not known: another Stowage built it",
+		"the provision hook is not run on a rollback (the --no-provision above is the rollback's): `" + exe + " provision --dir " + e.dir + "` runs notes 1.0.0's hook, if it has one, on the data as the newer release left it, only if that release needs it"} {
 		if !strings.Contains(e.log.String(), want) {
 			t.Errorf("not logged: %s\n%s", want, e.log)
 		}
@@ -1907,5 +1912,37 @@ func TestARollbackTakesBackAPickOfThePreviousReleaseAlone(t *testing.T) {
 	}
 	if v, _ := env.Get("POSTURE"); v != "strict" {
 		t.Errorf("rolled back with %q", v)
+	}
+}
+
+// The rollback's word on the hook follows the previous release: none when it has no hook, a
+// conditional one when this Stowage cannot read it, and nothing for a VM's boot.
+func TestARollbacksStartSaysWhetherTheHookWasSkipped(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	with, _ := testInstaller(t, "1.0.0")
+	without, _ := testInstallerWith(t, "1.0.0", func(s *spec.Spec) { s.Hooks.Provision = nil })
+	bundled := *with.Manifest
+	bundled.Channel, bundled.Tag = "", "" // an OS bundle's: the VM's boot runs the hook
+	for name, c := range map[string]struct {
+		m    *release.Manifest
+		rel  *Release
+		want string
+	}{
+		"a hook":            {with.Manifest, with, "runs notes 1.0.0's hook on the data"},
+		"no hook":           {with.Manifest, without, ""},
+		"another Stowage's": {with.Manifest, nil, "runs notes 1.0.0's hook, if it has one, on the data"},
+		"a VM's boot":       {&bundled, with, ""},
+		"a stopped run":     {with.Manifest, with, "on the data as the run that stopped left it (as it was, if it stopped before the newer release started)"},
+	} {
+		e.log.Reset()
+		in := e.installer(func(o *Options) { o.Exec = func(context.Context, string, []string) error { return nil } })
+		if err := in.startKept(context.Background(), c.m, c.rel, false, name == "a stopped run"); err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		said := strings.Contains(e.log.String(), "the provision hook is not run on a rollback")
+		if said != (c.want != "") || c.want != "" && !strings.Contains(e.log.String(), c.want) {
+			t.Errorf("%s: logged\n%s", name, e.log)
+		}
 	}
 }

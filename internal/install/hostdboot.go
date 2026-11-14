@@ -243,7 +243,7 @@ func (h *Hostd) toPassive(j *job, p RollbackPlan) error {
 	// Never during an operator's run: the install's lock is held to the reboot, kept by the
 	// daemon so it is not released before.
 	in, _ := h.run()
-	unlock, err := lockFile(in.path(lifecycleLock))
+	unlock, err := in.lockNow()
 	if errors.Is(err, errLocked) {
 		return errors.New("nothing changed: the install is busy (an install, upgrade, rollback, provision or service action); run rollback again once it is done")
 	}

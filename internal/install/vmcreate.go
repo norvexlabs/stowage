@@ -226,11 +226,35 @@ func (in *Installer) CreateVM(ctx context.Context, c *VMCreate) error {
 		if state, err = o.stateDir(name, mach.Hostname); err != nil {
 			return err
 		}
+		// The state's lock, held for the whole run (its apply, the wait, the install over SSH):
+		// vm attach and vm destroy hold it too, and a second create of this host checks the
+		// state below only once the first wrote it.
+		if err := os.MkdirAll(filepath.Dir(state), 0o700); err != nil {
+			return err
+		}
+		unlock, err := lockFile(stateLock(state))
+		if errors.Is(err, errLocked) {
+			return fmt.Errorf("%s: another vm create, vm attach or vm destroy runs on it", mach.Hostname)
+		}
+		if err != nil {
+			return err
+		}
+		defer unlock()
 		// A VM of this host, or another of the same TrueNAS name, was applied (or tried to be):
 		// never applied over — its zvol is its data.
 		if _, err := os.Lstat(filepath.Join(state, varsFile)); err == nil {
 			return fmt.Errorf("%s exists: a VM %s was created before (`%s vm destroy %s` removes it), or give this one another --hostname", state, mach.Hostname, in.R.Ctl(), mach.Hostname)
 		}
+		// The platform name's lock too, for the whole run: another host's create of the same
+		// name writes its variables, which claimedBy reads, only once its disk is fetched.
+		nameUnlock, err := lockFile(nameLock(state, p.Key, c.Module == "", c.Name))
+		if errors.Is(err, errLocked) {
+			return fmt.Errorf("another vm create makes a VM named %s on %s now: give this one another --vm-name", c.Name, p.Key)
+		}
+		if err != nil {
+			return err
+		}
+		defer nameUnlock()
 		switch other, err := o.claimedBy(name, mach.Hostname, c.Name, p.Key, c.Module == ""); {
 		case err != nil:
 			return err

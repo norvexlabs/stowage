@@ -271,6 +271,7 @@ internal/backup/      the recipe of the VM's backup runner (rclone built from it
 internal/chown/       the recipe of the volume helper (busybox, pinned by digest), built by ship
 internal/sbom/        SBOMs (syft) and scans (grype); the audit report, the gate's policy and allowlist; the recipe of the scanner a release carries, built by ship
 internal/lock/        stowage.lock
+internal/flock/       advisory file locks that wait while a context lasts (the scanner's cache, the host's disk builds)
 internal/hook/        the post-commit hook: release detection, lock, detached ship
 internal/gitcmd/      git run without git's per-hook variables
 internal/installerbin/ the installer executable embedded in stowage

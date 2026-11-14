@@ -11,9 +11,10 @@
 #
 # The change is every path that differs from GATE_BASE, untracked files included. Markdown alone
 # runs nothing (a docs-only commit). A test file (_test.go) runs no suite: make check runs it. The
-# parallel suites run with make -j -k; beside them e2e-kairos, e2e-vm and e2e-full-vm run as one
-# chain, one at a time (they make disks with auroraboot, which races for loop devices; a failure
-# ends the chain), and e2e-vm and e2e-full-vm need STOWAGE_VM_ENV=<file>. A change to the cloud
+# parallel suites, e2e-kairos among them, run with make -j -k (disk builds wait for one another on
+# auroraboot's one container name, as its loop devices are the host's); beside them e2e-vm and
+# e2e-full-vm run as one chain, one TrueNAS VM at a time (a failure ends the chain), and need
+# STOWAGE_VM_ENV=<file>. A change to the cloud
 # images' registration (the uploader, the publisher's step, the CLI's settings) runs e2e-kairos with STOWAGE_CLOUD_ENV=<file> (the clouds' settings and credentials), so
 # its images are registered for real. Every suite runs the binaries the gate builds once, before
 # them: a snapshot of the tree as the gate started.
@@ -125,6 +126,14 @@ for f in "${changed[@]}"; do
 		lifecycle "$f"
 		need e2e-full-vm "$f"
 		;;
+	# Every lock Stowage takes: the installs' (smoke and the lifecycles), the host daemon's (the
+	# VM's), the scanner cache's (every ship's audit).
+	internal/flock/*)
+		need smoke-install "$f"
+		need e2e "$f"
+		lifecycle "$f"
+		vm_side "$f"
+		;;
 	# The SBOMs ship makes, the scanner a release carries, the audits that read them.
 	internal/sbom/*) # every signed ship of every example makes SBOMs; the audits read them
 		need e2e "$f"
@@ -216,7 +225,7 @@ for s in "${order[@]}"; do
 	if [[ -n ${why[$s]:-} ]]; then
 		echo "  $s  (${why[$s]})"
 		case $s in
-		e2e-kairos | e2e-vm | e2e-full-vm) chain+=("$s") ;;
+		e2e-vm | e2e-full-vm) chain+=("$s") ;;
 		*) parallel+=("$s") ;;
 		esac
 	else
@@ -241,7 +250,7 @@ make build
 ./bin/stowage -C examples/full lint
 ./bin/stowage -C examples/stateless lint
 if $hooks; then test/hooks.sh; fi
-# The kairos chain runs one suite at a time, beside the parallel suites. Both run the binaries the
+# The VM chain runs one suite at a time, beside the parallel suites. Both run the binaries the
 # build above made (-o build): a suite's own build would rewrite ./bin while another one runs a
 # binary from it, which exec then refuses (text file busy).
 chain_rc=0 pid=""

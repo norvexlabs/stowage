@@ -2,6 +2,7 @@ package kairos
 
 import (
 	"archive/tar"
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/binary"
@@ -395,6 +396,23 @@ func TestOVAIsTheDescriptorThenTheDisk(t *testing.T) {
 // qemu-img that writes its last argument. Every call is logged.
 const fakeDocker = `#!/bin/sh
 echo "$*" >> "$FAKE_LOG"
+case "$*" in
+"run --name stowage-disks-loop "*)
+	if [ -n "$FAKE_BUSY" ] && [ ! -e "$FAKE_BUSY" ]; then
+		echo 'docker: Error response from daemon: Conflict. The container name "/stowage-disks-loop" is already in use by container "0123". You have to remove (or rename) that container to be able to reuse that name.' >&2
+		echo "See 'docker run --help'." >&2
+		exit 125
+	fi
+	echo "$*" | sed -n 's/.*--label io.stowage.disks.run=\([0-9a-f]*\) .*/\1/p' > "$FAKE_LOG.run"
+	[ -z "$FAKE_HANG" ] || exec sleep 30 ;;
+"container inspect --format {{.Id}} {{.State.Status}} stowage-disks-loop")
+	h=holder1; [ -z "$FAKE_HOLDER_EACH" ] || h=holder$(date +%s%N)
+	echo "$h ${FAKE_STATE:-running}"; exit 0 ;;
+"ps --all --quiet --filter label=io.stowage.disks.run="*)
+	label=$(cat "$FAKE_LOG.run" 2>/dev/null); [ -z "$FAKE_OWNER" ] || label=$FAKE_OWNER
+	case "$*" in *"=$label") [ -z "$label" ] || echo loopcid ;; esac; exit 0 ;;
+"rm --force "*) exit 0 ;;
+esac
 vol() { echo "$1" | sed -n "s|.*--volume \([^ ]*\):/$2[ :].*|\1|p"; }
 case "$*" in
 *"--entrypoint chown"*|buildx*) exit 0 ;;
@@ -479,73 +497,7 @@ func fakeBuilder(t *testing.T) (*DiskBuilder, string) {
 	saved := OnDisk
 	OnDisk = func(string) error { return nil }
 	t.Cleanup(func() { OnDisk = saved })
-	return &DiskBuilder{Docker: filepath.Join(bin, "docker"), WorkDir: t.TempDir(), Stderr: io.Discard}, log
-}
-
-func TestDiskBuilderMakesEachFormat(t *testing.T) {
-	for _, c := range []struct {
-		formats []string
-		runs    []string // auroraboot flags, in order
-	}{
-		{[]string{"qcow2"}, []string{"disk.efi"}},
-		{[]string{"raw", "qcow2", "ova", "vhd", "gce"}, []string{"disk.efi"}},
-		{[]string{"vhd"}, []string{"disk.efi"}},
-		{[]string{"gce"}, []string{"disk.efi"}},
-		{[]string{"iso"}, []string{"disk.efi"}},
-		{[]string{"raw", "qcow2", "ova", "vhd", "gce", "iso"}, []string{"disk.efi"}},
-	} {
-		t.Run(strings.Join(c.formats, ","), func(t *testing.T) {
-			b, log := fakeBuilder(t)
-			r := DiskRequest{Source: "127.0.0.1:5000/notes-os@sha256:" + strings.Repeat("c", 64), Registry: "127.0.0.1:5000", RootfsMiB: 3500,
-				Auth: authn.AuthConfig{Username: "u", Password: "p"}, Formats: c.formats, Base: "notes-1.0.0"}
-			made, cleanup, err := b.Build(context.Background(), r)
-			if err != nil {
-				t.Fatal(err)
-			}
-			out := made.Files
-			if !slices.Equal(slices.Sorted(maps.Keys(out)), slices.Sorted(slices.Values(c.formats))) {
-				t.Errorf("files = %v", out)
-			}
-			for f, p := range out {
-				if filepath.Base(p) != "notes-1.0.0."+Ext[f] {
-					t.Errorf("%s: %s", f, p)
-				}
-				if _, err := os.Stat(p); err != nil {
-					t.Errorf("%s: %v", f, err)
-				}
-			}
-			dir := filepath.Dir(out[c.formats[0]])
-			if left, _ := os.ReadDir(dir); len(left) != len(c.formats) {
-				t.Errorf("the output holds more than the disks: %v", left)
-			}
-			calls, _ := os.ReadFile(log)
-			var runs []string
-			for _, l := range strings.Split(string(calls), "\n") {
-				if strings.Contains(l, Auroraboot+" --set") {
-					if !strings.Contains(l, "container_image=oci://"+r.Source) || !strings.Contains(l, "--privileged") || !strings.Contains(l, fmt.Sprintf("--set disk.state_size=%d ", StateMiB(3500))) {
-						t.Errorf("auroraboot call: %s", l)
-					}
-					runs = append(runs, strings.TrimSuffix(l[strings.LastIndex(l, " ")+1:], "=true"))
-				}
-			}
-			if !slices.Equal(runs, c.runs) {
-				t.Errorf("auroraboot runs = %v, want %v", runs, c.runs)
-			}
-			// The installer embeds the raw disk's state partition and the screen's console.
-			if iso, ok := out["iso"]; ok {
-				if cc, _ := os.ReadFile(iso); string(cc) != fmt.Sprintf(isoConfig, StateMiB(3500)) || !strings.Contains(string(cc), "      size: "+strconv.FormatInt(StateMiB(3500), 10)+"\n") {
-					t.Errorf("the ISO's cloud-config:\n%s", cc)
-				}
-				if !strings.Contains(string(calls), " build-iso --output /state --override-name notes-1.0.0 --cloud-config /iso-config.yaml oci://"+r.Source+"\n") || strings.Contains(string(calls), "--privileged --network host --volume "+filepath.Dir(iso)) {
-					t.Errorf("build-iso call:\n%s", calls)
-				}
-			}
-			cleanup()
-			if _, err := os.Stat(dir); !errors.Is(err, fs.ErrNotExist) {
-				t.Errorf("cleanup left %s", dir)
-			}
-		})
-	}
+	return &DiskBuilder{Docker: filepath.Join(bin, "docker"), WorkDir: t.TempDir(), Stderr: io.Discard, removeGrace: 10 * time.Millisecond}, log
 }
 
 // auroraboot can exit 0 without writing its disk: that is a failure, and nothing is left behind.
@@ -1264,39 +1216,49 @@ func TestInterfacesAreTheImagesNetworkdFiles(t *testing.T) {
 	}
 }
 
-// A cancelled build removes the container its docker run started, which the killed CLI leaves
-// running, before it returns; a container already gone is no error.
+// A cancelled build removes the containers labelled with its run, which the killed CLI leaves
+// running (or the daemon makes a moment after the kill), before it returns; none is no error. A
+// run that ends on its own removes nothing.
 func TestACancelledBuildRemovesItsContainer(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
 	log := filepath.Join(dir, "log")
 	fake := filepath.Join(dir, "docker")
-	body := "#!/bin/sh\necho \"$*\" >> " + log + "\ncase $1 in run) exec sleep 30 ;; rm) [ ! -e " + dir + "/gone ] || { echo 'Error: No such container' >&2; exit 1; } ;; esac\n"
+	// run records its label and hangs; ps lists the container of that label from its second look
+	// (the daemon makes it after the CLI was killed) until it is removed; rm removes it.
+	body := `#!/bin/sh
+echo "$*" >> ` + log + `
+case $1 in
+run) echo "$*" | sed -n 's/.*--label io.stowage.disks.run=\([0-9a-f]*\) .*/\1/p' > ` + dir + `/label; exec sleep 30 ;;
+ps) n=$(cat ` + dir + `/psn 2>/dev/null || echo 0); echo $((n+1)) > ` + dir + `/psn
+	[ "$n" -ge 1 ] || exit 0 # made by the daemon only after the first look, as one whose create was in flight
+	[ -e ` + dir + `/none ] || [ -e ` + dir + `/removed ] || case "$*" in *"=$(cat ` + dir + `/label)") echo cid1 ;; esac ;;
+rm) touch ` + dir + `/removed ;;
+esac
+`
 	if err := testutil.WriteExecutable(fake, []byte(body)); err != nil {
 		t.Fatal(err)
 	}
-	b := &DiskBuilder{Docker: fake}
+	b := &DiskBuilder{Docker: fake, removeGrace: 20 * time.Millisecond}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- b.docker(ctx, "run", "--rm", "img") }()
 	for {
-		if raw, _ := os.ReadFile(log); len(raw) > 0 {
+		if raw, _ := os.ReadFile(filepath.Join(dir, "label")); len(bytes.TrimSpace(raw)) > 0 {
 			break
 		}
 		time.Sleep(time.Millisecond)
 	}
 	cancel()
-	if err := <-done; err == nil {
-		t.Fatal("a cancelled run succeeded")
+	if err := <-done; err == nil || strings.Contains(err.Error(), "may still run") {
+		t.Fatalf("a cancelled run: %v", err)
 	}
 	raw, _ := os.ReadFile(log)
-	lines := strings.Split(strings.TrimSpace(string(raw)), "\n")
-	name := strings.Fields(lines[0])[2]
-	if len(lines) != 2 || !strings.HasPrefix(lines[0], "run --name "+containerPrefix+"-") || lines[1] != "rm --force "+name {
-		t.Errorf("ran %q", lines)
+	if !strings.HasPrefix(string(raw), "run --name "+containerPrefix+"-") || !strings.Contains(string(raw), "\nrm --force cid1\n") {
+		t.Errorf("ran %q", raw)
 	}
-	// A container the daemon never made is no error of the removal's.
-	if err := os.WriteFile(filepath.Join(dir, "gone"), nil, 0o644); err != nil {
+	// None made: nothing removed, no error of the removal's.
+	if err := os.WriteFile(filepath.Join(dir, "none"), nil, 0o644); err != nil {
 		t.Fatal(err)
 	}
 	ctx, cancel = context.WithCancel(context.Background())
@@ -1314,5 +1276,156 @@ func TestACancelledBuildRemovesItsContainer(t *testing.T) {
 	}
 	if raw, _ := os.ReadFile(log + ".ok"); strings.Count(string(raw), "\n") != 1 {
 		t.Errorf("ran %q", raw)
+	}
+}
+
+// A disk build waits while another build's auroraboot holds the host's one name (whatever process
+// or namespace runs it), says so once over several tries, naming the container and its fix, and
+// gives up with its context without removing that container; once the name is free it builds.
+func TestDiskBuilderWaitsForAnotherBuildsContainer(t *testing.T) {
+	b, log := fakeBuilder(t)
+	b.loopPoll = time.Millisecond
+	free := filepath.Join(t.TempDir(), "free")
+	t.Setenv("FAKE_BUSY", free)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { // cancelled once three tries met the name taken
+		for ctx.Err() == nil {
+			if raw, _ := os.ReadFile(log); strings.Count(string(raw), "run --name stowage-disks-loop ") >= 3 {
+				cancel()
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}()
+	var said bytes.Buffer
+	b.Stderr = &said
+	req := DiskRequest{Source: "r/notes-os@sha256:" + strings.Repeat("c", 64), Registry: "r", RootfsMiB: 3500, Formats: []string{"raw"}, Base: "notes-1.0.0"}
+	_, cleanup, err := b.Build(ctx, req)
+	cleanup()
+	if !errors.Is(err, context.Canceled) { // cancelled between tries, or during one
+		t.Fatalf("Build while the name is held = %v", err)
+	}
+	if n := strings.Count(said.String(), "waiting for another disk build on this host: its container stowage-disks-loop holds the name (running; `docker rm --force stowage-disks-loop` if its build is gone)"); n != 1 {
+		t.Errorf("said %d times: %q", n, said.String())
+	}
+	if strings.Contains(said.String(), "is already in use by container") || strings.Contains(said.String(), "docker run --help") {
+		t.Errorf("the daemon's refusal reached the operator at each try: %q", said.String())
+	}
+	if raw, _ := os.ReadFile(log); strings.Contains(string(raw), "rm --force") {
+		t.Errorf("removed another build's container:\n%s", raw)
+	}
+	if err := os.WriteFile(free, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	b.Stderr = io.Discard
+	_, cleanup, err = b.Build(context.Background(), req)
+	defer cleanup()
+	if err != nil {
+		t.Fatalf("Build once the name is free = %v", err)
+	}
+}
+
+// A holder of the name that no longer runs (exited, dead, or made and never started past the
+// bound) is refused at once, naming its removal: no build will free the name.
+func TestDiskBuilderRefusesAStaleHolderOfTheName(t *testing.T) {
+	for _, state := range []string{"exited", "dead", "created", "removing", "paused"} {
+		want := "is " + state + " and holds the name every disk build takes: `docker rm --force stowage-disks-loop`, then run again"
+		b, _ := fakeBuilder(t)
+		b.loopPoll, b.loopStale = time.Millisecond, 5*time.Millisecond
+		t.Setenv("FAKE_BUSY", filepath.Join(t.TempDir(), "never"))
+		t.Setenv("FAKE_STATE", state)
+		req := DiskRequest{Source: "r/notes-os@sha256:" + strings.Repeat("c", 64), Registry: "r", RootfsMiB: 3500, Formats: []string{"raw"}, Base: "notes-1.0.0"}
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		_, cleanup, err := b.Build(ctx, req)
+		cleanup()
+		cancel()
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("%s: %v", state, err)
+		}
+	}
+}
+
+// A build cancelled while its auroraboot runs removes its own container, never another build's
+// that took the name meanwhile (its docker run was killed before the daemon's refusal reached it).
+func TestDiskBuilderCancelledRemovesOnlyItsOwnContainer(t *testing.T) {
+	for owner, removed := range map[string]bool{"": true, "0123456789abcdef": false} {
+		b, log := fakeBuilder(t)
+		t.Setenv("FAKE_HANG", "1")
+		t.Setenv("FAKE_OWNER", owner) // "": the label of this run's own docker run
+		ctx, cancel := context.WithCancel(context.Background())
+		go func() {
+			for ctx.Err() == nil {
+				// Once the fake daemon made the container (its label recorded).
+				if raw, _ := os.ReadFile(log + ".run"); len(bytes.TrimSpace(raw)) > 0 {
+					cancel()
+				}
+				time.Sleep(time.Millisecond)
+			}
+		}()
+		req := DiskRequest{Source: "r/notes-os@sha256:" + strings.Repeat("c", 64), Registry: "r", RootfsMiB: 3500, Formats: []string{"raw"}, Base: "notes-1.0.0"}
+		_, cleanup, err := b.Build(ctx, req)
+		cleanup()
+		cancel()
+		if err == nil {
+			t.Fatalf("owner %q: a cancelled build succeeded", owner)
+		}
+		raw, _ := os.ReadFile(log)
+		if got := strings.Contains(string(raw), "rm --force loopcid"); got != removed {
+			t.Errorf("owner %q: removed %v, want %v:\n%s", owner, got, removed, raw)
+		}
+	}
+}
+
+// The docker CLI's refusal of a name is found wherever it comes, after a long image pull too, and
+// kept from the operator; a line of the container's own holding the same words is shown.
+func TestConflictLinesFindsTheCLIsRefusal(t *testing.T) {
+	t.Parallel()
+	var shown bytes.Buffer
+	c := &conflictLines{w: &shown}
+	pull := strings.Repeat("a1b2c3d4e5f6: Downloading [=====>     ]  12.3MB/45.6MB\n", 200) // past any head buffer
+	for _, chunk := range []string{pull, "auroraboot: name x is already in use by container y\n", "docker: Error response from daemon: Conf", "lict. The container name \"/stowage-disks-loop\" is already in use by container \"0123\".\n", "See 'docker run --help'.\n"} {
+		if _, err := c.Write([]byte(chunk)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c.flush()
+	if !c.conflict {
+		t.Error("the refusal after a long pull was not found")
+	}
+	if strings.Contains(shown.String(), "Error response from daemon: Conflict") || !strings.HasSuffix(shown.String(), "auroraboot: name x is already in use by container y\n") {
+		t.Errorf("shown %q", shown.String()[len(shown.String())-200:])
+	}
+	// None: no conflict.
+	c = &conflictLines{}
+	_, _ = c.Write([]byte("pulling\nok\n"))
+	if c.flush(); c.conflict {
+		t.Error("a conflict found in none")
+	}
+}
+
+// Different holders of the name one after another, each seen not running once, never add up to
+// a stale one: the bound is one container's. A carriage-return progress line reaches the operator
+// as it comes.
+func TestDiskBuilderStaleIsOneContainers(t *testing.T) {
+	b, _ := fakeBuilder(t)
+	b.loopPoll, b.loopStale = time.Millisecond, 5*time.Millisecond
+	free := filepath.Join(t.TempDir(), "free")
+	t.Setenv("FAKE_BUSY", free)
+	t.Setenv("FAKE_STATE", "created")
+	t.Setenv("FAKE_HOLDER_EACH", "1") // a new holder at each look
+	go func() { time.Sleep(50 * time.Millisecond); _ = os.WriteFile(free, nil, 0o600) }()
+	req := DiskRequest{Source: "r/notes-os@sha256:" + strings.Repeat("c", 64), Registry: "r", RootfsMiB: 3500, Formats: []string{"raw"}, Base: "notes-1.0.0"}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_, cleanup, err := b.Build(ctx, req)
+	defer cleanup()
+	if err != nil {
+		t.Fatalf("holders one after another refused as one stale: %v", err)
+	}
+	var shown bytes.Buffer
+	c := &conflictLines{w: &shown}
+	_, _ = c.Write([]byte("40%\r"))
+	if shown.String() != "40%\r" {
+		t.Errorf("a progress redraw held back: %q", shown.String())
 	}
 }

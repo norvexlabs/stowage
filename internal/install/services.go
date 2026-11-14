@@ -194,7 +194,7 @@ func (in *Installer) Uninstall(ctx context.Context, data bool) (err error) {
 	if err != nil {
 		return err
 	}
-	unlock, err := lockFile(in.path(lifecycleLock))
+	unlock, err := in.lockNow()
 	if errors.Is(err, errLocked) {
 		return lockedRefusal
 	}

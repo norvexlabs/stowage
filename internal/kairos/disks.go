@@ -276,39 +276,158 @@ type DiskBuilder struct {
 	WorkDir string
 	Stdout  io.Writer
 	Stderr  io.Writer
+	// loopPoll is how often a build waiting for another's auroraboot tries again; 0: loopWait.
+	loopPoll time.Duration
+	// loopStale and removeGrace are the constants' values; 0: the constants.
+	loopStale, removeGrace time.Duration
 }
 
+// loopName is the name every auroraboot run takes: auroraboot's loop devices are the host's, and
+// two runs at once fail ("device or resource busy"). The Docker daemon allows one container of a
+// name, whichever process, user or mount namespace asks: a build finding the name in use waits.
+const loopName = containerPrefix + "-loop"
+
+// loopWait is how often a build waiting for another's auroraboot tries again.
+const loopWait = time.Second
+
+// errNameInUse is a docker run refused because a container of its name exists.
+var errNameInUse = errors.New("the container name is in use")
+
 func (b *DiskBuilder) docker(ctx context.Context, args ...string) error {
-	d := b.Docker
-	if d == "" {
-		d = "docker"
-	}
-	// A container is named, so that a cancelled run removes it: killing the docker CLI leaves the
-	// container it started running, holding the work directory and, for auroraboot, loop devices.
-	name, what := "", strings.Join(args[:min(2, len(args))], " ")
+	name := ""
 	if len(args) > 0 && args[0] == "run" {
-		var r [8]byte
-		if _, err := rand.Read(r[:]); err != nil {
-			return err
-		}
-		name = fmt.Sprintf("%s-%x", containerPrefix, r)
-		args = append([]string{"run", "--name", name}, args[1:]...)
+		name = containerPrefix + "-" + randomHex()
 	}
+	return b.dockerNamed(ctx, name, args...)
+}
+
+// randomHex is 16 random hex digits.
+func randomHex() string {
+	var r [8]byte
+	_, _ = rand.Read(r[:]) // crypto/rand never fails on Linux
+	return fmt.Sprintf("%x", r)
+}
+
+// runLabel marks each container a disk build runs with that run's own id: a cancelled run removes
+// its containers by it, never another build's of the same name.
+const runLabel = "io.stowage.disks.run"
+
+// dockerNamed runs the docker CLI; a run (named name, labelled with its own id) is removed when
+// cancelled: killing the docker CLI leaves the container it started running, holding the work
+// directory and, for auroraboot, loop devices. A run refused for its name (docker's exit 125, the
+// daemon's conflict) is errNameInUse: that line is not shown, and nothing is removed.
+func (b *DiskBuilder) dockerNamed(ctx context.Context, name string, args ...string) error {
+	d := cmp.Or(b.Docker, "docker")
+	what := strings.Join(args[:min(2, len(args))], " ")
+	run := ""
+	if name != "" {
+		run = randomHex()
+		args = append([]string{"run", "--name", name, "--label", runLabel + "=" + run}, args[1:]...)
+	}
+	errs := &conflictLines{w: b.Stderr}
 	cmd := exec.CommandContext(ctx, d, args...)
-	cmd.Stdout, cmd.Stderr = b.Stdout, b.Stderr
+	cmd.Stdout, cmd.Stderr = b.Stdout, errs
 	err := cmd.Run()
-	if name != "" && ctx.Err() != nil {
-		rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), removeTimeout)
-		defer cancel()
-		rm := exec.CommandContext(rctx, d, "rm", "--force", name)
-		if out, rerr := rm.CombinedOutput(); rerr != nil && !strings.Contains(string(out), "No such container") {
-			err = errors.Join(err, fmt.Errorf("the cancelled container %s may still run: docker rm --force %s: %w: %s", name, name, rerr, bytes.TrimSpace(out)))
+	errs.flush()
+	var exit *exec.ExitError
+	if name != "" && errors.As(err, &exit) && exit.ExitCode() == 125 && errs.conflict {
+		return fmt.Errorf("docker %s: %w", what, errNameInUse)
+	}
+	if err != nil && ctx.Err() != nil { // the CLI killed: "signal: killed" alone hides the cancel
+		err = fmt.Errorf("%w (%v)", ctx.Err(), err)
+	}
+	if run != "" && ctx.Err() != nil {
+		if rerr := b.removeRun(ctx, run); rerr != nil {
+			err = errors.Join(err, fmt.Errorf("the cancelled container %s may still run: docker rm --force %s: %w", name, name, rerr))
 		}
 	}
 	if err != nil {
 		return fmt.Errorf("docker %s: %w", what, err)
 	}
 	return nil
+}
+
+// removeRun removes the containers labelled with run, for removeGrace after a cancel: the
+// daemon may make one a moment after the CLI asking for it was killed.
+func (b *DiskBuilder) removeRun(ctx context.Context, run string) error {
+	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), removeTimeout)
+	defer cancel()
+	d := cmp.Or(b.Docker, "docker")
+	grace := cmp.Or(b.removeGrace, removeGrace)
+	until := time.Now().Add(grace)
+	for {
+		out, err := exec.CommandContext(rctx, d, "ps", "--all", "--quiet", "--filter", "label="+runLabel+"="+run).Output()
+		if err != nil {
+			return err
+		}
+		if ids := strings.Fields(string(out)); len(ids) > 0 {
+			if out, err := exec.CommandContext(rctx, d, append([]string{"rm", "--force"}, ids...)...).CombinedOutput(); err != nil && !strings.Contains(string(out), "No such container") {
+				return fmt.Errorf("%w: %s", err, bytes.TrimSpace(out))
+			}
+		}
+		if time.Now().After(until) {
+			return nil
+		}
+		select {
+		case <-rctx.Done():
+			return rctx.Err()
+		case <-time.After(grace / 10):
+		}
+	}
+}
+
+// removeGrace is how long a cancelled run keeps removing containers of its own the daemon makes.
+const removeGrace = 2 * time.Second
+
+// dockerOut runs the docker CLI and returns what it printed.
+func (b *DiskBuilder) dockerOut(ctx context.Context, args ...string) (string, error) {
+	out, err := exec.CommandContext(ctx, cmp.Or(b.Docker, "docker"), args...).Output()
+	return string(out), err
+}
+
+// conflictLines passes stderr on to w (when not nil) line by line, but the docker CLI's own
+// refusal of a container name, which it notes: wherever it comes (after an image pull's lines).
+type conflictLines struct {
+	w        io.Writer
+	partial  []byte
+	conflict bool
+}
+
+func (c *conflictLines) Write(p []byte) (int, error) {
+	c.partial = append(c.partial, p...)
+	for {
+		// A line ends at a newline or a carriage return (a progress bar redrawn), and a run of
+		// output past 4 KiB without either is passed on as it is: the CLI's refusal is one short line.
+		i := bytes.IndexAny(c.partial, "\n\r")
+		if i < 0 && len(c.partial) > 4096 {
+			i = len(c.partial) - 1
+		}
+		if i < 0 {
+			return len(p), nil
+		}
+		c.line(c.partial[:i+1])
+		c.partial = c.partial[i+1:]
+	}
+}
+
+func (c *conflictLines) line(l []byte) {
+	if c.conflict {
+		return // the CLI's hint after its refusal ("See 'docker run --help'.")
+	}
+	if bytes.HasPrefix(l, []byte("docker: Error response from daemon: Conflict.")) && bytes.Contains(l, []byte("is already in use by container")) {
+		c.conflict = true
+		return
+	}
+	if c.w != nil {
+		_, _ = c.w.Write(l) // an operator's stream that fails hides nothing from the check
+	}
+}
+
+func (c *conflictLines) flush() {
+	if len(c.partial) > 0 {
+		c.line(c.partial)
+		c.partial = nil
+	}
 }
 
 // Build makes r's disks and returns each format's file. The cleanup function removes them, and is
@@ -455,6 +574,45 @@ func (b *DiskBuilder) build(ctx context.Context, dir string, r DiskRequest) (map
 	return out, osMiB, nil
 }
 
+// loop runs auroraboot (args), one run on the host at a time (loopName): while another build's
+// container holds the name it waits, saying so once, until ctx ends. A holder that stays the same
+// container and does not run (exited, dead, created, paused, being removed…) for loopStale is
+// refused, naming its removal: no build will free that name.
+func (b *DiskBuilder) loop(ctx context.Context, args []string) error {
+	said := false
+	var since time.Time // when the holder (id) was first seen not running
+	id := ""
+	for {
+		err := b.dockerNamed(ctx, loopName, args...)
+		if !errors.Is(err, errNameInUse) {
+			return err
+		}
+		out, _ := b.dockerOut(ctx, "container", "inspect", "--format", "{{.Id}} {{.State.Status}}", loopName)
+		holder, state, _ := strings.Cut(strings.TrimSpace(out), " ")
+		switch {
+		case holder == "" || state == "running":
+			since, id = time.Time{}, ""
+		case holder != id:
+			since, id = time.Now(), holder
+		case time.Since(since) > cmp.Or(b.loopStale, loopStale):
+			return fmt.Errorf("the container %s of an earlier disk build is %s and holds the name every disk build takes: `docker rm --force %s`, then run again", loopName, state, loopName)
+		}
+		if !said && b.Stderr != nil {
+			fmt.Fprintf(b.Stderr, "waiting for another disk build on this host: its container %s holds the name (%s; `docker rm --force %s` if its build is gone)\n", loopName, cmp.Or(state, "gone"), loopName)
+		}
+		said = true
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("waiting for the disk build's container %s: %w", loopName, ctx.Err())
+		case <-time.After(cmp.Or(b.loopPoll, loopWait)):
+		}
+	}
+}
+
+// loopStale is how long a holder of loopName may stay not running (exited, dead, created) before
+// the build holding it is taken as gone.
+const loopStale = time.Minute
+
 // auroraboot makes one disk of source with flag set and moves the file it wrote, the one ending in
 // suffix, to dst. auroraboot can exit 0 without writing its disk, so the file is looked for.
 func (b *DiskBuilder) auroraboot(ctx context.Context, dir, config, source string, stateMiB int64, flag, suffix, dst string) error {
@@ -472,7 +630,7 @@ func (b *DiskBuilder) auroraboot(ctx context.Context, dir, config, source string
 	}
 	args = append(args, "--set", "state_dir=/state", "--set", "container_image=oci://"+source, "--set", fmt.Sprintf("disk.state_size=%d", stateMiB),
 		"--set", flag+"=true")
-	err = b.docker(ctx, args...)
+	err = b.loop(ctx, args)
 	if err != nil {
 		return fmt.Errorf("auroraboot %s: %w", flag, err)
 	}

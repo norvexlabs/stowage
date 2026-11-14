@@ -156,8 +156,9 @@ a self-review against the code it describes is enough. Every other commit clears
    to `internal/truenas`, the OpenTofu module (`internal/install/tofu`), `vmtofu.go`, `seed*.go`,
    the boot (`vm.go`), the host daemon, the backup runner or the OS bundle's files (its recipe's lists, `internal/kairos/kairos.go`, included) runs `STOWAGE_VM_ENV=<file> make
    e2e-vm` too (a real VM on TrueNAS, an upgrade of it through a TLS mirror, `reset-db`, `rollback`, a failed health gate's fallback, a backup, `vm attach` of a second NIC and the network overrides' revert, handoff kits with a Docker install and a kind cluster beside it, a second VM made by `vm create --kit`, ~105 min; the file is the user's, its path given at run time,
-   never written in the tree); it runs beside the parallel suites in one chain with `e2e-kairos` and
-   `e2e-full-vm`, one at a time, as they make disks with auroraboot, which races for loop devices. A change to `examples/full`'s kairos
+   never written in the tree); it runs beside the parallel suites (`e2e-kairos` among them: disk
+   builds wait for one another on auroraboot's one container name) in one chain with `e2e-full-vm`, one TrueNAS VM
+   at a time. A change to `examples/full`'s kairos
    shape (its `stowage.yaml`'s `shapes.kairos` block and its top-level `host` block, each compared
    whole: any of their keys, a module's or a package's entry included — not an input's or a route's `shapes:`, as the VM runs the Docker
    shape's install, which the short suites prove; the same test picks e2e-kairos for `examples/minimal`), `test/e2e-full-vm.sh`, `test/vm.sh` or `test/metal-truenas/` runs `STOWAGE_VM_ENV=<file> make
@@ -171,7 +172,9 @@ a self-review against the code it describes is enough. Every other commit clears
    `vmcli*.go`, `vmhealth*.go`) run e2e-vm; a test script runs its own suite (`test/libvirtd/`, the libvirt daemon e2e-kairos
    applies the libvirt module against, runs e2e-kairos; `test/lib.sh`,
    `pins.sh`, `sweep.sh`: e2e, e2e-docker, e2e-full, e2e-stateless, e2e-k8s, e2e-full-k8s); `go.mod`/`go.sum`
-   run every suite but e2e-full-vm; `internal/sbom` (the SBOMs, the scanner, the audits) runs
+   run every suite but e2e-full-vm; `internal/flock` (every lock Stowage takes: the installs', the host
+   daemon's, the scanner cache's) runs smoke-install, e2e, the lifecycle suites, e2e-kairos and
+   e2e-vm; `internal/sbom` (the SBOMs, the scanner, the audits) runs
    e2e, the lifecycle suites (e2e-docker, e2e-full, e2e-stateless, e2e-k8s, e2e-full-k8s),
    e2e-kairos and e2e-vm, its `policy.go` (the release gate's allowances, `ship`'s alone) e2e,
    the lifecycle suites and e2e-full-vm (the one shipping `examples/full`'s OS bundle); `internal/tune` the lifecycle suites and e2e-vm, its `modules.go`

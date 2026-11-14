@@ -3,6 +3,27 @@
 Stowage's own releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
+## [0.37.1]
+
+### Fixed
+
+- Two disk builds on one host (two `ship`s of a project with the `kairos` shape, whoever runs them
+  and wherever, a container included) no longer fail on auroraboot's loop devices: auroraboot's
+  container is always `stowage-disks-loop`, and a second build waits for that name, saying so.
+- A run waiting for an install's lock while that install's directory is removed (a first install
+  that failed, an uninstall) is refused naming the fix, `run again`, instead of failing with `no
+  such file or directory`.
+- `vm create --create opentofu` holds the VM's state lock for its whole run, as `vm attach` and
+  `vm destroy` do: a second create of the same host, or one of them, is refused while it runs;
+  and a lock of the platform's VM name: a create of the same `--vm-name` for another host meanwhile
+  is refused.
+- Every lock Stowage takes is on the file at its path once taken: a run waiting for one that
+  another run removed or replaced takes the file there now, never a removed one; a backup, a
+  settings change and the image's wait of `vm create` end with Ctrl-C.
+- A rollback on Docker to a release with a provision hook says that the hook is not run on a
+  rollback, and when to run `provision`, after the previous installer's own `not provisioned
+  (--no-provision)` line.
+
 ## [0.37.0] - 2026-11-12
 
 ### Added

@@ -2076,3 +2076,83 @@ func (s *syncBuffer) Bytes() []byte {
 	defer s.mu.Unlock()
 	return bytes.Clone(s.b.Bytes())
 }
+
+// An install whose lock file is gone (a dotfile left out of a copy) gets it made again; one whose
+// directory or .env went while a run waited for the lock (an uninstall) is refused, `run again`.
+func TestARunWhoseInstallIsGoneIsRefused(t *testing.T) {
+	t.Parallel()
+	e := installed(t)
+	in := e.installer(nil)
+	env, err := in.open()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(e.dir, lifecycleLock)); err != nil {
+		t.Fatal(err)
+	}
+	unlock, err := in.lockRun(context.Background(), env)
+	if err != nil {
+		t.Fatalf("an intact install without its lock file: %v", err)
+	}
+	unlock()
+	// Another install made there meanwhile: refused too.
+	other := NewEnvFile()
+	other.Set("COMPOSE_PROJECT_NAME", "another-project")
+	var r Refused
+	if _, err := in.reopen(other); !errors.As(err, &r) || r.Fix != "run again" || !strings.Contains(err.Error(), "was replaced by another before this run held") {
+		t.Fatalf("replaced: %v", err)
+	}
+	if _, err := in.reopen(env); err != nil {
+		t.Fatalf("the same install: %v", err)
+	}
+	if err := os.Remove(filepath.Join(e.dir, ".env")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := in.reopen(env); !errors.As(err, &r) || r.Fix != "run again" || !strings.Contains(err.Error(), "was removed before this run held its lock") {
+		t.Fatalf(".env gone: %v", err)
+	}
+	if err := os.RemoveAll(e.dir); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := in.lockRun(context.Background(), env); !errors.As(err, &r) || r.Fix != "run again" {
+		t.Fatalf("directory gone: %v", err)
+	}
+}
+
+// A run taking the lifecycle lock without waiting, whose install directory is gone, is refused as
+// no install, naming what to give instead.
+func TestLockNowOnAnInstallGone(t *testing.T) {
+	t.Parallel()
+	e := installed(t)
+	in := e.installer(nil)
+	if err := os.RemoveAll(e.dir); err != nil {
+		t.Fatal(err)
+	}
+	var r Refused
+	if _, err := in.lockNow(); !errors.As(err, &r) || !r.Absent || r.Fix != "give the --dir of an install, or install again" {
+		t.Fatalf("%v", err)
+	}
+}
+
+// A run whose own context ends while it waits for the lock reports that end, not another run
+// holding the lock.
+func TestLockRunReportsItsCallersEnd(t *testing.T) {
+	t.Parallel()
+	e := installed(t)
+	unlock, err := lockFile(filepath.Join(e.dir, lifecycleLock))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unlock()
+	in := e.installer(func(o *Options) { o.LockWait = time.Hour })
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if _, err := in.lockRun(ctx, e.readEnv()); !errors.Is(err, context.DeadlineExceeded) || isRefused(err) {
+		t.Fatalf("%v", err)
+	}
+	// Its own LockWait ending is another run's lock.
+	in = e.installer(func(o *Options) { o.LockWait = 20 * time.Millisecond })
+	if _, err := in.lockRun(context.Background(), e.readEnv()); !errors.Is(err, errLocked) {
+		t.Fatalf("LockWait out: %v", err)
+	}
+}

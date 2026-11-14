@@ -173,6 +173,15 @@ func pushed(t *testing.T, c *Client, repo string, b Blob) error {
 	return nil
 }
 
+// fixedChunks makes every chunk but the last chunkMax bytes, whatever the rate the upload measures
+// (which sizes them otherwise, and a loaded host slows): a blob's last chunk is then the remainder
+// alone. For the test's length; its subtests run one at a time.
+func fixedChunks(t *testing.T) {
+	lo := chunkMin
+	chunkMin = chunkMax
+	t.Cleanup(func() { chunkMin = lo })
+}
+
 func TestAFileBlobGoesUpInChunksAndResumes(t *testing.T) {
 	unit, lo, hi := uploadUnit, chunkMin, chunkMax
 	uploadUnit, chunkMin, chunkMax = time.Millisecond, 1<<10, 4<<10
@@ -505,7 +514,8 @@ func TestAFileBlobGoesUpInChunksAndResumes(t *testing.T) {
 
 	t.Run("a 416 to the last chunk whose status cannot be read is retried", func(t *testing.T) {
 		f, c, out, repo, _ := uploadFixture(t)
-		b := fileBlob(t, 1<<10+4*4<<10+512)
+		fixedChunks(t)
+		b := fileBlob(t, int(4*chunkMin+512)) // four whole chunks, then 512 B
 		refused, unread := 0, false
 		f.patch = func(n int, w http.ResponseWriter, r *http.Request) bool {
 			if r.ContentLength < chunkMin && refused == 0 {
@@ -554,7 +564,8 @@ func TestAFileBlobGoesUpInChunksAndResumes(t *testing.T) {
 
 	t.Run("a last chunk under the smallest refused for its size is retried", func(t *testing.T) {
 		f, c, out, repo, _ := uploadFixture(t)
-		b := fileBlob(t, 1<<10+4*4<<10+512) // 1 KiB, then 4 KiB chunks, then 512 B
+		fixedChunks(t)
+		b := fileBlob(t, int(4*chunkMin+512)) // four whole chunks, then 512 B
 		refused := 0
 		f.patch = func(n int, w http.ResponseWriter, r *http.Request) bool {
 			if r.ContentLength < chunkMin && refused == 0 {

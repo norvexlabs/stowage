@@ -188,15 +188,26 @@ scanner_fresh() {
 untag_repo() { docker images --format '{{.Repository}}:{{.Tag}}' "$1" | xargs -r docker rmi >/dev/null 2>&1 || true; }
 # grype_db: GRYPE_DB, grype's latest vulnerability database archive, fetched once into the tools
 # cache and checked against the listing's digest; the audits scan with it (--db), as a site without
-# access to grype's servers does, so no suite fetches its own. The two newest archives are kept:
-# a suite in parallel may still scan with the one before a database grype published during the run.
+# access to grype's servers does, so no suite fetches its own. The run records the archive it scans
+# with beside the archives (.used/<run>, one archive name per line, each call's appended: an
+# archive the run exported earlier stays named) before fetching it; the run's exit removes its
+# record, and a record a dead run left is dropped after six hours (the longest suite's time, as the
+# sweep judges). An archive no record names is removed. Names alone, not paths: a run with another
+# cache, or in another mount namespace, shares the archives' directory and its records. The record
+# and the prune take the directory's lock: a prune never reads the records between a run's choice
+# and its record.
 grype_db() {
 	local dir=$TOOLS/grype-db latest path sum tmp
-	mkdir -p "$dir"
+	mkdir -p "$dir/.used"
 	latest=$(curl -fsSL https://grype.anchore.io/databases/v6/latest.json) || fail "grype's database listing"
 	path=$(jq -r .path <<<"$latest") sum=$(jq -r .checksum <<<"$latest")
 	[[ $path == vulnerability-db_*.tar.zst && $sum == sha256:* ]] || fail "grype's listing: $latest"
 	GRYPE_DB=$dir/$path
+	if [[ ! -e $dir/.used/$RUN ]]; then CLEANUP+=("rm -f '$dir/.used/$RUN'"); fi
+	(
+		flock 9
+		echo "$path" >>"$dir/.used/$RUN"
+	) 9>"$dir/.lock"
 	if [[ ! -s $GRYPE_DB ]]; then
 		tmp=$(mktemp "$dir/.dl.XXXXXX")
 		CLEANUP+=("rm -f '$tmp'")
@@ -204,9 +215,16 @@ grype_db() {
 		echo "${sum#sha256:}  $tmp" | sha256sum -c --quiet - || fail "$path: the digest is not $sum"
 		mv -f "$tmp" "$GRYPE_DB"
 	fi
-	local old
-	mapfile -t old < <(ls -1t "$dir"/vulnerability-db_*.tar.zst | grep -vxF "$GRYPE_DB" | tail -n +2)
-	((${#old[@]} == 0)) || rm -f -- "${old[@]}"
+	(
+		flock 9
+		find "$dir/.used" -type f -mmin +360 -delete 2>/dev/null || true
+		local named a
+		named=$(cat "$dir"/.used/* 2>/dev/null) || true
+		for a in "$dir"/vulnerability-db_*.tar.zst; do
+			if [[ -L $a && ! -e $a ]] || { [[ -e $a ]] && ! grep -qxF "${a##*/}" <<<"$named"; }; then rm -f -- "$a"; fi
+		done
+		true
+	) 9>"$dir/.lock"
 }
 
 [[ -x $STOWAGE ]] || fail "$STOWAGE is missing: run make build"
@@ -667,10 +685,11 @@ remove_cluster() {
 	docker images --format '{{.Repository}}:{{.Tag}}' --filter "reference=$REG/${NAME:-notes}/*" | xargs -r docker rmi >/dev/null 2>&1 || true
 }
 # docker_beside <installer script in $OP> [install argument]…: a Docker install of the project in
-# $WORK/docker-site beside a suite's cluster or VM, for handoffs between shapes: DOCKER_CTL its
-# <short>-stow, run in DOCKER_OPERATOR, the operator's environment the suite kept before k8s_tools.
+# $WORK/stowage-e2e-docker-site (a test project's name to the sweep) beside a suite's cluster or
+# VM, for handoffs between shapes: DOCKER_CTL its <short>-stow, run in DOCKER_OPERATOR, the
+# operator's environment the suite kept before k8s_tools.
 docker_beside() {
-	D=$WORK/docker-site
+	D=$WORK/stowage-e2e-docker-site
 	CLEANUP+=('remove_install')
 	DOCKER_CTL=("${DOCKER_OPERATOR[@]}" "$D/$SHORT-stow")
 	APP_PORT=$(free_port)

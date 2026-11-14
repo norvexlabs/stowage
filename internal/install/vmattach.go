@@ -5,6 +5,7 @@ import (
 	"cmp"
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -572,7 +573,7 @@ func openState(dir, host, ctl string) (unlock func(), vars []byte, err error) {
 	}
 	unlock, err = lockFile(stateLock(dir))
 	if errors.Is(err, errLocked) {
-		return nil, nil, fmt.Errorf("%s: another vm attach or vm destroy runs on it", host)
+		return nil, nil, fmt.Errorf("%s: another vm create, vm attach or vm destroy runs on it", host)
 	}
 	if err != nil {
 		return nil, nil, err
@@ -586,6 +587,15 @@ func openState(dir, host, ctl string) (unlock func(), vars []byte, err error) {
 		return nil, nil, err
 	}
 	return unlock, vars, nil
+}
+
+// nameLock is the lock file of a platform VM name, beside the state directories, which a vm create
+// holds for its whole run: the platform, whether its module is the built-in one and the name
+// folded to lowercase (as claimedBy tells VMs apart), hashed, so any name makes a file name. Never
+// removed, as stateLock.
+func nameLock(state, platform string, builtin bool, vmName string) string {
+	sum := sha256.Sum256(fmt.Appendf(nil, "%s\x00%t\x00%s", platform, builtin, strings.ToLower(vmName)))
+	return filepath.Join(filepath.Dir(state), ".name-"+hex.EncodeToString(sum[:8])+".lock")
 }
 
 // stateLock is the lock file of a VM's state directory: beside it, which vm destroy removes,

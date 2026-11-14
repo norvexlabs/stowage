@@ -1060,3 +1060,71 @@ func TestSSHArgsOfferTheGivenKeyAlone(t *testing.T) {
 		t.Errorf("both keys: ssh %q", a)
 	}
 }
+
+// vm create holds the state's lock for its whole run: another create, attach or destroy holding
+// it refuses this one before anything is applied; released, the create goes on.
+func TestVMCreateWithOpenTofuTakesTheStatesLock(t *testing.T) {
+	t.Parallel()
+	v := newVMCreate(t, "qcow2")
+	r := newTofuRun(t)
+	r.vars["XDG_STATE_HOME"] = filepath.Join(r.vars["HOME"], "st")
+	vms := filepath.Join(r.vars["XDG_STATE_HOME"], "notes", "vms")
+	if err := os.MkdirAll(vms, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	unlock, err := lockFile(stateLock(filepath.Join(vms, "notes-1")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = v.create(tofuCreate(), r.mod(nil))
+	if err == nil || !strings.Contains(err.Error(), "notes-1: another vm create, vm attach or vm destroy runs on it") {
+		t.Fatalf("locked: %v", err)
+	}
+	for _, c := range r.tofu.calls {
+		if slices.Contains(c, "apply") {
+			t.Fatalf("applied while locked: %v", r.tofu.calls)
+		}
+	}
+	unlock()
+	if err := v.create(tofuCreate(), r.mod(nil)); err != nil {
+		t.Fatalf("released: %v", err)
+	}
+	// The run released it.
+	if unlock, err := lockFile(stateLock(filepath.Join(vms, "notes-1"))); err != nil {
+		t.Fatalf("after the run: %v", err)
+	} else {
+		unlock()
+	}
+}
+
+// A create of a platform VM name another host's create is making now is refused before anything
+// is applied, whatever the case of the name; released, it goes on.
+func TestVMCreateWithOpenTofuTakesTheVMNamesLock(t *testing.T) {
+	t.Parallel()
+	v := newVMCreate(t, "qcow2")
+	r := newTofuRun(t)
+	r.vars["XDG_STATE_HOME"] = filepath.Join(r.vars["HOME"], "st")
+	vms := filepath.Join(r.vars["XDG_STATE_HOME"], "notes", "vms")
+	if err := os.MkdirAll(vms, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	c := tofuCreate()
+	c.Name = "notes1"
+	unlock, err := lockFile(nameLock(filepath.Join(vms, "other-host"), "truenas", true, "NOTES1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = v.create(c, r.mod(nil))
+	if err == nil || !strings.Contains(err.Error(), "another vm create makes a VM named notes1") {
+		t.Fatalf("locked: %v", err)
+	}
+	for _, call := range r.tofu.calls {
+		if slices.Contains(call, "apply") {
+			t.Fatalf("applied while locked: %v", r.tofu.calls)
+		}
+	}
+	unlock()
+	if err := v.create(c, r.mod(nil)); err != nil {
+		t.Fatalf("released: %v", err)
+	}
+}

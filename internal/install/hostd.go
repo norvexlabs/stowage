@@ -1213,7 +1213,7 @@ func (h *Hostd) serviceAction(w http.ResponseWriter, r *http.Request) {
 	}
 	// Under the install's lifecycle lock — never during an install, upgrade, rollback, provision or reset-db —
 	// and with the install as it is under it.
-	unlock, err := lockFile(in.path(lifecycleLock))
+	unlock, err := in.lockNow()
 	if errors.Is(err, errLocked) {
 		replyErr(w, fail(http.StatusConflict, "an install, upgrade, rollback, provision or reset-db is running: wait for it to finish"))
 		return
@@ -2100,11 +2100,13 @@ func (h *Hostd) power(w http.ResponseWriter, r *http.Request, action string) {
 		return
 	} else if st != "activating" {
 		in, _ := h.run()
-		unlock, err := lockFile(in.path(lifecycleLock))
+		unlock, err := in.lockNow()
 		if errors.Is(err, errLocked) {
 			replyErr(w, fail(http.StatusConflict, "an install, upgrade, rollback, provision or reset-db is running: wait for it to finish"))
 			return
 		}
+		// Any other answer lets the power action go: it needs no install (none yet, or one gone),
+		// only that no lifecycle run holds one.
 		if err == nil {
 			unlock()
 		}

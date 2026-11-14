@@ -988,7 +988,7 @@ func systemdText(s string) string {
 func (in *Installer) gatewayApply(ctx context.Context) error {
 	// Under the install's lock: a start running meanwhile would write the record it read. The
 	// start this runs takes the lock again, waiting for one that took it meanwhile.
-	unlock, err := lockFile(in.path(lifecycleLock))
+	unlock, err := in.lockNow()
 	if errors.Is(err, errLocked) {
 		return errors.New("a start, upgrade, rollback, provision or reset-db of this install runs: wait for it to finish, then tune --apply again")
 	}
@@ -1105,7 +1105,7 @@ func (in *Installer) writeUnits(ctx context.Context, enable bool) (undo func(), 
 
 // lockedRevert is gatewayRevert under the install's lock (tune --revert).
 func (in *Installer) lockedRevert(ctx context.Context) error {
-	unlock, err := lockFile(in.path(lifecycleLock))
+	unlock, err := in.lockNow()
 	if errors.Is(err, errLocked) {
 		return errors.New("a start, upgrade, rollback, provision or reset-db of this install runs: wait for it to finish, then tune --revert again")
 	}

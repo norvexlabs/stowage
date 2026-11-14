@@ -26,6 +26,16 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
    (user, 2026-11-11): (a) needs a `registry.pull` mint operation per registry, an issuing
    credential, revocation and a fallback.
 
+### Machine interface — the VM's dry runs
+
+1. **`upgrade --dry-run --json` and `rollback --dry-run --json` on the VM**: the OpenTofu provider's
+   plan-time check of a release change (DESIGN § 13, "an upgrade's dry run over SSH") has no verb
+   on the VM; Docker's `upgrade`/`rollback` and `k8s upgrade`/`k8s rollback` have one. Same
+   contract as Docker's: exit 0 with what would change, or exit 3 with the `{reason, fix}`
+   refusal; nothing written, no job, no OS write, no reboot, no backup. The host daemon's checks
+   (the target's installer, the kept-installer and schema-baseline checks it can run) answer it.
+   The provider refuses `plan_dry_run` on a `vm` block until then.
+
 ### VM creation — the OpenTofu path moves out of Stowage
 
 1. **`vm create --create opentofu` gives way to the OpenTofu provider and standalone modules**:
@@ -223,18 +233,6 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
   (SFTP, S3, …), or mount the path into the rclone container. Gate: smoke-install, `backup config`
   refusing a local remote and accepting an SFTP one.
 
-- **`rollback` reports a `--no-provision` nobody gave**: a rollback starts the previous release
-  without the provision hook, and ends with `not provisioned (--no-provision): … provision does
-  it` — the operator passed no such flag, and nothing says whether running it against the data the
-  newer release left is wanted. Word it for the rollback (the hook is not run on a rollback; run
-  `provision` only if …), and keep the `--no-provision` wording for the install that was given it.
-  Gate: the rollback lifecycle case, its last line.
-
-- **`vm create` takes no lock on its state directory**: `vm attach` and `vm destroy` hold
-  `<state>.lock`, but a create still applying, waiting for the VM or installing it over SSH can
-  meet one of them, or a second create of the same host passing its "state exists" check before
-  the first wrote its variables. Take the lock for create's whole run, checking the state under it.
-
 - **A volumes-age-rclone backup reads its volumes live**: without a dump, the archive is the
   whole backup, and files a service writes together (a CA's index and serial) may be archived
   between two writes. A provider option stopping the services that mount the volumes for the
@@ -360,9 +358,6 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
   `forward_auth` are enforced by the Docker and VM fronts; on Kubernetes the chart's ingress
   serves the routes and lint says nothing. Warn per route with a `kubernetes` shape (the examples
   would then need the chart to declare it handles them, or the warning accepted there).
-- **e2e-docker's uploads-archive check failed once beside the parallel suites** (2026-10-26) and
-  passed alone: `age -d … | tar -t | grep -qx ./e2e.txt` under `pipefail`, where `grep -q` exiting
-  on its match can SIGPIPE `tar` and fail the pipeline. Read the listing into a variable first.
 
 - **A prune on a registry that deletes no tag alone reads every tag per refused delete**: `untag`
   and the sweep after it list the repository and read each tag for each tag they remove, so a
@@ -468,27 +463,10 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
   needs the operator in the kind cluster. Also open: `k8s reset-db` deletes the claims of the
   release's StatefulSets, not those an operator's resource makes, so it would not wipe a cnpg
   database.
-- **An image vanishes from the engine while suites run in parallel** (nine times on 2026-10-11 and
-  2026-10-13; each suite passed alone). The installer now pulls with the project's account at
-  `compose up` and at the provision hook's run too, so a lost image is pulled again instead of
-  failing anonymously: the symptom is gone, the cause is not found. Every lost image had the same
-  content as one another suite held under its own registry's name. Not reproduced by two loops on
-  this engine (containerd image store): removing one name, by tag, by digest or forced, while
-  another is pulled or kept; nor by a build's temporary tag removed beside a pulled copy. Again on
-  2026-10-13: e2e-docker's install from its mirror lost `notes-api` between Compose's image check
-  and the container's creation, beside e2e (which ships the same content): the installer's `up`
-  now pulls a gone image again and starts once more. Next clue: `docker image ls --digests` and
-  `docker events --filter type=image` across a parallel gate.
 - **Reconfigure beyond the re-run**: on a terminal, a re-run asks nothing; a form pre-filled with
   the recorded values would let an operator change inputs without naming them. A re-run also keeps
   the loopback address, the registry and its CA, and the channel (TLS: done); changing them
   needs a new install today. Rotating the pull password is its variable at the next run.
-- **`make smoke-install` leaves two stacks behind**: after a passing run, the
-  `stowage-smoke-notes` and `stowage-smoke-notes-internal` stacks (their front containers) and the
-  test's temporary directory under `/tmp` remain, while `stowage-smoke-notes-byo` is taken down;
-  `test/sweep.sh` keeps them, as their working directory still exists. Find why those two
-  cleanups do not run, and let the sweep remove the smoke test's projects whose test process is
-  gone.
 - **Sealed secrets, opt-in per deployment**: `<short>-stow answers seal` generates the generated
   secrets and asks for the supplied ones, and encrypts them all with the sops library to the
   operator's age key plus a per-deployment age key (or a KMS); `install --answers x.sops.yaml`
@@ -564,15 +542,6 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
   Linux's loopback answers on all of `127.0.0.0/8` and Docker publishes on it. Accept an address
   inside a loopback interface's prefix.
 
-- **A failed first install removes its lock under waiters**: a first install that fails after
-  taking the lock removes its directory (`RemoveAll`), lock file included, while a second run
-  into the same `--dir` may wait on that lock; the waiter then fails (`no such file`) instead of
-  installing. Keep the lock file outside what a failed install removes.
-
-- **Flaky chunked-upload case**: `TestAFileBlobGoesUpInChunksAndResumes/a last chunk under the
-  smallest refused for its size is retried` failed once in `make check` under load (no refusal
-  seen, one session) and passes 20 of 20 alone. Find what it races on.
-
 - **Text `k8s status` after an uninstall that kept its history**: it prints the uninstalled
   revision's release first, as if it ran (`k8s status --json` says nothing is installed). Say the
   release is uninstalled, its history kept, and that `k8s rollback` brings it back.
@@ -642,11 +611,6 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
   artifacts it accepts include `front`, `backup`, `chown` and `audit` whatever the project
   declares, so an entry for `front` in a project without a front passes lint and shows only at a
   ship (`matches no finding`). Deriving them from the spec as `ship` does would close it.
-
-- **grype's database archives kept for a whole gate run**: `test/lib.sh`'s `grype_db` keeps the
-  archive the listing names and the newest other one, which covers one publication of grype's
-  database during a gate run, not two (a long suite still scanning with the archive before both
-  then loses it). Keep each archive a suite of this run named, or delete under a lock.
 
 - **A pre-commit hook running `lint`**: `hook install` writes git's post-commit hook alone; a
   project wanting `lint`'s allowance checks (an artifact the release cannot carry, an entry
@@ -860,12 +824,6 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
   pods and fail on that reason early (a namespace's Pod Security label is checked before
   anything changes already; the cluster's default level, without a label, is not).
 
-- **An image gone under `make gate`'s parallel suites**: once, e2e-full's re-run met `No such
-  image: …/atlas/atlas-provision@sha256:…` at its provision step (its registry live, the image
-  pulled earlier in the run); alone it passes. No suite removes another's registry references;
-  the suspect is two suites pulling the same content (e2e-full and e2e-full-k8s build
-  `examples/full` alike) and a removal of one reference reaching the other's. Find the removal.
-
 - **A Docker host's NIC rings on the `network` profile**: a resize resets the link, so `tune`
   never resizes an up link and reports it as advice with the `ethtool -G` to run while it is
   down; a host's own boot does not grow them either. A unit ordered before the network (as the
@@ -932,8 +890,6 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
 - **A mirror import's blobs in chunks too**: `mirror import` pushes each blob in one stream, as
   a ship pushed disks before; a disk set imported over a lossy link restarts from zero. Push the
   archive's large blobs as a ship pushes a disk.
-- **e2e-kairos's `backup verify` failed once beside the parallel suites** (2026-10-21) and passed
-  alone: find the clash (the WebDAV server's port, or the runner's container name) and fix it.
 - **A volume quiesced for its backup**: `backup.volumes` are read while the stack runs,
   which suits material written once; a service writing a volume continuously would need its own
   pause (a hook around the archive).
@@ -1017,13 +973,6 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
 - **Lint the data volumes against the compose file**: `data.volumes` and `data.reset` names are
   not checked to be top-level compose volumes Compose owns (not `external`); `reset-db` refuses
   them at run time.
-- **A parallel clash in the gate**: once, with every suite in parallel, `e2e-docker`'s upgrade
-  to 2.0.0 found its pinned postgres (`<reg>/notes/notes-postgres@sha256:…`, pulled at install)
-  gone from the engine, and Compose then pulled it without credentials; alone it passes. Suspect:
-  another suite's removal of an image of the same content (`docker image rm -f` in
-  `e2e-kairos`, the sweep's `docker rmi` of a dead run's reference) on the containerd image
-  store, where references to one target may go together. Pin it down, then remove by reference
-  without `-f`, or have the installer pull what `up` needs right before it.
 - **Reset leftovers** (review of `reset-db`): `K8sReset` repeats the release lookup of
   `k8sDeploy` and `K8sRollback` (one helper), reads the values twice (`--all` then user-supplied)
   and Docker `Reset` decodes the hook twice; untested: the mirror flags of the recovery command, the
@@ -1051,10 +1000,6 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
   write has no test (it needs a hanging fake), nor the fresh context the rollback's restore of the
   marks takes, nor the rollback's re-checked plan finding another target (reachable only through
   a run that changes the install consistently during the drain).
-
-- **`e2e-kairos` and `e2e-vm` cannot run in parallel**: both build disks with auroraboot, whose
-  loop device setup fails ("device or resource busy") when two run at once. The gate runs `e2e-vm`
-  after the others; serialise the disk builds on the host (a lock) to run them together.
 
 - **`vm create --create opentofu` waits out a failed first install**: the VM's status reports no
   install and the first boot's failure is not in it, so the wait runs to `--wait`. Report the
@@ -1092,8 +1037,6 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
   front files with its own renderer (from the kept release's spec and `.env`), so a rollback runs
   them as this Stowage writes them, not as the older one did. Equal while the front's format does
   not change; render through the kept installer when it does.
-- **A first install refused by the lock** leaves the directory it created (holding only the lock
-  file): another run holds it, so it is not removed.
 
 - **Upgrade order under a `command` scheme**: the project's scheme command does not run on an
   install, so an upgrade to an older release is not refused there.
@@ -1156,10 +1099,6 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
   `.github/workflows/`, so the release's tag, date and notes extraction run first on a real tag.
   A script the workflow calls, with a test in the gate, would cover it.
 
-- **`make build` rewrites `./bin` in place**: a build in another terminal while a suite runs a
-  binary from it fails that exec (text file busy); the gate's own suites reuse its one build
-  (`make -o build`). Exporting to a temporary directory and renaming each file into `./bin`
-  would make any build safe beside a run.
 - **A test release's key check**: `cosign public-key` runs with a background context (a cancelled
   command waits for it, up to cosign's timeout), and once, when the signer is made: a key file
   changed during the ship would sign unchecked. The check beside each sign call would close it.

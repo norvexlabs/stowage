@@ -202,7 +202,10 @@ backups=("$WORK"/dav/backups/notes-full-*-1.0.0-r1.pgdump.age)
 check_backup "${backups[0]}" "$PG" e2e_backup
 # The uploads volume's archive beside the dump (backup.volumes), encrypted too; backup list shows the dump alone.
 archive=${backups[0]%.pgdump.age}.uploads.tar.age
-"$BIN/age" -d -i "$AGE_KEY" "$archive" | tar -t | grep -qx './e2e.txt' || fail "$archive does not hold the uploads volume's file"
+# The listing is read whole before it is searched: grep -q ending at its match could stop tar
+# with SIGPIPE, failing the pipeline under pipefail.
+listing=$("$BIN/age" -d -i "$AGE_KEY" "$archive" | tar -t) || fail "$archive does not decrypt and list"
+grep -qx './e2e.txt' <<<"$listing" || fail "$archive does not hold the uploads volume's file"
 "${CTL[@]}" backup list --dir "$D" | grep -q "^${backups[0]##*/} " || fail "backup list does not show the backup"
 ! "${CTL[@]}" backup list --dir "$D" | grep -q 'tar\.age' || fail "backup list shows a volume's archive as a backup"
 "${CTL[@]}" backup status --dir "$D" | grep -q "^last  .*${backups[0]##*/}" || fail "backup status does not show the backup"

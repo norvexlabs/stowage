@@ -19,6 +19,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/norvexlabs/stowage/internal/flock"
 	"github.com/norvexlabs/stowage/internal/providers"
 )
 
@@ -76,17 +77,11 @@ func (in *Installer) dockerHostd(ctx context.Context) (*Hostd, func(), error) {
 		return nil, nil, err
 	}
 	lock := filepath.Join(h.O.Dir, hostLock)
-	unlock, err := lockFile(lock)
-	if errors.Is(err, errLocked) {
+	unlock, err := flock.Take(ctx, lock, flock.Create, true, 100*time.Millisecond, func() {
 		in.O.logf("another backup or restore of this install runs: waiting for it")
-	}
-	for errors.Is(err, errLocked) {
-		select {
-		case <-ctx.Done():
-			return nil, nil, ctx.Err()
-		case <-time.After(time.Second):
-		}
-		unlock, err = lockFile(lock)
+	})
+	if err != nil && ctx.Err() != nil {
+		err = fmt.Errorf("waiting for another backup or restore of this install: %w", err)
 	}
 	if err != nil {
 		return nil, nil, err
@@ -257,7 +252,10 @@ func (in *Installer) InstallSchedule(ctx context.Context) error {
 	if err != nil || !h.systemdHost() {
 		return err
 	}
-	unlock, err := flockWait(filepath.Join(h.O.Dir, settingsLock), true)
+	unlock, err := flockWait(ctx, filepath.Join(h.O.Dir, settingsLock), true)
+	if err != nil && ctx.Err() != nil {
+		err = fmt.Errorf("waiting for another change of the backup settings: %w", err)
+	}
 	if err != nil {
 		return err
 	}
@@ -366,7 +364,10 @@ func (t *lazyTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	}
 	// A settings change reads, merges and writes the settings: one process at a time.
 	if t.settings != "" && r.URL.Path == "/v1/backup/config" && r.Method != http.MethodGet {
-		unlock, err := flockWait(t.settings, true)
+		unlock, err := flockWait(r.Context(), t.settings, true)
+		if err != nil && r.Context().Err() != nil {
+			err = fmt.Errorf("waiting for another change of the backup settings: %w", err)
+		}
 		if err != nil {
 			return nil, madeErr{err}
 		}

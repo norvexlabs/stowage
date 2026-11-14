@@ -236,12 +236,7 @@ volumes:
 	dir := filepath.Join(work, "stowage-smoke-notes")
 	var out, log bytes.Buffer
 	in := &Installer{R: r, O: Options{Dir: dir, Out: &out, Log: &log, Docker: ExecTool{Bin: "docker"}, Self: self}}
-	t.Cleanup(func() {
-		env, err := ReadEnvFile(filepath.Join(dir, ".env"))
-		if err == nil {
-			_, _ = in.Compose(context.Background(), env, io.Discard, "down", "--volumes")
-		}
-	})
+	downAtEnd(t, in)
 	if err := in.Install(context.Background()); err != nil {
 		t.Fatalf("%v\n%s", err, log.String())
 	}
@@ -316,11 +311,7 @@ volumes:
 	// With --ipv6: the stack's network has IPv6, and the front an IPv6 address on it.
 	ipv6 := true
 	in6 := &Installer{R: r, O: Options{Dir: dir6, Out: io.Discard, Log: &log, Docker: ExecTool{Bin: "docker"}, Self: self, Address: "::1", Ports: map[string]int{"app": port6}, IPv6: &ipv6}}
-	t.Cleanup(func() {
-		if env, err := ReadEnvFile(filepath.Join(dir6, ".env")); err == nil {
-			_, _ = in6.Compose(context.Background(), env, io.Discard, "down", "--volumes")
-		}
-	})
+	downAtEnd(t, in6)
 	if err := in6.Install(context.Background()); err != nil {
 		t.Fatalf("install on ::1: %v\n%s", err, log.String())
 	}
@@ -488,11 +479,7 @@ volumes:
 		if mode == "byo" {
 			in.O.Cert, in.O.Key, in.O.CA = cert, key, ca
 		}
-		t.Cleanup(func() {
-			if env, err := ReadEnvFile(filepath.Join(dir, ".env")); err == nil {
-				_, _ = in.Compose(context.Background(), env, io.Discard, "down", "--volumes")
-			}
-		})
+		downAtEnd(t, in)
 		if err := in.Install(context.Background()); err != nil {
 			t.Fatalf("%s: %v\n%s", mode, err, log.String())
 		}
@@ -560,11 +547,7 @@ volumes:
 			httpPort2, httpsPort2 := freePort(t), freePort(t)
 			in2 := &Installer{R: r, O: Options{Dir: again, Out: &out, Log: &log, Docker: ExecTool{Bin: "docker"}, TLS: "internal", Secrets: plain,
 				Domains: map[string]string{"app": "notes.smoke.test"}, HTTPPort: httpPort2, HTTPSPort: httpsPort2}}
-			t.Cleanup(func() {
-				if env, err := ReadEnvFile(filepath.Join(again, ".env")); err == nil {
-					_, _ = in2.Compose(context.Background(), env, io.Discard, "down", "--volumes")
-				}
-			})
+			downAtEnd(t, in2)
 			if err := in2.Install(context.Background()); err != nil {
 				t.Fatalf("the install made again: %v\n%s", err, log.String())
 			}
@@ -623,11 +606,7 @@ func smokeIPv6Client(t *testing.T, r *Release, work string, log *bytes.Buffer) {
 	httpPort, httpsPort := freePort(t), freePort(t)
 	in := &Installer{R: &r6, O: Options{Dir: dir, Out: io.Discard, Log: log, Docker: ExecTool{Bin: "docker"}, TLS: "internal",
 		Domains: map[string]string{"app": "notes.smoke.test"}, HTTPPort: httpPort, HTTPSPort: httpsPort}}
-	t.Cleanup(func() {
-		if env, err := ReadEnvFile(filepath.Join(dir, ".env")); err == nil {
-			_, _ = in.Compose(context.Background(), env, io.Discard, "down", "--volumes")
-		}
-	})
+	downAtEnd(t, in)
 	c := &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec // the local CA: what is checked is the status
 		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
@@ -730,4 +709,25 @@ func smokeCloudflareCaddyfile(t *testing.T, work, frontRef string, f spec.Front)
 func pemBody(der []byte) []byte {
 	b := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
 	return bytes.Join(bytes.Split(b, []byte("\n"))[1:3], []byte("\n"))
+}
+
+// downAtEnd takes the stack of in's install down when the test ends, its volumes too; a failure
+// fails the test, as the stack would outlive it.
+func downAtEnd(t *testing.T, in *Installer) {
+	t.Helper()
+	t.Cleanup(func() {
+		env, err := ReadEnvFile(filepath.Join(in.O.Dir, ".env"))
+		if errors.Is(err, os.ErrNotExist) {
+			return // never installed
+		}
+		if err == nil {
+			var out []byte
+			if out, err = in.Compose(context.Background(), env, io.Discard, "down", "--volumes"); err != nil {
+				err = fmt.Errorf("%w: %s", err, out)
+			}
+		}
+		if err != nil {
+			t.Errorf("the stack in %s is left up: %v", in.O.Dir, err)
+		}
+	})
 }

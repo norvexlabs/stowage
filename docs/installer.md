@@ -236,7 +236,20 @@ again, to copy an installer to another host.
   --dir D\``). It runs under the install's lifecycle
   lock, and refuses a directory holding an install of another project. `--dry-run` prints what
   it would remove and keep. The host's own settings (`tune`) are not touched.
-- A failed first install removes the directory it created.
+- A failed first install removes the directory it created. Each run takes the install's lifecycle
+  lock (`.stowage.lock`, made again when absent) on the file at its path: one removed or replaced
+  while the run waited is opened again. A run whose install is gone once it holds the lock (its
+  directory or `.env` removed meanwhile: an uninstall, another first install into the same `--dir`
+  that failed) is refused: `the install in <dir> was removed before this run held its lock
+  (an uninstall, or a first install that failed)`, fix `run again`; so is one finding another
+  project's install there once it holds the lock (an uninstall, then an install, meanwhile): `the
+  install in <dir> was replaced by another before this run held for its lock` (the same project
+  installed again there is the install the run goes on with). A run that takes the lock
+  without waiting (`uninstall`, `tune --apply` and `--revert` of a gateway, a service's
+  `restart`/`stop`/`start` through the VM's daemon, the VM's restore and its rollback's reboot) on a
+  directory that does not exist is refused as no install: `no install in <dir>: the directory does
+  not exist (none made there, or an uninstall removed it)`, fix `give the --dir of an install, or
+  install again` (`install again` on the VM).
 - The install directory holds:
   - `.env`, the project's `compose.yaml`, `.env.prev` and `.stowage-changing` (a re-run's
     changes, above);
@@ -539,8 +552,12 @@ again, to copy an installer to another host.
   (a secret the upgrade added is kept for the next upgrade). The previous release is then started
   by its own installer (`starting <name> <v> (revision <r>) with its own installer: …`): on Docker
   a re-run of it (`<short>-stow --dir <dir> --no-input --no-provision`, and `--offline` for an
-  install that runs loaded images), on the VM its `boot` (which runs the provision hook, as every
-  boot of the VM does); a release is always started by the
+  install that runs loaded images: the hook is not run, and when the previous release has a hook
+  the rollback ends saying so — ``the provision hook is not run on a rollback (the --no-provision
+  above is the rollback's): `<short>-stow provision --dir <dir>` runs <name> <previous v>'s hook
+  on the data as the newer release left it, only if that release needs it`` (`hook, if it has
+  one,` when another Stowage built that release, whose spec this one does not read)), on the VM its `boot` (which
+  runs the provision hook, as every boot of the VM does); a release is always started by the
   Stowage that built it. Should that start fail (another run holding the install meanwhile), the
   install already records the previous release: running its installer again starts it. The release it leaves is kept in
   `.stowage-failed/`. Like an upgrade it switches `.env` before the installer, and keeps

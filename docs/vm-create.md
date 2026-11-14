@@ -669,8 +669,8 @@ in the same installer (bootstrap it as above, then `sh <name>.sh vm create …`,
   the saved plan, which powers the VM off and on (TrueNAS applies a device at a start); an apply
   that fails says the NIC is recorded on the VM and in the state's variables, and names the same
   way to finish by hand once its cause is fixed. The plan file is removed whatever happens, and
-  `vm attach` and `vm destroy` hold `.<host>.lock`, beside the state directory (kept: a lock file removed while held would exclude no run that opened it), for their whole run: one on a VM at a time
-  (`another vm attach or vm destroy runs on it`). It waits up to `--wait` (default 10m) for the VM to answer from a new boot naming a NIC
+  `vm create` (with `--create opentofu`), `vm attach` and `vm destroy` hold `.<host>.lock`, beside the state directory (kept: a lock file removed while held would exclude no run that opened it), for their whole run — a create from its check that no state exists to its install over SSH: one on a VM at a time
+  (`another vm create, vm attach or vm destroy runs on it`). `vm create` also holds a lock of the platform's VM name (`.name-<hash>.lock` there, of the platform, its built-in or own module and the name compared without case, as the `--vm-name` check tells VMs apart) for its whole run: a create of the same `--vm-name` on that platform for another host meanwhile is refused (`another vm create makes a VM named <name> on <platform> now: give this one another --vm-name`). It waits up to `--wait` (default 10m) for the VM to answer from a new boot naming a NIC
   by the role (`has
   not booted again naming a NIC <role> after …`, with the journal to read, when it does not). Run
   again for a role the state attaches, it goes on with the state's MAC and bridge (another `mac=`
