@@ -75,8 +75,11 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
      links beside v4, GHSA-mgcc-cww5-fp2q high (v3's last release is affected; v4 4.1.6 is
      fixed); golang.org/x/crypto 0.58.0 in every Go artifact (Stowage's own binaries included),
      GO-2026-5932, fixed only in a pseudo-version after 0.58.0 — take the first tagged release.
-   - The audit allowances in `examples/full/audit-allow.yaml` (the OS bundle's containerd/runc,
-     until 2027-01-31; see the Should entry): removed once Docker ships fixed builds. Checked
+   - The audit allowances in `examples/full/audit-allow.yaml` (the OS bundle's containerd,
+     containerd-shim-runc-v2, ctr and runc, until 2027-01-31, each narrowed to its package and
+     binary; every project with the kairos shape and `audit` needs the same): removed once Docker
+     ships fixed builds. Those builds do not link x/net's HTTP/2 server, where GO-2026-6612's bug
+     is, but the scanner matches on the module's version. Checked
      2026-11-11: Docker's containerd.io 2.4.2-3 is containerd v2.4.2 (x/net 0.58.0) with runc v1.5.2
      (x/net 0.55.0), upstream's latest: no fix yet.
 
@@ -122,24 +125,6 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
   read another path at the commit than the checkout follows (refused as not committed, or another
   spec). Keep the path as written and let the commit's links resolve it (`gitcmd.FileAt`).
 
-- **Machine interface** ([DESIGN § 6](docs/DESIGN.md#machine-interface--the-installer-read-by-programs)),
-  one slice each, in this order; each useful to CI scripts alone, and the base of the OpenTofu
-  provider below:
-  1. `status --json` on Docker and Kubernetes, the VM's field names; each install records its
-     release's installer digest (Docker: the install directory and the kept previous release;
-     Kubernetes: the release's values). The VM's daemon untouched, so the VM suites stay out.
-  2. `describe --json`: the release, the inputs (never a secret's default), the first-install-only
-     settings, `format`; read with no install.
-  5. Release, all suites once.
-
-- **OpenTofu provider** ([DESIGN § 13](docs/DESIGN.md#13-opentofu-provider-planned)), after the
-  machine interface is released, in its own public repository `terraform-provider-stowage`
-  (created by the maintainer with the org app and its ruleset; a GPG key for its releases;
-  registry submission by hand). Slices: Docker target (create, read, delete); update (inputs
-  then release), rollback, write-only secrets, import; Kubernetes target; `stowage_vm_seed` and the
-  VM target; docs, acceptance scripts against `tofu` (sshd + Docker-in-Docker, kind, one TrueNAS
-  VM), first release.
-
 - **ACME proven end to end**: no suite runs an ACME server, so `acme` and `dns-cloudflare` are
   proven by the Caddyfile they write alone — for the HTTP routes and for a domain the front holds
   for L4 routes alone (a site answering 404 over HTTPS, its challenges on the front's ports 80
@@ -181,9 +166,6 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
   `crossingAsked` (`reset-db --new-baseline`'s mark) compares the same way; e2e-vm's crossing
   passes, so find which path it takes before trusting either, and match marks on version and
   revision in one helper.
-- **`TestHookShip` is timing-bound**: it failed once in `make check` under `-race` (ship returned
-  nil but the output or build count differed) and passed 20 runs in a row on the host; its 50 ms
-  lock window and output prefix are worth making deterministic.
 - **Keep a raised module's version in one place**: klauspost/compress is pinned in go.mod and in the
   front, backup and scanner recipes, in three syntaxes, and only `make self-audit` notices one left
   behind. A test comparing each recipe's pin with go.mod would catch it in `make check`.
@@ -219,14 +201,6 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
   0.9.9 records no `libvirt_domain` when the start after its define fails, so `vm destroy` leaves
   it (the failed `vm create` names `virsh undefine … --nvram`). Fixed upstream (the resource kept
   in the state, tainted) or by a `vm destroy` that reaches the platform, it needs no hint.
-- **The OS bundle carries upstream binaries with fixable criticals no rebuild clears yet**: Docker's
-  latest `containerd`, `containerd-shim-runc-v2`, `ctr` and `runc` (golang.org/x/net 0.55–0.58).
-  The containerd.io 2.4.2 builds do not link x/net's HTTP/2 server, where GO-2026-6612's bug is, but
-  the scanner matches on the module's version; nothing checks that again for a later build.
-  `examples/full`'s `audit-allow.yaml` accepts it in `os`, each entry narrowed to its package and
-  binary, until 2027-01-31; every project with the kairos shape and `audit` needs the same until
-  Docker ships fixed builds. Before then: check for fixed releases, then remove the allowances. The
-  fixes are taken from upstream's releases only.
 
 - **A change to `examples/full`'s `os` allowances is audited by no suite the gate picks**: e2e-full
   and e2e-full-k8s drop the kairos shape and those entries, so an entry removed too early first
@@ -386,10 +360,6 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
   `forward_auth` are enforced by the Docker and VM fronts; on Kubernetes the chart's ingress
   serves the routes and lint says nothing. Warn per route with a `kubernetes` shape (the examples
   would then need the chart to declare it handles them, or the warning accepted there).
-- **`TestAnUnreachableDaemonIsNamed` flakes under load**: once in a full `go test ./internal/...`
-  run its 0000 socket still let the caller connect (`no permission: <nil>`); 30 runs alone pass.
-  The chmod and the dial race the served socket's own setup: make the test wait for the daemon to
-  listen before the chmod.
 - **e2e-docker's uploads-archive check failed once beside the parallel suites** (2026-10-26) and
   passed alone: `age -d … | tar -t | grep -qx ./e2e.txt` under `pipefail`, where `grep -q` exiting
   on its match can SIGPIPE `tar` and fail the pipeline. Read the listing into a variable first.
@@ -568,9 +538,6 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
 - **A yank reaching the mirror**: an export carries the channel's release, not the yanked one's
   manifest, so the mirror keeps the yanked release's tag unmarked (`--older` moves its channel
   back). Export the yanked manifests of the channel too.
-- **A VM reading a mirror that needs a login**: the VM's reads of a mirror use root's Docker login
-  on the VM (`sudo docker login` over SSH); the e2e mirror allows anonymous reads. Carry the site's
-  pull account (a secret, so over SSH, as other secrets) when a mirror refuses anonymous reads.
 - **A test release on another name of the project's registry**: `--test-registry` is compared
   by its spelling, folded (case, dots, ports, loopback, Docker Hub); another DNS name or address
   of the same registry is not told. Before publishing, a test release of a signing project could
@@ -888,7 +855,6 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
   `.stowage-front-logins`; a weak password the operator typed falls offline. Write it 0600 (here,
   in `restoreStack`), or the install dir 0750.
 
-
 - **`k8s install --unsafe-sysctls` on a kubelet that refuses them**: the pods fail at once
   (`SysctlForbidden`), yet helm waits out `--timeout` before it rolls back. Watch the rollout's
   pods and fail on that reason early (a namespace's Pod Security label is checked before
@@ -972,7 +938,7 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
   which suits material written once; a service writing a volume continuously would need its own
   pause (a hook around the archive).
 - Not built for non-HTTP stacks: x509/key generators (product PKI; DR is covered by volume
-  backup), a pre-start hook, front client-cert auth, a project with no front.
+  backup), a pre-start hook.
 
 - **A compressed disk's file size**: a disk's layer is annotated with its file's digest, not its
   size, so a different file of that name in `vm create`'s `--out` is hashed whole before it is
@@ -1122,9 +1088,6 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
   `stowage.pullSecret` from the release, check it exists, and write it back (or drop it for a
   mirror).
 
-- **A symlinked version file at a commit**: the hook reads the link's target text, not the file it
-  points to, so a project whose `VERSION` or changelog is a symbolic link gets an error from
-  `hook post-commit` (`ship` reads it fine).
 - **Kept release's front rendered by the newer Stowage**: an upgrade renders the kept release's
   front files with its own renderer (from the kept release's spec and `.env`), so a rollback runs
   them as this Stowage writes them, not as the older one did. Equal while the front's format does
@@ -1193,10 +1156,6 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
   `.github/workflows/`, so the release's tag, date and notes extraction run first on a real tag.
   A script the workflow calls, with a test in the gate, would cover it.
 
-- **Other tests write a script and run it while parallel tests fork** (`internal/command`,
-  `internal/publish`, `internal/kairos`): exec can then fail with "text file busy" (a fork holds
-  the file it inherited open until its own exec). `internal/install`'s hook tests write theirs
-  before they turn parallel; the same would make these immune.
 - **`make build` rewrites `./bin` in place**: a build in another terminal while a suite runs a
   binary from it fails that exec (text file busy); the gate's own suites reuse its one build
   (`make -o build`). Exporting to a temporary directory and renaming each file into `./bin`
