@@ -13,7 +13,7 @@ same change.
 | [docs/DESIGN.md](docs/DESIGN.md) | contributors | format, versioning, build graph, registry, lifecycle matrix, phases, decisions |
 | [CHANGELOG.md](CHANGELOG.md) | users | Stowage's own releases; the version source of the build |
 | this file | contributors | rules and commit gates |
-| [TODO.md](TODO.md) | contributors | pending work, MoSCoW for the first version (Must = parity), deferred review findings; a done item is deleted |
+| [TODO.md](TODO.md) | contributors | pending features, MoSCoW for the first version (Must = parity), and what is blocked outside the repository; never a finding; a done item is deleted |
 
 **README.md and the reference pages it links document every feature — nothing is discovered in
 the code.** A user or an AI agent reading README.md and the docs/*.md pages it links (DESIGN.md
@@ -28,11 +28,17 @@ in DESIGN.
 ## Scope — the first version is parity
 
 The first version does what an existing production deployment of this kind does today on its
-three shapes, and nothing more. Every pending item and every review finding is sorted MoSCoW in
-[TODO.md](TODO.md): **Must** = needed for parity (or a finding that changes what is published,
-who may read or write it, or what an install trusts — always fixed now); **Should / Could** =
-useful beyond parity, deferred unless cheap; **Won't** = not in the first version. Decide the
-category yourself; do not ask. Mutation-style checks are timeboxed (gate 4).
+three shapes, and nothing more. Every pending feature is sorted MoSCoW in [TODO.md](TODO.md):
+**Must** = needed for parity; **Should / Could** = useful beyond parity, deferred unless cheap;
+**Won't** = not in the first version. Decide the category yourself; do not ask.
+
+**A finding is never deferred.** A bug, a wrong behaviour, a security hole, a race, a leftover of
+a review, a message whose hint does not work, or a test that proves less than it claims is not a
+feature: it is fixed in the slice that finds it (one found outside a slice opens the next one),
+at its cause — the rule that let it exist: one helper where a rule was written twice, a lock where
+two runs race, a refusal at decode or lint rather than at boot — and never written to TODO.md.
+Only a finding blocked outside the repository (upstream, an account, hardware) is noted there,
+under Blocked, with what unblocks it. Mutation-style checks are timeboxed (gate 4).
 
 ## Build — Docker only
 
@@ -76,19 +82,19 @@ The Serena MCP server is this repository's code tool; use it for every code task
 - **Cheap checks first.** Before a review round: host `go vet ./...`, the language server's
   diagnostics and the package tests are clean, so the review spends itself on what they cannot see.
 - **Narrow later rounds.** Round 1 targets the whole slice. A later round targets only the files its
-  fixes touched, and its brief names the fixes and what is deferred — it never re-reads the slice.
+  fixes touched, and its brief names the fixes — it never re-reads the slice.
 - **Round budget.** Three rounds per slice, and more while a round still finds a blocking
   defect (wrong behaviour, security hole, data loss, a rule of this file broken): each round is
   preceded by the self-review (gate 4), each fix gets a test that fails without it, and each later
   round is narrowed to the files its fixes touched.
-  Rounds that find only minor findings end the loop: those are fixed or deferred, no round.
+  Rounds that find only minor findings end the loop: those are fixed, with no new round.
 - **Overlap.** While a review runs, read and design the next slice; never edit a file under review.
 - **One gate run.** `make gate` (`STOWAGE_VM_ENV=<file> make gate` when it needs e2e-vm), once per
   settled tree: check, build and lint, then only the suites gate 1 lists for the changed paths —
   `test/gate.sh` encodes that list, and a change to the list changes both. The long suites
   (e2e-kairos ~25 min, e2e-vm ~105 min) run only for the code they exercise. The end-to-end suites run **in parallel**: each has its own zot, ports, network
   and work directory. A suite that fails only in parallel is re-run alone, and the clash is fixed
-  or noted in TODO.md.
+  in the next slice.
 - **Commit as soon as the gates and the review settle.** Then, before starting the next slice:
   prepare it (read the reference shape, write its brief — decisions, parity facts, files, open
   questions — where the next context will find it), and ask the user, loudly, to `/compact`.
@@ -197,15 +203,15 @@ a self-review against the code it describes is enough. Every other commit clears
      do, whether each message or hint works when followed literally, and whether each refusal and
      branch has a test. Prefer the simplest rule (refuse, naming the exact fix) over recovery
      logic. **Sabotage every new check or test and watch it fail.** Fix what you find. Timeboxed:
-     one sabotage pass, plus one re-run on the checks a fix touched; a survivor left after that is
-     noted (TODO.md when it matters), not chased. A slice reaching a fourth round is a sign this
-     walk was skipped: do it on the whole slice before the next round.
+     one sabotage pass, plus one re-run on the checks a fix touched; a check that survives its
+     sabotage is fixed (it proves nothing as it is), and its fix sabotaged once. A slice reaching
+     a fourth round is a sign this walk was skipped: do it on the whole slice before the next
+     round.
    - Every change → `/code-review medium <paths>`; a complex change → `/code-review high <paths>`
      (one that touches a costly area listed below, or a concurrency, process or security boundary);
      never `xhigh` or above. Looped while a round finds a blocking defect (wrong behaviour, security
-     hole, data loss, a rule of this file broken). Minor findings are fixed without a new round, or
-     deferred to TODO.md (Should / Could) when fixing them would slow the first version — never a
-     finding that changes what is published, who may read or write it, or what an install trusts.
+     hole, data loss, a rule of this file broken). Minor findings are fixed without a new round,
+     never deferred (see [Scope](#scope--the-first-version-is-parity)).
      Take extra care in the self-review where a defect is costly: the registry client, signing or
      verification, credentials, the release manifest format, the build graph's skip/re-tag decision,
      a runtime piece that runs on an operator's host, a format version, or an edit to a gate (this

@@ -1,9 +1,11 @@
 # TODO
 
-Pending work, prioritised MoSCoW for the **first version**. Its goal is parity: Stowage does what
-an existing production deployment of this kind does today on its three shapes — nothing more.
-A finished item is deleted, not ticked. The plan behind it is
-[docs/DESIGN.md § 11](docs/DESIGN.md#11-phases).
+Pending features, prioritised MoSCoW for the **first version**. Its goal is parity: Stowage does
+what an existing production deployment of this kind does today on its three shapes — nothing
+more. A finding (a bug, a wrong behaviour, a security hole, a review's leftover, a weak test) is
+never written here: it is fixed in the slice that finds it; only one blocked outside the
+repository is, under Blocked, with what unblocks it. A finished item is deleted, not ticked.
+The plan behind it is [docs/DESIGN.md § 11](docs/DESIGN.md#11-phases).
 
 ## Must — parity
 
@@ -25,16 +27,6 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
    every other install pulling; an install without one keeps the baked account. Not in 0.35.0
    (user, 2026-11-11): (a) needs a `registry.pull` mint operation per registry, an issuing
    credential, revocation and a fallback.
-
-### Machine interface — the VM's dry runs
-
-1. **`upgrade --dry-run --json` and `rollback --dry-run --json` on the VM**: the OpenTofu provider's
-   plan-time check of a release change (DESIGN § 13, "an upgrade's dry run over SSH") has no verb
-   on the VM; Docker's `upgrade`/`rollback` and `k8s upgrade`/`k8s rollback` have one. Same
-   contract as Docker's: exit 0 with what would change, or exit 3 with the `{reason, fix}`
-   refusal; nothing written, no job, no OS write, no reboot, no backup. The host daemon's checks
-   (the target's installer, the kept-installer and schema-baseline checks it can run) answer it.
-   The provider refuses `plan_dry_run` on a `vm` block until then.
 
 ### VM creation — the OpenTofu path moves out of Stowage
 
@@ -813,11 +805,6 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
   sits readable in the staging dataset and is never deleted. A storage reader who is also on
   the path impersonates the VM to the pinned SSH and receives the secrets. Upload it 0600, and
   remove it once the key is retired.
-- **The Caddyfile shows the route logins' hashes** (security audit 2026-10-26, Low):
-  `renderStack` writes `stowage-front.Caddyfile` 0644 in the 0755 install dir
-  (`internal/install/install.go`), so another local user reads the bcrypt hashes kept 0600 in
-  `.stowage-front-logins`; a weak password the operator typed falls offline. Write it 0600 (here,
-  in `restoreStack`), or the install dir 0750.
 
 - **`k8s install --unsafe-sysctls` on a kubelet that refuses them**: the pods fail at once
   (`SysctlForbidden`), yet helm waits out `--timeout` before it rolls back. Watch the rollout's
