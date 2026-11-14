@@ -29,8 +29,8 @@ sudo <short>-stow install [--channel C] [--set KEY=VALUE]… [--set-file KEY=PAT
 <short>-stow restart|stop|start SERVICE
 <short>-stow provision [--set KEY=VALUE]…   # the provision hook again; --set as on Docker (an input only it reads, or a value it returned or declares it returns; empty forgets it)
 <short>-stow updates [--channel C] [--version V] [--json]
-<short>-stow upgrade [--channel C] [--version V] [--yes] [--no-reboot] [--skip-backup] [--accessible] [--json]   # ends at the reboot it schedules: status and events after it tell how it went
-<short>-stow rollback [--yes] [--accessible] [--json]   # reboot into the passive system: back to the release the last upgrade replaced; ends at that reboot
+<short>-stow upgrade [--channel C] [--version V] [--yes] [--no-reboot] [--skip-backup] [--dry-run] [--accessible] [--json]   # ends at the reboot it schedules: status and events after it tell how it went
+<short>-stow rollback [--yes] [--dry-run] [--accessible] [--json]   # reboot into the passive system: back to the release the last upgrade replaced; ends at that reboot
 <short>-stow reset-db [--yes] [--no-provision] [--accessible]   # wipe the data, start again as first installed
           [--new-baseline [--channel C] [--version V]]   # instead: a later release at another schema baseline, its OS written and booted, that boot wiping the data
 <short>-stow restore OBJECT [--identity FILE|-] [--yes] [--accessible]   # load a backup into the database and its volumes (the volumes alone without one)
@@ -402,6 +402,28 @@ sudo <short>-stow network attach --role ROLE --mac MAC [--mode dhcp|static|none]
   the job's log alone, never the journal, which the verb says first (`the event journal does not
   hold this <kind>'s start (<events_error>): …`): a job's end is then only `GET job`'s, and a
   daemon gone during the job fails the verb.
+- `upgrade --dry-run` and `rollback --dry-run` ask nothing and change nothing: the daemon runs
+  every check the verb runs before its job starts — the release confirmed, the boot judged, no
+  job running and no reboot scheduled, no system written that no boot ran yet, no volumes half
+  restored; for `upgrade` the checks the boot into the release would refuse, for `rollback` the
+  install's own `rollback --dry-run` — and answers the plan instead of starting a job: no backup,
+  no OS written, no reboot. What only the job does is not tried: the OS bundle's pull
+  (`upgrade`), the boot assessment's write and the reboot (`rollback`). The run prints `dry run:
+  every check passed; …; nothing changed` and exits 0 (`--json`: `result` `nothing`); a check
+  that says no exits 3, refused (`--json`: `refused`), as the verb does; a failure (the registry
+  not reachable, a read that fails) exits 1. A check that holds now may not when the verb runs
+  (another job, a restore).
+- Every verb the daemon serves answers "not now" as a refusal, exit 3 (`--json`: `refused`, its
+  `fix` naming what to wait for), nothing changed: a job running, a reboot scheduled, the daemon
+  stopping, the boot not over or not judged yet, an install, upgrade, rollback, provision or
+  reset-db holding the install's lock, a system written that no boot ran yet; `upgrade` and
+  `rollback` also another release than the one confirmed, `upgrade` before the first install
+  another channel than its settings', `rollback` on the recovery system. A state that cannot be
+  read (the gate's, the written system's mark, the system the VM runs) is a failure, exit 1.
+  `rollback --dry-run` prints the install's own rollback dry run's lines, as the job logs them;
+  `upgrade --dry-run` says whether a backup comes first, the slot written (the passive one; the
+  active one for the running release written again) and, with `--no-reboot`, that the next boot
+  runs the new system.
 - `rollback` goes back to the release the last upgrade replaced by booting the passive system,
   which carries it: the daemon checks that the VM runs the active system (refused on the passive
   one: there is no earlier one, and on recovery), that the install runs the release this OS
@@ -1031,7 +1053,7 @@ the POST, `confirm` then naming the release found, cross a baseline; a channel o
 it, or `no_provision` with it, is a 400; a token is good for the plan its GET showed alone — a
 crossing or not, and its target — and another is refused: `reset-db's token is the GET's that
 showed another plan: look again`), `GET updates?channel=&version=` (`left_by_rollback` marks a release the
-  install went back from; `rewrite` the running release offered on the passive system), `POST upgrade` (`{"channel", "version", "confirm": {"version", "revision"}, "reboot", "skip_backup"}`, 202), `GET job?since=N` (`log_total` is the line to ask from next; the last job's `started` (its identity), kind, target, state — `idle`, `running`, `done`, `failed`
+  install went back from; `rewrite` the running release offered on the passive system), `POST upgrade` (`{"channel", "version", "confirm": {"version", "revision"}, "reboot", "skip_backup", "dry_run"}`, 202; with `dry_run`, every check before the job and no job: 200, `{"to", "slot", "does", "backup"}`, the release the upgrade writes, the slot written, what the boot into it does and whether a backup comes first), `GET job?since=N` (`log_total` is the line to ask from next; the last job's `started` (its identity), kind, target, state — `idle`, `running`, `done`, `failed`
   — and its log from line N; `result`, what a job that is done found: `backup-verify`'s message;
   `reboot`, `{"action", "drain_secs"}`, the reboot a job that is done scheduled as its last step), `GET events?after=N&wait=S` (`{"events": [...],
   "last", "dropped", "truncated"}`: the journal's entries after N (default 0), at most 200,
@@ -1045,7 +1067,7 @@ showed another plan: look again`), `GET updates?channel=&version=` (`left_by_rol
   `after`), the answer waits until an entry is appended — the daemon's own at once, the health
   gate's within half a second — or S seconds pass (then empty), or the daemon stops), `GET rollback` (`{"from", "to"}`: the release the install runs, the
   one the passive system carries; refusals as `rollback`'s), `POST rollback` (`{"confirm":
-  {"version", "revision"}}`, 202, a job), `POST reboot` and `POST shutdown` (`{"drain_secs"}`, 202), `GET network` (`{"live":
+  {"version", "revision"}, "dry_run"}`, 202, a job; with `dry_run`, every check before the job and no job, `confirm` optional: 200, `GET rollback`'s answer and `checks`, the lines of the install's own rollback dry run, which the job logs), `POST reboot` and `POST shutdown` (`{"drain_secs"}`, 202), `GET network` (`{"live":
   {"interface", "mac", "addresses", "gateway", "gateways6", "dns"}, "source": "override|install|dhcp",
   "override", "install", "pending": {"previous", "deadline", "secs_left"}}`; `install` is the
   network `vm create` gave, DHCP or static, which `network reset` returns to while its networkd

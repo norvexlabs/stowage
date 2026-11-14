@@ -1321,7 +1321,7 @@ func (h *Hostd) noReboot() error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.rebooting {
-		return fail(http.StatusConflict, "a reboot is scheduled")
+		return notNowErr{fail(http.StatusConflict, "a reboot is scheduled"), "wait for the reboot, then run again"}
 	}
 	return nil
 }

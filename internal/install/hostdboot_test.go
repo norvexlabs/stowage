@@ -150,6 +150,65 @@ func TestRollbackChoosesThePassiveSystemThenReboots(t *testing.T) {
 		t.Fatalf("%d %+v", code, p)
 	}
 	before := read(t, filepath.Join(e.dir, ".env"))
+	var e409 errOf
+	e409 = errOf{}
+	if code := call(t, hh, "POST", "/v1/rollback", RollbackRequest{Confirm: &p.From, DryRun: true}, &e409); code != 409 || !strings.Contains(e409.Error, "which was confirmed") || !e409.Refused {
+		t.Fatalf("a dry run confirming another release: %d %s", code, e409.Error)
+	}
+	// A dry run refuses volumes a restore left half restored, as the rollback does.
+	split := filepath.Join(e.dir, volumesSplitFile)
+	if err := os.WriteFile(split, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	e409 = errOf{}
+	if code := call(t, hh, "POST", "/v1/rollback", RollbackRequest{DryRun: true}, &e409); code != 409 || !strings.Contains(e409.Error, "half restored") || !e409.Refused {
+		t.Fatalf("a dry run with volumes half restored: %d %s", code, e409.Error)
+	}
+	if err := os.Remove(split); err != nil {
+		t.Fatal(err)
+	}
+	// The boot not judged yet: going back is refused until it is.
+	host.mu.Lock()
+	host.judge = "activating"
+	host.mu.Unlock()
+	e409 = errOf{}
+	if code := call(t, hh, "POST", "/v1/rollback", RollbackRequest{DryRun: true}, &e409); code != 409 || !strings.Contains(e409.Error, "not judged this boot yet") || !e409.Refused {
+		t.Fatalf("a dry run before the judgement: %d %+v", code, e409)
+	}
+	host.mu.Lock()
+	host.judge = ""
+	host.mu.Unlock()
+	// A system written that no boot ran yet: going back is refused until a reboot.
+	if err := os.WriteFile(filepath.Join(d.Run, osWritten), []byte("notes:3.0.0\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	e409 = errOf{}
+	if code := call(t, hh, "POST", "/v1/rollback", RollbackRequest{DryRun: true}, &e409); code != 409 || !strings.Contains(e409.Error, "reboot first") || !e409.Refused {
+		t.Fatalf("a dry run with an OS written: %d %+v", code, e409)
+	}
+	if err := os.Remove(filepath.Join(d.Run, osWritten)); err != nil {
+		t.Fatal(err)
+	}
+	// A dry run refuses what claiming the job slot refuses.
+	d.mu.Lock()
+	d.rebooting = true
+	d.mu.Unlock()
+	e409 = errOf{}
+	if code := call(t, hh, "POST", "/v1/rollback", RollbackRequest{Confirm: &p.To, DryRun: true}, &e409); code != 409 || !strings.Contains(e409.Error, "a reboot is scheduled") || !e409.Refused {
+		t.Fatalf("a dry run with a reboot scheduled: %d %s", code, e409.Error)
+	}
+	d.mu.Lock()
+	d.rebooting = false
+	d.mu.Unlock()
+	// A dry run answers the plan and starts nothing.
+	var dry RollbackPlan
+	if code := call(t, hh, "POST", "/v1/rollback", RollbackRequest{Confirm: &p.To, DryRun: true}, &dry); code != 200 || dry.From != p.From || dry.To != p.To || len(dry.Checks) == 0 {
+		t.Fatalf("the dry run: %d %+v", code, dry)
+	}
+	var idle JobStatus
+	if call(t, hh, "GET", "/v1/job", nil, &idle); idle.State != "idle" || len(host.calls()) > 0 || read(t, filepath.Join(e.dir, ".env")) != before {
+		t.Fatalf("a dry run started %+v, ran %v", idle, host.calls())
+	}
 	if code := call(t, hh, "POST", "/v1/rollback", RollbackRequest{Confirm: &p.To}, nil); code != 202 {
 		t.Fatalf("%d", code)
 	}
@@ -160,6 +219,12 @@ func TestRollbackChoosesThePassiveSystemThenReboots(t *testing.T) {
 	log := strings.Join(j.Log, "\n")
 	if !strings.Contains(log, "the database is at 6; 1.0.0 reads past the newer migrations") || !strings.Contains(log, "a run would go back") {
 		t.Errorf("the checks are not in the log: %s", log)
+	}
+	// The dry run answered the lines the job logs.
+	for _, l := range dry.Checks {
+		if !strings.Contains(log, l) {
+			t.Errorf("the dry run's check %q is not in the job's log", l)
+		}
 	}
 	var st Status
 	call(t, hh, "GET", "/v1/status", nil, &st)
@@ -299,9 +364,10 @@ func TestAStoppingDaemonStartsNoJob(t *testing.T) {
 	d.mu.Lock()
 	d.stopping = true
 	d.mu.Unlock()
-	var body map[string]any
-	if code := call(t, d.Handler(), "POST", "/v1/rollback", RollbackRequest{}, &body); code != http.StatusServiceUnavailable || !strings.Contains(fmt.Sprint(body), "the host daemon is stopping") {
-		t.Fatalf("%d %v", code, body)
+	var body errOf
+	if code := call(t, d.Handler(), "POST", "/v1/rollback", RollbackRequest{}, &body); code != http.StatusServiceUnavailable || !strings.Contains(body.Error, "the host daemon is stopping") ||
+		!body.Refused || body.Fix != "wait for the host daemon to start again, then run again" {
+		t.Fatalf("%d %+v", code, body)
 	}
 	if strings.Contains(fmt.Sprint(host.calls()), "grub2-editenv") {
 		t.Errorf("a refused rollback wrote: %v", host.calls())
@@ -353,9 +419,20 @@ func TestRollbackRefusals(t *testing.T) {
 	} {
 		e, d, host := upgradedVM(t)
 		c.setup(t, e, d, host)
-		var got errOf
-		if code := call(t, d.Handler(), "POST", "/v1/rollback", c.body, &got); code != 409 || !strings.Contains(got.Error, c.want) {
-			t.Errorf("%s: %d %q, want %q", name, code, got.Error, c.want)
+		// Each is a refusal (nothing changed), its plan's GET and a dry run's too.
+		dry := c.body
+		dry.DryRun = true
+		for _, how := range []struct {
+			method string
+			body   any
+		}{{"POST", c.body}, {"POST", dry}, {"GET", nil}} {
+			if how.method == "GET" && (c.body.Confirm != nil || slices.Contains([]string{"gate queued", "judging", "booting"}, name)) {
+				continue // the GET confirms nothing, and shows the plan whatever the boot's state
+			}
+			var got errOf
+			if code := call(t, d.Handler(), how.method, "/v1/rollback", how.body, &got); code != 409 || !strings.Contains(got.Error, c.want) || !got.Refused {
+				t.Errorf("%s (%s %+v): %d %+v, want %q", name, how.method, how.body, code, got, c.want)
+			}
 		}
 		if v := assessOf(t, d); v[assessTentative] != "" {
 			t.Errorf("%s: the assessment changed: %v", name, v)
@@ -372,8 +449,16 @@ func TestAnUpgradeWaitsForTheGatesJudgement(t *testing.T) {
 	p.release("2.0.0", 1, nil)
 	host := &fakeHost{judge: "activating"}
 	var got errOf
-	if code := call(t, daemon(p.env, host).Handler(), "POST", "/v1/upgrade", UpgradeRequest{Channel: "stable"}, &got); code != 409 || !strings.Contains(got.Error, "not judged this boot yet") {
-		t.Errorf("%d %s", code, got.Error)
+	if code := call(t, daemon(p.env, host).Handler(), "POST", "/v1/upgrade", UpgradeRequest{Channel: "stable"}, &got); code != 409 || !strings.Contains(got.Error, "not judged this boot yet") || !got.Refused {
+		t.Errorf("%d %+v", code, got)
+	}
+	// The gate's state that cannot be read is a failure, not a refusal: dry run or not.
+	for _, dry := range []bool{false, true} {
+		got = errOf{}
+		bus := daemon(p.env, &fakeHost{judge: "<error>"}).Handler()
+		if code := call(t, bus, "POST", "/v1/upgrade", UpgradeRequest{Channel: "stable", DryRun: dry}, &got); code < 500 || got.Refused || !strings.Contains(got.Error, "Failed to connect to bus") {
+			t.Errorf("an unreadable gate (dry run %t): %d %+v", dry, code, got)
+		}
 	}
 	// Once judged (failed is judged too), it runs.
 	host.judge = "failed"
@@ -537,8 +622,11 @@ func TestASecondUpgradeWaitsForTheBootOfTheFirst(t *testing.T) {
 	}
 	waitJob(t, hh)
 	var got errOf
-	if code := call(t, hh, "POST", "/v1/upgrade", UpgradeRequest{Channel: "stable"}, &got); code != 409 || !strings.Contains(got.Error, "which no boot ran yet: reboot first") {
-		t.Errorf("%d %s", code, got.Error)
+	for _, dry := range []bool{false, true} {
+		got = errOf{}
+		if code := call(t, hh, "POST", "/v1/upgrade", UpgradeRequest{Channel: "stable", DryRun: dry}, &got); code != 409 || !strings.Contains(got.Error, "which no boot ran yet: reboot first") || !got.Refused {
+			t.Errorf("dry run %t: %d %+v", dry, code, got)
+		}
 	}
 	// A mark that cannot be read refuses too.
 	if err := os.Remove(filepath.Join(d.Run, osWritten)); err != nil {
@@ -547,8 +635,12 @@ func TestASecondUpgradeWaitsForTheBootOfTheFirst(t *testing.T) {
 	if err := os.Mkdir(filepath.Join(d.Run, osWritten), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if code := call(t, hh, "POST", "/v1/upgrade", UpgradeRequest{Channel: "stable"}, &got); code != 409 || !strings.Contains(got.Error, "is not known") {
-		t.Errorf("unreadable: %d %s", code, got.Error)
+	// A failure to read it, not a refusal: dry run or not.
+	for _, dry := range []bool{false, true} {
+		got = errOf{}
+		if code := call(t, hh, "POST", "/v1/upgrade", UpgradeRequest{Channel: "stable", DryRun: dry}, &got); code != 409 || !strings.Contains(got.Error, "is not known") || got.Refused {
+			t.Errorf("unreadable (dry run %t): %d %+v", dry, code, got)
+		}
 	}
 }
 

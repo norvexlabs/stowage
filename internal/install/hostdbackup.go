@@ -906,6 +906,19 @@ func (h *Hostd) planBackup(ctx context.Context, req BackupRequest) (*backupPlan,
 
 // preflightBackup takes a backup before an upgrade, when one is configured: one that fails is
 // logged, and the upgrade goes on (the boot still dumps the database before it migrates).
+// backupFirst says whether preflightBackup would take a backup: settings that can be read
+// configure one.
+func (h *Hostd) backupFirst() bool {
+	pg, err := h.pgBackup()
+	if err != nil {
+		return false
+	}
+	h.backupMu.Lock()
+	c, err := h.readBackup(pg)
+	h.backupMu.Unlock()
+	return err == nil && c != nil
+}
+
 func (h *Hostd) preflightBackup(in *Installer, logf func(string, ...any)) {
 	pg, err := h.pgBackup()
 	if err != nil {

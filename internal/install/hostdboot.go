@@ -25,17 +25,34 @@ type Health struct {
 	Reason string `json:"reason,omitempty"` // why not
 }
 
-// RollbackPlan is what GET /v1/rollback answers: the release the install runs, and the one the
-// passive system carries, which going back runs.
+// RollbackPlan is what GET /v1/rollback and a dry run of POST /v1/rollback answer: the release
+// the install runs, and the one the passive system carries, which going back runs.
 type RollbackPlan struct {
 	From Version `json:"from"`
 	To   Version `json:"to"`
+	// Checks, a dry run's alone: the lines of the install's own rollback dry run, which the job
+	// logs.
+	Checks []string `json:"checks,omitempty"`
 }
 
 // RollbackRequest is POST /v1/rollback's body.
 type RollbackRequest struct {
 	// Confirm, when set, is the release the operator confirmed going back to: another is refused.
 	Confirm *Version `json:"confirm,omitempty"`
+	// DryRun runs every check before the job and answers the RollbackPlan: no job, nothing
+	// written; Confirm may be left out.
+	DryRun bool `json:"dry_run,omitempty"`
+}
+
+// nonEmptyLines is s's non-empty lines.
+func nonEmptyLines(s string) []string {
+	var out []string
+	for _, l := range strings.Split(strings.TrimSpace(s), "\n") {
+		if l != "" {
+			out = append(out, l)
+		}
+	}
+	return out
 }
 
 // osWritten, in the daemon's runtime directory (which a reboot empties), marks an OS an upgrade
@@ -53,7 +70,7 @@ func (h *Hostd) osWritten() error {
 	case err != nil:
 		return fmt.Errorf("whether an upgrade wrote a new system is not known: %w", err)
 	}
-	return fmt.Errorf("an upgrade wrote (or began to write) %s, which no boot ran yet", strings.TrimSpace(string(raw)))
+	return notNowErr{fmt.Errorf("an upgrade wrote (or began to write) %s, which no boot ran yet", strings.TrimSpace(string(raw))), "reboot first (the next boot runs the system written), then run again"}
 }
 
 func (h *Hostd) assessment() assessment {
@@ -109,7 +126,10 @@ func (h *Hostd) plan(ctx context.Context, log io.Writer) (RollbackPlan, error) {
 	case "passive":
 		return RollbackPlan{}, refuseAs(http.StatusConflict, "nothing to go back to: the VM runs the earlier system already", "the VM runs the passive system already: there is no earlier one to go back to")
 	default:
-		return RollbackPlan{}, fail(http.StatusConflict, "the VM runs the %q system, not the active one: going back chooses the passive system from the active one", mode)
+		if mode == "" {
+			return RollbackPlan{}, fail(http.StatusInternalServerError, "the system the VM runs is not known (no *_mode file in %s)", h.O.cos())
+		}
+		return RollbackPlan{}, refuseAs(http.StatusConflict, "boot the active system (GRUB's default entry), then run again", "the VM runs the %q system, not the active one: going back chooses the passive system from the active one", mode)
 	}
 	env, err := in.open()
 	if err != nil {
@@ -123,7 +143,7 @@ func (h *Hostd) plan(ctx context.Context, log io.Writer) (RollbackPlan, error) {
 	}
 	// An upgrade written but not booted yet (--no-reboot) made the running system the passive one.
 	if err := h.osWritten(); err != nil {
-		return RollbackPlan{}, fail(http.StatusConflict, "%v: the passive system may now be this one; reboot first", err)
+		return RollbackPlan{}, sameKind(err, fail(http.StatusConflict, "%v: the passive system may now be this one; reboot first", err))
 	}
 	raw, err := os.ReadFile(filepath.Join(in.path(PrevDir), prevState))
 	if errors.Is(err, os.ErrNotExist) {
@@ -180,13 +200,28 @@ func (h *Hostd) rollback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.Confirm != nil && *req.Confirm != p.To {
-		replyErr(w, fail(http.StatusConflict, "the passive system carries %s, not %s, which was confirmed", p.To, *req.Confirm))
+		replyErr(w, refuseAs(http.StatusConflict, "look again, then confirm the release the passive system carries", "the passive system carries %s, not %s, which was confirmed", p.To, *req.Confirm))
 		return
 	}
 	// Again as the job claims the slot: a restore that just ended may have marked them.
-	j, err := h.startJob("rollback", p.To.String(), func() error {
+	split := func() error {
 		if err := in.volumesSplit(); err != nil {
 			return failAs(http.StatusConflict, err)
+		}
+		return nil
+	}
+	if req.DryRun {
+		if err := h.slotFree(split); err != nil {
+			replyErr(w, err)
+			return
+		}
+		p.Checks = nonEmptyLines(checks.String())
+		reply(w, http.StatusOK, p)
+		return
+	}
+	j, err := h.startJob("rollback", p.To.String(), func() error {
+		if err := split(); err != nil {
+			return err
 		}
 		// Counted as the job is claimed (under mu, after claimJob's stopping check; nothing
 		// after this guard fails the claim): Serve's wait never misses it.
@@ -199,10 +234,8 @@ func (h *Hostd) rollback(w http.ResponseWriter, r *http.Request) {
 	}
 	go func() {
 		defer h.rollbacks.Done()
-		for _, l := range strings.Split(strings.TrimSpace(checks.String()), "\n") {
-			if l != "" {
-				h.logf(j, "%s", l)
-			}
+		for _, l := range nonEmptyLines(checks.String()) {
+			h.logf(j, "%s", l)
 		}
 		if err := h.toPassive(j, p); err != nil {
 			h.finish(j, err)
@@ -237,7 +270,7 @@ func (h *Hostd) toPassive(j *job, p RollbackPlan) error {
 	// The plan again, as a run during the drain may have changed what it found.
 	if again, err := h.plan(h.ctx, io.Discard); err != nil {
 		return fmt.Errorf("nothing changed: %w", err)
-	} else if again != p {
+	} else if again.From != p.From || again.To != p.To {
 		return fmt.Errorf("nothing changed: the passive system now carries %s, the install runs %s", again.To, again.From)
 	}
 	// Never during an operator's run: the install's lock is held to the reboot, kept by the

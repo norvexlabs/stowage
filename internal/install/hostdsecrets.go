@@ -295,7 +295,7 @@ func (h *Hostd) restoreBackup(w http.ResponseWriter, r *http.Request) {
 	// restored would strand it, its boot refusing them.
 	j, err := h.startJob("restore", req.Object, func() error {
 		if err := h.osWritten(); len(pg.Volumes) > 0 && err != nil {
-			return fail(http.StatusConflict, "%v: reboot first, then restore", err)
+			return sameKind(err, fail(http.StatusConflict, "%v: reboot first, then restore", err))
 		}
 		return nil
 	})

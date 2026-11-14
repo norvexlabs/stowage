@@ -189,6 +189,27 @@ func TestVMVerbsJSONResults(t *testing.T) {
 	started := func(w http.ResponseWriter, _ *http.Request) {
 		reply(w, 202, JobStarted{Job: "upgrade", Target: "2.0.0-1", Started: fakeStart, Events: ptr(int64(0))})
 	}
+	// dryRun answers plan to a request asking a dry run, confirming a release unless confirmless;
+	// anything else fails.
+	dryRun := func(plan any, confirmless bool) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			var body struct {
+				DryRun  bool     `json:"dry_run"`
+				Confirm *Version `json:"confirm"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil || !body.DryRun || (body.Confirm == nil) != confirmless {
+				reply(w, 500, map[string]any{"error": "not a confirmed dry run"})
+				return
+			}
+			reply(w, 200, plan)
+		}
+	}
+	// answers is the daemon's plain error answer, not a refusal, with status.
+	answers := func(status int) http.HandlerFunc {
+		return func(w http.ResponseWriter, _ *http.Request) {
+			reply(w, status, map[string]any{"error": "the daemon says no"})
+		}
+	}
 	jobEnds := func(state string) http.HandlerFunc {
 		return func(w http.ResponseWriter, _ *http.Request) {
 			reply(w, 200, JobStatus{Started: ptr(fakeStart), Kind: "upgrade", Target: "2.0.0-1", State: state, Error: "it broke", Log: []string{"a line"}})
@@ -248,6 +269,26 @@ func TestVMVerbsJSONResults(t *testing.T) {
 			},
 			"POST /v1/rollback": started, "GET /v1/job": refused,
 		}, "", "", false, false},
+		"upgrade --dry-run, nothing asked": {[]string{"upgrade", "--dry-run"}, map[string]http.HandlerFunc{
+			"GET /v1/updates":  func(w http.ResponseWriter, _ *http.Request) { reply(w, 200, avail) },
+			"POST /v1/upgrade": dryRun(UpgradePlan{To: Version{"2.0.0", 1}, Does: "upgrades the install"}, false),
+		}, ResultNothing, "", false, true},
+		"upgrade --dry-run refused by the daemon": {[]string{"upgrade", "--dry-run"}, map[string]http.HandlerFunc{
+			"GET /v1/updates": func(w http.ResponseWriter, _ *http.Request) { reply(w, 200, avail) }, "POST /v1/upgrade": refused,
+		}, ResultNothing, "choose another release", true, true},
+		"rollback --dry-run, nothing asked": {[]string{"rollback", "--dry-run"}, map[string]http.HandlerFunc{
+			"POST /v1/rollback": dryRun(RollbackPlan{From: Version{"2.0.0", 1}, To: Version{"1.0.0", 1}}, true),
+		}, ResultNothing, "", false, true},
+		"rollback --dry-run refused by the daemon": {[]string{"rollback", "--dry-run"}, map[string]http.HandlerFunc{
+			"POST /v1/rollback": refused,
+		}, ResultNothing, "choose another release", true, true},
+		// The daemon says what is a refusal: a plain error answer stays a failure, dry run or not.
+		"upgrade --dry-run with a plain error": {[]string{"upgrade", "--dry-run"}, map[string]http.HandlerFunc{
+			"GET /v1/updates": func(w http.ResponseWriter, _ *http.Request) { reply(w, 200, avail) }, "POST /v1/upgrade": answers(409),
+		}, "", "", false, false},
+		"rollback --dry-run with a plain error": {[]string{"rollback", "--dry-run"}, map[string]http.HandlerFunc{
+			"POST /v1/rollback": answers(503),
+		}, "", "", false, false},
 		"rollback without a terminal or --yes": {[]string{"rollback"}, map[string]http.HandlerFunc{
 			"GET /v1/rollback": func(w http.ResponseWriter, _ *http.Request) {
 				reply(w, 200, RollbackPlan{From: Version{"2.0.0", 1}, To: Version{"1.0.0", 1}})
@@ -283,7 +324,7 @@ func TestVMVerbsJSONResults(t *testing.T) {
 				t.Errorf("refused %+v, want the fix %q", r.Refused, c.fix)
 			}
 			// The run's text is the log's, never standard output's.
-			if strings.Contains(out, "2.0.0 (revision 1) on stable") || strings.Contains(out, "the passive system carries") {
+			if strings.Contains(out, "2.0.0 (revision 1) on stable") || strings.Contains(out, "the passive system carries") || strings.Contains(out, "dry run") {
 				t.Errorf("text on standard output:\n%s", out)
 			}
 		})
@@ -965,5 +1006,39 @@ func TestVMRefusalsCarryAFixThatHoldsOnTheVM(t *testing.T) {
 				t.Errorf("on Docker: %#v", r)
 			}
 		})
+	}
+}
+
+// The dry runs' text, on the log under --json: rollback's prints the install's checks; upgrade's
+// says which boot runs the new system, --no-reboot's the next.
+func TestVMDryRunText(t *testing.T) {
+	t.Parallel()
+	e := vmEnv(t, "1.0.0")
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/updates", func(w http.ResponseWriter, _ *http.Request) {
+		reply(w, 200, Update{Channel: "stable", Current: Version{"1.0.0", 1}, Target: Version{"2.0.0", 1}, Available: true})
+	})
+	mux.HandleFunc("POST /v1/upgrade", func(w http.ResponseWriter, _ *http.Request) {
+		reply(w, 200, UpgradePlan{To: Version{"2.0.0", 1}, Slot: "passive", Does: "upgrades the install", Backup: true})
+	})
+	mux.HandleFunc("POST /v1/rollback", func(w http.ResponseWriter, _ *http.Request) {
+		reply(w, 200, RollbackPlan{From: Version{"2.0.0", 1}, To: Version{"1.0.0", 1}, Checks: []string{"the database is at 6", "a run would go back"}})
+	})
+	mux.HandleFunc("GET /v1/status", func(w http.ResponseWriter, _ *http.Request) {
+		reply(w, 200, Status{Name: "notes", Installed: &Version{"2.0.0", 1}, Job: "idle"})
+	})
+	sock := servedHandler(t, mux)
+	for _, c := range []struct {
+		args      []string
+		want, not string
+	}{
+		{[]string{"upgrade", "--dry-run"}, "an upgrade takes a backup first, then notes 2.0.0 (revision 1) written to the passive slot, and the boot into it (the reboot the upgrade schedules) upgrades the install", "no reboot scheduled"},
+		{[]string{"upgrade", "--dry-run", "--no-reboot"}, "and the next boot (no reboot scheduled) upgrades the install", "the reboot the upgrade schedules"},
+		{[]string{"rollback", "--dry-run"}, "the database is at 6\na run would go back\ndry run: every check passed; going back reboots into notes 1.0.0 (revision 1)", "\x00"},
+	} {
+		out, log, err := ctlSplit(e, sock, append(c.args, "--json")...)
+		if err != nil || !strings.Contains(log, c.want) || strings.Contains(log, c.not) || result(t, out).Result != ResultNothing {
+			t.Errorf("%v: %v\n%s\n%s", c.args, err, log, out)
+		}
 	}
 }

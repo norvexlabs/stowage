@@ -427,7 +427,7 @@ func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(
 		root.AddCommand(k)
 	}
 	var channel, version string
-	var yes, noReboot, skipBackup bool
+	var yes, noReboot, skipBackup, dryRun bool
 	updates := &cobra.Command{
 		Use:   "updates",
 		Short: "The release an upgrade would install: the channel's latest, or --version's",
@@ -467,6 +467,25 @@ func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(
 				nothing = err == nil
 				return err
 			}
+			reboot := !noReboot
+			req := UpgradeRequest{Channel: channel, Version: version, Confirm: &u.Target, Reboot: &reboot, SkipBackup: skipBackup}
+			if dryRun {
+				req.DryRun, nothing = true, true
+				var p UpgradePlan
+				if err := c.do(ctx, http.MethodPost, "/v1/upgrade", req, &p); err != nil {
+					return err
+				}
+				boot := "the boot into it (the reboot the upgrade schedules)"
+				if noReboot {
+					boot = "the next boot (no reboot scheduled)"
+				}
+				first := ""
+				if p.Backup {
+					first = "a backup first, then "
+				}
+				fmt.Fprintf(out, "dry run: every check passed; an upgrade takes %s%s %s written to the %s slot, and %s %s; nothing changed\n", first, name, p.To, p.Slot, boot, p.Does)
+				return nil
+			}
 			if !yes {
 				p := terminal(accessible)
 				if p == nil {
@@ -483,8 +502,6 @@ func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(
 					return ErrAborted
 				}
 			}
-			reboot := !noReboot
-			req := UpgradeRequest{Channel: channel, Version: version, Confirm: &u.Target, Reboot: &reboot, SkipBackup: skipBackup}
 			var started JobStarted
 			if err := c.do(ctx, http.MethodPost, "/v1/upgrade", req, &started); err != nil {
 				return err
@@ -500,6 +517,7 @@ func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(
 	uf.BoolVarP(&yes, "yes", "y", false, "upgrade without asking")
 	uf.BoolVar(&noReboot, "no-reboot", false, "write the new OS but do not reboot (the next boot runs it)")
 	uf.BoolVar(&skipBackup, "skip-backup", false, "no backup first, though one is configured")
+	uf.BoolVar(&dryRun, "dry-run", false, "run every check the upgrade runs, ask nothing, change nothing")
 	uf.BoolVar(&accessible, "accessible", false, "confirm with a plain line prompt")
 	var drain int
 	power := func(use, short, path string) *cobra.Command {
@@ -525,12 +543,29 @@ func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(
 	}
 	resultFlag(rollback)
 	vmVerb(rollback, func(ctx context.Context) (bool, error) {
+		var nothing bool
 		err := func() error {
+			out := c.textOut(resultJSON, stderr)
+			// A dry run's POST runs the plan's checks and every other: no GET first, no confirm.
 			var p RollbackPlan
-			if err := c.do(ctx, http.MethodGet, "/v1/rollback", nil, &p); err != nil {
+			var err error
+			if dryRun {
+				nothing = true
+				err = c.do(ctx, http.MethodPost, "/v1/rollback", RollbackRequest{DryRun: true}, &p)
+			} else {
+				err = c.do(ctx, http.MethodGet, "/v1/rollback", nil, &p)
+			}
+			if err != nil {
 				return err
 			}
-			fmt.Fprintf(c.textOut(resultJSON, stderr), "the passive system carries %s %s; the install runs %s\n", name, p.To, p.From)
+			fmt.Fprintf(out, "the passive system carries %s %s; the install runs %s\n", name, p.To, p.From)
+			if dryRun {
+				for _, l := range p.Checks {
+					fmt.Fprintln(out, l)
+				}
+				fmt.Fprintf(out, "dry run: every check passed; going back reboots into %s %s; nothing changed\n", name, p.To)
+				return nil
+			}
 			if !yes {
 				t := terminal(accessible)
 				if t == nil {
@@ -554,9 +589,10 @@ func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(
 			// The job started: the run changed the VM.
 			return changed(c.follow(ctx, stderr, started))
 		}()
-		return false, err
+		return nothing, err
 	})
 	rollback.Flags().BoolVarP(&yes, "yes", "y", false, "go back without asking")
+	rollback.Flags().BoolVar(&dryRun, "dry-run", false, "run every check going back runs, ask nothing, change nothing")
 	rollback.Flags().BoolVar(&accessible, "accessible", false, "confirm with a plain line prompt")
 	var noProvision, newBaseline bool
 	var resetChannel, resetVersion string

@@ -36,7 +36,7 @@ type fakeHost struct {
 	// gate, when set, holds kairos-agent until it is closed.
 	gate chan struct{}
 	// boot is the ActiveState of <name>.service, and judge of <name>-health.service; empty is
-	// active.
+	// active; judge "<error>": systemctl fails to read it.
 	boot, judge string
 	// reset is the ActiveState of kairos-reset.service; empty is active.
 	reset string
@@ -85,6 +85,9 @@ func (f *fakeHost) Run(_ context.Context, c Cmd) ([]byte, error) {
 		case "notes.service":
 			st = f.boot
 		case "notes-health.service":
+			if f.judge == "<error>" {
+				return nil, errors.New("Failed to connect to bus")
+			}
 			st = f.judge
 		case kairosReset:
 			st = f.reset
@@ -659,11 +662,16 @@ func TestOneJobAtATime(t *testing.T) {
 		t.Fatalf("%d", code)
 	}
 	var e errOf
-	if code := call(t, hh, "POST", "/v1/upgrade", UpgradeRequest{Channel: "stable"}, &e); code != 409 || !strings.Contains(e.Error, "a job (upgrade) is running") {
-		t.Errorf("a second upgrade: %d %s", code, e.Error)
+	if code := call(t, hh, "POST", "/v1/upgrade", UpgradeRequest{Channel: "stable"}, &e); code != 409 || !strings.Contains(e.Error, "a job (upgrade) is running") || !e.Refused {
+		t.Errorf("a second upgrade: %d %+v", code, e)
 	}
-	if code := call(t, hh, "POST", "/v1/reboot", nil, &e); code != 409 {
-		t.Errorf("a reboot during the upgrade: %d", code)
+	e = errOf{}
+	if code := call(t, hh, "POST", "/v1/upgrade", UpgradeRequest{Channel: "stable", DryRun: true}, &e); code != 409 || !strings.Contains(e.Error, "a job (upgrade) is running") || !e.Refused {
+		t.Errorf("a dry run during the upgrade: %d %+v", code, e)
+	}
+	e = errOf{}
+	if code := call(t, hh, "POST", "/v1/reboot", nil, &e); code != 409 || !e.Refused || e.Fix != "wait for the job to end, then run again" {
+		t.Errorf("a reboot during the upgrade: %d %+v", code, e)
 	}
 	close(host.gate)
 	j := waitJob(t, hh)
@@ -678,6 +686,10 @@ func TestOneJobAtATime(t *testing.T) {
 	host.err = nil
 	if code := call(t, hh, "POST", "/v1/upgrade", UpgradeRequest{Channel: "stable"}, nil); code != 409 {
 		t.Errorf("after a failure: %d", code)
+	}
+	e = errOf{}
+	if code := call(t, hh, "POST", "/v1/upgrade", UpgradeRequest{Channel: "stable", DryRun: true}, &e); code != 409 || !strings.Contains(e.Error, "reboot first") || !e.Refused {
+		t.Errorf("a dry run after a failure: %d %+v", code, e)
 	}
 	if err := os.Remove(filepath.Join(d.Run, osWritten)); err != nil {
 		t.Fatal(err)
@@ -761,8 +773,9 @@ func TestNothingChangesWhileTheBootRuns(t *testing.T) {
 		{"/v1/provision", nil},
 	} {
 		var e errOf
-		if code := call(t, hh, "POST", c.path, c.body, &e); code != 409 || !strings.Contains(e.Error, "still bringing the install up") {
-			t.Errorf("%s: %d %s", c.path, code, e.Error)
+		// A refusal, whatever the verb: nothing changed.
+		if code := call(t, hh, "POST", c.path, c.body, &e); code != 409 || !strings.Contains(e.Error, "still bringing the install up") || !e.Refused || e.Fix == "" {
+			t.Errorf("%s: %d %+v", c.path, code, e)
 		}
 	}
 	if len(host.calls()) > 0 {
@@ -787,9 +800,22 @@ func TestUpgradeRefusesAReleaseOtherThanTheConfirmed(t *testing.T) {
 	hh := daemon(p.env, host).Handler()
 	var e errOf
 	for _, other := range []Version{{"2.0.0", 1}, {"3.0.0", 2}} {
-		if code := call(t, hh, "POST", "/v1/upgrade", UpgradeRequest{Channel: "stable", Confirm: &other}, &e); code != 409 || !strings.Contains(e.Error, "which was confirmed") {
-			t.Fatalf("%v: %d %s", other, code, e.Error)
+		for _, dry := range []bool{false, true} {
+			e = errOf{}
+			if code := call(t, hh, "POST", "/v1/upgrade", UpgradeRequest{Channel: "stable", Confirm: &other, DryRun: dry}, &e); code != 409 || !strings.Contains(e.Error, "which was confirmed") || !e.Refused {
+				t.Fatalf("%v (dry run %t): %d %+v", other, dry, code, e)
+			}
 		}
+	}
+	// A dry run of the confirmed release answers its plan and starts nothing.
+	var plan UpgradePlan
+	if code := call(t, hh, "POST", "/v1/upgrade", UpgradeRequest{Channel: "stable", Confirm: &Version{"2.0.0", 2}, DryRun: true}, &plan); code != 200 ||
+		plan.To != (Version{"2.0.0", 2}) || plan.Does == "" {
+		t.Fatalf("the dry run: %d %+v", code, plan)
+	}
+	var st JobStatus
+	if call(t, hh, "GET", "/v1/job", nil, &st); st.State != "idle" || len(host.calls()) > 0 {
+		t.Fatalf("a dry run started %+v, ran %v", st, host.calls())
 	}
 	if code := call(t, hh, "POST", "/v1/upgrade", UpgradeRequest{Channel: "stable", Confirm: &Version{"2.0.0", 2}}, nil); code != 202 {
 		t.Fatalf("the confirmed revision: %d", code)
@@ -1061,8 +1087,9 @@ func TestAnUpgradeBeforeTheFirstInstall(t *testing.T) {
 	if err := os.WriteFile(h.O.Settings, []byte("channel: stable\nregistry: "+p.prefix+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if code := call(t, hh, "POST", "/v1/upgrade", UpgradeRequest{Channel: "beta"}, &e); code != 409 || !strings.Contains(e.Error, "the first install follows stable (its settings)") {
-		t.Fatalf("another channel: %d %s", code, e.Error)
+	e = errOf{}
+	if code := call(t, hh, "POST", "/v1/upgrade", UpgradeRequest{Channel: "beta"}, &e); code != 409 || !strings.Contains(e.Error, "the first install follows stable (its settings)") || !e.Refused || e.Fix == "" {
+		t.Fatalf("another channel: %d %+v", code, e)
 	}
 	var u Update
 	if code := call(t, hh, "GET", "/v1/updates", nil, &u); code != 200 || !u.Available || u.Target != (Version{"1.0.0", 2}) {
@@ -1076,8 +1103,10 @@ func TestAnUpgradeBeforeTheFirstInstall(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if code := call(t, hh, "POST", "/v1/upgrade", UpgradeRequest{}, &e); code != 409 || !strings.Contains(e.Error, "an install is running") {
-		t.Fatalf("an install running: %d %s", code, e.Error)
+	e = errOf{}
+	if code := call(t, hh, "POST", "/v1/upgrade", UpgradeRequest{}, &e); code != 409 || !strings.Contains(e.Error, "an install is running") || !e.Refused ||
+		e.Fix != "wait for the install to finish, then run again" {
+		t.Fatalf("an install running: %d %+v", code, e)
 	}
 	unlock()
 	no := false

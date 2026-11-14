@@ -51,11 +51,13 @@ import (
 //	                                     output cut at maxExecOutput (operator only)
 //	POST /v1/provision                   {set}: the provision hook again, set recorded first
 //	GET  /v1/updates                     ?channel=C&version=V: the release an upgrade would install
-//	POST /v1/upgrade                     {channel, version, confirm, reboot, skip_backup}: an upgrade job
-//	                                     (202, JobStarted), a backup first when one is configured
+//	POST /v1/upgrade                     {channel, version, confirm, reboot, skip_backup, dry_run}: an
+//	                                     upgrade job (202, JobStarted), a backup first when one is
+//	                                     configured; dry_run: every check before the job, no job (200, UpgradePlan)
 //	GET  /v1/rollback                    {from, to}: what going back to the passive system would do
-//	POST /v1/rollback                    {confirm}: a rollback job, choosing the passive system, then
-//	                                     a reboot (202, JobStarted)
+//	POST /v1/rollback                    {confirm, dry_run}: a rollback job, choosing the passive
+//	                                     system, then a reboot (202, JobStarted); dry_run: every
+//	                                     check before the job, no job (200, RollbackPlan)
 //	GET  /v1/job                         ?since=N: the last job and its log from line N; log_total is
 //	                                     the line to ask from next
 //	GET  /v1/events                      ?after=N&wait=S: the event journal's entries after N, waiting
@@ -433,6 +435,18 @@ type UpgradeRequest struct {
 	Reboot *bool `json:"reboot,omitempty"`
 	// SkipBackup: no backup first, though one is configured.
 	SkipBackup bool `json:"skip_backup,omitempty"`
+	// DryRun runs every check before the job and answers the UpgradePlan: no job, nothing written.
+	DryRun bool `json:"dry_run,omitempty"`
+}
+
+// UpgradePlan is POST /v1/upgrade's answer to a dry run: every check passed, nothing started.
+type UpgradePlan struct {
+	To   Version `json:"to"`
+	Slot string  `json:"slot"` // the slot its OS is written to: passive, or active for a rewrite
+	Does string  `json:"does"` // what the boot into it does
+	// Backup: the job takes a backup first (settings configured, no skip_backup, not a first
+	// install nor a rewrite).
+	Backup bool `json:"backup"`
 }
 
 // PowerRequest is POST /v1/reboot's and /v1/shutdown's body.
@@ -765,6 +779,7 @@ func reply(w http.ResponseWriter, code int, v any) {
 // raised before the request changed anything) is answered as one, refused true, with its fix when
 // it has one: the client exits 3 on it (hostClient.do).
 func replyErr(w http.ResponseWriter, err error) {
+	err = notNow(err)
 	code := http.StatusInternalServerError
 	var he httpError
 	if errors.As(err, &he) {
@@ -1215,7 +1230,7 @@ func (h *Hostd) serviceAction(w http.ResponseWriter, r *http.Request) {
 	// and with the install as it is under it.
 	unlock, err := in.lockNow()
 	if errors.Is(err, errLocked) {
-		replyErr(w, fail(http.StatusConflict, "an install, upgrade, rollback, provision or reset-db is running: wait for it to finish"))
+		replyErr(w, notNowErr{fail(http.StatusConflict, "an install, upgrade, rollback, provision or reset-db is running: wait for it to finish"), "wait for it to finish, then run again"})
 		return
 	}
 	if err != nil {
@@ -1321,9 +1336,9 @@ func (h *Hostd) resetCheck(ctx context.Context, in *Installer) (ResetPlan, error
 	defer h.mu.Unlock()
 	switch {
 	case h.rebooting:
-		return ResetPlan{}, fail(http.StatusConflict, "a reboot is scheduled")
+		return ResetPlan{}, notNowErr{fail(http.StatusConflict, "a reboot is scheduled"), "wait for the reboot, then run again"}
 	case h.job != nil && h.job.State == "running":
-		return ResetPlan{}, fail(http.StatusConflict, "a job (%s) is running", h.job.Kind)
+		return ResetPlan{}, notNowErr{fail(http.StatusConflict, "a job (%s) is running", h.job.Kind), "wait for the job to end, then run again"}
 	}
 	return ResetPlan{Target: target, Plan: in.resetPlan()}, nil
 }
@@ -1504,7 +1519,7 @@ func (h *Hostd) resetDB(w http.ResponseWriter, r *http.Request) {
 			return nil
 		}
 		if err := h.osWritten(); err != nil {
-			return fail(http.StatusConflict, "%v: reboot first, then reset-db", err)
+			return sameKind(err, fail(http.StatusConflict, "%v: reboot first, then reset-db", err))
 		}
 		if err := in.volumesSplit(); err != nil {
 			return failAs(http.StatusConflict, err)
@@ -1621,7 +1636,7 @@ func (h *Hostd) booting(ctx context.Context) error {
 		return err
 	}
 	if !unitDone(st) {
-		return fail(http.StatusConflict, "the boot is still bringing the install up (%s.service is %s): wait for it", h.R.Spec.Name, st)
+		return notNowErr{fail(http.StatusConflict, "the boot is still bringing the install up (%s.service is %s): wait for it", h.R.Spec.Name, st), "wait for the boot to bring the install up, then run again"}
 	}
 	return nil
 }
@@ -1642,7 +1657,7 @@ func (h *Hostd) judged(ctx context.Context) error {
 	}
 	// RemainAfterExit: a judged boot leaves the gate active, or failed.
 	if !unitDone(st) {
-		return fail(http.StatusConflict, "the health gate has not judged this boot yet (%s is %s): wait for it, or `systemctl start %s` if it does not run", unit, st, unit)
+		return notNowErr{fail(http.StatusConflict, "the health gate has not judged this boot yet (%s is %s): wait for it, or `systemctl start %s` if it does not run", unit, st, unit), "wait for the health gate's judgement of this boot, then run again"}
 	}
 	return nil
 }
@@ -1694,21 +1709,65 @@ type jobRunning struct{ err error }
 func (e jobRunning) Error() string { return e.err.Error() }
 func (e jobRunning) Unwrap() error { return e.err }
 
+// slotRefusal is why the job slot cannot be claimed now, guard (when set) run last; nil when it
+// can. The caller holds mu.
+func (h *Hostd) slotRefusal(guard func() error) error {
+	switch {
+	case h.stopping:
+		return notNowErr{fail(http.StatusServiceUnavailable, "the host daemon is stopping"), "wait for the host daemon to start again, then run again"}
+	case h.rebooting:
+		return notNowErr{fail(http.StatusConflict, "a reboot is scheduled"), "wait for the reboot, then run again"}
+	case h.job != nil && h.job.State == "running":
+		return notNowErr{jobRunning{fail(http.StatusConflict, "a job (%s) is running", h.job.Kind)}, "wait for the job to end, then run again"}
+	}
+	if guard != nil {
+		return guard()
+	}
+	return nil
+}
+
+// notNowErr is a check's answer that the run must wait — a job running, a reboot scheduled,
+// the daemon stopping, the boot not over or not judged yet, a system written that no boot ran
+// yet — never an error reading what it checks. Every answer of the daemon makes it a refusal
+// (replyErr, through notNow): nothing changed.
+type notNowErr struct {
+	error
+	fix string // what to wait for
+}
+
+func (e notNowErr) Unwrap() error { return e.error }
+
+// notNow is err as the daemon answers it: a notNowErr is a refusal with its fix, nothing
+// changed; any other error, a refusal included, as it is.
+func notNow(err error) error {
+	var n notNowErr
+	if _, ok := Refusal(err); ok || !errors.As(err, &n) {
+		return err
+	}
+	return refusal(n.fix, err)
+}
+
+// sameKind is err restated as as: a notNowErr stays one, with its fix.
+func sameKind(err, as error) error {
+	var n notNowErr
+	if errors.As(err, &n) {
+		return notNowErr{as, n.fix}
+	}
+	return as
+}
+
+// slotFree refuses as claimJob would, guard included, and claims nothing: a dry run's answer.
+func (h *Hostd) slotFree(guard func() error) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.slotRefusal(guard)
+}
+
 func (h *Hostd) claimJob(kind, target string, guard func() error) (*job, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	switch {
-	case h.stopping:
-		return nil, fail(http.StatusServiceUnavailable, "the host daemon is stopping")
-	case h.rebooting:
-		return nil, fail(http.StatusConflict, "a reboot is scheduled")
-	case h.job != nil && h.job.State == "running":
-		return nil, jobRunning{fail(http.StatusConflict, "a job (%s) is running", h.job.Kind)}
-	}
-	if guard != nil {
-		if err := guard(); err != nil {
-			return nil, err
-		}
+	if err := h.slotRefusal(guard); err != nil {
+		return nil, err
 	}
 	h.job = &job{Started: time.Now().UTC(), Kind: kind, State: "running", Target: target}
 	h.jobEnd = make(chan struct{})
@@ -1890,6 +1949,7 @@ func (h *Hostd) upgrade(w http.ResponseWriter, r *http.Request) {
 		replyErr(w, failAs(http.StatusConflict, err))
 		return
 	}
+	// The checks that say "not now" are refusals: nothing changed, the run may be made again.
 	if err := h.judged(r.Context()); err != nil {
 		replyErr(w, err)
 		return
@@ -1897,13 +1957,13 @@ func (h *Hostd) upgrade(w http.ResponseWriter, r *http.Request) {
 	// An operator's first install running (it holds the lock before it writes .env): the reboot
 	// would cut it.
 	if first && lockHeld(in.path(lifecycleLock)) {
-		replyErr(w, fail(http.StatusConflict, "an install is running: wait for it to finish"))
+		replyErr(w, notNowErr{fail(http.StatusConflict, "an install is running: wait for it to finish"), "wait for the install to finish, then run again"})
 		return
 	}
 	// The first install follows its settings' channel: a release from another would be followed
 	// on a channel it is not on.
 	if c, _ := env.Get(ChannelVar); first && c != "" && req.Channel != "" && req.Channel != c {
-		replyErr(w, fail(http.StatusConflict, "the first install follows %s (its settings): an upgrade before it takes that channel's release, not %s's", c, req.Channel))
+		replyErr(w, refuseAs(http.StatusConflict, "upgrade on the channel the first install's settings name", "the first install follows %s (its settings): an upgrade before it takes that channel's release, not %s's", c, req.Channel))
 		return
 	}
 	m, _, err := h.target(r.Context(), in, env, req.Channel, req.Version)
@@ -1918,7 +1978,7 @@ func (h *Hostd) upgrade(w http.ResponseWriter, r *http.Request) {
 		replyErr(w, err)
 		return
 	case req.Confirm != nil && *req.Confirm != (Version{m.ProjectVersion, m.Revision}):
-		replyErr(w, fail(http.StatusConflict, "the release found is %s %s (revision %d), not %s, which was confirmed: look again with updates", m.Name, m.ProjectVersion, m.Revision, *req.Confirm))
+		replyErr(w, refuseAs(http.StatusConflict, "look again with updates, then confirm the release found", "the release found is %s %s (revision %d), not %s, which was confirmed: look again with updates", m.Name, m.ProjectVersion, m.Revision, *req.Confirm))
 		return
 	case in.leftByRollback(m.ProjectVersion, m.Revision):
 		replyErr(w, refuseAs(http.StatusConflict, "upgrade to a later release; or, to try this one again, remove the record of the release the install went back from", "the install went back from %s %s (revision %d): the boot would not upgrade to it again (remove %s to try it again)", m.Name, m.ProjectVersion, m.Revision, in.path(FailedDir)))
@@ -1945,21 +2005,16 @@ func (h *Hostd) upgrade(w http.ResponseWriter, r *http.Request) {
 	src := fmt.Sprintf("%s/%s-os@%s", prefix, m.Name, m.Artifacts.OS)
 	// Checked as the job starts: another upgrade could replace the running system's copy in the
 	// passive slot.
-	j, err := h.startJob("upgrade", m.Tag, func() error {
+	guard := func() error {
 		if err := h.osWritten(); err != nil {
-			return fail(http.StatusConflict, "%v: reboot first, then upgrade", err)
+			return sameKind(err, fail(http.StatusConflict, "%v: reboot first, then upgrade", err))
 		}
 		// Again as the job claims the slot: a restore that just ended may have marked them.
 		if err := in.volumesSplit(); err != nil {
 			return failAs(http.StatusConflict, err)
 		}
 		return nil
-	})
-	if err != nil {
-		replyErr(w, err)
-		return
 	}
-	reboot := req.Reboot == nil || *req.Reboot
 	does := "upgrades the install"
 	switch {
 	case first:
@@ -1967,6 +2022,25 @@ func (h *Hostd) upgrade(w http.ResponseWriter, r *http.Request) {
 	case rewrite:
 		does = "runs it from the active slot again"
 	}
+	if req.DryRun {
+		if err := h.slotFree(guard); err != nil {
+			replyErr(w, err)
+			return
+		}
+		slot := "passive"
+		if rewrite {
+			slot = "active"
+		}
+		backup := !req.SkipBackup && !first && !rewrite && h.backupFirst()
+		reply(w, http.StatusOK, UpgradePlan{To: Version{m.ProjectVersion, m.Revision}, Slot: slot, Does: does, Backup: backup})
+		return
+	}
+	j, err := h.startJob("upgrade", m.Tag, guard)
+	if err != nil {
+		replyErr(w, err)
+		return
+	}
+	reboot := req.Reboot == nil || *req.Reboot
 	go func() {
 		if !req.SkipBackup && !first && !rewrite {
 			h.preflightBackup(in, func(format string, a ...any) { h.logf(j, format, a...) })
@@ -2102,7 +2176,7 @@ func (h *Hostd) power(w http.ResponseWriter, r *http.Request, action string) {
 		in, _ := h.run()
 		unlock, err := in.lockNow()
 		if errors.Is(err, errLocked) {
-			replyErr(w, fail(http.StatusConflict, "an install, upgrade, rollback, provision or reset-db is running: wait for it to finish"))
+			replyErr(w, notNowErr{fail(http.StatusConflict, "an install, upgrade, rollback, provision or reset-db is running: wait for it to finish"), "wait for it to finish, then run again"})
 			return
 		}
 		// Any other answer lets the power action go: it needs no install (none yet, or one gone),
@@ -2166,10 +2240,10 @@ func (h *Hostd) claimReboot(idle bool, hold func()) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.rebooting {
-		return fail(http.StatusConflict, "a reboot is scheduled")
+		return notNowErr{fail(http.StatusConflict, "a reboot is scheduled"), "wait for the reboot, then run again"}
 	}
 	if idle && h.job != nil && h.job.State == "running" {
-		return fail(http.StatusConflict, "a job (%s) is running: wait for it to finish", h.job.Kind)
+		return notNowErr{fail(http.StatusConflict, "a job (%s) is running: wait for it to finish", h.job.Kind), "wait for the job to end, then run again"}
 	}
 	h.rebooting, h.held = true, hold
 	h.rebootGen++

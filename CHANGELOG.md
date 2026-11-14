@@ -3,7 +3,18 @@
 Stowage's own releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
-## [0.37.1]
+## [0.38.0]
+
+### Added
+
+- `upgrade --dry-run` and `rollback --dry-run` on the VM run every check the verb runs before its
+  job, ask nothing and change nothing (no job, no backup, no OS written, no reboot), and print the
+  plan; `--json` answers `nothing`, and a check that says no exits 3, refused.
+- On the VM, every verb of `<short>-stow` told "not now" — a job running, a reboot scheduled, the
+  boot not judged yet, the install's lock held, a system written that no boot ran yet; for
+  `upgrade` and `rollback` another release than the one confirmed — exits 3, refused (nothing
+  changed), with a fix naming what to wait for, not 1; a state that cannot be read stays a failure. The host daemon's
+  `upgrade` and `rollback` take `dry_run`, from the app socket too.
 
 ### Fixed
 
