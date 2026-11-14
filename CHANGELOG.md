@@ -7,6 +7,9 @@ follow [SemVer](https://semver.org/).
 
 ### Added
 
+- `vm seed --json` names the NICs it makes the VM with (`interfaces`: each one's role, the MAC its
+  cloud-config names it by, generated or given, its network and the primary), so the program
+  creating the VM gives each NIC the MAC the VM expects.
 - `upgrade --dry-run` and `rollback --dry-run` on the VM run every check the verb runs before its
   job, ask nothing and change nothing (no job, no backup, no OS written, no reboot), and print the
   plan; `--json` answers `nothing`, and a check that says no exits 3, refused.

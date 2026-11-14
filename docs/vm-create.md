@@ -79,12 +79,25 @@ in the same installer (bootstrap it as above, then `sh <name>.sh vm create …`,
     "app_gib": 20,
     "disk_file": { "path": "/abs/DIR/<the disk's file name>.qcow2", "format": "qcow2", "sha256": "…", "disk_gib": 43 },
     "await_secrets": true,
-    "waiting": ["API_KEY"]
+    "waiting": ["API_KEY"],
+    "interfaces": [
+      { "role": "edge", "mac": "02:5e:41:0c:9a:17", "attach": "br1" },
+      { "role": "uplink", "mac": "02:8b:d2:44:01:6e", "primary": true }
+    ]
   }
   ```
   `user_data` is the cloud-config for `--platform` (a NoCloud seed's `user-data`, or a cloud's
   user data); it carries no secret input, but the one-time SSH host key it makes the VM serve
   until its install and the reboot after it, as `vm create`'s does for what it gives over SSH.
+  `interfaces` are the NICs the VM is made with, sorted by role, which the program creating the
+  VM gives it: the release's `host.interfaces` NICs, an optional one only when `--interface`
+  names it (`[]` when that leaves none). Each one's `role`, the `mac` its cloud-config names it
+  by (`--interface ROLE=mac=…`, else generated, a locally administered unicast MAC, for a
+  hypervisor's VM of more than one NIC; left out when neither: a VM of one NIC is named from the
+  NIC it has, and a cloud gives its NICs their MACs), the network it `attach`es to (`attach=`;
+  left out: the primary's; for the primary, the network the program making the VM gives it) and `primary` on
+  the primary NIC. A `mac` printed is the one the VM's NIC must have. Each run draws new MACs: the
+  VM is made from the seed that printed them.
   `known_hosts_line` is that key under the name `vm-seed-host-key`, which `--known-hosts-line`
   takes (below); `fingerprint` its SHA256 as ssh prints it; `host_key_private` the key itself,
   an OpenSSH private key, which the caller keeps secret until the key retires (`vm host-key`

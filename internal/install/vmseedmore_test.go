@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/netip"
@@ -79,6 +80,54 @@ func TestVMSeedMachineMaterial(t *testing.T) {
 	}
 	if _, err := seedOf(t, v, nil, SeedOptions{DiskDir: filepath.Join(dir, "missing")}); !isRefused(err) || !strings.Contains(err.Error(), "is not a directory") {
 		t.Errorf("%v", err)
+	}
+}
+
+// The seed names the NICs it makes the VM with: each one's role, the MAC its cloud-config names it
+// by (generated on a hypervisor for more than one NIC), its network and the primary; none for a
+// release declaring none.
+func TestVMSeedNamesItsNICs(t *testing.T) {
+	t.Parallel()
+	v := newVMCreate(t, "qcow2")
+	if s, err := seedOf(t, v, nil, SeedOptions{}); err != nil {
+		t.Fatal(err)
+	} else if b, _ := json.Marshal(s); !strings.Contains(string(b), `"interfaces":[]`) {
+		t.Fatalf("no NIC declared: %s", b)
+	}
+	v.r.Spec.Host = &spec.Host{Interfaces: map[string]spec.HostInterface{"uplink": {Primary: true}, "edge": {}}}
+	in := v.installer(func(o *Options) {
+		o.TLS, o.Set = "internal", map[string]string{"ADMIN_EMAIL": "admin@example.org", "APP_DOMAIN": "app.example.org", "API_DOMAIN": "api.example.org"}
+	})
+	s, err := in.SeedVM(context.Background(), &VMCreate{Platform: "truenas", Hostname: "notes-1", User: "ops", SSHKey: v.key,
+		Interfaces: []string{"edge=dhcp,mac=02:00:00:00:00:0b,attach=br1"}}, SeedOptions{})
+	if err != nil {
+		t.Fatalf("%v\n%s", err, v.log)
+	}
+	if len(s.Interfaces) != 2 {
+		t.Fatalf("%+v", s.Interfaces)
+	}
+	edge, uplink := s.Interfaces[0], s.Interfaces[1]
+	// The generated MAC: locally administered (second bit of the first octet set) and unicast.
+	if edge != (SeedInterface{Role: "edge", MAC: "02:00:00:00:00:0b", Attach: "br1"}) || uplink.Role != "uplink" || !uplink.Primary || uplink.Attach != "" ||
+		!macAddr.MatchString(uplink.MAC) || !unicastMAC(uplink.MAC) || uplink.MAC[1]&2 == 0 {
+		t.Fatalf("%+v", s.Interfaces)
+	}
+	for _, i := range s.Interfaces {
+		if i.MAC == "" || !strings.Contains(s.UserData, i.MAC) {
+			t.Errorf("the cloud-config names no NIC by %s's MAC %q", i.Role, i.MAC)
+		}
+	}
+	// One NIC: named from the NIC the VM has, so no MAC, unless one is given.
+	v.r.Spec.Host = &spec.Host{Interfaces: map[string]spec.HostInterface{"uplink": {Primary: true}, "edge": {Optional: true}}}
+	for given, mac := range map[string]string{"": "", "uplink=mac=02:00:00:00:00:0c": "02:00:00:00:00:0c"} {
+		c := &VMCreate{Platform: "truenas", Hostname: "notes-1", User: "ops", SSHKey: v.key}
+		if given != "" {
+			c.Interfaces = []string{given}
+		}
+		s, err := in.SeedVM(context.Background(), c, SeedOptions{})
+		if err != nil || len(s.Interfaces) != 1 || s.Interfaces[0] != (SeedInterface{Role: "uplink", MAC: mac, Primary: true}) {
+			t.Errorf("one NIC, %q: %v %+v", given, err, s)
+		}
 	}
 }
 

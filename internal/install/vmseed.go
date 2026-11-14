@@ -52,6 +52,21 @@ type VMSeed struct {
 	// reads of the mirror take it, given over SSH once the VM answers (`sudo <short>-stow
 	// registry-login -`); never the login itself. Empty: omitted.
 	RegistryLogin string `json:"registry_login,omitempty"`
+	// Interfaces are the NICs the VM is made with, the release's host.interfaces as --interface
+	// gives them, sorted by role: what the program creating the VM gives each NIC; [] when the
+	// release declares none (never omitted: a consumer tells an installer that names none).
+	Interfaces []SeedInterface `json:"interfaces"`
+}
+
+// SeedInterface is one NIC a seed's VM is made with: its role, the MAC its cloud-config names it
+// by (given, else generated on a hypervisor; empty for a VM of one NIC, named from the NIC it
+// has, and on a cloud, which gives its NICs their MACs), the network it attaches to (empty: the
+// primary's) and whether it is the primary.
+type SeedInterface struct {
+	Role    string `json:"role"`
+	MAC     string `json:"mac,omitempty"`
+	Attach  string `json:"attach,omitempty"`
+	Primary bool   `json:"primary,omitempty"`
 }
 
 // SeedDisk is a disk image: its format, its reference by digest, what Kairos takes of a VM's disk
@@ -165,6 +180,10 @@ func (in *Installer) SeedVM(ctx context.Context, c *VMCreate, so SeedOptions) (*
 		AwaitSecrets: so.AwaitSecrets, AwaitTLS: byo}
 	if login != nil {
 		s.RegistryLogin = login.Host
+	}
+	s.Interfaces = []SeedInterface{}
+	for _, i := range mach.Interfaces {
+		s.Interfaces = append(s.Interfaces, SeedInterface{Role: i.Role, MAC: i.MAC, Attach: i.Attach, Primary: i.Primary})
 	}
 	var platformRef name.Digest // --platform's disk, which --disk-dir writes
 	for _, pl := range Platforms {

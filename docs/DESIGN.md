@@ -948,7 +948,8 @@ Stowage calls a project's programs: the two never share a reader.
 - **`vm seed --json`** — a VM's first-boot material without creating the VM, for a tool that
   creates it with its own means: `{format, platform, user_data, meta_data, known_hosts_line,
   fingerprint, host_key_private, disk: {<platform>: {format, image, os_gib, disk_gib,
-  cloud_image}}, app_gib, disk_file, await_secrets, await_tls, waiting: [<key>]}` — everything a
+  cloud_image}}, app_gib, disk_file, await_secrets, await_tls, waiting: [<key>], registry_login,
+  interfaces: [{role, mac, attach, primary}]}` — everything a
   consumer would otherwise read from the registry or rebuild (the NoCloud meta-data, the sizes a
   disk's annotation records, the disk unpacked from its zstd artifact with `--disk-dir`, the name
   `ship --disks` registers a cloud image under, which is derived from the disk's digest, so no
@@ -959,7 +960,9 @@ Stowage calls a project's programs: the two never share a reader.
   `known_hosts` line under the name `vm-seed-host-key`, its fingerprint and its private key, which
   the caller keeps secret until it retires), the disk image by digest of each platform the
   registry holds a disk for, and `waiting`: the sorted keys of the required secret inputs nothing
-  gives, which the first install waits for (never a value; omitted when none). It never asks: `vm create`'s machine flags, the front's, `--set`,
+  gives, which the first install waits for (never a value; omitted when none); `interfaces`, the
+  NICs the cloud-config names by MAC, as the program making the VM must create them (a MAC
+  generated here is in the seed alone, so it is printed, never omitted: `[]` for none). It never asks: `vm create`'s machine flags, the front's, `--set`,
   `--answers` and `--channel` (the channel the first install follows) give it all. It is the seed
   `vm create --create manual` writes, built by the same steps (the registry and disk set, the
   machine, the settings, the user-data). A missing, unknown or unoffered `--platform` is refused
