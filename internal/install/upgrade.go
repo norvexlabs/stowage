@@ -625,7 +625,6 @@ func (in *Installer) certFix() string {
 func (in *Installer) upgradePorts(env *EnvFile, mode string) (publish, error) {
 	s, o, m := in.R.Spec, &in.O, in.R.Manifest
 	get := func(k string) string { v, _ := env.Get(k); return v }
-	port := func(k string) int { p, _ := strconv.Atoi(get(k)); return p }
 	switch {
 	case !s.HasFront() && len(o.Ports) > 0:
 		return publish{}, refuse(in.flagFix("leave out --ports"), "--ports: %s %s has no front", m.Name, m.ProjectVersion)
@@ -633,8 +632,14 @@ func (in *Installer) upgradePorts(env *EnvFile, mode string) (publish, error) {
 		return publish{}, nil
 	case mode != Loopback && len(o.Ports) > 0:
 		return publish{}, refuse(in.flagFix("leave out --ports"), "--ports is for loopback mode: this install's front serves %s, on its recorded ports", mode)
-	case mode != Loopback:
-		return publish{addr: "127.0.0.1", all: true, ports: map[string]int{"http": port(HTTPPortVar), "https": port(HTTPSPortVar)}, unserved: in.unservedPorts(mode)}, nil
+	}
+	none := func(string) bool { return false }
+	recorded, err := in.recordedFrontPorts(env, mode, false, none)
+	if err != nil {
+		return publish{}, err
+	}
+	if mode != Loopback {
+		return publish{addr: "127.0.0.1", all: true, ports: recorded, unserved: in.unservedPorts(mode)}, nil
 	}
 	pub := publish{addr: get("STOWAGE_LOOPBACK_ADDRESS"), ports: map[string]int{}}
 	added := publish{addr: pub.addr, ports: map[string]int{}}
@@ -643,7 +648,7 @@ func (in *Installer) upgradePorts(env *EnvFile, mode string) (publish, error) {
 			if _, given := o.Ports[r.Name]; given {
 				return publish{}, refuse(in.flagFix("leave out --ports "+r.Name), "--ports: the route %s is recorded at the install, and an upgrade keeps its port (only a route the release adds is given one)", r.Name)
 			}
-			pub.ports[r.Name] = port(PortVar(r.Name))
+			pub.ports[r.Name] = recorded[r.Name]
 			continue
 		}
 		p, ok := o.Ports[r.Name]

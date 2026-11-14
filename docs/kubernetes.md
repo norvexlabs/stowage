@@ -18,7 +18,7 @@ the current directory. A release with no chart (published without the shape) is 
 <short>-stow k8s upgrade  [the same flags; --timeout 6m]                 # the NEW release's installer
 <short>-stow k8s upgrade --version V [the same flags, but --given, --kit] # fetches V's installer
 <short>-stow k8s rollback [--namespace NS] [--release R] [--kube-context C] [--revision N] [--timeout 6m] [--dry-run] [--json]
-<short>-stow k8s status   [--namespace NS] [--release R] [--kube-context C] [--json]
+<short>-stow k8s status   [--namespace NS] [--release R] [--kube-context C] [--json [--values]]
 <short>-stow k8s reset-db [--namespace NS] [--release R] [--kube-context C] [--yes] [--no-input]
                        [--accessible] [--registry-ca FILE] [--timeout 10m] [--dry-run] [--no-provision]
                        [--new-baseline [--set-file KEY=PATH]…]        # the NEW release's installer, across a baseline

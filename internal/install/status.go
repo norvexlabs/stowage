@@ -78,6 +78,105 @@ type InstallStatus struct {
 	// first install chose (--registry, else the release's), on Kubernetes the release's values'.
 	// Empty (left out) when none is recorded.
 	Registry string `json:"registry,omitempty"`
+	// Values: with --values, what the install records that a configuration gives again
+	// (recordedValues); left out without it, or when this installer cannot tell what is secret.
+	Values *RecordedValues `json:"values,omitempty"`
+}
+
+// RecordedValues is what `status --json --values` adds: the recorded values a configuration
+// gives again, never a secret's.
+type RecordedValues struct {
+	// Inputs are the recorded inputs, by key, that are not secret: the installed release's and
+	// the recorded TLS mode's; a file input as sha256:<hex> of its content. {} when none.
+	Inputs map[string]string `json:"inputs"`
+	// TLS is the front's mode (none for loopback); Domains each route's domain in a TLS mode;
+	// Ports each route's loopback port. Left out without a front, as on Kubernetes.
+	TLS     string            `json:"tls,omitempty"`
+	Domains map[string]string `json:"domains,omitempty"`
+	Ports   map[string]int    `json:"ports,omitempty"`
+	// HTTPPort and HTTPSPort are the host ports a TLS mode's front publishes (--http-port,
+	// --https-port); left out in loopback mode.
+	HTTPPort  int `json:"http_port,omitempty"`
+	HTTPSPort int `json:"https_port,omitempty"`
+}
+
+// recordedValues reads, through get, the values recorded that s, the installed release's spec,
+// declares: its inputs and the recorded TLS mode's that are not secret, and with front its mode,
+// each route's domain and the host ports the front publishes in a TLS mode, each front route's
+// port in loopback mode. Nil when s is: what is secret is not known.
+func recordedValues(s *spec.Spec, get func(string) (string, bool), front bool) *RecordedValues {
+	if s == nil {
+		return nil
+	}
+	out := &RecordedValues{Inputs: map[string]string{}}
+	inputs := slices.Clone(s.Inputs)
+	if front {
+		out.TLS, _ = get("STOWAGE_TLS_MODE")
+		// The recorded mode's own: one an earlier mode left recorded is not this mode's.
+		for _, t := range tlsModeInputs {
+			if slices.Contains(t.modes, out.TLS) {
+				inputs = append(inputs, t.Input)
+			}
+		}
+	}
+	for _, i := range inputs {
+		v, ok := get(i.Key)
+		if !ok || i.Secret {
+			continue
+		}
+		if isFileInput(i, v) {
+			// Never the content: a value recorded as a file shows as its digest, whatever the
+			// input is declared now; one that does not decode is left out (not known).
+			if v, ok = fileContentDigest(v); !ok {
+				continue
+			}
+		}
+		out.Inputs[i.Key] = v
+	}
+	if !front || out.TLS == "" {
+		return out
+	}
+	// A port recorded; none, or one that is no port (recordedPortOf), is left out: not known.
+	port := func(k string) int {
+		v, _ := get(k)
+		n, _ := recordedPortOf(v)
+		return n
+	}
+	if out.TLS == Loopback {
+		// --ports moves the front's routes alone: an L4 route's host port is the spec's.
+		for _, r := range s.Front.Routes {
+			if n := port(PortVar(r.Name)); n > 0 {
+				if out.Ports == nil {
+					out.Ports = map[string]int{}
+				}
+				out.Ports[r.Name] = n
+			}
+		}
+		return out
+	}
+	// The ports the front publishes in this mode, as the install binds them.
+	http, https := frontServed(s.Front, s.L4.Routes, out.TLS)
+	if http {
+		out.HTTPPort = port(HTTPPortVar)
+	}
+	if https {
+		out.HTTPSPort = port(HTTPSPortVar)
+	}
+	for _, d := range s.RouteDomains() {
+		// Never a secret's, never a file's content: a domain input the project declares secret,
+		// or a value recorded as a file, is left out.
+		i, declared := s.Input(d.Input)
+		if declared && i.Secret {
+			continue
+		}
+		if v, ok := get(d.Input); ok && v != "" && !isFileInput(i, v) {
+			if out.Domains == nil {
+				out.Domains = map[string]string{}
+			}
+			out.Domains[d.Route] = v
+		}
+	}
+	return out
 }
 
 // DockerStatus is `status --json` on Docker: the stack's services too, as `ps` reads them, or why
@@ -296,6 +395,9 @@ func (in *Installer) StatusJSON(ctx context.Context) error {
 		st.Channel = m.Channel
 	}
 	st.Inputs = installInputs(env, s)
+	if in.O.StatusValues {
+		st.Values = recordedValues(s, env.Get, s != nil && s.HasFront())
+	}
 	if st.Previous, err = in.keptPrevious(v, n); err != nil {
 		return err
 	}
@@ -390,6 +492,9 @@ func (in *Installer) K8sStatusJSON(ctx context.Context) error {
 			return err
 		}
 		st.Inputs = recordedInputs(in.R.Spec, func(key string) bool { _, ok := data[key]; return ok })
+		if in.O.StatusValues {
+			st.Values = recordedValues(in.R.Spec, func(key string) (string, bool) { v, ok := data[key]; return v, ok }, false)
+		}
 	}
 	return printJSON(in.O.Out, st)
 }

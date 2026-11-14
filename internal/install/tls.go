@@ -524,13 +524,26 @@ func (in *Installer) frontInputs(mode string) []input {
 	for i := range out {
 		out[i].Prompt = "Domain for " + strings.Join(routes[out[i].Key], ", ")
 	}
-	if mode == "acme" || mode == "dns-cloudflare" {
-		out = append(out, input{spec.Input{Key: ACMEEmailVar, Prompt: "Email Let's Encrypt writes to before a certificate expires (optional)"}, checkEmail, false})
-	}
-	if mode == "dns-cloudflare" {
-		out = append(out, input{spec.Input{Key: CloudflareTokenVar, Prompt: "Cloudflare API token (Zone DNS Edit on each domain's zone)", Required: true, Secret: true}, checkCloudflareToken, false})
+	for _, t := range tlsModeInputs {
+		if slices.Contains(t.modes, mode) {
+			out = append(out, input{t.Input, t.check, false})
+		}
 	}
 	return out
+}
+
+// tlsModeInput is an input Stowage adds to the project's in the TLS modes it names.
+type tlsModeInput struct {
+	spec.Input
+	check func(string) error
+	modes []string
+}
+
+// tlsModeInputs are the inputs the TLS modes add after the routes' domains, in the form's order;
+// describe lists them (tls_inputs) from this table too.
+var tlsModeInputs = []tlsModeInput{
+	{spec.Input{Key: ACMEEmailVar, Prompt: "Email Let's Encrypt writes to before a certificate expires (optional)"}, checkEmail, []string{"acme", "dns-cloudflare"}},
+	{spec.Input{Key: CloudflareTokenVar, Prompt: "Cloudflare API token (Zone DNS Edit on each domain's zone)", Required: true, Secret: true}, checkCloudflareToken, []string{"dns-cloudflare"}},
 }
 
 // publicHTTPSPort is the HTTPS port clients reach: with acme always 443, which its challenge

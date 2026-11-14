@@ -13,6 +13,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -837,5 +838,24 @@ func TestDockerDirCheck(t *testing.T) {
 		if err := cmd.Execute(); !refusedAbsent(err) {
 			t.Errorf("%v: %v\n%s", args, err, &errb)
 		}
+	}
+}
+
+// k8s status --json --values gives the recorded inputs that are not secret, and no front's.
+func TestK8sStatusJSONValues(t *testing.T) {
+	t.Parallel()
+	e := newKubeEnv(t, spec.Provider{Name: "none"})
+	e.runs("1.0.0", 1)
+	e.f.history = []helmRevision{{Revision: 1, Status: "deployed", Chart: "notes-0.1.0"}}
+	e.stored(map[string]string{"ADMIN_EMAIL": "admin@example.org", "ACCESS_TOKEN": "tok-not-to-be-printed"}, ours)
+	in := e.installer(func(o *Options) { o.StatusValues = true })
+	in.R.Spec.Inputs = append(in.R.Spec.Inputs, spec.Input{Key: "ACCESS_TOKEN", Secret: true})
+	if err := in.K8sStatusJSON(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	var st K8sReleaseStatus
+	if err := json.Unmarshal(e.out.Bytes(), &st); err != nil || st.Values == nil ||
+		!reflect.DeepEqual(*st.Values, RecordedValues{Inputs: map[string]string{"ADMIN_EMAIL": "admin@example.org"}}) || strings.Contains(e.out.String(), "tok-not-to-be-printed") {
+		t.Errorf("%v %+v\n%s", err, st.Values, e.out)
 	}
 }

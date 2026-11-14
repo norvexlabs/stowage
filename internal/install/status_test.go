@@ -3,13 +3,17 @@ package install
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"github.com/norvexlabs/stowage/internal/testutil"
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -783,5 +787,228 @@ func TestDockerStatusJSONPreviousIsNeverTheInstalled(t *testing.T) {
 	}
 	if st, out := statusOf(t, e, nil); st.Previous == nil || *st.Previous != (StatusRelease{"2.0.0", 2, ""}) {
 		t.Errorf("%s", out)
+	}
+}
+
+// status --json --values gives what a configuration gives again, never a secret: loopback mode
+// its ports, a TLS mode its domains and the ACME contact, never the Cloudflare token.
+func TestDockerStatusJSONValues(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	e.r, e.self = testInstallerWith(t, "1.0.0", func(s *spec.Spec) {
+		s.Inputs = append(s.Inputs, spec.Input{Key: "ACCESS_TOKEN", Secret: true}, spec.Input{Key: "WORKERS", Default: "4"})
+		s.Front.TLSModes = append(s.Front.TLSModes, "dns-cloudflare")
+	})
+	e.vars["ACCESS_TOKEN"] = "tok-not-to-be-printed"
+	if err := e.install(func(o *Options) { o.Ports = map[string]int{"app": 18080} }); err != nil {
+		t.Fatalf("%v\n%s", err, e.log)
+	}
+	st, out := statusOf(t, e, nil)
+	if st.Values != nil || strings.Contains(out, `"values"`) {
+		t.Errorf("values without --values:\n%s", out)
+	}
+	env := e.readEnv()
+	st, out = statusOf(t, e, func(o *Options) { o.StatusValues = true })
+	want := RecordedValues{Inputs: map[string]string{"ADMIN_EMAIL": get(env, "ADMIN_EMAIL"), "WORKERS": "4"}, TLS: Loopback,
+		Ports: map[string]int{"app": 18080, "api": mustAtoi(t, get(env, PortVar("api")))}}
+	if st.Values == nil || !reflect.DeepEqual(*st.Values, want) || strings.Contains(out, "tok-not-to-be-printed") {
+		t.Errorf("loopback: %+v, want %+v\n%s", st.Values, want, out)
+	}
+
+	// A TLS mode is a new install: another directory.
+	r, self := e.r, e.self
+	e = newEnv(t)
+	e.r, e.self = r, self
+	e.vars["ACCESS_TOKEN"] = "tok-not-to-be-printed"
+	token := "cfut_" + strings.Repeat("a", 40)
+	if err := e.install(func(o *Options) {
+		tlsDomains(o)
+		o.TLS, o.Set = "dns-cloudflare", map[string]string{CloudflareTokenVar: token, ACMEEmailVar: "ops@example.com"}
+	}); err != nil {
+		t.Fatalf("%v\n%s", err, e.log)
+	}
+	env = e.readEnv()
+	st, out = statusOf(t, e, func(o *Options) { o.StatusValues = true })
+	want = RecordedValues{Inputs: map[string]string{"ADMIN_EMAIL": get(env, "ADMIN_EMAIL"), "WORKERS": "4", ACMEEmailVar: "ops@example.com"}, TLS: "dns-cloudflare",
+		Domains: map[string]string{"app": "notes.example.com", "api": "api.example.com"}, HTTPPort: 80, HTTPSPort: 443}
+	if st.Values == nil || !reflect.DeepEqual(*st.Values, want) || strings.Contains(out, token) {
+		t.Errorf("dns-cloudflare: %+v, want %+v\n%s", st.Values, want, out)
+	}
+	// Another mode: what the earlier one recorded is not this one's.
+	if err := e.install(func(o *Options) { o.TLS = "internal" }); err != nil {
+		t.Fatalf("%v\n%s", err, e.log)
+	}
+	if st, out = statusOf(t, e, func(o *Options) { o.StatusValues = true }); st.Values == nil || st.Values.TLS != "internal" || st.Values.Inputs[ACMEEmailVar] != "" {
+		t.Errorf("internal: %+v\n%s", st.Values, out)
+	}
+}
+
+// A file input's value is the digest a program computes of the file it gives.
+func TestRecordedFileInputIsItsContentDigest(t *testing.T) {
+	t.Parallel()
+	content := []byte("-----BEGIN CERTIFICATE-----\nx\n")
+	sum := sha256.Sum256(content)
+	got := recordedValues(&spec.Spec{Inputs: []spec.Input{{Key: "CA", Type: spec.InputFile}}}, func(k string) (string, bool) { return encodeFileInput(content), k == "CA" }, false)
+	if got == nil || got.Inputs["CA"] != "sha256:"+hex.EncodeToString(sum[:]) {
+		t.Errorf("%+v", got)
+	}
+	// Not a file's value: left out (not known); a value recorded as a file is never its content,
+	// whatever the input is declared now.
+	odd := &spec.Spec{Inputs: []spec.Input{{Key: "CA", Type: spec.InputFile}, {Key: "NOTE"}}}
+	rec := map[string]string{"CA": "not-a-file", "NOTE": "stowage-file:aGk="}
+	hi := sha256.Sum256([]byte("hi"))
+	if got := recordedValues(odd, func(k string) (string, bool) { v, ok := rec[k]; return v, ok }, false); got == nil || !reflect.DeepEqual(got.Inputs, map[string]string{"NOTE": "sha256:" + hex.EncodeToString(hi[:])}) {
+		t.Errorf("odd values: %+v", got)
+	}
+	// A TLS mode's input recorded under another mode is not this mode's.
+	get := func(rec map[string]string) func(string) (string, bool) {
+		return func(k string) (string, bool) { v, ok := rec[k]; return v, ok }
+	}
+	front := &spec.Spec{Front: spec.Front{Routes: []spec.Route{{Name: "app"}}, TLSModes: []string{"none", "internal", "acme"}}}
+	if got := recordedValues(front, get(map[string]string{"STOWAGE_TLS_MODE": "internal", ACMEEmailVar: "ops@example.com"}), true); got == nil || len(got.Inputs) != 0 || got.TLS != "internal" {
+		t.Errorf("internal: %+v", got)
+	}
+	acme := map[string]string{"STOWAGE_TLS_MODE": "acme", ACMEEmailVar: "ops@example.com", HTTPPortVar: "80", HTTPSPortVar: "443"}
+	if got := recordedValues(front, get(acme), true); got == nil || got.Inputs[ACMEEmailVar] != "ops@example.com" || got.HTTPPort != 80 || got.HTTPSPort != 443 {
+		t.Errorf("acme: %+v", got)
+	}
+	// A recorded port that is no port is not known: left out; a port's bounds are kept.
+	for v, want := range map[string]int{"": 0, "x": 0, "0": 0, "70000": 0, "65536": 0, "1": 1, "65535": 65535} {
+		acme[HTTPSPortVar] = v
+		if got := recordedValues(front, get(acme), true); got == nil || got.HTTPSPort != want || got.HTTPPort != 80 {
+			t.Errorf("https port %q: %+v, want %d", v, got, want)
+		}
+	}
+	// A domain the project declares secret is never shown; a loopback port's bounds are kept.
+	secretDomain := &spec.Spec{Inputs: []spec.Input{{Key: "APP_DOMAIN", Secret: true}},
+		Front: spec.Front{Routes: []spec.Route{{Name: "app", DomainInput: "APP_DOMAIN"}}, TLSModes: []string{"none", "acme"}}}
+	if got := recordedValues(secretDomain, get(map[string]string{"STOWAGE_TLS_MODE": "acme", "APP_DOMAIN": "hidden.example.com"}), true); got == nil || got.Domains != nil || len(got.Inputs) != 0 {
+		t.Errorf("secret domain: %+v", got)
+	}
+	// An undeclared domain input is shown; a secret L4 one is not; a value recorded as a file is not.
+	domains := &spec.Spec{Inputs: []spec.Input{{Key: "DB_DOMAIN", Secret: true}, {Key: "DOCS_DOMAIN", Type: spec.InputFile}},
+		Front: spec.Front{Routes: []spec.Route{{Name: "app", DomainInput: "APP_DOMAIN"}, {Name: "files", DomainInput: "FILES_DOMAIN"}, {Name: "docs", DomainInput: "DOCS_DOMAIN"}}, TLSModes: []string{"none", "acme"}},
+		L4:    spec.L4{Routes: []spec.L4Route{{Name: "db", TLS: &spec.L4TLS{DomainInput: "DB_DOMAIN"}}}}}
+	if got := recordedValues(domains, get(map[string]string{"STOWAGE_TLS_MODE": "acme", "APP_DOMAIN": "app.example.com", "FILES_DOMAIN": encodeFileInput([]byte("x")), "DB_DOMAIN": "db.example.com", "DOCS_DOMAIN": "docs.example.com"}), true); got == nil ||
+		!reflect.DeepEqual(got.Domains, map[string]string{"app": "app.example.com"}) {
+		t.Errorf("domains: %+v", got)
+	}
+	for v, want := range map[string]int{"0": 0, "70000": 0, "x": 0, "1": 1, "65535": 65535} {
+		got := recordedValues(front, get(map[string]string{"STOWAGE_TLS_MODE": "none", PortVar("app"): v}), true)
+		if n, ok := got.Ports["app"]; want == 0 && ok || want != 0 && n != want {
+			t.Errorf("loopback port %q: %+v", v, got.Ports)
+		}
+	}
+	// A front of L4 routes alone publishes no HTTPS port but in acme's challenge, plain HTTP.
+	l4 := &spec.Spec{Front: spec.Front{TLSModes: []string{"none", "acme", "internal"}}, L4: spec.L4{Routes: []spec.L4Route{{Name: "db", TLS: &spec.L4TLS{DomainInput: "DB_DOMAIN"}}}}}
+	if got := recordedValues(l4, get(map[string]string{"STOWAGE_TLS_MODE": "internal", HTTPPortVar: "8080", HTTPSPortVar: "8443"}), true); got == nil || got.HTTPPort != 0 || got.HTTPSPort != 0 {
+		t.Errorf("l4 internal: %+v", got)
+	}
+	if got := recordedValues(l4, get(map[string]string{"STOWAGE_TLS_MODE": "acme", HTTPPortVar: "8080", HTTPSPortVar: "8443"}), true); got == nil || got.HTTPPort != 8080 || got.HTTPSPort != 0 {
+		t.Errorf("l4 acme: %+v", got)
+	}
+}
+
+func mustAtoi(t *testing.T, s string) int {
+	t.Helper()
+	n, err := strconv.Atoi(s)
+	if err != nil {
+		t.Fatalf("%q: %v", s, err)
+	}
+	return n
+}
+
+// A port of the front .env should record that is missing or no port is refused by a re-run and an
+// upgrade (exit 3), naming the key and the flag that gives it, unless the run gives that port; the
+// installer's own form alone is a port; a TLS port the mode does not serve stands at the spec's
+// when missing, and is refused when recorded as no port.
+func TestRecordedFrontPortThatIsNoPortIsRefused(t *testing.T) {
+	t.Parallel()
+	for _, v := range []string{"+443", "0443", "0", "65536", " 80"} {
+		if _, ok := recordedPortOf(v); ok {
+			t.Errorf("%q read as a port", v)
+		}
+	}
+	if n, ok := recordedPortOf("65535"); !ok || n != 65535 {
+		t.Errorf("65535: %d %v", n, ok)
+	}
+	edit := func(e *env, k, v string, drop bool) {
+		t.Helper()
+		path := filepath.Join(e.dir, envName)
+		f, err := ReadEnvFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		next := NewEnvFile()
+		for _, key := range f.Keys() {
+			if key == k && drop {
+				continue
+			}
+			val, _ := f.Get(key)
+			if key == k {
+				val = v
+			}
+			next.Set(key, val)
+		}
+		if err := next.WriteFile(path); err != nil {
+			t.Fatal(err)
+		}
+	}
+	refused := func(err error, want, fix string) bool {
+		r, ok := Refusal(err)
+		return ok && strings.Contains(r.Reason, want) && strings.Contains(r.Fix, fix)
+	}
+	for _, c := range []struct {
+		name, key, v string
+		drop         bool
+		tls          bool
+		want, fix    string
+		given        func(*Options)
+	}{
+		{"loopback no port", PortVar("app"), "70000", false, false, PortVar("app") + ` "70000" is not a TCP port`, "--ports app=PORT", func(o *Options) { o.Ports = map[string]int{"app": 18081} }},
+		{"loopback missing", PortVar("app"), "", true, false, PortVar("app") + " is not recorded", "--ports app=PORT", func(o *Options) { o.Ports = map[string]int{"app": 18081} }},
+		{"tls no port", HTTPPortVar, "x", false, true, HTTPPortVar + ` "x" is not a TCP port`, "--http-port PORT", func(o *Options) { o.HTTPPort = 8080 }},
+		{"tls missing", HTTPSPortVar, "", true, true, HTTPSPortVar + " is not recorded", "--https-port PORT", func(o *Options) { o.HTTPSPort = 8443 }},
+	} {
+		e := newEnv(t)
+		first := func(o *Options) {
+			if c.tls {
+				tlsDomains(o)
+				o.TLS = "internal"
+			}
+		}
+		if err := e.install(first); err != nil {
+			t.Fatalf("%s: %v\n%s", c.name, err, e.log)
+		}
+		edit(e, c.key, c.v, c.drop)
+		if err := e.install(nil); !refused(err, c.want, c.fix) || strings.Contains(err.Error(), "--http-port 0") {
+			t.Errorf("%s: re-run %v", c.name, err)
+		}
+		e.to("2.0.0", nil)
+		if err := e.upgrade(nil); !refused(err, c.want, "--dir "+e.dir+" "+c.fix+", then upgrade") {
+			t.Errorf("%s: upgrade %v", c.name, err)
+		}
+		e.to("1.0.0", nil)
+		if err := e.install(c.given); err != nil {
+			t.Errorf("%s: given over: %v\n%s", c.name, err, e.log)
+		}
+	}
+	// A TLS port the mode does not serve (a front of L4 routes alone in internal): missing, it
+	// stands at the spec's; recorded as no port, it is refused all the same.
+	in := &Installer{R: &Release{Spec: &spec.Spec{Front: spec.Front{TLSModes: []string{"none", "internal"}, HTTPSPort: 8443},
+		L4: spec.L4{Routes: []spec.L4Route{{Name: "db", TLS: &spec.L4TLS{DomainInput: "DB_DOMAIN"}}}}}}}
+	none := func(string) bool { return false }
+	if ports, err := in.recordedFrontPorts(NewEnvFile(), "internal", true, none); err != nil || ports["http"] != 80 || ports["https"] != 8443 {
+		t.Errorf("unserved, missing: %v %v", ports, err)
+	}
+	f := NewEnvFile()
+	f.Set(HTTPPortVar, "x")
+	if _, err := in.recordedFrontPorts(f, "internal", true, none); !refused(err, HTTPPortVar+` "x" is not a TCP port`, "--http-port PORT") {
+		t.Errorf("unserved, no port: %v", err)
+	}
+	// On the VM the upgrade's fix is the VM's install.
+	in.O.Preloaded = true
+	if _, err := in.recordedFrontPorts(f, "internal", false, none); !refused(err, HTTPPortVar, "sudo "+in.R.Ctl()+" install --http-port PORT, then upgrade") {
+		t.Errorf("vm upgrade: %v", err)
 	}
 }

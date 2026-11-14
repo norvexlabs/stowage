@@ -171,3 +171,54 @@ func TestFirstInstallOnlyIsWhatARerunRefuses(t *testing.T) {
 		t.Errorf("first install only %v, want %d settings", names, len(given))
 	}
 }
+
+// The inputs a TLS mode adds are described as the form asks for them: each mode's, in the form's
+// order, on the shapes the front serves; none without a front.
+func TestDescribeTLSInputs(t *testing.T) {
+	t.Parallel()
+	r, _ := testInstallerWith(t, "1.0.0", func(s *spec.Spec) { s.Front.TLSModes = append(s.Front.TLSModes, "dns-cloudflare") })
+	d := Describe(r)
+	for _, mode := range []string{"internal", "acme", "dns-cloudflare"} {
+		var described, asked []string
+		for _, i := range d.TLSInputs {
+			if slices.Contains(i.TLSModes, mode) {
+				described = append(described, i.Key)
+			}
+		}
+		for _, i := range (&Installer{R: r}).frontInputs(mode) {
+			if !i.domain {
+				asked = append(asked, i.Key)
+			}
+		}
+		if !slices.Equal(described, asked) {
+			t.Errorf("%s: described %v, the form asks %v", mode, described, asked)
+		}
+	}
+	var b bytes.Buffer
+	if err := d.print(&b); err != nil {
+		t.Fatal(err)
+	}
+	if want := "input     " + CloudflareTokenVar + " (secret, required, shapes docker,kairos, tls dns-cloudflare)\n"; !strings.Contains(b.String(), want) {
+		t.Errorf("no %q in:\n%s", want, b.String())
+	}
+	// A mode the release does not offer asks nothing: without dns-cloudflare, no token.
+	r.Spec.Front.TLSModes = slices.DeleteFunc(r.Spec.Front.TLSModes, func(m string) bool { return m == "dns-cloudflare" })
+	if got := Describe(r).TLSInputs; len(got) != 1 || got[0].Key != ACMEEmailVar || !slices.Equal(got[0].TLSModes, []string{"acme"}) {
+		t.Errorf("without dns-cloudflare: %+v", got)
+	}
+	r.Spec.Front.TLSModes = []string{"none", "internal"}
+	if got := Describe(r).TLSInputs; got == nil || len(got) != 0 {
+		t.Errorf("internal alone: %+v", got)
+	}
+	// Kubernetes alone: the chart's ingress owns the certificate.
+	r.Spec.Front.TLSModes = []string{"none", "acme", "dns-cloudflare"}
+	k8sOnly := *r.Spec
+	k8sOnly.Shapes = spec.Shapes{Kubernetes: &spec.K8sShape{}}
+	if got := describeTLSInputs(&k8sOnly); got == nil || len(got) != 0 {
+		t.Errorf("kubernetes alone: %+v", got)
+	}
+	r.Spec.Front = spec.Front{}
+	if got := Describe(r).TLSInputs; got == nil || len(got) != 0 {
+		t.Errorf("without a front: %#v", got)
+	}
+}

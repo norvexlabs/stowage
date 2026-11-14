@@ -93,10 +93,12 @@ type Options struct {
 	Settings string
 	// LockWait is how long a run waits for the install's lifecycle lock another run holds; 0
 	// refuses at once. The VM's boot waits, so an operator's short run never fails it.
-	LockWait    time.Duration
-	DryRun      bool // check and print what would be written, write nothing
-	NoProvision bool // start the stack without running the provision hook
-	Yes         bool // reset-db: wipe without asking
+	LockWait time.Duration
+	DryRun   bool // check and print what would be written, write nothing
+	// StatusValues: status --json --values adds the recorded values a configuration gives again.
+	StatusValues bool
+	NoProvision  bool // start the stack without running the provision hook
+	Yes          bool // reset-db: wipe without asking
 	// NewBaseline lets reset-db wipe an install of a release that runs another schema baseline
 	// than this installer's release, and install this one: the only way across a baseline.
 	NewBaseline bool
@@ -567,8 +569,8 @@ func (in *Installer) frontServedPorts(mode string, get func(string) string) ([]i
 			continue
 		}
 		v := get(p.key)
-		n, err := strconv.Atoi(v)
-		if err != nil || n < 1 || n > 65535 {
+		n, ok := recordedPortOf(v)
+		if !ok {
 			errs = append(errs, fmt.Errorf("%s %q is not a TCP port", p.key, v))
 			n = p.spec
 		}
@@ -1866,17 +1868,20 @@ func (in *Installer) l4Clash(p publish) error {
 // on the front's recorded ports, and each on a port the stack publishes already or one free on the
 // host.
 func (in *Installer) l4Upgrade(ctx context.Context, env *EnvFile, mode string) error {
-	pub := publish{all: true, ports: map[string]int{}, unserved: in.unservedPorts(mode)}
+	// What the recorded ports hold now; one that is no port is upgradePorts' to refuse.
+	pub := publish{all: mode != Loopback, ports: map[string]int{}, unserved: in.unservedPorts(mode)}
 	keys := map[string]string{"http": HTTPPortVar, "https": HTTPSPortVar}
 	if mode == Loopback {
-		pub.all, keys = false, map[string]string{}
+		keys = map[string]string{}
 		for _, r := range in.R.Spec.Front.Routes {
 			keys[r.Name] = PortVar(r.Name)
 		}
 	}
 	for k, v := range keys {
 		s, _ := env.Get(v)
-		pub.ports[k], _ = strconv.Atoi(s)
+		if p, ok := recordedPortOf(s); ok {
+			pub.ports[k] = p
+		}
 	}
 	if err := in.l4Clash(pub); err != nil {
 		// The front's port is changed by a re-run alone: the fix names it, not the flag the clash's.

@@ -283,6 +283,11 @@ type Status struct {
 	// before the first install, or when the OS's installer carries another release than the one
 	// installed and the install keeps no installer of it this one reads.
 	Inputs *[]string `json:"inputs,omitempty"`
+	// Values: asked with ?values=true (status --json --values), on the operator's socket alone, what
+	// the install records that a configuration gives again (RecordedValues); left out otherwise,
+	// before the first install, or when the installed release's spec cannot be read (what is
+	// secret cannot be told), Inputs then listed from the install's record alone.
+	Values *RecordedValues `json:"values,omitempty"`
 	// Installing: the first install has not finished — its stack is coming up or the provision
 	// hook runs (or a reboot cut it: the boot runs it again). InstallFailed: why its last run
 	// failed; a re-run of the install finishes it.
@@ -918,6 +923,16 @@ func notInstalled(in *Installer) bool {
 func (h *Hostd) status(w http.ResponseWriter, r *http.Request) {
 	in, _ := h.run()
 	m := h.R.Manifest
+	q := r.URL.Query()
+	if q.Has("values") && fromApp(r) {
+		reply(w, http.StatusForbidden, map[string]string{"error": "the host daemon's app socket does not serve the install's values: run it as the operator"})
+		return
+	}
+	values, err := strconv.ParseBool(cmp.Or(q.Get("values"), "false"))
+	if err != nil {
+		reply(w, http.StatusBadRequest, map[string]string{"error": "values: want true or false"})
+		return
+	}
 	st := Status{Format: MachineFormat, Name: m.Name, OS: Version{m.ProjectVersion, m.Revision}, Job: "idle"}
 	if env, err := in.open(); err == nil {
 		name, v, rev := runs(env)
@@ -928,7 +943,11 @@ func (h *Hostd) status(w http.ResponseWriter, r *http.Request) {
 		if st.Previous, err = in.keptPrevious(v, n); err != nil {
 			h.O.logf("status: the previous release is not known: %v", err)
 		}
-		st.Inputs = installInputs(env, h.installedSpec(in, name, v, n))
+		s := h.installedSpec(in, name, v, n)
+		st.Inputs = installInputs(env, s)
+		if values {
+			st.Values = recordedValues(s, env.Get, s != nil && s.HasFront())
+		}
 		st.Installing, st.InstallFailed, _ = in.firstInstall()
 		st.RestoreAwaited = in.restoreAwaited()
 		st.Channel, _ = env.Get(ChannelVar)

@@ -14,7 +14,6 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
-	"strconv"
 	"strings"
 	"unicode/utf8"
 
@@ -303,8 +302,8 @@ func (in *Installer) frontPorts(get func(string) string) ([]int, error) {
 		spec int
 	}{{HTTPPortVar, cmp.Or(f.HTTPPort, 80)}, {HTTPSPortVar, cmp.Or(f.HTTPSPort, 443)}} {
 		v := get(p.key)
-		n, err := strconv.Atoi(v)
-		if err != nil || n < 1 || n > 65535 {
+		n, ok := recordedPortOf(v)
+		if !ok {
 			errs = append(errs, fmt.Errorf("%s %q is not a TCP port", p.key, v))
 			n = p.spec
 		}

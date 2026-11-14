@@ -3,6 +3,7 @@ package install
 import (
 	"fmt"
 	"io"
+	"slices"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -57,12 +58,15 @@ type Description struct {
 	Format int    `json:"format"`
 	Name   string `json:"name"`
 	// ShortName is the <short> of the installer <short>-stow, which an install keeps as <dir>/<short>-stow.
-	ShortName        string           `json:"short_name"`
-	Release          Version          `json:"release"`
-	Channel          string           `json:"channel"`
-	Shapes           []string         `json:"shapes"`
-	Inputs           []DescribedInput `json:"inputs"`
-	FirstInstallOnly []string         `json:"first_install_only"`
+	ShortName string           `json:"short_name"`
+	Release   Version          `json:"release"`
+	Channel   string           `json:"channel"`
+	Shapes    []string         `json:"shapes"`
+	Inputs    []DescribedInput `json:"inputs"`
+	// TLSInputs are the inputs Stowage adds to the project's in a TLS mode of the front ([]
+	// without a front), each with the modes that ask for it.
+	TLSInputs        []DescribedTLSInput `json:"tls_inputs"`
+	FirstInstallOnly []string            `json:"first_install_only"`
 	// Registry is the prefix the release's images are pulled from when no --registry or
 	// --image-registry gives a mirror.
 	Registry string `json:"registry"`
@@ -108,6 +112,13 @@ type DescribedInput struct {
 	Default *string `json:"default,omitempty"`
 }
 
+// DescribedTLSInput is an input a TLS mode adds: an input's fields, and the modes (--tls) that ask
+// for it.
+type DescribedTLSInput struct {
+	DescribedInput
+	TLSModes []string `json:"tls_modes"`
+}
+
 // Describe is what r offers.
 func Describe(r *Release) Description {
 	d := Description{
@@ -132,6 +143,7 @@ func Describe(r *Release) Description {
 	for _, i := range r.Spec.Inputs {
 		d.Inputs = append(d.Inputs, describeInput(i))
 	}
+	d.TLSInputs = describeTLSInputs(r.Spec)
 	for _, s := range firstInstallOnly {
 		d.FirstInstallOnly = append(d.FirstInstallOnly, s.Name)
 	}
@@ -150,6 +162,42 @@ func describeInput(i spec.Input) DescribedInput {
 		di.Default = &def
 	}
 	return di
+}
+
+// describeTLSInputs lists the tlsModeInputs a mode the release's front offers asks for, each with
+// those modes, on the shapes the front serves (on Kubernetes the chart's ingress owns the
+// certificate): none without a front, or with Kubernetes alone.
+func describeTLSInputs(s *spec.Spec) []DescribedTLSInput {
+	out := []DescribedTLSInput{}
+	if !s.HasFront() {
+		return out
+	}
+	// The shapes whose install runs the front: Docker, and the VM's (its Docker install).
+	var shapes []string
+	if s.Shapes.Docker != nil {
+		shapes = append(shapes, "docker")
+	}
+	if s.Shapes.Kairos != nil {
+		shapes = append(shapes, "kairos")
+	}
+	if len(shapes) == 0 {
+		return out // Kubernetes alone: the chart's ingress owns the certificate
+	}
+	for _, t := range tlsModeInputs {
+		var modes []string
+		for _, m := range t.modes {
+			if slices.Contains(s.Front.TLSModes, m) {
+				modes = append(modes, m)
+			}
+		}
+		if len(modes) == 0 {
+			continue // no mode the release offers asks for it
+		}
+		i := t.Input
+		i.Shapes = shapes
+		out = append(out, DescribedTLSInput{describeInput(i), modes})
+	}
+	return out
 }
 
 // describeCommand is `describe`: Describe as JSON with --json, else a short summary for people.
@@ -175,7 +223,13 @@ func (d Description) print(w io.Writer) error {
 	var b strings.Builder
 	fmt.Fprintf(&b, "%s %s, channel %s\n", d.Name, d.Release, d.Channel)
 	fmt.Fprintf(&b, "shapes    %s\n", strings.Join(d.Shapes, ", "))
-	for _, i := range d.Inputs {
+	inputs := slices.Clone(d.Inputs)
+	modes := map[string][]string{}
+	for _, t := range d.TLSInputs {
+		inputs = append(inputs, t.DescribedInput)
+		modes[t.Key] = t.TLSModes
+	}
+	for _, i := range inputs {
 		var tags []string
 		if i.Type != "text" {
 			tags = append(tags, i.Type)
@@ -193,6 +247,9 @@ func (d Description) print(w io.Writer) error {
 		}
 		if i.When != "" {
 			tags = append(tags, "when "+i.When)
+		}
+		if m := modes[i.Key]; m != nil {
+			tags = append(tags, "tls "+strings.Join(m, ","))
 		}
 		if i.Profile != "" {
 			tags = append(tags, "profile "+i.Profile)

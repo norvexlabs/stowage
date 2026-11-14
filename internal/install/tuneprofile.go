@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"slices"
-	"strconv"
 
 	"github.com/norvexlabs/stowage/internal/tune"
 	"github.com/spf13/pflag"
@@ -106,7 +105,7 @@ func (in *Installer) stackPorts(get func(string) string) []int {
 	}
 	var out []int
 	for _, k := range keys {
-		if p, err := strconv.Atoi(get(k)); err == nil && p > 0 {
+		if p, ok := recordedPortOf(get(k)); ok {
 			out = append(out, p)
 		}
 	}

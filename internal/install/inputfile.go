@@ -203,8 +203,30 @@ func checkPEMBlock(b *pem.Block) error {
 	return nil
 }
 
-// fileInputDigest shows a file input's value in a log: its value is the file.
-func fileInputDigest(v string) string {
+// isFileInput is whether the recorded value v of input i is a file's: i declares a file, or v is
+// recorded as one (a value a release before it gave). Whatever shows a recorded value asks it.
+func isFileInput(i spec.Input, v string) bool { return i.File() || isFileValue(v) }
+
+// fileContentDigest is sha256:<hex> of a file input's content, as a program hashes the file it
+// would give (status --values); "" for an input left empty; false for a value that is not a
+// file's. fileLogDigest is the logs' shorter digest of the recorded value: another number.
+func fileContentDigest(v string) (string, bool) {
+	if v == "" {
+		return "", true
+	}
+	if !isFileValue(v) {
+		return "", false
+	}
+	content, err := decodeFileInput(v)
+	if err != nil {
+		return "", false
+	}
+	sum := sha256.Sum256(content)
+	return "sha256:" + hex.EncodeToString(sum[:]), true
+}
+
+// fileLogDigest shows a file input's value in a log: its value is the file.
+func fileLogDigest(v string) string {
 	if v == "" {
 		return ""
 	}
@@ -573,8 +595,8 @@ func (in *Installer) shownValue(k, v string, secrets map[string]bool) string {
 		return "<redacted>"
 	}
 	// In the recorded form whatever this release declares: a value it replaces may be one.
-	if i, ok := in.R.Spec.Input(k); (ok && i.File()) || isFileValue(v) {
-		return fileInputDigest(v)
+	if i, _ := in.R.Spec.Input(k); isFileInput(i, v) {
+		return fileLogDigest(v)
 	}
 	if key, ok := strings.CutPrefix(k, spec.FileVarPrefix); ok && secrets[key] {
 		return "<redacted>"

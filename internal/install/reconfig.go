@@ -135,12 +135,6 @@ func (in *Installer) changes(env *EnvFile) (next *EnvFile, secrets map[string]bo
 
 	// Where the front listens: the recorded ports, with those given over them.
 	held := map[int]bool{}
-	recordedPort := func(k string) int {
-		v, _ := env.Get(k)
-		p, _ := strconv.Atoi(v)
-		held[p] = true
-		return p
-	}
 	var pub publish
 	switch {
 	case !s.HasFront():
@@ -149,9 +143,12 @@ func (in *Installer) changes(env *EnvFile) (next *EnvFile, secrets map[string]bo
 		if o.HTTPPort != 0 || o.HTTPSPort != 0 {
 			return nil, nil, publish{}, errors.New("--http-port and --https-port are for TLS modes: this install is in loopback mode, which takes --ports")
 		}
-		ports := map[string]int{}
-		for _, r := range s.Front.Routes {
-			ports[r.Name] = recordedPort(PortVar(r.Name))
+		ports, err := in.recordedFrontPorts(env, mode, true, func(r string) bool { _, ok := o.Ports[r]; return ok })
+		if err != nil {
+			return nil, nil, publish{}, err
+		}
+		for _, p := range ports {
+			held[p] = true
 		}
 		addr, _ := env.Get("STOWAGE_LOOPBACK_ADDRESS")
 		p, err := in.ports(ports, o.Ports)
@@ -163,19 +160,27 @@ func (in *Installer) changes(env *EnvFile) (next *EnvFile, secrets map[string]bo
 		if len(o.Ports) > 0 {
 			return nil, nil, publish{}, fmt.Errorf("--ports is for loopback mode: this install's front serves %s, on --http-port and --https-port", mode)
 		}
-		if pub, err = tlsPublish(cmp.Or(o.HTTPPort, recordedPort(HTTPPortVar)), cmp.Or(o.HTTPSPort, recordedPort(HTTPSPortVar))); err != nil {
+		given := map[string]bool{"http": o.HTTPPort != 0, "https": o.HTTPSPort != 0}
+		ports, err := in.recordedFrontPorts(env, mode, true, func(k string) bool { return given[k] })
+		if err != nil {
 			return nil, nil, publish{}, err
 		}
-		pub.unserved = in.unservedPorts(mode)
+		for _, p := range ports {
+			held[p] = true
+		}
 		// A recorded port the last mode left unpublished is no port the install holds.
 		if was != Loopback {
 			for k := range in.unservedPorts(was) {
 				v, _ := env.Get(map[string]string{"http": HTTPPortVar, "https": HTTPSPortVar}[k])
-				if p, err := strconv.Atoi(v); err == nil {
+				if p, ok := recordedPortOf(v); ok {
 					delete(held, p)
 				}
 			}
 		}
+		if pub, err = tlsPublish(cmp.Or(o.HTTPPort, ports["http"]), cmp.Or(o.HTTPSPort, ports["https"])); err != nil {
+			return nil, nil, publish{}, err
+		}
+		pub.unserved = in.unservedPorts(mode)
 	}
 	if err := in.l4Clash(pub); err != nil {
 		return nil, nil, publish{}, err
@@ -357,7 +362,7 @@ func (in *Installer) logChanges(env, next *EnvFile, secrets map[string]bool) {
 		if secrets[k] {
 			a, b = redact(a), redact(b)
 		} else if i, ok := in.R.Spec.Input(k); ok && i.File() {
-			a, b = fileInputDigest(a), fileInputDigest(b)
+			a, b = fileLogDigest(a), fileLogDigest(b)
 		}
 		in.O.logf("changing %s: %s → %s", k, cmp.Or(a, `""`), cmp.Or(b, `""`))
 	}

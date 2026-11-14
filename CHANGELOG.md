@@ -15,9 +15,21 @@ follow [SemVer](https://semver.org/).
   `upgrade` and `rollback` another release than the one confirmed — exits 3, refused (nothing
   changed), with a fix naming what to wait for, not 1; a state that cannot be read stays a failure. The host daemon's
   `upgrade` and `rollback` take `dry_run`, from the app socket too.
+- `status --json --values` (Docker, `k8s status`, the VM's `status`) adds the values the install
+  records that a configuration gives again: the inputs that are not secret (a file as its
+  content's digest), the TLS mode, each route's domain, the front's host ports, each route's
+  loopback port. A program taking over an install compares its configuration
+  with them. On the VM the operator alone reads them.
+- `describe --json` lists `tls_inputs`, the inputs a TLS mode the release offers adds (the ACME
+  contact, the secret Cloudflare token), with the modes that ask for each: a program knows the
+  token is a secret and that the install records it.
 
 ### Fixed
 
+- A re-run and an upgrade refuse a port of the front that `.env` should record and does not, or
+  records as no port (an edited `.env`), naming the key and the flag that gives it, instead of
+  publishing port 0, failing at Compose, or blaming `--http-port 0`; a signed or zero-padded port
+  is no port either.
 - Two disk builds on one host (two `ship`s of a project with the `kairos` shape, whoever runs them
   and wherever, a container included) no longer fail on auroraboot's loop devices: auroraboot's
   container is always `stowage-disks-loop`, and a second build waits for that name, saying so.

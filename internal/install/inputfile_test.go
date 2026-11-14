@@ -526,7 +526,7 @@ func TestAFileInputIsWrittenForTheStack(t *testing.T) {
 		t.Errorf("after the start: %v", names)
 	}
 	log := e.log.String()
-	if strings.Contains(log, v) || !strings.Contains(log, `changing CA: "" → `+fileInputDigest(v)) || strings.Contains(log, "changing "+spec.FileVar("CA")) {
+	if strings.Contains(log, v) || !strings.Contains(log, `changing CA: "" → `+fileLogDigest(v)) || strings.Contains(log, "changing "+spec.FileVar("CA")) {
 		t.Errorf("the log: %s", log)
 	}
 
@@ -665,7 +665,7 @@ func TestADryRunShowsAFileInputsDigest(t *testing.T) {
 		t.Fatal(err)
 	}
 	out := e.out.String()
-	if strings.Contains(out, v) || !strings.Contains(out, "CA="+fileInputDigest(v)+"\n") {
+	if strings.Contains(out, v) || !strings.Contains(out, "CA="+fileLogDigest(v)+"\n") {
 		t.Errorf("%s", out)
 	}
 	if _, err := os.Stat(filepath.Join(e.dir, InputFilesDir)); !errors.Is(err, os.ErrNotExist) {
@@ -682,7 +682,7 @@ func TestVMCreateCarriesAFileInput(t *testing.T) {
 	if err := v.create(VMCreate{Platform: "proxmox", SSHAllow: []string{"192.0.2.0/24"}}, func(o *Options) { o.Set = map[string]string{"CA": value} }); err != nil {
 		t.Fatalf("%v\n%s", err, v.log)
 	}
-	if log := v.log.String(); strings.Contains(log, value) || !strings.Contains(log, "CA="+fileInputDigest(value)) {
+	if log := v.log.String(); strings.Contains(log, value) || !strings.Contains(log, "CA="+fileLogDigest(value)) {
 		t.Errorf("%s", log)
 	}
 	ud, _, _ := readSeed(t, filepath.Join(v.out, "notes-seed.iso"))
@@ -823,7 +823,7 @@ func TestShownValue(t *testing.T) {
 	secrets := map[string]bool{"KEY": true, "TOKEN": true}
 	v := encodeFileInput([]byte("x"))
 	for _, c := range []struct{ k, v, want string }{
-		{"CA", v, fileInputDigest(v)},
+		{"CA", v, fileLogDigest(v)},
 		{"KEY", v, "<redacted>"},
 		{"TOKEN", "t", "<redacted>"},
 		{"TOKEN", "", ""},
@@ -860,7 +860,7 @@ func TestFileInputsInAnUpgradesDryRunAndRollback(t *testing.T) {
 	if err := e.upgrade(func(o *Options) { o.DryRun, o.Set = true, map[string]string{"ADDED": added} }); err != nil {
 		t.Fatalf("%v\n%s", err, e.log)
 	}
-	if out := e.out.String(); strings.Contains(out, added) || !strings.Contains(out, "ADDED="+fileInputDigest(added)+"\n") {
+	if out := e.out.String(); strings.Contains(out, added) || !strings.Contains(out, "ADDED="+fileLogDigest(added)+"\n") {
 		t.Errorf("the dry run:\n%s", out)
 	}
 	if err := e.upgrade(nil); err != nil {

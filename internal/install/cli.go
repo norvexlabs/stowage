@@ -174,6 +174,9 @@ func newCommand(r *Release, self string, stdout, stderr io.Writer, tools K8sOpti
 		Short: "What the install runs, its URLs and its services",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			if o.StatusValues && !statusJSON {
+				return errors.New("--values goes with --json")
+			}
 			err := prepare()
 			if statusJSON {
 				if err == nil {
@@ -188,7 +191,8 @@ func newCommand(r *Release, self string, stdout, stderr io.Writer, tools K8sOpti
 		},
 	}
 	dirFlag(status)
-	status.Flags().BoolVar(&statusJSON, "json", false, "print the install's status as one JSON object, for a program (never an input's value)")
+	status.Flags().BoolVar(&statusJSON, "json", false, "print the install's status as one JSON object, for a program (never an input's value but with --values)")
+	status.Flags().BoolVar(&o.StatusValues, "values", false, "with --json, add the recorded values a configuration gives again: the inputs that are not secret, the TLS mode, the domains and the ports")
 	root.AddCommand(status)
 	var asJSON bool
 	ps := &cobra.Command{
@@ -577,6 +581,9 @@ func k8sCommand(in *Installer, o *Options, prepare func() error, terminal func(b
 		Short: "What the helm release runs, then helm's status",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			if o.StatusValues && !statusJSON {
+				return errors.New("--values goes with --json")
+			}
 			if statusJSON {
 				err := run(cmd, 0, false, in.K8sStatusJSON)
 				return printStatusRefused(o.Out, err)
@@ -584,7 +591,8 @@ func k8sCommand(in *Installer, o *Options, prepare func() error, terminal func(b
 			return run(cmd, 0, false, in.K8sStatus)
 		},
 	}
-	status.Flags().BoolVar(&statusJSON, "json", false, "print the release's status as one JSON object, for a program (never an input's value)")
+	status.Flags().BoolVar(&statusJSON, "json", false, "print the release's status as one JSON object, for a program (never an input's value but with --values)")
+	status.Flags().BoolVar(&o.StatusValues, "values", false, "with --json, add the recorded inputs that are not secret")
 	var resetTimeout time.Duration
 	reset := &cobra.Command{
 		Use:   "reset-db",

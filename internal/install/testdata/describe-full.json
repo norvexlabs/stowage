@@ -342,6 +342,48 @@
       "default": "observe"
     }
   ],
+  "tls_inputs": [
+    {
+      "key": "STOWAGE_ACME_EMAIL",
+      "type": "text",
+      "secret": false,
+      "required": false,
+      "optional": false,
+      "shapes": [
+        "docker",
+        "kairos"
+      ],
+      "when": "",
+      "advanced": false,
+      "as_file": false,
+      "profile": "",
+      "prompt": "Email Let's Encrypt writes to before a certificate expires (optional)",
+      "default": "",
+      "tls_modes": [
+        "acme",
+        "dns-cloudflare"
+      ]
+    },
+    {
+      "key": "STOWAGE_CLOUDFLARE_API_TOKEN",
+      "type": "text",
+      "secret": true,
+      "required": true,
+      "optional": false,
+      "shapes": [
+        "docker",
+        "kairos"
+      ],
+      "when": "",
+      "advanced": false,
+      "as_file": false,
+      "profile": "",
+      "prompt": "Cloudflare API token (Zone DNS Edit on each domain's zone)",
+      "tls_modes": [
+        "dns-cloudflare"
+      ]
+    }
+  ],
   "first_install_only": [
     "address",
     "registry",

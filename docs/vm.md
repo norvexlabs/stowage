@@ -20,7 +20,7 @@ sudo <short>-stow install [--channel C] [--set KEY=VALUE]… [--set-file KEY=PAT
           [--json]   # the run's result as one object, for a program (see "Exit status and --json on the VM")
 <short>-stow --version               # (-v) the release this OS carries and the Stowage that built it, as the Docker installer's
 <short>-stow describe [--json]        # what the release this OS carries offers, read with no install: the Docker installer's describe
-<short>-stow status [--json]          # this OS's release, the install's (and `not finished` while a first install's stack comes up or its provision hook runs, or after one failed — with why, and the `sudo <short>-stow install` that runs it again; `"installing": true` and `"install_failed": "<why>"` in JSON; `not provisioned` while an install given `--secrets` awaits the backup `restore` loads, `"restore_awaited": true`; `not running` while a restore left the volumes half restored, `"volumes_split": true`), the channel, the stack's tuning profile and whose it is (`tune       network (operator)`, `"tune"` in JSON), the system Kairos booted (active, passive or recovery; the fallback), the last failed boot, the disk, a byo install's certificate (`cert`: its names, end and days left, with a warning from 30 days before it; `"cert"` in JSON), a network warning (`network    warning: …`, `"network_warning"` in JSON: IPv6 on and no IPv6 default route for a minute or more), the services
+<short>-stow status [--json [--values]]   # --values: the recorded values (machine-interface.md), the operator's alone; this OS's release, the install's (and `not finished` while a first install's stack comes up or its provision hook runs, or after one failed — with why, and the `sudo <short>-stow install` that runs it again; `"installing": true` and `"install_failed": "<why>"` in JSON; `not provisioned` while an install given `--secrets` awaits the backup `restore` loads, `"restore_awaited": true`; `not running` while a restore left the volumes half restored, `"volumes_split": true`), the channel, the stack's tuning profile and whose it is (`tune       network (operator)`, `"tune"` in JSON), the system Kairos booted (active, passive or recovery; the fallback), the last failed boot, the disk, a byo install's certificate (`cert`: its names, end and days left, with a warning from 30 days before it; `"cert"` in JSON), a network warning (`network    warning: …`, `"network_warning"` in JSON: IPv6 on and no IPv6 default route for a minute or more), the services
 <short>-stow health [--json]          # ready, or fails saying why: the health gate's check, once
 <short>-stow events [--after N] [--follow|-f] [--json]   # the event journal: jobs, reboots, boots and the health gate's verdicts, the first install; --follow waits for more until interrupted, through daemon restarts
 <short>-stow ps [--json]              # the stack's services, state and health, then `down: <service> <why>` for each service down (as on Docker's `status`; the VM's `status` ends with the same); `--json`: each with `exit_code`, and when set (each absent when false, 0 or empty) `id`, `oom_killed`, `mem_limit_bytes` and `restarts` (these three from docker inspect)
@@ -1035,7 +1035,10 @@ sudo <short>-stow network attach --role ROLE --mac MAC [--mode dhcp|static|none]
   (through the front's compose file, `stowage-front.yaml`). A Docker install records no token and
   mounts nothing.
 - The daemon's API is JSON over HTTP on the socket, under `/v1`: `GET status` (`format`,
-  `previous` and `inputs` as `status --json` gives them, above; `boot`;
+  `previous` and `inputs` as `status --json` gives them, above; with `?values=true`, `values` as
+  `status --json --values` gives them (the operator's socket alone: the app socket answers any
+  `values` query 403);
+  `boot`;
   `reset_failed`: on the recovery system, Kairos's automatic reset (`kairos-reset.service`, the
   first boot's) failed in this boot, so the VM stays there — `kairos-reset.service failed: ` and
   the unit's last 15 journal lines joined by ` | `, absent otherwise; `status` prints it after

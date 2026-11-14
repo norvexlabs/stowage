@@ -1651,7 +1651,7 @@ func (in *Installer) confirmVM(ctx context.Context, p Platform, format string, m
 	for _, k := range sortedKeys(st.Inputs) {
 		v := st.Inputs[k]
 		if i, ok := in.R.Spec.Input(k); ok && i.File() {
-			v = fileInputDigest(v)
+			v = fileLogDigest(v)
 		}
 		fmt.Fprintf(&b, "  %s=%s\n", k, v)
 	}

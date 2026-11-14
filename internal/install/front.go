@@ -60,6 +60,71 @@ func frontPort(i int) int { return 10000 + i }
 // routes' (frontPort), whatever host port publishes it.
 func frontL4Port(i int) int { return 20000 + i }
 
+// recordedPortOf reads a recorded TCP port: a number in 1..65535 written as the installer writes
+// it (strconv.Itoa: no sign, no leading zero), else 0 and false. Whatever reads a port .env records takes it by this
+// rule.
+func recordedPortOf(v string) (int, bool) {
+	if n, err := strconv.Atoi(v); err == nil && n >= 1 && n <= 65535 && strconv.Itoa(n) == v {
+		return n, true
+	}
+	return 0, false
+}
+
+// recordedFrontPorts reads the front's ports .env records in mode: in loopback mode each front
+// route's whose URL is recorded (every route on a re-run, all), by route name; in a TLS mode
+// "http" and "https". A recorded one that is no port (an edited .env) is refused, naming its key
+// and the flag that gives it, unless given(name) says the run gives it; so is a missing one the
+// mode serves; a missing one it does not serve stands at the spec's. A port given that is not
+// read is left out of the map: the caller lays the run's over the map. On an upgrade (rerun false) the fix is a re-run of
+// the installer the install runs with that flag, then the upgrade.
+func (in *Installer) recordedFrontPorts(env *EnvFile, mode string, rerun bool, given func(string) bool) (map[string]int, error) {
+	f := in.R.Spec.Front
+	type slot struct {
+		name, key, flag string
+		served          bool
+		def             int
+	}
+	var slots []slot
+	if mode == Loopback {
+		for _, r := range f.Routes {
+			if _, ok := env.Get(spec.URLVar(r.Name)); ok || rerun {
+				slots = append(slots, slot{r.Name, PortVar(r.Name), "--ports " + r.Name + "=PORT", true, 0})
+			}
+		}
+	} else {
+		http, https := frontServed(f, in.R.Spec.L4.Routes, mode)
+		slots = []slot{{"http", HTTPPortVar, "--http-port PORT", http, cmp.Or(f.HTTPPort, 80)}, {"https", HTTPSPortVar, "--https-port PORT", https, cmp.Or(f.HTTPSPort, 443)}}
+	}
+	out := map[string]int{}
+	var bad, fixes []string
+	for _, s := range slots {
+		v, recorded := env.Get(s.key)
+		n, ok := recordedPortOf(v)
+		switch {
+		case ok:
+			out[s.name] = n // given too: the install holds it until the run moves it
+		case given(s.name):
+			// Not read: the run gives it.
+		case !recorded && !s.served:
+			out[s.name] = s.def
+		case recorded:
+			bad, fixes = append(bad, fmt.Sprintf("%s %q is not a TCP port", s.key, v)), append(fixes, s.flag)
+		default:
+			bad, fixes = append(bad, s.key+" is not recorded"), append(fixes, s.flag)
+		}
+	}
+	if len(bad) == 0 {
+		return out, nil
+	}
+	cause := fmt.Errorf("%s: the front's recorded port: %s", in.path(envName), strings.Join(bad, "; "))
+	flags := strings.Join(fixes, " ")
+	if rerun {
+		return nil, refusal(in.flagFix("give "+flags), cause)
+	}
+	return nil, refusal(in.fixOn(in.ctl()+" --dir "+in.O.Dir+" "+flags+", then upgrade", in.vmCtl()+" install "+flags+", then upgrade"),
+		fmt.Errorf("%w: give it to a re-run of the installer the install runs (%s), then upgrade", cause, in.fixOn("`"+in.ctl()+" --dir "+in.O.Dir+" "+flags+"`", "`"+in.vmCtl()+" install "+flags+"`")))
+}
+
 // PortVar records a route's loopback port in .env.
 func PortVar(route string) string {
 	return "STOWAGE_PORT_" + strings.TrimPrefix(spec.URLVar(route), "STOWAGE_URL_")

@@ -91,6 +91,42 @@ share; each shape's own fields and verbs are on its page:
   revision that is no number, a kept record (`.stowage-prev/state.json`) that does not read,
   naming the file, and an `.env` or a `registry-ca.pem` that cannot be read (a permission). An install of another project is
   not refused: `name` says whose it is.
+- `status --json --values` (Docker, `k8s status`, the VM's `status`) adds `values`, what the
+  install records that a configuration gives again, so a program that takes over an install
+  compares its configuration with it; `--values` without `--json` is refused (`--values goes with
+  --json`). It prints recorded values, never a secret's:
+  ```json
+  "values": {
+    "inputs": { "ADMIN_EMAIL": "admin@example.org", "STOWAGE_ACME_EMAIL": "ops@example.org" },
+    "tls": "acme",
+    "domains": { "app": "notes.example.org" },
+    "http_port": 80,
+    "https_port": 443
+  }
+  ```
+  `inputs` the recorded inputs the installed release declares, and those of the recorded TLS
+  mode (`describe`'s `tls_inputs`; one an earlier mode left is not listed), that are not secret,
+  by key (`{}` when none); a file input, or any value recorded as a file, as `sha256:<hex>` of its
+  content, as a program hashes the file it would give, never the content (`""` for a file input
+  left empty; left out when what is recorded is not a file's: not known) — not the shorter digest
+  the logs print. A route's domain input the project declares itself (not secret) is in `inputs`
+  (empty included), and in a TLS mode, when it holds a domain, in `domains` too, the same value:
+  one key, which `--set KEY=` and `--domains route=` both record; a file's value is never a
+  domain (left out of `domains`). `tls`
+  the front's mode as recorded (`none` for loopback mode); in a TLS mode `domains`, each route's
+  domain (the front's routes and the L4 routes it terminates), and `http_port` and `https_port`,
+  the host ports the front publishes in that mode (`--http-port`, `--https-port`; a front of L4
+  routes alone publishes plain HTTP for `acme`'s challenge only); in loopback mode `ports`, each
+  front route's loopback port (`--ports`; an L4 route's host port is the spec's): a recorded port
+  that is no port (not a number 1..65535 written plainly, without a sign or a leading zero) is
+  left out, not known; a domain the project declares secret
+  is left out; each left out when it holds nothing, and all of them without a front, as on Kubernetes. `values` is left out
+  when the spec of the release installed cannot be read — what is secret is not known —, though
+  `inputs` may still list the keys the install recorded; on Kubernetes when the installer run
+  does not carry the release installed (as `inputs`); and before the VM's first install.
+  On the VM the daemon serves it (`GET status?values=true`, a boolean: `1`, `true`, `0`, `false`…;
+  another value is answered 400) on the operator's socket alone: the app socket answers any
+  `values` query 403.
 ## describe
 
 - `describe` prints what the release this installer carries offers, read from the installer alone,
@@ -119,6 +155,15 @@ share; each shape's own fields and verbs are on its page:
     secret input delivered as a file; `shapes` is `[]` for an input of every
     shape; `when`, `profile`, `prompt` and `default` are `""` when the spec gives none. A secret
     input's `default` is never printed: the key is left out.
+  - `tls_inputs`: the inputs Stowage adds to the project's in a TLS mode of the front (`--tls`),
+    in the form's order, each with an input's fields and `tls_modes`, the modes the release's
+    front offers (`front.tls_modes`) that ask for it: `STOWAGE_ACME_EMAIL` (`acme`,
+    `dns-cloudflare`) and the secret `STOWAGE_CLOUDFLARE_API_TOKEN` (`dns-cloudflare`), each left
+    out when no mode offered asks for it; their `shapes` are the spec's but `kubernetes`, where the
+    chart's ingress owns the certificate. `[]` without a front, or with the `kubernetes` shape
+    alone. A program gives them as it gives `inputs`: the
+    token as a secret, never on a command line. Without `--json` each is an `input` line after the
+    project's, tagged `tls MODES`.
   - `first_install_only`: the settings an install records at its first run and a re-run refuses,
     `["address", "registry", "registry_ca", "channel"]` (`--address`, `--registry`,
     `--registry-ca`, and the VM's `install --channel`).

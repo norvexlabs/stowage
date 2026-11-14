@@ -271,7 +271,7 @@ func TestK8sDryRunShowsAFileInputByItsDigest(t *testing.T) {
 		t.Fatal(err)
 	}
 	out := e.out.String()
-	if strings.Contains(out, set["CA"]) || !strings.Contains(out, "  CA="+fileInputDigest(set["CA"])) || !strings.Contains(out, "secret notes-stowage-files: the file inputs CA, EXTRA\n") {
+	if strings.Contains(out, set["CA"]) || !strings.Contains(out, "  CA="+fileLogDigest(set["CA"])) || !strings.Contains(out, "secret notes-stowage-files: the file inputs CA, EXTRA\n") {
 		t.Errorf("printed\n%s", out)
 	}
 }
@@ -329,7 +329,7 @@ func TestK8sUpgradeGivenReplacesRecordedValuesAndRestartsTheirReaders(t *testing
 		t.Errorf("files %v", got)
 	}
 	log := e.log.String()
-	if !strings.Contains(log, "changing TOKEN: <redacted> → <redacted>") || !strings.Contains(log, "changing CA: "+fileInputDigest(encodeFileInput([]byte(pemCA)))+" → "+fileInputDigest(other)) {
+	if !strings.Contains(log, "changing TOKEN: <redacted> → <redacted>") || !strings.Contains(log, "changing CA: "+fileLogDigest(encodeFileInput([]byte(pemCA)))+" → "+fileLogDigest(other)) {
 		t.Errorf("log %s", log)
 	}
 	if strings.Contains(log, "new-token") || strings.Contains(log, other) || strings.Contains(e.out.String(), "new-token") {
@@ -531,7 +531,7 @@ func TestShownValueOfARecordedFile(t *testing.T) {
 	e := newKubeEnv(t, spec.Provider{Name: "none"})
 	in := e.installer(nil)
 	v := encodeFileInput([]byte(pemCA))
-	if got := in.shownValue("ADMIN_EMAIL", v, nil); got != fileInputDigest(v) {
+	if got := in.shownValue("ADMIN_EMAIL", v, nil); got != fileLogDigest(v) {
 		t.Errorf("%q", got)
 	}
 	if got := in.shownValue("ADMIN_EMAIL", "a@example.org", nil); got != "a@example.org" {

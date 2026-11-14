@@ -119,6 +119,37 @@ func TestVMStatusJSON(t *testing.T) {
 			t.Errorf("%s=%q is printed, or not recorded:\n%s", k, v, out)
 		}
 	}
+	// --values: the operator's alone, never a secret's; --json's alone.
+	out, _, err = ctlSplit(e, sock, "status", "--json", "--values")
+	if err != nil {
+		t.Fatal(err)
+	}
+	st = Status{}
+	strictJSON(t, out, &st)
+	if st.Values == nil || st.Values.Inputs["ADMIN_EMAIL"] != get(env, "ADMIN_EMAIL") || st.Values.TLS != Loopback || len(st.Values.Ports) == 0 ||
+		strings.Contains(out, "tok-not-to-be-printed") {
+		t.Errorf("values %+v\n%s", st.Values, out)
+	}
+	if _, _, err := ctlSplit(e, sock, "status", "--values"); err == nil || !strings.Contains(err.Error(), "--values goes with --json") {
+		t.Errorf("--values without --json: %v", err)
+	}
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/v1/status?values=1", nil)
+	req.Header.Set("Authorization", "Bearer "+get(env, HostTokenVar))
+	if daemon(e, &fakeHost{}).AppHandler().ServeHTTP(w, req); w.Code != http.StatusForbidden || strings.Contains(w.Body.String(), get(env, "ADMIN_EMAIL")) {
+		t.Errorf("the app socket's values: %d %s", w.Code, w.Body.String())
+	}
+	// Any spelling of the query: the app socket refuses it; the operator's reads it or refuses it.
+	for q, want := range map[string][2]int{"values=0": {http.StatusForbidden, http.StatusOK}, "values=true": {http.StatusForbidden, http.StatusOK}, "values=yes": {http.StatusForbidden, http.StatusBadRequest}} {
+		for i, h := range []http.Handler{daemon(e, &fakeHost{}).AppHandler(), daemon(e, &fakeHost{}).Handler()} {
+			w := httptest.NewRecorder()
+			req := httptest.NewRequest("GET", "/v1/status?"+q, nil)
+			req.Header.Set("Authorization", "Bearer "+get(env, HostTokenVar))
+			if h.ServeHTTP(w, req); w.Code != want[i] || (q == "values=true" && i == 1 && !strings.Contains(w.Body.String(), `"values"`)) {
+				t.Errorf("%s on socket %d: %d %s", q, i, w.Code, w.Body.String())
+			}
+		}
+	}
 
 	// Upgraded: the release replaced is the previous one, by version alone (the OS carries it).
 	e, d, _ := upgradedVM(t)

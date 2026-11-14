@@ -269,6 +269,7 @@ func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(
 	dirFlag(tablesBoot)
 	root.AddCommand(install, boot, back, hostd, gate, netBoot, tuneBootCommand(r, stderr), route6BootCommand(r, stderr), tablesBoot, tuneCommand(in, prepare, terminal, true))
 
+	var values bool
 	jsonFlag := func(cmd *cobra.Command) {
 		cmd.Flags().BoolVar(&asJSON, "json", false, "print the daemon's JSON answer")
 	}
@@ -277,10 +278,14 @@ func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(
 		Short: "The release this OS carries, the install's, the disk and the services",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			return c.status(cmd.Context(), asJSON)
+			if values && !asJSON {
+				return errors.New("--values goes with --json")
+			}
+			return c.status(cmd.Context(), asJSON, values)
 		},
 	}
 	jsonFlag(status)
+	status.Flags().BoolVar(&values, "values", false, "with --json, add the recorded values a configuration gives again: the inputs that are not secret, the TLS mode, the domains and the ports (the operator's alone)")
 	ps := &cobra.Command{
 		Use:   "ps",
 		Short: "The stack's services and their state",
@@ -880,9 +885,13 @@ func printJSON(w io.Writer, v any) error {
 	return enc.Encode(v)
 }
 
-func (c *hostClient) status(ctx context.Context, asJSON bool) error {
+func (c *hostClient) status(ctx context.Context, asJSON, values bool) error {
 	var st Status
-	if err := c.do(ctx, http.MethodGet, "/v1/status", nil, &st); err != nil {
+	p := "/v1/status"
+	if values {
+		p += "?values=true"
+	}
+	if err := c.do(ctx, http.MethodGet, p, nil, &st); err != nil {
 		return err
 	}
 	if asJSON {

@@ -24,7 +24,7 @@ again, to copy an installer to another host.
           [--interface ROLE=NIC]…                                          # this host's NIC of a host.interfaces role
           [--secrets FILE|-]                                               # a machine made again
           [--json]                                                         # the result as one object, for a program
-<short>-stow status [--json] [--dir D]                                    # --json: one object, for a program
+<short>-stow status [--json [--values]] [--dir D]                         # --json: one object, for a program; --values adds the recorded values
 <short>-stow describe [--json]                                           # what the release offers, read with no install
 <short>-stow ps [--json] [--dir D]                                       # the stack's services, state and health
 <short>-stow logs SERVICE [--tail N] [--follow|-f] [--dir D]             # 1 to 5000 lines, default 200
@@ -357,7 +357,15 @@ again, to copy an installer to another host.
     keeps its recorded value when that other changes: give it too.
   - `--ports route=port` (loopback mode) or `--http-port` and `--https-port` (TLS modes) move the
     front; the other mode's flags are refused. Only a port the install does not already hold is
-    checked free, so two routes may swap theirs.
+    checked free, so two routes may swap theirs. A port of the front `.env` records that is no
+    port (not a number 1..65535 written plainly, without a sign or a leading zero: an edited
+    `.env`), or one the mode serves that `.env` does not record, is refused (`<dir>/.env: the
+    front's recorded port: STOWAGE_PORT_APP "70000" is not a TCP port`, or `… is not recorded`),
+    its fix the flag that gives it (`--ports app=PORT`, `--http-port PORT`, `--https-port PORT`),
+    unless the run gives that port; a TLS port the mode does not serve and `.env` does not record
+    stands at the spec's. An `upgrade` refuses it the same way, its fix a re-run of the installer
+    the install runs with that flag, then the upgrade (on the VM `sudo <short>-stow install
+    --http-port PORT`, then the upgrade).
   - `--tls` moves the install to another TLS mode (between `acme`, `dns-cloudflare`, `byo` and
     `internal`; to or from loopback is a new install, refused), the inputs the new mode requires
     given with it (`--set STOWAGE_CLOUDFLARE_API_TOKEN=…` for `dns-cloudflare`) and the front's
