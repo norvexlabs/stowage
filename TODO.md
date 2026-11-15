@@ -9,7 +9,9 @@ The plan behind it is [docs/DESIGN.md § 11](docs/DESIGN.md#11-phases).
 
 ## Must — parity
 
-Batched by the gate they share: a batch is one slice, one review, one gate run.
+Batched by the gate they share: a batch is one slice, one review, one gate run. The beta is every
+Must above Blocked (user, 2026-11-15): the clouds under Blocked ship in it as preview, Google
+Cloud alone proven.
 
 ### Features — pull credentials
 
@@ -27,6 +29,39 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
    every other install pulling; an install without one keeps the baked account. Not in 0.35.0
    (user, 2026-11-11): (a) needs a `registry.pull` mint operation per registry, an issuing
    credential, revocation and a fallback.
+
+### Features — a service knows the machine is the stack's alone
+
+1. **A service can tell a host the stack owns whole from a shared one**: on the VM every process
+   but the OS is the stack's, so a service reporting memory pressure should report the host's;
+   on a Docker host (shared with whatever else runs there) and on Kubernetes its own cgroup is the
+   signal. Today a container sees `STOWAGE_HOST_MEM_MB` on Docker and the VM alike, and nothing
+   that only the VM sets, so a project cannot pick the right signal without an operator input —
+   which would make a product-owned fact an operator knob. Options: (a) Stowage gives every
+   service's container `STOWAGE_SHAPE` (`docker` | `kairos`; the chart's pods `kubernetes`)
+   beside the sizing variables (recommended: one fact, read the way the sizing ones are); (b) a
+   per-shape `environment` override in the spec (`shapes.kairos.env`), written into the VM's
+   compose overlay — more general, but a second place a service's environment is defined.
+
+### Beta — promoted from Should (user, 2026-11-15)
+
+1. **ACME proven end to end**: no suite runs an ACME server, so `acme` and `dns-cloudflare` are
+   proven by the Caddyfile they write alone — for the HTTP routes and for a domain the front holds
+   for L4 routes alone (a site answering 404 over HTTPS, its challenges on the front's ports 80
+   and 443, as a route's). Run Pebble (and a DNS stub for `dns-01`) beside a suite, with a
+   test-only way to point the front at its directory and trust its root, and check that a front
+   with L4 TLS routes alone obtains and renews its certificate. The VM runs the Docker install's
+   front, which e2e-stateless proves for such a front in `internal` and `byo`.
+2. **`mirror import` checks the archive's signatures** with the importing `<short>-stow`'s keys
+   (read from the archive's referrers, offline) before anything is pushed; today an install
+   checks the release only when it reads it from the mirror.
+3. **A `command` provider receives only the keys it declares**: the schema-compat and health
+   `command` providers' containers still receive every input, secret and safe default (as the
+   provision hook did before its `env`). An `env` list on `command`, as on the hook, would narrow
+   them.
+4. **Disaster recovery on Kubernetes**: `secrets export` and `install --secrets` run on Docker and
+   the VM; `k8s secrets export` (from the release's Secret) and `k8s install --secrets` would
+   follow the same file format.
 
 ### VM creation — the OpenTofu path moves out of Stowage
 
@@ -120,14 +155,6 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
    release.
 
 ## Should
-
-- **ACME proven end to end**: no suite runs an ACME server, so `acme` and `dns-cloudflare` are
-  proven by the Caddyfile they write alone — for the HTTP routes and for a domain the front holds
-  for L4 routes alone (a site answering 404 over HTTPS, its challenges on the front's ports 80
-  and 443, as a route's). Run Pebble (and a DNS stub for `dns-01`) beside a suite, with a
-  test-only way to point the front at its directory and trust its root, and check that a front
-  with L4 TLS routes alone obtains and renews its certificate. The VM runs the Docker install's
-  front, which e2e-stateless proves for such a front in `internal` and `byo`.
 
 - **An L4 route hands its upstream the client's address**: a TCP route's upstream sees the
   connection's source as Docker's NAT or userland proxy leaves it, and a front terminating TLS
@@ -342,10 +369,6 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
   `http://<release>-<service>.<namespace>.svc:<port>` from the endpoint route's upstream, the
   chart's contract; nothing checks the chart keeps it. Lint could render the chart and warn when
   it has no Service `<release>-<service>` on that port.
-- **A `command` provider receives only the keys it declares**: the schema-compat and health
-  `command` providers' containers still receive every input, secret and safe default (as the
-  provision hook did before its `env`). An `env` list on `command`, as on the hook, would narrow
-  them; their images are usually the stack's own, which is why it can wait.
 - **`k8s provision` from another release's installer**: it is refused unless the installer is the
   release's that runs; after a failed `k8s upgrade --version` the operator fetches that release's
   installer (or uses the one the upgrade kept). Fetching and running it, as `upgrade --version`
@@ -370,9 +393,6 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
   a VM on a missed heartbeat would; on TrueNAS it cannot use the QEMU guest agent (`vm.device.create`
   offers no channel/serial dtype), so it would read the VM power state the host already sees.
 
-- **Disaster recovery on Kubernetes**: `secrets export` and `install --secrets` run on Docker and
-  the VM; `k8s secrets export` (from the release's Secret) and `k8s install --secrets` would
-  follow the same file format.
 - **The `cnpg` Postgres mode on Kubernetes** (`postgres_modes` validates it; DESIGN § 7 row 7).
   The mode is the project's chart's, and Stowage has no code for it: `examples/full`'s chart
   proves `embedded` and `external` (`make e2e-full-k8s`) but has no CloudNativePG `Cluster`, which
@@ -410,9 +430,6 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
   reports the top CHANGELOG version, so it passes the pin with another installer or front. An
   immutable channel still refuses those changed inputs under an existing tag; pinning the
   embedded installer's and front recipe's digests too would close it on mutable channels.
-- **`mirror import` checks the archive's signatures** with the importing `<short>-stow`'s keys
-  (read from the archive's referrers, offline) before anything is pushed; today an install
-  checks the release only when it reads it from the mirror.
 
 - **Offline archives across image stores**: an archive `docker save`d on a classic-store host and
   loaded on a containerd-store host gets a regenerated manifest digest the release does not record,
