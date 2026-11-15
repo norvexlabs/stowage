@@ -79,6 +79,14 @@ Cloud alone proven.
    (a) the steps above (recommended); (b) also a `vm root` verb printing a ready root (provider +
    module) for an operator with no IaC of their own, Stowage never running `tofu`; (c) keep
    `vm create` as is beside the provider (two owners of a VM's state). No compatibility until 1.0.
+   What moves with the modules, owned by their own suite then (not by a `vm create` run): each
+   applied on its platform with a no-drift plan after the apply (`tofu plan -detailed-exitcode`
+   returning 0; libvirt's sorted firmware features were one); libvirt's on a stock Ubuntu LTS host
+   with KVM and AppArmor enforcing (the guest's boot, SSH, first install, `virt-aa-helper`; today
+   proven only against libvirtd in a container without KVM), and with several vCPUs (`queues`, as
+   proxmox's `min(var.cpus, 64)`, never applied with more than one); libvirt 0.9.9 leaves a domain
+   whose start failed defined and out of the state, said in the module's docs until upstream keeps
+   it in the state. A module leaves preview after that run on its platform.
 
 ### Supply chain — stopgaps back to canonical
 
@@ -142,7 +150,7 @@ Cloud alone proven.
    Each checked against its provider's schema and applied for real.
 2. **Scaleway, run for real**: `cloud_publish: [scaleway]` and `vm create --platform scaleway` are
    written against `scaleway/scaleway` 2.91.0 and checked against its schema, not yet run on
-   Scaleway (`STOWAGE_CLOUD_ENV=<file> make e2e-kairos`, then a `vm create --create opentofu`).
+   Scaleway (`STOWAGE_CLOUD_ENV=<file> make e2e-kairos`, then a VM from the Scaleway module).
    Check there: the import takes the compressed qcow2 (`qemu-img -c`), a tag holding the
    description's spaces and colon is accepted and filtered on, the 5 GB single PUT holds the
    disk, the bundle's `scaleway` datasource reads the `cloud-init` user data at first boot (its
@@ -185,24 +193,6 @@ Cloud alone proven.
   but no suite runs a consented start on a real engine, as e2e-full stops at "not in force". A
   privileged Docker-in-Docker step in e2e-full would prove the chain, the IPv4-only publication and
   the boot's order.
-
-- **The libvirt module on a KVM host (blocked: a host with KVM)**: e2e-kairos proves the module
-  against libvirtd in a container without KVM (defined, running, no drift, nothing left after
-  `vm destroy`). The guest's boot, its SSH and its first install, and AppArmor's confinement
-  (Ubuntu's `virt-aa-helper`), need a stock Ubuntu LTS host with KVM and AppArmor enforcing; each
-  built-in module leaving preview gets the same run on its platform.
-- **A built-in module's apply leaves no drift**: a `tofu plan -detailed-exitcode` after the apply
-  returning 0 would catch any attribute the platform normalizes (libvirt sorted the firmware's
-  features); run it where a suite applies a module for real (e2e-vm). libvirt's module was
-  applied by hand against libvirtd in a privileged Ubuntu 24.04 container (QEMU without KVM: the
-  module's `type` set to `qemu`, its CPU mode to `maximum`), then planned with no change, two NICs
-  included; made a suite, it would keep the module from drifting (DHCP's lease wait aside, which
-  needs a guest that boots).
-- **libvirt: a domain whose start failed stays defined, out of the state**: dmacvicar/libvirt
-  0.9.9 records no `libvirt_domain` when the start after its define fails, so `vm destroy` leaves
-  it (the failed `vm create` names `virsh undefine … --nvram`). Fixed upstream (the resource kept
-  in the state, tainted) or by a `vm destroy` that reaches the platform, it needs no hint.
-
 
 - **A volumes-age-rclone backup reads its volumes live**: without a dump, the archive is the
   whole backup, and files a service writes together (a CA's index and serial) may be archived
@@ -484,16 +474,9 @@ Cloud alone proven.
   `l4.routes[].tls` domain is not, so a service of the stack dialing `<domain>:<port>` leaves
   through the host's public address (hairpin NAT) rather than straight to the front.
 
-
 - **Docker L4 allowlist, leftovers of its review**: `l4Exposure` and `status` recompute the rules
   and re-read the marks per route; a retried `prepare` applies the chains twice (idempotent);
   `lint` reports only the first of an allowlist input's errors.
-
-- The libvirt e2e creates its VM with one vCPU alone: no suite applies the module with several
-  (`queues = var.cpus`) nor checks its no-drift plan then; a second, short apply with `--cpus 2`
-  asserting `queues='2'` would.
-- The proxmox module sets `queues = min(var.cpus, 64)` with one vCPU too: whether the bpg provider
-  reads 1 back as set (libvirt's leaves it out, failing the apply) is unproven.
 
 - **The service watch's races**: a look judges the lock, the daemon's jobs and its reboots at
   instants around the read; a lifecycle lock a CLI run takes and releases wholly inside one
@@ -534,7 +517,6 @@ Cloud alone proven.
 - **`flush_conntrack`, leftovers** (review): e2e-full-vm watches an SSH session across the flush,
   not a connection through the front's published ports (Docker's DNAT made again on the next
   packet).
-
 
 - **An interrupt that fired once before the boot moved it**: `tune --check` judges a NIC
   interrupt that never fired (`per_cpu_count` all zeros) by the affinity asked, since the kernel
@@ -615,7 +597,6 @@ Cloud alone proven.
     keys the project mapped them to (`# stowage: <unit> -> <service>`, or a spec list), so none is
     lost without a word.
 
-
 - **Review findings left from batch D** (cross-Stowage rollback), minor:
   a rollback releases the install's lock before the previous installer's start takes it (the
   install then records the previous release, consistent, but another run may slip in: hand the
@@ -639,7 +620,6 @@ Cloud alone proven.
 
 - **L4 routes on the host's network, leftovers** (review): the fetched installer of a later
   revision looks the channel up again before it upgrades.
-
 
 - **HSTS `includeSubDomains` opt-out** (security review, Low): the front sends it on every route,
   as the reference deployment does, binding the names under a route's to HTTPS for a year. A spec
@@ -668,7 +648,6 @@ Cloud alone proven.
   `tune --apply` sets them on the running host only, so the host's reboot loses them until the next apply (the VM's
   boot sets them each time). A unit ordered after the NICs' probe, written by `--apply`, would
   keep them.
-
 
 - **Retired release tags stay**: on a registry that deletes no tag alone, a tag `prune` retired
   (a release's, an image's, an installer's) is never visited again, even once the registry deletes
@@ -757,7 +736,7 @@ Cloud alone proven.
   a database outside the Kubernetes release (`external`) is not reset.
 
 - **What `test/sweep.sh` does not sweep**: a TrueNAS VM `stowage-e2e-<run>` whose run died
-  without its cleanup (a host crash; `vm destroy` needs the run's state, gone with it), and the
+  without its cleanup (a host crash; its destroy needs the run's state, gone with it), and the
   build cache, which lives in the host's shared buildx builder.
 
 - **VM health gate leftovers** (review of the health gate): `reboot`/`shutdown` are accepted while
@@ -767,10 +746,8 @@ Cloud alone proven.
   bookkeeping each their own way; the rollback's re-checked plan finding another target has no
   test (reachable only through a run that changes the install consistently during the drain).
 
-
 - **The app socket reads the install's `.env` at every request** to check the token: cache it,
   re-read when the file changes.
-
 
 - **A disk that fails rebuilds the bundle on the next ship**: the bundle was pushed by digest,
   untagged, and nothing records it. Recording built digests (a staging tag) would keep it.
@@ -828,8 +805,6 @@ Cloud alone proven.
 - `make smoke-install` leaves the images it pushed to its throwaway registry
   (`127.0.0.1:<port>/smoke/*`) in the local engine, and `make e2e` the installer and front images
   it pulls: remove them at the end, as `make e2e-docker` does.
-
-
 
 - **No suite runs a failing start-first successor**: the quoting of its last lines is unit-tested
   against the engine's calls; an e2e case (a release whose new container exits) would prove it
