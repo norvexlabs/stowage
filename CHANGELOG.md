@@ -73,9 +73,10 @@ follow [SemVer](https://semver.org/).
   enforces none of its guards.
 - `lint` refuses a `command` provider's `timeout_s` past 3600 (an hour), the health, schema and
   backup commands' included: a longer one could hold a run without bound.
-- A test release's key is checked against `--test-public-key` again before every signature and
-  attestation, not once when the command starts: a key file replaced during the run signs nothing,
-  and interrupting the command stops the check.
+- A signing key file is read once per command, and every signature and attestation is made with
+  the key as read — the one a test release's `--test-public-key` was checked against: a key file
+  replaced during the run signs nothing. cosign gets a 0600 copy of it for each call, in the call's
+  private directory, removed when the call ends.
 - A signature check reads at most a digest's 64 newest signatures, ordered by the annotations
   cosign writes, instead of refusing every digest with more than 64 referrers: one found among
   them verifies, and none found with others left unread is still a failure to check, never

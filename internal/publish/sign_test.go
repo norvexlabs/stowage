@@ -212,8 +212,8 @@ func TestCosignSignerPublicKeyCarriesNoCredentials(t *testing.T) {
 }
 
 // A file key is read once, by the signer's first cosign call: every call reads those bytes from a
-// pipe, never a file, so a key file replaced during the run signs nothing, the key a check derived
-// is the key that signs, and no copy is left on disk.
+// copy in the call's own directory, removed when the call ends, so a key file replaced during the
+// run signs nothing and the key a check derived is the key that signs.
 func TestCosignSignerSignsWithTheKeyFileAsItReadIt(t *testing.T) {
 	dir := t.TempDir()
 	bin := filepath.Join(dir, "cosign")
@@ -250,7 +250,7 @@ func TestCosignSignerSignsWithTheKeyFileAsItReadIt(t *testing.T) {
 	var got []string
 	for _, l := range strings.Split(strings.TrimSpace(readFile(t, logf)), "\n") {
 		f := strings.Fields(l)
-		if len(f) != 3 || f[2] != "/dev/fd/3" {
+		if len(f) != 3 || !strings.HasPrefix(f[2], s.WorkDir+string(filepath.Separator)+"cosign-") || filepath.Base(f[2]) != "cosign.key" {
 			t.Fatalf("cosign was given %q", l)
 		}
 		got = append(got, f[0]+" "+f[1])

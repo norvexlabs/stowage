@@ -562,7 +562,10 @@ install carries (list old + new while rotating). `verify` — and every fallback
 pointer — requires a signature by one of them, checked in-process (the bundle's signature by the
 key, over the artifact's own digest; cosign is needed only to sign). A signature that cannot be
 read is an error, never "unsigned". cosign gets the registry credentials in a private
-Docker config for one call, never on its command line; signing is refused for a registry that
+Docker config for one call, never on its command line, and a key file as the command first read
+it (a 0600 copy in that call's private directory, `$XDG_CACHE_HOME/stowage/sign/cosign-*`, removed
+when the call ends), so a key file changed during a run signs nothing. A run killed during a call
+leaves that directory, its Docker config and key copy in it: remove it; signing is refused for a registry that
 cosign could reach over plain HTTP (a private IP or `*.localhost`, loopback excepted): name it by
 DNS. A manifest read (a release manifest, a signature, an artifact) whose content does not hash to
 the digest the registry gives is refused.
