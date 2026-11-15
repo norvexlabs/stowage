@@ -506,11 +506,11 @@ const frontJSON = "/tmp/stowage-caddy.json"
 // reads a recorded value).
 // digest labels the front with its configuration (the Caddyfile, a byo certificate), so a change
 // recreates it. ca is the CA it publishes (frontCommand); noALPN, the Caddyfile names noALPNMark.
-// clientCA mounts the install's client CA.
+// clientCA mounts the install's client CA; acmeRoot, its ACME CA's root.
 // ipv6 turns IPv6 on for the default network. onHost are the services on the host's network
 // (hostServices), whose L4 routes' ports are their own. frontV4 publishes the front's ports on
 // IPv4 alone (frontV4Only). uid is the front's user and group (frontUser).
-func frontCompose(f spec.Front, l4 []spec.L4Route, get func(string) string, mode string, host hostAPI, digest, ca string, noALPN, clientCA, ipv6 bool, onHost, v4Only []string, frontV4 bool, uid int) ([]byte, error) {
+func frontCompose(f spec.Front, l4 []spec.L4Route, get func(string) string, mode string, host hostAPI, digest, ca string, noALPN, clientCA, acmeRoot, ipv6 bool, onHost, v4Only []string, frontV4 bool, uid int) ([]byte, error) {
 	var ports []any
 	volumes := []string{FrontDataVolume + ":/data"}
 	if mode == Loopback {
@@ -536,6 +536,9 @@ func frontCompose(f spec.Front, l4 []spec.L4Route, get func(string) string, mode
 	}
 	if clientCA {
 		volumes = append(volumes, "./"+ClientCADir+":"+clientCADir+":ro")
+	}
+	if acmeRoot {
+		volumes = append(volumes, "./"+ACMERootDir+":"+acmeRootMount+":ro")
 	}
 	if f.PublishCA != nil {
 		volumes = append(volumes, f.PublishCA.Volume+":"+caMount)

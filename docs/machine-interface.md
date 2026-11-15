@@ -118,7 +118,9 @@ share; each shape's own fields and verbs are on its page:
   the front's mode as recorded (`none` for loopback mode); in a TLS mode `domains`, each route's
   domain (the front's routes and the L4 routes it terminates), and `http_port` and `https_port`,
   the host ports the front publishes in that mode (`--http-port`, `--https-port`; a front of L4
-  routes alone publishes plain HTTP for `acme`'s challenge only); in loopback mode `ports`, each
+  routes alone publishes plain HTTP for `acme`'s challenge only), and in `acme` and
+  `dns-cloudflare` `acme_ca`, the ACME directory `--acme-ca` gave (left out for Let's Encrypt's);
+  in loopback mode `ports`, each
   front route's loopback port (`--ports`; an L4 route's host port is the spec's): a recorded port
   that is no port (not a number 1..65535 written plainly, without a sign or a leading zero) is
   left out, not known; a domain the project declares secret
@@ -285,8 +287,10 @@ share; each shape's own fields and verbs are on its page:
     no passive system, a boot not on trial); `failed_boot` names its diagnostics.
   `installed`, `on_trial`, `fallback` and `failed_boot` are then final for that boot. A rollback's
   boot of the passive system is not on trial: the gate still judges it, `on_trial` `false`.
-- The VM's `registry_login` says it holds a login to its mirror (the host, never the login;
-  [vm](vm.md), `registry-login`): a program that gave one over SSH reads it back there.
+- `registry_login` (Docker's `status --json` and the VM's) says the install holds its own login
+  for a host, the release's own registry's or its mirror's (the host, never the login;
+  `registry-login`, [installer](installer.md), [vm](vm.md)): a program that gave one reads it
+  back there; `registry_login_error` when the file held cannot be read (naming it and the fix).
 
 ## Exit status
 

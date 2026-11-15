@@ -273,6 +273,10 @@ func (in *Installer) k8sReadsNewer(ctx context.Context, prefix string, d *deploy
 	if c.ReadsNewerLabel == "" {
 		return false, errors.New("database.schema_compat sets no reads_newer_label")
 	}
+	// The pull Secret's login reads it: a rollback writes no pull Secret.
+	if err := in.k8sLogins(ctx, prefix, false); err != nil {
+		return false, err
+	}
 	cl, err := in.registryClient(prefix)
 	if err != nil {
 		return false, err

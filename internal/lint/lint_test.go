@@ -112,6 +112,12 @@ func TestEachRuleFires(t *testing.T) {
 		{"handoff run env", []edit{{specFile, "cmd: [notes-api, kit-issue], env: []", "cmd: [notes-api, kit-issue], env: [NOPE]"}}, nil, "handoffs[0].run.env[0]"},
 		{"handoff run env twice", []edit{{specFile, "cmd: [notes-api, kit-issue], env: []", "cmd: [notes-api, kit-issue], env: [ADMIN_EMAIL, ADMIN_EMAIL]"}}, nil, "is listed twice"},
 		{"handoff check image", []edit{{specFile, "check: { image: api,", "check: { image: nope,"}}, nil, "handoffs[0].check.image"},
+		{"schema compat env missing", []edit{{specFile, "    env: []                                                    # it reads no input, secret or safe default\n", ""}}, nil, "database.schema_compat: env is required: the keys of the inputs, secrets and safe defaults the command reads ([] for none)"},
+		{"schema compat env not recorded", []edit{{specFile, "    env: []                                                    # it reads", "    env: [ADMIN_EMAIL, API_URL]                                # it reads"}}, nil, "database.schema_compat.env[1]: API_URL is no input, secret or safe default (the URLs and the values Stowage provides it receives without asking)"},
+		{"schema compat env twice", []edit{{specFile, "    env: []                                                    # it reads", "    env: [ADMIN_EMAIL, ADMIN_EMAIL]                            # it reads"}}, nil, "database.schema_compat: env: ADMIN_EMAIL is listed twice"},
+		{"health command env missing", []edit{{specFile, "  provider: http-status\n  service: api\n  port: 8000\n  path: /healthz/ready\n  expect: 200\n", "  provider: command\n  image: api\n  cmd: [notes-api, ready]\n"}}, nil, "health: env is required"},
+		{"health command env not recorded", []edit{{specFile, "  provider: http-status\n  service: api\n  port: 8000\n  path: /healthz/ready\n  expect: 200\n", "  provider: command\n  image: api\n  cmd: [notes-api, ready]\n  env: [SESSION_SECRET, NOPE]\n"}}, nil, "health.env[1]: NOPE is no input, secret or safe default"},
+		{"backup command env not recorded", []edit{{specFile, "  provider: pg-age-rclone\n  profiles: { full: all }\n  volumes: [uploads]", "  provider: command\n  image: api\n  cmd: [notes-api, backup]\n  env: [NOPE]\n"}}, nil, "backup.env[0]: NOPE is no input, secret or safe default"},
 		{"handoff gives nothing", []edit{{specFile, "    gives: [ADMIN_EMAIL]\n", ""}}, nil, "handoffs[0].gives"},
 		{"handoff gives what it asks", []edit{{specFile, "gives: [ADMIN_EMAIL]", "gives: [SITE_ADMIN]"}}, nil, "is what the handoff asks"},
 		{"handoff gives the install's", []edit{{specFile, "gives: [ADMIN_EMAIL]", "gives: [STOWAGE_X]"}}, nil, "is not a key a step's stdout may give"},
@@ -1583,6 +1589,45 @@ func TestInputOnlyTheHookReads(t *testing.T) {
 	testutil.Edit(t, root, specFile, "cmd: [handoff.py, check], env: []", "cmd: [handoff.py, check], env: [ADMIN_EMAIL]")
 	if res := run(t, root); warned(res) {
 		t.Fatal("warned while the handoff's check lists it")
+	}
+}
+
+// An input a `command` provider's env lists is read, as the hook's: the schema-compat's and the
+// health's, and nothing else reads it.
+func TestInputOnlyACommandReads(t *testing.T) {
+	t.Parallel()
+	const unread = "PROBE_TOKEN is asked but read by no compose service and no hook"
+	type edit struct{ file, old, new string }
+	warned := func(res *Result) bool {
+		for _, f := range res.Findings {
+			if f.Severity == Warning && strings.Contains(f.Message, unread) {
+				return true
+			}
+		}
+		return false
+	}
+	input := []edit{{specFile, "  - { key: ADMIN_EMAIL,", "  - { key: PROBE_TOKEN, prompt: \"The probe's token\", required: true }\n  - { key: ADMIN_EMAIL,"}}
+	schemaEnv := "    env: []                                                    # it reads"
+	health := "  provider: http-status\n  service: api\n  port: 8000\n  path: /healthz/ready\n  expect: 200\n"
+	backup := "  provider: pg-age-rclone\n  profiles: { full: all }\n  volumes: [uploads]"
+	for name, c := range map[string]struct {
+		edits []edit
+		warn  bool
+		errs  int // the backup command's: none runs on the kairos shape's VM
+	}{
+		"none":   {input, true, 0},
+		"schema": {append(slices.Clone(input), edit{specFile, schemaEnv, "    env: [PROBE_TOKEN]                                         # it reads"}), false, 0},
+		"health": {append(slices.Clone(input), edit{specFile, health, "  provider: command\n  image: api\n  cmd: [notes-api, ready]\n  env: [PROBE_TOKEN]\n"}), false, 0},
+		// A backup command is validated, never run: its env reads nothing.
+		"backup": {append(slices.Clone(input), edit{specFile, backup, "  provider: command\n  image: api\n  cmd: [notes-api, backup]\n  env: [PROBE_TOKEN]\n"}), true, 1},
+	} {
+		root := testutil.CopyExample(t, "minimal")
+		for _, e := range c.edits {
+			testutil.Edit(t, root, e.file, e.old, e.new)
+		}
+		if res := run(t, root); warned(res) != c.warn || res.Errors() != c.errs {
+			t.Errorf("%s: warned %v, want %v: %+v", name, !c.warn, c.warn, res.Findings)
+		}
 	}
 }
 

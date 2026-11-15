@@ -13,8 +13,8 @@
 # provisions again as first installed. The stand-in API keeps its migration
 # number in its uploads volume (examples/minimal/api/notes-api). Then a site without internet:
 # `notes-stow mirror export` writes 3.0.0 to one file, `mirror import` pushes it into a TLS mirror of
-# its own CA, a second install pulls from the mirror (--registry, --registry-ca) and `upgrade
-# --version` reads it, trusting the CA the install recorded. Along the way, the machine interface:
+# its own CA that reads nothing anonymously, a second install pulls from the mirror with its own
+# login (--registry, --registry-ca, --registry-login-file) and `upgrade --version` reads it, trusting the CA the install recorded. Along the way, the machine interface:
 # `describe --json`; `status --json` before the install and after each change; `--json` on the
 # install, upgrade, rollback and the mirror install's uninstall; the refusals exiting 3.
 set -euo pipefail
@@ -280,6 +280,7 @@ if docker exec "$(api)" test -e /data/uploads/marker; then fail "the uploads vol
 [[ $(sha256sum "$D/.env") == "$sum" ]] || fail "reset-db changed .env"
 
 step "mirror: export 3.0.0, import it into a TLS mirror of its own CA"
+MIRROR_SIGN_IN=1 # the mirror reads nothing anonymously: the site's install reads it with its own login
 start_mirror
 "${CTL[@]}" mirror export --output "$WORK/notes.oci.tar" >"$WORK/export.txt" 2>"$WORK/export.log" || { cat "$WORK/export.log"; fail "mirror export"; }
 grep -q "^Exported notes 3.0.0 (revision 1, .*) to $WORK/notes.oci.tar" "$WORK/export.txt" || { cat "$WORK/export.txt"; fail "export did not report"; }
@@ -294,14 +295,19 @@ grep -q "^Imported $WORK/notes.oci.tar into $SITE" "$WORK/import.txt" || { cat "
 tag=$(sed -n 's/^Exported notes 3.0.0 (revision 1, \([^)]*\)).*/\1/p' "$WORK/export.txt")
 [[ $(mirror_referrers site/notes/notes-api "$tag") -ge 1 ]] || fail "the api image's signature did not reach the mirror"
 
-step "an install from the mirror; upgrade --version reads it with the recorded CA"
+step "an install from the mirror with its own login; upgrade --version reads it with the recorded CA"
 D1=$D D=$WORK/stowage-e2e-site APP1=$APP_PORT API1=$API_PORT
 APP_PORT=$(free_port)
 API_PORT=$(free_port)
 CLEANUP+=('D=$WORK/stowage-e2e-site remove_install' "docker images --format '{{.Repository}}@{{.Digest}}' | grep -F '$SITE/' | xargs -r docker rmi >/dev/null 2>&1")
 "${OPERATOR[@]}" "$D1/notes-stow" --no-input --dir "$D" --ports "app=$APP_PORT,api=$API_PORT" --set ADMIN_EMAIL=admin@notes.test \
-	--registry "$SITE" --registry-ca "$MIRROR_CA" >"$WORK/install-site.log" 2>&1 || { cat "$WORK/install-site.log"; fail "install from the mirror"; }
+	--registry "$SITE" --registry-ca "$MIRROR_CA" --registry-login-file "$MIRROR_VM_LOGIN" >"$WORK/install-site.log" 2>&1 || { cat "$WORK/install-site.log"; fail "install from the mirror"; }
 running 3.0.0 3
+# The login is recorded beside the install, its owner's alone, and shown by its host, never its secret.
+[[ $(stat -c %a "$D.registry-login.json") == 600 ]] || fail "the install's login is not recorded 0600 beside it"
+"${OPERATOR[@]}" "$D/notes-stow" status --dir "$D" >"$WORK/status-site.txt" 2>&1 || { cat "$WORK/status-site.txt"; fail "status of the mirror's install"; }
+grep -qx "login     held for $MIRROR" "$WORK/status-site.txt" || { cat "$WORK/status-site.txt"; fail "status does not name the login held"; }
+! grep -qF -- "$MIRROR_VM_TOKEN" "$WORK/install-site.log" "$WORK/status-site.txt" "$D/.env" || fail "the login's password was printed or recorded"
 grep -qx "STOWAGE_REGISTRY='\{0,1\}$SITE'\{0,1\}" "$D/.env" || fail "the install does not record the mirror"
 cmp -s "$D/registry-ca.pem" "$MIRROR_CA" || fail "the install does not keep the mirror's CA"
 "${OPERATOR[@]}" "$D/notes-stow" upgrade --version 3.0.0 --dir "$D" >"$WORK/site-again.log" 2>&1 || { cat "$WORK/site-again.log"; fail "upgrade --version through the mirror"; }
@@ -320,6 +326,7 @@ project=$(project)
 	{ cat "$WORK/uninstall.log" "$WORK/uninstall.json"; fail "uninstall --json"; }
 result "$WORK/uninstall.json" "done"
 [[ -z $(docker ps -aq --filter "label=com.docker.compose.project=$project") ]] || fail "uninstall left the stack's containers"
+[[ ! -e $D.registry-login.json ]] || fail "uninstall --data left the install's login"
 D=$D1 APP_PORT=$APP1 API_PORT=$API1
 
 printf '\nPASS\n'

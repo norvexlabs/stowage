@@ -344,13 +344,22 @@ JSON
 }
 
 # mirror_referrers <repo> <tag>: how many referrers (signatures) the mirror holds for the manifest a tag
-# names, read anonymously.
+# names, read anonymously, or as vm when the mirror asks for a sign-in (MIRROR_SIGN_IN).
 mirror_referrers() {
 	local d
-	d=$(curl -sfI --cacert "$MIRROR_CA" -H 'Accept: application/vnd.oci.image.manifest.v1+json, application/vnd.oci.image.index.v1+json' \
+	d=$(mirror_curl -sfI -H 'Accept: application/vnd.oci.image.manifest.v1+json, application/vnd.oci.image.index.v1+json' \
 		"https://$MIRROR/v2/$1/manifests/$2" | tr -d '\r' | sed -n 's/^[Dd]ocker-[Cc]ontent-[Dd]igest: //p')
 	[[ -n $d ]] || { echo 0; return; }
-	curl -sf --cacert "$MIRROR_CA" "https://$MIRROR/v2/$1/referrers/$d" | python3 -c 'import json,sys; print(len(json.load(sys.stdin).get("manifests") or []))'
+	mirror_curl -sf "https://$MIRROR/v2/$1/referrers/$d" | python3 -c 'import json,sys; print(len(json.load(sys.stdin).get("manifests") or []))'
+}
+# mirror_curl <curl args>: curl trusting the mirror's CA, signed in as vm when the mirror asks for
+# it; the password reaches curl on its standard input, never on a command line.
+mirror_curl() {
+	if [[ -n ${MIRROR_SIGN_IN:-} ]]; then
+		printf 'user = "vm:%s"\n' "$MIRROR_VM_TOKEN" | curl -K - --cacert "$MIRROR_CA" "$@"
+	else
+		curl --cacert "$MIRROR_CA" "$@"
+	fi
 }
 
 # new_project <postgres ref>: examples/minimal pinned to $STOWAGE, publishing to zot with the token accounts, its

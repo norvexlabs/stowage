@@ -54,6 +54,7 @@ database:
     provider: command
     image: api                                                 # runs inside the api image
     cmd: [notes-api, schema-compat]                            # JSON stdin/stdout contract
+    env: []                                                    # it reads no input, secret or safe default
 
 data:
   volumes:

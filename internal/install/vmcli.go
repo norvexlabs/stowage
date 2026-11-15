@@ -162,6 +162,7 @@ func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(
 			}
 			in.O.Prompt = prompt
 			in.O.Cert, in.O.Key, in.O.CA, in.O.ClientCA = expandHome(in.O.Cert), expandHome(in.O.Key), expandHome(in.O.CA), expandHome(in.O.ClientCA)
+			in.O.ACMECARoot = expandHome(in.O.ACMECARoot)
 			if err := in.Install(cmd.Context()); err != nil {
 				return err
 			}
@@ -185,6 +186,7 @@ func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(
 	if len(clientAuthRoutes(r.Spec)) > 0 {
 		f.StringVar(&o.ClientCA, "client-ca", "", "the CA, PEM, the client certificates of the routes with client_auth chain to, copied into the install (on an installed VM, replaces it; none removes it)")
 	}
+	acmeCAFlags(f, r.Spec, &o, "an installed VM's re-run")
 	f.IntVar(&o.HTTPPort, "http-port", 0, "the host port a TLS front serves HTTP on (default the project's front.http_port, else 80; on an installed VM, changes it)")
 	f.IntVar(&o.HTTPSPort, "https-port", 0, "the host port a TLS front serves HTTPS on (default the project's front.https_port, else 443; on an installed VM, changes it)")
 	f.StringVar(&o.Channel, "channel", "", "the channel `updates` and `upgrade` follow")
@@ -1032,7 +1034,7 @@ func (c *hostClient) status(ctx context.Context, asJSON, values bool) error {
 		}
 	}
 	if st.RegistryLogin != "" {
-		fmt.Fprintf(c.out, "login      held for the mirror %s\n", st.RegistryLogin)
+		fmt.Fprintf(c.out, "login      held for %s\n", st.RegistryLogin)
 	}
 	if st.RegistryLoginError != "" {
 		fmt.Fprintf(c.out, "login      unreadable: %s\n", st.RegistryLoginError)

@@ -19,10 +19,12 @@ again, to copy an installer to another host.
           [--tls acme|dns-cloudflare|byo|internal] [--domains route=host,…] # TLS mode
           [--cert FILE --key FILE [--ca FILE]] [--http-port N] [--https-port N]
           [--client-ca FILE|none]                                          # routes with client_auth
+          [--acme-ca URL|none [--acme-ca-root FILE|none]]                  # acme, dns-cloudflare: another ACME CA
           [--ipv6[=false]]                                                 # IPv6 on the stack's network
           [--tune-profile default|network|release]                         # over the release's tune.profile
           [--interface ROLE=NIC]…                                          # this host's NIC of a host.interfaces role
           [--secrets FILE|-]                                               # a machine made again
+          [--registry-login-file FILE|-]                                   # this install's own registry login
           [--json]                                                         # the result as one object, for a program
 <short>-stow status [--json [--values]] [--dir D]                         # --json: one object, for a program; --values adds the recorded values
 <short>-stow describe [--json]                                           # what the release offers, read with no install
@@ -32,6 +34,7 @@ again, to copy an installer to another host.
 <short>-stow exec [--stdin] SERVICE [--dir D] -- COMMAND [ARG…]          # in the running container; its exit status
 <short>-stow schema [--after N] [--json] [--dir D]                        # the database's migration, the kept release's, the barriers after it
 <short>-stow uninstall [--data] [--yes] [--no-input] [--accessible] [--dry-run] [--json] [--dir D]
+<short>-stow registry-login FILE|-|--remove [--dir D]                     # record or remove this install's own registry login
 <short>-stow secrets export --recipient AGE_KEY… [-o FILE|-] [--dir D]   # the secrets, encrypted
 <short>-stow secrets rotate KEY [--stage | --finish] [--dir D]           # a secret with rotation: true
 <short>-stow secrets set KEY [--accessible] [--dir D] < value            # a secret with settable: true; asked, unechoed, on a terminal
@@ -135,8 +138,8 @@ again, to copy an installer to another host.
   so is the flag on the VM, which names its NICs by their roles (`vm create --interface`).
 - `--registry PREFIX` pulls the images from a mirror holding the same `<name>-<key>`
   repositories (and `<name>-release` and `<name>-installer`, which `upgrade --version` reads
-  there). The project's pull account is never sent there: the pulls use the operator's own
-  `docker login`.
+  there). The project's pull account is never sent there: the pulls use the install's own login
+  for the mirror's host (`--registry-login-file`), else the operator's own `docker login`.
 - `--registry-ca FILE` is a PEM file of the certificate authority the registry's certificate
   chains to — a mirror's own CA (certificates only: a file holding a private key, or nothing
   else, is refused, before anything is written). The installer's own reads (`upgrade
@@ -156,6 +159,35 @@ again, to copy an installer to another host.
   or rootless Docker (`~/.config/docker/certs.d`) needs the file put there by hand.
   `--registry` and `--registry-ca` are recorded at the first install: a re-run given either is
   refused.
+- `--registry-login-file FILE` (`-` for standard input, which no other flag of the run may name;
+  an empty value is refused) gives the install its own registry login: a Docker config holding one
+  `auths` entry, `{"auths": {"HOST": {"auth": "BASE64(USER:PASSWORD)"}}}` (or `username` and
+  `password` for `auth`; a credential store's login is not in a file and is refused), at most a
+  few KiB, for the host of the release's own registry or of the install's mirror (`--registry`, or
+  the one recorded); another host, or a file that does not read, is refused before anything is
+  written, its error never quoting the file. The operator mints one per install in the registry:
+  revoking one install's login leaves every other install pulling. It is recorded beside the
+  install directory as `<dir>.registry-login.json` (0600, its owner's alone; outside the directory,
+  so `upgrade` and `rollback`, which move the install's state, keep it) before anything is pulled;
+  a re-run with the flag replaces it, one without keeps it, `--dry-run` writes none, and a run
+  (a first install or a re-run) that fails before the images are fetched with it puts the login
+  held before back (0600; `the run failed: the login held before it is restored in …`), or removes
+  the one it wrote where none was held; one that fails after keeps the new login, which pulled
+  (`the run failed after the images were fetched with the login it recorded: the login stays`). The install's reads of that host take it: the
+  pulls (through the same private Docker config as the pull account), `upgrade --version`,
+  `updates` and the release reads. On the release's own registry the account a read takes is, in
+  order: the password the pull account's variable (`token_env`) gives this run, then the login
+  held, then the account baked into the installer — an install without a login keeps pulling with
+  the baked one. On a mirror it is the login held for the mirror's host, never the pull account;
+  a login is never sent to another host. `registry-login FILE|-` records one on an install that
+  exists (replacing the one held; a directory holding no install is refused, its first install
+  taking the flag), `--remove` removes it (the release's own registry then reads with the pull
+  account again, a mirror without a login); it runs as the install's owner, as the other verbs.
+  `status` prints `login     held for HOST` (`login     unreadable: …` naming the file and the fix
+  when it does not read, the reads of that host then failing), `status --json` `registry_login`;
+  never the login itself, which no log, output or `.env` holds. `secrets export` does not carry
+  it: it is the operator's credential for this machine, given again to a machine made again.
+  `uninstall --data` deletes it with the directory; `uninstall` keeps it.
 - `--answers FILE` is a YAML map, `KEY: value`; a file input's also `KEY: {file: PATH}` (see "File inputs"), the path relative to the answers file.
   Its reserved `tls` section gives the front's TLS settings to an install or its re-run, on Docker and on the VM, as `--tls`, `--cert`, `--key`, `--ca` and `--client-ca` do, a flag winning over the file:
   `tls: { mode: byo, cert: front.crt, key: front.key, ca: root.pem, client_ca: root.pem }`, every field optional, a relative path relative to the answers file (no `~`, as `{file: PATH}`), and `none` for `ca` or `client_ca` the flags' word (`./none` is a file). A flag wins whole: `--cert` or `--key` replaces the section's `mode`, `cert`, `key` and `ca`; `--tls` with a mode other than `byo` replaces `mode` and leaves out `cert`, `key` and `ca`; `--domains` replaces a section's `mode: none` (loopback serves no domain); `--ca` and `--client-ca` replace only their own. The run logs which flags the section stands in for, as a later check names those flags (`the tls section of FILE gives --tls, --cert`), and which fields a flag left out; a file left out need not exist. The flags' checks apply unchanged, so a re-run given the section replaces the certificate as `--cert` and `--key` do; left out, a re-run keeps what the install recorded. A re-run that reads a new certificate refuses a domain `--domains` or `--set` gives that is no domain name before it reads the files, as a first install does (`--domains <route>: "<v>" is not a domain name …`, `KEY: …`).
@@ -271,6 +303,7 @@ again, to copy an installer to another host.
   - the files Stowage adds: `stowage-front.yaml` and `stowage-front.Caddyfile` (the front; without
     one, the first carries the L4 ports and the host API alone and the second is a comment),
     `stowage-front-client-ca/ca.pem` (the client CA `--client-ca` gave),
+    `stowage-front-acme-ca/root.pem` (the ACME CA's root `--acme-ca-root` gave),
     `stowage-content.yaml`, `stowage-provision.yaml`, `stowage-schema.yaml`.
     `stowage-content.yaml` labels each service that mounts a compose `configs:` entry with inline
     `content:` or a `secrets:` entry from an `environment:` variable with an HMAC-SHA256 of what
@@ -679,7 +712,8 @@ again, to copy an installer to another host.
   one of another project, an unknown field, over 1 MiB, a `front_ca` whose certificate is not a
   CA's or whose key is not its own, and `--secrets` on an install that
   exists (it keeps its own). A key that is no secret of the release is left out, and said.
-  Docker and the Kairos VM; on Kubernetes, not yet.
+  Docker and the Kairos VM; on Kubernetes, `k8s secrets export` writes the same file and `k8s
+  install --secrets` takes it (see [kubernetes](kubernetes.md)), so a file restores on any shape.
 - `secrets rotate KEY` replaces a generated secret whose spec entry has `rotation: true` (any
   other is refused, naming the ones that have it), in three passes, each recorded in `.env` and
   followed by the stack brought up again (the services reading a changed value are recreated)
@@ -786,7 +820,7 @@ again, to copy an installer to another host.
   paths besides its volume `stowage-front-data` and the published CA's; it binds 80 and 443 in its
   container as its network namespace lets any user (`net.ipv4.ip_unprivileged_port_start: 0`, as
   Docker's engines set by default). It mounts nothing of the install directory but
-  `stowage-front-client-ca/` (0755, its `ca.pem` 0644, whatever the umask): it reads its
+  `stowage-front-client-ca/` and `stowage-front-acme-ca/` (each 0755, its file 0644, whatever the umask): it reads its
   configuration and a `byo` certificate from its own volume, where each start copies them. Each
   start, before the stack's containers are made when the front's volumes are there and no volume
   awaits its uid (after, when one is not, `up --no-start` making it, or after the volumes are
@@ -1097,13 +1131,14 @@ again, to copy an installer to another host.
   file input read as text: as a route's domain, allowlist, forward auth or basic auth, an L4 route's
   or a service's address or bind, a set, a table's input, an extension's,
   or in another input's `default`. Reading `STOWAGE_INPUT_FILE_<KEY>` counts as reading the input.
-  A provision hook's `env`, and a handoff step's (see [kits](kits.md)), may name a file input: its container gets the file read-only at
+  A provision hook's `env`, a handoff step's (see [kits](kits.md)) and a `command` provider's (`health`, `database.schema_compat`) may name a file input: its container gets the file read-only at
   `/run/stowage/inputs/<KEY>` and `STOWAGE_INPUT_FILE_<KEY>` holding that path, never the recorded
   value (these are the hook's only mounts). The file is empty while the input is, so a hook tests
   its size; `provision` writes it first, as no start did. `provision --set` refuses a file input,
   whatever reads it (`--set: KEY is a file input`), naming the re-run that changes it:
   `--set-file KEY=PATH` or, for an optional one, `--set KEY=` (on the VM, `sudo <short>-stow install`). On Kubernetes the hook's Job gets the same: the file read-only at `/run/stowage/inputs/<KEY>`, from the Secret below, and the variable holding that path; a hook cannot return that variable. A `command`
-  provider's container gets neither on any shape.
+  provider's container (Docker and the VM, where it runs) gets the file when its `env` lists the
+  input, written first when no start wrote it, and nothing of the input when it does not.
   On Kubernetes a file input is asked as on Docker, with `--set-file` on `k8s install` and, for an input the release adds, `k8s upgrade` (`--set-file` passes on with `upgrade --version`, and an installer made before it refuses it as unknown). The release's Secret records its value as above, and the Secret `<release>-stowage-files` (labelled, applied server-side beside it, one of that name another tool wrote never written over) holds its content under its key, an empty file while the input is empty, for the chart to mount from `.Values.stowage.files`. A release with no file input writes no such Secret, gives `files: ""` on every deploy and leaves one of that name another tool wrote alone. A key no input declares any more stays with what it holds until `k8s uninstall` deletes the Secret (in every case, as the release's Secret brings it back): the release a rollback or a failed upgrade leaves running mounts it. So the content of a dropped file input, a secret one's too, stays in that Secret until then; `kubectl delete secret` before the next deploy clears it. A release declaring that input again asks it, as any input it adds; left empty, its file is emptied, logged (`input KEY: nothing recorded, so its file in the Secret <release>-stowage-files is emptied`). An `upgrade`, or `install` over a kept Secret, is refused when a value it keeps is one the release cannot read (the message above; an install given the key replaces it). `--given` replaces a value of the right form this release's checks refuse, and on an upgrade never changes its form, text to file or back, as the release a rollback brings back reads it too. An upgrade asks a required file input recorded empty, and restarts what reads it. `k8s reset-db --new-baseline` takes `--set-file` for a file input the release adds; without `--new-baseline` it refuses the flag. A hook whose `env` names a file input no longer asked on Kubernetes gets neither its file nor its value.
 - Secrets delivered as files (`as_file: true` on a `secrets[]` entry, or on an input with `secret:
   true`): the value is recorded as any other, but a service reads it from a file, never from a
@@ -1123,13 +1158,12 @@ again, to copy an installer to another host.
   (as_file: true), never as a variable: mount ${STOWAGE_SECRET_FILE_KEY}`), `as_file` on an input
   that is no secret or is a file input already, on a secret that rotates (its passes hand the
   services `KEY_NEXT` and `KEY_PREVIOUS` as variables beside it). A provision hook's `env`, and a
-  handoff step's (see [kits](kits.md)), may name one: its container gets the file read-only at
+  handoff step's (see [kits](kits.md)), and a `command` provider's, may name one: its container gets the file read-only at
   `/run/stowage/inputs/<KEY>` and `STOWAGE_SECRET_FILE_<KEY>` holding that path, never the
   variable, on every shape. `provision` (and a handoff's step) refuses an install whose `.env` no
   longer holds `STOWAGE_FILE_SALT`, naming the `install` re-run that records it, and on
-  Kubernetes a listed key the release's Secrets do not hold, naming it and `k8s install`. A `command` provider's container receives it as a variable, as it
-  receives every recorded value: that is the `command` contract, and its image is the project's
-  own tool, not a service. On Kubernetes the value is written to the Secret
+  Kubernetes a listed key the release's Secrets do not hold, naming it and `k8s install`; a
+  `command` provider's run is refused the same way without the salt. On Kubernetes the value is written to the Secret
   `<release>-stowage-secret-files` (labelled, applied server-side, one of that name another tool
   wrote never written over), never to `<release>-stowage` (one that Secret already holds, from a
   release that read it as a variable, stays there with its value, as that release reads it after
@@ -1181,7 +1215,7 @@ again, to copy an installer to another host.
   `tls/`, and a mismatched certificate and key re-open their form, saying why. A route's domain is its `domain_input`, an input like any other
   (`--domains route=host` is the shorthand, an L4 route with `tls` among the routes it names); giving one picks TLS: `acme`, or the project's
   first HTTPS mode when it does not offer `acme`, unless `--tls` says otherwise. Domains are lowercase DNS names, one per `domain_input` (asked once for the routes sharing it; `--domains` giving those routes two values is refused). Safe defaults stay safe. One
-  certificate source per mode, never a fallback: `acme` (Let's Encrypt alone, HTTP-01 or
+  certificate source per mode, never a fallback: `acme` (Let's Encrypt alone, or the CA `--acme-ca` names, below; HTTP-01 or
   TLS-ALPN, so ports 80 and 443 must reach the host — with moved ports, a run says to forward
   them, and that IPv6 forwards no port: a domain whose AAAA record names the host is reached on
   80 and 443 themselves; `STOWAGE_ACME_EMAIL`, optional, is checked
@@ -1193,13 +1227,36 @@ again, to copy an installer to another host.
   before it), `internal` (Caddy's local CA; its root is
   `/data/caddy/pki/authorities/local/root.crt` in the front; `secrets export` carries it and its
   key, so a machine made again with `--secrets` keeps the root). `dns-cloudflare`
-  (Let's Encrypt alone, DNS-01 through Cloudflare, so no port needs to reach the host for
+  (Let's Encrypt alone, or the CA `--acme-ca` names; DNS-01 through Cloudflare, so no port needs to reach the host for
   issuance; `STOWAGE_ACME_EMAIL` as with `acme`; `STOWAGE_CLOUDFLARE_API_TOKEN`, required and
   secret, a token with Zone DNS Edit on each domain's zone, in the form Cloudflare issues — 35 to
   50 letters, digits, `-` or `_`, or `cfut_` / `cfat_` and at least 32 more — recorded in `.env`
   and given to the front's container as `CLOUDFLARE_API_TOKEN`; the project's services and the
   provision hook are not given it, though a stack that reads `.env` itself — an `env_file` or a
   mount of the install directory — sees it like every recorded value). HSTS is sent except with `internal`.
+  **Another ACME CA** (`acme` and `dns-cloudflare` alone): `--acme-ca URL` gives the ACME
+  directory the front's certificates come from instead of Let's Encrypt's — a private CA's
+  (step-ca, Pebble), another public one's — and `--acme-ca-root FILE` the root, PEM CA
+  certificates alone, that directory's own TLS chains to, for a CA this host's system trust would
+  not verify (given, it is the only root the front trusts that directory with). The URL is an
+  `https://` URL with a host and no user, without a space, a quote, a brace, a backslash or a `#`
+  (`--acme-ca <url>: is not an https URL …`); it is recorded as `STOWAGE_ACME_CA` in `.env` (a
+  value Stowage keeps, which the compose file cannot read) and written into the Caddyfile's global
+  options as `acme_ca <url>`, the root copied (its certificates alone) into
+  `<dir>/stowage-front-acme-ca/root.pem` (0644, the directory 0755), mounted read-only into the
+  front at `/etc/caddy/acme-ca/` and named `acme_ca_root /etc/caddy/acme-ca/root.pem`; both enter
+  the front's configuration digest, so a change recreates it. Both are refused in another mode
+  (`--acme-ca is for --tls acme or dns-cloudflare, not <mode>`), a root with neither `--acme-ca`
+  given nor one recorded (`--acme-ca-root is the root of --acme-ca's directory, and this install
+  uses Let's Encrypt's: give --acme-ca URL with it`), a root with `--acme-ca none`, and a root that
+  is unreadable, holds no PEM certificate, text after its certificates, a key or a certificate
+  that is no CA. A re-run keeps both, each change logged (`changing STOWAGE_ACME_CA: <was> →
+  <url>`); a re-run's `--acme-ca-root FILE` replaces the root; `--acme-ca-root none` removes it;
+  a new `--acme-ca` given without `--acme-ca-root` removes the root, which belongs to the CA it was
+  given with; `--acme-ca none` goes back to Let's Encrypt, its root removed; a move to `byo` or
+  `internal` removes both. `status --json --values` shows the URL (`acme_ca`). On the VM the
+  install's re-run takes them as on Docker (`sudo <short>-stow install --acme-ca URL
+  --acme-ca-root FILE`); `vm create` does not.
 
 **Backups, restore and the disk-pressure watch on Docker.** The VM's host daemon's code runs in
 the Docker installer's process for one command (no daemon stays): run by the installer the install

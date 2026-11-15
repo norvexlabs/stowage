@@ -1547,6 +1547,8 @@ func (l *linter) healthAndDatabase() {
 	svc, err := providers.Health(l.s.Health, l.s.Images)
 	if err != nil {
 		l.errf("health", "%v", err)
+	} else {
+		l.commandEnv("health", &l.s.Health)
 	}
 	l.service("health.service", svc)
 	if !l.s.HasDatabase() {
@@ -1568,6 +1570,8 @@ func (l *linter) healthAndDatabase() {
 	}
 	if err := providers.SchemaCompat(d.SchemaCompat, l.s.Images); err != nil {
 		l.errf("database.schema_compat", "%v", err)
+	} else {
+		l.commandEnv("database.schema_compat", &d.SchemaCompat)
 	}
 }
 
@@ -1953,8 +1957,8 @@ func (l *linter) profileInput(w string, in spec.Input) {
 var composeProfile = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]*$`)
 
 // readInputs reports whether something reads an input: a compose service, a route of the front,
-// the provision hook's env or a handoff step's; one asked on Kubernetes only is the chart's, taken
-// as read.
+// the env of the provision hook, of a `command` provider (a backup's aside) or of a handoff
+// step; one asked on Kubernetes only is the chart's, taken as read.
 func (l *linter) readInputs() func(spec.Input) bool {
 	inCompose := map[string]bool{}
 	for _, v := range l.compose.Vars {
@@ -1964,6 +1968,18 @@ func (l *linter) readInputs() func(spec.Input) bool {
 	// The provision hook reads the keys its env lists.
 	if h, err := providers.DecodeProvision(l.s.Short(), l.s.Hooks.Provision, l.s.Images); err == nil {
 		for _, k := range h.Keys() {
+			inCompose[k] = true
+		}
+	}
+	// A `command` provider reads the keys its env lists; a `command` backup is validated only, as
+	// nothing runs it.
+	cmds := []*spec.Provider{&l.s.Health}
+	if l.s.HasDatabase() {
+		d := l.s.DB()
+		cmds = append(cmds, &d.SchemaCompat)
+	}
+	for _, p := range cmds {
+		for _, k := range commandKeys(p, l.s.Images) {
 			inCompose[k] = true
 		}
 	}
@@ -2121,6 +2137,8 @@ func (l *linter) hooks() {
 		l.errf("backup", "%v", err)
 	} else if pg, err := providers.DecodeBackup(l.s.Backup); err == nil {
 		l.backupVolumes(pg.Volumes)
+	} else {
+		l.commandEnv("backup", l.s.Backup)
 	}
 }
 
@@ -2157,6 +2175,29 @@ func (l *linter) backupVolumes(vols []string) {
 // hookEnv checks that each key the provision hook's env lists is one the install records (an
 // input, a secret or a safe default).
 func (l *linter) hookEnv(h *providers.ProvisionHook) {
+	l.recordedKeys("hooks.provision.env", h.Keys(), "the URLs and what the hook returned before it receives without asking")
+}
+
+// commandEnv checks the env of p, when it is a `command` provider decoded (a refusal of its
+// decode is its concern's), at w as the hook's (recordedKeys).
+func (l *linter) commandEnv(w string, p *spec.Provider) {
+	l.recordedKeys(w+".env", commandKeys(p, l.s.Images), "the URLs and the values Stowage provides it receives without asking")
+}
+
+// commandKeys are the keys the env of p lists when it is a `command` provider that decodes
+// (providers.DecodeCommand, whose check's refusal is its concern's).
+func commandKeys(p *spec.Provider, images map[string]spec.Image) []string {
+	if p == nil || p.Name != "command" {
+		return nil
+	}
+	c, _ := providers.DecodeCommand(*p, images)
+	return c.Keys()
+}
+
+// recordedKeys checks that each of keys, the env at w of a container Stowage runs with the
+// install's values, is one the install records (an input, a secret or a safe default); given
+// names what that container receives without listing it.
+func (l *linter) recordedKeys(w string, keys []string, given string) {
 	known := map[string]bool{}
 	for _, i := range l.s.Inputs {
 		known[i.Key] = true
@@ -2167,9 +2208,9 @@ func (l *linter) hookEnv(h *providers.ProvisionHook) {
 	for k := range l.s.SafeDefaults {
 		known[k] = true
 	}
-	for i, k := range h.Keys() {
+	for i, k := range keys {
 		if !known[k] {
-			l.errf(fmt.Sprintf("hooks.provision.env[%d]", i), "%s is no input, secret or safe default (the URLs and what the hook returned before it receives without asking)", k)
+			l.errf(fmt.Sprintf("%s[%d]", w, i), "%s is no input, secret or safe default (%s)", k, given)
 		}
 	}
 }

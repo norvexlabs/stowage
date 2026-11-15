@@ -56,6 +56,17 @@ its part to the byte (rounded up), and none is less than 64 MiB.
   where `STOWAGE_MEM_LIMIT_MB` is unset — on Kubernetes (the pod's `resources.limits.memory`), on
   Docker Desktop, and for a service no share names but whose compose file sets a limit.
 
+**The deploy shape** (`STOWAGE_SHAPE`). At each start on Docker and the VM, every service's
+container is given `STOWAGE_SHAPE`: `docker` on a Docker host, `kairos` on the VM. On the VM every
+process but the OS is the stack's, so a service judging memory pressure may read the host's
+(`/proc/meminfo`); on a Docker host, shared with whatever else runs there, its own cgroup is the
+signal. Stowage writes nothing into a chart's pods: a chart whose services read it sets
+`STOWAGE_SHAPE: kubernetes` in their `env` itself (a chart runs on Kubernetes alone). Like the
+sizing variables it is in the container's environment, not the compose file's
+(`$${STOWAGE_SHAPE}` in a command), and Stowage's value wins over one the compose file sets.
+Adding it changes each service's `stowage-content.yaml` entry, so the first start of a Stowage
+that gives it recreates each service once.
+
 **Whole cores** (`services.<name>.cpus`). At each start (Docker and the VM, not Docker Desktop) a
 service given `cpus: N` runs on N whole cores of its own: its `cpuset` in `stowage-content.yaml`,
 the count of its CPUs (the cores' SMT threads) in `STOWAGE_CPUS`. The cores are read from sysfs

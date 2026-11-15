@@ -120,7 +120,7 @@ in the same installer (bootstrap it as above, then `sh <name>.sh vm create …`,
   bytes (decompressed: what a hypervisor imports) and `disk_gib`; left out otherwise.
   `await_secrets` (`--await-secrets`) and `await_tls` (`--tls byo`) say what the first install
   waits for over SSH, left out when false. `registry_login` (`--registry-login-file`) is the
-  mirror's host the login is for, never the login; left out without it. `waiting` names, sorted,
+  host the login is for, never the login; left out without it. `waiting` names, sorted,
   the keys of the required secret inputs nothing gives (never a value; left out when there are
   none): the VM's first install waits for them, as `vm create` says, until they are given over
   SSH (`sudo <short>-stow install --given - --no-input`). `--platform` missing, not a platform
@@ -384,13 +384,16 @@ in the same installer (bootstrap it as above, then `sh <name>.sh vm create …`,
   PREFIX` (a mirror, checked as a repository name) the disk is read there instead, with the
   Docker client's login, and `--registry-ca FILE` (certificates only) is trusted for that read;
   the review shows the registry and the CA file.
-- **A mirror that asks for a sign-in.** `--registry-login-file FILE|-` (an empty value is refused) is the login the VM reads its
-  mirror with: a Docker config holding one `auths` entry for the mirror's host (as
+- **The VM's own registry login.** `--registry-login-file FILE|-` (an empty value is refused) is the login the VM reads its
+  registry with — a mirror that asks for a sign-in, or the release's own registry with a login
+  minted for this VM (revoking it leaves every other install pulling): a Docker config holding one
+  `auths` entry for the host of the release's own registry or of `--registry`'s mirror (as
   `registry-login` takes it, see [vm](vm.md)), checked before anything is made. It is refused
-  without `--registry` (the release's own registry is read with its pull account), for another
-  host than `--registry`'s, for a file that is not one such entry, and when the VM would boot
-  another release's disk set (its first boot reads this release's OS bundle from the mirror
-  before the login reaches it: give the mirror this release's own disks). It never enters the
+  for another host (the refusal names the hosts the VM reads), for a file that is not one such
+  entry, and when the VM would boot another release's disk set whose first boot reads this
+  release's OS bundle before the login reaches it: from the mirror the login is for (give the
+  mirror this release's own disks), or from the release's own registry when the installer carries
+  no pull account to read it with (that first boot reads with the baked account). It never enters the
   cloud-config, a log or the review: the cloud-config carries the one-time host key, and with
   OpenTofu, once the VM answers, `vm create` runs `sudo <short>-stow registry-login -` over SSH
   pinned to that key, the login on its standard input, before any install over SSH (a failure

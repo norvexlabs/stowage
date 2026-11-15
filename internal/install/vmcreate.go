@@ -131,9 +131,9 @@ type VMCreate struct {
 	// Secrets is a decrypted SecretsFile the first install takes (a machine made again): given over
 	// SSH, never in the cloud-config.
 	Secrets []byte
-	// RegistryLogin is a login file for the mirror (--registry-login-file), a Docker config
-	// holding one auths entry for its host: given over SSH once the VM answers (`registry-login
-	// -`), never in the cloud-config.
+	// RegistryLogin is a login file (--registry-login-file), a Docker config holding one auths
+	// entry for the host of the release's own registry or of the mirror: given over SSH once the
+	// VM answers (`registry-login -`), never in the cloud-config.
 	RegistryLogin []byte
 	Progress      func(done, total int64) // the disk's download; nil reports nothing
 
@@ -513,7 +513,7 @@ func (in *Installer) CreateVM(ctx context.Context, c *VMCreate) error {
 		}
 	}
 	if login != nil {
-		fmt.Fprintf(o.Out, "\nIts reads of the mirror %s take the login --registry-login-file gave, which the cloud-config never carries: once it answers, %s\n", login.Host, loginSteps(mach.User, "<address>", ctl))
+		fmt.Fprintf(o.Out, "\nIts reads of %s take the login --registry-login-file gave, which the cloud-config never carries: once it answers, %s\n", login.Host, loginSteps(mach.User, "<address>", ctl))
 		if given == nil && !st.AwaitSecrets {
 			fmt.Fprint(o.Out, seedHostKeyNote(hostKey, "<address>"))
 		}
@@ -545,10 +545,9 @@ func (in *Installer) CreateVM(ctx context.Context, c *VMCreate) error {
 	return nil
 }
 
-// createLogin checks vm create's --registry-login-file, raw (nil: none), against the mirror at
-// prefix the VM reads: its one entry must be for that host, and the VM must boot this release's
-// own disk — a first boot of another release's disk reads that release's OS from the mirror before
-// the login reaches it over SSH.
+// createLogin checks vm create's --registry-login-file, raw (nil: none), for the VM reading prefix:
+// its one entry must be for the host of the release's own registry or of the mirror, and the
+// first boot must read without it — it reaches the VM over SSH only after that boot.
 func (in *Installer) createLogin(raw []byte, prefix string) (*registryLogin, error) {
 	if raw == nil {
 		return nil, nil
@@ -560,19 +559,30 @@ func (in *Installer) createLogin(raw []byte, prefix string) (*registryLogin, err
 	if err != nil {
 		return nil, fmt.Errorf("--registry-login-file: %w", err)
 	}
-	if in.O.Registry == "" || prefix == in.R.Spec.Registry.Prefix {
-		return nil, refuse("give --registry, the mirror the login is for, or leave out --registry-login-file", "--registry-login-file is a mirror's login: the VM reads %s, the release's own registry, with its pull account", in.R.Spec.Registry.Prefix)
+	own, mirror := in.R.Spec.Registry.Prefix, ""
+	if in.O.Registry != "" && prefix != own {
+		mirror = prefix
 	}
-	if h := registryHost(prefix); !strings.EqualFold(l.Host, h) {
-		return nil, fmt.Errorf("--registry-login-file: the login is for %s, but the VM reads its mirror %s at %s: give an auths entry for %s", l.Host, prefix, h, h)
+	if err := loginReads(l.Host, own, mirror, "the VM"); err != nil {
+		return nil, fmt.Errorf("--registry-login-file: %w", err)
 	}
-	if m := in.R.Manifest; in.boot.release != m.Tag {
+	m := in.R.Manifest
+	if in.boot.release == m.Tag {
+		return &l, nil
+	}
+	// The first boot of another release's disk set reads m's OS bundle from prefix, before the
+	// login reaches the VM over SSH: with the account baked into the installer on the release's
+	// own registry, with none on a mirror.
+	switch {
+	case mirror != "" && strings.EqualFold(l.Host, registryHost(mirror)):
 		return nil, fmt.Errorf("--registry-login-file: the VM would boot %s's disk set, and its first boot reads %s's OS bundle from the mirror before the login reaches it over SSH: give the mirror %s's own disk set (`mirror export --disks`, then `mirror import`), or use a mirror that reads without a sign-in", in.boot.release, m.Tag, m.Tag)
+	case mirror == "" && in.R.Spec.Registry.Pull.Name == "token" && (in.R.Pull == nil || in.R.Pull.Password == ""):
+		return nil, fmt.Errorf("--registry-login-file: the VM would boot %s's disk set, and its first boot reads %s's OS bundle from %s before the login reaches it over SSH, with the pull account this installer does not carry: publish %s's own disk set, or use the installer of a release that carries its pull account", in.boot.release, m.Tag, prefix, m.Tag)
 	}
 	return &l, nil
 }
 
-// loginSteps tells how to give a VM its login to the mirror by hand, from the login file FILE.
+// loginSteps tells how to give a VM its login to its registry by hand, from the login file FILE.
 func loginSteps(user, addr, ctl string) string {
 	return fmt.Sprintf("ssh %s@%s sudo %s registry-login - < FILE", user, addr, ctl)
 }

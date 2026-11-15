@@ -90,7 +90,7 @@ sh notes.sh
 | **Upgrade** | operator | `upgrade --version V` fetches that release's installer, checks its signature against the keys the install trusts and brings the stack up on the new images (under a `command` version scheme, which no installer runs, another version needs `--unordered`, as does the VM's `reset-db --new-baseline --version`: [installer](docs/installer.md), [VM](docs/vm.md)) — on Docker after a `pg_dump` snapshot, on Kubernetes through Helm. `updates` says which release the channel offers after the one the install runs, signed by a key it trusts, with its changelog (or that there is none) — on Docker, on Kubernetes (`k8s updates`) and on the VM, where `upgrade` reboots into the new OS. |
 | **Roll back** | operator | `rollback` returns to the previous release — unless a migration since then is a rollback barrier your schema-compat provider reports, in which case it refuses and names it. On the VM the health gate does it alone: an upgraded boot that is not healthy in time falls back to the previous system. |
 | **Recover** | operator | On the VM: scheduled and pre-upgrade backups (`pg_dump` and the volumes the project lists, or those volumes alone for a project without a database, encrypted to age keys, uploaded with rclone to any rclone remote), `restore` into a side database swapped in once loaded whole, and a disaster recovery from exported secrets. |
-| **Disconnected sites** | operator | `mirror export` carries a release, signatures included, as one file; `mirror import` loads it into a local registry; installs and upgrades then read the mirror (`--registry`, `--registry-ca`). |
+| **Disconnected sites** | operator | `mirror export` carries a release, signatures included, as one file; `mirror import` checks its signatures with the keys `<short>-stow` trusts, then loads it into a local registry; installs and upgrades then read the mirror (`--registry`, `--registry-ca`). |
 
 ### What each shape gets
 
@@ -103,7 +103,7 @@ sh notes.sh
 | `reset-db`, `secrets rotate` | ✓ | ✓ | ✓ |
 | `secrets set` | ✓ | — | ✓ |
 | `secrets show` | ✓ | ✓ | ✓ |
-| `secrets export` | ✓ | — | ✓ |
+| `secrets export`, `install --secrets` | ✓ | ✓ | ✓ |
 | Install from a mirror | ✓ | ✓ | ✓ |
 | A failed upgrade undone on its own | — | ✓ (Helm `--wait`, rolled back when not ready) | ✓ (health gate) |
 | Scheduled encrypted backups, `restore` | ✓ (systemd timer) | — | ✓ |
@@ -186,7 +186,7 @@ a real registry, the local Docker engine, a kind cluster and a VM on TrueNAS
 | Part | Not built yet |
 |---|---|
 | Publisher | registering the cloud images on AWS, Azure and Scaleway: written, run on Google Cloud only |
-| Installer, every shape | `upgrade --reset-db` (an upgrade across a schema baseline in one run: [TODO.md](TODO.md)); a pull credential per install ([TODO.md](TODO.md)) |
+| Installer, every shape | `upgrade --reset-db` (an upgrade across a schema baseline in one run: [TODO.md](TODO.md)) |
 
 Everything the next section lists is built.
 
@@ -213,8 +213,8 @@ Every command, verb and flag is described in the reference page each line links.
 
 | Shape | Verbs | Reference |
 |---|---|---|
-| Docker | install and re-run, `status`, `describe`, `ps`, `logs`, `restart`/`stop`/`start`, `exec`, `schema`, `provision`, `updates`, `upgrade` (`--version`), `rollback`, `reset-db`, `uninstall`, `secrets export`/`rotate`/`set`/`show`, `backup`, `restore`, `disk-check`, `tune`, `script`, `audit`, `sbom export` | [docs/installer.md](docs/installer.md), [docs/host.md](docs/host.md), [docs/tuning.md](docs/tuning.md) |
-| Kubernetes | `k8s install`, `status`, `updates`, `upgrade` (`--version`), `rollback`, `reset-db`, `uninstall`, `provision`, `secrets rotate`/`show`, `tune` | [docs/kubernetes.md](docs/kubernetes.md) |
+| Docker | install and re-run, `status`, `describe`, `ps`, `logs`, `restart`/`stop`/`start`, `exec`, `schema`, `provision`, `updates`, `upgrade` (`--version`), `rollback`, `reset-db`, `uninstall`, `secrets export`/`rotate`/`set`/`show`, `backup`, `restore`, `disk-check`, `tune`, `registry-login`, `script`, `audit`, `sbom export` | [docs/installer.md](docs/installer.md), [docs/host.md](docs/host.md), [docs/tuning.md](docs/tuning.md) |
+| Kubernetes | `k8s install`, `status`, `updates`, `upgrade` (`--version`), `rollback`, `reset-db`, `uninstall`, `provision`, `secrets export`/`rotate`/`show`, `tune` | [docs/kubernetes.md](docs/kubernetes.md) |
 | Creating a VM | `vm create`, `vm seed`, `vm host-key`, `vm attach`, `vm destroy` | [docs/vm-create.md](docs/vm-create.md) |
 | On the Kairos VM | `install`, `status`, `describe`, `health`, `events`, `ps`, `logs`, `restart`/`stop`/`start`, `exec`, `provision`, `updates`, `upgrade`, `rollback`, `reset-db`, `network`, `backup`, `restore`, `secrets export`/`rotate`/`set`/`show`, `host-key`, `registry-login`, `tune`, `reboot`, `shutdown` | [docs/vm.md](docs/vm.md) |
 | Every shape | `kit create`/`check` (`k8s kit`, `vm kit`), `mirror export`/`import` | [docs/kits.md](docs/kits.md), [docs/mirror.md](docs/mirror.md) |

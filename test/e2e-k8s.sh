@@ -19,7 +19,9 @@
 # same again is a note → 1.0.0's `k8s upgrade` is refused → an upgrade that never becomes ready is
 # rolled back by helm → `k8s rollback` goes back one upgrade, to 1.0.0 → `k8s status` → `k8s
 # reset-db` deletes the release's claim, forgets what the hook returned and installs it again with
-# the same values and Secret → `k8s uninstall` is refused without --data (helm would delete the
+# the same values and Secret → `k8s secrets export` to an age key, decrypted, holds the Secret's
+# values and what the hook returned, none in the clear; a second release's `k8s install --secrets`
+# takes it, its hook waiting (labelled) until `k8s provision` → `k8s uninstall` is refused without --data (helm would delete the
 # chart's own claim), then `--data` removes the release, its Secrets, the hook's account and the
 # claim, and keeps the namespace → the previous Stowage (the latest release tag, built once from it)
 # ships 3.0.0 at schema baseline 1 and installs it; this one ships 4.0.0 at baseline 2, whose
@@ -263,6 +265,31 @@ runs 1.0.0 2
 if kubectl exec -n "$NS" deploy/notes-web -- test -e /data/marker; then fail "the uploads claim kept its data"; fi
 [[ $(kubectl get -n "$NS" secret notes-stowage -o jsonpath='{.data}') == "$secret" ]] || fail "reset-db changed the Secret"
 [[ -n $(returned) && $(returned) != "$pw" ]] || fail "reset-db did not forget what the hook returned"
+
+step "k8s secrets export to the operator's key; a second release's k8s install --secrets takes it, its hook waiting for the data"
+age_key
+ctl v1.sh k8s secrets export --recipient "$AGE_RECIPIENT" -o - >"$WORK/k8s-secrets.age" 2>"$WORK/k8s-secrets.log" || { cat "$WORK/k8s-secrets.log"; fail "k8s secrets export"; }
+"$BIN/age" -d -i "$AGE_KEY" "$WORK/k8s-secrets.age" >"$OP/secrets.yaml" || fail "the exported secrets do not decrypt with the key"
+session=$(kubectl get -n "$NS" secret notes-stowage -o jsonpath='{.data.SESSION_SECRET}' | base64 -d)
+hookpw=$(returned)
+grep -q '^ *SESSION_SECRET: ' "$OP/secrets.yaml" && grep -qF -- "$session" "$OP/secrets.yaml" || fail "the export does not hold the Secret's SESSION_SECRET"
+grep -q '^ *ADMIN_PASSWORD: ' "$OP/secrets.yaml" && grep -qF -- "$hookpw" "$OP/secrets.yaml" || fail "the export does not hold what the hook returned"
+! grep -qE '^ +ADMIN_EMAIL:|dockerconfigjson' "$OP/secrets.yaml" || fail "the export holds an input that is no secret, or the pull login"
+for v in "$session" "$hookpw"; do
+	! grep -qF -- "$v" "$WORK/k8s-secrets.age" "$WORK/k8s-secrets.log" || fail "a value is in the clear in the export or its log"
+done
+ctl v1.sh k8s install --namespace notes2 --release notes2 --secrets secrets.yaml --no-input --set ADMIN_EMAIL=admin@notes.test --timeout 3m >"$WORK/restore.log" 2>&1 ||
+	{ cat "$WORK/restore.log"; cluster_logs >&2; fail "k8s install --secrets of a second release"; }
+[[ $(kubectl get -n notes2 secret notes2-stowage -o jsonpath='{.data.SESSION_SECRET}' | base64 -d) == "$session" ]] || fail "the second release's Secret does not hold the exported SESSION_SECRET"
+[[ $(kubectl get -n notes2 secret notes2-stowage-provision -o jsonpath='{.data.ADMIN_PASSWORD}' | base64 -d) == "$hookpw" ]] || fail "the second release's outputs Secret does not hold what the hook returned"
+[[ $(kubectl get -n notes2 secret notes2-stowage-provision -o jsonpath='{.metadata.labels.stowage\.dev/restore-awaited}') == true ]] || fail "the outputs Secret is not marked as awaiting a backup"
+grep -qF 'not provisioned: the provision hook' "$WORK/restore.log" || { cat "$WORK/restore.log"; fail "the install with --secrets ran the hook on an empty database"; }
+! grep -qF -- "$session" "$WORK/restore.log" || fail "the install with --secrets logged a value"
+ctl v1.sh k8s provision --namespace notes2 --release notes2 >"$WORK/restore-prov.log" 2>&1 || { cat "$WORK/restore-prov.log"; cluster_logs >&2; fail "k8s provision after the restore"; }
+[[ -z $(kubectl get -n notes2 secret notes2-stowage-provision -o jsonpath='{.metadata.labels.stowage\.dev/restore-awaited}') ]] || fail "k8s provision left the restore-awaited label"
+ctl v1.sh k8s uninstall --namespace notes2 --release notes2 --data --yes --timeout 3m >"$WORK/restore-gone.log" 2>&1 || { cat "$WORK/restore-gone.log"; fail "uninstall of the second release"; }
+kubectl delete namespace notes2 --wait=false >/dev/null || fail "deleting the namespace notes2"
+rm -f "$OP/secrets.yaml"
 
 step "k8s uninstall: refused without --data (helm deletes the chart's claim), then removes all but the namespace"
 rc=0; ctl v1.sh k8s uninstall --yes --json >"$WORK/uninstall0.json" 2>"$WORK/uninstall0.log" || rc=$?

@@ -7,6 +7,37 @@ follow [SemVer](https://semver.org/).
 
 ### Added
 
+- Another ACME CA than Let's Encrypt: `--acme-ca URL` (an https ACME directory) and
+  `--acme-ca-root FILE` (the PEM root that directory's TLS chains to) on a Docker install and the
+  VM's install re-run, in the `acme` and `dns-cloudflare` modes alone. The URL is recorded, the
+  root kept in the install and mounted read-only into the front; a re-run keeps both, `none`
+  removes either, a new `--acme-ca` without its root removes the old root, and a move to another
+  mode removes both. `status --json --values` shows the URL (`acme_ca`). The end-to-end suite of
+  the stateless example now proves a front holding a domain for L4 TLS routes alone obtaining and
+  renewing its certificate from a real ACME server.
+- A pull credential per install: the operator mints a login per install in the registry and gives
+  it with `--registry-login-file FILE|-` — on a Docker install (recorded beside the install, 0600,
+  before anything is pulled; a re-run with it replaces it, and a run that fails before the images
+  are fetched with it puts the one held before back), on `k8s install`, `k8s upgrade` and `k8s
+  upgrade --version` (the pull Secret is written from it, labelled, and kept by a later run without
+  the flag, whose own reads of that host take it, a rollback's schema check and a kit's included;
+  a login for another host than the images' is never named for them, nor in place of another pull
+  Secret the release's values name; a pull Secret the cluster does not let the run read stops an
+  install, an upgrade or a reset before anything is asked or applied, so the login is never
+  written over unseen, and is logged by a run that only reads; one whose login does not read is
+  logged with the way to give a login again, and the run goes on without it; the installer
+  `--version` runs gets the login on a pipe, never a file on disk), and on
+  `vm create` / `vm seed`, now for the release's own registry too and not only a mirror. A new
+  `registry-login FILE|-|--remove` verb on Docker records or removes it later, as the VM's does,
+  which now takes a login for the release's own registry too. On the release's own registry the
+  password the pull account's variable gives comes first, then the install's login, then the
+  account baked into the installer, so an install without a login keeps pulling with the baked
+  one, and revoking one install's login leaves every other install pulling. `status` and `status
+  --json` (`registry_login`) name the login's host, never the login; `secrets export` does not
+  carry it; `uninstall --data` deletes it.
+- Every service's container is given `STOWAGE_SHAPE` on Docker (`docker`) and on the VM
+  (`kairos`), so a service can tell a machine that is the stack's alone from a shared one; a chart
+  sets `kubernetes` in its own pods. The first start after the upgrade recreates each service once.
 - Under a `command` version scheme, `upgrade --version`, `k8s upgrade --version` and the VM's
   `reset-db --new-baseline --version` to a release other than the one the install runs are refused
   unless `--unordered` is given: the scheme's command runs only where the project publishes, so
@@ -19,8 +50,26 @@ follow [SemVer](https://semver.org/).
   app socket's refusal of `unordered` names the operator's command over SSH, and `reset-db
   --new-baseline`'s refusals say it installs the channel's release, or with `--unordered` wipes
   the data and installs the version named.
+- `mirror import` checks, before it pushes anything, that the archive's release and each yank it
+  carries are signed by a key the importing `<short>-stow` trusts, reading the signatures from the
+  archive itself: one unsigned, signed by another key or whose signature does not verify is
+  refused with nothing imported, naming the release and why, and how to get a signed archive.
+- Disaster recovery on Kubernetes: `k8s secrets export --recipient AGE_KEY…` writes the release's
+  secrets (generated, secret inputs, what the provision hook returned; never the pull login)
+  age-encrypted in the same file format as Docker's and the VM's `secrets export`, and `k8s
+  install --secrets FILE|-` makes a first install from such a file, from any shape, by the same
+  rules (refused on a release whose Secret is already there, beside `--given` or `--kit`; a key
+  that is no secret of the release on Kubernetes left out, said). The provision hook's values it
+  carries are written to the release's outputs Secret, marked, and no deploy runs the hook until
+  `k8s provision` does, once the old install's backup is loaded.
 
 ### Changed
+
+- A `command` provider of `health`, `database.schema_compat` or `backup` takes `env`, as the
+  provision hook does: the inputs, secrets and safe defaults its container receives, required (`[]`
+  for none), each one the project declares; a file input or a secret delivered as a file reaches it
+  as its file. Its container no longer receives every input, secret and safe default; a spec
+  without `env` is a `lint` error, and is refused when it runs, naming the key to add.
 
 - `restore --unrecorded` says, before it loads, what it trusts in each unchecked object: a dump's
   statements run with the migrate role's rights, a volume's archive replaces the volume's files as
@@ -38,6 +87,11 @@ follow [SemVer](https://semver.org/).
   allowed, and a key of the chart's provision ConfigMap counts as recorded on Kubernetes.
 - `make e2e` and `make smoke-install` remove the images they pulled or pushed from their test
   registry.
+- `make self-audit` fails on a stale stopgap: a Go module a recipe forces that its upstream's
+  release already requires at that version or past it, or an Alpine package a recipe or an
+  example's Dockerfile raises that its base already carries at that version or past it. Live ones
+  are printed with the versions they are raised over; an `apk upgrade` and a module the release
+  does not require are left to judge by hand.
 
 ### Fixed
 

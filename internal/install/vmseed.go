@@ -51,9 +51,9 @@ type VMSeed struct {
 	// Waiting are the keys of the required secret inputs nothing gives, sorted (never a value):
 	// the VM's first install waits for them, given over SSH once the VM answers. Empty: omitted.
 	Waiting []string `json:"waiting,omitempty"`
-	// RegistryLogin is the host of the mirror whose login --registry-login-file checked: the VM's
-	// reads of the mirror take it, given over SSH once the VM answers (`sudo <short>-stow
-	// registry-login -`); never the login itself. Empty: omitted.
+	// RegistryLogin is the host whose login --registry-login-file checked (the release's own
+	// registry's or the mirror's): the VM's reads of that host take it, given over SSH once the VM
+	// answers (`sudo <short>-stow registry-login -`); never the login itself. Empty: omitted.
 	RegistryLogin string `json:"registry_login,omitempty"`
 	// Interfaces are the NICs the VM is made with, the release's host.interfaces as --interface
 	// gives them, sorted by role: what the program creating the VM gives each NIC; [] when the
@@ -101,7 +101,7 @@ type SeedOptions struct {
 	Channel      string
 	AwaitSecrets bool
 	DiskDir      string
-	// RegistryLogin is --registry-login-file's login file, checked for the mirror (createLogin);
+	// RegistryLogin is --registry-login-file's login file, checked for the VM's registry (createLogin);
 	// nil: none. The seed names its host alone.
 	RegistryLogin []byte
 }

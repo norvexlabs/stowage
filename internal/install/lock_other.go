@@ -12,3 +12,6 @@ func flockWait(context.Context, string, bool) (func(), error) { return func() {}
 
 // lockHeld is false where flock does not exist; the installer runs on Unix hosts.
 func lockHeld(string) bool { return false }
+
+// keepFromChildren is a no-op where descriptors are not inherited by number.
+func keepFromChildren(string) {}

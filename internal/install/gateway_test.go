@@ -1071,7 +1071,7 @@ func TestAnAllowlistedRouteIsIPv4s(t *testing.T) {
 	if got := in.allowV4Only(); !slices.Equal(got, []string{"db"}) {
 		t.Errorf("consented: %v", got)
 	}
-	fc, err := frontCompose(in.R.Spec.Front, routes, func(string) string { return "" }, Loopback, hostAPI{}, "sha256:x", "", false, false, true, nil, []string{"db"}, false, FrontUID)
+	fc, err := frontCompose(in.R.Spec.Front, routes, func(string) string { return "" }, Loopback, hostAPI{}, "sha256:x", "", false, false, false, true, nil, []string{"db"}, false, FrontUID)
 	if err != nil || !strings.Contains(string(fc), "host_ip: 0.0.0.0\n") || strings.Count(string(fc), "host_ip") != 1 {
 		t.Errorf("%v\n%s", err, fc)
 	}
@@ -1435,7 +1435,7 @@ func TestADockerHostHoldsTheFrontToItsInterfaces(t *testing.T) {
 	if in.frontV4Only(get) {
 		t.Error("with IPv6, on IPv4 alone")
 	}
-	fc, err := frontCompose(in.R.Spec.Front, nil, get, "internal", hostAPI{}, "sha256:x", "", false, false, false, nil, nil, true, FrontUID)
+	fc, err := frontCompose(in.R.Spec.Front, nil, get, "internal", hostAPI{}, "sha256:x", "", false, false, false, false, nil, nil, true, FrontUID)
 	if err != nil || !strings.Contains(string(fc), "0.0.0.0:${"+HTTPSPortVar+"}:443") {
 		t.Errorf("%v\n%s", err, fc)
 	}

@@ -206,3 +206,25 @@ func withFilesValue(values []byte, name, secretFiles string, asFile []string) ([
 	v[helm.ValuesKey] = block
 	return yaml.Marshal(v)
 }
+
+// withPullSecret is the values a release ran with, naming the pull Secret to where they named the
+// installer's own (own) or none; another Secret the operator's values name is kept.
+func withPullSecret(values []byte, own, to string) ([]byte, error) {
+	var v map[string]any
+	if err := yaml.Unmarshal(values, &v); err != nil {
+		return nil, fmt.Errorf("the release's values: %w", err)
+	}
+	if v == nil {
+		v = map[string]any{}
+	}
+	block, _ := v[helm.ValuesKey].(map[string]any)
+	if block == nil {
+		block = map[string]any{}
+	}
+	if cur, _ := block["pullSecret"].(string); cur != "" && cur != own {
+		return values, nil
+	}
+	block["pullSecret"] = to
+	v[helm.ValuesKey] = block
+	return yaml.Marshal(v)
+}

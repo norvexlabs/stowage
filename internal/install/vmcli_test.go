@@ -1110,6 +1110,8 @@ func TestHealthOverTheSocketFailsWhenNotReady(t *testing.T) {
 	e := installedVM(t)
 	stackAnswers(e, healthyStack)
 	d := daemon(e, &fakeHost{})
+	// A check is bounded by healthWait units: 20 ms ones keep a loaded race run inside it.
+	d.Unit = 20 * time.Millisecond
 	p := &prober{status: 200}
 	d.Probe = p.client(t)
 	sock := served(t, d)

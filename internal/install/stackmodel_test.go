@@ -231,6 +231,52 @@ func TestTheContentLabelsAreWrittenBeforeTheStackStarts(t *testing.T) {
 	}
 }
 
+// Every service is told the install's shape (STOWAGE_SHAPE), beside the sizing variables a share
+// and cores give it, none of which replaces another.
+func TestEveryServiceIsGivenTheShape(t *testing.T) {
+	e := newEnv(t)
+	e.docker.model = `{"services": {"web": {}, "db": {}}}`
+	if err := e.install(nil); err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := os.ReadFile(filepath.Join(e.dir, ContentCompose))
+	var doc struct {
+		Services map[string]struct {
+			Environment map[string]string `yaml:"environment"`
+		} `yaml:"services"`
+	}
+	if err := yaml.Unmarshal(raw, &doc); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"web", "db"} {
+		if v := doc.Services[name].Environment[ShapeVar]; v != "docker" {
+			t.Errorf("%s: %s=%q in\n%s", name, ShapeVar, v, raw)
+		}
+	}
+	var m composeModel
+	if err := json.Unmarshal([]byte(`{"services": {"db": {}, "web": {}}}`), &m); err != nil {
+		t.Fatal(err)
+	}
+	vm := hostPlan{Shape: "kairos", Shares: map[string]spec.Share{"db": {Percent: 50}}, Host: tune.Host{MemBytes: 4 << 30, CPUs: 2},
+		CPUSets: map[string]string{"db": "1"}}
+	raw, err := contentCompose(&m, nil, []byte("key"), tune.Container{}, vm, hostNet{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := yaml.Unmarshal(raw, &doc); err != nil {
+		t.Fatal(err)
+	}
+	if e := doc.Services["db"].Environment; e[ShapeVar] != "kairos" || e[MemLimitVar] != "2048" || e[HostCoresVar] != "1" {
+		t.Errorf("db: %v", e)
+	}
+	if e := doc.Services["web"].Environment; e[ShapeVar] != "kairos" || len(e) != 1 {
+		t.Errorf("web: %v", e)
+	}
+	if !strings.Contains(e.installer(func(o *Options) { o.Preloaded = true }).shape(), "kairos") {
+		t.Error("the VM's install is not kairos")
+	}
+}
+
 // An install a Stowage without content labels made has no such file: compose is not told of it
 // until a start writes it. The key of the labels is the install's own, private and kept.
 func TestTheContentFileAndKeyOfAnInstall(t *testing.T) {

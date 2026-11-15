@@ -61,7 +61,7 @@ func TestTheFrontPublishesWhatServesOnIt(t *testing.T) {
 		{f, "acme", []string{"${" + HTTPPortVar + "}:80\n"}, []string{":443\n"}},
 		{l4TLSFront(), "internal", []string{"${" + HTTPPortVar + "}:80\n", "${" + HTTPSPortVar + "}:443\n"}, nil},
 	} {
-		raw, err := frontCompose(c.f, l4, get, c.mode, hostAPI{}, "sha256:x", "", false, false, false, nil, nil, false, FrontUID)
+		raw, err := frontCompose(c.f, l4, get, c.mode, hostAPI{}, "sha256:x", "", false, false, false, false, nil, nil, false, FrontUID)
 		if err != nil {
 			t.Fatal(err)
 		}

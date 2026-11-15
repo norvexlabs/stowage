@@ -3,14 +3,18 @@
 // from the recipes this tree embeds, makes the SBOM of each and of Stowage's binaries (stowage,
 // stowage-install, which the OS bundle carries), scans them with the pinned scanner and refuses,
 // exit 1, on a fixable finding at or above high that no allowance in force accepts. It runs where
-// Docker does: `make self-audit`, and the release workflow before anything is published. It also
-// reminds, on every run, of each module a recipe forces over its upstream's release (overrides.go).
+// Docker does: `make self-audit`, and the release workflow before anything is published. On every
+// run it also judges each stopgap: a module a recipe forces over its upstream's release
+// (overrides.go) and an Alpine package a Dockerfile raises over its base (raises.go), the recipes'
+// and the examples'. One the upstream's release or the base already carries is stale and fails
+// the run; a live one is printed with a reminder.
 package main
 
 import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -28,17 +32,18 @@ func main() {
 	allow := flag.String("allow", "audit-allow.yaml", "the allowlist file (sbom.ParseAllowances)")
 	db := flag.String("db", "", "a grype database archive to scan with (default: grype's servers)")
 	cache := flag.String("cache", "", "the scanner's database directory (default: the user cache's stowage/grype)")
+	examples := flag.String("examples", "examples", "the directory whose Dockerfiles' package raises are judged with the recipes'")
 	flag.Parse()
-	if err := run(context.Background(), *bin, *allow, *db, *cache); err != nil {
+	if err := run(context.Background(), *bin, *allow, *db, *cache, *examples); err != nil {
 		fmt.Fprintln(os.Stderr, "self-audit:", err)
 		os.Exit(1)
 	}
 }
 
-func run(ctx context.Context, bin, allowFile, db, cache string) error {
-	// Deferred: a run that fails, a recipe that no longer builds included, shows it too, and an
-	// override may be what to change.
-	defer remind(os.Stderr, recipes)
+func run(ctx context.Context, bin, allowFile, db, cache, examples string) (err error) {
+	// Deferred: a run that fails, a recipe that no longer builds included, judges them too, and a
+	// stopgap may be what to change.
+	defer func() { err = errors.Join(err, stopgaps(ctx, os.Stderr, recipes, examples, proxyMod, dockerProbe)) }()
 	now := time.Now().UTC()
 	doc, err := os.ReadFile(allowFile)
 	if err != nil {

@@ -17,7 +17,10 @@
 # before 1.0.0, upgrades to 1.0.1 with this one's, and a rollback goes back to it with its own
 # installer → 1.0.2 adds a front terminating the L4 route's TLS alone (no HTTP route, no portal),
 # installed with --tls internal (no ALPN protocol selected), then re-run with --tls byo, its CA
-# published into a volume.
+# published into a volume, then with --tls acme against an ACME server (Pebble, its DNS stub
+# answering for the domain): the certificate issued and renewed for the L4 route alone (a site
+# answering 404, its challenge on the front's HTTP port) → 1.0.3 adds an HTTP route on that
+# domain, served over HTTPS with Pebble's certificate after the upgrade.
 set -euo pipefail
 . "$(dirname "$0")/lib.sh"
 
@@ -247,5 +250,81 @@ grep -qx "lookup 1.0.2 is running" "$WORK/rerun-byo.log" || { cat "$WORK/rerun-b
 # The front copies its CA in the background once Caddy runs: the internal root may still be there.
 for _ in $(seq 30); do cmp -s <(published_ca 2>/dev/null) "$WORK/byo-ca.crt" && break; sleep 1; done
 cmp -s <(published_ca) "$WORK/byo-ca.crt" || fail "the front did not publish the byo CA"
+
+step "acme against an ACME server (Pebble): the L4 route's certificate issued and renewed, then an HTTP route's"
+# Pebble and its DNS stub on a network of their own; Pebble joins the stack's network too, as
+# pebble, where the front reaches its directory. The stub answers every name with the stack
+# network's gateway, where the host publishes the front's HTTP port, which Pebble's HTTP-01
+# validation dials (httpPort; tlsPort the HTTPS one). Its certificates last 90 seconds, so Caddy's
+# renewal comes within the run.
+ACME_NET=stowage-e2e-$RUN
+STACK_NET=$(project)_default
+GATEWAY=$(docker network inspect -f '{{(index .IPAM.Config 0).Gateway}}' "$STACK_NET") || fail "the stack's network $STACK_NET"
+# Removed before the stack is: a network an endpoint holds is not removed.
+CLEANUP=("docker rm -f $ZOT_NAME-pebble $ZOT_NAME-challtestsrv >/dev/null 2>&1; docker network rm $ACME_NET >/dev/null 2>&1" "${CLEANUP[@]}")
+docker network create "$ACME_NET" >/dev/null
+docker run -d --name "$ZOT_NAME-challtestsrv" --network "$ACME_NET" --network-alias challtestsrv "$CHALLTESTSRV" \
+	-defaultIPv4 "$GATEWAY" -defaultIPv6 "" -http01 "" -https01 "" -tlsalpn01 "" -doh "" >/dev/null || fail "start pebble-challtestsrv"
+cat >"$WORK/pebble.json" <<EOF
+{"pebble": {"listenAddress": "0.0.0.0:14000", "managementListenAddress": "0.0.0.0:15000",
+  "certificate": "test/certs/localhost/cert.pem", "privateKey": "test/certs/localhost/key.pem",
+  "httpPort": $HTTP_PORT, "tlsPort": $HTTPS_PORT, "ocspResponderURL": "", "externalAccountBindingRequired": false,
+  "profiles": {"default": {"description": "short-lived", "validityPeriod": 90}}}}
+EOF
+docker run -d --name "$ZOT_NAME-pebble" --network "$ACME_NET" -p 127.0.0.1::15000 -e PEBBLE_VA_NOSLEEP=1 -e PEBBLE_WFE_NONCEREJECT=0 \
+	-v "$WORK/pebble.json:/pebble.json:ro" "$PEBBLE" -config /pebble.json -dnsserver challtestsrv:8053 >/dev/null || fail "start pebble"
+docker network connect --alias pebble "$STACK_NET" "$ZOT_NAME-pebble" || fail "pebble on the stack's network"
+docker cp "$ZOT_NAME-pebble:/test/certs/pebble.minica.pem" "$WORK/pebble-directory-root.pem" >/dev/null || fail "pebble's directory root"
+MGMT=$(published_port "$ZOT_NAME-pebble" 15000)
+"${CTL[@]}" --dir "$D" --no-input --tls acme --acme-ca https://pebble:14000/dir --acme-ca-root "$WORK/pebble-directory-root.pem" >"$WORK/rerun-acme.log" 2>&1 ||
+	{ cat "$WORK/rerun-acme.log"; fail "re-run with --tls acme --acme-ca"; }
+grep -qxF "STOWAGE_ACME_CA='https://pebble:14000/dir'" "$D/.env" || fail ".env does not record the ACME CA"
+cmp -s "$D/stowage-front-acme-ca/root.pem" "$WORK/pebble-directory-root.pem" || fail "the install does not hold the ACME CA's root"
+# The root of the chains Pebble issues (made at its start): what a client trusts.
+for _ in $(seq 30); do curl -sfk --max-time 5 "https://127.0.0.1:$MGMT/roots/0" >"$WORK/pebble-root.pem" && break; sleep 1; done
+grep -q 'BEGIN CERTIFICATE' "$WORK/pebble-root.pem" || fail "pebble's issuing root"
+# serial: the serial of the certificate the front serves for lookup.test on the L4 route, verified
+# against Pebble's issuing root; empty while it serves none that verifies.
+serial() {
+	timeout 10 openssl s_client -connect "127.0.0.1:$PORT" -servername lookup.test -CAfile "$WORK/pebble-root.pem" </dev/null 2>/dev/null |
+		{ out=$(cat); grep -q 'Verify return code: 0 (ok)' <<<"$out" && openssl x509 -noout -serial <<<"$out"; } || true
+}
+for _ in $(seq 90); do [[ $(tls_get "$WORK/pebble-root.pem" 2>/dev/null) == secure ]] && break; sleep 1; done
+[[ $(tls_get "$WORK/pebble-root.pem") == secure ]] || { stack_logs >&2; docker logs "$ZOT_NAME-pebble" 2>&1 | tail -30 >&2; tls_why "$WORK/pebble-root.pem"; fail "the L4 route does not serve a certificate Pebble issued for its domain"; }
+FIRST=$(serial)
+[[ -n $FIRST ]] || fail "no serial read from the front's certificate"
+# Renewed by Caddy once in its renewal window (the last third of its life): the front started
+# again past that point renews it as it loads it (its maintenance loop checks every 10 minutes).
+END=$(timeout 10 openssl s_client -connect "127.0.0.1:$PORT" -servername lookup.test </dev/null 2>/dev/null | openssl x509 -noout -enddate | cut -d= -f2)
+WAIT=$(($(date -d "$END" +%s) - $(date +%s) - 25))
+((WAIT > 0)) && sleep "$WAIT"
+docker restart "$(docker ps -q --filter "label=com.docker.compose.project=$(project)" --filter label=com.docker.compose.service=stowage-front)" >/dev/null || fail "restart the front"
+for _ in $(seq 60); do
+	now=$(serial)
+	[[ -n $now && $now != "$FIRST" ]] && break
+	sleep 1
+done
+[[ -n $now && $now != "$FIRST" ]] || { stack_logs >&2; fail "the front did not renew its certificate ($FIRST, now ${now:-none})"; }
+# 1.0.3 adds an HTTP route on the same domain: the upgrade keeps the ACME CA, and the route is
+# served over HTTPS with Pebble's certificate.
+python3 - "$P/stowage.yaml" "$P/CHANGELOG.md" <<'PY3'
+import sys
+spec, changelog = sys.argv[1:]
+for path, old, new in [
+    (spec, "  tls_modes: [internal, byo, acme, dns-cloudflare]\n", "  tls_modes: [internal, byo, acme, dns-cloudflare]\n  routes:\n    - { name: web, domain_input: LOOKUP_DOMAIN, upstream: server:8080 }\n  portal: web\n"),
+    (changelog, "## [1.0.2]", "## [1.0.3]\n\n### Changed\n- The front serves the page over HTTPS too.\n\n## [1.0.2]"),
+]:
+    s = open(path).read()
+    assert s.count(old) == 1, old
+    open(path, "w").write(s.replace(old, new))
+PY3
+"${S[@]}" lint || fail "lint of 1.0.3"
+"${S[@]}" ship --channel stable 2>"$WORK/ship-1.0.3.log" || { cat "$WORK/ship-1.0.3.log"; fail "ship 1.0.3"; }
+"${CTL[@]}" upgrade --version 1.0.3 --dir "$D" --no-input >"$WORK/upgrade-acme.log" 2>&1 || { cat "$WORK/upgrade-acme.log"; fail "upgrade to 1.0.3 in acme mode"; }
+grep -qxF "STOWAGE_ACME_CA='https://pebble:14000/dir'" "$D/.env" || fail "the upgrade did not keep the ACME CA"
+for _ in $(seq 60); do [[ $(curl -sf --max-time 10 --cacert "$WORK/pebble-root.pem" --resolve "lookup.test:$HTTPS_PORT:127.0.0.1" "https://lookup.test:$HTTPS_PORT/") == secure ]] && break; sleep 1; done
+[[ $(curl -sf --max-time 10 --cacert "$WORK/pebble-root.pem" --resolve "lookup.test:$HTTPS_PORT:127.0.0.1" "https://lookup.test:$HTTPS_PORT/") == secure ]] ||
+	{ stack_logs >&2; fail "the HTTP route does not serve over HTTPS with Pebble's certificate"; }
+[[ $(tls_get "$WORK/pebble-root.pem") == secure ]] || fail "the L4 route no longer serves after the HTTP route came"
 
 echo PASS

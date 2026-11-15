@@ -190,6 +190,7 @@ func (in *Installer) frontFlags() error {
 		set  bool
 	}{
 		{"--tls", o.TLS != ""}, {"--cert", o.Cert != ""}, {"--key", o.Key != ""}, {"--ca", o.CA != ""}, {"--client-ca", o.ClientCA != ""},
+		{"--acme-ca", o.ACMECA != ""}, {"--acme-ca-root", o.ACMECARoot != ""},
 		{"--domains", len(o.Domains) > 0}, {"--http-port", o.HTTPPort != 0}, {"--https-port", o.HTTPSPort != 0},
 		{"--ports", len(o.Ports) > 0}, {"--address", o.Address != ""},
 	} {
@@ -570,13 +571,14 @@ const hsts = `header Strict-Transport-Security "max-age=31536000; includeSubDoma
 // tlsCaddyfile serves each route on its domain over HTTPS, with one certificate source and no
 // fallback: a failed issuance shows, rather than an untrusted certificate. dns-cloudflare proves
 // each domain to Let's Encrypt through Cloudflare's DNS, with the token from the front's
-// environment. HSTS is sent except
+// environment; acme gives both modes' issuer its contact, and another ACME directory than Let's
+// Encrypt's with the root its TLS chains to. HSTS is sent except
 // with the local CA, which browsers do not trust. The front listens on 80 and 443 in its
 // container, whatever host ports publish them; its redirects to HTTPS name the public port. Routes
 // of one domain are one site, told apart by their paths. A route with client_auth requires a
 // client certificate chaining to the install's client CA (clientCA: one was given), and refuses
 // everyone while none was.
-func tlsCaddyfile(f spec.Front, l4 []spec.L4Route, mode string, domains map[string]string, email string, httpsPort string, clientCA bool, get func(string) string, logins map[string]login) string {
+func tlsCaddyfile(f spec.Front, l4 []spec.L4Route, mode string, domains map[string]string, acme acmeIssuer, httpsPort string, clientCA bool, get func(string) string, logins map[string]login) string {
 	public := publicHTTPSPort(mode, httpsPort)
 	var b strings.Builder
 	b.WriteString("# Written by the installer from the project's front routes; rewritten on every run.\n")
@@ -593,8 +595,16 @@ func tlsCaddyfile(f spec.Front, l4 []spec.L4Route, mode string, domains map[stri
 		} else {
 			b.WriteString("\tcert_issuer acme {\n\t\tdns cloudflare {env.CLOUDFLARE_API_TOKEN}\n\t}\n")
 		}
-		if email != "" {
-			fmt.Fprintf(&b, "\temail %s\n", email)
+		if acme.Email != "" {
+			fmt.Fprintf(&b, "\temail %s\n", acme.Email)
+		}
+		// Another directory than Let's Encrypt's, and the root its TLS chains to: global options,
+		// which fill in the cert_issuer above (its CA and trusted roots).
+		if acme.CA != "" {
+			fmt.Fprintf(&b, "\tacme_ca %s\n", acme.CA)
+			if acme.Root {
+				fmt.Fprintf(&b, "\tacme_ca_root %s\n", acmeRootPath)
+			}
 		}
 	case "internal":
 		// The local CA's root is published (publish_ca), never put in the front's own trust

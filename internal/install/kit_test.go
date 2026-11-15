@@ -468,6 +468,13 @@ func TestSecretsAndAKitAreOne(t *testing.T) {
 	if err := cmd.Execute(); err == nil || !strings.Contains(err.Error(), "read once") {
 		t.Errorf("vm create: %v", err)
 	}
+	for _, other := range []string{"--secrets", "--kit"} {
+		cmd = newCommand(e.r, e.self, io.Discard, io.Discard, K8sOptions{}, func(bool) Prompter { return nil })
+		cmd.SetArgs([]string{"vm", "create", "--no-input", "--registry-login-file", "-", other, "-"})
+		if err := cmd.Execute(); err == nil || !strings.Contains(err.Error(), "--registry-login-file and another flag both name standard input") {
+			t.Errorf("vm create %s: %v", other, err)
+		}
+	}
 }
 
 // The command opens the kit, for the shape the VM's install takes, before it creates anything.

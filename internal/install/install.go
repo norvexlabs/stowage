@@ -68,6 +68,11 @@ type Options struct {
 	// ClientCA is the CA file, PEM, the client certificates of the routes with client_auth chain
 	// to (--client-ca), copied into the install; "none" removes the install's.
 	ClientCA string
+	// ACMECA is the ACME directory, an https URL, the front's issuer uses instead of Let's
+	// Encrypt's (--acme-ca), recorded as ACMECAVar; "none" removes the record. ACMECARoot is the
+	// root, PEM, that directory's TLS chains to (--acme-ca-root), copied into the install
+	// (ACMERootFile); "none" removes the install's.
+	ACMECA, ACMECARoot string
 	// HTTPPort and HTTPSPort are the host ports a TLS front publishes; 0 is 80 and 443.
 	HTTPPort, HTTPSPort int
 	Registry            string // --registry: the prefix images are pulled from (a mirror); first install only
@@ -75,6 +80,9 @@ type Options struct {
 	// gives the cluster a mirror's pull Secret from; nil is the Docker client's own (its config,
 	// DOCKER_CONFIG, its credential helpers).
 	Login authn.Keychain
+	// RegistryLogin is the login file --registry-login-file gave (Docker's install, `k8s install`
+	// and `k8s upgrade`): a Docker config holding one auths entry; nil for none.
+	RegistryLogin []byte
 	// RegistryCA is a PEM file of the CA the registry's certificate chains to (--registry-ca), a
 	// mirror's own: the installer's reads trust it, and an install records it (RegistryCAFile).
 	RegistryCA string
@@ -147,6 +155,9 @@ type Options struct {
 	Exec func(ctx context.Context, exe string, args []string) error
 	// handLock, while set, is the lock file the installer exec runs is handed (flock.Hand).
 	handLock *os.File
+	// childFiles, while set, are the descriptors the installer exec runs inherits from 3 on
+	// (childLogin).
+	childFiles []*os.File
 	// K8s is a run of `k8s`.
 	K8s K8sOptions
 	// PortFree and UDPPortFree replace the TCP and UDP port probes in tests.
@@ -255,6 +266,16 @@ type Installer struct {
 	again bool
 	// lockHeld is the lock file of the install's lifecycle lock while this run holds it (lockRun).
 	lockHeld *os.File
+	// noLoginFile: the run is not an install's on this host — a `k8s`, `vm` or `mirror` verb — and
+	// reads no login file (heldLogin); k8sLogin is the login a Kubernetes run's
+	// --registry-login-file gave (k8sTakeLogin), nil for none; k8sPulls is, per prefix k8sLogins
+	// took the logins of, the login the release's pull Secret holds from a run before (nil for
+	// none), which the run's reads of that prefix wait for. k8sRun: the run is a `k8s` verb's
+	// (checkTarget).
+	noLoginFile bool
+	k8sLogin    *registryLogin
+	k8sPulls    map[string]*registryLogin
+	k8sRun      bool
 	// boot is the disk set `vm create` boots (bootDisks).
 	boot bootDisk
 	// dropped is what an upgrade drops: inputs and hook returns the release removed.
@@ -284,6 +305,9 @@ type Installer struct {
 	remote bool
 	// restored is the SecretsFile O.Secrets gives (useSecrets); nil when none.
 	restored *SecretsFile
+	// kube: the run drives a Kubernetes release, whose secrets are the spec's and its secret inputs
+	// on Kubernetes (secretKey).
+	kube bool
 	// givenCA: the registry's CA is --registry-ca alone, never one recorded in a directory — the
 	// commands that keep no install (k8s, mirror, vm create).
 	givenCA bool
@@ -352,6 +376,10 @@ func (in *Installer) Install(ctx context.Context) (err error) {
 		}
 		in.useSecrets(f)
 	}
+	login, err := in.givenLogin()
+	if err != nil {
+		return err
+	}
 
 	if err := in.applyDomains(); err != nil {
 		return err
@@ -367,6 +395,10 @@ func (in *Installer) Install(ctx context.Context) (err error) {
 	if err != nil {
 		return err
 	}
+	acmeRoot, err := in.readACMECA()
+	if err != nil {
+		return err
+	}
 	// Everything is checked and decided first; nothing is pulled or written before. The host is
 	// checked before anything is asked, so a refusal never comes after the operator answered a
 	// form. With nothing to ask, every given input is checked before the host. Going back from the
@@ -377,6 +409,9 @@ func (in *Installer) Install(ctx context.Context) (err error) {
 			return err
 		}
 		if err := in.knownInputs(mode); err != nil {
+			return err
+		}
+		if err := in.acmeVar(NewEnvFile(), mode); err != nil {
 			return err
 		}
 		if _, err := in.inputs(ctx, in.inputList(mode), false); err != nil {
@@ -433,6 +468,7 @@ func (in *Installer) Install(ctx context.Context) (err error) {
 			v, _ := env.Get(k)
 			fmt.Fprintf(o.Out, "%s=%s\n", k, in.shownValue(k, v, secrets))
 		}
+		in.loginDryRun(login)
 		return nil
 	}
 	if _, err := os.Stat(dir); errors.Is(err, os.ErrNotExist) {
@@ -454,7 +490,7 @@ func (in *Installer) Install(ctx context.Context) (err error) {
 	}
 	mutated = true // the run writes the install from here
 	// Until .env is written no install owns what this run wrote: a failure removes it.
-	certWritten, caWritten, clientCAWritten := false, false, false
+	certWritten, caWritten, clientCAWritten, acmeRootWritten := false, false, false, false
 	unwritten := func(err error) error {
 		switch {
 		case in.removeDir:
@@ -469,13 +505,28 @@ func (in *Installer) Install(ctx context.Context) (err error) {
 			if clientCAWritten {
 				_ = os.RemoveAll(in.path(ClientCADir))
 			}
+			if acmeRootWritten {
+				_ = os.RemoveAll(in.path(ACMERootDir))
+			}
 			_ = os.Remove(in.path(installingFile)) // written by this run, under its lock
 		}
 		return err
 	}
+	var undoLogin func()
+	if login != nil {
+		// A login there before is replaced: a failure of the run before the images are fetched
+		// with it puts it back (one this run wrote alone is removed), beside the directory the
+		// failure may remove.
+		var lerr error // not err: the deferred undo reads the run's
+		if undoLogin, lerr = in.recordLogin(*login); lerr != nil {
+			return unwritten(lerr)
+		}
+		defer func() { undoLoginOn(err, undoLogin, &in.O) }()
+	}
 	if err := in.fetchImages(ctx, env); err != nil {
 		return unwritten(err)
 	}
+	undoLogin = nil // the images are fetched with it: kept
 	in.recordInstaller(ctx, env)
 	if err := in.writeCert(); err != nil { // it removes a tls/ it created; one it did not is not this run's
 		return unwritten(err)
@@ -488,6 +539,14 @@ func (in *Installer) Install(ctx context.Context) (err error) {
 	}
 	if err := in.writeClientCA(clientCA, mode); err != nil {
 		return unwritten(err)
+	}
+	if acmeRoot != nil {
+		// A file of that name there before is not this run's to remove.
+		_, err := os.Lstat(in.path(ACMERootDir))
+		acmeRootWritten = errors.Is(err, os.ErrNotExist)
+		if err := in.writeACMERoot(acmeRoot, "", env); err != nil {
+			return unwritten(err)
+		}
 	}
 	if o.RegistryCA != "" {
 		// A file of that name there before is not this run's to remove (it may be the CA given).
@@ -914,6 +973,11 @@ func (in *Installer) decide(ctx context.Context, dir, mode string, pub publish, 
 		env.Set(ChannelVar, o.Channel)
 	}
 	in.frontVars(env, mode, pub, domains)
+	if s.HasFront() {
+		if err := in.acmeVar(env, mode); err != nil {
+			return nil, nil, err
+		}
+	}
 	in.tuneVar(env)
 	if err := in.interfaceVars(env); err != nil {
 		return nil, nil, err
@@ -973,16 +1037,25 @@ func (in *Installer) rerun(ctx context.Context) (err error) {
 	if err != nil {
 		return err
 	}
+	acmeRoot, err := in.readACMECA()
+	if err != nil {
+		return err
+	}
 	env, unlock, err := in.openLocked(ctx)
 	if err != nil {
 		return err
 	}
 	defer unlock()
+	wasACMECA, _ := env.Get(ACMECAVar)
 	if err := in.sameRelease(ctx, env); err != nil {
 		return err
 	}
 	// Before anything is recorded: nothing would come up to use it.
 	if err := in.volumesSplit(); err != nil {
+		return err
+	}
+	login, err := in.givenLogin()
+	if err != nil {
 		return err
 	}
 	in.again = true
@@ -1025,6 +1098,7 @@ func (in *Installer) rerun(ctx context.Context) (err error) {
 		} else {
 			o.logf("%s holds this release: a run would bring the stack up again", o.Dir)
 		}
+		in.loginDryRun(login)
 		return nil
 	}
 	mutated = true // its marker, the images, the files: changes from here
@@ -1038,13 +1112,25 @@ func (in *Installer) rerun(ctx context.Context) (err error) {
 			}
 		}()
 	}
+	var undoLogin func()
+	if login != nil {
+		var lerr error // not err: the deferred undo reads the run's
+		if undoLogin, lerr = in.recordLogin(*login); lerr != nil {
+			return lerr
+		}
+		defer func() { undoLoginOn(err, undoLogin, &in.O) }()
+	}
 	if err := in.fetchImages(ctx, env); err != nil {
 		return err
 	}
+	undoLogin = nil // the images are fetched with it: kept
 	if err := in.writeNewCert(); err != nil {
 		return err
 	}
 	if err := in.writeClientCA(clientCA, mode); err != nil {
+		return err
+	}
+	if err := in.writeACMERoot(acmeRoot, wasACMECA, cmp.Or(next, env)); err != nil {
 		return err
 	}
 	if next == nil {
@@ -1382,6 +1468,14 @@ func (in *Installer) renderStack(env *EnvFile, dir string) error {
 			return err
 		}
 	}
+	// The ACME CA's root, read where the install records a CA in an ACME mode.
+	var acme acmeIssuer
+	acme.CA, _ = env.Get(ACMECAVar)
+	acmeRoot, err := in.heldACMERoot(mode, acme.CA)
+	if err != nil {
+		return err
+	}
+	acme.Root = acmeRoot != nil
 	logins, err := in.logins(f, get, dir)
 	if err != nil {
 		return err
@@ -1397,9 +1491,9 @@ func (in *Installer) renderStack(env *EnvFile, dir string) error {
 		for _, d := range in.R.Spec.RouteDomains() {
 			domains[d.Route], _ = env.Get(d.Input)
 		}
-		email, _ := env.Get(ACMEEmailVar)
+		acme.Email, _ = env.Get(ACMEEmailVar)
 		httpsPort, _ := env.Get(HTTPSPortVar)
-		cf = tlsCaddyfile(f, in.R.Spec.L4.Routes, mode, domains, email, httpsPort, clientCA != nil, get, logins)
+		cf = tlsCaddyfile(f, in.R.Spec.L4.Routes, mode, domains, acme, httpsPort, clientCA != nil, get, logins)
 	}
 	// The front's configuration: the Caddyfile, the client CA it reads, and in byo the files of
 	// tls/ it reads.
@@ -1407,6 +1501,9 @@ func (in *Installer) renderStack(env *EnvFile, dir string) error {
 	fmt.Fprintf(h, "Caddyfile %d\n%s", len(cf), cf)
 	if clientCA != nil {
 		fmt.Fprintf(h, "%s %d\n%s", ClientCAFile, len(clientCA), clientCA)
+	}
+	if acmeRoot != nil {
+		fmt.Fprintf(h, "%s %d\n%s", ACMERootFile, len(acmeRoot), acmeRoot)
 	}
 	ca := ""
 	switch mode {
@@ -1427,7 +1524,7 @@ func (in *Installer) renderStack(env *EnvFile, dir string) error {
 			}
 		}
 	}
-	fc, err := frontCompose(f, in.R.Spec.L4.Routes, get, mode, in.hostAPI(), "sha256:"+hex.EncodeToString(h.Sum(nil)), ca, strings.Contains(cf, noALPNMark), clientCA != nil, get(IPv6Var) == "true", in.hostServices(), in.allowV4Only(), in.frontV4Only(get), in.frontUser())
+	fc, err := frontCompose(f, in.R.Spec.L4.Routes, get, mode, in.hostAPI(), "sha256:"+hex.EncodeToString(h.Sum(nil)), ca, strings.Contains(cf, noALPNMark), clientCA != nil, acmeRoot != nil, get(IPv6Var) == "true", in.hostServices(), in.allowV4Only(), in.frontV4Only(get), in.frontUser())
 	if err != nil {
 		return err
 	}
@@ -2798,6 +2895,12 @@ func (in *Installer) Status(ctx context.Context) error {
 	dir := in.O.Dir
 	get := func(k string) string { v, _ := env.Get(k); return v }
 	fmt.Fprintf(in.O.Out, "%s %s (revision %s)\nregistry  %s\n", get("STOWAGE_NAME"), get("STOWAGE_PROJECT_VERSION"), get("STOWAGE_REVISION"), get("STOWAGE_REGISTRY"))
+	switch host, problem := in.heldLoginHost(); {
+	case host != "":
+		fmt.Fprintf(in.O.Out, "%-9s held for %s\n", "login", host)
+	case problem != "":
+		fmt.Fprintf(in.O.Out, "%-9s unreadable: %s\n", "login", problem)
+	}
 	p, by := in.tuneProfile(get)
 	fmt.Fprintf(in.O.Out, "%-9s %s (%s)\n", "tune", p, by)
 	// The allowlists' state is read once, for the gateway line and the L4 routes' lines.
@@ -3441,8 +3544,9 @@ func (in *Installer) pullEnviron(env *EnvFile) ([]string, func(), error) {
 	return cfg, cleanup, nil
 }
 
-// pullConfig returns the environment the pulls run with. When the project has a pull account — its
-// password from the environment, else the one baked into the installer — that is a private Docker
+// pullConfig returns the environment the pulls run with. When the reads of prefix take an account
+// (pullAccount: the pull account's password from the environment, the install's login held, the
+// account baked into the installer) that is a private Docker
 // config holding the account — written by the
 // installer, never by `docker login`, so nothing reaches the operator's own config or credential
 // store, and removed afterwards — which keeps the operator's current context (its contexts are
@@ -3512,25 +3616,33 @@ func (in *Installer) pullConfig(prefix string) ([]string, func(), error) {
 	return append(env, "DOCKER_CONFIG="+dir), cleanup, nil
 }
 
-// pullAccount is the project's pull account on its own registry: the password from the
-// environment, else the one baked into the installer. On a mirror it is the login the VM holds
-// for the mirror's host (mirrorLogin), never the pull account. The token is empty for public
-// images, a mirror the operator logs in to (off the VM, or a VM holding no login for it) or a
-// password nothing gives.
+// pullAccount is the account the install reads the registry at prefix with. On the release's own
+// registry: the password TOKEN_ENV gives this run, else the login the install holds for its host
+// (heldLogin), else the account baked into the installer. On a mirror: the login held for its
+// host (loginFor), never the pull account. The token is empty for public images, a mirror the
+// operator logs in to (no login held for it) or a password nothing gives.
 func (in *Installer) pullAccount(prefix string) (user, token string, err error) {
 	if prefix != in.R.Spec.Registry.Prefix {
-		return in.mirrorLogin(prefix)
+		return in.loginFor(prefix)
 	}
 	p := in.R.Spec.Registry.Pull
+	var c providers.TokenConfig
+	if p.Name == "token" {
+		if c, err = providers.Token(p); err != nil {
+			return "", "", fmt.Errorf("registry.pull: %w", err)
+		}
+		if token := in.O.getenv(c.TokenEnv); token != "" {
+			return c.User, token, nil
+		}
+	}
+	if user, token, err := in.loginFor(prefix); err != nil || token != "" {
+		return user, token, err
+	}
 	if p.Name != "token" {
 		return "", "", nil
 	}
-	c, err := providers.Token(p)
-	if err != nil {
-		return "", "", fmt.Errorf("registry.pull: %w", err)
-	}
-	user, token = c.User, in.O.getenv(c.TokenEnv)
-	if token == "" && in.R.Pull != nil {
+	user = c.User
+	if in.R.Pull != nil {
 		user, token = in.R.Pull.User, in.R.Pull.Password
 	}
 	if token == "" {

@@ -79,10 +79,11 @@ type fakeDocker struct {
 	upErr  error             // `compose up` fails
 	upOut  string            // what `compose up` prints
 	onUp   func() error      // when set, runs at each `compose up` and gives its error
-	// schemaFiles are the schema command's compose files, one per run.
-	schemaFiles []string
-	checked     func() // runs when the installer checks Compose's version
-	inspected   func() // runs when the installer looks for a leftover container
+	// schemaFiles are the schema command's compose files, one per run, and schemaEnv the
+	// environment its last run was given; healthFiles and healthEnv the health command's.
+	schemaFiles, schemaEnv, healthFiles, healthEnv []string
+	checked                                        func() // runs when the installer checks Compose's version
+	inspected                                      func() // runs when the installer looks for a leftover container
 	// answer, when it answers (ok), answers a call before anything else.
 	answer func(args string) (out []byte, ok bool, err error)
 	// runner answers `docker run` of the backup runner.
@@ -213,6 +214,12 @@ func (f *fakeDocker) Run(_ context.Context, c Cmd) ([]byte, error) {
 		if f.health == nil {
 			return nil, exitCode(1)
 		}
+		if i := slices.Index(c.Args, "run"); i > 0 { // the health command's own file, the last -f
+			raw, _ := os.ReadFile(c.Args[i-1])
+			f.mu.Lock()
+			f.healthFiles, f.healthEnv = append(f.healthFiles, string(raw)), c.Env
+			f.mu.Unlock()
+		}
 		var req map[string]any
 		body, _ := io.ReadAll(c.Stdin)
 		if err := json.Unmarshal(body, &req); err != nil {
@@ -230,6 +237,7 @@ func (f *fakeDocker) Run(_ context.Context, c Cmd) ([]byte, error) {
 			return nil, err
 		}
 		f.schemaFiles = append(f.schemaFiles, string(raw))
+		f.schemaEnv = c.Env
 		image := regexp.MustCompile(`image: (\S+)`).FindStringSubmatch(string(raw))[1]
 		var req map[string]any
 		body, _ := io.ReadAll(c.Stdin)
@@ -1482,7 +1490,7 @@ func TestFrontStripsHeadersAndPublishesOnTheLoopback(t *testing.T) {
 			t.Errorf("Caddyfile lacks %q:\n%s", want, cf)
 		}
 	}
-	fc, err := frontCompose(e.r.Spec.Front, nil, nil, Loopback, hostAPI{}, "sha256:x", "", false, false, false, nil, nil, false, FrontUID)
+	fc, err := frontCompose(e.r.Spec.Front, nil, nil, Loopback, hostAPI{}, "sha256:x", "", false, false, false, false, nil, nil, false, FrontUID)
 	if err != nil {
 		t.Fatal(err)
 	}

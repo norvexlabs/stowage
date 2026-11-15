@@ -9,7 +9,7 @@
 #   bash test/sweep.sh [cache dir]     (default: XDG_CACHE_HOME, else ~/.cache)
 #
 # Kept on purpose, one copy each, which the next run reuses: the pinned images every run pulls
-# (zot, httpd, cosign, helm, rclone, kind's node, auroraboot, postgres, the front's base) and the newest
+# (zot, httpd, cosign, helm, rclone, pebble and its DNS stub, kind's node, auroraboot, postgres, the front's base) and the newest
 # disk-tools image. A VM kept with E2E_KEEP_VM and its state are the operator's to destroy.
 set -u
 
@@ -53,11 +53,14 @@ run_live() {
 }
 created() { docker inspect -f '{{.Created}}' "$@" 2>/dev/null | head -n1; }
 
-# Registries of dead runs, and their backups' WebDAV server: stowage-e2e-zot-<run>[-mirror|-dav]
+# Registries of dead runs, their backups' WebDAV server and ACME server (Pebble and its DNS stub):
+# stowage-e2e-zot-<run>[-mirror|-dav|-pebble|-challtestsrv]
 # (the smoke test's too: it records its run as lib.sh does).
-for n in $(docker ps -a --format '{{.Names}}' | grep -E '^stowage-e2e-zot-r[0-9a-f]+(-mirror|-dav)?$'); do
+for n in $(docker ps -a --format '{{.Names}}' | grep -E '^stowage-e2e-zot-r[0-9a-f]+(-mirror|-dav|-pebble|-challtestsrv)?$'); do
 	r=${n#stowage-e2e-zot-}
 	r=${r%-mirror}
+	r=${r%-pebble}
+	r=${r%-challtestsrv}
 	run_live "${r%-dav}" "$(created "$n")" || docker rm -f "$n" >/dev/null 2>&1
 done
 

@@ -11,6 +11,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -71,6 +72,7 @@ func published(t *testing.T, c *Client, prefix string) ([]Entry, v1.Hash) {
 	var raw map[string]any
 	_ = json.Unmarshal(body, &raw)
 	raw["subject"] = v1.Descriptor{MediaType: imt, Digest: ih, Size: isz}
+	raw["annotations"] = map[string]string{"dev.sigstore.bundle.predicateType": "p"}
 	body, _ = json.Marshal(raw)
 	repo, _ := c.Repo(prefix + "/notes-api")
 	for _, bl := range append([]Blob{sig.Config}, sig.Layers...) {
@@ -152,6 +154,58 @@ func TestExportImportKeepsDigestsTagsAndReferrers(t *testing.T) {
 	// Again: everything is there, and nothing changes.
 	if _, err := c.Import(ctx, a, dst+"/site/notes", nil, nil); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// An archive read under a prefix lists a manifest's referrers as the registry it was exported from
+// does (their annotations; their type the manifest's own, as the OCI spec gives it, where this
+// test registry lists the config's), reads them by digest, and holds nothing else.
+func TestAnArchiveReadsAsTheRegistryItCameFrom(t *testing.T) {
+	src := referrers(t)
+	c := New(authn.DefaultKeychain)
+	ctx := context.Background()
+	entries, sig := published(t, c, src+"/p")
+	a, err := ReadArchive(export(t, c, src+"/p", entries))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	from, _ := name.NewDigest(src + "/p/notes-api@" + entries[0].Digest)
+	want, err := c.Referrers(ctx, from, kind)
+	if err != nil || len(want) != 1 {
+		t.Fatalf("the registry's referrers: %+v %v", want, err)
+	}
+	r := a.Under("mirror.example/site/notes/")
+	idx, _ := name.NewDigest("mirror.example/site/notes/notes-api@" + entries[0].Digest)
+	got, err := r.Referrers(ctx, idx, kind)
+	if err != nil || len(got) != 1 || got[0].Digest != sig || got[0].ArtifactType != string(kind) || got[0].Annotations["dev.sigstore.bundle.predicateType"] != "p" || got[0].Size != want[0].Size {
+		t.Fatalf("referrers %+v %v, want %+v", got, err, want)
+	}
+	if got, err := r.Referrers(ctx, idx, "application/other"); err != nil || len(got) != 0 {
+		t.Errorf("another type: %+v %v", got, err)
+	}
+	// The release's digest has no referrer; another prefix's repository holds nothing.
+	rel, _ := name.NewDigest("mirror.example/site/notes/notes-release@" + entries[1].Digest)
+	if got, err := r.Referrers(ctx, rel, kind); err != nil || len(got) != 0 {
+		t.Errorf("the release's referrers: %+v %v", got, err)
+	}
+	other, _ := name.NewDigest("other.example/x/notes-api@" + entries[0].Digest)
+	if got, err := r.Referrers(ctx, other, kind); err != nil || len(got) != 0 {
+		t.Errorf("another prefix: %+v %v", got, err)
+	}
+	art, h, err := r.GetArtifact(ctx, idx.Context().Digest(sig.String()), kind)
+	if err != nil || art == nil || string(art.Data) != `{"sig":1}` || h != sig {
+		t.Fatalf("the referrer: %+v %v %v", art, h, err)
+	}
+	if _, _, err := r.GetArtifact(ctx, idx.Context().Digest(sig.String()), "application/other"); !errors.Is(err, ErrNotArtifact) {
+		t.Errorf("another type: %v", err)
+	}
+	missing := idx.Context().Digest("sha256:" + strings.Repeat("0", 64))
+	if art, _, err := r.GetArtifact(ctx, missing, kind); err != nil || art != nil {
+		t.Errorf("a digest not held: %+v %v", art, err)
+	}
+	if art, _, err := r.GetArtifact(ctx, other.Context().Digest(sig.String()), kind); err != nil || art != nil {
+		t.Errorf("another prefix: %+v %v", art, err)
 	}
 }
 

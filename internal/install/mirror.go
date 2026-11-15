@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/google/go-containerregistry/pkg/authn"
+	"github.com/google/go-containerregistry/pkg/name"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 
 	"github.com/norvexlabs/stowage/internal/backup"
@@ -372,6 +373,9 @@ func (in *Installer) MirrorImport(ctx context.Context, file, prefix string, olde
 	if err := releaseTags(a, m, h, yanks); err != nil {
 		return fmt.Errorf("%s: %w", file, err)
 	}
+	if err := in.archiveSigned(ctx, a, prefix, m, h, yanks); err != nil {
+		return fmt.Errorf("%s: %w", file, err)
+	}
 	// The release's own repositories, and no other project's: its images are the ones this
 	// installer's project names (an image another release adds needs that release's installer).
 	ours := map[string]bool{name + "-release": true, name + "-installer": true, name + "-os": true, name + "-disk": true}
@@ -531,6 +535,41 @@ func archivedManifest(a *registry.Archive, name string, h v1.Hash) (*release.Man
 		return nil, fmt.Errorf("its release could not be read (from another Stowage? use that release's installer): %w", err)
 	}
 	return m, nil
+}
+
+// archiveSigned checks, offline and before anything is pushed, that each release manifest the
+// archive carries — its release m at h and each yank it carries — is signed by a key this
+// installer trusts, as an install checks the release it reads (checkSigned, the same verifier),
+// the signatures read from the archive's referrers. The release names every other manifest by
+// digest (releaseTags), so its signature covers them. An installer that trusts no key (its project
+// does not sign) checks nothing, as its installs check nothing.
+func (in *Installer) archiveSigned(ctx context.Context, a *registry.Archive, prefix string, m *release.Manifest, h v1.Hash, yanks map[string]archivedYank) error {
+	trust, err := trusted("this installer", in.R.Keys)
+	if err != nil || trust == nil {
+		return err
+	}
+	repo, err := name.NewRepository(prefix+"/"+m.Name+"-release", name.Insecure)
+	if err != nil {
+		return fmt.Errorf("--to: %w", err)
+	}
+	r := a.Under(prefix)
+	check := func(y *release.Manifest, d v1.Hash) error {
+		err := checkSigned(ctx, r, repo, d, y, trust)
+		if _, refused := Refusal(err); refused {
+			return refuse("export the release again from its registry, whose signatures an export carries, or import the archive with the "+providers.Ctl(m.ShortName)+" of a release whose keys sign it",
+				"%w: nothing imported", err)
+		}
+		return err
+	}
+	if err := check(m, h); err != nil {
+		return err
+	}
+	for _, t := range sortedKeys(yanks) {
+		if err := check(yanks[t].m, yanks[t].h); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // yankedAfter are the publications of m's channel in read after m's, yanked since, each signed by

@@ -365,10 +365,10 @@ type Status struct {
 	// no error, the gate ended without a verdict.
 	BootJudged      *BootJudged `json:"boot_judged,omitempty"`
 	BootJudgedError string      `json:"boot_judged_error,omitempty"`
-	// RegistryLogin is the host of the mirror the VM holds a login for (`registry-login`): never
-	// the login itself. Empty when it holds none.
+	// RegistryLogin is the host the VM holds a login for (`registry-login`), the release's own
+	// registry's or its mirror's: never the login itself. Empty when it holds none.
 	RegistryLogin string `json:"registry_login,omitempty"`
-	// RegistryLoginError: the login file held cannot be read (the reads of the mirror fail on it),
+	// RegistryLoginError: the login file held cannot be read (the reads of its host fail on it),
 	// naming the file and the fix; never a value.
 	RegistryLoginError string `json:"registry_login_error,omitempty"`
 	Job                string `json:"job"` // the last job's state, idle when none ran

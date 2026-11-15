@@ -54,9 +54,10 @@ func (h *Hostd) changed() { h.stateGen.Add(1) }
 // the next request starts another.
 func healthWait(r *Release) int {
 	t := 30
-	var c providers.RuntimeCommand
-	if r.Spec.Health.Name == "command" && r.Spec.Health.Decode(&c) == nil && c.TimeoutS > 0 {
-		t = c.TimeoutS
+	if r.Spec.Health.Name == "command" {
+		if c, err := providers.DecodeCommand(r.Spec.Health, r.Spec.Images); err == nil && c.TimeoutS > 0 {
+			t = c.TimeoutS
+		}
 	}
 	return 60 + 30 + 2*t
 }

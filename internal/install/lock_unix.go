@@ -7,6 +7,9 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -63,6 +66,70 @@ func lockHeld(path string) bool {
 		}
 	}
 	return false
+}
+
+// keepFromChildren marks the descriptor a path names close-on-exec (inheritedFD): a descriptor a
+// parent handed this run (childLogin's login) reaches no process this run starts (helm, kubectl,
+// a hook), whether its read then succeeds or not. Any other path is left as it is.
+func keepFromChildren(path string) {
+	if fd, ok := inheritedFD(path); ok {
+		unix.CloseOnExec(fd)
+	}
+}
+
+// fdPath is a path naming one of this process's descriptors: /dev/fd/N, /proc/self/fd/N,
+// /proc/thread-self/fd/N, /proc/PID/fd/N and /proc/PID/task/TID/fd/N (PID this process's or one
+// of its threads', ownProcess).
+var fdPath = regexp.MustCompile(`^/(?:dev|proc/(self|thread-self|[0-9]+)(?:/task/[0-9]+)?)/fd/([0-9]+)$`)
+
+// inheritedFD is the descriptor path names (fdPath, once resolveFDPath resolved it: a symlink to
+// /dev/fd/N names N), past standard error: those three (/dev/stdin among their spellings) are the
+// run's own.
+func inheritedFD(path string) (int, bool) {
+	m := fdPath.FindStringSubmatch(resolveFDPath(path))
+	if m == nil || !ownProcess(m[1]) {
+		return 0, false
+	}
+	fd, err := strconv.Atoi(m[2])
+	return fd, err == nil && fd > 2
+}
+
+// ownProcess reports whether id, fdPath's process part, names this process: empty (/dev/fd),
+// self, thread-self, this process's id or one of its threads' (/proc/self/task/<id>).
+func ownProcess(id string) bool {
+	switch id {
+	case "", "self", "thread-self", strconv.Itoa(os.Getpid()):
+		return true
+	}
+	_, err := os.Stat("/proc/self/task/" + id)
+	return err == nil
+}
+
+// resolveFDPath is path with its symlinks resolved up to the descriptor it names: each directory
+// through filepath.EvalSymlinks (/dev/fd to /proc/<pid>/fd), a link it ends in followed until the
+// path is one fdPath reads, whose own link (pipe:[…], a file's path) is never followed. A path
+// that cannot be resolved is taken cleaned.
+func resolveFDPath(path string) string {
+	p := filepath.Clean(path)
+	for range 40 { // the kernel's own bound on a chain of links
+		dir, err := filepath.EvalSymlinks(filepath.Dir(p))
+		if err != nil {
+			return p
+		}
+		p = filepath.Join(dir, filepath.Base(p))
+		if fdPath.MatchString(p) {
+			return p
+		}
+		target, err := os.Readlink(p)
+		if err != nil {
+			return p
+		}
+		if !filepath.IsAbs(target) {
+			target = filepath.Join(dir, target)
+		}
+		p = filepath.Clean(target)
+	}
+	return p
 }
 
 // lockTableReads is how many times lockHeld reads the kernel's lock table before it judges a

@@ -3,6 +3,7 @@ package registry
 import (
 	"archive/tar"
 	"bytes"
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -372,6 +373,100 @@ func (a *Archive) Read(h v1.Hash) ([]byte, error) {
 		return nil, fmt.Errorf("manifest %s: %d bytes, more than %d", h, size, maxManifest)
 	}
 	return io.ReadAll(r)
+}
+
+// Under reads the archive as a registry holding it under prefix would, offline: what an import
+// there would push, read before it pushes (a signature's check, sigverify.Registry). A manifest is
+// read from the archive checked against its digest, as from a registry.
+func (a *Archive) Under(prefix string) *ArchiveRegistry {
+	return &ArchiveRegistry{a: a, prefix: strings.TrimSuffix(prefix, "/")}
+}
+
+// ArchiveRegistry is an archive read as a registry (Archive.Under).
+type ArchiveRegistry struct {
+	a      *Archive
+	prefix string
+}
+
+// rel is the archive's repository repo names under the prefix, "" when none.
+func (r *ArchiveRegistry) rel(repo name.Repository) string {
+	for _, d := range r.a.Manifests {
+		rel := d.Annotations[RepositoryAnnotation]
+		if n, err := name.NewRepository(r.prefix+"/"+rel, name.Insecure); err == nil && n.Name() == repo.Name() {
+			return rel
+		}
+	}
+	return ""
+}
+
+// Referrers lists the archive's manifests in d's repository whose subject is d, as a registry's
+// referrers API would: their artifact type (the config's type when they name none) and
+// annotations read from each manifest, filtered as Client.Referrers filters them.
+func (r *ArchiveRegistry) Referrers(_ context.Context, d name.Digest, t types.MediaType) ([]v1.Descriptor, error) {
+	rel := r.rel(d.Context())
+	var out []v1.Descriptor
+	seen := map[v1.Hash]bool{}
+	for _, m := range r.a.Manifests {
+		if rel == "" || m.Annotations[RepositoryAnnotation] != rel || m.Annotations[RefNameAnnotation] != "" || seen[m.Digest] {
+			continue // a referrer is archived untagged, in its subject's repository
+		}
+		body, err := r.a.Read(m.Digest)
+		if err != nil {
+			return nil, fmt.Errorf("referrers of %s: %w", d, err)
+		}
+		var mf struct {
+			ArtifactType string            `json:"artifactType"`
+			Config       v1.Descriptor     `json:"config"`
+			Subject      *v1.Descriptor    `json:"subject"`
+			Annotations  map[string]string `json:"annotations"`
+		}
+		if json.Unmarshal(body, &mf) != nil || mf.Subject == nil || mf.Subject.Digest.String() != d.DigestStr() {
+			continue
+		}
+		seen[m.Digest] = true
+		ref := v1.Descriptor{MediaType: m.MediaType, Digest: m.Digest, Size: m.Size, ArtifactType: cmp.Or(mf.ArtifactType, string(mf.Config.MediaType)), Annotations: mf.Annotations}
+		if mayRefer(ref, t) {
+			out = append(out, ref)
+		}
+	}
+	return out, nil
+}
+
+// GetArtifact reads the artifact of type want at ref, a digest, from the archive, as
+// Client.GetArtifact reads it: nil when the archive does not hold it in ref's repository.
+func (r *ArchiveRegistry) GetArtifact(_ context.Context, ref name.Reference, want types.MediaType) (*Artifact, v1.Hash, error) {
+	d, ok := ref.(name.Digest)
+	if !ok {
+		return nil, v1.Hash{}, fmt.Errorf("%s: an archive is read by digest", ref)
+	}
+	h, err := v1.NewHash(d.DigestStr())
+	if err != nil {
+		return nil, v1.Hash{}, err
+	}
+	if _, held := r.a.blobs[h.Hex]; !held || h.Algorithm != "sha256" || r.rel(d.Context()) == "" {
+		return nil, v1.Hash{}, nil
+	}
+	body, err := r.a.Read(h)
+	if err != nil {
+		return nil, v1.Hash{}, err
+	}
+	a, err := artifactOf(ref, body, want, func(l v1.Descriptor) ([]byte, error) {
+		if l.Size > maxArtifactBlob {
+			return nil, fmt.Errorf("%s: blob of %d bytes exceeds %d: %w", ref, l.Size, maxArtifactBlob, ErrTooLarge)
+		}
+		rd, size, err := r.a.open(l.Digest)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", ref, err)
+		}
+		if size != l.Size {
+			return nil, fmt.Errorf("%s: blob size %d, manifest says %d", ref, size, l.Size)
+		}
+		return io.ReadAll(rd)
+	})
+	if err != nil {
+		return nil, v1.Hash{}, err
+	}
+	return a, h, nil
 }
 
 // verifying reads a blob of left bytes, and fails on its last byte when the content is not the one

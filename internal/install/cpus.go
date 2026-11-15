@@ -66,3 +66,17 @@ func (p hostPlan) giveCPUs(extra map[string]any, name string) {
 	env[HostCoresVar] = strconv.Itoa(len(strings.Split(set, ",")))
 	extra["environment"] = env
 }
+
+// giveShape adds the install's deploy shape to a service's environment, beside what the other
+// gives put there.
+func (p hostPlan) giveShape(extra map[string]any) {
+	if p.Shape == "" {
+		return
+	}
+	env, _ := extra["environment"].(map[string]string)
+	if env == nil {
+		env = map[string]string{}
+	}
+	env[ShapeVar] = p.Shape
+	extra["environment"] = env
+}

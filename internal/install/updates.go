@@ -206,6 +206,9 @@ func (in *Installer) K8sUpdates(ctx context.Context, channel, v string) (Update,
 		return Update{}, err
 	}
 	prefix := cmp.Or(in.O.K8s.Registry, cur.Registry)
+	if err := in.k8sLogins(ctx, prefix, false); err != nil { // the pull Secret's login reads the registry
+		return Update{}, err
+	}
 	c, err := in.registryClient(prefix)
 	if err != nil {
 		return Update{}, err

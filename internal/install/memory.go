@@ -16,6 +16,11 @@ const (
 	HostCPUsVar = "STOWAGE_HOST_CPUS"    // the host's online CPUs
 )
 
+// ShapeVar is the deploy shape every service's container is given on Docker and the VM (docker or
+// kairos; a chart's pods are given kubernetes by the chart): on kairos the machine is the stack's
+// alone, so a service may judge the host's memory rather than its own cgroup's.
+const ShapeVar = "STOWAGE_SHAPE"
+
 // MinMemLimit is the least limit a share gives.
 const MinMemLimit = int64(spec.MinMemLimit)
 
@@ -33,6 +38,8 @@ type hostPlan struct {
 	Tables map[string]string
 	// Sockets are each start-first service's update_socket directory, which UpdateVolume mounts.
 	Sockets map[string]string
+	// Shape is the install's deploy shape, every service's ShapeVar; "" gives none.
+	Shape string
 }
 
 // memoryPlan is the release's memory shares on host h, read at each start, so a host given more

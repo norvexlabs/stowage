@@ -218,6 +218,11 @@ func (in *Installer) changes(env *EnvFile) (next *EnvFile, secrets map[string]bo
 	if err != nil {
 		return nil, nil, publish{}, err
 	}
+	if s.HasFront() {
+		if err := in.acmeVar(next, mode); err != nil {
+			return nil, nil, publish{}, err
+		}
+	}
 	in.frontVars(next, mode, pub, domains)
 	in.tuneVar(next)
 	in.profilesVar(next)

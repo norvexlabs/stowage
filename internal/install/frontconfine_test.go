@@ -28,7 +28,7 @@ func TestTheFrontIsConfined(t *testing.T) {
 	t.Parallel()
 	f := l4TLSFront()
 	f.PublishCA = &spec.PublishCA{Volume: "ca"}
-	raw, err := frontCompose(f, nil, func(string) string { return "" }, "byo", hostAPI{}, "sha256:x", byoCA, false, false, false, nil, nil, false, FrontUID)
+	raw, err := frontCompose(f, nil, func(string) string { return "" }, "byo", hostAPI{}, "sha256:x", byoCA, false, false, false, false, nil, nil, false, FrontUID)
 	if err != nil {
 		t.Fatal(err)
 	}

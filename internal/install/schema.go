@@ -189,9 +189,9 @@ func (s schema) psql(ctx context.Context, q string) (string, error) {
 // call runs one op of the `command` schema-compat provider (runCommand), in the image its config
 // names, taken from image.
 func (s schema) call(ctx context.Context, image *EnvFile, req map[string]any, resp any) error {
-	var c providers.RuntimeCommand
-	if err := s.in.R.Spec.DB().SchemaCompat.Decode(&c); err != nil {
-		return err
+	c, err := providers.DecodeCommand(s.in.R.Spec.DB().SchemaCompat, s.in.R.Spec.Images)
+	if err != nil {
+		return fmt.Errorf("database.schema_compat: %w", err)
 	}
 	return s.in.runCommand(ctx, commandRun{what: "the schema-compat command", service: SchemaService, file: SchemaCompose,
 		name: containerName(s.stack, SchemaService)}, c, image, s.stack, req, resp)
@@ -207,8 +207,9 @@ type commandRun struct {
 
 // runCommand runs one op of a `command` provider, c, in a confined container of the image its
 // config names, taken from image; the command reaches the stack on its network and receives the
-// recorded values (recordedEnv), the services on the host's network by name (targetHosts). Exit 2 is
-// command.ErrNoAnswer.
+// recorded values its env lists, as the provision hook does (declaredEnv; a file input or a secret
+// delivered as a file as its file, commandFiles), the services on the host's network by name
+// (targetHosts). Exit 2 is command.ErrNoAnswer.
 func (in *Installer) runCommand(ctx context.Context, r commandRun, c providers.RuntimeCommand, image, stack *EnvFile, req map[string]any, resp any) error {
 	ref, ok := image.Get(ImageVar(c.Image))
 	if !ok {
@@ -225,7 +226,13 @@ func (in *Installer) runCommand(ctx context.Context, r commandRun, c providers.R
 	if err != nil {
 		return err
 	}
-	svc := confined(r.service, strings.ReplaceAll(ref, "$", "$$"), user, c.Cmd, in.recordedEnv(stack))
+	files := in.declaredFiles(c.Keys())
+	paths, err := in.commandFiles(stack, files)
+	if err != nil {
+		return err
+	}
+	svc := confined(r.service, strings.ReplaceAll(ref, "$", "$$"), user, c.Cmd, in.declaredEnv(stack, c.Keys()))
+	mountFiles(svc, files, in.fileVarOf)
 	if hosts := in.targetHosts(); len(hosts) > 0 {
 		svc["extra_hosts"] = hosts
 	}
@@ -253,7 +260,7 @@ func (in *Installer) runCommand(ctx context.Context, r commandRun, c providers.R
 	out := &capped{limit: maxSchemaAnswer}
 	_, err = in.runNamed(runCtx, r.name, Cmd{
 		Args:   append(in.composeBase(r.file), "run", "--rm", "--no-deps", "-T", "--name", r.name, r.service),
-		Env:    stack.Environ(in.O.environ()),
+		Env:    append(stack.Environ(in.O.environ()), paths...),
 		Stdin:  bytes.NewReader(body),
 		Stdout: out,
 	})

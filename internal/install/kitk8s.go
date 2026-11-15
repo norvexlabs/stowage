@@ -35,9 +35,9 @@ const maxK8sName = 63
 func (in *Installer) k8sKitInstaller(ctx context.Context, h *spec.Handoff, step *spec.HandoffStep) (*Installer, *k8sHookPlan, error) {
 	in.givenCA = true
 	k, m := in.O.K8s, in.R.Manifest
-	kin := *in
-	kin.O.K8s.kit = h.Name
-	if name := kin.O.K8s.hookJob(); len(name) > maxK8sName {
+	kk := k
+	kk.kit = h.Name
+	if name := kk.hookJob(); len(name) > maxK8sName {
 		return nil, nil, fmt.Errorf("the Job %s is more than %d characters: the release's name and the handoff's come to too long a name", name, maxK8sName)
 	}
 	if err := in.checkTarget(); err != nil {
@@ -57,6 +57,11 @@ func (in *Installer) k8sKitInstaller(ctx context.Context, h *spec.Handoff, step 
 		return nil, nil, fmt.Errorf("release %s in %s runs %s %s (revision %d), and this installer carries %s (revision %d): issue it with the installer of %s",
 			k.Release, k.Namespace, m.Name, r.Version, r.Revision, m.ProjectVersion, m.Revision, r.Version)
 	}
+	// The registry is read with the pull Secret's login (k8sLogins): a handoff writes no pull
+	// Secret.
+	if err := in.k8sLogins(ctx, cur.Registry, false); err != nil {
+		return nil, nil, err
+	}
 	ref, err := in.hookImageOf(ctx, cur.Registry, kitUse)
 	if err != nil {
 		return nil, nil, err
@@ -68,6 +73,8 @@ func (in *Installer) k8sKitInstaller(ctx context.Context, h *spec.Handoff, step 
 	if err := in.k8sReadPull(ctx, p); err != nil {
 		return nil, nil, err
 	}
+	kin := *in // with the login this run took
+	kin.O.K8s.kit = h.Name
 	return &kin, p, nil
 }
 

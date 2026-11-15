@@ -815,16 +815,109 @@ func TestProvisionSetOfAFileInputNamesTheRerun(t *testing.T) {
 	}
 }
 
-// A command provider's container gets no file input's encoded value, and no text input loses out.
-func TestACommandProviderGetsNoFileInput(t *testing.T) {
+// A `command` provider's container, the schema-compat's and the health's alike, receives the
+// recorded keys its env lists, never a secret or a safe default it does not list; a file input and
+// a secret delivered as a file it lists reach it as their files, written when absent, never as
+// variables.
+func TestACommandProviderGetsOnlyItsEnv(t *testing.T) {
+	t.Parallel()
+	for _, kind := range []string{"schema", "health"} {
+		t.Run(kind, func(t *testing.T) {
+			t.Parallel()
+			e := newEnv(t)
+			s := e.r.Spec
+			asFileSession(s)
+			s.Inputs = append(s.Inputs, spec.Input{Key: "CA", Prompt: "CA file", Optional: true, Type: spec.InputFile})
+			s.Secrets = append(s.Secrets, spec.Secret{Key: "API_TOKEN", Gen: "hex32"})
+			declared := []any{"ADMIN_EMAIL", "POSTGRES_PASSWORD", "SESSION_SECRET", "CA"}
+			c := spec.Provider{Name: "command", Config: map[string]any{"image": "api", "cmd": []any{"notes-api", "x"}, "env": declared}}
+			if kind == "schema" {
+				s.Database.SchemaCompat = c
+			} else {
+				s.Health = c
+			}
+			if err := os.MkdirAll(e.dir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			f := NewEnvFile()
+			for k, v := range map[string]string{"ADMIN_EMAIL": "a@b", "POSTGRES_PASSWORD": "pg", "SESSION_SECRET": "sess", "API_TOKEN": "tok",
+				"SECURE_COOKIES": "true", "CA": encodeFileInput([]byte("ca")), FileSaltVar: "salt", ImageVar("api"): "api@sha256:1", "COMPOSE_PROJECT_NAME": "notes"} {
+				f.Set(k, v)
+			}
+			in := e.installer(nil)
+			e.docker.schema = func(string, map[string]any) (string, error) { return `{"version": 1}`, nil }
+			e.docker.health = func(map[string]any) (string, error) { return `{"ready": true}`, nil }
+			var file string
+			var environ []string
+			if kind == "schema" {
+				var out struct{}
+				if err := (schema{in: in, stack: f}).call(context.Background(), f, map[string]any{"op": "schema.current"}, &out); err != nil {
+					t.Fatal(err)
+				}
+				file, environ = e.docker.schemaFiles[0], e.docker.schemaEnv
+			} else {
+				if err := in.probeCommand(context.Background(), f); err != nil {
+					t.Fatal(err)
+				}
+				file, environ = e.docker.healthFiles[0], e.docker.healthEnv
+			}
+			var cf struct {
+				Services map[string]struct{ Environment, Volumes []string }
+			}
+			if err := yaml.Unmarshal([]byte(file), &cf); err != nil {
+				t.Fatal(err)
+			}
+			if len(cf.Services) != 1 {
+				t.Fatalf("services %v", cf.Services)
+			}
+			for _, svc := range cf.Services {
+				for _, k := range []string{"ADMIN_EMAIL", "POSTGRES_PASSWORD", spec.SecretFileVar("SESSION_SECRET") + "=" + HookInputsDir + "/SESSION_SECRET", spec.FileVar("CA") + "=" + HookInputsDir + "/CA"} {
+					if !slices.Contains(svc.Environment, k) {
+						t.Errorf("environment %v lacks %s", svc.Environment, k)
+					}
+				}
+				for _, k := range []string{"API_TOKEN", "SECURE_COOKIES", "SESSION_SECRET", "CA", FileSaltVar} {
+					if slices.Contains(svc.Environment, k) {
+						t.Errorf("environment %v holds %s, which its env does not list as a variable", svc.Environment, k)
+					}
+				}
+				if len(svc.Volumes) != 2 {
+					t.Errorf("volumes %v", svc.Volumes)
+				}
+			}
+			// Each file is written, its path given to compose.
+			for key, want := range map[string]string{spec.SecretFileVar("SESSION_SECRET"): "sess", spec.FileVar("CA"): "ca"} {
+				i := slices.IndexFunc(environ, func(v string) bool { return strings.HasPrefix(v, key+"=./"+InputFilesDir+"/") })
+				if i < 0 {
+					t.Errorf("compose was not given %s: %v", key, environ)
+					continue
+				}
+				if got := read(t, filepath.Join(e.dir, strings.TrimPrefix(environ[i], key+"=./"))); got != want {
+					t.Errorf("%s holds %q", key, got)
+				}
+			}
+		})
+	}
+}
+
+// A command listing a secret delivered as a file, in an install recording no salt to name its file
+// by, is refused before it runs, naming the install that records it.
+func TestACommandProviderNeedsTheSaltOfASecretFile(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t)
-	e.r.Spec.Inputs = append(e.r.Spec.Inputs, spec.Input{Key: "CA", Prompt: "CA file", Optional: true, Type: spec.InputFile})
+	asFileSession(e.r.Spec)
+	e.r.Spec.Health = spec.Provider{Name: "command", Config: map[string]any{"image": "api", "cmd": []any{"notes-api", "ready"}, "env": []any{"SESSION_SECRET"}}}
 	f := NewEnvFile()
-	f.Set("CA", encodeFileInput([]byte("x")))
-	f.Set("ADMIN_EMAIL", "a@b")
-	keys := e.installer(nil).recordedEnv(f)
-	if slices.Contains(keys, "CA") || !slices.Contains(keys, "ADMIN_EMAIL") {
-		t.Errorf("keys %v", keys)
+	f.Set("SESSION_SECRET", "sess")
+	f.Set(ImageVar("api"), "api@sha256:1")
+	e.docker.health = func(map[string]any) (string, error) { return `{"ready": true}`, nil }
+	in := e.installer(nil)
+	err := in.probeCommand(context.Background(), f)
+	if err == nil || !strings.Contains(err.Error(), "records no "+FileSaltVar) || !strings.Contains(err.Error(), in.ctl()+" install --dir "+e.dir) {
+		t.Fatalf("%v", err)
+	}
+	if len(e.docker.healthFiles) != 0 {
+		t.Error("the command ran")
 	}
 }
 

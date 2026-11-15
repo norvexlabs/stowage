@@ -18,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/norvexlabs/stowage/internal/command"
 	"github.com/norvexlabs/stowage/internal/spec"
 	"github.com/norvexlabs/stowage/internal/testutil"
 )
@@ -1049,5 +1050,18 @@ func TestStatusCarriesTheBootID(t *testing.T) {
 	call(t, d.Handler(), "GET", "/v1/status", nil, &st)
 	if st.BootID != "6f1c2d3e-0000-4000-8000-000000000001" {
 		t.Errorf("read again: %q", st.BootID)
+	}
+}
+
+// healthWait takes the health command's timeout_s as the one decode reads it: a timeout the
+// provider refuses bounds nothing.
+func TestHealthWaitTakesTheCommandsTimeout(t *testing.T) {
+	t.Parallel()
+	for timeout, want := range map[int]int{45: 60 + 30 + 90, command.MaxTimeoutS + 1: 60 + 30 + 60} {
+		r := &Release{Spec: &spec.Spec{Images: map[string]spec.Image{"api": {Context: "."}}, Health: spec.Provider{Name: "command", Config: map[string]any{
+			"image": "api", "cmd": []any{"check"}, "env": []any{}, "timeout_s": timeout}}}}
+		if got := healthWait(r); got != want {
+			t.Errorf("timeout_s %d: %d, want %d", timeout, got, want)
+		}
 	}
 }

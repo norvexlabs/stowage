@@ -189,6 +189,15 @@ func (in *Installer) k8sProvisioned(ctx context.Context, p *k8sHookPlan) error {
 		}
 		return nil
 	}
+	awaited, err := in.k8sRestoreAwaited(ctx)
+	if err != nil {
+		return in.hookFailed(err, outputKeys(nil, p.hook, nil))
+	}
+	if awaited {
+		in.O.logf("not provisioned: the provision hook's values in the Secret %s came with --secrets from another install and belong to its data (label %s): load its backup into the release's database, then `%s` runs the hook",
+			in.O.K8s.provisionName(), restoreAwaitedLabel, in.k8sCtl("provision"))
+		return nil
+	}
 	if err := in.k8sReadPull(ctx, p); err != nil {
 		return in.hookFailed(err, outputKeys(nil, p.hook, nil))
 	}
@@ -244,6 +253,10 @@ func (in *Installer) K8sProvision(ctx context.Context) error {
 			k.Release, k.Namespace, m.Name, r.Version, r.Revision, m.ProjectVersion, m.Revision, r.Version)
 	}
 	in.O.NoProvision = false // the verb runs the hook
+	// The registry is read with the pull Secret's login (k8sLogins).
+	if err := in.k8sLogins(ctx, cur.Registry, false); err != nil {
+		return err
+	}
 	p, err := in.k8sHookPlanFor(ctx, cur.Registry)
 	if err != nil {
 		return err
@@ -251,7 +264,18 @@ func (in *Installer) K8sProvision(ctx context.Context) error {
 	if err := in.k8sReadPull(ctx, p); err != nil {
 		return err
 	}
-	return in.k8sRunHook(ctx, p, in.O.Set)
+	awaited, err := in.k8sRestoreAwaited(ctx)
+	if err != nil {
+		return err
+	}
+	if err := in.k8sRunHook(ctx, p, in.O.Set); err != nil {
+		return err
+	}
+	// Run by the operator: the data is what they chose, the wait a --secrets install began is over.
+	if awaited {
+		in.k8sRestoreDone(ctx)
+	}
+	return nil
 }
 
 // hookFailed is a failed run of the hook on the release, which runs on: it names the command that
@@ -521,6 +545,12 @@ func (in *Installer) applyHookObjects(ctx context.Context) error {
 // patchOutputs merges change into the outputs Secret's data (nil removes a key), from a private
 // file: the values never reach a command line.
 func (in *Installer) patchOutputs(ctx context.Context, change map[string]*string) error {
+	return in.patchSecret(ctx, in.O.K8s.hookName(), map[string]any{"data": patchData(change)})
+}
+
+// patchData is change as a Secret's data in a merge patch: a value base64-encoded, nil removing
+// its key.
+func patchData(change map[string]*string) map[string]any {
 	data := map[string]any{}
 	for key, v := range change {
 		if v == nil {
@@ -529,7 +559,13 @@ func (in *Installer) patchOutputs(ctx context.Context, change map[string]*string
 			data[key] = base64.StdEncoding.EncodeToString([]byte(*v))
 		}
 	}
-	raw, err := json.Marshal(map[string]any{"data": data})
+	return data
+}
+
+// patchSecret applies patch to the Secret name as a merge patch, from a private file (never a
+// command line, which other users of the machine can read).
+func (in *Installer) patchSecret(ctx context.Context, name string, patch map[string]any) error {
+	raw, err := json.Marshal(patch)
 	if err != nil {
 		return err
 	}
@@ -542,7 +578,7 @@ func (in *Installer) patchOutputs(ctx context.Context, change map[string]*string
 	if err := os.WriteFile(file, raw, 0o600); err != nil {
 		return err
 	}
-	_, err = in.kubectl(ctx, Cmd{Args: []string{"patch", "secret", in.O.K8s.hookName(), "--type", "merge", "--patch-file", file}})
+	_, err = in.kubectl(ctx, Cmd{Args: []string{"patch", "secret", name, "--type", "merge", "--patch-file", file}})
 	return err
 }
 

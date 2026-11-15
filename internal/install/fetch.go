@@ -354,18 +354,21 @@ func (in *Installer) mirrorPull(prefix, secret string) ([]byte, error) {
 	return nil, refuse(fix, "--image-pull-login: no Docker login for %s", host)
 }
 
-// keychain is the login the installer's registry reads use: the project's pull account on its
-// own registry, as the image pulls use it (pullAccount); anonymous on the registry of a project
-// whose images are public; else (a mirror included) the Docker client's own login.
+// keychain is the login the installer's registry reads use: the account the image pulls use
+// (pullAccount: TOKEN_ENV's, the login held, the baked one on the release's own registry; the
+// login held on a mirror); else anonymous on the registry of a project whose images are public;
+// else the Docker client's own login.
 func (in *Installer) keychain(prefix string) (authn.Keychain, error) {
-	if in.R.Spec.Registry.Pull.Name == "none" && prefix == in.R.Spec.Registry.Prefix {
+	user, token, err := in.pullAccount(prefix)
+	switch {
+	case err != nil:
+		return nil, err
+	case token != "":
+		return registry.Fixed(authn.FromConfig(authn.AuthConfig{Username: user, Password: token})), nil
+	case in.R.Spec.Registry.Pull.Name == "none" && prefix == in.R.Spec.Registry.Prefix:
 		return registry.Fixed(authn.Anonymous), nil
 	}
-	user, token, err := in.pullAccount(prefix)
-	if err != nil || token == "" {
-		return in.O.login(), err
-	}
-	return registry.Fixed(authn.FromConfig(authn.AuthConfig{Username: user, Password: token})), nil
+	return in.O.login(), nil
 }
 
 // readers bounds the release manifests findRelease reads at once.
@@ -557,7 +560,7 @@ func trusted(src string, keys map[string][]byte) (*sigverify.Verifier, error) {
 // checkSigned refuses the release m, read from repo with the digest h, unless h carries a
 // signature by a key trust holds; with no trust (the install's project does not sign) nothing is
 // checked. Once an install trusts a key, an unsigned release is refused: no silent downgrade.
-func checkSigned(ctx context.Context, c *registry.Client, repo name.Repository, h v1.Hash, m *release.Manifest, trust *sigverify.Verifier) error {
+func checkSigned(ctx context.Context, c sigverify.Registry, repo name.Repository, h v1.Hash, m *release.Manifest, trust *sigverify.Verifier) error {
 	if trust == nil {
 		return nil
 	}
@@ -718,12 +721,7 @@ func (o *Options) execTo(ctx context.Context, exe string, args []string, out io.
 	if o.Exec != nil {
 		return o.Exec(ctx, exe, args)
 	}
-	cmd := exec.CommandContext(ctx, exe, args...)
-	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, out, o.Log
-	if o.handLock != nil {
-		flock.Hand(cmd, o.handLock)
-	}
-	cmd.Cancel = func() error { return cmd.Process.Signal(os.Interrupt) }
+	cmd := o.childCmd(ctx, exe, args, out)
 	err := cmd.Run()
 	var ee *exec.ExitError
 	if errors.As(err, &ee) && ee.ExitCode() > 0 {
@@ -731,6 +729,22 @@ func (o *Options) execTo(ctx context.Context, exe string, args []string, out io.
 	}
 	return err
 }
+
+// childCmd is the installer execTo runs: its descriptors past standard error are childFiles from
+// childFD(0) on, then the lock handed (flock.Hand), whose number its environment names.
+func (o *Options) childCmd(ctx context.Context, exe string, args []string, out io.Writer) *exec.Cmd {
+	cmd := exec.CommandContext(ctx, exe, args...)
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, out, o.Log
+	cmd.ExtraFiles = slices.Clone(o.childFiles)
+	if o.handLock != nil {
+		flock.Hand(cmd, o.handLock)
+	}
+	cmd.Cancel = func() error { return cmd.Process.Signal(os.Interrupt) }
+	return cmd
+}
+
+// childFD is the path, in the child execTo runs, of childFiles[i].
+func childFD(i int) string { return fmt.Sprintf("/dev/fd/%d", 3+i) }
 
 // unorderedAlone refuses verb's --unordered without --version, verb as the operator types it
 // (`upgrade`, `k8s upgrade`, verbNewBaseline): the plain verb takes the channel's release, which

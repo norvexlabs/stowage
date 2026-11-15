@@ -47,9 +47,18 @@ carries it:
   and its push, the second logging `waiting for another import into PREFIX` (an interrupt ends the
   wait: `waiting for another import into PREFIX: context canceled`); imports from several
   machines into one mirror are the operators' to order. The bytes are the
-  published ones, so every digest is the same and the signatures still verify there (the import
-  does not check them: an install checks the release when it reads it from the mirror). The
-  release manifest and the channel's tag are pushed last, so the mirror never names a release
+  published ones, so every digest is the same and the signatures still verify there. Before
+  anything is pushed, the import checks offline, with the importing `<short>-stow`'s trusted keys
+  and the verifier an install uses, that the archive's release manifest and each yank it carries
+  are signed by one of them, reading the signatures from the archive's referrers (the release
+  names every other manifest by digest, so its signature covers them, as an install's check of
+  the release does); one unsigned, signed by another key or whose signature does not verify is
+  refused, naming it — `<file>: <name> <version> (revision N, <tag>) is not signed by a key this
+  install trusts: refused (<prefix>/<name>-release@<digest>: <why>): nothing imported`, the fix
+  being to export the release again from its registry, whose signatures an export carries, or to
+  import the archive with the `<short>-stow` of a release whose keys sign it. A `<short>-stow`
+  that trusts no key (its project does not sign) checks nothing, as its installs check nothing.
+  The release manifest and the channel's tag are pushed last, so the mirror never names a release
   whose artifacts it lacks. A blob or manifest whose content is not its digest's, a repository
   path or tag that is not one (`..`), or a repository that is not the release's own
   (`<name>-release`, `-installer`, `-os`, `-disk`, `<name>-<key>` for each image, and the chart's
@@ -76,9 +85,11 @@ carries it:
   `<short>-stow k8s install --image-registry PREFIX --registry-ca FILE` (Kubernetes) and `<short>-stow
   vm create --registry PREFIX --registry-ca FILE` (the Kairos VM). A newer release crosses the
   same way; `upgrade --version`, `updates` and the VM's `upgrade` find it in the mirror.
-- A mirror that refuses anonymous reads: Docker reads it with the Docker client's login,
-  Kubernetes with the pull Secret `--image-pull-login` writes from that login, and the VM with the
-  login `vm create --registry-login-file FILE` gives it over SSH (or `sudo <short>-stow
+- A mirror that refuses anonymous reads: Docker reads it with the install's own login
+  (`--registry-login-file FILE`, or `registry-login FILE` later; [installer](installer.md)), else
+  the Docker client's login; Kubernetes with the pull Secret `--registry-login-file FILE` writes,
+  or `--image-pull-login` from the Docker client's login ([kubernetes](kubernetes.md)); and the VM
+  with the login `vm create --registry-login-file FILE` gives it over SSH (or `sudo <short>-stow
   registry-login -` on the VM), for the mirror's host alone ([vm](vm.md)).
 - `vm create --create opentofu` also needs its module's OpenTofu provider, which `tofu init`
   fetches from the OpenTofu registry: on a site without internet, give `tofu` a provider mirror

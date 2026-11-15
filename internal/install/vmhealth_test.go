@@ -617,7 +617,7 @@ func TestTheProbeTakesAnIPv6AddressWithoutIPv4(t *testing.T) {
 func TestTheHealthCommandAnswersReady(t *testing.T) {
 	t.Parallel()
 	cmdHealth := func(s *spec.Spec) {
-		s.Health = spec.Provider{Name: "command", Config: map[string]any{"image": "api", "cmd": []any{"notes-api", "ready"}}}
+		s.Health = spec.Provider{Name: "command", Config: map[string]any{"image": "api", "cmd": []any{"notes-api", "ready"}, "env": []any{}}}
 	}
 	for name, c := range map[string]struct {
 		out  string
@@ -693,7 +693,7 @@ func TestTheGateRemovesTheHealthContainersOfEarlierBoots(t *testing.T) {
 	}
 	// The check's own container is labelled with this boot.
 	g.gate.In.R, _ = bundledInstaller(t, "1.0.0", 1, func(s *spec.Spec) {
-		s.Health = spec.Provider{Name: "command", Config: map[string]any{"image": "api", "cmd": []any{"notes-api", "ready"}}}
+		s.Health = spec.Provider{Name: "command", Config: map[string]any{"image": "api", "cmd": []any{"notes-api", "ready"}, "env": []any{}}}
 	})
 	g.docker.health = func(map[string]any) (string, error) { return `{"ready": true}`, nil }
 	if err := g.gate.In.ready(context.Background(), g.readEnv(), nil, nil); err != nil {
@@ -880,5 +880,30 @@ func TestTheGateJudgesTheServicesAsAStartDoes(t *testing.T) {
 		if err := g.gate.In.ready(context.Background(), g.readEnv(), g.gate.Probe, nil); err == nil || err.Error() != want {
 			t.Errorf("%s: %v, want %q", ps, err, want)
 		}
+	}
+}
+
+// A `command` provider decoded at run time without env, health's or schema_compat's, is refused
+// naming its key, never run with only the variables Stowage provides.
+func TestARuntimeCommandWithoutEnvIsRefused(t *testing.T) {
+	t.Parallel()
+	noEnv := spec.Provider{Name: "command", Config: map[string]any{"image": "api", "cmd": []any{"notes-api", "x"}}}
+	g := newGate(t, "", nil, false)
+	g.gate.In.R, _ = bundledInstaller(t, "1.0.0", 1, func(s *spec.Spec) {
+		s.Health = noEnv
+		s.Database.SchemaCompat = noEnv
+	})
+	ran := 0
+	g.docker.health = func(map[string]any) (string, error) { ran++; return `{"ready": true}`, nil }
+	const want = "env is required: the keys of the inputs, secrets and safe defaults the command reads ([] for none)"
+	if err := g.gate.In.ready(context.Background(), g.readEnv(), nil, nil); err == nil || !strings.Contains(err.Error(), "health: "+want) {
+		t.Errorf("health: %v, want %q", err, want)
+	}
+	var resp map[string]any
+	if err := (schema{in: g.gate.In, stack: g.readEnv()}).call(context.Background(), g.readEnv(), map[string]any{"op": "schema.check"}, &resp); err == nil || err.Error() != "database.schema_compat: "+want {
+		t.Errorf("schema_compat: %v, want %q", err, want)
+	}
+	if ran != 0 {
+		t.Errorf("the command ran %d times", ran)
 	}
 }

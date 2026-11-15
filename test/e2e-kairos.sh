@@ -205,6 +205,7 @@ api=$(docker ps -q --filter "label=com.docker.compose.project=$(project)" --filt
 docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$api" >"$WORK/api-env.txt"
 grep -qx "STOWAGE_HOST_TOKEN=$host_token" "$WORK/api-env.txt" && grep -qx "STOWAGE_HOST_SOCKET=/run/stowage-host/app.sock" "$WORK/api-env.txt" ||
 	fail "the api service is not given the token and the socket"
+grep -qx "STOWAGE_SHAPE=kairos" "$WORK/api-env.txt" || fail "the api service is not told it runs on the kairos shape"
 docker inspect --format '{{range .Mounts}}{{.Source}}:{{.Destination}}:{{.RW}}{{println}}{{end}}' "$api" | grep -qx '/run/notes/app:/run/stowage-host:false' ||
 	fail "the api service does not mount the app directory read-only"
 web=$(docker ps -q --filter "label=com.docker.compose.project=$(project)" --filter label=com.docker.compose.service=web)

@@ -13,6 +13,7 @@ import (
 
 	"github.com/google/go-containerregistry/pkg/name"
 
+	"github.com/norvexlabs/stowage/internal/payload"
 	"github.com/norvexlabs/stowage/internal/release"
 	"github.com/norvexlabs/stowage/internal/spec"
 )
@@ -75,7 +76,7 @@ func TestTheVMRecordsItsMirrorsLoginForItsHostAlone(t *testing.T) {
 	t.Parallel()
 	_, in := vmMirrorEnv(t)
 	f := registryLoginFile(in.O.Dir)
-	if _, err := in.recordRegistryLogin(loginFile("other.example", "ops", loginPassword)); err == nil || !strings.Contains(err.Error(), "the login is for other.example, but this VM reads its mirror mirror.example:5000/acme/notes at mirror.example:5000") {
+	if _, err := in.recordRegistryLogin(loginFile("other.example", "ops", loginPassword)); err == nil || !strings.Contains(err.Error(), "the login is for other.example, but this install reads the release's own registry ghcr.io/acme/notes at ghcr.io and its mirror mirror.example:5000/acme/notes at mirror.example:5000: give an auths entry for ghcr.io or mirror.example:5000") {
 		t.Errorf("another host: %v", err)
 	}
 	if fileExists(f) {
@@ -103,11 +104,11 @@ func TestTheVMRecordsItsMirrorsLoginForItsHostAlone(t *testing.T) {
 			t.Errorf("%s: %q %v", prefix, token, err)
 		}
 	}
-	// Off the VM nothing reads it.
+	// A Kubernetes run reads no login file: its --registry-login-file alone.
 	off := *in
-	off.O.Preloaded = false
+	off.noLoginFile = true
 	if _, token, err := off.pullAccount("mirror.example:5000/acme/notes"); err != nil || token != "" {
-		t.Errorf("off the VM: %q %v", token, err)
+		t.Errorf("on Kubernetes: %q %v", token, err)
 	}
 	// The registry client of the mirror signs in with it.
 	kc, err := in.keychain("mirror.example:5000/acme/notes")
@@ -134,19 +135,26 @@ func TestTheVMRecordsItsMirrorsLoginForItsHostAlone(t *testing.T) {
 	}
 }
 
-func TestALoginIsRefusedOnAVMReadingTheReleasesRegistry(t *testing.T) {
+func TestAVMReadingTheReleasesRegistryTakesALoginForItsHost(t *testing.T) {
 	t.Parallel()
 	e := vmEnv(t, "1.0.0")
 	in := e.installer(func(o *Options) { vm(o); o.Settings = filepath.Join(t.TempDir(), "none.yaml") })
-	if _, err := in.recordRegistryLogin(loginFile("ghcr.io", "ops", loginPassword)); err == nil || !strings.Contains(err.Error(), "a login is for a mirror") {
-		t.Errorf("%v", err)
+	own := registryHost(e.r.Spec.Registry.Prefix)
+	if _, err := in.recordRegistryLogin(loginFile("mirror.example", "ops", loginPassword)); err == nil || !strings.Contains(err.Error(), "the login is for mirror.example, but this install reads the release's own registry "+e.r.Spec.Registry.Prefix+" at "+own+": give an auths entry for "+own) {
+		t.Errorf("another host: %v", err)
+	}
+	if host, err := in.recordRegistryLogin(loginFile(own, "ops", loginPassword)); err != nil || host != own {
+		t.Errorf("%q %v", host, err)
 	}
 	// An install's recorded registry decides once it exists.
 	if err := e.install(vm); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := in.recordRegistryLogin(loginFile("ghcr.io", "ops", loginPassword)); err == nil || !strings.Contains(err.Error(), "a login is for a mirror") {
+	if _, err := in.recordRegistryLogin(loginFile(own, "ops", loginPassword)); err != nil {
 		t.Errorf("installed: %v", err)
+	}
+	if _, token, err := in.pullAccount(e.r.Spec.Registry.Prefix); err != nil || token != loginPassword {
+		t.Errorf("the release's registry: %q %v", token, err)
 	}
 }
 
@@ -185,7 +193,7 @@ func TestTheRegistryLoginVerb(t *testing.T) {
 	if st.RegistryLogin != "mirror.example:5000" || strings.Contains(string(raw2), loginPassword) || strings.Contains(string(raw2), base64.StdEncoding.EncodeToString([]byte("ops:"+loginPassword))) {
 		t.Errorf("status: %s", raw2)
 	}
-	if out, err := ctl(e, served(t, d), "status"); err != nil || !strings.Contains(out, "login      held for the mirror mirror.example:5000") || strings.Contains(out, loginPassword) {
+	if out, err := ctl(e, served(t, d), "status"); err != nil || !strings.Contains(out, "login      held for mirror.example:5000") || strings.Contains(out, loginPassword) {
 		t.Errorf("%v\n%s", err, out)
 	}
 	if err := os.WriteFile(registryLoginFile(in.O.Dir), []byte("{}"), 0o600); err != nil {
@@ -262,7 +270,7 @@ func TestVMCreateGivesTheMirrorsLoginOverSSH(t *testing.T) {
 		err   string
 	}{
 		"another host": {mirror, loginFile("other.example", "ops", loginPassword), "the login is for other.example"},
-		"no mirror":    {nil, loginFile(host, "ops", loginPassword), "--registry-login-file is a mirror's login"},
+		"no mirror":    {nil, loginFile("other.example", "ops", loginPassword), "the login is for other.example, but the VM reads the release's own registry"},
 		"bad file":     {mirror, []byte("{}"), "0 entries in auths"},
 	} {
 		v := newVMCreate(t, "qcow2")
@@ -381,14 +389,42 @@ func TestALoginNotGivenNamesTheInputsTheInstallWaitsFor(t *testing.T) {
 	}
 }
 
-// A mirror that is the release's own registry takes no login: the VM would refuse it.
-func TestVMCreateRefusesALoginForTheReleasesOwnRegistry(t *testing.T) {
+// A login for the release's own registry is given over SSH as a mirror's; a VM booting another
+// release's disks is refused one when the installer carries no pull account to read that
+// release's OS with first, and takes it when it does.
+func TestVMCreateGivesTheReleasesRegistryLogin(t *testing.T) {
 	t.Parallel()
 	v := newVMCreate(t, "qcow2")
 	r := newTofuRun(t)
 	c := tofuCreate()
 	c.RegistryLogin = loginFile(registryHost(v.prefix), "ops", loginPassword)
-	if err := v.create(c, r.mod(func(o *Options) { o.Registry = v.prefix })); err == nil || !strings.Contains(err.Error(), "the release's own registry") || len(r.tofu.calls) > 0 {
-		t.Errorf("%v", err)
+	if err := v.create(c, r.mod(func(o *Options) { o.Registry = v.prefix })); err != nil {
+		t.Fatalf("%v\n%s", err, v.log)
+	}
+	i := slices.IndexFunc(r.ssh.calls, func(call []string) bool {
+		return strings.HasSuffix(strings.Join(call, " "), "-- sudo notes-stow registry-login -")
+	})
+	if i < 0 || !strings.Contains(r.ssh.stdin[i], `"`+registryHost(v.prefix)+`"`) {
+		t.Fatalf("ssh %v", r.ssh.calls)
+	}
+	if strings.Contains(v.log.String(), loginPassword) || strings.Contains(v.out2(), loginPassword) {
+		t.Errorf("the login is printed:\n%s%s", v.log, v.out2())
+	}
+	token := spec.Provider{Name: "token", Config: map[string]any{"user": "notes-pull", "token_env": "NOTES_PULL"}}
+	for name, baked := range map[string]bool{"none baked": false, "baked": true} {
+		v := newVMCreatePulling(t, token, "qcow2")
+		if baked {
+			v.r.Pull = &payload.Account{User: "notes-pull", Password: "baked"}
+		}
+		m := v.r.Manifest
+		m.Artifacts.BootDisks = &release.BootDisks{Release: "1.0.0-r0", Stowage: "0.34.0", Disks: m.Artifacts.Disks}
+		m.Artifacts.Disks = nil
+		_, err := seedOf(t, v, nil, SeedOptions{RegistryLogin: loginFile(registryHost(v.prefix), "ops", loginPassword)})
+		switch {
+		case !baked && (err == nil || !strings.Contains(err.Error(), "its first boot reads 1.0.0-1's OS bundle from "+v.prefix+" before the login reaches it over SSH, with the pull account this installer does not carry")):
+			t.Errorf("%s: %v", name, err)
+		case baked && err != nil:
+			t.Errorf("%s: %v", name, err)
+		}
 	}
 }

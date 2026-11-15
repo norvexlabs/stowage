@@ -39,11 +39,12 @@ func (in *Installer) secretKey(k string) bool {
 		}
 	}
 	for _, i := range in.R.Spec.Inputs {
-		if i.Key == k && i.Secret {
+		if i.Key == k && i.Secret && (!in.kube || i.OnKubernetes()) {
 			return true
 		}
 	}
-	return k == CloudflareTokenVar
+	// The Cloudflare token is the Docker front's: a Kubernetes release's ingress takes none.
+	return k == CloudflareTokenVar && !in.kube
 }
 
 // exportSecrets is the install's SecretsFile: its recorded secrets that are not empty, the

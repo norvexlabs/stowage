@@ -59,27 +59,38 @@ func (in *Installer) hook() (*providers.ProvisionHook, error) {
 	return h, nil
 }
 
-// hookEnv lists the recorded keys the provision hook receives: the values Stowage provides, each
-// route's URL, and the keys its env declares. Nothing else of .env reaches it: not a secret it
-// did not ask for, nor an image, a port or compose's own settings. A file input stays out: its
-// recorded value is encoded, and the hook gets its file (hookFiles).
+// hookEnv lists the recorded keys the provision hook receives as variables (declaredEnv).
 func (in *Installer) hookEnv(env *EnvFile, h *providers.ProvisionHook) []string {
-	keys := in.providedEnv(env)
-	files := in.hookFiles(h)
-	for _, k := range h.Keys() {
-		if _, ok := env.Get(k); ok && !slices.Contains(keys, k) && !slices.Contains(files, k) {
-			keys = append(keys, k)
-		}
-	}
-	return keys
+	return in.declaredEnv(env, h.Keys())
 }
 
-// hookFiles lists the keys of the provision hook's env it gets as files: the file inputs, and the
-// secrets delivered as files.
+// declaredEnv lists the recorded keys a container Stowage runs with the install's values (the
+// provision hook, a `command` provider) receives as variables, its env listing keys: the values
+// Stowage provides, each route's URL, and each of keys recorded. Nothing else of .env reaches it:
+// not a secret it did not ask for, nor an image, a port or compose's own settings. A file input or
+// a secret delivered as a file stays out: it gets its file (declaredFiles).
+func (in *Installer) declaredEnv(env *EnvFile, keys []string) []string {
+	out := in.providedEnv(env)
+	files := in.declaredFiles(keys)
+	for _, k := range keys {
+		if _, ok := env.Get(k); ok && !slices.Contains(out, k) && !slices.Contains(files, k) {
+			out = append(out, k)
+		}
+	}
+	return out
+}
+
+// hookFiles lists the keys of the provision hook's env it gets as files (declaredFiles).
 func (in *Installer) hookFiles(h *providers.ProvisionHook) []string {
+	return in.declaredFiles(h.Keys())
+}
+
+// declaredFiles lists the keys of an env listing keys that its container gets as files: the file
+// inputs, and the secrets delivered as files.
+func (in *Installer) declaredFiles(keys []string) []string {
 	var files []string
 	mounted := in.mountedFiles()
-	for _, k := range h.Keys() {
+	for _, k := range keys {
 		if slices.ContainsFunc(mounted, func(f mountedFile) bool { return f.Key == k }) {
 			files = append(files, k)
 		}
@@ -96,10 +107,16 @@ func (in *Installer) writeHookFiles(env *EnvFile, h *providers.ProvisionHook) ([
 	}
 	// The salt names the secrets' files the stack mounts: a new one here, never saved, would name others.
 	if _, ok := env.Get(FileSaltVar); !ok && slices.ContainsFunc(files, in.R.Spec.AsFile) {
-		return nil, refuse(in.ctl()+" install --dir "+in.O.Dir, "%s records no %s, which names the files of the secrets delivered as files: `%s install --dir %s` records it, then run again", in.path(envName), FileSaltVar, in.ctl(), in.O.Dir)
+		return nil, in.noSalt()
 	}
 	in.fileVars(env)
 	return files, in.writeInputFiles(env)
+}
+
+// noSalt refuses a run that gets a secret's file, in an install whose .env records no FileSaltVar
+// to name it by, naming the install that records it.
+func (in *Installer) noSalt() error {
+	return refuse(in.ctl()+" install --dir "+in.O.Dir, "%s records no %s, which names the files of the secrets delivered as files: `%s install --dir %s` records it, then run again", in.path(envName), FileSaltVar, in.ctl(), in.O.Dir)
 }
 
 // fileVarOf is the variable holding the path of the file key is mounted from.
@@ -131,33 +148,40 @@ func (in *Installer) providedEnv(env *EnvFile) []string {
 	return keys
 }
 
-// recordedEnv lists the recorded keys a `command` provider's container receives: the values
-// Stowage provides, each route's URL and domain, the inputs but file inputs, the secrets and the
-// safe defaults.
-// Images, ports and compose's own settings stay out.
-func (in *Installer) recordedEnv(env *EnvFile) []string {
-	s := in.R.Spec
-	keys := in.providedEnv(env)
-	add := func(k string) {
-		if _, ok := env.Get(k); ok && !slices.Contains(keys, k) {
-			keys = append(keys, k)
+// commandFiles readies the files a `command` provider's container mounts, files (declaredFiles):
+// each is written when absent, as its recorded value gives it, and named by its variable in the
+// environment returned, which compose's run is given. env is only read: the run may be an older
+// release's command beside the install's .env, whose recorded paths are not that release's to
+// change. A secret's file needs the install's salt, which an install records.
+func (in *Installer) commandFiles(env *EnvFile, files []string) ([]string, error) {
+	var environ []string
+	for _, f := range in.mountedFiles() {
+		if !slices.Contains(files, f.Key) {
+			continue
 		}
-	}
-	for _, i := range s.Inputs {
-		if !i.File() { // what is recorded is encoded, and such a container mounts no file
-			add(i.Key)
+		if _, ok := env.Get(FileSaltVar); f.secret && !ok {
+			return nil, in.noSalt()
 		}
+		v, _ := env.Get(f.Key)
+		name := f.name(env, v)
+		path := filepath.Join(in.path(InputFilesDir), name)
+		if _, err := os.Stat(path); errors.Is(err, fs.ErrNotExist) {
+			content, err := f.content(v)
+			if err != nil {
+				return nil, fmt.Errorf("input %s: its recorded value: %w", f.Key, err)
+			}
+			if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+				return nil, err
+			}
+			if err := writeAtomic(path, bytes.NewReader(content), 0o644, nil); err != nil {
+				return nil, fmt.Errorf("%s: %w", f.Key, err)
+			}
+		} else if err != nil {
+			return nil, err
+		}
+		environ = append(environ, f.Var+"=./"+InputFilesDir+"/"+name)
 	}
-	for _, d := range s.RouteDomains() {
-		add(d.Input)
-	}
-	for _, sec := range s.Secrets {
-		add(sec.Key)
-	}
-	for _, k := range sortedKeys(s.SafeDefaults) {
-		add(k)
-	}
-	return keys
+	return environ, nil
 }
 
 // HookUID is the user and group a hook (a service Stowage runs on demand: the provision hook, a

@@ -62,8 +62,9 @@ sudo <short>-stow network attach --role ROLE --mac MAC [--mode dhcp|static|none]
 - `install` is the Docker shape's first install (the same flags, form, checks and refusals) from
   the preloaded images, asking the inputs of the `kairos` shape (`inputs[].shapes`); its re-run
   is the Docker shape's too, moving between TLS modes and taking a new certificate (`--tls`,
-  `--cert`, `--key`, `--ca` for a project with `front.publish_ca`, and `--client-ca` for one
-  with a `client_auth` route), and `--secrets` makes a
+  `--cert`, `--key`, `--ca` for a project with `front.publish_ca`, `--client-ca` for one
+  with a `client_auth` route, and `--acme-ca` / `--acme-ca-root` for one offering `acme` or
+  `dns-cloudflare`: another ACME CA than Let's Encrypt, see the Docker shape's TLS modes), and `--secrets` makes a
   first install with exported secrets (see `secrets export` under the Docker shape). `--kit FILE|-` and `--kit-code-file FILE` take a handoff kit, as on the Docker shape, and go as `--given` does; on either flag an input declared for other shapes alone is left out and logged (`… not an input of the kairos shape`). `--given FILE|-`
   takes what `vm create` gives over SSH, at most 1 MiB, strict YAML (`project`, `inputs` of KEY: value with a file input as `stowage-file:<base64>`, `tls` of `cert`, `key`, `ca`, `client_ca` as PEM; a certificate picks `byo`): a first install or a re-run, refused with `--secrets`, on Kairos's recovery system, when encrypted, for another project, holding nothing, with a `cert` or `key` alone, or a `ca` without a `cert`. Flags and `--answers` win: `--cert`, `--key` or `--tls` with another mode leave out the file's `cert`, `key` and `ca`, `--ca` and `--client-ca` their own, and the run logs what it left out. A first
   install takes the settings file `/etc/<name>/install.yaml` (written by the cloud-config `vm
@@ -126,22 +127,26 @@ sudo <short>-stow network attach --role ROLE --mac MAC [--mode dhcp|static|none]
   `registry`, `short_name`, `address`, `registry_ca` (`sha256:` of the registry CA the install
   keeps; left out when it keeps none, or when it cannot be read: the status always answers, and
   a poll logs nothing) — and the VM's own fields.
-- `registry-login FILE|-` (as root) records the login the VM reads its mirror with: a Docker
-  config holding one `auths` entry for the mirror's host, `{"auths": {"HOST": {"auth":
+- `registry-login FILE|-` (as root) records the VM's own login to the registry it reads — the
+  release's own or its mirror — a Docker config holding one `auths` entry for that host, `{"auths": {"HOST": {"auth":
   "BASE64(USER:PASSWORD)"}}}` (or `username` and `password` for `auth`), from FILE or standard
-  input, at most 32 KiB. It is refused when not run as root, for another host than the
-  mirror's (the install's recorded `registry`, before the first install the settings file's),
-  on a VM reading the release's own registry (which it reads with the pull account), and for a
-  file that is not one such entry (two entries, a credential store's `credsStore` or
+  input, at most 32 KiB. The operator mints one per VM in the registry: revoking it leaves every
+  other install pulling. It is refused when not run as root, for another host than the release's
+  own registry's or the mirror's (the install's recorded `registry`, before the first install the
+  settings file's; the refusal names both), and for a file that is not one such entry (two entries, a credential store's `credsStore` or
   `credHelpers`, an `identitytoken`, no user or password; the error names the field, never a
   value). It is recorded in `/usr/local/<name>.registry-login.json`, root's alone (0600), beside
   the install directory: kept by the first install, upgrades, rollbacks and reboots, replaced by
-  the next `registry-login`, removed by `registry-login --remove`. The VM's reads of that host
-  alone take it — its updates, an upgrade's OS bundle (`kairos-agent` runs with a Docker config
-  of it alone), a first boot's switch to another release's OS — and the release's pull account
-  is never sent there. `status` says `login      held for the mirror HOST`, `status --json`
+  the next `registry-login`, removed by `registry-login --remove` (the release's own registry is
+  then read with the pull account baked into the installer again, a mirror without a login). The
+  VM's reads of that host alone take it — its updates, an upgrade's OS bundle (`kairos-agent`
+  runs with a Docker config of it alone), a first boot's switch to another release's OS: on the
+  release's own registry after the pull account's password its variable gives and before the
+  account baked into the installer, on a mirror alone (the release's pull account is never sent
+  to a mirror, nor the login to another host). `secrets export` does not carry it: it is the
+  operator's credential for this VM, given again to a VM made again. `status` says `login      held for HOST`, `status --json`
   `registry_login` (the host), never the login. A recorded file that no longer reads fails the
-  reads of the mirror, naming the file and the fix, and `status --json` says so
+  reads of its host, naming the file and the fix, and `status --json` says so
   (`registry_login_error`). `vm create --registry-login-file` gives it
   over SSH once the VM answers (see [vm-create](vm-create.md)); a program that made the VM from
   `vm seed` runs `sudo <short>-stow registry-login -` over SSH itself. The cloud-config never
@@ -1179,7 +1184,7 @@ sudo <short>-stow network attach --role ROLE --mac MAC [--mode dhcp|static|none]
   first boot's) failed in this boot, so the VM stays there — `kairos-reset.service failed: ` and
   the unit's last 15 journal lines joined by ` | `, absent otherwise; `status` prints it after
   the boot (`boot       recovery (the first boot gave up: …)`);
-  `fallback`: Kairos booted the passive system; `on_trial`: the boot runs an upgrade's new system, which the gate has not judged yet; `boot_id`: the kernel's id of this boot, which changes with every reboot; `boot_settled`: this boot is over — `<name>.service` (the boot's install, upgrade or going back) and `<name>-health.service` (the health gate, ordered after it) have each ended: active, failed, absent, or inactive with no job queued (skipped by its condition, stopped, or never started as a dependency failed) —, so what the status says of this boot changes no more but by a job (`false` while either runs or is queued, or when their state cannot be read; `true` on Docker, which has no boot units); `boot_judged`: the health gate's last verdict in this boot, its `boot.judged` entry (`seq`, `verdict`, `on_trial`, `reboots`, and when set `reason`, `kept`, `error`; kept through the journal's rotations), absent before the verdict, and when it cannot be told, `boot_judged_error` then saying why (this boot's id or the journal cannot be read) — settled with an install, no `boot_judged` and no `boot_judged_error`, the gate ended without a verdict, which `status` says (`judged     no verdict: …`; `judged     unknown: …` for an error); a `went_back` whose `reboots` is `false` gets no reboot from the gate; `status` prints `judged` with the verdict, and `settling` while the boot is not settled (or the units' state cannot be read); `registry_login`: the host of the mirror the VM holds a login for (`registry-login`), never the login, absent when it holds none, and `registry_login_error` when the file held cannot be read (naming it and the fix; `status` prints `login      unreadable: …`); `events`: the event journal's last `seq`, 0 before the first, which a client follows with `GET events?after=` — `null` when the journal cannot be read, `events_error` then saying why (a client never takes a cursor from such a status); `failed_boot`: the last boot the gate found
+  `fallback`: Kairos booted the passive system; `on_trial`: the boot runs an upgrade's new system, which the gate has not judged yet; `boot_id`: the kernel's id of this boot, which changes with every reboot; `boot_settled`: this boot is over — `<name>.service` (the boot's install, upgrade or going back) and `<name>-health.service` (the health gate, ordered after it) have each ended: active, failed, absent, or inactive with no job queued (skipped by its condition, stopped, or never started as a dependency failed) —, so what the status says of this boot changes no more but by a job (`false` while either runs or is queued, or when their state cannot be read; `true` on Docker, which has no boot units); `boot_judged`: the health gate's last verdict in this boot, its `boot.judged` entry (`seq`, `verdict`, `on_trial`, `reboots`, and when set `reason`, `kept`, `error`; kept through the journal's rotations), absent before the verdict, and when it cannot be told, `boot_judged_error` then saying why (this boot's id or the journal cannot be read) — settled with an install, no `boot_judged` and no `boot_judged_error`, the gate ended without a verdict, which `status` says (`judged     no verdict: …`; `judged     unknown: …` for an error); a `went_back` whose `reboots` is `false` gets no reboot from the gate; `status` prints `judged` with the verdict, and `settling` while the boot is not settled (or the units' state cannot be read); `registry_login`: the host the VM holds a login for (`registry-login`; the release's own registry's or the mirror's), never the login, absent when it holds none, and `registry_login_error` when the file held cannot be read (naming it and the fix; `status` prints `login      unreadable: …`); `events`: the event journal's last `seq`, 0 before the first, which a client follows with `GET events?after=` — `null` when the journal cannot be read, `events_error` then saying why (a client never takes a cursor from such a status); `failed_boot`: the last boot the gate found
   unhealthy — `release`, `at`, `reason`, `kept` when the gate kept it, `dir`, `seq` (the event journal's last entry as it was kept); absent once the journal's last verdict, after it in the journal, is a boot on trial (an upgrade's) judged `healthy` — the passive system's boot after a fallback keeps it told), `GET health` (`{"ready", "reason"}`), `GET services` (each with its `exit_code`, and when set — each absent when false, 0 or empty — `id`, `oom_killed`, `mem_limit_bytes`, `restarts`),
   `GET services/{service}/logs?tail=N`, `POST services/{service}/{restart|stop|start}`,
   `POST provision` (an optional `{"set": {"KEY": "VALUE"}}`, as `provision --set`), `GET reset-db` (`{"target": {"version", "revision"}, "plan", "token"}`: the release a reset

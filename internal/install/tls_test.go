@@ -139,7 +139,7 @@ func TestCloudflareDNSGivesTheTokenToTheFrontNotTheStack(t *testing.T) {
 		t.Errorf("front compose:\n%s", fc)
 	}
 	in := &Installer{R: e.r}
-	if keys := in.recordedEnv(f); slices.Contains(keys, CloudflareTokenVar) {
+	if keys := in.declaredEnv(f, nil); slices.Contains(keys, CloudflareTokenVar) {
 		t.Errorf("a command provider receives the token: %v", keys)
 	}
 
@@ -599,7 +599,7 @@ func TestRoutesGivenOneDomainAreRefusedWhereTheyClash(t *testing.T) {
 	in.R.Spec.Front.Routes[2].Path = "/ops"
 	// Rendered all the same (an upgrade's checks aside), the route refuses everyone: its site
 	// asks no certificate.
-	cf := tlsCaddyfile(in.R.Spec.Front, nil, "internal", map[string]string{"app": "a.example.com", "idp": "a.example.com", "ops": "a.example.com"}, "", "443", true, get, nil)
+	cf := tlsCaddyfile(in.R.Spec.Front, nil, "internal", map[string]string{"app": "a.example.com", "idp": "a.example.com", "ops": "a.example.com"}, acmeIssuer{}, "443", true, get, nil)
 	if !strings.Contains(cf, "\t@stowage_path_2 path /ops /ops/*\n\thandle @stowage_path_2 {\n\t\trespond 403\n\t}\n") || strings.Contains(cf, "client_auth") {
 		t.Errorf("a client_auth route on a shared site:\n%s", cf)
 	}

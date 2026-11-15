@@ -214,6 +214,7 @@ func contentCompose(m *composeModel, environ []string, key []byte, ctr tune.Cont
 			mem.give(extra, share, svc.serviceMemory)
 		}
 		mem.giveCPUs(extra, name)
+		mem.giveShape(extra)
 		if v, ok := mem.IPVlans[name]; ok {
 			giveIPVlan(extra, v, svc.Networks)
 		}
@@ -380,6 +381,7 @@ func (in *Installer) writeContent(ctx context.Context, m *composeModel, env *Env
 		return err
 	}
 	mem.Tables = in.tableLoads()
+	mem.Shape = in.shape()
 	for name, svc := range in.R.Spec.Services {
 		if svc.UpdateSocket != "" {
 			if mem.Sockets == nil {

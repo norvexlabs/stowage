@@ -44,7 +44,7 @@ func TestL4TLSCaddyfile(t *testing.T) {
 	t.Parallel()
 	domains := map[string]string{"app": "app.example.test", "db": "db.example.test", "mq": "app.example.test", "admin": "admin.example.test", "shut": "db.example.test"}
 	get := func(k string) string { return l4TLSValues[k] }
-	cf := tlsCaddyfile(l4TLSFront(), l4TLSRoutes(), "internal", domains, "", "443", true, get, nil)
+	cf := tlsCaddyfile(l4TLSFront(), l4TLSRoutes(), "internal", domains, acmeIssuer{}, "443", true, get, nil)
 	global, sites, _ := strings.Cut(cf, "\n}\n")
 	for _, want := range []string{
 		"\tlocal_certs\n\tskip_install_trust\n\tlayer4 {\n",
@@ -68,7 +68,7 @@ func TestL4TLSCaddyfile(t *testing.T) {
 	}
 	// Without the client CA a route asking for a certificate refuses everyone; byo's site loads
 	// its files.
-	cf = tlsCaddyfile(l4TLSFront(), l4TLSRoutes(), "byo", domains, "", "443", false, get, nil)
+	cf = tlsCaddyfile(l4TLSFront(), l4TLSRoutes(), "byo", domains, acmeIssuer{}, "443", false, get, nil)
 	if !strings.Contains(cf, "\t\t# admin, host port 9443\n\t\t:20003 {\n\t\t\troute {\n\t\t\t\tclose\n") || strings.Contains(cf, "trust_pool") {
 		t.Errorf("admin without a client CA:\n%s", cf)
 	}
@@ -76,7 +76,7 @@ func TestL4TLSCaddyfile(t *testing.T) {
 		t.Errorf("byo's site:\n%s", cf)
 	}
 	// No route the front terminates TLS on: no layer4 app.
-	if cf := tlsCaddyfile(l4TLSFront(), l4TLSRoutes()[:1], "internal", domains, "", "443", false, get, nil); strings.Contains(cf, "layer4") {
+	if cf := tlsCaddyfile(l4TLSFront(), l4TLSRoutes()[:1], "internal", domains, acmeIssuer{}, "443", false, get, nil); strings.Contains(cf, "layer4") {
 		t.Errorf("layer4 without a TLS route:\n%s", cf)
 	}
 }
@@ -95,7 +95,7 @@ func TestL4TLSFrontWithoutRoutes(t *testing.T) {
 		"byo":            {"\ndb.example.test {\n\ttls " + frontTLS + "/cert.pem " + frontTLS + "/key.pem\n\trespond 404\n}\n"},
 		"internal":       {"\tlocal_certs\n", "\ndb.example.test {\n\trespond 404\n}\n"},
 	} {
-		cf := tlsCaddyfile(f, routes, mode, domains, "ops@example.test", "443", false, func(string) string { return "" }, nil)
+		cf := tlsCaddyfile(f, routes, mode, domains, acmeIssuer{Email: "ops@example.test"}, "443", false, func(string) string { return "" }, nil)
 		for _, w := range append(want, "\t\t\t\t\t\tdefault_sni db.example.test\n") {
 			if !strings.Contains(cf, w) {
 				t.Errorf("%s: lacks %q:\n%s", mode, w, cf)
@@ -129,7 +129,7 @@ func TestL4TLSALPN(t *testing.T) {
 		{Name: "mq", Protocol: "tcp", Port: 8883, Upstream: "mq:1883", TLS: &spec.L4TLS{DomainInput: "MQ_DOMAIN"}},
 	}
 	domains := map[string]string{"db": "db.example.test", "mq": "mq.example.test"}
-	cf := tlsCaddyfile(spec.Front{TLSModes: []string{"internal"}}, routes, "internal", domains, "", "443", false, func(string) string { return "" }, nil)
+	cf := tlsCaddyfile(spec.Front{TLSModes: []string{"internal"}}, routes, "internal", domains, acmeIssuer{}, "443", false, func(string) string { return "" }, nil)
 	for _, want := range []string{"default_sni db.example.test\n\t\t\t\t\t\talpn postgresql\n", "default_sni mq.example.test\n\t\t\t\t\t\talpn " + noALPNMark + "\n"} {
 		if !strings.Contains(cf, want) {
 			t.Errorf("lacks %q:\n%s", want, cf)
@@ -165,9 +165,9 @@ func TestL4TLSALPN(t *testing.T) {
 		if c.mode == Loopback {
 			cf = loopbackCaddyfile(front, c.routes, get, nil)
 		} else {
-			cf = tlsCaddyfile(front, c.routes, c.mode, domains, "", "443", false, get, nil)
+			cf = tlsCaddyfile(front, c.routes, c.mode, domains, acmeIssuer{}, "443", false, get, nil)
 		}
-		fc, err := frontCompose(front, c.routes, get, c.mode, hostAPI{}, "d", "", strings.Contains(cf, noALPNMark), false, false, nil, nil, false, FrontUID)
+		fc, err := frontCompose(front, c.routes, get, c.mode, hostAPI{}, "d", "", strings.Contains(cf, noALPNMark), false, false, false, nil, nil, false, FrontUID)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -206,7 +206,7 @@ func TestL4TLSFrontCompose(t *testing.T) {
 	routes[1].BindInput = "DB_BIND"
 	for mode, hostIP := range map[string]string{"internal": "192.0.2.9", Loopback: "${STOWAGE_LOOPBACK_ADDRESS}"} {
 		get := func(k string) string { return map[string]string{"DB_BIND": "192.0.2.9"}[k] }
-		raw, err := frontCompose(l4TLSFront(), routes, get, mode, hostAPI{}, "sha256:x", "", false, false, false, []string{"db"}, nil, false, FrontUID)
+		raw, err := frontCompose(l4TLSFront(), routes, get, mode, hostAPI{}, "sha256:x", "", false, false, false, false, []string{"db"}, nil, false, FrontUID)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -447,8 +447,8 @@ func TestL4TLSUpgrade(t *testing.T) {
 	}
 }
 
-// An L4 TLS route's domain is read by the front: a command provider's container gets it, as a
-// front route's, and the provision hook never holds it alone (provision --set would leave the front
+// An L4 TLS route's domain is read by the front: a command provider's container gets it when its env
+// lists it, as a front route's, and the provision hook never holds it alone (provision --set would leave the front
 // serving the old domain).
 func TestL4TLSDomainIsTheFronts(t *testing.T) {
 	t.Parallel()
@@ -461,8 +461,8 @@ func TestL4TLSDomainIsTheFronts(t *testing.T) {
 	f.Set("MQ_DOMAIN", "mq.example.org")
 	// A domain the project does not declare, which the install asks as a route's.
 	e.r.Spec.L4.Routes = append(e.r.Spec.L4.Routes, spec.L4Route{Name: "mq", Protocol: "tcp", Port: 8883, Upstream: "web:1883", TLS: &spec.L4TLS{DomainInput: "MQ_DOMAIN"}})
-	if keys := in.recordedEnv(f); !slices.Contains(keys, "DB_DOMAIN") || !slices.Contains(keys, "MQ_DOMAIN") {
-		t.Errorf("recordedEnv %v", keys)
+	if keys := in.declaredEnv(f, []string{"DB_DOMAIN"}); !slices.Contains(keys, "DB_DOMAIN") || slices.Contains(keys, "MQ_DOMAIN") {
+		t.Errorf("a command declaring DB_DOMAIN gets %v", keys)
 	}
 	env := []string{"DB_DOMAIN"}
 	h := &providers.ProvisionHook{Image: "api", Env: &env}
@@ -543,7 +543,7 @@ func TestL4TLSNewCertificateCoversItsDomains(t *testing.T) {
 func TestL4TLSEmptyDomainIsNeverPlaintext(t *testing.T) {
 	t.Parallel()
 	domains := map[string]string{"app": "app.example.test", "mq": "app.example.test", "admin": "admin.example.test"}
-	cf := tlsCaddyfile(l4TLSFront(), l4TLSRoutes(), "internal", domains, "", "443", true, func(string) string { return "" }, nil)
+	cf := tlsCaddyfile(l4TLSFront(), l4TLSRoutes(), "internal", domains, acmeIssuer{}, "443", true, func(string) string { return "" }, nil)
 	if !strings.Contains(cf, "\t\t# db, host port 7443\n\t\t:20001 {\n\t\t\troute {\n\t\t\t\tclose\n") || strings.Contains(cf, "\n {\n") {
 		t.Errorf("a route without its domain, or a site without an address:\n%s", cf)
 	}

@@ -13,56 +13,6 @@ Batched by the gate they share: a batch is one slice, one review, one gate run. 
 Must above Blocked (user, 2026-11-15): the clouds under Blocked ship in it as preview, Google
 Cloud alone proven.
 
-### Features — pull credentials
-
-1. **A pull credential per install**: issued at install time by what the `registry.pull` provider
-   can mint, the account baked into installers and OS images staying the fallback of a provider
-   that cannot; one leaked installer then reads no other install's images. Options: (a) the
-   provider mints a per-install account (a registry robot account) when an operator holding an
-   issuing credential runs `kit create` or a first install — the registry decides its scope and
-   revocation (recommended where the registry has such accounts); (b) the registry's token auth:
-   a per-install long-lived secret exchanged for short-lived pull tokens, the token service the
-   registry's; (c) one pull account per channel or per customer, chosen at `ship` — coarser, but
-   no issuing step; (d) the operator mints the per-install token in the registry and Stowage only
-   takes it per install (a `kit`/install flag, recorded like a secret, replaced by a re-run) — the
-   same containment with no registry API in Stowage. Revoking one install's credential leaves
-   every other install pulling; an install without one keeps the baked account. Not in 0.35.0
-   (user, 2026-11-11): (a) needs a `registry.pull` mint operation per registry, an issuing
-   credential, revocation and a fallback.
-
-### Features — a service knows the machine is the stack's alone
-
-1. **A service can tell a host the stack owns whole from a shared one**: on the VM every process
-   but the OS is the stack's, so a service reporting memory pressure should report the host's;
-   on a Docker host (shared with whatever else runs there) and on Kubernetes its own cgroup is the
-   signal. Today a container sees `STOWAGE_HOST_MEM_MB` on Docker and the VM alike, and nothing
-   that only the VM sets, so a project cannot pick the right signal without an operator input —
-   which would make a product-owned fact an operator knob. Options: (a) Stowage gives every
-   service's container `STOWAGE_SHAPE` (`docker` | `kairos`; the chart's pods `kubernetes`)
-   beside the sizing variables (recommended: one fact, read the way the sizing ones are); (b) a
-   per-shape `environment` override in the spec (`shapes.kairos.env`), written into the VM's
-   compose overlay — more general, but a second place a service's environment is defined.
-
-### Beta — promoted from Should (user, 2026-11-15)
-
-1. **ACME proven end to end**: no suite runs an ACME server, so `acme` and `dns-cloudflare` are
-   proven by the Caddyfile they write alone — for the HTTP routes and for a domain the front holds
-   for L4 routes alone (a site answering 404 over HTTPS, its challenges on the front's ports 80
-   and 443, as a route's). Run Pebble (and a DNS stub for `dns-01`) beside a suite, with a
-   test-only way to point the front at its directory and trust its root, and check that a front
-   with L4 TLS routes alone obtains and renews its certificate. The VM runs the Docker install's
-   front, which e2e-stateless proves for such a front in `internal` and `byo`.
-2. **`mirror import` checks the archive's signatures** with the importing `<short>-stow`'s keys
-   (read from the archive's referrers, offline) before anything is pushed; today an install
-   checks the release only when it reads it from the mirror.
-3. **A `command` provider receives only the keys it declares**: the schema-compat and health
-   `command` providers' containers still receive every input, secret and safe default (as the
-   provision hook did before its `env`). An `env` list on `command`, as on the hook, would narrow
-   them.
-4. **Disaster recovery on Kubernetes**: `secrets export` and `install --secrets` run on Docker and
-   the VM; `k8s secrets export` (from the release's Secret) and `k8s install --secrets` would
-   follow the same file format.
-
 ### VM creation — the OpenTofu path moves out of Stowage
 
 1. **`vm create --create opentofu` gives way to the OpenTofu provider and standalone modules**:
@@ -128,10 +78,13 @@ Cloud alone proven.
      2026-11-11: Docker's containerd.io 2.4.2-3 is containerd v2.4.2 (x/net 0.58.0) with runc v1.5.2
      (x/net 0.55.0), upstream's latest: no fix yet.
 
-   How: before every release, run `make self-audit` and the e2e suites' ships and read each
-   `override:` line and each raise against its upstream's latest release. Make it mechanical where
-   cheap: have `self-audit` also flag a raise its base already satisfies, so a stale stopgap fails
-   loudly rather than staying silently.
+   How: `make self-audit` fails on a stale stopgap: an override the release the recipe builds
+   already requires at that version or past it, a raise (the recipes' and the examples'
+   Dockerfiles) its pinned base already carries. What stays by hand, before every release: read
+   each live `override:` and `raise:` line it prints against the upstream's latest release (a later
+   Caddy, grype or rclone carrying the module: move the recipe, then drop the override; a base
+   build carrying the package: repin it, then drop the raise), the `apk upgrade` and any module the
+   release does not require it leaves to judge, base repins, and the findings with no fix yet.
 
 ### Blocked — upstream or accounts
 
@@ -163,6 +116,13 @@ Cloud alone proven.
    release.
 
 ## Should
+
+- **`dns-cloudflare` issued end to end**: e2e-stateless proves `acme` against Pebble
+  (`--acme-ca`); `dns-cloudflare`'s DNS-01 step goes through Caddy's Cloudflare module, which
+  calls Cloudflare's API to write the TXT record, so a DNS stub alone cannot stand in for it.
+  Proving it needs a fake Cloudflare API (the zone and record endpoints the module calls,
+  writing into pebble-challtestsrv) or a test zone on Cloudflare; the mode's Caddyfile and
+  `--acme-ca` in it are unit-tested.
 
 - **An L4 route hands its upstream the client's address**: a TCP route's upstream sees the
   connection's source as Docker's NAT or userland proxy leaves it, and a front terminating TLS
@@ -438,6 +398,12 @@ Cloud alone proven.
   only for a target published by its own Stowage version; two unreleased builds of one top
   CHANGELOG entry share it, so one may judge by the other's rules (the boot judges again, and
   falls back). Comparing the build's commit as well would close it.
+- **A file input swept while a command mounts it**: a `command` provider's run checks that a file
+  input's file exists and hands its path to Compose for a bind mount, with no lock against a
+  concurrent re-run's sweep of the inputs' files; the host daemon's health probe can race a
+  re-run that changes that input, and Docker then creates a root-owned directory at the missing
+  path. Rare (a re-run changing a file input during a probe); a lock the sweep and the command's
+  mount share, or a mount from a per-run copy, would close it.
 
 - **e2e-vm's SSH over IPv6 times out now and then**: the VM has its global address and its IPv6
   default route, yet this host's SSH to it times out (`no SSH over IPv6 to …`); 2 runs of 4 on

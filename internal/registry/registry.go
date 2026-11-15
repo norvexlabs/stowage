@@ -356,11 +356,16 @@ func (c *Client) Referrers(ctx context.Context, d name.Digest, t types.MediaType
 	}
 	var out []v1.Descriptor
 	for _, m := range im.Manifests {
-		if m.ArtifactType == string(t) || m.ArtifactType == string(EmptyMediaType) || m.ArtifactType == "" {
+		if mayRefer(m, t) {
 			out = append(out, m)
 		}
 	}
 	return out, nil
+}
+
+// mayRefer reports whether a referrer listed as m may be one of artifact type t (Referrers).
+func mayRefer(m v1.Descriptor, t types.MediaType) bool {
+	return m.ArtifactType == string(t) || m.ArtifactType == string(EmptyMediaType) || m.ArtifactType == ""
 }
 
 // ErrNotArtifact marks a reference that exists but holds something other than the artifact type
@@ -727,22 +732,32 @@ func (c *Client) GetArtifactMax(ctx context.Context, ref name.Reference, want ty
 			return nil, v1.Hash{}, nil
 		}
 	}
+	a, err := artifactOf(ref, d.Manifest, want, func(l v1.Descriptor) ([]byte, error) { return c.readLayer(ctx, ref, l, limit) })
+	if err != nil {
+		return nil, v1.Hash{}, err
+	}
+	return a, d.Digest, nil
+}
+
+// artifactOf is the artifact of type want the manifest body of ref holds, its one layer read by
+// read; ErrNotArtifact when it holds anything else.
+func artifactOf(ref name.Reference, body []byte, want types.MediaType, read func(v1.Descriptor) ([]byte, error)) (*Artifact, error) {
 	var m struct {
 		ArtifactType types.MediaType   `json:"artifactType"`
 		Layers       []v1.Descriptor   `json:"layers"`
 		Annotations  map[string]string `json:"annotations"`
 	}
-	if err := json.Unmarshal(d.Manifest, &m); err != nil {
-		return nil, v1.Hash{}, fmt.Errorf("%s: manifest: %w: %w", ref, ErrNotArtifact, err)
+	if err := json.Unmarshal(body, &m); err != nil {
+		return nil, fmt.Errorf("%s: manifest: %w: %w", ref, ErrNotArtifact, err)
 	}
 	if m.ArtifactType != want || len(m.Layers) != 1 || m.Layers[0].MediaType != want {
-		return nil, v1.Hash{}, fmt.Errorf("%s is not a %s artifact: %w", ref, want, ErrNotArtifact)
+		return nil, fmt.Errorf("%s is not a %s artifact: %w", ref, want, ErrNotArtifact)
 	}
-	data, err := c.readLayer(ctx, ref, m.Layers[0], limit)
+	data, err := read(m.Layers[0])
 	if err != nil {
-		return nil, v1.Hash{}, err
+		return nil, err
 	}
-	return &Artifact{Type: want, Data: data, Annotations: m.Annotations}, d.Digest, nil
+	return &Artifact{Type: want, Data: data, Annotations: m.Annotations}, nil
 }
 
 // readLayer reads the blob a layer descriptor of ref's manifest names, refused when it is larger

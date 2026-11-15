@@ -68,7 +68,8 @@ These are what `lint` checks; each finding names the key path or `file:line` to 
     bare — Compose's port syntax takes `::1:5432:5432`), `STOWAGE_IPV6` (`true` with `--ipv6`, else `false`; Docker and the VM),
     `STOWAGE_L4_<ROUTE>` (an `l4` route's endpoint, `<address>:<port>`, for a route with an
     `address_input`; Docker and the VM), `STOWAGE_INPUT_FILE_<KEY>` (the path of a file input's file, to mount; Docker and the VM), `STOWAGE_SECRET_FILE_<KEY>` (the path of the file a secret with `as_file: true` is delivered as, to mount; Docker and the VM). The variables a service's `services` entry gives it
-    (`STOWAGE_MEM_LIMIT_MB`, `STOWAGE_HOST_MEM_MB`, `STOWAGE_HOST_CPUS`; `STOWAGE_CPUS`) are in its container's
+    (`STOWAGE_MEM_LIMIT_MB`, `STOWAGE_HOST_MEM_MB`, `STOWAGE_HOST_CPUS`; `STOWAGE_CPUS`), and
+    `STOWAGE_SHAPE`, which every service is given (see "The deploy shape" ([host](host.md))), are in its container's
     environment, not the compose file's: a command reads them escaped, `$${STOWAGE_MEM_LIMIT_MB}`,
     and `${STOWAGE_MEM_LIMIT_MB}` is an unknown variable;
   - an unknown `STOWAGE_…` variable, a `STOWAGE_IMAGE_<KEY>` naming no image, a
@@ -502,7 +503,7 @@ These are what `lint` checks; each finding names the key path or `file:line` to 
   network, as the VM runs an L4 route's and `host_network` runs one), within 10 s: ready is the status `expect`
   (`http-status`; a redirect is not followed, no proxy is used, no connection kept), or a 2xx JSON object carrying every field of `expect` with the same value
   (`http-json`, an answer of at most 64 KiB). `command` runs `cmd` in its image, confined like the
-  schema command (a `stowage-health` service, a container of its own per call, its compose file
+  schema command, with the same environment (its `env`) (a `stowage-health` service, a container of its own per call, its compose file
   `.stowage-health-<id>_<boot id>.yaml` in the install directory, removed after the call; the
   container is labelled `io.stowage.health-boot=<boot id>`; the health gate removes the files and
   containers an earlier boot left (a reboot interrupted their calls), never one of its own boot,
@@ -515,9 +516,12 @@ These are what `lint` checks; each finding names the key path or `file:line` to 
   `reads_newer_image` carries set to `true` when it reads a schema newer than its own (its absence
   means it does not). The queries run with `psql` in the database service as the migrate role.
   `command` runs `cmd` in its image, confined like the provision hook (a `stowage-schema`
-  service, a 64 KiB answer; its environment is every recorded input, secret and safe default,
-  each route's URL and domain, and the values Stowage provides — not narrowed by an `env` as the
-  hook's is): `schema.current` → `{"version": N}`,
+  service, a 64 KiB answer; its environment is what its `env` lists, as the hook's: those of the
+  recorded inputs, secrets and safe defaults, a file input or a secret delivered as a file as its
+  file read-only at `/run/stowage/inputs/<KEY>` with its path in `STOWAGE_INPUT_FILE_<KEY>` or
+  `STOWAGE_SECRET_FILE_<KEY>` (written when absent), plus each route's URL, each L4 route's
+  endpoint and the values Stowage provides; a secret delivered as a file in an install recording
+  no `STOWAGE_FILE_SALT` is refused before the run, naming the `install` that records it): `schema.current` → `{"version": N}`,
   `schema.barrier_after` `{"version": N}` → `{"barriers": [...]}`, and `schema.reads_newer`
   `{"version": N}` → `{"reads_newer": bool}`, run in the previous release's image with the
   previous release's own provider. Migration numbers are whole numbers of at most 15 digits

@@ -219,7 +219,7 @@ func (in *Installer) Uninstall(ctx context.Context, data bool) (err error) {
 		}
 		in.O.logf("a run would %s: %s", what, removes)
 		if data {
-			in.O.logf("and delete its volumes and %s", dir)
+			in.O.logf("and delete its volumes and %s%s", dir, heldBeside(dir))
 		} else {
 			in.O.logf("and keep its volumes and %s", dir)
 		}
@@ -293,10 +293,23 @@ func (in *Installer) Uninstall(ctx context.Context, data bool) (err error) {
 		if err := os.RemoveAll(dir); err != nil {
 			return fmt.Errorf("the stack is down and its volumes deleted, but %s: %w", dir, err)
 		}
+		// The install's login, beside the directory, goes with it.
+		if err := os.Remove(registryLoginFile(dir)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("the stack is down and its data deleted, but its login %s: %w", registryLoginFile(dir), err)
+		}
 		fmt.Fprintf(in.O.Out, "%s in %s is uninstalled, its data deleted\n", name, dir)
 		return nil
 	}
 	fmt.Fprintf(in.O.Out, "%s in %s is uninstalled\nkept: its volumes and %s (its secrets): `%s --dir %s` installs it again on them, `%s uninstall --data --dir %s` deletes them\n",
 		name, dir, dir, in.ctl(), dir, in.ctl(), dir)
 	return nil
+}
+
+// heldBeside names, for a dry run, the login beside the install directory dir that `uninstall
+// --data` deletes with it; empty when there is none.
+func heldBeside(dir string) string {
+	if f := registryLoginFile(dir); fileExists(f) {
+		return " and the login " + f
+	}
+	return ""
 }

@@ -670,8 +670,8 @@ func (in *Installer) removeEarlierHealth(ctx context.Context) {
 // "reason": "..."} out; no answer (exit 2) is not ready. Each call runs as a container of its own,
 // so the gate and the daemon may ask at once.
 func (in *Installer) probeCommand(ctx context.Context, env *EnvFile) error {
-	var c providers.RuntimeCommand
-	if err := in.R.Spec.Health.Decode(&c); err != nil {
+	c, err := providers.DecodeCommand(in.R.Spec.Health, in.R.Spec.Images)
+	if err != nil {
 		return fmt.Errorf("health: %w", err)
 	}
 	var b [4]byte
@@ -684,7 +684,7 @@ func (in *Installer) probeCommand(ctx context.Context, env *EnvFile) error {
 		Reason string `json:"reason"`
 	}
 	boot := in.O.bootID()
-	err := in.runCommand(ctx, commandRun{what: "the health command", service: HealthService, file: healthFilePrefix + id + "_" + boot + ".yaml",
+	err = in.runCommand(ctx, commandRun{what: "the health command", service: HealthService, file: healthFilePrefix + id + "_" + boot + ".yaml",
 		name: containerName(env, HealthService) + "-" + id, labels: map[string]string{HealthBootLabel: boot}}, c, env, env, map[string]any{"op": "health.ready"}, &out)
 	switch {
 	case errors.Is(err, command.ErrNoAnswer):

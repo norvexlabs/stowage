@@ -79,8 +79,8 @@ Lint rules (`stowage lint`): compose has no `build:` and no `name:`; every servi
 `${STOWAGE_IMAGE_<KEY>}` for an `images` key (no literal image: the registry is the single
 deployment point); every `${VAR}` without a default is an input, a secret, a safe default, a route
 domain or a Stowage-provided variable (`${VAR:-x}` is an optional tunable); every input is consumed
-by compose, a route or the provision hook's `env` (a Kubernetes-only input is the chart's);
-the provision hook's `env` names only inputs, secrets and safe defaults; every `safe_defaults` key appears in compose as
+by compose, a route or the `env` of the provision hook or a `command` provider (a
+Kubernetes-only input is the chart's); that `env` names only inputs, secrets and safe defaults; every `safe_defaults` key appears in compose as
 `${KEY:-<value>}`; routes, the portal, the health and database services resolve to compose
 services; L4 routes resolve to compose services and take no port the front publishes by default
 over TCP (nor 80 and 443 while `acme` is offered); a service publishes no port of its own (an error
@@ -629,8 +629,13 @@ Off until the project configures a key (`signing: { provider: cosign-key, key: �
   is the project's, its pins deciding what it holds; Stowage's own release runs the
   same policy on what it supplies (`make self-audit`, fixable high and above) before it publishes,
   so a project inherits no fixable finding of Stowage's. A module its recipes force over the
-  upstream's release leaves the scan clean, and so unmarked: that run lists each one, read from the
-  recipes, as a stopgap to drop once the upstream carries the fix.
+  upstream's release leaves the scan clean, and so unmarked, as does a package a Dockerfile raises
+  over its base: that run reads each from the recipes (and the examples' Dockerfiles) and judges it
+  mechanically where that is cheap and exact — the module against the `go.mod` of the very release
+  the recipe builds, the package against the very base it is raised over, with apk's own comparer
+  — so a stopgap the pinned upstream already covers fails the run instead of staying silently. What
+  needs judgement stays printed: a later upstream release that would carry the fix (a move of the
+  recipe, not a drop), an `apk upgrade`, a module the release does not require.
 - **An app's own SBOM documents**: one audit covers the whole stack only if each image's SBOM
   names what the app put in it. syft reads what is self-describing (package databases, lock files,
   Go binaries, Rust binaries built by `cargo auditable`); what it cannot see — scripts a front
@@ -1047,10 +1052,10 @@ Stowage calls a project's programs: the two never share a reader.
 | 24 | Rotate secrets | `secrets rotate KEY` for `rotation: true`, three passes (`--stage` → `KEY_NEXT` accepted; swap → `KEY_PREVIOUS` accepted; `--finish`), the stack up again at each **C** | `k8s secrets rotate`: the same passes on the Secret, each workload's rollout restarted and awaited **C** | the Docker shape's verb, a host daemon job **C** |
 | 24b | Set a secret | `secrets set KEY` for `settable: true` (opt-in: a database password or an encryption key changed in `.env` alone breaks the data made with it), the value on standard input, the stack up again **C** | not yet **X** | the Docker shape's verb, a host daemon job on the operator's socket alone **C** |
 | 24c | Show a login | `secrets show KEY` for `settable: true`, standard output a terminal or refused; the closing report names the logins and the verb **C** | `k8s secrets show`, from the release's Secret (or its secret files' one) **C** | the Docker shape's verb, the host daemon's answer on the operator's socket alone, never logged **C** |
-| 25 | Registry credential rotation | `.env` / installer flag **C** | pull Secret **C** | sealed env + `reconfigure-userdata` **C** → the pull account the OS bundle carries; a mirror's is the login `registry-login` records (`vm create --registry-login-file`), else root's Docker login on the VM |
+| 25 | Registry credential rotation | `.env` / installer flag **C** | pull Secret **C** | sealed env + `reconfigure-userdata` **C** → the pull account the OS bundle carries; an install's own login, `registry-login` / `--registry-login-file` on every shape (Kubernetes: the pull Secret it writes), comes before it, after the password a run sets; a mirror without one: root's Docker login on the VM |
 | 26 | Power / maintenance | `stop` / `start` **C** | owner: cluster | `<short>-stow reboot/shutdown --drain-secs`, disk-pressure hook **C** |
 | 27 | Uninstall | `uninstall`: `compose down`, the install's timers and applied network declarations removed; the volumes and the install directory kept unless `--data` **C** | `k8s uninstall`: `helm uninstall`, the installer's Secrets, the hook's account and Job; the claims only with `--data`, kept data keeping the Secrets that answer for it, a chart's own claim (which helm deletes) needing `--data` **C** | `vm destroy` (a VM `vm create` made with OpenTofu) **C**; else owner: hypervisor |
-| 28 | Move host / disaster recovery | `secrets export` on old (the front's local CA with the secrets: a new root would break every client trusting the old) → `install --secrets` on new **C** (data: the snapshot by hand) | owner: managed PG; secrets **X** | `secrets export`, then `vm create --secrets` + `restore OBJECT` **C** |
+| 28 | Move host / disaster recovery | `secrets export` on old (the front's local CA with the secrets: a new root would break every client trusting the old) → `install --secrets` on new **C** (data: the snapshot by hand) | `k8s secrets export` (the same file, read from the release's Secrets) → `k8s install --secrets` on the new cluster, the hook waiting for the data (a label on its outputs Secret) **C** | `secrets export`, then `vm create --secrets` + `restore OBJECT` **C** |
 
 Rules:
 - A verb has the **same name** on every shape where it applies; elsewhere the owner is named.
@@ -1191,7 +1196,6 @@ changes with the tree in the same commit.
 | Extension | Matrix row | Size | Why |
 |---|---|---|---|
 | K8s portal URL | 9 | S | parity with Docker |
-| Kubernetes secrets export/import | 28 | M | the VM and Docker have it |
 
 ## 11. Phases
 
@@ -1290,6 +1294,22 @@ every shape, the VM end-to-end test upgrading through it), then the health gate.
   `vm create` and `vm seed` instead of waited for: the fix (the mirror carrying the release's own
   disks) is the operator's, and a boot blocking on a file over SSH would race the install.
 
+- **A pull credential per install is the operator's login, taken per install (TODO option (d))** —
+  the account baked into every installer and OS image reads every install's images, so one leaked
+  installer exposes them all. Minting per-install accounts would need a mint operation, an issuing
+  credential and revocation per registry; the registry already does all three for an operator, so
+  Stowage only takes the login it minted, as the VM's mirror login above (one `auths` entry, one
+  host), on every shape: Docker records it beside the install as the VM does (outside the moving
+  state; given by an install flag, since Docker's install reads no secret on standard input it
+  cannot share, and by the same verb later), Kubernetes records it as the pull Secret itself,
+  labelled so a run without the flag keeps it. One rule on every shape: a login is for the host
+  of the registry the install reads, the release's own or its mirror, and is never sent to
+  another host; on the release's own registry it sits between the password the operator sets for
+  this run (an explicit rotation wins) and the baked account (the fallback that keeps an install
+  without a login pulling). It is not in `secrets export`: it is the operator's credential for one
+  machine, minted again (or given again) for a machine made again, so a recovery file never
+  carries a registry login.
+
 - **Signing** — a dedicated release key; cosign pushes signatures as referrers with the publisher
   token (§ 5.1).
 - **Registry auth** — no mTLS: a pull account + a publisher token (API key), standard login only;
@@ -1302,6 +1322,15 @@ every shape, the VM end-to-end test upgrading through it), then the health gate.
   everyone rather than serving unauthenticated. One CA per install, not per route: a second PKI
   is a second front. The Kubernetes shape's front is the chart's ingress, so the key is the
   Docker and VM fronts'.
+- **Another ACME CA is an install flag, kept like the client CA** — `acme` and `dns-cloudflare`
+  default to Let's Encrypt; `--acme-ca URL` and `--acme-ca-root FILE` point the front's issuer at
+  another directory (a private CA, a test server) because the CA an install trusts is the
+  operator's, not the release's. The URL is a recorded value, the root a file in the install
+  mounted read-only (as the client CA, a directory so Docker never makes one in a file's place);
+  both go into the Caddyfile's global `acme_ca` / `acme_ca_root`, which fill in the issuer the
+  mode writes, so no mode's issuer block is written twice. A root belongs to its CA: a new CA
+  without one drops it. The same flag is how e2e-stateless proves issuance and renewal against
+  Pebble, with no test-only path in the installer.
 - **A route's login is the front's basic auth, its password a secret** — a console showing what
   users do needs more than a CIDR list, and less than an identity provider: `basic_auth` names a
   user and the secret (generated, or a secret input) holding its password, which the front
@@ -1793,6 +1822,12 @@ every shape, the VM end-to-end test upgrading through it), then the health gate.
   trust is the cluster owner's, so the installer takes the CA for its own reads only. OpenTofu's
   provider comes from a provider mirror the operator configures (documented, not carried in the
   archive: it is the operator's tool, not the release's).
+  The import checks the archive's release (and each yank it carries) against the importing
+  `<short>-stow`'s keys before it pushes anything, reading the signatures from the archive with
+  the install's own verifier (`sigverify`, the archive read as a registry): an install would
+  refuse a release unsigned in the mirror anyway, but only after a tampered or foreign archive
+  had filled the mirror and moved its channel's tag. The release names every other manifest by
+  digest, so checking it covers them, as an install's check does.
 - **Secrets** — the same rule on every shape: `<short>-stow` generates the generated secrets
   (`secrets[]`) at the first install, on the target, and they never travel; the secrets an
   operator supplies (`secret: true` inputs: a mail provider's password, a third party's API key)
@@ -1805,7 +1840,10 @@ every shape, the VM end-to-end test upgrading through it), then the health gate.
   Disaster recovery: `secrets export` writes the secrets encrypted to the operator's age keys
   (age, the backups' tool; no private key on the target), and `install --secrets` / `vm create
   --secrets` take them back decrypted, the VM's over SSH as every secret (its settings only say
-  the first install waits); then a backup is restored. That SSH is pinned: `vm create` gives the
+  the first install waits); then a backup is restored. Kubernetes writes and takes the same file
+  (`k8s secrets export`, `k8s install --secrets`): one format, so a file restores on any shape
+  where its keys apply; its hook's wait is a label on the outputs Secret, which `k8s provision`
+  removes, as the cluster keeps no install directory for a marker file. That SSH is pinned: `vm create` gives the
   VM a one-time host key in its cloud-config and refuses any other, as a first contact taking
   whatever key answers would hand the secrets to whoever answered first. The key is a secret of
   little worth: it is served only until the install (from `/run`, so not past a reboot), then
@@ -2356,8 +2394,13 @@ every shape, the VM end-to-end test upgrading through it), then the health gate.
   `secrets set`, `export` and an upgrade carry it); only its delivery changes. On Kubernetes it
   goes to a Secret of its own rather than the release's, so a chart's `envFrom` of that one cannot
   leak it whatever the chart does. Rotation is refused with it: its passes hand the services two
-  more values as variables. A `command` provider still receives it as a variable — one calling
-  convention for those (§ 12, the `command` contract), run by Stowage, not a service.
+  more values as variables. A `command` provider listing it in its `env` gets its file, as the
+  provision hook does.
+- **A `command` provider's container receives only the keys its `env` lists**, as the provision
+  hook's: a readiness or schema probe holding every secret of the install is a leak waiting for a
+  bug in the project's tool. One rule (`providers.CheckEnv`, the linter's check of recorded keys,
+  the installer's `declaredEnv`/`declaredFiles`) serves the hook and the command, so they cannot
+  drift; `env` is required, so a spec states what each reads.
 
 ## 13. OpenTofu provider (planned)
 
@@ -2393,8 +2436,8 @@ no `action` blocks, so every operation is a resource's create, update or delete)
   line), the release, the non-secret inputs; on Kubernetes the namespace and release name alone,
   as the cluster's connection is the provider's configuration. Not in state: secret inputs (write-only, with a
   `secret_inputs_wo_version` that triggers their update), a handoff kit or given values
-  (`given_wo`, at create), a decrypted `secrets export` (`secrets_wo`, at create, Docker and the VM:
-  Kubernetes has no `secrets export`). Read and delete see state alone, so nothing they need is
+  (`given_wo`, at create), a decrypted `secrets export` (`secrets_wo`, at create, Docker and the VM;
+  on Kubernetes `k8s install --secrets` takes it, which the resource does not pass yet). Read and delete see state alone, so nothing they need is
   write-only. Generated secrets never leave the target.
 - **Read** is `status --json`: a VM whose health gate fell back shows its real release, and the next
   plan proposes the upgrade again.

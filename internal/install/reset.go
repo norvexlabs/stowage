@@ -454,13 +454,20 @@ func (in *Installer) K8sReset(ctx context.Context) error {
 	// A reset installs the release it wipes again, with its installer; only across a schema
 	// baseline, asked for by --new-baseline, does it install this installer's release instead.
 	other := cur.Release.Version != m.ProjectVersion || cur.Release.Revision != m.Revision
+	if !other && in.O.NewBaseline {
+		r := cur.Release
+		return fmt.Errorf("release %s in %s already runs %s %s (revision %d): --new-baseline installs another release, which this installer does not carry; reset-db without it wipes this one",
+			k.Release, k.Namespace, m.Name, r.Version, r.Revision)
+	}
+	// The login next, before any other read: the releases are read with it, from the registry the
+	// release records.
+	// Only a crossing (other) writes the pull Secret; its dry run refuses as the run would.
+	if err := in.k8sLogins(ctx, cur.Registry, other); err != nil {
+		return err
+	}
 	if other || in.O.NewBaseline {
 		r := cur.Release
-		if !other {
-			return fmt.Errorf("release %s in %s already runs %s %s (revision %d): --new-baseline installs another release, which this installer does not carry; reset-db without it wipes this one",
-				k.Release, k.Namespace, m.Name, r.Version, r.Revision)
-		}
-		running, runErr := in.k8sRunning(ctx, cur, cmp.Or(k.Registry, cur.Registry))
+		running, runErr := in.k8sRunning(ctx, cur, cur.Registry)
 		from, to, ok := in.k8sBaselines(running, runErr, cur)
 		crosses := ok && from != to
 		switch {
@@ -481,6 +488,7 @@ func (in *Installer) K8sReset(ctx context.Context) error {
 	// Across a baseline the new release's Secrets are written before the wipe: the secrets and
 	// inputs it adds (asked as an upgrade asks), and the pull account it carries.
 	var d deploy
+	var keep pullKeep
 	if other {
 		if err := in.k8sSecrets(ctx, &d, true); err != nil {
 			return err
@@ -488,6 +496,15 @@ func (in *Installer) K8sReset(ctx context.Context) error {
 		user, token, err := in.pullAccount(cur.Registry)
 		if err != nil {
 			return err
+		}
+		// A login --registry-login-file gave stays the pull Secret's as an upgrade keeps it
+		// (pullLoginRule).
+		var line string
+		if keep, line = in.pullLoginRule(cur.Registry, token); line != "" {
+			in.O.logf("%s", line)
+		}
+		if keep == pullKept {
+			token = ""
 		}
 		if token != "" {
 			if d.pull, err = dockerAuths(registryHost(cur.Registry), user, token); err != nil {
@@ -512,6 +529,17 @@ func (in *Installer) K8sReset(ctx context.Context) error {
 			secretFiles = k.secretFilesSecret()
 		}
 		if values, err = withFilesValue(values, name, secretFiles, d.asFile); err != nil {
+			return err
+		}
+		// The pods name the pull Secret where it holds this run's login, kept or written, and no
+		// longer where it holds another host's; another Secret the values name stays.
+		switch {
+		case keep == pullKept || d.pull != nil:
+			values, err = withPullSecret(values, k.pullSecret(), k.pullSecret())
+		case keep == pullDropped:
+			values, err = withPullSecret(values, k.pullSecret(), "")
+		}
+		if err != nil {
 			return err
 		}
 	}

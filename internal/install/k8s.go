@@ -425,6 +425,7 @@ func k8sTarget(k K8sOptions) string {
 // checkTarget refuses a namespace or a release name Kubernetes would refuse, and names that leave
 // no room for the Secrets named after the release.
 func (in *Installer) checkTarget() error {
+	in.k8sRun = true // every k8s verb checks its target first: heldLogin waits for k8sLogins
 	k := in.O.K8s
 	if len(k.Namespace) > 63 || !dnsLabel.MatchString(k.Namespace) {
 		return fmt.Errorf("--namespace %q: a namespace is a DNS label (lower-case letters, digits, '-'; at most 63)", k.Namespace)
@@ -561,12 +562,18 @@ func (in *Installer) k8sInputs() []input {
 // readSecret returns the data of a Secret the installer wrote; nil when there is none. A Secret of
 // that name it did not write is refused: it is never written over.
 func (in *Installer) readSecret(ctx context.Context, name string) (map[string]string, error) {
+	data, _, err := in.readSecretLabeled(ctx, name)
+	return data, err
+}
+
+// readSecretLabeled is readSecret, with the Secret's labels.
+func (in *Installer) readSecretLabeled(ctx context.Context, name string) (map[string]string, map[string]string, error) {
 	out, err := in.kubectl(ctx, Cmd{Args: []string{"get", "secret", name, "--ignore-not-found", "--output", "json"}})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if len(bytes.TrimSpace(out)) == 0 {
-		return nil, nil
+		return nil, nil, nil
 	}
 	var s struct {
 		Metadata struct {
@@ -575,20 +582,186 @@ func (in *Installer) readSecret(ctx context.Context, name string) (map[string]st
 		Data map[string][]byte `json:"data"`
 	}
 	if err := json.Unmarshal(out, &s); err != nil {
-		return nil, fmt.Errorf("secret %s: %w", name, err)
+		return nil, nil, fmt.Errorf("secret %s: %w", name, err)
 	}
 	want := in.secretLabels()
 	// Who wrote it first: another tool's Secret is named as such, not as another release's.
 	for _, key := range []string{"app.kubernetes.io/managed-by", "app.kubernetes.io/part-of", "app.kubernetes.io/instance"} {
 		if got, want := s.Metadata.Labels[key], want[key]; got != want {
-			return nil, &foreignSecret{fmt.Sprintf("secret %s in %s was not written by %s for release %s (label %s is %q, not %q): it is not written over", name, in.O.K8s.Namespace, in.R.Ctl(), in.O.K8s.Release, key, got, want)}
+			return nil, nil, &foreignSecret{fmt.Sprintf("secret %s in %s was not written by %s for release %s (label %s is %q, not %q): it is not written over", name, in.O.K8s.Namespace, in.R.Ctl(), in.O.K8s.Release, key, got, want)}
 		}
 	}
 	data := map[string]string{}
 	for k, v := range s.Data {
 		data[k] = string(v)
 	}
-	return data, nil
+	return data, s.Metadata.Labels, nil
+}
+
+// pullLoginLabel marks the pull Secret a run wrote from --registry-login-file's login
+// (pullLoginByRun): a later run without the flag keeps it rather than write the pull account over
+// it. A run writing the Secret otherwise leaves the label out, and the server-side apply removes it.
+const (
+	pullLoginLabel = "stowage.dev/pull-login"
+	pullLoginByRun = "install"
+)
+
+// k8sTakeLogin checks --registry-login-file's login (O.RegistryLogin; nil: none) for a deploy
+// whose images come from prefix: one auths entry for prefix's host, neither beside
+// --image-pull-login nor beside the pull account's password (TOKEN_ENV), which each give the pull
+// Secret another login. It is then the login this run reads prefix with (heldLogin), and the pull
+// Secret's.
+func (in *Installer) k8sTakeLogin(prefix string) error {
+	raw := in.O.RegistryLogin
+	if raw == nil {
+		return nil
+	}
+	if in.O.K8s.PullLogin {
+		return refuse("give --registry-login-file or --image-pull-login", "--registry-login-file gives the pull Secret its login, --image-pull-login copies the Docker client's: give one")
+	}
+	if len(raw) > maxRegistryLogin {
+		return fmt.Errorf("--registry-login-file is over %d KiB: one entry is a few hundred bytes", maxRegistryLogin>>10)
+	}
+	l, err := parseRegistryLogin(raw)
+	if err != nil {
+		return fmt.Errorf("--registry-login-file: %w", err)
+	}
+	if h := registryHost(prefix); !strings.EqualFold(l.Host, h) {
+		return fmt.Errorf("--registry-login-file: the login is for %s, but the release's images come from %s at %s: give an auths entry for %s", l.Host, prefix, h, h)
+	}
+	if in.tokenGiven(prefix) {
+		c, _ := providers.Token(in.R.Spec.Registry.Pull)
+		return refuse("leave out --registry-login-file, or unset "+c.TokenEnv, "--registry-login-file and %s both give the pull Secret of %s a login: give one", c.TokenEnv, prefix)
+	}
+	in.k8sLogin = &l
+	return nil
+}
+
+// tokenGiven reports whether the pull account's password is given this run (TOKEN_ENV) for prefix,
+// the release's own registry.
+func (in *Installer) tokenGiven(prefix string) bool {
+	p := in.R.Spec.Registry.Pull
+	if prefix != in.R.Spec.Registry.Prefix || p.Name != "token" {
+		return false
+	}
+	c, err := providers.Token(p)
+	return err == nil && in.O.getenv(c.TokenEnv) != ""
+}
+
+// pullLoginHeld is the login the release's pull Secret holds when --registry-login-file gave it
+// (pullLoginLabel); nil otherwise. Another tool's Secret of that name, or one without the label,
+// holds none of the installer's and is never read as a login. err is kubectl's read failing;
+// broken, why the login of a labelled Secret that was read does not parse.
+func (in *Installer) pullLoginHeld(ctx context.Context) (held *registryLogin, broken string, err error) {
+	data, labels, err := in.readSecretLabeled(ctx, in.O.K8s.pullSecret())
+	var foreign *foreignSecret
+	if errors.As(err, &foreign) {
+		return nil, "", nil
+	}
+	if err != nil {
+		return nil, "", err
+	}
+	if labels[pullLoginLabel] != pullLoginByRun {
+		return nil, "", nil
+	}
+	l, err := parseRegistryLogin(secretLogin([]byte(data[".dockerconfigjson"])))
+	if err != nil {
+		return nil, err.Error(), nil
+	}
+	return &l, "", nil
+}
+
+// secretLogin is a pull Secret's Docker config as a login file parseRegistryLogin reads: the
+// entry dockerAuths writes holds the user and password twice, in auth and in username and
+// password, and keeps auth alone when both say the same. Any other config is returned as it is.
+func secretLogin(raw []byte) []byte {
+	var doc struct {
+		Auths map[string]loginEntry `json:"auths"`
+	}
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	if dec.Decode(&doc) != nil || len(doc.Auths) != 1 {
+		return raw
+	}
+	for host, e := range doc.Auths {
+		if e.Auth == "" || e.Username == "" || e.Password == "" || e.Auth != base64.StdEncoding.EncodeToString([]byte(e.Username+":"+e.Password)) {
+			return raw
+		}
+		out, err := json.Marshal(map[string]any{"auths": map[string]loginEntry{host: {Auth: e.Auth}}})
+		if err != nil {
+			return raw
+		}
+		return out
+	}
+	return raw
+}
+
+// k8sLogins takes the login a Kubernetes run reads prefix with, before its first read of it:
+// --registry-login-file's (k8sTakeLogin); without it, unless --image-pull-login asks for the
+// Docker client's, the one the release's pull Secret holds from a run before, which heldLogin
+// gives the reads of its own host alone, after the password TOKEN_ENV gives. The Secret is read
+// once per run and prefix (k8sPulls), so every read of one prefix takes one login. When kubectl
+// cannot read the Secret, a run that writes it (writes: install, upgrade, reset-db) is refused,
+// as it would write over a login it cannot see; any other run logs it and reads without a login.
+// A labelled Secret whose login does not parse is logged, with the way to give one again, and the
+// run goes on as one holding no login: a run writing the Secret writes the account it has over it.
+// heldLogin refuses a Kubernetes run's read of a prefix before it.
+func (in *Installer) k8sLogins(ctx context.Context, prefix string, writes bool) error {
+	if _, ok := in.k8sPulls[prefix]; ok {
+		return nil
+	}
+	if err := in.k8sTakeLogin(prefix); err != nil {
+		return err
+	}
+	var held *registryLogin
+	if in.k8sLogin == nil && !in.O.K8s.PullLogin {
+		name := in.O.K8s.pullSecret()
+		h, broken, err := in.pullLoginHeld(ctx)
+		switch {
+		case err != nil && writes:
+			return fmt.Errorf("the pull Secret %s could not be read (%v): run again once it can be read (the run needs `get` on that Secret in %s) — a run that cannot see it would overwrite the login --registry-login-file gave", name, err, in.O.K8s.Namespace)
+		case err != nil:
+			in.O.logf("the pull Secret %s could not be read (%v); this run reads the registry without the login it may hold", name, err)
+		case broken != "":
+			in.O.logf("the pull Secret %s: the login --registry-login-file gave does not read (%s); this run reads the registry without it (`%s --registry-login-file FILE` gives one again)", name, broken, in.k8sCtl("upgrade"))
+		}
+		held = h
+	}
+	if in.k8sPulls == nil {
+		in.k8sPulls = map[string]*registryLogin{}
+	}
+	in.k8sPulls[prefix] = held
+	return nil
+}
+
+// pullKeep is what a run does with the pull Secret holding a login a run before gave (k8sPulls).
+type pullKeep int
+
+const (
+	pullNoLogin  pullKeep = iota // none held, or this run gives the Secret its login: written as the run decides
+	pullKept                     // kept as it is, and the pods name it
+	pullReplaced                 // the pull account written over it
+	pullDropped                  // a login for another host than the images': the pods name it no longer
+)
+
+// pullLoginRule is what a run whose images come from prefix does with the pull Secret holding a
+// login a run before gave, token being the pull account's password it would write ("" for none),
+// and the line it logs. A login for another host is never named for prefix's images: the pull
+// account replaces it when the run has one, else the pods name no pull Secret. On prefix's host
+// it is kept, unless the pull account's password is given (TOKEN_ENV).
+func (in *Installer) pullLoginRule(prefix, token string) (pullKeep, string) {
+	held, name, host := in.k8sPulls[prefix], in.O.K8s.pullSecret(), registryHost(prefix)
+	switch {
+	case held == nil:
+		return pullNoLogin, ""
+	case !strings.EqualFold(held.Host, host) && token != "":
+		return pullReplaced, fmt.Sprintf("the pull Secret %s holds a login --registry-login-file gave for %s, but the images come from %s: the pull account replaces it", name, held.Host, host)
+	case !strings.EqualFold(held.Host, host):
+		return pullDropped, fmt.Sprintf("the pull Secret %s holds a login --registry-login-file gave for %s, but the images come from %s: the pods no longer name it and pull from %s without a login (`%s --registry-login-file FILE`, FILE an auths entry for %s, gives them one)", name, held.Host, host, host, in.k8sCtl("upgrade"), host)
+	case in.tokenGiven(prefix):
+		return pullReplaced, fmt.Sprintf("the pull Secret %s holds a login --registry-login-file gave: the pull account's password, given, replaces it", name)
+	}
+	return pullKept, fmt.Sprintf("the pull Secret %s keeps the login --registry-login-file gave for %s (a run with --registry-login-file replaces it)", name, host)
 }
 
 // k8sObject is a Kubernetes object the installer applies.
@@ -634,6 +807,7 @@ type deploy struct {
 	secret        map[string]bool   // keys of env never printed
 	changed       []string          // keys of env this run adds or changes
 	pull          []byte            // the pull Secret's Docker config; nil writes none
+	pullLogin     bool              // pull is the login --registry-login-file gave (pullLoginLabel)
 	files         map[string][]byte // the files Secret's data; nil writes none
 	asFile        []string          // the keys of env delivered as files: in secretFilesSecret, never envSecret
 	heldEnv       map[string]bool   // the keys envSecret held (k8sRecorded)
@@ -769,10 +943,13 @@ var selfRecorded = [][]string{{"release", k8sInstallerKey}, {"release", k8sInsta
 func (in *Installer) k8sDeploy(ctx context.Context, upgrade bool) (err error) {
 	var mutated bool
 	defer afterChange(&mutated, &err)
-	in.givenCA = true
+	in.givenCA, in.kube = true, true
 	o, k, m := &in.O, in.O.K8s, in.R.Manifest
 	if err := in.checkTarget(); err != nil {
 		return err
+	}
+	if o.Secrets != nil && upgrade {
+		return refuse("leave out --secrets: an upgrade keeps the release's secrets", "--secrets is for a first install (a machine made again): release %s in %s keeps its secrets", k.Release, k.Namespace)
 	}
 	if m.Artifacts.Chart == nil {
 		return refuse("install the release with Docker, or a release published with the kubernetes shape", "%s %s has no chart (published without the kubernetes shape): it is not installed on Kubernetes", m.Name, m.ProjectVersion)
@@ -820,6 +997,10 @@ func (in *Installer) k8sDeploy(ctx context.Context, upgrade bool) (err error) {
 		prefix = cmp.Or(k.Registry, cur.Registry)
 		sysctls = cur.givesSysctls()
 		runningPull = cur.pullSecretName()
+		// The login first: the release that runs is read with it.
+		if err := in.k8sLogins(ctx, prefix, true); err != nil {
+			return err
+		}
 		// The same release applied again shares its baseline and its inputs: nothing to fetch.
 		if cur.Release.Version != m.ProjectVersion || cur.Release.Revision != m.Revision {
 			running, runErr := in.k8sRunning(ctx, cur, prefix)
@@ -837,8 +1018,17 @@ func (in *Installer) k8sDeploy(ctx context.Context, upgrade bool) (err error) {
 			}
 		}
 	}
+	// The file first, as Docker's install reads it: a refusal here wastes no answer either.
+	if err := in.k8sUseSecrets(); err != nil {
+		return err
+	}
 	// The pull account first, before any input is asked: a refusal here wastes no answer.
 	var d deploy
+	if !upgrade { // an upgrade took them before it read the release that runs
+		if err := in.k8sLogins(ctx, prefix, true); err != nil {
+			return err
+		}
+	}
 	user, token, err := in.pullAccount(prefix)
 	if err != nil {
 		return err
@@ -848,9 +1038,21 @@ func (in *Installer) k8sDeploy(ctx context.Context, upgrade bool) (err error) {
 		if err != nil {
 			return err
 		}
-		return refuse("leave out --image-pull-login: with "+c.TokenEnv+" set, the run writes the pull account's Secret", "--image-pull-login: the images come from %s, the host of the release's own registry, whose images the cluster pulls with the pull account %s (%s): the Docker login there is never copied into the cluster", registryHost(prefix), c.User, c.TokenEnv)
+		return refuse("leave out --image-pull-login: the run writes the pull account's Secret ("+c.TokenEnv+"), or --registry-login-file FILE's login", "--image-pull-login: the images come from %s, the host of the release's own registry, whose images the cluster pulls with the pull account %s (%s), or with the release's own login --registry-login-file gives: the Docker login there is never copied into the cluster", registryHost(prefix), c.User, c.TokenEnv)
 	}
-	if token == "" && !upgrade && in.R.Spec.Registry.Pull.Name == "token" && prefix == in.R.Spec.Registry.Prefix {
+	// A login --registry-login-file gave is the pull Secret's record: a run without it keeps it
+	// (pullLoginRule), unless it is asked for another (--image-pull-login, which holds
+	// none), the pull account's password is given (TOKEN_ENV) or the images come from another host.
+	d.pullLogin = in.k8sLogin != nil // pullAccount gives it: the Secret below is written from it
+	keep, line := in.pullLoginRule(prefix, token)
+	if line != "" {
+		o.logf("%s", line)
+	}
+	keptLogin := keep == pullKept
+	if keptLogin {
+		token = "" // the Secret holds it already
+	}
+	if token == "" && !keptLogin && !upgrade && in.R.Spec.Registry.Pull.Name == "token" && prefix == in.R.Spec.Registry.Prefix {
 		c, err := providers.Token(in.R.Spec.Registry.Pull)
 		if err != nil {
 			return err
@@ -873,9 +1075,17 @@ func (in *Installer) k8sDeploy(ctx context.Context, upgrade bool) (err error) {
 		}
 	}
 	// An upgrade writing no pull account names the Secret the release names, once it is seen to
-	// exist: never one reused unseen.
+	// exist: never one reused unseen. The Secret keeping a login a run gave for the images' host
+	// is named on an install, and on an upgrade of a release naming it or none (a run before
+	// dropped it for another host's images): never in place of another Secret the operator's
+	// values name, unless that one is gone.
 	keptPull := ""
-	if upgrade && d.pull == nil && runningPull != "" {
+	if keptLogin && (!upgrade || runningPull == "" || runningPull == k.pullSecret()) {
+		keptPull = k.pullSecret()
+	}
+	// A login for another host is never named again for these images (pullDropped).
+	dropped := keep == pullDropped && runningPull == k.pullSecret()
+	if upgrade && d.pull == nil && runningPull != "" && keptPull == "" && !dropped {
 		out, err := in.kubectl(ctx, Cmd{Args: []string{"get", "secret", runningPull, "--ignore-not-found", "--output", "name"}})
 		if err != nil {
 			return err
@@ -883,6 +1093,9 @@ func (in *Installer) k8sDeploy(ctx context.Context, upgrade bool) (err error) {
 		switch {
 		case len(bytes.TrimSpace(out)) > 0:
 			keptPull = runningPull
+		case keptLogin:
+			keptPull = k.pullSecret()
+			o.logf("the pull Secret %s the release names is gone: the pods name %s", runningPull, keptPull)
 		case in.R.Spec.Registry.Pull.Name == "token" && prefix == in.R.Spec.Registry.Prefix:
 			c, err := providers.Token(in.R.Spec.Registry.Pull)
 			if err != nil {
@@ -903,6 +1116,10 @@ func (in *Installer) k8sDeploy(ctx context.Context, upgrade bool) (err error) {
 		d.namespace = err == nil && len(bytes.TrimSpace(ns)) == 0
 	}
 	if err := in.k8sSecrets(ctx, &d, upgrade); err != nil {
+		return err
+	}
+	restoredOuts, err := in.k8sRestoredOutputs(ctx)
+	if err != nil {
 		return err
 	}
 	// A value the release no longer declares as an input leaves its Secret: the server-side apply
@@ -991,11 +1208,17 @@ func (in *Installer) k8sDeploy(ctx context.Context, upgrade bool) (err error) {
 		args = append(args, "--values", f)
 	}
 	if o.DryRun {
+		if restoredOuts != nil {
+			o.logf("--secrets: a run writes the provision hook's values %s into the Secret %s, and the hook waits for the backup they belong to", strings.Join(sortedKeys(in.restored.Provision), ", "), k.provisionName())
+		}
 		c := m.Artifacts.Chart
 		return in.printDeploy(d, args, map[string]string{chart: "oci://" + prefix + "/" + c.Repository + "@" + c.Digest, valuesFile: "<the values above>"}, plan)
 	}
 	mutated = true // the Secrets, then helm
 	if err := in.applySecrets(ctx, d); err != nil {
+		return err
+	}
+	if err := in.k8sWriteRestoredOutputs(ctx, restoredOuts); err != nil {
 		return err
 	}
 	// The schema before helm migrates, which a rollback past this upgrade is checked against; empty
@@ -1140,6 +1363,11 @@ func (in *Installer) k8sEnv(ctx context.Context, upgrade bool) (env map[string]s
 	if err != nil {
 		return nil, nil, nil, err
 	}
+	if rec != nil && in.restored != nil {
+		k := o.K8s
+		return nil, nil, nil, refuse(fmt.Sprintf("leave out --secrets: the install reuses the Secret %s; or `kubectl delete secret %s %s` first", k.envSecret(), k.envSecret(), k.kubectlWhere()),
+			"the Secret %s in %s holds release %s's secrets (an install that stopped, or one uninstalled, kept it), which a first install reuses: --secrets is for one with none", k.envSecret(), k.Namespace, k.Release)
+	}
 	recorded := NewEnvFile()
 	for _, key := range sortedKeys(rec) {
 		recorded.Set(key, rec[key])
@@ -1187,11 +1415,16 @@ func (in *Installer) k8sEnv(ctx context.Context, upgrade bool) (env map[string]s
 		if _, ok := values[s.Key]; ok {
 			continue
 		}
+		if v := in.restoredSecret(s.Key); v != "" {
+			values[s.Key] = v
+			continue
+		}
 		if values[s.Key], err = generate(o.rand(), s.Gen); err != nil {
 			return nil, nil, nil, fmt.Errorf("secret %s: %w", s.Key, err)
 		}
 	}
-	rotationVars(in.R.Spec.Secrets, func(k string) bool { _, ok := rec[k]; return ok }, func(k, v string) { values[k] = v; secret[k] = true })
+	// A rotation under way when the secrets were exported goes on from where it was.
+	rotationVars(in.R.Spec.Secrets, func(k string) bool { _, ok := rec[k]; return ok }, func(k, _ string) { values[k] = in.restoredSecret(k); secret[k] = true })
 	acceptedVars(in.R.Spec.Secrets, func(k string) string { return values[k] }, func(k, v string) { values[k] = v; secret[k] = true })
 	for _, key := range sortedKeys(values) {
 		if old, ok := rec[key]; !ok || old != values[key] {
@@ -1266,7 +1499,11 @@ func (in *Installer) applySecrets(ctx context.Context, d deploy) error {
 		items = append(items, in.secretObject(k.secretFilesSecret(), "Opaque", f))
 	}
 	if d.pull != nil {
-		items = append(items, in.secretObject(k.pullSecret(), "kubernetes.io/dockerconfigjson", map[string][]byte{".dockerconfigjson": d.pull}))
+		obj := in.secretObject(k.pullSecret(), "kubernetes.io/dockerconfigjson", map[string][]byte{".dockerconfigjson": d.pull})
+		if d.pullLogin {
+			obj.Metadata.Labels[pullLoginLabel] = pullLoginByRun
+		}
+		items = append(items, obj)
 	}
 	list, err := json.Marshal(map[string]any{"apiVersion": "v1", "kind": "List", "items": items})
 	if err != nil {
@@ -1310,7 +1547,10 @@ func (in *Installer) printDeploy(d deploy, args []string, shown map[string]strin
 	if f := d.secretFiles(); f != nil {
 		fmt.Fprintf(w, "secret %s: the secrets delivered as files %s (redacted)\n", k.secretFilesSecret(), strings.Join(sortedKeys(f), ", "))
 	}
-	if d.pull != nil {
+	switch {
+	case d.pull != nil && d.pullLogin:
+		fmt.Fprintf(w, "secret %s: the login --registry-login-file gave (redacted)\n", k.pullSecret())
+	case d.pull != nil:
 		fmt.Fprintf(w, "secret %s: the pull account (redacted)\n", k.pullSecret())
 	}
 	fmt.Fprintf(w, "values:\n%s", indent(string(d.values)))
@@ -1548,6 +1788,11 @@ func (in *Installer) K8sUpgradeTo(ctx context.Context, v string, args []string) 
 		return err
 	}
 	prefix := cmp.Or(k.Registry, cur.Registry)
+	// The release and the installer are read with the login --registry-login-file gives, else the
+	// one the pull Secret holds; the installer it runs writes the pull Secret, and reads it again.
+	if err := in.k8sLogins(ctx, prefix, false); err != nil {
+		return err
+	}
 	c, err := in.registryClient(prefix)
 	if err != nil {
 		return err
@@ -1583,6 +1828,9 @@ func (in *Installer) K8sUpgradeTo(ctx context.Context, v string, args []string) 
 		if k.PullLogin {
 			fmt.Fprintf(in.O.Out, "--image-pull-login is not applied: an upgrade to the release that runs changes nothing\n")
 		}
+		if in.k8sLogin != nil {
+			fmt.Fprintf(in.O.Out, "--registry-login-file is not applied: an upgrade to the release that runs changes nothing (`%s` without --version writes the pull Secret from it)\n", in.k8sCtl("upgrade"))
+		}
 		return nil
 	}
 	in.O.logf("fetching the installer of %s %s (revision %d, %s)", name, m.ProjectVersion, m.Revision, m.Tag)
@@ -1590,8 +1838,22 @@ func (in *Installer) K8sUpgradeTo(ctx context.Context, v string, args []string) 
 	if err != nil {
 		return err
 	}
-	if err := in.runChild(ctx, exe, append([]string{"k8s", "upgrade"}, args...)); err != nil {
+	args = append([]string{"k8s", "upgrade"}, args...)
+	if in.k8sLogin != nil {
+		// The child reads the login from a pipe it inherits, never from a file on disk: its
+		// standard input stays its own (its terminal, a flag's -).
+		file, done, err := in.childLogin()
+		if err != nil {
+			return err
+		}
+		defer done()
+		args = append(args, "--registry-login-file="+file)
+	}
+	if err := in.runChild(ctx, exe, args); err != nil {
 		in.O.logf("the fetched installer is kept: %s", exe)
+		if in.k8sLogin != nil {
+			in.O.logf("note: if it refused --registry-login-file as an unknown flag, it was made before it, and takes no login of its own: run `%s --version %s` without it, with the pull account's password (the release's own registry) or a Docker login to the mirror", in.k8sCtl("upgrade"), m.ProjectVersion)
+		}
 		if k.UnsafeSysctls != nil {
 			in.O.logf("note: if it refused --unsafe-sysctls as an unknown flag, it was made before it: run `%s --version %s` without it; its release gives the pods no such settings", in.k8sCtl("upgrade"), m.ProjectVersion)
 		}
@@ -1604,6 +1866,33 @@ func (in *Installer) K8sUpgradeTo(ctx context.Context, v string, args []string) 
 		in.O.logf("the fetched installer could not be removed: %v", err)
 	}
 	return nil
+}
+
+// childLogin hands the login --registry-login-file gave (k8sLogin) to the installer `k8s upgrade
+// --version` runs: the read end of a pipe holding it, the child's first descriptor past standard
+// error (O.childFiles, childFD), whose path it returns for the child's --registry-login-file.
+// The child's readFlagFile marks that descriptor close-on-exec before it reads it, whether the
+// read succeeds or not, so none of the processes the child starts inherits it. No copy reaches the disk, so none outlives a killed run. done
+// closes the parent's ends once the child ended.
+func (in *Installer) childLogin() (path string, done func(), err error) {
+	raw, err := in.k8sLogin.marshal()
+	if err != nil {
+		return "", nil, err
+	}
+	r, w, err := os.Pipe()
+	if err != nil {
+		return "", nil, fmt.Errorf("--registry-login-file: %w", err)
+	}
+	// Written beside the child: a login past the pipe's buffer waits for its read.
+	go func() {
+		_, _ = w.Write(raw)
+		_ = w.Close()
+	}()
+	in.O.childFiles = []*os.File{r}
+	return childFD(0), func() {
+		in.O.childFiles = nil
+		_ = r.Close()
+	}, nil
 }
 
 // k8sBaselines are the schema baselines of the release the helm release runs (from) and of this

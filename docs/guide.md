@@ -318,7 +318,8 @@ API it is set up through) packages without changing the software, through the co
   daemons need through a shared volume, one marker file per finished step. The provision hook
   is not the vehicle: it mounts no project volume and its results go back to it alone.
 - **Health behind authentication**: a `command` health provider, in an image holding a client of
-  the API, or an unauthenticated readiness endpoint.
+  the API, its `env` listing the secret it authenticates with, or an unauthenticated readiness
+  endpoint.
 - **An optional daemon**: a compose profile an input's `profile` turns on.
 
 ## What to read next

@@ -134,44 +134,56 @@ func (in *Installer) K8sShowSecret(ctx context.Context, key string) (string, err
 	if _, err := in.settable(key); err != nil {
 		return "", err
 	}
-	if err := in.checkTarget(); err != nil {
+	rec, err := in.k8sRecordedHere(ctx, "show")
+	if err != nil {
 		return "", err
 	}
 	k := in.O.K8s
-	if _, err := in.checkHelm(ctx); err != nil {
-		return "", err
-	}
-	rel, err := in.release(ctx)
-	if err != nil {
-		return "", err
-	}
-	if rel == nil {
-		return "", in.noRelease()
-	}
-	if rel.Status == "uninstalled" {
-		return "", in.uninstalledRelease()
-	}
-	// The release's spec says which secrets are settable: this installer's only when it carries it.
-	cur, err := in.installedRelease(ctx)
-	if err != nil {
-		return "", err
-	}
-	if r, m := cur.Release, in.R.Manifest; r.Version != m.ProjectVersion || r.Revision != m.Revision {
-		return "", refuse(fmt.Sprintf("the installer of %s", r.Version), "release %s in %s runs %s %s (revision %d), and this installer carries %s (revision %d): show with the installer of %s",
-			k.Release, k.Namespace, m.Name, r.Version, r.Revision, m.ProjectVersion, m.Revision, r.Version)
-	}
-	rec, err := in.k8sRecorded(ctx)
-	if err != nil {
-		return "", err
-	}
-	if rec == nil {
-		return "", in.noRelease()
-	}
 	where := k.envSecret()
 	if in.R.Spec.AsFile(key) {
 		where = k.secretFilesSecret()
 	}
 	return recordedSecret(func(k string) (string, bool) { v, ok := rec[k]; return v, ok }, key, "the Secret "+where+" in "+k.Namespace)
+}
+
+// k8sRecordedHere is what the release records (k8sRecorded), for a verb reading its secrets with
+// the installer of the release it runs, whose spec says which keys are secrets: refused with no
+// release, an uninstalled one, one running another release (the fix: verb with that release's
+// installer) and one with no Secret.
+func (in *Installer) k8sRecordedHere(ctx context.Context, verb string) (map[string]string, error) {
+	if err := in.checkTarget(); err != nil {
+		return nil, err
+	}
+	k := in.O.K8s
+	if _, err := in.checkHelm(ctx); err != nil {
+		return nil, err
+	}
+	rel, err := in.release(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if rel == nil {
+		return nil, in.noRelease()
+	}
+	if rel.Status == "uninstalled" {
+		return nil, in.uninstalledRelease()
+	}
+	cur, err := in.installedRelease(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if r, m := cur.Release, in.R.Manifest; r.Version != m.ProjectVersion || r.Revision != m.Revision {
+		return nil, refuse(fmt.Sprintf("the installer of %s", r.Version), "release %s in %s runs %s %s (revision %d), and this installer carries %s (revision %d): %s with the installer of %s",
+			k.Release, k.Namespace, m.Name, r.Version, r.Revision, m.ProjectVersion, m.Revision, verb, r.Version)
+	}
+	rec, err := in.k8sRecorded(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if rec == nil {
+		return nil, in.noRelease()
+	}
+	return rec, nil
 }
 
 // recordedSecret is key's value as get reads it from where (named in the error when it holds none).

@@ -109,6 +109,8 @@ want_mb=$((host_mb * 25 / 100)); ((want_mb < 16384)) || want_mb=16384; ((want_mb
 	fail "postgres's memory limit is $(docker inspect --format '{{.HostConfig.Memory}}' "$pg"), want $want_mb MiB of $host_mb"
 docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$pg" | grep -qxF "STOWAGE_HOST_MEM_MB=$host_mb" ||
 	fail "postgres is not given the host's RAM"
+docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$pg" | grep -qxF "STOWAGE_SHAPE=docker" ||
+	fail "postgres is not told it runs on the docker shape"
 [[ $(docker exec "$pg" psql -U atlas -d atlas -tAc "SELECT setting::bigint * 8 / 1024 FROM pg_settings WHERE name = 'shared_buffers'") == $((want_mb / 4)) ]] ||
 	fail "postgres did not size shared_buffers from STOWAGE_MEM_LIMIT_MB"
 # The release's network profile: each container gets the profile's settings and the host's open

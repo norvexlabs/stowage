@@ -40,7 +40,7 @@ func newCommand(r *Release, self string, stdout, stderr io.Writer, tools K8sOpti
 		o.SelfExe = "/proc/self/exe" // the running file, even when its path was replaced since
 	}
 	var ports, sets, setFiles, domains []string
-	var answers, to, secretsFile string
+	var answers, to, secretsFile, loginFile string
 	var noInput, accessible bool
 	var given givenFlags
 	var takesTLS bool // the running command is install or vm create, which alone take an answers file's tls section
@@ -100,14 +100,9 @@ func newCommand(r *Release, self string, stdout, stderr io.Writer, tools K8sOpti
 				in.O.Prompt = terminal(accessible)
 			}
 			in.O.Cert, in.O.Key, in.O.CA, in.O.ClientCA = expandHome(in.O.Cert), expandHome(in.O.Key), expandHome(in.O.CA), expandHome(in.O.ClientCA)
-			if secretsFile != "" {
-				if given.any() {
-					return refuse("give --secrets or "+given.name()+", not both", "--secrets restores an install, %s gives one its inputs and TLS material: give one", given.name())
-				}
-				var err error
-				if in.O.Secrets, err = readSecretsArg(secretsFile, cmd.InOrStdin()); err != nil {
-					return err
-				}
+			in.O.ACMECARoot = expandHome(in.O.ACMECARoot)
+			if err := readRunFiles(&in.O, secretsFile, loginFile, given, cmd.InOrStdin()); err != nil {
+				return err
 			}
 			if err := given.take(cmd.Context(), in, cmd.InOrStdin(), in.O.Prompt, time.Now(), func(g *Given, flag string) error {
 				return in.useGiven(g, flag, in.shape())
@@ -148,10 +143,12 @@ func newCommand(r *Release, self string, stdout, stderr io.Writer, tools K8sOpti
 	if len(clientAuthRoutes(r.Spec)) > 0 {
 		rf.StringVar(&o.ClientCA, "client-ca", "", "the CA, PEM, the client certificates of the routes with client_auth chain to, copied into the install (a re-run replaces it; none removes it)")
 	}
+	acmeCAFlags(rf, r.Spec, &o, "a re-run")
 	rf.IntVar(&o.HTTPPort, "http-port", 0, "the host port a TLS front serves HTTP on (default the project's front.http_port, else 80; a re-run changes it)")
 	rf.IntVar(&o.HTTPSPort, "https-port", 0, "the host port a TLS front serves HTTPS on (default the project's front.https_port, else 443; a re-run changes it)")
 	rf.StringVar(&o.Registry, "registry", "", "pull the images from this registry prefix, a mirror (first install only)")
 	rf.StringVar(&o.RegistryCA, "registry-ca", "", "a PEM file of the CA the registry's certificate chains to, a mirror's own: kept in the install, given to the Docker daemon (first install only)")
+	rf.Var(pathFlag{&loginFile}, "registry-login-file", "this install's own login, a Docker config holding one auths entry for the host of the release's registry or of the mirror (- for standard input): recorded beside the install (0600) before anything is pulled, its reads of that host take it; a re-run with it replaces it")
 	ipv6Flag(rf, &o.IPv6, "IPv6 on the stack's network, so the front's IPv6 clients keep their address (Docker 27 or later); --ipv6=false turns it off (default off; on a re-run, the recorded choice)")
 	tuneProfileFlag(rf, &o.TuneProfile, "the containers' tuning profile over the release's tune.profile ("+r.Spec.TuneProfile()+"): default (as fast as on the host's network) or network (the network profile's own settings too); release follows the release's again (default: on a re-run, the recorded choice)")
 	rf.Var(interfacesValue{&o.Interfaces}, "interface", "a NIC of this host playing a role the release names (host.interfaces), ROLE=NIC (repeatable; ROLE= removes the record; a re-run changes it): where a service's address of its own is (services.<name>.interface); the VM names its NICs itself")
@@ -459,6 +456,9 @@ func newCommand(r *Release, self string, stdout, stderr io.Writer, tools K8sOpti
 	root.AddCommand(auditCommand(in, &o, prepare, dirFlag, stdout), sbomCommand(in, &o, prepare, dirFlag, stdout))
 	root.AddCommand(tuneCommand(in, prepare, terminal, false))
 	root.AddCommand(dockerHostCommands(in, prepare, dirFlag, stdout, stderr, terminal)...)
+	regLogin := registryLoginCommand(in, &o, stdout, nil)
+	dirFlag(regLogin)
+	root.AddCommand(regLogin)
 	// What a hook's Job and a handoff's Job run.
 	if r.Spec.Shapes.Kubernetes != nil && (r.Spec.Hooks.Provision != nil || len(r.Spec.Handoffs) > 0) {
 		root.AddCommand(k8sHookPodCommand(stderr))
@@ -483,7 +483,7 @@ func newCommand(r *Release, self string, stdout, stderr io.Writer, tools K8sOpti
 // subcommand works in the current directory, where `upgrade --version` fetches an installer.
 func k8sCommand(in *Installer, o *Options, prepare func() error, terminal func(bool) Prompter, sets, setFiles *[]string, answers *string, noInput, accessible *bool, jsonFlag func(c *cobra.Command, uninstall bool)) *cobra.Command {
 	name, v := in.R.Spec.Name, in.R.Manifest.ProjectVersion
-	var to string
+	var to, loginFile, secretsFile string
 	var given givenFlags
 	// One per subcommand: a flag writes its default into its variable when it is defined.
 	var installTimeout, upTimeout, backTimeout time.Duration
@@ -502,6 +502,9 @@ func k8sCommand(in *Installer, o *Options, prepare func() error, terminal func(b
 	// deployWith is run for what takes --given and --kit: what they give joins the inputs before f reads them.
 	deployWith := func(cmd *cobra.Command, timeout time.Duration, f func(context.Context) error) error {
 		return run(cmd, timeout, true, func(ctx context.Context) error {
+			if err := readRunFiles(&in.O, secretsFile, loginFile, given, cmd.InOrStdin()); err != nil {
+				return err
+			}
 			if err := given.take(ctx, in, cmd.InOrStdin(), in.O.Prompt, time.Now(), in.useK8sGiven); err != nil {
 				return err
 			}
@@ -512,6 +515,8 @@ func k8sCommand(in *Installer, o *Options, prepare func() error, terminal func(b
 		Use:   "k8s",
 		Short: fmt.Sprintf("Install and manage %s %s on Kubernetes, with helm and kubectl", name, v),
 		Args:  cobra.NoArgs,
+		// No Docker install's login file: the release's is its pull Secret.
+		PersistentPreRun: func(*cobra.Command, []string) { in.noLoginFile = true },
 	}
 	pf := k.PersistentFlags()
 	pf.StringVar(&o.K8s.Namespace, "namespace", name, "the release's namespace")
@@ -522,6 +527,7 @@ func k8sCommand(in *Installer, o *Options, prepare func() error, terminal func(b
 		f.StringArrayVar(&o.K8s.Values, "values", nil, "a chart values file, given to helm after the installer's (repeatable)")
 		f.StringVar(&o.K8s.Registry, "image-registry", "", "pull the chart and the images from this registry prefix, a mirror")
 		f.BoolVar(&o.K8s.PullLogin, "image-pull-login", false, "write the cluster's pull Secret for the mirror's host from the Docker client's login (its user and password), which the installer reads the mirror with")
+		f.Var(pathFlag{&loginFile}, "registry-login-file", "this release's own login, a Docker config holding one auths entry for the host its images come from (the release's registry or the mirror; - for standard input): the pull Secret is written from it, and a later run without it keeps it")
 		f.StringVar(&o.RegistryCA, "registry-ca", "", "a PEM file of the CA the registry's certificate chains to, a mirror's own: the installer's reads trust it (the cluster's nodes must trust it already)")
 		f.StringArrayVar(sets, "set", nil, what)
 		f.StringArrayVar(setFiles, "set-file", nil, whatFile)
@@ -544,6 +550,7 @@ func k8sCommand(in *Installer, o *Options, prepare func() error, terminal func(b
 		},
 	}
 	deployFlags(install, &installTimeout, 10*time.Minute, "an input, KEY=VALUE (repeatable)", "a file input's file, KEY=PATH (repeatable)")
+	install.Flags().StringVar(&secretsFile, "secrets", "", "a first install's secrets: the file `secrets export` wrote (on any shape), decrypted (- for standard input)")
 	up := &cobra.Command{
 		Use:   "upgrade",
 		Short: fmt.Sprintf("Move the release to %s, or apply it again with new values; rolled back by helm when not ready", v),
@@ -555,7 +562,10 @@ func k8sCommand(in *Installer, o *Options, prepare func() error, terminal func(b
 						flag := given.name()
 						return refuse("run "+in.k8sCtl("upgrade")+" --version "+to+" first, then the new release's installer with "+given.name(), "%s with --version: `%s --version %s` first, then the installer of %s (`docker run --rm %s/%s-installer:<its tag> > %s.sh`) takes `k8s upgrade %s FILE` with the same target", flag, in.k8sCtl("upgrade"), to, to, in.R.Spec.Registry.Prefix, in.R.Spec.Name, in.R.Spec.Name, flag)
 					}
-					return in.K8sUpgradeTo(ctx, to, passed(cmd, "version", "unordered"))
+					if err := readRunFiles(&in.O, "", loginFile, given, cmd.InOrStdin()); err != nil {
+						return err
+					}
+					return in.K8sUpgradeTo(ctx, to, passed(cmd, "version", "unordered", "registry-login-file"))
 				})
 			}
 			if o.Unordered {
@@ -685,13 +695,15 @@ func k8sCommand(in *Installer, o *Options, prepare func() error, terminal func(b
 		err = run(cmd, 0, false, func(ctx context.Context) error { v, err = in.K8sShowSecret(ctx, key); return err })
 		return v, err
 	})
-	if rotate != nil || show != nil {
-		k.AddCommand(secretsCommand(in.R.Spec.Name, o.Out, func(c *cobra.Command) {
-			if c.Name() == "rotate" {
-				c.Flags().DurationVar(&rotateTimeout, "timeout", 6*time.Minute, "how long kubectl waits for each restarted workload to be ready")
-			}
-		}, rotate, nil, nil, nil, nil, show))
+	export := func(cmd *cobra.Command, recipients []string) (raw []byte, err error) {
+		err = run(cmd, 0, false, func(ctx context.Context) error { raw, err = in.K8sExportSecrets(ctx, recipients); return err })
+		return raw, err
 	}
+	k.AddCommand(secretsCommand(in.R.Spec.Name, o.Out, func(c *cobra.Command) {
+		if c.Name() == "rotate" {
+			c.Flags().DurationVar(&rotateTimeout, "timeout", 6*time.Minute, "how long kubectl waits for each restarted workload to be ready")
+		}
+	}, rotate, nil, nil, nil, export, show))
 	return k
 }
 
@@ -738,17 +750,62 @@ func readSecretsArg(path string, stdin io.Reader) ([]byte, error) {
 	return readStdinFlag("--secrets", path, stdin)
 }
 
+// secretsWithGiven refuses --secrets beside --given or --kit: one restores an install, the other
+// gives one its inputs.
+func secretsWithGiven(given givenFlags) error {
+	return refuse("give --secrets or "+given.name()+", not both", "--secrets restores an install, %s gives one its inputs and TLS material: give one", given.name())
+}
+
+// readRunFiles reads what a run's --secrets (secretsFile) and --registry-login-file (loginFile)
+// name, either standard input for -, into o: --secrets never beside --given or --kit, and
+// standard input, read once, named by one flag alone.
+func readRunFiles(o *Options, secretsFile, loginFile string, given givenFlags, stdin io.Reader) error {
+	if secretsFile != "" {
+		if given.any() {
+			return secretsWithGiven(given)
+		}
+		var err error
+		if o.Secrets, err = readSecretsArg(secretsFile, stdin); err != nil {
+			return err
+		}
+	}
+	if loginFile != "" {
+		var err error
+		if o.RegistryLogin, err = readLoginFlag(loginFile, stdin, secretsFile, given.given, given.kit); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// readLoginFlag reads the file --registry-login-file names (loginFile; nil for none), standard
+// input for -, refused when another flag of the run (others: their values) names standard input
+// too.
+func readLoginFlag(loginFile string, stdin io.Reader, others ...string) ([]byte, error) {
+	if loginFile == "" {
+		return nil, nil
+	}
+	if loginFile == "-" && slices.Contains(others, "-") {
+		return nil, errors.New("--registry-login-file and another flag both name standard input, which is read once")
+	}
+	return readFlagFile("--registry-login-file", loginFile, stdin, maxRegistryLogin)
+}
+
 // readStdinFlag reads the file flag names, standard input for -, up to one byte past
 // maxSecretsFile, so its reader refuses it.
 func readStdinFlag(flag, path string, stdin io.Reader) ([]byte, error) {
 	return readFlagFile(flag, path, stdin, maxSecretsFile)
 }
 
-// readFlagFile reads the file flag names, standard input for -, up to one byte past limit.
+// readFlagFile reads the file flag names, standard input for -, up to one byte past limit. A
+// path naming a descriptor (/dev/fd/N) is kept from the processes the run starts before it is
+// read, whether the read succeeds or not (keepFromChildren).
 func readFlagFile(flag, path string, stdin io.Reader, limit int64) ([]byte, error) {
 	r := stdin
 	if path != "-" {
-		f, err := os.Open(expandHome(path))
+		p := expandHome(path)
+		keepFromChildren(p)
+		f, err := os.Open(p)
 		if err != nil {
 			return nil, fmt.Errorf("%s: %w", flag, err)
 		}
@@ -901,6 +958,8 @@ func mirrorCommand(in *Installer, o *Options, prepare func() error) *cobra.Comma
 		Use:   "mirror",
 		Short: fmt.Sprintf("Carry %s's latest release to a registry without internet: export it to one file, import that file", name),
 		Args:  cobra.NoArgs,
+		// The operator's reads, never a Docker install's login.
+		PersistentPreRun: func(*cobra.Command, []string) { in.noLoginFile = true },
 	}
 	var channel, output, to, version string
 	var older bool
@@ -1018,6 +1077,8 @@ func vmCreateCommand(in *Installer, o *Options, prepare func() error, terminal f
 		Use:   "vm",
 		Short: fmt.Sprintf("Run %s on a VM of its own: its Kairos OS, from a disk image", name),
 		Args:  cobra.NoArgs,
+		// The operator's reads, never a Docker install's login (the VM's own is given over SSH).
+		PersistentPreRun: func(*cobra.Command, []string) { in.noLoginFile = true },
 	}
 	create := &cobra.Command{
 		Use:   "create",
@@ -1052,13 +1113,8 @@ func vmCreateCommand(in *Installer, o *Options, prepare func() error, terminal f
 			if c.Ctl, err = os.Executable(); err != nil {
 				return err
 			}
-			if loginFile != "" {
-				if loginFile == "-" && (secretsFile == "-" || kitFlags.kit == "-") {
-					return errors.New("--registry-login-file and another flag both name standard input, which is read once")
-				}
-				if c.RegistryLogin, err = readFlagFile("--registry-login-file", loginFile, cmd.InOrStdin(), maxRegistryLogin); err != nil {
-					return err
-				}
+			if c.RegistryLogin, err = readLoginFlag(loginFile, cmd.InOrStdin(), secretsFile, kitFlags.kit); err != nil {
+				return err
 			}
 			if secretsFile != "" {
 				if secretsFile == "-" && kitFlags.kit == "-" {
@@ -1108,7 +1164,7 @@ func vmCreateCommand(in *Installer, o *Options, prepare func() error, terminal f
 	f.BoolVar(accessible, "accessible", false, "ask with plain line prompts (screen readers); also when ACCESSIBLE is set or TERM=dumb")
 	f.StringVar(&o.Registry, "registry", "", "a registry prefix to read the disk and the VM's updates from, a mirror")
 	f.StringVar(&o.RegistryCA, "registry-ca", "", "a PEM file of the CA the registry's certificate chains to, a mirror's own: trusted here and, through the cloud-config, by the VM")
-	f.Var(pathFlag{&loginFile}, "registry-login-file", "a Docker config holding one auths entry, the mirror's login for its host, which the VM's reads of the mirror take: given over SSH once the VM answers, never in the cloud-config")
+	f.Var(pathFlag{&loginFile}, "registry-login-file", "a Docker config holding one auths entry, this VM's own login for the host of the release's registry or of the mirror, which its reads of that host take: given over SSH once the VM answers, never in the cloud-config")
 	var tofuKeys []string
 	for _, p := range Platforms {
 		if p.Tofu {
@@ -1186,11 +1242,10 @@ func vmCreateCommand(in *Installer, o *Options, prepare func() error, terminal f
 				if err := prepare(); err != nil {
 					return nil, err
 				}
-				if seedLogin != "" {
-					var err error
-					if so.RegistryLogin, err = readFlagFile("--registry-login-file", seedLogin, cmd.InOrStdin(), maxRegistryLogin); err != nil {
-						return nil, err
-					}
+				// No other flag of the seed reads standard input.
+				var err error
+				if so.RegistryLogin, err = readLoginFlag(seedLogin, cmd.InOrStdin()); err != nil {
+					return nil, err
 				}
 				// Standard output is the seed's alone; nothing is asked.
 				in.O.Out, in.O.Prompt = in.O.Log, nil
@@ -1217,7 +1272,7 @@ func vmCreateCommand(in *Installer, o *Options, prepare func() error, terminal f
 	sf.StringVar(answers, "answers", "", "a YAML file of the non-secret inputs, KEY: value, and the front's tls section (no secret input, no certificate: those go after the boot, over SSH)")
 	sf.StringVar(&o.Registry, "registry", "", "a registry prefix to read the disk and the VM's updates from, a mirror")
 	sf.StringVar(&o.RegistryCA, "registry-ca", "", "a PEM file of the CA the registry's certificate chains to, a mirror's own: trusted here and, through the cloud-config, by the VM")
-	sf.Var(pathFlag{&seedLogin}, "registry-login-file", "a Docker config holding one auths entry, the mirror's login for its host: checked, and named in the seed (registry_login) by its host alone; the program gives it over SSH once the VM answers (`registry-login -`)")
+	sf.Var(pathFlag{&seedLogin}, "registry-login-file", "a Docker config holding one auths entry, the VM's own login for the host of the release's registry or of the mirror: checked, and named in the seed (registry_login) by its host alone; the program gives it over SSH once the VM answers (`registry-login -`)")
 	var seedJSON bool
 	sf.BoolVar(&seedJSON, "json", false, "print the seed as one JSON object (required: the seed is for a program)")
 	_ = seed.MarkFlagRequired("json")
@@ -1339,7 +1394,7 @@ func parsePorts(items []string) (map[string]int, error) {
 }
 
 // frontFlagNames are the install flags only a front takes.
-var frontFlagNames = []string{"tls", "domains", "cert", "key", "ca", "client-ca", "http-port", "https-port", "ports", "address"}
+var frontFlagNames = []string{"tls", "domains", "cert", "key", "ca", "client-ca", "acme-ca", "acme-ca-root", "http-port", "https-port", "ports", "address"}
 
 // hideFrontFlags hides, for a project without a front, the flags of names f has; given, they are
 // refused naming it (frontFlags).

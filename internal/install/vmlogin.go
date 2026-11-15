@@ -8,24 +8,29 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
+	"slices"
 	"strings"
 
 	"github.com/spf13/cobra"
 )
 
-// The VM's login to its mirror (`registry-login`): a Docker config holding one `auths` entry, for
-// the mirror's host alone, given over SSH after the boot and never in the cloud-config. The VM's
-// own reads of that host (its updates, an upgrade's OS bundle, a first boot's switch to another
-// release's OS) use it; the release's pull account is never sent there, nor the login elsewhere.
+// An install's login to the registry it reads (`registry-login`, `install --registry-login-file`):
+// a Docker config holding one `auths` entry, for the host of the release's own registry or of its
+// mirror. The operator mints one per install, so revoking it leaves every other install pulling.
+// On the VM it is given over SSH after the boot, never in the cloud-config. The install's reads of
+// that host use it: on the release's own registry it comes after the password TOKEN_ENV gives and
+// before the account baked into the installer; the release's pull account is never sent to a
+// mirror, nor the login to another host.
 
 // maxRegistryLogin bounds a login file, as readFileOrStdin reads it: one entry is a few hundred
 // bytes.
 const maxRegistryLogin = maxRcloneConfig
 
-// registryLoginFile records, on the persistent partition beside the install directory, the VM's
-// login to its mirror, root's alone (0600). Beside the directory, not in it: a login given before
-// the first install is kept by it, and upgrades and rollbacks, which move the install's state,
-// never touch it.
+// registryLoginFile records, beside the install directory (on the VM's persistent partition), the
+// install's login, root's or the install owner's alone (0600). Beside the directory, not in it:
+// a login given before the first install is kept by it, and upgrades and rollbacks, which move the
+// install's state, never touch it.
 func registryLoginFile(dir string) string {
 	return strings.TrimSuffix(dir, "/") + ".registry-login.json"
 }
@@ -109,10 +114,23 @@ func (l registryLogin) marshal() ([]byte, error) {
 	return json.Marshal(map[string]any{"auths": map[string]loginEntry{l.Host: {Auth: auth}}})
 }
 
-// heldLogin is the login the VM holds for its mirror; nil when it holds none. Off the VM
-// (O.Preloaded unset) there is none.
-func (in *Installer) heldLogin() (*registryLogin, error) {
-	if !in.O.Preloaded || in.O.Dir == "" {
+// heldLogin is the login the install holds (`registry-login`, `install --registry-login-file`)
+// for its reads of prefix; nil when it holds none. On Kubernetes no file is read: it is the one
+// this run's --registry-login-file gave (k8sLogin), else the one the release's pull Secret records
+// from a run before, as k8sLogins took it for prefix (k8sPulls), and a read of a prefix whose
+// logins were not taken is refused: none is made without the login it may hold.
+func (in *Installer) heldLogin(prefix string) (*registryLogin, error) {
+	if in.k8sRun {
+		held, ok := in.k8sPulls[prefix]
+		if !ok {
+			return nil, fmt.Errorf("internal error: a Kubernetes run reads %s before it takes the pull Secret's login (k8sLogins)", prefix)
+		}
+		if in.k8sLogin != nil {
+			return in.k8sLogin, nil
+		}
+		return held, nil
+	}
+	if in.noLoginFile || in.O.Dir == "" {
 		return nil, nil
 	}
 	f := registryLoginFile(in.O.Dir)
@@ -121,19 +139,28 @@ func (in *Installer) heldLogin() (*registryLogin, error) {
 		return nil, nil
 	}
 	if err != nil {
-		return nil, fmt.Errorf("%w (`sudo %s registry-login --remove` removes it, then `registry-login FILE` gives one)", err, in.R.Ctl())
+		return nil, fmt.Errorf("%w (`%s` removes it, then `registry-login FILE` gives one)", err, in.loginCmd("--remove"))
 	}
 	l, err := parseRegistryLogin(raw)
 	if err != nil {
-		return nil, fmt.Errorf("%s: %w (`sudo %s registry-login FILE` replaces it, `--remove` removes it)", f, err, in.R.Ctl())
+		return nil, fmt.Errorf("%s: %w (`%s` replaces it, `--remove` removes it)", f, err, in.loginCmd("FILE"))
 	}
 	return &l, nil
 }
 
-// heldLoginHost is the host of the login the VM holds, empty for none; or why the file held
-// cannot be read (its reads of the mirror fail on it).
+// loginCmd is the `registry-login` command line giving args to this install: as root on the VM,
+// with the install's directory on Docker.
+func (in *Installer) loginCmd(args string) string {
+	if in.O.Preloaded {
+		return fmt.Sprintf("sudo %s registry-login %s", in.R.Ctl(), args)
+	}
+	return fmt.Sprintf("%s registry-login --dir %s %s", in.R.Ctl(), shellQuote(in.O.Dir), args)
+}
+
+// heldLoginHost is the host of the login the install holds, empty for none; or why the file held
+// cannot be read (its reads of that registry fail on it).
 func (in *Installer) heldLoginHost() (host, problem string) {
-	l, err := in.heldLogin()
+	l, err := in.heldLogin("")
 	if err != nil {
 		return "", err.Error()
 	}
@@ -143,24 +170,27 @@ func (in *Installer) heldLoginHost() (host, problem string) {
 	return l.Host, ""
 }
 
-// mirrorLogin is the login the VM's reads of the mirror at prefix take: the one it holds, when it
-// is for prefix's host; none otherwise.
-func (in *Installer) mirrorLogin(prefix string) (user, password string, err error) {
-	l, err := in.heldLogin()
+// loginFor is the login the install's reads of the registry at prefix take: the one it holds,
+// when it is for prefix's host; none otherwise. A login is never sent to another host.
+func (in *Installer) loginFor(prefix string) (user, password string, err error) {
+	l, err := in.heldLogin(prefix)
 	if err != nil || l == nil || !strings.EqualFold(l.Host, registryHost(prefix)) {
 		return "", "", err
 	}
 	return l.User, l.Password, nil
 }
 
-// vmMirror is the mirror the VM reads its releases from: the install's recorded registry, before
-// the first install the settings', when it is not the release's own registry; empty for none.
-func (in *Installer) vmMirror() (string, error) {
+// installMirror is the mirror the install reads its releases from: the install's recorded
+// registry; before the first install the one it is given (Docker's --registry, the VM's
+// settings'), when it is not the release's own registry; empty for none.
+func (in *Installer) installMirror() (string, error) {
 	prefix := ""
 	if env, err := ReadEnvFile(in.path(envName)); err == nil {
 		prefix, _ = env.Get("STOWAGE_REGISTRY")
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return "", err
+	} else if !in.O.Preloaded {
+		prefix = strings.TrimSuffix(in.O.Registry, "/")
 	} else {
 		path := in.O.Settings
 		if path == "" {
@@ -180,48 +210,147 @@ func (in *Installer) vmMirror() (string, error) {
 	return prefix, nil
 }
 
-// recordRegistryLogin checks the login file raw and records it, replacing the one held: its host
-// must be the VM's mirror's. It returns that host.
-func (in *Installer) recordRegistryLogin(raw []byte) (string, error) {
+// checkLogin checks the login file raw for this install: one auths entry, for the host of a
+// registry the install reads — the release's own, or its mirror.
+func (in *Installer) checkLogin(raw []byte) (registryLogin, error) {
 	if len(raw) > maxRegistryLogin {
-		return "", fmt.Errorf("the login file is over %d KiB: one entry is a few hundred bytes", maxRegistryLogin>>10)
+		return registryLogin{}, fmt.Errorf("the login file is over %d KiB: one entry is a few hundred bytes", maxRegistryLogin>>10)
 	}
 	l, err := parseRegistryLogin(raw)
 	if err != nil {
-		return "", err
+		return registryLogin{}, err
 	}
-	mirror, err := in.vmMirror()
+	mirror, err := in.installMirror()
 	if err != nil {
-		return "", err
+		return registryLogin{}, err
 	}
-	if mirror == "" {
-		return "", fmt.Errorf("this VM reads %s, the release's own registry, with its pull account: a login is for a mirror (`vm create --registry`), and none is used here", in.R.Spec.Registry.Prefix)
+	return l, loginReads(l.Host, in.R.Spec.Registry.Prefix, mirror, "this install")
+}
+
+// loginReads refuses a login for host unless host is the release's own registry's (own) or the
+// mirror's (empty: none) that who reads.
+func loginReads(host, own, mirror, who string) error {
+	hosts := []string{registryHost(own)}
+	reads := fmt.Sprintf("the release's own registry %s at %s", own, hosts[0])
+	if mirror != "" {
+		hosts = append(hosts, registryHost(mirror))
+		reads += fmt.Sprintf(" and its mirror %s at %s", mirror, hosts[1])
 	}
-	if h := registryHost(mirror); !strings.EqualFold(l.Host, h) {
-		return "", fmt.Errorf("the login is for %s, but this VM reads its mirror %s at %s: give an auths entry for %s", l.Host, mirror, h, h)
+	if slices.ContainsFunc(hosts, func(h string) bool { return strings.EqualFold(h, host) }) {
+		return nil
 	}
+	return fmt.Errorf("the login is for %s, but %s reads %s: give an auths entry for %s", host, who, reads, strings.Join(hosts, " or "))
+}
+
+// writeLogin records l as the install's login, replacing the one held: root's or the install
+// owner's alone (0600).
+func (in *Installer) writeLogin(l registryLogin) error {
 	data, err := l.marshal()
 	if err != nil {
+		return err
+	}
+	return writeAtomic(registryLoginFile(in.O.Dir), bytes.NewReader(data), 0o600, nil)
+}
+
+// recordRegistryLogin checks the login file raw and records it, replacing the one held. It
+// returns its host.
+func (in *Installer) recordRegistryLogin(raw []byte) (string, error) {
+	l, err := in.checkLogin(raw)
+	if err != nil {
 		return "", err
 	}
-	if err := writeAtomic(registryLoginFile(in.O.Dir), bytes.NewReader(data), 0o600, nil); err != nil {
+	if err := in.writeLogin(l); err != nil {
 		return "", err
 	}
 	return l.Host, nil
 }
 
-// registryLoginCommand is `registry-login`, run as root on the VM: it records the VM's login to
-// its mirror, or removes it.
+// givenLogin is the login Docker's --registry-login-file gave (O.RegistryLogin), checked for the
+// install in O.Dir; nil for none.
+func (in *Installer) givenLogin() (*registryLogin, error) {
+	if in.O.RegistryLogin == nil {
+		return nil, nil
+	}
+	l, err := in.checkLogin(in.O.RegistryLogin)
+	if err != nil {
+		return nil, fmt.Errorf("--registry-login-file: %w", err)
+	}
+	return &l, nil
+}
+
+// recordLogin records l as the install's login, before anything is pulled, and says where. undo,
+// called when the run fails before the images are fetched with l (undoLoginOn), puts back the
+// login held before (0600), or removes l when none was.
+func (in *Installer) recordLogin(l registryLogin) (undo func(), err error) {
+	file := registryLoginFile(in.O.Dir)
+	prev, err := os.ReadFile(file)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("--registry-login-file: the login held: %w", err)
+	}
+	held := err == nil
+	if err := in.writeLogin(l); err != nil {
+		return nil, fmt.Errorf("--registry-login-file: %w", err)
+	}
+	in.O.logf("recorded the login to %s in %s (0600): the install's reads of %s take it", l.Host, file, l.Host)
+	return func() {
+		if !held {
+			if err := os.Remove(file); err != nil && !errors.Is(err, os.ErrNotExist) {
+				in.O.logf("the login this run recorded could not be removed: %v (`%s` removes it)", err, in.loginCmd("--remove"))
+			}
+			return
+		}
+		if err := writeAtomic(file, bytes.NewReader(prev), 0o600, nil); err != nil {
+			in.O.logf("the login held before this run could not be restored: %v (`%s` gives it again)", err, in.loginCmd("FILE"))
+			return
+		}
+		in.O.logf("the run failed: the login held before it is restored in %s", file)
+	}, nil
+}
+
+// undoLoginOn is a run's end for the login it recorded (recordLogin): when the run failed, undo
+// puts back the login held before; a nil undo is a login the run fetched the images with, which
+// stays, said so on a failure.
+func undoLoginOn(err error, undo func(), o *Options) {
+	switch {
+	case err == nil:
+	case undo != nil:
+		undo()
+	default:
+		o.logf("the run failed after the images were fetched with the login it recorded: the login stays")
+	}
+}
+
+// loginDryRun says what a run would record of the login l (nil: none).
+func (in *Installer) loginDryRun(l *registryLogin) {
+	if l != nil {
+		in.O.logf("a run would record the login to %s in %s (0600), replacing the one held", l.Host, registryLoginFile(in.O.Dir))
+	}
+}
+
+// registryLoginCommand is `registry-login`: it records the login the install reads its registry
+// with, or removes it. On the VM (euid set) it runs as root; on Docker (euid nil) as the install's
+// owner, on an install that exists (a first install takes --registry-login-file).
 func registryLoginCommand(in *Installer, o *Options, stdout io.Writer, euid func() int) *cobra.Command {
 	var remove bool
+	short := "Record the login this install reads its registry with — a Docker config holding one auths entry, for the host of the release's own registry or of its mirror — from FILE or standard input (-), replacing the one held; --remove removes it"
+	owner := "the install owner's alone"
+	if euid != nil {
+		short += " (as root)"
+		owner = "root's alone"
+	}
 	cmd := &cobra.Command{
 		Use:   "registry-login [FILE]",
-		Short: "Record the login this VM reads its mirror with — a Docker config holding one auths entry, for the mirror's host — from FILE or standard input (-), replacing the one held; --remove removes it (as root)",
+		Short: short,
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			in.O = *o
-			if euid() != 0 {
+			if euid != nil && euid() != 0 {
 				return fmt.Errorf("the login is root's: `sudo %s registry-login`", in.R.Ctl())
+			}
+			if euid == nil {
+				if err := in.loginInstalled(); err != nil {
+					return err
+				}
 			}
 			f := registryLoginFile(in.O.Dir)
 			if remove {
@@ -230,12 +359,12 @@ func registryLoginCommand(in *Installer, o *Options, stdout io.Writer, euid func
 				}
 				switch err := os.Remove(f); {
 				case errors.Is(err, os.ErrNotExist):
-					fmt.Fprintln(stdout, "This VM holds no login to its mirror: nothing to remove.")
+					fmt.Fprintln(stdout, "This install holds no login to a registry: nothing to remove.")
 					return nil
 				case err != nil:
 					return err
 				}
-				fmt.Fprintln(stdout, "Removed the login to the mirror: its reads go without one.")
+				fmt.Fprintln(stdout, "Removed the login held: the reads of the release's own registry take the installer's pull account again, a mirror's go without one.")
 				return nil
 			}
 			if len(args) == 0 {
@@ -249,12 +378,28 @@ func registryLoginCommand(in *Installer, o *Options, stdout io.Writer, euid func
 			if err != nil {
 				return fmt.Errorf("%s: %w", loginSource(args[0]), err)
 			}
-			fmt.Fprintf(stdout, "Recorded the login to %s in %s (root's alone): this VM's reads of its mirror use it.\n", host, f)
+			fmt.Fprintf(stdout, "Recorded the login to %s in %s (%s): this install's reads of %s use it.\n", host, f, owner, host)
 			return nil
 		},
 	}
 	cmd.Flags().BoolVar(&remove, "remove", false, "remove the login held")
 	return cmd
+}
+
+// loginInstalled refuses `registry-login` on a Docker directory holding no install: the first
+// install takes the login with --registry-login-file. O.Dir is made absolute.
+func (in *Installer) loginInstalled() error {
+	dir, err := filepath.Abs(in.O.Dir)
+	if err != nil {
+		return err
+	}
+	in.O.Dir = dir
+	if _, err := os.Stat(in.path(envName)); errors.Is(err, os.ErrNotExist) {
+		return refuse(fmt.Sprintf("give the first install its login: %s --dir %s --registry-login-file FILE", in.R.Ctl(), shellQuote(dir)), "%s holds no install: the first install takes its login with --registry-login-file", dir)
+	} else if err != nil {
+		return err
+	}
+	return nil
 }
 
 // loginSource names a login file argument in an error: - is standard input.

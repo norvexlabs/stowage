@@ -79,20 +79,42 @@ func TestHealth(t *testing.T) {
 	check(t, "no service", err, "service is required")
 	_, err = Health(prov("http-status", append(ok, "liveness_path", "health")...), images)
 	check(t, "liveness path", err, "liveness_path")
-	_, err = Health(prov("command", "image", "api", "cmd", []any{"x"}), images)
+	_, err = Health(prov("command", "image", "api", "env", []any{}, "cmd", []any{"x"}), images)
 	check(t, "command", err, "")
 	_, err = Health(prov("command", "image", "web", "cmd", []any{"x"}), images)
 	check(t, "command image", err, "not an images key")
-	_, err = Health(prov("command", "image", "api"), images)
+	_, err = Health(prov("command", "image", "api", "env", []any{}), images)
 	check(t, "command cmd", err, "cmd is required")
-	_, err = Health(prov("command", "cmd", []any{"x"}), images)
+	_, err = Health(prov("command", "env", []any{}, "cmd", []any{"x"}), images)
 	check(t, "command no image", err, "image is required")
-	_, err = Health(prov("command", "image", "api", "cmd", []any{"x"}, "timeout_s", -1), images)
+	_, err = Health(prov("command", "image", "api", "env", []any{}, "cmd", []any{"x"}, "timeout_s", -1), images)
 	check(t, "command timeout", err, "timeout_s")
-	_, err = Health(prov("command", "image", "api", "cmd", []any{"x"}, "timeout_s", 3600), images)
+	_, err = Health(prov("command", "image", "api", "env", []any{}, "cmd", []any{"x"}, "timeout_s", 3600), images)
 	check(t, "command timeout at the bound", err, "")
-	_, err = Health(prov("command", "image", "api", "cmd", []any{"x"}, "timeout_s", 3601), images)
+	_, err = Health(prov("command", "image", "api", "env", []any{}, "cmd", []any{"x"}, "timeout_s", 3601), images)
 	check(t, "command timeout past the bound", err, "timeout_s must be 1 to 3600")
+	// The command's env is the provision hook's, on every concern that runs one.
+	cmdEnv := func(env ...any) spec.Provider {
+		if env == nil {
+			return prov("command", "image", "api", "cmd", []any{"x"})
+		}
+		return prov("command", "image", "api", "cmd", []any{"x"}, "env", env[0])
+	}
+	for _, c := range []struct {
+		name string
+		p    spec.Provider
+		want string
+	}{
+		{"env missing", cmdEnv(), "env is required: the keys of the inputs, secrets and safe defaults the command reads ([] for none)"},
+		{"env listed", cmdEnv([]any{"ADMIN_EMAIL", "SESSION_SECRET"}), ""},
+		{"env name", cmdEnv([]any{"admin"}), `env: "admin" is not a variable name`},
+		{"env twice", cmdEnv([]any{"A", "A"}), "env: A is listed twice"},
+	} {
+		_, err := Health(c.p, images)
+		check(t, "health "+c.name, err, c.want)
+		check(t, "schema compat "+c.name, SchemaCompat(c.p, images), c.want)
+		check(t, "backup "+c.name, Backup(&c.p, images), c.want)
+	}
 	_, err = Health(spec.Provider{}, images)
 	check(t, "missing", err, "provider is required")
 	_, err = Health(prov("tcp"), images)
@@ -130,7 +152,7 @@ func TestSchemaCompat(t *testing.T) {
 			t.Errorf("SchemaBaseline(%v) = %d, %v", c.p.Config, b, err)
 		}
 	}
-	check(t, "command", SchemaCompat(prov("command", "image", "api", "cmd", []any{"x"}), images), "")
+	check(t, "command", SchemaCompat(prov("command", "image", "api", "cmd", []any{"x"}, "env", []any{}), images), "")
 	check(t, "none", SchemaCompat(prov("none"), images), "")
 	check(t, "none with config", SchemaCompat(prov("none", "x", 1), images), "x")
 	check(t, "missing", SchemaCompat(spec.Provider{}, images), "provider is required")
@@ -206,7 +228,7 @@ func TestBackup(t *testing.T) {
 		{"volumes alone, twice", prov("volumes-age-rclone", "volumes", []any{"a", "a"}), `volumes-age-rclone: volumes[1] "a" is listed twice`},
 		{"volumes alone, not a key", prov("volumes-age-rclone", "volumes", []any{"../a"}), `volumes-age-rclone: volumes[0] "../a" is not a compose volume's key`},
 		{"volumes alone, profiles", prov("volumes-age-rclone", "volumes", []any{"a"}, "profiles", map[string]any{"full": "all"}), "profiles"},
-		{"command", prov("command", "image", "api", "cmd", []any{"x"}), ""},
+		{"command", prov("command", "image", "api", "cmd", []any{"x"}, "env", []any{}), ""},
 		{"unknown", prov("restic"), "unknown provider"},
 	}
 	for _, c := range cases {
@@ -235,5 +257,19 @@ func TestBackupReportsDeterministically(t *testing.T) {
 		if got := Backup(&p, images).Error(); got != first {
 			t.Fatalf("%q then %q", first, got)
 		}
+	}
+}
+
+// DecodeCommand returns the decoded command beside its check's refusal, and the zero command when
+// its decode fails: the linter reads the rest of a command whose check refuses.
+func TestDecodeCommandKeepsTheCommandItsCheckRefuses(t *testing.T) {
+	t.Parallel()
+	c, err := DecodeCommand(spec.Provider{Name: "command", Config: map[string]any{"image": "nope", "cmd": []any{"x"}, "env": []any{"A"}}}, images)
+	if err == nil || !slices.Equal(c.Keys(), []string{"A"}) {
+		t.Errorf("a refused check: %+v %v", c, err)
+	}
+	c, err = DecodeCommand(spec.Provider{Name: "command", Config: map[string]any{"image": "api", "cmd": []any{"x"}, "env": []any{"A"}, "typo": 1}}, images)
+	if err == nil || c.Keys() != nil || c.Image != "" {
+		t.Errorf("a failed decode: %+v %v", c, err)
 	}
 }

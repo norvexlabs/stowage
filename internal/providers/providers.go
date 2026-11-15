@@ -22,9 +22,24 @@ var EnvName = regexp.MustCompile(`^[A-Z][A-Z0-9_]*$`)
 // RuntimeCommand is the `command` provider on the target side: a command run inside one of the
 // project's images (named by its `images` key), speaking the JSON stdin/stdout contract.
 type RuntimeCommand struct {
-	Image    string   `yaml:"image"`
-	Cmd      []string `yaml:"cmd"`
-	TimeoutS int      `yaml:"timeout_s"`
+	Image string   `yaml:"image"`
+	Cmd   []string `yaml:"cmd"`
+	// Env are the recorded keys the command receives (inputs, secrets, safe defaults), as the
+	// provision hook's env (CheckEnv): required, so a command holds no secret it did not ask for.
+	Env      *[]string `yaml:"env"`
+	TimeoutS int       `yaml:"timeout_s"`
+}
+
+// DecodeCommand decodes a `command` provider and checks it: the one decode the linter and every
+// runtime caller use, so a spec without env is refused at run time too, never run with only the
+// variables Stowage provides. The command is returned beside its check's refusal, for the linter
+// to read the rest of it; it is the zero command when its decode fails.
+func DecodeCommand(p spec.Provider, images map[string]spec.Image) (RuntimeCommand, error) {
+	var c RuntimeCommand
+	if err := p.Decode(&c); err != nil {
+		return RuntimeCommand{}, err
+	}
+	return c, c.check(images)
 }
 
 func (c RuntimeCommand) check(images map[string]spec.Image) error {
@@ -37,8 +52,39 @@ func (c RuntimeCommand) check(images map[string]spec.Image) error {
 	if len(c.Cmd) == 0 {
 		return errors.New("cmd is required")
 	}
+	if err := CheckEnv(c.Env, "command"); err != nil {
+		return err
+	}
 	if err := command.CheckTimeout(c.TimeoutS); err != nil {
 		return err
+	}
+	return nil
+}
+
+// Keys are the recorded keys c's env lists, none when it lists none.
+func (c RuntimeCommand) Keys() []string {
+	if c.Env == nil {
+		return nil
+	}
+	return *c.Env
+}
+
+// CheckEnv checks the env of a container Stowage runs with the install's values (the provision
+// hook's, a `command` provider's), whose reader names: given ([] for none), each a variable name
+// listed once. That each is a recorded key is the spec's linter's check.
+func CheckEnv(env *[]string, reader string) error {
+	if env == nil {
+		return fmt.Errorf("env is required: the keys of the inputs, secrets and safe defaults the %s reads ([] for none)", reader)
+	}
+	seen := map[string]bool{}
+	for _, k := range *env {
+		switch {
+		case !EnvName.MatchString(k):
+			return fmt.Errorf("env: %q is not a variable name", k)
+		case seen[k]:
+			return fmt.Errorf("env: %s is listed twice", k)
+		}
+		seen[k] = true
 	}
 	return nil
 }
@@ -262,11 +308,8 @@ func Health(p spec.Provider, images map[string]spec.Image) (service string, err 
 		c, err := HTTPHealth(p)
 		return c.Service, err
 	case "command":
-		var c RuntimeCommand
-		if err := p.Decode(&c); err != nil {
-			return "", err
-		}
-		return "", c.check(images)
+		_, err := DecodeCommand(p, images)
+		return "", err
 	case "":
 		return "", errors.New("provider is required (http-json, http-status, command)")
 	default:
@@ -349,11 +392,8 @@ func SchemaCompat(p spec.Provider, images map[string]spec.Image) error {
 		_, err := SQL(p, images)
 		return err
 	case "command":
-		var c RuntimeCommand
-		if err := p.Decode(&c); err != nil {
-			return err
-		}
-		return c.check(images)
+		_, err := DecodeCommand(p, images)
+		return err
 	case "none":
 		var c struct{}
 		return p.Decode(&c)
@@ -415,20 +455,10 @@ func DecodeProvision(short string, p *spec.Provider, images map[string]spec.Imag
 	if len(c.Cmd) == 0 {
 		return nil, errors.New("container: cmd is required")
 	}
-	if c.Env == nil {
-		return nil, errors.New("container: env is required: the keys of the inputs, secrets and safe defaults the hook reads ([] for none)")
+	if err := CheckEnv(c.Env, "hook"); err != nil {
+		return nil, fmt.Errorf("container: %w", err)
 	}
 	seen := map[string]bool{}
-	for _, k := range *c.Env {
-		switch {
-		case !EnvName.MatchString(k):
-			return nil, fmt.Errorf("container: env: %q is not a variable name", k)
-		case seen[k]:
-			return nil, fmt.Errorf("container: env: %s is listed twice", k)
-		}
-		seen[k] = true
-	}
-	seen = map[string]bool{}
 	for _, k := range c.Returns {
 		switch {
 		case !EnvName.MatchString(k):
@@ -643,11 +673,8 @@ func Backup(p *spec.Provider, images map[string]spec.Image) error {
 		_, err := DecodeBackup(p)
 		return err
 	case "command":
-		var c RuntimeCommand
-		if err := p.Decode(&c); err != nil {
-			return err
-		}
-		return c.check(images)
+		_, err := DecodeCommand(*p, images)
+		return err
 	default:
 		return fmt.Errorf("unknown provider %q (pg-age-rclone, volumes-age-rclone, command)", p.Name)
 	}

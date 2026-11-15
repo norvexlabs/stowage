@@ -48,6 +48,7 @@ type fakeKube struct {
 	values    map[string]any
 	secret    string // `kubectl get secret` of the release's Secret
 	pull      string // `kubectl get secret` of the pull Secret
+	pullErr   error  // the next `kubectl get secret` of the pull Secret fails, once (an API error)
 	namespace bool   // the namespace exists
 	nsErr     error  // reading the namespace fails
 	// podSecurity is the namespace's Pod Security enforce label.
@@ -210,6 +211,9 @@ func (k kubeTool) Run(_ context.Context, c Cmd) ([]byte, error) {
 			return nil, err
 		}
 		f.patches = append(f.patches, string(raw))
+		if strings.HasSuffix(a[2], "-stowage-provision") {
+			f.outputs = mergedSecret(f.outputs, raw) // as `kubectl get` gives it back
+		}
 		return nil, nil
 	case "kubectl auth":
 		// As kubectl answers: yes (exit 0) or no (exit 1) on stdout; an error on stderr otherwise.
@@ -285,6 +289,13 @@ func (k kubeTool) Run(_ context.Context, c Cmd) ([]byte, error) {
 			return nil, errors.New("the connection to the server was refused")
 		case a[1] == "pods":
 			return []byte(cmp.Or(f.pods, `{"items": []}`)), nil
+		case strings.HasSuffix(a[2], "-pull") && f.pullErr != nil:
+			err := f.pullErr
+			f.pullErr = nil
+			return nil, err
+		case strings.HasSuffix(a[2], "-pull") && strings.HasPrefix(f.pull, "secret/") && slices.Contains(a, "json"):
+			// A Secret the installer wrote, seen by name: as `kubectl get --output json` gives it.
+			return []byte(`{"metadata":{"labels":{"app.kubernetes.io/managed-by":"stowage","app.kubernetes.io/part-of":"notes","app.kubernetes.io/instance":"notes"}},"data":{}}`), nil
 		case strings.HasSuffix(a[2], "-pull"):
 			return []byte(f.pull), nil
 		case f.kitReadFails != "" && a[2] == f.kitReadFails:
@@ -309,6 +320,10 @@ func (k kubeTool) Run(_ context.Context, c Cmd) ([]byte, error) {
 				raw, _ := json.Marshal(o) // as `kubectl get` gives it back
 				f.secret = string(raw)
 			}
+			if md, _ := o["metadata"].(map[string]any); o["kind"] == "Secret" && strings.HasSuffix(fmt.Sprint(md["name"]), "-stowage-pull") {
+				raw, _ := json.Marshal(o)
+				f.pull = string(raw)
+			}
 			if md, _ := o["metadata"].(map[string]any); o["kind"] == "Secret" && strings.HasSuffix(fmt.Sprint(md["name"]), "-stowage-secret-files") {
 				raw, _ := json.Marshal(o)
 				if f.objects == nil {
@@ -332,6 +347,41 @@ func (f *fakeKube) ran(prefix string) [][]string {
 		}
 	}
 	return out
+}
+
+// mergedSecret is the Secret obj (JSON; empty: the one the installer applied before, its labels
+// alone) with the merge patch applied to its labels and data, as the API server applies it.
+func mergedSecret(obj string, patch []byte) string {
+	var s struct {
+		Metadata struct {
+			Labels map[string]any `json:"labels"`
+		} `json:"metadata"`
+		Data map[string]any `json:"data"`
+	}
+	_ = json.Unmarshal([]byte(cmp.Or(obj, outputsJSON(nil))), &s)
+	var p struct {
+		Metadata struct {
+			Labels map[string]any `json:"labels"`
+		} `json:"metadata"`
+		Data map[string]any `json:"data"`
+	}
+	_ = json.Unmarshal(patch, &p)
+	merge := func(into *map[string]any, from map[string]any) {
+		if *into == nil {
+			*into = map[string]any{}
+		}
+		for k, v := range from {
+			if v == nil {
+				delete(*into, k)
+			} else {
+				(*into)[k] = v
+			}
+		}
+	}
+	merge(&s.Metadata.Labels, p.Metadata.Labels)
+	merge(&s.Data, p.Data)
+	raw, _ := json.Marshal(s)
+	return string(raw)
 }
 
 // kubeEnv is a cluster the fake answers for, and a registry holding the release's chart.
@@ -1365,10 +1415,15 @@ func TestK8sRollbackChecksTheSchema(t *testing.T) {
 				}
 				return "Succeeded", c.barrier + "\n"
 			}
+			// The release's registry is read with the login the pull Secret holds.
+			e.f.pull = heldPullSecret(registryHost(e.prefix), "inst-1", loginPassword, true)
 			// No --revision: the one before the last upgrade, 1, found from the history.
 			err := e.installer(nil).K8sRollback(context.Background())
 			if rolled := len(e.f.ran("helm rollback")) == 1; rolled != c.rolledBack || (c.want != "" && (err == nil || !strings.Contains(err.Error(), c.want))) || (c.want == "" && err != nil) {
 				t.Fatalf("rolled back %v: %v\n%s", rolled, err, e.log)
+			}
+			if readsNewer := c.recorded == "3" && c.barrier == ""; readsNewer && !slices.Contains(e.auth, basicAuth("inst-1", loginPassword)) {
+				t.Errorf("the release manifest was not read with the pull Secret's login: %q\n%s", e.auth, e.log)
 			}
 			if c.rolledBack {
 				if got := strings.Join(e.f.ran("helm rollback")[0], " "); !strings.HasPrefix(got, "helm rollback notes 1 ") {

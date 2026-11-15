@@ -98,6 +98,9 @@ type RecordedValues struct {
 	// --https-port); left out in loopback mode.
 	HTTPPort  int `json:"http_port,omitempty"`
 	HTTPSPort int `json:"https_port,omitempty"`
+	// ACMECA is the ACME directory the front's certificates come from instead of Let's Encrypt's
+	// (--acme-ca), in the acme and dns-cloudflare modes; left out when none is recorded.
+	ACMECA string `json:"acme_ca,omitempty"`
 }
 
 // recordedValues reads, through get, the values recorded that s, the installed release's spec,
@@ -154,6 +157,9 @@ func recordedValues(s *spec.Spec, get func(string) (string, bool), front bool) *
 		}
 		return out
 	}
+	if acmeMode(out.TLS) {
+		out.ACMECA, _ = get(ACMECAVar)
+	}
 	// The ports the front publishes in this mode, as the install binds them.
 	http, https := frontServed(s.Front, s.L4.Routes, out.TLS)
 	if http {
@@ -190,6 +196,12 @@ type DockerStatus struct {
 	VolumesSplit   bool      `json:"volumes_split,omitempty"`
 	Services       []Service `json:"services"`
 	ServicesError  string    `json:"services_error,omitempty"`
+	// RegistryLogin is the host the install holds a login for (`registry-login`,
+	// --registry-login-file), the release's own registry's or its mirror's: never the login itself.
+	// Empty when it holds none; RegistryLoginError when the file held cannot be read (the reads of
+	// its host fail on it).
+	RegistryLogin      string `json:"registry_login,omitempty"`
+	RegistryLoginError string `json:"registry_login_error,omitempty"`
 }
 
 // HelmStatus is the helm release's latest revision and its status, as `helm list` gives it.
@@ -442,6 +454,7 @@ func (in *Installer) StatusJSON(ctx context.Context) error {
 	if st.Services, err = in.stackServices(ctx, env, nil); err != nil {
 		st.ServicesError = err.Error()
 	}
+	st.RegistryLogin, st.RegistryLoginError = in.heldLoginHost()
 	return printJSON(in.O.Out, st)
 }
 

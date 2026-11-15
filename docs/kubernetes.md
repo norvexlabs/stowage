@@ -9,8 +9,8 @@ the current directory. A release with no chart (published without the shape) is 
 
 ```bash
 <short>-stow k8s install  [--namespace NS] [--release R] [--kube-context C] [--values FILE]…
-                       [--image-registry PREFIX] [--image-pull-login] [--registry-ca FILE] [--set KEY=VALUE]… [--set-file KEY=PATH]…
-                       [--answers FILE] [--given FILE|- | --kit FILE|- [--kit-code-file FILE]]
+                       [--image-registry PREFIX] [--image-pull-login | --registry-login-file FILE|-] [--registry-ca FILE] [--set KEY=VALUE]… [--set-file KEY=PATH]…
+                       [--answers FILE] [--given FILE|- | --kit FILE|- [--kit-code-file FILE] | --secrets FILE|-]
                        [--no-input] [--accessible] [--timeout 10m] [--dry-run] [--no-provision]
                        [--unsafe-sysctls[=false]] [--json]
 <short>-stow k8s updates  [--namespace NS] [--release R] [--kube-context C] [--channel C] [--version V]
@@ -29,6 +29,7 @@ the current directory. A release with no chart (published without the shape) is 
 <short>-stow k8s secrets rotate KEY [--stage | --finish] [--namespace NS] [--release R]
 <short>-stow k8s secrets show KEY [--namespace NS] [--release R]   # a settable secret's value from the release's Secret, on a terminal only
                        [--kube-context C] [--timeout 6m]
+<short>-stow k8s secrets export --recipient AGE_KEY… [-o FILE|-] [--namespace NS] [--release R] [--kube-context C]
 <short>-stow k8s tune                                                 # what tunes the network (prints)
 ```
 
@@ -201,7 +202,9 @@ the current directory. A release with no chart (published without the shape) is 
   the release names, once `kubectl get` sees it (none named: `""`, given explicitly, never reused
   unseen); one gone is refused on the release's own registry with a `token` pull account (`the
   pull Secret S the release names is gone: set TOKEN_ENV (the pull account U) to write it
-  again`), and elsewhere (a mirror) logged and given as none.
+  again`), and elsewhere (a mirror) logged and given as none — unless `<release>-stowage-pull`
+  holds the login `--registry-login-file` gave for the images' host, which the pods then name
+  (`the pull Secret S the release names is gone: the pods name <release>-stowage-pull`).
 - `upgrade` drops, from the Secret `<release>-stowage`, the value of an input the release no
   longer declares (fetching the installer of the release the helm release runs, as for the schema
   baseline: one that cannot be read keeps every value), saying `input KEY is not in <name>
@@ -310,6 +313,39 @@ the current directory. A release with no chart (published without the shape) is 
   rollout status`, each bounded by `--timeout`). The chart gives `KEY_NEXT` and `KEY_PREVIOUS`
   (or `KEY_ACCEPTED`, the one of them that holds a value, as on Docker; the Secret holds the three)
   to the pods that check the value.
+- `secrets export --recipient age1…` (repeatable, 1 to 16 keys; `-o FILE`, default
+  `<name>-secrets.age`, 0600, never over a file; `-` for standard output) writes the release's
+  secrets for a disaster recovery in the format of the Docker shape's `secrets export` (see
+  `secrets export` in [installer](installer.md)), encrypted to those age public keys and
+  ASCII-armored: the generated secrets (a rotated one's `KEY_NEXT`, `KEY_PREVIOUS` and
+  `KEY_ACCEPTED` with them) and the secret inputs on Kubernetes that the Secrets
+  `<release>-stowage` and `<release>-stowage-secret-files` hold, and what the provision hook
+  returned (`<release>-stowage-provision`). The pull Secret (the operator's credential) is never
+  in it, nor a front CA (the chart's ingress owns the certificate). The keys are checked before
+  the cluster is read; it is run by the installer of the release it runs (another is refused,
+  naming it, as are no release, an uninstalled one, one without the Secret and another tool's
+  Secret of these names) and needs `get` on Secrets in the namespace. No value is printed. The
+  file restores on any shape: `install --secrets` on Docker or the VM, `k8s install --secrets`
+  here; a key that is no secret of the release there is left out, said.
+- `install --secrets FILE` (`-` for standard input; the file `secrets export` wrote on any shape,
+  decrypted) makes a first install with those secrets, by the Docker shape's rules: every
+  generated secret the file holds is taken (one it lacks is generated, said; a rotation under
+  way goes on), its secret inputs on Kubernetes are given (under `--set` and `--answers`, over
+  the environment), a key that is no secret of the release on Kubernetes (a Docker-only input,
+  the Cloudflare token) is left out and said, and a `front_ca` is left out and said. Refused
+  before the cluster changes: a file still encrypted, one of another project, an unknown field,
+  over 1 MiB, a provision value that is no variable name or that a variable cannot hold, beside
+  `--given` or `--kit`, or naming standard input with `--registry-login-file -`; and the Secret
+  `<release>-stowage` already there (an install that stopped, or one uninstalled, kept it: a
+  first install reuses it, so leave out `--secrets`, or `kubectl delete secret <release>-stowage`
+  first). `k8s upgrade` takes no `--secrets`. What the provision hook returned is written,
+  before helm, into `<release>-stowage-provision` (created when missing; a key it held is
+  removed), labelled `stowage.dev/restore-awaited: "true"` in the same merge patch: the values
+  belong to the old install's data, so no deploy (this install, an `upgrade`) runs the hook while
+  the label is there — it logs `not provisioned: …` and names the way on: load the old install's
+  backup into the release's database, then `k8s provision` runs the hook, and removes the label
+  once it succeeds. A file without provision values awaits nothing: the hook runs as on any first
+  install. `--dry-run` says what a run would write there, and writes nothing.
 - `reset-db` takes the release back to its first setup, run by the installer of the release it
   runs (another is refused, as is a `pending-…` release and a project whose `data.reset` names
   nothing). With `--new-baseline`, run by the installer of a release at another schema baseline,
@@ -369,8 +405,62 @@ the current directory. A release with no chart (published without the shape) is 
   nothing`; one fetching an installer made before the flag fails on it as unknown, and the run
   notes that installer writes no pull Secret from a login (run that version without the flag, and
   give the chart your own pull Secret through `--values`). `reset-db` keeps the pull Secret and the
-  values naming it. A program with a pull account for the mirror gives it as a Docker config:
+  values naming it (across a baseline, as `--registry-login-file` below says). A program with a pull account for the mirror gives it as a Docker config:
   `DOCKER_CONFIG` pointing at a directory whose `config.json` holds it.
+- `--registry-login-file FILE|-` (`k8s install`, `k8s upgrade`, and `k8s upgrade --version`; `-`
+  for standard input, which `--given -` or `--kit -` may not name too; an empty value is refused)
+  gives the release its own login, minted for this install in the registry (revoking it leaves
+  every other install pulling): a Docker config holding one `auths` entry (as Docker's
+  `--registry-login-file` takes it, see [installer](installer.md)) for the host the release's
+  images come from — the release's own registry, or the mirror (`--image-registry`, else the one
+  the release records). The pull Secret `<release>-stowage-pull` is written from it, labelled
+  `stowage.dev/pull-login: install`, and the installer's own reads of that host (the release, the
+  chart, the installer image) take it. `k8s upgrade --version` reads the release and fetches its
+  installer with it, then gives that installer the login on a pipe it inherits
+  (`--registry-login-file=/dev/fd/3`, a descriptor it keeps from the processes it starts once
+  read), never a file on disk, its standard input left its own; an
+  installer made before the flag fails on it as
+  unknown, and the run notes it (`note: if it refused --registry-login-file as an unknown flag …`:
+  run that version without the flag). To the release that runs it applies nothing, and says
+  `--registry-login-file is not applied: …`. That Secret is the login's record: a later run
+  without the flag (`k8s upgrade`, `upgrade --version`, `updates`, `provision`, `reset-db`,
+  `rollback`'s schema check, `kit create` and `kit check`) reads that host with the login it
+  holds — after the pull account's password its variable (`token_env`) gives, and for that host alone; a Secret without the label is never read as a
+  login — and `k8s upgrade` (or `reset-db --new-baseline`) keeps it (`the pull Secret … keeps the
+  login --registry-login-file gave for HOST`) rather than write the pull account over it; the pods
+  name it on an install, and on an upgrade (or `reset-db --new-baseline`) of a release naming it
+  or none — one a run before stopped naming it for another host's images names it again once they
+  come from its host: one whose values name another pull Secret keeps naming that one while it
+  exists. A pull Secret kubectl cannot read (a denied read, an API error, a timeout) stops
+  a run that writes it — `k8s install`, `k8s upgrade`, a `reset-db` that crosses to another
+  release — before anything is asked or applied (exit 1, `the pull Secret <release>-stowage-pull
+  could not be read (<kubectl's error>): run again once it can be read (the run needs `get` on
+  that Secret in <namespace>) — a run that cannot see it would overwrite the login
+  --registry-login-file gave`), its `--dry-run` alike; a run that only reads (`updates`,
+  `provision`, `rollback`'s schema check, `kit create` and `kit check`, `upgrade --version` before
+  it runs the release's installer, a `reset-db` of the release it runs) logs it (`the pull Secret … could not be read (…); this run reads the registry without the
+  login it may hold`) and goes on without it. A labelled pull Secret whose login does not read is
+  logged once by every verb (`the pull Secret <release>-stowage-pull: the login
+  --registry-login-file gave does not read (…); this run reads the registry without it
+  (`<short>-stow k8s upgrade … --registry-login-file FILE` gives one again)`), which goes on as
+  one holding no login: a run writing the pull Secret with a pull account (the password its
+  variable gives, else the one baked in) writes it over it, and an upgrade without one keeps
+  naming the Secret the running release names. A run reads the pull Secret once per registry it reads, whichever verbs of it read that registry. A run with the
+  flag replaces it; the pull account's password given in its variable replaces it, said, as does
+  `--image-pull-login`, each write dropping the label. A run whose images come from
+  another host than the login's never names it for them: the pull account, when the run has one
+  for that host, replaces it (`… holds a login --registry-login-file gave for HOST, but the images
+  come from …: the pull account replaces it`); otherwise the pods name no pull Secret (`… the pods
+  no longer name it and pull from HOST without a login (`<short>-stow k8s upgrade
+  --registry-login-file FILE`, FILE an auths entry for HOST, gives them one)`), on `k8s upgrade`
+  and on `reset-db --new-baseline` alike. Refused (exit 3) before anything is asked or
+  applied: a login for another host, a file that is not one `auths` entry, the flag with
+  `--image-pull-login` (`give one`), and the flag with the pull account's password set on the
+  release's own registry (both would write the pull Secret: give one). `--dry-run` prints `secret
+  <release>-stowage-pull: the login --registry-login-file gave (redacted)`. Without a login, the
+  release's own registry is read with the pull account (its password from the variable, else the
+  one baked into the installer); `--image-pull-login` on that host stays refused, the refusal
+  naming `--registry-login-file` as the way to give this release its own login.
 - `uninstall` removes the release and what the installer made beside it: `helm uninstall
   <release> --wait`, then the provision Job `<release>-stowage` (`kubectl delete
   --cascade=foreground --wait`), the provision hook's RoleBinding, Role and ServiceAccount
