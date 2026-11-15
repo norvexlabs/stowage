@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"cmp"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -161,22 +160,38 @@ func newBaselineFile(dir string) string { return filepath.Clean(dir) + ".new-bas
 // tries it again, as the operator cannot ask it again from this OS. removed tells whether a mark
 // was removed.
 func (in *Installer) crossingAsked() (asked, removed bool, err error) {
-	mark := newBaselineFile(in.O.Dir)
-	raw, err := os.ReadFile(mark)
-	if errors.Is(err, os.ErrNotExist) {
+	mark, m := newBaselineFile(in.O.Dir), in.R.Manifest
+	if asked, err := markNames(mark, m.ProjectVersion, m.Revision); asked || err != nil {
+		return asked, false, err
+	}
+	switch err := os.Remove(mark); {
+	case errors.Is(err, os.ErrNotExist):
 		return false, false, nil
-	}
-	if err != nil {
-		return false, false, err
-	}
-	if tag := strings.TrimSpace(string(raw)); tag != "" && tag == in.R.Manifest.Tag {
-		return true, false, nil
-	}
-	if err := os.Remove(mark); err != nil {
+	case err != nil:
 		in.O.logf("warning: removing %s: %v", mark, err)
 		return false, false, nil
 	}
 	return false, true, nil
+}
+
+// releaseMark is how a mark beside the install directory names a release: by version and
+// revision, which an OS bundle's installer carries as a published release does (it carries no
+// tag).
+func releaseMark(version string, revision int) string {
+	return fmt.Sprintf("%s %d", version, revision)
+}
+
+// markNames reports whether the mark at path names the release version at revision; an absent
+// mark names none.
+func markNames(path, version string, revision int) (bool, error) {
+	raw, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return strings.TrimSpace(string(raw)) == releaseMark(version, revision), nil
 }
 
 // fellBackFromCrossing reports whether the install's release, version at revision, is one a
@@ -196,10 +211,16 @@ func (in *Installer) crossed() error {
 	return nil
 }
 
-// upgradedTo reports whether an upgrade before the first install wrote this OS's release.
+// upgradedTo reports whether an upgrade before the first install wrote this OS's release: its mark
+// names it. The mark lasts until that install is made (firstBoot, or the next boot finding an
+// install), so a later first install follows the settings again.
 func (in *Installer) upgradedTo() bool {
-	raw, err := os.ReadFile(osUpgradeFile(in.O.Dir))
-	return err == nil && in.R.Manifest.Tag != "" && strings.TrimSpace(string(raw)) == in.R.Manifest.Tag
+	m := in.R.Manifest
+	ok, err := markNames(osUpgradeFile(in.O.Dir), m.ProjectVersion, m.Revision)
+	if err != nil {
+		in.O.logf("warning: %v", err)
+	}
+	return ok
 }
 
 // switchOS writes the OS bundle of the release the settings name into the passive slot and
@@ -211,7 +232,9 @@ func (in *Installer) switchOS(ctx context.Context, st *Settings) error {
 		return fmt.Errorf("%s: release.os %q is not a digest", cmp.Or(o.Settings, SettingsFile(in.R.Spec.Name)), t.OS)
 	}
 	mark := osSwitchFile(o.Dir)
-	if raw, err := os.ReadFile(mark); err == nil && strings.TrimSpace(string(raw)) == t.Tag {
+	if done, err := markNames(mark, t.Version, t.Revision); err != nil {
+		return err
+	} else if done {
 		return fmt.Errorf("this OS carries %s %s (revision %d) after %s's OS bundle was written and booted: the first install of %s %s stops (remove %s to write it again)",
 			in.R.Spec.Name, m.ProjectVersion, m.Revision, t.Tag, in.R.Spec.Name, t.Version, mark)
 	}
@@ -222,7 +245,7 @@ func (in *Installer) switchOS(ctx context.Context, st *Settings) error {
 	src := fmt.Sprintf("%s/%s-os@%s", prefix, in.R.Spec.Name, t.OS)
 	o.logf("this OS carries %s %s (revision %d); the first install runs %s (revision %d): writing its OS bundle %s, then rebooting into it",
 		in.R.Spec.Name, m.ProjectVersion, m.Revision, t.Version, t.Revision, src)
-	if err := writeAtomic(mark, strings.NewReader(t.Tag+"\n"), 0o600, nil); err != nil {
+	if err := writeAtomic(mark, strings.NewReader(releaseMark(t.Version, t.Revision)+"\n"), 0o600, nil); err != nil {
 		return err
 	}
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Minute)
@@ -298,9 +321,8 @@ func (in *Installer) applySettings(path string, st *Settings) error {
 	// over the file's loopback mode. A domain over its HTTPS mode keeps that mode.
 	domain := len(o.Domains) > 0
 	for _, k := range in.domainKeys() {
-		_, set := o.Set[k]
-		_, answered := o.Answers[k]
-		domain = domain || set || answered
+		_, given := in.domainGiven(k)
+		domain = domain || given
 	}
 	if o.Cert == "" && o.Key == "" && !(domain && st.TLS == Loopback) {
 		o.TLS = cmp.Or(o.TLS, st.TLS)
@@ -480,7 +502,16 @@ func (in *Installer) waiting(ctx context.Context) ([]string, error) {
 // wrote one; without it, or while a secret input is missing, the VM waits for `sudo <short>-stow
 // install`.
 func (in *Installer) firstBoot(ctx context.Context, path string) error {
-	o, ctl := &in.O, in.R.Ctl()
+	o, ctl, m := &in.O, in.R.Ctl(), in.R.Manifest
+	// The OS an upgrade before the first install wrote is, from its first boot, the OS a first
+	// boot came to, as switchOS's is: the passive system holds no install, and the health gate
+	// reads the switch's mark (switchedHere), which outlives the install. The upgrade's own mark
+	// stays until the install is made.
+	if in.upgradedTo() {
+		if err := writeAtomic(osSwitchFile(o.Dir), strings.NewReader(releaseMark(m.ProjectVersion, m.Revision)+"\n"), 0o600, nil); err != nil {
+			return err
+		}
+	}
 	st, err := ReadSettings(path)
 	if err != nil {
 		return err
@@ -493,7 +524,7 @@ func (in *Installer) firstBoot(ctx context.Context, path string) error {
 		if !in.upgradedTo() {
 			return in.switchOS(ctx, st)
 		}
-		o.logf("%s names %s; `upgrade` wrote this OS's %s since: the first install runs it", path, t.Tag, in.R.Manifest.Tag)
+		o.logf("%s names %s; `upgrade` wrote this OS's %s (revision %d) since: the first install runs it", path, t.Tag, m.ProjectVersion, m.Revision)
 	}
 	if st.AwaitSecrets {
 		if st.AwaitGiven != "" {
@@ -518,7 +549,8 @@ func (in *Installer) firstBoot(ctx context.Context, path string) error {
 	if err := in.Install(ctx); err != nil {
 		return err
 	}
-	// Made: the mark says nothing of a later first install (the install removed).
+	// Made: the mark says nothing of a later first install (the install removed), which follows
+	// the settings.
 	if err := os.Remove(osUpgradeFile(o.Dir)); err != nil && !errors.Is(err, os.ErrNotExist) {
 		o.logf("warning: removing %s: %v", osUpgradeFile(o.Dir), err)
 	}
@@ -687,10 +719,6 @@ func (in *Installer) leftByRollback(version string, revision int) bool {
 
 // prevIs reports whether the release kept in PrevDir is version at revision.
 func (in *Installer) prevIs(version, revision string) bool {
-	raw, err := os.ReadFile(filepath.Join(in.path(PrevDir), prevState))
-	if err != nil {
-		return false
-	}
-	var st state
-	return json.Unmarshal(raw, &st) == nil && st.ProjectVersion == version && strconv.Itoa(st.Revision) == revision
+	st, err := in.readPrevState()
+	return err == nil && st != nil && st.ProjectVersion == version && strconv.Itoa(st.Revision) == revision
 }

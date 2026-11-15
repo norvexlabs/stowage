@@ -42,6 +42,7 @@ type fakeKube struct {
 	mu        sync.Mutex
 	helm      string         // `helm version`
 	listed    []helmRelease  // `helm list`
+	unlisted  string         // the status of a release helm list shows under no flag (unknown)
 	history   []helmRevision // `helm history`
 	revValues map[int]string // `helm get values --revision N`: the values of revision N
 	values    map[string]any
@@ -228,6 +229,13 @@ func (k kubeTool) Run(_ context.Context, c Cmd) ([]byte, error) {
 		}
 		return []byte(f.logs[a[slices.Index(a, "--container")+1]]), nil
 	case "helm status":
+		if slices.Contains(a, "--output") {
+			// What helm list does not show (unlisted), else none.
+			if f.unlisted == "" {
+				return nil, errors.New("helm status: exit status 1: Error: release: not found")
+			}
+			return []byte(`{"name":"` + a[1] + `","info":{"status":"` + f.unlisted + `"}}`), nil
+		}
 		_, err := io.WriteString(c.Stdout, "STATUS: deployed\n")
 		return nil, err
 	case "kubectl version":
@@ -833,22 +841,42 @@ func TestK8sNeverWritesOverAPullSecretItDidNotWrite(t *testing.T) {
 	}
 }
 
-// An upgrade with no pull password keeps the pull Secret the release names: it writes no
-// pullSecret value, so helm reuses the earlier one.
+// An upgrade with no pull password names the pull Secret the release names, once seen to exist;
+// one gone is refused naming the password, and with none named it gives none: never a value reused
+// unseen.
 func TestK8sUpgradeWithoutAPasswordKeepsThePullSecret(t *testing.T) {
 	t.Parallel()
-	e := newKubeEnv(t, spec.Provider{Name: "token", Config: map[string]any{"user": "notes-pull", "token_env": "NOTES_PULL"}})
-	e.runs("0.9.0", 1)
-	e.stored(map[string]string{"ADMIN_EMAIL": "a@example.org", "SESSION_SECRET": "s", "POSTGRES_PASSWORD": "p"}, ours)
-	if err := e.installer(nil).K8sUpgrade(context.Background()); err != nil {
+	token := spec.Provider{Name: "token", Config: map[string]any{"user": "notes-pull", "token_env": "NOTES_PULL"}}
+	upgrade := func(named string, exists bool) (*kubeEnv, error) {
+		e := newKubeEnv(t, token)
+		e.runs("0.9.0", 1)
+		if named != "" {
+			e.f.values["stowage"].(map[string]any)["pullSecret"] = named
+		}
+		if exists {
+			e.f.pull = "secret/" + named + "\n"
+		}
+		e.stored(map[string]string{"ADMIN_EMAIL": "a@example.org", "SESSION_SECRET": "s", "POSTGRES_PASSWORD": "p"}, ours)
+		return e, e.installer(nil).K8sUpgrade(context.Background())
+	}
+	e, err := upgrade("notes-stowage-pull", true)
+	if err != nil {
 		t.Fatalf("%v\n%s", err, e.log)
 	}
-	if strings.Contains(e.f.given[0], "pullSecret") || e.secretData("notes-stowage-pull") != nil {
+	if !strings.Contains(e.f.given[0], "pullSecret: notes-stowage-pull\n") || e.secretData("notes-stowage-pull") != nil {
 		t.Errorf("values %q, applied %v", e.f.given[0], e.f.applied)
+	}
+	e, err = upgrade("notes-stowage-pull", false)
+	if err == nil || !strings.Contains(err.Error(), "the pull Secret notes-stowage-pull the release names is gone: set NOTES_PULL (the pull account notes-pull) to write it again") || e.f.ran("helm upgrade") != nil {
+		t.Errorf("a pull Secret gone: %v", err)
+	}
+	e, err = upgrade("", false)
+	if err != nil || !strings.Contains(e.f.given[0], "pullSecret: \"\"\n") {
+		t.Errorf("none named: %v, values %q", err, e.f.given)
 	}
 	// A first install with none is refused: the cluster could not pull the images.
 	e = newKubeEnv(t, spec.Provider{Name: "token", Config: map[string]any{"user": "notes-pull", "token_env": "NOTES_PULL"}})
-	err := e.installer(nil).K8sInstall(context.Background())
+	err = e.installer(nil).K8sInstall(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "the cluster pulls the images with the pull account notes-pull, whose password this installer does not carry: set NOTES_PULL") {
 		t.Fatalf("%v", err)
 	}
@@ -1377,5 +1405,118 @@ func TestK8sUpgradeVersionWithUnsafeSysctlsToAnOlderInstaller(t *testing.T) {
 		if err == nil || noted != (flag != nil) {
 			t.Errorf("--unsafe-sysctls %v: %v\n%s", flag, err, e.log)
 		}
+	}
+}
+
+// A release in helm's unknown status, which helm list shows under no flag, is a release: install
+// does not go over it, and upgrade refuses it naming helm's repair.
+func TestK8sReleaseInHelmsUnknownStatus(t *testing.T) {
+	t.Parallel()
+	e := newKubeEnv(t, spec.Provider{Name: "none"})
+	e.f.unlisted = "unknown"
+	if err := e.installer(nil).K8sInstall(context.Background()); err == nil || !strings.Contains(err.Error(), "release notes in notes exists (unknown") {
+		t.Errorf("install: %v", err)
+	}
+	if err := e.installer(nil).K8sUpgrade(context.Background()); err == nil || !strings.Contains(err.Error(), "release notes in notes is in helm's unknown status: `helm history notes --namespace notes` shows it") {
+		t.Errorf("upgrade: %v", err)
+	}
+	if e.f.ran("helm upgrade") != nil {
+		t.Error("helm upgrade ran")
+	}
+	// Every verb acting on the release installed reads it one way (k8sCurrent).
+	in := e.installer(func(o *Options) { o.Yes = true })
+	for name, verb := range map[string]func(context.Context) error{"rollback": in.K8sRollback, "provision": in.K8sProvision, "reset-db": in.K8sReset} {
+		if err := verb(context.Background()); err == nil || !strings.Contains(err.Error(), "is in helm's unknown status") {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+}
+
+// A kubectl command a message prints reaches what the run's own kubectl commands reach: the same
+// flags, the context's included.
+func TestKubectlHintsTargetAsTheRunDoes(t *testing.T) {
+	t.Parallel()
+	for _, kctx := range []string{"", "kind-a b"} {
+		e := newKubeEnv(t, spec.Provider{Name: "none"})
+		in := e.installer(func(o *Options) { o.K8s.Context = kctx })
+		if _, err := in.kubectl(context.Background(), Cmd{Args: []string{"get", "pods"}}); err != nil {
+			t.Fatal(err)
+		}
+		ran := e.f.ran("kubectl get pods")
+		if len(ran) != 1 {
+			t.Fatalf("ran %v", ran)
+		}
+		want := strings.Join(ran[0][3:], " ")
+		if kctx != "" {
+			want = "--namespace notes --context 'kind-a b'"
+		}
+		if got := in.O.K8s.kubectlWhere(); got != want || !slices.Equal(ran[0][3:], in.O.K8s.kubectlTarget()) {
+			t.Errorf("context %q: hint %q, ran %q", kctx, got, ran[0])
+		}
+	}
+	// The uninstall's hint for the claims it keeps names the context.
+	e := newKubeEnv(t, spec.Provider{Name: "none"})
+	in := e.installer(func(o *Options) { o.K8s.Context = "other" })
+	if got := in.O.K8s.kubectlWhere(); got != "--namespace notes --context other" {
+		t.Errorf("%q", got)
+	}
+}
+
+// A k8s upgrade to a release adding a route takes the input it adds for it, as any added input:
+// given with --set, recorded in the release's Secret.
+func TestK8sUpgradeAddingARoute(t *testing.T) {
+	t.Parallel()
+	e := newKubeEnv(t, spec.Provider{Name: "none"})
+	e.runs("0.9.0", 1)
+	e.stored(map[string]string{"ADMIN_EMAIL": "a@example.org", "SESSION_SECRET": "s", "POSTGRES_PASSWORD": "p"}, ours)
+	e.release.Spec.Inputs = append(e.release.Spec.Inputs, spec.Input{Key: "DOCS_DOMAIN", Prompt: "The docs' domain", Required: true})
+	e.release.Spec.Front.Routes = append(e.release.Spec.Front.Routes, spec.Route{Name: "docs", DomainInput: "DOCS_DOMAIN", Upstream: "web:9000"})
+	e.release.Spec.Front.LoopbackPorts["docs"] = 9000
+	if err := e.installer(func(o *Options) { o.Set = map[string]string{"DOCS_DOMAIN": "docs.example.org"} }).K8sUpgrade(context.Background()); err != nil {
+		t.Fatalf("%v\n%s", err, e.log)
+	}
+	if got := e.secretData("notes-stowage")["DOCS_DOMAIN"]; got != "docs.example.org" {
+		t.Errorf("recorded %q", got)
+	}
+	// Not given: refused before anything changes, naming the flag.
+	e = newKubeEnv(t, spec.Provider{Name: "none"})
+	e.runs("0.9.0", 1)
+	e.stored(map[string]string{"ADMIN_EMAIL": "a@example.org", "SESSION_SECRET": "s", "POSTGRES_PASSWORD": "p"}, ours)
+	e.release.Spec.Inputs = append(e.release.Spec.Inputs, spec.Input{Key: "DOCS_DOMAIN", Prompt: "The docs' domain", Required: true})
+	if err := e.installer(nil).K8sUpgrade(context.Background()); err == nil || !strings.Contains(err.Error(), "DOCS_DOMAIN") || e.f.ran("helm upgrade") != nil {
+		t.Errorf("not given: %v", err)
+	}
+}
+
+// A release uninstalled with its history kept runs nothing: every verb acting on the release
+// installed refuses it as absent, naming the rollback; rollback itself brings it back.
+func TestK8sVerbsRefuseAnUninstalledRelease(t *testing.T) {
+	t.Parallel()
+	uninstalled := func() *kubeEnv {
+		e := newKubeEnv(t, spec.Provider{Name: "none"})
+		e.runs("1.0.0", 1)
+		e.stored(nil, ours)
+		e.f.listed[0].Status = "uninstalled"
+		e.f.history = []helmRevision{{Revision: 1, Status: "superseded", Chart: "notes-0.1.0"}, {Revision: 2, Status: "uninstalled", Chart: "notes-0.1.0"}}
+		e.f.revValues = map[int]string{2: `{"stowage":{"registry":"` + e.prefix + `","release":{"name":"notes","version":"1.0.0","revision":1}}}`}
+		return e
+	}
+	e := uninstalled()
+	in := e.installer(func(o *Options) { o.Yes = true })
+	for name, verb := range map[string]func(context.Context) error{"provision": in.K8sProvision, "reset-db": in.K8sReset, "upgrade": in.K8sUpgrade, "install": in.K8sInstall} {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second) // a verb that goes on polls the fake hook Job, which never finishes, until ctx ends
+		err := verb(ctx)
+		cancel()
+		if r, ok := Refusal(err); !ok || !r.Absent || !strings.Contains(err.Error(), "release notes in notes is uninstalled, its history kept: nothing runs; `notes-stow k8s rollback --namespace notes --release notes` brings it back") ||
+			!strings.Contains(r.Fix, "or, to start over, `helm uninstall notes --namespace notes` (its history dropped), then `") || strings.Contains(err.Error(), "k8s upgrade") {
+			t.Errorf("%s: %v (%s)", name, err, r.Fix)
+		}
+	}
+	if e.f.ran("helm upgrade") != nil {
+		t.Error("helm upgrade ran")
+	}
+	e = uninstalled()
+	if err := e.installer(nil).K8sRollback(context.Background()); err != nil && strings.Contains(err.Error(), "is uninstalled") {
+		t.Errorf("rollback: %v", err)
 	}
 }

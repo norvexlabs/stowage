@@ -5,12 +5,14 @@ import (
 	"crypto/elliptic"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net/http/httptest"
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/name"
@@ -231,15 +233,18 @@ func TestFailureToReadIsNotUnsigned(t *testing.T) {
 	d, _ := name.NewDigest("registry.example/t/img@sha256:" + strings.Repeat("a", 64))
 	v := verifier(t, testutil.NewKeySigner(t).PEM)
 	for what, r := range map[string]fixed{
-		"list":                {err: errors.New("503")},
-		"bundle":              {},
-		"too many signatures": {bundle: []byte("{}"), n: maxBundles + 1},
+		"list":   {err: errors.New("503")},
+		"bundle": {},
 	} {
 		if err := v.Verify(context.Background(), r, d); err == nil || errors.Is(err, ErrUnsigned) || !strings.Contains(err.Error(), "cannot check signatures") {
 			t.Errorf("%s: %v", what, err)
 		}
 	}
-	// One past the bound is refused, the bound itself is read.
+	// Candidates left unread may hold the signature: past the bound, none verifying is a failure
+	// to check, never "unsigned"; at the bound, every one was read.
+	if err := v.Verify(context.Background(), fixed{bundle: []byte("{}"), n: maxBundles + 1}, d); err == nil || errors.Is(err, ErrUnsigned) || !strings.Contains(err.Error(), "cannot check signatures") {
+		t.Errorf("past the bound: %v", err)
+	}
 	if err := v.Verify(context.Background(), fixed{bundle: []byte("{}"), n: maxBundles}, d); !errors.Is(err, ErrUnsigned) {
 		t.Errorf("at the bound: %v", err)
 	}
@@ -269,7 +274,8 @@ type unreadFirst struct {
 func (u *unreadFirst) Referrers(ctx context.Context, d name.Digest, t types.MediaType) ([]v1.Descriptor, error) {
 	refs, err := u.Registry.Referrers(ctx, d, t)
 	h, _ := v1.NewHash("sha256:" + strings.Repeat("e", 64))
-	return append([]v1.Descriptor{{Digest: h, ArtifactType: string(t)}}, refs...), err
+	ann := map[string]string{predicateAnnotation: SignPredicate, createdAnnotation: time.Now().Add(time.Hour).UTC().Format(time.RFC3339)}
+	return append([]v1.Descriptor{{Digest: h, ArtifactType: string(t), Annotations: ann}}, refs...), err
 }
 
 func (u *unreadFirst) GetArtifact(ctx context.Context, ref name.Reference, want types.MediaType) (*registry.Artifact, v1.Hash, error) {
@@ -306,5 +312,206 @@ func TestALargeAttestationIsNeitherASignatureNorAFailure(t *testing.T) {
 	}
 	if doc, err := v.Attestation(ctx, e.c, e.d, "https://spdx.dev/Document"); err != nil || len(doc) < registry.MaxArtifactBlob {
 		t.Fatalf("the attestation: %d bytes, %v", len(doc), err)
+	}
+}
+
+// listed lists the referrers given, each holding the bundle the map gives its digest.
+type listed struct {
+	refs    []v1.Descriptor
+	bundles map[v1.Hash][]byte
+}
+
+func (l listed) Referrers(context.Context, name.Digest, types.MediaType) ([]v1.Descriptor, error) {
+	return l.refs, nil
+}
+
+func (l listed) GetArtifact(_ context.Context, ref name.Reference, _ types.MediaType) (*registry.Artifact, v1.Hash, error) {
+	h, err := v1.NewHash(ref.Identifier())
+	if err != nil {
+		return nil, v1.Hash{}, err
+	}
+	return &registry.Artifact{Type: BundleType, Data: l.bundles[h]}, h, nil
+}
+
+func (l listed) GetArtifactMax(ctx context.Context, ref name.Reference, want types.MediaType, _ int64) (*registry.Artifact, v1.Hash, error) {
+	return l.GetArtifact(ctx, ref, want)
+}
+
+// signed is a registry listing k's signature of a fresh digest (as the registry lists it,
+// annotations included), alone.
+func signed(t *testing.T, k *testutil.KeySigner) (listed, name.Digest) {
+	t.Helper()
+	e := newEnv(t)
+	k.Sign(t, e.d)
+	refs, err := e.c.Referrers(context.Background(), e.d, BundleType)
+	if err != nil || len(refs) != 1 {
+		t.Fatalf("the signature: %v %v", refs, err)
+	}
+	a, _, err := e.c.GetArtifact(context.Background(), e.d.Context().Digest(refs[0].Digest.String()), BundleType)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return listed{refs: refs, bundles: map[v1.Hash][]byte{refs[0].Digest: a.Data}}, e.d
+}
+
+// with is l with n more referrers annotated with predicate (none when empty), made at created,
+// holding no valid bundle; first puts them before l's own.
+func (l listed) with(n int, predicate string, created time.Time, first bool) listed {
+	out := listed{bundles: map[v1.Hash][]byte{}}
+	for h, b := range l.bundles {
+		out.bundles[h] = b
+	}
+	var more []v1.Descriptor
+	for range n {
+		h, _ := v1.NewHash(fmt.Sprintf("sha256:%064x", len(out.bundles)+1))
+		d := v1.Descriptor{Digest: h, ArtifactType: string(BundleType)}
+		if predicate != "" {
+			d.Annotations = map[string]string{predicateAnnotation: predicate, createdAnnotation: created.UTC().Format(time.RFC3339)}
+		}
+		more = append(more, d)
+		out.bundles[h] = []byte("{}")
+	}
+	if first {
+		out.refs = append(more, l.refs...)
+	} else {
+		out.refs = append(append(out.refs, l.refs...), more...)
+	}
+	return out
+}
+
+// Of more signatures than are read, the newest are: a valid one among them verifies, one older
+// than all of them is not read and the answer says so. The registry's listing (here through the
+// tag fallback) carries the annotations cosign writes.
+func TestTheNewestSignaturesAreRead(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	now := time.Now()
+	k := testutil.NewKeySigner(t)
+	k.Created = now
+	v := verifier(t, k.PEM)
+	l, d := signed(t, k)
+	if a := l.refs[0].Annotations; a[predicateAnnotation] != SignPredicate || a[createdAnnotation] != now.UTC().Format(time.RFC3339) {
+		t.Fatalf("the listing's annotations: %v", a)
+	}
+	if err := v.Verify(ctx, l.with(maxBundles+1, SignPredicate, now.Add(-time.Hour), true), d); err != nil {
+		t.Fatalf("a valid signature, the newest of %d: %v", maxBundles+2, err)
+	}
+	want := fmt.Sprintf("cannot check signatures: none of the newest %d of %d read is by a trusted key", maxBundles, maxBundles+1)
+	if err := v.Verify(ctx, l.with(maxBundles, SignPredicate, now.Add(time.Hour), false), d); err == nil || errors.Is(err, ErrUnsigned) || !strings.Contains(err.Error(), want) {
+		t.Fatalf("a valid signature older than %d others: %v", maxBundles, err)
+	}
+	// At the bound, the oldest is read too.
+	if err := v.Verify(ctx, l.with(maxBundles-1, SignPredicate, now.Add(time.Hour), false), d); err != nil {
+		t.Fatalf("a valid signature, the oldest of %d: %v", maxBundles, err)
+	}
+}
+
+// An attestation of another predicate (an SBOM) is no signature: it is not read for one, nor
+// counted, nor pushes a signature out of those read; a signature is no attestation.
+func TestAttestationsAreNotSignatures(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	now := time.Now()
+	e := newEnv(t)
+	k := testutil.NewKeySigner(t)
+	sbom := testutil.NewKeySigner(t)
+	sbom.Predicate, sbom.Body = "https://spdx.dev/Document", json.RawMessage(`{"spdxVersion":"SPDX-2.3"}`)
+	sbom.Sign(t, e.d)
+	v := verifier(t, k.PEM, sbom.PEM)
+	if err := v.Verify(ctx, e.c, e.d); !errors.Is(err, ErrUnsigned) || !strings.Contains(err.Error(), "no signature") {
+		t.Fatalf("an attestation alone: %v", err)
+	}
+	other := testutil.NewKeySigner(t)
+	other.Sign(t, e.d)
+	// A referrer of no type, which the listing gives as a candidate, holding something else.
+	testutil.PushReferrerAs(t, e.d, "", "application/vnd.example.other", []byte("x"))
+	if refs, _ := e.c.Referrers(ctx, e.d, BundleType); len(refs) != 3 {
+		t.Fatalf("listed: %v", refs)
+	}
+	if err := v.Verify(ctx, e.c, e.d); !errors.Is(err, ErrUnsigned) || !strings.Contains(err.Error(), ": 1 signature(s), none") {
+		t.Fatalf("one untrusted signature beside an attestation: %v", err)
+	}
+	if _, err := v.Attestation(ctx, e.c, e.d, "https://spdx.dev/Document"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := v.Attestation(ctx, e.c, e.d, "https://example.com/other"); !errors.Is(err, ErrNoAttestation) {
+		t.Fatalf("an attestation of a predicate never made: %v", err)
+	}
+	k.Created = now.Add(-time.Hour)
+	l, d := signed(t, k)
+	if err := v.Verify(ctx, l.with(maxBundles, sbom.Predicate, now, true), d); err != nil {
+		t.Fatalf("a valid signature beside %d newer attestations: %v", maxBundles, err)
+	}
+}
+
+// A referrer with no predicate annotation (another tool's) is read after the annotated ones, in
+// the registry's order: within the bound it verifies, past it it is not read.
+func TestUnannotatedReferrersAreReadLast(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	k := testutil.NewKeySigner(t)
+	k.NoAnnotations = true
+	l, d := signed(t, k)
+	if len(l.refs[0].Annotations) != 0 {
+		t.Fatalf("the unannotated signature: %v", l.refs[0].Annotations)
+	}
+	v := verifier(t, k.PEM)
+	old := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	if err := v.Verify(ctx, l.with(maxBundles-1, SignPredicate, old, false), d); err != nil {
+		t.Fatalf("an unannotated signature within the bound: %v", err)
+	}
+	if err := v.Verify(ctx, l.with(maxBundles, SignPredicate, old, false), d); err == nil || errors.Is(err, ErrUnsigned) || !strings.Contains(err.Error(), fmt.Sprintf("of %d read", maxBundles+1)) {
+		t.Fatalf("an unannotated signature past the bound: %v", err)
+	}
+	if err := v.Verify(ctx, l.with(maxBundles+5, "", old, false), d); err != nil {
+		t.Fatalf("an unannotated signature listed first of unannotated ones: %v", err)
+	}
+}
+
+// A creation time past now and the clock's skew orders nothing: such referrers sort after the
+// dated ones, so they cannot push a fresh signature out of those read; within the skew they order.
+// The note says "newest" only when every candidate was dated.
+func TestAFutureDateOrdersNothing(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	now := time.Now()
+	k := testutil.NewKeySigner(t)
+	k.Created = now
+	v := verifier(t, k.PEM)
+	l, d := signed(t, k)
+	if err := v.Verify(ctx, l.with(maxBundles, SignPredicate, now.Add(clockSkew+time.Minute), true), d); err != nil {
+		t.Fatalf("a fresh signature beside %d dated past the skew: %v", maxBundles, err)
+	}
+	err := v.Verify(ctx, l.with(maxBundles, SignPredicate, now.Add(clockSkew-time.Minute), true), d)
+	if err == nil || errors.Is(err, ErrUnsigned) || !strings.Contains(err.Error(), fmt.Sprintf("the newest %d of %d read", maxBundles, maxBundles+1)) {
+		t.Fatalf("a fresh signature beside %d dated within the skew: %v", maxBundles, err)
+	}
+	// Undated candidates past the window: the note does not say "newest".
+	unsigned := testutil.NewKeySigner(t)
+	unsigned.Created = now
+	l2, d2 := signed(t, unsigned)
+	err = v.Verify(ctx, l2.with(maxBundles, "", now, false), d2)
+	if err == nil || errors.Is(err, ErrUnsigned) || !strings.Contains(err.Error(), fmt.Sprintf("the %d of %d read", maxBundles, maxBundles+1)) {
+		t.Fatalf("undated candidates past the window: %v", err)
+	}
+}
+
+// An attestation's read fails closed the same way: past the bound, none by a trusted key among
+// those read is a failure to read, never "no attestation"; one within them is read.
+func TestAnAttestationReadPastTheBoundFailsClosed(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	now := time.Now()
+	k := testutil.NewKeySigner(t)
+	k.Predicate, k.Body = "https://spdx.dev/Document", json.RawMessage(`{"spdxVersion":"SPDX-2.3"}`)
+	k.Created = now
+	v := verifier(t, k.PEM)
+	l, d := signed(t, k)
+	if _, err := v.Attestation(ctx, l.with(maxBundles, k.Predicate, now.Add(-time.Minute), true), d, k.Predicate); err != nil {
+		t.Fatalf("the newest of %d: %v", maxBundles+1, err)
+	}
+	_, err := v.Attestation(ctx, l.with(maxBundles, k.Predicate, now.Add(time.Minute), true), d, k.Predicate)
+	if err == nil || errors.Is(err, ErrNoAttestation) || !strings.Contains(err.Error(), "cannot read its attestations") {
+		t.Fatalf("pushed out of those read: %v", err)
 	}
 }

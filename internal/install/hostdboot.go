@@ -2,9 +2,7 @@ package install
 
 import (
 	"bytes"
-	"cmp"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -14,6 +12,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/norvexlabs/stowage/internal/providers"
 )
 
 // The host daemon's side of the boot: the health check, an upgrade's fresh trial, and going back
@@ -23,6 +23,43 @@ import (
 type Health struct {
 	Ready  bool   `json:"ready"`
 	Reason string `json:"reason,omitempty"` // why not
+}
+
+// healthReuseSecs is how long GET /v1/health's verdict answers again once its check ended: the
+// `command` provider starts a container per check, and the app socket may poll it.
+const healthReuseSecs = 5
+
+// healthCheck is one check of GET /v1/health, every request arriving while it runs waiting for it:
+// done closes once ans and at, when it ended, are set (under healthMu). gen is the daemon's
+// stateGen as it began: a change since (a job, a service verb) makes its verdict stale.
+type healthCheck struct {
+	done chan struct{}
+	ans  Health
+	at   time.Time
+	gen  uint64
+}
+
+// reusable reports whether c's verdict still answers at now: no state change since it began, and
+// it is running, or ended within healthReuseSecs (healthMu held).
+func (h *Hostd) reusable(c *healthCheck, now time.Time) bool {
+	return c != nil && c.gen == h.stateGen.Load() && (c.at.IsZero() || !c.at.Before(now.Add(-healthReuseSecs*h.unit())))
+}
+
+// changed marks a change of what the install runs (a job's start or end, a service verb): a
+// health verdict read before it no longer answers.
+func (h *Hostd) changed() { h.stateGen.Add(1) }
+
+// healthWait bounds, in Unit, one check of GET /v1/health: the `command` provider's own bounds
+// (its image's user read, then its run: timeout_s each, 30 s by default) and a minute for the
+// rest (the stack's state, the http probe's 10 s). A check that hangs ends at it, unhealthy, and
+// the next request starts another.
+func healthWait(r *Release) int {
+	t := 30
+	var c providers.RuntimeCommand
+	if r.Spec.Health.Name == "command" && r.Spec.Health.Decode(&c) == nil && c.TimeoutS > 0 {
+		t = c.TimeoutS
+	}
+	return 60 + 30 + 2*t
 }
 
 // RollbackPlan is what GET /v1/rollback and a dry run of POST /v1/rollback answer: the release
@@ -74,20 +111,47 @@ func (h *Hostd) osWritten() error {
 }
 
 func (h *Hostd) assessment() assessment {
-	return assessment{cmp.Or(h.State, cosState), h.Host}
+	return assessmentIn(h.State, h.Host)
 }
 
 func (h *Hostd) health(w http.ResponseWriter, r *http.Request) {
-	in, _ := h.run()
-	env, err := h.installed(in)
-	if err != nil {
-		replyErr(w, err)
+	h.healthMu.Lock()
+	c := h.healthRun
+	if !h.reusable(c, time.Now()) {
+		// A new check reads the install as it is now; a verdict reused reads nothing.
+		in, _ := h.run()
+		env, err := h.installed(in)
+		if err != nil {
+			h.healthMu.Unlock()
+			replyErr(w, err)
+			return
+		}
+		c = &healthCheck{done: make(chan struct{}), gen: h.stateGen.Load()}
+		h.healthRun = c
+		// The check is every waiting request's, on the daemon's context: none's going away cuts
+		// it; its own bound does.
+		go func() {
+			ctx, cancel := context.WithTimeout(h.ctx, time.Duration(healthWait(in.R))*h.unit())
+			defer cancel()
+			ans := Health{Ready: true}
+			if err := in.ready(ctx, env, h.Probe); err != nil {
+				ans = Health{Reason: err.Error()}
+			}
+			h.healthMu.Lock()
+			c.ans, c.at = ans, time.Now()
+			h.healthMu.Unlock()
+			close(c.done)
+		}()
+	}
+	h.healthMu.Unlock()
+	select {
+	case <-c.done:
+	case <-r.Context().Done():
 		return
 	}
-	ans := Health{Ready: true}
-	if err := in.ready(r.Context(), env, h.Probe); err != nil {
-		ans = Health{Reason: err.Error()}
-	}
+	h.healthMu.Lock()
+	ans := c.ans
+	h.healthMu.Unlock()
 	reply(w, http.StatusOK, ans)
 }
 
@@ -103,7 +167,7 @@ func (h *Hostd) retry(j *job) error {
 		return nil
 	}
 	h.logf(j, "clearing the boot assessment's mark of the last attempt, so the next boot tries the new system")
-	ctx, cancel := context.WithTimeout(h.ctx, time.Minute)
+	ctx, cancel := context.WithTimeout(h.ctx, assessWrite*h.unit())
 	defer cancel()
 	if err := a.set(ctx, assessTentative+"="); err != nil {
 		return fmt.Errorf("the new system is written, but the next boot would skip it: %w", err)
@@ -145,16 +209,12 @@ func (h *Hostd) plan(ctx context.Context, log io.Writer) (RollbackPlan, error) {
 	if err := h.osWritten(); err != nil {
 		return RollbackPlan{}, sameKind(err, fail(http.StatusConflict, "%v: the passive system may now be this one; reboot first", err))
 	}
-	raw, err := os.ReadFile(filepath.Join(in.path(PrevDir), prevState))
-	if errors.Is(err, os.ErrNotExist) {
-		return RollbackPlan{}, refuseAs(http.StatusConflict, "nothing to go back to: an upgrade keeps the release it replaces", "%s has no previous release to go back to (an upgrade keeps one)", in.O.Dir)
-	}
+	st, err := in.readPrevState()
 	if err != nil {
 		return RollbackPlan{}, err
 	}
-	var st state
-	if err := json.Unmarshal(raw, &st); err != nil {
-		return RollbackPlan{}, fmt.Errorf("%s: %w", filepath.Join(in.path(PrevDir), prevState), err)
+	if st == nil {
+		return RollbackPlan{}, refuseAs(http.StatusConflict, "nothing to go back to: an upgrade keeps the release it replaces", "%s has no previous release to go back to (an upgrade keeps one)", in.O.Dir)
 	}
 	in.O.DryRun, in.O.Log = true, log
 	// Rollback runs as on the VM (O.Preloaded), so each refusal carries the fix it chose for the
@@ -244,6 +304,10 @@ func (h *Hostd) rollback(w http.ResponseWriter, r *http.Request) {
 	accepted(w, j)
 }
 
+// assessWrite bounds, in Unit, a write of the boot assessment's marks (remount, grub2-editenv,
+// remount): a write that hangs fails rather than hold the job.
+const assessWrite = 60
+
 // rebootGrace is the wait, in Unit, between a rollback's end and its marks and `systemctl reboot`.
 const rebootGrace = 5
 
@@ -315,12 +379,12 @@ func (h *Hostd) toPassive(j *job, p RollbackPlan) error {
 	if h.ctx.Err() != nil { // a stop, even one as the grace ends, arms nothing
 		return cancelled("the daemon stopped before the reboot: nothing changed")
 	}
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(h.ctx), time.Minute)
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(h.ctx), assessWrite*h.unit())
 	defer cancel()
 	// back answers reason with the marks put back as they were, and whether that worked.
 	back := func(reason string) string {
 		// A context of its own: the one that ran out may be why it failed.
-		rctx, rcancel := context.WithTimeout(context.WithoutCancel(h.ctx), time.Minute)
+		rctx, rcancel := context.WithTimeout(context.WithoutCancel(h.ctx), assessWrite*h.unit())
 		defer rcancel()
 		switch rerr := a.set(rctx, assessEnable+"="+was[assessEnable], assessTentative+"="+was[assessTentative]); {
 		case errors.As(rerr, new(leftWritable)):

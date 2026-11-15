@@ -359,7 +359,7 @@ func (in *Installer) tofuVM(ctx context.Context, p Platform, t *TofuVM, host str
 		if v.HasDefault {
 			title += " (empty: the module's default)"
 		}
-		qs = append(qs, Question{Title: title, Key: v.Name, Required: !v.HasDefault})
+		qs = append(qs, Question{Title: title, Key: v.Name, Required: !v.HasDefault, Check: typedCheck(v)})
 		given[v.Name] = t.Vars[v.Name]
 	}
 	defaults := map[string]string{"--vm-name": defName, "--disk": itoa(size.def.gib)}
@@ -390,6 +390,10 @@ func (in *Installer) tofuVM(ctx context.Context, p Platform, t *TofuVM, host str
 	for _, v := range own {
 		switch val := a[v.Name]; {
 		case val != "":
+			val, err := typedValue(v, val)
+			if err != nil {
+				return nil, nil, fmt.Errorf("--tofu-var %s: %w", v.Name, err)
+			}
 			if t.Vars == nil {
 				t.Vars = map[string]string{}
 			}
@@ -397,15 +401,6 @@ func (in *Installer) tofuVM(ctx context.Context, p Platform, t *TofuVM, host str
 		case !v.HasDefault:
 			return nil, nil, fmt.Errorf("--tofu-var %s=<value> is required by the module: %s", v.Name, cmp.Or(v.Description, "it has no default"))
 		}
-	}
-	// A built-in module's firewall is a bool OpenTofu would refuse only once the apply started;
-	// its spellings (OpenTofu's: 1 and 0 too) are made true or false, which moduleFirewall reads.
-	if fw, ok := t.Vars["firewall"]; ok && t.Module == "" && declares(declared, "firewall") {
-		on, known := map[string]string{"true": "true", "1": "true", "false": "false", "0": "false"}[fw]
-		if !known {
-			return nil, nil, fmt.Errorf("--tofu-var firewall=%s: true or false", fw)
-		}
-		t.Vars["firewall"] = on
 	}
 	return files, declared, nil
 }
@@ -878,7 +873,7 @@ func (in *Installer) DestroyVM(ctx context.Context, d *VMDestroy) error {
 		cl, err := in.registryClient(prefix)
 		if err == nil {
 			lctx, cancel := context.WithTimeout(ctx, destroyLookup)
-			_, err = in.bootDisks(lctx, cl, prefix)
+			_, err = in.bootDisks(lctx, cl, prefix, nil)
 			cancel()
 		}
 		known := errors.As(err, new(noBootDisk))

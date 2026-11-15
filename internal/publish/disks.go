@@ -14,6 +14,7 @@ import (
 
 	"github.com/norvexlabs/stowage/internal/registry"
 	"github.com/norvexlabs/stowage/internal/release"
+	"github.com/norvexlabs/stowage/internal/version"
 )
 
 // A channel's disk set is a record in the registry (release.DiskSet, under DiskSetTag of the
@@ -259,35 +260,58 @@ func (p *Publisher) remove(ctx context.Context, repo, digest string) error {
 	return p.deleter().DeleteManifest(ctx, d)
 }
 
+// heldPrefix starts the tag that marks content whose tag was retired while another tag held it:
+// held-<the digest's first 12 hex digits>. The registry is the record, so a run stopped part way
+// leaves it for the next sweep. No other tag starts so: the channel checks reserve the prefix.
+const heldPrefix = version.ReservedPrefix
+
+func heldTag(d v1.Hash) string { return heldPrefix + d.Hex[:12] }
+
 // untag removes tag. A registry refusing to delete a tag alone has the manifest deleted by digest
-// when no other tag of the repository holds it; otherwise the tag is retired (moved onto the
-// retired artifact, which reads as absent) and the content returned: the other tags hold it, and
-// sweepHeld deletes it once they no longer do. A retired tag is left as it is.
-func (p *Publisher) untag(ctx context.Context, tag name.Tag) (*name.Digest, error) {
+// when no other tag of the repository holds it; otherwise the content is marked held (heldTag)
+// and the tag retired (moved onto the retired artifact, which reads as absent): the other tags
+// hold it, and sweepMarked deletes it once they no longer do. A retired tag is left as it is.
+func (p *Publisher) untag(ctx context.Context, tag name.Tag) error {
 	err := p.Registry.DeleteTag(ctx, tag)
 	if err == nil || !errors.Is(err, registry.ErrDeleteRefused) {
-		return nil, err
+		return err
 	}
 	have, herr := p.headFloating(ctx, tag)
 	if herr != nil || have == nil {
-		return nil, herr
+		return herr
 	}
 	others, herr := p.holders(ctx, tag.Context(), have.Digest, tag.TagStr())
 	if herr != nil {
-		return nil, herr
+		return herr
 	}
 	if len(others) > 0 {
+		if err := p.markHeld(ctx, tag.Context(), have.Digest); err != nil {
+			return err
+		}
 		if err := p.retire(ctx, tag); err != nil {
-			return nil, err
+			return err
 		}
 		p.logf("%s retired: the registry deletes no tag alone; its content stays under %s", tag, strings.Join(others, ", "))
-		d := tag.Context().Digest(have.Digest.String())
-		return &d, nil
+		return nil
 	}
-	return nil, p.remove(ctx, tag.Context().Name(), have.Digest.String())
+	return p.remove(ctx, tag.Context().Name(), have.Digest.String())
 }
 
-// holders lists the tags of repo but except that hold the manifest d.
+// markHeld tags d in repo heldTag(d), before the tag that names it is retired: once no other tag
+// holds d, sweepMarked deletes it.
+func (p *Publisher) markHeld(ctx context.Context, repo name.Repository, d v1.Hash) error {
+	t, err := p.Registry.Tag(repo.Name(), heldTag(d))
+	if err != nil {
+		return err
+	}
+	if err := p.Registry.Retag(ctx, repo.Digest(d.String()), t); err != nil {
+		return fmt.Errorf("mark %s held: %w", repo.Digest(d.String()), err)
+	}
+	p.marked = append(p.marked, t)
+	return nil
+}
+
+// holders lists the tags of repo but except that hold the manifest d; a held mark is none.
 func (p *Publisher) holders(ctx context.Context, repo name.Repository, d v1.Hash, except string) ([]string, error) {
 	tags, err := p.Registry.Tags(ctx, repo)
 	if err != nil {
@@ -295,7 +319,7 @@ func (p *Publisher) holders(ctx context.Context, repo name.Repository, d v1.Hash
 	}
 	var out []string
 	for _, t := range tags {
-		if t == except {
+		if t == except || strings.HasPrefix(t, heldPrefix) {
 			continue
 		}
 		ref, err := p.Registry.Tag(repo.Name(), t)
@@ -313,38 +337,103 @@ func (p *Publisher) holders(ctx context.Context, repo name.Repository, d v1.Hash
 	return out, nil
 }
 
-// sweepHeld deletes by digest the content untag left to other tags, once none holds it; content
-// already gone is skipped, and an error on one digest does not stop the others.
-func (p *Publisher) sweepHeld(ctx context.Context, held []name.Digest) error {
+// sweepMarked deletes by digest, in the release and installer repositories and in repos, the
+// content any held mark names once no other tag holds it (the mark goes with it), a stopped run's
+// included: prune's sweep. Content already gone is skipped, and an error on one does not stop the
+// others. A repository with no mark costs one listing of its tags.
+func (p *Publisher) sweepMarked(ctx context.Context, repos ...string) error {
+	all := append([]string{p.releaseRepo(), p.installerRepo()}, repos...)
+	slices.Sort(all)
 	var errs []error
-	seen := map[name.Digest]bool{}
-	for _, d := range held {
-		if seen[d] {
-			continue
-		}
-		seen[d] = true
-		if err := p.sweepOne(ctx, d); err != nil {
+	for _, r := range slices.Compact(all) {
+		if err := p.sweepRepo(ctx, r, nil); err != nil {
 			errs = append(errs, err)
 		}
 	}
 	return errors.Join(errs...)
 }
 
-// sweepOne deletes d by digest unless it is gone or a tag of its repository holds it.
-func (p *Publisher) sweepOne(ctx context.Context, d name.Digest) error {
-	have, err := p.Registry.Head(ctx, d)
-	if err != nil || have == nil {
+// sweepOrWarn is the sweep that ends a ship or a yank: of the marks this run made alone, so it
+// never judges content another run is working on; a failure is a warning, the marks staying for
+// a prune.
+func (p *Publisher) sweepOrWarn(ctx context.Context) {
+	byRepo := map[string]map[string]bool{}
+	for _, t := range p.marked {
+		r := t.Context().Name()
+		if byRepo[r] == nil {
+			byRepo[r] = map[string]bool{}
+		}
+		byRepo[r][t.TagStr()] = true
+	}
+	var errs []error
+	for _, r := range slices.Sorted(maps.Keys(byRepo)) {
+		if err := p.sweepRepo(ctx, r, byRepo[r]); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if err := errors.Join(errs...); err != nil {
+		p.logf("warning: held content not swept (a prune sweeps it): %v", err)
+	}
+}
+
+// sweepRepo deletes by digest the content each held mark of the repository names (of only, when
+// set) that no other tag holds. Every tag is read once: one map of digest to the tags holding it
+// judges every mark.
+func (p *Publisher) sweepRepo(ctx context.Context, repoName string, only map[string]bool) error {
+	repo, err := p.Registry.Repo(repoName)
+	if err != nil {
 		return err
 	}
-	others, err := p.holders(ctx, d.Context(), have.Digest, "")
-	if err != nil || len(others) > 0 {
+	tags, err := p.Registry.Tags(ctx, repo)
+	if err != nil {
+		if registry.NotFound(err) {
+			return nil
+		}
 		return err
 	}
-	if err := p.remove(ctx, d.Context().Name(), d.DigestStr()); err != nil {
-		return err
+	var marks []string
+	for _, t := range tags {
+		if strings.HasPrefix(t, heldPrefix) && (only == nil || only[t]) {
+			marks = append(marks, t)
+		}
 	}
-	p.logf("%s deleted: no tag holds it any more", d)
-	return nil
+	if len(marks) == 0 {
+		return nil
+	}
+	marked := map[string]v1.Hash{} // mark → the content it names
+	held := map[v1.Hash]bool{}     // content a tag other than a mark holds
+	for _, t := range tags {
+		ref, err := p.Registry.Tag(repoName, t)
+		if err != nil {
+			return err
+		}
+		h, err := p.Registry.Head(ctx, ref)
+		if err != nil {
+			return err
+		}
+		switch {
+		case h == nil:
+		case strings.HasPrefix(t, heldPrefix):
+			marked[t] = h.Digest
+		default:
+			held[h.Digest] = true
+		}
+	}
+	var errs []error
+	done := map[v1.Hash]bool{}
+	for _, m := range marks {
+		d, ok := marked[m]
+		if !ok || held[d] || done[d] {
+			continue
+		}
+		done[d] = true
+		if err := p.remove(ctx, repoName, d.String()); err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		p.logf("%s deleted: no tag holds it any more", repo.Digest(d.String()))
+	}
+	return errors.Join(errs...)
 }
 
 // cleanDisks makes rel's disks its channel's set and removes the channel's older disk sets, once

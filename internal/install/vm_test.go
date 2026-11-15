@@ -1445,7 +1445,7 @@ func TestTheFirstBootInstallsTheReleaseAnUpgradeWrote(t *testing.T) {
 	host := &fakeHost{}
 	in := e.installer(func(o *Options) { with(o); o.Host = host })
 	// Another release's mark switches as ever.
-	if err := os.WriteFile(osUpgradeFile(e.dir), []byte("0.8.0\n"), 0o600); err != nil {
+	if err := os.WriteFile(osUpgradeFile(e.dir), []byte("0.8.0 1\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := in.Boot(context.Background()); err != nil || len(host.calls()) == 0 {
@@ -1456,8 +1456,8 @@ func TestTheFirstBootInstallsTheReleaseAnUpgradeWrote(t *testing.T) {
 	}
 	host = &fakeHost{}
 	in = e.installer(func(o *Options) { with(o); o.Host = host })
-	in.R.Manifest.Tag = "1.0.0-1" // as a release's: an empty mark names no release
-	if err := os.WriteFile(osUpgradeFile(e.dir), []byte(in.R.Manifest.Tag+"\n"), 0o600); err != nil {
+	// The mark names the release as hostd's upgrade writes it; an OS bundle's installer carries no tag.
+	if err := os.WriteFile(osUpgradeFile(e.dir), []byte("1.0.0 1\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := in.Boot(context.Background()); err != nil {
@@ -1472,8 +1472,15 @@ func TestTheFirstBootInstallsTheReleaseAnUpgradeWrote(t *testing.T) {
 	if _, err := os.Stat(osUpgradeFile(e.dir)); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("the mark outlived the first install: %v", err)
 	}
+	// It lasts as the switch's: the health gate reads this OS as the one a first boot came to.
+	if raw, err := os.ReadFile(osSwitchFile(e.dir)); err != nil || string(raw) != "1.0.0 1\n" {
+		t.Errorf("switch mark: %q %v", raw, err)
+	}
+	if !in.switchedHere() {
+		t.Error("the gate does not read this OS as the one the first boot came to")
+	}
 	// A first install made otherwise (over SSH): the next boot finding it drops the mark.
-	if err := os.WriteFile(osUpgradeFile(e.dir), []byte(in.R.Manifest.Tag+"\n"), 0o600); err != nil {
+	if err := os.WriteFile(osUpgradeFile(e.dir), []byte("1.0.0 1\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := e.installer(with).Boot(context.Background()); err != nil {
@@ -1481,6 +1488,49 @@ func TestTheFirstBootInstallsTheReleaseAnUpgradeWrote(t *testing.T) {
 	}
 	if _, err := os.Stat(osUpgradeFile(e.dir)); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("the mark outlived a boot of the install: %v", err)
+	}
+	// Once that install is gone, a first install follows the settings again, the switch's mark
+	// (this OS's) notwithstanding: the boot writes the OS of the release they name.
+	if err := os.RemoveAll(e.dir); err != nil {
+		t.Fatal(err)
+	}
+	host = &fakeHost{}
+	if err := e.installer(func(o *Options) { with(o); o.Host = host }).Boot(context.Background()); err != nil || !strings.Contains(fmt.Sprint(host.calls()), "kairos-agent upgrade") {
+		t.Errorf("a later first install: %v, ran %v", err, host.calls())
+	}
+}
+
+// The kept release is read in one place: absent is none, a file that does not parse is an error
+// naming it, for the rollback, its plan and status alike; the VM's boot, which only asks whether
+// it is a release, takes it as none.
+func TestTheKeptReleaseIsReadOnce(t *testing.T) {
+	t.Parallel()
+	e := vmEnv(t, "1.0.0")
+	in := e.installer(vm)
+	if st, err := in.readPrevState(); st != nil || err != nil {
+		t.Fatalf("absent: %v %v", st, err)
+	}
+	file := filepath.Join(e.dir, PrevDir, prevState)
+	if err := os.MkdirAll(filepath.Dir(file), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(file, []byte(`{"project_version": "0.9.0", "revision": 2}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if st, err := in.readPrevState(); err != nil || st.ProjectVersion != "0.9.0" || st.Revision != 2 || !in.prevIs("0.9.0", "2") || in.prevIs("0.9.0", "1") {
+		t.Fatalf("kept: %+v %v", st, err)
+	}
+	if err := os.WriteFile(file, []byte(`{"project_version": `), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := in.readPrevState(); err == nil || !strings.Contains(err.Error(), file) {
+		t.Errorf("unparsable: %v", err)
+	}
+	if _, err := in.keptPrevious("1.0.0", 1); err == nil || !strings.Contains(err.Error(), file) {
+		t.Errorf("status: %v", err)
+	}
+	if in.prevIs("0.9.0", "2") {
+		t.Error("an unparsable state is a release")
 	}
 }
 
@@ -1496,9 +1546,8 @@ func TestBootCrossesTheBaselineAResetAsked(t *testing.T) {
 		}
 		e.docker.answer = volumes(get(e.readEnv(), "COMPOSE_PROJECT_NAME"), e.docker.answer)
 		e.r, e.self = bundledInstaller(t, "2.0.0", 1, atBaseline(2))
-		e.r.Manifest.Tag = "2.0.0-1"
 		if mark == "this OS's" {
-			mark = e.r.Manifest.Tag
+			mark = "2.0.0 1" // as reset-db writes it: an OS bundle's installer carries no tag
 		}
 		if mark != "" {
 			if err := os.WriteFile(newBaselineFile(e.dir), []byte(mark+"\n"), 0o600); err != nil {
@@ -1517,7 +1566,7 @@ func TestBootCrossesTheBaselineAResetAsked(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "starts schema baseline 2") {
 		t.Fatalf("no mark: %v", err)
 	}
-	e, _, err := boot(t, "1.9.0-1")
+	e, _, err := boot(t, "1.9.0 1")
 	if err == nil || !strings.Contains(err.Error(), "starts schema baseline 2") {
 		t.Fatalf("another release's mark: %v", err)
 	}
@@ -1565,14 +1614,13 @@ func TestBootCrossesTheBaselineAResetAsked(t *testing.T) {
 func TestTheOperatorsFirstInstallWaitsForTheReleaseTheSettingsName(t *testing.T) {
 	t.Parallel()
 	e := vmEnv(t, "1.0.0")
-	e.r.Manifest.Tag = "1.0.0-1"
 	with := settings(t, "inputs: { ADMIN_EMAIL: ops@example.org }\nrelease: { version: 0.9.0, revision: 1, tag: 0.9.0-1, os: \"sha256:"+strings.Repeat("a", 64)+"\" }\n")
 	err := e.installer(with).withSettings()
 	if err == nil || !strings.Contains(err.Error(), "names notes 0.9.0 (revision 1) as the first install, and this OS carries 1.0.0 (revision 1): the boot writes that release's OS bundle and reboots into it") {
 		t.Fatalf("%v", err)
 	}
 	e.nothingWritten()
-	if err := os.WriteFile(osUpgradeFile(e.dir), []byte("1.0.0-1\n"), 0o600); err != nil {
+	if err := os.WriteFile(osUpgradeFile(e.dir), []byte("1.0.0 1\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := e.installer(with).withSettings(); err != nil {
@@ -1595,7 +1643,7 @@ func TestABootOnItsOwnReleaseUsesTheCrossingsMarkUp(t *testing.T) {
 	if err := e.install(vm); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(newBaselineFile(e.dir), []byte("2.0.0-1\n"), 0o600); err != nil {
+	if err := os.WriteFile(newBaselineFile(e.dir), []byte("2.0.0 1\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := e.installer(vm).Boot(context.Background()); err != nil {
@@ -1623,8 +1671,7 @@ func TestACrossingThatFailsIsTriedAgainByTheNextBoot(t *testing.T) {
 		return nil, false, nil
 	})
 	e.r, e.self = bundledInstaller(t, "2.0.0", 1, atBaseline(2))
-	e.r.Manifest.Tag = "2.0.0-1"
-	if err := os.WriteFile(newBaselineFile(e.dir), []byte("2.0.0-1\n"), 0o600); err != nil {
+	if err := os.WriteFile(newBaselineFile(e.dir), []byte("2.0.0 1\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := e.installer(vm).Boot(context.Background()); err == nil || !strings.Contains(err.Error(), "down failed") {

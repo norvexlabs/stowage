@@ -226,13 +226,34 @@ func TestAPlainUpgradeTakesANewRevision(t *testing.T) {
 	if done, err := run(); done || err != nil || len(p.ran) != 0 {
 		t.Fatalf("%v %v, ran %q\n%s", done, err, p.ran, p.out.String())
 	}
-	// The channel unreadable: logged, nothing run, no failure.
+	// The installer the install keeps unreadable: what it trusts is that installer's to tell,
+	// logged; the channel is not called unreadable.
+	ctl := filepath.Join(p.dir, "notes-stow")
+	if err := os.Rename(ctl, ctl+".away"); err != nil {
+		t.Fatal(err)
+	}
+	p.log.Reset()
+	if done, err := run(); done || err != nil || !strings.Contains(p.log.String(), "no later revision of notes 1.0.0 looked for") {
+		t.Fatalf("no kept installer: %v %v\n%s", done, err, p.log.String())
+	}
+	if err := os.Rename(ctl+".away", ctl); err != nil {
+		t.Fatal(err)
+	}
+	// The channel unreadable: nothing run, and the upgrade fails saying the install stays.
 	tag := p.r.Manifest.Tag
 	p.downFor.Store(&tag)
-	if done, err := run(); done || err != nil || len(p.ran) != 0 || !strings.Contains(p.log.String(), "no later revision of notes 1.0.0 looked for") {
+	if done, err := run(); done || err == nil || len(p.ran) != 0 || !strings.Contains(err.Error(), "the channel could not be read: ") || !strings.HasSuffix(err.Error(), "; the install stays on notes 1.0.0 (revision 1)") {
 		t.Fatalf("%v %v, ran %q\n%s", done, err, p.ran, p.log.String())
 	}
 	p.downFor.Store(nil)
+	// The channel read, holding this version yanked: no revision to move to, logged, no failure.
+	yanked := *p.r.Manifest
+	yanked.Yanked = &release.Yank{Reason: "broken", Date: yanked.Date}
+	p.putRelease(tag, &yanked)
+	if done, err := run(); done || err != nil || len(p.ran) != 0 || !strings.Contains(p.log.String(), "no later revision of notes 1.0.0 looked for") {
+		t.Fatalf("yanked: %v %v, ran %q\n%s", done, err, p.ran, p.log.String())
+	}
+	p.putRelease(tag, p.r.Manifest)
 	p.publish("1.0.0", 2, nil, nil)
 	if done, err := run(); !done || err != nil {
 		t.Fatalf("%v %v\n%s", done, err, p.log)
@@ -774,5 +795,22 @@ func TestUpgradeVersionFailsOnAManifestItCannotRead(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), "release manifest 2.0.0-2 could not be read (from another Stowage?") || len(p.ran) != 0 {
 			t.Errorf("%s: %v, ran %q", c.name, err, p.ran)
 		}
+	}
+}
+
+// A release manifest that cannot be read fails the channel's read with its own error, and cancels
+// the reads still under way: a manifest that cannot be read could be the one looked for.
+func TestReadChannelFailsOnTheFirstUnreadableManifest(t *testing.T) {
+	t.Parallel()
+	p := published(t, spec.Provider{Name: "none"}, nil)
+	for v := range 12 {
+		p.publish(fmt.Sprintf("1.%d.0", v+1), 1, nil, nil)
+	}
+	tag := "1.5.0-1"
+	p.downFor.Store(&tag)
+	c := registry.New(authn.NewMultiKeychain())
+	_, err := readChannel(context.Background(), c, p.prefix, "notes", "stable")
+	if err == nil || errors.Is(err, context.Canceled) || !strings.Contains(err.Error(), "denied") {
+		t.Fatalf("%v", err)
 	}
 }

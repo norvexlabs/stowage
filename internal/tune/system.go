@@ -572,12 +572,17 @@ func (s System) Inspect(ctx context.Context, h Host) []Item {
 	if s.Docker.Rootless {
 		return append(items, Item{NA, "docker", "daemon.json", "rootless Docker", "its own daemon file and user-mode network"})
 	}
-	daemon := s.daemonFile()
+	args, seen := s.dockerdArgs()
+	if !seen && s.Euid() != 0 {
+		// Under /proc's hidepid a user sees no dockerd: its --config-file is not known, so no file
+		// is judged in its place.
+		return append(items, Item{NA, "docker", "daemon.json", "dockerd is not visible to this user (/proc hidepid)", "run tune as root to judge its file"})
+	}
+	daemon := s.daemonFile(args)
 	raw, err := os.ReadFile(s.path(daemon))
 	if err != nil && !os.IsNotExist(err) {
 		return append(items, Item{Differs, "docker", daemon, "unreadable: " + err.Error(), ""})
 	}
-	args := s.dockerdArgs()
 	for _, d := range s.daemonWants(h) {
 		have, ok, err := daemonValue(raw, d.path)
 		why := leave(d, raw, args)
@@ -593,6 +598,18 @@ func (s System) Inspect(ctx context.Context, h Host) []Item {
 		}
 	}
 	return items
+}
+
+// managedIRQs are the interrupts the last apply recorded the kernel manages (ManagedIRQFile).
+func (s System) managedIRQs() []int {
+	v, _ := s.read(ManagedIRQFile)
+	var irqs []int
+	for f := range strings.FieldsSeq(v) {
+		if irq, err := strconv.Atoi(f); err == nil {
+			irqs = append(irqs, irq)
+		}
+	}
+	return irqs
 }
 
 // inspectSteering judges how a NIC's received packets spread over the CPUs: its interrupts, and
@@ -618,8 +635,19 @@ func (s System) inspectSteering(h Host, n nic) []Item {
 		items = append(items, Item{NA, "nic", n.name + " interrupts", "irqbalance spreads them", ""})
 	case len(on) > 0:
 		// Drift: --apply (the VM's boot) moves each off them; one the kernel manages refuses the
-		// move, which its note says.
-		items = append(items, Item{Differs, "nic", n.name + " interrupts", fmt.Sprintf("%d of %d on the services' cores (IRQ %s)", len(on), len(irqs), cpuRanges(on)), off})
+		// move (the apply recorded it): advice, as no apply moves it.
+		managed := s.managedIRQs()
+		kernel := slices.DeleteFunc(slices.Clone(on), func(irq int) bool { return !slices.Contains(managed, irq) })
+		moves := slices.DeleteFunc(slices.Clone(on), func(irq int) bool { return slices.Contains(managed, irq) })
+		fix := "isolcpus=managed_irq," + cpuRanges(h.Isolated) + " on the kernel's command line keeps them off"
+		switch {
+		case len(moves) == 0:
+			items = append(items, Item{Advice, "nic", n.name + " interrupts", fmt.Sprintf("%d of %d on the services' cores (IRQ %s), which the kernel manages:", len(on), len(irqs), cpuRanges(on)), fix})
+		case len(kernel) > 0:
+			items = append(items, Item{Differs, "nic", n.name + " interrupts", fmt.Sprintf("%d of %d on the services' cores (IRQ %s), and %d the kernel manages (IRQ %s: %s)", len(moves), len(irqs), cpuRanges(moves), len(kernel), cpuRanges(kernel), fix), off})
+		default:
+			items = append(items, Item{Differs, "nic", n.name + " interrupts", fmt.Sprintf("%d of %d on the services' cores (IRQ %s)", len(on), len(irqs), cpuRanges(on)), off})
+		}
 	case len(unread) > 0:
 		items = append(items, Item{Advice, "nic", n.name + " interrupts", fmt.Sprintf("%d of %d whose CPUs do not read (IRQ %s): whether they reach the services' cores is not known", len(unread), len(irqs), cpuRanges(unread)), off})
 	case isolating && (!h.network() || len(irqs) < 2 || len(h.steerCPUs()) < 2):
@@ -884,11 +912,12 @@ func (s System) kernelAtLeast(major, minor int) bool {
 
 // dockerdArgs are the flags the system's dockerd was started with (proc/<pid>/cmdline of the
 // process named dockerd that runs as root, not a user's rootless one), each with its value ("set"
-// for one without); none when it is not found.
-func (s System) dockerdArgs() map[string]string {
+// for one without); none when it is not found. seen reports whether such a dockerd was found: a
+// user under /proc's hidepid sees none.
+func (s System) dockerdArgs() (args map[string]string, seen bool) {
 	entries, err := os.ReadDir(s.path("proc"))
 	if err != nil {
-		return nil
+		return nil, false
 	}
 	for _, e := range entries {
 		if comm, ok := s.read(filepath.Join("proc", e.Name(), "comm")); !ok || comm != "dockerd" {
@@ -897,6 +926,7 @@ func (s System) dockerdArgs() map[string]string {
 		if status, _ := s.read(filepath.Join("proc", e.Name(), "status")); !rootUID(status) {
 			continue
 		}
+		seen = true
 		raw, err := os.ReadFile(s.path(filepath.Join("proc", e.Name(), "cmdline")))
 		if err != nil {
 			continue
@@ -916,9 +946,9 @@ func (s System) dockerdArgs() map[string]string {
 			}
 			out[f] = v
 		}
-		return out
+		return out, true
 	}
-	return nil
+	return nil, seen
 }
 
 // hostPID reports whether a proc/<pid>/status reads as a process of the host's own pid namespace:
@@ -944,8 +974,8 @@ func rootUID(status string) bool {
 
 // daemonFile is the daemon's file under the root: the running dockerd's --config-file (a relative
 // one from /, its working directory as a service), else DaemonFile.
-func (s System) daemonFile() string {
-	if f := s.dockerdArgs()["--config-file"]; f != "" && f != "set" {
+func (s System) daemonFile(args map[string]string) string {
+	if f := args["--config-file"]; f != "" && f != "set" {
 		return strings.TrimPrefix(filepath.Join("/", f), "/")
 	}
 	return DaemonFile

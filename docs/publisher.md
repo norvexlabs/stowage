@@ -221,10 +221,11 @@ release for a test run, never the project's, without editing the spec:
   key), and refuses its own key (`signing.key`, or a copy of it) and its own `public_keys` as
   them (compared as keys, whatever their encoding; a project key that cannot be read refuses the
   test release); the public key must be a PEM public key (PKIX or PKCS#1, as installs read).
-  Before a command signs anything, cosign derives the public key of `--test-key` (`cosign
-  public-key`): one that is not `--test-public-key` is refused (`--test-key K is not the key of
-  --test-public-key F: not signed`), so no form of the project's key — `env://`, a copy encrypted
-  again — signs a test release. An unsigned project's test release is signed
+  Before a ship or promotion builds anything, and again before each signature and attestation,
+  cosign derives the public key of `--test-key` (`cosign public-key`): one that is not
+  `--test-public-key` is refused (`--test-key K is not the key of --test-public-key F: not
+  signed`), so no form of the project's key — `env://`, a copy encrypted again, a key file
+  replaced during the run — signs a test release. Interrupting the command stops that check too. An unsigned project's test release is signed
   with them when given.
 - `--shapes docker,kubernetes,kairos` keeps only those of the project's shapes (`kairos` left
   out: no OS bundle or disk is built); one that leaves none is refused. A test release's disks
@@ -242,7 +243,11 @@ release for a test run, never the project's, without editing the spec:
   replaces a hook only it wrote, and refuses another (printing the line to add to it). Run it
   again after moving the `stowage` binary or the project. A spec (`-f`) outside the repository, or
   not committed, is refused, here and by `hook post-commit`: the ship runs in a checkout of the
-  commit.
+  commit. The spec's path, and the project's directory, are kept as written below the repository's
+  top level when the commit records them so, a symbolic link on them followed as the commit
+  records it (as its checkout follows it), not as the working tree holds it now; otherwise (a
+  link the commit lacks, to a committed file or directory) the working tree's links resolve them.
+  A link the commit records to nothing is not committed.
 - `hook post-commit` reads the version recorded by `HEAD` and by `HEAD~1` (from the commits, not
   the working tree; a version file the commit records as a link read through it, as a checkout
   reads it). It starts a ship only when `HEAD`'s version is later than `HEAD~1`'s by the
@@ -522,7 +527,9 @@ how far it got. A registry that lost the upload (a 404, a 416 it no longer knows
 status claiming bytes never sent, or a 400 `BLOB_UPLOAD_*`, which Docker Distribution answers to an
 upload resumed after a chunk cut short; one that cannot tell how far it got keeps the last offset
 acknowledged) is asked again whether it holds the blob, then gets a new upload, from the first byte,
-said in the log. A push with no byte acknowledged for 5 minutes fails, naming the disk (its file and
+said in the log. Once every byte is up, the commit's answer is awaited for 2 minutes plus a second
+per 20 MiB of the disk (a registry verifying or moving a large blob; in one stream too), and the 5 minutes below count
+from the commit's start. A push with no byte acknowledged for 5 minutes fails, naming the disk (its file and
 digest); so does, at once, a refusal no retry changes: a credential (401, 403), the repository
 (`NAME_UNKNOWN`, `NAME_INVALID`, `DENIED`), a registry that takes no push (405, `UNSUPPORTED`), the
 digest or size, or any other 400. Between chunks, every 30 s at most, the push logs its progress to
@@ -539,7 +546,18 @@ OS bundle, disk image, installer and release manifest is signed by digest before
 file reads its password from `COSIGN_PASSWORD`. Signatures are OCI referrers (sigstore bundles),
 read from the registry's referrers API or, on a registry without one (the GitHub Container
 Registry), its tag fallback, where a referrer listed under its config's type or none is read
-and judged by its own manifest; there is no transparency log: the trust anchor is `public_keys`, PEM files in the project that every
+and judged by its own manifest. A check reads at most 64 of a digest's referrers, newest first by
+the annotations cosign writes on each (`dev.sigstore.bundle.predicateType`,
+`org.opencontainers.image.created`): a referrer annotated with another predicate (an SBOM's
+attestation) is no signature and is neither read nor counted, and those carrying no predicate
+annotation (another tool's) come after the annotated ones, in the registry's order; one dated
+more than an hour past the clock sorts as undated, after the dated ones; more referrers than
+that are not read: a check finding a trusted signature among the 64 read passes, and one finding
+none answers `cannot check signatures: none of the newest 64 of N read is by a trusted key, and
+the others were not` (`64 of N` when some were undated) — a failure to check, never "unsigned",
+so an install never passes over such a release for an older one (an SBOM's read alike: `cannot
+read its attestations: …`); and the
+annotations only order what is read: each signature is still verified. There is no transparency log: the trust anchor is `public_keys`, PEM files in the project that every
 install carries (list old + new while rotating). `verify` — and every fallback of the channel
 pointer — requires a signature by one of them, checked in-process (the bundle's signature by the
 key, over the artifact's own digest; cosign is needed only to sign). A signature that cannot be
@@ -630,16 +648,32 @@ exactly what was published (same release inputs: images, compose, spec, changelo
 `stowage.lock`, and the same `stowage` and pull account password, which make the installer
 and the front),
 checked before anything is written. Re-shipping a yanked release fails: publish a new revision (the channel never moves forward to it; a pointer an interrupted yank left on it moves back). Image keys `release`,
-`release-seq`, `os`, `disk`, `installer`, `front`, `backup`, `chown` and `audit` are reserved for Stowage's own repositories. `yank` marks a release (nothing is deleted) and moves the pointer back to the latest
+`release-seq`, `os`, `disk`, `installer`, `front`, `backup`, `chown` and `audit` are reserved for Stowage's own repositories. `yank` marks a release (its artifacts stay; on a registry that deletes no tag alone, the
+manifest a retired pointer or `:latest` held is deleted once no other tag holds it, as below) and
+moves the pointer back to the latest
 release that is not yanked and verifies, removing it when none is left; a broken release can
 always be yanked. `prune` deletes tags (the release's images, installer, chart, OS bundle and
 disk tags first, its manifest last; disks as "Disk sets" says): a registry that deletes no tag
 alone has a manifest deleted by digest through `registry.delete` when no other tag holds it; when
 another does (the channel pointer, `:latest`, another release's tag of the same image), the tag is
 retired as step 6 of `ship` says and logged `<tag> retired: the registry deletes no tag alone; its
-content stays under <tags>`. Once the pointer and `:latest` have moved, the prune deletes by digest
-what no tag holds any more (logged `<ref> deleted: no tag holds it any more`). A retired release
-tag is no release: `prune`, `verify`, installs and mirrors skip it; it stays in the registry.
+content stays under <tags>`. Before it is retired, its content is tagged `held-<the digest's first
+12 hex digits>` in the same repository (the installer's `:latest` content too, when `:latest` is
+retired): the mark is the registry's record of it, so a run stopped part way loses nothing. A
+`ship` or `yank` ends by deleting by digest the content the marks it made itself name that no
+other tag holds any more (a failure there is a warning, `warning: held content not swept …`, the
+marks staying); a `prune` ends by doing so for every mark in the release and installer
+repositories and those it untagged, a stopped run's included (logged `<ref> deleted: no tag holds
+it any more`; the mark goes with it). A `held-` tag never counts as holding content. A retired release tag is no release: `prune`, `verify`, installs
+and mirrors skip it; it stays in the registry.
+
+A mutable release shipped again over its tag whose earlier build had an image key, an installer or
+an OS bundle the new one lacks (a key or a shape dropped from the spec) loses that tag (logged
+`<tag> removed: release <tag> no longer has it`), as a prune would remove it, before the new
+manifest is written: the content is marked `held-` first and deleted by the ship's sweep once
+the new release is out and no other tag holds it. A ship stopped before the new manifest is
+written leaves the old one, and its re-run drops them again; the dropped disk formats go with
+the disk cleanup.
 
 Global flags: `-C <dir>` project root (default `.`), `-f <file>` spec file (default
 `<dir>/stowage.yaml`). Exit codes: `0` success, `1` failure or lint errors, `3` a release `ship`

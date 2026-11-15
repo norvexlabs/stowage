@@ -150,11 +150,8 @@ func (in *Installer) Schema(ctx context.Context, after string, asJSON bool) erro
 	if rep.Migration, err = s.current(ctx, env); err != nil {
 		return fmt.Errorf("the database's migration: %w", err)
 	}
-	if raw, err := os.ReadFile(filepath.Join(in.path(PrevDir), prevState)); err == nil {
-		var st state
-		if json.Unmarshal(raw, &st) == nil {
-			rep.Kept = &st
-		}
+	if st, err := in.readPrevState(); err == nil {
+		rep.Kept = st
 	}
 	rep.After = after
 	if after == "" && rep.Kept != nil && schemaVersion.MatchString(rep.Kept.Schema) {

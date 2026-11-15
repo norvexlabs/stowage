@@ -172,6 +172,36 @@ func TestVMSeedAwaits(t *testing.T) {
 	}
 }
 
+// --channel names a channel the registry holds a release of the project on: a typo is refused
+// before the seed is made, the release's own channel needs no pointer.
+func TestVMSeedChecksTheChannel(t *testing.T) {
+	t.Parallel()
+	v := newVMCreate(t, "qcow2")
+	own := v.r.Manifest.Channel
+	if _, err := seedOf(t, v, nil, SeedOptions{Channel: "beta"}); !isRefused(err) || !strings.Contains(err.Error(), "--channel beta: the registry "+v.prefix+" holds no release of notes on beta (this release is on "+own+")") {
+		t.Fatalf("a channel without a release: %v", err)
+	}
+	other := *v.r.Manifest
+	other.Name = "other"
+	other.Channel = "beta"
+	v.putRelease("beta", &other)
+	if _, err := seedOf(t, v, nil, SeedOptions{Channel: "beta"}); !isRefused(err) {
+		t.Fatalf("another project's release on the channel: %v", err)
+	}
+	beta := *v.r.Manifest
+	beta.Channel = "beta"
+	v.putRelease("beta", &beta)
+	for _, ch := range []string{"beta", own} {
+		s, err := seedOf(t, v, nil, SeedOptions{Channel: ch})
+		if err != nil {
+			t.Fatalf("%s: %v\n%s", ch, err, v.log)
+		}
+		if st, _ := cloudSettings(t, s.UserData); st.Channel != ch {
+			t.Errorf("%s: channel %q", ch, st.Channel)
+		}
+	}
+}
+
 // awaitedGiven is what the cloud-config's AwaitGivenFile holds; "" when it writes none.
 func awaitedGiven(cc cloudConfig) string {
 	for _, stg := range cc.Stages {

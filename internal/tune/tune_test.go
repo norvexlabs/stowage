@@ -331,10 +331,15 @@ func TestContainerKeepsTheNamespacedSettings(t *testing.T) {
 		t.Errorf("the default profile's container settings are not the host's: %v", c.Sysctls)
 	}
 	c = s.Container(netHost(4096, 2))
-	for k, want := range map[string]string{"net.ipv4.tcp_wmem": "4096 16384 33554432", "net.core.somaxconn": "8192", "net.ipv4.tcp_tw_reuse": "1", "net.ipv4.ip_local_port_range": "10000 65535"} {
+	for k, want := range map[string]string{"net.ipv4.tcp_wmem": "4096 16384 33554432", "net.core.somaxconn": "8192", "net.ipv4.tcp_tw_reuse": "1"} {
 		if c.Sysctls[k] != want {
 			t.Errorf("the network profile's %s = %q, want %q", k, c.Sysctls[k], want)
 		}
+	}
+	// The range of local ports stays the kernel's in a container: a widened one could take a port
+	// a service of its namespace listens on.
+	if v, ok := c.Sysctls["net.ipv4.ip_local_port_range"]; ok {
+		t.Errorf("a container's range of local ports is set: %q", v)
 	}
 	for k := range c.Sysctls {
 		if strings.HasPrefix(k, "vm.") || strings.Contains(k, "netfilter") || strings.Contains(k, "rmem_max") || strings.Contains(k, "neigh") {
@@ -1528,12 +1533,25 @@ func TestTheNICsInterruptsLeaveTheServicesCores(t *testing.T) {
 	if it := find(s.Inspect(ctx, h), "nic", "eth0 interrupts"); it == nil || it.State != Differs || it.Have != "2 of 2 on the services' cores (IRQ 24-25)" || it.Want != "off CPUs 2-3, the services' cores" {
 		t.Errorf("spread onto the services' cores: %+v", it)
 	}
+	// One the last apply found the kernel manages (its write's EIO) is advice: no apply moves it.
+	write(t, s.Root, ManagedIRQFile, "25\n")
+	if it := find(s.Inspect(ctx, h), "nic", "eth0 interrupts"); it == nil || it.State != Differs || !strings.HasPrefix(it.Have, "1 of 2 on the services' cores (IRQ 24), and 1 the kernel manages (IRQ 25: isolcpus=managed_irq,2-3 ") {
+		t.Errorf("one the kernel manages: %+v", it)
+	}
+	write(t, s.Root, ManagedIRQFile, "24 25\n")
+	if it := find(s.Inspect(ctx, h), "nic", "eth0 interrupts"); it == nil || it.State != Advice || it.Have != "2 of 2 on the services' cores (IRQ 24-25), which the kernel manages:" || !strings.HasPrefix(it.Want, "isolcpus=managed_irq,2-3") {
+		t.Errorf("all the kernel manages: %+v", it)
+	}
 	p, err := s.Plan(h)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.Apply(ctx, p, ApplyOptions{}); err != nil {
 		t.Fatal(err)
+	}
+	// The apply moved both: its record of the ones the kernel manages is new, and empty.
+	if got := read(t, s.Root, ManagedIRQFile); got != "\n" {
+		t.Errorf("managed record %q", got)
 	}
 	for irq, cpu := range map[string]string{"24": "0\n", "25": "1\n"} {
 		if got := read(t, s.Root, "proc/irq/"+irq+"/smp_affinity_list"); got != cpu {
@@ -1624,6 +1642,32 @@ func TestTheNICsInterruptsLeaveTheServicesCores(t *testing.T) {
 	}
 	if got := read(t, s.Root, "proc/irq/25/smp_affinity_list"); got != "1-2\n" {
 		t.Errorf("the default profile moved an interrupt: %q", got)
+	}
+}
+
+// A user under /proc's hidepid sees no dockerd: the report says so rather than judge
+// /etc/docker/daemon.json where the engine may read another file. Root, or a visible dockerd, is
+// judged.
+func TestTuneAsAUserWhoSeesNoDockerd(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s, _ := fakeHost(t, "1500")
+	s.Docker, s.Profile = &Docker{}, Network
+	h, _ := s.Host()
+	hidden := func() *Item { return find(s.Inspect(ctx, h), "docker", "daemon.json") }
+	s.Euid = func() int { return 1000 }
+	if it := hidden(); it != nil {
+		t.Errorf("a visible dockerd: %+v", it)
+	}
+	if err := os.Remove(filepath.Join(s.Root, "proc/9000/comm")); err != nil {
+		t.Fatal(err)
+	}
+	if it := hidden(); it == nil || it.State != NA || it.Have != "dockerd is not visible to this user (/proc hidepid)" || it.Want != "run tune as root to judge its file" {
+		t.Errorf("hidden: %+v", it)
+	}
+	s.Euid = func() int { return 0 }
+	if it := hidden(); it != nil {
+		t.Errorf("root: %+v", it)
 	}
 }
 
@@ -2003,6 +2047,24 @@ func TestAppliedForwardingIsNotAdvised(t *testing.T) {
 	}
 	if !slices.Contains(ok, "its forwarding out of uplink applied by each start (tune --apply)") {
 		t.Errorf("ok: %v", ok)
+	}
+}
+
+// Devices not known (the install's record does not read as this user): the forwarding is not
+// judged, never advised with a placeholder for the NIC.
+func TestUnjudgedForwardingIsNotAdvised(t *testing.T) {
+	t.Parallel()
+	s := System{Look: func(string) (string, error) { return "", errors.New("no") }, Interfaces: []Interface{{
+		Role: "vpn0", Kind: "tun", Forward: []string{"uplink"}, Devices: map[string]string{"vpn0": "vpn0", "uplink": ""}, Unjudged: "the record does not read",
+	}}}
+	var got []Item
+	for _, it := range s.inspectInterfaces(context.Background()) {
+		if strings.Contains(it.Have, "forward") {
+			got = append(got, it)
+		}
+	}
+	if len(got) != 1 || got[0].State != NA || got[0].Have != "its forwarding or interception not judged: the record does not read" {
+		t.Errorf("items %+v", got)
 	}
 }
 

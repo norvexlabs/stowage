@@ -11,11 +11,11 @@ import (
 	"github.com/norvexlabs/stowage/internal/spec"
 )
 
-// CloudUploader registers a disk as an image on a cloud, once: Registered is the id of the image
-// already registered ("" when none).
+// CloudUploader registers a disk as an image on a cloud, once: Ensure is the id of the image,
+// registered first (registering called before) when it is not yet, another run registering the
+// same image waited for.
 type CloudUploader interface {
-	Registered(ctx context.Context, img cloud.Image) (string, error)
-	Upload(ctx context.Context, img cloud.Image) (string, error)
+	Ensure(ctx context.Context, img cloud.Image, registering func()) (string, error)
 }
 
 // publishClouds registers, on each cloud of cloud_publish the publisher has settings for, the disk
@@ -50,15 +50,9 @@ func (p *Publisher) publishClouds(ctx context.Context, disks []*artifact) error 
 				return file, h.Hex, err
 			},
 		}
-		id, err := p.Cloud.Registered(ctx, img)
+		id, err := p.Cloud.Ensure(ctx, img, func() { p.logf("cloud %s: register %s", c, name) })
 		if err != nil {
 			return err
-		}
-		if id == "" {
-			p.logf("cloud %s: register %s", c, name)
-			if id, err = p.Cloud.Upload(ctx, img); err != nil {
-				return err
-			}
 		}
 		p.logf("cloud %s: image %s", c, id)
 	}

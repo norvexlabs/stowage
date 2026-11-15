@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/norvexlabs/stowage/internal/command"
 	"github.com/norvexlabs/stowage/internal/spec"
 )
 
@@ -36,8 +37,8 @@ func (c RuntimeCommand) check(images map[string]spec.Image) error {
 	if len(c.Cmd) == 0 {
 		return errors.New("cmd is required")
 	}
-	if c.TimeoutS < 0 {
-		return errors.New("timeout_s must be positive")
+	if err := command.CheckTimeout(c.TimeoutS); err != nil {
+		return err
 	}
 	return nil
 }

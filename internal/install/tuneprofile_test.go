@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/norvexlabs/stowage/internal/spec"
+	"github.com/norvexlabs/stowage/internal/testutil"
 	"github.com/norvexlabs/stowage/internal/tune"
 )
 
@@ -379,5 +380,49 @@ func TestAReportSaysTheRecordDoesNotRead(t *testing.T) {
 	in := e.installer(func(o *Options) { o.Tune = fakeTune(tuneRoot(t), 1000) })
 	if err := in.Tune(context.Background(), TuneOptions{}); err != nil || !strings.Contains(e.log.String(), "note: the install's record does not read") || !strings.Contains(e.out.String(), "the default profile") {
 		t.Errorf("%v\n%s%s", err, e.log, e.out)
+	}
+}
+
+// status run by another release's installer tells the profile of the release the install runs,
+// as the installer the install keeps carries it.
+func TestStatusProfileIsTheInstalledRelease(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	e.r, e.self = testInstallerWith(t, "1.0.0", func(s *spec.Spec) { s.Tune = &spec.Tune{Profile: "network"} })
+	if err := e.install(nil); err != nil {
+		t.Fatalf("%v\n%s", err, e.log)
+	}
+	e.r, e.self = testInstaller(t, "2.0.0")
+	e.out.Reset()
+	if err := e.installer(nil).Status(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(e.out.String(), "\ntune      network (release)\n") {
+		t.Errorf("%s", e.out)
+	}
+	// Without the kept installer, the installed release's profile is unknown, and said so.
+	in := e.installer(nil)
+	if err := os.Remove(in.ctl()); err != nil {
+		t.Fatal(err)
+	}
+	e.out.Reset()
+	if err := in.Status(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(e.out.String(), "\ntune      default (release: unknown, run the installed release's installer)\n") {
+		t.Errorf("%s", e.out)
+	}
+	// A kept installer that does not read is read, and said, once a run.
+	if err := testutil.WriteExecutable(in.ctl(), []byte("not an installer")); err != nil {
+		t.Fatal(err)
+	}
+	in = e.installer(nil)
+	e.log.Reset()
+	get, _ := in.installedEnv()
+	for range 3 {
+		in.tuneProfile(get)
+	}
+	if n := strings.Count(e.log.String(), "the installer the install keeps"); n != 1 {
+		t.Errorf("said %d times:\n%s", n, e.log)
 	}
 }

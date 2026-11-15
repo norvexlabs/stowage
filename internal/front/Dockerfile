@@ -11,6 +11,14 @@ ARG TARGETOS TARGETARCH
 RUN GOOS=$TARGETOS GOARCH=$TARGETARCH xcaddy build v2.11.9 --with github.com/caddy-dns/cloudflare@v0.2.4 --with github.com/mholt/caddy-l4@v0.1.2 \
       --replace golang.org/x/net=golang.org/x/net@v0.62.0 --replace github.com/go-jose/go-jose/v4=github.com/go-jose/go-jose/v4@v4.1.7 \
       --replace github.com/klauspost/compress=github.com/klauspost/compress@v1.20.2
+# A --replace raises a module past what Caddy requires, never lowers it: one Caddy now requires at
+# or past its version is dropped, as it holds Caddy back (go version -m: a `dep` line's version is
+# what the build asked for, the `=>` line under it the replacement's).
+RUN go version -m /usr/bin/caddy | awk 'function n(v, i) { sub(/^v/, "", v); split(v, p, /[.+-]/); return p[i] + 0 } \
+      function ge(a, b,  i) { for (i = 1; i <= 3; i++) if (n(a, i) != n(b, i)) return n(a, i) > n(b, i); return 1 } \
+      $1 == "dep" { m = $2; v = $3; next } \
+      $1 == "=>" && $2 == m && ge(v, $3) { print "Caddy requires " m " " v ": drop the --replace of " m " (" $3 ")"; bad = 1 } \
+      END { exit bad }'
 
 # Caddy's image less what the front never runs (curl and its libraries, the capability tools: the
 # front runs as its own user with no capability, and binds 80 and 443 as its network namespace lets

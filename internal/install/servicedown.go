@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -20,11 +21,15 @@ func (s Service) Down() bool {
 	switch s.State {
 	case "exited":
 		return s.ExitCode != 0
-	case "restarting", "dead", "created", "removing":
+	case "restarting", "dead", "created", "removing", stateMissing:
 		return true
 	}
 	return false
 }
+
+// stateMissing is the state of a service the stack declares that has no container at all (a run
+// that removed it failed before `up` made it again).
+const stateMissing = "missing"
 
 // Why is a down service's state in words: its exit code, whether its memory cgroup killed it, and
 // the memory limit its container ran with.
@@ -37,6 +42,8 @@ func (s Service) Why() string {
 		fmt.Fprintf(&b, "restarting (exited %d%s)", s.ExitCode, signalOf(s.ExitCode))
 	case "created":
 		b.WriteString("created, never started")
+	case stateMissing:
+		b.WriteString("missing: no container")
 	default:
 		b.WriteString(s.State)
 	}
@@ -144,8 +151,11 @@ func sameContainer(a, b string) bool {
 	return a != "" && b != "" && (strings.HasPrefix(a, b) || strings.HasPrefix(b, a))
 }
 
-// stackServices is `compose ps --all` of the install env runs, each service with its facts.
-func (in *Installer) stackServices(ctx context.Context, env *EnvFile) ([]Service, error) {
+// stackServices is `compose ps --all` of the install env runs, each service with its facts, and
+// each service the stack declares that has no container, missing. declared gives what the stack
+// declares (nil: declaredServices, one `compose config` of its own); not read, the list is
+// compose ps's alone, and the log says so.
+func (in *Installer) stackServices(ctx context.Context, env *EnvFile, declared func(context.Context) ([]string, error)) ([]Service, error) {
 	out, err := in.Compose(ctx, env, nil, "ps", "--all", "--format", "json")
 	if err != nil {
 		return nil, fmt.Errorf("compose ps: %w", err)
@@ -154,8 +164,30 @@ func (in *Installer) stackServices(ctx context.Context, env *EnvFile) ([]Service
 	if err != nil {
 		return nil, err
 	}
+	if declared == nil {
+		declared = func(ctx context.Context) ([]string, error) { return in.declaredServices(ctx, env) }
+	}
+	names, err := declared(ctx)
+	if err != nil {
+		in.O.logf("warning: the services the stack declares could not be read (%v): a service with no container is not told", err)
+	}
+	for _, name := range names {
+		if !slices.ContainsFunc(list, func(s Service) bool { return s.Service == name }) {
+			list = append(list, Service{Service: name, State: stateMissing})
+		}
+	}
 	in.serviceFacts(ctx, list)
 	return list, nil
+}
+
+// declaredServices are the services the stack declares as env runs it (`compose config
+// --services`: its profiles on).
+func (in *Installer) declaredServices(ctx context.Context, env *EnvFile) ([]string, error) {
+	out, err := in.Compose(ctx, env, nil, "config", "--services")
+	if err != nil {
+		return nil, fmt.Errorf("compose config --services: %w", err)
+	}
+	return strings.Fields(string(out)), nil
 }
 
 // printDown prints a line for each service down (downOnes), and why.

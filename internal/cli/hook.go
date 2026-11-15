@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -156,11 +157,11 @@ func (o *options) hookShip(ctx context.Context, channel, v, commit string, disks
 	if err != nil {
 		return err
 	}
-	rel, err := relTo(r.Top, root)
+	id, err := r.Commit(commit)
 	if err != nil {
 		return err
 	}
-	id, err := r.Commit(commit)
+	rel, _, err := repoPath(r.Top, id, root, true)
 	if err != nil {
 		return err
 	}
@@ -215,7 +216,7 @@ func (o *options) hookShip(ctx context.Context, channel, v, commit string, disks
 // working tree's top level). A required one absent is refused. specRel is the spec's path in the
 // repository (specInRepo), "" for the project's own.
 func stageUntracked(p *project.Project, r hook.Repo, id, specRel string) ([]string, error) {
-	rel, err := relTo(r.Top, p.Root)
+	rel, _, err := repoPath(r.Top, id, p.Root, true)
 	if err != nil {
 		return nil, err
 	}
@@ -291,7 +292,7 @@ func hookInstallCmd(o *options) *cobra.Command {
 			// Git runs a hook from the working tree's top level: the project is named from there,
 			// so the hook keeps working wherever the clone moves. Git resolves symbolic links in
 			// the top level, so the project's path is resolved too.
-			rel, err := relTo(r.Top, p.Root)
+			rel, _, err := repoPath(r.Top, "HEAD", p.Root, true)
 			if err != nil {
 				return err
 			}
@@ -327,6 +328,46 @@ func hookInstallCmd(o *options) *cobra.Command {
 	return c
 }
 
+// repoPath is path (a directory when dir is set, else a file) relative to the repository's top
+// level top, as the hook ships read it at commit rev: the path as written below the way into the
+// repository (underTop), whose links the commit resolves, when rev records it there; else the
+// path with every link resolved in the working tree (an untracked link to a committed directory).
+// present is whether rev records the path chosen; rel is "" for a path outside the repository.
+func repoPath(top, rev, path string, dir bool) (rel string, present bool, err error) {
+	written, err := underTop(top, path)
+	if err != nil {
+		return "", false, err
+	}
+	resolved, err := relTo(top, path)
+	if err != nil {
+		return "", false, err
+	}
+	if !filepath.IsLocal(resolved) {
+		resolved = ""
+	}
+	for _, c := range []string{written, resolved} {
+		if c == "" {
+			continue
+		}
+		var ok bool
+		switch {
+		case dir && c == ".":
+			ok = true
+		case dir:
+			ok, err = gitcmd.Verify(top, rev+":"+filepath.ToSlash(c))
+		default:
+			_, ok, err = gitcmd.FileAt(top, rev, filepath.ToSlash(c))
+		}
+		if err != nil {
+			return "", false, err
+		}
+		if ok {
+			return c, true, nil
+		}
+	}
+	return cmp.Or(written, resolved), false, nil
+}
+
 // relTo is path relative to top, symbolic links resolved on both sides.
 func relTo(top, path string) (string, error) {
 	t, err := filepath.EvalSymlinks(top)
@@ -340,9 +381,9 @@ func relTo(top, path string) (string, error) {
 	return filepath.Rel(t, p)
 }
 
-// specInRepo is the -f spec's path relative to the repository's top level, "" without -f. A spec
-// outside the repository, or one commit rev does not record, is refused: a hook ship runs in a
-// checkout of the commit, which does not have it.
+// specInRepo is the -f spec's path relative to the repository's top level, "" without -f, as
+// repoPath maps it. A spec outside the repository, or one commit rev does not record, is
+// refused: a hook ship runs in a checkout of the commit, which does not have it.
 func (o *options) specInRepo(r hook.Repo, rev string) (string, error) {
 	if o.specPath == "" {
 		return "", nil
@@ -351,17 +392,41 @@ func (o *options) specInRepo(r hook.Repo, rev string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	rel, err := relTo(r.Top, abs)
+	rel, present, err := repoPath(r.Top, rev, abs, false)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("the spec %s: %w", abs, err)
 	}
-	if !filepath.IsLocal(rel) {
+	if rel == "" {
 		return "", fmt.Errorf("the spec %s is outside the repository: a hook ship runs in a checkout of the commit", abs)
 	}
-	if ok, err := gitcmd.Verify(r.Top, rev+":"+filepath.ToSlash(rel)); err != nil {
-		return "", err
-	} else if !ok {
+	if !present {
 		return "", fmt.Errorf("the spec %s is not committed (at %s): a hook ship runs in a checkout of the commit", abs, rev)
 	}
 	return rel, nil
+}
+
+// underTop is path relative to the top level top: the outermost of its parent directories that
+// resolves (links followed) to top or a directory under it is the way into the repository, taken
+// as it resolves, and every component below it is kept as written, so a link inside the
+// repository is the commit's to resolve; "" when none resolves into the repository.
+func underTop(top, path string) (string, error) {
+	t, err := filepath.EvalSymlinks(top)
+	if err != nil {
+		return "", err
+	}
+	rel := ""
+	for dir := filepath.Dir(path); ; dir = filepath.Dir(dir) {
+		if d, err := filepath.EvalSymlinks(dir); err == nil {
+			if in, err := filepath.Rel(t, d); err == nil && filepath.IsLocal(in) {
+				below, err := filepath.Rel(dir, path)
+				if err != nil {
+					return "", err
+				}
+				rel = filepath.Join(in, below)
+			}
+		}
+		if dir == filepath.Dir(dir) {
+			return rel, nil
+		}
+	}
 }

@@ -256,7 +256,7 @@ func TestL4TLSExposure(t *testing.T) {
 		3: "closed to every source: it asks for a client certificate, and the install holds no client CA (--client-ca)",
 		4: "closed to every source: SHUT_SOURCES is empty",
 	} {
-		if got := in.l4Exposure(r[i], get, nil, in.readHeldCA()); got != want {
+		if got := in.l4Exposure(r[i], get, nil, in.l4FactsOf(context.Background(), get)); got != want {
 			t.Errorf("%s: %q", r[i].Name, got)
 		}
 	}
@@ -268,19 +268,19 @@ func TestL4TLSExposure(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(in.O.Dir, ClientCAFile), []byte("not PEM"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if got := in.l4Exposure(r[3], get, nil, in.readHeldCA()); !strings.HasPrefix(got, "closed to every source: it asks for a client certificate") {
+	if got := in.l4Exposure(r[3], get, nil, in.l4FactsOf(context.Background(), get)); !strings.HasPrefix(got, "closed to every source: it asks for a client certificate") {
 		t.Errorf("admin with a file holding no CA: %q", got)
 	}
 	ca, _ := testRoot(t, true)
 	if err := os.WriteFile(filepath.Join(in.O.Dir, ClientCAFile), ca, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if got := in.l4Exposure(r[3], get, nil, in.readHeldCA()); got != "on every address, TLS by the front for admin.example.test with a client certificate" {
+	if got := in.l4Exposure(r[3], get, nil, in.l4FactsOf(context.Background(), get)); got != "on every address, TLS by the front for admin.example.test with a client certificate" {
 		t.Errorf("admin with a client CA: %q", got)
 	}
 	vals["STOWAGE_TLS_MODE"], vals["DB_DOMAIN"] = Loopback, ""
 	for _, i := range []int{1, 2, 4} { // its allowlist, empty or not, is not the front's there
-		if got := in.l4Exposure(r[i], get, nil, in.readHeldCA()); got != "on the loopback address alone, in the clear: TLS and the sources are the proxy's in front of this install" {
+		if got := in.l4Exposure(r[i], get, nil, in.l4FactsOf(context.Background(), get)); got != "on the loopback address alone, in the clear: TLS and the sources are the proxy's in front of this install" {
 			t.Errorf("loopback %s: %q", r[i].Name, got)
 		}
 	}
@@ -289,14 +289,14 @@ func TestL4TLSExposure(t *testing.T) {
 		t.Fatal(err)
 	}
 	vals["STOWAGE_TLS_MODE"] = "internal"
-	if got := in.l4Exposure(r[3], get, nil, in.readHeldCA()); os.Geteuid() != 0 && !strings.HasPrefix(got, "unknown: the client CA cannot be read: ") {
+	if got := in.l4Exposure(r[3], get, nil, in.l4FactsOf(context.Background(), get)); os.Geteuid() != 0 && !strings.HasPrefix(got, "unknown: the client CA cannot be read: ") {
 		t.Errorf("an unreadable client CA: %q", got)
 	}
 	vals["STOWAGE_TLS_MODE"] = Loopback
 	if err := os.Chmod(filepath.Join(in.O.Dir, ClientCAFile), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if got := in.l4Exposure(r[3], get, nil, in.readHeldCA()); !strings.HasPrefix(got, "closed to every source: it asks for a client certificate, which loopback") {
+	if got := in.l4Exposure(r[3], get, nil, in.l4FactsOf(context.Background(), get)); !strings.HasPrefix(got, "closed to every source: it asks for a client certificate, which loopback") {
 		t.Errorf("loopback client_auth: %q", got)
 	}
 	// On the VM, a route opened on some interfaces alone says so.
@@ -304,7 +304,7 @@ func TestL4TLSExposure(t *testing.T) {
 	in.O.Firewall = t.TempDir()
 	db := r[1]
 	db.Interfaces = []string{"lan"}
-	if got := in.l4Exposure(db, get, nil, in.readHeldCA()); got != "on the interfaces lan alone, TLS by the front for db.example.test" {
+	if got := in.l4Exposure(db, get, nil, in.l4FactsOf(context.Background(), get)); got != "on the interfaces lan alone, TLS by the front for db.example.test" {
 		t.Errorf("on an interface: %q", got)
 	}
 }

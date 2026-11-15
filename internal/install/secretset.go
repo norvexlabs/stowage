@@ -99,7 +99,7 @@ func (in *Installer) SetSecret(ctx context.Context, key, value string) error {
 	} else {
 		env.Set(key, value)
 		in.fileVars(env) // a secret delivered as a file: the new value's path, recorded with it
-		if err := env.WriteFile(in.path(envName)); err != nil {
+		if err := in.writeEnv(env); err != nil {
 			return err
 		}
 		in.O.logf("recorded the new %s: the services reading it are recreated; `secrets export` carries it from now on", key)
@@ -147,6 +147,9 @@ func (in *Installer) K8sShowSecret(ctx context.Context, key string) (string, err
 	}
 	if rel == nil {
 		return "", in.noRelease()
+	}
+	if rel.Status == "uninstalled" {
+		return "", in.uninstalledRelease()
 	}
 	// The release's spec says which secrets are settable: this installer's only when it carries it.
 	cur, err := in.installedRelease(ctx)

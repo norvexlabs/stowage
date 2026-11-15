@@ -74,7 +74,7 @@ func (h *Hostd) lookAtServices(ctx context.Context, w *serviceLooks) {
 	env, err := in.open()
 	var list []Service
 	if err == nil {
-		list, err = in.stackServices(look, env)
+		list, err = in.stackServices(look, env, h.declared(in, env))
 	}
 	if ctx.Err() != nil {
 		return // the daemon stops: no word of a look it cut
@@ -127,7 +127,7 @@ func (h *Hostd) busy(in *Installer) (gen uint64, busy bool) {
 	h.mu.Lock()
 	gen, busy = h.slotGen+h.rebootGen<<32, h.rebooting || h.job != nil && h.job.State == "running"
 	h.mu.Unlock()
-	return gen, busy || lockHeldPassive(in.path(lifecycleLock))
+	return gen, busy || lockHeld(in.path(lifecycleLock))
 }
 
 // skipping logs, once a stretch, that the watch cannot look (err), and that it looks again (nil).

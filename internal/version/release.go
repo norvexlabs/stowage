@@ -80,6 +80,11 @@ type Channel struct {
 // names) are reserved as well and added by TemplateConflicts.
 var ReservedTags = []string{"latest"}
 
+// ReservedPrefix starts the tags Stowage marks held content with (held-<digest's first 12 hex>,
+// in every repository of a project): no channel's pointer or release tag may start with it, or
+// the publisher would take that tag for a mark — never a holder of its content.
+const ReservedPrefix = "held-"
+
 // TemplateConflicts reports what the channels' tag templates allow for ANY version: two channels
 // sharing a template, or a template that spells a reserved tag or a channel pointer tag for some
 // version the scheme accepts. Channels whose template CheckTemplate refuses are left to it. The
@@ -92,6 +97,14 @@ func TemplateConflicts(channels []Channel, s Scheme, reserved []string) ([]strin
 			if i < j && a.Template == b.Template {
 				out = append(out, fmt.Sprintf("channels %s and %s share the tag template %q", a.Name, b.Name, a.Template))
 			}
+		}
+	}
+	for _, c := range channels {
+		if strings.HasPrefix(c.Name, ReservedPrefix) {
+			out = append(out, fmt.Sprintf("channel %s's pointer tag starts with %s, which Stowage's held marks start with", c.Name, ReservedPrefix))
+		}
+		if pre, _, _ := strings.Cut(c.Template, "{v}"); strings.HasPrefix(pre, ReservedPrefix) {
+			out = append(out, fmt.Sprintf("channel %s's tags (%q) start with %s, which Stowage's held marks start with", c.Name, c.Template, ReservedPrefix))
 		}
 	}
 	type reservedTag struct{ tag, what string }
@@ -136,6 +149,10 @@ func VersionConflicts(channels []Channel, s Scheme, v string) ([]string, error) 
 			tag, err := ChannelTag(a.Template, vt, rev)
 			if err != nil {
 				out = append(out, fmt.Sprintf("channel %s: %v", a.Name, err))
+				break
+			}
+			if strings.HasPrefix(tag, ReservedPrefix) {
+				out = append(out, fmt.Sprintf("channel %s tag %q starts with %s, which Stowage's held marks start with", a.Name, tag, ReservedPrefix))
 				break
 			}
 			for _, b := range channels {

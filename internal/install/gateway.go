@@ -14,7 +14,9 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/norvexlabs/stowage/internal/kairos"
@@ -227,8 +229,11 @@ func (in *Installer) forwardRecord() string {
 func (in *Installer) allowChain() string { return "STOWAGE-ALW-" + in.gatewayDigest() }
 
 // allowRecord is where allowSources records the rules it gave allowChain, beside forwardRecord.
-func (in *Installer) allowRecord() string {
-	return filepath.Join(in.O.gatewayRun(), in.R.Spec.Name+"-gateway-"+in.gatewayDigest()+"-allow.rules")
+func (in *Installer) allowRecord() string { return in.allowRecordOf(in.gatewayDigest()) }
+
+// allowRecordOf is allowRecord of the install whose gateway digest is digest.
+func (in *Installer) allowRecordOf(digest string) string {
+	return filepath.Join(in.O.gatewayRun(), in.R.Spec.Name+"-gateway-"+digest+"-allow.rules")
 }
 
 // allowHeld marks the allowlists held: written by a start as root once it applied them, saw
@@ -253,17 +258,56 @@ func heldMark(rules map[string][]byte) string {
 	return fmt.Sprintf("sha256:%x\n", sha256.Sum256(chainRecord(rules)))
 }
 
-// allowHolds reports whether the allowlists the release and get give are those a start as root
-// applied and saw hold (allowHeld): a start not as root, which applies nothing, after an upgrade
-// or a change of values leaves another mark.
-func (in *Installer) allowHolds(get func(string) string) bool {
+// allowState reports whether the allowlists the release and get give are those the held mark
+// (allowHeld) records (marked), and whether they also hold (holds): DOCKER-USER still jumps to
+// their chain. A start not as root, which applies nothing, after an upgrade or a change of values
+// leaves another mark. The rules are computed once, and the jump read once.
+func (in *Installer) allowState(ctx context.Context, get func(string) string) (marked, holds bool) {
 	rules, err := in.heldRules(in.allowChain(), get)
 	if err != nil || rules == nil {
-		return false
+		return false, false
 	}
 	mark, err := os.ReadFile(in.allowHeld())
-	return err == nil && string(mark) == heldMark(rules)
+	if err != nil || string(mark) != heldMark(rules) {
+		return false, false
+	}
+	return true, in.chainJumped(ctx, in.allowChain(), rules)
 }
+
+// allowHolds is allowState's holds.
+func (in *Installer) allowHolds(ctx context.Context, get func(string) string) bool {
+	_, holds := in.allowState(ctx, get)
+	return holds
+}
+
+// jumpWait bounds, in seconds, a check that DOCKER-USER jumps to a chain: iptables's wait for the
+// xtables lock (-w), and the check itself, twice that.
+const jumpWait = 5
+
+// chainJumped reports whether DOCKER-USER still jumps to chain in each table rules give rules to
+// (ip6tables on a kernel with IPv6): a host firewall's reload (firewall-cmd --reload) flushes the
+// jump while the record and the marks under /run stay. Read as root alone: not as root, iptables
+// does not read, and the marks are taken as they are.
+func (in *Installer) chainJumped(ctx context.Context, chain string, rules map[string][]byte) bool {
+	if in.O.euid() != 0 {
+		return true
+	}
+	for _, t := range slices.Sorted(maps.Keys(rules)) {
+		if _, err := os.Stat(ipv6Proc); t == "ip6tables" && err != nil {
+			continue
+		}
+		cctx, cancel := context.WithTimeout(ctx, 2*jumpWait*time.Second)
+		_, err := in.O.host().Run(cctx, Cmd{Args: []string{t, "-w", strconv.Itoa(jumpWait), "-C", "DOCKER-USER", "-j", chain}})
+		cancel()
+		if err != nil {
+			return false
+		}
+	}
+	return true
+}
+
+// unjumped is what status says of a chain a start applied that DOCKER-USER no longer jumps to.
+const unjumped = "not applied (DOCKER-USER no longer jumps to it: the host's firewall reloaded; the next start as root applies it again)"
 
 // allowRoutes are the names of the L4 routes with a source allowlist (allow_input), which a
 // consented Docker host enforces (allowRules).
@@ -640,6 +684,13 @@ func (in *Installer) allowSources(ctx context.Context, get func(string) string, 
 	if err := os.Remove(in.allowHeld()); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("%s: %w", what, err)
 	}
+	// A start (an upgrade's too) writes this release's routes, which may now share a port with
+	// another install's: refused before its rules are written, as at the consent.
+	if !boot {
+		if err := in.sharedPorts(in.allowRecord(), get); err != nil {
+			return err
+		}
+	}
 	err := in.allowBound(get)
 	var rules map[string][]byte
 	if err == nil {
@@ -941,13 +992,16 @@ func (in *Installer) gatewayUnit() (name, content string) {
 
 // gatewayTablesUnit is the boot unit of a consented Docker install that loads the services' tables
 // the last start loaded (tables-boot) before Docker restores their containers, once the network
-// is up (a table may name a device by its index).
+// is up (a table may name a device by its index). It is inert under an installer that does not
+// know it (a rollback to a release built by an earlier Stowage): it runs only while the install
+// keeps its gateway record. Its failure is the unit's (systemctl shows it failed); no other unit
+// requires it, and the start loads the tables after it.
 func (in *Installer) gatewayTablesUnit() (name, content string) {
 	dir := in.gatewayDir()
 	name = in.gatewayTablesUnitName(in.gatewayDigest())
 	ctl := filepath.Join(dir, in.R.Ctl())
-	return name, fmt.Sprintf("[Unit]\nDescription=%s (%s): the services' nftables tables and the L4 routes' source allowlists, before Docker restores their containers (tune --apply)\nAfter=network-online.target\nWants=network-online.target\nBefore=docker.service\n\n[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=%s %s --dir %s\n\n[Install]\nWantedBy=multi-user.target\n",
-		in.R.Spec.Name, systemdText(dir), systemdArg(ctl), tablesBootCmd, systemdArg(dir))
+	return name, fmt.Sprintf("[Unit]\nDescription=%s (%s): the services' nftables tables and the L4 routes' source allowlists, before Docker restores their containers (tune --apply)\nConditionPathExists=%s\nAfter=network-online.target\nWants=network-online.target\nBefore=docker.service\n\n[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=%s %s --dir %s\n\n[Install]\nWantedBy=multi-user.target\n",
+		in.R.Spec.Name, systemdText(dir), systemdText(filepath.Join(dir, GatewayFile)), systemdArg(ctl), tablesBootCmd, systemdArg(dir))
 }
 
 // systemdArg is s as one argument of a unit's ExecStart: double-quoted, its backslashes and quotes
@@ -1026,6 +1080,12 @@ func (in *Installer) consent(ctx context.Context) error {
 	recorded := in.gatewayRecorded()
 	rec := prev
 	rec.Digest = in.digestOf(prev)
+	if err := in.otherConsents(rec.Digest); err != nil {
+		return err
+	}
+	if err := in.sharedPorts(in.allowRecordOf(rec.Digest), get); err != nil {
+		return err
+	}
 	rec.Revoked, rec.Dir = false, cmp.Or(prev.Dir, in.gatewayDir())
 	undo, err := in.writeUnits(ctx, true)
 	if err != nil {
@@ -1040,6 +1100,85 @@ func (in *Installer) consent(ctx context.Context) error {
 	}
 	return nil
 }
+
+// otherConsents refuses a consent beside another install of the project standing on this host
+// (its boot unit, of another digest, is in the units' directory), whose tables and sets carry the
+// same names.
+func (in *Installer) otherConsents(digest string) error {
+	name, ctl := in.R.Spec.Name, in.R.Ctl()
+	units, _ := filepath.Glob(filepath.Join(in.O.systemd(), name+"-gateway-*.service"))
+	for _, u := range units {
+		base := filepath.Base(u)
+		d := strings.TrimSuffix(strings.TrimPrefix(base, name+"-gateway-"), ".service")
+		if hexDigest.MatchString(d) && d != digest {
+			tables := in.gatewayTablesUnitName(d)
+			return refuse(fmt.Sprintf("`%s tune --revert` in that install's directory first (`systemctl cat %s` names it); that directory gone, `sudo systemctl disable %s %s && sudo rm -f %s %s && sudo systemctl daemon-reload` removes its units",
+				ctl, base, base, tables, u, filepath.Join(in.O.systemd(), tables)),
+				"another install of %s on this host holds the consent (its boot unit %s): two installs of one project would share their tables' names", name, base)
+		}
+	}
+	return nil
+}
+
+// sharedPorts refuses this install's allowlisted routes (their ports and bind addresses, as get
+// reads them) sharing a port with another install's allowlists on this host (their records in the
+// runtime directory but own, this install's): the chain of either drops every source of the port,
+// on every address, while its values do not read. Two routes bound to two addresses share none;
+// one bound to none shares every address. The consent and every start that writes the
+// allowlists check it.
+func (in *Installer) sharedPorts(own string, get func(string) string) error {
+	var mine []portHold
+	for _, h := range in.holds(get) {
+		if h.allow != "" {
+			mine = append(mine, h)
+		}
+	}
+	if len(mine) == 0 {
+		return nil
+	}
+	records, _ := filepath.Glob(filepath.Join(in.O.gatewayRun(), "*-gateway-*-allow.rules"))
+	for _, f := range records {
+		if f == own {
+			continue
+		}
+		raw, err := os.ReadFile(f)
+		if err != nil {
+			return fmt.Errorf("another install's allowlists record: %w", err)
+		}
+		for _, m := range heldPort.FindAllStringSubmatch(string(raw), -1) {
+			proto, port, addr := m[1], m[2], m[3]
+			if i := slices.IndexFunc(mine, func(h portHold) bool {
+				return h.protocol == proto && fmt.Sprint(h.port) == port && bindsOverlap(h.bind, addr)
+			}); i >= 0 {
+				return refuse("give one of the two routes another port or bind address, or `tune --revert` in the other install's directory",
+					"l4 route %s: port %s/%s is also held by the install whose allowlists %s records: two installs' allowlists cannot share a port", mine[i].name, port, proto, f)
+			}
+		}
+	}
+	return nil
+}
+
+// bindsOverlap reports whether two bind addresses share an address: none (every address) shares
+// all, an unspecified one (0.0.0.0, ::) every address of its family, two others when equal.
+func bindsOverlap(a, b string) bool {
+	if a == "" || b == "" {
+		return true
+	}
+	x, errA := netip.ParseAddr(a)
+	y, errB := netip.ParseAddr(b)
+	if errA != nil || errB != nil {
+		return a == b
+	}
+	x, y = x.Unmap(), y.Unmap()
+	if x.IsUnspecified() || y.IsUnspecified() {
+		return x.Is4() == y.Is4()
+	}
+	return x == y
+}
+
+// heldPort matches a rule of an allow chain (holdRules): its protocol, published port, and the
+// address it is bound to, when it is.
+var heldPort = regexp.MustCompile(`(?m)^-A \S+ -p (\w+) -m conntrack --ctstate DNAT --ctdir ORIGINAL --ctorigdstport (\d+)(?: --ctorigdst (\S+))?`)
 
 // writeUnits writes and enables the consented install's boot units (gatewayUnit,
 // gatewayTablesUnit), each written only when its content differs, and enabled when one was written
@@ -1250,7 +1389,7 @@ func (in *Installer) dropChain(ctx context.Context, chain, record string) error 
 
 // gatewayStatus describes, for `status` on a Docker host, whether the declarations are applied:
 // empty when the release declares none and no consent stands.
-func (in *Installer) gatewayStatus(get func(string) string) string {
+func (in *Installer) gatewayStatus(ctx context.Context, get func(string) string) string {
 	recorded := in.gatewayRecorded()
 	if in.O.Firewall != "" || !in.gatewayDeclared() && !recorded {
 		return ""
@@ -1272,8 +1411,10 @@ func (in *Installer) gatewayStatus(get func(string) string) string {
 		applied = append(applied, "tables "+strings.Join(loaded, ", "))
 	}
 	switch rules, _ := in.forwardTables(get); {
-	case in.forwardApplied(get):
+	case in.forwardApplied(ctx, get):
 		applied = append(applied, "forwarding")
+	case in.forwardMarked(get):
+		notYet = append(notYet, "forwarding "+unjumped)
 	case rules == nil && fileExists(in.forwardRecord()):
 		notYet = append(notYet, "forwarding left (the next start as root removes it)")
 	case rules != nil:
@@ -1285,13 +1426,25 @@ func (in *Installer) gatewayStatus(get func(string) string) string {
 	if unheld := in.unheldRoles(get); len(unheld) > 0 {
 		notYet = append(notYet, "no client through "+strings.Join(unheld, ", ")+" to the ports held to it (no NIC named: --interface)")
 	}
-	switch routes, held := strings.Join(in.allowRoutes(), ", "), strings.Join(in.heldNamesIn(get), ", "); {
-	case (routes != "" || held != "") && in.allowHolds(get):
+	routes, held := strings.Join(in.allowRoutes(), ", "), strings.Join(in.heldNamesIn(get), ", ")
+	var marked, holds bool
+	if routes != "" || held != "" {
+		marked, holds = in.allowState(ctx, get)
+	}
+	switch {
+	case (routes != "" || held != "") && holds:
 		if routes != "" {
 			applied = append(applied, "source allowlists of "+routes)
 		}
 		if held != "" {
 			applied = append(applied, "interfaces of "+held)
+		}
+	case (routes != "" || held != "") && marked:
+		if routes != "" {
+			notYet = append(notYet, "source allowlists of "+routes+" "+unjumped)
+		}
+		if held != "" {
+			notYet = append(notYet, "interfaces of "+held+" "+unjumped)
 		}
 	case routes != "" || held != "":
 		if routes != "" {

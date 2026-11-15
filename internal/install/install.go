@@ -26,6 +26,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -204,6 +205,9 @@ func (o *Options) bootID() string { return readBootID(cmp.Or(o.BootIDFile, kerne
 type Installer struct {
 	R *Release
 	O Options
+	// keptSpecs holds recordedSpec's reads of the kept installer, by release ("name version
+	// revision"): each read, and its error logged, once per run (keptCache makes it).
+	keptSpecs *sync.Map
 	// k8sHeld is what the release's Secret and its secret files' one held when k8sRecorded read them.
 	k8sHeld struct {
 		env   map[string]bool
@@ -269,11 +273,6 @@ type Installer struct {
 	// givenCA: the registry's CA is --registry-ca alone, never one recorded in a directory — the
 	// commands that keep no install (k8s, mirror, vm create).
 	givenCA bool
-	// wroteDockerCA is the Docker daemon's CA file this run wrote, which a first install that
-	// fails removes again.
-	wroteDockerCA string
-	// madeDockerCADirs are the directories this run made for it, deepest first.
-	madeDockerCADirs []string
 }
 
 // input is one value a first install records, and its check beyond the .env rule.
@@ -440,12 +439,6 @@ func (in *Installer) Install(ctx context.Context) (err error) {
 	// Until .env is written no install owns what this run wrote: a failure removes it.
 	certWritten, caWritten, clientCAWritten := false, false, false
 	unwritten := func(err error) error {
-		if in.wroteDockerCA != "" {
-			_ = os.Remove(in.wroteDockerCA)
-		}
-		for _, d := range in.madeDockerCADirs {
-			_ = os.Remove(d) // only when empty
-		}
 		switch {
 		case in.removeDir:
 			_ = os.RemoveAll(dir)
@@ -492,7 +485,7 @@ func (in *Installer) Install(ctx context.Context) (err error) {
 	if err := os.WriteFile(in.path(installingFile), nil, 0o600); err != nil {
 		return unwritten(err)
 	}
-	if err := env.WriteFile(in.path(envName)); err != nil {
+	if err := in.writeEnv(env); err != nil {
 		return unwritten(err)
 	}
 	o.logf("wrote %s", in.path(envName))
@@ -768,12 +761,30 @@ func (in *Installer) bindHere(routes []spec.L4Route, value func(string) string) 
 	}
 	for _, r := range routes {
 		a := bindAddr(r, value)
-		if a == "" || slices.ContainsFunc(addrs, func(h string) bool { b, err := netip.ParseAddr(h); return err == nil && b.Unmap().String() == a }) {
+		if a == "" || hostHolds(addrs, a) {
 			continue
 		}
 		return refuse("give "+r.BindInput+" an address of this host", "%s (%s, the L4 route %s's address) is not an address of this host", value(r.BindInput), r.BindInput, r.Name)
 	}
 	return nil
+}
+
+// hostHolds reports whether the host whose interfaces hold addrs answers on a: one of them, or an
+// IPv4 loopback address when the host lists one (Linux answers on all of 127.0.0.0/8).
+func hostHolds(addrs []string, a string) bool {
+	want, err := netip.ParseAddr(a)
+	if err != nil {
+		return false
+	}
+	want = want.Unmap()
+	return slices.ContainsFunc(addrs, func(h string) bool {
+		b, err := netip.ParseAddr(h)
+		if err != nil {
+			return false
+		}
+		b = b.Unmap()
+		return b == want || b.Is4() && b.IsLoopback() && want.Is4() && want.IsLoopback()
+	})
 }
 
 func (in *Installer) publish(mode string) (publish, error) {
@@ -847,9 +858,9 @@ func (in *Installer) portsFree(p publish) error {
 		return nil
 	}
 	if p.all { // a TLS front
-		return refuse(in.flagFix("choose free ports with --http-port and --https-port"), "port(s) %s already in use on this host: choose others with --http-port and --https-port", strings.Join(busy, ", "))
+		return refuse(in.flagFix("choose free ports with --http-port and --https-port"), "port(s) %s already in use on this host%s", strings.Join(busy, ", "), in.flagFix(": choose others with --http-port and --https-port"))
 	}
-	return refuse(in.flagFix("choose free ports with --ports ROUTE=PORT"), "port(s) %s already in use on %s: choose others with --ports", strings.Join(busy, ", "), p.addr)
+	return refuse(in.flagFix("choose free ports with --ports ROUTE=PORT"), "port(s) %s already in use on %s%s", strings.Join(busy, ", "), p.addr, in.flagFix(": choose others with --ports"))
 }
 
 // decide computes every value a first install records, and checks each can be recorded. It returns
@@ -1042,15 +1053,23 @@ func (in *Installer) rerun(ctx context.Context) (err error) {
 		return err
 	}
 	in.recordInputKeys(next, env)
-	if err := next.WriteFile(in.path(envName)); err != nil {
+	if err := in.writeEnv(next); err != nil {
 		return err
 	}
-	o.logf("recorded the changes in %s; %s holds the values the stack last came up with", in.path(envName), in.path(envPrev))
+	// No .env.prev under a change marker: the change before was an upgrade whose start did not
+	// come up, and no values of this release ever did.
+	before := fmt.Sprintf("%s holds the values the stack last came up with", in.path(envPrev))
+	back := ": a re-run giving them goes back"
+	if !fileExists(in.path(envPrev)) {
+		before = "no values of this release have come up yet (the upgrade to it did not)"
+		back = fmt.Sprintf(": `%s rollback --dir %s` goes back to the release before, when it is kept", in.ctl(), o.Dir)
+	}
+	o.logf("recorded the changes in %s; %s", in.path(envName), before)
 	recorded := func(err error) error {
 		if err == nil {
 			return nil
 		}
-		return fmt.Errorf("%w\nthe changes are recorded; %s holds the values the stack last came up with: a re-run giving them goes back", err, in.path(envPrev))
+		return fmt.Errorf("%w\nthe changes are recorded; %s%s", err, before, back)
 	}
 	if err := in.writeStack(next); err != nil {
 		return recorded(err)
@@ -1481,6 +1500,14 @@ func (in *Installer) up(ctx context.Context, env *EnvFile) (err error) {
 	if err != nil {
 		return err
 	}
+	// A start never lets Compose pull (`up --pull never`): an image pinned by digest the engine no
+	// longer holds (pruned since) is pulled first, so what the start reads of it (EXPOSE) is there.
+	if gone, seen := in.goneOf(ctx, env); len(gone) > 0 {
+		in.O.logf("%s left the engine: pulling again", strings.Join(gone, ", "))
+		if err := in.fetchList(ctx, env, in.stackImages(env), seen); err != nil {
+			return err
+		}
+	}
 	// What the start adds to the services and opens in the firewall, written again after a pull
 	// that brought back an image whose EXPOSE it reads.
 	prepare := func() error {
@@ -1559,15 +1586,20 @@ func (in *Installer) up(ctx context.Context, env *EnvFile) (err error) {
 				return err
 			}
 		}
-		if !early {
-			if _, err := in.O.Docker.Run(ctx, Cmd{Args: append(in.composeBase(), "up", "--no-start", "--remove-orphans"), Env: environ, Stream: in.O.Log}); err != nil {
+		// Only the services mounting those volumes are made, with what they need of others (a
+		// network namespace, volumes_from, depends_on: Compose makes those too): the rest of a
+		// running stack runs on until the start below.
+		made := volumeServices(m, names, missing)
+		if !early && len(made) > 0 {
+			args := append(append(in.composeBase(), "up", "--no-start", "--pull", "never"), made...)
+			if _, err := in.O.Docker.Run(ctx, Cmd{Args: args, Env: environ, Stream: in.O.Log}); err != nil {
 				return err
 			}
 		}
 		if len(names) > 0 {
 			given, err := in.ownVolumes(ctx, env, names, uids)
 			if err != nil {
-				return err
+				return fmt.Errorf("%w: %s stays created, not started; a re-run of the install gives the volumes their uid and starts the stack", err, strings.Join(made, ", "))
 			}
 			if given {
 				if err := in.writePending(keep); err != nil {
@@ -1589,7 +1621,7 @@ func (in *Installer) up(ctx context.Context, env *EnvFile) (err error) {
 		if in.O.Log != nil {
 			w = io.MultiWriter(in.O.Log, &out)
 		}
-		if _, err := in.O.Docker.Run(ctx, Cmd{Args: append(in.composeBase(), "up", "--detach", "--wait", "--remove-orphans"), Env: environ, Stream: w}); err != nil {
+		if _, err := in.O.Docker.Run(ctx, Cmd{Args: append(in.composeBase(), "up", "--detach", "--wait", "--remove-orphans", "--pull", "never"), Env: environ, Stream: w}); err != nil {
 			return in.settle(ctx, env, out.Bytes(), err)
 		}
 		return nil
@@ -1622,7 +1654,7 @@ func (in *Installer) up(ctx context.Context, env *EnvFile) (err error) {
 		in.O.logf("warning: removing the files of the inputs' earlier values: %v", err)
 	}
 	get := func(k string) string { v, _ := env.Get(k); return v }
-	ca := in.readHeldCA()
+	ca := in.l4FactsOf(ctx, get)
 	for _, r := range in.R.Spec.L4.Routes {
 		if e := in.l4Exposure(r, get, off, ca); e != "" {
 			in.O.logf("L4 route %s: %s/%d %s", r.Name, r.Protocol, r.Port, e)
@@ -1857,7 +1889,7 @@ func (in *Installer) l4Clash(p publish) error {
 				if p.all {
 					flag = "--" + k + "-port"
 				}
-				return refuse(in.flagFix("choose another port with "+flag), "the front's %s port %d is the L4 route %s's: choose another with %s", k, r.Port, r.Name, flag)
+				return refuse(in.flagFix("choose another port with "+flag), "the front's %s port %d is the L4 route %s's%s", k, r.Port, r.Name, in.flagFix(": choose another with "+flag))
 			}
 		}
 	}
@@ -2029,7 +2061,7 @@ func bindAddr(r spec.L4Route, get func(string) string) string {
 // whose firewall applies the route's allowlist.
 // ca is the install's client CA as the front reads it (heldClientCA, read once by the caller for
 // all the routes' lines).
-func (in *Installer) l4Exposure(r spec.L4Route, get func(string) string, off []string, ca heldCA) string {
+func (in *Installer) l4Exposure(r spec.L4Route, get func(string) string, off []string, ca l4Facts) string {
 	name, _, _ := strings.Cut(r.Upstream, ":")
 	where, open, hint := "on every address", ", open to whoever reaches this host", ""
 	if slices.Contains(off, name) {
@@ -2049,7 +2081,7 @@ func (in *Installer) l4Exposure(r spec.L4Route, get func(string) string, off []s
 		hint = " (" + r.BindInput + " gives it one address)"
 	}
 	switch {
-	case r.AllowInput != "" && in.gatewayConsented() && in.allowHolds(get):
+	case r.AllowInput != "" && in.gatewayConsented() && ca.allowHolds != nil && ca.allowHolds():
 		if where == "on every address" {
 			where = "on IPv4's every address"
 		}
@@ -2065,16 +2097,19 @@ func (in *Installer) l4Exposure(r spec.L4Route, get func(string) string, off []s
 	return where + open + hint
 }
 
-// heldCA is the install's client CA as heldClientCA reads it, or why it could not.
-type heldCA struct {
-	certs []byte
-	err   error
+// l4Facts are what the L4 routes' lines read of the install once for them all: its client CA as
+// heldClientCA reads it, or why it could not, and whether its allowlists hold (allowHolds), read
+// once when a line asks (nil: they do not).
+type l4Facts struct {
+	certs      []byte
+	err        error
+	allowHolds func() bool
 }
 
-// readHeldCA is heldClientCA's answer, for the L4 routes' status lines.
-func (in *Installer) readHeldCA() heldCA {
+// l4FactsOf reads the l4Facts of the install, as get gives its values.
+func (in *Installer) l4FactsOf(ctx context.Context, get func(string) string) l4Facts {
 	c, err := in.heldClientCA(false)
-	return heldCA{c, err}
+	return l4Facts{c, err, sync.OnceValue(func() bool { return in.allowHolds(ctx, get) })}
 }
 
 // heldClientCA is the install's client CA (--client-ca) as the front reads it: its CA
@@ -2107,7 +2142,7 @@ func (in *Installer) heldClientCA(logIt bool) ([]byte, error) {
 // and who decides its sources: the front, by the route's allowlist; on the VM the firewall opens
 // the port to every source, and on Docker nothing filters it before the front. In loopback mode,
 // plaintext on the loopback address alone.
-func (in *Installer) l4TLSExposure(r spec.L4Route, get func(string) string, ca heldCA) string {
+func (in *Installer) l4TLSExposure(r spec.L4Route, get func(string) string, ca l4Facts) string {
 	tls := get("STOWAGE_TLS_MODE") != Loopback
 	domain := ""
 	if tls {
@@ -2508,16 +2543,21 @@ func (in *Installer) forwardRoles(ctx context.Context, get func(string) string) 
 		in.O.logf("warning: host.interfaces.%s: no NIC of this host plays it (`--interface %s=<NIC>` on a re-run names one): the forwarding through it is not applied", r, r)
 	}
 	const what = "the forwarding between the host's interfaces"
+	// Its mark first: a mark from an earlier start says nothing of an engine that changed, and
+	// is written only once every table took the rules.
+	mark := appliedMark(in.forwardRecord())
+	if err := os.Remove(mark); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("%s: %w", what, err)
+	}
 	if in.O.Firewall == "" && rules != nil {
-		// Its mark first: a mark from an earlier start says nothing of an engine that changed.
-		if err := os.Remove(appliedMark(in.forwardRecord())); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("%s: %w", what, err)
-		}
 		if err := in.dockerUserReached(ctx, what); err != nil {
 			return err
 		}
 	}
-	return in.applyChain(ctx, chain, in.forwardRecord(), rules, what, false)
+	if err := in.applyChain(ctx, chain, in.forwardRecord(), rules, what, false); err != nil || rules == nil {
+		return err
+	}
+	return writeAtomic(mark, bytes.NewReader(chainRecord(rules)), 0o644, nil)
 }
 
 // applyChain gives chain, which DOCKER-USER jumps to, its rules by table (iptables, ip6tables: a
@@ -2540,11 +2580,7 @@ func (in *Installer) applyChain(ctx context.Context, chain, record string, rules
 		tables = tables[:1] // a kernel without IPv6: Docker keeps no ip6tables chain either
 	}
 	// The record goes first, as what the chain may hold: a start that fails here leaves it, so a
-	// later one with no rules still removes the chain; its applied mark (appliedMark) only once
-	// every table took the rules.
-	if err := os.Remove(appliedMark(record)); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("%s: %w", what, err)
-	}
+	// later one with no rules still removes the chain.
 	if err := os.MkdirAll(filepath.Dir(record), 0o755); err != nil {
 		return err
 	}
@@ -2576,7 +2612,7 @@ func (in *Installer) applyChain(ctx context.Context, chain, record string, rules
 			return fmt.Errorf("%s (%s's DOCKER-USER): %w", what, t, err)
 		}
 	}
-	return writeAtomic(appliedMark(record), bytes.NewReader(chainRecord(rules)), 0o644, nil)
+	return nil
 }
 
 // forwardTables are the forwarding chain's rules by table (forwardRules, the same for IPv4 and
@@ -2590,15 +2626,22 @@ func (in *Installer) forwardTables(get func(string) string) (map[string][]byte, 
 }
 
 // forwardApplied reports whether the forwarding the release and get give is the one a start
+// applied whole (forwardMarked) and DOCKER-USER still jumps to (chainJumped).
+func (in *Installer) forwardApplied(ctx context.Context, get func(string) string) bool {
+	rules, _ := in.forwardTables(get)
+	return in.forwardMarked(get) && in.chainJumped(ctx, in.forwardChain(), rules)
+}
+
+// forwardMarked reports whether the forwarding the release and get give is the one a start
 // applied whole (its applied mark), the pairs through a role no device plays left out.
-func (in *Installer) forwardApplied(get func(string) string) bool {
+func (in *Installer) forwardMarked(get func(string) string) bool {
 	rules, _ := in.forwardTables(get)
 	mark, err := os.ReadFile(appliedMark(in.forwardRecord()))
 	return err == nil && rules != nil && bytes.Equal(mark, chainRecord(rules))
 }
 
-// appliedMark is where applyChain marks record's rules applied, every table having taken them:
-// what status and tune read as in force.
+// appliedMark is where forwardRoles marks the forwarding's rules applied, every table having
+// taken them: what status and tune read as in force.
 func appliedMark(record string) string { return record + ".applied" }
 
 // chainRecord is what applyChain records of rules: the iptables then the ip6tables ones, nil for
@@ -2724,7 +2767,7 @@ func (in *Installer) Status(ctx context.Context) error {
 	fmt.Fprintf(in.O.Out, "%s %s (revision %s)\nregistry  %s\n", get("STOWAGE_NAME"), get("STOWAGE_PROJECT_VERSION"), get("STOWAGE_REVISION"), get("STOWAGE_REGISTRY"))
 	p, by := in.tuneProfile(get)
 	fmt.Fprintf(in.O.Out, "%-9s %s (%s)\n", "tune", p, by)
-	if g := in.gatewayStatus(get); g != "" {
+	if g := in.gatewayStatus(ctx, get); g != "" {
 		fmt.Fprintf(in.O.Out, "%-9s %s\n", "gateway", g)
 	}
 	split := in.volumesSplit()
@@ -2746,7 +2789,7 @@ func (in *Installer) Status(ctx context.Context) error {
 	if err != nil {
 		fmt.Fprintf(in.O.Out, "warning: the services whose profiles are off could not be read: %v\n", err)
 	}
-	ca := in.readHeldCA()
+	ca := in.l4FactsOf(ctx, get)
 	for _, r := range in.R.Spec.L4.Routes {
 		line := strings.TrimSpace(fmt.Sprintf("%s/%d %s", r.Protocol, r.Port, get(spec.L4Var(r.Name))))
 		if e := in.l4Exposure(r, get, off, ca); e != "" {
@@ -2783,7 +2826,7 @@ func (in *Installer) Status(ctx context.Context) error {
 		return err
 	}
 	// Compose's table says exited; the services down are told apart from one-shots that finished.
-	list, err := in.stackServices(ctx, env)
+	list, err := in.stackServices(ctx, env, nil)
 	if err != nil {
 		fmt.Fprintf(in.O.Out, "warning: which services are down could not be read: %v\n", err)
 		return nil
@@ -3184,16 +3227,37 @@ func (in *Installer) stackImages(env *EnvFile) []image {
 // goneImages are the release's images pinned by digest that the engine does not hold (an
 // offline install's, recorded by tag, are never pulled: none).
 func (in *Installer) goneImages(ctx context.Context, env *EnvFile) []string {
+	gone, _ := in.goneOf(ctx, env)
+	return gone
+}
+
+// goneOf is goneImages with what each image it inspected answered, which fetchList takes so it
+// inspects none of them again.
+func (in *Installer) goneOf(ctx context.Context, env *EnvFile) ([]string, map[string]inspected) {
 	var gone []string
+	seen := map[string]inspected{}
 	for _, im := range in.stackImages(env) {
 		if !im.pinned() {
 			continue
 		}
-		if _, err := in.O.Docker.Run(ctx, Cmd{Args: []string{"image", "inspect", "--format", "{{.Id}}", im.ref}}); err != nil {
+		seen[im.ref] = in.inspectImage(ctx, im.ref)
+		if seen[im.ref].err != nil {
 			gone = append(gone, im.ref)
 		}
 	}
-	return gone
+	return gone, seen
+}
+
+// inspected is an image's ID as the engine answered, or why it did not.
+type inspected struct {
+	id  string
+	err error
+}
+
+// inspectImage asks the engine for the image ref's ID.
+func (in *Installer) inspectImage(ctx context.Context, ref string) inspected {
+	out, err := in.O.Docker.Run(ctx, Cmd{Args: []string{"image", "inspect", "--format", "{{.Id}}", ref}})
+	return inspected{strings.TrimSpace(string(out)), err}
 }
 
 // fetchImages makes every image the recorded file names present. One pinned by digest that is
@@ -3202,10 +3266,32 @@ func (in *Installer) goneImages(ctx context.Context, env *EnvFile) []string {
 // the release manifest records. Which applies is decided by what was recorded at the first
 // install, not by this run's flags.
 func (in *Installer) fetchImages(ctx context.Context, env *EnvFile) error {
+	return in.fetchList(ctx, env, in.stackImages(env), nil)
+}
+
+// recordedImages are the images env records by digest (the front's, the volume helper's and each
+// of the stack's): what a release whose spec this installer does not read runs, as its record
+// tells it. None for a record by tag (an offline install's: loaded, never pulled).
+func recordedImages(env *EnvFile) []image {
+	var out []image
+	for _, k := range env.Keys() {
+		if v, _ := env.Get(k); (k == FrontImageVar || k == ChownImageVar || strings.HasPrefix(k, "STOWAGE_IMAGE_")) && strings.Contains(v, "@sha256:") {
+			out = append(out, image{ref: v})
+		}
+	}
+	return out
+}
+
+// fetchList is fetchImages of the images list, env recording the registry they come from; seen
+// is what the engine answered already for some of them (goneOf), never asked again.
+func (in *Installer) fetchList(ctx context.Context, env *EnvFile, list []image, seen map[string]inspected) error {
 	var missing, unloaded, wrong []string
-	for _, im := range in.stackImages(env) {
-		out, err := in.O.Docker.Run(ctx, Cmd{Args: []string{"image", "inspect", "--format", "{{.Id}}", im.ref}})
-		id := strings.TrimSpace(string(out))
+	for _, im := range list {
+		got, ok := seen[im.ref]
+		if !ok {
+			got = in.inspectImage(ctx, im.ref)
+		}
+		id, err := got.id, got.err
 		switch {
 		case err != nil && im.pinned():
 			missing = append(missing, im.ref)

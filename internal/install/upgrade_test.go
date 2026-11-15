@@ -1578,8 +1578,19 @@ func TestAReleaseOfAnotherStowageUpgradesAndGoesBack(t *testing.T) {
 	}
 	e.log.Reset()
 	e.schemaAt("6", nil, true)
+	// Its images, as its record names them, are pulled before anything changes: one that does not
+	// pull leaves the install on 2.0.0.
+	e.docker.loaded = map[string]string{}
+	e.docker.pullErr = errors.New("pull refused")
+	if err := e.rollback(start); err == nil || !strings.Contains(err.Error(), "pull refused") || len(ran) != 0 || get(e.readEnv(), "STOWAGE_PROJECT_VERSION") != "2.0.0" {
+		t.Fatalf("a pull refused: %v, ran %v", err, ran)
+	}
+	e.docker.pullErr = nil
 	if err := e.rollback(start); err != nil {
 		t.Fatalf("%v\n%s", err, e.log)
+	}
+	if _, ok := e.docker.loaded[get(e.readEnv(), ImageVar("api"))]; !ok {
+		t.Errorf("1.0.0's api image is not pulled: %v", e.docker.loaded)
 	}
 	if want := [][]string{{"--dir", e.dir, "--no-input", "--no-provision"}}; !slices.EqualFunc(ran, want, slices.Equal) || exe != filepath.Join(e.dir, "notes-stow") {
 		t.Errorf("ran %s %v, want %v", exe, ran, want)
@@ -1944,5 +1955,129 @@ func TestARollbacksStartSaysWhetherTheHookWasSkipped(t *testing.T) {
 		if said != (c.want != "") || c.want != "" && !strings.Contains(e.log.String(), c.want) {
 			t.Errorf("%s: logged\n%s", name, e.log)
 		}
+	}
+}
+
+// An upgrade asks again a recorded value the release's check refuses — here an input it makes a
+// set's, recorded with no element nft reads — and keeps one the check accepts.
+func TestUpgradeAsksRecordedValueTheReleaseRefuses(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	e.to("2.0.0", func(s *spec.Spec) {
+		s.Inputs = append(s.Inputs, spec.Input{Key: "ALLOW", Default: "10.0.0.0/8"})
+		s.Services = map[string]spec.Service{"web": {Sets: map[string]string{"trusted": "ALLOW"}}}
+	})
+	in := e.installer(nil)
+	added := func(v string) bool {
+		env := NewEnvFile()
+		for _, i := range in.inputList(Loopback) {
+			env.Set(i.Key, "")
+		}
+		env.Set("ADMIN_EMAIL", "admin@example.org")
+		env.Set("ALLOW", v)
+		return slices.ContainsFunc(in.addedInputs(env, Loopback), func(i input) bool { return i.Key == "ALLOW" })
+	}
+	if !added("not-an-element") {
+		t.Error("a recorded value the set refuses is not asked again")
+	}
+	if added("192.0.2.0/24") {
+		t.Error("a recorded value the set takes is asked again")
+	}
+	if got := in.refusedRecord(input{Input: spec.Input{Key: "ALLOW"}, check: checkSetElements}, "not-an-element"); !strings.HasPrefix(got, "notes 2.0.0 refuses the recorded value (") {
+		t.Errorf("said %q", got)
+	}
+	if got := in.refusedRecord(input{Input: spec.Input{Key: "ALLOW", Secret: true}, check: checkSetElements}, "not-an-element"); got != "notes 2.0.0 refuses the recorded value" {
+		t.Errorf("a secret's said %q", got)
+	}
+}
+
+// A run that takes no flag (the VM's upgrade) states the fact alone: no refusal names a flag it
+// cannot be given; a run that takes them names it in the reason, for the person reading it.
+func TestUpgradeCheckNamesNoFlag(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	e.r.Spec.L4.Routes = []spec.L4Route{{Name: "data", Protocol: "tcp", Port: 7443, Upstream: "api:7000"}}
+	e.busy[8080] = true
+	for _, nothing := range []bool{true, false} {
+		in := e.installer(nil)
+		in.givenNothing = nothing
+		errs := []error{
+			in.portsFree(publish{addr: "127.0.0.1", ports: map[string]int{"app": 8080}}),
+			in.l4Clash(publish{all: true, ports: map[string]int{"https": 7443}}),
+			in.l4Clash(publish{ports: map[string]int{"app": 7443}}),
+		}
+		for _, err := range errs {
+			if err == nil || strings.Contains(err.Error(), "--") != !nothing {
+				t.Errorf("given nothing %v: %v", nothing, err)
+			}
+		}
+	}
+}
+
+// A route the release adds may take the port of a route it removes, which the stack's front holds
+// until the upgrade's start: it is not refused as in use.
+func TestUpgradeTakesARemovedRoutesPort(t *testing.T) {
+	t.Parallel()
+	e := installed(t)
+	api := get(e.readEnv(), PortVar("api"))
+	e.busy[8000] = true // the running front's, on api's recorded port
+	if api != "8000" {
+		t.Fatalf("api recorded on %q", api)
+	}
+	e.to("2.0.0", func(s *spec.Spec) {
+		docsRoute(8000)(s)
+		s.Front.Routes = slices.DeleteFunc(s.Front.Routes, func(r spec.Route) bool { return r.Name == "api" })
+	})
+	if err := e.upgrade(nil); err != nil {
+		t.Fatalf("%v\n%s", err, e.log)
+	}
+	if got := get(e.readEnv(), PortVar("docs")); got != "8000" {
+		t.Errorf("docs on %q", got)
+	}
+	// A port no route of the install records is still probed.
+	e = installed(t)
+	e.busy[8001] = true
+	e.to("2.0.0", docsRoute(8001))
+	if err := e.upgrade(nil); err == nil || !strings.Contains(err.Error(), "port(s) 8001 (docs) already in use") {
+		t.Errorf("a busy port: %v", err)
+	}
+}
+
+// An upgrade whose start fails leaves its change marked: a re-run then takes no .env.prev from
+// values that never came up; one whose start comes up leaves none.
+func TestAFailedUpgradeStartLeavesItsChangeMarked(t *testing.T) {
+	t.Parallel()
+	e := installed(t)
+	e.to("2.0.0", nil)
+	e.docker.upErr = errors.New("unhealthy")
+	if err := e.upgrade(nil); err == nil {
+		t.Fatal("the upgrade came up")
+	}
+	if _, err := os.Stat(filepath.Join(e.dir, changingFile)); err != nil {
+		t.Fatalf("no change marked: %v", err)
+	}
+	// A re-run whose start fails again says no values of the release came up, naming the
+	// rollback, never an .env.prev that is not there.
+	e.log.Reset()
+	err := e.install(func(o *Options) { o.Set = map[string]string{"ADMIN_EMAIL": "other@example.org"} })
+	if err == nil || strings.Contains(err.Error(), envPrev) || !strings.Contains(err.Error(), "no values of this release have come up yet (the upgrade to it did not): `") ||
+		!strings.Contains(err.Error(), " rollback --dir ") || strings.Contains(e.log.String(), "holds the values") {
+		t.Errorf("a failed re-run: %v\n%s", err, e.log)
+	}
+	e.docker.upErr = nil
+	if err := e.install(func(o *Options) { o.Set = map[string]string{"ADMIN_EMAIL": "third@example.org"} }); err != nil {
+		t.Fatalf("%v\n%s", err, e.log)
+	}
+	if _, err := os.Stat(filepath.Join(e.dir, envPrev)); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf(".env.prev taken from an .env that never came up: %v", err)
+	}
+	// One that comes up leaves no marker.
+	e = installed(t)
+	e.to("2.0.0", nil)
+	if err := e.upgrade(nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(e.dir, changingFile)); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("a marker after an upgrade that came up: %v", err)
 	}
 }

@@ -3,7 +3,9 @@
 package command
 
 import (
+	"bytes"
 	"context"
+	"fmt"
 	"github.com/norvexlabs/stowage/internal/testutil"
 	"os"
 	"os/exec"
@@ -149,6 +151,7 @@ func TestJobControlReachesTheCommandGroup(t *testing.T) {
 		r := Runner{Root: dir, Config: Config{Cmd: []string{"./c.sh"}, TimeoutS: timeout}, unit: testSecond}
 		var out struct{ OK bool }
 		if err := r.Call(context.Background(), map[string]any{"op": "x"}, &out); err != nil || !out.OK {
+			fmt.Fprintln(os.Stderr, err)
 			os.Exit(3)
 		}
 		os.Exit(0)
@@ -231,6 +234,68 @@ func TestSuspendDoesNotConsumeTheTimeout(t *testing.T) {
 	}
 	if err := helper.Wait(); err != nil {
 		t.Fatalf("the suspend counted against the timeout: %v", err)
+	}
+}
+
+// The timeout pauses while the run is stopped and runs again once it is resumed: a command that
+// never answers, stopped for longer than its whole timeout, is not timed out on the resume (the
+// timer did not fire across the stop) but once the time left at the stop has run again (the timer
+// was re-armed) — the other side of TestSuspendDoesNotConsumeTheTimeout.
+func TestTimeoutRunsAgainAfterAResume(t *testing.T) {
+	t.Parallel()
+	const timeout = 15 // units of testSecond; the stop lands well before it runs out
+	dir := t.TempDir()
+	pidFile := filepath.Join(dir, "sleep.pid")
+	body := "#!/bin/sh\nsleep 60 & echo $! > " + pidFile + "\nwait\n"
+	if err := testutil.WriteExecutable(filepath.Join(dir, "c.sh"), []byte(body)); err != nil {
+		t.Fatal(err)
+	}
+	helper := exec.Command(os.Args[0], "-test.run=^TestJobControlReachesTheCommandGroup$")
+	helper.Env = append(os.Environ(), "STOWAGE_TEST_TSTP="+dir, "STOWAGE_TEST_TSTP_TIMEOUT="+strconv.Itoa(timeout))
+	var stderr bytes.Buffer
+	helper.Stderr = &stderr
+	started := time.Now() // the timer starts later, in the helper: a bound on the time it ran
+	if err := helper.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = helper.Process.Kill() }()
+	var sleepPid int
+	for deadline := time.Now().Add(10 * time.Second); sleepPid == 0; time.Sleep(20 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("the command never started")
+		}
+		if b, err := os.ReadFile(pidFile); err == nil && strings.HasSuffix(string(b), "\n") {
+			sleepPid, _ = strconv.Atoi(strings.TrimSpace(string(b)))
+		}
+	}
+	defer func() { _ = syscall.Kill(sleepPid, syscall.SIGKILL) }()
+	if err := helper.Process.Signal(syscall.SIGTSTP); err != nil {
+		t.Fatal(err)
+	}
+	waitState(t, helper.Process.Pid, "T")
+	// The longest the timer can have run before the stop; what it has left is at least the rest.
+	left := timeout*testSecond - time.Since(started)
+	if left < 2*testSecond {
+		t.Fatalf("the stop landed %s before the timeout: too late to tell a paused timer", left)
+	}
+	time.Sleep((timeout + 1) * testSecond) // longer than the whole timeout
+	resumed := time.Now()
+	if err := helper.Process.Signal(syscall.SIGCONT); err != nil {
+		t.Fatal(err)
+	}
+	exited := make(chan error, 1)
+	go func() { exited <- helper.Wait() }()
+	select {
+	case <-exited:
+		ran := time.Since(resumed)
+		if ws, ok := helper.ProcessState.Sys().(syscall.WaitStatus); !ok || !ws.Exited() || ws.ExitStatus() != 3 || !strings.Contains(stderr.String(), "timed out after") {
+			t.Fatalf("the helper ended %v, want exit 3 on the timeout: %s", helper.ProcessState, stderr.String())
+		}
+		if ran < left {
+			t.Errorf("timed out %s after the resume, with at least %s left: the stop counted against the timeout", ran, left)
+		}
+	case <-time.After((timeout + 10) * testSecond):
+		t.Fatal("a resumed command was never timed out")
 	}
 }
 

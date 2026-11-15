@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -26,6 +27,7 @@ import (
 	"github.com/google/go-containerregistry/pkg/v1/mutate"
 	"github.com/google/go-containerregistry/pkg/v1/random"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
+	"go.yaml.in/yaml/v3"
 
 	"github.com/norvexlabs/stowage/internal/backup"
 	"github.com/norvexlabs/stowage/internal/chown"
@@ -138,8 +140,12 @@ type fakeCloud struct {
 	fail       bool
 }
 
-func (f *fakeCloud) Registered(_ context.Context, img cloud.Image) (string, error) {
-	return f.registered[img.Cloud+"/"+img.Name], nil
+func (f *fakeCloud) Ensure(ctx context.Context, img cloud.Image, registering func()) (string, error) {
+	if id := f.registered[img.Cloud+"/"+img.Name]; id != "" {
+		return id, nil
+	}
+	registering()
+	return f.Upload(ctx, img)
 }
 
 func (f *fakeCloud) Upload(ctx context.Context, img cloud.Image) (string, error) {
@@ -203,6 +209,8 @@ type env struct {
 	refuseTagDelete bool
 	// ignorePut answers a manifest PUT to a path containing it with 201 and stores nothing.
 	ignorePut string
+	// heads counts the manifest HEADs the registry answered.
+	heads atomic.Int32
 }
 
 // fakeSigner records signatures by digest reference.
@@ -324,6 +332,9 @@ func newEnv(t *testing.T) *env {
 		if e.ignorePut != "" && r.Method == http.MethodPut && strings.Contains(r.URL.Path, e.ignorePut) {
 			w.WriteHeader(http.StatusCreated)
 			return
+		}
+		if r.Method == http.MethodHead && strings.Contains(r.URL.Path, "/manifests/") {
+			e.heads.Add(1)
 		}
 		if e.refuseTagDelete && r.Method == http.MethodDelete && strings.Contains(r.URL.Path, "/manifests/") &&
 			!strings.Contains(r.URL.Path, "/manifests/sha256:") {
@@ -756,8 +767,8 @@ func TestYankAndPruneRetireWhereNoTagDeletes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if d, err := p.untag(ctx, retiredTag); d != nil || err != nil {
-		t.Fatalf("untag of a retired tag: %v %v", d, err)
+	if err := p.untag(ctx, retiredTag); err != nil {
+		t.Fatalf("untag of a retired tag: %v", err)
 	}
 	eq(t, "retired once", strings.Count(e.log.String(), "notes-release:beta-1.2.0 retired"), 1)
 	eq(t, "still retired", e.digest("notes-release", "beta-1.2.0"), r.String())
@@ -1623,5 +1634,250 @@ func TestShipTakesTheUntrackedFiles(t *testing.T) {
 	}
 	if rec, err := pub.untracked(); err != nil || rec != fmt.Sprintf(`{"api/api/blob.bin":"sha256:%x executable"}`, sha256.Sum256([]byte("made again"))) {
 		t.Fatalf("executable: %q %v", rec, err)
+	}
+}
+
+// On a registry that deletes no tag alone, content whose tag was retired while another tag held
+// it is marked held in the registry: a run stopped before its sweep leaves the mark, and a later
+// sweep deletes the content once no other tag holds it.
+func TestHeldContentIsMarkedInTheRegistry(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	e.refuseTagDelete = true
+	ctx := context.Background()
+	first := e.mustShip("beta", 1)
+	e.bump("1.1.0")
+	second := e.mustShip("beta", 1)
+	web := first.Manifest.Artifacts.Images["web"]
+	eq(t, "shared image", second.Manifest.Artifacts.Images["web"], web)
+	p, _ := e.publisher()
+	tag := func(repo, tag string) name.Tag {
+		t.Helper()
+		r, err := p.Registry.Tag(e.host+"/acme/notes/"+repo, tag)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return r
+	}
+	// A prune stopped right after its untag: the mark holds what the run's memory held.
+	if err := p.untag(ctx, tag("notes-web", "beta-1.0.0")); err != nil {
+		t.Fatal(err)
+	}
+	h, _ := v1.NewHash(web)
+	mark := heldTag(h)
+	eq(t, "marked", e.digest("notes-web", mark), web)
+	// The mark holds nothing: the other tag does, so the sweep keeps it.
+	if err := p.sweepMarked(ctx, p.imageRepo("web")); err != nil {
+		t.Fatal(err)
+	}
+	eq(t, "kept while beta-1.1.0 holds it", e.digest("notes-web", "beta-1.1.0"), web)
+	// The other tag moves (retired with no mark of its own): the next sweep deletes the content.
+	if err := p.retire(ctx, tag("notes-web", "beta-1.1.0")); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.sweepMarked(ctx, p.imageRepo("web")); err != nil {
+		t.Fatal(err)
+	}
+	if d, _ := e.reg.Head(ctx, mustDigest(t, e, "notes-web", web)); d != nil {
+		t.Fatal("the content no tag holds stayed")
+	}
+	eq(t, "the mark went with it", e.digest("notes-web", mark), "")
+	eq(t, "deletion logged", strings.Contains(e.log.String(), "notes-web@"+web+" deleted: no tag holds it any more"), true)
+}
+
+// On a registry that deletes no tag alone, an installer :latest alone held is marked before it is
+// retired, and deleted by the yank's sweep after.
+func TestAnInstallerOnlyLatestHeldIsDeletedOnItsRetirement(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	ctx := context.Background()
+	rel := e.mustShip("stable", 1)
+	inst := rel.Manifest.Artifacts.Installer
+	// A prune that stopped part way, before marks: the release's installer tag gone, :latest left.
+	gone, _ := name.NewTag(e.host + "/acme/notes/notes-installer:1.0.0")
+	if err := remote.Delete(gone); err != nil {
+		t.Fatal(err)
+	}
+	eq(t, "latest alone holds it", e.digest("notes-installer", "latest"), inst)
+	e.refuseTagDelete = true
+	p, _ := e.publisher()
+	// The yank removes the pointer, retires :latest, then sweeps.
+	if err := p.Yank(ctx, "stable", "1.0.0", 1, "bad"); err != nil {
+		t.Fatal(err)
+	}
+	eq(t, "latest retired", e.digest("notes-installer", "latest"), e.retired())
+	if d, _ := e.reg.Head(ctx, mustDigest(t, e, "notes-installer", inst)); d != nil {
+		t.Fatal("the installer only :latest held stayed in the registry")
+	}
+}
+
+// A mutable release shipped again without an image key or a disk format its earlier build had
+// leaves no tag of them: the replaced build's tags go, the rest stay.
+func TestAReplacedReleaseLeavesNoTagItDropped(t *testing.T) {
+	t.Parallel()
+	for _, refuse := range []bool{false, true} {
+		e := newEnv(t)
+		e.refuseTagDelete = refuse
+		formats := func(f ...string) {
+			testutil.SetYAML(t, e.root, "stowage.yaml", []string{"shapes", "kairos", "disk_formats"}, f)
+		}
+		var spec struct {
+			Images map[string]any `yaml:"images"`
+		}
+		if err := yaml.Unmarshal([]byte(readFile(t, filepath.Join(e.root, "stowage.yaml"))), &spec); err != nil {
+			t.Fatal(err)
+		}
+		spec.Images["extra"] = spec.Images["web"]
+		testutil.SetYAML(t, e.root, "stowage.yaml", []string{"images"}, spec.Images)
+		formats("qcow2", "raw")
+		first := e.mustShip("beta", 1)
+		if first.Manifest.Artifacts.Images["extra"] == "" || first.Manifest.Artifacts.Disks["raw"] == "" {
+			t.Fatalf("the first build: %+v", first.Manifest.Artifacts)
+		}
+		delete(spec.Images, "extra")
+		testutil.SetYAML(t, e.root, "stowage.yaml", []string{"images"}, spec.Images)
+		formats("qcow2")
+		second := e.mustShip("beta", 1)
+		for _, c := range []struct{ repo, tag string }{{"notes-extra", "beta-1.0.0"}, {"notes-disk", "beta-1.0.0-raw"}} {
+			if d := e.digest(c.repo, c.tag); d != "" && !strings.HasSuffix(e.retired(), d) {
+				t.Errorf("refuse %v: %s:%s is still %s", refuse, c.repo, c.tag, d)
+			}
+		}
+		eq(t, "web kept", e.digest("notes-web", "beta-1.0.0"), second.Manifest.Artifacts.Images["web"])
+		eq(t, "qcow2 kept", e.digest("notes-disk", "beta-1.0.0-qcow2"), second.Manifest.Artifacts.Disks["qcow2"])
+		p, _ := e.publisher()
+		if _, err := p.Verify(context.Background(), "beta", "", 1); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// A replacing ship stopped before its manifest is written has dropped the tags already, the
+// content kept under its held mark; the re-run marks it again from the old manifest, writes the
+// new one, and its sweep deletes the content no tag holds.
+func TestAReplacingShipStoppedBeforeItsManifest(t *testing.T) {
+	t.Parallel()
+	for _, refuse := range []bool{false, true} {
+		e := newEnv(t)
+		e.refuseTagDelete = refuse
+		ctx := context.Background()
+		var spec struct {
+			Images map[string]any `yaml:"images"`
+		}
+		if err := yaml.Unmarshal([]byte(readFile(t, filepath.Join(e.root, "stowage.yaml"))), &spec); err != nil {
+			t.Fatal(err)
+		}
+		spec.Images["extra"] = spec.Images["web"]
+		testutil.SetYAML(t, e.root, "stowage.yaml", []string{"images"}, spec.Images)
+		e.noDisks = true
+		first := e.mustShip("beta", 1)
+		extra := first.Manifest.Artifacts.Images["extra"]
+		delete(spec.Images, "extra")
+		testutil.SetYAML(t, e.root, "stowage.yaml", []string{"images"}, spec.Images)
+		e.ignorePut = "/notes-release/manifests/beta-1.0.0"
+		if _, err := e.ship("beta", 1); err == nil {
+			t.Fatalf("refuse %v: a ship whose manifest the registry dropped succeeded", refuse)
+		}
+		e.ignorePut = ""
+		if d := e.digest("notes-extra", "beta-1.0.0"); d != "" && d != e.retired() {
+			t.Fatalf("refuse %v: the dropped tag is still %s", refuse, d)
+		}
+		if d, _ := e.reg.Head(ctx, mustDigest(t, e, "notes-extra", extra)); d == nil {
+			t.Fatalf("refuse %v: the content went before the new manifest was out", refuse)
+		}
+		e.mustShip("beta", 1)
+		if d, _ := e.reg.Head(ctx, mustDigest(t, e, "notes-extra", extra)); d != nil {
+			t.Fatalf("refuse %v: the dropped content stayed after the re-run", refuse)
+		}
+	}
+}
+
+// retired is the retired artifact's digest.
+func (e *env) retired() string {
+	e.t.Helper()
+	r, err := registry.RetiredDigest()
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	return r.String()
+}
+
+// A ship or a yank sweeps only the marks its own run made: a stopped run's mark, whose content a
+// run under way may be working on, is a prune's to sweep. The installer a stopped prune retired,
+// held by :latest alone, stays through the ship that moves :latest off it, and goes with the
+// next prune.
+func TestOnlyAPruneSweepsWhatAStoppedRunMarked(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	e.refuseTagDelete = true
+	ctx := context.Background()
+	first := e.mustShip("stable", 1)
+	inst := first.Manifest.Artifacts.Installer
+	p, _ := e.publisher()
+	tag, err := p.Registry.Tag(p.installerRepo(), "1.0.0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.untag(ctx, tag); err != nil {
+		t.Fatal(err)
+	}
+	eq(t, "latest holds it", e.digest("notes-installer", "latest"), inst)
+	e.bump("1.1.0")
+	e.changeWeb()
+	second := e.mustShip("stable", 1)
+	if second.Manifest.Artifacts.Installer == inst {
+		t.Fatal("the same installer")
+	}
+	if d, _ := e.reg.Head(ctx, mustDigest(t, e, "notes-installer", inst)); d == nil {
+		t.Fatal("a ship swept a mark another run made")
+	}
+	p, _ = e.publisher()
+	if _, err := p.PruneKeep(ctx, "stable", 1); err != nil {
+		t.Fatal(err)
+	}
+	if d, _ := e.reg.Head(ctx, mustDigest(t, e, "notes-installer", inst)); d != nil {
+		t.Fatal("the installer no tag holds stayed through a prune")
+	}
+}
+
+// A sweep reads each tag of a repository once, whatever the number of marks it judges.
+func TestASweepReadsEachTagOnce(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	e.refuseTagDelete = true
+	ctx := context.Background()
+	var webs []string
+	for _, v := range []string{"1.0.0", "1.1.0", "1.2.0"} {
+		e.bump(v)
+		e.changeWeb()
+		webs = append(webs, e.mustShip("beta", 1).Manifest.Artifacts.Images["web"])
+	}
+	p, _ := e.publisher()
+	repo, err := p.Registry.Repo(p.imageRepo("web"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, w := range webs {
+		h, _ := v1.NewHash(w)
+		if err := p.markHeld(ctx, repo, h); err != nil {
+			t.Fatal(err)
+		}
+	}
+	tags, err := p.Registry.Tags(ctx, repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := e.heads.Load()
+	if err := p.sweepMarked(ctx, p.imageRepo("web")); err != nil {
+		t.Fatal(err)
+	}
+	// The release and installer repositories hold no mark: listed, never read.
+	if n := int(e.heads.Load() - before); n > len(tags) {
+		t.Fatalf("%d manifest reads for %d tags", n, len(tags))
+	}
+	for _, w := range webs {
+		if d, _ := e.reg.Head(ctx, mustDigest(t, e, "notes-web", w)); d == nil {
+			t.Fatalf("%s, which its release tag holds, was deleted", w)
+		}
 	}
 }

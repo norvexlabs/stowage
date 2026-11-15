@@ -49,17 +49,7 @@ func (in *Installer) k8sKitInstaller(ctx context.Context, h *spec.Handoff, step 
 	if _, err := k.Kubectl.Run(ctx, Cmd{Args: []string{"version", "--client"}}); err != nil {
 		return nil, nil, fmt.Errorf("kubectl is required: %w", err)
 	}
-	rel, err := in.release(ctx)
-	if err != nil {
-		return nil, nil, err
-	}
-	if rel == nil {
-		return nil, nil, in.noRelease()
-	}
-	if err := in.pending(rel); err != nil {
-		return nil, nil, err
-	}
-	cur, err := in.installedRelease(ctx)
+	cur, err := in.k8sCurrent(ctx)
 	if err != nil {
 		return nil, nil, err
 	}

@@ -515,8 +515,20 @@ func TestK8sUpgradeImagePullLogin(t *testing.T) {
 	if err := e.installer(func(o *Options) { o.K8s.Registry, o.Login = mirror, pull }).K8sUpgrade(context.Background()); err != nil {
 		t.Fatalf("%v\n%s", err, e.log)
 	}
-	if e.secretData("notes-stowage-pull") != nil || strings.Contains(e.f.given[0], "pullSecret") {
+	if e.secretData("notes-stowage-pull") != nil || !strings.Contains(e.f.given[0], "pullSecret: \"\"\n") {
 		t.Errorf("not asked: %q", e.f.given[0])
+	}
+	// To a mirror, a pull Secret the release names that is gone is none: logged, not refused.
+	e = newKubeEnv(t, spec.Provider{Name: "token", Config: map[string]any{"user": "notes-pull", "token_env": "NOTES_PULL"}})
+	mirror = mirrored(t, e)
+	e.runs("0.9.0", 1)
+	e.f.values["stowage"].(map[string]any)["pullSecret"] = "notes-stowage-pull"
+	e.stored(map[string]string{"ADMIN_EMAIL": "a@example.org", "SESSION_SECRET": "s", "POSTGRES_PASSWORD": "p"}, ours)
+	if err := e.installer(func(o *Options) { o.K8s.Registry = mirror }).K8sUpgrade(context.Background()); err != nil {
+		t.Fatalf("%v\n%s", err, e.log)
+	}
+	if !strings.Contains(e.f.given[0], "pullSecret: \"\"\n") || !strings.Contains(e.log.String(), "the pull Secret notes-stowage-pull the release names is gone: the pods pull from "+mirror+" with none") {
+		t.Errorf("%q\n%s", e.f.given[0], e.log)
 	}
 }
 

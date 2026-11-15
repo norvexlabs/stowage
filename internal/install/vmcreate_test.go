@@ -865,6 +865,43 @@ func TestVMCreateBootsTheChannelsDiskSet(t *testing.T) {
 	}
 }
 
+// A mirror holding the release's raw disk alone and the channel's set in ova: the release boots
+// its own set, never another release's — aws its raw disk; vmware, whose format the mirror lacks
+// of it, and gcp are refused naming their missing format.
+func TestVMCreateBootsTheReleasesOwnSet(t *testing.T) {
+	t.Parallel()
+	for _, c := range []struct{ platform, disk, err string }{
+		{"vmware", "", "--platform vmware: the ova disk sha256:eeeeeeeeeeee is not in"},
+		{"aws", "notes-1.0.0.raw", ""},
+		{"gcp", "", "--platform gcp: the gce disk sha256:eeeeeeeeeeee is not in"},
+	} {
+		t.Run(c.platform, func(t *testing.T) {
+			t.Parallel()
+			v := newVMCreate(t, "raw", "ova")
+			ptr := *v.r.Manifest
+			ptr.ProjectVersion, ptr.Tag, ptr.StowageVersion, ptr.ReleaseSeq = "0.9.0", "0.9.0", "0.6.0", 1
+			ptr.Artifacts.Images = maps.Clone(ptr.Artifacts.Images)
+			ptr.Artifacts.Disks = map[string]string{"ova": v.r.Manifest.Artifacts.Disks["ova"]}
+			v.putRelease(ptr.Channel, &ptr)
+			gone := "sha256:" + strings.Repeat("e", 64)
+			v.r.Manifest.Artifacts.Disks = map[string]string{"raw": v.r.Manifest.Artifacts.Disks["raw"], "ova": gone, "gce": gone}
+			err := v.create(VMCreate{Platform: c.platform, Hostname: "notes-1", User: "ops", Create: CreateManual}, func(o *Options) { o.TLS = "internal" })
+			if c.err != "" {
+				if err == nil || !strings.Contains(err.Error(), c.err) {
+					t.Fatalf("got %v, want %q", err, c.err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("%v\n%s", err, v.log)
+			}
+			if _, err := os.Stat(filepath.Join(v.out, c.disk)); err != nil {
+				t.Fatalf("%v\n%s", err, v.log)
+			}
+		})
+	}
+}
+
 // A release's own disk: the first boot installs from its OS, no release named.
 func TestVMCreateOfItsOwnDiskNamesNoRelease(t *testing.T) {
 	t.Parallel()
@@ -1117,6 +1154,10 @@ func TestMachineInterfacesFromTheFlags(t *testing.T) {
 	}
 	if _, err := machineInterfaces(opt, []string{"lan=dhcp"}, plat("gcp")); err == nil || !strings.Contains(err.Error(), "--interface lan: Google Cloud names its VMs' NICs itself, one here: leave the optional lan out") {
 		t.Errorf("a cloud, an optional NIC asked: %v", err)
+	}
+	// A server without a MAC: the refusal names the optional NIC --interface takes too.
+	if _, err := machineInterfaces(opt, nil, plat("metal")); err == nil || !strings.Contains(err.Error(), "names (uplink) by its MAC, as it may have more ports than those; the optional lan too, when given: --interface lan=mac=…") {
+		t.Errorf("a server, an optional NIC not asked: %v", err)
 	}
 	// Two NICs beside the optional: the release is refused whatever --interface asks, before the flags.
 	opt.Host.Interfaces["edge"] = spec.HostInterface{}

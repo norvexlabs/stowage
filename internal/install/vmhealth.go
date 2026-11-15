@@ -62,9 +62,10 @@ const HealthService = "stowage-health"
 // Bounds on a probe and on what the diagnostics keep.
 const (
 	probeTimeout = 10 * time.Second
-	// staleHealthFile is past the longest a health command may run (timeout_s is unbounded only
-	// in principle).
-	staleHealthFile = time.Hour
+	// staleHealthFile is past the longest a health command's compose file lives: the command's
+	// longest timeout_s (lint refuses more), the 30 s its container's removal may take, and a
+	// margin for a slow pull of its environment.
+	staleHealthFile = time.Duration(command.MaxTimeoutS)*time.Second + 30*time.Second + 10*time.Minute
 	maxProbeAnswer  = 64 << 10
 	diagLogLines    = 500
 	diagBootLines   = 2000
@@ -74,6 +75,12 @@ const (
 type assessment struct {
 	dir  string
 	host Tool
+}
+
+// assessmentIn is the boot assessment of the state directory state (empty: Kairos's), set through
+// host: the gate's and the daemon's one way to it.
+func assessmentIn(state string, host Tool) assessment {
+	return assessment{cmp.Or(state, cosState), host}
 }
 
 func (a assessment) file() string { return filepath.Join(a.dir, assessFile) }
@@ -212,6 +219,8 @@ func (g *Gate) Run(ctx context.Context) error {
 			}
 		}
 	}
+	// Their containers an earlier boot left: no check of this boot owns one.
+	in.removeEarlierHealth(ctx)
 	a, onTrial, err := g.trial()
 	if err != nil {
 		return err
@@ -314,7 +323,7 @@ func killedBySignal(err error) bool {
 
 // trial reads the boot assessment: whether GRUB booted the active system on trial.
 func (g *Gate) trial() (assessment, bool, error) {
-	a := assessment{cmp.Or(g.State, cosState), g.Host}
+	a := assessmentIn(g.State, g.Host)
 	vars, err := a.read()
 	if err != nil {
 		return a, false, fmt.Errorf("the boot assessment: %w", err)
@@ -353,26 +362,17 @@ func (g *Gate) noInstall(ctx context.Context) error {
 	return nil
 }
 
-// switchedHere reports whether this OS is the one a first boot switched to: the settings file
-// names this OS's release (by version and revision, as firstBoot compares them: an OS bundle's
-// installer carries no tag), and switchOS's mark names that release's tag. The mark stays after
-// the install, and the health gate reads it: removed, an unhealthy first install on trial falls
-// back as any other.
+// switchedHere reports whether this OS is the one a first boot came to: the switch's mark names
+// this OS's release, which switchOS wrote (the settings naming it) or firstBoot renamed from an
+// upgrade's before the first install. The mark stays after the install, and the health gate
+// reads it: removed, an unhealthy first install on trial falls back as any other.
 func (in *Installer) switchedHere() bool {
-	raw, err := os.ReadFile(osSwitchFile(in.O.Dir))
-	if err != nil {
-		return false
-	}
-	st, err := ReadSettings(cmp.Or(in.O.Settings, SettingsFile(in.R.Spec.Name)))
+	m := in.R.Manifest
+	ok, err := markNames(osSwitchFile(in.O.Dir), m.ProjectVersion, m.Revision)
 	if err != nil {
 		in.O.logf("warning: %v: the OS a first boot switched to is not recognised", err)
-		return false
 	}
-	if st == nil || st.Release == nil {
-		return false
-	}
-	t, m := st.Release, in.R.Manifest
-	return t.Tag != "" && strings.TrimSpace(string(raw)) == t.Tag && t.Version == m.ProjectVersion && t.Revision == m.Revision
+	return ok
 }
 
 // refusedRollback runs the rollback the passive system's boot would run, dry: why the database
@@ -565,6 +565,34 @@ func (in *Installer) address(ctx context.Context, env *EnvFile, service string) 
 	return "", fmt.Errorf("%s is only on internal networks (%s), which the host does not reach", service, strings.Join(names, ", "))
 }
 
+// HealthBootLabel labels the container of a `command` health check with the boot it ran in: one
+// labelled with an earlier boot is one a reboot interrupted, which no running check owns.
+const HealthBootLabel = "io.stowage.health-boot"
+
+// removeEarlierHealth removes the health checks' containers an earlier boot left (a reboot
+// interrupts a check, and nothing then removes its container); this boot's, which a running
+// check may own, are kept, and so is every one when this boot's id does not read.
+func (in *Installer) removeEarlierHealth(ctx context.Context) {
+	boot := in.O.bootID()
+	if boot == "" {
+		return
+	}
+	out, err := in.O.Docker.Run(ctx, Cmd{Args: []string{"ps", "--all", "--filter", "label=" + HealthBootLabel, "--format", "{{.ID}} {{.Label \"" + HealthBootLabel + "\"}}"}})
+	if err != nil {
+		in.O.logf("warning: listing the health checks' containers: %v", err)
+		return
+	}
+	for line := range strings.SplitSeq(strings.TrimSpace(string(out)), "\n") {
+		id, label, _ := strings.Cut(strings.TrimSpace(line), " ")
+		if id == "" || label == boot {
+			continue
+		}
+		if _, err := in.O.Docker.Run(ctx, Cmd{Args: []string{"rm", "--force", id}}); err != nil {
+			in.O.logf("warning: removing the health check container %s an earlier boot left: %v", id, err)
+		}
+	}
+}
+
 // probeCommand asks the `command` health provider: {"op": "health.ready"} in, {"ready": bool,
 // "reason": "..."} out; no answer (exit 2) is not ready. Each call runs as a container of its own,
 // so the gate and the daemon may ask at once.
@@ -583,7 +611,7 @@ func (in *Installer) probeCommand(ctx context.Context, env *EnvFile) error {
 		Reason string `json:"reason"`
 	}
 	err := in.runCommand(ctx, commandRun{what: "the health command", service: HealthService, file: ".stowage-health-" + id + ".yaml",
-		name: containerName(env, HealthService) + "-" + id}, c, env, env, map[string]any{"op": "health.ready"}, &out)
+		name: containerName(env, HealthService) + "-" + id, labels: map[string]string{HealthBootLabel: in.O.bootID()}}, c, env, env, map[string]any{"op": "health.ready"}, &out)
 	switch {
 	case errors.Is(err, command.ErrNoAnswer):
 		return errors.New("the health command has no answer")
@@ -605,6 +633,9 @@ type FailedBoot struct {
 	// Kept: the gate kept the failed system, as going back is refused for this reason.
 	Kept string `json:"kept,omitempty"`
 	Dir  string `json:"dir"`
+	// Seq is the event journal's last entry number as the failure was kept: a verdict after it
+	// in the journal is a later one, whatever the clocks say.
+	Seq int64 `json:"seq"`
 }
 
 // unsafeName is what a directory name drops from a version.
@@ -626,7 +657,11 @@ func (g *Gate) keep(ctx context.Context, why error, kept string) (string, error)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", err
 	}
-	desc, err := json.MarshalIndent(FailedBoot{Release: Version{m.ProjectVersion, m.Revision}, At: at, Reason: why.Error(), Kept: kept, Dir: dir}, "", "  ")
+	seq, _, err := (&journal{dir: in.O.Dir}).lastOf()
+	if err != nil {
+		in.O.logf("the event journal: %v", err)
+	}
+	desc, err := json.MarshalIndent(FailedBoot{Release: Version{m.ProjectVersion, m.Revision}, At: at, Reason: why.Error(), Kept: kept, Dir: dir, Seq: seq}, "", "  ")
 	if err != nil {
 		return "", err
 	}

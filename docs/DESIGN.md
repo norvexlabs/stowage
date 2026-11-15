@@ -328,11 +328,20 @@ pushed artifact.
   pruned release, `:latest` on its installer) is retired instead, as is a floating tag (`:latest`,
   `latest-<format>`): moved onto a retired artifact (one manifest per repository) that the
   registry client reads as absent, so every reader does. A floating tag's manifest is never
-  deleted by digest there, since a release's own tag or another channel's disk set may name it;
-  the disk cleanup, which knows the sets, removes a disk none keeps. A prune that completes deletes
-  by digest what it retired a tag of once no tag holds it (the pointer and `:latest` moved off),
-  so a pruned release is not left pullable by digest. A retired floating tag is deleted once the
-  registry deletes tags alone; another retired tag stays.
+  deleted by digest when it is retired, since a release's own tag or another channel's disk set
+  may name it; the disk cleanup, which knows the sets, removes a disk none keeps. Before a tag
+  another one shares (or the installer's `:latest`) is retired, its content is tagged
+  `held-<12 hex digits of its digest>`: the registry, not a run's memory, records what waits for
+  its other tags to move, so a run stopped between the retirement and its sweep loses nothing.
+  A ship or a yank ends by deleting by digest the content the marks it made name that no other
+  tag holds; a prune does so for every mark, a stopped run's included (a mark never counts as a
+  holder), so a pruned release is not left pullable by digest. Only a prune judges another run's
+  marks: a ship sweeping them could delete content a concurrent ship is about to tag again. No
+  channel name, template or release tag may start with `held-`, or it would read as a mark.
+  A retired floating tag is deleted once the registry deletes tags alone; another retired tag
+  stays. A mutable release shipped over a build that had an image key, installer or OS bundle it
+  lacks untags those (their content marked held) before its manifest is written: once it is,
+  no later ship or prune of the tag would name them.
 - **Disk sets.** A disk set is several GB a release, while most releases move only the OS bundle
   and the images: `ship` publishes disks only with `--disks`, the publisher's call (the post-commit
   hook passes it from the hook's own flag or the commit's environment), or with every ship when
@@ -516,7 +525,16 @@ Off until the project configures a key (`signing: { provider: cosign-key, key: �
 - **Transport**: push auth is a standard registry login (§ 5.2), so cosign (v3) pushes its
   signatures itself with the publisher token, as an OCI referrer of the signed digest — a sigstore
   bundle — with no transparency-log upload: the trust anchor is the baked public key. Reads need
-  only the pull account, so verification works everywhere. The publisher hands cosign the
+  only the pull account, so verification works everywhere. A check reads at most 64 bundles of a
+  digest, newest first by the annotations cosign v3 writes on each referrer
+  (`dev.sigstore.bundle.predicateType`, `org.opencontainers.image.created`), passing over those
+  annotated with another predicate (SBOM attestations) and reading unannotated ones (and those
+  dated more than an hour ahead, which would otherwise outrank every fresh signature) last: someone
+  with push access piling referrers on a release can only push its signature out of the 64 read,
+  and a check that left candidates unread and found none answers "cannot check", never
+  "unsigned": an install fails closed rather than pass over that release for an older one (a
+  denial, as deleting its tags is, never a downgrade); the annotations order the reads, the
+  bundles read are still verified. The publisher hands cosign the
   credentials in a private Docker config per call, and refuses to sign where cosign could fall back
   to plain HTTP (a private IP or `*.localhost` registry other than loopback).
 - **Order**: an image is signed by digest before its tag moves; the release manifest is pushed by
@@ -2146,15 +2164,16 @@ every shape, the VM end-to-end test upgrading through it), then the health gate.
   start-first`): an appliance's clients cannot be told to retry, so its new container must serve
   before the old one stops. Compose has no start-first order outside Swarm, so the start scales the
   service to two with `--no-recreate` (the old container kept, the new one made with this start's
-  configuration), waits for it with `--wait`, then stops and removes the old one, before the
+  configuration), reads it until it serves, then stops and removes the old one, before the
   stack's own `up`, which then finds the service as it runs it. Stowage holds no port in between:
   two containers cannot publish one port, so a service reached from outside runs on the host's
   network and shares its port the canonical ways, `SO_REUSEPORT` or the app's own socket handoff
   (`update_socket`, a volume both containers mount); one behind the front is reached by name,
   which answers for both. A handoff the old process starts when told to go (`update_signal`)
-  cannot wait for the new container's health, which follows the handoff: the new one is started
-  without `--wait`, the old one signalled once the new one runs, and the new one's health read
-  until it decides. Running is not ready: a new container still preparing, or failing during it,
+  cannot wait for the new container's health, which follows the handoff: the old one is signalled
+  once the new one runs, and the new one's health read until it decides. Compose's `--wait` is
+  never asked, with or without a signal: one judge reads the new container (a decline under a
+  restart policy, a restart after the signal), where two would each see a part of it. Running is not ready: a new container still preparing, or failing during it,
   must not have the old one hand its listeners over, so `update_ready` names a file the new one
   writes in the shared directory once it can take them, and the signal waits for it (read with
   `docker cp`, which needs nothing in the image; against what the old container saw before the new

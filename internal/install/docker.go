@@ -64,15 +64,41 @@ func (d ExecTool) Run(ctx context.Context, c Cmd) ([]byte, error) {
 	if c.Stdout != nil {
 		cmd.Stdout = c.Stdout
 	}
+	// A failing command's output is returned with its error: a command over several objects
+	// (`docker inspect` of containers one of which went) prints what it found.
 	if err := cmd.Run(); err != nil {
 		msg := strings.TrimSpace(errb.String())
 		if msg == "" {
-			return nil, fmt.Errorf("%s %s: %w", filepath.Base(bin), strings.Join(head(c.Args, 2), " "), err)
+			return out.Bytes(), fmt.Errorf("%s %s: %w", filepath.Base(bin), strings.Join(head(c.Args, 2), " "), err)
 		}
-		return nil, fmt.Errorf("%s %s: %w: %s", filepath.Base(bin), strings.Join(head(c.Args, 2), " "), err, msg)
+		return out.Bytes(), fmt.Errorf("%s %s: %w: %s", filepath.Base(bin), strings.Join(head(c.Args, 2), " "), err, msg)
 	}
 	return out.Bytes(), nil
 }
+
+// runNamed runs c, a `docker run` or `compose run` of a container named name, and removes that
+// container by its name when the run was cut — its context ended, or the docker CLI was killed by
+// a signal —, as the container then runs on. A run that ended of itself (exit 2, "no answer",
+// included) is left as it is: `--rm` took its container. The removal takes a context of its own,
+// bounded (removeWait), as the run's may be what ended; a container gone already is no error, and
+// a removal that fails is joined to the run's error with the command that removes it.
+func (in *Installer) runNamed(ctx context.Context, name string, c Cmd) ([]byte, error) {
+	out, err := in.O.Docker.Run(ctx, c)
+	var exit *exec.ExitError
+	killed := errors.As(err, &exit) && exit.ProcessState != nil && !exit.ProcessState.Exited()
+	if err == nil || ctx.Err() == nil && !killed {
+		return out, err
+	}
+	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), removeWait)
+	defer cancel()
+	if _, rerr := in.O.Docker.Run(rctx, Cmd{Args: []string{"rm", "--force", name}}); rerr != nil && !strings.Contains(rerr.Error(), "No such container") {
+		err = errors.Join(err, fmt.Errorf("the container may still be running: `docker rm --force %s` (%w)", name, rerr))
+	}
+	return out, err
+}
+
+// removeWait bounds the removal of a named container whose run failed (runNamed).
+const removeWait = 30 * time.Second
 
 func head(s []string, n int) []string {
 	if len(s) < n {

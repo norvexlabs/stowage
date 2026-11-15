@@ -178,19 +178,19 @@ func TestAGateWithNoInstallClearsATrialOnly(t *testing.T) {
 		cleared                    bool
 		want                       string // in the error, or else in the log
 	}{
-		"switched, on trial":              {mode: "active", mark: "1.0.0-1", settings: this, vars: onTrial, cleared: true, want: "is marked good"},
-		"switched, always on trial":       {mode: "active", mark: "1.0.0-1", settings: this, vars: always, cleared: true, want: "is marked good"},
+		"switched, on trial":              {mode: "active", mark: "1.0.0 1", settings: this, vars: onTrial, cleared: true, want: "is marked good"},
+		"switched, always on trial":       {mode: "active", mark: "1.0.0 1", settings: this, vars: always, cleared: true, want: "is marked good"},
 		"not switched, on trial":          {mode: "active", settings: this, vars: onTrial, want: "nothing to judge"},
-		"switched to another, on trial":   {mode: "active", mark: "3.0.0-1", settings: this, vars: onTrial, want: "nothing to judge"},
-		"settings of another release":     {mode: "active", mark: "0.9.0-1", settings: "release:\n  version: 0.9.0\n  revision: 1\n  tag: 0.9.0-1\n  os: sha256:0\n", vars: onTrial, want: "nothing to judge"},
-		"settings of another revision":    {mode: "active", mark: "1.0.0-2", settings: "release:\n  version: 1.0.0\n  revision: 2\n  tag: 1.0.0-2\n  os: sha256:0\n", vars: onTrial, want: "nothing to judge"},
-		"settings naming no tag":          {mode: "active", mark: " ", settings: "release:\n  version: 1.0.0\n  revision: 1\n  os: sha256:0\n", vars: onTrial, want: "nothing to judge"},
-		"settings unreadable":             {mode: "active", mark: "1.0.0-1", settings: "release: [\n", vars: onTrial, want: "is not recognised"},
-		"no settings":                     {mode: "active", mark: "1.0.0-1", vars: onTrial, want: "nothing to judge"},
-		"switched, not on trial":          {mode: "active", mark: "1.0.0-1", settings: this, vars: map[string]string{assessEnable: "yes"}, want: "nothing to judge"},
-		"switched, passive":               {mode: "passive", mark: "1.0.0-1", settings: this, vars: onTrial, want: "nothing to judge"},
-		"switched, on trial, boot failed": {mode: "active", mark: "1.0.0-1", settings: this, vars: onTrial, boot: "failed", cleared: true, want: "is marked good"},
-		"switched, on trial, edit fails":  {mode: "active", mark: "1.0.0-1", settings: this, vars: onTrial, editErr: errors.New("read-only"), want: "switched to good failed"},
+		"switched to another, on trial":   {mode: "active", mark: "3.0.0 1", settings: this, vars: onTrial, want: "nothing to judge"},
+		"a mark of another release":       {mode: "active", mark: "0.9.0 1", settings: "release:\n  version: 0.9.0\n  revision: 1\n  tag: 0.9.0-1\n  os: sha256:0\n", vars: onTrial, want: "nothing to judge"},
+		"a mark of another revision":      {mode: "active", mark: "1.0.0 2", settings: this, vars: onTrial, want: "nothing to judge"},
+		"an empty mark":                   {mode: "active", mark: " ", settings: this, vars: onTrial, want: "nothing to judge"},
+		"a mark naming a tag":             {mode: "active", mark: "1.0.0-1", settings: this, vars: onTrial, want: "nothing to judge"},
+		"an upgrade's, no settings":       {mode: "active", mark: "1.0.0 1", vars: onTrial, cleared: true, want: "is marked good"},
+		"switched, not on trial":          {mode: "active", mark: "1.0.0 1", settings: this, vars: map[string]string{assessEnable: "yes"}, want: "nothing to judge"},
+		"switched, passive":               {mode: "passive", mark: "1.0.0 1", settings: this, vars: onTrial, want: "nothing to judge"},
+		"switched, on trial, boot failed": {mode: "active", mark: "1.0.0 1", settings: this, vars: onTrial, boot: "failed", cleared: true, want: "is marked good"},
+		"switched, on trial, edit fails":  {mode: "active", mark: "1.0.0 1", settings: this, vars: onTrial, editErr: errors.New("read-only"), want: "switched to good failed"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -262,7 +262,7 @@ func TestAGateKeepsTheOSAFirstBootSwitchedTo(t *testing.T) {
 			g := newGate(t, "active", onTrial, true)
 			g.probe.status = 503
 			g.gate.In.R.Manifest.Tag = "" // an OS bundle's installer carries no tag
-			if err := os.WriteFile(osSwitchFile(g.dir), []byte("1.0.0-1\n"), 0o600); err != nil {
+			if err := os.WriteFile(osSwitchFile(g.dir), []byte("1.0.0 1\n"), 0o600); err != nil {
 				t.Fatal(err)
 			}
 			g.gate.In.O.Settings = filepath.Join(t.TempDir(), "install.yaml")
@@ -651,6 +651,66 @@ func TestTheHealthCommandAnswersReady(t *testing.T) {
 		if left, _ := filepath.Glob(filepath.Join(g.dir, ".stowage-health-*.yaml")); len(left) > 0 {
 			t.Errorf("%s: left %v", name, left)
 		}
+	}
+}
+
+// A health check's container carries the boot it ran in; the gate removes those an earlier boot
+// left (a reboot interrupted them), never this boot's, which a running check may own, and none
+// when this boot's id does not read.
+func TestTheGateRemovesTheHealthContainersOfEarlierBoots(t *testing.T) {
+	t.Parallel()
+	g := newGate(t, "", nil, false)
+	id := filepath.Join(t.TempDir(), "boot_id")
+	if err := os.WriteFile(id, []byte("boot2\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	g.gate.In.O.BootIDFile = id
+	var mu sync.Mutex
+	var removed []string
+	var file string
+	healthy := g.docker.answer
+	g.docker.answer = func(a string) ([]byte, bool, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch {
+		case a == "ps --all --filter label="+HealthBootLabel+" --format {{.ID}} {{.Label \""+HealthBootLabel+"\"}}":
+			return []byte("aaa boot1\nbbb boot2\nccc \n"), true, nil
+		case strings.HasPrefix(a, "rm --force "):
+			removed = append(removed, strings.TrimPrefix(a, "rm --force "))
+			return nil, true, nil
+		case strings.HasSuffix(a, " "+HealthService):
+			left, _ := filepath.Glob(filepath.Join(g.dir, ".stowage-health-*.yaml"))
+			if len(left) == 1 {
+				raw, _ := os.ReadFile(left[0])
+				file = string(raw)
+			}
+		}
+		return healthy(a)
+	}
+	if err := g.gate.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if fmt.Sprint(removed) != "[aaa ccc]" {
+		t.Errorf("removed %v", removed)
+	}
+	// The check's own container is labelled with this boot.
+	g.gate.In.R, _ = bundledInstaller(t, "1.0.0", 1, func(s *spec.Spec) {
+		s.Health = spec.Provider{Name: "command", Config: map[string]any{"image": "api", "cmd": []any{"notes-api", "ready"}}}
+	})
+	g.docker.health = func(map[string]any) (string, error) { return `{"ready": true}`, nil }
+	if err := g.gate.In.ready(context.Background(), g.readEnv(), nil); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(file, HealthBootLabel+": boot2") {
+		t.Errorf("the check's compose file:\n%s", file)
+	}
+	removed = nil
+	g.gate.In.O.BootIDFile = filepath.Join(t.TempDir(), "absent")
+	if err := g.gate.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(removed) > 0 {
+		t.Errorf("removed with no boot id: %v", removed)
 	}
 }
 

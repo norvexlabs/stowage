@@ -49,6 +49,28 @@ type Params struct {
 	KernelArgs map[string]spec.HostValue
 }
 
+// BackupSchedule is the scheduled backup's default calendar event, the bundle's timer's
+// (Params.BackupSchedule renders it there) and the host daemon's default alike.
+const BackupSchedule = "*-*-* 03:00:00 UTC"
+
+// BackupRetry and BackupStartLimit are a scheduled backup unit's retries, its [Service]'s and its
+// [Unit]'s: a run that fails (refused while another job runs, a destination that did not answer)
+// is tried again 15 minutes later, at most 6 times in 3 hours, rather than wait for the next day.
+// The bundle's unit (Params.BackupRetry, Params.BackupStartLimit) and a Docker install's take them.
+const (
+	BackupRetry      = "Restart=on-failure\nRestartSec=15min"
+	BackupStartLimit = "StartLimitIntervalSec=3h\nStartLimitBurst=6"
+)
+
+// BackupSchedule renders BackupSchedule in the bundle's files.
+func (Params) BackupSchedule() string { return BackupSchedule }
+
+// BackupRetry renders BackupRetry in the bundle's files.
+func (Params) BackupRetry() string { return BackupRetry }
+
+// BackupStartLimit renders BackupStartLimit in the bundle's files.
+func (Params) BackupStartLimit() string { return BackupStartLimit }
+
 // Purged are the packages kairos-init installs that the bundle removes, before its init stage: no
 // part of the bundle uses them, and each one is a service, a listener, a report to a vendor or a
 // tool for storage the appliance does without. PurgedAfterInit go after it, as its init stage

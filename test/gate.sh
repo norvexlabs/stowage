@@ -32,6 +32,7 @@ else
 fi
 
 declare -A why=()
+unrouted=()
 need() { # need <suite> <path>: the path runs the suite (the first path is kept as the reason)
 	[[ -n ${why[$1]:-} ]] || why[$1]=$2
 }
@@ -54,7 +55,19 @@ kairos_lines() {
 	[[ "$(git show "$base:$1" 2>/dev/null | kairos_block)" != "$(kairos_block <"$1")" ]]
 }
 
-code=false hooks=false
+# os_allow_lines <audit-allow.yaml>: an entry whose artifact is os or "*" differs, before and after
+# (an entry is its `- ` line and the lines under it, to the next entry; block or flow style, the
+# value bare or quoted).
+os_allow_block() {
+	awk '/^ *- / { if (e != "" && os) printf "%s", e; e = ""; os = 0 } { e = e $0 "\n" }
+		/(^|[ {,])artifact: *(os|"os"|\x27os\x27|"\*"|\x27\*\x27) *([,}#]|$)/ { os = 1 }
+		END { if (e != "" && os) printf "%s", e }'
+}
+os_allow_lines() {
+	[[ "$(git show "$base:$1" 2>/dev/null | os_allow_block)" != "$(os_allow_block <"$1")" ]]
+}
+
+code=false hooks=false selfaudit=false release=false
 for f in "${changed[@]}"; do
 	case $f in
 	*.md | LICENSE) continue ;;
@@ -73,7 +86,11 @@ for f in "${changed[@]}"; do
 			lifecycle "$f"
 		fi
 		;;
-	internal/registry/* | internal/release/* | internal/publish/* | internal/cli/* | cmd/stowage/*)
+	# The publisher: its commands, the project it reads, its lock, its build graph's inputs, the hook
+	# that ships on a push.
+	internal/registry/* | internal/release/* | internal/publish/* | internal/cli/* | cmd/stowage/* | \
+		internal/hook/* | internal/lock/* | internal/project/* | internal/dockerfile/* | internal/digest/* | \
+		internal/changelog/* | internal/gitcmd/*)
 		need e2e "$f"
 		lifecycle "$f"
 		[[ $f == internal/publish/os.go ]] && need e2e-kairos "$f"
@@ -159,7 +176,29 @@ for f in "${changed[@]}"; do
 		need e2e-kairos "$f"
 		need e2e-full-vm "$f"
 		;;
-	internal/kairos/* | internal/graph/*) need e2e-kairos "$f" ;;
+	# The build graph: every ship's skip and re-tag decision, the OS keys' bundle.
+	internal/graph/*)
+		need e2e "$f"
+		lifecycle "$f"
+		need e2e-kairos "$f"
+		;;
+	internal/kairos/*) need e2e-kairos "$f" ;;
+	# The front every Docker install runs: every ship builds it, every lifecycle serves through it.
+	internal/front/*)
+		need e2e "$f"
+		lifecycle "$f"
+		;;
+	# Read by the installer and the publisher alike: the spec's decoding, the providers' settings,
+	# the `command` contract, the volumes' ownership.
+	internal/spec/* | internal/providers/* | internal/command/* | internal/chown/*)
+		need smoke-install "$f"
+		need e2e "$f"
+		lifecycle "$f"
+		;;
+	# make check and the examples' lint prove them; a test helper runs no suite.
+	internal/lint/* | internal/testutil/*) ;;
+	# Stowage's own release gate: make self-audit (images built, scanned; needs the network).
+	audit-allow.yaml | test/selfaudit/*) selfaudit=true ;;
 	internal/truenas/*) need e2e-vm "$f" ;;
 	examples/minimal/*)
 		need e2e "$f"
@@ -181,6 +220,15 @@ for f in "${changed[@]}"; do
 		fi
 		;;
 	examples/full/deploy/compose.yaml) need e2e-full "$f" ;;
+	# The allowances: an entry of the OS bundle's (artifact os or "*") is audited only by the ship
+	# that keeps the kairos shape, e2e-full-vm's.
+	examples/full/audit-allow.yaml)
+		need e2e-full "$f"
+		need e2e-full-k8s "$f"
+		if os_allow_lines "$f"; then
+			need e2e-full-vm "$f"
+		fi
+		;;
 	examples/stateless/*) need e2e-stateless "$f" ;; # its chart is linted only: no suite installs it on Kubernetes
 	examples/full/*) # the images, the spec, the migrations: both shapes run them
 		need e2e-full "$f"
@@ -192,7 +240,7 @@ for f in "${changed[@]}"; do
 		lifecycle "$f"
 		vm_side "$f"
 		;;
-	Dockerfile | Makefile) # the binaries' build, the targets
+	Dockerfile | Makefile | .dockerignore) # the binaries' build, its context, the targets
 		need e2e "$f"
 		need smoke-install "$f"
 		lifecycle "$f"
@@ -211,16 +259,27 @@ for f in "${changed[@]}"; do
 		need e2e "$f"
 		lifecycle "$f"
 		;;
+	# The release workflow's reading of CHANGELOG.md: test/release.sh after lint. CI's other steps
+	# run on a push.
+	.github/workflows/* | test/release.sh | test/release-notes.sh) release=true ;;
+	# No suite: the gate's plan prints itself, the docs' pictures, git's ignores.
+	test/gate.sh | docs/* | .gitignore) ;;
+	*) unrouted+=("$f") ;;
 	esac
 done
 
+# A path no arm names would run no suite unseen: each gets its rule, here and in CLAUDE.md gate 1.
+if ((${#unrouted[@]} > 0)); then
+	printf 'gate: no rule for %s: add its suites (or none) to test/gate.sh and CLAUDE.md gate 1\n' "${unrouted[@]}" >&2
+	exit 1
+fi
 if ! $code; then
 	echo "gate: nothing but Markdown changed against $base: no gate (a self-review against the code is enough)"
 	exit 0
 fi
 order=(smoke-install e2e e2e-docker e2e-full e2e-stateless e2e-k8s e2e-full-k8s e2e-kairos e2e-vm e2e-full-vm)
 parallel=() chain=()
-echo "gate: against $base, ${#changed[@]} paths changed; make check, make build, lint$($hooks && echo ", test/hooks.sh"), then:"
+echo "gate: against $base, ${#changed[@]} paths changed; make check, make build, lint$($hooks && echo ", test/hooks.sh")$($selfaudit && echo ", make self-audit")$($release && echo ", test/release.sh"), then:"
 for s in "${order[@]}"; do
 	if [[ -n ${why[$s]:-} ]]; then
 		echo "  $s  (${why[$s]})"
@@ -250,6 +309,8 @@ make build
 ./bin/stowage -C examples/full lint
 ./bin/stowage -C examples/stateless lint
 if $hooks; then test/hooks.sh; fi
+if $selfaudit; then make -o build self-audit; fi
+if $release; then test/release.sh; fi
 # The VM chain runs one suite at a time, beside the parallel suites. Both run the binaries the
 # build above made (-o build): a suite's own build would rewrite ./bin while another one runs a
 # binary from it, which exec then refuses (text file busy).

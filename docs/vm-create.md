@@ -41,7 +41,9 @@ in the same installer (bootstrap it as above, then `sh <name>.sh vm create …`,
   `--registry`, `--registry-ca` and `--registry-login-file` (checked as `vm create` checks it;
   the seed names its host alone, `registry_login`, and the program gives the file over SSH once
   the VM answers, `sudo <short>-stow registry-login -`), `--channel` (the channel the first install follows; default
-  the release's), and its own: `--await-secrets` (the first install waits for a decrypted
+  the release's; another channel must hold a release of the project in the registry the seed
+  names, else it is refused: `--channel C: the registry P holds no release of <name> on C (this
+  release is on <channel>)`), and its own: `--await-secrets` (the first install waits for a decrypted
   `secrets export`, given over SSH once the VM answers, `sudo <short>-stow install --secrets -
   --no-input`, as `vm create --secrets` makes it; a machine made again), `--tls byo` (it waits
   for the certificate, its key and CA, and the secret inputs, given over SSH, `sudo <short>-stow
@@ -244,7 +246,8 @@ in the same installer (bootstrap it as above, then `sh <name>.sh vm create …`,
   into its seed and, with OpenTofu, the module's variables, which every later apply of that state
   reuses: the NICs take the MACs the run that wrote their seed printed). A server's NICs are its own, each named
   by the MAC given (`--interface ROLE=mac=…` for each, one NIC or more: a server may have more
-  ports than the release names). A cloud, which gives its NICs' MACs itself, takes one NIC (an optional one not asked is none), and no
+  ports than the release names; one missing is refused naming the NICs this run makes, and the
+  optional ones not asked apart: `; the optional <role> too, when given: --interface <role>=mac=…`). A cloud, which gives its NICs' MACs itself, takes one NIC (an optional one not asked is none), and no
   `mac=` (`<cloud> names its VMs' NICs itself, one here: …`; `mac=: <cloud> gives its VMs' NICs
   their MACs`). A VM keeps its NICs as its cloud-config named them: `network set`'s override
   matches what the cloud-config's `05-<name>-static.network` matches, whatever the running
@@ -336,11 +339,15 @@ in the same installer (bootstrap it as above, then `sh <name>.sh vm create …`,
   them, the set its manifest names (`boot_disks`); a set no longer in the registry (a newer one
   replaced it) gives way to the set of the channel's pointer (its manifest signed by a key this
   `<short>-stow` carries), and a channel holding none is refused, naming `stowage ship --disks`.
+  The release's own set, the registry holding some of its disks, is the one it boots: with
+  `--platform` given, one the registry holds none of that platform's formats of (a mirror
+  exported with some formats alone) is refused naming the format this registry lacks, never
+  replaced by another release's set; so is a channel's set holding none.
   Another release's set must have been published by stowage 0.6.0 or later, whose OS takes another
   release (refused otherwise). The VM's settings then name the release to install (`release`:
   its version, revision, tag and OS bundle digest): its first boot writes that release's OS
   bundle into the passive slot (`kairos-agent upgrade`, by digest, from the registry or the
-  mirror the settings name), records it in `/usr/local/<name>.os-switch`, and reboots into it;
+  mirror the settings name), records it (version and revision) in `/usr/local/<name>.os-switch`, and reboots into it;
   the boot after it installs (a boot still on another OS after that stops, naming the file).
   `vm create --create opentofu` waits 40 minutes by default then, rather than 20, and says so as
   it fetches the disk (`fetching <name>'s <format> disk of <tag> (…): <name> <v> published none`,
@@ -431,7 +438,7 @@ in the same installer (bootstrap it as above, then `sh <name>.sh vm create …`,
   | `proxmox` (preview) | `bpg/proxmox` 0.117.0 | the image uploaded to a datastore with *Import* content (not enabled by default: Datacenter > Storage), the seed to one with *ISO* content, both through the API (the token alone, no SSH to the node); an OVMF VM importing the image, grown to `disk_gib` (the app's `--disk` and Kairos's share), the seed on its CD-ROM, a virtio NIC with a queue per vCPU (at most 64); no address (no guest agent) | `node` (required), `datastore` (`local-lvm`), `import_datastore` (`local`), `iso_datastore` (`local`), `bridge` (`vmbr0`) |
   | `vmware` (preview) | `vmware/vsphere` 2.17.1 | the OVA deployed, its disk grown to `disk_gib` (the app's `--disk` and Kairos's share), the seed uploaded to the datastore on its CD-ROM; its address when VMware tools report one | `datacenter`, `cluster`, `datastore`, `host` (required), `network` (`VM Network`), `folder` |
   | `aws` (preview) | `hashicorp/aws` 6.69.1 | by its image module, the raw image uploaded to S3 (`stowage/<name>-<hash>.raw`), imported as a snapshot (the `vmimport` role) and registered as a UEFI image; an instance launched from it with the cloud-config as its user data (IMDSv2), with `eip_allocation_id` that Elastic IP (reserved beforehand, released from it and kept by `vm destroy`); that address, else its public one, else its private one | `region`, `bucket`, `subnet_id` (required), `security_group_ids` (comma-separated), `instance_type` (`t3.medium`), `vmimport_role` (`vmimport`), `eip_allocation_id` |
-  | `gcp` (preview) | `hashicorp/google` 8.7.0 | by its image module, the image's `tar.gz` uploaded to Cloud Storage (`stowage/<name>-<hash>.tar.gz`) and a UEFI image declaring gVNIC; an instance booted from it with the cloud-config as its `user-data`, tagged with its name; with `firewall`, firewall rules on its network reaching that tag (`<name>-<hash>-ssh`: TCP 22 from `ssh_sources`' IPv4 sources; `<name>-<hash>-p<hash>`: one for each set of IPv4 `sources` among `open_ports`, its ports from them; a port with no IPv4 source makes none), for which the account OpenTofu runs as must be allowed to create and delete firewall rules (`compute.firewalls.*`, e.g. `roles/compute.securityAdmin`); its external address. Without `firewall`, `vm create` warns `no firewall rule is made on Google Cloud: the network's own rules must let tcp/22, <the opened ports> reach the VM`: the default network's `default-allow-ssh` opens SSH to every source, which the VM's firewall then narrows, and nothing opens the front's ports. With `firewall=true` and `--ssh-allow` naming IPv6 sources alone, no SSH rule is made and `vm create` warns `SSH's sources name no IPv4 address`. A value other than `true`, `false`, `1` or `0` is refused before OpenTofu runs. The network's own rules apply either way | `project`, `zone`, `bucket` (required), `firewall` (`false`), `network` (`default`), `subnetwork`, `machine_type` (`e2-medium`), `nic_type` (`GVNIC`, or `VIRTIO_NET`), `nat_ip` (a static external address of the zone's region, reserved beforehand and kept by `vm destroy`; else an ephemeral one) |
+  | `gcp` (preview) | `hashicorp/google` 8.7.0 | by its image module, the image's `tar.gz` uploaded to Cloud Storage (`stowage/<name>-<hash>.tar.gz`) and a UEFI image declaring gVNIC; an instance booted from it with the cloud-config as its `user-data`, tagged with its name; with `firewall`, firewall rules on its network reaching that tag (`<name>-<hash>-ssh`: TCP 22 from `ssh_sources`' IPv4 sources; `<name>-<hash>-p<hash>`: one for each set of IPv4 `sources` among `open_ports`, its ports from them; a port with no IPv4 source makes none), for which the account OpenTofu runs as must be allowed to create and delete firewall rules (`compute.firewalls.*`, e.g. `roles/compute.securityAdmin`); its external address. Without `firewall`, `vm create` warns `no firewall rule is made on Google Cloud: the network's own rules must let tcp/22, <the opened ports> reach the VM`: the default network's `default-allow-ssh` opens SSH to every source, which the VM's firewall then narrows, and nothing opens the front's ports. With `firewall=true` and `--ssh-allow` naming IPv6 sources alone, no SSH rule is made and `vm create` warns `SSH's sources name no IPv4 address`. A value other than `true`, `false`, `1` or `0` is refused before OpenTofu runs, as is any value a module's `bool` or `number` variable (`type` in its `.tf` or `.tf.json`) does not take, given or answered in the form (`<name>: "<value>": the module's <name> is a bool: true or false`, `… is a number`). The network's own rules apply either way | `project`, `zone`, `bucket` (required), `firewall` (`false`), `network` (`default`), `subnetwork`, `machine_type` (`e2-medium`), `nic_type` (`GVNIC`, or `VIRTIO_NET`), `nat_ip` (a static external address of the zone's region, reserved beforehand and kept by `vm destroy`; else an ephemeral one) |
   | `azure` (preview) | `hashicorp/azurerm` 5.10.0 | by its image module, the fixed VHD uploaded as a page blob (`stowage-<name>-<hash>.vhd`) and a generation 2 image; a VM with a static public address (`public_ip_name`'s, a Standard public IP of the resource group reserved beforehand, which `vm destroy` keeps, else one made with the VM) and accelerated networking made from it with the cloud-config as its custom data (no VM agent); its public address | `resource_group`, `location`, `storage_account`, `subnet_id` (required), `container` (`vhds`), `vm_size` (`Standard_B2ls_v2`: a size that offers accelerated networking), `accelerated_networking` (`true`), `public_ip_name` |
   | `scaleway` (preview) | `scaleway/scaleway` 2.91.0 | by its image module, the qcow2 image uploaded to Object Storage (`stowage/<name>-<hash>.qcow2`), imported as a Block Storage snapshot and made an x86_64 image (UEFI); a routed public IPv4 address (no IPv6): `ip_id`'s, a flexible IP of the zone reserved beforehand, which `vm destroy` keeps, else one made with the VM; unless `security_group_id` is given, a stateful security group named as the VM that drops every inbound packet but TCP 22 from `ssh_sources` (IPv4 and IPv6) and each of `open_ports` from its `sources` (a rule per source: none for a route whose allowlist is empty), and accepts every outbound one; an instance of `instance_type` from the image with an SBS root volume of `disk_gib` (in GB, rounded up from GiB) and the cloud-config as its `cloud-init` user data; its public address. The credentials are the provider's (`SCW_ACCESS_KEY` / `SCW_SECRET_KEY`, or the `scw` configuration file); the account needs Instances, Block Storage and Object Storage access in the project | `zone`, `bucket` (required: the bucket in the zone's region), `project` (the credentials' default project), `instance_type` (`PLAY2-NANO`), `security_group_id`, `ip_id` |
 
@@ -484,7 +491,10 @@ in the same installer (bootstrap it as above, then `sh <name>.sh vm create …`,
     flags), and on TrueNAS's built-in module `pool`, `parent_dataset`, `nic_attach` and
     `insecure_skip_verify` (its flags and `TRUENAS_INSECURE_SKIP_VERIFY` give them) are refused. A required variable not given is asked on a terminal (its description as
     the question), else refused (`--tofu-var NAME=<value> is required by the module`); one with a
-    default is asked too, empty keeping the module's default. The review lists them.
+    default is asked too, empty keeping the module's default. A variable of `type = bool` takes
+    `true`, `false`, `1` or `0`; one of `type = number` an HCL number literal (`-1.5`, `2e3`; no
+    `+`, hexadecimal, `NaN` or infinity), refused otherwise (`"<v>": the module's <name> is a
+    number`). The review lists them.
   - `--vm-name` is letters and digits on `truenas` (as TrueNAS names a VM); elsewhere lower-case
     letters, digits and `-`, starting with a letter, at most 63 (default the host name in lower
     case). `--pool`, `--dataset` and `--bridge` are TrueNAS's built-in module's alone.
@@ -524,7 +534,8 @@ in the same installer (bootstrap it as above, then `sh <name>.sh vm create …`,
     Proxmox's `bridge`, vSphere's `network` variable; vSphere's OVF network map takes the
     primary's). Its
     `*.tf` files are read as `tofu fmt` writes them (a variable block on one line, or closing at a
-    lone `}`). It outputs `id` (what the platform calls the VM;
+    lone `}`; its own `type` and `default`, however indented, never an object's attribute of
+    that name). It outputs `id` (what the platform calls the VM;
     required: `the module has no output id` fails the run after the apply, the state kept) and
     `address` (where the VM answers, empty when the platform does not tell); `vm create` reads them
     with `tofu output -json`, logs `OpenTofu created the VM <name> (<id>)`, and waits at `address`
@@ -578,7 +589,8 @@ in the same installer (bootstrap it as above, then `sh <name>.sh vm create …`,
     (`TF_IN_AUTOMATION=1`, `TF_INPUT=0`, and `STOWAGE_CTL` set to the running `<short>-stow`, which
     the module's steps run). TrueNAS's module creates a staging dataset `<vm-name>-staging` and a zvol `<dataset>/<vm-name>` of `disk_gib` (the app's `--disk` and Kairos's share; 16K blocks,
     LZ4), uploads the disk image (checked against its SHA-256 first; an upload already there at
-    its size is not sent again) and converts it into the zvol, uploads the seed, creates the VM
+    its size is not sent again) and converts it into the zvol, uploads the seed (every upload mode
+    0600: the seed holds the one-time host key, the disk the pull account), creates the VM
     (UEFI, host CPU, `--cpus` cores, autostart) with the disk, a VirtIO NIC whose MAC is derived
     from the VM's name (the same at every start, so a DHCP lease follows it) — or one for each NIC
     the release names (`nics`), each with its MAC on its bridge — and the seed as its
@@ -687,7 +699,8 @@ in the same installer (bootstrap it as above, then `sh <name>.sh vm create …`,
   by the role (`has
   not booted again naming a NIC <role> after …`, with the journal to read, when it does not). Run
   again for a role the state attaches, it goes on with the state's MAC and bridge (another `mac=`
-  or `attach=` is refused) and, when the plan has no changes, reboots the VM instead (`sudo
+  is refused; another `attach=` too while the state holds the NIC's device — one an apply that
+  failed on a wrong bridge left out is added on the bridge given, its plan read as above) and, when the plan has no changes, reboots the VM instead (`sudo
   <short>-stow reboot`: its 30 s drain, its refusal the error) for the addressing given. Refused before the VM is changed: a role that is not one of the release's
   NICs, the primary, a MAC another NIC of the state has (the module's own derived one included),
   a VM with no state or no VM name in it, a VM made with another module, a `--user` that is not a

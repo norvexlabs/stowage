@@ -121,12 +121,6 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
 
 ## Should
 
-- **`-f`'s spec path is resolved through the working tree's links, not the commit's**: a hook
-  ship (`specInRepo`) resolves the spec's path with the working tree's current symbolic links,
-  then reads it at the commit; a link the next commit changed before a queued ship runs makes it
-  read another path at the commit than the checkout follows (refused as not committed, or another
-  spec). Keep the path as written and let the commit's links resolve it (`gitcmd.FileAt`).
-
 - **ACME proven end to end**: no suite runs an ACME server, so `acme` and `dns-cloudflare` are
   proven by the Caddyfile they write alone — for the HTTP routes and for a domain the front holds
   for L4 routes alone (a site answering 404 over HTTPS, its challenges on the front's ports 80
@@ -156,24 +150,6 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
   it with an e2e: a request with a forged `X-Forwarded-For` reaches an echo upstream with the
   test client's own address alone, over IPv4 and, with `--ipv6`, over IPv6.
 
-- **The health gate's first install after a pre-install `upgrade`**: an `upgrade` run before a VM's
-  first install writes a newer OS on trial; that release's first install failing after `.env` is
-  written, or made by `install --given`/`--secrets` after the gate (the install awaiting them),
-  falls back at the next reboot to the older OS, whose installer refuses the newer install. The
-  switch's case is covered by its `<dir>.os-switch` mark; this one has no lasting mark (firstBoot
-  removes `<dir>.os-upgrade`). A field of the install's own state ("made on an OS written before
-  it") would cover both, and outlive an operator removing the mark. Check first that `upgradedTo`
-  can be true on a VM at all: it compares `<dir>.os-upgrade` with the installer's own tag, and an
-  OS bundle's installer carries none (the gate's switch check reads the settings' release instead).
-  `crossingAsked` (`reset-db --new-baseline`'s mark) compares the same way; e2e-vm's crossing
-  passes, so find which path it takes before trusting either, and match marks on version and
-  revision in one helper.
-- **Keep a raised module's version in one place**: klauspost/compress is pinned in go.mod and in the
-  front, backup and scanner recipes, in three syntaxes, and only `make self-audit` notices one left
-  behind. A test comparing each recipe's pin with go.mod would catch it in `make check`.
-- **The front's `--replace` is a pin, not a floor**: a later Caddy needing a newer klauspost/compress
-  is silently held back to the replaced version. The recipe should fail when the replacement is below
-  what Caddy requires.
 - **A file input on a chart**: lint refuses one asked on the `kubernetes` shape, as the Secret holds
   its recorded form and a chart can only mount a key as it is. A second Secret of the decoded
   contents, named in `.Values.stowage`, would give it the same reach as on Docker and the VM.
@@ -188,10 +164,6 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
   `vm destroy`). The guest's boot, its SSH and its first install, and AppArmor's confinement
   (Ubuntu's `virt-aa-helper`), need a stock Ubuntu LTS host with KVM and AppArmor enforcing; each
   built-in module leaving preview gets the same run on its platform.
-- **A start does not say when the memory floors exceed the host's RAM**: a share's `min` (or the
-  compose file's own limit) on a host smaller than it gives a limit, and `STOWAGE_MEM_LIMIT_MB`,
-  over the RAM the host has (`STOWAGE_HOST_MEM_MB` beside it says so). Lint warns on the least VM;
-  a Docker host of any size gets no word: the start could log it.
 - **A built-in module's apply leaves no drift**: a `tofu plan -detailed-exitcode` after the apply
   returning 0 would catch any attribute the platform normalizes (libvirt sorted the firmware's
   features); run it where a suite applies a module for real (e2e-vm). libvirt's module was
@@ -204,35 +176,12 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
   it (the failed `vm create` names `virsh undefine … --nvram`). Fixed upstream (the resource kept
   in the state, tainted) or by a `vm destroy` that reaches the platform, it needs no hint.
 
-- **A change to `examples/full`'s `os` allowances is audited by no suite the gate picks**: e2e-full
-  and e2e-full-k8s drop the kairos shape and those entries, so an entry removed too early first
-  fails at e2e-full-vm or a real ship. Route those entries to e2e-full-vm in `test/gate.sh` and
-  gate 1.
-
-- **The lint tests edit a live allowance**: `TestEachRuleFiresOnFull` and `TestAuditAllowNotice`
-  anchor on the `runc` entry of `examples/full/audit-allow.yaml`, which goes when Docker ships a
-  fix. Have them add a fixture entry to the copied example instead. The base image's digest is
-  likewise repeated across `graph_test.go` and `lint_test.go`, and `TestKairosSettingsReachTheBundle`
-  anchors on its first hex digit: a repin edits them all, and a digest starting with `d` turns that
-  test's edit into a no-op. A shared constant keeps a repin to one line.
-
-- **A `local` rclone destination is accepted, then never works**: where rclone runs in a
-  throw-away container (`docker run --rm`, the Docker shape), a `type = local` remote writes
-  inside it and the file is gone — `backup config` saves it, then `backup verify` and `backup run`
-  fail with `was written but does not read back … directory not found`, naming neither the cause
-  nor the fix. Refuse a `local` (or `alias` of one) remote at `backup config` and `verify
-  --destination`, saying the destination must be reachable from outside the host's containers
-  (SFTP, S3, …), or mount the path into the rclone container. Gate: smoke-install, `backup config`
-  refusing a local remote and accepting an SFTP one.
 
 - **A volumes-age-rclone backup reads its volumes live**: without a dump, the archive is the
   whole backup, and files a service writes together (a CA's index and serial) may be archived
   between two writes. A provider option stopping the services that mount the volumes for the
   archive (a short downtime per backup), or a service's own quiesce hook, would make it consistent.
 
-- **A set's input default holding a variable is checked at the start only**: lint skips a
-  `services.<name>.sets` input whose `default` holds `${…}`, and the expanded default is not
-  checked before the start, which then fails after the tables loaded.
 - **A host-network service's ports, per client container**: the VM accepts them from every
   container of the stack (`iifname "br-*"`); lint warns of a guarded front route to one. Accepting
   each port only from the containers that reach it (the front, a dependent) needs addresses
@@ -254,40 +203,23 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
   device (it exists, is up, holds the default route for `primary`).
 - **An upgrade adding a route on the VM, leftovers**: the daemon's check refuses a route the boot
   could not decide, but a new domain input cannot be given on the VM (neither the daemon nor the
-  boot takes `--set`: `UpgradeRequest` would carry values to the boot), and its loopback-port
-  refusals name `--ports`, which the VM's `upgrade` does not take. The daemon judges with its own
-  Stowage's rules (an older one may refuse what the boot's would accept), and leaves out the
-  kept-installer, schema-baseline and L4 checks, which need the boot's OS. `k8s upgrade` was not
-  looked at for a release adding a route.
+  boot takes `--set`: `UpgradeRequest` would carry values to the boot). The daemon judges with its
+  own Stowage's rules (an older one may refuse what the boot's would accept), and leaves out the
+  kept-installer, schema-baseline and L4 checks, which need the boot's OS.
   The daemon's check downloads the target's whole installer in the request, before the job, with
-  no progress (the job, or reading the spec alone, would show it). A route the release adds on the
-  port of a route it removes is refused in loopback mode as in use (the running front holds it).
-- **`tune`'s report of a consented host's tables**: `ok` once the install's record lists the table
-  loaded (`.stowage-nftables`), not from `nft list table` (a reboot before the boot unit ran
-  leaves it listed); no test runs `tune`'s report on a consented host.
-- **A Docker host's gateway, leftovers** (review): a consent whose record write fails after the
-  unit was enabled leaves the unit for a record that was there before (untested: no fault
-  injection of the record's write); a moved install's applied chain, unit and files are reverted
-  only from its old directory (moved back); two installs of one project on a host share their
-  tables' names; the record is read several times per start (one read per run, cached, would do).
-  A host firewall that flushes DOCKER-USER (`firewall-cmd --reload`) drops the chain's jump while
-  the /run record stays: starts skip it and `tune`/`status` call it applied until a reboot
-  (check the jump with `-C` before trusting the record). `tune` run not as root cannot read a
-  0600 `.env`, so it does not see a role's recorded NIC. `tune --print` still says a table is
-  "not written: load it with nft -f", beside the consent path.
+  no progress (the job, or reading the spec alone, would show it).
+- **A Docker host's gateway, leftovers** (review): the record is read several times per start (one
+  read per run, cached, would do).
 - **A Docker host's gateway proven end to end**: `tune --apply`'s tables, forwarding chain,
   networkd files and boot unit are unit-tested; no suite applies them to a real Docker host (the
   gate's host is not one to change). A disposable Docker host (a VM of the Docker shape) running
   e2e-full's `tune --apply --dir`, a reboot, `status`, then `tune --revert`, would prove them.
-- **A restore loads a backup it cannot authenticate** (security audit 2026-10-26, Medium): age
-  gives confidentiality only, the recipients are public, and `ownBackup` checks the object's name
-  (`internal/install/hostdsecrets.go`), so whoever can write the destination can plant (or
-  overwrite in place) a dump the operator's identity decrypts. `pg_restore` then runs its TOC as
-  the migrate role with owners kept, the image's superuser in the examples (`COPY … FROM
-  PROGRAM`, `CREATE ROLE … SUPERUSER`), and the volume archives are untarred as root. Record a
-  digest (or a MAC under a key hostd holds) of each object at backup and refuse a restore that
-  does not match, with an operator override for a machine made again; load as a non-superuser
-  owner role, or filter the TOC to schema objects and data.
+- **A restore `--unrecorded` runs the dump's TOC as the migrate role** (security audit 2026-10-26,
+  Medium): a restore loads the copy whose SHA-256 it checked against the backup's record, so a
+  planted or swapped object never loads; an object without a record, loaded with `--unrecorded`,
+  is unchecked, and `pg_restore` runs its TOC as the migrate role with owners kept (the image's
+  superuser in the examples: `COPY … FROM PROGRAM`, `CREATE ROLE … SUPERUSER`). Load it as a
+  non-superuser owner role, or filter the TOC to schema objects and data.
 
 - **A start-first start's engine calls**: each dependency of each start-first service costs four
   sequential calls (`ps`, `inspect`, `compose config --hash`, `image inspect`), repeated across
@@ -346,11 +278,6 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
   umask 027, password ageing and faillock). Adopting it needs the install's writes to set their
   modes whatever the umask, and the operator account exempt from ageing (it has no password).
 
-- **A front route's guards on Kubernetes are the chart's**: `client_auth`, `allow_input` and
-  `forward_auth` are enforced by the Docker and VM fronts; on Kubernetes the chart's ingress
-  serves the routes and lint says nothing. Warn per route with a `kubernetes` shape (the examples
-  would then need the chart to declare it handles them, or the warning accepted there).
-
 - **A prune on a registry that deletes no tag alone reads every tag per refused delete**: `untag`
   and the sweep after it list the repository and read each tag for each tag they remove, so a
   prune of many releases makes a quadratic number of requests and may meet the registry's rate
@@ -370,9 +297,6 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
 - **One rule for a boot set's stowage**: which stowage published a release's boot set (its own
   disks' or `boot_disks`') is written in the publisher (`bootSet`) and the installer (`vm create`);
   one helper beside `release.Artifacts.Boot`.
-- **A killed read leaves an rclone config**: `backup list` on Docker (and on the VM, under the
-  daemon's runtime directory) writes the destination's rclone config to a temporary directory
-  removed once read; a SIGKILL leaves it. Sweep stale ones.
 - **The Docker disk-pressure check end to end**: `disk-check` and its timer are unit-tested; no
   suite runs the check against a filled volume on a Docker host.
 
@@ -502,12 +426,6 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
   which the daemon takes as insecure, and the run is not root, so `/etc/docker/certs.d` is
   covered by unit tests only (a directory variable). A root e2e with a non-loopback mirror
   address would cover it.
-- **Mirror imports at once**: the check that a mirror's channel never goes back reads the channel,
-  then pushes: two imports run together can still leave it on the earlier one. Likewise two
-  first installs against one mirror: one that fails removes the daemon's `ca.crt` the other kept.
-- **A yank reaching the mirror**: an export carries the channel's release, not the yanked one's
-  manifest, so the mirror keeps the yanked release's tag unmarked (`--older` moves its channel
-  back). Export the yanked manifests of the channel too.
 - **A test release on another name of the project's registry**: `--test-registry` is compared
   by its spelling, folded (case, dots, ports, loopback, Docker Hub); another DNS name or address
   of the same registry is not told. Before publishing, a test release of a signing project could
@@ -529,26 +447,12 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
   sides' neighbour tables, the VM's addresses and its ip6 rules: read them, and a capture on both
   sides if they say nothing.
 
-- **A bind input refuses a loopback address the loopback answers on but does not carry**: an L4
-  route's bind input must be an address an interface carries, so `127.0.0.2` is refused although
-  Linux's loopback answers on all of `127.0.0.0/8` and Docker publishes on it. Accept an address
-  inside a loopback interface's prefix.
-
-- **Text `k8s status` after an uninstall that kept its history**: it prints the uninstalled
-  revision's release first, as if it ran (`k8s status --json` says nothing is installed). Say the
-  release is uninstalled, its history kept, and that `k8s rollback` brings it back.
-
 - **One release-identity check**: whether a release is a version at a revision is tested in four
   places (the kept previous release, the VM's `prevIs`, `keptInstaller`, `isRelease`). Use one.
 
 - **`k8s rollback` reads helm twice**: a rollback with no `--revision` runs `helm history` and
   `helm get values` of the target twice (the previous revision's search, then the schema check).
   Hand the history the search read to the check.
-
-- **Two ships on one cloud cache**: two `ship`/`promote` runs on the same `$XDG_CACHE_HOME`
-  share an image's working directory with no lock of Stowage's own: the second can take the
-  first's live state for a stopped run's, upload over its object and, failing on OpenTofu's state
-  lock, destroy the upload the first is importing. Take a lock on the image's directory.
 
 - **Cloud resume without a second transfer**: a run stopped once its snapshot was imported
   (Scaleway, AWS) downloads and uploads the disk again to make the image, which never reads that
@@ -563,21 +467,10 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
   `l4.routes[].tls` domain is not, so a service of the stack dialing `<domain>:<port>` leaves
   through the host's public address (hairpin NAT) rather than straight to the front.
 
-- **File inputs' leftovers**: the user-data limit is checked after `vm create`'s confirmation, not
-  before it; the re-run's hint for a required file input a new TLS mode asks has no test; a compose
-  command run before the first start of a service mounting a file input would make a directory at
-  its path, which the start then reports; a rollback to a release whose spec this installer cannot
-  read takes back a file value by its record alone, a branch with no test.
 
-- **Docker L4 allowlist, leftovers of its review**: the allow chain's `.applied` mark is redundant
-  beside `.held`; `l4Exposure` and `status` recompute the rules and re-read the marks per route; a
-  retried `prepare` applies the chains twice; a boot with an unreadable record, or a refused IPv6
-  bind, closes the port on every IPv4 address, another install's route of that port included;
-  `status` not as root on a root-only `.env` reads the lists as not held; right after an upgrade
-  from 0.27 a forwarding chain reads as not applied until a start as root; `lint` reports only the
-  first of an allowlist input's errors.
-- **A cancelled disk build's race**: a `docker run` whose create reaches the daemon after the
-  cancel's `rm --force` leaves a container Created, never started.
+- **Docker L4 allowlist, leftovers of its review**: `l4Exposure` and `status` recompute the rules
+  and re-read the marks per route; a retried `prepare` applies the chains twice (idempotent);
+  `lint` reports only the first of an allowlist input's errors.
 
 - The libvirt e2e creates its VM with one vCPU alone: no suite applies the module with several
   (`queues = var.cpus`) nor checks its no-drift plan then; a second, short apply with `--cpus 2`
@@ -589,20 +482,8 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
   instants around the read; a lifecycle lock a CLI run takes and releases wholly inside one
   `compose ps`, or the boot unit run wholly inside it, goes unseen, and the services it stopped
   may be journaled down (an extra event, never a crash hidden).
-- **The service watch's blind spots**: a service with no container at all (a run that removed it
-  and failed before `up`) is never down to it, as it judges the containers `compose ps` lists,
-  not the services the stack declares; a one-off `compose run` container left exited non-zero
-  counts as its service down; when docker inspect fails on one container (removed between ps and
-  inspect) every container loses its facts that look, as the exec runner drops a failing
-  command's output; and inspect runs at every look, where only the services down need it.
-- **`lockHeld` takes the lifecycle lock for an instant**: the upgrade's and the boot's checks
-  that a run holds it (`lockHeld`) take and release the flock, so a run arriving at that instant
-  is refused as if one ran. `lockHeldPassive` reads the kernel's table instead; the two could be
-  one.
-- **`lint` accepts an allowance for an image of Stowage's the release does not carry**: the
-  artifacts it accepts include `front`, `backup`, `chown` and `audit` whatever the project
-  declares, so an entry for `front` in a project without a front passes lint and shows only at a
-  ship (`matches no finding`). Deriving them from the spec as `ship` does would close it.
+- **The service watch's inspect at every look**: `docker inspect` runs at every look, where only the
+  services down need it.
 
 - **A pre-commit hook running `lint`**: `hook install` writes git's post-commit hook alone; a
   project wanting `lint`'s allowance checks (an artifact the release cannot carry, an entry
@@ -633,20 +514,10 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
   test link with a lifetime-0 router answering first and the default router's solicited answer
   dropped (the field case) is not built.
 
-- **`flush_conntrack`, leftovers** (review): a host whose kernel has no connection-tracking
-  netlink (the flush fails with nothing to flush) keeps the `.flush` mark and warns at every start;
-  e2e-full-vm watches an SSH session across the flush, not a
-  connection through the front's published ports (Docker's DNAT made again on the next packet).
+- **`flush_conntrack`, leftovers** (review): e2e-full-vm watches an SSH session across the flush,
+  not a connection through the front's published ports (Docker's DNAT made again on the next
+  packet).
 
-- **The daemon's start applies a record its networkd file differs from once**: a failure (networkd
-  not ready) is logged and the boot renders the record again, where it was retried every 15 s;
-  retries would need the one revert timer, which a pending change on another NIC owns. A timer
-  per NIC would bring them back, and would undo two records each holding a change awaiting
-  confirmation at the daemon's start (only a record repaired by hand leaves two) without one's
-  failing revert disarming the other's.
-- **`vm attach` with a wrong `attach=` bridge**: the plan passes, the variables record it, and the
-  apply fails; a re-run with the right bridge is refused against the recorded one, and the hint's
-  `tofu apply` fails the same way. Let a re-run correct a NIC whose device the state lacks.
 
 - **An interrupt that fired once before the boot moved it**: `tune --check` judges a NIC
   interrupt that never fired (`per_cpu_count` all zeros) by the affinity asked, since the kernel
@@ -654,28 +525,13 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
   interrupt at probe) and never again keeps its old effective CPU and is still reported. Record
   the counts when the boot writes the affinity, and judge by the asked one while they have not
   grown.
-- **The update volume's name is Compose's default**: the overlap finds the old container's mount
-  of `<project>_stowage-update-<service>`, the name Compose gives the volume the installer declares
-  without a `name:`. Declare it with an explicit `name:` from one helper both use, so a change to
-  either cannot make every handoff fall back to stop-first unseen.
-- **The ready file's reads are unbounded**: each poll of an overlap's `update_ready` copies the
-  whole file (a directory's whole tree) through `docker cp … -` into memory, every 500 ms for up
-  to 10 minutes, though only its first entry is judged. Stop the copy after the first entry (a
-  `Cmd.Stdout` writer that fails past a bound), or refuse a ready path that is a directory. Of
-  the same reads: a symlink or a directory at the ready path is judged by its header alone (its
-  time), and a missing file is told by the Docker engine's wording (`Could not find the file`,
-  `No such container:path`), which Podman's compatible CLI does not share.
-- **A Docker host's tables unit after a rollback to an older Stowage**: the tables' boot unit
-  (`<name>-gateway-<8 hex>-tables.service`) is written by this Stowage's starts alone; a rollback
-  to a release built with an earlier one leaves it enabled, running a `tables-boot` that release's
-  installer does not know (it fails at boot, the start loads the tables), and that release's
-  `tune --revert` or uninstall does not remove it. Remove it by its name whatever the release, or
-  have the older verb set absent be a no-op.
-- **A decline under `up --wait` with a restart policy**: without `update_signal` the overlap waits
-  with `docker compose up --wait`; a new container that exits with `update_decline_status` and is
-  restarted by its `restart:` policy is Compose's to judge (it may wait on it) before the decline
-  is read. Read the new container as the signalled overlap does (no `--wait`) when the service
-  has a decline status, and prove it with a real decline in e2e-full.
+- **The ready file's absence told by Docker's wording**: a missing `update_ready` file is told by
+  the Docker engine's wording (`Could not find the file`, `No such container:path`), which
+  Podman's compatible CLI does not share.
+- **A decline proven in e2e-full**: the overlap reads the new container itself (never Compose's
+  `--wait`), a decline under a restart policy included, unit-tested against the engine's calls; a
+  real decline in e2e-full (an environment flag on the example's api) would prove it against
+  Docker.
 
 - **A chunk ceiling that recovers**: a registry's chunk ceiling only drops within a run, and is
   keyed by host, so one transient 413 slows every later disk of that run to the host. Probe a
@@ -742,33 +598,14 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
     keys the project mapped them to (`# stowage: <unit> -> <service>`, or a spec list), so none is
     lost without a word.
 
-- **`vm create` takes the first disk set holding any format**: `bootDisks`' `usable`
-  (`internal/install/vmcreate.go`) settles on the release's own set as soon as the registry
-  holds one of its formats, before the platform is chosen, so a mirror holding the release's raw
-  disk alone and the channel's set in qcow2 refuses `--platform truenas` naming the missing
-  qcow2 instead of booting the channel's set. Choose the platform first, or try the next set
-  when the platform's formats are missing.
-- **A NIC interrupt the kernel manages stays drift under isolated cores**: `inspectSteering`
-  (`internal/tune/system.go`) reports an interrupt reaching a service's cores as `differs`, and a
-  driver with managed affinity refuses the move `--apply` makes, so `tune --check` never clears
-  there. Tell a managed interrupt apart (the write's `EIO`, recorded at apply) and make it advice.
 
-- **Review findings left from batch D** (cross-Stowage rollback, `update_signal`), minor:
+- **Review findings left from batch D** (cross-Stowage rollback), minor:
   a rollback releases the install's lock before the previous installer's start takes it (the
   install then records the previous release, consistent, but another run may slip in: hand the
   held lock to the child); finishing a stopped upgrade or rollback on the VM starts the kept
-  release twice (the child's `boot`, then the outer boot's own); a rollback to a release of
-  another spec format fetches none of its images before the switch (they need its spec), and one
-  of the same format fetches them twice (before the switch, then its installer's re-run); for
-  such a release `keepPrev` copies the install's stack files rather than rendering them; with
-  `update_signal`, a new container found `restarting` fails the overlap at once, where
-  `up --wait` would judge it.
+  release twice (the child's `boot`, then the outer boot's own).
 
 - **Review findings left from batch A** (host block), minor:
-  - `lint`'s namespaced-setting warning is a prefix heuristic: a few `net.ipv4.*` and
-    `net.netfilter.*` keys are global (`tcp_max_orphans`, `inet_peer_*`, `fib_sync_mem`,
-    `nf_conntrack_expect_max`) and are warned anyway; a table of the kernel's per-namespace keys
-    would be exact.
   - The OS bundle's refusal of a kernel argument its boot script sets reads the generic lines, not
     a board's `baseExtraArgs` (Stowage builds the generic model only).
   - A build with `host.packages` fetches the archive's indexes twice (its step, then the cloud
@@ -783,28 +620,14 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
   manager). Revisit once it publishes SBOMs (today `audit` would see next to nothing of the OS)
   and ships nftables and a container runtime; every package is a build from source today.
 
-- **L4 routes on the host's network, leftovers** (review): an image the engine lacks at a start's
-  plan, which `compose up` then pulls itself, leaves its `EXPOSE` out of that start's peer ports
-  and bridge rules (the installer's own re-pull plans again); a plain `upgrade` whose look for a
-  later revision fails says so in the log alone and exits 0; the fetched installer of a later
+- **L4 routes on the host's network, leftovers** (review): the fetched installer of a later
   revision looks the channel up again before it upgrades.
 
-- **A built-in module's variables checked by type** (review, Low): only Google Cloud's
-  `firewall` is checked (true/false, 1/0) before OpenTofu runs; another built-in bool or number
-  (Azure's `accelerated_networking`) given wrong fails at the apply. Read each variable's `type`
-  from `variables.tf` and check every operator-given value, and refuse a bad answer inside the
-  interactive form (a Check on its question) rather than after it.
 
 - **HSTS `includeSubDomains` opt-out** (security review, Low): the front sends it on every route,
   as the reference deployment does, binding the names under a route's to HTTPS for a year. A spec
   key (`front.hsts_subdomains: false`) for an operator whose route name has other services
   under it.
-- **The TrueNAS seed goes up world-readable with its host key** (security audit 2026-10-26, Low):
-  `Client.Upload` asks `filesystem.put` for mode 0644 (`internal/truenas/client.go`), so the seed
-  ISO that `vm create --secrets` writes 0600 locally, since it holds the one-time SSH host key,
-  sits readable in the staging dataset and is never deleted. A storage reader who is also on
-  the path impersonates the VM to the pinned SSH and receives the secrets. Upload it 0600, and
-  remove it once the key is retired.
 
 - **`k8s install --unsafe-sysctls` on a kubelet that refuses them**: the pods fail at once
   (`SysctlForbidden`), yet helm waits out `--timeout` before it rolls back. Watch the rollout's
@@ -817,10 +640,9 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
   VM's) would.
 
 - **Ports the network profile's local range may take**: the host reserves the front's and the
-  L4 routes' ports, not a port a service publishes itself on loopback, nor a container's own
-  listening ports in its namespace (whose range the network profile widens too). Reserve the
-  model's published host ports on the host and each service's listening ports in its namespace
-  (`ip_local_reserved_ports` is a namespace's), or keep a container's range at the host's.
+  L4 routes' ports, not a port a service publishes itself (`ports:`, on loopback too): the start
+  knows them from the compose model, but `tune` and the VM's boot read no model; recording the
+  published host ports at each start (a `.env` key) would let them be reserved.
 
 - **One pass over the stack's networks before `up`**: the IPv6 check and the MTU check each list
   the networks and may each stop the stack; one listing, judging both, would stop it once.
@@ -830,33 +652,10 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
   boot sets them each time). A unit ordered after the NICs' probe, written by `--apply`, would
   keep them.
 
-- **The Docker `status`'s `(release)` profile is the running installer's**: `status` run by
-  another release's installer than the one installed names that release's `tune.profile`; the
-  stack runs the installed one's. Read the kept installer's spec, as `upgrade` reads its release.
-
-- **`tune` as a user on a `hidepid` host**: without root, `/proc` hides dockerd's command line,
-  so the report judges `/etc/docker/daemon.json` where the engine may read a `--config-file`
-  (which `--apply`, as root, writes): the report can show the daemon keys as differing after a
-  good apply. Say so in the report when no dockerd is visible to a user.
 
 - **Retired release tags stay**: on a registry that deletes no tag alone, a tag `prune` retired
   (a release's, an image's, an installer's) is never visited again, even once the registry deletes
   tags alone; each costs a read in every release listing. Only floating tags are deleted then.
-- **Content left untagged outside a prune's sweep**: on a registry that deletes no tag alone, a
-  prune killed between retiring a tag and its closing sweep loses the list of content another tag
-  held, and a pointer `yank` retires on an incomplete release keeps no such list; once the other
-  tag moves, that manifest stays untagged and is deleted by nothing. The sweep running when the
-  pointer's move back fails has no test that fails without it (the pointer then still holds the
-  content).
-- **An installer only `:latest` held, left untagged on retirement**: on a registry that deletes no
-  tag alone, a retired `:latest` leaves the installer manifest it held in the registry, untagged,
-  when no release tag holds it any more (a prune that stopped part way). Disks have the disk set
-  cleanup; nothing sweeps the installer repository.
-- **A failed chown after `up --no-start` leaves a running stack down**: when a start makes a
-  volume of a `uid` while the stack runs (an upgrade that adds one), `up --no-start` recreates the
-  changed services before the volume helper runs; if the helper then fails, they stay created and
-  stopped until a re-run or a rollback. Start the volume's own services alone first, or bring the
-  others back up on that failure.
 - **`compose config` on every start**: a start reads the stack as Compose runs it for the content
   labels and the new volumes, even for a stack with no inline config, no environment-sourced
   secret and no volume of a `uid`, where it finds nothing; skip it there.
@@ -868,10 +667,6 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
   the installer (preflight, decide, renderStack, up, openPorts, reconfig, upgrade, vm create, the
   CLI's flags); one front mode with no ports, Caddyfile or image would keep a new path from
   forgetting its guard.
-- **A disk push's commit on a slow registry**: the commit (`PUT ?digest=`) waits at most the
-  client's 2-minute response bound; a registry that verifies or moves a large blob for longer
-  gets the commit retried, the blob looked for until the 5-minute stall bound, then the push fails
-  though every byte went up. Give the commit a bound of its own, scaled to the blob.
 - **`k8s upgrade --version` reads the fetched installer's payload twice** (its check, then the
   run's release): pass the files read once along.
 - **A mirror import's blobs in chunks too**: `mirror import` pushes each blob in one stream, as
@@ -908,41 +703,21 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
   the input is asked only on other shapes (an input with `shapes: [kubernetes]` the hook mints on
   Docker cannot be declared); and lint cannot see a declared key the chart's ConfigMap
   `<release>-stowage-provision` also sets, which `k8s provision --set` then refuses at run time.
-- **A scheduled reboot whose boot id was not read never resolves in the journal**: when the
-  kernel's boot id cannot be read (never on Kairos), the `reboot.scheduled` carries no `boot_id`,
-  and a starting daemon tells two boots apart only by two ids read, so it neither cancels that
-  reboot (`the daemon restarted before it`) nor takes it as run: the journal leaves it open for
-  good, and `events` never tells whether it happened. Comparing a monotonic boot counter, or the
-  status's uptime, would tell.
-- **Re-run leftovers**: the check "was a route's domain given" is written three times (`mode`,
-  `applySettings`, `changes`), the release's compose file is parsed by three partial structs
-  (`passesEnvOn`, `reset-db`) and "diff two `.env`, redact secrets" twice (re-run's log,
-  upgrade's dry run); one helper each. An input whose default names another (`${KEY}`) is not recomputed when that one
-  changes (README says to give it too); a `byo` domain change reads the certificate before the
-  domain's syntax is checked, so a missing or expired file hides that error. An upgrade whose
-  `up` failed leaves no change marker, so a later change's `.env.prev` holds a `.env` that never
-  came up.
+- **Re-run leftovers**: "diff two `.env`, redact secrets" is written twice (re-run's log,
+  upgrade's dry run); one helper. An input whose default names another (`${KEY}`) is not
+  recomputed when that one changes (README says to give it too).
 - **Disk-pressure leftovers** (the VM's watch): its POST repeats the health probe's steps (the
-  service's address, the client, the bounded answer): one helper could serve both. e2e-kairos
-  runs the daemon on the test host with the default `/etc/issue.d`: past `hard_pct` (99% there)
-  it would write the host's login banner; `hostd` could take a hidden directory flag. A banner
-  whose `agetty --reload` failed is not reloaded by a later check (the file is unchanged), and a
-  disk that stops reading leaves the last banner up. An address that never comes (a broken
-  compose file) is retried every minute, not every 10. pressurePost's
-  `(result, ok, again)` could be one struct; TestServeWaitsForTheCheckUnderWay repeats served()'s
-  short socket directory.
-- **Backup leftovers** (the VM's backups): a scheduled run refused because another job runs (an
-  upgrade at 03:00) fails the timer's service and waits for the next day: retry it after the job.
-  The `command` backup provider runs nowhere (lint warns on a `kairos` shape). The
-  timer's default (`*-*-* 03:00:00 UTC`) is written twice, in the bundle's unit and the daemon.
-  An upload cut off on a multipart backend (S3) may leave parts `deletefile` does not see: abort
-  them (`rclone cleanup`). The timer's skip and `installed()` test "not installed" apart.
-  Retention prunes the current profiles only: backups of a profile a later release dropped stay
-  (`backup list` shows them). A runner container cut off by its context is removed by name only
-  when the docker CLI was stopped by that context.
+  service's address, the client, the bounded answer): one helper could serve both, and
+  pressurePost's `(result, ok, again)` could be one struct. e2e-kairos runs the daemon on the test
+  host with the default `/etc/issue.d`: `test/e2e-kairos.sh` should give it the hidden `hostd
+  --issue-dir`. An address that never comes (a broken compose file) is retried every minute, not
+  every 10. TestServeWaitsForTheCheckUnderWay repeats served()'s short socket directory.
+- **Backup leftovers** (the VM's backups): the `command` backup provider runs nowhere (lint warns
+  on a `kairos` shape). An upload cut off on a multipart backend (S3) may leave parts
+  `deletefile` does not see: abort them (`rclone cleanup`). Retention prunes the current profiles
+  only: backups of a profile a later release dropped stay (`backup list` shows them).
 - **Network override leftovers** (review of the network slice): a confirmation refused after its
-  window answers an error only, not the settings in force (`network` shows them); the host
-  daemon's start taking the network lock before it serves has no deterministic test.
+  window answers an error only, not the settings in force (`network` shows them).
 
 - **`upgrade --reset-db`**: an upgrade that wipes the data in the same run — the way across a
   schema baseline, which today takes a fresh install (on the VM, in the boot that upgrades, judged
@@ -957,15 +732,9 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
   `k8s rollback` needs no check: a helm history never spans a baseline, since upgrade refuses one
   and `reset-db --new-baseline` uninstalls.) Recording the baseline in the chart's values would
   spare the installer fetch `k8s upgrade` makes to read it.
-- **Lint the data volumes against the compose file**: `data.volumes` and `data.reset` names are
-  not checked to be top-level compose volumes Compose owns (not `external`); `reset-db` refuses
-  them at run time.
-- **Reset leftovers** (review of `reset-db`): `K8sReset` repeats the release lookup of
-  `k8sDeploy` and `K8sRollback` (one helper), reads the values twice (`--all` then user-supplied)
-  and Docker `Reset` decodes the hook twice; untested: the mirror flags of the recovery command, the
-  name half of the daemon's release check (which repeats `sameRelease`), and a values file whose
-  write fails after it was created (it is removed and the temporary copy named). The kubectl
-  hint builds its target flags by hand, beside `in.kubectl`'s: one helper for both.
+- **Reset leftovers** (review of `reset-db`): `K8sReset` reads the values twice (`--all` then
+  user-supplied) and Docker `Reset` decodes the hook twice; untested: a values file whose write
+  fails after it was created (it is removed and the temporary copy named).
 - **Reset extras**: a `seed` provider (a project's dataset loaded after a reset, beyond what the
   provision hook creates); `keep_on_reset` on Kubernetes (today every claim of the release goes);
   a database outside the Kubernetes release (`external`) is not reset.
@@ -975,50 +744,26 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
   build cache, which lives in the host's shared buildx builder.
 
 - **VM health gate leftovers** (review of the health gate): `reboot`/`shutdown` are accepted while
-  the gate judges a boot on trial (documented: the next boot falls back); `GET /v1/health` with
-  the `command` provider starts one container per call, unthrottled (the app socket can poll it),
-  and the container of a call a reboot interrupted is not removed (its compose file is, after an
-  hour);
-  `status` shows the last failed boot forever, and diagnostics are named and pruned by the wall
-  clock (wrong before time sync); the gate's diagnostics run `compose ps` again; the rollback plan
-  parses `.stowage-prev/state.json` beside the dry run that parses it too; the stale health file
-  age is wall-clock (`timeout_s` is unbounded); the gate and the daemon build the assessment and
-  the reboot bookkeeping each their own way; the one-minute bound on the upgrade's assessment
-  write has no test (it needs a hanging fake), nor the fresh context the rollback's restore of the
-  marks takes, nor the rollback's re-checked plan finding another target (reachable only through
-  a run that changes the install consistently during the drain).
+  the gate judges a boot on trial (documented: the next boot falls back); diagnostics are named
+  and pruned by the wall clock (wrong before time sync); the gate's diagnostics run `compose ps`
+  again; the stale health file age is wall-clock; the gate and the daemon keep the reboot
+  bookkeeping each their own way; the rollback's re-checked plan finding another target has no
+  test (reachable only through a run that changes the install consistently during the drain).
 
-- **`vm create --create opentofu` waits out a failed first install**: the VM's status reports no
-  install and the first boot's failure is not in it, so the wait runs to `--wait`. Report the
-  boot's install failure in the status, and stop waiting on it.
 
 - **The app socket reads the install's `.env` at every request** to check the token: cache it,
   re-read when the file changes.
 
-- **A VM's `--channel` is not checked against the project's channels**: the bundle's runtime spec
-  carries no channels, so a typo is recorded and fails later as "no release" on `updates`.
-  `vm create` will give the channel of the release it installs.
 
 - **A disk that fails rebuilds the bundle on the next ship**: the bundle was pushed by digest,
   untagged, and nothing records it. Recording built digests (a staging tag) would keep it.
-- **A format dropped from a mutable release leaves its disk tag**: re-shipping `beta-1.0.0`
-  without `raw` records no raw disk, so `prune` never deletes `beta-1.0.0-raw` (an image key
-  dropped from the spec behaves the same).
 - **`latest-<format>` of a format only a newer stowage knows**: an older stowage moving the
   latest channel leaves that tag as it was (it lists its own formats).
 - **Disk `latest-<format>` checks every format**: each sync or verify on the latest channel HEADs
   all five tags; the spec's formats plus the pointer release's would do.
 
-- **k8s release in helm's `unknown` status**: no `helm list` status flag selects it, so `k8s`
-  treats such a release as absent (`install` would try to install over it). Read `helm status`
-  when `helm list` finds nothing.
 - **k8s rollback reads the running values twice** (`installedRelease`, then the comparison): pass
   them through.
-- **k8s pull Secret on an upgrade without a password**: kept through helm's reused values, so
-  `--dry-run` does not show it, a pull Secret deleted out of band is not noticed, and an upgrade
-  moved to an `--image-registry` mirror keeps naming the project registry's account. Read
-  `stowage.pullSecret` from the release, check it exists, and write it back (or drop it for a
-  mirror).
 
 - **Kept release's front rendered by the newer Stowage**: an upgrade renders the kept release's
   front files with its own renderer (from the kept release's spec and `.env`), so a rollback runs
@@ -1028,12 +773,6 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
 - **Upgrade order under a `command` scheme**: the project's scheme command does not run on an
   install, so an upgrade to an older release is not refused there.
 
-- **`command` timeout after a resume**: no test catches a timer left stopped after Ctrl-Z / `fg`
-  (the command could then hang with no timeout); the suspend test only proves a stop is not
-  counted.
-- **Environment size**: each recorded value is capped (64 KiB) and the hook's outputs (256 KiB),
-  but not their sum, which a stack with many large inputs could push past the kernel's `ARG_MAX`
-  for the docker CLI or the hook's command.
 - **Provision hook networks**: the hook joins the project's `default` network only; a stack whose
   services live on named networks only would need `hooks.provision` to name one.
 - **Charm UI everywhere in the CLIs** (`stowage` and `<short>-stow`, every shape): lipgloss styles and
@@ -1047,22 +786,13 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
 - **Yank freshness**: a yank writes a new signed manifest, but the earlier, un-yanked one stays
   validly signed, so someone with registry write access and without the key can re-tag it back.
   Needs a signed, expiring channel record (TUF-style timestamp) that installs check.
-- **Signature counts name referrers**: on a registry without the referrers API every referrer
-  listed under the empty config type or none is read, so the 64 cap and the "N signature(s), none
-  by a trusted key" message count non-bundle referrers as signatures, and the SBOM attestations
-  (bundles too) everywhere; count the bundles whose predicate is a signature instead, and cover the tag-fallback shape with a verifier-level test, not only the
-  registry client's.
 - **Fewer attestation reads**: `ship`'s check that an artifact carries its SBOM reads and verifies
-  the whole attestation (an OS bundle's runs to MiB), and every signature check reads each SBOM
-  bundle up to 4 MiB before it passes it over. cosign writes the predicate type as an annotation of
-  the referrer: order or skip by it (an unsigned hint, what is read still verified), and read no
-  predicate where presence alone matters.
-- **Signature reads are bounded at 64 referrers per digest**: someone with push access can push
-  65 junk referrers on a signed release and every check of it fails ("cannot check"). The same
-  access can already delete the release's tags, so it is a denial of service, not a bypass; read
-  the newest 64 instead, or prefer the key's hint. Likewise an unsigned revision of V with unreadable signatures
-  stops `upgrade --version` (fail closed), and V's revisions are checked one at a time, newest
-  first, so many unsigned revisions make it slow: check them concurrently (bounded).
+  the whole attestation (an OS bundle's runs to MiB): read no predicate where presence alone
+  matters. (Signature checks already pass over the referrers cosign annotates with another
+  predicate; an unannotated SBOM bundle is still read up to 4 MiB.)
+- **Unsigned revisions slow `upgrade --version`**: an unsigned revision of V with unreadable
+  signatures stops `upgrade --version` (fail closed), and V's revisions are checked one at a time,
+  newest first, so many unsigned revisions make it slow: check them concurrently (bounded).
 - `ship` makes the installer image again on every run (payload, tar and gzip in memory, about
   three copies of the executable) only to compare its digest with the published one, and twice
   on a mutable re-push whose installer changed: stream it, or hash without compressing first.
@@ -1082,36 +812,8 @@ Batched by the gate they share: a batch is one slice, one review, one gate run.
   (`127.0.0.1:<port>/smoke/*`) in the local engine, and `make e2e` the installer and front images
   it pulls: remove them at the end, as `make e2e-docker` does.
 
-- **The gate exercises the release workflow**: `test/gate.sh` selects nothing for a change to
-  `.github/workflows/`, so the release's tag, date and notes extraction run first on a real tag.
-  A script the workflow calls, with a test in the gate, would cover it.
 
-- **A test release's key check**: `cosign public-key` runs with a background context (a cancelled
-  command waits for it, up to cosign's timeout), and once, when the signer is made: a key file
-  changed during the ship would sign unchecked. The check beside each sign call would close it.
-- **An empty `services:` is caught by lint alone**, from the file: decoding takes it as no
-  key. A presence check in spec decoding would give every reader of the spec the refusal.
 
-- **A project's own ARP value on `all` is not range-checked**: lint takes `host.sysctls`'
-  `net.ipv4.conf.all.arp_ignore` / `arp_announce` as the floor a NIC's value is judged against,
-  whatever it is (`arp_announce` 5 passes lint and fails at the VM's boot). Each ARP setting's
-  range (`arp_announce` 0–2, `arp_ignore` 0–3 or 8) checked at lint would close it.
-- **A server's MAC refusal names the NICs this run makes**: with an optional role not asked,
-  `vm create` on metal says `a server names each NIC the release names (uplink)`, leaving the
-  optional one out though `--interface <role>=mac=` takes it too.
-
-- **A picked table reported loaded whatever its posture**: on a consented Docker host, `tune`
-  reports `table inet <service>` ok when a table of that name is loaded, even when a re-run moved
-  the input to another value and no start has loaded it yet. Judging the loaded file (TablesDir)
-  against the value's would say `differs` until the next start.
-- **One rule of a picked table's sets, two copies**: lint and the release decoding each compare
-  the files' named sets; a shared helper beside `CheckNftTable` would keep them one. The decoding
-  also folds a value nft's names refuse into `is no table a service declares`.
-
-- **A failed successor's quoted lines are not redacted**: what its entrypoint printed (an input's
-  value it refused, a secret among them) reaches the start's error, the terminal and the host
-  daemon's reply as written; `logs` shows the same today. Masking the install's secret values in
-  them would narrow it.
 - **No suite runs a failing start-first successor**: the quoting of its last lines is unit-tested
   against the engine's calls; an e2e case (a release whose new container exits) would prove it
   against Docker's own `logs`.

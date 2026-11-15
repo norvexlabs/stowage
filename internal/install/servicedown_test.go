@@ -51,7 +51,12 @@ type stackOf struct {
 	inspect    string
 	inspectErr error
 	psErr      error
-	looks      int
+	// services answers compose config --services when set: the services the stack declares;
+	// configErr fails it.
+	services  string
+	configErr error
+	configs   int
+	looks     int
 	// during, when set, runs as compose ps answers: a run taking the lock in the middle of a look.
 	during func()
 }
@@ -68,6 +73,9 @@ func (s *stackOf) answer(a string) ([]byte, bool, error) {
 		return []byte(s.ps), true, s.psErr
 	case strings.HasPrefix(a, "inspect --type container --format "):
 		return []byte(s.inspect), true, s.inspectErr
+	case (s.services != "" || s.configErr != nil) && strings.HasSuffix(a, "config --services"):
+		s.configs++
+		return []byte(s.services), true, s.configErr
 	}
 	return nil, false, nil
 }
@@ -98,6 +106,54 @@ func TestServiceFacts(t *testing.T) {
 	in.serviceFacts(context.Background(), fresh)
 	if fresh[0].OOMKilled || fresh[0].State != "exited" {
 		t.Errorf("inspect failing: %+v", fresh)
+	}
+	// One container gone between ps and inspect: the others keep their facts.
+	st.set("", "abc123ffff true 100663296 0\n")
+	part := []Service{{Service: "api", ID: "abc123", State: "exited", ExitCode: 137}, {Service: "web", ID: "def456", State: "running"}}
+	in.serviceFacts(context.Background(), part)
+	if !part[0].OOMKilled || part[1].Restarts != 0 {
+		t.Errorf("inspect failing on one: %+v", part)
+	}
+}
+
+// The services are those the stack declares (`compose config --services`): one with no container
+// at all is down (missing); a `compose run` container left exited is no service's. Which it
+// declares not read, the list is compose ps's, said in the log, and the status stands. The
+// daemon reads what it declares once per change.
+func TestStackServicesNamesTheMissingAndSkipsOneOffs(t *testing.T) {
+	t.Parallel()
+	e := vmEnv(t, "1.0.0")
+	if err := e.install(vm); err != nil {
+		t.Fatal(err)
+	}
+	st := &stackOf{services: "api\ndb\n"}
+	e.docker.answer = st.answer
+	in := e.installer(vm)
+	st.set(`{"ID":"a1","Service":"api","State":"running","Labels":"com.docker.compose.oneoff=False,com.docker.compose.service=api"}
+{"ID":"r1","Service":"api","State":"exited","ExitCode":1,"Labels":"com.docker.compose.service=api,com.docker.compose.oneoff=True"}`, "")
+	env := e.readEnv()
+	list, err := in.stackServices(context.Background(), env, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list) != 2 || list[0].Service != "api" || list[0].Down() || list[1].Service != "db" || !list[1].Down() || list[1].Why() != "missing: no container" {
+		t.Errorf("%+v", list)
+	}
+	// The daemon's: one read for two looks, another after a change.
+	d := daemon(e, &fakeHost{})
+	for range 2 {
+		if _, err := in.stackServices(context.Background(), env, d.declared(in, env)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	n := st.configs
+	d.changed()
+	if _, err := in.stackServices(context.Background(), env, d.declared(in, env)); err != nil || st.configs != n+1 || n != 2 {
+		t.Errorf("%v: %d reads, then %d", err, n, st.configs)
+	}
+	st.services, st.configErr = "", errors.New("compose: no such file")
+	if list, err := in.stackServices(context.Background(), env, nil); err != nil || len(list) != 1 || !strings.Contains(e.log.String(), "the services the stack declares could not be read") {
+		t.Errorf("%v %+v\n%s", err, list, e.log)
 	}
 }
 

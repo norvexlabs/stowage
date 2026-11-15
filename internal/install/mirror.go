@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"cmp"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
@@ -14,18 +16,21 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/google/go-containerregistry/pkg/authn"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 
 	"github.com/norvexlabs/stowage/internal/backup"
 	"github.com/norvexlabs/stowage/internal/chown"
+	"github.com/norvexlabs/stowage/internal/flock"
 	"github.com/norvexlabs/stowage/internal/front"
 	"github.com/norvexlabs/stowage/internal/lint"
 	"github.com/norvexlabs/stowage/internal/providers"
 	"github.com/norvexlabs/stowage/internal/registry"
 	"github.com/norvexlabs/stowage/internal/release"
 	"github.com/norvexlabs/stowage/internal/sbom"
+	"github.com/norvexlabs/stowage/internal/sigverify"
 )
 
 // RegistryCAFile is the install's copy of the CA its registry's certificate chains to (a mirror's
@@ -120,22 +125,15 @@ func (in *Installer) dockerCA(prefix string) error {
 	case !errors.Is(err, os.ErrNotExist):
 		return err
 	}
-	var made []string // the directories this run makes, deepest first
-	for d := filepath.Dir(dst); ; d = filepath.Dir(d) {
-		if _, err := os.Stat(d); !errors.Is(err, os.ErrNotExist) || d == filepath.Dir(d) {
-			break
-		}
-		made = append(made, d)
-	}
+	// Written to stay: it holds exactly the CA the operator gave (another one is refused above),
+	// which another install from that registry may rely on as soon as it is there.
 	err = os.MkdirAll(filepath.Dir(dst), 0o755)
 	if err == nil {
-		in.madeDockerCADirs = made
 		err = writeAtomic(dst, bytes.NewReader(ca), 0o644, nil)
 	}
 	if err != nil {
 		return fmt.Errorf("the Docker daemon trusts %s's CA from %s, which this run could not write (%w): as root, `install -D -m 0644 %s %s`, then run again", host, dst, err, src, dst)
 	}
-	in.wroteDockerCA = dst
 	in.O.logf("wrote %s: the Docker daemon trusts %s's CA", dst, host)
 	return nil
 }
@@ -223,6 +221,15 @@ func (in *Installer) MirrorExport(ctx context.Context, r MirrorExportRequest) er
 	relRepo := name + "-release"
 	var m *release.Manifest
 	var d v1.Hash
+	trust, err := trusted("this installer", in.R.Keys)
+	if err != nil {
+		return err
+	}
+	// The release repository read once: the revision asked for, and the yanks carried.
+	read, err := readChannel(ctx, c, prefix, name, channel)
+	if err != nil {
+		return err
+	}
 	if r.Version == "" {
 		ptr, err := c.Tag(prefix+"/"+relRepo, channel)
 		if err != nil {
@@ -241,14 +248,8 @@ func (in *Installer) MirrorExport(ctx context.Context, r MirrorExportRequest) er
 		if m.Name != name || m.Channel != channel {
 			return fmt.Errorf("the release on %s is %s's on %s, not %s's", channel, m.Name, m.Channel, name)
 		}
-	} else {
-		trust, err := trusted("this installer", in.R.Keys)
-		if err != nil {
-			return err
-		}
-		if m, err = findRevision(ctx, c, prefix, name, channel, r.Version, r.Revision, trust, o.logf); err != nil {
-			return err
-		}
+	} else if m, err = read.revision(ctx, c, name, channel, r.Version, r.Revision, trust, o.logf); err != nil {
+		return err
 	}
 	tag, err := c.Tag(prefix+"/"+relRepo, m.Tag)
 	if err != nil {
@@ -296,6 +297,16 @@ func (in *Installer) MirrorExport(ctx context.Context, r MirrorExportRequest) er
 		}
 		entries = append(entries, registry.Entry{Repo: name + "-disk", Tag: release.DiskTag(bootTag, f), Digest: disks[f]})
 	}
+	// The channel's later publications yanked since (the channel went back from them), their
+	// manifests alone, with their signatures: an import marks them yanked in the mirror too.
+	yanked, err := yankedAfter(ctx, c, read, m, trust, o.logf)
+	if err != nil {
+		return err
+	}
+	for _, y := range yanked {
+		o.logf("carrying the yank of %s %s (%s): %s", name, y.m.ProjectVersion, y.m.Tag, y.m.Yanked.Reason)
+		entries = append(entries, registry.Entry{Repo: relRepo, Tag: y.m.Tag, Digest: y.h.String()})
+	}
 	// The release last, its channel's tag after it: an import pushes in this order, so a mirror
 	// never names a release whose artifacts it does not hold yet. The channel's tag holds the
 	// release exported.
@@ -342,16 +353,23 @@ func (in *Installer) MirrorImport(ctx context.Context, file, prefix string, olde
 	if _, err := registry.Repository(prefix); err != nil {
 		return fmt.Errorf("--to: %w", err)
 	}
+	// The channel's check and the push under one lock: two imports into the prefix from this
+	// machine run one after the other, so neither pushes past what the other's check saw.
+	unlock, err := in.mirrorLock(ctx, prefix)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	a, err := registry.ReadArchive(file)
 	if err != nil {
 		return err
 	}
 	defer a.Close()
-	m, h, err := archivedRelease(a, name)
+	m, h, yanks, err := archivedRelease(a, name)
 	if err != nil {
 		return fmt.Errorf("%s: %w", file, err)
 	}
-	if err := releaseTags(a, m, h); err != nil {
+	if err := releaseTags(a, m, h, yanks); err != nil {
 		return fmt.Errorf("%s: %w", file, err)
 	}
 	// The release's own repositories, and no other project's: its images are the ones this
@@ -387,7 +405,7 @@ func (in *Installer) MirrorImport(ctx context.Context, file, prefix string, olde
 	switch {
 	case cur != nil && (cur.Name != name || cur.Channel != m.Channel):
 		return fmt.Errorf("%s's %s channel holds %s's release on %s, not %s's: nothing imported", prefix, m.Channel, cur.Name, cur.Channel, name)
-	case cur != nil && cur.ReleaseSeq > m.ReleaseSeq && !older:
+	case cur != nil && cur.ReleaseSeq > m.ReleaseSeq && !older && !yanks[cur.Tag].carries(cur):
 		return fmt.Errorf("%s's %s channel holds %s %s (revision %d, publication %d), after the archive's %s (revision %d, publication %d): nothing imported (--older imports it, when the channel went back where it was published: a yank)", prefix, m.Channel, name, cur.ProjectVersion, cur.Revision, cur.ReleaseSeq, m.ProjectVersion, m.Revision, m.ReleaseSeq)
 	}
 	// The same publication, yanked in the mirror, is not published there again; a rebuild of its
@@ -397,6 +415,17 @@ func (in *Installer) MirrorImport(ctx context.Context, file, prefix string, olde
 	} else if was != nil && was.Yanked != nil && m.Yanked == nil && was.ReleaseSeq == m.ReleaseSeq {
 		return fmt.Errorf("%s %s is yanked in %s (%s): nothing imported", name, m.Tag, prefix, was.Yanked.Reason)
 	}
+	// A yank carried replaces the mirror's manifest of that publication; one of another
+	// publication there is not replaced, and none there is pushed yanked: never installed.
+	for _, t := range sortedKeys(yanks) {
+		was, _, err := readRelease(ctx, c, relRepo, t)
+		if err != nil {
+			return err
+		}
+		if y := yanks[t]; was != nil && was.ReleaseSeq != y.m.ReleaseSeq {
+			return fmt.Errorf("%s %s in %s is publication %d, not the yanked publication %d the archive carries: nothing imported", name, t, prefix, was.ReleaseSeq, y.m.ReleaseSeq)
+		}
+	}
 	st, err := c.Import(ctx, a, prefix, func(repo string) bool { return ours[repo] }, o.logf)
 	if err != nil {
 		return err
@@ -405,58 +434,144 @@ func (in *Installer) MirrorImport(ctx context.Context, file, prefix string, olde
 	return nil
 }
 
+// mirrorLock takes this user's lock on imports into prefix ($XDG_CACHE_HOME/stowage/
+// mirror-<sha256 of prefix>.lock), waiting for another import holding it (said in the log) until
+// ctx ends. Imports from other machines are their operators' to order.
+func (in *Installer) mirrorLock(ctx context.Context, prefix string) (func(), error) {
+	base, err := in.O.xdgDir("XDG_CACHE_HOME", ".cache", "the lock of the imports into "+prefix)
+	if err != nil {
+		return nil, err
+	}
+	dir := filepath.Join(base, "stowage")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return nil, err
+	}
+	sum := sha256.Sum256([]byte(prefix))
+	unlock, err := flock.Take(ctx, filepath.Join(dir, "mirror-"+hex.EncodeToString(sum[:8])+".lock"), flock.Create, true, 100*time.Millisecond, func() {
+		in.O.logf("waiting for another import into %s", prefix)
+	})
+	if err != nil && ctx.Err() != nil {
+		return nil, fmt.Errorf("waiting for another import into %s: %w", prefix, err)
+	}
+	return unlock, err
+}
+
 // archivedRelease is the release an archive carries: <name>-release holds two tags, the
-// release's own and its channel's, both on the one manifest, which must be name's release.
-func archivedRelease(a *registry.Archive, name string) (*release.Manifest, v1.Hash, error) {
+// release's own and its channel's, both on the one manifest, which must be name's release; and
+// the yanks it carries: a tag of its own on each later publication of the channel yanked since,
+// by tag.
+func archivedRelease(a *registry.Archive, name string) (*release.Manifest, v1.Hash, map[string]archivedYank, error) {
 	tags := map[string]v1.Hash{}
 	var h v1.Hash
 	for _, d := range a.Manifests {
 		if t := d.Annotations[registry.RefNameAnnotation]; t != "" && d.Annotations[registry.RepositoryAnnotation] == name+"-release" {
-			tags[t], h = d.Digest, d.Digest
+			tags[t], h = d.Digest, d.Digest // the channel's tag comes last
 		}
 	}
 	if len(tags) == 0 {
-		return nil, h, fmt.Errorf("it holds no %s release: it is not an export of %s", name, name)
+		return nil, h, nil, fmt.Errorf("it holds no %s release: it is not an export of %s", name, name)
 	}
+	m, err := archivedManifest(a, name, h)
+	if err != nil {
+		return nil, h, nil, err
+	}
+	if m.Name != name {
+		return nil, h, nil, fmt.Errorf("it carries %s's release, not %s's", m.Name, name)
+	}
+	if tags[m.Tag] != h || tags[m.Channel] != h {
+		return nil, h, nil, fmt.Errorf("its %s-release must hold the tags %s and %s on its release", name, m.Tag, m.Channel)
+	}
+	yanks := map[string]archivedYank{}
 	for t, d := range tags {
-		if d != h {
-			return nil, h, fmt.Errorf("its %s-release tags name different manifests (%s)", name, t)
+		if t == m.Tag || t == m.Channel {
+			continue
 		}
+		y, err := archivedManifest(a, name, d)
+		if err != nil {
+			return nil, h, nil, err
+		}
+		if y.Name != name || y.Channel != m.Channel || y.Tag != t || y.Yanked == nil || y.ReleaseSeq <= m.ReleaseSeq {
+			return nil, h, nil, fmt.Errorf("its %s-release must hold the tags %s and %s alone, and those of the channel's later publications yanked since (%s is none)", name, m.Tag, m.Channel, t)
+		}
+		yanks[t] = archivedYank{y, d}
 	}
+	return m, h, yanks, nil
+}
+
+// archivedYank is a later publication of the channel, yanked, an archive carries.
+type archivedYank struct {
+	m *release.Manifest
+	h v1.Hash
+}
+
+// carries reports whether y is the yank of publication cur (y empty: none).
+func (y archivedYank) carries(cur *release.Manifest) bool {
+	return y.m != nil && y.m.ReleaseSeq == cur.ReleaseSeq
+}
+
+// archivedManifest is the release manifest at h in the archive's <name>-release.
+func archivedManifest(a *registry.Archive, name string, h v1.Hash) (*release.Manifest, error) {
 	body, err := a.Read(h)
 	if err != nil {
-		return nil, h, err
+		return nil, err
 	}
 	var mf struct {
 		ArtifactType string          `json:"artifactType"`
 		Layers       []v1.Descriptor `json:"layers"`
 	}
 	if err := json.Unmarshal(body, &mf); err != nil || mf.ArtifactType != release.MediaType || len(mf.Layers) != 1 || mf.Layers[0].MediaType != release.MediaType {
-		return nil, h, fmt.Errorf("%s-release@%s is not a release manifest", name, h)
+		return nil, fmt.Errorf("%s-release@%s is not a release manifest", name, h)
 	}
 	data, err := a.Read(mf.Layers[0].Digest)
 	if err != nil {
-		return nil, h, err
+		return nil, err
 	}
 	m, err := release.Decode(data)
 	if err != nil {
-		return nil, h, fmt.Errorf("its release could not be read (from another Stowage? use that release's installer): %w", err)
+		return nil, fmt.Errorf("its release could not be read (from another Stowage? use that release's installer): %w", err)
 	}
-	if m.Name != name {
-		return nil, h, fmt.Errorf("it carries %s's release, not %s's", m.Name, name)
+	return m, nil
+}
+
+// yankedAfter are the publications of m's channel in read after m's, yanked since, each signed by
+// a key trust holds (nil: the installer carries none, and its install trusts none, as findRevision
+// counts a yank): an unsigned yank is passed over, logged, never carried. A tag whose manifest is
+// no release this Stowage reads (an older format, another project's) cannot be this channel's
+// yank and is passed over; one whose read or signature check failed otherwise fails the export.
+func yankedAfter(ctx context.Context, c *registry.Client, read *channelRead, m *release.Manifest, trust *sigverify.Verifier, logf func(string, ...any)) ([]archivedYank, error) {
+	var out []archivedYank
+	for i, t := range read.tags {
+		y, err := read.ms[i], read.errs[i]
+		if errors.As(err, new(foreignManifest)) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		if y == nil || y.Yanked == nil || y.Name != m.Name || y.Channel != m.Channel || y.Tag != t || y.ReleaseSeq <= m.ReleaseSeq {
+			continue
+		}
+		if err := checkSigned(ctx, c, read.repo, read.hs[i], y, trust); err != nil {
+			if _, refused := Refusal(err); !refused {
+				return nil, err
+			}
+			logf("not carrying the yank of %s %s: %v", y.Name, y.Tag, err)
+			continue
+		}
+		out = append(out, archivedYank{y, read.hs[i]})
 	}
-	if _, ok := tags[m.Tag]; !ok || len(tags) != 2 || tags[m.Channel] != h {
-		return nil, h, fmt.Errorf("its %s-release must hold the tags %s and %s alone", name, m.Tag, m.Channel)
-	}
-	return m, h, nil
+	return out, nil
 }
 
 // releaseTags checks every tagged manifest of the archive against its release m (at h): each tag
-// is one the release gives an artifact, on the digest it records — as an export writes them — so
-// an import moves no tag of another release.
-func releaseTags(a *registry.Archive, m *release.Manifest, h v1.Hash) error {
+// is one the release gives an artifact, on the digest it records — as an export writes them —, or
+// a yank it carries (archivedRelease), so an import moves no tag of another release.
+func releaseTags(a *registry.Archive, m *release.Manifest, h v1.Hash, yanks map[string]archivedYank) error {
 	name := m.Name
 	want := map[string]string{name + "-release:" + m.Tag: h.String(), name + "-release:" + m.Channel: h.String()}
+	for t, y := range yanks {
+		want[name+"-release:"+t] = y.h.String()
+	}
 	for k, d := range m.Artifacts.Images {
 		want[name+"-"+k+":"+m.Tag] = d
 	}

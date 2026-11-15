@@ -197,17 +197,7 @@ func (in *Installer) K8sUpdates(ctx context.Context, channel, v string) (Update,
 	if _, err := in.checkHelm(ctx); err != nil {
 		return Update{}, err
 	}
-	rel, err := in.release(ctx)
-	if err != nil {
-		return Update{}, err
-	}
-	if rel == nil {
-		return Update{}, in.noRelease()
-	}
-	if err := in.pending(rel); err != nil {
-		return Update{}, err
-	}
-	cur, err := in.installedRelease(ctx)
+	cur, err := in.k8sCurrent(ctx)
 	if err != nil {
 		return Update{}, err
 	}

@@ -397,21 +397,47 @@ func TestServiceWatchLogsALookItCannotMake(t *testing.T) {
 }
 
 // The lock's holder is read from the kernel's table, never by taking it.
-func TestLockHeldPassive(t *testing.T) {
+func TestLockHeld(t *testing.T) {
 	t.Parallel()
 	p := filepath.Join(t.TempDir(), "lock")
-	if lockHeldPassive(p) {
+	if lockHeld(p) {
 		t.Error("held without a file")
 	}
 	unlock, err := lockFile(p)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !lockHeldPassive(p) {
+	if !lockHeld(p) {
 		t.Error("not held, while it is")
 	}
 	unlock()
-	if lockHeldPassive(p) {
+	if lockHeld(p) {
 		t.Error("held once released")
 	}
+}
+
+// Looking never takes the lock: a run taking it at that instant finds it free.
+func TestLockHeldNeverTakesTheLock(t *testing.T) {
+	t.Parallel()
+	p := filepath.Join(t.TempDir(), "lock")
+	unlock, err := lockFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unlock()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for range 2000 {
+			lockHeld(p)
+		}
+	}()
+	for range 2000 {
+		unlock, err := lockFile(p)
+		if err != nil {
+			t.Fatalf("taking the lock while it was looked at: %v", err)
+		}
+		unlock()
+	}
+	<-done
 }

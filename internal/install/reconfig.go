@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"errors"
 	"fmt"
+	"maps"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -40,10 +41,7 @@ func (in *Installer) changes(env *EnvFile) (next *EnvFile, secrets map[string]bo
 	// A domain is checked only when it changes: a value as recorded is no change.
 	var domainGiven []string
 	for _, d := range s.RouteDomains() {
-		v, ok := o.Set[d.Input]
-		if !ok {
-			v, ok = o.Answers[d.Input]
-		}
+		v, ok := in.domainGiven(d.Input)
 		if was, _ := env.Get(d.Input); ok && v != was && !slices.Contains(domainGiven, d.Input) {
 			domainGiven = append(domainGiven, d.Input)
 		}
@@ -246,6 +244,11 @@ func (in *Installer) rerunMode(was string) (string, error) {
 	switch {
 	case mode != "byo":
 	case o.Cert != "" || o.Key != "" || was != "byo":
+		// A domain given that is no domain is refused before the certificate is read, as a
+		// first install refuses it: its fix comes first, whatever the files say.
+		if err := in.givenDomains(); err != nil {
+			return "", err
+		}
 		if o.Cert == "" || o.Key == "" {
 			return "", errors.New("--tls byo needs --cert FILE and --key FILE: the certificate chain and its private key, PEM")
 		}
@@ -366,6 +369,24 @@ func (in *Installer) logChanges(env, next *EnvFile, secrets map[string]bool) {
 		}
 		in.O.logf("changing %s: %s → %s", k, cmp.Or(a, `""`), cmp.Or(b, `""`))
 	}
+}
+
+// givenDomains refuses a value --domains, --set or --answers gives a route's domain input that is
+// no domain name.
+func (in *Installer) givenDomains() error {
+	for _, route := range slices.Sorted(maps.Keys(in.O.Domains)) {
+		if err := checkDomain(in.O.Domains[route]); err != nil {
+			return refusal("give --domains "+route+"= a domain name", fmt.Errorf("--domains %s: %w", route, err))
+		}
+	}
+	for _, i := range in.R.Spec.Inputs {
+		if v := in.given(i.Key); v != "" && in.R.Spec.IsDomainInput(i.Key) {
+			if err := checkDomain(v); err != nil {
+				return refusal("give "+i.Key+" a domain name", fmt.Errorf("%s: %w", i.Key, err))
+			}
+		}
+	}
+	return nil
 }
 
 func redact(v string) string {

@@ -161,7 +161,7 @@ func (in *Installer) CreateVM(ctx context.Context, c *VMCreate) error {
 		}
 		in.useSecrets(f)
 	}
-	prefix, cl, err := in.seedRegistry(ctx)
+	prefix, cl, err := in.seedRegistry(ctx, c.Platform)
 	if err != nil {
 		return err
 	}
@@ -309,15 +309,16 @@ func (in *Installer) CreateVM(ctx context.Context, c *VMCreate) error {
 			in.sshAllows(a, mach)
 		}
 	}
-	if err := in.confirmVM(ctx, p, format, mach, st, given, seed, c, addr); err != nil {
-		return err
-	}
 	// What is given goes over SSH to a host key known beforehand: one generated here, which the
 	// cloud-config carries and the VM serves until its install.
 	// What goes over SSH goes to the host key the cloud-config carries, never to a key taken on
-	// first sight.
+	// first sight. Made before the confirmation: a cloud-config past what the cloud takes is
+	// refused before the operator is asked to go on.
 	userData, hostKey, err := in.seedUserData(p, &mach, st, ca, st.AwaitSecrets || login != nil)
 	if err != nil {
+		return err
+	}
+	if err := in.confirmVM(ctx, p, format, mach, st, given, seed, c, addr); err != nil {
 		return err
 	}
 	if err := os.MkdirAll(out, 0o755); err != nil {
@@ -594,8 +595,8 @@ func (in *Installer) seedable() error {
 
 // seedRegistry is the registry a VM's disk comes from, its prefix and its client: the mirror when
 // one is given (--registry), as the VM's updates do. The disk set the VM boots is read from it
-// into in.boot (bootDisks).
-func (in *Installer) seedRegistry(ctx context.Context) (string, *registry.Client, error) {
+// into in.boot (bootDisks): one holding a format of the platform keyed platform, when it is one.
+func (in *Installer) seedRegistry(ctx context.Context, platform string) (string, *registry.Client, error) {
 	prefix := in.R.Spec.Registry.Prefix
 	if r := in.O.Registry; r != "" {
 		prefix = strings.TrimSuffix(r, "/")
@@ -607,7 +608,11 @@ func (in *Installer) seedRegistry(ctx context.Context) (string, *registry.Client
 	if err != nil {
 		return "", nil, err
 	}
-	if in.boot, err = in.bootDisks(ctx, cl, prefix); err != nil {
+	var formats []string
+	if j := slices.IndexFunc(Platforms, func(p Platform) bool { return p.Key == platform }); j >= 0 {
+		formats = Platforms[j].Formats
+	}
+	if in.boot, err = in.bootDisks(ctx, cl, prefix, formats); err != nil {
 		return "", nil, err
 	}
 	return prefix, cl, nil
@@ -721,8 +726,10 @@ const switchingStowage = "0.6.0"
 // release's own disks, or the set it records (a release that published none boots its channel's);
 // when they are no longer there (a newer set replaced them), the set of the channel pointer's
 // release, its manifest signed by a key this installer trusts, else the channel's disk set
-// record, signed too.
-func (in *Installer) bootDisks(ctx context.Context, cl *registry.Client, prefix string) (bootDisk, error) {
+// record, signed too. A set is taken when the registry holds one of formats (nil: of any format);
+// when none does, the first set holding any format is, so that the platform names the format
+// this registry lacks.
+func (in *Installer) bootDisks(ctx context.Context, cl *registry.Client, prefix string, formats []string) (bootDisk, error) {
 	m, name := in.R.Manifest, in.R.Spec.Name
 	// cannot is why a set found could not boot this release (an older stowage's, or one recording
 	// no OS size), said when no other one can.
@@ -759,8 +766,10 @@ func (in *Installer) bootDisks(ctx context.Context, cl *registry.Client, prefix 
 		}
 		return sizes, missing, nil
 	}
-	// usable is the set when the registry holds one of its formats at least: which one the
-	// platform boots is told by platform.
+	// first is the first set the registry holds a format of, none of formats.
+	var first *bootDisk
+	// usable is the set when the registry holds one of formats (one of its own, formats nil):
+	// which one the platform boots is told by platform.
 	usable := func(src *release.Manifest) (bootDisk, bool, error) {
 		tag, disks := src.Artifacts.Boot(src.Tag)
 		if len(disks) == 0 {
@@ -781,10 +790,23 @@ func (in *Installer) bootDisks(ctx context.Context, cl *registry.Client, prefix 
 				return bootDisk{}, false, nil
 			}
 		}
-		return bootDisk{tag, disks, sizes, missing}, true, nil
+		d := bootDisk{tag, disks, sizes, missing}
+		if formats == nil || slices.ContainsFunc(formats, func(f string) bool { _, ok := sizes[f]; return ok }) {
+			return d, true, nil
+		}
+		if first == nil {
+			first = &d
+		}
+		return bootDisk{}, false, nil
 	}
 	if d, ok, err := usable(m); err != nil || ok {
 		return d, err
+	}
+	// The release's own set, the registry holding some of it but none of formats: it is the one
+	// this release boots, never another release's, and the platform refuses it naming the format
+	// it lacks.
+	if first != nil {
+		return *first, nil
 	}
 	trust, err := trusted("this installer", in.R.Keys)
 	if err != nil {
@@ -845,6 +867,9 @@ func (in *Installer) bootDisks(ctx context.Context, cl *registry.Client, prefix 
 		if d, ok, err := usable(rec); err != nil || ok {
 			return d, err
 		}
+	}
+	if first != nil {
+		return *first, nil
 	}
 	if unread != nil {
 		return bootDisk{}, fmt.Errorf("%s %s has no disk in %s, and its channel %s's release could not be read: %w", name, m.ProjectVersion, prefix, m.Channel, unread)
@@ -1141,7 +1166,14 @@ func machineInterfaces(s *spec.Spec, given []string, p Platform) ([]MachineInter
 		}
 		byRole[role] = i
 	}
-	roles = slices.DeleteFunc(roles, func(r string) bool { return s.Host.Interfaces[r].Optional && !set[r] })
+	notAsked := func(r string) bool { return s.Host.Interfaces[r].Optional && !set[r] }
+	var skipped []string
+	for _, r := range roles {
+		if notAsked(r) {
+			skipped = append(skipped, r)
+		}
+	}
+	roles = slices.DeleteFunc(roles, notAsked)
 	if cloud && len(roles) > 1 {
 		asked := slices.DeleteFunc(slices.Clone(roles), func(r string) bool { return slices.Contains(required, r) })
 		return nil, fmt.Errorf("--interface %s: %s names its VMs' NICs itself, one here: leave the optional %s out", asked[0], p.Label, strings.Join(asked, ", "))
@@ -1153,7 +1185,11 @@ func machineInterfaces(s *spec.Spec, given []string, p Platform) ([]MachineInter
 		switch {
 		case i.MAC != "":
 		case p.Install:
-			return nil, fmt.Errorf("--interface %s=mac=…: a server names each NIC the release names (%s) by its MAC, as it may have more ports than those", r, strings.Join(roles, ", "))
+			also := ""
+			if len(skipped) > 0 {
+				also = fmt.Sprintf("; the optional %s too, when given: --interface %s=mac=…", strings.Join(skipped, ", "), skipped[0])
+			}
+			return nil, fmt.Errorf("--interface %s=mac=…: a server names each NIC the release names (%s) by its MAC, as it may have more ports than those%s", r, strings.Join(roles, ", "), also)
 		case !cloud && len(roles) > 1:
 			mac, err := generatedMAC()
 			if err != nil {

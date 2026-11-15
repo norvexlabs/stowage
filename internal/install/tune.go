@@ -1,6 +1,7 @@
 package install
 
 import (
+	"bytes"
 	"cmp"
 	"context"
 	"errors"
@@ -35,13 +36,13 @@ func (in *Installer) tuneSystem(ctx context.Context) (tune.System, error) {
 	sys := *in.O.Tune
 	releaseHost(&sys, in.R.Spec)
 	if !sys.Owned {
-		get, _ := in.installedEnv()
+		get, envErr := in.installedEnv()
 		roleDevices(&sys, in.R.Spec, func(r string) string { return in.roleDevice(r, get) })
 		// The forwarding a start as root applied as the release and the devices now give it (its
 		// record holds those rules), through roles that each have a device here, is reported so
 		// rather than advised.
 		_, unmapped := in.forwardTables(get)
-		applied := in.gatewayConsented() && in.forwardApplied(get) && len(unmapped) == 0
+		applied := in.gatewayConsented() && in.forwardApplied(ctx, get) && len(unmapped) == 0
 		// An optional role without its NIC here is no difference: nothing forwards through it nor
 		// is intercepted on it, so no rule names it.
 		absent := func(r string) bool { return in.R.Spec.Host.Interfaces[r].Optional && in.roleDevice(r, get) == "" }
@@ -52,6 +53,9 @@ func (in *Installer) tuneSystem(ctx context.Context) (tune.System, error) {
 			}
 			ti.Forward = slices.DeleteFunc(slices.Clone(ti.Forward), absent)
 			ti.Applied = applied
+			if envErr != nil {
+				ti.Unjudged = fmt.Sprintf("the install's record does not read (%v): the NICs it names are not known (run as root)", envErr)
+			}
 		}
 	}
 	out, err := in.O.Docker.Run(ctx, Cmd{Args: []string{"info", "--format", "{{.ServerVersion}}|{{.OperatingSystem}}|{{json .SecurityOptions}}"}})
@@ -204,8 +208,13 @@ func (in *Installer) Tune(ctx context.Context, t TuneOptions) error {
 			// The services' nftables tables are the operator's to load on a host Stowage does not
 			// own: printed, never written.
 			if !sys.Owned {
+				// Consented, each start loads them: nothing for the operator to load.
+				load, loadPicked := "not written: load it with nft -f <file>, the host's firewall is its operator's", "not written: load the one this install's %s picks alone, with nft -f <file>, the host's firewall is its operator's"
+				if in.gatewayConsented() {
+					load, loadPicked = "loaded by each start: tune --apply consented", "the one this install's %s picks loaded by each start: tune --apply consented"
+				}
 				for _, name := range sortedKeys(in.R.Nftables) {
-					fmt.Fprintf(in.O.Out, "# services.%s.nftables (not written: load it with nft -f <file>, the host's firewall is its operator's)\n%s\n", name, in.R.Nftables[name])
+					fmt.Fprintf(in.O.Out, "# services.%s.nftables (%s)\n%s\n", name, load, in.R.Nftables[name])
 				}
 				get := func(string) string { return "" }
 				if len(in.R.NftByInput) > 0 {
@@ -226,7 +235,7 @@ func (in *Installer) Tune(ctx context.Context, t TuneOptions) error {
 						fmt.Fprintf(in.O.Out, "# note: %s: %v: a start that loads the table refuses it; each table it picks is printed, load one alone\n", t.Input, pickError(name, t, v))
 					}
 					for _, v := range values {
-						fmt.Fprintf(in.O.Out, "# services.%s.nftables.files.%s, the table %s=%s picks (not written: load the one this install's %s picks alone, with nft -f <file>, the host's firewall is its operator's)\n%s\n", name, v, t.Input, v, t.Input, in.R.NftByInput[name][v])
+						fmt.Fprintf(in.O.Out, "# services.%s.nftables.files.%s, the table %s=%s picks ("+loadPicked+")\n%s\n", name, v, t.Input, v, t.Input, in.R.NftByInput[name][v])
 					}
 				}
 			}
@@ -270,11 +279,27 @@ func (in *Installer) Tune(ctx context.Context, t TuneOptions) error {
 		if consented || revoked {
 			loaded = in.loadedTables(ctx)
 		}
+		get := in.reportEnv(true)
 		for _, name := range in.R.Tables() {
 			item := tune.Item{State: tune.Advice, Kind: "nftables", Name: "table inet " + name,
 				Have: "the service " + name + " asks for its nftables table:", Want: "`" + ctl + " tune --apply` loads it at each start, or nft -f <file> from `" + ctl + " tune --print` (the host's firewall is its operator's)"}
+			// What the install's values pick of this table alone: another's pick that fails is its
+			// own item's.
+			var want []byte
+			var wantErr error
+			if consented && slices.Contains(loaded, name) {
+				want, wantErr = in.R.tableNow(name, get)
+			}
 			switch {
+			case consented && slices.Contains(loaded, name) && wantErr != nil:
+				item.State, item.Have, item.Want = tune.Differs, "loaded", wantErr.Error()+": a start that loads the table refuses it"
 			case consented && slices.Contains(loaded, name):
+				// Loaded, from the file the install's values pick now: a re-run changing the value
+				// picks another, which the next start loads.
+				if have, err := os.ReadFile(in.tableFile(name, ".nft")); err != nil || !bytes.Equal(have, tableText(name, want)) {
+					item.State, item.Have, item.Want = tune.Differs, "loaded from other rules than the release's, as the install's values pick them", "loaded by the next start as root (tune --apply)"
+					break
+				}
 				item.State, item.Have, item.Want = tune.OK, "loaded by each start (tune --apply)", "loaded"
 			case consented:
 				item.State, item.Have, item.Want = tune.Differs, "not loaded", "loaded by the next start as root (tune --apply)"

@@ -200,7 +200,7 @@ func TestKeyURIsAreNotProjectFiles(t *testing.T) {
 		"env://SIGNING_KEY": true, "hashivault://release": true, "awskms:///alias/release": true,
 		"pkcs11:token=release;slot-id=0": true, "keys/release.key": false, "release.key": false,
 	} {
-		if keyURI.MatchString(key) != uri {
+		if publish.KeyIsURI(key) != uri {
 			t.Errorf("%s: uri = %v", key, !uri)
 		}
 	}

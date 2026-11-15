@@ -208,6 +208,52 @@ func TestPressurePastHardShowsTheBannerUntilItEases(t *testing.T) {
 	}
 }
 
+// A banner whose reload failed is reloaded by the next check, unchanged as it is; one reload that
+// worked is not repeated.
+func TestPressureReloadsABannerWhoseReloadFailed(t *testing.T) {
+	t.Parallel()
+	p := newPressure(t, true)
+	p.h.Host = &failingReload{fakeHost: p.host, fails: 1}
+	p.check(95)
+	p.check(95)
+	if p.reloads() != 2 {
+		t.Errorf("%d reloads, want the failed one tried again", p.reloads())
+	}
+	p.check(95)
+	if p.reloads() != 2 {
+		t.Errorf("%d reloads once one worked", p.reloads())
+	}
+}
+
+// failingReload fails the first fails `agetty --reload`s.
+type failingReload struct {
+	*fakeHost
+	fails int
+}
+
+func (f *failingReload) Run(ctx context.Context, c Cmd) ([]byte, error) {
+	out, err := f.fakeHost.Run(ctx, c)
+	if slices.Equal(c.Args, []string{"agetty", "--reload"}) && f.fails > 0 {
+		f.fails--
+		return nil, errors.New("agetty: no consoles")
+	}
+	return out, err
+}
+
+// A disk that stops reading takes down the banner of the last level read.
+func TestPressureUnreadableDiskRemovesTheBanner(t *testing.T) {
+	t.Parallel()
+	p := newPressure(t, true)
+	p.check(95)
+	if _, err := os.Stat(p.banner); err != nil {
+		t.Fatal(err)
+	}
+	p.check(-1)
+	if _, err := os.Stat(p.banner); !os.IsNotExist(err) || p.reloads() != 2 {
+		t.Errorf("%v, %d reloads", err, p.reloads())
+	}
+}
+
 // No result carries the token: an error that quotes it, before the POST, has it replaced.
 func TestPressureErrorNeverShowsTheToken(t *testing.T) {
 	t.Parallel()
@@ -382,6 +428,7 @@ func TestServeWaitsForTheCheckUnderWay(t *testing.T) {
 	t.Cleanup(func() { os.RemoveAll(dir) })
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
+	withBootID(t, p.h)
 	go func() { done <- p.h.Serve(ctx, filepath.Join(dir, "run", "host.sock")) }()
 	<-entered
 	cancel()

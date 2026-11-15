@@ -187,8 +187,8 @@ func (in *Installer) K8sUninstall(ctx context.Context) (err error) {
 		if len(foreign) > 0 {
 			others = "; another tool made " + strings.Join(foreign, ", ")
 		}
-		return refuse(fmt.Sprintf("kubectl delete secret %s --namespace %s, once the data's claims are deleted", strings.Join(keptSecrets, " "), k.Namespace), "no release %s in %s, and nothing %s made for it there but the Secrets %s, which answer for its data: once the data's claims are deleted, `kubectl delete secret %s --namespace %s` deletes them%s",
-			k.Release, k.Namespace, in.R.Ctl(), strings.Join(keptSecrets, ", "), strings.Join(keptSecrets, " "), k.Namespace, others)
+		return refuse(fmt.Sprintf("kubectl delete secret %s %s, once the data's claims are deleted", strings.Join(keptSecrets, " "), k.kubectlWhere()), "no release %s in %s, and nothing %s made for it there but the Secrets %s, which answer for its data: once the data's claims are deleted, `kubectl delete secret %s %s` deletes them%s",
+			k.Release, k.Namespace, in.R.Ctl(), strings.Join(keptSecrets, ", "), strings.Join(keptSecrets, " "), k.kubectlWhere(), others)
 	}
 	if len(owned) > 0 {
 		var names []string
@@ -259,18 +259,18 @@ func (in *Installer) K8sUninstall(ctx context.Context) (err error) {
 	var kept []string
 	if !data && len(claims) > 0 {
 		// The release is gone now: a later uninstall cannot tell them, so the command is kubectl's.
-		kept = append(kept, fmt.Sprintf("its PersistentVolumeClaims %s, which hold its data (`kubectl delete persistentvolumeclaims %s --namespace %s` deletes them)",
-			strings.Join(claims, ", "), strings.Join(claims, " "), k.Namespace))
+		kept = append(kept, fmt.Sprintf("its PersistentVolumeClaims %s, which hold its data (`kubectl delete persistentvolumeclaims %s %s` deletes them)",
+			strings.Join(claims, ", "), strings.Join(claims, " "), k.kubectlWhere()))
 	}
 	if len(keptClaims) > 0 {
-		kept = append(kept, fmt.Sprintf("the PersistentVolumeClaims %s, which its chart keeps (`kubectl delete persistentvolumeclaims %s --namespace %s` deletes them)",
-			strings.Join(keptClaims, ", "), strings.Join(keptClaims, " "), k.Namespace))
+		kept = append(kept, fmt.Sprintf("the PersistentVolumeClaims %s, which its chart keeps (`kubectl delete persistentvolumeclaims %s %s` deletes them)",
+			strings.Join(keptClaims, ", "), strings.Join(keptClaims, " "), k.kubectlWhere()))
 	}
 	if rel == nil {
-		kept = append(kept, "any PersistentVolumeClaim the release made: helm no longer knows it, so they cannot be told (`kubectl get persistentvolumeclaims --namespace "+k.Namespace+"` lists them)")
+		kept = append(kept, "any PersistentVolumeClaim the release made: helm no longer knows it, so they cannot be told (`kubectl get persistentvolumeclaims "+k.kubectlWhere()+"` lists them)")
 	}
 	if len(keptSecrets) > 0 {
-		then := fmt.Sprintf("once the data's claims are deleted, `kubectl delete secret %s --namespace %s` deletes them", strings.Join(keptSecrets, " "), k.Namespace)
+		then := fmt.Sprintf("once the data's claims are deleted, `kubectl delete secret %s %s` deletes them", strings.Join(keptSecrets, " "), k.kubectlWhere())
 		kept = append(kept, fmt.Sprintf("the Secrets %s, which answer for the data kept: `%s` takes it back with them (%s)", strings.Join(keptSecrets, ", "), in.k8sCtl("install"), then))
 	}
 	if len(foreign) > 0 {

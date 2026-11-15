@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -38,11 +39,15 @@ type faulty struct {
 	posts   int
 	chunks  int
 	deletes int
-	sizes   []int64 // each chunk's length
-	minimum string  // the OCI-Chunk-Min-Length a session is opened with
+	sizes   []int64      // each chunk's length
+	minimum string       // the OCI-Chunk-Min-Length a session is opened with
+	pings   atomic.Int32 // GET /v2/: one per transport made
 }
 
 func (f *faulty) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == "/v2/" {
+		f.pings.Add(1)
+	}
 	upload := strings.Contains(r.URL.Path, "/blobs/uploads/")
 	id := path.Base(r.URL.Path)
 	f.mu.Lock()
@@ -880,5 +885,122 @@ func TestSize(t *testing.T) {
 		if got := size(n); got != want {
 			t.Errorf("%d: %s, want %s", n, got, want)
 		}
+	}
+}
+
+// A commit is awaited for its own bound, scaled to the blob, beyond the client's response bound:
+// a registry verifying a large blob for longer than that answers one commit, not a retry.
+func TestACommitIsAwaitedForTheBlobsSize(t *testing.T) {
+	unit, wait, rate := uploadUnit, responseWait, commitRate
+	uploadUnit, responseWait, commitRate = time.Millisecond, 200*time.Millisecond, 40
+	t.Cleanup(func() { uploadUnit, responseWait, commitRate = unit, wait, rate })
+	f, c, out, repo, b := uploadFixture(t)
+	// 20 KiB at 40 bytes a unit: the commit is awaited for 200 ms and 512 units.
+	if got := commitWait(b.size); got != 712*time.Millisecond {
+		t.Fatalf("commitWait: %s", got)
+	}
+	var commits atomic.Int32
+	f.put = func(w http.ResponseWriter, r *http.Request) bool {
+		if r.URL.Query().Get("digest") != "" {
+			commits.Add(1)
+			time.Sleep(2 * responseWait) // past the client's response bound, within the commit's
+		}
+		return false
+	}
+	if err := pushed(t, c, repo, b); err != nil {
+		t.Fatal(err)
+	}
+	if n := commits.Load(); n != 1 || strings.Contains(out.String(), "again in") {
+		t.Fatalf("%d commits, log:\n%s", n, out)
+	}
+	// A registry refusing chunks gets the blob in one stream, its commit awaited as long.
+	f, c, out, repo, b = uploadFixture(t)
+	f.patch = func(n int, w http.ResponseWriter, r *http.Request) bool {
+		w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+		return true
+	}
+	commits.Store(0)
+	f.put = func(w http.ResponseWriter, r *http.Request) bool {
+		if r.URL.Query().Get("digest") != "" {
+			commits.Add(1)
+			time.Sleep(2 * responseWait)
+		}
+		return false
+	}
+	if err := pushed(t, c, repo, b); err != nil || !strings.Contains(out.String(), "pushing it in one stream") {
+		t.Fatalf("one stream: %v, log:\n%s", err, out)
+	}
+	if n := commits.Load(); n != 1 {
+		t.Fatalf("one stream: %d commits", n)
+	}
+}
+
+// A registry failing every commit fails the push once the commit's bound passed since the first
+// commit, not at each attempt; a blob already there makes no commit transport.
+func TestAFailingCommitStopsAtItsBound(t *testing.T) {
+	unit, wait, rate := uploadUnit, responseWait, commitRate
+	uploadUnit, responseWait, commitRate = time.Millisecond, 50*time.Millisecond, 1<<30
+	t.Cleanup(func() { uploadUnit, responseWait, commitRate = unit, wait, rate })
+	f, c, _, repo, b := uploadFixture(t)
+	f.put = func(w http.ResponseWriter, r *http.Request) bool {
+		if r.URL.Query().Get("digest") != "" {
+			w.WriteHeader(http.StatusInternalServerError)
+			return true
+		}
+		return false
+	}
+	r, err := c.Repo(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	start := time.Now()
+	err = c.pushFile(ctx, r, b)
+	if err == nil || !strings.Contains(err.Error(), "not committed in 300ms since every byte was acknowledged") {
+		t.Fatalf("a commit failing for good: %v", err)
+	}
+	if d := time.Since(start); d > 5*time.Second {
+		t.Fatalf("stopped after %s", d)
+	}
+	// Lazily made: the commit's transport is one ping more than the upload's.
+	f.put = nil
+	if err := pushed(t, c, repo, b); err != nil {
+		t.Fatal(err)
+	}
+	pings := f.pings.Load()
+	if err := c.pushFile(context.Background(), r, b); err != nil {
+		t.Fatal(err)
+	}
+	if n := f.pings.Load() - pings; n != 1 {
+		t.Fatalf("a blob already there: %d transports made, want 1", n)
+	}
+}
+
+// The waiting transport is made once per client, when a commit first needs it: a push the registry
+// already holds makes none, and every later push reuses the first one's.
+func TestTheWaitingTransportIsMadeOnce(t *testing.T) {
+	t.Parallel()
+	_, c, _, repo, b := uploadFixture(t)
+	if err := pushed(t, c, repo, b); err != nil {
+		t.Fatal(err)
+	}
+	first := c.awaited
+	if first == nil {
+		t.Fatal("a commit made no waiting transport")
+	}
+	if err := pushed(t, c, repo, fileBlob(t, 4<<10)); err != nil {
+		t.Fatal(err)
+	}
+	if c.awaited != first {
+		t.Fatal("a second push made another waiting transport")
+	}
+	_, fresh, _, _, _ := uploadFixture(t)
+	r, err := fresh.Repo(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fresh.pushFile(context.Background(), r, b); err != nil || fresh.awaited != nil {
+		t.Fatalf("a blob already there: %v, waiting transport %v", err, fresh.awaited)
 	}
 }

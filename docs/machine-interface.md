@@ -73,7 +73,9 @@ share; each shape's own fields and verbs are on its page:
   volumes half restored — not while a restore runs (it holds the install's host lock), as on the
   VM; `services` the stack's services as the VM's `ps --json` gives them
   (`service`, `state`, `health`, `image`, `exit_code`, `id`, `oom_killed`, `mem_limit_bytes`,
-  `restarts`), `null` with `services_error` saying why when Compose cannot list them. The
+  `restarts`; a service the stack declares with no container is `"state": "missing"`, and a
+  `compose run` container is left out), `null` with `services_error` saying why when Compose
+  cannot list them. The
   installer image is recorded in `.env` as `STOWAGE_INSTALLER`, with `STOWAGE_INSTALLER_RELEASE`
   the release it was recorded for (`<version>/<revision>`), by the install and each upgrade,
   read from the release manifest of its release under its tag in the registry the install pulls

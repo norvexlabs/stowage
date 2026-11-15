@@ -157,7 +157,7 @@ func (in *Installer) k8sPSQL(ctx context.Context, registry, q string) (string, e
 		dctx, dcancel := context.WithTimeout(context.WithoutCancel(ctx), time.Minute)
 		defer dcancel()
 		if _, err := in.kubectl(dctx, Cmd{Args: []string{"delete", "pod", name, "--ignore-not-found", "--wait=false"}}); err != nil {
-			in.O.logf("the schema pod %s could not be deleted: `kubectl delete pod %s --namespace %s` (%v)", name, name, k.Namespace, err)
+			in.O.logf("the schema pod %s could not be deleted: `kubectl delete pod %s %s` (%v)", name, name, k.kubectlWhere(), err)
 		}
 	}()
 	for {

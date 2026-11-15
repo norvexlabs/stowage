@@ -75,7 +75,8 @@ the current directory. A release with no chart (published without the shape) is 
   out and its replies, nft's `socket transparent 1` accept), each kernel argument (`kernel
   argument <name>[=<value>]`), each setting (`sysctl <key> = <value>`) and, under `host.power:
   performance`, what it holds the CPUs at.
-- `install` refuses a namespace that already has the release (it names `upgrade`). It creates
+- `install` refuses a namespace that already has the release, in any helm status (`unknown`,
+  which `helm list` never shows, included: `helm status` tells it) (it names `upgrade`). It creates
   the namespace when missing (one the operator may not read is taken to exist), then applies, with `kubectl apply --server-side --field-manager
   stowage`, the Secret `<release>-stowage` (type `Opaque`): every `secrets` key, generated as the
   Docker shape generates it, and every input that applies to Kubernetes (`shapes` empty or
@@ -180,7 +181,14 @@ the current directory. A release with no chart (published without the shape) is 
   on Kubernetes `--set` never changes a recorded input. A failed hook's message names
   `k8s provision --set` and the keys it returned or declares.
 - `upgrade`, run by the new release's installer, requires the release in the namespace, refuses
-  one helm is still working on (`pending-…`), one not installed from a chart Stowage published or
+  one helm is still working on (`pending-…`), one in a status but `deployed`, `failed`,
+  `superseded` or `uninstalled` (helm's `unknown`, an interrupted `uninstalling`: `release R in NS
+  is in helm's <status> status: \`helm history R --namespace NS\` shows it; repair or uninstall it
+  with helm first`; `rollback`, `upgrade --version` and `provision` refuse it too), one
+  uninstalled with its history kept (every verb acting on the installed release but `rollback`,
+  which brings it back, refuses it as absent, `install` too, exit 3: `release R in NS is
+  uninstalled, its history kept: nothing runs; \`… k8s rollback …\` brings it back; to install <v>
+  afresh, \`helm uninstall R --namespace NS\` drops its history, then \`… k8s install …\``), one not installed from a chart Stowage published or
   of another project, and one running a later release by the scheme the release records (it
   names `rollback`; a `command` scheme is not ordered), and one running another schema baseline
   (see "Schema baselines" ([installer](installer.md)); it names `reset-db --new-baseline`). The same release is applied again: that is
@@ -189,7 +197,11 @@ the current directory. A release with no chart (published without the shape) is 
   as `install` does, with `--reset-then-reuse-values`: the new chart's values, then every value
   given at earlier runs (the installer's and the operator's `--values`), then this run's. By
   default the chart and the images come from the registry the release was installed from. An
-  upgrade with no pull password refreshes no pull Secret and keeps the one the release names.
+  upgrade with no pull password refreshes no pull Secret and gives `stowage.pullSecret` the one
+  the release names, once `kubectl get` sees it (none named: `""`, given explicitly, never reused
+  unseen); one gone is refused on the release's own registry with a `token` pull account (`the
+  pull Secret S the release names is gone: set TOKEN_ENV (the pull account U) to write it
+  again`), and elsewhere (a mirror) logged and given as none.
 - `upgrade` drops, from the Secret `<release>-stowage`, the value of an input the release no
   longer declares (fetching the installer of the release the helm release runs, as for the schema
   baseline: one that cannot be read keeps every value), saying `input KEY is not in <name>
@@ -243,7 +255,9 @@ the current directory. A release with no chart (published without the shape) is 
   nothing is checked, and lint warns.
 - `status` prints what the release runs (name, version, revision, channel) and its registry,
   `endpoint  http://<release>-<service>.<namespace>.svc:<port>` when the spec names an `endpoint`
-  (see "Extensions" ([extensions](extensions.md))), then `helm status`. `status --json` prints one JSON object for a program
+  (see "Extensions" ([extensions](extensions.md))), then `helm status`; after an uninstall that kept
+  its history it prints instead `release R in NS is uninstalled, its history kept (revision N):
+  \`<short>-stow k8s rollback …\` brings back <name> <version> (revision M)`. `status --json` prints one JSON object for a program
   instead, with the Docker shape's `status --json` names (`format`, `name`, `installed` with `installer`,
   `channel`, `installing`, `previous`, `inputs`) and `helm` in place of `services`, never a
   value of the release's Secret:
@@ -380,7 +394,8 @@ the current directory. A release with no chart (published without the shape) is 
     one (`helm.sh/resource-policy: keep`, `--data` or not), and when helm no longer knows the
     release. `kept:` names the `kubectl delete persistentvolumeclaims` and `kubectl delete secret`
     that remove them later (the release is gone then, so a second `uninstall` cannot tell its
-    claims); an `uninstall` that finds nothing but those Secrets is refused, naming them.
+    claims) — like every `kubectl` command a message prints, with the flags the run's own kubectl
+    commands take: `--namespace NS`, and `--context C` when `--kube-context` is given; an `uninstall` that finds nothing but those Secrets is refused, naming them.
   - A release helm no longer knows (gone, or `uninstalled` with its history kept) has its other
     objects deleted all the same, its claims untold (none deleted, `--data` or not); nothing of it
     at all is refused (`no release R in NS, and nothing <short>-stow made for it

@@ -247,9 +247,21 @@ func TestVMAttach(t *testing.T) {
 		t.Errorf("another MAC: %v", err)
 	}
 	b.Interface = "edge=dhcp,attach=br1"
-	if err := in.AttachVM(ctx, &b); err == nil || !strings.Contains(err.Error(), "to br0 already") {
+	vm(boot("1"), ok) // the state holds the device: the plan adds none
+	if err := in.AttachVM(ctx, &b); err == nil || !strings.Contains(err.Error(), "to br0 already") || readNICs()[1].Attach != "br0" {
 		t.Errorf("another bridge: %v", err)
 	}
+	// The state lacking the device (an apply failed on the bridge recorded): the plan adds it, on
+	// the bridge given now.
+	vm(boot("1"), ok, ok)
+	r.tofu.calls, r.tofu.plan, r.tofu.show = nil, 2, nicPlan
+	if err := in.AttachVM(ctx, &b); err != nil {
+		t.Fatalf("another bridge, the device not in the state: %v\n%s", err, v.log)
+	}
+	if n := readNICs(); n[1].Attach != "br1" || n[1].MAC != mac {
+		t.Errorf("nics %+v", n)
+	}
+	r.tofu.plan = 0
 	if _, err := os.Stat(filepath.Join(dir, attachPlanFile)); err == nil {
 		t.Error("the plan file is left")
 	}

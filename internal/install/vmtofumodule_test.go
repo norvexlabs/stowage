@@ -278,10 +278,31 @@ variable "flat_default" { default = "x" }
 variable "flat_typed" { type = string }
 variable "flat_quoted" { description = "no default = pick one" }
 variable "flat_commented" { type = string } # a comment
+variable "flat_bool" { type = bool }
+variable "count_n" {
+  type    = number
+  default = 2
+}
+variable "nested_bool" { type = object({ on = bool }) }
 variable "flat_object" { type = object({ default = string }) }
 variable "object" {
   type = object({
     default = string
+  })
+}
+
+variable "tabbed" {
+	type = number
+	default = 1
+}
+variable "deep_type" {
+    description = "four spaces"
+    type = bool
+    default = { type = number }
+}
+variable "nested_attr" {
+  type = object({
+    type = number
   })
 }
 
@@ -291,15 +312,15 @@ variable "url" {
 }
 `),
 		"crlf.tf":      []byte("variable \"crlf\" {\r\n  default = 1\r\n}\r\n"),
-		"more.tf.json": []byte(`{"variable": {"region": {"description": "R"}, "tier": {"default": null}, "count": {"default": 2}}}`),
+		"more.tf.json": []byte(`{"variable": {"region": {"description": "R"}, "tier": {"default": null}, "count": {"default": 2, "type": "number"}, "on": {"type": "bool"}, "list": {"type": "list(bool)"}}}`),
 		"README.md":    []byte(`variable "readme" {`),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []moduleVar{{"count", "", true}, {"crlf", "", true}, {"flat", "", false}, {"flat_commented", "", false}, {"flat_default", "", true},
-		{"flat_object", "", false}, {"flat_quoted", "", false}, {"flat_typed", "", false}, {"object", "", false},
-		{"region", "R", false}, {"size", "", true}, {"tier", "", false}, {"url", "A # is not a comment, nor // in a string", true}, {"zone", `The "zone".`, false}}
+	want := []moduleVar{{"count", "", true, "number"}, {"count_n", "", true, "number"}, {"crlf", "", true, ""}, {"deep_type", "four spaces", true, "bool"}, {"flat", "", false, ""}, {"flat_bool", "", false, "bool"}, {"flat_commented", "", false, ""}, {"flat_default", "", true, ""},
+		{"flat_object", "", false, ""}, {"flat_quoted", "", false, ""}, {"flat_typed", "", false, ""}, {"list", "", false, ""}, {"nested_attr", "", false, ""}, {"nested_bool", "", false, ""}, {"object", "", false, ""}, {"on", "", false, "bool"},
+		{"region", "R", false, ""}, {"size", "", true, ""}, {"tabbed", "", true, "number"}, {"tier", "", false, ""}, {"url", "A # is not a comment, nor // in a string", true, ""}, {"zone", `The "zone".`, false, ""}}
 	if !slices.Equal(vars, want) {
 		t.Errorf("%+v\nwant %+v", vars, want)
 	}
@@ -500,11 +521,50 @@ func TestTheGCPModulesFirewallIsOptIn(t *testing.T) {
 	delete(r.vars, "TRUENAS_URL")
 	c := VMCreate{Platform: "gcp", Create: CreateTofu, Hostname: "notes-1", User: "ops", Ctl: "/opt/notes-stow", Wait: 5 * time.Second,
 		Vars: map[string]string{"project": "p", "zone": "z", "bucket": "b", "firewall": "yes"}}
-	if err := v.create(c, r.mod(nil)); err == nil || err.Error() != "--tofu-var firewall=yes: true or false" {
+	if err := v.create(c, r.mod(nil)); err == nil || err.Error() != `firewall: "yes": the module's firewall is a bool: true or false` {
 		t.Fatalf("err = %v", err)
 	}
 	if len(r.tofu.calls) != 1 {
 		t.Errorf("OpenTofu ran: %v", r.tofu.calls)
+	}
+	// Every built-in module's typed variable: Azure's accelerated_networking too.
+	v = newVMCreate(t, "vhd")
+	r = newTofuRun(t)
+	delete(r.vars, "TRUENAS_URL")
+	c = VMCreate{Platform: "azure", Create: CreateTofu, Hostname: "notes-1", User: "ops", Ctl: "/opt/notes-stow", Wait: 5 * time.Second,
+		Vars: map[string]string{"resource_group": "g", "location": "l", "storage_account": "s", "subnet_id": "n", "accelerated_networking": "yes"}}
+	if err := v.create(c, r.mod(nil)); err == nil || err.Error() != `accelerated_networking: "yes": the module's accelerated_networking is a bool: true or false` {
+		t.Fatalf("azure: err = %v", err)
+	}
+	if len(r.tofu.calls) != 1 {
+		t.Errorf("azure: OpenTofu ran: %v", r.tofu.calls)
+	}
+}
+
+// A value given a bool variable takes its spellings, made true or false; a number one, one that
+// parses; any other type, anything.
+func TestTypedValue(t *testing.T) {
+	t.Parallel()
+	for _, c := range []struct {
+		typ, val, want string
+		ok             bool
+	}{
+		{"bool", "true", "true", true}, {"bool", "1", "true", true}, {"bool", "0", "false", true}, {"bool", "false", "false", true},
+		{"bool", "yes", "", false}, {"bool", "True", "", false}, {"bool", "", "", false},
+		{"number", "3", "3", true}, {"number", "-1.5", "-1.5", true}, {"number", "3x", "", false}, {"number", " 3", "", false}, {"number", "", "", false},
+		{"number", "1e3", "1e3", true}, {"number", "2.5E-2", "2.5E-2", true},
+		{"number", "NaN", "", false}, {"number", "Inf", "", false}, {"number", "-Infinity", "", false}, {"number", "0x10", "", false}, {"number", "+1", "", false}, {"number", "1.", "", false}, {"number", ".5", "", false}, {"number", "1_000", "", false},
+		{"", "anything", "anything", true},
+	} {
+		got, err := typedValue(moduleVar{Name: "x", Type: c.typ}, c.val)
+		if (err == nil) != c.ok || got != c.want {
+			t.Errorf("%s %q: %q %v", c.typ, c.val, got, err)
+		}
+	}
+	// A form's answer: empty is the module's default, another value checked by its type.
+	check := typedCheck(moduleVar{Name: "x", Type: "bool"})
+	if check("") != nil || check("yes") == nil || check("1") != nil {
+		t.Error("the form's check of a bool")
 	}
 }
 

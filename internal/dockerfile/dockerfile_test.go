@@ -86,6 +86,47 @@ func TestFroms(t *testing.T) {
 	}
 }
 
+// ModulePins reads xcaddy's --replace and go get's arguments across continuations; a module
+// pinned twice must agree.
+func TestModulePins(t *testing.T) {
+	for _, c := range []struct {
+		name, run string
+		want      map[string]string
+	}{
+		{"replace", "xcaddy build v2 --replace example.com/a=example.com/a@v1.2.3 --replace example.com/d=../d", map[string]string{"example.com/a": "v1.2.3"}},
+		{"replace of one version", "xcaddy build v2 --replace example.com/a@v1.0.0=example.com/a@v1.2.3", map[string]string{"example.com/a": "v1.2.3"}},
+		{"with", "xcaddy build v2 --with example.com/p@v0.1.0 --with example.com/q@v0.2.0=../q --with example.com/r", map[string]string{"example.com/p": "v0.1.0"}},
+		{"go get, continued", "go mod init b \\\n && go get -u example.com/b/cmd/b@v0.4.0 example.com/c/v4@v4.1.7 \\\n && go build -o /b example.com/z@v9", map[string]string{"example.com/b/cmd/b": "v0.4.0", "example.com/c/v4": "v4.1.7"}},
+		{"go install", "go install example.com/i/cmd/i@v1.0.0; go build example.com/z@v9", map[string]string{"example.com/i/cmd/i": "v1.0.0"}},
+		{"punctuation and quotes", "(go get 'example.com/e@v1.1.0' \"example.com/f@v2.0.0\";go build example.com/z@v9)|| go get example.com/g@v3.0.0&&true", map[string]string{"example.com/e": "v1.1.0", "example.com/f": "v2.0.0", "example.com/g": "v3.0.0"}},
+		{"pipe", "go get example.com/h@v1.0.0|tee x example.com/z@v9", map[string]string{"example.com/h": "v1.0.0"}},
+	} {
+		f, err := Parse([]byte("FROM golang\nRUN " + c.run + "\n"))
+		if err != nil {
+			t.Fatalf("%s: %v", c.name, err)
+		}
+		got, err := f.ModulePins()
+		if err != nil {
+			t.Fatalf("%s: %v", c.name, err)
+		}
+		if !reflect.DeepEqual(got, c.want) {
+			t.Errorf("%s: ModulePins = %v, want %v", c.name, got, c.want)
+		}
+	}
+	for _, bad := range []string{
+		"FROM x\nRUN xcaddy build --replace example.com/a=example.com/a@v1\nFROM y\nRUN go get example.com/a@v2\n",
+		"FROM x\nRUN xcaddy build --replace example.com/a=example.com/fork@v1\n",
+	} {
+		f, err := Parse([]byte(bad))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.ModulePins(); err == nil {
+			t.Errorf("%q: accepted", bad)
+		}
+	}
+}
+
 // A Dockerfile the build would refuse is refused here, so lint reports it before ship does.
 func TestInvalidDockerfiles(t *testing.T) {
 	for _, src := range []string{

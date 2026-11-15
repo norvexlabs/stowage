@@ -116,7 +116,8 @@ func (in *Installer) fixOn(docker, vm string) string {
 }
 
 // flagFix is fix, which gives the run a flag, input or answer — none when the run takes none
-// (Installer.givenNothing): no advice holds there.
+// (Installer.givenNothing): no advice holds there. A reason names a flag through it too, so it
+// states the fact alone where no flag can be given (the VM's upgrade).
 func (in *Installer) flagFix(fix string) string {
 	if in.givenNothing {
 		return ""

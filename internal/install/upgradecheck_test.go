@@ -174,7 +174,7 @@ func TestTheDaemonResetsToANewBaselineByItsOS(t *testing.T) {
 		t.Fatalf("%+v %v", j, host.calls())
 	}
 	mark := newBaselineFile(p.env.dir)
-	if raw, err := os.ReadFile(mark); err != nil || strings.TrimSpace(string(raw)) != "2.0.0-1" {
+	if raw, err := os.ReadFile(mark); err != nil || strings.TrimSpace(string(raw)) != "2.0.0 1" {
 		t.Fatalf("mark %q %v (job %+v)", raw, err, j)
 	}
 	if n := len(p.env.docker.ran("volume rm")); n != 0 {
@@ -189,7 +189,7 @@ func TestTheDaemonResetsToANewBaselineByItsOS(t *testing.T) {
 	// An upgrade written instead takes the mark away: it crosses no baseline.
 	q.releaseOf("2.1.0", atBaseline(1))
 	qm := newBaselineFile(q.env.dir)
-	if err := os.WriteFile(qm, []byte("2.0.0-1\n"), 0o600); err != nil {
+	if err := os.WriteFile(qm, []byte("2.0.0 1\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	qh := daemon(q.env, &fakeHost{}).Handler()

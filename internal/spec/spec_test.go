@@ -157,3 +157,71 @@ func TestUnheldNetwork(t *testing.T) {
 		}
 	}
 }
+
+// A key written with nothing under it (null or {}) is refused with its line; the same key with
+// content, or left out, decodes.
+func TestParseRefusesEmptyKeys(t *testing.T) {
+	t.Parallel()
+	cases := []struct{ empty, full, want string }{
+		{"services:\n", "services: { api: { memory: 10 } }\n", "stowage.yaml:3: services is written with nothing under it: name a service, or remove services"},
+		{"services: {}\n", "", "stowage.yaml:3: services is written with nothing under it"},
+		{"tune: ~\n", "tune: { profile: network }\n", "stowage.yaml:3: tune is written with nothing under it: give its profile, or remove tune"},
+		{"shapes:\n  kairos:\n    size:\n", "shapes:\n  kairos:\n    size: { min: { cpus: 2 } }\n", "stowage.yaml:5: shapes.kairos.size is written with nothing under it: give min, recommended or both, or remove size"},
+		{"shapes:\n  kairos:\n    size: { min: {}, recommended: { cpus: 2 } }\n", "", "stowage.yaml:5: shapes.kairos.size.min is written with nothing under it: give cpus, memory or disk, or remove min"},
+		{"shapes:\n  kairos:\n    size: { min: { cpus: 1 }, recommended: }\n", "", "stowage.yaml:5: shapes.kairos.size.recommended is written with nothing under it"},
+	}
+	for _, c := range cases {
+		if _, err := Parse([]byte(base + c.empty)); err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("%q: want %q, got %v", c.empty, c.want, err)
+		}
+		if c.full == "" {
+			continue
+		}
+		if _, err := Parse([]byte(base + c.full)); err != nil {
+			t.Errorf("%q: %v", c.full, err)
+		}
+	}
+	if _, err := Parse([]byte(base + "shapes:\n  kairos: {}\n")); err != nil {
+		t.Errorf("a kairos shape without size: %v", err)
+	}
+}
+
+// Each ARP setting's range, on both sides of its bounds; another name passes.
+func TestCheckARP(t *testing.T) {
+	t.Parallel()
+	for _, c := range []struct {
+		name, value string
+		ok          bool
+	}{
+		{"arp_announce", "0", true}, {"arp_announce", "2", true}, {"arp_announce", "3", false}, {"arp_announce", "-1", false},
+		{"arp_ignore", "3", true}, {"arp_ignore", "4", false}, {"arp_ignore", "7", false}, {"arp_ignore", "8", true}, {"arp_ignore", "9", false},
+		{"arp_ignore", "one", false}, {"arp_filter", "9", true},
+	} {
+		if err := CheckARP(c.name, c.value); (err == nil) != c.ok {
+			t.Errorf("%s %s: %v", c.name, c.value, err)
+		}
+	}
+	if err := CheckARP("arp_ignore", "4"); err == nil || err.Error() != "arp_ignore is 0, 1, 2, 3 or 8" {
+		t.Errorf("message: %v", err)
+	}
+}
+
+// An alias or a merge key leaving a key empty is refused as the key written empty: decoding reads
+// them; one bringing content is not.
+func TestParseRefusesEmptyKeysThroughAliases(t *testing.T) {
+	t.Parallel()
+	for doc, want := range map[string]string{
+		"safe_defaults: &e {}\nservices: *e\n":                                     "stowage.yaml:4: services is written with nothing under it",
+		"safe_defaults: &e {}\nshapes:\n  kairos:\n    size: *e\n":                 "stowage.yaml:6: shapes.kairos.size is written with nothing under it",
+		"safe_defaults: &e {}\nservices: { <<: *e }\n":                             "stowage.yaml:4: services is written with nothing under it",
+		"safe_defaults: &e {}\nservices: { <<: [*e, *e] }\n":                       "stowage.yaml:4: services is written with nothing under it",
+		"safe_defaults: &n\ntune: *n\n":                                            "stowage.yaml:4: tune is written with nothing under it",
+		"shapes:\n  kairos:\n    size: { min: &m { cpus: 2 }, recommended: *m }\n": "",
+		"safe_defaults: &e {}\nservices: { <<: *e, api: { memory: 10 } }\n":        "",
+	} {
+		_, err := Parse([]byte(base + doc))
+		if want == "" && err != nil || want != "" && (err == nil || !strings.Contains(err.Error(), want)) {
+			t.Errorf("%q: want %q, got %v", doc, want, err)
+		}
+	}
+}

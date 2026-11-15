@@ -11,7 +11,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/go-containerregistry/pkg/authn"
@@ -65,7 +68,21 @@ type CosignSigner struct {
 	WorkDir    string             // holds the per-call Docker config; on disk, private to the user
 	Reader     sigverify.Registry // reads the signatures
 	verifier   *sigverify.Verifier
+	// keyData is a file key's content, read once, by the signer's first cosign call: each call
+	// reads it from a pipe (--key /dev/fd/3), so a file changed during the run signs nothing, the
+	// key a check derived (PublicKey) is the key that signs, and no copy is ever on disk. An env:// or KMS/Vault key is no file: the
+	// environment is the process's own, a KMS key is held by its service.
+	keyData []byte
+	keyErr  error
+	keyOnce *sync.Once
 }
+
+// keyURI matches the key forms cosign reads other than a file: env://, KMS and Vault URIs, pkcs11:.
+var keyURI = regexp.MustCompile(`^[a-z][a-z0-9+.-]*:`)
+
+// KeyIsURI reports whether a signing key is given as a URI cosign reads (env://, a KMS or Vault
+// URI, pkcs11:), not as a file.
+func KeyIsURI(key string) bool { return keyURI.MatchString(key) }
 
 // NewCosignSigner checks that a signing cosign can be held to HTTPS. cosign falls back to plain
 // HTTP for the hosts go-containerregistry treats as local (private addresses, *.localhost) when
@@ -94,6 +111,7 @@ func NewCosignSigner(s CosignSigner) (*CosignSigner, error) {
 		return nil, fmt.Errorf("signing.public_keys: %w", err)
 	}
 	s.verifier = v
+	s.keyOnce = new(sync.Once)
 	return &s, nil
 }
 
@@ -214,10 +232,43 @@ func (s *CosignSigner) run(ctx context.Context, stdout io.Writer, auth bool, ver
 			return err
 		}
 	}
+	var keyPipe *os.File
+	if s.Key != "" && !KeyIsURI(s.Key) {
+		s.keyOnce.Do(func() {
+			if s.keyData, s.keyErr = os.ReadFile(s.Key); s.keyErr != nil {
+				s.keyErr = fmt.Errorf("signing.key: %w", s.keyErr)
+			}
+		})
+		if s.keyErr != nil {
+			return s.keyErr
+		}
+		// The key as the first call read it reaches cosign through a pipe, never a file: cosign
+		// reads its --key file once, whole (os.ReadFile), and a pipe leaves nothing on disk
+		// however the run ends.
+		r, w, err := os.Pipe()
+		if err != nil {
+			return err
+		}
+		defer r.Close()
+		go func() {
+			_, _ = w.Write(s.keyData)
+			w.Close()
+		}()
+		keyPipe = r
+		args = slices.Clone(args)
+		for i := 0; i+1 < len(args); i++ {
+			if args[i] == "--key" {
+				args[i+1] = "/dev/fd/3" // the first of ExtraFiles
+			}
+		}
+	}
 	cosign := cmp.Or(s.Cosign, "cosign")
 	ctx, cancel := context.WithTimeout(ctx, cosignTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, cosign, append([]string{verb}, args...)...)
+	if keyPipe != nil {
+		cmd.ExtraFiles = []*os.File{keyPipe}
+	}
 	cmd.Env = append(withoutEnv(os.Environ(), "DOCKER_CONFIG"), "DOCKER_CONFIG="+dir)
 	var out tail
 	cmd.Stdout, cmd.Stderr = cmp.Or[io.Writer](stdout, io.Discard), &out

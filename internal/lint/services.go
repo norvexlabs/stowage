@@ -622,32 +622,69 @@ func (l *linter) pickedTable(at, name string, t spec.NftTable) string {
 		l.errf(at+".input", "%s's default %q picks no table (one of %s)", t.Input, in.Default, strings.Join(t.Values(), ", "))
 	}
 	var first string
-	var sets []string
-	var each []string
-	same := true
+	bodies := map[string]string{}
 	for _, v := range t.Values() {
 		wv := at + ".files." + v
 		if !spec.NftChoice.MatchString(v) {
-			l.errf(wv, "not a value naming a table's file: a letter or digit, then letters, digits and _ . -, at most 64")
+			l.errf(wv, "%s", notAChoice)
 			continue
 		}
 		text := l.nftTable(wv, name, t.Files[v])
 		if text == "" {
 			continue
 		}
-		got := spec.NftSets(text)
+		if first == "" {
+			first = text
+		}
+		bodies[v] = text
+	}
+	if err := sameSets(bodies); err != nil {
+		l.errf(at+".files", "%v", err)
+	}
+	return first
+}
+
+// notAChoice refuses a picked table's value spec.NftChoice does not match.
+const notAChoice = "not a value naming a table's file: a letter or digit, then letters, digits and _ . -, at most 64"
+
+// CheckPickedTables checks the files of a table an input picks, by value, as lint does: each value
+// a name of its file (spec.NftChoice), each file `table inet <name> { … }` alone (CheckNftTable),
+// all declaring the same sets. The error names the key under services.<name>.nftables it is about.
+func CheckPickedTables(name string, bodies map[string]string) error {
+	for _, v := range slices.Sorted(maps.Keys(bodies)) {
+		if !spec.NftChoice.MatchString(v) {
+			return fmt.Errorf("files: %q is %s", v, notAChoice)
+		}
+		if err := CheckNftTable(bodies[v], name); err != nil {
+			return fmt.Errorf("files.%s: %w", v, err)
+		}
+	}
+	if err := sameSets(bodies); err != nil {
+		return fmt.Errorf("files: %w", err)
+	}
+	return nil
+}
+
+// sameSets refuses a picked table's files, by value, that declare different named sets: its
+// feeders and inputs fill the same ones whatever the value.
+func sameSets(bodies map[string]string) error {
+	var each []string
+	var sets []string
+	same := true
+	for i, v := range slices.Sorted(maps.Keys(bodies)) {
+		got := spec.NftSets(bodies[v])
 		slices.Sort(got)
 		each = append(each, fmt.Sprintf("%s: [%s]", v, strings.Join(got, " ")))
-		if first == "" {
-			first, sets = text, got
+		if i == 0 {
+			sets = got
 		} else if !slices.Equal(got, sets) {
 			same = false
 		}
 	}
 	if !same {
-		l.errf(at+".files", "its files declare different sets (%s): each declares the same, which its feeders and inputs fill whatever the value", strings.Join(each, ", "))
+		return fmt.Errorf("its files declare different sets (%s): each declares the same, which its feeders and inputs fill whatever the value", strings.Join(each, ", "))
 	}
-	return first
+	return nil
 }
 
 // otherUse is what else the installer reads input key as, checked as such (a set's elements, an L4

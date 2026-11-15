@@ -32,9 +32,67 @@ const BundleType types.MediaType = "application/vnd.dev.sigstore.bundle.v0.3+jso
 // same key made over the digest (an SBOM, a scan) does not approve it.
 const SignPredicate = "https://sigstore.dev/cosign/sign/v1"
 
-// maxBundles bounds the signatures read for one digest: a registry listing more is refused
-// rather than read without end.
+// maxBundles bounds the bundles read for one digest: of more candidates, the newest are read.
 var maxBundles = 64
+
+// The annotations cosign v3 writes on a bundle's referrer manifest: the in-toto predicate type
+// the bundle signs, and when it was pushed.
+const (
+	predicateAnnotation = "dev.sigstore.bundle.predicateType"
+	createdAnnotation   = "org.opencontainers.image.created"
+)
+
+// clockSkew is how far past now a referrer's creation time may be and still order it: one dated
+// later sorts as undated, so a referrer dated in the future cannot push a fresh one out.
+const clockSkew = time.Hour
+
+// candidates are the referrers a read for predicate tries, in order, at most maxBundles of them:
+// those annotated with predicate, newest first (one with no creation time, or one past now and
+// clockSkew, after the dated ones), then those carrying no predicate annotation (written by
+// another tool), in the registry's order. A referrer annotated with another predicate (an SBOM's
+// attestation beside signatures) is never one. total counts every candidate, read or not; dated
+// is whether each of them had a creation time it is ordered by.
+func candidates(refs []v1.Descriptor, predicate string, now time.Time) (read []v1.Descriptor, total int, dated bool) {
+	type ref struct {
+		d       v1.Descriptor
+		created time.Time
+	}
+	var annotated []ref
+	var bare []v1.Descriptor
+	dated = true
+	for _, d := range refs {
+		switch p, ok := d.Annotations[predicateAnnotation]; {
+		case !ok || p == "":
+			bare = append(bare, d)
+			dated = false
+		case p == predicate:
+			c, err := time.Parse(time.RFC3339, d.Annotations[createdAnnotation])
+			if err != nil || c.After(now.Add(clockSkew)) {
+				c, dated = time.Time{}, false // sorts as the oldest
+			}
+			annotated = append(annotated, ref{d, c})
+		}
+	}
+	sort.SliceStable(annotated, func(i, j int) bool { return annotated[i].created.After(annotated[j].created) })
+	for _, r := range annotated {
+		read = append(read, r.d)
+	}
+	read = append(read, bare...)
+	total = len(read)
+	if total > maxBundles {
+		read = read[:maxBundles]
+	}
+	return read, total, dated
+}
+
+// readOf says which candidates were read when some were not: the newest only when every
+// candidate was dated.
+func readOf(n, total int, dated bool) string {
+	if dated {
+		return fmt.Sprintf("newest %d of %d", n, total)
+	}
+	return fmt.Sprintf("%d of %d", n, total)
+}
 
 // ErrUnsigned is the answer "no signature by a trusted key", as opposed to a failure to check.
 var ErrUnsigned = errors.New("no signature by a trusted key")
@@ -106,20 +164,20 @@ func (v *Verifier) Verify(ctx context.Context, r Registry, d name.Digest) error 
 	if err != nil {
 		return fmt.Errorf("%s: cannot check signatures: %w", d, err)
 	}
+	refs, total, dated := candidates(refs, SignPredicate, time.Now())
 	if len(refs) == 0 {
 		return fmt.Errorf("%s: no signature: %w", d, ErrUnsigned)
-	}
-	if len(refs) > maxBundles {
-		return fmt.Errorf("%s: cannot check signatures: %d signatures, more than %d", d, len(refs), maxBundles)
 	}
 	policy := verify.NewPolicy(verify.WithArtifactDigest("sha256", sum), verify.WithKey())
 	// Every referrer is tried: one that cannot be read does not hide a valid signature beside it,
 	// and is reported only when none verifies.
 	var readErr error
+	signatures := len(refs) // the candidates read, but those that are no signature at all
 	for _, ref := range refs {
 		a, _, err := r.GetArtifact(ctx, d.Context().Digest(ref.Digest.String()), BundleType)
 		// A bundle larger than a signature ever is (an SBOM's attestation) signs nothing.
 		if errors.Is(err, registry.ErrNotArtifact) || errors.Is(err, registry.ErrTooLarge) || (err == nil && a == nil) {
+			signatures--
 			continue
 		}
 		if err != nil {
@@ -139,7 +197,14 @@ func (v *Verifier) Verify(ctx context.Context, r Registry, d name.Digest) error 
 	if readErr != nil {
 		return fmt.Errorf("%s: cannot check signatures: %w", d, readErr)
 	}
-	return fmt.Errorf("%s: %d signature(s), none by a trusted key: %w", d, len(refs), ErrUnsigned)
+	// Candidates left unread may hold the signature: never "unsigned", which a reader passes over.
+	if total > len(refs) {
+		return fmt.Errorf("%s: cannot check signatures: none of the %s read is by a trusted key, and the others were not", d, readOf(len(refs), total, dated))
+	}
+	if signatures == 0 {
+		return fmt.Errorf("%s: no signature: %w", d, ErrUnsigned)
+	}
+	return fmt.Errorf("%s: %d signature(s), none by a trusted key: %w", d, signatures, ErrUnsigned)
 }
 
 // MaxAttestation caps an attestation's bundle read.
@@ -173,9 +238,7 @@ func (v *Verifier) Attestation(ctx context.Context, r AttestationRegistry, d nam
 	if err != nil {
 		return nil, fmt.Errorf("%s: cannot read its attestations: %w", d, err)
 	}
-	if len(refs) > maxBundles {
-		return nil, fmt.Errorf("%s: cannot read its attestations: %d bundles, more than %d", d, len(refs), maxBundles)
-	}
+	refs, total, dated := candidates(refs, predicateType, time.Now())
 	policy := verify.NewPolicy(verify.WithArtifactDigest("sha256", sum), verify.WithKey())
 	var readErr error
 	for _, ref := range refs {
@@ -212,6 +275,9 @@ func (v *Verifier) Attestation(ctx context.Context, r AttestationRegistry, d nam
 	}
 	if readErr != nil {
 		return nil, fmt.Errorf("%s: cannot read its attestations: %w", d, readErr)
+	}
+	if total > len(refs) {
+		return nil, fmt.Errorf("%s: cannot read its attestations: no %s attestation by a trusted key among the %s read, and the others were not", d, predicateType, readOf(len(refs), total, dated))
 	}
 	return nil, fmt.Errorf("%s: no %s attestation by a trusted key: %w", d, predicateType, ErrNoAttestation)
 }

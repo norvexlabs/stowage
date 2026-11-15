@@ -490,14 +490,17 @@ func recoverEvents(held []Event, boot *Event) []Event {
 
 // lastJudged is the last boot.judged, when it is of the boot id (lastOf's).
 func (j *journal) lastJudged(id string) (*Event, error) {
-	_, e, err := j.lastOf(id)
+	_, e, err := j.lastOf()
+	if e != nil && !sameBoot(e.BootID, id) {
+		e = nil
+	}
 	return e, err
 }
 
 // lastOf is, in one read under the shared lock, the journal's last entry number and its last
-// boot.judged when it is of the boot id: the state's alone when its writer keeps the verdict
-// (Judges), the journal read only for a state that does not, or none.
-func (j *journal) lastOf(id string) (int64, *Event, error) {
+// boot.judged, of whichever boot: the state's alone when its writer keeps the verdict (Judges),
+// the journal read only for a state that does not, or none.
+func (j *journal) lastOf() (int64, *Event, error) {
 	if !fileExists(j.statePath()) && !fileExists(j.path()) {
 		return 0, nil, nil
 	}
@@ -518,10 +521,7 @@ func (j *journal) lastOf(id string) (int64, *Event, error) {
 		}
 		st.Judged = cmp.Or(st.Judged, of.Judged)
 	}
-	if e := st.Judged; e != nil && sameBoot(e.BootID, id) {
-		return st.Last, e, nil
-	}
-	return st.Last, nil, nil
+	return st.Last, st.Judged, nil
 }
 
 // sameBoot and otherBoot tell two boot ids name one boot, or two: only ids both read decide
@@ -570,6 +570,13 @@ type bootCache struct {
 // bootRetry is how long, in the writer's seconds, a writer waits after a failed read of its
 // boot's record before it reads again.
 const bootRetry = 60
+
+// again lets the next get read at once when no read succeeded yet.
+func (b *bootCache) again() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.next = time.Time{}
+}
 
 // get is the boot.started held, or read reads it, when every has passed (at now) since the last
 // read that failed.

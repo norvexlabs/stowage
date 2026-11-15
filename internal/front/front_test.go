@@ -10,6 +10,9 @@ import (
 
 var pinned = regexp.MustCompile(`^[^@\s]+@sha256:[0-9a-f]{64}$`)
 
+// replaceArg is one of xcaddy's --replace arguments, module=module@version.
+var replaceArg = regexp.MustCompile(`--replace \S+=\S+@v\S+`)
+
 // The recipe builds the pinned Caddy, from bases pinned by digest, and never 2.11.6.
 func TestRecipe(t *testing.T) {
 	t.Parallel()
@@ -43,6 +46,16 @@ func TestRecipe(t *testing.T) {
 		if !strings.Contains(src, want) {
 			t.Errorf("the recipe lacks %q", want)
 		}
+	}
+	// A --replace is a floor Caddy has not reached: checked against the build's own module list,
+	// after the build that applies every --replace.
+	check := strings.Index(src, "go version -m /usr/bin/caddy")
+	last := -1
+	for _, m := range replaceArg.FindAllStringIndex(src, -1) {
+		last = m[0]
+	}
+	if check < 0 || !strings.Contains(src, ": drop the --replace of ") || check < last {
+		t.Error("the recipe does not check, after its build, that each --replace stays above what Caddy requires")
 	}
 	if CaddyVersion == "2.11.6" || strings.Contains(strings.ReplaceAll(src, "Never Caddy 2.11.6", ""), "2.11.6") {
 		t.Error("Caddy 2.11.6 cuts every response to a request with a body at 60 s")

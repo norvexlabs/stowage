@@ -414,7 +414,7 @@ func newEnv(t *testing.T) *env {
 	r, self := testInstaller(t, "1.0.0")
 	return &env{t: t, r: r, self: self, docker: &fakeDocker{loaded: map[string]string{}, compose: "2.29.1"},
 		dir: filepath.Join(t.TempDir(), "notes"), cos: t.TempDir(), out: &bytes.Buffer{}, log: &syncBuffer{},
-		vars: map[string]string{"ADMIN_EMAIL": "admin@example.org"}, busy: map[int]bool{}}
+		vars: map[string]string{"ADMIN_EMAIL": "admin@example.org", "XDG_CACHE_HOME": t.TempDir()}, busy: map[int]bool{}}
 }
 
 func (e *env) installer(mod func(*Options)) *Installer {
@@ -559,14 +559,14 @@ func TestInstallWritesTheStackAndStartsIt(t *testing.T) {
 	}
 	// The stack's containers made, the front's volumes readied for its user, then the stack started.
 	up := e.docker.ran("compose")
-	if len(up) != 5 || !strings.HasSuffix(strings.Join(up[1].Args, " "), "config --format json") || !strings.HasSuffix(strings.Join(up[2].Args, " "), "up --no-start --remove-orphans") ||
+	if len(up) != 5 || !strings.HasSuffix(strings.Join(up[1].Args, " "), "config --format json") || !strings.HasSuffix(strings.Join(up[2].Args, " "), "up --no-start --pull never stowage-front") ||
 		!strings.Contains(strings.Join(up[3].Args, " "), "up --detach --wait") || !strings.HasSuffix(strings.Join(up[4].Args, " "), "run --rm --no-deps -T --name "+get(e.readEnv(), "COMPOSE_PROJECT_NAME")+"-"+ProvisionService+" "+ProvisionService) {
 		t.Fatalf("compose calls: %v", up)
 	}
 	var order []string
 	for _, c := range e.docker.calls {
 		switch a := strings.Join(c.Args, " "); {
-		case strings.HasSuffix(a, " up --no-start --remove-orphans"):
+		case strings.Contains(a, " up --no-start "):
 			order = append(order, "create")
 		case strings.HasPrefix(a, frontPrepPrefix):
 			order = append(order, "root")
@@ -996,7 +996,7 @@ func TestAnL4RoutesExposureIsSaid(t *testing.T) {
 		{spec.L4Route{Name: "data", Protocol: "tcp", Port: 7443, AllowInput: "SRC", BindInput: "DATA_BIND"}, "192.0.2.7", "", "on 192.0.2.7 alone, open to whoever reaches it: SRC's sources hold once `notes-stow tune --apply` consents", nil},
 	} {
 		in := &Installer{R: &Release{Spec: &spec.Spec{Name: "notes", Services: map[string]spec.Service{"proxy": {HostNetwork: true}}}}, O: Options{Firewall: c.fw}}
-		if got := in.l4Exposure(c.r, func(k string) string { return map[string]string{"DATA_BIND": c.bind}[k] }, c.off, heldCA{}); got != c.want {
+		if got := in.l4Exposure(c.r, func(k string) string { return map[string]string{"DATA_BIND": c.bind}[k] }, c.off, l4Facts{}); got != c.want {
 			t.Errorf("%+v: %q", c, got)
 		}
 	}
@@ -1007,14 +1007,15 @@ func TestAnL4RoutesExposureIsSaid(t *testing.T) {
 	}
 	route := spec.L4Route{Name: "data", Protocol: "tcp", Port: 7443, Upstream: "api:7443", AllowInput: "SRC"}
 	in.R.Spec.L4.Routes = []spec.L4Route{route}
-	if got := in.l4Exposure(route, none, nil, heldCA{}); got != "open to whoever reaches this host: SRC's list is not held yet: a start as root applies it, on IPv4 alone (consented; `status` says what the last one did)" {
+	if got := in.l4Exposure(route, none, nil, l4Facts{}); got != "open to whoever reaches this host: SRC's list is not held yet: a start as root applies it, on IPv4 alone (consented; `status` says what the last one did)" {
 		t.Errorf("consented, not applied: %q", got)
 	}
 	rules, _ := in.heldRules(in.allowChain(), none)
 	if err := os.WriteFile(in.allowHeld(), []byte(heldMark(rules)), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if got := in.l4Exposure(route, none, nil, heldCA{}); got != "on IPv4's every address, from the IPv4 sources SRC holds (the install's chain in DOCKER-USER, applied by each start as root)" {
+	in.O.Host.(*gwHost).jumps[in.allowChain()] = 1
+	if got := in.l4Exposure(route, none, nil, in.l4FactsOf(context.Background(), none)); got != "on IPv4's every address, from the IPv4 sources SRC holds (the install's chain in DOCKER-USER, applied by each start as root)" {
 		t.Errorf("applied: %q", got)
 	}
 }
@@ -2154,5 +2155,28 @@ func TestLockRunReportsItsCallersEnd(t *testing.T) {
 	in = e.installer(func(o *Options) { o.LockWait = 20 * time.Millisecond })
 	if _, err := in.lockRun(context.Background(), e.readEnv()); !errors.Is(err, errLocked) {
 		t.Fatalf("LockWait out: %v", err)
+	}
+}
+
+// A loopback address the host answers on but does not list (127.0.0.2) is the host's when it lists
+// a loopback one; any other unlisted address is not.
+func TestBindHereLoopbackRange(t *testing.T) {
+	t.Parallel()
+	for _, c := range []struct {
+		addrs []string
+		a     string
+		want  bool
+	}{
+		{[]string{"127.0.0.1", "10.0.0.2"}, "127.0.0.2", true},
+		{[]string{"127.0.0.1", "10.0.0.2"}, "10.0.0.2", true},
+		{[]string{"127.0.0.1", "10.0.0.2"}, "10.0.0.3", false},
+		{[]string{"10.0.0.2"}, "127.0.0.2", false},
+		{[]string{"::1", "10.0.0.2"}, "127.0.0.2", false},
+		{[]string{"127.0.0.1"}, "::2", false},
+		{[]string{"::1"}, "::1", true},
+	} {
+		if got := hostHolds(c.addrs, c.a); got != c.want {
+			t.Errorf("%v holds %s: %v", c.addrs, c.a, got)
+		}
 	}
 }

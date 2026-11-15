@@ -114,6 +114,100 @@ func (f *File) Froms() []From {
 	return out
 }
 
+// ModulePins are the Go modules the RUN instructions pin by version, module path → version: each
+// xcaddy `--replace M=M@V` and `--with M@V`, and each `M@V` argument of a `go get` or `go
+// install`. A module pinned twice at two versions, or replaced by another module, is an error
+// naming both.
+func (f *File) ModulePins() (map[string]string, error) {
+	pins := map[string]string{}
+	add := func(m, v string) error {
+		if old, ok := pins[m]; ok && old != v {
+			return fmt.Errorf("module %s is pinned at %s and at %s", m, old, v)
+		}
+		pins[m] = v
+		return nil
+	}
+	for _, st := range f.stages {
+		for _, c := range st.Commands {
+			run, ok := c.(*instructions.RunCommand)
+			if !ok {
+				continue
+			}
+			fields := shellWords(strings.Join(run.CmdLine, " "))
+			for i := 0; i < len(fields); i++ {
+				switch {
+				case fields[i] == "--with" && i+1 < len(fields):
+					i++
+					if strings.Contains(fields[i], "=") {
+						continue // --with M@V=../dir builds M from a directory: no version pinned
+					}
+					if m, v, ok := strings.Cut(fields[i], "@"); ok {
+						if err := add(m, v); err != nil {
+							return nil, err
+						}
+					}
+				case fields[i] == "--replace" && i+1 < len(fields):
+					i++
+					from, to, _ := strings.Cut(fields[i], "=")
+					m, v, ok := strings.Cut(to, "@")
+					if !ok {
+						continue // a replacement by a directory pins no version
+					}
+					if from, _, _ = strings.Cut(from, "@"); m != from { // M@v1=M@v2 replaces v1 alone
+						return nil, fmt.Errorf("--replace %s: replaced by another module", fields[i])
+					}
+					if err := add(m, v); err != nil {
+						return nil, err
+					}
+				case fields[i] == "go" && i+1 < len(fields) && (fields[i+1] == "get" || fields[i+1] == "install"):
+					for i += 2; i < len(fields) && !shellOperator[fields[i]]; i++ {
+						m, v, ok := strings.Cut(fields[i], "@")
+						if !ok || strings.HasPrefix(fields[i], "-") {
+							continue
+						}
+						if err := add(m, v); err != nil {
+							return nil, err
+						}
+					}
+					i-- // the loop's step reads the field that ended the arguments
+				}
+			}
+		}
+	}
+	return pins, nil
+}
+
+// shellOperator are the words shellWords makes of the shell's command separators.
+var shellOperator = map[string]bool{";": true, "&": true, "|": true, "(": true, ")": true}
+
+// shellWords splits a shell command line into words, each character of a command separator
+// (; & | ( ), so && and || too) a word of its own and quotes dropped: enough to read a command's
+// arguments, not a shell.
+func shellWords(line string) []string {
+	var words []string
+	var w strings.Builder
+	flush := func() {
+		if w.Len() > 0 {
+			words = append(words, w.String())
+			w.Reset()
+		}
+	}
+	for i := 0; i < len(line); i++ {
+		switch ch := line[i]; ch {
+		case ' ', '\t', '\n', '\\':
+			flush()
+		case '\'', '"':
+		case ';', '&', '|', '(', ')':
+			flush()
+			words = append(words, string(ch))
+		default:
+			w.WriteByte(ch)
+		}
+	}
+	flush()
+	return words
+}
+
 // ContextName is the name BuildKit looks a named build context up by for an image reference (a
 // FROM's base), as BuildKit computes it: the reference parsed as a normalised image name, then
 // spelled in its familiar form less the default tag — `schema`, `schema:latest`, `docker.io/schema`

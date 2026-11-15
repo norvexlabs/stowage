@@ -10,6 +10,9 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/norvexlabs/stowage/internal/flock"
 )
 
 func env(m map[string]string) func(string) string { return func(k string) string { return m[k] } }
@@ -497,5 +500,45 @@ func checkModule(t *testing.T, file string, vars []string, ss []Setting) {
 	}
 	if !strings.HasSuffix(file, "/upload/main.tf") && !strings.Contains(string(b), "\noutput \"id\" {") {
 		t.Errorf("%s: no output id", file)
+	}
+}
+
+// Ensure registers an image once, under the lock of its working directory: another run holding it
+// is waited for, said once, and nothing of the image is read or run meanwhile.
+func TestEnsureWaitsForAnotherRun(t *testing.T) {
+	t.Parallel()
+	tf := &fakeTofu{id: "projects/p/global/images/notes-0123456789ab", upload: "https://storage.googleapis.com/b/stowage/notes-0123456789ab.tar.gz"}
+	var log strings.Builder
+	u := &Uploader{WorkDir: t.TempDir(), Tofu: tf.run, Log: &log}
+	img := Image{Cloud: "gcp", Name: "notes-0123456789ab", Vars: map[string]string{"project": "p", "bucket": "b"},
+		Fetch: func(_ context.Context, dir string) (string, string, error) {
+			p := filepath.Join(dir, "disk.tar.gz")
+			return p, strings.Repeat("a", 64), os.WriteFile(p, []byte("disk"), 0o600)
+		}}
+	dir, err := u.dir(img)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(dir), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	unlock, err := flock.Take(context.Background(), dir+".lock", flock.Create, true, 0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registering := 0
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if _, err := u.Ensure(ctx, img, func() { registering++ }); !errors.Is(err, context.DeadlineExceeded) || tf.runs != nil || registering != 0 ||
+		log.String() != "cloud gcp: waiting for another run registering image notes-0123456789ab ("+dir+")\n" {
+		t.Fatalf("with the lock held: %v, runs %v, log %q", err, tf.runs, log.String())
+	}
+	unlock()
+	if id, err := u.Ensure(context.Background(), img, func() { registering++ }); id != tf.id || err != nil || registering != 1 {
+		t.Fatalf("registered %q, %v, %d registering", id, err, registering)
+	}
+	tf.runs = nil
+	if id, err := u.Ensure(context.Background(), img, func() { registering++ }); id != tf.id || err != nil || registering != 1 || tf.runs != nil {
+		t.Fatalf("again: %q, %v, %d registering, runs %v", id, err, registering, tf.runs)
 	}
 }

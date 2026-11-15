@@ -19,6 +19,7 @@ import (
 	"os/user"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -144,21 +145,27 @@ type Hostd struct {
 	crossPlan *crossPlanned
 	ctx       context.Context // the daemon's: a job outlives its request
 
-	// netMu orders the network changes and their revert; netTimer is the armed revert, netGen
-	// counts disarms (a revert that fired after one does nothing).
-	netMu    sync.Mutex
-	netTimer stopper
-	netGen   int
+	// netMu orders the network changes and their reverts; netReverts is each NIC's armed revert
+	// by role (empty: the primary): one NIC's arming or disarming never touches another's.
+	netMu      sync.Mutex
+	netReverts map[string]*netRevert
+	// healthMu guards healthRun, GET /v1/health's check running or last done: its verdict answers
+	// every request until healthReuseSecs after it ended.
+	healthMu  sync.Mutex
+	healthRun *healthCheck
+	// stateGen counts the changes of what the install runs (changed): a health verdict of an
+	// earlier one is not reused, nor the services the stack declares (declared).
+	stateGen atomic.Uint64
+	// declaredMu guards declaredKey and declaredNames: the services the stack declares, as read
+	// for that key (declared).
+	declaredMu    sync.Mutex
+	declaredKey   string
+	declaredNames []string
 	// afterFunc arms a revert's timer: time.AfterFunc, or a test's, which fires it itself.
 	afterFunc func(d time.Duration, f func()) stopper
 	// onWait, a test's, is told what a request waits on ("slot": a running job's end; "events":
 	// the journal's next event) as it starts waiting: the test acts then, never before.
 	onWait func(what string)
-	// netOwner is the role of the NIC whose change netTimer undoes (empty: the primary): another
-	// NIC's change waits for it, as it would disarm it.
-	netOwner string
-	// netFired is the netGen of the last revert timer that fired.
-	netFired atomic.Int64
 	// installNetLogged is the last bad install network record's error logged: the network is
 	// polled, and the record is rewritten the same at every boot, so each error is logged once.
 	installNetLogged atomic.Value // a string
@@ -176,6 +183,9 @@ type Hostd struct {
 	// pressMu guards lastPost, the disk-pressure watch's last POST.
 	pressMu  sync.Mutex
 	lastPost *PressurePost
+	// bannerOwed: the login screen's reload after the disk banner's last change failed. The
+	// pressure watch alone, one goroutine, reads and writes it.
+	bannerOwed bool
 	// evMu guards evCh, closed at the daemon's next append to the event journal.
 	evMu sync.Mutex
 	evCh chan struct{}
@@ -324,7 +334,8 @@ type Status struct {
 	// OnTrial: the boot runs an upgrade's new system, which the health gate has not judged yet —
 	// healthy, it is kept; not, the gate goes back (or keeps it, as failed_boot then says).
 	OnTrial bool `json:"on_trial,omitempty"`
-	// FailedBoot is the last boot the health gate found unhealthy, its diagnostics kept.
+	// FailedBoot is the last boot the health gate found unhealthy, its diagnostics kept, until a
+	// later boot is judged healthy.
 	FailedBoot    *FailedBoot `json:"failed_boot,omitempty"`
 	RebootPending bool        `json:"reboot_pending"`
 	// BootID is the kernel's id of this boot: a client that saw a reboot scheduled knows the
@@ -476,6 +487,12 @@ func (h *Hostd) Serve(ctx context.Context, path string) error {
 	h.mu.Lock()
 	h.stopping = false
 	h.mu.Unlock()
+	// The journal tells boots apart by their ids (a reboot scheduled, then run or not): with none
+	// read, such an entry would stay open for good, so the daemon does not start.
+	if h.O.bootID() == "" {
+		return fmt.Errorf("the kernel's boot id (%s) does not read: the host daemon tells boots apart by it", cmp.Or(h.O.BootIDFile, kernelBootID))
+	}
+	h.bootRec.again() // read now, whatever a read before Serve found
 	h.startJournal()
 	gid := -1
 	if h.Group != "" {
@@ -487,6 +504,8 @@ func (h *Hostd) Serve(ctx context.Context, path string) error {
 	}
 	dir := filepath.Dir(path)
 	h.Run = dir
+	// No job runs before the daemon serves: every rclone config a killed run left goes.
+	sweepRclone(dir, 0)
 	if err := os.MkdirAll(dir, 0o750); err != nil {
 		return err
 	}
@@ -988,10 +1007,20 @@ func (h *Hostd) status(w http.ResponseWriter, r *http.Request) {
 			st.OnTrial = trial(vars)
 		}
 	}
-	st.FailedBoot = lastFailedBoot(in.O.Dir)
 	st.BootID = h.bootID()
-	// One read of the journal: its cursor and this boot's verdict.
-	last, judged, jerr := h.journal().lastOf(st.BootID)
+	// One read of the journal: its cursor, its last verdict and this boot's.
+	last, lastJudged, jerr := h.journal().lastOf()
+	var judged *Event
+	if lastJudged != nil && sameBoot(lastJudged.BootID, st.BootID) {
+		judged = lastJudged
+	}
+	// The last failed boot is told until a later boot on trial (an upgrade's) is judged healthy,
+	// after it in the journal: the fallback's boot of the passive system, healthy as it may be,
+	// keeps it told.
+	if fb := lastFailedBoot(in.O.Dir); fb != nil && !(lastJudged != nil && lastJudged.Verdict == verdictHealthy &&
+		lastJudged.OnTrial != nil && *lastJudged.OnTrial && lastJudged.Seq > fb.Seq) {
+		st.FailedBoot = fb
+	}
 	if jerr != nil {
 		st.EventsError = fmt.Sprintf("the event journal cannot be read: %v", jerr)
 	} else {
@@ -1060,6 +1089,28 @@ func bootMode(dir string) string {
 	return ""
 }
 
+// declared gives the services the stack of in's install (env) declares, read once per change
+// (stateGen) and per state of its .env (its size and modification time, which a re-run changing
+// the profiles moves): the service watch's looks and GET services fork no `compose config` each.
+func (h *Hostd) declared(in *Installer, env *EnvFile) func(context.Context) ([]string, error) {
+	return func(ctx context.Context) ([]string, error) {
+		key := ""
+		if fi, err := os.Stat(in.path(envName)); err == nil {
+			key = fmt.Sprintf("%d %d %d", h.stateGen.Load(), fi.Size(), fi.ModTime().UnixNano())
+		}
+		h.declaredMu.Lock()
+		defer h.declaredMu.Unlock()
+		if key != "" && key == h.declaredKey {
+			return h.declaredNames, nil
+		}
+		names, err := in.declaredServices(ctx, env)
+		if err == nil && key != "" {
+			h.declaredKey, h.declaredNames = key, names
+		}
+		return names, err
+	}
+}
+
 func fileExists(p string) bool {
 	_, err := os.Stat(p)
 	return err == nil
@@ -1072,7 +1123,7 @@ func (h *Hostd) services(w http.ResponseWriter, r *http.Request) {
 		replyErr(w, err)
 		return
 	}
-	list, err := in.stackServices(r.Context(), env)
+	list, err := in.stackServices(r.Context(), env, h.declared(in, env))
 	if err != nil {
 		replyErr(w, err)
 		return
@@ -1084,8 +1135,8 @@ func (h *Hostd) services(w http.ResponseWriter, r *http.Request) {
 // array.
 func parseServices(out []byte) ([]Service, error) {
 	type row struct {
-		ID, Service, State, Health, Image string
-		ExitCode                          int
+		ID, Service, State, Health, Image, Labels string
+		ExitCode                                  int
 	}
 	var rows []row
 	trimmed := bytes.TrimSpace(out)
@@ -1112,6 +1163,10 @@ func parseServices(out []byte) ([]Service, error) {
 	}
 	list := []Service{}
 	for _, r := range rows {
+		// A `compose run` container is no service's: one left exited is not its service down.
+		if slices.Contains(strings.Split(r.Labels, ","), "com.docker.compose.oneoff=True") {
+			continue
+		}
 		list = append(list, Service{Service: r.Service, State: r.State, Health: r.Health, Image: r.Image, ExitCode: r.ExitCode, ID: r.ID})
 	}
 	return list, nil
@@ -1272,7 +1327,10 @@ func (h *Hostd) serviceAction(w http.ResponseWriter, r *http.Request) {
 		replyErr(w, err)
 		return
 	}
-	if _, err := in.Compose(r.Context(), env, nil, append(args, svc)...); err != nil {
+	// Done or not, the service may have changed.
+	_, err = in.Compose(r.Context(), env, nil, append(args, svc)...)
+	h.changed()
+	if err != nil {
 		replyErr(w, err)
 		return
 	}
@@ -1348,8 +1406,8 @@ func (h *Hostd) resetCheck(ctx context.Context, in *Installer) (ResetPlan, error
 	}
 	m := h.R.Manifest
 	target := Version{m.ProjectVersion, m.Revision}
-	if name, v, rev := runs(env); name != m.Name || v != m.ProjectVersion || rev != strconv.Itoa(m.Revision) {
-		return ResetPlan{}, fail(http.StatusConflict, "the install runs %s %s (revision %s), not this OS's %s %s: reset-db resets the release the OS carries", name, v, rev, m.Name, target)
+	if err := h.osRelease(env, "reset-db"); err != nil {
+		return ResetPlan{}, err
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -1552,7 +1610,7 @@ func (h *Hostd) resetDB(w http.ResponseWriter, r *http.Request) {
 	if m != nil {
 		src := fmt.Sprintf("%s/%s-os@%s", prefix, m.Name, m.Artifacts.OS)
 		go h.osJob(j, in, m.Tag, prefix, src, true, "wipes the data and installs it", func() error {
-			return writeAtomic(newBaselineFile(in.O.Dir), strings.NewReader(m.Tag+"\n"), 0o600, nil)
+			return writeAtomic(newBaselineFile(in.O.Dir), strings.NewReader(releaseMark(m.ProjectVersion, m.Revision)+"\n"), 0o600, nil)
 		})
 		accepted(w, j)
 		return
@@ -1791,6 +1849,7 @@ func (h *Hostd) claimJob(kind, target string, guard func() error) (*job, error) 
 	h.job = &job{Started: time.Now().UTC(), Kind: kind, State: "running", Target: target}
 	h.jobEnd = make(chan struct{})
 	h.slotGen++
+	h.changed()
 	return h.job, nil
 }
 
@@ -1798,6 +1857,7 @@ func (h *Hostd) claimJob(kind, target string, guard func() error) (*job, error) 
 func (h *Hostd) ended(j *job, state, msg string) {
 	j.State, j.Error = state, msg
 	h.slotGen++
+	h.changed()
 	if h.job == j && h.jobEnd != nil {
 		close(h.jobEnd)
 		h.jobEnd = nil
@@ -2075,7 +2135,7 @@ func (h *Hostd) upgrade(w http.ResponseWriter, r *http.Request) {
 			}
 			// The boot into it makes the first install of that release, whatever release the
 			// settings name.
-			return writeAtomic(osUpgradeFile(in.O.Dir), strings.NewReader(m.Tag+"\n"), 0o600, nil)
+			return writeAtomic(osUpgradeFile(in.O.Dir), strings.NewReader(releaseMark(m.ProjectVersion, m.Revision)+"\n"), 0o600, nil)
 		})
 	}()
 	accepted(w, j)

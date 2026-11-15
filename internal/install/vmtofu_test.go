@@ -928,6 +928,64 @@ func TestDestroyVMSaysWhenNoDiskMakesItAgain(t *testing.T) {
 	}
 }
 
+// A command that fails returns what it printed with its error: `docker inspect` of containers one
+// of which went prints the others'.
+func TestExecToolReturnsTheOutputOfAFailure(t *testing.T) {
+	t.Parallel()
+	out, err := ExecTool{Bin: "sh"}.Run(context.Background(), Cmd{Args: []string{"-c", "echo found; echo gone >&2; exit 1"}})
+	if string(out) != "found\n" || err == nil || !strings.Contains(err.Error(), "gone") {
+		t.Errorf("%q %v", out, err)
+	}
+}
+
+// toolFunc is a Tool of a function.
+type toolFunc func(context.Context, Cmd) ([]byte, error)
+
+func (f toolFunc) Run(ctx context.Context, c Cmd) ([]byte, error) { return f(ctx, c) }
+
+// A named run cut off (its context ended) has its container removed by name under a context of
+// its own; one gone already is no error, a removal that fails is said with its command. A run
+// that ended of itself (exit 2 included) is left: --rm took its container.
+func TestARunCutOffRemovesItsContainer(t *testing.T) {
+	t.Parallel()
+	for name, c := range map[string]struct {
+		cut   bool
+		rmErr error
+		want  string
+	}{
+		"ended of itself": {false, nil, ""},
+		"removed":         {true, nil, ""},
+		"gone":            {true, errors.New("docker rm: exit status 1: Error response from daemon: No such container: c1"), ""},
+		"kept":            {true, errors.New("docker rm: daemon busy"), "the container may still be running: `docker rm --force c1`"},
+	} {
+		var ran [][]string
+		tool := toolFunc(func(ctx context.Context, cmd Cmd) ([]byte, error) {
+			ran = append(ran, cmd.Args)
+			if cmd.Args[0] == "rm" {
+				if ctx.Err() != nil {
+					return nil, ctx.Err()
+				}
+				return nil, c.rmErr
+			}
+			return nil, exitCode(2)
+		})
+		in := &Installer{O: Options{Docker: tool}}
+		ctx, cancel := context.WithCancel(context.Background())
+		if c.cut {
+			cancel() // the run's context ended: the removal's is its own
+		}
+		_, err := in.runNamed(ctx, "c1", Cmd{Args: []string{"run", "--name", "c1", "img"}})
+		cancel()
+		removed := len(ran) == 2 && strings.Join(ran[1], " ") == "rm --force c1"
+		if !errors.Is(err, exitCode(2)) || removed != c.cut || len(ran) > 2 {
+			t.Errorf("%s: %v, ran %v", name, err, ran)
+		}
+		if got := fmt.Sprint(err); (c.want == "") == strings.Contains(got, "may still be running") || c.want != "" && !strings.Contains(got, c.want) {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+}
+
 func TestExecToolInterruptsWithGrace(t *testing.T) {
 	t.Parallel()
 	ctx, cancel := context.WithCancel(context.Background())

@@ -106,16 +106,16 @@ func (e *engineState) docker(cfg string) *fakeDocker {
 				byID["new1"] = e.news[0]
 			}
 			return []byte(strings.Join(out, "\n") + "\n"), true, nil
-		case strings.Contains(a, " up --detach --no-deps --no-recreate --scale "):
-			e.containers["api"] = append(e.containers["api"], "new1")
-			byID["new1"] = e.news[0]
+		case strings.Contains(a, " up --detach --no-deps --no-recreate --pull never --scale "):
+			// The new container its states (news) give, else one healthy at once.
+			e.containers[last] = append(e.containers[last], "new1")
+			byID["new1"] = "new1|/p-new1|running|0|healthy|h2|sha256:img|"
+			if len(e.news) > 0 {
+				byID["new1"] = e.news[0]
+			}
 			return nil, true, e.upErr
 		case strings.HasPrefix(a, "kill "):
 			return nil, true, nil
-		case strings.Contains(a, " up --detach --wait --no-deps --no-recreate --scale "):
-			e.containers["api"] = append(e.containers["api"], "new1|/p-new1|running|0|healthy|h2|sha256:img|")
-			byID["new1"] = "new1|/p-new1|running|0|healthy|h2|sha256:img|"
-			return nil, true, e.upErr
 		case strings.HasPrefix(a, "stop "), strings.HasPrefix(a, "rm "):
 			return nil, true, nil
 		}
@@ -161,9 +161,12 @@ func TestAStartFirstServiceOverlaps(t *testing.T) {
 	hashes := map[string]string{"api": "h2", "db": "d1", "init": "i1"}
 	// The last start ran the networks of a configuration without any.
 	none := sha256.Sum256([]byte("null"))
+	var environ []string
 	run := func(e *engineState, cfg string, fresh ...string) (*fakeDocker, string, error) {
 		r := testRelease(t, "1.0.0")
 		r.Spec.Services = map[string]spec.Service{"api": {Update: spec.UpdateStartFirst}, "gone": {Update: spec.UpdateStartFirst}}
+		r.Spec.Inputs = append(r.Spec.Inputs, spec.Input{Key: "SMTP_PASSWORD", Secret: true}, spec.Input{Key: "PIN", Secret: true})
+		r.Spec.Front.TLSModes = append(r.Spec.Front.TLSModes, "dns-cloudflare")
 		var log bytes.Buffer
 		f := e.docker(cfg)
 		in := &Installer{R: r, O: Options{Dir: t.TempDir(), Docker: f, Log: &log}}
@@ -173,10 +176,10 @@ func TestAStartFirstServiceOverlaps(t *testing.T) {
 		if err := in.takeNetworks(); err != nil {
 			t.Fatal(err)
 		}
-		err := in.startFirst(context.Background(), nil, &m, fresh)
+		err := in.startFirst(context.Background(), environ, &m, fresh)
 		return f, log.String(), err
 	}
-	up := "up --detach --wait --no-deps --no-recreate --scale api=2 api"
+	up := "up --detach --no-deps --no-recreate --pull never --scale api=2 api"
 	f, log, err := run(&engineState{containers: deps(), hash: hashes}, cfg)
 	if err != nil || !slices.Equal(f.engine(), []string{up, "stop old1", "rm old1"}) || !strings.Contains(log, "the new container is healthy, the old one stopped") {
 		t.Errorf("a changed configuration: %v, ran %q, logged %s", err, f.engine(), log)
@@ -213,6 +216,22 @@ func TestAStartFirstServiceOverlaps(t *testing.T) {
 	if err == nil || !errors.As(err, &sf) || !strings.HasSuffix(err.Error(), "which serves on: unhealthy; its last lines (docker logs --tail 20), the container removed:\n  | starting\n  | FEED_SOURCES: not an address") {
 		t.Errorf("a failed new container's log: %v", err)
 	}
+	// A secret of the install the new container printed is never quoted: neither a generated
+	// secret nor a secret input; another value is.
+	// The front's own secret input (the Cloudflare token) too; a value under 4 bytes never is.
+	environ = []string{"SESSION_SECRET=s3cr3t-session", "ADMIN_EMAIL=admin@example.org", "SMTP_PASSWORD=pw-input-9",
+		"STOWAGE_TLS_MODE=dns-cloudflare", CloudflareTokenVar + "=cf-token-0123", "PIN=x"}
+	secretLogs := func(a string) ([]byte, bool, error) {
+		if a == "logs --tail 20 new1" {
+			return []byte("key s3cr3t-session for admin@example.org\nsmtp pw-input-9\ndns cf-token-0123 x\n"), true, nil
+		}
+		return nil, false, nil
+	}
+	_, _, err = run(&engineState{containers: deps(), hash: hashes, upErr: errors.New("unhealthy"), answer: secretLogs}, cfg)
+	if err == nil || !strings.HasSuffix(err.Error(), "  | key <redacted> for admin@example.org\n  | smtp <redacted>\n  | dns <redacted> x") {
+		t.Errorf("a secret in the log: %v", err)
+	}
+	environ = nil
 	// Nothing quoted: compose's logs are still where to look, the plain error.
 	_, _, err = run(&engineState{containers: deps(), hash: hashes, upErr: errors.New("unhealthy")}, cfg)
 	if errors.As(err, &sf) {
@@ -356,7 +375,7 @@ func TestAnUpdateSignalTellsTheOldContainerToGo(t *testing.T) {
 		return f, log.String(), err
 	}
 	const (
-		up      = "up --detach --no-deps --no-recreate --scale api=2 api"
+		up      = "up --detach --no-deps --no-recreate --pull never --scale api=2 api"
 		kill    = "kill --signal SIGUSR2 old1"
 		created = "new1|/p-new1|created|0||h2|sha256:img|"
 		start   = "new1|/p-new1|running|0|starting|h2|sha256:img|"
@@ -442,7 +461,7 @@ func TestAnUpdateReadyFileHoldsTheSignal(t *testing.T) {
 	t.Cleanup(func() { overlapPoll = 500 * time.Millisecond; readyWait = 10 * time.Minute })
 	svc := spec.Service{UpdateSocket: "/run/hand", UpdateSignal: "SIGUSR2", UpdateReady: "ready"}
 	const (
-		up      = "up --detach --no-deps --no-recreate --scale api=2 api"
+		up      = "up --detach --no-deps --no-recreate --pull never --scale api=2 api"
 		kill    = "kill --signal SIGUSR2 old1"
 		start   = "new1|/p-new1|running|0|starting|h2|sha256:img|"
 		healthy = "new1|/p-new1|running|0|healthy|h2|sha256:img|"
@@ -565,13 +584,14 @@ func TestAnUpdateReadyFileHoldsTheSignal(t *testing.T) {
 // without update_signal; another status, or one after the signal, fails the start.
 func TestANewContainerDeclinesTheOverlap(t *testing.T) {
 	overlapPoll = time.Millisecond
-	t.Cleanup(func() { overlapPoll = 500 * time.Millisecond })
+	t.Cleanup(func() { overlapPoll = 500 * time.Millisecond; readyWait = 10 * time.Minute })
 	const (
-		up       = "up --detach --no-deps --no-recreate --scale api=2 api"
-		created  = "new1|/p-new1|created|0||h2|sha256:img|"
-		start    = "new1|/p-new1|running|0|starting|h2|sha256:img|"
-		declines = "new1|/p-new1|exited|75||h2|sha256:img|"
-		says     = "services.api.update: its new container declined the overlap (exit status 75, update_decline_status), so this start replaces it stop-first"
+		up         = "up --detach --no-deps --no-recreate --pull never --scale api=2 api"
+		healthyNew = "new1|/p-new1|running|0|healthy|h2|sha256:img|"
+		created    = "new1|/p-new1|created|0||h2|sha256:img|"
+		start      = "new1|/p-new1|running|0|starting|h2|sha256:img|"
+		declines   = "new1|/p-new1|exited|75||h2|sha256:img|"
+		says       = "services.api.update: its new container declined the overlap (exit status 75, update_decline_status), so this start replaces it stop-first"
 	)
 	decline75 := 75
 	signal := spec.Service{UpdateSignal: "SIGUSR2", UpdateDeclineStatus: &decline75}
@@ -593,31 +613,32 @@ func TestANewContainerDeclinesTheOverlap(t *testing.T) {
 		!slices.Equal(f.engine(), []string{up, "kill --signal SIGUSR2 old1", "rm --force new1"}) {
 		t.Errorf("a decline after the signal: %v, ran %q", err, f.engine())
 	}
-	// Without update_signal, up --wait fails on the new container's end, which is then read.
-	wait := func(exit string) func(a string) ([]byte, bool, error) {
-		upped := false
-		return func(a string) ([]byte, bool, error) {
-			switch {
-			case strings.Contains(a, " up --detach --wait "):
-				upped = true
-				return nil, true, errors.New("container p-new1 exited (" + exit + ")")
-			case upped && strings.Contains(a, " ps --all --quiet api"):
-				return []byte("old1\nnew1\n"), true, nil
-			case upped && a == "inspect --type container --format "+containerFormat+" old1 new1":
-				return []byte("old1|/p-old1|running|0|healthy|h1|sha256:img|\nnew1|/p-new1|exited|" + exit + "||h2|sha256:img|\n"), true, nil
-			}
-			return nil, false, nil
-		}
+	// Without update_signal, the same loop judges it: Compose's --wait is never asked.
+	plain := spec.Service{UpdateDeclineStatus: &decline75}
+	f, log, err = overlapRun(t, plain, nil, created, declines)
+	if err != nil || !slices.Equal(f.engine(), []string{up, "rm --force new1"}) || !strings.Contains(log, says) {
+		t.Errorf("a decline without update_signal: %v, ran %q, logged %s", err, f.engine(), log)
 	}
-	waitUp := "up --detach --wait --no-deps --no-recreate --scale api=2 api"
-	f, log, err = overlapRun(t, spec.Service{UpdateDeclineStatus: &decline75}, wait("75"))
-	if err != nil || !slices.Equal(f.engine(), []string{waitUp, "rm --force new1"}) || !strings.Contains(log, says) {
-		t.Errorf("a decline under up --wait: %v, ran %q, logged %s", err, f.engine(), log)
+	f, log, err = overlapRun(t, plain, nil, created, "new1|/p-new1|restarting|75||h2|sha256:img|")
+	if err != nil || !slices.Equal(f.engine(), []string{up, "rm --force new1"}) || !strings.Contains(log, says) {
+		t.Errorf("a decline its restart policy restarts, without update_signal: %v, ran %q, logged %s", err, f.engine(), log)
 	}
-	f, _, err = overlapRun(t, spec.Service{UpdateDeclineStatus: &decline75}, wait("1"))
-	if err == nil || !strings.Contains(err.Error(), "did not become healthy beside the old one, which serves on: container p-new1 exited (1)") ||
-		!slices.Equal(f.engine(), []string{waitUp, "rm --force new1"}) {
-		t.Errorf("another status under up --wait: %v, ran %q", err, f.engine())
+	f, _, err = overlapRun(t, plain, nil, created, "new1|/p-new1|exited|1||h2|sha256:img|")
+	if err == nil || !strings.Contains(err.Error(), "did not become healthy beside the old one, which serves on: its new container /p-new1 is exited (exit code 1)") ||
+		!slices.Equal(f.engine(), []string{up, "rm --force new1"}) {
+		t.Errorf("another status without update_signal: %v, ran %q", err, f.engine())
+	}
+	// Restarting after the signal, or with another status, is read on: a restart that comes up
+	// serves; one that keeps restarting past readyWait fails.
+	f, _, err = overlapRun(t, signal, nil, start, "new1|/p-new1|restarting|1||h2|sha256:img|", healthyNew)
+	if err != nil || !slices.Equal(f.engine(), []string{up, "kill --signal SIGUSR2 old1", "stop old1", "rm old1"}) {
+		t.Errorf("a restart after the signal: %v, ran %q", err, f.engine())
+	}
+	readyWait = 0
+	_, _, err = overlapRun(t, plain, nil, "new1|/p-new1|restarting|1||h2|sha256:img|")
+	readyWait = 10 * time.Minute
+	if err == nil || !strings.Contains(err.Error(), "its new container /p-new1 keeps restarting (exit code 1) after 0s") {
+		t.Errorf("one that keeps restarting: %v", err)
 	}
 }
 
@@ -654,7 +675,7 @@ func TestTheContainerFormatReadsAContainerWithoutAHealthcheck(t *testing.T) {
 func TestTheUpdateSocketIsAVolume(t *testing.T) {
 	t.Parallel()
 	var m composeModel
-	if err := json.Unmarshal([]byte(`{"services": {"api": {}, "ui": {}}}`), &m); err != nil {
+	if err := json.Unmarshal([]byte(`{"name": "p", "services": {"api": {}, "ui": {}}}`), &m); err != nil {
 		t.Fatal(err)
 	}
 	raw, err := contentCompose(&m, nil, []byte("key"), tune.Container{}, hostPlan{Sockets: map[string]string{"api": "/run/handoff"}}, hostNet{})
@@ -673,7 +694,8 @@ func TestTheUpdateSocketIsAVolume(t *testing.T) {
 	if v := doc.Services["api"].Volumes; !slices.Equal(v, []string{"stowage-update-api:/run/handoff"}) || len(doc.Services["ui"].Volumes) != 0 {
 		t.Errorf("volumes %v:\n%s", v, raw)
 	}
-	if _, ok := doc.Volumes["stowage-update-api"]; !ok || len(doc.Volumes) != 1 {
+	// Named as the overlap looks for it in the old container: one name, never Compose's default.
+	if v, _ := doc.Volumes["stowage-update-api"].(map[string]any); v["name"] != updateVolumeName("p", "api") || updateVolumeName("p", "api") != "p_stowage-update-api" || len(doc.Volumes) != 1 {
 		t.Errorf("top-level volumes %v", doc.Volumes)
 	}
 }
@@ -739,7 +761,7 @@ func TestTheNetworksRecord(t *testing.T) {
 	if _, _, err := start(cfg); err != nil {
 		t.Fatal(err)
 	}
-	if f, _, err := start(`{"networks":{"default":{}},"services":{"api":{}}}`); err != nil || !slices.Equal(f.engine(), []string{"up --detach --wait --no-deps --no-recreate --scale api=2 api", "stop old1", "rm old1"}) {
+	if f, _, err := start(`{"networks":{"default":{}},"services":{"api":{}}}`); err != nil || !slices.Equal(f.engine(), []string{"up --detach --no-deps --no-recreate --pull never --scale api=2 api", "stop old1", "rm old1"}) {
 		t.Fatalf("its own record: %v, ran %q", err, f.engine())
 	}
 	// A record it cannot remove fails the start, naming it.
@@ -985,7 +1007,7 @@ func TestTheLastLinesOfAFailedContainer(t *testing.T) {
 	t.Parallel()
 	read := func(out string, err error) string {
 		in := &Installer{O: Options{Docker: streamTool{out: out, err: err}}}
-		return in.lastLines(context.Background(), "c1")
+		return in.lastLines(context.Background(), "c1", nil)
 	}
 	if got := read("a\r\n\xffb\x1b[2J\tc\n", nil); got != "  | a\n  | ?b?[2J\tc" {
 		t.Errorf("%q", got)
@@ -1024,4 +1046,54 @@ func (s streamTool) Run(_ context.Context, c Cmd) ([]byte, error) {
 		_, _ = io.WriteString(c.Stream, s.out)
 	}
 	return nil, s.err
+}
+
+// runTool is a Tool answering each run with run.
+type runTool func(c Cmd) ([]byte, error)
+
+func (f runTool) Run(_ context.Context, c Cmd) ([]byte, error) { return f(c) }
+
+// The ready file's read is bounded, and only a regular file is one: a directory or a link is
+// refused naming what it is.
+func TestTheReadyFilesReadIsBounded(t *testing.T) {
+	t.Parallel()
+	entry := func(h tar.Header, content []byte) []byte {
+		var b bytes.Buffer
+		w := tar.NewWriter(&b)
+		h.Size = int64(len(content))
+		if err := w.WriteHeader(&h); err != nil {
+			t.Fatal(err)
+		}
+		_, _ = w.Write(content)
+		_ = w.Close()
+		return b.Bytes()
+	}
+	read := func(archive []byte, stream bool) error {
+		in := &Installer{O: Options{Docker: runTool(func(c Cmd) ([]byte, error) {
+			if !stream {
+				return archive, nil
+			}
+			if _, err := c.Stdout.Write(archive); err != nil {
+				return nil, errors.Join(errors.New("docker cp"), err) // as a command whose output stops
+			}
+			return nil, nil
+		})}}
+		_, _, err := in.readyFile(context.Background(), "new1", "/run/hand/ready")
+		return err
+	}
+	at := time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC)
+	for _, stream := range []bool{true, false} {
+		if err := read(entry(tar.Header{Name: "ready", Typeflag: tar.TypeReg, ModTime: at}, make([]byte, maxReadyFile)), stream); err != nil {
+			t.Errorf("a file at the bound: %v", err)
+		}
+		if err := read(entry(tar.Header{Name: "ready", Typeflag: tar.TypeReg, ModTime: at}, make([]byte, maxReadyFile+100<<10)), stream); err == nil || !strings.Contains(err.Error(), "update_ready /run/hand/ready is over 1048576 bytes in the container") {
+			t.Errorf("a file over it: %v", err)
+		}
+	}
+	if err := read(entry(tar.Header{Name: "ready", Typeflag: tar.TypeDir, ModTime: at}, nil), true); err == nil || !strings.Contains(err.Error(), "update_ready /run/hand/ready is a directory in the container: it must be a regular file the new container writes") {
+		t.Errorf("a directory: %v", err)
+	}
+	if err := read(entry(tar.Header{Name: "ready", Typeflag: tar.TypeSymlink, Linkname: "/etc/passwd", ModTime: at}, nil), true); err == nil || !strings.Contains(err.Error(), "is a symbolic link") {
+		t.Errorf("a link: %v", err)
+	}
 }

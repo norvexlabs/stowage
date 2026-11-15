@@ -21,7 +21,11 @@ its part to the byte (rounded up), and none is less than 64 MiB.
 - **A minimum floors it**: `{ percent: 5, min: 256M }` is 5 % of the RAM, never under 256 MiB:
   the least the service needs, which a small percent of a small host would not give. It wins over
   the maximum (lint refuses a `min` over the `max`), and the compose file's own limit still wins
-  over it when larger.
+  over it when larger. A start whose shares' floors together (each the largest of its `min`, the
+  compose file's own limit or reservation and 64 MiB, for each container) pass the 90 % of this
+  host's RAM the shares take logs `warning: the memory shares' floors total N MiB, over the M MiB
+  this host's RAM leaves them (90 %): services may be OOM-killed; give the host more RAM or lower
+  services.<name>.memory.min` (the service of the largest floor) and starts.
 - **The share is the service's**: a service run as several containers (`scale`,
   `deploy.replicas`) splits it, its minimum and its maximum, each container's limit its part.
 - The limit is set on the key the compose file sets it with — `mem_limit`, or
@@ -75,7 +79,9 @@ interrupt whose affinity (its effective one, else the one asked —
 also for one that never fired, `per_cpu_count` all zeros, a virtio NIC's config interrupt, while
 its effective CPUs lie outside the one asked) reaches those cores as a
 difference (`<nic> interrupts: N of M on the services' cores (IRQ …)`; an interrupt the kernel
-manages refuses the move, which `--apply` notes; one whose CPUs do not read is advice), and where
+manages refuses the move (its write's `EIO`), which `--apply` notes and records for the boot in
+`/run/stowage/managed-irqs`: `--check` then gives it as advice, `isolcpus=managed_irq,<cores>` on
+the kernel's command line keeping it off them; one whose CPUs do not read is advice), and where
 `irqbalance` runs, `tune` advises
 `IRQBALANCE_BANNED_CPULIST=<their CPUs>` in its environment file (`/etc/default/irqbalance`, or
 `/etc/sysconfig/irqbalance` where the RHEL family's is alone), `ok` once irqbalance bans each of
@@ -142,7 +148,9 @@ nothing. A change nft refuses changes nothing and flushes nothing, then or later
 the app socket never flushes (below). The boot's load flushes nothing, and drops a flush still
 due (a reboot empties the table). The flush runs however
 the start's loads end, a later table's refusal included. A flush that fails is warned, and the
-start goes on (`warning: services.<name>.flush_conntrack: the host's connection-tracking table
+start goes on (a kernel that tracks no connection — no `nf_conntrack`, its
+`/proc/sys/net/netfilter/nf_conntrack_count` absent — has nothing to flush: no warning, the mark
+removed) (`warning: services.<name>.flush_conntrack: the host's connection-tracking table
 does not flush: …: the connections open before keep the previous table's verdict until they end,
 or until `sudo conntrack -F` (the next start tries again)`): the load is marked first
 (`<dir>/nftables/<name>.flush`, holding the boot it was written in), so each next start flushes
@@ -200,15 +208,19 @@ ipvlan's traffic does not cross the host's firewall (its rules are the service's
 re-run, an upgrade, a rollback, a boot; Docker and the VM) first replaces each start-first service
 whose running container differs from what the start runs (its configuration's digest, Compose's
 `com.docker.compose.config-hash`, or its image): the new container starts beside the old one
-(`docker compose up --wait --no-deps --no-recreate --scale <service>=2`), and once it runs —
-healthy, when it has a healthcheck — the old one is stopped with its `stop_grace_period` (10 s by
+(`docker compose up --detach --no-deps --no-recreate --scale <service>=2`, never Compose's
+`--wait`: the installer reads the new container itself, every half second, whatever the service's
+keys), and once it runs — healthy, when it has a healthcheck — the old one is stopped with its `stop_grace_period` (10 s by
 default) as the drain, then removed (`services.<name>: start-first: the new container starts
 beside the old one`, then `… the new container is healthy, the old one stopped`). The rest of the
-stack then starts as before. A new container that does not become healthy is removed and the old one
+stack then starts as before. A new container its restart policy restarts is read on (a restart
+that comes up serves) for 10 minutes, then fails the start (`… its new container <name> keeps
+restarting (exit code N) after 10m0s`). A new container that does not become healthy is removed and the old one
 serves on: the start fails (`services.<name>: its new container did not become healthy beside the
 old one, which serves on: …`), quoting the last lines it wrote, read before it goes (`…; its last
 lines (docker logs --tail 20), the container removed:`, then each line after `  | `, at most 4 KiB, a control or format
-character but a tab shown as `?`; each container's ID before its lines when there are several), and
+character but a tab shown as `?`, the value of each secret of the install — a `secret` input, a
+generated secret and its rotation's — shown as `<redacted>`; each container's ID before its lines when there are several), and
 then without the `see: docker compose … logs` pointer of a failed start, whose logs no longer hold
 it; one that wrote nothing, whose log does not read, or that stays (`a new container left (see the
 warning)` when its removal fails) keeps the pointer. A service none runs yet, or one unchanged, is the stack's start's
@@ -241,7 +253,10 @@ before its new container starts, which it does not: …`)), so a container still
 or failing during it never has the old one hand its listeners over (`services.<name>: the new
 container wrote <update_socket>/<file> (update_ready)`); one that does not write it within 10
 minutes fails the start, the old one never signalled (`… did not write <update_socket>/<file>
-(update_ready) within 10m0s: the directory must be writable by the container's user …`). The directory must be
+(update_ready) within 10m0s: the directory must be writable by the container's user …`). The file must be a
+regular file of at most 1 MiB: a directory, a symbolic link or a larger one fails the start where it is read
+(`update_ready <path> is a directory|a symbolic link in the container: it must be a regular file the new
+container writes`, `update_ready <path> is over 1048576 bytes in the container: …`). The directory must be
 writable by the container's user: a new volume takes the image's directory, owner included, and
 a volume made before keeps its owner (remove it, `docker volume rm`, for the next start to make it
 again). With `update_decline_status`, a new container that exits

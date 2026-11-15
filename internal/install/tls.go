@@ -52,6 +52,16 @@ func (in *Installer) domainKeys() map[string]string {
 	return out
 }
 
+// domainGiven is the value this run gives the route domain input k: --set's (--domains' once
+// applied), else the answers file's; ok reports that one was given. It is the one rule of "a
+// domain was given" the mode, the VM's settings and a re-run's changes read.
+func (in *Installer) domainGiven(k string) (v string, ok bool) {
+	if v, ok = in.O.Set[k]; !ok {
+		v, ok = in.O.Answers[k]
+	}
+	return v, ok
+}
+
 // applyDomains turns --domains route=host into the routes' domain inputs.
 func (in *Installer) applyDomains() error {
 	o := &in.O
@@ -102,12 +112,11 @@ func (in *Installer) mode(ctx context.Context, prev string) (mode string, asked 
 	}
 	domainGiven := false
 	for _, k := range in.domainKeys() {
-		_, set := o.Set[k]
-		_, answered := o.Answers[k]
+		_, given := in.domainGiven(k)
 		// The environment counts only where loopback is not offered: a variable exported for
 		// something else must not publish the stack.
 		env := in.inputEnv(k) != "" && o.Prompt == nil && !slices.Contains(offered, Loopback)
-		domainGiven = domainGiven || set || answered || env
+		domainGiven = domainGiven || given || env
 	}
 	switch {
 	case o.TLS != "":

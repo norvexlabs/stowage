@@ -3,6 +3,9 @@ package install
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
@@ -11,6 +14,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"filippo.io/age"
 	"go.yaml.in/yaml/v3"
@@ -374,7 +378,7 @@ func TestARestoreReadsTheInstallAgainUnderTheLock(t *testing.T) {
 	if err := changed.WriteFile(filepath.Join(e.dir, ".env")); err != nil {
 		t.Fatal(err)
 	}
-	err = d.runRestore(in, obj, []age.Identity{key}, func(string, ...any) {})
+	err = d.runRestore(in, obj, []age.Identity{key}, false, func(string, ...any) {})
 	if err == nil || !strings.Contains(err.Error(), "the install runs notes 0.9.0 (revision 1)") || e.docker.restored != "" {
 		t.Errorf("%v, restored %q", err, e.docker.restored)
 	}
@@ -809,6 +813,11 @@ func TestAManifestNotOfTheReleaseRestoresNothing(t *testing.T) {
 		return b.Bytes()
 	}
 	good := f.objects["store:backups/notes/"+obj]
+	// Without the backup's records, nothing but the manifest's own checks stands between a
+	// planted manifest and the restore.
+	if err := os.Remove(BackupDigestsFile(d.O.Dir)); err != nil {
+		t.Fatal(err)
+	}
 	for _, c := range []struct {
 		name, want string
 		identity   string
@@ -824,7 +833,7 @@ func TestAManifestNotOfTheReleaseRestoresNothing(t *testing.T) {
 	} {
 		f.objects["store:backups/notes/"+obj] = c.manifest
 		n := len(e.docker.ran("compose"))
-		call(t, h, "POST", "/v1/restore", RestoreRequest{Object: obj, Identity: c.identity, Confirm: &Version{"1.0.0", 1}}, nil)
+		call(t, h, "POST", "/v1/restore", RestoreRequest{Object: obj, Identity: c.identity, Confirm: &Version{"1.0.0", 1}, Unrecorded: true}, nil)
 		j := waitJob(t, h)
 		if j.State != "failed" || !strings.Contains(j.Error, c.want) || !strings.Contains(j.Error, "nothing restored") {
 			t.Errorf("%s: %+v", c.name, j)
@@ -848,8 +857,313 @@ func TestAManifestNotOfTheReleaseRestoresNothing(t *testing.T) {
 	}
 	// Positive control: the manifest it wrote restores.
 	f.objects["store:backups/notes/"+obj] = good
-	call(t, h, "POST", "/v1/restore", RestoreRequest{Object: obj, Identity: key.String(), Confirm: &Version{"1.0.0", 1}}, nil)
+	call(t, h, "POST", "/v1/restore", RestoreRequest{Object: obj, Identity: key.String(), Confirm: &Version{"1.0.0", 1}, Unrecorded: true}, nil)
 	if j := waitJob(t, h); j.State != "done" {
 		t.Errorf("%+v", j)
+	}
+}
+
+// swapped reports whether a compose call from n on swapped a database in.
+func swapped(e *env, n int) bool {
+	for _, c := range e.docker.ran("compose")[n:] {
+		if strings.Contains(strings.Join(c.Args, " "), "RENAME TO stowage_replaced") {
+			return true
+		}
+	}
+	return false
+}
+
+func TestARestoreLoadsOnlyWhatTheBackupUploaded(t *testing.T) {
+	t.Parallel()
+	e, d, f, key, obj := restoreVM(t)
+	h := d.Handler()
+	at := "store:backups/notes/" + obj
+	good := f.objects[at]
+	// The backup recorded its object's digest, root's alone.
+	fi, err := os.Stat(BackupDigestsFile(d.O.Dir))
+	if err != nil || fi.Mode().Perm() != 0o600 {
+		t.Fatalf("%v %v", fi, err)
+	}
+	rec, err := readDigests(d.O.Dir)
+	if sum := sha256.Sum256(good); err != nil || len(rec) != 2 || rec[at].SHA256 != hex.EncodeToString(sum[:]) {
+		t.Fatalf("%v %+v", err, rec)
+	}
+	var planted bytes.Buffer
+	w, _ := age.Encrypt(&planted, key.Recipient())
+	w.Write([]byte("PGDMP planted"))
+	w.Close()
+	restore := func(unrecorded bool) JobStatus {
+		t.Helper()
+		call(t, h, "POST", "/v1/restore", RestoreRequest{Object: obj, Identity: key.String(), Confirm: &Version{"1.0.0", 1}, Unrecorded: unrecorded}, nil)
+		return waitJob(t, h)
+	}
+	// An object overwritten in place is refused before a byte of it loads, override or not.
+	f.objects[at] = planted.Bytes()
+	for _, unrecorded := range []bool{false, true} {
+		n := len(e.docker.ran("compose"))
+		j := restore(unrecorded)
+		if j.State != "failed" || !strings.Contains(j.Error, "is not the object this install's backup uploaded") || !strings.Contains(j.Error, "the database is as it was") {
+			t.Errorf("unrecorded %v: %+v", unrecorded, j)
+		}
+		if slices.Contains(composeCalls(e, n), "restore") || e.docker.restored != "" || swapped(e, n) {
+			t.Errorf("unrecorded %v: ran %v, restored %q", unrecorded, composeCalls(e, n), e.docker.restored)
+		}
+	}
+	// One changed after it was downloaded: the restore loads the copy it checked, downloaded once,
+	// which it then removes.
+	f.objects[at], f.afterCat = good, map[string][]byte{at: planted.Bytes()}
+	cats := func() int {
+		n := 0
+		for _, c := range f.calls() {
+			if c[0] == "cat" && c[len(c)-1] == at {
+				n++
+			}
+		}
+		return n
+	}
+	before, n := cats(), len(e.docker.ran("compose"))
+	if j := restore(false); j.State != "done" || !swapped(e, n) || cats() != before+1 {
+		t.Errorf("%+v, %d downloads", j, cats()-before)
+	}
+	if left, err := os.ReadDir(filepath.Join(d.O.Dir, restoreObjects)); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("the downloads are kept: %v %v", left, err)
+	}
+	// Without a record: refused, naming the override, which loads it.
+	f.objects[at] = good
+	if err := os.Remove(BackupDigestsFile(d.O.Dir)); err != nil {
+		t.Fatal(err)
+	}
+	n = len(e.docker.ran("compose"))
+	if j := restore(false); j.State != "failed" || !strings.Contains(j.Error, "this install recorded no digest of it") || !strings.Contains(j.Error, "restore --unrecorded") || len(composeCalls(e, n)) != 0 {
+		t.Errorf("%+v", j)
+	}
+	if j := restore(true); j.State != "done" || !swapped(e, n) {
+		t.Errorf("%+v", j)
+	}
+}
+
+func TestARestoreChecksEveryVolumesArchive(t *testing.T) {
+	t.Parallel()
+	_, d, f, key, vol := volumesVM(t)
+	f.volumes, f.staged = map[string][]byte{vol: []byte("at the backup")}, map[string][]byte{}
+	h := d.Handler()
+	call(t, h, "POST", "/v1/backup", BackupRequest{}, nil)
+	obj := waitJob(t, h).Target
+	rec, err := readDigests(d.O.Dir)
+	at := "store:backups/notes/" + volumeObject(obj, "uploads")
+	if err != nil || len(rec) != 2 || rec[at].SHA256 == "" || rec["store:backups/notes/"+obj].SHA256 == "" {
+		t.Fatalf("%v %+v", err, rec)
+	}
+	good := f.objects[at]
+	f.volumes[vol] = []byte("since")
+	var planted bytes.Buffer
+	w, _ := age.Encrypt(&planted, key.Recipient())
+	w.Write([]byte("planted"))
+	w.Close()
+	req := RestoreRequest{Object: obj, Identity: key.String(), Confirm: &Version{"1.0.0", 1}}
+	f.objects[at] = planted.Bytes()
+	call(t, h, "POST", "/v1/restore", req, nil)
+	if j := waitJob(t, h); j.State != "failed" || !strings.Contains(j.Error, "is not the object this install's backup uploaded") || !strings.Contains(j.Error, "the data is as it was") {
+		t.Errorf("overwritten: %+v", j)
+	}
+	if string(f.volumes[vol]) != "since" || len(f.staged) != 0 {
+		t.Errorf("overwritten: volume %q, staged %q", f.volumes[vol], f.staged)
+	}
+	// The disk cannot hold the largest object: refused before anything stops, naming it.
+	f.objects[at] = good
+	largest, name := len(good), volumeObject(obj, "uploads")
+	if m := len(f.objects["store:backups/notes/"+obj]); m > largest {
+		largest, name = m, obj
+	}
+	d.Statfs = func(string) *Disk { return &Disk{Available: uint64(largest - 1)} }
+	call(t, h, "POST", "/v1/restore", req, nil)
+	if j := waitJob(t, h); j.State != "failed" || !strings.Contains(j.Error, "the largest, "+name+", is "+fmt.Sprint(largest)+" bytes: the disk has "+fmt.Sprint(largest-1)+" available") || !strings.Contains(j.Error, "nothing restored") {
+		t.Errorf("no room: %+v", j)
+	}
+	if string(f.volumes[vol]) != "since" {
+		t.Errorf("no room: volume %q", f.volumes[vol])
+	}
+	d.Statfs = func(string) *Disk { return &Disk{Available: uint64(largest)} }
+	// Positive control.
+	f.objects[at] = good
+	call(t, h, "POST", "/v1/restore", req, nil)
+	if j := waitJob(t, h); j.State != "done" || string(f.volumes[vol]) != "at the backup" {
+		t.Errorf("%+v %q", j, f.volumes[vol])
+	}
+}
+
+func TestTheBackupsDigestsAreBounded(t *testing.T) {
+	t.Parallel()
+	_, d, _, _ := backupVM(t)
+	t0 := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	sums := map[string]string{}
+	for i := range maxDigests - 1 {
+		sums[fmt.Sprintf("o%05d", i)] = "s"
+	}
+	if err := d.recordDigests(sums, t0); err != nil {
+		t.Fatal(err)
+	}
+	// At the bound, every record stays; past it, the oldest go.
+	if err := d.recordDigests(map[string]string{"new1": "s"}, t0.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if rec, err := readDigests(d.O.Dir); err != nil || len(rec) != maxDigests {
+		t.Fatalf("%v %d", err, len(rec))
+	}
+	if err := d.recordDigests(map[string]string{"new2": "s"}, t0.Add(2*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	rec, err := readDigests(d.O.Dir)
+	if err != nil || len(rec) != maxDigests {
+		t.Fatalf("%v %d", err, len(rec))
+	}
+	for name, kept := range map[string]bool{"o00000": false, "o00001": true, "new1": true, "new2": true} {
+		if _, ok := rec[name]; ok != kept {
+			t.Errorf("%s kept %v", name, ok)
+		}
+	}
+}
+
+// The record is bounded in bytes too, the oldest dropped, so a file written always reads back; a
+// record of `null` is none, never a failure to add to.
+func TestTheBackupsDigestsFitTheirRead(t *testing.T) {
+	t.Parallel()
+	_, d, _, _ := backupVM(t)
+	if err := os.WriteFile(BackupDigestsFile(d.O.Dir), []byte("null\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t0 := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	if err := d.recordDigests(map[string]string{"store:first": "s"}, t0); err != nil {
+		t.Fatal(err)
+	}
+	// About 1.9 MB of older records, then 200 more: past the bound in bytes, under the count.
+	long := strings.Repeat("x", 1000)
+	old := map[string]backupDigest{}
+	for i := range 1900 {
+		old[fmt.Sprintf("store:%05d/%s", i, long)] = backupDigest{SHA256: "s", Time: t0.Add(time.Duration(i) * time.Second)}
+	}
+	raw, err := json.Marshal(old)
+	if err != nil || len(raw) > maxDigestsBytes {
+		t.Fatalf("%v %d", err, len(raw))
+	}
+	if err := os.WriteFile(BackupDigestsFile(d.O.Dir), raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	more := map[string]string{}
+	for i := 1900; i < 2100; i++ {
+		more[fmt.Sprintf("store:%05d/%s", i, long)] = "s"
+	}
+	if err := d.recordDigests(more, t0.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	rec, err := readDigests(d.O.Dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi, _ := os.Stat(BackupDigestsFile(d.O.Dir)); fi.Size() > maxDigestsBytes || len(rec) >= 2100 {
+		t.Errorf("%d bytes, %d records", fi.Size(), len(rec))
+	}
+	for name, kept := range map[string]bool{"store:00000/" + long: false, "store:02099/" + long: true} {
+		if _, ok := rec[name]; ok != kept {
+			t.Errorf("%.12s kept %v", name, ok)
+		}
+	}
+}
+
+// A digest is the object's in its destination: the same name in another destination has none.
+func TestADigestIsTheDestinations(t *testing.T) {
+	t.Parallel()
+	_, d, _, _ := backupVM(t)
+	if err := d.recordDigests(map[string]string{"store:a/o.age": "s"}, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if sums, err := d.checkDigests("store:a", []string{"o.age"}, false, t.Logf); err != nil || sums["o.age"] != "s" {
+		t.Errorf("%v %v", sums, err)
+	}
+	if _, err := d.checkDigests("store:b", []string{"o.age"}, false, t.Logf); err == nil || !strings.Contains(err.Error(), "store:b/o.age: this install recorded no digest of it") {
+		t.Errorf("%v", err)
+	}
+}
+
+// The rclone config, the destination's credentials, is written in the daemon's private directory
+// alone, never the system's temporary one; one a killed run left goes with the next run's once
+// stale, and all as the daemon starts.
+func TestAnRcloneConfigLeftIsSwept(t *testing.T) {
+	t.Parallel()
+	c := BackupConfig{RcloneConfig: "[store]\ntype = sftp\n", operator: true}
+	if _, _, err := (&Hostd{R: testRelease(t, "1.0.0"), Docker: true}).rcloneConf(c); err == nil {
+		t.Error("written with no private directory")
+	}
+	run := filepath.Join(t.TempDir(), "run")
+	h := &Hostd{R: testRelease(t, "1.0.0"), Docker: true, Run: run}
+	stale, fresh := filepath.Join(run, "backup-stale"), filepath.Join(run, "backup-fresh")
+	for _, d := range []string{stale, fresh} {
+		if err := os.MkdirAll(d, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	old := time.Now().Add(-staleRclone - time.Minute)
+	if err := os.Chtimes(stale, old, old); err != nil {
+		t.Fatal(err)
+	}
+	dir, done, err := h.rcloneConf(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if filepath.Dir(dir) != run || fileExists(stale) || !fileExists(fresh) {
+		t.Errorf("config in %s; stale kept %v, fresh kept %v", dir, fileExists(stale), fileExists(fresh))
+	}
+	done()
+	if fileExists(dir) {
+		t.Error("the config outlived its run")
+	}
+	sweepRclone(run, 0)
+	if fileExists(fresh) {
+		t.Error("the start's sweep kept one")
+	}
+	// A Docker install's reads write theirs in its own directory.
+	in := &Installer{R: testRelease(t, "1.0.0"), O: Options{Dir: t.TempDir()}}
+	w, err := in.dockerWatchd(context.Background())
+	if err != nil || w.Run != filepath.Join(in.O.Dir, readRun) {
+		t.Errorf("%v: %q", err, w.Run)
+	}
+}
+
+func TestABackupWhoseDigestsCannotBeRecordedFails(t *testing.T) {
+	t.Parallel()
+	_, d, f, key := backupVM(t)
+	configure(t, d, validConfig(key))
+	if err := os.WriteFile(BackupDigestsFile(d.O.Dir), []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	h := d.Handler()
+	call(t, h, "POST", "/v1/backup", BackupRequest{}, nil)
+	j := waitJob(t, h)
+	if j.State != "failed" || !strings.Contains(j.Error, "recording the backup's digests: ") || !strings.Contains(j.Error, "backup-digests.json is not the backups' digests: remove it") {
+		t.Errorf("%+v", j)
+	}
+	if len(f.objects) != 0 {
+		t.Errorf("left %v", slices.Collect(maps.Keys(f.objects)))
+	}
+}
+
+// The daemon's release check names the project too: an install of another project of the same
+// version is refused, as one of another revision is.
+func TestTheDaemonRefusesAResetOfAnotherProject(t *testing.T) {
+	t.Parallel()
+	e, d, _ := resettableVM(t)
+	m := *d.R.Manifest
+	m.Name = "crm"
+	r := *d.R
+	r.Manifest = &m
+	d.R = &r
+	e.docker.calls = nil
+	var refused errOf
+	if code := call(t, d.Handler(), "GET", "/v1/reset-db", nil, &refused); code != 409 ||
+		!strings.Contains(refused.Error, "the install runs notes 1.0.0 (revision 1), not this OS's crm 1.0.0 (revision 1): reset-db runs on the release the OS carries") {
+		t.Fatalf("%d %s", code, refused.Error)
+	}
+	if n := len(e.docker.ran("compose")) + resetVolumeCalls(e); n != 0 {
+		t.Errorf("%d docker calls", n)
 	}
 }

@@ -28,6 +28,56 @@ import (
 var fakeStart = time.Date(2026, 10, 14, 9, 0, 0, 0, time.UTC)
 
 // served runs h on a socket of its own until the test ends, and returns the socket.
+// withBootID gives h a boot id to read when its options name none that reads (vm's os.DevNull):
+// the daemon does not start without one.
+func withBootID(t *testing.T, h *Hostd) {
+	t.Helper()
+	if h.O.bootID() != "" {
+		return
+	}
+	f := filepath.Join(t.TempDir(), "boot_id")
+	if err := os.WriteFile(f, []byte("00000000-0000-4000-8000-000000000001\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h.O.BootIDFile = f
+}
+
+// The daemon does not start without this boot's id: the journal tells boots apart by it, and a
+// reboot scheduled with none would never resolve.
+func TestTheDaemonNeedsTheBootID(t *testing.T) {
+	t.Parallel()
+	d := daemon(installedVM(t), &fakeHost{})
+	d.O.BootIDFile = filepath.Join(t.TempDir(), "absent")
+	dir, err := os.MkdirTemp("", "hostd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	err = d.Serve(context.Background(), filepath.Join(dir, "host.sock"))
+	if err == nil || !strings.Contains(err.Error(), "the kernel's boot id ("+d.O.BootIDFile+") does not read") {
+		t.Fatalf("%v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "host.sock")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("served: %v", err)
+	}
+}
+
+// The daemon's login banners go to the directory --issue-dir names (a test's on its own host),
+// a hidden flag.
+func TestTheDaemonTakesAnIssueDirectory(t *testing.T) {
+	t.Parallel()
+	e := vmEnv(t, "1.0.0")
+	cmd := vmCommand(e.r, e.self, io.Discard, io.Discard, func(bool) Prompter { return nil }, clientTimes{})
+	hostd, _, err := cmd.Find([]string{hostdCmd})
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := hostd.Flags().Lookup("issue-dir")
+	if f == nil || !f.Hidden || f.DefValue != "" {
+		t.Fatalf("%+v", f)
+	}
+}
+
 func served(t *testing.T, h *Hostd) string {
 	t.Helper()
 	// A short path: a unix socket's is bounded (108 bytes), which a test's temporary directory may pass.
@@ -39,6 +89,7 @@ func served(t *testing.T, h *Hostd) string {
 	sock := filepath.Join(dir, "run", "host.sock")
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
+	withBootID(t, h)
 	go func() { done <- h.Serve(ctx, sock) }()
 	t.Cleanup(func() {
 		cancel()
@@ -244,6 +295,35 @@ func TestInstallRefusesABadChannel(t *testing.T) {
 		t.Errorf("err = %v", err)
 	}
 	e.nothingWritten()
+}
+
+// A first install's --channel names a channel the registry holds a release of the project on, as
+// `vm seed --channel` does: a typo is refused, not found later by `updates`; an installed VM's
+// re-run is not checked.
+func TestTheFirstInstallChecksItsChannel(t *testing.T) {
+	t.Parallel()
+	p := vmPublished(t, spec.Provider{Name: "none"}, nil)
+	p.release("1.0.0", 1, nil)
+	dir := filepath.Join(t.TempDir(), "notes") // no install yet
+	in := &Installer{R: p.r, O: Options{Dir: dir, Log: io.Discard}}
+	ctx := context.Background()
+	if err := in.checkInstallChannel(ctx, "stabel"); !isRefused(err) || !strings.Contains(err.Error(), "--channel stabel: the registry "+p.prefix+" holds no release of notes on stabel") || strings.Contains(err.Error(), "this release is on") {
+		t.Fatalf("a typo: %v", err)
+	}
+	for _, ch := range []string{"stable", ""} {
+		if err := in.checkInstallChannel(ctx, ch); err != nil {
+			t.Errorf("%q: %v", ch, err)
+		}
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, envName), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := in.checkInstallChannel(ctx, "stabel"); err != nil {
+		t.Errorf("an installed VM: %v", err)
+	}
 }
 
 func TestUpgradeReadsTheChannelsPointerAlone(t *testing.T) {
@@ -781,6 +861,7 @@ func TestHealthOverTheSocketFailsWhenNotReady(t *testing.T) {
 		t.Errorf("%v %q", err, out)
 	}
 	p.status = 503
+	time.Sleep(healthReuseSecs * d.Unit) // the last verdict's reuse ends
 	if out, err := ctl(e, sock, "health"); err == nil || !strings.Contains(err.Error(), "not ready: api:8000/healthz/ready answered 503") {
 		t.Errorf("%v %q", err, out)
 	}

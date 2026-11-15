@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/go-containerregistry/pkg/authn"
@@ -47,9 +48,14 @@ var maxArtifactBlob int64 = MaxArtifactBlob
 type Client struct {
 	keychain authn.Keychain
 	rt       http.RoundTripper
-	roots    *x509.CertPool
-	log      io.Writer // a large blob's push: its progress and its retries
-	ceilings sync.Map  // registry → *atomic.Int64: the largest chunk it takes, 0 until it refused one for its size
+	own      *http.Transport // the client's own transport, under rt; nil when WithTransport gave one
+	// awaited is the transport of the requests whose response a registry may take long to give (a
+	// large blob's commit), each with its own bound (withHeaderWait); made once, when first used.
+	awaited     http.RoundTripper
+	awaitedOnce sync.Once
+	roots       *x509.CertPool
+	log         io.Writer // a large blob's push: its progress and its retries
+	ceilings    sync.Map  // registry → *atomic.Int64: the largest chunk it takes, 0 until it refused one for its size
 }
 
 // Option configures a Client.
@@ -120,19 +126,116 @@ func CertPool(data []byte) (*x509.CertPool, error) {
 	return pool, nil
 }
 
+// responseWait bounds the wait for a response's headers on the client's own transport. A variable
+// for tests.
+var responseWait = 2 * time.Minute
+
 // New returns a client authenticating with keychain.
 func New(keychain authn.Keychain, opts ...Option) *Client {
 	own := http.DefaultTransport.(*http.Transport).Clone()
-	own.ResponseHeaderTimeout = 2 * time.Minute
+	own.ResponseHeaderTimeout = responseWait
 	c := &Client{keychain: keychain, rt: own}
 	for _, o := range opts {
 		o(c)
 	}
-	if c.roots != nil && c.rt == own {
-		own.TLSClientConfig = &tls.Config{RootCAs: c.roots, MinVersion: tls.VersionTLS12}
+	if c.rt == own {
+		if c.roots != nil {
+			own.TLSClientConfig = &tls.Config{RootCAs: c.roots, MinVersion: tls.VersionTLS12}
+		}
+		c.own = own
 	}
 	c.rt = httpsOnly{c.rt}
 	return c
+}
+
+// waiting is the client's transport for the requests whose response a registry may take long to
+// give: each request's headers are awaited for the bound its context carries (withHeaderWait),
+// responseWait without one, rather than the client's own transport's responseWait. Made once per
+// client; a transport WithTransport gave is used under the same bounds.
+func (c *Client) waiting() http.RoundTripper {
+	c.awaitedOnce.Do(func() {
+		if c.own == nil {
+			c.awaited = awaiting{c.rt}
+			return
+		}
+		t := c.own.Clone()
+		t.ResponseHeaderTimeout = 0 // awaiting bounds each request
+		c.awaited = httpsOnly{awaiting{t}}
+	})
+	return c.awaited
+}
+
+type headerWaitKey struct{}
+
+// withHeaderWait has the requests made with ctx through waiting's transport await their response
+// headers for d once their body is sent.
+func withHeaderWait(ctx context.Context, d time.Duration) context.Context {
+	return context.WithValue(ctx, headerWaitKey{}, d)
+}
+
+// awaiting cancels a request whose response headers have not come within its bound
+// (withHeaderWait, else responseWait) after its body was sent, as ResponseHeaderTimeout does for
+// every request of a transport.
+type awaiting struct{ next http.RoundTripper }
+
+func (a awaiting) RoundTrip(r *http.Request) (*http.Response, error) {
+	bound, ok := r.Context().Value(headerWaitKey{}).(time.Duration)
+	if !ok {
+		bound = responseWait
+	}
+	ctx, cancel := context.WithCancel(r.Context())
+	var timer atomic.Pointer[time.Timer]
+	var once sync.Once
+	start := func() { once.Do(func() { timer.Store(time.AfterFunc(bound, cancel)) }) }
+	r = r.WithContext(ctx)
+	if r.Body == nil || r.Body == http.NoBody {
+		start()
+	} else {
+		r.Body = &sent{ReadCloser: r.Body, done: start}
+	}
+	resp, err := a.next.RoundTrip(r)
+	once.Do(func() {}) // the headers came: no bound starts after this
+	if t := timer.Load(); t != nil {
+		t.Stop()
+	}
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	resp.Body = &closing{ReadCloser: resp.Body, close: cancel}
+	return resp, nil
+}
+
+// sent calls done once its body was read to its end or closed (the transport closes a request's
+// body once it sent it).
+type sent struct {
+	io.ReadCloser
+	done func()
+}
+
+func (s *sent) Read(p []byte) (int, error) {
+	n, err := s.ReadCloser.Read(p)
+	if err == io.EOF {
+		s.done()
+	}
+	return n, err
+}
+
+func (s *sent) Close() error {
+	s.done()
+	return s.ReadCloser.Close()
+}
+
+// closing calls close once its body is closed.
+type closing struct {
+	io.ReadCloser
+	close func()
+}
+
+func (c *closing) Close() error {
+	err := c.ReadCloser.Close()
+	c.close()
+	return err
 }
 
 // httpsOnly refuses plain HTTP to any host but the loopback. go-containerregistry falls back to

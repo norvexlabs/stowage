@@ -435,7 +435,7 @@ func TestTheFrontsVolumesHeldNeedNoEarlyCreate(t *testing.T) {
 	creates := func() int {
 		n := 0
 		for _, c := range e.docker.calls {
-			if strings.HasSuffix(strings.Join(c.Args, " "), " up --no-start --remove-orphans") {
+			if strings.Contains(strings.Join(c.Args, " "), " up --no-start ") {
 				n++
 			}
 		}
@@ -701,7 +701,7 @@ func TestAFrontStoppedForAFailedPrepStaysStopped(t *testing.T) {
 			order = append(order, "stop")
 		case strings.HasSuffix(a, " start "+FrontService):
 			order = append(order, "start")
-		case strings.HasSuffix(a, " up --no-start --remove-orphans"):
+		case strings.Contains(a, " up --no-start "):
 			order = append(order, "create")
 		case strings.HasPrefix(a, frontPrepPrefix):
 			order = append(order, "root")
@@ -796,7 +796,7 @@ func TestAVolumeAwaitingItsUIDIsGivenBeforeTheFrontsStep(t *testing.T) {
 	var order []string
 	for _, c := range e.docker.calls {
 		switch a := strings.Join(c.Args, " "); {
-		case strings.HasSuffix(a, " up --no-start --remove-orphans"):
+		case strings.Contains(a, " up --no-start "):
 			order = append(order, "create")
 		case strings.HasPrefix(a, frontUserPrefix):
 			order = append(order, "front")

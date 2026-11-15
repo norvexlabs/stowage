@@ -86,6 +86,18 @@ type deployed struct {
 	// Sysctls are the pods' network settings the release was given (stowage.sysctls). Raw, as
 	// PublicKeys.
 	Sysctls json.RawMessage `json:"sysctls"`
+	// PullSecret is the pull Secret the release's pods name (stowage.pullSecret); "" for none.
+	// Raw, as PublicKeys.
+	PullSecret json.RawMessage `json:"pullSecret"`
+}
+
+// pullSecretName is the pull Secret the release names, "" when none or one of another shape.
+func (d *deployed) pullSecretName() string {
+	var s string
+	if json.Unmarshal(d.PullSecret, &s) != nil {
+		return ""
+	}
+	return s
 }
 
 // givesSysctls reports whether the release's values give its pods network settings.
@@ -424,11 +436,17 @@ func (in *Installer) helm(ctx context.Context, c Cmd) ([]byte, error) {
 
 func (in *Installer) kubectl(ctx context.Context, c Cmd) ([]byte, error) {
 	k := in.O.K8s
-	c.Args = append(c.Args, "--namespace", k.Namespace)
-	if k.Context != "" {
-		c.Args = append(c.Args, "--context", k.Context)
-	}
+	c.Args = append(c.Args, k.kubectlTarget()...)
 	return k.Kubectl.Run(ctx, c)
+}
+
+// kubectlTarget are the flags every kubectl command of the run takes — the namespace, and the
+// context when one is given —, the ones a hint names too (kubectlWhere).
+func (k K8sOptions) kubectlTarget() []string {
+	if k.Context != "" {
+		return []string{"--namespace", k.Namespace, "--context", k.Context}
+	}
+	return []string{"--namespace", k.Namespace}
 }
 
 // checkHelm requires helm ≥ MinHelm and returns its major version.
@@ -465,7 +483,24 @@ func (in *Installer) release(ctx context.Context) (*helmRelease, error) {
 			return &r, nil
 		}
 	}
-	return nil, nil
+	// A status helm list shows under no flag (helm's unknown) is still a release: helm status
+	// reads any, and says when there is none.
+	out, err = in.helm(ctx, Cmd{Args: []string{"status", k.Release, "--output", "json"}})
+	if err != nil {
+		if strings.Contains(err.Error(), "release: not found") {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var st struct {
+		Info struct {
+			Status string `json:"status"`
+		} `json:"info"`
+	}
+	if err := json.Unmarshal(out, &st); err != nil {
+		return nil, fmt.Errorf("helm status: %w", err)
+	}
+	return &helmRelease{Name: k.Release, Status: st.Info.Status}, nil
 }
 
 // installedRelease reads what the release runs from its values; an error when it was not installed
@@ -751,7 +786,12 @@ func (in *Installer) k8sDeploy(ctx context.Context, upgrade bool) (err error) {
 	prefix := cmp.Or(k.Registry, in.R.Spec.Registry.Prefix)
 	// sysctls: the release gives its pods network settings, as reused or given now.
 	var sysctls bool
+	// runningPull: the pull Secret the running release names, on an upgrade.
+	var runningPull string
 	switch {
+	case rel != nil && rel.Status == "uninstalled":
+		// Neither an install nor an upgrade goes over it: each names what does.
+		return in.uninstalledRelease()
 	case !upgrade && rel != nil:
 		return refuse(in.k8sCtl("upgrade"), "release %s in %s exists (%s, %s): `%s` moves it to %s", k.Release, k.Namespace, rel.Status, rel.AppVersion, in.k8sCtl("upgrade"), m.ProjectVersion)
 	case upgrade && rel == nil:
@@ -769,6 +809,7 @@ func (in *Installer) k8sDeploy(ctx context.Context, upgrade bool) (err error) {
 		}
 		prefix = cmp.Or(k.Registry, cur.Registry)
 		sysctls = cur.givesSysctls()
+		runningPull = cur.pullSecretName()
 		// The same release applied again shares its baseline and its inputs: nothing to fetch.
 		if cur.Release.Version != m.ProjectVersion || cur.Release.Revision != m.Revision {
 			running, runErr := in.k8sRunning(ctx, cur, prefix)
@@ -821,6 +862,27 @@ func (in *Installer) k8sDeploy(ctx context.Context, upgrade bool) (err error) {
 			return err
 		}
 	}
+	// An upgrade writing no pull account names the Secret the release names, once it is seen to
+	// exist: never one reused unseen.
+	keptPull := ""
+	if upgrade && d.pull == nil && runningPull != "" {
+		out, err := in.kubectl(ctx, Cmd{Args: []string{"get", "secret", runningPull, "--ignore-not-found", "--output", "name"}})
+		if err != nil {
+			return err
+		}
+		switch {
+		case len(bytes.TrimSpace(out)) > 0:
+			keptPull = runningPull
+		case in.R.Spec.Registry.Pull.Name == "token" && prefix == in.R.Spec.Registry.Prefix:
+			c, err := providers.Token(in.R.Spec.Registry.Pull)
+			if err != nil {
+				return err
+			}
+			return refuse("set "+c.TokenEnv, "the pull Secret %s the release names is gone: set %s (the pull account %s) to write it again", runningPull, c.TokenEnv, c.User)
+		default:
+			o.logf("the pull Secret %s the release names is gone: the pods pull from %s with none", runningPull, prefix)
+		}
+	}
 	if !upgrade {
 		// Reading a namespace takes a cluster-wide grant an operator limited to it may not have:
 		// one that cannot be read is taken to exist, and the Secrets' apply says when it does not.
@@ -845,12 +907,10 @@ func (in *Installer) k8sDeploy(ctx context.Context, upgrade bool) (err error) {
 		d.restart = in.k8sRestartList(d.changed)
 	}
 	vals := map[string]any{"registry": prefix, "secret": k.envSecret()}
-	switch {
-	case d.pull != nil:
+	// Given on every deploy: a value reused could name a Secret deleted since.
+	vals["pullSecret"] = keptPull
+	if d.pull != nil {
 		vals["pullSecret"] = k.pullSecret()
-	case !upgrade:
-		vals["pullSecret"] = ""
-		// An upgrade with no password keeps the pull Secret the release names (reused values).
 	}
 	// Given on every deploy, an upgrade's too: a value reused could name a Secret deleted since.
 	vals["files"] = ""
@@ -995,15 +1055,44 @@ func helmDeploy(major int, k K8sOptions, chart, values string) []string {
 
 // pending refuses a release helm is working on, or left half done.
 func (in *Installer) pending(rel *helmRelease) error {
-	if !strings.HasPrefix(rel.Status, "pending-") {
-		return nil
-	}
 	k := in.O.K8s
+	switch {
+	case slices.Contains([]string{"deployed", "failed", "superseded", "uninstalled"}, rel.Status):
+		return nil
+	case !strings.HasPrefix(rel.Status, "pending-"):
+		return refuse("repair or uninstall release "+k.Release+" with helm first", "release %s in %s is in helm's %s status: `helm history %s --namespace %s` shows it; repair or uninstall it with helm first", k.Release, k.Namespace, cmp.Or(rel.Status, "empty"), k.Release, k.Namespace)
+	}
 	end := "helm rollback"
 	if rel.Status == "pending-install" {
 		end = "helm uninstall" // no earlier revision to go back to; the Secrets are kept
 	}
 	return refuse(end+" "+k.Release+" --namespace "+k.Namespace, "release %s in %s is %s: another helm operation runs on it, or one stopped before it finished (`%s %s --namespace %s` ends it)", k.Release, k.Namespace, rel.Status, end, k.Release, k.Namespace)
+}
+
+// k8sCurrent is the release the namespace runs, as its latest revision's values record it: refused
+// when there is none (noRelease) or helm is working on it or left it in another status (pending).
+// Each verb acting on the installed release reads it here.
+func (in *Installer) k8sCurrent(ctx context.Context) (*deployed, error) {
+	return in.k8sLatest(ctx, false)
+}
+
+// k8sLatest is k8sCurrent, which, with uninstalledToo, also reads a release uninstalled with its
+// history kept (what `k8s rollback` brings back) rather than refuse it.
+func (in *Installer) k8sLatest(ctx context.Context, uninstalledToo bool) (*deployed, error) {
+	rel, err := in.release(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if rel == nil {
+		return nil, in.noRelease()
+	}
+	if rel.Status == "uninstalled" && !uninstalledToo {
+		return nil, in.uninstalledRelease()
+	}
+	if err := in.pending(rel); err != nil {
+		return nil, err
+	}
+	return in.installedRelease(ctx)
 }
 
 // k8sNewer refuses a release that comes before the one the helm release runs, by the scheme the
@@ -1253,17 +1342,8 @@ func (in *Installer) K8sRollback(ctx context.Context) (err error) {
 	if _, err := in.checkHelm(ctx); err != nil {
 		return err
 	}
-	rel, err := in.release(ctx)
-	if err != nil {
-		return err
-	}
-	if rel == nil {
-		return in.noRelease()
-	}
-	if err := in.pending(rel); err != nil {
-		return err
-	}
-	cur, err := in.installedRelease(ctx)
+	// An uninstall that kept the history is what a rollback brings back.
+	cur, err := in.k8sLatest(ctx, true)
 	if err != nil {
 		return err
 	}
@@ -1300,6 +1380,20 @@ func (in *Installer) K8sRollback(ctx context.Context) (err error) {
 // Docker's refuses a directory that holds no install: nothing changed, and the install is what
 // to run, named in the message too, as a verb without --json prints no fix.
 func (in *Installer) noRelease() error { return in.noReleaseTo("") }
+
+// uninstalledRelease refuses, as noRelease does (nothing runs), a verb on a release uninstalled
+// with its history kept — an install and an upgrade alike —, naming what works: the rollback that
+// brings it back, or, to start over, dropping its history with helm, then the install.
+func (in *Installer) uninstalledRelease() error {
+	k, cmd := in.O.K8s, in.k8sInstallCmd()
+	drop := "helm uninstall " + k.Release + " --namespace " + k.Namespace
+	if k.Context != "" {
+		drop += " --kube-context " + shellQuote(k.Context)
+	}
+	return absent("bring it back first: `"+in.k8sCtl("rollback")+"`; or, to start over, `"+drop+"` (its history dropped), then `"+cmd+"`",
+		"release %s in %s is uninstalled, its history kept: nothing runs; `%s` brings it back; to install %s afresh, `%s` drops its history, then `%s`",
+		k.Release, k.Namespace, in.k8sCtl("rollback"), in.R.Manifest.ProjectVersion, drop, cmd)
+}
 
 // noReleaseTo is noRelease for an upgrade asked for version to (empty: none): it says what this
 // installer installs, which may be another release than the one asked.
@@ -1371,17 +1465,22 @@ func (in *Installer) k8sStatusRelease(ctx context.Context) (*helmRelease, error)
 // then helm's own status.
 func (in *Installer) K8sStatus(ctx context.Context) error {
 	o, k := &in.O, in.O.K8s
-	if _, err := in.k8sStatusRelease(ctx); err != nil {
-		return err
-	}
-	cur, err := in.installedRelease(ctx)
+	st, cur, err := in.k8sReleaseStatus(ctx, false)
 	if err != nil {
 		return err
 	}
-	r := cur.Release
-	fmt.Fprintf(o.Out, "%s %s (revision %d, %s)\nregistry  %s\n", r.Name, r.Version, r.Revision, r.Channel, cur.Registry)
-	if url := in.k8sEndpoint(); url != "" {
-		fmt.Fprintf(o.Out, "endpoint  %s\n", url)
+	if st.Installed == nil {
+		fmt.Fprintf(o.Out, "release %s in %s is uninstalled, its history kept (revision %d)", k.Release, k.Namespace, st.Helm.Revision)
+		if p := st.Previous; p != nil {
+			fmt.Fprintf(o.Out, ": `%s` brings back %s %s (revision %d)", in.k8sCtl("rollback"), st.Name, p.Version, p.Revision)
+		}
+		fmt.Fprintln(o.Out)
+	} else {
+		r := cur.Release
+		fmt.Fprintf(o.Out, "%s %s (revision %d, %s)\nregistry  %s\n", r.Name, r.Version, r.Revision, r.Channel, cur.Registry)
+		if url := in.k8sEndpoint(); url != "" {
+			fmt.Fprintf(o.Out, "endpoint  %s\n", url)
+		}
 	}
 	left, err := in.k8sKitLeftovers(ctx)
 	if err != nil {
@@ -1413,6 +1512,9 @@ func (in *Installer) K8sUpgradeTo(ctx context.Context, v string, args []string) 
 	}
 	if rel == nil {
 		return in.noReleaseTo(v)
+	}
+	if rel.Status == "uninstalled" {
+		return in.uninstalledRelease()
 	}
 	if err := in.pending(rel); err != nil {
 		return err

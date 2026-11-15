@@ -1591,3 +1591,31 @@ func TestCertStatusWarnsBeforeTheEnd(t *testing.T) {
 		t.Errorf("no certificate: %+v %v", st, err)
 	}
 }
+
+// A byo install given a domain that is none is refused for it before its certificate is read: a
+// missing certificate does not hide the domain's fix.
+func TestByoChecksTheDomainBeforeTheCertificate(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	missing := filepath.Join(t.TempDir(), "none.pem")
+	bad := func(o *Options) {
+		tlsDomains(o)
+		o.Domains["app"] = "not a domain"
+		o.TLS, o.Cert, o.Key = "byo", missing, missing
+	}
+	if err := e.install(bad); err == nil || !strings.Contains(err.Error(), `: "not a domain" is not a domain name`) {
+		t.Errorf("a first install: %v", err)
+	}
+	// A re-run giving a new certificate, as a first install.
+	cert, key := writeCert(t, time.Now().Add(90*24*time.Hour), "*.example.com")
+	if err := e.install(func(o *Options) { tlsDomains(o); o.TLS, o.Cert, o.Key = "byo", cert, key }); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.install(bad); err == nil || !strings.Contains(err.Error(), `--domains app: "not a domain" is not a domain name`) || !isRefused(err) {
+		t.Errorf("a re-run: %v", err)
+	}
+	// A valid one: the certificate's error.
+	if err := e.install(func(o *Options) { tlsDomains(o); o.TLS, o.Cert, o.Key = "byo", missing, missing }); err == nil || strings.Contains(err.Error(), "is not a domain name") {
+		t.Errorf("%v", err)
+	}
+}

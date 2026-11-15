@@ -916,6 +916,26 @@ var ARPSettings = map[string]int{"arp_announce": 2, "arp_ignore": 1}
 // ARPKey is the ARP setting name's key on all.
 func ARPKey(name string) string { return "net.ipv4.conf.all." + name }
 
+// ARPRange are the values the kernel takes for each ARP setting of a net.ipv4.conf.<dev> key.
+var ARPRange = map[string][]int{"arp_announce": {0, 1, 2}, "arp_ignore": {0, 1, 2, 3, 8}}
+
+// CheckARP refuses an ARP setting's value out of its ARPRange; a name ARPRange does not hold is
+// no ARP setting and passes.
+func CheckARP(name, value string) error {
+	r, ok := ARPRange[name]
+	if !ok {
+		return nil
+	}
+	if v, err := strconv.Atoi(value); err == nil && slices.Contains(r, v) {
+		return nil
+	}
+	w := make([]string, len(r))
+	for i, v := range r {
+		w[i] = strconv.Itoa(v)
+	}
+	return fmt.Errorf("%s is %s or %s", name, strings.Join(w[:len(w)-1], ", "), w[len(w)-1])
+}
+
 // Ethtool is one of host.interfaces' NIC settings: its channels (combined queues: max or a
 // count), its rings (rx, tx: max or a count), its features by name (on or off, each set where the
 // driver lets it be changed), and its Energy-Efficient Ethernet (on or off).
@@ -1191,7 +1211,104 @@ func Parse(raw []byte) (*Spec, error) {
 	if err := dec.Decode(&s); err != nil {
 		return nil, fmt.Errorf("stowage.yaml: %w", err)
 	}
+	if err := emptyKeys(raw); err != nil {
+		return nil, err
+	}
 	return &s, nil
+}
+
+// keysNotEmpty are the keys a spec may leave out but never write with nothing under them (null or
+// {}, which decode as the key left out); each with what to write under it.
+var keysNotEmpty = []struct {
+	path []string
+	fix  string
+}{
+	{[]string{"services"}, "name a service"},
+	{[]string{"tune"}, "give its profile"},
+	{[]string{"shapes", "kairos", "size"}, "give min, recommended or both"},
+	{[]string{"shapes", "kairos", "size", "min"}, "give cpus, memory or disk"},
+	{[]string{"shapes", "kairos", "size", "recommended"}, "give cpus, memory or disk"},
+}
+
+// emptyKeys refuses a key of keysNotEmpty written with nothing under it, naming its line.
+func emptyKeys(raw []byte) error {
+	var doc yaml.Node
+	if err := yaml.Unmarshal(raw, &doc); err != nil || len(doc.Content) == 0 {
+		return nil // the strict decode has judged the document
+	}
+	for _, k := range keysNotEmpty {
+		n, line := deref(doc.Content[0]), 0
+		for _, key := range k.path {
+			n, line = mappingValue(n, key, 0)
+		}
+		if n != nil && (n.Tag == "!!null" || n.Kind == yaml.MappingNode && !hasEntries(n, 0)) {
+			return fmt.Errorf("stowage.yaml:%d: %s is written with nothing under it: %s, or remove %s", line, strings.Join(k.path, "."), k.fix, k.path[len(k.path)-1])
+		}
+	}
+	return nil
+}
+
+// maxMergeDepth bounds the merge keys (<<) followed into one another.
+const maxMergeDepth = 16
+
+// deref is the node an alias names, as decoding reads it; any other node itself.
+func deref(n *yaml.Node) *yaml.Node {
+	for i := 0; n != nil && n.Kind == yaml.AliasNode && i < maxMergeDepth; i++ {
+		n = n.Alias
+	}
+	return n
+}
+
+// merged are the mappings a mapping's merge key (<<) names, one or a list, aliases followed.
+func merged(n *yaml.Node) []*yaml.Node {
+	var out []*yaml.Node
+	for i := 0; i+1 < len(n.Content); i += 2 {
+		if n.Content[i].Value != "<<" || n.Content[i].Tag != "!!merge" && n.Content[i].Tag != "" {
+			continue
+		}
+		v := deref(n.Content[i+1])
+		if v != nil && v.Kind == yaml.SequenceNode {
+			for _, e := range v.Content {
+				out = append(out, deref(e))
+			}
+		} else {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+// mappingValue is the value of key in mapping n as decoding reads it (its own key first, then the
+// mappings it merges), aliases followed, with the line of the key; nil when n holds no such key.
+func mappingValue(n *yaml.Node, key string, depth int) (*yaml.Node, int) {
+	if n == nil || n.Kind != yaml.MappingNode || depth > maxMergeDepth {
+		return nil, 0
+	}
+	for i := 0; i+1 < len(n.Content); i += 2 {
+		if n.Content[i].Value == key && n.Content[i].Tag != "!!merge" {
+			return deref(n.Content[i+1]), n.Content[i].Line
+		}
+	}
+	for _, m := range merged(n) {
+		if v, line := mappingValue(m, key, depth+1); v != nil {
+			return v, line
+		}
+	}
+	return nil, 0
+}
+
+// hasEntries reports whether mapping n holds a key as decoding reads it: its own, or one a mapping
+// it merges holds.
+func hasEntries(n *yaml.Node, depth int) bool {
+	if n == nil || n.Kind != yaml.MappingNode || depth > maxMergeDepth {
+		return false
+	}
+	for i := 0; i+1 < len(n.Content); i += 2 {
+		if n.Content[i].Tag != "!!merge" {
+			return true
+		}
+	}
+	return slices.ContainsFunc(merged(n), func(m *yaml.Node) bool { return hasEntries(m, depth+1) })
 }
 
 // Requires reads stowage.requires alone from spec bytes, leniently, so a Stowage the project does

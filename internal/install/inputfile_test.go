@@ -698,15 +698,24 @@ func TestVMCreateCarriesAFileInput(t *testing.T) {
 	}
 }
 
-// A cloud's limit on user data refuses a file input carrying the cloud-config past it.
+// A cloud's limit on user data refuses a file input carrying the cloud-config past it, before the
+// operator is asked to go on.
 func TestVMCreateRefusesAFileInputPastTheUserDataLimit(t *testing.T) {
 	t.Parallel()
 	v := newVMCreate(t, "raw")
 	v.r.Spec.Inputs = append(v.r.Spec.Inputs, spec.Input{Key: "CA", Prompt: "CA file", Optional: true, Type: spec.InputFile})
 	big := encodeFileInput(bytes.Repeat([]byte("x"), 20<<10))
-	err := v.create(VMCreate{Platform: "aws", Hostname: "edge"}, func(o *Options) { o.Set = map[string]string{"CA": big} })
+	p := &fakePrompter{answers: map[string]string{"APP_DOMAIN": "app.example.org", "API_DOMAIN": "api.example.org", "ADMIN_EMAIL": "ops@example.org"}}
+	err := v.create(VMCreate{Platform: "aws", Hostname: "edge"}, func(o *Options) { o.Set = map[string]string{"CA": big}; o.Prompt = p })
 	if err == nil || !strings.Contains(err.Error(), "give smaller files for CA") {
 		t.Fatalf("%v", err)
+	}
+	for _, f := range p.forms {
+		for _, q := range f.Questions {
+			if q.Key == "confirm" {
+				t.Errorf("asked to go on first: %q", q.Title)
+			}
+		}
 	}
 }
 
@@ -874,5 +883,82 @@ func TestFileInputsInAnUpgradesDryRunAndRollback(t *testing.T) {
 	}
 	if got := get(e.readEnv(), "CA"); got != first {
 		t.Errorf("rolled back to %q", got)
+	}
+}
+
+// Every .env write writes the files its inputs give first: a path .env names always exists, so a
+// compose command run before the stack's start never has Docker make a directory there.
+func TestTheEnvNamesNoMissingFile(t *testing.T) {
+	e := newEnv(t)
+	e.r.Spec.Inputs = append(e.r.Spec.Inputs, spec.Input{Key: "CA", Prompt: "CA file", Optional: true, Type: spec.InputFile})
+	if err := e.install(nil); err != nil {
+		t.Fatal(err)
+	}
+	in := e.installer(nil)
+	env := e.readEnv()
+	env.Set("CA", encodeFileInput([]byte("given")))
+	in.fileVars(env)
+	if err := os.RemoveAll(filepath.Join(e.dir, InputFilesDir)); err != nil {
+		t.Fatal(err)
+	}
+	if err := in.writeEnv(env); err != nil {
+		t.Fatal(err)
+	}
+	path := get(e.readEnv(), spec.FileVar("CA"))
+	if got, err := os.ReadFile(filepath.Join(e.dir, path)); err != nil || string(got) != "given" {
+		t.Errorf("%s: %q, %v", path, got, err)
+	}
+}
+
+// A re-run that finds a required file input recorded empty names the flag that gives a file.
+func TestAReRunNamesSetFileForARequiredFileInput(t *testing.T) {
+	e := newEnv(t)
+	e.r.Spec.Inputs = append(e.r.Spec.Inputs, spec.Input{Key: "CA", Prompt: "CA file", Optional: true, Type: spec.InputFile})
+	if err := e.install(nil); err != nil {
+		t.Fatal(err)
+	}
+	ca := &e.r.Spec.Inputs[len(e.r.Spec.Inputs)-1]
+	ca.Optional, ca.Required = false, true
+	err := e.install(func(o *Options) { o.Set = map[string]string{"ADMIN_EMAIL": "other@example.org"} })
+	if err == nil || !strings.Contains(err.Error(), "CA is required (--set-file CA=PATH)") {
+		t.Errorf("%v", err)
+	}
+}
+
+// A rollback to a release another Stowage built, whose spec this one does not read, judges by the
+// record alone: a file given since for what the previous release recorded as text goes back to
+// the value it ran with, and says so.
+func TestARollbackToAnotherStowagesReleaseTakesBackItsText(t *testing.T) {
+	e := newEnv(t)
+	e.docker.dump = "DUMP"
+	e.schemaAt("5", nil, true)
+	mod := func(typ string) func(*spec.Spec) {
+		return func(s *spec.Spec) {
+			s.Inputs = append(s.Inputs, spec.Input{Key: "CA", Prompt: "CA", Optional: true, Type: typ})
+		}
+	}
+	e.r, e.self = testInstallerWith(t, "1.0.0", mod(""))
+	if err := e.install(func(o *Options) { o.Set = map[string]string{"CA": ""} }); err != nil {
+		t.Fatal(err)
+	}
+	anotherStowages(t, e)
+	e.r, e.self = testInstallerWith(t, "2.0.0", mod(spec.InputFile))
+	if err := e.upgrade(nil); err != nil {
+		t.Fatalf("%v\n%s", err, e.log)
+	}
+	if err := e.install(func(o *Options) { o.Set = map[string]string{"CA": encodeFileInput([]byte("x"))} }); err != nil {
+		t.Fatal(err)
+	}
+	if !isFileValue(get(e.readEnv(), "CA")) {
+		t.Fatalf("CA recorded as %q", get(e.readEnv(), "CA"))
+	}
+	start := func(o *Options) {
+		o.Exec = func(_ context.Context, _ string, args []string) error { return nil }
+	}
+	if err := e.rollback(start); err != nil {
+		t.Fatalf("%v\n%s", err, e.log)
+	}
+	if got := get(e.readEnv(), "CA"); got != "" || !strings.Contains(e.log.String(), "CA goes back to the value notes 1.0.0 ran with") {
+		t.Errorf("rolled back to %q\n%s", got, e.log)
 	}
 }

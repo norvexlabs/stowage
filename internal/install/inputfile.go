@@ -314,6 +314,16 @@ func (in *Installer) fileVars(env *EnvFile) {
 	}
 }
 
+// writeEnv writes env as the install's .env, the files its inputs give first (writeInputFiles):
+// every path .env names exists before a command of the stack reads it — a compose command run
+// before the first start (`exec`, `run`) never has Docker make a directory at a file's path.
+func (in *Installer) writeEnv(env *EnvFile) error {
+	if err := in.writeInputFiles(env); err != nil {
+		return err
+	}
+	return env.WriteFile(in.path(envName))
+}
+
 // writeInputFiles writes each mounted file for the start to mount; an empty value writes an
 // empty file, as the engine would make a directory of a path it does not find.
 func (in *Installer) writeInputFiles(env *EnvFile) error {

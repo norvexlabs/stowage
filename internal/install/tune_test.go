@@ -620,6 +620,11 @@ func TestTuneWithAGatewayRecord(t *testing.T) {
 	if err := os.WriteFile(appliedMark(in.forwardRecord()), chainRecord(map[string][]byte{"iptables": rules, "ip6tables": rules}), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	// The host's firewall reloaded: DOCKER-USER no longer jumps to the chain, the mark stays.
+	if applied() {
+		t.Error("applied though DOCKER-USER does not jump to the chain")
+	}
+	in.O.Host.(*gwHost).jumps[in.forwardChain()] = 1
 	if !applied() {
 		t.Error("not applied though a start applied it")
 	}
@@ -771,5 +776,203 @@ func TestTunePrintsThePickedTable(t *testing.T) {
 	}
 	if out := printed(); strings.Count(out, "# note: the install's record does not read") != 1 || !strings.Contains(out, "# observe\n") || !strings.Contains(out, "# enforce\n") {
 		t.Errorf("a record that does not read:\n%s", out)
+	}
+}
+
+// tune reports a picked table loaded from the file of another value than the one the install
+// records as differing, and the one it records as loaded.
+func TestTuneReportsAPickedTableOfAnotherValue(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	in, _, _ := gateway(t, 0)
+	in.R.Nftables = map[string][]byte{}
+	in.R.Spec.Services = map[string]spec.Service{"probe": {Nftables: spec.NftTable{Input: "POSTURE", Files: map[string]string{"a": "a.nft", "b": "b.nft"}}}}
+	in.R.NftByInput = map[string]map[string][]byte{"probe": {"a": []byte("table inet probe {\n}\n"), "b": []byte("table inet probe {\n\tset s { type ipv4_addr; }\n}\n")}}
+	if err := in.writeGateway(gatewayRecord{Digest: dirDigest(in.gatewayDir()), Dir: in.gatewayDir()}); err != nil {
+		t.Fatal(err)
+	}
+	if err := in.loadTables(ctx, func(string) string { return "a" }); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	in.O.Out, in.O.Tune = &out, fakeTune(tuneRoot(t), 0)
+	docker := &fakeDocker{loaded: map[string]string{}, compose: "2.29.1"}
+	dockerInfo(docker, `27.3.1|Ubuntu 24.04 LTS|["name=seccomp,profile=builtin"]`)
+	in.O.Docker = docker
+	report := func(v string) string {
+		env := NewEnvFile()
+		env.Set("POSTURE", v)
+		if err := env.WriteFile(in.path(envName)); err != nil {
+			t.Fatal(err)
+		}
+		out.Reset()
+		_ = in.Tune(ctx, TuneOptions{})
+		for _, l := range strings.Split(out.String(), "\n") {
+			if strings.Contains(l, "table inet probe") {
+				return l
+			}
+		}
+		return out.String()
+	}
+	if l := report("b"); !strings.Contains(l, "loaded from other rules than the release's") {
+		t.Errorf("another value: %s", l)
+	}
+	if l := report("a"); !strings.Contains(l, "loaded by each start (tune --apply)") {
+		t.Errorf("the value loaded: %s", l)
+	}
+}
+
+// A value that picks no table marks that table alone: another table, picked well, is judged.
+func TestTuneReportsAFailedPickOnItsTableAlone(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	in, _, _ := gateway(t, 0)
+	in.R.Nftables = map[string][]byte{}
+	in.R.Spec.Services = map[string]spec.Service{
+		"probe": {Nftables: spec.NftTable{Input: "POSTURE", Files: map[string]string{"a": "a.nft"}}},
+		"edge":  {Nftables: spec.NftTable{Input: "EDGE", Files: map[string]string{"x": "x.nft"}}},
+	}
+	in.R.NftByInput = map[string]map[string][]byte{"probe": {"a": []byte("table inet probe {\n}\n")}, "edge": {"x": []byte("table inet edge {\n}\n")}}
+	if err := in.writeGateway(gatewayRecord{Digest: dirDigest(in.gatewayDir()), Dir: in.gatewayDir()}); err != nil {
+		t.Fatal(err)
+	}
+	if err := in.loadTables(ctx, func(k string) string { return map[string]string{"POSTURE": "a", "EDGE": "x"}[k] }); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	in.O.Out, in.O.Tune = &out, fakeTune(tuneRoot(t), 0)
+	docker := &fakeDocker{loaded: map[string]string{}, compose: "2.29.1"}
+	dockerInfo(docker, `27.3.1|Ubuntu 24.04 LTS|["name=seccomp,profile=builtin"]`)
+	in.O.Docker = docker
+	env := NewEnvFile()
+	env.Set("POSTURE", "a")
+	env.Set("EDGE", "nope")
+	if err := env.WriteFile(in.path(envName)); err != nil {
+		t.Fatal(err)
+	}
+	_ = in.Tune(ctx, TuneOptions{})
+	lines := map[string]string{}
+	for _, l := range strings.Split(out.String(), "\n") {
+		for _, n := range []string{"probe", "edge"} {
+			if strings.Contains(l, "table inet "+n) {
+				lines[n] = l
+			}
+		}
+	}
+	if !strings.Contains(lines["probe"], "loaded by each start (tune --apply)") {
+		t.Errorf("probe: %s", lines["probe"])
+	}
+	if !strings.Contains(lines["edge"], `EDGE: "nope" picks no table of edge`) || strings.Contains(lines["edge"], "POSTURE") {
+		t.Errorf("edge: %s", lines["edge"])
+	}
+}
+
+// tune's report of a consented host's table: ok while the kernel holds it, differing once a boot
+// dropped it (the record still lists it), and still loaded once the consent is withdrawn.
+func TestTuneReportsConsentedTables(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	in, host, _ := gateway(t, 0)
+	rec := gatewayRecord{Digest: dirDigest(in.gatewayDir()), Dir: in.gatewayDir()}
+	if err := in.writeGateway(rec); err != nil {
+		t.Fatal(err)
+	}
+	if err := in.loadTables(ctx, none); err != nil {
+		t.Fatal(err)
+	}
+	if err := NewEnvFile().WriteFile(in.path(envName)); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	in.O.Out, in.O.Tune = &out, fakeTune(tuneRoot(t), 0)
+	docker := &fakeDocker{loaded: map[string]string{}, compose: "2.29.1"}
+	dockerInfo(docker, `27.3.1|Ubuntu 24.04 LTS|["name=seccomp,profile=builtin"]`)
+	in.O.Docker = docker
+	report := func() string {
+		out.Reset()
+		in.tuned = nil
+		_ = in.Tune(ctx, TuneOptions{})
+		for _, l := range strings.Split(out.String(), "\n") {
+			if strings.Contains(l, "table inet vpn") {
+				return l
+			}
+		}
+		return out.String()
+	}
+	if l := report(); !strings.Contains(l, "loaded by each start (tune --apply)") {
+		t.Errorf("loaded: %s", l)
+	}
+	host.tables = map[string]bool{} // a reboot, before the next start
+	if l := report(); !strings.Contains(l, "not loaded") || !strings.Contains(l, "loaded by the next start as root") {
+		t.Errorf("after a reboot: %s", l)
+	}
+	if err := in.loadTables(ctx, none); err != nil {
+		t.Fatal(err)
+	}
+	rec.Revoked = true
+	if err := in.writeGateway(rec); err != nil {
+		t.Fatal(err)
+	}
+	if l := report(); !strings.Contains(l, "still loaded, the consent withdrawn") {
+		t.Errorf("revoked: %s", l)
+	}
+}
+
+// tune not as root on an install whose record it cannot read: its roles' NICs are not known, said
+// so, never taken for none named.
+func TestTuneSaysARecordThatDoesNotReadLeavesTheNICsUnknown(t *testing.T) {
+	t.Parallel()
+	in, _, _ := gateway(t, 1000)
+	in.O.Interfaces = nil
+	in.O.Tune = fakeTune(tuneRoot(t), 0)
+	docker := &fakeDocker{loaded: map[string]string{}, compose: "2.29.1"}
+	dockerInfo(docker, `27.3.1|Ubuntu 24.04 LTS|[]`)
+	in.O.Docker = docker
+	if err := os.Mkdir(in.path(envName), 0o700); err != nil { // a record that does not read
+		t.Fatal(err)
+	}
+	sys, err := in.tuneSystem(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u := ti(sys, "vpn0").Unjudged; !strings.Contains(u, "the install's record does not read") || !strings.Contains(u, "(run as root)") {
+		t.Errorf("unjudged %q", u)
+	}
+	if err := os.Remove(in.path(envName)); err != nil {
+		t.Fatal(err)
+	}
+	in.tuned = nil
+	if sys, err := in.tuneSystem(context.Background()); err != nil || ti(sys, "vpn0").Unjudged != "" {
+		t.Errorf("no install yet: %q %v", ti(sys, "vpn0").Unjudged, err)
+	}
+}
+
+// tune --print on a consented host says each start loads the tables; before the consent, the
+// operator loads them.
+func TestTunePrintSaysWhoLoadsTheTables(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	in, _, _ := gateway(t, 0)
+	var out bytes.Buffer
+	in.O.Out, in.O.Tune = &out, fakeTune(tuneRoot(t), 0)
+	docker := &fakeDocker{loaded: map[string]string{}, compose: "2.29.1"}
+	dockerInfo(docker, `27.3.1|Ubuntu 24.04 LTS|[]`)
+	in.O.Docker = docker
+	printed := func() string {
+		out.Reset()
+		in.tuned = nil
+		if err := in.Tune(ctx, TuneOptions{Print: true}); err != nil {
+			t.Fatal(err)
+		}
+		return out.String()
+	}
+	if p := printed(); !strings.Contains(p, "# services.vpn.nftables (not written: load it with nft -f <file>") {
+		t.Errorf("not consented:\n%s", p)
+	}
+	if err := in.writeGateway(gatewayRecord{Digest: dirDigest(in.gatewayDir()), Dir: in.gatewayDir()}); err != nil {
+		t.Fatal(err)
+	}
+	if p := printed(); !strings.Contains(p, "# services.vpn.nftables (loaded by each start: tune --apply consented)") || strings.Contains(p, "nft -f") {
+		t.Errorf("consented:\n%s", p)
 	}
 }

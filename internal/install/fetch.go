@@ -46,8 +46,9 @@ func (e ExitCode) Error() string { return "exit status " + strconv.Itoa(int(e)) 
 // the install's channel holds a later revision of that version, it upgrades to it as UpgradeTo does,
 // so a fix shipped as a revision reaches the install. It answers false, doing nothing, when this
 // installer carries another release (Upgrade moves to it), the install never pulls (made
-// --offline), the channel holds no later revision, or it cannot be read (logged): Upgrade then
-// says the install already runs the release, as before.
+// --offline), or the channel holds no later revision (none of this version on it, yanked or
+// retired, logged): Upgrade then says the install already runs the release. A channel that cannot
+// be read (the registry unreachable, a manifest unread) is an error: the install stays as it is.
 func (in *Installer) UpgradeRevision(ctx context.Context, args []string) (bool, error) {
 	env, err := in.open()
 	if err != nil {
@@ -61,10 +62,28 @@ func (in *Installer) UpgradeRevision(ctx context.Context, args []string) (bool, 
 	if cur != m.ProjectVersion || rev != strconv.Itoa(m.Revision) || !pinnedImages(env) {
 		return false, nil
 	}
-	latest, c, prefix, _, err := in.channelRelease(ctx, env, name, cur, rev, cur)
+	// What the install trusts, read from the installer it keeps: a failure there is that
+	// installer's to tell (logged), and Upgrade says the install runs the release.
+	trust, kept, err := in.installTrust(ctx, name, cur, rev, cur)
 	if err != nil {
 		in.O.logf("no later revision of %s %s looked for: %v", name, cur, err)
 		return false, nil
+	}
+	prefix, _ := env.Get("STOWAGE_REGISTRY")
+	c, err := in.registryClient(prefix)
+	if err != nil {
+		return false, err
+	}
+	latest, err := findRelease(ctx, c, prefix, name, kept.Manifest.Channel, cur, trust, in.O.logf)
+	if _, refused := Refusal(err); refused {
+		// The channel read, and holds no revision of this version to move to (yanked, retired):
+		// Upgrade says the install runs the release.
+		in.O.logf("no later revision of %s %s looked for: %v", name, cur, err)
+		return false, nil
+	}
+	if err != nil {
+		// The registry's read alone: the install stays as it is, and the upgrade fails.
+		return false, fmt.Errorf("the channel could not be read: %w; the install stays on %s %s (revision %s)", err, name, cur, rev)
 	}
 	// findRelease kept the manifests of this version alone, as its scheme reads them.
 	if latest.Revision <= m.Revision {
@@ -305,6 +324,27 @@ func findRelease(ctx context.Context, c *registry.Client, prefix, name, channel,
 
 // findRevision is findRelease of revision rev of v; 0 is its latest revision.
 func findRevision(ctx context.Context, c *registry.Client, prefix, name, channel, v string, rev int, trust *sigverify.Verifier, logf func(string, ...any)) (*release.Manifest, error) {
+	read, err := readChannel(ctx, c, prefix, name, channel)
+	if err != nil {
+		return nil, err
+	}
+	return read.revision(ctx, c, name, channel, v, rev, trust, logf)
+}
+
+// channelRead is the release repository's tags but the channel's pointer, the reserved tags and
+// the signature tags, sorted, with each one's manifest (nil when it holds no release manifest)
+// and digest, or the error its read ended with.
+type channelRead struct {
+	repo name.Repository
+	tags []string
+	ms   []*release.Manifest
+	hs   []v1.Hash
+	errs []error
+}
+
+// readChannel reads the release manifests of name's release repository at prefix, as findRelease
+// judges them; an error is the listing's, each tag's own is in its errs.
+func readChannel(ctx context.Context, c *registry.Client, prefix, name, channel string) (*channelRead, error) {
 	repo, err := c.Repo(prefix + "/" + name + "-release")
 	if err != nil {
 		return nil, err
@@ -317,19 +357,35 @@ func findRevision(ctx context.Context, c *registry.Client, prefix, name, channel
 		return t == channel || slices.Contains(version.ReservedTags, t) || strings.HasPrefix(t, "sha256-")
 	})
 	slices.Sort(tags) // a tie between equal spellings does not depend on the registry's listing
-	ms := make([]*release.Manifest, len(tags))
-	hs := make([]v1.Hash, len(tags))
+	r := &channelRead{repo: repo, tags: tags, ms: make([]*release.Manifest, len(tags)), hs: make([]v1.Hash, len(tags)), errs: make([]error, len(tags))}
+	// The first read that fails (but on a manifest of no release this Stowage reads, which a
+	// caller may pass over) cancels the others: every caller fails on it, and it is the error
+	// returned, never a sibling's cancellation.
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(readers)
 	for i, t := range tags {
-		g.Go(func() (err error) {
-			ms[i], hs[i], err = readRelease(gctx, c, repo.String(), t)
-			return err
+		g.Go(func() error {
+			r.ms[i], r.hs[i], r.errs[i] = readRelease(gctx, c, repo.String(), t)
+			if errors.As(r.errs[i], new(foreignManifest)) {
+				return nil
+			}
+			return r.errs[i]
 		})
 	}
-	// Fail closed: a manifest that cannot be read could be V's latest revision.
 	if err := g.Wait(); err != nil {
-		return nil, err
+		return r, err
+	}
+	return r, ctx.Err()
+}
+
+// revision is findRevision's choice among the manifests read.
+func (r *channelRead) revision(ctx context.Context, c *registry.Client, name, channel, v string, rev int, trust *sigverify.Verifier, logf func(string, ...any)) (*release.Manifest, error) {
+	repo, tags, ms, hs := r.repo, r.tags, r.ms, r.hs
+	// Fail closed: a manifest that cannot be read could be V's latest revision.
+	for _, err := range r.errs {
+		if err != nil {
+			return nil, err
+		}
 	}
 	// V's candidates in order of preference: the latest revision, among equal revisions the
 	// spelling typed, else the first tag in sorted order.

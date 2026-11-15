@@ -539,10 +539,10 @@ func ProfileKeys() []string {
 // containerKeys are the settings a container's network namespace keeps of its own, most starting
 // at the kernel's defaults rather than the host's: every profile gives a container the host's
 // value, so a service runs as it would on the host, and the network profile its own value where
-// the host holds less.
+// the host holds less. The range of local ports is not one: a container keeps the kernel's, so an
+// outgoing connection never takes a port at 10000 or above a service of its namespace listens on.
 var containerKeys = []string{
 	"net.core.somaxconn",
-	"net.ipv4.ip_local_port_range",
 	"net.ipv4.tcp_max_syn_backlog",
 	"net.ipv4.tcp_mtu_probing",
 	"net.ipv4.tcp_notsent_lowat",

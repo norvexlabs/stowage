@@ -86,11 +86,14 @@ func (h *Hostd) diskPath() string {
 	return filepath.Dir(dir)
 }
 
-func (h *Hostd) disk() *Disk {
+func (h *Hostd) disk() *Disk { return h.diskAt(h.diskPath()) }
+
+// diskAt reads the space of dir's filesystem (Statfs's, when set); nil when it cannot be read.
+func (h *Hostd) diskAt(dir string) *Disk {
 	if h.Statfs != nil {
-		return h.Statfs(h.diskPath())
+		return h.Statfs(dir)
 	}
-	return diskOf(h.diskPath())
+	return diskOf(dir)
 }
 
 // pressureOf is d's use in percent as df counts it — used of used and available, the blocks
@@ -163,7 +166,9 @@ func (h *Hostd) pressureCheck(ctx context.Context, dp *spec.DiskPressure) bool {
 	d := h.disk()
 	level, used := pressureOf(d, dp)
 	if level == "" {
+		// No level: the last one's banner would stay up whatever the disk becomes.
 		h.O.logf("disk pressure: cannot read the disk of %s", h.diskPath())
+		h.pressureBanner(ctx, "")
 		return true
 	}
 	banner := ""
@@ -271,7 +276,7 @@ func (h *Hostd) pressurePost(ctx context.Context, dp *spec.DiskPressure, body Pr
 }
 
 // pressureBanner writes text as the disk banner, or removes it when text is empty; the login
-// screen is reloaded only when the banner changed.
+// screen is reloaded when the banner changed, or when the reload after its last change failed.
 func (h *Hostd) pressureBanner(ctx context.Context, text string) {
 	if h.Docker {
 		return // a Docker host's console is not the install's
@@ -279,10 +284,12 @@ func (h *Hostd) pressureBanner(ctx context.Context, text string) {
 	p := filepath.Join(cmp.Or(h.Issue, "/etc/issue.d"), "08-"+h.R.Spec.Name+"-disk.issue")
 	old, err := os.ReadFile(p)
 	switch {
-	case errors.Is(err, os.ErrNotExist) && text == "":
+	case errors.Is(err, os.ErrNotExist) && text == "" && !h.bannerOwed:
 		return // none, and none wanted
-	case err == nil && string(old) == text:
+	case err == nil && string(old) == text && !h.bannerOwed:
 		return
+	case errors.Is(err, os.ErrNotExist) && text == "", err == nil && string(old) == text:
+		// As wanted, but the login screen was not reloaded since it changed.
 	case text == "":
 		if err := os.Remove(p); err != nil {
 			h.O.logf("disk pressure: removing the banner: %v", err)
@@ -298,5 +305,5 @@ func (h *Hostd) pressureBanner(ctx context.Context, text string) {
 			return
 		}
 	}
-	h.reloadBanner(ctx)
+	h.bannerOwed = h.reloadBanner(ctx) != nil
 }

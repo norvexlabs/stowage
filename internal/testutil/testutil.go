@@ -135,6 +135,40 @@ func SetYAML(t testing.TB, root, rel string, path []string, value any) {
 	}
 }
 
+// Allowance is an audit allowances file of one entry, a fixture of an OS-bundle finding no
+// release holds: a test writes it as the full example's audit-allow.yaml and edits its lines,
+// never a live entry's, which change as upstream fixes land.
+const Allowance = `- id: GO-0000-0001
+  artifact: os
+  package: example.com/fixture
+  path: /usr/bin/fixture
+  reason: a fixture of the tests
+  expires: 2027-01-31
+`
+
+// KairosPin is shapes.kairos.<key> of root/stowage.yaml (a pinned image: base, kairos_init), for a
+// test to build its edits from the example's pin instead of quoting it.
+func KairosPin(t testing.TB, root, key string) string {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join(root, "stowage.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc struct {
+		Shapes struct {
+			Kairos map[string]any `yaml:"kairos"`
+		} `yaml:"shapes"`
+	}
+	if err := yaml.Unmarshal(b, &doc); err != nil {
+		t.Fatal(err)
+	}
+	v, ok := doc.Shapes.Kairos[key].(string)
+	if !ok || v == "" {
+		t.Fatalf("%s: no shapes.kairos.%s", root, key)
+	}
+	return v
+}
+
 // Git runs git in dir with a fixed identity and returns its output; the package's TestMain calls
 // IsolateGit. The test skips when git is not installed.
 func Git(t testing.TB, dir string, args ...string) string {

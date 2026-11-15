@@ -41,8 +41,20 @@ func (c Config) Validate() error {
 	if len(c.Cmd) == 0 || c.Cmd[0] == "" {
 		return errors.New("command provider: cmd is required")
 	}
-	if c.TimeoutS < 0 {
-		return errors.New("command provider: timeout_s must be positive")
+	if err := CheckTimeout(c.TimeoutS); err != nil {
+		return fmt.Errorf("command provider: %w", err)
+	}
+	return nil
+}
+
+// MaxTimeoutS is the longest timeout_s a command takes, here and in the runtime `command`
+// providers: an hour.
+const MaxTimeoutS = 3600
+
+// CheckTimeout refuses a timeout_s outside 1 to MaxTimeoutS; 0 (unset) is the default, 30.
+func CheckTimeout(s int) error {
+	if s < 0 || s > MaxTimeoutS {
+		return fmt.Errorf("timeout_s must be 1 to %d (unset: 30), not %d", MaxTimeoutS, s)
 	}
 	return nil
 }

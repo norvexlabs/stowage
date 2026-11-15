@@ -35,7 +35,7 @@ type gwHost struct {
 	restoreErr                            error // fails iptables-restore
 }
 
-func (h *gwHost) Run(_ context.Context, c Cmd) ([]byte, error) {
+func (h *gwHost) Run(ctx context.Context, c Cmd) ([]byte, error) {
 	h.ran = append(h.ran, c.Args)
 	a := c.Args
 	switch {
@@ -93,6 +93,9 @@ func (h *gwHost) Run(_ context.Context, c Cmd) ([]byte, error) {
 	case a[0] == "iptables" && h.noUser && (slices.Contains(a, "-I") || slices.Contains(a, "-C") || slices.Contains(a, "-L") && a[len(a)-1] == "DOCKER-USER"):
 		return nil, errors.New("No chain/target/match by that name")
 	case strings.HasPrefix(a[0], "ip") && slices.Contains(a, "-C"):
+		if err := ctx.Err(); err != nil { // as exec refuses a context that ended
+			return nil, err
+		}
 		if h.jumps[a[len(a)-1]] == 0 {
 			return nil, errors.New("Bad rule")
 		}
@@ -180,14 +183,14 @@ func TestADockerHostAppliesNothingOfTheGatewayWithoutConsent(t *testing.T) {
 			t.Errorf("no %q in %q", want, l)
 		}
 	}
-	if st := in.gatewayStatus(none); !strings.HasPrefix(st, "not in force") {
+	if st := in.gatewayStatus(context.Background(), none); !strings.HasPrefix(st, "not in force") {
 		t.Errorf("status %q", st)
 	}
 	// Nothing declared: nothing said.
 	in.R.Nftables, in.R.Spec.Host = nil, nil
 	*log = nil
-	if err := in.gatewayStart(ctx, none); err != nil || len(*log) != 0 || in.gatewayStatus(none) != "" {
-		t.Errorf("%v %q %q", err, *log, in.gatewayStatus(none))
+	if err := in.gatewayStart(ctx, none); err != nil || len(*log) != 0 || in.gatewayStatus(context.Background(), none) != "" {
+		t.Errorf("%v %q %q", err, *log, in.gatewayStatus(context.Background(), none))
 	}
 }
 
@@ -230,7 +233,7 @@ func TestAConsentedStartAppliesTheGatewayAsRootAlone(t *testing.T) {
 	if rec, _ := in.readGateway(); !maps.Equal(rec.Networkd, map[string]networkdFile{tun: {Role: "vpn0"}}) {
 		t.Errorf("record %v", rec.Networkd)
 	}
-	if st := in.gatewayStatus(none); st != "applied at each start (tune --apply): tables vpn; forwarding; 1 networkd file(s)" {
+	if st := in.gatewayStatus(context.Background(), none); st != "applied at each start (tune --apply): tables vpn; forwarding; 1 networkd file(s)" {
 		t.Errorf("status %q", st)
 	}
 	// Again: nothing changed, networkd is not reloaded.
@@ -246,7 +249,7 @@ func TestAConsentedStartAppliesTheGatewayAsRootAlone(t *testing.T) {
 	if err := in.gatewayStart(ctx, none); err == nil {
 		t.Fatal("a reload that fails")
 	}
-	if st := in.gatewayStatus(none); !strings.Contains(st, "forwarding; 1 networkd file(s) pending") {
+	if st := in.gatewayStatus(context.Background(), none); !strings.Contains(st, "forwarding; 1 networkd file(s) pending") {
 		t.Errorf("status %q", st)
 	}
 	host.reloadErr, host.ran = nil, nil
@@ -328,7 +331,7 @@ func TestTheGatewaysNetworkdFilesAreTheInstallsAlone(t *testing.T) {
 	if err := in.loadTables(ctx, none); err != nil || in.gatewayStart(ctx, none) != nil || host.did("nft") || !strings.Contains(strings.Join(*log, ""), "nothing of the stack's network declarations is applied (fix it, or remove it and `notes-stow tune --apply` again)") {
 		t.Errorf("start: %v %q %v", err, *log, host.ran)
 	}
-	if st := in.gatewayStatus(none); !strings.HasPrefix(st, "not applied: ") {
+	if st := in.gatewayStatus(context.Background(), none); !strings.HasPrefix(st, "not applied: ") {
 		t.Errorf("status %q", st)
 	}
 }
@@ -355,7 +358,8 @@ func TestTuneApplyConsentsAndRevertRemovesTheGateway(t *testing.T) {
 	}
 	tname, tcontent := in.gatewayTablesUnit()
 	if raw, err := os.ReadFile(filepath.Join(in.O.Systemd, tname)); err != nil || string(raw) != tcontent || tname != "notes-gateway-"+in.gatewayDigest()+"-tables.service" ||
-		!strings.Contains(tcontent, "ExecStart=\""+filepath.Join(in.O.Dir, "notes-stow")+"\" tables-boot --dir \""+in.O.Dir+"\"\n") || !strings.Contains(tcontent, "Before=docker.service\n") || !strings.Contains(tcontent, "After=network-online.target\n") {
+		!strings.Contains(tcontent, "ExecStart=\""+filepath.Join(in.O.Dir, "notes-stow")+"\" tables-boot --dir \""+in.O.Dir+"\"\n") || !strings.Contains(tcontent, "Before=docker.service\n") || !strings.Contains(tcontent, "After=network-online.target\n") ||
+		!strings.Contains(tcontent, "\nConditionPathExists="+filepath.Join(in.O.Dir, GatewayFile)+"\n") {
 		t.Errorf("tables unit %s: %q %v", tname, raw, err)
 	}
 	if !host.did("systemctl enable "+name+" "+tname) || !slices.Equal(started, []string{filepath.Join(in.O.Dir, "notes-stow"), "--dir", in.O.Dir, "--no-input", "--no-provision"}) {
@@ -373,7 +377,7 @@ func TestTuneApplyConsentsAndRevertRemovesTheGateway(t *testing.T) {
 	if in.gatewayConsented() || !in.gatewayRecorded() || host.tables["vpn"] || host.njumps() != 0 || fileExists(filepath.Join(in.O.Systemd, name)) || fileExists(filepath.Join(in.O.Systemd, tname)) || fileExists(in.tunFile("vpn0")) {
 		t.Errorf("left: consented %v, tables %v, jumps %d", in.gatewayConsented(), host.tables, host.njumps())
 	}
-	if st := in.gatewayStatus(none); !strings.HasPrefix(st, "revoked, but not all it applied is removed") {
+	if st := in.gatewayStatus(context.Background(), none); !strings.HasPrefix(st, "revoked, but not all it applied is removed") {
 		t.Errorf("status %q", st)
 	}
 	if !host.did("systemctl disable "+name) || !host.did("systemctl disable "+tname) {
@@ -459,7 +463,7 @@ func TestAConsentedReleaseDeclaringNothingClearsTheGateway(t *testing.T) {
 	if fileExists(in.tunFile("vpn0")) || !host.did("networkctl reload") || !host.did("iptables -w -X STOWAGE-FWD-"+dirDigest(in.O.Dir)) || fileExists(in.forwardRecord()) {
 		t.Errorf("left: ran %v", host.ran)
 	}
-	if st := in.gatewayStatus(none); !strings.HasPrefix(st, "consented (tune --apply): the release declares none") {
+	if st := in.gatewayStatus(context.Background(), none); !strings.HasPrefix(st, "consented (tune --apply): the release declares none") {
 		t.Errorf("status %q", st)
 	}
 	// Nothing left: a start not as root says nothing.
@@ -478,7 +482,7 @@ func TestTheVMsForwardingKeepsItsChain(t *testing.T) {
 	if in.forwardChain() != ForwardChain || in.forwardRecord() != "/run/notes/nftables.d/notes-forward.rules" || !in.gatewayApplies() {
 		t.Errorf("%s %s", in.forwardChain(), in.forwardRecord())
 	}
-	if in.gatewayConsented() || in.gatewayStatus(none) != "" {
+	if in.gatewayConsented() || in.gatewayStatus(context.Background(), none) != "" {
 		t.Error("the VM has no consent to give")
 	}
 }
@@ -528,7 +532,7 @@ func TestTheGatewaysRecordIsItsDirectorys(t *testing.T) {
 			t.Errorf("%s elsewhere: %v", name, err)
 		}
 	}
-	if st := copied.gatewayStatus(none); !strings.HasPrefix(st, "not applied: this install's") {
+	if st := copied.gatewayStatus(context.Background(), none); !strings.HasPrefix(st, "not applied: this install's") {
 		t.Errorf("status %q", st)
 	}
 	cwd, err := os.Getwd()
@@ -598,7 +602,7 @@ func TestTheForwardingNamesARolesNIC(t *testing.T) {
 	if err := in.forwardRoles(ctx, none); err != nil || strings.Contains(rules, "-A ") || !strings.Contains(strings.Join(*log, ""), "host.interfaces.uplink: no NIC of this host plays it (`--interface uplink=<NIC>` on a re-run names one): the forwarding through it is not applied") {
 		t.Errorf("unmapped: %v %q %q", err, rules, *log)
 	}
-	if st := in.gatewayStatus(none); !strings.HasPrefix(st, "consented (tune --apply), nothing in force: ") || !strings.Contains(st, "no forwarding through uplink (no NIC named: --interface)") {
+	if st := in.gatewayStatus(context.Background(), none); !strings.HasPrefix(st, "consented (tune --apply), nothing in force: ") || !strings.Contains(st, "no forwarding through uplink (no NIC named: --interface)") {
 		t.Errorf("status %q", st)
 	}
 	// The VM names its NICs by their roles.
@@ -647,8 +651,8 @@ func TestAMovedInstallRevertsWhereItIs(t *testing.T) {
 		t.Fatal(err)
 	}
 	in.O.Dir = moved
-	if in.gatewayConsented() || !strings.Contains(in.gatewayStatus(none), "which is gone (the directory moved)") {
-		t.Errorf("moved: %v %q", in.gatewayConsented(), in.gatewayStatus(none))
+	if in.gatewayConsented() || !strings.Contains(in.gatewayStatus(context.Background(), none), "which is gone (the directory moved)") {
+		t.Errorf("moved: %v %q", in.gatewayConsented(), in.gatewayStatus(context.Background(), none))
 	}
 	if err := in.gatewayRevert(ctx); err != nil || in.gatewayRecorded() || host.tables["vpn"] || fileExists(filepath.Join(in.O.Systemd, name)) {
 		t.Errorf("revert: %v, tables %v", err, host.tables)
@@ -830,7 +834,7 @@ func TestAConsentedDockerHostEnforcesTheL4Allowlists(t *testing.T) {
 	if err := in.gatewayStart(ctx, get); err != nil {
 		t.Fatal(err)
 	}
-	if in.allowHolds(get) {
+	if in.allowHolds(context.Background(), get) {
 		t.Error("held before the stack is up")
 	}
 	if err := in.markAllowHeld(); err != nil {
@@ -845,12 +849,51 @@ func TestAConsentedDockerHostEnforcesTheL4Allowlists(t *testing.T) {
 	if !slices.Equal(host.stdin, []string{v4}) || !host.did("iptables -w -I DOCKER-USER -j "+chain) || host.did("ip6tables -w -I DOCKER-USER -j "+chain) || !host.did("iptables -w -C FORWARD -j DOCKER-USER") {
 		t.Errorf("rules %q, ran %v", host.stdin, host.ran)
 	}
-	if st := in.gatewayStatus(get); st != "applied at each start (tune --apply): source allowlists of db" {
+	if st := in.gatewayStatus(context.Background(), get); st != "applied at each start (tune --apply): source allowlists of db" {
 		t.Errorf("status %q", st)
 	}
+	// The held mark alone says the lists hold: the allow chain keeps no applied mark.
+	if fileExists(appliedMark(in.allowRecord())) {
+		t.Error("the allow chain has an applied mark")
+	}
+	// A host firewall's reload flushed DOCKER-USER: the marks stay, the list holds no more.
+	jumps := maps.Clone(host.jumps)
+	clear(host.jumps)
+	if st := in.gatewayStatus(context.Background(), get); in.allowHolds(context.Background(), get) || !strings.Contains(st, "source allowlists of db not applied (DOCKER-USER no longer jumps to it: the host's firewall reloaded; the next start as root applies it again)") {
+		t.Errorf("a flushed jump: %q", st)
+	}
+	maps.Copy(host.jumps, jumps)
+	// The jump is read with a bounded wait for the xtables lock, under the caller's context, and
+	// once for all the L4 lines of a status.
+	checks := func() (n int) {
+		for _, r := range host.ran {
+			if strings.Join(r, " ") == "iptables -w 5 -C DOCKER-USER -j "+chain {
+				n++
+			}
+		}
+		return n
+	}
+	gone, cancel := context.WithCancel(ctx)
+	cancel()
+	if n := checks(); in.allowHolds(gone, get) || checks() != n+1 {
+		t.Errorf("a context ended: held, or %d checks", checks()-n)
+	}
+	facts := in.l4FactsOf(ctx, get)
+	n := checks()
+	first, second := facts.allowHolds(), facts.allowHolds() // two status lines, one check
+	if !first || !second || checks() != n+1 {
+		t.Errorf("%d checks for two lines", checks()-n)
+	}
+	clear(host.jumps)
+	in.O.Euid = func() int { return 1000 } // iptables does not read: the marks are taken
+	if !in.allowHolds(context.Background(), get) {
+		t.Error("not as root: the marks are not taken")
+	}
+	in.O.Euid = func() int { return 0 }
+	maps.Copy(host.jumps, jumps)
 	// Values changed by no start as root (one not as root applies nothing): no longer held.
-	if changed := func(k string) string { return map[string]string{"DB_SOURCES": "192.0.2.0/24"}[k] }; in.allowHolds(changed) || !strings.Contains(in.gatewayStatus(changed), "source allowlists of db not held") {
-		t.Errorf("held for other values: %q", in.gatewayStatus(changed))
+	if changed := func(k string) string { return map[string]string{"DB_SOURCES": "192.0.2.0/24"}[k] }; in.allowHolds(context.Background(), changed) || !strings.Contains(in.gatewayStatus(context.Background(), changed), "source allowlists of db not held") {
+		t.Errorf("held for other values: %q", in.gatewayStatus(context.Background(), changed))
 	}
 	// Replaced at each start: a chain flushed meanwhile holds again.
 	host.stdin = nil
@@ -863,7 +906,7 @@ func TestAConsentedDockerHostEnforcesTheL4Allowlists(t *testing.T) {
 	}
 	// A recorded list that does not read: every source dropped, the start failed, no record.
 	values["DB_SOURCES"], host.stdin = "10.0.0.0/8 -j ACCEPT", nil
-	if err := in.gatewayStart(ctx, get); err == nil || !strings.Contains(err.Error(), "l4 route db: DB_SOURCES") || !slices.Equal(host.stdin, []string{rules(match + " -j DROP")}) || fileExists(in.allowHeld()) || !strings.Contains(in.gatewayStatus(get), "source allowlists of db not held") {
+	if err := in.gatewayStart(ctx, get); err == nil || !strings.Contains(err.Error(), "l4 route db: DB_SOURCES") || !slices.Equal(host.stdin, []string{rules(match + " -j DROP")}) || fileExists(in.allowHeld()) || !strings.Contains(in.gatewayStatus(context.Background(), get), "source allowlists of db not held") {
 		t.Errorf("a list that does not read: %v, rules %q", err, host.stdin)
 	}
 	// An engine that sends nothing through DOCKER-USER holds no list: refused.
@@ -1030,11 +1073,11 @@ func TestStatusSaysWhetherTheForwardingIsApplied(t *testing.T) {
 	if err := in.gatewayStart(ctx, none); err != nil {
 		t.Fatal(err)
 	}
-	if st := in.gatewayStatus(none); !strings.Contains(st, "forwarding;") || strings.Contains(st, "not applied") {
+	if st := in.gatewayStatus(context.Background(), none); !strings.Contains(st, "forwarding;") || strings.Contains(st, "not applied") {
 		t.Errorf("applied: %q", st)
 	}
 	in.O.Interfaces = map[string]string{"uplink": "eth1"} // another NIC named, no start as root since
-	if st := in.gatewayStatus(none); !strings.Contains(st, "forwarding not applied (no start as root applied it since this release or these devices") {
+	if st := in.gatewayStatus(context.Background(), none); !strings.Contains(st, "forwarding not applied (no start as root applied it since this release or these devices") {
 		t.Errorf("another NIC: %q", st)
 	}
 }
@@ -1102,7 +1145,7 @@ func TestAStartWithoutDockerUserFails(t *testing.T) {
 		t.Fatal(err)
 	}
 	host.noUser = true
-	if err := in.gatewayStart(ctx, none); err == nil || !strings.Contains(err.Error(), "the forwarding between the host's interfaces (iptables's DOCKER-USER)") || host.did("iptables -w -N") || in.forwardApplied(none) {
+	if err := in.gatewayStart(ctx, none); err == nil || !strings.Contains(err.Error(), "the forwarding between the host's interfaces (iptables's DOCKER-USER)") || host.did("iptables -w -N") || in.forwardApplied(context.Background(), none) {
 		t.Errorf("%v, ran %v", err, host.ran)
 	}
 }
@@ -1128,10 +1171,10 @@ func TestAnEngineWithoutDockerUserHoldsNoChain(t *testing.T) {
 			t.Errorf("no %q in %v", want, err)
 		}
 	}
-	if in.forwardApplied(none) || in.allowHolds(none) || len(host.stdin) != 0 {
+	if in.forwardApplied(context.Background(), none) || in.allowHolds(context.Background(), none) || len(host.stdin) != 0 {
 		t.Errorf("applied: rules %q", host.stdin)
 	}
-	if st := in.gatewayStatus(none); !strings.HasPrefix(st, "consented (tune --apply), nothing in force: forwarding not applied") || !strings.Contains(st, "source allowlists of db not held") {
+	if st := in.gatewayStatus(context.Background(), none); !strings.HasPrefix(st, "consented (tune --apply), nothing in force: forwarding not applied") || !strings.Contains(st, "source allowlists of db not held") {
 		t.Errorf("status %q", st)
 	}
 }
@@ -1146,12 +1189,12 @@ func TestAnEarlierForwardingMarkGoesWithTheEngine(t *testing.T) {
 	if err := in.writeGateway(gatewayRecord{Digest: dirDigest(in.gatewayDir()), Dir: in.gatewayDir()}); err != nil {
 		t.Fatal(err)
 	}
-	if err := in.gatewayStart(ctx, none); err != nil || !in.forwardApplied(none) {
-		t.Fatalf("%v, applied %v", err, in.forwardApplied(none))
+	if err := in.gatewayStart(ctx, none); err != nil || !in.forwardApplied(context.Background(), none) {
+		t.Fatalf("%v, applied %v", err, in.forwardApplied(context.Background(), none))
 	}
 	host.noForward = true
-	if err := in.gatewayStart(ctx, none); err == nil || in.forwardApplied(none) {
-		t.Errorf("%v, applied %v", err, in.forwardApplied(none))
+	if err := in.gatewayStart(ctx, none); err == nil || in.forwardApplied(context.Background(), none) {
+		t.Errorf("%v, applied %v", err, in.forwardApplied(context.Background(), none))
 	}
 }
 
@@ -1179,7 +1222,7 @@ func TestAConsentedStartPublishesAndHoldsTheList(t *testing.T) {
 	}
 	// A stack that does not come up holds no list: its old publication may still run.
 	e.docker.upErr = errors.New("unhealthy")
-	if err := e.install(opts); err == nil || fileExists(in.allowHeld()) || !strings.Contains(in.gatewayStatus(func(k string) string { return map[string]string{"SRC": "10.0.0.0/8"}[k] }), "source allowlists of data not held") {
+	if err := e.install(opts); err == nil || fileExists(in.allowHeld()) || !strings.Contains(in.gatewayStatus(context.Background(), func(k string) string { return map[string]string{"SRC": "10.0.0.0/8"}[k] }), "source allowlists of data not held") {
 		t.Errorf("up failed: %v, held %v", err, fileExists(in.allowHeld()))
 	}
 	e.docker.upErr = nil
@@ -1205,7 +1248,7 @@ func TestPendingNetworkdFilesAreNotInForce(t *testing.T) {
 	if err := in.writeGateway(gatewayRecord{Digest: dirDigest(in.gatewayDir()), Dir: in.gatewayDir(), Networkd: map[string]networkdFile{file: {Role: "vpn0", Pending: true}}}); err != nil {
 		t.Fatal(err)
 	}
-	if st := in.gatewayStatus(none); !strings.HasPrefix(st, "consented (tune --apply), nothing in force: 1 networkd file(s) pending") {
+	if st := in.gatewayStatus(context.Background(), none); !strings.HasPrefix(st, "consented (tune --apply), nothing in force: 1 networkd file(s) pending") {
 		t.Errorf("status %q", st)
 	}
 }
@@ -1461,5 +1504,160 @@ func TestK8sStatusBesideAForeignSecretFilesSecret(t *testing.T) {
 	}
 	if err := e.installer(nil).K8sStatusJSON(context.Background()); err != nil || !strings.Contains(e.out.String(), `"ADMIN_EMAIL"`) {
 		t.Errorf("%v\n%s", err, e.out)
+	}
+}
+
+// A consent whose record cannot be written after the units were enabled: with no record before,
+// the units it wrote go again; with one, the units stay for it and the record is as it was.
+func TestAConsentWhoseRecordFailsLeavesTheUnitsAsTheyWere(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	for _, recorded := range []bool{false, true} {
+		in, host, _ := gateway(t, 0)
+		if err := NewEnvFile().WriteFile(in.path(envName)); err != nil {
+			t.Fatal(err)
+		}
+		var was []byte
+		if recorded {
+			if err := in.writeGateway(gatewayRecord{Digest: dirDigest(in.gatewayDir()), Dir: in.gatewayDir(), Revoked: true}); err != nil {
+				t.Fatal(err)
+			}
+			was, _ = os.ReadFile(in.path(GatewayFile))
+		}
+		// The record's path turns into a directory once the units are enabled: its write fails.
+		rec, kept := in.path(GatewayFile), in.path(GatewayFile)+".kept"
+		in.O.Host = hostFunc(func(c Cmd) ([]byte, error) {
+			if slices.Equal(c.Args[:2], []string{"systemctl", "enable"}) {
+				if recorded {
+					if err := os.Rename(rec, kept); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if err := os.MkdirAll(filepath.Join(rec, "x"), 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			return host.Run(ctx, c)
+		})
+		if err := in.consent(ctx); err == nil {
+			t.Fatalf("recorded %v: the record's write did not fail", recorded)
+		}
+		if err := os.RemoveAll(rec); err != nil {
+			t.Fatal(err)
+		}
+		unit, _ := in.gatewayUnit()
+		_, err := os.Stat(filepath.Join(in.O.systemd(), unit))
+		if recorded {
+			if err != nil {
+				t.Errorf("recorded: the units went: %v", err)
+			}
+			if err := os.Rename(kept, rec); err != nil {
+				t.Fatal(err)
+			}
+			if now, _ := os.ReadFile(rec); string(now) != string(was) {
+				t.Errorf("recorded: the record changed: %s", now)
+			}
+		} else if err == nil {
+			t.Error("not recorded: the unit written stays")
+		}
+	}
+}
+
+// One consent per project on a host: a second install of it is refused while the first's boot unit
+// stands; another project's install whose allowlists hold a port this one's allowlisted route
+// publishes is refused too; another port is not.
+func TestAConsentBesideAnotherInstallsIsRefused(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	first, _, _ := gateway(t, 0)
+	second, _, _ := gateway(t, 0)
+	second.O.Systemd, second.O.GatewayRun = first.O.Systemd, first.O.GatewayRun
+	for _, in := range []*Installer{first, second} {
+		if err := NewEnvFile().WriteFile(in.path(envName)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := first.consent(ctx); err != nil {
+		t.Fatal(err)
+	}
+	unit, _ := first.gatewayUnit()
+	if err := second.consent(ctx); !isRefused(err) || !strings.Contains(err.Error(), "another install of notes on this host holds the consent (its boot unit "+unit+")") || second.gatewayRecorded() ||
+		!strings.Contains(refusedFix(err), "that directory gone, `sudo systemctl disable "+unit+" ") || !strings.Contains(refusedFix(err), "sudo rm -f "+filepath.Join(first.O.systemd(), unit)+" ") {
+		t.Fatalf("a second install of the project: %v (%s)", err, refusedFix(err))
+	}
+	// Re-run, the first's own consent stands.
+	if err := first.consent(ctx); err != nil {
+		t.Fatalf("the same install again: %v", err)
+	}
+	// Another project, its allowlist record holding tcp 5432.
+	second.R.Spec.Name = "atlas"
+	second.R.Nftables, second.R.Spec.Host = nil, nil
+	second.R.Spec.Inputs = append(second.R.Spec.Inputs, spec.Input{Key: "SRC"})
+	other := filepath.Join(first.O.gatewayRun(), "notes-gateway-"+dirDigest(first.gatewayDir())+"-allow.rules")
+	held := "*filter\n:STOWAGE-ALW-x - [0:0]\n-A STOWAGE-ALW-x -p tcp -m conntrack --ctstate DNAT --ctdir ORIGINAL --ctorigdstport 5432 -j DROP\nCOMMIT\n"
+	if err := os.WriteFile(other, []byte(held), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for port, shared := range map[int]bool{5432: true, 5433: false} {
+		second.R.Spec.L4.Routes = []spec.L4Route{{Name: "db", Protocol: "tcp", Port: port, Upstream: "postgres:5432", AllowInput: "SRC"}}
+		err := second.consent(ctx)
+		if shared != (isRefused(err) && strings.Contains(err.Error(), "l4 route db: port 5432/tcp is also held by the install whose allowlists "+other+" records")) || !shared && err != nil {
+			t.Errorf("port %d: %v", port, err)
+		}
+	}
+	// Bound to an address: another address shares nothing; the same one, or none, does.
+	second.R.Spec.Inputs = append(second.R.Spec.Inputs, spec.Input{Key: "BIND"})
+	if err := os.WriteFile(other, []byte(strings.Replace(held, "--ctorigdstport 5432", "--ctorigdstport 5432 --ctorigdst 192.0.2.5", 1)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	second.R.Spec.L4.Routes = []spec.L4Route{{Name: "db", Protocol: "tcp", Port: 5432, Upstream: "postgres:5432", AllowInput: "SRC", BindInput: "BIND"}}
+	for bind, shared := range map[string]bool{"192.0.2.6": false, "192.0.2.5": true, "": true, "0.0.0.0": true} {
+		env := NewEnvFile()
+		env.Set("BIND", bind)
+		if err := env.WriteFile(second.path(envName)); err != nil {
+			t.Fatal(err)
+		}
+		get := func(k string) string { v, _ := env.Get(k); return v }
+		if err := second.sharedPorts(second.allowRecord(), get); shared != isRefused(err) {
+			t.Errorf("bound to %q: %v", bind, err)
+		}
+		// A start writing the allowlists checks it too; a boot leaves it to the start.
+		if err := second.allowSources(ctx, get, false); shared != isRefused(err) {
+			t.Errorf("a start bound to %q: %v", bind, err)
+		}
+	}
+}
+
+// Two bind addresses overlap when either is none, either is its family's unspecified address, or
+// they are equal.
+func TestBindsOverlap(t *testing.T) {
+	t.Parallel()
+	for _, c := range []struct {
+		a, b string
+		want bool
+	}{
+		{"", "192.0.2.5", true}, {"192.0.2.5", "", true}, {"192.0.2.5", "192.0.2.5", true}, {"192.0.2.5", "192.0.2.6", false},
+		{"0.0.0.0", "192.0.2.5", true}, {"192.0.2.5", "0.0.0.0", true}, {"::", "2001:db8::1", true}, {"::", "192.0.2.5", false},
+		{"0.0.0.0", "2001:db8::1", false}, {"::ffff:192.0.2.5", "192.0.2.5", true},
+	} {
+		if got := bindsOverlap(c.a, c.b); got != c.want {
+			t.Errorf("%q %q: %v", c.a, c.b, got)
+		}
+	}
+}
+
+// The tables' unit runs only while the install keeps its gateway record, whatever its directory's
+// name, and its failure is the unit's to show (no `-` on its ExecStart).
+func TestTheTablesUnitIsInertWithoutTheRecord(t *testing.T) {
+	t.Parallel()
+	in, _, _ := gateway(t, 0)
+	in.O.Dir = filepath.Join(in.O.Dir, "my 100% stack")
+	if err := os.Mkdir(in.O.Dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_, content := in.gatewayTablesUnit()
+	cond := "\nConditionPathExists=" + strings.ReplaceAll(filepath.Join(in.gatewayDir(), GatewayFile), "%", "%%") + "\n"
+	if !strings.Contains(content, cond) || !strings.Contains(content, "\nExecStart=\"") {
+		t.Errorf("unit %q", content)
 	}
 }

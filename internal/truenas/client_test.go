@@ -143,7 +143,7 @@ func newFake(t *testing.T) (*fake, *httptest.Server) {
 					Params []any  `json:"params"`
 				}
 				_ = json.Unmarshal(b, &d)
-				if d.Method != "filesystem.put" || d.Params[1].(map[string]any)["mode"].(float64) != 0o644 {
+				if d.Method != "filesystem.put" || d.Params[1].(map[string]any)["mode"].(float64) != 0o600 {
 					http.Error(w, "bad data", http.StatusBadRequest)
 					return
 				}

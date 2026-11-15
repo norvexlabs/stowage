@@ -66,10 +66,14 @@ func (k K8sOptions) provisionName() string { return k.Release + "-stowage-provis
 
 // kubectlWhere is what a printed kubectl command needs to reach the release.
 func (k K8sOptions) kubectlWhere() string {
-	if k.Context != "" {
-		return "--namespace " + shellQuote(k.Namespace) + " --context " + shellQuote(k.Context)
+	var out []string
+	for i, a := range k.kubectlTarget() {
+		if i%2 == 1 {
+			a = shellQuote(a)
+		}
+		out = append(out, a)
 	}
-	return "--namespace " + shellQuote(k.Namespace)
+	return strings.Join(out, " ")
 }
 
 // hookImageOf is the release's installer image (readInstallerImage), which a Job runs for use
@@ -231,17 +235,7 @@ func (in *Installer) K8sProvision(ctx context.Context) error {
 	if _, err := k.Kubectl.Run(ctx, Cmd{Args: []string{"version", "--client"}}); err != nil {
 		return fmt.Errorf("kubectl is required: %w", err)
 	}
-	rel, err := in.release(ctx)
-	if err != nil {
-		return err
-	}
-	if rel == nil {
-		return in.noRelease()
-	}
-	if err := in.pending(rel); err != nil {
-		return err
-	}
-	cur, err := in.installedRelease(ctx)
+	cur, err := in.k8sCurrent(ctx)
 	if err != nil {
 		return err
 	}
@@ -394,7 +388,7 @@ func (in *Installer) k8sRunHook(ctx context.Context, p *k8sHookPlan, set map[str
 	// Removed whatever happened, an interrupted run included: its pod stops the hook with it.
 	dctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 90*time.Second) // kubectl's own --timeout 60s, and more
 	if err := in.deleteHookJob(dctx); err != nil {
-		runErr = errors.Join(runErr, fmt.Errorf("the Job %s could not be deleted: `kubectl delete job %s --namespace %s` (%w)", k.hookJob(), k.hookJob(), k.Namespace, err))
+		runErr = errors.Join(runErr, fmt.Errorf("the Job %s could not be deleted: `kubectl delete job %s %s` (%w)", k.hookJob(), k.hookJob(), k.kubectlWhere(), err))
 	}
 	cancel()
 	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
@@ -616,7 +610,7 @@ func (in *Installer) clearHookJob(ctx context.Context) error {
 		return fmt.Errorf("job %s in %s was not created by %s for release %s: it is not deleted, and the provision hook needs its name", k.hookJob(), k.Namespace, in.R.Ctl(), k.Release)
 	}
 	if done, _ := j.finished(); done == "" {
-		return fmt.Errorf("the provision Job %s in %s still runs (another run of the hook?): wait for it, or `kubectl delete job %s --namespace %s`, then run again", k.hookJob(), k.Namespace, k.hookJob(), k.Namespace)
+		return fmt.Errorf("the provision Job %s in %s still runs (another run of the hook?): wait for it, or `kubectl delete job %s %s`, then run again", k.hookJob(), k.Namespace, k.hookJob(), k.kubectlWhere())
 	}
 	in.O.logf("deleting the provision Job %s an earlier run left", k.hookJob())
 	return in.deleteHookJob(ctx)
@@ -714,7 +708,7 @@ func (in *Installer) hookJobState(ctx context.Context) (pod *k8sJob, j k8sJob, w
 		}
 	}
 	if pod == nil {
-		return nil, j, "no pod was created (`kubectl describe job " + k.hookJob() + " --namespace " + k.Namespace + "` says why)", nil
+		return nil, j, "no pod was created (`kubectl describe job " + k.hookJob() + " " + k.kubectlWhere() + "` says why)", nil
 	}
 	for _, c := range pod.Status.Conditions {
 		if c.Type == "PodScheduled" && c.Status == "False" && c.Reason == "Unschedulable" {

@@ -141,4 +141,10 @@ func TestValidate(t *testing.T) {
 	if err := (Config{Cmd: []string{"x"}, TimeoutS: -1}).Validate(); err == nil {
 		t.Error("negative timeout accepted")
 	}
+	if err := (Config{Cmd: []string{"x"}, TimeoutS: MaxTimeoutS}).Validate(); err != nil {
+		t.Errorf("a timeout at the bound: %v", err)
+	}
+	if err := (Config{Cmd: []string{"x"}, TimeoutS: MaxTimeoutS + 1}).Validate(); err == nil || !strings.Contains(err.Error(), "timeout_s must be 1 to 3600") {
+		t.Errorf("a timeout past the bound: %v", err)
+	}
 }

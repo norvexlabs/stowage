@@ -180,20 +180,11 @@ func Build(p *project.Project, r Release) (*Graph, error) {
 		imageIDs = append(imageIDs, n.ID)
 		imageDigests.Field(n.ID, n.Inputs)
 	}
-	var stowageImages []Node
-	if s.HasFront() {
-		stowageImages = append(stowageImages, frontNode())
-	}
-	if providers.RunsBackups(s) {
-		stowageImages = append(stowageImages, backupNode())
-	}
-	if providers.OwnsVolumes(s) {
-		stowageImages = append(stowageImages, chownNode())
-	}
-	if s.Signs() {
-		stowageImages = append(stowageImages, auditNode())
-	}
-	for _, n := range stowageImages {
+	for _, im := range stowageImages {
+		if !im.carried(s) {
+			continue
+		}
+		n := im.node()
 		g.Nodes = append(g.Nodes, n)
 		imageIDs = append(imageIDs, n.ID)
 		imageDigests.Field(n.ID, n.Inputs)
@@ -317,6 +308,35 @@ func Build(p *project.Project, r Release) (*Graph, error) {
 	sort.Strings(deps)
 	g.Nodes = append(g.Nodes, Node{ID: KindRelease, Kind: KindRelease, Deps: deps, Inputs: all.Sum(), Fields: all.Fields()})
 	return g, nil
+}
+
+// stowageImages are the images Stowage builds from its own recipes, in the graph's order, each
+// with the rule saying whether a release of a spec carries it and the node it makes: the front for
+// a project with one, the backup runner for a VM running backups, the volume-owner helper for
+// installs giving data volumes a uid, the scanner for a signing release. Build and StowageImages
+// both read it.
+var stowageImages = []struct {
+	key     string
+	carried func(*spec.Spec) bool
+	node    func() Node
+}{
+	{front.Key, (*spec.Spec).HasFront, frontNode},
+	{backup.Key, providers.RunsBackups, backupNode},
+	{chown.Key, providers.OwnsVolumes, chownNode},
+	{sbom.Key, (*spec.Spec).Signs, auditNode},
+}
+
+// StowageImages names, in the graph's order, the images Stowage builds from its own recipes that a
+// release of s carries (stowageImages): Build makes their nodes, and lint accepts an allowance for
+// these alone.
+func StowageImages(s *spec.Spec) []string {
+	var keys []string
+	for _, im := range stowageImages {
+		if im.carried(s) {
+			keys = append(keys, im.key)
+		}
+	}
+	return keys
 }
 
 // frontNode is the front: its inputs are the recipe and the platform; it reads no project file.

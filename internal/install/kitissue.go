@@ -157,21 +157,13 @@ func (in *Installer) kitContainer(ctx, runCtx context.Context, env *EnvFile, ste
 	for _, k := range sortedKeys(vars) {
 		environ = append(environ, k+"="+vars[k])
 	}
-	_, runErr := in.O.Docker.Run(runCtx, Cmd{
+	_, runErr := in.runNamed(runCtx, name, Cmd{
 		Args:   append(in.composeBase(KitCompose), "run", "--rm", "--no-deps", "-T", "--name", name, KitService),
 		Env:    environ,
 		Stream: in.O.Log,
 		Stdout: stdout,
 	})
-	runErr = hookRanAs(runErr, user)
-	if runCtx.Err() != nil || stopped() {
-		rmCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
-		defer cancel()
-		if _, err := in.O.Docker.Run(rmCtx, Cmd{Args: []string{"rm", "--force", name}}); err != nil {
-			runErr = errors.Join(runErr, fmt.Errorf("the container may still be running: `docker rm --force %s` (%w)", name, err))
-		}
-	}
-	return runErr
+	return hookRanAs(runErr, user)
 }
 
 // IssueKit runs the handoff's step on this install's running stack and seals what it gave.

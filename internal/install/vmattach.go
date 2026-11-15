@@ -376,11 +376,17 @@ func (in *Installer) AttachVM(ctx context.Context, a *VMAttach) error {
 	attach := cmp.Or(i.Attach, nics[0].Attach)
 	j := slices.IndexFunc(nics, func(n moduleNIC) bool { return n.Role == role })
 	fresh := j < 0
+	// rebridged: the variables record the NIC on another bridge, which the plan below allows only
+	// while the state lacks its device (an apply that failed on a wrong bridge): then it is added
+	// on the bridge given; a device the state holds is refused.
+	var rebridged error
 	switch {
 	case j >= 0 && given("mac") && nics[j].MAC != i.MAC:
 		return fmt.Errorf("--interface %s: the VM's state attaches %s with the MAC %s already", a.Interface, role, nics[j].MAC)
 	case j >= 0 && given("attach") && bridge(nics[j].Attach) != bridge(attach):
-		return fmt.Errorf("--interface %s: the VM's state attaches %s to %s already", a.Interface, role, bridge(nics[j].Attach))
+		rebridged = fmt.Errorf("--interface %s: the VM's state attaches %s to %s already", a.Interface, role, bridge(nics[j].Attach))
+		nics[j].Attach = attach
+		i.MAC = nics[j].MAC
 	case j >= 0:
 		i.MAC = nics[j].MAC
 	default:
@@ -441,7 +447,12 @@ func (in *Installer) AttachVM(ctx context.Context, a *VMAttach) error {
 	}
 	finish := fmt.Sprintf("power the VM off on TrueNAS, then `%s=%s tofu -chdir=%s apply` (with the TrueNAS API's variables) finishes it, and `%s` again checks it", CtlVar, shellQuote(a.Ctl), shellQuote(dir), again)
 	cycles, err := in.attachPlan(ctx, dir, a.Ctl, nicsJSON, fmt.Sprintf("truenas_vm_device.nic[%q]", strconv.Itoa(j)), finish)
-	if err != nil {
+	switch {
+	case rebridged != nil && err != nil:
+		return fmt.Errorf("%w (%v)", rebridged, err)
+	case rebridged != nil && !cycles:
+		return rebridged
+	case err != nil:
 		return err
 	}
 	if fresh && !cycles {

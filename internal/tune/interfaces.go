@@ -33,6 +33,9 @@ type Interface struct {
 	// Devices are the devices of the roles it names (its own, its Forward's) where a role is not
 	// its interface's name (a Docker host, a node); nil where it is (a host Stowage owns).
 	Devices map[string]string
+	// Unjudged is why the devices of its roles are not known (the install's record does not read
+	// as this user): its forwarding and interception are then not judged.
+	Unjudged string
 }
 
 // dev is role's device in a rule: its own name where roles are names (its own device for the
@@ -131,6 +134,10 @@ func (s System) inspectInterfaces(ctx context.Context) []Item {
 			if i.Applied && len(i.Forward) > 0 {
 				fw = slices.DeleteFunc(fw, func(r string) bool { return strings.HasPrefix(r, "ip") })
 				items = append(items, Item{OK, "interface", i.Role, "its forwarding out of " + strings.Join(i.Forward, ", ") + " applied by each start (tune --apply)", "applied"})
+			}
+			if len(fw) > 0 && i.Unjudged != "" {
+				items = append(items, Item{NA, "interface", i.Role, "its forwarding or interception not judged: " + i.Unjudged, strings.Join(fw, "; ")})
+				continue
 			}
 			if len(fw) > 0 {
 				items = append(items, Item{Advice, "interface", i.Role, "the project forwards or intercepts traffic on " + i.Role + ", which this host's firewall drops:", strings.Join(fw, "; ")})

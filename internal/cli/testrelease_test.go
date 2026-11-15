@@ -7,6 +7,7 @@ import (
 	"encoding/pem"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -210,6 +211,13 @@ func TestTestReleaseKeyIsItsPublicKeysPair(t *testing.T) {
 	test := []string{"-C", root, "--test-registry", host + "/test/notes", "--test-push", "publisher:NOTES_PUSH_TOKEN",
 		"--test-key", "env://RUN_KEY", "--test-public-key", "keys/test.pub", "ship"}
 	t.Setenv("FAKE_PUB", filepath.Join(root, "keys/release.pub"))
+	// Every command that writes is refused before it reads or writes the registry.
+	for _, cmd := range [][]string{{"yank", "1.0.0", "--reason", "x"}, {"prune", "--channel", "beta", "1.0.0"}, {"promote", "1.0.0", "--from", "beta", "--to", "stable"}} {
+		args := append(slices.Clone(test[:len(test)-1]), cmd...)
+		if _, _, err := run(t, b, env, args...); err == nil || !strings.Contains(err.Error(), "--test-key env://RUN_KEY is not the key of --test-public-key keys/test.pub: not signed") {
+			t.Errorf("%s with the project's key: %v", cmd[0], err)
+		}
+	}
 	if _, _, err := run(t, b, env, test...); err == nil || !strings.Contains(err.Error(), "--test-key env://RUN_KEY is not the key of --test-public-key keys/test.pub: not signed") || b.n != 0 {
 		t.Fatalf("the project's key: %v (%d builds)", err, b.n)
 	}

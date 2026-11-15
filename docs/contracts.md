@@ -110,7 +110,11 @@ These are what `lint` checks; each finding names the key path or `file:line` to 
     `domainInput` holds, which the chart reads as any input; never its `targetPort` published in
     the clear), and the chart publishes each route as it
     chooses (a `NodePort` or `LoadBalancer` Service to the pods of `service`, as
-    [examples/full](../examples/full/deploy/chart/templates/echo.yaml) does);
+    [examples/full](../examples/full/deploy/chart/templates/echo.yaml) does). A route's
+    `allow_input` is not in `stowage.l4` and nothing enforces it on Kubernetes (lint requires its
+    input asked on the `docker` and `kairos` shapes alone: the cluster's firewall, a
+    `NetworkPolicy` or the load balancer's source ranges, is the chart's); `tls.clientAuth` is,
+    and requiring the client certificate is the chart's as terminating the TLS is;
   - the templates run the release's images by digest:
     `{{ printf "%s/%s@%s" .Values.stowage.registry $img.repository $img.digest }}` with
     `$img := index .Values.stowage.images "<key>"`. `lint` warns when no template reads
@@ -129,7 +133,7 @@ These are what `lint` checks; each finding names the key path or `file:line` to 
     Kubernetes, when no template reads `.Values.stowage.pullSecret` while its pull account is
     a `token`, when no template reads `.Values.stowage.files` while a file input is asked on
     Kubernetes, when no template reads `.Values.stowage.secretFiles` while a secret is delivered
-    as a file there, and when no template reads `.Values.stowage.sysctls`;
+    as a file there, and when no template reads `.Values.stowage.sysctls`. A chart that may route HTTP to its Services serves the front's routes itself: lint reads every template (`templates/`, and each subchart's under `charts/`, vendored as a directory or a `.tgz`, nested ones included) for a line `kind: Ingress`, `kind: HTTPRoute` or `kind: GRPCRoute` (quoted or not, a comment after it) or a `kind:` a template computes (`{{` on the line), and takes a subchart archive it cannot read as one that may; each front route with a guard the Docker and VM fronts enforce (`client_auth`, `allow_input`, `forward_auth`, `basic_auth`) is warned (`front.routes[N]: <route>: on Kubernetes the chart's ingress serves the route, and Stowage enforces none of its guards there (<guards>): the chart's ingress must, or the route is open on the cluster`);
   - with an `endpoint` (see "Extensions" ([extensions](extensions.md))), the chart exposes that route's `upstream:
     <service>:<port>` as the Service `<release>-<service>` on that port: `<short>-stow k8s` prints
     `http://<release>-<service>.<namespace>.svc:<port>` as the project's endpoint.
@@ -291,11 +295,14 @@ These are what `lint` checks; each finding names the key path or `file:line` to 
   disk builds whoever else may read the registry. auroraboot runs on the host's network, so the
   Docker engine must share this machine's loopback (a rootful engine; not rootless Docker nor
   Docker Desktop's VM). Each container the disks' build runs (qemu-img, the files' `chown`) is named
-  `stowage-disks-<16 hex>`, auroraboot's `stowage-disks-loop` (below), and labelled with its run's
-  own id (`io.stowage.disks.run`); a `ship` interrupted (Ctrl-C, SIGTERM) removes the containers of
-  its run's label (`docker rm --force`), for 2 s after the cancel (the daemon may make one a moment
-  after the killed `docker` CLI asked for it), before it removes its work directory: the killed
-  CLI would leave one running, holding that directory and its loop devices (one it cannot remove
+  `stowage-disks-<16 hex>`, auroraboot's `stowage-disks-loop` (below), and made in two steps:
+  `docker create`, in a session of its own so a terminal's Ctrl-C does not reach it (an image
+  pull included, 15 min at most; a create that fails otherwise than on its name — killed at
+  that bound, or its id misread — has the container of its name removed when it carries that
+  create's label, `io.stowage.disks-run=<16 hex>`, never another build's of the same name), then `docker start --attach` of the id it printed; a `ship` interrupted (Ctrl-C, SIGTERM) removes
+  that container by its id (`docker rm --force <id>`), whether the interrupt came during its
+  create or its start, before it removes its work directory: the killed CLI would leave one
+  running, holding that directory and its loop devices (one it cannot remove
   is named in the error: `the cancelled container <name> may still run: docker rm --force <name>:
   …`). auroraboot's loop devices are the host's, so two of its runs at once fail: its container
   is always named `stowage-disks-loop`, a name the Docker daemon gives one container at a time,
@@ -367,7 +374,10 @@ These are what `lint` checks; each finding names the key path or `file:line` to 
   its variables (`terraform.tfvars.json`: the image's name, the settings, the description, where
   the upload is; never a credential), OpenTofu's state, the disk while it uploads, the upload
   module in `upload/` (its variables name the disk's path and SHA-256; its state is empty once the
-  upload is deleted), and once registered the image's id in a file `id`; the providers are kept
+  upload is deleted), and once registered the image's id in a file `id`. A run takes the lock
+  file `<image>.lock` beside it for the whole lookup and registration: another `ship` or `promote`
+  on the same cache registering the same image waits for it (`cloud <cloud>: waiting for another
+  run registering image <image> (<dir>)`, said once), then finds the image registered. The providers are kept
   once in `$XDG_CACHE_HOME/stowage/cloud/plugins`, shared by every working directory and checked
   against the lock files. So an image is registered once: before uploading, `ship` takes the kept
   id, else the id of a run stopped once its image was made (deleting its upload then), else looks
@@ -473,7 +483,7 @@ These are what `lint` checks; each finding names the key path or `file:line` to 
 - **`command` provider** (the escape hatch of every concern): one JSON request on stdin
   (`{"op": "...", ...}`), one JSON answer on stdout, exit `0` success, `2` "no answer" (read as
   unknown, never as a negative), anything else an error. It runs in its own session with no
-  controlling terminal (it cannot prompt) under `timeout_s` (default 30); anything it leaves
+  controlling terminal (it cannot prompt) under `timeout_s` (default 30; lint refuses one past 3600, an hour); anything it leaves
   running is killed, and Ctrl-C / Ctrl-Z reach it through Stowage. Ops: `version.get`, `scheme.validate` (must answer `{"valid": true|false, "reason": "..."}`),
   `scheme.compare`, `changelog.versions`, `changelog.section`, `schema.current`,
   `schema.barrier_after`, `schema.reads_newer`, `health.ready`.
@@ -488,7 +498,9 @@ These are what `lint` checks; each finding names the key path or `file:line` to 
   (`http-json`, an answer of at most 64 KiB). `command` runs `cmd` in its image, confined like the
   schema command (a `stowage-health` service, a container of its own per call, its compose file
   `.stowage-health-<id>.yaml` in the install directory, removed after the call; the health gate
-  removes those an interrupted call left, once older than an hour):
+  removes those an interrupted call left, once older than an hour; the container is labelled
+  `io.stowage.health-boot=<boot id>`, and the gate removes those an earlier boot left, never one
+  of its own boot, which a running call may own):
   `health.ready` → `{"ready": bool, "reason": "..."}`; no answer (exit 2) is not ready.
 - **Schema compat** (`database.schema_compat`) decides whether `rollback` may go back after the
   database moved. `sql`: `current` returns the migration number; `barrier_after` (with `$1`, the
@@ -510,6 +522,9 @@ These are what `lint` checks; each finding names the key path or `file:line` to 
   holds `{v}` once; a revision above 1 renders as `{v}-r<N>`, so a version whose tag already ends in
   `-r<digits>` is refused. Channels write into the same repositories, so no channel's tag may be
   another's: under SemVer use a prefix (`beta-{v}`), not a suffix (`{v}-beta`, a pre-release).
+  No channel name, template prefix or release tag may start with `held-`, the prefix of the marks
+  the publisher tags held content with (`ship` and `lint` refuse it: `… starts with held-, which
+  Stowage's held marks start with`).
 - **Interpolation** that needs a value is `${X}`, `$X`, `${X:?msg}`; `${X:-v}`, `${X-v}`,
   `${X:+v}`, `${X+v}` are defined when X is unset.
 - **`stowage.lock`** (next to `stowage.yaml`, committed; written by `stowage lock`). It is

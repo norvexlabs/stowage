@@ -21,6 +21,7 @@ import (
 
 	"github.com/norvexlabs/stowage/internal/registry"
 	"github.com/norvexlabs/stowage/internal/release"
+	"github.com/norvexlabs/stowage/internal/testutil"
 )
 
 // caFile is a CA certificate file, as --registry-ca takes one.
@@ -422,14 +423,15 @@ func TestInstallRecordsTheRegistryCAAndGivesItToTheDaemon(t *testing.T) {
 		t.Fatalf("a key: %v", err)
 	}
 	e.nothingWritten()
-	// A pull that fails: nothing stays, the daemon's CA included.
+	// A pull that fails: nothing of the install stays, but the daemon's CA, the CA given, which
+	// another install from the registry may rely on already.
 	e.docker.pullErr = errors.New("pull refused")
 	if err := e.install(func(o *Options) { o.Registry, o.RegistryCA = "mirror.example.org/site/notes", ca }); err == nil {
 		t.Fatal("installed with a failing pull")
 	}
 	e.nothingWritten()
-	if _, err := os.Stat(filepath.Join(certs, "mirror.example.org", "ca.crt")); err == nil {
-		t.Error("a failed install left the daemon's CA")
+	if _, err := os.Stat(filepath.Join(certs, "mirror.example.org", "ca.crt")); err != nil {
+		t.Errorf("a failed install removed the daemon's CA: %v", err)
 	}
 	e.docker.pullErr = nil
 	// A CA file in a directory no install owns is not trusted without --registry-ca.
@@ -657,5 +659,150 @@ func TestMirrorExportOfAnEarlierRevision(t *testing.T) {
 	}
 	if err := in.MirrorExport(context.Background(), MirrorExportRequest{File: filepath.Join(t.TempDir(), "x.tar"), Version: first.ProjectVersion, Revision: 3}); err == nil || !strings.Contains(err.Error(), "(revision 3) is not published") {
 		t.Errorf("revision 3: %v", err)
+	}
+}
+
+// An import waits for another into the same prefix from this machine, until its context ends.
+func TestMirrorImportWaitsForAnother(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	in := e.installer(nil)
+	unlock, err := in.mirrorLock(context.Background(), "mirror.example.org/site/notes")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if _, err := in.mirrorLock(ctx, "mirror.example.org/site/notes"); err == nil || !strings.Contains(err.Error(), "waiting for another import into mirror.example.org/site/notes") || !strings.Contains(e.log.String(), "waiting for another import into mirror.example.org/site/notes") {
+		t.Errorf("%v\n%s", err, e.log)
+	}
+	if err := in.MirrorImport(ctx, filepath.Join(t.TempDir(), "none.tar"), "mirror.example.org/site/notes", false); err == nil || !strings.Contains(err.Error(), "waiting for another import") {
+		t.Errorf("an import beside it: %v", err)
+	}
+	// Another prefix's lock is another.
+	other, err := in.mirrorLock(context.Background(), "mirror.example.org/site/other")
+	if err != nil {
+		t.Fatal(err)
+	}
+	other()
+}
+
+// An export of a channel that went back from a later publication, yanked, carries that yank: the
+// import marks the mirror's tag yanked, and takes the channel back without --older.
+func TestMirrorExportCarriesALaterYank(t *testing.T) {
+	t.Parallel()
+	v := newVMCreate(t, "qcow2")
+	first := withDisks(t, v)
+	later := *first
+	later.ProjectVersion, later.Tag, later.ReleaseSeq = "1.1.0", "1.1.0-1", first.ReleaseSeq+1
+	later.Artifacts.Disks = nil
+	later.Artifacts.BootDisks = &release.BootDisks{Release: first.Tag, Stowage: "0.6.0", Disks: first.Artifacts.Disks}
+	v.putRelease(later.Tag, &later)
+	v.putRelease(later.Channel, &later)
+	ctx := context.Background()
+	in := v.installer(nil)
+	to := mirrorRegistry(t)
+	export := func(name string) string {
+		file := filepath.Join(t.TempDir(), name)
+		if err := in.MirrorExport(ctx, MirrorExportRequest{File: file}); err != nil {
+			t.Fatalf("%v\n%s", err, v.log)
+		}
+		return file
+	}
+	if err := in.MirrorImport(ctx, export("later.tar"), to, false); err != nil {
+		t.Fatal(err)
+	}
+	// The publisher yanks 1.1.0: the channel goes back to 1.0.0.
+	yanked := later
+	yanked.Yanked = &release.Yank{Reason: "broken", Date: later.Date}
+	v.putRelease(later.Tag, &yanked)
+	v.putRelease(first.Channel, first)
+	file := export("back.tar")
+	if got := archived(t, file); !slices.Contains(got, "notes-release:"+later.Tag) || !strings.Contains(v.log.String(), "carrying the yank of notes 1.1.0 (1.1.0-1): broken") {
+		t.Errorf("the yank is not carried: %v\n%s", got, v.log)
+	}
+	if err := in.MirrorImport(ctx, file, to, false); err != nil {
+		t.Fatalf("import: %v", err)
+	}
+	c := registry.New(authn.NewMultiKeychain())
+	if mm, _, err := readRelease(ctx, c, to+"/notes-release", later.Tag); err != nil || mm == nil || mm.Yanked == nil {
+		t.Errorf("the mirror's %s: %+v %v", later.Tag, mm, err)
+	}
+	if mm, _, err := readRelease(ctx, c, to+"/notes-release", first.Channel); err != nil || mm == nil || mm.Tag != first.Tag {
+		t.Errorf("the mirror's channel: %+v %v", mm, err)
+	}
+	// A yank of another publication than the mirror's is refused.
+	rebuilt := later
+	rebuilt.ReleaseSeq = later.ReleaseSeq + 5
+	data, _ := rebuilt.Encode()
+	ref, _ := c.Tag(to+"/notes-release", later.Tag)
+	if _, err := c.PutArtifact(ctx, ref, registry.Artifact{Type: release.MediaType, Data: data}); err != nil {
+		t.Fatal(err)
+	}
+	if err := in.MirrorImport(ctx, file, to, false); err == nil || !strings.Contains(err.Error(), "is publication 7, not the yanked publication 2 the archive carries") {
+		t.Errorf("another publication: %v", err)
+	}
+}
+
+// Only a yank signed by a key the installer trusts is carried: an unsigned one (pushed by someone
+// without the key) is passed over, so the import neither marks the mirror's release yanked nor
+// takes its channel back without --older. A tag holding a manifest this Stowage does not read is
+// passed over, not an error.
+func TestMirrorExportCarriesOnlyASignedYank(t *testing.T) {
+	t.Parallel()
+	v := newVMCreate(t, "qcow2")
+	first := withDisks(t, v)
+	later := *first
+	later.ProjectVersion, later.Tag, later.ReleaseSeq = "1.1.0", "1.1.0-1", first.ReleaseSeq+1
+	later.Artifacts.Disks = nil
+	later.Artifacts.BootDisks = &release.BootDisks{Release: first.Tag, Stowage: "0.6.0", Disks: first.Artifacts.Disks}
+	v.putRelease(later.Tag, &later)
+	v.putRelease(later.Channel, &later)
+	ctx := context.Background()
+	to := mirrorRegistry(t)
+	file := filepath.Join(t.TempDir(), "later.tar")
+	if err := v.installer(nil).MirrorExport(ctx, MirrorExportRequest{File: file}); err != nil {
+		t.Fatal(err)
+	}
+	if err := v.installer(nil).MirrorImport(ctx, file, to, false); err != nil {
+		t.Fatal(err)
+	}
+	yanked := later
+	yanked.Yanked = &release.Yank{Reason: "broken", Date: later.Date}
+	v.putRelease(later.Tag, &yanked)
+	v.putRelease(first.Channel, first)
+	// A tag of another format beside them.
+	c := registry.New(authn.NewMultiKeychain())
+	odd, _ := c.Tag(v.prefix+"/notes-release", "0.1.0-1")
+	if _, err := c.PutArtifact(ctx, odd, registry.Artifact{Type: release.MediaType, Data: []byte(`{"schema_version":99}`)}); err != nil {
+		t.Fatal(err)
+	}
+	signer := testutil.NewKeySigner(t)
+	export := func() string {
+		in := v.installer(nil)
+		r := *in.R
+		r.Keys = map[string][]byte{"release.pub": signer.PEM}
+		in.R = &r
+		f := filepath.Join(t.TempDir(), "back.tar")
+		if err := in.MirrorExport(ctx, MirrorExportRequest{File: f}); err != nil {
+			t.Fatalf("%v\n%s", err, v.log)
+		}
+		return f
+	}
+	back := export()
+	if got := archived(t, back); slices.Contains(got, "notes-release:"+later.Tag) || !strings.Contains(v.log.String(), "not carrying the yank of notes 1.1.0-1") {
+		t.Errorf("an unsigned yank carried: %v\n%s", got, v.log)
+	}
+	if err := v.installer(nil).MirrorImport(ctx, back, to, false); err == nil || !strings.Contains(err.Error(), "--older imports it") {
+		t.Errorf("the import took the channel back: %v", err)
+	}
+	if mm, _, err := readRelease(ctx, c, to+"/notes-release", later.Tag); err != nil || mm == nil || mm.Yanked != nil {
+		t.Errorf("the mirror's %s: %+v %v", later.Tag, mm, err)
+	}
+	// Signed by the trusted key: carried.
+	v.signRelease(later.Tag, signer)
+	if got := archived(t, export()); !slices.Contains(got, "notes-release:"+later.Tag) {
+		t.Errorf("a signed yank not carried: %v", got)
 	}
 }

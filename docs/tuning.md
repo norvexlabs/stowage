@@ -33,14 +33,15 @@ with `tune` and neither a `docker` nor a `kairos` shape.
 - **Each container**, at each start (the install, a re-run, `upgrade`, `rollback`, the VM's
   boot), in `stowage-content.yaml`, on every profile, unless Docker Desktop runs it (its own VM)
   or the engine does not answer (the start then fails):
-  - its network namespace's own settings — `net.core.somaxconn`, `net.ipv4.ip_local_port_range`,
+  - its network namespace's own settings — `net.core.somaxconn`,
     `tcp_max_syn_backlog`, `tcp_mtu_probing`, `tcp_notsent_lowat`, `tcp_rmem`,
     `tcp_slow_start_after_idle`, `tcp_tw_reuse`, `tcp_wmem`, most of which a new namespace takes at
     the kernel's default rather than the host's — at the host's value; on the `network` profile
     at the profile's value where the host holds less (field by field, a ceiling the host holds
-    higher kept), so the containers are tuned before the host is — the range of local ports
-    included, so a service listening at 10000 or above in its own namespace may see an outgoing
-    connection of that namespace take its port while it restarts. A service's own `sysctls`
+    higher kept), so the containers are tuned before the host is. The range of local ports
+    (`net.ipv4.ip_local_port_range`) is not one: a container keeps the kernel's, so an outgoing
+    connection of its namespace never takes a port at 10000 or above a service of it listens
+    on. A service's own `sysctls`
     key wins; a service on the host's namespace or another service's (`network_mode`) gets none;
     a key the host's kernel lacks is left out (its start would fail); none on a kernel before
     4.15 or under a user namespace (rootless Docker, `userns-remap`), whose namespace hides keys.
@@ -97,7 +98,8 @@ with `tune` and neither a `docker` nor a `kairos` shape.
   NIC's or `default`'s value below `all`'s (the project's own, else 1 and 2) is lint's error with a
   `kairos` shape, naming the `all` key to set instead (`… is below the arp_ignore 1 all holds on a
   VM of several NIC roles, and the kernel takes the larger: set net.ipv4.conf.all.arp_ignore to 0
-  to choose it for every NIC`). Under `host.power:
+  to choose it for every NIC`). A value out of the kernel's range (`arp_announce` 0–2, `arp_ignore`
+  0–3 or 8) is lint's error on every shape and device, `all` included. Under `host.power:
   performance`, each CPU's `scaling_governor` is judged and set `performance` where its cpufreq
   driver offers it (one that does not keeps its own), its `energy_performance_preference`
   `performance` where exposed and offered, `intel_pstate/min_perf_pct` 100 where intel_pstate
@@ -129,15 +131,22 @@ with `tune` and neither a `docker` nor a `kairos` shape.
   `iptables -I DOCKER-USER -i <role> -o <out> -j ACCEPT` and the replies' `-i <out> -o <role> -m
   conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT`, for `iptables` and `ip6tables`, and nft's
   `iifname "<role>" meta l4proto { tcp, udp } socket transparent 1 accept` in an input chain that
-  drops. And under `services.<name>.cpus` (`irq: off`), on any profile, the NICs'
+  drops; run not as root where the install's record (`.env`, 0600) does not read, the roles' NICs
+  are not known, and that second item is `n/a` (`its forwarding or interception not judged: the
+  install's record does not read (…): the NICs it names are not known (run as root)`), never
+  advice for no NIC named. And under `services.<name>.cpus` (`irq: off`), on any profile, the NICs'
   interrupts (and, with the network profile, RPS) steer off those cores (an interrupt that reaches one is `differs`), and a
   running `irqbalance` is `advice` (`IRQBALANCE_BANNED_CPULIST=…`).
   And on a Docker host each service's nftables table is `advice` (`nftables table inet <name>`),
-  which `--print` prints after the files (consented and applied by a start as root,
+  which `--print` prints after the files (`not written: load it with nft -f <file>, the host's
+  firewall is its operator's`; once consented, `loaded by each start: tune --apply consented`) (consented and applied by a start as root,
   through roles that each have a device here, a role's forwarding is reported `ok`, `its
   forwarding out of <roles> applied by each start (tune --apply)`, its rules no longer advised) — once the operator consented, `ok`, `loaded by each
-  start (tune --apply)`, when it is loaded, else `differs`, `not loaded` (`loaded by the next start
-  as root`); with the consent revoked and the table still loaded, `differs`, `still loaded, the
+  start (tune --apply)`, when it is loaded from the rules the install's values pick now, else
+  `differs`: `not loaded`, or `loaded from other rules than the release's, as the install's values
+  pick them` (a re-run gave a table's input another value, or an upgrade changed the file; both
+  `loaded by the next start as root`), or, when the recorded value picks no table, `loaded` (`"<v>"
+  picks no table of <service> (…): a start that loads the table refuses it`); with the consent revoked and the table still loaded, `differs`, `still loaded, the
   consent withdrawn` (`<short>-stow tune --revert` again removes it). Loaded means listed in
   `.stowage-nftables` and, as root, held by the kernel (`nft list table`: a boot drops it until
   the boot's tables unit or the next start loads it); `status`'s `tables` are the same. `--print` prints the files `--apply` writes, for a host configured by other
@@ -158,7 +167,9 @@ with `tune` and neither a `docker` nor a `kairos` shape.
   a reboot), and its tables' unit, `/etc/systemd/system/<name>-gateway-<8 hex>-tables.service`
   (before Docker, once the network is up: `<dir>/<short>-stow tables-boot --dir <dir>`, the
   services' tables the last start loaded — see "A service's nftables table" ([host](host.md)) under the installer —
-  and the L4 routes' source allowlists),
+  and the L4 routes' source allowlists; run only while `<dir>/.stowage-gateway` exists
+  (`ConditionPathExists`); a failure shows as the unit's (`systemctl status`), no other unit
+  requiring it, the start loading the tables after it),
   both enabled together (`systemctl enable`), and runs that start now. Each start as root writes
   the two units again when either differs from what this release writes (a consent an earlier
   release recorded gets the tables' unit so), and enables them then; one it cannot write is
@@ -251,7 +262,13 @@ with `tune` and neither a `docker` nor a `kairos` shape.
   them since this release or these values, or its error says why)`, and `published ports' holds left (the next start as root removes them)` once the release
   declares none while a chain is recorded; `forwarding` once every table took the rules the
   release and the devices give now, else `forwarding not applied (no start as root applied it since this
-  release or these devices, or its error says why)`, or `forwarding left (the next start as root removes it)` once the
+  release or these devices, or its error says why)`; as root, a chain applied is in force only
+  while `DOCKER-USER` still jumps to it (`iptables -C`, `ip6tables` too where it holds rules): a
+  host firewall's reload (`firewall-cmd --reload`) flushes the jump while the records under `/run`
+  stay, and `status` then says `forwarding not applied (DOCKER-USER no longer jumps to it: the
+  host's firewall reloaded; the next start as root applies it again)`, as it says of `source
+  allowlists of <routes>` and `interfaces of <…>`, and `tune` reports the forwarding not applied
+  (not as root, iptables does not read: the records are taken as they are); or `forwarding left (the next start as root removes it)` once the
   release forwards nothing; with nothing in force, the line reads `consented (tune --apply), nothing
   in force: …`. A route to a service on the host's
   network is left out of them all. Should a boot's own `iptables` fail, Docker still starts (the
@@ -281,7 +298,19 @@ with `tune` and neither a `docker` nor a `kairos` shape.
   moved): nothing … is applied here until `<short>-stow tune --revert` here removes what it
   applied, then `<short>-stow tune --apply` here`. A record naming no directory applies nothing
   either (`… names no directory: … remove it, then `<short>-stow tune --apply` here`). The services' tables are
-  named after the services, as on the VM: one install of a project per host applies them. A host where `systemd-networkd` does not run is
+  named after the services, as on the VM: one install of a project per host applies them, and
+  `--apply` refuses a second while another install of the project holds the consent (its boot
+  unit, of another digest, is in `/etc/systemd/system`): `another install of <name> on this host
+  holds the consent (its boot unit <unit>): two installs of one project would share their tables'
+  names` (fix: `<short>-stow tune --revert` in that install's directory first; `systemctl cat
+  <unit>` names it; that directory gone, `sudo systemctl disable <unit> <tables unit> && sudo rm
+  -f <their files> && sudo systemctl daemon-reload` removes its units). It refuses as well, and
+  so does every start that writes the allowlists (an upgrade's too), an allowlisted route whose
+  port and protocol another install's allowlists hold (`/run/*-gateway-*-allow.rules`) on its
+  bind address (two routes bound to two addresses share nothing; one bound to none shares every
+  address, one bound to `0.0.0.0` or `::` every address of its family), as either chain drops every source of the port while its values do not read: `l4
+  route <name>: port <port>/<proto> is also held by the install whose allowlists <file> records:
+  two installs' allowlists cannot share a port`. A host where `systemd-networkd` does not run is
   warned and given no file (`warning: systemd-networkd does not run on this host: the networkd
   files of <roles> are not written or reloaded (`<short>-stow tune` gives their settings)`, or, a
   release declaring none, `the networkd files an earlier
@@ -407,7 +436,9 @@ with `tune` and neither a `docker` nor a `kairos` shape.
   flows and the RPS of a NIC with fewer queues than CPUs, at each device's or queue's
   appearance); on `network` the keys above merged into the daemon's file —
   `/etc/docker/daemon.json`, or the `--config-file` of the dockerd that runs as root (snap; a
-  relative one from `/`; a user's rootless dockerd is never read) — its other keys kept (a file
+  relative one from `/`; a user's rootless dockerd is never read; a report run as a user who sees
+  no dockerd, as under `/proc`'s `hidepid`, judges no file: `daemon.json  n/a  dockerd is not
+  visible to this user (/proc hidepid)`, run it as root) — its other keys kept (a file
   that does not parse is refused, nothing written); `/etc/stowage/tune.json`, the values the
   first `--apply` found (the modules loaded first, so their settings are there), the values the
   last one wrote, the profile, and each daemon key it set with its file, which `--revert` reads;

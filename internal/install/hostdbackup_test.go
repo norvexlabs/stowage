@@ -51,6 +51,9 @@ type fakeRclone struct {
 	dropped          []string // the volumes whose former data was deleted
 	// modTimes are objects' times other than the fixed one lsjson gives.
 	modTimes map[string]time.Time
+	// afterCat replaces an object once a download of it was served: a writer of the destination
+	// changing it meanwhile.
+	afterCat map[string][]byte
 }
 
 // shell runs the runner's shell on a volume: its archive, a restore's staging and swap.
@@ -198,6 +201,10 @@ func (f *fakeRclone) run(c Cmd) ([]byte, error) {
 			return nil, exitCode(3)
 		}
 		_, err := c.Stdout.Write(data)
+		if next, ok := f.afterCat[last]; ok {
+			f.objects[last] = next
+			delete(f.afterCat, last)
+		}
 		return nil, err
 	case "lsjson":
 		type entry struct {
@@ -888,6 +895,7 @@ func TestStoppingWaitsForABackup(t *testing.T) {
 	d.backups.Add(1)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
+	withBootID(t, d)
 	go func() { done <- d.Serve(ctx, filepath.Join(dir, "host.sock")) }()
 	time.Sleep(20 * time.Millisecond)
 	cancel()
@@ -1071,7 +1079,8 @@ func TestADockerInstallBacksUpThroughItsOwnDaemon(t *testing.T) {
 		t.Fatalf("timer %q %v", timer, err)
 	}
 	svc, _ := os.ReadFile(filepath.Join(units, unit+".service"))
-	if !strings.Contains(string(svc), "ExecStart=\""+filepath.Join(e.dir, "notes-stow")+"\" backup run --if-configured --dir \""+e.dir+"\"\n") {
+	if !strings.Contains(string(svc), "ExecStart=\""+filepath.Join(e.dir, "notes-stow")+"\" backup run --if-configured --dir \""+e.dir+"\"\n") ||
+		!strings.Contains(string(svc), "\nStartLimitIntervalSec=3h\nStartLimitBurst=6\n\n[Service]\n") || !strings.HasSuffix(string(svc), "\nRestart=on-failure\nRestartSec=15min\n") {
 		t.Errorf("service %s", svc)
 	}
 	if !strings.Contains(fmt.Sprint(host.calls()), "systemctl enable --now "+unit+".timer") {
@@ -1628,5 +1637,46 @@ func TestTheAppChangesTheBackupSettingsUnlessLocked(t *testing.T) {
 	}
 	if want := []string{"changed through the app socket: destination", "changed through the app socket: destination"}; !slices.Equal(reasons, want) {
 		t.Errorf("events %q", reasons)
+	}
+}
+
+func TestAnRcloneDestinationOnTheRunnersOwnDiskIsRefused(t *testing.T) {
+	t.Parallel()
+	_, d, _, key := backupVM(t)
+	h := d.Handler()
+	for conf, want := range map[string]string{
+		"[store]\ntype = local\n":                                                      "the remote store writes to the local remote store",
+		"[store]\ntype = alias\nremote = /mnt/backups\n":                               "writes to the path /mnt/backups",
+		"[store]\ntype = alias\nremote = backups\n":                                    "writes to the path backups",
+		"[store]\ntype = crypt\nremote = disk:b\npassword = x\n[disk]\ntype = local\n": "the remote store writes to the local remote disk",
+		"[store]\ntype = union\nupstreams = s3:a /mnt/b:ro\n[s3]\ntype = s3\n":         "writes to the path /mnt/b",
+		"[store]\ntype = combine\nupstreams = a=disk:x\n[disk]\ntype = local\n":        "the local remote disk",
+		"[store]\ntype = alias\nremote = :local,nounc=true:/b\n":                       "writes to the path :local,nounc=true:/b",
+		"[store]\ntype = memory\n":                                                     "the remote store writes to the memory remote store",
+		"[store]\ntype = union\nupstreams = nas:a :memory:b\n[nas]\ntype = sftp\n":     "writes to the path :memory:b",
+	} {
+		req := validConfig(key)
+		req.RcloneConfig = ptr(conf)
+		var e errOf
+		if code := call(t, h, "POST", "/v1/backup/config", req, &e); code != 400 || !strings.Contains(e.Error, want) || !strings.Contains(e.Error, "reachable from outside the host's containers") {
+			t.Errorf("%q: %d %s", conf, code, e.Error)
+		}
+		if code := call(t, h, "POST", "/v1/backup/verify", req, &e); code != 400 || !strings.Contains(e.Error, want) {
+			t.Errorf("verify %q: %d %s", conf, code, e.Error)
+		}
+	}
+	// A wrapper over a remote reached over the network, and remotes that loop, are accepted.
+	for _, conf := range []string{
+		"[store]\ntype = sftp\nhost = nas\n",
+		"[store]\ntype = crypt\nremote = nas:b\npassword = x\n[nas]\ntype = sftp\nhost = nas\n",
+		"[store]\ntype = alias\nremote = loop:x\n[loop]\ntype = alias\nremote = store:y\n",
+		"[store]\ntype = union\nupstreams = nas:a nas:b:ro\n[nas]\ntype = sftp\n",
+	} {
+		req := validConfig(key)
+		req.RcloneConfig = ptr(conf)
+		var e errOf
+		if code := call(t, h, "POST", "/v1/backup/config", req, &e); code != 200 {
+			t.Errorf("%q: %d %s", conf, code, e.Error)
+		}
 	}
 }

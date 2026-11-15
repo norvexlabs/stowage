@@ -403,20 +403,14 @@ func (in *Installer) runHook(ctx context.Context, env *EnvFile, h *providers.Pro
 	runCtx, cancel := context.WithTimeout(ctx, provisionTimeout)
 	defer cancel()
 	w := &outputWriter{outs: outs, reserved: reserved, save: func() error { return outs.WriteFile(in.path(ProvisionEnv)) }, stop: cancel}
-	_, runErr := in.O.Docker.Run(runCtx, Cmd{
+	// A run the installer stopped (its bound, the hook's output) kills the docker CLI alone: the
+	// container is removed by its name, as after any failure.
+	_, runErr := in.runNamed(runCtx, name, Cmd{
 		Args:   append(in.composeBase(ProvisionCompose), "run", "--rm", "--no-deps", "-T", "--name", name, ProvisionService),
 		Env:    env.Environ(base),
 		Stream: in.O.Log,
 		Stdout: w,
 	})
-	if runCtx.Err() != nil || w.stopped {
-		// The installer stopped the run: only the docker CLI died, the container is removed here.
-		rmCtx, rmCancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
-		if _, err := in.O.Docker.Run(rmCtx, Cmd{Args: []string{"rm", "--force", name}}); err != nil {
-			runErr = errors.Join(runErr, fmt.Errorf("the hook's container may still be running: `docker rm --force %s` (%w)", name, err))
-		}
-		rmCancel()
-	}
 	err = errors.Join(hookRanAs(runErr, user), w.close(runErr == nil))
 	if h.Outputs != "" {
 		err = errors.Join(err, writeOutputs(in.path(h.Outputs), outs))

@@ -605,6 +605,11 @@ func TestAnInputPicksTheServicesTable(t *testing.T) {
 		"its files declare different sets": func(f map[string][]byte) {
 			f[payload.NftablesDir+"ingest/enforce.nft"] = []byte(strings.Replace(ingestTable, "set probes", "set trusted", 1))
 		},
+		// A value no file may be named after is refused as lint refuses it, not as an undeclared table.
+		`services.ingest.nftables.files: "-x" is not a value naming a table's file`: func(f map[string][]byte) {
+			f[payload.Spec] = bytes.Replace(f[payload.Spec], []byte(`"enforce":"b.nft"`), []byte(`"enforce":"b.nft","-x":"c.nft"`), 1)
+			f[payload.NftablesDir+"ingest/-x.nft"] = []byte(ingestTable)
+		},
 	} {
 		if _, err := picked(edit); err == nil || !strings.Contains(err.Error(), name) {
 			t.Errorf("%s: %v", name, err)

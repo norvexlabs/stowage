@@ -240,7 +240,9 @@ func (c *Client) Wait(ctx context.Context, id int64, what string) error {
 	}
 }
 
-// Upload writes the local file to remote on the host (filesystem.put through /_upload/, 0644),
+// Upload writes the local file to remote on the host (filesystem.put through /_upload/, 0600: a
+// seed holds the one-time SSH host key, a disk the release's pull account; the middleware reads
+// it as root, and libvirt hands a VM's disk or CD-ROM to the VM's process as it starts it),
 // streamed: a disk image does not fit in memory.
 func (c *Client) Upload(ctx context.Context, local, remote string) error {
 	f, err := os.Open(local)
@@ -252,7 +254,7 @@ func (c *Client) Upload(ctx context.Context, local, remote string) error {
 	mw := multipart.NewWriter(pw)
 	go func() {
 		err := func() error {
-			data, err := json.Marshal(map[string]any{"method": "filesystem.put", "params": []any{remote, map[string]any{"mode": 0o644}}})
+			data, err := json.Marshal(map[string]any{"method": "filesystem.put", "params": []any{remote, map[string]any{"mode": 0o600}}})
 			if err != nil {
 				return err
 			}

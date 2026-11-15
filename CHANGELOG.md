@@ -29,6 +29,13 @@ follow [SemVer](https://semver.org/).
 
 ### Fixed
 
+- On TrueNAS, the seed ISO (which holds the VM's one-time SSH host key) and the disk image are
+  uploaded readable by root alone, not by every user of the host.
+- `lint` refuses an `audit.allow` entry for an image of Stowage's the release does not carry (a
+  front, backup runner, volume helper or scanner its project makes no use of): it could never
+  match a finding.
+- The front image's build refuses a module raised by `--replace` that Caddy now requires at or
+  past that version, instead of holding Caddy's requirement back.
 - A re-run and an upgrade refuse a port of the front that `.env` should record and does not, or
   records as no port (an edited `.env`), naming the key and the flag that gives it, instead of
   publishing port 0, failing at Compose, or blaming `--http-port 0`; a signed or zero-padded port
@@ -49,6 +56,194 @@ follow [SemVer](https://semver.org/).
 - A rollback on Docker to a release with a provision hook says that the hook is not run on a
   rollback, and when to run `provision`, after the previous installer's own `not provisioned
   (--no-provision)` line.
+- `services:`, `tune:` and `shapes.kairos.size` (or its `min` / `recommended`) written with
+  nothing under them are refused as the spec is read, naming the line, by every command, not by
+  `lint` alone.
+- `lint` refuses an ARP setting in `host.sysctls` out of the kernel's range (`arp_announce` 0–2,
+  `arp_ignore` 0–3 or 8), `all`'s included, on every shape.
+- `lint` refuses a `data.volumes` entry the compose file does not declare, and a `data.reset`
+  volume that is `external` or whose `name:` is interpolated, which `reset-db` refused only at
+  run time. The full example's unused `certs` data volume is now its front CA's `ca` volume.
+- `lint` no longer warns of `host.sysctls` keys the kernel holds once for every namespace
+  (`tcp_max_orphans`, `inet_peer_*`, `fib_sync_mem`, `nf_conntrack_expect_max`,
+  `nf_conntrack_buckets`).
+- `lint` warns of each front route with a guard (`client_auth`, `allow_input`, `forward_auth`,
+  `basic_auth`) when the Kubernetes chart, or a subchart, declares an Ingress, HTTPRoute or
+  GRPCRoute, or a kind a template computes: there the chart's ingress serves the route and Stowage
+  enforces none of its guards.
+- `lint` refuses a `command` provider's `timeout_s` past 3600 (an hour), the health, schema and
+  backup commands' included: a longer one could hold a run without bound.
+- A test release's key is checked against `--test-public-key` again before every signature and
+  attestation, not once when the command starts: a key file replaced during the run signs nothing,
+  and interrupting the command stops the check.
+- A signature check reads at most a digest's 64 newest signatures, ordered by the annotations
+  cosign writes, instead of refusing every digest with more than 64 referrers: one found among
+  them verifies, and none found with others left unread is still a failure to check, never
+  "unsigned". SBOM attestations are neither read for a signature nor counted in "N signature(s)".
+- A hook ship reads its `-f` spec through the links the commit records, not those the working
+  tree holds when the queued ship runs.
+- A disk push's commit is awaited for a bound scaled to the disk (2 minutes and a second per
+  20 MiB), so a registry verifying a large disk for longer no longer fails a push whose every byte
+  went up.
+- Two ships or promotions on one cache registering the same cloud image take turns, instead of
+  working over the same OpenTofu state.
+- On a registry that deletes no tag alone, content whose tag is retired while another tag holds it
+  is marked with a `held-` tag in the registry and deleted once no tag holds it: by the run that
+  marked it (a prune, a yank, a ship), or by the next prune after a run that stopped part way;
+  `:latest`'s retirement of an installer no release tag holds marks it too. A channel name,
+  template or release tag starting with `held-` is refused.
+- A mutable release shipped again without an image key, an installer or an OS bundle its earlier
+  build had removes that tag, which nothing removed before.
+- An install whose recorded values total over 1 MiB is refused when they are recorded: every
+  compose and hook process gets them all in its environment, which the kernel bounds.
+- `k8s status` after an uninstall that kept the release's history says it is uninstalled and
+  which revision `k8s rollback` brings back, as `k8s status --json` does, instead of printing the
+  uninstalled revision as if it ran.
+- An L4 route's bind address on the loopback range other than `127.0.0.1` (`127.0.0.2`) is taken
+  as the host's when the host has a loopback address, as Linux answers on all of `127.0.0.0/8`.
+- A start whose memory shares' floors together pass the part of the host's RAM the shares take
+  warns that services may be OOM-killed, naming the share's `min` to lower.
+- `status` run by another release's installer names the tuning profile of the release the
+  install runs (read from the installer it keeps), or says it is unknown.
+- An upgrade asks again a recorded value the new release's checks refuse (an element a set
+  refuses, a narrower check), as it does a table it picks no file of, instead of failing at the
+  start once the tables loaded.
+- A Kubernetes release in helm's `unknown` status is a release: `k8s install` no longer goes over
+  it, and the verbs acting on the installed release refuse it, naming `helm history`.
+- `k8s upgrade` without a pull password gives the chart the pull Secret the release names once it
+  sees it exists, instead of reusing it unseen; one deleted out of band is refused on the
+  project's registry (naming the token to set) and dropped on a mirror.
+- `tune` on a consented Docker host reports a service's table loaded from other rules than the
+  install's values pick now (a re-run picked another file) as differing until the next start.
+- A start making a volume that awaits its uid creates only the services mounting it (and the
+  front when its volumes are new), so a running stack keeps running if the volume helper fails.
+- Two `mirror import`s into one prefix from one machine run one after the other; a failed first
+  install keeps the Docker daemon's `ca.crt` it wrote, which another install may rely on.
+- A mirror export carries the yanks of the channel's later publications, and the import marks
+  them yanked in the mirror: `upgrade --version` there refuses them as at the source.
+- A start-first service's failed new container's quoted log lines show the install's secret values
+  as `<redacted>`.
+- A start-first overlap is judged by the installer's own reads of the new container, never
+  Compose's `--wait`: a decline is seen under a restart policy, and a new container its restart
+  policy restarts after the signal is read on for 10 minutes instead of failing at once.
+- An `update_ready` file is read at most 1 MiB, and one that is a directory or a link fails the
+  overlap naming it.
+- A rollback pulls the previous release's images before it switches, also for a release another
+  Stowage built (from what its record names).
+- A start pulls an image pinned by digest that left the engine before it reads the stack, and
+  Compose never pulls during a start.
+- A plain `upgrade` whose channel cannot be read fails (exit non-zero) instead of saying the
+  install already runs the release.
+- On the VM, an upgrade's refusals name no flag its `upgrade` does not take; an added loopback
+  route may take the port of a route the release removes.
+- `kubectl` commands in messages name `--context` when `--kube-context` is given, as the run's own
+  kubectl commands do.
+- A re-run giving a new byo certificate refuses a domain that is no domain name before it reads
+  the certificate files.
+- An upgrade whose start fails leaves its change marked, so a later re-run keeps no `.env.prev`
+  of values that never came up.
+- A file input's file is written with every `.env` write, so a compose command run before the
+  first start never makes a directory at its path.
+- A release payload naming a picked table's value no file may be named after is refused as lint
+  refuses it.
+- On bare metal, `vm create`'s refusal of a NIC without its MAC also names the optional NICs
+  `--interface <role>=mac=…` takes.
+- `vm create --platform P` boots the disk set holding one of P's formats (the channel's, when a
+  mirror holds the release's own in another format alone) instead of refusing the platform.
+- `vm seed --channel C` refuses a channel the registry holds no release of the project on.
+- A Docker host's `tune --apply` refuses a second install of the same project while one holds the
+  consent, and an allowlisted route whose port another install's allowlists hold.
+- On a Docker host whose firewall reloaded (DOCKER-USER flushed), `status` and `tune` no longer
+  call the forwarding chain or the allowlists applied; the next start as root applies them again.
+- `tune` not as root on an install whose record it cannot read says the roles' forwarding is not
+  judged, instead of advising rules for a NIC named by none.
+- `tune --print` on a consented Docker host says each start loads the services' tables, instead of
+  telling the operator to load them.
+- A consented Docker host's tables boot unit is inert without the consent's record and fails no
+  boot, so a rollback to a release built by an earlier Stowage leaves it harmless.
+- A host whose kernel tracks no connection no longer warns at every start that
+  `flush_conntrack`'s flush failed.
+- The network profile no longer widens a container's range of local ports, which could take a
+  port a service of that container listens on.
+- An interrupted disk build removes its container whenever the interrupt came, even while the
+  container was being created.
+- `vm create --tofu-var` checks every value a module's bool or number variable takes before
+  OpenTofu runs, in the form too.
+- `vm attach` run again with the right `attach=` bridge after an apply failed on a wrong one adds
+  the NIC on it.
+- A restore loads only the objects the install's own backups uploaded: each backup records the
+  SHA-256 of its objects, and a restore downloads and checks every one before anything stops
+  (and again as it loads), refusing one that differs; a backup the install recorded nothing of
+  (a machine made again) is refused unless `restore --unrecorded` is given.
+- A backup destination that writes to the backup runner's own disk or memory (a `local` or
+  `memory` remote, a bare path, or a remote leading to one) is refused at `backup config`, `backup verify` and every run,
+  as its backups would be lost with the runner's container.
+- The VM's upgrade before a first install no longer finds the install's lock held at the instant
+  another run takes it: the daemon reads who holds it without taking it.
+- Each VM NIC's network revert is its own, undoing that NIC's change on the interface it was made
+  on: two changes awaiting confirmation at the daemon's start are each undone, and a record the
+  daemon's start could not apply is tried again. A change of one NIC still waits while another
+  NIC's change awaits confirmation.
+- `health` and `GET /v1/health` share one check among the requests arriving while it runs and
+  reuse its verdict for 5 s, unless a job or a service verb ran since: polling it no longer
+  starts a health container per request. A check that hangs ends at its bound.
+- `status` no longer shows the last failed boot once a later upgrade's boot on trial is judged
+  healthy after it in the event journal; the passive system's boot after a fallback keeps it.
+- The host daemon's refusal of a `reset-db` or a restore on an install of another release names
+  the project the OS carries.
+- The VM acts on an `upgrade` made before its first install, and on a `reset-db --new-baseline`,
+  at the boot of the OS they wrote (their marks now name the release by version and revision,
+  which the OS's installer carries), and its health gate keeps the OS such an upgrade wrote, as
+  it keeps the one a first boot switched to, rather than fall back to an OS that cannot run the
+  install.
+- `tune --check` gives an interrupt the kernel manages (its move refused at `--apply`) as advice
+  naming `isolcpus=managed_irq`, not as a difference that never clears.
+- `tune` run as a user who sees no dockerd (`/proc` mounted with `hidepid`) says so, rather than
+  judge `/etc/docker/daemon.json` in place of the engine's own file.
+- The VM's first `install --channel` is checked against the registry as `vm seed --channel` is: a
+  channel the publisher ships no release of the project on is refused.
+- `vm create` refuses a cloud-config past the cloud's user-data limit before asking to go on.
+- The container of a `command` health check a reboot interrupted is removed by the next boot's
+  health gate.
+- The VM's service watch and `status`: a service the stack declares with no container is down
+  (`missing`), a `compose run` container left exited is no service's, and a container gone between
+  two reads no longer hides the others' facts.
+- The host daemon does not start when the kernel's boot id does not read: its event journal tells
+  boots apart by it.
+- The disk banner whose login-screen reload failed is reloaded by the next check, and a disk that
+  stops reading takes the banner down.
+- A restore downloads each object once into a private file of the install, checks its digest and
+  loads that checked copy: an object changed after its check never loads; a disk that cannot hold
+  the largest object is refused before anything stops.
+- The backups' digest record is bounded in bytes, and keyed by the object's path in its
+  destination: the same name in another destination has none (a restore of a backup recorded
+  before this release needs `--unrecorded`).
+- A network change not confirmed is undone on the interface it was applied on, wherever the
+  default route moved since, its retries included.
+- A disk build's `docker create` runs in a session of its own, and one that fails has its
+  container removed when it carries that create's label, never another build's of the name.
+- `tune` reports a table whose recorded value picks no file on that table alone.
+- Two Docker installs' L4 allowlists on one port bound to different addresses no longer conflict
+  (`0.0.0.0` and `::` overlapping every address of their family);
+  every start checks the conflict, not the consent alone; and the refusal of a second install's
+  consent names how to remove the other's units when its directory is gone.
+- `vm create` boots the release's own disk set: a `--platform` format the registry lacks of it is
+  refused, naming it, never replaced by another release's set.
+- A module's `number` variable takes an HCL number literal alone (no `NaN`, infinity or
+  hexadecimal), and a variable's `type` and `default` are read however its block is indented,
+  never an object attribute's.
+- A scheduled backup that fails is tried again 15 minutes later, at most 6 times in 3 hours, on
+  the VM and on Docker.
+- A one-shot container of the installer's (the provision hook, a schema or health command, a
+  kit's run, the backup runner) whose run is cut off is removed by its name at once, the docker
+  CLI killed by a signal included.
+- The rclone config a Docker install's read writes goes into the install's own directory, never
+  the system's temporary one; one a killed run left is removed by a later run, and by the VM's
+  daemon as it starts.
+- `k8s install` on a release uninstalled with its history kept is refused as `k8s upgrade` is,
+  both naming what works: `k8s rollback`, or `helm uninstall` (dropping its history) then
+  `k8s install`.
+- A Docker host's boot unit loading the services' tables shows its failure as the unit's.
 
 ## [0.37.0] - 2026-11-12
 

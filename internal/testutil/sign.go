@@ -13,6 +13,7 @@ import (
 	"encoding/pem"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/google/go-containerregistry/pkg/name"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
@@ -32,6 +33,11 @@ type KeySigner struct {
 	Predicate string
 	// Body is the statement's predicate, when set (an attestation's document).
 	Body json.RawMessage
+	// Created is the referrer's org.opencontainers.image.created annotation; now when zero.
+	Created time.Time
+	// NoAnnotations pushes the referrer without the annotations cosign v3 writes on it (its
+	// creation time and dev.sigstore.bundle.predicateType), as other tools may.
+	NoAnnotations bool
 }
 
 // NewKeySigner makes a fresh ECDSA P-256 key pair, as `cosign generate-key-pair` does.
@@ -105,7 +111,19 @@ func (s *KeySigner) SignAs(t testing.TB, d, subject name.Digest, opts ...remote.
 			"signatures":  []any{map[string]string{"sig": base64.StdEncoding.EncodeToString(sig)}},
 		},
 	})
-	PushReferrer(t, d, "application/vnd.dev.sigstore.bundle.v0.3+json", b, opts...)
+	var ann map[string]string
+	if !s.NoAnnotations {
+		created := s.Created
+		if created.IsZero() {
+			created = time.Now()
+		}
+		ann = map[string]string{
+			"org.opencontainers.image.created":  created.UTC().Format(time.RFC3339),
+			"dev.sigstore.bundle.content":       "dsse-envelope",
+			"dev.sigstore.bundle.predicateType": s.Predicate,
+		}
+	}
+	pushReferrer(t, d, "application/vnd.dev.sigstore.bundle.v0.3+json", "application/vnd.dev.sigstore.bundle.v0.3+json", b, ann, opts...)
 }
 
 // PushReferrer pushes an artifact of type mt holding data, as a referrer of d.
@@ -117,6 +135,12 @@ func PushReferrer(t testing.TB, d name.Digest, mt types.MediaType, data []byte, 
 // PushReferrerAs pushes, as a referrer of d, an artifact of type mt whose one layer, holding
 // data, is of type layer.
 func PushReferrerAs(t testing.TB, d name.Digest, mt, layerType types.MediaType, data []byte, opts ...remote.Option) {
+	t.Helper()
+	pushReferrer(t, d, mt, layerType, data, nil, opts...)
+}
+
+// pushReferrer is PushReferrerAs with the manifest's annotations.
+func pushReferrer(t testing.TB, d name.Digest, mt, layerType types.MediaType, data []byte, ann map[string]string, opts ...remote.Option) {
 	t.Helper()
 	sh, err := remote.Head(d, opts...)
 	if err != nil {
@@ -135,7 +159,7 @@ func PushReferrerAs(t testing.TB, d name.Digest, mt, layerType types.MediaType, 
 		}
 	}
 	sub := v1.Descriptor{MediaType: sh.MediaType, Digest: sh.Digest, Size: sh.Size}
-	m := v1.Manifest{SchemaVersion: 2, MediaType: types.OCIManifestSchema1, ArtifactType: string(mt), Config: desc(cfg), Layers: []v1.Descriptor{desc(layer)}, Subject: &sub}
+	m := v1.Manifest{SchemaVersion: 2, MediaType: types.OCIManifestSchema1, ArtifactType: string(mt), Config: desc(cfg), Layers: []v1.Descriptor{desc(layer)}, Subject: &sub, Annotations: ann}
 	raw, err := json.Marshal(m)
 	if err != nil {
 		t.Fatal(err)

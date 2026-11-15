@@ -26,21 +26,6 @@ func lockFile(path string) (func(), error) {
 	return unlock, err
 }
 
-// lockHeld reports whether another process holds the lock on path, without taking it or making
-// the file.
-func lockHeld(path string) bool {
-	f, err := os.OpenFile(path, os.O_RDWR, 0)
-	if err != nil {
-		return false
-	}
-	defer f.Close()
-	if err := unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
-		return errors.Is(err, unix.EWOULDBLOCK)
-	}
-	_ = unix.Flock(int(f.Fd()), unix.LOCK_UN)
-	return false
-}
-
 // flockWait takes a lock on path, created 0600 if absent, waiting for another holder to release
 // it until ctx ends: exclusive, or shared when exclusive is false. The lock goes with the process,
 // however it ends, and is on the file at path when taken (flock.Take).
@@ -48,12 +33,12 @@ func flockWait(ctx context.Context, path string, exclusive bool) (func(), error)
 	return flock.Take(ctx, path, flock.Create, exclusive, 100*time.Millisecond, nil)
 }
 
-// lockHeldPassive reports whether a process holds a flock on path, read from the kernel's table
+// lockHeld reports whether a process holds a flock on path, read from the kernel's table
 // (/proc/locks) and never by taking the lock, which a run taking it at that instant would find
 // held. False where the table does not read, or path does not exist; and where the file's device
 // is not the one the table names (a btrfs subvolume, an overlay), or the holder is in another PID
 // namespace: the host daemon reads it on the VM, whose install is on ext4, run in the host's.
-func lockHeldPassive(path string) bool {
+func lockHeld(path string) bool {
 	var st unix.Stat_t
 	if err := unix.Stat(path, &st); err != nil {
 		return false

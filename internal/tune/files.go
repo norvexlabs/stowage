@@ -14,6 +14,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"syscall"
 )
 
 // The files tune writes, under the system's root. They are named for Stowage, not for one stack:
@@ -29,6 +30,10 @@ const (
 	// BootProfileFile is the profile the last Boot applied and the ports it reserved (0644, the
 	// runtime's): what the host holds until its next boot, which a report reads without root.
 	BootProfileFile = "run/stowage/tune-profile"
+	// ManagedIRQFile lists the interrupts the last apply could not move because the kernel
+	// manages their affinity (the write's EIO), space separated (0644, the runtime's: a boot's
+	// interrupts are numbered anew). A report reads it to tell them from drift.
+	ManagedIRQFile = "run/stowage/managed-irqs"
 	// StateFile records what the first apply replaced, for `--revert`.
 	StateFile = "etc/stowage/tune.json"
 )
@@ -238,7 +243,8 @@ func (s System) Plan(h Host) (*Plan, error) {
 
 // planDaemon merges the daemon keys into the daemon file, keeping every other key.
 func (s System) planDaemon(p *Plan) error {
-	daemon := s.daemonFile()
+	args, _ := s.dockerdArgs()
+	daemon := s.daemonFile(args)
 	old, err := os.ReadFile(s.path(daemon))
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
@@ -251,7 +257,6 @@ func (s System) planDaemon(p *Plan) error {
 			return fmt.Errorf("%s: %w", s.path(daemon), err)
 		}
 	}
-	args := s.dockerdArgs()
 	for _, w := range s.daemonWants(p.Host) {
 		have, ok, _ := daemonValue(old, w.path)
 		if ok && w.ok(have) {
@@ -589,20 +594,27 @@ func (s System) steer(h Host, all []nic) []string {
 	var notes []string
 	balanced := s.running("irqbalance")
 	cpus := h.steerCPUs()
+	var managed []int
+	moved := false
 	for _, n := range all {
 		if !n.physical {
 			continue
 		}
 		if irqs := s.irqs(n); !balanced && len(irqs) > 0 && (h.isolating() || h.network() && len(cpus) > 1 && s.irqsStacked(irqs)) {
-			refused := 0
+			moved = true
+			kept := 0
 			for i, irq := range irqs {
 				f := filepath.Join("proc/irq", strconv.Itoa(irq), "smp_affinity_list")
-				if err := os.WriteFile(s.path(f), []byte(strconv.Itoa(cpus[i%len(cpus)])+"\n"), 0o644); err != nil {
-					refused++
+				switch err := os.WriteFile(s.path(f), []byte(strconv.Itoa(cpus[i%len(cpus)])+"\n"), 0o644); {
+				case errors.Is(err, syscall.EIO): // the kernel manages its affinity
+					managed = append(managed, irq)
+					kept++
+				case err != nil:
+					notes = append(notes, fmt.Sprintf("%s IRQ %d: %v", n.name, irq, err))
 				}
 			}
-			if refused > 0 {
-				notes = append(notes, fmt.Sprintf("%s: %d of its %d interrupts keep their CPU (the kernel manages them)", n.name, refused, len(irqs)))
+			if kept > 0 {
+				notes = append(notes, fmt.Sprintf("%s: %d of its %d interrupts keep their CPU (the kernel manages them)", n.name, kept, len(irqs)))
 			}
 		}
 		if !h.steers(n) {
@@ -615,6 +627,15 @@ func (s System) steer(h Host, all []nic) []string {
 					notes = append(notes, fmt.Sprintf("%s rx-%d rps_cpus: %v", n.name, i, err))
 				}
 			}
+		}
+	}
+	if moved {
+		var list []string
+		for _, irq := range managed {
+			list = append(list, strconv.Itoa(irq))
+		}
+		if err := s.writeFile(ManagedIRQFile, []byte(strings.Join(list, " ")+"\n"), 0o644); err != nil {
+			notes = append(notes, fmt.Sprintf("%s: %v", ManagedIRQFile, err))
 		}
 	}
 	return notes

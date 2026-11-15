@@ -50,6 +50,8 @@ type fakeHost struct {
 	rebootAt time.Time
 	// onEdit, when set, runs as grub2-editenv writes, with its variables.
 	onEdit func(vars []string)
+	// editHang is how many grub2-editenv calls, the next ones, hang until their context ends.
+	editHang int
 	// calendarErr fails systemd-analyze calendar; noTimer: systemd has no backup timer.
 	calendarErr error
 	noTimer     bool
@@ -68,7 +70,7 @@ func waitCall(t *testing.T, h *fakeHost, call string) {
 	t.Fatalf("no %s: %v", call, h.calls())
 }
 
-func (f *fakeHost) Run(_ context.Context, c Cmd) ([]byte, error) {
+func (f *fakeHost) Run(ctx context.Context, c Cmd) ([]byte, error) {
 	if len(c.Args) > 1 && c.Args[0] == "systemctl" && c.Args[1] == "show" {
 		f.mu.Lock()
 		defer f.mu.Unlock()
@@ -106,6 +108,22 @@ func (f *fakeHost) Run(_ context.Context, c Cmd) ([]byte, error) {
 	}
 	if f.gate != nil && c.Args[0] == "kairos-agent" {
 		<-f.gate
+	}
+	if c.Args[0] == "grub2-editenv" {
+		if err := ctx.Err(); err != nil { // as exec refuses a context that ended
+			return nil, err
+		}
+		f.mu.Lock()
+		hang := f.editHang > 0
+		if hang {
+			f.editHang--
+			f.ran = append(f.ran, c.Args)
+		}
+		f.mu.Unlock()
+		if hang {
+			<-ctx.Done()
+			return nil, ctx.Err()
+		}
 	}
 	if f.rebootHold != nil && len(c.Args) > 1 && c.Args[0] == "systemctl" && c.Args[1] == "reboot" {
 		f.mu.Lock()
@@ -1120,7 +1138,7 @@ func TestAnUpgradeBeforeTheFirstInstall(t *testing.T) {
 	if !strings.Contains(fmt.Sprint(host.calls()), "kairos-agent upgrade --source oci:"+p.prefix+"/notes-os@") {
 		t.Errorf("ran %v", host.calls())
 	}
-	if raw, err := os.ReadFile(osUpgradeFile(p.env.dir)); err != nil || string(raw) != "1.0.0-2\n" {
+	if raw, err := os.ReadFile(osUpgradeFile(p.env.dir)); err != nil || string(raw) != "1.0.0 2\n" {
 		t.Errorf("mark: %q %v", raw, err)
 	}
 	// A Docker host's daemon has no OS to write: still the install's alone.

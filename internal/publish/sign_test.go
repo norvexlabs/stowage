@@ -210,3 +210,66 @@ func TestCosignSignerPublicKeyCarriesNoCredentials(t *testing.T) {
 		t.Fatalf("cosign public-key was given the registry's credentials: %s", c)
 	}
 }
+
+// A file key is read once, by the signer's first cosign call: every call reads those bytes from a
+// pipe, never a file, so a key file replaced during the run signs nothing, the key a check derived
+// is the key that signs, and no copy is left on disk.
+func TestCosignSignerSignsWithTheKeyFileAsItReadIt(t *testing.T) {
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "cosign")
+	// It records, for each call, its verb and the content of the --key file it was given.
+	script := "#!/bin/sh\nverb=$1\nwhile [ $# -gt 0 ]; do [ \"$1\" = --key ] && { echo \"$verb $(cat \"$2\") $2\" >> \"$FAKE_COSIGN_LOG\"; }; shift; done\n"
+	if err := testutil.WriteExecutable(bin, []byte(script)); err != nil {
+		t.Fatal(err)
+	}
+	logf := filepath.Join(dir, "log")
+	t.Setenv("FAKE_COSIGN_LOG", logf)
+	key := filepath.Join(dir, "release.key")
+	if err := os.WriteFile(key, []byte("the-run-key"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	r, _ := name.NewRegistry("registry.example.com", name.StrictValidation)
+	s, err := NewCosignSigner(CosignSigner{Cosign: bin, Key: key, PublicKeys: pubKeys(t, testutil.NewKeySigner(t)),
+		Registry: r, WorkDir: filepath.Join(dir, "work"), Reader: registry.New(authn.DefaultKeychain)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.PublicKey(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(key, []byte("the-project-key"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	d, _ := name.NewDigest("registry.example.com/acme/notes-api@sha256:" + strings.Repeat("a", 64))
+	if err := s.Sign(context.Background(), d); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Attest(context.Background(), d, []byte("{}")); err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, l := range strings.Split(strings.TrimSpace(readFile(t, logf)), "\n") {
+		f := strings.Fields(l)
+		if len(f) != 3 || f[2] != "/dev/fd/3" {
+			t.Fatalf("cosign was given %q", l)
+		}
+		got = append(got, f[0]+" "+f[1])
+	}
+	eq(t, "keys cosign read", strings.Join(got, ", "), "public-key the-run-key, sign the-run-key, attest the-run-key")
+	if left, _ := os.ReadDir(s.WorkDir); len(left) != 0 {
+		t.Errorf("left in the signer's directory: %v", left)
+	}
+	// A key given as a URI is cosign's to read: passed as it is.
+	if _, err := NewCosignSigner(CosignSigner{Cosign: bin, Key: "env://KEY", PublicKeys: pubKeys(t, testutil.NewKeySigner(t)),
+		Registry: r, Reader: registry.New(authn.DefaultKeychain)}); err != nil {
+		t.Fatal(err)
+	}
+	absent, err := NewCosignSigner(CosignSigner{Cosign: bin, Key: filepath.Join(dir, "absent.key"), PublicKeys: pubKeys(t, testutil.NewKeySigner(t)),
+		Registry: r, WorkDir: filepath.Join(dir, "work"), Reader: registry.New(authn.DefaultKeychain)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := absent.Sign(context.Background(), d); err == nil || !strings.Contains(err.Error(), "signing.key") {
+		t.Fatalf("an absent key file: %v", err)
+	}
+}

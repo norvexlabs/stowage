@@ -303,6 +303,32 @@ func TestChannelConflicts(t *testing.T) {
 	if v, ok, _ := versionUnder("{v}", "1.0.0-r2", SemVer{}); !ok || v != "1.0.0" {
 		t.Errorf("1.0.0-r2 under {v} = %q, %v; want 1.0.0 at revision 2", v, ok)
 	}
+	// Held marks' prefix: a pointer, a template or a version's tag starting with it is refused,
+	// one starting otherwise is not.
+	for _, c := range []struct {
+		chs  []Channel
+		v    string
+		want string
+	}{
+		{ch("held-x", "x-{v}"), "x1", "channel held-x's pointer tag starts with held-"},
+		{ch("stable", "held-{v}"), "x1", `channel stable's tags ("held-{v}") start with held-`},
+		{ch("stable", "hel{v}"), "x1", ""},
+		{ch("stable", "he{v}"), "ld-1", `channel stable tag "held-1" starts with held-`},
+		{ch("stable", "he{v}"), "ld1", ""},
+		{ch("held", "hold-{v}"), "x1", ""},
+	} {
+		got := all(c.chs, words, c.v)
+		switch {
+		case c.want == "" && got != "":
+			t.Errorf("%v %s: unexpected conflict %s", c.chs, c.v, got)
+		case c.want != "" && !strings.Contains(got, c.want):
+			t.Errorf("%v %s: got %q, want %q", c.chs, c.v, got, c.want)
+		}
+	}
+	// A template's prefix is refused for any version, before one is released.
+	if got, err := TemplateConflicts(ch("stable", "held-{v}"), words, nil); err != nil || len(got) != 1 || !strings.Contains(got[0], "start with held-") {
+		t.Errorf("a held- template: %q %v", got, err)
+	}
 	// Invalid templates are left to CheckTemplate: no duplicate report.
 	if got := all(ch("stable", "latest", "dev", "{v}-dev"), cal, "2026.10.1"); got != "" {
 		t.Errorf("invalid template reported twice: %v", got)

@@ -37,6 +37,10 @@ const NetworksFile = ".stowage-networks"
 // service, both containers of an overlap mount it.
 func UpdateVolume(service string) string { return "stowage-update-" + service }
 
+// updateVolumeName is the engine's name of service's update volume in the compose project: what
+// the content file names it (its `name:`) and what an overlap looks for in the old container.
+func updateVolumeName(project, service string) string { return project + "_" + UpdateVolume(service) }
+
 // startFirst replaces each start-first service (services.<name>.update) this start would
 // recreate before the stack's start does: its new container starts beside the old one, which
 // stops once the new is healthy. One the start changes is replaced by the stack's start,
@@ -493,7 +497,7 @@ func (in *Installer) overlap(ctx context.Context, environ []string, m *composeMo
 		for _, c := range news {
 			// Its log goes with it: what it said before it failed is the error's.
 			if !declined {
-				if l := in.lastLines(ctx, c.ID); l != "" {
+				if l := in.lastLines(ctx, c.ID, environ); l != "" {
 					if len(news) > 1 {
 						l = "  " + c.ID + ":\n" + l
 					}
@@ -536,25 +540,22 @@ var overlapPoll = 500 * time.Millisecond
 // readyWait is how long startBeside waits for the new container to write its update_ready file.
 var readyWait = 10 * time.Minute
 
-// startBeside starts service's new container beside its old one and returns once the new one
-// serves: running, healthy when it has a healthcheck. With update_signal, the new container is
-// started without waiting, the old one sent the signal once the new one runs (signalled) and, with
-// update_ready, once it wrote that file in update_socket: one that differs from what the directory
-// held before it started, read through the old container (within readyWait, else an error, the old
-// one never signalled), and the new one's health read until it is healthy, or unhealthy or no
-// longer running (an error). A new container that ends with update_decline_status before the
-// signal is errDeclined. Before the new container is made: with update_socket and update_signal,
+// startBeside starts service's new container beside its old one (never with Compose's --wait) and
+// returns once the new one serves: running, healthy when it has a healthcheck, read until then,
+// or until it is unhealthy or no longer running (an error); one its restart policy restarts is
+// read on until readyWait has passed (then an error). With update_signal, the old one is sent the
+// signal once the new one runs (signalled) and, with update_ready, once it wrote that file in
+// update_socket: one that differs from what the directory held before it started, read through
+// the old container (within readyWait, else an error, the old one never signalled). A new
+// container that ends, or restarts, with update_decline_status before the signal is errDeclined. Before the new container is made: with update_socket and update_signal,
 // an old container that does not mount the update volume is errNoHandoff, and a read of where it
 // does, or of its ready file, that fails is a beforeUp: the caller replaces the service stop-first
 // on the one, and fails the start on the other, nothing to remove either way.
 func (in *Installer) startBeside(ctx context.Context, environ []string, project, service, old string) (signalled bool, err error) {
 	svc := in.R.Spec.Services[service]
 	signal := svc.UpdateSignal
-	up := append(in.composeBase(), "up", "--detach")
-	if signal == "" {
-		up = append(up, "--wait")
-	}
-	up = append(up, "--no-deps", "--no-recreate", "--scale", service+"=2", service)
+	// Never `--wait`: the loop below is the one judge of the new container, whatever its keys.
+	up := append(in.composeBase(), "up", "--detach", "--no-deps", "--no-recreate", "--pull", "never", "--scale", service+"=2", service)
 	// The ready file as the shared volume holds it before the new container starts (an earlier
 	// overlap's, or none), read where the old container mounts the volume (an earlier release's
 	// update_socket may be another directory): the new container's is one that differs.
@@ -564,7 +565,7 @@ func (in *Installer) startBeside(ctx context.Context, environ []string, project,
 	if svc.UpdateSocket != "" && signal != "" {
 		// The signal asks the old container to hand its sockets over in the volume: one that does
 		// not mount it has none to hand.
-		dir, mounted, err := in.updateMount(ctx, old, project+"_"+UpdateVolume(service))
+		dir, mounted, err := in.updateMount(ctx, old, updateVolumeName(project, service))
 		if err != nil {
 			return false, beforeUp{fmt.Errorf("reading where its old container mounts its update_socket volume: %w", err)}
 		}
@@ -579,10 +580,7 @@ func (in *Installer) startBeside(ctx context.Context, environ []string, project,
 		}
 	}
 	in.O.logf("services.%s: start-first: the new container starts beside the old one", service)
-	if _, err := in.O.Docker.Run(ctx, Cmd{Args: up, Env: environ, Stream: in.O.Log}); err != nil || signal == "" {
-		if err != nil && in.declinedBeside(ctx, environ, service, old) {
-			return false, errDeclined
-		}
+	if _, err := in.O.Docker.Run(ctx, Cmd{Args: up, Env: environ, Stream: in.O.Log}); err != nil {
 		return false, err
 	}
 	cs, err := in.containers(ctx, environ, service)
@@ -599,6 +597,15 @@ func (in *Installer) startBeside(ctx context.Context, environ []string, project,
 	deadline := time.Now().Add(readyWait)
 	for {
 		switch {
+		case c.State == "restarting":
+			// Its restart policy runs it again: a decline before the signal is one, else the
+			// container is judged again until the deadline.
+			if !signalled && declines(svc, c) {
+				return false, errDeclined
+			}
+			if time.Now().After(deadline) {
+				return signalled, fmt.Errorf("its new container %s keeps restarting (exit code %s) after %s", c.Name, c.Exit, readyWait)
+			}
 		case c.State != "running" && c.State != "created":
 			if !signalled && declines(svc, c) {
 				return false, errDeclined
@@ -606,7 +613,7 @@ func (in *Installer) startBeside(ctx context.Context, environ []string, project,
 			return signalled, fmt.Errorf("its new container %s is %s (exit code %s)", c.Name, c.State, c.Exit)
 		case c.Health == "unhealthy":
 			return signalled, fmt.Errorf("its new container %s is unhealthy", c.Name)
-		case c.State == "running" && !signalled:
+		case c.State == "running" && signal != "" && !signalled:
 			if !ready {
 				now, there, err := in.readyFile(ctx, c.ID, file)
 				unread, ready = err, there && (!had || now != before)
@@ -662,14 +669,52 @@ type successorFailed struct{ err error }
 func (s successorFailed) Error() string { return s.err.Error() }
 func (s successorFailed) Unwrap() error { return s.err }
 
+// minMasked is the shortest value maskSecrets hides: a shorter one would rewrite ordinary
+// characters all through a log, and a value that short is no secret worth hiding.
+const minMasked = 4
+
+// maskSecrets is text with every value environ gives a secret of the install shown as
+// <redacted>, the longest first: a secret input of the mode environ records (the front's own
+// among them, such as the Cloudflare token: inputList), a generated secret and its rotation's
+// variables. A container's or Compose's output quoted into an error never shows one.
+func (in *Installer) maskSecrets(text string, environ []string) string {
+	if len(environ) == 0 {
+		return text // no value to hide
+	}
+	get := environLookup(environ)
+	keys := map[string]bool{}
+	for _, i := range in.inputList(get("STOWAGE_TLS_MODE")) {
+		if i.Secret {
+			keys[i.Key] = true
+		}
+	}
+	for _, sec := range in.secrets() {
+		keys[sec.Key] = true
+		if sec.Rotation {
+			keys[NextVar(sec.Key)], keys[PreviousVar(sec.Key)], keys[AcceptedVar(sec.Key)] = true, true, true
+		}
+	}
+	var values []string
+	for _, kv := range environ {
+		if k, v, _ := strings.Cut(kv, "="); keys[k] && len(v) >= minMasked {
+			values = append(values, v)
+		}
+	}
+	slices.SortFunc(values, func(a, b string) int { return len(b) - len(a) })
+	for _, v := range values {
+		text = strings.ReplaceAll(text, v, "<redacted>")
+	}
+	return text
+}
+
 // successorLogWait bounds the read of a failed new container's log.
 var successorLogWait = 10 * time.Second
 
 // lastLines are the last lines container id wrote (stdout and stderr, as docker logs merges them),
 // each indented, at most successorBytes (cut at a line where one fits), a control character but a
-// tab shown as ?; "" when there are none or the read fails (its stderr is docker's, not the
-// container's).
-func (in *Installer) lastLines(ctx context.Context, id string) string {
+// tab shown as ?, the install's secrets environ gives masked (maskSecrets); "" when there are none
+// or the read fails (its stderr is docker's, not the container's).
+func (in *Installer) lastLines(ctx context.Context, id string, environ []string) string {
 	ctx, cancel := context.WithTimeout(ctx, successorLogWait)
 	defer cancel()
 	var b bytes.Buffer
@@ -678,6 +723,8 @@ func (in *Installer) lastLines(ctx context.Context, id string) string {
 		return ""
 	}
 	out := bytes.TrimRight(append(ret, b.Bytes()...), "\r\n") // a Stream takes both streams; a tool may return them instead
+	// Masked whole, before the cut below could keep a secret's tail alone.
+	out = []byte(in.maskSecrets(string(out), environ))
 	if n := len(out); n > successorBytes {
 		atLine := out[n-successorBytes-1] == '\n'
 		out = out[n-successorBytes:]
@@ -708,25 +755,6 @@ func (in *Installer) lastLines(ctx context.Context, id string) string {
 // exit code until it runs again).
 func declines(svc spec.Service, c container) bool {
 	return svc.UpdateDeclineStatus != nil && (c.State == "exited" || c.State == "restarting") && c.Exit == strconv.Itoa(*svc.UpdateDeclineStatus)
-}
-
-// declinedBeside tells whether the service's new container beside old (a failed up --wait's)
-// ended declining the overlap; one that cannot be read did not.
-func (in *Installer) declinedBeside(ctx context.Context, environ []string, service, old string) bool {
-	svc := in.R.Spec.Services[service]
-	if svc.UpdateDeclineStatus == nil {
-		return false
-	}
-	cs, err := in.containers(ctx, environ, service)
-	if err != nil {
-		return false
-	}
-	for _, c := range cs {
-		if c.ID != old && declines(svc, c) {
-			return true
-		}
-	}
-	return false
 }
 
 // errNoHandoff is startBeside's when, with update_signal, the old container does not mount the
@@ -773,7 +801,12 @@ type readyStamp struct {
 // readyFile reads file in the container id (`docker cp`, which needs nothing in the image): its
 // stamp, there false when the engine answers that the container holds none.
 func (in *Installer) readyFile(ctx context.Context, id, file string) (st readyStamp, there bool, err error) {
-	out, err := in.O.Docker.Run(ctx, Cmd{Args: []string{"cp", id + ":" + file, "-"}})
+	// The archive docker cp writes, bounded: a ready file is a mark, never a large one.
+	b := &boundedBuffer{max: maxReadyFile + 64<<10}
+	ret, err := in.O.Docker.Run(ctx, Cmd{Args: []string{"cp", id + ":" + file, "-"}, Stdout: b})
+	if b.over || len(ret) > b.max {
+		return readyStamp{}, false, fmt.Errorf("update_ready %s is over %d bytes in the container: it must be a small file the new container writes", file, maxReadyFile)
+	}
 	if err != nil {
 		// The engine's answers for a path the container lacks, never a connection's or the CLI's.
 		if e := strings.ToLower(err.Error()); strings.Contains(e, "could not find the file") || strings.Contains(e, "no such container:path") {
@@ -781,10 +814,20 @@ func (in *Installer) readyFile(ctx context.Context, id, file string) (st readySt
 		}
 		return readyStamp{}, false, err
 	}
-	r := tar.NewReader(bytes.NewReader(out))
+	r := tar.NewReader(bytes.NewReader(append(ret, b.buf.Bytes()...))) // a tool may return stdout instead
 	h, err := r.Next()
 	if err != nil {
 		return readyStamp{}, false, fmt.Errorf("reading %s: %w", file, err)
+	}
+	if h.Typeflag != tar.TypeReg {
+		what := "not a regular file"
+		switch h.Typeflag {
+		case tar.TypeDir:
+			what = "a directory"
+		case tar.TypeSymlink:
+			what = "a symbolic link"
+		}
+		return readyStamp{}, false, fmt.Errorf("update_ready %s is %s in the container: it must be a regular file the new container writes", file, what)
 	}
 	d := sha256.New()
 	if _, err := io.Copy(d, r); err != nil {
@@ -793,6 +836,25 @@ func (in *Installer) readyFile(ctx context.Context, id, file string) (st readySt
 	st = readyStamp{mod: h.ModTime.UTC(), size: h.Size}
 	copy(st.sum[:], d.Sum(nil))
 	return st, true, nil
+}
+
+// maxReadyFile bounds an update_ready file readyFile reads.
+const maxReadyFile = 1 << 20
+
+// boundedBuffer holds at most max bytes written to it; a write past them fails (over), which
+// stops the command writing.
+type boundedBuffer struct {
+	buf  bytes.Buffer
+	max  int
+	over bool
+}
+
+func (b *boundedBuffer) Write(p []byte) (int, error) {
+	if b.buf.Len()+len(p) > b.max {
+		b.over = true
+		return 0, errors.New("over the bound")
+	}
+	return b.buf.Write(p)
 }
 
 // takeNetworks reads the networks' record into the start (prevNetworks, prevNetworksErr when it

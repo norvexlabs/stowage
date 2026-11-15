@@ -1,6 +1,10 @@
 package lint
 
 import (
+	"archive/tar"
+	"bytes"
+	"compress/gzip"
+	"maps"
 	"net"
 	"os"
 	"path/filepath"
@@ -162,6 +166,8 @@ func TestEachRuleFires(t *testing.T) {
 		{"unknown secret generator", []edit{{specFile, "gen: pass18", "gen: pass99"}}, nil, "unknown generator"},
 		{"duplicate key", []edit{{specFile, "key: SESSION_SECRET", "key: POSTGRES_PASSWORD"}}, nil, "already declared"},
 		{"reserved prefix", []edit{{specFile, "key: ADMIN_EMAIL", "key: STOWAGE_ADMIN"}}, nil, "reserved"},
+		// held- names the content a retired tag left: a channel's tags never start with it.
+		{"held tag prefix", []edit{{specFile, `tag: "beta-{v}"`, `tag: "held-{v}"`}}, nil, "held-"},
 		{"secret input with default", []edit{{specFile, `prompt: "Administrator email", required: true`, `prompt: "x", secret: true, default: "y"`}}, nil, "secret input"},
 		{"provision image unknown", []edit{{specFile, "    image: api\n    cmd: [notes-api, create-admin]", "    image: tools\n    cmd: [notes-api, create-admin]"}}, nil, "not an images key"},
 		{"schema compat unknown key", []edit{{specFile, "    image: api                                                 # runs inside the api image", "    image: api\n    shell: true"}}, nil, "shell"},
@@ -206,6 +212,9 @@ func TestEachRuleFires(t *testing.T) {
 // Every rule not reached from the minimal example, each by one mutation of the full example.
 func TestEachRuleFiresOnFull(t *testing.T) {
 	const sp, cp = specFile, composeFile
+	full := filepath.Join(testutil.RepoRoot(t), "examples", "full")
+	kbase, kinit := testutil.KairosPin(t, full, "base"), testutil.KairosPin(t, full, "kairos_init")
+	unpinned := func(ref string) string { r, _, _ := strings.Cut(ref, "@"); return r }
 	type edit struct{ file, old, new string }
 	cases := []struct {
 		name  string
@@ -233,11 +242,15 @@ func TestEachRuleFiresOnFull(t *testing.T) {
 		{"audit unsigned", []edit{{sp, "provider: cosign-key\n  key: env://ATLAS_SIGNING_KEY", "provider: none\n  key: env://ATLAS_SIGNING_KEY"}}, nil, "audit: a project that signs no release"},
 		{"audit fail_on", []edit{{sp, "fail_on: critical", "fail_on: none"}}, nil, `audit.fail_on: "none": one of negligible`},
 		{"audit allow missing", []edit{{sp, "allow: audit-allow.yaml", "allow: no-such.yaml"}}, nil, "audit.allow: no-such.yaml:"},
-		{"audit allow reason", []edit{{"audit-allow.yaml", "  reason: Docker's latest runc", "  reasons: Docker's latest runc"}}, nil, "audit.allow: audit-allow.yaml: yaml: unmarshal errors"},
-		{"audit allow date", []edit{{"audit-allow.yaml", "golang.org/x/net 0.55, no release has the fix; that build does not link x/net's HTTP/2 server, where the bug is\n  expires: 2027-01-31", "golang.org/x/net 0.55, no release has the fix; that build does not link x/net's HTTP/2 server, where the bug is\n  expires: 2027-02-30"}}, nil, `expires "2027-02-30": a date`},
-		{"audit allow artifact", []edit{{"audit-allow.yaml", "artifact: os\n  package: golang.org/x/net\n  path: /usr/bin/runc", "artifact: osx\n  package: golang.org/x/net\n  path: /usr/bin/runc"}}, nil, `audit.allow: audit-allow.yaml: allowance GO-2026-6612 in osx (package golang.org/x/net) (path /usr/bin/runc): artifact "osx" is no artifact of the release: one of api, ingest, postgres, provision, ui, os, front, backup, chown, audit, installer, or "*"`},
-		{"audit allow path", []edit{{"audit-allow.yaml", "path: /usr/bin/runc", "path: usr/bin/runc"}}, nil, `path "usr/bin/runc": an absolute, clean path`},
-		{"audit allow forever", []edit{{"audit-allow.yaml", "golang.org/x/net 0.55, no release has the fix; that build does not link x/net's HTTP/2 server, where the bug is\n  expires: 2027-01-31", "golang.org/x/net 0.55, no release has the fix; that build does not link x/net's HTTP/2 server, where the bug is\n  expires: 2099-01-01"}}, nil, "expires 2099-01-01: more than a year ahead"},
+		{"audit allow reason", []edit{{"audit-allow.yaml", "  reason: a fixture", "  reasons: a fixture"}}, nil, "audit.allow: audit-allow.yaml: yaml: unmarshal errors"},
+		{"audit allow date", []edit{{"audit-allow.yaml", "expires: 2027-01-31", "expires: 2027-02-30"}}, nil, `expires "2027-02-30": a date`},
+		// Stowage's images are the release's only when its graph builds them: no volume owned, no chown.
+		{"audit allow stowage image not built", []edit{{sp, "postgres: { uid: 70 }", "postgres: {}"}, {sp, "spool:    { uid: 65532 }", "spool:    {}"}, {"audit-allow.yaml", "artifact: os", "artifact: chown"}}, nil, `artifact "chown" is no artifact of the release: one of api, ingest, postgres, provision, ui, os, front, backup, audit, installer, or "*"`},
+		{"audit allow backup runner not built", []edit{{sp, "backup:\n  provider: pg-age-rclone\n", "backup:\n  provider: command\n  command: [./backup.sh]\n"}, {sp, "  default_profile: full\n  profiles:\n    full: all\n    config: [organisations, users, api_keys, settings]\n    lean: { exclude: [events, \"audit_*\"] }\n  volumes: [spool]", ""}, {"audit-allow.yaml", "artifact: os", "artifact: backup"}}, nil, `artifact "backup" is no artifact of the release`},
+		{"audit allow scanner not built", []edit{{sp, "signing:\n  provider: cosign-key\n  key: env://ATLAS_SIGNING_KEY\n  public_keys: [keys/release-2026.pub]\n", "signing: { provider: none }\n"}, {"audit-allow.yaml", "artifact: os", "artifact: audit"}}, nil, `artifact "audit" is no artifact of the release`},
+		{"audit allow artifact", []edit{{"audit-allow.yaml", "artifact: os", "artifact: osx"}}, nil, `audit.allow: audit-allow.yaml: allowance GO-0000-0001 in osx (package example.com/fixture) (path /usr/bin/fixture): artifact "osx" is no artifact of the release: one of api, ingest, postgres, provision, ui, os, front, backup, chown, audit, installer, or "*"`},
+		{"audit allow path", []edit{{"audit-allow.yaml", "path: /usr/bin/fixture", "path: usr/bin/fixture"}}, nil, `path "usr/bin/fixture": an absolute, clean path`},
+		{"audit allow forever", []edit{{"audit-allow.yaml", "expires: 2027-01-31", "expires: 2099-01-01"}}, nil, "expires 2099-01-01: more than a year ahead"},
 		{"contexts name", []edit{{sp, "contexts: { schema: migrations }", "contexts: { Schema: migrations }"}}, nil, `images.api.contexts: "Schema" is not a build context name`},
 		{"contexts name end", []edit{{sp, "contexts: { schema: migrations }", "contexts: { schema-: migrations }"}}, nil, `images.api.contexts: "schema-" is not a build context name`},
 		{"contexts name twice", []edit{{sp, "contexts: { schema: migrations }", "contexts: { a..b: migrations }"}}, nil, `images.api.contexts: "a..b" is not a build context name`},
@@ -305,8 +318,8 @@ func TestEachRuleFiresOnFull(t *testing.T) {
 		{"memory share min over max", []edit{{sp, memShares, "services:\n  api: { memory: { percent: 10, min: 1025M, max: 1G } }\n"}}, nil, "services.api.memory.min: 1025M: over the share's max 1G"},
 		{"memory share min over max by a byte", []edit{{sp, memShares, "services:\n  api: { memory: { percent: 10, min: 1073741825, max: 1G } }\n"}}, nil, "services.api.memory.min: 1073741825: over the share's max 1G"},
 		{"memory share max without percent", []edit{{sp, memShares, "services:\n  postgres: { memory: { max: 16G } }\n"}}, nil, "services.postgres.memory: 0: a percent of the host's RAM"},
-		{"vm size empty", []edit{{sp, vmSizeLine, "size: {}"}}, nil, "shapes.kairos.size: states no size"},
-		{"vm size states nothing", []edit{{sp, vmSizeLine, "size: { min: {} }"}}, nil, "shapes.kairos.size.min: states nothing"},
+		{"vm size empty", []edit{{sp, vmSizeLine, "size: {}"}}, nil, "shapes.kairos.size is written with nothing under it: give min, recommended or both, or remove size"},
+		{"vm size states nothing", []edit{{sp, vmSizeLine, "size: { min: {} }"}}, nil, "shapes.kairos.size.min is written with nothing under it: give cpus, memory or disk, or remove min"},
 		{"vm size negative cpus", []edit{{sp, vmSizeLine, "size: { min: { cpus: -1 } }"}}, nil, "cpus: -1: at least 1"},
 		{"vm size small memory", []edit{{sp, vmSizeLine, "size: { min: { memory: 1023M } }"}}, nil, "shapes.kairos.size.min.memory: 1023M: whole MiB, at least 1G"},
 		{"vm size partial MiB", []edit{{sp, vmSizeLine, "size: { min: { memory: 2097153K } }"}}, nil, "shapes.kairos.size.min.memory: 2097153K: whole MiB"},
@@ -315,15 +328,15 @@ func TestEachRuleFiresOnFull(t *testing.T) {
 		{"vm size min over recommended cpus", []edit{{sp, vmSizeLine, "size: { min: { cpus: 4 }, recommended: { cpus: 3 } }"}}, nil, "shapes.kairos.size.recommended.cpus: 3: under the minimum 4"},
 		{"vm size min over recommended memory", []edit{{sp, vmSizeLine, "size: { min: { memory: 8G }, recommended: { memory: 8191M } }"}}, nil, "shapes.kairos.size.recommended.memory: 8191M: under the minimum 8G"},
 		{"vm size min over recommended disk", []edit{{sp, vmSizeLine, "size: { min: { disk: 41G }, recommended: { disk: 40G } }"}}, nil, "shapes.kairos.size.recommended.disk: 40G: under the minimum 41G"},
-		{"vm size min left empty", []edit{{sp, vmSizeLine, "size: { min: , recommended: { cpus: 2 } }"}}, nil, "shapes.kairos.size.min: states nothing"},
-		{"vm size left empty", []edit{{sp, vmSizeLine, "size:"}}, nil, "shapes.kairos.size: states no size"},
-		{"memory shares empty", []edit{{sp, servicesBlock, "services: {}\n"}}, nil, "services: names no service"},
-		{"services left empty", []edit{{sp, servicesBlock, "services:\n"}}, nil, "services: names no service"},
+		{"vm size min left empty", []edit{{sp, vmSizeLine, "size: { min: , recommended: { cpus: 2 } }"}}, nil, "shapes.kairos.size.min is written with nothing under it"},
+		{"vm size left empty", []edit{{sp, vmSizeLine, "size:"}}, nil, "shapes.kairos.size is written with nothing under it"},
+		{"memory shares empty", []edit{{sp, servicesBlock, "services: {}\n"}}, nil, "services is written with nothing under it: name a service, or remove services"},
+		{"services left empty", []edit{{sp, servicesBlock, "services:\n"}}, nil, "services is written with nothing under it"},
 		{"service asking nothing", []edit{{sp, memShares, "services:\n  api: {}\n"}}, nil, "services.api: says nothing"},
 		{"tune profile unknown", []edit{{sp, "  profile: network   #", "  profile: shared   #"}}, nil, `tune.profile: "shared": default or network`},
 		{"tune profile missing", []edit{{sp, "  profile: network   #", "  other: network   #"}}, nil, "field other not found"},
 		{"tune profile empty", []edit{{sp, "  profile: network   #", "  profile: \"\"   #"}}, nil, "tune.profile: missing"},
-		{"tune left empty", []edit{{sp, "tune:\n  profile: network   # a heavy network load: the hosts are tuned for it (default: Docker's path alone)\n", "tune:\n"}}, nil, "tune.profile: missing"},
+		{"tune left empty", []edit{{sp, "tune:\n  profile: network   # a heavy network load: the hosts are tuned for it (default: Docker's path alone)\n", "tune:\n"}}, nil, "tune is written with nothing under it: give its profile, or remove tune"},
 		{"login user", []edit{{sp, "basic_auth: { user: ops, secret: OPS_PASSWORD }", "basic_auth: { user: \"o:ps\", secret: OPS_PASSWORD }"}}, nil, `front.routes[3].basic_auth.user: "o:ps" must be 1 to 64 letters`},
 		{"login user missing", []edit{{sp, "basic_auth: { user: ops, secret: OPS_PASSWORD }", "basic_auth: { secret: OPS_PASSWORD }"}}, nil, `front.routes[3].basic_auth.user: "" must be`},
 		{"login secret missing", []edit{{sp, "basic_auth: { user: ops, secret: OPS_PASSWORD }", "basic_auth: { user: ops }"}}, nil, "front.routes[3].basic_auth.secret: is required"},
@@ -423,7 +436,7 @@ func TestEachRuleFiresOnFull(t *testing.T) {
 		{"allow input advanced", []edit{{sp, `default: "0.0.0.0/0, ::/0", shapes`, `advanced: true, shapes`}}, nil, "INGEST_SOURCES is advanced, never asked"},
 		{"allow input required", []edit{{sp, `default: "0.0.0.0/0, ::/0", shapes`, `required: true, shapes`}}, nil, "INGEST_SOURCES is required: empty is how the front"},
 		{"publish ca volume undeclared", []edit{{sp, "publish_ca: { volume: ca }", "publish_ca: { volume: cacerts }"}}, nil, `front.publish_ca.volume: "cacerts" is not a volume`},
-		{"publish ca volume of root", []edit{{sp, "    certs:    { uid: 0, keep_on_reset: true }\n", "    certs:    { uid: 0, keep_on_reset: true }\n    ca:       { uid: 0 }\n"}}, nil, "front.publish_ca.volume: ca's uid is 0 (data.volumes.ca.uid): the front"},
+		{"publish ca volume of root", []edit{{sp, "    ca:       { keep_on_reset: true }", "    ca:       { uid: 0, keep_on_reset: true }"}}, nil, "front.publish_ca.volume: ca's uid is 0 (data.volumes.ca.uid): the front"},
 		{"publish ca without a CA mode", []edit{{sp, "tls_modes: [acme, dns-cloudflare, byo, internal, none]", "tls_modes: [acme, dns-cloudflare, none]"}}, nil, "front.publish_ca: no mode offered has a CA to publish"},
 		{"advanced with default", []edit{{sp, `prompt: "Log level (debug, info, warning)", advanced: true`, `prompt: "Log level (debug, info, warning)", default: info, advanced: true`}}, nil, "inputs[9].advanced: an advanced input is never asked"},
 		{"advanced without compose default", []edit{{cp, "${LOG_LEVEL:-info}", "${LOG_LEVEL}"}}, nil, "${LOG_LEVEL} is an advanced input, recorded only when given"},
@@ -447,7 +460,11 @@ func TestEachRuleFiresOnFull(t *testing.T) {
 		{"sql without current", []edit{{sp, "    current: \"SELECT max(version) FROM schema_migrations WHERE success\"\n", ""}}, nil, "current is required"},
 		{"negative uid", []edit{{sp, "spool:    { uid: 65532 }", "spool:    { uid: -1 }"}}, nil, "uid must be 0 to 4294967294"},
 		{"uid past the range", []edit{{sp, "spool:    { uid: 65532 }", "spool:    { uid: 4294967295 }"}}, nil, "uid must be 0 to 4294967294"},
-		{"reset keeps", []edit{{sp, "reset: [postgres, spool]", "reset: [postgres, certs]"}}, nil, "keep_on_reset"},
+		{"data volume undeclared", []edit{{sp, "spool:    { uid: 65532 }", "spool:    { uid: 65532 }\n    cache:    { uid: 1 }"}}, nil, `data.volumes.cache: "cache" is not a volume deploy/compose.yaml declares`},
+		{"reset external", []edit{{cp, "  spool: {}\n", "  spool: { external: true }\n"}}, nil, `data.reset: "spool" is an external volume, which Compose does not own: reset-db does not delete it`},
+		{"reset external string", []edit{{cp, "  spool: {}\n", "  spool: { external: \"${SPOOL_EXTERNAL}\" }\n"}}, nil, `data.reset: "spool" is an external volume`},
+		{"reset interpolated name", []edit{{cp, "  spool: {}\n", "  spool: { name: \"${SPOOL}\" }\n"}}, nil, `data.reset: "spool" is named "${SPOOL}", which Compose interpolates: reset-db does not delete it`},
+		{"reset keeps", []edit{{sp, "reset: [postgres, spool]", "reset: [postgres, ca]"}}, nil, "keep_on_reset"},
 		{"secret key name", []edit{{sp, "key: APP_DB_PASSWORD", "key: app-db"}}, nil, "not an environment variable name"},
 		{"input without prompt", []edit{{sp, `prompt: "Organisation name",        required: true`, `required: true`}}, nil, "prompt: is required"},
 		{"required and optional", []edit{{sp, `prompt: "Organisation name",        required: true`, `prompt: "x", required: true, optional: true`}}, nil, "exclusive"},
@@ -536,10 +553,10 @@ func TestEachRuleFiresOnFull(t *testing.T) {
 		{"backup exclude pattern", []edit{{sp, "lean: { exclude: [events", "lean: { exclude: [events-x"}}, nil, "is not a table pattern"},
 		{"backup profile name", []edit{{sp, "    config: [organisations", "    con-fig: [organisations"}}, nil, "lowercase letters and digits"},
 		{"postgres mode", []edit{{sp, "postgres_modes: [embedded, external]", "postgres_modes: [rds]"}}, nil, "unknown mode \"rds\""},
-		{"kairos base", []edit{{sp, "    base: ubuntu:26.04@sha256:6a06111c3b0a8600feadb270aec771dc239bf407b25625f93f44ab00e11f4d3c\n", ""}}, nil, "shapes.kairos.base: is required"},
-		{"kairos init", []edit{{sp, "    kairos_init: quay.io/kairos/kairos-init:v4.4.0@sha256:eb131bd9b4ed5b9b25cf761af9afa7d462bef27c2d0e9453ce884cf7733a6556\n", ""}}, nil, "shapes.kairos.kairos_init: is required"},
-		{"kairos base unpinned", []edit{{sp, "base: ubuntu:26.04@sha256:6a06111c3b0a8600feadb270aec771dc239bf407b25625f93f44ab00e11f4d3c", "base: ubuntu:26.04"}}, nil, `shapes.kairos.base: "ubuntu:26.04" must be pinned by digest`},
-		{"kairos init unpinned", []edit{{sp, "kairos-init:v4.4.0@sha256:eb131bd9b4ed5b9b25cf761af9afa7d462bef27c2d0e9453ce884cf7733a6556", "kairos-init:v4.4.0"}}, nil, `"quay.io/kairos/kairos-init:v4.4.0" must be pinned by digest`},
+		{"kairos base", []edit{{sp, "    base: " + kbase + "\n", ""}}, nil, "shapes.kairos.base: is required"},
+		{"kairos init", []edit{{sp, "    kairos_init: " + kinit + "\n", ""}}, nil, "shapes.kairos.kairos_init: is required"},
+		{"kairos base unpinned", []edit{{sp, "base: " + kbase, "base: " + unpinned(kbase)}}, nil, `shapes.kairos.base: "` + unpinned(kbase) + `" must be pinned by digest`},
+		{"kairos init unpinned", []edit{{sp, kinit, unpinned(kinit)}}, nil, `"` + unpinned(kinit) + `" must be pinned by digest`},
 		{"pull shares the push token", []edit{{sp, "token_env: STOWAGE_PULL_TOKEN", "token_env: STOWAGE_PUSH_TOKEN"}}, nil, "registry.pull: token_env STOWAGE_PUSH_TOKEN is registry.push's"},
 		{"pull is the push docker config", []edit{{sp, "pull: { provider: token, user: atlas-pull, token_env: STOWAGE_PULL_TOKEN }", "pull: { provider: docker-config, config: ci }"}, {sp, "push: { provider: token, user: publisher, token_env: STOWAGE_PUSH_TOKEN }", "push: { provider: docker-config, config: ci/ }"}}, nil, "registry.pull: is registry.push's Docker config"},
 		{"cloud", []edit{{sp, "cloud_publish: [aws, azure, gcp]", "cloud_publish: [ovh]"}}, nil, "unknown cloud"},
@@ -697,6 +714,10 @@ func TestEachRuleFiresOnFull(t *testing.T) {
     vm.swappiness: { value: "10",`}}, nil, "host.sysctls.net.ipv4.conf.edge.arp_announce.value: 1 is below the arp_announce 2 all holds on a VM of several NIC roles, and the kernel takes the larger: set net.ipv4.conf.all.arp_announce to 1"},
 		{"default's ARP setting below all's", []edit{{sp, `    vm.swappiness: { value: "10",`, `    net.ipv4.conf.default.arp_ignore: { value: "0", reason: "r" }
     vm.swappiness: { value: "10",`}}, nil, "host.sysctls.net.ipv4.conf.default.arp_ignore.value: 0 is below the arp_ignore 1 all holds"},
+		{"all's ARP announce out of range", []edit{{sp, `    vm.swappiness: { value: "10",`, `    net.ipv4.conf.all.arp_announce: { value: "5", reason: "r" }
+    vm.swappiness: { value: "10",`}}, nil, "host.sysctls.net.ipv4.conf.all.arp_announce.value: 5: arp_announce is 0, 1 or 2"},
+		{"a NIC's ARP ignore out of range", []edit{{sp, `    vm.swappiness: { value: "10",`, `    net.ipv4.conf.edge.arp_ignore: { value: "4", reason: "r" }
+    vm.swappiness: { value: "10",`}}, nil, "host.sysctls.net.ipv4.conf.edge.arp_ignore.value: 4: arp_ignore is 0, 1, 2, 3 or 8"},
 		{"a NIC's ARP setting below the project's all", []edit{{sp, `    vm.swappiness: { value: "10",`, `    net.ipv4.conf.all.arp_ignore: { value: "2", reason: "r" }
     net.ipv4.conf.edge.arp_ignore: { value: "1", reason: "r" }
     vm.swappiness: { value: "10",`}}, nil, "host.sysctls.net.ipv4.conf.edge.arp_ignore.value: 1 is below the arp_ignore 2 all holds"},
@@ -711,6 +732,10 @@ func TestEachRuleFiresOnFull(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			root := testutil.CopyExample(t, "full")
 			for _, e := range c.edits {
+				if e.file == "audit-allow.yaml" {
+					// The fixture alone: live entries change as upstream fixes land.
+					testutil.Write(t, root, e.file, testutil.Allowance)
+				}
 				testutil.Edit(t, root, e.file, e.old, e.new)
 			}
 			for f, content := range c.write {
@@ -1603,7 +1628,7 @@ func TestAnotherKairosInitReleaseIsWarned(t *testing.T) {
 // from a mirror included, is not.
 func TestABaseOtherThanUbuntuIsWarned(t *testing.T) {
 	t.Parallel()
-	const base = "base: ubuntu:26.04@"
+	base := "base: " + strings.SplitAfter(testutil.KairosPin(t, filepath.Join(testutil.RepoRoot(t), "examples", "full"), "base"), "@")[0]
 	warned := func(res *Result) bool {
 		return slices.ContainsFunc(res.Findings, func(f Finding) bool {
 			return f.Severity == Warning && strings.Contains(f.String(), "shapes.kairos.base:") && strings.Contains(f.String(), "takes Ubuntu alone")
@@ -1669,7 +1694,9 @@ func TestAHostSettingOfTheNamespaceIsWarned(t *testing.T) {
 	}) {
 		t.Errorf("network_mode host: %+v", res.Findings)
 	}
-	for key, want := range map[string]bool{"kernel.shmmax": true, "kernel.sem": true, "fs.mqueue.msg_max": true, "net.unix.max_dgram_qlen": true, "net.ipv4.tcp_mem": false, "net.core.rmem_default": false, "kernel.pid_max": false, "net.mptcp.enabled": true, "kernel.hostname": true, "kernel.sem_next_id": true} {
+	for key, want := range map[string]bool{"kernel.shmmax": true, "kernel.sem": true, "fs.mqueue.msg_max": true, "net.unix.max_dgram_qlen": true, "net.ipv4.tcp_mem": false, "net.core.rmem_default": false, "kernel.pid_max": false, "net.mptcp.enabled": true, "kernel.hostname": true, "kernel.sem_next_id": true,
+		"net.ipv4.tcp_max_orphans": false, "net.ipv4.inet_peer_threshold": false, "net.ipv4.inet_peer_minttl": false, "net.ipv4.inet_peer_maxttl": false, "net.ipv4.fib_sync_mem": false, "net.netfilter.nf_conntrack_expect_max": false, "net.netfilter.nf_conntrack_buckets": false,
+		"net.ipv4.tcp_max_syn_backlog": true, "net.ipv4.udp_rmem_min": true, "net.netfilter.nf_conntrack_tcp_timeout_established": true} {
 		if namespaced(key) != want {
 			t.Errorf("namespaced(%s) = %v", key, !want)
 		}
@@ -1817,7 +1844,7 @@ func TestL4AllowlistToTheHostsNetworkWarnsOnDocker(t *testing.T) {
 func TestVMFirewallOnlyKeysWithoutKairosWarn(t *testing.T) {
 	t.Parallel()
 	root := testutil.CopyExample(t, "full")
-	testutil.Edit(t, root, specFile, "  kairos:\n    base: ubuntu:26.04@sha256:6a06111c3b0a8600feadb270aec771dc239bf407b25625f93f44ab00e11f4d3c\n    kairos_init: quay.io/kairos/kairos-init:v4.4.0@sha256:eb131bd9b4ed5b9b25cf761af9afa7d462bef27c2d0e9453ce884cf7733a6556\n    disk_formats: [raw, qcow2, ova, vhd, gce, iso]\n    cloud_publish: [aws, azure, gcp]\n    disks: opt-in   # always: every ship publishes the disks; opt-in (the default): a ship asked to (--disks)\n    health_gate: { deadline_s: 600, deadline_after_reset_s: 1800, poll_s: 30 }\n    host_api: [api]\n    "+vmSizeLine+"   # vm create's least and default size\n", "")
+	testutil.Edit(t, root, specFile, "  kairos:\n    base: "+testutil.KairosPin(t, root, "base")+"\n    kairos_init: "+testutil.KairosPin(t, root, "kairos_init")+"\n    disk_formats: [raw, qcow2, ova, vhd, gce, iso]\n    cloud_publish: [aws, azure, gcp]\n    disks: opt-in   # always: every ship publishes the disks; opt-in (the default): a ship asked to (--disks)\n    health_gate: { deadline_s: 600, deadline_after_reset_s: 1800, poll_s: 30 }\n    host_api: [api]\n    "+vmSizeLine+"   # vm create's least and default size\n", "")
 	testutil.Write(t, root, "audit-allow.yaml", "") // its entries are the OS bundle's, which the release no longer carries
 	res := run(t, root)
 	if errs := errorsOf(res); len(errs) > 0 {
@@ -1969,6 +1996,121 @@ func TestChartNotReadingTheL4RoutesWarns(t *testing.T) {
 	if len(res.Findings) != 1 || !strings.Contains(res.Findings[0].String(), "no template reads .Values.stowage.l4") {
 		t.Fatalf("findings: %+v", res.Findings)
 	}
+}
+
+// A chart that routes HTTP to its Services (an Ingress, an HTTPRoute) serves the front's routes on
+// Kubernetes: each route with a guard the Docker and VM fronts enforce is warned, a route without
+// one is not; a chart declaring no such resource (the full example's) serves none and is not.
+func TestAGuardedRouteOnAChartsIngressWarns(t *testing.T) {
+	t.Parallel()
+	for kind, want := range map[string][]string{
+		"Ingress":                 {"front.routes[1]: api: on Kubernetes the chart's ingress serves the route, and Stowage enforces none of its guards there (forward_auth): the chart's ingress must, or the route is open on the cluster", "front.routes[2]: ingest: on Kubernetes the chart's ingress serves the route, and Stowage enforces none of its guards there (allow_input)", "front.routes[3]: ops: on Kubernetes the chart's ingress serves the route, and Stowage enforces none of its guards there (client_auth, basic_auth)"},
+		"\"HTTPRoute\"   # api":   {"front.routes[1]: api:", "front.routes[2]: ingest:", "front.routes[3]: ops:"},
+		"GRPCRoute":               {"front.routes[1]: api:", "front.routes[2]: ingest:", "front.routes[3]: ops:"},
+		"IngressClass":            nil,
+		"Service":                 nil,
+		"{{ .Values.routeKind }}": {"front.routes[1]: api:", "front.routes[2]: ingest:", "front.routes[3]: ops:"},
+	} {
+		root := testutil.CopyExample(t, "full")
+		testutil.Write(t, root, "deploy/chart/templates/routes.yaml", "apiVersion: v1\nkind: "+kind+"\nmetadata:\n  name: {{ .Release.Name }}-routes\n")
+		res := run(t, root)
+		var got []string
+		for _, f := range res.Findings {
+			got = append(got, f.String())
+		}
+		if len(got) != len(want) {
+			t.Fatalf("%s: findings %q", kind, got)
+		}
+		for i := range want {
+			if !strings.Contains(got[i], want[i]) {
+				t.Errorf("%s: %q, want %q", kind, got[i], want[i])
+			}
+		}
+	}
+}
+
+// A subchart's templates are scanned too, vendored as a directory or an archive (nested ones
+// included); an archive that cannot be read may route HTTP, so it warns.
+func TestAGuardedRouteOnASubchartsIngressWarns(t *testing.T) {
+	t.Parallel()
+	ingress := "apiVersion: networking.k8s.io/v1\nkind: Ingress\nmetadata:\n  name: x\n"
+	service := "apiVersion: v1\nkind: Service\nmetadata:\n  name: x\n"
+	for name, c := range map[string]struct {
+		path, content string
+		warns         bool
+	}{
+		"directory":             {"deploy/chart/charts/web/templates/ingress.yaml", ingress, true},
+		"directory service":     {"deploy/chart/charts/web/templates/svc.yaml", service, false},
+		"archive":               {"deploy/chart/charts/web-1.0.0.tgz", chartArchive(t, "web", map[string]string{"templates/ingress.yaml": ingress}), true},
+		"archive service":       {"deploy/chart/charts/web-1.0.0.tgz", chartArchive(t, "web", map[string]string{"templates/svc.yaml": service, "values.yaml": ingress}), false},
+		"archive in archive":    {"deploy/chart/charts/web-1.0.0.tgz", chartArchive(t, "web", map[string]string{"charts/edge-1.0.0.tgz": chartArchive(t, "edge", map[string]string{"templates/route.yaml": strings.Replace(ingress, "Ingress", "HTTPRoute", 1)})}), true},
+		"unreadable archive":    {"deploy/chart/charts/web-1.0.0.tgz", brokenArchive(t), true},
+		"archive of ./ entries": {"deploy/chart/charts/web-1.0.0.tgz", chartArchive(t, "web", map[string]string{"charts/edge-1.0.0.tgz": chartArchive(t, "./edge", map[string]string{"templates/route.yaml": ingress})}), true},
+		"json":                  {"deploy/chart/templates/r.yaml", `{"apiVersion": "networking.k8s.io/v1", "kind": "Ingress", "metadata": {"name": "x"}}`, true},
+		"flow":                  {"deploy/chart/templates/r.yaml", "{apiVersion: gateway.networking.k8s.io/v1, kind: HTTPRoute, metadata: {name: x}}\n", true},
+		"flow class":            {"deploy/chart/templates/r.yaml", "{apiVersion: networking.k8s.io/v1, kind: IngressClass, metadata: {name: x}}\n", false},
+	} {
+		root := testutil.CopyExample(t, "full")
+		testutil.Write(t, root, c.path, c.content)
+		warned := slices.ContainsFunc(run(t, root).Findings, func(f Finding) bool {
+			return strings.Contains(f.String(), "front.routes[1]: api: on Kubernetes the chart's ingress serves the route")
+		})
+		if warned != c.warns {
+			t.Errorf("%s: warned %v", name, warned)
+		}
+	}
+}
+
+// brokenArchive is a packaged chart whose Chart.yaml helm reads, followed by a header tar refuses.
+func brokenArchive(t *testing.T) string {
+	t.Helper()
+	var tb bytes.Buffer
+	tw := tar.NewWriter(&tb)
+	chart := "apiVersion: v2\nname: web\nversion: 1.0.0\n"
+	if err := tw.WriteHeader(&tar.Header{Name: "web/Chart.yaml", Mode: 0o644, Size: int64(len(chart)), Typeflag: tar.TypeReg}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tw.Write([]byte(chart)); err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	tb.Write(bytes.Repeat([]byte("x"), 512))
+	var b bytes.Buffer
+	zw := gzip.NewWriter(&b)
+	if _, err := zw.Write(tb.Bytes()); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return b.String()
+}
+
+// chartArchive is a packaged chart named name holding files (by their path inside the chart); a
+// name starting with ./ gives its entries that prefix, as some archivers write them.
+func chartArchive(t *testing.T, name string, files map[string]string) string {
+	t.Helper()
+	var b bytes.Buffer
+	zw := gzip.NewWriter(&b)
+	tw := tar.NewWriter(zw)
+	files["Chart.yaml"] = "apiVersion: v2\nname: " + strings.TrimPrefix(name, "./") + "\nversion: 1.0.0\n"
+	for _, p := range slices.Sorted(maps.Keys(files)) {
+		if err := tw.WriteHeader(&tar.Header{Name: name + "/" + p, Mode: 0o644, Size: int64(len(files[p])), Typeflag: tar.TypeReg}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tw.Write([]byte(files[p])); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return b.String()
 }
 
 // A disk-pressure hook with neither the docker nor the kairos shape is warned: only the VM's host
@@ -2736,7 +2878,8 @@ func TestADeclaredL4TLSDomainIsAlwaysAsked(t *testing.T) {
 // A VM of a project without a database still keeps its data volumes: without a backup, warned.
 func TestAVMsDataVolumesWithoutABackupAreWarned(t *testing.T) {
 	t.Parallel()
-	kairos := "  docker: {}\n  kairos:\n    base: ubuntu:26.04@sha256:6a06111c3b0a8600feadb270aec771dc239bf407b25625f93f44ab00e11f4d3c\n    kairos_init: quay.io/kairos/kairos-init:v4.4.0@sha256:eb131bd9b4ed5b9b25cf761af9afa7d462bef27c2d0e9453ce884cf7733a6556\n    disk_formats: [qcow2]\n"
+	full := filepath.Join(testutil.RepoRoot(t), "examples", "full")
+	kairos := "  docker: {}\n  kairos:\n    base: " + testutil.KairosPin(t, full, "base") + "\n    kairos_init: " + testutil.KairosPin(t, full, "kairos_init") + "\n    disk_formats: [qcow2]\n"
 	const want = "the VM keeps its data volumes locally and no backup is declared (volumes-age-rclone archives them)"
 	for _, backup := range []bool{true, false} {
 		root := testutil.CopyExample(t, "stateless")
@@ -2769,7 +2912,8 @@ func TestAuditAllowNotice(t *testing.T) {
 		{"2026-11-07", ""},
 	} {
 		root := testutil.CopyExample(t, "full")
-		testutil.Edit(t, root, "audit-allow.yaml", "golang.org/x/net 0.55, no release has the fix; that build does not link x/net's HTTP/2 server, where the bug is\n  expires: 2027-01-31", "golang.org/x/net 0.55, no release has the fix; that build does not link x/net's HTTP/2 server, where the bug is\n  expires: "+c.expires)
+		testutil.Write(t, root, "audit-allow.yaml", testutil.Allowance)
+		testutil.Edit(t, root, "audit-allow.yaml", "expires: 2027-01-31", "expires: "+c.expires)
 		res, err := Run(root, filepath.Join(root, specFile), now)
 		if err != nil {
 			t.Fatal(err)
@@ -2783,16 +2927,17 @@ func TestAuditAllowNotice(t *testing.T) {
 		switch {
 		case c.want == "" && len(warns) > 0:
 			t.Errorf("%s: warned %q", c.expires, warns)
-		case c.want != "" && (len(warns) != 1 || !strings.Contains(warns[0], "allowance GO-2026-6612 in os (package golang.org/x/net) (path /usr/bin/runc) "+c.want)):
+		case c.want != "" && (len(warns) != 1 || !strings.Contains(warns[0], "allowance GO-0000-0001 in os (package example.com/fixture) (path /usr/bin/fixture) "+c.want)):
 			t.Errorf("%s: %q, want %q", c.expires, warns, c.want)
 		}
 		if errs := errorsOf(res); len(errs) > 0 {
 			t.Errorf("%s: %q", c.expires, errs)
 		}
 	}
-	for art, ok := range map[string]bool{"disk-raw": false, "disk": false, "release": false, "api": true, "\"*\"": true, "front": true} {
+	for art, ok := range map[string]bool{"disk-raw": false, "disk": false, "release": false, "api": true, "\"*\"": true, "front": true, "chown": true, "backup": true, "audit": true} {
 		root := testutil.CopyExample(t, "full")
-		testutil.Edit(t, root, "audit-allow.yaml", "artifact: os\n  package: golang.org/x/net\n  path: /usr/bin/runc", "artifact: "+art+"\n  package: golang.org/x/net\n  path: /usr/bin/runc")
+		testutil.Write(t, root, "audit-allow.yaml", testutil.Allowance)
+		testutil.Edit(t, root, "audit-allow.yaml", "artifact: os", "artifact: "+art)
 		res, err := Run(root, filepath.Join(root, specFile), now)
 		if err != nil {
 			t.Fatal(err)
@@ -2829,5 +2974,22 @@ func TestUntrackedIsAFileGitDoesNotRecord(t *testing.T) {
 	testutil.Git(t, root, "add", "-f", "server/vendor/codec.bin")
 	if errs := strings.Join(errorsOf(run(t, root)), "\n"); !strings.Contains(errs, "images.api.untracked[0].path: git records server/vendor/codec.bin") {
 		t.Fatalf("recorded by git:\n%s", errs)
+	}
+}
+
+// A reset volume the compose file does not declare is reported once, as a data volume.
+func TestAResetVolumeMissingFromComposeIsReportedOnce(t *testing.T) {
+	t.Parallel()
+	root := testutil.CopyExample(t, "full")
+	testutil.Edit(t, root, specFile, "spool:    { uid: 65532 }", "spool:    { uid: 65532 }\n    cache:    { uid: 1 }")
+	testutil.Edit(t, root, specFile, "reset: [postgres, spool]", "reset: [postgres, spool, cache]")
+	var got []string
+	for _, e := range errorsOf(run(t, root)) {
+		if strings.Contains(e, `"cache"`) {
+			got = append(got, e)
+		}
+	}
+	if len(got) != 1 || !strings.Contains(got[0], `data.volumes.cache: "cache" is not a volume deploy/compose.yaml declares: data volumes are the compose file's`) {
+		t.Fatalf("errors: %q", got)
 	}
 }

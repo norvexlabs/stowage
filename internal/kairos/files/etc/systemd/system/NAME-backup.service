@@ -4,9 +4,12 @@ Description={{.Name}}: the scheduled backup (`{{.Ctl}} backup`), when one is con
 ConditionPathExists=!/run/cos/live_mode
 Wants={{.Name}}-hostd.service
 After={{.Name}}.service {{.Name}}-hostd.service
+# A run that failed is tried again later, a bounded number of times.
+{{.BackupStartLimit}}
 
 [Service]
 Type=oneshot
 ExecStart=/usr/sbin/{{.Ctl}} backup run --if-configured
 # The host daemon bounds a backup at an hour.
 TimeoutStartSec=75min
+{{.BackupRetry}}

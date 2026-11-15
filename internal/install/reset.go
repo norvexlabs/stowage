@@ -16,6 +16,7 @@ import (
 
 	"go.yaml.in/yaml/v3"
 
+	"github.com/norvexlabs/stowage/internal/lint"
 	"github.com/norvexlabs/stowage/internal/providers"
 	"github.com/norvexlabs/stowage/internal/spec"
 )
@@ -74,28 +75,9 @@ func confirmReset(ctx context.Context, p Prompter, yes bool, name, what string) 
 // creates (not external): a reset that deleted nothing would leave the data. It returns each one's
 // `name:`, empty when the compose file gives none.
 func (in *Installer) composeVolumes(names []string) (map[string]string, error) {
-	var doc struct {
-		Volumes map[string]struct {
-			Name     string `yaml:"name"`
-			External any    `yaml:"external"`
-		} `yaml:"volumes"`
-	}
-	if err := yaml.Unmarshal(in.R.Compose, &doc); err != nil {
-		return nil, fmt.Errorf("the release's compose file: %w", err)
-	}
-	named := map[string]string{}
-	for _, v := range names {
-		decl, ok := doc.Volumes[v]
-		switch {
-		case !ok:
-			return nil, fmt.Errorf("data.reset: %q is no volume of the compose file: reset-db would wipe nothing of it", v)
-		case decl.External != nil && decl.External != false:
-			return nil, fmt.Errorf("data.reset: %q is an external volume, which Compose does not own: reset-db does not delete it", v)
-		}
-		if strings.Contains(decl.Name, "$") {
-			return nil, fmt.Errorf("data.reset: %q is named %q, which Compose interpolates: reset-db finds a volume by its labels or a literal name", v, decl.Name)
-		}
-		named[v] = decl.Name
+	named, err := lint.OwnedVolumes(in.R.Compose, names)
+	if err != nil {
+		return nil, fmt.Errorf("data.reset: %w: reset-db wipes a volume Compose creates, finding it by its labels or a literal name", err)
 	}
 	return named, nil
 }
@@ -444,17 +426,7 @@ func (in *Installer) K8sReset(ctx context.Context) error {
 	if _, err := k.Kubectl.Run(ctx, Cmd{Args: []string{"version", "--client"}}); err != nil {
 		return fmt.Errorf("kubectl is required: %w", err)
 	}
-	rel, err := in.release(ctx)
-	if err != nil {
-		return err
-	}
-	if rel == nil {
-		return in.noRelease()
-	}
-	if err := in.pending(rel); err != nil {
-		return err
-	}
-	cur, err := in.installedRelease(ctx)
+	cur, err := in.k8sCurrent(ctx)
 	if err != nil {
 		return err
 	}

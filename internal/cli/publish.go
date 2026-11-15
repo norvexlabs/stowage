@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"regexp"
 	"slices"
 	"strings"
 	"text/tabwriter"
@@ -57,7 +56,7 @@ const (
 
 // publisher opens a Publisher on the project's registry. Read-only commands use the pull account,
 // so a check never needs the publisher's secret.
-func (o *options) publisher(p *project.Project, a access) (*publish.Publisher, error) {
+func (o *options) publisher(ctx context.Context, p *project.Project, a access) (*publish.Publisher, error) {
 	cred, key := p.Spec.Registry.Push, "registry.push"
 	if a != writeAccess {
 		cred, key = p.Spec.Registry.Pull, "registry.pull"
@@ -93,7 +92,7 @@ func (o *options) publisher(p *project.Project, a access) (*publish.Publisher, e
 	reg := registry.New(kc, append(slices.Clip(o.registryOpts), registry.WithLog(o.err))...)
 	var signer publish.Signer
 	if a != listAccess {
-		if signer, err = o.signer(p, kc, a, reg); err != nil {
+		if signer, err = o.signer(ctx, p, kc, a, reg); err != nil {
 			return nil, err
 		}
 	}
@@ -220,13 +219,10 @@ func (o *options) sbomMaker(p *project.Project, kc authn.Keychain) (publish.SBOM
 	return &publish.SyftMaker{Docker: sbom.DockerCLI, Registry: repo.Registry, Auth: auth, WorkDir: filepath.Join(cache, "stowage", "sbom")}, nil
 }
 
-// keyURI matches the key forms cosign reads other than a file: env://, KMS and Vault URIs, pkcs11:.
-var keyURI = regexp.MustCompile(`^[a-z][a-z0-9+.-]*:`)
-
 // signer returns the project's signer, nil when it does not sign; it reads signatures with reg,
 // the publisher's client. A read-only command gets a verify-only signer that reaches the
 // registry with the pull account.
-func (o *options) signer(p *project.Project, kc authn.Keychain, a access, reg *registry.Client) (publish.Signer, error) {
+func (o *options) signer(ctx context.Context, p *project.Project, kc authn.Keychain, a access, reg *registry.Client) (publish.Signer, error) {
 	if !p.Spec.Signs() {
 		return nil, nil
 	}
@@ -257,7 +253,7 @@ func (o *options) signer(p *project.Project, kc authn.Keychain, a access, reg *r
 	}
 	if a == writeAccess {
 		s.Key = c.Key
-		if !keyURI.MatchString(c.Key) && !filepath.IsAbs(c.Key) {
+		if !publish.KeyIsURI(c.Key) && !filepath.IsAbs(c.Key) {
 			base := p.Root
 			if o.keyRoot != "" {
 				base = o.keyRoot
@@ -270,15 +266,17 @@ func (o *options) signer(p *project.Project, kc authn.Keychain, a access, reg *r
 		return signer, err
 	}
 	// A test release is signed with the run's key alone: the key given must be the one its public
-	// key names, so no form of the project's key (env://, a copy re-encrypted) signs it.
-	if err := o.test.sameKey(context.Background(), signer, s.PublicKeys); err != nil {
+	// key names, so no form of the project's key (env://, a copy re-encrypted) signs it. Checked
+	// once, before the command writes anything: the signer signs with the key as it read it when
+	// made (a file's private copy; env:// and KMS keys do not change under a run), the key checked.
+	if err := o.test.sameKey(ctx, signer, s.PublicKeys); err != nil {
 		return nil, err
 	}
 	return signer, nil
 }
 
 // openPublisher opens the project, its publisher and the channel (the default one when empty).
-func (o *options) openPublisher(channel *string, a access) (*project.Project, *publish.Publisher, error) {
+func (o *options) openPublisher(ctx context.Context, channel *string, a access) (*project.Project, *publish.Publisher, error) {
 	p, err := o.open()
 	if err != nil {
 		return nil, nil, err
@@ -289,7 +287,7 @@ func (o *options) openPublisher(channel *string, a access) (*project.Project, *p
 	if _, ok := p.Spec.Channels[*channel]; !ok {
 		return nil, nil, fmt.Errorf("channel %q is not declared (%s)", *channel, strings.Join(p.Spec.ChannelNames(), ", "))
 	}
-	pub, err := o.publisher(p, a)
+	pub, err := o.publisher(ctx, p, a)
 	return p, pub, err
 }
 
@@ -415,7 +413,7 @@ func (o *options) ship(ctx context.Context, channel string, revision int, want s
 	if channel == "" {
 		channel = defaultChannel(p.Spec.Channels, p.Spec.ChannelNames())
 	}
-	pub, err := o.publisher(p, writeAccess)
+	pub, err := o.publisher(ctx, p, writeAccess)
 	if err != nil {
 		return err
 	}
@@ -483,7 +481,7 @@ func verifyCmd(o *options) *cobra.Command {
 		Short: "Check a release (or the channel pointer's) is complete and digest-exact on the registry",
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			p, pub, err := o.openPublisher(&channel, readAccess)
+			p, pub, err := o.openPublisher(cmd.Context(), &channel, readAccess)
 			if err != nil {
 				return err
 			}
@@ -538,7 +536,7 @@ func promoteCmd(o *options) *cobra.Command {
 					return fmt.Errorf("channel %q is not declared (%s)", ch, strings.Join(p.Spec.ChannelNames(), ", "))
 				}
 			}
-			pub, err := o.publisher(p, writeAccess)
+			pub, err := o.publisher(cmd.Context(), p, writeAccess)
 			if err != nil {
 				return err
 			}
@@ -565,13 +563,13 @@ func yankCmd(o *options) *cobra.Command {
 	var revision int
 	c := &cobra.Command{
 		Use:   "yank <version> --reason <text>",
-		Short: "Mark a release so consumers refuse to upgrade to it; nothing is deleted",
+		Short: "Mark a release so consumers refuse to upgrade to it; its artifacts stay",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if strings.TrimSpace(reason) == "" {
 				return errors.New("--reason is required")
 			}
-			_, pub, err := o.openPublisher(&channel, writeAccess)
+			_, pub, err := o.openPublisher(cmd.Context(), &channel, writeAccess)
 			if err != nil {
 				return err
 			}
@@ -599,7 +597,7 @@ func pruneCmd(o *options) *cobra.Command {
 			if keeping && len(args) == 1 {
 				return errors.New("--keep keeps the latest releases, a version prunes one: give one of them")
 			}
-			_, pub, err := o.openPublisher(&channel, writeAccess)
+			_, pub, err := o.openPublisher(cmd.Context(), &channel, writeAccess)
 			if err != nil {
 				return err
 			}
@@ -640,7 +638,7 @@ func releasesCmd(o *options) *cobra.Command {
 					return fmt.Errorf("channel %q is not declared (%s)", channel, strings.Join(p.Spec.ChannelNames(), ", "))
 				}
 			}
-			pub, err := o.publisher(p, listAccess)
+			pub, err := o.publisher(cmd.Context(), p, listAccess)
 			if err != nil {
 				return err
 			}

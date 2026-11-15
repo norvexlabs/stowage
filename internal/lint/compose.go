@@ -791,3 +791,44 @@ func composeBool(v any) (b, known bool) {
 	}
 	return false, false
 }
+
+// OwnedVolume checks that name is a top-level volume of the compose file that Compose creates and
+// owns: declared, not `external` (anything but a known false is taken as external), and with no
+// `name:` Compose interpolates (`$$` is an escaped `$`) nor one that is not a string. It returns
+// the volume's `name:` as Compose reads it, empty when it gives none.
+func (c *Compose) OwnedVolume(name string) (string, error) {
+	vols, _ := c.TopLevel["volumes"].(map[string]any)
+	if !hasKey(vols, name) {
+		return "", fmt.Errorf("%q is no volume of the compose file", name)
+	}
+	decl, _ := vols[name].(map[string]any)
+	if ext, known := composeBool(decl["external"]); ext || !known {
+		return "", fmt.Errorf("%q is an external volume, which Compose does not own", name)
+	}
+	raw, given := decl["name"]
+	literal, ok := raw.(string)
+	switch {
+	case given && raw != nil && !ok:
+		return "", fmt.Errorf("%q's name: %v is not a string: quote it", name, raw)
+	case strings.Contains(strings.ReplaceAll(literal, "$$", ""), "$"):
+		return "", fmt.Errorf("%q is named %q, which Compose interpolates", name, literal)
+	}
+	// $$ is Compose's escaped $.
+	return strings.ReplaceAll(literal, "$$", "$"), nil
+}
+
+// OwnedVolumes is OwnedVolume for each of names in the compose file raw, mapping each to its
+// literal `name:`.
+func OwnedVolumes(raw []byte, names []string) (map[string]string, error) {
+	c, err := parseCompose(raw, "compose.yaml")
+	if err != nil {
+		return nil, err
+	}
+	named := map[string]string{}
+	for _, v := range names {
+		if named[v], err = c.OwnedVolume(v); err != nil {
+			return nil, err
+		}
+	}
+	return named, nil
+}

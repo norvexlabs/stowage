@@ -26,6 +26,7 @@ import (
 	"go.yaml.in/yaml/v3"
 
 	"github.com/norvexlabs/stowage/internal/backup"
+	"github.com/norvexlabs/stowage/internal/kairos"
 	"github.com/norvexlabs/stowage/internal/providers"
 )
 
@@ -51,7 +52,7 @@ import (
 //	                          none), saving nothing
 
 const (
-	defaultBackupSchedule = "*-*-* 03:00:00 UTC"
+	defaultBackupSchedule = kairos.BackupSchedule // the bundle's timer's
 	defaultRetentionDays  = 30
 	maxRetentionDays      = 3650
 	maxRecipients         = 16
@@ -173,6 +174,100 @@ func BackupLockFile(dir string) string { return filepath.Join(dir, "backup-setti
 // is never run. It is no part of the settings, which an older release decodes strictly.
 func BackupRcloneFile(dir string) string { return filepath.Join(dir, "backup-rclone.sha256") }
 
+// BackupDigestsFile holds the SHA-256 of each object this install's backups uploaded, as the
+// destination held it once checked, by the object's path there (the destination, then its name:
+// the same name in another destination is another object): a restore loads only an object whose
+// bytes match its record (or, told to, one it finds no record of). Root's alone, on the
+// persistent partition; it keeps the newest maxDigests objects, within maxDigestsBytes.
+func BackupDigestsFile(dir string) string { return filepath.Join(dir, "backup-digests.json") }
+
+// maxDigests bounds the objects BackupDigestsFile records (a daily backup of a dump and three
+// volumes over two and a half years); maxDigestsBytes bounds the file, as written and as read.
+const (
+	maxDigests      = 4096
+	maxDigestsBytes = 2 << 20
+)
+
+// backupDigest is one object's record: its ciphertext's SHA-256, hex, and when it was recorded.
+type backupDigest struct {
+	SHA256 string    `json:"sha256"`
+	Time   time.Time `json:"time"`
+}
+
+// readDigests is BackupDigestsFile's records by object name (none: empty), strictly read; the
+// caller holds backupMu.
+func readDigests(dir string) (map[string]backupDigest, error) {
+	path := BackupDigestsFile(dir)
+	f, err := os.Open(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return map[string]backupDigest{}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	raw, err := io.ReadAll(io.LimitReader(f, maxDigestsBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	var rec map[string]backupDigest
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	if len(raw) > maxDigestsBytes || dec.Decode(&rec) != nil || !trailingSpace(dec) {
+		return nil, fmt.Errorf("%s is not the backups' digests: remove it (a restore of a backup it recorded then needs --unrecorded)", path)
+	}
+	if rec == nil { // `null`: none
+		rec = map[string]backupDigest{}
+	}
+	return rec, nil
+}
+
+// recordDigests adds sums (an object's path in its destination to its SHA-256) to
+// BackupDigestsFile, recorded at at, keeping the newest maxDigests within maxDigestsBytes: the
+// oldest go first, so a file written always reads back (readDigests).
+func (h *Hostd) recordDigests(sums map[string]string, at time.Time) error {
+	h.backupMu.Lock()
+	defer h.backupMu.Unlock()
+	rec, err := readDigests(h.O.Dir)
+	if err != nil {
+		return err
+	}
+	for name, sum := range sums {
+		rec[name] = backupDigest{SHA256: sum, Time: at.UTC()}
+	}
+	names := sortedKeys(rec)
+	// Oldest first, by name within a time: the order is the file's, whatever the map's.
+	sort.SliceStable(names, func(i, j int) bool { return rec[names[i]].Time.Before(rec[names[j]].Time) })
+	// The file's size is each entry's ("name":{…}, a comma between two) within its braces.
+	size := map[string]int{}
+	total := 1
+	for _, n := range names {
+		k, err := json.Marshal(n)
+		if err != nil {
+			return err
+		}
+		v, err := json.Marshal(rec[n])
+		if err != nil {
+			return err
+		}
+		size[n] = len(k) + 1 + len(v) + 1
+		total += size[n]
+	}
+	for len(names) > 0 && (len(names) > maxDigests || total > maxDigestsBytes) {
+		total -= size[names[0]]
+		delete(rec, names[0])
+		names = names[1:]
+	}
+	raw, err := json.Marshal(rec)
+	if err != nil {
+		return err
+	}
+	if len(raw) > maxDigestsBytes {
+		return fmt.Errorf("the backups' digests take %d bytes, over %d", len(raw), maxDigestsBytes)
+	}
+	return writePrivate(BackupDigestsFile(h.O.Dir), raw)
+}
+
 // rcloneOperator and rcloneUnknown are BackupSettings.RcloneConfigFrom's values.
 const (
 	rcloneOperator = "operator"
@@ -248,6 +343,8 @@ func (h *Hostd) writeBackup(c BackupConfig) error {
 // schedule's syntax is systemd's to judge (checkSchedule).
 func validBackup(c BackupConfig, pg *providers.AgeRclone) ([]age.Recipient, error) {
 	remote, path, ok := strings.Cut(c.Destination, ":")
+	sections := rcloneSections(c.RcloneConfig)
+	local := localTarget(sections, remote, map[string]bool{})
 	switch {
 	case c.Destination == "":
 		return nil, errors.New("destination is required: an rclone remote and a path, remote:path")
@@ -259,8 +356,10 @@ func validBackup(c BackupConfig, pg *providers.AgeRclone) ([]age.Recipient, erro
 		return nil, errors.New("the rclone config is required: it defines the destination's remote and its credentials")
 	case len(c.RcloneConfig) > maxRcloneConfig || strings.ContainsRune(c.RcloneConfig, 0):
 		return nil, fmt.Errorf("the rclone config: at most %d bytes, no NUL", maxRcloneConfig)
-	case !slices.Contains(rcloneRemotes(c.RcloneConfig), remote):
-		return nil, fmt.Errorf("the rclone config defines no remote %q (its sections: %s)", remote, strings.Join(rcloneRemotes(c.RcloneConfig), ", "))
+	case sections[remote] == nil:
+		return nil, fmt.Errorf("the rclone config defines no remote %q (its sections: %s)", remote, strings.Join(sortedKeys(sections), ", "))
+	case local != "":
+		return nil, fmt.Errorf("the remote %s writes to %s: rclone runs in a container removed after each run, so a backup there would be lost; give a destination reachable from outside the host's containers (SFTP, S3, …)", remote, local)
 	case c.RetentionDays < 0 || c.RetentionDays > maxRetentionDays:
 		return nil, fmt.Errorf("retention_days %d: 0 (keep every backup) to %d", c.RetentionDays, maxRetentionDays)
 	}
@@ -284,16 +383,66 @@ func validSchedule(s string) error {
 
 func isControl(r rune) bool { return r < 0x20 || r == 0x7f }
 
-// rcloneRemotes lists the sections of an rclone config: its remotes.
-func rcloneRemotes(conf string) []string {
-	var out []string
+// rcloneSections is an rclone config's sections, its remotes, by name: each one's keys and values.
+func rcloneSections(conf string) map[string]map[string]string {
+	out := map[string]map[string]string{}
+	var cur map[string]string
 	for _, l := range strings.Split(conf, "\n") {
 		l = strings.TrimSpace(l)
 		if len(l) > 2 && l[0] == '[' && l[len(l)-1] == ']' {
-			out = append(out, strings.TrimSpace(l[1:len(l)-1]))
+			cur = map[string]string{}
+			out[strings.TrimSpace(l[1:len(l)-1])] = cur
+			continue
+		}
+		if k, v, ok := strings.Cut(l, "="); ok && cur != nil && !strings.HasPrefix(l, "#") && !strings.HasPrefix(l, ";") {
+			cur[strings.TrimSpace(k)] = strings.TrimSpace(v)
 		}
 	}
 	return out
+}
+
+// localTarget says what an rclone remote of sections writes to on the filesystem of the
+// container rclone runs in (or its memory): a `local` or `memory` remote (on the fly too), a bare
+// path, or a remote leading to one through
+// the remotes wrapping another (alias, crypt, chunker, compress, hasher… by `remote`) or several
+// (union, combine, by `upstreams`); "" for none. seen holds the remotes followed.
+func localTarget(sections map[string]map[string]string, remote string, seen map[string]bool) string {
+	s, ok := sections[remote]
+	if !ok || seen[remote] {
+		return ""
+	}
+	seen[remote] = true
+	if t := s["type"]; t == "local" || t == "memory" {
+		return "the " + t + " remote " + remote
+	}
+	targets := []string{s["remote"]}
+	for _, u := range strings.Fields(s["upstreams"]) {
+		if s["type"] == "combine" {
+			_, u, _ = strings.Cut(u, "=")
+		}
+		for _, mode := range []string{":ro", ":nc", ":writeback"} {
+			u = strings.TrimSuffix(u, mode)
+		}
+		targets = append(targets, u)
+	}
+	for _, t := range targets {
+		name, _, colon := strings.Cut(t, ":")
+		switch {
+		case t == "":
+		case strings.HasPrefix(t, ":"):
+			// An on-the-fly remote, :backend[,options]:path.
+			if b, _, _ := strings.Cut(strings.TrimPrefix(t, ":"), ":"); slices.Contains([]string{"local", "memory"}, strings.SplitN(b, ",", 2)[0]) {
+				return "the path " + t
+			}
+		case !colon || strings.ContainsAny(name, "/\\"):
+			return "the path " + t
+		default:
+			if l := localTarget(sections, name, seen); l != "" {
+				return l
+			}
+		}
+	}
+	return ""
 }
 
 // backupSettings is what GET /v1/backup/config shows of c (nil: none).
@@ -1024,6 +1173,7 @@ func (h *Hostd) dumpUpload(ctx context.Context, in *Installer, env *EnvFile, c B
 		}
 	}
 	var total int64
+	sums := map[string]string{}
 	var image string
 	if len(pg.Volumes) > 0 {
 		if image, err = h.runnerImage(ctx, in); err != nil {
@@ -1038,7 +1188,7 @@ func (h *Hostd) dumpUpload(ctx context.Context, in *Installer, env *EnvFile, c B
 		}
 		dest := within(c.Destination, volumeObject(obj, v))
 		logf("archiving the volume %s, encrypted to %d recipient(s), to %s", v, len(recips), dest)
-		n, err := h.encryptUpload(ctx, in, conf, recips, dest, func(w io.Writer) error {
+		n, sum, err := h.encryptUpload(ctx, in, conf, recips, dest, func(w io.Writer) error {
 			if vol == "" {
 				// Never created (no service of it ran): an archive of nothing.
 				return tar.NewWriter(w).Close()
@@ -1054,6 +1204,7 @@ func (h *Hostd) dumpUpload(ctx context.Context, in *Installer, env *EnvFile, c B
 			return 0, nil, err
 		}
 		sent, total = append(sent, dest), total+n
+		sums[dest] = sum
 	}
 	dest := within(c.Destination, obj)
 	produce := func(w io.Writer) error {
@@ -1078,12 +1229,18 @@ func (h *Hostd) dumpUpload(ctx context.Context, in *Installer, env *EnvFile, c B
 			return err
 		}
 	}
-	n, err := h.encryptUpload(ctx, in, conf, recips, dest, produce, logf)
+	n, sum, err := h.encryptUpload(ctx, in, conf, recips, dest, produce, logf)
 	if err != nil {
 		discard()
 		return 0, nil, err
 	}
-	total += n
+	sent, total = append(sent, dest), total+n
+	sums[dest] = sum
+	// A backup whose digests are not recorded would restore only unchecked: it is no backup.
+	if err := h.recordDigests(sums, time.Now()); err != nil {
+		discard()
+		return 0, nil, fmt.Errorf("recording the backup's digests: %w", err)
+	}
 	var prune error
 	if c.RetentionDays != 0 {
 		_, prune = h.rclone(ctx, in, conf, nil, "delete", "--min-age", fmt.Sprintf("%dd", c.RetentionDays), "--max-depth", "1", "--include", ownBackups(h.R.Spec.Name, profile), c.Destination)
@@ -1133,8 +1290,8 @@ func (h *Hostd) pruneArchives(ctx context.Context, in *Installer, conf, dest, pr
 }
 
 // encryptUpload streams what produce writes, encrypted to recips, to dest, and checks the size it
-// reached; one that fails leaves nothing under its name.
-func (h *Hostd) encryptUpload(ctx context.Context, in *Installer, conf string, recips []age.Recipient, dest string, produce func(io.Writer) error, logf func(string, ...any)) (int64, error) {
+// reached: its bytes and their SHA-256, hex. One that fails leaves nothing under its name.
+func (h *Hostd) encryptUpload(ctx context.Context, in *Installer, conf string, recips []age.Recipient, dest string, produce func(io.Writer) error, logf func(string, ...any)) (int64, string, error) {
 	pr, pw := io.Pipe()
 	// The producer's own error does not say whether the upload stopped first (the CLI reports
 	// its exit, not the broken pipe): its writes do.
@@ -1150,7 +1307,9 @@ func (h *Hostd) encryptUpload(ctx context.Context, in *Installer, conf string, r
 		pw.CloseWithError(err)
 		produced <- err
 	}()
-	sent := &counter{r: pr}
+	// What rclone read is what it uploaded: its SHA-256 is the object's, which the destination holds.
+	sum := sha256.New()
+	sent := &counter{r: io.TeeReader(pr, sum)}
 	_, upErr := h.rcloneNamed(ctx, in, conf, h.runnerName(), sent, "rcat", dest)
 	// An upload that stopped early leaves the producer nothing to write to.
 	pr.CloseWithError(errUploadEnded)
@@ -1162,28 +1321,28 @@ func (h *Hostd) encryptUpload(ctx context.Context, in *Installer, conf string, r
 		h.discard(ctx, in, conf, dest, logf)
 		switch {
 		case errors.Is(ctxErr, context.DeadlineExceeded):
-			return 0, fmt.Errorf("the backup did not finish within %s", backupTimeout)
+			return 0, "", fmt.Errorf("the backup did not finish within %s", backupTimeout)
 		case ctxErr != nil:
-			return 0, errors.New("the backup was stopped: the host daemon is stopping")
+			return 0, "", errors.New("the backup was stopped: the host daemon is stopping")
 		case prodErr != nil && !watched.ended.Load():
 			// The producer failed on its own: the upload's error is its echo.
-			return 0, prodErr
+			return 0, "", prodErr
 		}
 		// The upload ended first (rclone may exit 0 before reading to the end).
-		return 0, fmt.Errorf("the upload: %w", cmp.Or(upErr, errUploadEnded))
+		return 0, "", fmt.Errorf("the upload: %w", cmp.Or(upErr, errUploadEnded))
 	}
 	n := sent.n.Load()
 	out, err := h.rclone(ctx, in, conf, nil, "lsjson", "--files-only", "--no-mimetype", dest)
 	if err != nil {
 		h.discard(ctx, in, conf, dest, logf)
-		return n, fmt.Errorf("the uploaded backup could not be checked: %w", err)
+		return n, "", fmt.Errorf("the uploaded backup could not be checked: %w", err)
 	}
 	var found []struct{ Size int64 }
 	if err := json.Unmarshal(out, &found); err != nil || len(found) != 1 || found[0].Size != n {
 		h.discard(ctx, in, conf, dest, logf)
-		return n, fmt.Errorf("the destination holds %s, not the %d bytes sent", strings.TrimSpace(string(out)), n)
+		return n, "", fmt.Errorf("the destination holds %s, not the %d bytes sent", strings.TrimSpace(string(out)), n)
 	}
-	return n, nil
+	return n, hex.EncodeToString(sum.Sum(nil)), nil
 }
 
 // discard deletes dest, an object a failed backup sent. The run's context may be over (the
@@ -1276,7 +1435,16 @@ func (h *Hostd) rcloneConf(c BackupConfig) (string, func(), error) {
 	if h.rcloneFrom(&c) != rcloneOperator {
 		return "", nil, fail(http.StatusConflict, "the saved rclone config is not known to be the operator's (it may have been saved through the app socket, and rclone runs the programs it names as root): it is not run until the operator saves one over SSH, `%s backup config --rclone-config FILE`", h.R.Ctl())
 	}
-	dir, err := os.MkdirTemp(cmp.Or(h.Run, os.TempDir()), "backup-")
+	// The daemon's private directory alone holds the destination's credentials: never the
+	// system's temporary directory, which other users list.
+	if h.Run == "" {
+		return "", nil, errors.New("the host daemon has no private directory for the rclone config")
+	}
+	if err := os.MkdirAll(h.Run, 0o700); err != nil {
+		return "", nil, err
+	}
+	sweepRclone(h.Run, staleRclone)
+	dir, err := os.MkdirTemp(h.Run, "backup-")
 	if err != nil {
 		return "", nil, err
 	}
@@ -1286,6 +1454,25 @@ func (h *Hostd) rcloneConf(c BackupConfig) (string, func(), error) {
 		return "", nil, err
 	}
 	return dir, done, nil
+}
+
+// staleRclone is how long an rclone config's directory may outlive its making: the longest run
+// reading it (a backup's or a restore's, backupTimeout), with a margin. One older was left by a
+// run killed before it removed it.
+const staleRclone = backupTimeout + 10*time.Minute
+
+// sweepRclone removes the rclone configs' directories in run made more than older ago (0: all):
+// those of runs killed before they removed theirs, which hold a destination's credentials.
+func sweepRclone(run string, older time.Duration) {
+	left, err := filepath.Glob(filepath.Join(run, "backup-*"))
+	if err != nil {
+		return
+	}
+	for _, d := range left {
+		if fi, err := os.Stat(d); err == nil && fi.IsDir() && time.Since(fi.ModTime()) >= older {
+			_ = os.RemoveAll(d)
+		}
+	}
 }
 
 // rclone runs the backup runner with the config in dir, stdin given when not nil.
@@ -1341,16 +1528,10 @@ func (h *Hostd) runnerImage(ctx context.Context, in *Installer) (string, error) 
 	return ref, nil
 }
 
-// runRunner runs c, a runner container named name; a stopped docker CLI leaves its container
-// running, which is then removed.
+// runRunner runs c, a runner container named name, removed by its name when the run is cut off
+// (runNamed).
 func (h *Hostd) runRunner(ctx context.Context, in *Installer, name string, c Cmd) ([]byte, error) {
-	out, err := in.O.Docker.Run(ctx, c)
-	if err != nil && ctx.Err() != nil {
-		clean, cancel := context.WithTimeout(context.WithoutCancel(ctx), rcloneTimeout)
-		defer cancel()
-		_, _ = in.O.Docker.Run(clean, Cmd{Args: []string{"rm", "--force", name}})
-	}
-	return out, err
+	return in.runNamed(ctx, name, c)
 }
 
 // runnerShell runs script in the runner's shell (image, the reference runnerImage resolved), off any network, with the Docker volume vol

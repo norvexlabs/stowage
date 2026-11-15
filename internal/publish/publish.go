@@ -99,8 +99,10 @@ type Publisher struct {
 	// checkDisksOf is the release tag whose disks the running ship published: verify checks them
 	// before the channel's set names them.
 	checkDisksOf string
-	Now          func() time.Time
-	Log          io.Writer
+	// marked are the held marks this run made (markHeld): a ship or a yank sweeps those alone.
+	marked []name.Tag
+	Now    func() time.Time
+	Log    io.Writer
 }
 
 func (p *Publisher) logf(format string, a ...any) {
@@ -1029,6 +1031,11 @@ func (p *Publisher) Ship(ctx context.Context, o ShipOptions) (*Ref, error) {
 		if err != nil {
 			return nil, err
 		}
+		if existing != nil {
+			if err := p.dropReplaced(ctx, existing.Manifest, m); err != nil {
+				return nil, err
+			}
+		}
 		d, err := p.writeRelease(ctx, tag, m, releaseRecords{override, nodes, untracked})
 		if err != nil {
 			return nil, err
@@ -1076,6 +1083,7 @@ func (p *Publisher) Ship(ctx context.Context, o ShipOptions) (*Ref, error) {
 		return rel, err
 	}
 	p.sweepCharts(ctx, o.Channel)
+	p.sweepOrWarn(ctx)
 	if len(rel.Manifest.Artifacts.Disks) > 0 && recorded == nil {
 		// A rebuilt tag's earlier disks, which no manifest names any more.
 		var replaced diskSet
@@ -1087,6 +1095,56 @@ func (p *Publisher) Ship(ctx context.Context, o ShipOptions) (*Ref, error) {
 		}
 	}
 	return rel, nil
+}
+
+// dropReplaced removes, before now is written over was under the same tag, the tags of was's
+// artifacts now has none under (an image key or a shape dropped from the spec): once now is
+// written, no ship or prune of the tag names them again. Each one's content is first marked held,
+// from the digest was records (so a re-run marks it again, whether or not its tag is still
+// there), and this run's sweep deletes it once now is published and no other tag holds it. A run
+// stopped before now is written leaves was to the re-run, which finds the same tags to drop.
+func (p *Publisher) dropReplaced(ctx context.Context, was, now *release.Manifest) error {
+	keep := map[[2]string]bool{}
+	for _, rt := range p.releaseTags(now) {
+		keep[[2]string{rt.repo, rt.tag}] = true
+	}
+	for _, rt := range p.releaseTags(was) {
+		if keep[[2]string{rt.repo, rt.tag}] || rt.repo == p.chartRepo(was.Channel) { // chart versions are sweepCharts'
+			continue
+		}
+		repo, err := p.Registry.Repo(rt.repo)
+		if err != nil {
+			return err
+		}
+		h, err := v1.NewHash(rt.digest)
+		if err != nil {
+			return fmt.Errorf("%s:%s: %w", rt.repo, rt.tag, err)
+		}
+		if have, err := p.Registry.Head(ctx, repo.Digest(h.String())); err != nil {
+			return err
+		} else if have != nil {
+			if err := p.markHeld(ctx, repo, h); err != nil {
+				return err
+			}
+		}
+		t, err := p.Registry.Tag(rt.repo, rt.tag)
+		if err != nil {
+			return err
+		}
+		if err := p.Registry.DeleteTag(ctx, t); errors.Is(err, registry.ErrDeleteRefused) {
+			if cur, herr := p.headFloating(ctx, t); herr != nil {
+				return herr
+			} else if cur != nil {
+				if err := p.retire(ctx, t); err != nil {
+					return err
+				}
+			}
+		} else if err != nil {
+			return err
+		}
+		p.logf("%s removed: release %s no longer has it", t, now.Tag)
+	}
+	return nil
 }
 
 // sameBoot reports whether two boot disk sets are the same.
@@ -1730,7 +1788,8 @@ func (p *Publisher) Releases(ctx context.Context, channel string) ([]*Ref, error
 
 // Yank marks a release so consumers refuse to upgrade to it. When the channel pointer is on it,
 // the pointer moves back to the latest release that is not yanked, or is removed when none is
-// left. Nothing is deleted.
+// left. The release's own artifacts stay; on a registry that deletes no tag alone, what the
+// pointer or :latest it retires held, once no other tag holds it, is deleted by digest.
 func (p *Publisher) Yank(ctx context.Context, channel, v string, revision int, reason string) error {
 	// A release is yanked whatever state its tags are in: a broken one is what needs it most.
 	tag, err := p.releaseTag(v, channel, revision)
@@ -1752,10 +1811,16 @@ func (p *Publisher) Yank(ctx context.Context, channel, v string, revision int, r
 			return err
 		}
 		p.logf("release %s yanked (now %s)", m.Tag, registry.Short(d.String()))
-		return p.retreatPointer(ctx, channel)
+	} else {
+		p.logf("release %s was already yanked", r.Manifest.Tag)
 	}
-	p.logf("release %s was already yanked", r.Manifest.Tag)
-	return p.retreatPointer(ctx, channel)
+	// The pointer and :latest it retires leave their content marked held: what no tag holds any
+	// more is deleted.
+	if err := p.retreatPointer(ctx, channel); err != nil {
+		return err
+	}
+	p.sweepOrWarn(ctx)
+	return nil
 }
 
 // retreatPointer moves the channel pointer back when the release it is on is no longer offered
@@ -1807,7 +1872,7 @@ func (p *Publisher) retreatPointer(ctx context.Context, channel string) error {
 		return err
 	}
 	p.logf("channel %s has no complete release left: pointer removed", channel)
-	if _, err := p.untag(ctx, t); err != nil {
+	if err := p.untag(ctx, t); err != nil {
 		return err
 	}
 	return p.dropLatest(ctx, channel)
@@ -1906,13 +1971,13 @@ func (p *Publisher) prune(ctx context.Context, channel string, rs []*Ref, ptr *R
 		}
 	}
 	var kept map[string]bool // the other channels' disk sets, read once a pruned release has disks
-	var held []name.Digest   // what untag left to other tags: the pointer, latest, another release
+	var touched []string     // the repositories of the tags untagged
 	// Whatever happens below, a pointer whose release lost tags is moved off it.
 	defer func() {
 		// Content whose tag was retired while another tag held it (the pointer, latest, another
 		// release) goes once no tag does, whatever happened: what a tag still holds stays.
 		defer func() {
-			if serr := p.sweepHeld(ctx, held); serr != nil {
+			if serr := p.sweepMarked(ctx, touched...); serr != nil {
 				err = errors.Join(err, serr)
 			}
 		}()
@@ -1935,31 +2000,14 @@ func (p *Publisher) prune(ctx context.Context, channel string, rs []*Ref, ptr *R
 		if ptr != nil && ptr.Manifest.Tag == r.Manifest.Tag {
 			pointerGone = true
 		}
-		type repoTag struct{ repo, tag string }
-		var tags []repoTag
-		for _, img := range sortedKeys(r.Manifest.Artifacts.Images) {
-			tags = append(tags, repoTag{p.imageRepo(img), r.Manifest.Tag})
-		}
-		if r.Manifest.Artifacts.Installer != "" {
-			tags = append(tags, repoTag{p.installerRepo(), r.Manifest.Tag})
-		}
-		if c := r.Manifest.Artifacts.Chart; c != nil {
-			tags = append(tags, repoTag{p.chartRepo(r.Manifest.Channel), c.Version})
-		}
-		if r.Manifest.Artifacts.OS != "" {
-			tags = append(tags, repoTag{p.osRepo(), r.Manifest.Tag})
-		}
-		for _, rt := range tags {
+		for _, rt := range p.releaseTags(r.Manifest) {
+			touched = append(touched, rt.repo)
 			t, err := p.Registry.Tag(rt.repo, rt.tag)
 			if err != nil {
 				return pruned, err
 			}
-			d, err := p.untag(ctx, t)
-			if err != nil {
+			if err := p.untag(ctx, t); err != nil {
 				return pruned, err
-			}
-			if d != nil {
-				held = append(held, *d)
 			}
 		}
 		// The disks the release boots (its own, or another's set) go, by digest, unless a release
@@ -2000,12 +2048,8 @@ func (p *Publisher) prune(ctx context.Context, channel string, rs []*Ref, ptr *R
 		if err != nil {
 			return pruned, err
 		}
-		d, err := p.untag(ctx, t)
-		if err != nil {
+		if err := p.untag(ctx, t); err != nil {
 			return pruned, err
-		}
-		if d != nil {
-			held = append(held, *d)
 		}
 		p.logf("pruned %s", r.Manifest.Tag)
 		pruned = append(pruned, r.Manifest.Tag)
@@ -2014,3 +2058,26 @@ func (p *Publisher) prune(ctx context.Context, channel string, rs []*Ref, ptr *R
 }
 
 func sortedKeys(m map[string]string) []string { return slices.Sorted(maps.Keys(m)) }
+
+// repoTag is a tag of a repository, and the digest the release records under it.
+type repoTag struct{ repo, tag, digest string }
+
+// releaseTags are the tags a release's artifacts are published under but its disks' (which disk
+// sets keep) and the release's own: each image's, the installer's, the chart's version and the
+// OS bundle's.
+func (p *Publisher) releaseTags(m *release.Manifest) []repoTag {
+	var tags []repoTag
+	for _, img := range sortedKeys(m.Artifacts.Images) {
+		tags = append(tags, repoTag{p.imageRepo(img), m.Tag, m.Artifacts.Images[img]})
+	}
+	if m.Artifacts.Installer != "" {
+		tags = append(tags, repoTag{p.installerRepo(), m.Tag, m.Artifacts.Installer})
+	}
+	if c := m.Artifacts.Chart; c != nil {
+		tags = append(tags, repoTag{p.chartRepo(m.Channel), c.Version, c.Digest})
+	}
+	if m.Artifacts.OS != "" {
+		tags = append(tags, repoTag{p.osRepo(), m.Tag, m.Artifacts.OS})
+	}
+	return tags
+}

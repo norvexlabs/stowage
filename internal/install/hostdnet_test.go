@@ -2,6 +2,7 @@ package install
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -46,6 +47,8 @@ type fakeLink struct {
 	// none); nicAddr what each runs, from its override in run, the secondaries' networkd directory.
 	nics, nicAddr map[string]string
 	run           string
+	// dev is the default route's interface; empty is ens3.
+	dev string
 }
 
 // nicLease is the address a secondary link's DHCP gives.
@@ -81,7 +84,7 @@ func (f *fakeLink) Run(ctx context.Context, c Cmd) ([]byte, error) {
 		if f.gw == "" {
 			return []byte("[]"), nil
 		}
-		return fmt.Appendf(nil, `[{"dst":"default","gateway":%q,"dev":"ens3"}]`, f.gw), nil
+		return fmt.Appendf(nil, `[{"dst":"default","gateway":%q,"dev":%q}]`, f.gw, cmp.Or(f.dev, "ens3")), nil
 	case "ip -6 -j route show default":
 		// The advertised route and a static one, of one metric, are one multipath route.
 		rs := []string{`{"dst":"default","gateway":"fe80::9","dev":"wg0"}`}
@@ -952,7 +955,7 @@ func TestAConfirmationAfterTheWindowUndoesTheChange(t *testing.T) {
 	// that has the lock first comes too late.
 	h.netMu.Lock()
 	done := timers.fire(t)
-	eventually(t, "the timer fired", func() bool { return h.netFired.Load() == int64(h.netGen) })
+	eventually(t, "the timer fired", func() bool { a := h.netReverts[""]; return a != nil && a.fired.Load() })
 	_, err := h.confirm()
 	h.netMu.Unlock()
 	if err == nil || !strings.Contains(err.Error(), "the change's window ended: the settings before it are back") {
@@ -966,6 +969,37 @@ func TestAConfirmationAfterTheWindowUndoesTheChange(t *testing.T) {
 	}
 	// The timer that waited does nothing more.
 	<-done
+	if addr, _, _ := link.live(); addr != leaseAddr {
+		t.Errorf("the link runs %s", addr)
+	}
+}
+
+// A revert applies on the interface its change was armed on, wherever the default route moved
+// since.
+func TestARevertAppliesOnTheInterfaceItsChangeWasArmedOn(t *testing.T) {
+	t.Parallel()
+	link := newLink(t)
+	h := netDaemon(t, link)
+	timers := manualTimers(h)
+	if code := call(t, h.Handler(), http.MethodPost, "/v1/network", NetRequest{NetConfig: NetConfig{Mode: "static", Address: "10.0.0.60/24", Gateway: "10.0.0.1"}, RevertSecs: intp(minRevertSecs)}, nil); code != http.StatusOK {
+		t.Fatal(code)
+	}
+	// Its first attempt fails (networkd busy), which clears the record's change: the retry
+	// applies on the interface all the same.
+	link.mu.Lock()
+	link.dev, link.ran, link.reloadFails = "ens9", nil, 1
+	link.mu.Unlock()
+	<-timers.fire(t)
+	<-timers.fire(t)
+	var reconfigured []string
+	for _, c := range link.calls() {
+		if len(c) == 3 && c[0] == "networkctl" && c[1] == "reconfigure" {
+			reconfigured = append(reconfigured, c[2])
+		}
+	}
+	if len(reconfigured) == 0 || slices.ContainsFunc(reconfigured, func(i string) bool { return i != "ens3" }) {
+		t.Errorf("reconfigured %v", reconfigured)
+	}
 	if addr, _, _ := link.live(); addr != leaseAddr {
 		t.Errorf("the link runs %s", addr)
 	}
@@ -1054,7 +1088,7 @@ func TestNoRetryOnceTheDaemonStops(t *testing.T) {
 	if err := h.undo("", 1, "a test", h.restore(h.netFiles(), nil, "ens3")); err == nil {
 		t.Fatal("undone on a stopped daemon")
 	}
-	if h.netTimer != nil {
+	if h.netReverts[""] != nil {
 		t.Error("a retry armed on a stopped daemon")
 	}
 }
@@ -1235,5 +1269,56 @@ func TestNetworkShowsTheHostRecords(t *testing.T) {
 	b.Reset()
 	if printNetwork(&b, "notes-stow", Network{}); strings.Contains(b.String(), "hosts") {
 		t.Errorf("%s", b.String())
+	}
+}
+
+// heldReload is a link whose `networkctl reload` waits for release, telling reloading first.
+type heldReload struct {
+	*fakeLink
+	reloading, release chan struct{}
+	once               sync.Once
+}
+
+func (l *heldReload) Run(ctx context.Context, c Cmd) ([]byte, error) {
+	if strings.Join(c.Args, " ") == "networkctl reload" {
+		l.once.Do(func() { close(l.reloading) })
+		<-l.release
+	}
+	return l.fakeLink.Run(ctx, c)
+}
+
+// The daemon serves while its start undoes a change awaiting confirmation, but no network request
+// runs before that undo ends: a confirmation arriving during it finds nothing to confirm.
+func TestANetworkRequestWaitsForTheStartsUndo(t *testing.T) {
+	t.Parallel()
+	e := installedVM(t)
+	link := newLink(t)
+	held := &heldReload{fakeLink: link, reloading: make(chan struct{}), release: make(chan struct{})}
+	h := daemon(e, &fakeHost{})
+	h.Host, h.Networkd = held, link.dir
+	prev := &NetConfig{Mode: "static", Address: "10.0.0.60/24", Gateway: "10.0.0.1"}
+	if err := h.netFiles().write(netState{Config: &NetConfig{Mode: "dhcp"}, Pending: &netPending{ID: "w", Deadline: time.Now().Add(time.Hour), Previous: prev}}); err != nil {
+		t.Fatal(err)
+	}
+	sock := served(t, h)
+	<-held.reloading
+	confirmed := make(chan error, 1)
+	go func() { _, err := ctl(e, sock, "network", "confirm"); confirmed <- err }()
+	// The daemon answers meanwhile; the confirmation is given time to reach it.
+	if _, err := ctl(e, sock, "status"); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(20 * time.Millisecond)
+	select {
+	case err := <-confirmed:
+		t.Fatalf("a confirmation answered during the undo: %v", err)
+	default:
+	}
+	close(held.release)
+	if err := <-confirmed; err == nil || !strings.Contains(err.Error(), "nothing awaits confirmation") {
+		t.Fatalf("%v", err)
+	}
+	if addr, _, _ := link.live(); addr != "10.0.0.60/24" {
+		t.Errorf("the link runs %s", addr)
 	}
 }

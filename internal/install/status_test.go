@@ -1012,3 +1012,24 @@ func TestRecordedFrontPortThatIsNoPortIsRefused(t *testing.T) {
 		t.Errorf("vm upgrade: %v", err)
 	}
 }
+
+// The text form says an uninstall that kept its history is one, as the JSON form does: no version
+// line, and the rollback that brings the release back.
+func TestK8sStatusAfterUninstallKeepHistory(t *testing.T) {
+	t.Parallel()
+	e := newKubeEnv(t, spec.Provider{Name: "none"})
+	e.runs("1.0.0", 1)
+	e.stored(nil, ours)
+	e.f.listed[0].Status = "uninstalled"
+	e.f.history = []helmRevision{{Revision: 1, Status: "superseded", Chart: "notes-0.1.0"}, {Revision: 2, Status: "uninstalled", Chart: "notes-0.1.0"}}
+	e.f.revValues = map[int]string{2: `{"stowage":{"registry":"ghcr.io/acme/notes","release":{"name":"notes","version":"1.0.0","revision":1}}}`}
+	e.out.Reset()
+	if err := e.installer(nil).K8sStatus(context.Background()); err != nil {
+		t.Fatalf("%v\n%s", err, e.log)
+	}
+	out := e.out.String()
+	if !strings.Contains(out, "release notes in notes is uninstalled, its history kept (revision 2): `notes-stow k8s rollback --namespace notes --release notes` brings back notes 1.0.0 (revision 1)") ||
+		strings.Contains(out, "registry  ") {
+		t.Errorf("%s", out)
+	}
+}

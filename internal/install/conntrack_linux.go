@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"os"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -19,10 +20,33 @@ const (
 	conntrackWait       = 10 * time.Second // the longest the kernel's ack is waited for
 )
 
+// conntrackCount is the count of the connection-tracking table's entries, there while the kernel
+// tracks connections (nf_conntrack).
+const conntrackCount = "/proc/sys/net/netfilter/nf_conntrack_count"
+
 // flushConntrack deletes every entry of the host's connection-tracking table, IPv4 and IPv6
 // (`conntrack -F`, through netlink: no tool needed). The packets of a connection open before then
-// meet the firewall as new.
+// meet the firewall as new. A kernel that tracks no connection has nothing to flush: no error.
 func flushConntrack() error {
+	if err := flushTable(); err != nil && !untracked(err, conntrackCount) {
+		return err
+	}
+	return nil
+}
+
+// untracked reports whether err, a flush's, is a kernel's that tracks no connection: netlink has
+// no conntrack subsystem, and the table's count (count) is absent. A kernel tracking connections
+// whose ctnetlink is missing has a table the flush did not empty: not untracked.
+func untracked(err error, count string) bool {
+	if !errors.Is(err, unix.EOPNOTSUPP) && !errors.Is(err, unix.EPROTONOSUPPORT) && !errors.Is(err, unix.ENOENT) {
+		return false
+	}
+	_, serr := os.Stat(count)
+	return errors.Is(serr, os.ErrNotExist)
+}
+
+// flushTable is flushConntrack's netlink exchange.
+func flushTable() error {
 	fd, err := unix.Socket(unix.AF_NETLINK, unix.SOCK_RAW|unix.SOCK_CLOEXEC, unix.NETLINK_NETFILTER)
 	if err != nil {
 		return fmt.Errorf("the conntrack netlink socket: %w", err)

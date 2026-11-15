@@ -20,6 +20,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/norvexlabs/stowage/internal/flock"
+	"github.com/norvexlabs/stowage/internal/kairos"
 	"github.com/norvexlabs/stowage/internal/providers"
 )
 
@@ -108,10 +109,12 @@ func (in *Installer) dockerHostd(ctx context.Context) (*Hostd, func(), error) {
 	}, nil
 }
 
+// readRun is the Docker install's private directory where a read writes a file (an rclone config,
+// removed once read; one a killed read left goes with the next read's, once stale).
+const readRun = ".read"
+
 // dockerWatchd is the host daemon of the Docker install in.O.Dir for what runs no job and reads
-// no journal: the reads, the disk-pressure check and its units. Nothing is written by making it;
-// a read writing a file (the rclone config of a list) writes it under the system's temporary
-// directory, removed once read.
+// no journal: the reads, the disk-pressure check and its units. Nothing is written by making it.
 func (in *Installer) dockerWatchd(ctx context.Context) (*Hostd, error) {
 	dir, err := filepath.Abs(in.O.Dir)
 	if err != nil {
@@ -122,7 +125,9 @@ func (in *Installer) dockerWatchd(ctx context.Context) (*Hostd, error) {
 	if o.Host == nil {
 		o.Host = HostTool{}
 	}
-	h := &Hostd{R: in.R, O: o, Host: o.Host, Docker: true, Systemd: cmp.Or(o.Systemd, systemdDir), DiskDir: in.dockerRoot(ctx)}
+	// A read writing a file (the rclone config of a list) writes it under Run, the install's
+	// private directory for it, made when a read first writes there.
+	h := &Hostd{R: in.R, O: o, Host: o.Host, Docker: true, Systemd: cmp.Or(o.Systemd, systemdDir), DiskDir: in.dockerRoot(ctx), Run: filepath.Join(dir, readRun)}
 	h.ctx = ctx
 	return h, nil
 }
@@ -212,10 +217,14 @@ func (h *Hostd) dockerUnits(ctx context.Context, kind string, service, timer str
 }
 
 // unitService is a oneshot unit running the install's installer with args.
-func (h *Hostd) unitService(what string, timeout time.Duration, args ...string) string {
+func (h *Hostd) unitService(what string, timeout time.Duration, retry bool, args ...string) string {
 	ctl := filepath.Join(h.O.Dir, h.R.Ctl())
-	return fmt.Sprintf("[Unit]\nDescription=%s (%s): %s\nAfter=docker.service\nWants=docker.service\n\n[Service]\nType=oneshot\nExecStart=%s %s --dir %s\nTimeoutStartSec=%dmin\n",
-		h.R.Spec.Name, systemdText(h.O.Dir), what, systemdArg(ctl), strings.Join(args, " "), systemdArg(h.O.Dir), int(timeout.Minutes()))
+	unit, service := "", ""
+	if retry { // the scheduled backup's retries, as the VM's unit has them
+		unit, service = kairos.BackupStartLimit+"\n", kairos.BackupRetry+"\n"
+	}
+	return fmt.Sprintf("[Unit]\nDescription=%s (%s): %s\nAfter=docker.service\nWants=docker.service\n%s\n[Service]\nType=oneshot\nExecStart=%s %s --dir %s\nTimeoutStartSec=%dmin\n%s",
+		h.R.Spec.Name, systemdText(h.O.Dir), what, unit, systemdArg(ctl), strings.Join(args, " "), systemdArg(h.O.Dir), int(timeout.Minutes()), service)
 }
 
 // dockerSchedule writes the scheduled backup's units for c's schedule (nil: removes them).
@@ -223,7 +232,7 @@ func (h *Hostd) dockerSchedule(ctx context.Context, c *BackupConfig) error {
 	if c == nil {
 		return h.dockerUnits(ctx, "backup", "", "")
 	}
-	return h.dockerUnits(ctx, "backup", h.unitService("the scheduled backup", 75*time.Minute, "backup", "run", "--if-configured"),
+	return h.dockerUnits(ctx, "backup", h.unitService("the scheduled backup", 75*time.Minute, true, "backup", "run", "--if-configured"),
 		fmt.Sprintf("[Unit]\nDescription=%s (%s): the scheduled backup's timer\n\n[Timer]\nOnCalendar=%s\nRandomizedDelaySec=15min\nPersistent=true\n\n[Install]\nWantedBy=timers.target\n",
 			h.R.Spec.Name, systemdText(h.O.Dir), c.Schedule))
 }
@@ -238,7 +247,7 @@ func (in *Installer) InstallWatch(ctx context.Context) error {
 	if h.pressureHook() == nil {
 		return h.dockerUnits(ctx, "disk", "", "")
 	}
-	return h.dockerUnits(ctx, "disk", h.unitService("the disk-pressure check", 5*time.Minute, "disk-check"),
+	return h.dockerUnits(ctx, "disk", h.unitService("the disk-pressure check", 5*time.Minute, false, "disk-check"),
 		fmt.Sprintf("[Unit]\nDescription=%s (%s): the disk-pressure watch\n\n[Timer]\nOnBootSec=2min\nOnUnitActiveSec=%ds\n\n[Install]\nWantedBy=timers.target\n",
 			in.R.Spec.Name, systemdText(in.O.Dir), pressureEvery))
 }

@@ -21,12 +21,11 @@ import (
 	"time"
 	"unicode"
 
-	"go.yaml.in/yaml/v3"
-
 	"github.com/norvexlabs/stowage/internal/changelog"
 	"github.com/norvexlabs/stowage/internal/digest"
 	"github.com/norvexlabs/stowage/internal/dockerfile"
 	"github.com/norvexlabs/stowage/internal/gitcmd"
+	"github.com/norvexlabs/stowage/internal/graph"
 	"github.com/norvexlabs/stowage/internal/helm"
 	"github.com/norvexlabs/stowage/internal/kairos"
 	"github.com/norvexlabs/stowage/internal/lock"
@@ -368,7 +367,9 @@ func (l *linter) audit() {
 	if l.s.Shapes.Kairos != nil {
 		known = append(known, "os")
 	}
-	known = append(known, sbom.StowageSubjects...)
+	// What Stowage supplies: the images the release's graph builds from Stowage's recipes (a
+	// front only with one, …), and the installer.
+	known = append(append(known, graph.StowageImages(l.s)...), "installer")
 	for _, e := range allow {
 		switch {
 		case e.Artifact != "*" && !slices.Contains(known, e.Artifact):
@@ -756,9 +757,6 @@ func (l *linter) stack() {
 // the floors together (shareOnLeastVM); the rest serviceHost.
 func (l *linter) memory() {
 	if len(l.s.Services) == 0 {
-		if l.leftEmpty("services") {
-			l.errf("services", "names no service: give one what it asks of the host, or remove services")
-		}
 		return
 	}
 	total, shares, floors := 0, false, spec.Bytes(0)
@@ -915,14 +913,10 @@ func (l *linter) vmSize() {
 		return
 	}
 	z := k.Size
-	if z == nil && !l.leftEmpty("shapes", "kairos", "size") {
+	if z == nil {
 		return
 	}
 	where := "shapes.kairos.size"
-	if z == nil || z.Min == nil && z.Recommended == nil {
-		l.errf(where, "states no size: give min, recommended or both, or remove size")
-		return
-	}
 	check := func(at string, m *spec.Machine) bool {
 		ok := true
 		if m.CPUs == 0 && m.Memory == 0 && m.Disk == 0 {
@@ -938,14 +932,6 @@ func (l *linter) vmSize() {
 			ok = false
 		}
 		return ok
-	}
-	for _, f := range []struct {
-		key string
-		m   *spec.Machine
-	}{{"min", z.Min}, {"recommended", z.Recommended}} {
-		if f.m == nil && l.leftEmpty("shapes", "kairos", "size", f.key) {
-			l.errf(where+"."+f.key, "states nothing: give cpus, memory or disk, or remove %s", f.key)
-		}
 	}
 	minOK := z.Min != nil && check(where+".min", z.Min)
 	recOK := z.Recommended != nil && check(where+".recommended", z.Recommended)
@@ -999,10 +985,10 @@ func (l *linter) vmCores() {
 // tune checks tune: a profile tune knows.
 func (l *linter) tune() {
 	t := l.s.Tune
-	if t == nil && !l.leftEmpty("tune") {
+	if t == nil {
 		return
 	}
-	if t == nil || t.Profile == "" {
+	if t.Profile == "" {
 		l.errf("tune.profile", "missing: default or network, or remove tune")
 		return
 	}
@@ -1013,36 +999,6 @@ func (l *linter) tune() {
 	if l.s.Shapes.Docker == nil && l.s.Shapes.Kairos == nil {
 		l.warnf("tune.profile", "only the docker and kairos shapes tune their hosts: the nodes are the cluster's, and `k8s install --unsafe-sysctls` gives the pods the network profile's settings")
 	}
-}
-
-// leftEmpty: the spec writes the key at path with nothing under it, which decodes as no key at
-// all.
-func (l *linter) leftEmpty(path ...string) bool {
-	raw, err := os.ReadFile(l.specPath)
-	if err != nil {
-		return false
-	}
-	var doc yaml.Node
-	if yaml.Unmarshal(raw, &doc) != nil || len(doc.Content) == 0 {
-		return false
-	}
-	n := doc.Content[0]
-	for _, k := range path {
-		if n.Kind != yaml.MappingNode {
-			return false
-		}
-		var next *yaml.Node
-		for i := 0; i+1 < len(n.Content); i += 2 {
-			if n.Content[i].Value == k {
-				next = n.Content[i+1]
-			}
-		}
-		if next == nil {
-			return false
-		}
-		n = next
-	}
-	return true
 }
 
 func (l *linter) hookUsesImage(key string) bool {
@@ -1609,17 +1565,32 @@ func (l *linter) healthAndDatabase() {
 const maxUID = 1<<32 - 2
 
 func (l *linter) data() {
+	// The compose file's volumes; nil without a compose file read, when none is judged.
+	var vols map[string]any
+	if l.compose != nil {
+		vols, _ = l.compose.TopLevel["volumes"].(map[string]any)
+	}
+	missing := map[string]bool{}
 	for _, name := range sortedKeys(l.s.Data.Volumes) {
 		if uid := l.s.Data.Volumes[name].UID; uid != nil && (*uid < 0 || *uid > maxUID) {
 			l.errf("data.volumes."+name, "uid must be 0 to %d", maxUID)
 		}
+		if l.compose != nil && !hasKey(vols, name) {
+			missing[name] = true
+			l.errf("data.volumes."+name, "%q is not a volume %s declares: data volumes are the compose file's, which the Docker and VM installs give their uid, back up and reset", name, l.s.Stack.Compose)
+		}
 	}
 	for _, r := range l.s.Data.Reset {
 		v, ok := l.s.Data.Volumes[r]
-		if !ok {
+		switch {
+		case !ok:
 			l.errf("data.reset", "%q is not a data volume", r)
-		} else if v.KeepOnReset {
+		case v.KeepOnReset:
 			l.errf("data.reset", "%q is marked keep_on_reset", r)
+		case l.compose != nil && !missing[r]:
+			if _, err := l.compose.OwnedVolume(r); err != nil {
+				l.errf("data.reset", "%v: reset-db does not delete it", err)
+			}
 		}
 	}
 	switch {
@@ -2247,6 +2218,32 @@ func (l *linter) chart(rel string) {
 	if len(l.s.L4.Routes) > 0 && !reads("l4") {
 		l.warnf("shapes.kubernetes.chart", "%s: no template reads .Values.%s.l4: the L4 routes are not published on Kubernetes", rel, helm.ValuesKey)
 	}
+	if !routesHTTP(c) {
+		return
+	}
+	for i, r := range l.s.Front.Routes {
+		if g := routeGuards(r); len(g) > 0 {
+			l.warnf(fmt.Sprintf("front.routes[%d]", i), "%s: on Kubernetes the chart's ingress serves the route, and Stowage enforces none of its guards there (%s): the chart's ingress must, or the route is open on the cluster", r.Name, strings.Join(g, ", "))
+		}
+	}
+}
+
+// routeGuards are the guards the Docker and VM fronts enforce on a front route, by key.
+func routeGuards(r spec.Route) []string {
+	var g []string
+	if r.ClientAuth {
+		g = append(g, "client_auth")
+	}
+	if r.AllowInput != "" {
+		g = append(g, "allow_input")
+	}
+	if r.ForwardAuth != nil {
+		g = append(g, "forward_auth")
+	}
+	if r.BasicAuth != nil {
+		g = append(g, "basic_auth")
+	}
+	return g
 }
 
 // k8sSchema checks shapes.kubernetes.schema: it needs the sql schema-compat provider, with the
@@ -2404,10 +2401,10 @@ func (l *linter) host() {
 			l.errf(at, "is a tune profile's: tune computes it from the host (`tune` reports it)")
 		case !spec.SysctlValue.MatchString(c.Value):
 			l.errf(at+".value", "%q: letters, digits and _ . , : / + -, fields of one space, at most 8", c.Value)
-		case namespaced(key):
-			kept = append(kept, key)
-			l.arpSetting(at, h, key, c.Value)
 		default:
+			if namespaced(key) {
+				kept = append(kept, key)
+			}
 			l.arpSetting(at, h, key, c.Value)
 		}
 		l.reason(at+".reason", c.Reason)
@@ -2436,19 +2433,23 @@ func (l *linter) host() {
 	l.interfaces(h.Interfaces)
 }
 
-// arpSetting refuses, on a VM of more than one NIC role, a NIC's or default's ARP setting below
-// all's (the project's own, else spec.ARPSettings'): the kernel takes the larger, so it would not
-// hold.
+// arpSetting refuses an ARP setting out of its spec.ARPRange on any device and shape, and, on a VM
+// of more than one NIC role, a NIC's or default's ARP setting below all's (the project's own, else
+// spec.ARPSettings'): the kernel takes the larger, so it would not hold.
 func (l *linter) arpSetting(at string, h *spec.Host, key, value string) {
-	if l.s.Shapes.Kairos == nil || h.NICRoles() < 2 {
-		return
-	}
 	rest, ok := strings.CutPrefix(key, "net.ipv4.conf.")
 	i := strings.LastIndexByte(rest, '.')
 	if !ok || i <= 0 {
 		return
 	}
 	dev, name := rest[:i], rest[i+1:]
+	if err := spec.CheckARP(name, value); err != nil {
+		l.errf(at+".value", "%s: %v", value, err)
+		return
+	}
+	if l.s.Shapes.Kairos == nil || h.NICRoles() < 2 {
+		return
+	}
 	all, arp := spec.ARPSettings[name]
 	if !arp || dev == "all" {
 		return
@@ -2765,10 +2766,10 @@ func (l *linter) reason(at, reason string) {
 }
 
 // namespaced reports whether a kernel setting is, mostly, one a network, IPC or UTS namespace keeps
-// of its own: a container's starts at the kernel's default, whatever the host holds. The TCP and
-// UDP memory limits are the host's, shared by every namespace.
+// of its own: a container's starts at the kernel's default, whatever the host holds. The keys of
+// globalNet are the host's, shared by every namespace.
 func namespaced(key string) bool {
-	if key == "net.ipv4.tcp_mem" || key == "net.ipv4.udp_mem" {
+	if globalNet[key] {
 		return false
 	}
 	for _, p := range []string{"net.ipv4.", "net.ipv6.", "net.unix.", "net.netfilter.", "net.mptcp.", "net.sctp.", "kernel.shm", "kernel.msg", "kernel.sem", "fs.mqueue."} {
@@ -2777,6 +2778,20 @@ func namespaced(key string) bool {
 		}
 	}
 	return key == "net.core.somaxconn" || key == "kernel.hostname" || key == "kernel.domainname"
+}
+
+// globalNet are the kernel settings under a namespaced prefix the kernel holds once for every
+// namespace.
+var globalNet = map[string]bool{
+	"net.ipv4.tcp_mem":                      true,
+	"net.ipv4.udp_mem":                      true,
+	"net.ipv4.tcp_max_orphans":              true,
+	"net.ipv4.inet_peer_threshold":          true,
+	"net.ipv4.inet_peer_minttl":             true,
+	"net.ipv4.inet_peer_maxttl":             true,
+	"net.ipv4.fib_sync_mem":                 true,
+	"net.netfilter.nf_conntrack_expect_max": true,
+	"net.netfilter.nf_conntrack_buckets":    true,
 }
 
 // kernelModules checks host.modules: each name, option and value is written into modprobe's files

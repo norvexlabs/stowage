@@ -401,7 +401,7 @@ func (in *Installer) StatusJSON(ctx context.Context) error {
 	if st.Previous, err = in.keptPrevious(v, n); err != nil {
 		return err
 	}
-	if st.Services, err = in.stackServices(ctx, env); err != nil {
+	if st.Services, err = in.stackServices(ctx, env, nil); err != nil {
 		st.ServicesError = err.Error()
 	}
 	return printJSON(in.O.Out, st)
@@ -412,17 +412,9 @@ func (in *Installer) StatusJSON(ctx context.Context) error {
 // stopped, which `rollback` finishes on it). Its installer is the one its .env records for it.
 func (in *Installer) keptPrevious(version string, revision int) (*StatusRelease, error) {
 	prev := in.path(PrevDir)
-	file := filepath.Join(prev, prevState)
-	raw, err := os.ReadFile(file)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil, nil
-	}
-	if err != nil {
+	st, err := in.readPrevState()
+	if st == nil || err != nil {
 		return nil, err
-	}
-	var st state
-	if err := json.Unmarshal(raw, &st); err != nil {
-		return nil, fmt.Errorf("%s: %w", file, err)
 	}
 	if st.ProjectVersion == version && st.Revision == revision {
 		return nil, nil
@@ -441,45 +433,11 @@ func (in *Installer) keptPrevious(version string, revision int) (*StatusRelease,
 
 // K8sStatusJSON prints the helm release's status as one JSON object (K8sReleaseStatus).
 func (in *Installer) K8sStatusJSON(ctx context.Context) error {
-	rel, err := in.k8sStatusRelease(ctx)
-	if err != nil {
-		return err
-	}
-	h, err := in.helmHistory(ctx)
-	if err != nil {
-		return err
-	}
-	// What `helm get values` gives is the latest revision's: read once, with the history's.
-	var cur *deployed
-	if n := h.latest(); n == 0 {
-		cur, err = in.installedRelease(ctx)
-	} else if raw, rerr := h.values(ctx, n); rerr != nil {
-		err = rerr
-	} else {
-		cur, err = in.deployedIn(raw, fmt.Sprintf("helm get values --revision %d", n))
-	}
+	st, cur, err := in.k8sReleaseStatus(ctx, true)
 	if err != nil {
 		return err
 	}
 	r := cur.Release
-	st := K8sReleaseStatus{InstallStatus: InstallStatus{Format: MachineFormat, Name: r.Name}, Helm: HelmStatus{Revision: h.latest(), Status: rel.Status}}
-	// After `helm uninstall --keep-history` nothing runs: the latest revision is what `rollback`
-	// brings back (previous), and nothing is installed.
-	if len(h.revs) == 0 || h.revs[0].Status != "uninstalled" {
-		st.Channel, st.Installing, st.Registry = r.Channel, rel.Status == "pending-install", cur.Registry
-		st.Installed = &StatusRelease{Version: r.Version, Revision: r.Revision, Installer: installerFor(r.Installer, r.InstallerRelease, r.Version, r.Revision)}
-	}
-	// The revision `rollback` goes back to: never the latest, but after an uninstall (when nothing
-	// is installed); none before an upgrade.
-	switch n, err := h.previous(ctx); {
-	case errors.As(err, new(noPrevious)):
-	case err != nil:
-		return err
-	default:
-		if st.Previous, err = h.release(ctx, n); err != nil {
-			return err
-		}
-	}
 	// The inputs, as the spec of the release installed tells them: this installer's only when it
 	// carries that release.
 	if st.Installed != nil && isRelease(in.R.Manifest, r.Name, r.Version, r.Revision) {
@@ -497,6 +455,55 @@ func (in *Installer) K8sStatusJSON(ctx context.Context) error {
 		}
 	}
 	return printJSON(in.O.Out, st)
+}
+
+// k8sReleaseStatus is what both forms of `k8s status` print: helm's status, the release installed
+// (nil after an uninstall that kept its history) and, with previous or when none is installed, the
+// one `rollback` brings back; with the latest revision's values it reads them from.
+func (in *Installer) k8sReleaseStatus(ctx context.Context, previous bool) (K8sReleaseStatus, *deployed, error) {
+	rel, err := in.k8sStatusRelease(ctx)
+	if err != nil {
+		return K8sReleaseStatus{}, nil, err
+	}
+	h, err := in.helmHistory(ctx)
+	if err != nil {
+		return K8sReleaseStatus{}, nil, err
+	}
+	// What `helm get values` gives is the latest revision's: read once, with the history's.
+	var cur *deployed
+	if n := h.latest(); n == 0 {
+		cur, err = in.installedRelease(ctx)
+	} else if raw, rerr := h.values(ctx, n); rerr != nil {
+		err = rerr
+	} else {
+		cur, err = in.deployedIn(raw, fmt.Sprintf("helm get values --revision %d", n))
+	}
+	if err != nil {
+		return K8sReleaseStatus{}, nil, err
+	}
+	r := cur.Release
+	st := K8sReleaseStatus{InstallStatus: InstallStatus{Format: MachineFormat, Name: r.Name}, Helm: HelmStatus{Revision: h.latest(), Status: rel.Status}}
+	// After `helm uninstall --keep-history` nothing runs: the latest revision is what `rollback`
+	// brings back (previous), and nothing is installed.
+	if len(h.revs) == 0 || h.revs[0].Status != "uninstalled" {
+		st.Channel, st.Installing, st.Registry = r.Channel, rel.Status == "pending-install", cur.Registry
+		st.Installed = &StatusRelease{Version: r.Version, Revision: r.Revision, Installer: installerFor(r.Installer, r.InstallerRelease, r.Version, r.Revision)}
+	}
+	if !previous && st.Installed != nil {
+		return st, cur, nil
+	}
+	// The revision `rollback` goes back to: never the latest, but after an uninstall (when nothing
+	// is installed); none before an upgrade.
+	switch n, err := h.previous(ctx); {
+	case errors.As(err, new(noPrevious)):
+	case err != nil:
+		return K8sReleaseStatus{}, nil, err
+	default:
+		if st.Previous, err = h.release(ctx, n); err != nil {
+			return K8sReleaseStatus{}, nil, err
+		}
+	}
+	return st, cur, nil
 }
 
 // release is the release revision n records in its values; nil when they record none of this

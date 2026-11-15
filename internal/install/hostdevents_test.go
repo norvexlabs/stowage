@@ -1285,7 +1285,7 @@ func TestAVerdictTheStateLacksIsReadOffTheJournal(t *testing.T) {
 	if err := os.Mkdir(j.path(), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if last, e, err := j.lastOf("boot-1"); err != nil || e == nil || last != 2 {
+	if last, e, err := j.lastOf(); err != nil || e == nil || e.BootID != "boot-1" || last != 2 {
 		t.Errorf("read the journal: %d %+v %v", last, e, err)
 	}
 }

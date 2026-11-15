@@ -186,7 +186,19 @@ a self-review against the code it describes is enough. Every other commit clears
    the lifecycle suites and e2e-full-vm (the one shipping `examples/full`'s OS bundle); `internal/tune` the lifecycle suites and e2e-vm, its `modules.go`
    e2e-full-vm alone, its `host.go`, `packages.go` (the firmware), `interfaces.go`, `ethtool.go` and `cores.go` e2e-full-vm too; `internal/install`'s `nftables*.go`, `ipvlan*.go` and `cpus*.go` (a service's table, address and cores) smoke-install, the lifecycle suites and e2e-full-vm (e2e-vm's project declares a kernel argument and a package); `internal/install/audit.go` smoke-install, the lifecycle suites and the VM's
    (e2e-kairos, e2e-vm);
-   `Dockerfile`/`Makefile` the suites but e2e-kairos, e2e-vm and e2e-full-vm; `.githooks/` and
+   `internal/front` (the front every ship builds) e2e and the lifecycle suites; `internal/spec`,
+   `internal/providers`, `internal/command` and `internal/chown` (read by the installer and the
+   publisher) smoke-install, e2e and the lifecycle suites; the publisher's other packages
+   (`internal/hook`, `lock`, `project`, `dockerfile`, `digest`, `changelog`, `gitcmd`) e2e and the
+   lifecycle suites, as `internal/publish`; `internal/graph` (every ship's skip and re-tag
+   decision) e2e, the lifecycle suites and e2e-kairos; `examples/full/audit-allow.yaml` e2e-full and
+   e2e-full-k8s, and e2e-full-vm when an entry of artifact `os` or `"*"` changes; Stowage's own
+   `audit-allow.yaml` and `test/selfaudit/` `make self-audit` after lint; `.github/workflows/`,
+   `test/release.sh` and `test/release-notes.sh` (the release workflow's reading of CHANGELOG.md)
+   `test/release.sh` after lint; `internal/lint`, `internal/testutil`, `docs/`, `.gitignore` and
+   `test/gate.sh` none. A path no rule
+   names refuses the gate until its rule is added, there and here;
+   `Dockerfile`/`Makefile`/`.dockerignore` the suites but e2e-kairos, e2e-vm and e2e-full-vm; `.githooks/` and
    `test/hooks.sh` none, but `test/hooks.sh` runs after lint; a `_test.go` file none (`make
    check` runs it), but `smoke_test.go` runs smoke-install.
 2. **Docs in sync**: README.md, the reference pages (docs/*.md), docs/DESIGN.md, CLAUDE.md describe what the tree does. Before

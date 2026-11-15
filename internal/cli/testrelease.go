@@ -214,7 +214,7 @@ func (t testRelease) signing(p *project.Project) error {
 		return fmt.Errorf("--test-public-key %s: %w", t.Public, err)
 	}
 	key := t.Key
-	if !keyURI.MatchString(key) {
+	if !publish.KeyIsURI(key) {
 		if key, err = filepath.Abs(key); err != nil {
 			return err
 		}
@@ -225,7 +225,7 @@ func (t testRelease) signing(p *project.Project) error {
 			return fmt.Errorf("signing: %w", err)
 		}
 		own := c.Key
-		if !keyURI.MatchString(own) && !filepath.IsAbs(own) {
+		if !publish.KeyIsURI(own) && !filepath.IsAbs(own) {
 			own = filepath.Join(p.Root, own)
 		}
 		if key == own || sameFile(key, own) {

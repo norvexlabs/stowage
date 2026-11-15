@@ -201,6 +201,8 @@ func (s schema) call(ctx context.Context, image *EnvFile, req map[string]any, re
 // file (in the install directory), as the container name.
 type commandRun struct {
 	what, service, file, name string
+	// labels are the container's own, beside Compose's.
+	labels map[string]string
 }
 
 // runCommand runs one op of a `command` provider, c, in a confined container of the image its
@@ -227,6 +229,9 @@ func (in *Installer) runCommand(ctx context.Context, r commandRun, c providers.R
 	if hosts := in.targetHosts(); len(hosts) > 0 {
 		svc["extra_hosts"] = hosts
 	}
+	if len(r.labels) > 0 {
+		svc["labels"] = r.labels
+	}
 	file, err := serviceFile(r.what, r.service, svc)
 	if err != nil {
 		return err
@@ -246,7 +251,7 @@ func (in *Installer) runCommand(ctx context.Context, r commandRun, c providers.R
 	runCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	out := &capped{limit: maxSchemaAnswer}
-	_, err = in.O.Docker.Run(runCtx, Cmd{
+	_, err = in.runNamed(runCtx, r.name, Cmd{
 		Args:   append(in.composeBase(r.file), "run", "--rm", "--no-deps", "-T", "--name", r.name, r.service),
 		Env:    stack.Environ(in.O.environ()),
 		Stdin:  bytes.NewReader(body),
@@ -254,9 +259,6 @@ func (in *Installer) runCommand(ctx context.Context, r commandRun, c providers.R
 	})
 	op := req["op"]
 	if runCtx.Err() != nil {
-		rmCtx, rmCancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
-		_, _ = in.O.Docker.Run(rmCtx, Cmd{Args: []string{"rm", "--force", r.name}})
-		rmCancel()
 		if err := ctx.Err(); err != nil {
 			return fmt.Errorf("%s: %w", op, err)
 		}

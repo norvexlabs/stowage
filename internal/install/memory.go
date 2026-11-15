@@ -1,6 +1,7 @@
 package install
 
 import (
+	"fmt"
 	"strconv"
 
 	"github.com/norvexlabs/stowage/internal/spec"
@@ -77,4 +78,35 @@ func (p hostPlan) give(extra map[string]any, share spec.Share, svc serviceMemory
 		HostMemVar:  strconv.FormatUint(p.Host.MemBytes>>20, 10),
 		HostCPUsVar: strconv.Itoa(p.Host.CPUs),
 	}
+}
+
+// floorsOver is the warning a start logs when the least the shares give the services of m (each
+// share's min, MinMemLimit or what the compose file gives the container itself, as lint sums them
+// for the least VM) passes the part of this host's RAM the shares take (spec.MaxMemoryShares %):
+// "" when it does not, or when the host's RAM is unknown.
+func (p hostPlan) floorsOver(m *composeModel) string {
+	if p.Host.MemBytes == 0 || len(p.Shares) == 0 {
+		return ""
+	}
+	var total spec.Bytes
+	largest, most := "", spec.Bytes(0)
+	for _, name := range sortedKeys(p.Shares) {
+		svc, ok := m.Services[name]
+		if !ok {
+			continue
+		}
+		own := max(int64(svc.MemLimit), int64(svc.Deploy.Resources.Limits.Memory), int64(svc.MemReservation), int64(svc.Deploy.Resources.Reservations.Memory))
+		n := max(svc.Scale, svc.Deploy.Replicas, 1)
+		floor := spec.Share{Min: p.Shares[name].Min}.Limit(0, n, spec.Bytes(own)) * spec.Bytes(n)
+		total += floor
+		if floor > most {
+			largest, most = name, floor
+		}
+	}
+	budget := spec.Bytes(p.Host.MemBytes / 100 * spec.MaxMemoryShares)
+	if total <= budget {
+		return ""
+	}
+	return fmt.Sprintf("the memory shares' floors total %d MiB, over the %d MiB this host's RAM leaves them (%d %%): services may be OOM-killed; give the host more RAM or lower services.%s.memory.min",
+		total.MiB(), budget.MiB(), spec.MaxMemoryShares, largest)
 }

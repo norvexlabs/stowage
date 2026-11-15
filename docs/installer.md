@@ -46,7 +46,7 @@ again, to copy an installer to another host.
 <short>-stow reset-db [--dir D] [--yes] [--no-input] [--accessible] [--dry-run] [--no-provision]
           [--new-baseline]                                               # the NEW release's installer, across a baseline
 <short>-stow backup config|run|status|list|verify [--dir D] [the VM's flags]   # a pg-age-rclone or volumes-age-rclone backup
-<short>-stow restore OBJECT [--dir D] [--identity FILE|-] [--yes] [--accessible]
+<short>-stow restore OBJECT [--dir D] [--identity FILE|-] [--yes] [--accessible] [--unrecorded]
 <short>-stow script                                                      # print the bootstrap script
 <short>-stow tune [--check | --print] [--profile default|network]        # the host's network tuning
 <short>-stow tune --apply | --revert [--profile default|network] [--yes] [--restart-docker] [--no-input] [--accessible]
@@ -145,8 +145,9 @@ again, to copy an installer to another host.
   `[fd00::5]:5000`; none for a loopback registry, `127.x` or `[::1]`), which only root writes: when the run may
   not, it stops before writing anything and prints the `install -D -m 0644 …` to run as root. A
   `ca.crt` already there holding the CA's certificates (alone or in a bundle) is kept; one that
-  does not is refused, never replaced. A first install that fails removes the `ca.crt` it wrote
-  with the rest (and the host directory it made); a `registry-ca.pem` that was in the
+  does not is refused, never replaced. A first install that fails keeps the `ca.crt` it wrote (it
+  holds the CA given, which another install from that registry may rely on as soon as it is
+  there; remove it as root if the registry is not used); a `registry-ca.pem` that was in the
   directory before is replaced by the CA given, not removed. A loopback registry gets
   none (the daemon takes it as insecure). The daemon is this machine's: a remote `DOCKER_HOST`
   or rootless Docker (`~/.config/docker/certs.d`) needs the file put there by hand.
@@ -154,7 +155,7 @@ again, to copy an installer to another host.
   refused.
 - `--answers FILE` is a YAML map, `KEY: value`; a file input's also `KEY: {file: PATH}` (see "File inputs"), the path relative to the answers file.
   Its reserved `tls` section gives the front's TLS settings to an install or its re-run, on Docker and on the VM, as `--tls`, `--cert`, `--key`, `--ca` and `--client-ca` do, a flag winning over the file:
-  `tls: { mode: byo, cert: front.crt, key: front.key, ca: root.pem, client_ca: root.pem }`, every field optional, a relative path relative to the answers file (no `~`, as `{file: PATH}`), and `none` for `ca` or `client_ca` the flags' word (`./none` is a file). A flag wins whole: `--cert` or `--key` replaces the section's `mode`, `cert`, `key` and `ca`; `--tls` with a mode other than `byo` replaces `mode` and leaves out `cert`, `key` and `ca`; `--domains` replaces a section's `mode: none` (loopback serves no domain); `--ca` and `--client-ca` replace only their own. The run logs which flags the section stands in for, as a later check names those flags (`the tls section of FILE gives --tls, --cert`), and which fields a flag left out; a file left out need not exist. The flags' checks apply unchanged, so a re-run given the section replaces the certificate as `--cert` and `--key` do; left out, a re-run keeps what the install recorded.
+  `tls: { mode: byo, cert: front.crt, key: front.key, ca: root.pem, client_ca: root.pem }`, every field optional, a relative path relative to the answers file (no `~`, as `{file: PATH}`), and `none` for `ca` or `client_ca` the flags' word (`./none` is a file). A flag wins whole: `--cert` or `--key` replaces the section's `mode`, `cert`, `key` and `ca`; `--tls` with a mode other than `byo` replaces `mode` and leaves out `cert`, `key` and `ca`; `--domains` replaces a section's `mode: none` (loopback serves no domain); `--ca` and `--client-ca` replace only their own. The run logs which flags the section stands in for, as a later check names those flags (`the tls section of FILE gives --tls, --cert`), and which fields a flag left out; a file left out need not exist. The flags' checks apply unchanged, so a re-run given the section replaces the certificate as `--cert` and `--key` do; left out, a re-run keeps what the install recorded. A re-run that reads a new certificate refuses a domain `--domains` or `--set` gives that is no domain name before it reads the files, as a first install does (`--domains <route>: "<v>" is not a domain name …`, `KEY: …`).
   A field it does not know, one given twice or empty, a mode that is no TLS mode and a file it takes that does not exist are refused, naming the file and the field. `vm create` takes it too, its material given over SSH ("Given over SSH"). Refused too: the section on any other command taking `--answers` (`upgrade`, `k8s install`, `k8s upgrade`; on Kubernetes the chart's ingress serves the routes): remove it for that command.
 - `--given FILE|-` takes what another install gives, in the clear, at most 1 MiB, strict YAML: `project`, `inputs` of KEY: value with a file input as `stowage-file:<base64>`, `tls` of `cert`, `key`, `ca`, `client_ca` as PEM (a certificate picks `byo`). An empty value is refused, as for `--kit` and `--kit-code-file`, so a script's unset variable cannot drop them. It is refused when encrypted, for another project, holding nothing, or with a `cert` or `key` alone or a `ca` without its `cert`. Its inputs are taken as an answers file's and its TLS material as `--cert`, `--key`, `--ca` and `--client-ca`: `--set`, an exported variable, `--answers` and the flags win, what they leave out of its `tls` logged (`--given: tls: cert, key left out, as the flags given decide`), and the form asks the rest. On a re-run its values replace the recorded ones, each change logged. An input the project declares for other shapes alone is left out and logged (`--given: KEY left out: not an input of the docker shape`), and it is refused when that leaves it nothing, so it cannot end a VM's wait for what `vm create` gives (`--given: nothing in the file is for this install: …`). One this install does not ask, undeclared or of another TLS mode (`when`), is refused as any (`no input of this install is named KEY`, naming the mode that asks it): on a first install `--tls` such a mode; on a re-run, which cannot cross between loopback and a TLS mode, get a new file from its issuer or make a new install. TLS material this install cannot take is refused as its flag is, and the message names that flag (`--ca: …`). The bootstrap script run from its file (`sh <name>.sh --kit - < FILE`) leaves standard input to the installer, whatever it is; arriving on standard input itself (`… | sh -s --`), it gives the installer the terminal, so `-` has nothing to read: save it first. With `-`, or any other run whose standard input is no terminal, nothing is asked: the form's questions take their defaults, and a kit's code must come from `--kit-code-file` or `STOWAGE_KIT_CODE`.
 - `--kit FILE|-` takes the same material sealed with a code: a handoff kit. A kit is age, armored, to a scrypt recipient (work factor at most 18), at most 2 MiB, holding at most 1 MiB of strict YAML: `format: stowage-kit/v1`, `for` (the project), `expires` (RFC 3339), and optionally `name`, `instance`, `issued`, `inputs` and `tls` as in `--given`. So `age --passphrase --armor` makes one. It is refused with the wrong code or a changed file (`--kit: this code does not open it: …`), when not armored, in another format, for another project, at or past `expires` by this machine's clock (which is no revocation), and as `--given` is for what it holds; left-out material is logged under `--kit`, and `--kit: "NAME", instance "I", until T` names what was opened. It never logs the code, and logs a value as any re-run does: a secret `<redacted>`, a non-secret in the clear (`changing KEY: old → new`). The code comes from `--kit-code-file FILE` (at most 4096 bytes, surrounding space ignored), else the variable `STOWAGE_KIT_CODE` (removed from the environment once read, so no program the run starts inherits it), else it is asked, unechoed, on the terminal (a plain line under `--accessible`); with none of them, or `--no-input` without the first two, the run is refused naming them. A file that is no kit is refused before the code is asked. A wrong code is not asked again: run it again. `--given` with `--kit` or `--kit-code-file`, `--kit-code-file` without `--kit`, and either with `--secrets` are refused. `upgrade`, on Docker and on the VM, refuses all three (`--kit: an upgrade takes none of it: …`), naming the re-run that takes them.
@@ -162,7 +163,9 @@ again, to copy an installer to another host.
   `<redacted>`) and writes nothing. On a re-run, it logs the changes a run would record and says
   the stack would be brought up again.
 - `status` prints the release (version, revision), the registry, the stack's tuning profile and
-  whose it is (`tune      network (operator)`, or `(release)`), then, while the first install
+  whose it is (`tune      network (operator)`, or `(release)`: the profile of the release the
+  install runs, read from the installer it keeps when another release's runs `status`; `(release:
+  unknown, run the installed release's installer)` when neither carries it), then, while the first install
   has not finished, `not finished: the first install failed (<the first line of its error>); a
   re-run of the installer with --dir D finishes it` (or `… runs, or was stopped; …`); while a
   restore left the volumes half restored, `not running: a restore left <name>'s volumes half
@@ -182,7 +185,9 @@ again, to copy an installer to another host.
   compose ps --all`, and a line for each service down (`warning: which services are down could
   not be read: …` when compose ps or its JSON fails): `down: <service> <why>`, where a service is
   down when its container exited with a code other than 0, restarts, is dead, is being removed
-  or was created and never started (`exited 137 (SIGKILL), OOM-killed (memory limit 96 MiB)`: its exit code, whether its memory
+  or was created and never started, or a service the stack declares (`compose config
+  --services`) has no container at all (`missing: no container`; a `compose run` container left
+  exited is no service's and never down) (`exited 137 (SIGKILL), OOM-killed (memory limit 96 MiB)`: its exit code, whether its memory
   cgroup killed it, the memory limit its container runs with, and the signal an exit of 128+N
   tells, N from 1 to 64: `(SIGTERM)` for 143, `(SIGKILL)` for 137, `SIGHUP` to `SIGTERM` by name,
   `(signal N)` for the others). A container exited 0 is not down (a one-shot that finished, which
@@ -336,7 +341,9 @@ again, to copy an installer to another host.
   `<prefix>/<name>-front:<tag>`, too.
 - `.env` (0600) records every decision — every safe default included —
   as single-quoted values compose reads literally (a value with a `'`, a line break or a trailing
-  `\`, or over 64 KiB, is refused);
+  `\`, or over 64 KiB, is refused, and so is a `.env` whose values total over 1 MiB, each counted
+  as `KEY=value`: every compose and hook process gets them all in its environment — `the recorded
+  values total N bytes, over 1048576: … give the largest inputs (K1, K2) shorter values`);
   its values win over the shell's environment on every run. Besides the values the compose file
   reads, it records the installer's own: `STOWAGE_REGISTRY` (the prefix images are pulled from),
   `STOWAGE_FRONT_IMAGE` (with a front), `STOWAGE_CHOWN_IMAGE` (a release with the volume helper), `STOWAGE_PORT_<ROUTE>` (loopback mode), `STOWAGE_HTTP_PORT` and
@@ -393,7 +400,10 @@ again, to copy an installer to another host.
     replaces, unless an earlier change has not come up since (marked by `.stowage-changing`,
     removed once a re-run's stack comes up and, unless `--no-provision`, its hook ran), so a
     second try never loses the values from before the first. An upgrade or a rollback removes
-    both: values of another release are no way back. `.env` is rewritten, then the stack is brought up
+    both: values of another release are no way back; an upgrade then marks its own start
+    (`.stowage-changing`, removed once its stack comes up), so a re-run after an upgrade whose
+    start failed keeps no `.env.prev` of values that never came up, and says so (`no values of
+    this release have come up yet (the upgrade to it did not)`, a failure naming `rollback`). `.env` is rewritten, then the stack is brought up
     again with it and the hook run. When a step after that fails, the changes stay recorded and
     the error says so, naming `.env.prev`: a re-run giving its values goes back. The `byo`
     certificate is read only for a domain that changes, so an expired one never stops a re-run
@@ -421,7 +431,9 @@ again, to copy an installer to another host.
     alone: `--ports: the route <r> is recorded at the install, and an upgrade keeps its port`),
     else the release's `front.loopback_ports`, else refused (`<name> <version> adds the route <r>,
     which has no loopback port: give it one with --ports <r>=PORT`); a port another route has, an
-    L4 route's, or one in use on the host is refused as at a first install; `--ports` in a TLS mode
+    L4 route's, or one in use on the host is refused as at a first install (but the port the
+    install records for a route the release removes, which its front holds: the added route takes
+    it); on the VM, whose upgrade takes no flag, these refusals name none; `--ports` in a TLS mode
     is refused (`--ports is for loopback mode: …`).
 
   A route the install publishes whose `domain_input` it does not record (a release that renames
@@ -435,8 +447,11 @@ again, to copy an installer to another host.
   upgraded to that version's latest revision on its channel, as `upgrade --version <its
   version>` does (the other flags passed on), so a fix shipped as a revision reaches it; with no
   later revision it is left as it is, with a note (`<dir> already runs <name> <version>
-  (revision N)`), and so it is when the channel cannot be read (logged: `no later revision of
-  <name> <version> looked for: …`) or holds only an earlier revision (its own yanked). An
+  (revision N)`), and so it is when the channel holds none of that version to move to (yanked,
+  retired; logged: `no later revision of <name> <version> looked for: …`) or holds only an
+  earlier revision (its own yanked); a channel that cannot be read (the registry unreachable)
+  fails the upgrade, the install left as it is (`the channel could not be read: …; the install
+  stays on <name> <version> (revision N)`, exit non-zero). An
   install made with `--offline`, which never pulls, is left as it is, with a note. The upgrade follows how the
   install pulls its images (an install made with `--offline` upgrades from loaded images). Then it pulls the images, dumps the database (`pg_dump` as the migrate role, gzip,
   `snapshots/<UTC time>.sql.gz`, 0600; a failed dump stops the upgrade), records the schema
@@ -444,7 +459,11 @@ again, to copy an installer to another host.
   `.stowage-prev/` (one level), writes `.env` (every recorded value kept but an input the release
   no longer declares, on any shape — dropped, with `input KEY is not in <name> <version>: dropped`,
   never asked again —; the release's added inputs, secrets and safe defaults decided as at a
-  first install; version, revision and images rewritten), starts it and provisions (a key the
+  first install, and so is a recorded value the release's own check refuses (an element a set
+  refuses, a narrower check, a table it picks no file of), noted first (`note: KEY: <name>
+  <version> refuses the recorded value (<why>): it is given, asked or defaulted again`; a secret
+  without the why) and warned when the value changes (`warning: KEY: …, so it is now "<new>"`, a
+  secret `<redacted>`), so no recorded value the release refuses reaches its start; version, revision and images rewritten), starts it and provisions (a key the
   previous release's hook declared in `returns` and this one's does not is dropped from
   `provision.env`, with `the provision hook of <name> <version> no longer returns KEY: dropped`).
   `rollback` takes both back: the previous release's values `.env` lacks, and what its hook
@@ -557,7 +576,9 @@ again, to copy an installer to another host.
   another Stowage built it`). The rollback barriers, the current release's own, still refuse.
 - `rollback`, run by the installer the install keeps, goes back to `.stowage-prev/`: the previous
   compose files, installer, version and images; every other value stays as it is now
-  (a secret the upgrade added is kept for the next upgrade). The previous release is then started
+  (a secret the upgrade added is kept for the next upgrade). Its images are pulled before anything
+  changes (as its spec names them, or, when another Stowage built it, as its record names them by
+  digest: a pull that fails leaves the install as it was). The previous release is then started
   by its own installer (`starting <name> <v> (revision <r>) with its own installer: …`): on Docker
   a re-run of it (`<short>-stow --dir <dir> --no-input --no-provision`, and `--offline` for an
   install that runs loaded images: the hook is not run, and when the previous release has a hook
@@ -576,7 +597,11 @@ again, to copy an installer to another host.
   schema; a check that cannot run (an unreadable database, no answer) does not refuse, and says
   so. `--dry-run` pulls the previous images only when the check reads them. One install run,
   provision, upgrade, rollback or reset-db works on an install at a time, reading it under its lock; a hook or schema container a
-  killed run left is refused, naming the `docker rm --force` that clears it.
+  killed run left is refused, naming the `docker rm --force` that clears it. A one-shot container
+  of the installer's (the provision hook, a schema or health command, a kit's run, the backup
+  runner) whose run is cut off (its bound, an interrupt, the docker CLI killed by a signal) is
+  removed by its name at once, under a bound of its own (30 s); one it cannot remove is named in
+  the error (`the container may still be running: `docker rm --force <name>``).
 - Once the stack is up, the provision hook runs (`--no-provision` skips it; `provision` runs it
   later). Each `KEY=VALUE` line it prints is recorded in `provision.env` (0600) as it arrives, and
   copied to the hook's `outputs` file (0600, `KEY=VALUE`) at the end, even when it fails; the
@@ -890,7 +915,8 @@ again, to copy an installer to another host.
   `--set` or `--answers` gives a route the release adds included; an address the stack holds the
   port on, there or on every address, is never probed; the wildcard always is). A re-run
   changing a route's address probes the port at the new one the same way. The address must be
-  one of the host's (when the host's addresses can be listed): an install, a re-run or an upgrade
+  one of the host's (when the host's addresses can be listed; any of 127.0.0.0/8 when the host
+  lists an IPv4 loopback address, as Linux answers on all of them): an install, a re-run or an upgrade
   refuses another (`<v> (<KEY>, the L4 route <name>'s address) is not an address of this
   host`).
   With `--ipv6`, Docker forwards them over IPv6 too. A route with an `address_input` gets
@@ -1031,7 +1057,7 @@ again, to copy an installer to another host.
   KEY=PATH, or KEY: {file: PATH} in --answers`). A log, `--dry-run` and `vm create`'s summary show
   a non-secret one as `sha256:<12 hex>`, a secret one `<redacted>`. `vm create` puts a non-secret
   one in the seed, refused when it carries the cloud-config past what the cloud takes as user data (Amazon EC2: 16 KiB, Microsoft Azure: 64 KiB; `the cloud-config is N bytes, and … takes …: give smaller files for KEY; an optional one can be left out and given over SSH once the VM answers, with `install --set-file``); a secret one is refused there as any secret input, given over SSH with
-  `--secrets`. An upgrade to a release that cannot read a recorded input, a text it declares as a file, a file it declares as text or a file a `pem` input refuses, in any mode, is refused before it writes anything (`KEY: <project> <version> declares it as a file, which cannot read the value recorded: the project must declare a changed input under a new key`); one that requires a file input recorded empty asks it as an input it adds; and a `rollback` to a release that cannot read a value given since takes back the one it ran with, or none (`KEY goes back to the value <project> <version> ran with`). Each start writes each file input's file under `.stowage-inputs/` in the install
+  `--secrets`. An upgrade to a release that cannot read a recorded input, a text it declares as a file, a file it declares as text or a file a `pem` input refuses, in any mode, is refused before it writes anything (`KEY: <project> <version> declares it as a file, which cannot read the value recorded: the project must declare a changed input under a new key`); one that requires a file input recorded empty asks it as an input it adds; and a `rollback` to a release that cannot read a value given since takes back the one it ran with, or none (`KEY goes back to the value <project> <version> ran with`). Each start, and every write of `.env` before it (so a path `.env` names always exists: a compose command run before the stack's first start, `exec` or `run`, never has Docker make a directory there), writes each file input's file under `.stowage-inputs/` in the install
   directory (the directory 0700, each file 0644: a bind mount lets a container of any uid read the
   file, and the host's other users stay out), named `<KEY>-<12 hex of the value's digest>`, and
   records its path as `STOWAGE_INPUT_FILE_<KEY>` in `.env`, relative to the install directory, for
@@ -1154,8 +1180,8 @@ keeps (`<dir>/<short>-stow`, the release it runs; another is refused).
 
 - `backup config|run|status|list|verify` and `restore OBJECT` (`--dir D`, the other flags as on
   the VM — see "Backups" under the installer on the Kairos VM) take a project's `pg-age-rclone`
-  or `volumes-age-rclone` backup: the settings in `backup.yaml` (root's alone) and the last run in `backup-last.json` in
-  the install directory, the volumes' archives and the dump encrypted to the recipients as they
+  or `volumes-age-rclone` backup: the settings in `backup.yaml` (root's alone), the last run in `backup-last.json` and
+  the uploaded objects' digests a restore checks in `backup-digests.json` in the install directory, the volumes' archives and the dump encrypted to the recipients as they
   stream to the backup runner
   (`<name>-backup`, pulled with the stack's images, by digest, since a release of a project with
   the `docker` shape and a `pg-age-rclone` or `volumes-age-rclone` backup publishes one, and pulled again when the engine
@@ -1165,7 +1191,8 @@ keeps (`<dir>/<short>-stow`, the release it runs; another is refused).
   digest>.timer` and its `.service` (`ExecStart="<dir>/<short>-stow" backup run --if-configured
   --dir "<dir>"`: each path quoted, its `%` and `$` doubled and a control character escaped, as in
   every unit Stowage writes on a Docker host; in `Description=` the directory's `%` doubled, a
-  control character `?`) in `/etc/systemd/system`, written, enabled and started by `backup config` (and
+  control character `?`; a failed run tried again as on the VM: `Restart=on-failure`,
+  `RestartSec=15min`, `StartLimitIntervalSec=3h`, `StartLimitBurst=6`) in `/etc/systemd/system`, written, enabled and started by `backup config` (and
   `--remove` removes them); on a host without systemd, or a run not as root, there is none (a
   backup runs when `backup run` is), and the schedule is kept unchecked. One process at a time
   runs the jobs (`backup run`, `verify`, `restore`): it holds `.stowage-host.lock` in the install

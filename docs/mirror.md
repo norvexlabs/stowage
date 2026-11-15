@@ -28,13 +28,25 @@ carries it:
   disk (`--disks` is then refused). The release manifest still names them: an install of a shape
   left out says, from the mirror, what is missing. The channel's tag in the archive is on the
   release exported, so importing an earlier release into a mirror whose channel holds a later one
-  takes `mirror import --older`.
+  takes `mirror import --older` — but when the channel went back from a yank: the export of a
+  channel carries, under their own tags, the manifests (with their signatures, not their
+  artifacts) of the channel's later publications yanked since — each yank signed by a key this
+  `<short>-stow` trusts (when it carries any), as an install counts a yank; an unsigned one is
+  passed over (`not carrying the yank of <name> <tag>: …`), and a tag holding a manifest this
+  Stowage does not read is passed over — logging `carrying the yank of <name>
+  <version> (<tag>): <reason>`, and the import marks them yanked in the mirror, so `upgrade
+  --version` there refuses them as at the source.
 - The archive is a standard OCI image layout (`oci-layout`, `index.json`, `blobs/sha256/`) as one
   tar; each top-level manifest carries `org.opencontainers.image.ref.name` (its tag; none for a
   signature) and `dev.stowage.repository` (its repository under the registry prefix), so skopeo
   and oras read it as well.
 - `mirror import FILE --to PREFIX` (on the site) pushes every manifest of the archive, with what
-  it names, into `<PREFIX>/<repository>`, by digest and under its tag. The bytes are the
+  it names, into `<PREFIX>/<repository>`, by digest and under its tag. Two imports into one
+  prefix from one machine (as one user) run one after the other: each takes the lock
+  `$XDG_CACHE_HOME/stowage/mirror-<hash of PREFIX>.lock` (`~/.cache` when unset) over its checks
+  and its push, the second logging `waiting for another import into PREFIX` (an interrupt ends the
+  wait: `waiting for another import into PREFIX: context canceled`); imports from several
+  machines into one mirror are the operators' to order. The bytes are the
   published ones, so every digest is the same and the signatures still verify there (the import
   does not check them: an install checks the release when it reads it from the mirror). The
   release manifest and the channel's tag are pushed last, so the mirror never names a release
@@ -42,15 +54,19 @@ carries it:
   path or tag that is not one (`..`), or a repository that is not the release's own
   (`<name>-release`, `-installer`, `-os`, `-disk`, `<name>-<key>` for each image, and the chart's
   `charts/<name>-<channel>`; checked for the whole archive before anything is pushed) is
-  refused. So is an archive whose `<name>-release` does not hold exactly the release's tag and
-  its channel's, on one manifest of a `<name>` release; that tags anything else than the
+  refused. So is an archive whose `<name>-release` does not hold the release's tag and its
+  channel's, on one manifest of a `<name>` release, and beside them only the tags of that channel's
+  later publications, each on its yanked manifest; that tags anything else than the
   release's artifacts under the tags the release gives them (by the digests it records); whose
   release names an image this
   `<short>-stow`'s project does not (a release that adds one is imported with its own `<short>-stow`,
   in the archive's `<name>-installer`); whose release is an earlier publication of the channel
   than the one the mirror's channel holds (by the channel's publication number: the mirror's
-  channel never goes back) — unless `--older`, for a channel that went back where it is
-  published (a yank moves it to the release before); whose channel holds another project's
+  channel never goes back) — unless the archive carries the yank of the mirror's channel's
+  publication, or `--older`, for a channel that went back where it is published (a yank moves it
+  to the release before); whose yank of a tag finds another publication of it in the mirror
+  (`<name> <tag> in <prefix> is publication N, not the yanked publication M the archive carries`;
+  a tag the mirror lacks gets the yanked manifest); whose channel holds another project's
   release, or another channel's; or whose release, that same publication, the mirror records as
   yanked (a rebuild of its tag is another publication). It logs in with the Docker client's own login
   for that registry (`docker login`, `DOCKER_CONFIG`) and trusts `--registry-ca` besides the

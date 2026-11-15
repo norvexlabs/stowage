@@ -278,8 +278,8 @@ type DiskBuilder struct {
 	Stderr  io.Writer
 	// loopPoll is how often a build waiting for another's auroraboot tries again; 0: loopWait.
 	loopPoll time.Duration
-	// loopStale and removeGrace are the constants' values; 0: the constants.
-	loopStale, removeGrace time.Duration
+	// loopStale is the constant's value; 0: the constant.
+	loopStale time.Duration
 }
 
 // loopName is the name every auroraboot run takes: auroraboot's loop devices are the host's, and
@@ -308,36 +308,65 @@ func randomHex() string {
 	return fmt.Sprintf("%x", r)
 }
 
-// runLabel marks each container a disk build runs with that run's own id: a cancelled run removes
-// its containers by it, never another build's of the same name.
-const runLabel = "io.stowage.disks.run"
+// createTimeout bounds a run's `docker create`, which a cancel does not cut (an image pull
+// included): a create the daemon received after its CLI was killed would leave a container no
+// run knows.
+const createTimeout = 15 * time.Minute
 
-// dockerNamed runs the docker CLI; a run (named name, labelled with its own id) is removed when
-// cancelled: killing the docker CLI leaves the container it started running, holding the work
-// directory and, for auroraboot, loop devices. A run refused for its name (docker's exit 125, the
-// daemon's conflict) is errNameInUse: that line is not shown, and nothing is removed.
+// dockerNamed runs the docker CLI. A run (args[0] "run") is made in two steps: `docker create
+// --name name`, which a cancel does not cut, so the container's id is known whatever happens, then
+// `docker start --attach` of it, which a cancel kills; the container is then removed by its id
+// (killing the CLI leaves it running, holding the work directory and, for auroraboot, loop
+// devices). A create refused for its name (the daemon's conflict) is errNameInUse: that line is
+// not shown, and nothing is removed.
 func (b *DiskBuilder) dockerNamed(ctx context.Context, name string, args ...string) error {
 	d := cmp.Or(b.Docker, "docker")
 	what := strings.Join(args[:min(2, len(args))], " ")
-	run := ""
-	if name != "" {
-		run = randomHex()
-		args = append([]string{"run", "--name", name, "--label", runLabel + "=" + run}, args[1:]...)
+	if name == "" {
+		cmd := exec.CommandContext(ctx, d, args...)
+		cmd.Stdout, cmd.Stderr = b.Stdout, b.Stderr
+		if err := cmd.Run(); err != nil {
+			if ctx.Err() != nil { // the CLI killed: "signal: killed" alone hides the cancel
+				err = fmt.Errorf("%w (%v)", ctx.Err(), err)
+			}
+			return fmt.Errorf("docker %s: %w", what, err)
+		}
+		return nil
 	}
+	cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), createTimeout)
+	defer cancel()
 	errs := &conflictLines{w: b.Stderr}
-	cmd := exec.CommandContext(ctx, d, args...)
-	cmd.Stdout, cmd.Stderr = b.Stdout, errs
-	err := cmd.Run()
+	run := randomHex() // labels this create's container, whose name another build may take
+	create := exec.CommandContext(cctx, d, append([]string{"create", "--name", name, "--label", runLabel + "=" + run}, args[1:]...)...)
+	ownSession(create) // the terminal's Ctrl-C reaches the run, never its create
+	create.Stderr = errs
+	out, err := create.Output()
 	errs.flush()
-	var exit *exec.ExitError
-	if name != "" && errors.As(err, &exit) && exit.ExitCode() == 125 && errs.conflict {
-		return fmt.Errorf("docker %s: %w", what, errNameInUse)
+	if err != nil && errs.conflict {
+		return fmt.Errorf("docker %s: %w", what, errNameInUse) // another's container: never removed
 	}
-	if err != nil && ctx.Err() != nil { // the CLI killed: "signal: killed" alone hides the cancel
-		err = fmt.Errorf("%w (%v)", ctx.Err(), err)
+	id := strings.TrimSpace(string(out))
+	if err == nil && !containerID.MatchString(id) {
+		err = fmt.Errorf("%q is no container id", id)
 	}
-	if run != "" && ctx.Err() != nil {
-		if rerr := b.removeRun(ctx, run); rerr != nil {
+	if err != nil {
+		// A create killed (its timeout) or misread may have left the container made: removed when
+		// the container of its name carries this create's label. A name all builds share
+		// (loopName) may be another build's, which is never removed.
+		err = fmt.Errorf("docker %s (create): %w", what, err)
+		if rerr := b.removeOwn(ctx, name, run); rerr != nil {
+			err = errors.Join(err, fmt.Errorf("a container %s may be left: docker rm --force %s: %w", name, name, rerr))
+		}
+		return err
+	}
+	if ctx.Err() == nil {
+		start := exec.CommandContext(ctx, d, "start", "--attach", id)
+		start.Stdout, start.Stderr = b.Stdout, b.Stderr
+		err = start.Run()
+	}
+	if ctx.Err() != nil {
+		err = fmt.Errorf("%w (%v)", ctx.Err(), cmp.Or(err, errors.New("cancelled before its start")))
+		if rerr := b.remove(ctx, id); rerr != nil {
 			err = errors.Join(err, fmt.Errorf("the cancelled container %s may still run: docker rm --force %s: %w", name, name, rerr))
 		}
 	}
@@ -347,37 +376,42 @@ func (b *DiskBuilder) dockerNamed(ctx context.Context, name string, args ...stri
 	return nil
 }
 
-// removeRun removes the containers labelled with run, for removeGrace after a cancel: the
-// daemon may make one a moment after the CLI asking for it was killed.
-func (b *DiskBuilder) removeRun(ctx context.Context, run string) error {
+// runLabel labels a container with the create that made it (dockerNamed).
+const runLabel = "io.stowage.disks-run"
+
+// removeOwn removes the container name when it carries the label run (the create of that run made
+// it); none, or another's, is left. Within removeTimeout whatever ctx.
+func (b *DiskBuilder) removeOwn(ctx context.Context, name, run string) error {
 	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), removeTimeout)
 	defer cancel()
-	d := cmp.Or(b.Docker, "docker")
-	grace := cmp.Or(b.removeGrace, removeGrace)
-	until := time.Now().Add(grace)
-	for {
-		out, err := exec.CommandContext(rctx, d, "ps", "--all", "--quiet", "--filter", "label="+runLabel+"="+run).Output()
-		if err != nil {
-			return err
-		}
-		if ids := strings.Fields(string(out)); len(ids) > 0 {
-			if out, err := exec.CommandContext(rctx, d, append([]string{"rm", "--force"}, ids...)...).CombinedOutput(); err != nil && !strings.Contains(string(out), "No such container") {
-				return fmt.Errorf("%w: %s", err, bytes.TrimSpace(out))
-			}
-		}
-		if time.Now().After(until) {
+	out, err := exec.CommandContext(rctx, cmp.Or(b.Docker, "docker"), "container", "inspect", "--format", `{{.Id}} {{index .Config.Labels "`+runLabel+`"}}`, name).CombinedOutput()
+	if err != nil {
+		if strings.Contains(string(out), "No such") {
 			return nil
 		}
-		select {
-		case <-rctx.Done():
-			return rctx.Err()
-		case <-time.After(grace / 10):
-		}
+		return fmt.Errorf("%w: %s", err, bytes.TrimSpace(out))
 	}
+	id, label, _ := strings.Cut(strings.TrimSpace(string(out)), " ")
+	if label != run || !containerID.MatchString(id) {
+		return nil
+	}
+	return b.remove(ctx, id)
 }
 
-// removeGrace is how long a cancelled run keeps removing containers of its own the daemon makes.
-const removeGrace = 2 * time.Second
+// containerID is the id `docker create` prints.
+var containerID = regexp.MustCompile(`^[0-9a-f]{64}$`)
+
+// remove removes the container id (or name), gone already being no error, within removeTimeout
+// whatever ctx.
+func (b *DiskBuilder) remove(ctx context.Context, id string) error {
+	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), removeTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(rctx, cmp.Or(b.Docker, "docker"), "rm", "--force", id).CombinedOutput()
+	if err != nil && !strings.Contains(string(out), "No such container") {
+		return fmt.Errorf("%w: %s", err, bytes.TrimSpace(out))
+	}
+	return nil
+}
 
 // dockerOut runs the docker CLI and returns what it printed.
 func (b *DiskBuilder) dockerOut(ctx context.Context, args ...string) (string, error) {
@@ -414,7 +448,8 @@ func (c *conflictLines) line(l []byte) {
 	if c.conflict {
 		return // the CLI's hint after its refusal ("See 'docker run --help'.")
 	}
-	if bytes.HasPrefix(l, []byte("docker: Error response from daemon: Conflict.")) && bytes.Contains(l, []byte("is already in use by container")) {
+	// The daemon's refusal, as `docker create` prints it (`docker run` adds "docker: ").
+	if r := bytes.TrimPrefix(l, []byte("docker: ")); bytes.HasPrefix(r, []byte("Error response from daemon: Conflict.")) && bytes.Contains(r, []byte("is already in use by container")) {
 		c.conflict = true
 		return
 	}

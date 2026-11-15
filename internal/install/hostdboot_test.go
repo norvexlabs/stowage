@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -11,9 +12,11 @@ import (
 	"runtime"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/norvexlabs/stowage/internal/command"
 	"github.com/norvexlabs/stowage/internal/spec"
 )
 
@@ -30,6 +33,11 @@ func TestHealthOverTheAPI(t *testing.T) {
 		t.Errorf("%d %+v", code, got)
 	}
 	p.status = 503
+	// Within its reuse, the verdict is the last check's; after it, a check of its own.
+	if code := call(t, h, "GET", "/v1/health", nil, &got); code != 200 || !got.Ready {
+		t.Errorf("reused: %d %+v", code, got)
+	}
+	time.Sleep(healthReuseSecs * d.Unit)
 	if code := call(t, h, "GET", "/v1/health", nil, &got); code != 200 || got.Ready || !strings.Contains(got.Reason, "answered 503") {
 		t.Errorf("%d %+v", code, got)
 	}
@@ -37,6 +45,120 @@ func TestHealthOverTheAPI(t *testing.T) {
 	var e409 errOf
 	if code := call(t, daemon(vmEnv(t, "1.0.0"), &fakeHost{}).Handler(), "GET", "/v1/health", nil, &e409); code != 409 {
 		t.Errorf("before the install: %d %s", code, e409.Error)
+	}
+}
+
+// Requests arriving while a check runs share it: the app socket polling GET /v1/health starts no
+// check per request (with the command provider, a container each).
+func TestHealthChecksOnceForConcurrentRequests(t *testing.T) {
+	t.Parallel()
+	e := installedVM(t)
+	stackAnswers(e, healthyStack)
+	d := daemon(e, &fakeHost{})
+	d.Unit = time.Hour // every request within the verdict's reuse, however slow the machine
+	p := &prober{status: 200}
+	d.Probe = p.client(t)
+	h := d.Handler()
+	checks := func() (n int) {
+		for _, c := range e.docker.ran("compose") {
+			if strings.HasSuffix(strings.Join(c.Args, " "), " ps --all --format json") {
+				n++
+			}
+		}
+		return n
+	}
+	n := checks()
+	var wg sync.WaitGroup
+	for range 10 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			var got Health
+			if code := call(t, h, "GET", "/v1/health", nil, &got); code != 200 || !got.Ready {
+				t.Errorf("%d %+v", code, got)
+			}
+		}()
+	}
+	wg.Wait()
+	if c := checks() - n; c != 1 {
+		t.Errorf("%d checks for 10 requests", c)
+	}
+}
+
+// A verdict is not reused across a change of what the install runs (a service verb, a job's
+// start or end), and one reused reads nothing of the install.
+func TestHealthIsCheckedAgainAfterAChange(t *testing.T) {
+	t.Parallel()
+	e := installedVM(t)
+	stackAnswers(e, healthyStack)
+	stack := e.docker.answer
+	e.docker.answer = func(a string) ([]byte, bool, error) {
+		if strings.HasSuffix(a, "config --services") {
+			return []byte("api\npostgres\nmigrate\n"), true, nil
+		}
+		return stack(a)
+	}
+	d := daemon(e, &fakeHost{})
+	d.Unit = time.Hour // every request within the verdict's reuse
+	p := &prober{status: 200}
+	d.Probe = p.client(t)
+	h := d.Handler()
+	asked := func() int {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		return p.asked
+	}
+	var got Health
+	call(t, h, "GET", "/v1/health", nil, &got)
+	// Reused: the install is not read again, even gone.
+	env := filepath.Join(e.dir, envName)
+	if err := os.Rename(env, env+".away"); err != nil {
+		t.Fatal(err)
+	}
+	if code := call(t, h, "GET", "/v1/health", nil, &got); code != 200 || !got.Ready || asked() != 1 {
+		t.Errorf("reused: %d %+v, %d checks", code, got, asked())
+	}
+	if err := os.Rename(env+".away", env); err != nil {
+		t.Fatal(err)
+	}
+	var e404 errOf
+	if code := call(t, h, "POST", "/v1/services/api/restart", nil, &e404); code != 200 {
+		t.Fatalf("restart: %d %s", code, e404.Error)
+	}
+	p.mu.Lock()
+	p.status = 503
+	p.mu.Unlock()
+	if code := call(t, h, "GET", "/v1/health", nil, &got); code != 200 || got.Ready || asked() != 2 {
+		t.Errorf("after a service verb: %d %+v, %d checks", code, got, asked())
+	}
+	j, err := d.startJob("backup-verify", "store:b", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.finish(j, nil)
+	call(t, h, "GET", "/v1/health", nil, &got)
+	if asked() != 3 {
+		t.Errorf("after a job: %d checks", asked())
+	}
+}
+
+// A check that hangs ends at its bound, unhealthy: the next request starts another.
+func TestAHangingHealthCheckEnds(t *testing.T) {
+	t.Parallel()
+	e := installedVM(t)
+	stackAnswers(e, healthyStack)
+	d := daemon(e, &fakeHost{}) // Unit 1 ms: the bound is healthWait ms
+	d.Probe = &http.Client{Transport: &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}}}
+	start := time.Now()
+	var got Health
+	if code := call(t, d.Handler(), "GET", "/v1/health", nil, &got); code != 200 || got.Ready {
+		t.Errorf("%d %+v", code, got)
+	}
+	if took := time.Since(start); took > 5*time.Second {
+		t.Errorf("the check ran %s", took)
 	}
 }
 
@@ -274,6 +396,7 @@ func TestARollbackWhoseDaemonStopsInItsGraceArmsNothing(t *testing.T) {
 	sock := filepath.Join(dir, "run", "host.sock")
 	ctx, stop := context.WithCancel(context.Background())
 	done := make(chan error, 1)
+	withBootID(t, d)
 	go func() { done <- d.Serve(ctx, sock) }()
 	waitSocket(t, sock)
 	if out, err := ctl(e, sock, "rollback", "--yes"); err != nil {
@@ -473,6 +596,12 @@ func TestStatusTellsTheFallbackAndTheLastFailedBoot(t *testing.T) {
 	t.Parallel()
 	g := newGate(t, "", nil, false)
 	g.probe.status = 503
+	yes, no := true, false
+	// A healthy verdict on trial before the failure, in the journal: it does not hide it, whatever
+	// its clock says.
+	if _, err := (&journal{dir: g.dir}).append(Event{Kind: evBootJudged, BootID: "an-earlier-boot", Verdict: verdictHealthy, OnTrial: &yes, At: time.Now().Add(time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
 	if err := g.gate.Run(context.Background()); err == nil {
 		t.Fatal("healthy")
 	}
@@ -483,13 +612,54 @@ func TestStatusTellsTheFallbackAndTheLastFailedBoot(t *testing.T) {
 	}
 	var st Status
 	call(t, d.Handler(), "GET", "/v1/status", nil, &st)
-	if !st.Fallback || st.Boot != "passive" || st.FailedBoot == nil || st.FailedBoot.Release != (Version{"1.0.0", 1}) {
+	if !st.Fallback || st.Boot != "passive" || st.FailedBoot == nil || st.FailedBoot.Release != (Version{"1.0.0", 1}) || st.FailedBoot.Seq < 1 {
 		t.Errorf("%+v", st)
+	}
+	// Told until a later boot on trial is judged healthy: the fallback's healthy boot, or one
+	// judged otherwise, keeps it, and the clock decides nothing.
+	fb := st.FailedBoot
+	for _, c := range []struct {
+		verdict string
+		onTrial *bool
+		told    bool
+	}{
+		{verdictHealthy, &no, true}, // the passive system the boot fell back to
+		{verdictHealthy, nil, true},
+		{verdictWentBack, &yes, true},
+		{verdictHealthy, &yes, false}, // a later upgrade's boot
+	} {
+		if _, err := (&journal{dir: d.O.Dir}).append(Event{Kind: evBootJudged, BootID: "another-boot", Verdict: c.verdict, OnTrial: c.onTrial, At: fb.At.Add(-time.Hour)}); err != nil {
+			t.Fatal(err)
+		}
+		var st Status
+		call(t, d.Handler(), "GET", "/v1/status", nil, &st)
+		if (st.FailedBoot != nil) != c.told {
+			t.Errorf("%s on trial %v: failed boot %+v", c.verdict, c.onTrial, st.FailedBoot)
+		}
 	}
 	var none Status
 	call(t, daemon(installedVM(t), &fakeHost{}).Handler(), "GET", "/v1/status", nil, &none)
 	if none.Fallback || none.FailedBoot != nil {
 		t.Errorf("%+v", none)
+	}
+}
+
+// A failure whose own verdict the journal lacks is still told over a healthy verdict on trial the
+// journal holds before it: the order is the journal's.
+func TestAFailedBootIsToldOverAnEarlierHealthyVerdict(t *testing.T) {
+	t.Parallel()
+	g := newGate(t, "", nil, false)
+	yes := true
+	if _, err := (&journal{dir: g.dir}).append(Event{Kind: evBootJudged, BootID: "an-earlier-boot", Verdict: verdictHealthy, OnTrial: &yes, At: time.Now().Add(time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := g.gate.keep(context.Background(), errors.New("api is down"), ""); err != nil {
+		t.Fatal(err)
+	}
+	var st Status
+	call(t, daemon(g.env, &fakeHost{}).Handler(), "GET", "/v1/status", nil, &st)
+	if st.FailedBoot == nil || st.FailedBoot.Reason != "api is down" {
+		t.Errorf("%+v", st.FailedBoot)
 	}
 }
 
@@ -562,6 +732,43 @@ func TestAFailedRollbackPutsTheMarksBack(t *testing.T) {
 	}
 }
 
+// A write of the boot assessment that hangs ends at its bound (assessWrite, in Unit): the
+// rollback's arming fails, and the marks are put back under a context of their own, as the one
+// that ran out would fail them too; an upgrade's clearing of the last attempt fails the same way.
+func TestAHangingAssessmentWriteEndsAtItsBound(t *testing.T) {
+	t.Parallel()
+	_, d, host := upgradedVM(t)
+	boots(t, d, "active", map[string]string{assessEnable: "no", assessTentative: "no"})
+	host.mu.Lock()
+	host.editHang = 1
+	host.mu.Unlock()
+	hh := d.Handler()
+	if code := call(t, hh, "POST", "/v1/rollback", RollbackRequest{}, nil); code != 202 {
+		t.Fatalf("%d", code)
+	}
+	if j := waitJob(t, hh); j.State != "done" {
+		t.Fatalf("%+v", j)
+	}
+	want := "marking the boot assessment failed: grub2-editenv " + filepath.Join(d.State, assessFile) + ": context deadline exceeded: the boot assessment is put back as it was"
+	if e := waitEvent(t, d.O.Dir, evRebootCancelled); !strings.Contains(e.Reason, want) {
+		t.Errorf("reason %q, want %q", e.Reason, want)
+	}
+	if v := assessOf(t, d); v[assessEnable] != "no" || v[assessTentative] != "no" {
+		t.Errorf("not put back: %v", v)
+	}
+	if strings.Contains(fmt.Sprint(host.calls()), "systemctl reboot") {
+		t.Error("rebooted")
+	}
+	// The upgrade's clearing of the last attempt's mark.
+	boots(t, d, "active", map[string]string{assessTentative: "yes"})
+	host.mu.Lock()
+	host.editHang = 1
+	host.mu.Unlock()
+	if err := d.retry(&job{}); err == nil || !strings.Contains(err.Error(), "the next boot would skip it") || !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("retry: %v", err)
+	}
+}
+
 func TestTheProbeFollowsNoRedirectAndNoProxy(t *testing.T) {
 	t.Parallel()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -593,6 +800,11 @@ func TestTheGateRemovesLeftHealthFiles(t *testing.T) {
 		if err := os.WriteFile(f, nil, 0o644); err != nil {
 			t.Fatal(err)
 		}
+	}
+	// No run of the longest health command (and its container's removal) still holds a file the
+	// gate takes for left.
+	if longest := time.Duration(command.MaxTimeoutS)*time.Second + 30*time.Second; staleHealthFile <= longest {
+		t.Errorf("staleHealthFile %s is within a health command's run, %s", staleHealthFile, longest)
 	}
 	old := time.Now().Add(-staleHealthFile - time.Minute)
 	if err := os.Chtimes(left, old, old); err != nil {

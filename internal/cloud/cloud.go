@@ -20,6 +20,9 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"time"
+
+	"github.com/norvexlabs/stowage/internal/flock"
 )
 
 //go:embed tofu/*/*.tf tofu/*/.terraform.lock.hcl tofu/*/*/*.tf tofu/*/*/.terraform.lock.hcl
@@ -254,6 +257,40 @@ func (u *Uploader) record(ctx context.Context, img Image, dir, id string) error 
 		return err
 	}
 	return os.WriteFile(filepath.Join(dir, idFile), []byte(id+"\n"), 0o600)
+}
+
+// lockPoll is how often a wait for another run's image tries the lock again.
+const lockPoll = time.Second
+
+// Ensure is the id of img on its cloud, registered (registering called first) when it is not
+// yet: Registered, then Upload when it is not, under a lock of the image's working directory, so
+// another run registering the same image in the same WorkDir is waited for (said once on Log)
+// until ctx ends, never worked over.
+func (u *Uploader) Ensure(ctx context.Context, img Image, registering func()) (string, error) {
+	dir, err := u.dir(img)
+	if err != nil {
+		return "", err
+	}
+	if err := os.MkdirAll(filepath.Dir(dir), 0o700); err != nil {
+		return "", err
+	}
+	unlock, err := flock.Take(ctx, dir+".lock", flock.Create, true, lockPoll, func() {
+		if u.Log != nil {
+			fmt.Fprintf(u.Log, "cloud %s: waiting for another run registering image %s (%s)\n", img.Cloud, img.Name, dir)
+		}
+	})
+	if err != nil {
+		return "", fmt.Errorf("cloud %s: lock image %s's directory %s: %w", img.Cloud, img.Name, dir, err)
+	}
+	defer unlock()
+	id, err := u.Registered(ctx, img)
+	if err != nil || id != "" {
+		return id, err
+	}
+	if registering != nil {
+		registering()
+	}
+	return u.Upload(ctx, img)
 }
 
 // Registered is the id of img on its cloud, "" when it is not registered: the id kept once

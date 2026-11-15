@@ -13,6 +13,7 @@ import (
 
 	"github.com/google/go-containerregistry/pkg/authn"
 
+	"github.com/norvexlabs/stowage/internal/gitcmd"
 	"github.com/norvexlabs/stowage/internal/hook"
 	"github.com/norvexlabs/stowage/internal/project"
 	"github.com/norvexlabs/stowage/internal/publish"
@@ -356,7 +357,7 @@ func TestHookShipSigningKey(t *testing.T) {
 		{plain, filepath.Join(root, "keys", "release.key")},
 		{at, "/work/proj/keys/release.key"},
 	} {
-		s, err := c.o.signer(p, authn.NewMultiKeychain(), writeAccess, registry.New(authn.NewMultiKeychain()))
+		s, err := c.o.signer(context.Background(), p, authn.NewMultiKeychain(), writeAccess, registry.New(authn.NewMultiKeychain()))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -472,5 +473,85 @@ func TestHookShipTakesTheUntrackedFilesOfTheCommit(t *testing.T) {
 	out, logs, _, err = runHook(t, b, env, "-C", root, "hook", "post-commit", "--ship", "1.0.0", "--commit", head)
 	if err != nil || !strings.Contains(out, "stowage hook: warning: staged untracked files left in ") {
 		t.Fatalf("a stale entry left: %v\n%s%s", err, out, logs)
+	}
+}
+
+// The -f spec's path is the commit's to resolve below the repository's top level: a link the
+// working tree repointed after the commit does not change the spec a queued ship reads, and a
+// way into the repository through a link outside it still names the spec in it.
+func TestSpecInRepoFollowsTheCommitsLinks(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	testutil.Write(t, dir, "a.yaml", "a\n")
+	testutil.Write(t, dir, "b.yaml", "b\n")
+	if err := os.Symlink("a.yaml", filepath.Join(dir, "s.yaml")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("gone.yaml", filepath.Join(dir, "d.yaml")); err != nil {
+		t.Fatal(err)
+	}
+	testutil.GitRepo(t, dir)
+	// The working tree's link now names b.yaml, which is committed too; the commit's names a.yaml.
+	if err := os.Remove(filepath.Join(dir, "s.yaml")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("b.yaml", filepath.Join(dir, "s.yaml")); err != nil {
+		t.Fatal(err)
+	}
+	r, err := hook.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(t.TempDir(), "repo")
+	if err := os.Symlink(dir, outside); err != nil {
+		t.Fatal(err)
+	}
+	// A link to a directory of the repository is a way in too: the rest is kept as written.
+	testutil.Write(t, dir, "services/app/s.yaml", "app\n")
+	testutil.Git(t, dir, "add", "services/app/s.yaml")
+	testutil.Git(t, dir, "commit", "-q", "-m", "app", "--", "services/app/s.yaml")
+	app := filepath.Join(t.TempDir(), "app")
+	if err := os.Symlink(filepath.Join(dir, "services", "app"), app); err != nil {
+		t.Fatal(err)
+	}
+	if rel, err := (&options{specPath: filepath.Join(app, "s.yaml")}).specInRepo(r, "HEAD"); err != nil || rel != filepath.Join("services", "app", "s.yaml") {
+		t.Fatalf("through a link to a directory of the repository: %q %v", rel, err)
+	}
+	for _, spec := range []string{filepath.Join(dir, "s.yaml"), filepath.Join(outside, "s.yaml")} {
+		o := &options{specPath: spec}
+		rel, err := o.specInRepo(r, "HEAD")
+		if err != nil || rel != "s.yaml" {
+			t.Fatalf("%s: %q %v", spec, rel, err)
+		}
+		if raw, ok, err := gitcmd.FileAt(r.Top, "HEAD", rel); err != nil || !ok || string(raw) != "a\n" {
+			t.Fatalf("%s at the commit: %q %v %v", rel, raw, ok, err)
+		}
+	}
+	// A link the commit lacks is the working tree's to resolve: to a committed file, that file.
+	if err := os.Symlink("b.yaml", filepath.Join(dir, "t.yaml")); err != nil {
+		t.Fatal(err)
+	}
+	if rel, err := (&options{specPath: filepath.Join(dir, "t.yaml")}).specInRepo(r, "HEAD"); err != nil || rel != "b.yaml" {
+		t.Fatalf("an untracked link to a committed file: %q %v", rel, err)
+	}
+	// A link the commit holds to nothing, which the working tree resolves to an untracked file,
+	// is no committed spec.
+	testutil.Write(t, dir, "gone.yaml", "here now\n")
+	if _, err := (&options{specPath: filepath.Join(dir, "d.yaml")}).specInRepo(r, "HEAD"); err == nil || !strings.Contains(err.Error(), "d.yaml is not committed (at HEAD)") {
+		t.Fatalf("d.yaml: %v", err)
+	}
+	// The project's directory maps the same way: an untracked link to a committed directory is
+	// that directory; a committed one is as written.
+	if err := os.Symlink("services", filepath.Join(dir, "svc")); err != nil {
+		t.Fatal(err)
+	}
+	if rel, present, err := repoPath(r.Top, "HEAD", filepath.Join(dir, "svc", "app"), true); err != nil || !present || rel != filepath.Join("services", "app") {
+		t.Fatalf("an untracked link to a committed directory: %q %v %v", rel, present, err)
+	}
+	if rel, present, err := repoPath(r.Top, "HEAD", filepath.Join(app), true); err != nil || !present || rel != filepath.Join("services", "app") {
+		t.Fatalf("a link from outside to a directory of the repository: %q %v %v", rel, present, err)
+	}
+	if rel, present, err := repoPath(r.Top, "HEAD", dir, true); err != nil || !present || rel != "." {
+		t.Fatalf("the top level: %q %v %v", rel, present, err)
 	}
 }

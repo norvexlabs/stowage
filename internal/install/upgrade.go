@@ -78,6 +78,25 @@ type state struct {
 	Snapshot string `json:"snapshot,omitempty"` // the dump taken before the upgrade
 }
 
+// readPrevState is the state PrevDir keeps of the release `rollback` goes back to: nil when it
+// keeps none; one that does not read or parse is an error naming its file. Every reader of the
+// kept release reads it here.
+func (in *Installer) readPrevState() (*state, error) {
+	file := filepath.Join(in.path(PrevDir), prevState)
+	raw, err := os.ReadFile(file)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var st state
+	if err := json.Unmarshal(raw, &st); err != nil {
+		return nil, fmt.Errorf("%s: %w", file, err)
+	}
+	return &st, nil
+}
+
 // open reads the install in O.Dir.
 func (in *Installer) open() (*EnvFile, error) {
 	dir, err := filepath.Abs(in.O.Dir)
@@ -241,8 +260,8 @@ func (in *Installer) Upgrade(ctx context.Context) (err error) {
 		in.recorded[k], _ = env.Get(k)
 	}
 	for _, i := range added {
-		if _, rec := env.Get(i.Key); rec && in.tablePick(i.Key) != nil {
-			o.logf("note: %s: the recorded value picks no table of %s %s: it is given, asked or defaulted again", i.Key, m.Name, m.ProjectVersion)
+		if v, rec := env.Get(i.Key); rec {
+			o.logf("note: %s: %s: it is given, asked or defaulted again", i.Key, in.refusedRecord(i, v))
 		}
 	}
 	values, err := in.inputs(ctx, added, false)
@@ -298,12 +317,16 @@ func (in *Installer) Upgrade(ctx context.Context) (err error) {
 		return fmt.Errorf("stopped before anything changed: %w", err)
 	}
 	mutated = true // the data wiped or dumped, the release kept: changes from here
-	// A table's posture the release asked again (its recorded value picks no file of it) is said
-	// once nothing stops the upgrade before its changes: the firewall the start loads changes.
+	// A recorded value the release asked again is said once nothing stops the upgrade before its
+	// changes: for a table's input, the firewall the start loads changes.
 	for _, i := range added {
 		was, rec := env.Get(i.Key)
-		if now, _ := next.Get(i.Key); rec && in.tablePick(i.Key) != nil && now != was {
-			o.logf("warning: %s: the recorded value picks no table of %s %s, so it is now %q: the table it picks is the one the start loads", i.Key, name, m.ProjectVersion, now)
+		if now, _ := next.Get(i.Key); rec && now != was {
+			if in.tablePick(i.Key) != nil {
+				o.logf("warning: %s: %s, so it is now %q: the table it picks is the one the start loads", i.Key, in.refusedRecord(i, was), now)
+			} else {
+				o.logf("warning: %s: %s, so it is now %q", i.Key, in.refusedRecord(i, was), in.shownValue(i.Key, now, map[string]bool{i.Key: i.Secret}))
+			}
 		}
 	}
 	if in.crossing != nil {
@@ -337,7 +360,7 @@ func (in *Installer) Upgrade(ctx context.Context) (err error) {
 			return err
 		}
 	}
-	if err := next.WriteFile(in.path(envName)); err != nil {
+	if err := in.writeEnv(next); err != nil {
 		return err
 	}
 	if in.crossing == nil {
@@ -346,10 +369,15 @@ func (in *Installer) Upgrade(ctx context.Context) (err error) {
 		}
 	}
 	in.forgetChanges()
+	// Marked as a change whose stack has not come up, until it does: a re-run after a start that
+	// failed takes no .env.prev from values that never came up.
+	if err := os.WriteFile(in.path(changingFile), nil, 0o600); err != nil {
+		return err
+	}
 	if err := in.copySelf(); err != nil {
 		return fmt.Errorf("the installer could not be kept (%w)\nthe install runs %s now: `%s --dir %s` keeps it and starts it", err, m.ProjectVersion, o.Self, o.Dir)
 	}
-	if err := in.up(ctx, next); err != nil {
+	if err := in.cameUp(in.up(ctx, next)); err != nil {
 		if in.crossing != nil {
 			return fmt.Errorf("%w\nthe install runs %s %s, its data wiped: `%s --dir %s` starts it again", err, name, m.ProjectVersion, in.ctl(), o.Dir)
 		}
@@ -391,9 +419,8 @@ func (in *Installer) upgradeRefusals(ctx context.Context, env *EnvFile, name, cu
 	if err := in.onlyAdded(env, added); err != nil {
 		return "", publish{}, nil, nil, err
 	}
-	if raw, err := os.ReadFile(filepath.Join(in.path(PrevDir), prevState)); err == nil {
-		var st state
-		if json.Unmarshal(raw, &st) == nil && st.ProjectVersion == cur && strconv.Itoa(st.Revision) == rev {
+	if st, err := in.readPrevState(); err == nil && st != nil {
+		if st.ProjectVersion == cur && strconv.Itoa(st.Revision) == rev {
 			return "", publish{}, nil, nil, refuse(in.fixOn(in.ctl()+" rollback --dir "+o.Dir, ""), "an upgrade from or a rollback to %s %s stopped before it finished: `%s rollback --dir %s` finishes it, back on %s %s", name, cur, in.ctl(), o.Dir, name, cur)
 		}
 	}
@@ -483,18 +510,33 @@ func (in *Installer) coresUpgrade(ctx context.Context) error {
 }
 
 // addedInputs are the inputs of the release in this mode the install does not record, and those
-// picking a table whose recorded value the release has no file for: each is given (--set,
-// --answers), asked or defaulted as the release's own.
+// whose recorded value the release's own check refuses (a table it picks no file of, an element a
+// set refuses, a narrower check): each is given (--set, --answers), asked or defaulted as the
+// release's own, so no recorded value the release refuses reaches the start.
 func (in *Installer) addedInputs(env *EnvFile, mode string) []input {
 	var added []input
 	for _, i := range in.inputList(mode) {
 		v, ok := env.Get(i.Key)
 		// A required file input recorded empty would start on an empty file.
-		if pick := in.tablePick(i.Key); !ok || pick != nil && pick(v) != nil || i.File() && i.Required && v == "" {
+		if !ok || i.checkValue(v) != nil || i.File() && i.Required && v == "" {
 			added = append(added, i)
 		}
 	}
 	return added
+}
+
+// refusedRecord says why the release asks again input i, whose recorded value is v (addedInputs).
+func (in *Installer) refusedRecord(i input, v string) string {
+	m := in.R.Manifest
+	if pick := in.tablePick(i.Key); pick != nil && pick(v) != nil {
+		return fmt.Sprintf("the recorded value picks no table of %s %s", m.Name, m.ProjectVersion)
+	}
+	if err := i.checkValue(v); err != nil && i.Secret {
+		return fmt.Sprintf("%s %s refuses the recorded value", m.Name, m.ProjectVersion)
+	} else if err != nil {
+		return fmt.Sprintf("%s %s refuses the recorded value (%v)", m.Name, m.ProjectVersion, err)
+	}
+	return fmt.Sprintf("%s %s requires a file, and the recorded one is empty", m.Name, m.ProjectVersion)
 }
 
 // keptInstaller returns the release the install's kept installer carries (readKept), and refuses
@@ -656,7 +698,7 @@ func (in *Installer) upgradePorts(env *EnvFile, mode string) (publish, error) {
 			p, ok = s.Front.LoopbackPorts[r.Name]
 		}
 		if !ok {
-			return publish{}, refuse(in.flagFix("--ports "+r.Name+"=PORT"), "%s %s adds the route %s, which has no loopback port: give it one with --ports %s=PORT", m.Name, m.ProjectVersion, r.Name, r.Name)
+			return publish{}, refuse(in.flagFix("--ports "+r.Name+"=PORT"), "%s %s adds the route %s, which has no loopback port%s", m.Name, m.ProjectVersion, r.Name, in.flagFix(": give it one with --ports "+r.Name+"=PORT"))
 		}
 		if p < 1 || p > 65535 {
 			return publish{}, refuse(in.flagFix("--ports "+r.Name+"=PORT, a port from 1 to 65535"), "--ports: %s=%d is not a TCP port", r.Name, p)
@@ -671,12 +713,31 @@ func (in *Installer) upgradePorts(env *EnvFile, mode string) (publish, error) {
 	for _, k := range sortedKeys(added.ports) {
 		for _, other := range sortedKeys(pub.ports) {
 			if other != k && pub.ports[other] == added.ports[k] {
-				return publish{}, refuse(in.flagFix("--ports "+k+"=PORT"), "%s %s adds the route %s on port %d, which %s has: choose another with --ports %s=PORT", m.Name, m.ProjectVersion, k, added.ports[k], other, k)
+				return publish{}, refuse(in.flagFix("--ports "+k+"=PORT"), "%s %s adds the route %s on port %d, which %s has%s", m.Name, m.ProjectVersion, k, added.ports[k], other, in.flagFix(": choose another with --ports "+k+"=PORT"))
 			}
 		}
 	}
 	if err := in.l4Clash(added); err != nil {
 		return publish{}, err
+	}
+	// A port the install records for a route the release removes is the stack's own (its front
+	// holds it until the upgrade's start): an added route may take it, unprobed.
+	kept := map[string]bool{}
+	for _, r := range s.Front.Routes {
+		kept[PortVar(r.Name)] = true
+	}
+	added.unserved = map[string]bool{}
+	for _, k := range env.Keys() {
+		if !strings.HasPrefix(k, "STOWAGE_PORT_") || kept[k] {
+			continue
+		}
+		if p, ok := recordedPortOf(get(k)); ok {
+			for name, q := range added.ports {
+				if q == p {
+					added.unserved[name] = true
+				}
+			}
+		}
 	}
 	return pub, in.portsFree(added)
 }
@@ -695,7 +756,7 @@ func (in *Installer) upgradeRoutes(env, next *EnvFile, mode string, pub publish)
 	if mode != Loopback {
 		for _, r := range s.Front.Routes {
 			if get(r.DomainInput) == "" {
-				return refuse(in.flagFix("--set "+r.DomainInput+"=<domain>"), "%s %s adds the route %s, whose domain %s nothing gives: --set %s=<domain>", m.Name, m.ProjectVersion, r.Name, r.DomainInput, r.DomainInput)
+				return refuse(in.flagFix("--set "+r.DomainInput+"=<domain>"), "%s %s adds the route %s, whose domain %s nothing gives%s", m.Name, m.ProjectVersion, r.Name, r.DomainInput, in.flagFix(": --set "+r.DomainInput+"=<domain>"))
 			}
 		}
 	}
@@ -711,7 +772,7 @@ func (in *Installer) upgradeRoutes(env, next *EnvFile, mode string, pub publish)
 				continue
 			}
 			if get(r.TLS.DomainInput) == "" {
-				return refuse(in.flagFix("--set "+r.TLS.DomainInput+"=<domain>"), "%s %s terminates TLS on the L4 route %s, whose domain %s nothing gives: --set %s=<domain>", m.Name, m.ProjectVersion, r.Name, r.TLS.DomainInput, r.TLS.DomainInput)
+				return refuse(in.flagFix("--set "+r.TLS.DomainInput+"=<domain>"), "%s %s terminates TLS on the L4 route %s, whose domain %s nothing gives%s", m.Name, m.ProjectVersion, r.Name, r.TLS.DomainInput, in.flagFix(": --set "+r.TLS.DomainInput+"=<domain>"))
 			}
 			l4 = append(l4, r)
 		}
@@ -993,17 +1054,14 @@ func (in *Installer) Rollback(ctx context.Context) (err error) {
 		return err
 	}
 	prev := in.path(PrevDir)
-	raw, err := os.ReadFile(filepath.Join(prev, prevState))
-	if errors.Is(err, os.ErrNotExist) {
-		return refuse("nothing to go back to: an upgrade keeps the release it replaces", "%s has no previous release to go back to (an upgrade keeps one)", o.Dir)
-	}
+	kept, err := in.readPrevState()
 	if err != nil {
 		return err
 	}
-	var st state
-	if err := json.Unmarshal(raw, &st); err != nil {
-		return fmt.Errorf("%s: %w", filepath.Join(prev, prevState), err)
+	if kept == nil {
+		return refuse("nothing to go back to: an upgrade keeps the release it replaces", "%s has no previous release to go back to (an upgrade keeps one)", o.Dir)
 	}
+	st := *kept
 	prevEnv, err := ReadEnvFile(filepath.Join(prev, envName))
 	if err != nil {
 		return err
@@ -1127,9 +1185,16 @@ func (in *Installer) Rollback(ctx context.Context) (err error) {
 	if err := in.checkDocker(ctx); err != nil {
 		return err
 	}
-	// A dry run pulls them only when the check may read them.
-	if back != nil && (!o.DryRun || in.schemaOn() && back.schemaOn()) {
+	// The images before anything changes: the previous release's, as its spec tells them, else
+	// as its record does (a release whose spec this installer does not read). A dry run pulls them
+	// only when the check may read them.
+	switch {
+	case back != nil && (!o.DryRun || in.schemaOn() && back.schemaOn()):
 		if err := back.fetchImages(ctx, rolled); err != nil {
+			return err
+		}
+	case back == nil && !o.DryRun:
+		if err := in.fetchList(ctx, rolled, recordedImages(prevEnv), nil); err != nil {
 			return err
 		}
 	}
@@ -1176,7 +1241,13 @@ func (in *Installer) Rollback(ctx context.Context) (err error) {
 	if back != nil { // the rolled-back release's own inputs, when its spec is read
 		back.recordInputKeys(rolled, rolled)
 	}
-	if err := rolled.WriteFile(in.path(envName)); err != nil {
+	// The previous release's files before its .env, as every .env write (writeEnv); one whose
+	// spec this installer does not read has its own installer's start write them.
+	if back != nil {
+		if err := back.writeEnv(rolled); err != nil {
+			return err
+		}
+	} else if err := rolled.WriteFile(in.path(envName)); err != nil {
 		return err
 	}
 	if err := restoreReturned(filepath.Join(prev, ProvisionEnv), in.path(ProvisionEnv)); err != nil {
@@ -1190,6 +1261,8 @@ func (in *Installer) Rollback(ctx context.Context) (err error) {
 		return err
 	}
 	unlock()
+	// Not --offline for images fetched above: an install by digest offline would record them by
+	// tag. Its own installer finds them there, and pulls what its record does not name.
 	if err := in.startKept(ctx, pk.Manifest, pk.Release, o.Offline, false); err != nil {
 		return fmt.Errorf("%w\nthe install records %s %s; the release left is kept in %s", err, pk.Manifest.Name, st.ProjectVersion, failed)
 	}

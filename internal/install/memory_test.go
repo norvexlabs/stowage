@@ -2,6 +2,7 @@ package install
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"go.yaml.in/yaml/v3"
@@ -218,5 +219,43 @@ func TestNoMemorySharesOnDockerDesktop(t *testing.T) {
 	}
 	if p := in.memoryPlan(tune.System{Docker: &tune.Docker{Desktop: true}}, h); len(p.Shares) != 0 {
 		t.Errorf("on Docker Desktop: %+v", p)
+	}
+}
+
+// The shares' floors are warned of when they pass the part of the host's RAM the shares take, and
+// not when they fill it exactly.
+func TestStackModelWarnsFloorsOverRAM(t *testing.T) {
+	t.Parallel()
+	const mib = 1 << 20
+	m := &composeModel{}
+	if err := json.Unmarshal([]byte(`{"services": {"api": {}, "db": {"mem_limit": "104857600"}, "web": {}}}`), m); err != nil {
+		t.Fatal(err)
+	}
+	// api's min 800 MiB and db's own limit 100 MiB: 900 MiB, 90 % of 1000 MiB.
+	shares := map[string]spec.Share{"api": {Percent: 10, Min: 800 * mib}, "db": {Percent: 10}}
+	if w := (hostPlan{Shares: shares, Host: tune.Host{MemBytes: 1000 * mib}}).floorsOver(m); w != "" {
+		t.Errorf("at the bound: %s", w)
+	}
+	w := (hostPlan{Shares: shares, Host: tune.Host{MemBytes: 999 * mib}}).floorsOver(m)
+	if w != "the memory shares' floors total 900 MiB, over the 899 MiB this host's RAM leaves them (90 %): services may be OOM-killed; give the host more RAM or lower services.api.memory.min" {
+		t.Errorf("over the bound: %q", w)
+	}
+	if w := (hostPlan{Shares: shares}).floorsOver(m); w != "" {
+		t.Errorf("RAM unknown: %s", w)
+	}
+}
+
+// A start logs that warning.
+func TestStartWarnsFloorsOverRAM(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	e.docker.model = `{"services": {"api": {}}}`
+	dockerInfo(e.docker, `27.3.1|Ubuntu 24.04 LTS|["name=seccomp,profile=builtin"]`)
+	e.r.Spec.Services = map[string]spec.Service{"api": {Memory: &spec.Share{Percent: 10, Min: 8 << 30}}}
+	if err := e.install(func(o *Options) { o.Tune = fakeTune(tuneRoot(t), 1000) }); err != nil {
+		t.Fatalf("%v\n%s", err, e.log)
+	}
+	if !strings.Contains(e.log.String(), "warning: the memory shares' floors total 8192 MiB, over the 3686 MiB this host's RAM leaves them") {
+		t.Errorf("%s", e.log)
 	}
 }

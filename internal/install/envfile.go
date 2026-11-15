@@ -86,12 +86,26 @@ func (e *EnvFile) WriteFile(path string) error {
 	return writePrivate(path, b.Bytes())
 }
 
-// Check refuses a value the file cannot hold as written (spec.CheckEnvValue).
+// maxEnvTotal bounds the recorded values' sum: Environ hands every one to each compose and hook
+// process, whose environment (with provision.env's maxProvisionTotal and the caller's own) stays
+// under Linux's 2 MiB argument limit at the default stack.
+const maxEnvTotal = 1 << 20
+
+// Check refuses a value the file cannot hold as written (spec.CheckEnvValue), and a file whose
+// values total more than maxEnvTotal bytes (each counted as KEY=value and its NUL).
 func (e *EnvFile) Check() error {
+	total := 0
 	for _, k := range e.keys {
 		if err := spec.CheckEnvValue(e.vals[k]); err != nil {
 			return fmt.Errorf("%s: %w", k, err)
 		}
+		total += len(k) + len(e.vals[k]) + 2
+	}
+	if total > maxEnvTotal {
+		largest := append([]string(nil), e.keys...)
+		slices.SortStableFunc(largest, func(a, b string) int { return len(e.vals[b]) - len(e.vals[a]) })
+		return fmt.Errorf("the recorded values total %d bytes, over %d: a process's environment holds no more; give the largest inputs (%s) shorter values",
+			total, maxEnvTotal, strings.Join(largest[:min(2, len(largest))], ", "))
 	}
 	return nil
 }

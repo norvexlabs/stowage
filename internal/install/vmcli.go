@@ -54,7 +54,7 @@ func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(
 	// resultJSON: install, upgrade and rollback print their Result alone on standard output
 	// (--json); prepared: prepare gave in the run's options.
 	var resultJSON, prepared bool
-	var group string
+	var group, issueDir string
 	socket := Socket(name)
 	prepare := func() error {
 		var err error
@@ -153,7 +153,11 @@ func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(
 			if err := in.vmInstallReady(cmd.Context(), os.Geteuid(), dirWritable); err != nil {
 				return err
 			}
+			flagChannel := in.O.Channel
 			if err := in.withSettings(); err != nil {
+				return err
+			}
+			if err := in.checkInstallChannel(cmd.Context(), flagChannel); err != nil {
 				return err
 			}
 			in.O.Prompt = prompt
@@ -243,13 +247,17 @@ func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(
 			if err := prepare(); err != nil {
 				return err
 			}
-			h := &Hostd{R: r, O: in.O, Host: HostTool{}, Group: group}
+			h := &Hostd{R: r, O: in.O, Host: HostTool{}, Group: group, Issue: issueDir}
 			return h.Serve(cmd.Context(), socket)
 		},
 	}
 	dirFlag(hostd)
 	hostd.Flags().StringVar(&group, "group", AdminGroup, "the group the socket opens to besides root (empty: root's alone)")
 	_ = hostd.Flags().MarkHidden("group")
+	// A test running the daemon on its own host gives another directory: the host's login
+	// banners are never written.
+	hostd.Flags().StringVar(&issueDir, "issue-dir", "", "the directory of the console's login banners (default /etc/issue.d)")
+	_ = hostd.Flags().MarkHidden("issue-dir")
 	gate := &cobra.Command{
 		Use:    healthGateCmd,
 		Short:  "Judge this boot: mark an upgraded boot good once the install is healthy, or reboot into the passive system (run at boot)",
@@ -711,7 +719,7 @@ func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(
 // restoreCommand is `restore OBJECT`, asking the host daemon c reaches; noInstall is the shape's
 // refusal of a restore before the first install (Installer.noInstall's).
 func restoreCommand(c *hostClient, name string, noInstall func() error, stderr io.Writer, terminal func(accessible bool) Prompter) *cobra.Command {
-	var yes, accessible bool
+	var yes, accessible, unrecorded bool
 	var identity string
 	restore := &cobra.Command{
 		Use:   "restore OBJECT",
@@ -747,7 +755,7 @@ func restoreCommand(c *hostClient, name string, noInstall func() error, stderr i
 				}
 			}
 			var started JobStarted
-			if err := c.do(ctx, http.MethodPost, "/v1/restore", RestoreRequest{Object: args[0], Identity: string(key), Confirm: st.Installed}, &started); err != nil {
+			if err := c.do(ctx, http.MethodPost, "/v1/restore", RestoreRequest{Object: args[0], Identity: string(key), Confirm: st.Installed, Unrecorded: unrecorded}, &started); err != nil {
 				return err
 			}
 			return c.follow(ctx, stderr, started)
@@ -756,6 +764,7 @@ func restoreCommand(c *hostClient, name string, noInstall func() error, stderr i
 	restore.Flags().StringVar(&identity, "identity", "-", "the age identity file that decrypts the backup; - for standard input")
 	restore.Flags().BoolVarP(&yes, "yes", "y", false, "restore without asking")
 	restore.Flags().BoolVar(&accessible, "accessible", false, "confirm with a plain line prompt")
+	restore.Flags().BoolVar(&unrecorded, "unrecorded", false, "load a backup this install recorded no digest of (one taken on another machine) unchecked; a backup whose bytes differ from its record is refused whatever this says")
 	return restore
 }
 

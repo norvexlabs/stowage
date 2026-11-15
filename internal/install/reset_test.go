@@ -841,3 +841,56 @@ func resetVolumeCalls(e *env) int {
 	}
 	return n
 }
+
+// A start that finds an image pinned by digest gone from the engine (pruned since) pulls it before
+// it reads the stack (an image's EXPOSE among it), and never lets Compose pull.
+func TestAStartPullsAGoneImageFirst(t *testing.T) {
+	t.Parallel()
+	e := resettable(t)
+	api := get(e.readEnv(), ImageVar("api"))
+	delete(e.docker.loaded, api)
+	e.docker.calls = nil
+	if err := e.reset(func(o *Options) { o.Yes = true }); err != nil {
+		t.Fatalf("%v\n%s", err, e.log)
+	}
+	pulled, read, up := -1, -1, -1
+	for i, c := range e.docker.calls {
+		switch a := strings.Join(c.Args, " "); {
+		case a == "pull --quiet "+api:
+			pulled = i
+		case strings.HasSuffix(a, " config --format json") && read < 0:
+			read = i
+		case strings.Contains(a, " up --detach --wait "):
+			up = i
+			if !strings.HasSuffix(a, " --pull never") {
+				t.Errorf("up lets Compose pull: %s", a)
+			}
+		}
+	}
+	if pulled < 0 || up < 0 || pulled > up || !strings.Contains(e.log.String(), api+" left the engine: pulling again") {
+		t.Errorf("pulled at %d, read at %d, up at %d\n%s", pulled, read, up, e.log)
+	}
+	// What the engine answered of each image is asked once by the start, the pull's look included.
+	web := get(e.readEnv(), ImageVar("web"))
+	if n := len(e.docker.ran("image inspect --format {{.Id}} " + web)); n != 1 {
+		t.Errorf("%s inspected %d times", web, n)
+	}
+}
+
+// The command a failed reset names to install the release again reads the chart where the release
+// was installed from: a mirror's prefix and the CA given are passed on; the project's own
+// registry needs neither.
+func TestK8sResetRecoveryNamesTheMirror(t *testing.T) {
+	t.Parallel()
+	e := newKubeEnv(t, spec.Provider{Name: "none"})
+	mirror := mirrored(t, e)
+	e.runs("1.0.0", 1)
+	e.f.values["stowage"].(map[string]any)["registry"] = mirror
+	e.f.manifest = resetManifest
+	e.f.uninstErr = errors.New("timed out waiting for the condition")
+	ca := caFile(t)
+	err := e.reset(func(o *Options) { o.Yes, o.RegistryCA = true, ca })
+	if err == nil || !strings.Contains(err.Error(), "--timeout 10m0s --image-registry "+mirror+" --registry-ca "+ca+" --values ") {
+		t.Errorf("%v", err)
+	}
+}

@@ -1,11 +1,14 @@
 package install
 
 import (
+	"cmp"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 
 	"github.com/google/go-containerregistry/pkg/name"
 
@@ -109,6 +112,47 @@ func seedRefusal(names string) error {
 		"%s: a seed carries no secret input and no TLS material; they go after the boot, over SSH", names)
 }
 
+// checkChannel refuses a channel ch (empty: the release's) other than the release's own that the
+// registry at prefix holds no release of this project on: the VM's updates would find none. A
+// release on ch that this installer cannot read (another Stowage's) is one.
+func (in *Installer) checkChannel(ctx context.Context, cl *registry.Client, prefix, ch string) error {
+	name, own := in.R.Spec.Name, in.R.Manifest.Channel
+	if ch == "" || ch == own {
+		return nil
+	}
+	ptr, _, err := readRelease(ctx, cl, prefix+"/"+name+"-release", ch)
+	switch {
+	case errors.As(err, new(foreignManifest)):
+		return nil
+	case err != nil:
+		return fmt.Errorf("--channel %s: %w", ch, err)
+	case ptr == nil || ptr.Name != name || ptr.Channel != ch:
+		// An OS bundle's installer is on no channel: the VM's settings name the one it follows.
+		hint, on := "give --channel a channel the publisher ships "+name+" on, or leave it out", ""
+		if own != "" {
+			hint, on = hint+" to follow "+own, " (this release is on "+own+")"
+		}
+		return refuse(hint, "--channel %s: the registry %s holds no release of %s on %s%s", ch, prefix, name, ch, on)
+	}
+	return nil
+}
+
+// checkInstallChannel refuses a first install's --channel ch (empty: none given) that the registry
+// the install reads (the settings', else the project's) holds no release of the project on: it is
+// the channel `updates` follows, checked as `vm seed --channel` is, whatever images the OS carries.
+// An installed VM's re-run records no channel, and is not checked.
+func (in *Installer) checkInstallChannel(ctx context.Context, ch string) error {
+	if ch == "" || fileExists(in.path(envName)) {
+		return nil
+	}
+	prefix := strings.TrimSuffix(cmp.Or(in.O.Registry, in.R.Spec.Registry.Prefix), "/")
+	cl, err := in.registryClient(prefix)
+	if err != nil {
+		return err
+	}
+	return in.checkChannel(ctx, cl, prefix, ch)
+}
+
 // SeedVM is the first-boot material of a new VM of this release on c's platform, as so asks. It
 // never asks (the run's prompter is not read), and refuses a secret input or TLS material: a seed
 // carries neither; with --tls byo or --await-secrets its first install waits for them over SSH.
@@ -141,8 +185,11 @@ func (in *Installer) SeedVM(ctx context.Context, c *VMCreate, so SeedOptions) (*
 	}
 	// A --platform missing, unknown or whose disk the registry lacks is refused once the registry
 	// is read (platform), naming the platforms it offers: a fix that holds.
-	prefix, cl, err := in.seedRegistry(ctx)
+	prefix, cl, err := in.seedRegistry(ctx, c.Platform)
 	if err != nil {
+		return nil, err
+	}
+	if err := in.checkChannel(ctx, cl, prefix, channel); err != nil {
 		return nil, err
 	}
 	login, err := in.createLogin(so.RegistryLogin, prefix)

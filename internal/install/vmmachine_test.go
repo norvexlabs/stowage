@@ -485,6 +485,9 @@ func TestVMSeed(t *testing.T) {
 		})
 		return in.SeedVM(context.Background(), &VMCreate{Platform: platform, Hostname: "notes-1", User: "ops", SSHKey: v.key}, SeedOptions{Channel: channel})
 	}
+	beta := *v.r.Manifest
+	beta.Channel = "beta"
+	v.putRelease("beta", &beta) // --channel names a channel the registry holds a release on
 	s, err := seed(nil, "beta")
 	if err != nil || asked.n != 0 {
 		t.Fatalf("%v (asked %d times)\n%s", err, asked.n, v.log)

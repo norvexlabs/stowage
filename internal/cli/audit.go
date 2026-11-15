@@ -22,7 +22,7 @@ func auditCmd(o *options) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			_, pub, err := o.openPublisher(&channel, readAccess)
+			_, pub, err := o.openPublisher(cmd.Context(), &channel, readAccess)
 			if err != nil {
 				return err
 			}
@@ -84,7 +84,7 @@ func sbomCmd(o *options) *cobra.Command {
 		Short: "Write each artifact's SBOM, verified, into DIR, with index.json naming them",
 		Args:  cobra.RangeArgs(1, 2),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			_, pub, err := o.openPublisher(&channel, readAccess)
+			_, pub, err := o.openPublisher(cmd.Context(), &channel, readAccess)
 			if err != nil {
 				return err
 			}

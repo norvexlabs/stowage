@@ -154,7 +154,7 @@ func (in *Installer) RotateSecret(ctx context.Context, key, pass string) error {
 	if err != nil {
 		return err
 	}
-	if err := env.WriteFile(in.path(envName)); err != nil {
+	if err := in.writeEnv(env); err != nil {
 		return err
 	}
 	in.O.logf("%s", what)
@@ -182,17 +182,7 @@ func (in *Installer) K8sRotateSecret(ctx context.Context, key, pass string) erro
 	if _, err := in.checkHelm(ctx); err != nil {
 		return err
 	}
-	rel, err := in.release(ctx)
-	if err != nil {
-		return err
-	}
-	if rel == nil {
-		return in.noRelease()
-	}
-	if err := in.pending(rel); err != nil {
-		return err
-	}
-	cur, err := in.installedRelease(ctx)
+	cur, err := in.k8sCurrent(ctx)
 	if err != nil {
 		return err
 	}

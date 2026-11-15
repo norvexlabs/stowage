@@ -232,7 +232,7 @@ func TestARecordThatDoesNotReadStopsChangesUntilItsReset(t *testing.T) {
 		t.Error("the record is left")
 	}
 	h.netMu.Lock()
-	armed := h.netTimer != nil && h.netOwner == ""
+	armed := h.netReverts[""] != nil
 	h.netMu.Unlock()
 	if !armed {
 		t.Error("the drop disarmed the primary's window")
@@ -257,9 +257,9 @@ func TestARecordThatDoesNotReadStopsChangesUntilItsReset(t *testing.T) {
 	eventually(t, "edge's change undone at its window's end", func() bool { return nicAddr(link, "edge") == "192.0.2.5/24" })
 }
 
-// Another NIC's change waits for a revert armed for one NIC, which it would disarm, retries
-// included; the same NIC's change replaces it.
-func TestARevertArmedHoldsTheOtherNICs(t *testing.T) {
+// A revert armed for one NIC, retries included, is its own: another NIC's change leaves it armed;
+// the same NIC's change replaces it.
+func TestARevertArmedIsItsNICsAlone(t *testing.T) {
 	t.Parallel()
 	link, h := roleDaemon(t)
 	api := h.Handler()
@@ -267,18 +267,24 @@ func TestARevertArmedHoldsTheOtherNICs(t *testing.T) {
 	h.armRevert("edge", time.Now().Add(time.Hour), 2, "a test", func(context.Context) error { return nil })
 	h.netMu.Unlock()
 	var e errOf
-	if code := call(t, api, http.MethodPost, "/v1/network", NetRequest{NetConfig: NetConfig{Mode: "dhcp"}, RevertSecs: intp(0)}, &e); code != http.StatusConflict || !strings.Contains(e.Error, "edge's network change has a revert armed") {
+	if code := call(t, api, http.MethodPost, "/v1/network", NetRequest{NetConfig: NetConfig{Mode: "dhcp"}, RevertSecs: intp(0)}, &e); code != http.StatusOK {
 		t.Errorf("a primary change: %d %q", code, e.Error)
 	}
-	if code := call(t, api, http.MethodPost, "/v1/network/reset", NetResetRequest{RevertSecs: intp(0)}, &e); code != http.StatusConflict {
+	if code := call(t, api, http.MethodPost, "/v1/network/reset", NetResetRequest{RevertSecs: intp(0)}, &e); code != http.StatusOK {
 		t.Errorf("a primary reset: %d %q", code, e.Error)
+	}
+	h.netMu.Lock()
+	armed := h.netReverts["edge"] != nil
+	h.netMu.Unlock()
+	if !armed {
+		t.Error("the primary's change disarmed edge's revert")
 	}
 	var a NetAnswer
 	if code := call(t, api, http.MethodPost, "/v1/network", NetRequest{Role: "edge", NetConfig: NetConfig{Mode: "none"}, RevertSecs: intp(0)}, fresh(&a)); code != http.StatusOK {
 		t.Fatalf("edge's change: %d %+v", code, a)
 	}
 	h.netMu.Lock()
-	armed := h.netTimer != nil
+	armed = h.netReverts["edge"] != nil
 	h.netMu.Unlock()
 	if armed || nicAddr(link, "edge") != "" {
 		t.Errorf("edge's change left the revert armed (%t) or did not apply", armed)
@@ -417,21 +423,70 @@ func TestNetworkPrintsTheSecondaries(t *testing.T) {
 	}
 }
 
-// The daemon's start applies a record its networkd file lacks once, arming no retry: the one
-// revert timer is the pending change's.
-func TestTheDaemonStartingAppliesARecordWithoutARetry(t *testing.T) {
+// The daemon's start applies a record its networkd file lacks, and tries again while it fails,
+// on that NIC's own timer.
+func TestTheDaemonStartingRetriesARecordItCouldNotApply(t *testing.T) {
 	t.Parallel()
 	link, h := roleDaemon(t)
+	timers := manualTimers(h)
 	link.reloadFails = 1
 	if err := h.netFiles().forRole("edge").write(netState{Config: &NetConfig{Mode: "none"}}); err != nil {
 		t.Fatal(err)
 	}
 	h.NetResume()
 	h.netMu.Lock()
-	armed, tried := h.netTimer != nil, link.reloadFails == 0
+	armed := h.netReverts["edge"] != nil
 	h.netMu.Unlock()
-	if armed || !tried {
-		t.Errorf("armed %t, applied %t", armed, tried)
+	if !armed || nicAddr(link, "edge") != "192.0.2.5/24" {
+		t.Fatalf("armed %t, edge runs %q", armed, nicAddr(link, "edge"))
+	}
+	<-timers.fire(t)
+	if nicAddr(link, "edge") != "" {
+		t.Errorf("edge runs %q", nicAddr(link, "edge"))
+	}
+}
+
+// Two changes awaiting confirmation at the daemon's start (a record repaired by hand) are each
+// undone, each on its NIC's own timer while it fails: one's retry never disarms the other's.
+func TestTheDaemonStartingUndoesEachPendingChangeOnItsOwnTimer(t *testing.T) {
+	t.Parallel()
+	link, h := roleDaemon(t)
+	timers := manualTimers(h)
+	api := h.Handler()
+	var a NetAnswer
+	if code := call(t, api, http.MethodPost, "/v1/network", NetRequest{Role: "edge", NetConfig: NetConfig{Mode: "none"}, RevertSecs: intp(maxRevertSecs)}, fresh(&a)); code != http.StatusOK || a.Pending == nil {
+		t.Fatalf("%d %+v", code, a)
+	}
+	edge := roleState(t, h, "edge")
+	if code := call(t, api, http.MethodPost, "/v1/network/confirm", nil, fresh(&a)); code != http.StatusOK {
+		t.Fatalf("%d %+v", code, a)
+	}
+	if code := call(t, api, http.MethodPost, "/v1/network", NetRequest{NetConfig: NetConfig{Mode: "static", Address: "10.0.0.60/24", Gateway: "10.0.0.1"}, RevertSecs: intp(maxRevertSecs)}, fresh(&a)); code != http.StatusOK || a.Pending == nil {
+		t.Fatalf("%d %+v", code, a)
+	}
+	// edge's window put back by hand beside the primary's.
+	if err := h.netFiles().forRole("edge").write(edge); err != nil {
+		t.Fatal(err)
+	}
+	h.netMu.Lock()
+	h.netDisarm("")
+	h.netMu.Unlock()
+	link.mu.Lock()
+	link.reloadFails = 2
+	link.mu.Unlock()
+	h.NetResume()
+	h.netMu.Lock()
+	armed := len(h.netReverts)
+	h.netMu.Unlock()
+	if armed != 2 {
+		t.Fatalf("%d reverts armed", armed)
+	}
+	<-timers.fire(t)
+	if addr, _, _ := link.live(); addr != leaseAddr || nicAddr(link, "edge") != "192.0.2.5/24" {
+		t.Errorf("the primary runs %s, edge %q", addr, nicAddr(link, "edge"))
+	}
+	if roleState(t, h, "").Pending != nil || roleState(t, h, "edge").Pending != nil {
+		t.Error("a change still awaits confirmation")
 	}
 }
 
@@ -459,7 +514,7 @@ func TestADropDisarmsItsOwnRevertAndIsRetried(t *testing.T) {
 		t.Fatalf("the re-run: %d %+v", code, a)
 	}
 	h.netMu.Lock()
-	armed := h.netTimer != nil
+	armed := h.netReverts["edge"] != nil
 	h.netMu.Unlock()
 	if armed {
 		t.Error("edge's revert is still armed")

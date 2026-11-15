@@ -188,11 +188,7 @@ func (in *Installer) syncTables(ctx context.Context, want map[string][]byte, set
 			_ = os.Remove(mark)
 		}
 		var b bytes.Buffer
-		fmt.Fprintf(&b, "# %s's nftables table, as services.%s.nftables gives it, loaded whole.\ntable inet %s\ndelete table inet %s\n", name, name, name, name)
-		b.Write(want[name])
-		if !bytes.HasSuffix(want[name], []byte("\n")) {
-			b.WriteByte('\n') // nft takes a comment on the last line only before a newline
-		}
+		b.Write(tableText(name, want[name]))
 		f, setsFile := in.tableFile(name, ".nft"), in.tableFile(name, SetsSuffix)
 		// Loaded from a file of its own, which becomes its file once loaded: a load that fails
 		// leaves it as it was, so the next start tries again.
@@ -323,6 +319,18 @@ func (in *Installer) syncTables(ctx context.Context, want map[string][]byte, set
 		return errors.Join(errs...)
 	}
 	return errors.Join(append(errs, save())...)
+}
+
+// tableText is what a start loads table name from, body its file (TablesNow), and records as its
+// .nft file once loaded: made if absent, deleted, then body, in one transaction.
+func tableText(name string, body []byte) []byte {
+	var b bytes.Buffer
+	fmt.Fprintf(&b, "# %s's nftables table, as services.%s.nftables gives it, loaded whole.\ntable inet %s\ndelete table inet %s\n", name, name, name, name)
+	b.Write(body)
+	if !bytes.HasSuffix(body, []byte("\n")) {
+		b.WriteByte('\n') // nft takes a comment on the last line only before a newline
+	}
+	return b.Bytes()
 }
 
 // tableFile is the file, under the install's TablesDir, of the table name with the extension

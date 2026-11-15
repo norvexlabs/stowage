@@ -5,7 +5,7 @@ Description={{.Name}}: the scheduled backup's timer (`{{.Ctl}} backup config --s
 ConditionPathExists=!/run/cos/live_mode
 
 [Timer]
-OnCalendar=*-*-* 03:00:00 UTC
+OnCalendar={{.BackupSchedule}}
 RandomizedDelaySec=15min
 # A run missed while the VM was off runs once it is up.
 Persistent=true

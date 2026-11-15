@@ -5,7 +5,10 @@ import (
 	"fmt"
 	"os"
 	"slices"
+	"strconv"
+	"sync"
 
+	"github.com/norvexlabs/stowage/internal/spec"
 	"github.com/norvexlabs/stowage/internal/tune"
 	"github.com/spf13/pflag"
 )
@@ -81,10 +84,33 @@ func (in *Installer) tuneProfile(get func(string) string) (tune.Profile, string)
 	if p, err := tune.ParseProfile(get(TuneProfileVar)); err == nil {
 		return p, "operator"
 	}
-	if p, err := tune.ParseProfile(in.R.Spec.TuneProfile()); err == nil {
-		return p, "release"
+	s, by := in.recordedSpec(get), "release"
+	if s == nil {
+		// The installed release's spec does not read here: this installer's is the best guess.
+		s, by = in.R.Spec, "release: unknown, run the installed release's installer"
 	}
-	return tune.Default, "release"
+	if p, err := tune.ParseProfile(s.TuneProfile()); err == nil {
+		return p, by
+	}
+	return tune.Default, by
+}
+
+// recordedSpec is the spec of the release get's record says the install runs: this installer's
+// when it carries that release or nothing is recorded, else the kept installer's (carriedRelease);
+// nil when neither carries it or its spec does not read. The kept installer is read once a run.
+func (in *Installer) recordedSpec(get func(string) string) *spec.Spec {
+	name, version := get("STOWAGE_NAME"), get("STOWAGE_PROJECT_VERSION")
+	revision, err := strconv.Atoi(get("STOWAGE_REVISION"))
+	if name == "" || err != nil || isRelease(in.R.Manifest, name, version, revision) {
+		return in.R.Spec
+	}
+	key := fmt.Sprintf("%s %s %d", name, version, revision)
+	if s, ok := in.keptCache().Load(key); ok {
+		return s.(*spec.Spec)
+	}
+	_, s := in.carriedRelease(name, version, revision)
+	in.keptCache().Store(key, s)
+	return s
 }
 
 // stackPorts are the host ports the stack listens on, as get reads the install: the front's and
@@ -163,4 +189,18 @@ func (in *Installer) hostProfile(sys tune.System, h tune.Host) tune.Host {
 	}
 	h.Reserved = in.stackPorts(get)
 	return h
+}
+
+// keptMu guards each Installer's keptSpecs as it is made.
+var keptMu sync.Mutex
+
+// keptCache is in's cache of the kept installer's specs, made on first use; a copy of in made
+// before shares none, one made after shares it.
+func (in *Installer) keptCache() *sync.Map {
+	keptMu.Lock()
+	defer keptMu.Unlock()
+	if in.keptSpecs == nil {
+		in.keptSpecs = &sync.Map{}
+	}
+	return in.keptSpecs
 }

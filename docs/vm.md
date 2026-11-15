@@ -20,7 +20,7 @@ sudo <short>-stow install [--channel C] [--set KEY=VALUE]… [--set-file KEY=PAT
           [--json]   # the run's result as one object, for a program (see "Exit status and --json on the VM")
 <short>-stow --version               # (-v) the release this OS carries and the Stowage that built it, as the Docker installer's
 <short>-stow describe [--json]        # what the release this OS carries offers, read with no install: the Docker installer's describe
-<short>-stow status [--json [--values]]   # --values: the recorded values (machine-interface.md), the operator's alone; this OS's release, the install's (and `not finished` while a first install's stack comes up or its provision hook runs, or after one failed — with why, and the `sudo <short>-stow install` that runs it again; `"installing": true` and `"install_failed": "<why>"` in JSON; `not provisioned` while an install given `--secrets` awaits the backup `restore` loads, `"restore_awaited": true`; `not running` while a restore left the volumes half restored, `"volumes_split": true`), the channel, the stack's tuning profile and whose it is (`tune       network (operator)`, `"tune"` in JSON), the system Kairos booted (active, passive or recovery; the fallback), the last failed boot, the disk, a byo install's certificate (`cert`: its names, end and days left, with a warning from 30 days before it; `"cert"` in JSON), a network warning (`network    warning: …`, `"network_warning"` in JSON: IPv6 on and no IPv6 default route for a minute or more), the services
+<short>-stow status [--json [--values]]   # --values: the recorded values (machine-interface.md), the operator's alone; this OS's release, the install's (and `not finished` while a first install's stack comes up or its provision hook runs, or after one failed — with why, and the `sudo <short>-stow install` that runs it again; `"installing": true` and `"install_failed": "<why>"` in JSON; `not provisioned` while an install given `--secrets` awaits the backup `restore` loads, `"restore_awaited": true`; `not running` while a restore left the volumes half restored, `"volumes_split": true`), the channel, the stack's tuning profile and whose it is (`tune       network (operator)`, `"tune"` in JSON), the system Kairos booted (active, passive or recovery; the fallback), the last failed boot (until a later boot is judged healthy), the disk, a byo install's certificate (`cert`: its names, end and days left, with a warning from 30 days before it; `"cert"` in JSON), a network warning (`network    warning: …`, `"network_warning"` in JSON: IPv6 on and no IPv6 default route for a minute or more), the services
 <short>-stow health [--json]          # ready, or fails saying why: the health gate's check, once
 <short>-stow events [--after N] [--follow|-f] [--json]   # the event journal: jobs, reboots, boots and the health gate's verdicts, the first install; --follow waits for more until interrupted, through daemon restarts
 <short>-stow ps [--json]              # the stack's services, state and health, then `down: <service> <why>` for each service down (as on Docker's `status`; the VM's `status` ends with the same); `--json`: each with `exit_code`, and when set (each absent when false, 0 or empty) `id`, `oom_killed`, `mem_limit_bytes` and `restarts` (these three from docker inspect)
@@ -33,7 +33,7 @@ sudo <short>-stow install [--channel C] [--set KEY=VALUE]… [--set-file KEY=PAT
 <short>-stow rollback [--yes] [--dry-run] [--accessible] [--json]   # reboot into the passive system: back to the release the last upgrade replaced; ends at that reboot
 <short>-stow reset-db [--yes] [--no-provision] [--accessible]   # wipe the data, start again as first installed
           [--new-baseline [--channel C] [--version V]]   # instead: a later release at another schema baseline, its OS written and booted, that boot wiping the data
-<short>-stow restore OBJECT [--identity FILE|-] [--yes] [--accessible]   # load a backup into the database and its volumes (the volumes alone without one)
+<short>-stow restore OBJECT [--identity FILE|-] [--yes] [--accessible] [--unrecorded]   # load a backup into the database and its volumes (the volumes alone without one)
 <short>-stow secrets export --recipient age1…… [-o FILE|-]   # the install's secrets, encrypted
 <short>-stow secrets rotate KEY [--stage | --finish]   # a secret with rotation: true
 <short>-stow secrets set KEY [--accessible] < value   # a secret with settable: true
@@ -74,7 +74,10 @@ sudo <short>-stow network attach --role ROLE --mac MAC [--mode dhcp|static|none]
   `--cert` or `--key` is given, nor when its `tls` is `none` and a domain is given, by
   `--domains`, `--set` or `--answers`; with `--tls none`, its domains are not taken); `tls: byo` and a secret
   input in it are refused (they are given over SSH). `--channel` (a channel name, as `lint` takes them) is recorded as
-  `STOWAGE_CHANNEL`, the channel `updates` and `upgrade` follow, at the first install only (a
+  `STOWAGE_CHANNEL`, the channel `updates` and `upgrade` follow, at the first install only,
+  once the registry (the settings', else the project's) holds a release of the project on it, as
+  `vm seed --channel` checks (`--channel C: the registry P holds no release of <name> on C`;
+  a registry that does not answer refuses it too) (a
   re-run given it is refused, as with the other first-install flags; `--channel` on `updates` and
   `upgrade` names another for one run). A second run is a re-run, as on Docker: over SSH,
   `sudo <short>-stow install --set KEY=VALUE` (or `--answers`, `--domains`, `--ports`, `--http-port`,
@@ -259,17 +262,19 @@ sudo <short>-stow network attach --role ROLE --mac MAC [--mode dhcp|static|none]
   never loops. A reboot before the gate marks a boot on trial good is a failed attempt too: the
   next boot falls back. The fallback sticks: every later boot boots the passive system, until an
   upgrade.
-  With no install yet, the gate judges nothing, except on the OS a first boot switched to (its
-  settings naming a newer release): its boot on trial is marked good, whatever `<name>.service`
-  did, as the passive system holds no install to go back to and its boot would stop at the
-  switch's mark (`<dir>.os-switch`). A first install waiting for what `vm create` gives over SSH,
+  With no install yet, the gate judges nothing, except on the OS a first boot came to (its
+  settings naming a newer release, or an `upgrade` before the first install writing it): its
+  boot on trial is marked good, whatever `<name>.service` did, as the passive system holds no
+  install to go back to and its boot would stop at the switch's mark (`<dir>.os-switch`, naming
+  the release by version and revision; the first boot on an upgrade's OS writes it too). A first install waiting for what `vm create` gives over SSH,
   or failed, is then run again on this OS. Its first install unhealthy while no previous release
   is kept, it is kept as when going back is refused (with the mark removed, it falls back as any
   other). Each judgement is a `boot.judged` entry of the
   event journal (below).
 - Every other verb asks the host daemon, `<name>-hostd.service` (`<short>-stow hostd`, root, hidden
   from the help; its hidden `--group`, default `admin`, names the socket's group, empty for root
-  alone), on the unix socket `/run/<name>/host.sock`: the socket is `root:admin` 0660 in a 0750
+  alone; its hidden `--issue-dir`, default `/etc/issue.d`, the console banners' directory, which a
+  test running the daemon on its own host moves), on the unix socket `/run/<name>/host.sock`: the socket is `root:admin` 0660 in a 0750
   directory (`root` alone, 0600, on a host without that group, which the bundle creates). Each
   socket the daemon serves (this one and the app socket) is made as `.<socket>.<pid>` beside it,
   given its owner and mode, then renamed into place: it appears listening, already restricted, and
@@ -346,8 +351,10 @@ sudo <short>-stow network attach --role ROLE --mac MAC [--mode dhcp|static|none]
   upgrade`), its baseline checked all the same. An upgrade removes the mark a `reset-db
   --new-baseline` left whose OS never booted (`/usr/local/<name>.new-baseline`, below).
   Before the first install, it reads the release as `updates` does, takes no backup, records the
-  release's tag in `/usr/local/<name>.os-upgrade` before `kairos-agent` runs (removed once the
-  first install is made: any boot finding an install removes it), refuses a `--channel` other
+  release (its version and revision) in `/usr/local/<name>.os-upgrade` before `kairos-agent`
+  runs (the first boot on that OS also writes the switch's mark, `<name>.os-switch`, which the
+  health gate reads; the upgrade's own is removed once the first install is made, by that boot or
+  the next one finding an install, so a later first install follows the settings again), refuses a `--channel` other
   than the settings' one (`the first install follows <channel> (its settings)`) and an operator's
   first install still running (`an install is running: wait for it to finish`); the boot into
   it (`the boot makes the first install`) makes the first install of that release from the
@@ -460,7 +467,12 @@ sudo <short>-stow network attach --role ROLE --mac MAC [--mode dhcp|static|none]
   (<error>)`, or `; putting the boot assessment back failed too, so the next boot may choose the
   passive system (<grubenv>): <error>` — read with `<short>-stow events`. It is refused for a release other than the one confirmed.
 - `health` answers whether the install is ready, as the health gate judges it (every service up,
-  the health provider's answer); not ready, it fails with the reason. A probe of a service (the
+  the health provider's answer); not ready, it fails with the reason. Requests (`health`, `GET
+  health` on either socket) arriving while a check runs share it, and its verdict answers them
+  for 5 s after it ended, unless a job started or ended or a service verb ran since it began: a
+  poll starts no check (with the `command` provider, a container) per request. A check ends,
+  not ready, after 90 s plus twice the `command` provider's `timeout_s` (30 s by default), and
+  the next request starts another. A probe of a service (the
   `http-json` and `http-status` health providers, the disk-pressure POST) reaches it at its
   address — IPv4, else IPv6 (a network without IPv4) — on the first network by name that gives
   it one and is not `internal: true` (the host
@@ -506,7 +518,21 @@ sudo <short>-stow network attach --role ROLE --mac MAC [--mode dhcp|static|none]
   gate judged the boot. The job takes the install's lock, reads the install again (refusing
   another release, and, before anything is stopped, a provision or schema container an earlier
   run left), refuses, before anything is stopped, a backup missing one of its volumes' archives
-  (`has no archive of the volume V to restore with it`), stops every service but the database
+  (`has no archive of the volume V to restore with it`), an object the install recorded no
+  digest of (a backup taken on another machine, such as the one this VM replaces, or older than
+  the newest 4096 objects recorded) naming `--unrecorded`, which loads it unchecked (said in the
+  job's log) once the operator knows the destination holds only what they wrote, and a disk that
+  cannot hold the backup's largest object (`restoring O holds each of its objects in
+  <dir>/.stowage-restore-objects while it loads, and the largest, N, is B bytes: the disk has A
+  available`). Each object (the dump or manifest, each volume's archive) is then downloaded once,
+  encrypted as stored, into a file of that directory (root's alone, removed as the restore ends,
+  and as the next one starts), its SHA-256 compared with the one the install's backup recorded
+  when it uploaded it (`backup-digests.json`, below), and that checked copy alone is decrypted
+  and loaded: an object whose bytes differ is refused before a byte of it loads (`is not the
+  object this install's backup uploaded`: whoever can write the destination changed it — age
+  encrypts to public recipients, so it proves nothing of who wrote a backup), whatever the flags,
+  the data as it was. The manifest is checked before anything stops; the dump and the archives as
+  each loads, after the services stopped. It stops every service but the database
   (none to stop: nothing), extracts each volume's archive into a directory of its own at the
   volume's root (`.stowage-restore`, made afresh with the root's owner and mode: it and
   `.stowage-replaced` are names the stack's own data must not use, never extracted from an
@@ -588,8 +614,8 @@ sudo <short>-stow network attach --role ROLE --mac MAC [--mode dhcp|static|none]
   and those it keeps). A release the install went back from is refused (`remove
   <dir>/.stowage-failed to cross to it again`). The POST takes the check of the GET that showed the plan when the
   target's installer and the install's `.env` are unchanged, rather than fetching the installer
-  again (the check of that GET alone: its token). The job, as `upgrade`'s, records the tag in
-  `/usr/local/<name>.new-baseline`, writes the OS and reboots; the boot on that OS runs the
+  again (the check of that GET alone: its token). The job, as `upgrade`'s, records the release
+  (its version and revision) in `/usr/local/<name>.new-baseline`, writes the OS and reboots; the boot on that OS runs the
   Docker shape's `reset-db --new-baseline` (no dump, no previous release kept),
   logging `… which reset-db --new-baseline asked: wiping the data and installing it`. A mark
   naming another release is removed by the next boot (its OS was not written, or the health gate
@@ -689,9 +715,10 @@ sudo <short>-stow network attach --role ROLE --mac MAC [--mode dhcp|static|none]
   confirmation: unless `network confirm` keeps it within `--revert-secs` (default 90, 30 to
   3600; a confirmation that comes once the window's timer fired is refused, 409, and the change
   undone; `network confirm` with nothing awaiting confirmation fails, saying that a change not
-  confirmed in time is undone), the settings before it come back — at the window's end, when the host daemon restarts
+  confirmed in time is undone), the settings before it come back, on the interface the change
+  was applied on (recorded with it, wherever the default route moved since) — at the window's end, when the host daemon restarts
   inside it (no network request runs before that; a record the daemon stopped before applying is
-  applied then), and at a reboot inside it (`<name>-network.service` runs `<short>-stow network-boot`
+  applied then, and tried again as a revert is while it fails), and at a reboot inside it (`<name>-network.service` runs `<short>-stow network-boot`
   before networkd starts, rendering the override and undoing a change never confirmed). A
   DNS change alone, or `--no-revert`, applies with no window. `network revert` undoes the change
   awaiting confirmation now (refused when none does). A state file that does not read (unknown
@@ -705,7 +732,7 @@ sudo <short>-stow network attach --role ROLE --mac MAC [--mode dhcp|static|none]
   whole override (its IPv4 addressing too) is dropped at boot and the cloud-config's network
   comes back — before rolling back to it, `network set --ipv6` without `--address6`, then `network confirm`
   (the settings before a change awaiting confirmation count too), whose record it reads. A revert that fails is tried again every
-  15 s, 5 times in all; a later change stops it.
+  15 s, 5 times in all; a later change of the same NIC stops it.
 - `network reset` drops the override, back to the cloud-config's static address or DHCP, on the
   same window (the override comes back unless confirmed); with no override it changes nothing.
 - `network set --role ROLE` sets a secondary NIC's override, on the release's secondary NIC
@@ -728,9 +755,9 @@ sudo <short>-stow network attach --role ROLE --mac MAC [--mode dhcp|static|none]
   across the primary and the secondaries. Refused before anything changes: the primary's role
   (`network set` without `--role`), a role that is not one of the release's secondary NICs, a
   role no NIC is named for on the VM (409: `vm attach` attaches one), a gateway, IPv6 or DNS
-  server, an address without `static`, `static` without one, another mode, and any NIC's change
-  while a revert is armed for another NIC's (at its window's end, or tried again while it
-  fails: `<NIC>'s network change has a revert armed`); a change awaiting confirmation names
+  server, an address without `static`, `static` without one, and another mode. Each NIC's revert
+  (at its window's end, or tried again while it fails) is its own: another NIC's change leaves
+  it armed, and the same NIC's change replaces it. A change awaiting confirmation names
   its NIC (`<role>'s network change awaits confirmation`). A record that does not read, the
   primary's or a secondary's, sets nothing at boot and stops every change, `network confirm`
   and `network revert` (it may hold the change awaiting confirmation), each naming the `network
@@ -766,8 +793,9 @@ sudo <short>-stow network attach --role ROLE --mac MAC [--mode dhcp|static|none]
   `auth_secret` is set: with one, the status alone, as an answer may echo the token — or why none
   was sent, the token shown as `<auth_secret>` should an error quote it); `status --json` gives them as `disk_pressure`, beside `disk` (`total_bytes`,
   `available_bytes`, `used_bytes`). Past `hard_pct`, the
-  console's login screen says so (`08-<name>-disk.issue`, then `agetty --reload`), until a check
-  finds the use below it; a release without the hook removes that banner as the daemon starts.
+  console's login screen says so (`08-<name>-disk.issue`, then `agetty --reload`, run again by
+  the next check when it failed), until a check finds the use below it or cannot read the disk; a
+  release without the hook removes that banner as the daemon starts.
 - A `volumes-age-rclone` backup (a project without a database) is a `pg-age-rclone` one without
   the dump: each of its `volumes` is archived as below, then a manifest — `{"project", "release":
   {"version", "revision"}, "volumes"}`, JSON, encrypted to the same recipients — is uploaded as
@@ -802,7 +830,9 @@ sudo <short>-stow network attach --role ROLE --mac MAC [--mode dhcp|static|none]
   `CHOWN`, `DAC_OVERRIDE`, `DAC_READ_SEARCH`, `FOWNER`, `FSETID` and `MKNOD` alone, for files of
   every owner, their modes, set-id bits and device nodes)
   (it reaches the destination, and names it, as the VM does — over IPv6 too), the settings' rclone config mounted from a directory under `/run/<name>/`
-  (root's, removed afterwards) — which uploads it with `rclone rcat` to
+  (root's, removed afterwards; one a killed run left is removed by the next run once over 70
+  minutes old, and every one as the daemon starts; on Docker, a read's under the install's
+  `.read/`, a job's under its `.host-*` directory, never the system's temporary one) — which uploads it with `rclone rcat` to
   `<destination>/<name>-<profile>-<UTC time, 20261010T030000Z>-<version>-r<revision>.pgdump.age`;
   nothing is written to the VM's disk. Before the dump, each of the backup's `volumes` is
   archived the same way beside it, as `<the same name>.<volume>.tar.age`: a tar of the volume's
@@ -835,11 +865,23 @@ sudo <short>-stow network attach --role ROLE --mac MAC [--mode dhcp|static|none]
   `<name>.service` ran, during another job, and once a reboot is scheduled); its last run —
   object, profile, release, start and end, bytes, error, pruning error — is kept in
   `/usr/local/<name>/backup-last.json`, which `backup status` shows with the timer's next run.
+  Once a backup's last object is uploaded and its size checked, the SHA-256 of each of its
+  objects, as uploaded, is recorded in `/usr/local/<name>/backup-digests.json` (0600; by the
+  object's path in its destination, so the same name in another destination has no record; the
+  newest 4096 objects are kept, within 2 MiB, the oldest dropped first), which `restore` checks; a backup whose digests cannot be
+  recorded fails and its objects are deleted (a file there that is not one names itself: remove
+  it, and a restore of a backup it recorded then needs `--unrecorded`).
 - The backup settings are the operator's, in `/usr/local/<name>/backup.yaml` (0600, on the
   persistent partition, strictly read; none: no backup runs), set over SSH with `backup config`
   (the cloud-config carries none): `destination` (`remote:path`, the remote a section of the
   rclone config — a remote name is letters, digits, `_`, `.`, `+`, `@`, `-` and spaces, at most
-  64; at most 1024 bytes, no control character), `rclone_config` (the rclone config file's text,
+  64; at most 1024 bytes, no control character; refused when it writes to the runner's own disk,
+  which goes with its container after each run, or to its memory: a `type = local` or
+  `type = memory` remote (or `:local:`, `:memory:` on the fly), a bare path, or a remote
+  leading to one through a wrapper's `remote` (alias, crypt, chunker, compress, hasher…) or a
+  union's or combine's `upstreams` — `the remote R writes to …: … give a destination reachable
+  from outside the host's containers (SFTP, S3, …)`, at `backup config`, `backup verify` and every
+  read of the settings), `rclone_config` (the rclone config file's text,
   at most 32 KiB: the destination's credentials; `-` reads it from standard input; never shown —
   `backup config` and its JSON say only that it is set), `recipients` (1 to 16 age public keys,
   `age1…`, X25519 or post-quantum, one per flag; given, they replace the list), `retention_days`
@@ -863,7 +905,9 @@ sudo <short>-stow network attach --role ROLE --mac MAC [--mode dhcp|static|none]
   another job runs — a `backup verify`, a restore, an upgrade — it waits for that job to end, at
   most 10 minutes, then runs at once, reading its settings, the install and its secrets then (a
   change made during the wait counts; settings removed skip it), or fails as refused (409) when the job still runs; a reboot
-  scheduled, and any other refusal, fails it at once; at most 75 minutes). `backup run` asked by
+  scheduled, and any other refusal, fails it at once; at most 75 minutes). A run that fails is
+  tried again 15 minutes later (`Restart=on-failure`), at most 6 starts in 3 hours
+  (`StartLimitIntervalSec=3h`, `StartLimitBurst=6`), as on a Docker install. `backup run` asked by
   hand is refused at once (409) while a job runs. `backup list` lists the destination's backups of
   the project — `<name>-<letters and digits>-<UTC time>-…`, a profile a later release dropped
   included, another project's in a shared destination not — (name, size, time); `backup verify` writes `<destination>/<name>-verify.txt` (again each time)
@@ -906,8 +950,9 @@ sudo <short>-stow network attach --role ROLE --mac MAC [--mode dhcp|static|none]
     not read: only two ids read tell two boots apart); written by a starting daemon for each
     `job.started` the journal holds without an end.
   - `reboot.scheduled` — `action` (`reboot` or `poweroff`), `drain_secs`, `by` (the `job` that
-    scheduled it: an upgrade's reboot, a rollback's; absent when asked for), `boot_id` (absent
-    when its id was not read). A `job.started` and a `reboot.scheduled` carry the id of the very
+    scheduled it: an upgrade's reboot, a rollback's; absent when asked for), `boot_id` (the
+    daemon does not start when the kernel's boot id does not read: `the kernel's boot id
+    (/proc/sys/kernel/random/boot_id) does not read: the host daemon tells boots apart by it`). A `job.started` and a `reboot.scheduled` carry the id of the very
     `boot.started` record their append writes with, never one read apart from it.
   - `reboot.cancelled` — `action`, `reason`: `systemctl <action> failed: …` (with `by`, the
     `job` whose reboot it was, when a job scheduled it; a rollback's goes on to say whether the
@@ -964,7 +1009,7 @@ sudo <short>-stow network attach --role ROLE --mac MAC [--mode dhcp|static|none]
     once the health gate judged the boot, and not before anything is installed. A restart its restart
     policy made is no event: `ps --json` gives each container's `restarts` and `oom_killed`. A
     Docker install has no such watch: its `status` names a service down. `GET health` and
-    `health` answer the services as they are at once (`not ready: api exited with code 137`).
+    `health` answer the services as they are (`not ready: api exited with code 137`; a verdict is reused for 5 s).
   - `backup.config` — `reason`: `changed through the app socket: <the settings changed>`
     (`destination`, `rclone_config`, `recipients`, `retention_days`, `schedule`, `profile`; the
     values never), each time a service `host_api` names saves the backup settings.
@@ -1044,7 +1089,7 @@ sudo <short>-stow network attach --role ROLE --mac MAC [--mode dhcp|static|none]
   the unit's last 15 journal lines joined by ` | `, absent otherwise; `status` prints it after
   the boot (`boot       recovery (the first boot gave up: …)`);
   `fallback`: Kairos booted the passive system; `on_trial`: the boot runs an upgrade's new system, which the gate has not judged yet; `boot_id`: the kernel's id of this boot, which changes with every reboot; `boot_settled`: this boot is over — `<name>.service` (the boot's install, upgrade or going back) and `<name>-health.service` (the health gate, ordered after it) have each ended: active, failed, absent, or inactive with no job queued (skipped by its condition, stopped, or never started as a dependency failed) —, so what the status says of this boot changes no more but by a job (`false` while either runs or is queued, or when their state cannot be read; `true` on Docker, which has no boot units); `boot_judged`: the health gate's last verdict in this boot, its `boot.judged` entry (`seq`, `verdict`, `on_trial`, `reboots`, and when set `reason`, `kept`, `error`; kept through the journal's rotations), absent before the verdict, and when it cannot be told, `boot_judged_error` then saying why (this boot's id or the journal cannot be read) — settled with an install, no `boot_judged` and no `boot_judged_error`, the gate ended without a verdict, which `status` says (`judged     no verdict: …`; `judged     unknown: …` for an error); a `went_back` whose `reboots` is `false` gets no reboot from the gate; `status` prints `judged` with the verdict, and `settling` while the boot is not settled (or the units' state cannot be read); `registry_login`: the host of the mirror the VM holds a login for (`registry-login`), never the login, absent when it holds none, and `registry_login_error` when the file held cannot be read (naming it and the fix; `status` prints `login      unreadable: …`); `events`: the event journal's last `seq`, 0 before the first, which a client follows with `GET events?after=` — `null` when the journal cannot be read, `events_error` then saying why (a client never takes a cursor from such a status); `failed_boot`: the last boot the gate found
-  unhealthy — `release`, `at`, `reason`, `kept` when the gate kept it, `dir`), `GET health` (`{"ready", "reason"}`), `GET services` (each with its `exit_code`, and when set — each absent when false, 0 or empty — `id`, `oom_killed`, `mem_limit_bytes`, `restarts`),
+  unhealthy — `release`, `at`, `reason`, `kept` when the gate kept it, `dir`, `seq` (the event journal's last entry as it was kept); absent once the journal's last verdict, after it in the journal, is a boot on trial (an upgrade's) judged `healthy` — the passive system's boot after a fallback keeps it told), `GET health` (`{"ready", "reason"}`), `GET services` (each with its `exit_code`, and when set — each absent when false, 0 or empty — `id`, `oom_killed`, `mem_limit_bytes`, `restarts`),
   `GET services/{service}/logs?tail=N`, `POST services/{service}/{restart|stop|start}`,
   `POST provision` (an optional `{"set": {"KEY": "VALUE"}}`, as `provision --set`), `GET reset-db` (`{"target": {"version", "revision"}, "plan", "token"}`: the release a reset
 resets, what it does, and a new token, which replaces the last; refusals as `reset-db`'s, a
@@ -1095,7 +1140,7 @@ showed another plan: look again`), `GET updates?channel=&version=` (`left_by_rol
   `result` is the message; failed, its `error` the destination's reason), `POST
   secrets/export` (`{"recipients"}`: `{"file"}`, the armored file), `POST secrets/rotate`
   (`{"key", "pass": "stage|swap|finish"}`, 202, a job), `POST restore` (`{"object", "identity",
-  "confirm": {"version", "revision"}}`, 202, a job). Every 202 that starts a job answers
+  "confirm": {"version", "revision"}, "unrecorded"}`, 202, a job; `unrecorded` is `--unrecorded`). Every 202 that starts a job answers
   `{"job", "target", "started", "events"}`: the job's kind and target, its `started` (its
   identity, as `GET job` and the journal's `job` give it) and the journal's last `seq` once its
   `job.started` was written, which its `job.ended` (and its reboot's entries) come after — `null`

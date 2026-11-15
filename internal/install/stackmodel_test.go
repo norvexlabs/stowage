@@ -92,7 +92,8 @@ func TestDataVolumesAreGivenTheirUID(t *testing.T) {
 	e := newEnv(t)
 	e.docker.model = `{"services": {
 		"postgres": {"volumes": [{"type": "volume", "source": "postgres", "target": "/var/lib/postgresql/data"}]},
-		"web": {"volumes": [{"type": "volume", "source": "uploads", "target": "/data/uploads"}, {"type": "bind", "source": "/srv", "target": "/srv"}]}},
+		"web": {"volumes": [{"type": "volume", "source": "uploads", "target": "/data/uploads"}, {"type": "bind", "source": "/srv", "target": "/srv"}]},
+		"other": {}},
 	"volumes": {"postgres": {"name": "p_postgres"}, "uploads": {"name": "p_uploads"}, "cache": {"name": "p_cache"}}}`
 	var script, image string
 	e.docker.owner = func(c Cmd) ([]byte, error) {
@@ -109,7 +110,11 @@ func TestDataVolumesAreGivenTheirUID(t *testing.T) {
 	for _, c := range e.docker.calls {
 		a := strings.Join(c.Args, " ")
 		switch {
-		case strings.HasSuffix(a, " up --no-start --remove-orphans"):
+		case strings.Contains(a, " up --no-start "):
+			// The services mounting a volume awaiting its uid, and the front, alone: other runs on.
+			if !strings.HasSuffix(a, " up --no-start --pull never postgres stowage-front web") {
+				t.Errorf("made %s", a)
+			}
 			order = append(order, "create")
 		case strings.HasPrefix(a, frontUserPrefix):
 			order = append(order, "front")
@@ -523,5 +528,41 @@ func TestAProjectWithoutAFront(t *testing.T) {
 	}
 	if err := (&Installer{R: e.r}).sameFront(f, ""); err != nil {
 		t.Errorf("between releases without a front: %v", err)
+	}
+}
+
+// A volume helper that fails names the services left created and unstarted, and the re-run.
+func TestAFailedVolumeHelperNamesTheServicesLeftCreated(t *testing.T) {
+	e := newEnv(t)
+	e.docker.model = `{"services": {
+		"postgres": {"volumes": [{"type": "volume", "source": "postgres", "target": "/var/lib/postgresql/data"}]},
+		"other": {}},
+	"volumes": {"postgres": {"name": "p_postgres"}}}`
+	e.docker.owner = func(Cmd) ([]byte, error) { return nil, errors.New("no space left") }
+	err := e.install(nil)
+	if err == nil || !strings.Contains(err.Error(), "no space left: postgres, stowage-front stays created, not started; a re-run of the install gives the volumes their uid and starts the stack") {
+		t.Fatalf("%v", err)
+	}
+}
+
+// A service mounting a volume awaiting its uid in another's network namespace is made with that
+// one: Compose makes what it needs (never --no-deps), so its create cannot fail on it.
+func TestAVolumeServiceIsMadeWithWhatItNeeds(t *testing.T) {
+	e := newEnv(t)
+	e.docker.model = `{"services": {
+		"api": {"network_mode": "service:db", "volumes": [{"type": "volume", "source": "postgres", "target": "/data"}]},
+		"db": {}, "other": {}},
+	"volumes": {"postgres": {"name": "p_postgres"}}}`
+	if err := e.install(nil); err != nil {
+		t.Fatalf("%v\n%s", err, e.log)
+	}
+	var made []string
+	for _, c := range e.docker.calls {
+		if a := strings.Join(c.Args, " "); strings.Contains(a, " up --no-start ") {
+			made = append(made, a)
+		}
+	}
+	if len(made) != 1 || strings.Contains(made[0], "--no-deps") || !strings.HasSuffix(made[0], " up --no-start --pull never api stowage-front") {
+		t.Errorf("made %q", made)
 	}
 }

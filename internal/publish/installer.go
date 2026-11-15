@@ -403,9 +403,10 @@ func (p *Publisher) dropLatest(ctx context.Context, channel string) error {
 }
 
 // dropTag removes a floating tag. A registry that deletes no tag alone has it retired instead:
-// moved onto the retired artifact, which reads as absent. Its manifest is never deleted by
-// digest here: a release's own tag, or a disk set, may name it; the disk cleanup removes a disk
-// no set keeps.
+// moved onto the retired artifact, which reads as absent. Its manifest is never deleted here: a
+// release's own tag, or a disk set, may name it. A non-disk tag's content is marked held first,
+// so sweepMarked deletes it once no tag holds it; a disk's is the disk cleanup's, which removes a
+// disk no set keeps.
 // A retired tag is deleted where the registry deletes tags alone, and left as it is elsewhere.
 func (p *Publisher) dropTag(ctx context.Context, l latest) error {
 	r, err := registry.RetiredDigest()
@@ -419,6 +420,11 @@ func (p *Publisher) dropTag(ctx context.Context, l latest) error {
 	if err := p.Registry.DeleteTag(ctx, l.tag); errors.Is(err, registry.ErrDeleteRefused) {
 		if have.Digest == r {
 			return nil
+		}
+		if !l.disk {
+			if err := p.markHeld(ctx, l.tag.Context(), have.Digest); err != nil {
+				return err
+			}
 		}
 		if err := p.retire(ctx, l.tag); err != nil {
 			return err

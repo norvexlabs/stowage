@@ -1,14 +1,17 @@
 package graph
 
 import (
+	"bytes"
 	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
 	"github.com/norvexlabs/stowage/internal/backup"
 	"github.com/norvexlabs/stowage/internal/chown"
+	"github.com/norvexlabs/stowage/internal/dockerfile"
 	"github.com/norvexlabs/stowage/internal/front"
 	"github.com/norvexlabs/stowage/internal/project"
 	"github.com/norvexlabs/stowage/internal/sbom"
@@ -424,7 +427,7 @@ func TestBackupRunnerOnlyWithAnAgeRcloneBackup(t *testing.T) {
 	}{
 		{"no backup", "backup:\n  provider: pg-age-rclone\n  profiles: { full: all }\n  volumes: [uploads]", "#"},
 		{"command backup", "  provider: pg-age-rclone\n  profiles: { full: all }\n  volumes: [uploads]", "  provider: command\n  image: api\n  cmd: [notes-api, backup]\n"},
-		{"neither docker nor kairos", "  docker: {}\n  kubernetes: { chart: deploy/chart, postgres_modes: [external, cnpg] }\n  kairos:\n    base: ubuntu:26.04@sha256:6a06111c3b0a8600feadb270aec771dc239bf407b25625f93f44ab00e11f4d3c\n    kairos_init: quay.io/kairos/kairos-init:v4.4.0@sha256:eb131bd9b4ed5b9b25cf761af9afa7d462bef27c2d0e9453ce884cf7733a6556\n    disk_formats: [qcow2]\n    host_api: [api]\n", "  kubernetes: { chart: deploy/chart, postgres_modes: [external, cnpg] }\n"},
+		{"neither docker nor kairos", "  docker: {}\n  kubernetes: { chart: deploy/chart, postgres_modes: [external, cnpg] }\n" + minimalKairos(t), "  kubernetes: { chart: deploy/chart, postgres_modes: [external, cnpg] }\n"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			t.Parallel()
@@ -438,7 +441,7 @@ func TestBackupRunnerOnlyWithAnAgeRcloneBackup(t *testing.T) {
 	}
 	// Positive control: the Docker shape alone runs backups, with the runner.
 	root := testutil.CopyExample(t, "minimal")
-	testutil.Edit(t, root, "stowage.yaml", "  kairos:\n    base: ubuntu:26.04@sha256:6a06111c3b0a8600feadb270aec771dc239bf407b25625f93f44ab00e11f4d3c\n    kairos_init: quay.io/kairos/kairos-init:v4.4.0@sha256:eb131bd9b4ed5b9b25cf761af9afa7d462bef27c2d0e9453ce884cf7733a6556\n    disk_formats: [qcow2]\n    host_api: [api]\n", "")
+	testutil.Edit(t, root, "stowage.yaml", minimalKairos(t), "")
 	if _, ok := build(t, root).Node(BackupID); !ok {
 		t.Error("a Docker release with a pg-age-rclone backup carries no runner")
 	}
@@ -479,7 +482,7 @@ func TestVolumeHelperOnlyWithAVolumeOfAUID(t *testing.T) {
 		name, old, new string
 	}{
 		{"no uid", "    postgres: { uid: 70 }\n    uploads:  { uid: 1000 }\n", "    postgres: {}\n    uploads:  {}\n"},
-		{"neither docker nor kairos", "  docker: {}\n  kubernetes: { chart: deploy/chart, postgres_modes: [external, cnpg] }\n  kairos:\n    base: ubuntu:26.04@sha256:6a06111c3b0a8600feadb270aec771dc239bf407b25625f93f44ab00e11f4d3c\n    kairos_init: quay.io/kairos/kairos-init:v4.4.0@sha256:eb131bd9b4ed5b9b25cf761af9afa7d462bef27c2d0e9453ce884cf7733a6556\n    disk_formats: [qcow2]\n    host_api: [api]\n", "  kubernetes: { chart: deploy/chart, postgres_modes: [external, cnpg] }\n"},
+		{"neither docker nor kairos", "  docker: {}\n  kubernetes: { chart: deploy/chart, postgres_modes: [external, cnpg] }\n" + minimalKairos(t), "  kubernetes: { chart: deploy/chart, postgres_modes: [external, cnpg] }\n"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			t.Parallel()
@@ -509,6 +512,107 @@ func TestNoFrontImageWithoutAFront(t *testing.T) {
 	if _, ok := g.Node(ChownID); !ok {
 		t.Error("examples/stateless's volume of a uid has no volume helper")
 	}
+}
+
+// StowageImages names exactly the images of Stowage's the graph builds: lint's allowances accept
+// these alone, so a project without a front has no "front" among them.
+func TestStowageImagesAreTheGraphs(t *testing.T) {
+	t.Parallel()
+	for _, c := range []struct {
+		example string
+		want    []string
+	}{
+		{"minimal", []string{front.Key, backup.Key, chown.Key}},
+		{"full", []string{front.Key, backup.Key, chown.Key, sbom.Key}},
+		{"stateless", []string{backup.Key, chown.Key}},
+	} {
+		t.Run(c.example, func(t *testing.T) {
+			t.Parallel()
+			root := testutil.CopyExample(t, c.example)
+			p, err := project.Open(root, "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := StowageImages(p.Spec)
+			if !slices.Equal(got, c.want) {
+				t.Errorf("StowageImages = %v, want %v", got, c.want)
+			}
+			var built []string
+			for _, n := range build(t, root).Nodes {
+				switch n.ID {
+				case FrontID, BackupID, ChownID, AuditID:
+					built = append(built, strings.TrimPrefix(n.ID, KindImage+"/"))
+				}
+			}
+			if !slices.Equal(built, got) {
+				t.Errorf("the graph builds %v, StowageImages names %v", built, got)
+			}
+		})
+	}
+}
+
+// A module raised past a vulnerability is raised everywhere at once: each recipe of Stowage's
+// pins it at the version go.mod requires, and two recipes pinning it agree.
+func TestRecipePinsAgreeWithGoMod(t *testing.T) {
+	t.Parallel()
+	b, err := os.ReadFile(filepath.Join(testutil.RepoRoot(t), "go.mod"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	required := goModRequires(string(b))
+	if len(required) == 0 {
+		t.Fatal("go.mod requires nothing")
+	}
+	type pin struct{ recipe, version string }
+	pinnedBy := map[string]pin{} // module → the first recipe pinning it
+	for _, r := range []struct {
+		name   string
+		recipe []byte
+	}{{front.Key, front.Dockerfile}, {backup.Key, backup.Dockerfile}, {chown.Key, chown.Dockerfile}, {sbom.Key, sbom.Dockerfile}} {
+		f, err := dockerfile.Parse(r.recipe)
+		if err != nil {
+			t.Fatalf("%s: %v", r.name, err)
+		}
+		pins, err := f.ModulePins()
+		if err != nil {
+			t.Fatalf("%s: %v", r.name, err)
+		}
+		if len(pins) == 0 && (bytes.Contains(r.recipe, []byte("--replace ")) || bytes.Contains(r.recipe, []byte("go get "))) {
+			t.Errorf("the %s recipe pins modules, none read", r.name)
+		}
+		for _, m := range slices.Sorted(maps.Keys(pins)) {
+			v := pins[m]
+			if w, ok := required[m]; ok && w != v {
+				t.Errorf("the %s recipe pins %s@%s, go.mod requires %s@%s: raise both together", r.name, m, v, m, w)
+			}
+			if other, ok := pinnedBy[m]; !ok {
+				pinnedBy[m] = pin{r.name, v}
+			} else if other.version != v {
+				t.Errorf("the %s recipe pins %s@%s, the %s recipe at %s: raise both together", r.name, m, v, other.recipe, other.version)
+			}
+		}
+	}
+}
+
+// goModRequires is go.mod's require directives, module → version, single-line and in blocks.
+func goModRequires(src string) map[string]string {
+	out := map[string]string{}
+	block := false
+	for _, line := range strings.Split(src, "\n") {
+		f := strings.Fields(strings.SplitN(line, "//", 2)[0])
+		switch {
+		case len(f) == 0:
+		case block && f[0] == ")":
+			block = false
+		case block && len(f) == 2:
+			out[f[0]] = f[1]
+		case f[0] == "require" && len(f) == 2 && f[1] == "(":
+			block = true
+		case f[0] == "require" && len(f) == 3:
+			out[f[1]] = f[2]
+		}
+	}
+	return out
 }
 
 func TestTrustedPublicKeysReachWhatCarriesThemNotImages(t *testing.T) {
@@ -635,12 +739,13 @@ func TestAChartThatCannotBePackagedFailsTheGraph(t *testing.T) {
 func TestKairosSettingsReachTheBundle(t *testing.T) {
 	root := testutil.CopyExample(t, "full")
 	base := inputs(build(t, root))
+	kbase, kinit := testutil.KairosPin(t, root, "base"), testutil.KairosPin(t, root, "kairos_init")
 	for _, e := range []struct {
 		old, new  string
 		os, disks bool
 	}{
-		{"base: ubuntu:26.04@sha256:6", "base: ubuntu:26.04@sha256:d", true, true},
-		{"kairos-init:v4.4.0@sha256:e", "kairos-init:v4.4.0@sha256:f", true, true},
+		{"base: " + kbase, "base: " + otherDigest(t, kbase), true, true},
+		{"kairos_init: " + kinit, "kairos_init: " + otherDigest(t, kinit), true, true},
 		{"pcspkr: { block: true, reason: a VM has no speaker }", "pcspkr: { block: true, reason: no speaker }", true, true},
 		{"redirect_always_follow: \"Y\"", "redirect_always_follow: \"N\"", true, true},
 		{"tcpdump: { reason:", "tcpdump-dbg: { reason:", true, true},
@@ -823,4 +928,28 @@ func TestUntrackedFilesReachTheImage(t *testing.T) {
 	if inst := node(build(t, root), KindInstaller); inst.Fields["changelog"] == "" || inst.Fields["spec"] == "" {
 		t.Errorf("the installer's fields: %v", inst.Fields)
 	}
+}
+
+// minimalKairos is examples/minimal's shapes.kairos block, built from its pins, for a test that
+// drops the shape.
+func minimalKairos(t *testing.T) string {
+	t.Helper()
+	root := filepath.Join(testutil.RepoRoot(t), "examples", "minimal")
+	return "  kairos:\n    base: " + testutil.KairosPin(t, root, "base") + "\n    kairos_init: " + testutil.KairosPin(t, root, "kairos_init") + "\n    disk_formats: [qcow2]\n    host_api: [api]\n"
+}
+
+// otherDigest is pin with the first hex digit of its digest changed, so an edit to it is never a
+// no-op whatever the pin.
+func otherDigest(t *testing.T, pin string) string {
+	t.Helper()
+	i := strings.Index(pin, "@sha256:")
+	if i < 0 || len(pin) <= i+len("@sha256:") {
+		t.Fatalf("%s: no digest", pin)
+	}
+	j := i + len("@sha256:")
+	d := byte('0')
+	if pin[j] == '0' {
+		d = '1'
+	}
+	return pin[:j] + string(d) + pin[j+1:]
 }

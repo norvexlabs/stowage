@@ -29,14 +29,14 @@ jobs:
           git merge-base --is-ancestor "$GITHUB_SHA" origin/main || { echo "tag $GITHUB_REF_NAME is not on main"; exit 1; }
           v="$(make -s -f Makefile -f - print-version <<<'print-version: ; @echo $(VERSION)')"
           [ "v$v" = "$GITHUB_REF_NAME" ] || { echo "tag $GITHUB_REF_NAME, CHANGELOG.md's top entry $v"; exit 1; }
-          awk -v h="## [$v] - " 'index($0, h) == 1 && substr($0, length(h) + 1) ~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]$/ {found = 1} END {exit !found}' CHANGELOG.md || { echo "CHANGELOG.md's $v entry has no date"; exit 1; }
+          test/release-notes.sh dated "$v"
           [ "$(uname -m)" = x86_64 ] || { echo "the runner is $(uname -m), the asset linux-amd64"; exit 1; }
       - run: make check
       - run: make build
       # The asset is the binary this build made, set aside before anything else runs from bin/, and
       # its SBOM (SPDX, by the syft every release's SBOMs are made with: internal/sbom's pin), both
       # in the signed checksums. The notes are the tag's own entry, up to the next entry or a link
-      # definition.
+      # definition (test/release-notes.sh, which test/release.sh proves).
       - name: assets and notes
         run: |
           mkdir dist
@@ -47,8 +47,7 @@ jobs:
           jq -e '.spdxVersion and (.packages | map(.name) | index("github.com/norvexlabs/stowage"))' dist/stowage-linux-amd64.spdx.json >/dev/null ||
             { echo "the SBOM does not name stowage's module"; exit 1; }
           (cd dist && sha256sum stowage-linux-amd64 stowage-linux-amd64.spdx.json > SHA256SUMS)
-          awk -v h="## [${GITHUB_REF_NAME#v}] - " 'index($0, h) == 1 {on = 1; next} on && (/^## \[/ || /^\[[^]]+\]: /) {exit} on' CHANGELOG.md > dist/notes.md
-          grep -q . dist/notes.md || { echo "no notes for $GITHUB_REF_NAME"; exit 1; }
+          test/release-notes.sh notes "${GITHUB_REF_NAME#v}" > dist/notes.md
       # Uploaded before anything else of the repository runs: what lint runs cannot change it.
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:

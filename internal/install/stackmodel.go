@@ -219,7 +219,7 @@ func contentCompose(m *composeModel, environ []string, key []byte, ctr tune.Cont
 		}
 		if dir, ok := mem.Sockets[name]; ok {
 			extra["volumes"] = []string{UpdateVolume(name) + ":" + dir}
-			volumes[UpdateVolume(name)] = map[string]any{}
+			volumes[UpdateVolume(name)] = map[string]any{"name": updateVolumeName(m.Name, name)}
 		}
 		if len(extra) > 0 {
 			services[name] = extra
@@ -373,6 +373,9 @@ func (in *Installer) writeContent(ctx context.Context, m *composeModel, env *Env
 	if err != nil {
 		return err
 	}
+	if w := mem.floorsOver(m); w != "" {
+		in.O.logf("warning: %s", w)
+	}
 	if mem.IPVlans, err = in.ipvlans(ctx, get); err != nil {
 		return err
 	}
@@ -519,4 +522,24 @@ func (in *Installer) ownVolumes(ctx context.Context, env *EnvFile, names []strin
 		}
 	}
 	return true, nil
+}
+
+// volumeServices are the services of m mounting a volume whose engine name is in names, and the
+// front when front is set (its volumes are not there yet), sorted: what a start makes, unstarted,
+// before it gives the volumes their uid, so each holds what its image put in it.
+func volumeServices(m *composeModel, names []string, front bool) []string {
+	var out []string
+	if front {
+		out = append(out, FrontService)
+	}
+	for _, name := range sortedKeys(m.Services) {
+		for _, v := range m.Services[name].Volumes {
+			if v.Type == "volume" && slices.Contains(names, m.Volumes[v.Source].Name) {
+				out = append(out, name)
+				break
+			}
+		}
+	}
+	slices.Sort(out)
+	return slices.Compact(out)
 }

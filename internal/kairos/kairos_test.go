@@ -252,8 +252,9 @@ func TestWriteContextNamesEveryFileAfterTheProject(t *testing.T) {
 	}
 	// The scheduled backup: the host daemon runs it, when one is configured.
 	for unit, wants := range map[string][]string{
-		"notes-backup.service": {"ExecStart=/usr/sbin/notes-stow backup run --if-configured\n", "Type=oneshot\n"},
-		"notes-backup.timer":   {"OnCalendar=*-*-* 03:00:00 UTC\n", "Persistent=true\n", "RandomizedDelaySec=15min\n"},
+		"notes-backup.service": {"ExecStart=/usr/sbin/notes-stow backup run --if-configured\n", "Type=oneshot\n",
+			"\nStartLimitIntervalSec=3h\nStartLimitBurst=6\n\n[Service]\n", "\nRestart=on-failure\nRestartSec=15min\n"},
+		"notes-backup.timer": {"OnCalendar=*-*-* 03:00:00 UTC\n", "Persistent=true\n", "RandomizedDelaySec=15min\n"},
 	} {
 		raw, err := os.ReadFile(filepath.Join(dir, "files/etc/systemd/system", unit))
 		if err != nil {
@@ -393,38 +394,41 @@ func TestOVAIsTheDescriptorThenTheDisk(t *testing.T) {
 
 // fakeDocker is a docker CLI that plays auroraboot (writing the disk its flag names into the
 // state volume, or nothing when NO_DISK names the flag) and runs the disk scripts with a fake
-// qemu-img that writes its last argument. Every call is logged.
+// qemu-img that writes its last argument; a run is a create, which does the work and prints its
+// id, then a start, which hangs on the auroraboot container under FAKE_HANG. Every call is logged.
 const fakeDocker = `#!/bin/sh
 echo "$*" >> "$FAKE_LOG"
+loopid=1111111111111111111111111111111111111111111111111111111111111111
 case "$*" in
-"run --name stowage-disks-loop "*)
+"create --name stowage-disks-loop "*)
 	if [ -n "$FAKE_BUSY" ] && [ ! -e "$FAKE_BUSY" ]; then
-		echo 'docker: Error response from daemon: Conflict. The container name "/stowage-disks-loop" is already in use by container "0123". You have to remove (or rename) that container to be able to reuse that name.' >&2
-		echo "See 'docker run --help'." >&2
+		echo 'Error response from daemon: Conflict. The container name "/stowage-disks-loop" is already in use by container "0123". You have to remove (or rename) that container to be able to reuse that name.' >&2
 		exit 125
 	fi
-	echo "$*" | sed -n 's/.*--label io.stowage.disks.run=\([0-9a-f]*\) .*/\1/p' > "$FAKE_LOG.run"
-	[ -z "$FAKE_HANG" ] || exec sleep 30 ;;
+	echo "$loopid" > "$FAKE_LOG.run" ;;
+"start --attach $loopid")
+	[ -z "$FAKE_HANG" ] || exec sleep 30
+	exit 0 ;;
+"start --attach "*) exit 0 ;;
 "container inspect --format {{.Id}} {{.State.Status}} stowage-disks-loop")
 	h=holder1; [ -z "$FAKE_HOLDER_EACH" ] || h=holder$(date +%s%N)
 	echo "$h ${FAKE_STATE:-running}"; exit 0 ;;
-"ps --all --quiet --filter label=io.stowage.disks.run="*)
-	label=$(cat "$FAKE_LOG.run" 2>/dev/null); [ -z "$FAKE_OWNER" ] || label=$FAKE_OWNER
-	case "$*" in *"=$label") [ -z "$label" ] || echo loopcid ;; esac; exit 0 ;;
 "rm --force "*) exit 0 ;;
 esac
+# A create does the run's work at once, then prints its id; the start that follows only waits.
 vol() { echo "$1" | sed -n "s|.*--volume \([^ ]*\):/$2[ :].*|\1|p"; }
+act() {
 case "$*" in
-*"--entrypoint chown"*|buildx*) exit 0 ;;
+*"--entrypoint chown"*|buildx*) ;;
 *auroraboot*" build-iso "*)
-	[ -z "$NO_ISO" ] || exit 0
+	[ -z "$NO_ISO" ] || return 0
 	state=$(vol "$*" state)
 	name=$(echo "$*" | sed -n 's/.*--override-name \([^ ]*\) .*/\1/p')
 	cp "$(vol "$*" iso-config.yaml)" "$state/$name.iso" ;;
 *auroraboot*)
 	state=$(vol "$*" state)
 	for a; do last=$a; done
-	case "$last" in "$NO_DISK=true") exit 0 ;; esac
+	case "$last" in "$NO_DISK=true") return 0 ;; esac
 	case "$last" in
 	disk.efi=true) echo "$*" | grep -o 'disk.state_size=[0-9]*' >> "$FAKE_LOG.state"
 		raw=$FAKE_RAW; [ -z "$FAKE_RAW2" ] || [ ! -e "$state/../.second" ] || raw=$FAKE_RAW2; touch "$state/../.second"
@@ -433,8 +437,14 @@ case "$*" in
 *stowage-disktools*)
 	work=$(vol "$*" work)
 	for a; do last=$a; done
-	cd "$work" && PATH="$FAKE_BIN:$PATH" sh -c "$last" ;;
+	(cd "$work" && PATH="$FAKE_BIN:$PATH" sh -c "$last") || exit 1 ;;
 *) echo "unexpected docker $*" >&2; exit 1 ;;
+esac
+}
+act "$@"
+case "$1:$3" in
+create:stowage-disks-loop) echo "$loopid" ;;
+create:*) echo 2222222222222222222222222222222222222222222222222222222222222222 ;;
 esac
 `
 
@@ -497,7 +507,7 @@ func fakeBuilder(t *testing.T) (*DiskBuilder, string) {
 	saved := OnDisk
 	OnDisk = func(string) error { return nil }
 	t.Cleanup(func() { OnDisk = saved })
-	return &DiskBuilder{Docker: filepath.Join(bin, "docker"), WorkDir: t.TempDir(), Stderr: io.Discard, removeGrace: 10 * time.Millisecond}, log
+	return &DiskBuilder{Docker: filepath.Join(bin, "docker"), WorkDir: t.TempDir(), Stderr: io.Discard}, log
 }
 
 // auroraboot can exit 0 without writing its disk: that is a failure, and nothing is left behind.
@@ -1216,67 +1226,141 @@ func TestInterfacesAreTheImagesNetworkdFiles(t *testing.T) {
 	}
 }
 
-// A cancelled build removes the containers labelled with its run, which the killed CLI leaves
-// running (or the daemon makes a moment after the kill), before it returns; none is no error. A
-// run that ends on its own removes nothing.
+// A run is a create, which a cancel does not cut, then a start: a cancel removes the container by
+// the id its create printed — during the start, or during the create (the daemon made it all the
+// same; it is never started) — and no listing of containers is needed. A run that ends on its own
+// removes nothing.
 func TestACancelledBuildRemovesItsContainer(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
 	log := filepath.Join(dir, "log")
 	fake := filepath.Join(dir, "docker")
-	// run records its label and hangs; ps lists the container of that label from its second look
-	// (the daemon makes it after the CLI was killed) until it is removed; rm removes it.
+	id := strings.Repeat("a", 64)
+	// create waits for the file "go" when "slow" exists, then prints its id; start hangs.
 	body := `#!/bin/sh
 echo "$*" >> ` + log + `
 case $1 in
-run) echo "$*" | sed -n 's/.*--label io.stowage.disks.run=\([0-9a-f]*\) .*/\1/p' > ` + dir + `/label; exec sleep 30 ;;
-ps) n=$(cat ` + dir + `/psn 2>/dev/null || echo 0); echo $((n+1)) > ` + dir + `/psn
-	[ "$n" -ge 1 ] || exit 0 # made by the daemon only after the first look, as one whose create was in flight
-	[ -e ` + dir + `/none ] || [ -e ` + dir + `/removed ] || case "$*" in *"=$(cat ` + dir + `/label)") echo cid1 ;; esac ;;
-rm) touch ` + dir + `/removed ;;
+create) touch ` + dir + `/created; while [ -e ` + dir + `/slow ] && [ ! -e ` + dir + `/go ]; do sleep 0.01; done; echo ` + id + ` ;;
+start) exec sleep 30 ;;
 esac
 `
 	if err := testutil.WriteExecutable(fake, []byte(body)); err != nil {
 		t.Fatal(err)
 	}
-	b := &DiskBuilder{Docker: fake, removeGrace: 20 * time.Millisecond}
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() { done <- b.docker(ctx, "run", "--rm", "img") }()
-	for {
-		if raw, _ := os.ReadFile(filepath.Join(dir, "label")); len(bytes.TrimSpace(raw)) > 0 {
-			break
+	b := &DiskBuilder{Docker: fake}
+	cancelWhen := func(started bool, then func()) error {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		done := make(chan error, 1)
+		go func() { done <- b.docker(ctx, "run", "--rm", "img") }()
+		for _, err := os.Stat(filepath.Join(dir, "created")); err != nil; _, err = os.Stat(filepath.Join(dir, "created")) {
+			time.Sleep(time.Millisecond)
 		}
-		time.Sleep(time.Millisecond)
+		if started { // cancelled once the start hangs
+			for raw, _ := os.ReadFile(log); !strings.Contains(string(raw), "start --attach "+id); raw, _ = os.ReadFile(log) {
+				time.Sleep(time.Millisecond)
+			}
+		}
+		cancel()
+		then()
+		return <-done
 	}
-	cancel()
-	if err := <-done; err == nil || strings.Contains(err.Error(), "may still run") {
-		t.Fatalf("a cancelled run: %v", err)
+	if err := cancelWhen(true, func() {}); !errors.Is(err, context.Canceled) || strings.Contains(err.Error(), "may still run") {
+		t.Fatalf("cancelled during the start: %v", err)
 	}
 	raw, _ := os.ReadFile(log)
-	if !strings.HasPrefix(string(raw), "run --name "+containerPrefix+"-") || !strings.Contains(string(raw), "\nrm --force cid1\n") {
+	if !strings.HasPrefix(string(raw), "create --name "+containerPrefix+"-") || !strings.HasSuffix(string(raw), "start --attach "+id+"\nrm --force "+id+"\n") || strings.Contains(string(raw), "ps ") {
 		t.Errorf("ran %q", raw)
 	}
-	// None made: nothing removed, no error of the removal's.
-	if err := os.WriteFile(filepath.Join(dir, "none"), nil, 0o644); err != nil {
+	// Cancelled while the create runs: it finishes, its container is removed, never started.
+	for _, f := range []string{log, filepath.Join(dir, "created")} {
+		_ = os.Remove(f)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "slow"), nil, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel = context.WithCancel(context.Background())
-	cancel()
-	if err := b.docker(ctx, "run", "img"); err == nil || strings.Contains(err.Error(), "may still run") {
-		t.Errorf("a container never made: %v", err)
+	// The create is let go a moment after the cancel: one the cancel cut would be gone by then.
+	if err := cancelWhen(false, func() { time.Sleep(20 * time.Millisecond); _ = os.WriteFile(filepath.Join(dir, "go"), nil, 0o644) }); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled during the create: %v", err)
+	}
+	raw, _ = os.ReadFile(log)
+	if strings.Contains(string(raw), "start ") || !strings.HasSuffix(string(raw), "rm --force "+id+"\n") {
+		t.Errorf("ran %q", raw)
 	}
 	// A run that ends on its own removes nothing.
 	ok := filepath.Join(dir, "ok")
-	if err := testutil.WriteExecutable(ok, []byte("#!/bin/sh\necho \"$*\" >> "+log+".ok\n")); err != nil {
+	if err := testutil.WriteExecutable(ok, []byte("#!/bin/sh\necho \"$*\" >> "+log+".ok\n[ $1 != create ] || echo "+id+"\n")); err != nil {
 		t.Fatal(err)
 	}
 	if err := (&DiskBuilder{Docker: ok}).docker(context.Background(), "run", "--rm", "img"); err != nil {
 		t.Fatal(err)
 	}
-	if raw, _ := os.ReadFile(log + ".ok"); strings.Count(string(raw), "\n") != 1 {
+	if raw, _ := os.ReadFile(log + ".ok"); strings.Count(string(raw), "\n") != 2 || strings.Contains(string(raw), "\nrm ") {
 		t.Errorf("ran %q", raw)
 	}
+}
+
+// A create that fails otherwise than on its name may have made the container: it is removed when
+// the container of its name carries this create's label (inspected first), never another
+// build's of the same name. One refused for its name is another's, never removed. The create runs
+// in a session of its own, which the terminal's interrupt does not reach.
+func TestAFailedCreateRemovesItsContainerByName(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	log := filepath.Join(dir, "log")
+	fake := filepath.Join(dir, "docker")
+	id := strings.Repeat("b", 64)
+	// create records its label (or another's, with "other"), then fails; inspect prints it.
+	body := `#!/bin/sh
+echo "$*" >> ` + log + `
+case $1 in
+create) cut -d' ' -f6 /proc/$$/stat > ` + dir + `/sid; [ -e ` + dir + `/conflict ] && { echo 'Error response from daemon: Conflict. The container name "/x" is already in use by container "y".' >&2; exit 1; }
+  if [ -e ` + dir + `/other ]; then echo another > ` + dir + `/label; else echo "$5" | cut -d= -f2 > ` + dir + `/label; fi
+  echo 'killed' >&2; exit 137 ;;
+container) echo "` + id + ` $(cat ` + dir + `/label)" ;;
+esac
+`
+	if err := testutil.WriteExecutable(fake, []byte(body)); err != nil {
+		t.Fatal(err)
+	}
+	b := &DiskBuilder{Docker: fake}
+	err := b.docker(context.Background(), "run", "--rm", "img")
+	raw, _ := os.ReadFile(log)
+	lines := strings.Split(strings.TrimSpace(string(raw)), "\n")
+	if err == nil || len(lines) != 3 || !strings.HasPrefix(lines[0], "create --name "+containerPrefix+"-") || !strings.Contains(lines[0], " --label "+runLabel+"=") ||
+		!strings.HasPrefix(lines[1], "container inspect ") || lines[2] != "rm --force "+id {
+		t.Errorf("%v: ran %q", err, raw)
+	}
+	if sid, _ := os.ReadFile(filepath.Join(dir, "sid")); strings.TrimSpace(string(sid)) == fmt.Sprint(mustSid(t)) {
+		t.Errorf("the create runs in this session (%s)", sid)
+	}
+	// Another build's container of the name (loopName's): inspected, left.
+	for _, f := range []string{"other", "conflict"} {
+		_ = os.Remove(log)
+		if err := os.WriteFile(filepath.Join(dir, f), nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		err := b.dockerNamed(context.Background(), loopName, "run", "--rm", "img")
+		if raw, _ := os.ReadFile(log); err == nil || strings.Contains(string(raw), "\nrm --force") {
+			t.Errorf("%s: %v, removed another's container: %q", f, err, raw)
+		}
+		if f == "conflict" && !errors.Is(err, errNameInUse) {
+			t.Errorf("conflict: %v", err)
+		}
+	}
+}
+
+// mustSid is this process's session id.
+func mustSid(t *testing.T) int {
+	t.Helper()
+	raw, err := os.ReadFile("/proc/self/stat")
+	if err != nil {
+		t.Skip("no /proc")
+	}
+	// The fields after the command's closing parenthesis: state, ppid, pgrp, session.
+	f := strings.Fields(string(raw[strings.LastIndexByte(string(raw), ')')+1:]))
+	n, _ := strconv.Atoi(f[3])
+	return n
 }
 
 // A disk build waits while another build's auroraboot holds the host's one name (whatever process
@@ -1291,7 +1375,7 @@ func TestDiskBuilderWaitsForAnotherBuildsContainer(t *testing.T) {
 	defer cancel()
 	go func() { // cancelled once three tries met the name taken
 		for ctx.Err() == nil {
-			if raw, _ := os.ReadFile(log); strings.Count(string(raw), "run --name stowage-disks-loop ") >= 3 {
+			if raw, _ := os.ReadFile(log); strings.Count(string(raw), "create --name stowage-disks-loop ") >= 3 {
 				cancel()
 			}
 			time.Sleep(time.Millisecond)
@@ -1345,34 +1429,30 @@ func TestDiskBuilderRefusesAStaleHolderOfTheName(t *testing.T) {
 	}
 }
 
-// A build cancelled while its auroraboot runs removes its own container, never another build's
-// that took the name meanwhile (its docker run was killed before the daemon's refusal reached it).
-func TestDiskBuilderCancelledRemovesOnlyItsOwnContainer(t *testing.T) {
-	for owner, removed := range map[string]bool{"": true, "0123456789abcdef": false} {
-		b, log := fakeBuilder(t)
-		t.Setenv("FAKE_HANG", "1")
-		t.Setenv("FAKE_OWNER", owner) // "": the label of this run's own docker run
-		ctx, cancel := context.WithCancel(context.Background())
-		go func() {
-			for ctx.Err() == nil {
-				// Once the fake daemon made the container (its label recorded).
-				if raw, _ := os.ReadFile(log + ".run"); len(bytes.TrimSpace(raw)) > 0 {
-					cancel()
-				}
-				time.Sleep(time.Millisecond)
+// A build cancelled while its auroraboot runs removes its own container, by the id its create
+// printed: never another build's that took the name since.
+func TestDiskBuilderCancelledRemovesItsOwnContainer(t *testing.T) {
+	b, log := fakeBuilder(t)
+	t.Setenv("FAKE_HANG", "1")
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		for ctx.Err() == nil {
+			if raw, _ := os.ReadFile(log); strings.Contains(string(raw), "start --attach 1111") {
+				cancel()
 			}
-		}()
-		req := DiskRequest{Source: "r/notes-os@sha256:" + strings.Repeat("c", 64), Registry: "r", RootfsMiB: 3500, Formats: []string{"raw"}, Base: "notes-1.0.0"}
-		_, cleanup, err := b.Build(ctx, req)
-		cleanup()
-		cancel()
-		if err == nil {
-			t.Fatalf("owner %q: a cancelled build succeeded", owner)
+			time.Sleep(time.Millisecond)
 		}
-		raw, _ := os.ReadFile(log)
-		if got := strings.Contains(string(raw), "rm --force loopcid"); got != removed {
-			t.Errorf("owner %q: removed %v, want %v:\n%s", owner, got, removed, raw)
-		}
+	}()
+	req := DiskRequest{Source: "r/notes-os@sha256:" + strings.Repeat("c", 64), Registry: "r", RootfsMiB: 3500, Formats: []string{"raw"}, Base: "notes-1.0.0"}
+	_, cleanup, err := b.Build(ctx, req)
+	cleanup()
+	cancel()
+	if err == nil {
+		t.Fatal("a cancelled build succeeded")
+	}
+	raw, _ := os.ReadFile(log)
+	if !strings.Contains(string(raw), "rm --force "+strings.Repeat("1", 64)) || strings.Contains(string(raw), "rm --force stowage-disks-loop") {
+		t.Errorf("removed:\n%s", raw)
 	}
 }
 

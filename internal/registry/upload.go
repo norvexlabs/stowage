@@ -47,6 +47,16 @@ const (
 	progressEvery = 30
 )
 
+// commitRate is the slowest a registry is waited for to verify or move a blob it was sent whole,
+// in bytes per uploadUnit: a commit's response is awaited for commitWait. A variable for tests.
+var commitRate int64 = 20 << 20
+
+// commitWait bounds a commit of n bytes: the client's response bound, and the time the registry
+// takes over the blob at commitRate.
+func commitWait(n int64) time.Duration {
+	return responseWait + time.Duration(n/commitRate)*uploadUnit
+}
+
 // maxSessions bounds the upload sessions of one blob.
 const maxSessions = 4
 
@@ -66,7 +76,8 @@ func (c *Client) pushFile(ctx context.Context, repo name.Repository, b Blob) err
 	if err != nil {
 		return err
 	}
-	rt, err := transport.NewWithContext(ctx, repo.Registry, auth, c.rt, []string{repo.Scope(transport.PushScope)})
+	scopes := []string{repo.Scope(transport.PushScope)}
+	rt, err := transport.NewWithContext(ctx, repo.Registry, auth, c.rt, scopes)
 	if err != nil {
 		return err
 	}
@@ -75,16 +86,26 @@ func (c *Client) pushFile(ctx context.Context, repo name.Repository, b Blob) err
 		return err
 	}
 	defer f.Close()
+	// The commit's response comes once the registry verified (or moved) the whole blob: it goes
+	// through the client's waiting transport, authenticated when a commit is first sent.
+	commitClient := func() (*http.Client, error) {
+		crt, err := transport.NewWithContext(ctx, repo.Registry, auth, c.waiting(), scopes)
+		if err != nil {
+			return nil, err
+		}
+		return &http.Client{Transport: crt}, nil
+	}
 	u := &upload{
-		hc:      &http.Client{Transport: rt},
-		repo:    repo,
-		b:       b,
-		f:       f,
-		log:     c.log,
-		label:   cmpLabel(b),
-		chunk:   chunkMin,
-		least:   chunkMin,
-		ceiling: c.ceiling(repo.RegistryStr()),
+		hc:           &http.Client{Transport: rt},
+		commitClient: commitClient,
+		repo:         repo,
+		b:            b,
+		f:            f,
+		log:          c.log,
+		label:        cmpLabel(b),
+		chunk:        chunkMin,
+		least:        chunkMin,
+		ceiling:      c.ceiling(repo.RegistryStr()),
 	}
 	err = u.run(ctx)
 	if err != nil {
@@ -92,7 +113,8 @@ func (c *Client) pushFile(ctx context.Context, repo name.Repository, b Blob) err
 	}
 	if errors.Is(err, errChunkRefused) || errors.Is(err, errSessions) {
 		u.logf("push %s: %v; pushing it in one stream", u.label, err)
-		return remote.WriteLayer(repo, b.layer(), c.opts(ctx)...)
+		// Its commit, as a chunked one's, comes once the registry verified the whole blob.
+		return remote.WriteLayer(repo, b.layer(), remote.WithContext(withHeaderWait(ctx, commitWait(b.size))), remote.WithAuthFromKeychain(c.keychain), remote.WithTransport(c.waiting()))
 	}
 	return err
 }
@@ -114,27 +136,34 @@ func cmpLabel(b Blob) string {
 
 type upload struct {
 	hc       *http.Client
-	repo     name.Repository
-	b        Blob
-	f        *os.File
-	log      io.Writer
-	label    string
-	loc      *url.URL  // the upload session
-	off      int64     // the bytes the registry acknowledged
-	sessions int       // the sessions begun
-	checked  bool      // the registry was asked whether it holds the blob
-	ever     bool      // the registry acknowledged a chunk once
-	took     int64     // the largest chunk the registry acknowledged whole
-	patched  bool      // a chunk was sent in this session
-	from     time.Time // the session began: the rate is measured from then
-	lostAt   int64     // the bytes the last session lost held
-	chunk    int64
-	last     int64         // the last chunk's length
-	reach    int64         // the furthest byte sent in this session: a registry holds no more
-	least    int64         // the smallest chunk but the last
-	ceiling  *atomic.Int64 // the largest chunk the registry takes, 0 when unknown
-	acked    time.Time     // when the registry last acknowledged a byte (or the upload began)
-	sent     atomic.Int64  // when a request's body was last read, in Unix nanoseconds
+	commitHC *http.Client // hc, with the commit's bound on its response; made by commitClient
+	// commitClient makes commitHC, when a commit is first sent.
+	commitClient func() (*http.Client, error)
+	// committing is set when every byte is acknowledged and a commit is first sent: the stall is
+	// counted from then, not from each attempt, and bounded by commitWait at least. A byte
+	// acknowledged again (a new session) clears it.
+	committing bool
+	repo       name.Repository
+	b          Blob
+	f          *os.File
+	log        io.Writer
+	label      string
+	loc        *url.URL  // the upload session
+	off        int64     // the bytes the registry acknowledged
+	sessions   int       // the sessions begun
+	checked    bool      // the registry was asked whether it holds the blob
+	ever       bool      // the registry acknowledged a chunk once
+	took       int64     // the largest chunk the registry acknowledged whole
+	patched    bool      // a chunk was sent in this session
+	from       time.Time // the session began: the rate is measured from then
+	lostAt     int64     // the bytes the last session lost held
+	chunk      int64
+	last       int64         // the last chunk's length
+	reach      int64         // the furthest byte sent in this session: a registry holds no more
+	least      int64         // the smallest chunk but the last
+	ceiling    *atomic.Int64 // the largest chunk the registry takes, 0 when unknown
+	acked      time.Time     // when the registry last acknowledged a byte (or the upload began)
+	sent       atomic.Int64  // when a request's body was last read, in Unix nanoseconds
 }
 
 func (u *upload) logf(format string, a ...any) {
@@ -150,10 +179,17 @@ func (u *upload) url(path string) *url.URL {
 // stalled is the error once no byte was acknowledged for uploadStall. Bytes sent are no
 // progress: a link that drops everything still takes a socket buffer's worth on each attempt.
 func (u *upload) stalled(err error) error {
-	if time.Since(u.acked) < uploadStall*uploadUnit {
+	bound := uploadStall * uploadUnit
+	if u.committing {
+		bound = max(bound, commitWait(u.b.size))
+	}
+	if time.Since(u.acked) < bound {
 		return nil
 	}
-	return fmt.Errorf("push %s: no byte acknowledged for %s, at %d of %d bytes: %w", u.label, uploadStall*uploadUnit, u.off, u.b.size, err)
+	if u.committing {
+		return fmt.Errorf("push %s: not committed in %s since every byte was acknowledged: %w", u.label, bound, err)
+	}
+	return fmt.Errorf("push %s: no byte acknowledged for %s, at %d of %d bytes: %w", u.label, bound, u.off, u.b.size, err)
 }
 
 func (u *upload) run(ctx context.Context) error {
@@ -224,10 +260,15 @@ func (u *upload) run(ctx context.Context) error {
 // do sends req with a watchdog: the request is cancelled once nothing was acknowledged for
 // uploadStall and its body was not read for as long.
 func (u *upload) do(ctx context.Context, req *http.Request) (*http.Response, error) {
+	return u.doOn(ctx, u.hc, req, uploadStall*uploadUnit)
+}
+
+// doOn is do through hc, with stall the watchdog's bound.
+func (u *upload) doOn(ctx context.Context, hc *http.Client, req *http.Request, stall time.Duration) (*http.Response, error) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	u.sent.Store(time.Now().UnixNano())
-	stall, acked := uploadStall*uploadUnit, u.acked
+	acked := u.acked
 	done := make(chan struct{})
 	defer close(done)
 	go func() {
@@ -245,7 +286,7 @@ func (u *upload) do(ctx context.Context, req *http.Request) (*http.Response, err
 			}
 		}
 	}()
-	resp, err := u.hc.Do(req.WithContext(ctx))
+	resp, err := hc.Do(req.WithContext(ctx))
 	if err != nil {
 		return nil, err
 	}
@@ -514,7 +555,7 @@ func (u *upload) sized(ctx context.Context, status int, n int64, err error) erro
 
 func (u *upload) advance(to int64) {
 	if to > u.off {
-		u.acked = time.Now()
+		u.acked, u.committing = time.Now(), false
 	}
 	u.off = to
 }
@@ -561,9 +602,21 @@ func (u *upload) held(ctx context.Context) (got int64, lost bool) {
 	return -1, errors.As(transport.CheckError(resp), &te) && sessionLost(te)
 }
 
-// commit closes the session with the blob's digest. A commit whose answer was lost may have
+// commit closes the session with the blob's digest, its response awaited for commitWait, and
+// the upload's stall counted from the first commit sent. A commit whose answer was lost may have
 // landed: the blob is looked for before the next attempt.
 func (u *upload) commit(ctx context.Context) error {
+	wait := commitWait(u.b.size)
+	if !u.committing {
+		u.acked, u.committing = time.Now(), true
+	}
+	if u.commitHC == nil {
+		hc, err := u.commitClient()
+		if err != nil {
+			return err
+		}
+		u.commitHC = hc
+	}
 	q := u.loc.Query()
 	q.Set("digest", u.b.digest.String())
 	l := *u.loc
@@ -574,7 +627,7 @@ func (u *upload) commit(ctx context.Context) error {
 	}
 	req.ContentLength = 0
 	req.Header.Set("Content-Type", "application/octet-stream")
-	resp, err := u.do(ctx, req)
+	resp, err := u.doOn(withHeaderWait(ctx, wait), u.commitHC, req, max(wait, uploadStall*uploadUnit))
 	if err == nil {
 		if err = transport.CheckError(resp, http.StatusCreated, http.StatusNoContent); err == nil {
 			return nil

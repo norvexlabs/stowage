@@ -39,10 +39,43 @@ var (
 // the built-in module ("<key> builtin") or the operator's ("<key> module").
 const platformFile = "platform"
 
-// moduleVar is a variable a module declares.
+// moduleVar is a variable a module declares; Type is its type when bool or number (typedValue
+// checks a value given it), else "".
 type moduleVar struct {
 	Name, Description string
 	HasDefault        bool
+	Type              string
+}
+
+// typedCheck is the check of an answer for the module's variable v: empty is the module's default
+// (or refused as required), another value one its type takes (typedValue; tfvars.json carries any
+// text).
+func typedCheck(v moduleVar) func(string) error {
+	return func(val string) error {
+		if val == "" {
+			return nil
+		}
+		_, err := typedValue(v, val)
+		return err
+	}
+}
+
+// typedValue is val as the module's variable v takes it: a bool's spellings (OpenTofu's 1 and 0
+// too) made true or false, which tfvars.json carries as a string OpenTofu converts; a number one
+// that parses as one. Any other type takes val as it is. Refused, it names the variable's type.
+func typedValue(v moduleVar, val string) (string, error) {
+	switch v.Type {
+	case "bool":
+		if b, ok := map[string]string{"true": "true", "1": "true", "false": "false", "0": "false"}[val]; ok {
+			return b, nil
+		}
+		return "", fmt.Errorf("%q: the module's %s is a bool: true or false", val, v.Name)
+	case "number":
+		if !hclNumber.MatchString(val) {
+			return "", fmt.Errorf("%q: the module's %s is a number", val, v.Name)
+		}
+	}
+	return val, nil
 }
 
 var (
@@ -51,8 +84,13 @@ var (
 	hclOneDefault  = regexp.MustCompile(`(^|\s)default\s*=`)
 	hclString      = regexp.MustCompile(`"(?:[^"\\]|\\.)*"`)
 	hclDescription = regexp.MustCompile(`^\s+description\s*=\s*"((?:[^"\\]|\\.)*)"\s*$`)
-	hclDefault     = regexp.MustCompile(`^  default\s*=`) // a block's own attribute, as `tofu fmt` indents it
-	hclNested      = regexp.MustCompile(`\([^()]*\)|\{[^{}]*\}`)
+	hclDefault     = regexp.MustCompile(`^\s*default\s*=`) // a block's own attribute (depth 0), however indented
+	hclType        = regexp.MustCompile(`^\s*type\s*=\s*(bool|number)\s*$`)
+	// hclNumber is an HCL number literal, as OpenTofu reads a number variable's value: no sign
+	// but a leading minus, no hexadecimal, no NaN or infinity.
+	hclNumber  = regexp.MustCompile(`^-?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$`)
+	hclOneType = regexp.MustCompile(`(^|\s)type\s*=\s*(bool|number)(\s|$)`)
+	hclNested  = regexp.MustCompile(`\([^()]*\)|\{[^{}]*\}`)
 )
 
 // moduleVars are the variables the module's files declare, sorted by name: its *.tf files read as
@@ -68,16 +106,22 @@ func moduleVars(files map[string][]byte) ([]moduleVar, error) {
 				Variable map[string]struct {
 					Description string `json:"description"`
 					Default     any    `json:"default"`
+					Type        any    `json:"type"`
 				} `json:"variable"`
 			}
 			if err := json.Unmarshal(b, &doc); err != nil {
 				return nil, fmt.Errorf("%s: %w", name, err)
 			}
 			for n, v := range doc.Variable {
-				seen[n] = moduleVar{n, v.Description, v.Default != nil}
+				typ, _ := v.Type.(string)
+				if typ != "bool" && typ != "number" {
+					typ = ""
+				}
+				seen[n] = moduleVar{n, v.Description, v.Default != nil, typ}
 			}
 		case strings.HasSuffix(name, ".tf"):
 			var cur *moduleVar
+			depth := 0
 			sc := bufio.NewScanner(bytes.NewReader(b))
 			for sc.Scan() {
 				line := hclCode(sc.Text())
@@ -87,18 +131,31 @@ func moduleVars(files map[string][]byte) ([]moduleVar, error) {
 					for n := ""; n != attrs; {
 						n, attrs = attrs, hclNested.ReplaceAllString(attrs, "")
 					}
-					seen[one[1]] = moduleVar{Name: one[1], HasDefault: hclOneDefault.MatchString(attrs)}
+					v := moduleVar{Name: one[1], HasDefault: hclOneDefault.MatchString(attrs)}
+					if m := hclOneType.FindStringSubmatch(attrs); m != nil {
+						v.Type = m[2]
+					}
+					seen[one[1]] = v
 					continue
+				}
+				// depth is the nesting the line starts at within the block: its own attributes are
+				// at 0, an object's or a type's at more.
+				d := depth
+				if cur != nil {
+					depth += hclDepth(line)
 				}
 				switch m := hclVariable.FindStringSubmatch(line); {
 				case m != nil:
-					cur = &moduleVar{Name: m[1]}
+					cur, depth = &moduleVar{Name: m[1]}, 0
 				case cur == nil:
-				case line == "}":
+				case d == 0 && strings.TrimSpace(line) == "}":
 					seen[cur.Name] = *cur
 					cur = nil
+				case d > 0:
 				case hclDefault.MatchString(line):
 					cur.HasDefault = true
+				case hclType.MatchString(line):
+					cur.Type = hclType.FindStringSubmatch(line)[1]
 				default:
 					if d := hclDescription.FindStringSubmatch(line); d != nil {
 						cur.Description = strings.ReplaceAll(d[1], `\"`, `"`)
@@ -118,6 +175,21 @@ func moduleVars(files map[string][]byte) ([]moduleVar, error) {
 		out = append(out, seen[n])
 	}
 	return out, nil
+}
+
+// hclDepth is how much deeper the nesting is after line than before it: its brackets, braces and
+// parentheses outside strings, opened less closed.
+func hclDepth(line string) int {
+	n := 0
+	for _, c := range hclString.ReplaceAllString(line, `""`) {
+		switch c {
+		case '{', '(', '[':
+			n++
+		case '}', ')', ']':
+			n--
+		}
+	}
+	return n
 }
 
 // hclCode is a line of HCL less its line ending and a trailing comment (# or //) outside a string.
