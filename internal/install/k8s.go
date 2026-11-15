@@ -19,7 +19,6 @@ import (
 	"go.yaml.in/yaml/v3"
 
 	"github.com/norvexlabs/stowage/internal/helm"
-	"github.com/norvexlabs/stowage/internal/payload"
 	"github.com/norvexlabs/stowage/internal/providers"
 	"github.com/norvexlabs/stowage/internal/registry"
 )
@@ -142,20 +141,6 @@ type helmRevision struct {
 // rolledBackTo matches the description helm gives a revision a rollback made.
 var rolledBackTo = regexp.MustCompile(`^Rollback to ([0-9]+)$`)
 
-// previousRevision is the revision a rollback goes back to. After a revision that did not deploy (a
-// failed upgrade or rollback helm left), the latest one that deployed: what ran before it. Otherwise
-// one upgrade back: the latest revision that deployed before the one the release runs came from (a
-// revision a rollback made comes from the one it copies) and that ran other values, so neither a
-// failed revision nor a copy of what runs (a rollback's, or an upgrade that changed nothing) is
-// chosen.
-func (in *Installer) previousRevision(ctx context.Context) (int, error) {
-	h, err := in.helmHistory(ctx)
-	if err != nil {
-		return 0, err
-	}
-	return h.previous(ctx)
-}
-
 // releaseHistory is a release's helm history, newest first, and the values of the revisions read
 // from it, each read once.
 type releaseHistory struct {
@@ -183,7 +168,7 @@ func (in *Installer) helmHistory(ctx context.Context) (*releaseHistory, error) {
 	return &releaseHistory{in: in, revs: hs, vals: map[int]*revValues{}}, nil
 }
 
-// values is revision rev's values (revisionValues), read once.
+// values is every value revision rev ran with, as canonical JSON (revisionRead), read once.
 func (h *releaseHistory) values(ctx context.Context, rev int) ([]byte, error) {
 	v, err := h.read(ctx, rev)
 	if err != nil {
@@ -230,6 +215,31 @@ type revValues struct {
 	ran  []byte
 }
 
+// deployed is what the release runs, as its latest revision's values record it (deployedIn); an
+// error when helm lists no revision.
+func (h *releaseHistory) deployed(ctx context.Context) (*deployed, error) {
+	k := h.in.O.K8s
+	rev := h.latest()
+	if rev == 0 {
+		return nil, fmt.Errorf("helm history lists no revision of %s in %s", k.Release, k.Namespace)
+	}
+	raw, err := h.values(ctx, rev)
+	if err != nil {
+		return nil, err
+	}
+	return h.in.deployedIn(raw, fmt.Sprintf("helm get values --revision %d", rev))
+}
+
+// revision is revision rev as the history lists it; nil when it does not.
+func (h *releaseHistory) revision(rev int) *helmRevision {
+	for i := range h.revs {
+		if h.revs[i].Revision == rev {
+			return &h.revs[i]
+		}
+	}
+	return nil
+}
+
 // latest is the newest revision; 0 when helm lists none.
 func (h *releaseHistory) latest() int {
 	if len(h.revs) == 0 {
@@ -238,7 +248,12 @@ func (h *releaseHistory) latest() int {
 	return h.revs[0].Revision
 }
 
-// previous is previousRevision on the history h holds; a noPrevious when there is none.
+// previous is the revision a rollback goes back to. After a revision that did not deploy (a
+// failed upgrade or rollback helm left), the latest one that deployed: what ran before it. Otherwise
+// one upgrade back: the latest revision that deployed before the one the release runs came from (a
+// revision a rollback made comes from the one it copies) and that ran other values, so neither a
+// failed revision nor a copy of what runs (a rollback's, or an upgrade that changed nothing) is
+// chosen. A noPrevious when h holds none.
 func (h *releaseHistory) previous(ctx context.Context) (int, error) {
 	k, hs := h.in.O.K8s, h.revs
 	if len(hs) == 0 {
@@ -305,11 +320,6 @@ func (h *releaseHistory) previous(ctx context.Context) (int, error) {
 func deployedOnce(h helmRevision) bool { return h.Status == "superseded" || h.Status == "deployed" }
 
 // revisionValues is every value a revision ran with, as canonical JSON.
-func (in *Installer) revisionValues(ctx context.Context, rev int) ([]byte, error) {
-	full, _, err := in.revisionRead(ctx, rev)
-	return full, err
-}
-
 // revisionRead is revision rev's values as canonical JSON, and as decoded from it.
 func (in *Installer) revisionRead(ctx context.Context, rev int) ([]byte, any, error) {
 	out, err := in.helm(ctx, Cmd{Args: []string{"get", "values", in.O.K8s.Release, "--revision", strconv.Itoa(rev), "--all", "--output", "json"}})
@@ -1079,20 +1089,25 @@ func (in *Installer) k8sCurrent(ctx context.Context) (*deployed, error) {
 // k8sLatest is k8sCurrent, which, with uninstalledToo, also reads a release uninstalled with its
 // history kept (what `k8s rollback` brings back) rather than refuse it.
 func (in *Installer) k8sLatest(ctx context.Context, uninstalledToo bool) (*deployed, error) {
-	rel, err := in.release(ctx)
-	if err != nil {
-		return nil, err
-	}
-	if rel == nil {
-		return nil, in.noRelease()
-	}
-	if rel.Status == "uninstalled" && !uninstalledToo {
-		return nil, in.uninstalledRelease()
-	}
-	if err := in.pending(rel); err != nil {
+	if err := in.k8sLatestStatus(ctx, uninstalledToo); err != nil {
 		return nil, err
 	}
 	return in.installedRelease(ctx)
+}
+
+// k8sLatestStatus is k8sLatest's refusals, on the release's status alone.
+func (in *Installer) k8sLatestStatus(ctx context.Context, uninstalledToo bool) error {
+	rel, err := in.release(ctx)
+	if err != nil {
+		return err
+	}
+	if rel == nil {
+		return in.noRelease()
+	}
+	if rel.Status == "uninstalled" && !uninstalledToo {
+		return in.uninstalledRelease()
+	}
+	return in.pending(rel)
 }
 
 // k8sNewer refuses a release that comes before the one the helm release runs, by the scheme the
@@ -1328,7 +1343,7 @@ func indent(s string) string {
 }
 
 // K8sRollback rolls the helm release back to a revision: by default the one before the last
-// upgrade (previousRevision).
+// upgrade (the history's previous).
 func (in *Installer) K8sRollback(ctx context.Context) (err error) {
 	var mutated bool
 	defer afterChange(&mutated, &err)
@@ -1343,18 +1358,27 @@ func (in *Installer) K8sRollback(ctx context.Context) (err error) {
 		return err
 	}
 	// An uninstall that kept the history is what a rollback brings back.
-	cur, err := in.k8sLatest(ctx, true)
+	if err := in.k8sLatestStatus(ctx, true); err != nil {
+		return err
+	}
+	// The history and each revision's values are read once: what the release runs (its latest
+	// revision), the revision to go back to, and the schema check share them.
+	h, err := in.helmHistory(ctx)
+	if err != nil {
+		return err
+	}
+	cur, err := h.deployed(ctx)
 	if err != nil {
 		return err
 	}
 	to := k.Revision
 	if to == 0 {
-		if to, err = in.previousRevision(ctx); err != nil {
+		if to, err = h.previous(ctx); err != nil {
 			return err
 		}
 	}
 	// The database is checked before helm is called, as Docker's and the VM's rollbacks check it.
-	if err := in.k8sRollbackCheck(ctx, cur, to); err != nil {
+	if err := in.k8sRollbackCheck(ctx, cur, to, h); err != nil {
 		return err
 	}
 	args := []string{"rollback", k.Release, strconv.Itoa(to), "--wait", "--timeout", k.Timeout.String()}
@@ -1537,6 +1561,9 @@ func (in *Installer) K8sUpgradeTo(ctx context.Context, v string, args []string) 
 	if err != nil {
 		return err
 	}
+	if err := in.unorderedTo(m, r.Version, "k8s upgrade", ""); err != nil {
+		return err
+	}
 	order, err := compareTo(m, r.Version)
 	if err != nil {
 		return err
@@ -1559,7 +1586,7 @@ func (in *Installer) K8sUpgradeTo(ctx context.Context, v string, args []string) 
 		return nil
 	}
 	in.O.logf("fetching the installer of %s %s (revision %d, %s)", name, m.ProjectVersion, m.Revision, m.Tag)
-	exe, err := in.fetchInstaller(ctx, c, prefix, m)
+	exe, _, err := in.fetchInstaller(ctx, c, prefix, m)
 	if err != nil {
 		return err
 	}
@@ -1629,7 +1656,7 @@ func (in *Installer) k8sRunning(ctx context.Context, cur *deployed, prefix strin
 	// Fetched to the system's temporary directory: an operator's current one may be read-only.
 	probe := &Installer{R: in.R, O: in.O}
 	probe.O.Dir = os.TempDir()
-	exe, err := probe.fetchInstaller(ctx, c, prefix, m)
+	exe, files, err := probe.fetchInstaller(ctx, c, prefix, m)
 	if err != nil {
 		return unknown(err)
 	}
@@ -1640,10 +1667,6 @@ func (in *Installer) k8sRunning(ctx context.Context, cur *deployed, prefix strin
 	}()
 	// Read as this Stowage reads it: a release it cannot read is not known, whatever the reason
 	// (nothing here runs a fetched installer).
-	files, err := payload.Read(exe)
-	if err != nil {
-		return unknown(err)
-	}
 	return keptOf(files)
 }
 

@@ -401,6 +401,12 @@ func joinList(own, base any) any {
 	return own
 }
 
+// VolumesFromSource returns the container or service a volumes_from value names, without its
+// access mode (:ro or :rw).
+func VolumesFromSource(v string) string {
+	return strings.TrimSuffix(strings.TrimSuffix(v, ":ro"), ":rw")
+}
+
 // PublishesBeyondLoopback reports whether a service's ports: publish one past this host: any
 // entry not bound to a loopback address or to ${STOWAGE_LOOPBACK_ADDRESS} (a bare port is
 // published on every address; an entry it cannot read counts as published).

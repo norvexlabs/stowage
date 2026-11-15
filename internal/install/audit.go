@@ -57,7 +57,7 @@ type auditSource struct {
 func (in *Installer) auditRelease(ctx context.Context, o AuditOptions) (*auditSource, error) {
 	src := &auditSource{m: in.R.Manifest, prefix: strings.TrimSuffix(in.R.Spec.Registry.Prefix, "/")}
 	env, envErr := in.open()
-	if envErr != nil && !notInstalled(in) {
+	if envErr != nil && !isAbsent(envErr) {
 		// An install there whose record does not read: its keys are not known, so none is assumed.
 		return nil, fmt.Errorf("%s: %w", in.O.Dir, envErr)
 	}

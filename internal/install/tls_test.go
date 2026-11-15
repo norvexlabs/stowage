@@ -836,6 +836,58 @@ func TestAFailedCertificateCopyLeavesNothing(t *testing.T) {
 	}
 }
 
+// readOnlyTemp is createTemp's stand-in for the files whose write a test fails: the file is
+// created, then handed back open for reading only, so the write into it fails.
+func readOnlyTemp(dir, pattern string) (*os.File, error) {
+	f, err := os.CreateTemp(dir, pattern)
+	if err != nil {
+		return nil, err
+	}
+	if err := f.Close(); err != nil {
+		return nil, err
+	}
+	return os.Open(f.Name())
+}
+
+// An .env that cannot be written, in a directory the run did not create, leaves it as it was: the
+// byo certificate's copy, the install's marker and the temporary file go, the operator's file
+// stays, and a later run installs.
+func TestAnEnvWriteThatFailsLeavesTheDirectoryAsItWas(t *testing.T) {
+	cert, key := writeCert(t, time.Now().Add(24*time.Hour), "*.example.com")
+	byo := func(o *Options) { tlsDomains(o); o.Cert, o.Key = cert, key }
+	e := newEnv(t)
+	_ = os.MkdirAll(e.dir, 0o755)
+	_ = os.WriteFile(filepath.Join(e.dir, "notes.txt"), []byte("mine"), 0o600)
+	t.Cleanup(func() { createTemp = os.CreateTemp })
+	createTemp = func(dir, pattern string) (*os.File, error) {
+		// .env alone: the marker is written right before it.
+		if _, err := os.Stat(filepath.Join(e.dir, installingFile)); err == nil && dir == e.dir {
+			return readOnlyTemp(dir, pattern)
+		}
+		return os.CreateTemp(dir, pattern)
+	}
+	if err := e.install(byo); err == nil || !strings.Contains(err.Error(), "bad file descriptor") {
+		t.Fatalf("err = %v", err)
+	}
+	entries, _ := os.ReadDir(e.dir)
+	var left []string
+	for _, d := range entries {
+		if d.Name() != "notes.txt" && d.Name() != lifecycleLock { // the lock's file the next install takes
+			left = append(left, d.Name())
+		}
+	}
+	if len(left) != 0 {
+		t.Errorf("left %q", left)
+	}
+	if _, err := os.Stat(filepath.Join(e.dir, "notes.txt")); err != nil {
+		t.Errorf("the operator's file: %v", err)
+	}
+	createTemp = os.CreateTemp
+	if err := e.install(byo); err != nil {
+		t.Fatalf("a later run: %v", err)
+	}
+}
+
 func TestOnATerminalAnExportedDomainNeverPicksTheMode(t *testing.T) {
 	e := newEnv(t)
 	e.r.Spec.Front.TLSModes = []string{"acme", "internal"}

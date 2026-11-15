@@ -819,6 +819,9 @@ func TestAChangedSetFlushesTheConnectionTracking(t *testing.T) {
 	start(0, "the same sets")
 	vals["PROBES"] = "192.0.2.7, 198.51.100.0/24"
 	start(1, "an element added")
+	// The same elements in another order, or another spacing: no change of the sets.
+	vals["PROBES"] = "198.51.100.0/24,  192.0.2.7"
+	start(0, "the same elements written otherwise")
 	vals["PROBES"] = "198.51.100.0/24"
 	start(1, "an element removed")
 	if !strings.Contains(log.String(), "flushed the host's connection-tracking table (services.ingest.flush_conntrack): the connections open before meet the tables and sets now loaded as new ones") {
@@ -932,6 +935,27 @@ func TestSetsDropped(t *testing.T) {
 		if got := setsDropped(c.prev, c.next); got != c.want {
 			t.Errorf("%q → %q: %v, want %v", c.prev, c.next, got, c.want)
 		}
+	}
+}
+
+func TestSetsDigest(t *testing.T) {
+	t.Parallel()
+	a := "flush set inet t s\nadd element inet t s { 192.0.2.1, 10.0.0.1 . 80 }\nflush set inet t u\n"
+	for other, same := range map[string]bool{
+		a: true,
+		"flush set inet t u\nflush set inet t s\nadd element inet t s { 10.0.0.1  .  80, 192.0.2.1, 192.0.2.1 }\n": true,
+		"flush set inet t s\nadd element inet t s { 192.0.2.1 }\nflush set inet t u\n":                             false,
+		"flush set inet t s\nadd element inet t s { 192.0.2.1, 10.0.0.1 . 80 }\n":                                  false,
+		"flush set inet t s\nflush set inet t u\nadd element inet t u { 192.0.2.1, 10.0.0.1 . 80 }\n":              false,
+		"flush set inet t s\nadd element inet t s { 192.0.2.1, 10.0.0.1 . 80 }\nflush set inet t u\nlist sets\n":   false,
+		"": false,
+	} {
+		if got := setsDigest(other) == setsDigest(a); got != same {
+			t.Errorf("%q: the same %v, want %v", other, got, same)
+		}
+	}
+	if setsDigest("") != setsDigest("\n") {
+		t.Error("an empty script")
 	}
 }
 

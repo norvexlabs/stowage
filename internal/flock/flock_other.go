@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"time"
 )
 
@@ -20,6 +21,21 @@ func Take(_ context.Context, path string, open func(string) (*os.File, error), _
 	}
 	return func() { f.Close() }, nil
 }
+
+// TakeFile is Take, which also returns the file it opened.
+func TakeFile(ctx context.Context, path string, open func(string) (*os.File, error), exclusive bool, poll time.Duration, waiting func()) (*os.File, func(), error) {
+	f, err := open(path)
+	if err != nil {
+		return nil, nil, err
+	}
+	return f, func() { f.Close() }, nil
+}
+
+// HandedEnv names a handed lock's descriptor; none is handed where flock does not exist.
+const HandedEnv = "STOWAGE_HANDED_LOCK"
+
+// Hand hands nothing where flock does not exist.
+func Hand(*exec.Cmd, *os.File) {}
 
 // Create opens a lock file read-write, made 0600 when absent.
 func Create(path string) (*os.File, error) {

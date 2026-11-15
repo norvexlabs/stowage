@@ -18,8 +18,6 @@ import (
 
 	"go.yaml.in/yaml/v3"
 
-	"github.com/norvexlabs/stowage/internal/chown"
-	"github.com/norvexlabs/stowage/internal/front"
 	"github.com/norvexlabs/stowage/internal/lint"
 	"github.com/norvexlabs/stowage/internal/providers"
 	"github.com/norvexlabs/stowage/internal/spec"
@@ -421,10 +419,8 @@ func (in *Installer) systemdBooted(ctx context.Context) bool {
 // allPreloaded reports whether the engine holds every image of the release the OS preloads.
 func (in *Installer) allPreloaded(ctx context.Context) bool {
 	keys := in.R.Spec.ImageNames()
-	for _, k := range []string{front.Key, chown.Key} { // the release's own images a start runs
-		if in.R.Manifest.Artifacts.Images[k] != "" {
-			keys = append(keys, k)
-		}
+	for _, o := range in.R.ownImages() {
+		keys = append(keys, o.key)
 	}
 	for _, k := range keys {
 		if _, err := in.O.Docker.Run(ctx, Cmd{Args: []string{"image", "inspect", "--format", "{{.Id}}", in.imageRef("", k)}}); err != nil {
@@ -607,13 +603,14 @@ func (in *Installer) Boot(ctx context.Context) (err error) {
 		}
 		_, cur, rev = runs(env)
 	}
-	if cur == m.ProjectVersion && rev == strconv.Itoa(m.Revision) {
-		if asked { // the crossing switched .env: made, its start brought up again here
-			if err := in.crossed(); err != nil {
-				return err
-			}
+	if isAt(m.ProjectVersion, m.Revision, cur, rev) {
+		// The crossing switched .env: made, its start brought up again here, its mark's removal
+		// failing or not.
+		var cerr error
+		if asked {
+			cerr = in.crossed()
 		}
-		return in.Install(ctx)
+		return errors.Join(cerr, in.Install(ctx))
 	}
 	if _, err := in.keptInstaller(ctx, name, cur, rev); err != nil {
 		return err
@@ -714,11 +711,11 @@ func (in *Installer) leftByRollback(version string, revision int) bool {
 		return false
 	}
 	_, v, rev := runs(env)
-	return v == version && rev == strconv.Itoa(revision)
+	return isAt(version, revision, v, rev)
 }
 
 // prevIs reports whether the release kept in PrevDir is version at revision.
 func (in *Installer) prevIs(version, revision string) bool {
 	st, err := in.readPrevState()
-	return err == nil && st != nil && st.ProjectVersion == version && strconv.Itoa(st.Revision) == revision
+	return err == nil && st != nil && isAt(st.ProjectVersion, st.Revision, version, revision)
 }

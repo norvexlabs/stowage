@@ -21,6 +21,7 @@ import (
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"golang.org/x/sync/errgroup"
 
+	"github.com/norvexlabs/stowage/internal/flock"
 	"github.com/norvexlabs/stowage/internal/payload"
 	"github.com/norvexlabs/stowage/internal/providers"
 	"github.com/norvexlabs/stowage/internal/registry"
@@ -59,7 +60,7 @@ func (in *Installer) UpgradeRevision(ctx context.Context, args []string) (bool, 
 	if err != nil {
 		return false, err
 	}
-	if cur != m.ProjectVersion || rev != strconv.Itoa(m.Revision) || !pinnedImages(env) {
+	if !isAt(m.ProjectVersion, m.Revision, cur, rev) || !pinnedImages(env) {
 		return false, nil
 	}
 	// What the install trusts, read from the installer it keeps: a failure there is that
@@ -165,6 +166,9 @@ func (in *Installer) UpgradeTo(ctx context.Context, v string, args []string) err
 	if err != nil {
 		return err
 	}
+	if err := in.unorderedTo(m, cur, "upgrade", ""); err != nil {
+		return err
+	}
 	// Ordered by the scheme the release records, as its own `upgrade` orders it; decided here
 	// first, so nothing is fetched to be refused.
 	order, err := compareTo(m, cur)
@@ -190,7 +194,7 @@ func (in *Installer) UpgradeTo(ctx context.Context, v string, args []string) err
 // its `upgrade` with args; the installer is kept when that fails.
 func (in *Installer) runFetched(ctx context.Context, c *registry.Client, prefix, name string, m *release.Manifest, args []string) error {
 	in.O.logf("fetching the installer of %s %s (revision %d, %s)", name, m.ProjectVersion, m.Revision, m.Tag)
-	exe, err := in.fetchInstaller(ctx, c, prefix, m)
+	exe, _, err := in.fetchInstaller(ctx, c, prefix, m)
 	if err != nil {
 		return err
 	}
@@ -235,6 +239,60 @@ func compareTo(m *release.Manifest, cur string) (int, error) {
 		return 0, fmt.Errorf("the install's version %q under %s's scheme: %w", cur, m.Tag, err)
 	}
 	return s.Compare(cur, m.ProjectVersion)
+}
+
+// unorderedTo refuses verb's --version to m when
+// the scheme m records is a `command` scheme and m's version is not cur as written, unless
+// O.Unordered: that scheme is the project's own command, which runs only where the project
+// publishes, so whether m comes after cur is not known here. Its fix names no command line, which
+// only the operator's shell holds (sudo, --dir, --channel, `k8s`, --namespace): it says to add
+// --unordered to the same command, or run verb plain — verb as the operator types it (`upgrade`,
+// `k8s upgrade`, `reset-db --new-baseline`). A plain verb follows the channel, which ship moves
+// only to a release the scheme orders after the channel's, and is never refused so. retry, when
+// not empty, replaces the fix's "add --unordered" (unorderedRefusal).
+func (in *Installer) unorderedTo(m *release.Manifest, cur, verb, retry string) error {
+	if !needsUnordered(m, cur) || in.O.Unordered {
+		return nil
+	}
+	return unorderedRefusal(m.Name, m.ProjectVersion, cur, verb, retry)
+}
+
+// unorderedRefusal is unorderedTo's refusal of verb's --version v, from cur, of project name: the
+// daemon's, and the VM client's before it asks for confirmation. Its reason says what --unordered
+// does with v: upgrades to it, or with verbNewBaseline wipes the data and installs it. Its fix
+// retries with --unordered: the same command with it added, or retry when not empty (the
+// operator's command over SSH, to a caller that may not send unordered: the app socket).
+func unorderedRefusal(name, v, cur, verb, retry string) error {
+	then := "--unordered upgrades to it once you know it does"
+	if verb == verbNewBaseline {
+		then = "--unordered wipes the data and installs it once you know it comes after"
+	}
+	if retry == "" {
+		retry = "run the same command again with --unordered added"
+	}
+	return refuse(retry+" (only if you checked "+v+" comes after "+cur+"), or a plain "+verb+" (the channel's release)",
+		"%s orders its versions with its own command, which runs only where the project publishes, never in an installer: whether %s comes after %s, which the install runs, is not known here: %s", name, v, cur, then)
+}
+
+// verbNewBaseline is reset-db's crossing as the operator types it, a verb of unorderedRefusal and
+// unorderedAlone.
+const verbNewBaseline = "reset-db --new-baseline"
+
+// needsUnordered reports whether a --version that finds the release m, from cur, needs
+// --unordered: the scheme m records is a `command` scheme and m's version is not cur as written.
+// It is the one rule unorderedTo refuses by and every hint naming such a --version decides by,
+// always with the release that --version finds (its latest revision on the channel), never another.
+func needsUnordered(m *release.Manifest, cur string) bool {
+	return m.Scheme.Provider == "command" && m.ProjectVersion != cur
+}
+
+// unorderedFlag is " --unordered" when a hint's --version needs it (needsUnordered on the release
+// that --version finds, which the hint holds).
+func unorderedFlag(needed bool) string {
+	if needed {
+		return " --unordered"
+	}
+	return ""
 }
 
 // isVersion reports whether m is version v by m's own scheme (by spelling for a `command` scheme).
@@ -514,41 +572,45 @@ func checkSigned(ctx context.Context, c *registry.Client, repo name.Repository, 
 }
 
 // fetchInstaller pulls m's installer image by digest, writes its executable in NextDir and returns
-// its path once its payload is checked to carry m: the manifest as published, but for the
-// installer's own digest and a yank, which the payload never records.
-func (in *Installer) fetchInstaller(ctx context.Context, c *registry.Client, prefix string, m *release.Manifest) (string, error) {
+// its path, with its payload, once that is checked to carry m: the manifest as published, but for
+// the installer's own digest and a yank, which the payload never records.
+func (in *Installer) fetchInstaller(ctx context.Context, c *registry.Client, prefix string, m *release.Manifest) (string, payload.Files, error) {
 	if m.Artifacts.Installer == "" {
-		return "", fmt.Errorf("%s %s (%s) has no installer", m.Name, m.ProjectVersion, m.Tag)
+		return "", nil, fmt.Errorf("%s %s (%s) has no installer", m.Name, m.ProjectVersion, m.Tag)
 	}
 	ref, err := c.Digest(prefix+"/"+m.Name+"-installer", m.Artifacts.Installer)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	img, err := c.Image(ctx, ref)
 	if err != nil {
-		return "", fmt.Errorf("%s: %w", ref, err)
+		return "", nil, fmt.Errorf("%s: %w", ref, err)
 	}
 	layers, err := img.Layers()
 	if err != nil {
-		return "", fmt.Errorf("%s: %w", ref, err)
+		return "", nil, fmt.Errorf("%s: %w", ref, err)
 	}
 	if len(layers) != 1 {
-		return "", fmt.Errorf("%s: %d layers, an installer image has one", ref, len(layers))
+		return "", nil, fmt.Errorf("%s: %d layers, an installer image has one", ref, len(layers))
 	}
 	dir, err := os.MkdirTemp(in.O.Dir, NextDir+"-") // 0700, one per run
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	exe := filepath.Join(dir, providers.Ctl(m.ShortName))
 	if err := extract(layers[0], providers.Ctl(m.ShortName), exe); err != nil {
 		_ = os.RemoveAll(dir)
-		return "", fmt.Errorf("%s: %w", ref, err)
+		return "", nil, fmt.Errorf("%s: %w", ref, err)
 	}
-	if err := carries(exe, m); err != nil {
+	files, err := readPayload(exe)
+	if err == nil {
+		err = carries(files, m)
+	}
+	if err != nil {
 		_ = os.RemoveAll(dir)
-		return "", fmt.Errorf("%s: %w", ref, err)
+		return "", nil, fmt.Errorf("%s: %w", ref, err)
 	}
-	return exe, nil
+	return exe, files, nil
 }
 
 // layer is the part of an image layer extract reads.
@@ -605,14 +667,13 @@ func extract(l layer, file, dst string) error {
 	return nil
 }
 
-// carries checks that the installer at exe carries the release m, by its release manifest alone:
-// the installer of a release a newer Stowage built carries a spec this one may not read, and its
-// own run reads it.
-func carries(exe string, m *release.Manifest) error {
-	files, err := payload.Read(exe)
-	if err != nil {
-		return err
-	}
+// readPayload reads an installer's payload (payload.Read); tests replace it to count the reads.
+var readPayload = payload.Read
+
+// carries checks that the installer whose payload is files carries the release m, by its release
+// manifest alone: the installer of a release a newer Stowage built carries a spec this one may not
+// read, and its own run reads it.
+func carries(files payload.Files, m *release.Manifest) error {
 	got, err := payloadRelease(files)
 	if err != nil {
 		return err
@@ -659,6 +720,9 @@ func (o *Options) execTo(ctx context.Context, exe string, args []string, out io.
 	}
 	cmd := exec.CommandContext(ctx, exe, args...)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, out, o.Log
+	if o.handLock != nil {
+		flock.Hand(cmd, o.handLock)
+	}
 	cmd.Cancel = func() error { return cmd.Process.Signal(os.Interrupt) }
 	err := cmd.Run()
 	var ee *exec.ExitError
@@ -666,4 +730,15 @@ func (o *Options) execTo(ctx context.Context, exe string, args []string, out io.
 		return ExitCode(ee.ExitCode())
 	}
 	return err
+}
+
+// unorderedAlone refuses verb's --unordered without --version, verb as the operator types it
+// (`upgrade`, `k8s upgrade`, verbNewBaseline): the plain verb takes the channel's release, which
+// ship moves only to one the scheme orders after it.
+func unorderedAlone(verb string) error {
+	plain := "a plain " + verb + " follows the channel"
+	if verb == verbNewBaseline {
+		plain = "a plain " + verb + " installs the channel's release"
+	}
+	return refuse("leave out --unordered, or give --version", "--unordered is for --version: %s, which ship moves only to a release the scheme orders after it", plain)
 }

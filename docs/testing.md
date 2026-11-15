@@ -78,7 +78,10 @@ live while its process is (its work directory records its PID in `.pid`, trusted
 namespace it records in `.pidns`), and a run it cannot judge so (another container's on the same
 Docker) for six hours after its object was made; a test install's
 stack in another container's work directory follows its run. A run's exit removes every container
-and network named with its id. The smoke test records its run the same way (its registry is
+and network named with its id. `make e2e` and `make smoke-install` also remove, at their end,
+every image reference the engine holds from their own registry (the installer and front `make e2e`
+pulls; the images the smoke test pushes and its installs pull), as the Docker suites remove what
+their installs pulled. The smoke test records its run the same way (its registry is
 `stowage-e2e-zot-<run>`, published on a port Docker picks). It removes the test registries
 (`stowage-e2e-zot-<run>`, `-mirror`, `-dav`), libvirt daemons
 (`stowage-e2e-libvirtd-<run>`), kind clusters and their networks (`stowage-e2e-<run>`) of dead

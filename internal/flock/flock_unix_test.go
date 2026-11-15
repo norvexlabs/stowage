@@ -5,9 +5,12 @@ package flock
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -166,4 +169,71 @@ func TestTakeNamesAStatError(t *testing.T) {
 	if _, err := Take(context.Background(), path, open, true, time.Millisecond, nil); !errors.Is(err, fs.ErrPermission) {
 		t.Fatalf("err = %v", err)
 	}
+}
+
+// A child handed the lock (Hand) takes it at once, as an exclusive take of the path while it does
+// not hold it, again after its release; a take while it holds it finds it held, as does a child
+// not handed it. The child's release never ends the parent's lock: it is held after the child
+// ended, until the parent releases it.
+func TestAHandedLockIsTheChilds(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "l")
+	f, unlock, err := TakeFile(context.Background(), path, create, true, 0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct {
+		handed bool
+		want   string
+	}{{true, "taken, held, taken again"}, {false, "held"}} {
+		cmd := exec.Command(os.Args[0], "-test.run=^TestHandedLockChild$")
+		cmd.Env = append(os.Environ(), "FLOCK_TEST_CHILD="+path)
+		if c.handed {
+			Hand(cmd, f)
+		}
+		out, err := cmd.CombinedOutput()
+		if got := strings.TrimSpace(strings.SplitN(string(out), "\n", 2)[0]); err != nil || got != c.want {
+			t.Errorf("handed %v: %v %q", c.handed, err, out)
+		}
+		if _, err := Take(context.Background(), path, create, true, 0, nil); !errors.Is(err, ErrHeld) {
+			t.Fatalf("handed %v: after the child, the parent's lock is not held: %v", c.handed, err)
+		}
+	}
+	unlock()
+	again, err := Take(context.Background(), path, create, true, 0, nil)
+	if err != nil {
+		t.Fatalf("after the parent's release: %v", err)
+	}
+	again()
+}
+
+// TestHandedLockChild is TestAHandedLockIsTheChilds's child: it takes the lock at
+// FLOCK_TEST_CHILD without waiting, again while it holds it, then once more after its release,
+// and prints what it found.
+func TestHandedLockChild(t *testing.T) {
+	path := os.Getenv("FLOCK_TEST_CHILD")
+	if path == "" {
+		t.Skip("run by TestAHandedLockIsTheChilds")
+	}
+	if os.Getenv(HandedEnv) != "" {
+		fmt.Println("the environment still names the lock")
+		return
+	}
+	first, err := Take(context.Background(), path, create, true, 0, nil)
+	if err != nil {
+		fmt.Println("held")
+		return
+	}
+	if _, err := Take(context.Background(), path, create, true, 0, nil); !errors.Is(err, ErrHeld) {
+		fmt.Println("taken twice")
+		return
+	}
+	first()
+	next, err := Take(context.Background(), path, create, true, 0, nil)
+	if err != nil {
+		fmt.Println("taken, held, then not taken:", err)
+		return
+	}
+	next()
+	fmt.Println("taken, held, taken again")
 }

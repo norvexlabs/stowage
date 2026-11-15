@@ -383,6 +383,15 @@ func newKubeEnv(t *testing.T, pull spec.Provider) *kubeEnv {
 	return e
 }
 
+// rollbackTarget is the revision `k8s rollback` goes back to: the release history's previous.
+func rollbackTarget(in *Installer) (int, error) {
+	h, err := in.helmHistory(context.Background())
+	if err != nil {
+		return 0, err
+	}
+	return h.previous(context.Background())
+}
+
 // ctlDigest is the installer image the release manifests published in a kubeEnv name.
 const ctlDigest = "sha256:5555555555555555555555555555555555555555555555555555555555555555"
 
@@ -1039,6 +1048,7 @@ func TestK8sRollbackAndStatus(t *testing.T) {
 	t.Parallel()
 	e := newKubeEnv(t, spec.Provider{Name: "none"})
 	e.runs("0.9.0", 2)
+	e.f.history = []helmRevision{{Revision: 1, Status: "superseded", Chart: "notes-0.1.0"}, {Revision: 2, Status: "deployed", Chart: "notes-0.2.0"}}
 	in := e.installer(func(o *Options) { o.K8s.Revision, o.K8s.Timeout = 3, 6*time.Minute })
 	if err := in.K8sRollback(context.Background()); err != nil {
 		t.Fatal(err)
@@ -1117,7 +1127,7 @@ func TestK8sRollbackGoesBackOneUpgrade(t *testing.T) {
 				e.f.revValues[h.Revision] = fmt.Sprintf(`{"n":9007199254740993,"same":1,"v":"%s"}`, values)
 			}
 		}
-		got, err := e.installer(nil).previousRevision(context.Background())
+		got, err := rollbackTarget(e.installer(nil))
 		if c.want == 0 {
 			if err == nil || !strings.Contains(err.Error(), "helm history notes --namespace notes` lists them") {
 				t.Errorf("%s: %d %v", c.name, got, err)
@@ -1150,11 +1160,14 @@ func TestK8sRollbackRefusesANegativeRevision(t *testing.T) {
 }
 
 // publishInstaller puts version's installer and its release manifest in the registry.
-func (e *kubeEnv) publish(version string, revision int) {
+func (e *kubeEnv) publish(version string, revision int, mms ...func(*release.Manifest)) {
 	t := e.t
 	r, exe := testInstallerOf(t, version, revision, e.spec, func(m *release.Manifest) {
 		m.Tag = fmt.Sprintf("%s-%d", version, revision)
 		m.Artifacts.Chart = &release.Chart{Repository: "charts/notes-stable", Version: "0.1.0", Digest: e.digest}
+		for _, mm := range mms {
+			mm(m)
+		}
 	})
 	raw, err := os.ReadFile(exe)
 	if err != nil {
@@ -1352,9 +1365,22 @@ func TestK8sRollbackChecksTheSchema(t *testing.T) {
 				}
 				return "Succeeded", c.barrier + "\n"
 			}
-			err := e.installer(func(o *Options) { o.K8s.Revision = 1 }).K8sRollback(context.Background())
+			// No --revision: the one before the last upgrade, 1, found from the history.
+			err := e.installer(nil).K8sRollback(context.Background())
 			if rolled := len(e.f.ran("helm rollback")) == 1; rolled != c.rolledBack || (c.want != "" && (err == nil || !strings.Contains(err.Error(), c.want))) || (c.want == "" && err != nil) {
 				t.Fatalf("rolled back %v: %v\n%s", rolled, err, e.log)
+			}
+			if c.rolledBack {
+				if got := strings.Join(e.f.ran("helm rollback")[0], " "); !strings.HasPrefix(got, "helm rollback notes 1 ") {
+					t.Errorf("%s", got)
+				}
+			}
+			// The history and each revision's values are read once; the release's values once
+			// more after helm, as they run then.
+			for prefix, want := range map[string]int{"helm history": 1, "helm get values notes --revision 1 ": 1, "helm get values notes --revision 2 ": 1, "helm get values notes --all": len(e.f.ran("helm rollback"))} {
+				if n := len(e.f.ran(prefix)); n != want {
+					t.Errorf("%s: %d reads, want %d", prefix, n, want)
+				}
 			}
 			if c.recorded != "" {
 				if len(e.f.schemaQs) == 0 {
@@ -1518,5 +1544,32 @@ func TestK8sVerbsRefuseAnUninstalledRelease(t *testing.T) {
 	e = uninstalled()
 	if err := e.installer(nil).K8sRollback(context.Background()); err != nil && strings.Contains(err.Error(), "is uninstalled") {
 		t.Errorf("rollback: %v", err)
+	}
+}
+
+// On Kubernetes too, `k8s upgrade --version` to another version under a `command` scheme is
+// refused unless --unordered.
+func TestK8sUpgradeVersionUnderACommandScheme(t *testing.T) {
+	t.Parallel()
+	e := newKubeEnv(t, spec.Provider{Name: "none"})
+	e.publish("2.0.0", 1, func(m *release.Manifest) {
+		m.Scheme = release.Scheme{Provider: "command", Config: map[string]any{"cmd": []any{"./scheme.sh"}}}
+	})
+	e.runs("1.0.0", 1)
+	for _, unordered := range []bool{false, true} {
+		e.ran = nil
+		in := e.installer(func(o *Options) { o.Unordered = unordered })
+		in.O.Exec = func(_ context.Context, exe string, args []string) error {
+			e.ran = append(e.ran, args)
+			return nil
+		}
+		err := in.K8sUpgradeTo(context.Background(), "2.0.0", nil)
+		r, _ := Refusal(err)
+		switch {
+		case !unordered && (r.Fix != "run the same command again with --unordered added (only if you checked 2.0.0 comes after 1.0.0), or a plain k8s upgrade (the channel's release)" || len(e.ran) != 0):
+			t.Errorf("refused: %v, ran %q", err, e.ran)
+		case unordered && (err != nil || len(e.ran) != 1):
+			t.Errorf("--unordered: %v, ran %q", err, e.ran)
+		}
 	}
 }

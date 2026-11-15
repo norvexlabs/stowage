@@ -551,6 +551,16 @@ remove_install() {
 		grep -F "$REG/${NAME:-notes}/" | sort -u | xargs -r docker rmi >/dev/null 2>&1 || true
 }
 
+# remove_registry_images, at exit (CLEANUP): every image the engine holds from this run's registry,
+# by each reference under $REG/ (a tag, or a digest it was pulled by): the image goes with its last
+# one. An image ID would also take the host's own tags of the same image.
+remove_registry_images() {
+	[[ -n ${REG:-} ]] || return 0
+	docker images -q | sort -u |
+		xargs -r docker image inspect --format '{{range .RepoTags}}{{println .}}{{end}}{{range .RepoDigests}}{{println .}}{{end}}' 2>/dev/null |
+		awk -v p="$REG/" 'index($0, p) == 1' | sort -u | xargs -r docker rmi >/dev/null 2>&1 || true
+}
+
 kept() { # <version>: the installer the install in $D keeps (CTL) is that release's
 	local h
 	h=$("${CTL[@]}" --help 2>&1) || true

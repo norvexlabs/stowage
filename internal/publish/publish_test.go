@@ -1881,3 +1881,32 @@ func TestASweepReadsEachTagOnce(t *testing.T) {
 		}
 	}
 }
+
+// Under a `command` scheme, as under every other, ship moves a channel only to a release the
+// scheme orders after the channel's: an earlier version ships and the channel stays; a later one
+// moves it. A plain upgrade, which follows the channel, relies on it.
+func TestShipOrdersTheChannelByACommandScheme(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	script := `#!/bin/sh
+in=$(cat)
+case $in in *scheme.validate*) echo '{"valid": true}'; exit 0 ;; esac
+a=$(printf '%s' "$in" | sed 's/.*"a":"\([^"]*\)".*/\1/')
+b=$(printf '%s' "$in" | sed 's/.*"b":"\([^"]*\)".*/\1/')
+if [ "$a" = "$b" ]; then r=0; elif [ "$(printf '%s\n%s\n' "$a" "$b" | sort -V | head -n1)" = "$a" ]; then r=-1; else r=1; fi
+echo "{\"result\": $r}"
+`
+	if err := testutil.WriteExecutable(filepath.Join(e.root, "scheme.sh"), []byte(script)); err != nil {
+		t.Fatal(err)
+	}
+	testutil.SetYAML(t, e.root, "stowage.yaml", []string{"version", "scheme"}, map[string]any{"provider": "command", "cmd": []string{"./scheme.sh"}})
+	e.bump("1.10.0")
+	later := e.mustShip("stable", 1)
+	eq(t, "pointer on 1.10.0", e.digest("notes-release", "stable"), later.Digest.String())
+	e.bump("1.9.0") // after 1.10.0 as a string, before it by the scheme
+	e.mustShip("stable", 1)
+	eq(t, "pointer stays on 1.10.0", e.digest("notes-release", "stable"), later.Digest.String())
+	e.bump("1.11.0")
+	next := e.mustShip("stable", 1)
+	eq(t, "pointer moved to 1.11.0", e.digest("notes-release", "stable"), next.Digest.String())
+}

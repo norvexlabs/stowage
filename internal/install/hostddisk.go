@@ -209,10 +209,10 @@ func (h *Hostd) pressurePost(ctx context.Context, dp *spec.DiskPressure, body Pr
 		return fmt.Sprintf("not sent: %s.post %q is not http://<service>:<port>/…", key, dp.Post), false, false
 	}
 	in, _ := h.run()
-	if notInstalled(in) {
+	env, err := in.open()
+	if isAbsent(err) {
 		return "not sent: not installed yet", false, true
 	}
-	env, err := in.open()
 	if err != nil {
 		return fmt.Sprintf("not sent: %v", err), false, true
 	}

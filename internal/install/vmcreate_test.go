@@ -508,6 +508,32 @@ func TestTheSecretsStepsBracketAnIPv6Address(t *testing.T) {
 	}
 }
 
+func TestIPv6BracketsAreAddedAndRemovedOnce(t *testing.T) {
+	t.Parallel()
+	for in, want := range map[string][2]string{ // bracketIPv6, unbracket
+		"2001:db8::7":    {"[2001:db8::7]", "2001:db8::7"},
+		"[2001:db8::7]":  {"[2001:db8::7]", "2001:db8::7"},
+		"::ffff:1.2.3.4": {"[::ffff:1.2.3.4]", "::ffff:1.2.3.4"},
+		"192.0.2.7":      {"192.0.2.7", "192.0.2.7"},
+		"vm.lan":         {"vm.lan", "vm.lan"},
+		"[vm.lan":        {"[vm.lan", "[vm.lan"},
+		"vm.lan]":        {"vm.lan]", "vm.lan]"},
+	} {
+		if got := bracketIPv6(in); got != want[0] {
+			t.Errorf("bracketIPv6(%q) = %q, want %q", in, got, want[0])
+		}
+		if got := unbracket(in); got != want[1] {
+			t.Errorf("unbracket(%q) = %q, want %q", in, got, want[1])
+		}
+	}
+	if got := urlHost("::1"); got != "[::1]" {
+		t.Errorf("urlHost(::1) = %q", got)
+	}
+	if got := urlHost("127.0.0.1"); got != "localhost" {
+		t.Errorf("urlHost(127.0.0.1) = %q", got)
+	}
+}
+
 func TestVMCreateWritesTheSSHSourcesAndTheTimeZone(t *testing.T) {
 	t.Parallel()
 	v := newVMCreate(t, "qcow2")
@@ -710,6 +736,25 @@ func TestVMCreateListsTheSecretInputsGivenOverSSH(t *testing.T) {
 	ud, _, _ := readSeed(t, filepath.Join(v.out, "notes-seed.iso"))
 	if strings.Contains(ud, "API_KEY") {
 		t.Errorf("the user-data names the secret:\n%s", ud)
+	}
+}
+
+// An input whose default names another input, given no value, is left out of the settings: the
+// VM's install expands it and records it as derived. One given keeps its value.
+func TestVMCreateLeavesDerivedInputsToTheInstall(t *testing.T) {
+	t.Parallel()
+	v := newVMCreate(t, "qcow2")
+	v.r.Spec.Inputs = append(v.r.Spec.Inputs, spec.Input{Key: "SMTP_HOST", Default: "smtp.${ADMIN_EMAIL}"}, spec.Input{Key: "REPLY_TO", Default: "${ADMIN_EMAIL}"})
+	err := v.create(VMCreate{Platform: "truenas", Hostname: "notes-1", User: "ops"}, func(o *Options) {
+		o.TLS, o.Set = "internal", map[string]string{"APP_DOMAIN": "app.example.org", "API_DOMAIN": "api.example.org", "REPLY_TO": "ops@example.org"}
+	})
+	if err != nil {
+		t.Fatalf("%v\n%s", err, v.log)
+	}
+	ud, _, _ := readSeed(t, filepath.Join(v.out, "notes-1-seed.iso"))
+	st, _ := cloudSettings(t, ud)
+	if _, ok := st.Inputs["SMTP_HOST"]; ok || st.Inputs["REPLY_TO"] != "ops@example.org" || st.Inputs["ADMIN_EMAIL"] != "admin@example.org" {
+		t.Errorf("settings' inputs %v", st.Inputs)
 	}
 }
 
@@ -1323,5 +1368,106 @@ func TestVMCreateWritesTheHostRecords(t *testing.T) {
 	}
 	if _, err := parseHosts(many, false); err == nil || !strings.Contains(err.Error(), "at most 64") {
 		t.Errorf("%d records: %v", maxHosts+1, err)
+	}
+}
+
+// The form offers the platforms of every disk set the release may boot, not only the first one's:
+// the channel's pointer holding a qcow2 disk and its disk set record an ova one, VMware is offered
+// and its choice boots the record's set.
+func TestVMCreateOffersEveryUsableSetsPlatforms(t *testing.T) {
+	t.Parallel()
+	v := newVMCreate(t, "qcow2", "ova")
+	all := maps.Clone(v.r.Manifest.Artifacts.Disks)
+	v.r.Manifest.Artifacts.Disks = map[string]string{"qcow2": all["qcow2"]}
+	gone := &release.BootDisks{Release: "0.8.0", Stowage: "0.6.0", Disks: map[string]string{"qcow2": "sha256:" + strings.Repeat("e", 64)}}
+	bootVia(t, v, gone, "0.6.0") // the pointer's release boots its own qcow2 disk
+	data, _ := json.Marshal(release.DiskSet{Channel: v.r.Manifest.Channel, Release: "0.9.0", Stowage: "0.6.0", Disks: map[string]string{"ova": all["ova"]}})
+	c := registry.New(nil)
+	tag, _ := c.Tag(v.prefix+"/notes-disk", release.DiskSetTag(v.r.Manifest.Channel))
+	if _, err := c.PutArtifact(context.Background(), tag, registry.Artifact{Type: release.DiskSetMediaType, Data: data}); err != nil {
+		t.Fatal(err)
+	}
+	p := &fakePrompter{answers: map[string]string{"--platform": "vmware", "--hostname": "asked", "--user": "ops", "--ssh-key": v.key,
+		"--network": "dhcp", "--tls": "internal", "APP_DOMAIN": "app.example.org", "API_DOMAIN": "api.example.org", "ADMIN_EMAIL": "a@example.org", "confirm": "yes"}}
+	if err := v.create(VMCreate{}, func(o *Options) { o.Prompt = p }); err != nil {
+		t.Fatalf("%v\n%s", err, v.log)
+	}
+	var offered []string
+	for _, ch := range p.forms[0].Questions[0].Choices {
+		offered = append(offered, ch.Value)
+	}
+	if !slices.Equal(offered, []string{"truenas", "proxmox", "libvirt", "vmware", "scaleway"}) {
+		t.Errorf("offered %v", offered)
+	}
+	if _, err := os.Stat(filepath.Join(v.out, "notes-1.0.0.ova")); err != nil {
+		t.Errorf("the record's ova disk: %v", err)
+	}
+	// One walk of the sets serves the question and the platform's lookup: the record is read once.
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if n := len(slices.DeleteFunc(slices.Clone(v.paths), func(p string) bool {
+		return !strings.HasPrefix(p, "GET ") || !strings.HasSuffix(p, "/notes-disk/manifests/"+release.DiskSetTag(v.r.Manifest.Channel))
+	})); n != 1 {
+		t.Errorf("the disk set record read %d times:\n%s", n, strings.Join(v.paths, "\n"))
+	}
+}
+
+// The platform question never fails where an explicit --platform succeeds: a disk set record that
+// cannot be read ends the question's walk, which offers the platforms of the sets read before it
+// and notes why; the chosen platform's lookup is then --platform's — the record's error for a
+// platform no set read holds. With no set read before it, the record's error is the question's.
+func TestVMCreatePlatformQuestionStopsAtAnUnreadableSource(t *testing.T) {
+	t.Parallel()
+	setup := func(t *testing.T, pointer bool) *vmCreate {
+		v := newVMCreate(t, "qcow2", "ova")
+		all := maps.Clone(v.r.Manifest.Artifacts.Disks)
+		v.r.Manifest.Artifacts.Disks = map[string]string{"qcow2": all["qcow2"]}
+		if pointer {
+			gone := &release.BootDisks{Release: "0.8.0", Stowage: "0.6.0", Disks: map[string]string{"qcow2": "sha256:" + strings.Repeat("e", 64)}}
+			bootVia(t, v, gone, "0.6.0")
+		} else {
+			v.r.Manifest.Artifacts.Disks = nil
+		}
+		c := registry.New(nil)
+		tag, _ := c.Tag(v.prefix+"/notes-disk", release.DiskSetTag(v.r.Manifest.Channel))
+		if _, err := c.PutArtifact(context.Background(), tag, registry.Artifact{Type: release.DiskSetMediaType, Data: []byte("{not json")}); err != nil {
+			t.Fatal(err)
+		}
+		return v
+	}
+	answers := func(platform string) *fakePrompter {
+		return &fakePrompter{answers: map[string]string{"--platform": platform, "--hostname": "asked", "--user": "ops", "--ssh-key": "",
+			"--network": "dhcp", "--tls": "internal", "APP_DOMAIN": "app.example.org", "API_DOMAIN": "api.example.org", "ADMIN_EMAIL": "a@example.org", "confirm": "yes"}}
+	}
+	v := setup(t, true)
+	p := answers("truenas")
+	p.answers["--ssh-key"] = v.key
+	if err := v.create(VMCreate{}, func(o *Options) { o.Prompt = p }); err != nil {
+		t.Fatalf("%v\n%s", err, v.log)
+	}
+	var offered []string
+	for _, ch := range p.forms[0].Questions[0].Choices {
+		offered = append(offered, ch.Value)
+	}
+	if !slices.Equal(offered, []string{"truenas", "proxmox", "libvirt", "scaleway"}) ||
+		!strings.Contains(v.log.String(), "note: the platforms offered are those of the disk sets read before one that could not be: "+v.prefix+"/notes-disk:set-stable: invalid character") {
+		t.Errorf("offered %v\n%s", offered, v.log)
+	}
+	// A platform no set read holds: the lookup is --platform's, failing on the record as it does.
+	v = setup(t, true)
+	p = answers("vmware")
+	p.answers["--ssh-key"] = v.key
+	asked := v.create(VMCreate{}, func(o *Options) { o.Prompt = p })
+	v = setup(t, true)
+	given := v.create(VMCreate{Platform: "vmware"}, nil)
+	at := func(err error) string { _, e, _ := strings.Cut(fmt.Sprint(err), "/notes-disk:"); return e } // each env its own registry
+	if asked == nil || given == nil || at(asked) != at(given) || !strings.Contains(at(given), "set-stable: invalid character") {
+		t.Errorf("asked: %v\ngiven: %v", asked, given)
+	}
+	// No set read before the record: the question fails with its error.
+	v = setup(t, false)
+	p = answers("truenas")
+	if err := v.create(VMCreate{}, func(o *Options) { o.Prompt = p }); err == nil || !strings.Contains(err.Error(), "invalid character") || len(p.forms) != 0 {
+		t.Errorf("%v, %d forms", err, len(p.forms))
 	}
 }

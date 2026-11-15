@@ -1866,7 +1866,9 @@ every shape, the VM end-to-end test upgrading through it), then the health gate.
   the front's ports, which matter most on Docker, often run on a workstation where a port is
   taken. The environment is not read on a re-run, so a lingering export never changes an install
   unseen; the changes are logged, not confirmed, so the same run works over SSH and in scripts.
-  Only a port the install does not hold is probed. `.env.prev` keeps the `.env` a change replaced
+  Only a port the install does not hold is probed. An input that took its default naming another
+  (`${KEY}`) is recorded as such (`STOWAGE_DERIVED`): a value derived, never chosen, follows what it
+  derives from, while one given once is the operator's and never recomputed. `.env.prev` keeps the `.env` a change replaced
   (not overwritten by a second try before a change comes up; an upgrade or a rollback removes
   it), as a secret input's old value is logged
   redacted and going back needs it. A plain re-run never reads the `byo`

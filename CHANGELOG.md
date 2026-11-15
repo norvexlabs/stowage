@@ -3,6 +3,56 @@
 Stowage's own releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
+## [0.39.0]
+
+### Added
+
+- Under a `command` version scheme, `upgrade --version`, `k8s upgrade --version` and the VM's
+  `reset-db --new-baseline --version` to a release other than the one the install runs are refused
+  unless `--unordered` is given: the scheme's command runs only where the project publishes, so
+  the installer cannot order the two releases; the refusal says to run the same command again with
+  `--unordered` added, or the plain verb. A plain `upgrade` follows the channel, which `ship`
+  moves forward only. `--unordered` without `--version` is refused. On the VM the host daemon's
+  `upgrade` and `reset-db` requests take `unordered` from the operator's socket alone (the app's
+  is refused), `<short>-stow` refuses before its confirmation, `updates --json` answers
+  `needs_unordered`; a hint naming the release the install runs never adds `--unordered`. The
+  app socket's refusal of `unordered` names the operator's command over SSH, and `reset-db
+  --new-baseline`'s refusals say it installs the channel's release, or with `--unordered` wipes
+  the data and installs the version named.
+
+### Changed
+
+- `restore --unrecorded` says, before it loads, what it trusts in each unchecked object: a dump's
+  statements run with the migrate role's rights, a volume's archive replaces the volume's files as
+  they are (owners and modes included).
+- A rollback holds the install's lock until the previous release's installer takes it over, so no
+  other run can come between them.
+- A re-run updates an input whose default names another input when that one changes, unless the
+  input was ever given a value.
+- A start-first overlap tells a missing `update_ready` file the same way on any engine; an
+  `update_socket` directory whose files total over 1 MiB fails the start.
+- `vm create` asks among every platform a disk set of the release can boot, reading the
+  registry's disk sets once; a disk-set source it cannot read ends the question with the
+  platforms read before it, and fails only where `--platform` would.
+- Lint judges `hooks.provision.returns` per shape: a key the install records on some shapes only is
+  allowed, and a key of the chart's provision ConfigMap counts as recorded on Kubernetes.
+- `make e2e` and `make smoke-install` remove the images they pulled or pushed from their test
+  registry.
+
+### Fixed
+
+- The VM's baseline hints name `sudo <short>-stow`, which reaches the host daemon.
+- A vendored chart archive whose entries start with `./` is read.
+- An install directory whose name holds a control character is refused.
+- `vm create` no longer writes an input that took its default from another input into the VM's
+  settings: the VM's install derives it, and a re-run expands it again.
+- `lint` reports every error of an L4 route's allowlist input, not only the first.
+- A start no longer flushes connection tracking when a set's input lists the same elements in
+  another order or spacing.
+- A start retried after an image left the engine applies the Docker host's firewall chains once.
+- `k8s rollback`, `k8s upgrade` and `reset-db` read helm, the fetched installer and the provision
+  hook once each.
+
 ## [0.38.0] - 2026-11-15
 
 ### Added

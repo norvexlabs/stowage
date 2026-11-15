@@ -6,9 +6,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"strconv"
 
-	"github.com/norvexlabs/stowage/internal/payload"
 	"github.com/norvexlabs/stowage/internal/release"
 )
 
@@ -60,18 +58,19 @@ func (in *Installer) upgradeCheck(ctx context.Context, env *EnvFile) error {
 // refuse (upgradeCheck), so a refusal never costs a reboot there and one back. The release's
 // installer is read as targetRelease reads it. An upgrade across a schema baseline is refused
 // (reset-db --new-baseline crosses it); of a payload this Stowage does not read (a newer
-// Stowage's) only that is checked: the boot decides the rest.
-func (h *Hostd) checkUpgrade(ctx context.Context, in *Installer, env *EnvFile, m *release.Manifest) error {
+// Stowage's) only that is checked: the boot decides the rest. channel is the one the upgrade was
+// asked with ("" for the install's), which the crossing's hint names again.
+func (h *Hostd) checkUpgrade(ctx context.Context, in *Installer, env *EnvFile, m *release.Manifest, channel string) error {
 	// An install that runs m already (a crossing whose boot fell back) moves no data: its OS is
 	// written again.
 	name, v, rev := runs(env)
-	if v == m.ProjectVersion && rev == strconv.Itoa(m.Revision) {
+	if isAt(m.ProjectVersion, m.Revision, v, rev) {
 		return nil
 	}
 	// The data is at the baseline of the release the install runs: the OS's, or — after a
 	// crossing whose boot fell back — the later one its own installer carries.
 	var running baselined = in
-	if this := in.R.Manifest; v != this.ProjectVersion || rev != strconv.Itoa(this.Revision) {
+	if this := in.R.Manifest; !isAt(this.ProjectVersion, this.Revision, v, rev) {
 		kept, err := in.keptInstaller(ctx, name, v, rev)
 		if err != nil {
 			return failAs(http.StatusConflict, err)
@@ -83,9 +82,19 @@ func (h *Hostd) checkUpgrade(ctx context.Context, in *Installer, env *EnvFile, m
 		return err
 	}
 	if from, to, ok := baselines(&in.O, running, k); ok && from != to {
-		way := fmt.Sprintf("`%s reset-db --new-baseline --version %s` wipes the data and installs it", in.R.Ctl(), m.ProjectVersion)
+		// reset-db's --version finds m, on the channel the upgrade was asked with: its --unordered is
+		// decided by m against the release the install runs (needsUnordered from runsVersion, as
+		// resetPlan orders it) — v, before and after an upgrade to v. upgrade's --version v names
+		// that release, which the daemon never refuses as unordered. Both are the VM's commands, as
+		// the operator types them over SSH (vmCtl).
+		ch := ""
+		if channel != "" {
+			ch = " --channel " + channel
+		}
+		reset := fmt.Sprintf("`%s reset-db --new-baseline%s --version %s%s` wipes the data and installs it", in.vmCtl(), ch, m.ProjectVersion, unorderedFlag(needsUnordered(m, h.runsVersion(env))))
+		way := reset
 		if running != baselined(in) { // reset-db resets the OS's release: the install's comes back first
-			way = fmt.Sprintf("`%s upgrade --version %s` writes the OS of the release the install runs, then `%s reset-db --new-baseline --version %s` wipes the data and installs it", in.R.Ctl(), v, in.R.Ctl(), m.ProjectVersion)
+			way = fmt.Sprintf("`%s upgrade --version %s` writes the OS of the release the install runs, then %s", in.vmCtl(), v, reset)
 		}
 		return refuseAs(http.StatusConflict, "stay on this release, or cross to it with its data wiped (reset-db --new-baseline)", "%s %s starts schema baseline %d, and the install runs %s %s, at baseline %d: its data cannot carry over, so its OS is not written; %s",
 			m.Name, m.ProjectVersion, to, m.Name, v, from, way)
@@ -112,15 +121,11 @@ func (h *Hostd) targetRelease(ctx context.Context, in *Installer, env *EnvFile, 
 	if err != nil {
 		return nil, err
 	}
-	exe, err := in.fetchInstaller(ctx, c, prefix, m)
+	exe, files, err := in.fetchInstaller(ctx, c, prefix, m)
 	if err != nil {
 		return nil, fail(http.StatusBadGateway, "the installer of %s: %v", m.Tag, err)
 	}
 	defer os.RemoveAll(filepath.Dir(exe))
-	files, err := payload.Read(exe)
-	if err != nil {
-		return nil, fail(http.StatusBadGateway, "the installer of %s: %v", m.Tag, err)
-	}
 	k, err := keptOf(files)
 	if err != nil {
 		return nil, fail(http.StatusBadGateway, "the installer of %s: %v", m.Tag, err)

@@ -245,7 +245,13 @@ func archivedChartYAML(tgz []byte) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
-		if dir, file, ok := strings.Cut(h.Name, "/"); ok && dir != "" && file == chartFile {
+		// An entry is read by its cleaned path ("./db/Chart.yaml" is "db/Chart.yaml"); one that
+		// leaves the archive's root is refused, as helm refuses it.
+		name := path.Clean(h.Name)
+		if path.IsAbs(name) || name == ".." || strings.HasPrefix(name, "../") {
+			return nil, fmt.Errorf("entry %q leaves the chart's directory", h.Name)
+		}
+		if dir, file, ok := strings.Cut(name, "/"); ok && dir != "" && file == chartFile {
 			return io.ReadAll(io.LimitReader(tr, maxFile))
 		}
 	}

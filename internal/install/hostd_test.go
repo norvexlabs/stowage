@@ -223,6 +223,23 @@ func call(t *testing.T, h http.Handler, method, path string, body any, out any) 
 	return w.Code
 }
 
+// asApp is the app socket of e's daemon, every request with the install's token (HostTokenVar),
+// which it writes to e's .env first.
+func asApp(t *testing.T, e *env) http.Handler {
+	t.Helper()
+	const token = "app-token"
+	f := e.readEnv()
+	f.Set(HostTokenVar, token)
+	if err := f.WriteFile(filepath.Join(e.dir, envName)); err != nil {
+		t.Fatal(err)
+	}
+	app := daemon(e, &fakeHost{}).AppHandler()
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r.Header.Set("Authorization", "Bearer "+token)
+		app.ServeHTTP(w, r)
+	})
+}
+
 // errOf is an error answer's message.
 // errOf is the daemon's error answer: its message, and a refusal's fix.
 type errOf struct {
@@ -625,6 +642,11 @@ func TestUpgradeWithoutRebootLeavesTheVMRunning(t *testing.T) {
 	}
 }
 
+// commandScheme records a `command` version scheme, which no installer runs.
+func commandScheme(m *release.Manifest) {
+	m.Scheme = release.Scheme{Provider: "command", Config: map[string]any{"cmd": []any{"./scheme.sh"}}}
+}
+
 // Each refusal of an upgrade is answered before anything runs, a rule's with its fix (the
 // client's exit 3); a bad request's with none.
 func TestUpgradeRefusals(t *testing.T) {
@@ -646,6 +668,12 @@ func TestUpgradeRefusals(t *testing.T) {
 		}, UpgradeRequest{Channel: "stable"}, "yanked: broken", "choose another release with --version: the channel's is yanked"},
 		"version not published": {func(p *pubEnv) { p.release("2.0.0", 1, nil) }, UpgradeRequest{Channel: "stable", Version: "4.0.0"}, "is not published on stable", "choose a version published on stable"},
 		"new revison":           {func(p *pubEnv) { p.release("1.0.0", 2, nil) }, UpgradeRequest{Channel: "stable"}, "", ""},
+		// A `command` scheme, which the daemon cannot run, orders no other version: an earlier
+		// one is taken only as the operator's (unordered), as Docker's `upgrade --version`.
+		"command scheme, another version": {func(p *pubEnv) { p.release("0.9.0", 1, commandScheme) }, UpgradeRequest{Channel: "stable", Version: "0.9.0"}, "own command, which runs only where the project publishes",
+			"run the same command again with --unordered added (only if you checked 0.9.0 comes after 1.0.0), or a plain upgrade (the channel's release)"},
+		"command scheme, unordered": {func(p *pubEnv) { p.release("0.9.0", 1, commandScheme) }, UpgradeRequest{Channel: "stable", Version: "0.9.0", Unordered: true}, "", ""},
+		"unordered alone":           {func(p *pubEnv) { p.release("2.0.0", 1, nil) }, UpgradeRequest{Channel: "stable", Unordered: true}, "--unordered is for --version", "leave out --unordered, or give --version"},
 	} {
 		p := vmPublished(t, spec.Provider{Name: "none"}, nil)
 		c.publish(p)
@@ -665,6 +693,75 @@ func TestUpgradeRefusals(t *testing.T) {
 		}
 		if len(host.calls()) > 0 {
 			t.Errorf("%s: ran %v", name, host.calls())
+		}
+	}
+}
+
+// Under a `command` scheme the daemon orders a --version from the release the install runs, not
+// the OS's: an install a crossing left on 2.0.0 over an OS of 1.0.0 takes --version 2.0.0, its
+// own release, without unordered, and names 2.0.0 in the refusal of 3.0.0.
+func TestTheDaemonOrdersAVersionFromTheInstalledRelease(t *testing.T) {
+	t.Parallel()
+	p := vmPublished(t, spec.Provider{Name: "none"}, nil)
+	_, installed := testInstallerWith(t, "2.0.0", p.spec)
+	if err := copyFile(installed, filepath.Join(p.env.dir, "notes-stow"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	env := p.env.readEnv()
+	env.Set("STOWAGE_PROJECT_VERSION", "2.0.0")
+	if err := env.WriteFile(filepath.Join(p.env.dir, envName)); err != nil {
+		t.Fatal(err)
+	}
+	p.release("2.0.0", 1, commandScheme)
+	p.release("3.0.0", 1, commandScheme)
+	hh := daemon(p.env, &fakeHost{}).Handler()
+	var e errOf
+	if code := call(t, hh, "POST", "/v1/upgrade", UpgradeRequest{Channel: "stable", Version: "2.0.0", DryRun: true}, &e); code != 200 {
+		t.Errorf("the installed release: %d %s (fix %q)", code, e.Error, e.Fix)
+	}
+	e = errOf{}
+	if code := call(t, hh, "POST", "/v1/upgrade", UpgradeRequest{Channel: "stable", Version: "3.0.0", DryRun: true}, &e); code != 409 ||
+		!strings.Contains(e.Error, "whether 3.0.0 comes after 2.0.0, which the install runs") ||
+		e.Fix != "run the same command again with --unordered added (only if you checked 3.0.0 comes after 2.0.0), or a plain upgrade (the channel's release)" {
+		t.Errorf("another release: %d %s (fix %q)", code, e.Error, e.Fix)
+	}
+	// The app, which may not send unordered, is told the operator's command over SSH.
+	e = errOf{}
+	if code := call(t, asApp(t, p.env), "POST", "/v1/upgrade", UpgradeRequest{Channel: "stable", Version: "3.0.0", DryRun: true}, &e); code != 409 ||
+		!strings.Contains(e.Error, "whether 3.0.0 comes after 2.0.0, which the install runs") ||
+		e.Fix != "run `sudo notes-stow upgrade --channel stable --version 3.0.0 --unordered` over SSH (only if you checked 3.0.0 comes after 2.0.0), or a plain upgrade (the channel's release)" {
+		t.Errorf("the app's: %d %s (fix %q)", code, e.Error, e.Fix)
+	}
+}
+
+// The daemon's updates says when its --version needs unordered: under a `command` scheme, a
+// release other than the one the install runs (2.0.0, over an OS of 1.0.0); never the install's
+// own, nor without --version, nor under a scheme the daemon orders.
+func TestTheDaemonSaysWhenAVersionNeedsUnordered(t *testing.T) {
+	t.Parallel()
+	for _, command := range []bool{false, true} {
+		p := vmPublished(t, spec.Provider{Name: "none"}, nil)
+		_, installed := testInstallerWith(t, "2.0.0", p.spec)
+		if err := copyFile(installed, filepath.Join(p.env.dir, "notes-stow"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		env := p.env.readEnv()
+		env.Set("STOWAGE_PROJECT_VERSION", "2.0.0")
+		if err := env.WriteFile(filepath.Join(p.env.dir, envName)); err != nil {
+			t.Fatal(err)
+		}
+		var scheme func(*release.Manifest)
+		if command {
+			scheme = commandScheme
+		}
+		p.release("2.0.0", 1, scheme)
+		p.release("3.0.0", 1, scheme)
+		hh := daemon(p.env, &fakeHost{}).Handler()
+		for q, want := range map[string]bool{"version=3.0.0": command, "version=2.0.0": false, "": false} {
+			var u Update
+			if code := call(t, hh, "GET", "/v1/updates?channel=stable&"+q, nil, &u); code != 200 || u.NeedsUnordered != want {
+				t.Errorf("command scheme %v, %q: %d %+v", command, q, code, u)
+			}
 		}
 	}
 }

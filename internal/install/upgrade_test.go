@@ -15,10 +15,12 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/norvexlabs/stowage/internal/command"
+	"github.com/norvexlabs/stowage/internal/flock"
 	"github.com/norvexlabs/stowage/internal/payload"
 	"github.com/norvexlabs/stowage/internal/release"
 	"github.com/norvexlabs/stowage/internal/spec"
@@ -99,6 +101,10 @@ func TestUpgradeKeepsTheRecordedValuesAndAddsTheNew(t *testing.T) {
 		if get(after, k) != get(before, k) {
 			t.Errorf("%s changed: %q → %q", k, get(before, k), get(after, k))
 		}
+	}
+	// The added input took its default naming another: recorded as derived, which a re-run follows.
+	if get(after, DerivedVar) != "SMTP_HOST" {
+		t.Errorf("%s = %q after the upgrade", DerivedVar, get(after, DerivedVar))
 	}
 	if get(after, "STOWAGE_PROJECT_VERSION") != "2.0.0" || get(after, "SMTP_HOST") != "smtp.admin@example.org" ||
 		len(get(after, "NEW_KEY")) != 32 || get(after, "NEW_FLAG") != "on" {
@@ -1948,13 +1954,61 @@ func TestARollbacksStartSaysWhetherTheHookWasSkipped(t *testing.T) {
 	} {
 		e.log.Reset()
 		in := e.installer(func(o *Options) { o.Exec = func(context.Context, string, []string) error { return nil } })
-		if err := in.startKept(context.Background(), c.m, c.rel, false, name == "a stopped run"); err != nil {
+		if err := in.startKept(context.Background(), c.m, c.rel, false, name == "a stopped run", func() {}); err != nil {
 			t.Fatalf("%s: %v", name, err)
 		}
 		said := strings.Contains(e.log.String(), "the provision hook is not run on a rollback")
 		if said != (c.want != "") || c.want != "" && !strings.Contains(e.log.String(), c.want) {
 			t.Errorf("%s: logged\n%s", name, e.log)
 		}
+	}
+}
+
+// A rollback's start holds the install's lock until the kept installer runs, handed to it when its
+// Stowage takes a handed lock, so no other run comes between them; to an earlier Stowage's,
+// which takes the lock anew, it is released first.
+func TestARollbacksStartHandsItsLockToTheKeptInstaller(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	if err := e.install(nil); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct {
+		stowage string
+		handed  bool
+	}{{lockHandedSince, true}, {"0.38.0", false}, {"", false}} {
+		in := e.installer(nil)
+		env, err := in.open()
+		if err != nil {
+			t.Fatal(err)
+		}
+		unlock, err := in.lockRun(context.Background(), env)
+		if err != nil {
+			t.Fatal(err)
+		}
+		m := *in.R.Manifest
+		m.StowageVersion = c.stowage
+		var held, given bool
+		in.O.Exec = func(context.Context, string, []string) error {
+			u, err := flock.Take(context.Background(), in.path(lifecycleLock), flock.Create, true, 0, nil)
+			if err == nil {
+				u()
+			}
+			held, given = errors.Is(err, flock.ErrHeld), in.O.handLock != nil
+			return nil
+		}
+		if err := in.startKept(context.Background(), &m, in.R, false, false, sync.OnceFunc(unlock)); err != nil {
+			t.Fatal(err)
+		}
+		if held != c.handed || given != c.handed {
+			t.Errorf("stowage %q: held %v, handed %v", c.stowage, held, given)
+		}
+		// Released once the child ended.
+		u, err := flock.Take(context.Background(), in.path(lifecycleLock), flock.Create, true, 0, nil)
+		if err != nil {
+			t.Fatalf("stowage %q: after the start: %v", c.stowage, err)
+		}
+		u()
 	}
 }
 
@@ -2079,5 +2133,23 @@ func TestAFailedUpgradeStartLeavesItsChangeMarked(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(e.dir, changingFile)); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("a marker after an upgrade that came up: %v", err)
+	}
+}
+
+// A rollback over an install kept under another short name is refused as the re-run and the
+// upgrade are, changing nothing.
+func TestARollbackOfAnotherShortNameIsRefused(t *testing.T) {
+	t.Parallel()
+	e := upgraded(t)
+	before := keptAs(t, e.dir, "nt")
+	e.docker.calls = nil
+	if err := e.rollback(nil); !isRefused(err) || !strings.Contains(err.Error(), "kept by nt-stow, not notes-stow") || !strings.Contains(err.Error(), "install this release afresh") {
+		t.Fatalf("%v", err)
+	}
+	if after := read(t, filepath.Join(e.dir, ".env")); after != string(before) || len(e.docker.ran("compose")) > 0 {
+		t.Errorf("the refused rollback changed the install: docker %v", e.docker.calls)
+	}
+	if _, err := os.Stat(filepath.Join(e.dir, PrevDir)); err != nil {
+		t.Errorf("the previous release is gone: %v", err)
 	}
 }

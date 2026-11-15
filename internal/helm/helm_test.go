@@ -161,37 +161,40 @@ func TestPackageWithoutValues(t *testing.T) {
 
 func TestLoadRefuses(t *testing.T) {
 	t.Parallel()
-	tgz := func(name string) string {
+	tgzAt := func(entry, name string) string {
 		var b bytes.Buffer
 		zw := gzip.NewWriter(&b)
 		tw := tar.NewWriter(zw)
 		data := "apiVersion: v2\nname: " + name + "\nversion: 1.0.0\n"
-		_ = tw.WriteHeader(&tar.Header{Name: name + "/Chart.yaml", Mode: 0o644, Size: int64(len(data))})
+		_ = tw.WriteHeader(&tar.Header{Name: entry, Mode: 0o644, Size: int64(len(data))})
 		_, _ = tw.Write([]byte(data))
 		_ = tw.Close()
 		_ = zw.Close()
 		return b.String()
 	}
+	tgz := func(name string) string { return tgzAt(name+"/Chart.yaml", name) }
 	deps := chartYAML + "dependencies:\n  - name: db\n    version: 0.1.0\n  - name: cache\n    version: 1.0.0\n"
 	for name, tc := range map[string]struct {
 		files map[string]string
 		want  string
 	}{
-		"no Chart.yaml":        {map[string]string{"values.yaml": "a: 1\n"}, "Chart.yaml is missing"},
-		"ignored Chart.yaml":   {map[string]string{"Chart.yaml": chartYAML, ".helmignore": "Chart.yaml\n"}, "Chart.yaml is missing"},
-		"apiVersion v1":        {map[string]string{"Chart.yaml": "apiVersion: v1\nname: notes\n"}, "apiVersion v2"},
-		"no name":              {map[string]string{"Chart.yaml": "apiVersion: v2\n"}, "not a chart name"},
-		"name with a slash":    {map[string]string{"Chart.yaml": "apiVersion: v2\nname: a/b\n"}, "not a chart name"},
-		"name ..":              {map[string]string{"Chart.yaml": "apiVersion: v2\nname: ..\n"}, "not a chart name"},
-		"library":              {map[string]string{"Chart.yaml": chartYAML + "type: library\n"}, "library chart"},
-		"other type":           {map[string]string{"Chart.yaml": chartYAML + "type: plugin\n"}, "must be application"},
-		"Chart.yaml not yaml":  {map[string]string{"Chart.yaml": "apiVersion: [v2\n"}, "Chart.yaml"},
-		"Chart.yaml no JSON":   {map[string]string{"Chart.yaml": chartYAML + "annotations: {[a]: b}\n"}, "Chart.yaml: yaml: invalid map key"},
-		"values a list":        {map[string]string{"Chart.yaml": chartYAML, "values.yaml": "- a\n"}, "must be a mapping"},
-		"values reserved key":  {map[string]string{"Chart.yaml": chartYAML, "values.yaml": "stowage: {}\n"}, "reserved"},
-		"dependency missing":   {map[string]string{"Chart.yaml": deps, "charts/db/Chart.yaml": "apiVersion: v2\nname: db\n"}, "cache are not vendored"},
-		"dependency by dir":    {map[string]string{"Chart.yaml": deps, "charts/cache/Chart.yaml": "apiVersion: v2\nname: other\n", "charts/db-0.1.0.tgz": tgz("db")}, "cache are not vendored"},
-		"bad vendored archive": {map[string]string{"Chart.yaml": chartYAML, "charts/db-0.1.0.tgz": "not gzip"}, "charts/db-0.1.0.tgz"},
+		"no Chart.yaml":               {map[string]string{"values.yaml": "a: 1\n"}, "Chart.yaml is missing"},
+		"ignored Chart.yaml":          {map[string]string{"Chart.yaml": chartYAML, ".helmignore": "Chart.yaml\n"}, "Chart.yaml is missing"},
+		"apiVersion v1":               {map[string]string{"Chart.yaml": "apiVersion: v1\nname: notes\n"}, "apiVersion v2"},
+		"no name":                     {map[string]string{"Chart.yaml": "apiVersion: v2\n"}, "not a chart name"},
+		"name with a slash":           {map[string]string{"Chart.yaml": "apiVersion: v2\nname: a/b\n"}, "not a chart name"},
+		"name ..":                     {map[string]string{"Chart.yaml": "apiVersion: v2\nname: ..\n"}, "not a chart name"},
+		"library":                     {map[string]string{"Chart.yaml": chartYAML + "type: library\n"}, "library chart"},
+		"other type":                  {map[string]string{"Chart.yaml": chartYAML + "type: plugin\n"}, "must be application"},
+		"Chart.yaml not yaml":         {map[string]string{"Chart.yaml": "apiVersion: [v2\n"}, "Chart.yaml"},
+		"Chart.yaml no JSON":          {map[string]string{"Chart.yaml": chartYAML + "annotations: {[a]: b}\n"}, "Chart.yaml: yaml: invalid map key"},
+		"values a list":               {map[string]string{"Chart.yaml": chartYAML, "values.yaml": "- a\n"}, "must be a mapping"},
+		"values reserved key":         {map[string]string{"Chart.yaml": chartYAML, "values.yaml": "stowage: {}\n"}, "reserved"},
+		"dependency missing":          {map[string]string{"Chart.yaml": deps, "charts/db/Chart.yaml": "apiVersion: v2\nname: db\n"}, "cache are not vendored"},
+		"dependency by dir":           {map[string]string{"Chart.yaml": deps, "charts/cache/Chart.yaml": "apiVersion: v2\nname: other\n", "charts/db-0.1.0.tgz": tgz("db")}, "cache are not vendored"},
+		"bad vendored archive":        {map[string]string{"Chart.yaml": chartYAML, "charts/db-0.1.0.tgz": "not gzip"}, "charts/db-0.1.0.tgz"},
+		"archive leaving its root":    {map[string]string{"Chart.yaml": chartYAML, "charts/db-0.1.0.tgz": tgzAt("../db/Chart.yaml", "db")}, "leaves the chart's directory"},
+		"archive at an absolute path": {map[string]string{"Chart.yaml": chartYAML, "charts/db-0.1.0.tgz": tgzAt("/db/Chart.yaml", "db")}, "leaves the chart's directory"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -204,6 +207,10 @@ func TestLoadRefuses(t *testing.T) {
 	// Positive control for the dependency cases: both vendored, one as a directory, one archived.
 	if _, err := Load(chart(t, map[string]string{"Chart.yaml": deps, "charts/db/Chart.yaml": "apiVersion: v2\nname: db\n", "charts/cache-1.0.0.tgz": tgz("cache")})); err != nil {
 		t.Fatalf("vendored dependencies refused: %v", err)
+	}
+	// An archive whose entries start with "./", as some packagers write them.
+	if _, err := Load(chart(t, map[string]string{"Chart.yaml": deps, "charts/db/Chart.yaml": "apiVersion: v2\nname: db\n", "charts/cache-1.0.0.tgz": tgzAt("./cache/Chart.yaml", "cache")})); err != nil {
+		t.Fatalf("an archive with ./ entries refused: %v", err)
 	}
 }
 

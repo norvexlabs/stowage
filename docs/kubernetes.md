@@ -16,7 +16,7 @@ the current directory. A release with no chart (published without the shape) is 
 <short>-stow k8s updates  [--namespace NS] [--release R] [--kube-context C] [--channel C] [--version V]
           [--image-registry PREFIX] [--registry-ca FILE] [--json]      # the release upgrade --version would move to
 <short>-stow k8s upgrade  [the same flags; --timeout 6m]                 # the NEW release's installer
-<short>-stow k8s upgrade --version V [the same flags, but --given, --kit] # fetches V's installer
+<short>-stow k8s upgrade --version V [the same flags, but --given, --kit] [--unordered] # fetches V's installer
 <short>-stow k8s rollback [--namespace NS] [--release R] [--kube-context C] [--revision N] [--timeout 6m] [--dry-run] [--json]
 <short>-stow k8s status   [--namespace NS] [--release R] [--kube-context C] [--json [--values]]
 <short>-stow k8s reset-db [--namespace NS] [--release R] [--kube-context C] [--yes] [--no-input]
@@ -211,7 +211,9 @@ the current directory. A release with no chart (published without the shape) is 
   registry the release records (or `--image-registry`), on its channel, refuses it unless it is
   signed by a key this `<short>-stow` carries (when it carries any), orders the release
   against it (already on it: a note; later: refused, naming `rollback`; a `pending-…` release is
-  refused first, as `upgrade` refuses it), then fetches V's
+  refused first, as `upgrade` refuses it; under a `command` scheme, another version than the
+  release's as written is refused unless `--unordered`, as on Docker ([installer](installer.md)),
+  its fix ending `or a plain k8s upgrade (the channel's release)`), then fetches V's
   installer into `./.stowage-next-<random>/` and runs its `k8s upgrade` with the other flags given.
 - `updates` says which release `upgrade --version` would move the release to, as the Docker
   shape's `updates` does ([installer](installer.md)): the latest revision of the version the

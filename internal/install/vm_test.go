@@ -1691,3 +1691,22 @@ func TestACrossingThatFailsIsTriedAgainByTheNextBoot(t *testing.T) {
 		t.Errorf("the mark outlived the crossing: %v", err)
 	}
 }
+
+// The VM's boot over an install kept under another short name is refused, its stack left down.
+func TestABootOfAnotherShortNameIsRefused(t *testing.T) {
+	t.Parallel()
+	e := vmEnv(t, "1.0.0")
+	if err := e.install(vm); err != nil {
+		t.Fatal(err)
+	}
+	keptAs(t, e.dir, "nt")
+	e.docker.calls = nil
+	in := e.installer(vm)
+	in.O.Exec = func(context.Context, string, []string) error { t.Error("ran another installer"); return nil }
+	if err := in.Boot(context.Background()); err == nil || !strings.Contains(err.Error(), "kept by nt-stow, not notes-stow") {
+		t.Fatalf("%v\n%s", err, e.log)
+	}
+	if len(e.docker.ran("compose")) > 0 {
+		t.Error("the stack was brought up")
+	}
+}

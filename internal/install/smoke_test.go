@@ -104,6 +104,38 @@ func smokeRun(t *testing.T) string {
 	}
 }
 
+// removeRegistryImages removes every image the engine holds from the registry at reg, by each of
+// its references there (a tag, or a digest it was pulled by): the image goes with its last one,
+// and the host's own references to the same image stay.
+func removeRegistryImages(t *testing.T, reg string) {
+	ids, err := exec.Command("docker", "images", "--quiet", "--no-trunc").Output()
+	if err != nil {
+		t.Logf("the registry's images are left: docker images: %v", err)
+		return
+	}
+	uniq := slices.Compact(slices.Sorted(slices.Values(strings.Fields(string(ids)))))
+	if len(uniq) == 0 {
+		return
+	}
+	out, err := exec.Command("docker", append([]string{"image", "inspect", "--format", "{{range .RepoTags}}{{println .}}{{end}}{{range .RepoDigests}}{{println .}}{{end}}"}, uniq...)...).Output()
+	if err != nil && len(out) == 0 { // an image removed since the listing fails the inspect: the others are read
+		t.Logf("the registry's images are left: docker image inspect: %v", err)
+		return
+	}
+	var refs []string
+	for _, ref := range strings.Fields(string(out)) {
+		if strings.HasPrefix(ref, reg+"/") && !slices.Contains(refs, ref) {
+			refs = append(refs, ref)
+		}
+	}
+	if len(refs) == 0 {
+		return
+	}
+	if out, err := exec.Command("docker", append([]string{"rmi"}, refs...)...).CombinedOutput(); err != nil {
+		t.Logf("the registry's images: docker rmi: %v: %s", err, out)
+	}
+}
+
 // publishedPort is the host port Docker published a container's port on.
 func publishedPort(t *testing.T, container string, port int) int {
 	t.Helper()
@@ -127,6 +159,8 @@ func TestSmokeInstallServesThroughTheFront(t *testing.T) {
 	t.Cleanup(func() { _ = exec.Command("docker", "rm", "-f", cname).Run() })
 	sh(t, "docker", "run", "-d", "--name", cname, "--user", fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid()), "-p", "127.0.0.1::5000", "-v", filepath.Join(work, "zot")+":/etc/zot", smokeRegistry, "serve", "/etc/zot/config.json")
 	reg := fmt.Sprintf("127.0.0.1:%d", publishedPort(t, cname, 5000))
+	// Run after the stacks' own cleanups, which free the images they used.
+	t.Cleanup(func() { removeRegistryImages(t, reg) })
 	for i := 0; i < 50; i++ {
 		if r, err := http.Get("http://" + reg + "/v2/"); err == nil {
 			r.Body.Close()

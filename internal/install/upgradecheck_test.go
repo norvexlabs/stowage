@@ -12,13 +12,17 @@ import (
 	"github.com/norvexlabs/stowage/internal/spec"
 )
 
-// releaseOf publishes version, revision 1, on stable with an OS bundle, its spec changed by mod.
-func (p *pubEnv) releaseOf(version string, mod func(*spec.Spec)) {
+// releaseOf publishes version, revision 1, on stable with an OS bundle, its spec changed by mod
+// and its manifest by each of mms.
+func (p *pubEnv) releaseOf(version string, mod func(*spec.Spec), mms ...func(*release.Manifest)) {
 	t := p.t
 	t.Helper()
 	tag := version + "-1"
 	r, exe := testInstallerKeys(t, version, 1, func(s *spec.Spec) { p.spec(s); mod(s) }, func(m *release.Manifest) {
 		m.Tag, m.Artifacts.OS = tag, "sha256:"+strings.Repeat("0", 64)
+		for _, mm := range mms {
+			mm(m)
+		}
 	}, p.keys)
 	raw, err := os.ReadFile(exe)
 	if err != nil {
@@ -91,21 +95,106 @@ func TestUpgradeWritesTheOSOfARouteTheBootAdds(t *testing.T) {
 }
 
 // An upgrade across a schema baseline is refused before its OS is written, naming the verb that
-// crosses it: the boot into it would refuse it, and the health gate go back.
+// crosses it, on the channel the upgrade was asked with: the boot into it would refuse it, and the
+// health gate go back.
 func TestUpgradeAcrossABaselineIsRefusedBeforeWritingTheOS(t *testing.T) {
 	t.Parallel()
 	p := vmPublished(t, spec.Provider{Name: "none"}, nil)
 	p.releaseOf("2.0.0", atBaseline(2))
+	env := p.env.readEnv()
+	env.Set(ChannelVar, "stable") // the channel an upgrade given none takes
+	if err := env.WriteFile(filepath.Join(p.env.dir, envName)); err != nil {
+		t.Fatal(err)
+	}
 	host := &fakeHost{}
 	hh := daemon(p.env, host).Handler()
-	var e errOf
-	if code := call(t, hh, "POST", "/v1/upgrade", UpgradeRequest{Channel: "stable"}, &e); code != 409 ||
-		!strings.Contains(e.Error, "notes 2.0.0 starts schema baseline 2, and the install runs notes 1.0.0, at baseline 1: its data cannot carry over, so its OS is not written; `notes-stow reset-db --new-baseline --version 2.0.0` wipes the data and installs it") ||
-		e.Fix != "stay on this release, or cross to it with its data wiped (reset-db --new-baseline)" {
-		t.Fatalf("%d %s (fix %q)", code, e.Error, e.Fix)
+	for channel, way := range map[string]string{
+		"stable": "`sudo notes-stow reset-db --new-baseline --channel stable --version 2.0.0` wipes the data and installs it",
+		"":       "`sudo notes-stow reset-db --new-baseline --version 2.0.0` wipes the data and installs it",
+	} {
+		var e errOf
+		if code := call(t, hh, "POST", "/v1/upgrade", UpgradeRequest{Channel: channel}, &e); code != 409 ||
+			!strings.Contains(e.Error, "notes 2.0.0 starts schema baseline 2, and the install runs notes 1.0.0, at baseline 1: its data cannot carry over, so its OS is not written; "+way) ||
+			e.Fix != "stay on this release, or cross to it with its data wiped (reset-db --new-baseline)" {
+			t.Fatalf("channel %q: %d %s (fix %q)", channel, code, e.Error, e.Fix)
+		}
 	}
 	if calls := fmt.Sprint(host.calls()); strings.Contains(calls, "kairos-agent") {
 		t.Errorf("the OS was written: %v", calls)
+	}
+}
+
+// Under a `command` scheme the crossing's hint names --unordered with the --version it names:
+// reset-db orders that version as an upgrade does (unorderedTo).
+func TestUpgradeAcrossABaselineHintsUnorderedUnderACommandScheme(t *testing.T) {
+	t.Parallel()
+	p := vmPublished(t, spec.Provider{Name: "none"}, nil)
+	p.releaseOf("2.0.0", atBaseline(2), commandScheme)
+	hh := daemon(p.env, &fakeHost{}).Handler()
+	var e errOf
+	if code := call(t, hh, "POST", "/v1/upgrade", UpgradeRequest{Channel: "stable", Version: "2.0.0", Unordered: true}, &e); code != 409 ||
+		!strings.Contains(e.Error, "`sudo notes-stow reset-db --new-baseline --channel stable --version 2.0.0 --unordered` wipes the data and installs it") {
+		t.Fatalf("%d %s (fix %q)", code, e.Error, e.Fix)
+	}
+}
+
+// reset-db --new-baseline --version under a `command` scheme, which the daemon cannot run, takes
+// another version than the OS's only with unordered, in the plan and in the job; unordered needs
+// a version; the channel's release, the OS's own version and another scheme's are not refused so.
+func TestTheDaemonsNewBaselineVersionIsUnorderedUnderACommandScheme(t *testing.T) {
+	t.Parallel()
+	p := vmPublished(t, spec.Provider{Name: "none"}, nil)
+	p.releaseOf("2.0.0", atBaseline(2), commandScheme)
+	host := &fakeHost{}
+	hh := daemon(p.env, host).Handler()
+	var e errOf
+	const fix = "run the same command again with --unordered added (only if you checked 2.0.0 comes after 1.0.0), or a plain reset-db --new-baseline (the channel's release)"
+	if code := call(t, hh, "GET", "/v1/reset-db?new_baseline=true&channel=stable&version=2.0.0", nil, &e); code != 409 ||
+		!strings.Contains(e.Error, "own command, which runs only where the project publishes") || e.Fix != fix {
+		t.Fatalf("ordered: %d %s (fix %q)", code, e.Error, e.Fix)
+	}
+	// The app, which may not send unordered, is told the operator's command over SSH.
+	e = errOf{}
+	if code := call(t, asApp(t, p.env), "GET", "/v1/reset-db?new_baseline=true&channel=stable&version=2.0.0", nil, &e); code != 409 ||
+		!strings.Contains(e.Error, "own command, which runs only where the project publishes") ||
+		e.Fix != "run `sudo notes-stow reset-db --new-baseline --channel stable --version 2.0.0 --unordered` over SSH (only if you checked 2.0.0 comes after 1.0.0), or a plain reset-db --new-baseline (the channel's release)" {
+		t.Fatalf("the app's: %d %s (fix %q)", code, e.Error, e.Fix)
+	}
+	e = errOf{}
+	if code := call(t, hh, "GET", "/v1/reset-db?new_baseline=true&channel=stable&unordered=true", nil, &e); code != 400 || !strings.Contains(e.Error, "--unordered is for --version") {
+		t.Fatalf("unordered alone: %d %s", code, e.Error)
+	}
+	// The OS's own version is not another: what refuses it is that it comes after nothing.
+	e = errOf{}
+	if code := call(t, hh, "GET", "/v1/reset-db?new_baseline=true&channel=stable&version=1.0.0", nil, &e); code != 409 || !strings.Contains(e.Error, "does not come after") {
+		t.Fatalf("the OS's version: %d %s", code, e.Error)
+	}
+	var plain ResetPlan
+	if code := call(t, hh, "GET", "/v1/reset-db?new_baseline=true&channel=stable", nil, &plain); code != 200 || plain.Target != (Version{"2.0.0", 1}) {
+		t.Fatalf("the channel's: %d %+v", code, plain)
+	}
+	var plan ResetPlan
+	if code := call(t, hh, "GET", "/v1/reset-db?new_baseline=true&channel=stable&version=2.0.0&unordered=true", nil, &plan); code != 200 || plan.Target != (Version{"2.0.0", 1}) {
+		t.Fatalf("unordered: %d %+v", code, plan)
+	}
+	// The job checks the order again: the POST without unordered is refused, its token kept.
+	e = errOf{}
+	req := ResetRequest{Confirm: &plan.Target, Token: plan.Token, NewBaseline: true, Channel: "stable", Version: "2.0.0"}
+	if code := call(t, hh, "POST", "/v1/reset-db", req, &e); code != 409 || e.Fix != fix {
+		t.Fatalf("POST ordered: %d %s (fix %q)", code, e.Error, e.Fix)
+	}
+	req.Unordered = true
+	if code := call(t, hh, "POST", "/v1/reset-db", req, &e); code != 202 {
+		t.Fatalf("POST unordered: %d %s", code, e.Error)
+	}
+	if j := waitJob(t, hh); j.State != "done" || !strings.Contains(fmt.Sprint(host.calls()), "kairos-agent upgrade") {
+		t.Fatalf("%+v %v", j, host.calls())
+	}
+	// Another scheme orders the version itself.
+	q := vmPublished(t, spec.Provider{Name: "none"}, nil)
+	q.releaseOf("2.0.0", atBaseline(2))
+	if code := call(t, daemon(q.env, &fakeHost{}).Handler(), "GET", "/v1/reset-db?new_baseline=true&channel=stable&version=2.0.0", nil, &plan); code != 200 || plan.Target != (Version{"2.0.0", 1}) {
+		t.Fatalf("semver: %d %+v", code, plan)
 	}
 }
 
@@ -183,7 +272,7 @@ func TestTheDaemonResetsToANewBaselineByItsOS(t *testing.T) {
 	// Within one baseline the flag is refused: an upgrade moves it.
 	q := vmPublished(t, spec.Provider{Name: "none"}, nil)
 	q.releaseOf("2.0.0", atBaseline(1))
-	if code := call(t, daemon(q.env, &fakeHost{}).Handler(), "GET", "/v1/reset-db?new_baseline=true&channel=stable", nil, &e); code != 409 || !strings.Contains(e.Error, "--new-baseline only crosses a baseline") {
+	if code := call(t, daemon(q.env, &fakeHost{}).Handler(), "GET", "/v1/reset-db?new_baseline=true&channel=stable", nil, &e); code != 409 || !strings.Contains(e.Error, "--new-baseline only crosses a baseline; `sudo notes-stow upgrade` moves it") {
 		t.Fatalf("same baseline: %d %s", code, e.Error)
 	}
 	// An upgrade written instead takes the mark away: it crosses no baseline.
@@ -345,6 +434,41 @@ func TestAnUpgradeFromACrossedInstallUsesItsBaseline(t *testing.T) {
 	}
 	if j := waitJob(t, hh); j.State != "done" {
 		t.Fatalf("%+v", j)
+	}
+}
+
+// Across a baseline from an install a crossing left on an older OS, the hint names the upgrade back
+// to the install's release, then the crossing. Under a `command` scheme the crossing names
+// --unordered and the upgrade, to the release the install runs, does not (it is never refused so);
+// under another scheme neither does.
+func TestACrossingFromACrossedInstallHintsUnorderedUnderACommandScheme(t *testing.T) {
+	t.Parallel()
+	for _, command := range []bool{false, true} {
+		p := vmPublished(t, spec.Provider{Name: "none"}, nil)
+		_, crossed := testInstallerWith(t, "2.0.0", func(s *spec.Spec) { p.spec(s); atBaseline(2)(s) })
+		if err := copyFile(crossed, filepath.Join(p.env.dir, "notes-stow"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		env := p.env.readEnv()
+		env.Set("STOWAGE_PROJECT_VERSION", "2.0.0")
+		env.Set(ChannelVar, "stable")
+		if err := env.WriteFile(filepath.Join(p.env.dir, envName)); err != nil {
+			t.Fatal(err)
+		}
+		var scheme []func(*release.Manifest)
+		if command {
+			scheme = append(scheme, commandScheme)
+		}
+		p.releaseOf("2.0.0", atBaseline(2), scheme...)
+		p.releaseOf("3.0.0", atBaseline(3), scheme...)
+		want := map[bool]string{
+			true:  "; `sudo notes-stow upgrade --version 2.0.0` writes the OS of the release the install runs, then `sudo notes-stow reset-db --new-baseline --channel stable --version 3.0.0 --unordered` wipes the data",
+			false: "; `sudo notes-stow upgrade --version 2.0.0` writes the OS of the release the install runs, then `sudo notes-stow reset-db --new-baseline --channel stable --version 3.0.0` wipes the data",
+		}[command]
+		var e errOf
+		if code := call(t, daemon(p.env, &fakeHost{}).Handler(), "POST", "/v1/upgrade", UpgradeRequest{Channel: "stable"}, &e); code != 409 || !strings.Contains(e.Error, want) {
+			t.Errorf("command scheme %v: %d %s", command, code, e.Error)
+		}
 	}
 }
 

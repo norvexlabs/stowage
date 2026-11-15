@@ -40,7 +40,7 @@ again, to copy an installer to another host.
 <short>-stow updates [--channel C] [--version V] [--json] [--dir D]     # the release upgrade --version would move to
 <short>-stow upgrade [--dir D] [--set KEY=VALUE]… [--set-file KEY=PATH]… [--answers FILE] [--no-input] # the NEW release's installer
           [--ports route=port]… [--offline] [--dry-run] [--no-provision] [--accessible] [--json]
-<short>-stow upgrade --version V [--dir D] [--set KEY=VALUE]… [--set-file KEY=PATH]… [--answers FILE] # fetches V's installer
+<short>-stow upgrade --version V [--dir D] [--set KEY=VALUE]… [--set-file KEY=PATH]… [--answers FILE] [--unordered] # fetches V's installer
           [--ports route=port]… [--no-input] [--accessible] [--dry-run] [--no-provision] [--json]
 <short>-stow rollback [--dir D] [--offline] [--dry-run] [--json]         # the installer the install keeps
 <short>-stow reset-db [--dir D] [--yes] [--no-input] [--accessible] [--dry-run] [--no-provision]
@@ -95,6 +95,9 @@ again, to copy an installer to another host.
   shared by several artifacts once. A release that is not signed, or was shipped before releases carried SBOMs (no
   scanner), is refused, and so is a directory holding another project's install.
 
+- A `--dir` (given or asked) whose name holds a control character (a line break, a tab, a NUL…)
+  is refused before anything is written (`--dir "…": a directory name cannot hold a control
+  character …`): the host's systemd units name it.
 - Defaults: `--dir ./<name>`, `--address 127.0.0.1` (a 127.x address or `::1`, recorded bare
   in `STOWAGE_LOOPBACK_ADDRESS` — Compose's port syntax takes `::1:8080:80` — and bracketed in
   the routes' URLs, `http://[::1]:8080`; `localhost` is 127.0.0.1, and its URL `http://localhost:…`;
@@ -347,7 +350,8 @@ again, to copy an installer to another host.
   its values win over the shell's environment on every run. Besides the values the compose file
   reads, it records the installer's own: `STOWAGE_REGISTRY` (the prefix images are pulled from),
   `STOWAGE_FRONT_IMAGE` (with a front), `STOWAGE_CHOWN_IMAGE` (a release with the volume helper), `STOWAGE_PORT_<ROUTE>` (loopback mode), `STOWAGE_HTTP_PORT` and
-  `STOWAGE_HTTPS_PORT` (TLS mode) and `COMPOSE_PROJECT_NAME`. Edit none of them by hand. The compose project is
+  `STOWAGE_HTTPS_PORT` (TLS mode), `STOWAGE_DERIVED` (the inputs holding their default that names another
+  input, never given: a re-run expands it again) and `COMPOSE_PROJECT_NAME`. Edit none of them by hand. The compose project is
   `<name>-<directory name>-<hash of its path>`, so two installs in two directories stay two
   projects. The install keeps the installer that wrote it as `<dir>/<short>-stow` (the running file
   itself, checked to carry the release).
@@ -361,7 +365,10 @@ again, to copy an installer to another host.
     expired). A loopback install takes no route's domain. The environment never changes a
     recorded value: an exported variable named like an input is ignored on a re-run. A key that
     names no input of the install is an error. An input whose default names another (`${KEY}`)
-    keeps its recorded value when that other changes: give it too.
+    and that was never given (`--set`, the environment, `--answers` or an answer on the form) follows
+    that other: a re-run that changes it expands the default again (logged as any change, `changing
+    KEY: old → new`; a value the input refuses is refused as a given one, naming the default). Given
+    once, the input keeps its value from then on.
   - `--ports route=port` (loopback mode) or `--http-port` and `--https-port` (TLS modes) move the
     front; the other mode's flags are refused. Only a port the install does not already hold is
     checked free, so two routes may swap theirs. A port of the front `.env` records that is no
@@ -478,8 +485,9 @@ again, to copy an installer to another host.
   is signed by a key the install trusts, as `upgrade --version` reads it (below). It prints
   `<release> on <channel>: <dir> runs <release>` and the release's changelog when it comes after
   the release the install runs (by the scheme the release records; revisions order one version;
-  a `command` scheme calls any other version later, as `upgrade --version` does: its order is the
-  project's command, which runs where the project publishes, never in an installer) and has an
+  a `command` scheme calls any other version later: its order is the project's command, which
+  runs where the project publishes, never in an installer, and the channel only moves forward by
+  it; `upgrade --version` to it then needs `--unordered`) and has an
   installer; else `no upgrade on <channel>: <dir> runs <release>, the release found is
   <release>`, or for a later release published without an installer `no upgrade on <channel>:
   <dir> runs <release>; <release>, after it, was published without an installer, which
@@ -515,8 +523,19 @@ again, to copy an installer to another host.
   verify**, above). Before anything is fetched, the install is ordered
   against it by that scheme: an install already on that release is left as it is, with a note;
   one on a later release or revision is refused, naming `rollback`, as is an install whose
-  version that scheme does not read. A `command` scheme is not ordered (the release's `upgrade`
-  says so): any other version is fetched and run.
+  version that scheme does not read. A `command` scheme cannot be ordered here: it is the
+  project's own command, which runs only where the project publishes, never in an installer. So
+  `--version` to another version than the install's (as written) is refused, nothing fetched
+  (`<name> orders its versions with its own command, which runs only where the project
+  publishes, never in an installer: whether V comes after <version>, which the install runs, is
+  not known here: --unordered upgrades to it once you know it does`, fix `run the same command
+  again with --unordered added (only if you checked V comes after <version>), or a plain upgrade
+  (the channel's release)`), unless `--unordered` is
+  given: then V is fetched and run (its `upgrade` says it does not check the order). The same
+  version as written orders its revisions as above. A plain `upgrade` (no `--version`) is never
+  refused so: it follows the channel, which `ship` moves only to a release the project's scheme,
+  its command included, orders after the channel's. `--unordered` without `--version` is refused
+  (`--unordered is for --version: …`), and is not passed on to the installer fetched.
   Otherwise the installer is pulled by the digest the manifest records
   (`<prefix>/<name>-installer@sha256:…`), written to `<dir>/.stowage-next-<random>/<short>-stow`
   (0700), and refused unless it carries that release: checked by its release manifest alone,
@@ -553,8 +572,9 @@ again, to copy an installer to another host.
   the data). One that cannot be read is logged and not checked by `upgrade`. On Docker,
   `reset-db --new-baseline` (below) is the way across; on the VM, `upgrade` refuses another
   baseline before it writes the OS (`… its data cannot carry over, so its OS is not written;
-  `<short>-stow reset-db --new-baseline` wipes the data and installs <v>`), and the VM's
-  `reset-db --new-baseline` is the way across.
+  `<short>-stow reset-db --new-baseline --version <v>` wipes the data and installs it`), and the
+  VM's `reset-db --new-baseline` is the way across ([VM](vm.md); `--unordered` with its
+  `--version` under a `command` scheme, as `upgrade --version`'s).
 - **Across Stowage versions.** The installer an install keeps is identified by its release
   manifest alone, whichever Stowage built it; its spec is read only when this Stowage reads the
   payload as its own (none is read leniently or migrated). A payload this Stowage refuses is put
@@ -587,7 +607,13 @@ again, to copy an installer to another host.
   on the data as the newer release left it, only if that release needs it`` (`hook, if it has
   one,` when another Stowage built that release, whose spec this one does not read)), on the VM its `boot` (which
   runs the provision hook, as every boot of the VM does); a release is always started by the
-  Stowage that built it. Should that start fail (another run holding the install meanwhile), the
+  Stowage that built it. The rollback holds the install's lock until that installer runs, and
+  hands it to an installer whose Stowage is 0.39.0 or later (its descriptor, named in the child's
+  `STOWAGE_HANDED_LOCK`, which the child takes as the install's lock and removes from its
+  environment), so no other run comes between them: the child's release of it never unlocks it,
+  and the rollback holds it until the child has ended; an earlier Stowage's installer takes the
+  lock anew, so it is released first. Should that start fail (another run holding the install
+  meanwhile, which only an earlier Stowage's start leaves room for), the
   install already records the previous release: running its installer again starts it. The release it leaves is kept in
   `.stowage-failed/`. Like an upgrade it switches `.env` before the installer, and keeps
   `.stowage-prev/` until the end: a rollback that stopped is finished by running it again (so is

@@ -83,6 +83,10 @@ type linter struct {
 	// could not answer (as opposed to refusing the version).
 	releasable   bool
 	schemeFailed bool
+	// provision is the provision hook once decoded (hooks), helmChart the chart once loaded
+	// (chart): hookReturns reads both.
+	provision *providers.ProvisionHook
+	helmChart *helm.Chart
 }
 
 func (l *linter) errf(where, format string, args ...any) {
@@ -136,6 +140,7 @@ func Run(root, specPath string, now time.Time) (*Result, error) {
 	l.secretsAndInputs()
 	l.hooks()
 	l.shapes()
+	l.hookReturns()
 	l.lockFile(filepath.Join(filepath.Dir(specPath), lock.FileName))
 	sort.SliceStable(l.findings, func(i, j int) bool {
 		return l.findings[i].Severity == Error && l.findings[j].Severity != Error
@@ -1506,17 +1511,22 @@ func (l *linter) l4Allow(where, key, upstream string, terminated bool) {
 		}
 	}
 	asked := func(sh string) bool { return len(in.Shapes) == 0 || slices.Contains(in.Shapes, sh) }
-	switch {
-	case len(enforcing) == 0:
+	// Each of the input's errors is reported: one fix never hides the next.
+	if len(enforcing) == 0 {
 		l.warnf(where, "only the VM's firewall and a Docker host's (tune --apply) enforce it, and the project has neither a docker nor a kairos shape: the route is open to every source")
-	case slices.ContainsFunc(enforcing, func(sh string) bool { return !asked(sh) }) || l.s.Shapes.Kubernetes != nil && asked("kubernetes"):
-		l.errf(where, "%s must be asked on the %s shapes alone (shapes: [%s]): their firewalls enforce it, a cluster's is its own", key, strings.Join(enforcing, " and "), strings.Join(enforcing, ", "))
-	case in.Secret:
-		l.errf(where, "%s is secret: the firewall's rules show it", key)
-	case in.Advanced:
-		l.errf(where, "%s is advanced, never asked: the route would refuse every source until it is set", key)
-	case in.When != "":
-		l.errf(where, "%s is asked only when %s: the firewall reads it in every mode", key, in.When)
+	} else {
+		if slices.ContainsFunc(enforcing, func(sh string) bool { return !asked(sh) }) || l.s.Shapes.Kubernetes != nil && asked("kubernetes") {
+			l.errf(where, "%s must be asked on the %s shapes alone (shapes: [%s]): their firewalls enforce it, a cluster's is its own", key, strings.Join(enforcing, " and "), strings.Join(enforcing, ", "))
+		}
+		if in.Secret {
+			l.errf(where, "%s is secret: the firewall's rules show it", key)
+		}
+		if in.Advanced {
+			l.errf(where, "%s is advanced, never asked: the route would refuse every source until it is set", key)
+		}
+		if in.When != "" {
+			l.errf(where, "%s is asked only when %s: the firewall reads it in every mode", key, in.When)
+		}
 	}
 	// The front filters a route it terminates TLS on itself, whatever network its upstream is on.
 	if always, _ := l.hostNetworkServices(); !terminated && l.s.Shapes.Docker != nil && slices.Contains(always, upstream) {
@@ -2076,6 +2086,7 @@ func (l *linter) hooks() {
 	if h, err := providers.DecodeProvision(l.s.Short(), l.s.Hooks.Provision, l.s.Images); err != nil {
 		l.errf("hooks.provision", "%v", err)
 	} else if h != nil {
+		l.provision = h
 		l.hookEnv(h)
 	}
 	if m := l.s.Hooks.Maintenance; m != nil && m.DiskPressure != nil {
@@ -2144,33 +2155,84 @@ func (l *linter) backupVolumes(vols []string) {
 }
 
 // hookEnv checks that each key the provision hook's env lists is one the install records (an
-// input, a secret or a safe default), and that no key its returns lists is: the install's value
-// would shadow it, and `provision --set` changes an input only through what records it.
+// input, a secret or a safe default).
 func (l *linter) hookEnv(h *providers.ProvisionHook) {
-	known := map[string]string{}
+	known := map[string]bool{}
 	for _, i := range l.s.Inputs {
-		known[i.Key] = "an input"
+		known[i.Key] = true
 	}
 	for _, sec := range l.s.Secrets {
-		known[sec.Key] = "a secret"
+		known[sec.Key] = true
 	}
 	for k := range l.s.SafeDefaults {
-		known[k] = "a safe default"
+		known[k] = true
 	}
 	for i, k := range h.Keys() {
-		if known[k] == "" {
+		if !known[k] {
 			l.errf(fmt.Sprintf("hooks.provision.env[%d]", i), "%s is no input, secret or safe default (the URLs and what the hook returned before it receives without asking)", k)
 		}
 	}
-	for _, d := range l.s.RouteDomains() {
-		if known[d.Input] == "" {
-			known[d.Input] = "a route domain"
+}
+
+// hookReturns checks that no key the provision hook's returns lists is a value the install
+// records on every shape the project has — an input asked there, a secret, a safe default, a
+// route's domain (Docker's and the VM's front), a key of the chart's ConfigMap
+// <release>-stowage-provision (Kubernetes) —: there the install's value would shadow it, and
+// `provision --set` changes an input only through what records it. A key recorded on some shapes
+// only is one the hook may return on the others.
+func (l *linter) hookReturns() {
+	h := l.provision
+	shapes := l.s.Shapes.Names()
+	if h == nil || len(shapes) == 0 {
+		return
+	}
+	var cm []string
+	if l.helmChart != nil {
+		cm = provisionConfigMapKeys(l.helmChart)
+	}
+	// recorded is what key is on shape: "" when the install there does not record it.
+	recorded := func(key, shape string) string {
+		if i, ok := l.s.Input(key); ok {
+			if shape == "kubernetes" && i.OnKubernetes() || shape != "kubernetes" && (len(i.Shapes) == 0 || slices.Contains(i.Shapes, shape)) {
+				return "an input"
+			}
 		}
+		if slices.ContainsFunc(l.s.Secrets, func(s spec.Secret) bool { return s.Key == key }) {
+			return "a secret"
+		}
+		if _, ok := l.s.SafeDefaults[key]; ok {
+			return "a safe default"
+		}
+		if shape == "kubernetes" {
+			if slices.Contains(cm, key) {
+				return "a key of the chart's ConfigMap <release>" + provisionConfigMap
+			}
+			return ""
+		}
+		if slices.ContainsFunc(l.s.RouteDomains(), func(d spec.RouteDomain) bool { return d.Input == key }) {
+			return "a route domain"
+		}
+		return ""
 	}
 	for i, k := range h.Returns {
-		if what := known[k]; what != "" {
-			l.errf(fmt.Sprintf("hooks.provision.returns[%d]", i), "%s is %s, a value the install records, not one the hook returns", k, what)
+		var whats []string
+		every := true
+		for _, sh := range shapes {
+			what := recorded(k, sh)
+			if what == "" {
+				every = false
+				break
+			}
+			whats = append(whats, what+" on "+sh)
 		}
+		if !every {
+			continue
+		}
+		what := strings.Join(whats, ", ")
+		if first, _, _ := strings.Cut(whats[0], " on "); !slices.ContainsFunc(whats, func(w string) bool { return !strings.HasPrefix(w, first+" on ") }) {
+			what = first // the same on every shape
+		}
+		l.errf(fmt.Sprintf("hooks.provision.returns[%d]", i), "%s is %s, a value the install records on every shape the project has, not one the hook returns", k, what)
 	}
 }
 
@@ -2183,6 +2245,7 @@ func (l *linter) chart(rel string) {
 		l.errf("shapes.kubernetes.chart", "%s: %v", rel, err)
 		return
 	}
+	l.helmChart = c
 	reads := func(key string) bool {
 		re := regexp.MustCompile(regexp.QuoteMeta(".Values."+helm.ValuesKey+"."+key) + `\b`)
 		for _, f := range c.Files {

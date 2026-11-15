@@ -52,9 +52,11 @@ import (
 //	                                     output cut at maxExecOutput (operator only)
 //	POST /v1/provision                   {set}: the provision hook again, set recorded first
 //	GET  /v1/updates                     ?channel=C&version=V: the release an upgrade would install
-//	POST /v1/upgrade                     {channel, version, confirm, reboot, skip_backup, dry_run}: an
-//	                                     upgrade job (202, JobStarted), a backup first when one is
-//	                                     configured; dry_run: every check before the job, no job (200, UpgradePlan)
+//	POST /v1/upgrade                     {channel, version, confirm, reboot, skip_backup, dry_run,
+//	                                     unordered}: an upgrade job (202, JobStarted), a backup first
+//	                                     when one is configured; dry_run: every check before the job,
+//	                                     no job (200, UpgradePlan); unordered: version under a `command`
+//	                                     scheme, refused without it (unorderedTo)
 //	GET  /v1/rollback                    {from, to}: what going back to the passive system would do
 //	POST /v1/rollback                    {confirm, dry_run}: a rollback job, choosing the passive
 //	                                     system, then a reboot (202, JobStarted); dry_run: every
@@ -203,6 +205,11 @@ type Hostd struct {
 	// (route6Watch).
 	route6Mu   sync.Mutex
 	route6Warn string
+	// tokenMu guards token, the app socket's token as .env held it when tokenFile described it
+	// (appToken).
+	tokenMu   sync.Mutex
+	token     string
+	tokenFile os.FileInfo
 }
 
 // job is a long run the daemon does on its own: an upgrade.
@@ -439,6 +446,9 @@ type Update struct {
 	// install's channel but was published without the installer `upgrade --version` fetches.
 	NoInstaller bool   `json:"no_installer,omitempty"`
 	Changelog   string `json:"changelog,omitempty"`
+	// NeedsUnordered: on the VM, the target --version names is under a `command` scheme and is not
+	// the release the install runs (needsUnordered): upgrade takes it only with --unordered.
+	NeedsUnordered bool `json:"needs_unordered,omitempty"`
 }
 
 // UpgradeRequest is POST /v1/upgrade's body.
@@ -453,6 +463,9 @@ type UpgradeRequest struct {
 	SkipBackup bool `json:"skip_backup,omitempty"`
 	// DryRun runs every check before the job and answers the UpgradePlan: no job, nothing written.
 	DryRun bool `json:"dry_run,omitempty"`
+	// Unordered, with Version, takes a version a `command` scheme would order, which the daemon
+	// cannot run (unorderedTo): the operator checked the order.
+	Unordered bool `json:"unordered,omitempty"`
 }
 
 // UpgradePlan is POST /v1/upgrade's answer to a dry run: every check passed, nothing started.
@@ -761,17 +774,13 @@ func (h *Hostd) routes(app bool) http.Handler {
 }
 
 // AppHandler is the API as the app socket serves it: each request must carry the install's token
-// (HostTokenVar), read from the install at every request, as "Authorization: Bearer <token>".
+// (HostTokenVar), as the install holds it now (appToken), as "Authorization: Bearer <token>".
 // Before the install records one, every request is refused. The operator's routes answer 403
 // (routes).
 func (h *Hostd) AppHandler() http.Handler {
 	api := h.routes(true)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		in, _ := h.run()
-		want := ""
-		if env, err := in.open(); err == nil {
-			want, _ = env.Get(HostTokenVar)
-		}
+		want := h.appToken()
 		got, bearer := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
 		if want == "" || !bearer || subtle.ConstantTimeCompare([]byte(got), []byte(want)) != 1 {
 			reply(w, http.StatusUnauthorized, map[string]string{"error": "the host daemon's app socket needs the install's token: Authorization: Bearer $" + HostTokenVar})
@@ -779,6 +788,37 @@ func (h *Hostd) AppHandler() http.Handler {
 		}
 		api.ServeHTTP(w, r)
 	})
+}
+
+// appToken is the install's token (HostTokenVar) as its .env holds it; "" before the install
+// records one. The file is read again only once it changed (another file, size or time) since the
+// read the token was kept from: it is stat'ed before it is read, so a change during the read is
+// seen at the next request.
+func (h *Hostd) appToken() string {
+	in, _ := h.run()
+	dir, err := filepath.Abs(in.O.Dir)
+	if err != nil {
+		return ""
+	}
+	path := filepath.Join(dir, envName)
+	fi, err := os.Stat(path)
+	h.tokenMu.Lock()
+	defer h.tokenMu.Unlock()
+	if err != nil {
+		h.tokenFile, h.token = nil, ""
+		return ""
+	}
+	if old := h.tokenFile; old != nil && os.SameFile(old, fi) && old.Size() == fi.Size() && old.ModTime().Equal(fi.ModTime()) {
+		return h.token
+	}
+	env, err := ReadEnvFile(path)
+	if err != nil {
+		h.tokenFile, h.token = nil, ""
+		return ""
+	}
+	h.token, _ = env.Get(HostTokenVar)
+	h.tokenFile = fi
+	return h.token
 }
 
 // httpError is an error with the status it is answered with.
@@ -865,7 +905,7 @@ func (h *Hostd) run() (*Installer, *bytes.Buffer) {
 // shape's: the daemon's options say which), answered 409.
 func (h *Hostd) installed(in *Installer) (*EnvFile, error) {
 	env, err := in.open()
-	if r, ok := Refusal(err); ok && r.Absent {
+	if isAbsent(err) {
 		return nil, failAs(http.StatusConflict, err)
 	}
 	return env, err
@@ -933,10 +973,10 @@ func (h *Hostd) installedSpec(in *Installer, name, version string, revision int)
 	return s
 }
 
-// notInstalled reports whether in has no install yet.
+// notInstalled reports whether in has no install yet: open's absent refusal, the one rule of it.
 func notInstalled(in *Installer) bool {
-	_, err := os.Stat(filepath.Join(in.O.Dir, envName))
-	return errors.Is(err, os.ErrNotExist)
+	_, err := in.open()
+	return isAbsent(err)
 }
 
 func (h *Hostd) status(w http.ResponseWriter, r *http.Request) {
@@ -1380,6 +1420,9 @@ type ResetRequest struct {
 	NewBaseline bool   `json:"new_baseline,omitempty"`
 	Channel     string `json:"channel,omitempty"`
 	Version     string `json:"version,omitempty"`
+	// Unordered, with Version, takes a version a `command` scheme would order, which the daemon
+	// cannot run (unorderedTo): the operator checked the order.
+	Unordered bool `json:"unordered,omitempty"`
 }
 
 // ResetPlan is what GET /v1/reset-db answers: the release the job resets and what it does.
@@ -1424,7 +1467,13 @@ func (h *Hostd) resetDBPlan(w http.ResponseWriter, r *http.Request) {
 	in, _ := h.run()
 	q := r.URL.Query()
 	nb := q.Get("new_baseline") == "true"
-	p, _, _, err := h.resetPlan(r.Context(), in, nb, q.Get("channel"), q.Get("version"), "", true)
+	// The app may look at a plan, not one the operator alone vouches for (POST reset-db is the
+	// operator's); unordered without a version is resetPlan's refusal, whoever asks.
+	if q.Get("unordered") == "true" && q.Get("version") != "" && fromApp(r) {
+		replyErr(w, unorderedOperators(in, verbNewBaseline, q.Get("channel"), q.Get("version")))
+		return
+	}
+	p, _, _, err := h.resetPlan(r.Context(), in, nb, q.Get("channel"), q.Get("version"), q.Get("unordered") == "true", fromApp(r), "", true)
 	if err != nil {
 		replyErr(w, err)
 		return
@@ -1446,10 +1495,15 @@ func (h *Hostd) resetDBPlan(w http.ResponseWriter, r *http.Request) {
 // resetPlan is resetCheck's plan, or with newBaseline the crossing's: the release found on
 // channel (version's latest revision, or the channel's latest) as an upgrade finds it, m, which
 // must come after this OS's and start another schema baseline, both told, and take the install's
-// values as its boot takes them (upgradeCheck); prefix is the registry it comes from.
-func (h *Hostd) resetPlan(ctx context.Context, in *Installer, newBaseline bool, channel, version, token string, shown bool) (p ResetPlan, m *release.Manifest, prefix string, err error) {
+// values as its boot takes them (upgradeCheck); prefix is the registry it comes from. A version
+// named under a `command` scheme is taken only with unordered, as an upgrade's (unorderedTo);
+// asked by the app (app), its refusal names the operator's command over SSH (unorderedCmd).
+func (h *Hostd) resetPlan(ctx context.Context, in *Installer, newBaseline bool, channel, version string, unordered, app bool, token string, shown bool) (p ResetPlan, m *release.Manifest, prefix string, err error) {
 	if !newBaseline && (channel != "" || version != "") {
 		return ResetPlan{}, nil, "", fail(http.StatusBadRequest, "a channel or a version names the release new_baseline installs: reset-db resets the release the OS carries")
+	}
+	if unordered && version == "" {
+		return ResetPlan{}, nil, "", failAs(http.StatusBadRequest, unorderedAlone(verbNewBaseline))
 	}
 	if p, err = h.resetCheck(ctx, in); err != nil || !newBaseline {
 		return p, nil, "", err
@@ -1460,6 +1514,13 @@ func (h *Hostd) resetPlan(ctx context.Context, in *Installer, newBaseline bool, 
 	}
 	if m, _, err = h.target(ctx, in, env, channel, version); err != nil {
 		return ResetPlan{}, nil, "", err
+	}
+	// after() calls any other version of a `command` scheme later, which it may not be.
+	in.O.Unordered = unordered
+	if version != "" {
+		if err := in.unorderedTo(m, h.runsVersion(env), verbNewBaseline, appRetry(in, app, verbNewBaseline, channel, version)); err != nil {
+			return ResetPlan{}, nil, "", failAs(http.StatusConflict, err)
+		}
 	}
 	newer, err := h.after(m)
 	switch {
@@ -1491,7 +1552,7 @@ func (h *Hostd) resetPlan(ctx context.Context, in *Installer, newBaseline bool, 
 	case !ok:
 		return ResetPlan{}, nil, "", fail(http.StatusConflict, "the schema baseline of %s %s or of %s %s cannot be told (the daemon's log says why): --new-baseline never wipes on a guess", m.Name, h.R.Manifest.ProjectVersion, m.Name, m.ProjectVersion)
 	case from == to:
-		return ResetPlan{}, nil, "", fail(http.StatusConflict, "%s %s starts the schema baseline the install runs: --new-baseline only crosses a baseline; `%s upgrade` moves it", m.Name, m.ProjectVersion, in.R.Ctl())
+		return ResetPlan{}, nil, "", fail(http.StatusConflict, "%s %s starts the schema baseline the install runs: --new-baseline only crosses a baseline; `%s upgrade` moves it", m.Name, m.ProjectVersion, in.vmCtl())
 	}
 	// What the boot's crossing wipes is told now, before the OS is written.
 	t, err := in.wipeOf(k)
@@ -1573,7 +1634,7 @@ func (h *Hostd) resetDB(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	in, _ := h.run()
-	p, m, prefix, err := h.resetPlan(r.Context(), in, req.NewBaseline, req.Channel, req.Version, req.Token, false)
+	p, m, prefix, err := h.resetPlan(r.Context(), in, req.NewBaseline, req.Channel, req.Version, req.Unordered, false, req.Token, false)
 	if err != nil {
 		replyErr(w, err)
 		return
@@ -1659,6 +1720,43 @@ func (h *Hostd) after(m *release.Manifest) (bool, error) {
 	return laterRelease(m, h.R.Manifest.ProjectVersion, h.R.Manifest.Revision)
 }
 
+// runsVersion is the version of the release the install runs, which a --version is ordered from
+// (unorderedTo); before the first install (env the settings'), the OS's, which that install makes.
+func (h *Hostd) runsVersion(env *EnvFile) string {
+	if _, v, _ := runs(env); v != "" {
+		return v
+	}
+	return h.R.Manifest.ProjectVersion
+}
+
+// unorderedOperators is the app socket's refusal of unordered on verb (`upgrade`, `reset-db
+// --new-baseline`) to version on channel: the operator alone vouches for an order the daemon
+// cannot check. Its fix is the operator's command over SSH (unorderedCmd).
+func unorderedOperators(in *Installer, verb, channel, version string) error {
+	return refuseAs(http.StatusForbidden, "run `"+unorderedCmd(in, verb, channel, version)+"` over SSH",
+		"unordered is the operator's: the operator alone vouches for an order this daemon cannot check")
+}
+
+// unorderedCmd is verb to version (on channel, when given) with --unordered, as the operator types
+// it on the VM over SSH (vmCtl).
+func unorderedCmd(in *Installer, verb, channel, version string) string {
+	c := in.vmCtl() + " " + verb
+	if channel != "" {
+		c += " --channel " + channel
+	}
+	return c + " --version " + version + " --unordered"
+}
+
+// appRetry is unorderedTo's retry for a request: from the app socket (app), which may not send
+// unordered (unorderedOperators), the operator's command over SSH; else none, the same command
+// with --unordered added.
+func appRetry(in *Installer, app bool, verb, channel, version string) string {
+	if !app {
+		return ""
+	}
+	return "run `" + unorderedCmd(in, verb, channel, version) + "` over SSH"
+}
+
 func (h *Hostd) updates(w http.ResponseWriter, r *http.Request) {
 	in, _ := h.run()
 	env, _, err := h.source(in)
@@ -1688,6 +1786,7 @@ func (h *Hostd) updates(w http.ResponseWriter, r *http.Request) {
 	reply(w, http.StatusOK, Update{
 		Channel: channel, Current: Version{cur.ProjectVersion, cur.Revision}, Target: Version{m.ProjectVersion, m.Revision},
 		Available: (newer || rewrite) && m.Yanked == nil && m.Artifacts.OS != "" && !left, LeftByRollback: left, Rewrite: rewrite, Installed: installed, Passive: !h.Docker && bootMode(h.O.cos()) == "passive", Changelog: m.Changelog.Project,
+		NeedsUnordered: q.Get("version") != "" && needsUnordered(m, h.runsVersion(env)),
 	})
 }
 
@@ -1698,8 +1797,8 @@ func (h *Hostd) updates(w http.ResponseWriter, r *http.Request) {
 func (h *Hostd) rewrites(m *release.Manifest, env *EnvFile) bool {
 	_, v, rev := runs(env)
 	this := h.R.Manifest
-	return !h.Docker && bootMode(h.O.cos()) == "passive" && m.ProjectVersion == this.ProjectVersion && m.Revision == this.Revision &&
-		v == this.ProjectVersion && rev == strconv.Itoa(this.Revision)
+	return !h.Docker && bootMode(h.O.cos()) == "passive" && isAt(m.ProjectVersion, m.Revision, this.ProjectVersion, strconv.Itoa(this.Revision)) &&
+		isAt(this.ProjectVersion, this.Revision, v, rev)
 }
 
 // booting refuses until <name>.service ran (active, or failed): before, the boot is queued or is
@@ -2017,7 +2116,16 @@ func (h *Hostd) upgrade(w http.ResponseWriter, r *http.Request) {
 		replyErr(w, fail(http.StatusForbidden, "skip_backup is the operator's: upgrade --skip-backup over SSH"))
 		return
 	}
+	// unordered is the operator vouching that the version named comes after the installed one.
+	if req.Unordered && req.Version == "" {
+		replyErr(w, failAs(http.StatusBadRequest, unorderedAlone("upgrade")))
+		return
+	}
 	in, _ := h.run()
+	if req.Unordered && fromApp(r) {
+		replyErr(w, unorderedOperators(in, "upgrade", req.Channel, req.Version))
+		return
+	}
 	env, first, err := h.source(in)
 	if err != nil {
 		replyErr(w, err)
@@ -2050,6 +2158,15 @@ func (h *Hostd) upgrade(w http.ResponseWriter, r *http.Request) {
 		replyErr(w, err)
 		return
 	}
+	// A version named under a `command` scheme is taken as Docker's `upgrade --version` takes it:
+	// after() calls any other version later, which it may not be.
+	in.O.Unordered = req.Unordered
+	if req.Version != "" {
+		if err := in.unorderedTo(m, h.runsVersion(env), "upgrade", appRetry(in, fromApp(r), "upgrade", req.Channel, req.Version)); err != nil {
+			replyErr(w, failAs(http.StatusConflict, err))
+			return
+		}
+	}
 	newer, err := h.after(m)
 	rewrite := !newer && h.rewrites(m, env)
 	switch {
@@ -2075,7 +2192,7 @@ func (h *Hostd) upgrade(w http.ResponseWriter, r *http.Request) {
 	// What the boot into it would refuse is refused now, before its OS is written. The release
 	// the install runs, rewritten, has nothing to refuse.
 	if !first && !rewrite {
-		if err := h.checkUpgrade(r.Context(), in, env, m); err != nil {
+		if err := h.checkUpgrade(r.Context(), in, env, m, req.Channel); err != nil {
 			replyErr(w, err)
 			return
 		}

@@ -18,6 +18,7 @@ import (
 	"testing"
 
 	"github.com/norvexlabs/stowage/internal/payload"
+	"github.com/norvexlabs/stowage/internal/release"
 	"github.com/norvexlabs/stowage/internal/spec"
 )
 
@@ -466,7 +467,7 @@ func TestK8sPreviousRevisionIgnoresTheRecordedInstaller(t *testing.T) {
 	}
 	e.f.history = []helmRevision{{Revision: 1, Status: "superseded", Chart: "notes-0.1.0"}, {Revision: 2, Status: "superseded", Chart: "notes-0.2.0"}, {Revision: 3, Status: "deployed", Chart: "notes-0.2.0"}}
 	e.f.revValues = map[int]string{1: ran("0.9.0", "x@sha256:9", "0.9.0/1"), 2: ran("1.0.0", "x@sha256:1", "1.0.0/1"), 3: ran("1.0.0", "", "1.0.0/1")}
-	if n, err := e.installer(nil).previousRevision(context.Background()); err != nil || n != 1 {
+	if n, err := rollbackTarget(e.installer(nil)); err != nil || n != 1 {
 		t.Errorf("revision %d, %v", n, err)
 	}
 	// Every value a deploy records about itself is left out of the comparison, each alone.
@@ -481,19 +482,19 @@ func TestK8sPreviousRevisionIgnoresTheRecordedInstaller(t *testing.T) {
 			return string(raw)
 		}
 		e.f.revValues = map[int]string{1: `{"stowage":{"registry":"old"}}`, 2: with("one"), 3: with("two")}
-		if n, err := e.installer(nil).previousRevision(context.Background()); err != nil || n != 1 {
+		if n, err := rollbackTarget(e.installer(nil)); err != nil || n != 1 {
 			t.Errorf("%v: revision %d, %v", path, n, err)
 		}
 	}
 	// Named here too, so a key dropped from selfRecorded fails.
 	e.f.revValues = map[int]string{1: `{"stowage":{"registry":"old"}}`, 2: `{"stowage":{"registry":"r","schemaFrom":"5","release":{"installer":"a","installerRelease":"1.0.0/1"}}}`, 3: `{"stowage":{"registry":"r","schemaFrom":"6","release":{"installer":"","installerRelease":"1.0.0/2"}}}`}
-	if n, err := e.installer(nil).previousRevision(context.Background()); err != nil || n != 1 {
+	if n, err := rollbackTarget(e.installer(nil)); err != nil || n != 1 {
 		t.Errorf("revision %d, %v", n, err)
 	}
 	// Another value is another run.
 	e.f.revValues = map[int]string{1: ran("0.9.0", "x@sha256:9", "0.9.0/1"), 2: ran("1.0.0", "x@sha256:1", "1.0.0/1")}
 	e.f.revValues[3] = `{"stowage":{"registry":"other","release":{"name":"notes","version":"1.0.0","revision":1}}}`
-	if n, err := e.installer(nil).previousRevision(context.Background()); err != nil || n != 2 {
+	if n, err := rollbackTarget(e.installer(nil)); err != nil || n != 2 {
 		t.Errorf("revision %d, %v", n, err)
 	}
 }
@@ -513,7 +514,7 @@ func TestK8sStatusJSONAfterAnUninstallThatKeptItsHistory(t *testing.T) {
 		st.Helm != (HelmStatus{2, "uninstalled"}) || st.Inputs != nil || st.Channel != "" || st.Registry != "" {
 		t.Errorf("%s", out)
 	}
-	if n, err := e.installer(nil).previousRevision(context.Background()); err != nil || n != 2 {
+	if n, err := rollbackTarget(e.installer(nil)); err != nil || n != 2 {
 		t.Errorf("rollback goes to %d, %v", n, err)
 	}
 }
@@ -1031,5 +1032,31 @@ func TestK8sStatusAfterUninstallKeepHistory(t *testing.T) {
 	if !strings.Contains(out, "release notes in notes is uninstalled, its history kept (revision 2): `notes-stow k8s rollback --namespace notes --release notes` brings back notes 1.0.0 (revision 1)") ||
 		strings.Contains(out, "registry  ") {
 		t.Errorf("%s", out)
+	}
+}
+
+// isAt is the one test of which release a record names: its version and its revision, the
+// revision as the install records it.
+func TestIsAt(t *testing.T) {
+	t.Parallel()
+	for _, c := range []struct {
+		v                 string
+		r                 int
+		version, revision string
+		want              bool
+	}{
+		{"1.0.0", 2, "1.0.0", "2", true},
+		{"1.0.0", 2, "1.0.1", "2", false},
+		{"1.0.0", 2, "1.0.0", "3", false},
+		{"1.0.0", 2, "1.0.0", "02", false},
+		{"1.0.0", 2, "1.0.0", "", false},
+	} {
+		if got := isAt(c.v, c.r, c.version, c.revision); got != c.want {
+			t.Errorf("isAt(%q, %d, %q, %q) = %v", c.v, c.r, c.version, c.revision, got)
+		}
+	}
+	m := &release.Manifest{Name: "notes", ProjectVersion: "1.0.0", Revision: 2}
+	if !isRelease(m, "notes", "1.0.0", 2) || isRelease(m, "other", "1.0.0", 2) || isRelease(m, "notes", "1.0.0", 3) {
+		t.Error("isRelease does not test the name, the version and the revision")
 	}
 }

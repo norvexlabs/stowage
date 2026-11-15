@@ -814,3 +814,82 @@ func TestReadChannelFailsOnTheFirstUnreadableManifest(t *testing.T) {
 		t.Fatalf("%v", err)
 	}
 }
+
+// Under a `command` scheme, which an installer cannot run, `upgrade --version` to another version
+// is refused unless --unordered; the same version as written is not, and the release's own plain
+// upgrade is never refused so.
+func TestUpgradeVersionUnderACommandScheme(t *testing.T) {
+	t.Parallel()
+	p := published(t, spec.Provider{Name: "none"}, nil)
+	command := func(m *release.Manifest) {
+		m.Scheme = release.Scheme{Provider: "command", Config: map[string]any{"cmd": []any{"./scheme.sh"}}}
+	}
+	p.publish("2.0.0", 1, command, nil)
+	p.publish("1.0.0", 2, command, nil)
+	run := func(v string, unordered bool) error {
+		in := p.installer(func(o *Options) { o.Unordered = unordered })
+		in.O.Exec = func(ctx context.Context, exe string, args []string) error {
+			p.ran = append(p.ran, args)
+			files, err := payload.Read(exe)
+			if err != nil {
+				return err
+			}
+			r, err := Load(files)
+			if err != nil {
+				return err
+			}
+			next := p.installer(nil) // the fetched release's plain upgrade, without --unordered
+			next.R, next.O.Self = r, exe
+			return next.Upgrade(ctx)
+		}
+		return in.UpgradeTo(context.Background(), v, nil)
+	}
+	err := run("2.0.0", false)
+	if r, ok := Refusal(err); !ok || !strings.Contains(r.Reason, "own command, which runs only where the project publishes") ||
+		r.Fix != "run the same command again with --unordered added (only if you checked 2.0.0 comes after 1.0.0), or a plain upgrade (the channel's release)" || len(p.ran) != 0 {
+		t.Fatalf("%v, ran %q", err, p.ran)
+	}
+	// The same version as written: its revisions are ordered, nothing refused.
+	if err := run("1.0.0", false); err != nil || len(p.ran) != 1 || get(p.readEnv(), "STOWAGE_REVISION") != "2" {
+		t.Fatalf("1.0.0 revision 2: %v, ran %q\n%s", err, p.ran, p.log)
+	}
+	if err := run("2.0.0", true); err != nil || len(p.ran) != 2 || get(p.readEnv(), "STOWAGE_PROJECT_VERSION") != "2.0.0" {
+		t.Fatalf("--unordered: %v, ran %q\n%s", err, p.ran, p.log)
+	}
+}
+
+// The refusals of --unordered say what the verb does: an upgrade follows the channel and moves to
+// the version, a crossing installs the channel's release and wipes the data.
+func TestTheUnorderedRefusalsNameWhatTheVerbDoes(t *testing.T) {
+	t.Parallel()
+	const alone = "--unordered is for --version: %s, which ship moves only to a release the scheme orders after it"
+	const order = "notes orders its versions with its own command, which runs only where the project publishes, never in an installer: whether 2.0.0 comes after 1.0.0, which the install runs, is not known here: %s"
+	for verb, want := range map[string][2]string{
+		"upgrade":       {"a plain upgrade follows the channel", "--unordered upgrades to it once you know it does"},
+		"k8s upgrade":   {"a plain k8s upgrade follows the channel", "--unordered upgrades to it once you know it does"},
+		verbNewBaseline: {"a plain reset-db --new-baseline installs the channel's release", "--unordered wipes the data and installs it once you know it comes after"},
+	} {
+		err := unorderedAlone(verb)
+		if r, _ := Refusal(err); err.Error() != fmt.Sprintf(alone, want[0]) || r.Fix != "leave out --unordered, or give --version" {
+			t.Errorf("%s alone: %v (fix %q)", verb, err, r.Fix)
+		}
+		err = unorderedRefusal("notes", "2.0.0", "1.0.0", verb, "")
+		if r, _ := Refusal(err); err.Error() != fmt.Sprintf(order, want[1]) ||
+			r.Fix != "run the same command again with --unordered added (only if you checked 2.0.0 comes after 1.0.0), or a plain "+verb+" (the channel's release)" {
+			t.Errorf("%s: %v (fix %q)", verb, err, r.Fix)
+		}
+	}
+}
+
+// --unordered is for --version: a plain upgrade follows the channel.
+func TestUnorderedWithoutVersionIsRefused(t *testing.T) {
+	t.Parallel()
+	r, self := testInstaller(t, "1.0.0")
+	for _, args := range [][]string{{"upgrade", "--unordered", "--dir", t.TempDir()}, {"k8s", "upgrade", "--unordered"}} {
+		cmd := Command(r, self, io.Discard, io.Discard)
+		cmd.SetArgs(args)
+		if err := cmd.Execute(); err == nil || !strings.Contains(err.Error(), "--unordered is for --version") {
+			t.Errorf("%q: %v", args, err)
+		}
+	}
+}

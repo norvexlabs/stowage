@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -127,6 +128,40 @@ func setsFlushed(script string) map[string]bool {
 	return out
 }
 
+// setsDigest is the digest of what a script of setScripts' form leaves in the sets it fills: each
+// set ("table set", sorted) with its elements, sorted and without repeats, each element's spaces
+// as one. Two scripts filling the same sets with the same elements have one digest, whatever their
+// text (the input's order, its spacing, a repeated element).
+func setsDigest(script string) string {
+	sets := map[string][]string{}
+	for line := range strings.Lines(script) {
+		f := strings.Fields(line)
+		switch {
+		case len(f) == 5 && f[0] == "flush" && f[1] == "set" && f[2] == "inet":
+			if _, ok := sets[f[3]+" "+f[4]]; !ok {
+				sets[f[3]+" "+f[4]] = []string{}
+			}
+		case len(f) > 6 && f[0] == "add" && f[1] == "element" && f[2] == "inet" && f[5] == "{" && f[len(f)-1] == "}":
+			key := f[3] + " " + f[4]
+			for e := range strings.SplitSeq(strings.Join(f[6:len(f)-1], " "), ",") {
+				if e = strings.Join(strings.Fields(e), " "); e != "" {
+					sets[key] = append(sets[key], e)
+				}
+			}
+		default:
+			if strings.TrimSpace(line) != "" {
+				sets["\x00"+line] = nil // a line of another form: compared as it is
+			}
+		}
+	}
+	h := sha256.New()
+	for _, key := range slices.Sorted(maps.Keys(sets)) {
+		elems := slices.Compact(slices.Sorted(slices.Values(sets[key])))
+		fmt.Fprintf(h, "%q %q\n", key, elems)
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
 // setsKeys names a table's input-filled sets for an error: services.<name>.sets (their inputs).
 func (in *Installer) setsKeys(name string) string {
 	sets := in.R.Spec.Services[name].Sets
@@ -209,8 +244,8 @@ func (in *Installer) syncTables(ctx context.Context, want map[string][]byte, set
 				case setsDropped(string(kept), script):
 					// A set no longer filled keeps its last input's elements: the table loads again,
 					// which gives it back the table's own and empties the sets the app socket fed.
-				case script == string(kept):
-					continue // as the last start wrote them
+				case setsDigest(script) == setsDigest(string(kept)):
+					continue // the elements the last start wrote, whatever their order or spacing
 				default:
 					// Marked before the sets change, as a load is: a start cut off before the
 					// flush flushes at the next one. A mark this start wrote goes when nft refuses

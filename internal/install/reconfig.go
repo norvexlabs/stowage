@@ -92,6 +92,37 @@ func (in *Installer) changes(env *EnvFile) (next *EnvFile, secrets map[string]bo
 			next.Set(i.Key, v)
 		}
 	}
+	// An input whose default names another (${KEY}), never given, follows the values this run
+	// records: its default is expanded again over them, in the inputs' order (a default names an
+	// earlier input). One given now is the operator's from here.
+	derived := derivedInputs(env)
+	for _, i := range in.inputList(mode) {
+		_, set := o.Set[i.Key]
+		_, answered := o.Answers[i.Key]
+		cur, ok := next.Get(i.Key)
+		switch {
+		case !derived[i.Key]:
+			continue
+		case set || answered:
+			delete(derived, i.Key)
+			continue
+		case !ok || !namedChanged(i.Default, env, next):
+			continue // a plain re-run changes nothing recorded
+		}
+		v := expandDefault(i.Default, func(k string) string { x, _ := next.Get(k); return x })
+		if v == cur {
+			continue
+		}
+		switch err := i.checkValue(v); {
+		case v == "" && i.Required:
+			bad = append(bad, fmt.Sprintf("%s is required: its default %q gives none (--set %s=…)", i.Key, i.Default, i.Key))
+		case err != nil:
+			bad = append(bad, fmt.Sprintf("%s: its default %q gives %q: %v (--set %s=…)", i.Key, i.Default, v, err, i.Key))
+		default:
+			next.Set(i.Key, v)
+		}
+	}
+	recordDerived(next, derived)
 	// A new mode: the inputs it requires are given, the front's inputs it does not read go, and a
 	// new certificate covers every domain.
 	used := map[string]bool{}
@@ -351,24 +382,46 @@ func (in *Installer) logChanges(env, next *EnvFile, secrets map[string]bool) {
 	path := func(k string) bool {
 		return strings.HasPrefix(k, spec.FileVarPrefix) || strings.HasPrefix(k, spec.SecretFileVarPrefix) || k == FileSaltVar
 	}
-	for _, k := range env.Keys() {
-		if _, ok := next.Get(k); !ok && !path(k) {
+	changes, removed := in.envChanges(env, next, secrets)
+	for _, k := range removed {
+		if !path(k) {
 			in.O.logf("removing %s", k)
 		}
 	}
-	for _, k := range next.Keys() {
-		a, _ := env.Get(k)
-		b, _ := next.Get(k)
-		if a == b || path(k) {
+	for _, c := range changes {
+		if path(c.key) || !c.had && c.now == "" {
 			continue
 		}
-		if secrets[k] {
-			a, b = redact(a), redact(b)
-		} else if i, ok := in.R.Spec.Input(k); ok && i.File() {
-			a, b = fileLogDigest(a), fileLogDigest(b)
-		}
-		in.O.logf("changing %s: %s → %s", k, cmp.Or(a, `""`), cmp.Or(b, `""`))
+		in.O.logf("changing %s: %s → %s", c.key, cmp.Or(c.was, `""`), cmp.Or(c.now, `""`))
 	}
+}
+
+// envChange is a value next gives key that env does not hold: what env held (had: whether it held
+// the key at all) and what next gives, each as shownValue shows it (a secret redacted, a file's by
+// its digest).
+type envChange struct {
+	key, was, now string
+	had           bool
+}
+
+// envChanges lists what next changes of env, as a re-run logs it and an upgrade's dry run prints
+// it: each key whose value next changes or adds, in next's order, and each key next removes, in
+// env's.
+func (in *Installer) envChanges(env, next *EnvFile, secrets map[string]bool) (changes []envChange, removed []string) {
+	for _, k := range env.Keys() {
+		if _, ok := next.Get(k); !ok {
+			removed = append(removed, k)
+		}
+	}
+	for _, k := range next.Keys() {
+		now, _ := next.Get(k)
+		was, had := env.Get(k)
+		if had && was == now {
+			continue
+		}
+		changes = append(changes, envChange{key: k, was: in.shownValue(k, was, secrets), now: in.shownValue(k, now, secrets), had: had})
+	}
+	return changes, removed
 }
 
 // givenDomains refuses a value --domains, --set or --answers gives a route's domain input that is

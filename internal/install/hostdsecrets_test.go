@@ -934,11 +934,57 @@ func TestARestoreLoadsOnlyWhatTheBackupUploaded(t *testing.T) {
 		t.Fatal(err)
 	}
 	n = len(e.docker.ran("compose"))
-	if j := restore(false); j.State != "failed" || !strings.Contains(j.Error, "this install recorded no digest of it") || !strings.Contains(j.Error, "restore --unrecorded") || len(composeCalls(e, n)) != 0 {
+	// The refusal, and the log of the load --unrecorded makes, say what the operator vouches for.
+	trust := "the dump is loaded unchecked, its statements running with the role notes's rights"
+	if j := restore(false); j.State != "failed" || !strings.Contains(j.Error, "this install recorded no digest of it") || !strings.Contains(j.Error, "with restore --unrecorded, "+trust+"; give it only for a backup you made") || len(composeCalls(e, n)) != 0 {
 		t.Errorf("%+v", j)
 	}
-	if j := restore(true); j.State != "done" || !swapped(e, n) {
+	if j := restore(true); j.State != "done" || !swapped(e, n) || !strings.Contains(strings.Join(j.Log, "\n"), "no digest recorded (--unrecorded): "+trust) {
 		t.Errorf("%+v", j)
+	}
+}
+
+// titles records the title of every question it is asked, and answers none: the operator says no.
+type titles struct{ asked *[]string }
+
+func (p titles) Ask(_ context.Context, f Form) (map[string]string, error) {
+	for _, q := range f.Questions {
+		*p.asked = append(*p.asked, q.Title)
+	}
+	return map[string]string{}, nil
+}
+
+// The confirmation of restore --unrecorded says, before anything loads, what an unchecked backup is
+// trusted with; the one of a plain restore does not.
+func TestRestoreUnrecordedConfirmationNamesTheTrust(t *testing.T) {
+	t.Parallel()
+	e, d, _, key, obj := restoreVM(t)
+	sock := served(t, d)
+	id := filepath.Join(t.TempDir(), "key.txt")
+	if err := os.WriteFile(id, []byte(key.String()+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	trust := unrecordedConfirm
+	for _, unrecorded := range []bool{false, true} {
+		var asked []string
+		var out, errb bytes.Buffer
+		cmd := vmCommand(e.r, e.self, &out, &errb, func(bool) Prompter { return titles{&asked} }, clientTimes{unit: time.Millisecond})
+		args := []string{"restore", obj, "--identity", id, "--socket", sock}
+		if unrecorded {
+			args = append(args, "--unrecorded")
+		}
+		cmd.SetArgs(args)
+		if err := cmd.ExecuteContext(context.Background()); !errors.Is(err, ErrAborted) {
+			t.Fatalf("unrecorded %v: %v\n%s%s", unrecorded, err, out.String(), errb.String())
+		}
+		// The role is the daemon's to name (its log and refusal): the installer the operator runs
+		// may be another release than the one the daemon loads with.
+		if len(asked) != 1 || strings.Contains(asked[0], trust) != unrecorded || strings.Contains(asked[0], "notes's") {
+			t.Errorf("unrecorded %v: asked %q", unrecorded, asked)
+		}
+	}
+	if e.docker.restored != "" {
+		t.Errorf("a declined restore loaded %q", e.docker.restored)
 	}
 }
 
@@ -989,6 +1035,35 @@ func TestARestoreChecksEveryVolumesArchive(t *testing.T) {
 	call(t, h, "POST", "/v1/restore", req, nil)
 	if j := waitJob(t, h); j.State != "done" || string(f.volumes[vol]) != "at the backup" {
 		t.Errorf("%+v %q", j, f.volumes[vol])
+	}
+}
+
+// Without a record, a volumes-age-rclone backup's refusal and the log of --unrecorded say what is
+// trusted in each of its objects — its manifest, its volume's archive — and name no dump or role.
+func TestAnUnrecordedVolumesBackupNamesWhatItTrusts(t *testing.T) {
+	t.Parallel()
+	_, d, f, key, vol := volumesVM(t)
+	f.volumes, f.staged = map[string][]byte{vol: []byte("at the backup")}, map[string][]byte{}
+	h := d.Handler()
+	call(t, h, "POST", "/v1/backup", BackupRequest{}, nil)
+	obj := waitJob(t, h).Target
+	if err := os.Remove(BackupDigestsFile(d.O.Dir)); err != nil {
+		t.Fatal(err)
+	}
+	manifest := "its manifest is read unchecked (the release and volumes it names are checked against this install's)"
+	archive := "the archive is unpacked unchecked, its files, owners and modes included, replacing the volume uploads's as they are"
+	req := RestoreRequest{Object: obj, Identity: key.String(), Confirm: &Version{"1.0.0", 1}}
+	call(t, h, "POST", "/v1/restore", req, nil)
+	if j := waitJob(t, h); j.State != "failed" || !strings.Contains(j.Error, "with restore --unrecorded, "+manifest) || strings.Contains(j.Error, "dump") {
+		t.Errorf("refused: %+v", j)
+	}
+	req.Unrecorded = true
+	call(t, h, "POST", "/v1/restore", req, nil)
+	j := waitJob(t, h)
+	log := strings.Join(j.Log, "\n")
+	if j.State != "done" || !strings.Contains(log, obj+": no digest recorded (--unrecorded): "+manifest) ||
+		!strings.Contains(log, volumeObject(obj, "uploads")+": no digest recorded (--unrecorded): "+archive) || strings.Contains(log, "dump") {
+		t.Errorf("%+v", j)
 	}
 }
 
@@ -1077,10 +1152,10 @@ func TestADigestIsTheDestinations(t *testing.T) {
 	if err := d.recordDigests(map[string]string{"store:a/o.age": "s"}, time.Now()); err != nil {
 		t.Fatal(err)
 	}
-	if sums, err := d.checkDigests("store:a", []string{"o.age"}, false, t.Logf); err != nil || sums["o.age"] != "s" {
+	if sums, err := d.checkDigests("store:a", []string{"o.age"}, false, func(string) string { return "trusted" }, t.Logf); err != nil || sums["o.age"] != "s" {
 		t.Errorf("%v %v", sums, err)
 	}
-	if _, err := d.checkDigests("store:b", []string{"o.age"}, false, t.Logf); err == nil || !strings.Contains(err.Error(), "store:b/o.age: this install recorded no digest of it") {
+	if _, err := d.checkDigests("store:b", []string{"o.age"}, false, func(string) string { return "trusted" }, t.Logf); err == nil || !strings.Contains(err.Error(), "store:b/o.age: this install recorded no digest of it") {
 		t.Errorf("%v", err)
 	}
 }

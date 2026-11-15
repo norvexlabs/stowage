@@ -21,6 +21,7 @@ PINNED=busybox:1.37@sha256:a7dbc319b1438115a207e11930dc4bb3e643dcb3ec0bdd694bb36
 
 step "start zot, which takes OCI manifests alone (no docker2s2): every image Stowage publishes is one"
 ZOT_COMPAT='' start_zot
+CLEANUP+=('remove_registry_images') # the installer and front images the suite pulls
 grep -q '"compat": \[\]' "$WORK/zot/config.json" || fail "zot takes Docker manifests"
 
 step "project"

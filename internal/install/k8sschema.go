@@ -202,7 +202,7 @@ func (in *Installer) k8sRecordSchema(ctx context.Context, registry string) strin
 // k8sRollbackCheck refuses a rollback to revision to, from the release cur runs, that the
 // database's schema forbids: a rollback barrier since the schema recorded by the upgrade that
 // replaced revision to, or a newer schema that release's reads_newer_image does not read.
-func (in *Installer) k8sRollbackCheck(ctx context.Context, cur *deployed, to int) error {
+func (in *Installer) k8sRollbackCheck(ctx context.Context, cur *deployed, to int, h *releaseHistory) error {
 	o, k := &in.O, in.O.K8s
 	if !in.schemaOn() {
 		return nil
@@ -214,18 +214,18 @@ func (in *Installer) k8sRollbackCheck(ctx context.Context, cur *deployed, to int
 	if !in.k8sSchemaOn() {
 		return unchecked("%s does not set shapes.kubernetes.schema", in.R.Spec.Name)
 	}
-	target, err := in.revisionDeployed(ctx, to)
+	target, err := revisionDeployed(ctx, h, to)
 	if err != nil {
 		return unchecked("what revision %d runs is not known (%v)", to, err)
 	}
-	after, err := in.revisionHistory(ctx, to+1)
-	if err != nil || after == nil || rolledBackTo.MatchString(after.Description) {
+	after := h.revision(to + 1)
+	if after == nil || rolledBackTo.MatchString(after.Description) {
 		return unchecked("the schema before the upgrade from revision %d was not recorded", to)
 	}
 	var v struct {
 		Stowage map[string]any `json:"stowage"`
 	}
-	raw, err := in.revisionValues(ctx, to+1)
+	raw, err := h.values(ctx, to+1)
 	if err == nil {
 		err = json.Unmarshal(raw, &v)
 	}
@@ -312,8 +312,8 @@ func (in *Installer) k8sReadsNewer(ctx context.Context, prefix string, d *deploy
 }
 
 // revisionDeployed is what revision rev of the release ran, from its values.
-func (in *Installer) revisionDeployed(ctx context.Context, rev int) (*deployed, error) {
-	raw, err := in.revisionValues(ctx, rev)
+func revisionDeployed(ctx context.Context, h *releaseHistory, rev int) (*deployed, error) {
+	raw, err := h.values(ctx, rev)
 	if err != nil {
 		return nil, err
 	}
@@ -330,19 +330,3 @@ func (in *Installer) revisionDeployed(ctx context.Context, rev int) (*deployed, 
 }
 
 // revisionHistory is revision rev of the release's helm history; nil when helm keeps none.
-func (in *Installer) revisionHistory(ctx context.Context, rev int) (*helmRevision, error) {
-	out, err := in.helm(ctx, Cmd{Args: []string{"history", in.O.K8s.Release, "--max", "1000", "--output", "json"}})
-	if err != nil {
-		return nil, err
-	}
-	var hs []helmRevision
-	if err := json.Unmarshal(out, &hs); err != nil {
-		return nil, fmt.Errorf("helm history: %w", err)
-	}
-	for _, h := range hs {
-		if h.Revision == rev {
-			return &h, nil
-		}
-	}
-	return nil, nil
-}

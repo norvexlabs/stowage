@@ -161,7 +161,7 @@ func (in *Installer) CreateVM(ctx context.Context, c *VMCreate) error {
 		}
 		in.useSecrets(f)
 	}
-	prefix, cl, err := in.seedRegistry(ctx, c.Platform)
+	prefix, cl, err := in.seedRegistry(ctx, &c.Platform)
 	if err != nil {
 		return err
 	}
@@ -192,9 +192,7 @@ func (in *Installer) CreateVM(ctx context.Context, c *VMCreate) error {
 		}
 		if c.Host != "" {
 			// An IPv6 address is taken bare, as ssh takes it.
-			if h, ok := strings.CutPrefix(c.Host, "["); ok && strings.HasSuffix(h, "]") {
-				c.Host = strings.TrimSuffix(h, "]")
-			}
+			c.Host = unbracket(c.Host)
 			if _, err := netip.ParseAddr(c.Host); err != nil {
 				if err := checkHostname(c.Host); err != nil {
 					return fmt.Errorf("--host: %w", err)
@@ -595,8 +593,10 @@ func (in *Installer) seedable() error {
 
 // seedRegistry is the registry a VM's disk comes from, its prefix and its client: the mirror when
 // one is given (--registry), as the VM's updates do. The disk set the VM boots is read from it
-// into in.boot (bootDisks): one holding a format of the platform keyed platform, when it is one.
-func (in *Installer) seedRegistry(ctx context.Context, platform string) (string, *registry.Client, error) {
+// into in.boot (bootDisks): one holding a format of the platform keyed *platform, when it is one;
+// none given and a prompter there, the platform is asked first (askPlatform) and *platform set,
+// the set then taken from the sets its walk read.
+func (in *Installer) seedRegistry(ctx context.Context, platform *string) (string, *registry.Client, error) {
 	prefix := in.R.Spec.Registry.Prefix
 	if r := in.O.Registry; r != "" {
 		prefix = strings.TrimSuffix(r, "/")
@@ -608,14 +608,72 @@ func (in *Installer) seedRegistry(ctx context.Context, platform string) (string,
 	if err != nil {
 		return "", nil, err
 	}
+	var walked *diskWalk
+	if *platform == "" && in.O.Prompt != nil {
+		if *platform, walked, err = in.askPlatform(ctx, cl, prefix); err != nil {
+			return "", nil, err
+		}
+	}
 	var formats []string
-	if j := slices.IndexFunc(Platforms, func(p Platform) bool { return p.Key == platform }); j >= 0 {
+	if j := slices.IndexFunc(Platforms, func(p Platform) bool { return p.Key == *platform }); j >= 0 {
 		formats = Platforms[j].Formats
 	}
-	if in.boot, err = in.bootDisks(ctx, cl, prefix, formats); err != nil {
+	// A walk an error stopped before a set holding the platform's format is walked again, as with
+	// --platform: the source that stopped it decides.
+	if walked != nil && (walked.stopped == nil || slices.ContainsFunc(walked.sets, func(d bootDisk) bool { return d.holdsOne(formats) })) {
+		in.boot, err = walked.pick(formats)
+	} else {
+		in.boot, err = in.bootDisks(ctx, cl, prefix, formats)
+	}
+	if err != nil {
 		return "", nil, err
 	}
 	return prefix, cl, nil
+}
+
+// askPlatform asks where the VM runs, offering every platform some disk set this release boots
+// holds a format of, in Platforms' order, and returns the walk of the sets it read (walkDisks, one
+// walk, until every platform's formats are held or no set is left), which serves the platform's
+// lookup (pick). None offered asks nothing: the lookup of any set then says why. A source that
+// fails to be read or checked ends the walk (w.stopped) without failing the question, which then
+// offers the platforms of the sets read before it and notes why; with none read, it is the error.
+func (in *Installer) askPlatform(ctx context.Context, cl *registry.Client, prefix string) (string, *diskWalk, error) {
+	var all []string
+	for _, p := range Platforms {
+		all = append(all, p.Formats...)
+	}
+	var read *diskWalk
+	w, err := in.walkDisks(ctx, cl, prefix, func(w *diskWalk) bool {
+		read = w
+		return !slices.ContainsFunc(all, func(f string) bool { return !w.holds(f) })
+	})
+	if err != nil {
+		if read == nil { // no set read
+			return "", nil, err
+		}
+		w = read
+		w.stopped = err
+	}
+	var choices []Choice
+	for _, p := range Platforms {
+		if slices.ContainsFunc(p.Formats, w.holds) {
+			choices = append(choices, Choice{p.Key, p.Label})
+		}
+	}
+	if len(choices) == 0 {
+		return "", w, nil
+	}
+	if w.stopped != nil {
+		in.O.logf("note: the platforms offered are those of the disk sets read before one that could not be: %v", w.stopped)
+	}
+	a, err := in.O.Prompt.Ask(ctx, Form{
+		Questions: []Question{{Title: "Where does the VM run", Key: "--platform", Choices: choices}},
+		Defaults:  func(map[string]string) map[string]string { return map[string]string{"--platform": choices[0].Value} },
+	})
+	if err != nil {
+		return "", nil, err
+	}
+	return cmp.Or(a["--platform"], choices[0].Value), w, nil
 }
 
 // seedSettings are what a VM's cloud-config gives on platform p, its disk from the registry at
@@ -730,7 +788,59 @@ const switchingStowage = "0.6.0"
 // when none does, the first set holding any format is, so that the platform names the format
 // this registry lacks.
 func (in *Installer) bootDisks(ctx context.Context, cl *registry.Client, prefix string, formats []string) (bootDisk, error) {
+	w, err := in.walkDisks(ctx, cl, prefix, func(w *diskWalk) bool { return w.sets[len(w.sets)-1].holdsOne(formats) })
+	if err != nil {
+		return bootDisk{}, err
+	}
+	return w.pick(formats)
+}
+
+// diskWalk is the disk sets walkDisks read, in bootDisks' order, each one a VM of this release can
+// boot and holding a format with its size.
+type diskWalk struct {
+	sets []bootDisk
+	// own: sets[0] is the release's own set, which this release boots whatever formats it holds;
+	// the walk ends there.
+	own bool
+	// end is why no further set was found, set when the walk read every source.
+	end error
+	// stopped is the error that ended the walk before every source was read (askPlatform's walk).
+	stopped error
+}
+
+// holds reports whether a set of the walk holds format f.
+func (w *diskWalk) holds(f string) bool {
+	return slices.ContainsFunc(w.sets, func(d bootDisk) bool { _, ok := d.osMiB[f]; return ok })
+}
+
+// holdsOne reports whether the registry holds one of formats of d (nil: any).
+func (d bootDisk) holdsOne(formats []string) bool {
+	return formats == nil || slices.ContainsFunc(formats, func(f string) bool { _, ok := d.osMiB[f]; return ok })
+}
+
+// pick is bootDisks' set among those w read: the release's own set, else the first holding one of
+// formats (nil: of any), else the first; when w read none, why.
+func (w *diskWalk) pick(formats []string) (bootDisk, error) {
+	if len(w.sets) == 0 {
+		return bootDisk{}, w.end
+	}
+	if !w.own {
+		if i := slices.IndexFunc(w.sets, func(d bootDisk) bool { return d.holdsOne(formats) }); i >= 0 {
+			return w.sets[i], nil
+		}
+	}
+	return w.sets[0], nil
+}
+
+// walkDisks reads, in the registry at prefix, the disk sets a VM of this release may boot, in
+// bootDisks' order: the release's own (or the set it records), where the walk ends when it is
+// there; else the channel pointer's release's, its manifest signed by a key this installer
+// trusts; else the channel's disk set record, signed too. After each set it reads, enough(w)
+// stops the walk. An error is a read or a check that failed; a walk that read every source sets
+// w.end, a noBootDisk unless the channel's release could not be read.
+func (in *Installer) walkDisks(ctx context.Context, cl *registry.Client, prefix string, enough func(*diskWalk) bool) (*diskWalk, error) {
 	m, name := in.R.Manifest, in.R.Spec.Name
+	w := &diskWalk{}
 	// cannot is why a set found could not boot this release (an older stowage's, or one recording
 	// no OS size), said when no other one can.
 	var cannot error
@@ -766,18 +876,16 @@ func (in *Installer) bootDisks(ctx context.Context, cl *registry.Client, prefix 
 		}
 		return sizes, missing, nil
 	}
-	// first is the first set the registry holds a format of, none of formats.
-	var first *bootDisk
-	// usable is the set when the registry holds one of formats (one of its own, formats nil):
-	// which one the platform boots is told by platform.
-	usable := func(src *release.Manifest) (bootDisk, bool, error) {
+	// usable reads the set src boots into w when the registry holds a format of it this release
+	// can boot, and reports whether the walk ends there.
+	usable := func(src *release.Manifest) (bool, error) {
 		tag, disks := src.Artifacts.Boot(src.Tag)
 		if len(disks) == 0 {
-			return bootDisk{}, false, nil
+			return false, nil
 		}
 		sizes, missing, err := present(disks)
 		if err != nil || len(sizes) == 0 {
-			return bootDisk{}, false, err
+			return false, err
 		}
 		if tag != m.Tag {
 			by := src.StowageVersion
@@ -787,30 +895,24 @@ func (in *Installer) bootDisks(ctx context.Context, cl *registry.Client, prefix 
 			if old, err := (version.SemVer{}).Compare(by, switchingStowage); err != nil || old < 0 {
 				cannot = cmp.Or(cannot, fmt.Errorf("the disk set %s boots is %s's, published by stowage %q, whose first boot cannot take another release's OS: the publisher ships a release with its disks (stowage ship --disks)",
 					src.Tag, tag, by))
-				return bootDisk{}, false, nil
+				return false, nil
 			}
 		}
-		d := bootDisk{tag, disks, sizes, missing}
-		if formats == nil || slices.ContainsFunc(formats, func(f string) bool { _, ok := sizes[f]; return ok }) {
-			return d, true, nil
-		}
-		if first == nil {
-			first = &d
-		}
-		return bootDisk{}, false, nil
+		w.sets = append(w.sets, bootDisk{tag, disks, sizes, missing})
+		return enough(w), nil
 	}
-	if d, ok, err := usable(m); err != nil || ok {
-		return d, err
+	// The release's own set, the registry holding some of it: it is the one this release boots,
+	// never another release's, and a platform whose format it lacks refuses it naming that format.
+	if _, err := usable(m); err != nil {
+		return nil, err
 	}
-	// The release's own set, the registry holding some of it but none of formats: it is the one
-	// this release boots, never another release's, and the platform refuses it naming the format
-	// it lacks.
-	if first != nil {
-		return *first, nil
+	if len(w.sets) > 0 {
+		w.own = true
+		return w, nil
 	}
 	trust, err := trusted("this installer", in.R.Keys)
 	if err != nil {
-		return bootDisk{}, err
+		return nil, err
 	}
 	repo := prefix + "/" + name + "-release"
 	ptr, h, err := readRelease(ctx, cl, repo, m.Channel)
@@ -827,57 +929,56 @@ func (in *Installer) bootDisks(ctx context.Context, cl *registry.Client, prefix 
 	if ptr != nil && ptr.Name == name && ptr.Channel == m.Channel {
 		r, err := cl.Repo(repo)
 		if err != nil {
-			return bootDisk{}, err
+			return nil, err
 		}
 		if err := checkSigned(ctx, cl, r, h, ptr, trust); err != nil {
-			return bootDisk{}, err
+			return nil, err
 		}
-		if d, ok, err := usable(ptr); err != nil || ok {
-			return d, err
+		if done, err := usable(ptr); err != nil || done {
+			return w, err
 		}
 	}
 	// The channel's disk set record, which only a ship publishing disks writes: signed as a
 	// release is when the installer trusts a key.
 	setTag, err := cl.Tag(prefix+"/"+name+"-disk", release.DiskSetTag(m.Channel))
 	if err != nil {
-		return bootDisk{}, err
+		return nil, err
 	}
 	a, h, err := cl.GetArtifact(ctx, setTag, release.DiskSetMediaType)
 	if err != nil && !errors.Is(err, registry.ErrNotArtifact) {
-		return bootDisk{}, err
+		return nil, err
 	}
 	if a != nil {
 		var set release.DiskSet
 		if err := json.Unmarshal(a.Data, &set); err != nil {
-			return bootDisk{}, fmt.Errorf("%s: %w", setTag, err)
+			return nil, fmt.Errorf("%s: %w", setTag, err)
 		}
 		if err := set.Check(m.Channel); err != nil {
-			return bootDisk{}, fmt.Errorf("%s: %w", setTag, err)
+			return nil, fmt.Errorf("%s: %w", setTag, err)
 		}
 		if trust != nil {
 			r, err := cl.Repo(prefix + "/" + name + "-disk")
 			if err != nil {
-				return bootDisk{}, err
+				return nil, err
 			}
 			if err := trust.Verify(ctx, cl, r.Digest(h.String())); err != nil {
-				return bootDisk{}, fmt.Errorf("%s is not signed by a key this installer trusts: %w", setTag, err)
+				return nil, fmt.Errorf("%s is not signed by a key this installer trusts: %w", setTag, err)
 			}
 		}
 		rec := &release.Manifest{Tag: set.Release, StowageVersion: set.Stowage, Artifacts: release.Artifacts{Disks: set.Disks}}
-		if d, ok, err := usable(rec); err != nil || ok {
-			return d, err
+		if done, err := usable(rec); err != nil || done {
+			return w, err
 		}
 	}
-	if first != nil {
-		return *first, nil
+	switch {
+	case unread != nil:
+		w.end = fmt.Errorf("%s %s has no disk in %s, and its channel %s's release could not be read: %w", name, m.ProjectVersion, prefix, m.Channel, unread)
+	case cannot != nil:
+		w.end = noBootDisk{cannot}
+	default:
+		w.end = noBootDisk{fmt.Errorf("%s %s has no disk in %s, nor does its channel %s: the publisher ships a release with its disks (stowage ship --disks)", name, m.ProjectVersion, prefix, m.Channel)}
 	}
-	if unread != nil {
-		return bootDisk{}, fmt.Errorf("%s %s has no disk in %s, and its channel %s's release could not be read: %w", name, m.ProjectVersion, prefix, m.Channel, unread)
-	}
-	if cannot != nil {
-		return bootDisk{}, noBootDisk{cannot}
-	}
-	return bootDisk{}, noBootDisk{fmt.Errorf("%s %s has no disk in %s, nor does its channel %s: the publisher ships a release with its disks (stowage ship --disks)", name, m.ProjectVersion, prefix, m.Channel)}
+	return w, nil
 }
 
 // noBootDisk is bootDisks' answer that the registry holds no disk set a VM of the release boots,
@@ -901,11 +1002,8 @@ func firstInstallOverSSH(name, ctl, flag string) []string {
 // secretsSteps tells how to give a VM's install its secrets file: copied over, its mode kept
 // 0600, then an install on a terminal, which can ask what the file does not hold.
 func secretsSteps(user, addr, ctl string) string {
-	dst := addr // scp reads an IPv6 address's colons as the path's, unless bracketed
-	if a, err := netip.ParseAddr(addr); err == nil && a.Is6() {
-		dst = "[" + addr + "]"
-	}
-	return fmt.Sprintf("chmod 600 FILE; scp -p FILE %[1]s@%[4]s:secrets.yaml, then ssh -t %[1]s@%[2]s 'sudo %[3]s install --secrets secrets.yaml; rm secrets.yaml'", user, addr, ctl, dst)
+	// scp reads an IPv6 address's colons as the path's, unless bracketed.
+	return fmt.Sprintf("chmod 600 FILE; scp -p FILE %[1]s@%[4]s:secrets.yaml, then ssh -t %[1]s@%[2]s 'sudo %[3]s install --secrets secrets.yaml; rm secrets.yaml'", user, addr, ctl, bracketIPv6(addr))
 }
 
 // sshAllows warns when the SSH sources leave out the address this machine reaches addr from:
@@ -951,7 +1049,8 @@ func (in *Installer) sshAllows(addr string, m Machine) {
 
 // platform is the platform the VM runs on, and the disk format it takes: the first of the
 // platform's formats the registry holds. Only the platforms the registry has a disk for are
-// offered; one whose formats the release publishes but the registry lacks is told which.
+// offered (askPlatform asked one, when none was given); one whose formats the release publishes
+// but the registry lacks is told which.
 func (in *Installer) platform(ctx context.Context, key string) (Platform, string, error) {
 	held := in.boot.osMiB
 	var offered []Platform
@@ -962,20 +1061,6 @@ func (in *Installer) platform(ctx context.Context, key string) (Platform, string
 	}
 	if len(offered) == 0 {
 		return Platform{}, "", fmt.Errorf("no platform `vm create` knows boots the disk formats %s %s publishes", in.R.Spec.Name, in.R.Manifest.ProjectVersion)
-	}
-	if key == "" && in.O.Prompt != nil {
-		choices := make([]Choice, len(offered))
-		for n, p := range offered {
-			choices[n] = Choice{p.Key, p.Label}
-		}
-		a, err := in.O.Prompt.Ask(ctx, Form{
-			Questions: []Question{{Title: "Where does the VM run", Key: "--platform", Choices: choices}},
-			Defaults:  func(map[string]string) map[string]string { return map[string]string{"--platform": offered[0].Key} },
-		})
-		if err != nil {
-			return Platform{}, "", err
-		}
-		key = cmp.Or(a["--platform"], offered[0].Key)
 	}
 	// A platform whose disk the release publishes but the registry lacks says which.
 	if j := slices.IndexFunc(Platforms, func(p Platform) bool { return p.Key == key }); j >= 0 && !slices.ContainsFunc(offered, func(p Platform) bool { return p.Key == key }) {
@@ -1546,8 +1631,10 @@ func (in *Installer) vmSettings(ctx context.Context) (*Settings, []string, *Give
 		shown = ""
 	}
 	st := &Settings{Channel: in.R.Manifest.Channel, TLS: shown, HTTPPort: o.HTTPPort, HTTPSPort: o.HTTPSPort}
+	// An input that took a default naming another input is left to the VM's install, which
+	// derives it again and records it so (DerivedVar): given here, a re-run would keep it.
 	for _, i := range list {
-		if v := values[i.Key]; v != "" {
+		if v := values[i.Key]; v != "" && !in.derived[i.Key] {
 			if st.Inputs == nil {
 				st.Inputs = map[string]string{}
 			}

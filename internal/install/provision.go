@@ -46,9 +46,13 @@ var (
 	maxBadLinesListed = 5
 )
 
+// decodeProvision decodes a provision hook (providers.DecodeProvision); tests replace it to count
+// the decodes.
+var decodeProvision = providers.DecodeProvision
+
 // hook returns the release's provision hook, nil when it has none.
 func (in *Installer) hook() (*providers.ProvisionHook, error) {
-	h, err := providers.DecodeProvision(in.R.Spec.Short(), in.R.Spec.Hooks.Provision, in.R.Spec.Images)
+	h, err := decodeProvision(in.R.Spec.Short(), in.R.Spec.Hooks.Provision, in.R.Spec.Images)
 	if err != nil {
 		return nil, fmt.Errorf("hooks.provision: %w", err)
 	}
@@ -293,7 +297,13 @@ func (in *Installer) lockRun(ctx context.Context, env *EnvFile) (func(), error) 
 		wait, cancel = context.WithTimeout(ctx, in.O.LockWait)
 		defer cancel()
 	}
-	unlock, err := flock.Take(wait, in.path(lifecycleLock), flock.Create, true, poll, nil)
+	f, release, err := flock.TakeFile(wait, in.path(lifecycleLock), flock.Create, true, poll, nil)
+	unlock := func() {
+		if in.lockHeld == f {
+			in.lockHeld = nil
+		}
+		release()
+	}
 	switch {
 	case err == nil:
 	case ctx.Err() != nil: // the caller's own end, its deadline included
@@ -305,6 +315,7 @@ func (in *Installer) lockRun(ctx context.Context, env *EnvFile) (func(), error) 
 	default:
 		return nil, err
 	}
+	in.lockHeld = f
 	if err := in.leftovers(ctx, env); err != nil {
 		unlock()
 		return nil, err
@@ -485,10 +496,14 @@ func writePrivate(path string, data []byte) error {
 	return writeAtomic(path, bytes.NewReader(data), 0o600, nil)
 }
 
+// createTemp creates a temporary file (os.CreateTemp); tests replace it to fail a write into the
+// file it created.
+var createTemp = os.CreateTemp
+
 // writeAtomic replaces path with what r holds and mode, atomically and durably: the file and the
 // rename reach the disk before it returns. check, when set, vets the written copy first.
 func writeAtomic(path string, r io.Reader, mode os.FileMode, check func(string) error) error {
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".stowage-")
+	tmp, err := createTemp(filepath.Dir(path), ".stowage-")
 	if err != nil {
 		return err
 	}

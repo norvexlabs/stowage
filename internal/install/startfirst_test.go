@@ -3,7 +3,6 @@ package install
 import (
 	"archive/tar"
 	"bytes"
-	"cmp"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -429,22 +428,38 @@ func overlapRun(t *testing.T, svc spec.Service, answer func(a string) ([]byte, b
 	return f, log.String(), err
 }
 
-// tarOf is the archive `docker cp … -` writes of one empty file modified at mod.
+// tarOf is the archive `docker cp <container>:<dir> -` writes of a directory holding one empty
+// file name (<dir's base>/<file>) modified at mod.
 func tarOf(t *testing.T, name string, mod time.Time) []byte {
 	t.Helper()
 	return tarOfContent(t, name, mod, "")
 }
 
-// tarOfContent is the archive of one file of content modified at mod.
+// tarOfContent is the archive of a directory holding one file of content modified at mod, beside
+// another file the app wrote; name "" is the directory without the file.
 func tarOfContent(t *testing.T, name string, mod time.Time, content string) []byte {
 	t.Helper()
 	var b bytes.Buffer
 	w := tar.NewWriter(&b)
-	if err := w.WriteHeader(&tar.Header{Name: name, Mode: 0o644, ModTime: mod, Typeflag: tar.TypeReg, Size: int64(len(content))}); err != nil {
-		t.Fatal(err)
+	dir, _, _ := strings.Cut(name, "/")
+	if name == "" {
+		dir = "hand"
 	}
-	if _, err := io.WriteString(w, content); err != nil {
-		t.Fatal(err)
+	for _, h := range []tar.Header{
+		{Name: dir + "/", Mode: 0o755, ModTime: mod, Typeflag: tar.TypeDir},
+		{Name: dir + "/other", Mode: 0o644, ModTime: mod, Typeflag: tar.TypeReg},
+	} {
+		if err := w.WriteHeader(&h); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if name != "" {
+		if err := w.WriteHeader(&tar.Header{Name: name, Mode: 0o644, ModTime: mod, Typeflag: tar.TypeReg, Size: int64(len(content))}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := io.WriteString(w, content); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if err := w.Close(); err != nil {
 		t.Fatal(err)
@@ -466,11 +481,13 @@ func TestAnUpdateReadyFileHoldsTheSignal(t *testing.T) {
 		start   = "new1|/p-new1|running|0|starting|h2|sha256:img|"
 		healthy = "new1|/p-new1|running|0|healthy|h2|sha256:img|"
 	)
-	missing := errors.New("Error: No such container:path: new1:/run/hand/ready")
+	// missing is the directory without the file; a failed copy tells no absence, whatever the
+	// engine's wording.
+	missing := tarOfContent(t, "", time.Time{}, "")
 	// mounts is where old1 mounts the update volume ("" none).
 	mounts := "/run/hand"
-	// answer answers the old container's read of the file with old, and the new one's with news in
-	// turn, the last again; nil is a file not there.
+	// answer answers the old container's read of the directory with old, and the new one's with
+	// news in turn, the last again; nil is a file not there.
 	answer := func(old []byte, oldErr error, news ...[]byte) func(a string) ([]byte, bool, error) {
 		return func(a string) ([]byte, bool, error) {
 			switch a {
@@ -479,18 +496,21 @@ func TestAnUpdateReadyFileHoldsTheSignal(t *testing.T) {
 					return []byte(`[{"Type":"volume","Name":"p_other","Destination":"/data"}]` + "\n"), true, nil
 				}
 				return []byte(`[{"Type":"bind","Name":"","Destination":"/etc/x"},{"Type":"volume","Name":"p_stowage-update-api","Destination":"` + mounts + `"}]` + "\n"), true, nil
-			case "cp old1:" + mounts + "/ready -":
+			case "cp old1:" + mounts + " -":
+				if oldErr != nil {
+					return nil, true, oldErr
+				}
 				if old == nil {
-					return nil, true, cmp.Or(oldErr, missing)
+					return missing, true, nil
 				}
 				return old, true, nil
-			case "cp new1:/run/hand/ready -":
+			case "cp new1:/run/hand -":
 				out := news[0]
 				if len(news) > 1 {
 					news = news[1:]
 				}
 				if out == nil {
-					return nil, true, missing
+					return missing, true, nil
 				}
 				return out, true, nil
 			}
@@ -503,7 +523,7 @@ func TestAnUpdateReadyFileHoldsTheSignal(t *testing.T) {
 		reads := 0
 		for _, c := range f.calls {
 			switch a := strings.Join(c.Args, " "); {
-			case a == "cp new1:/run/hand/ready -":
+			case a == "cp new1:/run/hand -":
 				reads++
 			case a == kill:
 				return reads
@@ -512,7 +532,7 @@ func TestAnUpdateReadyFileHoldsTheSignal(t *testing.T) {
 		return -1
 	}
 	t0 := time.Date(2026, 10, 31, 10, 0, 0, 0, time.UTC)
-	stale, fresh := tarOf(t, "ready", t0), tarOf(t, "ready", t0.Add(time.Second))
+	stale, fresh := tarOf(t, "hand/ready", t0), tarOf(t, "hand/ready", t0.Add(time.Second))
 	// An earlier overlap's file: the signal waits for one that differs.
 	f, log, err := overlapRun(t, svc, answer(stale, nil, nil, stale, fresh), start, healthy)
 	if err != nil || !slices.Equal(f.engine(), []string{up, kill, "stop old1", "rm old1"}) || signalledAfter(f) != 3 ||
@@ -526,14 +546,14 @@ func TestAnUpdateReadyFileHoldsTheSignal(t *testing.T) {
 		t.Errorf("none before: %v, signalled after %d reads", err, signalledAfter(f))
 	}
 	// The same time (whole seconds, or a copy keeping it), another content: written.
-	same := tarOfContent(t, "ready", t0, "2")
-	f, _, err = overlapRun(t, svc, answer(tarOfContent(t, "ready", t0, "1"), nil, tarOfContent(t, "ready", t0, "1"), same), start, healthy)
+	same := tarOfContent(t, "hand/ready", t0, "2")
+	f, _, err = overlapRun(t, svc, answer(tarOfContent(t, "hand/ready", t0, "1"), nil, tarOfContent(t, "hand/ready", t0, "1"), same), start, healthy)
 	if err != nil || signalledAfter(f) != 2 {
 		t.Errorf("another content at the same time: %v, signalled after %d reads", err, signalledAfter(f))
 	}
 	// An earlier release's update_socket elsewhere: the old container's mount is read.
 	mounts = "/run/old"
-	f, _, err = overlapRun(t, svc, answer(stale, nil, stale, fresh), start, healthy)
+	f, _, err = overlapRun(t, svc, answer(tarOf(t, "old/ready", t0), nil, stale, fresh), start, healthy)
 	if err != nil || signalledAfter(f) != 2 {
 		t.Errorf("the volume at another directory: %v, signalled after %d reads", err, signalledAfter(f))
 	}
@@ -564,6 +584,11 @@ func TestAnUpdateReadyFileHoldsTheSignal(t *testing.T) {
 	f, log, err = overlapRun(t, svc, answer(nil, errors.New("error during connect: dial unix /run/docker.sock: connect: no such file or directory")), start)
 	if err == nil || err.Error() != "services.api: before its new container starts, which it does not: reading /run/hand/ready (update_ready) through its old container: error during connect: dial unix /run/docker.sock: connect: no such file or directory" || len(f.engine()) != 0 || strings.Contains(log, "stop-first") {
 		t.Errorf("an old read failing: %v, ran %q, logged %s", err, f.engine(), log)
+	}
+	// So does Docker's answer for a missing path: the directory the old container mounts the
+	// volume at is there, and a failed copy of it tells no absence, whatever its wording.
+	if f, _, err := overlapRun(t, svc, answer(nil, errors.New("Error response from daemon: Could not find the file /run/hand in container old1")), start); err == nil || !strings.Contains(err.Error(), "before its new container starts, which it does not: reading /run/hand/ready (update_ready) through its old container: Error response from daemon: Could not find the file") || len(f.engine()) != 0 {
+		t.Errorf("the engine's missing path: %v, ran %q", err, f.engine())
 	}
 	readyWait = 20 * time.Millisecond
 	f, _, err = overlapRun(t, svc, answer(stale, nil, stale), start)
@@ -1083,17 +1108,46 @@ func TestTheReadyFilesReadIsBounded(t *testing.T) {
 	}
 	at := time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC)
 	for _, stream := range []bool{true, false} {
-		if err := read(entry(tar.Header{Name: "ready", Typeflag: tar.TypeReg, ModTime: at}, make([]byte, maxReadyFile)), stream); err != nil {
+		if err := read(entry(tar.Header{Name: "hand/ready", Typeflag: tar.TypeReg, ModTime: at}, make([]byte, maxReadyFile)), stream); err != nil {
 			t.Errorf("a file at the bound: %v", err)
 		}
-		if err := read(entry(tar.Header{Name: "ready", Typeflag: tar.TypeReg, ModTime: at}, make([]byte, maxReadyFile+100<<10)), stream); err == nil || !strings.Contains(err.Error(), "update_ready /run/hand/ready is over 1048576 bytes in the container") {
+		if err := read(entry(tar.Header{Name: "hand/ready", Typeflag: tar.TypeReg, ModTime: at}, make([]byte, maxReadyFile+100<<10)), stream); err == nil || !strings.Contains(err.Error(), "update_ready /run/hand/ready, with what /run/hand holds beside it, is over 1048576 bytes in the container") {
 			t.Errorf("a file over it: %v", err)
 		}
 	}
-	if err := read(entry(tar.Header{Name: "ready", Typeflag: tar.TypeDir, ModTime: at}, nil), true); err == nil || !strings.Contains(err.Error(), "update_ready /run/hand/ready is a directory in the container: it must be a regular file the new container writes") {
+	if err := read(entry(tar.Header{Name: "hand/ready", Typeflag: tar.TypeDir, ModTime: at}, nil), true); err == nil || !strings.Contains(err.Error(), "update_ready /run/hand/ready is a directory in the container: it must be a regular file the new container writes") {
 		t.Errorf("a directory: %v", err)
 	}
-	if err := read(entry(tar.Header{Name: "ready", Typeflag: tar.TypeSymlink, Linkname: "/etc/passwd", ModTime: at}, nil), true); err == nil || !strings.Contains(err.Error(), "is a symbolic link") {
+	if err := read(entry(tar.Header{Name: "hand/ready", Typeflag: tar.TypeSymlink, Linkname: "/etc/passwd", ModTime: at}, nil), true); err == nil || !strings.Contains(err.Error(), "is a symbolic link") {
 		t.Errorf("a link: %v", err)
+	}
+	if err := read(entry(tar.Header{Name: "hand/ready", Typeflag: tar.TypeReg, ModTime: at}, make([]byte, maxReadyFile+1)), true); err == nil || !strings.Contains(err.Error(), "update_ready /run/hand/ready is over 1048576 bytes in the container: it must be a small file") {
+		t.Errorf("a file one byte over: %v", err)
+	}
+	// The directory's archive tells the file's absence; a failed copy is an error whatever the
+	// engine's wording, which differs between engines.
+	stamp := func(archive []byte, err error) (bool, error) {
+		in := &Installer{O: Options{Docker: runTool(func(c Cmd) ([]byte, error) {
+			if a := strings.Join(c.Args, " "); a != "cp new1:/run/hand -" {
+				t.Errorf("ran %q", a)
+			}
+			return archive, err
+		})}}
+		_, there, err := in.readyFile(context.Background(), "new1", "/run/hand/ready")
+		return there, err
+	}
+	if there, err := stamp(tarOfContent(t, "", at, ""), nil); there || err != nil {
+		t.Errorf("a directory without it: %v %v", there, err)
+	}
+	if there, err := stamp(entry(tar.Header{Name: "./hand/ready", Typeflag: tar.TypeReg, ModTime: at}, []byte("1")), nil); !there || err != nil {
+		t.Errorf("an entry named ./hand/ready: %v %v", there, err)
+	}
+	if there, err := stamp(entry(tar.Header{Name: "other/ready", Typeflag: tar.TypeReg, ModTime: at}, []byte("1")), nil); there || err != nil {
+		t.Errorf("another directory's file: %v %v", there, err)
+	}
+	for _, wording := range []string{"Error response from daemon: Could not find the file /run/hand in container new1", "Error: No such container:path: new1:/run/hand", "Error: copying from container: stat /run/hand: no such file or directory"} {
+		if there, err := stamp(nil, errors.New(wording)); there || err == nil || err.Error() != wording {
+			t.Errorf("%s: %v %v", wording, there, err)
+		}
 	}
 }

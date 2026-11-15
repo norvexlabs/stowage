@@ -331,7 +331,10 @@ func newCommand(r *Release, self string, stdout, stderr io.Writer, tools K8sOpti
 				if in.O.Offline {
 					return refusal("leave out --offline, or upgrade with the new release's own installer", errors.New("--version fetches the release from the registry: --offline upgrades with the new release's own installer"))
 				}
-				return in.UpgradeTo(cmd.Context(), to, passed(cmd, "version"))
+				return in.UpgradeTo(cmd.Context(), to, passed(cmd, "version", "unordered"))
+			}
+			if o.Unordered {
+				return unorderedAlone("upgrade")
 			}
 			if !in.O.Offline {
 				if done, err := in.UpgradeRevision(cmd.Context(), passed(cmd, "version")); done || err != nil {
@@ -353,6 +356,7 @@ func newCommand(r *Release, self string, stdout, stderr io.Writer, tools K8sOpti
 	refusesKit(up, fmt.Sprintf("a re-run, `%s --dir <the install> --kit FILE`, gives it to the install", r.Ctl()))
 	uf := up.Flags()
 	uf.StringVar(&to, "version", "", "fetch the installer of this version (its latest revision, on the install's channel) from the install's registry, and upgrade with it")
+	uf.BoolVar(&o.Unordered, "unordered", false, "with --version under a `command` version scheme, which an installer cannot run: upgrade to that version, its order checked by you")
 	uf.StringArrayVar(&sets, "set", nil, "an input this release adds, KEY=VALUE (repeatable)")
 	uf.StringArrayVar(&setFiles, "set-file", nil, "a file input this release adds, KEY=PATH (repeatable)")
 	uf.StringVar(&answers, "answers", "", "a YAML file of the inputs this release adds, KEY: value")
@@ -551,8 +555,11 @@ func k8sCommand(in *Installer, o *Options, prepare func() error, terminal func(b
 						flag := given.name()
 						return refuse("run "+in.k8sCtl("upgrade")+" --version "+to+" first, then the new release's installer with "+given.name(), "%s with --version: `%s --version %s` first, then the installer of %s (`docker run --rm %s/%s-installer:<its tag> > %s.sh`) takes `k8s upgrade %s FILE` with the same target", flag, in.k8sCtl("upgrade"), to, to, in.R.Spec.Registry.Prefix, in.R.Spec.Name, in.R.Spec.Name, flag)
 					}
-					return in.K8sUpgradeTo(ctx, to, passed(cmd, "version"))
+					return in.K8sUpgradeTo(ctx, to, passed(cmd, "version", "unordered"))
 				})
+			}
+			if o.Unordered {
+				return unorderedAlone("k8s upgrade")
 			}
 			return deployWith(cmd, upTimeout, in.K8sUpgrade)
 		},
@@ -564,6 +571,7 @@ func k8sCommand(in *Installer, o *Options, prepare func() error, terminal func(b
 		k.AddCommand(c)
 	}
 	up.Flags().StringVar(&to, "version", "", "fetch the installer of this version (its latest revision, on the release's channel) from the release's registry, and upgrade with it")
+	up.Flags().BoolVar(&o.Unordered, "unordered", false, "with --version under a `command` version scheme, which an installer cannot run: upgrade to that version, its order checked by you")
 	back := &cobra.Command{
 		Use:   "rollback",
 		Short: "Roll the helm release back to its previous revision, or --revision N",
@@ -953,11 +961,11 @@ func mirrorCommand(in *Installer, o *Options, prepare func() error) *cobra.Comma
 	return m
 }
 
-// passed is the flags given to cmd, but for skip, as the arguments that give them again.
-func passed(cmd *cobra.Command, skip string) []string {
+// passed is the flags given to cmd, but for skip's, as the arguments that give them again.
+func passed(cmd *cobra.Command, skip ...string) []string {
 	var args []string
 	cmd.Flags().Visit(func(f *pflag.Flag) {
-		if f.Name == skip || f.Name == "dir" {
+		if slices.Contains(skip, f.Name) || f.Name == "dir" {
 			return
 		}
 		if s, ok := f.Value.(pflag.SliceValue); ok {
@@ -1286,10 +1294,11 @@ func downloadProgress(w io.Writer) func(done, total int64) {
 	}
 }
 
-// checkDir refuses a directory name no file system takes; anything else is the file system's call.
+// checkDir refuses a directory name holding a control character, which no unit file the install
+// writes can name as it is; anything else is the file system's call.
 func checkDir(v string) error {
-	if strings.ContainsAny(v, "\x00\n\r") {
-		return errors.New("a directory name cannot hold a line break or a NUL")
+	if strings.ContainsFunc(v, isControl) {
+		return errors.New("a directory name cannot hold a control character (a line break, a tab, a NUL): the host's systemd units name it")
 	}
 	return nil
 }

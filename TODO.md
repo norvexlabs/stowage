@@ -225,18 +225,10 @@ Cloud alone proven.
   kept-installer, schema-baseline and L4 checks, which need the boot's OS.
   The daemon's check downloads the target's whole installer in the request, before the job, with
   no progress (the job, or reading the spec alone, would show it).
-- **A Docker host's gateway, leftovers** (review): the record is read several times per start (one
-  read per run, cached, would do).
 - **A Docker host's gateway proven end to end**: `tune --apply`'s tables, forwarding chain,
   networkd files and boot unit are unit-tested; no suite applies them to a real Docker host (the
   gate's host is not one to change). A disposable Docker host (a VM of the Docker shape) running
   e2e-full's `tune --apply --dir`, a reboot, `status`, then `tune --revert`, would prove them.
-- **A restore `--unrecorded` runs the dump's TOC as the migrate role** (security audit 2026-10-26,
-  Medium): a restore loads the copy whose SHA-256 it checked against the backup's record, so a
-  planted or swapped object never loads; an object without a record, loaded with `--unrecorded`,
-  is unchecked, and `pg_restore` runs its TOC as the migrate role with owners kept (the image's
-  superuser in the examples: `COPY … FROM PROGRAM`, `CREATE ROLE … SUPERUSER`). Load it as a
-  non-superuser owner role, or filter the TOC to schema objects and data.
 
 - **A start-first start's engine calls**: each dependency of each start-first service costs four
   sequential calls (`ps`, `inspect`, `compose config --hash`, `image inspect`), repeated across
@@ -248,8 +240,7 @@ Cloud alone proven.
   inspects every container of the engine (`ps --all`, a batch `inspect`) to find one joining its
   old container; one snapshot per start would serve them all, and a batch that fails (a container
   removed meanwhile) is read again one container at a time, which a retry without the missing
-  IDs would spare. The `:ro`/`:rw` strip of a `volumes_from` value is written three times (the
-  config's joiner, the engine's, lint's).
+  IDs would spare.
 - **The networks record per service**: `.stowage-networks` digests every network of the project, so
   a change to a network a start-first service does not join replaces it stop-first all the same;
   a digest of each service's own networks would keep it overlapping.
@@ -338,10 +329,6 @@ Cloud alone proven.
   is the host's own global address (smoke-install), which crosses Docker's DNAT as an outside one
   does; a host without a global IPv6 address skips the check.
 
-- **A renamed installer's refusal on `rollback` and the VM's boot**: an install refuses a release
-  whose `short_name` differs from the one it records (`ship` refuses publishing one); the re-run
-  and `upgrade` paths have a test, `rollback` and `boot` none.
-
 - **VM: move an install to another channel carrying its release**: `upgrade --channel C` refuses
   when C's release is the one the OS runs ("no upgrade on C") — the normal case after `promote`,
   or a release shipped to two channels from one commit (identical digests). The install keeps
@@ -412,9 +399,6 @@ Cloud alone proven.
 - **Hook ship with submodules**: refused today (a checkout has no submodule content). Fetch them
   into the checkout from the repository's own `.git/modules` (no network, no change to the
   repository's configuration).
-- **Installer: test the `.env` write failure path** — the cleanup of a byo `tls/` copy and of the
-  lock file when `.env` cannot be written (into a directory the run did not create) has no test;
-  `.env` writes through `os.CreateTemp` with no failure seam.
 
 - **The lock pins a version label, not bytes**: a `stowage` built between two of its releases
   reports the top CHANGELOG version, so it passes the pin with another installer or front. An
@@ -454,13 +438,6 @@ Cloud alone proven.
   sides' neighbour tables, the VM's addresses and its ip6 rules: read them, and a capture on both
   sides if they say nothing.
 
-- **One release-identity check**: whether a release is a version at a revision is tested in four
-  places (the kept previous release, the VM's `prevIs`, `keptInstaller`, `isRelease`). Use one.
-
-- **`k8s rollback` reads helm twice**: a rollback with no `--revision` runs `helm history` and
-  `helm get values` of the target twice (the previous revision's search, then the schema check).
-  Hand the history the search read to the check.
-
 - **Cloud resume without a second transfer**: a run stopped once its snapshot was imported
   (Scaleway, AWS) downloads and uploads the disk again to make the image, which never reads that
   upload. Skip the upload module when the image module's state holds the imported snapshot.
@@ -474,10 +451,6 @@ Cloud alone proven.
   `l4.routes[].tls` domain is not, so a service of the stack dialing `<domain>:<port>` leaves
   through the host's public address (hairpin NAT) rather than straight to the front.
 
-- **Docker L4 allowlist, leftovers of its review**: `l4Exposure` and `status` recompute the rules
-  and re-read the marks per route; a retried `prepare` applies the chains twice (idempotent);
-  `lint` reports only the first of an allowlist input's errors.
-
 - **The service watch's races**: a look judges the lock, the daemon's jobs and its reboots at
   instants around the read; a lifecycle lock a CLI run takes and releases wholly inside one
   `compose ps`, or the boot unit run wholly inside it, goes unseen, and the services it stopped
@@ -489,9 +462,6 @@ Cloud alone proven.
   project wanting `lint`'s allowance checks (an artifact the release cannot carry, an entry
   expired or ending within 30 days) before a version bump is committed adds its own pre-commit
   hook running `stowage lint`. `hook install --pre-commit` could write it.
-
-- **`flush_conntrack` marks, leftovers** (review): the sets record is compared as nft text the start wrote, where a digest of
-  the elements would not depend on its form.
 
 - **IPv6 on with no IPv6 router**: a link given IPv6 for a static `address6` alone (no
   `gateway6`, no router) holds every boot's Docker 60 s for the default route and warns in `status`
@@ -524,9 +494,6 @@ Cloud alone proven.
   interrupt at probe) and never again keeps its old effective CPU and is still reported. Record
   the counts when the boot writes the affinity, and judge by the asked one while they have not
   grown.
-- **The ready file's absence told by Docker's wording**: a missing `update_ready` file is told by
-  the Docker engine's wording (`Could not find the file`, `No such container:path`), which
-  Podman's compatible CLI does not share.
 - **A decline proven in e2e-full**: the overlap reads the new container itself (never Compose's
   `--wait`), a decline under a restart policy included, unit-tested against the engine's calls; a
   real decline in e2e-full (an environment flag on the example's api) would prove it against
@@ -597,12 +564,6 @@ Cloud alone proven.
     keys the project mapped them to (`# stowage: <unit> -> <service>`, or a spec list), so none is
     lost without a word.
 
-- **Review findings left from batch D** (cross-Stowage rollback), minor:
-  a rollback releases the install's lock before the previous installer's start takes it (the
-  install then records the previous release, consistent, but another run may slip in: hand the
-  held lock to the child); finishing a stopped upgrade or rollback on the VM starts the kept
-  release twice (the child's `boot`, then the outer boot's own).
-
 - **Review findings left from batch A** (host block), minor:
   - The OS bundle's refusal of a kernel argument its boot script sets reads the generic lines, not
     a board's `baseExtraArgs` (Stowage builds the generic model only).
@@ -627,9 +588,10 @@ Cloud alone proven.
   under it.
 
 - **`k8s install --unsafe-sysctls` on a kubelet that refuses them**: the pods fail at once
-  (`SysctlForbidden`), yet helm waits out `--timeout` before it rolls back. Watch the rollout's
-  pods and fail on that reason early (a namespace's Pod Security label is checked before
-  anything changes already; the cluster's default level, without a label, is not).
+  (`SysctlForbidden`), yet helm waits out `--timeout` before it rolls back. Failing early needs to
+  tell this deploy's pods from any other (a label contract the charts keep, which lint cannot
+  judge from template text reliably) and helm rolling back when interrupted; a watch tried on
+  label selection kept missing pods Pod Security never admitted.
 
 - **A Docker host's NIC rings on the `network` profile**: a resize resets the link, so `tune`
   never resizes an up link and reports it as advice with the `ethtool -G` to run while it is
@@ -655,16 +617,10 @@ Cloud alone proven.
 - **`compose config` on every start**: a start reads the stack as Compose runs it for the content
   labels and the new volumes, even for a stack with no inline config, no environment-sourced
   secret and no volume of a `uid`, where it finds nothing; skip it there.
-- **One list of the release's own images a start runs**: the front and the volume helper are
-  listed from the manifest (`allPreloaded`), from the spec and the manifest (`stowageImageVars`)
-  and from `.env` (`stackImages`); one helper would keep a new Stowage image from reaching some
-  and not others.
 - **No front as one install mode**: a project without a front is a set of `HasFront` guards across
   the installer (preflight, decide, renderStack, up, openPorts, reconfig, upgrade, vm create, the
   CLI's flags); one front mode with no ports, Caddyfile or image would keep a new path from
   forgetting its guard.
-- **`k8s upgrade --version` reads the fetched installer's payload twice** (its check, then the
-  run's release): pass the files read once along.
 - **A mirror import's blobs in chunks too**: `mirror import` pushes each blob in one stream, as
   a ship pushed disks before; a disk set imported over a lossy link restarts from zero. Push the
   archive's large blobs as a ship pushes a disk.
@@ -677,9 +633,6 @@ Cloud alone proven.
 - **A compressed disk's file size**: a disk's layer is annotated with its file's digest, not its
   size, so a different file of that name in `vm create`'s `--out` is hashed whole before it is
   refused, and the download's progress counts compressed bytes. Annotate the size too.
-
-- **One helper for an IPv6 host's brackets**: `secretsSteps`, `urlHost`, `vm create --host` and the
-  mirror's CA directory each bracket or unbracket an IPv6 address by hand.
 
 - **IPv6 beyond the switch**: the VM suite against an IPv6-only TrueNAS or mirror (`test/vm.sh`
   reads IPv4 addresses and routes); `test/sweep.sh` sweeping `[::1]` registries; a lint warning on
@@ -695,13 +648,6 @@ Cloud alone proven.
   `http://127.0.0.1:<port>`, which another compose project's containers cannot reach (two
   projects never share a network); a host on the same machine needs the extension behind a TLS
   front, or the host's address.
-- **`hooks.provision.returns` leftovers**: lint refuses a `returns` key that is an input even when
-  the input is asked only on other shapes (an input with `shapes: [kubernetes]` the hook mints on
-  Docker cannot be declared); and lint cannot see a declared key the chart's ConfigMap
-  `<release>-stowage-provision` also sets, which `k8s provision --set` then refuses at run time.
-- **Re-run leftovers**: "diff two `.env`, redact secrets" is written twice (re-run's log,
-  upgrade's dry run); one helper. An input whose default names another (`${KEY}`) is not
-  recomputed when that one changes (README says to give it too).
 - **Disk-pressure leftovers** (the VM's watch): its POST repeats the health probe's steps (the
   service's address, the client, the bounded answer): one helper could serve both, and
   pressurePost's `(result, ok, again)` could be one struct. e2e-kairos runs the daemon on the test
@@ -728,9 +674,6 @@ Cloud alone proven.
   `k8s rollback` needs no check: a helm history never spans a baseline, since upgrade refuses one
   and `reset-db --new-baseline` uninstalls.) Recording the baseline in the chart's values would
   spare the installer fetch `k8s upgrade` makes to read it.
-- **Reset leftovers** (review of `reset-db`): `K8sReset` reads the values twice (`--all` then
-  user-supplied) and Docker `Reset` decodes the hook twice; untested: a values file whose write
-  fails after it was created (it is removed and the temporary copy named).
 - **Reset extras**: a `seed` provider (a project's dataset loaded after a reset, beyond what the
   provision hook creates); `keep_on_reset` on Kubernetes (today every claim of the release goes);
   a database outside the Kubernetes release (`external`) is not reset.
@@ -746,9 +689,6 @@ Cloud alone proven.
   bookkeeping each their own way; the rollback's re-checked plan finding another target has no
   test (reachable only through a run that changes the install consistently during the drain).
 
-- **The app socket reads the install's `.env` at every request** to check the token: cache it,
-  re-read when the file changes.
-
 - **A disk that fails rebuilds the bundle on the next ship**: the bundle was pushed by digest,
   untagged, and nothing records it. Recording built digests (a staging tag) would keep it.
 - **`latest-<format>` of a format only a newer stowage knows**: an older stowage moving the
@@ -756,16 +696,10 @@ Cloud alone proven.
 - **Disk `latest-<format>` checks every format**: each sync or verify on the latest channel HEADs
   all five tags; the spec's formats plus the pointer release's would do.
 
-- **k8s rollback reads the running values twice** (`installedRelease`, then the comparison): pass
-  them through.
-
 - **Kept release's front rendered by the newer Stowage**: an upgrade renders the kept release's
   front files with its own renderer (from the kept release's spec and `.env`), so a rollback runs
   them as this Stowage writes them, not as the older one did. Equal while the front's format does
   not change; render through the kept installer when it does.
-
-- **Upgrade order under a `command` scheme**: the project's scheme command does not run on an
-  install, so an upgrade to an older release is not refused there.
 
 - **Provision hook networks**: the hook joins the project's `default` network only; a stack whose
   services live on named networks only would need `hooks.provision` to name one.
@@ -801,10 +735,6 @@ Cloud alone proven.
   version: the channel's tag template, carried in the payload, would bound the reads to V's tags.
 - `planPinned` scans every source release for each pinned image: index the sources once.
 - `ship` reads the changelog section twice (graph and manifest): pass it through.
-- `short()` is duplicated between packages: one helper.
-- `make smoke-install` leaves the images it pushed to its throwaway registry
-  (`127.0.0.1:<port>/smoke/*`) in the local engine, and `make e2e` the installer and front images
-  it pulls: remove them at the end, as `make e2e-docker` does.
 
 - **No suite runs a failing start-first successor**: the quoting of its last lines is unit-tested
   against the engine's calls; an e2e case (a release whose new container exits) would prove it

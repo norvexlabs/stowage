@@ -15,7 +15,6 @@ import (
 	"os"
 	"regexp"
 	"slices"
-	"strconv"
 	"strings"
 	"time"
 
@@ -89,7 +88,7 @@ func (h *Hostd) exportSecrets(w http.ResponseWriter, r *http.Request) {
 // daemon reads: what runs names the verb.
 func (h *Hostd) osRelease(env *EnvFile, verb string) error {
 	m := h.R.Manifest
-	if name, v, rev := runs(env); name != m.Name || v != m.ProjectVersion || rev != strconv.Itoa(m.Revision) {
+	if name, v, rev := runs(env); name != m.Name || !isAt(m.ProjectVersion, m.Revision, v, rev) {
 		return fail(http.StatusConflict, "the install runs %s %s (revision %s), not this OS's %s %s: %s runs on the release the OS carries", name, v, rev, m.Name, Version{m.ProjectVersion, m.Revision}, verb)
 	}
 	return nil
@@ -559,7 +558,7 @@ func (h *Hostd) runRestore(in *Installer, object string, ids []age.Identity, unr
 	}
 	// The recorded digest of each object, before anything stops: one without a record is refused
 	// unless unrecorded.
-	sums, err := h.checkDigests(c.Destination, objects, unrecorded, logf)
+	sums, err := h.checkDigests(c.Destination, objects, unrecorded, restoreTrust(pg, object, d.Roles.Migrate), logf)
 	if err != nil {
 		return fmt.Errorf("%w: nothing restored", err)
 	}
@@ -909,8 +908,9 @@ func changedObject(src, got, want string) error {
 
 // checkDigests is the SHA-256 this install's backup recorded of each of objects (names in dest), by
 // name, which fetchVerified compares each download with. An object without a record is refused,
-// unless unrecorded: then it is loaded unchecked (said in the log, absent from the result).
-func (h *Hostd) checkDigests(dest string, objects []string, unrecorded bool, logf func(string, ...any)) (map[string]string, error) {
+// unless unrecorded: then it is loaded unchecked (said in the log, absent from the result). The
+// refusal and the log say what --unrecorded vouches for in that object: trust's sentence of it.
+func (h *Hostd) checkDigests(dest string, objects []string, unrecorded bool, trust func(object string) string, logf func(string, ...any)) (map[string]string, error) {
 	h.backupMu.Lock()
 	rec, err := readDigests(h.O.Dir)
 	h.backupMu.Unlock()
@@ -923,12 +923,35 @@ func (h *Hostd) checkDigests(dest string, objects []string, unrecorded bool, log
 		d, ok := rec[src]
 		switch {
 		case !ok && !unrecorded:
-			return nil, fmt.Errorf("%s: this install recorded no digest of it, so nothing proves it is what one of its backups uploaded (a backup taken on another machine, or one past the newest %d objects): restore --unrecorded loads it unchecked, once you know the destination holds only what you wrote", src, maxDigests)
+			return nil, fmt.Errorf("%s: this install recorded no digest of it, so nothing proves it is what one of its backups uploaded (a backup taken on another machine, or one past the newest %d objects): with restore --unrecorded, %s; give it only for a backup you made", src, maxDigests, trust(o))
 		case !ok:
-			logf("%s: no digest recorded, loaded unchecked (--unrecorded)", src)
+			logf("%s: no digest recorded (--unrecorded): %s", src, trust(o))
 			continue
 		}
 		sums[o] = d.SHA256
 	}
 	return sums, nil
+}
+
+// restoreTrust is, for each object a restore of backup object of pg reads, what restore
+// --unrecorded makes the operator vouch for in it when it has no digest, migrate being the role a
+// dump loads as: a dump's statements, and the code it defines, run with that role's rights (a
+// superuser in many stacks) through the load, the hook and the migrations after it; a volume's
+// archive's files, owners and modes included, replace the volume's; a volumes-age-rclone
+// backup's manifest only names the release and the volumes, which the restore checks.
+func restoreTrust(pg *providers.AgeRclone, object, migrate string) func(string) string {
+	return func(o string) string {
+		switch {
+		case o == object && pg.Dump:
+			return fmt.Sprintf("the dump is loaded unchecked, its statements running with the role %s's rights", migrate)
+		case o == object:
+			return "its manifest is read unchecked (the release and volumes it names are checked against this install's)"
+		}
+		for _, v := range pg.Volumes {
+			if o == volumeObject(object, v) {
+				return fmt.Sprintf("the archive is unpacked unchecked, its files, owners and modes included, replacing the volume %s's as they are", v)
+			}
+		}
+		return "it is read unchecked"
+	}
 }

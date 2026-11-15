@@ -11,7 +11,6 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
-	"strconv"
 	"strings"
 
 	"go.yaml.in/yaml/v3"
@@ -120,11 +119,13 @@ func (in *Installer) Reset(ctx context.Context) error {
 	if err := in.hasDatabase("reset-db has nothing to reset"); err != nil {
 		return err
 	}
-	wipe, _ := in.resetVolumes()
-	if _, err := in.composeVolumes(wipe); err != nil {
+	// The provision hook, decoded once: what the wipe forgets of it, and the hook the start runs.
+	h, err := in.hook()
+	if err != nil {
 		return err
 	}
-	if _, err := in.hook(); err != nil {
+	wipe, _, named, forget, err := in.wipeSetOf(nil, h)
+	if err != nil {
 		return err
 	}
 	// A crossing also wipes what the release the install runs names: checked there.
@@ -171,10 +172,10 @@ func (in *Installer) Reset(ctx context.Context) error {
 	if err := in.checkDocker(ctx); err != nil {
 		return err
 	}
-	if err := in.wipeData(ctx, env, nil); err != nil {
+	if err := in.wipeVolumes(ctx, env, wipe, named, forget); err != nil {
 		return err
 	}
-	return in.start(ctx, env)
+	return in.startWith(ctx, env, h)
 }
 
 // wipeSet is what wipeData deletes: the data.reset volumes, sorted, each with the name its compose
@@ -182,6 +183,15 @@ func (in *Installer) Reset(ctx context.Context) error {
 // (a crossing), old's are added to this release's — its stack is the one stopped, whose volumes
 // carry the data, and its names win.
 func (in *Installer) wipeSet(old *Installer) (wipe, keep []string, named map[string]string, forget []string, err error) {
+	h, err := in.hook()
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	return in.wipeSetOf(old, h)
+}
+
+// wipeSetOf is wipeSet with h, this release's provision hook, decoded by the caller.
+func (in *Installer) wipeSetOf(old *Installer, h *providers.ProvisionHook) (wipe, keep []string, named map[string]string, forget []string, err error) {
 	named = map[string]string{}
 	forget = []string{ProvisionEnv, restoreAwaitedFile}
 	var kept []string
@@ -203,13 +213,15 @@ func (in *Installer) wipeSet(old *Installer) (wipe, keep []string, named map[str
 				wipe = append(wipe, k)
 			}
 		}
-		h, err := src.hook()
-		if err != nil {
-			return nil, nil, nil, nil, err
+		sh := h
+		if src != in {
+			if sh, err = src.hook(); err != nil {
+				return nil, nil, nil, nil, err
+			}
 		}
 		out := src.outputs // another Stowage's release, read for that alone (wipeOf)
-		if h != nil {
-			out = h.Outputs
+		if sh != nil {
+			out = sh.Outputs
 		}
 		if out != "" && !slices.Contains(forget, out) {
 			forget = append(forget, out)
@@ -230,11 +242,17 @@ func (in *Installer) wipeSet(old *Installer) (wipe, keep []string, named map[str
 // database is provisioned afresh at the next start; with old, a crossing's, its volumes too
 // (wipeSet). A volume found by its name alone is deleted only when the stack used it.
 func (in *Installer) wipeData(ctx context.Context, env *EnvFile, old *Installer) error {
-	o, name := &in.O, in.R.Spec.Name
 	wipe, _, named, forget, err := in.wipeSet(old)
 	if err != nil {
 		return err
 	}
+	return in.wipeVolumes(ctx, env, wipe, named, forget)
+}
+
+// wipeVolumes is wipeData on the set wipeSet made: the volumes wipe lists, by the names named
+// gives them, and the files forget lists.
+func (in *Installer) wipeVolumes(ctx context.Context, env *EnvFile, wipe []string, named map[string]string, forget []string) error {
+	o, name := &in.O, in.R.Spec.Name
 	project, err := in.composeProject(env)
 	if err != nil {
 		return err
@@ -351,7 +369,7 @@ func (in *Installer) resetBaseline(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if cur == m.ProjectVersion && rev == strconv.Itoa(m.Revision) {
+	if isAt(m.ProjectVersion, m.Revision, cur, rev) {
 		return fmt.Errorf("%s already runs %s %s (revision %s): --new-baseline installs another release, which this installer does not carry; reset-db without it wipes this one",
 			o.Dir, name, cur, rev)
 	}
@@ -591,7 +609,7 @@ func (in *Installer) K8sReset(ctx context.Context) error {
 	}
 	kept := func(err error, left []string) error {
 		file := valuesFile
-		f, werr := os.CreateTemp(o.Dir, k.Release+"-values-*.yaml")
+		f, werr := createTemp(o.Dir, k.Release+"-values-*.yaml")
 		if werr == nil {
 			_, werr = f.Write(values)
 			werr = errors.Join(werr, f.Close())

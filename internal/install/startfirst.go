@@ -21,6 +21,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"github.com/norvexlabs/stowage/internal/lint"
 	"github.com/norvexlabs/stowage/internal/spec"
 )
 
@@ -169,7 +170,7 @@ func joiner(services map[string]runService, service, project string) string {
 			return n
 		}
 		for _, v := range o.VolumesFrom {
-			if v = strings.TrimSuffix(strings.TrimSuffix(v, ":ro"), ":rw"); v == service || own(v) {
+			if v = lint.VolumesFromSource(v); v == service || own(v) {
 				return n
 			}
 		}
@@ -232,7 +233,7 @@ func (in *Installer) joinedContainer(ctx context.Context, old container) (string
 	name := strings.TrimPrefix(old.Name, "/")
 	// As Docker resolves a reference: its ID, then a name, then a prefix of an ID.
 	of := func(v string) bool {
-		v = strings.TrimPrefix(strings.TrimSuffix(strings.TrimSuffix(v, ":ro"), ":rw"), "container:")
+		v = strings.TrimPrefix(lint.VolumesFromSource(v), "container:")
 		return v != "" && (v == old.ID || v == name || !names[v] && strings.HasPrefix(old.ID, v))
 	}
 	for _, f := range rows {
@@ -798,44 +799,55 @@ type readyStamp struct {
 	sum  [sha256.Size]byte
 }
 
-// readyFile reads file in the container id (`docker cp`, which needs nothing in the image): its
-// stamp, there false when the engine answers that the container holds none.
+// readyFile reads file in the container id through its directory's archive (`docker cp`, which
+// needs nothing in the image): its stamp, there false when the archive does not list it.
 func (in *Installer) readyFile(ctx context.Context, id, file string) (st readyStamp, there bool, err error) {
-	// The archive docker cp writes, bounded: a ready file is a mark, never a large one.
+	// The directory's archive, which lists the file when it is there: a missing file is told by
+	// the archive, never by an engine's wording of a failed copy. The engine's archive leaves the
+	// sockets out, so it holds the ready file and what else the app writes there, bounded.
+	dir := path.Dir(file)
 	b := &boundedBuffer{max: maxReadyFile + 64<<10}
-	ret, err := in.O.Docker.Run(ctx, Cmd{Args: []string{"cp", id + ":" + file, "-"}, Stdout: b})
+	ret, err := in.O.Docker.Run(ctx, Cmd{Args: []string{"cp", id + ":" + dir, "-"}, Stdout: b})
 	if b.over || len(ret) > b.max {
-		return readyStamp{}, false, fmt.Errorf("update_ready %s is over %d bytes in the container: it must be a small file the new container writes", file, maxReadyFile)
+		return readyStamp{}, false, fmt.Errorf("update_ready %s, with what %s holds beside it, is over %d bytes in the container: the directory holds the sockets handed over and a small file the new container writes", file, dir, maxReadyFile)
 	}
 	if err != nil {
-		// The engine's answers for a path the container lacks, never a connection's or the CLI's.
-		if e := strings.ToLower(err.Error()); strings.Contains(e, "could not find the file") || strings.Contains(e, "no such container:path") {
-			return readyStamp{}, false, nil
-		}
 		return readyStamp{}, false, err
 	}
+	name := path.Join(path.Base(dir), path.Base(file))
 	r := tar.NewReader(bytes.NewReader(append(ret, b.buf.Bytes()...))) // a tool may return stdout instead
-	h, err := r.Next()
-	if err != nil {
-		return readyStamp{}, false, fmt.Errorf("reading %s: %w", file, err)
-	}
-	if h.Typeflag != tar.TypeReg {
-		what := "not a regular file"
-		switch h.Typeflag {
-		case tar.TypeDir:
-			what = "a directory"
-		case tar.TypeSymlink:
-			what = "a symbolic link"
+	for {
+		h, err := r.Next()
+		if err == io.EOF {
+			return readyStamp{}, false, nil
 		}
-		return readyStamp{}, false, fmt.Errorf("update_ready %s is %s in the container: it must be a regular file the new container writes", file, what)
+		if err != nil {
+			return readyStamp{}, false, fmt.Errorf("reading %s: %w", dir, err)
+		}
+		if path.Clean(h.Name) != name {
+			continue
+		}
+		if h.Typeflag != tar.TypeReg {
+			what := "not a regular file"
+			switch h.Typeflag {
+			case tar.TypeDir:
+				what = "a directory"
+			case tar.TypeSymlink:
+				what = "a symbolic link"
+			}
+			return readyStamp{}, false, fmt.Errorf("update_ready %s is %s in the container: it must be a regular file the new container writes", file, what)
+		}
+		if h.Size > maxReadyFile {
+			return readyStamp{}, false, fmt.Errorf("update_ready %s is over %d bytes in the container: it must be a small file the new container writes", file, maxReadyFile)
+		}
+		d := sha256.New()
+		if _, err := io.Copy(d, r); err != nil {
+			return readyStamp{}, false, fmt.Errorf("reading %s: %w", file, err)
+		}
+		st = readyStamp{mod: h.ModTime.UTC(), size: h.Size}
+		copy(st.sum[:], d.Sum(nil))
+		return st, true, nil
 	}
-	d := sha256.New()
-	if _, err := io.Copy(d, r); err != nil {
-		return readyStamp{}, false, fmt.Errorf("reading %s: %w", file, err)
-	}
-	st = readyStamp{mod: h.ModTime.UTC(), size: h.Size}
-	copy(st.sum[:], d.Sum(nil))
-	return st, true, nil
 }
 
 // maxReadyFile bounds an update_ready file readyFile reads.

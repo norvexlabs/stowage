@@ -29,10 +29,10 @@ sudo <short>-stow install [--channel C] [--set KEY=VALUE]… [--set-file KEY=PAT
 <short>-stow restart|stop|start SERVICE
 <short>-stow provision [--set KEY=VALUE]…   # the provision hook again; --set as on Docker (an input only it reads, or a value it returned or declares it returns; empty forgets it)
 <short>-stow updates [--channel C] [--version V] [--json]
-<short>-stow upgrade [--channel C] [--version V] [--yes] [--no-reboot] [--skip-backup] [--dry-run] [--accessible] [--json]   # ends at the reboot it schedules: status and events after it tell how it went
+<short>-stow upgrade [--channel C] [--version V] [--yes] [--no-reboot] [--skip-backup] [--dry-run] [--unordered] [--accessible] [--json]   # ends at the reboot it schedules: status and events after it tell how it went
 <short>-stow rollback [--yes] [--dry-run] [--accessible] [--json]   # reboot into the passive system: back to the release the last upgrade replaced; ends at that reboot
 <short>-stow reset-db [--yes] [--no-provision] [--accessible]   # wipe the data, start again as first installed
-          [--new-baseline [--channel C] [--version V]]   # instead: a later release at another schema baseline, its OS written and booted, that boot wiping the data
+          [--new-baseline [--channel C] [--version V [--unordered]]]   # instead: a later release at another schema baseline, its OS written and booted, that boot wiping the data
 <short>-stow restore OBJECT [--identity FILE|-] [--yes] [--accessible] [--unrecorded]   # load a backup into the database and its volumes (the volumes alone without one)
 <short>-stow secrets export --recipient age1…… [-o FILE|-]   # the install's secrets, encrypted
 <short>-stow secrets rotate KEY [--stage | --finish]   # a secret with rotation: true
@@ -93,7 +93,7 @@ sudo <short>-stow network attach --role ROLE --mac MAC [--mode dhcp|static|none]
   `--new-secrets` (the file lost) goes on, generating them, or with the flags that give the material again; a mark of `byo` keeps the mode `byo` unless `--tls` says otherwise, so that run asks for the certificate rather than moving to another mode (that run takes the
   settings file and asks the rest). An upgrade or a rollback a reboot stopped is finished first by
   the install's own `<short>-stow` (`.stowage-prev/` recording the release the install runs gives
-  it away). Then an install of the OS's release comes up again; an install of
+  it away). Then an install of the OS's release comes up again (also when the removal of a crossing's mark fails, which the boot then fails with); an install of
   the release the last upgrade replaced (Kairos booted the passive slot) goes back to it with the
   install's own `<short>-stow` — the newer release's — which first brings the database up, so the
   check reads the schema the newer release left, and refuses as `rollback` refuses (a rollback
@@ -305,7 +305,8 @@ sudo <short>-stow network attach --role ROLE --mac MAC [--mode dhcp|static|none]
   (revision <r>) again when it is that one) to the active slot` (`passive` in JSON); when the
   install runs another release than the OS (a crossing whose boot fell back), it names that one
   instead (`the install runs <v> (revision <r>), which this OS (<v'> (revision <r'>)) does not
-  carry: `upgrade --version <v>` writes its OS`; `installed` in JSON), and the passive system's
+  carry: `upgrade --version <v>` writes its OS`, never with `--unordered`: the release the install
+  runs is never refused as unordered; `installed` in JSON), and the passive system's
   own release is not offered. Before the first
   install (none made, or one refused), it reads the channel and registry of the first install's
   settings (`/etc/<name>/install.yaml`: `channel`, `registry` and `registry_ca`, else the
@@ -334,6 +335,22 @@ sudo <short>-stow network attach --role ROLE --mac MAC [--mode dhcp|static|none]
   reboot. It is refused for a
   yanked release, one that does not come after the OS's, one published without an OS bundle, one
   the install went back from, and one other than the release confirmed (published meanwhile).
+  Under a `command` version scheme, which the VM cannot run, `--version V` naming another version
+  than the release the install runs (before the first install, the OS's) as written is refused
+  (409, `<name> orders its versions with its own command, …`, fix `run the same command again
+  with --unordered added (only if you checked V comes after <installed>), or a plain upgrade (the
+  channel's release)`) unless `--unordered`, as on Docker ([installer](installer.md)); `updates`
+  still offers it (`needs_unordered` in its JSON when `--version` names such a release).
+  `<short>-stow` refuses it itself, before showing it as available and asking for confirmation, when the release `--version`
+  finds is under such a scheme, after its other refusals (yanked, left by a rollback, not after
+  the OS's), which tell their own reason. `--unordered` without `--version` is refused
+  (`--unordered is for --version: a plain upgrade follows the channel, …`) before the daemon is
+  asked, by the daemon too (400), whoever asks. `unordered` is the operator vouching for the order
+  (the reason: `unordered is the operator's: the operator alone vouches for an order this daemon
+  cannot check`): the app socket refuses it (403, fix ``run `sudo <short>-stow upgrade [--channel
+  C] --version V --unordered` over SSH``, with the request's version and channel), as
+  `skip_backup`; to the app, the refusal of a version that needs it names that command over SSH
+  in place of `run the same command again with --unordered added`.
   Before the job starts it fetches the target's installer (`<prefix>/<name>-installer@<digest>`,
   by the digest of its signed manifest, the payload checked to carry that release; a copy under
   `<dir>/.stowage-next-*`, removed after), reads its spec without running it, and checks the
@@ -343,8 +360,10 @@ sudo <short>-stow network attach --role ROLE --mac MAC [--mode dhcp|static|none]
   would refuse this upgrade (it is given no input), so its OS is not written`), and so is a release
   at another schema baseline, read from that installer whichever Stowage built it (409: `<name> <v>
   starts schema baseline <n>, and the install runs <name> <v'>, at baseline <m>: its data cannot
-  carry over, so its OS is not written; `<short>-stow reset-db --new-baseline` wipes the data and
-  installs <v>`), rather than by a
+  carry over, so its OS is not written; `sudo <short>-stow reset-db --new-baseline --version <v>` wipes
+  the data and installs it`, with `--channel C` before `--version` when the upgrade was asked with
+  one, and `--unordered` after `<v>` when that release is under a `command` scheme and `<v>` is
+  not the version of the release the install runs), rather than by a
   boot that would fall back; an installer that cannot be fetched is a 502 (`the installer of
   <tag>: …`); a spec this daemon's Stowage does not read is logged and left to the boot (`the
   installer of <tag> carries a spec this Stowage does not read (…): the boot into it checks the
@@ -548,7 +567,22 @@ sudo <short>-stow network attach --role ROLE --mac MAC [--mode dhcp|static|none]
   as a stack keeps its configuration in its schemas) takes the archive by `pg_restore
   --single-transaction --exit-on-error`, owners and privileges kept (every role the dump names
   must exist: a role made by hand on the old database is made again first, or the restore fails
-  naming it). The load never touches the install's database: whatever ends it — a failure, the
+  naming it). `--unrecorded` is the operator vouching for each object without a digest: nothing
+  checks it. A dump's statements, and the functions, triggers and views it defines, run with the
+  migration role's rights (a superuser in many stacks), through the load and the hook, migrations
+  and schema check after it; a volume's archive replaces the volume's files, their owners and modes
+  included, as they are; a volumes-only backup's manifest is read unchecked (the release and
+  volumes it names are still checked against the install's). The refusal names the object and
+  what it would trust in it (`with restore --unrecorded, the dump is loaded unchecked, its
+  statements running with the role <migrate role>'s rights; give it only for a backup you made`,
+  `the archive is unpacked unchecked, its files, owners and modes included, replacing the volume
+  V's as they are`, `its manifest is read unchecked (…)`), as does the job's log of each object
+  loaded unchecked, the role being the one of the release the install runs. The confirmation (the
+  question `--yes` answers) says it before anything loads, by kind of object: `With --unrecorded,
+  nothing checks what loads: a database dump's statements run with the database's migrate role's
+  rights, a volume's archive replaces the volume's files, owners and modes included, as they are;
+  give it only for a backup you made.`
+  The load never touches the install's database: whatever ends it — a failure, the
   job stopped — the database is as it was (a load that fails drops its database; one left behind
   is dropped by the next restore, which says so). Only once it loaded, and while the job still
   waits, does a second step end the database's sessions (those the migration role may end) and
@@ -601,12 +635,22 @@ sudo <short>-stow network attach --role ROLE --mac MAC [--mode dhcp|static|none]
   it, and another is refused, and carries the plan's single-use token. Nothing is dumped first. The app socket serves it too,
   as the whole API.
 - `reset-db --new-baseline` crosses a schema baseline on the VM: it finds the release as
-  `upgrade` does (`--channel`, `--version`, refused without `--new-baseline`; `--no-provision`
+  `upgrade` does (`--channel`, `--version`, refused without `--new-baseline`; under a `command`
+  version scheme, `--version` naming another version than the release the install runs is
+  refused (`… is not known here …`, fix `run the same command again with --unordered added (only
+  if you checked V comes after <installed>), or a plain reset-db --new-baseline (the channel's
+  release)`; its reason ends `--unordered wipes the data and installs it once you know it comes
+  after`) unless `--unordered`, checked by the plan and again by the job and by
+  `<short>-stow` before it asks for confirmation, as `upgrade`'s, and refused from the app socket
+  (403, fix ``run `sudo <short>-stow reset-db --new-baseline [--channel C] --version V
+  --unordered` over SSH``, with the request's version and channel; the plan's refusal of a version
+  that needs it names that command too, to the app); `--unordered` without `--version` is refused (`--unordered is for --version: a plain
+  reset-db --new-baseline installs the channel's release, …`) before the daemon is asked; `--no-provision`
   is refused with it, as the boot that crosses is given no flag: `provision` runs the hook
   afterwards), which must come after the OS's, carry an OS bundle,
   not be yanked, start another baseline than the install's — both told, read from the two
   installers (`… cannot be told (the daemon's log says why): --new-baseline never wipes on a
-  guess`; the same baseline: `… --new-baseline only crosses a baseline; `<short>-stow upgrade`
+  guess`; the same baseline: `… --new-baseline only crosses a baseline; `sudo <short>-stow upgrade`
   moves it`) — and pass `upgrade`'s checks given no input. The question names that release and
   the plan (`write <tag>'s OS and reboot into it; that boot stops <name>, deletes the volumes
   data.reset names, forgets what its provision hook returned, then installs <v>, at schema
@@ -628,8 +672,10 @@ sudo <short>-stow network attach --role ROLE --mac MAC [--mode dhcp|static|none]
   `<short>-stow upgrade --version <v>` writes its OS again`), and that `upgrade` checks no
   baseline when it writes the release the install runs; to another release it checks the
   baseline of the release the install runs (its own installer's), not the OS's, and across one
-  names `upgrade --version <v>` (the install's release back first: `reset-db` resets the OS's
-  release), then `reset-db --new-baseline`. A later OS
+  names `sudo <short>-stow upgrade --version <v>` (the install's release back first: `reset-db` resets the OS's
+  release; never with `--unordered`, as it names the release the install runs), then `sudo
+  <short>-stow reset-db --new-baseline` (with the upgrade's `--channel`, and `--unordered` when the
+  release it finds is under a `command` scheme and is not the release the install runs). A later OS
   boots as an upgrade like any. The plan resolves what that boot would wipe (both releases' `data.reset`) before the OS
   is written, and refuses one it cannot tell.
 - `network` shows the interface (that of the default route, else the first `en*`/`eth*`), its
@@ -1096,12 +1142,13 @@ resets, what it does, and a new token, which replaces the last; refusals as `res
 running job and a scheduled reboot included), `POST reset-db` (`{"confirm": {"version",
 "revision"}, "token", "no_provision"}`, 202, a job; refused without `confirm`, with a release
 other than the one the install runs, and without the last GET's token, which it uses up; `GET
-reset-db?new_baseline=true&channel=&version=` and `"new_baseline": true, "channel", "version"` in
-the POST, `confirm` then naming the release found, cross a baseline; a channel or version without
-it, or `no_provision` with it, is a 400; a token is good for the plan its GET showed alone — a
+reset-db?new_baseline=true&channel=&version=&unordered=` and `"new_baseline": true, "channel", "version",
+"unordered"` in the POST, `confirm` then naming the release found, cross a baseline (`unordered`
+as `upgrade`'s, given to both); a channel or version without it, `unordered` without `version`,
+or `no_provision` with it, is a 400; a token is good for the plan its GET showed alone — a
 crossing or not, and its target — and another is refused: `reset-db's token is the GET's that
 showed another plan: look again`), `GET updates?channel=&version=` (`left_by_rollback` marks a release the
-  install went back from; `rewrite` the running release offered on the passive system), `POST upgrade` (`{"channel", "version", "confirm": {"version", "revision"}, "reboot", "skip_backup", "dry_run"}`, 202; with `dry_run`, every check before the job and no job: 200, `{"to", "slot", "does", "backup"}`, the release the upgrade writes, the slot written, what the boot into it does and whether a backup comes first), `GET job?since=N` (`log_total` is the line to ask from next; the last job's `started` (its identity), kind, target, state — `idle`, `running`, `done`, `failed`
+  install went back from; `rewrite` the running release offered on the passive system; `needs_unordered`, with `version`, a release under a `command` scheme other than the one the install runs, which `upgrade` takes only with `unordered`), `POST upgrade` (`{"channel", "version", "confirm": {"version", "revision"}, "reboot", "skip_backup", "dry_run", "unordered"}`, 202; `unordered` without `version` is a 400; with `dry_run`, every check before the job and no job: 200, `{"to", "slot", "does", "backup"}`, the release the upgrade writes, the slot written, what the boot into it does and whether a backup comes first), `GET job?since=N` (`log_total` is the line to ask from next; the last job's `started` (its identity), kind, target, state — `idle`, `running`, `done`, `failed`
   — and its log from line N; `result`, what a job that is done found: `backup-verify`'s message;
   `reboot`, `{"action", "drain_secs"}`, the reboot a job that is done scheduled as its last step), `GET events?after=N&wait=S` (`{"events": [...],
   "last", "dropped", "truncated"}`: the journal's entries after N (default 0), at most 200,

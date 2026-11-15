@@ -405,7 +405,7 @@ func (g *Gate) check(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if _, v, rev := runs(env); v != m.ProjectVersion || rev != strconv.Itoa(m.Revision) {
+	if _, v, rev := runs(env); !isAt(m.ProjectVersion, m.Revision, v, rev) {
 		return fmt.Errorf("the install runs %s (revision %s), not %s (revision %d), which this OS carries", v, rev, m.ProjectVersion, m.Revision)
 	}
 	return in.ready(ctx, env, g.Probe)

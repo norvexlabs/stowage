@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"time"
 
@@ -199,7 +198,7 @@ func (h *Hostd) plan(ctx context.Context, log io.Writer) (RollbackPlan, error) {
 	if err != nil {
 		return RollbackPlan{}, err
 	}
-	if _, v, rev := runs(env); v != m.ProjectVersion || rev != strconv.Itoa(m.Revision) {
+	if _, v, rev := runs(env); !isAt(m.ProjectVersion, m.Revision, v, rev) {
 		return RollbackPlan{}, refuseAs(http.StatusConflict, "", "the install runs %s (revision %s), not %s, which this OS carries: going back to the passive system is for an install of the active system's release", v, rev, from)
 	}
 	if !fileExists(filepath.Join(h.assessment().dir, passiveImage)) {

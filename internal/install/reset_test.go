@@ -10,9 +10,11 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/norvexlabs/stowage/internal/providers"
 	"github.com/norvexlabs/stowage/internal/spec"
 )
 
@@ -92,6 +94,26 @@ func TestResetWipesTheResetVolumesAndProvisionsAsFirstInstalled(t *testing.T) {
 	}
 	if after := read(t, filepath.Join(e.dir, ".env")); after != before {
 		t.Errorf(".env changed:\n%s\n%s", before, after)
+	}
+}
+
+// A reset decodes the provision hook once: its checks, the wipe and the start share it.
+func TestResetDecodesTheHookOnce(t *testing.T) {
+	e := resettable(t)
+	var mu sync.Mutex
+	n := 0
+	t.Cleanup(func() { decodeProvision = providers.DecodeProvision })
+	decodeProvision = func(short string, p *spec.Provider, images map[string]spec.Image) (*providers.ProvisionHook, error) {
+		mu.Lock()
+		n++
+		mu.Unlock()
+		return providers.DecodeProvision(short, p, images)
+	}
+	if err := e.reset(func(o *Options) { o.Yes = true }); err != nil {
+		t.Fatalf("%v\n%s", err, e.log)
+	}
+	if n != 1 {
+		t.Errorf("the hook decoded %d times", n)
 	}
 }
 
@@ -759,6 +781,44 @@ func TestK8sResetKeepsTheValuesInItsOwnDirectoryWhenTheCurrentOneRefuses(t *test
 	kept = filepath.Dir(m[1])
 	if raw := read(t, m[1]); !strings.Contains(raw, `"registry":"`+e.prefix+`"`) {
 		t.Errorf("kept %q", raw)
+	}
+}
+
+// A values file that cannot be written once created is removed, and the error names the
+// temporary copy, which stays.
+func TestK8sResetValuesWhoseCopyFailsStayInTheTemporaryOne(t *testing.T) {
+	e := newKubeEnv(t, spec.Provider{Name: "none"})
+	e.runs("1.0.0", 1)
+	e.f.manifest = resetManifest
+	e.f.deleteErr = errors.New("forbidden")
+	e.f.claims = []string{"notes-uploads"}
+	t.Cleanup(func() { createTemp = os.CreateTemp })
+	createTemp = func(dir, pattern string) (*os.File, error) {
+		if dir == e.dir {
+			return readOnlyTemp(dir, pattern)
+		}
+		return os.CreateTemp(dir, pattern)
+	}
+	var kept string
+	t.Cleanup(func() {
+		if strings.HasPrefix(filepath.Base(kept), "stowage-chart-") {
+			os.RemoveAll(kept)
+		}
+	})
+	err := e.reset(func(o *Options) { o.Yes = true })
+	m := regexp.MustCompile(`its values are in ([^\s;:]+)`).FindStringSubmatch(fmt.Sprint(err))
+	if m == nil {
+		t.Fatalf("%v", err)
+	}
+	kept = filepath.Dir(m[1])
+	if kept == e.dir || !strings.Contains(e.log.String(), "the values could not be kept in "+e.dir) {
+		t.Errorf("%v\n%s", err, e.log)
+	}
+	if raw := read(t, m[1]); !strings.Contains(raw, `"registry":"`+e.prefix+`"`) {
+		t.Errorf("kept %q", raw)
+	}
+	if left, _ := filepath.Glob(filepath.Join(e.dir, "notes-values-*")); len(left) != 0 {
+		t.Errorf("left %q", left)
 	}
 }
 

@@ -440,7 +440,7 @@ func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(
 		root.AddCommand(k)
 	}
 	var channel, version string
-	var yes, noReboot, skipBackup, dryRun bool
+	var yes, noReboot, skipBackup, dryRun, unordered bool
 	updates := &cobra.Command{
 		Use:   "updates",
 		Short: "The release an upgrade would install: the channel's latest, or --version's",
@@ -471,17 +471,34 @@ func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(
 		out := c.textOut(resultJSON, stderr)
 		var nothing bool
 		err := func() error {
+			if unordered && version == "" {
+				return unorderedAlone("upgrade")
+			}
 			u, err := c.updates(ctx, channel, version)
 			if err != nil {
 				return err
 			}
+			refused := refusedVersion(version, u)
+			// The daemon's refusal of a version it cannot order, before the release is shown as
+			// available and before the question; after the refusals that do not depend on the
+			// order, which tell their own reason.
+			if refused == nil && u.Available && u.NeedsUnordered && !unordered {
+				cur := u.Current
+				if u.Installed != nil {
+					cur = *u.Installed
+				}
+				return unorderedRefusal(name, u.Target.Version, cur.Version, "upgrade", "")
+			}
 			printUpdate(out, u)
-			if err := refusedVersion(version, u); err != nil || !u.Available {
-				nothing = err == nil
-				return err
+			if refused != nil {
+				return refused
+			}
+			if !u.Available {
+				nothing = true
+				return nil
 			}
 			reboot := !noReboot
-			req := UpgradeRequest{Channel: channel, Version: version, Confirm: &u.Target, Reboot: &reboot, SkipBackup: skipBackup}
+			req := UpgradeRequest{Channel: channel, Version: version, Confirm: &u.Target, Reboot: &reboot, SkipBackup: skipBackup, Unordered: unordered}
 			if dryRun {
 				req.DryRun, nothing = true, true
 				var p UpgradePlan
@@ -531,6 +548,7 @@ func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(
 	uf.BoolVar(&noReboot, "no-reboot", false, "write the new OS but do not reboot (the next boot runs it)")
 	uf.BoolVar(&skipBackup, "skip-backup", false, "no backup first, though one is configured")
 	uf.BoolVar(&dryRun, "dry-run", false, "run every check the upgrade runs, ask nothing, change nothing")
+	uf.BoolVar(&unordered, "unordered", false, "with --version under a `command` version scheme, which the VM cannot run: upgrade to that version, its order checked by you")
 	uf.BoolVar(&accessible, "accessible", false, "confirm with a plain line prompt")
 	var drain int
 	power := func(use, short, path string) *cobra.Command {
@@ -607,7 +625,7 @@ func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(
 	rollback.Flags().BoolVarP(&yes, "yes", "y", false, "go back without asking")
 	rollback.Flags().BoolVar(&dryRun, "dry-run", false, "run every check going back runs, ask nothing, change nothing")
 	rollback.Flags().BoolVar(&accessible, "accessible", false, "confirm with a plain line prompt")
-	var noProvision, newBaseline bool
+	var noProvision, newBaseline, resetUnordered bool
 	var resetChannel, resetVersion string
 	reset := &cobra.Command{
 		Use:   "reset-db",
@@ -621,6 +639,8 @@ func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(
 				return errors.New("--channel and --version name the release --new-baseline installs: give --new-baseline, or neither")
 			case newBaseline && noProvision:
 				return errors.New("--no-provision is not given to the boot that crosses the baseline: `provision` runs the hook afterwards")
+			case resetUnordered && resetVersion == "":
+				return unorderedAlone(verbNewBaseline)
 			}
 			path := "/v1/reset-db"
 			if newBaseline {
@@ -630,6 +650,9 @@ func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(
 				}
 				if resetVersion != "" {
 					q.Set("version", resetVersion)
+				}
+				if resetUnordered {
+					q.Set("unordered", "true")
 				}
 				path += "?" + q.Encode()
 			}
@@ -646,7 +669,7 @@ func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(
 			}
 			var started JobStarted
 			if err := c.do(ctx, http.MethodPost, "/v1/reset-db", ResetRequest{Confirm: &p.Target, Token: p.Token, NoProvision: noProvision,
-				NewBaseline: newBaseline, Channel: resetChannel, Version: resetVersion}, &started); err != nil {
+				NewBaseline: newBaseline, Channel: resetChannel, Version: resetVersion, Unordered: resetUnordered}, &started); err != nil {
 				return err
 			}
 			return c.follow(ctx, stderr, started)
@@ -658,6 +681,7 @@ func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(
 	reset.Flags().BoolVar(&newBaseline, "new-baseline", false, "install a later release at another schema baseline instead: its OS is written and booted, and that boot wipes the data")
 	reset.Flags().StringVar(&resetChannel, "channel", "", "with --new-baseline: the channel to find the release on (default: the install's)")
 	reset.Flags().StringVar(&resetVersion, "version", "", "with --new-baseline: this version's latest revision, not the channel's latest release")
+	reset.Flags().BoolVar(&resetUnordered, "unordered", false, "with --version under a `command` version scheme, which the daemon cannot run: cross to that version, its order checked by you")
 	var rotate func(cmd *cobra.Command, key, pass string) error
 	if slices.ContainsFunc(r.Spec.Secrets, func(s spec.Secret) bool { return s.Rotation }) {
 		rotate = func(cmd *cobra.Command, key, pass string) error {
@@ -717,7 +741,9 @@ func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(
 }
 
 // restoreCommand is `restore OBJECT`, asking the host daemon c reaches; noInstall is the shape's
-// refusal of a restore before the first install (Installer.noInstall's).
+// refusal of a restore before the first install (Installer.noInstall's). The confirmation of
+// --unrecorded says what it vouches for by object kind (unrecordedConfirm): the daemon, which knows
+// the backup's objects and the role its release loads a dump as, names them in its log or refusal.
 func restoreCommand(c *hostClient, name string, noInstall func() error, stderr io.Writer, terminal func(accessible bool) Prompter) *cobra.Command {
 	var yes, accessible, unrecorded bool
 	var identity string
@@ -743,8 +769,12 @@ func restoreCommand(c *hostClient, name string, noInstall func() error, stderr i
 				if t == nil {
 					return errors.New("no terminal to confirm on: --yes restores without asking")
 				}
+				title := fmt.Sprintf("Replace %s %s's data with %s?", name, st.Installed, args[0])
+				if unrecorded {
+					title += " " + unrecordedConfirm
+				}
 				a, err := t.Ask(ctx, Form{Questions: []Question{{
-					Title: fmt.Sprintf("Replace %s %s's data with %s?", name, st.Installed, args[0]), Key: "--yes", Required: true,
+					Title: title, Key: "--yes", Required: true,
 					Choices: []Choice{{"yes", "Restore"}, {"no", "Not now"}},
 				}}})
 				if err != nil {
@@ -764,9 +794,14 @@ func restoreCommand(c *hostClient, name string, noInstall func() error, stderr i
 	restore.Flags().StringVar(&identity, "identity", "-", "the age identity file that decrypts the backup; - for standard input")
 	restore.Flags().BoolVarP(&yes, "yes", "y", false, "restore without asking")
 	restore.Flags().BoolVar(&accessible, "accessible", false, "confirm with a plain line prompt")
-	restore.Flags().BoolVar(&unrecorded, "unrecorded", false, "load a backup this install recorded no digest of (one taken on another machine) unchecked; a backup whose bytes differ from its record is refused whatever this says")
+	restore.Flags().BoolVar(&unrecorded, "unrecorded", false, "load a backup this install recorded no digest of (one taken on another machine), unchecked. A dump's statements run with the rights of the database's migrate role, and a volume's archive replaces the volume's files as they are, owners and modes included. Give it only for a backup you made. A backup whose bytes differ from its record is refused whatever this says.")
 	return restore
 }
+
+// unrecordedConfirm is what the confirmation of restore --unrecorded adds: what a backup without a
+// digest is trusted with, by kind of object, true whatever the backup holds and whichever release
+// the daemon runs.
+const unrecordedConfirm = "With --unrecorded, nothing checks what loads: a database dump's statements run with the database's migrate role's rights, a volume's archive replaces the volume's files, owners and modes included, as they are; give it only for a backup you made."
 
 // socketClient is an HTTP client that dials the unix socket *path.
 func socketClient(path *string) *http.Client {
@@ -1046,19 +1081,23 @@ func (c *hostClient) updates(ctx context.Context, channel, version string) (Upda
 	return u, err
 }
 
-// printUpdate is the VM's `updates`: printUpdateOf for the release this OS carries.
-func printUpdate(w io.Writer, u Update) { printUpdateOf(w, u, "this OS", "upgrade") }
+// printUpdate is the VM's `updates`: printUpdateOf for the release this OS carries, then what
+// the VM's passive system or a later release the install runs leaves to do. Each hint's
+// `upgrade --version` names the release the install runs, which needs no --unordered.
+func printUpdate(w io.Writer, u Update) {
+	printUpdateOf(w, u, "this OS", "upgrade")
+	switch {
+	case u.Passive && u.Installed != nil && *u.Installed != u.Current && !u.Available:
+		fmt.Fprintf(w, "the install runs %s, which this OS (%s) does not carry: `upgrade --version %s` writes its OS\n", *u.Installed, u.Current, u.Installed.Version)
+	case u.Passive && !u.Rewrite && !u.Available:
+		fmt.Fprintf(w, "the VM runs the passive system (a boot that failed went back to it): `upgrade --version %s` writes %s's latest revision (%s again when it is that one) to the active slot\n", u.Current.Version, u.Current.Version, u.Current)
+	}
+}
 
 // printUpdateOf prints u, the release an upgrade of what runs (the VM's OS, a Docker install, a
 // helm release) would install, or that there is none to, every shape's `updates` alike; upgrade
 // is the shape's upgrade verb.
 func printUpdateOf(w io.Writer, u Update, runs, upgrade string) {
-	switch {
-	case u.Passive && u.Installed != nil && *u.Installed != u.Current && !u.Available:
-		defer fmt.Fprintf(w, "the install runs %s, which this OS (%s) does not carry: `upgrade --version %s` writes its OS\n", *u.Installed, u.Current, u.Installed.Version)
-	case u.Passive && !u.Rewrite && !u.Available:
-		defer fmt.Fprintf(w, "the VM runs the passive system (a boot that failed went back to it): `upgrade --version %s` writes %s's latest revision (%s again when it is that one) to the active slot\n", u.Current.Version, u.Current.Version, u.Current)
-	}
 	if u.LeftByRollback {
 		fmt.Fprintf(w, "no upgrade on %s: the install went back from %s, and the boot does not upgrade to it again: a new revision of %s is the way forward\n", u.Channel, u.Target, u.Target.Version)
 		return

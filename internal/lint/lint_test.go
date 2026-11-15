@@ -24,6 +24,8 @@ var now = time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC)
 const (
 	specFile    = "stowage.yaml"
 	composeFile = "deploy/compose.yaml"
+	// provisionEnv is examples/full's ConfigMap for the provision hook.
+	provisionEnv = "deploy/chart/templates/provision-env.yaml"
 )
 
 func run(t *testing.T, root string) *Result {
@@ -374,7 +376,8 @@ func TestEachRuleFiresOnFull(t *testing.T) {
 		{"hook returns an input", []edit{{sp, "returns: [ADMIN_API_KEY, ADMIN_LOGIN]", "returns: [ADMIN_API_KEY, ADMIN_EMAIL]"}}, nil, "hooks.provision.returns[1]: ADMIN_EMAIL is an input, a value the install records"},
 		{"hook returns a secret", []edit{{sp, "returns: [ADMIN_API_KEY, ADMIN_LOGIN]", "returns: [INTERNAL_SERVICE_SECRET]"}}, nil, "hooks.provision.returns[0]: INTERNAL_SERVICE_SECRET is a secret"},
 		{"hook returns a safe default", []edit{{sp, "returns: [ADMIN_API_KEY, ADMIN_LOGIN]", "returns: [COOKIE_SECURE]"}}, nil, "hooks.provision.returns[0]: COOKIE_SECURE is a safe default"},
-		{"hook returns a route domain", []edit{{sp, "returns: [ADMIN_API_KEY, ADMIN_LOGIN]", "returns: [API_DOMAIN]"}}, nil, "hooks.provision.returns[0]: API_DOMAIN is a route domain"},
+		{"hook returns a route domain", []edit{{sp, "returns: [ADMIN_API_KEY, ADMIN_LOGIN]", "returns: [API_DOMAIN]"}, {provisionEnv, "  API_URL:", "  API_DOMAIN: x\n  API_URL:"}}, nil,
+			"hooks.provision.returns[0]: API_DOMAIN is a route domain on docker, a key of the chart's ConfigMap <release>-stowage-provision on kubernetes, a route domain on kairos"},
 		{"hook returns twice", []edit{{sp, "returns: [ADMIN_API_KEY, ADMIN_LOGIN]", "returns: [ADMIN_LOGIN, ADMIN_LOGIN]"}}, nil, "hooks.provision: container: returns: ADMIN_LOGIN is listed twice"},
 		{"hook returns a bad name", []edit{{sp, "returns: [ADMIN_API_KEY, ADMIN_LOGIN]", "returns: [admin-key]"}}, nil, "hooks.provision: container: returns: \"admin-key\" is not a variable name"},
 		{"hook returns a provided value", []edit{{sp, "returns: [ADMIN_API_KEY, ADMIN_LOGIN]", "returns: [STOWAGE_TLS_MODE]"}}, nil, "hooks.provision: container: returns: STOWAGE_TLS_MODE is a value the install records"},
@@ -755,6 +758,43 @@ func TestEachRuleFiresOnFull(t *testing.T) {
 			}
 			t.Fatalf("no error containing %q; got:\n%s", c.want, strings.Join(errs, "\n"))
 		})
+	}
+}
+
+// A key the provision hook returns is judged per shape: one an input asks on Kubernetes alone is
+// the hook's on Docker and the VM; one every shape records (here an input of Docker and the VM the
+// chart's ConfigMap also sets, under a template's condition) is refused, naming each.
+func TestHookReturnsAreJudgedPerShape(t *testing.T) {
+	t.Parallel()
+	root := testutil.CopyExample(t, "full")
+	testutil.Edit(t, root, specFile, "returns: [ADMIN_API_KEY, ADMIN_LOGIN]", "returns: [ADMIN_API_KEY, DATABASE_URL, ECHO_ADDRESS]")
+	errs := strings.Join(errorsOf(run(t, root)), "\n")
+	if strings.Contains(errs, "hooks.provision.returns") {
+		t.Fatalf("refused: %s", errs)
+	}
+	testutil.Edit(t, root, provisionEnv, "  API_URL:", "  {{- if .Values.echo }}\n  ECHO_ADDRESS: {{ .Values.echo | quote }}\n  {{- end }}\n  API_URL:")
+	errs = strings.Join(errorsOf(run(t, root)), "\n")
+	want := "hooks.provision.returns[2]: ECHO_ADDRESS is an input on docker, a key of the chart's ConfigMap <release>-stowage-provision on kubernetes, an input on kairos"
+	if !strings.Contains(errs, want) || strings.Contains(errs, "DATABASE_URL is") {
+		t.Fatalf("no error containing %q; got:\n%s", want, errs)
+	}
+}
+
+// An L4 allowlist input wrong in several ways is refused for each: one fix never hides the next.
+func TestAnAllowlistInputsErrorsAreEachReported(t *testing.T) {
+	t.Parallel()
+	root := testutil.CopyExample(t, "full")
+	testutil.Edit(t, root, specFile, `default: "0.0.0.0/0 ::/0", shapes: [docker, kairos] }`, `default: "0.0.0.0/0 ::/0", shapes: [kairos], secret: true, advanced: true, when: tls }`)
+	errs := strings.Join(errorsOf(run(t, root)), "\n")
+	for _, want := range []string{
+		"l4.routes[1].allow_input: ECHO_SOURCES must be asked on the docker and kairos shapes alone",
+		"l4.routes[1].allow_input: ECHO_SOURCES is secret: the firewall's rules show it",
+		"l4.routes[1].allow_input: ECHO_SOURCES is advanced, never asked",
+		"l4.routes[1].allow_input: ECHO_SOURCES is asked only when tls",
+	} {
+		if !strings.Contains(errs, want) {
+			t.Errorf("no error containing %q; got:\n%s", want, errs)
+		}
 	}
 }
 

@@ -519,7 +519,10 @@ on_vm sudo notes-stow backup run >"$WORK/backup-run.txt" 2>&1 || { cat "$WORK/ba
 backups=("$WORK"/dav/backups/notes-full-*-1.0.0-r1.pgdump.age)
 [[ ${#backups[@]} == 1 && -s ${backups[0]} ]] || { ls -la "$WORK/dav/backups"; fail "no backup in the destination"; }
 check_backup "${backups[0]}" "$PG" e2e_backup_all
-"$BIN/age" -d -i "$AGE_KEY" "${backups[0]%.pgdump.age}.uploads.tar.age" | tar -t | grep -qx './e2e.txt' || fail "the backup holds no archive of the uploads volume"
+# The listing is read whole before it is searched: grep -q ending at its match could stop tar
+# with SIGPIPE, failing the pipeline under pipefail.
+listing=$("$BIN/age" -d -i "$AGE_KEY" "${backups[0]%.pgdump.age}.uploads.tar.age" | tar -t) || fail "the uploads volume's archive does not decrypt and list"
+grep -qx './e2e.txt' <<<"$listing" || fail "the backup holds no archive of the uploads volume"
 on_vm notes-stow backup status | grep -q "^last  .*${backups[0]##*/}" || fail "backup status does not show the backup"
 
 step "restore on the VM: the backup loaded back over newer data; the secrets exported, encrypted to the operator's key"

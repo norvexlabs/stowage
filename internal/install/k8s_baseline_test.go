@@ -5,6 +5,7 @@ import (
 	"context"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/norvexlabs/stowage/internal/payload"
@@ -77,6 +78,27 @@ func TestK8sUpgradeAcrossASchemaBaselineIsRefused(t *testing.T) {
 	}
 	if len(e.f.ran("helm upgrade")) != 1 {
 		t.Errorf("same baseline did not upgrade")
+	}
+}
+
+// An upgrade reads the payload of the running release's installer once: its check that it
+// carries the release, and what the upgrade learns of that release, share it.
+func TestK8sUpgradeReadsTheRunningInstallerOnce(t *testing.T) {
+	e := baselineKube(t, 2, 2)
+	var mu sync.Mutex
+	n := 0
+	t.Cleanup(func() { readPayload = payload.Read })
+	readPayload = func(p string) (payload.Files, error) {
+		mu.Lock()
+		n++
+		mu.Unlock()
+		return payload.Read(p)
+	}
+	if err := e.installer(nil).K8sUpgrade(context.Background()); err != nil {
+		t.Fatalf("%v\n%s", err, e.log)
+	}
+	if n != 1 {
+		t.Errorf("the payload read %d times", n)
 	}
 }
 

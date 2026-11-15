@@ -110,7 +110,7 @@ func (in *Installer) dockerCA(prefix string) error {
 	host := repo.RegistryStr()
 	h, _, err := net.SplitHostPort(host)
 	if err != nil {
-		h = strings.Trim(host, "[]") // an IPv6 address without a port
+		h = unbracket(host) // an IPv6 address without a port
 	}
 	if registry.Loopback(h) {
 		return nil

@@ -19,6 +19,7 @@ import (
 	"github.com/norvexlabs/stowage/internal/providers"
 	"github.com/norvexlabs/stowage/internal/release"
 	"github.com/norvexlabs/stowage/internal/spec"
+	"github.com/norvexlabs/stowage/internal/version"
 )
 
 const (
@@ -234,7 +235,7 @@ func (in *Installer) Upgrade(ctx context.Context) (err error) {
 	if err != nil {
 		return err
 	}
-	if cur == m.ProjectVersion && rev == strconv.Itoa(m.Revision) {
+	if isAt(m.ProjectVersion, m.Revision, cur, rev) {
 		in.nothing = true
 		fmt.Fprintf(o.Out, "%s already runs %s %s (revision %s): `%s --dir %s` brings it up again\n", o.Dir, name, cur, rev, cmp.Or(o.Self, in.ctl()), o.Dir)
 		if pinnedImages(env) {
@@ -287,12 +288,9 @@ func (in *Installer) Upgrade(ctx context.Context) (err error) {
 	}
 	in.recordInputKeys(next, env) // before a dry run prints the changes: what the run writes
 	if o.DryRun {
-		for _, k := range next.Keys() {
-			v, _ := next.Get(k)
-			if old, ok := env.Get(k); ok && old == v {
-				continue
-			}
-			fmt.Fprintf(o.Out, "%s=%s\n", k, in.shownValue(k, v, secrets))
+		changes, _ := in.envChanges(env, next, secrets)
+		for _, c := range changes {
+			fmt.Fprintf(o.Out, "%s=%s\n", c.key, c.now)
 		}
 		if in.R.Spec.HasDatabase() {
 			o.logf("a run would dump the database to %s, keep %s %s in %s, then start %s", in.path(SnapshotsDir), name, cur, in.path(PrevDir), m.ProjectVersion)
@@ -420,7 +418,7 @@ func (in *Installer) upgradeRefusals(ctx context.Context, env *EnvFile, name, cu
 		return "", publish{}, nil, nil, err
 	}
 	if st, err := in.readPrevState(); err == nil && st != nil {
-		if st.ProjectVersion == cur && strconv.Itoa(st.Revision) == rev {
+		if isAt(st.ProjectVersion, st.Revision, cur, rev) {
 			return "", publish{}, nil, nil, refuse(in.fixOn(in.ctl()+" rollback --dir "+o.Dir, ""), "an upgrade from or a rollback to %s %s stopped before it finished: `%s rollback --dir %s` finishes it, back on %s %s", name, cur, in.ctl(), o.Dir, name, cur)
 		}
 	}
@@ -570,7 +568,7 @@ func (in *Installer) keptInstaller(ctx context.Context, name, version, revision 
 func (in *Installer) installerOf(ctx context.Context, name, version, revision string) (k *keptRelease, refused bool, err error) {
 	other := false
 	k, err = in.readKept(ctx, in.ctl(), func(m *release.Manifest) error {
-		if m.Name == name && m.ProjectVersion == version && strconv.Itoa(m.Revision) == revision {
+		if m.Name == name && isAt(m.ProjectVersion, m.Revision, version, revision) {
 			return nil
 		}
 		other = true
@@ -850,12 +848,15 @@ func (in *Installer) upgradeEnv(env *EnvFile, mode string, added []input, values
 		next.Set(k, v)
 	}
 	secrets := map[string]bool{}
+	derived := derivedInputs(env) // the added inputs as inputs() took them (in.derived)
 	for _, i := range added {
 		if v, ok := values[i.Key]; ok || !i.Advanced { // an advanced input only when given
 			next.Set(i.Key, v)
 		}
 		secrets[i.Key] = i.Secret
+		derived[i.Key] = in.derived[i.Key]
 	}
+	recordDerived(next, derived)
 	for _, sec := range in.secrets() {
 		if _, ok := next.Get(sec.Key); ok {
 			continue
@@ -1069,8 +1070,8 @@ func (in *Installer) Rollback(ctx context.Context) (err error) {
 	pname, pversion, prevRev := runs(prevEnv)
 	// A stopped upgrade or rollback is finished by whichever installer runs it; any other rollback
 	// by the installer the install keeps, refused before the kept release is read.
-	stopped := cur == st.ProjectVersion && rev == strconv.Itoa(st.Revision)
-	if !stopped && (cur != m.ProjectVersion || rev != strconv.Itoa(m.Revision)) {
+	stopped := isAt(st.ProjectVersion, st.Revision, cur, rev)
+	if !stopped && !isAt(m.ProjectVersion, m.Revision, cur, rev) {
 		fix := sameArgs(in.ctl(), "a rollback is run by the installer the install keeps", "")
 		if sameFile(o.Self, in.ctl()) {
 			// This is the kept one: an upgrade to the release installed stopped before it kept its own.
@@ -1085,7 +1086,7 @@ func (in *Installer) Rollback(ctx context.Context) (err error) {
 	var mixed error // PrevDir holding more than one release, told before its installer is run
 	pk, err := in.readKept(ctx, filepath.Join(prev, in.R.Ctl()), func(pm *release.Manifest) error {
 		if pm.Name != name || pm.ProjectVersion != st.ProjectVersion || pm.Revision != st.Revision ||
-			pname != name || pversion != st.ProjectVersion || prevRev != strconv.Itoa(st.Revision) {
+			pname != name || !isAt(st.ProjectVersion, st.Revision, pversion, prevRev) {
 			mixed = refuse("look into "+prev+": its installer, its record and its .env must name the release a rollback goes back to", "%s does not hold one release: its installer carries %s %s (revision %d), its record says %s (revision %d), its .env %s %s (revision %s)",
 				prev, pm.Name, pm.ProjectVersion, pm.Revision, st.ProjectVersion, st.Revision, pname, pversion, prevRev)
 		}
@@ -1119,8 +1120,7 @@ func (in *Installer) Rollback(ctx context.Context) (err error) {
 		if err := os.RemoveAll(prev); err != nil {
 			return err
 		}
-		unlock()
-		return in.startKept(ctx, pk.Manifest, pk.Release, o.Offline || !pinnedImages(env), true)
+		return in.startKept(ctx, pk.Manifest, pk.Release, o.Offline || !pinnedImages(env), true, unlock)
 	}
 	o.Offline = o.Offline || !pinnedImages(prevEnv)
 	// back is the previous release as this Stowage reads it: nil when another built it, whose
@@ -1260,10 +1260,9 @@ func (in *Installer) Rollback(ctx context.Context) (err error) {
 	if err := os.RemoveAll(prev); err != nil {
 		return err
 	}
-	unlock()
 	// Not --offline for images fetched above: an install by digest offline would record them by
 	// tag. Its own installer finds them there, and pulls what its record does not name.
-	if err := in.startKept(ctx, pk.Manifest, pk.Release, o.Offline, false); err != nil {
+	if err := in.startKept(ctx, pk.Manifest, pk.Release, o.Offline, false, unlock); err != nil {
 		return fmt.Errorf("%w\nthe install records %s %s; the release left is kept in %s", err, pk.Manifest.Name, st.ProjectVersion, failed)
 	}
 	return nil
@@ -1272,11 +1271,21 @@ func (in *Installer) Rollback(ctx context.Context) (err error) {
 // startKept starts the release the install now records, m, with the installer it keeps: a release
 // is started by its own Stowage's code, whichever Stowage built the one this installer carries.
 // On Docker that is a re-run of it (without the provision hook); a VM's installer (an OS
-// bundle's) runs its boot, which brings up the release the install records. The install is
-// unlocked: the child locks it, and says how to start it again if it cannot. rel is that release
-// as this Stowage reads it, nil when another Stowage built it. stopped is a run finishing one that
-// stopped, which may have stopped before the newer release ever ran on the data.
-func (in *Installer) startKept(ctx context.Context, m *release.Manifest, rel *Release, offline, stopped bool) error {
+// bundle's) runs its boot, which brings up the release the install records. The child locks the
+// install, and says how to start it again if it cannot: unlock releases this run's lock, held
+// until then — handed to the child (flock.Hand) when its Stowage takes a lock handed to it
+// (handsLock), so no other run comes between them; released before it otherwise, as such a child
+// takes the lock anew. rel is that release as this Stowage reads it, nil when another Stowage
+// built it. stopped is a run finishing one that stopped, which may have stopped before the newer
+// release ever ran on the data.
+func (in *Installer) startKept(ctx context.Context, m *release.Manifest, rel *Release, offline, stopped bool, unlock func()) error {
+	defer unlock()
+	if in.lockHeld == nil || !handsLock(m) {
+		unlock()
+	} else {
+		in.O.handLock = in.lockHeld
+		defer func() { in.O.handLock = nil }()
+	}
 	args := []string{"--dir", in.O.Dir, "--no-input", "--no-provision"}
 	if m.Bundled() {
 		args = []string{bootCmd, "--dir", in.O.Dir}
@@ -1308,6 +1317,17 @@ func (in *Installer) startKept(ctx context.Context, m *release.Manifest, rel *Re
 	}
 	in.O.logf("the provision hook is not run on a rollback (the --no-provision above is the rollback's): `%s provision --dir %s` runs %s %s's hook%s %s, only if that release needs it", in.ctl(), in.O.Dir, m.Name, m.ProjectVersion, has, data)
 	return nil
+}
+
+// lockHandedSince is the first Stowage whose installers take, as their lock, the one the run that
+// started them handed them (flock.Hand); an earlier one's would find it held.
+const lockHandedSince = "0.39.0"
+
+// handsLock reports whether the installer of release m, by the Stowage its manifest records,
+// takes a lock handed to it.
+func handsLock(m *release.Manifest) bool {
+	order, err := version.SemVer{}.Compare(m.StowageVersion, lockHandedSince)
+	return err == nil && order >= 0
 }
 
 // rollbackRefused is the rollback check's refusal: the database moved past what the previous

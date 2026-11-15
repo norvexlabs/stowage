@@ -305,6 +305,7 @@ func TestK8sVerbsUnderJSON(t *testing.T) {
 	t.Parallel()
 	e := newKubeEnv(t, spec.Provider{Name: "none"})
 	e.runs("0.9.0", 2)
+	e.f.history = []helmRevision{{Revision: 1, Status: "deployed", Chart: "notes-0.1.0"}}
 	in := e.installer(func(o *Options) { o.K8s.Revision, o.K8s.Timeout = 3, 6*time.Minute })
 	out, err := machineRun(t, in, verbKind{k8s: true}, in.K8sRollback)
 	if err != nil {
@@ -422,6 +423,7 @@ func TestTheVerbsTakeJSON(t *testing.T) {
 	}
 	// Done: what the run prints for a person goes to standard error.
 	e.runs("0.9.0", 2)
+	e.f.history = []helmRevision{{Revision: 1, Status: "deployed", Chart: "notes-0.1.0"}}
 	out.Reset()
 	log.Reset()
 	cmd = newCommand(e.release, "notes-stow", &out, &log, tools, func(bool) Prompter { return nil })
@@ -877,5 +879,32 @@ func TestNoShortNameIsAdvisedGenerically(t *testing.T) {
 	r, ok := Refusal(e.rollback(nil))
 	if !ok || !strings.HasPrefix(r.Fix, "run the installer the install keeps in "+e.dir+" instead") || strings.Contains(r.Fix, "/-stow") {
 		t.Fatalf("%+v", r)
+	}
+}
+
+// notInstalled is open's absent refusal: a directory missing or without a record is not
+// installed; one whose record is there, readable or not, is.
+func TestNotInstalledIsOpensAbsentRefusal(t *testing.T) {
+	t.Parallel()
+	r, _ := testInstaller(t, "1.0.0")
+	missing := filepath.Join(t.TempDir(), "gone")
+	empty := t.TempDir()
+	recorded := t.TempDir()
+	if err := os.WriteFile(filepath.Join(recorded, envName), []byte("A=1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	unreadable := t.TempDir()
+	if err := os.Mkdir(filepath.Join(unreadable, envName), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for dir, want := range map[string]bool{missing: true, empty: true, recorded: false, unreadable: false} {
+		in := &Installer{R: r, O: Options{Dir: dir, Out: io.Discard, Log: io.Discard}}
+		if got := notInstalled(in); got != want {
+			t.Errorf("%s: notInstalled = %v, want %v", dir, got, want)
+		}
+		_, err := in.open()
+		if isAbsent(err) != want {
+			t.Errorf("%s: open's error %v absent = %v, want %v", dir, err, isAbsent(err), want)
+		}
 	}
 }

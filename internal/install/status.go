@@ -286,6 +286,37 @@ func listedInputs(env *EnvFile) []string {
 	return strings.Split(v, ",")
 }
 
+// DerivedVar records, in a Docker install's .env (and the VM's), the inputs whose recorded value
+// is their default naming another input (${KEY}), never given (--set, the environment, --answers or
+// an answer on the form), comma-separated and sorted: a re-run that changes the input such a
+// default names expands it again (rederive). Not a value compose or a hook reads.
+const DerivedVar = "STOWAGE_DERIVED"
+
+// derivedInputs are the keys DerivedVar lists in env.
+func derivedInputs(env *EnvFile) map[string]bool {
+	out := map[string]bool{}
+	if v, _ := env.Get(DerivedVar); v != "" {
+		for _, k := range strings.Split(v, ",") {
+			out[k] = true
+		}
+	}
+	return out
+}
+
+// recordDerived sets DerivedVar in env to the keys of derived env records; none, no variable.
+func recordDerived(env *EnvFile, derived map[string]bool) {
+	var keys []string
+	for _, k := range sortedKeys(derived) {
+		if _, ok := env.Get(k); ok && derived[k] {
+			keys = append(keys, k)
+		}
+	}
+	env.Delete(DerivedVar)
+	if len(keys) > 0 {
+		env.Set(DerivedVar, strings.Join(keys, ","))
+	}
+}
+
 // installInputs are the keys of the inputs env records: those s (the installed release's spec;
 // nil when no installer of it is read) declares, and those InputsVar lists — every release's that
 // wrote it —, sorted. Nil (unknown) when neither tells: no spec, and no list recorded.
@@ -321,7 +352,14 @@ func recordedInputs(s *spec.Spec, recorded func(string) bool) *[]string {
 
 // isRelease reports whether m is the release name version at revision.
 func isRelease(m *release.Manifest, name, version string, revision int) bool {
-	return m.Name == name && m.ProjectVersion == version && m.Revision == revision
+	return m.Name == name && isAt(m.ProjectVersion, m.Revision, version, strconv.Itoa(revision))
+}
+
+// isAt reports whether the release of version v at revision r is version at revision, the
+// revision as an install records it (its decimal text): the one test of which release a record,
+// a manifest or a kept state names.
+func isAt(v string, r int, version, revision string) bool {
+	return v == version && strconv.Itoa(r) == revision
 }
 
 // carriedRelease is the release name version at revision as an installer carrying it tells it — this
@@ -416,7 +454,7 @@ func (in *Installer) keptPrevious(version string, revision int) (*StatusRelease,
 	if st == nil || err != nil {
 		return nil, err
 	}
-	if st.ProjectVersion == version && st.Revision == revision {
+	if isAt(st.ProjectVersion, st.Revision, version, strconv.Itoa(revision)) {
 		return nil, nil
 	}
 	r := &StatusRelease{Version: st.ProjectVersion, Revision: st.Revision}

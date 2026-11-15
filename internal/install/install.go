@@ -79,6 +79,9 @@ type Options struct {
 	// mirror's own: the installer's reads trust it, and an install records it (RegistryCAFile).
 	RegistryCA string
 	Offline    bool // images are already loaded: no login, no pull
+	// Unordered lets `upgrade --version` move to a version a `command` scheme would order
+	// (unorderedTo), which an install cannot run: the operator checked the order.
+	Unordered bool
 	// Preloaded: the images are the ones an OS bundle preloads, named by digest
 	// (release.PreloadTag); an install on the Kairos VM shape. It implies Offline.
 	Preloaded bool
@@ -142,6 +145,8 @@ type Options struct {
 	// nil, and a kept installer's `--help` reading its own payload (readsItself), whose output is
 	// discarded and its run bounded when nil.
 	Exec func(ctx context.Context, exe string, args []string) error
+	// handLock, while set, is the lock file the installer exec runs is handed (flock.Hand).
+	handLock *os.File
 	// K8s is a run of `k8s`.
 	K8s K8sOptions
 	// PortFree and UDPPortFree replace the TCP and UDP port probes in tests.
@@ -223,6 +228,8 @@ type Installer struct {
 	removeDir bool
 	// hookUsers are the users the hooks' images run as, by reference, once read (hookUser).
 	hookUsers map[string]string
+	// gateway is the gateway record once read (readGateway): one read per run.
+	gateway *gatewayCache
 	// tuned is the host's tune.System once its engine read: one `docker info` per run.
 	tuned *tune.System
 	// setsWarned is the release this run warned of the sets only the VM's app socket feeds
@@ -239,8 +246,12 @@ type Installer struct {
 	answered               map[string]string // the form's answers, kept when it goes back to the TLS mode
 	// recorded are the values an upgrade keeps, which an added input's default may name.
 	recorded map[string]string
+	// derived are the inputs the last inputs() gave their default naming another input (DerivedVar).
+	derived map[string]bool
 	// again: this run is a re-run of an install.
 	again bool
+	// lockHeld is the lock file of the install's lifecycle lock while this run holds it (lockRun).
+	lockHeld *os.File
 	// boot is the disk set `vm create` boots (bootDisks).
 	boot bootDisk
 	// dropped is what an upgrade drops: inputs and hook returns the release removed.
@@ -311,6 +322,9 @@ func (in *Installer) Install(ctx context.Context) (err error) {
 	o := &in.O
 	if o.Dir == "" {
 		return errors.New("an install directory is required")
+	}
+	if err := checkDir(o.Dir); err != nil {
+		return refuse("give --dir a directory name without one", "--dir %q: %w", o.Dir, err)
 	}
 	if err := in.R.checkFront(); err != nil {
 		return err
@@ -921,6 +935,7 @@ func (in *Installer) decide(ctx context.Context, dir, mode string, pub publish, 
 			secrets[i.Key] = i.Secret
 		}
 	}
+	recordDerived(env, in.derived)
 	for _, sec := range in.secrets() {
 		v := in.restoredSecret(sec.Key)
 		if v == "" {
@@ -1276,11 +1291,16 @@ func (in *Installer) keepSelf() {
 // start brings the stack up, then runs the provision hook — idempotent, so a re-run runs it
 // again — unless --no-provision. Its caller holds the lifecycle lock.
 func (in *Installer) start(ctx context.Context, env *EnvFile) error {
-	if err := in.up(ctx, env); err != nil {
-		return err
-	}
 	h, err := in.hook()
 	if err != nil {
+		return err
+	}
+	return in.startWith(ctx, env, h)
+}
+
+// startWith is start with h, the release's provision hook (nil: none), decoded by the caller.
+func (in *Installer) startWith(ctx context.Context, env *EnvFile, h *providers.ProvisionHook) error {
+	if err := in.up(ctx, env); err != nil {
 		return err
 	}
 	if err := in.provisionUp(ctx, env, h); err != nil {
@@ -1323,7 +1343,7 @@ func (in *Installer) sameRelease(ctx context.Context, env *EnvFile) error {
 	if err != nil {
 		return err
 	}
-	if v == m.ProjectVersion && rev == strconv.Itoa(m.Revision) {
+	if isAt(m.ProjectVersion, m.Revision, v, rev) {
 		return nil
 	}
 	if in.O.Preloaded { // the VM's installer is its OS's: no other is the operator's to run
@@ -1508,6 +1528,16 @@ func (in *Installer) up(ctx context.Context, env *EnvFile) (err error) {
 			return err
 		}
 	}
+	// The services' tables before the content: a table a start loads gives its service the label
+	// that recreates it. Then the gateway's chains and files. Neither reads an image: a retry after
+	// a pull applies them not again.
+	get := func(k string) string { v, _ := env.Get(k); return v }
+	if err := in.loadTables(ctx, get); err != nil {
+		return err
+	}
+	if err := in.gatewayStart(ctx, get); err != nil {
+		return err
+	}
 	// What the start adds to the services and opens in the firewall, written again after a pull
 	// that brought back an image whose EXPOSE it reads.
 	prepare := func() error {
@@ -1520,15 +1550,7 @@ func (in *Installer) up(ctx context.Context, env *EnvFile) (err error) {
 			return err
 		}
 		mode, _ := env.Get("STOWAGE_TLS_MODE")
-		hn.domains = hostDomains(in.R.Spec.Front, mode, func(k string) string { v, _ := env.Get(k); return v })
-		// The services' tables first: a table a start loads gives its service the label that
-		// recreates it.
-		if err := in.loadTables(ctx, func(k string) string { v, _ := env.Get(k); return v }); err != nil {
-			return err
-		}
-		if err := in.gatewayStart(ctx, func(k string) string { v, _ := env.Get(k); return v }); err != nil {
-			return err
-		}
+		hn.domains = hostDomains(in.R.Spec.Front, mode, get)
 		if err := in.writeContent(ctx, m, env, environ, hn); err != nil {
 			return err
 		}
@@ -1653,7 +1675,6 @@ func (in *Installer) up(ctx context.Context, env *EnvFile) (err error) {
 	if err := in.sweepInputFiles(env); err != nil {
 		in.O.logf("warning: removing the files of the inputs' earlier values: %v", err)
 	}
-	get := func(k string) string { v, _ := env.Get(k); return v }
 	ca := in.l4FactsOf(ctx, get)
 	for _, r := range in.R.Spec.L4.Routes {
 		if e := in.l4Exposure(r, get, off, ca); e != "" {
@@ -2081,7 +2102,7 @@ func (in *Installer) l4Exposure(r spec.L4Route, get func(string) string, off []s
 		hint = " (" + r.BindInput + " gives it one address)"
 	}
 	switch {
-	case r.AllowInput != "" && in.gatewayConsented() && ca.allowHolds != nil && ca.allowHolds():
+	case r.AllowInput != "" && in.gatewayConsented() && ca.allowHolds():
 		if where == "on every address" {
 			where = "on IPv4's every address"
 		}
@@ -2097,19 +2118,28 @@ func (in *Installer) l4Exposure(r spec.L4Route, get func(string) string, off []s
 	return where + open + hint
 }
 
-// l4Facts are what the L4 routes' lines read of the install once for them all: its client CA as
-// heldClientCA reads it, or why it could not, and whether its allowlists hold (allowHolds), read
-// once when a line asks (nil: they do not).
+// l4Facts are what the L4 routes' lines, and status's gateway line, read of the install once for
+// them all: its client CA as heldClientCA reads it, or why it could not, and its allowlists' state
+// (allowOnce), read once when a line asks (nil: they do not hold).
 type l4Facts struct {
-	certs      []byte
-	err        error
-	allowHolds func() bool
+	certs []byte
+	err   error
+	allow func() (marked, holds bool)
+}
+
+// allowHolds reports whether the allowlists hold, as allow reads it.
+func (f l4Facts) allowHolds() bool {
+	if f.allow == nil {
+		return false
+	}
+	_, holds := f.allow()
+	return holds
 }
 
 // l4FactsOf reads the l4Facts of the install, as get gives its values.
 func (in *Installer) l4FactsOf(ctx context.Context, get func(string) string) l4Facts {
 	c, err := in.heldClientCA(false)
-	return l4Facts{c, err, sync.OnceValue(func() bool { return in.allowHolds(ctx, get) })}
+	return l4Facts{c, err, in.allowOnce(ctx, get)}
 }
 
 // heldClientCA is the install's client CA (--client-ca) as the front reads it: its CA
@@ -2767,7 +2797,9 @@ func (in *Installer) Status(ctx context.Context) error {
 	fmt.Fprintf(in.O.Out, "%s %s (revision %s)\nregistry  %s\n", get("STOWAGE_NAME"), get("STOWAGE_PROJECT_VERSION"), get("STOWAGE_REVISION"), get("STOWAGE_REGISTRY"))
 	p, by := in.tuneProfile(get)
 	fmt.Fprintf(in.O.Out, "%-9s %s (%s)\n", "tune", p, by)
-	if g := in.gatewayStatus(ctx, get); g != "" {
+	// The allowlists' state is read once, for the gateway line and the L4 routes' lines.
+	ca := in.l4FactsOf(ctx, get)
+	if g := in.gatewayStatus(ctx, get, ca.allow); g != "" {
 		fmt.Fprintf(in.O.Out, "%-9s %s\n", "gateway", g)
 	}
 	split := in.volumesSplit()
@@ -2789,7 +2821,6 @@ func (in *Installer) Status(ctx context.Context) error {
 	if err != nil {
 		fmt.Fprintf(in.O.Out, "warning: the services whose profiles are off could not be read: %v\n", err)
 	}
-	ca := in.l4FactsOf(ctx, get)
 	for _, r := range in.R.Spec.L4.Routes {
 		line := strings.TrimSpace(fmt.Sprintf("%s/%d %s", r.Protocol, r.Port, get(spec.L4Var(r.Name))))
 		if e := in.l4Exposure(r, get, off, ca); e != "" {
@@ -3052,6 +3083,15 @@ func (in *Installer) inputs(ctx context.Context, list []input, back bool) (map[s
 		}
 	}
 	values, missing := in.resolve(list, given, answers)
+	// The inputs that take a default naming another input, given no value: recorded (DerivedVar),
+	// so a re-run changing that other expands the default again.
+	in.derived = map[string]bool{}
+	for _, i := range list {
+		_, isGiven := given[i.Key]
+		if _, ok := values[i.Key]; ok && !isGiven && answers[i.Key] == "" && refInDefault.MatchString(i.Default) {
+			in.derived[i.Key] = true
+		}
+	}
 	if len(missing) > 0 {
 		return nil, refuse(in.flagFix("give each with --set KEY=VALUE, --set-file KEY=PATH or --answers"), "missing required input(s), set by --set KEY=VALUE, the environment or --answers: %s", strings.Join(missing, "; "))
 	}
@@ -3108,9 +3148,7 @@ func (in *Installer) resolve(list []input, given, answers map[string]string) (ma
 			v = answers[i.Key]
 		}
 		if !ok && v == "" {
-			v = refInDefault.ReplaceAllStringFunc(i.Default, func(m string) string {
-				return values[refInDefault.FindStringSubmatch(m)[1]]
-			})
+			v = expandDefault(i.Default, func(k string) string { return values[k] })
 		}
 		if v == "" && i.Required {
 			what := i.Prompt
@@ -3123,6 +3161,26 @@ func (in *Installer) resolve(list []input, given, answers map[string]string) (ma
 		values[i.Key] = v
 	}
 	return values, missing
+}
+
+// expandDefault is an input's default with each ${KEY} it names replaced by get's value of KEY.
+func expandDefault(def string, get func(string) string) string {
+	return refInDefault.ReplaceAllStringFunc(def, func(m string) string {
+		return get(refInDefault.FindStringSubmatch(m)[1])
+	})
+}
+
+// namedChanged reports whether next records another value than env for an input def names
+// (${KEY}).
+func namedChanged(def string, env, next *EnvFile) bool {
+	for _, m := range refInDefault.FindAllStringSubmatch(def, -1) {
+		a, _ := env.Get(m[1])
+		b, _ := next.Get(m[1])
+		if a != b {
+			return true
+		}
+	}
+	return false
 }
 
 // imageRef is where an image is taken from: pinned by digest; offline, by the release's tag,
@@ -3140,21 +3198,44 @@ func (in *Installer) imageRef(prefix, key string) string {
 	return in.R.ImageRef(prefix, key)
 }
 
-// frontImage is where the release's front is taken from: published with its images.
-func (in *Installer) frontImage(prefix string) string { return in.imageRef(prefix, front.Key) }
-
 // stowageImageVars records the references of the release's own images a start runs: the front's,
 // for a project with one, and the volume helper's, for a release that carries it. Recorded, they
 // keep the first install's way of reaching images (by digest, or loaded by tag) on every run.
 func (in *Installer) stowageImageVars(env *EnvFile, prefix string) {
-	env.Delete(FrontImageVar)
-	if in.R.Spec.HasFront() {
-		env.Set(FrontImageVar, in.frontImage(prefix))
+	for _, o := range ownImages {
+		env.Delete(o.envVar)
 	}
-	env.Delete(ChownImageVar)
-	if in.R.Manifest.Artifacts.Images[chown.Key] != "" {
-		env.Set(ChownImageVar, in.imageRef(prefix, chown.Key))
+	for _, o := range in.R.ownImages() {
+		env.Set(o.envVar, in.imageRef(prefix, o.key))
 	}
+}
+
+// ownImage is one of the release's own images a start runs, which no service of the compose file
+// names: its key in the release manifest, the .env variable recording its reference, and whether
+// a release runs it.
+type ownImage struct {
+	key, envVar string
+	runs        func(r *Release) bool
+}
+
+// ownImages are every image of Stowage's own a start may run: the front, for a project with one
+// (a release of one carries it), and the volume helper, for a release that carries it. The
+// variables they record (stowageImageVars), the images a start pulls and checks (stackImages) and
+// those the VM's OS preloads (allPreloaded) are all read from this list.
+var ownImages = []ownImage{
+	{front.Key, FrontImageVar, func(r *Release) bool { return r.Spec.HasFront() }},
+	{chown.Key, ChownImageVar, func(r *Release) bool { return r.Manifest.Artifacts.Images[chown.Key] != "" }},
+}
+
+// ownImages are the images of Stowage's own (ownImages) the release runs.
+func (r *Release) ownImages() []ownImage {
+	var out []ownImage
+	for _, o := range ownImages {
+		if o.runs(r) {
+			out = append(out, o)
+		}
+	}
+	return out
 }
 
 // checkDocker requires the Docker engine (≥ MinDockerIPv6 with --ipv6) and Compose ≥ MinCompose.
@@ -3204,16 +3285,16 @@ func (im image) pinned() bool { return strings.Contains(im.ref, "@sha256:") }
 func (in *Installer) stackImages(env *EnvFile) []image {
 	a := in.R.Manifest.Artifacts
 	var out []image
-	if ref, ok := env.Get(FrontImageVar); ok {
-		out = append(out, image{ref, []string{a.Images[front.Key], a.Manifests[front.Key], a.Configs[front.Key]}})
-	}
 	for _, k := range in.R.Spec.ImageNames() {
 		ref, _ := env.Get(ImageVar(k))
 		out = append(out, image{ref, []string{a.Images[k], a.Manifests[k], a.Configs[k]}})
 	}
-	// The volume helper, which no service runs: a start runs it to give new volumes their uid.
-	if ref, ok := env.Get(ChownImageVar); ok {
-		out = append(out, image{ref, []string{a.Images[chown.Key], a.Manifests[chown.Key], a.Configs[chown.Key]}})
+	// Stowage's own images the file records (the front, the volume helper, which a start runs to
+	// give new volumes their uid).
+	for _, o := range ownImages {
+		if ref, ok := env.Get(o.envVar); ok {
+			out = append(out, image{ref, []string{a.Images[o.key], a.Manifests[o.key], a.Configs[o.key]}})
+		}
 	}
 	// The backup runner, which no service runs: a Docker install's backups run it (the VM's OS
 	// bundle preloads it).
@@ -3492,13 +3573,30 @@ func loopbackAddr(a string) (string, error) {
 }
 
 func urlHost(a string) string {
-	switch ip, _ := netip.ParseAddr(a); {
-	case a == "127.0.0.1":
+	if a == "127.0.0.1" {
 		return "localhost"
-	case ip.Is6():
-		return "[" + a + "]"
 	}
-	return a
+	return bracketIPv6(a)
+}
+
+// bracketIPv6 returns an IPv6 address in brackets, as a URL, scp or a host:port writes it, and any
+// other host as given.
+func bracketIPv6(h string) string {
+	if a, err := netip.ParseAddr(h); err == nil && a.Is6() {
+		return "[" + h + "]"
+	}
+	return h
+}
+
+// unbracket returns an address written in brackets ([::1]) without them, and any other host as
+// given.
+func unbracket(h string) string {
+	if inner, ok := strings.CutPrefix(h, "["); ok {
+		if inner, ok := strings.CutSuffix(inner, "]"); ok {
+			return inner
+		}
+	}
+	return h
 }
 
 const alnum = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"

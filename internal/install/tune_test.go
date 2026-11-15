@@ -585,6 +585,7 @@ func TestTuneWithAGatewayRecord(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(e.dir, GatewayFile), []byte("{"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	in.forgetGateway() // the next run's read
 	e.out.Reset()
 	if err := in.Tune(ctx, TuneOptions{Revert: true}); err == nil || !strings.Contains(err.Error(), "fix or remove it, then tune again") || strings.Contains(e.out.String(), "the tuning files are removed") {
 		t.Errorf("revert of a record that does not read: %v\n%s", err, e.out)
@@ -596,6 +597,7 @@ func TestTuneWithAGatewayRecord(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(e.dir, GatewayFile), []byte(`{"digest":"`+dirDigest(in.gatewayDir())+`","dir":"`+in.gatewayDir()+`"}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	in.forgetGateway()
 	applied := func() bool {
 		in.tuned = nil
 		sys, err := in.tuneSystem(ctx)

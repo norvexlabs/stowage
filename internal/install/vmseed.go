@@ -185,7 +185,7 @@ func (in *Installer) SeedVM(ctx context.Context, c *VMCreate, so SeedOptions) (*
 	}
 	// A --platform missing, unknown or whose disk the registry lacks is refused once the registry
 	// is read (platform), naming the platforms it offers: a fix that holds.
-	prefix, cl, err := in.seedRegistry(ctx, c.Platform)
+	prefix, cl, err := in.seedRegistry(ctx, &c.Platform)
 	if err != nil {
 		return nil, err
 	}

@@ -1141,18 +1141,25 @@ func TestAnInstallOfAnotherShortNameIsRefused(t *testing.T) {
 	if err := e.install(nil); err != nil {
 		t.Fatalf("a re-run of the same release: %v", err)
 	}
-	envFile := filepath.Join(e.dir, ".env")
+	keptAs(t, e.dir, "nt")
+	if err := e.install(nil); err == nil || !strings.Contains(err.Error(), "install this release afresh") {
+		t.Fatalf("a re-run over an install of another short name: %v", err)
+	}
+}
+
+// keptAs makes the install in dir one kept under the short name short, and returns its .env.
+func keptAs(t *testing.T, dir, short string) []byte {
+	t.Helper()
+	envFile := filepath.Join(dir, ".env")
 	raw, _ := os.ReadFile(envFile)
-	renamed := regexp.MustCompile(`(?m)^STOWAGE_SHORT_NAME=.*$`).ReplaceAll(raw, []byte("STOWAGE_SHORT_NAME='nt'"))
+	renamed := regexp.MustCompile(`(?m)^STOWAGE_SHORT_NAME=.*$`).ReplaceAll(raw, []byte("STOWAGE_SHORT_NAME='"+short+"'"))
 	if bytes.Equal(raw, renamed) {
 		t.Fatal(".env records no STOWAGE_SHORT_NAME")
 	}
 	if err := os.WriteFile(envFile, renamed, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := e.install(nil); err == nil || !strings.Contains(err.Error(), "install this release afresh") {
-		t.Fatalf("a re-run over an install of another short name: %v", err)
-	}
+	return renamed
 }
 
 func TestAReRunChangesWhatItIsGiven(t *testing.T) {
@@ -1348,6 +1355,49 @@ func TestInputPrecedenceAndDefaults(t *testing.T) {
 		if got := get(f, k); got != want {
 			t.Errorf("%s = %q, want %q", k, got, want)
 		}
+	}
+}
+
+// An input whose default names another, never given, follows that other on a re-run; once given,
+// it is the operator's and stays.
+func TestADerivedInputFollowsTheInputItNames(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	e.r.Spec.Inputs = append(e.r.Spec.Inputs,
+		inputWithDefault("OWNER_EMAIL", "owner-${ADMIN_EMAIL}"),
+		inputWithDefault("TEAM", "${ADMIN_EMAIL}"),
+		inputWithDefault("EARLY", "${LATER}"), // names a later input: empty when taken
+		inputWithDefault("LATER", "late"))
+	if err := e.install(func(o *Options) { o.Set = map[string]string{"TEAM": "core"} }); err != nil {
+		t.Fatal(err)
+	}
+	f := e.readEnv()
+	if get(f, "OWNER_EMAIL") != "owner-admin@example.org" || get(f, DerivedVar) != "EARLY,OWNER_EMAIL" {
+		t.Fatalf("first install: OWNER_EMAIL=%q %s=%q", get(f, "OWNER_EMAIL"), DerivedVar, get(f, DerivedVar))
+	}
+	rerun := func(set map[string]string) *EnvFile {
+		t.Helper()
+		e.log.Reset()
+		if err := e.install(func(o *Options) { o.Set = set }); err != nil {
+			t.Fatal(err)
+		}
+		return e.readEnv()
+	}
+	// A plain re-run changes nothing recorded, whatever the defaults would give now.
+	if f = rerun(nil); get(f, "EARLY") != "" || get(f, "OWNER_EMAIL") != "owner-admin@example.org" {
+		t.Errorf("a plain re-run: EARLY=%q OWNER_EMAIL=%q", get(f, "EARLY"), get(f, "OWNER_EMAIL"))
+	}
+	f = rerun(map[string]string{"ADMIN_EMAIL": "ops@example.org"})
+	if get(f, "OWNER_EMAIL") != "owner-ops@example.org" || get(f, "TEAM") != "core" || !strings.Contains(e.log.String(), "changing OWNER_EMAIL: owner-admin@example.org → owner-ops@example.org") {
+		t.Errorf("the input it names changed: OWNER_EMAIL=%q TEAM=%q\n%s", get(f, "OWNER_EMAIL"), get(f, "TEAM"), e.log)
+	}
+	f = rerun(map[string]string{"OWNER_EMAIL": "boss@example.org"})
+	if get(f, "OWNER_EMAIL") != "boss@example.org" || get(f, DerivedVar) != "EARLY" {
+		t.Errorf("given: OWNER_EMAIL=%q %s=%q", get(f, "OWNER_EMAIL"), DerivedVar, get(f, DerivedVar))
+	}
+	f = rerun(map[string]string{"ADMIN_EMAIL": "it@example.org"})
+	if get(f, "OWNER_EMAIL") != "boss@example.org" {
+		t.Errorf("given before, then the input it names changed: OWNER_EMAIL=%q", get(f, "OWNER_EMAIL"))
 	}
 }
 
@@ -1721,6 +1771,41 @@ func TestAnImageGoneAsTheStackStartsIsPulledAgain(t *testing.T) {
 	e.docker.onUp = func() error { ups++; return errors.New("unhealthy") }
 	if err := e.install(nil); err == nil || ups != 1 {
 		t.Fatalf("%v, %d ups", err, ups)
+	}
+}
+
+// Each of Stowage's own images a release runs reaches every list a start reads: its variable in
+// .env, the images a start pulls and checks, and those the VM's OS preloads.
+func TestStowagesOwnImagesReachEveryList(t *testing.T) {
+	t.Parallel()
+	r := testRelease(t, "1.0.0")
+	if got := len(r.ownImages()); got != len(ownImages) {
+		t.Fatalf("the test release runs %d of Stowage's %d own images", got, len(ownImages))
+	}
+	for _, o := range ownImages {
+		digest := r.Manifest.Artifacts.Images[o.key]
+		named := "-" + o.key + "@" + digest // its reference, by its key
+		var inspected []string
+		in := &Installer{R: r, O: Options{Docker: runTool(func(c Cmd) ([]byte, error) {
+			ref := c.Args[len(c.Args)-1]
+			inspected = append(inspected, ref)
+			if strings.Contains(ref, named) {
+				return nil, errors.New("No such image")
+			}
+			return []byte("sha256:x\n"), nil
+		})}}
+		env := NewEnvFile()
+		in.stowageImageVars(env, "registry.example/acme")
+		ref, ok := env.Get(o.envVar)
+		if !ok || !strings.Contains(ref, named) {
+			t.Errorf("%s: %s is %q", o.key, o.envVar, ref)
+		}
+		if !slices.ContainsFunc(in.stackImages(env), func(im image) bool { return im.ref == ref && slices.Contains(im.ids, digest) }) {
+			t.Errorf("%s: not an image a start pulls: %v", o.key, in.stackImages(env))
+		}
+		if in.allPreloaded(context.Background()) || !slices.ContainsFunc(inspected, func(s string) bool { return strings.Contains(s, named) }) {
+			t.Errorf("%s: the OS's preload is not checked for it: %q", o.key, inspected)
+		}
 	}
 }
 
@@ -2177,6 +2262,23 @@ func TestBindHereLoopbackRange(t *testing.T) {
 	} {
 		if got := hostHolds(c.addrs, c.a); got != c.want {
 			t.Errorf("%v holds %s: %v", c.addrs, c.a, got)
+		}
+	}
+}
+
+// A directory whose name holds a control character is refused before anything is written: the
+// host's units name it, where a line break would start a directive and a ? stand for a tab.
+func TestInstallRefusesADirWithAControlCharacter(t *testing.T) {
+	t.Parallel()
+	for _, name := range []string{"no\ttes", "no\ntes", "no\x7ftes"} {
+		e := newEnv(t)
+		e.dir = filepath.Join(filepath.Dir(e.dir), name)
+		err := e.installer(nil).Install(context.Background())
+		if !isRefused(err) || !strings.Contains(err.Error(), "--dir ") || !strings.Contains(err.Error(), "control character") {
+			t.Errorf("%q: %v", name, err)
+		}
+		if _, err := os.Stat(e.dir); err == nil {
+			t.Errorf("%q: the refused install made its directory", name)
 		}
 	}
 }

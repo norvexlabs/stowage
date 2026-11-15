@@ -21,6 +21,7 @@ import (
 
 	"go.yaml.in/yaml/v3"
 
+	"github.com/norvexlabs/stowage/internal/release"
 	"github.com/norvexlabs/stowage/internal/spec"
 )
 
@@ -389,6 +390,139 @@ func TestUpgradeSendsTheConfirmedReleaseAndNoVersionUnasked(t *testing.T) {
 	}
 }
 
+// --unordered reaches the daemon with --version, and is refused without it before the daemon is
+// asked anything.
+func TestUpgradeSendsUnordered(t *testing.T) {
+	t.Parallel()
+	e := vmEnv(t, "1.0.0")
+	var got UpgradeRequest
+	asked := 0
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/updates", func(w http.ResponseWriter, _ *http.Request) {
+		asked++
+		reply(w, 200, Update{Channel: "stable", Current: Version{"1.0.0", 1}, Target: Version{"0.9.0", 1}, Available: true})
+	})
+	mux.HandleFunc("POST /v1/upgrade", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&got)
+		reply(w, 202, JobStarted{Job: "upgrade", Target: "0.9.0-1", Started: fakeStart, Events: ptr(int64(0))})
+	})
+	mux.HandleFunc("GET /v1/job", func(w http.ResponseWriter, _ *http.Request) {
+		reply(w, 200, JobStatus{Started: ptr(fakeStart), Kind: "upgrade", Target: "0.9.0-1", State: "done", Log: []string{}})
+	})
+	sock := servedHandler(t, mux)
+	if out, err := ctl(e, sock, "upgrade", "--yes", "--unordered"); err == nil || !strings.Contains(err.Error(), "--unordered is for --version") || asked != 0 {
+		t.Fatalf("--unordered alone: %v, asked %d\n%s", err, asked, out)
+	}
+	if out, err := ctl(e, sock, "upgrade", "--yes", "--version", "0.9.0", "--unordered"); err != nil {
+		t.Fatalf("%v\n%s", err, out)
+	}
+	if got.Version != "0.9.0" || !got.Unordered {
+		t.Errorf("sent %+v", got)
+	}
+}
+
+// reset-db's --unordered reaches the daemon with --new-baseline --version, in the plan's GET and
+// the POST, and is refused without --version before the daemon is asked.
+func TestResetSendsUnordered(t *testing.T) {
+	t.Parallel()
+	e := vmEnv(t, "1.0.0")
+	var got ResetRequest
+	var unordered, version string
+	asked := 0
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/reset-db", func(w http.ResponseWriter, r *http.Request) {
+		asked++
+		unordered, version = r.URL.Query().Get("unordered"), r.URL.Query().Get("version")
+		reply(w, 200, ResetPlan{Target: Version{"2.0.0", 1}, Plan: "cross", Token: "t"})
+	})
+	mux.HandleFunc("POST /v1/reset-db", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&got)
+		reply(w, 202, JobStarted{Job: "reset-db", Target: "2.0.0-1", Started: fakeStart, Events: ptr(int64(0))})
+	})
+	mux.HandleFunc("GET /v1/job", func(w http.ResponseWriter, _ *http.Request) {
+		reply(w, 200, JobStatus{Started: ptr(fakeStart), Kind: "reset-db", Target: "2.0.0-1", State: "done", Log: []string{}})
+	})
+	sock := servedHandler(t, mux)
+	for _, args := range [][]string{{"--unordered"}, {"--new-baseline", "--unordered"}} {
+		if out, err := ctl(e, sock, append([]string{"reset-db", "--yes"}, args...)...); err == nil || !strings.Contains(err.Error(), "--unordered is for --version") || asked != 0 {
+			t.Fatalf("%v: %v, asked %d\n%s", args, err, asked, out)
+		}
+	}
+	if out, err := ctl(e, sock, "reset-db", "--yes", "--new-baseline", "--version", "2.0.0", "--unordered"); err != nil {
+		t.Fatalf("%v\n%s", err, out)
+	}
+	if unordered != "true" || version != "2.0.0" || got.Version != "2.0.0" || !got.Unordered || !got.NewBaseline {
+		t.Errorf("asked unordered=%q version=%q, sent %+v", unordered, version, got)
+	}
+}
+
+// Under a `command` scheme, upgrade --version and reset-db --new-baseline --version naming another
+// release than the install's, without --unordered, are refused before the question, with the
+// daemon's fix; the install's own release is asked as any. The install runs 2.0.0 (a crossing
+// left it over this OS's 1.0.0), so the order is from 2.0.0.
+func TestAnUnorderedVersionIsRefusedBeforeTheQuestion(t *testing.T) {
+	t.Parallel()
+	run := func(p *pubEnv, args ...string) ([]string, error) {
+		var asked []string
+		host := &fakeHost{}
+		sock := served(t, daemon(p.env, host))
+		cmd := vmCommand(p.env.r, p.env.self, io.Discard, io.Discard, func(bool) Prompter { return titles{&asked} }, clientTimes{unit: time.Millisecond})
+		cmd.SetArgs(append(args, "--socket", sock))
+		err := cmd.Execute()
+		if calls := fmt.Sprint(host.calls()); strings.Contains(calls, "kairos-agent") {
+			t.Errorf("%v: ran %s", args, calls)
+		}
+		return asked, err
+	}
+	fix := func(v, cur, verb string) string {
+		return "run the same command again with --unordered added (only if you checked " + v + " comes after " + cur + "), or a plain " + verb + " (the channel's release)"
+	}
+	t.Run("upgrade", func(t *testing.T) {
+		t.Parallel()
+		p := vmPublished(t, spec.Provider{Name: "none"}, nil)
+		_, installed := testInstallerWith(t, "2.0.0", p.spec)
+		if err := copyFile(installed, filepath.Join(p.env.dir, "notes-stow"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		env := p.env.readEnv()
+		env.Set("STOWAGE_PROJECT_VERSION", "2.0.0")
+		env.Set(ChannelVar, "stable")
+		if err := env.WriteFile(filepath.Join(p.env.dir, envName)); err != nil {
+			t.Fatal(err)
+		}
+		p.release("2.0.0", 1, commandScheme)
+		yanked := p.release("4.0.0", 1, commandScheme)
+		yanked.Yanked = &release.Yank{Reason: "broken", Date: time.Now()}
+		p.putRelease("4.0.0-1", yanked)
+		p.release("5.0.0", 1, func(m *release.Manifest) { commandScheme(m); m.Artifacts.OS = "" })
+		p.release("3.0.0", 1, commandScheme)
+		// A yanked release is refused as one (the daemon finds none to offer), not as unordered.
+		if asked, err := run(p, "upgrade", "--version", "4.0.0"); err == nil || !strings.Contains(err.Error(), "yanked") || strings.Contains(err.Error(), "--unordered") || len(asked) != 0 {
+			t.Errorf("yanked: %v, asked %q", err, asked)
+		}
+		// So is one published without an OS bundle, which the daemon offers to no upgrade.
+		if asked, err := run(p, "upgrade", "--version", "5.0.0"); err == nil || !strings.Contains(err.Error(), "published without an OS bundle") || strings.Contains(err.Error(), "--unordered") || len(asked) != 0 {
+			t.Errorf("no OS bundle: %v, asked %q", err, asked)
+		}
+		asked, err := run(p, "upgrade", "--version", "3.0.0")
+		if r, _ := Refusal(err); r.Fix != fix("3.0.0", "2.0.0", "upgrade") || len(asked) != 0 {
+			t.Errorf("%v (fix %q), asked %q", err, r.Fix, asked)
+		}
+		if asked, err := run(p, "upgrade", "--version", "2.0.0"); !errors.Is(err, ErrAborted) || len(asked) != 1 {
+			t.Errorf("the install's release: %v, asked %q", err, asked)
+		}
+	})
+	t.Run("reset-db", func(t *testing.T) {
+		t.Parallel()
+		p := vmPublished(t, spec.Provider{Name: "none"}, nil)
+		p.releaseOf("2.0.0", atBaseline(2), commandScheme)
+		asked, err := run(p, "reset-db", "--new-baseline", "--channel", "stable", "--version", "2.0.0")
+		if r, _ := Refusal(err); r.Fix != fix("2.0.0", "1.0.0", "reset-db --new-baseline") || len(asked) != 0 {
+			t.Errorf("%v (fix %q), asked %q", err, r.Fix, asked)
+		}
+	})
+}
+
 func TestUpdatesSaysWhenTheInstallWentBackFromTheTarget(t *testing.T) {
 	t.Parallel()
 	var b bytes.Buffer
@@ -534,6 +668,91 @@ func TestTheAppSocketServesTheAPIToTheInstallsToken(t *testing.T) {
 	}
 }
 
+// The app socket's token is read from .env once per change of the file: another file (an atomic
+// rewrite), another size or another time reads it again; requests at once share the read.
+func TestTheAppSocketsTokenIsReadOncePerChange(t *testing.T) {
+	t.Parallel()
+	e := vmEnv(t, "1.0.0")
+	if err := e.install(vm); err != nil {
+		t.Fatal(err)
+	}
+	h := daemon(e, &fakeHost{})
+	path := filepath.Join(e.dir, envName)
+	token := get(e.readEnv(), HostTokenVar)
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Go(func() {
+			if got := h.appToken(); got != token {
+				t.Errorf("at once: %q", got)
+			}
+		})
+	}
+	wg.Wait()
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	other := strings.Repeat("x", len(token))
+	rewrite := func(content []byte, atomic bool, mod time.Time) {
+		t.Helper()
+		target := path
+		if atomic {
+			target = path + ".new"
+		}
+		if err := os.WriteFile(target, content, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(target, mod, mod); err != nil {
+			t.Fatal(err)
+		}
+		if atomic {
+			if err := os.Rename(target, path); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	// The same file, size and time: the kept token.
+	same := bytes.Replace(raw, []byte(token), []byte(other), 1)
+	rewrite(same, false, fi.ModTime())
+	if got := h.appToken(); got != token {
+		t.Errorf("an unchanged stat read again: %q", got)
+	}
+	for what, c := range map[string]struct {
+		atomic bool
+		mod    time.Time
+	}{
+		"another time": {false, fi.ModTime().Add(time.Second)},
+		"another file": {true, fi.ModTime()},
+	} {
+		rewrite(raw, false, fi.ModTime())
+		_ = h.appToken()
+		h.tokenMu.Lock()
+		h.tokenFile, h.token = nil, ""
+		h.tokenMu.Unlock()
+		if got := h.appToken(); got != token {
+			t.Fatalf("%s: before: %q", what, got)
+		}
+		rewrite(same, c.atomic, c.mod)
+		if got := h.appToken(); got != other {
+			t.Errorf("%s: %q, want the new token", what, got)
+		}
+	}
+	rewrite(append(bytes.Clone(raw), "# a longer file\n"...), false, fi.ModTime())
+	if got := h.appToken(); got != token {
+		t.Errorf("another size: %q", got)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if got := h.appToken(); got != "" {
+		t.Errorf("no install: %q", got)
+	}
+}
+
 func TestTheAppSocketRefusesTheOperatorsRoutes(t *testing.T) {
 	t.Parallel()
 	e := vmEnv(t, "1.0.0")
@@ -564,6 +783,35 @@ func TestTheAppSocketRefusesTheOperatorsRoutes(t *testing.T) {
 	req.Header.Set("Authorization", "Bearer "+token)
 	if h.AppHandler().ServeHTTP(w, req); w.Code != http.StatusForbidden || !strings.Contains(w.Body.String(), "skip_backup is the operator's") {
 		t.Errorf("an app's upgrade without its backup: %d %s", w.Code, w.Body.String())
+	}
+	// So is vouching for the order of a version the daemon cannot order: a refusal whose fix is the
+	// operator's command over SSH, with the request's version and channel. Without a version it is
+	// the bad request it is from anyone.
+	for _, c := range []struct {
+		method, path, body string
+		code               int
+		error, fix         string
+	}{
+		{"POST", "/v1/upgrade", `{"channel": "beta", "version": "2.0.0", "unordered": true}`, http.StatusForbidden,
+			"unordered is the operator's: the operator alone vouches for an order this daemon cannot check", "run `sudo notes-stow upgrade --channel beta --version 2.0.0 --unordered` over SSH"},
+		{"POST", "/v1/upgrade", `{"version": "2.0.0", "unordered": true}`, http.StatusForbidden,
+			"unordered is the operator's: the operator alone vouches for an order this daemon cannot check", "run `sudo notes-stow upgrade --version 2.0.0 --unordered` over SSH"},
+		{"GET", "/v1/reset-db?new_baseline=true&channel=beta&version=2.0.0&unordered=true", "", http.StatusForbidden,
+			"unordered is the operator's: the operator alone vouches for an order this daemon cannot check", "run `sudo notes-stow reset-db --new-baseline --channel beta --version 2.0.0 --unordered` over SSH"},
+		{"POST", "/v1/upgrade", `{"channel": "beta", "unordered": true}`, http.StatusBadRequest,
+			"--unordered is for --version: a plain upgrade follows the channel, which ship moves only to a release the scheme orders after it", "leave out --unordered, or give --version"},
+		{"GET", "/v1/reset-db?new_baseline=true&channel=beta&unordered=true", "", http.StatusBadRequest,
+			"--unordered is for --version: a plain reset-db --new-baseline installs the channel's release, which ship moves only to a release the scheme orders after it", "leave out --unordered, or give --version"},
+	} {
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(c.method, c.path, strings.NewReader(c.body))
+		req.Header.Set("Authorization", "Bearer "+token)
+		h.AppHandler().ServeHTTP(w, req)
+		var e errOf
+		_ = json.Unmarshal(w.Body.Bytes(), &e)
+		if w.Code != c.code || !e.Refused || e.Error != c.error || e.Fix != c.fix {
+			t.Errorf("an app's unordered %s %s: %d %s", c.method, c.path, w.Code, w.Body.String())
+		}
 	}
 	// Every route an app's console operates the VM with stays the app's.
 	for _, pattern := range []string{"GET /v1/status", "GET /v1/updates", "POST /v1/upgrade", "GET /v1/job", "GET /v1/rollback", "POST /v1/rollback",
@@ -1461,5 +1709,79 @@ func TestAFollowReadsADaemonThatAnswersLate(t *testing.T) {
 	out, err := bounded(t, func() (string, error) { return ctl(e, sock, "upgrade", "--yes") })
 	if err == nil || !strings.Contains(err.Error(), "upgrade 2.0.0-1 lost: the daemon restarted") {
 		t.Errorf("%v\n%s", err, out)
+	}
+}
+
+// The VM's updates names `upgrade --version` to the release the install runs, or to the passive
+// system's, with no --unordered, even when the --version asked for needs it: the daemon orders a
+// --version from the release the install runs, and the passive system's is that one.
+func TestUpdatesHintsTheInstallsReleaseWithoutUnordered(t *testing.T) {
+	t.Parallel()
+	for _, c := range []struct {
+		u    Update
+		want string
+	}{
+		// `updates --version 3.0.0` under a `command` scheme, 3.0.0 yanked: the install a crossing
+		// left on 2.0.0 runs over an OS of 1.0.0.
+		{Update{Channel: "stable", Current: Version{"1.0.0", 1}, Target: Version{"3.0.0", 1}, Passive: true, Installed: &Version{"2.0.0", 1}, NeedsUnordered: true},
+			"the install runs 2.0.0 (revision 1), which this OS (1.0.0 (revision 1)) does not carry: `upgrade --version 2.0.0` writes its OS\n"},
+		// The same, the install on the OS's release, which the passive system runs.
+		{Update{Channel: "stable", Current: Version{"1.0.0", 1}, Target: Version{"3.0.0", 1}, Passive: true, Installed: &Version{"1.0.0", 1}, NeedsUnordered: true},
+			"the VM runs the passive system (a boot that failed went back to it): `upgrade --version 1.0.0` writes 1.0.0's latest revision (1.0.0 (revision 1) again when it is that one) to the active slot\n"},
+	} {
+		var b strings.Builder
+		printUpdate(&b, c.u)
+		if !strings.HasSuffix(b.String(), c.want) || strings.Contains(b.String(), "--unordered") {
+			t.Errorf("%+v:\n%s", c.u, b.String())
+		}
+	}
+}
+
+// The client refuses an upgrade whose --version the daemon says needs --unordered before it asks
+// anything, with the daemon's fix; with --unordered it asks, and sends it. A version refused for
+// another reason (not offered: a yanked release, as a daemon that found it would answer) is told
+// that reason, not to add --unordered.
+func TestTheClientRefusesANeedsUnorderedVersionBeforeTheQuestion(t *testing.T) {
+	t.Parallel()
+	e := vmEnv(t, "1.0.0")
+	available := true
+	var got *UpgradeRequest
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/updates", func(w http.ResponseWriter, _ *http.Request) {
+		reply(w, 200, Update{Channel: "stable", Current: Version{"1.0.0", 1}, Target: Version{"3.0.0", 1}, Available: available, NeedsUnordered: true})
+	})
+	mux.HandleFunc("POST /v1/upgrade", func(w http.ResponseWriter, r *http.Request) {
+		got = &UpgradeRequest{}
+		_ = json.NewDecoder(r.Body).Decode(got)
+		reply(w, 202, JobStarted{Job: "upgrade", Target: "3.0.0-1", Started: fakeStart, Events: ptr(int64(0))})
+	})
+	mux.HandleFunc("GET /v1/job", func(w http.ResponseWriter, _ *http.Request) {
+		reply(w, 200, JobStatus{Started: ptr(fakeStart), Kind: "upgrade", Target: "3.0.0-1", State: "done", Log: []string{}})
+	})
+	sock := servedHandler(t, mux)
+	run := func(args ...string) ([]string, string, error) {
+		var asked []string
+		var out bytes.Buffer
+		cmd := vmCommand(e.r, e.self, &out, &out, func(bool) Prompter { return titles{&asked} }, clientTimes{unit: time.Millisecond})
+		cmd.SetArgs(append(args, "--socket", sock))
+		err := cmd.Execute()
+		return asked, out.String(), err
+	}
+	asked, out, err := run("upgrade", "--version", "3.0.0")
+	if r, _ := Refusal(err); r.Fix != "run the same command again with --unordered added (only if you checked 3.0.0 comes after 1.0.0), or a plain upgrade (the channel's release)" ||
+		!strings.Contains(err.Error(), "whether 3.0.0 comes after 1.0.0, which the install runs, is not known here") || len(asked) != 0 || got != nil ||
+		strings.Contains(out, "3.0.0 (revision 1) on stable") {
+		t.Fatalf("%v (fix %q), asked %q, sent %+v\n%s", err, r.Fix, asked, got, out)
+	}
+	if asked, out, err := run("upgrade", "--version", "3.0.0", "--unordered"); len(asked) != 1 {
+		t.Fatalf("--unordered: %v, asked %q\n%s", err, asked, out)
+	}
+	if _, out, err := run("upgrade", "--version", "3.0.0", "--unordered", "--yes"); err != nil || got == nil || !got.Unordered || got.Version != "3.0.0" {
+		t.Fatalf("--unordered --yes: %v, sent %+v\n%s", err, got, out)
+	}
+	available, got = false, nil
+	if asked, out, err := run("upgrade", "--version", "3.0.0"); err == nil || !strings.Contains(err.Error(), "is not one this VM, which runs 1.0.0 (revision 1), can be upgraded to") ||
+		strings.Contains(err.Error()+out, "--unordered added") || len(asked) != 0 || got != nil {
+		t.Errorf("not offered: %v, asked %q\n%s", err, asked, out)
 	}
 }

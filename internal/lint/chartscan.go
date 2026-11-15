@@ -6,7 +6,10 @@ import (
 	"compress/gzip"
 	"io"
 	"regexp"
+	"slices"
 	"strings"
+
+	"go.yaml.in/yaml/v3"
 
 	"github.com/norvexlabs/stowage/internal/helm"
 )
@@ -79,3 +82,54 @@ func archiveRoutesHTTP(data []byte, depth int) bool {
 		}
 	}
 }
+
+// templateAction is a template action on one line, {{ … }}.
+var templateAction = regexp.MustCompile(`\{\{.*?\}\}`)
+
+// provisionConfigMapKeys are the data keys of a ConfigMap <release>-stowage-provision the chart's
+// templates (a subchart's directory included) make, as far as they read without rendering: each
+// action stands for a value, a line holding nothing but actions is dropped, and a key an action
+// computes is not seen; a template that does not read so is skipped. Sorted.
+func provisionConfigMapKeys(c *helm.Chart) []string {
+	var keys []string
+	for _, f := range c.Files {
+		if !isTemplate(f.Name) || !bytes.Contains(f.Data, []byte(provisionConfigMap)) {
+			continue
+		}
+		var lines []string
+		for _, line := range strings.Split(string(f.Data), "\n") {
+			bare := templateAction.ReplaceAllString(line, "")
+			if bare != line && strings.TrimSpace(bare) == "" {
+				continue
+			}
+			lines = append(lines, templateAction.ReplaceAllString(line, "x"))
+		}
+		d := yaml.NewDecoder(strings.NewReader(strings.Join(lines, "\n")))
+		for {
+			var doc struct {
+				Kind     string `yaml:"kind"`
+				Metadata struct {
+					Name string `yaml:"name"`
+				} `yaml:"metadata"`
+				Data map[string]any `yaml:"data"`
+			}
+			if err := d.Decode(&doc); err != nil {
+				break
+			}
+			if doc.Kind != "ConfigMap" || !strings.HasSuffix(doc.Metadata.Name, provisionConfigMap) {
+				continue
+			}
+			for k := range doc.Data {
+				if !slices.Contains(keys, k) {
+					keys = append(keys, k)
+				}
+			}
+		}
+	}
+	slices.Sort(keys)
+	return keys
+}
+
+// provisionConfigMap ends the name of the ConfigMap a chart gives the provision hook through:
+// <release>-stowage-provision.
+const provisionConfigMap = "-stowage-provision"

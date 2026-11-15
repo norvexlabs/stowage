@@ -16,6 +16,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -278,6 +279,12 @@ func (in *Installer) allowState(ctx context.Context, get func(string) string) (m
 func (in *Installer) allowHolds(ctx context.Context, get func(string) string) bool {
 	_, holds := in.allowState(ctx, get)
 	return holds
+}
+
+// allowOnce is allowState, read once when first asked: a status's lines share one computation of
+// the rules, one read of the mark and one check of the jump.
+func (in *Installer) allowOnce(ctx context.Context, get func(string) string) func() (marked, holds bool) {
+	return sync.OnceValues(func() (bool, bool) { return in.allowState(ctx, get) })
 }
 
 // jumpWait bounds, in seconds, a check that DOCKER-USER jumps to a chain: iptables's wait for the
@@ -854,11 +861,43 @@ func (in *Installer) gatewayWhat() string {
 	return "the stack's network declarations, " + strings.Join(what, ", ")
 }
 
-// readGateway reads GatewayFile; an empty record when there is none. A record naming another path
+// readGateway reads GatewayFile once per run (gatewayCache); an empty record when there is none. A record naming another path
 // than the install's own networkd files (ownRecord) is refused: root removes what it lists.
 func (in *Installer) readGateway() (gatewayRecord, error) {
+	gatewayMu.Lock()
+	defer gatewayMu.Unlock()
+	p := in.path(GatewayFile)
+	if c := in.gateway; c == nil || c.path != p {
+		r, err := in.decodeGateway(p)
+		in.gateway = &gatewayCache{path: p, rec: r, err: err}
+	}
+	r := in.gateway.rec
+	r.Networkd = maps.Clone(r.Networkd) // a caller's change is never the next read's
+	return r, in.gateway.err
+}
+
+// gatewayCache is readGateway's read of the record, once per run: writeGateway and a removal of
+// the record forget it.
+type gatewayCache struct {
+	path string
+	rec  gatewayRecord
+	err  error
+}
+
+// gatewayMu guards each Installer's gateway cache.
+var gatewayMu sync.Mutex
+
+// forgetGateway drops the record's cached read: the next readGateway reads the file again.
+func (in *Installer) forgetGateway() {
+	gatewayMu.Lock()
+	in.gateway = nil
+	gatewayMu.Unlock()
+}
+
+// decodeGateway reads the record at p.
+func (in *Installer) decodeGateway(p string) (gatewayRecord, error) {
 	var r gatewayRecord
-	raw, err := os.ReadFile(in.path(GatewayFile))
+	raw, err := os.ReadFile(p)
 	if errors.Is(err, os.ErrNotExist) {
 		return r, nil
 	}
@@ -868,21 +907,22 @@ func (in *Installer) readGateway() (gatewayRecord, error) {
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&r); err != nil {
-		return gatewayRecord{}, fmt.Errorf("%s: %w", in.path(GatewayFile), err)
+		return gatewayRecord{}, fmt.Errorf("%s: %w", p, err)
 	}
 	if r.Digest != "" && !hexDigest.MatchString(r.Digest) {
-		return gatewayRecord{}, fmt.Errorf("%s: digest %q is not 8 hex digits", in.path(GatewayFile), r.Digest)
+		return gatewayRecord{}, fmt.Errorf("%s: digest %q is not 8 hex digits", p, r.Digest)
 	}
-	for _, p := range slices.Sorted(maps.Keys(r.Networkd)) {
-		role := r.Networkd[p].Role
-		if r.Digest == "" || !spec.InterfaceName.MatchString(role) || p != filepath.Join(in.O.networkdDir(), tunFile(in.R.Spec.Name, r.Digest, role)) {
-			return gatewayRecord{}, fmt.Errorf("%s records %s, which is not a networkd file of the install's: refused", in.path(GatewayFile), p)
+	for _, f := range slices.Sorted(maps.Keys(r.Networkd)) {
+		role := r.Networkd[f].Role
+		if r.Digest == "" || !spec.InterfaceName.MatchString(role) || f != filepath.Join(in.O.networkdDir(), tunFile(in.R.Spec.Name, r.Digest, role)) {
+			return gatewayRecord{}, fmt.Errorf("%s records %s, which is not a networkd file of the install's: refused", p, f)
 		}
 	}
 	return r, nil
 }
 
 func (in *Installer) writeGateway(r gatewayRecord) error {
+	defer in.forgetGateway()
 	raw, err := json.MarshalIndent(r, "", "  ")
 	if err != nil {
 		return err
@@ -1321,7 +1361,9 @@ func (in *Installer) gatewayRevert(ctx context.Context) error {
 		}
 		return fmt.Errorf("the consent is withdrawn, but not all it applied is removed (`%s tune --revert` again removes the rest): %w", in.R.Ctl(), err)
 	}
-	if err := os.Remove(in.path(GatewayFile)); err != nil && !errors.Is(err, os.ErrNotExist) {
+	err = os.Remove(in.path(GatewayFile))
+	in.forgetGateway()
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
 	in.O.logf("removed %s, and the consent to them", in.gatewayWhat())
@@ -1388,8 +1430,9 @@ func (in *Installer) dropChain(ctx context.Context, chain, record string) error 
 }
 
 // gatewayStatus describes, for `status` on a Docker host, whether the declarations are applied:
-// empty when the release declares none and no consent stands.
-func (in *Installer) gatewayStatus(ctx context.Context, get func(string) string) string {
+// empty when the release declares none and no consent stands. allow is the allowlists' state
+// (allowOnce) status shares with its L4 lines; nil reads it here.
+func (in *Installer) gatewayStatus(ctx context.Context, get func(string) string, allow func() (marked, holds bool)) string {
 	recorded := in.gatewayRecorded()
 	if in.O.Firewall != "" || !in.gatewayDeclared() && !recorded {
 		return ""
@@ -1410,7 +1453,8 @@ func (in *Installer) gatewayStatus(ctx context.Context, get func(string) string)
 	if loaded := in.loadedTables(context.Background()); len(loaded) > 0 {
 		applied = append(applied, "tables "+strings.Join(loaded, ", "))
 	}
-	switch rules, _ := in.forwardTables(get); {
+	rules, unmapped := in.forwardTables(get)
+	switch {
 	case in.forwardApplied(ctx, get):
 		applied = append(applied, "forwarding")
 	case in.forwardMarked(get):
@@ -1420,7 +1464,7 @@ func (in *Installer) gatewayStatus(ctx context.Context, get func(string) string)
 	case rules != nil:
 		notYet = append(notYet, "forwarding not applied (no start as root applied it since this release or these devices, or its error says why)")
 	}
-	if _, unmapped := in.forwardTables(get); len(unmapped) > 0 {
+	if len(unmapped) > 0 {
 		notYet = append(notYet, "no forwarding through "+strings.Join(unmapped, ", ")+" (no NIC named: --interface)")
 	}
 	if unheld := in.unheldRoles(get); len(unheld) > 0 {
@@ -1429,7 +1473,10 @@ func (in *Installer) gatewayStatus(ctx context.Context, get func(string) string)
 	routes, held := strings.Join(in.allowRoutes(), ", "), strings.Join(in.heldNamesIn(get), ", ")
 	var marked, holds bool
 	if routes != "" || held != "" {
-		marked, holds = in.allowState(ctx, get)
+		if allow == nil {
+			allow = in.allowOnce(ctx, get)
+		}
+		marked, holds = allow()
 	}
 	switch {
 	case (routes != "" || held != "") && holds:

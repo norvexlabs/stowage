@@ -273,7 +273,7 @@ func (l *linter) serviceUpdate(at, name string, svc spec.Service) {
 			}
 		}
 		for _, v := range stringList(o.VolumesFrom) {
-			if base := strings.TrimSuffix(strings.TrimSuffix(v, ":ro"), ":rw"); base == name || base == "service:"+name {
+			if base := VolumesFromSource(v); base == name || base == "service:"+name {
 				l.errf(at+".update", "%s mounts %s's volumes (volumes_from: %s), which the overlap leaves with its old container", other, name, v)
 			}
 		}

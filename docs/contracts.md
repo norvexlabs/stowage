@@ -87,7 +87,8 @@ These are what `lint` checks; each finding names the key path or `file:line` to 
     `application` or none (a `library` chart cannot be installed). Its `version` and `appVersion`
     are set by `ship` (comments and other keys are kept); the source values are ignored;
   - a dependency in `Chart.yaml` must be vendored under `charts/` (a directory with a
-    `Chart.yaml`, or a `.tgz`, of that chart name): `ship` fetches nothing;
+    `Chart.yaml`, or a `.tgz`, of that chart name, its entries read by their cleaned paths — `./db/Chart.yaml`
+    is `db/Chart.yaml` — one leaving the archive's root refused): `ship` fetches nothing;
   - every file must be a regular file of at most 5 MiB (a symlink is refused);
   - `values.yaml`, when present, is one block-style mapping document. `ship` appends to it, as
     text (the chart's own lines are kept byte for byte), a top-level `stowage:` block, so the
@@ -453,10 +454,15 @@ These are what `lint` checks; each finding names the key path or `file:line` to 
   requires it to return these. `provision --set KEY=VALUE` accepts a key it lists even when the
   hook never returned it, so a hook that finds an account it did not create (a database restored
   or shared from another install, a value the operator made it forget) can fail naming the
-  `--set` that gives it the credential instead of minting one. Lint: a `returns` key that is an
-  input, a secret, a safe default or a route's domain input is an error (the install records it),
-  as is a key listed twice, one that is not a variable name, or one starting `STOWAGE_` or
-  `COMPOSE_`.
+  `--set` that gives it the credential instead of minting one. Lint: a `returns` key the install
+  records on every shape the project has is an error, naming what it is on each — an input asked
+  on that shape (an input's `shapes`; on Kubernetes, not one with `when`), a secret, a safe default,
+  a route's domain input (Docker and the VM), or a key of the chart's ConfigMap
+  `<release>-stowage-provision` (Kubernetes; read from the chart's templates without rendering
+  them: a key a template action computes is not seen) —; a key recorded on some shapes only is one
+  the hook may return on the others (where it is recorded, the hook's line is refused at run time
+  and `provision --set` refuses it). A key listed twice, one that is not a variable name, or one
+  starting `STOWAGE_` or `COMPOSE_` is an error too.
 - **Front**: when `tls_modes` offers `none` (loopback mode), every route has a `loopback_ports`
   entry (distinct ports); `loopback_env` relaxes a `safe_defaults` key in loopback mode only (plain
   HTTP on the operator's machine). A project that does not offer `none` owes no loopback port, and

@@ -106,6 +106,12 @@ func absent(fix, format string, a ...any) error {
 	return r
 }
 
+// isAbsent reports whether err is a refusal of no install where the run was pointed.
+func isAbsent(err error) bool {
+	r, ok := Refusal(err)
+	return ok && r.Absent
+}
+
 // fixOn is a refusal's fix for the shape the installer runs: docker on Docker (and Kubernetes),
 // vm on the VM (O.Preloaded), where "" says no advice holds — the refusal stays one.
 func (in *Installer) fixOn(docker, vm string) string {

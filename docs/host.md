@@ -243,12 +243,13 @@ above (one that ended on its own after the handoff is removed). A new container 
 running or turns unhealthy fails the start as above, its message saying the old one was sent the
 signal and serves on as far as the app keeps serving after it. With `update_ready`, the signal waits until
 the new container holds that file in its `update_socket` directory as the directory did not hold
-it before the new one started (read with `docker cp <container>:<update_socket>/<file> -`, first
-through the old container where it mounts the service's update volume — an earlier release's
-`update_socket` may be another directory: none then, or a file whose time, size or content differs
-from the one an earlier overlap left; a read of it that fails otherwise than on the engine's
-answer for a missing path, like a failed read of where the old container mounts the volume,
-fails the start before the new container is made, the old one serving on (`services.<name>:
+it before the new one started (read in the directory's archive, `docker cp <container>:<update_socket> -`,
+which lists the file when it is there and leaves the sockets out, so a missing file is told the same
+way on any engine; first through the old container where it mounts the service's update volume —
+an earlier release's `update_socket` may be another directory: none then, or a file whose time,
+size or content differs from the one an earlier overlap left; a read of that directory that fails,
+like a failed read of where the old container mounts the volume, fails the start before the new
+container is made, the old one serving on (`services.<name>:
 before its new container starts, which it does not: …`)), so a container still preparing (validating its settings, rendering its configuration)
 or failing during it never has the old one hand its listeners over (`services.<name>: the new
 container wrote <update_socket>/<file> (update_ready)`); one that does not write it within 10
@@ -256,7 +257,9 @@ minutes fails the start, the old one never signalled (`… did not write <update
 (update_ready) within 10m0s: the directory must be writable by the container's user …`). The file must be a
 regular file of at most 1 MiB: a directory, a symbolic link or a larger one fails the start where it is read
 (`update_ready <path> is a directory|a symbolic link in the container: it must be a regular file the new
-container writes`, `update_ready <path> is over 1048576 bytes in the container: …`). The directory must be
+container writes`, `update_ready <path> is over 1048576 bytes in the container: …`), and so does a
+directory whose files (the sockets aside) are together over about 1 MiB (`update_ready <path>, with
+what <update_socket> holds beside it, is over 1048576 bytes in the container: …`). The directory must be
 writable by the container's user: a new volume takes the image's directory, owner included, and
 a volume made before keeps its owner (remove it, `docker volume rm`, for the next start to make it
 again). With `update_decline_status`, a new container that exits

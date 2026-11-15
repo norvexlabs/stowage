@@ -180,7 +180,16 @@ in the same installer (bootstrap it as above, then `sh <name>.sh vm create …`,
   its configuration as it starts).
 - The platform decides the disk format (the first of its formats the registry holds: a mirror
   carries the formats its `mirror export --disks` named) and how the cloud-config reaches the VM.
-  Only the platforms the registry has a disk for are offered; a `--platform` whose formats the
+  Only the platforms the registry has a disk for are offered: asked on a terminal (no
+  `--platform`), every platform a disk set the VM may boot holds a format of — the release's own
+  set, else the channel's release's or its disk set record, whichever holds the chosen platform's
+  format — and that set is the one the VM then boots; a source that cannot be read or checked
+  (a disk set record that is malformed or not signed by a trusted key, a registry error) ends that
+  look-up without failing the question, which offers the platforms of the sets read before it and
+  prints `note: the platforms offered are those of the disk sets read before one that could not
+  be: <why>` (with none read before it, the run fails with that error, as with `--platform`); a platform none of those
+  holds is then looked up as `--platform` does, so the question never fails where `--platform`
+  succeeds; a `--platform` whose formats the
   release publishes but the registry lacks is refused (exit 3) with `--platform P: the <format> disk
   <digest> is not in <prefix> (…)` and the platforms it does offer:
 
@@ -412,7 +421,9 @@ in the same installer (bootstrap it as above, then `sh <name>.sh vm create …`,
   would flush Docker's rules); with `--timezone` links `/etc/localtime` to the zone and writes
   `/etc/timezone`; and writes the first install's settings, `/etc/<name>/install.yaml`
   (0600): the channel this installer follows, the TLS mode, the ports given and every input
-  answered that is not empty, and with `--registry` its `registry` and with `--registry-ca` its
+  answered that is not empty — but one that took its default naming another input, given no
+  value, which the VM's install expands again and records as derived (`STOWAGE_DERIVED`, so a
+  re-run changing that other input expands it again) — and with `--registry` its `registry` and with `--registry-ca` its
   `registry_ca`. With `--registry-ca` it also writes the CA to
   `/usr/local/share/ca-certificates/<name>-registry.crt` (0644) and then, in a step of its own,
   runs `update-ca-certificates`: the VM's trust store holds it from every boot on, so its
