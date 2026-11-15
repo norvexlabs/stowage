@@ -101,8 +101,10 @@ type Publisher struct {
 	checkDisksOf string
 	// marked are the held marks this run made (markHeld): a ship or a yank sweeps those alone.
 	marked []name.Tag
-	Now    func() time.Time
-	Log    io.Writer
+	// snap is the tags a prune's removals judge holders by (nil: none, each untag reads them).
+	snap tagSnapshot
+	Now  func() time.Time
+	Log  io.Writer
 }
 
 func (p *Publisher) logf(format string, a ...any) {
@@ -1972,8 +1974,13 @@ func (p *Publisher) prune(ctx context.Context, channel string, rs []*Ref, ptr *R
 	}
 	var kept map[string]bool // the other channels' disk sets, read once a pruned release has disks
 	var touched []string     // the repositories of the tags untagged
+	// The removals below judge holders by one snapshot of each repository's tags.
+	p.snap = tagSnapshot{}
 	// Whatever happens below, a pointer whose release lost tags is moved off it.
 	defer func() {
+		// The pointer and floating tags move by other means than untag: they and the sweep read
+		// the registry afresh.
+		p.snap = nil
 		// Content whose tag was retired while another tag held it (the pointer, latest, another
 		// release) goes once no tag does, whatever happened: what a tag still holds stays.
 		defer func() {
@@ -2037,10 +2044,13 @@ func (p *Publisher) prune(ctx context.Context, channel string, rs []*Ref, ptr *R
 				if err != nil {
 					return pruned, err
 				}
-				if err := p.Registry.DeleteTag(ctx, t); errors.Is(err, registry.ErrDeleteRefused) {
+				switch err := p.Registry.DeleteTag(ctx, t); {
+				case errors.Is(err, registry.ErrDeleteRefused):
 					p.logf("disk %s of %s kept: it is a channel's disk set, and the registry deletes no tag alone", registry.Short(d), r.Manifest.Tag)
-				} else if err != nil {
+				case err != nil:
 					return pruned, err
+				default:
+					p.snap.drop(t)
 				}
 			}
 		}

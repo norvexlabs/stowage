@@ -369,6 +369,64 @@ func TestServiceWatchDropsALookTheLockCut(t *testing.T) {
 	}
 }
 
+// A run that takes and releases the lifecycle lock wholly inside a look (its stamp moves): that
+// look journals nothing, and the next one does.
+func TestServiceWatchDropsALookALockCameAndWentIn(t *testing.T) {
+	t.Parallel()
+	e, st, h, downs := watched(t)
+	ctx := context.Background()
+	st.set(`{"ID":"c1","Service":"api","State":"exited","ExitCode":1}`+"\n", "")
+	st.during = func() {
+		unlock, err := e.installer(vm).lockNow()
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		unlock()
+	}
+	w := &serviceLooks{}
+	h.lookAtServices(ctx, w)
+	if got := downs(); len(got) != 0 {
+		t.Fatalf("journaled on a look a lock came and went in: %q", got)
+	}
+	st.during = nil
+	h.lookAtServices(ctx, w)
+	if got := downs(); len(got) != 1 {
+		t.Errorf("the look after: %q", got)
+	}
+}
+
+// docker inspect reads only the services a look sees down, and runs not at all when none is.
+func TestServiceWatchInspectsOnlyTheServicesDown(t *testing.T) {
+	t.Parallel()
+	e, st, h, downs := watched(t)
+	ctx := context.Background()
+	inspected := func() (out []string) {
+		e.docker.mu.Lock()
+		defer e.docker.mu.Unlock()
+		for _, c := range e.docker.calls {
+			if len(c.Args) > 0 && c.Args[0] == "inspect" {
+				out = append(out, strings.Join(c.Args[len(c.Args)-1:], " "))
+			}
+		}
+		return out
+	}
+	w := &serviceLooks{}
+	st.set(`{"ID":"c1","Service":"api","State":"running"}`+"\n", "")
+	h.lookAtServices(ctx, w)
+	if got := inspected(); len(got) != 0 {
+		t.Fatalf("inspected with every service up: %q", got)
+	}
+	st.set(`{"ID":"c1","Service":"api","State":"running"}`+"\n"+`{"ID":"c2","Service":"worker","State":"exited","ExitCode":137}`+"\n", "c2 true 100663296 0\n")
+	h.lookAtServices(ctx, w)
+	if got := inspected(); !slices.Equal(got, []string{"c2"}) {
+		t.Fatalf("inspected %q", got)
+	}
+	if got := downs(); !slices.Equal(got, []string{"worker: exited 137 (SIGKILL), OOM-killed (memory limit 96 MiB)"}) {
+		t.Errorf("%q", got)
+	}
+}
+
 // A compose ps that fails is logged once a stretch, and the look after it says it looks again; a
 // look the daemon's stop cuts says nothing.
 func TestServiceWatchLogsALookItCannotMake(t *testing.T) {

@@ -70,11 +70,7 @@ func (d diskSet) digests() []string {
 // bootSet is the disk set an install of m boots: its own disks, or the set it records.
 func bootSet(m *release.Manifest) diskSet {
 	tag, disks := m.Artifacts.Boot(m.Tag)
-	st := m.StowageVersion
-	if b := m.Artifacts.BootDisks; len(m.Artifacts.Disks) == 0 && b != nil {
-		st = b.Stowage
-	}
-	return diskSet{release: tag, disks: disks, stowage: st}
+	return diskSet{release: tag, disks: disks, stowage: m.BootStowage()}
 }
 
 // present reports whether every disk of the set is in the registry.
@@ -241,6 +237,7 @@ func (p *Publisher) remove(ctx context.Context, repo, digest string) error {
 		if err := p.deleter().DeleteManifest(ctx, rd); err != nil {
 			return err
 		}
+		p.snap.dropDigest(rd)
 	}
 	fallback, err := p.Registry.Tag(repo, strings.Replace(digest, ":", "-", 1))
 	if err != nil {
@@ -256,8 +253,13 @@ func (p *Publisher) remove(ctx context.Context, repo, digest string) error {
 		if err := p.deleter().DeleteManifest(ctx, fr); err != nil {
 			return err
 		}
+		p.snap.dropDigest(fr)
 	}
-	return p.deleter().DeleteManifest(ctx, d)
+	if err := p.deleter().DeleteManifest(ctx, d); err != nil {
+		return err
+	}
+	p.snap.dropDigest(d)
+	return nil
 }
 
 // heldPrefix starts the tag that marks content whose tag was retired while another tag held it:
@@ -273,6 +275,9 @@ func heldTag(d v1.Hash) string { return heldPrefix + d.Hex[:12] }
 // hold it, and sweepMarked deletes it once they no longer do. A retired tag is left as it is.
 func (p *Publisher) untag(ctx context.Context, tag name.Tag) error {
 	err := p.Registry.DeleteTag(ctx, tag)
+	if err == nil {
+		p.snap.drop(tag)
+	}
 	if err == nil || !errors.Is(err, registry.ErrDeleteRefused) {
 		return err
 	}
@@ -280,6 +285,7 @@ func (p *Publisher) untag(ctx context.Context, tag name.Tag) error {
 	if herr != nil || have == nil {
 		return herr
 	}
+	p.snap.set(tag, have.Digest)
 	others, herr := p.holders(ctx, tag.Context(), have.Digest, tag.TagStr())
 	if herr != nil {
 		return herr
@@ -307,21 +313,45 @@ func (p *Publisher) markHeld(ctx context.Context, repo name.Repository, d v1.Has
 	if err := p.Registry.Retag(ctx, repo.Digest(d.String()), t); err != nil {
 		return fmt.Errorf("mark %s held: %w", repo.Digest(d.String()), err)
 	}
+	p.snap.set(t, d)
 	p.marked = append(p.marked, t)
 	return nil
 }
 
-// holders lists the tags of repo but except that hold the manifest d; a held mark is none.
+// holders lists the tags of repo but except that hold the manifest d; a held mark is none. With
+// a snapshot (a prune's), the repository's tags are the snapshot's, read once per repository;
+// otherwise each call lists and reads them.
 func (p *Publisher) holders(ctx context.Context, repo name.Repository, d v1.Hash, except string) ([]string, error) {
+	tags, err := p.snap.of(ctx, p, repo)
+	if err != nil {
+		return nil, err
+	}
+	if tags == nil {
+		if tags, err = p.readTags(ctx, repo); err != nil {
+			return nil, err
+		}
+	}
+	var out []string
+	for _, t := range slices.Sorted(maps.Keys(tags)) {
+		if t == except || strings.HasPrefix(t, heldPrefix) {
+			continue
+		}
+		if tags[t] == d {
+			out = append(out, t)
+		}
+	}
+	return out, nil
+}
+
+// readTags lists the tags of repo and reads the manifest digest each holds; a tag gone between
+// the listing and its read is left out.
+func (p *Publisher) readTags(ctx context.Context, repo name.Repository) (map[string]v1.Hash, error) {
 	tags, err := p.Registry.Tags(ctx, repo)
 	if err != nil {
 		return nil, err
 	}
-	var out []string
+	out := map[string]v1.Hash{}
 	for _, t := range tags {
-		if t == except || strings.HasPrefix(t, heldPrefix) {
-			continue
-		}
 		ref, err := p.Registry.Tag(repo.Name(), t)
 		if err != nil {
 			return nil, err
@@ -330,11 +360,72 @@ func (p *Publisher) holders(ctx context.Context, repo name.Repository, d v1.Hash
 		if err != nil {
 			return nil, err
 		}
-		if h != nil && h.Digest == d {
-			out = append(out, t)
+		if h != nil {
+			out[t] = h.Digest
 		}
 	}
 	return out, nil
+}
+
+// tagSnapshot is, per repository, each tag and the manifest digest it holds: read once, when a
+// repository's holders are first needed, and kept in step with this run's own changes (a tag
+// deleted, marked held or retired, a manifest deleted by digest). A prune's tag removals hold one,
+// so removing n tags of a repository reads its tags once rather than n times; it is dropped before
+// the prune moves its pointer and floating tags, which change tags it does not follow. A nil
+// snapshot is none: every method does nothing. Its methods take typed references and reach a
+// repository under snapKey alone.
+type tagSnapshot map[string]map[string]v1.Hash
+
+// tagsOf is repo's tags when they were read (nil otherwise).
+func (s tagSnapshot) tagsOf(repo name.Repository) (map[string]v1.Hash, bool) {
+	m, ok := s[snapKey(repo)]
+	return m, ok
+}
+
+// snapKey is repo's key in a snapshot: its canonical name, whatever the spelling it was made from.
+func snapKey(repo name.Repository) string { return repo.Name() }
+
+// of is repo's tags, read on first use; nil without a snapshot.
+func (s tagSnapshot) of(ctx context.Context, p *Publisher, repo name.Repository) (map[string]v1.Hash, error) {
+	if s == nil {
+		return nil, nil
+	}
+	if m, ok := s.tagsOf(repo); ok {
+		return m, nil
+	}
+	m, err := p.readTags(ctx, repo)
+	if err != nil {
+		return nil, err
+	}
+	s[snapKey(repo)] = m
+	return m, nil
+}
+
+// set records tag holding d, in a repository already read.
+func (s tagSnapshot) set(tag name.Tag, d v1.Hash) {
+	if m, ok := s.tagsOf(tag.Context()); ok {
+		m[tag.TagStr()] = d
+	}
+}
+
+// drop records tag deleted.
+func (s tagSnapshot) drop(tag name.Tag) {
+	if m, ok := s.tagsOf(tag.Context()); ok {
+		delete(m, tag.TagStr())
+	}
+}
+
+// dropDigest records the manifest d deleted, with every tag on it.
+func (s tagSnapshot) dropDigest(d name.Digest) {
+	m, ok := s.tagsOf(d.Context())
+	if !ok {
+		return
+	}
+	for t, h := range m {
+		if h.String() == d.DigestStr() {
+			delete(m, t)
+		}
+	}
 }
 
 // sweepMarked deletes by digest, in the release and installer repositories and in repos, the

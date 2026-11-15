@@ -56,7 +56,8 @@ stowage -C <project> --test-registry PREFIX [--test-push USER:ENV] [--test-pull 
   `go build`'s `dev`) cannot pin, and a lock that does not decode is never overwritten.
 - `verify` without `<version>` checks the channel pointer's release. On the `latest` channel it
   also checks the installer's `:latest` and, with the `kairos` shape, each `latest-<format>` disk
-  tag (absent for a format the release has none of). A retired tag counts as absent. With a
+  tag present or of a format the channel's disk set has (on that disk; absent for a format the set
+  has none of, one this `stowage` does not make included). A retired tag counts as absent. With a
   version, it checks that release.
 - `audit` (a project that signs) checks the release as `verify` does, then reads the SBOM each
   of its images, its installer and its OS bundle carries, attested by a key of
@@ -465,7 +466,8 @@ platform is part of an image's inputs). What `ship` does, in order:
    `<prefix>/<name>-release:<channel>` moves — never backwards to an earlier release, never to
    a yanked one. On the channel with `latest: true` the installer's `:latest` follows the pointer
    (a yank or prune moves it back, or removes it with the last release) and each disk's
-   `latest-<format>` follows the channel's disk set (a format the set has none of loses its tag);
+   `latest-<format>` follows the channel's disk set (a format the set has none of loses its tag,
+   a format only a newer `stowage` makes included);
    `verify` of that channel compares their digests with the pointer's and the set's. On a
    registry that deletes no tag alone (ghcr), a floating tag with nothing to offer is retired
    instead of removed: moved onto a small artifact of type
@@ -513,13 +515,19 @@ needs `delete:packages`).
 the last, raised to the `OCI-Chunk-Min-Length` a registry answers, sized to about a minute at the
 rate the last one went and halved after a failure). A 413 to a chunk, or a 416 to any but the first
 chunk of a disk's upload (below), asks the registry how far the upload got: an upload it no longer
-knows is lost (below), one further on goes on from there, one behind is retried from there, and a
-416 it cannot tell is retried while the chunk can shrink. Otherwise — the upload still at the last
-byte acknowledged (ghcr.io caps a request at 4 MiB and answers 416), or a 413 it cannot tell — the
-chunk's size was refused: the chunk is halved at once, said in the log, and no later chunk to that
-registry in the same run (the other disks of a `ship` included) is larger, unless the registry's own
-minimum is. The smallest chunk refused so is retried once this disk's upload had a whole chunk that
-large acknowledged, and before that gets the disk in one stream. A 413 or 416 naming a refusal of
+knows is lost (below), one further on goes on from there, one behind is retried from there.
+Otherwise — the upload still at the last byte acknowledged (ghcr.io caps a request at 4 MiB and
+answers 416), or a 413 or 416 it cannot tell — the chunk's size was refused: the chunk is halved
+(at once, or after the wait below when the registry could not tell), said in the log (`the registry
+refuses a chunk of <size>; chunks of at most <size> from now`), and no later chunk to that
+registry in the same run (the other disks of a `ship` included) is larger, unless the registry's
+own minimum is. After 4 chunks taken whole at that ceiling, it rises halfway back to the
+smallest chunk refused (logged `the registry took 4 chunks of <size>; chunks of up to <size> from
+now`) while that gap is over the least chunk: a refusal that was transient costs the run little, and
+under the registry's cap the ceiling settles a little below it. The smallest chunk refused so is
+retried, 3 times at most at one offset, once this disk's upload had a whole chunk that large
+acknowledged (a last chunk shorter than the least is such a chunk); before that, or refused a
+fourth time, the disk goes up in one stream. A 413 or 416 naming a refusal of
 the push (`DENIED`, `SIZE_INVALID`, …) fails it at once. After a failure (a dropped or stalled
 connection, a 5xx, a 408 or 429, a 413 to any other request, with `Retry-After` not read) it waits
 (2 s, doubled up to a minute) and goes on from the last byte the registry acknowledged, asking it

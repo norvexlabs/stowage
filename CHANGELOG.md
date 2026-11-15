@@ -52,6 +52,55 @@ follow [SemVer](https://semver.org/).
 - A start retried after an image left the engine applies the Docker host's firewall chains once.
 - `k8s rollback`, `k8s upgrade` and `reset-db` read helm, the fetched installer and the provision
   hook once each.
+- `prune` on a registry that deletes no tag alone (ghcr) reads each repository's tags once,
+  rather than once per tag it removes, so a prune of many releases stays clear of rate limits.
+- Moving the latest channel removes a disk's `latest-<format>` of a format the channel's disk set
+  has none of even when this `stowage` does not make that format (a newer one's), and `verify` and
+  the moves read only the tags present and the set's formats.
+- A disk's chunk ceiling recovers: after a few chunks taken whole it
+  rises halfway back to the chunk refused, so one transient refusal no longer slows every later
+  disk of the run; a 416 whose upload status cannot be read lowers it too, rather than each disk
+  paying it again; and a short last chunk refused on every attempt goes up in one stream after 3
+  retries instead of retrying until the stall bound.
+- A VM link given a static `address6` without a `gateway6` expects no IPv6 router: the boot no
+  longer waits 60 s for an IPv6 default route on it, the daemon no longer solicits one, and
+  `status` no longer warns of its absence.
+- `tune --check` judges a NIC interrupt that fired before the boot moved it, and not since (a
+  virtio NIC's config interrupt), by the CPU asked rather than reporting its old CPU: the apply
+  records its counts when it moves it.
+- Under `flush_conntrack`, a change of a set through the app socket ends the flows of the elements
+  nft changed (their connection-tracking entries deleted, the others kept), and a start's change
+  of a set an input fills ends those alone too, rather than flushing the whole table. A set whose
+  key type cannot be matched to flows keeps them through the app socket (its answer warns), and
+  flushes the whole table at a start, as before.
+- A `command` backup with a `kairos` shape is a `lint` error: the VM runs none.
+- `backup list` marks a backup of a profile the release no longer declares, which retention never
+  prunes.
+- A VM backup cut off by its hour's limit or the host daemon's stop stops its runner gracefully
+  before removing it, so rclone aborts a multipart upload rather than leaving its parts in the
+  destination; the host daemon's stop waits up to 5 min 45 s for it (its unit's stop timeout is
+  7 min).
+- An OS bundle with `host.packages` fetches the package archive's indexes once; `tune` reads each
+  CPU's frequency settings once under `host.power: performance`.
+- The VM's host daemon judges an upgrade's routes, inputs and cores before it writes the OS only
+  for a release published by the Stowage it was built with; another Stowage's release is judged
+  by the boot into it, with that Stowage's rules (falling back on a refusal), and the dry run and
+  the job's log say so. `upgrade` says the release's installer is downloaded before the check.
+- A schema baseline crossing is refused in the same words on Docker, Kubernetes and the VM: `…
+  only with its data wiped: <the way across>`.
+- The disk-pressure watch retries a POST that may be taken soon every minute for 10 checks in a
+  row, then every 10 minutes (a service whose address never comes).
+- A network confirmation refused after its window, or with nothing awaiting confirmation, ends
+  with the settings in force.
+- The health gate's diagnostics are numbered in the order kept (`failed-boots/<N>-…`), never by
+  the clock, keep the services as the failed judgement listed them (`ps.json`), and the last 5 by
+  number are kept; a health command's compose file names the boot it ran in, and the gate removes
+  those of an earlier boot rather than judging their age by the clock.
+- A reboot whose `systemctl` the shutdown stops is the reboot coming wherever it is asked: a
+  rollback's keeps the boot assessment's marks and is not journaled cancelled; the health gate,
+  the scheduled reboots and the first boot's switch judge it one way.
+- The VM's service watch drops a look during which the install's lifecycle lock was taken, even
+  taken and released inside it, and reads `docker inspect` only for the services it sees down.
 
 ## [0.38.0] - 2026-11-15
 

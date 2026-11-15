@@ -189,7 +189,11 @@ func backupCommand(c *hostClient, name string, stdout, stderr io.Writer) *cobra.
 			tw := tabwriter.NewWriter(stdout, 0, 0, 2, ' ', 0)
 			fmt.Fprintln(tw, "NAME\tSIZE\tTIME")
 			for _, o := range l {
-				fmt.Fprintf(tw, "%s\t%s\t%s\n", o.Name, size(uint64(o.Size)), o.Time.UTC().Format(time.RFC3339))
+				fmt.Fprintf(tw, "%s\t%s\t%s", o.Name, size(uint64(o.Size)), o.Time.UTC().Format(time.RFC3339))
+				if o.DroppedProfile {
+					fmt.Fprint(tw, "\ta profile the release dropped: never pruned")
+				}
+				fmt.Fprintln(tw)
 			}
 			return tw.Flush()
 		},

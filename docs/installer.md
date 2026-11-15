@@ -571,8 +571,9 @@ again, to copy an installer to another host.
   `k8s reset-db --new-baseline`, run by the new release's installer, is the way across (it wipes
   the data). One that cannot be read is logged and not checked by `upgrade`. On Docker,
   `reset-db --new-baseline` (below) is the way across; on the VM, `upgrade` refuses another
-  baseline before it writes the OS (`… its data cannot carry over, so its OS is not written;
-  `<short>-stow reset-db --new-baseline --version <v>` wipes the data and installs it`), and the
+  baseline before it writes the OS (`… its data cannot carry over, so it moves to <v> only with its
+  data wiped: `<short>-stow reset-db --new-baseline --version <v>` wipes it and installs <v>; its OS
+  is not written`; every shape refuses a crossing in these words), and the
   VM's `reset-db --new-baseline` is the way across ([VM](vm.md); `--unordered` with its
   `--version` under a `command` scheme, as `upgrade --version`'s).
 - **Across Stowage versions.** The installer an install keeps is identified by its release

@@ -12,6 +12,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -105,7 +106,7 @@ func (c *Client) pushFile(ctx context.Context, repo name.Repository, b Blob) err
 		label:        cmpLabel(b),
 		chunk:        chunkMin,
 		least:        chunkMin,
-		ceiling:      c.ceiling(repo.RegistryStr()),
+		ceiling:      c.ceiling(repo),
 	}
 	err = u.run(ctx)
 	if err != nil {
@@ -119,11 +120,75 @@ func (c *Client) pushFile(ctx context.Context, repo name.Repository, b Blob) err
 	return err
 }
 
-// ceiling is the largest chunk a registry takes, shared by every upload of this client to it: 0
-// until it refused a chunk for its size.
-func (c *Client) ceiling(registry string) *atomic.Int64 {
-	v, _ := c.ceilings.LoadOrStore(registry, new(atomic.Int64))
-	return v.(*atomic.Int64)
+// ceiling is the largest chunk repo's registry takes, shared by every upload of this client to it:
+// a registry caps a request's body whatever the repository.
+func (c *Client) ceiling(repo name.Repository) *chunkCeiling {
+	v, _ := c.ceilings.LoadOrStore(repo.RegistryStr(), new(chunkCeiling))
+	return v.(*chunkCeiling)
+}
+
+// probeAfter is how many chunks a registry takes whole at its ceiling before a larger
+// one is tried.
+const probeAfter = 4
+
+// chunkCeiling is the largest chunk a registry takes: none until it refused one for its size.
+// A chunk refused for its size lowers it to half that chunk, or to the largest chunk taken whole
+// under it when that is larger; probeAfter chunks taken whole at the ceiling since the last
+// refusal or rise raise it
+// halfway to the smallest chunk refused, never to it. A ceiling a transient refusal lowered
+// climbs back towards the chunk refused; one under the registry's cap settles under it, within a
+// gap of the least chunk (each probe refused halves the gap).
+type chunkCeiling struct {
+	mu      sync.Mutex
+	limit   int64 // the largest chunk sent; 0 none
+	refused int64 // the smallest chunk refused for its size
+	took    int64 // the largest chunk taken whole under refused
+	streak  int   // chunks taken whole at limit since the last refusal or rise
+}
+
+func (c *chunkCeiling) get() int64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.limit
+}
+
+// refuse records a chunk of n bytes (over least) refused for its size; a lower ceiling (another
+// upload's) stays.
+func (c *chunkCeiling) refuse(n, least int64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.streak = 0
+	if c.refused == 0 || n < c.refused {
+		c.refused = n
+	}
+	if c.took >= c.refused {
+		c.took = 0
+	}
+	l := max(n/2, least, c.took)
+	if c.limit == 0 || l < c.limit {
+		c.limit = l
+	}
+}
+
+// take records a chunk of n bytes taken whole, and returns the ceiling when this raises it (0
+// otherwise): the probeAfter-th at the ceiling, the smallest chunk refused more than least above
+// it.
+func (c *chunkCeiling) take(n, least int64) int64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.limit == 0 || n >= c.refused { // none, or sent before the refusal
+		return 0
+	}
+	c.took = max(c.took, n)
+	if n < c.limit {
+		return 0
+	}
+	if c.streak++; c.streak < probeAfter || c.refused-c.limit <= least {
+		return 0
+	}
+	c.streak = 0
+	c.limit += (c.refused - c.limit) / 2
+	return c.limit
 }
 
 // cmpLabel names a blob in messages: its title, with its digest.
@@ -154,6 +219,7 @@ type upload struct {
 	checked    bool      // the registry was asked whether it holds the blob
 	ever       bool      // the registry acknowledged a chunk once
 	took       int64     // the largest chunk the registry acknowledged whole
+	again      int       // the retries of a chunk that cannot shrink at this offset (sized)
 	patched    bool      // a chunk was sent in this session
 	from       time.Time // the session began: the rate is measured from then
 	lostAt     int64     // the bytes the last session lost held
@@ -161,7 +227,7 @@ type upload struct {
 	last       int64         // the last chunk's length
 	reach      int64         // the furthest byte sent in this session: a registry holds no more
 	least      int64         // the smallest chunk but the last
-	ceiling    *atomic.Int64 // the largest chunk the registry takes, 0 when unknown
+	ceiling    *chunkCeiling // the largest chunk the registry takes
 	acked      time.Time     // when the registry last acknowledged a byte (or the upload began)
 	sent       atomic.Int64  // when a request's body was last read, in Unix nanoseconds
 }
@@ -396,7 +462,7 @@ func (u *upload) begin(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	u.loc, u.off, u.patched, u.reach, u.last = loc, 0, false, 0, 0
+	u.loc, u.off, u.patched, u.reach, u.last, u.again = loc, 0, false, 0, 0, 0
 	u.from = time.Now()
 	u.sessions++
 	if u.sessions > 1 {
@@ -492,6 +558,9 @@ func (u *upload) patch(ctx context.Context) error {
 	u.ever = true
 	if got == off+n {
 		u.took = max(u.took, n)
+		if c := u.ceiling.take(n, u.least); c > 0 {
+			u.logf("push %s: the registry took %d chunks of %s; chunks of up to %s from now", u.label, probeAfter, size(n), size(c))
+		}
 	}
 	if d := time.Since(t0).Seconds(); d > 0 {
 		rate := float64(got-off) / d
@@ -504,7 +573,7 @@ func (u *upload) patch(ctx context.Context) error {
 // smallest chunk it takes.
 func (u *upload) bounded(n int64) int64 {
 	n = min(n, chunkMax)
-	if c := u.ceiling.Load(); c > 0 {
+	if c := u.ceiling.get(); c > 0 {
 		n = min(n, c)
 	}
 	return max(n, u.least)
@@ -512,14 +581,15 @@ func (u *upload) bounded(n int64) int64 {
 
 // sized answers a 413 or a 416 to a chunk of n bytes that names no refusal of the push, from the
 // session's status. A session the registry no longer knows is lost; one further on goes on from
-// there at once, one behind is retried from there; a 416 it cannot answer is retried (run halves
-// the chunk and asks again) while the chunk can shrink. Otherwise — the session at the
-// acknowledged offset, a 413 the status does not explain, the smallest chunk unexplained — it is a
-// refusal of the chunk's size (a registry that caps a request's body answers it, ghcr.io a 416
-// over 4 MiB): the chunk is halved, from the last byte acknowledged, and the registry's ceiling
-// drops below n for every later chunk of this client to it. A chunk that cannot shrink (the
-// smallest the upload takes, or a last one under it) is retried when the registry took a whole
-// chunk as large: before that, it is a registry that takes no chunk that small (errChunkRefused).
+// there at once, one behind is retried from there. Otherwise — the session at the acknowledged
+// offset, a 413 the status does not explain, a 416 whose status cannot be read — it is a refusal
+// of the chunk's size (a registry that caps a request's body answers it, ghcr.io a 416 over
+// 4 MiB): the registry's ceiling drops (chunkCeiling.refuse) for every later chunk of this
+// client to it, and the chunk is sent again, smaller, from the last byte acknowledged — at once,
+// or after a retry's wait and a new look at the session when its status could not be read. A
+// chunk that cannot shrink (the smallest the upload takes, or a last one under it) is retried,
+// sizeRetries times at most, when the registry took a whole chunk as large; past that, or before
+// it took one, it is a registry that takes no chunk that small (errChunkRefused).
 func (u *upload) sized(ctx context.Context, status int, n int64, err error) error {
 	got, lost := u.held(ctx)
 	switch {
@@ -532,30 +602,32 @@ func (u *upload) sized(ctx context.Context, status int, n int64, err error) erro
 	case got >= 0 && got < u.off:
 		u.advance(got)
 		return err
-	case got < 0 && status == http.StatusRequestedRangeNotSatisfiable && n > u.least:
-		return err
 	}
 	if n <= u.least {
-		if u.took >= n {
+		if u.took >= n && u.again < sizeRetries {
+			u.again++
 			return err
+		}
+		if u.took >= n {
+			return fmt.Errorf("%w: a chunk of %s refused %d times in a row: %w", errChunkRefused, size(n), u.again+1, err)
 		}
 		return fmt.Errorf("%w: a chunk of %s refused: %w", errChunkRefused, size(n), err)
 	}
-	c := max(n/2, u.least)
-	for {
-		old := u.ceiling.Load()
-		if old > 0 && old <= c || u.ceiling.CompareAndSwap(old, c) {
-			break
-		}
+	u.ceiling.refuse(n, u.least)
+	u.logf("push %s: the registry refuses a chunk of %s; chunks of at most %s from now", u.label, size(n), size(max(u.ceiling.get(), u.least)))
+	if got < 0 && status == http.StatusRequestedRangeNotSatisfiable {
+		return err // run cuts the chunk, as after any failure
 	}
 	u.chunk = u.bounded(u.chunk)
-	u.logf("push %s: the registry refuses a chunk of %s; chunks of at most %s from now", u.label, size(n), size(max(u.ceiling.Load(), u.least)))
 	return nil
 }
 
+// sizeRetries bounds the retries of a chunk that cannot shrink, refused for its size, at one offset.
+const sizeRetries = 3
+
 func (u *upload) advance(to int64) {
 	if to > u.off {
-		u.acked, u.committing = time.Now(), false
+		u.acked, u.committing, u.again = time.Now(), false, 0
 	}
 	u.off = to
 }

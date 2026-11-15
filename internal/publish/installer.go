@@ -13,6 +13,7 @@ import (
 	"os"
 	"path"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/google/go-containerregistry/pkg/name"
@@ -309,8 +310,9 @@ type latest struct {
 
 // latestTags are channel's floating tags for rel (nil: no release), none when channel does not
 // set latest: the installer's follows rel, each disk format's the channel's disk set
-// (currentDisks), which only a ship publishing disks moves. Every disk format is listed, so a
-// format the project dropped loses its tag.
+// (currentDisks), which only a ship publishing disks moves. The disk formats are the set's and
+// those a latest-<format> tag of the disk repository names (latestFormats), so a format the
+// project dropped, or one only a newer stowage makes, loses its tag once the set has none of it.
 func (p *Publisher) latestTags(ctx context.Context, channel string, rel *Ref) ([]latest, error) {
 	if !p.Project.Spec.Channels[channel].Latest {
 		return nil, nil
@@ -329,12 +331,39 @@ func (p *Publisher) latestTags(ctx context.Context, channel string, rel *Ref) ([
 		if err != nil {
 			return nil, err
 		}
-		for _, f := range spec.DiskFormats {
+		have, err := p.latestFormats(ctx)
+		if err != nil {
+			return nil, err
+		}
+		formats := append(slices.Collect(maps.Keys(cur.disks)), have...)
+		slices.Sort(formats)
+		for _, f := range slices.Compact(formats) {
 			t, err := p.Registry.Tag(p.diskRepo(), release.DiskTag(LatestTag, f))
 			if err != nil {
 				return nil, err
 			}
 			out = append(out, latest{"disk " + f, t, p.diskRepo(), cur.disks[f], true})
+		}
+	}
+	return out, nil
+}
+
+// latestFormats are the formats a latest-<format> tag of the disk repository names, a retired one
+// included. A format holds no '-' (spec.DiskFormats) while a release's disk tag <tag>-<format>
+// starting with latest- holds two or more, so none is taken for a format's.
+func (p *Publisher) latestFormats(ctx context.Context) ([]string, error) {
+	repo, err := p.Registry.Repo(p.diskRepo())
+	if err != nil {
+		return nil, err
+	}
+	tags, err := p.Registry.Tags(ctx, repo)
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, t := range tags {
+		if f, ok := strings.CutPrefix(t, LatestTag+"-"); ok && f != "" && !strings.Contains(f, "-") {
+			out = append(out, f)
 		}
 	}
 	return out, nil
@@ -442,6 +471,9 @@ func (p *Publisher) dropTag(ctx context.Context, l latest) error {
 func (p *Publisher) retire(ctx context.Context, tag name.Tag) error {
 	if _, err := p.Registry.PutArtifact(ctx, tag, registry.Retired()); err != nil {
 		return err
+	}
+	if rd, err := registry.RetiredDigest(); err == nil {
+		p.snap.set(tag, rd)
 	}
 	have, err := p.headFloating(ctx, tag)
 	if err != nil {

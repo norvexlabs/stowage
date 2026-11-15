@@ -140,6 +140,48 @@ func TestTheOverrideSaysWhetherIPv6IsOn(t *testing.T) {
 	}
 }
 
+// A static address6 without a gateway6 expects no IPv6 router: the boot neither waits for nor
+// solicits a default route, and the daemon gives no warning of its absence; with a gateway6, or
+// without a static address6, the route is expected.
+func TestAStaticIPv6AddressWithoutAGatewayExpectsNoRouter(t *testing.T) {
+	t.Parallel()
+	for _, c := range []struct {
+		cfg    NetConfig
+		router bool
+	}{
+		{NetConfig{Mode: "dhcp", IPv6: true, Address6: "2001:db8::5/64"}, false},
+		{NetConfig{Mode: "static", Address: "192.0.2.5/24", Gateway: "192.0.2.1", IPv6: true, Address6: "2001:db8::5/64"}, false},
+		{NetConfig{Mode: "dhcp", IPv6: true, Address6: "2001:db8::5/64", Gateway6: "2001:db8::1"}, true},
+		{NetConfig{Mode: "dhcp", IPv6: true}, true},
+	} {
+		link := &routeLink{}
+		h := route6Hostd(t, link, true)
+		if err := h.netFiles().write(netState{Version: netStateVersion, Config: &c.cfg}); err != nil {
+			t.Fatal(err)
+		}
+		if got := h.primaryIPv6(); got != c.router {
+			t.Errorf("%+v: expects a router %v, want %v", c.cfg, got, c.router)
+		}
+		var log bytes.Buffer
+		h.route6Boot(context.Background(), 20*time.Millisecond, &log)
+		if c.router == (link.count() == 0) {
+			t.Errorf("%+v: %d solicitations: %s", c.cfg, link.count(), log.String())
+		}
+		if !c.router && log.Len() > 0 {
+			t.Errorf("%+v: the boot logs %s", c.cfg, log.String())
+		}
+	}
+	install := filepath.Join(t.TempDir(), "install-network.yaml")
+	if err := os.WriteFile(install, []byte("mode: dhcp\nipv6: true\naddress6: 2001:db8::5/64\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h := route6Hostd(t, &routeLink{}, true)
+	h.InstallNet = install
+	if h.primaryIPv6() {
+		t.Error("the install's static address6 without a gateway6 expects a router")
+	}
+}
+
 // The daemon solicits while the route is missing, warns once past the bound in status and the
 // journal, and clears the warning once the route is back.
 func TestTheDaemonSolicitsAndWarnsWithoutAnIPv6DefaultRoute(t *testing.T) {
@@ -265,7 +307,7 @@ func TestTheDaemonNeitherWarnsOnAnUnreadRouteNorAfterIPv6IsOff(t *testing.T) {
 			t.Fatal("the warning stays with IPv6 off")
 		}
 	}
-	if l := logged(); strings.Contains(l, "is back") || !strings.Contains(l, "IPv6 is off on the primary link: its default route is no longer watched") {
+	if l := logged(); strings.Contains(l, "is back") || !strings.Contains(l, "IPv6 is off on the primary link, or it expects no router (a static address6 without a gateway6): its default route is no longer watched") {
 		t.Errorf("IPv6 off:\n%s", l)
 	}
 }

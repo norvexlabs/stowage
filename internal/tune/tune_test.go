@@ -1645,6 +1645,80 @@ func TestTheNICsInterruptsLeaveTheServicesCores(t *testing.T) {
 	}
 }
 
+// An interrupt that fired before the apply moved it (a virtio NIC's config interrupt, at probe)
+// keeps its old effective CPU until it next fires: the apply records its counts, and the report
+// judges it by the CPU asked while they have not grown, by its effective CPU once they have.
+func TestAnInterruptQuietSinceItsMoveIsJudgedByTheCPUAsked(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s, _ := fakeHost(t, "1500")
+	write(t, s.Root, "sys/devices/system/cpu/online", "0-3\n")
+	for cpu := range 4 {
+		write(t, s.Root, "sys/devices/system/cpu/cpu"+strconv.Itoa(cpu)+"/topology/core_id", strconv.Itoa(cpu)+"\n")
+		write(t, s.Root, "sys/devices/system/cpu/cpu"+strconv.Itoa(cpu)+"/topology/physical_package_id", "0\n")
+	}
+	s.ServiceCores = []CoreRequest{{Service: "proxy", Cores: 2}}
+	for irq, eff := range map[string]string{"24": "2", "25": "3"} {
+		write(t, s.Root, "sys/class/net/eth0/device/msi_irqs/"+irq, "msix\n")
+		write(t, s.Root, "proc/irq/"+irq+"/smp_affinity_list", "0-3\n")
+		write(t, s.Root, "proc/irq/"+irq+"/effective_affinity_list", eff+"\n")
+	}
+	write(t, s.Root, "sys/kernel/irq/24/per_cpu_count", "0,0,9,0\n")
+	write(t, s.Root, "sys/kernel/irq/25/per_cpu_count", "0,0,0,1\n")
+	h, _ := s.Host()
+	p, err := s.Plan(h)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Apply(ctx, p, ApplyOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := read(t, s.Root, IRQCountFile); got != "24 0,0,9,0\n25 0,0,0,1\n" {
+		t.Errorf("recorded counts %q", got)
+	}
+	// 24 fired since and moved; 25 did not fire since, and keeps CPU 3.
+	write(t, s.Root, "proc/irq/24/effective_affinity_list", "0\n")
+	write(t, s.Root, "sys/kernel/irq/24/per_cpu_count", "1,0,9,0\n")
+	if it := find(s.Inspect(ctx, h), "nic", "eth0 interrupts"); it == nil || it.State != OK || it.Have != "2, off the services' cores" {
+		t.Errorf("one quiet since its move: %+v", it)
+	}
+	write(t, s.Root, "sys/kernel/irq/25/per_cpu_count", "0,0,0,2\n")
+	if it := find(s.Inspect(ctx, h), "nic", "eth0 interrupts"); it == nil || it.State != Differs || it.Have != "1 of 2 on the services' cores (IRQ 25)" {
+		t.Errorf("one that fired since on its old CPU: %+v", it)
+	}
+}
+
+// The apply records an interrupt's counts after it writes its affinity: a firing before the write
+// keeps the old CPU, one between the write and the read moved it. Here the affinity file is the
+// count's, so the record shows which came first.
+func TestTheCountsAreReadAfterTheAffinityIsWritten(t *testing.T) {
+	t.Parallel()
+	s, _ := fakeHost(t, "1500")
+	write(t, s.Root, "sys/devices/system/cpu/online", "0-3\n")
+	for cpu := range 4 {
+		write(t, s.Root, "sys/devices/system/cpu/cpu"+strconv.Itoa(cpu)+"/topology/core_id", strconv.Itoa(cpu)+"\n")
+		write(t, s.Root, "sys/devices/system/cpu/cpu"+strconv.Itoa(cpu)+"/topology/physical_package_id", "0\n")
+	}
+	s.ServiceCores = []CoreRequest{{Service: "proxy", Cores: 2}}
+	write(t, s.Root, "sys/class/net/eth0/device/msi_irqs/24", "msix\n")
+	write(t, s.Root, "proc/irq/24/effective_affinity_list", "2\n")
+	write(t, s.Root, "sys/kernel/irq/24/per_cpu_count", "before\n")
+	if err := os.Symlink(filepath.Join(s.Root, "sys/kernel/irq/24/per_cpu_count"), filepath.Join(s.Root, "proc/irq/24/smp_affinity_list")); err != nil {
+		t.Fatal(err)
+	}
+	h, _ := s.Host()
+	p, err := s.Plan(h)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Apply(context.Background(), p, ApplyOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := read(t, s.Root, IRQCountFile); got != "24 0\n" {
+		t.Errorf("recorded %q, want the counts after the write", got)
+	}
+}
+
 // A user under /proc's hidepid sees no dockerd: the report says so rather than judge
 // /etc/docker/daemon.json where the engine may read another file. Root, or a visible dockerd, is
 // judged.

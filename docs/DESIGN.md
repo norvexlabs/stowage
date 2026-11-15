@@ -387,16 +387,23 @@ pushed artifact.
   losing the upload acknowledges the same bytes again. A chunk refused for its size (a 413 or 416
   the session survives at the acknowledged offset: a proxy capping a request's body answers it,
   ghcr.io at 4 MiB) is a ceiling, not a lost session: the chunk is halved and the ceiling held for
-  the client's later chunks to that registry, so the first disk pays a few refused bodies (from a 64
-  MiB chunk on ghcr.io: 64, 32, 16, 8) and the others none, instead of four sessions each. The
+  the client's later chunks to that registry (a cap on a request's body is the registry's, whatever
+  the repository), so the first disk pays a few refused bodies (from a 64 MiB chunk on ghcr.io: 64,
+  32, 16, 8) and the others none, instead of four sessions each. The
   session's status (`GET`) classifies, once, every 413 and 416 but one to a disk's first chunk or
   one naming a refusal: at the acknowledged offset it is a size (so is a 413 it cannot answer),
   elsewhere it is followed, a session the registry no longer knows (or one claiming bytes never
-  sent) is lost, and a 416 it cannot answer is retried without touching the shared ceiling, as a
-  guess must not slow every later disk. The smallest chunk refused is a registry without chunks only
-  before the disk's upload had a whole chunk that large acknowledged; after, the registry took one,
-  so it is retried. A refusal naming the push itself (`DENIED`, …) stays final whatever its status.
-  The ceiling only drops within a run: a transient 413 costs that run speed, never the upload. Past
+  sent) is lost, and a 416 it cannot answer is a size too: left alone, each disk would climb back
+  and pay it again. The ceiling is a guess either way, so it recovers: after a few chunks taken
+  whole at it, it rises halfway to the smallest chunk refused, never to it, while that gap is over
+  the least chunk — a transient refusal climbs back to near the chunk refused, a real cap is
+  bisected to just under it, a few refused bodies in all. The smallest chunk refused is a registry
+  without chunks only before the disk's upload had a whole chunk that large acknowledged; after, the
+  registry took one, so it is retried, a bounded number of times (a registry refusing a short last
+  chunk on every attempt would otherwise run to the stall bound), then the blob goes in one stream
+  — from the first byte: the distribution API's only way on from an offset is the session's own
+  chunks, which that registry refuses. A refusal naming the push itself (`DENIED`, …) stays final
+  whatever its status. Past
   the session cap, or for a registry without chunked uploads, the blob goes up in one stream. Both
   are planned once the images are pushed by digest — still before any tag moves; on an immutable
   channel the images are then all kept, so a refusal still writes nothing.
@@ -763,7 +770,11 @@ point.
    that release acts on it unasked. The crossing wipes the `data.reset` of both releases (the old
    one's stack holds the data, the new one's names what it will mount), and the plan resolves
    that set before the OS is written. The VM's `upgrade` checks the
-   baseline before it writes an OS, so a crossing never costs a reboot and a fallback.
+   baseline before it writes an OS, so a crossing never costs a reboot and a fallback. A baseline
+   is data, read from any Stowage's spec; whether the install's values fit the release is a rule,
+   and the daemon judges it there only for a release its own Stowage published: another Stowage's
+   rules are its boot's, which may accept what the daemon's would refuse (or the reverse), so that
+   release's boot judges, and falls back on a refusal.
 
 ### The Kubernetes shape — `<short>-stow k8s`
 
@@ -1063,7 +1074,8 @@ Rules:
   is the project's endpoint's to decide. It reaches the service as the health gate does, at its
   container's address on the stack's network, so the service publishes no port for it; a POST
   not taken is tried again after a minute (at boot the daemon starts before the stack), not at
-  once, and nothing is persisted on the VM (the reading is the disk's, the last POST is the
+  once, for ten minutes in a row, then on the regular cadence (an address that never comes costs
+  no more than a disk that is fine), and nothing is persisted on the VM (the reading is the disk's, the last POST is the
   daemon's memory); a Docker install keeps its last POST in the install directory, as each check
   is a process of its own.
 - A secondary NIC's override (`network set --role`) is a record of its own beside the primary's
@@ -2125,14 +2137,19 @@ every shape, the VM end-to-end test upgrading through it), then the health gate.
   bundle), marked before the load so a start cut off before it flushes at the next. A set's
   change is a change of the rules' verdicts like a table's: an element removed from a set the
   rules admit by, or added to one they deny by, leaves flows open that the set no longer admits,
-  and Stowage cannot tell which way a set is used. So any change of a held table's sets (an
-  input's value, a set no longer filled, a set filled anew) flushes
-  as a load does, and so does a sets record that does not read; the same values do not. The app
-  socket's changes do not flush: its calls come as often as the app likes, and a whole-table flush
-  at each would cut every flow of the host's, where a start is rare. A change
-  nft refuses removes the mark it wrote, and the boot drops a mark still due, as a reboot empties
-  the table. The flush is the whole table's: ending only a removed element's flows means matching the element
-  (an address, a prefix, a port, a concatenation) against each entry's tuple by the set's key. The feeder is often
+  and Stowage cannot tell which way a set is used, nor which end of a flow the rules read. So a
+  change of an input's elements, at a start or through the app socket, ends the flows of every
+  element it changed, added or removed (the set listed before and after: what nft changed, not
+  what was asked), matched by the set's key against every address and port of the entry's two
+  tuples: a superset of the flows the element judged, each re-judged as new, where a whole-table
+  flush at each of the app's calls would cut every flow of the host's. A key type with no tuple
+  field to match (an interface, a mark) cannot be narrowed: a start flushes the whole table, as
+  it did before narrowing existed, but the app socket keeps the flows and warns, as a flush at
+  each of its calls would cut every flow of the host's. A set no
+  longer filled, or filled anew, loads or flushes as a load does, and so does a sets record that
+  does not read; the same values end nothing. A change nft refuses removes the mark it wrote, and
+  the boot drops a mark still due, as a reboot empties the table; a mark an earlier start left
+  (its listing before is lost) flushes the whole table. The feeder is often
   not the table's service: the socket's token upgrades, reboots and re-addresses the VM, so the
   least-privilege stack gives it to a service its clients do not face, which `feeds` the proxy's
   table. A feeder carries the fed table's load token in its label, so a load recreates it as it

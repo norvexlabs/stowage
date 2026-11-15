@@ -832,8 +832,8 @@ func (in *Installer) k8sDeploy(ctx context.Context, upgrade bool) (err error) {
 				in.dropped = removedBy(running.Release, in.R)
 			}
 			if from, to, ok := in.k8sBaselines(running, runErr, cur); ok && from != to {
-				return refuse(in.k8sCtl("reset-db")+" --new-baseline", "%s %s starts schema baseline %d, and release %s in %s runs %s %s, at baseline %d: its data cannot carry over, so it moves to %s only by a fresh install: `%s --new-baseline` wipes it and installs %s",
-					m.Name, m.ProjectVersion, to, k.Release, k.Namespace, cur.Release.Name, cur.Release.Version, from, m.ProjectVersion, in.k8sCtl("reset-db"), m.ProjectVersion)
+				return baselineRefused(in.k8sCtl("reset-db")+" --new-baseline", m, to, fmt.Sprintf("release %s in %s runs %s %s", k.Release, k.Namespace, cur.Release.Name, cur.Release.Version), from,
+					fmt.Sprintf("`%s --new-baseline` wipes it and installs %s", in.k8sCtl("reset-db"), m.ProjectVersion))
 			}
 		}
 	}

@@ -316,6 +316,7 @@ func (in *Installer) lockRun(ctx context.Context, env *EnvFile) (func(), error) 
 		return nil, err
 	}
 	in.lockHeld = f
+	markLockTaken(in.path(lifecycleLock))
 	if err := in.leftovers(ctx, env); err != nil {
 		unlock()
 		return nil, err
@@ -334,7 +335,38 @@ func (in *Installer) lockNow() (func(), error) {
 		}
 		return nil, Refused{Reason: fmt.Sprintf("no install in %s: the directory does not exist (none made there, or an uninstall removed it)", in.O.Dir), Fix: fix, Absent: true, cause: err}
 	}
+	if err == nil {
+		markLockTaken(in.path(lifecycleLock))
+	}
 	return unlock, err
+}
+
+// markLockTaken moves the lifecycle lock file's times as a run takes the lock: the host daemon's
+// service watch compares the file's stamp (lockStamp) before and after each look, so a lock taken
+// and released wholly inside one is seen. A file whose times cannot be set only costs that.
+func markLockTaken(path string) {
+	now := time.Now()
+	_ = os.Chtimes(path, now, now)
+}
+
+// lockStamp is the lifecycle lock file at path as a look reads it: nil when it does not stat. Two
+// stamps are the same lock untaken between them when sameLock says so.
+func lockStamp(path string) os.FileInfo {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return nil
+	}
+	return fi
+}
+
+// sameLock reports whether two stamps of the lifecycle lock file are one file, not taken between
+// them (markLockTaken): both absent (a take makes the file), or the same file at the same
+// modification time.
+func sameLock(a, b os.FileInfo) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return os.SameFile(a, b) && a.ModTime().Equal(b.ModTime())
 }
 
 // goneRefusal refuses a run whose install was removed while it waited for the lock.

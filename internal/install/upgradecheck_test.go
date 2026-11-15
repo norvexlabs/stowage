@@ -75,6 +75,29 @@ func TestUpgradeRefusesWhatTheBootWouldBeforeWritingTheOS(t *testing.T) {
 	}
 }
 
+// A release another Stowage published is judged by the boot into it, with that Stowage's rules:
+// the daemon's own rules would refuse its route, and do not; the dry run's answer and the job's
+// log say the boot judges. Its schema baseline is still checked here (TestUpgradeAcrossABaseline…).
+func TestUpgradeOfAnotherStowagesReleaseLeavesItsValuesToTheBoot(t *testing.T) {
+	t.Parallel()
+	p := vmPublished(t, spec.Provider{Name: "none"}, nil)
+	p.releaseOf("2.0.0", docsRoute(8080), func(m *release.Manifest) { m.StowageVersion = "9.9.9" })
+	host := &fakeHost{}
+	hh := daemon(p.env, host).Handler()
+	const note = "2.0.0-1 was published by Stowage 9.9.9, and the host daemon is Stowage " + testStowage + "'s: the boot into it judges whether it takes the install's values, with its own rules, and on a refusal falls back to the release the install runs"
+	var plan UpgradePlan
+	if code := call(t, hh, "POST", "/v1/upgrade", UpgradeRequest{Channel: "stable", DryRun: true}, &plan); code != 200 || plan.Unchecked != note {
+		t.Fatalf("%d %+v", code, plan)
+	}
+	no := false
+	if code := call(t, hh, "POST", "/v1/upgrade", UpgradeRequest{Channel: "stable", Reboot: &no}, nil); code != 202 {
+		t.Fatalf("%d", code)
+	}
+	if j := waitJob(t, hh); j.State != "done" || !slices.Contains(j.Log, note) || !strings.Contains(fmt.Sprint(host.calls()), "kairos-agent upgrade") {
+		t.Fatalf("%+v %v", j, host.calls())
+	}
+}
+
 // A release the boot would install is written: the route it adds on a port of its own.
 func TestUpgradeWritesTheOSOfARouteTheBootAdds(t *testing.T) {
 	t.Parallel()
@@ -82,6 +105,11 @@ func TestUpgradeWritesTheOSOfARouteTheBootAdds(t *testing.T) {
 	p.releaseOf("2.0.0", docsRoute(9000))
 	host := &fakeHost{}
 	hh := daemon(p.env, host).Handler()
+	// updates tells the upgrade downloads the release's installer to check it.
+	var u Update
+	if code := call(t, hh, "GET", "/v1/updates?channel=stable", nil, &u); code != 200 || !u.ChecksInstaller {
+		t.Fatalf("%d %+v", code, u)
+	}
 	no := false
 	if code := call(t, hh, "POST", "/v1/upgrade", UpgradeRequest{Channel: "stable", Reboot: &no}, nil); code != 202 {
 		t.Fatalf("%d", code)
@@ -109,12 +137,12 @@ func TestUpgradeAcrossABaselineIsRefusedBeforeWritingTheOS(t *testing.T) {
 	host := &fakeHost{}
 	hh := daemon(p.env, host).Handler()
 	for channel, way := range map[string]string{
-		"stable": "`sudo notes-stow reset-db --new-baseline --channel stable --version 2.0.0` wipes the data and installs it",
-		"":       "`sudo notes-stow reset-db --new-baseline --version 2.0.0` wipes the data and installs it",
+		"stable": "`sudo notes-stow reset-db --new-baseline --channel stable --version 2.0.0` wipes it and installs 2.0.0; its OS is not written",
+		"":       "`sudo notes-stow reset-db --new-baseline --version 2.0.0` wipes it and installs 2.0.0; its OS is not written",
 	} {
 		var e errOf
 		if code := call(t, hh, "POST", "/v1/upgrade", UpgradeRequest{Channel: channel}, &e); code != 409 ||
-			!strings.Contains(e.Error, "notes 2.0.0 starts schema baseline 2, and the install runs notes 1.0.0, at baseline 1: its data cannot carry over, so its OS is not written; "+way) ||
+			!strings.Contains(e.Error, "notes 2.0.0 starts schema baseline 2, and the install runs notes 1.0.0, at baseline 1: its data cannot carry over, so it moves to 2.0.0 only with its data wiped: "+way) ||
 			e.Fix != "stay on this release, or cross to it with its data wiped (reset-db --new-baseline)" {
 			t.Fatalf("channel %q: %d %s (fix %q)", channel, code, e.Error, e.Fix)
 		}
@@ -133,7 +161,7 @@ func TestUpgradeAcrossABaselineHintsUnorderedUnderACommandScheme(t *testing.T) {
 	hh := daemon(p.env, &fakeHost{}).Handler()
 	var e errOf
 	if code := call(t, hh, "POST", "/v1/upgrade", UpgradeRequest{Channel: "stable", Version: "2.0.0", Unordered: true}, &e); code != 409 ||
-		!strings.Contains(e.Error, "`sudo notes-stow reset-db --new-baseline --channel stable --version 2.0.0 --unordered` wipes the data and installs it") {
+		!strings.Contains(e.Error, "`sudo notes-stow reset-db --new-baseline --channel stable --version 2.0.0 --unordered` wipes it and installs 2.0.0") {
 		t.Fatalf("%d %s (fix %q)", code, e.Error, e.Fix)
 	}
 }
@@ -462,8 +490,8 @@ func TestACrossingFromACrossedInstallHintsUnorderedUnderACommandScheme(t *testin
 		p.releaseOf("2.0.0", atBaseline(2), scheme...)
 		p.releaseOf("3.0.0", atBaseline(3), scheme...)
 		want := map[bool]string{
-			true:  "; `sudo notes-stow upgrade --version 2.0.0` writes the OS of the release the install runs, then `sudo notes-stow reset-db --new-baseline --channel stable --version 3.0.0 --unordered` wipes the data",
-			false: "; `sudo notes-stow upgrade --version 2.0.0` writes the OS of the release the install runs, then `sudo notes-stow reset-db --new-baseline --channel stable --version 3.0.0` wipes the data",
+			true:  ": `sudo notes-stow upgrade --version 2.0.0` writes the OS of the release the install runs, then `sudo notes-stow reset-db --new-baseline --channel stable --version 3.0.0 --unordered` wipes it",
+			false: ": `sudo notes-stow upgrade --version 2.0.0` writes the OS of the release the install runs, then `sudo notes-stow reset-db --new-baseline --channel stable --version 3.0.0` wipes it",
 		}[command]
 		var e errOf
 		if code := call(t, daemon(p.env, &fakeHost{}).Handler(), "POST", "/v1/upgrade", UpgradeRequest{Channel: "stable"}, &e); code != 409 || !strings.Contains(e.Error, want) {

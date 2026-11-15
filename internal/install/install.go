@@ -175,6 +175,9 @@ type Options struct {
 	Hostname func() (string, error)
 	// FlushConntrack replaces the flush of the host's connection-tracking table in tests.
 	FlushConntrack func() error
+	// DeleteConntrack replaces the deletion of the entries of the host's connection-tracking table
+	// that match in tests.
+	DeleteConntrack func(match func(ctEntry) bool) (int, error)
 	// Roots are the host's trusted CAs a byo chain is checked against; nil is the system's.
 	Roots func() (*x509.CertPool, error)
 	// Tune is the host tune reads and changes (`tune`, the containers' network settings, the

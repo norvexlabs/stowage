@@ -408,6 +408,27 @@ func TestPressureWatchRetriesSoonerWhenNotTaken(t *testing.T) {
 	p.waitAsked(t, 3, 2*time.Second)
 }
 
+// A check asking to check again sooner waits pressureRetry for pressureRetries checks in a row,
+// then pressureEvery (an address that never comes); one that does not ask starts the count again.
+func TestPressureWaitRetriesSoonerForTenMinutesInARow(t *testing.T) {
+	t.Parallel()
+	tries := 0
+	for i := 1; i <= pressureRetries; i++ {
+		if w := pressureWait(true, &tries); w != pressureRetry {
+			t.Fatalf("check %d asking again waits %d", i, w)
+		}
+	}
+	if w := pressureWait(true, &tries); w != pressureEvery {
+		t.Fatalf("check %d asking again waits %d", pressureRetries+1, w)
+	}
+	if w := pressureWait(false, &tries); w != pressureEvery {
+		t.Fatalf("a check not asking again waits %d", w)
+	}
+	if w := pressureWait(true, &tries); w != pressureRetry {
+		t.Fatalf("asking again after a check that did not waits %d", w)
+	}
+}
+
 // Serve returns only once a check under way has ended: nothing of the watch runs after it.
 func TestServeWaitsForTheCheckUnderWay(t *testing.T) {
 	t.Parallel()
@@ -421,15 +442,11 @@ func TestServeWaitsForTheCheckUnderWay(t *testing.T) {
 		returned.Store(true)
 		return nil
 	}
-	dir, err := os.MkdirTemp("", "hostd")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { os.RemoveAll(dir) })
+	sock := filepath.Join(shortDir(t), "run", "host.sock")
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	withBootID(t, p.h)
-	go func() { done <- p.h.Serve(ctx, filepath.Join(dir, "run", "host.sock")) }()
+	go func() { done <- p.h.Serve(ctx, sock) }()
 	<-entered
 	cancel()
 	if err := <-done; err != nil {

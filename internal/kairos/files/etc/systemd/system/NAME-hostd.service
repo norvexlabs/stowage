@@ -9,8 +9,8 @@ After=docker.service
 ExecStart=/usr/sbin/{{.Ctl}} hostd
 Restart=always
 RestartSec=2
-# A backup cut off by a stop cleans up first (up to 2 min 15 s).
-TimeoutStopSec=3min
+# A backup cut off by a stop cleans up first (up to 5 min 45 s: the daemon's backupStopWait).
+TimeoutStopSec=7min
 
 [Install]
 WantedBy=multi-user.target

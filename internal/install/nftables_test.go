@@ -295,7 +295,7 @@ func TestAReleaseWithAProjectNamedTableIsRefused(t *testing.T) {
 // port or their concatenation, in one nft command a verb; anything else is refused before nft runs.
 func TestTheSetsRouteFeedsTheServicesOwnSets(t *testing.T) {
 	t.Parallel()
-	host := &nftHost{}
+	host := &stdinHost{}
 	r := testRelease(t, "1.0.0")
 	r.Nftables = map[string][]byte{"ingest": []byte(ingestTable)}
 	h := &Hostd{R: r, O: Options{Dir: t.TempDir(), Host: host}}
@@ -308,9 +308,10 @@ func TestTheSetsRouteFeedsTheServicesOwnSets(t *testing.T) {
 	if w := post("/v1/nftables/ingest/sets/probes", `{"add": ["192.0.2.1", "198.51.100.0/24"], "delete": ["192.0.2.9"]}`); w.Code != http.StatusOK {
 		t.Fatalf("%d %s", w.Code, w.Body)
 	}
-	want := [][]string{{"nft", "add", "element", "inet", "ingest", "probes", "{ 192.0.2.1, 198.51.100.0/24 }"}, {"nft", "delete", "element", "inet", "ingest", "probes", "{ 192.0.2.9 }"}}
-	if !slices.EqualFunc(host.ran, want, slices.Equal) {
-		t.Errorf("ran %v", host.ran)
+	// The additions, then the deletions: a deletion nft refuses leaves the additions made.
+	want := []string{"nft add element inet ingest probes { 192.0.2.1, 198.51.100.0/24 }", "nft delete element inet ingest probes { 192.0.2.9 }"}
+	if !slices.Equal(host.ran, want) {
+		t.Errorf("ran %q", host.ran)
 	}
 	host.ran = nil
 	for _, c := range [][2]string{
@@ -956,24 +957,5 @@ func TestSetsDigest(t *testing.T) {
 	}
 	if setsDigest("") != setsDigest("\n") {
 		t.Error("an empty script")
-	}
-}
-
-// The sets route never flushes the connection-tracking table, flush_conntrack or not: the app's
-// calls come often, and a flush ends every flow of the host's.
-func TestTheSetsRouteFlushesNothing(t *testing.T) {
-	t.Parallel()
-	r := testRelease(t, "1.0.0")
-	r.Nftables = map[string][]byte{"ingest": []byte(ingestTable)}
-	r.Spec.Services = map[string]spec.Service{"ingest": {FlushConntrack: true}}
-	flushes := 0
-	h := &Hostd{R: r, O: Options{Dir: t.TempDir(), Host: &nftHost{}, Log: io.Discard, FlushConntrack: func() error { flushes++; return nil }}}
-	api := h.routes(true)
-	for _, body := range []string{`{"add": ["192.0.2.1"]}`, `{"delete": ["192.0.2.1"]}`} {
-		w := httptest.NewRecorder()
-		api.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/v1/nftables/ingest/sets/probes", strings.NewReader(body)))
-		if w.Code != http.StatusOK || flushes != 0 {
-			t.Errorf("%s: %d %s, %d flushes", body, w.Code, w.Body, flushes)
-		}
 	}
 }

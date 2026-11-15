@@ -192,18 +192,20 @@ func (s System) irqsStacked(irqs []int) bool {
 }
 
 // irqCPUs are the CPUs an interrupt is judged on against the services' cores: where it runs
-// (irqRunsOn), but the affinity asked for one that never fired whose effective CPUs lie outside
-// it, which it takes when it first fires.
+// (irqRunsOn), but the affinity asked for one whose effective CPUs lie outside it and that has
+// not fired since it was asked (never fired, or its counts as the last apply recorded them),
+// which it takes when it next fires.
 func (s System) irqCPUs(irq int) (string, bool) {
 	cpus, ok := s.irqRunsOn(irq)
 	if !ok {
 		return cpus, ok
 	}
-	// The kernel moves an MSI interrupt when it next fires: one that never fired (a virtio NIC's
-	// config interrupt) keeps the effective affinity it had before the one asked, and runs on the
-	// one asked when it does. One that fired is where its effective affinity says.
+	// The kernel moves an MSI interrupt when it next fires: one that has not fired since the
+	// affinity was asked (a virtio NIC's config interrupt, which fires at probe alone) keeps the
+	// effective affinity it had before, and runs on the one asked when it does. One that fired
+	// since is where its effective affinity says.
 	asked, askedOK := s.read(filepath.Join("proc/irq", strconv.Itoa(irq), "smp_affinity_list"))
-	if _, parsed := cpuList(asked); askedOK && parsed && !within(cpus, asked) && s.neverFired(irq) {
+	if _, parsed := cpuList(asked); askedOK && parsed && !within(cpus, asked) && (s.neverFired(irq) || s.quietSinceMoved(irq)) {
 		return asked, true
 	}
 	return cpus, ok
@@ -233,6 +235,22 @@ func (s System) neverFired(irq int) bool {
 		}
 	}
 	return true
+}
+
+// quietSinceMoved reports whether the interrupt's per-CPU counts are the ones the last apply
+// recorded when it moved it (IRQCountFile); false when either does not read or none was recorded.
+func (s System) quietSinceMoved(irq int) bool {
+	now, ok := s.read(filepath.Join("sys/kernel/irq", strconv.Itoa(irq), "per_cpu_count"))
+	if !ok || now == "" {
+		return false
+	}
+	recorded, _ := s.read(IRQCountFile)
+	for line := range strings.Lines(recorded) {
+		if n, counts, found := strings.Cut(strings.TrimSpace(line), " "); found && n == strconv.Itoa(irq) {
+			return counts == now
+		}
+	}
+	return false
 }
 
 // within reports whether every CPU of the list a lies in the list b; false when either does not
@@ -669,8 +687,7 @@ func (s System) inspectSteering(h Host, n nic) []Item {
 }
 
 // inspectGovernor judges the CPUs' frequency governors.
-func (s System) inspectGovernor() Item {
-	gs := s.governors()
+func (s System) inspectGovernor(gs []cpuGovernor) Item {
 	if len(gs) == 0 {
 		return Item{NA, "cpu", "governor", "no cpufreq: the hypervisor or the firmware drives the CPUs' frequency", ""}
 	}

@@ -81,13 +81,7 @@ func TestTheDaemonTakesAnIssueDirectory(t *testing.T) {
 
 func served(t *testing.T, h *Hostd) string {
 	t.Helper()
-	// A short path: a unix socket's is bounded (108 bytes), which a test's temporary directory may pass.
-	dir, err := os.MkdirTemp("", "hostd")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { os.RemoveAll(dir) })
-	sock := filepath.Join(dir, "run", "host.sock")
+	sock := filepath.Join(shortDir(t), "run", "host.sock")
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	withBootID(t, h)
@@ -100,6 +94,18 @@ func served(t *testing.T, h *Hostd) string {
 	})
 	waitSocket(t, sock)
 	return sock
+}
+
+// shortDir is a directory of the test's, removed after it, with a short path: a unix socket's is
+// bounded (108 bytes), which a test's temporary directory may pass.
+func shortDir(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "hostd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	return dir
 }
 
 // waitSocket waits for a daemon serving on sock: ready once a connection is taken, not once
@@ -350,12 +356,7 @@ func TestUpgradeReadsTheChannelsPointerAlone(t *testing.T) {
 // servedHandler serves h on a socket of its own until the test ends, and returns the socket.
 func servedHandler(t *testing.T, h http.Handler) string {
 	t.Helper()
-	dir, err := os.MkdirTemp("", "hostd")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { os.RemoveAll(dir) })
-	sock := filepath.Join(dir, "host.sock")
+	sock := filepath.Join(shortDir(t), "host.sock")
 	l, err := net.Listen("unix", sock)
 	if err != nil {
 		t.Fatal(err)
@@ -370,9 +371,10 @@ func TestUpgradeSendsTheConfirmedReleaseAndNoVersionUnasked(t *testing.T) {
 	t.Parallel()
 	e := vmEnv(t, "1.0.0")
 	var got UpgradeRequest
+	checks := false
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/updates", func(w http.ResponseWriter, _ *http.Request) {
-		reply(w, 200, Update{Channel: "stable", Current: Version{"1.0.0", 1}, Target: Version{"2.0.0", 3}, Available: true})
+		reply(w, 200, Update{Channel: "stable", Current: Version{"1.0.0", 1}, Target: Version{"2.0.0", 3}, Available: true, ChecksInstaller: checks})
 	})
 	mux.HandleFunc("POST /v1/upgrade", func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewDecoder(r.Body).Decode(&got)
@@ -382,11 +384,17 @@ func TestUpgradeSendsTheConfirmedReleaseAndNoVersionUnasked(t *testing.T) {
 		reply(w, 200, JobStatus{Started: ptr(fakeStart), Kind: "upgrade", Target: "2.0.0-3", State: "done", Log: []string{}})
 	})
 	sock := servedHandler(t, mux)
-	if out, err := ctl(e, sock, "upgrade", "--yes"); err != nil {
+	const download = "checking 2.0.0 (revision 3) against the install: its installer is downloaded first"
+	// The download is said only when updates says the daemon makes it.
+	if out, err := ctl(e, sock, "upgrade", "--yes"); err != nil || strings.Contains(out, download) {
 		t.Fatalf("%v\n%s", err, out)
 	}
 	if got.Version != "" || got.Confirm == nil || *got.Confirm != (Version{"2.0.0", 3}) || got.Reboot == nil || !*got.Reboot {
 		t.Errorf("sent %+v", got)
+	}
+	checks = true
+	if out, err := ctl(e, sock, "upgrade", "--yes"); err != nil || !strings.Contains(out, download) {
+		t.Fatalf("%v\n%s", err, out)
 	}
 }
 
@@ -1146,7 +1154,7 @@ func TestStatusOverTheSocketTellsTheFallback(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, want := range []string{"boot       passive (the fallback:", "failed     notes 1.0.0 (revision 1) at 2026-10-10T12:00:00Z: ",
-		"answered 503", "diagnostics: " + filepath.Join(g.dir, FailedBootsDir, "20261010T120000Z-1.0.0-r1")} {
+		"answered 503", "diagnostics: " + filepath.Join(g.dir, FailedBootsDir, "000001-1.0.0-r1")} {
 		if !strings.Contains(out, want) {
 			t.Errorf("no %q in\n%s", want, out)
 		}

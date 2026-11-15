@@ -69,15 +69,19 @@ cores as the start does (`<name> <version> cannot run here, and nothing was chan
 Desktop, running or stopped, has none to check; an engine that does not answer, or a host whose
 cores do not read, refuses it, nothing changed, until the upgrade is tried again: `reading this
 host's cores for the services' cpus: …`); on the
-VM before its OS is written (`… so its OS is not written`), the boot into it never failing for it.
+VM before its OS is written (`… so its OS is not written`) when the release was published by the
+Stowage the host daemon was built with, else by the boot into it, which falls back.
 `lint` checks the cores against `shapes.kairos.size` (see `services` in the spec). With
 `irq: off` (the default) `tune` keeps the NICs' interrupts and their receive steering (RPS) off
 those cores: `--apply` and the VM's boot write every NIC interrupt's affinity, on any profile,
 one to a CPU in turn over the other CPUs alone (all of them when none is left), wherever the
 kernel spread it, and the network profile sets `rps_cpus` over them; `--check` reports an
 interrupt whose affinity (its effective one, else the one asked —
-also for one that never fired, `per_cpu_count` all zeros, a virtio NIC's config interrupt, while
-its effective CPUs lie outside the one asked) reaches those cores as a
+also for one that has not fired since that affinity was asked, while its effective CPUs lie
+outside it, as the kernel moves it only when it next fires: one that never fired, `per_cpu_count`
+all zeros, or one whose counts are those `--apply` and the boot record when they move it, in
+`/run/stowage/irq-counts`, such as a virtio NIC's config interrupt, which fires at probe alone)
+reaches those cores as a
 difference (`<nic> interrupts: N of M on the services' cores (IRQ …)`; an interrupt the kernel
 manages refuses the move (its write's `EIO`), which `--apply` notes and records for the boot in
 `/run/stowage/managed-irqs`: `--check` then gives it as advice, `isolcpus=managed_irq,<cores>` on
@@ -137,15 +141,32 @@ comes before its next outgoing packet has no entry, so it meets the input chain 
 VM's drops, and a container's is no longer translated back (Docker's masquerade), so the host
 answers it with a reset; on a Docker host every container's and process's connections are judged
 anew, the host's other workloads' too. A table held as the
-last start loaded it flushes too when the start changes a set an input fills
-(`services.<name>.sets`: the input's value written otherwise than at the last start, an element
-added or removed — a set may admit or deny by its elements, so either can end a flow's verdict; a
-set the release no longer fills, whose elements a load of the table then empties, the table
-loading again even while other sets stay filled, which also empties what the app socket fed; a
-set an input fills anew; or the last start's record of the sets, `<dir>/nftables/<name>.sets`,
-unreadable or not of the form it writes, the table then loading again); the same values flush
-nothing. A change nft refuses changes nothing and flushes nothing, then or later. A change through
-the app socket never flushes (below). The boot's load flushes nothing, and drops a flush still
+last start loaded it, when the start changes a set an input fills (`services.<name>.sets`: the
+input's value written otherwise than at the last start, an element added or removed — a set may
+admit or deny by its elements, so either can end a flow's verdict), ends the flows of the
+elements changed alone: the sets listed before and after (`nft -j list set`), the
+connection-tracking table read once, and each entry an element one listing holds and the other
+not matches deleted over netlink by its tuple, as `conntrack -D` does (`ended the flows of the N
+elements changed in services.<name>.sets (…) (services.<name>.flush_conntrack): M
+connection-tracking entries deleted, …`). An element matches an entry by each part of the set's
+key: an address (`ipv4_addr`, `ipv6_addr`: one, a prefix or a range) any address of the entry's
+original and reply tuples (so a published port's flow is matched by the container's address
+too), a port (`inet_service`) any of their ports, a protocol (`inet_proto`, by number or by the name nft prints) the entry's; a
+concatenation by every part. A set of one key type is compared by what its listings cover, so an
+interval set's element nft merged with its neighbours counts only for the addresses or ports it
+added or lost. The deletion goes on past a batch the kernel refuses, within 60 s in all. Matching any end of the flow ends a few flows the rules did not judge
+by the element, never fewer than they did; each meets the firewall again as new. A set of another
+key type (an interface, a mark, a MAC address…), a listing that fails, a read of the table the
+kernel reports changed under it twice (it is read again once), or a deletion that fails flushes
+the whole table instead (`note: services.<name>.flush_conntrack: the flows of the elements
+changed in … cannot be ended alone (…): the whole connection-tracking table is flushed`). The
+whole table flushes too for a set the release no longer fills, whose elements a load of the table
+then empties, the table loading again even while other sets stay filled, which also empties what
+the app socket fed; a set an input fills anew; or the last start's record of the sets,
+`<dir>/nftables/<name>.sets`, unreadable or not of the form it writes, the table then loading
+again; the same values end nothing. A change nft refuses changes nothing and ends nothing, then
+or later. A change through the app socket ends the flows of its elements alike, but never
+flushes the whole table: one whose flows cannot be told keeps them (below). The boot's load flushes nothing, and drops a flush still
 due (a reboot empties the table). The flush runs however
 the start's loads end, a later table's refusal included. A flush that fails is warned, and the
 start goes on (a kernel that tracks no connection — no `nf_conntrack`, its

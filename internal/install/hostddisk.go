@@ -1,15 +1,12 @@
 package install
 
 import (
-	"bytes"
 	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"math"
-	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -27,10 +24,12 @@ import (
 // console's login screen says so.
 
 // pressureEvery and pressureRetry, the wait after a check that may succeed sooner, are counted in
-// Hostd.Unit.
+// Hostd.Unit; pressureRetries is how many such checks in a row wait pressureRetry, the later ones
+// pressureEvery (a service whose address never comes, a broken compose file).
 const (
 	pressureEvery   = 600
 	pressureRetry   = 60
+	pressureRetries = pressureEvery / pressureRetry
 	pressureTimeout = 30 * time.Second
 	// maxPressureAnswer bounds the part of an answer the daemon reads, to log it.
 	maxPressureAnswer = 512
@@ -143,11 +142,9 @@ func (h *Hostd) pressureWatch(ctx context.Context) {
 		h.pressureBanner(ctx, "")
 		return
 	}
+	tries := 0
 	for {
-		wait := pressureEvery
-		if h.pressureCheck(ctx, dp) {
-			wait = pressureRetry
-		}
+		wait := pressureWait(h.pressureCheck(ctx, dp), &tries)
 		t := time.NewTimer(time.Duration(wait) * h.unit())
 		select {
 		case <-ctx.Done():
@@ -156,6 +153,20 @@ func (h *Hostd) pressureWatch(ctx context.Context) {
 		case <-t.C:
 		}
 	}
+}
+
+// pressureWait is the wait, in Hostd.Unit, after a check that asked to check again sooner (again)
+// or not; tries counts the checks in a row that asked it: the first pressureRetries wait
+// pressureRetry, the later ones pressureEvery, as a check that does not ask.
+func pressureWait(again bool, tries *int) int {
+	if !again {
+		*tries = 0
+		return pressureEvery
+	}
+	if *tries++; *tries > pressureRetries {
+		return pressureEvery
+	}
+	return pressureRetry
 }
 
 // pressureCheck reads the disk once: it writes or removes the banner, and at soft or hard POSTs
@@ -182,97 +193,99 @@ func (h *Hostd) pressureCheck(ctx context.Context, dp *spec.DiskPressure) bool {
 	}
 	pctx, cancel := context.WithTimeout(ctx, pressureTimeout)
 	defer cancel()
-	result, ok, again := h.pressurePost(pctx, dp, PressureBody{Level: level, UsedPct: used, SoftPct: dp.SoftPct, HardPct: dp.HardPct})
-	if ctx.Err() != nil && !ok {
+	out := h.pressurePost(pctx, dp, PressureBody{Level: level, UsedPct: used, SoftPct: dp.SoftPct, HardPct: dp.HardPct})
+	if ctx.Err() != nil && !out.ok {
 		return false // the daemon stops: the check was cut off, not refused
 	}
-	h.O.logf("disk pressure %s, %.1f%% used: POST %s: %s", level, used, dp.Post, result)
-	post := PressurePost{At: time.Now().UTC(), Level: level, UsedPct: used, Result: result, OK: ok}
+	h.O.logf("disk pressure %s, %.1f%% used: POST %s: %s", level, used, dp.Post, out.result)
+	post := PressurePost{At: time.Now().UTC(), Level: level, UsedPct: used, Result: out.result, OK: out.ok}
 	h.pressMu.Lock()
 	h.lastPost = &post
 	h.pressMu.Unlock()
 	if h.Docker {
 		h.savePressure(post)
 	}
-	return again
+	return out.again
+}
+
+// pressureOutcome is what came of a POST of the watch: result says it (the service's status, or
+// why it was not made or not answered), ok whether the service took it (2xx), again whether it may
+// be taken soon.
+type pressureOutcome struct {
+	result    string
+	ok, again bool
 }
 
 // pressurePost POSTs body to the hook's service, at its container's address with the name `post`
-// gives as the Host, the auth secret as a bearer token when the hook names one; ctx bounds it
-// all. It answers what came of it, whether the service took it (2xx), and whether it may be
-// taken soon: it sends nothing before the first install, and nothing when the service has no
-// address (the stack is down, or being upgraded).
-func (h *Hostd) pressurePost(ctx context.Context, dp *spec.DiskPressure, body PressureBody) (result string, ok, again bool) {
+// gives as the Host, the auth secret as a bearer token when the hook names one (callService); ctx
+// bounds it all. It answers its outcome: it sends nothing before the first install, and nothing
+// when the service has no address (the stack is down, or being upgraded), both to be tried again.
+func (h *Hostd) pressurePost(ctx context.Context, dp *spec.DiskPressure, body PressureBody) (out pressureOutcome) {
 	const key = "hooks.maintenance.disk_pressure"
+	notSent := func(again bool, format string, a ...any) pressureOutcome {
+		return pressureOutcome{result: "not sent: " + fmt.Sprintf(format, a...), again: again}
+	}
 	u, err := url.Parse(dp.Post)
 	if err != nil || u.Scheme != "http" || u.Hostname() == "" || u.Port() == "" {
-		return fmt.Sprintf("not sent: %s.post %q is not http://<service>:<port>/…", key, dp.Post), false, false
+		return notSent(false, "%s.post %q is not http://<service>:<port>/…", key, dp.Post)
 	}
 	in, _ := h.run()
 	env, err := in.open()
 	if isAbsent(err) {
-		return "not sent: not installed yet", false, true
+		return notSent(true, "not installed yet")
 	}
 	if err != nil {
-		return fmt.Sprintf("not sent: %v", err), false, true
+		return notSent(true, "%v", err)
 	}
 	token := ""
 	// No result carries the token, whatever echoes it (an error's output, the service).
 	defer func() {
 		if token != "" {
-			result = strings.ReplaceAll(result, token, "<"+dp.AuthSecret+">")
+			out.result = strings.ReplaceAll(out.result, token, "<"+dp.AuthSecret+">")
 		}
 	}()
 	if dp.AuthSecret != "" {
 		var found bool
 		if token, found = env.Get(dp.AuthSecret); !found || token == "" {
-			return fmt.Sprintf("not sent: the install has no %s (%s.auth_secret)", dp.AuthSecret, key), false, false
+			return notSent(false, "the install has no %s (%s.auth_secret)", dp.AuthSecret, key)
 		}
-	}
-	ip, err := in.address(ctx, env, u.Hostname())
-	if err != nil {
-		return fmt.Sprintf("not sent: %v", err), false, true
 	}
 	raw, err := json.Marshal(body)
 	if err != nil {
-		return fmt.Sprintf("not sent: %v", err), false, false
+		return notSent(false, "%v", err)
 	}
-	target := *u
-	target.Host = net.JoinHostPort(ip, u.Port())
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, target.String(), bytes.NewReader(raw))
-	if err != nil {
-		return fmt.Sprintf("not sent: %v", err), false, false
-	}
-	req.Host = u.Host
-	req.Header.Set("Content-Type", "application/json")
+	header := http.Header{"Content-Type": {"application/json"}}
 	if token != "" {
-		req.Header.Set("Authorization", "Bearer "+token)
+		header.Set("Authorization", "Bearer "+token)
 	}
-	resp, err := cmp.Or(h.Probe, probes).Do(req)
+	ans, err := in.callService(ctx, env, h.Probe, serviceCall{method: http.MethodPost, service: u.Hostname(), port: u.Port(), path: u.RequestURI(),
+		host: u.Host, header: header, body: raw, limit: maxPressureAnswer})
+	if errors.As(err, new(unsent)) {
+		// No address: the stack is down, or being upgraded.
+		return notSent(true, "%v", err)
+	}
 	if err != nil {
 		// The URL error names the address, never the token: it is in a header.
-		return fmt.Sprintf("no answer: %v", err), false, true
+		return pressureOutcome{result: fmt.Sprintf("no answer: %v", err), again: true}
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 200 && resp.StatusCode <= 299 {
-		return fmt.Sprintf("answered %d", resp.StatusCode), true, false
+	status := fmt.Sprintf("answered %d", ans.status)
+	if ans.status >= 200 && ans.status <= 299 {
+		return pressureOutcome{result: status, ok: true}
 	}
-	again = resp.StatusCode >= 500
-	if token != "" {
-		// An answer may echo the token in any form (cut, encoded): only its status is kept.
-		return fmt.Sprintf("answered %d", resp.StatusCode), false, again
-	}
-	ans, _ := io.ReadAll(io.LimitReader(resp.Body, maxPressureAnswer))
+	out.again = ans.status >= 500
 	msg := strings.Map(func(r rune) rune {
 		if !unicode.IsPrint(r) {
 			return ' '
 		}
 		return r
-	}, strings.TrimSpace(string(ans)))
-	if msg == "" {
-		return fmt.Sprintf("answered %d", resp.StatusCode), false, again
+	}, strings.TrimSpace(string(ans.body[:min(len(ans.body), maxPressureAnswer)])))
+	// With a token, an answer may echo it in any form (cut, encoded): only its status is kept.
+	if token != "" || msg == "" {
+		out.result = status
+		return out
 	}
-	return fmt.Sprintf("answered %d: %s", resp.StatusCode, msg), false, again
+	out.result = status + ": " + msg
+	return out
 }
 
 // pressureBanner writes text as the disk banner, or removes it when text is empty; the login

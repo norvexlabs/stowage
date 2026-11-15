@@ -339,6 +339,10 @@ func testInstallerAt(t *testing.T, version string, revision int, mod func(*spec.
 	return testInstallerOf(t, version, revision, mod, nil)
 }
 
+// testStowage is the Stowage a test release records as its publisher: one, before any behaviour
+// a Stowage version turns on (handsLock).
+const testStowage = "0.0.1"
+
 // testInstallerOf is testInstallerAt with the release manifest mm changes.
 func testInstallerOf(t *testing.T, version string, revision int, mod func(*spec.Spec), mm func(*release.Manifest)) (*Release, string) {
 	t.Helper()
@@ -367,7 +371,8 @@ func testInstallerKeys(t *testing.T, version string, revision int, mod func(*spe
 		images[k], configs[k], manifests[k] = digest, config, manifest
 	}
 	m := &release.Manifest{SchemaVersion: release.SchemaVersion, Name: "notes", ShortName: view.Short(), ProjectVersion: version, Revision: revision, ReleaseSeq: 1, Channel: "stable", Tag: version,
-		Date: time.Now(), Inputs: "sha256:in", Scheme: release.Scheme{Provider: "semver"}, Artifacts: release.Artifacts{Images: images, Configs: configs, Manifests: manifests}}
+		Date: time.Now(), Inputs: "sha256:in", Scheme: release.Scheme{Provider: "semver"}, Artifacts: release.Artifacts{Images: images, Configs: configs, Manifests: manifests},
+		StowageVersion: testStowage}
 	if mm != nil {
 		mm(m)
 	}

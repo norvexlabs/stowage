@@ -208,3 +208,24 @@ func TestCloudImageName(t *testing.T) {
 		}
 	}
 }
+
+// The set a release boots is its own disks' when it has some, else BootDisks', and so is the
+// stowage that published it.
+func TestBootStowageIsTheBootSetsPublishers(t *testing.T) {
+	t.Parallel()
+	other := &BootDisks{Release: "1.0.0", Stowage: "0.20.0", Disks: map[string]string{"raw": "sha256:a"}}
+	for _, c := range []struct {
+		what     string
+		a        Artifacts
+		tag, got string
+	}{
+		{"its own disks", Artifacts{Disks: map[string]string{"raw": "sha256:b"}, BootDisks: other}, "1.1.0", "0.30.0"},
+		{"another release's", Artifacts{BootDisks: other}, "1.0.0", "0.20.0"},
+		{"none", Artifacts{}, "", "0.30.0"},
+	} {
+		m := &Manifest{Tag: "1.1.0", StowageVersion: "0.30.0", Artifacts: c.a}
+		if tag, _ := m.Artifacts.Boot(m.Tag); tag != c.tag || m.BootStowage() != c.got {
+			t.Errorf("%s: boots %q published by %q, want %q by %q", c.what, tag, m.BootStowage(), c.tag, c.got)
+		}
+	}
+}

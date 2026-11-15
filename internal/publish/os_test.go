@@ -782,3 +782,46 @@ func TestVerifyReportsTheSetAReleaseBoots(t *testing.T) {
 		t.Fatalf("got %v", err)
 	}
 }
+
+// latest-<format> of a format this stowage does not make (a newer one's) follows the channel's
+// disk set as a known format's does: a set without it removes it. A release's disk tag starting
+// with latest- names no format. Only the set's formats and the tags present are read.
+func TestALatestTagOfAnUnknownFormatFollowsTheSet(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	first := e.mustShip("stable", 1)
+	ctx := context.Background()
+	disk := mustDigest(t, e, "notes-disk", first.Manifest.Artifacts.Disks["qcow2"])
+	for _, tag := range []string{"latest-future", "latest-1.0.0-qcow2"} {
+		t, _ := e.reg.Tag(e.host+"/acme/notes/notes-disk", tag)
+		if err := e.reg.Retag(ctx, disk, t); err != nil {
+			e.t.Fatal(err)
+		}
+	}
+	p, _ := e.publisher()
+	before := e.latestHeads.Load()
+	_, err := p.Verify(ctx, "stable", "", 1)
+	if err == nil || !strings.Contains(err.Error(), "latest-future is "+first.Manifest.Artifacts.Disks["qcow2"]) || strings.Contains(err.Error(), "latest-1.0.0") {
+		t.Fatalf("verify with a stray latest-future: %v", err)
+	}
+	// qcow2 (the set's) and future (a tag present); none of the formats the set lacks.
+	eq(t, "latest tags read by verify", e.latestHeads.Load()-before, int32(2))
+	e.bump("1.1.0")
+	second := e.mustShip("stable", 1)
+	eq(t, "latest-future removed", e.digest("notes-disk", "latest-future"), "")
+	eq(t, "latest-qcow2 moved", e.digest("notes-disk", "latest-qcow2"), second.Manifest.Artifacts.Disks["qcow2"])
+	eq(t, "a release's disk tag left to the disk cleanup", strings.Contains(e.log.String(), ":latest-1.0.0-qcow2"), false)
+	if _, err := p.Verify(ctx, "stable", "", 1); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A disk format holds no '-': latestFormats tells latest-<format> from a release's disk tag by it.
+func TestNoDiskFormatHoldsADash(t *testing.T) {
+	t.Parallel()
+	for _, f := range spec.DiskFormats {
+		if strings.Contains(f, "-") {
+			t.Errorf("disk format %q holds a '-': latest-%s reads as a release's disk tag", f, f)
+		}
+	}
+}

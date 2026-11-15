@@ -218,6 +218,20 @@ func TestAPlainUpgradeTakesANewRevision(t *testing.T) {
 			}
 			next := p.installer(nil)
 			next.R, next.O.Self = r, exe
+			// The fetched installer's plain upgrade, as its command runs it: the release it
+			// carries is not the one the install runs, so it looks nothing up and upgrades.
+			p.mu.Lock()
+			before := len(p.paths)
+			p.mu.Unlock()
+			if done, err := next.UpgradeRevision(ctx, nil); done || err != nil {
+				return fmt.Errorf("the fetched installer's look for a revision: %v %w", done, err)
+			}
+			p.mu.Lock()
+			read := p.paths[before:]
+			p.mu.Unlock()
+			if len(read) > 0 {
+				return fmt.Errorf("the fetched installer read the registry again: %v", read)
+			}
 			return next.Upgrade(ctx)
 		}
 		return in.UpgradeRevision(context.Background(), []string{"--no-provision"})

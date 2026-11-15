@@ -133,7 +133,7 @@ func (h *Hostd) health(w http.ResponseWriter, r *http.Request) {
 			ctx, cancel := context.WithTimeout(h.ctx, time.Duration(healthWait(in.R))*h.unit())
 			defer cancel()
 			ans := Health{Ready: true}
-			if err := in.ready(ctx, env, h.Probe); err != nil {
+			if err := in.ready(ctx, env, h.Probe, nil); err != nil {
 				ans = Health{Reason: err.Error()}
 			}
 			h.healthMu.Lock()
@@ -325,6 +325,9 @@ const rollbackDrain = 30
 // them back worked; the job's end stands.
 func (h *Hostd) toPassive(j *job, p RollbackPlan) error {
 	h.logf(j, "rebooting into the passive system in %d s: the boot goes back to %s", rollbackDrain+rebootGrace, p.To)
+	if h.onWait != nil {
+		h.onWait("rollback drain")
+	}
 	select {
 	case <-h.ctx.Done():
 		return fmt.Errorf("nothing changed: the host daemon stopped: %w", h.ctx.Err())
@@ -403,7 +406,8 @@ func (h *Hostd) toPassive(j *job, p RollbackPlan) error {
 	if h.ctx.Err() != nil {
 		return cancelled(back("the daemon stopped before the reboot"))
 	}
-	if _, err := h.Host.Run(ctx, Cmd{Args: []string{"systemctl", "reboot"}}); err != nil {
+	// Stopped as the system goes down, the reboot comes: the marks stay for it.
+	if down, err := powerHost(ctx, h.Host, "reboot"); err != nil && !down {
 		return cancelled(back(fmt.Sprintf("systemctl reboot failed: %v", err)))
 	}
 	return nil

@@ -2,7 +2,6 @@ package install
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -12,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -33,8 +33,6 @@ func stackAnswers(e *env, ps string) {
 			return []byte("true\nfalse\n"), true, nil
 		case strings.Contains(a, " logs "):
 			return []byte("a line\n"), true, nil
-		case strings.HasSuffix(a, "ps --all"):
-			return []byte("NAME STATUS\n"), true, nil
 		}
 		return nil, false, nil
 	}
@@ -303,11 +301,11 @@ func TestAnUnhealthyBootOnTrialKeepsDiagnosticsAndFallsBack(t *testing.T) {
 	if v := g.vars(); v[assessEnable] != "yes" || v[assessTentative] != "yes" {
 		t.Errorf("the assessment changed: %v", v)
 	}
-	dir := filepath.Join(g.dir, FailedBootsDir, "20261010T120000Z-1.0.0-r1")
+	dir := filepath.Join(g.dir, FailedBootsDir, "000001-1.0.0-r1")
 	if !strings.Contains(err.Error(), dir) {
 		t.Errorf("the error does not name %s: %v", dir, err)
 	}
-	for _, f := range []string{failedBootFile, "boot.log", "ps.txt", "logs-api.txt", "logs-postgres.txt", "logs-migrate.txt"} {
+	for _, f := range []string{failedBootFile, "boot.log", "ps.json", "logs-api.txt", "logs-postgres.txt", "logs-migrate.txt"} {
 		if _, err := os.Stat(filepath.Join(dir, f)); err != nil {
 			t.Error(err)
 		}
@@ -511,7 +509,7 @@ func TestReadyJudgesEveryService(t *testing.T) {
 	} {
 		g := newGate(t, "", nil, false)
 		stackAnswers(g.env, ps)
-		err := g.gate.In.ready(context.Background(), g.readEnv(), g.gate.Probe)
+		err := g.gate.In.ready(context.Background(), g.readEnv(), g.gate.Probe, nil)
 		if want == "" {
 			if err != nil {
 				t.Errorf("%q: %v", ps, err)
@@ -541,7 +539,7 @@ func TestTheHTTPJSONProbeComparesFields(t *testing.T) {
 		g := newGate(t, "", nil, false)
 		g.gate.In.R, _ = bundledInstaller(t, "1.0.0", 1, jsonHealth)
 		g.probe.body = body
-		err := g.gate.In.ready(context.Background(), g.readEnv(), g.gate.Probe)
+		err := g.gate.In.ready(context.Background(), g.readEnv(), g.gate.Probe, nil)
 		if want == "" {
 			if err != nil {
 				t.Errorf("%.40s: %v", body, err)
@@ -555,7 +553,7 @@ func TestTheHTTPJSONProbeComparesFields(t *testing.T) {
 	g := newGate(t, "", nil, false)
 	g.gate.In.R, _ = bundledInstaller(t, "1.0.0", 1, jsonHealth)
 	g.probe.status = 500
-	if err := g.gate.In.ready(context.Background(), g.readEnv(), g.gate.Probe); err == nil || !strings.Contains(err.Error(), "answered 500") {
+	if err := g.gate.In.ready(context.Background(), g.readEnv(), g.gate.Probe, nil); err == nil || !strings.Contains(err.Error(), "answered 500") {
 		t.Errorf("500: %v", err)
 	}
 }
@@ -583,7 +581,7 @@ func TestTheProbeNeedsAnAddress(t *testing.T) {
 			}
 			return nil, false, nil
 		}
-		if err := g.gate.In.ready(context.Background(), g.readEnv(), g.gate.Probe); err == nil || err.Error() != c.want {
+		if err := g.gate.In.ready(context.Background(), g.readEnv(), g.gate.Probe, nil); err == nil || err.Error() != c.want {
 			t.Errorf("%s: %v", name, err)
 		}
 	}
@@ -640,7 +638,7 @@ func TestTheHealthCommandAnswersReady(t *testing.T) {
 			asked = append(asked, req["op"])
 			return c.out, c.err
 		}
-		err := g.gate.In.ready(context.Background(), g.readEnv(), nil)
+		err := g.gate.In.ready(context.Background(), g.readEnv(), nil, nil)
 		if c.want == "" && err != nil || c.want != "" && (err == nil || !strings.Contains(err.Error(), c.want)) {
 			t.Errorf("%s: %v, want %q", name, err, c.want)
 		}
@@ -679,7 +677,7 @@ func TestTheGateRemovesTheHealthContainersOfEarlierBoots(t *testing.T) {
 			removed = append(removed, strings.TrimPrefix(a, "rm --force "))
 			return nil, true, nil
 		case strings.HasSuffix(a, " "+HealthService):
-			left, _ := filepath.Glob(filepath.Join(g.dir, ".stowage-health-*.yaml"))
+			left, _ := filepath.Glob(filepath.Join(g.dir, ".stowage-health-*_boot2.yaml"))
 			if len(left) == 1 {
 				raw, _ := os.ReadFile(left[0])
 				file = string(raw)
@@ -698,7 +696,7 @@ func TestTheGateRemovesTheHealthContainersOfEarlierBoots(t *testing.T) {
 		s.Health = spec.Provider{Name: "command", Config: map[string]any{"image": "api", "cmd": []any{"notes-api", "ready"}}}
 	})
 	g.docker.health = func(map[string]any) (string, error) { return `{"ready": true}`, nil }
-	if err := g.gate.In.ready(context.Background(), g.readEnv(), nil); err != nil {
+	if err := g.gate.In.ready(context.Background(), g.readEnv(), nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(file, HealthBootLabel+": boot2") {
@@ -714,12 +712,106 @@ func TestTheGateRemovesTheHealthContainersOfEarlierBoots(t *testing.T) {
 	}
 }
 
+// deadlines records, for each engine call, whether its context carried a deadline.
+type deadlines struct {
+	Tool
+	mu   sync.Mutex
+	seen map[string]bool
+}
+
+func (d *deadlines) Run(ctx context.Context, c Cmd) ([]byte, error) {
+	_, has := ctx.Deadline()
+	d.mu.Lock()
+	d.seen[strings.Join(c.Args, " ")] = has
+	d.mu.Unlock()
+	return d.Tool.Run(ctx, c)
+}
+
+type roundTrip func(*http.Request) (*http.Response, error)
+
+func (f roundTrip) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+// The http probe bounds its request alone by probeTimeout: the service's address is looked up
+// under the caller's context, so an engine slow to answer (a loaded first boot) is waited for as
+// the gate's poll does, never judged as a service that does not answer.
+func TestTheProbeBoundsTheRequestAlone(t *testing.T) {
+	t.Parallel()
+	g := newGate(t, "", nil, false)
+	d := &deadlines{Tool: g.gate.In.O.Docker, seen: map[string]bool{}}
+	g.gate.In.O.Docker = d
+	client := *g.gate.Probe
+	inner := client.Transport
+	var bounded atomic.Bool
+	client.Transport = roundTrip(func(r *http.Request) (*http.Response, error) {
+		_, has := r.Context().Deadline()
+		bounded.Store(has)
+		return inner.RoundTrip(r)
+	})
+	if err := g.gate.In.probeHTTP(context.Background(), g.readEnv(), &client); err != nil {
+		t.Fatal(err)
+	}
+	if !bounded.Load() {
+		t.Error("the request is not bounded")
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	looked := 0
+	for call, has := range d.seen {
+		if strings.Contains(call, "ps --quiet api") || strings.HasPrefix(call, "inspect ") || strings.HasPrefix(call, "network inspect ") {
+			looked++
+			if has {
+				t.Errorf("the lookup %q runs under the request's bound", call)
+			}
+		}
+	}
+	if looked != 3 {
+		t.Errorf("looked up with %v", d.seen)
+	}
+}
+
+// The diagnostics keep the services as the failed judgement listed them, without listing them
+// again; a judgement that did not list them (its boot unit failed first) has them listed then.
+func TestTheDiagnosticsKeepTheJudgementsServices(t *testing.T) {
+	t.Parallel()
+	g := newGate(t, "", nil, false)
+	healthy := g.docker.answer
+	var listed atomic.Int32
+	g.docker.answer = func(a string) ([]byte, bool, error) {
+		if strings.HasSuffix(a, "ps --all --format json") {
+			listed.Add(1)
+		}
+		return healthy(a)
+	}
+	judged := `{"Service":"api","State":"exited","ExitCode":1,"Image":"a"}` + "\n"
+	g.gate.ps = []byte(judged)
+	dir, err := g.gate.keep(context.Background(), errors.New("api exited 1"), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if raw, _ := os.ReadFile(filepath.Join(dir, "ps.json")); string(raw) != judged || listed.Load() != 0 || !fileExists(filepath.Join(dir, "logs-api.txt")) || fileExists(filepath.Join(dir, "logs-postgres.txt")) {
+		t.Fatalf("ps.json %q, listed %d times", raw, listed.Load())
+	}
+	g.gate.ps = nil
+	if dir, err = g.gate.keep(context.Background(), errors.New("the boot failed"), ""); err != nil {
+		t.Fatal(err)
+	}
+	if raw, _ := os.ReadFile(filepath.Join(dir, "ps.json")); string(raw) != healthyStack || listed.Load() != 1 {
+		t.Fatalf("ps.json %q, listed %d times", raw, listed.Load())
+	}
+}
+
+// The diagnostics are numbered in the order the gate keeps them, whatever the clock says (here it
+// goes back), and the last keepFailedBoots are kept: a directory of no number counts as the oldest.
 func TestOnlyTheLastFailedBootsAreKept(t *testing.T) {
 	t.Parallel()
 	g := newGate(t, "", nil, false)
 	g.probe.status = 503
-	for i := range keepFailedBoots + 2 {
-		g.gate.Now = func() time.Time { return time.Date(2026, 10, 10, 12, 0, i, 0, time.UTC) }
+	unnumbered := filepath.Join(g.dir, FailedBootsDir, "20261010T120000Z-1.0.0-r1")
+	if err := os.MkdirAll(unnumbered, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for i := range keepFailedBoots + 1 {
+		g.gate.Now = func() time.Time { return time.Date(2026, 10, 10, 12, 0, 59-i, 0, time.UTC) }
 		if err := g.gate.Run(context.Background()); err == nil {
 			t.Fatal("healthy")
 		}
@@ -728,16 +820,16 @@ func TestOnlyTheLastFailedBootsAreKept(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(entries) != keepFailedBoots || entries[0].Name() != "20261010T120002Z-1.0.0-r1" {
-		t.Errorf("kept %v", entries)
+	var kept []string
+	for _, e := range entries {
+		kept = append(kept, e.Name())
 	}
-	if fb := lastFailedBoot(g.dir); fb == nil || !strings.HasSuffix(fb.Dir, "20261010T120006Z-1.0.0-r1") {
+	if fmt.Sprint(kept) != "[000002-1.0.0-r1 000003-1.0.0-r1 000004-1.0.0-r1 000005-1.0.0-r1 000006-1.0.0-r1]" {
+		t.Errorf("kept %v", kept)
+	}
+	fb := lastFailedBoot(g.dir)
+	if fb == nil || !strings.HasSuffix(fb.Dir, "000006-1.0.0-r1") || fb.At != time.Date(2026, 10, 10, 12, 0, 54, 0, time.UTC) {
 		t.Errorf("last %+v", fb)
-	}
-	raw, _ := os.ReadFile(filepath.Join(g.dir, FailedBootsDir, "20261010T120006Z-1.0.0-r1", failedBootFile))
-	var fb FailedBoot
-	if err := json.Unmarshal(raw, &fb); err != nil || fb.At.IsZero() {
-		t.Errorf("%s: %v", raw, err)
 	}
 }
 
@@ -785,7 +877,7 @@ func TestTheGateJudgesTheServicesAsAStartDoes(t *testing.T) {
 			}
 			return nil, false, nil
 		}
-		if err := g.gate.In.ready(context.Background(), g.readEnv(), g.gate.Probe); err == nil || err.Error() != want {
+		if err := g.gate.In.ready(context.Background(), g.readEnv(), g.gate.Probe, nil); err == nil || err.Error() != want {
 			t.Errorf("%s: %v, want %q", ps, err, want)
 		}
 	}

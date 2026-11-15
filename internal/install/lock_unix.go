@@ -43,18 +43,28 @@ func lockHeld(path string) bool {
 	if err := unix.Stat(path, &st); err != nil {
 		return false
 	}
-	raw, err := os.ReadFile("/proc/locks")
-	if err != nil {
-		return false
-	}
 	// "1: FLOCK  ADVISORY  WRITE 1234 fd:01:5678 0 EOF": the device's major and minor in hex, the
 	// inode in decimal.
 	want := fmt.Sprintf("%02x:%02x:%d", unix.Major(uint64(st.Dev)), unix.Minor(uint64(st.Dev)), st.Ino)
-	for _, line := range strings.Split(string(raw), "\n") {
-		f := strings.Fields(line)
-		if len(f) >= 6 && f[1] == "FLOCK" && strings.EqualFold(f[5], want) {
-			return true
+	// The table reads a page at a time, each from the entry at its offset then: a lock released
+	// between two reads shifts the later ones down, and one held all along can fall between the
+	// pages. Each read misses it only while other locks come and go across that boundary, so a
+	// held lock found in none of lockTableReads reads is taken as free.
+	for range lockTableReads {
+		raw, err := os.ReadFile("/proc/locks")
+		if err != nil {
+			return false
+		}
+		for _, line := range strings.Split(string(raw), "\n") {
+			f := strings.Fields(line)
+			if len(f) >= 6 && f[1] == "FLOCK" && strings.EqualFold(f[5], want) {
+				return true
+			}
 		}
 	}
 	return false
 }
+
+// lockTableReads is how many times lockHeld reads the kernel's lock table before it judges a
+// lock free (each read can skip a held entry while other locks change).
+const lockTableReads = 3

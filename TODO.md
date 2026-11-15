@@ -218,13 +218,10 @@ Cloud alone proven.
   rules name the NIC `--interface ROLE=NIC` recorded; the `primary` role could default to the
   default route's NIC (said in the output), and `status` / `tune --check` could judge each role's
   device (it exists, is up, holds the default route for `primary`).
-- **An upgrade adding a route on the VM, leftovers**: the daemon's check refuses a route the boot
-  could not decide, but a new domain input cannot be given on the VM (neither the daemon nor the
-  boot takes `--set`: `UpgradeRequest` would carry values to the boot). The daemon judges with its
-  own Stowage's rules (an older one may refuse what the boot's would accept), and leaves out the
-  kept-installer, schema-baseline and L4 checks, which need the boot's OS.
-  The daemon's check downloads the target's whole installer in the request, before the job, with
-  no progress (the job, or reading the spec alone, would show it).
+- **An upgrade adding a route on the VM, leftovers**: a new domain input cannot be given on the
+  VM (neither the daemon nor the boot takes `--set`: `UpgradeRequest` would carry values to the
+  boot); the daemon's check before the OS is written leaves out the kept-installer and L4 checks,
+  which need the boot's OS.
 - **A Docker host's gateway proven end to end**: `tune --apply`'s tables, forwarding chain,
   networkd files and boot unit are unit-tested; no suite applies them to a real Docker host (the
   gate's host is not one to change). A disposable Docker host (a VM of the Docker shape) running
@@ -286,10 +283,6 @@ Cloud alone proven.
   umask 027, password ageing and faillock). Adopting it needs the install's writes to set their
   modes whatever the umask, and the operator account exempt from ageing (it has no password).
 
-- **A prune on a registry that deletes no tag alone reads every tag per refused delete**: `untag`
-  and the sweep after it list the repository and read each tag for each tag they remove, so a
-  prune of many releases makes a quadratic number of requests and may meet the registry's rate
-  limit. One tag-to-digest snapshot per repository per prune would do.
 - **The compose model in a package of its own**: the installer imports `internal/lint` for
   `ServiceProfiles`, `ServiceDevices`, `CheckL4Address` and the `extends` resolution, linking the
   publisher's lint code (and `dockerfile`, `lock`, `digest`) into `stowage-install`.
@@ -299,12 +292,6 @@ Cloud alone proven.
 - **Docker restore drill of a machine made again**: e2e-docker restores into the install the
   backup came from; an install made with `--secrets` that then restores (`restore_awaited`) is
   unit-tested only on Docker.
-- **Untag on a registry deleting no tag alone, at scale**: `untag` lists and reads every tag of
-  the repository to find the others on a digest, once per tag; `prune` on ghcr does it for each
-  image, installer, chart, bundle and release tag. Read each repository's tags once per prune.
-- **One rule for a boot set's stowage**: which stowage published a release's boot set (its own
-  disks' or `boot_disks`') is written in the publisher (`bootSet`) and the installer (`vm create`);
-  one helper beside `release.Artifacts.Boot`.
 - **The Docker disk-pressure check end to end**: `disk-check` and its timer are unit-tested; no
   suite runs the check against a filled volume on a Docker host.
 
@@ -431,6 +418,27 @@ Cloud alone proven.
 
 ## Could
 
+- **The lifecycle lock read from a paged table**: the host daemon tells a held lifecycle lock (the
+  service watch, the upgrade before a first install) from `/proc/locks`, which the kernel serves a
+  page at a time; a held entry can fall between two pages while other locks come and go across
+  that boundary. Three reads make it rare, not impossible. A holder record the daemon can check
+  (or a lock type with a test-without-taking call that older installers' handed locks honour)
+  would close it.
+- **A reboot the daemon's own stop cut**: the host daemon counts a `systemctl reboot` ended by a
+  signal as the system going down; one its own context killed (`systemctl restart <name>-hostd`
+  while a scheduled reboot's `systemctl` runs, or Ctrl-C on the installer's switch) is counted
+  the same, so that reboot is journaled as coming and not given back. Telling the shutdown's
+  SIGTERM from the context's kill (a distinct cancel signal) would close it.
+- **Two app calls on one set at once**: under `flush_conntrack`, the host daemon lists a set before
+  and after each `POST /v1/nftables/<table>/sets/<set>` and ends the flows of the difference;
+  nothing serialises two calls on one set (or an element timing out between the listings), so
+  each may end flows of the other's elements and count them. A lock per set around the change
+  and its listings would close it.
+- **The VM's upgrade check between unreleased builds**: the host daemon judges an upgrade's values
+  only for a target published by its own Stowage version; two unreleased builds of one top
+  CHANGELOG entry share it, so one may judge by the other's rules (the boot judges again, and
+  falls back). Comparing the build's commit as well would close it.
+
 - **e2e-vm's SSH over IPv6 times out now and then**: the VM has its global address and its IPv6
   default route, yet this host's SSH to it times out (`no SSH over IPv6 to …`); 2 runs of 4 on
   2026-11-11 with no code change between them, the address the firewall admits unchanged, and
@@ -451,30 +459,11 @@ Cloud alone proven.
   `l4.routes[].tls` domain is not, so a service of the stack dialing `<domain>:<port>` leaves
   through the host's public address (hairpin NAT) rather than straight to the front.
 
-- **The service watch's races**: a look judges the lock, the daemon's jobs and its reboots at
-  instants around the read; a lifecycle lock a CLI run takes and releases wholly inside one
-  `compose ps`, or the boot unit run wholly inside it, goes unseen, and the services it stopped
-  may be journaled down (an extra event, never a crash hidden).
-- **The service watch's inspect at every look**: `docker inspect` runs at every look, where only the
-  services down need it.
 
 - **A pre-commit hook running `lint`**: `hook install` writes git's post-commit hook alone; a
   project wanting `lint`'s allowance checks (an artifact the release cannot carry, an entry
   expired or ending within 30 days) before a version bump is committed adds its own pre-commit
   hook running `stowage lint`. `hook install --pre-commit` could write it.
-
-- **IPv6 on with no IPv6 router**: a link given IPv6 for a static `address6` alone (no
-  `gateway6`, no router) holds every boot's Docker 60 s for the default route and warns in `status`
-  for good, soliciting hourly. A setting saying no router is expected, or skipping the wait when a
-  static IPv6 address has no gateway, would quiet it (review).
-
-- **The app socket's set changes leave the flows the set judged before**: under
-  `flush_conntrack`, an element deleted from an allow-list (or added to a deny-list) through
-  `POST /v1/nftables/<table>/sets/<set>` keeps its open flows until they end, as a whole-table
-  flush at each of the app's calls would cut every flow of the host's (review). Delete over
-  netlink only the entries matching the changed elements by the set's key (address, prefix, port,
-  concatenation), as `conntrack -D` would by tuple, counting only elements nft actually changed;
-  the start's set changes could use the same instead of the whole-table flush.
 
 - **networkd's router solicitations, upstream**: networkd (systemd v259, `sd-ndisc.c`,
   `ndisc_handle_router`) stops soliciting on any router's advertisement, a lifetime-0 one
@@ -484,29 +473,10 @@ Cloud alone proven.
   test link with a lifetime-0 router answering first and the default router's solicited answer
   dropped (the field case) is not built.
 
-- **`flush_conntrack`, leftovers** (review): e2e-full-vm watches an SSH session across the flush,
-  not a connection through the front's published ports (Docker's DNAT made again on the next
-  packet).
-
-- **An interrupt that fired once before the boot moved it**: `tune --check` judges a NIC
-  interrupt that never fired (`per_cpu_count` all zeros) by the affinity asked, since the kernel
-  moves it only when it next fires; one that fired once before the boot's write (a virtio config
-  interrupt at probe) and never again keeps its old effective CPU and is still reported. Record
-  the counts when the boot writes the affinity, and judge by the asked one while they have not
-  grown.
 - **A decline proven in e2e-full**: the overlap reads the new container itself (never Compose's
   `--wait`), a decline under a restart policy included, unit-tested against the engine's calls; a
   real decline in e2e-full (an environment flag on the example's api) would prove it against
   Docker.
-
-- **A chunk ceiling that recovers**: a registry's chunk ceiling only drops within a run, and is
-  keyed by host, so one transient 413 slows every later disk of that run to the host. Probe a
-  larger chunk again after a run of successes, or key it by repository; it is half the chunk
-  refused, so it can settle under the registry's real cap (2.3 MiB from a 37 MiB chunk on ghcr.io).
-  Edges of the same classification: a registry that refuses a short last chunk on every attempt
-  is retried until the stall bound fails the push (no fall back to one stream); one that answers
-  only partial ranges and then refuses the smallest chunk gets one stream from the first byte; a
-  416 whose status cannot be read lowers no ceiling, so each disk climbs back and pays it again.
 
 - **Images from packages** (a project hand-writes the Dockerfile stage today, which works): a project that ships Debian packages — software its
   operators install on a host, whose stack runs the same packages one service per container —
@@ -564,13 +534,6 @@ Cloud alone proven.
     keys the project mapped them to (`# stowage: <unit> -> <service>`, or a spec list), so none is
     lost without a word.
 
-- **Review findings left from batch A** (host block), minor:
-  - The OS bundle's refusal of a kernel argument its boot script sets reads the generic lines, not
-    a board's `baseExtraArgs` (Stowage builds the generic model only).
-  - A build with `host.packages` fetches the archive's indexes twice (its step, then the cloud
-    NICs' modules step); `tune` reads each CPU's cpufreq files twice under `host.power:
-    performance`.
-
 - **Debian 13 as the OS bundle's base**: the build takes Ubuntu alone. Debian is the one cheap
   alternative (apt, the same package names and purge, glibc, Docker's repository), but it ships
   6.12 (a modern kernel only from backports). Choosing Docker's repository from
@@ -578,9 +541,6 @@ Cloud alone proven.
 - **Hadron as the OS bundle's base**: Kairos's own minimal distribution (musl, no package
   manager). Revisit once it publishes SBOMs (today `audit` would see next to nothing of the OS)
   and ships nftables and a container runtime; every package is a build from source today.
-
-- **L4 routes on the host's network, leftovers** (review): the fetched installer of a later
-  revision looks the channel up again before it upgrades.
 
 - **HSTS `includeSubDomains` opt-out** (security review, Low): the front sends it on every route,
   as the reference deployment does, binding the names under a route's to HTTPS for a year. A spec
@@ -648,18 +608,10 @@ Cloud alone proven.
   `http://127.0.0.1:<port>`, which another compose project's containers cannot reach (two
   projects never share a network); a host on the same machine needs the extension behind a TLS
   front, or the host's address.
-- **Disk-pressure leftovers** (the VM's watch): its POST repeats the health probe's steps (the
-  service's address, the client, the bounded answer): one helper could serve both, and
-  pressurePost's `(result, ok, again)` could be one struct. e2e-kairos runs the daemon on the test
-  host with the default `/etc/issue.d`: `test/e2e-kairos.sh` should give it the hidden `hostd
-  --issue-dir`. An address that never comes (a broken compose file) is retried every minute, not
-  every 10. TestServeWaitsForTheCheckUnderWay repeats served()'s short socket directory.
-- **Backup leftovers** (the VM's backups): the `command` backup provider runs nowhere (lint warns
-  on a `kairos` shape). An upload cut off on a multipart backend (S3) may leave parts
-  `deletefile` does not see: abort them (`rclone cleanup`). Retention prunes the current profiles
-  only: backups of a profile a later release dropped stay (`backup list` shows them).
-- **Network override leftovers** (review of the network slice): a confirmation refused after its
-  window answers an error only, not the settings in force (`network` shows them).
+- **A verb deleting the backups of a dropped profile**: retention never prunes the backups of a
+  profile the release no longer declares (`backup list` marks them); the operator deletes them
+  with the destination's own tools. `backup delete <name>` (the dump, or the manifest, with its
+  volume archives) would do it through the daemon's rclone config.
 
 - **`upgrade --reset-db`**: an upgrade that wipes the data in the same run — the way across a
   schema baseline, which today takes a fresh install (on the VM, in the boot that upgrades, judged
@@ -668,12 +620,9 @@ Cloud alone proven.
   stopped between the `.env` switch and the wipe leaves the new release recorded on old data
   (the hints and `rollback` must know); the recovering `reset-db` must wipe the old release's
   volumes too.
-- **Schema baselines before the VM's upgrade job**: the host daemon's `upgrade` to a release at
-  another baseline is refused only at the boot (a reboot, a failed health gate, the fallback) —
-  check the two specs before the job writes the OS. (On Kubernetes `k8s upgrade` checks it, and
-  `k8s rollback` needs no check: a helm history never spans a baseline, since upgrade refuses one
-  and `reset-db --new-baseline` uninstalls.) Recording the baseline in the chart's values would
-  spare the installer fetch `k8s upgrade` makes to read it.
+- **A helm release's schema baseline in its chart values**: `k8s upgrade` fetches the installer of
+  the release the helm release runs only to read its baseline; recorded in the chart's values, it
+  would be read without that fetch.
 - **Reset extras**: a `seed` provider (a project's dataset loaded after a reset, beyond what the
   provision hook creates); `keep_on_reset` on Kubernetes (today every claim of the release goes);
   a database outside the Kubernetes release (`external`) is not reset.
@@ -682,19 +631,8 @@ Cloud alone proven.
   without its cleanup (a host crash; its destroy needs the run's state, gone with it), and the
   build cache, which lives in the host's shared buildx builder.
 
-- **VM health gate leftovers** (review of the health gate): `reboot`/`shutdown` are accepted while
-  the gate judges a boot on trial (documented: the next boot falls back); diagnostics are named
-  and pruned by the wall clock (wrong before time sync); the gate's diagnostics run `compose ps`
-  again; the stale health file age is wall-clock; the gate and the daemon keep the reboot
-  bookkeeping each their own way; the rollback's re-checked plan finding another target has no
-  test (reachable only through a run that changes the install consistently during the drain).
-
 - **A disk that fails rebuilds the bundle on the next ship**: the bundle was pushed by digest,
   untagged, and nothing records it. Recording built digests (a staging tag) would keep it.
-- **`latest-<format>` of a format only a newer stowage knows**: an older stowage moving the
-  latest channel leaves that tag as it was (it lists its own formats).
-- **Disk `latest-<format>` checks every format**: each sync or verify on the latest channel HEADs
-  all five tags; the spec's formats plus the pointer release's would do.
 
 - **Kept release's front rendered by the newer Stowage**: an upgrade renders the kept release's
   front files with its own renderer (from the kept release's spec and `.env`), so a rollback runs

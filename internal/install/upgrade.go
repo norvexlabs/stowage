@@ -437,8 +437,8 @@ func (in *Installer) upgradeRefusals(ctx context.Context, env *EnvFile, name, cu
 			return "", publish{}, nil, nil, cmp.Or(err, refuse("install the release afresh", "neither %s %s nor %s %s names a volume in data.reset: --new-baseline has nothing to wipe, and the new release would start on the old baseline's data", name, cur, name, m.ProjectVersion))
 		}
 	} else if from, to, ok := baselines(o, kept, in); ok && from != to {
-		return "", publish{}, nil, nil, refuse(in.fixOn(cmp.Or(o.Self, in.ctl())+" reset-db --new-baseline --dir "+o.Dir, ""), "%s %s starts schema baseline %d, and the install runs %s %s, at baseline %d: its data cannot carry over, so it moves to %s only with its data wiped: `%s reset-db --new-baseline --dir %s` wipes it and installs %s",
-			m.Name, m.ProjectVersion, to, name, cur, from, m.ProjectVersion, cmp.Or(o.Self, in.ctl()), o.Dir, m.ProjectVersion)
+		return "", publish{}, nil, nil, baselineRefused(in.fixOn(cmp.Or(o.Self, in.ctl())+" reset-db --new-baseline --dir "+o.Dir, ""), m, to, fmt.Sprintf("the install runs %s %s", name, cur), from,
+			fmt.Sprintf("`%s reset-db --new-baseline --dir %s` wipes it and installs %s", cmp.Or(o.Self, in.ctl()), o.Dir, m.ProjectVersion))
 	}
 	if o.Self == "" {
 		return "", publish{}, nil, nil, refusal("run the installer from its file", errors.New("an upgrade keeps the installer it runs as the install's: its path is not known"))

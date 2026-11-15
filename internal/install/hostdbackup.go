@@ -64,10 +64,17 @@ const (
 	// scheduledBackupWait is how long, in Unit, the timer's run waits for a running job to end:
 	// with the backup's own hour, within the unit's 75 minutes.
 	scheduledBackupWait = 10 * 60
-	// backupStopWait is how long the daemon's stop waits for a backup's cleanup (two runner
-	// calls) and, after it, a rollback stopped in its grace (its cancel journaled at once), both
-	// within this one bound and the unit's TimeoutStopSec.
-	backupStopWait = 2*rcloneTimeout + 15*time.Second
+	// backupStopWait is how long the daemon's stop waits for a backup cut off to clean up and,
+	// after it, a rollback stopped in its grace (its cancel journaled at once): the upload's runner
+	// stopped with its grace then removed (runnerCutWait(runnerGrace)), then two runner calls each
+	// bounded by rcloneTimeout and removed when cut (runnerCutWait(0)), then rollbackStopWait. The
+	// hostd unit's TimeoutStopSec stays above it.
+	backupStopWait = (runnerGrace + removeWait + pipeWait) + (pipeWait + removeWait + pipeWait) + 2*(rcloneTimeout+pipeWait+removeWait+pipeWait) + rollbackStopWait
+	// rollbackStopWait is what a rollback stopped in its grace takes to journal its cancel.
+	rollbackStopWait = 15 * time.Second
+	// runnerGrace is how long a runner cut off has, after SIGTERM, to end (rclone aborting its
+	// multipart upload) before Docker kills it.
+	runnerGrace = 20 * time.Second
 )
 
 // BackupConfig is the backup settings file, root's alone.
@@ -153,11 +160,13 @@ type BackupStatus struct {
 	Last    *BackupRun `json:"last,omitempty"`
 }
 
-// BackupObject is one backup in the destination.
+// BackupObject is one backup in the destination. DroppedProfile marks one of a profile the
+// release's backup no longer declares: retention never prunes it.
 type BackupObject struct {
-	Name string    `json:"name"`
-	Size int64     `json:"size"`
-	Time time.Time `json:"time"`
+	Name           string    `json:"name"`
+	Size           int64     `json:"size"`
+	Time           time.Time `json:"time"`
+	DroppedProfile bool      `json:"dropped_profile,omitempty"`
 }
 
 // BackupFile and BackupLastFile hold the settings and the last backup, in the install's directory.
@@ -826,6 +835,13 @@ const anyProfile = `{{[a-z0-9]+}}` // no "}}" inside: rclone ends a regexp at th
 
 func ownBackups(name, profile string) string {
 	return name + "-" + profile + `-{{\d{8}T\d{6}Z}}-*` + ownSuffixes
+}
+
+// backupProfile is the profile in the name of one of the project name's backups (ownBackups):
+// letters and digits between the project's name and the time.
+func backupProfile(name, obj string) string {
+	profile, _, _ := strings.Cut(strings.TrimPrefix(obj, name+"-"), "-")
+	return profile
 }
 
 // composeKV is a compose mapping as key=value entries: a mapping's sorted by key, a list's as
@@ -1506,7 +1522,13 @@ func (h *Hostd) rcloneTo(ctx context.Context, in *Installer, dir, name string, s
 		return nil, err
 	}
 	a = append(append(a, image, "--config", "/config/rclone/rclone.conf"), args...)
-	return h.runRunner(ctx, in, name, Cmd{Args: a, Stdin: stdin, Stdout: stdout})
+	// An upload (its stream on stdin) cut off gets runnerGrace for rclone to abort its multipart
+	// upload, whose parts a forced removal would leave in the destination.
+	grace := time.Duration(0)
+	if stdin != nil {
+		grace = runnerGrace
+	}
+	return h.runRunner(ctx, in, name, Cmd{Args: a, Stdin: stdin, Stdout: stdout}, grace)
 }
 
 // runnerImage is the backup runner's image reference. A Docker install pulls it again when the
@@ -1528,10 +1550,10 @@ func (h *Hostd) runnerImage(ctx context.Context, in *Installer) (string, error) 
 	return ref, nil
 }
 
-// runRunner runs c, a runner container named name, removed by its name when the run is cut off
-// (runNamed).
-func (h *Hostd) runRunner(ctx context.Context, in *Installer, name string, c Cmd) ([]byte, error) {
-	return in.runNamed(ctx, name, c)
+// runRunner runs c, a runner container named name, stopped with grace then removed by its name
+// when the run is cut off (runNamedGrace).
+func (h *Hostd) runRunner(ctx context.Context, in *Installer, name string, c Cmd, grace time.Duration) ([]byte, error) {
+	return in.runNamedGrace(ctx, name, c, grace)
 }
 
 // runnerShell runs script in the runner's shell (image, the reference runnerImage resolved), off any network, with the Docker volume vol
@@ -1552,29 +1574,36 @@ func (h *Hostd) runnerShell(ctx context.Context, in *Installer, image, vol strin
 		a = append(a, "-i")
 	}
 	a = append(a, "--entrypoint", "sh", image, "-euc", script)
-	return h.runRunner(ctx, in, name, Cmd{Args: a, Stdin: stdin, Stdout: stdout})
+	// The shell (PID 1) ignores SIGTERM and uploads nothing: a run cut off is removed at once.
+	return h.runRunner(ctx, in, name, Cmd{Args: a, Stdin: stdin, Stdout: stdout}, 0)
 }
 
 // runnerCall is a short call of the runner with the settings: list and verify.
 func (h *Hostd) runnerCall(r *http.Request) (*Installer, *BackupConfig, error) {
+	in, c, _, err := h.runnerCallBackup(r)
+	return in, c, err
+}
+
+// runnerCallBackup is runnerCall, with the release's backup it read.
+func (h *Hostd) runnerCallBackup(r *http.Request) (*Installer, *BackupConfig, *providers.AgeRclone, error) {
 	pg, err := h.pgBackup()
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	in, _ := h.run()
 	if _, err := h.installed(in); err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	h.backupMu.Lock()
 	c, err := h.readBackup(pg)
 	h.backupMu.Unlock()
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	if c == nil {
-		return nil, nil, fail(http.StatusConflict, "no backup is configured: `%s backup config` sets the destination", h.R.Ctl())
+		return nil, nil, nil, fail(http.StatusConflict, "no backup is configured: `%s backup config` sets the destination", h.R.Ctl())
 	}
-	return in, c, nil
+	return in, c, pg, nil
 }
 
 // appRclone refuses an rclone config from the app socket (app): the daemon runs rclone as root on
@@ -1618,7 +1647,7 @@ func (h *Hostd) proposedBackup(req BackupConfigRequest, app bool) (*Installer, *
 }
 
 func (h *Hostd) listBackups(w http.ResponseWriter, r *http.Request) {
-	in, c, err := h.runnerCall(r)
+	in, c, pg, err := h.runnerCallBackup(r)
 	if err != nil {
 		replyErr(w, err)
 		return
@@ -1647,7 +1676,8 @@ func (h *Hostd) listBackups(w http.ResponseWriter, r *http.Request) {
 	}
 	list := []BackupObject{}
 	for _, f := range found {
-		list = append(list, BackupObject{f.Name, f.Size, f.ModTime})
+		_, kept := pg.Profiles[backupProfile(h.R.Spec.Name, f.Name)]
+		list = append(list, BackupObject{f.Name, f.Size, f.ModTime, !kept})
 	}
 	sort.Slice(list, func(i, j int) bool { return list[i].Name < list[j].Name })
 	reply(w, http.StatusOK, list)

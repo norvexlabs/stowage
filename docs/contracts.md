@@ -503,10 +503,10 @@ These are what `lint` checks; each finding names the key path or `file:line` to 
   (`http-status`; a redirect is not followed, no proxy is used, no connection kept), or a 2xx JSON object carrying every field of `expect` with the same value
   (`http-json`, an answer of at most 64 KiB). `command` runs `cmd` in its image, confined like the
   schema command (a `stowage-health` service, a container of its own per call, its compose file
-  `.stowage-health-<id>.yaml` in the install directory, removed after the call; the health gate
-  removes those an interrupted call left, once older than an hour; the container is labelled
-  `io.stowage.health-boot=<boot id>`, and the gate removes those an earlier boot left, never one
-  of its own boot, which a running call may own):
+  `.stowage-health-<id>_<boot id>.yaml` in the install directory, removed after the call; the
+  container is labelled `io.stowage.health-boot=<boot id>`; the health gate removes the files and
+  containers an earlier boot left (a reboot interrupted their calls), never one of its own boot,
+  which a running call may own, and none when the boot's id does not read):
   `health.ready` → `{"ready": bool, "reason": "..."}`; no answer (exit 2) is not ready.
 - **Schema compat** (`database.schema_compat`) decides whether `rollback` may go back after the
   database moved. `sql`: `current` returns the migration number; `barrier_after` (with `$1`, the

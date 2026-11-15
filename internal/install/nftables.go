@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/norvexlabs/stowage/internal/spec"
 	"github.com/spf13/cobra"
@@ -257,6 +258,12 @@ func (in *Installer) syncTables(ctx context.Context, want map[string][]byte, set
 						}
 						marked = true
 					}
+					// The sets as they were, to end only the flows of the elements that change.
+					var before map[string]nftSet
+					var beforeErr error
+					if marked {
+						before, beforeErr = listSets(ctx, host, name, scriptSets(name, script))
+					}
 					if _, err := host.Run(ctx, Cmd{Args: []string{"nft", "-f", "-"}, Stdin: strings.NewReader(script)}); err != nil {
 						if marked {
 							_ = os.Remove(mark)
@@ -264,7 +271,22 @@ func (in *Installer) syncTables(ctx context.Context, want map[string][]byte, set
 						errs = append(errs, fmt.Errorf("%s: nft refuses their elements: %w", in.setsKeys(name), err))
 						continue
 					}
-					if flushes && !slices.Contains(flush, name) {
+					// A mark of an earlier start (its flush still due) flushes the whole table, as
+					// does a change whose flows cannot be told.
+					if marked {
+						n, changed, err := in.O.endChangedFlows(ctx, name, before, beforeErr)
+						if err == nil {
+							_ = os.Remove(mark)
+						}
+						if err == nil && changed > 0 {
+							in.O.logf("ended the flows of the %d elements changed in %s (services.%s.flush_conntrack): %d connection-tracking entries deleted, their connections' next packets meet the sets as new ones", changed, in.setsKeys(name), name, n)
+						} else if err != nil {
+							in.O.logf("note: services.%s.flush_conntrack: the flows of the elements changed in %s cannot be ended alone (%v): the whole connection-tracking table is flushed", name, in.setsKeys(name), err)
+						}
+						if err != nil && !slices.Contains(flush, name) {
+							flush = append(flush, name)
+						}
+					} else if flushes && !slices.Contains(flush, name) {
 						flush = append(flush, name)
 					}
 					if err := in.keepSets(setsFile, script); err != nil {
@@ -676,19 +698,167 @@ func (h *Hostd) setElements(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	in, _ := h.run()
+	// Under flush_conntrack, the set as it was, to end the flows of the elements that change.
+	flushes := h.R.Spec.Services[table].FlushConntrack
+	var before map[string]nftSet
+	var beforeErr error
+	if flushes {
+		before, beforeErr = listSets(r.Context(), in.O.host(), table, []string{set})
+	}
+	// The additions, then the deletions, each nft command of its own: a deletion nft refuses (an
+	// element gone already, one that timed out) leaves the additions made. The flows of whatever
+	// changed end then, the listing after telling what did.
+	added, deleted := 0, 0
+	var refused error
 	for _, op := range []struct {
 		verb  string
 		elems []string
-	}{{"add", req.Add}, {"delete", req.Delete}} {
+		done  *int
+	}{{"add", req.Add, &added}, {"delete", req.Delete, &deleted}} {
 		if len(op.elems) == 0 {
 			continue
 		}
-		if _, err := in.O.Host.Run(r.Context(), Cmd{Args: []string{"nft", op.verb, "element", "inet", table, set, "{ " + strings.Join(op.elems, ", ") + " }"}}); err != nil {
-			replyErr(w, fail(http.StatusBadRequest, "nft %s element inet %s %s: %v", op.verb, table, set, err))
-			return
+		if _, err := in.O.host().Run(r.Context(), Cmd{Args: []string{"nft", op.verb, "element", "inet", table, set, "{ " + strings.Join(op.elems, ", ") + " }"}}); err != nil {
+			refused = fail(http.StatusBadRequest, "nft %s element inet %s %s: %v", op.verb, table, set, err)
+			break
+		}
+		*op.done = len(op.elems)
+	}
+	// A client gone once nft changed the set does not keep its flows: the flows step runs on.
+	fctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), setFlowsWait)
+	defer cancel()
+	done := h.endSetFlows(fctx, in, table, set, added, deleted, flushes, before, beforeErr)
+	if refused != nil {
+		done.Error = refused.Error()
+		reply(w, http.StatusBadRequest, done)
+		return
+	}
+	reply(w, http.StatusOK, done)
+}
+
+// setFlowsWait bounds the listing of a set after an app's change (the deletion of the flows has
+// its own bound, ctDeleteBound).
+const setFlowsWait = 30 * time.Second
+
+// SetElementsDone is the answer of POST /v1/nftables/<table>/sets/<set>: the elements asked
+// added and deleted, and under flush_conntrack the connection-tracking entries deleted for the
+// elements nft changed, or why none could be (their flows then kept). Error is nft's refusal of
+// the additions or of the deletions, which the answer's 400 carries with what was done before it.
+type SetElementsDone struct {
+	Error      string `json:"error,omitempty"`
+	Added      int    `json:"added"`
+	Deleted    int    `json:"deleted"`
+	FlowsEnded *int   `json:"flows_ended,omitempty"`
+	Warning    string `json:"warning,omitempty"`
+}
+
+// endSetFlows ends, under flush_conntrack (flushes), the flows of the elements a call changed in
+// the set of the table inet table (before: its listing before the call): their entries deleted,
+// the table read only when an element changed. It never flushes the whole table, which would end
+// every flow of the host's at each of the app's calls: a change whose flows cannot be told (a key
+// type not matched to flows, a listing that fails) or whose deletion fails keeps them, the
+// answer's warning and the daemon's log saying so. The elements are changed all the same.
+func (h *Hostd) endSetFlows(ctx context.Context, in *Installer, table, set string, added, deleted int, flushes bool, before map[string]nftSet, beforeErr error) SetElementsDone {
+	done := SetElementsDone{Added: added, Deleted: deleted}
+	if !flushes {
+		return done
+	}
+	n, _, err := in.O.endChangedFlows(ctx, table, before, beforeErr)
+	if err == nil {
+		done.FlowsEnded = &n
+		return done
+	}
+	if de := (*deletionError)(nil); errors.As(err, &de) {
+		done.FlowsEnded = &de.deleted
+		done.Warning = fmt.Sprintf("services.%s.flush_conntrack: of the flows of the elements changed in the set %s, some may have ended (%d connection-tracking entries deleted), the others are kept: %v", table, set, de.deleted, err)
+	} else {
+		done.Warning = fmt.Sprintf("services.%s.flush_conntrack: the flows of the elements changed in the set %s are kept, as they judged them before: %v", table, set, err)
+	}
+	h.O.logf("warning: %s", done.Warning)
+	return done
+}
+
+// deleteConntrack deletes the entries of the host's connection-tracking table that match
+// (DeleteConntrack in tests), and says how many.
+func (o *Options) deleteConntrack(match func(ctEntry) bool) (int, error) {
+	if o.DeleteConntrack != nil {
+		return o.DeleteConntrack(match)
+	}
+	return deleteConntrack(match)
+}
+
+// listSets lists the sets of the table inet table, by name.
+func listSets(ctx context.Context, host Tool, table string, sets []string) (map[string]nftSet, error) {
+	out := map[string]nftSet{}
+	for _, set := range sets {
+		s, err := listSet(ctx, host, table, set)
+		if err != nil {
+			return nil, err
+		}
+		out[set] = s
+	}
+	return out, nil
+}
+
+// endChangedFlows deletes the connection-tracking entries the elements changed in the sets of the
+// table inet table since their listing before may have judged (changedFlows): the sets listed
+// again now, then one pass over the table for them all. It answers the entries deleted and the
+// elements changed; an error when it cannot tell them (a listing that fails, a key type not
+// matched to flows, before's own error) or the deletion fails, which the caller answers with a
+// flush of the whole table.
+func (o *Options) endChangedFlows(ctx context.Context, table string, before map[string]nftSet, beforeErr error) (int, int, error) {
+	if beforeErr != nil {
+		return 0, 0, beforeErr
+	}
+	after, err := listSets(ctx, o.host(), table, slices.Sorted(maps.Keys(before)))
+	if err != nil {
+		return 0, 0, err
+	}
+	var matches []func(ctEntry) bool
+	changed := 0
+	for _, set := range slices.Sorted(maps.Keys(before)) {
+		m, n, err := changedFlows(before[set], after[set])
+		if err != nil {
+			return 0, 0, fmt.Errorf("the set %s: %w", set, err)
+		}
+		if n > 0 {
+			matches = append(matches, m)
+			changed += n
 		}
 	}
-	// No flush of the connection-tracking table here, flush_conntrack or not: the app's calls
-	// come often, and a flush ends every flow of the host's.
-	reply(w, http.StatusOK, map[string]int{"added": len(req.Add), "deleted": len(req.Delete)})
+	if changed == 0 {
+		return 0, 0, nil
+	}
+	n, err := o.deleteConntrack(func(c ctEntry) bool {
+		return slices.ContainsFunc(matches, func(m func(ctEntry) bool) bool { return m(c) })
+	})
+	if err != nil {
+		return n, changed, &deletionError{deleted: n, err: err}
+	}
+	return n, changed, nil
+}
+
+// deletionError is a deletion of connection-tracking entries that failed once deleted had gone:
+// some flows of the elements changed may have ended, the others are kept.
+type deletionError struct {
+	deleted int
+	err     error
+}
+
+func (e *deletionError) Error() string {
+	return fmt.Sprintf("the deletion of their connection-tracking entries failed after %d: %v", e.deleted, e.err)
+}
+
+func (e *deletionError) Unwrap() error { return e.err }
+
+// scriptSets are the sets of the table inet table a script of setScripts' form fills.
+func scriptSets(table, script string) []string {
+	var out []string
+	for ts := range setsFlushed(script) {
+		if t, set, _ := strings.Cut(ts, " "); t == table {
+			out = append(out, set)
+		}
+	}
+	slices.Sort(out)
+	return out
 }

@@ -209,8 +209,9 @@ type env struct {
 	refuseTagDelete bool
 	// ignorePut answers a manifest PUT to a path containing it with 201 and stores nothing.
 	ignorePut string
-	// heads counts the manifest HEADs the registry answered.
-	heads atomic.Int32
+	// heads counts the manifest HEADs the registry answered, latestHeads those of a disk's
+	// latest-<format>, lists the tag listings.
+	heads, latestHeads, lists atomic.Int32
 }
 
 // fakeSigner records signatures by digest reference.
@@ -335,6 +336,12 @@ func newEnv(t *testing.T) *env {
 		}
 		if r.Method == http.MethodHead && strings.Contains(r.URL.Path, "/manifests/") {
 			e.heads.Add(1)
+			if strings.Contains(r.URL.Path, "-disk/manifests/latest-") {
+				e.latestHeads.Add(1)
+			}
+		}
+		if r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/tags/list") {
+			e.lists.Add(1)
 		}
 		if e.refuseTagDelete && r.Method == http.MethodDelete && strings.Contains(r.URL.Path, "/manifests/") &&
 			!strings.Contains(r.URL.Path, "/manifests/sha256:") {
@@ -1522,6 +1529,37 @@ func amd64Image(size, layers int64) (v1.Image, error) {
 }
 
 // --keep prunes any channel, an immutable one too, to its latest releases and the pointer's.
+// On a registry that deletes no tag alone, a prune reads each repository's tags once for its
+// removals: the requests grow with the releases pruned, not with their square.
+func TestAPruneReadsEachRepositoryOnce(t *testing.T) {
+	t.Parallel()
+	cost := func(n int) (heads, lists int32) {
+		e := newEnv(t)
+		e.noDisks = true
+		for i := range n {
+			e.bump(fmt.Sprintf("1.%d.0", i))
+			e.mustShip("beta", 1)
+		}
+		e.refuseTagDelete = true
+		p, _ := e.publisher()
+		h, l := e.heads.Load(), e.lists.Load()
+		pruned, err := p.Prune(context.Background(), "beta", "")
+		if err != nil || len(pruned) != n-1 {
+			t.Fatalf("prune of %d releases: %v %v", n, pruned, err)
+		}
+		return e.heads.Load() - h, e.lists.Load() - l
+	}
+	h3, l3 := cost(3)
+	h5, l5 := cost(5)
+	// Two more pruned releases: each adds its own tags' requests, not a read of every tag.
+	if l5 != l3 {
+		t.Errorf("tag listings: %d pruning 2 releases, %d pruning 4", l3, l5)
+	}
+	if perRelease := (h5 - h3) / 2; perRelease > h3/2 {
+		t.Errorf("manifest HEADs: %d pruning 2 releases, %d pruning 4", h3, h5)
+	}
+}
+
 func TestPruneKeepsTheLatestReleases(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)

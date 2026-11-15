@@ -3,6 +3,7 @@ package install
 import (
 	"context"
 	"maps"
+	"os"
 	"slices"
 	"time"
 )
@@ -15,10 +16,11 @@ const serviceEvery = 60
 // becomes down: one of its containers is down (downOnes) at this look and none was at the last
 // whole one. A stretch down is one event, a crash loop's included, while the looks are whole: a
 // look that is not — the daemon's restart, a job of the daemon, a reboot or power-off it
-// scheduled draining, the install's lifecycle lock held (an install, upgrade, rollback,
-// provision, reset-db or a service verb), the boot unit bringing the stack up again, an install
-// or compose ps that does not read, a look past lookWait — forgets it, so a service still down
-// after it is journaled again. Skipped before anything is installed; the reads that fail, or
+// scheduled draining, the install's lifecycle lock held or taken while the look reads (an install,
+// upgrade, rollback, provision, reset-db or a service verb; the boot unit bringing the stack up
+// again takes it too), an install or compose ps that does not read, a look past lookWait — forgets
+// it, so a service still down after it is journaled again. docker inspect reads only the
+// services seen down. Skipped before anything is installed; the reads that fail, or
 // outlive lookWait, are logged once a stretch; an event the journal refuses is journaled at the
 // next look.
 func (h *Hostd) serviceWatch(ctx context.Context) {
@@ -64,26 +66,30 @@ func (h *Hostd) lookAtServices(ctx context.Context, w *serviceLooks) {
 		}
 		return
 	}
-	gen, busy := h.busy(in)
-	if busy {
+	before := h.busy(in)
+	if before.busy {
 		w.down = nil
 		return
 	}
 	look, cancel := context.WithTimeout(ctx, time.Duration(lookWait)*h.unit())
 	defer cancel()
 	env, err := in.open()
-	var list []Service
+	var downs []Service
 	if err == nil {
-		list, err = in.stackServices(look, env, h.declared(in, env))
+		var list []Service
+		if list, err = in.stackList(look, env, h.declared(in, env)); err == nil {
+			// What docker inspect adds is told of the services down alone.
+			downs = downOnes(list)
+			in.serviceFacts(look, downs)
+		}
 	}
 	if ctx.Err() != nil {
 		return // the daemon stops: no word of a look it cut
 	}
-	// A job claimed or ended, or a reboot scheduled or cancelled, while the services were read
-	// (the daemon's generation moved) cut it as much as one still running. A lock taken and
-	// released between the two reads of it, or the boot unit run between them, goes unseen.
-	after, busy := h.busy(in)
-	if err != nil || busy || after != gen {
+	// A job claimed or ended, a reboot scheduled or cancelled, or the lifecycle lock taken (the
+	// boot unit's run included), while the services were read cut the look as much as one still
+	// under way: the daemon's generation or the lock's stamp moved.
+	if err != nil || !before.same(h.busy(in)) {
 		w.down = nil
 		if err != nil {
 			w.skipping(h, err)
@@ -92,7 +98,7 @@ func (h *Hostd) lookAtServices(ctx context.Context, w *serviceLooks) {
 	}
 	w.skipping(h, nil)
 	down := map[string]Service{}
-	for _, s := range downOnes(list) {
+	for _, s := range downs {
 		if _, seen := down[s.Service]; !seen {
 			down[s.Service] = s
 		}
@@ -119,15 +125,32 @@ func (h *Hostd) lookAtServices(ctx context.Context, w *serviceLooks) {
 	w.down = down
 }
 
-// busy reports whether a job of the daemon runs, a reboot or power-off it scheduled drains, or the
-// install's lifecycle lock is held, the lock read from the kernel's table, never by taking it (a
-// run taking it at that instant would find it held); and the daemon's generation, which moves at
-// every claim of its job slot, every job's end and every reboot scheduled or cancelled.
-func (h *Hostd) busy(in *Installer) (gen uint64, busy bool) {
+// busy reads the lookState: whether the lifecycle lock is held is read from the kernel's table,
+// never by taking it (a run taking it at that instant would find it held).
+func (h *Hostd) busy(in *Installer) lookState {
+	var st lookState
 	h.mu.Lock()
-	gen, busy = h.slotGen+h.rebootGen<<32, h.rebooting || h.job != nil && h.job.State == "running"
+	st.gen, st.busy = h.slotGen+h.rebootGen<<32, h.rebooting || h.job != nil && h.job.State == "running"
 	h.mu.Unlock()
-	return gen, busy || lockHeld(in.path(lifecycleLock))
+	path := in.path(lifecycleLock)
+	st.lock = lockStamp(path)
+	st.busy = st.busy || lockHeld(path)
+	return st
+}
+
+// lookState is what a look reads before and after it lists the services (busy): the daemon's
+// generation, which moves at every claim of its job slot, every job's end and every reboot or
+// power-off scheduled or cancelled; whether a job runs, a reboot drains or the lifecycle lock is
+// held; and the lock file's stamp, which moves at every take of the lock.
+type lookState struct {
+	gen  uint64
+	busy bool
+	lock os.FileInfo
+}
+
+// same reports whether nothing that cuts a look happened between two reads of it.
+func (a lookState) same(b lookState) bool {
+	return a.gen == b.gen && a.busy == b.busy && sameLock(a.lock, b.lock)
 }
 
 // skipping logs, once a stretch, that the watch cannot look (err), and that it looks again (nil).

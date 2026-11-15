@@ -37,16 +37,17 @@ const (
 // route6BootCmd waits at boot for the IPv6 default route, before Docker starts.
 const route6BootCmd = "route6-boot"
 
-// primaryIPv6 reports whether the primary link runs IPv6: its override's setting, else the
-// network `vm create` gave (an override that does not read is not applied: the boot renders the
-// cloud-config's).
+// primaryIPv6 reports whether the primary link runs IPv6 and expects an IPv6 router: its
+// override's setting, else the network `vm create` gave (an override that does not read is not
+// applied: the boot renders the cloud-config's). A static address6 without a gateway6 expects
+// none: its default route is neither waited for nor watched.
 func (h *Hostd) primaryIPv6() bool {
 	f := h.netFiles()
-	if st, err := f.read(); err == nil && st.Config != nil {
-		return st.Config.IPv6
-	}
 	c, _ := f.readInstall()
-	return c != nil && c.IPv6
+	if st, err := f.read(); err == nil && st.Config != nil {
+		c = st.Config
+	}
+	return c != nil && c.IPv6 && (c.Address6 == "" || c.Gateway6 != "")
 }
 
 // route6 reads the primary link — the IPv4 default route's (a secondary NIC's aside), else the one
@@ -197,7 +198,7 @@ func (h *Hostd) route6Watch(ctx context.Context) {
 		next := route6Every * h.unit()
 		if !h.primaryIPv6() {
 			if warned {
-				h.O.logf("IPv6 is off on the primary link: its default route is no longer watched")
+				h.O.logf("IPv6 is off on the primary link, or it expects no router (a static address6 without a gateway6): its default route is no longer watched")
 			}
 			if !since.IsZero() || warned {
 				end()

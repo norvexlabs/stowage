@@ -824,6 +824,34 @@ func TestThePurgeKeepsTheProjectsPackages(t *testing.T) {
 	}
 }
 
+// The project's packages and the cloud NICs' modules share one fetch of the archive's indexes:
+// the lists the packages' install fetched stay for the modules' download, which fetches them
+// only when nothing did before it.
+func TestTheArchivesIndexesAreFetchedOnce(t *testing.T) {
+	t.Parallel()
+	p := params
+	p.Packages = map[string]spec.HostPackage{"tcpdump": {Reason: "capture"}}
+	df, err := Dockerfile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(df)
+	i, j := strings.Index(s, "--no-remove $want"), strings.Index(s, "apt-get download")
+	if i < 0 || j < i {
+		t.Fatalf("the packages' install at %d, the modules' download at %d", i, j)
+	}
+	between := s[i:j]
+	if strings.Contains(between, "/var/lib/apt/lists") || strings.Contains(between, "\nRUN ") {
+		t.Errorf("the indexes are dropped between the packages' install and the modules' download:\n%s", between)
+	}
+	if strings.Count(between, "apt-get update") != 1 || !strings.Contains(between, `[ -n "$fetched" ] || { apt-get update; fetched=1; }`) {
+		t.Errorf("the modules' download fetches the indexes again:\n%s", between)
+	}
+	if !strings.Contains(s, "apt-get update; fetched=1; apt-get install -y --no-install-recommends --no-remove $want") {
+		t.Error("the packages' fetch is not recorded")
+	}
+}
+
 // The project's firmware files are checked in the bundle, each as it is or compressed; without
 // any, no step. A path that is not one under /lib/firmware is refused.
 func TestTheBuildChecksTheProjectsFirmware(t *testing.T) {

@@ -12,6 +12,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -359,7 +360,8 @@ func TestAFileBlobGoesUpInChunksAndResumes(t *testing.T) {
 	})
 
 	// A registry that caps a request's body (ghcr.io: 416 over 4 MiB, others 413): the chunk
-	// shrinks, the session goes on, and the client's later uploads to it stay under the cap.
+	// shrinks, the session goes on, one probe halfway back is refused, and the ceiling settles
+	// there: the client's later uploads to it stay under the cap.
 	for _, status := range []int{http.StatusRequestedRangeNotSatisfiable, http.StatusRequestEntityTooLarge} {
 		t.Run(fmt.Sprintf("a chunk refused with %d for its size shrinks", status), func(t *testing.T) {
 			f, c, out, repo, b := uploadFixture(t)
@@ -378,8 +380,10 @@ func TestAFileBlobGoesUpInChunksAndResumes(t *testing.T) {
 			if err := pushed(t, c, repo, b); err != nil {
 				t.Fatal(err)
 			}
-			if f.posts != 1 || refused != 1 || strings.Contains(out.String(), "one stream") || strings.Contains(out.String(), "again in") ||
-				!strings.Contains(out.String(), "refuses a chunk of 4.0 KiB; chunks of at most 2.0 KiB from now") {
+			if f.posts != 1 || refused != 2 || strings.Contains(out.String(), "one stream") || strings.Contains(out.String(), "again in") ||
+				!strings.Contains(out.String(), "refuses a chunk of 4.0 KiB; chunks of at most 2.0 KiB from now") ||
+				!strings.Contains(out.String(), "took 4 chunks of 2.0 KiB; chunks of up to 3.0 KiB from now") ||
+				!strings.Contains(out.String(), "refuses a chunk of 3.0 KiB; chunks of at most 2.0 KiB from now") {
 				t.Fatalf("%d sessions, %d refused, log:\n%s", f.posts, refused, out)
 			}
 			// The chunk at the cap went up: the boundary's other side.
@@ -438,7 +442,9 @@ func TestAFileBlobGoesUpInChunksAndResumes(t *testing.T) {
 		}
 	})
 
-	t.Run("a 416 the session's status cannot explain is retried, not a ceiling", func(t *testing.T) {
+	// Unexplained, it is taken for a refusal of the chunk's size: the ceiling drops, so the next
+	// upload does not climb back and pay it again.
+	t.Run("a 416 whose status cannot be read lowers the ceiling and is retried", func(t *testing.T) {
 		f, c, out, repo, b := uploadFixture(t)
 		refused := false
 		f.patch = func(n int, w http.ResponseWriter, r *http.Request) bool {
@@ -460,8 +466,12 @@ func TestAFileBlobGoesUpInChunksAndResumes(t *testing.T) {
 		if err := pushed(t, c, repo, b); err != nil {
 			t.Fatal(err)
 		}
-		if f.posts != 1 || strings.Contains(out.String(), "refuses a chunk") || !strings.Contains(out.String(), "again in") {
+		if f.posts != 1 || !strings.Contains(out.String(), "refuses a chunk of 4.0 KiB; chunks of at most 2.0 KiB from now") || !strings.Contains(out.String(), "again in") {
 			t.Fatalf("%d sessions, log:\n%s", f.posts, out)
+		}
+		// One refusal, one cut: the chunk refused was 4 KiB, the next is 2 KiB.
+		if f.sizes[2] != 4<<10 || f.sizes[3] != 2<<10 {
+			t.Fatalf("chunks %v", f.sizes)
 		}
 	})
 
@@ -550,17 +560,18 @@ func TestAFileBlobGoesUpInChunksAndResumes(t *testing.T) {
 			t.Fatal(err)
 		}
 		// Learnt while this upload's chunk is past it, as by a disk going up beside it.
-		ceiling := c.ceiling(r.RegistryStr())
+		ceiling := c.ceiling(r)
 		f.patch = func(n int, w http.ResponseWriter, r *http.Request) bool {
 			if n == 1 {
-				ceiling.Store(2 << 10)
+				ceiling.refuse(4<<10, chunkMin)
 			}
 			return false
 		}
 		if err := pushed(t, c, repo, b); err != nil {
 			t.Fatal(err)
 		}
-		for _, n := range f.sizes[2:] {
+		// Bounded until the ceiling's probe.
+		for _, n := range f.sizes[2 : 2+probeAfter] {
 			if n > 2<<10 {
 				t.Fatalf("chunks %v", f.sizes)
 			}
@@ -1003,4 +1014,70 @@ func TestTheWaitingTransportIsMadeOnce(t *testing.T) {
 	if err := fresh.pushFile(context.Background(), r, b); err != nil || fresh.awaited != nil {
 		t.Fatalf("a blob already there: %v, waiting transport %v", err, fresh.awaited)
 	}
+}
+
+// A repository's chunk ceiling: its own, climbing back after a transient refusal; and the chunks
+// it cannot shrink refused on every attempt.
+func TestAChunkCeilingRecovers(t *testing.T) {
+	unit, lo, hi := uploadUnit, chunkMin, chunkMax
+	uploadUnit, chunkMin, chunkMax = time.Millisecond, 1<<10, 4<<10
+	t.Cleanup(func() { uploadUnit, chunkMin, chunkMax = unit, lo, hi })
+
+	t.Run("another repository of the registry is bounded too", func(t *testing.T) {
+		f, c, _, repo, b := uploadFixtureOf(t, 40<<10)
+		r, err := c.Repo(repo)
+		if err != nil {
+			t.Fatal(err)
+		}
+		c.ceiling(r).refuse(4<<10, chunkMin)
+		if err := pushed(t, c, repo+"-other", b); err != nil {
+			t.Fatal(err)
+		}
+		// Bounded until the ceiling's probe.
+		if i := slices.IndexFunc(f.sizes, func(n int64) bool { return n > 2<<10 }); i >= 0 && i < 1+probeAfter {
+			t.Fatalf("chunks %v", f.sizes)
+		}
+	})
+
+	t.Run("a transient refusal is probed back", func(t *testing.T) {
+		f, c, out, repo, b := uploadFixtureOf(t, 40<<10)
+		refused := 0
+		f.patch = func(n int, w http.ResponseWriter, r *http.Request) bool {
+			if r.ContentLength == 4<<10 && refused == 0 {
+				refused++
+				w.WriteHeader(http.StatusRequestEntityTooLarge)
+				return true
+			}
+			return false
+		}
+		if err := pushed(t, c, repo, b); err != nil {
+			t.Fatal(err)
+		}
+		// Halfway back to the chunk refused, then the gap is the least chunk: settled.
+		if refused != 1 || !strings.Contains(out.String(), "chunks of up to 3.0 KiB from now") || f.sizes[len(f.sizes)-2] != 3<<10 {
+			t.Fatalf("%d refused, chunks %v, log:\n%s", refused, f.sizes, out)
+		}
+	})
+
+	t.Run("a short last chunk refused on every attempt gets one stream", func(t *testing.T) {
+		f, c, out, repo, _ := uploadFixture(t)
+		fixedChunks(t)
+		b := fileBlob(t, int(4*chunkMin+512)) // four whole chunks, then 512 B
+		refused := 0
+		f.patch = func(n int, w http.ResponseWriter, r *http.Request) bool {
+			if r.ContentLength < chunkMin {
+				refused++
+				w.WriteHeader(http.StatusRequestEntityTooLarge)
+				return true
+			}
+			return false
+		}
+		if err := pushed(t, c, repo, b); err != nil {
+			t.Fatal(err)
+		}
+		if refused != sizeRetries+1 || !strings.Contains(out.String(), fmt.Sprintf("a chunk of 512 B refused %d times in a row", sizeRetries+1)) ||
+			!strings.Contains(out.String(), "pushing it in one stream") {
+			t.Fatalf("%d refused, log:\n%s", refused, out)
+		}
+	})
 }

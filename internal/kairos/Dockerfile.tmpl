@@ -130,7 +130,16 @@ RUN set -e; fail() { echo "os bundle: $*" >&2; exit 1; }; \
 # neither upgrades nor removes one for them (one that needs it fails the build), and the build
 # fails when they bring a package of that kind (a kernel, its modules, a service of the boot's);
 # one declared that is installed already is left as it is.
-RUN set -e{{with .PurgeAfterInit}}; {{template "purge" .}}{{end}}; \
+#
+# The clouds' fast NICs, gVNIC (gve) and Azure's MANA, ship in the kernel's extra modules: those two
+# are copied from it, not its 110 MB. The build fails when a kernel lacks one, a module the boot's
+# tuning loads (TUN devices, the connection tracker, BBR, fq), nftables' socket and TPROXY matches
+# (services.<name>.transparent), a server's NIC or disk controller
+# a bare-metal install boots with (Intel, Broadcom, Mellanox, Marvell/QLogic, Realtek, NVMe, AHCI,
+# LSI/Broadcom MegaRAID and SAS, Microchip, HPE). This step shares its RUN with the project's
+# packages: the archive's indexes are fetched once, by whichever needs them first, and only when
+# one does.
+RUN set -e; fetched={{with .PurgeAfterInit}}; {{template "purge" .}}{{end}}; \
     for u in apt-daily.timer apt-daily-upgrade.timer motd-news.timer; do ln -sf /dev/null /etc/systemd/system/$u; done; \
     for p in{{range .Absent}} {{.}}{{end}}; do \
         if dpkg-query -W -f='${db:Status-Abbrev}' "$p" 2>/dev/null | grep -q '^i'; then echo "the OS bundle has $p, which it purges: host.packages keeps one" >&2; exit 1; fi; done{{with .Packages}}; \
@@ -139,21 +148,14 @@ RUN set -e{{with .PurgeAfterInit}}; {{template "purge" .}}{{end}}; \
     held="$(grep -E '{{$.Held}}' "$t/installed" | grep -vxF -f "$t/held" || true)"; \
     want="$(printf '%s\n'{{range $n, $_ := .}} {{$n}}{{end}} | grep -vxF -f "$t/installed" || true)"; \
     [ -z "$held" ] || printf '%s\n' "$held" | xargs apt-mark hold >/dev/null; \
-    if [ -n "$want" ]; then apt-get update; apt-get install -y --no-install-recommends --no-remove $want; fi; \
+    if [ -n "$want" ]; then apt-get update; fetched=1; apt-get install -y --no-install-recommends --no-remove $want; fi; \
     new="$(dpkg-query -W -f='${db:Status-Abbrev} ${Package}\n' | awk '$1 ~ /^i/ {print $2}' | grep -E '{{$.Held}}' | grep -vxF -f "$t/installed" || true)"; rm -rf "$t"; \
     [ -z "$new" ] || { echo "host.packages bring packages of the boot's own: $new" >&2; exit 1; }; \
-    [ -z "$held" ] || printf '%s\n' "$held" | xargs apt-mark unhold >/dev/null; \
-    rm -rf /var/lib/apt/lists/*{{end}}
-
-# The clouds' fast NICs, gVNIC (gve) and Azure's MANA, ship in the kernel's extra modules: those two
-# are copied from it, not its 110 MB. The build fails when a kernel lacks one, a module the boot's
-# tuning loads (TUN devices, the connection tracker, BBR, fq), nftables' socket and TPROXY matches
-# (services.<name>.transparent), a server's NIC or disk controller
-# a bare-metal install boots with (Intel, Broadcom, Mellanox, Marvell/QLogic, Realtek, NVMe, AHCI,
-# LSI/Broadcom MegaRAID and SAS, Microchip, HPE).
-RUN set -e; apt-get update; cd /tmp; \
+    [ -z "$held" ] || printf '%s\n' "$held" | xargs apt-mark unhold >/dev/null{{end}}; \
+    cd /tmp; \
     for k in /lib/modules/*; do v="$(basename "$k")"; \
         if ! modinfo -k "$v" gve >/dev/null 2>&1 || ! modinfo -k "$v" mana >/dev/null 2>&1; then \
+            [ -n "$fetched" ] || { apt-get update; fetched=1; }; \
             apt-get download "linux-modules-extra-$v"; dpkg-deb -x linux-modules-extra-"$v"_*.deb /tmp/extra; \
             for m in gve mana; do \
                 f="$(find /tmp/extra -path "*/modules/$v/*" -name "$m.ko*" | head -n1)"; \

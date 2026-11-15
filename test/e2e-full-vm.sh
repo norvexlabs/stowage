@@ -170,7 +170,7 @@ printf 'a-chosen-password\n' | on_vm sudo at-stow secrets set OPS_PASSWORD >"$WO
 [[ $(ops) == 000 && $(ops --cert "$WORK/rogue.pem" --key "$WORK/rogue.key") == 000 ]] || fail "the ops route takes a client without a certificate its client CA issued"
 [[ $(curl -sk -o /dev/null -w '%{http_code}' --max-time 10 --resolve "api.atlas.test:443:$IP" https://api.atlas.test/health) == 200 ]] || fail "the api route asks for a client certificate"
 
-step "on metal: the input picking ingest's table: observe first, enforce on a re-run (the connection tracking flushed, an SSH session open across it kept), a value without a file refused"
+step "on metal: the input picking ingest's table: observe first, enforce on a re-run (the connection tracking flushed, an SSH session and a connection through the front's published port open across it kept), a value without a file refused"
 on_vm sudo nft list table inet ingest >"$WORK/ingest.txt" && ! grep -q 'tcp dport 9 ' "$WORK/ingest.txt" || { cat "$WORK/ingest.txt"; fail "ingest's table is not the observe posture's (INGEST_POSTURE's default)"; }
 on_vm sudo at-stow install --no-input --set INGEST_POSTURE=count >"$WORK/posture.txt" 2>&1 && fail "a value picking no table was taken"
 grep -q 'INGEST_POSTURE: "count" picks no table of ingest' "$WORK/posture.txt" || { cat "$WORK/posture.txt"; fail "the refusal of a value picking no table"; }
@@ -183,15 +183,31 @@ ticks=$!
 stop_ticks() { pkill -P "$ticks" 2>/dev/null; kill "$ticks" 2>/dev/null; }
 for _ in $(seq 30); do grep -q tick "$WORK/ticks.txt" && break; sleep 1; done
 grep -q tick "$WORK/ticks.txt" || { stop_ticks; fail "the SSH session to keep open across the re-run did not start"; }
-on_vm sudo at-stow install --no-input --set INGEST_POSTURE=enforce >"$WORK/posture.txt" 2>&1 || { stop_ticks; cat "$WORK/posture.txt"; fail "the re-run picking the enforce table"; }
-grep -q "flushed the host's connection-tracking table (services.ingest.flush_conntrack)" "$WORK/posture.txt" || { stop_ticks; cat "$WORK/posture.txt"; fail "the re-run loading another table of ingest flushed no connection tracking"; }
+# A connection through the front's published port open across the re-run, one HTTPS request a
+# second on it (the console's route: its ui is not recreated by ingest's load): Docker's DNAT is
+# made again on its next packet after the flush, so it goes on.
+rm -f "$WORK/front-stop"
+{
+	while [[ ! -e $WORK/front-stop ]]; do printf 'GET / HTTP/1.1\r\nHost: console.atlas.test\r\n\r\n'; sleep 1; done
+	printf 'GET / HTTP/1.1\r\nHost: console.atlas.test\r\nConnection: close\r\n\r\n'
+} | openssl s_client -quiet -connect "$IP:443" -servername console.atlas.test >"$WORK/front-ticks.txt" 2>/dev/null &
+front=$!
+stop_front() { touch "$WORK/front-stop"; pkill -P "$front" 2>/dev/null; kill "$front" 2>/dev/null; }
+for _ in $(seq 30); do grep -q '^HTTP/1.1 200' "$WORK/front-ticks.txt" && break; sleep 1; done
+grep -q '^HTTP/1.1 200' "$WORK/front-ticks.txt" || { stop_ticks; stop_front; fail "the connection through the front to keep open across the re-run did not start"; }
+on_vm sudo at-stow install --no-input --set INGEST_POSTURE=enforce >"$WORK/posture.txt" 2>&1 || { stop_ticks; stop_front; cat "$WORK/posture.txt"; fail "the re-run picking the enforce table"; }
+grep -q "flushed the host's connection-tracking table (services.ingest.flush_conntrack)" "$WORK/posture.txt" || { stop_ticks; stop_front; cat "$WORK/posture.txt"; fail "the re-run loading another table of ingest flushed no connection tracking"; }
 before=$(grep -c tick "$WORK/ticks.txt")
+front_before=$(grep -c '^HTTP/1.1 200' "$WORK/front-ticks.txt")
 sleep 5
-(( $(grep -c tick "$WORK/ticks.txt") > before )) || { stop_ticks; fail "the SSH session open across the connection tracking's flush went silent after it"; }
+(( $(grep -c tick "$WORK/ticks.txt") > before )) || { stop_ticks; stop_front; fail "the SSH session open across the connection tracking's flush went silent after it"; }
+(( $(grep -c '^HTTP/1.1 200' "$WORK/front-ticks.txt") > front_before )) || { stop_ticks; stop_front; fail "the connection through the front's published port open across the connection tracking's flush went silent after it"; }
 on_vm touch /tmp/e2e-ticks-stop
+touch "$WORK/front-stop"
 # A session cut hangs until TCP gives up: it gets 30 s to see the stop and end.
-for _ in $(seq 30); do kill -0 "$ticks" 2>/dev/null || break; sleep 1; done
-if kill -0 "$ticks" 2>/dev/null; then stop_ticks; fail "the SSH session open across the connection tracking's flush was cut"; fi
+for _ in $(seq 30); do kill -0 "$ticks" 2>/dev/null || kill -0 "$front" 2>/dev/null || break; sleep 1; done
+if kill -0 "$ticks" 2>/dev/null; then stop_ticks; stop_front; fail "the SSH session open across the connection tracking's flush was cut"; fi
+if kill -0 "$front" 2>/dev/null; then stop_front; fail "the connection through the front's published port open across the connection tracking's flush was cut"; fi
 wait "$ticks" || { cat "$WORK/ticks.txt"; fail "the SSH session open across the connection tracking's flush ended in error"; }
 on_vm sudo nft list table inet ingest >"$WORK/ingest.txt" && grep -q 'tcp dport 9 ' "$WORK/ingest.txt" || { cat "$WORK/ingest.txt"; fail "ingest's table is not the enforce posture's after the re-run"; }
 

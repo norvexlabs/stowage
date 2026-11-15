@@ -15,6 +15,10 @@ import (
 	"github.com/norvexlabs/stowage/internal/payload"
 )
 
+// version is the Stowage release this installer was built with, set at build time (-ldflags "-X
+// main.version=…").
+var version = "dev"
+
 func main() {
 	os.Exit(exit(run(), os.Stderr))
 }
@@ -37,6 +41,7 @@ func exit(err error, stderr io.Writer) int {
 }
 
 func run() error {
+	install.StowageVersion = version
 	exe, err := os.Executable()
 	if err != nil {
 		return err

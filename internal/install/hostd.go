@@ -76,6 +76,10 @@ import (
 // AdminGroup is the group whose members may use the host daemon: Kairos's administrators.
 const AdminGroup = "admin"
 
+// StowageVersion is the Stowage release this installer was built with, which its command sets
+// (stowage-install's build flags); empty, or "dev", is one of no release.
+var StowageVersion string
+
 // Hostd is the host daemon of one VM install.
 type Hostd struct {
 	// R is the release this OS carries; O the options every request's run starts from, O.Dir the
@@ -120,6 +124,9 @@ type Hostd struct {
 	// data, whose filesystem the disk-pressure watch reads.
 	Docker  bool
 	DiskDir string
+	// Stowage is the Stowage release this daemon was built with (StowageVersion): an upgrade's
+	// values are judged here only for a release that Stowage published (valuesCheck).
+	Stowage string
 
 	// held is the install's lock a rollback keeps to its reboot: the daemon holds it so the
 	// collector never closes its file, which would release it, before the reboot.
@@ -449,6 +456,9 @@ type Update struct {
 	// NeedsUnordered: on the VM, the target --version names is under a `command` scheme and is not
 	// the release the install runs (needsUnordered): upgrade takes it only with --unordered.
 	NeedsUnordered bool `json:"needs_unordered,omitempty"`
+	// ChecksInstaller: an upgrade to the target downloads its installer and checks it against the
+	// install before it writes the OS (checksTarget).
+	ChecksInstaller bool `json:"checks_installer,omitempty"`
 }
 
 // UpgradeRequest is POST /v1/upgrade's body.
@@ -476,6 +486,10 @@ type UpgradePlan struct {
 	// Backup: the job takes a backup first (settings configured, no skip_backup, not a first
 	// install nor a rewrite).
 	Backup bool `json:"backup"`
+	// Unchecked, when set, says why the daemon left the install's values to the boot into the
+	// release (published by another Stowage, or a spec this one does not read): the job's log says
+	// it too.
+	Unchecked string `json:"unchecked,omitempty"`
 }
 
 // PowerRequest is POST /v1/reboot's and /v1/shutdown's body.
@@ -1570,14 +1584,16 @@ func (h *Hostd) resetPlan(ctx context.Context, in *Installer, newBaseline bool, 
 	if len(keep) > 0 {
 		kept = " (keeping " + strings.Join(keep, ", ") + ")"
 	}
-	if k.Release != nil {
-		if err := (&Installer{R: k.Release, O: in.O}).upgradeCheck(ctx, env); err != nil {
-			return ResetPlan{}, nil, "", failAs(http.StatusConflict, fmt.Errorf("%w\nthe boot into %s would refuse it (it is given no input), so its OS is not written", err, m.Tag))
-		}
+	unchecked, err := h.valuesCheck(ctx, in, env, m, k, "it")
+	if err != nil {
+		return ResetPlan{}, nil, "", err
+	}
+	if unchecked != "" {
+		unchecked = " (" + unchecked + ")"
 	}
 	key.plan = ResetPlan{Target: Version{m.ProjectVersion, m.Revision},
-		Plan: fmt.Sprintf("write %s's OS and reboot into it; that boot stops %s, deletes its volumes %s%s, forgets what its provision hook returned, then installs %s, at schema baseline %d (from %d), with the same values",
-			m.Tag, m.Name, strings.Join(wipe, ", "), kept, m.ProjectVersion, to, from)}
+		Plan: fmt.Sprintf("write %s's OS and reboot into it; that boot stops %s, deletes its volumes %s%s, forgets what its provision hook returned, then installs %s, at schema baseline %d (from %d), with the same values%s",
+			m.Tag, m.Name, strings.Join(wipe, ", "), kept, m.ProjectVersion, to, from, unchecked)}
 	if shown {
 		h.mu.Lock()
 		h.checkedPlan = &key
@@ -1759,7 +1775,7 @@ func appRetry(in *Installer, app bool, verb, channel, version string) string {
 
 func (h *Hostd) updates(w http.ResponseWriter, r *http.Request) {
 	in, _ := h.run()
-	env, _, err := h.source(in)
+	env, first, err := h.source(in)
 	if err != nil {
 		replyErr(w, err)
 		return
@@ -1786,7 +1802,8 @@ func (h *Hostd) updates(w http.ResponseWriter, r *http.Request) {
 	reply(w, http.StatusOK, Update{
 		Channel: channel, Current: Version{cur.ProjectVersion, cur.Revision}, Target: Version{m.ProjectVersion, m.Revision},
 		Available: (newer || rewrite) && m.Yanked == nil && m.Artifacts.OS != "" && !left, LeftByRollback: left, Rewrite: rewrite, Installed: installed, Passive: !h.Docker && bootMode(h.O.cos()) == "passive", Changelog: m.Changelog.Project,
-		NeedsUnordered: q.Get("version") != "" && needsUnordered(m, h.runsVersion(env)),
+		NeedsUnordered:  q.Get("version") != "" && needsUnordered(m, h.runsVersion(env)),
+		ChecksInstaller: checksTarget(first, !newer && rewrite, env, m),
 	})
 }
 
@@ -2191,8 +2208,9 @@ func (h *Hostd) upgrade(w http.ResponseWriter, r *http.Request) {
 	}
 	// What the boot into it would refuse is refused now, before its OS is written. The release
 	// the install runs, rewritten, has nothing to refuse.
-	if !first && !rewrite {
-		if err := h.checkUpgrade(r.Context(), in, env, m, req.Channel); err != nil {
+	unchecked := ""
+	if checksTarget(first, rewrite, env, m) {
+		if unchecked, err = h.checkUpgrade(r.Context(), in, env, m, req.Channel); err != nil {
 			replyErr(w, err)
 			return
 		}
@@ -2228,7 +2246,7 @@ func (h *Hostd) upgrade(w http.ResponseWriter, r *http.Request) {
 			slot = "active"
 		}
 		backup := !req.SkipBackup && !first && !rewrite && h.backupFirst()
-		reply(w, http.StatusOK, UpgradePlan{To: Version{m.ProjectVersion, m.Revision}, Slot: slot, Does: does, Backup: backup})
+		reply(w, http.StatusOK, UpgradePlan{To: Version{m.ProjectVersion, m.Revision}, Slot: slot, Does: does, Backup: backup, Unchecked: unchecked})
 		return
 	}
 	j, err := h.startJob("upgrade", m.Tag, guard)
@@ -2237,6 +2255,9 @@ func (h *Hostd) upgrade(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	reboot := req.Reboot == nil || *req.Reboot
+	if unchecked != "" {
+		h.logf(j, "%s", unchecked)
+	}
 	go func() {
 		if !req.SkipBackup && !first && !rewrite {
 			h.preflightBackup(in, func(format string, a ...any) { h.logf(j, format, a...) })
@@ -2408,7 +2429,9 @@ func (h *Hostd) schedule(action string, drain int, idle bool, by *job, note stri
 		h.event(h.scheduledEvent(action, drain, nil))
 	}
 	time.AfterFunc(time.Duration(drain)*h.unit(), func() {
-		if _, err := h.Host.Run(h.ctx, Cmd{Args: []string{"systemctl", action}}); err != nil {
+		if down, err := powerHost(h.ctx, h.Host, action); down {
+			h.O.logf("systemctl %s stopped as the system goes down: %v", action, err)
+		} else if err != nil {
 			reason := fmt.Sprintf("systemctl %s failed: %v", action, err)
 			h.O.logf("%s", reason)
 			if by != nil {
@@ -2492,5 +2515,7 @@ func (HostTool) Run(ctx context.Context, c Cmd) ([]byte, error) {
 	if len(c.Args) == 0 {
 		return nil, errors.New("no program")
 	}
-	return ExecTool{Bin: c.Args[0]}.Run(ctx, Cmd{Args: c.Args[1:], Env: c.Env, Stdin: c.Stdin, Stream: c.Stream, Stdout: c.Stdout})
+	bin := c.Args[0]
+	c.Args = c.Args[1:] // the rest of c (its stdin, its Cancel) as given
+	return ExecTool{Bin: bin}.Run(ctx, c)
 }

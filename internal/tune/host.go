@@ -100,11 +100,11 @@ func (s System) iommuTranslates() bool {
 	return false
 }
 
-// epps are the energy-performance preferences of the CPUs whose driver exposes one, as governors
-// gives them: each one's file, its value, whether it offers performance.
-func (s System) epps() []cpuGovernor {
+// epps are the energy-performance preferences of the CPUs gs lists whose driver exposes one, read
+// when called: each one's file, its value, whether it offers performance.
+func (s System) epps(gs []cpuGovernor) []cpuGovernor {
 	var out []cpuGovernor
-	for _, g := range s.governors() {
+	for _, g := range gs {
 		dir := filepath.Dir(g.file)
 		have, ok := s.read(filepath.Join(dir, "energy_performance_preference"))
 		if !ok {
@@ -127,8 +127,9 @@ func (s System) inspectPower() []Item {
 	if s.Power != Performance {
 		return nil
 	}
-	items := []Item{s.inspectGovernor()}
-	if es := s.epps(); len(es) > 0 {
+	gs := s.governors()
+	items := []Item{s.inspectGovernor(gs)}
+	if es := s.epps(gs); len(es) > 0 {
 		var have []string
 		ok := true
 		for _, e := range es {
@@ -157,12 +158,10 @@ func (s System) power() []string {
 	if s.Power != Performance {
 		return nil
 	}
-	notes := s.governor()
-	for _, e := range s.epps() {
+	gs := s.governors()
+	notes := s.governor(gs)
+	for _, e := range s.epps(gs) {
 		if e.have == Performance || !e.offers {
-			continue
-		}
-		if v, _ := s.read(e.file); v == Performance {
 			continue
 		}
 		if err := os.WriteFile(s.path(e.file), []byte(Performance+"\n"), 0o644); err != nil {

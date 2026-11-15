@@ -254,8 +254,10 @@ func (in *Installer) switchOS(ctx context.Context, st *Settings) error {
 		return err
 	}
 	o.logf("%s's OS is written: rebooting into it", t.Tag)
-	_, err := o.Host.Run(ctx, Cmd{Args: []string{"systemctl", "reboot"}})
-	return err
+	if down, err := powerHost(ctx, o.Host, "reboot"); err != nil && !down {
+		return err
+	}
+	return nil
 }
 
 // AwaitGivenFile is the file beside the settings at path holding Settings.AwaitGiven.

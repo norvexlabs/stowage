@@ -16,6 +16,8 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -30,6 +32,9 @@ type Cmd struct {
 	Stream io.Writer
 	// Stdout, when set, receives stdout as it runs, apart from Stream; a write error stops the run.
 	Stdout io.Writer
+	// Cancel, when set, runs when the run's context ends, before the CLI is killed: its stdin is
+	// still open then, and the CLI is killed once Cancel returns.
+	Cancel func()
 }
 
 // Tool runs a CLI.
@@ -51,10 +56,24 @@ func (d ExecTool) Run(ctx context.Context, c Cmd) ([]byte, error) {
 	bin := d.Bin
 	cmd := exec.CommandContext(ctx, bin, c.Args...)
 	cmd.Env, cmd.Stdin = c.Env, c.Stdin
-	cmd.WaitDelay = 10 * time.Second
+	// The pipes are closed pipeWait after the cancel (Cancel's own time aside: exec times the
+	// delay from its return).
+	cmd.WaitDelay = pipeWait
 	if d.Grace > 0 {
 		defer graceful(cmd, d.Grace)()
-		cmd.WaitDelay = d.Grace + 10*time.Second // its group is killed at Grace
+		cmd.WaitDelay = d.Grace + pipeWait // its group is killed at Grace
+	}
+	if c.Cancel != nil {
+		// c's Cancel first, its stdin still open, then the tool's own: graceful's interrupt of
+		// its group and timed kill, else the kill.
+		then := cmd.Cancel
+		if then == nil {
+			then = func() error { return cmd.Process.Kill() }
+		}
+		cmd.Cancel = func() error {
+			c.Cancel()
+			return then()
+		}
 	}
 	var out, errb bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &errb
@@ -78,24 +97,99 @@ func (d ExecTool) Run(ctx context.Context, c Cmd) ([]byte, error) {
 
 // runNamed runs c, a `docker run` or `compose run` of a container named name, and removes that
 // container by its name when the run was cut — its context ended, or the docker CLI was killed by
-// a signal —, as the container then runs on. A run that ended of itself (exit 2, "no answer",
-// included) is left as it is: `--rm` took its container. The removal takes a context of its own,
-// bounded (removeWait), as the run's may be what ended; a container gone already is no error, and
-// a removal that fails is joined to the run's error with the command that removes it.
+// a signal —, as the container then runs on (runNamedGrace without a grace).
 func (in *Installer) runNamed(ctx context.Context, name string, c Cmd) ([]byte, error) {
+	return in.runNamedGrace(ctx, name, c, 0)
+}
+
+// runNamedGrace is runNamed, the container cut off stopped first when grace is not zero: SIGTERM,
+// then grace to end before Docker kills it (`docker stop --time`), sent while the run's stdin is
+// still open — when its context ends, before the CLI is killed (Cmd.Cancel), or when its stdin
+// fails, before the CLI sees its end — so a program reading it (rclone's upload) is stopped rather
+// than reading an end of input and completing what it was sent. The stop runs once, within grace
+// and removeWait; then the container is removed. A run that ended of itself (exit 2, "no answer",
+// included) is left as it is: `--rm` took its container. The stop and the removal take contexts
+// of their own, bounded, as the run's may be what ended; a container gone already, or whose
+// removal is under way (`--rm`'s, after the stop), is no error; a stop that fails is joined to the
+// run's error and the removal still runs, and a removal that fails is joined with the command that
+// removes it. A run cut off returns within runnerCutWait(grace).
+func (in *Installer) runNamedGrace(ctx context.Context, name string, c Cmd, grace time.Duration) ([]byte, error) {
+	var stopErr error
+	var once sync.Once
+	var stopped atomic.Bool // a stop was attempted: its stdin's failure, or the cut
+	stop := func() {
+		once.Do(func() {
+			stopped.Store(true)
+			sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), grace+removeWait)
+			defer cancel()
+			if _, err := in.O.Docker.Run(sctx, Cmd{Args: []string{"stop", "--time", stopSeconds(grace), name}}); !containerGone(err) {
+				stopErr = fmt.Errorf("the container %s did not stop: %w", name, err)
+			}
+		})
+	}
+	if grace > 0 {
+		c.Cancel = stop
+		if c.Stdin != nil {
+			c.Stdin = &stopOnFail{r: c.Stdin, stop: stop}
+		}
+	}
 	out, err := in.O.Docker.Run(ctx, c)
 	var exit *exec.ExitError
 	killed := errors.As(err, &exit) && exit.ProcessState != nil && !exit.ProcessState.Exited()
-	if err == nil || ctx.Err() == nil && !killed {
+	if (err == nil || ctx.Err() == nil && !killed) && !stopped.Load() {
 		return out, err
+	}
+	if grace > 0 {
+		stop()
+		err = errors.Join(err, stopErr)
 	}
 	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), removeWait)
 	defer cancel()
-	if _, rerr := in.O.Docker.Run(rctx, Cmd{Args: []string{"rm", "--force", name}}); rerr != nil && !strings.Contains(rerr.Error(), "No such container") {
+	if _, rerr := in.O.Docker.Run(rctx, Cmd{Args: []string{"rm", "--force", name}}); !containerGone(rerr) {
 		err = errors.Join(err, fmt.Errorf("the container may still be running: `docker rm --force %s` (%w)", name, rerr))
 	}
 	return out, err
 }
+
+// stopSeconds is grace in `docker stop --time`'s whole seconds, rounded up: at least 1.
+func stopSeconds(grace time.Duration) string {
+	return strconv.Itoa(int(max((grace+time.Second-1)/time.Second, 1)))
+}
+
+// containerGone reports whether a stop's or a removal's error leaves the container gone: none, no
+// such container, or its removal under way (`--rm`'s, as Docker answers 409).
+func containerGone(err error) bool {
+	return err == nil || strings.Contains(err.Error(), "No such container") || strings.Contains(err.Error(), "is already in progress")
+}
+
+// stopOnFail is a run's stdin that stops the run (stop) before it reports a failure of its own
+// reader: the run sees no end of input before its stop.
+type stopOnFail struct {
+	r    io.Reader
+	stop func()
+}
+
+func (s *stopOnFail) Read(p []byte) (int, error) {
+	n, err := s.r.Read(p)
+	if err != nil && !errors.Is(err, io.EOF) {
+		s.stop()
+	}
+	return n, err
+}
+
+// runnerCutWait bounds what a run cut off takes, past its cut, in runNamedGrace: its stop when it
+// has a grace (grace and removeWait, then that run's own pipes, pipeWait), its pipes' close
+// (pipeWait), then its removal (removeWait, then that run's pipes).
+func runnerCutWait(grace time.Duration) time.Duration {
+	wait := pipeWait + removeWait + pipeWait
+	if grace > 0 {
+		wait += grace + removeWait + pipeWait
+	}
+	return wait
+}
+
+// pipeWait is how long a cancelled run's pipes stay open once it is killed (exec's WaitDelay).
+const pipeWait = 10 * time.Second
 
 // removeWait bounds the removal of a named container whose run failed (runNamed).
 const removeWait = 30 * time.Second

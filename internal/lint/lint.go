@@ -2410,7 +2410,7 @@ func (l *linter) shapes() {
 		case l.s.Backup == nil:
 			l.warnf("backup", "the VM keeps its data locally and no backup is declared")
 		case !providers.RunsBackups(l.s):
-			l.warnf("backup", "the VM runs %s and %s backups only: it schedules no %s backup", providers.VMBackup, providers.VolumesBackup, l.s.Backup.Name)
+			l.errf("backup", "a %s backup runs nowhere on the kairos shape's VM, which runs %s and %s backups only: declare one of them", l.s.Backup.Name, providers.VMBackup, providers.VolumesBackup)
 		}
 	}
 }

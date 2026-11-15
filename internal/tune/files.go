@@ -34,6 +34,11 @@ const (
 	// manages their affinity (the write's EIO), space separated (0644, the runtime's: a boot's
 	// interrupts are numbered anew). A report reads it to tell them from drift.
 	ManagedIRQFile = "run/stowage/managed-irqs"
+	// IRQCountFile records, for each interrupt the last apply moved, its per-CPU counts
+	// (per_cpu_count) at the move, one `<irq> <counts>` line each (0644, the runtime's). The
+	// kernel moves an interrupt when it next fires: a report judges one whose counts have not grown
+	// since by the affinity asked.
+	IRQCountFile = "run/stowage/irq-counts"
 	// StateFile records what the first apply replaced, for `--revert`.
 	StateFile = "etc/stowage/tune.json"
 )
@@ -595,6 +600,7 @@ func (s System) steer(h Host, all []nic) []string {
 	balanced := s.running("irqbalance")
 	cpus := h.steerCPUs()
 	var managed []int
+	var counts []string // IRQCountFile's lines
 	moved := false
 	for _, n := range all {
 		if !n.physical {
@@ -611,6 +617,11 @@ func (s System) steer(h Host, all []nic) []string {
 					kept++
 				case err != nil:
 					notes = append(notes, fmt.Sprintf("%s IRQ %d: %v", n.name, irq, err))
+				default:
+					// Read after the write: a count the record holds is one of a firing that moved it.
+					if count, ok := s.read(filepath.Join("sys/kernel/irq", strconv.Itoa(irq), "per_cpu_count")); ok && count != "" {
+						counts = append(counts, strconv.Itoa(irq)+" "+count+"\n")
+					}
 				}
 			}
 			if kept > 0 {
@@ -637,15 +648,18 @@ func (s System) steer(h Host, all []nic) []string {
 		if err := s.writeFile(ManagedIRQFile, []byte(strings.Join(list, " ")+"\n"), 0o644); err != nil {
 			notes = append(notes, fmt.Sprintf("%s: %v", ManagedIRQFile, err))
 		}
+		if err := s.writeFile(IRQCountFile, []byte(strings.Join(counts, "")), 0o644); err != nil {
+			notes = append(notes, fmt.Sprintf("%s: %v", IRQCountFile, err))
+		}
 	}
 	return notes
 }
 
 // governor puts every CPU whose frequency the kernel drives (cpufreq) on the performance
 // governor, where its driver offers it.
-func (s System) governor() []string {
+func (s System) governor(gs []cpuGovernor) []string {
 	var notes []string
-	for _, g := range s.governors() {
+	for _, g := range gs {
 		if g.have == "performance" || !g.offers {
 			continue
 		}

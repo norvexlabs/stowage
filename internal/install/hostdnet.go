@@ -211,6 +211,24 @@ func (f netFiles) all() []netFiles {
 	return out
 }
 
+// inForce says what each override sets now, as its state file records it (one that does not read
+// says so): a confirmation refused answers it with its error.
+func (f netFiles) inForce() string {
+	var parts []string
+	for _, g := range f.all() {
+		st, err := g.read()
+		switch {
+		case err != nil:
+			parts = append(parts, fmt.Sprintf("%s: not read (%v)", g.what(), err))
+		case g.role != "":
+			parts = append(parts, g.role+": "+describeRole(st.Config))
+		default:
+			parts = append(parts, "network: "+describeNet(st.Config))
+		}
+	}
+	return "in force: " + strings.Join(parts, "; ")
+}
+
 // what names the override in a message.
 func (f netFiles) what() string {
 	if f.role == "" {
@@ -1504,14 +1522,14 @@ func (h *Hostd) confirm() (NetAnswer, error) {
 		return NetAnswer{}, err
 	}
 	if st.Pending == nil {
-		return NetAnswer{}, fail(http.StatusConflict, "nothing awaits confirmation: a change not confirmed in its window, or before a restart or a reboot, is undone (`%s network` shows the network)", h.R.Ctl())
+		return NetAnswer{}, fail(http.StatusConflict, "nothing awaits confirmation: a change not confirmed in its window, or before a restart or a reboot, is undone; %s (`%s network` shows the network)", f.inForce(), h.R.Ctl())
 	}
 	if a, p := h.netReverts[f.role], st.Pending; a != nil && a.fired.Load() {
 		h.netDisarm(f.role)
 		if err := h.undo(f.role, 1, "not confirmed in time", h.revertWindow(f, p.ID, p.Interface)); err != nil {
-			return NetAnswer{}, fail(http.StatusConflict, "the change's window ended: undoing it failed, and is tried again every %d s: %v", revertRetrySecs, err)
+			return NetAnswer{}, fail(http.StatusConflict, "the change's window ended: undoing it failed, and is tried again every %d s: %v; %s", revertRetrySecs, err, f.inForce())
 		}
-		return NetAnswer{}, fail(http.StatusConflict, "the change's window ended: the settings before it are back")
+		return NetAnswer{}, fail(http.StatusConflict, "the change's window ended: the settings before it are back; %s", f.inForce())
 	}
 	// Recorded first: a confirmation that is not recorded leaves the window armed.
 	st.Pending = nil

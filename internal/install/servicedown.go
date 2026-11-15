@@ -156,6 +156,16 @@ func sameContainer(a, b string) bool {
 // declares (nil: declaredServices, one `compose config` of its own); not read, the list is
 // compose ps's alone, and the log says so.
 func (in *Installer) stackServices(ctx context.Context, env *EnvFile, declared func(context.Context) ([]string, error)) ([]Service, error) {
+	list, err := in.stackList(ctx, env, declared)
+	if err != nil {
+		return nil, err
+	}
+	in.serviceFacts(ctx, list)
+	return list, nil
+}
+
+// stackList is stackServices without what serviceFacts adds.
+func (in *Installer) stackList(ctx context.Context, env *EnvFile, declared func(context.Context) ([]string, error)) ([]Service, error) {
 	out, err := in.Compose(ctx, env, nil, "ps", "--all", "--format", "json")
 	if err != nil {
 		return nil, fmt.Errorf("compose ps: %w", err)
@@ -176,7 +186,6 @@ func (in *Installer) stackServices(ctx context.Context, env *EnvFile, declared f
 			list = append(list, Service{Service: name, State: stateMissing})
 		}
 	}
-	in.serviceFacts(ctx, list)
 	return list, nil
 }
 

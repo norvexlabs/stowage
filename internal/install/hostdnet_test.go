@@ -934,7 +934,7 @@ func TestTheDaemonUndoesAChangeBeforeItServesOne(t *testing.T) {
 	}
 	sock := served(t, h)
 	// The first request, a confirmation, comes after the restart undid the change: it fails.
-	if _, err := ctl(e, sock, "network", "confirm"); err == nil || !strings.Contains(err.Error(), "nothing awaits confirmation: a change not confirmed in its window, or before a restart or a reboot, is undone") {
+	if _, err := ctl(e, sock, "network", "confirm"); err == nil || !strings.Contains(err.Error(), "nothing awaits confirmation: a change not confirmed in its window, or before a restart or a reboot, is undone; in force: network: 10.0.0.60/24 via 10.0.0.1, no IPv6 (") {
 		t.Fatalf("%v", err)
 	}
 	if addr, _, _ := link.live(); addr != "10.0.0.60/24" {
@@ -958,7 +958,7 @@ func TestAConfirmationAfterTheWindowUndoesTheChange(t *testing.T) {
 	eventually(t, "the timer fired", func() bool { a := h.netReverts[""]; return a != nil && a.fired.Load() })
 	_, err := h.confirm()
 	h.netMu.Unlock()
-	if err == nil || !strings.Contains(err.Error(), "the change's window ended: the settings before it are back") {
+	if err == nil || !strings.Contains(err.Error(), "the change's window ended: the settings before it are back; in force: network: the cloud-config's network") {
 		t.Fatalf("%v", err)
 	}
 	if addr, _, _ := link.live(); addr != leaseAddr {

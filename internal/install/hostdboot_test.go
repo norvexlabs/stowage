@@ -2,12 +2,14 @@ package install
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"slices"
@@ -16,8 +18,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/norvexlabs/stowage/internal/command"
 	"github.com/norvexlabs/stowage/internal/spec"
+	"github.com/norvexlabs/stowage/internal/testutil"
 )
 
 func TestHealthOverTheAPI(t *testing.T) {
@@ -732,6 +734,100 @@ func TestAFailedRollbackPutsTheMarksBack(t *testing.T) {
 	}
 }
 
+// A rollback's reboot whose systemctl the shutdown's signal ends is the reboot coming: the marks
+// stay set for it, and no reboot.cancelled says it failed.
+func TestARollbackRebootTheShutdownStopsKeepsTheMarks(t *testing.T) {
+	t.Parallel()
+	_, d, host := upgradedVM(t)
+	host.rebootErr = exec.Command("sh", "-c", "kill -TERM $$").Run()
+	boots(t, d, "active", map[string]string{assessEnable: "no", assessTentative: "no"})
+	hh := d.Handler()
+	if code := call(t, hh, "POST", "/v1/rollback", RollbackRequest{}, nil); code != 202 {
+		t.Fatalf("%d", code)
+	}
+	if j := waitJob(t, hh); j.State != "done" {
+		t.Fatalf("%+v", j)
+	}
+	d.rollbacks.Wait()
+	if !strings.Contains(fmt.Sprint(host.calls()), "systemctl reboot") {
+		t.Fatal("no reboot")
+	}
+	if v := assessOf(t, d); v[assessEnable] != "yes" || v[assessTentative] != "yes" {
+		t.Errorf("the marks: %v", v)
+	}
+	if c := ofKind(held(t, d.O.Dir), evRebootCancelled); len(c) > 0 {
+		t.Errorf("a reboot the shutdown stopped is journaled cancelled: %+v", c)
+	}
+	var st Status
+	call(t, hh, "GET", "/v1/status", nil, &st)
+	if !st.RebootPending {
+		t.Error("the reboot coming is not pending")
+	}
+}
+
+// The plan checked again after the drain finds the passive system carrying another release (a run
+// changed what the install keeps meanwhile): nothing changes, the job says why, nothing reboots.
+func TestARollbackWhosePlanMovesDuringTheDrainChangesNothing(t *testing.T) {
+	t.Parallel()
+	e, d, host := upgradedVM(t)
+	prev := filepath.Join(e.dir, PrevDir)
+	// What the install keeps becomes revision 2 of the release, whole: its record, its .env and
+	// its installer.
+	_, exe := bundledInstaller(t, "1.0.0", 2, nil)
+	d.onWait = func(what string) {
+		if what != "rollback drain" {
+			return
+		}
+		raw, err := os.ReadFile(filepath.Join(prev, prevState))
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		var st state
+		if err := json.Unmarshal(raw, &st); err != nil {
+			t.Error(err)
+			return
+		}
+		st.Revision = 2
+		raw, _ = json.Marshal(st)
+		if err := os.WriteFile(filepath.Join(prev, prevState), raw, 0o600); err != nil {
+			t.Error(err)
+		}
+		env, err := ReadEnvFile(filepath.Join(prev, envName))
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		env.Set("STOWAGE_REVISION", "2")
+		if err := env.WriteFile(filepath.Join(prev, envName)); err != nil {
+			t.Error(err)
+		}
+		bin, err := os.ReadFile(exe)
+		if err == nil {
+			err = testutil.WriteExecutable(filepath.Join(prev, d.R.Ctl()), bin)
+		}
+		if err != nil {
+			t.Error(err)
+		}
+	}
+	boots(t, d, "active", map[string]string{assessEnable: "no", assessTentative: "no"})
+	hh := d.Handler()
+	if code := call(t, hh, "POST", "/v1/rollback", RollbackRequest{}, nil); code != 202 {
+		t.Fatalf("%d", code)
+	}
+	j := waitJob(t, hh)
+	d.rollbacks.Wait()
+	if j.State != "failed" || j.Error != "nothing changed: the passive system now carries 1.0.0 (revision 2), the install runs 2.0.0 (revision 1)" {
+		t.Fatalf("%+v", j)
+	}
+	if strings.Contains(fmt.Sprint(host.calls()), "systemctl reboot") {
+		t.Error("rebooted")
+	}
+	if v := assessOf(t, d); v[assessEnable] != "no" || v[assessTentative] != "no" {
+		t.Errorf("the marks: %v", v)
+	}
+}
+
 // A write of the boot assessment that hangs ends at its bound (assessWrite, in Unit): the
 // rollback's arming fails, and the marks are put back under a context of their own, as the one
 // that ran out would fail them too; an upgrade's clearing of the last attempt fails the same way.
@@ -792,32 +888,46 @@ func TestTheProbeFollowsNoRedirectAndNoProxy(t *testing.T) {
 	}
 }
 
+// A health command's compose file is named with the boot it ran in: the gate removes those of an
+// earlier boot (a reboot interrupted their calls) and those named with none, never this boot's,
+// which a running call may own; and none when this boot's id does not read.
 func TestTheGateRemovesLeftHealthFiles(t *testing.T) {
 	t.Parallel()
 	g := newGate(t, "", nil, false)
-	left, live := filepath.Join(g.dir, ".stowage-health-dead.yaml"), filepath.Join(g.dir, ".stowage-health-live.yaml")
-	for _, f := range []string{left, live} {
-		if err := os.WriteFile(f, nil, 0o644); err != nil {
-			t.Fatal(err)
-		}
-	}
-	// No run of the longest health command (and its container's removal) still holds a file the
-	// gate takes for left.
-	if longest := time.Duration(command.MaxTimeoutS)*time.Second + 30*time.Second; staleHealthFile <= longest {
-		t.Errorf("staleHealthFile %s is within a health command's run, %s", staleHealthFile, longest)
-	}
-	old := time.Now().Add(-staleHealthFile - time.Minute)
-	if err := os.Chtimes(left, old, old); err != nil {
+	id := filepath.Join(t.TempDir(), "boot_id")
+	if err := os.WriteFile(id, []byte("boot2\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	dead, unnamed, live := filepath.Join(g.dir, ".stowage-health-dead_boot1.yaml"), filepath.Join(g.dir, ".stowage-health-old.yaml"), filepath.Join(g.dir, ".stowage-health-live_boot2.yaml")
+	write := func() {
+		for _, f := range []string{dead, unnamed, live} {
+			if err := os.WriteFile(f, nil, 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	write()
+	// This boot's id unread: nothing is removed.
+	g.gate.In.O.BootIDFile = filepath.Join(t.TempDir(), "absent")
 	if err := g.gate.Run(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(left); err == nil {
-		t.Error("an interrupted run's file is left")
+	for _, f := range []string{dead, unnamed, live} {
+		if !fileExists(f) {
+			t.Errorf("removed with no boot id: %s", f)
+		}
 	}
-	if _, err := os.Stat(live); err != nil {
-		t.Error("a running call's file is removed")
+	g.gate.In.O.BootIDFile = id
+	if err := g.gate.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range []string{dead, unnamed} {
+		if fileExists(f) {
+			t.Errorf("an interrupted call's file is left: %s", f)
+		}
+	}
+	if !fileExists(live) {
+		t.Error("a call of this boot's file is removed")
 	}
 }
 

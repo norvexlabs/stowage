@@ -656,6 +656,10 @@ func TestListAndVerifyUseTheDestination(t *testing.T) {
 	if code := call(t, h, "GET", "/v1/backup/list", nil, &list); code != 200 || len(list) != 2 || list[0].Name != "notes-full-20261009T030000Z-1.0.0-r1.pgdump.age" || list[0].Size != 3 || list[1].Name != "notes-lite-20261008T030000Z-0.9.0-r1.pgdump.age" {
 		t.Errorf("%d %+v", code, list)
 	}
+	// The profile the release dropped is marked; the release's own is not.
+	if len(list) == 2 && (list[0].DroppedProfile || !list[1].DroppedProfile) {
+		t.Errorf("dropped profiles: %+v", list)
+	}
 	if j := verifyJob(t, h, nil); j.State != "done" || j.Target != "store:backups/notes" || !strings.Contains(j.Result, "reachable and writable") || strings.Contains(j.Result, "proposed") {
 		t.Errorf("%+v", j)
 	}

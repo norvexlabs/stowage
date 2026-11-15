@@ -188,6 +188,7 @@ func TestEachRuleFires(t *testing.T) {
 		{"chart values not extendable", nil, map[string]string{"deploy/chart/values.yaml": "{web: {replicas: 1}}\n"}, "adding the stowage block"},
 		{"unknown disk format", []edit{{specFile, "disk_formats: [qcow2]", "disk_formats: [vmdk]"}}, nil, "unknown format"},
 		{"bad lock", nil, map[string]string{"stowage.lock": "stowage: 1.0.0\nruntime: {}\n"}, "field runtime not found"},
+		{"backup command on the VM", []edit{{specFile, "  provider: pg-age-rclone\n  profiles: { full: all }\n  volumes: [uploads]", "  provider: command\n  image: api\n  cmd: [notes-api, backup]\n"}}, nil, "backup: a command backup runs nowhere on the kairos shape's VM, which runs pg-age-rclone and volumes-age-rclone backups only: declare one of them"},
 		{"backup default profile", []edit{{specFile, "profiles: { full: all }", "profiles: { full: all, config: [users] }"}}, nil, "default_profile is required"},
 		{"backup of the volumes alone", []edit{{specFile, "  provider: pg-age-rclone\n  profiles: { full: all }\n", "  provider: volumes-age-rclone\n"}}, nil, "backup: volumes-age-rclone leaves the database out, and the project declares one: pg-age-rclone backs it up with its volumes"},
 	}
@@ -1308,20 +1309,6 @@ func TestFailingSchemeReportedOnce(t *testing.T) {
 	found := errorsOf(run(t, root))
 	if len(found) != 1 || !strings.Contains(found[0], "version.scheme") {
 		t.Fatalf("want one version.scheme error, got:\n%s", strings.Join(found, "\n"))
-	}
-}
-
-// A VM backup by another provider than pg-age-rclone is warned: the VM schedules none.
-func TestVMBackupCommandWarns(t *testing.T) {
-	t.Parallel()
-	root := testutil.CopyExample(t, "minimal")
-	testutil.Edit(t, root, specFile, "  provider: pg-age-rclone\n  profiles: { full: all }\n  volumes: [uploads]", "  provider: command\n  image: api\n  cmd: [notes-api, backup]\n")
-	res := run(t, root)
-	if errs := errorsOf(res); len(errs) > 0 {
-		t.Fatalf("errors:\n%s", strings.Join(errs, "\n"))
-	}
-	if len(res.Findings) != 1 || !strings.Contains(res.Findings[0].Message, "the VM runs pg-age-rclone and volumes-age-rclone backups only") {
-		t.Fatalf("findings: %+v", res.Findings)
 	}
 }
 

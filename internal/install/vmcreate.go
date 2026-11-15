@@ -888,10 +888,7 @@ func (in *Installer) walkDisks(ctx context.Context, cl *registry.Client, prefix 
 			return false, err
 		}
 		if tag != m.Tag {
-			by := src.StowageVersion
-			if b := src.Artifacts.BootDisks; len(src.Artifacts.Disks) == 0 && b != nil {
-				by = b.Stowage
-			}
+			by := src.BootStowage()
 			if old, err := (version.SemVer{}).Compare(by, switchingStowage); err != nil || old < 0 {
 				cannot = cmp.Or(cannot, fmt.Errorf("the disk set %s boots is %s's, published by stowage %q, whose first boot cannot take another release's OS: the publisher ships a release with its disks (stowage ship --disks)",
 					src.Tag, tag, by))

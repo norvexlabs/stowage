@@ -1217,8 +1217,9 @@ type cancelOnReboot struct {
 
 func (c cancelOnReboot) Run(ctx context.Context, cmd Cmd) ([]byte, error) {
 	if len(cmd.Args) > 1 && cmd.Args[0] == "systemctl" && cmd.Args[1] == "reboot" {
+		// systemctl started, and the gate's stop as the system goes down killed it.
 		c.cancel()
-		return nil, ctx.Err()
+		return nil, exec.Command("sh", "-c", "kill -KILL $$").Run()
 	}
 	return c.fakeHost.Run(ctx, cmd)
 }
@@ -1249,6 +1250,36 @@ func TestKilledBySignal(t *testing.T) {
 	exited := exec.Command("sh", "-c", "exit 1").Run()
 	if !killedBySignal(fmt.Errorf("systemctl reboot: %w", killed)) || killedBySignal(fmt.Errorf("systemctl reboot: %w", exited)) || killedBySignal(errors.New("other")) {
 		t.Errorf("killed %v, exited %v", killed, exited)
+	}
+}
+
+// sleeper runs a sleep as the host runs systemctl, exec.CommandContext's way: not started under
+// a context already ended, killed when its context ends.
+type sleeper struct{}
+
+func (sleeper) Run(ctx context.Context, _ Cmd) ([]byte, error) {
+	return nil, exec.CommandContext(ctx, "sh", "-c", "sleep 5").Run()
+}
+
+// A reboot is coming only when systemctl ran and a signal or the caller's stop ended it: one that
+// never started (the context ended first: a scheduled reboot firing after the daemon's stop) or
+// that the context's deadline killed is a failure.
+func TestPowerHostTellsARebootComingFromOneNeverAsked(t *testing.T) {
+	t.Parallel()
+	ended, cancel := context.WithCancel(context.Background())
+	cancel()
+	if down, err := powerHost(ended, sleeper{}, "reboot"); down || err == nil {
+		t.Errorf("never started: down %v, %v", down, err)
+	}
+	stopping, stop := context.WithCancel(context.Background())
+	time.AfterFunc(20*time.Millisecond, stop)
+	if down, err := powerHost(stopping, sleeper{}, "reboot"); !down || err == nil {
+		t.Errorf("stopped while it ran: down %v, %v", down, err)
+	}
+	late, done := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer done()
+	if down, err := powerHost(late, sleeper{}, "reboot"); down || err == nil {
+		t.Errorf("past its deadline: down %v, %v", down, err)
 	}
 }
 

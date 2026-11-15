@@ -247,7 +247,7 @@ func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(
 			if err := prepare(); err != nil {
 				return err
 			}
-			h := &Hostd{R: r, O: in.O, Host: HostTool{}, Group: group, Issue: issueDir}
+			h := &Hostd{R: r, O: in.O, Host: HostTool{}, Group: group, Issue: issueDir, Stowage: StowageVersion}
 			return h.Serve(cmd.Context(), socket)
 		},
 	}
@@ -499,8 +499,16 @@ func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(
 			}
 			reboot := !noReboot
 			req := UpgradeRequest{Channel: channel, Version: version, Confirm: &u.Target, Reboot: &reboot, SkipBackup: skipBackup, Unordered: unordered}
+			// The daemon downloads the release's installer whole before it answers, when updates says
+			// it checks it.
+			checking := func() {
+				if u.ChecksInstaller {
+					fmt.Fprintf(out, "checking %s against the install: its installer is downloaded first\n", u.Target)
+				}
+			}
 			if dryRun {
 				req.DryRun, nothing = true, true
+				checking()
 				var p UpgradePlan
 				if err := c.do(ctx, http.MethodPost, "/v1/upgrade", req, &p); err != nil {
 					return err
@@ -512,6 +520,9 @@ func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(
 				first := ""
 				if p.Backup {
 					first = "a backup first, then "
+				}
+				if p.Unchecked != "" {
+					fmt.Fprintf(out, "not checked here: %s\n", p.Unchecked)
 				}
 				fmt.Fprintf(out, "dry run: every check passed; an upgrade takes %s%s %s written to the %s slot, and %s %s; nothing changed\n", first, name, p.To, p.Slot, boot, p.Does)
 				return nil
@@ -532,6 +543,7 @@ func vmCommand(r *Release, self string, stdout, stderr io.Writer, terminal func(
 					return ErrAborted
 				}
 			}
+			checking()
 			var started JobStarted
 			if err := c.do(ctx, http.MethodPost, "/v1/upgrade", req, &started); err != nil {
 				return err

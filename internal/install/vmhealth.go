@@ -61,14 +61,10 @@ const HealthService = "stowage-health"
 
 // Bounds on a probe and on what the diagnostics keep.
 const (
-	probeTimeout = 10 * time.Second
-	// staleHealthFile is past the longest a health command's compose file lives: the command's
-	// longest timeout_s (lint refuses more), the 30 s its container's removal may take, and a
-	// margin for a slow pull of its environment.
-	staleHealthFile = time.Duration(command.MaxTimeoutS)*time.Second + 30*time.Second + 10*time.Minute
-	maxProbeAnswer  = 64 << 10
-	diagLogLines    = 500
-	diagBootLines   = 2000
+	probeTimeout   = 10 * time.Second
+	maxProbeAnswer = 64 << 10
+	diagLogLines   = 500
+	diagBootLines  = 2000
 )
 
 // assessment is Kairos's boot assessment environment in the COS_STATE partition mounted at dir.
@@ -173,11 +169,14 @@ type Gate struct {
 	State string
 	// Unit is what shapes.kairos.health_gate's seconds count; 0 is a second. Tests shorten it.
 	Unit time.Duration
-	// Now is the clock the diagnostics are named by; nil is time.Now.
+	// Now is the clock a failed boot's time is read from (FailedBoot.At); nil is time.Now.
 	Now func() time.Time
 
 	// boot holds this boot's boot.started once read (judged).
 	boot bootCache
+	// ps is the services as the last judgement's `compose ps` listed them (JSON), which the
+	// diagnostics keep; nil when it did not list them.
+	ps []byte
 }
 
 // judged journals the gate's verdict on this boot: healthy, went_back (the next boot runs the
@@ -210,16 +209,8 @@ func (g *Gate) Run(ctx context.Context) error {
 	if !fileExists(in.path(envName)) {
 		return g.noInstall(ctx)
 	}
-	// The compose files of health commands a reboot or a kill interrupted: older than any call
-	// the daemon may be running.
-	if left, err := filepath.Glob(in.path(".stowage-health-*.yaml")); err == nil {
-		for _, f := range left {
-			if fi, err := os.Stat(f); err == nil && time.Since(fi.ModTime()) > staleHealthFile {
-				_ = os.Remove(f)
-			}
-		}
-	}
-	// Their containers an earlier boot left: no check of this boot owns one.
+	// The health commands' compose files and containers an earlier boot left (a reboot interrupted
+	// their calls): no check of this boot owns one.
 	in.removeEarlierHealth(ctx)
 	a, onTrial, err := g.trial()
 	if err != nil {
@@ -296,10 +287,9 @@ func (g *Gate) Run(ctx context.Context) error {
 	g.judged(true, verdictWentBack, unhealthy, "", true)
 	o.logf("%v", failed)
 	o.logf("rebooting: Kairos boots the passive system, and its boot goes back to the release the upgrade replaced")
-	if _, err := g.Host.Run(ctx, Cmd{Args: []string{"systemctl", "reboot"}}); err != nil {
-		// A run the shutdown stopped is the reboot coming: no second verdict. Its signal may reach
-		// systemctl before the gate's context is cancelled.
-		if ctx.Err() != nil || killedBySignal(err) {
+	if down, err := powerHost(ctx, g.Host, "reboot"); err != nil {
+		// A run the shutdown stopped is the reboot coming: no second verdict.
+		if down {
 			return fmt.Errorf("%w; stopped as the system goes down: %v", failed, cmp.Or[error](ctx.Err(), err))
 		}
 		// The marks stay set: the next boot, whenever it comes, goes back all the same.
@@ -308,6 +298,19 @@ func (g *Gate) Run(ctx context.Context) error {
 		return fmt.Errorf("%w; the reboot failed: %v", failed, err)
 	}
 	return failed
+}
+
+// powerHost runs `systemctl action` (reboot, poweroff) through host: the one way the health gate,
+// the host daemon and the first boot's switch reboot. down reports a systemctl that ran and was
+// ended by a signal — the shutdown's, or ctx cancelled as the caller stops with it —: the action
+// comes all the same, so a caller never counts it as one that failed (no second verdict, no reboot
+// cancelled, the boot assessment's marks left for it). A systemctl that never started (ctx ended
+// first) or that ctx's deadline killed is a failure: no action was asked.
+func powerHost(ctx context.Context, host Tool, action string) (down bool, err error) {
+	if _, err = host.Run(ctx, Cmd{Args: []string{"systemctl", action}}); err == nil {
+		return false, nil
+	}
+	return killedBySignal(err) && !errors.Is(ctx.Err(), context.DeadlineExceeded), err
 }
 
 // killedBySignal reports whether err is a program's that the shutdown's signal ended (SIGTERM or
@@ -391,6 +394,7 @@ func (g *Gate) refusedRollback(ctx context.Context) string {
 // check is one judgement: the boot brought the install up, the install runs this OS's release,
 // and it is ready.
 func (g *Gate) check(ctx context.Context) error {
+	g.ps = nil
 	in := g.In
 	m := in.R.Manifest
 	unit := in.R.Spec.Name + ".service"
@@ -408,13 +412,20 @@ func (g *Gate) check(ctx context.Context) error {
 	if _, v, rev := runs(env); !isAt(m.ProjectVersion, m.Revision, v, rev) {
 		return fmt.Errorf("the install runs %s (revision %s), not %s (revision %d), which this OS carries", v, rev, m.ProjectVersion, m.Revision)
 	}
-	return in.ready(ctx, env, g.Probe)
+	return in.ready(ctx, env, g.Probe, &g.ps)
 }
 
 // ready reports why the install is not ready, nil when it is: every service of the stack runs —
-// healthy when it has a healthcheck — or exited 0, and the health provider answers ready.
-func (in *Installer) ready(ctx context.Context, env *EnvFile, probe *http.Client) error {
+// healthy when it has a healthcheck — or exited 0, and the health provider answers ready. ps, when
+// not nil, is given the services as `compose ps` listed them (JSON), nil when it did not answer.
+func (in *Installer) ready(ctx context.Context, env *EnvFile, probe *http.Client, ps *[]byte) error {
 	out, err := in.Compose(ctx, env, nil, "ps", "--all", "--format", "json")
+	if ps != nil {
+		*ps = nil
+		if err == nil {
+			*ps = out
+		}
+	}
 	if err != nil {
 		return fmt.Errorf("compose ps: %w", err)
 	}
@@ -445,43 +456,31 @@ func (in *Installer) probeHTTP(ctx context.Context, env *EnvFile, client *http.C
 	if err != nil {
 		return fmt.Errorf("health: %w", err)
 	}
-	ip, err := in.address(ctx, env, c.Service)
-	if err != nil {
-		return err
-	}
-	if client == nil {
-		client = probes
-	}
-	pctx, cancel := context.WithTimeout(ctx, probeTimeout)
-	defer cancel()
 	where := fmt.Sprintf("%s:%d%s", c.Service, c.Port, c.Path)
-	req, err := http.NewRequestWithContext(pctx, http.MethodGet, "http://"+net.JoinHostPort(ip, strconv.Itoa(c.Port))+c.Path, nil)
-	if err != nil {
+	ans, err := in.callService(ctx, env, client, serviceCall{method: http.MethodGet, service: c.Service, port: strconv.Itoa(c.Port), path: c.Path, limit: maxProbeAnswer, timeout: probeTimeout})
+	if errors.As(err, new(unsent)) {
 		return err
 	}
-	resp, err := client.Do(req)
 	if err != nil {
 		return fmt.Errorf("%s does not answer: %w", where, err)
 	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxProbeAnswer+1))
-	if err != nil {
-		return fmt.Errorf("%s: %w", where, err)
+	if ans.readErr != nil {
+		return fmt.Errorf("%s: %w", where, ans.readErr)
 	}
 	if c.Fields == nil {
-		if resp.StatusCode != c.Status {
-			return fmt.Errorf("%s answered %d, not %d", where, resp.StatusCode, c.Status)
+		if ans.status != c.Status {
+			return fmt.Errorf("%s answered %d, not %d", where, ans.status, c.Status)
 		}
 		return nil
 	}
-	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return fmt.Errorf("%s answered %d", where, resp.StatusCode)
+	if ans.status < 200 || ans.status > 299 {
+		return fmt.Errorf("%s answered %d", where, ans.status)
 	}
-	if len(body) > maxProbeAnswer {
+	if len(ans.body) > maxProbeAnswer {
 		return fmt.Errorf("%s answered more than %d bytes", where, maxProbeAnswer)
 	}
 	var got map[string]any
-	if err := json.Unmarshal(body, &got); err != nil {
+	if err := json.Unmarshal(ans.body, &got); err != nil {
 		return fmt.Errorf("%s did not answer a JSON object: %w", where, err)
 	}
 	// The expected fields as JSON reads them, so a YAML 1 equals a JSON 1.
@@ -513,6 +512,68 @@ func (in *Installer) probeHTTP(ctx context.Context, env *EnvFile, client *http.C
 var probes = &http.Client{
 	Transport:     &http.Transport{Proxy: nil, DisableKeepAlives: true},
 	CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+}
+
+// serviceCall is a request the host sends a service of the stack, at its container's address on a
+// network the host reaches (address): the health probe's and the disk-pressure watch's.
+type serviceCall struct {
+	method, service, port string
+	path                  string // the request's path, with its query
+	host                  string // the Host header; empty, the address's
+	header                http.Header
+	body                  []byte
+	limit                 int64 // the answer's bytes read: up to limit+1, so a longer one is told
+	// timeout, when set, bounds the request and its answer alone: the address is looked up under
+	// the caller's context, so a slow engine is never taken for a service that does not answer.
+	timeout time.Duration
+}
+
+// serviceAnswer is a service's answer: its status, its body as read (serviceCall.limit), and why
+// the body could not be read whole (nil when it could).
+type serviceAnswer struct {
+	status  int
+	body    []byte
+	readErr error
+}
+
+// unsent is callService's error when no request was sent: the service has no address, or the
+// request cannot be made. Any other error is the service's not answering.
+type unsent struct{ error }
+
+func (e unsent) Unwrap() error { return e.error }
+
+// callService sends c through client (probes when nil), ctx bounding it, and reads the answer.
+func (in *Installer) callService(ctx context.Context, env *EnvFile, client *http.Client, c serviceCall) (serviceAnswer, error) {
+	ip, err := in.address(ctx, env, c.service)
+	if err != nil {
+		return serviceAnswer{}, unsent{err}
+	}
+	if c.timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, c.timeout)
+		defer cancel()
+	}
+	var body io.Reader
+	if c.body != nil {
+		body = bytes.NewReader(c.body)
+	}
+	req, err := http.NewRequestWithContext(ctx, c.method, "http://"+net.JoinHostPort(ip, c.port)+c.path, body)
+	if err != nil {
+		return serviceAnswer{}, unsent{err}
+	}
+	if c.host != "" {
+		req.Host = c.host
+	}
+	for k, v := range c.header {
+		req.Header[k] = v
+	}
+	resp, err := cmp.Or(client, probes).Do(req)
+	if err != nil {
+		return serviceAnswer{}, err
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, c.limit+1))
+	return serviceAnswer{status: resp.StatusCode, body: raw, readErr: err}, nil
 }
 
 // address is service's container's address on a network the host reaches: the first network by
@@ -566,16 +627,28 @@ func (in *Installer) address(ctx context.Context, env *EnvFile, service string) 
 }
 
 // HealthBootLabel labels the container of a `command` health check with the boot it ran in: one
-// labelled with an earlier boot is one a reboot interrupted, which no running check owns.
-const HealthBootLabel = "io.stowage.health-boot"
+// labelled with an earlier boot is one a reboot interrupted, which no running check owns. Its
+// compose file, in the install directory, is healthFilePrefix<call>_<boot>.yaml likewise.
+const (
+	HealthBootLabel  = "io.stowage.health-boot"
+	healthFilePrefix = ".stowage-health-"
+)
 
-// removeEarlierHealth removes the health checks' containers an earlier boot left (a reboot
-// interrupts a check, and nothing then removes its container); this boot's, which a running
-// check may own, are kept, and so is every one when this boot's id does not read.
+// removeEarlierHealth removes the health checks' compose files and containers an earlier boot left
+// (a reboot interrupts a check, and nothing then removes them), each named or labelled with the
+// boot it ran in; this boot's, which a running check may own, are kept, and so is every one when
+// this boot's id does not read.
 func (in *Installer) removeEarlierHealth(ctx context.Context) {
 	boot := in.O.bootID()
 	if boot == "" {
 		return
+	}
+	if left, err := filepath.Glob(in.path(healthFilePrefix + "*.yaml")); err == nil {
+		for _, f := range left {
+			if _, of, _ := strings.Cut(strings.TrimSuffix(filepath.Base(f), ".yaml"), "_"); of != boot {
+				_ = os.Remove(f)
+			}
+		}
 	}
 	out, err := in.O.Docker.Run(ctx, Cmd{Args: []string{"ps", "--all", "--filter", "label=" + HealthBootLabel, "--format", "{{.ID}} {{.Label \"" + HealthBootLabel + "\"}}"}})
 	if err != nil {
@@ -610,8 +683,9 @@ func (in *Installer) probeCommand(ctx context.Context, env *EnvFile) error {
 		Ready  *bool  `json:"ready"`
 		Reason string `json:"reason"`
 	}
-	err := in.runCommand(ctx, commandRun{what: "the health command", service: HealthService, file: ".stowage-health-" + id + ".yaml",
-		name: containerName(env, HealthService) + "-" + id, labels: map[string]string{HealthBootLabel: in.O.bootID()}}, c, env, env, map[string]any{"op": "health.ready"}, &out)
+	boot := in.O.bootID()
+	err := in.runCommand(ctx, commandRun{what: "the health command", service: HealthService, file: healthFilePrefix + id + "_" + boot + ".yaml",
+		name: containerName(env, HealthService) + "-" + id, labels: map[string]string{HealthBootLabel: boot}}, c, env, env, map[string]any{"op": "health.ready"}, &out)
 	switch {
 	case errors.Is(err, command.ErrNoAnswer):
 		return errors.New("the health command has no answer")
@@ -641,9 +715,10 @@ type FailedBoot struct {
 // unsafeName is what a directory name drops from a version.
 var unsafeName = regexp.MustCompile(`[^A-Za-z0-9._-]`)
 
-// keep writes the diagnostics of a failed judgement into a directory of FailedBootsDir — why, the
-// services, their last log lines and the boot unit's journal — and drops all but the last
-// keepFailedBoots. What cannot be read is noted in its place.
+// keep writes the diagnostics of a failed judgement into a directory of FailedBootsDir, numbered
+// one past the last one kept — why, the services as the judgement listed them, their last log
+// lines and the boot unit's journal — and drops all but the last keepFailedBoots. What cannot be
+// read is noted in its place.
 func (g *Gate) keep(ctx context.Context, why error, kept string) (string, error) {
 	in := g.In
 	m := in.R.Manifest
@@ -651,9 +726,16 @@ func (g *Gate) keep(ctx context.Context, why error, kept string) (string, error)
 	if g.Now != nil {
 		now = g.Now
 	}
-	at := now().UTC()
 	root := in.path(FailedBootsDir)
-	dir := filepath.Join(root, fmt.Sprintf("%s-%s-r%d", at.Format("20060102T150405Z"), unsafeName.ReplaceAllString(m.ProjectVersion, "_"), m.Revision))
+	dirs, err := failedBootDirs(root)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return "", err
+	}
+	n := 1
+	if len(dirs) > 0 {
+		n = failedBootSeq(dirs[len(dirs)-1]) + 1
+	}
+	dir := filepath.Join(root, fmt.Sprintf("%06d-%s-r%d", n, unsafeName.ReplaceAllString(m.ProjectVersion, "_"), m.Revision))
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", err
 	}
@@ -661,7 +743,7 @@ func (g *Gate) keep(ctx context.Context, why error, kept string) (string, error)
 	if err != nil {
 		in.O.logf("the event journal: %v", err)
 	}
-	desc, err := json.MarshalIndent(FailedBoot{Release: Version{m.ProjectVersion, m.Revision}, At: at, Reason: why.Error(), Kept: kept, Dir: dir, Seq: seq}, "", "  ")
+	desc, err := json.MarshalIndent(FailedBoot{Release: Version{m.ProjectVersion, m.Revision}, At: now().UTC(), Reason: why.Error(), Kept: kept, Dir: dir, Seq: seq}, "", "  ")
 	if err != nil {
 		return "", err
 	}
@@ -680,36 +762,31 @@ func (g *Gate) keep(ctx context.Context, why error, kept string) (string, error)
 	out, err := g.Host.Run(ctx, Cmd{Args: []string{"journalctl", "--unit", unit, "--boot", "--no-pager", "--lines", strconv.Itoa(diagBootLines)}})
 	save("boot.log", out, err)
 	if env, err := in.open(); err == nil {
-		out, err := in.Compose(ctx, env, nil, "ps", "--all")
-		save("ps.txt", out, err)
-		if raw, err := in.Compose(ctx, env, nil, "ps", "--all", "--format", "json"); err == nil {
-			if list, err := parseServices(raw); err == nil {
-				for _, s := range list {
-					if !serviceName.MatchString(s.Service) {
-						continue
-					}
-					out, err := in.Compose(ctx, env, nil, "logs", "--no-color", "--timestamps", "--tail", strconv.Itoa(diagLogLines), s.Service)
-					save("logs-"+s.Service+".txt", out, err)
+		// The services as the last judgement listed them; listed now when it did not.
+		ps, err := g.ps, error(nil)
+		if ps == nil {
+			ps, err = in.Compose(ctx, env, nil, "ps", "--all", "--format", "json")
+		}
+		save("ps.json", ps, err)
+		if list, err := parseServices(ps); err == nil {
+			for _, s := range list {
+				if !serviceName.MatchString(s.Service) {
+					continue
 				}
+				out, err := in.Compose(ctx, env, nil, "logs", "--no-color", "--timestamps", "--tail", strconv.Itoa(diagLogLines), s.Service)
+				save("logs-"+s.Service+".txt", out, err)
 			}
 		}
 	}
 	return dir, prune(root)
 }
 
-// prune drops all but the last keepFailedBoots diagnostics, named by their time.
+// prune drops all but the last keepFailedBoots diagnostics, in the order the gate kept them.
 func prune(root string) error {
-	entries, err := os.ReadDir(root)
+	dirs, err := failedBootDirs(root)
 	if err != nil {
 		return err
 	}
-	var dirs []string
-	for _, e := range entries {
-		if e.IsDir() {
-			dirs = append(dirs, e.Name())
-		}
-	}
-	slices.Sort(dirs)
 	for len(dirs) > keepFailedBoots {
 		if err := os.RemoveAll(filepath.Join(root, dirs[0])); err != nil {
 			return err
@@ -719,14 +796,43 @@ func prune(root string) error {
 	return nil
 }
 
+// failedBootDirs are the diagnostics' directories in root, oldest first: by the number each name
+// starts with (failedBootSeq), a name without one before every other.
+func failedBootDirs(root string) ([]string, error) {
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return nil, err
+	}
+	var dirs []string
+	for _, e := range entries {
+		if e.IsDir() {
+			dirs = append(dirs, e.Name())
+		}
+	}
+	slices.SortStableFunc(dirs, func(a, b string) int { return cmp.Compare(failedBootSeq(a), failedBootSeq(b)) })
+	return dirs, nil
+}
+
+// failedBootSeq is the number a diagnostics directory's name starts with, which the gate counts up
+// from the last one kept; 0 for a name without one.
+func failedBootSeq(name string) int {
+	digits, _, _ := strings.Cut(name, "-")
+	n, err := strconv.Atoi(digits)
+	if err != nil || n < 0 {
+		return 0
+	}
+	return n
+}
+
 // lastFailedBoot is the last boot the gate found unhealthy; nil when none is kept.
 func lastFailedBoot(dir string) *FailedBoot {
-	entries, err := os.ReadDir(filepath.Join(dir, FailedBootsDir))
+	root := filepath.Join(dir, FailedBootsDir)
+	dirs, err := failedBootDirs(root)
 	if err != nil {
 		return nil
 	}
-	for i := len(entries) - 1; i >= 0; i-- {
-		raw, err := os.ReadFile(filepath.Join(dir, FailedBootsDir, entries[i].Name(), failedBootFile))
+	for i := len(dirs) - 1; i >= 0; i-- {
+		raw, err := os.ReadFile(filepath.Join(root, dirs[i], failedBootFile))
 		if err != nil || len(raw) > 64<<10 {
 			continue
 		}

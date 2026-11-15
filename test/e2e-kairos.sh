@@ -160,7 +160,7 @@ running 1.0.0 1
 
 step "the host daemon answers notes-stow"
 SOCK=$WORK/hostd/host.sock
-"${VM1[@]}" hostd --dir "$D" --socket "$SOCK" --group "" >"$WORK/hostd.log" 2>&1 &
+"${VM1[@]}" hostd --dir "$D" --socket "$SOCK" --group "" --issue-dir "$WORK/hostd/issue" >"$WORK/hostd.log" 2>&1 &
 CLEANUP+=("kill $! 2>/dev/null")
 for _ in $(seq 1 50); do [[ -S $SOCK ]] && break; sleep 0.1; done
 [[ -S $SOCK ]] || { cat "$WORK/hostd.log"; fail "the host daemon did not start"; }
