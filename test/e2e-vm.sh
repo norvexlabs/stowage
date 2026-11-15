@@ -535,14 +535,18 @@ api=$(on_vm sudo docker ps -q --filter label=com.docker.compose.service=api)
 	{ on_vm sudo docker exec "$api" ls -lan /data/uploads; fail "the restore did not bring the uploads volume back as it was"; }
 # A backup cut short (named as one, a later time): its restore fails and the data stays as it was.
 cut=${backups[0]##*/}; cut=${cut/-full-????????T??????Z-/-full-29991231T235959Z-}
-head -c $(($(stat -c %s "${backups[0]}") / 2)) "${backups[0]}" >"$WORK/dav/backups/$cut"
-# Its archive whole beside it (the dump is what is cut), sent through the server, whose listing a
-# file written behind its back reaches only once its directory cache expires.
+head -c $(($(stat -c %s "${backups[0]}") / 2)) "${backups[0]}" >"$WORK/cut.pgdump.age"
+# The cut dump and its archive whole beside it, sent through the server, whose listing a file
+# written behind its back reaches only once its directory cache expires.
 dav_rclone() { docker run --rm --network host --user "$(id -u):$(id -g)" -v "$WORK:$WORK" "$RCLONE" --config "$DAV_CONF" "$@"; }
+dav_rclone copyto "$WORK/cut.pgdump.age" "dav:backups/$cut" || fail "the cut backup's dump"
 dav_rclone copyto "${backups[0]%.pgdump.age}.uploads.tar.age" "dav:backups/${cut%.pgdump.age}.uploads.tar.age" || fail "the cut backup's archive"
 on_vm sudo docker exec "$pg" psql -U notes -d notes -c "'INSERT INTO e2e_backup VALUES (3)'" >/dev/null || fail "a row before the restore cut short"
 on_vm sudo docker exec "$api" touch /data/uploads/since-cut || fail "a file before the restore cut short"
-if on_vm sudo notes-stow restore "$cut" --yes <"$AGE_KEY" >"$WORK/restore-cut.txt" 2>&1; then cat "$WORK/restore-cut.txt"; fail "a backup cut short restored"; fi
+# No backup of this install uploaded it: refused before anything stops, unless --unrecorded.
+if on_vm sudo notes-stow restore "$cut" --yes <"$AGE_KEY" >"$WORK/restore-unrecorded.txt" 2>&1; then cat "$WORK/restore-unrecorded.txt"; fail "a backup this install did not record restored"; fi
+grep -q 'this install recorded no digest of it' "$WORK/restore-unrecorded.txt" || { cat "$WORK/restore-unrecorded.txt"; fail "a backup this install did not record was not refused as unrecorded"; }
+if on_vm sudo notes-stow restore "$cut" --unrecorded --yes <"$AGE_KEY" >"$WORK/restore-cut.txt" 2>&1; then cat "$WORK/restore-cut.txt"; fail "a backup cut short restored"; fi
 grep -q 'the database is as it was' "$WORK/restore-cut.txt" || { cat "$WORK/restore-cut.txt"; fail "the restore cut short did not fail loading the dump"; }
 healthy_postgres "after the restore cut short"
 pg=$(on_vm sudo docker ps -q --filter label=com.docker.compose.service=postgres)
