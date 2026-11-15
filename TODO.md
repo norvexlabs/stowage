@@ -398,6 +398,14 @@ Cloud alone proven.
   only for a target published by its own Stowage version; two unreleased builds of one top
   CHANGELOG entry share it, so one may judge by the other's rules (the boot judges again, and
   falls back). Comparing the build's commit as well would close it.
+- **A command cut off while Docker is still creating its container**: a `command` provider's run
+  past its timeout is removed by name (`docker rm --force`); on a daemon slow enough that the
+  create is still in flight, the removal finds no container, the create then lands, and the
+  container stays (`Created`) — the next lifecycle run refuses it, naming `docker rm --force`
+  (seen once in smoke-install under load, a rollback's schema check). The timeout's message also
+  leaves out a removal that failed. Rare; a removal confirmed over a settle window, or the next
+  run removing a schema check's container that is not running, would close it.
+
 - **A file input swept while a command mounts it**: a `command` provider's run checks that a file
   input's file exists and hands its path to Compose for a bind mount, with no lock against a
   concurrent re-run's sweep of the inputs' files; the host daemon's health probe can race a

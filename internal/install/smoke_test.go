@@ -223,7 +223,7 @@ case "$req" in
 *schema.barrier_after*) echo "{\"barriers\": [$(wget -qO- http://web:8080/barriers)]}" ;;
 *schema.reads_newer*) echo '{"reads_newer": true}' ;;
 *) exit 2 ;;
-esac`}}}},
+esac`}, "env": []any{}}}},
 	}
 	// release v is at migration v; barriers is the JSON list of rollback barriers it carries.
 	build := func(v int, barriers string) (*Release, string) {
