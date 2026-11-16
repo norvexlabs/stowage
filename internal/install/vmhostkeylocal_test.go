@@ -262,33 +262,3 @@ exit 2
 		}
 	}
 }
-
-// vm create's retirement after its install: the VM's own key recorded, and the pin dropped once sshd
-// took the reload; when it did not, the pin is kept beside the record (the VM may serve the
-// one-time key until it reloads), and a warning names the fix, followed literally.
-func TestVMCreatesRetirementChecksTheReload(t *testing.T) {
-	t.Parallel()
-	for _, reloaded := range []bool{true, false} {
-		out := "ssh-ed25519 " + testHostKeyBlob + " root@notes\n"
-		if !reloaded {
-			out += sshdNotReloaded + "\n"
-		}
-		r, _ := testInstallerWith(t, "1.0.0", nil)
-		var log bytes.Buffer
-		dir := t.TempDir()
-		pin := filepath.Join(dir, "known_hosts.seed")
-		if err := os.WriteFile(pin, []byte("x\n"), 0o600); err != nil {
-			t.Fatal(err)
-		}
-		in := &Installer{R: r, O: Options{SSH: &hostKeyHost{out: []byte(out)}, Log: &log, Out: io.Discard}}
-		in.retireSeedHostKey(context.Background(), dir, pin, Machine{User: "ops"}, "192.0.2.10", "")
-		_, pinErr := os.Stat(pin)
-		_, knownErr := os.Stat(filepath.Join(dir, "known_hosts"))
-		if reloaded && (pinErr == nil || knownErr != nil) {
-			t.Errorf("reloaded: the pin kept %v, known_hosts %v; log %s", pinErr == nil, knownErr, &log)
-		}
-		if !reloaded && (pinErr != nil || knownErr != nil || !strings.Contains(log.String(), "sshd did not reload") || !strings.Contains(log.String(), "sudo systemctl reload ssh") || !strings.Contains(log.String(), "`notes-stow vm host-key 192.0.2.10`")) {
-			t.Errorf("not reloaded: the pin %v, known_hosts %v; log %s", pinErr, knownErr, &log)
-		}
-	}
-}

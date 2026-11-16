@@ -23,6 +23,7 @@ import (
 	"github.com/google/go-containerregistry/pkg/v1/remote"
 	"github.com/klauspost/compress/zstd"
 
+	"github.com/norvexlabs/stowage/internal/installerbin"
 	"github.com/norvexlabs/stowage/internal/kairos"
 	"github.com/norvexlabs/stowage/internal/payload"
 	"github.com/norvexlabs/stowage/internal/registry"
@@ -111,8 +112,12 @@ func TestShipPublishesTheOSBundleAndItsDisks(t *testing.T) {
 	// <short>-stow: the installer executable with the release as the bundle carries it — no
 	// publication, and a spec without what is made from the bundle.
 	ctl := e.builder.context["ctl/notes-stow"]
-	if !bytes.HasPrefix(ctl, p.Installer) {
-		t.Fatal("ctl/notes-stow is not the installer executable")
+	target, err := p.Installer[installerbin.Target].Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.HasPrefix(ctl, target) {
+		t.Fatal("ctl/notes-stow is not the target's installer executable")
 	}
 	exe := filepath.Join(t.TempDir(), "notes-stow")
 	if err := testutil.WriteExecutable(exe, ctl); err != nil {

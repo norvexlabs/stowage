@@ -77,11 +77,25 @@ func sortFindings(f []Finding) {
 
 // Subject is one artifact of the release audited: its SBOM's findings, or why it has none.
 type Subject struct {
-	Name     string    `json:"name"`  // the image key, installer or os
+	Name string `json:"name"` // the image key, installer or os
+	// Platform is an image's platform in its artifact's index (the installer's other images);
+	// absent for the artifact itself.
+	Platform string    `json:"platform,omitempty"`
 	Owner    string    `json:"owner"` // who fixes its findings: "project" or "stowage" (Owner)
 	Digest   string    `json:"digest"`
 	Error    string    `json:"error,omitempty"`
 	Findings []Finding `json:"findings"`
+}
+
+// Label names the subject for people: its name, and its platform when it has one.
+func (s Subject) Label() string { return label(s.Name, s.Platform) }
+
+// label is name, with platform in parentheses when there is one.
+func label(name, platform string) string {
+	if platform == "" {
+		return name
+	}
+	return name + " (" + platform + ")"
 }
 
 // Report is an audit of one release.
@@ -136,7 +150,7 @@ func (r Report) Verdict(min Severity, on bool) error {
 	var not []string
 	for _, s := range r.Subjects {
 		if s.Error != "" {
-			not = append(not, s.Name)
+			not = append(not, s.Label())
 		}
 	}
 	if len(not) > 0 {
@@ -174,10 +188,10 @@ func (r Report) Print(w io.Writer) error {
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
 	for _, s := range r.Subjects {
 		if s.Error != "" {
-			fmt.Fprintf(tw, "%s\t%s\tnot audited: %s\n", s.Name, s.Digest, s.Error)
+			fmt.Fprintf(tw, "%s\t%s\tnot audited: %s\n", s.Label(), s.Digest, s.Error)
 		}
 		for _, f := range s.Findings {
-			rows = append(rows, row{s.Name, f})
+			rows = append(rows, row{s.Label(), f})
 		}
 	}
 	slices.SortStableFunc(rows, func(a, b row) int {

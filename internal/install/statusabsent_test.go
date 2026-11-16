@@ -45,7 +45,7 @@ func oneStatusRefused(t *testing.T, out string) StatusRefused {
 func TestStatusJSONTellsAbsentFromAnother(t *testing.T) {
 	t.Parallel()
 	e := newKubeEnv(t, spec.Provider{Name: "none"})
-	tools := K8sOptions{Helm: kubeTool{e.f, "helm"}, Kubectl: kubeTool{e.f, "kubectl"}}
+	tools := e.tools()
 	run := func(args ...string) (string, error) {
 		var out bytes.Buffer
 		cmd := newCommand(e.release, "notes-stow", &out, io.Discard, tools, func(bool) Prompter { return nil })
@@ -853,7 +853,8 @@ func TestDockerDirCheck(t *testing.T) {
 	}
 }
 
-// k8s status --json --values gives the recorded inputs that are not secret, and no front's.
+// k8s status --json --values gives the recorded inputs that are not secret, and no front's, and
+// whether the pull Secret holds a login.
 func TestK8sStatusJSONValues(t *testing.T) {
 	t.Parallel()
 	e := newKubeEnv(t, spec.Provider{Name: "none"})
@@ -869,5 +870,37 @@ func TestK8sStatusJSONValues(t *testing.T) {
 	if err := json.Unmarshal(e.out.Bytes(), &st); err != nil || st.Values == nil ||
 		!reflect.DeepEqual(*st.Values, RecordedValues{Inputs: map[string]string{"ADMIN_EMAIL": "admin@example.org"}}) || strings.Contains(e.out.String(), "tok-not-to-be-printed") {
 		t.Errorf("%v %+v\n%s", err, st.Values, e.out)
+	}
+	// The pull Secret holding a run's login: pull_login, never the login.
+	e.f.pull = heldPullSecret(registryHost(e.prefix), "inst-1", loginPassword, true)
+	e.out.Reset()
+	if err := in.K8sStatusJSON(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(e.out.Bytes(), &st); err != nil || st.Values == nil || !st.Values.PullLogin || st.Values.PullLoginError != "" || strings.Contains(e.out.String(), loginPassword) {
+		t.Errorf("a login held: %v %+v\n%s", err, st.Values, e.out)
+	}
+	// The pull Secret unread (kubectl failing), or its login not parsing: pull_login false, and
+	// pull_login_error says why, never the login.
+	labels := map[string]string{"app.kubernetes.io/managed-by": "stowage", "app.kubernetes.io/part-of": "notes", "app.kubernetes.io/instance": "notes", pullLoginLabel: pullLoginByRun}
+	broken, _ := json.Marshal(map[string]any{"metadata": map[string]any{"labels": labels},
+		"data": map[string][]byte{".dockerconfigjson": []byte(`{"auths":` + loginPassword)}})
+	for name, c := range map[string]struct {
+		set  func()
+		want string
+	}{
+		"unread":  {func() { e.f.pullErr = errors.New("the API server is down") }, "the pull Secret notes-stowage-pull cannot be read: "},
+		"garbled": {func() { e.f.pull = string(broken) }, "the pull Secret notes-stowage-pull holds a login that does not parse: "},
+	} {
+		c.set()
+		e.out.Reset()
+		if err := in.K8sStatusJSON(context.Background()); err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		st = K8sReleaseStatus{}
+		if err := json.Unmarshal(e.out.Bytes(), &st); err != nil || st.Values == nil || st.Values.PullLogin || !strings.HasPrefix(st.Values.PullLoginError, c.want) ||
+			strings.Contains(e.out.String(), loginPassword) {
+			t.Errorf("%s: %v %+v\n%s", name, err, st.Values, e.out)
+		}
 	}
 }

@@ -24,7 +24,6 @@ import (
 
 	"github.com/google/go-containerregistry/pkg/authn"
 	ggcrregistry "github.com/google/go-containerregistry/pkg/registry"
-	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/mutate"
 	"github.com/google/go-containerregistry/pkg/v1/random"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
@@ -467,10 +466,18 @@ func (e *kubeEnv) at(version string, revision int, mod func(*spec.Spec)) *Releas
 	return r
 }
 
+// tools are the k8s verbs' tools on e's fake cluster. A Job runs the installer image as it is:
+// ctlDigest names none in the registry (TestAJobRunsTheInstallerIndexsTargetImage reads a real
+// one).
+func (e *kubeEnv) tools() K8sOptions {
+	return K8sOptions{Helm: kubeTool{e.f, "helm"}, Kubectl: kubeTool{e.f, "kubectl"}, JobImage: asIs}
+}
+
 func (e *kubeEnv) installer(mod func(*Options)) *Installer {
 	// The provision hook does not run unless a test asks for it (hookRuns).
 	o := Options{Dir: e.dir, Out: e.out, Log: e.log, Getenv: func(k string) string { return e.vars[k] }, NoProvision: true,
-		K8s: K8sOptions{Namespace: "notes", Release: "notes", Timeout: 10 * time.Minute, Helm: kubeTool{e.f, "helm"}, Kubectl: kubeTool{e.f, "kubectl"}}}
+		K8s: e.tools()}
+	o.K8s.Namespace, o.K8s.Release, o.K8s.Timeout = "notes", "notes", 10*time.Minute
 	if mod != nil {
 		mod(&o)
 	}
@@ -1388,9 +1395,13 @@ func TestK8sRollbackChecksTheSchema(t *testing.T) {
 			// 0.9.0's api image, labelled as the case says, in its published release manifest.
 			cl := registry.New(authn.NewMultiKeychain())
 			img, _ := random.Image(64, 1)
+			cf, _ := img.ConfigFile()
+			cf = cf.DeepCopy()
+			cf.OS, cf.Architecture = "linux", "amd64" // the platform a release runs on
 			if c.label != "" {
-				img, _ = mutate.Config(img, v1.Config{Labels: map[string]string{"com.example.reads-newer": c.label}})
+				cf.Config.Labels = map[string]string{"com.example.reads-newer": c.label}
 			}
+			img, _ = mutate.ConfigFile(img, cf)
 			h, _ := img.Digest()
 			ref, _ := cl.Digest(e.prefix+"/notes-api", h.String())
 			if err := remote.Write(ref, img); err != nil {

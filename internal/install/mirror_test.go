@@ -806,3 +806,20 @@ func TestMirrorExportCarriesOnlyASignedYank(t *testing.T) {
 		t.Errorf("a signed yank not carried: %v", got)
 	}
 }
+
+// An export reads the referrers of each image of the installer's index (each signed and attested
+// on its own), and of no other entry's images.
+func TestAMirrorExportCarriesTheInstallerImagesReferrers(t *testing.T) {
+	t.Parallel()
+	m := &release.Manifest{Tag: "1.0.0", Artifacts: release.Artifacts{Images: map[string]string{"api": "sha256:a"}, Installer: "sha256:1",
+		Chart: &release.Chart{Repository: "charts/notes-stable", Version: "0.1.0", Digest: "sha256:c"}, OS: "sha256:0"}}
+	var children []string
+	for _, e := range artifactEntries("notes", m, map[string]bool{"kubernetes": true, "kairos": true}) {
+		if e.Children {
+			children = append(children, e.Repo+"@"+e.Digest)
+		}
+	}
+	if len(children) != 1 || children[0] != "notes-installer@sha256:1" {
+		t.Errorf("entries whose images' referrers go with them: %v", children)
+	}
+}

@@ -195,14 +195,14 @@ func TestTheFrontsPortsServedFirstAreCheckedFree(t *testing.T) {
 	}
 }
 
-// A cloud module's firewall opens the front's ports something serves on in the mode vm create
-// gives, both when it gives none (the VM's install may take any).
-func TestTheModulesPortsAreWhatServesOnThem(t *testing.T) {
+// The seed's firewall opens the front's ports something serves on in the mode vm seed is given,
+// both when it is given none (the VM's install may take any).
+func TestTheSeedsPortsAreWhatServesOnThem(t *testing.T) {
 	t.Parallel()
 	in := &Installer{R: testRelease(t, "1.0.0")}
 	f, l4 := l4OnlyFront()
 	in.R.Spec.Front, in.R.Spec.L4.Routes = f, l4
-	ports := func(mode string) []modulePort { return in.openedPorts(&Settings{TLS: mode}) }
+	ports := func(mode string) []SeedPort { return in.openedPorts(&Settings{TLS: mode}) }
 	if got := ports("internal"); len(got) != 1 || got[0].Port != 7443 {
 		t.Errorf("internal: %v", got)
 	}
@@ -214,13 +214,13 @@ func TestTheModulesPortsAreWhatServesOnThem(t *testing.T) {
 	}
 }
 
-// An L4 route's port is opened to what its allowlist holds as vm create gives it: the value given,
+// An L4 route's port is opened to what its allowlist holds as vm seed is given it: the value given,
 // each address a prefix of its own, else the input's default; none for an empty list (the VM's
 // firewall refuses every source then), as the VM's firewall reads it (an IPv4-mapped address as
 // IPv4, host bits masked, one another holds left out); every source for
 // a route without a list, one the front terminates TLS on (the front filters its port; in
-// loopback mode it is not opened), and a secret list, which vm create is not given.
-func TestTheModulesPortsTakeTheRoutesAllowlists(t *testing.T) {
+// loopback mode it is not opened), and a secret list, which vm seed is not given.
+func TestTheSeedsPortsTakeTheRoutesAllowlists(t *testing.T) {
 	t.Parallel()
 	in := &Installer{R: testRelease(t, "1.0.0")}
 	in.R.Spec.Front = spec.Front{}

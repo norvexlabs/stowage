@@ -2,73 +2,136 @@ package publish
 
 import (
 	"archive/tar"
+	"bytes"
+	"compress/gzip"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
+	"fmt"
 	"io"
+	"io/fs"
+	"maps"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"testing/fstest"
 
 	"github.com/google/go-containerregistry/pkg/name"
+	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
+	"github.com/google/go-containerregistry/pkg/v1/types"
 
+	"github.com/norvexlabs/stowage/internal/installerbin"
 	"github.com/norvexlabs/stowage/internal/payload"
 	"github.com/norvexlabs/stowage/internal/release"
 	"github.com/norvexlabs/stowage/internal/testutil"
 )
 
-// installerAt reads the installer image under tag, whose one file must be ctl: its entrypoint and
-// command, and the payload the file carries.
+// installerAt reads the installer index under tag: one image per platform, in installerbin's
+// order, each holding one file, ctl, its platform's executable with the release appended. It
+// returns the target image's entrypoint and command, and the payload every image carries.
 func (e *env) installerAt(tag, ctl string) (entry, cmd []string, files payload.Files) {
 	e.t.Helper()
 	ref, _ := name.NewTag(e.host + "/acme/notes/notes-installer:" + tag)
-	img, err := remote.Image(ref)
+	idx, err := remote.Index(ref)
 	if err != nil {
 		e.t.Fatal(err)
 	}
-	cf, err := img.ConfigFile()
+	im, err := idx.IndexManifest()
 	if err != nil {
 		e.t.Fatal(err)
 	}
-	if cf.OS != "linux" || cf.Architecture != "amd64" {
-		e.t.Fatalf("installer platform %s/%s", cf.OS, cf.Architecture)
+	if im.MediaType != types.OCIImageIndex || len(im.Manifests) != len(installerbin.Platforms) {
+		e.t.Fatalf("the installer is a %s of %d manifests, not an OCI index of one image per platform", im.MediaType, len(im.Manifests))
 	}
-	layers, err := img.Layers()
-	if err != nil || len(layers) != 1 {
-		e.t.Fatalf("installer layers: %d %v", len(layers), err)
+	set := testInstallers(e.installer)
+	for i, pl := range installerbin.Platforms {
+		d := im.Manifests[i]
+		if d.Platform == nil || d.Platform.String() != pl || d.MediaType != types.OCIManifestSchema1 {
+			e.t.Fatalf("installer entry %d: %s %v, want an image for %s", i, d.MediaType, d.Platform, pl)
+		}
+		img, err := idx.Image(d.Digest)
+		if err != nil {
+			e.t.Fatal(err)
+		}
+		cf, err := img.ConfigFile()
+		if err != nil {
+			e.t.Fatal(err)
+		}
+		if cf.OS+"/"+cf.Architecture != pl {
+			e.t.Fatalf("installer %s: its config says %s/%s", pl, cf.OS, cf.Architecture)
+		}
+		layers, err := img.Layers()
+		if err != nil || len(layers) != 1 {
+			e.t.Fatalf("installer %s layers: %d %v", pl, len(layers), err)
+		}
+		rc, err := layers[0].Uncompressed()
+		if err != nil {
+			e.t.Fatal(err)
+		}
+		tr := tar.NewReader(rc)
+		h, err := tr.Next()
+		if err != nil {
+			e.t.Fatal(err)
+		}
+		if h.Name != ctl || h.Mode != 0o755 {
+			e.t.Fatalf("installer %s file %s %o", pl, h.Name, h.Mode)
+		}
+		exe := filepath.Join(e.t.TempDir(), ctl)
+		b, err := io.ReadAll(tr)
+		if err != nil {
+			e.t.Fatal(err)
+		}
+		if _, err := tr.Next(); err != io.EOF {
+			e.t.Fatalf("the installer %s layer holds more than one file: %v", pl, err)
+		}
+		rc.Close()
+		if err := os.WriteFile(exe, b, 0o600); err != nil {
+			e.t.Fatal(err)
+		}
+		want, err := set[pl].Executable()
+		if err != nil {
+			e.t.Fatal(err)
+		}
+		if !strings.HasPrefix(string(b), string(want)) {
+			e.t.Fatalf("the installer %s file does not start with its platform's executable", pl)
+		}
+		got, err := payload.Read(exe)
+		if err != nil {
+			e.t.Fatal(err)
+		}
+		// Every image carries the same payload; the target's is returned.
+		if pl == installerbin.Target {
+			entry, cmd, files = cf.Config.Entrypoint, cf.Config.Cmd, got
+		} else if !maps.EqualFunc(got, files, bytes.Equal) {
+			e.t.Fatalf("the installer %s carries another payload than %s's", pl, installerbin.Target)
+		}
 	}
-	rc, err := layers[0].Uncompressed()
+	return entry, cmd, files
+}
+
+// installerImages are the images of the installer index inst, by platform.
+func (e *env) installerImages(inst string) map[string]string {
+	e.t.Helper()
+	ref, err := name.NewDigest(e.host + "/acme/notes/notes-installer@" + inst)
 	if err != nil {
 		e.t.Fatal(err)
 	}
-	defer rc.Close()
-	tr := tar.NewReader(rc)
-	h, err := tr.Next()
+	idx, err := remote.Index(ref)
 	if err != nil {
 		e.t.Fatal(err)
 	}
-	if h.Name != ctl || h.Mode != 0o755 {
-		e.t.Fatalf("installer file %s %o", h.Name, h.Mode)
-	}
-	exe := filepath.Join(e.t.TempDir(), ctl)
-	b, err := io.ReadAll(tr)
+	im, err := idx.IndexManifest()
 	if err != nil {
 		e.t.Fatal(err)
 	}
-	if _, err := tr.Next(); err != io.EOF {
-		e.t.Fatalf("the installer layer holds more than one file: %v", err)
+	out := map[string]string{}
+	for _, m := range im.Manifests {
+		out[m.Platform.String()] = m.Digest.String()
 	}
-	if err := os.WriteFile(exe, b, 0o600); err != nil {
-		e.t.Fatal(err)
-	}
-	if !strings.HasPrefix(string(b), string(e.installer)) {
-		e.t.Fatal("the installer file does not start with the installer executable")
-	}
-	if files, err = payload.Read(exe); err != nil {
-		e.t.Fatal(err)
-	}
-	return cf.Config.Entrypoint, cf.Config.Cmd, files
+	return out
 }
 
 func TestTheShortNameNamesTheInstaller(t *testing.T) {
@@ -128,6 +191,230 @@ func TestShipPublishesTheInstallerWithTheRelease(t *testing.T) {
 	eq(t, "the same release makes the same installer", again.Manifest.Artifacts.Installer, inst)
 	if strings.Contains(e.log.String(), "installer:") {
 		t.Fatalf("a re-ship wrote the installer:\n%s", e.log)
+	}
+}
+
+// The installer index of a release made again is the one made last, not built anew; one of
+// another release, or of other executables, is made.
+func TestTheSameInstallerIndexIsMadeOnce(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	r := e.mustShip("stable", 1)
+	p, _ := e.publisher()
+	first, err := p.installerIndex(r.Manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again, err := p.installerIndex(r.Manifest); err != nil || again != first {
+		t.Fatalf("made again: %v", err)
+	}
+	h, err := first.Digest()
+	if err != nil || h.String() != r.Manifest.Artifacts.Installer {
+		t.Fatalf("the index made is %s, the release's %s (%v)", h, r.Manifest.Artifacts.Installer, err)
+	}
+	other := *r.Manifest
+	other.Tag = "1.0.1"
+	if idx, err := p.installerIndex(&other); err != nil || idx == first {
+		t.Fatalf("another release's: %v", err)
+	}
+	if _, err := p.installerIndex(r.Manifest); err != nil {
+		t.Fatal(err)
+	}
+	p.Installer = testInstallers([]byte("#!/bin/sh\necho other\n"))
+	idx, err := p.installerIndex(r.Manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d, _ := idx.Digest(); d == h {
+		t.Fatal("other executables made the index of the first")
+	}
+}
+
+// An installer index made from embedded installers keeps no executable: each image's layer's tar
+// is streamed from its compressed installer on each read; the index made once keeps its digests
+// and its compressed stream alone.
+func TestTheInstallerIndexKeepsNoExecutable(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	r := e.mustShip("stable", 1)
+	files := embeddedFiles(t, testInstallers(e.installer))
+	set, err := installerbin.Read(files)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, _ := e.publisher()
+	p.Installer = set
+	idx, err := p.installerIndex(r.Manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h, err := idx.Digest(); err != nil || h.String() != r.Manifest.Artifacts.Installer {
+		t.Fatalf("the index streamed is %s, the release's %s (%v)", h, r.Manifest.Artifacts.Installer, err)
+	}
+	for pl := range set {
+		delete(files, installerbin.File(pl))
+	}
+	again, err := p.installerIndex(r.Manifest)
+	if err != nil || again != idx {
+		t.Fatalf("made again: %v", err)
+	}
+	im, err := idx.IndexManifest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, d := range im.Manifests {
+		img, err := idx.Image(d.Digest)
+		if err != nil {
+			t.Fatal(err)
+		}
+		layers, err := img.Layers()
+		if err != nil || len(layers) != 1 {
+			t.Fatalf("%s: %d layers %v", d.Platform, len(layers), err)
+		}
+		rc, err := layers[0].Uncompressed()
+		if err == nil {
+			_, err = io.Copy(io.Discard, rc)
+			rc.Close()
+		}
+		if err == nil {
+			t.Fatalf("the %s layer's tar was read without its compressed installer: it is kept", d.Platform)
+		}
+	}
+}
+
+// embeddedFiles is set as a release build embeds it: each executable gzip-compressed (File) with
+// its sha256 (SumFile) and its size (SizeFile).
+func embeddedFiles(t *testing.T, set installerbin.Set) fstest.MapFS {
+	t.Helper()
+	files := fstest.MapFS{}
+	for pl, inst := range set {
+		exe, err := inst.Executable()
+		if err != nil {
+			t.Fatal(err)
+		}
+		var buf bytes.Buffer
+		zw := gzip.NewWriter(&buf)
+		if _, err := zw.Write(exe); err != nil {
+			t.Fatal(err)
+		}
+		if err := zw.Close(); err != nil {
+			t.Fatal(err)
+		}
+		files[installerbin.File(pl)] = &fstest.MapFile{Data: buf.Bytes()}
+		files[installerbin.SumFile(pl)] = &fstest.MapFile{Data: fmt.Appendf(nil, "%x", sha256.Sum256(exe))}
+		files[installerbin.SizeFile(pl)] = &fstest.MapFile{Data: fmt.Appendf(nil, "%d", len(exe))}
+	}
+	return files
+}
+
+// countingFS counts the opens of each of its files.
+type countingFS struct {
+	fs.FS
+	mu    sync.Mutex
+	opens map[string]int
+}
+
+func (c *countingFS) Open(n string) (fs.File, error) {
+	c.mu.Lock()
+	c.opens[n]++
+	c.mu.Unlock()
+	return c.FS.Open(n)
+}
+
+func (c *countingFS) count(n string) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.opens[n]
+}
+
+// An installer image's layer is read and compressed once per run for one content, which makes its
+// digests and the bytes its push sends: each executable is streamed, never kept. A ship of a new
+// release reads each executable twice: its check before anything is written, and that pass.
+func TestAnInstallerLayerIsReadAndCompressedOncePerRun(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	ctx := context.Background()
+	r := e.mustShip("stable", 1)
+	files := &countingFS{FS: embeddedFiles(t, testInstallers(e.installer)), opens: map[string]int{}}
+	set, err := installerbin.Read(files)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, _ := e.publisher()
+	p.Installer = set
+	extra := map[string]int{} // reads beside the installer's, by platform
+	step := func(what string, want int, f func() error) {
+		t.Helper()
+		before := map[string]int{}
+		for _, pl := range installerbin.Platforms {
+			before[pl] = files.count(installerbin.File(pl))
+		}
+		if err := f(); err != nil {
+			t.Fatalf("%s: %v", what, err)
+		}
+		for _, pl := range installerbin.Platforms {
+			if n := files.count(installerbin.File(pl)) - before[pl]; n != want+extra[pl] {
+				t.Errorf("%s: the %s executable read %d times, want %d", what, pl, n, want+extra[pl])
+			}
+		}
+	}
+	idx := func(m *release.Manifest) (v1.ImageIndex, error) { return p.installerIndex(m) }
+	// Its digests in one pass: its size is the one its build recorded.
+	step("the release's index made", 1, func() error { _, err := idx(r.Manifest); return err })
+	other := *r.Manifest
+	other.Tag = "1.0.1"
+	var made v1.ImageIndex
+	step("another release's index made", 1, func() (err error) { made, err = idx(&other); return err })
+	step("the first index made again", 0, func() error { _, err := idx(r.Manifest); return err })
+	step("another release's index pushed", 0, func() error { _, err := p.pushInstaller(ctx, made); return err })
+	step("pushed again", 0, func() error { _, err := p.pushInstaller(ctx, made); return err })
+	e.bump("1.1.0")
+	p, v := e.publisher()
+	p.Installer = set
+	extra[installerbin.Target] = 1 // the OS bundle's <short>-stow
+	step("a new release shipped", 2, func() error {
+		_, err := p.Ship(ctx, ShipOptions{Version: v, Channel: "stable", Revision: 1})
+		return err
+	})
+}
+
+// The payload the index's key hashes is the one each image ships, byte for byte.
+func TestTheInstallerKeyHashesThePayloadShipped(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	r := e.mustShip("stable", 1)
+	ref, _ := name.NewTag(e.host + "/acme/notes/notes-installer:1.0.0")
+	img, err := remote.Image(ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	layers, err := img.Layers()
+	if err != nil || len(layers) != 1 {
+		t.Fatalf("%d layers %v", len(layers), err)
+	}
+	rc, err := layers[0].Uncompressed()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rc.Close()
+	tr := tar.NewReader(rc)
+	if _, err := tr.Next(); err != nil {
+		t.Fatal(err)
+	}
+	file, err := io.ReadAll(tr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	shipped, ok := bytes.CutPrefix(file, e.installer)
+	if !ok {
+		t.Fatal("the target image's file does not start with its executable")
+	}
+	p, _ := e.publisher()
+	if _, err := p.installerIndex(r.Manifest); err != nil {
+		t.Fatal(err)
+	}
+	if p.lastIndex.key != installerKey(shipped, p.Installer) {
+		t.Fatal("the index's key hashes another payload than the one its images ship")
 	}
 }
 

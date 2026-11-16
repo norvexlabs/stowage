@@ -48,10 +48,10 @@ e2e-k8s: build     ## the Kubernetes shape end to end on a kind cluster: install
 e2e-kairos: build  ## the Kairos VM shape's publication: OS bundle and disk images built for real, ship, promote, prune (needs Docker + network, ~30 GB)
 	bash test/e2e-kairos.sh
 
-e2e-vm: build      ## a real Kairos VM on TrueNAS: vm create with OpenTofu, first-boot install, the app socket, vm destroy (needs STOWAGE_VM_ENV=<file>, tofu, ssh)
+e2e-vm: build      ## a real Kairos VM on TrueNAS: vm seed and the suite's OpenTofu root, first-boot install, the app socket, tofu destroy (needs STOWAGE_VM_ENV=<file>, tofu, genisoimage, ssh)
 	bash test/e2e-vm.sh
 
-e2e-full-vm: build ## examples/full on a real Kairos VM on TrueNAS: vm create from a TLS mirror, the search extension's input set, upgrade, rollback (needs STOWAGE_VM_ENV=<file>, tofu, ssh)
+e2e-full-vm: build ## examples/full on bare metal a TrueNAS VM plays: its installer ISO from a mirror (vm seed + the suite's OpenTofu root), a secret input given over SSH, the hook, the published CA (needs STOWAGE_VM_ENV=<file>, tofu, genisoimage, ssh)
 	bash test/e2e-full-vm.sh
 
 gate:             ## the commit gate: check, build, lint, then only the end-to-end suites the change can affect (test/gate.sh)

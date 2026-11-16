@@ -20,6 +20,7 @@ import (
 	"github.com/google/go-containerregistry/pkg/v1/types"
 
 	"github.com/norvexlabs/stowage/internal/graph"
+	"github.com/norvexlabs/stowage/internal/installerbin"
 	"github.com/norvexlabs/stowage/internal/kairos"
 	"github.com/norvexlabs/stowage/internal/payload"
 	"github.com/norvexlabs/stowage/internal/providers"
@@ -171,7 +172,7 @@ func (p *Publisher) planOS(ctx context.Context, o ShipOptions, disks bool, tag s
 	if err := p.ensureSigned(ctx, osRef); err != nil {
 		return nil, fmt.Errorf("os bundle: %w", err)
 	}
-	if err := p.ensureSBOM(ctx, osRef); err != nil {
+	if err := p.ensureSBOM(ctx, osRef, sbom.Platform); err != nil {
 		return nil, fmt.Errorf("os bundle: %w", err)
 	}
 
@@ -216,7 +217,7 @@ func (p *Publisher) planOS(ctx context.Context, o ShipOptions, disks bool, tag s
 		if err := p.ensureSigned(ctx, d); err != nil {
 			return nil, fmt.Errorf("%s: %w", a.what, err)
 		}
-		if err := p.ensureDiskSBOM(ctx, d, osRef); err != nil {
+		if err := p.ensureSBOMOf(ctx, d, osRef, "its bundle"); err != nil {
 			return nil, fmt.Errorf("%s: %w", a.what, err)
 		}
 	}
@@ -345,8 +346,12 @@ func (p *Publisher) bundledCtl(o ShipOptions, key string, images, configs, manif
 	if err != nil {
 		return nil, err
 	}
+	target, err := p.Installer[installerbin.Target].Executable()
+	if err != nil {
+		return nil, err
+	}
 	var exe bytes.Buffer
-	if err := payload.Write(&exe, bytes.NewReader(p.Installer), files); err != nil {
+	if err := payload.Write(&exe, bytes.NewReader(target), files); err != nil {
 		return nil, err
 	}
 	return exe.Bytes(), nil

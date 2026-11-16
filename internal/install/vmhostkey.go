@@ -16,7 +16,7 @@ type VMHostKey struct {
 	Format int `json:"format"` // MachineFormat
 	// PublicKey is the VM's own key ("ssh-ed25519 <base64>"), Fingerprint its SHA256 as ssh prints
 	// it; KnownHostsLine the key as a known_hosts line, under the host name the run checked the VM
-	// by (the --known-hosts-line's, else the address; on the VM itself, its host name), absent
+	// by (the --known-hosts-line's; on the VM itself, its host name), absent
 	// when that name cannot sit in one (Note says why).
 	PublicKey      string `json:"public_key"`
 	KnownHostsLine string `json:"known_hosts_line,omitempty"`
@@ -33,10 +33,10 @@ type VMHostKey struct {
 var errNotReloaded = errors.New("the seed's one-time host key's files are gone, but sshd did not reload: it may serve that key until it does; `sudo systemctl reload ssh` (or reboot the VM), then run host-key again")
 
 // HostKey reads the VM r names's own ed25519 host key over SSH, checked against the key r gives
-// (--known-hosts-line: a seed's line, or the VM's own), else the one vm create recorded, and
-// retires the one-time key: from then on the VM serves its own alone. With vm create's record,
-// the record becomes the VM's own key. Run again, it changes nothing more, through the VM's own
-// key. A VM answering from its recovery or live system is refused, the one-time key kept. Its
+// (--known-hosts-line: a seed's line, or the VM's own), and retires the one-time key: from then on
+// the VM serves its own alone. It records nothing here: the key it returns, as a known_hosts line
+// under the line's host name, is the caller's to keep. Run again, it changes nothing more, through
+// the VM's own key. A VM answering from its recovery or live system is refused, the one-time key kept. Its
 // reach's errors, and a VM that answers no SSH, are refusals: nothing changed.
 func (in *Installer) HostKey(ctx context.Context, r VMReach) (*VMHostKey, error) {
 	l, err := in.link(r)
@@ -55,11 +55,6 @@ func (in *Installer) HostKey(ctx context.Context, r VMReach) (*VMHostKey, error)
 	k, err := hostKeyFrom(out, l.alias, r.Host+": ", "")
 	if err != nil {
 		return nil, err
-	}
-	if r.KnownHostsLine == "" && k.KnownHostsLine != "" { // vm create's record (link read it): the VM's own key from now on
-		if err := writeAtomic(l.known, strings.NewReader(k.KnownHostsLine+"\n"), 0o600, nil); err != nil {
-			return nil, err
-		}
 	}
 	if !k.Retired {
 		return k, errNotReloaded

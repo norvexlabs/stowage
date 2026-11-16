@@ -20,6 +20,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -32,6 +33,7 @@ import (
 	"github.com/google/go-containerregistry/pkg/v1/mutate"
 	"github.com/google/go-containerregistry/pkg/v1/random"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
+	"github.com/google/go-containerregistry/pkg/v1/types"
 )
 
 // referrers serves a registry with the Referrers API.
@@ -64,17 +66,30 @@ func published(t *testing.T, c *Client, prefix string) ([]Entry, v1.Hash) {
 	// A referrer: an artifact manifest whose subject is the index.
 	isz, _ := idx.Size()
 	imt, _ := idx.MediaType()
-	sig := Manifest{ArtifactType: kind, Config: Blob{MediaType: EmptyMediaType, Data: []byte("{}")}, Layers: []Blob{{MediaType: kind, Data: []byte(`{"sig":1}`)}}}
+	repo, _ := c.Repo(prefix + "/notes-api")
+	sh := refer(t, c, repo, v1.Descriptor{MediaType: imt, Digest: ih, Size: isz}, `{"sig":1}`)
+	return []Entry{
+		{Repo: "notes-api", Tag: "beta-1.0.0", Digest: ih.String()},
+		{Repo: "notes-release", Tag: "beta-1.0.0", Digest: rh.String()},
+		{Repo: "notes-release", Tag: "beta", Digest: rh.String()},
+	}, sh
+}
+
+// refer pushes into repo a signature-like referrer of subject, an artifact manifest holding data,
+// and returns its digest.
+func refer(t *testing.T, c *Client, repo name.Repository, subject v1.Descriptor, data string) v1.Hash {
+	t.Helper()
+	ctx := context.Background()
+	sig := Manifest{ArtifactType: kind, Config: Blob{MediaType: EmptyMediaType, Data: []byte("{}")}, Layers: []Blob{{MediaType: kind, Data: []byte(data)}}}
 	body, _, err := sig.Body()
 	if err != nil {
 		t.Fatal(err)
 	}
 	var raw map[string]any
 	_ = json.Unmarshal(body, &raw)
-	raw["subject"] = v1.Descriptor{MediaType: imt, Digest: ih, Size: isz}
+	raw["subject"] = subject
 	raw["annotations"] = map[string]string{"dev.sigstore.bundle.predicateType": "p"}
 	body, _ = json.Marshal(raw)
-	repo, _ := c.Repo(prefix + "/notes-api")
 	for _, bl := range append([]Blob{sig.Config}, sig.Layers...) {
 		if err := remote.WriteLayer(repo, bl.layer(), c.opts(ctx)...); err != nil {
 			t.Fatal(err)
@@ -84,11 +99,83 @@ func published(t *testing.T, c *Client, prefix string) ([]Entry, v1.Hash) {
 	if err := remote.Put(repo.Digest(sh.String()), rawManifest{body, "application/vnd.oci.image.manifest.v1+json"}, c.opts(ctx)...); err != nil {
 		t.Fatal(err)
 	}
-	return []Entry{
-		{Repo: "notes-api", Tag: "beta-1.0.0", Digest: ih.String()},
-		{Repo: "notes-release", Tag: "beta-1.0.0", Digest: rh.String()},
-		{Repo: "notes-release", Tag: "beta", Digest: rh.String()},
-	}, sh
+	return sh
+}
+
+// Each image of the installer's index is signed and attested on its own digest: an export of it
+// (Children) carries the referrers of the index and of every image it names, and an import puts
+// each back on its subject.
+func TestExportCarriesTheReferrersOfAnIndexsImages(t *testing.T) {
+	src, dst := referrers(t), referrers(t)
+	c := New(authn.DefaultKeychain)
+	ctx := context.Background()
+	repo, _ := c.Repo(src + "/p/notes-installer")
+	amd, _ := random.Image(64, 1)
+	arm, _ := random.Image(64, 1)
+	idx := mutate.AppendManifests(empty.Index,
+		mutate.IndexAddendum{Add: amd, Descriptor: v1.Descriptor{Platform: &v1.Platform{OS: "linux", Architecture: "amd64"}}},
+		mutate.IndexAddendum{Add: arm, Descriptor: v1.Descriptor{Platform: &v1.Platform{OS: "linux", Architecture: "arm64"}}})
+	tag, _ := c.Tag(repo.String(), "1.0.0")
+	if err := c.WriteIndex(ctx, tag, idx); err != nil {
+		t.Fatal(err)
+	}
+	desc := func(m interface {
+		Digest() (v1.Hash, error)
+		Size() (int64, error)
+		MediaType() (types.MediaType, error)
+	}) v1.Descriptor {
+		h, _ := m.Digest()
+		sz, _ := m.Size()
+		mt, _ := m.MediaType()
+		return v1.Descriptor{MediaType: mt, Digest: h, Size: sz}
+	}
+	onIndex := refer(t, c, repo, desc(idx), `{"sig":"index"}`)
+	onArm := refer(t, c, repo, desc(arm), `{"sig":"arm64"}`)
+	ih, _ := idx.Digest()
+	// An index whose images are not signed on their own (an upstream image's) carries its own
+	// referrers alone: its images' are not read.
+	a, err := ReadArchive(export(t, c, src+"/p", []Entry{{Repo: "notes-installer", Tag: "1.0.0", Digest: ih.String()}}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var own []v1.Hash
+	for _, m := range a.Manifests {
+		own = append(own, m.Digest)
+	}
+	a.Close()
+	if !slices.Equal(own, []v1.Hash{ih, onIndex}) {
+		t.Fatalf("an index without Children: top level %v, want it and its own referrer", own)
+	}
+	a, err = ReadArchive(export(t, c, src+"/p", []Entry{{Repo: "notes-installer", Tag: "1.0.0", Digest: ih.String(), Children: true}}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	var top []v1.Hash
+	for _, m := range a.Manifests {
+		top = append(top, m.Digest)
+	}
+	if !slices.Equal(top, []v1.Hash{ih, onIndex, onArm}) {
+		t.Fatalf("top level %v, want the index and the referrers of the index and of its arm64 image", top)
+	}
+	if _, err := c.Import(ctx, a, dst+"/site", nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	for subject, want := range map[v1.Hash]v1.Hash{ih: onIndex, desc(arm).Digest: onArm} {
+		refs, err := c.Referrers(ctx, mustDigest(t, dst+"/site/notes-installer@"+subject.String()), kind)
+		if err != nil || len(refs) != 1 || refs[0].Digest != want {
+			t.Fatalf("the referrers of %s at the mirror: %v %v", subject, refs, err)
+		}
+	}
+}
+
+func mustDigest(t *testing.T, ref string) name.Digest {
+	t.Helper()
+	d, err := name.NewDigest(ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return d
 }
 
 func export(t *testing.T, c *Client, prefix string, entries []Entry) string {

@@ -264,19 +264,7 @@ func (in *Installer) MirrorExport(ctx context.Context, r MirrorExportRequest) er
 		return fmt.Errorf("%s: the channel's release has no tag of its own", tag)
 	}
 	d = hd.Digest
-	var entries []registry.Entry
-	for _, k := range sortedKeys(m.Artifacts.Images) {
-		entries = append(entries, registry.Entry{Repo: name + "-" + k, Tag: m.Tag, Digest: m.Artifacts.Images[k]})
-	}
-	if m.Artifacts.Installer != "" {
-		entries = append(entries, registry.Entry{Repo: name + "-installer", Tag: m.Tag, Digest: m.Artifacts.Installer})
-	}
-	if ch := m.Artifacts.Chart; ch != nil && shapes["kubernetes"] {
-		entries = append(entries, registry.Entry{Repo: ch.Repository, Tag: ch.Version, Digest: ch.Digest})
-	}
-	if m.Artifacts.OS != "" && shapes["kairos"] {
-		entries = append(entries, registry.Entry{Repo: name + "-os", Tag: m.Tag, Digest: m.Artifacts.OS})
-	}
+	entries := artifactEntries(name, m, shapes)
 	bootTag, disks := m.Artifacts.Boot(m.Tag)
 	all := sortedKeys(disks)
 	formats := r.Formats
@@ -342,6 +330,26 @@ func (in *Installer) MirrorExport(ctx context.Context, r MirrorExportRequest) er
 	}
 	fmt.Fprintf(o.Out, "Exported %s %s (revision %d, %s) to %s: %d manifests, %d blobs, %s\n", name, m.ProjectVersion, m.Revision, m.Tag, file, st.Manifests, st.Blobs, sizeOf(st.Bytes))
 	return nil
+}
+
+// artifactEntries are the archive entries of m's images, its installer, and its chart and OS
+// bundle when shapes has theirs; each image of the installer's index is signed and attested on
+// its own (Children).
+func artifactEntries(name string, m *release.Manifest, shapes map[string]bool) []registry.Entry {
+	var entries []registry.Entry
+	for _, k := range sortedKeys(m.Artifacts.Images) {
+		entries = append(entries, registry.Entry{Repo: name + "-" + k, Tag: m.Tag, Digest: m.Artifacts.Images[k]})
+	}
+	if m.Artifacts.Installer != "" {
+		entries = append(entries, registry.Entry{Repo: name + "-installer", Tag: m.Tag, Digest: m.Artifacts.Installer, Children: true})
+	}
+	if ch := m.Artifacts.Chart; ch != nil && shapes["kubernetes"] {
+		entries = append(entries, registry.Entry{Repo: ch.Repository, Tag: ch.Version, Digest: ch.Digest})
+	}
+	if m.Artifacts.OS != "" && shapes["kairos"] {
+		entries = append(entries, registry.Entry{Repo: name + "-os", Tag: m.Tag, Digest: m.Artifacts.OS})
+	}
+	return entries
 }
 
 // MirrorImport pushes an archive MirrorExport wrote into the registry under prefix (a mirror), with

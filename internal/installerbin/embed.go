@@ -2,9 +2,9 @@
 
 package installerbin
 
-import _ "embed"
+import "embed"
 
-//go:embed stowage-install
-var embedded []byte
+//go:embed stowage-install-*.gz stowage-install-*.sha256 stowage-install-*.size
+var files embed.FS
 
-func init() { Executable = embedded }
+func init() { embedded = files }

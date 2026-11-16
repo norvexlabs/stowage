@@ -18,7 +18,6 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/google/go-containerregistry/pkg/name"
 
@@ -27,7 +26,6 @@ import (
 	"github.com/norvexlabs/stowage/internal/registry"
 	"github.com/norvexlabs/stowage/internal/release"
 	"github.com/norvexlabs/stowage/internal/spec"
-	"github.com/norvexlabs/stowage/internal/truenas"
 	"github.com/norvexlabs/stowage/internal/tune"
 	"github.com/norvexlabs/stowage/internal/version"
 )
@@ -42,9 +40,6 @@ type Platform struct {
 	// Install: the disk is the installer ISO, which installs the OS on the machine's own disk
 	// (--device), the seed's install block saying which.
 	Install bool
-	// Tofu: `vm create` can create the VM with OpenTofu, with its built-in module (tofu/<Key>);
-	// Preview: that module has not run on the platform yet.
-	Tofu, Preview bool
 	// Steps are what the operator does with the files, in order; %[1]s is the disk file, %[2]s the
 	// seed (the ISO or the user-data file), %[3]d the disk's size in GiB (the OS's and the app's).
 	Steps []string
@@ -56,21 +51,21 @@ type Platform struct {
 
 // Platforms are the platforms `vm create` knows, in the order it offers them.
 var Platforms = []Platform{
-	{Key: "truenas", Console: "its display on TrueNAS", Label: "TrueNAS", Formats: []string{"qcow2", "raw"}, ISO: true, Tofu: true, Steps: []string{
+	{Key: "truenas", Console: "its display on TrueNAS", Label: "TrueNAS", Formats: []string{"qcow2", "raw"}, ISO: true, Steps: []string{
 		"Copy %[1]s and %[2]s to the TrueNAS host.",
 		"Create a zvol of %[3]d GiB, and write the disk into it: qemu-img convert -O raw %[1]s /dev/zvol/<pool>/<zvol>.",
 		"Create a VM with UEFI boot, that zvol as its disk (VirtIO) and %[2]s as its CD-ROM, then start it.",
 	}},
-	{Key: "proxmox", Console: "its console in Proxmox VE", Label: "Proxmox VE", Formats: []string{"qcow2", "raw"}, ISO: true, Tofu: true, Preview: true, Steps: []string{
+	{Key: "proxmox", Console: "its console in Proxmox VE", Label: "Proxmox VE", Formats: []string{"qcow2", "raw"}, ISO: true, Steps: []string{
 		"Copy %[1]s to the Proxmox host, and %[2]s to an ISO storage (e.g. /var/lib/vz/template/iso/).",
 		"Create a VM with OVMF (UEFI) firmware and no disk, then import the disk: qm disk import <vmid> %[1]s <storage>; attach it and grow it to %[3]d GiB.",
 		"Attach %[2]s as the VM's CD-ROM, make the disk the first boot device, then start it.",
 	}},
-	{Key: "libvirt", Console: "`virsh console` on the libvirt host", Label: "libvirt / KVM (virt-install, virt-manager)", Formats: []string{"qcow2", "raw"}, ISO: true, Tofu: true, Preview: true, Steps: []string{
+	{Key: "libvirt", Console: "`virsh console` on the libvirt host", Label: "libvirt / KVM (virt-install, virt-manager)", Formats: []string{"qcow2", "raw"}, ISO: true, Steps: []string{
 		"Grow the disk: qemu-img resize %[1]s %[3]dG.",
 		"virt-install --name <name> --memory 4096 --vcpus 2 --boot uefi --osinfo linux2022 --import --disk %[1]s --disk %[2]s,device=cdrom --network default --noautoconsole",
 	}},
-	{Key: "vmware", Console: "its console in vSphere or Workstation", Label: "VMware vSphere, ESXi or Workstation", Formats: []string{"ova"}, ISO: true, Tofu: true, Preview: true, Steps: []string{
+	{Key: "vmware", Console: "its console in vSphere or Workstation", Label: "VMware vSphere, ESXi or Workstation", Formats: []string{"ova"}, ISO: true, Steps: []string{
 		"Deploy %[1]s (Deploy OVF Template, or File > Open), and grow its disk to %[3]d GiB.",
 		"Upload %[2]s to a datastore and attach it as the VM's CD-ROM (connected at power on), then power the VM on.",
 	}},
@@ -83,19 +78,19 @@ var Platforms = []Platform{
 		"Plug both into the server and boot it from the first, in UEFI mode with Secure Boot off: the installer wipes the --device disk (at least %[3]d GiB), installs the OS on it and powers the server off.",
 		"Take both sticks out, then power the server on: its first boot installs the release.",
 	}},
-	{Key: "azure", Console: "its serial console in the Azure portal", Label: "Microsoft Azure", Formats: []string{"vhd"}, Tofu: true, Preview: true, UserDataMax: 64 << 10, Steps: []string{
+	{Key: "azure", Console: "its serial console in the Azure portal", Label: "Microsoft Azure", Formats: []string{"vhd"}, UserDataMax: 64 << 10, Steps: []string{
 		"Upload %[1]s as a page blob, and create a managed image from it (az image create --source <blob URL> --os-type Linux --hyper-v-generation V2).",
 		"Create the VM from that image with %[2]s as its custom data and a %[3]d GiB disk (az vm create --custom-data %[2]s --os-disk-size-gb %[3]d).",
 	}},
-	{Key: "gcp", Console: "its serial port output in the Google Cloud console", Label: "Google Cloud", Formats: []string{"gce"}, Tofu: true, Preview: true, Steps: []string{
+	{Key: "gcp", Console: "its serial port output in the Google Cloud console", Label: "Google Cloud", Formats: []string{"gce"}, Steps: []string{
 		"Upload %[1]s to a bucket, and create an image from it (gcloud compute images create --source-uri gs://<bucket>/<file> --guest-os-features UEFI_COMPATIBLE).",
 		"Create the instance from that image with %[2]s as its user-data and a %[3]d GiB disk (gcloud compute instances create --metadata-from-file user-data=%[2]s --boot-disk-size %[3]dGB).",
 	}},
-	{Key: "aws", Console: "its serial console or system log in the EC2 console", Label: "Amazon EC2", Formats: []string{"raw"}, Tofu: true, Preview: true, UserDataMax: 16 << 10, Steps: []string{
+	{Key: "aws", Console: "its serial console or system log in the EC2 console", Label: "Amazon EC2", Formats: []string{"raw"}, UserDataMax: 16 << 10, Steps: []string{
 		"Upload %[1]s to S3, import it as a snapshot (aws ec2 import-snapshot), and register an image from it (aws ec2 register-image --boot-mode uefi).",
 		"Launch the instance from that image with %[2]s as its user data and a %[3]d GiB root volume (aws ec2 run-instances --user-data file://%[2]s, the image's root device mapped to a volume of that size with --block-device-mappings).",
 	}},
-	{Key: "scaleway", Console: "the instance's Console tab in the Scaleway console", Label: "Scaleway", Formats: []string{"qcow2"}, Tofu: true, Preview: true, Steps: []string{
+	{Key: "scaleway", Console: "the instance's Console tab in the Scaleway console", Label: "Scaleway", Formats: []string{"qcow2"}, Steps: []string{
 		"Upload %[1]s to an Object Storage bucket in the instance's region, import it as a snapshot, and make an image of it (scw block snapshot import-from-object-storage bucket=<bucket> key=<key> name=<name>; scw instance image create snapshot-id=<snapshot id> arch=x86_64 name=<name>).",
 		"Create the instance from that image with %[2]s as its cloud-init user data and an SBS root volume of %[3]d GiB, which Scaleway counts in GB: %[3]d × 1.073741824, rounded up (scw instance server create type=PLAY2-NANO image=<image id> root-volume=sbs:<GB>GB cloud-init=@%[2]s).",
 	}},
@@ -136,12 +131,6 @@ type VMCreate struct {
 	// VM answers (`registry-login -`), never in the cloud-config.
 	RegistryLogin []byte
 	Progress      func(done, total int64) // the disk's download; nil reports nothing
-
-	Create string // CreateTofu or CreateManual; empty is asked where OpenTofu can create the VM
-	TofuVM
-	Host string        // OpenTofu: the name or address the VM answers at (default: its static address, else Hostname)
-	Wait time.Duration // OpenTofu: how long to wait for the VM to answer and install
-	Ctl  string        // this <short>-stow's path, which OpenTofu's steps run
 }
 
 // CreateVM writes what a new VM of this release needs: its disk image in the format its platform
@@ -174,35 +163,11 @@ func (in *Installer) CreateVM(ctx context.Context, c *VMCreate) error {
 	if err != nil {
 		return err
 	}
-	if c.Module != "" {
-		c.Module = expandHome(c.Module)
+	secrets := ""
+	if c.Secrets != nil {
+		secrets = "--secrets"
 	}
-	how, err := in.creation(ctx, p, c.Create, c.Module)
-	if err != nil {
-		return err
-	}
-	tofu := how == CreateTofu
-	if tofu {
-		if err := in.tofuReady(ctx, c.builtinTrueNAS(p)); err != nil {
-			return err
-		}
-		if p.Preview && c.Module == "" {
-			fmt.Fprintf(o.Out, "OpenTofu's %s module is a preview: it has not run on %s yet. If it fails, `%s vm destroy <host>` removes what it made, and `--create %s` writes the disk and the cloud-config and prints the steps by hand.\n",
-				p.Label, p.Label, in.R.Ctl(), CreateManual)
-		}
-		if c.Host != "" {
-			// An IPv6 address is taken bare, as ssh takes it.
-			c.Host = unbracket(c.Host)
-			if _, err := netip.ParseAddr(c.Host); err != nil {
-				if err := checkHostname(c.Host); err != nil {
-					return fmt.Errorf("--host: %w", err)
-				}
-			}
-		}
-	} else if c.Host != "" || c.Wait != 0 || c.Name != "" || c.Pool != "" || c.Dataset != "" || c.Bridge != "" || c.CPUs != 0 || c.MemoryMiB != 0 || c.DiskGiB != 0 || len(c.Vars) > 0 {
-		return fmt.Errorf("--host, --wait, --vm-name, --pool, --dataset, --bridge, --cpus, --memory, --disk and --tofu-var are for --create %s", CreateTofu)
-	}
-	mach, st, waiting, given, ca, err := in.seedSettings(ctx, c, p, prefix)
+	mach, st, waiting, given, ca, err := in.seedSettings(ctx, c, p, prefix, secrets)
 	if err != nil {
 		return err
 	}
@@ -211,104 +176,32 @@ func (in *Installer) CreateVM(ctx context.Context, c *VMCreate) error {
 	if p.ISO {
 		seed = filepath.Join(out, mach.Hostname+"-seed.iso")
 	}
-	var state, addr string
-	var files map[string][]byte
-	var declared []moduleVar
-	if tofu {
-		if files, declared, err = in.tofuVM(ctx, p, &c.TofuVM, mach.Hostname); err != nil {
-			return err
-		}
-		if len(mach.Interfaces) > 1 && !slices.ContainsFunc(declared, func(v moduleVar) bool { return v.Name == "nics" }) {
-			return fmt.Errorf("%s names %d NICs (host.interfaces), and the module declares no nics variable to attach them", in.R.Spec.Name, len(mach.Interfaces))
-		}
-		if state, err = o.stateDir(name, mach.Hostname); err != nil {
-			return err
-		}
-		// The state's lock, held for the whole run (its apply, the wait, the install over SSH):
-		// vm attach and vm destroy hold it too, and a second create of this host checks the
-		// state below only once the first wrote it.
-		if err := os.MkdirAll(filepath.Dir(state), 0o700); err != nil {
-			return err
-		}
-		unlock, err := lockFile(stateLock(state))
-		if errors.Is(err, errLocked) {
-			return fmt.Errorf("%s: another vm create, vm attach or vm destroy runs on it", mach.Hostname)
-		}
-		if err != nil {
-			return err
-		}
-		defer unlock()
-		// A VM of this host, or another of the same TrueNAS name, was applied (or tried to be):
-		// never applied over — its zvol is its data.
-		if _, err := os.Lstat(filepath.Join(state, varsFile)); err == nil {
-			return fmt.Errorf("%s exists: a VM %s was created before (`%s vm destroy %s` removes it), or give this one another --hostname", state, mach.Hostname, in.R.Ctl(), mach.Hostname)
-		}
-		// The platform name's lock too, for the whole run: another host's create of the same
-		// name writes its variables, which claimedBy reads, only once its disk is fetched.
-		nameUnlock, err := lockFile(nameLock(state, p.Key, c.Module == "", c.Name))
-		if errors.Is(err, errLocked) {
-			return fmt.Errorf("another vm create makes a VM named %s on %s now: give this one another --vm-name", c.Name, p.Key)
-		}
-		if err != nil {
-			return err
-		}
-		defer nameUnlock()
-		switch other, err := o.claimedBy(name, mach.Hostname, c.Name, p.Key, c.Module == ""); {
-		case err != nil:
-			return err
-		case other != "":
-			return fmt.Errorf("the VM %s, of host %s, is named %s on its platform already: give this one another --vm-name", other, other, c.Name)
-		}
-		if out, err = o.diskCache(name); err != nil {
-			return err
-		}
-		// One directory per disk: another release's disk of the same file name never meets it.
-		d := strings.TrimPrefix(boot.disks[format], "sha256:")
-		if len(d) != 64 {
-			return fmt.Errorf("the release's %s disk digest %q is not sha256", format, boot.disks[format])
-		}
-		out = filepath.Join(out, d[:16])
-		seed = filepath.Join(state, "user-data.yaml")
-		if p.ISO {
-			seed = filepath.Join(state, "seed.iso")
-		}
-		addr = cmp.Or(c.Host, mach.staticAddr(), mach.Hostname)
-		in.sshAllows(addr, mach)
-		if a6 := mach.staticAddr6(); c.Host == "" && a6 != "" {
-			in.sshAllows(a6, mach) // ssh to the VM's name may take it
-		}
-	} else if _, err := os.Lstat(seed); err == nil { // a seed may already be attached to a VM: never replaced
+	if _, err := os.Lstat(seed); err == nil { // a seed may already be attached to a VM: never replaced
 		return fmt.Errorf("%s exists: move it away, or give the VM another --hostname or --out", seed)
 	}
-	// Manual steps: the given material waits in a file of the operator's, beside the seed, and ssh
-	// reads its pin's path.
-	givenFile := filepath.Join(state, "given.yaml")
-	if !tofu {
-		// Absolute: the step is run later, from anywhere.
-		abs, err := filepath.Abs(out)
-		if err != nil {
-			return err
+	// The given material waits in a file of the operator's, beside the seed, and ssh reads its
+	// pin's path. Absolute: the step is run later, from anywhere.
+	abs, err := filepath.Abs(out)
+	if err != nil {
+		return err
+	}
+	givenFile := filepath.Join(abs, mach.Hostname+".given")
+	if given != nil {
+		if err := sshPathOK(abs); err != nil {
+			return fmt.Errorf("--out: %w", err)
 		}
-		givenFile = filepath.Join(abs, mach.Hostname+".given")
-		if given != nil {
-			if err := sshPathOK(abs); err != nil {
-				return fmt.Errorf("--out: %w", err)
-			}
-		}
-		for _, f := range []string{givenFile, givenFile + ".known_hosts"} {
-			if _, err := os.Lstat(f); given != nil && err == nil {
-				return fmt.Errorf("%s exists: move it away, or give the VM another --hostname or --out", f)
-			}
+	}
+	for _, f := range []string{givenFile, givenFile + ".known_hosts"} {
+		if _, err := os.Lstat(f); given != nil && err == nil {
+			return fmt.Errorf("%s exists: move it away, or give the VM another --hostname or --out", f)
 		}
 	}
 	givenPin := givenFile + ".known_hosts"
 	for _, a := range []string{mach.staticAddr(), mach.staticAddr6()} {
-		if !tofu && a != "" {
+		if a != "" {
 			in.sshAllows(a, mach)
 		}
 	}
-	// What is given goes over SSH to a host key known beforehand: one generated here, which the
-	// cloud-config carries and the VM serves until its install.
 	// What goes over SSH goes to the host key the cloud-config carries, never to a key taken on
 	// first sight. Made before the confirmation: a cloud-config past what the cloud takes is
 	// refused before the operator is asked to go on.
@@ -316,16 +209,11 @@ func (in *Installer) CreateVM(ctx context.Context, c *VMCreate) error {
 	if err != nil {
 		return err
 	}
-	if err := in.confirmVM(ctx, p, format, mach, st, given, seed, c, addr); err != nil {
+	if err := in.confirmVM(ctx, p, format, mach, st, given, seed); err != nil {
 		return err
 	}
 	if err := os.MkdirAll(out, 0o755); err != nil {
 		return err
-	}
-	if tofu {
-		if err := os.MkdirAll(state, 0o700); err != nil {
-			return err
-		}
 	}
 	ref, err := in.seedDisk(cl, prefix, format)
 	if err != nil {
@@ -342,7 +230,7 @@ func (in *Installer) CreateVM(ctx context.Context, c *VMCreate) error {
 		o.logf("fetching %s's %s disk (%s)", name, format, registry.Short(ref.DigestStr()))
 	}
 	fallback := fmt.Sprintf("%s-%s.%s", name, boot.release, format)
-	disk, layer, err := cl.Download(ctx, ref, release.DiskArtifactType, release.DiskMediaType(format), out, fallback, c.Progress)
+	disk, _, err := cl.Download(ctx, ref, release.DiskArtifactType, release.DiskMediaType(format), out, fallback, c.Progress)
 	if err != nil {
 		return err
 	}
@@ -359,137 +247,6 @@ func (in *Installer) CreateVM(ctx context.Context, c *VMCreate) error {
 		return err
 	}
 	ctl := in.R.Ctl()
-	if tofu {
-		// Written before a VM exists, so a VM never waits for what is lost; `vm destroy` removes it
-		// with the state, and a done install at once.
-		if given != nil {
-			if err := writeGiven(givenFile, givenPin, given, hostKey); err != nil {
-				return err
-			}
-		}
-		id, out, err := in.applyVM(ctx, state, c.Ctl, p, mach, st, &c.TofuVM, files, declared, disk, format, layer.Hex, seed)
-		if err != nil {
-			// A failure past the variables may leave a VM waiting, and `vm destroy` removes the file
-			// with the state. Before them no VM exists, and no `vm destroy` finds this state.
-			if given != nil {
-				if _, serr := os.Lstat(filepath.Join(state, varsFile)); errors.Is(serr, os.ErrNotExist) {
-					if rerr := errors.Join(os.Remove(givenFile), os.Remove(givenPin)); rerr != nil {
-						o.logf("warning: %v: it holds what the VM was to be given", rerr)
-					}
-				} else {
-					o.logf("%s holds what a VM made by this run waits for: `%s vm destroy %s` removes it", givenFile, ctl, mach.Hostname)
-				}
-			}
-			if _, serr := os.Lstat(filepath.Join(state, varsFile)); errors.Is(serr, os.ErrNotExist) {
-				err = fmt.Errorf("%w\n(no VM was made: `%s vm create` runs again with the same --hostname)", err, ctl)
-			} else {
-				err = fmt.Errorf("%w\n(the state is in %s: `%s vm create` again with the same --hostname is refused; `%s vm destroy %s` removes what was made)", err, state, ctl, ctl, mach.Hostname)
-			}
-			if p.Key == "libvirt" && c.Module == "" {
-				// The provider defines the domain, then starts it: a failed start leaves the domain
-				// defined, out of the state, where no destroy reaches it.
-				uri := c.Vars["uri"]
-				if uri == "" {
-					uri = "qemu:///system"
-				}
-				err = fmt.Errorf("%w\n(a domain libvirt defined before its start failed is not in the state: `virsh -c %s undefine %s --nvram` removes it)", err, uri, c.Name)
-			}
-			return err
-		}
-		o.logf("OpenTofu created the VM %s (%s)", c.Name, id)
-		// The address the platform gave, when nothing named one: a cloud's is known only now.
-		if out != "" && c.Host == "" && mach.staticAddr() == "" {
-			addr = out
-			in.sshAllows(addr, mach)
-		}
-		wait := 20 * time.Minute
-		if st.Release != nil {
-			wait = 40 * time.Minute // the first boot writes the release's OS bundle and reboots first
-		}
-		pin := ""
-		if given != nil {
-			pin = givenPin // writeGiven wrote it
-		} else if hostKey != nil {
-			pin = filepath.Join(state, "known_hosts.seed")
-			if err := writeAtomic(pin, strings.NewReader(seedHostAlias+" "+hostKey.Public+"\n"), 0o600, nil); err != nil {
-				return err
-			}
-		}
-		giveAgain := func() string {
-			return "this gives what `vm create` gave, then removes the file holding it: " + givenSteps(mach.User, addr, ctl, givenFile, givenPin, c.SSHKey) + "; " + givenRetired + " `" + ctl + " vm destroy " + mach.Hostname + "` removes the VM and that file. " + strings.TrimSpace(seedHostKeyNote(hostKey, addr))
-		}
-		if err := in.awaitVM(ctx, state, pin, mach.User, addr, c.SSHKey, cmp.Or(c.Wait, wait), len(waiting) == 0 && !st.AwaitSecrets, st.Release, p.Console); err != nil {
-			if given != nil {
-				return fmt.Errorf("%w; once it answers, %s", err, giveAgain())
-			}
-			return err
-		}
-		if login != nil {
-			o.logf("giving the VM its login to %s over SSH", login.Host)
-			raw, err := login.marshal()
-			if err != nil {
-				return err
-			}
-			args := pinnedSSHArgs(pin, mach.User, addr, c.SSHKey, "sudo", ctl, "registry-login", "-")
-			if _, err := o.SSH.Run(ctx, Cmd{Args: args, Stdin: bytes.NewReader(raw), Stream: o.Log}); err != nil {
-				then := ""
-				switch {
-				case given != nil:
-					then = "; then its install waits for what `vm create` gives: " + giveAgain() // it ends on the seed key's note
-				case st.AwaitSecrets && len(waiting) > 0:
-					then = fmt.Sprintf("; then its install waits for its secrets and %s: %s", strings.Join(waiting, ", "), secretsSteps(mach.User, addr, ctl))
-				case st.AwaitSecrets:
-					then = "; then its install waits for its secrets: " + secretsSteps(mach.User, addr, ctl)
-				case len(waiting) > 0:
-					then = fmt.Sprintf("; then its install waits for %s: ssh -t %s@%s sudo %s install", strings.Join(waiting, ", "), mach.User, addr, ctl)
-				}
-				note := ""
-				if n := strings.TrimSpace(seedHostKeyNote(hostKey, addr)); given == nil && n != "" {
-					note = ". " + n
-				}
-				return fmt.Errorf("giving the VM its login to %s over SSH: %w; the VM is kept: %s, then `ssh %s@%s %s status` says whether it holds it%s%s", login.Host, err, loginSteps(mach.User, addr, ctl), mach.User, addr, ctl, then, note)
-			}
-			// The last step over SSH retires the seed's one-time host key: the install's, when one
-			// follows.
-			if given == nil && !st.AwaitSecrets {
-				in.retireSeedHostKey(ctx, state, pin, mach, addr, c.SSHKey)
-			}
-		}
-		if given != nil {
-			raw, err := marshalGiven(given)
-			if err != nil {
-				return err
-			}
-			o.logf("installing over SSH with %s", given.names())
-			args := pinnedSSHArgs(pin, mach.User, addr, c.SSHKey, firstInstallOverSSH(name, ctl, "--given")...)
-			if _, err := o.SSH.Run(ctx, Cmd{Args: args, Stdin: bytes.NewReader(raw), Stream: o.Log}); err != nil {
-				return fmt.Errorf("the install over SSH: %w; the VM is kept: `ssh %s@%s %s status` tells where it stopped — %s", err, mach.User, addr, ctl, giveAgain())
-			}
-			if err := os.Remove(givenFile); err != nil {
-				o.logf("warning: %v: it holds what the install took", err)
-			}
-			in.retireSeedHostKey(ctx, state, pin, mach, addr, c.SSHKey)
-		} else if st.AwaitSecrets && len(waiting) == 0 {
-			o.logf("installing over SSH with the secrets given")
-			args := pinnedSSHArgs(pin, mach.User, addr, c.SSHKey, firstInstallOverSSH(name, ctl, "--secrets")...)
-			if _, err := o.SSH.Run(ctx, Cmd{Args: args, Stdin: bytes.NewReader(c.Secrets), Stream: o.Log}); err != nil {
-				return fmt.Errorf("the install over SSH with the secrets: %w; the VM is kept: `ssh %s@%s %s status` tells where it stopped — `sudo %s install` finishes an install begun, and %s; `%s vm destroy %s` removes it. %s",
-					err, mach.User, addr, ctl, ctl, secretsSteps(mach.User, addr, ctl), ctl, mach.Hostname, strings.TrimSpace(seedHostKeyNote(hostKey, addr)))
-			}
-			in.retireSeedHostKey(ctx, state, pin, mach, addr, c.SSHKey)
-		}
-		switch {
-		case st.AwaitSecrets && len(waiting) > 0:
-			fmt.Fprintf(o.Out, "The VM %s answers. Its install waits for its secrets and %s, which the cloud-config never carries: %s\n", mach.Hostname, strings.Join(waiting, ", "), secretsSteps(mach.User, addr, ctl))
-			fmt.Fprint(o.Out, seedHostKeyNote(hostKey, addr))
-		case len(waiting) > 0:
-			fmt.Fprintf(o.Out, "The VM %s answers. Its install waits for %s, which the cloud-config never carries: ssh %s@%s sudo %s install\n", mach.Hostname, strings.Join(waiting, ", "), mach.User, addr, ctl)
-		default:
-			fmt.Fprintf(o.Out, "The VM %s runs %s %s. Then: ssh %s@%s %s status\n", mach.Hostname, name, m.ProjectVersion, mach.User, addr, ctl)
-		}
-		fmt.Fprintf(o.Out, "Its OpenTofu state is in %s; `%s vm destroy %s` removes it.\n", state, ctl, mach.Hostname)
-		return nil
-	}
 	fmt.Fprintf(o.Out, "Wrote %s and %s.\n\nOn %s:\n", disk, seed, p.Label)
 	if n := in.vmSize().note(name); n != "" {
 		fmt.Fprintf(o.Out, "  Size the VM: %s.\n", n)
@@ -687,11 +444,12 @@ func (in *Installer) askPlatform(ctx context.Context, cl *registry.Client, prefi
 }
 
 // seedSettings are what a VM's cloud-config gives on platform p, its disk from the registry at
-// prefix: the machine (machine), the first install's settings (vmSettings; the install awaits
-// what goes over SSH when c gives secrets or vmSettings returns given material), and the mirror's
-// CA, which ca holds when --registry-ca names one. waiting are the secret inputs the install
-// needs that nothing gives.
-func (in *Installer) seedSettings(ctx context.Context, c *VMCreate, p Platform, prefix string) (mach Machine, st *Settings, waiting []string, given *Given, ca []byte, err error) {
+// prefix: the machine (machine), the first install's settings (vmSettings; what the install
+// awaits over SSH, awaitOverSSH: a secrets export when secrets names the flag asking one, the
+// given material vmSettings returns, a seed's byo certificate), and the mirror's CA, which ca
+// holds when --registry-ca names one. waiting are the secret inputs the install needs that
+// nothing gives.
+func (in *Installer) seedSettings(ctx context.Context, c *VMCreate, p Platform, prefix, secrets string) (mach Machine, st *Settings, waiting []string, given *Given, ca []byte, err error) {
 	o, m := &in.O, in.R.Manifest
 	if mach, err = in.machine(ctx, c, p); err != nil {
 		return
@@ -699,9 +457,8 @@ func (in *Installer) seedSettings(ctx context.Context, c *VMCreate, p Platform, 
 	if st, waiting, given, err = in.vmSettings(ctx); err != nil {
 		return
 	}
-	st.AwaitSecrets = c.Secrets != nil || given != nil
-	if given != nil {
-		st.AwaitGiven = given.awaits()
+	if err = awaitOverSSH(st, secrets, in.seeding && o.TLS == "byo", given); err != nil {
+		return
 	}
 	st.IPv6 = c.IPv6 // the install's network too: the front's IPv6 clients keep their address
 	st.TuneProfile = c.TuneProfile
@@ -721,6 +478,48 @@ func (in *Installer) seedSettings(ctx context.Context, c *VMCreate, p Platform, 
 		st.RegistryCA = VMRegistryCA(in.R.Spec.Name)
 	}
 	return
+}
+
+// awaitOverSSH sets what a new VM's first install waits for over SSH, pinned to the one-time host
+// key its cloud-config carries, the one rule of `vm create` and `vm seed`: a decrypted secrets
+// export (`install --secrets -`) when secrets names the flag asking one (--secrets, --await-secrets;
+// "": none); the secret inputs and TLS material (`install --given -`) when given holds any (the
+// --answers file's secret inputs, a certificate) or byo (a seed's --tls byo, whose certificate
+// goes after the boot), the install then taking byo when a certificate goes, else its own mode.
+// A secrets export beside given material is refused: the install waits for one of them.
+func awaitOverSSH(st *Settings, secrets string, byo bool, given *Given) error {
+	if secrets != "" && (byo || given != nil) {
+		var what, fix []string
+		// A certificate goes in byo mode alone, which is what is left out: without it, its
+		// certificate is refused as being for byo, naming the flags.
+		cert := byo
+		if given != nil {
+			what = append(what, given.names())
+			if len(given.Inputs) > 0 {
+				fix = append(fix, "remove "+strings.Join(sortedKeys(given.Inputs), ", ")+" from the --answers file")
+			}
+			cert = cert || given.TLS != nil && given.TLS.Cert != ""
+			if given.TLS != nil && given.TLS.ClientCA != "" {
+				fix = append(fix, "leave out the client CA (--client-ca and the --answers file's tls client_ca)")
+			}
+		}
+		if byo {
+			what = append(what, "--tls byo")
+		}
+		if cert {
+			fix = append(fix, "leave out --tls byo (choose another --tls mode)")
+		}
+		return refuse(strings.Join(fix, " and ")+", or leave out "+secrets,
+			"%s and %s: the first install waits for one of them over SSH, a secrets export (install --secrets -) or what install --given - gives", secrets, strings.Join(what, ", "))
+	}
+	st.AwaitSecrets = secrets != "" || byo || given != nil
+	switch {
+	case byo:
+		st.AwaitGiven = "byo"
+	case given != nil:
+		st.AwaitGiven = given.awaits()
+	}
+	return nil
 }
 
 // seedUserData is the VM's cloud-config (UserData) for platform p, checked to fit what p takes;
@@ -1158,9 +957,9 @@ func checkDevice(v string) error {
 var macAddr = regexp.MustCompile(`^[0-9a-f]{2}(:[0-9a-f]{2}){5}$`)
 
 // generatedMAC is a random, locally administered unicast MAC: two VMs of one host name on one
-// network never share one. Each run of vm create draws its own, written into its seed (and, with
-// OpenTofu, the module's variables, which every later apply of that state reuses): the NICs take
-// the MACs the run that wrote their seed gave.
+// network never share one. Each run of vm create or vm seed draws its own, written into its seed
+// (and vm seed's interfaces, which the program creating the VM gives its NICs): the NICs take the
+// MACs the run that wrote their seed gave.
 func generatedMAC() (string, error) {
 	b := make([]byte, 5)
 	if _, err := rand.Read(b); err != nil {
@@ -1179,8 +978,8 @@ func unicastMAC(mac string) bool {
 // machineInterfaces are the release's host.interfaces NICs on the machine p creates, from
 // --interface: each secondary's addressing (none by default: the link up, no address), each NIC's
 // MAC and the network it attaches to. A VM of one such NIC needs no MAC: it is named from the NIC
-// it has. Of more, each is named by its MAC: given, else generated on a hypervisor (which creates
-// the NICs with them). A server's are its own, given for each NIC (it may have more ports). A
+// it has, and its first boot pins that name to the NIC's MAC (pinScript). Of more, each is named
+// by its MAC: given, else generated on a hypervisor (which creates the NICs with them). A server's are its own, given for each NIC (it may have more ports). A
 // cloud names its NICs' MACs itself: it takes one, and no MAC. An optional NIC is made only when
 // --interface names it. Nil when the release declares none.
 func machineInterfaces(s *spec.Spec, given []string, p Platform) ([]MachineInterface, error) {
@@ -1298,7 +1097,7 @@ func machineInterfaces(s *spec.Spec, given []string, p Platform) ([]MachineInter
 	return out, nil
 }
 
-// hostNetName is a platform's network or bridge name, as a module's variable takes it.
+// hostNetName is a platform's network or bridge name, as --interface's attach= gives it.
 var hostNetName = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9_.:/-]{0,63}$`)
 
 // sshKeyTypes are the public key types an authorized key may have.
@@ -1395,7 +1194,7 @@ func (in *Installer) machine(ctx context.Context, c *VMCreate, p Platform) (Mach
 	if m.SSHKey, err = authorizedKey(a["--ssh-key"]); err != nil {
 		return Machine{}, err
 	}
-	c.SSHKey = a["--ssh-key"] // the key ssh logs in with, OpenTofu's VM waited for
+	c.SSHKey = a["--ssh-key"] // the key the steps' ssh logs in with
 	for _, v := range c.SSHAllow {
 		p, err := netip.ParsePrefix(strings.TrimSpace(v))
 		if err != nil {
@@ -1663,8 +1462,8 @@ func (in *Installer) vmSettings(ctx context.Context) (*Settings, []string, *Give
 
 // givenOverSSH collects what the VM's install in mode takes over the pinned SSH channel, each value
 // checked as the install would, before a VM exists: the answers file's secret inputs, the byo
-// certificate loadCert read and the client CA. nil when there is none, and refused beside --secrets,
-// as the install over SSH takes one or the other.
+// certificate loadCert read and the client CA. nil when there is none (awaitOverSSH refuses it
+// beside --secrets).
 func (in *Installer) givenOverSSH(mode string) (*Given, error) {
 	o := &in.O
 	g := &Given{Project: in.R.Spec.Name}
@@ -1703,9 +1502,6 @@ func (in *Installer) givenOverSSH(mode string) (*Given, error) {
 	if len(raw) > maxSecretsFile {
 		return nil, fmt.Errorf("%s come to %d bytes, and the install over SSH takes %d at most: give the rest over SSH once the VM answers", g.names(), len(raw), maxSecretsFile)
 	}
-	if in.restored != nil {
-		return nil, fmt.Errorf("--secrets restores an install, and %s would go with it: create the VM with --secrets alone, then a re-run over SSH gives them (`sudo %s install --answers FILE`)", g.names(), in.R.Ctl())
-	}
 	return g, nil
 }
 
@@ -1717,39 +1513,10 @@ func (in *Installer) diskSplit(format string, app int) string {
 }
 
 // confirmVM shows what will be written, and on a terminal asks to go on.
-func (in *Installer) confirmVM(ctx context.Context, p Platform, format string, m Machine, st *Settings, given *Given, seed string, c *VMCreate, addr string) error {
+func (in *Installer) confirmVM(ctx context.Context, p Platform, format string, m Machine, st *Settings, given *Given, seed string) error {
 	o := &in.O
 	var b bytes.Buffer
 	fmt.Fprintf(&b, "%s %s (revision %d) on %s: its %s disk, and %s\n", in.R.Spec.Name, in.R.Manifest.ProjectVersion, in.R.Manifest.Revision, p.Label, format, seed)
-	tofu := addr != ""
-	if tofu {
-		t := c.TofuVM
-		if t.builtinTrueNAS(p) {
-			fmt.Fprintf(&b, "  OpenTofu creates the VM %s at %s: %d CPUs, %d MiB, %s on %s/%s, its network on %s\n", t.Name, o.getenv(truenas.URLVar), t.CPUs, t.MemoryMiB, in.diskSplit(format, t.DiskGiB), t.Pool, t.Dataset, t.Bridge)
-		} else {
-			with := ""
-			if t.Module != "" {
-				with = " with the module " + t.Module
-			}
-			var size []string
-			if t.CPUs != 0 {
-				size = append(size, fmt.Sprintf("%d CPUs", t.CPUs))
-			}
-			if t.MemoryMiB != 0 {
-				size = append(size, fmt.Sprintf("%d MiB", t.MemoryMiB))
-			}
-			size = append(size, in.diskSplit(format, t.DiskGiB))
-			fmt.Fprintf(&b, "  OpenTofu creates the VM %s on %s%s: %s\n", t.Name, p.Label, with, strings.Join(size, ", "))
-			for _, k := range sortedKeys(t.Vars) {
-				fmt.Fprintf(&b, "    %s = %s\n", k, t.Vars[k])
-			}
-		}
-		if c.Host == "" && m.staticAddr() == "" && !t.builtinTrueNAS(p) {
-			fmt.Fprintf(&b, "  then waits for it at the address its module returns, else %s\n", addr)
-		} else {
-			fmt.Fprintf(&b, "  then waits for it at %s\n", addr)
-		}
-	}
 	fmt.Fprintf(&b, "  host %s, administrator %s (%s key)\n", m.Hostname, m.User, strings.Fields(m.SSHKey)[0])
 	fmt.Fprintf(&b, "  network: %s\n", describeNet(&m.Net))
 	if m.Install != "" {
@@ -1802,7 +1569,7 @@ func (in *Installer) confirmVM(ctx context.Context, p Platform, format string, m
 		}
 		fmt.Fprintf(&b, "  opens %s/%d (L4 route %s) to %s\n", r.Protocol, r.Port, r.Name, from)
 	}
-	// The host devices the stack maps, which the VM must have: its module or its host gives them.
+	// The host devices the stack maps, which the VM must have: its platform or its host gives them.
 	devices, err := lint.ServiceDevices(in.R.Compose)
 	if err != nil {
 		return err
@@ -1815,8 +1582,8 @@ func (in *Installer) confirmVM(ctx context.Context, p Platform, format string, m
 		return nil
 	}
 	a, err := o.Prompt.Ask(ctx, Form{
-		Questions: []Question{{Title: map[bool]string{false: "Write the VM's disk and cloud-config", true: "Create the VM"}[tofu], Key: "confirm",
-			Choices: []Choice{{"yes", map[bool]string{false: "Yes, write them", true: "Yes, create it"}[tofu]}, {"no", "No, quit writing nothing"}}}},
+		Questions: []Question{{Title: "Write the VM's disk and cloud-config", Key: "confirm",
+			Choices: []Choice{{"yes", "Yes, write them"}, {"no", "No, quit writing nothing"}}}},
 		Defaults: func(map[string]string) map[string]string { return map[string]string{"confirm": "yes"} },
 	})
 	if err != nil {

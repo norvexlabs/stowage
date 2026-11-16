@@ -1,17 +1,24 @@
 #!/usr/bin/env bash
 # End-to-end test of examples/full (atlas) on the Kairos shape, a real VM on TrueNAS: this month's
 # signed CalVer release .1 is shipped with its installer ISO, .2 without one (it records .1's), and
-# .2 crosses to a TLS mirror of its own CA; `vm create --platform metal` of .2 on a bare-metal
-# machine that a TrueNAS VM plays (test/metal-truenas: an empty disk, the installer and the seed as
-# two USB sticks, left in) installs .1's OS on the disk, powers off and is started again; the
-# installed system's first boot writes .2's OS bundle and reboots into it, which waits for a secret input (`--answers`) over the
-# pinned SSH, in no seed, and installs it from the cloud-config's settings with the search
-# extension's input set (to the api itself, standing in for a search service); the provision hook registers the administrator through the api; the api reaches the host
-# daemon's app socket and reads the front's local CA (`exec` through the host daemon, its exit status carried); an event goes through ingest; the ops route
-# refuses everyone until a re-run gives `--client-ca`, then takes a certificate that CA issued
-# alone, and its login (basic_auth, the generated OPS_PASSWORD, then one `secrets set` records); then `vm destroy`. Upgrade, rollback and the health gate's fallback are the VM machinery's: e2e-vm. Needs
-# what e2e-vm needs: Docker (privileged containers, loop devices), network access, about 15 GB
-# on disk under XDG_CACHE_HOME, OpenTofu's `tofu`, ssh, and a TrueNAS host.
+# .2 crosses to a TLS mirror of its own CA; the suite's OpenTofu root (test/metal-truenas, on
+# truenas/truenas, a plan after its apply changing nothing) makes, from `vm seed --json --platform
+# metal` of .2, a bare-metal machine that a TrueNAS VM plays (an empty disk, the installer and the
+# seed as two USB sticks, left in), which installs .1's OS on the disk and powers off; an apply (the
+# power button) starts it again; the installed system's first boot writes .2's OS bundle and reboots
+# into it, where its first install waits for the secret input the seed's --answers holds (the
+# search extension's key, in no seed); given over SSH pinned to the seed's one-time host key
+# (`install --given -`), it installs from the cloud-config's settings with the search extension's
+# input set (to the api itself, standing in for a search service); the provision hook registers the administrator through the api;
+# the api reaches the host daemon's app socket and reads the front's local CA (`exec` through the
+# host daemon, its exit status carried); an event goes through ingest; the ops route refuses
+# everyone until a re-run gives `--client-ca`, then takes a certificate that CA issued alone, and
+# its login (basic_auth, the generated OPS_PASSWORD, then one `secrets set` records); then `tofu
+# destroy`, the machine's zvol holding a snapshot (force_destroy), leaves nothing on TrueNAS.
+# Upgrade, rollback and the health gate's fallback are the VM machinery's: e2e-vm. Needs what
+# e2e-vm needs: Docker (privileged containers, loop devices), network access, about 15 GB on disk
+# under XDG_CACHE_HOME, OpenTofu's `tofu`, genisoimage, Python's websocket-client, ssh, and a
+# TrueNAS host.
 #
 #   STOWAGE_VM_ENV=<file> make e2e-full-vm        (builds ./bin/stowage first)
 #
@@ -75,31 +82,59 @@ vm_mirror
 mirror "$WORK/r1.oci.tar"
 grep -q "^Exported atlas $V2" "$WORK/r1.oci.tar.txt" || { cat "$WORK/r1.oci.tar.txt"; fail "export of $V2"; }
 
-step "vm create of $V2 on metal (a TrueNAS VM), from the mirror, search set: $V1's installer installs, the machine starts again, takes $V2's OS, and installs $V2"
+step "the machine of $V2 on metal (a TrueNAS VM), from the suite's root and vm seed --json against the mirror, search set: $V1's installer installs, the power button starts the machine again, it takes $V2's OS, waits for the search key over the pinned SSH, and installs $V2"
 vm_names
-vm_cleanup
-# The machine's power button loops until it answers, and stops before any destroy.
-CLEANUP=("touch $WORK/metal-up" "${CLEANUP[@]}")
+vm_root metal-truenas
 # The server's two NICs (host.interfaces' uplink and edge), both on the bridge, by MACs of this run.
 MAC_UPLINK=02:5e:${RUN:1:2}:${RUN:3:2}:00:01
 MAC_EDGE=02:5e:${RUN:1:2}:${RUN:3:2}:00:02
+# The secret input in --answers, in no seed: the extension's key, which the first install waits for.
 SEARCH_KEY_GIVEN=$(token)
 (umask 077; printf 'SEARCH_KEY: %s\n' "$SEARCH_KEY_GIVEN" >"$WORK/vm-answers.yaml")
-"$CTL" vm create --no-input --platform metal --device /dev/vda --answers "$WORK/vm-answers.yaml" --create opentofu --module "$(dirname "$0")/metal-truenas" --vm-name "${H//-/}" \
-	--interface uplink=mac="$MAC_UPLINK" --interface edge=dhcp,mac="$MAC_EDGE" --hostname "$H" --user ops --ssh-key "$KEY.pub" \
+vm_seed --answers "$WORK/vm-answers.yaml" --platform metal --device /dev/vda --interface uplink=mac="$MAC_UPLINK" --interface edge=dhcp,mac="$MAC_EDGE" \
 	--tls internal --domains console=console.atlas.test,api=api.atlas.test,ingest=ingest.atlas.test,ops=ops.atlas.test,echo-tls=echo.atlas.test \
 	--set ADMIN_EMAIL=admin@atlas.test --set ORG_NAME=Atlas --set SUPPORT_EMAIL=support@atlas.test --set SEARCH_URL=http://api:9090 \
-	--tofu-var pool="$POOL" --tofu-var parent_dataset="$DATASET" --tofu-var nic_attach="$BRIDGE" --tofu-var stop_file="$WORK/metal-up" \
-	--tofu-var insecure_skip_verify="${TRUENAS_INSECURE_SKIP_VERIFY:-false}" --cpus 2 --memory 4096 --disk 20 --host "$ADDR" --wait "${E2E_VM_WAIT:-60m}" \
-	--registry "$SITE" --registry-ca "$MIRROR_CA" \
-	>"$WORK/vm-create.txt" 2>"$WORK/vm-create.log" || { tail -80 "$WORK/vm-create.log"; fail "vm create"; }
-touch "$WORK/metal-up"
-grep -q "fetching atlas's iso disk of v$V1" "$WORK/vm-create.log" || { tail -30 "$WORK/vm-create.log"; fail "vm create did not take $V1's installer"; }
-grep -q "^The VM $H runs atlas $V2" "$WORK/vm-create.txt" || { cat "$WORK/vm-create.txt"; fail "vm create did not report the install"; }
-! grep -rqF -- "$TRUENAS_API_KEY" "$STATE" || fail "the API key is in the VM's state"
-grep -q 'installing over SSH with ' "$WORK/vm-create.log" || { tail -30 "$WORK/vm-create.log"; fail "the secret input did not go over SSH"; }
-[[ ! -e $STATE/given.yaml ]] || fail "what the install took is left on this machine"
-! grep -rqaF -- "$SEARCH_KEY_GIVEN" "$STATE" "$WORK/vm-create.log" "$WORK/vm-create.txt" || fail "the secret input is in the VM's state or the log"
+	--registry "$SITE" --registry-ca "$MIRROR_CA"
+# The disk is $V1's installer, the one $V2 records.
+jq -e '.platform == "metal" and .disk_file.format == "iso"' "$STATE/seed.json" >/dev/null ||
+	{ jq 'del(.host_key_private, .user_data)' "$STATE/seed.json"; fail "vm seed --json of metal gives no installer ISO"; }
+case $(basename "$(jq -r .disk_file.path "$STATE/seed.json")") in
+"atlas-$V1.iso" | "atlas-v$V1.iso") ;;
+*) jq .disk_file "$STATE/seed.json"; fail "vm seed did not take $V1's installer" ;;
+esac
+jq -e --arg u "$MAC_UPLINK" --arg e "$MAC_EDGE" '[.interfaces[] | {role, mac}] == [{role: "edge", mac: $e}, {role: "uplink", mac: $u}]' "$STATE/seed.json" >/dev/null ||
+	{ jq .interfaces "$STATE/seed.json"; fail "the seed's NICs are not uplink's and edge's of this run's MACs"; }
+jq -e '.await_given == ["SEARCH_KEY"] and (has("await_secrets") | not)' "$STATE/seed.json" >/dev/null ||
+	{ jq 'del(.host_key_private, .user_data)' "$STATE/seed.json"; fail "the seed does not say the first install waits for SEARCH_KEY"; }
+rm "$WORK/vm-answers.yaml"
+vm_vars 2 4096 20
+vm_apply "the machine"
+# On $V2's OS, past the switch, the first install waits for the key: none made yet.
+vm_await "${E2E_VM_WAIT:-60m}" 0 "$V2" power
+[[ $(on_vm sudo cat /etc/atlas/install.yaml.given) == given ]] || fail "the cloud-config does not say the first install waits for given inputs"
+# Waiting, not installing: within 5 min, this boot's run says it waits for what install --given
+# gives (a line only the given mark leads to: without it the run waits for a secrets export, or
+# installs), having begun no install, and a minute on still has none, nor one under way or failed.
+waits='the first install waits for the secret inputs and TLS material the cloud-config never carries'
+said_by=$((SECONDS + 300))
+until on_vm sudo journalctl -b -u atlas.service --no-pager >"$WORK/first-boot.log" 2>&1 && grep -qF "$waits" "$WORK/first-boot.log"; do
+	((SECONDS < said_by)) || { tail -40 "$WORK/first-boot.log"; fail "the first boot's run did not say within 5 min that it waits for the given inputs"; }
+	sleep 5
+done
+sleep 60
+on_vm sudo journalctl -b -u atlas.service --no-pager >"$WORK/first-boot.log" 2>&1 || fail "the first boot's journal over SSH"
+! grep -q 'installing atlas ' "$WORK/first-boot.log" || { tail -40 "$WORK/first-boot.log"; fail "the first boot's run began an install instead of waiting for the given inputs"; }
+on_vm at-stow status --json >"$WORK/waiting.json" || fail "status over SSH"
+jq -e '.installed == null and ((.installing // false) | not) and (.install_failed // "") == ""' "$WORK/waiting.json" >/dev/null ||
+	{ jq . "$WORK/waiting.json"; fail "the first install did not wait for the secret input"; }
+# Given over SSH pinned to the seed's one-time host key, the first install takes it.
+(umask 077; printf 'project: atlas\ninputs:\n  SEARCH_KEY: %s\n' "$SEARCH_KEY_GIVEN" >"$WORK/vm-given.yaml")
+vm_given "$WORK/vm-given.yaml"
+rm "$WORK/vm-given.yaml"
+vm_await 10m 1 "$V2"
+vm_retire
+! grep -rqF -- "$TRUENAS_API_KEY" "$STATE" || fail "the API key is in the machine's root or state"
+! grep -rqaF -- "$SEARCH_KEY_GIVEN" "$STATE" "$XDG_STATE_HOME" || fail "the secret input is in the machine's root, seed or state"
 on_vm sudo grep -rqF admin@atlas.test /oem || fail "/oem does not read in the clear: the search below would see nothing"
 not_on_vm "$SEARCH_KEY_GIVEN" /oem
 IP=$(getent hosts "$ADDR" | awk '{print $1; exit}')
@@ -338,9 +373,7 @@ grep -qE "^n/a +cpu governor " "$WORK/tune.txt" || { cat "$WORK/tune.txt"; fail 
 # shellcheck disable=SC2016 # expanded on the VM
 on_vm '! dpkg-query -W -f="\${db:Status-Abbrev}" nfs-common rpcbind snmpd 2>/dev/null | grep -q "^i"' || fail "a package the bundle purges is on the VM"
 
-step "vm destroy: the VM, its disk and its uploads go, and its state"
-"$CTL" vm destroy "$H" --yes >"$WORK/vm-destroy.txt" 2>"$WORK/vm-destroy.log" || { tail -50 "$WORK/vm-destroy.log"; fail "vm destroy"; }
-grep -q "^Destroyed $H" "$WORK/vm-destroy.txt" || fail "vm destroy did not report"
-[[ ! -e $STATE ]] || fail "the VM's state is left"
+step "tofu destroy: the machine, its disk and its media go, their snapshots with them"
+vm_destroy
 
 printf '\nPASS\n'

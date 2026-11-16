@@ -446,8 +446,16 @@ func (e *env) installer(mod func(*Options)) *Installer {
 		// The registry holds each release's manifest, naming its installer image (testCtl).
 		in.O.InstallerImage = func(_ context.Context, prefix string) (string, error) { return testCtl(prefix, in.R.Manifest), nil }
 	}
+	if in.O.K8s.JobImage == nil {
+		// A Job runs the installer image as it is: no registry holds testCtl's (jobImage's test
+		// clears this).
+		in.O.K8s.JobImage = asIs
+	}
 	return in
 }
+
+// asIs is a Job's installer image as the release names it (K8sOptions.JobImage).
+func asIs(_ context.Context, _, ref string) (string, error) { return ref, nil }
 
 // testCtl is the installer image the registry at prefix records for release m in the tests.
 func testCtl(prefix string, m *release.Manifest) string {

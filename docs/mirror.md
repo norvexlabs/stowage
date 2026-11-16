@@ -20,7 +20,9 @@ carries it:
   own, or the set its manifest records; `--disks` limits them to the formats given, `none`
   exports none; a format the release has no disk of is refused, as is a disk a newer set
   replaced, which is no longer published), each by digest and under the
-  tag it was published with, with its signatures (each one's referrers). Every blob is checked
+  tag it was published with, with its signatures and SBOM attestations (each one's referrers,
+  and those of every image of the installer's index, each signed and attested on its own; another
+  artifact's index, an upstream image's, carries its own alone). Every blob is checked
   against its digest as it is read. It prints `Exported <name> <version> (revision N, <tag>) to
   <file>` with the manifests, blobs and bytes written.
   `--shapes S,…` (`docker`, `kubernetes`, `kairos`; default every shape the project has) exports
@@ -91,7 +93,8 @@ carries it:
   or `--image-pull-login` from the Docker client's login ([kubernetes](kubernetes.md)); and the VM
   with the login `vm create --registry-login-file FILE` gives it over SSH (or `sudo <short>-stow
   registry-login -` on the VM), for the mirror's host alone ([vm](vm.md)).
-- `vm create --create opentofu` also needs its module's OpenTofu provider, which `tofu init`
-  fetches from the OpenTofu registry: on a site without internet, give `tofu` a provider mirror
-  (a `provider_installation { filesystem_mirror { … } }` block in a CLI configuration file named
-  by `TF_CLI_CONFIG_FILE`, filled by `tofu providers mirror` on a machine with internet).
+- An OpenTofu root creating a VM from `vm seed --json` ([vm-create](vm-create.md)) needs its
+  providers, which `tofu init` fetches from the OpenTofu registry: on a site without internet,
+  give `tofu` a provider mirror (a `provider_installation { filesystem_mirror { … } }` block in a
+  CLI configuration file named by `TF_CLI_CONFIG_FILE`, filled by `tofu providers mirror` on a
+  machine with internet).

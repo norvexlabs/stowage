@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 
+	"github.com/norvexlabs/stowage/internal/release"
 	"github.com/norvexlabs/stowage/internal/sbom"
 )
 
@@ -18,7 +19,7 @@ func (p *Publisher) Audit(ctx context.Context, channel, v string, revision int, 
 	if err != nil {
 		return nil, err
 	}
-	targets, err := sbom.Targets(p.Project.Spec.Registry.Prefix, p.Project.Spec.Name, r.Manifest.Artifacts)
+	targets, err := p.auditTargets(ctx, r.Manifest.Artifacts)
 	if err != nil {
 		return nil, err
 	}
@@ -41,10 +42,20 @@ func (p *Publisher) ExportSBOMs(ctx context.Context, channel, v string, revision
 	if err != nil {
 		return sbom.Index{}, err
 	}
-	targets, err := sbom.Targets(p.Project.Spec.Registry.Prefix, p.Project.Spec.Name, r.Manifest.Artifacts)
+	targets, err := p.auditTargets(ctx, r.Manifest.Artifacts)
 	if err != nil {
 		return sbom.Index{}, err
 	}
 	m := r.Manifest
 	return sbom.Export(ctx, p.Signer.Attestation, targets, dir, sbom.Index{Project: m.Name, Version: m.ProjectVersion, Revision: m.Revision, Channel: m.Channel, Tag: m.Tag})
+}
+
+// auditTargets are the artifacts of a that carry an SBOM, each image of the installer's index with
+// its own after the installer (sbom.WithEntries).
+func (p *Publisher) auditTargets(ctx context.Context, a release.Artifacts) ([]sbom.Target, error) {
+	targets, err := sbom.Targets(p.Project.Spec.Registry.Prefix, p.Project.Spec.Name, a)
+	if err != nil {
+		return nil, err
+	}
+	return sbom.WithEntries(ctx, targets, sbom.RegistryEntries(p.Registry)), nil
 }

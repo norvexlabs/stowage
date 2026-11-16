@@ -17,6 +17,7 @@ import (
 	"github.com/spf13/pflag"
 	"golang.org/x/term"
 
+	"github.com/norvexlabs/stowage/internal/installerbin"
 	"github.com/norvexlabs/stowage/internal/payload"
 	"github.com/norvexlabs/stowage/internal/spec"
 	"github.com/norvexlabs/stowage/internal/tune"
@@ -29,13 +30,20 @@ func Command(r *Release, self string, stdout, stderr io.Writer) *cobra.Command {
 	return newCommand(r, self, stdout, stderr, K8sOptions{Helm: ExecTool{Bin: "helm"}, Kubectl: ExecTool{Bin: "kubectl"}}, Terminal)
 }
 
-// newCommand is Command running helm and kubectl as tools gives them, asking with terminal.
+// newCommand is Command running helm and kubectl as tools gives them, asking with terminal, on
+// this program's platform.
 func newCommand(r *Release, self string, stdout, stderr io.Writer, tools K8sOptions, terminal func(accessible bool) Prompter) *cobra.Command {
+	return newCommandOn(hostPlatform(), r, self, stdout, stderr, tools, terminal)
+}
+
+// newCommandOn is newCommand on platform (os/arch): every verb but an operator's machine's
+// (operatorVerbs) refuses a platform other than the target's (onTargetOnly).
+func newCommandOn(platform string, r *Release, self string, stdout, stderr io.Writer, tools K8sOptions, terminal func(accessible bool) Prompter) *cobra.Command {
 	if r.Manifest.Bundled() {
 		return vmCommand(r, self, stdout, stderr, terminal, clientTimes{})
 	}
-	o := Options{Out: stdout, Log: stderr, Docker: ExecTool{Bin: "docker"}, Tofu: ExecTool{Bin: "tofu", Grace: 5 * time.Minute}, SSH: ExecTool{Bin: "ssh"}, Self: self, K8s: tools,
-		Tune: hostTune(r.Ctl(), runHost, tune.SystemLook, "")}
+	o := Options{Out: stdout, Log: stderr, Docker: ExecTool{Bin: "docker"}, SSH: ExecTool{Bin: "ssh"}, Self: self, K8s: tools,
+		Tune: hostTune(r.Ctl(), runHost, tune.SystemLook, ""), Platform: platform}
 	if _, err := os.Stat("/proc/self/exe"); err == nil {
 		o.SelfExe = "/proc/self/exe" // the running file, even when its path was replaced since
 	}
@@ -476,7 +484,66 @@ func newCommand(r *Release, self string, stdout, stderr io.Writer, tools K8sOpti
 			return payload.Script(stdout, name, r.Ctl(), f)
 		},
 	})
+	onTargetOnly(root, r, platform, func(cmd *cobra.Command, err error) error {
+		if !resultJSON {
+			return err
+		}
+		if !prepared {
+			in.O = o
+		}
+		return in.printResult(cmd.Context(), stdout, verbKind{}, err)
+	})
 	return root
+}
+
+// operatorVerbs are the verbs an operator's machine runs, on any platform: the bootstrap script,
+// describe, the Kubernetes shape (helm and kubectl, from the operator's machine), the VM's
+// first-boot material and its platform steps, the mirror, and cobra's help and completion. Every
+// other verb works on an install on this host, a target, whose images are the target's platform's.
+var operatorVerbs = []string{payload.ScriptCommand, "describe", "k8s", "vm", "mirror", "help", "completion"}
+
+// onTargetOnly makes every verb of root but operatorVerbs refuse to run on platform when it is
+// not the target's (installerbin.Target), naming it: an arm64 Docker host pulls the installer
+// image's arm64 entry, whose installs would pull images for amd64. finish makes the refusal the
+// verb's own (its --json Result).
+func onTargetOnly(root *cobra.Command, r *Release, platform string, finish func(*cobra.Command, error) error) {
+	if platform == installerbin.Target {
+		return
+	}
+	image := r.Spec.Registry.Prefix + "/" + r.Spec.Name + "-installer:" + r.Manifest.Tag
+	refusal := refuse(fmt.Sprintf("install from a %[1]s host: `docker run --rm --platform %[1]s %[2]s > %[3]s.sh` writes its bootstrap script", installerbin.Target, image, r.Spec.Name),
+		"this installer is the %s build: %s installs on %s hosts alone (its images are built for it); here it runs %s alone",
+		platform, r.Spec.Name, installerbin.Target, strings.Join(operatorVerbs[:5], ", "))
+	var walk func(c *cobra.Command)
+	walk = func(c *cobra.Command) {
+		if c != root && slices.Contains(operatorVerbs, verbOf(root, c)) {
+			return
+		}
+		for _, sub := range c.Commands() {
+			walk(sub)
+		}
+		if c.RunE == nil && c.Run == nil {
+			return
+		}
+		c.Run, c.PreRunE, c.PreRun = nil, nil, nil
+		c.RunE = func(cmd *cobra.Command, _ []string) error { return finish(cmd, refusal) }
+		if c.Annotations == nil {
+			c.Annotations = map[string]string{}
+		}
+		c.Annotations[targetOnlyAnnotation] = installerbin.Target
+	}
+	walk(root)
+}
+
+// targetOnlyAnnotation marks a verb onTargetOnly made refuse, with the platform it runs on.
+const targetOnlyAnnotation = "stowage.target-only"
+
+// verbOf is the verb of root c is under: the name of its ancestor (or itself) right under root.
+func verbOf(root, c *cobra.Command) string {
+	for c.HasParent() && c.Parent() != root {
+		c = c.Parent()
+	}
+	return c.Name()
 }
 
 // k8sCommand is `k8s`: the release on a Kubernetes cluster, with helm and kubectl. Every
@@ -1071,8 +1138,6 @@ func vmCreateCommand(in *Installer, o *Options, prepare func() error, terminal f
 	name, m := in.R.Spec.Name, in.R.Manifest
 	var c VMCreate
 	var secretsFile, loginFile string
-	var tofuVars []string
-	var kitFlags givenFlags
 	vm := &cobra.Command{
 		Use:   "vm",
 		Short: fmt.Sprintf("Run %s on a VM of its own: its Kairos OS, from a disk image", name),
@@ -1094,40 +1159,13 @@ func vmCreateCommand(in *Installer, o *Options, prepare func() error, terminal f
 			}
 			in.O.Cert, in.O.Key, in.O.CA, in.O.ClientCA = expandHome(in.O.Cert), expandHome(in.O.Key), expandHome(in.O.CA), expandHome(in.O.ClientCA)
 			c.Progress = downloadProgress(in.O.Log)
-			for _, kv := range tofuVars {
-				k, v, ok := strings.Cut(kv, "=")
-				if !ok || k == "" {
-					return fmt.Errorf("--tofu-var %q: NAME=VALUE", kv)
-				}
-				if slices.Contains(contractVars, k) || slices.Contains(optionalVars, k) {
-					return fmt.Errorf("--tofu-var %s: vm create writes it (the module contract's), from its own flags", k)
-				}
-				if _, dup := c.Vars[k]; dup {
-					return fmt.Errorf("--tofu-var %s is given twice", k)
-				}
-				if c.Vars == nil {
-					c.Vars = map[string]string{}
-				}
-				c.Vars[k] = v
-			}
-			if c.Ctl, err = os.Executable(); err != nil {
-				return err
-			}
-			if c.RegistryLogin, err = readLoginFlag(loginFile, cmd.InOrStdin(), secretsFile, kitFlags.kit); err != nil {
+			if c.RegistryLogin, err = readLoginFlag(loginFile, cmd.InOrStdin(), secretsFile); err != nil {
 				return err
 			}
 			if secretsFile != "" {
-				if secretsFile == "-" && kitFlags.kit == "-" {
-					return errors.New("--secrets and --kit both name standard input, which is read once")
-				}
 				if c.Secrets, err = readSecretsArg(secretsFile, cmd.InOrStdin()); err != nil {
 					return err
 				}
-			}
-			if err := kitFlags.take(cmd.Context(), in, cmd.InOrStdin(), in.O.Prompt, time.Now(), func(g *Given, flag string) error {
-				return in.useGiven(g, flag, "kairos") // the shape the VM's install takes
-			}); err != nil {
-				return err
 			}
 			return in.CreateVM(cmd.Context(), &c)
 		},
@@ -1159,75 +1197,11 @@ func vmCreateCommand(in *Installer, o *Options, prepare func() error, terminal f
 	f.StringArrayVar(sets, "set", nil, "an input, KEY=VALUE (repeatable; never a secret input: --answers gives one)")
 	f.StringArrayVar(setFiles, "set-file", nil, "a file input's file, KEY=PATH (repeatable; never a secret input: --answers gives one)")
 	f.StringVar(answers, "answers", "", "a YAML file of inputs, KEY: value, and the front's tls section: secret inputs and TLS material are given over SSH once the VM answers, never in the cloud-config")
-	kitFlags.defineKit(f, "a handoff kit, or - for standard input: its inputs taken as --answers', its secret inputs and TLS material given over SSH once the VM answers, never in the cloud-config")
 	f.BoolVar(noInput, "no-input", false, "never ask: what nothing gave takes its default")
 	f.BoolVar(accessible, "accessible", false, "ask with plain line prompts (screen readers); also when ACCESSIBLE is set or TERM=dumb")
 	f.StringVar(&o.Registry, "registry", "", "a registry prefix to read the disk and the VM's updates from, a mirror")
 	f.StringVar(&o.RegistryCA, "registry-ca", "", "a PEM file of the CA the registry's certificate chains to, a mirror's own: trusted here and, through the cloud-config, by the VM")
 	f.Var(pathFlag{&loginFile}, "registry-login-file", "a Docker config holding one auths entry, this VM's own login for the host of the release's registry or of the mirror, which its reads of that host take: given over SSH once the VM answers, never in the cloud-config")
-	var tofuKeys []string
-	for _, p := range Platforms {
-		if p.Tofu {
-			tofuKeys = append(tofuKeys, p.Key)
-		}
-	}
-	f.StringVar(&c.Create, "create", "", CreateTofu+" (OpenTofu creates the VM: "+strings.Join(tofuKeys, ", ")+", or any platform with --module) or "+CreateManual+" (write its disk and seed, print the steps); asked where OpenTofu can, else "+CreateManual)
-	f.StringVar(&c.Module, "module", "", "OpenTofu: your own module directory, applied instead of the platform's built-in one (it holds the module contract: README)")
-	f.StringArrayVar(&tofuVars, "tofu-var", nil, "OpenTofu: a variable of the module, NAME=VALUE (repeatable): a platform's own, never a credential (those come from the environment)")
-	f.StringVar(&c.Name, "vm-name", "", "OpenTofu: the VM's name on its platform: letters and digits on TrueNAS, else lower-case letters, digits and '-' (default: the host name's)")
-	f.StringVar(&c.Pool, "pool", "", "OpenTofu on TrueNAS: the pool the VM's disk goes on")
-	f.StringVar(&c.Dataset, "dataset", "", "OpenTofu on TrueNAS: the dataset, under the pool, the VM's disk goes in")
-	f.StringVar(&c.Bridge, "bridge", "", "OpenTofu on TrueNAS: the bridge or interface the VM's network attaches to")
-	f.IntVar(&c.CPUs, "cpus", 0, "OpenTofu: the VM's CPUs (default: the release's recommended size, else 2; at least its minimum)")
-	f.IntVar(&c.MemoryMiB, "memory", 0, "OpenTofu: the VM's memory in MiB (default: the release's recommended size, else 4096; at least its minimum and 1024)")
-	f.IntVar(&c.DiskGiB, "disk", 0, "OpenTofu: the app's space on the VM's disk in GiB, to which vm create adds what Kairos takes (default: the release's recommended size, else 20; at least its minimum and 4)")
-	f.StringVar(&c.Host, "host", "", "OpenTofu: the name or address the VM answers at once booted (default: --address's, else the host name)")
-	f.DurationVar(&c.Wait, "wait", 0, "OpenTofu: how long to wait for the VM to answer over SSH and install (default 20m)")
-
-	var d VMDestroy
-	destroy := &cobra.Command{
-		Use:   "destroy HOSTNAME",
-		Short: "Destroy a VM `vm create --create " + CreateTofu + "` made — the VM, its disk and data, its uploads — and its OpenTofu state",
-		Args:  cobra.ExactArgs(1),
-		RunE: func(cmd *cobra.Command, args []string) (err error) {
-			if err := prepare(); err != nil {
-				return err
-			}
-			if !*noInput {
-				in.O.Prompt = terminal(*accessible)
-			}
-			d.Host = args[0]
-			if d.Ctl, err = os.Executable(); err != nil {
-				return err
-			}
-			return in.DestroyVM(cmd.Context(), &d)
-		},
-	}
-	df := destroy.Flags()
-	df.BoolVar(&d.Yes, "yes", false, "destroy without asking")
-	df.BoolVar(noInput, "no-input", false, "never ask: without --yes, refuse")
-	df.BoolVar(accessible, "accessible", false, "ask with plain line prompts (screen readers); also when ACCESSIBLE is set or TERM=dumb")
-	var at VMAttach
-	attach := &cobra.Command{
-		Use:   "attach HOSTNAME",
-		Short: "Attach a NIC for a role of the release to a VM `vm create --create " + CreateTofu + "` made on TrueNAS: recorded on the VM over SSH, added to its OpenTofu state, the VM powered off and on",
-		Args:  cobra.ExactArgs(1),
-		RunE: func(cmd *cobra.Command, args []string) (err error) {
-			if err := prepare(); err != nil {
-				return err
-			}
-			at.Host = args[0]
-			if at.Ctl, err = os.Executable(); err != nil {
-				return err
-			}
-			return in.AttachVM(cmd.Context(), &at)
-		},
-	}
-	af := attach.Flags()
-	af.StringVar(&at.Interface, "interface", "", "the NIC, ROLE=SPEC as vm create takes it: dhcp, static,address=A/P or none, then mac= (default: generated) and attach= (the bridge; default the primary's)")
-	reachFlags(af, &at.User, &at.SSHKey, &at.Address, &at.KnownHostsLine)
-	af.DurationVar(&at.Wait, "wait", 0, "how long to wait for the VM to answer over SSH after its power cycle (default 10m)")
-	_ = attach.MarkFlagRequired("interface")
 	var sc VMCreate
 	var so SeedOptions
 	var seedLogin string
@@ -1297,7 +1271,7 @@ func vmCreateCommand(in *Installer, o *Options, prepare func() error, terminal f
 	var hkJSON bool
 	hostKey.Flags().BoolVar(&hkJSON, "json", false, "print the key as one JSON object (required: it is for a program)")
 	_ = hostKey.MarkFlagRequired("json")
-	vm.AddCommand(create, seed, destroy, attach, hostKey, truenasCommand(os.Getenv))
+	vm.AddCommand(create, seed, hostKey, truenasCommand(os.Getenv))
 	if k := in.vmKitCommand(o, prepare, terminal); k != nil {
 		vm.AddCommand(k)
 	}

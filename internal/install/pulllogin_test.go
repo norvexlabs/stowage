@@ -332,7 +332,7 @@ func TestTheRegistryLoginFileFlag(t *testing.T) {
 	t.Parallel()
 	e := newKubeEnv(t, spec.Provider{Name: "none"})
 	run := func(args ...string) error {
-		cmd := newCommand(e.release, "notes-stow", io.Discard, io.Discard, K8sOptions{Helm: kubeTool{e.f, "helm"}, Kubectl: kubeTool{e.f, "kubectl"}}, func(bool) Prompter { return nil })
+		cmd := newCommand(e.release, "notes-stow", io.Discard, io.Discard, e.tools(), func(bool) Prompter { return nil })
 		cmd.SetArgs(args)
 		cmd.SetIn(strings.NewReader("{}"))
 		cmd.SilenceUsage, cmd.SilenceErrors = true, true
@@ -572,7 +572,7 @@ func TestK8sUpgradeVersionReadsTheLoginFileFlag(t *testing.T) {
 	t.Parallel()
 	e := newKubeEnv(t, spec.Provider{Name: "none"})
 	e.runs("1.0.0", 1)
-	cmd := newCommand(e.release, "notes-stow", io.Discard, io.Discard, K8sOptions{Helm: kubeTool{e.f, "helm"}, Kubectl: kubeTool{e.f, "kubectl"}}, func(bool) Prompter { return nil })
+	cmd := newCommand(e.release, "notes-stow", io.Discard, io.Discard, e.tools(), func(bool) Prompter { return nil })
 	cmd.SetArgs([]string{"k8s", "upgrade", "--version", "2.0.0", "--registry-login-file", "-"})
 	cmd.SetIn(bytes.NewReader(loginFile("other.example", "inst-1", loginPassword)))
 	cmd.SilenceUsage, cmd.SilenceErrors = true, true

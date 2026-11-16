@@ -15,6 +15,7 @@ import (
 	"github.com/google/go-containerregistry/pkg/name"
 	"github.com/spf13/cobra"
 
+	"github.com/norvexlabs/stowage/internal/installerbin"
 	"github.com/norvexlabs/stowage/internal/kairos"
 	"github.com/norvexlabs/stowage/internal/lint"
 	"github.com/norvexlabs/stowage/internal/payload"
@@ -111,7 +112,11 @@ func (o *options) publisher(ctx context.Context, p *project.Project, a access) (
 			return nil, err
 		}
 	}
+	var installers installerbin.Set
 	if a == writeAccess {
+		if installers, err = o.installerSet(); err != nil {
+			return nil, fmt.Errorf("this stowage's installers: %w", err)
+		}
 		if pull, err = o.pullAccount(p); err != nil {
 			return nil, err
 		}
@@ -134,7 +139,7 @@ func (o *options) publisher(ctx context.Context, p *project.Project, a access) (
 		CloudErr:       cloudErr,
 		Deleter:        del,
 		StowageVersion: o.buildVersion,
-		Installer:      o.installer,
+		Installer:      installers,
 		Pull:           pull,
 		Scan:           scan,
 		AuditOverride:  o.auditOverride,

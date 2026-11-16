@@ -55,6 +55,9 @@ type Entry struct {
 	Repo   string
 	Tag    string
 	Digest string
+	// Children: the entry is an index whose every image is signed and attested on its own digest
+	// (the installer's), so their referrers go with it; another entry carries its own alone.
+	Children bool
 }
 
 // ArchiveStats counts what an export wrote or an import pushed: manifests, blobs, and the blobs'
@@ -69,7 +72,7 @@ type ArchiveStats struct {
 // which go at the top level untagged, in the entry's repository. A blob is written once, and each is
 // checked against its digest as it is read. logf, when set, tells each entry as it starts.
 func (c *Client) Export(ctx context.Context, prefix string, entries []Entry, w io.Writer, logf func(string, ...any)) (ArchiveStats, error) {
-	e := &exporter{c: c, ctx: ctx, tw: tar.NewWriter(w), seen: map[v1.Hash]bool{}, manifests: map[v1.Hash]v1.Descriptor{}, top: map[string]bool{}, referred: map[string]bool{}}
+	e := &exporter{c: c, ctx: ctx, tw: tar.NewWriter(w), seen: map[v1.Hash]bool{}, manifests: map[v1.Hash]v1.Descriptor{}, top: map[string]bool{}, referred: map[string]bool{}, children: map[v1.Hash][]v1.Hash{}}
 	layout, _ := json.Marshal(map[string]string{"imageLayoutVersion": LayoutVersion})
 	if err := e.file(layoutFile, layout); err != nil {
 		return e.st, err
@@ -96,24 +99,32 @@ func (c *Client) Export(ctx context.Context, prefix string, entries []Entry, w i
 			return e.st, err
 		}
 		e.add(en.Repo, en.Tag, d)
-		if e.referred[en.Repo+"@"+h.String()] {
-			continue
+		// The entry's referrers, and those of every manifest it names when its images are signed
+		// on their own (Children).
+		subjects := []v1.Hash{h}
+		if en.Children {
+			subjects = e.subjects(h)
 		}
-		e.referred[en.Repo+"@"+h.String()] = true
-		refs, err := remote.Referrers(repo.Digest(h.String()), c.opts(ctx)...)
-		if err != nil {
-			return e.st, fmt.Errorf("referrers of %s@%s: %w", repo, h, err)
-		}
-		im, err := refs.IndexManifest()
-		if err != nil {
-			return e.st, fmt.Errorf("referrers of %s@%s: %w", repo, h, err)
-		}
-		for _, r := range im.Manifests {
-			d, err := e.manifest(repo, r.Digest)
-			if err != nil {
-				return e.st, err
+		for _, s := range subjects {
+			if e.referred[en.Repo+"@"+s.String()] {
+				continue
 			}
-			e.add(en.Repo, "", d)
+			e.referred[en.Repo+"@"+s.String()] = true
+			refs, err := remote.Referrers(repo.Digest(s.String()), c.opts(ctx)...)
+			if err != nil {
+				return e.st, fmt.Errorf("referrers of %s@%s: %w", repo, s, err)
+			}
+			im, err := refs.IndexManifest()
+			if err != nil {
+				return e.st, fmt.Errorf("referrers of %s@%s: %w", repo, s, err)
+			}
+			for _, r := range im.Manifests {
+				d, err := e.manifest(repo, r.Digest)
+				if err != nil {
+					return e.st, err
+				}
+				e.add(en.Repo, "", d)
+			}
 		}
 	}
 	index, err := json.Marshal(v1.IndexManifest{SchemaVersion: 2, MediaType: types.OCIImageIndex, Manifests: e.index})
@@ -133,6 +144,16 @@ func cmpTag(t string) string {
 	return t
 }
 
+// subjects are h and every manifest under it, an index's images (and theirs) after it: what a
+// signature or an attestation may refer to.
+func (e *exporter) subjects(h v1.Hash) []v1.Hash {
+	out := []v1.Hash{h}
+	for _, c := range e.children[h] {
+		out = append(out, e.subjects(c)...)
+	}
+	return out
+}
+
 // epoch is every archive entry's time: the same release makes the same archive.
 var epoch = time.Unix(0, 0)
 
@@ -145,8 +166,10 @@ type exporter struct {
 	manifests map[v1.Hash]v1.Descriptor
 	top       map[string]bool
 	referred  map[string]bool // repo@digest whose referrers were read
-	index     []v1.Descriptor
-	st        ArchiveStats
+	// children are the manifests each index written names, by the index's digest.
+	children map[v1.Hash][]v1.Hash
+	index    []v1.Descriptor
+	st       ArchiveStats
 }
 
 func (e *exporter) file(name string, data []byte) error {
@@ -194,6 +217,7 @@ func (e *exporter) manifest(repo name.Repository, h v1.Hash) (v1.Descriptor, err
 		if _, err := e.manifest(repo, c.Digest); err != nil {
 			return v1.Descriptor{}, err
 		}
+		e.children[h] = append(e.children[h], c.Digest)
 	}
 	for _, b := range blobs {
 		if err := e.blob(repo, b); err != nil {

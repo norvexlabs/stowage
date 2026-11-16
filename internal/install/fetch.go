@@ -22,6 +22,7 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/norvexlabs/stowage/internal/flock"
+	"github.com/norvexlabs/stowage/internal/installerbin"
 	"github.com/norvexlabs/stowage/internal/payload"
 	"github.com/norvexlabs/stowage/internal/providers"
 	"github.com/norvexlabs/stowage/internal/registry"
@@ -35,8 +36,9 @@ import (
 // fetched while it runs; it is kept when that run fails, so its hints name a file that exists.
 const NextDir = ".stowage-next"
 
-// maxInstaller bounds the installer executable read from an installer image.
-var maxInstaller int64 = 512 << 20
+// maxInstaller bounds the installer file read from an installer image: the executable with its
+// payload (installerbin.MaxFile); tests shorten it.
+var maxInstaller int64 = installerbin.MaxFile
 
 // ExitCode is the exit status of an installer run as a child, which printed its own error.
 type ExitCode int
@@ -574,7 +576,8 @@ func checkSigned(ctx context.Context, c sigverify.Registry, repo name.Repository
 	return nil
 }
 
-// fetchInstaller pulls m's installer image by digest, writes its executable in NextDir and returns
+// fetchInstaller pulls m's installer image by digest (its image for the platform this installer
+// runs on), writes its executable in NextDir and returns
 // its path, with its payload, once that is checked to carry m: the manifest as published, but for
 // the installer's own digest and a yank, which the payload never records.
 func (in *Installer) fetchInstaller(ctx context.Context, c *registry.Client, prefix string, m *release.Manifest) (string, payload.Files, error) {
@@ -585,9 +588,21 @@ func (in *Installer) fetchInstaller(ctx context.Context, c *registry.Client, pre
 	if err != nil {
 		return "", nil, err
 	}
-	img, err := c.Image(ctx, ref)
+	// The installer index's image for the platform this one runs on: a target's is the target's
+	// (Command refuses another), an operator's machine its own (a Kubernetes upgrade's).
+	platform, err := v1.ParsePlatform(in.O.platform())
 	if err != nil {
-		return "", nil, fmt.Errorf("%s: %w", ref, err)
+		return "", nil, err
+	}
+	img, err := c.ImageFor(ctx, ref, *platform)
+	if errors.Is(err, registry.ErrNoPlatform) && in.O.platform() != installerbin.Target {
+		// An installer a stowage before 0.40.0 published is one image, of the target's platform.
+		return "", nil, refuse(fmt.Sprintf("run the same command from a %s machine: every installer image has its executable", installerbin.Target),
+			"the installer of %s %s (%s) has none for this machine, %s (one a stowage before 0.40.0 published is a %s image alone): %v",
+			m.Name, m.ProjectVersion, m.Tag, in.O.platform(), installerbin.Target, err)
+	}
+	if err != nil {
+		return "", nil, err
 	}
 	layers, err := img.Layers()
 	if err != nil {

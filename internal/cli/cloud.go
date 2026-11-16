@@ -70,7 +70,7 @@ func cloudEnv(p *project.Project) []string {
 	})
 }
 
-// runTofu runs the tofu on PATH as `vm create` does: in a session of its own, a cancelled run
+// runTofu runs the tofu on PATH that registers the clouds' images: in a session of its own, a cancelled run
 // interrupted once (OpenTofu writes its state before it exits) and killed with what it started
 // once the grace period has passed.
 func runTofu(ctx context.Context, args, env []string, log io.Writer) ([]byte, error) {

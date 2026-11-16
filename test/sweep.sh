@@ -64,10 +64,6 @@ for n in $(docker ps -a --format '{{.Names}}' | grep -E '^stowage-e2e-zot-r[0-9a
 	run_live "${r%-dav}" "$(created "$n")" || docker rm -f "$n" >/dev/null 2>&1
 done
 
-# e2e-kairos's libvirt daemon of a dead run, stowage-e2e-libvirtd-<run> (with its domains).
-for n in $(docker ps -a --format '{{.Names}}' | grep -E '^stowage-e2e-libvirtd-r[0-9a-f]+$'); do
-	run_live "${n#stowage-e2e-libvirtd-}" "$(created "$n")" || docker rm -f "$n" >/dev/null 2>&1
-done
 # kind clusters of dead runs, stowage-e2e-<run>: their node containers (and anonymous volumes),
 # then their network.
 for c in $(docker ps -a --filter label=io.x-k8s.kind.cluster --format '{{.Label "io.x-k8s.kind.cluster"}}' | sort -u | grep -E '^stowage-e2e-r[0-9a-f]+$'); do

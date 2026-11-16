@@ -27,6 +27,7 @@ import (
 	"github.com/norvexlabs/stowage/internal/dockerfile"
 	"github.com/norvexlabs/stowage/internal/front"
 	"github.com/norvexlabs/stowage/internal/helm"
+	"github.com/norvexlabs/stowage/internal/installerbin"
 	"github.com/norvexlabs/stowage/internal/kairos"
 	"github.com/norvexlabs/stowage/internal/project"
 	"github.com/norvexlabs/stowage/internal/providers"
@@ -36,9 +37,10 @@ import (
 	"github.com/norvexlabs/stowage/internal/spec"
 )
 
-// Platform is the platform every built image targets. It is one of an image's inputs, so an image
-// built for another platform is never kept or re-tagged in its place.
-const Platform = "linux/amd64"
+// Platform is the platform every built image targets: the one an install runs on
+// (installerbin.Target). It is one of an image's inputs, so an image built for another platform
+// is never kept or re-tagged in its place.
+const Platform = installerbin.Target
 
 // platform is what imageNode digests; tests change it to prove the platform is an input.
 var platform = Platform
@@ -117,9 +119,9 @@ type Release struct {
 	Version  string
 	Revision int
 	Channel  string
-	// Installer is the installer executable the release's installer image is made of: the one
-	// this Stowage publishes.
-	Installer []byte
+	// Installer is the installer executable per platform the release's installer image is made
+	// of, one entry each: the ones this Stowage publishes. The OS bundle carries the target's.
+	Installer installerbin.Set
 	// Pull is the pull account baked into the installer ("" when the project has none).
 	Pull string
 }
@@ -237,7 +239,13 @@ func Build(p *project.Project, r Release) (*Graph, error) {
 	if err != nil {
 		return nil, err
 	}
-	executable := fmt.Sprintf("sha256:%x", sha256.Sum256(r.Installer))
+	// The bundle's <short>-stow is the target's executable; the installer image holds every one.
+	// Each executable's sha256, as its build recorded it (checked when ship decompresses it).
+	executable := r.Installer.Digest(installerbin.Target)
+	var executables []string
+	for _, pl := range slices.Sorted(maps.Keys(r.Installer)) {
+		executables = append(executables, pl+"="+r.Installer.Digest(pl))
+	}
 	pull := fmt.Sprintf("sha256:%x", sha256.Sum256([]byte(r.Pull)))
 
 	installerDeps := append([]string(nil), imageIDs...)
@@ -290,7 +298,7 @@ func Build(p *project.Project, r Release) (*Graph, error) {
 	installer.Field("images", images)
 	installer.Field("changelog", text)
 	installer.Field("scheme", string(scheme))
-	installer.Field("executable", executable)
+	installer.Field("executables", strings.Join(executables, ","))
 	installer.Field("pull", pull)
 	if err := installer.Tree(p.Root, installed, nil); err != nil {
 		return nil, fmt.Errorf("installer: %w", err)

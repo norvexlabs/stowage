@@ -103,7 +103,9 @@ share; each shape's own fields and verbs are on its page:
     "tls": "acme",
     "domains": { "app": "notes.example.org" },
     "http_port": 80,
-    "https_port": 443
+    "https_port": 443,
+    "acme_ca_root": "sha256:…",
+    "pull_login": true
   }
   ```
   `inputs` the recorded inputs the installed release declares, and those of the recorded TLS
@@ -119,12 +121,22 @@ share; each shape's own fields and verbs are on its page:
   domain (the front's routes and the L4 routes it terminates), and `http_port` and `https_port`,
   the host ports the front publishes in that mode (`--http-port`, `--https-port`; a front of L4
   routes alone publishes plain HTTP for `acme`'s challenge only), and in `acme` and
-  `dns-cloudflare` `acme_ca`, the ACME directory `--acme-ca` gave (left out for Let's Encrypt's);
+  `dns-cloudflare` `acme_ca`, the ACME directory `--acme-ca` gave (left out for Let's Encrypt's),
+  and `acme_ca_root`, `sha256:<hex>` of the root `--acme-ca-root` gave, as the install holds it
+  (as a file input's; left out when it holds none), or `acme_ca_root_error`, why the root held
+  cannot be read (left out when it can);
   in loopback mode `ports`, each
   front route's loopback port (`--ports`; an L4 route's host port is the spec's): a recorded port
   that is no port (not a number 1..65535 written plainly, without a sign or a leading zero) is
   left out, not known; a domain the project declares secret
-  is left out; each left out when it holds nothing, and all of them without a front, as on Kubernetes. `values` is left out
+  is left out; each left out when it holds nothing, and all of them without a front, as on Kubernetes.
+  `pull_login` (always there) is whether the install holds a pull login (`--registry-login-file`,
+  `registry-login`; on Kubernetes the pull Secret holding the login a run gave), never the login
+  nor its host (`status --json`'s `registry_login` names the host): `false` too when the login held
+  cannot be read, which `pull_login_error` says (left out when it can) — on Docker and the VM the
+  text of `status --json`'s `registry_login_error`; on Kubernetes, which has no
+  `registry_login_error`, `the pull Secret <release>-stowage-pull cannot be read: …` (kubectl's
+  read failing) or `… holds a login that does not parse: …`, never the login. `values` is left out
   when the spec of the release installed cannot be read — what is secret is not known —, though
   `inputs` may still list the keys the install recorded; on Kubernetes when the installer run
   does not carry the release installed (as `inputs`); and before the VM's first install.

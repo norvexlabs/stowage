@@ -24,12 +24,15 @@ import (
 
 	"github.com/google/go-containerregistry/pkg/authn"
 	ggcrregistry "github.com/google/go-containerregistry/pkg/registry"
+	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/empty"
 	"github.com/google/go-containerregistry/pkg/v1/mutate"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
 	"github.com/google/go-containerregistry/pkg/v1/tarball"
+	"github.com/google/go-containerregistry/pkg/v1/types"
 	"github.com/spf13/cobra"
 
+	"github.com/norvexlabs/stowage/internal/installerbin"
 	"github.com/norvexlabs/stowage/internal/payload"
 	"github.com/norvexlabs/stowage/internal/registry"
 	"github.com/norvexlabs/stowage/internal/release"
@@ -117,20 +120,39 @@ func (p *pubEnv) publish(version string, revision int, mm func(*release.Manifest
 func (p *pubEnv) pushInstaller(file string, exe []byte) string {
 	t := p.t
 	t.Helper()
-	var buf bytes.Buffer
-	tw := tar.NewWriter(&buf)
-	_ = tw.WriteHeader(&tar.Header{Name: file, Mode: 0o755, Size: int64(len(exe)), Typeflag: tar.TypeReg})
-	_, _ = tw.Write(exe)
-	_ = tw.Close()
-	l, err := tarball.LayerFromOpener(func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(buf.Bytes())), nil })
-	if err != nil {
-		t.Fatal(err)
+	image := func(exe []byte, platform v1.Platform) v1.Image {
+		var buf bytes.Buffer
+		tw := tar.NewWriter(&buf)
+		_ = tw.WriteHeader(&tar.Header{Name: file, Mode: 0o755, Size: int64(len(exe)), Typeflag: tar.TypeReg})
+		_, _ = tw.Write(exe)
+		_ = tw.Close()
+		l, err := tarball.LayerFromOpener(func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(buf.Bytes())), nil })
+		if err != nil {
+			t.Fatal(err)
+		}
+		img, err := mutate.AppendLayers(empty.Image, l)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cf, err := img.ConfigFile()
+		if err != nil {
+			t.Fatal(err)
+		}
+		cf = cf.DeepCopy()
+		cf.OS, cf.Architecture = platform.OS, platform.Architecture
+		if img, err = mutate.ConfigFile(img, cf); err != nil {
+			t.Fatal(err)
+		}
+		return img
 	}
-	img, err := mutate.AppendLayers(empty.Image, l)
-	if err != nil {
-		t.Fatal(err)
-	}
-	h, err := img.Digest()
+	// As ship makes it: an index of one image per platform. Another platform's comes first and
+	// cannot run (its first line is no interpreter's): a fetch that took it fails.
+	arm := v1.Platform{OS: "linux", Architecture: "arm64"}
+	amd := v1.Platform{OS: "linux", Architecture: "amd64"}
+	idx := mutate.AppendManifests(mutate.IndexMediaType(empty.Index, types.OCIImageIndex),
+		mutate.IndexAddendum{Add: image(append([]byte(otherPlatformLine), exe...), arm), Descriptor: v1.Descriptor{Platform: &arm}},
+		mutate.IndexAddendum{Add: image(exe, amd), Descriptor: v1.Descriptor{Platform: &amd}})
+	h, err := idx.Digest()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -139,11 +161,140 @@ func (p *pubEnv) pushInstaller(file string, exe []byte) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := remote.Write(ref, img); err != nil {
+	if err := remote.WriteIndex(ref, idx); err != nil {
 		t.Fatal(err)
 	}
 	return h.String()
 }
+
+// A fetch takes the installer index's image for the platform the running installer is on — the
+// target's on a target, an operator's machine's own for a Kubernetes upgrade —, and refuses a
+// platform the index has no image for, naming those it has.
+func TestFetchTakesTheInstallerOfItsOwnPlatform(t *testing.T) {
+	t.Parallel()
+	p := published(t, spec.Provider{Name: "none"}, nil)
+	r, exe := p.publish("2.0.0", 1, nil, nil)
+	want, err := os.ReadFile(exe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := *r.Manifest
+	m.Artifacts.Installer = p.pushInstaller("notes-stow", want) // the index publish pushed
+	c := registry.New(authn.NewMultiKeychain())
+	for platform, prefix := range map[string]string{"linux/amd64": "", "linux/arm64": otherPlatformLine} {
+		in := p.installer(func(o *Options) { o.Platform = platform })
+		got, _, err := in.fetchInstaller(context.Background(), c, p.prefix, &m)
+		if err != nil {
+			t.Fatalf("%q: %v", platform, err)
+		}
+		raw, err := os.ReadFile(got)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(raw) != prefix+string(want) {
+			t.Errorf("%q: fetched another platform's installer", platform)
+		}
+	}
+	in := p.installer(func(o *Options) { o.Platform = "darwin/arm64" })
+	_, _, err = in.fetchInstaller(context.Background(), c, p.prefix, &m)
+	if err == nil || !strings.Contains(err.Error(), "has no image for darwin/arm64 (it has linux/arm64, linux/amd64)") {
+		t.Fatalf("a platform the index lacks: %v", err)
+	}
+	fix := "run the same command from a linux/amd64 machine: every installer image has its executable"
+	if refusedFix(err) != fix {
+		t.Errorf("the fix: %q", refusedFix(err))
+	}
+	// An installer a stowage before 0.40.0 published, one linux/amd64 image: refused on another
+	// platform with the same fix, run on the target's.
+	ref, err := c.Digest(p.prefix+"/notes-installer", m.Artifacts.Installer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries, _, err := c.Platforms(context.Background(), ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if e.Platform.String() == installerbin.Target {
+			m.Artifacts.Installer = e.Digest.String()
+		}
+	}
+	_, _, err = in.fetchInstaller(context.Background(), c, p.prefix, &m)
+	if err == nil || refusedFix(err) != fix || !strings.Contains(err.Error(), "the installer of notes 2.0.0 (2.0.0-1) has none for this machine, darwin/arm64 (one a stowage before 0.40.0 published is a linux/amd64 image alone)") ||
+		!strings.Contains(err.Error(), "is a linux/amd64 image, not darwin/arm64") {
+		t.Fatalf("a single image on darwin/arm64: %v (fix %q)", err, refusedFix(err))
+	}
+	target := p.installer(func(o *Options) { o.Platform = installerbin.Target })
+	if _, _, err := target.fetchInstaller(context.Background(), c, p.prefix, &m); err != nil {
+		t.Fatalf("a single image on %s: %v", installerbin.Target, err)
+	}
+	// On the target's platform, a release without its image is broken: no fix sends it elsewhere.
+	for _, e := range entries {
+		if e.Platform.String() == "linux/arm64" {
+			m.Artifacts.Installer = e.Digest.String()
+		}
+	}
+	if _, _, err := target.fetchInstaller(context.Background(), c, p.prefix, &m); err == nil || refusedFix(err) != "" {
+		t.Fatalf("another platform's image alone on %s: %v (fix %q)", installerbin.Target, err, refusedFix(err))
+	}
+}
+
+// A Kubernetes Job runs the installer index's image for the target's platform, by its digest in
+// the same repository (on a node of that platform, jobNodeSelector). One image (what a Stowage
+// before 0.40.0 published) runs as it is; one for another platform, an index without the target's
+// image or a ref the registry does not hold is refused, naming the ref.
+func TestAJobRunsTheInstallerIndexsTargetImage(t *testing.T) {
+	t.Parallel()
+	p := published(t, spec.Provider{Name: "none"}, nil)
+	_, exe := p.publish("2.0.0", 1, nil, nil)
+	raw, err := os.ReadFile(exe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	idx := p.pushInstaller("notes-stow", raw)
+	repo := p.prefix + "/notes-installer"
+	c := registry.New(authn.NewMultiKeychain())
+	ref, err := c.Digest(repo, idx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries, _, err := c.Platforms(context.Background(), ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	child := map[string]string{}
+	for _, e := range entries {
+		child[e.Platform.String()] = e.Digest.String()
+	}
+	in := p.installer(nil)
+	in.O.K8s.JobImage = nil
+	image := func(ref string) (string, error) {
+		return in.hookImage(context.Background(), p.prefix, ref, nil, hookUse)
+	}
+	got, err := image(repo + "@" + idx)
+	if err != nil || got != repo+"@"+child[installerbin.Target] {
+		t.Fatalf("the index: %q %v (want its %s image %s)", got, err, installerbin.Target, child[installerbin.Target])
+	}
+	if got, err := image(repo + "@" + child[installerbin.Target]); err != nil || got != repo+"@"+child[installerbin.Target] {
+		t.Fatalf("one image of the target's platform: %q %v", got, err)
+	}
+	for what, d := range map[string]string{
+		"another platform's image": child["linux/arm64"],
+		"absent":                   "sha256:" + strings.Repeat("0", 64),
+	} {
+		if _, err := image(repo + "@" + d); err == nil || !strings.Contains(err.Error(), repo+"@"+d) {
+			t.Errorf("%s: %v", what, err)
+		}
+	}
+	// A read failing (the registry down) is refused too, naming the ref.
+	if _, err := in.hookImage(context.Background(), "127.0.0.1:1/x", "127.0.0.1:1/x/notes-installer@"+idx, nil, hookUse); err == nil ||
+		!strings.Contains(err.Error(), "127.0.0.1:1/x/notes-installer@"+idx) {
+		t.Errorf("an unreadable registry: %v", err)
+	}
+}
+
+// otherPlatformLine starts the linux/arm64 installer pushInstaller pushes, before the executable.
+const otherPlatformLine = "# linux/arm64\n"
 
 // signRelease signs the release manifest under tag with s.
 func (p *pubEnv) signRelease(tag string, s *testutil.KeySigner) {
@@ -613,6 +764,11 @@ func (l layerOf) Uncompressed() (io.ReadCloser, error) {
 }
 
 func TestExtractTakesOneRegularFileWithinBounds(t *testing.T) {
+	// The bound is the one file an installer image holds (installerbin.MaxFile): an executable
+	// installerbin bounds with the largest payload.
+	if maxInstaller != installerbin.MaxFile {
+		t.Fatalf("maxInstaller is %d, an installer image's file is up to %d", maxInstaller, installerbin.MaxFile)
+	}
 	old := maxInstaller
 	maxInstaller = 8
 	t.Cleanup(func() { maxInstaller = old })

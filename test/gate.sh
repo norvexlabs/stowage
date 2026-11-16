@@ -95,13 +95,19 @@ for f in "${changed[@]}"; do
 		lifecycle "$f"
 		[[ $f == internal/publish/os.go ]] && need e2e-kairos "$f"
 		;;
-	internal/install/tofu/* | internal/install/vmtofu*.go | internal/install/seed*.go | internal/install/vm.go | \
-		internal/install/vmhealth*.go | internal/install/vmcreate*.go | internal/install/vmcli*.go | internal/install/hostd*.go)
+	# The TrueNAS steps (vmtruenas*.go) are what both VM suites' OpenTofu roots run; vmseed*.go their
+	# seed; vmssh*.go, vmkit*.go and vmhostkey*.go the verbs e2e-vm runs over SSH.
+	# internal/install/tofu/* and vmtofu*.go: a path not in the tree keeps its rule, as a GATE_BASE
+	# diff names it.
+	internal/install/tofu/* | internal/install/vmtofu*.go | internal/install/vmtruenas*.go | internal/install/vmseed*.go | \
+		internal/install/vmssh*.go | internal/install/vmkit*.go | internal/install/vmhostkey*.go | internal/install/seed*.go | \
+		internal/install/vm.go | internal/install/vmhealth*.go | internal/install/vmcreate*.go | internal/install/vmcli*.go | internal/install/hostd*.go)
 		need smoke-install "$f"
 		lifecycle "$f"
 		vm_side "$f"
-		# A machine's creation and its seed: bare metal's is examples/full's (its installer).
-		[[ $f == internal/install/vmcreate*.go || $f == internal/install/seed*.go ]] && need e2e-full-vm "$f"
+		# A machine's creation and its seed (vm seed's too): bare metal's is examples/full's (its
+		# installer); the TrueNAS steps: test/metal-truenas runs import-image, seed and stop.
+		[[ $f == internal/install/vmcreate*.go || $f == internal/install/seed*.go || $f == internal/install/vmseed*.go || $f == internal/install/vmtruenas*.go ]] && need e2e-full-vm "$f"
 		;;
 	internal/install/audit.go) # the Docker host's audit, and the VM's scanner (preloaded, or pulled)
 		need smoke-install "$f"
@@ -199,7 +205,10 @@ for f in "${changed[@]}"; do
 	internal/lint/* | internal/testutil/*) ;;
 	# Stowage's own release gate: make self-audit (images built, scanned; needs the network).
 	audit-allow.yaml | test/selfaudit/*) selfaudit=true ;;
-	internal/truenas/*) need e2e-vm "$f" ;;
+	internal/truenas/*) # the TrueNAS steps' client: both VM suites' roots run them
+		need e2e-vm "$f"
+		need e2e-full-vm "$f"
+		;;
 	examples/minimal/*)
 		need e2e "$f"
 		need e2e-docker "$f"
@@ -251,9 +260,16 @@ for f in "${changed[@]}"; do
 	test/e2e-stateless.sh) need e2e-stateless "$f" ;;
 	test/e2e-k8s.sh) need e2e-k8s "$f" ;;
 	test/e2e-full-k8s.sh) need e2e-full-k8s "$f" ;;
+	# test/libvirtd/*: a path not in the tree keeps its rule, as a GATE_BASE diff names it.
 	test/e2e-kairos.sh | test/libvirtd/*) need e2e-kairos "$f" ;;
-	test/e2e-vm.sh) need e2e-vm "$f" ;;
-	test/e2e-full-vm.sh | test/vm.sh | test/metal-truenas/*) need e2e-full-vm "$f" ;;
+	# The VM suites' OpenTofu roots: e2e-vm's VMs (test/vm-truenas), e2e-full-vm's machine
+	# (test/metal-truenas); test/vm.sh, which applies them, is both suites'.
+	test/e2e-vm.sh | test/vm-truenas/*) need e2e-vm "$f" ;;
+	test/e2e-full-vm.sh | test/metal-truenas/*) need e2e-full-vm "$f" ;;
+	test/vm.sh)
+		need e2e-vm "$f"
+		need e2e-full-vm "$f"
+		;;
 	.githooks/* | test/hooks.sh) hooks=true ;; # the git hooks' branches, test/hooks.sh
 	test/lib.sh | test/pins.sh | test/sweep.sh) # shared by every suite; the short ones exercise it
 		need e2e "$f"

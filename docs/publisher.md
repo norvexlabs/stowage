@@ -70,9 +70,15 @@ stowage -C <project> --test-registry PREFIX [--test-push USER:ENV] [--test-pull 
   binaries is two findings, each `in` its binary; an SBOM whose files or relationships do not
   decode leaves its artifact `not audited`; an
   artifact without an SBOM by a trusted key (or whose scan failed) is listed as `not audited:
-  <why>`. `--json` prints the report: `{project, version, revision, channel, tag, db_built,
-  subjects: [{name, owner, digest, error, findings: [{id, severity, package, version, type,
-  fixed_in, path}]}]}`, `owner` being who fixes the artifact's findings: `stowage` for what Stowage
+  <why>`. The installer is a subject per image of its index: `installer` (the index, carrying its
+  linux/amd64 image's SBOM, what a target runs), then `installer (<os>/<arch>)` for each other
+  platform's image, read from the registry's index; an index that cannot be read (or names a
+  platform that is no `os/arch[/variant]`) is one subject `installer (other platforms)`, `not
+  audited` with why, beside the rest of the release, which is read as ever (the gate, `audit` and
+  `sbom export` alike). `--json` prints the report: `{project,
+  version, revision, channel, tag, db_built, subjects: [{name, platform, owner, digest, error,
+  findings: [{id, severity, package, version, type, fixed_in, path}]}]}` (`platform` an installer
+  image's, absent otherwise; an allowance's `artifact: installer` covers every one), `owner` being who fixes the artifact's findings: `stowage` for what Stowage
   supplies (the images `front`, `backup`, `chown` and `audit`, built from its recipes, and the
   installer), `project` for the rest: the project's own images, and the OS bundle and its disks,
   whose contents its `shapes.kairos` pins (`base`, `kairos_init`) decide. The printed summary splits the counts the same
@@ -160,7 +166,9 @@ stowage -C <project> --test-registry PREFIX [--test-push USER:ENV] [--test-pull 
   archive instead. `audit` is the publisher's alone: no artifact carries it, and changing it
   changes no release's inputs. Without `audit`, nothing is scanned before publication.
 - `sbom export [<version>] DIR` checks the release as `verify` does and writes the SBOMs `audit`
-  reads, as the installer's `sbom export` does (`DIR/<artifact>.spdx.json`, `DIR/index.json`).
+  reads, as the installer's `sbom export` does (`DIR/<artifact>.spdx.json`, each image of the installer
+  index but the linux/amd64 one, whose SBOM the index carries, `DIR/installer/<os>-<arch>.spdx.json`
+  — a folder no image key can name —, `DIR/index.json`).
 - `prune` without a version deletes every release of the channel except the pointer's. With a
   version, it deletes every revision of that version, and the pointer moves back when it held
   one. An immutable channel is refused: yank instead. `--keep N` (1 or more; not with a version)
@@ -343,7 +351,8 @@ The release manifest (artifact type `application/vnd.stowage.release.v1+json`) h
   - `images`: each image's digest, keyed by the spec's image key, plus `front` (the front
     Stowage builds);
   - `configs` and `manifests`: each image's linux/amd64 config and manifest digests;
-  - `installer`: the installer image's digest;
+  - `installer`: the installer image's digest: its index, which pins each platform's image (see
+    "The installer image" below);
   - `chart` (a project with the `kubernetes` shape): `{repository, version, digest}`, the chart's
     repository under the prefix (`charts/<name>-<channel>`), its version (`0.<release_seq>.0`)
     and its manifest digest;
@@ -362,12 +371,62 @@ The release manifest (artifact type `application/vnd.stowage.release.v1+json`) h
 | `<name>-backup` | the backup runner, built by Stowage (a `docker` or `kairos` shape with a `pg-age-rclone` or `volumes-age-rclone` backup), by the release tag |
 | `<name>-chown` | the volume helper, built by Stowage (a `docker` or `kairos` shape with a `data.volumes` entry of a `uid`), by the release tag |
 | `<name>-audit` | the vulnerability scanner a signing release carries (grype, built from its source by ship), by the release tag |
-| `<name>-installer` | the release tag, and `:latest` |
+| `<name>-installer` | the installer image (an index of one image per platform), by the release tag, and `:latest` |
 | `<name>-os` | the Kairos OS bundle (an image), by the release tag |
 | `<name>-disk` | each disk image by `<tag>-<format>` (one disk set per channel), and `latest-<format>` |
 | `charts/<name>-<channel>` | the channel's Helm charts (OCI), each by its version `0.<release_seq>.0`. The release manifests are the channel's offer: a yank deletes nothing, so the repository's highest version may be a yanked release's — install the version a release names (`--version`), never the latest |
 | `<name>-release` | the release tag; `:<channel>` (the channel pointer) |
 | `<name>-release-seq` | `:<channel>`: the last sequence number claimed, written before the release so a number is never reused, even after a prune or a failure |
+
+**The installer image** (`<prefix>/<name>-installer`), as a client without Docker reads it:
+
+- It is an OCI image index (`application/vnd.oci.image.index.v1+json`), the release manifest's
+  `artifacts.installer` digest, tagged with the release tag (and `:latest` on the channel that
+  sets latest). It lists one image (`application/vnd.oci.image.manifest.v1+json`) per platform,
+  in this order: `linux/amd64`, `linux/arm64`, `darwin/amd64`, `darwin/arm64` (no Windows yet);
+  each entry's `platform` names its `os` and `architecture`, and the image's config says the same.
+- Each image has one layer (`application/vnd.oci.image.layer.v1.tar+gzip`) holding one regular
+  file at its root, `<short>-stow` (mode 0755): that platform's static `<short>-stow`, followed by
+  the release's payload (a tar of the release manifest less its installer digest and yank, the
+  runtime spec, the compose file, the trusted keys and the pull account; then the tar's length as
+  8 bytes, big-endian; then `STOWAGE-PAYLOAD1`). The config's entrypoint is `/<short>-stow`, its
+  command `script`, its label `org.opencontainers.image.version` the release tag.
+- To verify an image: check the release manifest `<prefix>/<name>-release:<tag>` against the
+  project's `public_keys` (a cosign signature, as installs check it); it names the index by
+  digest, the index each image by digest, the image its layer. Each image and the index also
+  carry a signature of their own and an SBOM attestation (the index's is its linux/amd64
+  image's), so one image checks alone: `cosign verify --key <public key>
+  --insecure-ignore-tlog=true <prefix>/<name>-installer@<the image's digest>`.
+- The darwin images are unproven on macOS until they run there: each is Go's ad-hoc
+  (linker-signed) Mach-O with the payload appended after the range its code signature covers,
+  which Stowage's tests check by structure alone (no Mac runs them; `codesign --verify --strict`
+  rejects such a file); until a run on a Mac proves them, the linux images are the proven ones.
+- To run it: write the file out, make it executable, run it. `<short>-stow script` prints the
+  bootstrap script (the file inside a shell script), what `docker run --rm <installer image>`
+  prints. On any of the four platforms it runs the verbs of an operator's machine: `script`,
+  `describe`, the `k8s` verbs, the `vm` verbs (`vm seed`, `vm truenas …`, `vm host-key`, `vm kit
+  …`) and `mirror`.
+- Which image a target uses: an install runs on linux/amd64 alone, which the release's images
+  are built for. `docker run` takes the image of the Docker host's platform, so an arm64 host gets
+  the linux/arm64 one, whose every other verb refuses (exit 3): `this installer is the
+  linux/arm64 build: <name> installs on linux/amd64 hosts alone (its images are built for it);
+  here it runs script, describe, k8s, vm, mirror alone`, naming `docker run --rm --platform
+  linux/amd64 <installer image> > <name>.sh`. `upgrade --version` (and `k8s upgrade --version`,
+  from an operator's machine) fetches the image of the platform the running `<short>-stow` is
+  on, and is refused when the index has none, naming the ones it has (`… has no image for
+  <platform> (it has …)`). An installer image a `stowage` before 0.40.0 published is one
+  linux/amd64 image: from a machine of another platform (a darwin operator's `k8s upgrade
+  --version <old>`), `upgrade --version` refuses it (exit 3): `the installer of <name> <version>
+  (<tag>) has none for this machine, <os>/<arch> (one a stowage before 0.40.0 published is a
+  linux/amd64 image alone): <ref> is a linux/amd64 image, not <os>/<arch>: …`, with the fix `run
+  the same command from a linux/amd64 machine: every installer image has its executable`. On a
+  linux/amd64 machine the same release's installer runs. The OS bundle carries the linux/amd64 one. A Kubernetes Job that runs
+  the installer image (the provision hook, a handoff) runs its linux/amd64 image by digest
+  (`<prefix>/<name>-installer@<that image's digest>`), read from the index when the Job is
+  planned.
+- An installer image a `stowage` before 0.40.0 published is one linux/amd64 image of the same
+  shape, which every reader above takes as it is for linux/amd64 (another platform's fetch is
+  refused, as above).
 
 On the publisher's machine:
 
@@ -388,8 +447,14 @@ variable); `verify` and `releases` read with `registry.pull` only. A `token` pul
 into every installer: `ship` and `promote` read its password from the named variable in the
 publisher's environment and refuse without it (the account is read-only, near-public by design;
 its password is one of the installer's inputs, so rotating it is a new revision). The installer
-`<short>-stow` is embedded in the `stowage` binary that `make build` makes (a plain `go build` has
-none and cannot publish); it is one of the installer's inputs too. So `ship` and `promote` refuse
+`<short>-stow` is embedded in the `stowage` binary that `make build` makes, built for each platform
+of the installer image and gzip-compressed beside its sha256 and its size (a plain `go build` has none and
+cannot publish, nor can a build missing a platform); the executables are the installer's inputs
+too (the OS bundle's, the linux/amd64 one alone), each by the sha256 its build recorded, so `plan`
+decompresses none. `ship` and `promote` decompress each before anything is built and refuse one
+whose size or sha256 is not the recorded one (`the <os>/<arch> installer: its executable is …
+bytes, and the build recorded …` or `… its executable's sha256 is …, and the build recorded …`,
+each ending `: rebuild stowage (make build)`). So `ship` and `promote` refuse
 a `stowage` other than the version `stowage.lock` pins, or a project without the file: moving the
 pin (`stowage lock --update`) is a reviewed change, and the release it publishes next carries the
 new installer and front (a version already on an immutable channel needs a new `--revision`). A registry is reached over
@@ -455,12 +520,14 @@ platform is part of an image's inputs). What `ship` does, in order:
    images'. A failure leaves every tag as it was (a bundle built before a disk failed is built
    again by the next ship). On an immutable channel, a published release whose bundle or a disk
    would now differ is refused — publish a new `--revision`;
-5. the installer image `<prefix>/<name>-installer:<tag>` is made: one linux/amd64 file,
-   `<short>-stow`, with the release appended (the manifest less its own installer digest and yank,
-   the compose file, the runtime spec, the trusted keys, the pull account); its default command
-   prints the bootstrap script. It has no timestamp, so the same release makes the same digest
-   (a re-ship rewrites nothing, and puts back a lost tag); it is pushed by digest, signed, then
-   tagged;
+5. the installer image `<prefix>/<name>-installer:<tag>` is made: an OCI index of one image per
+   platform (linux/amd64, linux/arm64, darwin/amd64, darwin/arm64), each holding one file,
+   `<short>-stow` built for that platform, with the release appended (the manifest less its own
+   installer digest and yank, the compose file, the runtime spec, the trusted keys, the pull
+   account); its default command prints the bootstrap script (see "The installer image" below).
+   It has no timestamp, so the same release makes the same digest (a re-ship rewrites nothing,
+   and puts back a lost tag); it is pushed by digest with its images, each image and the index
+   signed, then tagged;
 6. the release manifest, naming the installer, the chart, the OS bundle and the disks, is pushed to
    `<prefix>/<name>-release:<tag>`, verified, and only then the channel pointer
    `<prefix>/<name>-release:<channel>` moves — never backwards to an earlier release, never to
@@ -548,7 +615,8 @@ An upload given up (lost, failed, or replaced by the one stream) is deleted, unl
 byte: its commit may be under way.
 
 **Signing** (`signing: { provider: cosign-key, key: …, public_keys: [...] }`): every image, chart,
-OS bundle, disk image, installer and release manifest is signed by digest before its tag moves, with the `cosign` CLI (v3, on
+OS bundle, disk image, installer (its index and each of its images) and release manifest is signed
+by digest before its tag moves, with the `cosign` CLI (v3, on
 `PATH`, or `STOWAGE_COSIGN`); a signature already made by a listed public key is not made again.
 `key` is a file (relative to the project root), `env://VAR` or a KMS/Vault URI; an encrypted key
 file reads its password from `COSIGN_PASSWORD`. Signatures are OCI referrers (sigstore bundles),
@@ -608,13 +676,15 @@ by `cosign sign` (an attestation the key made over the same digest does not), ch
 hash cosign uses for the key type.
 
 **SBOMs.** A project that signs gives each image of a release (its own, the mirrored ones and
-Stowage's), its installer, its OS bundle and each disk an SBOM: an SPDX 2.3 JSON document made by syft
+Stowage's), each image of its installer, its OS bundle and each disk an SBOM: an SPDX 2.3 JSON document made by syft
 (`docker.io/anchore/syft:v1.55.0`, pinned by digest, run on the local engine on the host network,
 reading the image from the registry with the push account), attached with `cosign attest --type
 spdxjson` signed by the release key as an in-toto attestation (predicate type
 `https://spdx.dev/Document`), stored as a sigstore bundle referrer of the artifact's digest, as the
-signatures are. A disk's is its bundle's, attested on the disk (`attested the SBOM of <ref> (its
-bundle's)`), with no scan of its own. `ship` and `promote` log `attested the SBOM of <ref>` for each one made; an
+signatures are. An image is read for linux/amd64 (an index's image for it), an installer's image for
+its own platform (syft's `--platform`). A disk's is its bundle's, attested on the disk (`attested
+the SBOM of <ref> (its bundle's)`), with no scan of its own; the installer index carries its
+linux/amd64 image's (`attested the SBOM of <ref> (its linux/amd64 image's)`). `ship` and `promote` log `attested the SBOM of <ref>` for each one made; an
 artifact that already carries one by a trusted key is left (a re-ship makes none, an SBOM deleted
 from the registry is made again), and one made is read back before the release is written. The
 SBOM of a digest is made once: a later syft makes no new one, and a digest that already carries
@@ -675,7 +745,13 @@ retired): the mark is the registry's record of it, so a run stopped part way los
 other tag holds any more (a failure there is a warning, `warning: held content not swept …`, the
 marks staying); a `prune` ends by doing so for every mark in the release and installer
 repositories and those it untagged, a stopped run's included (logged `<ref> deleted: no tag holds
-it any more`; the mark goes with it). A `held-` tag never counts as holding content. A retired release tag is no release: `prune`, `verify`, installs
+it any more`, once per manifest; the mark goes with it). A `held-` tag never holds the content it
+names, but a marked index still in the registry holds what it names. Content deleted by digest
+that is an index (an installer's, a multi-platform image's) takes with it, after it, each
+manifest it names that no other tag holds — directly, or through another index a tag holds, a
+marked one the same run does not delete included —, each marked `held-` first, so a run stopped
+between leaves them to the next sweep. Indexes go first, then what they named, judged once every
+index of the run is gone: a manifest two deleted indexes name goes once, after both. A retired release tag is no release: `prune`, `verify`, installs
 and mirrors skip it; it stays in the registry.
 
 A mutable release shipped again over its tag whose earlier build had an image key, an installer or

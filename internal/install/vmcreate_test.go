@@ -10,7 +10,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/norvexlabs/stowage/internal/testutil"
 	"io"
 	"maps"
 	"net/netip"
@@ -23,6 +22,8 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/norvexlabs/stowage/internal/testutil"
 
 	"github.com/diskfs/go-diskfs/backend/file"
 	"github.com/diskfs/go-diskfs/filesystem/iso9660"
@@ -232,6 +233,23 @@ func TestVMCreateWritesTheDiskTheSeedAndTheSteps(t *testing.T) {
 		if !strings.Contains(v.out2(), s) {
 			t.Errorf("no %q in:\n%s", s, v.out2())
 		}
+	}
+}
+
+// A hypervisor's VM of one NIC: no MAC to make it with, as the cloud-config names the NIC the VM
+// has and its first boot pins it to its MAC; the steps list none.
+func TestVMCreateListsNoMACForOneNIC(t *testing.T) {
+	t.Parallel()
+	v := newVMCreate(t, "qcow2")
+	v.r.Spec.Host = &spec.Host{Interfaces: map[string]spec.HostInterface{"uplink": {Primary: true}}}
+	err := v.create(VMCreate{Platform: "truenas", Hostname: "notes-1", User: "ops"}, func(o *Options) {
+		o.TLS, o.Set = "internal", map[string]string{"APP_DOMAIN": "app.example.org", "API_DOMAIN": "api.example.org"}
+	})
+	if err != nil {
+		t.Fatalf("%v\n%s", err, v.log)
+	}
+	if strings.Contains(v.out2(), "Its NICs") || strings.Contains(v.out2(), "02:") {
+		t.Errorf("a MAC listed for the one NIC:\n%s", v.out2())
 	}
 }
 
@@ -684,6 +702,26 @@ func TestVMCreateRefusals(t *testing.T) {
 	}
 }
 
+// vm create writes the files alone: it takes none of the flags that made a VM, and vm destroy and
+// vm attach are gone.
+func TestVMCreateMakesNoVM(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	for _, flag := range []string{"--create", "--module", "--tofu-var", "--vm-name", "--pool", "--dataset", "--bridge", "--cpus", "--memory", "--disk", "--host", "--wait", "--kit"} {
+		cmd := newCommand(e.r, e.self, io.Discard, io.Discard, K8sOptions{}, func(bool) Prompter { return nil })
+		cmd.SetArgs([]string{"vm", "create", flag, "x"})
+		if err := cmd.Execute(); err == nil || !strings.Contains(err.Error(), "unknown flag: "+flag) {
+			t.Errorf("vm create %s: %v", flag, err)
+		}
+	}
+	root := newCommand(e.r, e.self, io.Discard, io.Discard, K8sOptions{}, func(bool) Prompter { return nil })
+	for _, verb := range []string{"destroy", "attach"} {
+		if c, _, err := root.Find([]string{"vm", verb}); err == nil && c.Name() == verb {
+			t.Errorf("vm %s is there", verb)
+		}
+	}
+}
+
 func TestVMCreateReadsNoInputFromTheEnvironment(t *testing.T) {
 	t.Parallel()
 	v := newVMCreate(t, "qcow2")
@@ -787,21 +825,17 @@ func TestVMCreateAsksWhatNoFlagGave(t *testing.T) {
 			asked = append(asked, q.Key)
 		}
 	}
-	// Where the built-in module is a preview, how is asked, and by hand is the default.
-	if !slices.Equal(asked, []string{"--platform", "--create", "--hostname", "--user", "--ssh-key", "--network", "--tls", "APP_DOMAIN", "API_DOMAIN", "ADMIN_EMAIL", "confirm"}) {
+	if !slices.Equal(asked, []string{"--platform", "--hostname", "--user", "--ssh-key", "--network", "--tls", "APP_DOMAIN", "API_DOMAIN", "ADMIN_EMAIL", "confirm"}) {
 		t.Errorf("asked %v", asked)
 	}
-	if d := p.forms[1].Defaults(nil)["--create"]; d != CreateManual {
-		t.Errorf("--create defaults to %q on a preview", d)
-	}
 	var modes []string
-	for _, c := range p.forms[3].Questions[0].Choices {
+	for _, c := range p.forms[2].Questions[0].Choices {
 		modes = append(modes, c.Value)
 	}
 	if !slices.Equal(modes, []string{"acme", "internal"}) {
 		t.Errorf("modes offered %v: a VM is offered neither loopback nor byo", modes)
 	}
-	if f := p.forms[4]; !f.Review || f.Go != "Go on with these answers" {
+	if f := p.forms[3]; !f.Review || f.Go != "Go on with these answers" {
 		t.Errorf("the inputs form %+v", f)
 	}
 	ud, _, _ := readSeed(t, filepath.Join(v.out, "asked-seed.iso"))
@@ -930,7 +964,7 @@ func TestVMCreateBootsTheReleasesOwnSet(t *testing.T) {
 			v.putRelease(ptr.Channel, &ptr)
 			gone := "sha256:" + strings.Repeat("e", 64)
 			v.r.Manifest.Artifacts.Disks = map[string]string{"raw": v.r.Manifest.Artifacts.Disks["raw"], "ova": gone, "gce": gone}
-			err := v.create(VMCreate{Platform: c.platform, Hostname: "notes-1", User: "ops", Create: CreateManual}, func(o *Options) { o.TLS = "internal" })
+			err := v.create(VMCreate{Platform: c.platform, Hostname: "notes-1", User: "ops"}, func(o *Options) { o.TLS = "internal" })
 			if c.err != "" {
 				if err == nil || !strings.Contains(err.Error(), c.err) {
 					t.Fatalf("got %v, want %q", err, c.err)
@@ -1221,9 +1255,15 @@ func TestMachineInterfacesFromTheFlags(t *testing.T) {
 	if _, err := machineInterfaces(one, nil, plat("metal")); err == nil || !strings.Contains(err.Error(), "a server names each NIC") {
 		t.Errorf("a server's one NIC without its MAC: %v", err)
 	}
-	// A hypervisor's machine of one NIC: named from the NIC it has, whatever MAC its module gives.
-	if got, err := machineInterfaces(one, nil, plat("truenas")); err != nil || len(got) != 1 || got[0].MAC != "" {
-		t.Errorf("a hypervisor's one NIC: %+v %v", got, err)
+	// A hypervisor's machine of one NIC: named from the NIC it has, which its first boot pins, so
+	// no MAC is generated; one given is taken.
+	for _, p := range []string{"truenas", "proxmox", "libvirt", "vmware", "hyperv"} {
+		if got, err := machineInterfaces(one, nil, plat(p)); err != nil || len(got) != 1 || got[0].MAC != "" {
+			t.Errorf("%s's one NIC: %+v %v", p, got, err)
+		}
+	}
+	if got, err := machineInterfaces(one, []string{"uplink=mac=02:00:00:00:00:0C"}, plat("truenas")); err != nil || len(got) != 1 || got[0].MAC != "02:00:00:00:00:0c" {
+		t.Errorf("a hypervisor's one NIC, its MAC given: %+v %v", got, err)
 	}
 	if _, err := machineInterfaces(&spec.Spec{Name: "notes"}, []string{"edge=dhcp"}, plat("truenas")); err == nil || !strings.Contains(err.Error(), "declares no NIC") {
 		t.Errorf("no interfaces: %v", err)
@@ -1231,7 +1271,7 @@ func TestMachineInterfacesFromTheFlags(t *testing.T) {
 }
 
 // The seed names each NIC by its role before the booted system's udev does (by MAC, or the only
-// NIC's original name), renames one named before, and addresses each: the primary as the machine's
+// NIC's original name, pinned to its MAC), renames one named before, and addresses each: the primary as the machine's
 // network, a secondary never the default route's, the DNS servers' nor the host name's.
 func TestTheSeedNamesAndAddressesTheNICs(t *testing.T) {
 	t.Parallel()
@@ -1246,6 +1286,9 @@ func TestTheSeedNamesAndAddressesTheNICs(t *testing.T) {
 	var cc cloudConfig
 	if err := yaml.Unmarshal(raw, &cc); err != nil {
 		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "pinned") {
+		t.Errorf("NICs named by their MACs pinned:\n%s", raw)
 	}
 	files := map[string]string{}
 	var cmds []string
@@ -1270,15 +1313,19 @@ func TestTheSeedNamesAndAddressesTheNICs(t *testing.T) {
 		}
 	}
 	if !slices.ContainsFunc(cmds, func(c string) bool {
-		return strings.Contains(c, `= 02:00:00:00:00:0b ] && basename`) && strings.Contains(c, `ip link set dev "$i" name edge`)
+		return strings.Contains(c, `[ "$(mac "$d")" = 02:00:00:00:00:0b ] && ! twin "$d"`) && strings.Contains(c, `ip link set dev "$i" name edge`)
 	}) {
 		t.Errorf("no rename of edge in %q", cmds)
 	}
 	one := m
 	one.Interfaces = []MachineInterface{{Role: "uplink", Primary: true}}
 	raw, _ = UserData("atlas", "at-stow", one, Settings{}, nil)
-	if !strings.Contains(string(raw), "OriginalName=en* eth*") || !strings.Contains(string(raw), "Driver=!mlx4_core mlx5_core mana") || !strings.Contains(string(raw), "ip -o route show default") {
+	if !strings.Contains(string(raw), "OriginalName=en* eth*") || !strings.Contains(string(raw), "Driver=!mlx4_en mlx5_core mana") || !strings.Contains(string(raw), "ip -o route show default") {
 		t.Errorf("one NIC without its MAC:\n%s", raw)
+	}
+	// Its first boot pins it to its MAC, once renamed: a step after the renames'.
+	if r, p := strings.Index(string(raw), "the interfaces named by their roles"), strings.Index(string(raw), "the interface named by its original name pinned to its MAC"); r < 0 || p < r || !strings.Contains(string(raw), pinnedOEM("atlas", "uplink")) {
+		t.Errorf("one NIC not pinned after its rename:\n%s", raw)
 	}
 	none := m
 	none.Interfaces = nil

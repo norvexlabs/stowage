@@ -171,7 +171,7 @@ func (r Report) Judge(p Policy, now time.Time) Gate {
 	accepted := make([]int, len(p.Allow))
 	for _, s := range r.Subjects {
 		if s.Error != "" {
-			g.NotAudited = append(g.NotAudited, s.Name)
+			g.NotAudited = append(g.NotAudited, s.Label())
 		}
 		for _, f := range s.Findings {
 			// An allowance matching a finding is in use, whether or not the policy counts the
@@ -195,7 +195,7 @@ func (r Report) Judge(p Policy, now time.Time) Gate {
 				}
 				continue
 			}
-			b := Blocked{s.Name, f}
+			b := Blocked{s.Label(), f}
 			g.Blocked = append(g.Blocked, b)
 			o := Outside{Blocked: b}
 			for _, a := range p.Allow {

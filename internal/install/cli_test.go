@@ -132,7 +132,7 @@ func TestK8sSubcommandsKeepTheirOwnDefaults(t *testing.T) {
 	asker := &fakePrompter{answers: map[string]string{"ADMIN_EMAIL": "asked@example.org"}}
 	run := func(args ...string) string {
 		var out bytes.Buffer
-		cmd := newCommand(e.release, "notes-stow", &out, io.Discard, K8sOptions{Helm: kubeTool{e.f, "helm"}, Kubectl: kubeTool{e.f, "kubectl"}},
+		cmd := newCommand(e.release, "notes-stow", &out, io.Discard, e.tools(),
 			func(bool) Prompter { return asker })
 		cmd.SetArgs(args)
 		if err := cmd.Execute(); err != nil {

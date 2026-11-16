@@ -51,8 +51,10 @@ type options struct {
 	// auditDB and auditOverride are ship's and promote's --audit-db and --audit-override.
 	auditDB, auditOverride string
 	cloud                  publish.CloudUploader
-	// installer is the installer executable releases are published with.
-	installer []byte
+	// installers are the installer executables releases are published with, one per platform, read
+	// when a command needs them (installerbin.Executables reads their recorded sha256 once; each
+	// executable is decompressed on each use).
+	installers func() (installerbin.Set, error)
 	// executable is this stowage's path, and launch starts it detached; the post-commit hook
 	// uses them, and tests replace them.
 	executable func() (string, error)
@@ -145,9 +147,17 @@ func (o *options) emitJSON(v any) error {
 	return enc.Encode(v)
 }
 
+// installerSet is the installers this stowage publishes with; none in a build without them.
+func (o *options) installerSet() (installerbin.Set, error) {
+	if o.installers == nil {
+		return nil, nil
+	}
+	return o.installers()
+}
+
 // New builds the root command. stdout carries results, stderr diagnostics.
 func New(buildVersion string, stdout, stderr io.Writer) *cobra.Command {
-	return newRoot(&options{buildVersion: buildVersion, getenv: os.Getenv, now: time.Now, out: stdout, err: stderr, installer: installerbin.Executable,
+	return newRoot(&options{buildVersion: buildVersion, getenv: os.Getenv, now: time.Now, out: stdout, err: stderr, installers: installerbin.Executables,
 		executable: os.Executable, launch: hook.Launch})
 }
 
@@ -392,10 +402,14 @@ func planCmd(o *options) *cobra.Command {
 				return err
 			}
 			// What ship would refuse, plan reports: the installer's inputs would not be ship's.
-			if len(o.installer) == 0 {
+			installers, err := o.installerSet()
+			if err != nil {
+				return fmt.Errorf("this stowage's installers: %w", err)
+			}
+			if len(installers) == 0 {
 				fmt.Fprintln(o.err, "warning: this stowage carries no installer (a build without it): the installer's inputs are not a release build's")
 			}
-			pub := &publish.Publisher{Project: p, Installer: o.installer, Pull: pull, StowageVersion: o.buildVersion}
+			pub := &publish.Publisher{Project: p, Installer: installers, Pull: pull, StowageVersion: o.buildVersion}
 			if err := pub.Unpinned(); err != nil {
 				fmt.Fprintf(o.err, "warning: %v\n", err)
 			}

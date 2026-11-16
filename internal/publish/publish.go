@@ -10,6 +10,7 @@ package publish
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -19,6 +20,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/go-containerregistry/pkg/name"
@@ -27,6 +29,7 @@ import (
 
 	"github.com/norvexlabs/stowage/internal/digest"
 	"github.com/norvexlabs/stowage/internal/graph"
+	"github.com/norvexlabs/stowage/internal/installerbin"
 	"github.com/norvexlabs/stowage/internal/lock"
 	"github.com/norvexlabs/stowage/internal/payload"
 	"github.com/norvexlabs/stowage/internal/project"
@@ -78,9 +81,10 @@ type Publisher struct {
 	Scan           *sbom.Scanner
 	AuditOverride  string
 	StowageVersion string
-	// Installer is the installer executable every release's installer image is made of; Pull is
-	// the pull account baked into it (nil when registry.pull is not a token).
-	Installer []byte
+	// Installer is the installer executable per platform every release's installer image is made
+	// of, one image each (the OS bundle carries the target's); Pull is the pull account baked into
+	// them (nil when registry.pull is not a token).
+	Installer installerbin.Set
 	Pull      *payload.Account
 	// Disks makes the OS bundle's disk images, and WorkDir (on disk) holds the bundle's build
 	// context: both are needed for a project with the kairos shape.
@@ -103,8 +107,28 @@ type Publisher struct {
 	marked []name.Tag
 	// snap is the tags a prune's removals judge holders by (nil: none, each untag reads them).
 	snap tagSnapshot
-	Now  func() time.Time
-	Log  io.Writer
+	// lastIndex is the installer index installerIndex made last, by what it was made of: a ship
+	// making the kept release's again has it.
+	lastIndex struct {
+		key [sha256.Size]byte
+		idx v1.ImageIndex
+	}
+	// indexes is, by digest, the manifests each index read by manifestsOf names (nil for an
+	// image), and whether a manifest a HEAD or an index's entry described is an index (index):
+	// content by digest never changes, so each index is read once per run, and an image never.
+	indexes struct {
+		sync.Mutex
+		of    map[v1.Hash][]v1.Descriptor
+		index map[v1.Hash]bool
+	}
+	// layers is, by what an installer image's layer is made of (installerLayer), its sums and
+	// compressed stream: read once per run, never its tar.
+	layers struct {
+		sync.Mutex
+		of map[[sha256.Size]byte]layerSums
+	}
+	Now func() time.Time
+	Log io.Writer
 }
 
 func (p *Publisher) logf(format string, a ...any) {
@@ -374,7 +398,7 @@ func (p *Publisher) auditGate(ctx context.Context, m *release.Manifest, policy *
 		return "", nil
 	}
 	tag := m.Tag
-	all, err := sbom.Targets(p.Project.Spec.Registry.Prefix, p.Project.Spec.Name, m.Artifacts)
+	all, err := p.auditTargets(ctx, m.Artifacts)
 	if err != nil {
 		return "", err
 	}
@@ -463,9 +487,10 @@ func (p *Publisher) ensureSigned(ctx context.Context, d name.Digest) error {
 	return nil
 }
 
-// ensureDiskSBOM attests on the disk d the SBOM of the bundle it is made of, unless a trusted key
-// already has: a disk holds the bundle's software, so its SBOM is the bundle's, read back attested.
-func (p *Publisher) ensureDiskSBOM(ctx context.Context, d, bundle name.Digest) error {
+// ensureSBOMOf attests on d the SBOM attested on src (what names it), unless a trusted key already
+// has: d holds src's software — a disk its bundle's, an installer index its target image's —, so
+// its SBOM is src's, read back attested.
+func (p *Publisher) ensureSBOMOf(ctx context.Context, d, src name.Digest, what string) error {
 	if !p.signed() {
 		return nil
 	}
@@ -476,9 +501,9 @@ func (p *Publisher) ensureDiskSBOM(ctx context.Context, d, bundle name.Digest) e
 	if !errors.Is(err, ErrNoAttestation) {
 		return err
 	}
-	doc, err := p.Signer.Attestation(ctx, bundle)
+	doc, err := p.Signer.Attestation(ctx, src)
 	if err != nil {
-		return fmt.Errorf("the SBOM of the bundle %s, for its disk: %w", bundle, err)
+		return fmt.Errorf("the SBOM of %s %s, for %s: %w", what, src, d, err)
 	}
 	if err := p.Signer.Attest(ctx, d, doc); err != nil {
 		return fmt.Errorf("attest the SBOM of %s: %w", d, err)
@@ -486,20 +511,21 @@ func (p *Publisher) ensureDiskSBOM(ctx context.Context, d, bundle name.Digest) e
 	if _, err := p.Signer.Attestation(ctx, d); err != nil {
 		return fmt.Errorf("attested the SBOM of %s, and the attestation does not read back by a trusted key: %w", d, err)
 	}
-	p.logf("attested the SBOM of %s (its bundle's)", d)
+	p.logf("attested the SBOM of %s (%s's)", d, what)
 	return nil
 }
 
-// SBOMMaker makes an image's SBOM (SPDX JSON) from the registry.
+// SBOMMaker makes an image's SBOM (SPDX JSON) from the registry: of platform's image (os/arch),
+// which an index resolves to.
 type SBOMMaker interface {
-	SBOM(ctx context.Context, d name.Digest) ([]byte, error)
+	SBOM(ctx context.Context, d name.Digest, platform string) ([]byte, error)
 }
 
-// ensureSBOM attests d's SBOM unless a trusted key already has, so a re-ship makes none, then
+// ensureSBOM attests the SBOM of d (its image for platform) unless a trusted key already has, so a re-ship makes none, then
 // checks the attestation reads back with a trusted key. A signing project's images, installer
 // and OS bundle each carry one; the SBOM of a digest never changes, so a later syft makes no new
 // one.
-func (p *Publisher) ensureSBOM(ctx context.Context, d name.Digest) error {
+func (p *Publisher) ensureSBOM(ctx context.Context, d name.Digest, platform string) error {
 	if !p.signed() {
 		return nil
 	}
@@ -513,7 +539,7 @@ func (p *Publisher) ensureSBOM(ctx context.Context, d name.Digest) error {
 	if !errors.Is(err, ErrNoAttestation) {
 		return err
 	}
-	doc, err := p.SBOM.SBOM(ctx, d)
+	doc, err := p.SBOM.SBOM(ctx, d, platform)
 	if err != nil {
 		return fmt.Errorf("the SBOM of %s: %w", d, err)
 	}
@@ -733,9 +759,9 @@ func (p *Publisher) Ship(ctx context.Context, o ShipOptions) (*Ref, error) {
 	// The published release's installer is made again from its manifest, before anything is
 	// written: the same release makes the same installer, and on an immutable channel one that
 	// would differ is refused here.
-	var keptInstaller v1.Image
+	var keptInstaller v1.ImageIndex
 	if existing != nil && existing.Manifest.Inputs == relNode.Inputs {
-		img, err := p.installerImage(existing.Manifest)
+		img, err := p.installerIndex(existing.Manifest)
 		if err != nil {
 			return nil, fmt.Errorf("installer: %w", err)
 		}
@@ -753,6 +779,10 @@ func (p *Publisher) Ship(ctx context.Context, o ShipOptions) (*Ref, error) {
 			return nil, fmt.Errorf("installer: %s %s is published on the immutable channel %s with the installer %s, and it would now be %s; publish a new revision (--revision %d)",
 				s.Name, tag, o.Channel, had, d, o.Revision+1)
 		}
+	} else if err := p.checkInstallers(); err != nil {
+		// No installer index made yet: each executable is checked against its recorded sha256
+		// before anything is built or written, as making one (above) does.
+		return nil, err
 	}
 	// The chart likewise: made again from the published manifest, refused on an immutable channel
 	// when it would differ.
@@ -808,7 +838,7 @@ func (p *Publisher) Ship(ctx context.Context, o ShipOptions) (*Ref, error) {
 		if err := p.ensureSigned(ctx, d); err != nil {
 			return nil, fmt.Errorf("image %s: %w", pl.image, err)
 		}
-		if err := p.ensureSBOM(ctx, d); err != nil {
+		if err := p.ensureSBOM(ctx, d, sbom.Platform); err != nil {
 			return nil, fmt.Errorf("image %s: %w", pl.image, err)
 		}
 	}
@@ -1009,7 +1039,7 @@ func (p *Publisher) Ship(ctx context.Context, o ShipOptions) (*Ref, error) {
 			}
 		}
 		// The installer carries the manifest as it is about to be published, less its own digest.
-		img, err := p.installerImage(m)
+		img, err := p.installerIndex(m)
 		if err != nil {
 			return nil, fmt.Errorf("installer: %w", err)
 		}
@@ -1557,6 +1587,9 @@ func (p *Publisher) verifyRelease(ctx context.Context, rel *Ref, tag string) err
 	}
 	if inst := rel.Manifest.Artifacts.Installer; inst != "" {
 		if err := checkTag(p.installerRepo(), rel.Manifest.Tag, inst); err != nil {
+			return err
+		}
+		if err := p.checkInstallerImages(ctx, inst, checkSig); err != nil {
 			return err
 		}
 	}

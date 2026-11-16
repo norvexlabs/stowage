@@ -41,7 +41,7 @@ func runHookTo(t *testing.T, out io.Writer, b *randomBuilder, env map[string]str
 	t.Helper()
 	var errOut bytes.Buffer
 	var l []launched
-	o := &options{buildVersion: "0.1.0", getenv: func(k string) string { return env[k] }, builder: b, installer: []byte("exe"),
+	o := &options{buildVersion: "0.1.0", getenv: func(k string) string { return env[k] }, builder: b, installers: testInstallers,
 		now: func() time.Time { return time.Date(2026, 10, 8, 0, 0, 0, 0, time.UTC) }, out: out, err: &errOut,
 		executable: func() (string, error) { return "/usr/local/bin/stowage", nil },
 		launch: func(exe string, args []string, logPath string) error {

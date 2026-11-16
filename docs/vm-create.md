@@ -2,9 +2,13 @@
 
 [README](../README.md) · [Documentation index](../README.md#documentation)
 
-A project with the `kairos` shape whose release publishes disk images gets a `vm create` command
-in the same installer (bootstrap it as above, then `sh <name>.sh vm create …`, or run the kept
-`<short>-stow`). It writes what a new VM of that release needs, then prints the platform's steps:
+A project with the `kairos` shape whose release publishes disk images gets `vm` commands in the
+same installer (bootstrap it as above, then `sh <name>.sh vm …`, or run the kept `<short>-stow`).
+Stowage owns no infrastructure state: it never creates a VM. `vm seed --json` prints what a new
+VM of the release needs at its first boot, and an OpenTofu root of yours creates the VM from it
+(see [Creating the VM with OpenTofu](#creating-the-vm-with-opentofu)); `vm create` writes the same
+disk and seed as files and prints the platform's steps by hand. Every verb that reaches the VM
+over SSH from your machine takes its host key with `--known-hosts-line`.
 
 ```bash
 <short>-stow vm create [--platform P] [--out DIR] [--hostname H] [--user U] [--ssh-key FILE]
@@ -15,21 +19,20 @@ in the same installer (bootstrap it as above, then `sh <name>.sh vm create …`,
           [--tls MODE] [--cert FILE --key FILE] [--ca FILE] [--client-ca FILE]
           [--domains route=host,…] [--http-port N] [--https-port N]
           [--set KEY=VALUE]… [--set-file KEY=PATH]… [--answers FILE] [--no-input] [--accessible]
-          [--create opentofu|manual] [--module DIR] [--tofu-var NAME=VALUE]…
-          [--vm-name N] [--pool P] [--dataset D] [--bridge B]
-          [--cpus N] [--memory MiB] [--disk GiB] [--host H] [--wait DURATION]
           [--registry PREFIX] [--registry-ca FILE] [--registry-login-file FILE]
 <short>-stow vm seed --json [--platform P] [--hostname H] [--user U] [--ssh-key FILE] [--channel C] [--await-secrets] [--disk-dir DIR]
           [the machine's flags, as vm create's: --network … --device DISK, --interface ROLE=SPEC…, --add-host NAME=IP…]
           [--tls MODE] [--domains route=host,…] [--http-port N] [--https-port N]
           [--set KEY=VALUE]… [--set-file KEY=PATH]… [--answers FILE] [--registry PREFIX] [--registry-ca FILE] [--registry-login-file FILE]
                                                    # a VM's first-boot material as JSON, the VM made by your own means
-<short>-stow vm destroy HOSTNAME [--yes] [--no-input] [--accessible]
-<short>-stow vm attach HOSTNAME --interface ROLE=SPEC [--user U] [--ssh-key FILE] [--host H] [--known-hosts-line LINE] [--wait DURATION]
-<short>-stow vm host-key HOSTNAME --json [--user U] [--ssh-key FILE] [--host H] [--known-hosts-line LINE]   # the VM's own SSH host key; the seed's one-time key retired
-<short>-stow vm kit create|check|take HOSTNAME … [--known-hosts-line LINE]   # a handoff kit issued on the VM or taken by it, over SSH (see "Handoff kits")
+<short>-stow vm host-key HOSTNAME --json --known-hosts-line LINE [--user U] [--ssh-key FILE] [--host H]   # the VM's own SSH host key; the seed's one-time key retired
+<short>-stow vm kit create|check|take HOSTNAME … --known-hosts-line LINE   # a handoff kit issued on the VM or taken by it, over SSH (see [kits](kits.md))
+<short>-stow vm truenas import-image|seed|stop [--timeout DURATION]   # TrueNAS steps an OpenTofu root runs (see "The TrueNAS steps")
 ```
 
+- `vm create` makes no VM: it writes the files and prints the steps. An OpenTofu root makes one
+  from `<short>-stow vm seed --json` (the OpenTofu provider's examples,
+  `norvexlabs/terraform-provider-stowage` `examples/guides/<platform>-vm`).
 - A project whose front offers no mode a VM can take (only `none`, or `byo` and no certificate given) is refused first, saying to give `--cert` and `--key` when it offers `byo`.
 - **`vm seed --json`** prints, as one JSON object, what a new VM needs at its first boot, for a
   tool that creates the VM with its own means (a hypervisor's or a cloud's own provider): it
@@ -37,7 +40,8 @@ in the same installer (bootstrap it as above, then `sh <name>.sh vm create …`,
   (`--platform`, required, `--hostname`, `--user`, `--ssh-key`, `--network` and its addressing,
   `--ipv6`, `--tune-profile`, `--ssh-allow`, `--timezone`, `--device`, `--interface`,
   `--add-host`), the front's (`--tls`, `--domains`, `--http-port`, `--https-port`), `--set`,
-  `--set-file` and `--answers` (inputs that are not secret, and an answers file's `tls` section),
+  `--set-file` and `--answers` (inputs that are not secret, an answers file's `tls` section, and
+  the secret inputs it holds, which the first install waits for over SSH, as `vm create`'s does),
   `--registry`, `--registry-ca` and `--registry-login-file` (checked as `vm create` checks it;
   the seed names its host alone, `registry_login`, and the program gives the file over SSH once
   the VM answers, `sudo <short>-stow registry-login -`), `--channel` (the channel the first install follows; default
@@ -50,20 +54,29 @@ in the same installer (bootstrap it as above, then `sh <name>.sh vm create …`,
   install --given - --no-input`, its front serving that certificate; the release must offer
   `byo`), and `--disk-dir DIR` (an existing directory `--platform`'s disk is written into,
   decompressed, as `vm create` fetches it; a file of that name already holding it is kept).
-  `--tls byo` with `--await-secrets` is refused (the first install waits for one of them), as is a
+  `--await-secrets` with `--tls byo` or with a secret input the answers file holds is refused by
+  `vm create`'s one rule (`--await-secrets and <names>: the first install waits for one of them
+  over SSH, a secrets export (install --secrets -) or what install --given - gives`, `<names>` the
+  inputs, then `--tls byo`; its fix: `remove <inputs> from the --answers file and leave out --tls
+  byo, or leave out --await-secrets`, naming only what was given), as is a
   `--disk-dir` that is no directory, and a certificate, key, CA or client CA an answers file's
   `tls` section gives (`none` aside; the seed takes none of `--cert`, `--key`, `--ca`,
   `--client-ca`): the seed carries none (a path the file names that does not exist fails first,
   as the answers file is read). A release whose
   front offers no mode a VM is made with, but `byo`, is refused naming `--tls byo` as the fix (`vm
   create`'s names `--cert` and `--key`; both exit 3). `disk_file`'s path is absolute, whatever
-  `--disk-dir` was given as; `--json` is required. It is the seed `vm create --create
-  manual` writes, made by the same steps and refused as `vm create` refuses (a release with no
+  `--disk-dir` was given as; `--json` is required. It is the seed `vm create` writes,
+  made by the same steps and refused as `vm create` refuses (a release with no
   OS bundle or no disk, a front with no mode a VM takes, `--platform` missing or not offered, an
-  input missing or refused), and a secret input or TLS material given to it is refused, naming
-  them (`<names>: a seed carries no secret input and no TLS material; they go after the boot,
-  over SSH`), never printing a value: they go once the VM answers, `sudo <short>-stow install
-  --given - --no-input` over SSH. A cloud platform's `--ssh-allow` default is this machine's
+  input missing or refused), and TLS material given to it, or a secret input on its command line
+  (`--set`, `--set-file`), is refused, naming them (`<names>: a seed carries no secret input and
+  no TLS material; they go after the boot, over SSH`), never printing a value: they go once the
+  VM answers, `sudo <short>-stow install --given - --no-input` over SSH. The first install waits
+  over SSH by `vm create`'s one rule: for a secrets export with `--await-secrets`; for the secret
+  inputs `--answers` holds (named in `await_given`) and, with `--tls byo`, the certificate, in one
+  `install --given -` file (`project: <name>`, `inputs: {KEY: value}`, and its `tls` section),
+  past the first boot's switch to this release's OS when its disk carries another; the seed never
+  holds a value. A cloud platform's `--ssh-allow` default is this machine's
   public address, as `vm create`'s.
   ```json
   {
@@ -85,7 +98,19 @@ in the same installer (bootstrap it as above, then `sh <name>.sh vm create …`,
     "interfaces": [
       { "role": "edge", "mac": "02:5e:41:0c:9a:17", "attach": "br1" },
       { "role": "uplink", "mac": "02:8b:d2:44:01:6e", "primary": true }
-    ]
+    ],
+    "size": {
+      "cpus": { "min": 2, "recommended": 4 },
+      "memory_mib": { "min": 2048, "recommended": 8192 },
+      "app_gib": { "min": 20, "recommended": 60 }
+    },
+    "firewall": {
+      "ssh_sources": ["0.0.0.0/0", "::/0"],
+      "open_ports": [
+        { "protocol": "tcp", "port": 443, "sources": ["0.0.0.0/0", "::/0"] },
+        { "protocol": "udp", "port": 51820, "sources": ["198.51.100.0/24"] }
+      ]
+    }
   }
   ```
   `user_data` is the cloud-config for `--platform` (a NoCloud seed's `user-data`, or a cloud's
@@ -94,12 +119,34 @@ in the same installer (bootstrap it as above, then `sh <name>.sh vm create …`,
   `interfaces` are the NICs the VM is made with, sorted by role, which the program creating the
   VM gives it: the release's `host.interfaces` NICs, an optional one only when `--interface`
   names it (`[]` when that leaves none). Each one's `role`, the `mac` its cloud-config names it
-  by (`--interface ROLE=mac=…`, else generated, a locally administered unicast MAC, for a
-  hypervisor's VM of more than one NIC; left out when neither: a VM of one NIC is named from the
-  NIC it has, and a cloud gives its NICs their MACs), the network it `attach`es to (`attach=`;
-  left out: the primary's; for the primary, the network the program making the VM gives it) and `primary` on
-  the primary NIC. A `mac` printed is the one the VM's NIC must have. Each run draws new MACs: the
-  VM is made from the seed that printed them.
+  by, the network it `attach`es to (`attach=`; left out: the primary's; for the primary, the
+  network the program making the VM gives it) and `primary` on the primary NIC. `mac` is:
+  - with no `host.interfaces`: no NIC is listed, `"interfaces": []`; the VM has one NIC, of the
+    platform's own MAC, which the cloud-config leaves the kernel's name;
+  - one NIC role on a hypervisor: left out, unless `--interface ROLE=mac=…` gives it. The NIC is
+    made with any MAC (the platform's own), the cloud-config names it by its original name
+    (`en*`, `eth*`), and the VM's first boot pins that name to the NIC's MAC (below);
+  - several NIC roles on a hypervisor: present on each, given by `--interface ROLE=mac=…` or
+    generated (a locally administered unicast MAC drawn at random by each run);
+  - on metal: present on each, given by `--interface ROLE=mac=…`, the server's own;
+  - on a cloud: left out; the cloud gives its one NIC its MAC, named and pinned as a
+    hypervisor's one NIC.
+
+  A `mac` printed is the one the VM's NIC must have: the program making the VM gives each NIC
+  device the `mac` of its role, and the VM is made from the seed that printed it (each run draws
+  new ones). Samples of `interfaces`:
+  ```json
+  "interfaces": []
+  "interfaces": [ { "role": "uplink", "primary": true } ]
+  "interfaces": [ { "role": "uplink", "mac": "02:00:00:00:00:0c", "primary": true } ]
+  "interfaces": [
+    { "role": "edge", "mac": "02:5e:41:0c:9a:17", "attach": "br1" },
+    { "role": "uplink", "mac": "02:8b:d2:44:01:6e", "primary": true }
+  ]
+  ```
+  The first is a release with no `host.interfaces`; the second one NIC role on a hypervisor or a
+  cloud; the third the same role with `--interface uplink=mac=02:00:00:00:00:0c` on a hypervisor;
+  the fourth several NIC roles on a hypervisor.
   `known_hosts_line` is that key under the name `vm-seed-host-key`, which `--known-hosts-line`
   takes (below); `fingerprint` its SHA256 as ssh prints it; `host_key_private` the key itself,
   an OpenSSH private key, which the caller keeps secret until the key retires (`vm host-key`
@@ -119,7 +166,9 @@ in the same installer (bootstrap it as above, then `sh <name>.sh vm create …`,
   artifact's title, the name `vm create` writes it under) —: its absolute path, format, the SHA-256 of its
   bytes (decompressed: what a hypervisor imports) and `disk_gib`; left out otherwise.
   `await_secrets` (`--await-secrets`) and `await_tls` (`--tls byo`) say what the first install
-  waits for over SSH, left out when false. `registry_login` (`--registry-login-file`) is the
+  waits for over SSH, left out when false; `await_given` names, sorted, the secret inputs the
+  `--answers` file holds (never a value; left out when none), which it waits for too, given over
+  SSH (`sudo <short>-stow install --given - --no-input`, with the certificate when `await_tls`). `registry_login` (`--registry-login-file`) is the
   host the login is for, never the login; left out without it. `waiting` names, sorted,
   the keys of the required secret inputs nothing gives (never a value; left out when there are
   none): the VM's first install waits for them, as `vm create` says, until they are given over
@@ -129,31 +178,48 @@ in the same installer (bootstrap it as above, then `sh <name>.sh vm create …`,
   or that offers no disk for any platform, is a failure (exit 1), whatever `--platform` says. A
   refusal prints one object on standard output, as `status --json`'s (`{"format": 1,
   "refused": {"reason": "…", "fix": "…"}}`), and exits 3; a failure prints none.
+  `size` is the VM's size the release takes (`shapes.kairos.size`): for its CPUs, its memory in
+  MiB and the app's space on its disk in GiB (to which each disk's `disk_gib` adds Kairos's
+  share), `min` is the least — the floor every VM needs (1 CPU, 1024 MiB, 4 GiB) raised by
+  `size.min` — and `recommended` the default — `size.recommended`, else 2 CPUs, 4096 MiB and
+  20 GiB, raised to that least (`app_gib.recommended` is the top-level `app_gib`). A program
+  creating the VM refuses a size under `min` and warns under `recommended`, as the provider's
+  examples do.
+  `firewall` is what a platform's own firewall in front of the VM (a cloud's security group or
+  firewall rules) lets through, as the VM's own firewall opens it: `ssh_sources`, the CIDRs SSH
+  accepts (`--ssh-allow`; every source, `0.0.0.0/0` and `::/0`, without it), and `open_ports`,
+  each port the VM opens besides SSH with its `protocol` (`tcp` or `udp`), `port` and `sources`:
+  the front's HTTP and HTTPS ports something serves on in the `--tls` mode given (both when none
+  is given: the VM's install may take any), from every source, and each L4 route's port — but
+  one the front terminates TLS on in loopback mode — from its `allow_input` list's value given
+  (`--set`, `--answers`), else the input's default, each address a network's prefix (an
+  IPv4-mapped address as IPv4, one another holds left out), sorted by family; from every source
+  for a route without a list, one the front terminates TLS on (the front filters its port), a
+  secret list, or a list the install refuses; `[]` for an empty list. A platform's rules made
+  from them are fixed when applied: a later change of the list on the VM does not reach them (the
+  VM's own firewall follows it).
 - **`vm host-key HOSTNAME --json`** reads the VM's own ed25519 SSH host key over SSH, checked by
-  the key `--known-hosts-line` gives (the seed's `known_hosts_line`, or the VM's own) or `vm
-  create` recorded, and retires the seed's one-time key at once — its file and sshd drop-in
+  the key `--known-hosts-line` gives (the seed's `known_hosts_line`, or the VM's own), and retires the seed's one-time key at once — its file and sshd drop-in
   removed, its retirement marked on the OEM partition, sshd reloaded — so the VM serves its own
   key alone from then on (as its first boot after the install would). It takes `--user`,
   `--ssh-key`, `--host` (the address, default HOSTNAME) and `--known-hosts-line`, and prints
   `{"format": 1, "public_key": "ssh-ed25519 AAAA…", "known_hosts_line": "<host name> ssh-ed25519
   AAAA…", "fingerprint": "SHA256:…", "retired": true}`: the VM's key, and under the host name the
-  run checked it by (the line's, else the address) its known_hosts line. The retirement's sshd
+  run checked it by (the line's) its known_hosts line: the next run's `--known-hosts-line`. The retirement's sshd
   reload is checked: a running `ssh.service` or `sshd.service` reloaded, or none running and
   `ssh.socket` there to start one (which reads its configuration per connection); one that did
   not take prints the key all the same with `"retired": false` and a `reason`, and fails the
   verb (exit 1: `the seed's one-time host key's files are gone, but sshd did not reload: it may
   serve that key until it does; `sudo systemctl reload ssh` (or reboot the VM), then run
-  host-key again`). With `vm create`'s record (no `--known-hosts-line`), the record is replaced by that
-  line; without it and without that record it is refused (a pin `vm create` keeps while it waits
-  is never read: a create may still be using it). With `--known-hosts-line` no record of `vm
-  create`'s is written (the line given is written to its own file, as for every verb taking it):
-  keep the printed line, the VM's key from then on. Run again it changes nothing more, through the VM's own key. Refused (exit 3,
+  host-key again`). Stowage keeps no record of the VM: the line given is written to a file of
+  its own (as for every verb taking it), and the printed line, the VM's key from then on, is
+  yours to keep. Run again it changes nothing more, through the VM's own key. Refused (exit 3,
   nothing changed): the VM answering from its recovery or live system (its first boot not done:
   the one-time key is kept, as the active system serves it; run it again once it rebooted), ssh
   not reaching the VM through the key (exit 255: the VM down, the key not authorized, or a VM that
   rebooted since its install serving its own key alone — the fix names the console's check,
-  `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub`), and the reach's own errors (no key known,
-  a bad `--known-hosts-line`, `--user` or `--host`). A refusal prints its object as `vm seed`'s.
+  `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub`), and the reach's own errors (no
+  `--known-hosts-line`, a bad `--known-hosts-line`, `--user` or `--host`). A refusal prints its object as `vm seed`'s.
 - **`sudo <short>-stow host-key [--json]`**, on the VM itself, runs the same steps locally (no
   SSH, so no SSH config of the operator's): it prints the VM's own ed25519 host key as a
   `known_hosts` line under the VM's host name (`<hostname> ssh-ed25519 AAAA…`), or with `--json`
@@ -174,9 +240,7 @@ in the same installer (bootstrap it as above, then `sh <name>.sh vm create …`,
   pattern) leaves the line out — the key and its retirement are no name's: the public key is
   printed (as the line, without `--json`), and a `note` (on standard error without `--json`)
   says why and names `hostnamectl set-hostname NAME`. The steps
-  are `vm host-key`'s over SSH (with sudo) and `vm create`'s after its install (which, when sshd
-  did not reload, keeps its pin of the one-time key and warns, naming the fix); the first boot
-  after the install runs the same file steps, its reload unchecked (an sshd not started yet reads
+  are `vm host-key`'s over SSH (with sudo); the first boot after the install runs the same file steps, its reload unchecked (an sshd not started yet reads
   its configuration as it starts).
 - The platform decides the disk format (the first of its formats the registry holds: a mirror
   carries the formats its `mirror export --disks` named) and how the cloud-config reaches the VM.
@@ -231,14 +295,21 @@ in the same installer (bootstrap it as above, then `sh <name>.sh vm create …`,
   which an `after-install-chroot` stage moves to `/oem/95_userdata/userdata.yaml` (a second
   source's `9N_custom.yaml` beside it; the stage fails without one), as a VM's first boot keeps it: no
   boot pulls the seed again, its stick left in or not, nor runs its stages twice. The machine's
-  network is the seed's (its NICs as below). OpenTofu creates no machine:
-  `--create opentofu` there needs `--module` (a module of the operator's, given the installer as
-  its `image` and the seed as its `seed`).
+  network is the seed's (its NICs as below).
 - **The NICs** (`host.interfaces`): a release that names none has one NIC, whatever its name
   (`en*`, `eth*`), addressed by the machine's network. A release that names NICs has one each,
   named by its role: the seed's `initramfs` stage writes `/etc/systemd/network/10-<name>-<role>.link`
   (`[Match] MACAddress=<mac>`, `[Link] Name=<role>`), before the booted system's udev names the
-  NICs, and its `boot` stage renames a NIC a first boot named before (down, renamed, up). The
+  NICs, and its `boot` stage renames a NIC a first boot named before (down, renamed, up): the NIC
+  of the role's MAC (a NIC of a device, never a virtual function beside it nor a bridge, as the
+  pin below counts them; of several, none is renamed, logged `<name>: the interface <role>: the
+  NICs <nics> all have its MAC (<mac>): which one is its NIC is not known, so none is renamed`),
+  or, for a role named by its original name, the NIC of the default route, and
+  that one only while the role is neither pinned (below) nor a NIC's name already, as a NIC added
+  later may get the first default route. A name another NIC holds is never taken, the NIC left
+  up (logged `<name>: the interface <role>: another NIC holds its name: <nic> keeps its own`), and
+  a rename that fails brings the NIC back up (`<name>: the interface <role>: <nic> is not renamed
+  so: it is brought back up`); the pin's rename below does the same. The
   primary's addressing is the machine's network (`05-<name>-static.network` matches its role's
   name, and so does `network set`'s override); each other NIC's is
   `/etc/systemd/network/10-<name>-<role>.network`, given by `--interface ROLE=SPEC` (repeatable):
@@ -248,12 +319,56 @@ in the same installer (bootstrap it as above, then `sh <name>.sh vm create …`,
   hypervisor, `attach=` (the platform's network or bridge, default the primary's); an `optional`
   role's NIC is made only when `--interface` names it (`--interface <role>=none` for the default
   addressing), else the machine has none and no MAC is drawn for it; no NIC waits
-  for the boot (`RequiredForOnline=no`). A machine of one such NIC needs no MAC: the `.link` names
-  the NIC it has (`OriginalName=en* eth*`, an accelerated networking's virtual function left out:
-  `Driver=!mlx4_core mlx5_core mana`), so a cloud takes it. Of more, each NIC is named by its MAC:
-  given, else generated on a hypervisor (`02:` and 5 random bytes, drawn by each run and written
-  into its seed and, with OpenTofu, the module's variables, which every later apply of that state
-  reuses: the NICs take the MACs the run that wrote their seed printed). A server's NICs are its own, each named
+  for the boot (`RequiredForOnline=no`). On a hypervisor, a VM of several NIC roles has each
+  named by its MAC: given, else generated (`02:` and 5 random bytes, drawn by each run and
+  written into its seed, `vm seed`'s `interfaces` and `vm create`'s steps: the NICs take the MACs
+  the run that wrote their seed printed). A VM of one NIC role (a hypervisor's, its MAC not
+  given, or a cloud's) has it named by its original name: the `.link` names the NIC it has
+  (`OriginalName=en* eth*`, an accelerated networking's virtual function left out by its driver,
+  `Driver=!mlx4_en mlx5_core mana`, the network device's driver as udev records it,
+  `ID_NET_DRIVER`, as this match cannot know the NIC's own), and its `boot` stage, after the
+  rename, **pins it to its MAC and driver**. The VM's NICs are counted by their device
+  (`/sys/class/net/<nic>/device`), a NIC another enslaves left out (`/sys/class/net/<nic>/master`:
+  an accelerated networking's virtual function, enslaved to its NIC, has that NIC's MAC). The pin
+  counts the free ones: a NIC whose MAC no attached role's `.link` file names
+  (`/oem/96_<name>-interfaces.yaml`, `network attach`'s: another role's NIC is never taken), and
+  not a virtual function beside its NIC (a NIC of `mlx4_en`, `mlx5_core` or `mana` with the MAC of
+  a NIC of another driver, before that NIC enslaves it). With exactly one free NIC and that NIC
+  named as the role, the pin replaces the seed's `/etc/systemd/network/10-<name>-<role>.link`
+  with one matching that NIC's MAC and driver (`[Match] MACAddress=<its MAC>`, `Driver=<value>`;
+  `[Link] Name=<role>`), the driver read from udev's record (`ID_NET_DRIVER` in
+  `/run/udev/data/n<ifindex>`), the same rule as `network attach`'s: the NIC's own driver when it
+  is one of `mlx4_en`, `mlx5_core`, `mana` (a physical NIC of one, on metal), else
+  `!mlx4_en mlx5_core mana` (any other driver, or none udev records): a change of the NIC's model
+  keeping its MAC (virtio_net to e1000) still matches, and a virtual function sharing that MAC
+  never does. It writes `/oem/96_<name>-<role>-pinned.yaml`
+  (synced before and after its rename), a cloud-config whose `initramfs` stage writes that file
+  at every later boot, before udev names the NICs. The role then has one `.link` file, matching
+  by its MAC and driver: a NIC added later, in any order, never takes the role's name. Every later boot,
+  the seed's own `initramfs` step writing the file by the original name skips while the pin
+  reads whole, so the pin's file alone writes it (yip also runs `/oem`'s files in lexical order,
+  `96_` after the seed's `95_userdata`). The OEM file marks the pin done when it holds the pin's
+  cloud-config whole, of a MAC and a `Driver=` value the pin writes: every later boot leaves it
+  while its NIC is there (named the role at once when it is not, by the seed's rename's rule: a
+  name another NIC holds is never taken), and an empty, truncated or otherwise altered one is
+  written again. A
+  boot that finds another free NIC there, or none named as the role, pins nothing and logs
+  `<name>: the interface <role> is not pinned to its NIC's MAC: the NICs here no other role names
+  are <nics>, not one NIC named <role>` (`none` when there is none; a NIC whose MAC does not read:
+  `…: the NIC <nic> has no MAC`); the next boot tries again. Once pinned, a boot that finds no NIC
+  matching the pin's MAC and `Driver=` value, as udev matches them (the NIC replaced on the
+  platform), and exactly one free NIC pins that one in its place and names it the role at once
+  (`ip link set dev <nic> down`, `name <role>`, `up`, as the seed's rename does: the pin's `.link`
+  file, of the NIC gone, left it its kernel name at this boot), logging `<name>: the interface
+  <role>'s pinned NIC (<mac>, Driver=<value>) is not here: the only NIC here no other role names,
+  <nic>, is pinned in its place`; with no free NIC, or several, it leaves the pin as it is and
+  logs `<name>: the interface <role>'s pinned NIC (<mac>, Driver=<value>) is not here, and the
+  NICs here no other role names are <nics>, not one: its pin is left as it is`. A `.link` file by
+  a MAC the seed names (several NIC roles) matches that MAC alone, with no `Driver=` clause: a
+  cloud, where accelerated networking gives a NIC a virtual function of its MAC, takes one NIC,
+  named by its original name, so a NIC the seed names by its MAC has no such twin; one `network attach` writes
+  matches the MAC and the `Driver=` value of the same rule. A VM seeded before 0.40.0 has no pin: see
+  [vm's](vm.md) "A VM seeded before 0.40.0". A server's NICs are its own, each named
   by the MAC given (`--interface ROLE=mac=…` for each, one NIC or more: a server may have more
   ports than the release names; one missing is refused naming the NICs this run makes, and the
   optional ones not asked apart: `; the optional <role> too, when given: --interface <role>=mac=…`). A cloud, which gives its NICs' MACs itself, takes one NIC (an optional one not asked is none), and no
@@ -263,10 +378,39 @@ in the same installer (bootstrap it as above, then `sh <name>.sh vm create …`,
   release declares (without that file, the release's primary role when the cloud-config named a
   NIC so, else every NIC). After an upgrade of a VM made by a release that named no NIC, a port on a NIC
   role no NIC is named for (no `10-<name>-<role>.link`) keeps its interface's match, which nothing
-  meets — never opened on the other interfaces — warned (`warning: no NIC of this VM is named
-  <role> …: its ports reach nothing`); a VM made by the release names it, and `vm attach` (below)
-  attaches one to this VM. By hand, the steps list each NIC with its MAC and network; OpenTofu's modules take
-  them as `nics` (below). A role that is not one of the release's NICs, the primary's addressing
+  meets — never opened on the other interfaces — warned (once a run for each role), with what names one, as `network set
+  --role` tells it ([vm](vm.md)): `warning: no NIC of this VM is named <role>: its ports reach
+  nothing: ` then the case and its fix, as `network set --role`'s refusal words them ([vm](vm.md)) —
+  the cloud-config names it by a MAC no NIC has (`the VM's cloud-config
+  names it by its MAC (<mac>): add the NIC of that MAC on the VM's platform (or fix the MAC of the
+  one there) and restart the VM`), or several NICs have (`…, and <n> NICs of this VM have that
+  MAC, so the boot names none of them: remove the other NICs with that MAC …`), its NIC here
+  while another device holds the role's name (`…, but another device holds the name <role> (MAC
+  <mac>): remove or rename that device …`), the boot's pin names it (`the VM's boot pinned it to its NIC's
+  MAC (<mac>, Driver=<value>), and no NIC of that MAC is on this VM: leave one NIC on the VM that
+  no other role names (…) and restart the VM, which pins the role to that NIC`), by its
+  original name (`the VM's cloud-config names it by its original name, as the VM's only NIC:
+  leave its NIC alone on the VM (remove the others on its platform[ but the NICs `network
+  attach` recorded, …]) and restart the VM, which names it (…)`), its `.link` file names no NIC
+  (`its .link file <path> names no NIC (…): restore <path> …`), `network attach` recorded it (`its NIC (<mac>) is recorded and
+  there, and is named so from the next boot: `sudo <short>-stow reboot`` or `its NIC (<mac>) is
+  recorded, and not on this VM yet: add it on the VM's platform with that MAC and restart the
+  VM`), or nothing names it (`none is recorded for it: `sudo <short>-stow network attach --role
+  <role> --mac <its MAC>` records one, named from the next boot: add that NIC on the VM's
+  platform and restart the VM`); a case that does not read says `what names one is not known
+  (<error>)`, followed by `: <fix>` when it is a refusal (`network attach`'s record that does not
+  decode), and a `.link` file whose presence does not read (but for its absence) says
+  `the VM's cloud-config's .link file of <role> does not read (<error>): restore it as the VM's
+  cloud-config writes it (`sudo <short>-stow reboot` writes it again)`, never that the
+  cloud-config names none. A role is named when a NIC of that name is on the VM (`/sys/class/net/<role>`). The
+  primary the cloud-config names (its `.link` file, by a MAC or by its original name) gets its
+  case as above. One it does not name is not attached (`network attach` refuses it): its warning
+  names the way to a VM made by the release, which names it (`…, the primary (…): its ports reach nothing; a VM made by this
+  release names it: `sudo <short>-stow secrets export --recipient <age key>` and `sudo
+  <short>-stow backup run` here, a new VM of this release made with those secrets (`vm create
+  --secrets`, or `vm seed --await-secrets`), then there `sudo <short>-stow backup config` with
+  this VM's destination and rclone config, and `sudo <short>-stow restore <backup>``). By hand, the steps of a VM of several NICs list each NIC with its MAC and network (a VM
+  of one NIC lists none); an OpenTofu root takes them from the seed's `interfaces`. A role that is not one of the release's NICs, the primary's addressing
   (`--network`'s), a `static` without its address or an address without `static`, two NICs of one
   MAC, and `attach=` on metal are refused, naming the flag.
 - Then the machine: its host name (default the project's name; lowercase labels of letters,
@@ -309,9 +453,9 @@ in the same installer (bootstrap it as above, then `sh <name>.sh vm create …`,
   digits, `_`, `+`, `-` and `/`, a zone Go's database knows, never `Local`, `localtime`,
   `posixrules`, `Factory` or one under `right/` or `posix/`; default the OS's, UTC; a zone the
   VM's own database lacks leaves it on UTC, said in its boot log). When `--ssh-allow` leaves out
-  the address this machine reaches the VM from (its `--host`, else its static addresses; each
+  the address this machine reaches the VM from (its static addresses; each
   address a name resolves to, IPv4 and IPv6, as ssh may take either; a link-local source without
-  its zone; a name not resolving yet is not checked), the run warns: `vm create` and the steps that follow go over
+  its zone; a name not resolving yet is not checked), the run warns: the steps that follow go over
   SSH from here, unless the VM sees this machine at another address (NAT, a VPN). The
   administrator logs in with the SSH key alone: there is no password, on SSH or the console.
   `--secrets FILE` (`-` for standard input) is a decrypted `secrets export` file, a machine made
@@ -325,7 +469,7 @@ in the same installer (bootstrap it as above, then `sh <name>.sh vm create …`,
   which names it before the system's own keys, and reloads sshd; the first boot after the install
   removes both and marks the key retired (`/oem/<name>-seed-host-key.retired`, on the OEM
   partition, which a reset keeps), so no later boot serves it again: not an uninstalled or reset
-  VM's, nor its recovery system's. Without OpenTofu,
+  VM's, nor its recovery system's.
   `vm create` prints the key's fingerprint (`ssh must show SHA256:… (ED25519), or do not send the
   secrets`): after the install and a reboot the VM serves its own key, so `ssh-keygen -R <address>`
   then. Then the product, as the VM's `install` asks it: the
@@ -334,7 +478,8 @@ in the same installer (bootstrap it as above, then `sh <name>.sh vm create …`,
   `kairos` shape — never from the environment, which says nothing about the VM — but no secret
   input is asked: one in `--answers` goes over SSH ("Given over SSH"), one given by `--set` or
   `--set-file` is refused, with no fix (exit 3: `KEY is a secret input, which a command line
-  (--set, --set-file) never carries`; `vm seed` refuses it as a seed refuses any secret input),
+  (--set, --set-file) never carries`; `vm seed` refuses it as a seed refuses a secret input on
+  its command line),
   and one the install
   requires that nothing gives is named at the end, for the operator to give over SSH (`ssh <user>@<address> sudo
   <short>-stow install`). The answers are reviewed ("Go on with these answers"), the whole is shown,
@@ -343,7 +488,7 @@ in the same installer (bootstrap it as above, then `sh <name>.sh vm create …`,
   the sources of <its allow_input>`; a route with `tls` `to every source, TLS by the front`, then
   `, which admits the sources of <its allow_input>` when it has one) and the host devices each service maps (`devices:`, its own
   and those it extends: `the service S maps the host's /dev/…: the VM must have them`), which
-  the VM's platform or module must give it.
+  the VM's platform must give it.
 - It boots the disk set the release records: its own disks, or, for a release shipped without
   them, the set its manifest names (`boot_disks`); a set no longer in the registry (a newer one
   replaced it) gives way to the set of the channel's pointer (its manifest signed by a key this
@@ -358,8 +503,7 @@ in the same installer (bootstrap it as above, then `sh <name>.sh vm create …`,
   bundle into the passive slot (`kairos-agent upgrade`, by digest, from the registry or the
   mirror the settings name), records it (version and revision) in `/usr/local/<name>.os-switch`, and reboots into it;
   the boot after it installs (a boot still on another OS after that stops, naming the file).
-  `vm create --create opentofu` waits 40 minutes by default then, rather than 20, and says so as
-  it fetches the disk (`fetching <name>'s <format> disk of <tag> (…): <name> <v> published none`,
+  `vm create` says so as it fetches the disk (`fetching <name>'s <format> disk of <tag> (…): <name> <v> published none`,
   or `has none left in <prefix> (a later ship's disk set replaced them)`, `. The VM boots <tag>'s
   OS first; its first boot writes <tag>'s OS bundle and reboots into it, and an install on the VM
   is refused until then`). That release alone decides the first install: an operator's `sudo
@@ -394,12 +538,10 @@ in the same installer (bootstrap it as above, then `sh <name>.sh vm create …`,
   release's OS bundle before the login reaches it: from the mirror the login is for (give the
   mirror this release's own disks), or from the release's own registry when the installer carries
   no pull account to read it with (that first boot reads with the baked account). It never enters the
-  cloud-config, a log or the review: the cloud-config carries the one-time host key, and with
-  OpenTofu, once the VM answers, `vm create` runs `sudo <short>-stow registry-login -` over SSH
-  pinned to that key, the login on its standard input, before any install over SSH (a failure
-  keeps the VM, naming the step to run by hand and what the install still waits for); the seed's key is retired after it when no
-  install over SSH follows. With `--create manual` the steps say to run `ssh <user>@<address>
-  sudo <short>-stow registry-login - < FILE` once it answers. The VM's first install reads
+  cloud-config, a log or the review: the steps say to run `ssh <user>@<address>
+  sudo <short>-stow registry-login - < FILE` once it answers (`vm seed` names the host alone,
+  `registry_login`, and the program creating the VM gives the file the same way, pinned to the
+  seed's one-time host key). The VM's first install reads
   nothing from the mirror (its images are preloaded), so it does not wait for the login; its
   updates and upgrades take it.
 - The cloud-config (`#cloud-config`, Kairos's stages, applied at every boot) sets the host name
@@ -436,294 +578,290 @@ in the same installer (bootstrap it as above, then `sh <name>.sh vm create …`,
   name; give a CA that issues the mirror's certificate alone (a dedicated one, not a company's
   root). It carries no secret,
   but with `--secrets` or given material (see "Given over SSH") the one-time host key (its header says so).
-- **Given over SSH.** A secret input in `--answers` (`--set` and `--set-file` of one are still refused, as a command line is no place for it) and the front's `byo` certificate, key and CA and its client CA (`--cert`, `--key`, `--ca`, `--client-ca`, or the answers file's `tls` section, `--tls byo` asking the paths on a terminal) never enter the cloud-config. `vm create` checks each before a VM exists (the pair, its expiry, its chain, that it covers each route's domain, the input's own check, 1 MiB in all), the review names them and never a value, the seed says only `await_secrets: true`, carries no `tls` for `byo`, and writes `/etc/<name>/install.yaml.given` (`byo`, else `given`), and the first boot waits. A chain without `--ca` is checked against this machine's trusted CAs, and again by the install against the VM's, so give `--ca` for a private CA. A required secret input the file does not give is refused, as the install over SSH has no terminal to ask it, and so is `--secrets` with any of them: it restores an install, so create the VM with `--secrets` alone and give them by a re-run over SSH.
-  With OpenTofu the material goes over SSH, on standard input, to `sudo <short>-stow install --given - --no-input`, pinned to the one-time host key as `--secrets` is. `<state>/given.yaml` (0600, beside `<state>/given.yaml.known_hosts`) holds it from before the VM exists until the install took it, and `vm destroy` removes it: if the wait or the install fails the VM is kept, and the error prints the step below for that file. By hand, `vm create` writes `<out>/<hostname>.given` (0600) and `<out>/<hostname>.given.known_hosts` beside the seed, refuses a `.given` already there, and prints the step, for `<address>` the VM's: `ssh -o HostKeyAlias=vm-seed-host-key -o ConnectTimeout=10 -o StrictHostKeyChecking=yes -o 'UserKnownHostsFile="<file>.known_hosts"' -o GlobalKnownHostsFile=/dev/null -o HashKnownHosts=no [-i KEY -o IdentitiesOnly=yes] <user>@<address> -- sudo <short>-stow install --given - --no-input < <file> && rm <file> <file>.known_hosts`. Run again after a failure, it finishes the install, and only success removes the file; a VM that rebooted since the install began has retired the one-time key, so ssh refuses it: check the VM's own key on its console, run the command without its `HostKeyAlias`, `StrictHostKeyChecking`, `UserKnownHostsFile`, `GlobalKnownHostsFile` and `HashKnownHosts` options, and remove the file. An `--out` with a character ssh reads in a path (`%`, a backslash, `"`) is refused for this file. With a disk of another release the first boot also writes this release's OS and reboots: the step is for that OS, and `vm create` says so. An install finished by this step leaves the one-time key served until the VM's next reboot, and `known_hosts` empty. OpenTofu failing keeps `given.yaml` for a VM it may have left waiting, for `vm destroy` to remove, and removes it when it failed before it wrote its variables, as no VM exists then. `install --given` is refused on Kairos's recovery system, as the reset wipes what it installs: the step works once the first boot rebooted.
-  `--kit FILE|-` and `--kit-code-file FILE` take a handoff kit (its format, its code's sources and its refusals under the Docker shape's `--kit`), opened on this machine. Its inputs are taken as the answers file's, an answers file and a flag winning, and its TLS material as the flags', so its secret inputs and TLS material take the route above: over the pinned SSH, or by hand from the `.given` file, on this machine's disk in the clear, 0600, until the install took it, as `--answers`' are. Its other inputs reach the cloud-config, as `--answers`' do. An input declared for other shapes alone is left out and logged (`--kit: KEY left out: not an input of the kairos shape`). `--secrets -` with `--kit -` is refused, as standard input is read once.
-- **With OpenTofu** (`--create opentofu`). `vm create` then creates the VM itself instead of
-  printing steps, with a module: the platform's built-in one, or the operator's (`--module DIR`).
-  The built-in modules, each pinning its provider's release exactly, with its lock file (the
-  provider's checksums for Linux and macOS, amd64 and arm64: `tofu init` refuses a provider binary
-  that does not match):
+- **Given over SSH.** A secret input in `--answers` (`--set` and `--set-file` of one are still refused, as a command line is no place for it) and the front's `byo` certificate, key and CA and its client CA (`--cert`, `--key`, `--ca`, `--client-ca`, or the answers file's `tls` section, `--tls byo` asking the paths on a terminal) never enter the cloud-config. `vm create` checks each before a VM exists (the pair, its expiry, its chain, that it covers each route's domain, the input's own check, 1 MiB in all), the review names them and never a value, the seed says only `await_secrets: true`, carries no `tls` for `byo`, and writes `/etc/<name>/install.yaml.given` (`byo`, else `given`), and the first boot waits. A chain without `--ca` is checked against this machine's trusted CAs, and again by the install against the VM's, so give `--ca` for a private CA. A required secret input the file does not give is refused, as the install over SSH has no terminal to ask it, and so is `--secrets` with any of them, by the rule `vm seed --await-secrets` follows (`--secrets and <names>: the first install waits for one of them over SSH, …`; its fix names the inputs to remove from the answers file, the TLS material to leave out — `--cert`, `--key`, `--ca`, `--client-ca` and the answers file's `tls` section — or `--secrets`): it restores an install, so create the VM with `--secrets` alone and give them by a re-run over SSH.
+  By hand, `vm create` writes `<out>/<hostname>.given` (0600) and `<out>/<hostname>.given.known_hosts` beside the seed, refuses a `.given` already there, and prints the step, for `<address>` the VM's: `ssh -o HostKeyAlias=vm-seed-host-key -o ConnectTimeout=10 -o StrictHostKeyChecking=yes -o 'UserKnownHostsFile="<file>.known_hosts"' -o GlobalKnownHostsFile=/dev/null -o HashKnownHosts=no [-i KEY -o IdentitiesOnly=yes] <user>@<address> -- sudo <short>-stow install --given - --no-input < <file> && rm <file> <file>.known_hosts`. Run again after a failure, it finishes the install, and only success removes the file; a VM that rebooted since the install began has retired the one-time key, so ssh refuses it: check the VM's own key on its console, run the command without its `HostKeyAlias`, `StrictHostKeyChecking`, `UserKnownHostsFile`, `GlobalKnownHostsFile` and `HashKnownHosts` options, and remove the file. An `--out` with a character ssh reads in a path (`%`, a backslash, `"`) is refused for this file. With a disk of another release the first boot also writes this release's OS and reboots: the step is for that OS, and `vm create` says so. An install finished by this step leaves the one-time key served until the VM's next reboot, and `known_hosts` empty. `install --given` is refused on Kairos's recovery system, as the reset wipes what it installs: the step works once the first boot rebooted.
+  A handoff kit goes to a VM made: `vm kit take HOSTNAME FILE --known-hosts-line LINE` opens it
+  here and gives what it holds to the VM's install over SSH (see [kits](kits.md)).
 
-  | `--platform` | provider | what the module makes | the module's own variables (`--tofu-var`, or asked) |
-  |---|---|---|---|
-  | `truenas` | `pjsalty/truenas` 3.1.0 | below | its flags: `--pool`, `--dataset`, `--bridge` |
-  | `libvirt` (preview) | `dmacvicar/libvirt` 0.9.9 | the image uploaded as a volume, a copy-on-write qcow2 volume over it grown to `disk_gib` (the app's `--disk` and Kairos's share); the seed as a second, read-only volume; both given to the domain by their paths (file disks, which the AppArmor security driver writes into the domain's profile with the image behind the disk); a KVM domain with libvirt's UEFI firmware (Secure Boot off, ACPI and the APIC on) on `network`, its virtio NIC with a queue per vCPU (none set with one vCPU: one is libvirt's default) and a receive ring of 1024, its DHCP lease of an IPv4 address the address (waited for, up to 5 minutes, only with DHCP) | `uri` (default `qemu:///system`), `pool` (`default`), `network` (`default`), `domain_type` (`kvm`, or `qemu` for a host without KVM: emulated, much slower, its CPU mode then `maximum`; any other value refused by the module) |
-  | `proxmox` (preview) | `bpg/proxmox` 0.117.0 | the image uploaded to a datastore with *Import* content (not enabled by default: Datacenter > Storage), the seed to one with *ISO* content, both through the API (the token alone, no SSH to the node); an OVMF VM importing the image, grown to `disk_gib` (the app's `--disk` and Kairos's share), the seed on its CD-ROM, a virtio NIC with a queue per vCPU (at most 64); no address (no guest agent) | `node` (required), `datastore` (`local-lvm`), `import_datastore` (`local`), `iso_datastore` (`local`), `bridge` (`vmbr0`) |
-  | `vmware` (preview) | `vmware/vsphere` 2.17.1 | the OVA deployed, its disk grown to `disk_gib` (the app's `--disk` and Kairos's share), the seed uploaded to the datastore on its CD-ROM; its address when VMware tools report one | `datacenter`, `cluster`, `datastore`, `host` (required), `network` (`VM Network`), `folder` |
-  | `aws` (preview) | `hashicorp/aws` 6.69.1 | by its image module, the raw image uploaded to S3 (`stowage/<name>-<hash>.raw`), imported as a snapshot (the `vmimport` role) and registered as a UEFI image; an instance launched from it with the cloud-config as its user data (IMDSv2), with `eip_allocation_id` that Elastic IP (reserved beforehand, released from it and kept by `vm destroy`); that address, else its public one, else its private one | `region`, `bucket`, `subnet_id` (required), `security_group_ids` (comma-separated), `instance_type` (`t3.medium`), `vmimport_role` (`vmimport`), `eip_allocation_id` |
-  | `gcp` (preview) | `hashicorp/google` 8.7.0 | by its image module, the image's `tar.gz` uploaded to Cloud Storage (`stowage/<name>-<hash>.tar.gz`) and a UEFI image declaring gVNIC; an instance booted from it with the cloud-config as its `user-data`, tagged with its name; with `firewall`, firewall rules on its network reaching that tag (`<name>-<hash>-ssh`: TCP 22 from `ssh_sources`' IPv4 sources; `<name>-<hash>-p<hash>`: one for each set of IPv4 `sources` among `open_ports`, its ports from them; a port with no IPv4 source makes none), for which the account OpenTofu runs as must be allowed to create and delete firewall rules (`compute.firewalls.*`, e.g. `roles/compute.securityAdmin`); its external address. Without `firewall`, `vm create` warns `no firewall rule is made on Google Cloud: the network's own rules must let tcp/22, <the opened ports> reach the VM`: the default network's `default-allow-ssh` opens SSH to every source, which the VM's firewall then narrows, and nothing opens the front's ports. With `firewall=true` and `--ssh-allow` naming IPv6 sources alone, no SSH rule is made and `vm create` warns `SSH's sources name no IPv4 address`. A value other than `true`, `false`, `1` or `0` is refused before OpenTofu runs, as is any value a module's `bool` or `number` variable (`type` in its `.tf` or `.tf.json`) does not take, given or answered in the form (`<name>: "<value>": the module's <name> is a bool: true or false`, `… is a number`). The network's own rules apply either way | `project`, `zone`, `bucket` (required), `firewall` (`false`), `network` (`default`), `subnetwork`, `machine_type` (`e2-medium`), `nic_type` (`GVNIC`, or `VIRTIO_NET`), `nat_ip` (a static external address of the zone's region, reserved beforehand and kept by `vm destroy`; else an ephemeral one) |
-  | `azure` (preview) | `hashicorp/azurerm` 5.10.0 | by its image module, the fixed VHD uploaded as a page blob (`stowage-<name>-<hash>.vhd`) and a generation 2 image; a VM with a static public address (`public_ip_name`'s, a Standard public IP of the resource group reserved beforehand, which `vm destroy` keeps, else one made with the VM) and accelerated networking made from it with the cloud-config as its custom data (no VM agent); its public address | `resource_group`, `location`, `storage_account`, `subnet_id` (required), `container` (`vhds`), `vm_size` (`Standard_B2ls_v2`: a size that offers accelerated networking), `accelerated_networking` (`true`), `public_ip_name` |
-  | `scaleway` (preview) | `scaleway/scaleway` 2.91.0 | by its image module, the qcow2 image uploaded to Object Storage (`stowage/<name>-<hash>.qcow2`), imported as a Block Storage snapshot and made an x86_64 image (UEFI); a routed public IPv4 address (no IPv6): `ip_id`'s, a flexible IP of the zone reserved beforehand, which `vm destroy` keeps, else one made with the VM; unless `security_group_id` is given, a stateful security group named as the VM that drops every inbound packet but TCP 22 from `ssh_sources` (IPv4 and IPv6) and each of `open_ports` from its `sources` (a rule per source: none for a route whose allowlist is empty), and accepts every outbound one; an instance of `instance_type` from the image with an SBS root volume of `disk_gib` (in GB, rounded up from GiB) and the cloud-config as its `cloud-init` user data; its public address. The credentials are the provider's (`SCW_ACCESS_KEY` / `SCW_SECRET_KEY`, or the `scw` configuration file); the account needs Instances, Block Storage and Object Storage access in the project | `zone`, `bucket` (required: the bucket in the zone's region), `project` (the credentials' default project), `instance_type` (`PLAY2-NANO`), `security_group_id`, `ip_id` |
+## Creating the VM with OpenTofu
 
-  The cloud modules (`aws`, `azure`, `gcp`, `scaleway`) make the disk's image with an **image
-  module** of their own (their `image/`), applied first in a state of its own:
-  `$XDG_STATE_HOME/<name>/images/<platform>-<key>`, the key a digest of the disk's SHA-256 and of
-  the module's other variables the operator gives (the zone on Scaleway, the region, bucket,
-  project, resource group, location, storage account: the VM module's values of the same names;
-  Google Cloud's image module takes no zone, as an image is the project's). Every VM of one disk
-  in one place shares it: the second finds the image there and uploads nothing, `vm create`
-  logging `the disk's image on <platform>: <directory> (shared by the VMs of this disk, kept by
-  vm destroy)`; two `vm create` runs on it at once take turns (`.stowage.lock` there; the second
-  logs `waiting for another vm create making the disk's image in <directory>`). Its variables
-  are `name` (the project's name), `description` (`<name>'s disk <the SHA-256's first 12
-  digits>, …`), `image`, `image_sha256` and `state_key` (the key above), and every name it gives
-  holds the disk's digest and the key (`<name>-<12 digits>-<the key's first 8>` on AWS, Azure and
-  Scaleway; on Google Cloud the image `<name, cut to 30>-<a hash of the name and the
-  key>-<12 digits>`), so two states never make the same object or image: a value given in one
-  run and left to the default in another makes a second state, and a second upload. Its output
-  `image_id` is the VM module's variable of that name, which `vm create` writes (`--tofu-var
-  image_id` is refused, as every variable of the contract is). `vm destroy` keeps it, with the uploads: `tofu -chdir=<that directory> destroy`
-  removes them, with the platform's credentials, once no VM boots from the image. A reserved
-  address (`ip_id`, `eip_allocation_id`, `public_ip_name`, `nat_ip`) lets a stack's first install
-  know its address, or another VM's (`--add-host`), before the VM exists: give it as `--host`.
+Stowage creates no VM and keeps no state of one: an OpenTofu root of yours does, from `vm seed
+--json`, with the platform's own provider and Stowage's (`norvexlabs/stowage`, whose
+`stowage_vm_seed` runs `vm seed` and whose install resources wait for the VM and give it what
+goes over SSH). Each platform has a complete root among the provider's examples,
+`norvexlabs/terraform-provider-stowage` `examples/guides/<platform>-vm` (TrueNAS, Proxmox VE,
+libvirt, VMware, AWS, Azure, Google Cloud, Scaleway): copy it into your own root. An example is a
+preview until it has been applied on its platform. The root:
 
-  On a libvirt host whose security driver is AppArmor (Ubuntu, Debian), `virt-aa-helper` must be
-  able to write each domain's profile; where its own profile denies it `sys_admin` or
-  `sys_resource`, the domain does not start until a local rule allows them (`capability
-  sys_admin,` and `capability sys_resource,` in
-  `/etc/apparmor.d/local/usr.lib.libvirt.virt-aa-helper`, then `apparmor_parser -r
-  /etc/apparmor.d/usr.lib.libvirt.virt-aa-helper`). The provider defines a domain, then starts it:
-  a start that fails leaves the domain defined but not in the state, so `vm destroy` does not
-  remove it, and a failed apply on the built-in libvirt module names the command that does:
-  `virsh -c <uri> undefine <vm-name> --nvram`.
-  `hyperv` has none: `--create opentofu` there needs `--module`. A **preview** module has not run
-  on its platform yet: `vm create` prints `OpenTofu's <platform> module is a preview: it has not
-  run on <platform> yet`, with the fallback (`vm destroy <host>` removes what it made, and
-  `--create manual` writes the disk and the cloud-config and prints the steps by hand); a module
-  loses the mark at its first passing run there. On a platform with a built-in module a terminal
-  asks "OpenTofu or by hand", default OpenTofu on `truenas` and by hand on a preview; without a
-  terminal and without `--create`, by hand. `--module` alone is `--create opentofu`, and refused
-  with `--create manual`.
-  - Credentials come from the environment only, as each provider reads them (`TRUENAS_URL` /
-    `TRUENAS_API_KEY`; `PROXMOX_VE_ENDPOINT` / `PROXMOX_VE_API_TOKEN`; `VSPHERE_SERVER` /
-    `VSPHERE_USER` / `VSPHERE_PASSWORD`; `AWS_*` or a profile; `GOOGLE_APPLICATION_CREDENTIALS`;
-    `ARM_*` or the `az` login; a libvirt `uri` over SSH uses the SSH agent); no module declares one,
-    and no `--tofu-var` should carry one: the variables are written to a file.
-  - `--tofu-var NAME=VALUE` (repeatable) sets a module variable; one the module does not declare,
-    one given twice, one of the contract's (below, which `vm create` writes from its own
-    flags), and on TrueNAS's built-in module `pool`, `parent_dataset`, `nic_attach` and
-    `insecure_skip_verify` (its flags and `TRUENAS_INSECURE_SKIP_VERIFY` give them) are refused. A required variable not given is asked on a terminal (its description as
-    the question), else refused (`--tofu-var NAME=<value> is required by the module`); one with a
-    default is asked too, empty keeping the module's default. A variable of `type = bool` takes
-    `true`, `false`, `1` or `0`; one of `type = number` an HCL number literal (`-1.5`, `2e3`; no
-    `+`, hexadecimal, `NaN` or infinity), refused otherwise (`"<v>": the module's <name> is a
-    number`). The review lists them.
-  - `--vm-name` is letters and digits on `truenas` (as TrueNAS names a VM); elsewhere lower-case
-    letters, digits and `-`, starting with a letter, at most 63 (default the host name in lower
-    case). `--pool`, `--dataset` and `--bridge` are TrueNAS's built-in module's alone.
-  - **The module contract**, which `--module DIR` holds (its `*.tf`, `*.tf.json` and
-    `.terraform.lock.hcl`, symbolic links followed, not its subdirectories, are copied into the
-    VM's directory, so `vm destroy` needs DIR no more): it declares the variables `name`,
-    `description`, `disk_gib` (the VM's disk in GiB: the app's `--disk` and what Kairos takes, which the disk records; an OVA's never under the capacity it declares), `image` (the disk on this machine, in the `--platform`'s format),
-    `image_sha256`, `seed` (the NoCloud seed ISO on a hypervisor, the cloud-config file on a cloud:
-    `--platform` decides) and `seed_sha256`, refused before anything is fetched when one is
-    missing. It may declare `cpus` and `memory_mib` (then asked and given `--cpus` and `--memory`;
-    a module that declares neither sizes the VM by a variable of its own, as the clouds' instance
-    types do, and those flags are refused: `--cpus: the module sizes the VM by a variable of its
-    own`), `image_format` (the format of `image`, the first of the `--platform`'s formats the
-    release publishes: `qcow2` before `raw` on `truenas`, `proxmox` and `libvirt`), `dhcp` (true when the VM takes its IPv4 address by DHCP, false with `--network
-    static`), `admin_user` and `ssh_public_key` (given `--user` and the `--ssh-key` file's key),
-    `ssh_sources` (a list of CIDR: the sources SSH accepts, `--ssh-allow`'s or the cloud default's
-    above, `["0.0.0.0/0", "::/0"]` for every source) and `open_ports` (a list of `{protocol,
-    port, sources}`: the ports the VM's firewall opens besides SSH, the front's HTTP and HTTPS ports that
-    something serves on in the `--tls` mode given (both when none is given; see the front under
-    the installer on Docker), from every source (`["0.0.0.0/0", "::/0"]`), and each `l4` route's
-    (but one the front terminates TLS on with `--tls none`, which the VM holds to its loopback
-    address), from the sources the VM's firewall lets reach it as `vm create` knows them — every
-    source for a route without an `allow_input`, one the front terminates TLS on (the front
-    filters its port) and a secret list, which `vm create` is not given; else the list's value
-    given (an answers file, `--set`) or the input's default, each a network's prefix (a bare
-    address `/32` or `/128`, host bits masked), sorted, once; none (`[]`) when that list is
-    empty, as the VM's firewall then refuses every source — for a firewall of the platform's,
-    fixed at create: `vm create` logs, for each route whose list it takes so, `l4 route <name>: the module's rule
-    for <protocol>/<port> takes the sources <input> holds now; a later change of <input> on the VM
-    does not reach it`; a module whose `open_ports` type is `{protocol, port}` drops `sources`), `image_id` (the built-in cloud modules': the image their image module made, below), and `nics` (a list of `{role, mac, attach}`: the NICs the release names, the
-    primary first, each MAC the one the cloud-config names it by — empty for a machine's only NIC,
-    whose MAC is the platform's — and each `attach` its network, empty for the module's own; an
-    empty list when the release names none, for the module's one NIC). A release that names more
-    than one NIC is refused with a module that declares no `nics` (`… declares no nics variable to
-    attach them`). The built-in TrueNAS, libvirt, Proxmox and vSphere modules declare it: one NIC
-    each, its MAC and its bridge or network (TrueNAS's default `--bridge`; libvirt's `network`,
-    Proxmox's `bridge`, vSphere's `network` variable; vSphere's OVF network map takes the
-    primary's). Its
-    `*.tf` files are read as `tofu fmt` writes them (a variable block on one line, or closing at a
-    lone `}`; its own `type` and `default`, however indented, never an object's attribute of
-    that name). It outputs `id` (what the platform calls the VM;
-    required: `the module has no output id` fails the run after the apply, the state kept) and
-    `address` (where the VM answers, empty when the platform does not tell); `vm create` reads them
-    with `tofu output -json`, logs `OpenTofu created the VM <name> (<id>)`, and waits at `address`
-    when neither `--host` nor a static address names one. Its steps may run `$STOWAGE_CTL` (the
-    running `<short>-stow`), as the TrueNAS module runs `vm truenas`.
-  - It needs OpenTofu's `tofu` on `PATH` (it runs `tofu version` first; the modules require
-    1.8 or later) and, for TrueNAS's built-in module, in the environment only, `TRUENAS_URL` (`https://<host>[:<port>]`; plain
-    `http://` is refused, as the key travels with every call) and `TRUENAS_API_KEY`; `TRUENAS_INSECURE_SKIP_VERIFY` (`1`, `true` or `yes`) accepts the host's
-    self-signed certificate. These are the names OpenTofu's TrueNAS provider reads; the key is
-    never written to a file. Each is checked before anything is asked.
-  - After the product's questions it asks the VM's name, where it goes and how big — on TrueNAS
-    `--vm-name` (default the host name's letters and digits), `--pool`, `--dataset` (under the pool, e.g. `vms`),
-    `--bridge` (the bridge or interface the NIC attaches to), `--cpus` (default 2), `--memory`
-    in MiB (default 4096, at least 1024) and `--disk`, the app's space in GiB (default 20, at
-    least 4): the VM's disk is that and what Kairos takes of it, which the disk records (its
-    boot, recovery and state partitions, sized from the OS bundle), and the review says both
-    (`a 43 GiB disk (the OS 23 GiB, the app 20 GiB)`; an OVA's disk is never under the capacity
-    it declares: 64 GiB, or Kairos's partitions and 8 GiB beyond them when that is more); a disk set recording none (published by an earlier Stowage) boots no VM, the
-    channel's set then tried, then elsewhere the module's own variables. A release whose
-    `shapes.kairos.size` states a size changes these: each default is its `recommended` size
-    (else the default above, raised to its `min`), a value under its `min` is refused (`"1": a
-    whole number, at least 2, the least <name> runs on`), and one under its `recommended` is
-    logged (`2 CPUs: under the 4 <name> recommends`). A module that sizes the VM by a variable of
-    its own logs the size it cannot check (`the module sizes the VM by its own variables: <name>
-    runs on at least …; … recommended`); `--create manual` prints it before the steps (`Size the
-    VM: <name> runs on …`). The review shows
-    them with the address it will wait at (`the address its module returns, else <host>` where the
-    module may return one). These flags, `--tofu-var`, `--host` and `--wait` are refused with
-    `--create manual`.
-  - The disk is fetched into `$XDG_CACHE_HOME/<name>/disks/<16 hex>/` (the first 16 hex digits of
-    the disk artifact's digest, which the release records; the file's own SHA-256 is
-    `image_sha256` below; `$XDG_CACHE_HOME` defaults to `~/.cache`), not `--out`, and kept, so
-    a second VM of that disk reuses it. The VM's directory is
-    `$XDG_STATE_HOME/<name>/vms/<hostname>/` (default `~/.local/state`, 0700; a relative
-    `XDG_*` value is ignored, as the XDG spec says, and `HOME` must then be absolute; a path
-    holding `%`, `\` or `"` is refused, as ssh would misread it): the module (the built-in one's
-    `main.tf`, `variables.tf`, `outputs.tf`, `versions.tf` and `.terraform.lock.hcl`, or `--module`'s files),
-    `terraform.tfvars.json` (the VM's name, place, size, the module's variables, the disk's and
-    the seed's paths and SHA-256 — no credential), `platform` (`<platform> builtin` or
-    `<platform> module`, which `vm destroy` reads), the seed (`seed.iso`, or `user-data.yaml` on a
-    cloud), OpenTofu's `terraform.tfstate`, and `known_hosts` (the VM's SSH host key; with
-    `--secrets`, `known_hosts.seed` holds the one-time key while it is pinned, and with given material `given.yaml.known_hosts`). A host name
-    whose directory holds the variables (an apply ran, or was tried) is refused: `vm destroy` it
-    first, or choose another `--hostname`. So is a `--vm-name` another VM there already has,
-    whatever its case (on TrueNAS its zvol and staging dataset would be the same).
-  - `tofu` runs in a session of its own: interrupted (Ctrl-C, or the run stopped), it is sent one
-    interrupt and given 5 minutes to record what it made; a second Ctrl-C is passed on (OpenTofu
-    then stops at once), and after 5 minutes it and what it started are killed. Interrupted
-    while it waits for the VM, `vm create` says the VM is kept and names `vm destroy`.
-  - It runs `tofu init`, `tofu apply -auto-approve` and `tofu output -json` there
-    (`TF_IN_AUTOMATION=1`, `TF_INPUT=0`, and `STOWAGE_CTL` set to the running `<short>-stow`, which
-    the module's steps run). TrueNAS's module creates a staging dataset `<vm-name>-staging` and a zvol `<dataset>/<vm-name>` of `disk_gib` (the app's `--disk` and Kairos's share; 16K blocks,
-    LZ4), uploads the disk image (checked against its SHA-256 first; an upload already there at
-    its size is not sent again) and converts it into the zvol, uploads the seed (every upload mode
-    0600: the seed holds the one-time host key, the disk the pull account), creates the VM
-    (UEFI, host CPU, `--cpus` cores, autostart) with the disk, a VirtIO NIC whose MAC is derived
-    from the VM's name (the same at every start, so a DHCP lease follows it) — or one for each NIC
-    the release names (`nics`), each with its MAC on its bridge — and the seed as its
-    CD-ROM, and starts it. A changed disk or seed rebuilds what depends on it, powering the VM off
-    and on. A failed apply keeps the state, and the error names `vm destroy`.
-  - It then waits, up to `--wait` (default 20m; past it, `not ready after <wait> (last: <what the
-    VM last answered>); the VM is kept: look at <the platform's console>, or `<short>-stow vm
-    destroy <name>``, the console named per `--platform` — TrueNAS's display, Proxmox VE's console,
-    `virsh console`, vSphere's, Hyper-V Manager's, the machine's screen, Azure's serial console,
-    Google Cloud's serial port output, EC2's serial console or system log, Scaleway's Console
-    tab), polling every 10 s over `ssh` (batch mode, the
-    private key next to `--ssh-key`'s `.pub` alone when it exists, else ssh's own keys and agent:
-    the VM's sshd drops a client after 4 failed keys, so an agent holding more needs that private
-    key next to the `.pub`) at `--host` (an address or a
-    host name; an IPv6 address bracketed or not, `[2001:db8::7]` taken as `2001:db8::7`; default
-    the static IPv4 address, else the module's `address`, else the host name — with DHCP and a static IPv6 address alone,
-    `--host` gives that address when this machine reaches the VM over it; a DHCP server must
-    register it) until `<short>-stow status
-    --json` there answers from a system that is not Kairos's recovery (a first boot runs the
-    recovery system, then resets and reboots into the active one; a recovery system whose
-    automatic reset failed, `"reset_failed"` in its status, fails the wait at once: `the first
-    boot gave up in Kairos's recovery system, which stays: kairos-reset.service failed: <its last
-    journal lines>; the VM is kept: look at <the platform's console>, or `<short>-stow vm destroy
-    <name>` removes it`) and reports the install
-    finished (its stack up and the provision hook done; `"installing": true` until then; a
-    first install that failed, `"install_failed": "<why>"` — also when the boot's install failed
-    before writing the install, and not while the boot runs it again — fails the wait at once
-    with why, the `journalctl -u <name>` to read and the `sudo <short>-stow install` that runs it
-    again; the key of the system that answered is kept) — or,
-    when a secret input is due, until it answers at all, and prints the `sudo <short>-stow install`
-    to give it (which, on the VM, first waits for the preload unit `<name>-preload.service` to
-    have loaded the release's images: run at once, it is not refused while the boot loads them;
-    a preload that failed is run again; when it fails again the install goes on if every image is
-    loaded, saying so, and is refused naming the unit, its failure and the `journalctl -u` to
-    read when one is missing; a preload unit that failed already is not run again when every image
-    is loaded, saying so; before any wait, the install is refused at once when this user cannot
-    write its directory, or the nearest one above it that exists (`D is not writable by this user:
-    the VM's install runs as root, \`sudo <short>-stow install\``; as root, `D is not writable, by root
-    either (a read-only filesystem?)`), `--dry-run` checks the same and waits for nothing, saying
-    what a run would wait for, and a host whose init is not systemd (`systemctl` there, but no
-    `/run/systemd/system`) waits for nothing). On a disk of another release it also waits until the VM answers from this release's OS (up to 40 min by default), saying what the old OS's boot reported if that wait ends. With `--secrets` it waits until the VM answers, then runs `sudo systemctl start
-    <name>.service && sudo <short>-stow install --secrets - --no-input` there over the same SSH (the
-    boot unit first: it runs once the release's images are loaded), the file on its standard input (a secret
-    input still due: it prints how to give both instead — `chmod 600 FILE; scp -p FILE
-    <user>@<host>:secrets.yaml` (an IPv6 host bracketed, `<user>@[2001:db8::7]:secrets.yaml`),
-    then `ssh -t <user>@<host> 'sudo <short>-stow install --secrets secrets.yaml; rm
-    secrets.yaml'`, on a terminal that asks the rest); a failure keeps the VM and says that
-    `status` tells where it stopped, a re-run of `sudo <short>-stow install` finishes an install
-    begun, and those steps make one that did not begin. By hand, the steps end with them. The recovery and active systems have different SSH host keys: each attempt takes
-    the key on first contact into a file of its own, and the VM's `known_hosts` keeps the key of
-    the attempt that answered. With `--secrets`, every call is pinned to the one-time host key
-    instead (`StrictHostKeyChecking=yes` against `known_hosts.seed`): a VM serving another key is
-    never sent the secrets, and is not ready until its wait ends. Once the install took them, a
-    last call through the pinned key reads the VM's own ed25519 key into `known_hosts`, removes
-    the one-time key and its drop-in, marks it retired and reloads sshd, and prints the VM's key's fingerprint; a
-    failure there is a warning (the next boot retires the key). A VM not ready in time is kept; the error says so.
-  - It prints `ssh <user>@<host> <short>-stow status` and where the state is.
-- **`vm destroy HOSTNAME`** destroys a VM `vm create --create opentofu` made: `tofu destroy` of its
-  module (the VM, its disk and data, its uploads — on a cloud, the disk's image and its uploads
-  are the image module's and stay, as does a reserved address), then its state directory, holding
-  `.<host>.lock` beside it meanwhile, which stays (refused while a `vm attach` runs on the VM). It needs the same
-  environment and `tofu` (the TrueNAS API's variables for TrueNAS's built-in module, as its
-  `platform` file records; a VM made before that file is TrueNAS's), asks on a terminal ("Destroy
-  the VM H: its disk, its data and its uploads on <platform>", on a cloud "its disk and its data
-  (the disk's image stays for the next VM of it)", default no), and on a cloud prints after it
-  `The disk's image stays, for the next VM of it: each state in $XDG_STATE_HOME/<name>/images holds one,
-  which `tofu -chdir=<state> destroy` removes (its uploads included) once no VM boots from it.`; without a terminal it refuses
-  unless `--yes`. Before asking (and before `--yes` goes on) it looks, as `vm create` does (in
-  `--registry` when given; for 30 s at most), for a disk set that could make the VM again, and
-  warns when the registry answers there is none (the channel's release read, or one this
-  Stowage does not read) (`Warning: <name> <version> has no disk in <prefix>, nor does its channel <channel>: …
-  (stowage ship --disks); until then, a VM destroyed is not created again.`) or when the
-  registry cannot be read (`Whether a VM of <name> <version> can be created again is not known:
-  …`); neither stops the destroy. On TrueNAS, snapshots of the zvol and the staging dataset (a periodic task's) are
-  deleted first, as TrueNAS refuses to delete a dataset that has any. The cached disk stays.
-- **`vm attach HOSTNAME --interface ROLE=SPEC`** attaches a NIC for a role of the release (a
-  secondary NIC its `host.interfaces` names, which the VM's cloud-config does not) to a VM `vm
-  create --create opentofu` made with TrueNAS's built-in module, keeping the VM and its data:
-  `SPEC` is `vm create --interface`'s (`dhcp`, `static,address=A/P` or `none`, the default; then
-  `mac=`, default generated, and `attach=`, the bridge, default the primary's). Over SSH, as `--user`
-  (default your user name, else `sysadmin`) with `--ssh-key`'s key (vm create's defaults), at
-  `--host` (default HOSTNAME: give the address `vm create` waited at, its `--host`), checked
-  strictly against the key `--known-hosts-line` gives (see `vm kit`), else the host key `vm create` recorded for that address in the state directory
-  (`known_hosts`; none, or none for that address, is refused: a VM whose install was finished by
-  hand has none, and its host key, checked on its console, goes there), it reads the VM's boot id (one that does not read is refused); runs `tofu init` and
-  `tofu plan -detailed-exitcode -out=attach.tfplan -var nics=…` (in the state directory; the NICs
-  with the new one appended, the primary's entry unchanged, or added as it was applied when the VM
-  had one NIC: the module's own MAC) and reads the plan (`tofu show -json`): it goes on with a plan
-  that creates the attached role's NIC device and replaces the power step, every other resource
-  unchanged, or with one that changes no resource when the state holds the NIC already (for a new
-  role it is refused: `the VM's OpenTofu plan does not add the NIC <role> …; nothing changed`); anything else
-  (drift on the disk, the VM, the datasets or another NIC; the power step alone; the NIC without
-  the power step: an earlier vm attach left half done) is refused before the VM or the state
-  changes: drift as `the VM's OpenTofu plan changes more than its NIC: <address> (<actions>), …;
-  nothing changed`, with the `STOWAGE_CTL=<ctl> tofu -chdir=<state> plan -var 'nics=…'` that shows
-  it (drift is the operator's to resolve: an apply would carry it out); a half-done attach as
-  `does not add the NIC with the VM's power cycle`, with the way to finish it by hand: power the VM
-  off on TrueNAS, then `STOWAGE_CTL=<ctl> tofu -chdir=<state> apply` with the TrueNAS API's
-  variables, and the same `vm attach` command, which the message repeats with its flags, checks it. Then it runs `sudo <short>-stow network attach` on the VM (below), which
-  records the NIC, writes the NICs into the module's `nics` in `terraform.tfvars.json`, and applies
-  the saved plan, which powers the VM off and on (TrueNAS applies a device at a start); an apply
-  that fails says the NIC is recorded on the VM and in the state's variables, and names the same
-  way to finish by hand once its cause is fixed. The plan file is removed whatever happens, and
-  `vm create` (with `--create opentofu`), `vm attach` and `vm destroy` hold `.<host>.lock`, beside the state directory (kept: a lock file removed while held would exclude no run that opened it), for their whole run — a create from its check that no state exists to its install over SSH: one on a VM at a time
-  (`another vm create, vm attach or vm destroy runs on it`). `vm create` also holds a lock of the platform's VM name (`.name-<hash>.lock` there, of the platform, its built-in or own module and the name compared without case, as the `--vm-name` check tells VMs apart) for its whole run: a create of the same `--vm-name` on that platform for another host meanwhile is refused (`another vm create makes a VM named <name> on <platform> now: give this one another --vm-name`). It waits up to `--wait` (default 10m) for the VM to answer from a new boot naming a NIC
-  by the role (`has
-  not booted again naming a NIC <role> after …`, with the journal to read, when it does not). Run
-  again for a role the state attaches, it goes on with the state's MAC and bridge (another `mac=`
-  is refused; another `attach=` too while the state holds the NIC's device — one an apply that
-  failed on a wrong bridge left out is added on the bridge given, its plan read as above) and, when the plan has no changes, reboots the VM instead (`sudo
-  <short>-stow reboot`: its 30 s drain, its refusal the error) for the addressing given. Refused before the VM is changed: a role that is not one of the release's
-  NICs, the primary, a MAC another NIC of the state has (the module's own derived one included),
-  a VM with no state or no VM name in it, a VM made with another module, a `--user` that is not a
-  user name, a `--host` holding spaces, quotes, `%`, `@` or starting with `-`, a state whose module predates NICs by role
-  (no `nics` variable: `has one NIC`), and `tofu` or the TrueNAS API's variables missing, as `vm
-  destroy` needs them. On another platform, or with such a module: attach the NIC there, run `sudo
-  <short>-stow network attach --role ROLE --mac MAC` on the VM, then power it off and on.
-- `vm truenas import-image|seed|start|stop|drop-snapshots` (hidden) are the module's steps, run
-  by OpenTofu: each reads `TRUENAS_URL`, `TRUENAS_API_KEY`, `TRUENAS_INSECURE_SKIP_VERIFY` and its
-  own variables (`IMAGE`, `IMAGE_SHA256`, `STAGING_DIR`, `ZVOL`; `SEED`, `SEED_PATH`; `VM_ID`;
-  `DATASET`) from the environment, and talks to TrueNAS's JSON-RPC API (`/api/current`) and its
-  `/_upload/` endpoint.
+1. reads the seed (`stowage_vm_seed`, or `vm seed --json` run as above), with `--disk-dir` for a
+   hypervisor that is given the disk as a file;
+2. makes the VM's disk from `disk[<platform>]` (`disk_file` on a hypervisor; on a cloud the image
+   `cloud_image` names, which `ship --disks` registered, else one the root registers itself),
+   sized `disk_gib`; its seed from `user_data` and `meta_data` (a NoCloud ISO on a hypervisor, the
+   cloud's user data on a cloud); its NICs from `interfaces` (each with its `mac`, on its
+   `attach` network); its CPUs and memory within `size` (refused under `min`, warned under
+   `recommended`); on a cloud, its firewall rules from `firewall`;
+3. once the VM answers over SSH, checked by the seed's `known_hosts_line`, gives it what the seed
+   says it waits for (`registry_login`, `await_secrets`, `await_tls`, `await_given`, `waiting`) over SSH, waits
+   for its first install, and retires the one-time host key (`vm host-key --json
+   --known-hosts-line <the seed's line>`), keeping the VM's own key's line for every later verb.
+
+`tofu destroy` removes what the root made; the root's state is OpenTofu's, under its own lock.
+
+**Verbs over SSH.** `vm host-key` and `vm kit create|check|take` reach the VM over SSH from this
+machine and require `--known-hosts-line LINE`: the VM's host key as one known_hosts line, `HOST
+KEYTYPE BASE64` — the seed's `known_hosts_line` until the install retires that one-time key (the
+first reboot after the install, or `vm host-key`), then the VM's own, which `vm host-key --json`
+prints (`known_hosts_line`) or which its console shows (`ssh-keygen -lf
+/etc/ssh/ssh_host_ed25519_key.pub`). That key alone is accepted (ssh's `StrictHostKeyChecking=yes`
+against a file holding that line alone, under `$XDG_STATE_HOME/<name>/known-hosts/`, never your
+own known hosts); without it a verb is refused before any connection (exit 3: `<host>: the VM's
+host key is not known: --known-hosts-line gives it`). A line that is not one host name or address
+and one key (a pattern, a list, a hashed name, `[host]:port`, a `@` marker) is refused. The verbs
+on the VM itself (`backup`, `upgrade`, `rollback`, `reset-db`, `network …`) run there, over your
+own `ssh <user>@<address>`.
+
+**Attaching a NIC.** A NIC for a role of the release (a secondary one, `host.interfaces`) is
+attached on its platform, its MAC yours to choose (a locally administered unicast one), and named
+on the VM by `sudo <short>-stow network attach --role ROLE --mac MAC [--mode dhcp|static|none]
+[--address A/P]` from the next boot (see [vm](vm.md)). The VM's existing NICs are named by their
+MACs already (the seed's, or its first boot's pin, above), so the two steps go in either order
+(a VM seeded before 0.40.0 has its NIC pinned by hand first: [vm's](vm.md) "A VM seeded before
+0.40.0"; until a NIC named by its original name is pinned, `network attach` refuses, saying so).
+The root adds the NIC device (TrueNAS: a `truenas_vm_device` of type NIC, the VM restarted by
+`truenas_vm_power`'s `restart_triggers`), and `network attach` prints what is left:
+`<role>: the NIC <mac> is named and addressed (<mode>) from the next boot: ` then
+
+- `the NIC is there: `sudo <short>-stow reboot` names it` — a NIC of that MAC is on the VM
+  (under the kernel's own name): the drained reboot names it;
+- `add the NIC on the VM's platform, then restart the VM: the boot names it` — none is.
+
+A MAC another role's NIC holds (the seed's, its pin, the record's, or a NIC named as another
+role now) is refused, as is an attach while the VM's NICs do not read (the error named, nothing
+written). NICs are counted by their device (`/sys/class/net/<nic>/device`): a bridge, veth or
+tunnel is none, nor is a NIC another enslaves (`/sys/class/net/<nic>/master`: an accelerated
+networking's virtual function, of its NIC's MAC).
+
+## The TrueNAS steps (`vm truenas`)
+
+TrueNAS's provider (`truenas/truenas`) puts no file on the host, writes no disk image into a zvol
+and does not stop a VM before deleting its devices. Until it does, the TrueNAS example runs
+these steps from `terraform_data` resources' `local-exec` provisioners, with the release's
+installer, `<short>-stow` (the program `stowage_vm_seed.ctl_path` names):
+
+```bash
+<short>-stow vm truenas import-image [--timeout DURATION]   # IMAGE, IMAGE_SHA256, STAGING_DIR, ZVOL; default 1h
+<short>-stow vm truenas seed [--timeout DURATION]           # SEED, SEED_PATH; default 10m
+<short>-stow vm truenas stop [--timeout DURATION]           # VM_ID; default 10m
+```
+
+- **The API.** Each reads the TrueNAS host from `TRUENAS_ENDPOINT` — the WebSocket URL the
+  provider reads, `wss://<host>[:<port>]/api/current` (the legacy `/websocket` path is taken,
+  rewritten to `/api/current`, as the truenas/truenas provider does) — or `TRUENAS_URL`, its HTTPS
+  root `https://<host>[:<port>]`; both set must name the same host and port (443 when none is
+  written, in either). `wss` and `https` only: the API key goes in every login and upload, and TrueNAS revokes a
+  key used over plain HTTP. The key is `TRUENAS_API_KEY`. The host's certificate is checked
+  against the system's CAs, or against the CA in the PEM file `TRUENAS_CA_CERT` alone, or not at
+  all with `TRUENAS_INSECURE_SKIP_VERIFY=1` (`true`, `yes`; a TrueNAS host's own self-signed
+  certificate); both set is refused. They talk to TrueNAS 25.04 or later: its JSON-RPC API over
+  the WebSocket and its `/_upload/` endpoint.
+- **`import-image`** writes the disk image file `IMAGE` into the zvol `ZVOL` (a dataset path,
+  `pool/…`, not `/dev/zvol/…`; made beforehand, e.g. `truenas_zvol`, at least the image's virtual
+  size): `IMAGE_SHA256` is 64 lower-case hex digits (else refused before the host is asked). A run
+  goes, in order:
+  1. **Reads the zvol.** One holding this image already (`org.stowage:image` `sha256:<hex>`, below)
+     is left as it is: exit 0, `the zvol <zvol> holds the image sha256:<hex> already: left as it
+     is` on standard error, nothing written, no lock taken, the file not read. Otherwise `IMAGE`
+     is opened before the lock is taken: one that cannot be (`open <IMAGE>: …`) is refused with no
+     lock made and nothing staged.
+  2. **Takes the zvol's lock**, held for the whole run: one import at a time writes into a zvol.
+     The lock is a zvol made beside it, `<zvol>-stowage-ref` — sparse, 1 MiB, of the zvol's
+     `volblocksize`, its user properties `org.stowage:ref` naming the zvol and `org.stowage:run`
+     a random nonce naming the run. TrueNAS refuses to make a dataset of a name that exists, so
+     one run makes it. When the create fails, the run reads the name (on a new connection when
+     the create got no answer):
+     - this run's own nonce (TrueNAS made it, its answer lost): the run holds it and goes on;
+     - another run's, whatever its age: refused, never deleted — while a job of that import runs
+       (below), naming the job (`another import into <zvol> is running: job <id> (…); let it
+       end, then run this again`); otherwise ``another import into <zvol> holds its lock
+       <zvol>-stowage-ref (run <nonce>, made <creation time, UTC>): once no `tofu apply` or `vm
+       truenas import-image` of <zvol> runs on any machine, and TrueNAS runs no job of it (Jobs: a
+       vm.device.convert into <zvol>, or a filesystem.put or vm.device.convert of a file
+       <STAGING_DIR>/<prefix><nonce>-…), delete the zvol <zvol>-stowage-ref on TrueNAS (Datasets,
+       or pool.dataset.delete with {"recursive": true}), then run this again; while either runs,
+       let it end``. The creation time tells a lock long dead from one just made. A run cut off
+       before it could delete its lock (killed, its machine gone) leaves it so, and nothing but
+       the operator deletes it: no run takes another's lock over;
+     - a dataset of that name without `org.stowage:ref=<zvol>`, or not a zvol: refused, never
+       deleted (`<zvol>-stowage-ref, the name of the lock of imports into <zvol>, is a dataset
+       without org.stowage:ref=<zvol>: not Stowage's, refusing to delete it; rename or delete it`);
+     - nothing of that name: the create's error (`the lock <zvol>-stowage-ref of imports into
+       <zvol>: …`). A read that fails is an error too, and the lock, if the run's own, is deleted.
+
+     The run deletes its lock as it ends, recursively (a periodic task's snapshots with it), even
+     when it fails or is cancelled — within 30 s, always on a connection of its own — unless it is
+     gone or another run's (`org.stowage:run` another nonce), and unless a convert may still run
+     (step 6). It deletes only a lock whose `org.stowage:run` it read as its own: no run deletes
+     another's, so the lock stays the run's from that read to its deletion — unless an operator
+     deletes a live lock, against the refusal's conditions above, and another run makes its own
+     in between: that voids the exclusion. A deletion that fails names the fix: `the lock <zvol>-stowage-ref not deleted
+     (<the API's error>): once no job of this import runs, delete the zvol <zvol>-stowage-ref on
+     TrueNAS (Datasets, or pool.dataset.delete with {"recursive": true}), then run this again`.
+  3. **Reads the zvol again, under the lock**, refusing it (below), and once more after the
+     upload, right before the zvol is marked, as well as the lock, which must still be this
+     run's (`this run (<nonce>) no longer holds the lock …: refusing to write the zvol; run this
+     again`); a zvol whose `org.stowage:image` changed in between is refused (`the zvol <zvol>'s
+     org.stowage:image changed during the upload (<before>, now <after>), …`).
+  4. **Uploads `IMAGE`** into `STAGING_DIR` (a dataset's mount point, `/mnt/…`) as `<prefix><nonce>-<the
+     file's name>`, mode 0600 — a name no other run shares —, where `<prefix>` is `<the digest's
+     first 16 hex digits>-<the first 8 hex digits of the SHA-256 of ZVOL>-`, and hashes the bytes
+     as it sends them: the one read of the file, so the bytes converted are the bytes checked. A
+     file that is not `IMAGE_SHA256` (a wrong digest, or a file that changed) is refused after
+     that one upload, before the zvol is marked or written, the staged file emptied (`<IMAGE>:
+     sha256 <got>, expected <want>: refusing to build a disk from it`).
+  5. **Marks the zvol** `org.stowage:image` `importing:sha256:<hex>`.
+  6. **Converts** the staged file into the zvol (`vm.device.convert`, which reads the format off
+     the file's extension: `.qcow2`, `.raw`). TrueNAS runs one convert at a time, host-wide, and
+     queues one more: a further call is answered with the queued convert's job, another
+     import's. The run reads the job it is given by its arguments, its paths compared cleaned, a
+     `/dev/zvol/` prefix dropped. One whose arguments read as another convert's is refused, never
+     waited for (`TrueNAS answered vm.device.convert of <staged> into <zvol> with job <id>,
+     another convert's (of <source> into <destination>): TrueNAS runs one convert at a time and
+     queues one more, handing a further call the queued job; let the other converts end, then run
+     this again`). One the run cannot tell — gone from TrueNAS's jobs (`… with job <id>, which
+     TrueNAS's jobs do not hold`), of arguments that are no convert's (`…, whose arguments TrueNAS
+     gives as no convert's`, or `which TrueNAS gives as a <method>`), or not read — may be its
+     own, and is followed as a convert cut off, below. Its own convert is waited for: `SUCCESS`
+     marks the zvol written (step 7); `FAILED` ends the run as below with TrueNAS's job's error
+     and no run again, as its cause fails every run the same (`vm.device.convert of <staged>: job
+     <id> FAILED: <its error>`: fix that cause, e.g. a larger zvol or the right image), the zvol
+     left `importing:`, written again by the next run; `ABORTED` or gone is followed as below, on the same
+     connection. A convert cut off — by `--timeout`, a cancellation or a broken connection — is
+     not aborted: TrueNAS marks an aborted convert `ABORTED` at once while its `qemu-img` writes
+     the zvol on to the end. The run reads the job instead, on a connection of its own, for up to
+     20 s, its watch ending 30 s before the 80 s it has, which its last read keeps (so less when
+     that connection took over 30 s), and reads its arguments again itself, from the last read of
+     the job: one that then reads as another convert's is the refusal above, and one that then
+     reads as the run's own is its own, below, whatever its first read gave. Only `SUCCESS` and
+     `FAILED` end a convert (TrueNAS fails one once its `qemu-img` has exited), and only the run's
+     own convert's ending ends the run:
+     - `SUCCESS`: the zvol is written, and marked so (step 7) — even when the run's first read of
+       the job failed; the step succeeds, printing `warning: the zvol <zvol> holds the image
+       sha256:<hex>; the wait for the convert job <id> was cut off (<why>), and the job then ended
+       SUCCESS`;
+     - `FAILED`: the run ends as below, `…; the convert job <id> then ended FAILED: <its error>`,
+       the zvol left `importing:`, written again by the next run;
+     - any other state — still `RUNNING` or `WAITING` at the watch's end, `ABORTED`, gone from
+       TrueNAS's jobs — a job that cannot be read, or one that ended with arguments the run cannot
+       tell leaves the lock and the staged file as they are, as a `qemu-img` of the run's may still
+       write the zvol, and is refused naming them: `…; the convert job <id> is still RUNNING on
+       TrueNAS after <the time watched, about 20s>` (or `is ABORTED, which TrueNAS marks an
+       aborted convert at once while its qemu-img writes on: it may still run`, `is gone from
+       TrueNAS's jobs: whether its qemu-img still writes cannot be told`, `could not be read (…):
+       it may still run`, `ended SUCCESS|FAILED, <why its arguments tell nothing>: whether a
+       convert of this run's still writes the zvol cannot be told`) `: the lock
+       <zvol>-stowage-ref and the staged file <staged> are left; once TrueNAS's Jobs shows no
+       vm.device.convert of <staged>, delete the zvol <zvol>-stowage-ref on TrueNAS (Datasets, or
+       pool.dataset.delete with {"recursive": true}), then run this again (TrueNAS's API deletes no
+       file: delete <staged> on the host)`.
+
+     A convert call whose answer was lost (`vm.device.convert of <staged> into <zvol>: …`) is
+     looked for among TrueNAS's jobs, on a connection of its own, by its source, which names
+     the run, three times over 5 s (the first at once), as the middleware may make the job after
+     the first look: one found is followed as a convert cut off, above, on that connection; none
+     means nothing ran (`… (its answer lost; TrueNAS has no job of it, looked for 3 times over 5s:
+     nothing ran)`), and the run ends as below. A middleware that makes the job later than that
+     is the one case where the lock is released while a convert of the run's may then write the
+     zvol. A look that fails leaves the lock and the staged file (`… (its answer lost, its job not
+     read: …; a convert may run): the lock … are left; …`).
+  7. **Marks the zvol written**, `org.stowage:image` `sha256:<hex>`. Run again, a zvol an earlier
+     run began writing this image into (`importing:` this digest) is uploaded and written again.
+
+  Once TrueNAS may hold the staged file, it is emptied as the run ends — converted, refused,
+  failed or cancelled — unless a convert may still run, on a connection of its own. TrueNAS may
+  hold it as the upload ends:
+  - accepted (HTTP 200): it holds the file;
+  - no request made, or none answered before a byte of its body was sent (the dial or TLS
+    failed), or refused with HTTP 401 or 403 (answered on its headers) before its body was sent
+    whole: nothing was written, nothing is emptied (`upload of <file> refused: HTTP <status> …`,
+    and no fix on the host);
+  - any other — no answer once a byte of its body was sent, 401 or 403 after its whole body,
+    413 or any other refusal —: it may hold a part, once a `filesystem.put` job of that path is
+    found among TrueNAS's jobs (none found: nothing was written, nothing is emptied).
+
+  Before it is emptied, a `filesystem.put` job of that path `RUNNING` or `WAITING` (the upload's,
+  which a run cut off leaves) is followed to its end for up to 20 s, as an upload still running
+  would write on after the emptying; one still running then leaves the file (`the staged file
+  <path> not emptied (TrueNAS's API deletes no file: delete it on the host): its upload's job
+  <id> is still RUNNING on TrueNAS after <the time watched>`).
+  TrueNAS's API deletes no file, so an empty file of that name stays in `STAGING_DIR`, a few
+  bytes per run (`the staged file <path> not emptied (TrueNAS's API deletes no file: delete it on
+  the host): …` when that fails). Before the zvol is marked written, a lock not deleted or a file
+  not emptied is an error (exit 1) beside the run's own; after, the zvol holds the image and the
+  step succeeds (exit 0), each printed on standard error as `warning: the zvol <zvol> holds the
+  image sha256:<hex>; <the message above>`. Refused, nothing written (exit 1):
+  - a zvol that does not exist, a dataset that is not a zvol, or a zvol whose `logicalreferenced`,
+    `volblocksize` or user properties TrueNAS does not give (`pool.dataset.query gave no
+    logicalreferenced|volblocksize|user_properties for the zvol <zvol>: …`, as whether it holds
+    data or the image is not known);
+  - a zvol holding another image (`org.stowage:image` another digest, written or being written:
+    give the image a new zvol);
+  - a zvol without the property holding data: its `logicalreferenced` past a zvol never
+    written's, which is the lock's, read as soon as it is made (`the zvol <zvol> holds data
+    (logicalreferenced <n> bytes, a zvol never written <m>) and no org.stowage:image: …`).
+    `logicalreferenced` counts the bytes written before compression, so a block of data written
+    passes the bound, and an all-zero block, a hole once compressed, holds nothing to lose;
+    TrueNAS 25.10 gives 28672 bytes for a zvol never written, whatever its size, block size or
+    sparseness, 45056 or more once one 4 KiB block is written, and 1028096 for an empty ext4 on
+    1 GiB (which references 378 KiB once compressed: the compressed size cannot tell);
+  - a zvol a VM's device uses as its disk (`attributes.path` `/dev/zvol/<zvol>`: the import comes
+    before the VM's disk device, which the root orders after it);
+  - a job of this import `RUNNING` or `WAITING` — a `vm.device.convert` into the zvol (written
+    `pool/…` or `/dev/zvol/pool/…`) or from a staged file of this image into this zvol (its path
+    beginning with `<STAGING_DIR>/<prefix>`), or a `filesystem.put` (an upload) of such a file,
+    paths compared cleaned (`another import into <zvol> is running: job <id> (vm.device.convert of
+    <source> into <destination>|filesystem.put of <path>); let it end, then run this again`): a
+    second sign beside the lock, checked as the lock is found held, under it, and again before
+    the zvol is marked. Imports of one image into two zvols stage under two prefixes and do not
+    block each other.
+
+  Runs in one apply (parallel resources, a tainted one applied again) or two operators' run in
+  parallel and are serialised by the lock: the ones refused succeed on the next apply.
+- **`seed`** uploads the seed ISO file `SEED` to the path `SEED_PATH` on the host (under a
+  dataset's mount point), mode 0600 (it holds the one-time SSH host key), replacing the file
+  there: run again, the same ISO is written again.
+- **`stop`** powers the VM `VM_ID` (TrueNAS's id, a positive number) off in any state but
+  `STOPPED`, so TrueNAS lets its devices be deleted: a `RUNNING` VM by a clean shutdown
+  (`vm.stop`), forced after the VM's own shutdown timeout; any other (`SUSPENDED`, …) by
+  `vm.poweroff`, as TrueNAS shuts down only a running VM. The TrueNAS example runs it at destroy,
+  before its devices go. Its state is read again after, whether the call failed or not: one
+  `STOPPED` or gone succeeds (a VM that stopped or went meanwhile fails the call), any other fails
+  (exit 1, `VM <id> is <state> after vm.stop|vm.poweroff, not STOPPED: …`, or `VM <id> is <state>
+  after vm.stop|vm.poweroff failed (<the API's error>): …`). A VM stopped already, or gone, is left
+  (exit 0).
+- Each needs its own variables (`<VAR> is not set`, exit 1, before anything is dialled), as `VM_ID`
+  a number; `--timeout` bounds the whole step, the API's answers and its jobs included (past it:
+  `--timeout <d> ran out: the step starts over: run it again with a longer --timeout` — nothing
+  a run cut off did resumes: a run again uploads and converts the image again, except that a zvol
+  marked holding the image is left as it is —, after the fix a lock not deleted names, which its
+  error holds (`the lock <zvol>-stowage-ref not deleted (…): once no job of this import runs,
+  delete the zvol …, then run this again`); or only `--timeout <d> ran out` after a convert that
+  may still run, which leaves the zvol's lock until it ends, its error naming the fix (`…: the
+  lock <zvol>-stowage-ref and the staged file <staged> are left; …`), or after a convert that
+  `FAILED`, whose error is TrueNAS's job's (`vm.device.convert of <staged>: job <id> FAILED: <its
+  error>`, or `…; the convert job <id> then ended FAILED: <its error>`) and names no run again:
+  its cause is TrueNAS's, the same on every run with any time — fix that cause, e.g. a zvol
+  larger than the image's virtual size or the right image, then run this again). A failure
+  exits 1 naming the API's error: a `local-exec` provisioner that fails taints its resource at
+  create, and the next apply runs it again, which each step takes.
+
+## VMs made by `vm create --create opentofu` (0.39.0 and earlier)
+
+Such a VM's OpenTofu state is in Stowage's state directory, `$XDG_STATE_HOME/<name>/vms/<host>`
+(`~/.local/state` by default), which this release no longer reads. Either destroy it with 0.39.0's
+`<short>-stow vm destroy <host>` before you move to this release, or adopt it into a root of your
+own with `import` blocks — each example's README lists its resources' import IDs. A `moved`
+block cannot carry it over: TrueNAS's examples use `truenas/truenas`, and the modules up to
+0.39.0 used the community `pjsalty/truenas` provider. Verbs over SSH take the VM's key from that
+directory's `known_hosts` no more: give it with `--known-hosts-line` (`cat
+~/.local/state/<name>/vms/<host>/known_hosts` holds it).

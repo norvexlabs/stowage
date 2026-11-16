@@ -1381,11 +1381,15 @@ func TestThePortsOfAnInterfaceAreOpenedOnItAlone(t *testing.T) {
 // that names them, a port on a NIC role keeps its match, which no interface meets (fail closed),
 // warned; the network override keeps matching what the VM's cloud-config named.
 func TestARoleWithoutItsNICFailsClosed(t *testing.T) {
-	dir := t.TempDir()
-	saved := networkdDir
-	networkdDir = dir
-	t.Cleanup(func() { networkdDir = saved })
+	dir, sys := t.TempDir(), t.TempDir()
+	saved := [2]string{networkdDir, sysNetDir}
+	networkdDir, sysNetDir = dir, sys
+	t.Cleanup(func() { networkdDir, sysNetDir = saved[0], saved[1] })
 	if err := os.WriteFile(filepath.Join(dir, "10-notes-uplink.link"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// uplink is named on the VM; edge is not.
+	if err := os.Mkdir(filepath.Join(sys, "uplink"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	ctx := context.Background()
@@ -1395,6 +1399,7 @@ func TestARoleWithoutItsNICFailsClosed(t *testing.T) {
 		s.Front.Interfaces = []string{"uplink"}
 		s.L4.Routes = []spec.L4Route{
 			{Name: "feed", Protocol: "udp", Port: 17007, Upstream: "api:17007", Interfaces: []string{"edge"}},
+			{Name: "relay", Protocol: "udp", Port: 17010, Upstream: "api:17010", Interfaces: []string{"edge"}},
 			{Name: "site", Protocol: "udp", Port: 17009, Upstream: "api:17009", Interfaces: []string{"lan"}},
 			{Name: "peer", Protocol: "udp", Port: 17008, Upstream: "api:17008", Interfaces: []string{"vpn0"}},
 			{Name: "dns", Protocol: "udp", Port: 53, Upstream: "api:53", Interfaces: []string{"vpn0", "uplink"}},
@@ -1415,23 +1420,109 @@ func TestARoleWithoutItsNICFailsClosed(t *testing.T) {
 			t.Errorf("no %q in:\n%s", want, b)
 		}
 	}
-	if !strings.Contains(log.String(), "warning: no NIC of this VM is named edge") || strings.Contains(log.String(), "named uplink") || strings.Contains(log.String(), "named vpn0") || strings.Contains(log.String(), "named lan") {
+	if !strings.Contains(log.String(), "warning: no NIC of this VM is named edge: its ports reach nothing: none is recorded for it: `sudo notes-stow network attach --role edge --mac <its MAC>` records one, named from the next boot: add that NIC on the VM's platform and restart the VM\n") || strings.Contains(log.String(), "named uplink") || strings.Contains(log.String(), "named vpn0") || strings.Contains(log.String(), "named lan") {
 		t.Errorf("log %q", log.String())
 	}
-	if got := seedMatch(dir, "notes"); got != "Name=uplink" {
-		t.Errorf("no seed file, one .link: %s", got)
+	// edge, on two routes, is warned of once a run.
+	if n := strings.Count(log.String(), "named edge"); n != 1 {
+		t.Errorf("edge warned of %d times: %q", n, log.String())
 	}
-	if err := os.WriteFile(filepath.Join(dir, "10-notes-edge.link"), nil, 0o644); err != nil {
+	// The record the hint reads does not decode: the warning gives its refusal's fix.
+	if err := os.WriteFile(filepath.Join(in.O.Dir, interfacesFile), []byte("- role: edge\n  colour: red\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if got := seedMatch(dir, "notes"); got != "Name=en* eth*" {
-		t.Errorf("no seed file, two .links: %s", got)
+	log.Reset()
+	in.roleNames(true, "edge")
+	record := filepath.Join(in.O.Dir, interfacesFile)
+	if !strings.HasPrefix(log.String(), "warning: no NIC of this VM is named edge: its ports reach nothing: what names one is not known ("+record+": ") ||
+		!strings.HasSuffix(log.String(), "): fix "+record+" (a list of role, mac, driver, mode and address), or remove it and run `network attach` again for each NIC it held\n") {
+		t.Errorf("log %q", log.String())
+	}
+	if err := os.Remove(filepath.Join(in.O.Dir, interfacesFile)); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := seedMatch(dir, "notes"); err != nil || got != "Name=uplink" {
+		t.Errorf("no seed file, one .link: %s %v", got, err)
+	}
+	// edge named by the seed's MAC, no NIC of it there: the warning sends to the platform, never
+	// to `network attach`, which refuses a role the seed names.
+	if err := os.WriteFile(filepath.Join(dir, "10-notes-edge.link"), []byte(interfaceLink("notes", MachineInterface{Role: "edge", MAC: "02:00:00:00:00:0e"})), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	log.Reset()
+	in.roleNames(true, "edge")
+	if want := "warning: no NIC of this VM is named edge: its ports reach nothing: the VM's cloud-config names it by its MAC (02:00:00:00:00:0e): add the NIC of that MAC on the VM's platform (or fix the MAC of the one there) and restart the VM\n"; log.String() != want {
+		t.Errorf("log %q\nwant %q", log.String(), want)
+	}
+	if got, err := seedMatch(dir, "notes"); err != nil || got != "Name=en* eth*" {
+		t.Errorf("no seed file, two .links: %s %v", got, err)
+	}
+	// A file that does not read is an error, never every NIC.
+	if err := os.Mkdir(filepath.Join(dir, staticUnit("notes")), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := seedMatch(dir, "notes"); err == nil || got != "" {
+		t.Errorf("the seed's file unread: %q %v", got, err)
+	}
+	if err := os.Remove(filepath.Join(dir, staticUnit("notes"))); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(dir, "10-notes-lan.link"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := seedMatch(dir, "notes"); err == nil || got != "" {
+		t.Errorf("a .link file unread: %q %v", got, err)
+	}
+	if err := os.Remove(filepath.Join(dir, "10-notes-lan.link")); err != nil {
+		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(dir, staticUnit("notes")), []byte("[Match]\nName=uplink\n\n[Network]\nDHCP=ipv4\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if got := seedMatch(dir, "notes"); got != "Name=uplink" {
-		t.Errorf("the seed's: %s", got)
+	if got, err := seedMatch(dir, "notes"); err != nil || got != "Name=uplink" {
+		t.Errorf("the seed's: %s %v", got, err)
+	}
+	// The primary unnamed, the cloud-config naming none: `network attach` names secondaries alone,
+	// so the warning names the way that does name it, a VM of this release given the install's
+	// secrets and backup.
+	if err := os.Remove(filepath.Join(sys, "uplink")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(dir, "10-notes-uplink.link")); err != nil {
+		t.Fatal(err)
+	}
+	log.Reset()
+	in.roleNames(true, "uplink")
+	if want := "warning: no NIC of this VM is named uplink, the primary (its cloud-config, from before its release named it, names none): its ports reach nothing; a VM made by this release names it: " +
+		"`sudo notes-stow secrets export --recipient <age key>` and `sudo notes-stow backup run` here, a new VM of this release made with those secrets (`vm create --secrets`, or `vm seed --await-secrets`), then there `sudo notes-stow backup config` with this VM's destination and rclone config, and `sudo notes-stow restore <backup>`\n"; log.String() != want {
+		t.Errorf("log %q\nwant %q", log.String(), want)
+	}
+	// The primary the cloud-config names, no NIC carrying it now: its case's hint, never a new VM.
+	for link, hint := range map[string]string{
+		interfaceLink("notes", MachineInterface{Role: "uplink", MAC: "02:00:00:00:00:0a"}): "the VM's cloud-config names it by its MAC (02:00:00:00:00:0a): add the NIC of that MAC",
+		interfaceLink("notes", MachineInterface{Role: "uplink"}):                           "the VM's cloud-config names it by its original name, as the VM's only NIC: leave its NIC alone on the VM",
+	} {
+		if err := os.WriteFile(filepath.Join(dir, "10-notes-uplink.link"), []byte(link), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		log.Reset()
+		in.roleNames(true, "uplink")
+		if want := "warning: no NIC of this VM is named uplink: its ports reach nothing: " + hint; !strings.HasPrefix(log.String(), want) {
+			t.Errorf("log %q\nwant %q", log.String(), want)
+		}
+	}
+	// Whether the cloud-config names the primary does not read: said, with what to restore,
+	// never a cloud-config naming none.
+	notDir := filepath.Join(t.TempDir(), "file")
+	if err := os.WriteFile(notDir, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	networkdDir = notDir
+	log.Reset()
+	in.roleNames(true, "uplink")
+	if want := "warning: no NIC of this VM is named uplink: its ports reach nothing: the VM's cloud-config's .link file of uplink does not read (stat " + filepath.Join(notDir, "10-notes-uplink.link") +
+		": not a directory): restore it as the VM's cloud-config writes it (`sudo notes-stow reboot` writes it again)\n"; log.String() != want {
+		t.Errorf("log %q\nwant %q", log.String(), want)
 	}
 }
 

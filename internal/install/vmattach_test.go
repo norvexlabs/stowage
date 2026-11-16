@@ -1,37 +1,96 @@
 package install
 
 import (
-	"cmp"
-	"context"
-	"encoding/json"
-	"errors"
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
-	"slices"
 	"strings"
+	"sync"
 	"testing"
-	"time"
+
+	"go.yaml.in/yaml/v3"
 
 	"github.com/norvexlabs/stowage/internal/spec"
 )
 
-// attachDirs moves the networkd, OEM and kernel NIC directories into a test's own: the VM's seed
-// named uplink by its original name, and the NIC named so has the MAC 02:00:00:00:00:aa.
+// attachDirs moves the networkd, OEM, kernel NIC and udev record directories into a test's own:
+// the VM's seed named uplink by its original name, its first boot pinned it to its NIC's MAC and
+// driver (the seed's .link file rewritten), and the NIC named so has that MAC, 02:00:00:00:00:aa.
 func attachDirs(t *testing.T) (networkd, oem string) {
-	networkd, oem, sys := t.TempDir(), t.TempDir(), t.TempDir()
-	saved := [3]string{networkdDir, oemDir, sysNetDir}
-	networkdDir, oemDir, sysNetDir = networkd, oem, sys
-	t.Cleanup(func() { networkdDir, oemDir, sysNetDir = saved[0], saved[1], saved[2] })
-	if err := os.WriteFile(filepath.Join(networkd, "10-notes-uplink.link"), []byte(interfaceLink("notes", MachineInterface{Role: "uplink"})), 0o644); err != nil {
+	networkd, oem, sys, udev := t.TempDir(), t.TempDir(), t.TempDir(), t.TempDir()
+	saved := [4]string{networkdDir, oemDir, sysNetDir, udevDataDir}
+	networkdDir, oemDir, sysNetDir, udevDataDir = networkd, oem, sys, udev
+	t.Cleanup(func() { networkdDir, oemDir, sysNetDir, udevDataDir = saved[0], saved[1], saved[2], saved[3] })
+	pin := strings.NewReplacer(macMark, "02:00:00:00:00:aa", driverMark, "virtio_net").Replace(pinnedLink("notes", "uplink"))
+	if err := os.WriteFile(filepath.Join(networkd, "10-notes-uplink.link"), []byte(pin), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.MkdirAll(filepath.Join(sys, "uplink"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(sys, "uplink", "address"), []byte("02:00:00:00:00:aa\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	sysNIC(t, "uplink", "02:00:00:00:00:aa")
 	return networkd, oem
+}
+
+// sysVF puts a virtual function named dev with mac in the test's kernel NIC directory, enslaved
+// to uplink.
+func sysVF(t *testing.T, dev, mac string) {
+	t.Helper()
+	sysNIC(t, dev, mac)
+	if err := os.Symlink("../uplink", filepath.Join(sysNetDir, dev, "master")); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// sysNIC puts a NIC of a device named dev with mac in the test's kernel NIC directory, its
+// ifindex one of its own and no driver udev records.
+func sysNIC(t *testing.T, dev, mac string) {
+	t.Helper()
+	ents, err := os.ReadDir(sysNetDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(sysNetDir, dev, "device"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sysNetDir, dev, "address"), []byte(mac+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sysNetDir, dev, "ifindex"), fmt.Appendf(nil, "%d\n", len(ents)+2), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// sysDriver records driver as udev's ID_NET_DRIVER of the test's NIC dev.
+func sysDriver(t *testing.T, dev, driver string) {
+	t.Helper()
+	idx, err := os.ReadFile(filepath.Join(sysNetDir, dev, "ifindex"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(udevDataDir, "n"+strings.TrimSpace(string(idx))), []byte("I:12\nE:ID_NET_DRIVER="+driver+"\nE:ID_NET_NAME_MAC=x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// attachedLinkOf is the .link file of role in the attached NICs' cloud-config on oem.
+func attachedLinkOf(t *testing.T, oem, role string) string {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join(oem, "96_notes-interfaces.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cc cloudConfig
+	if err := yaml.Unmarshal(raw, &cc); err != nil {
+		t.Fatal(err)
+	}
+	for _, st := range cc.Stages["initramfs"] {
+		for _, f := range st.Files {
+			if f.Path == "/etc/systemd/network/"+attachedLink("notes", role) {
+				return f.Content
+			}
+		}
+	}
+	t.Fatalf("no link of %s in:\n%s", role, raw)
+	return ""
 }
 
 func attachRelease(t *testing.T) *Release {
@@ -42,50 +101,66 @@ func attachRelease(t *testing.T) *Release {
 }
 
 // A NIC attached to an installed VM is named by its MAC in the initramfs stage of a cloud-config
-// on the OEM partition, and addressed at boot; the seed's NIC named by its original name alone is
-// named by its MAC too, ahead of the seed's file, once.
+// on the OEM partition, and addressed at boot.
 func TestANICAttachedIsNamedFromTheNextBoot(t *testing.T) {
 	networkd, oem := attachDirs(t)
 	r, dir := attachRelease(t), t.TempDir()
+	// The NIC is there already, under the kernel's name: the platform attached it and the VM
+	// restarted to take it, before the VM names it.
+	sysNIC(t, "eth1", "02:00:00:00:00:01")
+	sysDriver(t, "eth1", "virtio_net")
+	// A bridge, a veth or a tunnel has no device: not a NIC the advice looks for.
+	if err := os.MkdirAll(filepath.Join(sysNetDir, "docker0"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sysNetDir, "docker0", "address"), []byte("02:42:00:00:00:01\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	var out strings.Builder
 	if err := AttachNIC(r, dir, NetAttach{Role: "edge", MAC: "02:00:00:00:00:01", Mode: IfaceStatic, Address: "192.0.2.10/24"}, &out); err != nil {
 		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "edge: the NIC 02:00:00:00:00:01 is named and addressed (static 192.0.2.10/24) from the next boot: the NIC is there: `sudo notes-stow reboot` names it\n") {
+		t.Errorf("out %q", out.String())
 	}
 	cc, err := os.ReadFile(filepath.Join(oem, "96_notes-interfaces.yaml"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, want := range []string{"#cloud-config\n", "initramfs:", "/etc/systemd/network/09-notes-edge.link", "MACAddress=02:00:00:00:00:01", "Name=edge",
-		"/etc/systemd/network/09-notes-uplink.link", "MACAddress=02:00:00:00:00:aa", "/etc/systemd/network/10-notes-edge.network", "Address=192.0.2.10/24",
-		"networkctl reload", notLive} {
+		"/etc/systemd/network/10-notes-edge.network", "Address=192.0.2.10/24", "networkctl reload", notLive} {
 		if !strings.Contains(string(cc), want) {
 			t.Errorf("no %q in:\n%s", want, cc)
 		}
 	}
-	if strings.Contains(string(cc), "10-notes-uplink.network") {
-		t.Errorf("the pinned primary is addressed:\n%s", cc)
+	// The NIC there, its driver is recorded; not a virtual function's, its link leaves those out,
+	// so a change of the NIC's model keeping its MAC still matches.
+	if l := attachedLinkOf(t, oem, "edge"); !strings.Contains(l, "[Match]\nMACAddress=02:00:00:00:00:01\nDriver=!mlx4_en mlx5_core mana\n\n[Link]\nName=edge\n") {
+		t.Errorf("the link of a NIC there:\n%s", l)
 	}
-	if !strings.Contains(out.String(), "uplink: its NIC (02:00:00:00:00:aa) is named by its MAC") || !strings.Contains(out.String(), "edge: the NIC 02:00:00:00:00:01 is named and addressed (static 192.0.2.10/24)") {
-		t.Errorf("out %q", out.String())
+	if nics, err := readAttached(dir); err != nil || len(nics) != 1 || nics[0].Driver != "virtio_net" {
+		t.Errorf("record %+v, %v", nics, err)
+	}
+	// The seed's NIC is its first boot's to pin: the attach leaves it.
+	if strings.Contains(string(cc), "uplink") || strings.Count(out.String(), "\n") != 1 {
+		t.Errorf("the attach names the primary:\n%s\n%s", cc, out.String())
 	}
 	// The next boot writes the link: the role is named, which the install's warning reads.
-	if roleNamed("notes", "edge") {
+	if roleNamed("edge") {
 		t.Error("named before the boot")
 	}
 	if err := os.WriteFile(filepath.Join(networkd, attachedLink("notes", "edge")), nil, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if roleNamed("notes", "edge") {
+	if roleNamed("edge") {
 		t.Error("named with no NIC there")
 	}
-	if err := os.MkdirAll(filepath.Join(sysNetDir, "edge"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if !roleNamed("notes", "edge") {
+	sysNIC(t, "edge", "02:00:00:00:00:01")
+	if !roleNamed("edge") {
 		t.Error("an attached NIC's role is not named")
 	}
 
-	// Again for the role: its addressing replaced, the pin kept once; another role beside it.
+	// Again for the role: its addressing replaced; another role beside it.
 	out.Reset()
 	if err := AttachNIC(r, dir, NetAttach{Role: "edge", MAC: "02:00:00:00:00:02", Mode: IfaceDHCP}, &out); err != nil {
 		t.Fatal(err)
@@ -94,15 +169,12 @@ func TestANICAttachedIsNamedFromTheNextBoot(t *testing.T) {
 		t.Fatal(err)
 	}
 	cc, _ = os.ReadFile(filepath.Join(oem, "96_notes-interfaces.yaml"))
-	if strings.Count(string(cc), "09-notes-uplink.link") != 1 || strings.Contains(string(cc), "02:00:00:00:00:01") || !strings.Contains(string(cc), "DHCP=ipv4") ||
+	if strings.Contains(string(cc), "uplink") || strings.Contains(string(cc), "02:00:00:00:00:01") || !strings.Contains(string(cc), "DHCP=ipv4") ||
 		!strings.Contains(string(cc), "10-notes-lan.network") || !strings.Contains(string(cc), "ConfigureWithoutCarrier=yes") {
 		t.Errorf("after a second attach:\n%s", cc)
 	}
-	if strings.Contains(out.String(), "uplink:") {
-		t.Errorf("the pin said again: %q", out.String())
-	}
 	nics, err := readAttached(dir)
-	if err != nil || len(nics) != 3 || nics[0].Role != "edge" || nics[1].Role != "lan" || !nics[2].Pin {
+	if err != nil || len(nics) != 2 || nics[0].Role != "edge" || nics[1].Role != "lan" {
 		t.Errorf("record %+v, %v", nics, err)
 	}
 
@@ -145,397 +217,333 @@ func TestANICAttachedIsNamedFromTheNextBoot(t *testing.T) {
 	if err := AttachNIC(r, dir, NetAttach{Role: "edge", MAC: "02:00:00:00:00:09"}, &out); err == nil || !strings.Contains(err.Error(), "names its NIC already") {
 		t.Errorf("a seed's role: %v", err)
 	}
+	// Whether the seed names the role does not read: refused, with what to restore, never taken
+	// for a role the seed does not name.
+	notDir := filepath.Join(t.TempDir(), "file")
+	if err := os.WriteFile(notDir, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	networkdDir = notDir
+	before, _ := os.ReadFile(filepath.Join(dir, interfacesFile))
+	if err := AttachNIC(r, dir, NetAttach{Role: "lan", MAC: "02:00:00:00:00:03"}, &out); err == nil ||
+		err.Error() != "--role lan: the VM's cloud-config's .link file of lan does not read (stat "+filepath.Join(notDir, "10-notes-lan.link")+": not a directory)" ||
+		refusedFix(err) != "restore it as the VM's cloud-config writes it (`sudo notes-stow reboot` writes it again), then run this again" {
+		t.Errorf("the seed's .link unread: %v (%q)", err, refusedFix(err))
+	}
+	if after, _ := os.ReadFile(filepath.Join(dir, interfacesFile)); string(after) != string(before) {
+		t.Errorf("the record changed:\n%s", after)
+	}
+	networkdDir = networkd
 	if err := os.WriteFile(filepath.Join(dir, interfacesFile), []byte("- role: lan\n  mac: 02:00:00:00:00:03\n  colour: red\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := AttachNIC(r, dir, NetAttach{Role: "lan", MAC: "02:00:00:00:00:03"}, &out); err == nil || !strings.Contains(err.Error(), "colour") {
-		t.Errorf("an unknown field: %v", err)
+	if err := AttachNIC(r, dir, NetAttach{Role: "lan", MAC: "02:00:00:00:00:03"}, &out); err == nil || !strings.Contains(err.Error(), "colour") ||
+		refusedFix(err) != "fix "+filepath.Join(dir, interfacesFile)+" (a list of role, mac, driver, mode and address), or remove it and run `network attach` again for each NIC it held" {
+		t.Errorf("an unknown field: %v (%q)", err, refusedFix(err))
+	}
+	// A record of Stowage 0.39.0 pinning the seed's NIC: refused, naming its fix.
+	if err := os.WriteFile(filepath.Join(dir, interfacesFile), []byte("- role: lan\n  mac: 02:00:00:00:00:03\n- role: uplink\n  mac: 02:00:00:00:00:aa\n  pin: true\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := AttachNIC(r, dir, NetAttach{Role: "lan", MAC: "02:00:00:00:00:03"}, &out); err == nil || err.Error() != filepath.Join(dir, interfacesFile)+" has a pin entry from Stowage 0.39.0 or earlier: remove its entries with `pin: true` (the first boot pins the NIC itself now), then run this again; this VM's cloud-config, from before 0.40.0, does not: pin its NIC by hand first, as \"A VM seeded before 0.40.0\" in docs/vm.md says" ||
+		refusedFix(err) != "pin the VM's NIC by hand (\"A VM seeded before 0.40.0\" in docs/vm.md), remove the entries with `pin: true` from "+filepath.Join(dir, interfacesFile)+", then run this again" {
+		t.Errorf("a 0.39.0 pin: %v (%q)", err, refusedFix(err))
 	}
 }
 
-// A seed's NIC named by its original name and no NIC named so now: nothing to pin it by, refused
-// before anything is written.
-func TestANICAttachedRefusesWithoutThePrimarysMAC(t *testing.T) {
-	_, oem := attachDirs(t)
-	if err := os.RemoveAll(filepath.Join(sysNetDir, "uplink")); err != nil {
-		t.Fatal(err)
-	}
-	err := AttachNIC(attachRelease(t), t.TempDir(), NetAttach{Role: "edge", MAC: "02:00:00:00:00:01"}, &strings.Builder{})
-	if err == nil || !strings.Contains(err.Error(), "no NIC is named so now") {
-		t.Fatalf("err = %v", err)
-	}
-	if _, err := os.Stat(filepath.Join(oem, "96_notes-interfaces.yaml")); err == nil {
-		t.Error("written")
-	}
-}
-
-// vm attach on a VM a release with one NIC made: the VM records the NIC over SSH first, the
-// module's state gains it after the primary's entry, unchanged, the apply power-cycles the VM,
-// and the VM is checked to name it. Run again, it goes on with the MAC the state holds.
-func TestVMAttach(t *testing.T) {
-	t.Parallel()
-	v := newVMCreate(t, "qcow2")
-	v.r.Spec.Host = &spec.Host{Interfaces: map[string]spec.HostInterface{"uplink": {Primary: true}}}
-	r := newTofuRun(t)
-	if err := v.create(tofuCreate(), r.mod(nil)); err != nil {
-		t.Fatalf("%v\n%s", err, v.log)
-	}
-	dir := filepath.Join(r.state, "notes", "vms", "notes-1")
-	readNICs := func() []moduleNIC {
-		var vars struct{ Nics []moduleNIC }
-		b, _ := os.ReadFile(filepath.Join(dir, varsFile))
-		if err := json.Unmarshal(b, &vars); err != nil {
-			t.Fatal(err)
-		}
-		return vars.Nics
-	}
-	before := readNICs()
-	v.r.Spec.Host.Interfaces["edge"] = spec.HostInterface{}
-	in := v.installer(r.mod(nil))
-	ctx := context.Background()
-	ok := func() ([]byte, error) { return []byte("edge: recorded\n"), nil }
-	boot := func(id string) func() ([]byte, error) {
-		return func() ([]byte, error) { return []byte("0000000" + id + "-0000-0000-0000-000000000000\n"), nil }
-	}
-	// One system answering each call in turn, with the host key vm create recorded for its address.
-	vm := func(steps ...func() ([]byte, error)) {
-		if err := os.WriteFile(filepath.Join(dir, "known_hosts"), []byte("notes-1.lan ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEAIlrmYko7n75rw1in9PSsqvQQwoVBxv2WjCA2q6yuS\n"), 0o600); err != nil {
-			t.Fatal(err)
-		}
-		n := 0
-		r.ssh.calls, r.ssh.answers = nil, []func() ([]byte, error){func() ([]byte, error) { n++; return steps[min(n, len(steps))-1]() }}
-	}
-	vm(boot("1"), ok, ok)
-	r.tofu.calls, r.tofu.plan, r.tofu.show = nil, 2, nicPlan
-	a := &VMAttach{Host: "notes-1", Interface: "edge=static,address=192.0.2.10/24", User: "ops", SSHKey: v.key, Address: "notes-1.lan", Ctl: "/opt/notes-stow", Wait: 2 * time.Second}
-	if err := in.AttachVM(ctx, a); err != nil {
-		t.Fatalf("%v\n%s", err, v.log)
-	}
-	nics := readNICs()
-	if len(nics) != 2 || nics[0] != before[0] || nics[1].Role != "edge" || nics[1].Attach != "br0" || !macAddr.MatchString(nics[1].MAC) {
-		t.Fatalf("nics %+v (before %+v)", nics, before)
-	}
-	mac := nics[1].MAC
-	if c := r.ssh.calls; len(c) != 3 || !slices.Equal(c[1][len(c[1])-12:], []string{"sudo", "notes-stow", "network", "attach", "--role", "edge", "--mac", mac, "--mode", "static", "--address", "192.0.2.10/24"}) ||
-		!slices.Contains(c[1], "ops@notes-1.lan") || !slices.Contains(c[1], "StrictHostKeyChecking=yes") || !slices.Contains(c[1], "HostKeyAlias=notes-1.lan") ||
-		c[2][len(c[2])-1] != `test "$(cat /proc/sys/kernel/random/boot_id)" != 00000001-0000-0000-0000-000000000000 && test -e /sys/class/net/edge` {
-		t.Fatalf("ssh ran %q", c)
-	}
-	if got := r.tofu.calls; len(got) != 5 || got[0][0] != "version" || got[1][1] != "init" || got[2][1] != "plan" || got[3][1] != "show" ||
-		!slices.Contains(got[2], "-var") || !slices.ContainsFunc(got[2], func(a string) bool { return strings.HasPrefix(a, `nics=[{"role":"uplink"`) && strings.Contains(a, mac) }) ||
-		!slices.Equal(got[4][1:], []string{"apply", "-input=false", "-no-color", attachPlanFile}) {
-		t.Fatalf("tofu ran %q", got)
-	}
-	if !strings.Contains(v.pubEnv.out.String(), "edge: recorded\nAttached edge's NIC "+mac+" to notes-1.") {
-		t.Errorf("out %q", v.pubEnv.out.String())
-	}
-
-	// Again: the MAC the state holds, no second entry, and no power cycle: the VM reboots for its
-	// addressing. Another MAC or bridge given is refused.
-	vm(boot("1"), ok, ok, ok)
-	r.tofu.plan, r.tofu.calls = 0, nil
-	if err := in.AttachVM(ctx, a); err != nil {
-		t.Fatal(err)
-	}
-	if n := readNICs(); len(n) != 2 || len(r.ssh.calls) != 4 || n[1].MAC != mac || !slices.Contains(r.ssh.calls[1], mac) || !slices.Equal(r.ssh.calls[2][len(r.ssh.calls[2])-3:], []string{"sudo", "notes-stow", "reboot"}) ||
-		slices.ContainsFunc(r.tofu.calls, func(c []string) bool { return len(c) > 1 && c[1] == "apply" }) {
-		t.Errorf("resumed: %+v %q", n, r.ssh.calls)
-	}
-	b := *a
-	b.Interface = "edge=dhcp,mac=02:00:00:00:00:77"
-	if err := in.AttachVM(ctx, &b); err == nil || !strings.Contains(err.Error(), "with the MAC "+mac+" already") {
-		t.Errorf("another MAC: %v", err)
-	}
-	b.Interface = "edge=dhcp,attach=br1"
-	vm(boot("1"), ok) // the state holds the device: the plan adds none
-	if err := in.AttachVM(ctx, &b); err == nil || !strings.Contains(err.Error(), "to br0 already") || readNICs()[1].Attach != "br0" {
-		t.Errorf("another bridge: %v", err)
-	}
-	// The state lacking the device (an apply failed on the bridge recorded): the plan adds it, on
-	// the bridge given now.
-	vm(boot("1"), ok, ok)
-	r.tofu.calls, r.tofu.plan, r.tofu.show = nil, 2, nicPlan
-	if err := in.AttachVM(ctx, &b); err != nil {
-		t.Fatalf("another bridge, the device not in the state: %v\n%s", err, v.log)
-	}
-	if n := readNICs(); n[1].Attach != "br1" || n[1].MAC != mac {
-		t.Errorf("nics %+v", n)
-	}
-	r.tofu.plan = 0
-	if _, err := os.Stat(filepath.Join(dir, attachPlanFile)); err == nil {
-		t.Error("the plan file is left")
-	}
-	// A plan that changes more than the NICs, adds them without a power cycle, or does not plan:
-	// nothing changed, on the VM (only its boot id read) or in the state.
-	noApply := func() bool {
-		_, left := os.Stat(filepath.Join(dir, attachPlanFile))
-		return !slices.ContainsFunc(r.tofu.calls, func(c []string) bool { return len(c) > 1 && c[1] == "apply" }) && len(r.ssh.calls) == 1 && left != nil
-	}
-	vb0, _ := os.ReadFile(filepath.Join(dir, varsFile))
-	unchanged := func() bool { vb, _ := os.ReadFile(filepath.Join(dir, varsFile)); return string(vb) == string(vb0) }
-	vm(boot("1"), ok, ok)
-	r.tofu.calls, r.tofu.plan, r.tofu.show = nil, 2, strings.Replace(nicPlan, `"address": "truenas_zvol.disk", "change": {"actions": ["no-op"]}`, `"address": "truenas_zvol.disk", "change": {"actions": ["update"]}`, 1)
-	if err := in.AttachVM(ctx, a); err == nil || !strings.Contains(err.Error(), "changes more than its NIC: truenas_zvol.disk (update)") || !strings.Contains(err.Error(), "nothing changed") || !strings.Contains(err.Error(), "STOWAGE_CTL=/opt/notes-stow tofu -chdir="+dir+" plan -var 'nics=[") || strings.Contains(err.Error(), " apply") || !noApply() || !unchanged() {
-		t.Errorf("drift: %v", err)
-	}
-	vm(boot("1"), ok, ok)
-	r.tofu.calls, r.tofu.show = nil, strings.Replace(nicPlan, `"address": "truenas_zvol.disk", "change": {"actions": ["no-op"]}`, `"address": "truenas_dataset.staging", "change": {"actions": ["create"]}`, 1)
-	if err := in.AttachVM(ctx, a); err == nil || !strings.Contains(err.Error(), "truenas_dataset.staging (create)") || !noApply() || !unchanged() {
-		t.Errorf("another resource created: %v", err)
-	}
-	vm(boot("1"), ok, ok)
-	r.tofu.calls, r.tofu.plan, r.tofu.show = nil, 1, nicPlan
-	if err := in.AttachVM(ctx, a); err == nil || !strings.Contains(err.Error(), "exit status 1") || !noApply() || !unchanged() {
-		t.Errorf("a plan that fails: %v", err)
-	}
-	vm(boot("1"), ok, ok)
-	r.tofu.calls, r.tofu.plan, r.tofu.show = nil, 2, strings.Replace(nicPlan, `"address": "terraform_data.power", "change": {"actions": ["delete", "create"]}`, `"address": "terraform_data.power", "change": {"actions": ["no-op"]}`, 1)
-	if err := in.AttachVM(ctx, a); err == nil || !strings.Contains(err.Error(), "does not add the NIC with the VM's power cycle") || !noApply() || !unchanged() {
-		t.Errorf("no power cycle: %v", err)
-	}
-	// Another NIC device created than the one attached: refused.
-	vm(boot("1"), ok, ok)
-	r.tofu.calls, r.tofu.show = nil, strings.Replace(nicPlan, `"address": "truenas_vm_device.nic[\"0\"]", "change": {"actions": ["no-op"]}`, `"address": "truenas_vm_device.nic[\"0\"]", "change": {"actions": ["create"]}`, 1)
-	if err := in.AttachVM(ctx, a); err == nil || !strings.Contains(err.Error(), `truenas_vm_device.nic["0"] (create)`) || !noApply() || !unchanged() {
-		t.Errorf("another NIC created: %v", err)
-	}
-	applied := func() bool {
-		return slices.ContainsFunc(r.tofu.calls, func(c []string) bool { return len(c) > 1 && c[1] == "apply" })
-	}
-	rebooted := func() bool {
-		return slices.ContainsFunc(r.ssh.calls, func(c []string) bool { return slices.Equal(c[len(c)-3:], []string{"sudo", "notes-stow", "reboot"}) })
-	}
-	// An earlier apply left half done (the power step alone to create or replace): refused, with
-	// the way to finish it by hand.
-	for _, acts := range []string{`["create"]`, `["delete", "create"]`} {
-		vm(boot("1"), ok, ok)
-		r.tofu.calls, r.tofu.show = nil, `{"resource_changes": [{"address": "terraform_data.power", "change": {"actions": `+acts+`}}]}`
-		if err := in.AttachVM(ctx, a); err == nil || !strings.Contains(err.Error(), "does not add the NIC with the VM's power cycle") ||
-			!strings.Contains(err.Error(), "power the VM off on TrueNAS, then `STOWAGE_CTL=/opt/notes-stow tofu -chdir="+dir+" apply`") ||
-			!strings.Contains(err.Error(), "`/opt/notes-stow vm attach notes-1 --interface edge=static,address=192.0.2.10/24 --host notes-1.lan --user ops --ssh-key "+v.key+" --wait 2s` again checks it") || !noApply() || !unchanged() {
-			t.Errorf("power alone %s: %v", acts, err)
-		}
-	}
-	// The command that checks it again carries the host key --known-hosts-line gave, without
-	// which it would not reach the VM: the line as written, its line end taken off.
-	vm(boot("1"), ok, ok)
-	r.tofu.calls, r.tofu.show = nil, `{"resource_changes": [{"address": "terraform_data.power", "change": {"actions": ["create"]}}]}`
-	const line = "vm-seed-host-key ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEAIlrmYko7n75rw1in9PSsqvQQwoVBxv2WjCA2q6yuS"
-	withLine := *a
-	withLine.KnownHostsLine = line + "\r\n"
-	if err := in.AttachVM(ctx, &withLine); err == nil || !strings.Contains(err.Error(), "--ssh-key "+v.key+" --known-hosts-line '"+line+"' --wait 2s` again checks it") || !noApply() || !unchanged() {
-		t.Errorf("with --known-hosts-line: %v", err)
-	}
-	// A plan with changes and no resource changed (outputs): nothing applied, the VM rebooted.
-	vm(boot("1"), ok, ok, ok)
-	r.tofu.calls, r.tofu.show = nil, `{"resource_changes": [{"address": "truenas_zvol.disk", "change": {"actions": ["no-op"]}}]}`
-	if err := in.AttachVM(ctx, a); err != nil || applied() || !rebooted() {
-		t.Errorf("outputs alone: %v", err)
-	}
-	// A vm attach running on the VM already: refused.
-	unlock, err := lockFile(stateLock(dir))
-	if err != nil {
-		t.Fatal(err)
-	}
-	vm(boot("1"))
-	if err := in.AttachVM(ctx, a); err == nil || !strings.Contains(err.Error(), "another vm create, vm attach or vm destroy runs on it") || len(r.ssh.calls) != 0 {
-		t.Errorf("locked: %v", err)
-	}
-	if err := in.DestroyVM(ctx, &VMDestroy{Host: "notes-1", Yes: true, Ctl: "/opt/notes-stow"}); err == nil || !strings.Contains(err.Error(), "another vm create, vm attach or vm destroy runs on it") {
-		t.Errorf("vm destroy, locked: %v", err)
-	}
-	unlock()
-	// An apply that fails says the NIC is recorded and a re-run goes on.
-	vm(boot("1"), ok, ok)
-	r.tofu.show, r.tofu.fail = nicPlan, errors.New("the start step failed")
-	if err := in.AttachVM(ctx, a); err == nil || !strings.Contains(err.Error(), "the start step failed; the NIC is recorded on the VM and in "+dir+"'s variables: fix the cause, power the VM off on TrueNAS") || !strings.Contains(err.Error(), "` again checks it") {
-		t.Errorf("an apply that fails: %v", err)
-	}
-	r.tofu.fail, r.tofu.plan = nil, 0
-	// The reboot refused is said.
-	vm(boot("1"), ok, refused)
-	if err := in.AttachVM(ctx, a); err == nil || !strings.Contains(err.Error(), "notes-stow reboot") {
-		t.Errorf("a reboot refused: %v", err)
-	}
-	// A boot id that does not read: refused before the VM is changed.
-	vm(refused)
-	if err := in.AttachVM(ctx, a); err == nil || !strings.Contains(err.Error(), "boot id does not read") || len(r.ssh.calls) != 1 {
-		t.Errorf("no boot id: %v, ssh %q", err, r.ssh.calls)
-	}
-	for _, bad := range []struct{ user, addr, want string }{{"-oProxyCommand=x", "", "--user -oProxyCommand=x"}, {"", "-oProxyCommand=x", `--host "-oProxyCommand=x"`}, {"", "a b", `--host "a b"`}} {
-		c := *a
-		c.User, c.Address = cmp.Or(bad.user, c.User), cmp.Or(bad.addr, c.Address)
-		r.ssh.calls = nil
-		if err := in.AttachVM(ctx, &c); err == nil || !strings.Contains(err.Error(), bad.want) || len(r.ssh.calls) != 0 {
-			t.Errorf("%+v: %v", bad, err)
-		}
-	}
-	r.tofu.plan, r.tofu.show = 2, nicPlan
-	// Another address than the one vm create recorded the host key for: refused by ssh.
-	vm(ok)
-	b.Interface, b.Address = "edge=dhcp", "192.0.2.99"
-	if err := in.AttachVM(ctx, &b); err == nil || !strings.Contains(err.Error(), "Host key verification failed") {
-		t.Errorf("another address: %v", err)
-	}
-
-	// The VM boots and names no NIC edge.
-	vm(boot("1"), ok, refused)
-	slow := *a
-	slow.Wait = 20 * time.Millisecond
-	if err := in.AttachVM(ctx, &slow); err == nil || !strings.Contains(err.Error(), "has not booted again naming a NIC edge after 20ms") {
-		t.Errorf("not named: %v", err)
-	}
-	// The VM refuses the record: the state is left as it was.
-	vm(boot("1"), refused)
-	b.Interface, b.Address = "lan=dhcp", a.Address
-	v.r.Spec.Host.Interfaces["lan"] = spec.HostInterface{}
-	r.tofu.show = strings.Replace(nicPlan, `nic[\"1\"]`, `nic[\"2\"]`, 1)
-	if err := in.AttachVM(ctx, &b); err == nil || !strings.Contains(err.Error(), "network attach") || len(readNICs()) != 2 {
-		t.Errorf("refused on the VM: %v, %+v", err, readNICs())
-	}
-
-	for _, c := range []struct{ host, iface, want string }{
-		{"notes-2", "edge=dhcp", "holds no state"},
-		{"notes-1", "uplink=mac=02:00:00:00:00:09", "the primary NIC is the VM's own"},
-		{"notes-1", "wan=dhcp", "not one of notes's NICs"},
-		{"notes-1", "lan=dhcp,mac=" + mac, "the MAC " + mac + " is edge's"},
-	} {
-		b := *a
-		b.Host, b.Interface = c.host, c.iface
-		if err := in.AttachVM(ctx, &b); err == nil || !strings.Contains(err.Error(), c.want) {
-			t.Errorf("%s %s: %v", c.host, c.iface, err)
-		}
-	}
-	// No host key known: refused before anything is run.
-	if err := os.Remove(filepath.Join(dir, "known_hosts")); err != nil {
-		t.Fatal(err)
-	}
-	r.ssh.calls = nil
-	if err := in.AttachVM(ctx, a); err == nil || !strings.Contains(err.Error(), "host key is not known") || len(r.ssh.calls) != 0 {
-		t.Errorf("no known host: %v", err)
-	}
-	// No TrueNAS API key: refused before the VM is changed.
-	delete(r.vars, "TRUENAS_API_KEY")
-	vm(ok)
-	if err := in.AttachVM(ctx, a); err == nil || !strings.Contains(err.Error(), "TRUENAS_API_KEY") || len(r.ssh.calls) != 0 {
-		t.Errorf("no API key: %v, ssh %q", err, r.ssh.calls)
-	}
-	r.vars["TRUENAS_API_KEY"] = "the-api-key"
-	// A state without the VM's name, which the module derives its MAC from: refused.
-	var raw map[string]any
-	vb, _ := os.ReadFile(filepath.Join(dir, varsFile))
-	if err := json.Unmarshal(vb, &raw); err != nil {
-		t.Fatal(err)
-	}
-	delete(raw, "name")
-	nb, _ := json.Marshal(raw)
-	if err := os.WriteFile(filepath.Join(dir, varsFile), nb, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := in.AttachVM(ctx, a); err == nil || !strings.Contains(err.Error(), "no VM name") {
-		t.Errorf("no name: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, varsFile), vb, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	// A module from before NICs by role: refused.
-	vt := filepath.Join(dir, "variables.tf")
-	tf, _ := os.ReadFile(vt)
-	if err := os.WriteFile(vt, []byte(strings.Replace(string(tf), `variable "nics"`, `variable "nics_old"`, 1)), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := in.AttachVM(ctx, a); err == nil || !strings.Contains(err.Error(), "has one NIC") || len(r.ssh.calls) != 0 {
-		t.Errorf("an old module: %v", err)
-	}
-	// Another platform's module: refused.
-	if err := os.WriteFile(filepath.Join(dir, platformFile), []byte("libvirt builtin\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := in.AttachVM(ctx, a); err == nil || !strings.Contains(err.Error(), "TrueNAS's built-in module") {
-		t.Errorf("libvirt: %v", err)
-	}
-}
-
-// vm attach on a VM a release naming no NIC made: the state's nics are empty, and the module's
-// one NIC goes first unchanged, its MAC the one the module derives, which no NIC added may take.
-func TestVMAttachToAVMOfOneUnnamedNIC(t *testing.T) {
-	t.Parallel()
-	v := newVMCreate(t, "qcow2")
-	r := newTofuRun(t)
-	if err := v.create(tofuCreate(), r.mod(nil)); err != nil {
-		t.Fatalf("%v\n%s", err, v.log)
-	}
-	dir := filepath.Join(r.state, "notes", "vms", "notes-1")
-	v.r.Spec.Host = &spec.Host{Interfaces: map[string]spec.HostInterface{"uplink": {Primary: true}, "edge": {}}}
-	in := v.installer(r.mod(nil))
-	if err := os.WriteFile(filepath.Join(dir, "known_hosts"), []byte("notes-1.lan ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEAIlrmYko7n75rw1in9PSsqvQQwoVBxv2WjCA2q6yuS\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	n := 0
-	r.tofu.plan, r.tofu.show = 2, nicPlan
-	steps := []func() ([]byte, error){func() ([]byte, error) { return []byte("00000001-0000-0000-0000-000000000000"), nil }, func() ([]byte, error) { return nil, nil }}
-	r.ssh.calls, r.ssh.answers = nil, []func() ([]byte, error){func() ([]byte, error) { n++; return steps[min(n, len(steps))-1]() }}
-	a := &VMAttach{Host: "notes-1", Interface: "edge=dhcp,mac=" + truenasMAC("notes1"), User: "ops", SSHKey: v.key, Address: "notes-1.lan", Ctl: "/opt/notes-stow"}
-	if err := in.AttachVM(context.Background(), a); err == nil || !strings.Contains(err.Error(), "is the primary NIC's") {
-		t.Fatalf("the module's own MAC: %v", err)
-	}
-	a.Interface = "edge=dhcp"
-	// A plan that does not add the new role's NIC (no changes, or none to a resource): refused
-	// before the VM or the state changes.
-	vb0, _ := os.ReadFile(filepath.Join(dir, varsFile))
+// The seed's NIC is pinned by the VM's first boot, not by the attach: whichever NICs are there,
+// in whatever order the platform added them, the attach names the new one alone, and its advice
+// follows what the kernel's NICs say — unread, it says so and gives both ways.
+func TestANICAttachedWhateverNICsAreThere(t *testing.T) {
+	unread := "; its driver unread (no NIC there, or none udev records), its link leaves out a virtual function's drivers (mlx4_en, mlx5_core, mana): a NIC of one of them is named once this is run again with the NIC there"
 	for _, c := range []struct {
-		plan int
-		show string
-	}{{0, ""}, {2, `{"resource_changes": [{"address": "truenas_zvol.disk", "change": {"actions": ["no-op"]}}]}`}} {
-		r.ssh.calls, n = nil, 0
-		r.tofu.plan, r.tofu.show = c.plan, c.show
-		err := in.AttachVM(context.Background(), a)
-		vb, _ := os.ReadFile(filepath.Join(dir, varsFile))
-		if err == nil || !strings.Contains(err.Error(), "does not add the NIC edge") || len(r.ssh.calls) != 1 || string(vb) != string(vb0) {
-			t.Fatalf("no NIC planned (%d): %v, ssh %q", c.plan, err, r.ssh.calls)
+		name string
+		nics map[string]string
+		want string
+	}{
+		{"not there yet", nil, "add the NIC on the VM's platform, then restart the VM: the boot names it" + unread + "\n"},
+		{"there, and a third NIC", map[string]string{"eth1": "02:00:00:00:00:01", "eth2": "02:00:00:00:00:77"}, "the NIC is there: `sudo notes-stow reboot` names it\n"},
+		{"there under the role's original name", map[string]string{"ens4": "02:00:00:00:00:01"}, "the NIC is there: `sudo notes-stow reboot` names it\n"},
+		{"a virtual function of its MAC alone", map[string]string{"enP1s1": "02:00:00:00:00:01"}, "add the NIC on the VM's platform, then restart the VM: the boot names it" + unread + "\n"},
+		{"there, no driver udev records", map[string]string{"eth9": "02:00:00:00:00:01"}, "the NIC is there: `sudo notes-stow reboot` names it" + unread + "\n"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			_, oem := attachDirs(t)
+			for dev, mac := range c.nics {
+				if strings.HasPrefix(dev, "enP") {
+					sysVF(t, dev, mac)
+					sysDriver(t, dev, "mlx5_core")
+					continue
+				}
+				sysNIC(t, dev, mac)
+				if dev != "eth9" {
+					sysDriver(t, dev, "virtio_net")
+				}
+			}
+			var out strings.Builder
+			if err := AttachNIC(attachRelease(t), t.TempDir(), NetAttach{Role: "edge", MAC: "02:00:00:00:00:01"}, &out); err != nil {
+				t.Fatal(err)
+			}
+			if want := "edge: the NIC 02:00:00:00:00:01 is named and addressed (none) from the next boot: " + c.want; out.String() != want {
+				t.Errorf("out %q\nwant %q", out.String(), want)
+			}
+			if cc, _ := os.ReadFile(filepath.Join(oem, "96_notes-interfaces.yaml")); strings.Contains(string(cc), "uplink") {
+				t.Errorf("the primary named by the attach:\n%s", cc)
+			}
+		})
+	}
+	// The kernel's NICs unread: refused before anything changes, never one guessed.
+	_, oem := attachDirs(t)
+	if err := os.Remove(filepath.Join(sysNetDir, "uplink", "address")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(sysNetDir, "uplink", "address"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	if err := AttachNIC(attachRelease(t), dir, NetAttach{Role: "edge", MAC: "02:00:00:00:00:01"}, &strings.Builder{}); err == nil || !strings.Contains(err.Error(), "uplink/address") {
+		t.Errorf("the NICs unread: %v", err)
+	}
+	for _, f := range []string{filepath.Join(oem, "96_notes-interfaces.yaml"), filepath.Join(dir, interfacesFile)} {
+		if _, err := os.Stat(f); err == nil {
+			t.Errorf("%s written", f)
 		}
 	}
-	r.tofu.plan, r.tofu.show, n = 2, nicPlan, 0
-	a.Interface = "edge=dhcp"
-	if err := in.AttachVM(context.Background(), a); err != nil {
+}
+
+// A role the seed names by its NIC's original name, never pinned (a VM seeded before 0.40.0, or
+// one whose first boot did not pin it): no NIC is attached beside it, which may take its name.
+func TestNoNICIsAttachedBesideAnUnpinnedOne(t *testing.T) {
+	networkd, oem := attachDirs(t)
+	if err := os.WriteFile(filepath.Join(networkd, "10-notes-uplink.link"), []byte(interfaceLink("notes", MachineInterface{Role: "uplink"})), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	var vars struct{ Nics []moduleNIC }
-	b, _ := os.ReadFile(filepath.Join(dir, varsFile))
-	if err := json.Unmarshal(b, &vars); err != nil {
-		t.Fatal(err)
+	dir := t.TempDir()
+	err := AttachNIC(attachRelease(t), dir, NetAttach{Role: "edge", MAC: "02:00:00:00:00:01"}, &strings.Builder{})
+	if err == nil || err.Error() != "--role edge: the VM's cloud-config names uplink by its NIC's original name, not pinned to its MAC: a NIC added may take its name" ||
+		refusedFix(err) != "pin it first: by hand, as \"A VM seeded before 0.40.0\" in docs/vm.md says, or, on a VM seeded by Stowage 0.40.0 or later, leave its NIC the VM's only one and restart the VM, whose boot pins it to that NIC's MAC; then run this again" {
+		t.Errorf("%v (fix %q)", err, refusedFix(err))
 	}
-	if len(vars.Nics) != 2 || vars.Nics[0] != (moduleNIC{}) || vars.Nics[1].Role != "edge" || vars.Nics[1].Attach != "" {
-		t.Errorf("nics %+v", vars.Nics)
-	}
-	// Again, naming the bridge the module put it on: the same bridge.
-	n = 0
-	a.Interface = "edge=dhcp,attach=br0"
-	if err := in.AttachVM(context.Background(), a); err != nil {
-		t.Errorf("the module's bridge named: %v", err)
+	for _, f := range []string{filepath.Join(oem, "96_notes-interfaces.yaml"), filepath.Join(dir, interfacesFile)} {
+		if _, err := os.Stat(f); err == nil {
+			t.Errorf("%s written", f)
+		}
 	}
 }
 
-// truenasMAC is the module's local.mac.
-func TestTrueNASMACIsTheModules(t *testing.T) {
-	t.Parallel()
-	b, err := os.ReadFile("tofu/truenas/main.tf")
-	if err != nil {
+// An attached NIC's link matches its MAC and the Driver= value of its driver (macMatch): the
+// virtual functions' drivers left out, unless the NIC's own is one of them (a physical Mellanox
+// NIC, matched by it), so a virtual function sharing that MAC is never named its role. The driver
+// is recorded in interfaces.yaml once a run finds the NIC there, a virtual function of its MAC
+// beside it left out.
+func TestAnAttachedNICsLinkMatchesItsDriver(t *testing.T) {
+	_, oem := attachDirs(t)
+	r, dir := attachRelease(t), t.TempDir()
+	edge := NetAttach{Role: "edge", MAC: "02:00:00:00:00:01", Mode: IfaceDHCP}
+	record := func() attachedNIC {
+		t.Helper()
+		nics, err := readAttached(dir)
+		if err != nil || len(nics) != 1 {
+			t.Fatalf("record %+v, %v", nics, err)
+		}
+		return nics[0]
+	}
+	// Attached first: no NIC there, no driver.
+	if err := AttachNIC(r, dir, edge, &strings.Builder{}); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(b), `sha256("stowage-vm/${var.name}")`) || !strings.Contains(string(b), `format("02:%s:%s:%s:%s:%s"`) {
-		t.Error("the module derives its MAC otherwise")
+	if l := attachedLinkOf(t, oem, "edge"); !strings.Contains(l, "[Match]\nMACAddress=02:00:00:00:00:01\nDriver=!mlx4_en mlx5_core mana\n\n") {
+		t.Errorf("the link of a NIC not there:\n%s", l)
 	}
-	// sha256("stowage-vm/notes1") as the module formats its first five bytes.
-	if got := truenasMAC("notes1"); got != "02:22:fa:db:69:28" {
-		t.Errorf("mac %q", got)
+	if n := record(); n.Driver != "" {
+		t.Errorf("a driver recorded with no NIC there: %+v", n)
+	}
+	// The NIC there now, under the kernel's name, with its virtual function of the same MAC
+	// beside it, not enslaved yet (Azure's accelerated networking as it comes up): run again, the
+	// NIC's driver is recorded, never the virtual function's, and its link leaves those out.
+	sysNIC(t, "eth1", "02:00:00:00:00:01")
+	sysDriver(t, "eth1", "hv_netvsc")
+	sysNIC(t, "enP1s1", "02:00:00:00:00:01")
+	sysDriver(t, "enP1s1", "mlx5_core")
+	var out strings.Builder
+	if err := AttachNIC(r, dir, edge, &out); err != nil {
+		t.Fatal(err)
+	}
+	if l := attachedLinkOf(t, oem, "edge"); !strings.Contains(l, "[Match]\nMACAddress=02:00:00:00:00:01\nDriver=!mlx4_en mlx5_core mana\n\n") {
+		t.Errorf("the link once the NIC is there:\n%s", l)
+	}
+	if strings.Contains(out.String(), "driver unread") || !strings.Contains(out.String(), "the NIC is there") {
+		t.Errorf("out %q", out.String())
+	}
+	// The record's round trip: written with its driver, read back with it, rendered from it.
+	raw, err := os.ReadFile(filepath.Join(dir, interfacesFile))
+	if err != nil || !strings.Contains(string(raw), "driver: hv_netvsc\n") {
+		t.Errorf("record %q, %v", raw, err)
+	}
+	if n := record(); n != (attachedNIC{Role: "edge", MAC: "02:00:00:00:00:01", Driver: "hv_netvsc", Mode: IfaceDHCP}) {
+		t.Errorf("record %+v", n)
+	}
+	// The virtual function enslaved now: the same.
+	if err := os.Symlink("../eth1", filepath.Join(sysNetDir, "enP1s1", "master")); err != nil {
+		t.Fatal(err)
+	}
+	if err := AttachNIC(r, dir, edge, &strings.Builder{}); err != nil || record().Driver != "hv_netvsc" {
+		t.Errorf("enslaved: %v %+v", err, record())
+	}
+	if err := os.Remove(filepath.Join(sysNetDir, "enP1s1", "master")); err != nil {
+		t.Fatal(err)
+	}
+	// Two NICs of that MAC, neither a virtual function's: which one is not known, refused naming
+	// them, nothing written.
+	sysDriver(t, "enP1s1", "virtio_net")
+	before, _ := os.ReadFile(filepath.Join(dir, interfacesFile))
+	err = AttachNIC(r, dir, NetAttach{Role: "edge", MAC: "02:00:00:00:00:01"}, &strings.Builder{})
+	if err == nil || err.Error() != "--mac 02:00:00:00:00:01: the VM's NICs enP1s1 (virtio_net), eth1 (hv_netvsc) all have it, and no one alone is told apart from a virtual function's (mlx4_en, mlx5_core, mana): which one is the NIC is not known" ||
+		refusedFix(err) != "give each NIC its own MAC on the VM's platform, then run this again" {
+		t.Errorf("two NICs of one MAC: %v (%q)", err, refusedFix(err))
+	}
+	if after, _ := os.ReadFile(filepath.Join(dir, interfacesFile)); string(after) != string(before) {
+		t.Errorf("written: %s", after)
+	}
+	if err := os.RemoveAll(filepath.Join(sysNetDir, "enP1s1")); err != nil {
+		t.Fatal(err)
+	}
+	// Run again while the NIC is gone: the same MAC keeps the driver recorded; another drops it.
+	if err := os.RemoveAll(filepath.Join(sysNetDir, "eth1")); err != nil {
+		t.Fatal(err)
+	}
+	if err := AttachNIC(r, dir, NetAttach{Role: "edge", MAC: "02:00:00:00:00:01"}, &strings.Builder{}); err != nil {
+		t.Fatal(err)
+	}
+	if n := record(); n.Driver != "hv_netvsc" || n.Mode != IfaceNone {
+		t.Errorf("the same MAC, its NIC gone: %+v", n)
+	}
+	if err := AttachNIC(r, dir, NetAttach{Role: "edge", MAC: "02:00:00:00:00:02"}, &strings.Builder{}); err != nil {
+		t.Fatal(err)
+	}
+	if n := record(); n.Driver != "" || !strings.Contains(attachedLinkOf(t, oem, "edge"), "MACAddress=02:00:00:00:00:02\nDriver=!mlx4_en mlx5_core mana\n") {
+		t.Errorf("another MAC, its NIC not there: %+v", n)
+	}
+	// A physical Mellanox NIC there (metal): matched by its own driver, one of the virtual
+	// functions'.
+	sysNIC(t, "enp3s0", "02:00:00:00:00:03")
+	sysDriver(t, "enp3s0", "mlx5_core")
+	if err := AttachNIC(r, dir, NetAttach{Role: "lan", MAC: "02:00:00:00:00:03"}, &strings.Builder{}); err != nil {
+		t.Fatal(err)
+	}
+	if l := attachedLinkOf(t, oem, "lan"); !strings.Contains(l, "[Match]\nMACAddress=02:00:00:00:00:03\nDriver=mlx5_core\n\n") {
+		t.Errorf("a physical Mellanox NIC:\n%s", l)
+	}
+	// The NIC gone between the listing and the read of its ifindex: no NIC there, never an error.
+	if err := os.Remove(filepath.Join(sysNetDir, "enp3s0", "ifindex")); err != nil {
+		t.Fatal(err)
+	}
+	var gone strings.Builder
+	if err := AttachNIC(r, dir, NetAttach{Role: "lan", MAC: "02:00:00:00:00:03"}, &gone); err != nil || !strings.Contains(gone.String(), "add the NIC on the VM's platform") {
+		t.Errorf("the NIC gone: %v %q", err, gone.String())
+	}
+	// The NIC's ifindex unread: refused, never a link guessed.
+	if err := os.Mkdir(filepath.Join(sysNetDir, "enp3s0", "ifindex"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := AttachNIC(r, dir, NetAttach{Role: "lan", MAC: "02:00:00:00:00:03"}, &strings.Builder{}); err == nil || !strings.Contains(err.Error(), "ifindex") {
+		t.Errorf("the ifindex unread: %v", err)
 	}
 }
 
-// nicPlan is `tofu show -json` of a plan adding a NIC device and power-cycling the VM.
-const nicPlan = `{"resource_changes": [
-	{"address": "truenas_zvol.disk", "change": {"actions": ["no-op"]}},
-	{"address": "truenas_vm_device.nic[\"0\"]", "change": {"actions": ["no-op"]}},
-	{"address": "truenas_vm_device.nic[\"1\"]", "change": {"actions": ["create"]}},
-	{"address": "terraform_data.power", "change": {"actions": ["delete", "create"]}}
-]}`
+// The hint for a role recorded by `network attach` whose NIC is there tells a reboot only when the
+// link as written matches that NIC (its MAC and the Driver= value of the driver recorded, as udev
+// matches it); else it names the `network attach` that records the NIC's driver, its addressing
+// kept, and that run, followed literally, makes the reboot name it.
+func TestAnAttachedRolesHintFollowsItsLink(t *testing.T) {
+	attachDirs(t)
+	r, dir := attachRelease(t), t.TempDir()
+	hint := func() string {
+		t.Helper()
+		h, err := unnamedRoleHint(networkdDir, "notes", "notes-stow", dir, "lan", nicsThere(sysNetDir, udevDataDir))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return h.String()
+	}
+	reboot := "its NIC (02:00:00:00:00:03) is recorded and there, and is named so from the next boot: `sudo notes-stow reboot`"
+	// Attached with a physical Mellanox NIC there: its link names mlx5_core.
+	sysNIC(t, "enp3s0", "02:00:00:00:00:03")
+	sysDriver(t, "enp3s0", "mlx5_core")
+	lan := NetAttach{Role: "lan", MAC: "02:00:00:00:00:03", Mode: IfaceStatic, Address: "192.0.2.20/24"}
+	if err := AttachNIC(r, dir, lan, &strings.Builder{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := hint(); got != reboot {
+		t.Errorf("matched: %q", got)
+	}
+	// The NIC's model changed on the platform, its MAC kept: the link names mlx5_core still.
+	sysDriver(t, "enp3s0", "virtio_net")
+	want := "its NIC (02:00:00:00:00:03) is recorded and there, but its link matches Driver=mlx5_core (the driver recorded: mlx5_core), not the NIC's (virtio_net): " +
+		"`sudo notes-stow network attach --role lan --mac 02:00:00:00:00:03 --mode static --address 192.0.2.20/24`, run with the NIC there, records its driver, then `sudo notes-stow reboot` names it"
+	if got := hint(); got != want {
+		t.Errorf("not matched:\n%q\nwant %q", got, want)
+	}
+	// Followed literally: the record's driver and its link follow the NIC, the addressing kept.
+	if err := AttachNIC(r, dir, lan, &strings.Builder{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := hint(); got != reboot || !strings.Contains(attachedLinkOf(t, oemDir, "lan"), "Driver=!mlx4_en mlx5_core mana\n") {
+		t.Errorf("after the attach again: %q", got)
+	}
+	if nics, _ := readAttached(dir); len(nics) != 1 || nics[0].Address != "192.0.2.20/24" || nics[0].Driver != "virtio_net" {
+		t.Errorf("record %+v", nics)
+	}
+	// Attached before a physical Mellanox NIC was there: its link leaves mlx5_core out, so the NIC
+	// there now is not named until the attach runs again.
+	if err := os.Remove(filepath.Join(dir, interfacesFile)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(filepath.Join(sysNetDir, "enp3s0")); err != nil {
+		t.Fatal(err)
+	}
+	if err := AttachNIC(r, dir, NetAttach{Role: "lan", MAC: "02:00:00:00:00:03"}, &strings.Builder{}); err != nil {
+		t.Fatal(err)
+	}
+	sysNIC(t, "enp3s0", "02:00:00:00:00:03")
+	sysDriver(t, "enp3s0", "mlx5_core")
+	want = "its NIC (02:00:00:00:00:03) is recorded and there, but its link matches Driver=!mlx4_en mlx5_core mana (the driver recorded: none), not the NIC's (mlx5_core): " +
+		"`sudo notes-stow network attach --role lan --mac 02:00:00:00:00:03 --mode none`, run with the NIC there, records its driver, then `sudo notes-stow reboot` names it"
+	if got := hint(); got != want {
+		t.Errorf("attached first:\n%q\nwant %q", got, want)
+	}
+	if err := AttachNIC(r, dir, NetAttach{Role: "lan", MAC: "02:00:00:00:00:03", Mode: IfaceNone}, &strings.Builder{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := hint(); got != reboot || !strings.Contains(attachedLinkOf(t, oemDir, "lan"), "Driver=mlx5_core\n") {
+		t.Errorf("after the attach again: %q", got)
+	}
+}
+
+// Two `network attach` runs at once, for two roles, each keep the other's NIC: one at a time
+// reads the record and writes it whole.
+func TestTwoAttachesAtOnceKeepBothNICs(t *testing.T) {
+	_, oem := attachDirs(t)
+	r := attachRelease(t)
+	for range 20 {
+		dir := t.TempDir()
+		var wg sync.WaitGroup
+		errs := make(chan error, 2)
+		for _, a := range []NetAttach{{Role: "edge", MAC: "02:00:00:00:00:01"}, {Role: "lan", MAC: "02:00:00:00:00:03"}} {
+			wg.Go(func() { errs <- AttachNIC(r, dir, a, io.Discard) })
+		}
+		wg.Wait()
+		close(errs)
+		for err := range errs {
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+		if nics, err := readAttached(dir); err != nil || len(nics) != 2 {
+			t.Fatalf("record %+v, %v", nics, err)
+		}
+		if cc, _ := os.ReadFile(filepath.Join(oem, attachedOEMName("notes"))); !strings.Contains(string(cc), "02:00:00:00:00:01") || !strings.Contains(string(cc), "02:00:00:00:00:03") {
+			t.Fatalf("the cloud-config:\n%s", cc)
+		}
+	}
+}

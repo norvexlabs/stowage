@@ -129,7 +129,20 @@ the current directory. A release with no chart (published without the shape) is 
   retried (`backoffLimit: 0`), `restartPolicy: Never`, an `activeDeadlineSeconds` of the hook's
   30 minutes and 5 more, `ttlSecondsAfterFinished: 3600`, the release's pull Secret (its
   `stowage.pullSecret` value), `seccompProfile: RuntimeDefault`, no service links and no
-  ServiceAccount token mounted; the Job and its pod carry the three Stowage labels and
+  ServiceAccount token mounted, and the installer image pinned to its linux/amd64 image
+  (`<prefix>/<name>-installer@<that image's digest>`: the installer image is an index of one image
+  per platform, and the Job runs the one the release's images run; its pod's `nodeSelector` is
+  `kubernetes.io/os: linux` and `kubernetes.io/arch: amd64`, as neither runs on another node: on a
+  cluster without a linux/amd64 node it stays pending, and the hook is given up after 10 minutes
+  with `the Job <release>-stowage: its pod cannot be scheduled: <the scheduler's message> (it runs
+  on a node labelled kubernetes.io/arch=amd64 and kubernetes.io/os=linux alone, …)`, the part in
+  parentheses added only when the scheduler's message holds `node(s) didn't match Pod's node
+  affinity/selector` or `node(s) didn't match node selector` (any other reason, such as memory, a
+  taint, pod affinity or anti-affinity or a topology spread constraint, is its message alone); the installer
+  reads the index with the release's pull account and registry CA before anything changes, and
+  refuses the run, naming the installer image, when it cannot read it or the index has no
+  linux/amd64 image; an installer image a `stowage` before 0.40.0 published, one linux/amd64 image,
+  runs as it is); the Job and its pod carry the three Stowage labels and
   `app.kubernetes.io/component: stowage-provision` (a chart with default-deny NetworkPolicies
   admits it by them: ingress to the Services the hook calls, and egress for `record` to the
   Kubernetes API server). Its steps: `copy` (the installer image, an init container) puts the

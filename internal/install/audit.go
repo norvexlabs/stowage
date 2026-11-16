@@ -133,6 +133,8 @@ func (in *Installer) carried(ctx context.Context, src *auditSource) ([]sbom.Targ
 	if err != nil {
 		return nil, err
 	}
+	// Each image of the installer's index carries its own: an operator's machine runs one.
+	targets = sbom.WithEntries(ctx, targets, sbom.RegistryEntries(src.c))
 	// The project's own registry holds the whole release: one missing there is reported.
 	mirror := src.prefix != strings.TrimSuffix(in.R.Spec.Registry.Prefix, "/")
 	var out []sbom.Target

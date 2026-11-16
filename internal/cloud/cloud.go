@@ -137,7 +137,8 @@ type Uploader struct {
 	// process's.
 	Env []string
 	Log io.Writer
-	// Tofu runs tofu (`vm create`'s runner, which stops a cancelled run gracefully).
+	// Tofu runs tofu; the publisher's runner (internal/cli's runTofu) stops a cancelled run
+	// gracefully.
 	Tofu Runner
 }
 

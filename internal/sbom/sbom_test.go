@@ -2,6 +2,7 @@ package sbom
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -11,6 +12,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/go-containerregistry/pkg/name"
 
@@ -265,6 +267,14 @@ func TestGenerate(t *testing.T) {
 			t.Errorf("lacks %q: %s", want, args)
 		}
 	}
+	// An installer index's entry is read for its own platform.
+	f = &fakeDocker{out: map[string]string{"syft": `{"spdxVersion":"SPDX-2.3"}`}}
+	if _, err := Generate(context.Background(), f.run, Source{Ref: "r@sha256:2", Platform: "darwin/arm64"}); err != nil {
+		t.Fatal(err)
+	}
+	if args := strings.Join(f.runs[0], " "); !strings.Contains(args, " registry:r@sha256:2 --platform darwin/arm64 ") {
+		t.Errorf("another platform: %s", args)
+	}
 	f = &fakeDocker{out: map[string]string{"syft": `{"bomFormat":"CycloneDX"}`}}
 	if _, err := Generate(context.Background(), f.run, Source{Ref: "r"}); err == nil || !strings.Contains(err.Error(), "not an SPDX") {
 		t.Errorf("not SPDX: %v", err)
@@ -275,6 +285,126 @@ func TestGenerate(t *testing.T) {
 	f = &fakeDocker{err: errors.New("boom")}
 	if _, err := Generate(context.Background(), f.run, Source{Ref: "r"}); err == nil {
 		t.Error("a failed syft passed")
+	}
+}
+
+// The installer's index adds each of its images but the target's after it, each for its platform,
+// and an export names each file by it; a platform that could not name a file is refused.
+func TestWithEntriesAddsTheInstallersImages(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	hexOf := map[string]string{"api": "a", "installer": "1", "os": "0", "amd": "2", "bar": "b", "cmac": "c"}
+	ref := func(s string) name.Digest {
+		d, err := name.NewDigest("r.example/p/notes-" + s + "@sha256:" + strings.Repeat(hexOf[s], 64))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return d
+	}
+	targets := []Target{{Name: "api", Digest: ref("api")}, {Name: "installer", Digest: ref("installer")}, {Name: "os", Digest: ref("os"), Optional: true}}
+	entries := map[string][]Entry{ref("installer").String(): {
+		{Platform: Platform, Digest: ref("amd")}, {Platform: "linux/arm64", Digest: ref("bar")}, {Platform: "darwin/arm64", Digest: ref("cmac")},
+	}}
+	read := func(_ context.Context, d name.Digest) ([]Entry, error) { return entries[d.String()], nil }
+	got := WithEntries(ctx, targets, read)
+	var names []string
+	for _, g := range got {
+		names = append(names, label(g.Name, g.Platform)+"="+g.Digest.DigestStr()[7:8])
+	}
+	if want := "api=a installer=1 installer (linux/arm64)=b installer (darwin/arm64)=c os=0"; strings.Join(names, " ") != want {
+		t.Fatalf("targets %q, want %q", strings.Join(names, " "), want)
+	}
+	dir := t.TempDir()
+	attested := func(_ context.Context, d name.Digest) ([]byte, error) {
+		return []byte(`{"spdxVersion":"SPDX-2.3"}`), nil
+	}
+	idx, err := Export(ctx, attested, got, dir, Index{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f := idx.Artifacts[3]; f.File != "installer/darwin-arm64.spdx.json" || f.Platform != "darwin/arm64" {
+		t.Errorf("the darwin/arm64 image's export: %+v", f)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "installer", "linux-arm64.spdx.json")); err != nil {
+		t.Error(err)
+	}
+	// An image key the platform's file would name (installer-linux-arm64 is a valid key) is
+	// another file: the platforms' are in the installer's folder.
+	keyed := append([]Target{{Name: "installer-linux-arm64", Digest: ref("api")}}, got...)
+	docs := map[string]string{ref("api").DigestStr(): "key", ref("bar").DigestStr(): "arm"}
+	byDigest := func(_ context.Context, d name.Digest) ([]byte, error) {
+		return []byte(`{"spdxVersion":"SPDX-2.3","name":"` + cmp.Or(docs[d.DigestStr()], "other") + `"}`), nil
+	}
+	dir = t.TempDir()
+	if _, err := Export(ctx, byDigest, keyed, dir, Index{}); err != nil {
+		t.Fatal(err)
+	}
+	for file, want := range map[string]string{"installer-linux-arm64.spdx.json": "key", "installer/linux-arm64.spdx.json": "arm"} {
+		if raw, err := os.ReadFile(filepath.Join(dir, filepath.FromSlash(file))); err != nil || !strings.Contains(string(raw), `"name":"`+want+`"`) {
+			t.Errorf("%s: %s %v, want the %s document", file, raw, err, want)
+		}
+	}
+	// A platform that could not name a file leaves the installer's images not audited, in one
+	// target in their place.
+	for _, bad := range []string{"../x", "linux", "Linux/amd64", "linux/amd64/v8/x"} {
+		entries[ref("installer").String()] = []Entry{{Platform: bad, Digest: ref("bar")}}
+		got := WithEntries(ctx, targets, read)
+		if len(got) != len(targets)+1 || got[2].Platform != OtherPlatforms || !strings.Contains(got[2].Err, "is not a platform") {
+			t.Errorf("%q: %+v", bad, got)
+		}
+	}
+	// An installer that is one image adds none.
+	entries[ref("installer").String()] = nil
+	if got := WithEntries(ctx, targets, read); len(got) != len(targets) {
+		t.Errorf("one image: %v", got)
+	}
+}
+
+// An installer index that cannot be read is one target not audited, named, in the audit, its
+// gate and an export: the rest of the release is read as ever.
+func TestAnUnreadableInstallerIndexIsNotAuditedAlone(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	ref := func(s, hex string) name.Digest {
+		d, err := name.NewDigest("r.example/p/notes-" + s + "@sha256:" + strings.Repeat(hex, 64))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return d
+	}
+	targets := WithEntries(ctx, []Target{{Name: "api", Digest: ref("api", "a")}, {Name: "installer", Digest: ref("installer", "1")}},
+		func(context.Context, name.Digest) ([]Entry, error) { return nil, errors.New("registry unreachable") })
+	if len(targets) != 3 || targets[2].Platform != OtherPlatforms || !strings.Contains(targets[2].Err, "registry unreachable") {
+		t.Fatalf("targets %+v", targets)
+	}
+	var reads []string
+	read := func(_ context.Context, d name.Digest) ([]byte, error) {
+		reads = append(reads, d.DigestStr())
+		return nil, errors.New("no SBOM")
+	}
+	r, err := Audit(ctx, read, Scanner{}, targets, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(r.Subjects) != 3 || r.Subjects[2].Label() != "installer (other platforms)" || !strings.Contains(r.Subjects[2].Error, "registry unreachable") {
+		t.Fatalf("subjects %+v", r.Subjects)
+	}
+	if len(reads) != 2 {
+		t.Errorf("read %v: the installer's images were read", reads)
+	}
+	if g := r.Judge(Policy{}, time.Now()); !slices.Contains(g.NotAudited, "installer (other platforms)") {
+		t.Errorf("the gate's not audited: %v", g.NotAudited)
+	}
+	dir := t.TempDir()
+	idx, err := Export(ctx, func(context.Context, name.Digest) ([]byte, error) { return []byte(`{"spdxVersion":"SPDX-2.3"}`), nil }, targets, dir, Index{})
+	if err == nil || !strings.Contains(err.Error(), "installer (other platforms)") || strings.Contains(err.Error(), "api") {
+		t.Fatalf("export: %v", err)
+	}
+	if a := idx.Artifacts[2]; a.File != "" || !strings.Contains(a.Error, "registry unreachable") {
+		t.Errorf("the export's entry: %+v", a)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "installer.spdx.json")); err != nil {
+		t.Errorf("the installer's own SBOM: %v", err)
 	}
 }
 

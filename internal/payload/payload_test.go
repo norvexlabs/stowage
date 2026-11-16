@@ -73,3 +73,23 @@ func TestRefusesACorruptLength(t *testing.T) {
 		t.Fatalf("got %v", err)
 	}
 }
+
+// Write appends at most MaxAppended bytes to an executable: the largest payload takes exactly
+// that, and one more byte of files is refused.
+func TestMaxAppendedBoundsWhatWriteAppends(t *testing.T) {
+	t.Parallel()
+	exe := []byte("exe")
+	// One file in a tar: its 512-byte header, its content in 512-byte blocks, two empty blocks.
+	content := make([]byte, MaxSize-3*512)
+	var buf bytes.Buffer
+	if err := Write(&buf, bytes.NewReader(exe), Files{"f": content}); err != nil {
+		t.Fatal(err)
+	}
+	if got := int64(buf.Len() - len(exe)); got != MaxAppended {
+		t.Fatalf("the largest payload appends %d bytes, MaxAppended is %d", got, MaxAppended)
+	}
+	buf.Reset()
+	if err := Write(&buf, bytes.NewReader(exe), Files{"f": append(content, 'x')}); err == nil {
+		t.Fatal("a payload past MaxSize was written")
+	}
+}

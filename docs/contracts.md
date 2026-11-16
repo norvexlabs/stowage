@@ -514,7 +514,8 @@ These are what `lint` checks; each finding names the key path or `file:line` to 
   number recorded before the upgrade) returns false or nothing when no rollback barrier came
   since, else true or the barriers' description; `reads_newer_label` is a label an image of
   `reads_newer_image` carries set to `true` when it reads a schema newer than its own (its absence
-  means it does not). The queries run with `psql` in the database service as the migrate role.
+  means it does not); on Kubernetes it is read from that image's `linux/amd64` image (an index's
+  entry for it, whose config must say so), and an image of another platform is refused. The queries run with `psql` in the database service as the migrate role.
   `command` runs `cmd` in its image, confined like the provision hook (a `stowage-schema`
   service, a 64 KiB answer; its environment is what its `env` lists, as the hook's: those of the
   recorded inputs, secrets and safe defaults, a file input or a secret delivered as a file as its

@@ -21,6 +21,7 @@ import (
 	"github.com/google/go-containerregistry/pkg/name"
 	ggcrregistry "github.com/google/go-containerregistry/pkg/registry"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
+	"github.com/google/go-containerregistry/pkg/v1/empty"
 	"github.com/google/go-containerregistry/pkg/v1/mutate"
 	"github.com/google/go-containerregistry/pkg/v1/random"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
@@ -410,6 +411,167 @@ func TestPlatformImageRefusesAnotherPlatform(t *testing.T) {
 		if !ok && (err == nil || !strings.Contains(err.Error(), "linux/arm64 image, not linux/amd64")) {
 			t.Fatalf("arm64 accepted as amd64: %v", err)
 		}
+	}
+}
+
+// An index resolves to its entry for the platform asked, whose config must say so too; one without
+// that platform is refused, naming those it has.
+func TestImageForPicksTheIndexEntryOfItsPlatform(t *testing.T) {
+	host := serve(t, nil)
+	c := New(authn.DefaultKeychain)
+	ctx := context.Background()
+	entry := func(os, arch string) v1.Image {
+		img, _ := random.Image(32, 1)
+		cf, _ := img.ConfigFile()
+		cf = cf.DeepCopy()
+		cf.OS, cf.Architecture = os, arch
+		img, _ = mutate.ConfigFile(img, cf)
+		return img
+	}
+	amd, arm, mac := entry("linux", "amd64"), entry("linux", "arm64"), entry("darwin", "arm64")
+	idx := mutate.AppendManifests(mutate.IndexMediaType(empty.Index, types.OCIImageIndex),
+		mutate.IndexAddendum{Add: amd, Descriptor: v1.Descriptor{Platform: &v1.Platform{OS: "linux", Architecture: "amd64"}}},
+		mutate.IndexAddendum{Add: arm, Descriptor: v1.Descriptor{Platform: &v1.Platform{OS: "linux", Architecture: "arm64"}}},
+		// The descriptor says darwin/amd64, the image's config darwin/arm64: refused.
+		mutate.IndexAddendum{Add: mac, Descriptor: v1.Descriptor{Platform: &v1.Platform{OS: "darwin", Architecture: "amd64"}}})
+	h, _ := idx.Digest()
+	ref, _ := c.Digest(host+"/p/installer", h.String())
+	if err := c.WriteIndex(ctx, ref, idx); err != nil {
+		t.Fatal(err)
+	}
+	for p, want := range map[string]v1.Image{"linux/amd64": amd, "linux/arm64": arm} {
+		pl, _ := v1.ParsePlatform(p)
+		img, err := c.ImageFor(ctx, ref, *pl)
+		if err != nil {
+			t.Fatalf("%s: %v", p, err)
+		}
+		got, _ := img.Digest()
+		if w, _ := want.Digest(); got != w {
+			t.Fatalf("%s: %s, want %s", p, got, w)
+		}
+	}
+	if _, err := c.ImageFor(ctx, ref, v1.Platform{OS: "windows", Architecture: "amd64"}); err == nil ||
+		!strings.Contains(err.Error(), "has no image for windows/amd64 (it has linux/amd64, linux/arm64, darwin/amd64)") {
+		t.Fatalf("a platform the index lacks: %v", err)
+	}
+	if _, err := c.ImageFor(ctx, ref, v1.Platform{OS: "darwin", Architecture: "amd64"}); err == nil || !strings.Contains(err.Error(), "is a darwin/arm64 image, not darwin/amd64") {
+		t.Fatalf("an entry whose config names another platform: %v", err)
+	}
+	entries, index, err := c.Platforms(ctx, ref)
+	if err != nil || !index || len(entries) != 3 || entries[1].Platform.Architecture != "arm64" {
+		t.Fatalf("platforms: %v %v %v", entries, index, err)
+	}
+	if d, _ := arm.Digest(); entries[1].Digest != d {
+		t.Fatalf("the arm64 entry: %s", entries[1].Digest)
+	}
+	// An image is no index.
+	ad, _ := amd.Digest()
+	if entries, index, err := c.Platforms(ctx, ref.Context().Digest(ad.String())); err != nil || index || entries != nil {
+		t.Fatalf("an image: %v %v %v", entries, index, err)
+	}
+}
+
+// Labels are read from the image of the platform asked, as ImageFor picks it: an index's entry for
+// it, whose config must say so, or an image of it; one of another platform is refused, never read
+// for its labels.
+func TestLabelsAreTheTargetImages(t *testing.T) {
+	host := serve(t, nil)
+	c := New(authn.DefaultKeychain)
+	ctx := context.Background()
+	labelled := func(os, arch, v string) v1.Image {
+		img, _ := random.Image(32, 1)
+		cf, _ := img.ConfigFile()
+		cf = cf.DeepCopy()
+		cf.OS, cf.Architecture = os, arch
+		cf.Config.Labels = map[string]string{"which": v}
+		img, _ = mutate.ConfigFile(img, cf)
+		return img
+	}
+	target := &v1.Platform{OS: "linux", Architecture: "amd64"}
+	arm := v1.Platform{OS: "linux", Architecture: "arm64"}
+	put := func(repo string, adds ...mutate.IndexAddendum) name.Digest {
+		idx := mutate.AppendManifests(mutate.IndexMediaType(empty.Index, types.OCIImageIndex), adds...)
+		h, _ := idx.Digest()
+		ref, _ := c.Digest(host+"/p/"+repo, h.String())
+		if err := c.WriteIndex(ctx, ref, idx); err != nil {
+			t.Fatal(err)
+		}
+		return ref
+	}
+	good := put("good",
+		mutate.IndexAddendum{Add: labelled("linux", "arm64", "arm"), Descriptor: v1.Descriptor{Platform: &v1.Platform{OS: "linux", Architecture: "arm64"}}},
+		mutate.IndexAddendum{Add: labelled(target.OS, target.Architecture, "target"), Descriptor: v1.Descriptor{Platform: target}})
+	if l, err := c.Labels(ctx, good, *target); err != nil || l["which"] != "target" {
+		t.Fatalf("the index's target image: %v %v", l, err)
+	}
+	if l, err := c.Labels(ctx, good, arm); err != nil || l["which"] != "arm" {
+		t.Fatalf("the index's linux/arm64 image: %v %v", l, err)
+	}
+	// The entry says the target, its config another platform.
+	lying := put("lying", mutate.IndexAddendum{Add: labelled("linux", "arm64", "arm"), Descriptor: v1.Descriptor{Platform: target}})
+	if l, err := c.Labels(ctx, lying, *target); !errors.Is(err, ErrNoPlatform) {
+		t.Fatalf("an entry of another platform: %v %v", l, err)
+	}
+	// An image of another platform alone.
+	other := labelled("linux", "arm64", "arm")
+	h, _ := other.Digest()
+	ref, _ := c.Digest(host+"/p/other", h.String())
+	if err := remote.Write(ref, other); err != nil {
+		t.Fatal(err)
+	}
+	if l, err := c.Labels(ctx, ref, *target); !errors.Is(err, ErrNoPlatform) {
+		t.Fatalf("an image of another platform: %v %v", l, err)
+	}
+}
+
+// Platforms match as an OCI client matches them: an unset variant asked takes any (an upstream
+// pin of an amd64 image built for v2, alone or in an index), the architecture must match, and a
+// variant asked must match.
+func TestImageForMatchesAVariantOnlyWhenOneIsAsked(t *testing.T) {
+	host := serve(t, nil)
+	c := New(authn.DefaultKeychain)
+	ctx := context.Background()
+	image := func(arch, variant string) v1.Image {
+		img, _ := random.Image(32, 1)
+		cf, _ := img.ConfigFile()
+		cf = cf.DeepCopy()
+		cf.OS, cf.Architecture, cf.Variant = "linux", arch, variant
+		img, _ = mutate.ConfigFile(img, cf)
+		return img
+	}
+	v2, arm := image("amd64", "v2"), image("arm64", "v8")
+	idx := mutate.AppendManifests(mutate.IndexMediaType(empty.Index, types.OCIImageIndex),
+		mutate.IndexAddendum{Add: arm, Descriptor: v1.Descriptor{Platform: &v1.Platform{OS: "linux", Architecture: "arm64", Variant: "v8"}}},
+		mutate.IndexAddendum{Add: v2, Descriptor: v1.Descriptor{Platform: &v1.Platform{OS: "linux", Architecture: "amd64", Variant: "v2"}}})
+	h, _ := idx.Digest()
+	ref, _ := c.Digest(host+"/p/up", h.String())
+	if err := c.WriteIndex(ctx, ref, idx); err != nil {
+		t.Fatal(err)
+	}
+	d2, _ := v2.Digest()
+	one, _ := c.Digest(host+"/p/up", d2.String())
+	amd := v1.Platform{OS: "linux", Architecture: "amd64"}
+	for what, r := range map[string]name.Digest{"the index": ref, "the image": one} {
+		img, err := c.ImageFor(ctx, r, amd)
+		if err != nil {
+			t.Fatalf("%s for linux/amd64: %v", what, err)
+		}
+		if got, _ := img.Digest(); got != d2 {
+			t.Fatalf("%s for linux/amd64: %s", what, got)
+		}
+		if _, err := c.ImageFor(ctx, r, v1.Platform{OS: "linux", Architecture: "amd64", Variant: "v3"}); err == nil {
+			t.Fatalf("%s: a v2 image taken for linux/amd64/v3", what)
+		}
+		if _, err := c.ImageFor(ctx, r, v1.Platform{OS: "linux", Architecture: "riscv64"}); err == nil {
+			t.Fatalf("%s: taken for linux/riscv64", what)
+		}
+	}
+	if _, err := c.ImageFor(ctx, one, v1.Platform{OS: "linux", Architecture: "amd64", Variant: "v3"}); err == nil ||
+		!strings.Contains(err.Error(), "is a linux/amd64/v2 image, not linux/amd64/v3") {
+		t.Fatalf("a variant asked: %v", err)
+	}
+	if _, _, err := c.PlatformImage(ctx, one, amd); err != nil {
+		t.Fatalf("an upstream pin of a v2 image: %v", err)
 	}
 }
 

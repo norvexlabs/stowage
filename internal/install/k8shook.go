@@ -16,6 +16,9 @@ import (
 	"sync"
 	"time"
 
+	v1 "github.com/google/go-containerregistry/pkg/v1"
+
+	"github.com/norvexlabs/stowage/internal/installerbin"
 	"github.com/norvexlabs/stowage/internal/providers"
 	"github.com/norvexlabs/stowage/internal/spec"
 )
@@ -42,6 +45,46 @@ var (
 
 // unschedulable starts why a pod no node takes is given up.
 const unschedulable = "its pod cannot be scheduled: "
+
+// jobNodeSelector is the nodes a Job's pod runs on, by their well-known labels: the installer
+// image it runs (jobImage) and the release's images are installerbin.Target's, which runs on no
+// other node. A cluster without such a node leaves the pod pending (jobPlacement says why).
+func jobNodeSelector() map[string]any {
+	os, arch, _ := strings.Cut(installerbin.Target, "/")
+	return map[string]any{"kubernetes.io/os": os, "kubernetes.io/arch": arch}
+}
+
+// jobPlacement is why a Job's pod no node takes may stay so: its node selector.
+var jobPlacement = func() string {
+	sel := jobNodeSelector()
+	var labels []string
+	for _, k := range sortedKeys(sel) {
+		labels = append(labels, k+"="+sel[k].(string))
+	}
+	return fmt.Sprintf("it runs on a node labelled %s alone, as the installer's and the release's images are %s",
+		strings.Join(labels, " and "), installerbin.Target)
+}()
+
+// nodeSelectorUnmatched is kube-scheduler's reasons for a node a pod's node affinity or node
+// selector refuses: the NodeAffinity plugin's (ErrReasonPod), and the one releases before it gave.
+var nodeSelectorUnmatched = []string{
+	"node(s) didn't match Pod's node affinity/selector",
+	"node(s) didn't match node selector",
+}
+
+// unschedulableWhy is why the scheduler takes no node for a Job's pod, from its Unschedulable
+// condition's message: the node selector is explained (jobPlacement) only when the scheduler names
+// the pod's node affinity or node selector as a reason (kube-scheduler's NodeAffinity plugin,
+// nodeSelectorUnmatched), never for another (memory, a taint, pod affinity or anti-affinity, a
+// topology spread constraint).
+func unschedulableWhy(msg string) string {
+	for _, r := range nodeSelectorUnmatched {
+		if strings.Contains(msg, r) {
+			return unschedulable + msg + " (" + jobPlacement + ")"
+		}
+	}
+	return unschedulable + msg
+}
 
 // hookJob names the provision Job: a Job's name is a pod label, at most 63 characters.
 func (k K8sOptions) hookJob() string {
@@ -80,7 +123,7 @@ func (k K8sOptions) kubectlWhere() string {
 // (hookImage).
 func (in *Installer) hookImageOf(ctx context.Context, prefix, use string) (string, error) {
 	ref, err := in.readInstallerImage(ctx, prefix)
-	return in.hookImage(ref, err, use)
+	return in.hookImage(ctx, prefix, ref, err, use)
 }
 
 // hookUse and kitUse are what a Job runs the release's installer image for, which a missing
@@ -91,15 +134,54 @@ const (
 )
 
 // hookImage is the installer image a Job runs in for use (hookUse, kitUse), read as
-// readInstallerImage answered: a registry holding no release manifest is told what a mirror must
-// hold for it.
-func (in *Installer) hookImage(ref string, err error, use string) (string, error) {
+// readInstallerImage answered — a registry holding no release manifest is told what a mirror must
+// hold for it —, pinned to its target's image (jobImage).
+func (in *Installer) hookImage(ctx context.Context, prefix, ref string, err error, use string) (string, error) {
 	var none noReleaseManifest
 	if errors.As(err, &none) {
 		name := in.R.Manifest.Name
 		return "", fmt.Errorf("%w: %s runs in the release's installer image (a mirror holds the %s-release and %s-installer repositories too)", err, use, name, name)
 	}
-	return ref, err
+	if err != nil {
+		return "", err
+	}
+	return in.jobImage(ctx, prefix, ref)
+}
+
+// jobImage is the installer image ref (by digest) as a Job runs it: an index's image for
+// installerbin.Target, by its digest in the same repository, run on a node of that platform alone
+// (jobNodeSelector; the installer runs a target's verbs on it alone); an installer a Stowage
+// before 0.40.0 published, one image of that platform, as it is. It is read with the registry client the
+// install pulls with (its pull account, its CA); one that cannot be read is refused, named.
+func (in *Installer) jobImage(ctx context.Context, prefix, ref string) (string, error) {
+	if in.O.K8s.JobImage != nil {
+		return in.O.K8s.JobImage(ctx, prefix, ref)
+	}
+	c, err := in.registryClient(prefix)
+	if err != nil {
+		return "", err
+	}
+	repo, digest, ok := strings.Cut(ref, "@")
+	if !ok {
+		return "", fmt.Errorf("the installer image %s: not by digest", ref)
+	}
+	d, err := c.Digest(repo, digest)
+	if err != nil {
+		return "", fmt.Errorf("the installer image %s: %w", ref, err)
+	}
+	platform, err := v1.ParsePlatform(installerbin.Target)
+	if err != nil {
+		return "", err
+	}
+	img, err := c.ImageFor(ctx, d, *platform)
+	if err != nil {
+		return "", fmt.Errorf("the installer image %s, for its %s image a Job runs: %w", ref, installerbin.Target, err)
+	}
+	h, err := img.Digest()
+	if err != nil {
+		return "", fmt.Errorf("the installer image %s: %w", ref, err)
+	}
+	return repo + "@" + h.String(), nil
 }
 
 // noReleaseManifest: the registry holds no release manifest under the release's tag.
@@ -748,7 +830,7 @@ func (in *Installer) hookJobState(ctx context.Context) (pod *k8sJob, j k8sJob, w
 	}
 	for _, c := range pod.Status.Conditions {
 		if c.Type == "PodScheduled" && c.Status == "False" && c.Reason == "Unschedulable" {
-			why = unschedulable + c.Message
+			why = unschedulableWhy(c.Message)
 		}
 	}
 	for _, c := range append(slices.Clone(pod.Status.InitContainerStatuses), pod.Status.ContainerStatuses...) {
@@ -895,6 +977,7 @@ func (in *Installer) hookJobObject(p *k8sHookPlan, env, outs map[string]string, 
 		"serviceAccountName":           name,
 		"automountServiceAccountToken": false,
 		"enableServiceLinks":           false,
+		"nodeSelector":                 jobNodeSelector(),
 		"securityContext":              map[string]any{"seccompProfile": map[string]any{"type": "RuntimeDefault"}},
 		"volumes": []any{
 			map[string]any{"name": "stowage", "emptyDir": map[string]any{}},

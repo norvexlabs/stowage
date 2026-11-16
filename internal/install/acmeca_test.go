@@ -1,6 +1,8 @@
 package install
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"os"
 	"path/filepath"
@@ -196,6 +198,43 @@ func TestTheACMECAIsRecordedAndKept(t *testing.T) {
 	}
 	if v := recordedValues(e.r.Spec, e.readEnv().Get, true); v == nil || v.ACMECA != testACMEDir {
 		t.Errorf("status --json --values: %+v", v)
+	}
+	// status --json --values: the root's digest, as a file input's; whether a pull login is held,
+	// never the login.
+	sum := sha256.Sum256(rootPEM)
+	values := func(o *Options) { o.StatusValues = true }
+	if st, out := statusOf(t, e, values); st.Values == nil || st.Values.ACMECARoot != "sha256:"+hex.EncodeToString(sum[:]) || st.Values.PullLogin || !strings.Contains(out, `"pull_login": false`) {
+		t.Errorf("status --json --values: %+v\n%s", st.Values, out)
+	}
+	if err := os.WriteFile(registryLoginFile(e.dir), loginFile("registry.example.org", "ops", loginPassword), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if st, out := statusOf(t, e, values); st.Values == nil || !st.Values.PullLogin || st.Values.PullLoginError != "" || strings.Contains(out, loginPassword) {
+		t.Errorf("a login held: %+v\n%s", st.Values, out)
+	}
+	// A login held that does not read, and a root held that does not: each said, never "none".
+	if err := os.WriteFile(registryLoginFile(e.dir), []byte("{"+loginPassword), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	rootFile := filepath.Join(e.dir, ACMERootFile)
+	if err := os.Rename(rootFile, rootFile+".away"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(rootFile, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if st, out := statusOf(t, e, values); st.Values == nil || st.Values.PullLogin || st.Values.PullLoginError == "" || st.Values.PullLoginError != st.RegistryLoginError ||
+		st.Values.ACMECARoot != "" || !strings.HasPrefix(st.Values.ACMECARootError, "the ACME CA's root: ") || strings.Contains(out, loginPassword) {
+		t.Errorf("unreadable: %+v\n%s", st.Values, out)
+	}
+	if err := os.Remove(rootFile); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(rootFile+".away", rootFile); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(registryLoginFile(e.dir)); err != nil {
+		t.Fatal(err)
 	}
 	e.r.Spec.Front.TLSModes = append(e.r.Spec.Front.TLSModes, "dns-cloudflare")
 	if err := e.install(func(o *Options) {

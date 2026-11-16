@@ -310,8 +310,8 @@ func TestAKitOnDocker(t *testing.T) {
 	}
 }
 
-// `vm create --kit` sends what the kit holds as any Given goes: never in the seed, and by hand through
-// the file its step takes.
+// A kit's content goes to a VM as any Given goes: never in the seed, and by hand through the file
+// its step takes.
 func TestVMCreateTakesAKit(t *testing.T) {
 	t.Parallel()
 	v := newVMCreate(t, "qcow2")
@@ -380,7 +380,7 @@ func TestK8sUpgradeKit(t *testing.T) {
 	}())
 	code := writeTestFile(t, "code", []byte(testKitCode))
 	var log bytes.Buffer
-	cmd := newCommand(e.release, "notes-stow", io.Discard, &log, K8sOptions{Helm: kubeTool{e.f, "helm"}, Kubectl: kubeTool{e.f, "kubectl"}}, func(bool) Prompter { return nil })
+	cmd := newCommand(e.release, "notes-stow", io.Discard, &log, e.tools(), func(bool) Prompter { return nil })
 	cmd.SetArgs([]string{"k8s", "upgrade", "--kit", file, "--kit-code-file", code, "--no-input", "--no-provision"})
 	if err := cmd.Execute(); err != nil {
 		t.Fatalf("%v\n%s", err, log.String())
@@ -401,12 +401,12 @@ func TestK8sUpgradeKit(t *testing.T) {
 	if err := in.useK8sGiven(&Given{Project: "notes", Inputs: map[string]string{"NOPE": "x"}}, "--kit"); err == nil || !strings.Contains(err.Error(), "--kit: notes 1.0.0 declares no input NOPE") {
 		t.Errorf("%v", err)
 	}
-	cmd = newCommand(e.release, "notes-stow", io.Discard, io.Discard, K8sOptions{Helm: kubeTool{e.f, "helm"}, Kubectl: kubeTool{e.f, "kubectl"}}, func(bool) Prompter { return nil })
+	cmd = newCommand(e.release, "notes-stow", io.Discard, io.Discard, e.tools(), func(bool) Prompter { return nil })
 	cmd.SetArgs([]string{"k8s", "upgrade", "--version", "2.0.0", "--kit", file, "--no-input"})
 	if err := cmd.Execute(); err == nil || !strings.Contains(err.Error(), "--kit with --version") || !strings.Contains(err.Error(), "takes `k8s upgrade --kit FILE`") {
 		t.Errorf("%v", err)
 	}
-	cmd = newCommand(e.release, "notes-stow", io.Discard, io.Discard, K8sOptions{Helm: kubeTool{e.f, "helm"}, Kubectl: kubeTool{e.f, "kubectl"}}, func(bool) Prompter { return nil })
+	cmd = newCommand(e.release, "notes-stow", io.Discard, io.Discard, e.tools(), func(bool) Prompter { return nil })
 	cmd.SetArgs([]string{"k8s", "upgrade", "--version", "2.0.0", "--kit-code-file", code, "--no-input"})
 	if err := cmd.Execute(); err == nil || !strings.Contains(err.Error(), "--kit with --version") {
 		t.Errorf("a code alone: %v", err)
@@ -437,8 +437,9 @@ func TestUpgradeRefusesAKit(t *testing.T) {
 	if root.Flags().Lookup("kit") == nil || root.Flags().Lookup("given") == nil || root.Flags().Lookup("kit-code-file") == nil {
 		t.Error("the Docker install's flags")
 	}
+	// vm create takes no kit: `vm kit take` gives one to a VM made.
 	create, _, err := root.Find([]string{"vm", "create"})
-	if err != nil || create.Flags().Lookup("kit") == nil || create.Flags().Lookup("kit-code-file") == nil {
+	if err != nil || create.Flags().Lookup("kit") != nil || create.Flags().Lookup("kit-code-file") != nil {
 		t.Errorf("vm create: %v", err)
 	}
 }
@@ -464,46 +465,9 @@ func TestSecretsAndAKitAreOne(t *testing.T) {
 		t.Errorf("vm: %v", err)
 	}
 	cmd = newCommand(e.r, e.self, io.Discard, io.Discard, K8sOptions{}, func(bool) Prompter { return nil })
-	cmd.SetArgs([]string{"vm", "create", "--no-input", "--secrets", "-", "--kit", "-"})
-	if err := cmd.Execute(); err == nil || !strings.Contains(err.Error(), "read once") {
+	cmd.SetArgs([]string{"vm", "create", "--no-input", "--registry-login-file", "-", "--secrets", "-"})
+	if err := cmd.Execute(); err == nil || !strings.Contains(err.Error(), "--registry-login-file and another flag both name standard input") {
 		t.Errorf("vm create: %v", err)
-	}
-	for _, other := range []string{"--secrets", "--kit"} {
-		cmd = newCommand(e.r, e.self, io.Discard, io.Discard, K8sOptions{}, func(bool) Prompter { return nil })
-		cmd.SetArgs([]string{"vm", "create", "--no-input", "--registry-login-file", "-", other, "-"})
-		if err := cmd.Execute(); err == nil || !strings.Contains(err.Error(), "--registry-login-file and another flag both name standard input") {
-			t.Errorf("vm create %s: %v", other, err)
-		}
-	}
-}
-
-// The command opens the kit, for the shape the VM's install takes, before it creates anything.
-func TestVMCreateCommandOpensTheKit(t *testing.T) {
-	t.Parallel()
-	e := newEnv(t)
-	e.r.Spec.Inputs = append(e.r.Spec.Inputs, spec.Input{Key: "KUBE_ONLY", Prompt: "k", Shapes: []string{"kubernetes"}}, spec.Input{Key: "DOCKER_ONLY", Prompt: "d", Shapes: []string{"docker"}})
-	raw, err := kit.Seal(&kit.Kit{For: "notes", Expires: time.Now().Add(time.Hour), Inputs: map[string]string{"KUBE_ONLY": "k", "DOCKER_ONLY": "d", "ADMIN_EMAIL": "a@example.org"}}, testKitCode, 4)
-	if err != nil {
-		t.Fatal(err)
-	}
-	file := writeTestFile(t, "kit", raw)
-	code := writeTestFile(t, "code", []byte(testKitCode))
-	run := func(codeFile string) (string, error) {
-		var log bytes.Buffer
-		cmd := newCommand(e.r, e.self, io.Discard, &log, K8sOptions{}, func(bool) Prompter { return nil })
-		cmd.SetArgs([]string{"vm", "create", "--no-input", "--kit", file, "--kit-code-file", codeFile, "--platform", "no-such-platform"})
-		err := cmd.Execute()
-		return log.String(), err
-	}
-	log, err := run(code)
-	if err == nil || strings.Contains(err.Error(), "--kit") {
-		t.Errorf("past the kit, the platform is refused: %v", err)
-	}
-	if !strings.Contains(log, "--kit: DOCKER_ONLY, KUBE_ONLY left out: not an input of the kairos shape") {
-		t.Errorf("log %q", log)
-	}
-	if _, err := run(writeTestFile(t, "wrong", []byte("wrong"))); err == nil || !strings.Contains(err.Error(), "--kit: this code does not open it") {
-		t.Errorf("a wrong code: %v", err)
 	}
 }
 
@@ -574,7 +538,6 @@ func TestAnEmptyGivenFlagIsRefused(t *testing.T) {
 	for _, args := range [][]string{
 		{"--kit", ""}, {"--given", ""}, {"--kit-code-file", ""},
 		{"k8s", "upgrade", "--kit", ""}, {"k8s", "install", "--given", ""},
-		{"vm", "create", "--kit", ""},
 	} {
 		cmd := newCommand(e.r, e.self, io.Discard, io.Discard, K8sOptions{}, func(bool) Prompter { return nil })
 		cmd.SetArgs(args)

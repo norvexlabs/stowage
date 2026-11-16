@@ -101,6 +101,18 @@ type RecordedValues struct {
 	// ACMECA is the ACME directory the front's certificates come from instead of Let's Encrypt's
 	// (--acme-ca), in the acme and dns-cloudflare modes; left out when none is recorded.
 	ACMECA string `json:"acme_ca,omitempty"`
+	// ACMECARoot is sha256:<hex> of the root the install holds for ACMECA (--acme-ca-root), as
+	// a file input shows; left out when it holds none. ACMECARootError is why the root held
+	// cannot be read (ACMECARoot then left out); left out when it can.
+	ACMECARoot      string `json:"acme_ca_root,omitempty"`
+	ACMECARootError string `json:"acme_ca_root_error,omitempty"`
+	// PullLogin is whether the install holds a pull login (--registry-login-file,
+	// `registry-login`; on Kubernetes the pull Secret's), never the login: false too when the
+	// login held cannot be read, which PullLoginError says (on Docker and the VM as status's
+	// registry_login_error; on Kubernetes kubectl's read of the pull Secret failing, or its login
+	// not parsing); left out when it can.
+	PullLogin      bool   `json:"pull_login"`
+	PullLoginError string `json:"pull_login_error,omitempty"`
 }
 
 // recordedValues reads, through get, the values recorded that s, the installed release's spec,
@@ -183,6 +195,24 @@ func recordedValues(s *spec.Spec, get func(string) (string, bool), front bool) *
 		}
 	}
 	return out
+}
+
+// heldValues adds to v what the install holds beside its recorded values: whether it holds a
+// pull login (loginHost and loginProblem, heldLoginHost's, read once by the status), and the
+// digest of its ACME root, or why each cannot be read. Nil v is left.
+func (in *Installer) heldValues(v *RecordedValues, loginHost, loginProblem string) {
+	if v == nil {
+		return
+	}
+	v.PullLogin, v.PullLoginError = loginHost != "", loginProblem
+	raw, err := in.heldACMERoot(v.TLS, v.ACMECA)
+	switch {
+	case err != nil:
+		v.ACMECARootError = err.Error()
+	case raw != nil:
+		sum := sha256.Sum256(raw)
+		v.ACMECARoot = "sha256:" + hex.EncodeToString(sum[:])
+	}
 }
 
 // DockerStatus is `status --json` on Docker: the stack's services too, as `ps` reads them, or why
@@ -445,8 +475,10 @@ func (in *Installer) StatusJSON(ctx context.Context) error {
 		st.Channel = m.Channel
 	}
 	st.Inputs = installInputs(env, s)
+	st.RegistryLogin, st.RegistryLoginError = in.heldLoginHost()
 	if in.O.StatusValues {
 		st.Values = recordedValues(s, env.Get, s != nil && s.HasFront())
+		in.heldValues(st.Values, st.RegistryLogin, st.RegistryLoginError)
 	}
 	if st.Previous, err = in.keptPrevious(v, n); err != nil {
 		return err
@@ -454,7 +486,6 @@ func (in *Installer) StatusJSON(ctx context.Context) error {
 	if st.Services, err = in.stackServices(ctx, env, nil); err != nil {
 		st.ServicesError = err.Error()
 	}
-	st.RegistryLogin, st.RegistryLoginError = in.heldLoginHost()
 	return printJSON(in.O.Out, st)
 }
 
@@ -503,6 +534,16 @@ func (in *Installer) K8sStatusJSON(ctx context.Context) error {
 		st.Inputs = recordedInputs(in.R.Spec, func(key string) bool { _, ok := data[key]; return ok })
 		if in.O.StatusValues {
 			st.Values = recordedValues(in.R.Spec, func(key string) (string, bool) { v, ok := data[key]; return v, ok }, false)
+			if st.Values != nil {
+				held, broken, err := in.pullLoginHeld(ctx)
+				st.Values.PullLogin = err == nil && held != nil
+				switch {
+				case err != nil:
+					st.Values.PullLoginError = fmt.Sprintf("the pull Secret %s cannot be read: %v", in.O.K8s.pullSecret(), err)
+				case broken != "":
+					st.Values.PullLoginError = fmt.Sprintf("the pull Secret %s holds a login that does not parse: %s", in.O.K8s.pullSecret(), broken)
+				}
+			}
 		}
 	}
 	return printJSON(in.O.Out, st)

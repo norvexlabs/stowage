@@ -5,10 +5,12 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"maps"
+	"regexp"
 	"slices"
 
 	"github.com/google/go-containerregistry/pkg/name"
 
+	"github.com/norvexlabs/stowage/internal/registry"
 	"github.com/norvexlabs/stowage/internal/release"
 )
 
@@ -22,6 +24,83 @@ type Target struct {
 	Optional bool
 	// Disk is a disk of the OS bundle, which carries the bundle's SBOM.
 	Disk bool
+	// Platform is an image's platform (os/arch) in its artifact's index (the installer's), whose
+	// own SBOM it carries; "" for the artifact itself.
+	Platform string
+	// Err, set, is why the target could not be named (OtherPlatforms): it is reported not audited
+	// with it, never read.
+	Err string
+}
+
+// OtherPlatforms stands for the installer index's images but the target's when the index could
+// not be read: one target not audited in their place.
+const OtherPlatforms = "other platforms"
+
+// platformName is a platform as an index names it, os/arch[/variant]: it names an exported file.
+var platformName = regexp.MustCompile(`^[a-z0-9]+/[a-z0-9]+(/[a-z0-9]+)?$`)
+
+// Entry is the image of an index for one platform (os/arch).
+type Entry struct {
+	Platform string
+	Digest   name.Digest
+}
+
+// Entries lists the images of the index d names; none when d names an image.
+type Entries func(ctx context.Context, d name.Digest) ([]Entry, error)
+
+// WithEntries is targets with, after the installer, each image of its index but the one for
+// Platform, whose SBOM the index carries: a target of the installer's name for its platform. An
+// installer that is one image (made before indexes) adds none.
+func WithEntries(ctx context.Context, targets []Target, entries Entries) []Target {
+	var out []Target
+	for _, t := range targets {
+		out = append(out, t)
+		if t.Name != "installer" || t.Platform != "" {
+			continue
+		}
+		es, err := entries(ctx, t.Digest)
+		if err == nil {
+			for _, e := range es {
+				if !platformName.MatchString(e.Platform) {
+					err = fmt.Errorf("%q is not a platform (os/arch)", e.Platform)
+					break
+				}
+			}
+		}
+		// An index that cannot be read leaves its images not audited, in one target, beside the
+		// rest of the release: never the whole audit stopped.
+		if err != nil {
+			out = append(out, Target{Name: t.Name, Digest: t.Digest, Optional: t.Optional, Platform: OtherPlatforms,
+				Err: fmt.Sprintf("the installer's images (one per platform): %v", err)})
+			continue
+		}
+		for _, e := range es {
+			if e.Platform != Platform {
+				out = append(out, Target{Name: t.Name, Digest: e.Digest, Optional: t.Optional, Platform: e.Platform})
+			}
+		}
+	}
+	return out
+}
+
+// IndexReader reads an index's images (registry.Client).
+type IndexReader interface {
+	Platforms(ctx context.Context, ref name.Reference) ([]registry.PlatformEntry, bool, error)
+}
+
+// RegistryEntries are the Entries r reads.
+func RegistryEntries(r IndexReader) Entries {
+	return func(ctx context.Context, d name.Digest) ([]Entry, error) {
+		es, _, err := r.Platforms(ctx, d)
+		if err != nil {
+			return nil, err
+		}
+		var out []Entry
+		for _, e := range es {
+			out = append(out, Entry{Platform: e.Platform.String(), Digest: d.Context().Digest(e.Digest.String())})
+		}
+		return out, nil
+	}
 }
 
 // Targets are the artifacts of a release (a) that carry an SBOM, under the registry prefix the
@@ -77,7 +156,12 @@ func Audit(ctx context.Context, read Attested, s Scanner, targets []Target, logf
 	docs := make([][]byte, len(targets))
 	ready := false
 	for i, t := range targets {
-		sub := Subject{Name: t.Name, Owner: Owner(t.Name), Digest: t.Digest.DigestStr(), Findings: []Finding{}}
+		sub := Subject{Name: t.Name, Platform: t.Platform, Owner: Owner(t.Name), Digest: t.Digest.DigestStr(), Findings: []Finding{}}
+		if t.Err != "" {
+			sub.Error = t.Err
+			r.Subjects = append(r.Subjects, sub)
+			continue
+		}
 		doc, err := read(ctx, t.Digest)
 		if err == nil {
 			err = Check(doc)
@@ -123,7 +207,7 @@ func Audit(ctx context.Context, read Attested, s Scanner, targets []Target, logf
 		sc, ok := seen[key]
 		if !ok {
 			if logf != nil {
-				logf("scanning %s (%s)", t.Name, t.Digest.DigestStr())
+				logf("scanning %s (%s)", label(t.Name, t.Platform), t.Digest.DigestStr())
 			}
 			sc.f, sc.built, sc.err = s.Scan(ctx, docs[i])
 			seen[key] = sc

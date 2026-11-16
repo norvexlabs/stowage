@@ -21,6 +21,7 @@ import (
 
 	"github.com/norvexlabs/stowage/internal/cloud"
 	"github.com/norvexlabs/stowage/internal/graph"
+	"github.com/norvexlabs/stowage/internal/installerbin"
 	"github.com/norvexlabs/stowage/internal/project"
 	"github.com/norvexlabs/stowage/internal/publish"
 	"github.com/norvexlabs/stowage/internal/release"
@@ -61,12 +62,21 @@ func registryProject(t *testing.T) string {
 func run(t *testing.T, b *randomBuilder, env map[string]string, args ...string) (string, string, error) {
 	t.Helper()
 	var out, errOut bytes.Buffer
-	o := &options{buildVersion: "0.1.0", getenv: func(k string) string { return env[k] }, builder: b, installer: []byte("exe"),
+	o := &options{buildVersion: "0.1.0", getenv: func(k string) string { return env[k] }, builder: b, installers: testInstallers,
 		now: func() time.Time { return time.Date(2026, 10, 8, 0, 0, 0, 0, time.UTC) }, out: &out, err: &errOut}
 	cmd := newRoot(o)
 	cmd.SetArgs(args)
 	err := cmd.ExecuteContext(context.Background())
 	return out.String(), errOut.String(), err
+}
+
+// testInstallers are an installer per platform, as a release build embeds them.
+func testInstallers() (installerbin.Set, error) {
+	s := installerbin.Set{}
+	for _, p := range installerbin.Platforms {
+		s[p] = installerbin.Of([]byte("exe " + p))
+	}
+	return s, nil
 }
 
 func TestPublishCommands(t *testing.T) {
@@ -396,7 +406,7 @@ func TestShipRefusesAVersionOutOfItsMonth(t *testing.T) {
 func runAt(t *testing.T, b *randomBuilder, env map[string]string, now time.Time, args ...string) (string, string, error) {
 	t.Helper()
 	var out, errOut bytes.Buffer
-	o := &options{buildVersion: "0.1.0", getenv: func(k string) string { return env[k] }, builder: b, installer: []byte("exe"),
+	o := &options{buildVersion: "0.1.0", getenv: func(k string) string { return env[k] }, builder: b, installers: testInstallers,
 		now: func() time.Time { return now }, out: &out, err: &errOut}
 	cmd := newRoot(o)
 	cmd.SetArgs(args)

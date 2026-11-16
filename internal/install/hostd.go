@@ -112,6 +112,12 @@ type Hostd struct {
 	// InstallNet is the file the cloud-config writes the install's network to; empty is
 	// InstallNetworkFile.
 	InstallNet string
+	// SysNet is the kernel's NIC directory, which the VM's NICs are read from (deviceNICs); empty
+	// is sysNetDir.
+	SysNet string
+	// UdevData is udev's records of the NICs, which their drivers are read from (nicDriver);
+	// empty is udevDataDir.
+	UdevData string
 	// Systemd is where the daemon writes runtime unit drop-ins (the backup timer's schedule);
 	// empty is /run/systemd/system.
 	Systemd string
@@ -1007,6 +1013,7 @@ func (h *Hostd) status(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	st := Status{Format: MachineFormat, Name: m.Name, OS: Version{m.ProjectVersion, m.Revision}, Job: "idle"}
+	st.RegistryLogin, st.RegistryLoginError = in.heldLoginHost()
 	if env, err := in.open(); err == nil {
 		name, v, rev := runs(env)
 		n, _ := strconv.Atoi(rev)
@@ -1020,6 +1027,7 @@ func (h *Hostd) status(w http.ResponseWriter, r *http.Request) {
 		st.Inputs = installInputs(env, s)
 		if values {
 			st.Values = recordedValues(s, env.Get, s != nil && s.HasFront())
+			in.heldValues(st.Values, st.RegistryLogin, st.RegistryLoginError)
 		}
 		st.Installing, st.InstallFailed, _ = in.firstInstall()
 		st.RestoreAwaited = in.restoreAwaited()
@@ -1089,7 +1097,6 @@ func (h *Hostd) status(w http.ResponseWriter, r *http.Request) {
 	default:
 		st.BootJudged = judgedOf(judged)
 	}
-	st.RegistryLogin, st.RegistryLoginError = in.heldLoginHost()
 	st.NetworkWarning = h.route6Warning()
 	h.mu.Lock()
 	st.RebootPending = h.rebooting

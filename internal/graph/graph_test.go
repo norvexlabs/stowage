@@ -13,6 +13,7 @@ import (
 	"github.com/norvexlabs/stowage/internal/chown"
 	"github.com/norvexlabs/stowage/internal/dockerfile"
 	"github.com/norvexlabs/stowage/internal/front"
+	"github.com/norvexlabs/stowage/internal/installerbin"
 	"github.com/norvexlabs/stowage/internal/project"
 	"github.com/norvexlabs/stowage/internal/sbom"
 	"github.com/norvexlabs/stowage/internal/testutil"
@@ -656,15 +657,24 @@ func TestInstallerExecutableAndPullAccountAreInstallerInputs(t *testing.T) {
 		}
 		return inputs(g)
 	}
-	base := at(Release{Installer: []byte("exe-1"), Pull: "pull:a"})
+	set := func(target, other string) installerbin.Set {
+		return installerbin.Set{installerbin.Target: installerbin.Of([]byte(target)), "darwin/arm64": installerbin.Of([]byte(other))}
+	}
+	base := at(Release{Installer: set("exe-1", "mac-1"), Pull: "pull:a"})
 	for what, r := range map[string]Release{
-		"executable": {Installer: []byte("exe-2"), Pull: "pull:a"},
-		"pull":       {Installer: []byte("exe-1"), Pull: "pull:b"},
+		"executable": {Installer: set("exe-2", "mac-1"), Pull: "pull:a"},
+		"pull":       {Installer: set("exe-1", "mac-1"), Pull: "pull:b"},
 	} {
 		c := changed(base, at(r))
 		if want := carriers(); !maps.Equal(c, want) {
 			t.Errorf("%s: changed %v, want %v", what, c, want)
 		}
+	}
+	// Another platform's executable is in the installer image alone: the OS bundle carries the
+	// target's.
+	c := changed(base, at(Release{Installer: set("exe-1", "mac-2"), Pull: "pull:a"}))
+	if want := map[string]bool{"installer": true, "release": true}; !maps.Equal(c, want) {
+		t.Errorf("another platform's executable: changed %v, want %v", c, want)
 	}
 }
 

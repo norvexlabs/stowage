@@ -1,3 +1,5 @@
 /bin/
-/internal/installerbin/stowage-install
+/internal/installerbin/stowage-install-*.gz
+/internal/installerbin/stowage-install-*.sha256
+/internal/installerbin/stowage-install-*.size
 /stowage

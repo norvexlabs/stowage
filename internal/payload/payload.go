@@ -25,6 +25,9 @@ const MaxSize = 16 << 20
 
 const trailer = int64(8 + len(Magic))
 
+// MaxAppended bounds what Write appends to an executable: the payload and its trailer.
+const MaxAppended = MaxSize + trailer
+
 // Well-known files.
 const (
 	Release = "release.json" // the release manifest, as published

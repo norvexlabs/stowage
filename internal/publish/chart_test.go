@@ -200,7 +200,7 @@ func TestAChartThatWouldDifferIsRefusedOnAnImmutableChannel(t *testing.T) {
 			m.Artifacts.Chart = &c
 		}
 		p, _ := e.publisher()
-		img, err := p.installerImage(&m)
+		img, err := p.installerIndex(&m)
 		if err != nil {
 			t.Fatal(err)
 		}

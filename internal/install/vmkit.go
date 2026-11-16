@@ -26,60 +26,48 @@ import (
 )
 
 // vmLink reaches a VM over SSH: as user with the key next to pub, at addr, checked strictly
-// against the one host key the file known holds under alias — the one vm create recorded for that
-// address in the VM's state directory, or the line --known-hosts-line gave. ssh refuses another
-// key, and an address it holds none for.
+// against the one host key the file known holds under alias, the line --known-hosts-line gave. ssh
+// refuses another key.
 type vmLink struct {
 	ssh             Tool
 	user, pub, addr string
 	known, alias    string
-	// line is the known_hosts line --known-hosts-line gave, as givenKnownHosts wrote it; empty
-	// without one.
+	// line is the known_hosts line --known-hosts-line gave, as givenKnownHosts wrote it.
 	line string
 }
 
 // VMReach names a VM and how SSH reaches it: vm create's defaults, the host name. KnownHostsLine,
-// when set, is the VM's host key as a known_hosts line, checked in place of vm create's record.
+// required, is the VM's host key as a known_hosts line: Stowage keeps no record of a VM.
 type VMReach struct {
 	Host                  string
 	User, SSHKey, Address string
 	KnownHostsLine        string
 }
 
-// link is the SSH link to the VM r names, refused before any connection when its state holds no
-// host key: a VM whose install was finished by hand has none.
+// link is the SSH link to the VM r names, the one way this machine reaches a VM over SSH: refused
+// before any connection without the VM's host key (--known-hosts-line).
 func (in *Installer) link(r VMReach) (*vmLink, error) {
 	o := &in.O
 	if err := checkHostname(r.Host); err != nil {
 		return nil, err
 	}
-	dir, err := o.stateDir(in.R.Spec.Name, r.Host)
-	if err != nil {
-		return nil, err
+	if r.KnownHostsLine == "" {
+		return nil, refuse("give --known-hosts-line the VM's host key as one known_hosts line: `vm seed --json`'s known_hosts_line until the VM's install retires that one-time key, then the VM's own, which `vm host-key --json` prints (known_hosts_line), or checked on its console (`ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub`)",
+			"%s: the VM's host key is not known: --known-hosts-line gives it", r.Host)
 	}
 	if o.SSH == nil {
 		return nil, errors.New("ssh is not available to this run")
 	}
-	l := &vmLink{ssh: o.SSH, user: cmp.Or(r.User, defaultUser(o.getenv)), pub: cmp.Or(r.SSHKey, defaultKey(o.getenv("HOME"))), addr: cmp.Or(r.Address, r.Host), known: filepath.Join(dir, "known_hosts")}
-	l.alias = hostAlias(l.addr)
+	l := &vmLink{ssh: o.SSH, user: cmp.Or(r.User, defaultUser(o.getenv)), pub: cmp.Or(r.SSHKey, defaultKey(o.getenv("HOME"))), addr: cmp.Or(r.Address, r.Host)}
 	if err := checkUser(l.user); err != nil {
 		return nil, fmt.Errorf("--user %s: %w", l.user, err)
 	}
 	if strings.HasPrefix(l.addr, "-") || strings.ContainsAny(l.addr, " \t\r\n%@\"'\\") {
 		return nil, fmt.Errorf("--host %q: a host name or an address", l.addr)
 	}
-	if r.KnownHostsLine != "" {
-		if l.known, l.alias, l.line, err = o.givenKnownHosts(in.R.Spec.Name, r.KnownHostsLine); err != nil {
-			return nil, err
-		}
-		return l, nil
-	}
-	st, err := os.Stat(l.known)
-	if err == nil && st.Size() == 0 {
-		err = errors.New("it is empty")
-	}
-	if err != nil {
-		return nil, fmt.Errorf("%s: the VM's host key is not known (vm create records it once the VM answers, for the address it waited at: --host gives that one; a VM whose install was finished by hand: put its host key, checked on its console, in %s; or give it with --known-hosts-line): %w", r.Host, l.known, err)
+	var err error
+	if l.known, l.alias, l.line, err = o.givenKnownHosts(in.R.Spec.Name, r.KnownHostsLine); err != nil {
+		return nil, err
 	}
 	return l, nil
 }
@@ -145,7 +133,7 @@ func (l *vmLink) run(ctx context.Context, command ...string) ([]byte, error) {
 // asked.
 func (l *vmLink) try(ctx context.Context, ctl string) error {
 	if _, err := l.run(ctx, "sudo", "-n", shellQuote(ctl), "--help"); err != nil {
-		return fmt.Errorf("%s does not answer over SSH, or does not run sudo without a password: %w (--host, --user and --ssh-key reach it as vm create did; its key is the one in %s; or its sudoers does not let the user run `%s` without a password)", l.at(), err, l.known, ctl)
+		return fmt.Errorf("%s does not answer over SSH, or does not run sudo without a password: %w (--host, --user and --ssh-key reach it; its key is the one in %s, which --known-hosts-line gave; or its sudoers does not let the user run `%s` without a password)", l.at(), err, l.known, ctl)
 	}
 	return nil
 }
@@ -163,7 +151,7 @@ func reachFlags(f *pflag.FlagSet, user, key, host, known *string) {
 	f.StringVar(user, "user", "", "the VM's administrator, who logs in over SSH (default: your user name, else sysadmin)")
 	f.StringVar(key, "ssh-key", "", "the administrator's SSH public key file (default: ~/.ssh/id_ed25519.pub, id_ecdsa.pub or id_rsa.pub)")
 	f.StringVar(host, "host", "", "the name or address the VM answers at (default: HOSTNAME)")
-	f.StringVar(known, "known-hosts-line", "", "the VM's SSH host key as one known_hosts line, HOST KEYTYPE BASE64 (`vm seed --json`'s known_hosts_line): that key alone is accepted, in place of the one vm create recorded")
+	f.StringVar(known, "known-hosts-line", "", "required: the VM's SSH host key as one known_hosts line, HOST KEYTYPE BASE64 — `vm seed --json`'s known_hosts_line until the install retires that one-time key, then `vm host-key --json`'s: that key alone is accepted")
 }
 
 // exitCoder is an error carrying the exit status of the program that failed (exec's ExitError).
@@ -351,7 +339,7 @@ type VMKitTake struct {
 }
 
 // TakeKitVM opens a kit on this machine and gives what it holds to the VM's install over SSH, on
-// standard input, as `vm create --kit` gives a first install's: the code never leaves this
+// standard input, as `install --kit` takes a first install's: the code never leaves this
 // machine, and the VM's install checks each input as `install --given` does (an input of another
 // shape left out and said there, one it does not declare refused).
 func (in *Installer) TakeKitVM(ctx context.Context, t *VMKitTake, stdin io.Reader, prompt Prompter, now time.Time) error {

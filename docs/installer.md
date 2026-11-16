@@ -10,6 +10,15 @@ private directory where a program may run: the current directory, then the user'
 `$TMPDIR`. It runs it there and removes it afterwards. `<short>-stow script` prints that script
 again, to copy an installer to another host.
 
+An install runs on a linux/amd64 host. The installer image holds one `<short>-stow` per platform
+(see [the installer image](publisher.md) in the publisher's registry layout), and `docker run`
+takes the Docker host's own: on another platform (an arm64 host gets the linux/arm64 one) every
+verb but `script`, `describe`, `k8s`, `vm` and `mirror` — the ones an operator's machine runs —
+refuses (exit 3) with `this installer is the <platform> build: <name> installs on linux/amd64
+hosts alone (its images are built for it); …`, naming the fix: on a linux/amd64 host, `docker run
+--rm --platform linux/amd64 <prefix>/<name>-installer:<tag> > <name>.sh`. Under `--json` the
+refusal is the verb's Result.
+
 ```bash
 <short>-stow --version   # (-v) `<short>-stow version <version> (revision N), stowage <Stowage version>`: the release it carries and the Stowage that built it (`, stowage …` left out when its manifest records none)
 <short>-stow [--dir D] [--registry PREFIX] [--registry-ca FILE] [--offline] [--dry-run] # install / finish setup
@@ -73,9 +82,12 @@ again, to copy an installer to another host.
   or a disk a mirror (`--registry`, or the one the install pulls from) does not hold (exported
   without the `kairos` shape, or with `--disks` naming other formats) is left out, logged as `<artifact> <digest> is not in <prefix>
   (…): not read`.
-- `sbom export DIR` writes each artifact's SBOM, verified, as `DIR/<artifact>.spdx.json` and
-  `DIR/index.json` (`{project, version, revision, channel, tag, format: "spdx-2.3+json",
-  artifacts: [{name, digest, file, error}]}`), for the operator's own tools (Dependency-Track,
+- `sbom export DIR` writes each artifact's SBOM, verified, as `DIR/<artifact>.spdx.json` (each
+  image of the installer index but the linux/amd64 one, whose SBOM the index carries, as
+  `DIR/installer/<os>-<arch>.spdx.json`, in a folder no image key can name) and `DIR/index.json`
+  (`{project, version, revision, channel, tag, format: "spdx-2.3+json", artifacts: [{name,
+  platform, digest, file, error}]}`, `platform` an installer image's alone, `file` relative to
+  `DIR`), for the operator's own tools (Dependency-Track,
   Trivy, grype); it prints each artifact, its digest and its file, and exits 1 when one has no
   SBOM by a trusted key (the others are written, the index naming why).
 - `audit` scans each SBOM with the release's own scanner, read by digest with the same registry

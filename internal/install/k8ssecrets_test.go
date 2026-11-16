@@ -261,7 +261,7 @@ func TestK8sSecretsFlags(t *testing.T) {
 	t.Parallel()
 	e := newKubeEnv(t, spec.Provider{Name: "none"})
 	run := func(stdin string, args ...string) error {
-		cmd := newCommand(e.release, "notes-stow", io.Discard, io.Discard, K8sOptions{Helm: kubeTool{e.f, "helm"}, Kubectl: kubeTool{e.f, "kubectl"}}, nil)
+		cmd := newCommand(e.release, "notes-stow", io.Discard, io.Discard, e.tools(), nil)
 		cmd.SetArgs(args)
 		cmd.SetIn(strings.NewReader(stdin))
 		return cmd.Execute()

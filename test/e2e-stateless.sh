@@ -13,8 +13,8 @@
 # (volumes-age-rclone: the archive and a manifest, no dump) to WebDAV, and a restore that brings the
 # volume back → ship 1.0.1, `upgrade --version
 # 1.0.1` (nothing dumped) → rollback (no schema check) → reset-db is refused: the release has no
-# database → an install of 0.9.0, which the last release's stowage (built from its tag) shipped
-# before 1.0.0, upgrades to 1.0.1 with this one's, and a rollback goes back to it with its own
+# database → an install of 0.9.0, which the last release's stowage (built from its tag by that
+# tree's own recipe, prev_stowage) shipped before 1.0.0, upgrades to 1.0.1 with this one's, and a rollback goes back to it with its own
 # installer → 1.0.2 adds a front terminating the L4 route's TLS alone (no HTTP route, no portal),
 # installed with --tls internal (no ALPN protocol selected), then re-run with --tls byo, its CA
 # published into a volume, then with --tls acme against an ACME server (Pebble, its DNS stub
@@ -53,22 +53,13 @@ PY
 PORT=$(free_port)
 
 step "the last release's stowage, built from its tag, ships 0.9.0"
-# The nearest release tag in this branch's history that is not this build's version (by history,
-# never by sorting tags); its checks ran when it was released.
-THIS=$("$STOWAGE" --version | awk '{print $NF}')
-OLDV=$(git -C "$REPO" describe --tags --abbrev=0 --match 'v*' --exclude "v$THIS" HEAD) || fail "no release before $THIS to install with"
+# The previous release's stowage, built by its own tree's recipe (prev_stowage), and its example.
+OLDSTOWAGE=$(prev_stowage)
+OLDV=$(basename "$(dirname "$OLDSTOWAGE")")
 OLDV=${OLDV#v}
-OLD=$WORK/stowage-$OLDV
-mkdir -p "$OLD" "$CACHE/stowage-go"
-git -C "$REPO" archive "v$OLDV" | tar -x -C "$OLD"
-docker run --rm -u "$(id -u):$(id -g)" -e HOME=/tmp -e GOCACHE=/cache/build -e GOMODCACHE=/cache/mod -e CGO_ENABLED=0 -e GOFLAGS=-trimpath \
-	-v "$CACHE/stowage-go:/cache" -v "$OLD:/src" -w /src "golang:$(sed -n 's/^GO_VERSION ?= //p' "$OLD/Makefile")-bookworm" sh -ec "
-	GOOS=linux GOARCH=amd64 go build -ldflags '-s -w -buildid= -X main.version=$OLDV' -o out/stowage-install ./cmd/stowage-install
-	cp out/stowage-install internal/installerbin/stowage-install
-	go build -tags stowage_installer -ldflags '-s -w -buildid= -X main.version=$OLDV' -o out/stowage ./cmd/stowage" >"$WORK/old-build.log" 2>&1 ||
-	{ cat "$WORK/old-build.log"; fail "building stowage $OLDV"; }
 P0=$WORK/lookup-$OLDV
-cp -r "$OLD/examples/stateless" "$P0"
+mkdir -p "$P0"
+git -C "$REPO" archive "v$OLDV" examples/stateless | tar -x --strip-components=2 -C "$P0" || fail "the example at v$OLDV"
 private "$P0"
 python3 - "$P0/CHANGELOG.md" <<'PY'
 import re, sys
@@ -77,7 +68,7 @@ s, n = re.subn(r"^## \[[^]]+\].*$", "## [0.9.0]", open(p).read(), count=1, flags
 assert n == 1, "no top entry in " + p
 open(p, "w").write(s)
 PY
-S0=("$OLD/out/stowage" -C "$P0")
+S0=("$OLDSTOWAGE" -C "$P0")
 "${S0[@]}" lock --update >/dev/null
 "${S0[@]}" ship --channel stable >"$WORK/ship-0.9.0.out" 2>"$WORK/ship-0.9.0.log" || { cat "$WORK/ship-0.9.0.log"; fail "ship 0.9.0 with stowage $OLDV"; }
 # The installer image as the ship names it, by digest.

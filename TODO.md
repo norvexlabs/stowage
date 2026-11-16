@@ -13,31 +13,6 @@ Batched by the gate they share: a batch is one slice, one review, one gate run. 
 Must above Blocked (user, 2026-11-15): the clouds under Blocked ship in it as preview, Google
 Cloud alone proven.
 
-### VM creation — the OpenTofu path moves out of Stowage
-
-1. **`vm create --create opentofu` gives way to the OpenTofu provider and standalone modules**:
-   Stowage runs `tofu` itself there (its own state of the VM, beside any root the operator keeps),
-   while the provider (`terraform-provider-stowage`) creates the same VM from an operator's root
-   with `stowage_vm_seed` and these modules. Stowage stays the core and never depends on the
-   provider: (1) publish the VM modules (`internal/install/tofu/*`) as standalone, versioned
-   OpenTofu modules the provider's examples and quickstarts call; (2) the VM suites make their
-   VMs from `vm seed --json` and a test root of their own (as the provider's `acc-vm` does), never
-   through the provider; (3) remove `--create opentofu`, `--module`, `--tofu-var`, `vm destroy` and
-   the hypervisor side of `vm attach` (a NIC becomes the root's change), `vm create --kit` becoming
-   the provider's flow; `vm seed`, `vm create --create manual` and every verb on the VM stay. The
-   cloud images `ship` registers (`internal/cloud`) stay: they are the publisher's side. Options:
-   (a) the steps above (recommended); (b) also a `vm root` verb printing a ready root (provider +
-   module) for an operator with no IaC of their own, Stowage never running `tofu`; (c) keep
-   `vm create` as is beside the provider (two owners of a VM's state). No compatibility until 1.0.
-   What moves with the modules, owned by their own suite then (not by a `vm create` run): each
-   applied on its platform with a no-drift plan after the apply (`tofu plan -detailed-exitcode`
-   returning 0; libvirt's sorted firmware features were one); libvirt's on a stock Ubuntu LTS host
-   with KVM and AppArmor enforcing (the guest's boot, SSH, first install, `virt-aa-helper`; today
-   proven only against libvirtd in a container without KVM), and with several vCPUs (`queues`, as
-   proxmox's `min(var.cpus, 64)`, never applied with more than one); libvirt 0.9.9 leaves a domain
-   whose start failed defined and out of the state, said in the module's docs until upstream keeps
-   it in the state. A module leaves preview after that run on its platform.
-
 ### Supply chain — stopgaps back to canonical
 
 1. **Check every stopgap at each release, and drop each one the upstream has caught up with**:
@@ -85,6 +60,13 @@ Cloud alone proven.
    Caddy, grype or rclone carrying the module: move the recipe, then drop the override; a base
    build carrying the package: repin it, then drop the raise), the `apk upgrade` and any module the
    release does not require it leaves to judge, base repins, and the findings with no fix yet.
+2. **`vm truenas import-image|seed|stop` back to the TrueNAS provider**: the TrueNAS example's
+   `local-exec` steps run them because `truenas/truenas` (1.9.1, checked 2026-11-15) cannot put a
+   file on the host (its issue #55, `truenas_filesystem_file`, open: no API deletes a file, and an
+   HTTP `/_upload/` transport is needed), write a disk image into a zvol (`vm.device.convert`; no
+   issue found) or stop a VM before its devices are deleted (`truenas_vm_power`'s delete does
+   nothing, and `truenas_vm_device`'s delete refuses a running VM). Each goes once the provider
+   covers it: drop the verb and its step from the example, and `internal/truenas` with the last.
 
 ### Blocked — upstream or accounts
 
@@ -96,24 +78,23 @@ Cloud alone proven.
    (`azurerm_storage_blob` refuses an existing blob): check both there, and that the service
    principal needs *Storage Blob Data Contributor* on the storage account (blobs are written with
    Entra ID).
-   The same accounts prove the modules' firewalls, as GCP's does (from the security review):
-   AWS's module makes a security group from `ssh_sources` and `open_ports` when no
-   `security_group_ids` is given (a VPC's default group admits nothing from outside) and an
-   `encrypted` root volume; Azure's an NSG on the NIC; Secure Boot / vTPM where the image allows.
-   Each checked against its provider's schema and applied for real.
-2. **Scaleway, run for real**: `cloud_publish: [scaleway]` and `vm create --platform scaleway` are
-   written against `scaleway/scaleway` 2.91.0 and checked against its schema, not yet run on
-   Scaleway (`STOWAGE_CLOUD_ENV=<file> make e2e-kairos`, then a VM from the Scaleway module).
-   Check there: the import takes the compressed qcow2 (`qemu-img -c`), a tag holding the
-   description's spaces and colon is accepted and filtered on, the 5 GB single PUT holds the
-   disk, the bundle's `scaleway` datasource reads the `cloud-init` user data at first boot (its
-   source port below 1024), and a drop-by-default security group lets DHCP and the metadata
-   service through; then drop the module's preview mark.
-3. **OVHcloud**: the same for OVHcloud Public Cloud (OpenStack): `vm create` and `cloud_publish`
-   (the disk uploaded as a Glance image of the project, `ovh/ovh` and/or
+2. **Scaleway, run for real**: `cloud_publish: [scaleway]` is written against `scaleway/scaleway`
+   2.91.0 and checked against its schema, not yet run on Scaleway (`STOWAGE_CLOUD_ENV=<file> make
+   e2e-kairos`, then a VM from the provider's Scaleway example). Check there: the import takes the
+   compressed qcow2 (`qemu-img -c`), a tag holding the description's spaces and colon is accepted
+   and filtered on, the 5 GB single PUT holds the disk, and the bundle's `scaleway` datasource reads
+   the `cloud-init` user data at first boot (its source port below 1024).
+3. **OVHcloud**: the same for OVHcloud Public Cloud (OpenStack): a `vm seed` platform and
+   `cloud_publish` (the disk uploaded as a Glance image of the project, `ovh/ovh` and/or
    `terraform-provider-openstack/openstack`, whichever the latest official docs make canonical).
-   Before writing a module, read the latest provider's official docs and its schema, and pin that
-   release.
+   Before writing the registration's module, read the latest provider's official docs and its
+   schema, and pin that release.
+4. **The darwin installer, run on a real Mac**: needs Mac hardware (arm64, and amd64 if one is at
+   hand). The darwin images of the installer index are Go's ad-hoc linker-signed Mach-O with the
+   payload appended after the code signature's range, checked by structure alone. Run `script`,
+   `describe --json` and a `k8s` verb from each; if macOS refuses one (killed, `Code Signature
+   Invalid`), re-sign it ad hoc after the payload is appended (the code directory's code limit
+   covering it, as Go's `cmd/internal/codesign` writes one), and add that run to the proof.
 
 ## Should
 
@@ -201,18 +182,18 @@ Cloud alone proven.
 - **The networks record per service**: `.stowage-networks` digests every network of the project, so
   a change to a network a start-first service does not join replaces it stop-first all the same;
   a digest of each service's own networks would keep it overlapping.
-- **Several NICs on a cloud**: `vm create` refuses more than one `host.interfaces` NIC on AWS,
+- **Several NICs on a cloud**: `vm seed` and `vm create` refuse more than one `host.interfaces` NIC on AWS,
   Azure and Google Cloud, whose NICs' MACs are the cloud's (the seed cannot name them by MAC) and
   which need a subnet (AWS, Azure) or a VPC network (Google Cloud) for each. Naming them by their
-  order on the bus (`Path=` in the `.link`), each module taking a list of subnets, once the test
-  accounts can prove it.
+  order on the bus (`Path=` in the `.link`), each cloud's root taking a list of subnets, once the
+  test accounts can prove it.
 - **`tune` judging a Docker host's mapped NIC**: `install --interface ROLE=NIC` records which NIC
   plays a role (for an ipvlan's parent); `tune` could judge that NIC's MTU and ethtool settings
   as it does the VM's, rather than advise them for any NIC.
 
 - **The data partition encrypted with the TPM** (`shapes.kairos.encryption: tpm`): Kairos's LUKS of
   `COS_PERSISTENT` (`install.encrypted_partitions` from the installer, `kcrypt.encrypt_on_boot` on a disk
-  image's first boot), its key in the TPM's NV memory. `vm create` attaches a virtual TPM where the
+  image's first boot), its key in the TPM's NV memory. The VM gets a virtual TPM where the
   platform has one (TrueNAS `trusted_platform_module`, Proxmox's TPM state disk, libvirt's swtpm, a
   Google Cloud Shielded VM, Azure's Trusted Launch, AWS NitroTPM registered with `tpm_support`), metal
   needs TPM 2.0; a boot without the TPM halts (no plaintext fallback). What it protects, said: the key
@@ -334,7 +315,7 @@ Cloud alone proven.
   the payload next to the install, decrypted at each start. Kubernetes: `<short>-stow` decrypts and
   writes the Secret (an External Secrets Operator source later). VM: cloud-config carries the
   payload and the deployment key (never the operator's), the seed is removed after the first
-  boot (OpenTofu detaches it; the manual steps say so; cloud steps block containers from the
+  boot (the OpenTofu root detaches it; the manual steps say so; cloud steps block containers from the
   metadata service), the payload is decrypted at each boot into `/run`. KMS seal flags and a real
   KMS test come with it or after.
 - **`gen` fallback on a secret input**: `{ key: K, prompt: …, secret: true, gen: pass18 }` asks,
@@ -377,6 +358,17 @@ Cloud alone proven.
   installers, the payload appended to each; needed before the provider's Kubernetes target ships.
 
 ## Could
+
+- **A `network reset` retried without end while the seed does not read**: a reset whose apply
+  fails while the cloud-config's network files do not read has its restore of the settings
+  before it tried again every few seconds, never given up; a restore that stops and says what to
+  restore would close it.
+- **The re-pin and a NIC added for another role**: when the pinned NIC is removed and a NIC for
+  another role added in the same power cycle, before `network attach` records it, the boot may
+  pin that NIC as the role's; a re-pin that waits for the attach (or asks) would close it.
+- **The attached role's reboot hint after a boot**: `network set --role` on an attached role whose
+  NIC is there says `reboot`, even when a boot has run since the attach and did not name it; a
+  record of the boot that applied the attach would tell the two apart.
 
 - **The lifecycle lock read from a paged table**: the host daemon tells a held lifecycle lock (the
   service watch, the upgrade before a first install) from `/proc/locks`, which the kernel serves a

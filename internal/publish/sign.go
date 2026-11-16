@@ -197,8 +197,8 @@ type SyftMaker struct {
 	WorkDir  string // on disk, private to the user
 }
 
-// SBOM is d's SPDX document.
-func (m *SyftMaker) SBOM(ctx context.Context, d name.Digest) ([]byte, error) {
+// SBOM is the SPDX document of d's image for platform.
+func (m *SyftMaker) SBOM(ctx context.Context, d name.Digest, platform string) ([]byte, error) {
 	if err := os.MkdirAll(m.WorkDir, 0o700); err != nil {
 		return nil, err
 	}
@@ -216,7 +216,7 @@ func (m *SyftMaker) SBOM(ctx context.Context, d name.Digest) ([]byte, error) {
 	if err := registry.WriteDockerConfig(dir, m.Registry, c, nil); err != nil {
 		return nil, err
 	}
-	return sbom.Generate(ctx, m.Docker, sbom.Source{Ref: d.String(), Insecure: m.Registry.Scheme() == "http", Config: dir})
+	return sbom.Generate(ctx, m.Docker, sbom.Source{Ref: d.String(), Platform: platform, Insecure: m.Registry.Scheme() == "http", Config: dir})
 }
 
 // run runs cosign's verb, with auth the registry's credentials in a private Docker config (an

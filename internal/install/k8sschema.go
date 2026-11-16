@@ -13,8 +13,10 @@ import (
 	"strings"
 	"time"
 
+	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"go.yaml.in/yaml/v3"
 
+	"github.com/norvexlabs/stowage/internal/installerbin"
 	"github.com/norvexlabs/stowage/internal/providers"
 	"github.com/norvexlabs/stowage/internal/sigverify"
 )
@@ -307,7 +309,11 @@ func (in *Installer) k8sReadsNewer(ctx context.Context, prefix string, d *deploy
 	if err != nil {
 		return false, err
 	}
-	labels, err := cl.Labels(ctx, ref)
+	platform, err := v1.ParsePlatform(installerbin.Target)
+	if err != nil {
+		return false, err
+	}
+	labels, err := cl.Labels(ctx, ref, *platform)
 	if err != nil {
 		return false, err
 	}

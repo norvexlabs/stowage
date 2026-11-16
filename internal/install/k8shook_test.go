@@ -119,6 +119,7 @@ func TestK8sInstallRunsTheHookAsAJobAfterTheRelease(t *testing.T) {
 	if hook["image"] != e.prefix+"/notes-api@"+digest || rec["image"] != ctl || cp["image"] != ctl {
 		t.Errorf("images %v %v %v", hook["image"], rec["image"], cp["image"])
 	}
+	// The Job runs the installer image pinned to the target's (jobImage), on its nodes (below).
 	if got := strings.Join(toStrings(hook["command"]), " "); got != "/stowage/notes-stow __k8s-hook run --dir /stowage --timeout 30m0s -- notes-api create-admin" {
 		t.Errorf("hook command %s", got)
 	}
@@ -146,6 +147,10 @@ func TestK8sInstallRunsTheHookAsAJobAfterTheRelease(t *testing.T) {
 	pod := job["spec"].(map[string]any)["template"].(map[string]any)["spec"].(map[string]any)
 	if pod["automountServiceAccountToken"] != false || pod["serviceAccountName"] != "notes-stowage-provision" || pod["restartPolicy"] != "Never" {
 		t.Errorf("pod %v", pod)
+	}
+	// The installer image's linux/amd64 image, and the release's, run on a linux/amd64 node alone.
+	if sel, _ := json.Marshal(pod["nodeSelector"]); string(sel) != `{"kubernetes.io/arch":"amd64","kubernetes.io/os":"linux"}` {
+		t.Errorf("the pod's node selector: %s", sel)
 	}
 	// The record step may patch the outputs Secret and nothing else.
 	var role map[string]any
@@ -624,7 +629,7 @@ func TestK8sHookPodGivenUp(t *testing.T) {
 	k8sHookPoll, k8sHookStuck, k8sHookUnschedulable = time.Millisecond, 5*time.Millisecond, 20*time.Millisecond
 	t.Cleanup(func() { k8sHookPoll, k8sHookStuck, k8sHookUnschedulable = poll, stuck, unsched })
 	for pod, want := range map[string]string{
-		`{"phase": "Pending", "conditions": [{"type": "PodScheduled", "status": "False", "reason": "Unschedulable", "message": "0/1 nodes are available"}]}`:                                                                 "its pod cannot be scheduled: 0/1 nodes are available",
+		`{"phase": "Pending", "conditions": [{"type": "PodScheduled", "status": "False", "reason": "Unschedulable", "message": "0/1 nodes are available: 1 node(s) didn't match Pod's node affinity/selector."}]}`:           "its pod cannot be scheduled: 0/1 nodes are available: 1 node(s) didn't match Pod's node affinity/selector. (it runs on a node labelled kubernetes.io/arch=amd64 and kubernetes.io/os=linux alone, as the installer's and the release's images are linux/amd64)",
 		`{"phase": "Running", "containerStatuses": [{"name": "provision", "state": {"terminated": {"exitCode": 137, "reason": "OOMKilled"}}}, {"name": "record"}]}`:                                                          "its hook step ended without recording how the hook ended: OOMKilled (exit 137)",
 		`{"phase": "Running", "containerStatuses": [{"name": "provision", "state": {"running": {}}}, {"name": "record", "state": {"terminated": {"exitCode": 1, "reason": "Error", "message": "the hook's status: bad"}}}]}`: "its record step ended while the hook ran: Error (exit 1) the hook's status: bad",
 	} {
@@ -642,6 +647,26 @@ func TestK8sHookPodGivenUp(t *testing.T) {
 		}
 		if strings.Contains(want, " step ") && len(e.f.ran("kubectl logs")) == 0 {
 			t.Errorf("%s: the steps' logs were not copied before the Job went", want)
+		}
+	}
+}
+
+// The node selector is explained only when the scheduler names it, never for another reason.
+func TestUnschedulableWhyNamesTheSelectorOnlyWhenTheSchedulerDoes(t *testing.T) {
+	t.Parallel()
+	for msg, hint := range map[string]bool{
+		"0/3 nodes are available: 3 node(s) didn't match Pod's node affinity/selector. preemption: 0/3 nodes are available": true,
+		"0/2 nodes are available: 2 node(s) didn't match node selector.":                                                    true,
+		"0/1 nodes are available: 1 Insufficient memory. preemption: 0/1 nodes are available":                               false,
+		"0/1 nodes are available: 1 node(s) had untolerated taint {node.kubernetes.io/disk-pressure: }":                     false,
+		"0/3 nodes are available: 3 node(s) didn't match pod anti-affinity rules.":                                          false,
+		"0/3 nodes are available: 3 node(s) didn't match pod affinity rules.":                                               false,
+		"0/3 nodes are available: 3 node(s) didn't match pod topology spread constraints.":                                  false,
+		"0/3 nodes are available: 3 node(s) didn't match scheduler-enforced node affinity.":                                 false,
+	} {
+		got := unschedulableWhy(msg)
+		if !strings.HasPrefix(got, unschedulable+msg) || strings.Contains(got, jobPlacement) != hint {
+			t.Errorf("%q: %q (hint wanted: %v)", msg, got, hint)
 		}
 	}
 }

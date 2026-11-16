@@ -35,7 +35,7 @@ func netAttachCommand(r *Release, dir *string, stdout io.Writer) *cobra.Command 
 	var a NetAttach
 	cmd := &cobra.Command{
 		Use:   "attach",
-		Short: "Name and address a NIC the release names and the VM's cloud-config does not, by its MAC, from the next boot (as root; `vm attach` runs it and attaches the NIC)",
+		Short: "Name and address a NIC the release names and the VM's cloud-config does not, by its MAC, from the next boot (as root; then add the NIC on the VM's platform and restart the VM, or reboot it if the NIC is there already)",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if os.Geteuid() != 0 {

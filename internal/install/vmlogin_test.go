@@ -4,10 +4,8 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
-	"errors"
 	"os"
 	"path/filepath"
-	"slices"
 	"strings"
 	"testing"
 
@@ -217,72 +215,43 @@ func TestTheRegistryLoginVerb(t *testing.T) {
 	}
 }
 
-// vm create gives the login over SSH once the VM answers, never in the cloud-config or a log; a
-// login for another host, without a mirror or on another release's disk, is refused first.
-func TestVMCreateGivesTheMirrorsLoginOverSSH(t *testing.T) {
+// vm create prints the step giving the login over SSH, never the login; a login for another host
+// or without a mirror is refused first.
+func TestVMCreatePrintsTheMirrorsLoginStep(t *testing.T) {
 	t.Parallel()
+	// The step is printed, never the login; nothing is given.
 	v := newVMCreate(t, "qcow2")
 	v.r.Spec.Registry.Prefix = "ghcr.io/acme/notes" // the test registry is the mirror
 	host := registryHost(v.prefix)
-	mirror := func(o *Options) { o.Registry = v.prefix }
-	r := newTofuRun(t)
-	c := tofuCreate()
-	c.RegistryLogin = loginFile(host, "ops", loginPassword)
-	if err := v.create(c, r.mod(mirror)); err != nil {
+	if err := v.create(VMCreate{Platform: "truenas", Hostname: "notes-1", User: "ops", RegistryLogin: loginFile(host, "ops", loginPassword)}, func(o *Options) { o.TLS = "internal"; o.Registry = v.prefix }); err != nil {
 		t.Fatalf("%v\n%s", err, v.log)
 	}
-	i := slices.IndexFunc(r.ssh.calls, func(call []string) bool {
-		return strings.HasSuffix(strings.Join(call, " "), "-- sudo notes-stow registry-login -")
-	})
-	if i < 0 || !strings.Contains(r.ssh.stdin[i], `"`+host+`"`) {
-		t.Fatalf("ssh %v", r.ssh.calls)
-	}
-	if l, err := parseRegistryLogin([]byte(r.ssh.stdin[i])); err != nil || l.Password != loginPassword {
-		t.Errorf("given %+v %v", l, err)
-	}
-	if !slices.Contains(r.ssh.calls[i], "StrictHostKeyChecking=yes") {
-		t.Errorf("not pinned: %v", r.ssh.calls[i])
-	}
-	// No install over SSH follows: the login's call is the last on the seed's key, retired then.
-	if n := len(r.ssh.calls); n != i+2 || !strings.Contains(strings.Join(r.ssh.calls[n-1], " "), "ssh_host_ed25519_key.pub") {
-		t.Errorf("the seed's key is not retired after the login: %v", r.ssh.calls)
-	}
-	dir := filepath.Join(r.state, "notes", "vms", "notes-1")
-	seed, _, _ := readSeed(t, filepath.Join(dir, "seed.iso"))
 	b64 := base64.StdEncoding.EncodeToString([]byte("ops:" + loginPassword))
-	for what, s := range map[string]string{"the cloud-config": seed, "the log": v.log.String(), "the output": v.out2()} {
-		if strings.Contains(s, loginPassword) || strings.Contains(s, b64) {
-			t.Errorf("%s holds the login:\n%s", what, s)
-		}
-	}
-	// By hand, the step is printed; nothing is given.
-	v2 := newVMCreate(t, "qcow2")
-	v2.r.Spec.Registry.Prefix = "ghcr.io/acme/notes"
-	if err := v2.create(VMCreate{Platform: "truenas", Hostname: "notes-1", User: "ops", RegistryLogin: loginFile(host, "ops", loginPassword)}, func(o *Options) { o.TLS = "internal"; mirror(o) }); err != nil {
-		t.Fatalf("%v\n%s", err, v2.log)
-	}
-	if out := v2.out2(); !strings.Contains(out, "ssh ops@<address> sudo notes-stow registry-login - < FILE") || strings.Contains(out, loginPassword) {
+	if out := v.out2(); !strings.Contains(out, "ssh ops@<address> sudo notes-stow registry-login - < FILE") || strings.Contains(out, loginPassword) || strings.Contains(v.log.String(), loginPassword) || strings.Contains(out+v.log.String(), b64) {
 		t.Errorf("out:\n%s", out)
 	}
 	for name, cc := range map[string]struct {
-		mod   func(*Options)
-		login []byte
-		err   string
+		mirror bool
+		login  []byte
+		err    string
 	}{
-		"another host": {mirror, loginFile("other.example", "ops", loginPassword), "the login is for other.example"},
-		"no mirror":    {nil, loginFile("other.example", "ops", loginPassword), "the login is for other.example, but the VM reads the release's own registry"},
-		"bad file":     {mirror, []byte("{}"), "0 entries in auths"},
+		"another host": {true, loginFile("other.example", "ops", loginPassword), "the login is for other.example"},
+		"no mirror":    {false, loginFile("other.example", "ops", loginPassword), "the login is for other.example, but the VM reads the release's own registry"},
+		"bad file":     {true, []byte("{}"), "0 entries in auths"},
 	} {
 		v := newVMCreate(t, "qcow2")
 		v.r.Spec.Registry.Prefix = "ghcr.io/acme/notes"
-		if cc.mod == nil {
+		if !cc.mirror {
 			v.r.Spec.Registry.Prefix = v.prefix
 		}
-		r := newTofuRun(t)
-		c := tofuCreate()
-		c.RegistryLogin = cc.login
-		if err := v.create(c, r.mod(cc.mod)); err == nil || !strings.Contains(err.Error(), cc.err) || len(r.tofu.calls) > 0 {
-			t.Errorf("%s: %v (tofu %d calls)", name, err, len(r.tofu.calls))
+		mod := func(o *Options) {
+			o.TLS = "internal"
+			if cc.mirror {
+				o.Registry = v.prefix
+			}
+		}
+		if err := v.create(VMCreate{Platform: "truenas", Hostname: "notes-1", User: "ops", RegistryLogin: cc.login}, mod); err == nil || !strings.Contains(err.Error(), cc.err) {
+			t.Errorf("%s: %v", name, err)
 		}
 	}
 }
@@ -342,74 +311,10 @@ func TestAnUpgradeReadsTheMirrorWithTheLoginHeld(t *testing.T) {
 	}
 }
 
-// With secrets still due over SSH the seed's key stays for them after the login; a login that
-// cannot be given names what the install still waits for.
-func TestVMCreateKeepsTheSeedKeyForTheSecretsAfterTheLogin(t *testing.T) {
+// A VM booting another release's disks is refused a login when the installer carries no pull
+// account to read that release's OS with first, and takes it when it does.
+func TestVMSeedRefusesALoginBeforeTheReleasesOS(t *testing.T) {
 	t.Parallel()
-	for name, fail := range map[string]bool{"given": false, "refused": true} {
-		v := newVMCreate(t, "qcow2")
-		v.r.Spec.Registry.Prefix = "ghcr.io/acme/notes"
-		v.r.Spec.Inputs = append(v.r.Spec.Inputs, spec.Input{Key: "API_KEY", Prompt: "API key", Secret: true, Required: true})
-		r := newTofuRun(t)
-		last := statusJSON(false)
-		if fail {
-			last = func() ([]byte, error) { return nil, errors.New("connection reset") }
-		}
-		r.ssh.answers = []func() ([]byte, error){refused, statusIn("recovery", false), statusJSON(false), last}
-		c := tofuCreate()
-		c.Secrets = []byte("project: notes\nsecrets:\n  SESSION_SECRET: kept\n")
-		c.RegistryLogin = loginFile(registryHost(v.prefix), "ops", loginPassword)
-		err := v.create(c, r.mod(func(o *Options) { o.Registry = v.prefix }))
-		switch {
-		case fail && (err == nil || !strings.Contains(err.Error(), "then its install waits for its secrets and API_KEY: chmod 600 FILE")):
-			t.Errorf("%s: %v", name, err)
-		case !fail && err != nil:
-			t.Fatalf("%s: %v\n%s", name, err, v.log)
-		}
-		for _, call := range r.ssh.calls {
-			if strings.Contains(strings.Join(call, " "), "ssh_host_ed25519_key.pub") {
-				t.Errorf("%s: the seed's key retired before the secrets: %v", name, call)
-			}
-		}
-	}
-}
-
-// A login that cannot be given names the secret inputs the install still waits for.
-func TestALoginNotGivenNamesTheInputsTheInstallWaitsFor(t *testing.T) {
-	t.Parallel()
-	v := newVMCreate(t, "qcow2")
-	v.r.Spec.Registry.Prefix = "ghcr.io/acme/notes"
-	v.r.Spec.Inputs = append(v.r.Spec.Inputs, spec.Input{Key: "API_KEY", Prompt: "API key", Secret: true, Required: true})
-	r := newTofuRun(t)
-	r.ssh.answers = []func() ([]byte, error){refused, statusIn("recovery", false), statusJSON(false), func() ([]byte, error) { return nil, errors.New("connection reset") }}
-	c := tofuCreate()
-	c.RegistryLogin = loginFile(registryHost(v.prefix), "ops", loginPassword)
-	if err := v.create(c, r.mod(func(o *Options) { o.Registry = v.prefix })); err == nil || !strings.Contains(err.Error(), "then its install waits for API_KEY: ssh -t ops@notes-1.lan sudo notes-stow install") {
-		t.Errorf("%v", err)
-	}
-}
-
-// A login for the release's own registry is given over SSH as a mirror's; a VM booting another
-// release's disks is refused one when the installer carries no pull account to read that
-// release's OS with first, and takes it when it does.
-func TestVMCreateGivesTheReleasesRegistryLogin(t *testing.T) {
-	t.Parallel()
-	v := newVMCreate(t, "qcow2")
-	r := newTofuRun(t)
-	c := tofuCreate()
-	c.RegistryLogin = loginFile(registryHost(v.prefix), "ops", loginPassword)
-	if err := v.create(c, r.mod(func(o *Options) { o.Registry = v.prefix })); err != nil {
-		t.Fatalf("%v\n%s", err, v.log)
-	}
-	i := slices.IndexFunc(r.ssh.calls, func(call []string) bool {
-		return strings.HasSuffix(strings.Join(call, " "), "-- sudo notes-stow registry-login -")
-	})
-	if i < 0 || !strings.Contains(r.ssh.stdin[i], `"`+registryHost(v.prefix)+`"`) {
-		t.Fatalf("ssh %v", r.ssh.calls)
-	}
-	if strings.Contains(v.log.String(), loginPassword) || strings.Contains(v.out2(), loginPassword) {
-		t.Errorf("the login is printed:\n%s%s", v.log, v.out2())
-	}
 	token := spec.Provider{Name: "token", Config: map[string]any{"user": "notes-pull", "token_env": "NOTES_PULL"}}
 	for name, baked := range map[string]bool{"none baked": false, "baked": true} {
 		v := newVMCreatePulling(t, token, "qcow2")

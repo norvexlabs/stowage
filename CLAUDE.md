@@ -159,9 +159,11 @@ a self-review against the code it describes is enough. Every other commit clears
    `internal/cli/cloud.go`) runs it as `STOWAGE_CLOUD_ENV=<file>
    make e2e-kairos`, which registers them on the test clouds the file sets up (the user's file,
    never in the tree). A change
-   to `internal/truenas`, the OpenTofu module (`internal/install/tofu`), `vmtofu.go`, `seed*.go`,
-   the boot (`vm.go`), the host daemon, the backup runner or the OS bundle's files (its recipe's lists, `internal/kairos/kairos.go`, included) runs `STOWAGE_VM_ENV=<file> make
-   e2e-vm` too (a real VM on TrueNAS, an upgrade of it through a TLS mirror, `reset-db`, `rollback`, a failed health gate's fallback, a backup, `vm attach` of a second NIC and the network overrides' revert, handoff kits with a Docker install and a kind cluster beside it, a second VM made by `vm create --kit`, ~105 min; the file is the user's, its path given at run time,
+   to `internal/truenas`, the TrueNAS steps (`vmtruenas*.go`), the seed (`vmseed*.go`), the verbs
+   over SSH (`vmssh*.go`, `vmkit*.go`, `vmhostkey*.go`), `internal/install/tofu` and `vmtofu*.go`
+   (a path not in the tree keeps its rule, as a `GATE_BASE` diff names it), `seed*.go`,
+   the boot (`vm.go`), the host daemon, the backup runner, the OS bundle's files (its recipe's lists, `internal/kairos/kairos.go`, included), e2e-vm's OpenTofu root (`test/vm-truenas/`) or `test/vm.sh` runs `STOWAGE_VM_ENV=<file> make
+   e2e-vm` too (a real VM on TrueNAS, an upgrade of it through a TLS mirror, `reset-db`, `rollback`, a failed health gate's fallback, a backup, a second NIC attached by the suite's OpenTofu root and `network attach` and the network overrides' revert, handoff kits with a Docker install and a kind cluster beside it, a kit taken by `vm kit take` on a second VM the root made, ~105 min; the file is the user's, its path given at run time,
    never written in the tree); it runs beside the parallel suites (`e2e-kairos` among them: disk
    builds wait for one another on auroraboot's one container name) in one chain with `e2e-full-vm`, one TrueNAS VM
    at a time. A change to `examples/full`'s kairos
@@ -172,11 +174,12 @@ a self-review against the code it describes is enough. Every other commit clears
    mirror, the hook, the app socket, the published CA; upgrade, rollback and the VM machinery
    itself are e2e-vm's), in that chain, as does a change to the disks' build
    (`internal/kairos/disks.go`, the installer ISO), the machine's creation and its seed
-   (`vmcreate*.go`, `seed*.go`). Each must
+   (`vmcreate*.go`, `seed*.go`, `vmseed*.go`), and the TrueNAS steps the machine's root runs
+   (`internal/truenas`, `vmtruenas*.go`). Each must
    print PASS. `make gate`
    runs exactly these, and also: the VM's creation, verbs and health gate (`vmcreate*.go`,
-   `vmcli*.go`, `vmhealth*.go`) run e2e-vm; a test script runs its own suite (`test/libvirtd/`, the libvirt daemon e2e-kairos
-   applies the libvirt module against, runs e2e-kairos; `test/lib.sh`,
+   `vmcli*.go`, `vmhealth*.go`) run e2e-vm; `test/libvirtd/` runs e2e-kairos (a path not in the tree keeps its rule, as a `GATE_BASE`
+   diff names it); a test script runs its own suite (`test/lib.sh`,
    `pins.sh`, `sweep.sh`: e2e, e2e-docker, e2e-full, e2e-stateless, e2e-k8s, e2e-full-k8s); `go.mod`/`go.sum`
    run every suite but e2e-full-vm; `internal/flock` (every lock Stowage takes: the installs', the host
    daemon's, the scanner cache's) runs smoke-install, e2e, the lifecycle suites, e2e-kairos and

@@ -476,6 +476,164 @@ func TestAStaticAddressConfirmedStays(t *testing.T) {
 	}
 }
 
+// The primary's override matches the NIC the cloud-config's network file names: that file not
+// reading refuses the change before anything changes, never matching every NIC.
+func TestAnUnreadSeedNetworkRefusesThePrimarysChange(t *testing.T) {
+	t.Parallel()
+	link := newLink(t)
+	if err := os.Mkdir(filepath.Join(link.dir, staticUnit("notes")), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	h := netDaemon(t, link)
+	var e errOf
+	set := NetRequest{NetConfig: NetConfig{Mode: "static", Address: "10.0.0.60/24", Gateway: "10.0.0.1"}, RevertSecs: intp(maxRevertSecs)}
+	if code := call(t, h.Handler(), http.MethodPost, "/v1/network", set, &e); code != http.StatusConflict || !e.Refused || !strings.HasPrefix(e.Error, "the network override's NIC: the VM's cloud-config's network: ") ||
+		!strings.HasPrefix(e.Fix, "restore the file that does not read (the VM's cloud-config's network: ") || !strings.Contains(e.Fix, staticUnit("notes")) ||
+		!strings.HasSuffix(e.Fix, "), or the VM's cloud-config that writes it, then set the network") {
+		t.Errorf("%d %+v", code, e)
+	}
+	if fileExists(NetworkFile(h.O.Dir)) || slices.ContainsFunc(link.calls(), func(c []string) bool { return c[0] == "networkctl" }) {
+		t.Errorf("the refused change was recorded or applied: %v", link.calls())
+	}
+	f := h.netFiles()
+	if err := f.render(&NetConfig{Mode: "dhcp"}); err == nil || fileExists(f.overrideUnit()) {
+		t.Errorf("rendered with no match: %v", err)
+	}
+}
+
+// At boot, the cloud-config's network file not reading leaves the override an earlier boot
+// rendered as it is, neither dropped nor matching every NIC: the boot's log and the console's
+// banner say so.
+func TestAnUnreadSeedNetworkLeavesTheBootsOverride(t *testing.T) {
+	t.Parallel()
+	link := newLink(t)
+	h := netDaemon(t, link)
+	f := h.netFiles()
+	c := &NetConfig{Mode: "static", Address: "10.0.0.60/24", Gateway: "10.0.0.1"}
+	if err := f.write(netState{Config: c}); err != nil {
+		t.Fatal(err)
+	}
+	var log strings.Builder
+	if err := f.boot(&log); err != nil {
+		t.Fatal(err)
+	}
+	rendered, err := os.ReadFile(f.overrideUnit())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(link.dir, staticUnit("notes")), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	f = h.netFiles()
+	if err := f.boot(&log); err != nil {
+		t.Fatal(err)
+	}
+	if now, err := os.ReadFile(f.overrideUnit()); err != nil || string(now) != string(rendered) {
+		t.Errorf("the override: %v\n%s", err, now)
+	}
+	if !strings.Contains(log.String(), "the network override: the VM's cloud-config's network: ") || !strings.HasSuffix(log.String(), ": its file is left as an earlier boot rendered it\n") {
+		t.Errorf("log %q", log.String())
+	}
+	if b, err := os.ReadFile(f.banner()); err != nil || !strings.Contains(string(b), "network: 10.0.0.60/24 via 10.0.0.1, no IPv6; set with `notes-stow network set`; which NIC it matches does not read (the VM's cloud-config's network: ") {
+		t.Errorf("the banner: %v\n%s", err, b)
+	}
+	// The daemon's start leaves it so too: no record renders it, and it is not removed.
+	h.NetResume()
+	if now, err := os.ReadFile(f.overrideUnit()); err != nil || string(now) != string(rendered) {
+		t.Errorf("the override after the daemon's start: %v\n%s", err, now)
+	}
+}
+
+// A change awaiting confirmation is undone when the cloud-config's network file does not read,
+// at boot, at the daemon's start and on `network revert` alike: the settings before it cannot be rendered (which NIC is
+// not known), so its file goes, and the cloud-config's settings apply — never the change kept.
+// The record holds the settings before it; the log, the banner and `network` say what applies.
+func TestAnUnconfirmedChangeGoesWhenTheSeedNetworkDoesNotRead(t *testing.T) {
+	t.Parallel()
+	before := &NetConfig{Mode: "static", Address: "10.0.0.60/24", Gateway: "10.0.0.1"}
+	breakSeed := func(t *testing.T, link *fakeLink) {
+		t.Helper()
+		if err := os.Mkdir(filepath.Join(link.dir, staticUnit("notes")), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	undone := func(t *testing.T, h *Hostd) {
+		t.Helper()
+		f := h.netFiles()
+		if st := readState(t, h); st.Pending != nil || st.Config == nil || st.Config.Address != before.Address || st.Config.Mode != before.Mode {
+			t.Errorf("recorded %+v", st)
+		}
+		if fileExists(f.overrideUnit()) {
+			t.Error("the change's file is left")
+		}
+		if b, err := os.ReadFile(f.banner()); err != nil || !strings.Contains(string(b), "network: 10.0.0.60/24 via 10.0.0.1, no IPv6 recorded, not in force; set with `notes-stow network set`; which NIC it matches does not read (the VM's cloud-config's network: ") ||
+			!strings.Contains(string(b), "): its file is removed, the cloud-config's settings apply\n") || strings.Contains(string(b), "not confirmed") {
+			t.Errorf("the banner: %v\n%s", err, b)
+		}
+		var n Network
+		if code := call(t, h.Handler(), http.MethodGet, "/v1/network", nil, &n); code != http.StatusOK || n.Source == "override" || n.Override == nil {
+			t.Errorf("network: %d %+v", code, n)
+		}
+	}
+	t.Run("at boot", func(t *testing.T) {
+		t.Parallel()
+		link := newLink(t)
+		h := netDaemon(t, link)
+		f := h.netFiles()
+		change := &NetConfig{Mode: "dhcp"}
+		if err := f.write(netState{Config: change, Pending: &netPending{ID: "w", Deadline: time.Now().Add(time.Hour), Previous: before}}); err != nil {
+			t.Fatal(err)
+		}
+		if err := f.render(change); err != nil {
+			t.Fatal(err)
+		}
+		breakSeed(t, link)
+		var log strings.Builder
+		if err := h.netFiles().boot(&log); err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(log.String(), "the network override: the VM's cloud-config's network: ") || !strings.HasSuffix(log.String(), ": the change never confirmed is undone, its file removed: the cloud-config's settings apply\n") {
+			t.Errorf("log %q", log.String())
+		}
+		undone(t, h)
+		// A later boot leaves it so; the daemon's start does not render it again.
+		if err := h.netFiles().boot(io.Discard); err != nil {
+			t.Fatal(err)
+		}
+		h.NetResume()
+		undone(t, h)
+	})
+	// The daemon's start, and `network revert`, undo it as its window's end does.
+	for _, how := range []string{"at the daemon's start", "asked"} {
+		t.Run(how, func(t *testing.T) {
+			t.Parallel()
+			link := newLink(t)
+			h := netDaemon(t, link)
+			manualTimers(h)
+			api := h.Handler()
+			var a NetAnswer
+			if code := call(t, api, http.MethodPost, "/v1/network", NetRequest{NetConfig: *before, RevertSecs: intp(0)}, fresh(&a)); code != http.StatusOK {
+				t.Fatalf("%d %+v", code, a)
+			}
+			if code := call(t, api, http.MethodPost, "/v1/network", NetRequest{NetConfig: NetConfig{Mode: "dhcp"}, RevertSecs: intp(maxRevertSecs)}, fresh(&a)); code != http.StatusOK || a.Pending == nil {
+				t.Fatalf("%d %+v", code, a)
+			}
+			breakSeed(t, link)
+			if how == "asked" {
+				if code := call(t, api, http.MethodPost, "/v1/network/revert", nil, fresh(&a)); code != http.StatusOK || a.Message != "reverted" {
+					t.Fatalf("%d %+v", code, a)
+				}
+			} else {
+				h.NetResume()
+			}
+			undone(t, h)
+			if !slices.ContainsFunc(link.calls(), func(c []string) bool { return slices.Equal(c, []string{"networkctl", "reload"}) }) {
+				t.Errorf("networkd not reloaded: %v", link.calls())
+			}
+		})
+	}
+}
+
 func TestAChangeNotConfirmedComesUndone(t *testing.T) {
 	t.Parallel()
 	link := newLink(t)

@@ -185,8 +185,10 @@ type netFiles struct {
 	// state and networkd are role's state file and networkd directory.
 	state, networkd string
 	// match is the [Match] section's setting the override's file takes (the role's, or
-	// primaryMatch: seedMatch, read once).
+	// primaryMatch: seedMatch, read once); matchErr is seedMatch's error, which refuses rendering
+	// the primary's file.
 	match, primaryMatch string
+	matchErr            error
 	// install is the file the cloud-config records the install's network in.
 	install string
 }
@@ -303,13 +305,13 @@ func newNetFiles(name, ctl, dir, networkd, run, issue string, roles []string) ne
 		name:    name,
 		ctl:     ctl,
 		dir:     dir,
-		etc:     cmp.Or(networkd, "/etc/systemd/network"),
+		etc:     cmp.Or(networkd, networkdDir),
 		run:     cmp.Or(run, "/run/systemd/network"),
 		issue:   cmp.Or(issue, "/etc/issue.d"),
 		roles:   roles,
 		install: InstallNetworkFile(name),
 	}
-	f.primaryMatch = seedMatch(f.etc, name)
+	f.primaryMatch, f.matchErr = seedMatch(f.etc, name)
 	return f.forRole("")
 }
 
@@ -463,6 +465,9 @@ func (f netFiles) render(c *NetConfig) error {
 			return err
 		}
 	} else {
+		if f.role == "" && f.matchErr != nil {
+			return f.matchErr
+		}
 		if err := os.MkdirAll(f.networkd, 0o755); err != nil {
 			return err
 		}
@@ -492,6 +497,10 @@ func (f netFiles) writeBanner() error {
 		case g.role != "" && st.Config != nil:
 			fmt.Fprintf(&b, "%s: %s; set with `%s network set --role %s`\n", g.role, describeRole(st.Config), ctl, g.role)
 		case g.role != "":
+		case st.Config != nil && g.matchErr != nil && !fileExists(g.overrideUnit()):
+			fmt.Fprintf(&b, "network: %s recorded, not in force; set with `%s network set`; which NIC it matches does not read (%v): its file is removed, the cloud-config's settings apply\n", describeNet(st.Config), ctl, g.matchErr)
+		case st.Config != nil && g.matchErr != nil:
+			fmt.Fprintf(&b, "network: %s; set with `%s network set`; which NIC it matches does not read (%v): its file is left as an earlier boot rendered it\n", describeNet(st.Config), ctl, g.matchErr)
 		case st.Config != nil:
 			fmt.Fprintf(&b, "network: %s; set with `%s network set`\n", describeNet(st.Config), ctl)
 		default:
@@ -522,15 +531,24 @@ const everyNIC = "Name=en* eth*"
 // cloud-config wrote for its network (staticUnit), which names the NIC as the seed named it — the
 // primary's role, or every NIC's for a VM whose release named none when it was made — whatever the
 // release running now declares. Without that file, the role the seed named its only NIC (one
-// .link), else every NIC: of several, which one the seed made primary is not known.
-func seedMatch(networkd, name string) string {
+// .link), else every NIC: of several, which one the seed made primary is not known. A file that
+// does not read (but for its absence) is an error, never every NIC.
+func seedMatch(networkd, name string) (string, error) {
 	raw, err := os.ReadFile(filepath.Join(networkd, staticUnit(name)))
-	if err != nil {
-		links, _ := filepath.Glob(filepath.Join(networkd, kairos.InterfaceLink(name, "*")))
-		if len(links) == 1 {
-			return "Name=" + linkRole(name, links[0])
+	if errors.Is(err, os.ErrNotExist) {
+		links, err := seedLinks(networkd, name)
+		if err != nil {
+			return "", fmt.Errorf("the VM's cloud-config's NIC names: %w", err)
 		}
-		return everyNIC
+		if len(links) == 1 {
+			for role := range links {
+				return "Name=" + role, nil
+			}
+		}
+		return everyNIC, nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("the VM's cloud-config's network: %w", err)
 	}
 	inMatch := false
 	for _, line := range strings.Split(string(raw), "\n") {
@@ -538,24 +556,18 @@ func seedMatch(networkd, name string) string {
 		case strings.HasPrefix(line, "["):
 			inMatch = line == "[Match]"
 		case inMatch && strings.HasPrefix(line, "Name="):
-			return line
+			return line, nil
 		}
 	}
-	return everyNIC
+	return everyNIC, nil
 }
 
 // networkdDir holds the VM's networkd files, the seed's .link ones among them; tests move it.
 var networkdDir = "/etc/systemd/network"
 
-// roleNamed reports whether the VM names a NIC role: its cloud-config's .link file, or the one of a
-// NIC `network attach` added once a NIC is named so (a NIC recorded, never attached, names none).
-func roleNamed(name, role string) bool {
-	if seedNamed(name, role) {
-		return true
-	}
-	if _, err := os.Stat(filepath.Join(networkdDir, attachedLink(name, role))); err != nil {
-		return false
-	}
+// roleNamed reports whether a NIC of the VM is named role now, as the seed's .link files or
+// `network attach`'s name them.
+func roleNamed(role string) bool {
 	_, err := os.Stat(filepath.Join(sysNetDir, role))
 	return err == nil
 }
@@ -857,12 +869,26 @@ func (f netFiles) boot(log io.Writer) error {
 		// Unreadable, it sets nothing: the cloud-config's settings bring the VM up.
 		return errors.Join(fmt.Errorf("%s: %w (the cloud-config's settings apply)", f.what(), err), f.render(nil))
 	}
-	if st.Pending != nil {
+	reverted := st.Pending != nil
+	if reverted {
 		fmt.Fprintf(log, "the network change awaiting confirmation was not confirmed before the reboot: the settings before it come back\n")
 		st = netState{Config: st.Pending.Previous}
 		if err := f.write(st); err != nil {
 			return errors.Join(err, f.render(nil))
 		}
+	}
+	if f.role == "" && f.matchErr != nil && st.Config != nil && reverted {
+		// The settings before the change cannot be rendered (which NIC is not known), and the
+		// file left is the change's, never confirmed: it goes, and the cloud-config's settings
+		// apply; the banner says so.
+		fmt.Fprintf(log, "%s: %v: the change never confirmed is undone, its file removed: the cloud-config's settings apply\n", f.what(), f.matchErr)
+		return f.render(nil)
+	}
+	if f.role == "" && f.matchErr != nil && st.Config != nil {
+		// Which NIC the override matches is not known: the file the last boot rendered is left as
+		// it is, neither dropped nor matching every NIC, and the banner says so.
+		fmt.Fprintf(log, "%s: %v: its file is left as an earlier boot rendered it\n", f.what(), f.matchErr)
+		return f.writeBanner()
 	}
 	return f.render(st.Config)
 }
@@ -1179,6 +1205,12 @@ func (h *Hostd) revertWindow(f netFiles, id, iface string) func(context.Context)
 				return err
 			}
 		}
+		if f.role == "" && f.matchErr != nil && st.Config != nil {
+			// Which NIC the settings before the change match is not known: the change's file
+			// goes, and the cloud-config's settings apply, as at boot; the banner says so.
+			h.O.logf("%s: %v: the change is undone, its file removed: the cloud-config's settings apply", f.what(), f.matchErr)
+			return h.netApply(ctx, f, nil, cmp.Or(iface, h.netIface(ctx, f)))
+		}
 		return h.netApply(ctx, f, st.Config, cmp.Or(iface, h.netIface(ctx, f)))
 	}
 }
@@ -1227,6 +1259,9 @@ func (h *Hostd) netResume() {
 		// A daemon stopped between recording a change and applying it left networkd on another: the
 		// record is applied again, and tried again while it fails (networkd not ready yet), on this
 		// NIC's own revert timer.
+		if f.role == "" && f.matchErr != nil {
+			continue // its file is left as the boot left it (boot), which no record renders
+		}
 		want := ""
 		if st.Config != nil {
 			want = f.unit(*st.Config)
@@ -1259,7 +1294,9 @@ func (h *Hostd) network(w http.ResponseWriter, r *http.Request) {
 	}
 	n := Network{Live: live, Override: st.Config, Install: install, Source: "dhcp", Hosts: (&Installer{R: h.R, O: h.O}).vmHosts()}
 	switch {
-	case st.Config != nil:
+	// An override whose file is removed, as which NIC it matches does not read (boot), sets
+	// nothing: the cloud-config's settings do.
+	case st.Config != nil && (f.matchErr == nil || fileExists(f.overrideUnit())):
 		n.Source = "override"
 	// The unit sets the network, the record only describes it: without the unit networkd runs
 	// the OS's DHCP default, whatever the record says.
@@ -1439,6 +1476,13 @@ func (h *Hostd) setNetwork(w http.ResponseWriter, r *http.Request) {
 		replyErr(w, err)
 		return
 	}
+	if f.role == "" && f.matchErr != nil {
+		// Which NIC the override matches is not known: refused before anything changes, naming
+		// the file that does not read.
+		replyErr(w, refuseAs(http.StatusConflict, fmt.Sprintf("restore the file that does not read (%v), or the VM's cloud-config that writes it, then set the network", f.matchErr),
+			"the network override's NIC: %v", f.matchErr))
+		return
+	}
 	next, err := f.valid(req.NetConfig)
 	if err != nil {
 		replyErr(w, fail(http.StatusBadRequest, "%v", err))
@@ -1464,7 +1508,7 @@ func (h *Hostd) setNetwork(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if !slices.ContainsFunc(links, func(l ipLink) bool { return l.Name == f.role }) {
-			replyErr(w, fail(http.StatusConflict, "role %s: no NIC is named so on this VM: `vm attach` attaches one (`network attach` names it from the next boot)", f.role))
+			replyErr(w, h.unnamedRole(f))
 			return
 		}
 	}
@@ -1482,6 +1526,164 @@ func (h *Hostd) setNetwork(w http.ResponseWriter, r *http.Request) {
 		msg = "applied, without a revert window"
 	}
 	reply(w, http.StatusOK, h.answer(f, st, msg))
+}
+
+// unnamedRole is the refusal of an override of f's role, a secondary NIC no NIC of the VM is
+// named as, its fix what names one (unnamedRoleHint): from f's networkd directory, the NICs read
+// as the install's warning reads them (nicsThere). Every answer is a refusal, with its fix: a hint
+// refused (a record that does not decode) is answered as the role's, that refusal's fix kept.
+func (h *Hostd) unnamedRole(f netFiles) error {
+	hint, err := unnamedRoleHint(f.etc, h.R.Spec.Name, h.R.Ctl(), h.O.Dir, f.role, nicsThere(cmp.Or(h.SysNet, sysNetDir), cmp.Or(h.UdevData, udevDataDir)))
+	if r, refused := Refusal(err); refused {
+		// A record the hint reads that does not decode: its refusal, with its fix, nothing changed.
+		return refuseAs(http.StatusConflict, r.Fix, "role %s: no NIC is named so on this VM: %s", f.role, r.Reason)
+	}
+	if err != nil {
+		// A file the hint reads (a .link file, the attached NICs' record, the kernel's or udev's
+		// NIC records) that does not read: the refusal, as the install's warning words it.
+		return refuseAs(http.StatusConflict, fmt.Sprintf("restore what does not read (%v), then set its network", err),
+			"role %s: no NIC is named so on this VM: what names one is not known (%v)", f.role, err)
+	}
+	return refuseAs(http.StatusConflict, hint.Fix+", then set its network", "role %s: no NIC is named so on this VM: %s", f.role, hint.Why)
+}
+
+// roleHint is why no NIC of the VM is named a role, and the fix that names one.
+type roleHint struct{ Why, Fix string }
+
+func (h roleHint) String() string { return h.Why + ": " + h.Fix }
+
+// unnamedRoleHint says why no NIC of the VM is named role, a secondary NIC of project name, and
+// what names one, from networkd's directory and the install in dir, there telling whether a NIC
+// of a MAC is on the VM: the seed names the role by a MAC no NIC is named by (none of the VM's
+// NICs has it, several have, or the one that has it is kept from the name by the device holding
+// it: nameFreeHint); the boot's pin
+// names it by the MAC and driver it pinned (its .link file's Driver=), its NIC gone or of
+// another driver (one NIC no other role names, left alone, is pinned in its place at the next
+// boot); the seed names it by its original name, never pinned (its NIC is not the VM's only one
+// but those `network attach` recorded at a boot); the seed's .link file names no NIC (restore
+// it); `network attach` recorded it, its NIC there and matched by its link (a reboot names it),
+// there and not matched (its driver recorded is not the NIC's: `network attach` again, with the
+// NIC there, records it) or not yet (added on the platform); else nothing names it, and `network
+// attach` does. The host daemon's refusal and the install's warning both tell it.
+func unnamedRoleHint(networkd, name, ctl, dir, role string, there vmNICs) (roleHint, error) {
+	links, err := seedLinks(networkd, name)
+	if err != nil {
+		return roleHint{}, err
+	}
+	// `network attach` refuses a role the seed names: the NIC its .link file matches names it.
+	if link, seeded := links[role]; seeded {
+		return seedRoleHint(link, filepath.Join(networkd, kairos.InterfaceLink(name, role)), role, ctl, dir, there)
+	}
+	nics, err := readAttached(dir)
+	if err != nil {
+		return roleHint{}, err
+	}
+	i := slices.IndexFunc(nics, func(n attachedNIC) bool { return n.Role == role })
+	if i < 0 {
+		return roleHint{"none is recorded for it", fmt.Sprintf("`sudo %s network attach --role %s --mac <its MAC>` records one, named from the next boot: add that NIC on the VM's platform and restart the VM", ctl, role)}, nil
+	}
+	n := nics[i]
+	drivers, err := there.drivers(n.MAC)
+	if err != nil {
+		return roleHint{}, err
+	}
+	if len(drivers) == 0 {
+		return roleHint{fmt.Sprintf("its NIC (%s) is recorded, and not on this VM yet", n.MAC), "add it on the VM's platform with that MAC and restart the VM"}, nil
+	}
+	// The NIC there is named from the next boot only when its link, as written, matches it.
+	value := driverValue(n.Driver)
+	if slices.ContainsFunc(drivers, func(d string) bool { return driverMatches(value, d) }) {
+		return roleHint{fmt.Sprintf("its NIC (%s) is recorded and there, and is named so from the next boot", n.MAC), fmt.Sprintf("`sudo %s reboot`", ctl)}, nil
+	}
+	cmd := fmt.Sprintf("sudo %s network attach --role %s --mac %s --mode %s", ctl, role, n.MAC, cmp.Or(n.Mode, IfaceNone))
+	if n.Address != "" {
+		cmd += " --address " + n.Address
+	}
+	return roleHint{fmt.Sprintf("its NIC (%s) is recorded and there, but its link matches Driver=%s (the driver recorded: %s), not the NIC's (%s)", n.MAC, value, cmp.Or(n.Driver, "none"), nicDrivers(drivers)),
+		fmt.Sprintf("`%s`, run with the NIC there, records its driver, then `sudo %s reboot` names it", cmd, ctl)}, nil
+}
+
+// nicDrivers lists the drivers of NICs as nicsThere answers them, one udev records none of said.
+func nicDrivers(drivers []string) string {
+	each := make([]string, len(drivers))
+	for k, d := range drivers {
+		each[k] = cmp.Or(d, "none udev records")
+	}
+	return strings.Join(each, ", ")
+}
+
+// seedRoleHint is unnamedRoleHint of a role the seed's .link file (at path) names as link says.
+func seedRoleHint(link seedLink, path, role, ctl, dir string, there vmNICs) (roleHint, error) {
+	if link.MAC != "" && !link.pinned() {
+		why := fmt.Sprintf("the VM's cloud-config names it by its MAC (%s)", link.MAC)
+		drivers, err := there.drivers(link.MAC)
+		if err != nil {
+			return roleHint{}, err
+		}
+		switch len(drivers) {
+		case 0:
+			return roleHint{why, "add the NIC of that MAC on the VM's platform (or fix the MAC of the one there) and restart the VM"}, nil
+		case 1:
+			return nameFreeHint(why+", and its NIC is here", role, ctl, there)
+		}
+		return roleHint{fmt.Sprintf("%s, and %d NICs of this VM have that MAC, so the boot names none of them", why, len(drivers)),
+			"remove the other NICs with that MAC on the VM's platform (or give each a MAC of its own) and restart the VM"}, nil
+	}
+	if link.MAC == "" && !link.Original {
+		return roleHint{fmt.Sprintf("its .link file %s names no NIC (neither a MACAddress= nor an OriginalName=)", path),
+			fmt.Sprintf("restore %s as the VM's cloud-config writes it: `sudo %s reboot` writes it again", path, ctl)}, nil
+	}
+	// The boot's pin and the seed's original name name the only NIC no `network attach` record
+	// names: the others recorded are kept, every other one removed.
+	nics, err := readAttached(dir)
+	if err != nil {
+		return roleHint{}, err
+	}
+	others := "the others on its platform"
+	if len(nics) > 0 {
+		each := make([]string, len(nics))
+		for k, n := range nics {
+			each[k] = n.Role + "'s " + n.MAC
+		}
+		others += " but the NICs `network attach` recorded, which keep their roles: " + strings.Join(each, ", ")
+	}
+	if link.Original {
+		return roleHint{"the VM's cloud-config names it by its original name, as the VM's only NIC",
+			"leave its NIC alone on the VM (remove " + others + ") and restart the VM, which names it (and, for a VM seeded by Stowage 0.40.0 or later, pins it to that NIC's MAC, so NICs added after it keep their names)"}, nil
+	}
+	why := fmt.Sprintf("the VM's boot pinned it to its NIC's MAC (%s, Driver=%s)", link.MAC, link.Driver)
+	drivers, err := there.drivers(link.MAC)
+	if err != nil {
+		return roleHint{}, err
+	}
+	switch {
+	case len(drivers) == 0:
+		why += ", and no NIC of that MAC is on this VM"
+	case !slices.ContainsFunc(drivers, func(d string) bool { return driverMatches(link.Driver, d) }):
+		why += fmt.Sprintf(", and the NIC of that MAC here has the driver %s, which the pin does not match", nicDrivers(drivers))
+	default:
+		return nameFreeHint(why+", and its NIC is here", role, ctl, there)
+	}
+	return roleHint{why, "leave one NIC on the VM that no other role names (remove " + others + ") and restart the VM, which pins the role to that NIC"}, nil
+}
+
+// nameFreeHint is the hint of a role whose NIC is here and matched by its .link file (why): a
+// reboot names it, unless another device holds the role's name, which the hint names with what
+// frees it.
+func nameFreeHint(why, role, ctl string, there vmNICs) (roleHint, error) {
+	mac, held, err := there.holder(role)
+	if err != nil {
+		return roleHint{}, err
+	}
+	if held {
+		of := "no MAC"
+		if mac != "" {
+			of = "MAC " + mac
+		}
+		return roleHint{fmt.Sprintf("%s, but another device holds the name %s (%s)", why, role, of),
+			fmt.Sprintf("remove or rename that device (or remove the record that names it so: its .link or .netdev file), then `sudo %s reboot` names it", ctl)}, nil
+	}
+	return roleHint{why, fmt.Sprintf("`sudo %s reboot` names it", ctl)}, nil
 }
 
 // roleFiles are the files of the override a request names: a role is one of the release's

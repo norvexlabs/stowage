@@ -1,16 +1,15 @@
 terraform {
   required_version = ">= 1.8"
   required_providers {
-    # A community provider over TrueNAS's JSON-RPC API (iXsystems ships none), pinned exactly: an
-    # upgrade is a reviewed change of `<short>-stow`, never a drift.
+    # TrueNAS's own provider, pinned exactly with its checksums in .terraform.lock.hcl.
     truenas = {
-      source  = "pjsalty/truenas"
-      version = "3.1.0"
+      source  = "truenas/truenas"
+      version = "1.9.1"
     }
   }
 }
 
-# The API's address and key come from TRUENAS_URL and TRUENAS_API_KEY: never from a file here.
+# The API's endpoint and key come from TRUENAS_ENDPOINT and TRUENAS_API_KEY: never from a file here.
 provider "truenas" {
-  insecure_skip_verify = var.insecure_skip_verify
+  insecure = var.insecure
 }

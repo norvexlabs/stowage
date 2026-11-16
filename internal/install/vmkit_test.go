@@ -53,17 +53,11 @@ func (s *kitSSH) Run(_ context.Context, c Cmd) ([]byte, error) {
 	return []byte(s.stdout), s.err
 }
 
-// vmKitRun is an operator's installer whose state knows the VM notes-1's host key, its stdout out.
+// vmKitRun is an operator's installer reaching the VM notes-1 over ssh, its stdout out, and its
+// XDG state directory.
 func vmKitRun(t *testing.T, ssh *kitSSH, env map[string]string) (*Installer, *bytes.Buffer, string) {
 	t.Helper()
 	state := t.TempDir()
-	dir := filepath.Join(state, "notes", "vms", "notes-1")
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, "known_hosts"), []byte("notes-1,notes-1.lan ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEAIlrmYko7n75rw1in9PSsqvQQwoVBxv2WjCA2q6yuS\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
 	var out bytes.Buffer
 	in := &Installer{R: kitRelease(), O: Options{Out: &out, Log: io.Discard, SSH: ssh, Getenv: func(k string) string {
 		switch k {
@@ -74,12 +68,24 @@ func vmKitRun(t *testing.T, ssh *kitSSH, env map[string]string) (*Installer, *by
 		}
 		return env[k]
 	}}}
-	return in, &out, dir
+	return in, &out, state
 }
+
+// testKnownLine is the VM's host key the kit tests give with --known-hosts-line.
+const testKnownLine = "notes-1 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEAIlrmYko7n75rw1in9PSsqvQQwoVBxv2WjCA2q6yuS"
 
 // runVMKit runs vm kit as the CLI does: the command built from the Options in holds, before a run
 // copies them into a fresh installer (prepare), so nothing it builds reads the installer's own.
 func runVMKit(t *testing.T, in *Installer, stdin io.Reader, args ...string) error {
+	t.Helper()
+	if !slices.Contains(args, "--known-hosts-line") {
+		args = append(args, "--known-hosts-line", testKnownLine)
+	}
+	return runVMKitBare(t, in, stdin, args...)
+}
+
+// runVMKitBare is runVMKit without the host key it adds.
+func runVMKitBare(t *testing.T, in *Installer, stdin io.Reader, args ...string) error {
 	t.Helper()
 	o := in.O
 	fresh := &Installer{R: in.R}
@@ -114,7 +120,7 @@ func TestVMKitCreate(t *testing.T) {
 	}
 	c := ssh.calls[0]
 	if len(ssh.calls) != 1 || !slices.Equal(c[len(c)-6:], []string{"sudo", "notes-stow", "kit", "create", "client", "--json"}) ||
-		!slices.Contains(c, "ops@Notes-1.LAN") || !slices.Contains(c, "StrictHostKeyChecking=yes") || !slices.Contains(c, "HostKeyAlias=notes-1.lan") ||
+		!slices.Contains(c, "ops@Notes-1.LAN") || !slices.Contains(c, "StrictHostKeyChecking=yes") || !slices.Contains(c, "HostKeyAlias=notes-1") ||
 		!slices.Contains(c, "GlobalKnownHostsFile=/dev/null") ||
 		slices.ContainsFunc(c, func(a string) bool { return strings.Contains(a, "hush-hush") }) {
 		t.Fatalf("ssh ran %q", c)
@@ -152,42 +158,45 @@ func TestVMKitCreate(t *testing.T) {
 	}
 }
 
-// A VM whose state holds no host key is refused before any connection.
+// Without --known-hosts-line every kit verb is refused before any connection, naming where the
+// line comes from.
 func TestVMKitNeedsTheHostKey(t *testing.T) {
 	t.Parallel()
 	ssh := &kitSSH{}
-	in, _, dir := vmKitRun(t, ssh, nil)
-	if err := os.Remove(filepath.Join(dir, "known_hosts")); err != nil {
-		t.Fatal(err)
-	}
-	err := runVMKit(t, in, nil, "create", "notes-1", "client", "--name", "site-1", "--set", "SITE=x", "-o", filepath.Join(t.TempDir(), "k"))
-	if err == nil || !strings.Contains(err.Error(), "the VM's host key is not known") || len(ssh.calls) != 0 {
-		t.Errorf("%v, %d calls", err, len(ssh.calls))
+	in, _, _ := vmKitRun(t, ssh, nil)
+	for _, args := range [][]string{
+		{"create", "notes-1", "client", "--name", "site-1", "--set", "SITE=x", "-o", filepath.Join(t.TempDir(), "k")},
+		{"check", "notes-1", "client", "site-1"},
+		{"take", "notes-1", "-", "--no-input"},
+	} {
+		err := runVMKitBare(t, in, strings.NewReader("x"), args...)
+		if args[0] == "check" { // its status is the answer: unknown, the refusal said on stderr
+			if err == nil || len(ssh.calls) != 0 || ssh.prechecks != 0 {
+				t.Errorf("check: %v, %d calls", err, len(ssh.calls))
+			}
+			continue
+		}
+		if !isRefused(err) || !strings.Contains(err.Error(), "the VM's host key is not known") || !strings.Contains(refusedFix(err), "vm seed --json`'s known_hosts_line") || len(ssh.calls) != 0 || ssh.prechecks != 0 {
+			t.Errorf("%s: %v, %d calls", args[0], err, len(ssh.calls))
+		}
 	}
 	if err := runVMKit(t, in, nil, "create", "notes-1", "client", "--name", "site-1", "--set", "SITE=x", "--host", "-oProxyCommand=x"); err == nil || len(ssh.calls) != 0 {
 		t.Errorf("an option as the host: %v", err)
 	}
 	// Refused before anything is asked: a VM it cannot reach costs no answer.
 	asked := &askCounter{}
-	c := in.vmKitCommand(&in.O, func() error { return nil }, func(bool) Prompter { return asked })
-	c.SetArgs([]string{"create", "notes-1", "client", "--name", "site-1"})
-	c.SetOut(io.Discard)
-	c.SetErr(io.Discard)
-	if err := c.ExecuteContext(context.Background()); err == nil || !strings.Contains(err.Error(), "host key is not known") || asked.n != 0 {
+	k := in.vmKitCommand(&in.O, func() error { return nil }, func(bool) Prompter { return asked })
+	k.SetArgs([]string{"create", "notes-1", "client", "--name", "site-1"})
+	k.SetOut(io.Discard)
+	k.SetErr(io.Discard)
+	if err := k.ExecuteContext(context.Background()); err == nil || !strings.Contains(err.Error(), "host key is not known") || asked.n != 0 {
 		t.Errorf("%v, asked %d times", err, asked.n)
-	}
-	// An empty known_hosts (an install finished by hand) holds no key: refused the same way.
-	if err := os.WriteFile(filepath.Join(dir, "known_hosts"), nil, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := runVMKit(t, in, nil, "check", "notes-1", "client", "site-1"); err == nil || len(ssh.calls) != 0 || ssh.prechecks != 0 {
-		t.Errorf("an empty known_hosts: %v", err)
 	}
 	// vm kit take tries the link before it asks the kit's code.
 	asked = &askCounter{}
 	takeRefused := &kitSSH{precheckErr: exitStatus(255)}
 	in4, _, _ := vmKitRun(t, takeRefused, nil)
-	if err := in4.TakeKitVM(context.Background(), &VMKitTake{VMReach: VMReach{Host: "notes-1"}, Kit: "-"}, strings.NewReader("x"), asked, time.Now()); err == nil || !strings.Contains(err.Error(), "does not answer over SSH") || asked.n != 0 || len(takeRefused.calls) != 0 {
+	if err := in4.TakeKitVM(context.Background(), &VMKitTake{VMReach: VMReach{Host: "notes-1", KnownHostsLine: testKnownLine}, Kit: "-"}, strings.NewReader("x"), asked, time.Now()); err == nil || !strings.Contains(err.Error(), "does not answer over SSH") || asked.n != 0 || len(takeRefused.calls) != 0 {
 		t.Errorf("take: %v, asked %d", err, asked.n)
 	}
 	// ssh refusing the link (a key it does not hold for the address, a VM away): refused by the
@@ -197,9 +206,9 @@ func TestVMKitNeedsTheHostKey(t *testing.T) {
 	asked = &askCounter{}
 	o := in3.O
 	fresh := &Installer{R: in3.R}
-	c = fresh.vmKitCommand(&o, func() error { fresh.O = o; return nil }, func(bool) Prompter { return asked })
+	c := fresh.vmKitCommand(&o, func() error { fresh.O = o; return nil }, func(bool) Prompter { return asked })
 	file := filepath.Join(t.TempDir(), "k")
-	c.SetArgs([]string{"create", "notes-1", "client", "--name", "site-1", "-o", file})
+	c.SetArgs([]string{"create", "notes-1", "client", "--name", "site-1", "-o", file, "--known-hosts-line", testKnownLine})
 	c.SetOut(io.Discard)
 	c.SetErr(io.Discard)
 	if err := c.ExecuteContext(context.Background()); err == nil || !strings.Contains(err.Error(), "does not answer over SSH") || asked.n != 0 || len(refusing.calls) != 0 || refusing.prechecks != 1 {

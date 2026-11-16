@@ -2,6 +2,7 @@ package publish
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -10,23 +11,29 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path"
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/fstest"
 	"time"
 
 	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/name"
 	ggcrregistry "github.com/google/go-containerregistry/pkg/registry"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
+	"github.com/google/go-containerregistry/pkg/v1/empty"
 	"github.com/google/go-containerregistry/pkg/v1/mutate"
 	"github.com/google/go-containerregistry/pkg/v1/random"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
+	"github.com/google/go-containerregistry/pkg/v1/types"
 	"go.yaml.in/yaml/v3"
 
 	"github.com/norvexlabs/stowage/internal/backup"
@@ -34,6 +41,7 @@ import (
 	"github.com/norvexlabs/stowage/internal/cloud"
 	"github.com/norvexlabs/stowage/internal/front"
 	"github.com/norvexlabs/stowage/internal/graph"
+	"github.com/norvexlabs/stowage/internal/installerbin"
 	"github.com/norvexlabs/stowage/internal/kairos"
 	"github.com/norvexlabs/stowage/internal/payload"
 	"github.com/norvexlabs/stowage/internal/project"
@@ -197,7 +205,8 @@ type env struct {
 	// scan is the audit gate's scanner, override its --audit-override.
 	scan     *sbom.Scanner
 	override string
-	// installer is the installer executable; pull the baked pull account.
+	// installer is the target's installer executable (testInstallers makes the others of it); pull
+	// the baked pull account.
 	installer []byte
 	pull      *payload.Account
 	// cloud registers cloud images with cloudVars as the publisher's settings.
@@ -209,9 +218,20 @@ type env struct {
 	refuseTagDelete bool
 	// ignorePut answers a manifest PUT to a path containing it with 201 and stores nothing.
 	ignorePut string
+	// indexOf maps an image digest to the manifest paths of the indexes naming it: the registry
+	// refuses to delete the image while one of them is in place, as zot does, and counts each
+	// refusal in refusedIndexed.
+	indexOf        map[string][]string
+	refusedIndexed atomic.Int32
 	// heads counts the manifest HEADs the registry answered, latestHeads those of a disk's
-	// latest-<format>, lists the tag listings.
-	heads, latestHeads, lists atomic.Int32
+	// latest-<format>, lists the tag listings, gets the manifest GETs, writes the PUTs and
+	// POSTs (a manifest, a blob upload).
+	heads, latestHeads, lists, gets, writes atomic.Int32
+	// deletes counts the deletions by digest the registry was asked, by digest; getsOf the
+	// manifest GETs, by digest or tag.
+	deletesMu sync.Mutex
+	deletes   map[string]int
+	getsOf    map[string]int
 }
 
 // fakeSigner records signatures by digest reference.
@@ -229,11 +249,33 @@ type fakeSigner struct {
 	// atts are the SBOMs attested, by digest reference; sboms counts those made.
 	atts          map[string][]byte
 	sboms, attest int
+	// platforms is the platform each SBOM made was read for, by digest reference.
+	platforms map[string]string
 }
 
-func (f *fakeSigner) SBOM(_ context.Context, d name.Digest) ([]byte, error) {
+func (f *fakeSigner) SBOM(_ context.Context, d name.Digest, platform string) ([]byte, error) {
 	f.sboms++
-	return []byte(`{"spdxVersion":"SPDX-2.3","name":"` + d.String() + `"}`), nil
+	if f.platforms == nil {
+		f.platforms = map[string]string{}
+	}
+	f.platforms[d.String()] = platform
+	return []byte(`{"spdxVersion":"SPDX-2.3","name":"` + d.String() + `","platform":"` + platform + `"}`), nil
+}
+
+// testInstallers is an installer per platform: exe for the target, exe after a line naming the
+// platform for each other one; none without exe.
+func testInstallers(exe []byte) installerbin.Set {
+	if exe == nil {
+		return nil
+	}
+	s := installerbin.Set{}
+	for _, p := range installerbin.Platforms {
+		s[p] = installerbin.Of(exe)
+		if p != installerbin.Target {
+			s[p] = installerbin.Of(append([]byte("# "+p+"\n"), exe...))
+		}
+	}
+	return s
 }
 
 func (f *fakeSigner) Attest(_ context.Context, d name.Digest, doc []byte) error {
@@ -326,9 +368,30 @@ func newEnv(t *testing.T) *env {
 	e := &env{t: t, installer: []byte("#!/bin/sh\necho installer\n")}
 	reg := ggcrregistry.New(ggcrregistry.Logger(log.New(io.Discard, "", 0)))
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete && strings.Contains(r.URL.Path, "/manifests/sha256:") {
+			e.deletesMu.Lock()
+			if e.deletes == nil {
+				e.deletes = map[string]int{}
+			}
+			e.deletes[path.Base(r.URL.Path)]++
+			e.deletesMu.Unlock()
+		}
 		if e.failDelete != "" && r.Method == http.MethodDelete && strings.Contains(r.URL.Path, e.failDelete) {
 			http.Error(w, "denied", http.StatusForbidden)
 			return
+		}
+		for _, idx := range e.indexOf[path.Base(r.URL.Path)] {
+			if r.Method != http.MethodDelete {
+				break
+			}
+			rec, head := httptest.NewRecorder(), httptest.NewRequest(http.MethodHead, idx, nil)
+			head.Header.Set("Accept", "*/*")
+			reg.ServeHTTP(rec, head)
+			if rec.Code == http.StatusOK {
+				e.refusedIndexed.Add(1)
+				http.Error(w, "manifest is referenced by an index", http.StatusForbidden)
+				return
+			}
 		}
 		if e.ignorePut != "" && r.Method == http.MethodPut && strings.Contains(r.URL.Path, e.ignorePut) {
 			w.WriteHeader(http.StatusCreated)
@@ -342,6 +405,18 @@ func newEnv(t *testing.T) *env {
 		}
 		if r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/tags/list") {
 			e.lists.Add(1)
+		}
+		if r.Method == http.MethodPut || r.Method == http.MethodPost {
+			e.writes.Add(1)
+		}
+		if r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/manifests/") {
+			e.gets.Add(1)
+			e.deletesMu.Lock()
+			if e.getsOf == nil {
+				e.getsOf = map[string]int{}
+			}
+			e.getsOf[path.Base(r.URL.Path)]++
+			e.deletesMu.Unlock()
 		}
 		if e.refuseTagDelete && r.Method == http.MethodDelete && strings.Contains(r.URL.Path, "/manifests/") &&
 			!strings.Contains(r.URL.Path, "/manifests/sha256:") {
@@ -404,7 +479,7 @@ func (e *env) publisher() (*Publisher, string) {
 		e.t.Fatal(err)
 	}
 	pub := &Publisher{Project: p, Registry: e.reg, Upstream: e.reg, Builder: e.builder, StowageVersion: "0.1.0", Scan: e.scan, AuditOverride: e.override,
-		Installer: e.installer, Pull: e.pull, Disks: e.disks, WorkDir: e.t.TempDir(), Anonymous: e.anon, Now: func() time.Time { return e.now }, Log: e.log}
+		Installer: testInstallers(e.installer), Pull: e.pull, Disks: e.disks, WorkDir: e.t.TempDir(), Anonymous: e.anon, Now: func() time.Time { return e.now }, Log: e.log}
 	if e.signer != nil {
 		pub.Signer, pub.SBOM = e.signer, e.signer
 	}
@@ -833,6 +908,66 @@ func TestSigningConfiguredRefusesToShipUnsigned(t *testing.T) {
 	eq(t, "nothing pushed", e.digest("notes-api", "1.0.0"), "")
 }
 
+// An executable whose bytes are not its recorded sha256 is refused before anything is built or
+// written: on a first ship, by the check of every executable; on a ship of a release already in
+// place, by the installer index made again first, which reads each one.
+func TestAShipRefusesAnExecutableOtherThanItsRecordedSum(t *testing.T) {
+	t.Parallel()
+	for _, kept := range []bool{false, true} {
+		e := newEnv(t)
+		installers := testInstallers(e.installer)
+		good := embeddedFiles(t, installers)
+		bad := maps.Clone(good)
+		// darwin/amd64's executable is other bytes than the sum the build recorded, of the size
+		// it recorded: the sum alone tells them apart.
+		other, err := installers["darwin/amd64"].Executable()
+		if err != nil {
+			t.Fatal(err)
+		}
+		other = slices.Clone(other)
+		other[len(other)-1] ^= 1
+		var buf bytes.Buffer
+		zw := gzip.NewWriter(&buf)
+		if _, err := zw.Write(other); err != nil {
+			t.Fatal(err)
+		}
+		if err := zw.Close(); err != nil {
+			t.Fatal(err)
+		}
+		bad[installerbin.File("darwin/amd64")] = &fstest.MapFile{Data: buf.Bytes()}
+		var before *Ref
+		if kept {
+			set, err := installerbin.Read(good)
+			if err != nil {
+				t.Fatal(err)
+			}
+			p, v := e.publisher()
+			p.Installer = set
+			if before, err = p.Ship(context.Background(), ShipOptions{Version: v, Channel: "stable", Revision: 1}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		built, writes := len(e.builder.built), e.writes.Load()
+		set, err := installerbin.Read(bad)
+		if err != nil {
+			t.Fatal(err)
+		}
+		p, v := e.publisher()
+		p.Installer = set
+		if _, err := p.Ship(context.Background(), ShipOptions{Version: v, Channel: "stable", Revision: 1}); err == nil ||
+			!strings.Contains(err.Error(), "the darwin/amd64 installer: its executable's sha256 is") {
+			t.Fatalf("kept %v: ship: %v", kept, err)
+		}
+		eq(t, "nothing built", len(e.builder.built), built)
+		eq(t, "nothing written", e.writes.Load(), writes)
+		if kept {
+			eq(t, "the release kept", e.digest("notes-release", "1.0.0"), fmt.Sprint(before.Digest))
+		} else {
+			eq(t, "no image", e.digest("notes-api", "1.0.0"), "")
+		}
+	}
+}
+
 func readFile(t *testing.T, p string) string {
 	t.Helper()
 	b, err := os.ReadFile(p)
@@ -1181,18 +1316,29 @@ func TestASignedProjectSignsEveryArtifactBeforeItsTagMoves(t *testing.T) {
 		eq(t, "image "+img+" signed", e.signedRef("notes-"+img, d), true)
 	}
 	eq(t, "installer signed", e.signedRef("notes-installer", r.Manifest.Artifacts.Installer), true)
+	images := e.installerImages(r.Manifest.Artifacts.Installer)
+	eq(t, "installer images", len(images), len(installerbin.Platforms))
+	for pl, d := range images {
+		eq(t, "installer "+pl+" signed", e.signedRef("notes-installer", d), true)
+	}
 	eq(t, "chart signed", e.signedRef("charts/notes-stable", r.Manifest.Artifacts.Chart.Digest), true)
 	eq(t, "manifest signed", e.signedRef("notes-release", r.Digest.String()), true)
 	eq(t, "os bundle signed", e.signedRef("notes-os", r.Manifest.Artifacts.OS), true)
 	eq(t, "disk signed", e.signedRef("notes-disk", r.Manifest.Artifacts.Disks["qcow2"]), true)
-	eq(t, "signatures", e.signer.signs, 13) // the scanner's, and the channel's disk set record
+	eq(t, "signatures", e.signer.signs, 17) // the scanner's, the installer's images, and the channel's disk set record
 
 	e.mustShip("stable", 1)
-	eq(t, "a re-ship signs nothing", e.signer.signs, 13)
+	eq(t, "a re-ship signs nothing", e.signer.signs, 17)
 	e.signer.onSign = nil
 	delete(e.signer.sigs, e.host+"/acme/notes/notes-release@"+r.Digest.String())
 	eq(t, "a lost signature is made again", e.mustShip("stable", 1).Digest, r.Digest)
-	eq(t, "signatures", e.signer.signs, 14)
+	eq(t, "signatures", e.signer.signs, 18)
+	// An installer image's lost signature too.
+	arm := e.host + "/acme/notes/notes-installer@" + images["linux/arm64"]
+	delete(e.signer.sigs, arm)
+	e.mustShip("stable", 1)
+	eq(t, "an installer image's lost signature is made again", e.signer.sigs[arm], true)
+	eq(t, "signatures", e.signer.signs, 19)
 	p, _ := e.publisher()
 	if _, err := p.Verify(context.Background(), "stable", "", 1); err != nil {
 		t.Fatal(err)
@@ -1209,6 +1355,11 @@ func TestASignedProjectSignsEveryArtifactBeforeItsTagMoves(t *testing.T) {
 		t.Fatalf("verify of an unsigned installer: %v", err)
 	}
 	e.signer.sigs[e.host+"/acme/notes/notes-installer@"+r.Manifest.Artifacts.Installer] = true
+	delete(e.signer.sigs, arm)
+	if _, err := p.Verify(context.Background(), "stable", "", 1); err == nil || !strings.Contains(err.Error(), images["linux/arm64"]) {
+		t.Fatalf("verify of an unsigned installer image: %v", err)
+	}
+	e.signer.sigs[arm] = true
 	delete(e.signer.sigs, e.host+"/acme/notes/charts/notes-stable@"+r.Manifest.Artifacts.Chart.Digest)
 	if _, err := p.Verify(context.Background(), "stable", "", 1); err == nil || !strings.Contains(err.Error(), "charts/notes-stable@") {
 		t.Fatalf("verify of an unsigned chart: %v", err)
@@ -1250,23 +1401,34 @@ func TestTheScannerIsBuiltFromItsRecipe(t *testing.T) {
 	eq(t, "a promotion builds nothing", built(), 0)
 }
 
-// A signing project attests the SBOM of every image, the installer and the OS bundle, once: a
-// re-ship makes none, a lost one is made again; the chart, the disks and the release manifest
-// carry none.
+// A signing project attests the SBOM of every image, each installer image and the OS bundle, once:
+// a re-ship makes none, a lost one is made again; the installer index and the disks carry the one
+// they hold, the chart and the release manifest none.
 func TestASignedProjectAttestsEachImagesSBOM(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
 	e.sign()
 	r := e.mustShip("stable", 1)
 	ref := func(repo, d string) string { return e.host + "/acme/notes/" + repo + "@" + d }
-	want := map[string]bool{ref("notes-installer", r.Manifest.Artifacts.Installer): true, ref("notes-os", r.Manifest.Artifacts.OS): true}
+	want := map[string]bool{ref("notes-os", r.Manifest.Artifacts.OS): true}
 	for img, d := range r.Manifest.Artifacts.Images {
 		want[ref("notes-"+img, d)] = true
+	}
+	// Each installer image carries its own, made for its platform.
+	for pl, d := range e.installerImages(r.Manifest.Artifacts.Installer) {
+		want[ref("notes-installer", d)] = true
+		eq(t, "the installer "+pl+"'s SBOM read for", e.signer.platforms[ref("notes-installer", d)], pl)
 	}
 	for d := range want {
 		if doc := e.signer.atts[d]; !strings.Contains(string(doc), d) {
 			t.Errorf("%s: SBOM %q", d, doc)
 		}
+	}
+	eq(t, "the web image's SBOM read for", e.signer.platforms[ref("notes-web", r.Manifest.Artifacts.Images["web"])], sbom.Platform)
+	// The index carries its target image's, which no scan makes again.
+	target := ref("notes-installer", e.installerImages(r.Manifest.Artifacts.Installer)[installerbin.Target])
+	if doc := e.signer.atts[ref("notes-installer", r.Manifest.Artifacts.Installer)]; string(doc) != string(e.signer.atts[target]) {
+		t.Errorf("the installer index: SBOM %q, not its %s image's", doc, installerbin.Target)
 	}
 	// Each disk carries its bundle's SBOM, which no scan makes again.
 	osDoc := e.signer.atts[ref("notes-os", r.Manifest.Artifacts.OS)]
@@ -1275,7 +1437,7 @@ func TestASignedProjectAttestsEachImagesSBOM(t *testing.T) {
 			t.Errorf("disk %s: SBOM %q, not its bundle's", f, doc)
 		}
 	}
-	eq(t, "attested", len(e.signer.atts), len(want)+len(r.Manifest.Artifacts.Disks))
+	eq(t, "attested", len(e.signer.atts), len(want)+1+len(r.Manifest.Artifacts.Disks))
 	// The bundle preloads the stack's images, not the scanner, which an operator runs off the VM.
 	eq(t, "the scanner preloaded", strings.Contains(e.log.String(), "os bundle: preload audit\n"), false)
 	eq(t, "web preloaded", strings.Contains(e.log.String(), "os bundle: preload web\n"), true)
@@ -1315,8 +1477,21 @@ func TestAuditScansEachAttestedSBOM(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := len(r.Manifest.Artifacts.Images) + 2 + len(r.Manifest.Artifacts.Disks)
+	// The installer's images other than the target's are subjects of their own; the index carries
+	// the target's.
+	want := len(r.Manifest.Artifacts.Images) + 2 + len(installerbin.Platforms) - 1 + len(r.Manifest.Artifacts.Disks)
 	eq(t, "subjects", len(rep.Subjects), want)
+	images := e.installerImages(r.Manifest.Artifacts.Installer)
+	var platforms []string
+	for _, s := range rep.Subjects {
+		if s.Name == "installer" {
+			platforms = append(platforms, s.Platform)
+			if s.Platform != "" && s.Digest != images[s.Platform] {
+				t.Errorf("the installer %s subject: %s, its image is %s", s.Platform, s.Digest, images[s.Platform])
+			}
+		}
+	}
+	eq(t, "the installer's subjects", strings.Join(platforms, " "), " linux/arm64 darwin/amd64 darwin/arm64")
 	eq(t, "scanned (a disk's SBOM is its bundle's: scanned once)", len(scanned), want-len(r.Manifest.Artifacts.Disks))
 	eq(t, "the release", rep.Tag, r.Manifest.Tag)
 	eq(t, "the database's build", rep.DBBuilt, "b")
@@ -1325,8 +1500,11 @@ func TestAuditScansEachAttestedSBOM(t *testing.T) {
 	if err != nil || len(idx.Artifacts) != want {
 		t.Fatalf("export: %v %+v", err, idx)
 	}
-	if raw, err := os.ReadFile(filepath.Join(out, "installer.spdx.json")); err != nil || !strings.Contains(string(raw), r.Manifest.Artifacts.Installer) {
-		t.Errorf("the installer's SBOM: %s %v", raw, err)
+	if raw, err := os.ReadFile(filepath.Join(out, "installer.spdx.json")); err != nil || !strings.Contains(string(raw), images[installerbin.Target]) {
+		t.Errorf("the installer's SBOM, its %s image's: %s %v", installerbin.Target, raw, err)
+	}
+	if raw, err := os.ReadFile(filepath.Join(out, "installer", "darwin-arm64.spdx.json")); err != nil || !strings.Contains(string(raw), images["darwin/arm64"]) {
+		t.Errorf("the installer darwin/arm64 image's SBOM: %s %v", raw, err)
 	}
 	if err := rep.Verdict(sbom.High, true); err == nil {
 		t.Error("a high finding passed --fail-on high")
@@ -1731,6 +1909,7 @@ func TestAnInstallerOnlyLatestHeldIsDeletedOnItsRetirement(t *testing.T) {
 	ctx := context.Background()
 	rel := e.mustShip("stable", 1)
 	inst := rel.Manifest.Artifacts.Installer
+	images := e.installerImages(inst)
 	// A prune that stopped part way, before marks: the release's installer tag gone, :latest left.
 	gone, _ := name.NewTag(e.host + "/acme/notes/notes-installer:1.0.0")
 	if err := remote.Delete(gone); err != nil {
@@ -1747,6 +1926,465 @@ func TestAnInstallerOnlyLatestHeldIsDeletedOnItsRetirement(t *testing.T) {
 	if d, _ := e.reg.Head(ctx, mustDigest(t, e, "notes-installer", inst)); d != nil {
 		t.Fatal("the installer only :latest held stayed in the registry")
 	}
+	// Its images went with it.
+	for pl, d := range images {
+		if have, _ := e.reg.Head(ctx, mustDigest(t, e, "notes-installer", d)); have != nil {
+			t.Fatalf("the installer's %s image stayed in the registry", pl)
+		}
+	}
+}
+
+// zotIndex makes the registry refuse, as zot does, to delete an image of the installer index inst
+// while inst is in place.
+func (e *env) zotIndex(inst string, images map[string]string) {
+	e.indexOf = map[string][]string{}
+	for _, d := range images {
+		e.indexOf[d] = []string{"/v2/acme/notes/notes-installer/manifests/" + inst}
+	}
+}
+
+// An installer index whose removal stops after the index went, on a registry refusing to delete
+// an image an index names: its images were marked held before it, so the one left over is
+// removed by the next prune's sweep.
+func TestAnInstallerIndexRemovalStoppedPartWayIsSweptLater(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	ctx := context.Background()
+	rel := e.mustShip("stable", 1)
+	inst := rel.Manifest.Artifacts.Installer
+	images := e.installerImages(inst)
+	e.zotIndex(inst, images)
+	gone, _ := name.NewTag(e.host + "/acme/notes/notes-installer:1.0.0")
+	if err := remote.Delete(gone); err != nil {
+		t.Fatal(err)
+	}
+	e.refuseTagDelete = true
+	arm := images["linux/arm64"]
+	e.failDelete = arm
+	p, _ := e.publisher()
+	if err := p.Yank(ctx, "stable", "1.0.0", 1, "bad"); err != nil {
+		t.Fatal(err)
+	}
+	if d, _ := e.reg.Head(ctx, mustDigest(t, e, "notes-installer", inst)); d != nil {
+		t.Fatal("the installer index stayed")
+	}
+	h, err := v1.NewHash(arm)
+	if err != nil {
+		t.Fatal(err)
+	}
+	eq(t, "the image left over is marked held", e.digest("notes-installer", heldTag(h)), arm)
+	for pl, d := range images {
+		if have, _ := e.reg.Head(ctx, mustDigest(t, e, "notes-installer", d)); (have != nil) != (d == arm) {
+			t.Fatalf("the %s image: present %v", pl, have != nil)
+		}
+	}
+	e.failDelete = ""
+	p, _ = e.publisher()
+	if _, err := p.PruneKeep(ctx, "stable", 1); err != nil {
+		t.Fatal(err)
+	}
+	if have, _ := e.reg.Head(ctx, mustDigest(t, e, "notes-installer", arm)); have != nil {
+		t.Fatal("the prune's sweep left the image over")
+	}
+}
+
+// A removal stopped before the index went leaves the index and its images marked: a sweep
+// removes the index first, as the registry refuses its images before; and an image marked under
+// an index a tag holds again (a re-ship) stays.
+func TestTheSweepRemovesAMarkedInstallerIndexBeforeItsImages(t *testing.T) {
+	t.Parallel()
+	for _, retagged := range []bool{false, true} {
+		e := newEnv(t)
+		ctx := context.Background()
+		rel := e.mustShip("stable", 1)
+		inst := rel.Manifest.Artifacts.Installer
+		images := e.installerImages(inst)
+		if !retagged {
+			e.zotIndex(inst, images)
+		}
+		p, _ := e.publisher()
+		repo, err := name.NewRepository(e.host + "/acme/notes/notes-installer")
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, d := range append(slices.Collect(maps.Values(images)), inst) {
+			h, err := v1.NewHash(d)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := p.markHeld(ctx, repo, h); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if !retagged {
+			for _, tag := range []string{"1.0.0", "latest"} {
+				gone, _ := name.NewTag(e.host + "/acme/notes/notes-installer:" + tag)
+				if err := remote.Delete(gone); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+		p, _ = e.publisher()
+		if err := p.sweepMarked(ctx); err != nil {
+			t.Fatalf("retagged %v: %v", retagged, err)
+		}
+		for _, d := range append(slices.Collect(maps.Values(images)), inst) {
+			have, _ := e.reg.Head(ctx, mustDigest(t, e, "notes-installer", d))
+			if (have != nil) != retagged {
+				t.Fatalf("retagged %v: %s present %v", retagged, d, have != nil)
+			}
+		}
+	}
+}
+
+// read is how many times the registry was asked for the manifest d (a digest or a tag).
+func (e *env) read(d string) int {
+	e.deletesMu.Lock()
+	defer e.deletesMu.Unlock()
+	return e.getsOf[d]
+}
+
+// deleted is how many times the registry was asked to delete d by digest.
+func (e *env) deleted(d string) int {
+	e.deletesMu.Lock()
+	defer e.deletesMu.Unlock()
+	return e.deletes[d]
+}
+
+// A sweep of a marked installer index whose images are marked too deletes each image once, with
+// the index, and logs each deletion once.
+func TestASweptIndexsImagesAreDeletedAndLoggedOnce(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	ctx := context.Background()
+	rel := e.mustShip("stable", 1)
+	inst := rel.Manifest.Artifacts.Installer
+	images := e.installerImages(inst)
+	e.zotIndex(inst, images)
+	p, _ := e.publisher()
+	repo, err := name.NewRepository(e.host + "/acme/notes/notes-installer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	all := append(slices.Collect(maps.Values(images)), inst)
+	for _, d := range all {
+		h, err := v1.NewHash(d)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := p.markHeld(ctx, repo, h); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, tag := range []string{"1.0.0", "latest"} {
+		gone, _ := name.NewTag(e.host + "/acme/notes/notes-installer:" + tag)
+		if err := remote.Delete(gone); err != nil {
+			t.Fatal(err)
+		}
+	}
+	p, _ = e.publisher()
+	if err := p.sweepMarked(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, d := range all {
+		if have, _ := e.reg.Head(ctx, mustDigest(t, e, "notes-installer", d)); have != nil {
+			t.Fatalf("%s stayed", d)
+		}
+		eq(t, d+" deletions", e.deleted(d), 1)
+		eq(t, d+" deletions logged", strings.Count(e.log.String(), "notes-installer@"+d+" deleted: no tag holds it any more"), 1)
+	}
+}
+
+// Removing an index, in any repository, deletes each manifest it names that nothing else holds:
+// one another tagged index names, or a tag names, stays.
+func TestRemovingAnIndexDeletesWhatNothingElseHolds(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	ctx := context.Background()
+	repo := e.host + "/acme/notes/notes-mirrored"
+	var imgs []v1.Image
+	var digests []string
+	for i := range 4 {
+		img, err := amd64Image(64+int64(i), 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		d, _ := img.Digest()
+		imgs, digests = append(imgs, img), append(digests, d.String())
+	}
+	index := func(tag string, of ...int) string {
+		var adds []mutate.IndexAddendum
+		for _, i := range of {
+			adds = append(adds, mutate.IndexAddendum{Add: imgs[i], Descriptor: v1.Descriptor{Platform: &v1.Platform{OS: "linux", Architecture: fmt.Sprint("arch", i)}}})
+		}
+		idx := mutate.AppendManifests(mutate.IndexMediaType(empty.Index, types.OCIImageIndex), adds...)
+		ref, _ := name.NewTag(repo + ":" + tag)
+		if err := remote.WriteIndex(ref, idx); err != nil {
+			t.Fatal(err)
+		}
+		d, _ := idx.Digest()
+		return d.String()
+	}
+	// a names 0, 1, 2 and 3; b (tagged) names 1; 2 is tagged itself; 0 and 3 are a's alone.
+	a := index("a", 0, 1, 2, 3)
+	b := index("b", 1)
+	two, _ := name.NewTag(repo + ":two")
+	if err := remote.Write(two, imgs[2]); err != nil {
+		t.Fatal(err)
+	}
+	for _, sweep := range []bool{false, true} {
+		p, _ := e.publisher()
+		gets := map[string]int{}
+		for _, d := range append([]string{a, b}, digests...) {
+			gets[d] = e.read(d)
+		}
+		if sweep {
+			// The same rule, from a sweep: a marked index no tag holds.
+			a = index("a", 0, 1, 2, 3)
+			h, _ := v1.NewHash(a)
+			r, _ := name.NewRepository(repo)
+			if err := p.markHeld(ctx, r, h); err != nil {
+				t.Fatal(err)
+			}
+			gone, _ := name.NewTag(repo + ":a")
+			if err := remote.Delete(gone); err != nil {
+				t.Fatal(err)
+			}
+			if err := p.sweepMarked(ctx, repo); err != nil {
+				t.Fatal(err)
+			}
+		} else if err := p.remove(ctx, repo, a); err != nil {
+			t.Fatal(err)
+		}
+		// The index b is read once; an image is read only to be marked held (0 and 3, which
+		// a alone names), never to tell what it names.
+		for d, want := range map[string]int{b: 1, digests[0]: 1, digests[1]: 0, digests[2]: 0, digests[3]: 1} {
+			if n := e.read(d) - gets[d]; n != want {
+				t.Errorf("sweep %v: %s read %d times, want %d", sweep, d, n, want)
+			}
+		}
+		for i, want := range []bool{false, true, true, false} {
+			ref, _ := name.NewDigest(repo + "@" + digests[i])
+			if have, _ := e.reg.Head(ctx, ref); (have != nil) != want {
+				t.Fatalf("sweep %v: image %d present %v, want %v", sweep, i, have != nil, want)
+			}
+		}
+		ref, _ := name.NewDigest(repo + "@" + a)
+		if have, _ := e.reg.Head(ctx, ref); have != nil {
+			t.Fatalf("sweep %v: the index stayed", sweep)
+		}
+	}
+	for i, want := range []int{2, 0, 0, 2} {
+		eq(t, fmt.Sprint("image ", i, " deletions"), e.deleted(digests[i]), want)
+	}
+	eq(t, "the sweep's logged", strings.Count(e.log.String(), "notes-mirrored@"+digests[0]+" deleted: no tag holds it any more"), 1)
+}
+
+// markedIndexes pushes to repo, as a stopped removal leaves them, an index per entry of of naming
+// the images (made from seeds) it lists, each marked held and its tag gone; the registry refuses
+// to delete an image while an index naming it is in place (zot). It returns the indexes' and the
+// images' digests.
+func (e *env) markedIndexes(p *Publisher, repo string, seeds int, of ...[]int) (indexes, images []string) {
+	t := e.t
+	t.Helper()
+	ctx := context.Background()
+	var imgs []v1.Image
+	for i := range seeds {
+		img, err := amd64Image(96+int64(i), 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		d, _ := img.Digest()
+		imgs, images = append(imgs, img), append(images, d.String())
+	}
+	r, err := name.NewRepository(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.indexOf = map[string][]string{}
+	for n, entries := range of {
+		var adds []mutate.IndexAddendum
+		for _, i := range entries {
+			adds = append(adds, mutate.IndexAddendum{Add: imgs[i], Descriptor: v1.Descriptor{Platform: &v1.Platform{OS: "linux", Architecture: fmt.Sprint("arch", i)}}})
+		}
+		idx := mutate.AppendManifests(mutate.IndexMediaType(empty.Index, types.OCIImageIndex), adds...)
+		tag, _ := name.NewTag(fmt.Sprint(repo, ":i", n))
+		if err := remote.WriteIndex(tag, idx); err != nil {
+			t.Fatal(err)
+		}
+		d, _ := idx.Digest()
+		if err := p.markHeld(ctx, r, d); err != nil {
+			t.Fatal(err)
+		}
+		if err := remote.Delete(tag); err != nil {
+			t.Fatal(err)
+		}
+		indexes = append(indexes, d.String())
+		for _, i := range entries {
+			e.indexOf[images[i]] = append(e.indexOf[images[i]], "/v2/"+r.RepositoryStr()+"/manifests/"+d.String())
+		}
+	}
+	return indexes, images
+}
+
+// Two marked indexes naming one image: a sweep of one keeps the image the other still names; a
+// sweep of both deletes it once, after both, and the registry never refuses a deletion.
+func TestAnImageTwoMarkedIndexesNameGoesAfterBoth(t *testing.T) {
+	t.Parallel()
+	for _, both := range []bool{false, true} {
+		e := newEnv(t)
+		ctx := context.Background()
+		repo := e.host + "/acme/notes/notes-mirrored"
+		p, _ := e.publisher()
+		// I names 0 and 2, J names 1 and 2.
+		idx, imgs := e.markedIndexes(p, repo, 3, []int{0, 2}, []int{1, 2})
+		only := map[string]bool{heldTag(mustHash(t, idx[0])): true}
+		if both {
+			only = nil
+		}
+		p, _ = e.publisher()
+		if err := p.sweepRepo(ctx, repo, only); err != nil {
+			t.Fatalf("both %v: %v", both, err)
+		}
+		eq(t, fmt.Sprint("both ", both, ": deletions refused"), int(e.refusedIndexed.Load()), 0)
+		present := func(d string) bool {
+			ref, _ := name.NewDigest(repo + "@" + d)
+			have, _ := e.reg.Head(ctx, ref)
+			return have != nil
+		}
+		for d, want := range map[string]bool{idx[0]: false, imgs[0]: false, idx[1]: !both, imgs[1]: !both, imgs[2]: !both} {
+			if present(d) != want {
+				t.Errorf("both %v: %s present %v, want %v", both, d, !want, want)
+			}
+		}
+		if both {
+			eq(t, "the shared image's deletions", e.deleted(imgs[2]), 1)
+			log := e.log.String()
+			at := func(d string) int { return strings.Index(log, "notes-mirrored@"+d+" deleted") }
+			if at(imgs[2]) < at(idx[0]) || at(imgs[2]) < at(idx[1]) || at(idx[0]) < 0 || at(idx[1]) < 0 {
+				t.Errorf("the shared image went before an index naming it:\n%s", log)
+			}
+		}
+	}
+}
+
+// A candidate index gone before its round (another run deleted it) is skipped: neither judged from
+// what was read of it before nor reported deleted.
+func TestACandidateIndexAlreadyGoneIsSkipped(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	ctx := context.Background()
+	repo := e.host + "/acme/notes/notes-mirrored"
+	img, err := amd64Image(200, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inner := mutate.AppendManifests(mutate.IndexMediaType(empty.Index, types.OCIImageIndex),
+		mutate.IndexAddendum{Add: img, Descriptor: v1.Descriptor{Platform: &v1.Platform{OS: "linux", Architecture: "amd64"}}})
+	outer := mutate.AppendManifests(mutate.IndexMediaType(empty.Index, types.OCIImageIndex), mutate.IndexAddendum{Add: inner})
+	tag, _ := name.NewTag(repo + ":a")
+	if err := remote.WriteIndex(tag, outer); err != nil {
+		t.Fatal(err)
+	}
+	in, _ := inner.Digest()
+	out, _ := outer.Digest()
+	p, _ := e.publisher()
+	r, _ := name.NewRepository(repo)
+	// The inner index is marked held and read, then deleted behind the pass's back.
+	if err := p.markHeld(ctx, r, in); err != nil {
+		t.Fatal(err)
+	}
+	tags, err := p.readTags(ctx, r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.manifestsOf(ctx, r, in); err != nil {
+		t.Fatal(err)
+	}
+	if err := remote.Delete(r.Digest(in.String())); err != nil {
+		t.Fatal(err)
+	}
+	deletes := e.deleted(in.String())
+	deleted, err := p.removeAll(ctx, &removal{name: repo, repo: r, tags: tags}, []v1.Hash{out})
+	if err != nil {
+		t.Fatal(err)
+	}
+	eq(t, "deleted", fmt.Sprint(deleted), fmt.Sprint([]v1.Hash{out}))
+	eq(t, "deletions of the index gone", e.deleted(in.String())-deletes, 0)
+}
+
+// A removal of images alone judges no holder: no tagged index is read.
+func TestRemovingAnImageReadsNoIndex(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	ctx := context.Background()
+	repo := e.host + "/acme/notes/notes-mirrored"
+	var imgs []v1.Image
+	for i := range 2 {
+		img, err := amd64Image(210+int64(i), 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		imgs = append(imgs, img)
+	}
+	idx := mutate.AppendManifests(mutate.IndexMediaType(empty.Index, types.OCIImageIndex),
+		mutate.IndexAddendum{Add: imgs[0], Descriptor: v1.Descriptor{Platform: &v1.Platform{OS: "linux", Architecture: "amd64"}}})
+	tag, _ := name.NewTag(repo + ":b")
+	if err := remote.WriteIndex(tag, idx); err != nil {
+		t.Fatal(err)
+	}
+	r, _ := name.NewRepository(repo)
+	d, _ := imgs[1].Digest()
+	if err := remote.Write(r.Digest(d.String()), imgs[1]); err != nil {
+		t.Fatal(err)
+	}
+	p, _ := e.publisher()
+	tags, err := p.readTags(ctx, r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := idx.Digest()
+	gets := e.read(b.String())
+	deleted, err := p.removeAll(ctx, &removal{name: repo, repo: r, tags: tags}, []v1.Hash{d})
+	if err != nil {
+		t.Fatal(err)
+	}
+	eq(t, "deleted", fmt.Sprint(deleted), fmt.Sprint([]v1.Hash{d}))
+	eq(t, "reads of the tagged index", e.read(b.String())-gets, 0)
+}
+
+// A sweep's manifest reads grow with the marks it judges, never with their square: the
+// repository's tags are read once for the pass, not once per index removed.
+func TestASweepOfManyIndexesReadsTagsOnce(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	ctx := context.Background()
+	repo := e.host + "/acme/notes/notes-mirrored"
+	p, _ := e.publisher()
+	const n = 16
+	var of [][]int
+	for i := range n {
+		of = append(of, []int{i})
+	}
+	e.markedIndexes(p, repo, n, of...)
+	p, _ = e.publisher()
+	before := e.heads.Load()
+	if err := p.sweepRepo(ctx, repo, nil); err != nil {
+		t.Fatal(err)
+	}
+	if heads := int(e.heads.Load() - before); heads > 6*n {
+		t.Fatalf("%d manifest HEADs to sweep %d indexes", heads, n)
+	}
+}
+
+// mustHash is the digest d parsed.
+func mustHash(t *testing.T, d string) v1.Hash {
+	t.Helper()
+	h, err := v1.NewHash(d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return h
 }
 
 // A mutable release shipped again without an image key or a disk format its earlier build had
@@ -1905,9 +2543,13 @@ func TestASweepReadsEachTagOnce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	before := e.heads.Load()
+	before, gets := e.heads.Load(), e.gets.Load()
 	if err := p.sweepMarked(ctx, p.imageRepo("web")); err != nil {
 		t.Fatal(err)
+	}
+	// Each tag names an image, which the sweep never reads.
+	if n := e.gets.Load() - gets; n != 0 {
+		t.Fatalf("%d manifest reads of images", n)
 	}
 	// The release and installer repositories hold no mark: listed, never read.
 	if n := int(e.heads.Load() - before); n > len(tags) {

@@ -304,6 +304,36 @@ pushed artifact.
   manifest, so it embeds outputs no inputs digest covers (image digests, `release_seq`, date):
   it has no `dev.stowage.inputs` annotation and is never kept on its inputs — ship makes it again
   from the manifest and compares digests. Its node's digest still enters the release's.
+- The installer image is one OCI index of an image per platform (linux/amd64, linux/arm64,
+  darwin/amd64, darwin/arm64), each still one layer of one file, so a client without Docker (the
+  OpenTofu provider) pulls its own platform's image and runs it natively; one repository, one
+  digest in the release manifest — no format change of the manifest, as the index pins each image.
+  Every image is signed and attested on its own digest, so one checks alone; the index carries
+  the target's SBOM, so a reader of the manifest's digest audits what a target runs. A target
+  stays linux/amd64 (the release's images are built for it): an index makes a Docker host or a
+  kubelet pick its own platform's image, so the installer refuses its target verbs off
+  linux/amd64, and a Job running it names its linux/amd64 image by digest (read from the index
+  with the install's pull account) and selects linux/amd64 nodes (`kubernetes.io/os`,
+  `kubernetes.io/arch`): the image is the target's, and so are the release's images the hook
+  runs, so a pod on another node could not start; a cluster without such a node leaves it
+  pending, and the hook's refusal names the selector. `stowage` embeds the four executables gzip-compressed (~11 MB
+  each, ~30 MB raw) with each one's sha256 and size recorded by the build: the CLI stays about 70 MB rather
+  than 145 MB, `plan` hashes nothing, and `ship` streams each, checked against its recorded sha256 and size as it
+  is read (its size is the recorded one, read without it): once before anything is built, then each image's layer is made from a stream, one
+  platform at a time, so no executable is kept (an installer index made once keeps its digests
+  alone). gzip over zstd: the standard library reads it and the build image
+  has it, for 2 MB more per platform. The installer node's inputs are every executable's recorded
+  sha256; the OS bundle's the linux/amd64 one's alone. Removing an index, in any repository (an
+  installer's, a mirrored multi-platform image's), removes after it each manifest it names that
+  no other tag holds, directly or through another index a tag holds (a registry such as zot
+  refuses to delete a manifest an index names), each marked held first, so a removal stopped
+  between leaves them to the next sweep; the sweep judges what a tag holds by the same rule (a
+  held mark holds what its index names while the index is there, never its own manifest), and a
+  removal goes in rounds: every index of the round first, then what they named, judged against
+  the tags left, so a manifest two removed indexes name goes once, after both, and one an index
+  outside the run names stays. The tags are read once per removal (per repository in a sweep),
+  and each manifest is visited once. A mirror export reads the referrers of the
+  installer index's images alone: no other artifact's index signs its images on their own.
 - Images are built for `linux/amd64`, and the platform is one of an image's inputs: an image built
   elsewhere is never kept or re-tagged in its place. Multi-platform builds are a later step.
 - `promote` publishes a release on another channel by re-tagging only: it runs `ship` for the
@@ -349,8 +379,7 @@ pushed artifact.
   view (`RuntimeView`, which the bundle view copies from) so it enters no inputs digest. The
   decision is shown where it is made: the ship's summary says per shape what the release can
   install, and for kairos whether `vm create` boots its own disks, its channel's, or is refused,
-  with the ship that fixes it; `vm destroy` reuses `vm create`'s lookup to warn of the outage it
-  would cause, never blocking on it. A release without disks
+  with the ship that fixes it. A release without disks
   records the set its installs boot (`boot_disks`: the channel's, the newest release's that
   published disks, with the stowage that published them); `vm create` boots it and the VM's first
   boot writes the requested release's OS bundle and reboots into it before installing, so a VM
@@ -442,7 +471,7 @@ pushed artifact.
 <prefix>/<name>-os:<tag>                    Kairos OS bundle (project images preloaded + VM runtime)
 <prefix>/<name>-disk:<tag>-<fmt>            installer disk images (+ latest-<fmt>)
 <prefix>/charts/<name>-<channel>:0.<seq>.0  Helm chart (OCI), one repository per channel
-<prefix>/<name>-installer:<tag>, :latest    installer image (all three shapes)
+<prefix>/<name>-installer:<tag>, :latest    installer image (all three shapes): an index, one image per platform
 <prefix>/<name>-release:<tag>               release manifest
 <prefix>/<name>-release:<channel>           channel pointer (stable, dev, …)
 ```
@@ -982,33 +1011,35 @@ Stowage calls a project's programs: the two never share a reader.
 - **`vm seed --json`** — a VM's first-boot material without creating the VM, for a tool that
   creates it with its own means: `{format, platform, user_data, meta_data, known_hosts_line,
   fingerprint, host_key_private, disk: {<platform>: {format, image, os_gib, disk_gib,
-  cloud_image}}, app_gib, disk_file, await_secrets, await_tls, waiting: [<key>], registry_login,
+  cloud_image}}, app_gib, disk_file, await_secrets, await_tls, await_given: [<key>], waiting: [<key>], registry_login,
   interfaces: [{role, mac, attach, primary}]}` — everything a
   consumer would otherwise read from the registry or rebuild (the NoCloud meta-data, the sizes a
   disk's annotation records, the disk unpacked from its zstd artifact with `--disk-dir`, the name
   `ship --disks` registers a cloud image under, which is derived from the disk's digest, so no
   record of it is needed), and what the first install waits for over SSH (`--await-secrets`: a
-  secrets export, so a machine made again keeps its secrets; `--tls byo`: the certificate) — the user-data for `--platform` (the
-  cloud-config; never a secret input — those go after the boot, `install --given -` over SSH: a
-  secret input or TLS material given to the seed is refused), the one-time host key (its
+  secrets export, so a machine made again keeps its secrets; `--tls byo`: the certificate; the
+  secret inputs `--answers` holds, named in `await_given`: `vm create`'s one rule, awaitOverSSH) — the user-data for `--platform` (the
+  cloud-config; never a secret input — those go after the boot, `install --given -` over SSH, given
+  by the caller, who holds them: TLS material or a secret input on the seed's command line is
+  refused), the one-time host key (its
   `known_hosts` line under the name `vm-seed-host-key`, its fingerprint and its private key, which
   the caller keeps secret until it retires), the disk image by digest of each platform the
   registry holds a disk for, and `waiting`: the sorted keys of the required secret inputs nothing
   gives, which the first install waits for (never a value; omitted when none); `interfaces`, the
   NICs the cloud-config names by MAC, as the program making the VM must create them (a MAC
-  generated here is in the seed alone, so it is printed, never omitted: `[]` for none). It never asks: `vm create`'s machine flags, the front's, `--set`,
+  generated here is in the seed alone, so it is printed, never omitted: `[]` for none); `size`, the
+  least and the default of the VM's CPUs, memory and app's space (what `vm create` sized a VM by),
+  and `firewall`, the sources of SSH and each opened port, for a platform's own firewall. It never asks: `vm create`'s machine flags, the front's, `--set`,
   `--answers` and `--channel` (the channel the first install follows) give it all. It is the seed
-  `vm create --create manual` writes, built by the same steps (the registry and disk set, the
+  `vm create` writes, built by the same steps (the registry and disk set, the
   machine, the settings, the user-data). A missing, unknown or unoffered `--platform` is refused
   (exit 3) once the registry has been read, naming the platforms it offers — the fix needs that
   list; a registry that cannot be read, or that offers no disk, is a failure (exit 1). The `vm` verbs that reach a VM over SSH (`vm kit`, `vm
-  attach`) take `--known-hosts-line LINE`: one host name and its key (no marker, pattern, list or
-  hashed name), checked strictly under that name (`HostKeyAlias`), never `accept-new`, in place
-  of the key `vm create` recorded; the line is written, its name lower-cased, to a file of its
+  host-key`) require `--known-hosts-line LINE`: one host name and its key (no marker, pattern, list
+  or hashed name), checked strictly under that name (`HostKeyAlias`), never `accept-new`; the line is written, its name lower-cased, to a file of its
   own under the state directory, named by its digest, so the `ssh` command a message gives runs
   as the verb's did. `vm host-key --json` reads the VM's own host key through that pinned key and
-  retires the seed's one-time key at once — the step `vm create` runs after its install over
-  SSH —, printing the VM's key as a `known_hosts` line: a consumer pins the VM's own key from
+  retires the seed's one-time key at once, printing the VM's key as a `known_hosts` line: a consumer pins the VM's own key from
   then on, with no file steps of its own. `<short>-stow host-key --json`, as root on the VM, runs
   that same command locally rather than over SSH (one implementation), for a consumer on the VM
   or one holding no SSH config of the operator's. A refusal of `vm seed`, `vm host-key` or
@@ -1054,7 +1085,7 @@ Stowage calls a project's programs: the two never share a reader.
 | 24c | Show a login | `secrets show KEY` for `settable: true`, standard output a terminal or refused; the closing report names the logins and the verb **C** | `k8s secrets show`, from the release's Secret (or its secret files' one) **C** | the Docker shape's verb, the host daemon's answer on the operator's socket alone, never logged **C** |
 | 25 | Registry credential rotation | `.env` / installer flag **C** | pull Secret **C** | sealed env + `reconfigure-userdata` **C** → the pull account the OS bundle carries; an install's own login, `registry-login` / `--registry-login-file` on every shape (Kubernetes: the pull Secret it writes), comes before it, after the password a run sets; a mirror without one: root's Docker login on the VM |
 | 26 | Power / maintenance | `stop` / `start` **C** | owner: cluster | `<short>-stow reboot/shutdown --drain-secs`, disk-pressure hook **C** |
-| 27 | Uninstall | `uninstall`: `compose down`, the install's timers and applied network declarations removed; the volumes and the install directory kept unless `--data` **C** | `k8s uninstall`: `helm uninstall`, the installer's Secrets, the hook's account and Job; the claims only with `--data`, kept data keeping the Secrets that answer for it, a chart's own claim (which helm deletes) needing `--data` **C** | `vm destroy` (a VM `vm create` made with OpenTofu) **C**; else owner: hypervisor |
+| 27 | Uninstall | `uninstall`: `compose down`, the install's timers and applied network declarations removed; the volumes and the install directory kept unless `--data` **C** | `k8s uninstall`: `helm uninstall`, the installer's Secrets, the hook's account and Job; the claims only with `--data`, kept data keeping the Secrets that answer for it, a chart's own claim (which helm deletes) needing `--data` **C** | owner: the OpenTofu root that made the VM (`tofu destroy`), else the hypervisor |
 | 28 | Move host / disaster recovery | `secrets export` on old (the front's local CA with the secrets: a new root would break every client trusting the old) → `install --secrets` on new **C** (data: the snapshot by hand) | `k8s secrets export` (the same file, read from the release's Secrets) → `k8s install --secrets` on the new cluster, the hook waiting for the data (a label on its outputs Secret) **C** | `secrets export`, then `vm create --secrets` + `restore OBJECT` **C** |
 
 Rules:
@@ -1169,7 +1200,7 @@ Rules:
 
 | Piece | Built from | Behaviour |
 |---|---|---|
-| Installer / `<short>-stow` | one static Go binary (linux/amd64; arm64 later) carried by the installer image, the release payload appended at ship time; terminal UI on Charm huh / bubbles / lipgloss | one binary, three shapes, interactive or fully non-interactive |
+| Installer / `<short>-stow` | one static Go binary per platform (linux/amd64 and arm64, darwin/amd64 and arm64; a target runs linux/amd64; windows later) carried by the installer image's index, the release payload appended at ship time; terminal UI on Charm huh / bubbles / lipgloss | one binary, three shapes, interactive or fully non-interactive |
 | Front | Caddy 2.11.9 + the Cloudflare DNS plugin and the layer4 app (caddy-l4), from a Dockerfile embedded in `stowage` (bases pinned by digest, never 2.11.6), built by `ship` into the project registry | Caddyfile generated by the installer from `front.routes` × TLS mode (no entrypoint script: the `sh -c` start alone, for `publish_ca`'s copy and an L4 route's empty ALPN list, adapted to JSON); a site per domain, its routes told apart by path prefix (each a named `path` matcher, `/p` and `/p/*`, in a `handle`, the longest first, the route without one last: a prefix never matches `/pfoo`), a client certificate asked for a whole site so a `client_auth` route has its domain alone; the front runs as a user of its own with no capability and a read-only root (§ 12, one confinement), and listens on 80 and 443 in its container whatever host ports publish them (published only where something serves on them: § 12), and on the public HTTPS port too when it is moved (a second site address), so the domains it is an alias of on the stack's network answer on the port a route's URL names, which an app building a URL from its domain alone (an OIDC issuer) needs; per route, in one ordered `route` block: the source allowlist (an input of CIDRs, empty refusing everyone: a scraper's route needs no port of its own), the login (`basic_auth`, its bcrypt hash kept), header stripping (the login's `Authorization` with it), then `forward_auth` (its address an input, off while empty; the answer's headers copied after the strip, so a client never forges an identity); the values the front reads are checked when given and written into the Caddyfile, and the front carries the digest of its configuration as a label, so a change recreates it; `publish_ca` copies the local CA's root (or byo's `--ca`) into a project volume from the front's own container (a shell loop before `exec caddy`, as the root exists only once Caddy started), not from a second service `up --wait` would have to tolerate exiting; HSTS except `internal`; domains are the routes' `domain_input` inputs (`--domains` is shorthand), checked at install; Stowage owns the ACME contact (`STOWAGE_ACME_EMAIL`, refused when malformed, never silently dropped); a byo certificate is checked against every domain at install; `dns-cloudflare` takes its token as a secret given to the front's container (not to the project's services or the hook; a stack that reads `.env` itself sees it), checked in the form the plugin accepts, since the plugin's own refusal prints it; one issuer per mode |
 | Volume helper | busybox 1.37.0, from a Dockerfile embedded in `stowage` (base pinned by digest), built by `ship` into the project registry for a `docker` or `kairos` shape with a data volume of a `uid`, pulled with the stack's images on Docker, preloaded by the bundle | run once per start that makes such a volume, after `up --no-start` and before the services start: as root, no network, the new volumes mounted, `chown -hR <uid>` of each whose root belongs to another user |
 | Backup | the host daemon (pg_dump inside the database service, age in Go) and a runner image (rclone, from a Dockerfile embedded in `stowage`, base pinned by digest, built by `ship` into the project registry for a `kairos` or `docker` shape with a `pg-age-rclone` or `volumes-age-rclone` backup, preloaded by the bundle) | the dump streamed through age to rclone `rcat`, never on the VM's disk, after each listed volume's tar (the runner's own, the volume read-only, no network) streamed the same way beside it; the size reached checked; the dump last, so a backup holds a dump only once whole; retention by `rclone delete --min-age` on the profile's own dumps, then the volume archives whose dump is gone (an archive is older than its dump); a project without a database (`volumes-age-rclone`) uploads an encrypted manifest (project, release, volumes) in the dump's place, so a backup's last object still marks it whole and names it, and every listing, pruning and restore keys on that last object, whichever it is; its restore decrypts the manifest before stopping anything, which proves the identity and the backup's release, then swaps the volumes alone in; settings (destination, rclone config, recipients, retention, schedule, profile) the operator's, on the persistent partition, set over SSH; the timer's schedule a runtime drop-in; a backup before each upgrade, warn-only |
@@ -1244,8 +1275,7 @@ often read more widely than the images — with the publisher's credentials from
 which nothing in a release carries. The modules pin each provider's exact release with its lock
 file's checksums, and OpenTofu runs with an empty CLI configuration, so the provider binary that
 receives the cloud credentials is the one checked. OpenTofu,
-not the clouds' SDKs: the providers already pinned for `vm create` know each cloud's upload and
-import, and adding three SDK trees to `stowage` would only repeat them. The disk is read back from
+not the clouds' SDKs: each cloud's pinned provider knows its upload and import, and adding three SDK trees to `stowage` would only repeat them. The disk is read back from
 the registry by digest, so the image is exactly what an install fetches; the image is named by
 that digest and its OpenTofu state and id kept in the publisher's cache, keyed by the cloud's
 settings; without them, a probe module looks the image up by name in the account, so it is
@@ -1261,11 +1291,9 @@ through kairos-agent, reboot); `make e2e-kairos` runs it on the local Docker eng
 boot that upgrades and one that goes back. `<short>-stow vm create` writes a new VM's disk (by
 digest, in its platform's format) and its cloud-config (a NoCloud seed ISO, or a cloud's
 user-data), whose settings the first boot installs from; the services the spec names reach the
-host daemon on its app socket with a token. With OpenTofu, `vm create` creates the VM on TrueNAS
-and waits until it has installed, and `vm destroy` removes it; `make e2e-vm` does both on a real
-TrueNAS host. The other canonical platforms (libvirt, Proxmox VE, vSphere, AWS, Google Cloud,
-Azure, Scaleway) have built-in modules as previews, and any platform takes the operator's module holding the
-same contract (`--module`). Next: the mirror for sites without internet (`mirror export` / `import`, a CA on
+host daemon on its app socket with a token. `vm seed --json` gives an OpenTofu root the same
+material, which makes the VM (§ "Stowage owns no infrastructure state"); `make e2e-vm` makes one
+on a real TrueNAS host from a test root of its own. Next: the mirror for sites without internet (`mirror export` / `import`, a CA on
 every shape, the VM end-to-end test upgrading through it), then the health gate.
 
 | Phase | Scope | Proof |
@@ -1510,9 +1538,8 @@ every shape, the VM end-to-end test upgrading through it), then the health gate.
   answer carries the floor, and a client moves past it, so a truncated answer cannot be asked
   for twice. The scheduled backup waits (bounded) for a running job rather than lose its day to
   a short one (a verify). A check that may outlast a client's
-  deadline (backup verify) is a job, so its answer is never lost to a hop that gives up. A VM is created by `<short>-stow` with OpenTofu (a built-in module per
-  canonical platform, TrueNAS's proven and the others previews, or the operator's; sizing asked,
-  the disk and the cloud-init seed given to `tofu apply`) or by hand.
+  deadline (backup verify) is a job, so its answer is never lost to a hop that gives up. A VM is created by an OpenTofu root of the operator's, from
+  `vm seed --json`, or by hand from `vm create`'s files.
 - **Kairos release on the VM** — the bundle is built before the release is published and serves
   every channel it is promoted to, so its `<short>-stow` carries the manifest without its
   publication (`bundled.json`: no channel, tag, number, date, yank or artifact beyond the images),
@@ -1553,19 +1580,14 @@ every shape, the VM end-to-end test upgrading through it), then the health gate.
   answers on a public address from its first boot, so `vm create` defaults SSH's sources to this
   machine's public address (asked of a plain-text echo service, the one fact it cannot see from
   here behind a NAT), and refuses rather than open SSH to the internet when it cannot learn it.
-  A cloud's network firewall is the platform's, in front of the VM's: a module may declare
-  `ssh_sources` and `open_ports` to make one matching the VM's (the GCP module does, behind its
-  `firewall` variable, off by default: creating firewall rules takes a role that may change every
-  rule of the project, which a deployment account is often refused; while it is off, `vm create`
-  warns, naming the ports the network must open; while it is on, the SSH rule takes IPv4 sources
-  alone, as the instance has no IPv6 address, and sources all IPv6 are warned: no rule is made).
-  `open_ports` carries each L4 route's allowlist as `vm create` is given it, so the platform's
-  rule is narrowed too (defence in depth: an admin route is not held by the VM's firewall alone);
-  the rule is fixed at create, as no later run of Stowage applies the module, so the VM's own
+  A cloud's network firewall is the platform's, in front of the VM's: the seed's `firewall`
+  (`ssh_sources`, `open_ports`) is what the VM's own opens, for a root to make one matching it.
+  `open_ports` carries each L4 route's allowlist as the seed is given it, so the platform's rule
+  is narrowed too (defence in depth: an admin route is not held by the VM's firewall alone); the
+  rule is fixed when applied, as the VM's later changes do not reach the root, so the VM's own
   firewall stays the one that follows a re-run's allowlist, and a narrower platform rule then
-  fails closed. A cloud's disk image is a state of its own (the module's `image/`), keyed on the
-  disk's digest and its place, so VMs of one disk share one upload and `vm destroy` of one leaves
-  it for the next: an image is the release's, not a VM's. The route's service is on the host's
+  fails closed. A cloud's disk image is the release's, not a VM's: `ship --disks` registers it
+  once (`cloud_publish`), and the seed names it. The route's service is on the host's
   network, so its traffic meets the input chain, which drops by default: the allowlist is an
   input rule under /run, and a boot drops the port until the install's start writes it again
   (fail closed), though Docker restarts the service before that start. A bind address is a
@@ -1720,48 +1742,58 @@ every shape, the VM end-to-end test upgrading through it), then the health gate.
   build asserts sshd's effective settings (`sshd -T`), and a unit test reads the image's drop-ins
   with kairos-init's (a copy of the pinned release's, in testdata) in sshd's order, so a setting
   the drop-ins would not give fails `make check` before a build does.
-- **Creating a VM with OpenTofu** — `<short>-stow` embeds a module per canonical platform:
-  TrueNAS (proven by `make e2e-vm`), and as previews libvirt/KVM, Proxmox VE and vSphere on
-  premises, AWS, Google Cloud, Azure and Scaleway in the clouds — each uploading the disk the platform takes
-  and the cloud-config (seed ISO on a hypervisor, user data on a cloud), creating and starting the
-  VM, and destroyed by `vm destroy`. A preview is a module not run on its platform yet: checked by
-  `tofu validate` against its pinned provider only, marked in README and in `vm create`'s output,
-  which names the manual steps as the fallback (by hand is its default on a terminal); it loses
-  the mark at its first passing run. libvirt's module gives each disk by its volume's path, never
-  as a pool volume: the AppArmor driver's `virt-aa-helper` writes a file disk and its backing
-  chain into the domain's profile, and resolves no pool volume, so confined QEMU could open none
-  of them. The provider defines then starts a domain and records neither when the start fails;
-  rather than `vm destroy` reaching past the state (a `virsh` on the operator's machine, which
-  the pure-Go provider does not need), the failed apply names the `virsh undefine` that removes
-  it. Its lists are written in the order libvirt returns them (the firmware's features by name):
-  the provider compares a read-back list by position, and fails an apply on another order.
-  e2e-kairos applies it through `vm create` against libvirtd in a container, as Ubuntu LTS
-  packages it, with `domain_type: qemu` (no KVM there): the domain must be defined and run, a plan
-  right after the apply must change nothing (which catches any attribute libvirt normalizes), and
-  `vm destroy` must leave no domain, volume or NVRAM file. The guest's boot, SSH and install wait
-  for a host with KVM, as does AppArmor's confinement (the container runs none).
-  Any other platform is the operator's own module
-  (`--module`), holding one contract: the variables `vm create` writes (name, size, the disk and
-  the seed, their SHA-256; the administrator and key when declared), the outputs it reads (`id`,
-  and `address` for a platform that only tells the address after the apply, as clouds do), and
-  `$STOWAGE_CTL` for steps the provider cannot declare. A platform's own settings are module
-  variables (`--tofu-var`, asked from the module's own descriptions), never a credential: each
-  provider reads those from the environment, so none enters the variables or the state. `vm
-  create` asks "OpenTofu or by hand" and, with OpenTofu, sizes the VM after the product's
-  questions, applies the module, and waits over SSH until the VM has installed.
-  `tofu` is the operator's own, on `PATH`: OpenTofu is a tool operators install and upgrade, not
-  one a product should vendor. The provider (`pjsalty/truenas`, community, over TrueNAS's JSON-RPC
-  API) is pinned exactly. What it cannot declare — the bytes of the disk and the seed, power,
-  the snapshots that block a delete — are steps of `<short>-stow` itself (`vm truenas …`, Go, the
-  JSON-RPC API and `/_upload/`), run by local-exec with `STOWAGE_CTL`: no Python, no
-  `genisoimage`, nothing to install beyond `tofu`. The disk comes from the registry by digest
-  through `<short>-stow` (the pull account it carries), never a URL OpenTofu fetches, and is checked
-  again against its SHA-256 before the upload. The API's address and key are read from the
-  environment by the provider and the steps alike, so no credential enters the variables or the
-  state. Each VM's module, variables and state live in `$XDG_STATE_HOME/<name>/vms/<host>/` (an
-  operator's own state, like any OpenTofu root), and `vm destroy` removes the VM and that
-  directory. The wait is SSH plus `<short>-stow status --json`, not an HTTP probe: SSH proves the
-  administrator's access, and the status the install itself.
+- **Stowage owns no infrastructure state** — a VM is created by an OpenTofu root of the
+  operator's, never by Stowage: `vm seed --json` prints what the VM needs (its disk by digest and
+  per platform, the seed, its NICs, its size, what its platform's firewall lets through, the
+  one-time host key's line), and the provider (`norvexlabs/stowage`, its own repository) reads it
+  (`stowage_vm_seed`) and waits for the install; the platform's own provider makes the VM, and
+  OpenTofu holds the state, its lock and its interruption. Each platform is a complete example in
+  the provider's docs, which the operator copies; published per-platform modules may follow.
+  Rejected: modules embedded in `<short>-stow` and applied by it with a state of its own — a second
+  owner of the VM beside any root the operator keeps, recovery logic (locks, interrupted applies,
+  drift refusals) OpenTofu already has, and every platform's provider pinned into Stowage's release. The size and firewall the seed
+  carries are computed by the code that sized and fenced those VMs, so a root makes the same VM.
+  The verbs that still reach a VM over SSH from the operator's machine (`vm host-key`, `vm kit`)
+  take its host key on the command line (`--known-hosts-line`), as nothing records it.
+  TrueNAS's provider (`truenas/truenas`) cannot yet put a file on the host, convert an image into
+  a zvol, or stop a VM before its devices are deleted: those are `<short>-stow vm truenas
+  import-image|seed|stop` (Go, the JSON-RPC API and `/_upload/`), run by the TrueNAS example's
+  local-exec steps — a stopgap listed in TODO.md until that provider covers them. Each is safe to
+  run again, as a failed create-time provisioner taints its resource: `import-image` records the
+  image in a ZFS user property of the zvol (`org.stowage:image`, `importing:` while it writes),
+  so a re-run skips a zvol holding the image, resumes one it began, and refuses one holding
+  anything else or used by a VM's device — never overwriting data it did not write. Without the
+  property, a zvol is empty only while its `logicalreferenced` (bytes before compression) is at
+  most what a zvol never written shows, measured each run on a reference zvol made beside it and
+  deleted, not a constant (one ZFS release's value is no other's): its compressed size cannot
+  tell, as a mostly-zero filesystem compresses below any bound worth setting. Runs overlap — a
+  root's parallel resources, a tainted one applied again, two operators — and point-in-time
+  checks (a job list, the mark read once before an hour-long upload) let two of them write one
+  zvol or one staged file. So the reference zvol is also the run's lock: made at the start, held
+  to the end, its creation atomic on TrueNAS (a name that exists is refused), its nonce naming
+  the run. No run takes over another's lock, whatever its age: a takeover reads, then deletes, and
+  between the two the lock may have changed hands, while a lock left by a run cut off is rare
+  and its owner's jobs are visible on TrueNAS — so the refusal names the lock and the jobs to
+  check — no `tofu apply` or `import-image` of that zvol on any machine, and no TrueNAS job of
+  it — and the operator deletes it. With that, a run deletes only a lock whose run property it
+  read as its own (recursively: the property proves it Stowage's, and a periodic snapshot must
+  not pin it), and between its read and its delete the lock stays its own; an operator deleting a
+  live lock against the refusal's conditions voids the exclusion, which nothing here can restore.
+  The refused runs succeed on the next apply. The image is opened before the lock is taken, so
+  a missing one leaves nothing behind. The image is read
+  once, hashed as it is sent, under a name of the run's own and of the zvol's (emptied after, as
+  the API deletes no file; only once the upload began), so the bytes converted are the bytes checked, and a wrong digest
+  costs one upload; the mark, the zvol's devices and the lock are read again before the zvol is
+  marked, so nothing that changed during the upload is written over. A convert is never aborted:
+  TrueNAS's abort cancels the job's coroutine and marks it ABORTED while the thread running
+  `qemu-img` writes on, hiding the writer. So only SUCCESS and FAILED end a convert (the
+  middleware fails one once its `qemu-img` has exited: the process is waited for as its block
+  ends): a convert cut off is waited for, a SUCCESS then marks the zvol written (the cut-off a
+  warning), and one in any other state — still running, ABORTED, gone or unread — keeps its lock
+  and staged file, named for the operator. A convert call whose answer was lost looks for its
+  job (its source names the run): none means nothing ran, and the run ends as any failure does. TrueNAS queues one convert behind the
+  running one and answers a further call with the queued job, so the job handed back is checked
+  to be the run's own before it is waited for.
 - **The app's access to the host** — the daemon serves its whole API (the reference app drives
   status, updates, upgrade and power from its console) on a second socket, which only the
   services the spec names mount, in a directory a container cannot write; every request carries
@@ -1843,22 +1875,21 @@ every shape, the VM end-to-end test upgrading through it), then the health gate.
   the first install waits); then a backup is restored. Kubernetes writes and takes the same file
   (`k8s secrets export`, `k8s install --secrets`): one format, so a file restores on any shape
   where its keys apply; its hook's wait is a label on the outputs Secret, which `k8s provision`
-  removes, as the cluster keeps no install directory for a marker file. That SSH is pinned: `vm create` gives the
+  removes, as the cluster keeps no install directory for a marker file. That SSH is pinned: the seed gives the
   VM a one-time host key in its cloud-config and refuses any other, as a first contact taking
   whatever key answers would hand the secrets to whoever answered first. The key is a secret of
   little worth: it is served only until the install (from `/run`, so not past a reboot), then
   marked retired on the OEM partition, which a reset keeps and the recovery system mounts too, so
-  no later boot serves it, and the VM's own key, read through it, is what `vm create` keeps;
+  no later boot serves it, and the VM's own key, read through it (`vm host-key`), is what the
+  operator keeps;
   anyone reading the seed or the metadata service later finds a key no system of the VM offers.
   A handoff kit (`internal/kit`) seals a `Given` with a code rather than to an age public key: age has
   no sender authentication, so anyone could forge a kit to a public key, and a kit sets what an install
   trusts (CAs, URLs); age refuses a scrypt file with any other recipient, so a file made without the
   code does not open. The most scrypt work a kit may ask is what Stowage seals with, as it is paid
-  before the code is known. `vm create --kit` opens the kit where it runs and gives the result as any
-  Given: the material is already on that machine's disk until the install took it, so a step copying
-  the sealed kit and asking the code on the VM would protect nothing more for a second way to fail.
-  `vm kit` does the same for a VM that already runs, from the operator's machine over the SSH link
-  `vm create` pinned (the host key in the VM's state, as `vm attach`): `take` opens the kit here and
+  before the code is known. `vm kit` takes a kit for a VM that runs, from the operator's machine over an
+  SSH link pinned to the key `--known-hosts-line` gives: `take` opens the kit here (a step copying
+  the sealed kit and asking the code on the VM would protect nothing more for a second way to fail) and
   sends a `Given` to the VM's `install --given -`, and `create` runs the VM's `kit create --json`,
   whose request (answers included) travels on standard input and whose kit and code come back on
   standard output, so neither the code nor a secret answer reaches the VM's disk, process list or
@@ -2110,11 +2141,14 @@ every shape, the VM end-to-end test upgrading through it), then the health gate.
   initramfs stage so the booted system's udev names it, and renamed at the first boot when it was
   named before; the firewall's `iifname`, the routing's drop-ins and `tune` then name the role,
   whatever the hardware calls it. A VM of one such NIC needs no MAC (its original name is
-  matched): a cloud, whose NICs' MACs are its own, takes one; a hypervisor's are generated
-  (random, written once into the seed and the module's variables: two VMs of one host name never
-  share one), a server's are always given (it may have more ports than the release names). A VM
+  matched, then pinned to its MAC by the first boot, below): a cloud, whose NICs' MACs are its
+  own, takes one; a hypervisor's several are generated (random, written once into the seed and
+  printed for the root: two VMs of one host name never share one), a server's are always given (it may have more ports than the release names). A VM
   keeps its NICs as its cloud-config named them: the override matches what the seed's own file
-  matches, never a guess from the running release; a port on a role no NIC is named for fails
+  matches, never a guess from the running release (that file not reading refuses `network set`
+  of the primary, and at boot leaves the override an earlier boot rendered as it is, said on the
+  log and the banner: dropping it or matching every NIC would each change the network on a
+  guess); a port on a role no NIC is named for fails
   closed (warned), as opening it on the other interfaces is what the role was declared against.
   An optional role is a NIC some sites have and others do not: its absence is the machine's shape,
   not drift, so it is neither reported nor warned, and `vm create` makes it only on demand — a
@@ -2126,12 +2160,67 @@ every shape, the VM end-to-end test upgrading through it), then the health gate.
   project's own `all` value is its decision, and a NIC's or `default`'s value below `all`'s is refused at lint
   rather than overridden in silence (the kernel takes the larger), naming the `all` key to set. The VM alone: a Docker host's ARP is its operator's (an address on
   `lo`, a VIP, answers on any NIC there by design).
-  A NIC a later release names is attached (`vm attach`, `network attach`) rather than the VM made
+  A NIC a later release names is attached (on its platform, then `network attach`) rather than the VM made
   again, which would lose its data: the seed is pulled once, at the first boot, so the NIC is
   recorded on the VM and written as a cloud-config of its own on the OEM partition, which every boot
-  runs after the seed's — its `.link` in the initramfs stage too, so udev names it from the start
-  and no rename races the seed's MAC-less primary link, which it names by its MAC (09-, ahead of
-  the seed's 10-). The platform's NIC goes through the module's state, index 0 untouched, and
+  runs after the seed's — its `.link` in the initramfs stage too, so udev names it from the start.
+  A seed's MAC-less link (one NIC role) would let a NIC added later take the role's name, so the
+  pin is made at the source, where it is certain: the VM's first boot, the one moment the VM has
+  that NIC alone, pins it to its MAC and its own driver (the seed's own 10- `.link` replaced by
+  one matching both, so the role has one `.link` and the original-name match is gone — a 09- file ahead of it
+  would leave that match for any NIC the pinned one is not; written at every boot by a
+  cloud-config of its own on the OEM partition, which a reset keeps, sorting after the seed's,
+  whose step writing the file skips once the pin reads whole, so neither yip's order nor a race
+  between the two decides the file), and only when exactly one free NIC is there
+  and it holds the role's name — never a guess later, when the order the platform and `network
+  attach` ran in could hand the name to the wrong NIC. A free NIC is one no attached role's
+  `.link` names by its MAC (another role's NIC is never taken, whatever order the boots and
+  attaches came in) and not a virtual function beside its NIC (below). Generating a MAC for the
+  one NIC instead would break a VM made by hand (no platform step passes it) and a root that
+  seeds again (a new MAC strips the installed NIC's name); the pin needs neither, and serves a
+  cloud alike, whose MAC is known only once the NIC exists. A NIC replaced on the platform loses
+  the pin's match: a boot finding no NIC that the pin's MAC and `Driver=` value match, as udev
+  matches them, and exactly one free NIC pins that one and names it the role at once (as the
+  seed's rename does: the `.link` file, written before udev ran, no longer matched it) — one NIC
+  is as certain as the first boot; with none or several it guesses nothing and says so. The pin
+  is read by one parser, which accepts only a `Driver=` value the pin writes and the pin's
+  cloud-config whole; anything else is no pin, written again.
+  An accelerated networking's virtual function (Azure's: `mlx4_en`, `mlx5_core`, `mana`) has its
+  NIC's MAC. A driver list cannot tell it from a physical NIC of the same driver (a Mellanox
+  server's), so the NIC count leaves out a NIC another enslaves (`/sys/class/net/<nic>/master`,
+  in Go and in the boot's shell alike): hv_netvsc enslaves its virtual function as the VF
+  registers, before udev renames it (the kernel's `netvsc_vf_join`, from the `NETDEV_REGISTER`
+  notifier; Microsoft's dmesg shows `joined to eth0` before `renamed from eth1`), and by the
+  boot stage that counts, udev has settled; one not enslaved yet, of those drivers and of the MAC
+  of a NIC of another driver, is left out too. One rule gives the `Driver=` value of a `.link` by
+  MAC, the pin's and `network attach`'s alike, from the NIC's driver (`ID_NET_DRIVER`, the very
+  value `Driver=` matches — `mlx4_en`, not the PCI device's `mlx4_core`): a virtual function's
+  driver is matched itself (that NIC is a physical one of it: leaving them out would never name
+  it); any other, or none known, leaves the virtual functions' drivers out. Matching any other
+  driver exactly would lose the NIC at a change of its model keeping its MAC (virtio_net to
+  e1000); leaving the virtual functions out is all a match by MAC needs to never name one. The
+  original-name match, which cannot know the NIC's driver, leaves them out too. A `.link` by a
+  MAC the seed is given (several roles) matches that MAC alone. `network attach`, which runs on
+  the VM, reads the NIC's driver as the pin does (`ID_NET_DRIVER` of the NIC's ifindex, in Go and
+  in the boot's shell) when the NIC is there — of several NICs of the MAC, the one whose driver
+  is not a virtual function's, else refused, as which one is the NIC is not known — and records
+  it in `interfaces.yaml`; with the NIC not there yet it records none — a physical NIC of those
+  drivers attached before it exists is named only once a run again with it there records its
+  driver. A run again keeps the recorded driver for the same MAC while the NIC is absent: the
+  record is the only place it survives. Two attaches at once would each write the record whole
+  from what it read, so one would drop the other's NIC: they take a lock in the install
+  directory. The hint for a role recorded and there says it is named from the next boot only when
+  the link as written matches the NIC's driver, and names the run that rewrites it otherwise.
+  The primary's override, while the cloud-config's network does not read, cannot be rendered
+  (which NIC it matches is not known, and matching every NIC is never right): the boot leaves the
+  file an earlier boot rendered, and the daemon's start leaves it too; a change awaiting
+  confirmation then is undone by removing its file — the settings before it cannot be rendered,
+  and keeping a change never confirmed is the one outcome a window exists to prevent — so the
+  cloud-config's settings apply, and the banner and `network` say so.
+  A VM seeded before the pin (0.40.0) is not migrated: no code reaches its seed, so its NIC is
+  pinned by hand (a cloud-config on the OEM partition, documented in vm.md), and a record of
+  0.39.0's `network attach` pins (`pin: true`) is refused naming that fix, rather than read.
+  The platform's NIC goes through the module's state, index 0 untouched, and
   TrueNAS's power step restarts the VM, as a device applies at a start; the other platforms' are
   attached by hand until one is asked for. The routing and MTU are
   the image's drop-ins (the release's, so each system boots with its own), the addressing the
@@ -2308,11 +2397,11 @@ every shape, the VM end-to-end test upgrading through it), then the health gate.
   Lint can only say the percent is never reached where every host is bounded below: a VM's
   `size.min`, not a Docker host of any size.
 - **The VM's size is the release's to state** (`shapes.kairos.size`): the project knows what its
-  stack needs, the operator the hypervisor, so `vm create` takes `recommended` as its default,
-  refuses under `min` and only logs under `recommended`. It is read where a VM is made, never on
-  it, so it stays out of the OS bundle's view (as the disk formats do) and changes the installer
-  alone. A module that sizes by its own instance type gets the size as a log line: Stowage cannot
-  map an instance type to CPUs and memory.
+  stack needs, the operator the hypervisor, so `vm seed` gives it (`size`: `recommended` the
+  default, `min` the least) for a root to default to, refuse under and warn under, and `vm
+  create`'s steps state it. It is read where a VM is made, never on it, so it stays out of the OS
+  bundle's view (as the disk formats do) and changes the installer alone. A root that sizes by an
+  instance type checks it itself: Stowage cannot map an instance type to CPUs and memory.
 - **A test release is the project's, overridden at open** (`--test-registry`, `--test-key`,
   `--test-public-key`, `--shapes`): every command that opens the project sees the same release,
   so a test run ships, verifies and promotes without a rewritten spec, and the publish and trust
@@ -2460,9 +2549,9 @@ provider (TrueNAS, a cloud) creates the VM from its user-data, meta-data and dis
 `--disk-dir` writes, sized by `disk_gib`, or a cloud's `cloud_image`). The private host key sits
 in state until the VM is installed, then `vm host-key` retires it and gives the VM's own key;
 state encryption is advised. `secrets_wo` on the VM is a seed made with `--await-secrets`, its
-export given over SSH at create; a `byo` certificate, `--tls byo`, given the same way. This replaces nesting
-`vm create --create opentofu`, a second OpenTofu root with its own state, inside the first;
-`vm create` keeps its built-in modules for operators who do not write OpenTofu.
+export given over SSH at create; a `byo` certificate, `--tls byo`, given the same way. Stowage
+itself creates no VM (§ "Stowage owns no infrastructure state"): the platforms' roots are the
+provider's examples, and `vm create` writes the files for an operator who makes the VM by hand.
 
 The provider is released from its repository (GoReleaser, the registry's signed checksums), pushed
 only by the org's GitHub App like Stowage, and can be mirrored into the project registry through

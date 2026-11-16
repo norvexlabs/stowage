@@ -194,7 +194,7 @@ sudo <short>-stow network attach --role ROLE --mac MAC [--mode dhcp|static|none]
   `--yes`; and what the host daemon refuses, below. On `rollback`: no terminal to confirm on
   without `--yes`, and what the daemon refuses. An operator's "no" at a prompt (`aborted`:
   `install`'s form, `upgrade`, `rollback`, `restore`, and on the operator's machine `vm
-  create`'s confirmation and `vm destroy`'s) is a refusal too. Every verb that asks the host
+  create`'s confirmation) is a refusal too. Every verb that asks the host
   daemon exits `3` on an error answer marked `refused` (a refusal, the daemon having changed
   nothing; its `fix` when it has one) and `1` on any other: the daemon refuses an upgrade to a yanked release (the
   channel's, or `--version`'s), to a version or revision not published on the channel, to one
@@ -712,26 +712,117 @@ sudo <short>-stow network attach --role ROLE --mac MAC [--mode dhcp|static|none]
   `` `<short>-stow network set --role <role>`: `` and the override's settings, or by `the
   cloud-config or \`network attach\``), and the change awaiting confirmation, a secondary's
   named with its role (`roles` and `pending.role` in `--json`).
-- `network attach` (as root; `vm attach` runs it) names and addresses a NIC the VM's
+- `network attach` (as root; then add the NIC on the VM's platform and restart the VM, or
+  `sudo <short>-stow reboot` when the NIC is there already, in either order:
+  [vm-create's](vm-create.md#creating-the-vm-with-opentofu)) names and addresses a NIC the VM's
   cloud-config does not name, for a secondary role of the release's `host.interfaces` (`kind:
   nic`), from the next boot: by its `--mac` (a unicast MAC), with `--mode` `dhcp`, `static` with
   `--address` (IPv4 with its prefix) or `none` (the default: the link up, no address), as `vm
-  create --interface` addresses a secondary. It records the NIC in `<dir>/interfaces.yaml` and
+  create --interface` addresses a secondary. It records the NIC in `<dir>/interfaces.yaml`
+  (`role`, `mac`, `driver`, `mode`, `address`) and
   writes `/oem/96_<name>-interfaces.yaml`, a cloud-config every boot runs after the seed's: its
-  `/etc/systemd/network/09-<name>-<role>.link` (by MAC; 09- sorts before the seed's 10- files) in
-  the initramfs stage, before udev names the NICs, and its `10-<name>-<role>.network` at boot
-  (the release's MTU and routing drop-ins apply to it). A NIC the seed named by its original name
-  alone (a VM made by a release with one NIC) is named by its MAC too, the MAC of the NIC its role
-  names now (`<role>: its NIC (<MAC>) is named by its MAC from the next boot, as another NIC joins
-  it`), so the new NIC never takes its name. Given again for a role, it replaces the role's MAC
+  `/etc/systemd/network/09-<name>-<role>.link` (09- sorts before the seed's 10- files) in the
+  initramfs stage, before udev names the NICs, and its `10-<name>-<role>.network` at boot. The
+  `.link` matches the NIC by two lines, `MACAddress=<mac>` and `Driver=<value>`, the value the
+  same rule as the first boot's pin ([vm-create's](vm-create.md) "The NICs"), from the driver
+  recorded as `driver`: the NIC's own driver as udev records it (`ID_NET_DRIVER` in
+  `/run/udev/data/n<ifindex>`), read when the NIC is there at the attach (a NIC of a device with
+  that MAC, not enslaved):
+  - a driver of an accelerated networking's virtual function (`mlx4_en`, `mlx5_core`, `mana`: a
+    physical NIC of one, a Mellanox NIC on metal): `Driver=<driver>`, so that NIC is named;
+  - any other driver, or none (the NIC not there yet, attached before the platform adds it, or
+    udev recording no driver of it): `Driver=!mlx4_en mlx5_core mana`, which leaves the virtual
+    functions out (Azure's, enslaved to `hv_netvsc`, of its MAC), and still matches the NIC after
+    a change of its model keeping its MAC. The limit: a physical NIC of one of those drivers
+    attached before it is there is not named until `network attach` is run again, same flags,
+    once the NIC is there (and `sudo <short>-stow reboot`): that run records its driver. Run again
+    for the same role and MAC while its NIC is not there, the driver recorded is kept; another
+    MAC drops it.
+
+  Several NICs of that MAC there (a virtual function beside its NIC before the NIC enslaves it),
+  the one whose driver is not a virtual function's is the NIC; with no such one alone, the
+  attach is refused: `--mac <mac>: the VM's NICs <nic> (<driver>), … all have it, and no one alone
+  is told apart from a virtual function's (mlx4_en, mlx5_core, mana): which one is the NIC is not
+  known` (fix `give each NIC its own MAC on the VM's platform, then run this again`; a NIC udev
+  records no driver of is named `(no driver udev records)`). One attach runs at a time: it holds
+  `<dir>/interfaces.lock` while it reads `<dir>/interfaces.yaml` and writes it and the
+  cloud-config, so two at once each keep the other's NIC.
+
+  The release's MTU and routing drop-ins apply to its `.network` file. A NIC the seed named by its original name alone (one NIC role, its MAC
+  not given) had the seed's `.link` file replaced by one matching its MAC and driver by the VM's boot
+  ([vm-create's](vm-create.md) "The NICs"), so the new NIC never takes its name, whichever
+  order the NIC and the attach come in. It prints `<role>: the NIC <mac> is named and addressed
+  (<mode>) from the next boot: ` and what is left: `the NIC is there: `sudo <short>-stow reboot`
+  names it` (a NIC of a device has that MAC), `add the NIC on the VM's platform, then restart the
+  VM: the boot names it` (none has; a NIC another enslaves, a virtual function of that MAC, is
+  none), followed, when no driver is recorded, by `; its driver unread (no NIC there, or none
+  udev records), its link leaves out a virtual function's drivers (mlx4_en, mlx5_core, mana): a
+  NIC of one of them is named once this is run again with the NIC there`; the VM's NICs, or the
+  NIC's `ifindex`, unread, it is refused with the error, before anything is written (a NIC gone between the listing of the VM's NICs and the read of its MAC or `ifindex` is none). Given again for a role, it replaces the role's MAC
   and addressing (applied at the next boot, with no window: `network set --role` re-addresses
   with one, and its override outranks this addressing). Refused: a role that is not one of the release's
-  NICs, the primary (`network set` addresses it), a role the cloud-config names, a MAC another
-  recorded NIC has, that the cloud-config names another NIC by, or that a NIC named as another
-  role has, `--address` without `static` or `static` without an IPv4 one, a mode other
-  than the three, a seed's NIC to pin that no NIC is named for now, and a run not as root. The
+  NICs, the primary (`network set` addresses it), a role the cloud-config names (its `.link` file
+  there; one whose presence does not read refused with the error, its fix ``restore it as the
+  VM's cloud-config writes it (`sudo <short>-stow reboot` writes it again), then run this
+  again``), a role while the cloud-config names one by its NIC's original name, not pinned to
+  its MAC (a VM seeded before 0.40.0, or one whose first boot did not pin it: a NIC added may take
+  that name; ``--role <role>: the VM's cloud-config names <pinned role> by its NIC's original
+  name, not pinned to its MAC: a NIC added may take its name``, a refusal, fix ``pin it first: by
+  hand, as "A VM seeded before 0.40.0" in docs/vm.md says, or, on a VM seeded by Stowage 0.40.0
+  or later, leave its NIC the VM's only one and restart the VM, whose boot pins it to that NIC's
+  MAC; then run this again``), a MAC another
+  recorded NIC has, that the cloud-config or its first boot's pin names another NIC by, or that a
+  NIC named as another role has, `--address` without `static` or `static` without an IPv4 one, a
+  mode other than the three, and a run not as root. The
   install's warning about a role no NIC is named for counts these NICs once a boot named them (a
-  NIC recorded and never attached names none: the warning stays).
+  NIC recorded and never attached names none: the warning stays, saying so). A
+  `<dir>/interfaces.yaml` of Stowage 0.39.0 or earlier holding an entry with `pin: true` (that
+  release's `network attach` pinned the seed's NIC so) is refused, by `network attach` and by
+  `network set --role` and the install's warning that read it: ``<dir>/interfaces.yaml has a pin
+  entry from Stowage 0.39.0 or earlier: remove its entries with `pin: true` (the first boot pins
+  the NIC itself now), then run this again; this VM's cloud-config, from before 0.40.0, does not:
+  pin its NIC by hand first, as "A VM seeded before 0.40.0" in docs/vm.md says`` (fix ``pin the
+  VM's NIC by hand ("A VM seeded before 0.40.0" in docs/vm.md), remove the entries with `pin:
+  true` from <dir>/interfaces.yaml, then run this again``); one that does not decode otherwise
+  (strictly read) is refused the same way, naming the file and the decoder's error (fix `fix
+  <dir>/interfaces.yaml (a list of role, mac, driver, mode and address), or remove it and run
+  `network attach` again for each NIC it held`). `network set --role` of a role no NIC is named
+  for, whose hint reads that file, answers either refusal 409 as the role's (`role <role>: no NIC is named so on this VM: <refusal>`), its fix kept, and changes nothing.
+
+  **A VM seeded before 0.40.0** has no pin: its seed names its only NIC by its original name, so
+  a NIC added later may take the role's name, and `network attach` does not pin it (it refuses
+  the primary). Before adding a NIC to it, pin that NIC by hand, as root on the VM, `<role>` its
+  role (the NIC's name, `ip link`) and `<name>` the project's name:
+
+  ```sh
+  mac=$(cat /sys/class/net/<role>/address)
+  drv=$(udevadm info -q property -p /sys/class/net/<role> | sed -n 's/^ID_NET_DRIVER=//p')
+  case "$drv" in mlx4_en|mlx5_core|mana) ;; *) drv='!mlx4_en mlx5_core mana';; esac
+  cat > /oem/96_<name>-<role>-pinned.yaml <<EOF
+  #cloud-config
+  stages:
+    initramfs:
+      - name: "<name>: the interface <role> pinned to its NIC's MAC"
+        files:
+          - path: /etc/systemd/network/10-<name>-<role>.link
+            permissions: 420
+            content: |
+              [Match]
+              MACAddress=$mac
+              Driver=$drv
+
+              [Link]
+              Name=<role>
+  EOF
+  sync /oem/96_<name>-<role>-pinned.yaml
+  ```
+
+  The `Driver=` line follows the pin's rule: the NIC's own driver when it is a virtual
+  function's (a physical NIC of one), else the virtual functions' drivers left out. Every boot
+  from the next one writes the role's `.link` file by that MAC and driver after the seed's step (`96_` runs after `95_userdata`), so no NIC added later takes the role's name. Then
+  remove the `pin: true` entries of `<dir>/interfaces.yaml`, if any, and attach the NIC: the next
+  `network attach` writes `/oem/96_<name>-interfaces.yaml` without that release's pin, which the
+  one above replaces.
 - `network set` sets an override that outranks the cloud-config's network, as a whole (a setting
   left out is not kept from before): `--mode static` with
   `--address` (IPv4 with its prefix, 1 to 32) and an optional `--gateway`, or `--mode dhcp`
@@ -823,7 +914,65 @@ sudo <short>-stow network attach --role ROLE --mac MAC [--mode dhcp|static|none]
   the cloud-config or `network attach` gave the role. One change awaits confirmation at a time,
   across the primary and the secondaries. Refused before anything changes: the primary's role
   (`network set` without `--role`), a role that is not one of the release's secondary NICs, a
-  role no NIC is named for on the VM (409: `vm attach` attaches one), a gateway, IPv6 or DNS
+  role no NIC is named for on the VM (409, a refusal, exit 3, on every case: `role <role>: no NIC
+  is named so on this VM: <case>`, its fix `<what names it>, then set its network`; below, each
+  as `<case>: <what names it>`, the install's warning's words, by what names the role): the
+  cloud-config by a MAC no NIC has,
+  ``the VM's cloud-config names it by its MAC (<mac>): add the NIC of that MAC on the VM's
+  platform (or fix the MAC of the one there) and restart the VM`` — `network attach` refuses such
+  a role; by a MAC one NIC has, ``…, and its NIC is here: `sudo <short>-stow reboot` names it``;
+  by a MAC several NICs have, ``…, and <n> NICs of this VM have that MAC, so the boot names none
+  of them: remove the other NICs with that MAC on the VM's platform (or give each a MAC of its
+  own) and restart the VM``; the boot's pin (its `.link` file matching a MAC and a `Driver=`), its NIC gone, ``the
+  VM's boot pinned it to its NIC's MAC (<mac>, Driver=<value>), and no NIC of that MAC is on this
+  VM: leave one NIC on the VM that no other role names (remove the others on its platform[ but
+  the NICs `network attach` recorded, which keep their roles: <role>'s <mac>, …]) and restart
+  the VM, which pins the role to that NIC``, or there of a driver the pin does not match, ``…,
+  and the NIC of that MAC here has the driver <driver>, which the pin does not match: <the same
+  fix>``, or there and matched, ``…, and its NIC is here: `sudo <short>-stow reboot` names it``;
+  its NIC here (by the seed's MAC or the pin) while another device holds the role's name, ``…,
+  and its NIC is here, but another device holds the name <role> (MAC <mac>, or no MAC): remove or
+  rename that device (or remove the record that names it so: its .link or .netdev file), then
+  `sudo <short>-stow reboot` names it``;
+  a `.link` file naming neither a MAC nor an original name (empty, cut short or foreign), ``its
+  .link file <path> names no NIC (neither a MACAddress= nor an OriginalName=): restore <path> as
+  the VM's cloud-config writes it: `sudo <short>-stow reboot` writes it again``; `network attach` recorded it and its NIC is there, its link matching the NIC's driver
+  as written (`Driver=` as above, matched as udev matches it), ``its NIC (<mac>) is recorded and
+  there, and is named so from the next boot: `sudo <short>-stow reboot```; there, its link not
+  matching it (a physical NIC of a virtual function's driver attached before it was there),
+  ``its NIC (<mac>) is recorded and there, but its link matches Driver=<value> (the driver
+  recorded: <driver, or none>), not the NIC's (<its drivers, or none udev records>): `sudo
+  <short>-stow network attach --role <role> --mac <mac> --mode <mode>[ --address <address>]`,
+  run with the NIC there, records its driver, then `sudo <short>-stow reboot` names it``; recorded and not
+  there, `its NIC (<mac>) is recorded, and not on this VM yet: add it on the VM's platform with
+  that MAC and restart the VM`; nothing, ``none is recorded for it: `sudo <short>-stow network
+  attach --role <role> --mac <its MAC>` records one, named from the next boot: add that NIC on
+  the VM's platform and restart the VM``; the cloud-config by its original name, never pinned,
+  ``the VM's cloud-config names it by its original name, as the VM's only NIC: leave its NIC
+  alone on the VM (remove the others on its platform[ but the NICs `network attach` recorded,
+  which keep their roles: <role>'s <mac>, …]) and restart the VM, which names it (and,
+  for a VM seeded by Stowage 0.40.0 or later, pins it to that NIC's MAC, so NICs added after it
+  keep their names)``; a file the case reads that does not read (a `.link` file, `network
+  attach`'s record, the kernel's or udev's NIC records), a refusal (exit 3), `role <role>: no NIC
+  is named so on this VM: what names one is not known (<error>)`, as the install's warning says
+  it, its fix `restore what does not read (<error>), then set its network`), the primary's change
+  while the cloud-config's network file or `.link` files do not read (409, a refusal: `the
+  network override's NIC: …`, its fix `restore the file that does not read (<error>), or the VM's
+  cloud-config that writes it, then set the network`: which NIC it matches is not known, never
+  every NIC; at boot, `network-boot` then leaves the override file an earlier boot
+  rendered as it is, neither dropped nor matching every NIC, logs `the network override: <error>:
+  its file is left as an earlier boot rendered it` and the console banner says `network:
+  <settings>; set with `<short>-stow network set`; which NIC it matches does not read (<error>):
+  its file is left as an earlier boot rendered it`; `network` keeps the override as its source;
+  with a change awaiting confirmation there, that change's file goes instead, at boot (logged
+  `the network override: <error>: the change never confirmed is undone, its file removed: the
+  cloud-config's settings apply`), at its window's end, at the daemon's start and on `network
+  revert` (logged `the network override: <error>: the change is undone, its file removed: the
+  cloud-config's settings apply`), as the settings before it cannot be rendered: the record holds
+  them, `network` does not name the override as its source, and the banner says `network:
+  <settings> recorded, not in force; set with `<short>-stow network set`; which NIC it matches
+  does not read (<error>): its file is removed, the cloud-config's settings apply`; the daemon's
+  start leaves a file the boot left as it is), a gateway, IPv6 or DNS
   server, an address without `static`, `static` without one, and another mode. Each NIC's revert
   (at its window's end, or tried again while it fails) is its own: another NIC's change leaves
   it armed, and the same NIC's change replaces it. A change awaiting confirmation names

@@ -1,15 +1,17 @@
 #!/usr/bin/env bash
 # End-to-end test of a real Kairos VM on a site without internet: the release goes to a TLS mirror
 # of its own CA that asks for a sign-in (`mirror export`, `mirror import`; the VM's login given by
-# `--registry-login-file` over SSH), `vm create --create opentofu` on a TrueNAS host
-# boots the disk it reads from the mirror, whose first boot installs from the cloud-config, IPv6 on
+# `--registry-login-file` over SSH), a VM the suite's OpenTofu root makes on a TrueNAS host
+# (test/vm-truenas on truenas/truenas, from `vm seed --json`'s disk and seed, with Stowage's `vm
+# truenas` steps; a plan after each apply changing nothing) boots the disk `vm seed` reads from the
+# mirror, whose first boot installs from the cloud-config, IPv6 on
 # (`--ipv6`: the LAN's IPv6 address, SSH and the front reached over it);
 # its firewall lets SSH in from this host alone (`--ssh-allow`) and the front's ports, and an L4
 # route's port from the sources its allowlist holds (this host over IPv4: refused over IPv6, and
 # from every source once a re-run changes the allowlist, through the upgrade's reboot), its service
 # (the database) on the host's network and reached by name from the stack's, in the time
 # zone given (`--timezone`); kits cross between it and a Docker install and a kind cluster beside
-# the suite, both ways, and a second VM's first install comes from `vm create --kit` of a kit Kubernetes
+# the suite, both ways, and a second VM's first install comes from `vm kit take` of a kit Kubernetes
 # issued, with a `byo` certificate and a secret input over the pinned SSH, in no seed; `reset-db` wipes the data and provisions again without a reboot; a
 # backup goes, encrypted, to a WebDAV server on this host — the database and the uploads volume —
 # and `restore` loads both back over newer data; `secrets export` writes the install's secrets encrypted to the operator's key; a newer release crosses the same way and the VM upgrades from the
@@ -17,14 +19,17 @@
 # good; `rollback` takes the VM back to the passive system; a release that never becomes ready
 # fails its health gate, and Kairos falls back to the passive system, whose boot goes back; one that
 # fails it past a rollback barrier is kept, as going back would leave nothing serving;
-# `vm attach` gives the VM a NIC for the role 1.0.1 adds, which `network set --role` re-addresses;
+# the root gives the VM a NIC for the role 1.0.1 adds (truenas_vm_power power-cycles it), which
+# `network attach` names from the next boot and `network set --role` re-addresses;
 # `network set` keeps the lease as a static address, a unique local IPv6 address beside it, and a
-# change not confirmed comes undone at its window's end and at a reboot; then `vm destroy`. Along
+# change not confirmed comes undone at its window's end and at a reboot; then `tofu destroy`, the
+# VM's zvol holding a snapshot (force_destroy), leaves nothing on TrueNAS. Along
 # the way, the machine interface: the VM's `describe --json` and `status --json`, `--json` on its
 # upgrade and rollback, a refusal exiting 3; `vm seed --json` against the mirror, and
-# `--known-hosts-line` on `vm kit check`. Needs Docker
-# (privileged containers, loop devices), network access, about 15 GB on disk under
-# XDG_CACHE_HOME, OpenTofu's `tofu`, ssh, and a TrueNAS host the VM's DHCP lease is registered on.
+# `--known-hosts-line` on every VM verb (the seed's one-time key, then the VM's own `vm host-key`
+# reads). Needs Docker (privileged containers, loop devices), network access, about 15 GB on disk
+# under XDG_CACHE_HOME, OpenTofu's `tofu`, genisoimage, Python's websocket-client, ssh, and a
+# TrueNAS host the VM's DHCP lease is registered on.
 #
 #   STOWAGE_VM_ENV=<file> make e2e-vm        (builds ./bin/stowage first)
 #
@@ -88,7 +93,7 @@ start_zot
 
 step "project, with the kairos shape and its qcow2 and raw disks"
 KAIROS=1 new_project "$PG"
-# Two formats: the site's mirror carries the qcow2 one alone, which vm create boots TrueNAS from.
+# Two formats: the site's mirror carries the qcow2 one alone, which vm seed fetches the TrueNAS VM's disk from.
 sed -i 's/^    disk_formats: \[qcow2\]$/    disk_formats: [qcow2, raw]/' "$P/stowage.yaml"
 grep -qx '    disk_formats: \[qcow2, raw\]' "$P/stowage.yaml" || fail "the disk formats were not edited"
 # A short health gate: the release that never becomes ready falls back sooner.
@@ -98,7 +103,7 @@ grep -q '^    health_gate: ' "$P/stowage.yaml" || fail "no health_gate in the pr
 # the host's network, the database listens on the route's port itself. A kernel argument the
 # active system boots with and the recovery system without (a module's parameter, which nothing
 # reads), and a package of the project's. Its NIC named by a role, the primary (1.0.1 adds a
-# secondary, which `vm attach` attaches).
+# secondary, which the root attaches).
 python3 - "$P/stowage.yaml" <<'PY'
 import sys
 path = sys.argv[1]
@@ -170,18 +175,26 @@ kit_code "$WORK/kit-vm-site.log" "$OP/vm-site.code"
 "${DOCKER_CTL[@]}" kit create second-site --dir "$D" --name site-vm --set SITE_ADMIN=from-docker@notes.test -o "$WORK/docker.kit" >"$WORK/kit-docker.log" 2>&1 || { cat "$WORK/kit-docker.log"; stack_logs >&2; fail "kit create on Docker"; }
 kit_code "$WORK/kit-docker.log" "$WORK/docker.code"
 
-step "vm create --kit, of Kubernetes's kit: the first install takes the byo certificate and the secret over the pinned SSH, and neither is in the seed"
-H_MAIN=$H ADDR_MAIN=$ADDR STATE_MAIN=$STATE
-H=$H-kit ADDR=$H.$DOMAIN STATE=$XDG_STATE_HOME/$NAME/vms/$H
-vm_cleanup
-DOCKER_CONFIG=$MIRROR_CONFIG "$CTL" vm create --no-input --platform truenas --create opentofu --hostname "$H" --user ops --ssh-key "$KEY.pub" \
-	--domains app=app.notes.test,api=api.notes.test --kit "$OP/vm-site.kit" --kit-code-file "$OP/vm-site.code" \
-	--pool "$POOL" --dataset "$DATASET" --bridge "$BRIDGE" --cpus 2 --memory 4096 --disk 16 --host "$ADDR" --wait "${E2E_VM_WAIT:-30m}" \
-	--registry "$SITE" --registry-ca "$MIRROR_CA" --registry-login-file "$MIRROR_VM_LOGIN" \
-	>"$WORK/vm-kit.txt" 2>"$WORK/vm-kit.log" || { tail -80 "$WORK/vm-kit.log"; fail "vm create --kit"; }
-grep -q "^The VM $H runs notes 1.0.0" "$WORK/vm-kit.txt" || { cat "$WORK/vm-kit.txt"; fail "vm create --kit did not report the install"; }
-grep -q 'installing over SSH with ' "$WORK/vm-kit.log" || { tail -30 "$WORK/vm-kit.log"; fail "the kit's material did not go over SSH"; }
-[[ ! -e $STATE/given.yaml ]] || fail "what the install took is left on this machine"
+step "a second VM from the root, of Kubernetes's kit: vm kit take gives its first install the byo certificate and the secret over the pinned SSH, and neither is in the seed"
+H_MAIN=$H
+vm_host "$H-kit"
+vm_root vm-truenas
+# The kit's plain input goes in the seed, as the operator gives it; its secret and its TLS material
+# go over SSH alone: the seed's first install waits for the certificate (--tls byo).
+DOCKER_CONFIG=$MIRROR_CONFIG vm_seed --platform truenas --tls byo --domains app=app.notes.test,api=api.notes.test --set ADMIN_EMAIL=from-k8s@notes.test \
+	--registry "$SITE" --registry-ca "$MIRROR_CA" --registry-login-file "$MIRROR_VM_LOGIN"
+jq -e --arg m "$MIRROR" '.await_tls == true and .registry_login == $m' "$STATE/seed.json" >/dev/null ||
+	{ jq 'del(.host_key_private, .user_data)' "$STATE/seed.json"; fail "the kit's VM's seed does not wait for its certificate, or names no login for $MIRROR"; }
+vm_vars 2 4096 16
+vm_apply "the kit's VM"
+vm_await "${E2E_VM_WAIT:-30m}" 0
+vm_login
+"$CTL" vm kit take "$H" "$OP/vm-site.kit" --kit-code-file "$OP/vm-site.code" --no-input --user ops --ssh-key "$KEY.pub" --host "$ADDR" --known-hosts-line "$VMLINE" \
+	>"$WORK/vm-kit.txt" 2>"$WORK/vm-kit.log" || { tail -80 "$WORK/vm-kit.log"; fail "vm kit take on the kit's VM's first install"; }
+grep -q "installing on ops@$ADDR over SSH with " "$WORK/vm-kit.log" || { tail -30 "$WORK/vm-kit.log"; fail "the kit's material did not go over SSH"; }
+vm_await 10m 1
+on_vm notes-stow status | grep -q '^installed  notes 1.0.0 (revision 1)' || fail "the kit's VM does not run notes 1.0.0"
+vm_retire
 # The kit's plain input is in the seed and in what the VM's first boot kept, so the search below reads
 # them; its secret, its certificate and its key are in neither, nor anywhere in the VM's state.
 # Each as a line of its PEM and whole in the form the kit's answers carried it.
@@ -192,8 +205,8 @@ cert_given=$(base64 -w0 "$WORK/site.pem")
 grep -aqF from-k8s@notes.test "$STATE/seed.iso" || fail "the seed does not read in the clear: the search below would see nothing"
 on_vm sudo grep -rqF from-k8s@notes.test /oem || fail "/oem does not read in the clear: the search below would see nothing"
 for v in "$SITE_TOKEN" "$key_line" "$cert_line" "$key_given" "$cert_given"; do
-	! grep -rqaF -- "$v" "$STATE" || fail "what vm create gives over SSH is in the VM's state"
-	! grep -qaF -- "$v" "$WORK/vm-kit.log" "$WORK/vm-kit.txt" || fail "what vm create gives over SSH reached its output"
+	! grep -rqaF -- "$v" "$STATE" "$XDG_STATE_HOME" || fail "what vm kit take gives over SSH is in the VM's root, seed or state"
+	! grep -qaF -- "$v" "$WORK/vm-kit.log" "$WORK/vm-kit.txt" || fail "what vm kit take gives over SSH reached its output"
 	not_on_vm "$v" /oem
 done
 on_vm sudo cat /usr/local/notes/.env >"$WORK/vm-kit.env"
@@ -225,26 +238,23 @@ until curl -fsS -o /dev/null --max-time 10 --cacert "$WORK/site-ca.pem" --resolv
 	}
 	sleep 5
 done
-"$CTL" vm destroy "$H" --yes >"$WORK/vm-kit-destroy.txt" 2>"$WORK/vm-kit-destroy.log" || { tail -50 "$WORK/vm-kit-destroy.log"; fail "vm destroy of the kit's VM"; }
-[[ ! -e $STATE ]] || fail "the kit's VM's state is left"
-H=$H_MAIN ADDR=$ADDR_MAIN STATE=$STATE_MAIN
+vm_destroy
+vm_host "$H_MAIN"
 
-step "vm create with OpenTofu on TrueNAS, from the mirror, IPv6 on: the disk, the seed, the VM; it boots and installs"
-vm_cleanup
+step "the VM from the root on TrueNAS, from vm seed --json against the mirror, IPv6 on: the disk, the seed, the VM; it boots and installs"
+vm_root vm-truenas
 # SSH lets in this host alone: its address the VM reaches it at, and its global IPv6 addresses.
 mapfile -t HOST6 < <(ip -6 -o addr show scope global | awk '$2 !~ /^(docker|br-|veth)/ && $0 !~ / (tentative|dadfailed|deprecated) / {sub(/\/.*/, "", $4); print $4}')
 allow=$MIRROR_IP/32
 for a in "${HOST6[@]}"; do allow+=",$a/128"; done
-DOCKER_CONFIG=$MIRROR_CONFIG "$CTL" vm create --no-input --platform truenas --create opentofu --hostname "$H" --user ops --ssh-key "$KEY.pub" \
-	--tls internal --domains app=app.notes.test,api=api.notes.test --set ADMIN_EMAIL=admin@notes.test --set "DB_SOURCES=$MIRROR_IP/32" \
-	--pool "$POOL" --dataset "$DATASET" --bridge "$BRIDGE" --cpus 2 --memory 4096 --disk 16 --host "$ADDR" --wait "${E2E_VM_WAIT:-30m}" \
-	--registry "$SITE" --registry-ca "$MIRROR_CA" --registry-login-file "$MIRROR_VM_LOGIN" --ssh-allow "$allow" --ipv6 --timezone Europe/Paris \
-	>"$WORK/vm-create.txt" 2>"$WORK/vm-create.log" || { tail -80 "$WORK/vm-create.log"; fail "vm create"; }
-grep -q "^The VM $H runs notes 1.0.0" "$WORK/vm-create.txt" || { cat "$WORK/vm-create.txt"; fail "vm create did not report the install"; }
-for f in main.tf variables.tf outputs.tf versions.tf terraform.tfvars.json terraform.tfstate seed.iso; do
-	[[ -f $STATE/$f ]] || fail "no $f in the VM's state"
-done
-! grep -rqF -- "$TRUENAS_API_KEY" "$STATE" || fail "the API key is in the VM's state"
+DOCKER_CONFIG=$MIRROR_CONFIG vm_seed --platform truenas --tls internal --domains app=app.notes.test,api=api.notes.test --set ADMIN_EMAIL=admin@notes.test --set "DB_SOURCES=$MIRROR_IP/32" \
+	--registry "$SITE" --registry-ca "$MIRROR_CA" --registry-login-file "$MIRROR_VM_LOGIN" --ssh-allow "$allow" --ipv6 --timezone Europe/Paris
+vm_vars 2 4096 16
+vm_apply "the VM"
+vm_await "${E2E_VM_WAIT:-30m}" 1
+vm_login
+vm_retire
+! grep -rqF -- "$TRUENAS_API_KEY" "$STATE" || fail "the API key is in the VM's root or state"
 
 step "on the VM: the install, its status, its services"
 on_vm notes-stow status >"$WORK/status.txt" || fail "status over SSH"
@@ -312,10 +322,11 @@ for t in iptables ip6tables; do
 	[[ $(on_vm sudo $t -S FORWARD | head -1) == '-P FORWARD DROP' ]] || { on_vm sudo $t -S FORWARD; fail "$t's FORWARD policy is not DROP"; }
 done
 # /oem holds the boot's state alone: the user-data kept, GRUB's environment, the seed host key's
-# retirement and the file system's lost+found; no cloud-config lands there beside them.
+# retirement, the first boot's pin of the one NIC to its MAC and the file system's lost+found; no
+# other cloud-config lands there beside them.
 on_vm sudo ls -A /oem >"$WORK/oem.txt" || fail "ls /oem on the VM"
-! grep -vxE '95_userdata|grubenv|lost\+found|notes-seed-host-key\.retired' "$WORK/oem.txt" ||
-	{ on_vm sudo ls -la /oem; fail "/oem holds more than the user-data, grubenv and the host key's retirement"; }
+! grep -vxE '95_userdata|96_notes-uplink-pinned\.yaml|grubenv|lost\+found|notes-seed-host-key\.retired' "$WORK/oem.txt" ||
+	{ on_vm sudo ls -la /oem; fail "/oem holds more than the user-data, the NIC's pin, grubenv and the host key's retirement"; }
 # The first boot keeps the cloud-config it pulled as /oem/95_userdata, which no later boot pulls
 # again (the upgrade's boot is judged against it below): a changed user-data is never applied.
 userdata=$(on_vm sudo stat -c "'%Y %s'" /oem/95_userdata) || fail "the first boot kept no user-data (/oem/95_userdata)"
@@ -384,21 +395,20 @@ api=$(on_vm sudo docker ps -q --filter label=com.docker.compose.service=api)
 on_vm sudo docker inspect --format "'{{range .Mounts}}{{.Source}}:{{.Destination}}:{{.RW}}{{println}}{{end}}'" "$api" |
 	grep -qx '/run/notes/app:/run/stowage-host:false' || fail "the api service does not mount the app directory read-only"
 
-step "on the VM: the install reads the mirror, whose CA the VM trusts, with the login vm create gave over SSH"
+step "on the VM: the install reads the mirror, whose CA the VM trusts, with the login given over SSH"
 grep -qx "STOWAGE_REGISTRY='$SITE'" "$WORK/vm.env" || fail "the install does not record the mirror"
 # TLS holds (000 would be a certificate refused), and the mirror asks for a sign-in.
 code=$(on_vm curl -s -o /dev/null -w '%{http_code}' "https://$MIRROR/v2/") || true
 [[ $code == 401 ]] || fail "the VM's anonymous read of the mirror answered $code, not 401 (000: the VM does not trust the mirror's CA)"
 code=$(curl -s -o /dev/null -w '%{http_code}' --cacert "$MIRROR_CA" "https://$MIRROR/v2/site/$NAME/$NAME-release/tags/list") || true
 [[ $code == 401 ]] || fail "an anonymous read of the mirror's release repository answered $code, not 401"
-grep -q "giving the VM its login to $MIRROR over SSH" "$WORK/vm-create.log" || { tail -30 "$WORK/vm-create.log"; fail "vm create did not give the login over SSH"; }
 on_vm "${SHORT}-stow" status --json >"$WORK/login-status.json" || fail "status --json"
 jq -e --arg h "$MIRROR" '.registry_login == $h and (has("registry_login_error") | not)' "$WORK/login-status.json" >/dev/null ||
 	{ cat "$WORK/login-status.json"; fail "status --json does not say the VM holds a login for $MIRROR"; }
 [[ $(on_vm sudo stat -c %a "/usr/local/$NAME.registry-login.json") == 600 ]] || fail "the login file on the VM is not root's alone"
 auth=$(printf 'vm:%s' "$MIRROR_VM_TOKEN" | base64 -w0)
 for v in "$MIRROR_VM_TOKEN" "$auth"; do
-	! grep -rqF -- "$v" "$STATE" "$WORK/vm-create.log" "$WORK/vm-create.txt" "$WORK/login-status.json" || fail "the mirror's login is in the VM's state, vm create's output or the status"
+	! grep -rqF -- "$v" "$STATE" "$XDG_STATE_HOME" "$WORK/login-status.json" || fail "the mirror's login is in the VM's root, seed, state or status"
 done
 not_on_vm "$MIRROR_VM_TOKEN" /oem
 
@@ -459,7 +469,8 @@ code=$(curl -sk -o /dev/null -w '%{http_code}' --resolve "app.notes.test:443:$ip
 [[ $code =~ ^[23] ]] || fail "https://app.notes.test/ on the VM answered $code"
 
 step "vm kit on the VM over the pinned SSH, through the daemon: the kit written here, taken by vm kit take, by a Docker install and by a release on Kubernetes; Docker's by the VM; vm kit check"
-VMKIT=(--user ops --ssh-key "$KEY.pub" --host "$ADDR")
+VMREACH=(--user ops --ssh-key "$KEY.pub" --host "$ADDR")
+VMKIT=("${VMREACH[@]}" --known-hosts-line "$VMLINE")
 "$CTL" vm kit create "$H" second-site --name site-2 --set SITE_ADMIN=second@notes.test -o "$OP/vm.kit" --no-input "${VMKIT[@]}" >"$WORK/kit.log" 2>&1 || { cat "$WORK/kit.log"; fail "vm kit create"; }
 code=$(sed -n 's/^code  //p' "$WORK/kit.log")
 [[ -n $code && -s $OP/vm.kit ]] || { cat "$WORK/kit.log"; fail "vm kit create wrote no kit or printed no code"; }
@@ -470,14 +481,9 @@ not_on_vm "$code" /home/ops
 "$CTL" vm kit take "$H" "$OP/vm.kit" --kit-code-file "$OP/vm.code" --no-input "${VMKIT[@]}" >"$WORK/kit-take.log" 2>&1 || { cat "$WORK/kit-take.log"; fail "vm kit take"; }
 grep -qF 'changing ADMIN_EMAIL: ' "$WORK/kit-take.log" || { cat "$WORK/kit-take.log"; fail "the change was not logged"; }
 "$CTL" vm kit check "$H" second-site site-2 "${VMKIT[@]}" | grep -q 'proven$' || fail "vm kit check of a site"
-# --known-hosts-line: the VM's own key (the one vm create recorded) given as one line, in place of
-# the record, reaches it; another key's line is refused by ssh before it logs in.
-real=$(awk 'NF >= 3 && $1 !~ /^#/ {print $2, $3; exit}' "$STATE/known_hosts")
-[[ -n $real ]] || { cat "$STATE/known_hosts"; fail "vm create recorded no host key"; }
-"$CTL" vm kit check "$H" second-site site-2 "${VMKIT[@]}" --known-hosts-line "$ADDR $real" >"$WORK/kit-line.txt" 2>"$WORK/kit-line.log" && grep -q 'proven$' "$WORK/kit-line.txt" ||
-	{ cat "$WORK/kit-line.txt" "$WORK/kit-line.log"; fail "vm kit check with --known-hosts-line of the VM's key"; }
+# --known-hosts-line of another key is refused by ssh before it logs in.
 ssh-keygen -q -t ed25519 -N '' -C '' -f "$WORK/wrong-host-key" || fail "ssh-keygen"
-rc=0; "$CTL" vm kit check "$H" second-site site-2 "${VMKIT[@]}" --known-hosts-line "$ADDR $(awk '{print $1, $2}' "$WORK/wrong-host-key.pub")" >"$WORK/kit-wrong.txt" 2>"$WORK/kit-wrong.log" || rc=$?
+rc=0; "$CTL" vm kit check "$H" second-site site-2 "${VMREACH[@]}" --known-hosts-line "$ADDR $(awk '{print $1, $2}' "$WORK/wrong-host-key.pub")" >"$WORK/kit-wrong.txt" 2>"$WORK/kit-wrong.log" || rc=$?
 [[ $rc != 0 ]] && ! grep -q 'proven$' "$WORK/kit-wrong.txt" && grep -q 'Host key verification failed' "$WORK/kit-wrong.log" ||
 	{ cat "$WORK/kit-wrong.txt" "$WORK/kit-wrong.log"; fail "vm kit check with another key's --known-hosts-line exited $rc, not refused by ssh's host key check"; }
 rc=0; "$CTL" vm kit check "$H" second-site site-unknown "${VMKIT[@]}" >/dev/null 2>&1 || rc=$?
@@ -569,7 +575,7 @@ on_vm sudo notes-stow install --no-input --set DB_SOURCES=192.0.2.1/32 >"$WORK/a
 ! reach "$vm4" 5432 || fail "the L4 route's port still answers this host, which its allowlist no longer holds"
 
 step "ship beta 1.0.1, which names a second NIC, carry it through the mirror; the VM upgrades from it, and its health gate keeps it"
-sed -i 's/^    uplink: { primary: true, reason: "the default route'"'"'s" }$/&\n    edge: { mtu: 1400, reason: "a NIC vm attach attaches" }/' "$P/stowage.yaml"
+sed -i 's/^    uplink: { primary: true, reason: "the default route'"'"'s" }$/&\n    edge: { mtu: 1400, reason: "a NIC the root attaches" }/' "$P/stowage.yaml"
 grep -q '^    edge: ' "$P/stowage.yaml" || fail "no edge NIC in the project"
 release 1.0.1
 on_vm notes-stow updates >"$WORK/updates.txt" 2>&1 || { cat "$WORK/updates.txt"; fail "updates"; }
@@ -587,7 +593,7 @@ healthy_postgres "after the upgrade"
 vm_status_json "$WORK/vm-status2.json" 1.0.1 1.0.0
 [[ $(on_vm systemctl is-active notes-health.service) == active ]] || fail "the health gate did not pass 1.0.1"
 # The boot keeps the operator's profile, and its Docker file, written before Docker starts, rotates
-# the logs. Until vm attach gives it a NIC, edge is the one setting that differs.
+# the logs. Until the root gives it a NIC, edge is the one setting that differs.
 on_vm notes-stow tune --check >"$WORK/tune.txt" 2>&1 || true
 grep -q '^this host: .* the network profile$' "$WORK/tune.txt" && grep -qE '^differs +interface edge +absent' "$WORK/tune.txt" &&
 	[[ $(grep '^differs ' "$WORK/tune.txt" | grep -cvE '^differs +interface edge ') == 0 ]] ||
@@ -607,17 +613,62 @@ on_vm notes-stow health >"$WORK/health.txt" 2>&1 && grep -qx ready "$WORK/health
 [[ $(on_vm sudo stat -c "'%Y %s'" /oem/95_userdata) == "$userdata" ]] && on_vm test ! -e /run/.userdata_load ||
 	fail "the upgrade's boot pulled the user-data again: /oem/95_userdata is not the first boot's"
 
-step "vm attach: a NIC for the role 1.0.1 names, the VM power-cycled on TrueNAS; network set --role re-addresses it, confirmed; a reset not confirmed comes undone"
-# The operator's notes-stow of the release naming the role; an address of TEST-NET-1 on the
-# primary's bridge, which nothing else on the LAN holds.
-vm_ctl beta-1.0.1
+step "a NIC for the role 1.0.1 names: the root adds it and power-cycles the VM, uplink kept by the first boot's pin, network attach names it from the next boot; network set --role re-addresses it, confirmed; a reset not confirmed comes undone"
+# The seed of one NIC role gives it no MAC: the root made it with its own, and the VM's first boot
+# pinned uplink's name to that MAC on the OEM partition. The root's NICs now: the primary's as
+# before, and edge's on the primary's bridge, by a MAC of this run: once the VM restarts with
+# both, uplink must still be the NIC it was — the proof of the pin.
+jq -e '[.interfaces[] | select(.role == "uplink" and .primary and (has("mac") | not))] | length == 1' "$STATE/seed.json" >/dev/null ||
+	{ jq .interfaces "$STATE/seed.json"; fail "the seed of one NIC role gives uplink a MAC"; }
+MAC_UPLINK=$(on_vm cat /sys/class/net/uplink/address)
+[[ $MAC_UPLINK =~ ^[0-9a-f]{2}(:[0-9a-f]{2}){5}$ ]] || { on_vm ip -br link || true; fail "the VM names no NIC uplink: $MAC_UPLINK"; }
+# The pin replaced the seed's own .link file of uplink, which matched by the original name: the
+# role has that one file, matching by the MAC and the Driver= value of the NIC's driver — this
+# VM's NIC is virtio_net, not a virtual function's driver, so those are left out (a physical
+# Mellanox NIC would be matched by its own driver).
+PIN_LINK=/etc/systemd/network/10-notes-uplink.link
+[[ $(on_vm udevadm info --query=property /sys/class/net/uplink | sed -n 's/^ID_NET_DRIVER=//p') == virtio_net ]] ||
+	{ on_vm udevadm info /sys/class/net/uplink || true; fail "uplink's NIC is not virtio_net, the driver this step expects"; }
+on_vm sudo grep -qF "MACAddress=$MAC_UPLINK" /oem/96_notes-uplink-pinned.yaml && on_vm sudo grep -qx "MACAddress=$MAC_UPLINK" "$PIN_LINK" &&
+	on_vm sudo grep -qx "'Driver=!mlx4_en mlx5_core mana'" "$PIN_LINK" && [[ $(on_vm sudo grep -c '^Driver=' "$PIN_LINK") == 1 ]] &&
+	! on_vm sudo grep -q OriginalName= "$PIN_LINK" && [[ $(on_vm ls /etc/systemd/network | grep -c -- '-notes-uplink\.link$') == 1 ]] ||
+	{ on_vm sudo cat /oem/96_notes-uplink-pinned.yaml "$PIN_LINK" || true; fail "the first boot did not pin uplink to its MAC $MAC_UPLINK, the virtual functions' drivers left out"; }
+MAC_EDGE=02:5e:${RUN:1:2}:${RUN:3:2}:00:02
+nics=$(jq -c --arg mac "$MAC_EDGE" '. + [{role: "edge", mac: $mac, attach: ""}]' <<<"$(jq -c '.interfaces | sort_by(.primary != true) | map({role, mac: (.mac // ""), attach: (.attach // "")})' "$STATE/seed.json")")
+[[ $(jq length <<<"$nics") == 2 ]] || fail "the root's NICs are not the primary's and edge's: $nics"
+vm_vars 2 4096 16 "$nics"
 boot=$(boot_id)
-"$CTL" vm attach "$H" --interface edge=static,address=192.0.2.10/24 --user ops --ssh-key "$KEY.pub" --host "$ADDR" --wait 15m \
-	>"$WORK/attach.txt" 2>"$WORK/attach.log" || { tail -80 "$WORK/attach.log"; fail "vm attach"; }
-back_on 1.0.1 active "after vm attach" "$boot"
-healthy_postgres "after vm attach"
+vm_apply "edge's NIC"
+[[ $(truenas_api vm.query "[[[\"id\", \"=\", $VM_ID]]]" | jq --arg mac "$MAC_EDGE" '[.[0].devices[] | select(.attributes.dtype == "NIC" and .attributes.mac == $mac)] | length') == 1 ]] ||
+	fail "the VM has no NIC of MAC $MAC_EDGE on TrueNAS"
+back_on 1.0.1 active "after the NIC's power cycle" "$boot"
+[[ $(on_vm cat /sys/class/net/uplink/address) == "$MAC_UPLINK" ]] || { on_vm ip -br link || true; fail "the NIC added took uplink's name"; }
+# The proof of the pin, by what udev applied: uplink's NIC took the pinned file, and edge's new
+# NIC, which the seed's match by the original name (en* eth*) would have named uplink, carries no
+# role's name — its kernel's. Sabotage: a pin of a wrong MAC matches no NIC, so no NIC is named
+# uplink (udevadm and the address above fail) or edge's NIC takes the name through a file still
+# matching by the original name (its link file is then the pinned path, its name uplink).
+applied=$(on_vm udevadm info --query=property /sys/class/net/uplink | sed -n 's/^ID_NET_LINK_FILE=//p')
+[[ $applied == "$PIN_LINK" ]] || { on_vm udevadm info /sys/class/net/uplink || true; fail "udev named uplink by $applied, not the pinned $PIN_LINK"; }
+edge_nic=$(on_vm ip -br link | awk -v mac="$MAC_EDGE" '$3 == mac {print $1}')
+[[ $edge_nic =~ ^(en|eth)[[:alnum:]]+$ ]] || { on_vm ip -br link || true; fail "edge's new NIC ($MAC_EDGE) is named ${edge_nic:-nothing}, not the kernel's name"; }
+[[ $(on_vm udevadm info --query=property "/sys/class/net/$edge_nic" | sed -n 's/^ID_NET_LINK_FILE=//p') != "$PIN_LINK" ]] ||
+	fail "udev applied uplink's pinned file to edge's new NIC $edge_nic"
+# An address of TEST-NET-1 on the primary's bridge, which nothing else on the LAN holds.
+on_vm sudo notes-stow network attach --role edge --mac "$MAC_EDGE" --mode static --address 192.0.2.10/24 >"$WORK/attach.txt" 2>&1 || { cat "$WORK/attach.txt"; fail "network attach --role edge"; }
+grep -qF "edge: the NIC $MAC_EDGE is named and addressed (static 192.0.2.10/24) from the next boot: the NIC is there: \`sudo notes-stow reboot\` names it" "$WORK/attach.txt" ||
+	{ cat "$WORK/attach.txt"; fail "network attach does not see the NIC the root added"; }
+# The NIC there, its driver is recorded (virtio_net), and its link leaves the virtual functions'
+# drivers out, as uplink's pin does.
+on_vm sudo grep -qx "'  driver: virtio_net'" /usr/local/notes/interfaces.yaml && on_vm sudo grep -qxE "' *Driver=!mlx4_en mlx5_core mana'" /oem/96_notes-interfaces.yaml ||
+	{ on_vm sudo cat /usr/local/notes/interfaces.yaml /oem/96_notes-interfaces.yaml || true; fail "network attach did not record edge's driver, or its link does not leave the virtual functions' drivers out"; }
+boot=$(boot_id)
+rc=0; on_vm sudo notes-stow reboot --drain-secs 0 >"$WORK/attach-reboot.txt" 2>&1 || rc=$?
+[[ $rc == 0 || $rc == 255 ]] || { cat "$WORK/attach-reboot.txt"; fail "the reboot after network attach exited $rc"; }
+back_on 1.0.1 active "after network attach's reboot" "$boot"
+healthy_postgres "after network attach"
 on_vm ip -4 -o addr show dev edge | grep -q ' 192\.0\.2\.10/24 ' || { on_vm ip -o addr || true; fail "the attached NIC is not named edge with its address"; }
-on_vm test -e /sys/class/net/uplink || fail "the primary NIC lost its name as edge joined it"
+[[ $(on_vm cat /sys/class/net/uplink/address) == "$MAC_UPLINK" ]] || { on_vm ip -br link || true; fail "the primary NIC lost its name as edge joined it"; }
 on_vm notes-stow tune --check >"$WORK/tune.txt" 2>&1 || { cat "$WORK/tune.txt"; fail "tune still finds a setting that differs once edge is attached"; }
 # role_line: the edge role's line of `notes-stow network`.
 role_line() { on_vm notes-stow network >"$WORK/net-role.txt" 2>&1 || { cat "$WORK/net-role.txt"; fail "network"; }; sed -n 's/^role       edge: //p' "$WORK/net-role.txt"; }
@@ -708,13 +759,13 @@ net "on DHCP"
 # edge's override, kept through 1.0.0 (which names no edge), rendered again by 1.0.3's boot.
 grep -q "^role       edge: .*192\.0\.2\.11/24; set by \`notes-stow network set --role edge\`: 192\.0\.2\.11/24$" "$WORK/net.txt" ||
 	{ cat "$WORK/net.txt"; fail "edge's override did not come back with a release naming edge"; }
-# vm create's network, DHCP with IPv6 on: the cloud-config's file, which asks DHCPv6 without
+# The seed's network, DHCP with IPv6 on: the cloud-config's file, which asks DHCPv6 without
 # waiting for a router's advertisement, as a cloud gives IPv6 addresses.
 [[ $(net_field 'set by') == "the VM's cloud-config, as \`vm create\` gave it: DHCP, automatic IPv6" ]] || { cat "$WORK/net.txt"; fail "the network is not the cloud-config's"; }
 on_vm cat /etc/systemd/network/05-notes-static.network >"$WORK/net-file.txt" || fail "no network file from the cloud-config"
 grep -qx 'DHCP=yes' "$WORK/net-file.txt" && grep -qx 'WithoutRA=solicit' "$WORK/net-file.txt" && ! grep -q 'IPv6AcceptRA=no' "$WORK/net-file.txt" ||
 	{ cat "$WORK/net-file.txt"; fail "the cloud-config's network is not DHCP with IPv6"; }
-# The stack's network has IPv6 (vm create --ipv6 reaches the install).
+# The stack's network has IPv6 (vm seed --ipv6 reaches the install).
 [[ -n $(on_vm sudo docker network ls -q --filter label=io.stowage.ipv6=true) ]] || fail "the stack's network on the VM has no IPv6"
 # On a LAN with IPv6 (this host has a global address), the VM gets a global IPv6 address and an
 # IPv6 default route, and this host reaches it over IPv6: SSH (the firewall's ip6 rule) and the front.
@@ -890,9 +941,7 @@ cmdline=$(on_recovery cat /proc/cmdline) || recovery_failed $? /proc/cmdline
 [[ $cmdline != *stowage.e2e* ]] || fail "the recovery system booted with the project's kernel argument: $cmdline"
 ! awk '$2 == "P" {print; found = 1} END {exit !found}' "$WORK/passwd.recovery.txt" || fail "an account of the recovery system has a password"
 
-step "vm destroy: the VM, its disk and its uploads go, and its state"
-"$CTL" vm destroy "$H" --yes >"$WORK/vm-destroy.txt" 2>"$WORK/vm-destroy.log" || { tail -50 "$WORK/vm-destroy.log"; fail "vm destroy"; }
-grep -q "^Destroyed $H" "$WORK/vm-destroy.txt" || fail "vm destroy did not report"
-[[ ! -e $STATE ]] || fail "the VM's state is left"
+step "tofu destroy: the VM, its disk and its uploads go, their snapshots with them"
+vm_destroy
 
 printf '\nPASS\n'

@@ -247,7 +247,7 @@ step "audit and sbom export from the operator's machine: the cluster's release, 
 grype_db
 scanner_fresh "$REG/notes"
 ctl v1.sh audit --version 1.0.0 --db "$GRYPE_DB" --json >"$WORK/audit.json" 2>"$WORK/audit.log" || { cat "$WORK/audit.log" "$WORK/audit.json"; fail "audit of 1.0.0"; }
-[[ $(jq -r .version "$WORK/audit.json") == 1.0.0 && $(jq '[.subjects[] | select(.error)] | length' "$WORK/audit.json") == 0 && $(jq '[.subjects[] | select(.name == "installer")] | length' "$WORK/audit.json") == 1 ]] ||
+[[ $(jq -r .version "$WORK/audit.json") == 1.0.0 && $(jq '[.subjects[] | select(.error)] | length' "$WORK/audit.json") == 0 && $(jq '[.subjects[] | select(.name == "installer")] | length' "$WORK/audit.json") == 4 ]] ||
 	{ cat "$WORK/audit.json"; fail "not every artifact of 1.0.0 was audited"; }
 ctl v1.sh sbom export --version 1.0.0 "$WORK/sbom" >"$WORK/sbom.txt" 2>&1 || { cat "$WORK/sbom.txt"; fail "sbom export"; }
 jq -e '(.artifacts | length) > 0 and all(.artifacts[]; .error == null and .file != null)' "$WORK/sbom/index.json" >/dev/null &&

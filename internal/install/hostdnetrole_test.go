@@ -3,6 +3,7 @@ package install
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"os"
@@ -25,6 +26,7 @@ func roleDaemon(t *testing.T) (*fakeLink, *Hostd) {
 	h := netDaemon(t, link)
 	h.R = attachRelease(t)
 	h.RunNetworkd = link.run
+	h.SysNet, h.UdevData = t.TempDir(), t.TempDir()
 	return link, h
 }
 
@@ -163,7 +165,6 @@ func TestASecondaryNICsOverrideIsRefused(t *testing.T) {
 		{NetRequest{Role: "uplink", NetConfig: NetConfig{Mode: "dhcp"}}, http.StatusBadRequest, "is the primary NIC: `notes-stow network set` and `network reset` without --role"},
 		{NetRequest{Role: "vpn0", NetConfig: NetConfig{Mode: "dhcp"}}, http.StatusBadRequest, "not one of notes's secondary NICs (edge, lan)"},
 		{NetRequest{Role: "wan", NetConfig: NetConfig{Mode: "dhcp"}}, http.StatusBadRequest, "not one of notes's secondary NICs"},
-		{NetRequest{Role: "lan", NetConfig: NetConfig{Mode: "dhcp"}}, http.StatusConflict, "no NIC is named so on this VM: `vm attach` attaches one"},
 		{NetRequest{Role: "edge", NetConfig: NetConfig{Mode: "static", Address: "192.0.2.10/24", Gateway: "192.0.2.1"}}, http.StatusBadRequest, "are the primary NIC's"},
 		{NetRequest{Role: "edge", NetConfig: NetConfig{Mode: "dhcp", IPv6: true}}, http.StatusBadRequest, "are the primary NIC's"},
 		{NetRequest{Role: "edge", NetConfig: NetConfig{Mode: "dhcp", DNS: []string{"9.9.9.9"}}}, http.StatusBadRequest, "are the primary NIC's"},
@@ -178,6 +179,17 @@ func TestASecondaryNICsOverrideIsRefused(t *testing.T) {
 			t.Errorf("%+v: %d %q, want %d %q", c.req, code, e.Error, c.code, c.want)
 		}
 	}
+	// unnamed asks an override of lan, which no NIC is named as: every answer is a refusal (exit
+	// 3), its fix what names one.
+	unnamed := func(why, fix string) {
+		t.Helper()
+		var e errOf
+		if code := call(t, api, http.MethodPost, "/v1/network", NetRequest{Role: "lan", NetConfig: NetConfig{Mode: "dhcp"}}, &e); code != http.StatusConflict || !e.Refused ||
+			e.Error != "role lan: no NIC is named so on this VM: "+why || e.Fix != fix+", then set its network" {
+			t.Errorf("%d %+v\nwant %q\nfix  %q", code, e, why, fix)
+		}
+	}
+	unnamed("none is recorded for it", "`sudo notes-stow network attach --role lan --mac <its MAC>` records one, named from the next boot: add that NIC on the VM's platform and restart the VM")
 	var e errOf
 	if code := call(t, api, http.MethodPost, "/v1/network/reset", NetResetRequest{Role: "uplink"}, &e); code != http.StatusBadRequest || !strings.Contains(e.Error, "primary NIC") {
 		t.Errorf("reset of the primary as a role: %d %q", code, e.Error)
@@ -188,6 +200,106 @@ func TestASecondaryNICsOverrideIsRefused(t *testing.T) {
 	}
 	if slices.ContainsFunc(link.calls(), func(c []string) bool { return c[0] == "networkctl" }) {
 		t.Errorf("a refused change reached networkd: %v", link.calls())
+	}
+	// lan recorded by `network attach`: its NIC not there yet, then there under the kernel's name.
+	if err := os.WriteFile(filepath.Join(h.O.Dir, interfacesFile), []byte("- role: lan\n  mac: 02:00:00:00:00:05\n  mode: none\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []roleHint{
+		{"its NIC (02:00:00:00:00:05) is recorded, and not on this VM yet", "add it on the VM's platform with that MAC and restart the VM"},
+		{"its NIC (02:00:00:00:00:05) is recorded and there, and is named so from the next boot", "`sudo notes-stow reboot`"},
+	} {
+		unnamed(want.Why, want.Fix)
+		// The kernel's NICs, as `network attach` and the install's warning read them.
+		fakeSys(t, h.SysNet, h.UdevData, map[string]fakeNIC{"ens10": {"02:00:00:00:00:05", "virtio_net", ""}})
+	}
+	// The driver recorded is a virtual function's (the NIC there at the attach was a physical
+	// Mellanox one) and the NIC's is not: its link does not match it, so the attach again does.
+	if err := os.WriteFile(filepath.Join(h.O.Dir, interfacesFile), []byte("- role: lan\n  mac: 02:00:00:00:00:05\n  driver: mlx5_core\n  mode: dhcp\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	unnamed("its NIC (02:00:00:00:00:05) is recorded and there, but its link matches Driver=mlx5_core (the driver recorded: mlx5_core), not the NIC's (virtio_net)",
+		"`sudo notes-stow network attach --role lan --mac 02:00:00:00:00:05 --mode dhcp`, run with the NIC there, records its driver, then `sudo notes-stow reboot` names it")
+	// A record that does not decode, a 0.39.0 pin entry among them: its refusal, with its fix,
+	// as the role's.
+	for _, c := range []struct{ record, fix string }{
+		{"- role: lan\n  mac: 02:00:00:00:00:05\n- role: uplink\n  mac: 02:00:00:00:00:aa\n  pin: true\n", "pin the VM's NIC by hand (\"A VM seeded before 0.40.0\" in docs/vm.md), remove the entries with `pin: true` from " + filepath.Join(h.O.Dir, interfacesFile) + ", then run this again"},
+		{"- role: lan\n  colour: red\n", "fix " + filepath.Join(h.O.Dir, interfacesFile) + " (a list of role, mac, driver, mode and address), or remove it and run `network attach` again for each NIC it held"},
+	} {
+		if err := os.WriteFile(filepath.Join(h.O.Dir, interfacesFile), []byte(c.record), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		e = errOf{}
+		if code := call(t, api, http.MethodPost, "/v1/network", NetRequest{Role: "lan", NetConfig: NetConfig{Mode: "dhcp"}}, &e); code != http.StatusConflict || !e.Refused || e.Fix != c.fix ||
+			!strings.HasPrefix(e.Error, "role lan: no NIC is named so on this VM: "+filepath.Join(h.O.Dir, interfacesFile)) {
+			t.Errorf("%q: %d %+v", c.record, code, e)
+		}
+	}
+	if err := os.Remove(filepath.Join(h.O.Dir, interfacesFile)); err != nil {
+		t.Fatal(err)
+	}
+	// lan named by the seed's MAC, which no NIC has: the platform's NIC, never `network attach`,
+	// which refuses a role the seed names.
+	if err := os.WriteFile(filepath.Join(h.Networkd, "10-notes-lan.link"), []byte(interfaceLink("notes", MachineInterface{Role: "lan", MAC: "02:00:00:00:00:0c"})), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	unnamed("the VM's cloud-config names it by its MAC (02:00:00:00:00:0c)", "add the NIC of that MAC on the VM's platform (or fix the MAC of the one there) and restart the VM")
+	// lan named by the seed's original name, never pinned: its NIC alone at a boot, never
+	// `network attach`.
+	if err := os.WriteFile(filepath.Join(h.Networkd, "10-notes-lan.link"), []byte(interfaceLink("notes", MachineInterface{Role: "lan"})), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	unnamed("the VM's cloud-config names it by its original name, as the VM's only NIC",
+		"leave its NIC alone on the VM (remove the others on its platform) and restart the VM, which names it (and, for a VM seeded by Stowage 0.40.0 or later, pins it to that NIC's MAC, so NICs added after it keep their names)")
+	// Another role's NIC recorded by `network attach`: kept, every other NIC removed.
+	if err := os.WriteFile(filepath.Join(h.O.Dir, interfacesFile), []byte("- role: edge\n  mac: 02:00:00:00:00:0e\n  mode: none\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	unnamed("the VM's cloud-config names it by its original name, as the VM's only NIC",
+		"leave its NIC alone on the VM (remove the others on its platform but the NICs `network attach` recorded, which keep their roles: edge's 02:00:00:00:00:0e) and restart the VM, which names it (and, for a VM seeded by Stowage 0.40.0 or later, pins it to that NIC's MAC, so NICs added after it keep their names)")
+	// lan named by the boot's pin (its .link file's MAC and Driver=): its NIC gone, or of a driver
+	// the pin does not match, one free NIC left alone is pinned in its place; there and matched, a
+	// reboot names it.
+	pinFix := "leave one NIC on the VM that no other role names (remove the others on its platform but the NICs `network attach` recorded, which keep their roles: edge's 02:00:00:00:00:0e) and restart the VM, which pins the role to that NIC"
+	if err := os.WriteFile(filepath.Join(h.Networkd, "10-notes-lan.link"), []byte(strings.NewReplacer(macMark, "02:00:00:00:00:0d", driverMark, driverValue("")).Replace(pinnedLink("notes", "lan"))), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	pinned := "the VM's boot pinned it to its NIC's MAC (02:00:00:00:00:0d, Driver=!mlx4_en mlx5_core mana)"
+	unnamed(pinned+", and no NIC of that MAC is on this VM", pinFix)
+	fakeSys(t, h.SysNet, h.UdevData, map[string]fakeNIC{"ens11": {"02:00:00:00:00:0d", "mlx5_core", ""}})
+	unnamed(pinned+", and the NIC of that MAC here has the driver mlx5_core, which the pin does not match", pinFix)
+	if err := os.RemoveAll(filepath.Join(h.SysNet, "ens11")); err != nil {
+		t.Fatal(err)
+	}
+	fakeSys(t, h.SysNet, h.UdevData, map[string]fakeNIC{"ens12": {"02:00:00:00:00:0d", "virtio_net", ""}})
+	unnamed(pinned+", and its NIC is here", "`sudo notes-stow reboot` names it")
+	if err := os.Remove(filepath.Join(h.O.Dir, interfacesFile)); err != nil {
+		t.Fatal(err)
+	}
+	// A .link file naming no NIC (empty, cut short, or foreign): the file to restore, never
+	// `network attach`, which refuses a role the seed names.
+	for _, cut := range []string{"", "# notes's interface lan.\n[Match]\n", "[Match]\nName=eth0\n\n[Link]\nName=lan\n"} {
+		if err := os.WriteFile(filepath.Join(h.Networkd, "10-notes-lan.link"), []byte(cut), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		path := filepath.Join(h.Networkd, "10-notes-lan.link")
+		unnamed("its .link file "+path+" names no NIC (neither a MACAddress= nor an OriginalName=)", "restore "+path+" as the VM's cloud-config writes it: `sudo notes-stow reboot` writes it again")
+	}
+	// A .link file that does not read: what names lan is not known, refused with what to restore.
+	if err := os.Remove(filepath.Join(h.Networkd, "10-notes-lan.link")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(h.Networkd, "10-notes-lan.link"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	e = errOf{}
+	if code := call(t, api, http.MethodPost, "/v1/network", NetRequest{Role: "lan", NetConfig: NetConfig{Mode: "dhcp"}}, &e); code != http.StatusConflict || !e.Refused ||
+		!strings.HasPrefix(e.Error, "role lan: no NIC is named so on this VM: what names one is not known (") || !strings.Contains(e.Error, "10-notes-lan.link") ||
+		!strings.HasPrefix(e.Fix, "restore what does not read (") || !strings.HasSuffix(e.Fix, "), then set its network") || !strings.Contains(e.Fix, "10-notes-lan.link") {
+		t.Errorf("a .link file unread: %d %+v", code, e)
+	}
+	if err := os.Remove(filepath.Join(h.Networkd, "10-notes-lan.link")); err != nil {
+		t.Fatal(err)
 	}
 	// A release without a secondary NIC.
 	_, plain := roleDaemon(t)
@@ -518,5 +630,92 @@ func TestADropDisarmsItsOwnRevertAndIsRetried(t *testing.T) {
 	h.netMu.Unlock()
 	if armed {
 		t.Error("edge's revert is still armed")
+	}
+}
+
+// A role recorded by `network attach` whose NIC's presence does not read: an error, never a hint
+// guessed.
+func TestAnUnnamedRolesHintNeverGuesses(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, interfacesFile), []byte("- role: lan\n  mac: 02:00:00:00:00:05\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	unread := errors.New("unread")
+	if hint, err := unnamedRoleHint(t.TempDir(), "notes", "notes-stow", dir, "lan", vmNICs{drivers: func(string) ([]string, error) { return nil, unread }}); !errors.Is(err, unread) || hint != (roleHint{}) {
+		t.Errorf("%q %v", hint, err)
+	}
+	networkd := t.TempDir()
+	if err := os.Mkdir(filepath.Join(networkd, "10-notes-lan.link"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if hint, err := unnamedRoleHint(networkd, "notes", "notes-stow", dir, "lan", vmNICs{drivers: func(string) ([]string, error) { return []string{"virtio_net"}, nil }}); err == nil || hint != (roleHint{}) {
+		t.Errorf("the seed's .link unread: %q %v", hint, err)
+	}
+}
+
+// A role whose NIC is here and matched by its .link file but not named: a reboot names it only
+// while no other device holds its name; one of several NICs of the seed's MAC is named by none.
+func TestAnUnnamedRolesHintSaysWhyItsNICIsNotNamed(t *testing.T) {
+	t.Parallel()
+	const mac = "02:00:00:00:00:05"
+	networkd, dir := t.TempDir(), t.TempDir()
+	byMAC := interfaceLink("notes", MachineInterface{Role: "lan", MAC: mac})
+	pinned := strings.NewReplacer(macMark, mac, driverMark, "virtio_net").Replace(pinnedLink("notes", "lan"))
+	reboot := "`sudo notes-stow reboot` names it"
+	held := "remove or rename that device (or remove the record that names it so: its .link or .netdev file), then `sudo notes-stow reboot` names it"
+	for _, c := range []struct {
+		name, link string
+		nics       int
+		holder     string
+		why, fix   string
+	}{
+		{"by MAC, none", byMAC, 0, "", "the VM's cloud-config names it by its MAC (" + mac + ")", "add the NIC of that MAC on the VM's platform (or fix the MAC of the one there) and restart the VM"},
+		{"by MAC, here", byMAC, 1, "", "the VM's cloud-config names it by its MAC (" + mac + "), and its NIC is here", reboot},
+		{"by MAC, several", byMAC, 2, "", "the VM's cloud-config names it by its MAC (" + mac + "), and 2 NICs of this VM have that MAC, so the boot names none of them",
+			"remove the other NICs with that MAC on the VM's platform (or give each a MAC of its own) and restart the VM"},
+		{"by MAC, the name held", byMAC, 1, "02:00:00:00:00:0b", "the VM's cloud-config names it by its MAC (" + mac + "), and its NIC is here, but another device holds the name lan (MAC 02:00:00:00:00:0b)", held},
+		{"pinned, here", pinned, 1, "", "the VM's boot pinned it to its NIC's MAC (" + mac + ", Driver=virtio_net), and its NIC is here", reboot},
+		{"pinned, the name held by a device of no MAC", pinned, 1, "-", "the VM's boot pinned it to its NIC's MAC (" + mac + ", Driver=virtio_net), and its NIC is here, but another device holds the name lan (no MAC)", held},
+	} {
+		if err := os.WriteFile(filepath.Join(networkd, "10-notes-lan.link"), []byte(c.link), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		there := vmNICs{
+			drivers: func(m string) ([]string, error) {
+				if m != mac {
+					return nil, nil
+				}
+				return slices.Repeat([]string{"virtio_net"}, c.nics), nil
+			},
+			holder: func(name string) (string, bool, error) {
+				if name != "lan" || c.holder == "" {
+					return "", false, nil
+				}
+				return strings.TrimPrefix(c.holder, "-"), true, nil
+			},
+		}
+		if hint, err := unnamedRoleHint(networkd, "notes", "notes-stow", dir, "lan", there); err != nil || hint != (roleHint{c.why, c.fix}) {
+			t.Errorf("%s: %v\n%q\nwant %q", c.name, err, hint, roleHint{c.why, c.fix})
+		}
+	}
+	// Who holds the name does not read: an error, never a reboot promised.
+	unread := errors.New("unread")
+	there := vmNICs{
+		drivers: func(string) ([]string, error) { return []string{"virtio_net"}, nil },
+		holder:  func(string) (string, bool, error) { return "", false, unread },
+	}
+	if hint, err := unnamedRoleHint(networkd, "notes", "notes-stow", dir, "lan", there); !errors.Is(err, unread) || hint != (roleHint{}) {
+		t.Errorf("the holder unread: %q %v", hint, err)
+	}
+	// nicsThere's holder: any device of the name, its MAC.
+	sys, udev := t.TempDir(), t.TempDir()
+	fakeSys(t, sys, udev, map[string]fakeNIC{"lan": {"02:00:00:00:00:0B", "", ""}})
+	h := nicsThere(sys, udev).holder
+	if m, ok, err := h("lan"); m != "02:00:00:00:00:0b" || !ok || err != nil {
+		t.Errorf("held: %q %v %v", m, ok, err)
+	}
+	if m, ok, err := h("edge"); m != "" || ok || err != nil {
+		t.Errorf("free: %q %v %v", m, ok, err)
 	}
 }

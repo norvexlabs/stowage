@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -20,10 +21,10 @@ import (
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/empty"
 	"github.com/google/go-containerregistry/pkg/v1/mutate"
-	"github.com/google/go-containerregistry/pkg/v1/tarball"
 	"github.com/google/go-containerregistry/pkg/v1/types"
 
 	"github.com/norvexlabs/stowage/internal/graph"
+	"github.com/norvexlabs/stowage/internal/installerbin"
 	"github.com/norvexlabs/stowage/internal/lock"
 	"github.com/norvexlabs/stowage/internal/payload"
 	"github.com/norvexlabs/stowage/internal/providers"
@@ -56,6 +57,8 @@ func (p *Publisher) readyToPublish() error {
 	if len(p.Installer) == 0 {
 		return errors.New("this stowage carries no installer to publish (a build without it): use a release build of stowage (make build)")
 	}
+	// The set is complete (installerbin.Read); each executable is checked against its recorded
+	// sha256 as a ship first reads it, before anything is written (checkInstallers).
 	if err := p.Unpinned(); err != nil {
 		return err
 	}
@@ -64,6 +67,22 @@ func (p *Publisher) readyToPublish() error {
 			err = fmt.Errorf("registry.pull: %s is not set: the pull account's password is baked into the installer", env)
 		}
 		return err
+	}
+	return nil
+}
+
+// checkInstallers reads each executable once (Installer.Verify: decompressed, checked against its
+// recorded sha256, which the graph's inputs take, and its recorded size): a ship that makes no
+// installer index before it writes anything calls it first, as each goes in the installer image.
+func (p *Publisher) checkInstallers() error {
+	for _, pl := range installerbin.Platforms {
+		inst := p.Installer[pl]
+		if inst == nil {
+			return fmt.Errorf("this stowage's installers: none for %s: use a release build of stowage (make build)", pl)
+		}
+		if err := inst.Verify(); err != nil {
+			return fmt.Errorf("this stowage's installers: %w", err)
+		}
 	}
 	return nil
 }
@@ -174,46 +193,71 @@ func (p *Publisher) projectFile(rel string) ([]byte, error) {
 	return os.ReadFile(f)
 }
 
-// installerImage is the release's installer image: one linux/amd64 layer holding <short>-stow, the
-// installer executable with the release appended, whose default command prints the bootstrap
-// script. It is a function of its content alone — no timestamp — so the same release makes the
+// installerIndex is the release's installer image: an OCI index of one image per platform of
+// installerbin.Platforms, in that order, each descriptor naming its platform (installerImage); a
+// target runs the installerbin.Target one. It is a function of its content alone — no timestamp — so the same release makes the
 // same digest. It carries no inputs digest: it embeds the release's outputs (image digests,
 // number, date), which no inputs digest covers, so it is never kept on its inputs — ship makes it
 // again from the manifest and compares digests.
-func (p *Publisher) installerImage(m *release.Manifest) (v1.Image, error) {
+func (p *Publisher) installerIndex(m *release.Manifest) (v1.ImageIndex, error) {
 	files, err := p.installerFiles(m)
 	if err != nil {
 		return nil, err
 	}
-	var exe bytes.Buffer
-	if err := payload.Write(&exe, bytes.NewReader(p.Installer), files); err != nil {
+	// The payload appended to each executable, made once: the bytes the key hashes are the bytes
+	// each image ships.
+	var appended bytes.Buffer
+	if err := payload.Write(&appended, bytes.NewReader(nil), files); err != nil {
 		return nil, err
 	}
+	key := installerKey(appended.Bytes(), p.Installer)
+	if p.lastIndex.idx != nil && p.lastIndex.key == key {
+		return p.lastIndex.idx, nil
+	}
+	var entries []mutate.IndexAddendum
+	for _, pl := range installerbin.Platforms {
+		platform, err := v1.ParsePlatform(pl)
+		if err != nil {
+			return nil, err
+		}
+		inst := p.Installer[pl]
+		if inst == nil {
+			return nil, fmt.Errorf("no installer for %s", pl)
+		}
+		img, err := p.installerImage(m, appended.Bytes(), inst, *platform)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", pl, err)
+		}
+		entries = append(entries, mutate.IndexAddendum{Add: img, Descriptor: v1.Descriptor{Platform: platform}})
+	}
+	idx := mutate.AppendManifests(mutate.IndexMediaType(empty.Index, types.OCIImageIndex), entries...)
+	p.lastIndex.key, p.lastIndex.idx = key, idx
+	return idx, nil
+}
+
+// installerKey names what an installer index is made of beside the project (<short>-stow): the
+// payload appended to each executable (the manifest, whose tag labels its images too) and each
+// executable's sha256. The same key makes the index made last.
+func installerKey(appended []byte, s installerbin.Set) [sha256.Size]byte {
+	h := sha256.New()
+	h.Write(appended)
+	for _, pl := range installerbin.Platforms {
+		fmt.Fprintf(h, "\x00%s=%s", pl, s.Digest(pl))
+	}
+	var key [sha256.Size]byte
+	h.Sum(key[:0])
+	return key
+}
+
+// installerImage is the installer index's image for platform: one layer holding one file,
+// <short>-stow, the platform's installer executable (inst) with the release's payload files
+// appended, whose default command prints the bootstrap script.
+func (p *Publisher) installerImage(m *release.Manifest, appended []byte, inst *installerbin.Installer, platform v1.Platform) (v1.Image, error) {
+	size := inst.Size()
 	ctl := providers.Ctl(p.Project.Spec.Short())
-	var layer bytes.Buffer
-	tw := tar.NewWriter(&layer)
-	if err := tw.WriteHeader(&tar.Header{Name: ctl, Mode: 0o755, Size: int64(exe.Len()), Typeflag: tar.TypeReg,
-		ModTime: time.Unix(0, 0), Format: tar.FormatPAX}); err != nil {
-		return nil, err
-	}
-	if _, err := tw.Write(exe.Bytes()); err != nil {
-		return nil, err
-	}
-	if err := tw.Close(); err != nil {
-		return nil, err
-	}
-	// Compressed once, here: the gzip stream (no name, no time) is the layer's bytes.
-	var gz bytes.Buffer
-	zw := gzip.NewWriter(&gz)
-	if _, err := zw.Write(layer.Bytes()); err != nil {
-		return nil, err
-	}
-	if err := zw.Close(); err != nil {
-		return nil, err
-	}
-	l, err := tarball.LayerFromOpener(func() (io.ReadCloser, error) {
-		return io.NopCloser(bytes.NewReader(gz.Bytes())), nil
-	}, tarball.WithMediaType(types.OCILayer))
+	hdr := tar.Header{Name: ctl, Mode: 0o755, Size: size + int64(len(appended)), Typeflag: tar.TypeReg,
+		ModTime: time.Unix(0, 0), Format: tar.FormatPAX}
+	l, err := p.installerLayer(hdr, inst, appended)
 	if err != nil {
 		return nil, err
 	}
@@ -226,10 +270,6 @@ func (p *Publisher) installerImage(m *release.Manifest) (v1.Image, error) {
 	if err != nil {
 		return nil, err
 	}
-	platform, err := v1.ParsePlatform(graph.Platform)
-	if err != nil {
-		return nil, err
-	}
 	cf.OS, cf.Architecture = platform.OS, platform.Architecture
 	cf.Config.Entrypoint = []string{"/" + ctl}
 	cf.Config.Cmd = []string{payload.ScriptCommand}
@@ -237,19 +277,129 @@ func (p *Publisher) installerImage(m *release.Manifest) (v1.Image, error) {
 	return mutate.ConfigFile(img, cf)
 }
 
-// publishInstaller puts img in the installer repository by digest, signs it, then moves the
+// installerLayer is the layer of the tar of one file, hdr: inst's executable with appended after
+// it. One pass, once per run for one content (p.layers), compresses its tar (no name, no time: one
+// content makes one digest), streamed from the executable, which is never kept: that pass makes
+// its digests and size and the compressed bytes its push sends.
+func (p *Publisher) installerLayer(hdr tar.Header, inst *installerbin.Installer, appended []byte) (v1.Layer, error) {
+	h := sha256.New()
+	fmt.Fprintf(h, "%s\x00%s\x00%d\x00", inst.Digest, hdr.Name, hdr.Size)
+	h.Write(appended)
+	var key [sha256.Size]byte
+	h.Sum(key[:0])
+	l := &streamedLayer{open: func() io.ReadCloser { return installerTar(hdr, inst, appended) }}
+	p.layers.Lock()
+	sums, ok := p.layers.of[key]
+	p.layers.Unlock()
+	if !ok {
+		var err error
+		if sums, err = l.read(); err != nil {
+			return nil, err
+		}
+		p.layers.Lock()
+		if p.layers.of == nil {
+			p.layers.of = map[[sha256.Size]byte]layerSums{}
+		}
+		p.layers.of[key] = sums
+		p.layers.Unlock()
+	}
+	l.layerSums = sums
+	return l, nil
+}
+
+// layerSums are a layer's digest (of its compressed stream), diffID (of its tar), size
+// (compressed) and compressed stream (zipped), a fraction of its tar's size.
+type layerSums struct {
+	digest, diffID v1.Hash
+	size           int64
+	zipped         []byte
+}
+
+// streamedLayer is an OCI gzip layer whose tar open streams on each read, compressed at
+// gzip.DefaultCompression with no name and no time (compress) by read: the same tar makes the
+// same compressed stream, whose sums and bytes it holds.
+type streamedLayer struct {
+	layerSums
+	open func() io.ReadCloser
+}
+
+func (l *streamedLayer) Digest() (v1.Hash, error)            { return l.digest, nil }
+func (l *streamedLayer) DiffID() (v1.Hash, error)            { return l.diffID, nil }
+func (l *streamedLayer) Size() (int64, error)                { return l.size, nil }
+func (l *streamedLayer) MediaType() (types.MediaType, error) { return types.OCILayer, nil }
+func (l *streamedLayer) Uncompressed() (io.ReadCloser, error) {
+	return l.open(), nil
+}
+func (l *streamedLayer) Compressed() (io.ReadCloser, error) {
+	return io.NopCloser(bytes.NewReader(l.zipped)), nil
+}
+
+// read is the layer's sums and compressed stream, by one pass over its tar.
+func (l *streamedLayer) read() (layerSums, error) {
+	tr := l.open()
+	defer tr.Close()
+	raw, zipped := sha256.New(), sha256.New()
+	var buf bytes.Buffer
+	if err := compress(io.MultiWriter(zipped, &buf), io.TeeReader(tr, raw)); err != nil {
+		return layerSums{}, err
+	}
+	return layerSums{
+		digest: v1.Hash{Algorithm: "sha256", Hex: fmt.Sprintf("%x", zipped.Sum(nil))},
+		diffID: v1.Hash{Algorithm: "sha256", Hex: fmt.Sprintf("%x", raw.Sum(nil))},
+		size:   int64(buf.Len()),
+		zipped: buf.Bytes(),
+	}, nil
+}
+
+// compress writes r to w gzip-compressed at gzip.DefaultCompression, with no name and no time.
+func compress(w io.Writer, r io.Reader) error {
+	zw, err := gzip.NewWriterLevel(w, gzip.DefaultCompression)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(zw, r); err != nil {
+		return err
+	}
+	return zw.Close()
+}
+
+// installerTar streams the tar of one file, hdr: inst's executable (checked as it is read,
+// installerbin.Installer.Open) followed by appended, its payload.
+func installerTar(hdr tar.Header, inst *installerbin.Installer, appended []byte) io.ReadCloser {
+	pr, pw := io.Pipe()
+	go func() {
+		exe, err := inst.Open()
+		if err == nil {
+			tw := tar.NewWriter(pw)
+			err = tw.WriteHeader(&hdr)
+			if err == nil {
+				_, err = io.Copy(tw, io.MultiReader(exe, bytes.NewReader(appended)))
+			}
+			if err == nil {
+				err = tw.Close()
+			}
+			exe.Close()
+		}
+		pw.CloseWithError(err)
+	}()
+	return pr
+}
+
+// publishInstaller puts idx in the installer repository by digest, signs it, then moves the
 // release's tag to it, and returns its digest. What is already in place is left alone.
-func (p *Publisher) publishInstaller(ctx context.Context, img v1.Image, tag string) (string, error) {
-	h, err := p.pushInstaller(ctx, img)
+func (p *Publisher) publishInstaller(ctx context.Context, idx v1.ImageIndex, tag string) (string, error) {
+	h, err := p.pushInstaller(ctx, idx)
 	if err != nil {
 		return "", err
 	}
 	return h, p.tagInstaller(ctx, h, tag)
 }
 
-// pushInstaller pushes the installer image by digest, signs it and attests its SBOM: no tag moves.
-func (p *Publisher) pushInstaller(ctx context.Context, img v1.Image) (string, error) {
-	h, err := img.Digest()
+// pushInstaller pushes the installer index by digest with its images, signs each image and the
+// index, and attests each image's SBOM (of its own platform) and the index's (its target image's):
+// no tag moves.
+func (p *Publisher) pushInstaller(ctx context.Context, idx v1.ImageIndex) (string, error) {
+	h, err := idx.Digest()
 	if err != nil {
 		return "", err
 	}
@@ -261,17 +411,70 @@ func (p *Publisher) pushInstaller(ctx context.Context, img v1.Image) (string, er
 		return "", err
 	} else if have == nil {
 		p.logf("installer: push %s", registry.Short(h.String()))
-		if err := p.Registry.WriteImage(ctx, d, img); err != nil {
+		if err := p.Registry.WriteIndex(ctx, d, idx); err != nil {
 			return "", err
 		}
+	}
+	im, err := idx.IndexManifest()
+	if err != nil {
+		return "", err
+	}
+	var target *name.Digest
+	for _, e := range im.Manifests {
+		ed, err := p.Registry.Digest(p.installerRepo(), e.Digest.String())
+		if err != nil {
+			return "", err
+		}
+		if e.Platform == nil {
+			return "", fmt.Errorf("installer: %s names no platform", ed)
+		}
+		pl := e.Platform.String()
+		if err := p.ensureSigned(ctx, ed); err != nil {
+			return "", fmt.Errorf("installer %s: %w", pl, err)
+		}
+		if err := p.ensureSBOM(ctx, ed, pl); err != nil {
+			return "", fmt.Errorf("installer %s: %w", pl, err)
+		}
+		if pl == installerbin.Target {
+			target = &ed
+		}
+	}
+	if target == nil {
+		return "", fmt.Errorf("installer: %s has no %s image", d, installerbin.Target)
 	}
 	if err := p.ensureSigned(ctx, d); err != nil {
 		return "", fmt.Errorf("installer: %w", err)
 	}
-	if err := p.ensureSBOM(ctx, d); err != nil {
+	// The index carries its target image's SBOM: what a reader of the release's installer digest
+	// audits is what a target runs.
+	if err := p.ensureSBOMOf(ctx, d, *target, "its "+installerbin.Target+" image"); err != nil {
 		return "", fmt.Errorf("installer: %w", err)
 	}
 	return h.String(), nil
+}
+
+// checkInstallerImages checks with checkSig the signature of each image of the installer index
+// inst, when it is in place and signatures are checked: each is signed on its own digest. An
+// installer a Stowage before indexes made is one image, checked as the index is; one missing is
+// reported by the index's check.
+func (p *Publisher) checkInstallerImages(ctx context.Context, inst string, checkSig func(repo, digest string) error) error {
+	if !p.signed() {
+		return nil
+	}
+	d, err := p.Registry.Digest(p.installerRepo(), inst)
+	if err != nil {
+		return err
+	}
+	entries, _, err := p.Registry.Platforms(ctx, d)
+	if err != nil {
+		return err
+	}
+	for _, e := range entries {
+		if err := checkSig(p.installerRepo(), e.Digest.String()); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // tagInstaller points the installer's release tag at the installer h, pushed by pushInstaller.

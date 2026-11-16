@@ -396,7 +396,7 @@ func TestAChildPrintsTheResult(t *testing.T) {
 func TestTheVerbsTakeJSON(t *testing.T) {
 	t.Parallel()
 	e := newKubeEnv(t, spec.Provider{Name: "none"})
-	tools := K8sOptions{Helm: kubeTool{e.f, "helm"}, Kubectl: kubeTool{e.f, "kubectl"}}
+	tools := e.tools()
 	root := newCommand(e.release, "notes-stow", io.Discard, io.Discard, tools, func(bool) Prompter { return nil })
 	for _, path := range [][]string{{}, {"upgrade"}, {"rollback"}, {"uninstall"}, {"k8s", "install"}, {"k8s", "upgrade"}, {"k8s", "rollback"}, {"k8s", "uninstall"}} {
 		c, _, err := root.Find(path)

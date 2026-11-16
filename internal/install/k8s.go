@@ -49,6 +49,9 @@ type K8sOptions struct {
 	UnsafeSysctls *bool
 	Helm          Tool
 	Kubectl       Tool
+	// JobImage pins the installer image ref (an index) to the image a Job runs; nil reads the
+	// index in the registry at prefix (jobImage).
+	JobImage func(ctx context.Context, prefix, ref string) (string, error)
 }
 
 // MinHelm is the oldest helm the installer accepts: --reset-then-reuse-values.
@@ -1193,7 +1196,7 @@ func (in *Installer) k8sDeploy(ctx context.Context, upgrade bool) (err error) {
 	}
 	// The hook runs from the release's installer image: one the registry does not hold refuses
 	// the run before anything changes.
-	plan, err := in.k8sHookPlanWith(ctx, prefix, func() (string, error) { return in.hookImage(ctlRef, ctlErr, hookUse) })
+	plan, err := in.k8sHookPlanWith(ctx, prefix, func() (string, error) { return in.hookImage(ctx, prefix, ctlRef, ctlErr, hookUse) })
 	if err != nil {
 		return err
 	}

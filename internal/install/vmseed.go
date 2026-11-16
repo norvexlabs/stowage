@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -15,10 +16,12 @@ import (
 	"github.com/norvexlabs/stowage/internal/lint"
 	"github.com/norvexlabs/stowage/internal/registry"
 	"github.com/norvexlabs/stowage/internal/release"
+	"github.com/norvexlabs/stowage/internal/spec"
 )
 
 // VMSeed is `vm seed --json`: a new VM's first-boot material, for a tool that creates the VM with
-// its own means. It is what `vm create --create manual` writes, made by the same steps.
+// its own means. It is what `vm create` writes beside the VM an operator makes, made by the same
+// steps.
 type VMSeed struct {
 	Format   int    `json:"format"` // MachineFormat
 	Platform string `json:"platform"`
@@ -48,6 +51,11 @@ type VMSeed struct {
 	// SSH (`install --given -`), its front serving them (--tls byo).
 	AwaitSecrets bool `json:"await_secrets,omitempty"`
 	AwaitTLS     bool `json:"await_tls,omitempty"`
+	// AwaitGiven are the keys of the secret inputs the --answers file gives, sorted (never a
+	// value): the first install waits for them, given over SSH once the VM answers (`install
+	// --given -`, a file `project: <name>` and `inputs: {KEY: value}`), with the certificate when
+	// AwaitTLS. Empty: omitted.
+	AwaitGiven []string `json:"await_given,omitempty"`
 	// Waiting are the keys of the required secret inputs nothing gives, sorted (never a value):
 	// the VM's first install waits for them, given over SSH once the VM answers. Empty: omitted.
 	Waiting []string `json:"waiting,omitempty"`
@@ -59,12 +67,42 @@ type VMSeed struct {
 	// gives them, sorted by role: what the program creating the VM gives each NIC; [] when the
 	// release declares none (never omitted: a consumer tells an installer that names none).
 	Interfaces []SeedInterface `json:"interfaces"`
+	// Size is the VM's size the release takes (shapes.kairos.size): what a program creating the VM
+	// refuses under (min) and makes by default (recommended).
+	Size SeedSize `json:"size"`
+	// Firewall is what a platform's own firewall in front of the VM lets through: SSH from
+	// SSHSources, and each port the VM's own firewall opens, from its sources.
+	Firewall SeedFirewall `json:"firewall"`
+}
+
+// SeedSize is a VM's CPUs, memory and app's space on its disk (to which each disk's disk_gib adds
+// what Kairos takes), each at least the floor every VM needs (1 CPU, 1024 MiB, 4 GiB) raised by the
+// release's size.min, and by default its size.recommended (else 2 CPUs, 4096 MiB, 20 GiB) raised
+// to that least.
+type SeedSize struct {
+	CPUs      SeedRange `json:"cpus"`
+	MemoryMiB SeedRange `json:"memory_mib"`
+	AppGiB    SeedRange `json:"app_gib"`
+}
+
+// SeedRange is a size's least and its default.
+type SeedRange struct {
+	Min         int `json:"min"`
+	Recommended int `json:"recommended"`
+}
+
+// SeedFirewall is the VM's reachable ports, for a platform's firewall: SSHSources are the CIDRs
+// --ssh-allow gave (every source without it), OpenPorts the front's ports and each L4 route's
+// (routeSources), never empty sources.
+type SeedFirewall struct {
+	SSHSources []string   `json:"ssh_sources"`
+	OpenPorts  []SeedPort `json:"open_ports"`
 }
 
 // SeedInterface is one NIC a seed's VM is made with: its role, the MAC its cloud-config names it
-// by (given, else generated on a hypervisor; empty for a VM of one NIC, named from the NIC it
-// has, and on a cloud, which gives its NICs their MACs), the network it attaches to (empty: the
-// primary's) and whether it is the primary.
+// by (given, else generated on a hypervisor; empty, so omitted, for a VM of one NIC, named from
+// the NIC it has and pinned to its MAC on its first boot, and on a cloud, which gives its NICs
+// their MACs), the network it attaches to (empty: the primary's) and whether it is the primary.
 type SeedInterface struct {
 	Role    string `json:"role"`
 	MAC     string `json:"mac,omitempty"`
@@ -154,8 +192,10 @@ func (in *Installer) checkInstallChannel(ctx context.Context, ch string) error {
 }
 
 // SeedVM is the first-boot material of a new VM of this release on c's platform, as so asks. It
-// never asks (the run's prompter is not read), and refuses a secret input or TLS material: a seed
-// carries neither; with --tls byo or --await-secrets its first install waits for them over SSH.
+// never asks (the run's prompter is not read), and refuses TLS material and a secret input on the
+// command line: a seed carries neither. Its first install waits over SSH, as vm create's does
+// (awaitOverSSH), for the secret inputs --answers holds, the certificate with --tls byo, a secrets
+// export with --await-secrets.
 func (in *Installer) SeedVM(ctx context.Context, c *VMCreate, so SeedOptions) (*VMSeed, error) {
 	in.O.Prompt, in.seeding = nil, true
 	channel := so.Channel
@@ -167,9 +207,6 @@ func (in *Installer) SeedVM(ctx context.Context, c *VMCreate, so SeedOptions) (*
 		return nil, seedRefusal("the certificate, its key, its CA or a client CA")
 	}
 	byo := in.O.TLS == "byo"
-	if byo && so.AwaitSecrets {
-		return nil, refuse("leave out --await-secrets, or --tls byo", "--tls byo and --await-secrets: the first install waits for one of them over SSH, the certificate (install --given -) or a secrets export (install --secrets -)")
-	}
 	if so.DiskDir != "" {
 		if st, err := os.Stat(so.DiskDir); err != nil || !st.IsDir() {
 			return nil, refuse("give --disk-dir a directory that exists", "--disk-dir %s is not a directory", so.DiskDir)
@@ -200,22 +237,18 @@ func (in *Installer) SeedVM(ctx context.Context, c *VMCreate, so SeedOptions) (*
 	if err != nil {
 		return nil, err
 	}
-	mach, st, waiting, given, ca, err := in.seedSettings(ctx, c, p, prefix)
+	secrets := ""
+	if so.AwaitSecrets {
+		secrets = "--await-secrets"
+	}
+	// The first install waits for what goes over SSH, pinned to the seed's one-time host key, as
+	// vm create's does: the seed carries none of it.
+	mach, st, waiting, given, ca, err := in.seedSettings(ctx, c, p, prefix, secrets)
 	if err != nil {
 		return nil, err
 	}
-	if given != nil {
-		return nil, seedRefusal(given.names())
-	}
 	if channel != "" {
 		st.Channel = channel
-	}
-	// The first install waits for what goes over SSH, pinned to the seed's one-time host key.
-	switch {
-	case byo:
-		st.AwaitSecrets, st.AwaitGiven = true, "byo"
-	case so.AwaitSecrets:
-		st.AwaitSecrets = true
 	}
 	userData, key, err := in.seedUserData(p, &mach, st, ca, true)
 	if err != nil {
@@ -225,9 +258,15 @@ func (in *Installer) SeedVM(ctx context.Context, c *VMCreate, so SeedOptions) (*
 	s := &VMSeed{Format: MachineFormat, Platform: p.Key, UserData: string(userData), MetaData: string(MetaData(mach)), KnownHostsLine: seedHostAlias + " " + key.Public,
 		Fingerprint: key.Fingerprint, HostKeyPrivate: string(key.Private), Disk: map[string]SeedDisk{}, AppGiB: app, Waiting: slices.Sorted(slices.Values(waiting)),
 		AwaitSecrets: so.AwaitSecrets, AwaitTLS: byo}
+	if given != nil {
+		s.AwaitGiven = slices.Sorted(maps.Keys(given.Inputs))
+	}
 	if login != nil {
 		s.RegistryLogin = login.Host
 	}
+	z := in.vmSize()
+	s.Size = SeedSize{CPUs: SeedRange{z.least.cpus, z.def.cpus}, MemoryMiB: SeedRange{z.least.mib, z.def.mib}, AppGiB: SeedRange{z.least.gib, z.def.gib}}
+	s.Firewall = SeedFirewall{SSHSources: sshSources(mach), OpenPorts: in.openedPorts(st)}
 	s.Interfaces = []SeedInterface{}
 	for _, i := range mach.Interfaces {
 		s.Interfaces = append(s.Interfaces, SeedInterface{Role: i.Role, MAC: i.MAC, Attach: i.Attach, Primary: i.Primary})
@@ -265,4 +304,85 @@ func (in *Installer) SeedVM(ctx context.Context, c *VMCreate, so SeedOptions) (*
 		s.DiskFile = &SeedDiskFile{Path: file, Format: d.Format, SHA256: h.Hex, DiskGiB: d.DiskGiB}
 	}
 	return s, nil
+}
+
+// SeedPort is a port the VM's firewall opens to some sources, for a platform's own firewall.
+type SeedPort struct {
+	Protocol string `json:"protocol"` // tcp or udp
+	Port     int    `json:"port"`
+	// Sources are the CIDRs the VM's own firewall lets reach the port, as the seed knows them
+	// (routeSources): every source for the front's ports, and an L4 route's allowlist.
+	Sources []string `json:"sources"`
+}
+
+// everySource is every IPv4 and IPv6 source.
+var everySource = []string{"0.0.0.0/0", "::/0"}
+
+// sshSources are the CIDRs SSH accepts (--ssh-allow), every source when none is given.
+func sshSources(m Machine) []string {
+	if len(m.SSHAllow) == 0 {
+		return everySource
+	}
+	var src []string
+	for _, a := range m.SSHAllow {
+		src = append(src, a.String())
+	}
+	return src
+}
+
+// openedPorts are the ports the VM's firewall opens besides SSH, each with its sources: the
+// front's, and each L4 route's but one the front holds to the loopback address (loopback mode).
+func (in *Installer) openedPorts(st *Settings) []SeedPort {
+	ports := []SeedPort{}
+	// The front's that something serves on in the mode given (frontServed); with none given, the
+	// mode the VM's install takes is not known here: both.
+	http, https := in.R.Spec.HasFront(), in.R.Spec.HasFront()
+	if st.TLS != "" {
+		http, https = frontServed(in.R.Spec.Front, in.R.Spec.L4.Routes, st.TLS)
+	}
+	if http {
+		ports = append(ports, SeedPort{"tcp", cmp.Or(st.HTTPPort, in.R.Spec.Front.HTTPPort, 80), everySource})
+	}
+	if https {
+		ports = append(ports, SeedPort{"tcp", cmp.Or(st.HTTPSPort, in.R.Spec.Front.HTTPSPort, 443), everySource})
+	}
+	for _, r := range in.R.Spec.L4.Routes {
+		// In loopback mode the front holds a route it terminates TLS on to the loopback address.
+		if r.Terminated() && st.TLS == Loopback {
+			continue
+		}
+		src, _ := in.routeSources(st, r)
+		ports = append(ports, SeedPort{r.Protocol, r.Port, src})
+	}
+	return ports
+}
+
+// routeSources are the sources the VM's firewall lets reach an L4 route's port, as the seed
+// knows them, and whether they are its allowlist's: every source for a route without an
+// allowlist or one the front terminates TLS on (the front filters its own port), and for an
+// allowlist whose value is not known here (a secret input, given over SSH; one the spec does not
+// declare; one the install refuses); else its input's value in the settings, or its default, as
+// the VM's firewall reads it (familySources: each a network's prefix, an IPv4-mapped address as
+// IPv4, one another holds left out), sorted by family — none when the list is empty, which the
+// VM's firewall refuses too. A platform's rules made from them are fixed when they are applied:
+// a later change of the list on the VM does not reach them.
+func (in *Installer) routeSources(st *Settings, r spec.L4Route) (sources []string, listed bool) {
+	i := slices.IndexFunc(in.R.Spec.Inputs, func(i spec.Input) bool { return i.Key == r.AllowInput })
+	v, given := st.Inputs[r.AllowInput]
+	switch {
+	case r.AllowInput == "" || r.Terminated() || i < 0:
+		return everySource, false
+	case !given && in.R.Spec.Inputs[i].Secret:
+		return everySource, false
+	case !given:
+		v = in.R.Spec.Inputs[i].Default
+	}
+	// A list the install refuses is no list a platform takes: every source, left to it.
+	if checkSources(v) != nil {
+		return everySource, false
+	}
+	v4, v6 := familySources(v)
+	slices.Sort(v4)
+	slices.Sort(v6)
+	return append(append([]string{}, v4...), v6...), true
 }

@@ -1,11 +1,13 @@
 package publish
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
+	"regexp"
 	"slices"
 	"strings"
 
@@ -218,10 +220,52 @@ func (p *Publisher) pruneDiskSets(ctx context.Context, channel string, keep *Ref
 	return errors.Join(errs...)
 }
 
-// remove deletes the manifest digest of repo with its signatures: each referrer, the referrers
-// fallback index, then the manifest itself.
+// remove deletes the manifest digest of repo with its signatures, then, an index, each manifest
+// it names that nothing else holds (removeAll). The repository's tags are read once for the pass
+// (the prune's snapshot when it has one), and only for an index.
 func (p *Publisher) remove(ctx context.Context, repo, digest string) error {
 	d, err := p.Registry.Digest(repo, digest)
+	if err != nil {
+		return err
+	}
+	h, err := v1.NewHash(d.DigestStr())
+	if err != nil {
+		return err
+	}
+	r := &removal{name: repo, repo: d.Context(), tags: map[string]v1.Hash{}}
+	named, err := p.manifestsOf(ctx, r.repo, h)
+	if err != nil {
+		return err
+	}
+	if len(named) > 0 {
+		if r.tags, err = p.snap.of(ctx, p, r.repo); err != nil {
+			return err
+		}
+		if r.tags == nil {
+			if r.tags, err = p.readTags(ctx, r.repo); err != nil {
+				return err
+			}
+		}
+	}
+	_, err = p.removeAll(ctx, r, []v1.Hash{h})
+	return err
+}
+
+// removal is one pass deleting manifests of a repository (removeAll): its tags, each tag's
+// manifest digest, kept in step with the pass's own marks and deletions; the manifests it visited
+// (done) and those it deleted (gone).
+type removal struct {
+	name string // the repository as the caller spelled it
+	repo name.Repository
+	tags map[string]v1.Hash
+	done map[v1.Hash]bool
+	gone map[v1.Hash]bool
+}
+
+// removeOne deletes the manifest h of r's repository with its signatures: each referrer, the
+// referrers fallback index, then the manifest itself, and drops every tag on it from r.tags.
+func (p *Publisher) removeOne(ctx context.Context, r *removal, h v1.Hash) error {
+	d, err := p.Registry.Digest(r.name, h.String())
 	if err != nil {
 		return err
 	}
@@ -229,8 +273,8 @@ func (p *Publisher) remove(ctx context.Context, repo, digest string) error {
 	if err != nil && !registry.NotFound(err) {
 		return err
 	}
-	for _, r := range refs {
-		rd, err := p.Registry.Digest(repo, r.Digest.String())
+	for _, ref := range refs {
+		rd, err := p.Registry.Digest(r.name, ref.Digest.String())
 		if err != nil {
 			return err
 		}
@@ -239,14 +283,14 @@ func (p *Publisher) remove(ctx context.Context, repo, digest string) error {
 		}
 		p.snap.dropDigest(rd)
 	}
-	fallback, err := p.Registry.Tag(repo, strings.Replace(digest, ":", "-", 1))
+	fallback, err := p.Registry.Tag(r.name, strings.Replace(h.String(), ":", "-", 1))
 	if err != nil {
 		return err
 	}
 	if fd, err := p.Registry.Head(ctx, fallback); err != nil {
 		return err
 	} else if fd != nil {
-		fr, err := p.Registry.Digest(repo, fd.Digest.String())
+		fr, err := p.Registry.Digest(r.name, fd.Digest.String())
 		if err != nil {
 			return err
 		}
@@ -254,13 +298,253 @@ func (p *Publisher) remove(ctx context.Context, repo, digest string) error {
 			return err
 		}
 		p.snap.dropDigest(fr)
+		dropTagsOn(r.tags, fd.Digest)
 	}
 	if err := p.deleter().DeleteManifest(ctx, d); err != nil {
 		return err
 	}
 	p.snap.dropDigest(d)
+	dropTagsOn(r.tags, h)
+	r.gone[h] = true
 	return nil
 }
+
+// dropTagsOn deletes from tags every tag naming d.
+func dropTagsOn(tags map[string]v1.Hash, d v1.Hash) {
+	maps.DeleteFunc(tags, func(_ string, h v1.Hash) bool { return h == d })
+}
+
+// removeAll deletes roots from r's repository, each with its signatures (removeOne), whatever holds
+// it (its caller judged it), then each manifest a deleted index names that nothing still there
+// holds (heldContent) — an installer's images, a mirrored multi-platform image's — returning
+// every manifest it deleted, in order. It goes in rounds: the indexes first, then the images, as a
+// registry refuses to delete a manifest an index still names (zot); what an index named is judged
+// in the next round, once every index of this one is gone, so a manifest two deleted indexes name
+// goes once, after both, and one a held mark's index outside the pass names stays. Each manifest
+// an index names that is left to go is marked held before the index goes, so a run stopped or
+// failing between leaves it to a sweep; one already gone when its round comes is skipped. Each
+// manifest is visited once, recorded in r.done (a sweep's passes share it). An error on one
+// manifest leaves the others to go.
+func (p *Publisher) removeAll(ctx context.Context, r *removal, roots []v1.Hash) ([]v1.Hash, error) {
+	if r.done == nil {
+		r.done = map[v1.Hash]bool{}
+	}
+	if r.gone == nil {
+		r.gone = map[v1.Hash]bool{}
+	}
+	var deleted []v1.Hash
+	var errs []error
+	fail := func(err error) ([]v1.Hash, error) { return deleted, errors.Join(append(errs, err)...) }
+	forced, cands := roots, []v1.Hash(nil)
+	for len(forced) > 0 || len(cands) > 0 {
+		// What holds a candidate, which only a deleted index named; a round of roots alone has none.
+		var held map[v1.Hash]bool
+		if len(cands) > 0 {
+			var err error
+			if held, err = p.heldContent(ctx, r.repo, r.tags, r.gone); err != nil {
+				return fail(err)
+			}
+		}
+		var indexes, images []v1.Hash
+		seen := map[v1.Hash]bool{}
+		for i, h := range append(slices.Clone(forced), cands...) {
+			candidate := i >= len(forced)
+			if r.done[h] || seen[h] || (candidate && held[h]) {
+				continue
+			}
+			seen[h] = true
+			if candidate {
+				// A candidate already gone is skipped: neither read from what manifestsOf kept of
+				// it nor reported deleted.
+				have, err := p.Registry.Head(ctx, r.repo.Digest(h.String()))
+				if err != nil || have == nil {
+					r.done[h] = true
+					if err != nil {
+						errs = append(errs, err)
+					}
+					continue
+				}
+			}
+			named, err := p.manifestsOf(ctx, r.repo, h)
+			if err != nil {
+				return fail(err)
+			}
+			if len(named) > 0 {
+				indexes = append(indexes, h)
+			} else {
+				images = append(images, h)
+			}
+		}
+		// What holds an index's manifests once the indexes of this round are gone.
+		if len(indexes) > 0 {
+			except := maps.Clone(r.gone)
+			for _, h := range indexes {
+				except[h] = true
+			}
+			var err error
+			if held, err = p.heldContent(ctx, r.repo, r.tags, except); err != nil {
+				return fail(err)
+			}
+		}
+		var next []v1.Hash
+		for _, h := range indexes {
+			r.done[h] = true
+			named, err := p.manifestsOf(ctx, r.repo, h)
+			if err != nil {
+				errs = append(errs, err)
+				continue
+			}
+			var orphans []v1.Hash
+			var markErr error
+			for _, m := range named {
+				p.noteManifest(m.Digest, m.MediaType.IsIndex())
+				if held[m.Digest] || r.done[m.Digest] || slices.Contains(orphans, m.Digest) {
+					continue
+				}
+				if mark := heldTag(m.Digest); r.tags[mark] != m.Digest {
+					if markErr = p.markHeld(ctx, r.repo, m.Digest); markErr != nil {
+						break
+					}
+					r.tags[mark] = m.Digest
+				}
+				orphans = append(orphans, m.Digest)
+			}
+			if markErr != nil {
+				errs = append(errs, markErr)
+				continue
+			}
+			if err := p.removeOne(ctx, r, h); err != nil {
+				errs = append(errs, err)
+				continue
+			}
+			deleted = append(deleted, h)
+			next = append(next, orphans...)
+		}
+		for _, h := range images {
+			r.done[h] = true
+			if err := p.removeOne(ctx, r, h); err != nil {
+				errs = append(errs, err)
+				continue
+			}
+			deleted = append(deleted, h)
+		}
+		forced, cands = nil, next
+	}
+	return deleted, errors.Join(errs...)
+}
+
+// manifestsOf is the manifests the index d of repo names, every entry (an image, an index, an
+// attestation); none for an image, or for nothing. Each index is read once per run.
+func (p *Publisher) manifestsOf(ctx context.Context, repo name.Repository, d v1.Hash) ([]v1.Descriptor, error) {
+	p.indexes.Lock()
+	named, ok := p.indexes.of[d]
+	p.indexes.Unlock()
+	if ok {
+		return named, nil
+	}
+	isIndex, known := p.knownIndex(d)
+	if !known {
+		desc, err := p.Registry.Head(ctx, repo.Digest(d.String()))
+		if err != nil || desc == nil {
+			return nil, err
+		}
+		isIndex = desc.MediaType.IsIndex()
+	}
+	if isIndex {
+		desc, err := p.Registry.Get(ctx, repo.Digest(d.String()))
+		if err != nil || desc == nil {
+			return nil, err
+		}
+		if desc.MediaType.IsIndex() {
+			im, err := v1.ParseIndexManifest(bytes.NewReader(desc.Manifest))
+			if err != nil {
+				return nil, fmt.Errorf("read %s: %w", repo.Digest(d.String()), err)
+			}
+			named = im.Manifests
+		}
+	}
+	p.indexes.Lock()
+	if p.indexes.of == nil {
+		p.indexes.of = map[v1.Hash][]v1.Descriptor{}
+	}
+	p.indexes.of[d] = named
+	p.indexes.Unlock()
+	return named, nil
+}
+
+// noteManifest records whether the manifest d is an index, as a HEAD or an index's entry described
+// it: manifestsOf then reads it without a HEAD, and an image not at all.
+func (p *Publisher) noteManifest(d v1.Hash, isIndex bool) {
+	p.indexes.Lock()
+	defer p.indexes.Unlock()
+	if p.indexes.index == nil {
+		p.indexes.index = map[v1.Hash]bool{}
+	}
+	p.indexes.index[d] = isIndex
+}
+
+// knownIndex is whether the manifest d is an index, as noteManifest recorded it (known false:
+// never described).
+func (p *Publisher) knownIndex(d v1.Hash) (isIndex, known bool) {
+	p.indexes.Lock()
+	defer p.indexes.Unlock()
+	isIndex, known = p.indexes.index[d]
+	return isIndex, known
+}
+
+// heldContent is the content the tags of repo (tags: each tag's manifest digest) hold, but a tag
+// on a manifest of except (one deleted, or being deleted, by the pass): each tag's manifest, and
+// every manifest an index among them names, at any depth (manifestsOf). A held mark holds what its
+// index names (a registry refuses to delete it while the index is there), never its own manifest,
+// which is the sweep's to judge. A referrers fallback index (sha256-<hex>) holds itself alone:
+// what it names are referrers, which go with their subject.
+func (p *Publisher) heldContent(ctx context.Context, repo name.Repository, tags map[string]v1.Hash, except map[v1.Hash]bool) (map[v1.Hash]bool, error) {
+	held := map[v1.Hash]bool{}
+	walked := map[v1.Hash]bool{}
+	var walk func(d v1.Hash) error
+	walk = func(d v1.Hash) error {
+		if walked[d] {
+			return nil
+		}
+		walked[d] = true
+		named, err := p.manifestsOf(ctx, repo, d)
+		if err != nil {
+			return err
+		}
+		for _, m := range named {
+			held[m.Digest] = true
+			p.noteManifest(m.Digest, m.MediaType.IsIndex())
+			if m.MediaType.IsIndex() {
+				if err := walk(m.Digest); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}
+	for _, t := range slices.Sorted(maps.Keys(tags)) {
+		d := tags[t]
+		switch {
+		case except[d]:
+		case fallbackTag.MatchString(t):
+			held[d] = true
+		case strings.HasPrefix(t, heldPrefix):
+			if err := walk(d); err != nil {
+				return nil, err
+			}
+		default:
+			held[d] = true
+			if err := walk(d); err != nil {
+				return nil, err
+			}
+		}
+	}
+	return held, nil
+}
+
+// fallbackTag is a referrers fallback index's tag (the OCI distribution spec's): its subject's
+// digest, sha256-<hex>.
+var fallbackTag = regexp.MustCompile(`^sha256-[0-9a-f]{64}$`)
 
 // heldPrefix starts the tag that marks content whose tag was retired while another tag held it:
 // held-<the digest's first 12 hex digits>. The registry is the record, so a run stopped part way
@@ -362,6 +646,7 @@ func (p *Publisher) readTags(ctx context.Context, repo name.Repository) (map[str
 		}
 		if h != nil {
 			out[t] = h.Digest
+			p.noteManifest(h.Digest, h.MediaType.IsIndex())
 		}
 	}
 	return out, nil
@@ -491,8 +776,7 @@ func (p *Publisher) sweepRepo(ctx context.Context, repoName string, only map[str
 	if len(marks) == 0 {
 		return nil
 	}
-	marked := map[string]v1.Hash{} // mark → the content it names
-	held := map[v1.Hash]bool{}     // content a tag other than a mark holds
+	tagged := map[string]v1.Hash{} // every tag → the content it names
 	for _, t := range tags {
 		ref, err := p.Registry.Tag(repoName, t)
 		if err != nil {
@@ -502,29 +786,35 @@ func (p *Publisher) sweepRepo(ctx context.Context, repoName string, only map[str
 		if err != nil {
 			return err
 		}
-		switch {
-		case h == nil:
-		case strings.HasPrefix(t, heldPrefix):
-			marked[t] = h.Digest
-		default:
-			held[h.Digest] = true
+		if h == nil {
+			continue
 		}
+		tagged[t] = h.Digest
+		p.noteManifest(h.Digest, h.MediaType.IsIndex())
 	}
-	var errs []error
-	done := map[v1.Hash]bool{}
+	// What a tag other than a mark holds, and what an index any tag holds names (a mark's
+	// included): removeAll marks an index's manifests before it deletes the index, and a stopped
+	// run leaves them marked under an index a re-ship may have tagged again, or another mark's
+	// index outside this sweep may name. A manifest a marked index of this sweep names goes with
+	// it (removeAll), once no index left names it.
+	held, err := p.heldContent(ctx, repo, tagged, nil)
+	if err != nil {
+		return err
+	}
+	var roots []v1.Hash
 	for _, m := range marks {
-		d, ok := marked[m]
-		if !ok || held[d] || done[d] {
-			continue
+		if d, ok := tagged[m]; ok && !held[d] && !slices.Contains(roots, d) {
+			roots = append(roots, d)
 		}
-		done[d] = true
-		if err := p.remove(ctx, repoName, d.String()); err != nil {
-			errs = append(errs, err)
-			continue
-		}
-		p.logf("%s deleted: no tag holds it any more", repo.Digest(d.String()))
 	}
-	return errors.Join(errs...)
+	if len(roots) == 0 {
+		return nil
+	}
+	deleted, err := p.removeAll(ctx, &removal{name: repoName, repo: repo, tags: tagged}, roots)
+	for _, h := range deleted {
+		p.logf("%s deleted: no tag holds it any more", repo.Digest(h.String()))
+	}
+	return err
 }
 
 // cleanDisks makes rel's disks its channel's set and removes the channel's older disk sets, once

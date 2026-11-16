@@ -5,6 +5,7 @@ package registry
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -16,6 +17,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -385,11 +387,12 @@ func RetiredDigest() (v1.Hash, error) { return retiredDigest() }
 
 var retiredDigest = sync.OnceValues(func() (v1.Hash, error) { return Retired().Digest() })
 
-// Labels are the labels of the image ref names (an index: its linux/amd64 image's).
-func (c *Client) Labels(ctx context.Context, ref name.Reference) (map[string]string, error) {
-	img, err := remote.Image(ref, append(c.opts(ctx), remote.WithPlatform(v1.Platform{OS: "linux", Architecture: "amd64"}))...)
+// Labels are the labels of the image ref names for platform (ImageFor: an index's image for it;
+// an image of another platform is refused).
+func (c *Client) Labels(ctx context.Context, ref name.Reference, platform v1.Platform) (map[string]string, error) {
+	img, err := c.ImageFor(ctx, ref, platform)
 	if err != nil {
-		return nil, fmt.Errorf("read %s: %w", ref, err)
+		return nil, err
 	}
 	cf, err := img.ConfigFile()
 	if err != nil {
@@ -456,25 +459,119 @@ func (c *Client) Copy(ctx context.Context, src name.Reference, dst name.Referenc
 	return c.WriteImage(ctx, dst, img)
 }
 
-// PlatformImage returns the manifest and config digests of ref's image for platform (an index
-// resolves to that platform's image; an image is its own, and must be for that platform).
+// PlatformImage returns the manifest and config digests of ref's image for platform (ImageFor).
 func (c *Client) PlatformImage(ctx context.Context, ref name.Digest, platform v1.Platform) (manifest, config v1.Hash, err error) {
-	img, err := remote.Image(ref, append(c.opts(ctx), remote.WithPlatform(platform))...)
+	img, err := c.ImageFor(ctx, ref, platform)
 	if err != nil {
-		return v1.Hash{}, v1.Hash{}, fmt.Errorf("read %s: %w", ref, err)
-	}
-	cf, err := img.ConfigFile()
-	if err != nil {
-		return v1.Hash{}, v1.Hash{}, fmt.Errorf("read %s: %w", ref, err)
-	}
-	if cf.OS != platform.OS || cf.Architecture != platform.Architecture {
-		return v1.Hash{}, v1.Hash{}, fmt.Errorf("%s is a %s/%s image, not %s/%s", ref, cf.OS, cf.Architecture, platform.OS, platform.Architecture)
+		return v1.Hash{}, v1.Hash{}, err
 	}
 	if manifest, err = img.Digest(); err != nil {
 		return v1.Hash{}, v1.Hash{}, err
 	}
 	config, err = img.ConfigName()
 	return manifest, config, err
+}
+
+// ImageFor reads the image ref names for platform (os/arch[/variant]): an index's first entry for
+// it, or an image, which must be for it; the image's config must name it too. Each is matched as
+// an OCI client matches them (v1.Platform.Satisfies): a variant only when platform names one, an
+// unset one taking any. An index without an entry for platform is refused, naming the platforms
+// it has.
+func (c *Client) ImageFor(ctx context.Context, ref name.Reference, platform v1.Platform) (v1.Image, error) {
+	d, err := c.Get(ctx, ref)
+	if err != nil {
+		return nil, err
+	}
+	if d == nil {
+		return nil, fmt.Errorf("%s: no such manifest", ref)
+	}
+	var img v1.Image
+	if d.MediaType.IsIndex() {
+		idx, err := d.ImageIndex()
+		if err != nil {
+			return nil, fmt.Errorf("read %s: %w", ref, err)
+		}
+		entries, err := platformEntries(idx)
+		if err != nil {
+			return nil, fmt.Errorf("read %s: %w", ref, err)
+		}
+		var have []string
+		for _, e := range entries {
+			if e.Platform.Satisfies(platform) {
+				img, err = idx.Image(e.Digest)
+				if err != nil {
+					return nil, fmt.Errorf("read %s: %w", ref, err)
+				}
+				break
+			}
+			have = append(have, e.Platform.String())
+		}
+		if img == nil {
+			return nil, fmt.Errorf("%s has no image for %s (it has %s): %w", ref, platform, cmp.Or(strings.Join(have, ", "), "none"), ErrNoPlatform)
+		}
+	} else if img, err = d.Image(); err != nil {
+		return nil, fmt.Errorf("read %s: %w", ref, err)
+	}
+	cf, err := img.ConfigFile()
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", ref, err)
+	}
+	if got := (v1.Platform{OS: cf.OS, Architecture: cf.Architecture, Variant: cf.Variant}); !got.Satisfies(platform) {
+		return nil, fmt.Errorf("%s is a %s image, not %s: %w", ref, got.String(), platform, ErrNoPlatform)
+	}
+	return img, nil
+}
+
+// ErrNoPlatform is ImageFor's refusal of a reference holding no image for the platform asked.
+var ErrNoPlatform = errors.New("no image for this platform")
+
+// PlatformEntry is an index's image for one platform.
+type PlatformEntry struct {
+	Platform v1.Platform
+	Digest   v1.Hash
+}
+
+// Platforms lists the entries of the index ref names, in its order; index is false (and the list
+// nil) when ref names an image, or nothing: what reads an absent manifest says so itself.
+func (c *Client) Platforms(ctx context.Context, ref name.Reference) (entries []PlatformEntry, index bool, err error) {
+	d, err := c.Get(ctx, ref)
+	if err != nil || d == nil || !d.MediaType.IsIndex() {
+		return nil, false, err
+	}
+	idx, err := d.ImageIndex()
+	if err != nil {
+		return nil, true, fmt.Errorf("read %s: %w", ref, err)
+	}
+	entries, err = platformEntries(idx)
+	if err != nil {
+		return nil, true, fmt.Errorf("read %s: %w", ref, err)
+	}
+	return entries, true, nil
+}
+
+// platformEntries are the image entries of idx that name a platform; another entry (an index, an
+// artifact, an attestation manifest naming no platform) is none.
+func platformEntries(idx v1.ImageIndex) ([]PlatformEntry, error) {
+	im, err := idx.IndexManifest()
+	if err != nil {
+		return nil, err
+	}
+	var out []PlatformEntry
+	for _, m := range im.Manifests {
+		if m.Platform == nil || !m.MediaType.IsImage() {
+			continue
+		}
+		out = append(out, PlatformEntry{Platform: *m.Platform, Digest: m.Digest})
+	}
+	return out, nil
+}
+
+// WriteIndex pushes an index, with every image it names, under a tag or untagged under its digest.
+func (c *Client) WriteIndex(ctx context.Context, ref name.Reference, idx v1.ImageIndex) error {
+	if err := remote.WriteIndex(ref, idx, c.opts(ctx)...); err != nil {
+		return fmt.Errorf("push %s: %w", ref, err)
+	}
+	return nil
 }
 
 // Retag points tag at the manifest digest already holds in the same repository: no blob moves.

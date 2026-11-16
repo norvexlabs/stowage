@@ -34,9 +34,9 @@ grep -q 'image postgres: mirror' "$WORK/ship1.log" || fail "postgres was not mir
 grep -q 'image front: build' "$WORK/ship1.log" || fail "the front was not built"
 grep -q 'installer: push' "$WORK/ship1.log" || fail "the installer was not pushed"
 grep -q 'chart: tag .* → charts/notes-beta:0.1.0' "$WORK/ship1.log" || fail "the chart was not pushed"
-[[ $(grep -c '^signed ' "$WORK/ship1.log") == 10 ]] || { cat "$WORK/ship1.log"; fail "want 10 signatures (3 images, the front, the backup runner, the volume helper, the scanner, the chart, the installer, the release manifest)"; }
+[[ $(grep -c '^signed ' "$WORK/ship1.log") == 14 ]] || { cat "$WORK/ship1.log"; fail "want 14 signatures (3 images, the front, the backup runner, the volume helper, the scanner, the chart, the installer's index and its 4 images, the release manifest)"; }
 grep -q 'image audit: build' "$WORK/ship1.log" || fail "the scanner was not built"
-[[ $(grep -c '^attested the SBOM of ' "$WORK/ship1.log") == 8 ]] || { cat "$WORK/ship1.log"; fail "want 8 SBOMs (the 7 images, the installer)"; }
+[[ $(grep -c '^attested the SBOM of ' "$WORK/ship1.log") == 12 ]] || { cat "$WORK/ship1.log"; fail "want 12 SBOMs (the 7 images, the installer's 4 images, its index carrying its linux/amd64 image's)"; }
 
 step "ship beta again (nothing changes)"
 "${S[@]}" ship --channel beta 2>"$WORK/ship2.log" || { cat "$WORK/ship2.log"; fail "ship"; }
@@ -54,8 +54,10 @@ step "audit: every SBOM attested by the release key, scanned (the database given
 grype_db
 env -u STOWAGE_PUSH_TOKEN "${S[@]}" audit --channel beta --db "$GRYPE_DB" --json >"$WORK/audit.json" 2>"$WORK/audit.log" ||
 	{ cat "$WORK/audit.log" "$WORK/audit.json"; fail "audit"; }
-[[ $(jq '.subjects | length' "$WORK/audit.json") == 8 && $(jq '[.subjects[] | select(.error)] | length' "$WORK/audit.json") == 0 ]] ||
+[[ $(jq '.subjects | length' "$WORK/audit.json") == 11 && $(jq '[.subjects[] | select(.error)] | length' "$WORK/audit.json") == 0 ]] ||
 	{ cat "$WORK/audit.json"; fail "not every artifact was audited"; }
+[[ $(jq -c '[.subjects[] | select(.name == "installer") | .platform]' "$WORK/audit.json") == '[null,"linux/arm64","darwin/amd64","darwin/arm64"]' ]] ||
+	{ cat "$WORK/audit.json"; fail "the installer's images are not each audited"; }
 [[ $(jq -r '.subjects[] | select(.name == "postgres") | .findings | type' "$WORK/audit.json") == array ]] && jq -e '.db_built | type == "string"' "$WORK/audit.json" >/dev/null ||
 	fail "the audit's report lacks the scan"
 api=$(jq -r '.subjects[] | select(.name == "api") | .digest' "$WORK/audit.json")
@@ -101,6 +103,24 @@ head -1 "$WORK/notes.sh" | grep -q '^#!/bin/sh' || fail "the installer image did
 (cd "$WORK" && sh notes.sh --help) >"$WORK/help.txt" || { cat "$WORK/help.txt"; fail "the script did not run the installer"; }
 grep -q 'Install and manage notes 1.0.0 with Docker' "$WORK/help.txt" || { cat "$WORK/help.txt"; fail "installer help"; }
 compgen -G "$WORK/.notes-stow.*" >/dev/null && fail "the script left its extracted installer behind"
+
+step "the installer image: an index of one image per platform, each one file, signed and attested on its own"
+INDEX_ACCEPT='Accept: application/vnd.oci.image.index.v1+json'
+curl -sf -u "pull:$PULL_TOKEN" -H "$INDEX_ACCEPT" "http://$REG/v2/notes/notes-installer/manifests/1.0.0" >"$WORK/installer-index.json" || fail "reading the installer index"
+jq -e '.mediaType == "application/vnd.oci.image.index.v1+json" and [.manifests[] | .platform.os + "/" + .platform.architecture] == ["linux/amd64", "linux/arm64", "darwin/amd64", "darwin/arm64"]' "$WORK/installer-index.json" >/dev/null ||
+	{ cat "$WORK/installer-index.json"; fail "the installer is not an index of linux/amd64, linux/arm64, darwin/amd64, darwin/arm64"; }
+mac=$(jq -r '.manifests[3].digest' "$WORK/installer-index.json")
+DOCKER_CONFIG=$WORK/pull-config "$STOWAGE_COSIGN" verify --key "$P/keys/release.pub" --insecure-ignore-tlog=true --allow-http-registry "$REG/notes/notes-installer@$mac" >/dev/null 2>"$WORK/verify-mac.log" ||
+	{ tail -5 "$WORK/verify-mac.log"; fail "the darwin/arm64 installer image is not signed on its own"; }
+DOCKER_CONFIG=$WORK/pull-config "$STOWAGE_COSIGN" verify-attestation --key "$P/keys/release.pub" --type spdxjson --insecure-ignore-tlog=true --allow-http-registry "$REG/notes/notes-installer@$mac" 2>"$WORK/verify-mac-att.log" |
+	jq -r .payload | base64 -d | jq -e '.predicate.spdxVersion | startswith("SPDX-")' >/dev/null ||
+	{ tail -5 "$WORK/verify-mac-att.log"; fail "the darwin/arm64 installer image carries no SBOM of its own"; }
+curl -sf -u "pull:$PULL_TOKEN" -H 'Accept: application/vnd.oci.image.manifest.v1+json' "http://$REG/v2/notes/notes-installer/manifests/$mac" >"$WORK/installer-mac.json" || fail "reading the darwin/arm64 installer image"
+[[ $(jq '.layers | length' "$WORK/installer-mac.json") == 1 ]] || { cat "$WORK/installer-mac.json"; fail "the darwin/arm64 installer image is not one layer"; }
+curl -sfL -u "pull:$PULL_TOKEN" "http://$REG/v2/notes/notes-installer/blobs/$(jq -r '.layers[0].digest' "$WORK/installer-mac.json")" >"$WORK/installer-mac.tgz" || fail "reading its layer"
+[[ $(tar -tzf "$WORK/installer-mac.tgz") == notes-stow ]] || { tar -tvzf "$WORK/installer-mac.tgz"; fail "the darwin/arm64 installer layer is not one file, notes-stow"; }
+[[ $(tar -xzOf "$WORK/installer-mac.tgz" notes-stow | head -c 4 | od -An -tx1 | tr -d ' \n') == cffaedfe ]] || fail "the darwin/arm64 notes-stow is no 64-bit Mach-O"
+[[ $(tar -xzOf "$WORK/installer-mac.tgz" notes-stow | tail -c 16) == STOWAGE-PAYLOAD1 ]] || fail "the darwin/arm64 notes-stow carries no payload"
 # The front shipped is the pinned Caddy, with the Cloudflare DNS plugin and the layer4 app (an L4
 # route's TLS).
 docker run --rm --pull always "$REG/notes/notes-front:1.0.0" sh -c 'caddy version; caddy list-modules' >"$WORK/front.txt" 2>&1 || { cat "$WORK/front.txt"; fail "docker run of the front"; }
@@ -139,14 +159,14 @@ step "yank"
 grep -q '^signed .*notes-release@' "$WORK/yank.log" || { cat "$WORK/yank.log"; fail "the yanked manifest was not signed"; }
 env -u STOWAGE_PUSH_TOKEN "${S[@]}" verify 1.0.0 --channel stable >/dev/null
 if "${S[@]}" verify --channel stable 2>/dev/null; then fail "stable still has a pointer after yanking its only release"; fi
-expect_code 404 -u "pull:$PULL_TOKEN" -H "$ACCEPT" "http://$REG/v2/notes/notes-installer/manifests/latest"
+expect_code 404 -u "pull:$PULL_TOKEN" -H "$INDEX_ACCEPT" "http://$REG/v2/notes/notes-installer/manifests/latest"
 "${S[@]}" releases | tee "$WORK/releases.txt"
 grep -qE '^stable +1\.0\.0 .* e2e$' "$WORK/releases.txt" || fail "yank not listed"
 
 step "prune beta (tag deletion keeps the stable tag on the same digest)"
 [[ $("${S[@]}" prune --channel beta 1.0.0) == beta-1.0.0 ]] || fail "prune output"
 expect_code 404 -u "pull:$PULL_TOKEN" -H "$ACCEPT" "http://$REG/v2/notes/notes-api/manifests/beta-1.0.0"
-expect_code 404 -u "pull:$PULL_TOKEN" -H "$ACCEPT" "http://$REG/v2/notes/notes-installer/manifests/beta-1.0.0"
+expect_code 404 -u "pull:$PULL_TOKEN" -H "$INDEX_ACCEPT" "http://$REG/v2/notes/notes-installer/manifests/beta-1.0.0"
 expect_code 404 -u "pull:$PULL_TOKEN" -H "$ACCEPT" "http://$REG/v2/notes/notes-front/manifests/beta-1.0.0"
 expect_code 404 -u "pull:$PULL_TOKEN" -H "$ACCEPT" "http://$REG/v2/notes/charts/notes-beta/manifests/0.1.0"
 expect_code 200 -u "pull:$PULL_TOKEN" -H "$ACCEPT" "http://$REG/v2/notes/notes-api/manifests/1.0.0"

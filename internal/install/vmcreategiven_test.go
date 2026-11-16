@@ -3,10 +3,8 @@ package install
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/norvexlabs/stowage/internal/testutil"
 	"io"
 	"maps"
 	"os"
@@ -18,6 +16,7 @@ import (
 
 	"github.com/norvexlabs/stowage/internal/release"
 	"github.com/norvexlabs/stowage/internal/spec"
+	"github.com/norvexlabs/stowage/internal/testutil"
 )
 
 func TestGivenIsDecodedStrictly(t *testing.T) {
@@ -318,102 +317,6 @@ func TestVMCreateByHandGivesAByoCertificateAndASecretThroughAFile(t *testing.T) 
 	}
 }
 
-func TestVMCreateWithOpenTofuGivesAByoCertificateOverThePinnedSSH(t *testing.T) {
-	t.Parallel()
-	v := newVMCreate(t, "qcow2")
-	mark, keyPEM, mod := byoVM(t, v)
-	r := newTofuRun(t)
-	const own = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMttF2bIpr7R386X4GUm0TkSzgnDFwXOzWeDxQGI7oDJ"
-	r.ssh.answers = []func() ([]byte, error){refused, statusIn("recovery", false), statusJSON(false), statusJSON(false),
-		func() ([]byte, error) { return []byte(own + " root@notes-1\n"), nil }}
-	if err := v.create(tofuCreate(), r.mod(func(o *Options) { o.TLS = ""; mod(o) })); err != nil {
-		t.Fatalf("%v\n%s", err, v.log)
-	}
-	if len(r.ssh.calls) != 5 || !strings.HasSuffix(strings.Join(r.ssh.calls[3], " "), "sudo notes-stow install --given - --no-input") {
-		t.Fatalf("ssh %v", r.ssh.calls)
-	}
-	g, err := parseGiven([]byte(r.ssh.stdin[3]), "notes")
-	if err != nil || g.Inputs["API_KEY"] != mark || g.TLS.Key != string(keyPEM) {
-		t.Errorf("%+v %v", g, err)
-	}
-	for _, call := range r.ssh.calls[1:] {
-		if !strings.Contains(strings.Join(call, " "), "StrictHostKeyChecking=yes") {
-			t.Errorf("not pinned: %v", call)
-		}
-	}
-	dir := filepath.Join(r.state, "notes", "vms", "notes-1")
-	seed, _, _ := readSeed(t, filepath.Join(dir, "seed.iso"))
-	if st, _ := cloudSettings(t, seed); !st.AwaitSecrets || strings.Contains(seed, mark) || strings.Contains(seed, strings.Split(string(keyPEM), "\n")[1]) {
-		t.Errorf("seed:\n%s", seed)
-	}
-	if _, err := os.Stat(filepath.Join(dir, "given.yaml")); !errors.Is(err, os.ErrNotExist) {
-		t.Errorf("a done install keeps the material on disk: %v", err)
-	}
-	if !strings.Contains(v.out2(), "The VM notes-1 runs notes 1.0.0") {
-		t.Errorf("out:\n%s", v.out2())
-	}
-}
-
-// A VM that never answers keeps what it waits for, and the error says how to give it.
-func TestVMCreateWithOpenTofuNeverAnsweringKeepsWhatItWaitsFor(t *testing.T) {
-	t.Parallel()
-	v := newVMCreate(t, "qcow2")
-	_, _, mod := byoVM(t, v)
-	r := newTofuRun(t)
-	r.ssh.answers = []func() ([]byte, error){refused}
-	c := tofuCreate()
-	c.Wait = 50 * time.Millisecond
-	err := v.create(c, r.mod(func(o *Options) { o.TLS = ""; mod(o) }))
-	file := filepath.Join(r.state, "notes", "vms", "notes-1", "given.yaml")
-	if err == nil || !strings.Contains(err.Error(), "not ready after") || !strings.Contains(err.Error(), "< "+file+" && rm ") {
-		t.Fatalf("%v", err)
-	}
-	if fi, serr := os.Stat(file); serr != nil || fi.Mode().Perm() != 0o600 {
-		t.Errorf("%v %v", fi, serr)
-	}
-}
-
-// OpenTofu failing past the variables may leave a VM waiting: what it waits for stays, for `vm destroy`
-// to remove.
-func TestVMCreateWithOpenTofuFailingKeepsWhatAVMMayWaitFor(t *testing.T) {
-	t.Parallel()
-	v := newVMCreate(t, "qcow2")
-	_, _, mod := byoVM(t, v)
-	r := newTofuRun(t)
-	r.tofu.fail = errors.New("the apply failed")
-	if err := v.create(tofuCreate(), r.mod(func(o *Options) { o.TLS = ""; mod(o) })); err == nil {
-		t.Fatal("no failure")
-	}
-	dir := filepath.Join(r.state, "notes", "vms", "notes-1")
-	for _, f := range []string{"given.yaml", "given.yaml.known_hosts"} {
-		if _, err := os.Stat(filepath.Join(dir, f)); err != nil {
-			t.Errorf("%s is gone: %v", f, err)
-		}
-	}
-}
-
-// OpenTofu failing before the variables leaves no VM, and no `vm destroy` finds this state: nothing
-// of what was to be given stays on this machine.
-func TestVMCreateWithOpenTofuFailingBeforeAnyVMKeepsNothing(t *testing.T) {
-	t.Parallel()
-	v := newVMCreate(t, "qcow2")
-	_, _, mod := byoVM(t, v)
-	r := newTofuRun(t)
-	dir := filepath.Join(r.state, "notes", "vms", "notes-1")
-	if err := os.MkdirAll(filepath.Join(dir, platformFile, "in-the-way"), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	err := v.create(tofuCreate(), r.mod(func(o *Options) { o.TLS = ""; mod(o) }))
-	if err == nil || !strings.Contains(err.Error(), "no VM was made") {
-		t.Fatalf("%v", err)
-	}
-	for _, f := range []string{"given.yaml", "given.yaml.known_hosts"} {
-		if _, err := os.Stat(filepath.Join(dir, f)); !errors.Is(err, os.ErrNotExist) {
-			t.Errorf("%s: %v", f, err)
-		}
-	}
-}
-
 // The default --out is the working directory, and the step runs from anywhere.
 func TestTheGivenStepNamesItsFileWhereverItRuns(t *testing.T) {
 	v := newVMCreate(t, "qcow2")
@@ -428,78 +331,6 @@ func TestTheGivenStepNamesItsFileWhereverItRuns(t *testing.T) {
 	}
 }
 
-// The install fails over SSH: the VM stays, and the error's step gives the material again.
-func TestVMCreateWithOpenTofuFailingOverSSHSaysHowToGiveItAgain(t *testing.T) {
-	t.Parallel()
-	v := newVMCreate(t, "qcow2")
-	mark, _, mod := byoVM(t, v)
-	r := newTofuRun(t)
-	r.ssh.answers = []func() ([]byte, error){refused, statusIn("recovery", false), statusJSON(false),
-		func() ([]byte, error) { return nil, fmt.Errorf("the install failed") }}
-	err := v.create(tofuCreate(), r.mod(func(o *Options) { o.TLS = ""; mod(o) }))
-	dir := filepath.Join(r.state, "notes", "vms", "notes-1")
-	file := filepath.Join(dir, "given.yaml")
-	if err == nil || !strings.Contains(err.Error(), "the install failed") || strings.Contains(err.Error(), mark) ||
-		!strings.Contains(err.Error(), "install --given - --no-input < "+file+" && rm ") || !strings.Contains(err.Error(), "vm destroy notes-1") {
-		t.Fatalf("%v", err)
-	}
-	if !strings.Contains(err.Error(), givenRetired) || !strings.Contains(err.Error(), "ssh must show ") {
-		t.Errorf("no word of the one-time key: %v", err)
-	}
-	if !strings.Contains(err.Error(), "-i ") {
-		t.Errorf("the step leaves out the --ssh-key every call uses: %v", err)
-	}
-	fi, serr := os.Stat(file)
-	if serr != nil || fi.Mode().Perm() != 0o600 {
-		t.Fatalf("%v %v", fi, serr)
-	}
-	raw, _ := os.ReadFile(file)
-	if g, err := parseGiven(raw, "notes"); err != nil || g.Inputs["API_KEY"] != mark {
-		t.Errorf("%+v %v", g, err)
-	}
-}
-
-// With a disk of another release, nothing is sent to the OS the first boot is leaving: it would die
-// in that boot's reboot.
-func TestVMCreateOnAnotherReleasesDiskGivesToTheReleasesOS(t *testing.T) {
-	t.Parallel()
-	in := &Installer{R: &Release{Spec: &spec.Spec{Name: "notes"}}}
-	calls := 0
-	old, want := Status{Name: "notes", OS: Version{"0.9.0", 1}, Boot: "active"}, Status{Name: "notes", OS: Version{"1.0.0", 1}, Boot: "active"}
-	in.O.Log, in.O.SSH = io.Discard, sshFunc(func(Cmd) ([]byte, error) {
-		calls++
-		if calls == 1 {
-			return json.Marshal(old)
-		}
-		return json.Marshal(want)
-	})
-	release := &OSRelease{Version: "1.0.0", Revision: 1, Tag: "1.0.0-r1"}
-	if err := in.awaitVM(context.Background(), t.TempDir(), "", "ops", "192.0.2.9", "", 5*time.Second, false, release, ""); err != nil || calls != 2 {
-		t.Errorf("%v after %d calls", err, calls)
-	}
-}
-
-// On a disk of another release, `vm create` itself gives nothing to the OS it boots away from.
-func TestVMCreateWithOpenTofuOnAnotherReleasesDiskWaitsForTheReleasesOS(t *testing.T) {
-	t.Parallel()
-	v := newVMCreate(t, "qcow2")
-	bootVia(t, v, &release.BootDisks{Release: "0.9.0", Stowage: "0.6.0", Disks: maps.Clone(v.r.Manifest.Artifacts.Disks)}, "0.6.0")
-	mark, _, mod := byoVM(t, v)
-	r := newTofuRun(t)
-	old := func() ([]byte, error) {
-		return json.Marshal(Status{Name: "notes", OS: Version{"0.9.0", 1}, Job: "idle", Boot: "active"})
-	}
-	r.ssh.answers = []func() ([]byte, error){old, statusJSON(false), statusJSON(false), func() ([]byte, error) {
-		return []byte("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMttF2bIpr7R386X4GUm0TkSzgnDFwXOzWeDxQGI7oDJ root@notes-1\n"), nil
-	}}
-	if err := v.create(tofuCreate(), r.mod(func(o *Options) { o.TLS = ""; mod(o) })); err != nil {
-		t.Fatalf("%v\n%s", err, v.log)
-	}
-	if len(r.ssh.stdin) != 4 || strings.Contains(r.ssh.stdin[0], mark) || strings.Contains(r.ssh.stdin[1], mark) || !strings.Contains(r.ssh.stdin[2], mark) {
-		t.Errorf("stdin %q", r.ssh.stdin)
-	}
-}
-
 // By hand, the step says which OS it is for.
 func TestVMCreateByHandOnAnotherReleasesDiskSaysWhichOS(t *testing.T) {
 	t.Parallel()
@@ -511,30 +342,6 @@ func TestVMCreateByHandOnAnotherReleasesDiskSaysWhichOS(t *testing.T) {
 	}
 	if !strings.Contains(v.out2(), "Its disk carries 0.9.0") {
 		t.Errorf("out:\n%s", v.out2())
-	}
-}
-
-// A boot that failed before it took the release's OS is said, and is waited past: a unit its own
-// reboot stopped reads the same.
-func TestAwaitVMSaysAFailureOfTheOSItBootsAwayFrom(t *testing.T) {
-	t.Parallel()
-	in := &Installer{R: &Release{Spec: &spec.Spec{Name: "notes"}}}
-	calls := 0
-	in.O.Log, in.O.SSH = io.Discard, sshFunc(func(Cmd) ([]byte, error) {
-		calls++
-		if calls > 1 {
-			return json.Marshal(Status{Name: "notes", OS: Version{"1.0.0", 1}, Boot: "active"})
-		}
-		return json.Marshal(Status{Name: "notes", OS: Version{"0.9.0", 1}, Boot: "active", InstallFailed: "the bundle would not write"})
-	})
-	release := &OSRelease{Version: "1.0.0", Revision: 1, Tag: "1.0.0-r1"}
-	if err := in.awaitVM(context.Background(), t.TempDir(), "", "ops", "192.0.2.9", "", 5*time.Second, false, release, ""); err != nil || calls != 2 {
-		t.Errorf("%v after %d calls", err, calls)
-	}
-	calls = -1000
-	err := in.awaitVM(context.Background(), t.TempDir(), "", "ops", "192.0.2.9", "", 50*time.Millisecond, false, release, "its display on TrueNAS")
-	if err == nil || !strings.Contains(err.Error(), "the bundle would not write") || !strings.Contains(err.Error(), "not ready after") || !strings.Contains(err.Error(), "look at its display on TrueNAS, or") {
-		t.Errorf("%v", err)
 	}
 }
 
@@ -569,8 +376,8 @@ func TestVMCreateRefusesWhatItCouldNotGive(t *testing.T) {
 		{"an expired certificate", nil, VMCreate{}, func(o *Options) { o.Cert, o.Key = expiredCert, expiredKey }, "the certificate expired"},
 		{"half a pair", nil, VMCreate{}, func(o *Options) { o.Cert = goodCert }, "--tls byo needs --cert FILE and --key FILE"},
 		{"--set of a secret", secret(true), VMCreate{}, func(o *Options) { o.TLS = "internal"; o.Set = map[string]string{"API_KEY": "v"} }, "a command line (--set, --set-file) never carries"},
-		{"--secrets beside a certificate", nil, VMCreate{Secrets: []byte("project: notes\nsecrets: {}\n")}, func(o *Options) { o.Cert, o.Key = goodCert, goodKey }, "--secrets restores an install, and the certificate and its key would go with it"},
-		{"--secrets beside a secret input", secret(false), VMCreate{Secrets: []byte("project: notes\nsecrets: {}\n")}, func(o *Options) { o.TLS = "internal"; o.Answers = map[string]string{"API_KEY": "v"} }, "--secrets restores an install, and API_KEY would go with it"},
+		{"--secrets beside a certificate", nil, VMCreate{Secrets: []byte("project: notes\nsecrets: {}\n")}, func(o *Options) { o.Cert, o.Key = goodCert, goodKey }, "--secrets and the certificate and its key: the first install waits for one of them over SSH"},
+		{"--secrets beside a secret input", secret(false), VMCreate{Secrets: []byte("project: notes\nsecrets: {}\n")}, func(o *Options) { o.TLS = "internal"; o.Answers = map[string]string{"API_KEY": "v"} }, "--secrets and API_KEY: the first install waits for one of them over SSH"},
 		{"a required secret nothing gives", secret(true), VMCreate{}, func(o *Options) { o.Cert, o.Key = goodCert, goodKey }, "also needs API_KEY"},
 		{"a secret its check refuses", secret(false), VMCreate{}, func(o *Options) { o.TLS = "internal"; o.Answers = map[string]string{"API_KEY": "a\nb"} }, "API_KEY: "},
 		{"more than the install takes", func(s *spec.Spec) {
@@ -601,6 +408,12 @@ func TestVMCreateRefusesWhatItCouldNotGive(t *testing.T) {
 				t.Errorf("a seed was written: %v", serr)
 			}
 		})
+	}
+	// --secrets beside --tls byo: the fix leaves the mode out, not its certificate alone.
+	vb := newVMCreate(t, "qcow2")
+	err := vb.create(VMCreate{Platform: "proxmox", Secrets: []byte("project: notes\nsecrets: {}\n")}, func(o *Options) { o.TLS, o.Cert, o.Key = "byo", goodCert, goodKey })
+	if r, ok := Refusal(err); !ok || r.Fix != "leave out --tls byo (choose another --tls mode), or leave out --secrets" {
+		t.Errorf("--secrets and --tls byo: %v (fix %q)", err, r.Fix)
 	}
 	// ssh would read a token in the pin's path, so the step could never run.
 	v0 := newVMCreate(t, "qcow2")
@@ -654,10 +467,6 @@ func TestAByoOnlyProjectMakesAVMWithItsCertificate(t *testing.T) {
 		t.Fatalf("%v\n%s", err, v.log)
 	}
 }
-
-type sshFunc func(Cmd) ([]byte, error)
-
-func (f sshFunc) Run(_ context.Context, c Cmd) ([]byte, error) { return f(c) }
 
 // The VM's own command takes --given, before anything touches the host, and alone.
 func TestTheVMInstallTakesGiven(t *testing.T) {

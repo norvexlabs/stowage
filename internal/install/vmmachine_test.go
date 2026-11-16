@@ -527,10 +527,30 @@ func TestVMSeed(t *testing.T) {
 		t.Errorf("%v", s.Disk)
 	}
 
-	// A secret input given, by the answers or a command line: refused, and never printed.
-	_, err = seed(func(o *Options) { o.Answers = map[string]string{"ACCESS_TOKEN": "tok-not-to-be-printed"} }, "")
-	if r, ok := Refusal(err); !ok || !strings.Contains(r.Reason, "ACCESS_TOKEN") || strings.Contains(r.Reason, "tok-not") || !strings.Contains(r.Fix, "install --given -") {
-		t.Errorf("%v", err)
+	// A secret input the answers give: the first install waits for it over SSH (install --given -),
+	// as vm create's does; the seed names its key, never its value.
+	answers := func(o *Options) { o.Answers = map[string]string{"ACCESS_TOKEN": "tok-not-to-be-printed"} }
+	s2, err := seed(answers, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw2, _ := json.Marshal(s2)
+	st2, cc2 := cloudSettings(t, s2.UserData)
+	if strings.Contains(string(raw2), "tok-not") || !slices.Equal(s2.AwaitGiven, []string{"ACCESS_TOKEN"}) || s2.AwaitSecrets || s2.AwaitTLS ||
+		!st2.AwaitSecrets || awaitedGiven(cc2) != "given" || st2.Inputs["ACCESS_TOKEN"] != "" {
+		t.Errorf("answers' secret: %+v %+v %q\n%s", s2, st2, awaitedGiven(cc2), raw2)
+	}
+	if s.AwaitGiven != nil || strings.Contains(string(raw), `"await_given"`) {
+		t.Errorf("await_given without a secret answer: %v", s.AwaitGiven)
+	}
+	// Beside --await-secrets: refused, as the install waits for one of them; never printed.
+	in := v.installer(func(o *Options) {
+		o.TLS, o.Set = "internal", map[string]string{"ADMIN_EMAIL": "admin@example.org", "APP_DOMAIN": "app.example.org", "API_DOMAIN": "api.example.org"}
+		answers(o)
+	})
+	_, err = in.SeedVM(context.Background(), &VMCreate{Platform: platform, Hostname: "notes-1", User: "ops", SSHKey: v.key}, SeedOptions{AwaitSecrets: true})
+	if r, ok := Refusal(err); !ok || !strings.Contains(r.Reason, "--await-secrets and ACCESS_TOKEN: the first install waits for one of them") || strings.Contains(r.Reason, "tok-not") || r.Fix != "remove ACCESS_TOKEN from the --answers file, or leave out --await-secrets" {
+		t.Errorf("answers and --await-secrets: %v", err)
 	}
 	modes := v.r.Spec.Front.TLSModes
 	v.r.Spec.Front.TLSModes = append(append([]string{}, modes...), "dns-cloudflare")

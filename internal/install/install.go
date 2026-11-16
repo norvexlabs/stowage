@@ -22,6 +22,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"slices"
 	"sort"
 	"strconv"
@@ -144,8 +145,7 @@ type Options struct {
 	Machine io.Writer
 	Log     io.Writer // progress, docker output
 	Docker  Tool
-	// Tofu and SSH are OpenTofu and ssh, run by `vm create --create opentofu` and `vm destroy`.
-	Tofu Tool
+	// SSH is ssh, which the vm verbs reach a VM with (link).
 	SSH  Tool
 	Rand io.Reader
 	// Exec runs an installer as a child: the installers a run starts (upgrade --version and a
@@ -206,7 +206,16 @@ type Options struct {
 	// InstallerImage reads the installer image of this installer's release, by the digest the
 	// release manifest in the registry at prefix records; nil reads it there (releaseInstallerImage).
 	InstallerImage func(ctx context.Context, prefix string) (string, error)
+	// Platform is the platform (os/arch) this installer runs on; "" is the running program's
+	// (hostPlatform).
+	Platform string
 }
+
+// hostPlatform is the running program's platform, os/arch.
+func hostPlatform() string { return runtime.GOOS + "/" + runtime.GOARCH }
+
+// platform is the platform this installer runs on (Options.Platform).
+func (o *Options) platform() string { return cmp.Or(o.Platform, hostPlatform()) }
 
 func (o *Options) logf(format string, a ...any) { fmt.Fprintf(o.Log, format+"\n", a...) }
 
@@ -264,6 +273,8 @@ type Installer struct {
 	derived map[string]bool
 	// again: this run is a re-run of an install.
 	again bool
+	// unnamed is an openPorts run's warnings of NIC roles the VM names no NIC for (roleNames).
+	unnamed *unnamedRoles
 	// lockHeld is the lock file of the install's lifecycle lock while this run holds it (lockRun).
 	lockHeld *os.File
 	// noLoginFile: the run is not an install's on this host — a `k8s`, `vm` or `mirror` verb — and
@@ -290,8 +301,9 @@ type Installer struct {
 	// givenNothing: the run takes no flag, input or answer — the VM's upgrade, which its daemon
 	// checks (upgradeCheck) and its boot runs (Upgrade) — so a refusal's fix names none (flagFix).
 	givenNothing bool
-	// seeding: the run is vm seed's, whose refusal of a secret input given to it says a seed
-	// carries none (seedRefusal), where vm create's names its own way.
+	// seeding: the run is vm seed's, whose refusal of a secret input on its command line says a
+	// seed carries none (seedRefusal), where vm create's names its own way, and whose --tls byo
+	// awaits its certificate over SSH (awaitOverSSH).
 	seeding bool
 	// outputs is the provision hook's outputs file of a release another Stowage built, whose spec
 	// is read for its wipe alone (wipeOf).
@@ -2354,6 +2366,9 @@ func (in *Installer) openPorts(ctx context.Context, env *EnvFile, hn hostNet) er
 	if in.O.Firewall == "" {
 		return nil
 	}
+	// The VM's NICs read once, and each role without its NIC warned of once, for the whole run.
+	in.unnamed = newUnnamedRoles()
+	defer func() { in.unnamed = nil }()
 	name := in.R.Spec.Name
 	var input []byte
 	mode, _ := env.Get("STOWAGE_TLS_MODE")
@@ -2801,10 +2816,15 @@ func (in *Installer) iif(roles ...string) string {
 }
 
 // roleNames are the interfaces' names of the host.interfaces roles given, quoted for nft, as iif
-// matches them, warning (warn) of a NIC role the VM names no NIC for; none for no role or only
-// empty ones.
+// matches them, warning (warn) of a NIC role the VM names no NIC for, once an openPorts run (once
+// a call outside one); none for no role or only empty ones.
 func (in *Installer) roleNames(warn bool, roles ...string) []string {
 	var names []string
+	// Outside an openPorts run, this call's own warnings.
+	u := in.unnamed
+	if u == nil {
+		u = newUnnamedRoles()
+	}
 	for _, role := range roles {
 		if role == "" {
 			continue
@@ -2812,13 +2832,56 @@ func (in *Installer) roleNames(warn bool, roles ...string) []string {
 		dev := role
 		if h := in.R.Spec.Host; h != nil {
 			dev = h.Interfaces[role].DeviceName(role)
-			if i, ok := h.Interfaces[role]; warn && ok && i.Kind != spec.InterfaceTUN && !i.Optional && !roleNamed(in.R.Spec.Name, role) {
-				in.O.logf("warning: no NIC of this VM is named %s (its cloud-config, from before its release named it, names none): its ports reach nothing, a VM made by this release (vm create --interface) names it, and `vm attach` (TrueNAS) or the NIC attached on its platform and `network attach` adds one to this VM", role)
+			if i, ok := h.Interfaces[role]; warn && ok && i.Kind != spec.InterfaceTUN && !i.Optional && !u.warned[role] && !roleNamed(role) {
+				u.warned[role] = true
+				in.unnamedRoleWarning(role, i.Primary, u.there)
 			}
 		}
 		names = append(names, strconv.Quote(dev))
 	}
 	return names
+}
+
+// unnamedRoles are the warnings of NIC roles the VM names no NIC for: the VM's NICs (there, read
+// at the first question) and the roles warned of already, each warned of once.
+type unnamedRoles struct {
+	there  vmNICs
+	warned map[string]bool
+}
+
+func newUnnamedRoles() *unnamedRoles {
+	return &unnamedRoles{there: nicsThere(sysNetDir, udevDataDir), warned: map[string]bool{}}
+}
+
+// unnamedRoleWarning warns that no NIC of the VM is named role, with what names one: for a
+// secondary, or a primary the cloud-config names (by its MAC, or by its original name, pinned or
+// not), the case it is in (unnamedRoleHint, as the host daemon's refusal tells it); for a primary
+// it does not name, which `network attach` refuses and the cloud-config's network matches as it
+// named it, a VM made by this release, the install's secrets, backup configuration and backup
+// moved to it.
+// there answers what the hint asks of the VM's NICs (nicsThere, read once per openPorts run).
+func (in *Installer) unnamedRoleWarning(role string, primary bool, there vmNICs) {
+	ctl := in.R.Ctl()
+	named, err := seedNamed(in.R.Spec.Name, role)
+	if err != nil {
+		in.O.logf("warning: no NIC of this VM is named %s: its ports reach nothing: %v: restore it as the VM's cloud-config writes it (`sudo %s reboot` writes it again)", role, err, ctl)
+		return
+	}
+	if primary && !named {
+		in.O.logf("warning: no NIC of this VM is named %s, the primary (its cloud-config, from before its release named it, names none): its ports reach nothing; a VM made by this release names it: `sudo %s secrets export --recipient <age key>` and `sudo %s backup run` here, a new VM of this release made with those secrets (`vm create --secrets`, or `vm seed --await-secrets`), then there `sudo %s backup config` with this VM's destination and rclone config, and `sudo %s restore <backup>`", role, ctl, ctl, ctl, ctl)
+		return
+	}
+	hint, err := unnamedRoleHint(networkdDir, in.R.Spec.Name, ctl, in.O.Dir, role, there)
+	if r, refused := Refusal(err); refused {
+		// A record the hint reads that does not decode: its refusal, with its fix.
+		in.O.logf("warning: no NIC of this VM is named %s: its ports reach nothing: what names one is not known (%s): %s", role, r.Reason, r.Fix)
+		return
+	}
+	if err != nil {
+		in.O.logf("warning: no NIC of this VM is named %s: its ports reach nothing: what names one is not known (%v)", role, err)
+		return
+	}
+	in.O.logf("warning: no NIC of this VM is named %s: its ports reach nothing: %s", role, hint)
 }
 
 // familySources splits an allowlist into its IPv4 and IPv6 prefixes, as the firewall's sets

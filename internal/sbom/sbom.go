@@ -17,6 +17,8 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+
+	"github.com/norvexlabs/stowage/internal/installerbin"
 )
 
 // Syft and Grype are the pinned images that make and scan the documents on the publisher's side
@@ -41,8 +43,9 @@ const (
 	CosignType    = "spdxjson"
 )
 
-// Platform is the one a release's images run on, which syft reads of an index.
-const Platform = "linux/amd64"
+// Platform is the one a release's images run on (installerbin.Target), which syft reads of an
+// index.
+const Platform = installerbin.Target
 
 // MaxDocument caps a document read or written: an OS's runs to a few MiB.
 const MaxDocument = 64 << 20
@@ -92,10 +95,12 @@ func (t *tail) Write(p []byte) (int, error) {
 
 func (t *tail) String() string { return string(t.b) }
 
-// Source is where syft reads an image: a reference by digest, over plain HTTP for a loopback
-// registry, with the Docker config in Config (a directory; "" for none).
+// Source is where syft reads an image: a reference by digest, its image for Platform (os/arch;
+// "" is the platform a release runs on), over plain HTTP for a loopback registry, with the Docker
+// config in Config (a directory; "" for none).
 type Source struct {
 	Ref      string
+	Platform string
 	Insecure bool
 	Config   string
 }
@@ -113,12 +118,12 @@ func Generate(ctx context.Context, docker Docker, src Source) ([]byte, error) {
 	if src.Insecure {
 		args = append(args, "-e", "SYFT_REGISTRY_INSECURE_USE_HTTP=true")
 	}
-	// The platform a release runs on: an index's other platforms are none of the install's. The
-	// sbom cataloger merges the SBOM documents an image ships (what no other cataloger sees in it).
+	// The platform a release runs on, unless the source names another (an installer index's
+	// entries): an index's other platforms are none of the install's. The sbom cataloger merges the SBOM documents an image ships (what no other cataloger sees in it).
 	// The kernel cataloger is left out: it lists a kernel by upstream's version, which a scanner
 	// matches against fixes a distribution backports, and each module without one; the OS
 	// bundle's kernel is its distribution's packages, which the package catalogers read.
-	args = append(args, Syft, "registry:"+src.Ref, "--platform", Platform, "--select-catalogers", "+sbom-cataloger,-linux-kernel-cataloger", "-o", "spdx-json", "-q")
+	args = append(args, Syft, "registry:"+src.Ref, "--platform", cmp.Or(src.Platform, Platform), "--select-catalogers", "+sbom-cataloger,-linux-kernel-cataloger", "-o", "spdx-json", "-q")
 	out := &capped{max: MaxDocument}
 	if err := docker(ctx, out, args...); err != nil {
 		return nil, fmt.Errorf("syft %s: %w", src.Ref, err)

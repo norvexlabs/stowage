@@ -3,6 +3,172 @@
 Stowage's own releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
+## [0.40.0]
+
+### Added
+
+- `vm seed --json` gives `size` (`cpus`, `memory_mib` and `app_gib`, each with its `min` and
+  `recommended`: the release's `shapes.kairos.size` over the floor every VM needs) and `firewall`
+  (`ssh_sources` and `open_ports`, each port with its protocol and sources: what a platform's
+  firewall in front of the VM lets through, the front's ports and each L4 route's allowlist), so
+  a root sizes and fences the VM as the release asks.
+- `status --json --values` (Docker, Kubernetes, the VM) gives `pull_login`, whether the install
+  holds a pull login (never the login), and `acme_ca_root`, the `sha256:` digest of the root
+  `--acme-ca-root` gave; when either cannot be read, `pull_login_error` or `acme_ca_root_error`
+  says why instead of reporting none (on Kubernetes, the pull Secret unread by kubectl or its
+  login not parsing; on Docker and the VM, as `registry_login_error`).
+- `vm seed --json` takes the secret inputs of `--answers` as `vm create` does: the first install
+  waits for them over SSH (`install --given -`), past the first boot's switch to the release's
+  OS, and the seed names them in `await_given`, never their values (it refused them before);
+  with `--await-secrets` they are refused, as the install waits for one of them.
+
+### Changed
+
+- A VM of one NIC role (a hypervisor's without `--interface ROLE=mac=…`, or a cloud's) has that
+  NIC pinned to its MAC by its first boot, on the OEM partition: the role's one `.link` file then
+  matches that MAC alone, so a NIC added later, in any order, can no longer take the role's name,
+  and `network attach` runs before or after the platform adds the NIC. The pin matches the NIC's
+  MAC and a `Driver=` line: the NIC's own driver when it is one of an accelerated networking's
+  virtual function (`mlx4_en`, `mlx5_core`, `mana`: a physical Mellanox NIC on metal), else those
+  drivers left out, so a virtual function of that MAC (Azure's) is never named as the role and a
+  change of the NIC's model keeping its MAC still is. The VM's NICs leave out a NIC another
+  enslaves (such a virtual function) rather than every NIC of those drivers, so a physical
+  Mellanox NIC is named and counted, and a `.link` file by a MAC the cloud-config is given no
+  longer leaves those drivers out. The pin counts only free NICs: not one an attached role's
+  `.link` file names, nor a virtual function beside its NIC before the NIC enslaves it. A pin
+  file altered or cut short is written again. `network attach` writes the same `Driver=` line
+  from the driver of the NIC there, recorded in `interfaces.yaml` (`driver`): of several NICs of
+  that MAC, the one not of those drivers, and refused when that does not tell them apart;
+  attached before the NIC is there, it leaves those drivers out and says so, and a run again with
+  the NIC there records its driver, which names a physical Mellanox NIC attached that way. Two
+  attaches at once keep both NICs (a lock, `interfaces.lock` in the install directory). A pinned
+  NIC replaced on the platform, the VM's only free NIC, is pinned in its place at the next boot
+  and named the role at once; with no free NIC or several, the pin is left and the boot says
+  why. A pinned NIC there under another name is named the role at boot, as is the NIC of a MAC
+  the cloud-config names, never a virtual function or a bridge of that MAC (of several NICs of
+  it, none, said). `vm seed --json` gives such a NIC no `mac` (several NIC roles still get one each).
+- Cut-over: a VM seeded before this release is not pinned, its only NIC still matched by its
+  original name: pin it by hand before adding a NIC (a cloud-config on the OEM partition, given
+  in the VM reference, "A VM seeded before 0.40.0"); `network attach` refuses while a NIC is
+  named by its original name and not pinned, naming that fix. `network attach`, `network set --role` and
+  the install's warning refuse an `interfaces.yaml` holding 0.39.0's `pin: true` entries, saying
+  to remove them (after that pin by hand) and run again.
+- `network set --role` on a role no NIC is named as is a refusal (exit 3) in every case, its fix
+  what names one, as the install's warning words it: for a role the cloud-config names by its
+  original name, never pinned, leave its NIC alone on the VM (keeping the NICs `network attach`
+  recorded, named) and restart it, as `network attach` refuses that role; for one the boot
+  pinned, its NIC gone or of another driver, leave one NIC no other role names and restart the
+  VM, which pins it again; for a NIC of the cloud-config's MAC or the pin there but not named,
+  why (several NICs of that MAC, or another device holding the role's name, named) and what
+  frees it; for a `.link` file naming no NIC, the file to restore. The install's warning comes
+  once a run for each role, and gives a refusal's fix too. A `.link` file
+  whose presence does not read is said so, with what to restore, by the install's warning and
+  `network attach`, never taken for one absent. At boot,
+  the primary's override is left as an earlier boot rendered it, said on the log and the console
+  banner, when the cloud-config's network files do not read; a change of it awaiting
+  confirmation then is undone by removing its file (at boot, its window's end, the daemon's start
+  and `network revert`), the cloud-config's settings applying, as the banner and `network` say.
+- `network attach` ends by saying what is left: `sudo <short>-stow reboot` when the NIC is there,
+  else add it on the platform and restart the VM; it refuses while the VM's NICs do not read.
+  `network set --role` on a role no NIC is named for, and the install's warning about it, say
+  the same: the NIC of the MAC the cloud-config names it by, or whether `network attach`
+  recorded it (and whether its NIC is there, and whether its link matches the NIC's driver), with
+  the step to take; an `interfaces.yaml` that does not read refuses it with its fix (409 on
+  `network set --role`), as does a NIC record that does not read (naming what to restore); the
+  install's warning about a primary the cloud-config names gives its case the same way, and about
+  one it does not name, the way to a VM of the release (its secrets, its backup configuration and
+  a backup restored), as `network attach` takes secondaries alone.
+  `network set` of the primary refuses (409, with its fix) while the cloud-config's network files
+  do not read, rather than match every NIC.
+- The boot's rename of a NIC never takes a name another NIC holds, nor takes the NIC down for
+  it, and brings a NIC whose rename fails back up; a VM of one NIC renames the NIC of the default
+  route only before its NIC is pinned or named, so a NIC added on the platform keeps its name.
+- `vm host-key` and `vm kit create`, `check` and `take` require `--known-hosts-line`: the VM's SSH
+  host key as one known_hosts line (`vm seed --json`'s `known_hosts_line` until the install
+  retires that one-time key, then `vm host-key --json`'s), as no record of the VM is kept. Without
+  it they are refused before any connection; a VM made by an earlier `vm create --create
+  opentofu` has its key in that state directory's `known_hosts`.
+- `vm truenas import-image`, `seed` and `stop` are documented, no longer hidden: the steps the
+  TrueNAS example runs where the `truenas/truenas` provider has none yet (write a disk image into
+  a zvol, upload the seed ISO, stop the VM before its devices are deleted) — a stopgap until that
+  provider covers them. They read `TRUENAS_ENDPOINT` (the provider's WebSocket URL) or
+  `TRUENAS_URL`, `TRUENAS_API_KEY`, and `TRUENAS_CA_CERT` (a CA file) or
+  `TRUENAS_INSECURE_SKIP_VERIFY`, take `--timeout`, and are safe to run again: `import-image`
+  leaves a zvol holding the image already, writes again one it began, and refuses a zvol holding
+  other data, another image or used by a VM's disk device (it records the image in the zvol's
+  `org.stowage:image` property; a zvol without it counts as empty only while it holds no more
+  than a zvol never written, counted before compression and measured on the host each run on a
+  throwaway zvol beside it, and one whose size or properties TrueNAS does not report is refused;
+  the image is checked against its digest as it is uploaded, its one read — a wrong one is
+  refused after that upload, before the zvol is written —, under a name of the run's own and of
+  the zvol's, emptied once its upload began and no longer runs; a missing image is refused before anything is
+  made). One import at a time
+  writes into a zvol: the throwaway zvol, made at the start, is its lock, held for the whole run;
+  a second import is refused while it is held (runs in one apply run in parallel, and the ones
+  refused succeed on the next apply), and a lock a run cut off left is never taken over: the
+  refusal names it, its age, and the zvol to delete once neither a run nor a TrueNAS job of that
+  import runs; the zvol, its devices
+  and the lock are read again before it is written, and any change since is refused; a convert
+  cut off is waited for, never aborted (TrueNAS's abort leaves its `qemu-img` writing): one that
+  then succeeds marks the zvol written, with a warning, and one still running, aborted or unread
+  leaves the lock and the staged file, named (a `--timeout` that ran out then suggests no plain
+  run again); a convert call whose answer was lost looks for its job first; a convert job TrueNAS hands over that
+  is another import's, from its one-at-a-time queue, is refused; once the zvol is written, a lock
+  not deleted or a file not emptied is a warning); `seed`
+  replaces the ISO; `stop` stops a VM in any state but stopped — a running one by a clean
+  shutdown forced after its timeout, a suspended one powered off at once —, fails if it is not
+  stopped after (a call that fails as the VM stops or goes meanwhile is no failure), and leaves
+  one stopped or gone. `vm
+  truenas start` and `drop-snapshots` are gone (the provider starts the VM, and its zvol and
+  dataset delete their snapshots with `force_destroy`).
+- The installer image is an index of one `<short>-stow` per platform — linux/amd64, linux/arm64,
+  darwin/amd64 and darwin/arm64 —, each one layer of one file, signed and carrying its own SBOM,
+  so a client without Docker pulls its own platform's from the registry and runs it (the
+  publisher's reference describes the contract); the release manifest still names the installer
+  by one digest, the index's. A target still runs linux/amd64: on another platform (an arm64
+  Docker host takes the linux/arm64 image) every verb but `script`, `describe`, `k8s`, `vm` and
+  `mirror` refuses, naming the platform and `docker run --rm --platform linux/amd64`; `upgrade
+  --version` fetches the image of the platform it runs on, and refuses an older release's
+  single linux/amd64 installer elsewhere, naming the fix (run it from a linux/amd64 machine); a
+  Kubernetes Job running the installer runs its linux/amd64 image by digest, on a linux/amd64
+  node alone (a cluster without one leaves it pending, and the hook's refusal says so). `audit`
+  and `sbom export` read each installer image's SBOM (the installer's other platforms are
+  subjects of their own, with `platform`, exported as `installer/<os>-<arch>.spdx.json`; an
+  index that cannot be read is one subject `installer (other platforms)` not audited, the rest of
+  the release read as ever), `verify` checks each image's signature, `mirror export` carries each
+  image's signatures, and `prune` and `yank` remove an index's images with it, in any
+  repository, but those another tagged index, a tag or an index still awaiting removal names
+  (an interrupted removal leaves them marked, for the next prune; one two indexes name goes once,
+  after both). The `stowage` binary embeds the
+  four, compressed, with each one's sha256 and size, which the release's inputs take; `ship`
+  refuses one whose bytes differ. The darwin images are unproven on a Mac until one runs them.
+
+### Removed
+
+- Stowage no longer creates or destroys VMs, and keeps no state of one: `vm create --create
+  opentofu` (with `--module`, `--tofu-var`, `--vm-name`, `--pool`, `--dataset`, `--bridge`,
+  `--cpus`, `--memory`, `--disk`, `--host` and `--wait`), `vm destroy`, `vm attach`, `vm create
+  --kit` and the OpenTofu modules embedded in the installer are gone. An OpenTofu root of yours
+  creates the VM from `vm seed --json`, with the `norvexlabs/stowage` provider's `stowage_vm_seed`
+  and the platform's own provider: each platform has a complete root among the provider's
+  examples, `norvexlabs/terraform-provider-stowage` `examples/guides/<platform>-vm`, to copy.
+  `vm create` keeps writing the disk and seed as files and printing the steps by hand (its
+  `--create` flag is gone with the OpenTofu way); `vm kit take` gives a
+  kit to a VM made; a NIC is attached on the platform, then `network attach` on the VM names it
+  from the next boot, whose message now says to reboot the VM once the platform attached the NIC
+  and the VM restarted. Cloud images `ship --disks` registers are unchanged.
+- A VM made with `--create opentofu` by 0.39.0 or earlier keeps its OpenTofu state in Stowage's
+  state directory (`~/.local/state/<name>/vms/<host>`), which this release no longer reads:
+  destroy it with 0.39.0's `vm destroy` before upgrading, or adopt it into a root of your own with
+  `import` blocks (each example lists its resources' import IDs). A `moved` block cannot carry
+  it over: the TrueNAS example uses the official `truenas/truenas` provider, the old modules the
+  community `pjsalty/truenas`.
+
+### Fixed
+
+- `mirror export` carries the signatures and SBOM attestations of every image an index names,
+  not only the index's.
+
 ## [0.39.0] - 2026-11-15
 
 ### Added

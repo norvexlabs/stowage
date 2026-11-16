@@ -85,7 +85,7 @@ sh notes.sh
 | **Describe** | developer | `stowage.yaml` names the images, the compose file (the single service definition), the front's routes, the health check, the database, the volumes, the secrets to generate and the inputs to ask. `stowage lint` checks the whole project against the [contracts](docs/contracts.md) and names the `key` or `file:line` to fix. |
 | **Version** | developer | The version comes from your changelog, a file, a git tag or a command; a scheme (CalVer, SemVer, regex, command) validates and orders it. Stowage never compares versions as strings. `stowage.lock` pins the Stowage that publishes. |
 | **Publish** | developer, CI | `stowage ship` builds what changed, pushes it by digest, signs it, builds the installer and the release manifest, then moves the channel's pointer. `verify`, `promote` (beta → stable without rebuilding), `yank`, `prune`, `releases`. `stowage hook install` ships each version bump on commit. |
-| **Install** | operator | `docker run --rm <prefix>/<name>-installer:latest > <name>.sh` gets the bootstrap script, which carries the installer, `<short>-stow`; then `sh <name>.sh` on Docker; `sh <name>.sh k8s install` on Kubernetes; `sh <name>.sh vm create` for a VM (seed ISO or cloud user-data, or the VM created with OpenTofu: TrueNAS; libvirt, Proxmox VE, vSphere, AWS, Google Cloud, Azure and Scaleway as previews; or a module of your own). Inputs asked once, secrets generated once, provision hook run, portal URL printed. |
+| **Install** | operator | `docker run --rm <prefix>/<name>-installer:latest > <name>.sh` gets the bootstrap script, which carries the installer, `<short>-stow`; then `sh <name>.sh` on Docker; `sh <name>.sh k8s install` on Kubernetes; for a VM, `sh <name>.sh vm seed --json` gives an OpenTofu root (the `norvexlabs/stowage` provider's examples: TrueNAS; libvirt, Proxmox VE, vSphere, AWS, Google Cloud, Azure and Scaleway as previews) the disk, the seed and the NICs to create it with, or `sh <name>.sh vm create` writes the disk and seed (ISO or cloud user-data) and prints the steps by hand; Stowage keeps no state of the VM. Inputs asked once, secrets generated once, provision hook run, portal URL printed. |
 | **Operate** | operator | `status`, a re-run to change inputs, ports or the TLS mode (the changes logged, the previous values kept), `provision`, `secrets rotate` (stage, swap, finish: the old value accepted meanwhile), `secrets set` (a chosen value for a `settable` secret), `secrets show` (a `settable` secret's value, on a terminal), `secrets export` (age-encrypted, to rebuild a machine), `reset-db`. |
 | **Upgrade** | operator | `upgrade --version V` fetches that release's installer, checks its signature against the keys the install trusts and brings the stack up on the new images (under a `command` version scheme, which no installer runs, another version needs `--unordered`, as does the VM's `reset-db --new-baseline --version`: [installer](docs/installer.md), [VM](docs/vm.md)) — on Docker after a `pg_dump` snapshot, on Kubernetes through Helm. `updates` says which release the channel offers after the one the install runs, signed by a key it trusts, with its changelog (or that there is none) — on Docker, on Kubernetes (`k8s updates`) and on the VM, where `upgrade` reboots into the new OS. |
 | **Roll back** | operator | `rollback` returns to the previous release — unless a migration since then is a rollback barrier your schema-compat provider reports, in which case it refuses and names it. On the VM the health gate does it alone: an upgraded boot that is not healthy in time falls back to the previous system. |
@@ -157,10 +157,11 @@ sh notes.sh --no-input --tls internal \
 **Install on Kubernetes** (a project with the `kubernetes` shape and its chart): `sh notes.sh k8s
 install`, with the operator's `helm` (≥ 3.14) and `kubectl` on the current context.
 
-**Create a VM** (a project with the `kairos` shape): `sh notes.sh vm create --platform truenas …`
-makes the VM from the release's disk and seeds its first boot; `vm seed --json` gives that seed to
-a tool that makes the VM itself. On the VM (as root or the `admin` group), `notes-stow status`,
-`updates`, `upgrade`.
+**Create a VM** (a project with the `kairos` shape): `sh notes.sh vm seed --json --platform truenas
+…` gives an OpenTofu root (copied from the `norvexlabs/stowage` provider's examples) the release's
+disk, the seed of its first boot, its NICs, size and firewall; `vm create` writes the disk and seed
+as files and prints the steps by hand. On the VM (as root or the `admin` group), `notes-stow
+status`, `updates`, `upgrade`.
 
 ## Packed with Stowage
 
@@ -215,7 +216,7 @@ Every command, verb and flag is described in the reference page each line links.
 |---|---|---|
 | Docker | install and re-run, `status`, `describe`, `ps`, `logs`, `restart`/`stop`/`start`, `exec`, `schema`, `provision`, `updates`, `upgrade` (`--version`), `rollback`, `reset-db`, `uninstall`, `secrets export`/`rotate`/`set`/`show`, `backup`, `restore`, `disk-check`, `tune`, `registry-login`, `script`, `audit`, `sbom export` | [docs/installer.md](docs/installer.md), [docs/host.md](docs/host.md), [docs/tuning.md](docs/tuning.md) |
 | Kubernetes | `k8s install`, `status`, `updates`, `upgrade` (`--version`), `rollback`, `reset-db`, `uninstall`, `provision`, `secrets export`/`rotate`/`show`, `tune` | [docs/kubernetes.md](docs/kubernetes.md) |
-| Creating a VM | `vm create`, `vm seed`, `vm host-key`, `vm attach`, `vm destroy` | [docs/vm-create.md](docs/vm-create.md) |
+| Creating a VM | `vm seed`, `vm create`, `vm host-key`, `vm truenas` (`import-image`, `seed`, `stop`: the TrueNAS steps an OpenTofu root runs) | [docs/vm-create.md](docs/vm-create.md) |
 | On the Kairos VM | `install`, `status`, `describe`, `health`, `events`, `ps`, `logs`, `restart`/`stop`/`start`, `exec`, `provision`, `updates`, `upgrade`, `rollback`, `reset-db`, `network`, `backup`, `restore`, `secrets export`/`rotate`/`set`/`show`, `host-key`, `registry-login`, `tune`, `reboot`, `shutdown` | [docs/vm.md](docs/vm.md) |
 | Every shape | `kit create`/`check` (`k8s kit`, `vm kit`), `mirror export`/`import` | [docs/kits.md](docs/kits.md), [docs/mirror.md](docs/mirror.md) |
 
@@ -238,7 +239,7 @@ install print one JSON object with a `format` number; a refusal exits `3`, a fai
 | [docs/kits.md](docs/kits.md) | handoff kits: what one install issues to another, sealed with a code |
 | [docs/extensions.md](docs/extensions.md) | extensions: an optional component that is a project of its own, its endpoint taken as an input |
 | [docs/mirror.md](docs/mirror.md) | sites without internet: `mirror export` and `import` |
-| [docs/vm-create.md](docs/vm-create.md) | creating a VM: `vm create`, `vm seed`, the platforms, the OpenTofu modules and their contract |
+| [docs/vm-create.md](docs/vm-create.md) | creating a VM: `vm seed` for an OpenTofu root, `vm create` by hand, the platforms, the verbs over SSH, the TrueNAS steps |
 | [docs/vm.md](docs/vm.md) | the installer on the Kairos VM: the boot, the host daemon and its verbs, backups, the network, the app socket, the API |
 | [docs/machine-interface.md](docs/machine-interface.md) | what programs read: `describe --json`, `status --json`, the Result object, exit statuses |
 | [docs/testing.md](docs/testing.md) | building and testing Stowage: what each suite proves and needs, releases |
@@ -274,15 +275,15 @@ internal/lock/        stowage.lock
 internal/flock/       advisory file locks that wait while a context lasts (the scanner's cache, the host's disk builds)
 internal/hook/        the post-commit hook: release detection, lock, detached ship
 internal/gitcmd/      git run without git's per-hook variables
-internal/installerbin/ the installer executable embedded in stowage
+internal/installerbin/ the installer executables, one per platform, embedded compressed in stowage
 internal/kit/         the handoff kit: sealed with a code (age scrypt, armored), opened, strictly decoded, checked
 internal/payload/     the release an installer carries; the bootstrap shell script
 internal/install/     the installer: the Docker shape (install, re-run, status, provision, the front),
-                      the Kubernetes one (k8s), the Kairos VM's (vm create, the cloud-config and
-                      its seed, OpenTofu's modules (TrueNAS, and the previews) and their contract, boot, the host daemon, its verbs) and
+                      the Kubernetes one (k8s), the Kairos VM's (vm seed and vm create, the cloud-config
+                      and its seed, the TrueNAS steps, boot, the host daemon, its verbs) and
                       mirror export / import
 internal/cloud/       the cloud images' registration: each cloud's settings and its built-in OpenTofu module (tofu/<cloud>), applied once per image
-internal/truenas/     TrueNAS's API: the disk and seed uploads, power, snapshots (the module's steps)
+internal/truenas/     TrueNAS's API: the disk image into a zvol, the seed upload, a VM's stop (vm truenas)
 internal/testutil/    test helpers
 examples/             minimal (the phase-1 smoke target), full (every spec key), stateless (no database, nothing built, no front)
 test/                 end-to-end scripts (make e2e, make e2e-docker, make e2e-full, make e2e-stateless, make e2e-k8s, make e2e-full-k8s, make e2e-kairos, make e2e-vm, make e2e-full-vm), the commit gate's suite selection (gate.sh), the git hooks' test (hooks.sh), the release workflow's reading of CHANGELOG.md and its test (release-notes.sh, release.sh), their shared helpers (lib.sh), the VM helpers (vm.sh), the bare-metal machine a TrueNAS VM plays for e2e-full-vm (metal-truenas, an OpenTofu module), Stowage's own release gate (selfaudit, with audit-allow.yaml at the root), their pinned images (pins.sh) and the sweep of earlier runs (sweep.sh)

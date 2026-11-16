@@ -2,7 +2,10 @@
 # Every build, test and check runs here: the host needs Docker and nothing else.
 #   make check  → target checks   (gofmt, go vet, staticcheck, govulncheck, go test -race)
 #   make build  → target bin      (static binaries exported to ./bin: stowage, which embeds the
-#                                  linux/amd64 stowage-install it ships, stowage-install, the
+#                                  stowage-install it ships for each platform installerbin.Platforms
+#                                  names (cmd/platforms prints them), gzip-compressed
+#                                  with its sha256 and size (internal/installerbin), the linux/amd64
+#                                  stowage-install, the
 #                                  installer's Docker smoke test, and self-audit, the release's
 #                                  vulnerability gate)
 #   make image  → target image    (distroless runtime image)
@@ -32,8 +35,17 @@ FROM base AS build
 ARG VERSION=dev
 RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build \
     set -eu; \
-    GOOS=linux GOARCH=amd64 go build -ldflags "-s -w -buildid= -X main.version=${VERSION}" -o /out/stowage-install ./cmd/stowage-install; \
-    cp /out/stowage-install internal/installerbin/stowage-install; \
+    mkdir -p /out/installers; \
+    platforms=$(go run ./internal/installerbin/cmd/platforms); \
+    test -n "$platforms"; \
+    for platform in $platforms; do \
+        os=${platform%/*}; arch=${platform#*/}; \
+        GOOS=$os GOARCH=$arch go build -ldflags "-s -w -buildid= -X main.version=${VERSION}" -o /out/installers/stowage-install-$os-$arch ./cmd/stowage-install; \
+        gzip -9 -n -c /out/installers/stowage-install-$os-$arch > internal/installerbin/stowage-install-$os-$arch.gz; \
+        sha256sum < /out/installers/stowage-install-$os-$arch | cut -d' ' -f1 > internal/installerbin/stowage-install-$os-$arch.sha256; \
+        wc -c < /out/installers/stowage-install-$os-$arch > internal/installerbin/stowage-install-$os-$arch.size; \
+    done; \
+    cp /out/installers/stowage-install-linux-amd64 /out/stowage-install; \
     go build -tags stowage_installer -ldflags "-s -w -buildid= -X main.version=${VERSION}" -o /out/stowage ./cmd/stowage; \
     go test -c -tags dockersmoke -o /out/install-smoke.test ./internal/install; \
     go build -o /out/self-audit ./test/selfaudit

@@ -722,27 +722,52 @@ kit_code() {
 	[[ -s $2 ]] || { cat "$1"; fail "kit create printed no code"; }
 }
 
-# prev_stowage: the path of the previous release's stowage — the latest v* tag but this tree's
-# own version — built from that tag with its own `make build` (in Docker) once, then kept in
-# ~/.cache/stowage-prev/<tag>; its git worktree is removed once built.
+# prev_stowage: the path of the previous release's stowage — the nearest v* tag in HEAD's history
+# but this tree's own version (by history, never by sorting tags) — built from that tag with its
+# own `make build` (in Docker) once, then kept in ~/.cache/stowage-prev/<commit>/<tag>/stowage,
+# keyed on the commit the tag names, so a moved tag builds again; the directory holding the binary
+# is named after the tag. Pre-release tags (v*-*) are skipped. Builds take a lock (30 min at most),
+# under which every other entry of ~/.cache/stowage-prev unused for a day is pruned: each use
+# touches its own, so a suite of another tree running beside keeps the binary it runs. Its git
+# worktree is removed once built.
 prev_stowage() (
 	# A subshell: its EXIT trap cleans the build up however it ends, and leaves the suite's own.
-	local cur tag dir out
+	local cur tag commit dir out
 	cur=$(sed -n 's/^## \[\([^]]*\)\].*/\1/p' "$REPO/CHANGELOG.md" | head -n1)
-	tag=$(git -C "$REPO" tag --list 'v*' --sort=-v:refname | { grep -vxF "v$cur" || true; } | head -n1)
-	[[ -n $tag ]] || fail "no previous release tag"
-	out=$HOME/.cache/stowage-prev/$tag/stowage
+	[[ -n $cur ]] || fail "no top entry in $REPO/CHANGELOG.md"
+	tag=$(git -C "$REPO" describe --tags --abbrev=0 --match 'v[0-9]*' --exclude 'v*-*' --exclude "v$cur" HEAD) || fail "no release before $cur in HEAD's history"
+	commit=$(git -C "$REPO" rev-parse --verify "$tag^{commit}") || fail "the commit of $tag"
+	[[ -n $HOME && -n $commit ]] || fail "no \$HOME or commit to keep the previous release's build by"
+	out=$HOME/.cache/stowage-prev/$commit/$tag/stowage
+	mkdir -p "$HOME/.cache" || fail "no $HOME/.cache"
+	# One build at a time: suites running in parallel wait for it, then take the binary it kept.
+	exec 9>"$HOME/.cache/stowage-prev.lock" || fail "the lock $HOME/.cache/stowage-prev.lock"
+	flock -w 1800 9 || fail "waited 30 min for the lock $HOME/.cache/stowage-prev.lock (another suite's build of a previous release holds it)"
+	# This release's build is kept, its use recorded by its mtime; every other commit's or tag's
+	# (the flat v*/ layout included) unused for a day goes.
+	local cache=$HOME/.cache/stowage-prev e
+	if [[ -d $cache ]]; then
+		[[ ! -d $cache/$commit/$tag ]] || touch -- "$cache/$commit" "$cache/$commit/$tag" || fail "touch $cache/$commit/$tag"
+		for e in "$cache"/* "$cache/$commit"/*; do
+			[[ -e $e && $e != "$cache/$commit" && $e != "$cache/$commit/$tag" ]] || continue
+			[[ -n $(find "$e" -maxdepth 0 -mmin +1440) ]] || continue
+			rm -rf -- "$e" || fail "prune $e"
+		done
+	fi
 	if [[ ! -x $out ]]; then
-		mkdir -p "$HOME/.cache" || fail "no $HOME/.cache"
 		dir=$(mktemp -d "$HOME/.cache/stowage-prev-tree.XXXXXX") || fail "mktemp in $HOME/.cache"
 		# The tree, its log and a half-kept binary go whichever way the build ends.
 		trap 'git -C "$REPO" worktree remove --force "$dir" >/dev/null 2>&1; rm -rf "$dir" "$dir.log" "$out.tmp"' EXIT
-		git -C "$REPO" worktree add --detach "$dir" "$tag" >&2 || fail "worktree of $tag"
+		git -C "$REPO" worktree add --detach "$dir" "$commit" >&2 || fail "worktree of $tag"
 		# Its binary alone: the tag's checks ran when it was released, and a vulnerability
-		# published since says nothing of this tree.
-		sed -i '/^COPY --from=checks /d' "$dir/Dockerfile"
+		# published since says nothing of this tree. Exactly one line goes, or the recipe is not
+		# the one this edit knows.
+		[[ $(grep -c '^COPY --from=checks ' "$dir/Dockerfile") == 1 ]] || fail "$tag's Dockerfile has not exactly one COPY --from=checks line to drop"
+		sed -i '/^COPY --from=checks /d' "$dir/Dockerfile" || fail "drop the COPY --from=checks line of $tag's Dockerfile"
 		# Its output goes to stderr: the caller takes the path from stdout.
-		make -C "$dir" build >"$dir.log" 2>&1 || { cat "$dir.log" >&2; fail "build of $tag"; }
+		# The lock's descriptor stays here: a child holding it (a Docker daemon helper) would keep
+		# the lock past this build.
+		make -C "$dir" build >"$dir.log" 2>&1 9>&- || { cat "$dir.log" >&2; fail "build of $tag"; }
 		mkdir -p "$(dirname "$out")"
 		{ cp "$dir/bin/stowage" "$out.tmp" && mv "$out.tmp" "$out"; } || fail "keeping the build of $tag in $out"
 	fi
