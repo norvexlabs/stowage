@@ -98,6 +98,13 @@ Cloud alone proven.
 
 ## Should
 
+- **The installer's binary and its payload as two layers**: each entry of the installer index
+  carries the Stowage binary and the release's payload as two layers rather than one file, the
+  payload appended at `ship`. The binary layer is then the same in every release a Stowage
+  version ships (pushed once, one SBOM), and a darwin binary keeps the code signature it was
+  built with. A format change of the installer and the release manifest: the target still keeps
+  one `<short>-stow`, and a release is still run by the Stowage that built it.
+
 - **`dns-cloudflare` issued end to end**: e2e-stateless proves `acme` against Pebble
   (`--acme-ca`); `dns-cloudflare`'s DNS-01 step goes through Caddy's Cloudflare module, which
   calls Cloudflare's API to write the TXT record, so a DNS stub alone cannot stand in for it.
