@@ -232,6 +232,16 @@ a self-review against the code it describes is enough. Every other commit clears
      a runtime piece that runs on an operator's host, a format version, or an edit to a gate (this
      file, the Makefile's `check`, the Dockerfile's checks stage, CI).
    - Re-run gate 1 after review fixes that touch code.
+5. **Provider impact**: every fix or feature is checked against `terraform-provider-stowage`
+   (`~/terraform-provider-stowage`, its `internal/installer` and its docs) before `git commit`:
+   what the provider calls or reads — the machine interface ([docs/machine-interface.md](docs/machine-interface.md):
+   `status`, `describe` and `updates --json`, the verbs' `--json`, the exit status), the flags it
+   passes (`--set`, `--values`, `--ports`, `--dry-run`, `--json`, `--no-input`, `--registry`,
+   `--address`, `--platform`, `--data`, `--yes`, `--after`, …), `vm seed --json`, kits — and what
+   its docs promise its users. The commit message states it (`Provider: none`, or the impact). A
+   change the provider must follow is made there too, with its test, before the Stowage release
+   that ships it; a breaking change of the machine interface bumps `MachineFormat`; a feature the
+   provider should expose is written to the provider's TODO.
 
 ## Release — only a pushed tag publishes
 
@@ -242,7 +252,8 @@ asks for one:
 1. A docs-only commit dates the top entry: `## [x.y.z]` → `## [x.y.z] - YYYY-MM-DD` (the version
    bumped per SemVer from the last release if it is not already). The Makefile's `VERSION` is that
    entry's version.
-   Before it, every suite `GATE_BASE=v<last release> make gate-plan` lists has printed PASS on
+   Before it, the provider impact each commit since the last release stated (gate 5) is settled:
+   none, or the provider's change made. Every suite `GATE_BASE=v<last release> make gate-plan` lists has printed PASS on
    the tree being released: a commit made "as is", with a suite deferred, is released only once
    that suite has run (a template that builds an image is proven by building it), unless the user
    waives it for a narrower proof, which the CHANGELOG entry's commit message names.
