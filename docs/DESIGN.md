@@ -1305,6 +1305,16 @@ every shape, the VM end-to-end test upgrading through it), then the health gate.
 
 ## 12. Decisions
 
+- **The publisher says how the chart serves a guarded route** — on Kubernetes the chart's ingress
+  serves the front's routes and Stowage enforces none of their guards, so while the chart may
+  route lint warns of each guarded route until the publisher answers it: not served
+  (`shapes.kubernetes.unserved`), or guarded by the chart's ingress or the operator's (`guarded`).
+  Lint reads no backend to decide or to check either answer: a chart is Go templates, and a
+  reader that renders nothing (Helm's engine would bring Kubernetes' libraries, and default
+  values hide the resources an operator turns on) always meets a construct it reads wrong — one
+  dropping the warning there would open a route, one refusing an answer there would leave the
+  publisher a warning it cannot answer. The answer is the publisher's statement, as the chart's
+  own security is.
 - **A VM's mirror login is given over SSH, as a Docker config entry, by a verb of its own** — a
   VM pulls from its mirror by itself, so a mirror that refuses anonymous reads needs a login on
   the VM. Its form is one Docker config `auths` entry (option (a) over a user flag and a password

@@ -14,27 +14,55 @@ import (
 	"github.com/norvexlabs/stowage/internal/helm"
 )
 
-// httpRouting matches a template's kind key — at a line's start, in a flow mapping or JSON
-// (`"kind": "Ingress"`), quoted or not — naming a resource that routes HTTP to the chart's Services
-// by host (an Ingress, a Gateway API HTTPRoute or GRPCRoute), or one a template computes
-// (`kind: {{ … }}`), which may be one.
-var httpRouting = regexp.MustCompile(`(?m)(^|[\s{,])["']?kind["']?\s*:\s*(["']?(Ingress|HTTPRoute|GRPCRoute)["']?\s*([,}#]|$)|[^\n]*\{\{)`)
+// routingKinds are the resources that route traffic to the chart's Services: an Ingress, the
+// Gateway API's routes, and the routes of Traefik, Istio, OpenShift, Contour, NGINX Inc, Kong,
+// APISIX, Emissary, Gloo, Skipper and Kuma.
+var routingKinds = []string{
+	"Ingress", "HTTPRoute", "GRPCRoute", "TLSRoute", "TCPRoute", "UDPRoute",
+	"IngressRoute", "IngressRouteTCP", "IngressRouteUDP", "VirtualService", "Route", "HTTPProxy",
+	"VirtualServer", "VirtualServerRoute", "TransportServer", "TCPIngress", "UDPIngress", "ApisixRoute", "Mapping", "RouteTable",
+	"RouteGroup", "MeshHTTPRoute", "MeshTCPRoute", "MeshGRPCRoute", "MeshGatewayRoute", "TCPMapping",
+}
+
+// routingKind matches a template's kind key — at a line's start, in a flow mapping or JSON
+// (`"kind": "Ingress"`), or after an action (`{{ if … }}kind:`), quoted or not, a YAML tag or
+// anchor before its value — naming a routing resource (routingKinds), or one a template computes
+// (`kind: {{ … }}`), which may be one; on one line.
+var routingKind = regexp.MustCompile(`(?m)(^|[ \t{,}])["']?kind["']?[ \t]*:[ \t]*((!!\w+|&\w+)[ \t]+)?["']?((` + strings.Join(routingKinds, "|") + `)["']?([ \t]|[,}#]|\{\{|$)|\{\{)`)
 
 // maxSubchart bounds what is read of one vendored subchart archive and of each template in it.
 const maxSubchart = 16 << 20
 
-// routesHTTP reports whether the chart's templates, or a subchart's under charts/ (a directory or
-// a vendored .tgz, nested ones included), may route HTTP to its Services (httpRouting). A subchart
+// mayRoute reports whether a template may route to the chart's Services: outside its comments,
+// it names a routing resource (routingKind).
+func mayRoute(data []byte) bool {
+	return routingKind.Match(uncommented(data))
+}
+
+// actionComment is a template comment, which may span lines; yamlComment, a YAML comment to its
+// line's end (a # at the line's start or after a blank).
+var (
+	actionComment = regexp.MustCompile(`(?s)\{\{-?\s*/\*.*?\*/\s*-?\}\}`)
+	yamlComment   = regexp.MustCompile(`(?m)(^|[ \t])#.*$`)
+)
+
+// uncommented is a template without its comments, a template's and YAML's.
+func uncommented(data []byte) []byte {
+	return yamlComment.ReplaceAll(actionComment.ReplaceAll(data, nil), []byte("$1"))
+}
+
+// chartMayRoute reports whether the chart's templates, or a subchart's under charts/ (a directory
+// or a vendored .tgz, nested ones included), may route to its Services (mayRoute). A subchart
 // archive that cannot be read counts as one that may.
-func routesHTTP(c *helm.Chart) bool {
+func chartMayRoute(c *helm.Chart) bool {
 	for _, f := range c.Files {
 		switch {
 		case isTemplate(f.Name):
-			if httpRouting.Match(f.Data) {
+			if mayRoute(f.Data) {
 				return true
 			}
 		case strings.HasPrefix(f.Name, "charts/") && strings.HasSuffix(f.Name, ".tgz"):
-			if archiveRoutesHTTP(f.Data, 0) {
+			if archiveMayRoute(f.Data, 0) {
 				return true
 			}
 		}
@@ -47,8 +75,8 @@ func isTemplate(name string) bool {
 	return strings.HasPrefix(name, "templates/") || strings.HasPrefix(name, "charts/") && strings.Contains(name, "/templates/")
 }
 
-// archiveRoutesHTTP is routesHTTP for a packaged chart: <name>/templates/… and <name>/charts/….
-func archiveRoutesHTTP(data []byte, depth int) bool {
+// archiveMayRoute is chartMayRoute for a packaged chart: <name>/templates/… and <name>/charts/….
+func archiveMayRoute(data []byte, depth int) bool {
 	if depth > 4 {
 		return true
 	}
@@ -77,7 +105,7 @@ func archiveRoutesHTTP(data []byte, depth int) bool {
 		if err != nil {
 			return true
 		}
-		if isArchive && archiveRoutesHTTP(b, depth+1) || !isArchive && httpRouting.Match(b) {
+		if isArchive && archiveMayRoute(b, depth+1) || !isArchive && mayRoute(b) {
 			return true
 		}
 	}

@@ -366,6 +366,14 @@ Cloud alone proven.
 
 ## Could
 
+- **A front route's upstream exposed on Kubernetes past the chart's ingress**: lint warns of a
+  guarded route while the chart has routing resources (an Ingress, a Gateway API route, a
+  controller's or a mesh's); a chart exposing a guarded route's upstream another way — a Service
+  of type `NodePort` or `LoadBalancer` or with `externalIPs`, a pod's `hostPort` or
+  `hostNetwork`, a Knative Service, a manifest a template writes whole from values — is not
+  warned. Telling those from the L4 routes' own NodePort Services (built from
+  `.Values.stowage.l4`) needs that range expanded from the spec, and a written manifest needs
+  rendering; a chart doing so departs from the chart contract (front routes through its ingress).
 - **A `network reset` retried without end while the seed does not read**: a reset whose apply
   fails while the cloud-config's network files do not read has its restore of the settings
   before it tried again every few seconds, never given up; a restore that stops and says what to

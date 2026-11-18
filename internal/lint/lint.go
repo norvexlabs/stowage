@@ -2035,8 +2035,10 @@ func (l *linter) readInputs() func(spec.Input) bool {
 // non-secret input something reads for its endpoint, an optional secret one for its key; and
 // that the project's own endpoint is one of its routes.
 func (l *linter) extensions() {
-	if e := l.s.Endpoint; e != "" && !slices.ContainsFunc(l.s.Front.Routes, func(r spec.Route) bool { return r.Name == e }) {
-		l.errf("endpoint", "%q is not a route of front.routes (%s)", e, strings.Join(l.s.Front.RouteNames(), ", "))
+	if e := l.s.Endpoint; e != "" {
+		if _, ok := l.route(e); !ok {
+			l.errf("endpoint", "%q is not a route of front.routes (%s)", e, strings.Join(l.s.Front.RouteNames(), ", "))
+		}
 	}
 	input := l.s.Input
 	read := func(spec.Input) bool { return true } // without the compose file nothing can be said
@@ -2322,12 +2324,57 @@ func (l *linter) chart(rel string) {
 	if len(l.s.L4.Routes) > 0 && !reads("l4") {
 		l.warnf("shapes.kubernetes.chart", "%s: no template reads .Values.%s.l4: the L4 routes are not published on Kubernetes", rel, helm.ValuesKey)
 	}
-	if !routesHTTP(c) {
+	l.frontOnKubernetes(c)
+}
+
+// frontOnKubernetes warns of each guarded front route while the chart, or a subchart, may route
+// to its Services (chartMayRoute): Stowage enforces none of its guards on Kubernetes. A route the
+// publisher says the chart does not serve (shapes.kubernetes.unserved), or whose guards the
+// chart's ingress or the operator's enforces there (shapes.kubernetes.guarded), is not warned: lint
+// takes the publisher at its word, reading no backend of the chart.
+func (l *linter) frontOnKubernetes(c *helm.Chart) {
+	if !chartMayRoute(c) {
 		return
 	}
+	k := l.s.Shapes.Kubernetes
 	for i, r := range l.s.Front.Routes {
-		if g := routeGuards(r); len(g) > 0 {
-			l.warnf(fmt.Sprintf("front.routes[%d]", i), "%s: on Kubernetes the chart's ingress serves the route, and Stowage enforces none of its guards there (%s): the chart's ingress must, or the route is open on the cluster", r.Name, strings.Join(g, ", "))
+		g := routeGuards(r)
+		if len(g) == 0 || slices.Contains(k.Guarded, r.Name) || slices.Contains(k.Unserved, r.Name) {
+			continue
+		}
+		l.warnf(fmt.Sprintf("front.routes[%d]", i), "%s: on Kubernetes the chart's ingress may serve the route, and Stowage enforces none of its guards there (%s): the chart's ingress must, or the route is open on the cluster; list %s in shapes.kubernetes.unserved if the chart does not serve it, or in shapes.kubernetes.guarded if the chart's ingress or the operator's enforces them", r.Name, strings.Join(g, ", "), r.Name)
+	}
+}
+
+// route is the front route named name, and whether there is one.
+func (l *linter) route(name string) (spec.Route, bool) {
+	if i := slices.IndexFunc(l.s.Front.Routes, func(r spec.Route) bool { return r.Name == name }); i >= 0 {
+		return l.s.Front.Routes[i], true
+	}
+	return spec.Route{}, false
+}
+
+// k8sRouteLists checks shapes.kubernetes.unserved and guarded: front routes, each once and in one
+// list alone, each with a guard (an empty list is refused as the spec is read).
+func (l *linter) k8sRouteLists(k *spec.K8sShape) {
+	for _, list := range []struct {
+		key   string
+		names []string
+	}{{"unserved", k.Unserved}, {"guarded", k.Guarded}} {
+		w := "shapes.kubernetes." + list.key
+		for i, name := range list.names {
+			where := fmt.Sprintf("%s[%d]", w, i)
+			r, ok := l.route(name)
+			switch {
+			case slices.Index(list.names, name) < i:
+				l.errf(where, "%s is given twice", name)
+			case !ok:
+				l.errf(where, "%s is no front route (front.routes[].name)", name)
+			case len(routeGuards(r)) == 0:
+				l.errf(where, "%s: the route has no guard (client_auth, allow_input, forward_auth, basic_auth), so lint warns nothing of it on Kubernetes; remove it (and %s, if it is the last)", name, w)
+			case list.key == "guarded" && slices.Contains(k.Unserved, name):
+				l.errf(where, "%s is in shapes.kubernetes.unserved too: the chart serves the route or it does not; keep it in one", name)
+			}
 		}
 	}
 }
@@ -2396,6 +2443,7 @@ func (l *linter) shapes() {
 			}
 		}
 		l.k8sSchema(k)
+		l.k8sRouteLists(k)
 	}
 	if k := sh.Kairos; k != nil {
 		w := "shapes.kairos"

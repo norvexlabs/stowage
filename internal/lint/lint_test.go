@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/norvexlabs/stowage/internal/helm"
 	"github.com/norvexlabs/stowage/internal/kairos"
 	"github.com/norvexlabs/stowage/internal/spec"
 	"github.com/norvexlabs/stowage/internal/testutil"
@@ -563,6 +564,16 @@ func TestEachRuleFiresOnFull(t *testing.T) {
 		{"backup exclude pattern", []edit{{sp, "lean: { exclude: [events", "lean: { exclude: [events-x"}}, nil, "is not a table pattern"},
 		{"backup profile name", []edit{{sp, "    config: [organisations", "    con-fig: [organisations"}}, nil, "lowercase letters and digits"},
 		{"postgres mode", []edit{{sp, "postgres_modes: [embedded, external]", "postgres_modes: [rds]"}}, nil, "unknown mode \"rds\""},
+		{"guarded empty", []edit{{sp, "guarded: [api, ops]", "guarded: []"}}, nil, "stowage.yaml:246: shapes.kubernetes.guarded is written with nothing under it"},
+		{"guarded twice", []edit{{sp, "guarded: [api, ops]", "guarded: [api, api]"}}, nil, "shapes.kubernetes.guarded[1]: api is given twice"},
+		{"guarded no route", []edit{{sp, "guarded: [api, ops]", "guarded: [metrics]"}}, nil, "shapes.kubernetes.guarded[0]: metrics is no front route"},
+		{"guarded no guard", []edit{{sp, "guarded: [api, ops]", "guarded: [console]"}}, nil, "shapes.kubernetes.guarded[0]: console: the route has no guard"},
+		{"guarded key", []edit{{sp, "guarded: [api, ops]", "guard: [api, ops]"}}, nil, "field guard not found"},
+		{"unserved empty", []edit{{sp, "unserved: [ingest]", "unserved: []"}}, nil, "stowage.yaml:245: shapes.kubernetes.unserved is written with nothing under it"},
+		{"unserved twice", []edit{{sp, "unserved: [ingest]", "unserved: [ingest, ingest]"}}, nil, "shapes.kubernetes.unserved[1]: ingest is given twice"},
+		{"unserved no route", []edit{{sp, "unserved: [ingest]", "unserved: [metrics]"}}, nil, "shapes.kubernetes.unserved[0]: metrics is no front route"},
+		{"unserved no guard", []edit{{sp, "unserved: [ingest]", "unserved: [status]"}}, nil, "shapes.kubernetes.unserved[0]: status: the route has no guard"},
+		{"unserved and guarded", []edit{{sp, "guarded: [api, ops]", "guarded: [api, ops, ingest]"}}, nil, "shapes.kubernetes.guarded[2]: ingest is in shapes.kubernetes.unserved too"},
 		{"kairos base", []edit{{sp, "    base: " + kbase + "\n", ""}}, nil, "shapes.kairos.base: is required"},
 		{"kairos init", []edit{{sp, "    kairos_init: " + kinit + "\n", ""}}, nil, "shapes.kairos.kairos_init: is required"},
 		{"kairos base unpinned", []edit{{sp, "base: " + kbase, "base: " + unpinned(kbase)}}, nil, `shapes.kairos.base: "` + unpinned(kbase) + `" must be pinned by digest`},
@@ -2070,40 +2081,51 @@ func TestChartNotReadingTheL4RoutesWarns(t *testing.T) {
 	}
 }
 
-// A chart that routes HTTP to its Services (an Ingress, an HTTPRoute) serves the front's routes on
-// Kubernetes: each route with a guard the Docker and VM fronts enforce is warned, a route without
-// one is not; a chart declaring no such resource (the full example's) serves none and is not.
-func TestAGuardedRouteOnAChartsIngressWarns(t *testing.T) {
-	t.Parallel()
-	for kind, want := range map[string][]string{
-		"Ingress":                 {"front.routes[1]: api: on Kubernetes the chart's ingress serves the route, and Stowage enforces none of its guards there (forward_auth): the chart's ingress must, or the route is open on the cluster", "front.routes[2]: ingest: on Kubernetes the chart's ingress serves the route, and Stowage enforces none of its guards there (allow_input)", "front.routes[3]: ops: on Kubernetes the chart's ingress serves the route, and Stowage enforces none of its guards there (client_auth, basic_auth)"},
-		"\"HTTPRoute\"   # api":   {"front.routes[1]: api:", "front.routes[2]: ingest:", "front.routes[3]: ops:"},
-		"GRPCRoute":               {"front.routes[1]: api:", "front.routes[2]: ingest:", "front.routes[3]: ops:"},
-		"IngressClass":            nil,
-		"Service":                 nil,
-		"{{ .Values.routeKind }}": {"front.routes[1]: api:", "front.routes[2]: ingest:", "front.routes[3]: ops:"},
-	} {
-		root := testutil.CopyExample(t, "full")
-		testutil.Write(t, root, "deploy/chart/templates/routes.yaml", "apiVersion: v1\nkind: "+kind+"\nmetadata:\n  name: {{ .Release.Name }}-routes\n")
-		res := run(t, root)
-		var got []string
-		for _, f := range res.Findings {
-			got = append(got, f.String())
+// routes is a template holding an Ingress.
+const routes = "apiVersion: networking.k8s.io/v1\nkind: Ingress\nmetadata:\n  name: {{ .Release.Name }}-web\n"
+
+// setK8sLists sets the full example's shapes.kubernetes.unserved and guarded ("" leaves
+// the key out).
+func setK8sLists(t *testing.T, root, unserved, guarded string) {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join(root, specFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for key, v := range map[string]string{"unserved": unserved, "guarded": guarded} {
+		i := slices.IndexFunc(strings.SplitAfter(string(b), "\n"), func(l string) bool { return strings.HasPrefix(l, "    "+key+": [") })
+		if i < 0 {
+			t.Fatalf("the full example has no shapes.kubernetes.%s line to set", key)
 		}
-		if len(got) != len(want) {
-			t.Fatalf("%s: findings %q", kind, got)
+		with := ""
+		if v != "" {
+			with = "    " + key + ": " + v + "\n"
 		}
-		for i := range want {
-			if !strings.Contains(got[i], want[i]) {
-				t.Errorf("%s: %q, want %q", kind, got[i], want[i])
-			}
-		}
+		testutil.Edit(t, root, specFile, strings.SplitAfter(string(b), "\n")[i], with)
 	}
 }
 
-// A subchart's templates are scanned too, vendored as a directory or an archive (nested ones
-// included); an archive that cannot be read may route HTTP, so it warns.
-func TestAGuardedRouteOnASubchartsIngressWarns(t *testing.T) {
+// guardWarnings are the front routes a run warns as served by the chart's ingress; any other
+// finding fails the test.
+func guardWarnings(t *testing.T, res *Result) (routes []string) {
+	t.Helper()
+	for _, f := range res.Findings {
+		s := f.String()
+		if !strings.Contains(s, ": on Kubernetes the chart's ingress may serve the route") {
+			t.Errorf("finding %q", s)
+			continue
+		}
+		_, rest, _ := strings.Cut(s, "]: ")
+		name, _, _ := strings.Cut(rest, ":")
+		routes = append(routes, name)
+	}
+	return routes
+}
+
+// The chart may route to its Services when a template — the chart's or a subchart's, vendored as a
+// directory or an archive, nested ones included — names a routing resource or a kind it computes;
+// a Service of any type is none; an archive that cannot be read may, so it counts.
+func TestChartMayRoute(t *testing.T) {
 	t.Parallel()
 	ingress := "apiVersion: networking.k8s.io/v1\nkind: Ingress\nmetadata:\n  name: x\n"
 	service := "apiVersion: v1\nkind: Service\nmetadata:\n  name: x\n"
@@ -2111,25 +2133,115 @@ func TestAGuardedRouteOnASubchartsIngressWarns(t *testing.T) {
 		path, content string
 		warns         bool
 	}{
-		"directory":             {"deploy/chart/charts/web/templates/ingress.yaml", ingress, true},
-		"directory service":     {"deploy/chart/charts/web/templates/svc.yaml", service, false},
-		"archive":               {"deploy/chart/charts/web-1.0.0.tgz", chartArchive(t, "web", map[string]string{"templates/ingress.yaml": ingress}), true},
-		"archive service":       {"deploy/chart/charts/web-1.0.0.tgz", chartArchive(t, "web", map[string]string{"templates/svc.yaml": service, "values.yaml": ingress}), false},
-		"archive in archive":    {"deploy/chart/charts/web-1.0.0.tgz", chartArchive(t, "web", map[string]string{"charts/edge-1.0.0.tgz": chartArchive(t, "edge", map[string]string{"templates/route.yaml": strings.Replace(ingress, "Ingress", "HTTPRoute", 1)})}), true},
-		"unreadable archive":    {"deploy/chart/charts/web-1.0.0.tgz", brokenArchive(t), true},
-		"archive of ./ entries": {"deploy/chart/charts/web-1.0.0.tgz", chartArchive(t, "web", map[string]string{"charts/edge-1.0.0.tgz": chartArchive(t, "./edge", map[string]string{"templates/route.yaml": ingress})}), true},
-		"json":                  {"deploy/chart/templates/r.yaml", `{"apiVersion": "networking.k8s.io/v1", "kind": "Ingress", "metadata": {"name": "x"}}`, true},
-		"flow":                  {"deploy/chart/templates/r.yaml", "{apiVersion: gateway.networking.k8s.io/v1, kind: HTTPRoute, metadata: {name: x}}\n", true},
-		"flow class":            {"deploy/chart/templates/r.yaml", "{apiVersion: networking.k8s.io/v1, kind: IngressClass, metadata: {name: x}}\n", false},
+		"ingress":                     {"templates/r.yaml", ingress, true},
+		"httproute":                   {"templates/r.yaml", "kind: \"HTTPRoute\"   # api\n", true},
+		"grpcroute":                   {"templates/r.yaml", "kind: GRPCRoute\n", true},
+		"tcproute":                    {"templates/r.yaml", "kind: TCPRoute\n", true},
+		"traefik":                     {"templates/r.yaml", "kind: IngressRoute\n", true},
+		"nginx":                       {"templates/r.yaml", "kind: VirtualServer\n", true},
+		"computed kind":               {"templates/r.yaml", "kind: {{ .Values.routeKind }}\n", true},
+		"ingress class":               {"templates/r.yaml", "kind: IngressClass\n", false},
+		"cluster ip service":          {"templates/s.yaml", service + "spec:\n  type: ClusterIP\n", false},
+		"nodeport service":            {"templates/s.yaml", service + "spec:\n  type: NodePort\n", false},
+		"loadbalancer service":        {"templates/s.yaml", service + "spec:\n  type: \"LoadBalancer\"\n", false},
+		"computed type":               {"templates/s.yaml", service + "spec:\n  type: {{ .Values.service.type }}\n", false},
+		"nodeport secret":             {"templates/s.yaml", "kind: Secret\ntype: NodePort\n", false},
+		"templated name":              {"templates/c.yaml", "{apiVersion: v1, kind: ConfigMap, metadata: {name: {{ .Release.Name }}-cfg}}\n", false},
+		"kind after an action":        {"templates/r.yaml", "{{- if .Values.ingress.enabled }}kind: Ingress\n{{- end }}\n", true},
+		"skipper":                     {"templates/r.yaml", "kind: RouteGroup\n", true},
+		"named kind, an action after": {"templates/r.yaml", "kind: Ingress {{- /* public */}}\n", true},
+		"quoted computed kind":        {"templates/r.yaml", "kind: \"{{ .Values.kind }}\"\n", true},
+		"action right after":          {"templates/r.yaml", "kind: HTTPRoute{{ \"\" }}\n", true},
+		"tagged kind":                 {"templates/r.yaml", "kind: !!str HTTPRoute\n", true},
+		"anchored kind":               {"templates/r.yaml", "kind: &k Ingress\n", true},
+		"commented kind":              {"templates/r.yaml", "# kind: Ingress\nkind: ConfigMap\n", false},
+		"action-commented kind":       {"templates/r.yaml", "{{/* kind: Ingress\n*/}}\nkind: ConfigMap\n", false},
+		"kind on the next line":       {"templates/r.yaml", "kind:\n  Ingress\n", false},
+		"comment after the kind":      {"templates/r.yaml", "kind: Ingress # the web\n", true},
+		"directory":                   {"charts/web/templates/ingress.yaml", ingress, true},
+		"directory service":           {"charts/web/templates/svc.yaml", service, false},
+		"archive":                     {"charts/web-1.0.0.tgz", chartArchive(t, "web", map[string]string{"templates/ingress.yaml": ingress}), true},
+		"archive service":             {"charts/web-1.0.0.tgz", chartArchive(t, "web", map[string]string{"templates/svc.yaml": service, "values.yaml": ingress}), false},
+		"archive in archive":          {"charts/web-1.0.0.tgz", chartArchive(t, "web", map[string]string{"charts/edge-1.0.0.tgz": chartArchive(t, "edge", map[string]string{"templates/route.yaml": strings.Replace(ingress, "Ingress", "HTTPRoute", 1)})}), true},
+		"unreadable archive":          {"charts/web-1.0.0.tgz", brokenArchive(t), true},
+		"archive of ./ entries":       {"charts/web-1.0.0.tgz", chartArchive(t, "web", map[string]string{"charts/edge-1.0.0.tgz": chartArchive(t, "./edge", map[string]string{"templates/route.yaml": ingress})}), true},
+		"json":                        {"templates/r.yaml", `{"apiVersion": "networking.k8s.io/v1", "kind": "Ingress", "metadata": {"name": "x"}}`, true},
+		"flow":                        {"templates/r.yaml", "{apiVersion: gateway.networking.k8s.io/v1, kind: HTTPRoute, metadata: {name: x}}\n", true},
+		"flow class":                  {"templates/r.yaml", "{apiVersion: networking.k8s.io/v1, kind: IngressClass, metadata: {name: x}}\n", false},
 	} {
-		root := testutil.CopyExample(t, "full")
-		testutil.Write(t, root, c.path, c.content)
-		warned := slices.ContainsFunc(run(t, root).Findings, func(f Finding) bool {
-			return strings.Contains(f.String(), "front.routes[1]: api: on Kubernetes the chart's ingress serves the route")
-		})
-		if warned != c.warns {
-			t.Errorf("%s: warned %v", name, warned)
+		c0 := &helm.Chart{Files: []helm.File{{Name: c.path, Data: []byte(c.content)}}}
+		if got := chartMayRoute(c0); got != c.warns {
+			t.Errorf("%s: chartMayRoute %v", name, got)
 		}
+	}
+	for _, k := range routingKinds {
+		for _, line := range []string{"kind: " + k + "\n", "kind: \"" + k + "\" # x\n", "{kind: " + k + ", metadata: {}}\n"} {
+			if c := (&helm.Chart{Files: []helm.File{{Name: "templates/r.yaml", Data: []byte(line)}}}); !chartMayRoute(c) {
+				t.Errorf("%q: chartMayRoute false", line)
+			}
+		}
+		if c := (&helm.Chart{Files: []helm.File{{Name: "templates/r.yaml", Data: []byte("kind: " + k + "Class\n")}}}); chartMayRoute(c) {
+			t.Errorf("%sClass: chartMayRoute true", k)
+		}
+	}
+}
+
+// A chart that routes to none of its Services (the full example's: Services, and NodePort ones for
+// its L4 routes) warns of no guarded route, whichever the lists hold.
+func TestAGuardedRouteOnAChartWithoutRoutingIsNotWarned(t *testing.T) {
+	t.Parallel()
+	root := testutil.CopyExample(t, "full")
+	setK8sLists(t, root, "", "")
+	if res := run(t, root); slices.ContainsFunc(res.Findings, func(f Finding) bool { return strings.Contains(f.String(), "may serve the route") }) {
+		t.Errorf("findings %v", res.Findings)
+	}
+}
+
+// While the chart may route to its Services, each guarded route is warned, naming its guards and
+// the keys that answer it.
+func TestAGuardedRouteOnAChartsIngressWarnsInFull(t *testing.T) {
+	t.Parallel()
+	root := testutil.CopyExample(t, "full")
+	setK8sLists(t, root, "", "")
+	testutil.Write(t, root, "deploy/chart/templates/routes.yaml", routes)
+	var got []string
+	for _, f := range run(t, root).Findings {
+		got = append(got, f.String())
+	}
+	hint := func(r string) string {
+		return "the chart's ingress must, or the route is open on the cluster; list " + r + " in shapes.kubernetes.unserved if the chart does not serve it, or in shapes.kubernetes.guarded if the chart's ingress or the operator's enforces them"
+	}
+	want := []string{
+		"warning: front.routes[1]: api: on Kubernetes the chart's ingress may serve the route, and Stowage enforces none of its guards there (forward_auth): " + hint("api"),
+		"warning: front.routes[2]: ingest: on Kubernetes the chart's ingress may serve the route, and Stowage enforces none of its guards there (allow_input): " + hint("ingest"),
+		"warning: front.routes[3]: ops: on Kubernetes the chart's ingress may serve the route, and Stowage enforces none of its guards there (client_auth, basic_auth): " + hint("ops"),
+	}
+	if !slices.Equal(got, want) {
+		t.Errorf("findings %q", got)
+	}
+}
+
+// A route in shapes.kubernetes.guarded or unserved is not warned, the chart's other guarded
+// routes still are; lint takes either list at the publisher's word.
+func TestKubernetesRouteLists(t *testing.T) {
+	t.Parallel()
+	for name, c := range map[string]struct {
+		unserved, guarded, template string
+		want                        []string
+	}{
+		"operator guards": {"", "[api]", routes, []string{"ingest", "ops"}},
+		"unserved":        {"[ingest]", "", routes, []string{"api", "ops"}},
+		"both lists":      {"[ingest]", "[api, ops]", routes, nil},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			root := testutil.CopyExample(t, "full")
+			setK8sLists(t, root, c.unserved, c.guarded)
+			testutil.Write(t, root, "deploy/chart/templates/routes.yaml", c.template)
+			if routes := guardWarnings(t, run(t, root)); !slices.Equal(routes, c.want) {
+				t.Errorf("%s: routes %q, want %q", name, routes, c.want)
+			}
+		})
 	}
 }
 

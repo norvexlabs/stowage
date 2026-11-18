@@ -789,6 +789,12 @@ type K8sShape struct {
 	// container of the workload running database.schema_compat's reads_newer_image, connecting
 	// to the URL the variable URLEnv holds there.
 	Schema *K8sSchema `yaml:"schema"`
+	// Unserved are the front routes the chart does not serve on Kubernetes, Guarded those
+	// it serves whose guards the chart's ingress or the operator's enforces there: lint warns of neither. Both
+	// are the publisher's: no view an artifact carries keeps them (RuntimeView), and omitempty keeps
+	// the view's encoding, and so the artifacts' digests, what it is without them.
+	Unserved []string `yaml:"unserved" json:",omitempty"`
+	Guarded  []string `yaml:"guarded" json:",omitempty"`
 }
 
 // K8sSchema is shapes.kubernetes.schema.
@@ -1217,8 +1223,8 @@ func Parse(raw []byte) (*Spec, error) {
 	return &s, nil
 }
 
-// keysNotEmpty are the keys a spec may leave out but never write with nothing under them (null or
-// {}, which decode as the key left out); each with what to write under it.
+// keysNotEmpty are the keys a spec may leave out but never write with nothing under them (null, {}
+// or [], which decode as the key left out or nothing); each with what to write under it.
 var keysNotEmpty = []struct {
 	path []string
 	fix  string
@@ -1228,6 +1234,8 @@ var keysNotEmpty = []struct {
 	{[]string{"shapes", "kairos", "size"}, "give min, recommended or both"},
 	{[]string{"shapes", "kairos", "size", "min"}, "give cpus, memory or disk"},
 	{[]string{"shapes", "kairos", "size", "recommended"}, "give cpus, memory or disk"},
+	{[]string{"shapes", "kubernetes", "unserved"}, "list the front routes the chart does not serve"},
+	{[]string{"shapes", "kubernetes", "guarded"}, "list the front routes whose guards the chart's ingress or the operator's enforces"},
 }
 
 // emptyKeys refuses a key of keysNotEmpty written with nothing under it, naming its line.
@@ -1241,7 +1249,7 @@ func emptyKeys(raw []byte) error {
 		for _, key := range k.path {
 			n, line = mappingValue(n, key, 0)
 		}
-		if n != nil && (n.Tag == "!!null" || n.Kind == yaml.MappingNode && !hasEntries(n, 0)) {
+		if n != nil && (n.Tag == "!!null" || n.Kind == yaml.MappingNode && !hasEntries(n, 0) || n.Kind == yaml.SequenceNode && len(n.Content) == 0) {
 			return fmt.Errorf("stowage.yaml:%d: %s is written with nothing under it: %s, or remove %s", line, strings.Join(k.path, "."), k.fix, k.path[len(k.path)-1])
 		}
 	}
@@ -1436,7 +1444,8 @@ func (s *Spec) Signs() bool { return s.Signing != nil && s.Signing.Name != "none
 
 // RuntimeView is the part of the spec that reaches an install: the spec without the fields only
 // the publisher reads (version and changelog providers, channels, push credentials, the signing
-// key, the audit gate, the delete provider, the kairos shape's disks policy). Artifacts embed this view, so their inputs digests hash it and nothing else: fixing push
+// key, the audit gate, the delete provider, the kairos shape's disks policy, the kubernetes shape's
+// answers to lint). Artifacts embed this view, so their inputs digests hash it and nothing else: fixing push
 // credentials or a channel template must not change what a release contains.
 func (s *Spec) RuntimeView() Spec {
 	v := *s
@@ -1457,6 +1466,11 @@ func (s *Spec) RuntimeView() Spec {
 		c := *k
 		c.Disks = ""
 		v.Shapes.Kairos = &c
+	}
+	if k := s.Shapes.Kubernetes; k != nil {
+		c := *k
+		c.Unserved, c.Guarded = nil, nil
+		v.Shapes.Kubernetes = &c
 	}
 	return v
 }

@@ -242,6 +242,8 @@ shapes:
     chart: deploy/chart
     postgres_modes: [embedded, external]
     schema: { url_env: DATABASE_URL, image: postgres }            # k8s upgrade records the schema, k8s rollback checks it
+    unserved: [ingest]                                            # no route of the chart serves the ingest: its senders reach it their own way
+    guarded: [api, ops]                                           # the chart's ingress or the operator's asks for the login, the certificate and the authentication service
   kairos:
     base: ubuntu:26.04@sha256:6a06111c3b0a8600feadb270aec771dc239bf407b25625f93f44ab00e11f4d3c
     kairos_init: quay.io/kairos/kairos-init:v4.4.0@sha256:eb131bd9b4ed5b9b25cf761af9afa7d462bef27c2d0e9453ce884cf7733a6556

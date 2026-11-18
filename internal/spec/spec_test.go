@@ -89,6 +89,25 @@ signing: { provider: cosign-key, key: env://SECRET, public_keys: [a.pub] }
 	}
 }
 
+// The kubernetes shape's answers to lint are the publisher's: the runtime view drops them, the spec
+// keeps them, and the view encodes as it does without them.
+func TestTheKubernetesLintAnswersAreThePublishers(t *testing.T) {
+	t.Parallel()
+	with, err := Parse([]byte(base + "shapes:\n  kubernetes:\n    chart: c\n    unserved: [a]\n    guarded: [b]\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	without, err := Parse([]byte(base + "shapes:\n  kubernetes:\n    chart: c\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, _ := json.Marshal(with.RuntimeView())
+	b, _ := json.Marshal(without.RuntimeView())
+	if string(a) != string(b) || len(with.Shapes.Kubernetes.Unserved) != 1 || len(with.Shapes.Kubernetes.Guarded) != 1 {
+		t.Errorf("runtime view %s, want %s; spec %+v", a, b, with.Shapes.Kubernetes)
+	}
+}
+
 // The disks policy is the publisher's: no view an artifact carries keeps it, and the spec does.
 func TestTheDisksPolicyIsThePublishers(t *testing.T) {
 	t.Parallel()
@@ -158,7 +177,7 @@ func TestUnheldNetwork(t *testing.T) {
 	}
 }
 
-// A key written with nothing under it (null or {}) is refused with its line; the same key with
+// A key written with nothing under it (null, {} or []) is refused with its line; the same key with
 // content, or left out, decodes.
 func TestParseRefusesEmptyKeys(t *testing.T) {
 	t.Parallel()
@@ -166,6 +185,9 @@ func TestParseRefusesEmptyKeys(t *testing.T) {
 		{"services:\n", "services: { api: { memory: 10 } }\n", "stowage.yaml:3: services is written with nothing under it: name a service, or remove services"},
 		{"services: {}\n", "", "stowage.yaml:3: services is written with nothing under it"},
 		{"tune: ~\n", "tune: { profile: network }\n", "stowage.yaml:3: tune is written with nothing under it: give its profile, or remove tune"},
+		{"shapes:\n  kubernetes:\n    chart: c\n    unserved:\n", "shapes:\n  kubernetes:\n    chart: c\n    unserved: [a]\n", "stowage.yaml:6: shapes.kubernetes.unserved is written with nothing under it: list the front routes the chart does not serve, or remove unserved"},
+		{"shapes:\n  kubernetes:\n    chart: c\n    guarded: ~\n", "shapes:\n  kubernetes:\n    chart: c\n    guarded: [a]\n", "stowage.yaml:6: shapes.kubernetes.guarded is written with nothing under it: list the front routes whose guards the chart's ingress or the operator's enforces, or remove guarded"},
+		{"shapes:\n  kubernetes:\n    chart: c\n    unserved: []\n", "shapes:\n  kubernetes:\n    chart: c\n    unserved: [a]\n", "stowage.yaml:6: shapes.kubernetes.unserved is written with nothing under it"},
 		{"shapes:\n  kairos:\n    size:\n", "shapes:\n  kairos:\n    size: { min: { cpus: 2 } }\n", "stowage.yaml:5: shapes.kairos.size is written with nothing under it: give min, recommended or both, or remove size"},
 		{"shapes:\n  kairos:\n    size: { min: {}, recommended: { cpus: 2 } }\n", "", "stowage.yaml:5: shapes.kairos.size.min is written with nothing under it: give cpus, memory or disk, or remove min"},
 		{"shapes:\n  kairos:\n    size: { min: { cpus: 1 }, recommended: }\n", "", "stowage.yaml:5: shapes.kairos.size.recommended is written with nothing under it"},

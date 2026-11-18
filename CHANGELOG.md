@@ -3,6 +3,23 @@
 Stowage's own releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
+## [0.41.0]
+
+### Added
+
+- `shapes.kubernetes.unserved` and `shapes.kubernetes.guarded` answer lint's warning of a
+  guarded front route on Kubernetes: the first lists the routes the chart does not serve, the
+  second those it serves whose guards the chart's ingress or the operator's enforces. Lint no longer warns of
+  either, and refuses a name that is no route, one given twice, a route without a guard, a route
+  in both lists, and either key written with nothing under it.
+
+### Changed
+
+- The warning also counts a chart's TLSRoute, TCPRoute or UDPRoute, and the routes of Traefik,
+  Istio, OpenShift, Contour, NGINX Inc, Kong, APISIX, Emissary, Gloo, Skipper and Kuma, as
+  routing, and a kind key right after a template action; it no longer counts a templated value
+  elsewhere on a `kind:` line as a computed kind, and it names the two keys that answer it.
+
 ## [0.40.0] - 2026-11-16
 
 ### Added
