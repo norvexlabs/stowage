@@ -22,7 +22,8 @@ RUN go version -m /usr/bin/caddy | awk 'function n(v, i) { sub(/^v/, "", v); spl
 
 # Caddy's image less what the front never runs (curl and its libraries, the capability tools: the
 # front runs as its own user with no capability, and binds 80 and 443 as its network namespace lets
-# any user), zlib past CVE-2026-4738, which the pinned base does not carry. Its data and
+# any user), zlib past CVE-2026-4738 and OpenSSL (libssl3, libcrypto3) past CVE-2026-107496, -88823,
+# -95691 and -95692, which the pinned base does not carry. Its data and
 # configuration directories are that user's (65532, the installer's FrontUID), so a volume made
 # on them is too; the binary carries no file capability.
 FROM caddy:2.11.9-alpine@sha256:0bbb055bda6793c999bde78b1b5ce3e89f829fb031af2cf50056ea1246559fee
@@ -31,7 +32,7 @@ COPY --from=builder /usr/bin/caddy /usr/bin/caddy
 # front with every capability dropped cannot grant, so the kernel would refuse its exec): taken off
 # and checked with the base's own tools, before they go.
 RUN setcap -r /usr/bin/caddy 2>/dev/null || true; caps="$(getcap /usr/bin/caddy)" && [ -z "$caps" ] && \
-    apk del --no-cache curl libcap libcap-utils && apk add --no-cache 'zlib>=1.4'
+    apk del --no-cache curl libcap libcap-utils && apk add --no-cache 'zlib>=1.4' 'libssl3>=3.5.9-r1' 'libcrypto3>=3.5.9-r1'
 RUN mkdir -p /data /config && chown -R 65532:65532 /data /config
 RUN caddy version | grep -q '^v2\.11\.9 ' && caddy list-modules | grep -qx 'dns.providers.cloudflare' && \
     caddy list-modules | grep -qx 'layer4.handlers.tls' && caddy list-modules | grep -qx 'layer4.matchers.remote_ip' && ! command -v curl

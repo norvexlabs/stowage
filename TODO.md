@@ -27,7 +27,9 @@ Cloud alone proven.
      Caddy 2.11.9 carries chi 5.4.0, rclone 1.76.0 x/net, chi, compress, brotli and grpc 1.84.0
      (past GO-2026-6443, which hit the 1.84.0-dev snapshot 1.75.1 shipped), grype 0.121.3 x/net,
      compress and brotli — those raises are gone.
-   - Alpine packages raised over a pinned base: `zlib>=1.4` (CVE-2026-4738) in
+   - Alpine packages raised over a pinned base: `zlib>=1.4` (CVE-2026-4738), `libssl3>=3.5.9-r1`
+     and `libcrypto3>=3.5.9-r1` (OpenSSL, CVE-2026-107496, -88823, -95691, -95692; checked
+     2026-11-19: alpine 3.24.4 and caddy 2.11.9-alpine still ship 3.5.9-r0) in
      `internal/front/Dockerfile`, `internal/backup/Dockerfile` and the examples' Python images
      (`examples/minimal/api`, `examples/full/docker/api`, `ingest`, `provision`); `apk upgrade`
      with su-exec in place of gosu in `examples/full/postgres`. These make the image depend on what

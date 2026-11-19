@@ -3,6 +3,14 @@
 Stowage's own releases. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/).
 
+## [0.41.1]
+
+### Fixed
+
+- The front and the backup runner (and the examples' Alpine images) carry OpenSSL 3.5.9-r1, past
+  CVE-2026-107496, CVE-2026-88823, CVE-2026-95691 and CVE-2026-95692, which their pinned bases
+  still ship: `ship`'s audit no longer refuses a release that installs them.
+
 ## [0.41.0] - 2026-11-18
 
 ### Added

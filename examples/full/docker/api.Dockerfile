@@ -9,8 +9,9 @@ ENV ATLAS_VERSION=${STOWAGE_PROJECT_VERSION}
 # "true": this release reads a schema newer than its own, so a rollback to it is allowed until a
 # rollback barrier.
 LABEL com.example.atlas.reads-newer-schema="true"
-# zlib past CVE-2026-4738, which the pinned base does not carry.
-RUN apk add --no-cache postgresql18-client 'zlib>=1.4'
+# zlib past CVE-2026-4738 and OpenSSL past CVE-2026-107496, -88823, -95691 and -95692, which the
+# pinned base does not carry.
+RUN apk add --no-cache postgresql18-client 'zlib>=1.4' 'libssl3>=3.5.9-r1' 'libcrypto3>=3.5.9-r1'
 # The image runs Python's standard library alone: pip, and the packages it vendors, are removed.
 RUN python -m pip uninstall -y -q pip && rm -rf /usr/local/lib/python3.13/ensurepip
 COPY --from=build /src/server/atlas-server /usr/local/bin/atlas-server

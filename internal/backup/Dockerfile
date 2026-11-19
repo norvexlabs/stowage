@@ -5,8 +5,9 @@
 # release's source with the Go toolchain, its modules as the release pins them (the checksum
 # database checks every module; a module raised past a published vulnerability is pinned here by
 # version until a release carries it), onto Alpine as its pinned
-# base is (its CA certificates; no FUSE: the runner mounts nothing), but for zlib, raised past
-# CVE-2026-4738, which the base does not carry. Every base is pinned by digest.
+# base is (its CA certificates; no FUSE: the runner mounts nothing), but for zlib and OpenSSL
+# (libssl3, libcrypto3), raised past CVE-2026-4738 and CVE-2026-107496, -88823, -95691 and -95692,
+# which the base does not carry. Every base is pinned by digest.
 FROM --platform=$BUILDPLATFORM golang:1.27.4-alpine@sha256:0a5f7fe796599ff487605987432e7619ae45beeb2fba4c2ce0b907879932aebf AS builder
 ARG TARGETOS TARGETARCH
 WORKDIR /build
@@ -16,7 +17,7 @@ RUN go mod init build \
       -ldflags '-s -w -X github.com/rclone/rclone/fs.Version=v1.76.0' -o /rclone github.com/rclone/rclone
 
 FROM alpine:3.24.4@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf
-RUN apk add --no-cache 'zlib>=1.4'
+RUN apk add --no-cache 'zlib>=1.4' 'libssl3>=3.5.9-r1' 'libcrypto3>=3.5.9-r1'
 COPY --from=builder /rclone /usr/local/bin/rclone
 ENV XDG_CONFIG_HOME=/config
 WORKDIR /data
